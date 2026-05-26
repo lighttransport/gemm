@@ -1657,6 +1657,20 @@ static int test_int8_gemm(void) {
         cuMemcpyDtoH(Yg2, dY, nY*sizeof(float));
         int det = (memcmp(Yg, Yg2, nY*sizeof(float)) == 0);
 
+        /* perf: time the int8 GEMM in isolation */
+        {
+            for (int w=0;w<10;w++) op_gemm(r, dY, dW, dX, dB, N, K, M);
+            cuStreamSynchronize(r->stream);
+            struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+            int iters=200;
+            for (int it=0; it<iters; it++) op_gemm(r, dY, dW, dX, dB, N, K, M);
+            cuStreamSynchronize(r->stream);
+            clock_gettime(CLOCK_MONOTONIC,&t1);
+            double ms=((t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)*1e-6)/iters;
+            double tops=2.0*N*K*M/(ms*1e-3)/1e12;
+            fprintf(stderr,"    [perf] %-20s %.3f ms/call  %.1f TOPS\n", cases[c].label, ms, tops);
+        }
+
         /* CPU references */
         double dot=0,na=0,nb=0,maxabs=0, dotf=0,naf=0,nbf=0;
         for (int t=0;t<M;t++){
@@ -1689,6 +1703,33 @@ static int test_int8_gemm(void) {
         cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY);
         free(Wf);free(Xf);free(Bf);free(wscale);free(Wq);free(fat);free(Yg);free(Yg2);
     }
+
+    /* Perf-only at realistic n_tok (real workload: n_img=256 @256^2, 1024 @512^2). */
+    fprintf(stderr, "  --- perf at realistic M (no correctness) ---\n");
+    struct { int N,K,M; const char *l; } pc[] = {
+        {3072,3072,256,"attn M=256"}, {12288,3072,256,"mlp_fc1 M=256"},
+        {3072,12288,256,"mlp_fc2 M=256"}, {3072,3072,1024,"attn M=1024"},
+        {12288,3072,1024,"mlp_fc1 M=1024"},
+    };
+    for (int c=0;c<(int)(sizeof(pc)/sizeof(pc[0]));c++){
+        int N=pc[c].N,K=pc[c].K,M=pc[c].M; size_t nW=(size_t)N*K;
+        unsigned char *fat=(unsigned char*)calloc((size_t)N*4+nW,1);
+        for(int o=0;o<N;o++) ((float*)fat)[o]=0.01f;
+        CUdeviceptr dW=0,dX=0,dB=0,dY=0;
+        cuMemAlloc(&dW,(size_t)N*4+nW); cuMemcpyHtoD(dW,fat,(size_t)N*4+nW);
+        cuMemAlloc(&dX,(size_t)M*K*4); cuMemsetD8(dX,1,(size_t)M*K*4);
+        cuMemAlloc(&dB,(size_t)N*4); cuMemsetD8(dB,0,(size_t)N*4);
+        cuMemAlloc(&dY,(size_t)M*N*4);
+        for(int w=0;w<10;w++) op_gemm(r,dY,dW,dX,dB,N,K,M);
+        cuStreamSynchronize(r->stream);
+        struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+        int iters=100; for(int it=0;it<iters;it++) op_gemm(r,dY,dW,dX,dB,N,K,M);
+        cuStreamSynchronize(r->stream); clock_gettime(CLOCK_MONOTONIC,&t1);
+        double ms=((t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)*1e-6)/iters;
+        fprintf(stderr,"    %-16s %.3f ms/call  %.1f TOPS\n",pc[c].l,ms,2.0*N*K*M/(ms*1e-3)/1e12);
+        cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY); free(fat);
+    }
+
     cuda_qimg_free(r);
     fprintf(stderr, "RESULT: %s\n", all_ok?"PASS":"FAIL");
     return all_ok?0:1;
