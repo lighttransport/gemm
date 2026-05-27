@@ -115,6 +115,9 @@ typedef struct {
     int n_out, n_in, rank, group_size;
 } qimg_int4_linear;
 
+/* Upper bound on calibration slots = max blocks (64) * 12 main linears/block. */
+#define QIMG_CALIB_MAXSLOT (64 * 12)
+
 /* ---- Runner struct ---- */
 
 struct hip_qimg_runner {
@@ -245,6 +248,15 @@ struct hip_qimg_runner {
     int fp8_act_scale_clamp;
     int current_block;
     char current_gemm_label[64];
+
+    /* Activation-stats calibration (QIMG_CALIB_DUMP=<path>): per-(block,slot) per-input-channel
+     * max-abs of each main linear's input, collected in the bf16/fp8 path to drive offline
+     * SVDQuant smoothing. Lazily allocated on first hit; dumped (safetensors of F32 [n_in]) and
+     * freed in hip_qimg_free. Slot = block*12 + op_proj slot (0..11). */
+    const char *calib_dump_path;            /* non-NULL enables collection */
+    hipFunction_t fn_calib_amax;            /* amax_per_col_f32 */
+    float *calib_amax[QIMG_CALIB_MAXSLOT];  /* device [n_in] per main linear */
+    int    calib_nin[QIMG_CALIB_MAXSLOT];   /* n_in per slot (0 = unallocated) */
 };
 
 enum {
@@ -631,6 +643,12 @@ static int qimg_upload_int4_linear(st_context *st, const char *key, qimg_int4_li
     idx = safetensors_find(st, nm); if (idx < 0) return -1;
     const uint64_t *qs = safetensors_shape(st, idx);          /* [n_out, n_in/2] */
     L->n_out = (int)qs[0]; L->n_in = (int)(qs[1] * 2);
+    /* Group size from wscale columns: Nunchaku g64 -> n_in/64 cols; simple g16 -> n_in/16. */
+    snprintf(nm, sizeof(nm), "%s.wscale", key);
+    { int widx = safetensors_find(st, nm);
+      if (widx >= 0) { const uint64_t *ws = safetensors_shape(st, widx);
+        int wcols = (int)ws[safetensors_ndims(st, widx) - 1];
+        if (wcols > 0) L->group_size = L->n_in / wcols; } }
     snprintf(nm, sizeof(nm), "%s.lora_up", key);
     idx = safetensors_find(st, nm); if (idx >= 0) L->rank = (int)safetensors_shape(st, idx)[1];
     snprintf(nm, sizeof(nm), "%s.qint4", key);     L->qint4     = qimg_st_upload_raw(st, nm);
@@ -1066,6 +1084,14 @@ static void op_gemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bi
  * replaces the W-materialize later. L = &int4_linears[block*PER_BLOCK + slot]. X is F32 [n_tok,n_in]. */
 static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
     int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank;
+    /* Simple RTN int4-g16 path (no swizzle/LoRA/smooth): plain nibble + per-g16
+     * bf16 scale via the validated gemm_int4w_g16 kernel. */
+    if (gs == 16 && r->fn_gemm_int4w_g16) {
+        void *ga[] = {&Y, (void*)&L->qint4, (void*)&L->wscale, &X, (void*)&L->bias, &n_out, &n_in, &n_tok};
+        hipModuleLaunchKernel(r->fn_gemm_int4w_g16, (unsigned)((n_out+127)/128),
+                              (unsigned)((n_tok+127)/128), 1, 256, 1, 1, 0, NULL, ga, NULL);
+        return;
+    }
     /* fused W4A16: dequant-in-LDS bf16 WMMA (main+smooth+bias) — replaces dense materialize */
     void *ga[]={&Y,(void*)&L->qint4,&X,(void*)&L->bias,(void*)&L->wscale,(void*)&L->smooth,&n_out,&n_in,&n_tok};
     hipModuleLaunchKernel(r->fn_gemm_int4w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,ga,NULL);
@@ -1093,6 +1119,20 @@ static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4
 /* Route a block projection: int4 descriptor[blk*12+slot] when a logical-INT4 DiT is loaded, else BF16 weight. */
 static void op_proj(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                     int n_out, int n_in, int n_tok, int blk, int slot) {
+    /* Calibration: accumulate this linear's per-input-channel activation max-abs (offline SVDQuant smoothing).
+     * Hooks the activation X before the GEMM; works in the bf16/fp8 path (collected before any INT4 exists). */
+    if (r->calib_dump_path && r->fn_calib_amax && X && blk >= 0 && slot >= 0
+        && blk * 12 + slot < QIMG_CALIB_MAXSLOT) {
+        int idx = blk * 12 + slot;
+        if (!r->calib_amax[idx] && hipMalloc(&r->calib_amax[idx], (size_t)n_in * 4) == hipSuccess) {
+            hipMemset(r->calib_amax[idx], 0, (size_t)n_in * 4);
+            r->calib_nin[idx] = n_in;
+        }
+        if (r->calib_amax[idx]) {
+            void *ca[] = {&r->calib_amax[idx], &X, &n_tok, &n_in};
+            hipModuleLaunchKernel(r->fn_calib_amax, (unsigned)((n_in + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ca, NULL);
+        }
+    }
     if (r->use_int4 && r->int4_linears) { op_int4_linear(r, Y, X, &r->int4_linears[(size_t)blk*12 + slot], n_tok); return; }
     op_wgemm_bf16(r, Y, W, X, bias, n_out, n_in, n_tok);
 }
@@ -1407,9 +1447,8 @@ char g_hip_arch[64] = {0};  /* cached arch string (e.g. "gfx1201") */
  * bf16 weight to simple RTN int4-g16 on the host, run the kernel, and compare to
  * a CPU reference using the SAME dequantized weights (so it isolates kernel
  * arithmetic/indexing, not quant error). Gated by QIMG_INT4_SELFTEST. */
-static void qimg_int4_g16_selftest(hip_qimg_runner *r) {
+static void qimg_int4_g16_selftest_one(hip_qimg_runner *r, int M, int K, int N) {
     if (!r->fn_gemm_int4w_g16) { fprintf(stderr, "int4-g16 selftest: kernel missing\n"); return; }
-    int M = 128, K = 256, N = 256;            /* M=n_tok, K=n_in, N=n_out */
     float *X = (float*)malloc((size_t)M*K*4), *W = (float*)malloc((size_t)N*K*4);
     float *Wd = (float*)malloc((size_t)N*K*4); /* dequantized ref */
     unsigned char *q = (unsigned char*)calloc((size_t)N*(K/2),1);
@@ -1434,12 +1473,20 @@ static void qimg_int4_g16_selftest(hip_qimg_runner *r) {
     hipMemcpy(dX,X,(size_t)M*K*4,hipMemcpyHostToDevice); hipMemcpy(dq,q,(size_t)N*(K/2),hipMemcpyHostToDevice); hipMemcpy(dsc,sc,(size_t)N*(K/16)*2,hipMemcpyHostToDevice);
     void *bias=NULL; void *args[]={&dY,&dq,&dsc,&dX,&bias,&N,&K,&M};
     hipModuleLaunchKernel(r->fn_gemm_int4w_g16,(unsigned)((N+127)/128),(unsigned)((M+127)/128),1,256,1,1,0,NULL,args,NULL);
-    hipDeviceSynchronize();
+    hipError_t le = hipDeviceSynchronize();
     float *Yg=(float*)malloc((size_t)M*N*4); hipMemcpy(Yg,dY,(size_t)M*N*4,hipMemcpyDeviceToHost);
     double dot=0,nr=0,ng=0,mx=0; for(int i=0;i<M*N;i++){double a=Yr[i],b=Yg[i];dot+=a*b;nr+=a*a;ng+=b*b;double d=fabs(a-b);if(d>mx)mx=d;}
-    fprintf(stderr,"hip_qimg: int4-g16 GEMM selftest M%d K%d N%d  cos=%.6f  max_abs=%.4e  %s\n",
-        M,K,N, dot/(sqrt(nr)*sqrt(ng)+1e-30), mx, (dot/(sqrt(nr)*sqrt(ng)+1e-30))>0.9999?"PASS":"FAIL");
+    double cosv = dot/(sqrt(nr)*sqrt(ng)+1e-30);
+    fprintf(stderr,"hip_qimg: int4-g16 selftest M%-4d K%-5d N%-5d  cos=%.6f  max=%.3e  sync_err=%d  %s\n",
+        M,K,N, cosv, mx, le, (le==0 && cosv>0.9999)?"PASS":"FAIL");
     hipFree(dX);hipFree(dq);hipFree(dsc);hipFree(dY); free(X);free(W);free(Wd);free(q);free(sc);free(Yr);free(Yg);
+}
+static void qimg_int4_g16_selftest(hip_qimg_runner *r) {
+    /* Real DiT linear shapes (N=n_out, K=n_in) at n_tok 256 (img) and 12 (txt). */
+    int shapes[][2] = {{3072,3072},{3072,3584},{12288,3072},{3072,12288},{18432,3072}};
+    int Ms[3] = {256, 12, 1};   /* img, txt, modulation (n_tok=1) */
+    for (int t = 0; t < 3; t++)
+        for (int s = 0; s < 5; s++) qimg_int4_g16_selftest_one(r, Ms[t], shapes[s][1], shapes[s][0]);
 }
 
 hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
@@ -1512,6 +1559,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
             r->fp8_act_scale_scalar = 1;
         if (e && (!strcmp(e, "clamp") || !strcmp(e, "safe") || !strcmp(e, "safe_scalar")))
             r->fp8_act_scale_clamp = 1;
+        r->calib_dump_path = getenv("QIMG_CALIB_DUMP");  /* enables per-linear activation max-abs collection */
+        if (r->calib_dump_path && !r->calib_dump_path[0]) r->calib_dump_path = NULL;
     }
 
     #define GET(field, name) hipModuleGetFunction(&r->field, mod, name)
@@ -1560,6 +1609,10 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_w_int8_rt, "w_int8_roundtrip_g64");
     GET(fn_w_int4_rt, "w_int4_roundtrip_g16");
     GET(fn_gemm_int4w_g16, "gemm_int4w_g16_bf16a_wmma_t");
+    GET(fn_calib_amax, "amax_per_col_f32");
+    if (r->calib_dump_path)
+        fprintf(stderr, "hip_qimg: QIMG_CALIB_DUMP active -> %s (collecting per-linear activation max-abs)\n",
+                r->calib_dump_path);
     GET(fn_vae_conv2d, "vae_conv2d_f32");
     if (hipModuleGetFunction(&r->fn_vae_conv2d_3x3_wmma, mod, "vae_conv2d_3x3_wmma_f32") != hipSuccess)
         r->fn_vae_conv2d_3x3_wmma = NULL;
@@ -2193,11 +2246,48 @@ int hip_qimg_load_vae(hip_qimg_runner *r, const char *path) {
     return 0;
 }
 
+/* Write collected calibration stats as a minimal safetensors of F32 [n_in] vectors keyed
+ * transformer_blocks.{b}.{suffix}.amax — consumed by tools/svdquant_from_bf16.py --calib. */
+static void qimg_calib_dump(hip_qimg_runner *r) {
+    if (!r->calib_dump_path) return;
+    size_t total_floats = 0; int present = 0;
+    for (int idx = 0; idx < QIMG_CALIB_MAXSLOT; idx++)
+        if (r->calib_amax[idx]) { total_floats += (size_t)r->calib_nin[idx]; present++; }
+    if (!present) { fprintf(stderr, "hip_qimg: calib dump: no stats collected (run with a bf16/fp8 DiT)\n"); return; }
+    char *json = (char *)malloc((size_t)present * 256 + 64);
+    float *data = (float *)malloc(total_floats * 4);
+    if (!json || !data) { free(json); free(data); fprintf(stderr, "hip_qimg: calib dump: OOM\n"); return; }
+    size_t jp = 0, foff = 0; int first = 1;
+    jp += sprintf(json + jp, "{");
+    for (int b = 0; b < QIMG_CALIB_MAXSLOT / QIMG_INT4_PER_BLOCK; b++)
+        for (int s = 0; s < QIMG_INT4_PER_BLOCK; s++) {
+            int idx = b * QIMG_INT4_PER_BLOCK + s;
+            if (!r->calib_amax[idx]) continue;
+            int nin = r->calib_nin[idx];
+            hipMemcpy(data + foff, r->calib_amax[idx], (size_t)nin * 4, hipMemcpyDeviceToHost);
+            jp += sprintf(json + jp,
+                "%s\"transformer_blocks.%d.%s.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                first ? "" : ",", b, qimg_int4_linear_suffix[s], nin, foff * 4, (foff + (size_t)nin) * 4);
+            foff += (size_t)nin; first = 0;
+        }
+    jp += sprintf(json + jp, "}");
+    while (jp % 8) json[jp++] = ' ';                 /* pad header to 8-byte alignment */
+    FILE *f = fopen(r->calib_dump_path, "wb");
+    if (!f) { fprintf(stderr, "hip_qimg: calib dump: cannot open %s\n", r->calib_dump_path); free(json); free(data); return; }
+    uint64_t hlen = (uint64_t)jp;
+    fwrite(&hlen, 8, 1, f); fwrite(json, 1, jp, f); fwrite(data, 4, foff, f); fclose(f);
+    fprintf(stderr, "hip_qimg: calib dump wrote %d vectors (%zu floats) -> %s\n", present, foff, r->calib_dump_path);
+    free(json); free(data);
+}
+
 /* ---- Free ---- */
 
 void hip_qimg_free(hip_qimg_runner *r) {
     if (!r) return;
     qimg_print_gemm_summary(r);
+    qimg_calib_dump(r);
+    for (int idx = 0; idx < QIMG_CALIB_MAXSLOT; idx++)
+        if (r->calib_amax[idx]) { hipFree(r->calib_amax[idx]); r->calib_amax[idx] = NULL; }
     qimg_free_block(&r->stream_blk[0]);
     qimg_free_block(&r->stream_blk[1]);
     if (r->gpu_blocks) {
@@ -2409,7 +2499,12 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
          * blocking — the dominant denoise overhead (see attention profile note). */
         qimg_block_gpu blk;
         int need_free = 0;
-        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+        if (r->use_int4) {
+            /* INT4: weights live in int4_linears/int4_mod; gpu_blocks[L] holds only the
+             * per-head norm weights (attn_q_w is intentionally NULL). Use it directly —
+             * never stream (the int4 checkpoint has no fp8/bf16 QKV to stream). */
+            blk = r->gpu_blocks[L];
+        } else if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
             blk = r->gpu_blocks[L];
         } else if (r->use_block_stream_db) {
             qimg_load_block_s(r, L, &r->stream_blk[0], 0);
