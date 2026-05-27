@@ -1293,6 +1293,7 @@ struct cuda_qimg_runner {
     /* INT8 W8A8 dynamic path (auto-enabled when DiT weights load as I8).
      * Bit-exact int8xint8->int32 GEMM for reproducible CUDA<->HIP verify. */
     int use_int8;
+    int use_int8_smooth;   /* SmoothQuant variant: fat buffer has a [n_in] smooth scale */
     CUfunction quant_act_perrow_int8;   /* X f32 -> Xq int8 + xscale[n_tok] */
     CUfunction gemm_w8a8_perrow;        /* int8 GEMM, naive (any shape) */
     CUfunction gemm_int8_s32;           /* OUR pure int8 mma GEMM -> int32 (no cuBLAS) */
@@ -1644,37 +1645,63 @@ static int qimg_int8_scale_name(const char *wname, char *out, size_t outsz) {
     return 0;
 }
 
-/* Resident (synchronous) fat upload. Returns device ptr or 0. */
-static CUdeviceptr qimg_st_upload_int8_fat(st_context *st, const char *wname) {
+/* SmoothQuant per-input-channel scale companion name (<base>.smooth_scale). */
+static int qimg_int8_smooth_name(const char *wname, char *out, size_t outsz) {
+    size_t L = strlen(wname);
+    if (L < 7 || strcmp(wname + L - 7, ".weight") != 0) return -1;
+    snprintf(out, outsz, "%.*s.smooth_scale", (int)(L - 7), wname);
+    return 0;
+}
+
+/* Resident (synchronous) fat upload. Returns device ptr or 0.
+ * Layout: [wscale n_out f32] [smooth n_in f32 (if with_smooth)] [wq n_out*n_in i8]. */
+static CUdeviceptr qimg_st_upload_int8_fat(st_context *st, const char *wname, int with_smooth) {
     int widx = safetensors_find(st, wname);
     if (widx < 0) return 0;
-    char sname[256];
+    char sname[256], mname[256];
     if (qimg_int8_scale_name(wname, sname, sizeof(sname)) != 0) return 0;
     int sidx = safetensors_find(st, sname);
     if (sidx < 0) return 0;
     size_t wbytes = safetensors_nbytes(st, widx);
     size_t sbytes = safetensors_nbytes(st, sidx);
-    CUdeviceptr d = checked_cuMemAlloc(sbytes + wbytes);
+    int midx = -1; size_t mbytes = 0;
+    if (with_smooth) {
+        if (qimg_int8_smooth_name(wname, mname, sizeof(mname)) != 0) return 0;
+        midx = safetensors_find(st, mname);
+        if (midx < 0) return 0;
+        mbytes = safetensors_nbytes(st, midx);
+    }
+    CUdeviceptr d = checked_cuMemAlloc(sbytes + mbytes + wbytes);
     if (!d) return 0;
     cuMemcpyHtoD(d, safetensors_data(st, sidx), sbytes);
-    cuMemcpyHtoD(d + sbytes, safetensors_data(st, widx), wbytes);
+    if (with_smooth) cuMemcpyHtoD(d + sbytes, safetensors_data(st, midx), mbytes);
+    cuMemcpyHtoD(d + sbytes + mbytes, safetensors_data(st, widx), wbytes);
     return d;
 }
 
-/* Streaming (async) fat upload into a pre-sized fat slot (scale then weight).
- * Slot must be sbytes+wbytes (see qimg_alloc_scratch_block int8 sizing). */
+/* Streaming (async) fat upload into a pre-sized fat slot.
+ * Layout matches qimg_st_upload_int8_fat (with_smooth from r->use_int8_smooth). */
 static int qimg_upload_int8_fat_async_r(struct cuda_qimg_runner *r, st_context *st,
                                         const char *wname, CUdeviceptr dst, CUstream s) {
     int widx = safetensors_find(st, wname);
     if (widx < 0) return -1;
-    char sname[256];
+    char sname[256], mname[256];
     if (qimg_int8_scale_name(wname, sname, sizeof(sname)) != 0) return -1;
     int sidx = safetensors_find(st, sname);
     if (sidx < 0) return -1;
     size_t wbytes = safetensors_nbytes(st, widx);
     size_t sbytes = safetensors_nbytes(st, sidx);
+    size_t mbytes = 0; int midx = -1;
+    if (r->use_int8_smooth) {
+        if (qimg_int8_smooth_name(wname, mname, sizeof(mname)) != 0) return -1;
+        midx = safetensors_find(st, mname);
+        if (midx < 0) return -1;
+        mbytes = safetensors_nbytes(st, midx);
+    }
     cuMemcpyHtoDAsync(dst, qimg_tensor_host_src(r, st, sidx), sbytes, s);
-    cuMemcpyHtoDAsync(dst + sbytes, qimg_tensor_host_src(r, st, widx), wbytes, s);
+    if (r->use_int8_smooth)
+        cuMemcpyHtoDAsync(dst + sbytes, qimg_tensor_host_src(r, st, midx), mbytes, s);
+    cuMemcpyHtoDAsync(dst + sbytes + mbytes, qimg_tensor_host_src(r, st, widx), wbytes, s);
     return 0;
 }
 
@@ -1754,7 +1781,7 @@ static int qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b
     #define BLK_W(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_int8) { \
-            b->field = qimg_st_upload_int8_fat(st, name); \
+            b->field = qimg_st_upload_int8_fat(st, name, r->use_int8_smooth); \
         } else if (r->use_fp8_gemm) { \
             b->field = qimg_st_upload_fp8_raw(st, name); \
         } else if (r->use_f16_gemm) { \
@@ -1831,7 +1858,8 @@ static int qimg_alloc_scratch_block(cuda_qimg_runner *r) {
         size_t _nb = safetensors_nbytes(st, _ti); \
         if (r->use_int8) { \
             const uint64_t *_sh = safetensors_shape(st, _ti); \
-            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-channel scale */ \
+            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-out-channel scale */ \
+            if (r->use_int8_smooth) _nb += (size_t)_sh[1] * sizeof(float); /* + per-in smooth */ \
         } \
         if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
     } } while(0)
@@ -1907,7 +1935,8 @@ static int qimg_alloc_scratch_block_b(cuda_qimg_runner *r) {
         size_t _nb = safetensors_nbytes(st, _ti); \
         if (r->use_int8) { \
             const uint64_t *_sh = safetensors_shape(st, _ti); \
-            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-channel scale */ \
+            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-out-channel scale */ \
+            if (r->use_int8_smooth) _nb += (size_t)_sh[1] * sizeof(float); /* + per-in smooth */ \
         } \
         if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
     } } while(0)
@@ -2127,10 +2156,16 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
     /* INT8 W8A8 dynamic path — highest priority when enabled. Quantizes X
      * per-token-row to int8, does int8xint8->int32 GEMM (bit-exact across HW),
      * dequants with xscale[t]*wscale[o], adds bias. The weight pointer W is a
-     * fat buffer: [wscale: n_out f32][wq: n_out*n_in int8]. */
+     * fat buffer: [wscale: n_out f32][smooth: n_in f32 (SmoothQuant only)][wq: n_out*n_in int8]. */
     if (r->use_int8 && r->gemm_w8a8_perrow && r->quant_act_perrow_int8) {
         CUdeviceptr wscale = W;
-        CUdeviceptr Wq = W + (size_t)n_out * sizeof(float);
+        /* SmoothQuant: per-input-channel scale s lives between wscale and wq;
+         * the activation is divided by s in the quant (W was pre-multiplied by s
+         * offline, so the GEMM math is unchanged but quantizes far more cleanly). */
+        CUdeviceptr smooth = r->use_int8_smooth ? (W + (size_t)n_out * sizeof(float)) : 0;
+        size_t woff = (size_t)n_out * sizeof(float)
+                    + (r->use_int8_smooth ? (size_t)n_in * sizeof(float) : 0);
+        CUdeviceptr Wq = W + woff;
 
         /* Conforming-shape int8 GEMM: quant X -> int8, int32 GEMM, dequant to bf16.
          * The GEMM is OUR OWN gemm_int8_s32 mma kernel by default (no cuBLAS, so the
@@ -2166,7 +2201,7 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                 else { r->yi32_int8_n = 0; ok = 0; }
             }
             if (ok) {
-                void *qa[] = {&X, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+                void *qa[] = {&X, &smooth, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
                 cuLaunchKernel(r->quant_act_perrow_int8, (unsigned)n_tok, 1, 1,
                                256, 1, 1, 0, r->stream, qa, NULL);
                 int gemm_ran = 0;
@@ -2213,7 +2248,7 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
             else r->x_iscale_n = 0;
         }
         if (r->d_xq_int8 && r->d_x_iscale) {
-            void *qa[] = {&X, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+            void *qa[] = {&X, &smooth, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
             cuLaunchKernel(r->quant_act_perrow_int8, (unsigned)n_tok, 1, 1,
                            256, 1, 1, 0, r->stream, qa, NULL);
             void *ga[] = {&Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale, &bias,
@@ -3083,8 +3118,12 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
 static const char *int8_kernels_src =
 "extern \"C\" {\n"
 /* Per-token-row activation quant: one CTA per row, 256 threads. Writes
- * xq[n_tok,n_in] (int8) and xscale[n_tok]. Same max-reduce as the fp8 path. */
-"__global__ void quant_act_perrow_int8(const float *X, signed char *Xq,\n"
+ * xq[n_tok,n_in] (int8) and xscale[n_tok]. Same max-reduce as the fp8 path.
+ * Optional SmoothQuant: if `smooth` (per-input-channel s[n_in]) is non-NULL, the
+ * effective activation is X[i]/smooth[i] (outliers migrated into the weights
+ * offline as W*s), which makes the per-token int8 scale far less coarse. */
+"__global__ void quant_act_perrow_int8(const float *X, const float *smooth,\n"
+"                                      signed char *Xq,\n"
 "                                      float *xscale, int n_tok, int n_in) {\n"
 "    int row = blockIdx.x;\n"
 "    if (row >= n_tok) return;\n"
@@ -3092,7 +3131,8 @@ static const char *int8_kernels_src =
 "    signed char *qr = Xq + (long)row * n_in;\n"
 "    float v = 0.0f;\n"
 "    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {\n"
-"        float a = fabsf(xr[i]); if (a > v) v = a;\n"
+"        float xe = smooth ? (xr[i] / smooth[i]) : xr[i];\n"
+"        float a = fabsf(xe); if (a > v) v = a;\n"
 "    }\n"
 "    for (int off = 16; off > 0; off >>= 1) {\n"
 "        float o = __shfl_xor_sync(0xFFFFFFFF, v, off); if (o > v) v = o;\n"
@@ -3115,7 +3155,8 @@ static const char *int8_kernels_src =
 "    __syncthreads();\n"
 "    float sc = s_scale;\n"
 "    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {\n"
-"        float q = rintf(xr[i] / sc);\n"
+"        float xe = smooth ? (xr[i] / smooth[i]) : xr[i];\n"
+"        float q = rintf(xe / sc);\n"
 "        if (q > 127.0f) q = 127.0f; else if (q < -127.0f) q = -127.0f;\n"
 "        qr[i] = (signed char)q;\n"
 "    }\n"
@@ -3655,7 +3696,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
 static CUdeviceptr qimg_upload_weight_auto(cuda_qimg_runner *r,
                                             st_context *st, const char *name) {
     if (r->use_int8)
-        return qimg_st_upload_int8_fat(st, name);
+        return qimg_st_upload_int8_fat(st, name, r->use_int8_smooth);
     if (r->use_fp8_gemm)
         return qimg_st_upload_fp8_raw(st, name);
     if (r->use_f16_gemm)
@@ -3725,7 +3766,13 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
             r->use_fp8_pipe_perrow = 0; r->use_fp8_pipe = 0;
             r->use_fp8_mma = 0; r->use_fp8_mma_bf16 = 0; r->use_bf16_mma = 0;
             r->use_cublaslt_fp8 = 0;
-            fprintf(stderr, "cuda_qimg: INT8 W8A8 weights detected — bit-exact int8 GEMM path\n");
+            /* SmoothQuant variant: a per-input-channel .smooth_scale companion
+             * exists. The fat buffer then carries [wscale][smooth][wq] and the
+             * quant divides X by smooth (W was pre-scaled by smooth offline). */
+            r->use_int8_smooth =
+                (safetensors_find(st, "transformer_blocks.0.attn.to_q.smooth_scale") >= 0);
+            fprintf(stderr, "cuda_qimg: INT8 W8A8 weights detected — bit-exact int8 GEMM path%s\n",
+                    r->use_int8_smooth ? " (SmoothQuant)" : "");
             /* Default int8 GEMM = OUR gemm_int8_s32 mma kernel (no cuBLAS dependency,
              * so the HIP port can mirror it exactly). cuBLAS int8 GemmEx is set up as
              * the bit-exact verification oracle (both compute the exact int32 sum):
