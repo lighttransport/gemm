@@ -5,8 +5,11 @@ One HTTP service that dispatches /v1/infer across backends for a
 text-to-image prompt:
 
   - "ours-cpu":     shells out to cpu/qwen_image/test_qwen_image --generate <dit> <vae> <enc>
-  - "ours-cuda":    (advertised only if cuda/qwen_image/test_cuda_qwen_image exists)
+  - "ours-cuda":    cuda/qimg/test_cuda_qimg (advertised only when built); the dit
+                    selects FP8 vs native W4A4 FP4 (NVFP4 OMMA, sm_120a) by its keys
   - "pytorch-cuda": shells out to ref/qwen_image/gen_diffusers_reference.py
+
+Pages served: /qwen_image_compare (generic compare) and /qwen-image-fp4 (FP4 vs FP8).
 
 Variants register {dit, vae, text_encoder} triplets by convention.
 Each variant directory is expected to contain::
@@ -35,6 +38,7 @@ import glob
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -54,12 +58,77 @@ def _cors_headers(handler):
 
 def _json(handler, status, payload):
     body = json.dumps(payload).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("content-type", "application/json")
-    handler.send_header("content-length", str(len(body)))
-    _cors_headers(handler)
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.send_response(status)
+        handler.send_header("content-type", "application/json")
+        handler.send_header("content-length", str(len(body)))
+        _cors_headers(handler)
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionError) as e:
+        # Client hung up before we could reply — common when a long one-shot
+        # generation outlasts the client's patience / a proxy idle-timeout.
+        # The work already happened; just don't crash the worker thread.
+        sys.stderr.write(f"[qwen] client disconnected before response sent ({e})\n")
+
+
+# ---- Live progress for the single in-flight inference job -----------------
+# Mirrors the C server's /v1/progress snapshot (server/server.c) so the web UI
+# can poll phase + DiT step count while a one-shot generation runs. The CUDA
+# runner already prints phase/step lines to stderr; OursCudaBackend streams and
+# parses them into this snapshot.
+_PROG_LOCK = threading.Lock()
+_PROG = {"active": False, "job_id": 0, "model": "qwen-image", "precision": "",
+         "phase": "idle", "dit_step": 0, "dit_total": 0, "gpu": "", "_t0": 0.0}
+
+def _prog_begin(precision):
+    with _PROG_LOCK:
+        _PROG.update(active=True, job_id=_PROG["job_id"] + 1, precision=str(precision or ""),
+                     phase="starting", dit_step=0, dit_total=0, gpu="", _t0=time.time())
+
+def _prog_set(**kw):
+    with _PROG_LOCK:
+        _PROG.update(kw)
+
+def _prog_end():
+    with _PROG_LOCK:
+        _PROG.update(active=False, phase="idle")
+
+def _prog_snapshot():
+    with _PROG_LOCK:
+        p = dict(_PROG)
+    t0 = p.pop("_t0", 0.0)
+    p["ok"] = True
+    p["elapsed_ms"] = round((time.time() - t0) * 1000.0) if p["active"] else 0
+    return p
+
+# Parse a runner stderr line into a progress update (returns dict or None).
+_STEP_RE = re.compile(r"step (\d+)/(\d+)")
+_DENOISE_RE = re.compile(r"DiT denoising \((\d+) steps")
+# Device line is "cuda_qimg: <name> (sm_NNN, X.Y GB)". The greedy ".*" anchors to
+# the LAST "cuda_qimg: " before "(sm_", and "[^(]+?" keeps the name even when the
+# runner's interleaved stdout/stderr merges several prints into one read.
+_DEV_RE = re.compile(r".*cuda_qimg: ([^(]+?) \(sm_\d")
+
+def _parse_progress_line(line):
+    m = _STEP_RE.search(line)
+    if m:
+        return {"phase": "dit", "dit_step": int(m.group(1)), "dit_total": int(m.group(2))}
+    m = _DENOISE_RE.search(line)
+    if m:
+        return {"phase": "dit", "dit_total": int(m.group(1))}
+    m = _DEV_RE.search(line)
+    if m:
+        return {"gpu": m.group(1).strip()}
+    if "[1/3]" in line or "Text conditioning" in line:
+        return {"phase": "encode"}
+    if "loading DiT" in line:
+        return {"phase": "dit_load"}
+    if "loading VAE" in line:
+        return {"phase": "vae_load"}
+    if "[3/3]" in line or "VAE decode" in line:
+        return {"phase": "vae"}
+    return None
 
 
 # ---- Variant triplet discovery -------------------------------------------
@@ -111,10 +180,34 @@ def detect_kind(dit_path):
 
 class Variant:
     __slots__ = ("name", "model_dir", "dit", "vae", "enc", "kind")
-    def __init__(self, name, model_dir):
+    def __init__(self, name, spec):
+        """spec is "PATH" or "PATH@ROOT":
+          - PATH = a model DIRECTORY (auto-detect dit/vae/enc), or an explicit dit FILE
+            (vae/enc auto-detected from the dit's grandparent model root).
+          - optional @ROOT sources vae/enc from a DIFFERENT model root, so a dit can run
+            with another model's encoder/VAE — e.g. the canonical FP8 dit in qwen-image-st/
+            (whose only encoder is a .safetensors) reuses the qwen-image gguf encoder + VAE,
+            making FP4 vs FP8 apples-to-apples (only the DiT differs)."""
         self.name = name
-        self.model_dir = os.path.abspath(model_dir)
-        self.dit, self.vae, self.enc = detect_triplet(self.model_dir)
+        if "@" in spec:
+            dit_path, root = spec.split("@", 1)
+            dit_path, root = os.path.abspath(dit_path.strip()), os.path.abspath(root.strip())
+            if not os.path.isfile(dit_path):
+                raise FileNotFoundError(f"variant '{name}': part before '@' must be a dit file: {dit_path}")
+            self.dit = dit_path
+            self.model_dir = root
+            _, self.vae, self.enc = detect_triplet(root)
+        else:
+            p = os.path.abspath(spec)
+            if os.path.isfile(p):
+                # Explicit dit file: use it; auto-detect vae/enc from the model root (grandparent).
+                # Lets several dits in one diffusion-models/ dir register as distinct variants.
+                self.dit = p
+                self.model_dir = os.path.dirname(os.path.dirname(p))
+                _, self.vae, self.enc = detect_triplet(self.model_dir)
+            else:
+                self.model_dir = p
+                self.dit, self.vae, self.enc = detect_triplet(self.model_dir)
         self.kind = detect_kind(self.dit)
 
 
@@ -125,7 +218,7 @@ def parse_variants_arg(s):
         piece = piece.strip()
         if not piece: continue
         if ":" not in piece:
-            raise ValueError(f"bad --variants entry '{piece}'; want name:dir")
+            raise ValueError(f"bad --variants entry '{piece}'; want name:dir|ditfile[@root]")
         name, d = piece.split(":", 1)
         out.append(Variant(name.strip(), d.strip()))
     return out
@@ -184,7 +277,14 @@ class OursCpuBackend:
 
 
 class OursCudaBackend:
-    """cuda/qwen_image/test_cuda_qwen_image — optional, advertised only when built."""
+    """cuda/qimg/test_cuda_qimg --generate --dit <> --vae <> --enc <> --prompt ... --out <ppm>.
+
+    Native CUDA runner. The dit auto-selects its path by the checkpoint's keys:
+    a Nunchaku NVFP4 OMMA checkpoint (transformer_blocks.0.attn.to_q.qweight_fp4)
+    runs the native W4A4 FP4 GEMM on sm_120a; an FP8 checkpoint runs the FP8 path.
+    So 'fp4' vs 'fp8' is just a different --dit. One-shot per request (reloads
+    weights each call), so expect ~tens of seconds per generation.
+    """
     def __init__(self, bin_path):
         self.bin = os.path.abspath(bin_path)
         self.lock = threading.Lock()
@@ -200,20 +300,45 @@ class OursCudaBackend:
         height = int(req.get("height") or 256)
         steps  = int(req.get("steps")  or 20)
         seed   = int(req.get("seed")   or 42)
+        # The runner's NVRTC FP4 (sm_120a) path needs CUDA 12.9 libs + the driver.
+        env = dict(os.environ)
+        cuda_libs = "/usr/local/cuda-12.9/lib64:/usr/local/cuda/lib64"
+        env["LD_LIBRARY_PATH"] = (
+            cuda_libs + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""))
         with self.lock, tempfile.TemporaryDirectory() as td:
-            out_path = os.path.join(td, "out.png")
-            cmd = [self.bin, "--generate", variant.dit, variant.vae, variant.enc,
+            out_path = os.path.join(td, "out.ppm")
+            cmd = [self.bin, "--generate",
+                   "--dit", variant.dit, "--vae", variant.vae, "--enc", variant.enc,
                    "--prompt", prompt,
                    "--width", str(width), "--height", str(height),
                    "--steps", str(steps), "--seed", str(seed),
                    "--out", out_path]
             t0 = time.time()
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            # Stream the runner's stdout+stderr line-by-line so GET /v1/progress
+            # reflects the live phase + per-step timing while it runs (the runner
+            # prints "[1/3]…", "step N/M …s", "[3/3]…"). cwd=td keeps the runner's
+            # stray latent dumps (cuda_latent*.npy/bin) out of the repo.
+            _prog_begin(variant.name)
+            tail = []
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True,
+                                        bufsize=1, cwd=td, env=env)
+                for line in proc.stdout:
+                    tail.append(line)
+                    if len(tail) > 120:
+                        del tail[0]
+                    upd = _parse_progress_line(line)
+                    if upd:
+                        _prog_set(**upd)
+                rc = proc.wait()
+            finally:
+                _prog_end()
             dt_ms = int((time.time() - t0) * 1000)
-            if proc.returncode != 0 or not os.path.isfile(out_path):
+            if rc != 0 or not os.path.isfile(out_path):
                 raise RuntimeError(
-                    f"ours-cuda({variant.name}) failed (rc={proc.returncode}):\n"
-                    f"stderr tail:\n{proc.stderr[-2000:]}")
+                    f"ours-cuda({variant.name}) failed (rc={rc}):\n"
+                    f"output tail:\n{''.join(tail)[-2000:]}")
             _, png = _read_image_file(out_path)
         return png, (width, height), dt_ms
 
@@ -290,11 +415,19 @@ def make_handler(backends, variants, default_variant, web_root):
                     os.path.join(web_root, "qwen_image_compare.html"),
                     "text/html; charset=utf-8")
                 return
+            if path in ("/qwen-image-fp4", "/qwen-image-fp4.html", "/qwen_image_fp4"):
+                self._serve_file(
+                    os.path.join(web_root, "qwen-image-fp4.html"),
+                    "text/html; charset=utf-8")
+                return
             if path == "/health":
                 _json(self, 200, {"ok": True,
                                   "backends": sorted(backends.keys()),
                                   "variants": [{"name": v.name, "kind": v.kind}
                                                for v in variants.values()]})
+                return
+            if path in ("/progress", "/v1/progress"):
+                _json(self, 200, _prog_snapshot())
                 return
             if path in ("/models", "/v1/models"):
                 _json(self, 200, {"ok": True, "models": [
@@ -385,8 +518,8 @@ def main():
                     default=os.path.join(repo_root, "cpu", "qwen_image",
                                          "test_qwen_image"))
     ap.add_argument("--cuda-bin",
-                    default=os.path.join(repo_root, "cuda", "qwen_image",
-                                         "test_cuda_qwen_image"))
+                    default=os.path.join(repo_root, "cuda", "qimg",
+                                         "test_cuda_qimg"))
     ap.add_argument("--ref-script",
                     default=os.path.join(here, "gen_diffusers_reference.py"))
     ap.add_argument("--ref-python", default=sys.executable,

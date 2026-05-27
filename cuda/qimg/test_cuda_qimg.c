@@ -1804,6 +1804,7 @@ int main(int argc, char **argv) {
     const char *enc_st_path = getenv("QIMG_TEXT_ENCODER_ST");
     const char *prompt = "a red apple on a white table";
     int custom_prompt = 0;
+    const char *out_path = "cuda_qimg_output.ppm";  /* --generate image output (PPM) */
     const char *mode = NULL;
     int out_h = 256, out_w = 256, n_steps = 20;
     int force_f16 = 0, no_cfg = 0;
@@ -1831,6 +1832,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--width") == 0 && i+1 < argc) out_w = atoi(argv[++i]);
         else if (strcmp(argv[i], "--steps") == 0 && i+1 < argc) n_steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (uint64_t)atoll(argv[++i]);
+        else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out_path = argv[++i];
     }
 
     if (mode && strcmp(mode, "kernels") == 0) return test_kernels();
@@ -1839,7 +1841,7 @@ int main(int argc, char **argv) {
     if (!mode) {
         fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--test-kernels|--generate\n"
                 "  --dit <st>  --vae <st>  --enc <gguf>  --enc-st <st>  --prompt <text>\n"
-                "  --height <h>  --width <w>  --steps <n>  --seed <s>  --no-fp8\n", argv[0]);
+                "  --height <h>  --width <w>  --steps <n>  --seed <s>  --out <ppm>  --no-fp8\n", argv[0]);
         return 1;
     }
 
@@ -2355,7 +2357,7 @@ int main(int argc, char **argv) {
         free(latent);
 
         /* Save */
-        save_ppm("cuda_qimg_output.ppm", rgb, out_h, out_w);
+        save_ppm(out_path, rgb, out_h, out_w);
         free(rgb);
     }
 
