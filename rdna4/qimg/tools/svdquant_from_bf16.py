@@ -113,6 +113,7 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--clip", type=float, default=1e3, help="clamp range for smoothing lambda")
     ap.add_argument("--no-smooth", action="store_true")
+    ap.add_argument("--mod-rtn", action="store_true", help="quantize modulation with plain RTN (old behavior) instead of SVDQuant")
     ap.add_argument("--check", action="store_true", help="print per-linear reconstruction cosine")
     a = ap.parse_args()
     torch.manual_seed(0)
@@ -159,11 +160,21 @@ def main():
                 cos, rel = reconstruct_and_check(W, lam, lora_up, lora_down_emit, qint4, wscale, a.group)
                 cos_acc.append(cos)
                 print(f"  b{b:02d} {suf:18s} out={W.shape[0]:5d} in={W.shape[1]:5d} r={r} cos={cos:.5f} rel={rel:.4f}", file=sys.stderr)
-        for suf in MOD:                                                        # weight-only RTN g64, rank 0
-            W = src.get_tensor(p + suf + ".weight").float()
-            qint4, wscale = quant_int4_g64(W, a.group)
-            out_t[p + suf + ".qint4"] = qint4
-            out_t[p + suf + ".wscale"] = wscale
+        for suf in MOD:                                                        # SVDQuant rank-r (weight-only) — was RTN
+            W = src.get_tensor(p + suf + ".weight").float()                    # [6*hidden, hidden]
+            if a.mod_rtn:
+                qint4, wscale = quant_int4_g64(W, a.group)
+                out_t[p + suf + ".qint4"] = qint4; out_t[p + suf + ".wscale"] = wscale
+            else:
+                # Modulation drives per-token adaLN scale/shift for every token+block; plain RTN
+                # injects high-frequency speckle. Give it the rank-r low-rank + INT4-g64 residual
+                # treatment (weight-only; no calib stats for the time-embedding input).
+                lu, ld, R, _ = svd_lowrank_branch(W, a.rank)
+                qint4, wscale = quant_int4_g64(R, a.group)
+                out_t[p + suf + ".qint4"] = qint4
+                out_t[p + suf + ".wscale"] = wscale
+                out_t[p + suf + ".lora_down"] = ld.to(torch.bfloat16)
+                out_t[p + suf + ".lora_up"] = lu.to(torch.bfloat16)
             out_t[p + suf + ".bias"] = src.get_tensor(p + suf + ".bias").float()
         for suf in NORMS:                                                      # bf16 passthrough
             out_t[p + suf + ".weight"] = src.get_tensor(p + suf + ".weight").to(torch.bfloat16)
