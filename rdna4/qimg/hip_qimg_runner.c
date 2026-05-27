@@ -118,6 +118,15 @@ typedef struct {
 /* Upper bound on calibration slots = max blocks (64) * 12 main linears/block. */
 #define QIMG_CALIB_MAXSLOT (64 * 12)
 
+/* INT8 W8A8: 14 quantized linears per block (12 main + img_mod.1 + txt_mod.1). */
+#define QIMG_I8_PER_BLOCK 14
+static const char *const qimg_i8_suffix[QIMG_I8_PER_BLOCK] = {
+    "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
+    "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
+    "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2",
+    "img_mod.1", "txt_mod.1",
+};
+
 /* ---- Runner struct ---- */
 
 struct hip_qimg_runner {
@@ -150,6 +159,7 @@ struct hip_qimg_runner {
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
+    hipFunction_t fn_quant_act_int8, fn_gemm_w8a8;  /* INT8 SmoothQuant W8A8: per-token act quant + dp4a GEMM */
     hipFunction_t fn_gemm_int4w_g16;  /* simple RTN int4-g16 BF16-act WMMA GEMM (no LoRA/swizzle) */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
     hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip, fn_act_fp8_rt, fn_w_int8_rt, fn_w_int4_rt;
@@ -204,6 +214,11 @@ struct hip_qimg_runner {
     qimg_int4_linear *int4_mod;      /* [n_blocks * 2] img_mod/txt_mod RTN-int4 (rank0, no smooth) */
     float *i4_ldf, *i4_luf, *i4_dt, *i4_dly; size_t i4_dt_cap, i4_dly_cap;  /* persistent lora scratch */
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
+    /* INT8 SmoothQuant (W8A8) path: int8 weights stream via the fp8 byte path (same 1 B/param);
+     * the small per-linear scales stay resident. d_xq_int8/d_x_iscale = per-token quant scratch. */
+    int use_int8, use_int8_smooth;
+    void **i8_ws, **i8_sm;           /* [n_blocks*QIMG_I8_PER_BLOCK] resident weight_scale[n_out] / smooth_scale[n_in] */
+    void *d_xq_int8; float *d_x_iscale; size_t i8_xq_cap, i8_is_cap;
     hipStream_t copy_stream;
     hipEvent_t stream_copy_done[2];
     hipEvent_t stream_use_done[2];
@@ -257,6 +272,9 @@ struct hip_qimg_runner {
     hipFunction_t fn_calib_amax;            /* amax_per_col_f32 */
     float *calib_amax[QIMG_CALIB_MAXSLOT];  /* device [n_in] per main linear */
     int    calib_nin[QIMG_CALIB_MAXSLOT];   /* n_in per slot (0 = unallocated) */
+    /* Modulation activation absmax: img_mod/txt_mod share the d_t_silu input [dim]; one [dim]
+     * buffer per block, dumped as img_mod.1.amax + txt_mod.1.amax (the 990x-outlier layer). */
+    float *calib_tsilu[64];                 /* device [dim] per block */
 };
 
 enum {
@@ -662,6 +680,7 @@ static int qimg_upload_int4_linear(st_context *st, const char *key, qimg_int4_li
 }
 
 static void *qimg_upload_weight(hip_qimg_runner *r, st_context *st, const char *name) {
+    if (r->use_int8) return qimg_st_upload_raw(st, name);   /* int8 bytes (1 B/param, like fp8) */
     if (r->use_fp8) return qimg_st_upload_fp8_raw(st, name);
     return qimg_st_upload_f32(st, name);
 }
@@ -696,7 +715,8 @@ static int qimg_st_upload_f32_into(st_context *st, const char *name, void *dest)
 
 static int qimg_upload_weight_into(hip_qimg_runner *r, st_context *st,
                                    const char *name, void *dest, hipStream_t stream) {
-    if (r->use_fp8) return qimg_st_upload_fp8_raw_into(st, name, dest, stream);
+    /* fp8_raw_into is a dtype-agnostic raw byte copy -> reuse it for int8 bytes too. */
+    if (r->use_int8 || r->use_fp8) return qimg_st_upload_fp8_raw_into(st, name, dest, stream);
     return qimg_st_upload_f32_into(st, name, dest);
 }
 
@@ -1082,6 +1102,44 @@ static void op_gemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bi
 /* Unfused W4A16 SVDQuant linear: Y[n_tok,n_out] = (W·wscale/smooth)@X + lora_up@(lora_down@X) + bias.
  * Verified-correct, perf-naive (per-call dense materialize + f32 GEMMs); the fused dequant-LDS WMMA kernel
  * replaces the W-materialize later. L = &int4_linears[block*PER_BLOCK + slot]. X is F32 [n_tok,n_in]. */
+/* INT8 SmoothQuant W8A8 linear: quant X per-token to int8 (dividing by `smooth` if non-NULL),
+ * int8xint8->int32 dp4a GEMM with fused dequant (xscale[t]*wscale[o]) + bias -> f32 Y[n_tok,n_out].
+ * Wq is the (streamed) int8 weight [n_out,n_in]; wscale[n_out]/smooth[n_in] are resident. */
+static void op_gemm_int8(hip_qimg_runner *r, void *Y, void *Wq, void *wscale, void *smooth,
+                         void *X, void *bias, int n_out, int n_in, int n_tok) {
+    size_t xqb = (size_t)n_tok * n_in;
+    if (xqb > r->i8_xq_cap) { if (r->d_xq_int8) { hipDeviceSynchronize(); hipFree(r->d_xq_int8); }
+        hipMalloc(&r->d_xq_int8, xqb); r->i8_xq_cap = xqb; }
+    size_t isb = (size_t)n_tok * 4;
+    if (isb > r->i8_is_cap) { if (r->d_x_iscale) { hipDeviceSynchronize(); hipFree(r->d_x_iscale); }
+        hipMalloc((void **)&r->d_x_iscale, isb); r->i8_is_cap = isb; }
+    void *qa[] = {&X, &smooth, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+    hipModuleLaunchKernel(r->fn_quant_act_int8, (unsigned)n_tok, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
+    void *ga[] = {&Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale, &bias, &n_out, &n_in, &n_tok};
+    hipModuleLaunchKernel(r->fn_gemm_w8a8, (unsigned)((n_out + 127) / 128), (unsigned)n_tok, 1, 128, 1, 1, 0, NULL, ga, NULL);
+    /* One-shot kernel self-test: host reference = (Wq*wscale)·(x/smooth)+bias, vs the GEMM Y. */
+    static int i8_dbg_done = 0;
+    if (getenv("QIMG_INT8_DEBUG") && !i8_dbg_done && n_tok >= 64 && n_tok <= 256) {
+        i8_dbg_done = 1; hipDeviceSynchronize();
+        signed char *hW = malloc((size_t)n_out*n_in); float *hws = malloc((size_t)n_out*4);
+        float *hsm = smooth ? malloc((size_t)n_in*4) : NULL, *hX = malloc((size_t)n_tok*n_in*4);
+        float *hY = malloc((size_t)n_tok*n_out*4), *hb = bias ? malloc((size_t)n_out*4) : NULL;
+        hipMemcpy(hW, Wq, (size_t)n_out*n_in, hipMemcpyDeviceToHost);
+        hipMemcpy(hws, wscale, (size_t)n_out*4, hipMemcpyDeviceToHost);
+        if (hsm) hipMemcpy(hsm, smooth, (size_t)n_in*4, hipMemcpyDeviceToHost);
+        hipMemcpy(hX, X, (size_t)n_tok*n_in*4, hipMemcpyDeviceToHost);
+        hipMemcpy(hY, Y, (size_t)n_tok*n_out*4, hipMemcpyDeviceToHost);
+        if (hb) hipMemcpy(hb, bias, (size_t)n_out*4, hipMemcpyDeviceToHost);
+        double dot=0, nr=0, ng=0; int t=0;
+        for (int o=0;o<n_out;o++){ double acc=0; for(int k=0;k<n_in;k++){ double xv=hX[(size_t)t*n_in+k]; if(hsm)xv/=hsm[k];
+            acc += (double)hW[(size_t)o*n_in+k]*hws[o]*xv; } if(hb)acc+=hb[o];
+            double g=hY[(size_t)t*n_out+o]; dot+=acc*g; nr+=acc*acc; ng+=g*g; }
+        fprintf(stderr,"[int8dbg] n_out=%d n_in=%d n_tok=%d smooth=%d cos(gpu,host)=%.5f ||host||=%.3g ||gpu||=%.3g\n",
+                n_out,n_in,n_tok,smooth?1:0, dot/(sqrt(nr)*sqrt(ng)+1e-30), sqrt(nr), sqrt(ng));
+        free(hW);free(hws);free(hX);free(hY); if(hsm)free(hsm); if(hb)free(hb);
+    }
+}
+
 static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
     int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank;
     /* Simple RTN int4-g16 path (no swizzle/LoRA/smooth): plain nibble + per-g16
@@ -1134,6 +1192,11 @@ static void op_proj(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
         }
     }
     if (r->use_int4 && r->int4_linears) { op_int4_linear(r, Y, X, &r->int4_linears[(size_t)blk*12 + slot], n_tok); return; }
+    if (r->use_int8 && r->i8_ws) {   /* W is the streamed int8 weight; scales resident at [blk,slot] */
+        size_t ix = (size_t)blk * QIMG_I8_PER_BLOCK + slot;
+        op_gemm_int8(r, Y, W, r->i8_ws[ix], r->use_int8_smooth ? r->i8_sm[ix] : NULL, X, bias, n_out, n_in, n_tok);
+        return;
+    }
     op_wgemm_bf16(r, Y, W, X, bias, n_out, n_in, n_tok);
 }
 
@@ -1610,6 +1673,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_w_int4_rt, "w_int4_roundtrip_g16");
     GET(fn_gemm_int4w_g16, "gemm_int4w_g16_bf16a_wmma_t");
     GET(fn_calib_amax, "amax_per_col_f32");
+    if (hipModuleGetFunction(&r->fn_quant_act_int8, mod, "quant_act_perrow_int8") != hipSuccess) r->fn_quant_act_int8 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8, mod, "gemm_w8a8_perrow_f32") != hipSuccess) r->fn_gemm_w8a8 = NULL;
     if (r->calib_dump_path)
         fprintf(stderr, "hip_qimg: QIMG_CALIB_DUMP active -> %s (collecting per-linear activation max-abs)\n",
                 r->calib_dump_path);
@@ -2100,6 +2165,19 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
         }
     }
 
+    /* INT8 SmoothQuant (W8A8) detection: if .weight is I8, stream int8 weight bytes via the fp8
+     * byte path and keep the small per-linear scales resident. Must precede global upload so
+     * use_fp8=0 routes the bf16 globals through F32. */
+    if (r->fn_quant_act_int8 && r->fn_gemm_w8a8) {
+        int qi = safetensors_find(st, "transformer_blocks.0.attn.to_q.weight");
+        if (qi >= 0 && strcmp(safetensors_dtype(st, qi), "I8") == 0) {
+            r->use_int8 = 1; r->use_fp8 = 0; r->use_wmma = 0; r->use_fp8_fp8w = 0;
+            r->use_int8_smooth = (safetensors_find(st, "transformer_blocks.0.attn.to_q.smooth_scale") >= 0);
+            fprintf(stderr, "hip_qimg: INT8 W8A8 path%s (per-token act quant + per-out wscale; int8 weights streamed)\n",
+                    r->use_int8_smooth ? " + SmoothQuant" : "");
+        }
+    }
+
     /* Upload global weights. Each *.weight may be FP8 or BF16/F32 depending on
      * the checkpoint (mixed-dtype like unsloth/Qwen-Image-2512-FP8). The auto
      * helper sets the per-weight is_fp8 flag, which is_fp8_<name> later uses
@@ -2168,13 +2246,36 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
         }
     }
 
+    /* INT8: load the small per-linear scales (weight_scale[n_out] + smooth_scale[n_in]) resident
+     * (~40 MB for all 60 blocks); only the int8 weight bytes are streamed. */
+    if (r->use_int8) {
+        size_t n = (size_t)r->n_blocks * QIMG_I8_PER_BLOCK;
+        r->i8_ws = (void **)calloc(n, sizeof(void *));
+        r->i8_sm = (void **)calloc(n, sizeof(void *));
+        int miss = 0;
+        for (int b = 0; b < r->n_blocks; b++)
+            for (int s = 0; s < QIMG_I8_PER_BLOCK; s++) {
+                char nm[256]; size_t ix = (size_t)b * QIMG_I8_PER_BLOCK + s;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.weight_scale", b, qimg_i8_suffix[s]);
+                r->i8_ws[ix] = qimg_st_upload_f32(st, nm);
+                if (!r->i8_ws[ix]) miss++;
+                if (r->use_int8_smooth) {
+                    snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.smooth_scale", b, qimg_i8_suffix[s]);
+                    r->i8_sm[ix] = qimg_st_upload_f32(st, nm);
+                }
+            }
+        if (miss) fprintf(stderr, "hip_qimg: INT8 — %d weight_scale tensors missing (render will be wrong)\n", miss);
+        else if (r->verbose) fprintf(stderr, "hip_qimg: INT8 — loaded %zu weight_scale%s vectors resident\n",
+                                     n, r->use_int8_smooth ? "+smooth_scale" : "");
+    }
+
     /* Preload as many blocks as fit in VRAM */
     {
         size_t free_mem = 0, total_mem = 0;
         hipMemGetInfo(&free_mem, &total_mem);
         /* FP8: ~324M params × 1 byte = ~324 MB/block (+ ~20MB F32 biases/norms)
          * F32:  ~324M params × 4 bytes = ~1296 MB/block */
-        size_t block_bytes = r->use_fp8 ? 344ULL * 1024 * 1024
+        size_t block_bytes = (r->use_fp8 || r->use_int8) ? 344ULL * 1024 * 1024
                                         : 1296ULL * 1024 * 1024;
         /* Workspace budget for per-step activation allocations. At 512×512
          * peak usage is ~300 MB (Q/K/V 72 MB, scratch3 48 MB, scratch1/2
@@ -2253,6 +2354,8 @@ static void qimg_calib_dump(hip_qimg_runner *r) {
     size_t total_floats = 0; int present = 0;
     for (int idx = 0; idx < QIMG_CALIB_MAXSLOT; idx++)
         if (r->calib_amax[idx]) { total_floats += (size_t)r->calib_nin[idx]; present++; }
+    for (int b = 0; b < 64; b++)                          /* tsilu -> img_mod.1 + txt_mod.1 (data written twice) */
+        if (r->calib_tsilu[b]) { total_floats += (size_t)r->dim * 2; present += 2; }
     if (!present) { fprintf(stderr, "hip_qimg: calib dump: no stats collected (run with a bf16/fp8 DiT)\n"); return; }
     char *json = (char *)malloc((size_t)present * 256 + 64);
     float *data = (float *)malloc(total_floats * 4);
@@ -2270,6 +2373,19 @@ static void qimg_calib_dump(hip_qimg_runner *r) {
                 first ? "" : ",", b, qimg_int4_linear_suffix[s], nin, foff * 4, (foff + (size_t)nin) * 4);
             foff += (size_t)nin; first = 0;
         }
+    for (int b = 0; b < 64; b++) {                        /* modulation: same d_t_silu amax for img_mod.1 + txt_mod.1 */
+        if (!r->calib_tsilu[b]) continue;
+        int nin = r->dim;
+        float *hbuf = data + foff;
+        hipMemcpy(hbuf, r->calib_tsilu[b], (size_t)nin * 4, hipMemcpyDeviceToHost);
+        jp += sprintf(json + jp, "%s\"transformer_blocks.%d.img_mod.1.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                      first ? "" : ",", b, nin, foff * 4, (foff + (size_t)nin) * 4);
+        foff += (size_t)nin; first = 0;
+        memcpy(data + foff, hbuf, (size_t)nin * 4);
+        jp += sprintf(json + jp, ",\"transformer_blocks.%d.txt_mod.1.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                      b, nin, foff * 4, (foff + (size_t)nin) * 4);
+        foff += (size_t)nin;
+    }
     jp += sprintf(json + jp, "}");
     while (jp % 8) json[jp++] = ' ';                 /* pad header to 8-byte alignment */
     FILE *f = fopen(r->calib_dump_path, "wb");
@@ -2288,6 +2404,18 @@ void hip_qimg_free(hip_qimg_runner *r) {
     qimg_calib_dump(r);
     for (int idx = 0; idx < QIMG_CALIB_MAXSLOT; idx++)
         if (r->calib_amax[idx]) { hipFree(r->calib_amax[idx]); r->calib_amax[idx] = NULL; }
+    for (int b = 0; b < 64; b++)
+        if (r->calib_tsilu[b]) { hipFree(r->calib_tsilu[b]); r->calib_tsilu[b] = NULL; }
+    if (r->i8_ws || r->i8_sm) {
+        size_t n = (size_t)r->n_blocks * QIMG_I8_PER_BLOCK;
+        for (size_t i = 0; i < n; i++) {
+            if (r->i8_ws && r->i8_ws[i]) hipFree(r->i8_ws[i]);
+            if (r->i8_sm && r->i8_sm[i]) hipFree(r->i8_sm[i]);
+        }
+        free(r->i8_ws); free(r->i8_sm); r->i8_ws = r->i8_sm = NULL;
+    }
+    if (r->d_xq_int8) { hipFree(r->d_xq_int8); r->d_xq_int8 = NULL; }
+    if (r->d_x_iscale) { hipFree(r->d_x_iscale); r->d_x_iscale = NULL; }
     qimg_free_block(&r->stream_blk[0]);
     qimg_free_block(&r->stream_blk[1]);
     if (r->gpu_blocks) {
@@ -2520,11 +2648,28 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
                        hipMemcpyDeviceToDevice, NULL);
         op_silu(r, d_t_silu, dim);
 
+        /* Calibration: modulation input (d_t_silu, shared by img_mod/txt_mod) per-channel abs-max. */
+        if (r->calib_dump_path && r->fn_calib_amax && L >= 0 && L < 64) {
+            if (!r->calib_tsilu[L] && hipMalloc(&r->calib_tsilu[L], (size_t)dim * 4) == hipSuccess)
+                hipMemset(r->calib_tsilu[L], 0, (size_t)dim * 4);
+            if (r->calib_tsilu[L]) {
+                int one = 1;
+                void *ca[] = {&r->calib_tsilu[L], &d_t_silu, &one, &dim};
+                hipModuleLaunchKernel(r->fn_calib_amax, (unsigned)((dim + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ca, NULL);
+            }
+        }
+
         qimg_set_gemm_context(r, L, "img_mod");
         if (r->use_int4) op_int4_linear(r, d_img_mod, d_t_silu, &r->int4_mod[2*L], 1);
+        else if (r->use_int8 && r->i8_ws) op_gemm_int8(r, d_img_mod, blk.img_mod_w,
+            r->i8_ws[(size_t)L*QIMG_I8_PER_BLOCK+12], r->use_int8_smooth ? r->i8_sm[(size_t)L*QIMG_I8_PER_BLOCK+12] : NULL,
+            d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         else op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         qimg_set_gemm_context(r, L, "txt_mod");
         if (r->use_int4) op_int4_linear(r, d_txt_mod, d_t_silu, &r->int4_mod[2*L+1], 1);
+        else if (r->use_int8 && r->i8_ws) op_gemm_int8(r, d_txt_mod, blk.txt_mod_w,
+            r->i8_ws[(size_t)L*QIMG_I8_PER_BLOCK+13], r->use_int8_smooth ? r->i8_sm[(size_t)L*QIMG_I8_PER_BLOCK+13] : NULL,
+            d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
         else op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
 
         /* Modulation offsets */
