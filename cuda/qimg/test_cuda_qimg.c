@@ -1601,6 +1601,13 @@ static int test_int8_gemm(void) {
         fprintf(stderr, "FAIL: int8 kernels not loaded\n"); cuda_qimg_free(r); return 1;
     }
     r->use_int8 = 1;  /* force the int8 path in op_gemm */
+    /* Mirror load_dit's auto-detect: enable the cuBLAS int8 GemmEx top path
+     * (library-tuned + bit-exact). Falls back to the hand mma kernel if missing
+     * or if QIMG_DISABLE_INT8_CUBLAS is set. */
+    if (!getenv("QIMG_DISABLE_INT8_CUBLAS") && r->dequant_int32_to_bf16 && r->cublaslt_ctx)
+        r->use_cublas_int8 = 1;
+    fprintf(stderr, "  int8 GEMM path: %s\n",
+            r->use_cublas_int8 ? "cuBLAS GemmEx" : "hand mma kernel");
 
     struct { int N, K, M; const char *label; } cases[] = {
         {512, 256, 64,   "small"},
