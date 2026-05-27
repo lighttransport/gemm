@@ -1343,6 +1343,14 @@ static const char hip_qimg_specific_kernels[] =
 "    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;\n"
 "    unsigned u = (unsigned)b[i] << 16; float v; __builtin_memcpy(&v,&u,4); f[i] = v;\n"
 "}\n"
+/* Calibration: per-input-channel running max-abs. X[n_tok,n_in] row-major; one thread per column j;
+ * amax[j] = max(amax[j], max_i |X[i,j]|). amax must be pre-zeroed; safe to call repeatedly to accumulate. */
+"__global__ void amax_per_col_f32(float *__restrict__ amax, const float *__restrict__ X, int n_tok, int n_in) {\n"
+"    int j = blockIdx.x * blockDim.x + threadIdx.x; if (j >= n_in) return;\n"
+"    float m = amax[j];\n"
+"    for (int i = 0; i < n_tok; i++) { float v = X[(long)i*n_in + j]; v = v < 0.f ? -v : v; if (v > m) m = v; }\n"
+"    amax[j] = m;\n"
+"}\n"
 "\n"
 
 /* FP8 roundtrip quantization */
