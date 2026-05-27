@@ -1297,6 +1297,10 @@ struct cuda_qimg_runner {
     CUfunction gemm_w8a8_perrow;        /* int8 GEMM, naive (any shape) */
     CUfunction gemm_int8_pipe_perrow;   /* int8 mma.sync GEMM (n_out%256,n_in%32,n_tok>=16) */
     CUfunction gemm_int8_pipe_perrow_mt4; /* MTILE=4 (64 rows/CTA), n_tok%64==0 */
+    CUfunction dequant_int32_to_bf16;   /* int32 GEMM out -> bf16 (xscale*wscale+bias) */
+    int use_cublas_int8;                /* cuBLAS int8 GemmEx path (tuned + bit-exact) */
+    CUdeviceptr d_yi32_int8;            /* int32 GEMM output scratch */
+    size_t yi32_int8_n;
     CUdeviceptr d_xq_int8;              /* [max_n_tok * max_n_in] int8, lazily grown */
     size_t      xq_int8_n;
     CUdeviceptr d_x_iscale;             /* [max_n_tok] f32 per-token act scale */
@@ -2128,6 +2132,55 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
     if (r->use_int8 && r->gemm_w8a8_perrow && r->quant_act_perrow_int8) {
         CUdeviceptr wscale = W;
         CUdeviceptr Wq = W + (size_t)n_out * sizeof(float);
+
+        /* Top path: cuBLAS int8 GemmEx (R_8I x R_8I -> R_32I, COMPUTE_32I).
+         * Library-tuned AND bit-exact (int32 accumulate is order-independent).
+         * Per-token int8 quant -> int32 GEMM -> per-(row x channel) dequant+bias
+         * to bf16. cuBLAS IMMA needs n_out/n_in/n_tok multiples of 4 (qimg always
+         * is). The accumulate can't overflow: n_in*127^2 < 2^31 for n_in up to
+         * ~133k. Falls through to the hand mma/naive paths if scratch OOMs. */
+        if (r->use_cublas_int8 && r->dequant_int32_to_bf16 && r->cublaslt_ctx &&
+            (n_out % 4) == 0 && (n_in % 4) == 0 && (n_tok % 4) == 0) {
+            size_t need_q = (size_t)n_tok * n_in;
+            size_t need_s = (size_t)n_tok * sizeof(float);
+            size_t need_y = (size_t)n_tok * n_out * sizeof(int);
+            int ok = 1;
+            if (need_q > r->xq_int8_n) {
+                if (r->d_xq_int8) cuMemFree(r->d_xq_int8);
+                r->d_xq_int8 = 0;
+                if (cuMemAlloc(&r->d_xq_int8, need_q) == CUDA_SUCCESS) r->xq_int8_n = need_q;
+                else { r->xq_int8_n = 0; ok = 0; }
+            }
+            if (ok && need_s > r->x_iscale_n) {
+                if (r->d_x_iscale) cuMemFree(r->d_x_iscale);
+                r->d_x_iscale = 0;
+                if (cuMemAlloc(&r->d_x_iscale, need_s) == CUDA_SUCCESS) r->x_iscale_n = need_s;
+                else { r->x_iscale_n = 0; ok = 0; }
+            }
+            if (ok && need_y > r->yi32_int8_n) {
+                if (r->d_yi32_int8) cuMemFree(r->d_yi32_int8);
+                r->d_yi32_int8 = 0;
+                if (cuMemAlloc(&r->d_yi32_int8, need_y) == CUDA_SUCCESS) r->yi32_int8_n = need_y;
+                else { r->yi32_int8_n = 0; ok = 0; }
+            }
+            if (ok) {
+                void *qa[] = {&X, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+                cuLaunchKernel(r->quant_act_perrow_int8, (unsigned)n_tok, 1, 1,
+                               256, 1, 1, 0, r->stream, qa, NULL);
+                int rc = cublasew_gemm_int8_s32_rowmajor_nt(
+                    r->cublaslt_ctx, r->d_yi32_int8, Wq, r->d_xq_int8,
+                    n_tok, n_out, n_in);
+                if (rc == 0) {
+                    void *da[] = {&Y, &r->d_yi32_int8, &r->d_x_iscale, &wscale,
+                                  &bias, &n_out, &n_tok};
+                    unsigned gx = (unsigned)((n_out + 255) / 256);
+                    cuLaunchKernel(r->dequant_int32_to_bf16, gx, (unsigned)n_tok, 1,
+                                   256, 1, 1, 0, r->stream, da, NULL);
+                    return;
+                }
+                /* cuBLAS rejected the shape — fall through to the hand kernel. */
+            }
+        }
 
         /* Fast path: pipelined mma.sync int8 GEMM (native INT8 tensor cores).
          * Quantizes X inline per-row; needs row_max from reduce_max_abs_per_row.
@@ -3424,6 +3477,20 @@ static const char *int8_kernels_src =
 "    }\n"
 "}\n"
 "#endif\n"
+/* Dequant the int32 GEMM output (from cuBLAS int8 GemmEx) to bf16-truncated f32.
+ * C is [n_tok, n_out] row-major int32 (== col-major [n_out,n_tok] ldc=n_out).
+ * y[t,o] = C[t,o] * (xscale[t] * wscale[o]) + bias[o]. 2-D grid avoids per-elem div. */
+"__global__ void dequant_int32_to_bf16(float *Y, const int *C,\n"
+"                                      const float *xscale, const float *wscale,\n"
+"                                      const float *bias, int n_out, int n_tok) {\n"
+"    int o = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int t = blockIdx.y;\n"
+"    if (o >= n_out || t >= n_tok) return;\n"
+"    long idx = (long)t * n_out + o;\n"
+"    float y = (float)C[idx] * (xscale[t] * wscale[o]);\n"
+"    if (bias) y += bias[o];\n"
+"    Y[idx] = to_bf16(y);\n"
+"}\n"
 "}\n";
 
 cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
@@ -3518,6 +3585,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_int8_pipe_perrow = NULL;
     if (cuModuleGetFunction(&r->gemm_int8_pipe_perrow_mt4, module, "gemm_int8_pipe_perrow_mt4") != CUDA_SUCCESS)
         r->gemm_int8_pipe_perrow_mt4 = NULL;
+    if (cuModuleGetFunction(&r->dequant_int32_to_bf16, module, "dequant_int32_to_bf16") != CUDA_SUCCESS)
+        r->dequant_int32_to_bf16 = NULL;
     if (cuModuleGetFunction(&r->quant_f32_to_fp8_e4m3, module, "quant_f32_to_fp8_e4m3") != CUDA_SUCCESS)
         r->quant_f32_to_fp8_e4m3 = NULL;
     if (cuModuleGetFunction(&r->compute_x_scale_from_max, module, "compute_x_scale_from_max") != CUDA_SUCCESS)
@@ -3876,6 +3945,19 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
             r->use_fp8_mma = 0; r->use_fp8_mma_bf16 = 0; r->use_bf16_mma = 0;
             r->use_cublaslt_fp8 = 0;
             fprintf(stderr, "cuda_qimg: INT8 W8A8 weights detected — bit-exact int8 GEMM path\n");
+            /* Top-priority int8 GEMM: cuBLAS int8 GemmEx (R_8I/R_32I/COMPUTE_32I).
+             * Library-tuned like the FP8 cuBLAS-LT path AND bit-exact (int32
+             * accumulate is order-independent). Needs a regular cuBLAS handle
+             * (cublaslt_ctx wraps one) + the int32->bf16 dequant kernel. The
+             * hand mma kernel stays as the fallback. QIMG_DISABLE_INT8_CUBLAS=1
+             * forces the hand kernel (for A/B and HIP-parity debugging). */
+            if (!getenv("QIMG_DISABLE_INT8_CUBLAS") && r->dequant_int32_to_bf16) {
+                if (!r->cublaslt_ctx) cublasewCreate(&r->cublaslt_ctx, r->stream);
+                if (r->cublaslt_ctx) {
+                    r->use_cublas_int8 = 1;
+                    fprintf(stderr, "cuda_qimg: INT8 cuBLAS GemmEx path enabled (tuned + bit-exact)\n");
+                }
+            }
         }
     }
 
@@ -3903,7 +3985,8 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     {
         size_t free_mem = 0, total_mem = 0;
         size_t block_bytes;
-        if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
+        if (r->use_int8) block_bytes = 344ULL * 1024 * 1024; /* INT8: 1 byte + per-channel f32 scale */
+        else if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
         else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
 
@@ -4056,6 +4139,10 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->d_x_scale_f32) cuMemFree(r->d_x_scale_f32);
     if (r->d_w_scale_one) cuMemFree(r->d_w_scale_one);
     if (r->cublaslt_ctx) cublasewDestroy(r->cublaslt_ctx);
+    /* INT8 W8A8 scratch (quantized X, per-token scale, int32 GEMM output) */
+    if (r->d_xq_int8)   cuMemFree(r->d_xq_int8);
+    if (r->d_x_iscale)  cuMemFree(r->d_x_iscale);
+    if (r->d_yi32_int8) cuMemFree(r->d_yi32_int8);
     /* BF16 attention workspace */
     if (r->d_q_bf16) cuMemFree(r->d_q_bf16);
     if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
