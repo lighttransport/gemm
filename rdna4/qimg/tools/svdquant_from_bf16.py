@@ -56,6 +56,10 @@ def smoothing_lambda(W, amax, alpha, clip):                  # W [out,in] f32, a
     if amax is None:
         return torch.ones_like(wmax)
     a = amax.clamp(min=1e-8)
+    # NOTE: unlike int8 (int8_smooth_from_bf16 clamps lam>=1 to avoid an activation-amplification
+    # blowup), INT4 keeps the full [1/clip, clip] range: the rank-128 low-rank branch absorbs the
+    # migrated outliers, so lam<1 is safe here and tested marginally BETTER (final-latent cos vs fp8
+    # 0.936 with lam<1 vs 0.929 with lam>=1). The residual int4 grain is inherent 4-bit precision.
     lam = (a.pow(alpha) / wmax.pow(1.0 - alpha)).clamp(min=1.0 / clip, max=clip)
     return lam
 
