@@ -148,9 +148,10 @@ struct hip_qimg_runner {
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
-    hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip, fn_act_fp8_rt, fn_w_int8_rt;
+    hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip, fn_act_fp8_rt, fn_w_int8_rt, fn_w_int4_rt;
     int act_fp8_rt;  /* QIMG_ACT_FP8_RT=1: per-row fp8/448 act roundtrip pre-GEMM (CUDA repro) */
     int w_int8_rt;   /* QIMG_W_INT8_RT=1: int8 g64 weight roundtrip pre-GEMM (int8 quality check) */
+    int w_int4_rt;   /* QIMG_W_INT4_RT=1: simple RTN int4 g16 weight roundtrip (int4 quality check) */
     /* VAE kernels */
     hipFunction_t fn_vae_conv2d, fn_vae_rmsnorm, fn_vae_silu, fn_vae_up2x;
     hipFunction_t fn_vae_conv2d_3x3_wmma, fn_vae_conv2d_1x1_wmma;
@@ -1015,6 +1016,9 @@ static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *b
     if (r->w_int8_rt && r->fn_w_int8_rt && !r->use_fp8) {  /* int8 g64 weight precision check (bf16 src) */
         void *a[] = {&W, &n_in}; hipModuleLaunchKernel(r->fn_w_int8_rt, (unsigned)n_out, 1, 1, 1, 1, 1, 0, NULL, a, NULL);
     }
+    if (r->w_int4_rt && r->fn_w_int4_rt && !r->use_fp8) {  /* simple RTN int4 g16 weight precision check */
+        void *a[] = {&W, &n_in}; hipModuleLaunchKernel(r->fn_w_int4_rt, (unsigned)n_out, 1, 1, 1, 1, 1, 0, NULL, a, NULL);
+    }
     hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
                              (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
     int fp8_fp8_eligible = (r->use_fp8_fp8w && !r->prefer_bf16_wmma && r->fn_gemm_fp8_fp8_pgr2 &&
@@ -1446,6 +1450,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         if (e && atoi(e) > 0) r->quant_stats_max = atoi(e);
         { const char *ar = getenv("QIMG_ACT_FP8_RT"); r->act_fp8_rt = (ar && atoi(ar)); }
         { const char *wr = getenv("QIMG_W_INT8_RT"); r->w_int8_rt = (wr && atoi(wr)); }
+        { const char *wr = getenv("QIMG_W_INT4_RT"); r->w_int4_rt = (wr && atoi(wr)); }
         r->fp8_fp8_allow = getenv("QIMG_FP8_FP8_ALLOW");
         r->fp8_fp8_deny = getenv("QIMG_FP8_FP8_DENY");
         r->fp8_fp8_block_min = -1;
@@ -1513,6 +1518,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_fp8_roundtrip, "quantize_fp8_roundtrip_f32");
     GET(fn_act_fp8_rt, "act_fp8_roundtrip_perrow");
     GET(fn_w_int8_rt, "w_int8_roundtrip_g64");
+    GET(fn_w_int4_rt, "w_int4_roundtrip_g16");
     GET(fn_vae_conv2d, "vae_conv2d_f32");
     if (hipModuleGetFunction(&r->fn_vae_conv2d_3x3_wmma, mod, "vae_conv2d_3x3_wmma_f32") != hipSuccess)
         r->fn_vae_conv2d_3x3_wmma = NULL;
