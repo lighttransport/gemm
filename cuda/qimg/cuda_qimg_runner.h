@@ -1201,6 +1201,17 @@ typedef struct {
     CUdeviceptr txt_mlp_fc1_w, txt_mlp_fc1_b, txt_mlp_fc2_w, txt_mlp_fc2_b;
 } qimg_block_gpu;
 
+/* ---- Stage 2: native W4A4 OMMA FP4 weights (resident, per block) ----
+ * Each quantized linear: qweight u32[out,in/8] (8 e2m1 codes/uint), wscales
+ * u8[out,in/16] (e4m3 group scales), wcwt f32[out] (wcscales*wtscale),
+ * proj_down/proj_up fp8 e4m3 (low-rank, used via op_gemm). Bias reuses the
+ * dense block's *_b fields. */
+typedef struct { CUdeviceptr qw, ws, wcwt, pd, pu; } qimg_fp4_lin;
+enum { FP4_TO_Q=0, FP4_TO_K, FP4_TO_V, FP4_TO_OUT,
+       FP4_ADD_Q, FP4_ADD_K, FP4_ADD_V, FP4_ADD_OUT,
+       FP4_IMG_FC1, FP4_IMG_FC2, FP4_TXT_FC1, FP4_TXT_FC2, FP4_NLIN };
+typedef struct { qimg_fp4_lin lin[FP4_NLIN]; } qimg_fp4_block;
+
 typedef enum {
     QIMG_CFG_BUF_IMG_C = 0,
     QIMG_CFG_BUF_IMG_U,
@@ -1432,6 +1443,16 @@ struct cuda_qimg_runner {
     double prof_attnout_ms;   /* attn out proj + gated_add */
     double prof_imgmlp_ms;    /* adaLN2 img + img MLP fc1+gelu+fc2 + gated_add */
     double prof_txtmlp_ms;    /* adaLN2 txt + txt MLP fc1+gelu+fc2 + gated_add */
+
+    /* ---- Stage 2: native W4A4 OMMA FP4 path (guarded by use_w4a4) ---- */
+    int use_w4a4;                 /* 1 when DiT checkpoint is the OMMA FP4 layout */
+    CUmodule fp4_module;          /* separate sm_120a module (block-scale mma) */
+    CUfunction k_fp4_quant;       /* fp4_quant_act */
+    CUfunction k_w4a4_gemm;       /* w4a4_gemm (block-scale mma) */
+    CUfunction k_w4a4_combine;    /* w4a4_combine: Y=D*wcwt+lora+bias */
+    qimg_fp4_block *fp4_blocks;   /* [dit_n_blocks] resident FP4 weights */
+    CUdeviceptr d_fp4_ac, d_fp4_as, d_fp4_d, d_fp4_la, d_fp4_lo;  /* op_gemm_fp4 scratch */
+    size_t fp4_ac_n, fp4_as_n, fp4_d_n, fp4_la_n, fp4_lo_n;
     int prof_block_count;
 };
 
@@ -1779,6 +1800,7 @@ static int qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b
 
     /* Upload weight: FP8 raw for native GEMM, F16 for MMA, or F32 fallback */
     #define BLK_W(field, suffix) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident, not here */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_int8) { \
             b->field = qimg_st_upload_int8_fat(st, name, r->use_int8_smooth); \
@@ -1852,6 +1874,7 @@ static int qimg_alloc_scratch_block(cuda_qimg_runner *r) {
     memset(b, 0, sizeof(*b));
     int ok = 1;
 #define ALLOC_FROM_ST(field, suffix) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
         int _ti = safetensors_find(st, name); \
         if (_ti < 0) { ok = 0; break; } \
@@ -1929,6 +1952,7 @@ static int qimg_alloc_scratch_block_b(cuda_qimg_runner *r) {
     memset(b, 0, sizeof(*b));
     int ok = 1;
 #define ALLOC_FROM_ST(field, suffix) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
         int _ti = safetensors_find(st, name); \
         if (_ti < 0) { ok = 0; break; } \
@@ -2019,6 +2043,7 @@ static int qimg_load_block_into_slot_ex(cuda_qimg_runner *r, int block_idx,
     char name[256];
     int ok = 1;
 #define UPLOAD_FP8(field, suffix, _bytes) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_int8) { \
             if (qimg_upload_int8_fat_async_r(r, st, name, b->field, s) != 0) ok = 0; \
@@ -3099,6 +3124,140 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
 }
 
 
+/* ==================== Stage 2: native W4A4 OMMA FP4 ====================
+ * Block-scale mma needs sm_120a, so these compile into a SEPARATE module
+ * (the runner's main module is sm_120). Layout validated in cuda/fp4/. */
+static const char *qimg_fp4_kernel_src =
+"__device__ __forceinline__ unsigned char qf_f32_to_e4m3(float v){\n"
+"  unsigned short p; asm(\"cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;\":\"=h\"(p):\"f\"(v),\"f\"(v)); return p&0xFF; }\n"
+"__device__ __forceinline__ float qf_e4m3_dec(unsigned char b){int e=(b>>3)&0xF,m=b&7;\n"
+"  if(e==0) return (m/8.0f)*0.015625f; return (1.0f+m/8.0f)*exp2f((float)(e-7)); }\n"
+"__device__ __forceinline__ unsigned char qf_near_e2m1(float q){\n"
+"  unsigned char s=q<0?8:0; float a=fabsf(q); unsigned char c;\n"
+"  if(a<0.25f)c=0;else if(a<0.75f)c=1;else if(a<1.25f)c=2;else if(a<1.75f)c=3;\n"
+"  else if(a<2.5f)c=4;else if(a<3.5f)c=5;else if(a<5.0f)c=6;else c=7; return s|c; }\n"
+"extern \"C\" __global__ void fp4_quant_act(const float* X, unsigned int* Ac, unsigned char* As, int M, int K){\n"
+"  int ng=K>>4; long gi=(long)blockIdx.x*blockDim.x+threadIdx.x; if(gi>=(long)M*ng) return;\n"
+"  int m=gi/ng, grp=gi%ng; long k0=(long)grp*16;\n"
+"  float amax=0; for(int i=0;i<16;i++){float v=fabsf(X[(long)m*K+k0+i]); amax=fmaxf(amax,v);}\n"
+"  float sc=amax*0.16666667f; unsigned char sb=qf_f32_to_e4m3(sc); float sd=qf_e4m3_dec(sb);\n"
+"  float inv = sd>0.f? 1.0f/sd : 0.f; As[(long)m*ng+grp]=sb;\n"
+"  for(int u=0;u<2;u++){ unsigned int v=0; for(int i=0;i<8;i++){ long k=k0+u*8+i;\n"
+"      float q=X[(long)m*K+k]*inv; v|=((unsigned)qf_near_e2m1(q))<<(i*4);} Ac[(long)m*(K>>3)+grp*2+u]=v; } }\n"
+"extern \"C\" __global__ void w4a4_gemm(const unsigned int* A, const unsigned int* B,\n"
+"     const unsigned char* sA, const unsigned char* sB, float* D, int M, int N, int K){\n"
+"  int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5; int lane=threadIdx.x&31;\n"
+"  int ntn=N>>3; int tm=warp/ntn, tn=warp%ntn; int M0=tm*16, N0=tn*8; if(M0>=M) return;\n"
+"  int g=lane>>2, t=lane&3; int Ku=K>>3, Kg=K>>4;\n"
+"  long rA0=(long)(M0+g)*Ku, rA1=(long)(M0+g+8)*Ku, cB=(long)(N0+g)*Ku;\n"
+"  int saRow=(t==0)?(M0+g):(t==1)?(M0+g+8):-1; int sbCol=(t==0)?(N0+g):-1;\n"
+"  float d0=0.f,d1=0.f,d2=0.f,d3=0.f; int nkc=K>>6;\n"
+"  for(int kc=0;kc<nkc;kc++){\n"
+"    unsigned int a0=A[rA0+kc*8+t],a1=A[rA1+kc*8+t],a2=A[rA0+kc*8+t+4],a3=A[rA1+kc*8+t+4];\n"
+"    unsigned int b0=B[cB+kc*8+t],b1=B[cB+kc*8+t+4];\n"
+"    unsigned int sfa=0x38383838u,sfb=0x38383838u;\n"
+"    if(saRow>=0){const unsigned char*p=&sA[(long)saRow*Kg+kc*4]; sfa=p[0]|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);}\n"
+"    if(sbCol>=0){const unsigned char*p=&sB[(long)sbCol*Kg+kc*4]; sfb=p[0]|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);}\n"
+"    asm volatile(\"mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 \"\n"
+"      \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0,0}, %11, {0,0};\"\n"
+"      : \"+f\"(d0),\"+f\"(d1),\"+f\"(d2),\"+f\"(d3)\n"
+"      : \"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1),\"r\"(sfa),\"r\"(sfb));\n"
+"  }\n"
+"  D[(long)(M0+g)*N+N0+2*t]=d0; D[(long)(M0+g)*N+N0+2*t+1]=d1;\n"
+"  D[(long)(M0+g+8)*N+N0+2*t]=d2; D[(long)(M0+g+8)*N+N0+2*t+1]=d3; }\n"
+"extern \"C\" __global__ void w4a4_combine(float* Y, const float* D, const float* wcwt,\n"
+"     const float* lo, const float* bias, int n_tok, int n_out){\n"
+"  long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)n_tok*n_out) return;\n"
+"  int o=i%n_out; Y[i]=D[i]*wcwt[o]+lo[i]+(bias?bias[o]:0.f); }\n";
+
+static int qimg_compile_fp4(cuda_qimg_runner *r) {
+    if (r->fp4_module) return 0;
+    nvrtcProgram prog;
+    if (nvrtcCreateProgram(&prog, qimg_fp4_kernel_src, "qimg_fp4.cu", 0, NULL, NULL) != NVRTC_SUCCESS) return -1;
+    const char *opts[] = { "--gpu-architecture=sm_120a" };
+    nvrtcResult cr = nvrtcCompileProgram(prog, 1, opts);
+    if (cr != NVRTC_SUCCESS) {
+        size_t ls=0; nvrtcGetProgramLogSize(prog,&ls); char*lg=(char*)malloc(ls+1);
+        nvrtcGetProgramLog(prog,lg); lg[ls]=0;
+        fprintf(stderr,"cuda_qimg: FP4 kernel compile FAILED:\n%s\n",lg); free(lg);
+        nvrtcDestroyProgram(&prog); return -1;
+    }
+    CUmodule m=NULL; size_t bs=0;
+    if (nvrtcGetCUBINSize && nvrtcGetCUBINSize(prog,&bs)==NVRTC_SUCCESS && bs>0) {
+        char*bl=(char*)malloc(bs); nvrtcGetCUBIN(prog,bl); nvrtcDestroyProgram(&prog);
+        if (cuModuleLoadData(&m,bl)!=CUDA_SUCCESS) { m=NULL; } free(bl);
+    } else {
+        size_t ps=0; nvrtcGetPTXSize(prog,&ps); char*x=(char*)malloc(ps); nvrtcGetPTX(prog,x);
+        nvrtcDestroyProgram(&prog); if (cuModuleLoadData(&m,x)!=CUDA_SUCCESS) { m=NULL; } free(x);
+    }
+    if (!m) return -1;
+    r->fp4_module = m;
+    if (cuModuleGetFunction(&r->k_fp4_quant, m, "fp4_quant_act")!=CUDA_SUCCESS) return -1;
+    if (cuModuleGetFunction(&r->k_w4a4_gemm, m, "w4a4_gemm")!=CUDA_SUCCESS) return -1;
+    if (cuModuleGetFunction(&r->k_w4a4_combine, m, "w4a4_combine")!=CUDA_SUCCESS) return -1;
+    if (r->verbose) fprintf(stderr,"cuda_qimg: FP4 W4A4 OMMA kernels compiled (sm_120a)\n");
+    return 0;
+}
+
+/* op_gemm_fp4: native W4A4. Y[tok,out] = (quant(X) @W_fp4)*wcwt + (X@pd^T)@pu^T + bias. */
+static void op_gemm_fp4(cuda_qimg_runner *r, CUdeviceptr Y, qimg_fp4_lin *w,
+                        CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
+    int Mpad = ((n_tok + 15) / 16) * 16;
+    size_t ac=(size_t)Mpad*(n_in/8)*4, as=(size_t)Mpad*(n_in/16);
+    size_t dsz=(size_t)Mpad*n_out*4, lasz=(size_t)Mpad*128*4, losz=(size_t)Mpad*n_out*4;
+#define QF_GROW(ptr,cap,need) do{ if((need)>(cap)){ if(ptr)cuMemFree(ptr); \
+    if(cuMemAlloc(&(ptr),(need))!=CUDA_SUCCESS){(ptr)=0;(cap)=0;} else (cap)=(need);} }while(0)
+    QF_GROW(r->d_fp4_ac,r->fp4_ac_n,ac); QF_GROW(r->d_fp4_as,r->fp4_as_n,as);
+    QF_GROW(r->d_fp4_d,r->fp4_d_n,dsz);  QF_GROW(r->d_fp4_la,r->fp4_la_n,lasz);
+    QF_GROW(r->d_fp4_lo,r->fp4_lo_n,losz);
+#undef QF_GROW
+    /* 1. activation quant -> Ac, As (n_tok rows) */
+    long ng = (long)n_tok * (n_in/16);
+    void *qa[] = {&X,&r->d_fp4_ac,&r->d_fp4_as,&n_tok,&n_in};
+    cuLaunchKernel(r->k_fp4_quant,(unsigned)((ng+255)/256),1,1,256,1,1,0,r->stream,qa,NULL);
+    /* 2. W4A4 block-scale GEMM (Mpad rows; padding rows produce ignored D) */
+    int nw=(Mpad/16)*(n_out/8), th=128, bl=(nw*32+th-1)/th;
+    void *ga[] = {&r->d_fp4_ac,&w->qw,&r->d_fp4_as,&w->ws,&r->d_fp4_d,&Mpad,&n_out,&n_in};
+    cuLaunchKernel(r->k_w4a4_gemm,(unsigned)bl,1,1,th,1,1,0,r->stream,ga,NULL);
+    /* 3. low-rank via existing op_gemm (fp8): la=X@pd^T [tok,128], lo=la@pu^T [tok,out] */
+    op_gemm(r, r->d_fp4_la, w->pd, X, 0, 128, n_in, n_tok);
+    op_gemm(r, r->d_fp4_lo, w->pu, r->d_fp4_la, 0, n_out, 128, n_tok);
+    /* 4. combine: Y = D*wcwt + lo + bias */
+    long tot = (long)n_tok * n_out;
+    void *ca[] = {&Y,&r->d_fp4_d,&w->wcwt,&r->d_fp4_lo,&bias,&n_tok,&n_out};
+    cuLaunchKernel(r->k_w4a4_combine,(unsigned)((tot+255)/256),1,1,256,1,1,0,r->stream,ca,NULL);
+}
+
+/* Load all blocks' FP4 W4A4 weights resident (qweight/wscales/wcwt/proj_down/proj_up).
+ * ~8 GB for 60 blocks. mod/norms/biases continue to stream via the dense path. */
+static const char *qimg_fp4_bases[FP4_NLIN] = {
+    "attn.to_q","attn.to_k","attn.to_v","attn.to_out.0",
+    "attn.add_q_proj","attn.add_k_proj","attn.add_v_proj","attn.to_add_out",
+    "img_mlp.net.0.proj","img_mlp.net.2","txt_mlp.net.0.proj","txt_mlp.net.2" };
+static int qimg_load_fp4_weights(cuda_qimg_runner *r) {
+    st_context *st = (st_context *)r->dit_st;
+    int nb = r->dit_n_blocks;
+    r->fp4_blocks = (qimg_fp4_block *)calloc((size_t)nb, sizeof(qimg_fp4_block));
+    if (!r->fp4_blocks) return -1;
+    char nm[256];
+    for (int b = 0; b < nb; b++) {
+        for (int i = 0; i < FP4_NLIN; i++) {
+            qimg_fp4_lin *L = &r->fp4_blocks[b].lin[i];
+#define QF_LD(field, suf) do { \
+            snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.%s", b, qimg_fp4_bases[i], suf); \
+            L->field = qimg_st_upload_fp8_raw(st, nm); if (!L->field) return -1; } while(0)
+            QF_LD(qw, "qweight_fp4"); QF_LD(ws, "wscales_fp4");
+            QF_LD(pd, "proj_down_fp8"); QF_LD(pu, "proj_up_fp8");
+#undef QF_LD
+            snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wcwt", b, qimg_fp4_bases[i]);
+            L->wcwt = qimg_st_upload_f32(st, nm); if (!L->wcwt) return -1;
+        }
+    }
+    if (r->verbose) fprintf(stderr, "cuda_qimg: loaded FP4 W4A4 weights for %d blocks (resident)\n", nb);
+    return 0;
+}
+
+
 /* ---- Init ---- */
 
 /* ---- INT8 W8A8 dynamic GEMM kernels (runner-local) ----
@@ -3338,7 +3497,10 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     CUstream stream;
     CU_CHECK_NULL(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
 
-    if (verbose) {
+    {
+        /* Print the device line unconditionally (not just under --verbose): the
+         * compare server parses "cuda_qimg: <name> (sm_..)" for its progress/device
+         * readout, and it's a single concise, harmless line for every caller. */
         char name[256]; cuDeviceGetName(name, sizeof(name), dev);
         size_t mem; cuDeviceTotalMem(&mem, dev);
         fprintf(stderr, "cuda_qimg: %s (sm_%d, %.1f GB)\n", name, sm, (float)mem/(1<<30));
@@ -3791,6 +3953,18 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         }
     }
 
+    /* ---- Stage 2: detect & load native W4A4 OMMA FP4 layout ---- */
+    if (safetensors_find(st, "transformer_blocks.0.attn.to_q.qweight_fp4") >= 0) {
+        r->use_w4a4 = 1;
+        if (qimg_compile_fp4(r) != 0) {
+            fprintf(stderr, "cuda_qimg: FP4 W4A4 kernel compile failed\n"); return -1;
+        }
+        if (qimg_load_fp4_weights(r) != 0) {
+            fprintf(stderr, "cuda_qimg: FP4 resident weight load failed (OOM?)\n"); return -1;
+        }
+        if (r->verbose) fprintf(stderr, "cuda_qimg: W4A4 OMMA path active\n");
+    }
+
     /* Upload global weights — FP8 raw if native GEMM, else GPU dequant to F16 */
     #define GW(nm) qimg_upload_weight_auto(r, st, nm)
     /* Helper: upload + GPU dequant if not using native FP8 */
@@ -3816,6 +3990,7 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         size_t free_mem = 0, total_mem = 0;
         size_t block_bytes;
         if (r->use_int8) block_bytes = 344ULL * 1024 * 1024; /* INT8: 1 byte + per-channel f32 scale */
+        else if (r->use_w4a4) block_bytes = 130ULL * 1024 * 1024;   /* W4A4: dense block = mod+norms+biases only */
         else if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
         else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
@@ -3844,6 +4019,10 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
          * ~200 MB. Reserve 250 MB to leave headroom. Override with
          * QIMG_WORKSPACE_MB=N for higher resolutions. */
         size_t act_mb = 250;
+        /* W4A4 needs much more headroom: op_gemm_fp4 scratch (Ac/As/D/la/lo) +
+         * the low-rank op_gemm scratch are allocated lazily during step 1 (after
+         * preload), on top of the activation working set and CFG double-buffers. */
+        if (r->use_w4a4) act_mb = 3072;
         const char *ws_env = getenv("QIMG_WORKSPACE_MB");
         if (ws_env) act_mb = (size_t)atoi(ws_env);
         size_t workspace = act_mb * 1024 * 1024;
@@ -4043,6 +4222,7 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUstream s = r->stream;
     int dim = r->dit_dim, nh = r->dit_n_heads, hd = r->dit_head_dim, mlp_h = r->dit_mlp_h;
     int n_img = st->n_img, n_txt = st->n_txt, n_total = st->n_total;
+    qimg_fp4_block *fp4 = r->use_w4a4 ? &r->fp4_blocks[L] : NULL;
     CUdeviceptr d_img = st->d_img, d_txt = st->d_txt;
     CUdeviceptr d_q = st->d_q, d_k = st->d_k, d_v = st->d_v;
     CUdeviceptr d_attn_out = st->d_attn_out;
@@ -4079,7 +4259,13 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUdeviceptr d_img_q = d_q + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_img_k = d_k + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_img_v = d_v + (size_t)n_txt * dim * sizeof(float);
-    if (op_gemm_qkv_fused(r, d_img_q, d_img_k, d_img_v,
+    if (fp4) {
+        /* W4A4: the FP8 qkv .weight is not loaded (NULL) — must NOT enter the
+         * fused FP8 path (it would read NULL weights). Go straight to op_gemm_fp4. */
+        op_gemm_fp4(r, d_img_q, &fp4->lin[FP4_TO_Q], d_scratch1, blk->attn_q_b, dim, dim, n_img);
+        op_gemm_fp4(r, d_img_k, &fp4->lin[FP4_TO_K], d_scratch1, blk->attn_k_b, dim, dim, n_img);
+        op_gemm_fp4(r, d_img_v, &fp4->lin[FP4_TO_V], d_scratch1, blk->attn_v_b, dim, dim, n_img);
+    } else if (op_gemm_qkv_fused(r, d_img_q, d_img_k, d_img_v,
                           blk->attn_q_w, blk->attn_k_w, blk->attn_v_w, d_scratch1,
                           blk->attn_q_b, blk->attn_k_b, blk->attn_v_b,
                           dim, dim, n_img) != 0) {
@@ -4092,7 +4278,11 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUdeviceptr d_txt_q = d_q;
     CUdeviceptr d_txt_k = d_k;
     CUdeviceptr d_txt_v = d_v;
-    if (op_gemm_qkv_fused(r, d_txt_q, d_txt_k, d_txt_v,
+    if (fp4) {
+        op_gemm_fp4(r, d_txt_q, &fp4->lin[FP4_ADD_Q], d_scratch2, blk->attn_add_q_b, dim, dim, n_txt);
+        op_gemm_fp4(r, d_txt_k, &fp4->lin[FP4_ADD_K], d_scratch2, blk->attn_add_k_b, dim, dim, n_txt);
+        op_gemm_fp4(r, d_txt_v, &fp4->lin[FP4_ADD_V], d_scratch2, blk->attn_add_v_b, dim, dim, n_txt);
+    } else if (op_gemm_qkv_fused(r, d_txt_q, d_txt_k, d_txt_v,
                           blk->attn_add_q_w, blk->attn_add_k_w, blk->attn_add_v_w, d_scratch2,
                           blk->attn_add_q_b, blk->attn_add_k_b, blk->attn_add_v_b,
                           dim, dim, n_txt) != 0) {
@@ -4136,8 +4326,13 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     /* Output projections */
     CUdeviceptr d_img_attn = d_attn_out + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_txt_attn = d_attn_out;
+    if (fp4) {
+        op_gemm_fp4(r, d_scratch1, &fp4->lin[FP4_TO_OUT], d_img_attn, blk->attn_out_b, dim, dim, n_img);
+        op_gemm_fp4(r, d_scratch2, &fp4->lin[FP4_ADD_OUT], d_txt_attn, blk->attn_add_out_b, dim, dim, n_txt);
+    } else {
     op_gemm(r, d_scratch1, blk->attn_out_w, d_img_attn, blk->attn_out_b, dim, dim, n_img);
     op_gemm(r, d_scratch2, blk->attn_add_out_w, d_txt_attn, blk->attn_add_out_b, dim, dim, n_txt);
+    }
 
     /* Gated residual */
     op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
@@ -4149,7 +4344,16 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
      * external buffer and skip the MLP + gated_add — the caller will do a
      * CFG-batched MLP across cond+uncond before running its own gated_add. */
     if (img_mlp_in_external) {
+        /* CFG path (fp4 and non-fp4 alike): write adaLN2 to the external buffer
+         * and defer the (batched) img MLP + gated_add to the caller. Running it
+         * locally would overflow the txt-sized d_scratch3 with n_img*mlp_h. */
         op_adaln(r, img_mlp_in_external, d_img, img_sh2, img_sc2, n_img, dim);
+    } else if (fp4) {
+        op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
+        op_gemm_fp4(r, d_scratch3, &fp4->lin[FP4_IMG_FC1], d_scratch1, blk->img_mlp_fc1_b, mlp_h, dim, n_img);
+        op_gelu(r, d_scratch3, n_img * mlp_h);
+        op_gemm_fp4(r, d_scratch1, &fp4->lin[FP4_IMG_FC2], d_scratch3, blk->img_mlp_fc2_b, dim, mlp_h, n_img);
+        op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
     } else {
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
         /* Try fused FP8 MLP (BF16 hidden, no F32 intermediate). adaLN output is in
@@ -4176,6 +4380,13 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     /* Text MLP — try fused FP8 first (BF16 hidden, no F32 intermediate),
      * fall back to op_gemm_gelu+op_gemm if not available. */
     op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
+    if (fp4) {
+        op_gemm_fp4(r, d_scratch3, &fp4->lin[FP4_TXT_FC1], d_scratch2, blk->txt_mlp_fc1_b, mlp_h, dim, n_txt);
+        op_gelu(r, d_scratch3, n_txt * mlp_h);
+        op_gemm_fp4(r, d_scratch2, &fp4->lin[FP4_TXT_FC2], d_scratch3, blk->txt_mlp_fc2_b, dim, mlp_h, n_txt);
+        op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
+        goto txt_mlp_done;
+    }
     if (op_mlp_fp8(r, d_scratch3, d_scratch2,
                    blk->txt_mlp_fc1_w, blk->txt_mlp_fc1_b,
                    blk->txt_mlp_fc2_w, blk->txt_mlp_fc2_b,
@@ -4925,10 +5136,20 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         /* --- CFG-batched img MLP. W is loaded once for both cond and uncond. --- */
         {
             int two_n_img = 2 * n_img;
-            op_gemm_gelu(r, d_img_mlp_h, blk.img_mlp_fc1_w, d_img_mlp_in, blk.img_mlp_fc1_b,
-                         mlp_h, dim, two_n_img);
-            op_gemm(r, d_img_mlp_out, blk.img_mlp_fc2_w, d_img_mlp_h, blk.img_mlp_fc2_b,
-                    dim, mlp_h, two_n_img);
+            if (r->use_w4a4) {
+                /* W4A4: native FP4 GEMM for the batched (2*n_img) MLP. */
+                qimg_fp4_block *fp4b = &r->fp4_blocks[L];
+                op_gemm_fp4(r, d_img_mlp_h, &fp4b->lin[FP4_IMG_FC1], d_img_mlp_in,
+                            blk.img_mlp_fc1_b, mlp_h, dim, two_n_img);
+                op_gelu(r, d_img_mlp_h, two_n_img * mlp_h);
+                op_gemm_fp4(r, d_img_mlp_out, &fp4b->lin[FP4_IMG_FC2], d_img_mlp_h,
+                            blk.img_mlp_fc2_b, dim, mlp_h, two_n_img);
+            } else {
+                op_gemm_gelu(r, d_img_mlp_h, blk.img_mlp_fc1_w, d_img_mlp_in, blk.img_mlp_fc1_b,
+                             mlp_h, dim, two_n_img);
+                op_gemm(r, d_img_mlp_out, blk.img_mlp_fc2_w, d_img_mlp_h, blk.img_mlp_fc2_b,
+                        dim, mlp_h, two_n_img);
+            }
             CUdeviceptr img_g2 = d_img_mod + (size_t)5 * dim * sizeof(float);
             op_gated_add(r, d_img_c, d_img_mlp_out_c, img_g2, n_img, dim);
             op_gated_add(r, d_img_u, d_img_mlp_out_u, img_g2, n_img, dim);
