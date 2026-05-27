@@ -1601,13 +1601,14 @@ static int test_int8_gemm(void) {
         fprintf(stderr, "FAIL: int8 kernels not loaded\n"); cuda_qimg_free(r); return 1;
     }
     r->use_int8 = 1;  /* force the int8 path in op_gemm */
-    /* Mirror load_dit's auto-detect: enable the cuBLAS int8 GemmEx top path
-     * (library-tuned + bit-exact). Falls back to the hand mma kernel if missing
-     * or if QIMG_DISABLE_INT8_CUBLAS is set. */
+    /* Mirror load_dit's auto-detect: default GEMM = OUR gemm_int8_s32; set up
+     * cuBLAS as the verification oracle. QIMG_INT8_CUBLAS=1 uses cuBLAS for the run. */
     if (!getenv("QIMG_DISABLE_INT8_CUBLAS") && r->dequant_int32_to_bf16 && r->cublaslt_ctx)
         r->use_cublas_int8 = 1;
-    fprintf(stderr, "  int8 GEMM path: %s\n",
-            r->use_cublas_int8 ? "cuBLAS GemmEx" : "hand mma kernel");
+    int will_cublas = r->use_cublas_int8 && getenv("QIMG_INT8_CUBLAS");
+    fprintf(stderr, "  int8 GEMM: %s (cuBLAS oracle %s)\n",
+            will_cublas ? "cuBLAS GemmEx" : (r->gemm_int8_s32 ? "own gemm_int8_s32" : "naive"),
+            r->use_cublas_int8 ? "available" : "off");
 
     struct { int N, K, M; const char *label; } cases[] = {
         {512, 256, 64,   "small"},
@@ -1735,6 +1736,60 @@ static int test_int8_gemm(void) {
         double ms=((t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)*1e-6)/iters;
         fprintf(stderr,"    %-16s %.3f ms/call  %.1f TOPS\n",pc[c].l,ms,2.0*N*K*M/(ms*1e-3)/1e12);
         cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY); free(fat);
+    }
+
+    /* ===== VERIFY: our gemm_int8_s32 vs cuBLAS int8 GemmEx, at the int32 level =====
+     * Both compute the EXACT integer dot product, so they must be bit-identical (and
+     * equal to a CPU int32 reference). Feeds identical int8 Wq/Xq (incl +-127) to both,
+     * compares the raw int32 outputs element-by-element. This is the cleanest check:
+     * integer equality, no floating-point ULP ambiguity. */
+    if (r->gemm_int8_s32 && r->use_cublas_int8 && r->cublaslt_ctx) {
+        fprintf(stderr, "  --- VERIFY: own gemm_int8_s32 vs cuBLAS GemmEx (int32, bit-exact) ---\n");
+        struct { int N,K,M; const char *l; } vc[] = {
+            {3072,3072,256,"attn"}, {12288,3072,256,"mlp_fc1"},
+            {3072,12288,256,"mlp_fc2"}, {3072,3072,1024,"attn M=1024"},
+            {256,3072,64,"small"},
+        };
+        for (int c=0;c<(int)(sizeof(vc)/sizeof(vc[0]));c++){
+            int N=vc[c].N,K=vc[c].K,M=vc[c].M;
+            signed char *Wq=(signed char*)malloc((size_t)N*K);
+            signed char *Xq=(signed char*)malloc((size_t)M*K);
+            srand(1000+c);
+            for(size_t i=0;i<(size_t)N*K;i++){int v=(rand()%255)-127; if(rand()%20==0)v=(rand()&1)?127:-127; Wq[i]=(signed char)v;}
+            for(size_t i=0;i<(size_t)M*K;i++){int v=(rand()%255)-127; if(rand()%20==0)v=(rand()&1)?127:-127; Xq[i]=(signed char)v;}
+            CUdeviceptr dWq=0,dXq=0,dCo=0,dCc=0;
+            cuMemAlloc(&dWq,(size_t)N*K); cuMemcpyHtoD(dWq,Wq,(size_t)N*K);
+            cuMemAlloc(&dXq,(size_t)M*K); cuMemcpyHtoD(dXq,Xq,(size_t)M*K);
+            cuMemAlloc(&dCo,(size_t)M*N*sizeof(int)); cuMemsetD8(dCo,0,(size_t)M*N*sizeof(int));
+            cuMemAlloc(&dCc,(size_t)M*N*sizeof(int)); cuMemsetD8(dCc,0,(size_t)M*N*sizeof(int));
+            /* our kernel */
+            void *ga[]={&dCo,&dWq,&dXq,&N,&K,&M};
+            unsigned gx=((N+255)/256); gx=(gx+3u)&~3u;
+            unsigned gy=((M+31)/32);   gy=(gy+3u)&~3u;
+            cuLaunchKernel(r->gemm_int8_s32,gx,gy,1,128,1,1,1024+8192*2,r->stream,ga,NULL);
+            /* cuBLAS */
+            int rc=cublasew_gemm_int8_s32_rowmajor_nt(r->cublaslt_ctx,dCc,dWq,dXq,M,N,K);
+            cuStreamSynchronize(r->stream);
+            int *Co=(int*)malloc((size_t)M*N*sizeof(int)), *Cc=(int*)malloc((size_t)M*N*sizeof(int));
+            cuMemcpyDtoH(Co,dCo,(size_t)M*N*sizeof(int));
+            cuMemcpyDtoH(Cc,dCc,(size_t)M*N*sizeof(int));
+            long mism_oc=0,maxd_oc=0, mism_cpu=0; long total=(long)M*N;
+            for(int t=0;t<M;t++)for(int o=0;o<N;o++){
+                long acc=0; const signed char *wr=Wq+(size_t)o*K,*xr=Xq+(size_t)t*K;
+                for(int k=0;k<K;k++) acc+=(int)xr[k]*(int)wr[k];
+                long g=Co[(size_t)t*N+o], b=Cc[(size_t)t*N+o];
+                long d=g-b; if(d<0)d=-d; if(d>maxd_oc)maxd_oc=d; if(d)mism_oc++;
+                if(g!=acc)mism_cpu++;
+            }
+            int vok = (rc==0) && (mism_oc==0) && (mism_cpu==0);
+            if(!vok) all_ok=0;
+            fprintf(stderr,"  %-12s N=%-5d K=%-5d M=%-4d  ours-vs-cuBLAS=%ld/%ld (max|d|=%ld)  ours-vs-CPU=%ld/%ld  cuBLAS_rc=%d -> %s\n",
+                    vc[c].l,N,K,M, mism_oc,total,maxd_oc, mism_cpu,total, rc, vok?"BIT-EXACT":"MISMATCH");
+            cuMemFree(dWq);cuMemFree(dXq);cuMemFree(dCo);cuMemFree(dCc);
+            free(Wq);free(Xq);free(Co);free(Cc);
+        }
+    } else {
+        fprintf(stderr, "  --- VERIFY skipped (need both own kernel + cuBLAS oracle) ---\n");
     }
 
     cuda_qimg_free(r);
