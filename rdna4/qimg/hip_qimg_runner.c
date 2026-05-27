@@ -147,6 +147,7 @@ struct hip_qimg_runner {
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
+    hipFunction_t fn_gemm_int4w_g16;  /* simple RTN int4-g16 BF16-act WMMA GEMM (no LoRA/swizzle) */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
     hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip, fn_act_fp8_rt, fn_w_int8_rt, fn_w_int4_rt;
     int act_fp8_rt;  /* QIMG_ACT_FP8_RT=1: per-row fp8/448 act roundtrip pre-GEMM (CUDA repro) */
@@ -1402,6 +1403,45 @@ static void *vae_resblock_gpu(hip_qimg_runner *r, void *x,
 int g_hip_initialized = 0;  /* track if HIP was already init'd by another runner */
 char g_hip_arch[64] = {0};  /* cached arch string (e.g. "gfx1201") */
 
+/* Standalone correctness gate for gemm_int4w_g16_bf16a_wmma_t: pack a random
+ * bf16 weight to simple RTN int4-g16 on the host, run the kernel, and compare to
+ * a CPU reference using the SAME dequantized weights (so it isolates kernel
+ * arithmetic/indexing, not quant error). Gated by QIMG_INT4_SELFTEST. */
+static void qimg_int4_g16_selftest(hip_qimg_runner *r) {
+    if (!r->fn_gemm_int4w_g16) { fprintf(stderr, "int4-g16 selftest: kernel missing\n"); return; }
+    int M = 128, K = 256, N = 256;            /* M=n_tok, K=n_in, N=n_out */
+    float *X = (float*)malloc((size_t)M*K*4), *W = (float*)malloc((size_t)N*K*4);
+    float *Wd = (float*)malloc((size_t)N*K*4); /* dequantized ref */
+    unsigned char *q = (unsigned char*)calloc((size_t)N*(K/2),1);
+    unsigned short *sc = (unsigned short*)malloc((size_t)N*(K/16)*2);
+    unsigned int s=12345;
+    #define RND ((s=s*1664525u+1013904223u),((float)(s>>8)*(1.0f/16777216.0f)*2.0f-1.0f))
+    for (int i=0;i<M*K;i++) X[i]=RND;
+    for (int i=0;i<N*K;i++) W[i]=RND;
+    for (int o=0;o<N;o++) for (int g=0; g<K/16; g++) {
+        float mx=0; for(int j=0;j<16;j++){float a=fabsf(W[o*K+g*16+j]); if(a>mx)mx=a;}
+        float scale=mx/7.0f; if(scale<1e-12f)scale=1e-12f;
+        unsigned int sb; float scf=scale; memcpy(&sb,&scf,4); sc[o*(K/16)+g]=(unsigned short)(sb>>16);
+        unsigned int sbk=((unsigned int)sc[o*(K/16)+g])<<16; float scq; memcpy(&scq,&sbk,4); /* bf16-rounded scale */
+        for (int j=0;j<16;j++){ int kp=g*16+j; int qq=(int)lroundf(W[o*K+kp]/scq); if(qq>7)qq=7; if(qq<-7)qq=-7;
+            Wd[o*K+kp]=qq*scq; unsigned char b=q[o*(K/2)+(kp>>1)];
+            if(kp&1) b=(b&0x0F)|((qq&0xF)<<4); else b=(b&0xF0)|(qq&0xF); q[o*(K/2)+(kp>>1)]=b; }
+    }
+    #undef RND
+    double *Yr=(double*)malloc((size_t)M*N*8);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){double a=0;for(int kk=0;kk<K;kk++)a+=(double)X[m*K+kk]*Wd[n*K+kk];Yr[m*N+n]=a;}
+    void *dX,*dq,*dsc,*dY; hipMalloc(&dX,(size_t)M*K*4); hipMalloc(&dq,(size_t)N*(K/2)); hipMalloc(&dsc,(size_t)N*(K/16)*2); hipMalloc(&dY,(size_t)M*N*4);
+    hipMemcpy(dX,X,(size_t)M*K*4,hipMemcpyHostToDevice); hipMemcpy(dq,q,(size_t)N*(K/2),hipMemcpyHostToDevice); hipMemcpy(dsc,sc,(size_t)N*(K/16)*2,hipMemcpyHostToDevice);
+    void *bias=NULL; void *args[]={&dY,&dq,&dsc,&dX,&bias,&N,&K,&M};
+    hipModuleLaunchKernel(r->fn_gemm_int4w_g16,(unsigned)((N+127)/128),(unsigned)((M+127)/128),1,256,1,1,0,NULL,args,NULL);
+    hipDeviceSynchronize();
+    float *Yg=(float*)malloc((size_t)M*N*4); hipMemcpy(Yg,dY,(size_t)M*N*4,hipMemcpyDeviceToHost);
+    double dot=0,nr=0,ng=0,mx=0; for(int i=0;i<M*N;i++){double a=Yr[i],b=Yg[i];dot+=a*b;nr+=a*a;ng+=b*b;double d=fabs(a-b);if(d>mx)mx=d;}
+    fprintf(stderr,"hip_qimg: int4-g16 GEMM selftest M%d K%d N%d  cos=%.6f  max_abs=%.4e  %s\n",
+        M,K,N, dot/(sqrt(nr)*sqrt(ng)+1e-30), mx, (dot/(sqrt(nr)*sqrt(ng)+1e-30))>0.9999?"PASS":"FAIL");
+    hipFree(dX);hipFree(dq);hipFree(dsc);hipFree(dY); free(X);free(W);free(Wd);free(q);free(sc);free(Yr);free(Yg);
+}
+
 hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
         fprintf(stderr, "hip_qimg: rocewInit failed (HIP/HIPRTC libraries not found)\n");
@@ -1519,6 +1559,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_act_fp8_rt, "act_fp8_roundtrip_perrow");
     GET(fn_w_int8_rt, "w_int8_roundtrip_g64");
     GET(fn_w_int4_rt, "w_int4_roundtrip_g16");
+    GET(fn_gemm_int4w_g16, "gemm_int4w_g16_bf16a_wmma_t");
     GET(fn_vae_conv2d, "vae_conv2d_f32");
     if (hipModuleGetFunction(&r->fn_vae_conv2d_3x3_wmma, mod, "vae_conv2d_3x3_wmma_f32") != hipSuccess)
         r->fn_vae_conv2d_3x3_wmma = NULL;
@@ -1793,6 +1834,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     }
 
     if (verbose) fprintf(stderr, "hip_qimg: kernels compiled OK\n");
+    if (getenv("QIMG_INT4_SELFTEST")) qimg_int4_g16_selftest(r);
     return r;
 }
 
