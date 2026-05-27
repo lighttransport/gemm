@@ -83,6 +83,9 @@
 </main>
 
 <script>
+// Build marker: if you don't see this line in the browser console, you are on a
+// stale (cached) copy of the page — hard-reload / open in a private window.
+console.log('[qwen-image] build 2026-05-27e: fp4 mode + cuda progress + backend-in-params fix');
 const $ = id => document.getElementById(id);
 
 const BACKEND_LABELS = {
@@ -126,10 +129,21 @@ function showToast(msg, opts) {
     el.appendChild(t);
   }
   const b = document.createElement('div'); b.textContent = msg;
+  b.style.userSelect = 'text';
   el.appendChild(b);
+  // Always mirror to the console so the message can be copied even after the
+  // toast is gone. Errors -> console.error, info -> console.log.
+  ((opts.kind === 'info') ? console.log : console.error)('[qwen-image] ' + (opts.title ? opts.title + ': ' : '') + msg);
   host.appendChild(el);
   el.addEventListener('click', () => el.remove());
-  setTimeout(() => { el.style.opacity = '0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),400); }, 5500);
+  // Sticky toasts (e.g. errors) stay until clicked so they can be read/copied.
+  if (!opts.sticky) {
+    setTimeout(() => { el.style.opacity = '0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),400); }, 5500);
+  } else {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:10px;opacity:.6;margin-top:4px;'; hint.textContent = '(click to dismiss)';
+    el.appendChild(hint);
+  }
 }
 
 function extractError(res, body) {
@@ -176,6 +190,7 @@ async function loadVariants() {
     const d = await r.json();
     const m = (d.models || []).find(x => x.id === 'qwen-image') || {};
     const vs = m.variants || [];
+    console.log('[qwen-image] /v1/models loaded — backends=%o variants=%o', m.backends, vs);
     VARIANTS = vs.map(v => ({ name: v.name, kind: v.kind || 'st', precisions: v.precisions || ['fp8'] }));
     const sel = $('variant'); sel.innerHTML = '';
     if (!vs.length) {
@@ -194,13 +209,23 @@ async function loadVariants() {
     refreshPrecisions();
     BACKENDS = (m.backends || []).map(id => ({ id, label: BACKEND_LABELS[id] || ('ours (' + id + ')') }));
     renderBackends();
+    loadVariants._tries = 0;
   } catch (e) {
-    showToast('failed to load /v1/models: ' + e, {title:'models'});
-    $('variant').innerHTML = '<option value="">(load failed)</option>';
-    VARIANTS = [];
-    refreshPrecisions();
-    BACKENDS = [{id:'cpu', label:'ours (cpu)'}];
-    renderBackends();
+    // Do NOT fabricate a backend here — the server rejects unknown backend ids
+    // ("unknown backend 'cpu'"), which is confusing. /v1/models can transiently
+    // fail if the page is opened before the server finishes starting, so retry
+    // a few times and surface a clear status instead.
+    const tries = (loadVariants._tries = (loadVariants._tries || 0) + 1);
+    console.error('[qwen-image] /v1/models load failed (try ' + tries + '):', e);
+    VARIANTS = []; refreshPrecisions();
+    BACKENDS = []; renderBackends();
+    if (tries <= 6) {
+      $('variant').innerHTML = '<option value="">(loading models… retry ' + tries + ')</option>';
+      setTimeout(loadVariants, 1500);
+    } else {
+      showToast('failed to load /v1/models: ' + e + ' — is the server up? reload the page.', {title:'models', sticky:true});
+      $('variant').innerHTML = '<option value="">(could not load /v1/models — reload)</option>';
+    }
   }
 }
 loadVariants();
@@ -301,11 +326,14 @@ async function runOne(be, precision, cell) {
 
   try {
     const payload = Object.assign({}, JOB_BODY);
-    payload.backend = be.id;
+    payload.backend = be.id;   // C server reads top-level backend
     payload.params = Object.assign({}, JOB_BODY.params || {}, {
       variant: $('variant').value || undefined,
       precision: precision,
+      backend: be.id,          // CUDA sidecar (qwen_image_server.py) reads params.backend
     });
+    console.log('[qwen-image] POST /v1/infer  backend=%s variant=%s precision=%s',
+                payload.backend, payload.params.variant, payload.params.precision, payload);
     const res = await fetch('/v1/infer', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -315,6 +343,11 @@ async function runOne(be, precision, cell) {
     let data = null;
     try { data = await res.json(); } catch(_) { data = null; }
     if (!res.ok || !data || data.ok === false) {
+      console.error('[qwen-image] /v1/infer FAILED', {
+        http_status: res.status, http_statusText: res.statusText, response_body: data,
+        sent_backend: payload.backend, sent_variant: payload.params.variant,
+        sent_precision: payload.params.precision,
+      });
       throw new Error(extractError(res, data));
     }
 
@@ -353,9 +386,12 @@ async function runOne(be, precision, cell) {
   } catch (e) {
     stopTimers();
     pill.className = 'pill err'; pill.textContent = 'error';
-    errEl.style.display = 'block';
+    errEl.style.display = 'block'; errEl.style.userSelect = 'text';
     errEl.textContent = String(e.message || e);
-    if (e.name !== 'AbortError') showToast(String(e.message || e), {title: be.label});
+    if (e.name !== 'AbortError') {
+      console.error('[qwen-image] infer error [' + be.label + ' / ' + precision + ']:', e.message || e, e);
+      showToast(String(e.message || e), {title: be.label, sticky: true});
+    }
   }
 }
 
