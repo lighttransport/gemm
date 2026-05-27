@@ -107,8 +107,10 @@ _STEP_RE = re.compile(r"step (\d+)/(\d+)")
 _DENOISE_RE = re.compile(r"DiT denoising \((\d+) steps")
 # Device line is "cuda_qimg: <name> (sm_NNN, X.Y GB)". The greedy ".*" anchors to
 # the LAST "cuda_qimg: " before "(sm_", and "[^(]+?" keeps the name even when the
-# runner's interleaved stdout/stderr merges several prints into one read.
-_DEV_RE = re.compile(r".*cuda_qimg: ([^(]+?) \(sm_\d")
+# runner's interleaved stdout/stderr merges several prints into one read. Require
+# the ", " after the sm number so this matches ONLY the device-info line and not
+# other "cuda_qimg: ... (sm_120a)" prints (e.g. "FP4 W4A4 OMMA kernels compiled").
+_DEV_RE = re.compile(r".*cuda_qimg: ([^(]+?) \(sm_\d+, ")
 
 def _parse_progress_line(line):
     m = _STEP_RE.search(line)
@@ -176,6 +178,22 @@ def detect_triplet(model_dir):
 def detect_kind(dit_path):
     """'gguf' or 'safetensors' — fp8 vs Q4_0 roughly maps to the filename."""
     return "gguf" if dit_path.endswith(".gguf") else "safetensors"
+
+
+def variant_precision(name, dit_path=""):
+    """Classify a variant's quantization mode from its name (fall back to the dit
+    filename) so the web UI can offer it as a first-class precision/mode and gate
+    it to a capable backend. 'fp4' = native NVFP4 W4A4 OMMA (CUDA sm_120a only);
+    'int4' = Nunchaku W4A16 (HIP); else 'fp8'. The 'fp8-repack' variant is an
+    FP4-derived *dense fp8* checkpoint, so it stays fp8."""
+    s = (name + " " + (dit_path or "")).lower()
+    if "fp8" in name.lower() or "repack" in name.lower():
+        return "fp8"
+    if re.search(r"fp4|nvfp4|w4a4|omma|svdq", s):
+        return "fp4"
+    if "int4" in s:
+        return "int4"
+    return "fp8"
 
 
 class Variant:
@@ -420,20 +438,32 @@ def make_handler(backends, variants, default_variant, web_root):
                     os.path.join(web_root, "qwen-image-fp4.html"),
                     "text/html; charset=utf-8")
                 return
+            if path in ("/qwen-image", "/qwen-image.html"):
+                self._serve_file(
+                    os.path.join(web_root, "qwen-image.html"),
+                    "text/html; charset=utf-8")
+                return
             if path == "/health":
                 _json(self, 200, {"ok": True,
                                   "backends": sorted(backends.keys()),
-                                  "variants": [{"name": v.name, "kind": v.kind}
+                                  "variants": [{"name": v.name, "kind": v.kind,
+                                                "precisions": [variant_precision(v.name, v.dit)]}
                                                for v in variants.values()]})
                 return
             if path in ("/progress", "/v1/progress"):
                 _json(self, 200, _prog_snapshot())
                 return
             if path in ("/models", "/v1/models"):
+                # Each sidecar variant is one quantization (one --dit), so it
+                # exposes a single precision derived from its name; the web UI
+                # uses it to badge the mode (fp4/fp8) and gate fp4 to the cuda
+                # backend. fp4 = native NVFP4 W4A4 OMMA (auto-detected by the
+                # CUDA runner from qweight_fp4 tensors).
                 _json(self, 200, {"ok": True, "models": [
                     {"id": "qwen-image", "tasks": ["text-to-image"],
                      "backends": sorted(backends.keys()),
-                     "variants": [{"name": v.name, "kind": v.kind}
+                     "variants": [{"name": v.name, "kind": v.kind,
+                                   "precisions": [variant_precision(v.name, v.dit)]}
                                   for v in variants.values()]}
                 ]})
                 return
