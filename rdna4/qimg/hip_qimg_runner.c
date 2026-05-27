@@ -2574,8 +2574,13 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
     if (!st) { fprintf(stderr, "hip_qimg: VAE not loaded\n"); return -1; }
     const char *vae_dump_prefix = getenv("QIMG_VAE_DUMP_PREFIX");
 
-    /* Free preloaded DiT blocks to make room */
-    if (r->gpu_blocks) {
+    /* Free DiT weights to make room for the VAE. INT4 keeps ~14 GB resident with
+     * no streaming, so it must be freed here or every VAE hipMalloc fails (OOM ->
+     * gray output). hip_qimg_unload_dit frees int4_linears/int4_mod + scratch +
+     * gpu_blocks; for the fp8 path (no int4) fall back to the block-only free. */
+    if (r->int4_linears || r->int4_mod) {
+        hip_qimg_unload_dit(r);
+    } else if (r->gpu_blocks) {
         for (int i = 0; i < r->n_preloaded; i++)
             qimg_free_block(&r->gpu_blocks[i]);
         r->n_preloaded = 0;

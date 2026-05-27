@@ -48,3 +48,23 @@ right quant to reduce *visible* wobble (bf16-equivalent at ~half VRAM), but only
 pays off with a real int8 streaming GEMM; the F32-stream validation here is
 207s/step (unusable for perf, quality-only). QIMG_FORCE_F32W enables bf16/f32
 ckpt via f32 streaming; QIMG_W_INT8_RT adds int8-g64 weight roundtrip.
+
+## int4 W4A16 status — BROKEN (single OOB root cause)
+Running the logical-v3 SVDQuant int4 ckpt produces flat-gray images for every
+prompt. Diagnosed via the harness:
+- DiT latent vs CUDA: step0 cos 0.9999 (first forward ~correct) then explodes —
+  step10 cos -0.97, final max 8.1e7.
+- HIP error probe: **err=700 (illegal address) is set during denoise, on the
+  FIRST forward, at block 0** — confirmed even with --steps 1 --cfg 1.
+- LoRA disabled (QIMG_INT4_NOLORA, temp): still faults (hangs at post-denoise
+  sync) → the OOB is in the fused `gemm_int4w_bf16a_wmma_t` kernel, not the LoRA
+  residual path.
+
+So one bug, two symptoms: the fused int4 GEMM commits an out-of-bounds access →
+(1) corrupts the context so the latent blows up over steps, and (2) sets sticky
+err 700 so every later hipMalloc "fails" — which is the gray VAE output (NOT a
+real OOM). Fix needed: bounds/indexing in gemm_int4w_bf16a_wmma_t (block 0
+shapes: to_q 3072x3072, add_* x3584, mlp x12288 — all /128, so likely a
+wscale[n_out,n_in/64] or LDS tile edge index). VAE-free-before-decode is wired
+(hip_qimg_unload_dit in vae_decode) as a necessary prerequisite for once the
+kernel is fixed (int4 is 14GB resident, no streaming).
