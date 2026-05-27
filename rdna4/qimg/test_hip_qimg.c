@@ -216,6 +216,7 @@ int main(int argc, char **argv) {
     const char *latent_bin_path = NULL;   /* --test-vae: VAE input latent [16,lat_h,lat_w] f32 */
     const char *txt_bin_path = NULL;
     const char *neg_txt_bin_path = NULL;
+    const char *dump_txt_path = NULL;  /* save GPU-encoded text embedding to a --txt-bin reusable file */
     const char *sigmas_bin_path = NULL;
     const char *dump_final_path = NULL;
     const char *dump_steps_prefix = NULL;
@@ -268,6 +269,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--latent-bin") && i+1 < argc) latent_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--txt-bin") && i+1 < argc) txt_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--neg-txt-bin") && i+1 < argc) neg_txt_bin_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-txt") && i+1 < argc) dump_txt_path = argv[++i];
         else if (!strcmp(argv[i], "--sigmas-bin") && i+1 < argc) sigmas_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-final") && i+1 < argc) dump_final_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-steps-prefix") && i+1 < argc) dump_steps_prefix = argv[++i];
@@ -402,6 +404,10 @@ int main(int argc, char **argv) {
                 if (txt_precomputed)
                     fprintf(stderr, "  Text hidden: [%d, 3584] (%.1fs)\n",
                             n_txt_precomputed, (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+                if (txt_precomputed && dump_txt_path) {
+                    write_f32_bin(dump_txt_path, txt_precomputed, (size_t)n_txt_precomputed * 3584);
+                    fprintf(stderr, "  Dumped text embedding -> %s (reuse via --txt-bin, skips GPU encoder)\n", dump_txt_path);
+                }
             }
             if (use_cfg && !neg_txt_bin_path) {
                 fprintf(stderr, "  Encoding negative: \"%s\"\n", negative);
