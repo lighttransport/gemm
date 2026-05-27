@@ -159,7 +159,7 @@ struct hip_qimg_runner {
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
-    hipFunction_t fn_quant_act_int8, fn_gemm_w8a8, fn_gemm_w8a8_wmma;  /* INT8 W8A8: act quant + dp4a/WMMA GEMM */
+    hipFunction_t fn_quant_act_int8, fn_gemm_w8a8, fn_gemm_w8a8_wmma, fn_gemm_w8a8_pgr2;  /* INT8 W8A8 GEMMs */
     hipFunction_t fn_gemm_int4w_g16;  /* simple RTN int4-g16 BF16-act WMMA GEMM (no LoRA/swizzle) */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
     hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip, fn_act_fp8_rt, fn_w_int8_rt, fn_w_int4_rt;
@@ -1117,7 +1117,11 @@ static void op_gemm_int8(hip_qimg_runner *r, void *Y, void *Wq, void *wscale, vo
     hipModuleLaunchKernel(r->fn_quant_act_int8, (unsigned)n_tok, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
     void *ga[] = {&Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale, &bias, &n_out, &n_in, &n_tok};
     static int i8_dp4a = -1; if (i8_dp4a < 0) i8_dp4a = getenv("QIMG_INT8_DP4A") ? 1 : 0;
-    if (r->fn_gemm_w8a8_wmma && !i8_dp4a) {  /* int8 matrix cores: 128x128 tile, tails zero-padded */
+    if (r->fn_gemm_w8a8_pgr2 && !i8_dp4a && (n_tok % 128) == 0 && (n_out % 128) == 0 && (n_in % 32) == 0) {
+        /* Pipelined int8 WMMA (double-buffered LDS) — the fast path for the big img linears. */
+        void *gp[] = {&Y, &Wq, &r->d_xq_int8, &bias, &r->d_x_iscale, &wscale, &n_out, &n_in, &n_tok, &n_tok};
+        hipModuleLaunchKernel(r->fn_gemm_w8a8_pgr2, (unsigned)(n_out / 128), (unsigned)(n_tok / 128), 1, 128, 1, 1, 0, NULL, gp, NULL);
+    } else if (r->fn_gemm_w8a8_wmma && !i8_dp4a) {  /* simple int8 WMMA: any size (n_tok=1 txt/mod), tails zero-padded */
         hipModuleLaunchKernel(r->fn_gemm_w8a8_wmma, (unsigned)((n_out + 127) / 128), (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, ga, NULL);
     } else {  /* scalar dp4a fallback (one thread per output) */
         hipModuleLaunchKernel(r->fn_gemm_w8a8, (unsigned)((n_out + 127) / 128), (unsigned)n_tok, 1, 128, 1, 1, 0, NULL, ga, NULL);
@@ -1681,6 +1685,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     if (hipModuleGetFunction(&r->fn_quant_act_int8, mod, "quant_act_perrow_int8") != hipSuccess) r->fn_quant_act_int8 = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_w8a8, mod, "gemm_w8a8_perrow_f32") != hipSuccess) r->fn_gemm_w8a8 = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_w8a8_wmma, mod, "gemm_w8a8_wmma") != hipSuccess) r->fn_gemm_w8a8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_pgr2, mod, "gemm_w8a8_pgr2") != hipSuccess) r->fn_gemm_w8a8_pgr2 = NULL;
     if (r->calib_dump_path)
         fprintf(stderr, "hip_qimg: QIMG_CALIB_DUMP active -> %s (collecting per-linear activation max-abs)\n",
                 r->calib_dump_path);
