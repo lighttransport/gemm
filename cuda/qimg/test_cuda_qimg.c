@@ -1887,6 +1887,7 @@ int main(int argc, char **argv) {
     clock_t t0;
     if (r) {
         t0 = clock();
+        r->dit_target_pixels = (size_t)out_h * out_w;  /* size W4A4 preload to the resolution */
         if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     }
@@ -2112,6 +2113,7 @@ int main(int argc, char **argv) {
         if (force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; }
         if (force_f16 == 4) { r->use_old_gemm = 1; }
         t0 = clock();
+        r->dit_target_pixels = (size_t)out_h * out_w;  /* size W4A4 preload to the resolution */
         if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
