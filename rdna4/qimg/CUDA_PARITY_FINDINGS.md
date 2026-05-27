@@ -68,3 +68,16 @@ shapes: to_q 3072x3072, add_* x3584, mlp x12288 — all /128, so likely a
 wscale[n_out,n_in/64] or LDS tile edge index). VAE-free-before-decode is wired
 (hip_qimg_unload_dit in vae_decode) as a necessary prerequisite for once the
 kernel is fixed (int4 is 14GB resident, no streaming).
+
+## Simple RTN int4 (bf16 -> int4 g16) WORKS — unlike Nunchaku fused kernel
+QIMG_W_INT4_RT: plain symmetric RTN int4, group-16, per-output-row, 15 levels,
+no LoRA/smoothing/swizzle (kernel w_int4_roundtrip_g16). Via bf16 ckpt + f32
+streaming (QIMG_FORCE_F32W):
+- Renders a CLEAN apple (std 79, no collapse, no fault), cos 0.987 vs CUDA
+  (between bf16 0.982 and fp8 0.9956). Offline weight rel-MAE 0.10 (6x fp8) but
+  diffusion is robust; g16 grouping holds quality.
+Contrast: the Nunchaku SVDQuant logical-v4 fused gemm_int4w kernel OOB-faults
+(gray). So the SIMPLE int4 path is the pragmatic win: a plain int4-g16 GEMM
+(packed nibbles + per-group fp16 scale, no LoRA/smooth/swizzle) is far simpler to
+build than fixing the swizzled SVDQuant kernel, and its quality is validated.
+f32-stream probe is quality-only (~70s/step); needs a real int4 GEMM for perf.
