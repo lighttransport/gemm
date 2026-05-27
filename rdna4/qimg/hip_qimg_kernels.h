@@ -1635,6 +1635,53 @@ static const char hip_qimg_specific_kernels[] =
 "#endif\n"
 "\n"
 
+/* ============================================================
+ * INT8 SmoothQuant (W8A8) — ported from cuda/qimg int8 path.
+ * Per-token int8 activation quant (optional SmoothQuant divide by `smooth`),
+ * per-output-channel int8 weights, int8xint8->int32 dp4a GEMM with fused
+ * dequant (xscale[t]*wscale[o]) + bias. RDNA4/HIPRTC has no __dp4a, so use the
+ * software dp4a_s8 helper (validated in rdna4/llm). Fixes the int4 flat-region
+ * "wobble" by keeping both activation outliers and bulk values precise.
+ * ============================================================ */
+"__device__ __forceinline__ int dp4a_s8(int a, int b, int c) {\n"
+"    signed char *av = (signed char*)&a; signed char *bv = (signed char*)&b;\n"
+"    c += (int)av[0]*(int)bv[0]; c += (int)av[1]*(int)bv[1];\n"
+"    c += (int)av[2]*(int)bv[2]; c += (int)av[3]*(int)bv[3]; return c;\n"
+"}\n"
+/* Per-token int8 quant. One block (256 threads = 8 wave32 warps) per token-row;
+ * scale = max(|x/smooth|)/127; writes Xq int8 + xscale[row]. smooth may be NULL. */
+"__global__ void quant_act_perrow_int8(const float *X, const float *smooth,\n"
+"                                      signed char *Xq, float *xscale, int n_tok, int n_in) {\n"
+"    int row = blockIdx.x; if (row >= n_tok) return;\n"
+"    const float *xr = X + (long)row*n_in; signed char *qr = Xq + (long)row*n_in;\n"
+"    float v = 0.0f;\n"
+"    for (int i = threadIdx.x; i < n_in; i += blockDim.x) { float xe = smooth ? (xr[i]/smooth[i]) : xr[i]; float a = fabsf(xe); if (a>v) v=a; }\n"
+"    for (int off=16; off>0; off>>=1) { float o=__shfl_xor(v,off,32); if (o>v) v=o; }\n"   /* width 32: correct on wave32 AND wave64 */
+"    __shared__ float warp_max[8]; int wid = threadIdx.x>>5;\n"
+"    if ((threadIdx.x&31)==0) warp_max[wid]=v; __syncthreads();\n"
+"    __shared__ float s_scale;\n"
+"    if (wid==0) { v = (threadIdx.x < (blockDim.x>>5)) ? warp_max[threadIdx.x] : 0.0f;\n"
+"        for (int off=16; off>0; off>>=1) { float o=__shfl_xor(v,off,32); if (o>v) v=o; }\n"
+"        if (threadIdx.x==0) { float sc = (v>1e-30f) ? (v/127.0f) : 1.0f; xscale[row]=sc; s_scale=sc; } }\n"
+"    __syncthreads(); float sc = s_scale;\n"
+"    for (int i = threadIdx.x; i < n_in; i += blockDim.x) { float xe = smooth ? (xr[i]/smooth[i]) : xr[i];\n"
+"        float q = rintf(xe/sc); if (q>127.0f) q=127.0f; else if (q<-127.0f) q=-127.0f; qr[i]=(signed char)q; }\n"
+"}\n"
+/* W8A8 GEMM, one thread per output (o,t); int32 dp4a k-reduction (n_in % 4 == 0
+ * for qimg linears), fused dequant + bias -> f32. */
+"__global__ void gemm_w8a8_perrow_f32(float *Y, const signed char *Wq, const float *wscale,\n"
+"        const signed char *Xq, const float *xscale, const float *bias, int n_out, int n_in, int n_tok) {\n"
+"    int o = blockIdx.x*blockDim.x + threadIdx.x; int t = blockIdx.y;\n"
+"    if (o >= n_out || t >= n_tok) return;\n"
+"    const int *w4 = (const int *)(Wq + (long)o*n_in); const int *x4 = (const int *)(Xq + (long)t*n_in);\n"
+"    int acc = 0, n4 = n_in>>2;\n"
+"    for (int i=0;i<n4;i++) acc = dp4a_s8(w4[i], x4[i], acc);\n"
+"    for (int i=n4<<2;i<n_in;i++) acc += (int)Wq[(long)o*n_in+i]*(int)Xq[(long)t*n_in+i];\n"
+"    float y = (float)acc * (xscale[t]*wscale[o]); if (bias) y += bias[o];\n"
+"    Y[(long)t*n_out + o] = y;\n"
+"}\n"
+"\n"
+
 /* Row-major bias add: Y[m, n] += bias[n] for m < n_tok, all n < N.
  * Used by the vendor (Tensile) FP8 GEMM path, which we launch with a null
  * bias slot and add the per-column bias separately. */
