@@ -65,10 +65,61 @@ def pack_codes_u32(codes):  # [O,I] int32 0..15 -> [O,I/8] int32 (8 codes/uint, 
     sh=torch.arange(0,32,4,dtype=torch.int32,device=codes.device)
     return (c.to(torch.int32)<<sh).sum(-1).to(torch.int32)   # [O,I/8]
 
+# E2M1 magnitudes (positive codes 0..7) and round-to-nearest midpoint thresholds.
+_E2M1_MAG = torch.tensor([0.,0.5,1.,1.5,2.,3.,4.,6.])
+_E2M1_THR = torch.tensor([0.25,0.75,1.25,1.75,2.5,3.5,5.0])
+
+def quant_nvfp4(W, dev, GS=16):
+    """Quantize a weight matrix W[O,I] to the OMMA NVFP4 layout that the runtime
+    decodes as  W[o,k] ≈ E2M1[code] * e4m3(wscales[o,k//GS]) * wcwt[o].
+    Two-level scale: per-row wcwt = max group amax / 6; per-16-group e4m3 scale
+    is the group amax relative to that (in (0,1], well inside e4m3 range). Codes
+    are round-to-nearest e2m1. Returns (qweight_fp4 [O,I/8] i32, wscales_fp4
+    [O,I/GS] u8, wcwt [O] f32) on CPU. Memory-frugal (no [.,16] broadcast)."""
+    O, I = W.shape
+    W = W.to(dev).float()
+    Wg = W.reshape(O, I // GS, GS)
+    amax_g = Wg.abs().amax(dim=2)                       # [O, I/GS]
+    wcwt = (amax_g.amax(dim=1) / 6.0).clamp_min(1e-12)  # [O]
+    gscale_rel = (amax_g / 6.0) / wcwt.unsqueeze(1)     # [O, I/GS] in (0,1]
+    ws_e4m3 = gscale_rel.to(torch.float8_e4m3fn)        # quantize group scale to e4m3
+    eff = (ws_e4m3.float() * wcwt.unsqueeze(1)).clamp_min(1e-12)  # [O, I/GS] effective scale
+    Wn = (Wg / eff.unsqueeze(2))                        # normalized to ~[-6,6]
+    mag = Wn.abs()
+    thr = _E2M1_THR.to(dev)
+    midx = torch.bucketize(mag, thr).to(torch.int32)    # 0..7 -> {0,.5,1,1.5,2,3,4,6}
+    codes = (midx + (Wn < 0).to(torch.int32) * 8).reshape(O, I)  # negatives -> 8..15
+    qw = pack_codes_u32(codes)                          # [O, I/8] i32
+    return qw.contiguous().cpu(), ws_e4m3.view(torch.uint8).contiguous().cpu(), wcwt.float().cpu()
+
+def _decode_nvfp4(qw, ws_u8, wcwt, O, I, dev, GS=16):
+    """Inverse of quant_nvfp4 (for the self-test): reconstruct W[O,I]."""
+    e2 = E2M1.to(dev)
+    sh = torch.arange(0,32,4,dtype=torch.int32,device=dev)
+    codes = ((qw.to(dev).view(O, I//8, 1) >> sh) & 0xF).reshape(O, I)   # [O,I]
+    vals = e2[codes.long()]                                            # [O,I]
+    ws = ws_u8.to(dev).view(torch.float8_e4m3fn).float().view(O, I//GS)
+    gidx = torch.arange(I, device=dev) // GS
+    return vals * ws[:, gidx] * wcwt.to(dev).unsqueeze(1)
+
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("src");ap.add_argument("dst")
+    ap=argparse.ArgumentParser(); ap.add_argument("src",nargs="?");ap.add_argument("dst",nargs="?")
     ap.add_argument("--blocks",type=int,default=60); ap.add_argument("--device",default="cuda")
+    ap.add_argument("--mod-fp4",action="store_true",dest="mod_fp4",
+                    help="quantize img_mod.1/txt_mod.1 to NVFP4 (W4A16) instead of dense FP8 "
+                         "so all 60 blocks fit resident (lossy adaLN; see cuda/qimg runner QIMG_MOD_FP4)")
+    ap.add_argument("--selftest",action="store_true",help="validate quant_nvfp4 round-trip and exit")
     a=ap.parse_args(); dev=a.device; P=Packer(); e2m1=E2M1.to(dev); GS=16
+    if a.selftest:
+        torch.manual_seed(0)
+        for (O,I) in [(18432,3072),(256,512)]:
+            W=(torch.randn(O,I,device=dev)*0.05)
+            qw,ws,wcwt=quant_nvfp4(W,dev)
+            R=_decode_nvfp4(qw,ws,wcwt,O,I,dev)
+            rel=(R-W.to(dev)).norm()/W.to(dev).norm()
+            print(f"[selftest] W[{O},{I}] qweight_fp4{tuple(qw.shape)} wscales_fp4{tuple(ws.shape)} "
+                  f"wcwt{tuple(wcwt.shape)}  rel_L2={rel.item():.4f}")
+        return
     src=safe_open(a.src,'pt'); keys=set(src.keys())
     def has(k):return k in keys
     def G(k):return src.get_tensor(k)
@@ -115,7 +166,12 @@ def main():
             bias=G(pre+"bias").float().to(dev)
             W=W.reshape(I,6,I).permute(1,0,2).reshape(O,I).contiguous()   # dim=I=3072
             bias=bias.reshape(I,6).permute(1,0).reshape(O).contiguous()
-            out[bp+nm+".weight"]=fp8(W).cpu(); out[bp+nm+".bias"]=bias.float().cpu()
+            if a.mod_fp4:
+                qw,ws_u8,wcwt=quant_nvfp4(W,dev)     # NVFP4 (W4A16): half the FP8 footprint
+                out[bp+nm+".qweight_fp4"]=qw; out[bp+nm+".wscales_fp4"]=ws_u8
+                out[bp+nm+".wcwt"]=wcwt;       out[bp+nm+".bias"]=bias.float().cpu()
+            else:
+                out[bp+nm+".weight"]=fp8(W).cpu(); out[bp+nm+".bias"]=bias.float().cpu()
         if (b+1)%10==0 or b==0: print(f"[omma] block {b+1}/{a.blocks}")
         if dev=="cuda": torch.cuda.empty_cache()
     for k in sorted(x for x in keys if not x.startswith("transformer_blocks.")):
