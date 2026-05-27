@@ -489,6 +489,29 @@ static const char *qimg_kernel_src =
 "}\n"
 "\n"
 
+/* gemv_fp8w_f32: dedicated n_tok==1 matvec, Y[n_out] = W[n_out,n_in] @ X[n_in] + bias.
+ * One warp per output row; X cached in dynamic shared (reused by all rows in the
+ * block); fp8 weight reads coalesced across the warp; warp-shuffle reduction.
+ * Memory-bound (~8x the 16x16 tiled kernel, which wastes 15/16 rows for n_tok=1).
+ * Grid: (ceil(n_out/8),1,1) Block: 256 (=8 warps=8 rows). Shared: n_in*4 bytes. */
+"__global__ void gemv_fp8w_f32(float *Y, const unsigned char *W, const float *X,\n"
+"    const float *bias, int n_out, int n_in, int n_tok) {\n"
+"    extern __shared__ float gx_smx[];\n"
+"    int tid = threadIdx.x;\n"
+"    for (int i = tid; i < n_in; i += blockDim.x) gx_smx[i] = X[i];\n"
+"    __syncthreads();\n"
+"    int warp = tid >> 5, lane = tid & 31;\n"
+"    int row = blockIdx.x * (blockDim.x >> 5) + warp;\n"
+"    if (row >= n_out) return;\n"
+"    const unsigned char *w = W + (size_t)row * n_in;\n"
+"    float acc = 0.f;\n"
+"    for (int k = lane; k < n_in; k += 32) acc += d_fp8_to_f32_lut[w[k]] * gx_smx[k];\n"
+"    #pragma unroll\n"
+"    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);\n"
+"    if (lane == 0) Y[row] = acc + (bias ? bias[row] : 0.f);\n"
+"}\n"
+"\n"
+
 /* gemm_f32_f32: pure F32 tiled GEMM (from HY3D kernels) */
 "__global__ void gemm_f32_f32(float *Y, const float *W, const float *X,\n"
 "    const float *bias, int n_out, int n_in, int n_tok) {\n"
@@ -1264,6 +1287,7 @@ struct cuda_qimg_runner {
     CUfunction gemm_fp8_f32;     /* native FP8 GEMM (sm_89+) */
     CUfunction gemm_f32_f32;     /* pure F32 GEMM (highest precision) */
     CUfunction gemm_fp8w_f32;   /* FP8 weight (LUT dequant) × F32 input */
+    CUfunction gemv_fp8w_f32;   /* FP8 weight matvec (n_tok==1 fast path, e.g. adaLN mod) */
     CUfunction gemm_opt_f16;    /* optimized 128×128 tiled F16 GEMM */
     CUfunction gemm_opt_fp8;    /* optimized 128×128 tiled FP8 LUT GEMM */
     CUfunction gemm_fp8_mma;    /* mma.sync m16n8k32 FP8 tensor-core GEMM (sm_89+) */
@@ -2557,6 +2581,20 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         return;  /* BF16 truncation fused into kernel */
     }
 
+    /* n_tok==1 matvec (e.g. adaLN modulation img_mod/txt_mod): the 16×16 tiled
+     * fallback wastes 15/16 of its token-rows on a single token. Use the dedicated
+     * warp-per-output-row matvec (X cached in shared) — memory-bound, ~8× faster.
+     * n_in must fit dynamic shared (48 KB → n_in ≤ 12288; mod n_in=3072). */
+    if (n_tok == 1 && r->use_fp8_gemm && r->gemv_fp8w_f32 && !r->use_old_gemm &&
+        (size_t)n_in * sizeof(float) <= 48u * 1024) {
+        void *gv[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 7) / 8);   /* 8 warps/block = 8 rows/block */
+        cuLaunchKernel(r->gemv_fp8w_f32, gx, 1, 1, 256, 1, 1,
+                       (unsigned)(n_in * sizeof(float)), r->stream, gv, NULL);
+        op_bf16_trunc(r, Y, n_out);
+        return;
+    }
+
     /* Fallback: old 16×16 tiled kernels */
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     unsigned gy = (unsigned)((n_tok + 15) / 16);
@@ -3711,6 +3749,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gemm_f16_f32, "gemm_tiled_f16_f32");  /* Use tiled (correct) kernel, not MMA (has fragment mapping bug) */
     GET(gemm_f32_f32, "gemm_f32_f32");
     GET(gemm_fp8w_f32, "gemm_fp8w_f32");
+    GET(gemv_fp8w_f32, "gemv_fp8w_f32");
     GET(gemm_opt_f16, "gemm_opt_f16");
     GET(gemm_opt_fp8, "gemm_opt_fp8");
     if (cuModuleGetFunction(&r->gemm_fp8_mma, module, "gemm_fp8_scaled_f32") != CUDA_SUCCESS)
