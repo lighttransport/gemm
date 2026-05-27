@@ -422,6 +422,12 @@ def make_handler(backends, variants, default_variant, web_root):
             self.send_response(200)
             self.send_header("content-type", ctype)
             self.send_header("content-length", str(len(data)))
+            # No caching: the demo HTML/JS is iterated on frequently and the file
+            # is read from disk each request, so a stale browser cache (which can
+            # send obsolete requests like an old backend id) must never win.
+            self.send_header("cache-control", "no-store, must-revalidate")
+            self.send_header("pragma", "no-cache")
+            self.send_header("expires", "0")
             _cors_headers(self)
             self.end_headers()
             self.wfile.write(data)
