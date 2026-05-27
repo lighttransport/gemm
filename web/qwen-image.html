@@ -44,7 +44,7 @@
 <div id="toast"></div>
 <main>
   <h1>Qwen-Image</h1>
-  <div class="sub">Fans out one prompt across the checked backends &times; the selected precision and renders each generated image + timings. Pick <code>fp8</code> or <code>int4</code> (Nunchaku W4A16), or <code>both</code> for a side-by-side precision compare. Variants come from the C server's <code>--qwen-variants</code> registry.</div>
+  <div class="sub">Fans out one prompt across the checked backends &times; the selected precision and renders each generated image + timings. Pick <code>fp8</code>, <code>fp4</code> (native NVFP4 W4A4 OMMA — CUDA sm_120a), or <code>int4</code> (Nunchaku W4A16 — HIP); <code>fp4</code>/<code>int4</code> run only on their capable backend, so picking one generates a single image. Variants come from the server registry.</div>
 
   <form id="form" class="panel">
     <div class="row">
@@ -86,11 +86,33 @@
 const $ = id => document.getElementById(id);
 
 const BACKEND_LABELS = {
-  "cpu":     "ours (cpu)",
-  "hip":     "ours (hip)",
-  "cuda":    "ours (cuda)",
-  "vulkan":  "ours (vulkan)",
-  "pytorch": "pytorch (comfyui fp8)",
+  "cpu":          "ours (cpu)",
+  "hip":          "ours (hip)",
+  "cuda":         "ours (cuda)",
+  "vulkan":       "ours (vulkan)",
+  "pytorch":      "pytorch (comfyui fp8)",
+  // sidecar (qwen_image_server.py) backend ids
+  "ours-cpu":     "ours (cpu)",
+  "ours-cuda":    "ours (cuda)",
+  "pytorch-cuda": "pytorch (comfyui fp8)",
+};
+
+// A precision/mode that needs a specific backend capability runs only where it
+// is supported: int4 = Nunchaku W4A16 (HIP); fp4 = native NVFP4 W4A4 OMMA, which
+// only OUR CUDA runner implements (so it must be the ours-cuda backend, not the
+// pytorch-cuda reference). fp8 runs anywhere. Returns true if be.id can run p.
+const PREC_CAP = {
+  int4: id => id.includes('hip'),
+  fp4:  id => id.includes('cuda') && !id.includes('pytorch'),
+};
+function backendCanRun(precision, beId) {
+  const cap = PREC_CAP[precision];
+  return cap ? cap(beId) : true;
+}
+const PREC_LABEL = {
+  fp8:  'fp8',
+  fp4:  'fp4 (native W4A4 · cuda)',
+  int4: 'int4 (W4A16 · hip)',
 };
 
 function showToast(msg, opts) {
@@ -136,7 +158,7 @@ function refreshPrecisions() {
   const sel = $('precision'); sel.innerHTML = '';
   precs.forEach(p => {
     const o = document.createElement('option');
-    o.value = p; o.textContent = p;
+    o.value = p; o.textContent = PREC_LABEL[p] || p;
     sel.appendChild(o);
   });
   if (precs.length > 1) {
@@ -163,8 +185,9 @@ async function loadVariants() {
     } else {
       vs.forEach(v => {
         const o = document.createElement('option');
-        const tag = (v.precisions || []).includes('int4') ? `${v.kind || 'st'}, +int4` : (v.kind || 'st');
-        o.value = v.name; o.textContent = `${v.name}  (${tag})`;
+        const precs = v.precisions || [];
+        const badge = precs.includes('fp4') ? 'FP4 · ' : (precs.includes('int4') ? '+int4 · ' : '');
+        o.value = v.name; o.textContent = `${v.name}  (${badge}${v.kind || 'st'})`;
         sel.appendChild(o);
       });
     }
@@ -261,9 +284,13 @@ async function runOne(be, precision, cell) {
   const ticker = setInterval(() => {
     pill.textContent = phaseTxt + ' · ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
   }, 100);
-  // Poll server-side progress (only meaningful for the hip backend; harmless
-  // otherwise). Sequential job execution means the active job is this one.
-  const poller = (be.id === 'hip') ? setInterval(async () => {
+  // Poll server-side progress for backends that report it: the C server's HIP
+  // path (in-process) and the CUDA sidecar's ours-cuda path (streams the runner's
+  // stderr phase/step lines into GET /v1/progress). The pytorch reference and
+  // cpu backends don't report, so skip them. Sequential job execution means the
+  // active snapshot is this job.
+  const reportsProgress = /hip|cuda/.test(be.id) && !/pytorch/.test(be.id);
+  const poller = reportsProgress ? setInterval(async () => {
     try {
       const r = await fetch('/v1/progress', { cache: 'no-store' });
       const p = await r.json();
@@ -341,8 +368,9 @@ $('form').addEventListener('submit', async (ev) => {
     .map(cb => BACKENDS[+cb.dataset.idx]);
   if (!checked.length) { showToast('check at least one backend'); return; }
 
-  // Expand "both" into the variant's precisions; int4 is HIP-only so it is
-  // paired only with the hip backend (other backends would 400 server-side).
+  // Expand "both" into the variant's precisions; precision modes that need a
+  // specific backend (fp4 → ours-cuda, int4 → hip) are paired only with a
+  // capable backend (others would fail or fall back server-side).
   const v = currentVariant();
   const avail = (v && v.precisions && v.precisions.length) ? v.precisions : ['fp8'];
   const selPrec = $('precision').value;
@@ -364,15 +392,16 @@ $('form').addEventListener('submit', async (ev) => {
     },
   };
 
-  // Build the job matrix (backend × precision), skipping int4 on non-hip backends.
+  // Build the job matrix (backend × precision), skipping precision modes on
+  // backends that can't run them (fp4 → ours-cuda only, int4 → hip only).
   const jobs = [];
   for (const p of precisions) {
     for (const be of checked) {
-      if (p === 'int4' && be.id !== 'hip') continue;
+      if (!backendCanRun(p, be.id)) continue;
       jobs.push({ be, precision: p });
     }
   }
-  if (!jobs.length) { showToast('no runnable backend × precision combo (int4 needs the hip backend)'); return; }
+  if (!jobs.length) { showToast('no runnable backend × precision combo (fp4 needs the ours-cuda backend; int4 needs a hip backend)'); return; }
 
   cancelled = false;
   $('go').disabled = true; $('cancel').disabled = false;
