@@ -114,6 +114,17 @@ int cublasew_gemm_f32_pedantic_rowmajor_nt_strided(cublasew_context *ctx,
                                                    int n_out,
                                                    int n_in);
 
+/* INT8 W8A8 GEMM: int8 x int8 -> int32 (CUBLAS_COMPUTE_32I), library-tuned AND
+ * bit-exact (order-independent int32 accumulate). Y[n_tok,n_out] int32 =
+ * Xq[n_tok,n_in] @ Wq[n_out,n_in]^T. Dequant to bf16 is a separate kernel. */
+int cublasew_gemm_int8_s32_rowmajor_nt(cublasew_context *ctx,
+                                       CUdeviceptr d_Yi32,
+                                       CUdeviceptr d_Wq,
+                                       CUdeviceptr d_Xq,
+                                       int n_tok,
+                                       int n_out,
+                                       int n_in);
+
 /* Row-major Y[m, n_out] = A[m, n_in] * B[n_in, n_out].
  * `ld_y` is the row stride of Y in floats, allowing writes into an
  * interleaved parent matrix.
