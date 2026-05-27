@@ -36,10 +36,14 @@
 /* ---- GPU weight structures ---- */
 
 /* Weight tensor: device pointer + per-tensor FP8 scale.
- * scale < 0 means F32 (no dequant); scale >= 0 means raw FP8 bytes. */
+ * scale < 0 means F32 (no dequant); scale >= 0 means raw FP8 bytes.
+ * INT8 (W8A8) path: w = raw int8 bytes, scale = -1, wscale = device per-output-row
+ * [n_out] scale (non-NULL flags int8), n_in = column count (for wt_slice row math). */
 typedef struct {
     void *w;
-    float scale;   /* -1.0 = F32, otherwise FP8 per-tensor scale */
+    float scale;     /* -1.0 = F32 or INT8; otherwise FP8 per-tensor scale */
+    float *wscale;   /* non-NULL => INT8: device per-output-row scale [n_out] */
+    int   n_in;      /* INT8 only: column count, for wt_slice row offset */
 } flux2_hip_wt;
 
 typedef struct {
@@ -77,6 +81,14 @@ struct hip_flux2_runner {
     void *d_act_fp8;                     /* persistent FP8 activation scratch */
     void *d_act_scales;                  /* persistent per-row scale scratch */
     size_t act_fp8_cap, act_sc_cap;
+    /* INT8 W8A8 (ModelOpt klein int8) */
+    hipFunction_t fn_quant_act_int8;     /* per-token int8 act quant (smooth=NULL) */
+    hipFunction_t fn_gemm_w8a8_pgr2;     /* pipelined int8 WMMA (fast path) */
+    hipFunction_t fn_gemm_w8a8_wmma;     /* simple int8 WMMA (any n_tok) */
+    hipFunction_t fn_gemm_w8a8_scalar;   /* scalar dp4a fallback (FLUX2_INT8_DP4A) */
+    void *d_act_int8; float *d_act_iscale;
+    size_t act_i8_cap, act_isc_cap;
+    int use_int8;                        /* 1 = INT8 W8A8 weights detected */
     hipFunction_t fn_gemm_fp8_bf16_wmma; /* BF16 act × FP8 wt (BF16 WMMA) */
     hipFunction_t fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_swiglu, fn_flash_attn;
@@ -169,7 +181,7 @@ static void flux2_fp8_lut_host_init(void) {
  * If use_fp8 == 0, always dequants to F32 regardless of storage dtype. */
 static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                                       const char *wname, const char *sname) {
-    flux2_hip_wt out = { NULL, -1.0f };
+    flux2_hip_wt out = { NULL, -1.0f, NULL, 0 };
     int widx = safetensors_find(st, wname);
     if (widx < 0) return out;
 
@@ -186,6 +198,26 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
         if (sname) {
             int sidx = safetensors_find(st, sname);
             if (sidx >= 0) out.scale = *(const float *)safetensors_data(st, sidx);
+        }
+        return out;
+    }
+
+    /* INT8 W8A8: raw int8 weight + per-output-row weight_scale [n_out] (F32).
+     * ModelOpt also ships a scalar input_scale per layer — we ignore it and use
+     * dynamic per-token activation quant (more accurate; the int8 GEMM is exact). */
+    if (strcmp(dtype, "I8") == 0) {
+        const void *data = safetensors_data(st, widx);
+        out.w = hip_upload_raw(data, n);            /* 1 byte/element */
+        out.scale = -1.0f;
+        out.n_in = (nd >= 2) ? (int)sh[1] : 0;
+        if (sname) {
+            int sidx = safetensors_find(st, sname);
+            if (sidx >= 0) {
+                int snd = safetensors_ndims(st, sidx);
+                const uint64_t *ssh = safetensors_shape(st, sidx);
+                size_t sn = 1; for (int i = 0; i < snd; i++) sn *= ssh[i];  /* = n_out */
+                out.wscale = (float *)hip_upload_raw(safetensors_data(st, sidx), sn * sizeof(float));
+            }
         }
         return out;
     }
@@ -326,9 +358,74 @@ static void op_gemm_fp8_bf16_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, flo
     hipModuleLaunchKernel(r->fn_gemm_fp8_bf16_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, args, NULL);
 }
 
-/* Dispatch: FP8 (scale >= 0) vs F32 (scale == -1). */
+/* INT8 W8A8: dynamic per-token int8 act quant (smooth=NULL) + int8×int8 WMMA with
+ * fused dequant (xscale[t]*wscale[o]) + bias. Mirrors qimg op_gemm_int8 + the fp8
+ * pipe32 lazy-scratch pattern. wscale = device per-output-row scale [n_out]. */
+static void op_gemm_int8(hip_flux2_runner *r, void *Y, void *Wq, float *wscale,
+                         void *X, void *bias, int n_out, int n_in, int n_tok) {
+    int M_pad = ((n_tok + 127) / 128) * 128;
+    size_t need_x = (size_t)M_pad * (size_t)n_in;     /* int8 bytes */
+    size_t need_s = (size_t)M_pad * sizeof(float);
+    if (r->act_i8_cap < need_x) {
+        if (r->d_act_int8) hipFree(r->d_act_int8);
+        hipMalloc(&r->d_act_int8, need_x); r->act_i8_cap = need_x;
+    }
+    if (r->act_isc_cap < need_s) {
+        if (r->d_act_iscale) hipFree(r->d_act_iscale);
+        hipMalloc((void **)&r->d_act_iscale, need_s); r->act_isc_cap = need_s;
+    }
+    void *smooth = NULL;
+    void *qa[] = {&X, &smooth, &r->d_act_int8, &r->d_act_iscale, &n_tok, &n_in};
+    hipModuleLaunchKernel(r->fn_quant_act_int8, (unsigned)n_tok, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
+    static int i8_dp4a = -1; if (i8_dp4a < 0) i8_dp4a = getenv("FLUX2_INT8_DP4A") ? 1 : 0;
+    if (r->fn_gemm_w8a8_pgr2 && !i8_dp4a && (n_out % 128) == 0 && (n_in % 32) == 0) {
+        /* Pipelined int8 WMMA; M_pad-padded rows are store-gated (row<n_tok). */
+        void *gp[] = {&Y, &Wq, &r->d_act_int8, &bias, &r->d_act_iscale, &wscale, &n_out, &n_in, &n_tok, &M_pad};
+        hipModuleLaunchKernel(r->fn_gemm_w8a8_pgr2, (unsigned)(n_out / 128), (unsigned)(M_pad / 128), 1,
+                              128, 1, 1, 0, NULL, gp, NULL);
+    } else if (r->fn_gemm_w8a8_wmma && !i8_dp4a) {
+        void *ga[] = {&Y, &Wq, &wscale, &r->d_act_int8, &r->d_act_iscale, &bias, &n_out, &n_in, &n_tok};
+        hipModuleLaunchKernel(r->fn_gemm_w8a8_wmma, (unsigned)((n_out + 127) / 128), (unsigned)((n_tok + 127) / 128), 1,
+                              256, 1, 1, 0, NULL, ga, NULL);
+    } else {
+        void *ga[] = {&Y, &Wq, &wscale, &r->d_act_int8, &r->d_act_iscale, &bias, &n_out, &n_in, &n_tok};
+        hipModuleLaunchKernel(r->fn_gemm_w8a8_scalar, (unsigned)((n_out + 127) / 128), (unsigned)n_tok, 1,
+                              128, 1, 1, 0, NULL, ga, NULL);
+    }
+    /* One-shot self-test: host ref (Wq*wscale)·x + bias vs GPU Y. FLUX2_INT8_DEBUG=1. */
+    static int i8_dbg_done = 0;
+    if (getenv("FLUX2_INT8_DEBUG") && !i8_dbg_done && n_tok >= 64 && n_tok <= 4096) {
+        i8_dbg_done = 1; hipDeviceSynchronize();
+        signed char *hW = (signed char *)malloc((size_t)n_out * n_in);
+        float *hws = (float *)malloc((size_t)n_out * 4);
+        float *hX = (float *)malloc((size_t)n_tok * n_in * 4);
+        float *hY = (float *)malloc((size_t)n_tok * n_out * 4);
+        float *hb = bias ? (float *)malloc((size_t)n_out * 4) : NULL;
+        hipMemcpy(hW, Wq, (size_t)n_out * n_in, hipMemcpyDeviceToHost);
+        hipMemcpy(hws, wscale, (size_t)n_out * 4, hipMemcpyDeviceToHost);
+        hipMemcpy(hX, X, (size_t)n_tok * n_in * 4, hipMemcpyDeviceToHost);
+        hipMemcpy(hY, Y, (size_t)n_tok * n_out * 4, hipMemcpyDeviceToHost);
+        if (hb) hipMemcpy(hb, bias, (size_t)n_out * 4, hipMemcpyDeviceToHost);
+        int t = n_tok / 2; double dot = 0, nr = 0, ng = 0;
+        for (int o = 0; o < n_out; o++) {
+            double acc = 0;
+            for (int k = 0; k < n_in; k++) acc += (double)hW[(size_t)o*n_in+k] * hws[o] * hX[(size_t)t*n_in+k];
+            if (hb) acc += hb[o];
+            double g = hY[(size_t)t*n_out+o]; dot += acc*g; nr += acc*acc; ng += g*g;
+        }
+        fprintf(stderr, "[int8dbg] n_out=%d n_in=%d n_tok=%d cos(gpu,host)=%.5f ||host||=%.3g ||gpu||=%.3g\n",
+                n_out, n_in, n_tok, dot/(sqrt(nr)*sqrt(ng)+1e-30), sqrt(nr), sqrt(ng));
+        free(hW); free(hws); free(hX); free(hY); if (hb) free(hb);
+    }
+}
+
+/* Dispatch: INT8 (wscale!=NULL) vs FP8 (scale >= 0) vs F32 (scale == -1). */
 static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
                        void *X, void *bias, int n_out, int n_in, int n_tok) {
+    if (W->wscale) {
+        op_gemm_int8(r, Y, W->w, W->wscale, X, bias, n_out, n_in, n_tok);
+        return;
+    }
     if (W->scale >= 0.0f) {
         if (r->use_wmma == 2 &&
             op_gemm_fp8_pipe32(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok) == 0)
@@ -349,10 +446,12 @@ static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
 /* Slice a weight tensor by element offset. FP8 storage is 1 byte/element,
  * F32 storage is 4 bytes/element; scale is preserved. */
 static flux2_hip_wt wt_slice(const flux2_hip_wt *w, size_t elem_offset) {
-    size_t esz = (w->scale >= 0.0f) ? 1 : 4;
-    flux2_hip_wt out;
+    /* INT8 and FP8 both store 1 byte/element; F32 stores 4. */
+    size_t esz = (w->scale >= 0.0f || w->wscale) ? 1 : 4;
+    flux2_hip_wt out = *w;
     out.w = (char *)w->w + elem_offset * esz;
-    out.scale = w->scale;
+    /* INT8 row-split (e.g. fused QKV): advance the per-output-row scale too. */
+    if (w->wscale && w->n_in > 0) out.wscale = w->wscale + elem_offset / (size_t)w->n_in;
     return out;
 }
 
@@ -540,6 +639,15 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         r->fn_flux2_quant_clamp = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_fp8_bf16_wmma, mod, "gemm_fp8w_bf16a_wmma_t") != hipSuccess)
         r->fn_gemm_fp8_bf16_wmma = NULL;
+    /* INT8 W8A8 kernels (tolerate missing on non-gfx12). */
+    if (hipModuleGetFunction(&r->fn_quant_act_int8,   mod, "quant_act_perrow_int8") != hipSuccess)
+        r->fn_quant_act_int8 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_pgr2,   mod, "gemm_w8a8_pgr2") != hipSuccess)
+        r->fn_gemm_w8a8_pgr2 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_wmma,   mod, "gemm_w8a8_wmma") != hipSuccess)
+        r->fn_gemm_w8a8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_scalar, mod, "gemm_w8a8_perrow_f32") != hipSuccess)
+        r->fn_gemm_w8a8_scalar = NULL;
     hipModuleGetFunction(&r->fn_layernorm,   mod, "layernorm_f32");
     hipModuleGetFunction(&r->fn_silu,        mod, "silu_f32");
     hipModuleGetFunction(&r->fn_adaln,       mod, "adaln_modulate_f32");
@@ -649,6 +757,7 @@ static void upload_stream_st(hip_flux2_runner *r, flux2_hip_stream_t *gs,
 
 static void free_wt(flux2_hip_wt *wt) {
     if (wt && wt->w) { hipFree(wt->w); wt->w = NULL; }
+    if (wt && wt->wscale) { hipFree(wt->wscale); wt->wscale = NULL; }
 }
 static void free_stream(flux2_hip_stream_t *gs) {
     free_wt(&gs->qkv);
@@ -695,6 +804,27 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         out_mlp->w  = hip_upload_raw(mlp_, (size_t)H * n_ff);
         out_mlp->scale  = scale;
         free(attn); free(mlp_);
+        return 0;
+    }
+
+    if (strcmp(dtype, "I8") == 0) {
+        /* INT8 column-split: both halves keep the same per-output-row scale [H]. */
+        const int8_t *src = (const int8_t *)safetensors_data(st, widx);
+        int8_t *attn = (int8_t *)malloc((size_t)H * H);
+        int8_t *mlp_ = (int8_t *)malloc((size_t)H * n_ff);
+        for (int row = 0; row < H; row++) {
+            memcpy(attn + (size_t)row * H,    src + (size_t)row * l2_in,     (size_t)H);
+            memcpy(mlp_ + (size_t)row * n_ff, src + (size_t)row * l2_in + H, (size_t)n_ff);
+        }
+        out_attn->w = hip_upload_raw(attn, (size_t)H * H);   out_attn->scale = -1.0f; out_attn->n_in = H;
+        out_mlp->w  = hip_upload_raw(mlp_, (size_t)H * n_ff); out_mlp->scale  = -1.0f; out_mlp->n_in = n_ff;
+        free(attn); free(mlp_);
+        /* Separate device copies per half so free_wt never double-frees. */
+        const float *ws = (sidx >= 0) ? (const float *)safetensors_data(st, sidx) : NULL;
+        if (ws) {
+            out_attn->wscale = (float *)hip_upload_raw(ws, (size_t)H * sizeof(float));
+            out_mlp->wscale  = (float *)hip_upload_raw(ws, (size_t)H * sizeof(float));
+        }
         return 0;
     }
 
@@ -758,9 +888,24 @@ int hip_flux2_load_dit(hip_flux2_runner *r, const char *path) {
         return -1;
     }
 
+    /* Auto-detect INT8 (W8A8) checkpoint: probe a known linear's dtype. INT8 takes
+     * its own GEMM path (per-row weight_scale + dynamic per-token act), so disable
+     * the FP8 LUT/WMMA paths. Requires the int8 kernels (gfx12). */
+    {
+        int pidx = safetensors_find(st, "single_blocks.0.linear1.weight");
+        if (pidx >= 0 && strcmp(safetensors_dtype(st, pidx), "I8") == 0) {
+            if (!r->fn_quant_act_int8 || !(r->fn_gemm_w8a8_pgr2 || r->fn_gemm_w8a8_wmma || r->fn_gemm_w8a8_scalar)) {
+                fprintf(stderr, "hip_flux2: INT8 checkpoint but int8 kernels missing (not gfx12?)\n");
+                safetensors_close(st); flux2_dit_free(r->dit); r->dit = NULL; return -1;
+            }
+            r->use_int8 = 1; r->use_fp8 = 0; r->use_fp8_opt = 0; r->use_wmma = 0;
+            if (r->verbose >= 1) fprintf(stderr, "hip_flux2: INT8 W8A8 weights detected\n");
+        }
+    }
+
     if (r->verbose >= 1)
         fprintf(stderr, "hip_flux2: uploading weights to GPU (H=%d, %d+%d blocks, %s)...\n",
-                r->H, r->n_dbl, r->n_sgl, r->use_fp8 ? "FP8 raw" : "F32 dequanted");
+                r->H, r->n_dbl, r->n_sgl, r->use_int8 ? "INT8 W8A8" : (r->use_fp8 ? "FP8 raw" : "F32 dequanted"));
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1172,6 +1317,10 @@ void hip_flux2_free(hip_flux2_runner *r) {
 
     if (r->dit) flux2_dit_free(r->dit);
     if (r->vae) flux2_vae_free(r->vae);
+    if (r->d_act_fp8)    hipFree(r->d_act_fp8);
+    if (r->d_act_scales) hipFree(r->d_act_scales);
+    if (r->d_act_int8)   hipFree(r->d_act_int8);
+    if (r->d_act_iscale) hipFree(r->d_act_iscale);
     if (r->mod) hipModuleUnload(r->mod);
     free(r);
 }
