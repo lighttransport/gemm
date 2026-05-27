@@ -1443,6 +1443,29 @@ struct cuda_qimg_runner {
     CUevent     block_barrier_unc;   /* uncond-done barrier */
     CUevent     mod_ready;           /* modulation computed (both streams wait on this) */
 
+    /* CUDA graph capture of the per-step DiT block loop (opt-in QIMG_CUDA_GRAPH=1).
+     * After warmup the block loop is a fixed kernel sequence: all scratch allocs
+     * are stable, streamed weights come from fixed pinned sources into the fixed
+     * single scratch slot, and the bf16 low-rank cuBLAS calls reuse a cached
+     * plan + preallocated workspace. We capture that sequence once and replay it
+     * each denoise step, dropping ~7800 kernel launches/step. Requires the
+     * default single-stream single-slot config (no QIMG_PIPELINE / QIMG_CFG_STREAMS).
+     *
+     * MEASURED (2026-05-27, RTX 5060 Ti): byte-identical output but NO speedup
+     * (256^2 1.14->1.14, 512^2 1.80->1.80 s/step). Launch overhead is NOT the
+     * bottleneck here — the step is bound by GPU compute + serialized H2D
+     * weight streaming (which the graph reproduces, still serialized by the
+     * single-slot dependency); the CPU stays ahead of the GPU because the FP4
+     * kernels are large. Kept as correct, default-OFF scaffolding: it would only
+     * pay off if combined with H2D/compute overlap (double-buffer pipeline) or if
+     * future fusion shrinks the kernels enough to expose launch latency. */
+    int         qg_enabled;     /* QIMG_CUDA_GRAPH requested */
+    int         qg_warm;        /* warmup steps completed (capture once >= 2) */
+    int         qg_ready;       /* qg_exec valid for the captured shape */
+    CUgraph     qg_graph;
+    CUgraphExec qg_exec;
+    int         qg_n_img, qg_n_txt_c, qg_n_txt_u;  /* shape graph was captured for */
+
     /* Main CFG DiT activation slots. These buffers are reused across denoise
      * steps and grown on demand for larger resolutions/text lengths. */
     cu_buf_slot cfg_slots[QIMG_CFG_BUF_COUNT];
@@ -1928,6 +1951,22 @@ static void qimg_free_block(qimg_block_gpu *b) {
     for (int i = 0; i < n; i++) {
         if (ptrs[i]) { cuMemFree(ptrs[i]); ptrs[i] = 0; }
     }
+}
+
+/* Double-buffered weight streaming overlaps each streamed block's H2D copy with
+ * the previous block's compute (second scratch slot + copy_stream). It is
+ * byte-identical to the single-slot synchronous path.
+ *   - W4A4: ON by default — the streamed slot is mod-only (~113 MB) and the FP4
+ *     step is so fast that the serialized H2D is a large fraction; big win
+ *     (512^2 1.48 -> 1.12, 256^2 0.84 -> 0.50 s/step). QIMG_PIPELINE=0 opts out.
+ *   - FP8/int8: OFF by default — the streamed slot is a full block (~324 MB) so
+ *     the 2nd slot eats preload headroom, and the benefit is marginal (compute
+ *     is cheap, H2D dominates regardless). Opt IN with QIMG_PIPELINE=1.
+ * Any explicit QIMG_PIPELINE value overrides the per-path default. */
+static int qimg_want_pipeline(const cuda_qimg_runner *r) {
+    const char *e = getenv("QIMG_PIPELINE");
+    if (e) return e[0] != '0';
+    return r->use_w4a4;
 }
 
 /* Allocate the per-runner scratch block slot once. Reserves one block's
@@ -3875,6 +3914,16 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
                 fprintf(stderr, "cuda_qimg: parallel CFG streams enabled\n");
         }
     }
+    /* CUDA graph capture of the per-step DiT block loop: opt-in via
+     * QIMG_CUDA_GRAPH=1. Incompatible with the multi-stream CFG path and the
+     * double-buffer pipeline, which are checked again at capture time. */
+    r->qg_enabled = (getenv("QIMG_CUDA_GRAPH") != NULL);
+    if (r->qg_enabled && r->uncond_stream) {
+        fprintf(stderr, "cuda_qimg: QIMG_CUDA_GRAPH ignored (incompatible with QIMG_CFG_STREAMS)\n");
+        r->qg_enabled = 0;
+    }
+    if (r->qg_enabled && verbose)
+        fprintf(stderr, "cuda_qimg: CUDA graph capture of DiT block loop enabled\n");
     /* FP8 flash attention: opt-in via QIMG_FP8_ATTN=1. */
     r->use_fp8_attn = 0;
     {
@@ -4226,12 +4275,12 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         } else {
             fprintf(stderr, "cuda_qimg: scratch slot alloc failed\n");
         }
-        if (getenv("QIMG_PIPELINE")) {
+        if (qimg_want_pipeline(r)) {
             if (qimg_alloc_scratch_block_b(r) == 0) {
                 if (r->verbose)
-                    fprintf(stderr, "cuda_qimg: 2nd scratch slot allocated\n");
+                    fprintf(stderr, "cuda_qimg: 2nd scratch slot allocated (double-buffer H2D)\n");
             } else {
-                fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed\n");
+                fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed — single-slot streaming\n");
             }
         }
 
@@ -4333,6 +4382,8 @@ int cuda_qimg_load_vae(cuda_qimg_runner *r, const char *path) {
 
 void cuda_qimg_free(cuda_qimg_runner *r) {
     if (!r) return;
+    if (r->qg_exec)  { cuGraphExecDestroy(r->qg_exec); r->qg_exec = NULL; }
+    if (r->qg_graph) { cuGraphDestroy(r->qg_graph);    r->qg_graph = NULL; }
     /* Free preloaded blocks */
     if (r->gpu_blocks) {
         for (int i = 0; i < r->n_preloaded; i++)
@@ -4853,15 +4904,16 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
      *  - slot_ready[i] : fires when copy_stream finished filling slot i
      *  - slot_free[i]  : fires when r->stream finished reading slot i
      */
-    /* Double-buffered on-demand block load is OFF by default — measured
-     * identical to the single-slot path (7.19 s/step at 512x512 with
-     * max_preload=12 → 48 on-demand blocks, pipeline on vs off differs
-     * by 10 ms). The copy engine on sm_89+ GPUs already runs concurrent
-     * with SM compute even when both are queued on one stream, so manual
-     * double-buffering adds event overhead without unlocking new parallelism.
-     * Kept behind QIMG_PIPELINE=1 for future experimentation. */
+    /* Double-buffered on-demand block load is ON by default (opt out with
+     * QIMG_PIPELINE=0). An earlier note claimed "no benefit" — that was the
+     * FP8 era (7.19 s/step) where compute dwarfed the H2D, AND the pipeline was
+     * broken for W4A4 (the preload check tested attn_q_w, which is NULL under
+     * W4A4, so every block fell into the pipeline branch with slot_used<0 and
+     * crashed). With FP4 the step is ~1.1 s and the streamed mod-weight H2D is a
+     * large serialized fraction on r->stream; overlapping it onto copy_stream is
+     * byte-identical and a large win (512^2 1.48 -> 1.12, 256^2 0.84 -> 0.50). */
     int use_pipeline = 0;
-    if (getenv("QIMG_PIPELINE") && r->scratch_block_b_ready &&
+    if (qimg_want_pipeline(r) && r->scratch_block_b_ready &&
         r->n_preloaded < r->dit_n_blocks) {
         use_pipeline = 1;
     }
@@ -4887,7 +4939,14 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
 
         qimg_block_gpu blk;
         int slot_used = -1;  /* which double-buffer slot (0/1) this block consumed */
-        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+        /* Use img_mod_w (not attn_q_w) to detect a preloaded block: under W4A4
+         * the dense attn/mlp weights live in fp4_blocks[] so gpu_blocks[L].attn_q_w
+         * is NULL even when the block IS preloaded — only the streamed mod/bias
+         * tensors land in gpu_blocks[L]. img_mod_w is populated in both the FP8
+         * and W4A4 preload paths. (The old attn_q_w check made every W4A4 block
+         * miss preload: they re-streamed in the single-slot path, and in the
+         * pipeline path fell through to slot_used=(L-n_preloaded)%2 < 0 → OOB.) */
+        if (L < r->n_preloaded && r->gpu_blocks[L].img_mod_w) {
             blk = r->gpu_blocks[L];
         } else if (use_pipeline) {
             int od = L - r->n_preloaded;
@@ -5128,6 +5187,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     double alloc_t0 = 0;
     if (alloc_timing) { cuStreamSynchronize(s); alloc_t0 = (double)clock()/CLOCKS_PER_SEC; }
     int rc = -1;
+    int qg_capturing = 0;   /* CUDA-graph capture in progress (function-scope so
+                             * 'cleanup' can end a capture aborted by a goto). */
     CUdeviceptr d_img_c = 0, d_img_u = 0;
     CUdeviceptr d_txt_c = 0, d_txt_u = 0;
     CUdeviceptr d_img_in = 0;
@@ -5269,10 +5330,10 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         fprintf(stderr, "  [alloc] %6.3fs (free now: %.2f GB)\n", dt, (float)fm/(1<<30));
     }
 
-    /* ---- 4. Block loop with optional double-buffered on-demand loading.
-     *       OFF by default — see dit_step comment above. ---- */
+    /* ---- 4. Block loop with double-buffered on-demand loading.
+     *       ON by default (QIMG_PIPELINE=0 opts out) — see dit_step comment. ---- */
     int use_pipeline = 0;
-    if (getenv("QIMG_PIPELINE") && r->scratch_block_b_ready &&
+    if (qimg_want_pipeline(r) && r->scratch_block_b_ready &&
         r->n_preloaded < r->dit_n_blocks) {
         use_pipeline = 1;
     }
@@ -5289,6 +5350,38 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
     int vae_blk_timing = (getenv("QIMG_BLK_TIMING") != NULL);
     double blk_t0 = 0;
+
+    /* ---- CUDA graph: replay a previously-captured block loop, or capture it
+     *      now after warmup. The captured region is exactly the for(L) loop
+     *      below; the per-step input uploads + timestep embedding (above) and
+     *      the final proj + DtoH (below) stay outside the graph. Requires the
+     *      default single-stream single-slot config; the multi-stream CFG path,
+     *      double-buffer pipeline, and any per-step host sync (verbose /
+     *      *_timing / profile_block) gate it off. ---- */
+    int qg_active = (r->qg_enabled && !use_pipeline && r->uncond_stream == NULL
+                     && r->verbose < 2 && !alloc_timing && !vae_blk_timing
+                     && !r->profile_block);
+    int qg_shape_ok = (r->qg_ready && r->qg_n_img == n_img
+                       && r->qg_n_txt_c == n_txt_cond && r->qg_n_txt_u == n_txt_uncond);
+    qg_capturing = 0;       /* (declared at function top for the cleanup path) */
+    int qg_did_replay = 0;
+    if (qg_active && qg_shape_ok) {
+        if (cuGraphLaunch(r->qg_exec, s) == CUDA_SUCCESS) qg_did_replay = 1;
+        else r->qg_enabled = 0;   /* replay failed unexpectedly: run the loop instead */
+    }
+    if (qg_active && r->qg_ready && !qg_shape_ok) {
+        /* Shape changed since capture (new resolution / prompt length): drop the
+         * stale graph and recapture for the new shape below. */
+        if (r->qg_exec)  { cuGraphExecDestroy(r->qg_exec); r->qg_exec = NULL; }
+        if (r->qg_graph) { cuGraphDestroy(r->qg_graph);    r->qg_graph = NULL; }
+        r->qg_ready = 0;
+    }
+    for (int attempt = 0; !qg_did_replay && attempt < 2; attempt++) {
+      qg_capturing = 0;
+      if (attempt == 0 && qg_active && r->qg_warm >= 2 && !r->qg_ready) {
+          if (cuStreamBeginCapture_v2(s, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) == CUDA_SUCCESS)
+              qg_capturing = 1;
+      }
     for (int L = 0; L < r->dit_n_blocks; L++) {
         if (vae_blk_timing) { cuStreamSynchronize(s); blk_t0 = (double)clock()/CLOCKS_PER_SEC; }
         if (r->verbose && (L % 10 == 0 || L == r->dit_n_blocks - 1))
@@ -5296,7 +5389,10 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
         qimg_block_gpu blk;
         int slot_used = -1;
-        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+        /* img_mod_w (not attn_q_w): under W4A4 the dense attn/mlp weights are in
+         * fp4_blocks[], so attn_q_w is NULL even for preloaded blocks. See the
+         * matching note in cuda_qimg_dit_step. */
+        if (L < r->n_preloaded && r->gpu_blocks[L].img_mod_w) {
             blk = r->gpu_blocks[L];
         } else if (use_pipeline) {
             int od = L - r->n_preloaded;
@@ -5399,6 +5495,34 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
                     L < r->n_preloaded ? "" : " (on-demand)");
         }
     }
+      if (!qg_capturing) {
+          if (attempt == 0 && qg_active) r->qg_warm++;
+          break;   /* normal run: the loop executed once */
+      }
+      /* End the capture and instantiate. On success the loop's kernels were
+       * only recorded (not executed), so launch the graph once for this step.
+       * On failure, discard, disable graphs, and let attempt=1 re-run the loop
+       * for real (capture mode produced no GPU side effects). */
+      {
+          CUgraph qg_g = NULL;
+          CUresult qg_ec = cuStreamEndCapture(s, &qg_g);
+          qg_capturing = 0;
+          if (qg_ec == CUDA_SUCCESS && qg_g &&
+              cuGraphInstantiateWithFlags(&r->qg_exec, qg_g, 0) == CUDA_SUCCESS) {
+              r->qg_graph = qg_g;
+              r->qg_ready = 1;
+              r->qg_n_img = n_img; r->qg_n_txt_c = n_txt_cond; r->qg_n_txt_u = n_txt_uncond;
+              QIMG_CFG_CU_OR_CLEANUP(cuGraphLaunch(r->qg_exec, s), "cuda graph first launch");
+              if (getenv("QIMG_CUDA_GRAPH_VERBOSE"))
+                  fprintf(stderr, "cuda_qimg: DiT block loop captured into CUDA graph\n");
+              break;
+          }
+          if (qg_g) cuGraphDestroy(qg_g);
+          r->qg_enabled = 0;
+          fprintf(stderr, "cuda_qimg: CUDA graph capture failed (end=%d) — disabled, re-running step\n",
+                  (int)qg_ec);
+      }
+    }
     if (r->verbose) fprintf(stderr, "\n");
 
     /* ---- 5. Final output: adaLN → proj_out for BOTH cond and uncond ---- */
@@ -5430,6 +5554,15 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
     /* Cleanup */
 cleanup:
+    if (qg_capturing) {
+        /* A fatal error (e.g. block slot OOM) aborted the loop mid-capture.
+         * End the capture so the stream isn't left in a capturing state. */
+        CUgraph qg_abort = NULL;
+        cuStreamEndCapture(s, &qg_abort);
+        if (qg_abort) cuGraphDestroy(qg_abort);
+        qg_capturing = 0;
+        r->qg_enabled = 0;
+    }
     if (rc == 0 && r->profile_block && r->prof_block_count > 0) {
         double n = (double)r->prof_block_count;
         double tot = r->prof_qkv_ms + r->prof_qknorm_ms + r->prof_attn_ms
