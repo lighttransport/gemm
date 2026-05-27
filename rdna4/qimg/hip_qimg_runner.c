@@ -1121,9 +1121,9 @@ static void op_gemm_int8(hip_qimg_runner *r, void *Y, void *Wq, void *wscale, vo
         /* Pipelined int8 WMMA (double-buffered LDS) — the fast path for the big img linears. */
         void *gp[] = {&Y, &Wq, &r->d_xq_int8, &bias, &r->d_x_iscale, &wscale, &n_out, &n_in, &n_tok, &n_tok};
         hipModuleLaunchKernel(r->fn_gemm_w8a8_pgr2, (unsigned)(n_out / 128), (unsigned)(n_tok / 128), 1, 128, 1, 1, 0, NULL, gp, NULL);
-    } else if (r->fn_gemm_w8a8_wmma && !i8_dp4a) {  /* simple int8 WMMA: any size (n_tok=1 txt/mod), tails zero-padded */
+    } else if (r->fn_gemm_w8a8_wmma && !i8_dp4a) {  /* simple int8 WMMA: any size (n_tok=1/19 tails), zero-padded — faster than scalar dp4a even with tile waste */
         hipModuleLaunchKernel(r->fn_gemm_w8a8_wmma, (unsigned)((n_out + 127) / 128), (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, ga, NULL);
-    } else {  /* scalar dp4a fallback (one thread per output) */
+    } else {  /* scalar dp4a fallback (QIMG_INT8_DP4A=1 or no WMMA) */
         hipModuleLaunchKernel(r->fn_gemm_w8a8, (unsigned)((n_out + 127) / 128), (unsigned)n_tok, 1, 128, 1, 1, 0, NULL, ga, NULL);
     }
     /* One-shot kernel self-test: host reference = (Wq*wscale)·(x/smooth)+bias, vs the GEMM Y. */
