@@ -1398,6 +1398,17 @@ static const char hip_qimg_specific_kernels[] =
 "      xr[j]=r*sc; }\n"
 "}\n"
 "\n"
+/* Int4 group-16 symmetric weight roundtrip (per output-channel, 16-col groups,
+ * 15 levels -7..7): plain RTN int4 from bf16, no LoRA residual. Diagnostic to
+ * measure simple int4 quality (vs Nunchaku SVDQuant). One block per output row. */
+"__global__ void w_int4_roundtrip_g16(float *__restrict__ w, int n_in) {\n"
+"    float *wr = w + (size_t)blockIdx.x*n_in;\n"
+"    for(int g=0; g*16<n_in; g++){ int n=min(16,n_in-g*16); float *p=wr+g*16;\n"
+"      float m=0; for(int j=0;j<n;j++){float a=fabsf(p[j]); if(a>m)m=a;}\n"
+"      float sc=m/7.0f; if(sc<1e-12f)sc=1e-12f; float inv=1.0f/sc;\n"
+"      for(int j=0;j<n;j++){ float q=roundf(p[j]*inv); if(q>7)q=7; if(q<-7)q=-7; p[j]=q*sc; } }\n"
+"}\n"
+"\n"
 /* Int8 group-64 symmetric weight roundtrip (per output-channel, 64-col groups):
  * quantize each group to int8 (sc=max/127) and dequant. Diagnostic to measure
  * int8 weight precision vs fp8. One block per output row, in place. */
