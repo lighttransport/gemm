@@ -1297,8 +1297,9 @@ struct cuda_qimg_runner {
     CUfunction gemm_w8a8_perrow;        /* int8 GEMM, naive (any shape) */
     CUfunction gemm_int8_pipe_perrow;   /* int8 mma.sync GEMM (n_out%256,n_in%32,n_tok>=16) */
     CUfunction gemm_int8_pipe_perrow_mt4; /* MTILE=4 (64 rows/CTA), n_tok%64==0 */
+    CUfunction gemm_int8_s32;           /* OUR pure int8 mma GEMM -> int32 (no cuBLAS) */
     CUfunction dequant_int32_to_bf16;   /* int32 GEMM out -> bf16 (xscale*wscale+bias) */
-    int use_cublas_int8;                /* cuBLAS int8 GemmEx path (tuned + bit-exact) */
+    int use_cublas_int8;                /* cuBLAS int8 GemmEx available (verify oracle) */
     CUdeviceptr d_yi32_int8;            /* int32 GEMM output scratch */
     size_t yi32_int8_n;
     CUdeviceptr d_xq_int8;              /* [max_n_tok * max_n_in] int8, lazily grown */
@@ -2133,14 +2134,17 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         CUdeviceptr wscale = W;
         CUdeviceptr Wq = W + (size_t)n_out * sizeof(float);
 
-        /* Top path: cuBLAS int8 GemmEx (R_8I x R_8I -> R_32I, COMPUTE_32I).
-         * Library-tuned AND bit-exact (int32 accumulate is order-independent).
-         * Per-token int8 quant -> int32 GEMM -> per-(row x channel) dequant+bias
-         * to bf16. cuBLAS IMMA needs n_out/n_in/n_tok multiples of 4 (qimg always
-         * is). The accumulate can't overflow: n_in*127^2 < 2^31 for n_in up to
-         * ~133k. Falls through to the hand mma/naive paths if scratch OOMs. */
-        if (r->use_cublas_int8 && r->dequant_int32_to_bf16 && r->cublaslt_ctx &&
-            (n_out % 4) == 0 && (n_in % 4) == 0 && (n_tok % 4) == 0) {
+        /* Conforming-shape int8 GEMM: quant X -> int8, int32 GEMM, dequant to bf16.
+         * The GEMM is OUR OWN gemm_int8_s32 mma kernel by default (no cuBLAS, so the
+         * HIP port can mirror it exactly). Our kernel and cuBLAS GemmEx both compute
+         * the EXACT int32 dot product (order-independent), so their int32 outputs are
+         * bit-identical; the shared per-token quant + per-(row x channel) dequant make
+         * the final bf16 identical regardless of which GEMM ran. QIMG_INT8_CUBLAS=1
+         * swaps in cuBLAS (A/B + perf oracle). Verified bit-for-bit by
+         * test_cuda_qimg --test-int8-gemm. */
+        if ((r->gemm_int8_s32 || r->use_cublas_int8) && r->quant_act_perrow_int8 &&
+            r->dequant_int32_to_bf16 &&
+            n_tok >= 16 && (n_out % 256) == 0 && (n_in % 32) == 0 && !r->use_old_gemm) {
             size_t need_q = (size_t)n_tok * n_in;
             size_t need_s = (size_t)n_tok * sizeof(float);
             size_t need_y = (size_t)n_tok * n_out * sizeof(int);
@@ -2167,63 +2171,32 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                 void *qa[] = {&X, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
                 cuLaunchKernel(r->quant_act_perrow_int8, (unsigned)n_tok, 1, 1,
                                256, 1, 1, 0, r->stream, qa, NULL);
-                int rc = cublasew_gemm_int8_s32_rowmajor_nt(
-                    r->cublaslt_ctx, r->d_yi32_int8, Wq, r->d_xq_int8,
-                    n_tok, n_out, n_in);
-                if (rc == 0) {
+                int gemm_ran = 0;
+                int want_cublas = r->use_cublas_int8 && r->cublaslt_ctx &&
+                                  getenv("QIMG_INT8_CUBLAS") &&
+                                  (n_out % 4) == 0 && (n_in % 4) == 0 && (n_tok % 4) == 0;
+                if (want_cublas) {
+                    if (cublasew_gemm_int8_s32_rowmajor_nt(r->cublaslt_ctx, r->d_yi32_int8,
+                            Wq, r->d_xq_int8, n_tok, n_out, n_in) == 0) gemm_ran = 1;
+                    /* cuBLAS rejected -> fall back to our kernel below. */
+                }
+                if (!gemm_ran && r->gemm_int8_s32) {
+                    void *ga[] = {&r->d_yi32_int8, &Wq, &r->d_xq_int8, &n_out, &n_in, &n_tok};
+                    unsigned gx = (unsigned)((n_out + 255) / 256); gx = (gx + 3u) & ~3u;
+                    unsigned gy = (unsigned)((n_tok +  31) /  32); gy = (gy + 3u) & ~3u;
+                    size_t smem = 1024 + 8192 * 2;
+                    cuLaunchKernel(r->gemm_int8_s32, gx, gy, 1, 128, 1, 1,
+                                   smem, r->stream, ga, NULL);
+                    gemm_ran = 1;
+                }
+                if (gemm_ran) {
                     void *da[] = {&Y, &r->d_yi32_int8, &r->d_x_iscale, &wscale,
                                   &bias, &n_out, &n_tok};
-                    unsigned gx = (unsigned)((n_out + 255) / 256);
-                    cuLaunchKernel(r->dequant_int32_to_bf16, gx, (unsigned)n_tok, 1,
+                    unsigned dgx = (unsigned)((n_out + 255) / 256);
+                    cuLaunchKernel(r->dequant_int32_to_bf16, dgx, (unsigned)n_tok, 1,
                                    256, 1, 1, 0, r->stream, da, NULL);
                     return;
                 }
-                /* cuBLAS rejected the shape — fall through to the hand kernel. */
-            }
-        }
-
-        /* Fast path: pipelined mma.sync int8 GEMM (native INT8 tensor cores).
-         * Quantizes X inline per-row; needs row_max from reduce_max_abs_per_row.
-         * Same shape gate as the fp8 perrow pipe. */
-        if (r->gemm_int8_pipe_perrow && r->reduce_max_abs_per_row &&
-            n_tok >= 16 && (n_out % 256) == 0 && (n_in % 32) == 0 && !r->use_old_gemm) {
-            size_t need = (size_t)n_tok * sizeof(float);
-            if (need > r->row_max_buf_n) {
-                if (r->d_row_max_buf) { cuMemFree(r->d_row_max_buf); r->d_row_max_buf = 0; }
-                if (cuMemAlloc(&r->d_row_max_buf, need) == CUDA_SUCCESS) r->row_max_buf_n = need;
-                else r->row_max_buf_n = 0;
-            }
-            if (r->d_row_max_buf) {
-                void *rargs[] = {&r->d_row_max_buf, &X, &n_tok, &n_in};
-                cuLaunchKernel(r->reduce_max_abs_per_row, (unsigned)n_tok, 1, 1,
-                               256, 1, 1, 0, r->stream, rargs, NULL);
-                void *ga[] = {&Y, &Wq, &wscale, &X, &bias, &n_out, &n_in, &n_tok,
-                              &r->d_row_max_buf};
-                unsigned gx = (unsigned)((n_out + 255) / 256);
-                gx = (gx + 3u) & ~3u;
-                /* MTILE=4 (64 rows/CTA) halves the row-tile count -> halves W
-                 * traffic, and the MT2 kernel is W-memory-bandwidth-bound here.
-                 * Same numerics (bit-exact). BUT halving rows/CTA also halves the
-                 * CTA count, and MT4's 128 s32 accumulators raise register pressure
-                 * (occupancy cap 3 vs MT2's 4): below ~512 rows the GPU is left
-                 * underfilled and MT4 is a wash/slight loss (measured 256^2: MT2
-                 * 1.80 vs MT4 1.85 s/step). Above it MT4 wins (512^2: 2.51 -> 2.33).
-                 * So gate on n_tok >= 512 to take the win without the small-M regression. */
-                if (!getenv("QIMG_DISABLE_INT8_MT4") && r->gemm_int8_pipe_perrow_mt4 &&
-                    n_tok >= 512 && (n_tok % 64) == 0) {
-                    unsigned gy4 = (unsigned)((n_tok + 63) / 64);
-                    gy4 = (gy4 + 3u) & ~3u;
-                    size_t smem4 = 2048 + 8192 * 2 + (64 + 64 + 256) * sizeof(float);
-                    cuLaunchKernel(r->gemm_int8_pipe_perrow_mt4, gx, gy4, 1, 128, 1, 1,
-                                   smem4, r->stream, ga, NULL);
-                    return;
-                }
-                unsigned gy = (unsigned)((n_tok +  31) /  32);
-                gy = (gy + 3u) & ~3u;
-                size_t smem = 1024 + 8192 * 2 + (32 + 32 + 256) * sizeof(float);
-                cuLaunchKernel(r->gemm_int8_pipe_perrow, gx, gy, 1, 128, 1, 1,
-                               smem, r->stream, ga, NULL);
-                return;  /* to_bf16 fused into the kernel writeback */
             }
         }
 
@@ -3476,8 +3449,125 @@ static const char *int8_kernels_src =
 "        }\n"
 "    }\n"
 "}\n"
+/* OUR OWN pure int8 x int8 -> int32 GEMM (mma.sync.m16n8k32.s32.s8.s8.s32), no
+ * cuBLAS. Inputs are already int8 (Xq quantized per-token by quant_act_perrow_int8);
+ * output is the RAW int32 dot product (dequant is the separate dequant_int32_to_bf16
+ * kernel). This is a drop-in for cublasGemmEx's int32 contract, so the two can be
+ * compared bit-for-bit (both compute the exact integer sum -> identical regardless of
+ * tiling). Same 4x4 CTA swizzle + cp.async double-buffered W + direct A-fragment load
+ * as the fused kernel; the only differences are int8-X load (no quant) and int32 store
+ * (no dequant). Gate (caller): n_out%256==0, n_in%32==0, n_tok>=16. The HIP port can
+ * mirror this kernel exactly. */
+"__global__ __launch_bounds__(128, 4)\n"
+"void gemm_int8_s32(int *C, const signed char *W, const signed char *Xq,\n"
+"                   int n_out, int n_in, int n_tok) {\n"
+"    extern __shared__ unsigned char i8s32_smem[];\n"
+"    signed char *smX  = (signed char *)i8s32_smem;\n"                /* 32 x 32 s8 = 1024 */
+"    signed char *smW0 = (signed char *)(i8s32_smem + 1024);\n"      /* double-buffered W */
+"    signed char *smW1 = (signed char *)(i8s32_smem + 1024 + 8192);\n"
+"    int blk_lin = blockIdx.y * gridDim.x + blockIdx.x;\n"
+"    int npx_ = gridDim.x; int npy_ = gridDim.y;\n"
+"    int panels_m_ = (npy_ + 3) >> 2;\n"
+"    int per_panel_ = 16;\n"
+"    int panel_id_ = blk_lin / per_panel_;\n"
+"    int in_panel_ = blk_lin - panel_id_ * per_panel_;\n"
+"    int panel_m_id_ = panel_id_ - (panel_id_ / panels_m_) * panels_m_;\n"
+"    int panel_n_id_ = panel_id_ / panels_m_;\n"
+"    int m_in_ = in_panel_ & 3; int n_in__ = in_panel_ >> 2;\n"
+"    int tile_m_ = (panel_m_id_ << 2) + m_in_;\n"
+"    int tile_n_ = (panel_n_id_ << 2) + n_in__;\n"
+"    if (tile_m_ >= npy_ || tile_n_ >= npx_) return;\n"
+"    int tok_base = tile_m_ * 32;\n"
+"    int warp_id  = threadIdx.x / 32;\n"
+"    int out_base_cta = tile_n_ * 256;\n"
+"    int out_base = out_base_cta + warp_id * 64;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int gid  = lane / 4; int tid4 = lane & 3; int tid = threadIdx.x;\n"
+"    if (tok_base >= n_tok) return;\n"
+"    if (out_base_cta >= n_out) return;\n"
+"    int d0[2][8]; int d1[2][8]; int d2[2][8]; int d3[2][8];\n"
+"#pragma unroll\n"
+"    for (int mt = 0; mt < 2; mt++)\n"
+"#pragma unroll\n"
+"        for (int i = 0; i < 8; i++) { d0[mt][i]=0; d1[mt][i]=0; d2[mt][i]=0; d3[mt][i]=0; }\n"
+"    int n_ktiles = n_in / 32;\n"
+"#define LOAD_W_S32(buf, ktile) do {\\\n"
+"        int _k = (ktile) * 32;\\\n"
+"        int _r0 = 2 * tid; int _r1 = _r0 + 1;\\\n"
+"        unsigned int _d0 = (unsigned int)__cvta_generic_to_shared((buf) + _r0 * 32);\\\n"
+"        unsigned int _d1 = (unsigned int)__cvta_generic_to_shared((buf) + _r1 * 32);\\\n"
+"        const signed char *_s0 = W + (size_t)(out_base_cta + _r0) * n_in + _k;\\\n"
+"        const signed char *_s1 = W + (size_t)(out_base_cta + _r1) * n_in + _k;\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d0),     \"l\"(_s0));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d0+16),  \"l\"(_s0+16));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d1),     \"l\"(_s1));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d1+16),  \"l\"(_s1+16));\\\n"
+"    } while (0)\n"
+"    LOAD_W_S32(smW0, 0); asm volatile(\"cp.async.commit_group;\\n\");\n"
+"    if (n_ktiles > 1) { LOAD_W_S32(smW1, 1); asm volatile(\"cp.async.commit_group;\\n\"); }\n"
+"    for (int kt = 0; kt < n_ktiles; kt++) {\n"
+"        int k = kt * 32;\n"
+"        signed char *smW_cur = (kt & 1) ? smW1 : smW0;\n"
+"        /* Load this k-tile of Xq into smX (raw int8 copy, no quant). */\n"
+"        int srow = tid / 4; int scol = (tid & 3) * 8;\n"
+"        int grow = tok_base + srow;\n"
+"        unsigned int p0 = 0, p1 = 0;\n"
+"        if (grow < n_tok) {\n"
+"            const unsigned int *xp = (const unsigned int *)(Xq + (long)grow * n_in + k + scol);\n"
+"            p0 = xp[0]; p1 = xp[1];\n"
+"        }\n"
+"        *(unsigned int *)(smX + srow * 32 + scol    ) = p0;\n"
+"        *(unsigned int *)(smX + srow * 32 + scol + 4) = p1;\n"
+"        if (n_ktiles - kt >= 2) asm volatile(\"cp.async.wait_group 1;\\n\");\n"
+"        else                    asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"        __syncthreads();\n"
+"        unsigned int a0[2], a1[2], a2[2], a3[2];\n"
+"#pragma unroll\n"
+"        for (int mt = 0; mt < 2; mt++) {\n"
+"            int mr = mt * 16;\n"
+"            a0[mt] = *(const unsigned int *)(smX + (mr + gid    ) * 32 + tid4 * 4);\n"
+"            a1[mt] = *(const unsigned int *)(smX + (mr + gid + 8) * 32 + tid4 * 4);\n"
+"            a2[mt] = *(const unsigned int *)(smX + (mr + gid    ) * 32 + tid4 * 4 + 16);\n"
+"            a3[mt] = *(const unsigned int *)(smX + (mr + gid + 8) * 32 + tid4 * 4 + 16);\n"
+"        }\n"
+"#pragma unroll\n"
+"        for (int nt = 0; nt < 8; nt++) {\n"
+"            int bc_local = warp_id * 64 + nt * 8 + gid;\n"
+"            const signed char *bp = smW_cur + bc_local * 32 + tid4 * 4;\n"
+"            unsigned int b0 = *(const unsigned int *)bp;\n"
+"            unsigned int b1 = *(const unsigned int *)(bp + 16);\n"
+"#pragma unroll\n"
+"            for (int mt = 0; mt < 2; mt++) {\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
+"                    : \"+r\"(d0[mt][nt]), \"+r\"(d1[mt][nt]), \"+r\"(d2[mt][nt]), \"+r\"(d3[mt][nt])\n"
+"                    : \"r\"(a0[mt]), \"r\"(a1[mt]), \"r\"(a2[mt]), \"r\"(a3[mt]), \"r\"(b0), \"r\"(b1));\n"
+"            }\n"
+"        }\n"
+"        if (kt + 2 < n_ktiles) {\n"
+"            signed char *smW_next = ((kt + 2) & 1) ? smW1 : smW0;\n"
+"            LOAD_W_S32(smW_next, kt + 2); asm volatile(\"cp.async.commit_group;\\n\");\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"#undef LOAD_W_S32\n"
+"#pragma unroll\n"
+"    for (int mt = 0; mt < 2; mt++) {\n"
+"        int mr = mt * 16;\n"
+"        int yr0 = tok_base + mr + gid; int yr1 = yr0 + 8;\n"
+"#pragma unroll\n"
+"        for (int nt = 0; nt < 8; nt++) {\n"
+"            int yc0 = out_base + nt * 8 + tid4 * 2; int yc1 = yc0 + 1;\n"
+"            if (yr0 < n_tok && yc0 < n_out) C[(long)yr0*n_out+yc0] = d0[mt][nt];\n"
+"            if (yr0 < n_tok && yc1 < n_out) C[(long)yr0*n_out+yc1] = d1[mt][nt];\n"
+"            if (yr1 < n_tok && yc0 < n_out) C[(long)yr1*n_out+yc0] = d2[mt][nt];\n"
+"            if (yr1 < n_tok && yc1 < n_out) C[(long)yr1*n_out+yc1] = d3[mt][nt];\n"
+"        }\n"
+"    }\n"
+"}\n"
 "#endif\n"
-/* Dequant the int32 GEMM output (from cuBLAS int8 GemmEx) to bf16-truncated f32.
+/* Dequant the int32 GEMM output (from our gemm_int8_s32 or cuBLAS int8 GemmEx) to bf16.
  * C is [n_tok, n_out] row-major int32 (== col-major [n_out,n_tok] ldc=n_out).
  * y[t,o] = C[t,o] * (xscale[t] * wscale[o]) + bias[o]. 2-D grid avoids per-elem div. */
 "__global__ void dequant_int32_to_bf16(float *Y, const int *C,\n"
@@ -3585,6 +3675,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_int8_pipe_perrow = NULL;
     if (cuModuleGetFunction(&r->gemm_int8_pipe_perrow_mt4, module, "gemm_int8_pipe_perrow_mt4") != CUDA_SUCCESS)
         r->gemm_int8_pipe_perrow_mt4 = NULL;
+    if (cuModuleGetFunction(&r->gemm_int8_s32, module, "gemm_int8_s32") != CUDA_SUCCESS)
+        r->gemm_int8_s32 = NULL;
     if (cuModuleGetFunction(&r->dequant_int32_to_bf16, module, "dequant_int32_to_bf16") != CUDA_SUCCESS)
         r->dequant_int32_to_bf16 = NULL;
     if (cuModuleGetFunction(&r->quant_f32_to_fp8_e4m3, module, "quant_f32_to_fp8_e4m3") != CUDA_SUCCESS)
@@ -3945,19 +4037,21 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
             r->use_fp8_mma = 0; r->use_fp8_mma_bf16 = 0; r->use_bf16_mma = 0;
             r->use_cublaslt_fp8 = 0;
             fprintf(stderr, "cuda_qimg: INT8 W8A8 weights detected — bit-exact int8 GEMM path\n");
-            /* Top-priority int8 GEMM: cuBLAS int8 GemmEx (R_8I/R_32I/COMPUTE_32I).
-             * Library-tuned like the FP8 cuBLAS-LT path AND bit-exact (int32
-             * accumulate is order-independent). Needs a regular cuBLAS handle
-             * (cublaslt_ctx wraps one) + the int32->bf16 dequant kernel. The
-             * hand mma kernel stays as the fallback. QIMG_DISABLE_INT8_CUBLAS=1
-             * forces the hand kernel (for A/B and HIP-parity debugging). */
+            /* Default int8 GEMM = OUR gemm_int8_s32 mma kernel (no cuBLAS dependency,
+             * so the HIP port can mirror it exactly). cuBLAS int8 GemmEx is set up as
+             * the bit-exact verification oracle (both compute the exact int32 sum):
+             * QIMG_INT8_CUBLAS=1 uses it for the run instead of ours; --test-int8-gemm
+             * compares the two int32 outputs. QIMG_DISABLE_INT8_CUBLAS=1 skips the
+             * oracle setup. */
             if (!getenv("QIMG_DISABLE_INT8_CUBLAS") && r->dequant_int32_to_bf16) {
                 if (!r->cublaslt_ctx) cublasewCreate(&r->cublaslt_ctx, r->stream);
-                if (r->cublaslt_ctx) {
-                    r->use_cublas_int8 = 1;
-                    fprintf(stderr, "cuda_qimg: INT8 cuBLAS GemmEx path enabled (tuned + bit-exact)\n");
-                }
+                if (r->cublaslt_ctx) r->use_cublas_int8 = 1;
             }
+            if (r->gemm_int8_s32)
+                fprintf(stderr, "cuda_qimg: INT8 GEMM = own gemm_int8_s32 (cuBLAS oracle %s)\n",
+                        r->use_cublas_int8 ? "available" : "off");
+            else if (r->use_cublas_int8)
+                fprintf(stderr, "cuda_qimg: INT8 GEMM = cuBLAS GemmEx (own kernel unavailable)\n");
         }
     }
 
