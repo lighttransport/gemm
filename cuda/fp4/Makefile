@@ -12,7 +12,7 @@ CUEW = ../cuew.c ../cuew.h
 
 .PHONY: all clean cublas probe w4a4 help
 
-BINS = cublas_fp4_gemm mma_fp4_probe fp4_gemm_test fp4_w4a4_gemm fp4_w4a4_qkv_test
+BINS = cublas_fp4_gemm mma_fp4_probe fp4_gemm_test fp4_w4a4_gemm fp4_w4a4_qkv_test fp4_w4a4_opt
 
 all: $(BINS)
 
@@ -35,6 +35,11 @@ fp4_w4a4_gemm: fp4_w4a4_gemm.c $(CUEW)
 # Full W4A4 op (quant+gemm+lora) on real block-0 to_qkv data in /tmp/qkv_*.bin
 fp4_w4a4_qkv_test: fp4_w4a4_qkv_test.c $(CUEW)
 	$(CC) $(CFLAGS) -o $@ fp4_w4a4_qkv_test.c ../cuew.c $(LDFLAGS)
+
+# Optimized W4A4 GEMM dev/verify bench: naive oracle vs shared-mem tiled (sync,
+# shipped in cuda/qimg) vs cp.async double-buffer; all bit-exact, ~4-6x over naive
+fp4_w4a4_opt: fp4_w4a4_opt.c $(CUEW)
+	$(CC) $(CFLAGS) -o $@ fp4_w4a4_opt.c ../cuew.c $(LDFLAGS)
 
 cublas: cublas_fp4_gemm
 	./cublas_fp4_gemm
