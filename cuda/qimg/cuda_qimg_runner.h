@@ -1454,6 +1454,9 @@ struct cuda_qimg_runner {
     qimg_fp4_block *fp4_blocks;   /* [dit_n_blocks] resident FP4 weights */
     CUdeviceptr d_fp4_ac, d_fp4_as, d_fp4_d, d_fp4_la, d_fp4_lo;  /* op_gemm_fp4 scratch */
     size_t fp4_ac_n, fp4_as_n, fp4_d_n, fp4_la_n, fp4_lo_n;
+    int lowrank_bf16;            /* FP4 low-rank: 1 = bf16 cuBLAS GEMM (pd/pu bf16), 0 = fp8 op_gemm */
+    CUdeviceptr d_x_bf16, d_la_bf16;  /* bf16-low-rank scratch: X cast, la cast */
+    size_t x_bf16_n, la_bf16_n;
     int prof_block_count;
 };
 
@@ -1550,6 +1553,48 @@ static void qimg_init_fp8_to_f32_lut(void) {
     for (int i = 0; i < 256; i++)
         qimg_cuda_fp8_to_f32_lut[i] = fp8_e4m3_to_f32((uint8_t)i);
     qimg_cuda_fp8_to_f32_lut_init = 1;
+}
+
+/* Upload safetensor as BF16 (for the FP4 low-rank pd/pu: dequant fp8->bf16 at load
+ * so la/lo run as plain bf16 cuBLAS GEMMs with no per-call fp8 quant/dequant). */
+static inline uint16_t qimg_f32_to_bf16_rne(float f) {
+    uint32_t bits; memcpy(&bits, &f, 4);
+    uint32_t r = bits + 0x7FFFu + ((bits >> 16) & 1u);   /* round to nearest even */
+    return (uint16_t)(r >> 16);
+}
+static CUdeviceptr qimg_st_upload_bf16(st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return 0;
+    const uint64_t *shape = safetensors_shape(st, idx);
+    int ndims = safetensors_ndims(st, idx);
+    size_t n = 1;
+    for (int d = 0; d < ndims; d++) n *= shape[d];
+    const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
+    const char *dtype = safetensors_dtype(st, idx);
+    uint16_t *bf = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!bf) return 0;
+    if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0) {
+        qimg_init_fp8_to_f32_lut();
+        for (size_t i = 0; i < n; i++) bf[i] = qimg_f32_to_bf16_rne(qimg_cuda_fp8_to_f32_lut[src[i]]);
+    } else if (strcmp(dtype, "BF16") == 0) {
+        memcpy(bf, src, n * 2);
+    } else if (strcmp(dtype, "F32") == 0) {
+        const float *f32 = (const float *)src;
+        for (size_t i = 0; i < n; i++) bf[i] = qimg_f32_to_bf16_rne(f32[i]);
+    } else {
+        fprintf(stderr, "qimg: unsupported dtype '%s' for bf16 upload %s\n", dtype, name);
+        free(bf); return 0;
+    }
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, n * sizeof(uint16_t));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg: BF16 upload cuMemAlloc(%.1f MB) FAILED (err=%d) for %s\n",
+                (float)(n * 2) / (1 << 20), (int)err, name);
+        free(bf); return 0;
+    }
+    cuMemcpyHtoD(d, bf, n * sizeof(uint16_t));
+    free(bf);
+    return d;
 }
 
 /* Checked cuMemAlloc — returns 0 on failure */
@@ -3294,6 +3339,10 @@ static void op_gemm_fp4(cuda_qimg_runner *r, CUdeviceptr Y, qimg_fp4_lin *w,
     QF_GROW(r->d_fp4_ac,r->fp4_ac_n,ac); QF_GROW(r->d_fp4_as,r->fp4_as_n,as);
     QF_GROW(r->d_fp4_d,r->fp4_d_n,dsz);  QF_GROW(r->d_fp4_la,r->fp4_la_n,lasz);
     QF_GROW(r->d_fp4_lo,r->fp4_lo_n,losz);
+    if (r->lowrank_bf16) {  /* bf16 cast scratch for X and la */
+        QF_GROW(r->d_x_bf16,  r->x_bf16_n,  (size_t)n_tok*n_in*2);
+        QF_GROW(r->d_la_bf16, r->la_bf16_n, (size_t)n_tok*128*2);
+    }
 #undef QF_GROW
     /* 1. activation quant -> Ac, As (n_tok rows) */
     long ng = (long)n_tok * (n_in/16);
@@ -3311,9 +3360,29 @@ static void op_gemm_fp4(cuda_qimg_runner *r, CUdeviceptr Y, qimg_fp4_lin *w,
         void *ga[] = {&r->d_fp4_ac,&w->qw,&r->d_fp4_as,&w->ws,&r->d_fp4_d,&n_tok,&n_out,&n_in};
         cuLaunchKernel(r->k_w4a4_gemm_opt,bx,by,1,256,1,1,0,r->stream,ga,NULL);
     }
-    /* 3. low-rank via existing op_gemm (fp8): la=X@pd^T [tok,128], lo=la@pu^T [tok,out] */
-    op_gemm(r, r->d_fp4_la, w->pd, X, 0, 128, n_in, n_tok);
-    op_gemm(r, r->d_fp4_lo, w->pu, r->d_fp4_la, 0, n_out, 128, n_tok);
+    /* 3. low-rank (SVDQuant residual): la=X@pd^T [tok,128], lo=la@pu^T [tok,out].
+     * QIMG_FP4_NO_LOWRANK=1 skips it (lo=0) — a profiling A/B knob to isolate the
+     * low-rank cost; PRODUCES A WRONG IMAGE (low-rank correction dropped). */
+    if (getenv("QIMG_FP4_NO_LOWRANK")) {
+        cuMemsetD8Async(r->d_fp4_lo, 0, (size_t)n_tok*n_out*4, r->stream);
+    } else if (r->lowrank_bf16 && r->d_x_bf16 && r->d_la_bf16) {
+        /* BF16 cuBLAS path: cast X->bf16, la=X@pd^T, cast la->bf16, lo=la@pu^T.
+         * pd/pu are resident bf16; no per-call fp8 max-reduce/quant/expand. Output
+         * is f32 directly. More accurate (bf16 X) than the fp8 path it replaces. */
+        cast_buf_f32_to_bf16(r, r->d_x_bf16, X, n_tok*n_in);
+        int rc = cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx,
+                     r->d_fp4_la, w->pd, r->d_x_bf16, n_tok, 128, n_in);
+        cast_buf_f32_to_bf16(r, r->d_la_bf16, r->d_fp4_la, n_tok*128);
+        rc |= cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx,
+                     r->d_fp4_lo, w->pu, r->d_la_bf16, n_tok, n_out, 128);
+        if (rc != 0) {  /* cuBLAS rejected -> should not happen; zero the residual */
+            fprintf(stderr, "cuda_qimg: bf16 low-rank GEMM failed (rc=%d)\n", rc);
+            cuMemsetD8Async(r->d_fp4_lo, 0, (size_t)n_tok*n_out*4, r->stream);
+        }
+    } else {
+        op_gemm(r, r->d_fp4_la, w->pd, X, 0, 128, n_in, n_tok);
+        op_gemm(r, r->d_fp4_lo, w->pu, r->d_fp4_la, 0, n_out, 128, n_tok);
+    }
     /* 4. combine: Y = D*wcwt + lo + bias */
     long tot = (long)n_tok * n_out;
     void *ca[] = {&Y,&r->d_fp4_d,&w->wcwt,&r->d_fp4_lo,&bias,&n_tok,&n_out};
@@ -3339,8 +3408,15 @@ static int qimg_load_fp4_weights(cuda_qimg_runner *r) {
             snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.%s", b, qimg_fp4_bases[i], suf); \
             L->field = qimg_st_upload_fp8_raw(st, nm); if (!L->field) return -1; } while(0)
             QF_LD(qw, "qweight_fp4"); QF_LD(ws, "wscales_fp4");
-            QF_LD(pd, "proj_down_fp8"); QF_LD(pu, "proj_up_fp8");
 #undef QF_LD
+            /* low-rank pd/pu: bf16 (dequant fp8->bf16, for the plumbing-free bf16
+             * cuBLAS GEMM path) or raw fp8 (for the legacy fp8 op_gemm path). */
+#define QF_LDPROJ(field, suf) do { \
+            snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.%s", b, qimg_fp4_bases[i], suf); \
+            L->field = r->lowrank_bf16 ? qimg_st_upload_bf16(st, nm) : qimg_st_upload_fp8_raw(st, nm); \
+            if (!L->field) return -1; } while(0)
+            QF_LDPROJ(pd, "proj_down_fp8"); QF_LDPROJ(pu, "proj_up_fp8");
+#undef QF_LDPROJ
             snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wcwt", b, qimg_fp4_bases[i]);
             L->wcwt = qimg_st_upload_f32(st, nm); if (!L->wcwt) return -1;
         }
@@ -4051,10 +4127,25 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         if (qimg_compile_fp4(r) != 0) {
             fprintf(stderr, "cuda_qimg: FP4 W4A4 kernel compile failed\n"); return -1;
         }
+        /* Low-rank (SVDQuant residual) GEMM: default to a plain bf16 cuBLAS path
+         * (pd/pu dequant'd fp8->bf16 at load) which drops the per-call fp8
+         * quant/dequant plumbing (~118 ms/step at 512^2) and is more accurate;
+         * needs the cuBLAS ctx + bulk f32->bf16 cast. QIMG_LOWRANK_FP8=1 forces
+         * the legacy fp8 op_gemm path. Falls back if either is unavailable. */
+        r->lowrank_bf16 = !getenv("QIMG_LOWRANK_FP8");
+        if (r->lowrank_bf16) {
+            if (!r->cublaslt_ctx) cublasewCreate(&r->cublaslt_ctx, r->stream);
+            if (!r->cublaslt_ctx || !r->cast_f32_to_bf16) {
+                fprintf(stderr, "cuda_qimg: bf16 low-rank unavailable (cublas/cast missing) -> fp8\n");
+                r->lowrank_bf16 = 0;
+            }
+        }
         if (qimg_load_fp4_weights(r) != 0) {
             fprintf(stderr, "cuda_qimg: FP4 resident weight load failed (OOM?)\n"); return -1;
         }
-        if (r->verbose) fprintf(stderr, "cuda_qimg: W4A4 OMMA path active\n");
+        if (r->verbose)
+            fprintf(stderr, "cuda_qimg: W4A4 OMMA path active (low-rank=%s)\n",
+                    r->lowrank_bf16 ? "bf16 cuBLAS" : "fp8 op_gemm");
     }
 
     /* Upload global weights — FP8 raw if native GEMM, else GPU dequant to F16 */
