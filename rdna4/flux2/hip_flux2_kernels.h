@@ -1253,6 +1253,89 @@ static const char hip_flux2_specific_kernels[] =
 "#endif\n"
 "\n"
 
+"\n"
+/* ================= INT4 W4A16 RTN g16 (ported verbatim from rdna4/qimg) ============
+ * Simple RTN int4 g16 weight (signed nibble [-7,7], per-(out, group-of-16) bf16 scale),
+ * bf16 activation, F32 accum via WMMA. No SVDQuant LoRA / no smooth / no calibration
+ * the minimal-risk int4 path that "renders clean" in qimg. Adds ~70 lines, self-contained. */
+/* ---- gemm_int4w_g16_bf16a_wmma_t: BF16-act × simple-RTN-int4-g16-wt WMMA.
+ * Identical tiling/lane layout to gemm_fp8w_bf16a_wmma_t; ONLY the B-load
+ * differs. Weight is plain RTN int4 (NO swizzle / LoRA / smoothing):
+ *   qint4  : packed nibbles row-major [n_out, n_in/2], two weights/byte
+ *            (kp even -> low nibble, kp odd -> high), signed 4-bit (-8..7).
+ *   scales : bf16 per (out, group16) [n_out, n_in/16].
+ *   w(col,kp) = signed_nibble * bf16_to_f32(scales[col*(n_in/16) + kp/16]).
+ * Requires n_in % 16 == 0 (all DiT linears are). */
+"#if defined(__gfx1200__) || defined(__gfx1201__)\n"
+"__global__ void gemm_int4w_g16_bf16a_wmma_t(float *Y, const unsigned char *qint4,\n"
+"        const unsigned short *scales, const float *X, const float *bias,\n"
+"        int n_out, int n_in, int n_tok) {\n"
+"    int tid = threadIdx.x; int wave_id = tid >> 5; int lane = tid & 31;\n"
+"    int wM = wave_id & 1; int wN = wave_id >> 1; int half = lane >> 4; int idx = lane & 15; int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128; int cta_n0 = blockIdx.x * 128;\n"
+"    int n_in_h = n_in >> 1; int n_in_g = n_in >> 4;\n"
+"    __shared__ short smA[128*16]; __shared__ short smB[128*16];\n"
+"    typedef float float8 __attribute__((ext_vector_type(8)));\n"
+"    typedef short bf16x8 __attribute__((ext_vector_type(8)));\n"
+"    float8 cv00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};\n"
+"    float8 cv01 = cv00, cv10 = cv00, cv11 = cv00, cv20 = cv00, cv21 = cv00, cv30 = cv00, cv31 = cv00;\n"
+"    for (int k = 0; k < n_in; k += 16) {\n"
+"        for (int it = 0; it < 8; it++) {\n"
+"            int e = tid * 8 + it; int er = e >> 4; int ek = e & 15;\n"
+"            int row = cta_m0 + er; int kp = k + ek;\n"
+"            float xv = (row < n_tok && kp < n_in) ? X[(long)row * n_in + kp] : 0.f;\n"
+"            unsigned int xbits; memcpy(&xbits, &xv, 4); smA[er * 16 + ek] = (short)(xbits >> 16);\n"
+"        }\n"
+"        for (int it = 0; it < 8; it++) {\n"
+"            int e = tid * 8 + it; int er = e >> 4; int ek = e & 15;\n"
+"            int col = cta_n0 + er; int kp = k + ek;\n"
+"            float wv = 0.f;\n"
+"            if (col < n_out && kp < n_in) {\n"
+"                unsigned char byte = qint4[(long)col * n_in_h + (kp >> 1)];\n"
+"                int nib = (kp & 1) ? (byte >> 4) : (byte & 0xF);\n"
+"                int q = (nib >= 8) ? nib - 16 : nib;\n"
+"                unsigned int sb = ((unsigned int)scales[(long)col * n_in_g + (kp >> 4)]) << 16;\n"
+"                float sc; memcpy(&sc, &sb, 4);\n"
+"                wv = (float)q * sc;\n"
+"            }\n"
+"            unsigned int wbits; memcpy(&wbits, &wv, 4); smB[er * 16 + ek] = (short)(wbits >> 16);\n"
+"        }\n"
+"        __syncthreads();\n"
+"        int a_base_row = wM * 64; int b_base_row = wN * 32;\n"
+"        bf16x8 a0, a1, a2, a3, b0, b1;\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            a0[i] = smA[(a_base_row + 0  + idx) * 16 + k_off + i];\n"
+"            a1[i] = smA[(a_base_row + 16 + idx) * 16 + k_off + i];\n"
+"            a2[i] = smA[(a_base_row + 32 + idx) * 16 + k_off + i];\n"
+"            a3[i] = smA[(a_base_row + 48 + idx) * 16 + k_off + i];\n"
+"            b0[i] = smB[(b_base_row + 0  + idx) * 16 + k_off + i];\n"
+"            b1[i] = smB[(b_base_row + 16 + idx) * 16 + k_off + i];\n"
+"        }\n"
+"        cv00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, b0, cv00);\n"
+"        cv01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, b1, cv01);\n"
+"        cv10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, b0, cv10);\n"
+"        cv11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, b1, cv11);\n"
+"        cv20 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2, b0, cv20);\n"
+"        cv21 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2, b1, cv21);\n"
+"        cv30 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3, b0, cv30);\n"
+"        cv31 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3, b1, cv31);\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64; int wave_n0 = cta_n0 + wN * 32;\n"
+"    float8 *accs[8] = {&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31};\n"
+"    int ms[8] = {0,0,16,16,32,32,48,48}; int ns[8] = {0,16,0,16,0,16,0,16};\n"
+"    for (int t = 0; t < 8; t++) {\n"
+"        int col = wave_n0 + ns[t] + idx; if (col >= n_out) continue;\n"
+"        float bv = bias ? bias[col] : 0.f; float8 acc = *accs[t];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int row = wave_m0 + ms[t] + half * 8 + i;\n"
+"            if (row < n_tok) Y[(long)row * n_out + col] = acc[i] + bv;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#endif\n"
+"\n"
+
 /* ---- BF16 WMMA self-attention (head_dim=128), ported from qimg
  * flash_attn_sa_wmma_f32. Replaces the scalar flash_attn_f32 — same math
  * (BF16 inputs, F32 accum, online softmax) so quality is preserved. ---- */
