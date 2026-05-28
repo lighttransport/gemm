@@ -38,12 +38,17 @@
 /* Weight tensor: device pointer + per-tensor FP8 scale.
  * scale < 0 means F32 (no dequant); scale >= 0 means raw FP8 bytes.
  * INT8 (W8A8) path: w = raw int8 bytes, scale = -1, wscale = device per-output-row
- * [n_out] scale (non-NULL flags int8), n_in = column count (for wt_slice row math). */
+ * [n_out] scale (non-NULL flags int8), n_in = column count (for wt_slice row math).
+ * INT4 (W4A16 RTN g16) path: qint4 = packed u8 [n_out, n_in/2] (non-NULL flags int4),
+ * wscale_pg = per-group bf16 scale [n_out, n_in/group_size]. */
 typedef struct {
     void *w;
-    float scale;     /* -1.0 = F32 or INT8; otherwise FP8 per-tensor scale */
-    float *wscale;   /* non-NULL => INT8: device per-output-row scale [n_out] */
-    int   n_in;      /* INT8 only: column count, for wt_slice row offset */
+    float scale;       /* -1.0 = F32/INT8/INT4; otherwise FP8 per-tensor scale */
+    float *wscale;     /* non-NULL => INT8: device per-output-row scale [n_out] */
+    int   n_in;        /* INT8/INT4: column count, for wt_slice row offset */
+    void *qint4;       /* non-NULL => INT4: packed nibbles u8 [n_out, n_in/2] */
+    void *wscale_pg;   /* INT4: per-group bf16 scale [n_out, n_in/group_size] */
+    int   group_size;  /* INT4: 16 for our RTN g16 path */
 } flux2_hip_wt;
 
 typedef struct {
@@ -89,6 +94,9 @@ struct hip_flux2_runner {
     void *d_act_int8; float *d_act_iscale;
     size_t act_i8_cap, act_isc_cap;
     int use_int8;                        /* 1 = INT8 W8A8 weights detected */
+    /* INT4 W4A16 RTN g16 */
+    hipFunction_t fn_gemm_int4w_g16;     /* gemm_int4w_g16_bf16a_wmma_t */
+    int use_int4;                        /* 1 = INT4 weights detected */
     hipFunction_t fn_gemm_fp8_bf16_wmma; /* BF16 act × FP8 wt (BF16 WMMA) */
     hipFunction_t fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_swiglu, fn_flash_attn;
@@ -181,7 +189,40 @@ static void flux2_fp8_lut_host_init(void) {
  * If use_fp8 == 0, always dequants to F32 regardless of storage dtype. */
 static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                                       const char *wname, const char *sname) {
-    flux2_hip_wt out = { NULL, -1.0f, NULL, 0 };
+    flux2_hip_wt out = { 0 }; out.scale = -1.0f;
+
+    /* INT4 W4A16 RTN g16: when the runner is in int4 mode, look for <base>.qint4 +
+     * <base>.wscale (group-16 bf16 scales). Fall through if absent (globals like
+     * img_in.weight stay bf16 passthrough in the int4 checkpoint). */
+    if (r->use_int4) {
+        const char *suf = strstr(wname, ".weight");
+        if (suf) {
+            char base[256]; int blen = (int)(suf - wname);
+            if (blen > 0 && blen < (int)sizeof(base)) {
+                memcpy(base, wname, blen); base[blen] = 0;
+                char qk[260], sk[260];
+                snprintf(qk, sizeof(qk), "%s.qint4",  base);
+                snprintf(sk, sizeof(sk), "%s.wscale", base);
+                int qidx = safetensors_find(st, qk);
+                if (qidx >= 0) {
+                    const uint64_t *qsh = safetensors_shape(st, qidx);   /* [n_out, n_in/2] */
+                    size_t qn = (size_t)qsh[0] * qsh[1];                 /* u8 elems */
+                    out.qint4 = hip_upload_raw(safetensors_data(st, qidx), qn);
+                    out.n_in = (int)(qsh[1] * 2);
+                    out.group_size = 16;
+                    int sidx = safetensors_find(st, sk);
+                    if (sidx >= 0) {
+                        const uint64_t *ssh = safetensors_shape(st, sidx); /* [n_out, n_in/16] bf16 */
+                        size_t sn = (size_t)ssh[0] * ssh[1] * sizeof(uint16_t);
+                        out.wscale_pg = hip_upload_raw(safetensors_data(st, sidx), sn);
+                    }
+                    return out;
+                }
+                /* no .qint4 for this key — fall through to bf16/etc. for global passthrough */
+            }
+        }
+    }
+
     int widx = safetensors_find(st, wname);
     if (widx < 0) return out;
 
@@ -419,9 +460,23 @@ static void op_gemm_int8(hip_flux2_runner *r, void *Y, void *Wq, float *wscale,
     }
 }
 
-/* Dispatch: INT8 (wscale!=NULL) vs FP8 (scale >= 0) vs F32 (scale == -1). */
+/* INT4 W4A16 RTN g16: simple per-group dequant on the WMMA B-load — bf16 act, F32 accum.
+ * Signature: (Y, qint4 [n_out,n_in/2], scales bf16 [n_out,n_in/16], X, bias, n_out, n_in, n_tok). */
+static void op_gemm_int4(hip_flux2_runner *r, void *Y, void *qint4, void *wscale_pg,
+                         void *X, void *bias, int n_out, int n_in, int n_tok) {
+    void *args[] = {&Y, &qint4, &wscale_pg, &X, &bias, &n_out, &n_in, &n_tok};
+    hipModuleLaunchKernel(r->fn_gemm_int4w_g16,
+                          (unsigned)((n_out + 127) / 128),
+                          (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, args, NULL);
+}
+
+/* Dispatch: INT4 (qint4!=NULL) vs INT8 (wscale!=NULL) vs FP8 (scale >= 0) vs F32. */
 static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
                        void *X, void *bias, int n_out, int n_in, int n_tok) {
+    if (W->qint4) {
+        op_gemm_int4(r, Y, W->qint4, W->wscale_pg, X, bias, n_out, n_in, n_tok);
+        return;
+    }
     if (W->wscale) {
         op_gemm_int8(r, Y, W->w, W->wscale, X, bias, n_out, n_in, n_tok);
         return;
@@ -446,9 +501,16 @@ static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
 /* Slice a weight tensor by element offset. FP8 storage is 1 byte/element,
  * F32 storage is 4 bytes/element; scale is preserved. */
 static flux2_hip_wt wt_slice(const flux2_hip_wt *w, size_t elem_offset) {
+    flux2_hip_wt out = *w;
+    if (w->qint4) {
+        /* INT4: qint4 packs 2 nibbles/byte; row-stride bytes = n_in/2 → elem_offset/2 bytes. */
+        out.qint4 = (char *)w->qint4 + elem_offset / 2;
+        if (w->wscale_pg && w->group_size > 0 && w->n_in > 0)
+            out.wscale_pg = (char *)w->wscale_pg + (elem_offset / (size_t)w->group_size) * sizeof(uint16_t);
+        return out;
+    }
     /* INT8 and FP8 both store 1 byte/element; F32 stores 4. */
     size_t esz = (w->scale >= 0.0f || w->wscale) ? 1 : 4;
-    flux2_hip_wt out = *w;
     out.w = (char *)w->w + elem_offset * esz;
     /* INT8 row-split (e.g. fused QKV): advance the per-output-row scale too. */
     if (w->wscale && w->n_in > 0) out.wscale = w->wscale + elem_offset / (size_t)w->n_in;
@@ -648,6 +710,9 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         r->fn_gemm_w8a8_wmma = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_w8a8_scalar, mod, "gemm_w8a8_perrow_f32") != hipSuccess)
         r->fn_gemm_w8a8_scalar = NULL;
+    /* INT4 W4A16 RTN g16 kernel (tolerate-missing on non-gfx12). */
+    if (hipModuleGetFunction(&r->fn_gemm_int4w_g16, mod, "gemm_int4w_g16_bf16a_wmma_t") != hipSuccess)
+        r->fn_gemm_int4w_g16 = NULL;
     hipModuleGetFunction(&r->fn_layernorm,   mod, "layernorm_f32");
     hipModuleGetFunction(&r->fn_silu,        mod, "silu_f32");
     hipModuleGetFunction(&r->fn_adaln,       mod, "adaln_modulate_f32");
@@ -758,6 +823,8 @@ static void upload_stream_st(hip_flux2_runner *r, flux2_hip_stream_t *gs,
 static void free_wt(flux2_hip_wt *wt) {
     if (wt && wt->w) { hipFree(wt->w); wt->w = NULL; }
     if (wt && wt->wscale) { hipFree(wt->wscale); wt->wscale = NULL; }
+    if (wt && wt->qint4) { hipFree(wt->qint4); wt->qint4 = NULL; }
+    if (wt && wt->wscale_pg) { hipFree(wt->wscale_pg); wt->wscale_pg = NULL; }
 }
 static void free_stream(flux2_hip_stream_t *gs) {
     free_wt(&gs->qkv);
@@ -779,13 +846,55 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
     char wn[256], sn[256];
     snprintf(wn, sizeof(wn), "single_blocks.%d.linear2.weight", bi);
     snprintf(sn, sizeof(sn), "single_blocks.%d.linear2.weight_scale", bi);
+    int l2_in = H + n_ff;  /* column count */
+
+    /* INT4 mode has no .weight — only .qint4/.wscale. Handle the column split here
+     * (before the .weight existence check, which would early-return). */
+    if (r->use_int4) {
+        char qk[256], sk2[256];
+        snprintf(qk,  sizeof(qk),  "single_blocks.%d.linear2.qint4",  bi);
+        snprintf(sk2, sizeof(sk2), "single_blocks.%d.linear2.wscale", bi);
+        int qidx_i4 = safetensors_find(st, qk);
+        int sidx_i4 = safetensors_find(st, sk2);
+        if (qidx_i4 < 0 || sidx_i4 < 0) {
+            fprintf(stderr, "hip_flux2: int4 linear2 missing for block %d\n", bi);
+            return -1;
+        }
+        const uint8_t *qsrc = (const uint8_t *)safetensors_data(st, qidx_i4);
+        const uint8_t *ssrc = (const uint8_t *)safetensors_data(st, sidx_i4);
+        size_t row_bytes = (size_t)l2_in / 2;
+        size_t row_grps  = (size_t)l2_in / 16;
+        size_t a_bytes = (size_t)H / 2,  m_bytes = (size_t)n_ff / 2;
+        size_t a_grps  = (size_t)H / 16, m_grps  = (size_t)n_ff / 16;
+        uint8_t *qa = (uint8_t *)malloc((size_t)H * a_bytes);
+        uint8_t *qm = (uint8_t *)malloc((size_t)H * m_bytes);
+        uint8_t *sa = (uint8_t *)malloc((size_t)H * a_grps * sizeof(uint16_t));
+        uint8_t *sm = (uint8_t *)malloc((size_t)H * m_grps * sizeof(uint16_t));
+        for (int row = 0; row < H; row++) {
+            memcpy(qa + (size_t)row*a_bytes, qsrc + (size_t)row*row_bytes,           a_bytes);
+            memcpy(qm + (size_t)row*m_bytes, qsrc + (size_t)row*row_bytes + a_bytes, m_bytes);
+            memcpy(sa + (size_t)row*a_grps*sizeof(uint16_t),
+                   ssrc + (size_t)row*row_grps*sizeof(uint16_t), a_grps*sizeof(uint16_t));
+            memcpy(sm + (size_t)row*m_grps*sizeof(uint16_t),
+                   ssrc + (size_t)row*row_grps*sizeof(uint16_t) + a_grps*sizeof(uint16_t),
+                   m_grps*sizeof(uint16_t));
+        }
+        out_attn->qint4 = hip_upload_raw(qa, (size_t)H*a_bytes);
+        out_attn->wscale_pg = hip_upload_raw(sa, (size_t)H*a_grps*sizeof(uint16_t));
+        out_attn->n_in = H;    out_attn->group_size = 16; out_attn->scale = -1.0f;
+        out_mlp->qint4  = hip_upload_raw(qm, (size_t)H*m_bytes);
+        out_mlp->wscale_pg  = hip_upload_raw(sm, (size_t)H*m_grps*sizeof(uint16_t));
+        out_mlp->n_in  = n_ff; out_mlp->group_size  = 16; out_mlp->scale  = -1.0f;
+        free(qa); free(qm); free(sa); free(sm);
+        return 0;
+    }
+
     int widx = safetensors_find(st, wn);
     if (widx < 0) {
         fprintf(stderr, "hip_flux2: missing %s\n", wn);
         return -1;
     }
     const char *dtype = safetensors_dtype(st, widx);
-    int l2_in = H + n_ff;  /* column count */
 
     float scale = 1.0f;
     int sidx = safetensors_find(st, sn);
@@ -888,10 +997,21 @@ int hip_flux2_load_dit(hip_flux2_runner *r, const char *path) {
         return -1;
     }
 
+    /* Auto-detect INT4 (W4A16 RTN g16) checkpoint: probe single_blocks.0.linear1.qint4.
+     * INT4 has no .weight for quantized linears — only .qint4 + .wscale (bf16 per-group). */
+    if (safetensors_find(st, "single_blocks.0.linear1.qint4") >= 0) {
+        if (!r->fn_gemm_int4w_g16) {
+            fprintf(stderr, "hip_flux2: INT4 checkpoint but int4 kernel missing (not gfx12?)\n");
+            safetensors_close(st); flux2_dit_free(r->dit); r->dit = NULL; return -1;
+        }
+        r->use_int4 = 1; r->use_int8 = 0; r->use_fp8 = 0; r->use_fp8_opt = 0; r->use_wmma = 0;
+        if (r->verbose >= 1) fprintf(stderr, "hip_flux2: INT4 W4A16 RTN g16 weights detected\n");
+    }
+
     /* Auto-detect INT8 (W8A8) checkpoint: probe a known linear's dtype. INT8 takes
      * its own GEMM path (per-row weight_scale + dynamic per-token act), so disable
      * the FP8 LUT/WMMA paths. Requires the int8 kernels (gfx12). */
-    {
+    if (!r->use_int4) {
         int pidx = safetensors_find(st, "single_blocks.0.linear1.weight");
         if (pidx >= 0 && strcmp(safetensors_dtype(st, pidx), "I8") == 0) {
             if (!r->fn_quant_act_int8 || !(r->fn_gemm_w8a8_pgr2 || r->fn_gemm_w8a8_wmma || r->fn_gemm_w8a8_scalar)) {
@@ -905,7 +1025,9 @@ int hip_flux2_load_dit(hip_flux2_runner *r, const char *path) {
 
     if (r->verbose >= 1)
         fprintf(stderr, "hip_flux2: uploading weights to GPU (H=%d, %d+%d blocks, %s)...\n",
-                r->H, r->n_dbl, r->n_sgl, r->use_int8 ? "INT8 W8A8" : (r->use_fp8 ? "FP8 raw" : "F32 dequanted"));
+                r->H, r->n_dbl, r->n_sgl,
+                r->use_int4 ? "INT4 W4A16 g16" :
+                (r->use_int8 ? "INT8 W8A8" : (r->use_fp8 ? "FP8 raw" : "F32 dequanted")));
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
