@@ -31,12 +31,15 @@ typedef enum {
 typedef struct {
     const char *safetensors_dir;
     const char *mhr_assets_dir;
-    int image_size;          /* 512 for dinov3_vith16plus; for VITH this
-                              * is the input height (W is fixed at 384) */
+    int image_size;          /* Legacy square size / default height. */
+    int image_height;        /* DINOv3 input height; 0 -> image_size. */
+    int image_width;         /* DINOv3 input width; 0 -> image_size.
+                              * For VITH the input remains fixed 512x384. */
     int device_ordinal;
     int verbose;
-    /* precision: "bf16" (upstream/PyTorch reference), "fp16" (faster).
-     * NULL or "" -> "bf16". */
+    /* precision: "fp16" (default fast F16-weight path), "fp32" (DINOv3
+     * f32 block weights), "bf16" (extra activation round-trips for
+     * diagnosis). NULL or "" -> "fp16". */
     const char *precision;
     /* Backbone variant. Defaults to DINOV3 (=0) when zero-initialized. */
     cuda_sam3d_body_backbone_t backbone;
@@ -74,7 +77,7 @@ int cuda_sam3d_body_debug_override_encoder(cuda_sam3d_body_ctx *ctx,
 int cuda_sam3d_body_debug_override_mhr_params(cuda_sam3d_body_ctx *ctx,
                                               const float *params, int n);
 
-/* Set the encoder input directly from a pre-normalized (3, IMG, IMG) f32
+/* Set the encoder input directly from a pre-normalized (3, H, W) f32
  * tensor — bypasses set_image's u8 upload + on-device resize/normalize.
  * Used by verify_dinov3 to feed the same tensor as the Python reference. */
 int cuda_sam3d_body_debug_set_normalized_input(cuda_sam3d_body_ctx *ctx,
@@ -84,7 +87,7 @@ int cuda_sam3d_body_debug_set_normalized_input(cuda_sam3d_body_ctx *ctx,
  *   image_emb_chw   : (1280, H*W) f32 host buffer  (CHW)
  *   rays_hwc        : (H, W, 3) f32 host buffer
  *   out_chw         : (1280, H*W) f32 host buffer (caller-allocated)
- * H and W must match the encoder grid (typically 32x32 for image_size=512). */
+ * H and W must match the encoder grid (typically 32x32 for 512x512). */
 int cuda_sam3d_body_debug_run_ray_cond(cuda_sam3d_body_ctx *ctx,
                                        const float *image_emb_chw,
                                        const float *rays_hwc,
@@ -160,13 +163,12 @@ int cuda_sam3d_body_debug_run_norm_and_heads(cuda_sam3d_body_ctx *ctx,
                                              float *pose_raw,
                                              float *cam_raw);
 
-/* Speculative MHR-on-GPU helpers (exploratory — off the production path).
+/* MHR-on-GPU helper coverage.
  *
- * Step 7 was officially closed via CPU OpenMP parallelization (see PORT.md).
- * These helpers exist to validate the GPU implementation of MHR's largest
- * GEMVs and are not weight-cached (each call uploads weights). All require
- * mhr_assets_dir to be passed to cuda_sam3d_body_create. Outputs match
- * the CPU counterparts:
+ * Production run_decoder can use a lazy cached hybrid GPU MHR/keypoint path
+ * when SAM3D_BODY_GPU_MHR=1. These debug helpers remain isolated verifier
+ * APIs; they upload weights per call and require mhr_assets_dir at create time.
+ * Outputs match the CPU counterparts:
  *   sam3d_body_mhr_blend_shape       — (B=1, V*3=55317) f32
  *   sam3d_body_mhr_face_expressions  — (B=1, V*3=55317) f32
  *   sam3d_body_mhr_pose_correctives  — (B=1, V*3=55317) f32

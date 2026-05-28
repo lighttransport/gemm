@@ -260,6 +260,12 @@ void paint_stage_view_maps_set_mesh(paint_stage_view_maps *s,
     cuCtxSynchronize();
     s->h_FN = (float *)malloc((size_t)nf * 3 * sizeof(float));
     cuMemcpyDtoH(s->h_FN, s->d_FN, (size_t)nf * 3 * sizeof(float));
+    /* set_mesh transform (x'=-x, y'=z, z'=-y) has det=-1, so cross(e1,e2)
+     * yields inward-pointing normals. Flip them. Mirror the flip back to
+     * d_FN so any GPU-side consumer (currently only normal_img lookup) sees
+     * the corrected normals too. */
+    for (int i = 0; i < nf * 3; i++) s->h_FN[i] = -s->h_FN[i];
+    cuMemcpyHtoD(s->d_FN, s->h_FN, (size_t)nf * 3 * sizeof(float));
 
     cuMemAlloc(&s->d_attr1,    (size_t)n_verts * sizeof(float));
     cuMemAlloc(&s->d_face_cos, (size_t)n_tris  * sizeof(float));

@@ -45,6 +45,17 @@ static float *load_or_die_dims(const char *refdir, const char *name,
     return d;
 }
 
+static int has_rect_dinov3_input(const char *refdir)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/dinov3_input.npy", refdir);
+    int nd = 0, dims[8] = {0}, is_f32 = 0;
+    void *d = npy_load(path, &nd, dims, &is_f32);
+    free(d);
+    return is_f32 && nd == 4 && dims[0] == 1 && dims[1] == 3 &&
+           dims[2] > 0 && dims[3] > 0 && dims[2] != dims[3];
+}
+
 int main(int argc, char **argv)
 {
     const char *refdir = NULL;
@@ -76,16 +87,18 @@ int main(int argc, char **argv)
         return 3;
     }
 
-    /* img_size is (B, 1, 2) = [H_in, W_in]. */
-    const int H_in = (int)img_size[0];
-    const int W_in = (int)img_size[1];
+    /* img_size is (B, 1, 2) = [W_in, H_in]. */
+    const int W_in = (int)img_size[0];
+    const int H_in = (int)img_size[1];
     const int H_out = ref_dims[1], W_out = ref_dims[2];
+    const int rect_dinov3 = has_rect_dinov3_input(refdir);
     fprintf(stderr, "[verify_ray_cond_xyz] H_in=%d W_in=%d → H_out=%d W_out=%d\n",
             H_in, W_in, H_out, W_out);
 
     float *ours = (float *)malloc((size_t)H_out * W_out * 3 * sizeof(float));
-    int rc = sam3d_body_compute_ray_cond_xyz(cam_int, affine_trans,
-                                              H_in, W_in, H_out, W_out, ours);
+    int rc = sam3d_body_compute_ray_cond_xyz_ex(cam_int, affine_trans,
+                                                H_in, W_in, H_out, W_out,
+                                                rect_dinov3, ours);
     if (rc != SAM3D_BODY_DECODER_E_OK) {
         fprintf(stderr, "[verify_ray_cond_xyz] compute rc=%d\n", rc);
         free(cam_int); free(affine_trans); free(img_size); free(ref_ds); free(ours);

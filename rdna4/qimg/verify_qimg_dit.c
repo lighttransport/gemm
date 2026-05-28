@@ -14,7 +14,7 @@
 #include <math.h>
 #include <time.h>
 
-#define SAFETENSORS_IMPLEMENTATION
+/* SAFETENSORS_IMPLEMENTATION is provided by hip_llm_runner.o (linked in). */
 #define GGML_DEQUANT_IMPLEMENTATION
 #define GGUF_LOADER_IMPLEMENTATION
 #define QIMG_DIT_IMPLEMENTATION

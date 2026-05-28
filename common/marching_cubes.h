@@ -538,8 +538,10 @@ mc_mesh mc_marching_cubes(const float *grid, int nx, int ny, int nz,
                 result.triangles[i] = remap[result.triangles[i]];
             }
             free(result.vertices);
-            result.vertices = (float *)realloc(vout, (size_t)n_unique * 3 * sizeof(float));
-            if (!result.vertices) result.vertices = vout;
+            {
+                float *shrunk = (float *)realloc(vout, (size_t)n_unique * 3 * sizeof(float));
+                result.vertices = shrunk ? shrunk : vout;
+            }
             result.n_verts = n_unique;
         }
         free(bucket);

@@ -83,6 +83,40 @@ static void save_ppm(const char *path, const float *rgb, int h, int w) {
 
 /* ---------------- Kernel unit tests (QIMG_FP8 paths) ---------------- */
 
+static int test_kernel_split_selector(void) {
+    fprintf(stderr, "  [kernel] QIMG_FA2_SPLIT_F32 selector... ");
+    int fail = 0;
+    fail |= (qimg_f32_split_kv_from_env(NULL, 2048) != 0);
+    fail |= (qimg_f32_split_kv_from_env("0", 2048) != 0);
+    fail |= (qimg_f32_split_kv_from_env("1", 2048) != 1024);
+    fail |= (qimg_f32_split_kv_from_env("512", 2048) != 512);
+    fail |= (qimg_f32_split_kv_from_env("auto", 1024) != 0);
+    fail |= (qimg_f32_split_kv_from_env("auto", 2048) != 384);
+    fail |= (qimg_f32_split_kv_from_env("auto", 4608) != 1024);
+    fail |= (qimg_f32_split_kv_from_env("garbage", 2048) != 0);
+    fail |= (qimg_f32_split_kv_from_env("12x", 2048) != 0);
+    fail |= (qimg_f32_split_kv_from_env("-4", 2048) != 0);
+    fail |= (!qimg_f32_split_env_is_auto("auto"));
+    fail |= (qimg_f32_split_env_is_auto("1024"));
+    fail |= (qimg_f32_split_env_is_auto(NULL));
+    fail |= (qimg_f32_split_apply_tensor_attn_priority("auto", 256, 1) != 0);
+    fail |= (qimg_f32_split_apply_tensor_attn_priority("auto", 256, 0) != 256);
+    fail |= (qimg_f32_split_apply_tensor_attn_priority("256", 256, 1) != 256);
+    fail |= (qimg_bf16_split_kv_from_env(NULL, 4608) != 0);
+    fail |= (qimg_bf16_split_kv_from_env("0", 4608) != 0);
+    fail |= (qimg_bf16_split_kv_from_env("1", 4608) != 1024);
+    fail |= (qimg_bf16_split_kv_from_env("512", 4608) != 512);
+    fail |= (qimg_bf16_split_kv_from_env("auto", 2048) != 0);
+    fail |= (qimg_bf16_split_kv_from_env("auto", 4608) != 0);
+    fail |= (qimg_bf16_split_kv_from_env("garbage", 4608) != 0);
+    if (fail) {
+        fprintf(stderr, "FAIL\n");
+        return 1;
+    }
+    fprintf(stderr, "OK\n");
+    return 0;
+}
+
 /* Local FP8 e4m3 decode (matches cuda_qimg_runner.h). */
 static float test_fp8_e4m3_to_f32(uint8_t b) {
     uint32_t sign = (b >> 7) & 1;
@@ -98,15 +132,35 @@ static float test_fp8_e4m3_to_f32(uint8_t b) {
 
 static CUdeviceptr upload_f32(const float *h, size_t n) {
     CUdeviceptr d = 0;
-    cuMemAlloc(&d, n * sizeof(float));
-    cuMemcpyHtoD(d, h, n * sizeof(float));
+    CUresult err = cuMemAlloc(&d, n * sizeof(float));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg_test: upload_f32 alloc failed (%zu bytes, err=%d)\n",
+                n * sizeof(float), (int)err);
+        return 0;
+    }
+    err = cuMemcpyHtoD(d, h, n * sizeof(float));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg_test: upload_f32 copy failed (err=%d)\n", (int)err);
+        cuMemFree(d);
+        return 0;
+    }
     return d;
 }
 
 static CUdeviceptr upload_fp8_bytes(const uint8_t *h, size_t n) {
     CUdeviceptr d = 0;
-    cuMemAlloc(&d, n);
-    cuMemcpyHtoD(d, h, n);
+    CUresult err = cuMemAlloc(&d, n);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg_test: upload_fp8 alloc failed (%zu bytes, err=%d)\n",
+                n, (int)err);
+        return 0;
+    }
+    err = cuMemcpyHtoD(d, h, n);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg_test: upload_fp8 copy failed (err=%d)\n", (int)err);
+        cuMemFree(d);
+        return 0;
+    }
     return d;
 }
 
@@ -127,6 +181,11 @@ static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
     float *X = (float *)malloc(nX * sizeof(float));
     float *Y_mma = (float *)malloc(nY * sizeof(float));
     float *Y_lut = (float *)malloc(nY * sizeof(float));
+    if (!W || !X || !Y_mma || !Y_lut) {
+        free(W); free(X); free(Y_mma); free(Y_lut);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
     /* Generate small-magnitude random weights via round-to-e4m3 to avoid NaN
      * (byte 0x7F / 0xFF) and saturating values that overflow the accumulator. */
     rng_state = 12345;
@@ -146,8 +205,20 @@ static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
 
     CUdeviceptr d_W = upload_fp8_bytes(W, nW);
     CUdeviceptr d_X = upload_f32(X, nX);
-    CUdeviceptr d_Y = 0; cuMemAlloc(&d_Y, nY * sizeof(float));
+    CUdeviceptr d_Y = 0;
     CUdeviceptr bias = 0;
+#define QIMG_FP8_GEMM_TEST_CU(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_qe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_W || !d_X) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    QIMG_FP8_GEMM_TEST_CU(cuMemAlloc(&d_Y, nY * sizeof(float)), "alloc output");
 
     /* MMA path */
     {
@@ -158,10 +229,12 @@ static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok +  31) /  32);
         size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);
-        cuLaunchKernel(r->gemm_fp8_mma, gx, gy, 1, 128, 1, 1,
-                       smem, r->stream, args, NULL);
-        cuStreamSynchronize(r->stream);
-        cuMemcpyDtoH(Y_mma, d_Y, nY * sizeof(float));
+        QIMG_FP8_GEMM_TEST_CU(cuLaunchKernel(r->gemm_fp8_mma, gx, gy, 1,
+                                             128, 1, 1, smem, r->stream, args, NULL),
+                              "mma launch");
+        QIMG_FP8_GEMM_TEST_CU(cuStreamSynchronize(r->stream), "mma sync");
+        QIMG_FP8_GEMM_TEST_CU(cuMemcpyDtoH(Y_mma, d_Y, nY * sizeof(float)),
+                              "mma copy");
     }
     /* LUT path */
     {
@@ -169,12 +242,15 @@ static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
         void *args[] = {&d_Y, &d_W, &d_X, &bias, &no, &ni, &nt};
         unsigned gx = (unsigned)((n_out + 127) / 128);
         unsigned gy = (unsigned)((n_tok + 127) / 128);
-        cuLaunchKernel(r->gemm_opt_fp8, gx, gy, 1, 256, 1, 1,
-                       0, r->stream, args, NULL);
-        cuStreamSynchronize(r->stream);
-        cuMemcpyDtoH(Y_lut, d_Y, nY * sizeof(float));
+        QIMG_FP8_GEMM_TEST_CU(cuLaunchKernel(r->gemm_opt_fp8, gx, gy, 1,
+                                             256, 1, 1, 0, r->stream, args, NULL),
+                              "lut launch");
+        QIMG_FP8_GEMM_TEST_CU(cuStreamSynchronize(r->stream), "lut sync");
+        QIMG_FP8_GEMM_TEST_CU(cuMemcpyDtoH(Y_lut, d_Y, nY * sizeof(float)),
+                              "lut copy");
     }
     cuMemFree(d_W); cuMemFree(d_X); cuMemFree(d_Y);
+    d_W = d_X = d_Y = 0;
 
     /* Statistics: both paths quantize W the same way, so the main diff is
      * X quantization (MMA path rounds X to e4m3, LUT path keeps F32). */
@@ -193,7 +269,15 @@ static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
         return 1;
     }
     fprintf(stderr, "OK (rms_err=%.4g rms_ref=%.4g max_abs=%.4g)\n", rms_err, rms_ref, max_abs);
+#undef QIMG_FP8_GEMM_TEST_CU
     return 0;
+fail:
+    if (d_W) cuMemFree(d_W);
+    if (d_X) cuMemFree(d_X);
+    if (d_Y) cuMemFree(d_Y);
+    free(W); free(X); free(Y_mma); free(Y_lut);
+#undef QIMG_FP8_GEMM_TEST_CU
+    return 1;
 }
 
 /* Test 2: flash_attn_fp8 MMA vs flash_attn_fp8_ref scalar.
@@ -221,6 +305,11 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
     float *V = (float *)malloc(n_elems * sizeof(float));
     float *out_mma = (float *)malloc(n_elems * sizeof(float));
     float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_mma || !out_ref) {
+        free(Q); free(K); free(V); free(out_mma); free(out_ref);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
     rng_state = 999;
     for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.7f;
     for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.7f;
@@ -229,10 +318,25 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
     CUdeviceptr d_Q = upload_f32(Q, n_elems);
     CUdeviceptr d_K = upload_f32(K, n_elems);
     CUdeviceptr d_V = upload_f32(V, n_elems);
-    CUdeviceptr d_out = 0; cuMemAlloc(&d_out, n_elems * sizeof(float));
+    CUdeviceptr d_out = 0;
+#define QIMG_FP8_ATTN_TEST_CU(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_qe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    QIMG_FP8_ATTN_TEST_CU(cuMemAlloc(&d_out, n_elems * sizeof(float)), "alloc output");
 
     /* Quantize Q/K/V (uses the runner's workspace via ensure_fp8_attn_buf) */
-    ensure_fp8_attn_buf(r, n_elems);
+    if (ensure_fp8_attn_buf(r, n_elems) != 0) {
+        fprintf(stderr, "FAIL (fp8 workspace)\n");
+        goto fail;
+    }
     CUdeviceptr s_q = r->d_qkv_scales + 0 * sizeof(float);
     CUdeviceptr s_k = r->d_qkv_scales + 1 * sizeof(float);
     CUdeviceptr s_v = r->d_qkv_scales + 2 * sizeof(float);
@@ -248,22 +352,27 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
         size_t smem = (size_t)(32 * 128 + 128 * 32 + 4 * 16 * 32 * sizeof(float));
         void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
                         &nt, &nh, &hd, &r->d_qkv_scales};
-        cuLaunchKernel(r->flash_attn_fp8, (unsigned)nh, gy, 1,
-                       128, 1, 1, smem, r->stream, args, NULL);
-        cuStreamSynchronize(r->stream);
-        cuMemcpyDtoH(out_mma, d_out, n_elems * sizeof(float));
+        QIMG_FP8_ATTN_TEST_CU(cuLaunchKernel(r->flash_attn_fp8, (unsigned)nh, gy, 1,
+                                             128, 1, 1, smem, r->stream, args, NULL),
+                              "mma launch");
+        QIMG_FP8_ATTN_TEST_CU(cuStreamSynchronize(r->stream), "mma sync");
+        QIMG_FP8_ATTN_TEST_CU(cuMemcpyDtoH(out_mma, d_out, n_elems * sizeof(float)),
+                              "mma copy");
     }
     /* Scalar ref path: grid=(n_heads, ceil(n_tok/32)), block=32 */
     {
         void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
                         &nt, &nh, &hd, &r->d_qkv_scales};
         unsigned gy = (unsigned)((n_tok + 31) / 32);
-        cuLaunchKernel(fn_ref, (unsigned)nh, gy, 1,
-                       32, 1, 1, 0, r->stream, args, NULL);
-        cuStreamSynchronize(r->stream);
-        cuMemcpyDtoH(out_ref, d_out, n_elems * sizeof(float));
+        QIMG_FP8_ATTN_TEST_CU(cuLaunchKernel(fn_ref, (unsigned)nh, gy, 1,
+                                             32, 1, 1, 0, r->stream, args, NULL),
+                              "ref launch");
+        QIMG_FP8_ATTN_TEST_CU(cuStreamSynchronize(r->stream), "ref sync");
+        QIMG_FP8_ATTN_TEST_CU(cuMemcpyDtoH(out_ref, d_out, n_elems * sizeof(float)),
+                              "ref copy");
     }
     cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V); cuMemFree(d_out);
+    d_Q = d_K = d_V = d_out = 0;
 
     float max_diff = 0.0f, mean_diff = 0.0f;
     for (size_t i = 0; i < n_elems; i++) {
@@ -278,7 +387,949 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
         return 1;
     }
     fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+#undef QIMG_FP8_ATTN_TEST_CU
     return 0;
+fail:
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_out) cuMemFree(d_out);
+    free(Q); free(K); free(V); free(out_mma); free(out_ref);
+#undef QIMG_FP8_ATTN_TEST_CU
+    return 1;
+}
+
+static void cpu_flash_attn_f32_ref(float *out, const float *Q, const float *K,
+                                   const float *V, int n_tok, int n_heads,
+                                   int head_dim) {
+    int dim = n_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    for (int qi = 0; qi < n_tok; qi++) {
+        for (int h = 0; h < n_heads; h++) {
+            float m_i = -1e30f, l_i = 0.0f;
+            float o_acc[128];
+            for (int d = 0; d < head_dim; d++) o_acc[d] = 0.0f;
+            for (int kj = 0; kj < n_tok; kj++) {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += Q[(size_t)qi * dim + h * head_dim + d] *
+                           K[(size_t)kj * dim + h * head_dim + d];
+                }
+                float score = dot * scale;
+                float new_max = fmaxf(m_i, score);
+                float alpha = expf(m_i - new_max);
+                float p = expf(score - new_max);
+                l_i = l_i * alpha + p;
+                for (int d = 0; d < head_dim; d++) {
+                    o_acc[d] = o_acc[d] * alpha +
+                               p * V[(size_t)kj * dim + h * head_dim + d];
+                }
+                m_i = new_max;
+            }
+            float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                out[(size_t)qi * dim + h * head_dim + d] = o_acc[d] * inv_l;
+        }
+    }
+}
+
+/* Test 3: split-key F32 flash attention partial+merge path vs baseline F32.
+ * This validates the explicit (m,l,O) workspace merge needed for true KV-split
+ * grid parallelism without changing the default BF16/FP8 fast paths. */
+static int test_kernel_split_attn_f32(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_f32 split-key vs baseline... ");
+    if (!r->attn_prefill_f32 || !r->attn_split_partials_f32 || !r->attn_split_merge_f32) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 128;
+    const int n_heads = 2;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_kv = 32;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    float *out_op = (float *)malloc(n_elems * sizeof(float));
+    float *out_cpu = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split || !out_op || !out_cpu) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+
+    rng_state = 20240517;
+    rng_has_cached = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.35f;
+    cpu_flash_attn_f32_ref(out_cpu, Q, K, V, n_tok, n_heads, head_dim);
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_ref = 0, d_split = 0, d_op = 0;
+#define QIMG_SPLIT_TEST_CU(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_qe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    QIMG_SPLIT_TEST_CU(cuMemAlloc(&d_ref, n_elems * sizeof(float)), "alloc ref");
+    QIMG_SPLIT_TEST_CU(cuMemAlloc(&d_split, n_elems * sizeof(float)), "alloc split");
+    QIMG_SPLIT_TEST_CU(cuMemAlloc(&d_op, n_elems * sizeof(float)), "alloc op");
+
+    int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    {
+        void *args[] = {&d_ref, &d_Q, &d_K, &d_V, &nt, &nh, &hd};
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        QIMG_SPLIT_TEST_CU(cuLaunchKernel(r->attn_prefill_f32, (unsigned)nh, gy, 1,
+                                          128, 1, 1, smem, r->stream, args, NULL),
+                           "baseline launch");
+        QIMG_SPLIT_TEST_CU(cuStreamSynchronize(r->stream), "baseline sync");
+        QIMG_SPLIT_TEST_CU(cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)),
+                           "baseline copy");
+    }
+
+    if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+        fprintf(stderr, "FAIL (device OOM)\n");
+        goto fail;
+    }
+    {
+        void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr,
+                          &d_Q, &d_K, &d_V, &nt, &nh, &hd, &sk};
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        QIMG_SPLIT_TEST_CU(cuLaunchKernel(r->attn_split_partials_f32,
+                                          (unsigned)nh, gy, (unsigned)n_splits,
+                                          128, 1, 1, smem, r->stream, p_args, NULL),
+                           "split partials launch");
+        void *m_args[] = {&d_split, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr, &nt, &nh, &hd, &ns};
+        QIMG_SPLIT_TEST_CU(cuLaunchKernel(r->attn_split_merge_f32,
+                                          (unsigned)nh, (unsigned)n_tok, 1,
+                                          128, 1, 1, 0, r->stream, m_args, NULL),
+                           "split merge launch");
+        QIMG_SPLIT_TEST_CU(cuStreamSynchronize(r->stream), "split sync");
+        QIMG_SPLIT_TEST_CU(cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)),
+                           "split copy");
+    }
+
+    {
+        const char *old_env = getenv("QIMG_FA2_SPLIT_F32");
+        char *old_env_copy = old_env ? (char *)malloc(strlen(old_env) + 1) : NULL;
+        if (old_env && !old_env_copy) {
+            fprintf(stderr, "FAIL (host OOM env copy)\n");
+            goto fail;
+        }
+        if (old_env_copy) strcpy(old_env_copy, old_env);
+        setenv("QIMG_FA2_SPLIT_F32", "32", 1);
+        op_attn(r, d_op, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+        CUresult env_err = cuStreamSynchronize(r->stream);
+        if (env_err == CUDA_SUCCESS)
+            env_err = cuMemcpyDtoH(out_op, d_op, n_elems * sizeof(float));
+        if (old_env_copy) {
+            setenv("QIMG_FA2_SPLIT_F32", old_env_copy, 1);
+            free(old_env_copy);
+        } else {
+            unsetenv("QIMG_FA2_SPLIT_F32");
+        }
+        if (env_err != CUDA_SUCCESS) {
+            fprintf(stderr, "FAIL (op_attn split dispatch err=%d)\n", (int)env_err);
+            goto fail;
+        }
+    }
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_ref); cuMemFree(d_split); cuMemFree(d_op);
+    d_Q = d_K = d_V = d_ref = d_split = d_op = 0;
+
+    float max_diff = 0.0f, mean_diff = 0.0f, op_max_diff = 0.0f, cpu_max_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_split[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+        float od = fabsf(out_op[i] - out_ref[i]);
+        if (od > op_max_diff) op_max_diff = od;
+        float cd = fabsf(out_ref[i] - out_cpu[i]);
+        if (cd > cpu_max_diff) cpu_max_diff = cd;
+    }
+    mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
+    if (max_diff > 1e-4f || mean_diff > 1e-5f || op_max_diff > 1e-4f ||
+        cpu_max_diff > 1e-4f) {
+        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g cpu_max_diff=%.6g splits=%d)\n",
+                max_diff, mean_diff, op_max_diff, cpu_max_diff, n_splits);
+        return 1;
+    }
+    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g cpu_max_diff=%.6g splits=%d)\n",
+            max_diff, mean_diff, op_max_diff, cpu_max_diff, n_splits);
+#undef QIMG_SPLIT_TEST_CU
+    return 0;
+fail:
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_ref) cuMemFree(d_ref);
+    if (d_split) cuMemFree(d_split);
+    if (d_op) cuMemFree(d_op);
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
+#undef QIMG_SPLIT_TEST_CU
+    return 1;
+}
+
+static int test_kernel_split_attn_bf16(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_bf16 split-key typed/tc paths... ");
+    if (!r->flash_attn_bf16 || !r->cast_f32_to_bf16 || !r->attn_split_merge_f32) {
+        fprintf(stderr, "SKIP (BF16 or merge kernels not loaded)\n");
+        return 0;
+    }
+    CUfunction split_bf16 = NULL;
+    if (cuModuleGetFunction(&split_bf16, r->module, "flash_attn_bf16_split_partials") != CUDA_SUCCESS ||
+        !split_bf16) {
+        fprintf(stderr, "SKIP (BF16 split kernel not loaded)\n");
+        return 0;
+    }
+    CUfunction split_bf16_tc = NULL;
+    if (cuModuleGetFunction(&split_bf16_tc, r->module, "flash_attn_bf16_tc_split_partials") != CUDA_SUCCESS ||
+        !split_bf16_tc) {
+        fprintf(stderr, "SKIP (BF16 tensor-core split kernel not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 128, n_heads = 2, head_dim = 128, split_kv = 32;
+    const int dim = n_heads * head_dim;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    float *out_tc = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split || !out_tc) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_tc);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+    rng_state = 20260520;
+    rng_has_cached = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.35f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_Qb = 0, d_Kb = 0, d_Vb = 0, d_ref = 0, d_split = 0, d_tc = 0;
+#define QIMG_BF16_SPLIT_CU(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_qe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    QIMG_BF16_SPLIT_CU(cuMemAlloc(&d_Qb, n_elems * sizeof(unsigned short)), "alloc Qb");
+    QIMG_BF16_SPLIT_CU(cuMemAlloc(&d_Kb, n_elems * sizeof(unsigned short)), "alloc Kb");
+    QIMG_BF16_SPLIT_CU(cuMemAlloc(&d_Vb, n_elems * sizeof(unsigned short)), "alloc Vb");
+    QIMG_BF16_SPLIT_CU(cuMemAlloc(&d_ref, n_elems * sizeof(float)), "alloc ref");
+    QIMG_BF16_SPLIT_CU(cuMemAlloc(&d_split, n_elems * sizeof(float)), "alloc split");
+    QIMG_BF16_SPLIT_CU(cuMemAlloc(&d_tc, n_elems * sizeof(float)), "alloc tc");
+
+    int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    cast_buf_f32_to_bf16(r, d_Qb, d_Q, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Kb, d_K, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Vb, d_V, (int)n_elems);
+    {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        size_t smem = (size_t)(4 * 32 * 136 * 2);
+        void *args[] = {&d_ref, &d_Qb, &d_Kb, &d_Vb, &nt, &nh, &hd};
+        QIMG_BF16_SPLIT_CU(cuLaunchKernel(r->flash_attn_bf16,
+                                          (unsigned)n_heads, gy, 1,
+                                          128, 1, 1, smem, r->stream, args, NULL),
+                           "bf16 baseline launch");
+    }
+    if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+        fprintf(stderr, "FAIL (device OOM)\n");
+        goto fail;
+    }
+    {
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+        void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr,
+                          &d_Qb, &d_Kb, &d_Vb, &nt, &nh, &hd, &sk};
+        QIMG_BF16_SPLIT_CU(cuLaunchKernel(split_bf16,
+                                          (unsigned)n_heads, gy, (unsigned)n_splits,
+                                          128, 1, 1, smem, r->stream, p_args, NULL),
+                           "bf16 split partials launch");
+        void *m_args[] = {&d_split, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr, &nt, &nh, &hd, &ns};
+        QIMG_BF16_SPLIT_CU(cuLaunchKernel(r->attn_split_merge_f32,
+                                          (unsigned)n_heads, (unsigned)n_tok, 1,
+                                          128, 1, 1, 0, r->stream, m_args, NULL),
+                           "bf16 split merge launch");
+    }
+    {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        size_t smem = (size_t)(4 * 32 * 136 * sizeof(unsigned short));
+        void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr,
+                          &d_Qb, &d_Kb, &d_Vb, &nt, &nh, &hd, &sk};
+        QIMG_BF16_SPLIT_CU(cuLaunchKernel(split_bf16_tc,
+                                          (unsigned)n_heads, gy, (unsigned)n_splits,
+                                          128, 1, 1, smem, r->stream, p_args, NULL),
+                           "bf16 tensor-core split partials launch");
+        void *m_args[] = {&d_tc, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr, &nt, &nh, &hd, &ns};
+        QIMG_BF16_SPLIT_CU(cuLaunchKernel(r->attn_split_merge_f32,
+                                          (unsigned)n_heads, (unsigned)n_tok, 1,
+                                          128, 1, 1, 0, r->stream, m_args, NULL),
+                           "bf16 tensor-core split merge launch");
+    }
+    QIMG_BF16_SPLIT_CU(cuStreamSynchronize(r->stream), "bf16 split sync");
+    QIMG_BF16_SPLIT_CU(cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)), "copy ref");
+    QIMG_BF16_SPLIT_CU(cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)), "copy split");
+    QIMG_BF16_SPLIT_CU(cuMemcpyDtoH(out_tc, d_tc, n_elems * sizeof(float)), "copy tc");
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_Qb); cuMemFree(d_Kb); cuMemFree(d_Vb);
+    cuMemFree(d_ref); cuMemFree(d_split); cuMemFree(d_tc);
+    d_Q = d_K = d_V = d_Qb = d_Kb = d_Vb = d_ref = d_split = d_tc = 0;
+    float max_diff = 0.0f, mean_diff = 0.0f, tc_max_diff = 0.0f, tc_mean_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_split[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+        float td = fabsf(out_tc[i] - out_ref[i]);
+        if (td > tc_max_diff) tc_max_diff = td;
+        tc_mean_diff += td;
+    }
+    mean_diff /= (float)n_elems;
+    tc_mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_tc);
+    if (max_diff > 1e-2f || mean_diff > 2e-4f ||
+        tc_max_diff > 5e-4f || tc_mean_diff > 1e-4f) {
+        fprintf(stderr, "FAIL (typed_max=%.6g typed_mean=%.6g tc_max=%.6g tc_mean=%.6g splits=%d)\n",
+                max_diff, mean_diff, tc_max_diff, tc_mean_diff, n_splits);
+        return 1;
+    }
+    fprintf(stderr, "OK (typed_max=%.6g typed_mean=%.6g tc_max=%.6g tc_mean=%.6g splits=%d)\n",
+            max_diff, mean_diff, tc_max_diff, tc_mean_diff, n_splits);
+#undef QIMG_BF16_SPLIT_CU
+    return 0;
+fail:
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_Qb) cuMemFree(d_Qb);
+    if (d_Kb) cuMemFree(d_Kb);
+    if (d_Vb) cuMemFree(d_Vb);
+    if (d_ref) cuMemFree(d_ref);
+    if (d_split) cuMemFree(d_split);
+    if (d_tc) cuMemFree(d_tc);
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_tc);
+#undef QIMG_BF16_SPLIT_CU
+    return 1;
+}
+
+static int test_kernel_split_auto_prefers_tensor_attn(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] QIMG_FA2_SPLIT_F32 auto keeps tensor attention... ");
+    if (!r->use_bf16_attn || !r->flash_attn_bf16 || !r->cast_f32_to_bf16 ||
+        !r->attn_prefill_f32 || !r->attn_split_partials_f32 || !r->attn_split_merge_f32) {
+        fprintf(stderr, "SKIP (BF16 or split kernels not active)\n");
+        return 0;
+    }
+
+    const int n_tok = 128;
+    const int n_heads = 2;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_kv = 32;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_bf16 = (float *)malloc(n_elems * sizeof(float));
+    float *out_bf16_split = (float *)malloc(n_elems * sizeof(float));
+    float *out_auto = (float *)malloc(n_elems * sizeof(float));
+    float *out_f32 = (float *)malloc(n_elems * sizeof(float));
+    float *out_forced = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_bf16 || !out_bf16_split || !out_auto || !out_f32 || !out_forced) {
+        free(Q); free(K); free(V); free(out_bf16); free(out_bf16_split);
+        free(out_auto); free(out_f32); free(out_forced);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+
+    rng_state = 20260519;
+    rng_has_cached = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.7f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_bf16 = 0, d_bf16_split = 0, d_auto = 0, d_f32 = 0, d_forced = 0;
+    const char *old_env = getenv("QIMG_FA2_SPLIT_F32");
+    char *old_env_copy = old_env ? (char *)malloc(strlen(old_env) + 1) : NULL;
+    const char *old_bf16_split_env = getenv("QIMG_BF16_SPLIT_KV");
+    char *old_bf16_split_env_copy = old_bf16_split_env ? (char *)malloc(strlen(old_bf16_split_env) + 1) : NULL;
+#define QIMG_SPLIT_AUTO_CU(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_qe); \
+            goto fail; \
+        } \
+    } while (0)
+    if ((old_env && !old_env_copy) || (old_bf16_split_env && !old_bf16_split_env_copy)) {
+        fprintf(stderr, "FAIL (host OOM env copy)\n");
+        goto fail;
+    }
+    if (old_env_copy) strcpy(old_env_copy, old_env);
+    if (old_bf16_split_env_copy) strcpy(old_bf16_split_env_copy, old_bf16_split_env);
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    QIMG_SPLIT_AUTO_CU(cuMemAlloc(&d_bf16, n_elems * sizeof(float)), "alloc bf16");
+    QIMG_SPLIT_AUTO_CU(cuMemAlloc(&d_bf16_split, n_elems * sizeof(float)), "alloc bf16 split");
+    QIMG_SPLIT_AUTO_CU(cuMemAlloc(&d_auto, n_elems * sizeof(float)), "alloc auto");
+    QIMG_SPLIT_AUTO_CU(cuMemAlloc(&d_f32, n_elems * sizeof(float)), "alloc f32");
+    QIMG_SPLIT_AUTO_CU(cuMemAlloc(&d_forced, n_elems * sizeof(float)), "alloc forced");
+
+    unsetenv("QIMG_FA2_SPLIT_F32");
+    op_attn(r, d_bf16, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    QIMG_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "bf16 sync");
+    QIMG_SPLIT_AUTO_CU(cuMemcpyDtoH(out_bf16, d_bf16, n_elems * sizeof(float)), "bf16 copy");
+
+    setenv("QIMG_BF16_SPLIT_KV", "32", 1);
+    op_attn(r, d_bf16_split, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    QIMG_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "bf16 split sync");
+    QIMG_SPLIT_AUTO_CU(cuMemcpyDtoH(out_bf16_split, d_bf16_split, n_elems * sizeof(float)), "bf16 split copy");
+    if (old_bf16_split_env_copy) {
+        setenv("QIMG_BF16_SPLIT_KV", old_bf16_split_env_copy, 1);
+    } else {
+        unsetenv("QIMG_BF16_SPLIT_KV");
+    }
+
+    setenv("QIMG_FA2_SPLIT_F32", "auto", 1);
+    op_attn(r, d_auto, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    QIMG_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "auto sync");
+    QIMG_SPLIT_AUTO_CU(cuMemcpyDtoH(out_auto, d_auto, n_elems * sizeof(float)), "auto copy");
+
+    {
+        int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+        void *f32_args[] = {&d_f32, &d_Q, &d_K, &d_V, &nt, &nh, &hd};
+        QIMG_SPLIT_AUTO_CU(cuLaunchKernel(r->attn_prefill_f32, (unsigned)nh, gy, 1,
+                                          128, 1, 1, smem, r->stream, f32_args, NULL),
+                           "f32 launch");
+        QIMG_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "f32 sync");
+        QIMG_SPLIT_AUTO_CU(cuMemcpyDtoH(out_f32, d_f32, n_elems * sizeof(float)), "f32 copy");
+
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            fprintf(stderr, "FAIL (split workspace)\n");
+            goto fail;
+        }
+        setenv("QIMG_FA2_SPLIT_F32", "32", 1);
+        op_attn(r, d_forced, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+        (void)sk; (void)ns;
+        QIMG_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "forced sync");
+        QIMG_SPLIT_AUTO_CU(cuMemcpyDtoH(out_forced, d_forced, n_elems * sizeof(float)), "forced copy");
+    }
+
+    if (old_env_copy) {
+        setenv("QIMG_FA2_SPLIT_F32", old_env_copy, 1);
+    } else {
+        unsetenv("QIMG_FA2_SPLIT_F32");
+    }
+    free(old_env_copy);
+    old_env_copy = NULL;
+    if (old_bf16_split_env_copy) {
+        setenv("QIMG_BF16_SPLIT_KV", old_bf16_split_env_copy, 1);
+    } else {
+        unsetenv("QIMG_BF16_SPLIT_KV");
+    }
+    free(old_bf16_split_env_copy);
+    old_bf16_split_env_copy = NULL;
+
+    float auto_bf16_max = 0.0f, bf16_split_max = 0.0f;
+    float forced_f32_max = 0.0f, bf16_f32_max = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float da = fabsf(out_auto[i] - out_bf16[i]);
+        float ds = fabsf(out_bf16_split[i] - out_bf16[i]);
+        float df = fabsf(out_forced[i] - out_f32[i]);
+        float db = fabsf(out_bf16[i] - out_f32[i]);
+        if (da > auto_bf16_max) auto_bf16_max = da;
+        if (ds > bf16_split_max) bf16_split_max = ds;
+        if (df > forced_f32_max) forced_f32_max = df;
+        if (db > bf16_f32_max) bf16_f32_max = db;
+    }
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_bf16); cuMemFree(d_bf16_split); cuMemFree(d_auto); cuMemFree(d_f32); cuMemFree(d_forced);
+    free(Q); free(K); free(V); free(out_bf16); free(out_bf16_split);
+    free(out_auto); free(out_f32); free(out_forced);
+    if (auto_bf16_max > 0.0f || bf16_split_max > 1e-3f ||
+        forced_f32_max > 1e-4f || bf16_f32_max < 1e-7f) {
+        fprintf(stderr, "FAIL (auto_bf16=%.6g bf16_split=%.6g forced_f32=%.6g bf16_f32=%.6g)\n",
+                auto_bf16_max, bf16_split_max, forced_f32_max, bf16_f32_max);
+        return 1;
+    }
+    fprintf(stderr, "OK (auto_bf16=%.6g bf16_split=%.6g forced_f32=%.6g bf16_f32=%.6g)\n",
+            auto_bf16_max, bf16_split_max, forced_f32_max, bf16_f32_max);
+#undef QIMG_SPLIT_AUTO_CU
+    return 0;
+
+fail:
+    if (old_env_copy) {
+        setenv("QIMG_FA2_SPLIT_F32", old_env_copy, 1);
+        free(old_env_copy);
+    } else if (old_env) {
+        setenv("QIMG_FA2_SPLIT_F32", old_env, 1);
+    } else {
+        unsetenv("QIMG_FA2_SPLIT_F32");
+    }
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_bf16) cuMemFree(d_bf16);
+    if (d_bf16_split) cuMemFree(d_bf16_split);
+    if (d_auto) cuMemFree(d_auto);
+    if (d_f32) cuMemFree(d_f32);
+    if (d_forced) cuMemFree(d_forced);
+    if (old_bf16_split_env_copy) {
+        setenv("QIMG_BF16_SPLIT_KV", old_bf16_split_env_copy, 1);
+        free(old_bf16_split_env_copy);
+    } else if (old_bf16_split_env) {
+        setenv("QIMG_BF16_SPLIT_KV", old_bf16_split_env, 1);
+    } else {
+        unsetenv("QIMG_BF16_SPLIT_KV");
+    }
+    free(Q); free(K); free(V); free(out_bf16); free(out_bf16_split);
+    free(out_auto); free(out_f32); free(out_forced);
+#undef QIMG_SPLIT_AUTO_CU
+    return 1;
+}
+
+static float time_qimg_f32_attn(cuda_qimg_runner *r, CUfunction fn,
+                                CUdeviceptr out, CUdeviceptr q,
+                                CUdeviceptr k, CUdeviceptr v,
+                                int n_tok, int n_heads, int head_dim,
+                                int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int nt = n_tok, nh = n_heads, hd = head_dim;
+    unsigned gy = (unsigned)((n_tok + 3) / 4);
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    void *args[] = {&out, &q, &k, &v, &nt, &nh, &hd};
+    if (cuLaunchKernel(fn, (unsigned)n_heads, gy, 1, 128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(fn, (unsigned)n_heads, gy, 1, 128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static float time_qimg_split_attn(cuda_qimg_runner *r,
+                                  CUdeviceptr out, CUdeviceptr q,
+                                  CUdeviceptr k, CUdeviceptr v,
+                                  int n_tok, int n_heads, int head_dim,
+                                  int split_kv, int n_splits, int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    unsigned gy = (unsigned)((n_tok + 3) / 4);
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr,
+                      &q, &k, &v, &nt, &nh, &hd, &sk};
+    void *m_args[] = {&out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr, &nt, &nh, &hd, &ns};
+    if (cuLaunchKernel(r->attn_split_partials_f32, (unsigned)n_heads, gy, (unsigned)n_splits,
+                       128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuLaunchKernel(r->attn_split_merge_f32, (unsigned)n_heads, (unsigned)n_tok, 1,
+                       128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(r->attn_split_partials_f32, (unsigned)n_heads, gy, (unsigned)n_splits,
+                           128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+        if (cuLaunchKernel(r->attn_split_merge_f32, (unsigned)n_heads, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static float time_qimg_bf16_attn(cuda_qimg_runner *r,
+                                 CUdeviceptr out, CUdeviceptr qb,
+                                 CUdeviceptr kb, CUdeviceptr vb,
+                                 int n_tok, int n_heads, int head_dim,
+                                 int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int nt = n_tok, nh = n_heads, hd = head_dim;
+    unsigned gy = (unsigned)((n_tok + 63) / 64);
+    size_t smem = (size_t)(4 * 32 * 136 * 2);
+    void *args[] = {&out, &qb, &kb, &vb, &nt, &nh, &hd};
+    if (cuLaunchKernel(r->flash_attn_bf16, (unsigned)n_heads, gy, 1,
+                       128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(r->flash_attn_bf16, (unsigned)n_heads, gy, 1,
+                           128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static float time_qimg_bf16_split_attn(cuda_qimg_runner *r,
+                                       CUdeviceptr out, CUdeviceptr qb,
+                                       CUdeviceptr kb, CUdeviceptr vb,
+                                       int n_tok, int n_heads, int head_dim,
+                                       int split_kv, int n_splits, int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    unsigned gy = (unsigned)((n_tok + 63) / 64);
+    size_t smem = (size_t)(4 * 32 * 136 * sizeof(unsigned short));
+    void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr,
+                      &qb, &kb, &vb, &nt, &nh, &hd, &sk};
+    void *m_args[] = {&out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr, &nt, &nh, &hd, &ns};
+    if (cuLaunchKernel(r->flash_attn_bf16_tc_split_partials,
+                       (unsigned)n_heads, gy, (unsigned)n_splits,
+                       128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuLaunchKernel(r->attn_split_merge_f32, (unsigned)n_heads, (unsigned)n_tok, 1,
+                       128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(r->flash_attn_bf16_tc_split_partials,
+                           (unsigned)n_heads, gy, (unsigned)n_splits,
+                           128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+        if (cuLaunchKernel(r->attn_split_merge_f32, (unsigned)n_heads, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static int test_kernel_split_attn_f32_bench(cuda_qimg_runner *r, int n_tok,
+                                            int n_heads, const char *label,
+                                            int repeats) {
+    fprintf(stderr, "  [kernel] flash_attn_f32 split-key %s bench... ", label);
+    if (!r->attn_prefill_f32 || !r->attn_split_partials_f32 || !r->attn_split_merge_f32) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_candidates[] = {128, 256, 384, 512, 768, 1024, 1536, 2048};
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+    rng_state = 20260518;
+    rng_has_cached = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.25f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_ref = 0, d_split = 0;
+    if (!d_Q || !d_K || !d_V ||
+        cuMemAlloc(&d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+        cuMemFree(d_ref); cuMemFree(d_split);
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (device alloc/upload)\n");
+        return 1;
+    }
+
+    float base_ms = time_qimg_f32_attn(r, r->attn_prefill_f32, d_ref, d_Q, d_K, d_V,
+                                       n_tok, n_heads, head_dim, repeats);
+    if (base_ms < 0.0f ||
+        cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+        cuMemFree(d_ref); cuMemFree(d_split);
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (baseline timing/copy)\n");
+        return 1;
+    }
+
+    float best_ms = 1e30f, best_max_diff = 0.0f, best_mean_diff = 0.0f;
+    int best_split_kv = 0, best_n_splits = 0;
+    for (int ci = 0; ci < (int)(sizeof(split_candidates) / sizeof(split_candidates[0])); ci++) {
+        int split_kv = split_candidates[ci];
+        int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (n_splits <= 1) continue;
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (device OOM split_kv=%d)\n", split_kv);
+            return 1;
+        }
+        float split_ms = time_qimg_split_attn(r, d_split, d_Q, d_K, d_V,
+                                              n_tok, n_heads, head_dim,
+                                              split_kv, n_splits, repeats);
+        if (split_ms < 0.0f ||
+            cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (split_kv=%d timing/copy)\n", split_kv);
+            return 1;
+        }
+        float max_diff = 0.0f, mean_diff = 0.0f;
+        for (size_t i = 0; i < n_elems; i++) {
+            float d = fabsf(out_split[i] - out_ref[i]);
+            if (d > max_diff) max_diff = d;
+            mean_diff += d;
+        }
+        mean_diff /= (float)n_elems;
+        if (max_diff > 2e-4f || mean_diff > 2e-5f) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (split_kv=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms)\n",
+                    split_kv, max_diff, mean_diff, base_ms, split_ms);
+            return 1;
+        }
+        if (split_ms < best_ms) {
+            best_ms = split_ms;
+            best_max_diff = max_diff;
+            best_mean_diff = mean_diff;
+            best_split_kv = split_kv;
+            best_n_splits = n_splits;
+        }
+    }
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_ref); cuMemFree(d_split);
+    free(Q); free(K); free(V); free(out_ref); free(out_split);
+    fprintf(stderr, "OK (best_split_kv=%d splits=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms speedup=%.2fx)\n",
+            best_split_kv, best_n_splits, best_max_diff, best_mean_diff,
+            base_ms, best_ms, base_ms / (best_ms + 1e-9f));
+    return 0;
+}
+
+static int test_kernel_split_attn_f32_2048(cuda_qimg_runner *r) {
+    return test_kernel_split_attn_f32_bench(r, 2048, 1, "2048-token", 3);
+}
+
+static int test_kernel_split_attn_f32_4608(cuda_qimg_runner *r) {
+    /* Qwen Image 1024x1024 is roughly 4096 image tokens plus text tokens. */
+    return test_kernel_split_attn_f32_bench(r, 4608, 1, "4608-token", 3);
+}
+
+static int test_kernel_split_attn_f32_4608_qimg_heads(cuda_qimg_runner *r) {
+    /* Production Qwen-Image attention shape: hidden=3072 = 24 heads * 128. */
+    return test_kernel_split_attn_f32_bench(r, 4608, 24, "4608-token/24-head", 2);
+}
+
+static int test_kernel_split_attn_bf16_bench(cuda_qimg_runner *r, int n_tok,
+                                             int n_heads, const char *label,
+                                             int repeats) {
+    fprintf(stderr, "  [kernel] flash_attn_bf16 split-key %s bench... ", label);
+    if (!r->flash_attn_bf16 || !r->flash_attn_bf16_tc_split_partials ||
+        !r->cast_f32_to_bf16 || !r->attn_split_merge_f32) {
+        fprintf(stderr, "SKIP (BF16 split kernels not loaded)\n");
+        return 0;
+    }
+
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_candidates[] = {128, 256, 384, 512, 768, 1024, 1536, 2048};
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+    rng_state = 20260521;
+    rng_has_cached = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.25f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_Qb = 0, d_Kb = 0, d_Vb = 0, d_ref = 0, d_split = 0;
+#define QIMG_BF16_BENCH_CLEANUP() do { \
+        if (d_Q) cuMemFree(d_Q); \
+        if (d_K) cuMemFree(d_K); \
+        if (d_V) cuMemFree(d_V); \
+        if (d_Qb) cuMemFree(d_Qb); \
+        if (d_Kb) cuMemFree(d_Kb); \
+        if (d_Vb) cuMemFree(d_Vb); \
+        if (d_ref) cuMemFree(d_ref); \
+        if (d_split) cuMemFree(d_split); \
+        free(Q); free(K); free(V); free(out_ref); free(out_split); \
+    } while (0)
+    if (!d_Q || !d_K || !d_V ||
+        cuMemAlloc(&d_Qb, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_Kb, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_Vb, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        QIMG_BF16_BENCH_CLEANUP();
+        fprintf(stderr, "FAIL (device alloc/upload)\n");
+        return 1;
+    }
+    cast_buf_f32_to_bf16(r, d_Qb, d_Q, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Kb, d_K, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Vb, d_V, (int)n_elems);
+
+    float base_ms = time_qimg_bf16_attn(r, d_ref, d_Qb, d_Kb, d_Vb,
+                                        n_tok, n_heads, head_dim, repeats);
+    if (base_ms < 0.0f ||
+        cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        QIMG_BF16_BENCH_CLEANUP();
+        fprintf(stderr, "FAIL (baseline timing/copy)\n");
+        return 1;
+    }
+
+    float best_ms = 1e30f, best_max_diff = 0.0f, best_mean_diff = 0.0f;
+    int best_split_kv = 0, best_n_splits = 0;
+    for (int ci = 0; ci < (int)(sizeof(split_candidates) / sizeof(split_candidates[0])); ci++) {
+        int split_kv = split_candidates[ci];
+        int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (n_splits <= 1) continue;
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            QIMG_BF16_BENCH_CLEANUP();
+            fprintf(stderr, "FAIL (device OOM split_kv=%d)\n", split_kv);
+            return 1;
+        }
+        float split_ms = time_qimg_bf16_split_attn(r, d_split, d_Qb, d_Kb, d_Vb,
+                                                   n_tok, n_heads, head_dim,
+                                                   split_kv, n_splits, repeats);
+        if (split_ms < 0.0f ||
+            cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+            QIMG_BF16_BENCH_CLEANUP();
+            fprintf(stderr, "FAIL (split_kv=%d timing/copy)\n", split_kv);
+            return 1;
+        }
+        float max_diff = 0.0f, mean_diff = 0.0f;
+        for (size_t i = 0; i < n_elems; i++) {
+            float d = fabsf(out_split[i] - out_ref[i]);
+            if (d > max_diff) max_diff = d;
+            mean_diff += d;
+        }
+        mean_diff /= (float)n_elems;
+        if (max_diff > 2e-3f || mean_diff > 2e-4f) {
+            QIMG_BF16_BENCH_CLEANUP();
+            fprintf(stderr, "FAIL (split_kv=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms)\n",
+                    split_kv, max_diff, mean_diff, base_ms, split_ms);
+            return 1;
+        }
+        if (split_ms < best_ms) {
+            best_ms = split_ms;
+            best_max_diff = max_diff;
+            best_mean_diff = mean_diff;
+            best_split_kv = split_kv;
+            best_n_splits = n_splits;
+        }
+    }
+    QIMG_BF16_BENCH_CLEANUP();
+#undef QIMG_BF16_BENCH_CLEANUP
+    fprintf(stderr, "OK (best_split_kv=%d splits=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms speedup=%.2fx)\n",
+            best_split_kv, best_n_splits, best_max_diff, best_mean_diff,
+            base_ms, best_ms, base_ms / (best_ms + 1e-9f));
+    return 0;
+}
+
+static int test_kernel_split_attn_bf16_2048(cuda_qimg_runner *r) {
+    return test_kernel_split_attn_bf16_bench(r, 2048, 1, "2048-token", 3);
+}
+
+static int test_kernel_split_attn_bf16_4608_qimg_heads(cuda_qimg_runner *r) {
+    return test_kernel_split_attn_bf16_bench(r, 4608, 24, "4608-token/24-head", 2);
 }
 
 /* Test 3: img_in linear projection against PyTorch reference.
@@ -308,8 +1359,17 @@ static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path
     uint8_t hdr[10];
     if (fread(hdr, 1, 10, f_in) != 10 || fread(hdr, 1, 10, f_pj) != 10) { fclose(f_in); fclose(f_pj); fprintf(stderr, "FAIL (npy header)\n"); return 1; }
     fseek(f_in, 0, SEEK_SET); fseek(f_pj, 0, SEEK_SET);
-    fread(hdr, 1, 8, f_in); uint16_t hl_in; fread(&hl_in, 2, 1, f_in); fseek(f_in, 10 + hl_in, SEEK_SET);
-    fread(hdr, 1, 8, f_pj); uint16_t hl_pj; fread(&hl_pj, 2, 1, f_pj); fseek(f_pj, 10 + hl_pj, SEEK_SET);
+    uint16_t hl_in, hl_pj;
+    if (fread(hdr, 1, 8, f_in) != 8 ||
+        fread(&hl_in, 2, 1, f_in) != 1 ||
+        fseek(f_in, 10 + hl_in, SEEK_SET) != 0 ||
+        fread(hdr, 1, 8, f_pj) != 8 ||
+        fread(&hl_pj, 2, 1, f_pj) != 1 ||
+        fseek(f_pj, 10 + hl_pj, SEEK_SET) != 0) {
+        fclose(f_in); fclose(f_pj);
+        fprintf(stderr, "FAIL (npy header)\n");
+        return 1;
+    }
 
     const int n_tok = 16, n_in = 64, n_out = 3072;
     size_t n_inp = (size_t)n_tok * n_in;
@@ -317,6 +1377,11 @@ static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path
     float *inp = (float *)malloc(n_inp * sizeof(float));
     float *ref = (float *)malloc(n_out_elem * sizeof(float));
     float *out_f = (float *)malloc(n_out_elem * sizeof(float));
+    if (!inp || !ref || !out_f) {
+        fclose(f_in); fclose(f_pj); free(inp); free(ref); free(out_f);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
     if (fread(inp, sizeof(float), n_inp, f_in) != n_inp ||
         fread(ref, sizeof(float), n_out_elem, f_pj) != n_out_elem) {
         fclose(f_in); fclose(f_pj); free(inp); free(ref); free(out_f);
@@ -332,14 +1397,28 @@ static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path
     CUdeviceptr d_b = qimg_st_upload_f32(st, "img_in.bias");
     safetensors_close(st);
     CUdeviceptr d_x = upload_f32(inp, n_inp);
-    CUdeviceptr d_y = 0; cuMemAlloc(&d_y, n_out_elem * sizeof(float));
+    CUdeviceptr d_y = 0;
+#define QIMG_PROJ_TEST_CU(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_qe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_w || !d_b || !d_x) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    QIMG_PROJ_TEST_CU(cuMemAlloc(&d_y, n_out_elem * sizeof(float)), "alloc output");
 
     /* Run through op_gemm (respects use_fp8_mma flag) */
     op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
-    cuStreamSynchronize(r->stream);
-    cuMemcpyDtoH(out_f, d_y, n_out_elem * sizeof(float));
+    QIMG_PROJ_TEST_CU(cuStreamSynchronize(r->stream), "gemm sync");
+    QIMG_PROJ_TEST_CU(cuMemcpyDtoH(out_f, d_y, n_out_elem * sizeof(float)),
+                      "output copy");
 
     cuMemFree(d_w); cuMemFree(d_b); cuMemFree(d_x); cuMemFree(d_y);
+    d_w = d_b = d_x = d_y = 0;
 
     /* Stats */
     double ss_d = 0, ss_r = 0, mean_o = 0, mean_r = 0;
@@ -362,7 +1441,16 @@ static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path
     int fail = (corr < 0.999);
     fprintf(stderr, "%s (corr=%.6f rms_diff=%.4f rms_ref=%.4f max_abs=%.4f use_fp8_mma=%d)\n",
             fail ? "FAIL" : "OK", corr, rms_diff, rms_ref, max_abs, r->use_fp8_mma);
+#undef QIMG_PROJ_TEST_CU
     return fail;
+fail:
+    if (d_w) cuMemFree(d_w);
+    if (d_b) cuMemFree(d_b);
+    if (d_x) cuMemFree(d_x);
+    if (d_y) cuMemFree(d_y);
+    free(inp); free(ref); free(out_f);
+#undef QIMG_PROJ_TEST_CU
+    return 1;
 }
 
 /* Test 4: FP8 MMA vs LUT on production shape 3072x3072 with n_tok=256.
@@ -380,7 +1468,12 @@ static int test_kernel_fp8_gemm_production_shape(cuda_qimg_runner *r, const char
     CUdeviceptr d_w = qimg_st_upload_fp8_raw(st, "transformer_blocks.0.attn.to_q.weight");
     CUdeviceptr d_b = qimg_st_upload_f32(st, "transformer_blocks.0.attn.to_q.bias");
     safetensors_close(st);
-    if (!d_w) { fprintf(stderr, "SKIP (weight missing)\n"); return 0; }
+    if (!d_w || !d_b) {
+        if (d_w) cuMemFree(d_w);
+        if (d_b) cuMemFree(d_b);
+        fprintf(stderr, "SKIP (weight/bias missing)\n");
+        return 0;
+    }
 
     const int n_tok = 256, n_in = 3072, n_out = 3072;
     size_t nX = (size_t)n_tok * n_in;
@@ -388,6 +1481,12 @@ static int test_kernel_fp8_gemm_production_shape(cuda_qimg_runner *r, const char
     float *X = (float *)malloc(nX * sizeof(float));
     float *Y_mma = (float *)malloc(nY * sizeof(float));
     float *Y_lut = (float *)malloc(nY * sizeof(float));
+    if (!X || !Y_mma || !Y_lut) {
+        cuMemFree(d_w); cuMemFree(d_b);
+        free(X); free(Y_mma); free(Y_lut);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
     /* Prefer real pipeline data if the caller has dumped block0 adaln via
      * --verbose 3, else fall back to random. */
     FILE *af = fopen("cuda_block0_adaln.bin", "rb");
@@ -402,22 +1501,37 @@ static int test_kernel_fp8_gemm_production_shape(cuda_qimg_runner *r, const char
         rng_state = 99;
         for (size_t i = 0; i < nX; i++) X[i] = randn() * 0.5f;
     }
-    CUdeviceptr d_x = upload_f32(X, nX);
-    CUdeviceptr d_y = 0; cuMemAlloc(&d_y, nY * sizeof(float));
-
     int saved_mma = r->use_fp8_mma;
+    CUdeviceptr d_x = upload_f32(X, nX);
+    CUdeviceptr d_y = 0;
+#define QIMG_PROD_GEMM_TEST_CU(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_qe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_x) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    QIMG_PROD_GEMM_TEST_CU(cuMemAlloc(&d_y, nY * sizeof(float)), "alloc output");
+
     r->use_fp8_mma = 1;
     op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
-    cuStreamSynchronize(r->stream);
-    cuMemcpyDtoH(Y_mma, d_y, nY * sizeof(float));
+    QIMG_PROD_GEMM_TEST_CU(cuStreamSynchronize(r->stream), "mma sync");
+    QIMG_PROD_GEMM_TEST_CU(cuMemcpyDtoH(Y_mma, d_y, nY * sizeof(float)),
+                           "mma copy");
 
     r->use_fp8_mma = 0;
     op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
-    cuStreamSynchronize(r->stream);
-    cuMemcpyDtoH(Y_lut, d_y, nY * sizeof(float));
+    QIMG_PROD_GEMM_TEST_CU(cuStreamSynchronize(r->stream), "lut sync");
+    QIMG_PROD_GEMM_TEST_CU(cuMemcpyDtoH(Y_lut, d_y, nY * sizeof(float)),
+                           "lut copy");
     r->use_fp8_mma = saved_mma;
 
     cuMemFree(d_w); cuMemFree(d_b); cuMemFree(d_x); cuMemFree(d_y);
+    d_w = d_b = d_x = d_y = 0;
 
     double ss_d = 0, ss_lut = 0, ss_mma = 0;
     for (size_t i = 0; i < nY; i++) {
@@ -435,7 +1549,17 @@ static int test_kernel_fp8_gemm_production_shape(cuda_qimg_runner *r, const char
     int fail = (ratio > 1.5 || ratio < 0.67 || rms_d > 0.3 * rms_lut);
     fprintf(stderr, "%s (rms_mma=%.4f rms_lut=%.4f ratio=%.3f rms_d=%.4f)\n",
             fail ? "FAIL" : "OK", rms_mma, rms_lut, ratio, rms_d);
+#undef QIMG_PROD_GEMM_TEST_CU
     return fail;
+fail:
+    r->use_fp8_mma = saved_mma;
+    if (d_w) cuMemFree(d_w);
+    if (d_b) cuMemFree(d_b);
+    if (d_x) cuMemFree(d_x);
+    if (d_y) cuMemFree(d_y);
+    free(X); free(Y_mma); free(Y_lut);
+#undef QIMG_PROD_GEMM_TEST_CU
+    return 1;
 }
 
 static int test_kernels(void) {
@@ -443,8 +1567,17 @@ static int test_kernels(void) {
     cuda_qimg_runner *r = cuda_qimg_init(0, 0);
     if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
     int fail = 0;
+    fail += test_kernel_split_selector();
     fail += test_kernel_fp8_gemm(r);
     fail += test_kernel_fp8_attn(r);
+    fail += test_kernel_split_attn_f32(r);
+    fail += test_kernel_split_attn_bf16(r);
+    fail += test_kernel_split_auto_prefers_tensor_attn(r);
+    fail += test_kernel_split_attn_bf16_2048(r);
+    fail += test_kernel_split_attn_bf16_4608_qimg_heads(r);
+    fail += test_kernel_split_attn_f32_2048(r);
+    fail += test_kernel_split_attn_f32_4608(r);
+    fail += test_kernel_split_attn_f32_4608_qimg_heads(r);
     /* The DiT-weight-vs-reference test needs a safetensors path; allow override */
     const char *ref_dit = getenv("QIMG_TEST_DIT");
     if (!ref_dit) ref_dit = "/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
@@ -456,12 +1589,222 @@ static int test_kernels(void) {
     return fail;
 }
 
+/* ---- INT8 W8A8 GEMM self-test (no model needed; exercises op_gemm int8 path) ----
+ * Validates (a) correctness vs a CPU int8 reference (cos ~1) and vs an f32
+ * dequant-weight reference (quant quality), and (b) run-to-run BIT-EXACT
+ * determinism — the core reproducibility property that motivates int8. */
+static int test_int8_gemm(void) {
+    fprintf(stderr, "=== INT8 W8A8 GEMM self-test ===\n");
+    cuda_qimg_runner *r = cuda_qimg_init(0, 1);
+    if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    if (!r->gemm_w8a8_perrow || !r->quant_act_perrow_int8) {
+        fprintf(stderr, "FAIL: int8 kernels not loaded\n"); cuda_qimg_free(r); return 1;
+    }
+    r->use_int8 = 1;  /* force the int8 path in op_gemm */
+    /* Mirror load_dit's auto-detect: default GEMM = OUR gemm_int8_s32; set up
+     * cuBLAS as the verification oracle. QIMG_INT8_CUBLAS=1 uses cuBLAS for the run. */
+    if (!getenv("QIMG_DISABLE_INT8_CUBLAS") && r->dequant_int32_to_bf16 && r->cublaslt_ctx)
+        r->use_cublas_int8 = 1;
+    int will_cublas = r->use_cublas_int8 && getenv("QIMG_INT8_CUBLAS");
+    fprintf(stderr, "  int8 GEMM: %s (cuBLAS oracle %s)\n",
+            will_cublas ? "cuBLAS GemmEx" : (r->gemm_int8_s32 ? "own gemm_int8_s32" : "naive"),
+            r->use_cublas_int8 ? "available" : "off");
+
+    struct { int N, K, M; const char *label; } cases[] = {
+        {512, 256, 64,   "small"},
+        {3072, 3072, 64, "attn-proj"},
+        {12288, 3072, 16,"mlp-fc1"},
+        {18432, 3072, 1, "modulation n_tok=1"},
+        {64, 3072, 64,   "proj_out"},
+    };
+    int n_cases = (int)(sizeof(cases)/sizeof(cases[0]));
+    int all_ok = 1;
+    rng_state = 1234567;
+
+    for (int c = 0; c < n_cases; c++) {
+        int N = cases[c].N, K = cases[c].K, M = cases[c].M;
+        size_t nW = (size_t)N*K, nX = (size_t)M*K, nY = (size_t)M*N;
+        float *Wf = (float*)malloc(nW*sizeof(float));
+        float *Xf = (float*)malloc(nX*sizeof(float));
+        float *Bf = (float*)malloc((size_t)N*sizeof(float));
+        for (size_t i=0;i<nW;i++) Wf[i] = randn()*0.05f;
+        for (size_t i=0;i<nX;i++) Xf[i] = randn()*0.5f;
+        for (int i=0;i<N;i++)     Bf[i] = randn()*0.1f;
+
+        /* per-channel symmetric int8 quant of W (same as quantize_int8.py) */
+        float *wscale = (float*)malloc((size_t)N*sizeof(float));
+        signed char *Wq = (signed char*)malloc(nW);
+        for (int o=0;o<N;o++){
+            float amax=0; for(int k=0;k<K;k++){float a=fabsf(Wf[(size_t)o*K+k]); if(a>amax)amax=a;}
+            float sc = amax>0 ? amax/127.0f : 1e-12f; wscale[o]=sc;
+            for(int k=0;k<K;k++){ float q=rintf(Wf[(size_t)o*K+k]/sc);
+                if(q>127)q=127; else if(q<-127)q=-127; Wq[(size_t)o*K+k]=(signed char)q; }
+        }
+        /* fat weight buffer: [wscale N f32][Wq N*K int8] */
+        size_t fatbytes = (size_t)N*sizeof(float) + nW;
+        unsigned char *fat = (unsigned char*)malloc(fatbytes);
+        memcpy(fat, wscale, (size_t)N*sizeof(float));
+        memcpy(fat + (size_t)N*sizeof(float), Wq, nW);
+
+        CUdeviceptr dW=0,dX=0,dB=0,dY=0;
+        cuMemAlloc(&dW, fatbytes);              cuMemcpyHtoD(dW, fat, fatbytes);
+        cuMemAlloc(&dX, nX*sizeof(float));      cuMemcpyHtoD(dX, Xf, nX*sizeof(float));
+        cuMemAlloc(&dB, (size_t)N*sizeof(float));cuMemcpyHtoD(dB, Bf, (size_t)N*sizeof(float));
+        cuMemAlloc(&dY, nY*sizeof(float));
+
+        cuMemsetD8(dY, 0, nY*sizeof(float));
+        op_gemm(r, dY, dW, dX, dB, N, K, M);
+        cuStreamSynchronize(r->stream);
+        float *Yg = (float*)malloc(nY*sizeof(float));
+        cuMemcpyDtoH(Yg, dY, nY*sizeof(float));
+        /* determinism: rerun, compare bit-exact */
+        cuMemsetD8(dY, 0, nY*sizeof(float));
+        op_gemm(r, dY, dW, dX, dB, N, K, M);
+        cuStreamSynchronize(r->stream);
+        float *Yg2 = (float*)malloc(nY*sizeof(float));
+        cuMemcpyDtoH(Yg2, dY, nY*sizeof(float));
+        int det = (memcmp(Yg, Yg2, nY*sizeof(float)) == 0);
+
+        /* perf: time the int8 GEMM in isolation */
+        {
+            for (int w=0;w<10;w++) op_gemm(r, dY, dW, dX, dB, N, K, M);
+            cuStreamSynchronize(r->stream);
+            struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+            int iters=200;
+            for (int it=0; it<iters; it++) op_gemm(r, dY, dW, dX, dB, N, K, M);
+            cuStreamSynchronize(r->stream);
+            clock_gettime(CLOCK_MONOTONIC,&t1);
+            double ms=((t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)*1e-6)/iters;
+            double tops=2.0*N*K*M/(ms*1e-3)/1e12;
+            fprintf(stderr,"    [perf] %-20s %.3f ms/call  %.1f TOPS\n", cases[c].label, ms, tops);
+        }
+
+        /* CPU references */
+        double dot=0,na=0,nb=0,maxabs=0, dotf=0,naf=0,nbf=0;
+        for (int t=0;t<M;t++){
+            float xmax=0; for(int k=0;k<K;k++){float a=fabsf(Xf[(size_t)t*K+k]); if(a>xmax)xmax=a;}
+            float xsc = xmax>1e-30f ? xmax/127.0f : 1.0f;
+            signed char *xq=(signed char*)malloc(K);
+            for(int k=0;k<K;k++){float q=rintf(Xf[(size_t)t*K+k]/xsc);
+                if(q>127)q=127; else if(q<-127)q=-127; xq[k]=(signed char)q;}
+            for (int o=0;o<N;o++){
+                long acc=0; const signed char *wr=Wq+(size_t)o*K;
+                for(int k=0;k<K;k++) acc += (int)xq[k]*(int)wr[k];
+                float y = (float)acc * (xsc*wscale[o]) + Bf[o];
+                unsigned int bits; memcpy(&bits,&y,4);
+                bits += 0x7FFFu + ((bits>>16)&1u); bits &= 0xFFFF0000u; memcpy(&y,&bits,4);
+                float g = Yg[(size_t)t*N+o];
+                double d=(double)g-y; if(fabs(d)>maxabs)maxabs=fabs(d);
+                dot+=(double)g*y; na+=(double)g*g; nb+=(double)y*y;
+                double yf=Bf[o]; for(int k=0;k<K;k++) yf+=(double)Xf[(size_t)t*K+k]*(double)wr[k]*wscale[o];
+                dotf+=(double)g*yf; naf+=(double)g*g; nbf+=yf*yf;
+            }
+            free(xq);
+        }
+        double cos  = dot/(sqrt(na)*sqrt(nb)+1e-30);
+        double cosf = dotf/(sqrt(naf)*sqrt(nbf)+1e-30);
+        int ok = (cos>0.999) && (cosf>0.99) && det;
+        if(!ok) all_ok=0;
+        fprintf(stderr, "  %-20s N=%-5d K=%-4d M=%-4d  cos(int8)=%.6f cos(f32)=%.5f maxabs=%.2e det=%s -> %s\n",
+                cases[c].label,N,K,M,cos,cosf,maxabs,det?"yes":"NO",ok?"PASS":"FAIL");
+
+        cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY);
+        free(Wf);free(Xf);free(Bf);free(wscale);free(Wq);free(fat);free(Yg);free(Yg2);
+    }
+
+    /* Perf-only at realistic n_tok (real workload: n_img=256 @256^2, 1024 @512^2). */
+    fprintf(stderr, "  --- perf at realistic M (no correctness) ---\n");
+    struct { int N,K,M; const char *l; } pc[] = {
+        {3072,3072,256,"attn M=256"}, {12288,3072,256,"mlp_fc1 M=256"},
+        {3072,12288,256,"mlp_fc2 M=256"}, {3072,3072,1024,"attn M=1024"},
+        {12288,3072,1024,"mlp_fc1 M=1024"},
+    };
+    for (int c=0;c<(int)(sizeof(pc)/sizeof(pc[0]));c++){
+        int N=pc[c].N,K=pc[c].K,M=pc[c].M; size_t nW=(size_t)N*K;
+        unsigned char *fat=(unsigned char*)calloc((size_t)N*4+nW,1);
+        for(int o=0;o<N;o++) ((float*)fat)[o]=0.01f;
+        CUdeviceptr dW=0,dX=0,dB=0,dY=0;
+        cuMemAlloc(&dW,(size_t)N*4+nW); cuMemcpyHtoD(dW,fat,(size_t)N*4+nW);
+        cuMemAlloc(&dX,(size_t)M*K*4); cuMemsetD8(dX,1,(size_t)M*K*4);
+        cuMemAlloc(&dB,(size_t)N*4); cuMemsetD8(dB,0,(size_t)N*4);
+        cuMemAlloc(&dY,(size_t)M*N*4);
+        for(int w=0;w<10;w++) op_gemm(r,dY,dW,dX,dB,N,K,M);
+        cuStreamSynchronize(r->stream);
+        struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+        int iters=100; for(int it=0;it<iters;it++) op_gemm(r,dY,dW,dX,dB,N,K,M);
+        cuStreamSynchronize(r->stream); clock_gettime(CLOCK_MONOTONIC,&t1);
+        double ms=((t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)*1e-6)/iters;
+        fprintf(stderr,"    %-16s %.3f ms/call  %.1f TOPS\n",pc[c].l,ms,2.0*N*K*M/(ms*1e-3)/1e12);
+        cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY); free(fat);
+    }
+
+    /* ===== VERIFY: our gemm_int8_s32 vs cuBLAS int8 GemmEx, at the int32 level =====
+     * Both compute the EXACT integer dot product, so they must be bit-identical (and
+     * equal to a CPU int32 reference). Feeds identical int8 Wq/Xq (incl +-127) to both,
+     * compares the raw int32 outputs element-by-element. This is the cleanest check:
+     * integer equality, no floating-point ULP ambiguity. */
+    if (r->gemm_int8_s32 && r->use_cublas_int8 && r->cublaslt_ctx) {
+        fprintf(stderr, "  --- VERIFY: own gemm_int8_s32 vs cuBLAS GemmEx (int32, bit-exact) ---\n");
+        struct { int N,K,M; const char *l; } vc[] = {
+            {3072,3072,256,"attn"}, {12288,3072,256,"mlp_fc1"},
+            {3072,12288,256,"mlp_fc2"}, {3072,3072,1024,"attn M=1024"},
+            {256,3072,64,"small"},
+        };
+        for (int c=0;c<(int)(sizeof(vc)/sizeof(vc[0]));c++){
+            int N=vc[c].N,K=vc[c].K,M=vc[c].M;
+            signed char *Wq=(signed char*)malloc((size_t)N*K);
+            signed char *Xq=(signed char*)malloc((size_t)M*K);
+            srand(1000+c);
+            for(size_t i=0;i<(size_t)N*K;i++){int v=(rand()%255)-127; if(rand()%20==0)v=(rand()&1)?127:-127; Wq[i]=(signed char)v;}
+            for(size_t i=0;i<(size_t)M*K;i++){int v=(rand()%255)-127; if(rand()%20==0)v=(rand()&1)?127:-127; Xq[i]=(signed char)v;}
+            CUdeviceptr dWq=0,dXq=0,dCo=0,dCc=0;
+            cuMemAlloc(&dWq,(size_t)N*K); cuMemcpyHtoD(dWq,Wq,(size_t)N*K);
+            cuMemAlloc(&dXq,(size_t)M*K); cuMemcpyHtoD(dXq,Xq,(size_t)M*K);
+            cuMemAlloc(&dCo,(size_t)M*N*sizeof(int)); cuMemsetD8(dCo,0,(size_t)M*N*sizeof(int));
+            cuMemAlloc(&dCc,(size_t)M*N*sizeof(int)); cuMemsetD8(dCc,0,(size_t)M*N*sizeof(int));
+            /* our kernel */
+            void *ga[]={&dCo,&dWq,&dXq,&N,&K,&M};
+            unsigned gx=((N+255)/256); gx=(gx+3u)&~3u;
+            unsigned gy=((M+31)/32);   gy=(gy+3u)&~3u;
+            cuLaunchKernel(r->gemm_int8_s32,gx,gy,1,128,1,1,1024+8192*2,r->stream,ga,NULL);
+            /* cuBLAS */
+            int rc=cublasew_gemm_int8_s32_rowmajor_nt(r->cublaslt_ctx,dCc,dWq,dXq,M,N,K);
+            cuStreamSynchronize(r->stream);
+            int *Co=(int*)malloc((size_t)M*N*sizeof(int)), *Cc=(int*)malloc((size_t)M*N*sizeof(int));
+            cuMemcpyDtoH(Co,dCo,(size_t)M*N*sizeof(int));
+            cuMemcpyDtoH(Cc,dCc,(size_t)M*N*sizeof(int));
+            long mism_oc=0,maxd_oc=0, mism_cpu=0; long total=(long)M*N;
+            for(int t=0;t<M;t++)for(int o=0;o<N;o++){
+                long acc=0; const signed char *wr=Wq+(size_t)o*K,*xr=Xq+(size_t)t*K;
+                for(int k=0;k<K;k++) acc+=(int)xr[k]*(int)wr[k];
+                long g=Co[(size_t)t*N+o], b=Cc[(size_t)t*N+o];
+                long d=g-b; if(d<0)d=-d; if(d>maxd_oc)maxd_oc=d; if(d)mism_oc++;
+                if(g!=acc)mism_cpu++;
+            }
+            int vok = (rc==0) && (mism_oc==0) && (mism_cpu==0);
+            if(!vok) all_ok=0;
+            fprintf(stderr,"  %-12s N=%-5d K=%-5d M=%-4d  ours-vs-cuBLAS=%ld/%ld (max|d|=%ld)  ours-vs-CPU=%ld/%ld  cuBLAS_rc=%d -> %s\n",
+                    vc[c].l,N,K,M, mism_oc,total,maxd_oc, mism_cpu,total, rc, vok?"BIT-EXACT":"MISMATCH");
+            cuMemFree(dWq);cuMemFree(dXq);cuMemFree(dCo);cuMemFree(dCc);
+            free(Wq);free(Xq);free(Co);free(Cc);
+        }
+    } else {
+        fprintf(stderr, "  --- VERIFY skipped (need both own kernel + cuBLAS oracle) ---\n");
+    }
+
+    cuda_qimg_free(r);
+    fprintf(stderr, "RESULT: %s\n", all_ok?"PASS":"FAIL");
+    return all_ok?0:1;
+}
+
 int main(int argc, char **argv) {
     const char *dit_path = "/mnt/nvme02/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
     const char *vae_path = "/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors";
     const char *enc_path = "/mnt/nvme02/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf";
+    const char *enc_st_path = getenv("QIMG_TEXT_ENCODER_ST");
     const char *prompt = "a red apple on a white table";
     int custom_prompt = 0;
+    const char *out_path = "cuda_qimg_output.ppm";  /* --generate image output (PPM) */
     const char *mode = NULL;
     int out_h = 256, out_w = 256, n_steps = 20;
     int force_f16 = 0, no_cfg = 0;
@@ -472,6 +1815,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
         else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
+        else if (strcmp(argv[i], "--test-int8-gemm") == 0) mode = "int8gemm";
         else if (strcmp(argv[i], "--test-vae") == 0) mode = "vae";
         else if (strcmp(argv[i], "--generate") == 0) mode = "gen";
         else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
@@ -482,20 +1826,39 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dit") == 0 && i+1 < argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae") == 0 && i+1 < argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc") == 0 && i+1 < argc) enc_path = argv[++i];
+        else if (strcmp(argv[i], "--enc-st") == 0 && i+1 < argc) enc_st_path = argv[++i];
         else if (strcmp(argv[i], "--prompt") == 0 && i+1 < argc) { prompt = argv[++i]; custom_prompt = 1; }
         else if (strcmp(argv[i], "--height") == 0 && i+1 < argc) out_h = atoi(argv[++i]);
         else if (strcmp(argv[i], "--width") == 0 && i+1 < argc) out_w = atoi(argv[++i]);
         else if (strcmp(argv[i], "--steps") == 0 && i+1 < argc) n_steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (uint64_t)atoll(argv[++i]);
+        else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out_path = argv[++i];
     }
 
     if (mode && strcmp(mode, "kernels") == 0) return test_kernels();
+    if (mode && strcmp(mode, "int8gemm") == 0) return test_int8_gemm();
 
     if (!mode) {
         fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--test-kernels|--generate\n"
-                "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
-                "  --height <h>  --width <w>  --steps <n>  --seed <s>  --no-fp8\n", argv[0]);
+                "  --dit <st>  --vae <st>  --enc <gguf>  --enc-st <st>  --prompt <text>\n"
+                "  --height <h>  --width <w>  --steps <n>  --seed <s>  --out <ppm>  --no-fp8\n", argv[0]);
         return 1;
+    }
+
+    if (!enc_st_path) {
+        const char *candidates[] = {
+            "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            NULL
+        };
+        for (int ci = 0; candidates[ci]; ci++) {
+            FILE *fp = fopen(candidates[ci], "rb");
+            if (fp) {
+                fclose(fp);
+                enc_st_path = candidates[ci];
+                break;
+            }
+        }
     }
 
     int lat_h = out_h / 8, lat_w = out_w / 8;
@@ -524,6 +1887,7 @@ int main(int argc, char **argv) {
     clock_t t0;
     if (r) {
         t0 = clock();
+        r->dit_target_pixels = (size_t)out_h * out_w;  /* size W4A4 preload to the resolution */
         if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     }
@@ -697,8 +2061,7 @@ int main(int argc, char **argv) {
         /* Try GPU text encoder (GGUF + biases, ~500× faster than CPU).
          * Uses primary CUDA context shared with DiT runner. */
         if (!txt_hidden) {
-            const char *bias_st = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
-            qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, bias_st, 0);
+            qimg_text_enc *enc = enc_st_path ? qimg_text_enc_load_gpu(enc_path, enc_st_path, 0) : NULL;
             if (enc) {
                 txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
                 fprintf(stderr, "  Encoding negative prompt...\n");
@@ -708,8 +2071,7 @@ int main(int argc, char **argv) {
         }
         /* CPU GGUF fallback (slow but works without GPU LLM runner) */
         if (!txt_hidden) {
-            const char *bias_st = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
-            qimg_text_enc *enc = qimg_text_enc_load_gguf_with_biases(enc_path, bias_st);
+            qimg_text_enc *enc = enc_st_path ? qimg_text_enc_load_gguf_with_biases(enc_path, enc_st_path) : NULL;
             if (enc) {
                 txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
                 fprintf(stderr, "  Encoding negative prompt...\n");
@@ -719,12 +2081,11 @@ int main(int argc, char **argv) {
         }
         /* FP8 safetensors fallback (dequants to F32 — 30GB, slow on CPU) */
         if (!txt_hidden) {
-            const char *st_enc = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
-            FILE *tf = fopen(st_enc, "rb");
+            FILE *tf = enc_st_path ? fopen(enc_st_path, "rb") : NULL;
             if (tf) {
                 fclose(tf);
                 fprintf(stderr, "  Loading FP8 scaled text encoder (slow fallback)...\n");
-                qimg_text_enc *enc = qimg_text_enc_load_safetensors(st_enc, enc_path);
+                qimg_text_enc *enc = qimg_text_enc_load_safetensors(enc_st_path, enc_path);
                 if (enc) {
                     txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
                     fprintf(stderr, "  Encoding negative prompt...\n");
@@ -752,6 +2113,7 @@ int main(int argc, char **argv) {
         if (force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; }
         if (force_f16 == 4) { r->use_old_gemm = 1; }
         t0 = clock();
+        r->dit_target_pixels = (size_t)out_h * out_w;  /* size W4A4 preload to the resolution */
         if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
@@ -788,6 +2150,21 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++)
             if (strcmp(argv[i], "--cfg-scale") == 0 && i+1 < argc)
                 cfg_scale = (float)atof(argv[++i]);
+
+        /* Debug dumps for HIP layer-by-layer verify (compare_cuda_dumps.py):
+         * the exact embeddings + sigma schedule the CUDA DiT saw, raw f32
+         * row-major. Cond [n_txt,3584], uncond [n_txt_neg,3584], sigmas[n+1]. */
+        if (r->verbose >= 3) {
+            FILE *tf = fopen("cuda_txt_pos.bin", "wb");
+            if (tf) { fwrite(txt_hidden, sizeof(float), (size_t)n_txt*txt_dim, tf); fclose(tf);
+                fprintf(stderr, "  Saved cuda_txt_pos.bin [%d, %d]\n", n_txt, txt_dim); }
+            FILE *nf = fopen("cuda_txt_neg.bin", "wb");
+            if (nf) { fwrite(txt_neg_hidden, sizeof(float), (size_t)n_txt_neg*txt_dim, nf); fclose(nf);
+                fprintf(stderr, "  Saved cuda_txt_neg.bin [%d, %d]\n", n_txt_neg, txt_dim); }
+            FILE *gf = fopen("cuda_sigmas.bin", "wb");
+            if (gf) { fwrite(sched.sigmas, sizeof(float), (size_t)n_steps+1, gf); fclose(gf);
+                fprintf(stderr, "  Saved cuda_sigmas.bin [%d]\n", n_steps+1); }
+        }
 
         /* Patchify + denoising loop with CFG */
         float *img_tokens = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
@@ -982,7 +2359,7 @@ int main(int argc, char **argv) {
         free(latent);
 
         /* Save */
-        save_ppm("cuda_qimg_output.ppm", rgb, out_h, out_w);
+        save_ppm(out_path, rgb, out_h, out_w);
         free(rgb);
     }
 

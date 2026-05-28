@@ -52,11 +52,33 @@ typedef struct {
     const char *precision;
 } cuda_sam3d_config;
 
+typedef struct {
+    double create_ms;
+    double set_image_ms;
+    double set_mask_ms;
+    double set_pointmap_ms;
+    double dinov2_ms;
+    double cond_fuser_ms;
+    double ss_dit_ms;
+    double ss_decode_ms;
+    double slat_dit_ms;
+    double slat_gs_ms;
+    int dinov2_tokens;
+    int cond_tokens;
+    int ss_steps;
+    int slat_steps;
+    int cfg_steps;
+    int active_voxels;
+    int gaussians;
+} cuda_sam3d_profile;
+
 /* Same 17-scalar PLY-export channel order as the CPU runner. */
 #define CUDA_SAM3D_GS_STRIDE 17
 
 cuda_sam3d_ctx *cuda_sam3d_create(const cuda_sam3d_config *cfg);
 void            cuda_sam3d_destroy(cuda_sam3d_ctx *ctx);
+int             cuda_sam3d_get_profile(cuda_sam3d_ctx *ctx,
+                                        cuda_sam3d_profile *out_profile);
 
 /* Inputs — idempotent, callable before any run_*. */
 int cuda_sam3d_set_image_rgba(cuda_sam3d_ctx *ctx, const uint8_t *rgba,

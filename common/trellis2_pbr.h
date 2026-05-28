@@ -464,7 +464,8 @@ int t2_pbr_write_textured_obj(const char *base_path,
         float vmin = fminf(v0, fminf(v1, v2)), vmax = fmaxf(v0, fmaxf(v1, v2));
         int px0 = (int)(umin * tex_size) - 1, px1 = (int)(umax * tex_size) + 2;
         int py0 = (int)(vmin * tex_size) - 1, py1 = (int)(vmax * tex_size) + 2;
-        if (px0 < 0) px0 = 0; if (py0 < 0) py0 = 0;
+        if (px0 < 0) px0 = 0;
+        if (py0 < 0) py0 = 0;
         if (px1 >= tex_size) px1 = tex_size - 1;
         if (py1 >= tex_size) py1 = tex_size - 1;
 
@@ -475,7 +476,9 @@ int t2_pbr_write_textured_obj(const char *base_path,
                 float bu, bv, bw;
                 t2pbr_barycentric(fu, fv, u0, v0, u1, v1, u2, v2, &bu, &bv, &bw);
                 if (bu < -0.01f || bv < -0.01f || bw < -0.01f) continue;
-                if (bu < 0) bu = 0; if (bv < 0) bv = 0; if (bw < 0) bw = 0;
+                if (bu < 0) bu = 0;
+                if (bv < 0) bv = 0;
+                if (bw < 0) bw = 0;
                 float s = bu + bv + bw; bu /= s; bv /= s; bw /= s;
 
                 float r = bu*c0->r + bv*c1->r + bw*c2->r;
