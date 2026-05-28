@@ -58,6 +58,10 @@ die() { echo "error: $*" >&2; exit 1; }
 
 # Default to the FP4-vs-FP8 comparison when VARIANTS is unset and the dits exist.
 #   fp4        = native W4A4 OMMA (Nunchaku NVFP4)
+#   modfp4     = fp4 + adaLN mod also NVFP4 (W4A16) so all 60 blocks fit resident:
+#                DiT load ~9s->~4s (no weight streaming), step time unchanged; lossy
+#                on the mod (~30 dB vs fp4, visually near-identical). Make with
+#                nunchaku_fp4_repack_omma.py --mod-fp4.
 #   fp8        = canonical ComfyUI FP8 (qwen_image_fp8_e4m3fn), run with the shared
 #                qwen-image gguf encoder + VAE via @ROOT (its own dir has only a .safetensors enc)
 #   fp8-repack = Nunchaku FP4 -> dense FP8 (Stage-1)
@@ -66,7 +70,8 @@ if [ -z "${VARIANTS:-}" ]; then
     QDM=$QROOT/diffusion-models
     FP8_CANON=/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors
     DEF=""
-    [ -f "$QDM/qwen-image-fp4-omma.safetensors" ]       && DEF="fp4:$QDM/qwen-image-fp4-omma.safetensors"
+    [ -f "$QDM/qwen-image-fp4-omma.safetensors" ]        && DEF="fp4:$QDM/qwen-image-fp4-omma.safetensors"
+    [ -f "$QDM/qwen-image-fp4-omma-modfp4.safetensors" ] && DEF="${DEF:+$DEF,}modfp4:$QDM/qwen-image-fp4-omma-modfp4.safetensors"
     [ -f "$FP8_CANON" ]                                 && DEF="${DEF:+$DEF,}fp8:$FP8_CANON@$QROOT"
     [ -f "$QDM/qwen-image-fp4-repack-fp8.safetensors" ] && DEF="${DEF:+$DEF,}fp8-repack:$QDM/qwen-image-fp4-repack-fp8.safetensors"
     [ -n "$DEF" ] && VARIANTS="$DEF" && echo "[run-qwen-compare] VARIANTS unset; defaulting to: $VARIANTS"
