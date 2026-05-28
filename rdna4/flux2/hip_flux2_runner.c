@@ -304,6 +304,27 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
             int sidx = safetensors_find(st, sname);
             if (sidx >= 0) out.scale = *(const float *)safetensors_data(st, sidx);
         }
+        /* Phase F probe: optional SmoothQuant smooth tensor — bf16 -> f32. */
+        if (wname) {
+            const char *wsuf = strstr(wname, ".weight");
+            if (wsuf) {
+                char base[256]; int blen = (int)(wsuf - wname);
+                if (blen > 0 && blen < (int)sizeof(base)) {
+                    memcpy(base, wname, blen); base[blen] = 0;
+                    char smk[260]; snprintf(smk, sizeof(smk), "%s.smooth", base);
+                    int smidx = safetensors_find(st, smk);
+                    if (smidx >= 0) {
+                        const uint64_t *ssh = safetensors_shape(st, smidx);
+                        size_t sn = (size_t)ssh[0];
+                        float *sf = (float *)malloc(sn * sizeof(float));
+                        const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+                        for (size_t i = 0; i < sn; i++) { uint32_t b = (uint32_t)src[i] << 16; memcpy(&sf[i], &b, 4); }
+                        out.smooth = (float *)hip_upload_raw(sf, sn * sizeof(float));
+                        free(sf);
+                    }
+                }
+            }
+        }
         return out;
     }
 
@@ -707,20 +728,37 @@ static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
         int force_bf16 = (r->use_wmma == 2 && r->fp8_bf16_blocks > 0 &&
                           bidx >= 0 && bidx < r->fp8_bf16_blocks &&
                           r->fn_gemm_fp8_bf16_wmma != NULL);
+        /* Phase F probe: optional SmoothQuant on fp8. Pre-divide X by lam into the
+         * existing d_smooth_tmp scratch and use that as the act input. Math:
+         *   y = (W*lam)·(X/lam) = W·X. PER-TENSOR ws inflates by max(lam) — risky. */
+        void *Xeff = X;
+        if (W->smooth && r->fn_div_by_smooth) {
+            size_t need = (size_t)n_tok * (size_t)n_in * sizeof(float);
+            if (r->smooth_tmp_cap < need) {
+                if (r->d_smooth_tmp) hipFree(r->d_smooth_tmp);
+                hipMalloc((void **)&r->d_smooth_tmp, need); r->smooth_tmp_cap = need;
+            }
+            void *o = r->d_smooth_tmp;
+            int n_tok_ = n_tok, n_in_ = n_in;
+            void *dv[] = {&o, &X, &W->smooth, &n_tok_, &n_in_};
+            hipModuleLaunchKernel(r->fn_div_by_smooth, (unsigned)((n_in + 255) / 256),
+                                  (unsigned)n_tok, 1, 256, 1, 1, 0, NULL, dv, NULL);
+            Xeff = r->d_smooth_tmp;
+        }
         if (force_bf16) {
-            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
+            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, Xeff, bias, n_out, n_in, n_tok);
         }
         else if (r->use_wmma == 2 &&
-            op_gemm_fp8_pipe32(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok) == 0)
+            op_gemm_fp8_pipe32(r, Y, W->w, W->scale, Xeff, bias, n_out, n_in, n_tok) == 0)
             ; /* pipe32 FP8xFP8 handled it */
         else if (r->use_wmma == 2 && r->fn_gemm_fp8_bf16_wmma)
-            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok); /* fallback for ineligible shapes */
+            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, Xeff, bias, n_out, n_in, n_tok); /* fallback for ineligible shapes */
         else if (r->use_wmma == 1 && r->fn_gemm_fp8_bf16_wmma)
-            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
+            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, Xeff, bias, n_out, n_in, n_tok);
         else if (r->use_fp8_opt && r->fn_gemm_fp8_opt)
-            op_gemm_fp8_opt(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
+            op_gemm_fp8_opt(r, Y, W->w, W->scale, Xeff, bias, n_out, n_in, n_tok);
         else
-            op_gemm_fp8(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
+            op_gemm_fp8(r, Y, W->w, W->scale, Xeff, bias, n_out, n_in, n_tok);
     } else {
         op_gemm(r, Y, W->w, X, bias, n_out, n_in, n_tok);
     }
@@ -1227,6 +1265,20 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         out_mlp->w  = hip_upload_raw(mlp_, (size_t)H * n_ff);
         out_mlp->scale  = scale;
         free(attn); free(mlp_);
+        /* Phase F: FP8 SmoothQuant column-split [H+n_ff] -> [H] + [n_ff] (bf16->f32). */
+        char smk[256];
+        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2.smooth", bi);
+        int smidx = safetensors_find(st, smk);
+        if (smidx >= 0) {
+            const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+            float *sa = (float *)malloc((size_t)H    * sizeof(float));
+            float *sm = (float *)malloc((size_t)n_ff * sizeof(float));
+            for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)src[k]     << 16; memcpy(&sa[k], &b, 4); }
+            for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)src[H + k] << 16; memcpy(&sm[k], &b, 4); }
+            out_attn->smooth = (float *)hip_upload_raw(sa, (size_t)H    * sizeof(float));
+            out_mlp->smooth  = (float *)hip_upload_raw(sm, (size_t)n_ff * sizeof(float));
+            free(sa); free(sm);
+        }
         return 0;
     }
 
