@@ -28,6 +28,7 @@
 #include "../hip_runner_common.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -53,6 +54,7 @@ typedef struct {
     float *lora_up;    /* F32 [n_out, lora_rank] (dequanted from bf16 on upload) */
     float *lora_down;  /* F32 [lora_rank, n_in]  (shared across QKV row splits) */
     int   lora_rank;   /* typically 32 */
+    float *smooth;     /* SmoothQuant lambda [n_in] F32 (NULL = no smooth, i.e. lambda=1) */
 } flux2_hip_wt;
 
 typedef struct {
@@ -98,13 +100,22 @@ struct hip_flux2_runner {
     void *d_act_int8; float *d_act_iscale;
     size_t act_i8_cap, act_isc_cap;
     int use_int8;                        /* 1 = INT8 W8A8 weights detected */
-    /* INT4 W4A16 RTN g16 (+ optional SVDQuant LoRA) */
+    /* INT4 W4A16 RTN g16 (+ optional SVDQuant LoRA + optional SmoothQuant) */
     hipFunction_t fn_gemm_int4w_g16;     /* gemm_int4w_g16_bf16a_wmma_t */
     hipFunction_t fn_gemm_f32_f32_acc;   /* Y += W @ X, naive (LoRA step 2) */
+    hipFunction_t fn_div_by_smooth;      /* flux2_div_by_smooth_f32 */
+    hipFunction_t fn_calib_amax;         /* amax_per_col_f32 */
     float *d_lora_tmp;                   /* persistent [max_tok * max_rank] F32 scratch */
     size_t lora_tmp_cap;                 /* bytes */
+    float *d_smooth_tmp;                 /* persistent [max_tok * max_in] F32 scratch (x_smooth) */
+    size_t smooth_tmp_cap;
     int max_lora_rank;
     int use_int4;                        /* 1 = INT4 weights detected */
+    /* Calibration (FLUX2_CALIB_DUMP=path): tagged-callsite amax dumper. */
+    const char *calib_dump_path;
+    const char *calib_name;              /* set by caller before op_gemm_wt; NULL = no dump */
+    struct { char *name; int n_in; float *d_amax; } calib_slot[256];
+    int calib_n_slots;
     hipFunction_t fn_gemm_fp8_bf16_wmma; /* BF16 act × FP8 wt (BF16 WMMA) */
     hipFunction_t fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_swiglu, fn_flash_attn;
@@ -250,6 +261,19 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                         out.lora_up   = (float *)hip_upload_raw(lufp, lun * sizeof(float));
                         out.lora_down = (float *)hip_upload_raw(ldfp, ldn * sizeof(float));
                         free(lufp); free(ldfp);
+                    }
+                    /* Optional SmoothQuant smooth tensor (lambda [n_in]) — bf16, dequant to F32. */
+                    char smk[260];
+                    snprintf(smk, sizeof(smk), "%s.smooth", base);
+                    int smidx = safetensors_find(st, smk);
+                    if (smidx >= 0) {
+                        const uint64_t *ssh = safetensors_shape(st, smidx);
+                        size_t sn = (size_t)ssh[0];
+                        float *sf = (float *)malloc(sn * sizeof(float));
+                        const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+                        for (size_t i = 0; i < sn; i++) { uint32_t b = (uint32_t)src[i] << 16; memcpy(&sf[i], &b, 4); }
+                        out.smooth = (float *)hip_upload_raw(sf, sn * sizeof(float));
+                        free(sf);
                     }
                     return out;
                 }
@@ -495,6 +519,57 @@ static void op_gemm_int8(hip_flux2_runner *r, void *Y, void *Wq, float *wscale,
     }
 }
 
+/* Find or allocate a per-tag accumulating amax buffer (zero-init on first use).
+ * Returns NULL on table-full / hipMalloc failure (silently skips the dump). */
+static float *flux2_calib_slot(hip_flux2_runner *r, const char *name, int n_in) {
+    for (int i = 0; i < r->calib_n_slots; i++)
+        if (r->calib_slot[i].name && strcmp(r->calib_slot[i].name, name) == 0)
+            return r->calib_slot[i].d_amax;
+    int i = r->calib_n_slots;
+    if (i >= (int)(sizeof(r->calib_slot) / sizeof(r->calib_slot[0]))) return NULL;
+    void *d = NULL;
+    if (hipMalloc(&d, (size_t)n_in * sizeof(float)) != hipSuccess) return NULL;
+    hipMemset(d, 0, (size_t)n_in * sizeof(float));
+    r->calib_slot[i].name = strdup(name);
+    r->calib_slot[i].n_in = n_in;
+    r->calib_slot[i].d_amax = (float *)d;
+    r->calib_n_slots++;
+    return (float *)d;
+}
+
+/* Save accumulated per-linear amax as a tiny safetensors (keys = "<name>.amax"). */
+static void flux2_calib_save(hip_flux2_runner *r) {
+    if (!r->calib_dump_path || r->calib_n_slots == 0) return;
+    /* compute total float bytes + json */
+    size_t foff = 0;
+    for (int i = 0; i < r->calib_n_slots; i++) foff += (size_t)r->calib_slot[i].n_in * sizeof(float);
+    char *json = (char *)malloc(64 * 1024); int jp = 0;
+    jp += sprintf(json + jp, "{");
+    size_t cur = 0;
+    for (int i = 0; i < r->calib_n_slots; i++) {
+        size_t nb = (size_t)r->calib_slot[i].n_in * sizeof(float);
+        jp += sprintf(json + jp, "%s\"%s.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                      i ? "," : "", r->calib_slot[i].name, r->calib_slot[i].n_in, cur, cur + nb);
+        cur += nb;
+    }
+    jp += sprintf(json + jp, "}");
+    while (jp % 8 != 0) json[jp++] = ' ';
+    uint64_t jlen = (uint64_t)jp;
+    uint8_t *data = (uint8_t *)malloc(foff);
+    size_t off = 0;
+    for (int i = 0; i < r->calib_n_slots; i++) {
+        size_t nb = (size_t)r->calib_slot[i].n_in * sizeof(float);
+        hipMemcpy(data + off, r->calib_slot[i].d_amax, nb, hipMemcpyDeviceToHost);
+        off += nb;
+    }
+    FILE *f = fopen(r->calib_dump_path, "wb");
+    if (!f) { fprintf(stderr, "hip_flux2: calib save: cannot open %s\n", r->calib_dump_path);
+              free(json); free(data); return; }
+    fwrite(&jlen, 8, 1, f); fwrite(json, jp, 1, f); fwrite(data, foff, 1, f); fclose(f);
+    fprintf(stderr, "hip_flux2: calib dump wrote %d linears -> %s\n", r->calib_n_slots, r->calib_dump_path);
+    free(json); free(data);
+}
+
 /* INT4 W4A16 RTN g16: simple per-group dequant on the WMMA B-load — bf16 act, F32 accum.
  * Signature: (Y, qint4 [n_out,n_in/2], scales bf16 [n_out,n_in/16], X, bias, n_out, n_in, n_tok).
  * Optional SVDQuant LoRA add: when lora_up/lora_down present, also computes
@@ -502,7 +577,24 @@ static void op_gemm_int8(hip_flux2_runner *r, void *Y, void *Wq, float *wscale,
 static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
                          void *X, void *bias, int n_out, int n_in, int n_tok) {
     int n_in_ = n_in, n_out_ = n_out, n_tok_ = n_tok;
-    void *args[] = {&Y, &W->qint4, &W->wscale_pg, &X, &bias, &n_out_, &n_in_, &n_tok_};
+    /* SmoothQuant: pre-divide X by lambda once into d_smooth_tmp, then use x_smooth
+     * for BOTH the main int4 GEMM (residual was stored as W_smooth = W*lambda) and
+     * the LoRA branch (decomposed from W_smooth). Math: W_smooth @ x_smooth = W @ x. */
+    void *Xeff = X;
+    if (W->smooth && r->fn_div_by_smooth) {
+        size_t need = (size_t)n_tok * (size_t)n_in * sizeof(float);
+        if (r->smooth_tmp_cap < need) {
+            if (r->d_smooth_tmp) hipFree(r->d_smooth_tmp);
+            hipMalloc((void **)&r->d_smooth_tmp, need); r->smooth_tmp_cap = need;
+        }
+        void *out = r->d_smooth_tmp;
+        void *dvargs[] = {&out, &X, &W->smooth, &n_tok_, &n_in_};
+        hipModuleLaunchKernel(r->fn_div_by_smooth,
+                              (unsigned)((n_in + 255) / 256),
+                              (unsigned)n_tok, 1, 256, 1, 1, 0, NULL, dvargs, NULL);
+        Xeff = r->d_smooth_tmp;
+    }
+    void *args[] = {&Y, &W->qint4, &W->wscale_pg, &Xeff, &bias, &n_out_, &n_in_, &n_tok_};
     hipModuleLaunchKernel(r->fn_gemm_int4w_g16,
                           (unsigned)((n_out + 127) / 128),
                           (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, args, NULL);
@@ -515,8 +607,8 @@ static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
         }
         void *tmp = r->d_lora_tmp;
         void *nullbias = NULL;
-        /* Step 1: tmp[n_tok, r] = X @ lora_down^T  (W=lora_down stored as [r, n_in]) */
-        void *a1[] = {&tmp, &W->lora_down, &X, &nullbias, &rk, &n_in_, &n_tok_};
+        /* Step 1: tmp[n_tok, r] = Xeff @ lora_down^T  (W_smooth's decomposition uses x_smooth) */
+        void *a1[] = {&tmp, &W->lora_down, &Xeff, &nullbias, &rk, &n_in_, &n_tok_};
         hipModuleLaunchKernel(r->fn_gemm, (unsigned)((rk + 63) / 64),
                               (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1, 0, NULL, a1, NULL);
         /* Step 2: Y[n_tok, n_out] += tmp @ lora_up^T  (W=lora_up stored as [n_out, r]) */
@@ -527,9 +619,29 @@ static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
     }
 }
 
+/* Tag the next op_gemm_wt call's input for per-linear amax accumulation. No-op
+ * unless FLUX2_CALIB_DUMP is set. Static buffer is fine for the single-threaded step. */
+static void flux2_calib_tag(hip_flux2_runner *r, const char *fmt, ...) {
+    if (!r->calib_dump_path) return;
+    static char buf[128];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    r->calib_name = buf;
+}
+
 /* Dispatch: INT4 (qint4!=NULL) vs INT8 (wscale!=NULL) vs FP8 (scale >= 0) vs F32. */
 static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
                        void *X, void *bias, int n_out, int n_in, int n_tok) {
+    /* Calibration tap: if the step set r->calib_name before this call, accumulate
+     * per-input-channel amax of X into the per-tag slot (max-merged across calls). */
+    if (r->calib_dump_path && r->calib_name && r->fn_calib_amax && X && n_tok > 0 && n_in > 0) {
+        float *amax = flux2_calib_slot(r, r->calib_name, n_in);
+        if (amax) {
+            int n_tok_ = n_tok, n_in_ = n_in;
+            void *ca[] = {&amax, &X, &n_tok_, &n_in_};
+            hipModuleLaunchKernel(r->fn_calib_amax, (unsigned)((n_in + 255) / 256), 1, 1,
+                                  256, 1, 1, 0, NULL, ca, NULL);
+        }
+    }
     if (W->qint4) {
         op_gemm_int4(r, W, Y, X, bias, n_out, n_in, n_tok);
         return;
@@ -777,6 +889,15 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         r->fn_gemm_int4w_g16 = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_f32_f32_acc, mod, "gemm_f32_f32_acc") != hipSuccess)
         r->fn_gemm_f32_f32_acc = NULL;
+    if (hipModuleGetFunction(&r->fn_div_by_smooth, mod, "flux2_div_by_smooth_f32") != hipSuccess)
+        r->fn_div_by_smooth = NULL;
+    if (hipModuleGetFunction(&r->fn_calib_amax, mod, "amax_per_col_f32") != hipSuccess)
+        r->fn_calib_amax = NULL;
+    /* Calibration: FLUX2_CALIB_DUMP=path enables per-tag activation-amax collection. */
+    r->calib_dump_path = getenv("FLUX2_CALIB_DUMP");
+    if (r->calib_dump_path && !r->calib_dump_path[0]) r->calib_dump_path = NULL;
+    if (r->calib_dump_path && verbose >= 1)
+        fprintf(stderr, "hip_flux2: FLUX2_CALIB_DUMP active -> %s\n", r->calib_dump_path);
     hipModuleGetFunction(&r->fn_layernorm,   mod, "layernorm_f32");
     hipModuleGetFunction(&r->fn_silu,        mod, "silu_f32");
     hipModuleGetFunction(&r->fn_adaln,       mod, "adaln_modulate_f32");
@@ -891,6 +1012,7 @@ static void free_wt(flux2_hip_wt *wt) {
     if (wt && wt->wscale_pg) { hipFree(wt->wscale_pg); wt->wscale_pg = NULL; }
     if (wt && wt->lora_up) { hipFree(wt->lora_up); wt->lora_up = NULL; }
     if (wt && wt->lora_down) { hipFree(wt->lora_down); wt->lora_down = NULL; }
+    if (wt && wt->smooth) { hipFree(wt->smooth); wt->smooth = NULL; }
 }
 static void free_stream(flux2_hip_stream_t *gs) {
     free_wt(&gs->qkv);
@@ -987,6 +1109,20 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
             out_attn->lora_down = (float *)hip_upload_raw(lda, (size_t)rank * H    * sizeof(float));
             out_mlp->lora_down  = (float *)hip_upload_raw(ldm, (size_t)rank * n_ff * sizeof(float));
             free(lufp); free(lda); free(ldm);
+        }
+        /* Optional SmoothQuant smooth — column-split [H+n_ff] -> [H] (attn) + [n_ff] (mlp) */
+        char smk[256];
+        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2.smooth", bi);
+        int smidx = safetensors_find(st, smk);
+        if (smidx >= 0) {
+            const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+            float *sa = (float *)malloc((size_t)H    * sizeof(float));
+            float *sm = (float *)malloc((size_t)n_ff * sizeof(float));
+            for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)src[k]     << 16; memcpy(&sa[k], &b, 4); }
+            for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)src[H + k] << 16; memcpy(&sm[k], &b, 4); }
+            out_attn->smooth = (float *)hip_upload_raw(sa, (size_t)H    * sizeof(float));
+            out_mlp->smooth  = (float *)hip_upload_raw(sm, (size_t)n_ff * sizeof(float));
+            free(sa); free(sm);
         }
         return 0;
     }
@@ -1350,9 +1486,11 @@ int hip_flux2_dit_step(hip_flux2_runner *r,
         flux2_hip_wt img_q_w = b->img.qkv;
         flux2_hip_wt img_k_w = wt_slice(&b->img.qkv, (size_t)H * H);
         flux2_hip_wt img_v_w = wt_slice(&b->img.qkv, (size_t)2 * H * H);
+        flux2_calib_tag(r, "double_blocks.%d.img_attn.qkv", bi);
         op_gemm_wt(r, r->d_q, &img_q_w, r->d_scratch1, d0, H, H, n_img);
         op_gemm_wt(r, r->d_k, &img_k_w, r->d_scratch1, d0, H, H, n_img);
         op_gemm_wt(r, r->d_v, &img_v_w, r->d_scratch1, d0, H, H, n_img);
+        r->calib_name = NULL;
 
         /* TXT stream: adaLN -> QKV */
         op_adaln(r, r->d_scratch1, r->d_txt, mt_shift_a, mt_scale_a, n_txt, H);
@@ -1362,9 +1500,11 @@ int hip_flux2_dit_step(hip_flux2_runner *r,
         void *tq = ptr_offset(r->d_q, (size_t)n_img * H * F);
         void *tk = ptr_offset(r->d_k, (size_t)n_img * H * F);
         void *tv = ptr_offset(r->d_v, (size_t)n_img * H * F);
+        flux2_calib_tag(r, "double_blocks.%d.txt_attn.qkv", bi);
         op_gemm_wt(r, tq, &txt_q_w, r->d_scratch1, d0, H, H, n_txt);
         op_gemm_wt(r, tk, &txt_k_w, r->d_scratch1, d0, H, H, n_txt);
         op_gemm_wt(r, tv, &txt_v_w, r->d_scratch1, d0, H, H, n_txt);
+        r->calib_name = NULL;
 
         /* Per-head RMSNorm on Q, K */
         op_rmsnorm_ph(r, r->d_q, b->img.q_norm, n_img, nH, hd);
@@ -1382,9 +1522,12 @@ int hip_flux2_dit_step(hip_flux2_runner *r,
         op_attn(r, r->d_attn_out, r->d_q, r->d_k, r->d_v, n_tot, nH, hd);
 
         /* Output projections */
+        flux2_calib_tag(r, "double_blocks.%d.img_attn.proj", bi);
         op_gemm_wt(r, r->d_scratch1, &b->img.proj, r->d_attn_out, d0, H, H, n_img);
         void *txt_attn = ptr_offset(r->d_attn_out, (size_t)n_img * H * F);
+        flux2_calib_tag(r, "double_blocks.%d.txt_attn.proj", bi);
         op_gemm_wt(r, r->d_scratch2, &b->txt.proj, txt_attn, d0, H, H, n_txt);
+        r->calib_name = NULL;
 
         /* Gated residual */
         op_gated_add(r, r->d_img, r->d_scratch1, mi_gate_a, n_img, H);
@@ -1392,16 +1535,22 @@ int hip_flux2_dit_step(hip_flux2_runner *r,
 
         /* FFN img */
         op_adaln(r, r->d_scratch1, r->d_img, mi_shift_f, mi_scale_f, n_img, H);
+        flux2_calib_tag(r, "double_blocks.%d.img_mlp.0", bi);
         op_gemm_wt(r, r->d_scratch2, &b->img.mlp_up, r->d_scratch1, d0, 2*n_ff, H, n_img);
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_img, n_ff);
+        flux2_calib_tag(r, "double_blocks.%d.img_mlp.2", bi);
         op_gemm_wt(r, r->d_scratch1, &b->img.mlp_dn, r->d_scratch3, d0, H, n_ff, n_img);
+        r->calib_name = NULL;
         op_gated_add(r, r->d_img, r->d_scratch1, mi_gate_f, n_img, H);
 
         /* FFN txt */
         op_adaln(r, r->d_scratch1, r->d_txt, mt_shift_f, mt_scale_f, n_txt, H);
+        flux2_calib_tag(r, "double_blocks.%d.txt_mlp.0", bi);
         op_gemm_wt(r, r->d_scratch2, &b->txt.mlp_up, r->d_scratch1, d0, 2*n_ff, H, n_txt);
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_txt, n_ff);
+        flux2_calib_tag(r, "double_blocks.%d.txt_mlp.2", bi);
         op_gemm_wt(r, r->d_scratch1, &b->txt.mlp_dn, r->d_scratch3, d0, H, n_ff, n_txt);
+        r->calib_name = NULL;
         op_gated_add(r, r->d_txt, r->d_scratch1, mt_gate_f, n_txt, H);
 
         if (r->verbose >= 2)
@@ -1426,10 +1575,12 @@ int hip_flux2_dit_step(hip_flux2_runner *r,
         flux2_hip_wt v_w  = wt_slice(&b->linear1, (size_t)2 * H * H);
         flux2_hip_wt gu_w = wt_slice(&b->linear1, (size_t)3 * H * H);
 
+        flux2_calib_tag(r, "single_blocks.%d.linear1", bi);
         op_gemm_wt(r, r->d_q, &q_w, r->d_scratch1, d0, H, H, n_tot);
         op_gemm_wt(r, r->d_k, &k_w, r->d_scratch1, d0, H, H, n_tot);
         op_gemm_wt(r, r->d_v, &v_w, r->d_scratch1, d0, H, H, n_tot);
         op_gemm_wt(r, r->d_scratch2, &gu_w, r->d_scratch1, d0, 2*n_ff, H, n_tot);
+        r->calib_name = NULL;
 
         /* Per-head Q/K norm + RoPE */
         op_rmsnorm_ph(r, r->d_q, b->q_norm, n_tot, nH, hd);
@@ -1448,9 +1599,13 @@ int hip_flux2_dit_step(hip_flux2_runner *r,
         /* Parallel MLP: SwiGLU on gate_up */
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_tot, n_ff);
 
-        /* linear2 split: attn + mlp */
+        /* linear2 split: attn + mlp — separate calib slots (their inputs are different
+         * scratches but the quantizer concats them into a single linear2 amax [H+n_ff]). */
+        flux2_calib_tag(r, "single_blocks.%d.linear2_attn", bi);
         op_gemm_wt(r, r->d_scratch1, &b->l2_attn, r->d_attn_out, d0, H, H, n_tot);
+        flux2_calib_tag(r, "single_blocks.%d.linear2_mlp", bi);
         op_gemm_wt(r, r->d_scratch2, &b->l2_mlp,  r->d_scratch3, d0, H, n_ff, n_tot);
+        r->calib_name = NULL;
 
         /* Add the two halves */
         op_add(r, r->d_scratch1, r->d_scratch2, n_tot * H);
@@ -1546,6 +1701,13 @@ void hip_flux2_free(hip_flux2_runner *r) {
     if (r->d_act_int8)   hipFree(r->d_act_int8);
     if (r->d_act_iscale) hipFree(r->d_act_iscale);
     if (r->d_lora_tmp)   hipFree(r->d_lora_tmp);
+    if (r->d_smooth_tmp) hipFree(r->d_smooth_tmp);
+    /* Save accumulated calibration amax (if FLUX2_CALIB_DUMP was set) and free slots. */
+    flux2_calib_save(r);
+    for (int i = 0; i < r->calib_n_slots; i++) {
+        if (r->calib_slot[i].d_amax) hipFree(r->calib_slot[i].d_amax);
+        if (r->calib_slot[i].name)   free(r->calib_slot[i].name);
+    }
     if (r->mod) hipModuleUnload(r->mod);
     free(r);
 }
