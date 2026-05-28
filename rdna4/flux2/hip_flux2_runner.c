@@ -210,6 +210,49 @@ static void flux2_fp8_lut_host_init(void) {
  * - BF16/F32: dequant to F32, mark scale as -1.0f (F32 dispatch).
  *
  * If use_fp8 == 0, always dequants to F32 regardless of storage dtype. */
+
+/* Probe <base>.smooth (bf16 [n_in]) where base = wname without ".weight" suffix;
+ * if present, dequant bf16->f32 and upload to device. Returns NULL when absent.
+ * Shared by all three quant branches (int4/int8/fp8) so the smooth load is one
+ * line per branch. */
+static float *flux2_load_smooth(st_context *st, const char *wname) {
+    if (!wname) return NULL;
+    const char *suf = strstr(wname, ".weight");
+    if (!suf) return NULL;
+    int blen = (int)(suf - wname);
+    if (blen <= 0 || blen >= 256) return NULL;
+    char smk[260];
+    snprintf(smk, sizeof(smk), "%.*s.smooth", blen, wname);
+    int smidx = safetensors_find(st, smk);
+    if (smidx < 0) return NULL;
+    const uint64_t *ssh = safetensors_shape(st, smidx);
+    size_t sn = (size_t)ssh[0];
+    float *sf = (float *)malloc(sn * sizeof(float));
+    const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+    for (size_t i = 0; i < sn; i++) { uint32_t b = (uint32_t)src[i] << 16; memcpy(&sf[i], &b, 4); }
+    float *d = (float *)hip_upload_raw(sf, sn * sizeof(float));
+    free(sf);
+    return d;
+}
+
+/* Column-split <key>.smooth [H+n_ff] -> [H] (attn) + [n_ff] (mlp), bf16->f32, upload
+ * both halves to device. Shared by the linear2 column-split branches (fp8/int8/int4). */
+static void flux2_split_smooth(st_context *st, const char *key, int H, int n_ff,
+                                float **out_attn_smooth, float **out_mlp_smooth) {
+    char smk[256];
+    snprintf(smk, sizeof(smk), "%s.smooth", key);
+    int smidx = safetensors_find(st, smk);
+    if (smidx < 0) return;
+    const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+    float *sa = (float *)malloc((size_t)H    * sizeof(float));
+    float *sm = (float *)malloc((size_t)n_ff * sizeof(float));
+    for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)src[k]     << 16; memcpy(&sa[k], &b, 4); }
+    for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)src[H + k] << 16; memcpy(&sm[k], &b, 4); }
+    *out_attn_smooth = (float *)hip_upload_raw(sa, (size_t)H    * sizeof(float));
+    *out_mlp_smooth  = (float *)hip_upload_raw(sm, (size_t)n_ff * sizeof(float));
+    free(sa); free(sm);
+}
+
 static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                                       const char *wname, const char *sname) {
     flux2_hip_wt out = { 0 }; out.scale = -1.0f;
@@ -267,19 +310,7 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                         out.lora_down = (float *)hip_upload_raw(ldfp, ldn * sizeof(float));
                         free(lufp); free(ldfp);
                     }
-                    /* Optional SmoothQuant smooth tensor (lambda [n_in]) — bf16, dequant to F32. */
-                    char smk[260];
-                    snprintf(smk, sizeof(smk), "%s.smooth", base);
-                    int smidx = safetensors_find(st, smk);
-                    if (smidx >= 0) {
-                        const uint64_t *ssh = safetensors_shape(st, smidx);
-                        size_t sn = (size_t)ssh[0];
-                        float *sf = (float *)malloc(sn * sizeof(float));
-                        const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
-                        for (size_t i = 0; i < sn; i++) { uint32_t b = (uint32_t)src[i] << 16; memcpy(&sf[i], &b, 4); }
-                        out.smooth = (float *)hip_upload_raw(sf, sn * sizeof(float));
-                        free(sf);
-                    }
+                    out.smooth = flux2_load_smooth(st, wname);   /* SVDQuant SmoothQuant lambda */
                     return out;
                 }
                 /* no .qint4 for this key — fall through to bf16/etc. for global passthrough */
@@ -304,27 +335,7 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
             int sidx = safetensors_find(st, sname);
             if (sidx >= 0) out.scale = *(const float *)safetensors_data(st, sidx);
         }
-        /* Phase F probe: optional SmoothQuant smooth tensor — bf16 -> f32. */
-        if (wname) {
-            const char *wsuf = strstr(wname, ".weight");
-            if (wsuf) {
-                char base[256]; int blen = (int)(wsuf - wname);
-                if (blen > 0 && blen < (int)sizeof(base)) {
-                    memcpy(base, wname, blen); base[blen] = 0;
-                    char smk[260]; snprintf(smk, sizeof(smk), "%s.smooth", base);
-                    int smidx = safetensors_find(st, smk);
-                    if (smidx >= 0) {
-                        const uint64_t *ssh = safetensors_shape(st, smidx);
-                        size_t sn = (size_t)ssh[0];
-                        float *sf = (float *)malloc(sn * sizeof(float));
-                        const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
-                        for (size_t i = 0; i < sn; i++) { uint32_t b = (uint32_t)src[i] << 16; memcpy(&sf[i], &b, 4); }
-                        out.smooth = (float *)hip_upload_raw(sf, sn * sizeof(float));
-                        free(sf);
-                    }
-                }
-            }
-        }
+        out.smooth = flux2_load_smooth(st, wname);   /* FP8 SmoothQuant (Phase F) */
         return out;
     }
 
@@ -345,27 +356,7 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                 out.wscale = (float *)hip_upload_raw(safetensors_data(st, sidx), sn * sizeof(float));
             }
         }
-        /* Optional SmoothQuant smooth tensor (lam ≥ 1, per-K-channel) — bf16 -> f32. */
-        if (wname) {
-            const char *wsuf = strstr(wname, ".weight");
-            if (wsuf) {
-                char base[256]; int blen = (int)(wsuf - wname);
-                if (blen > 0 && blen < (int)sizeof(base)) {
-                    memcpy(base, wname, blen); base[blen] = 0;
-                    char smk[260]; snprintf(smk, sizeof(smk), "%s.smooth", base);
-                    int smidx = safetensors_find(st, smk);
-                    if (smidx >= 0) {
-                        const uint64_t *ssh = safetensors_shape(st, smidx);
-                        size_t sn = (size_t)ssh[0];
-                        float *sf = (float *)malloc(sn * sizeof(float));
-                        const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
-                        for (size_t i = 0; i < sn; i++) { uint32_t b = (uint32_t)src[i] << 16; memcpy(&sf[i], &b, 4); }
-                        out.smooth = (float *)hip_upload_raw(sf, sn * sizeof(float));
-                        free(sf);
-                    }
-                }
-            }
-        }
+        out.smooth = flux2_load_smooth(st, wname);   /* INT8 SmoothQuant (Phase D, lam>=1) */
         return out;
     }
 
@@ -1226,18 +1217,8 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         }
         /* Optional SmoothQuant smooth — column-split [H+n_ff] -> [H] (attn) + [n_ff] (mlp) */
         char smk[256];
-        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2.smooth", bi);
-        int smidx = safetensors_find(st, smk);
-        if (smidx >= 0) {
-            const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
-            float *sa = (float *)malloc((size_t)H    * sizeof(float));
-            float *sm = (float *)malloc((size_t)n_ff * sizeof(float));
-            for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)src[k]     << 16; memcpy(&sa[k], &b, 4); }
-            for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)src[H + k] << 16; memcpy(&sm[k], &b, 4); }
-            out_attn->smooth = (float *)hip_upload_raw(sa, (size_t)H    * sizeof(float));
-            out_mlp->smooth  = (float *)hip_upload_raw(sm, (size_t)n_ff * sizeof(float));
-            free(sa); free(sm);
-        }
+        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2", bi);
+        flux2_split_smooth(st, smk, H, n_ff, &out_attn->smooth, &out_mlp->smooth);
         return 0;
     }
 
@@ -1267,18 +1248,8 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         free(attn); free(mlp_);
         /* Phase F: FP8 SmoothQuant column-split [H+n_ff] -> [H] + [n_ff] (bf16->f32). */
         char smk[256];
-        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2.smooth", bi);
-        int smidx = safetensors_find(st, smk);
-        if (smidx >= 0) {
-            const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
-            float *sa = (float *)malloc((size_t)H    * sizeof(float));
-            float *sm = (float *)malloc((size_t)n_ff * sizeof(float));
-            for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)src[k]     << 16; memcpy(&sa[k], &b, 4); }
-            for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)src[H + k] << 16; memcpy(&sm[k], &b, 4); }
-            out_attn->smooth = (float *)hip_upload_raw(sa, (size_t)H    * sizeof(float));
-            out_mlp->smooth  = (float *)hip_upload_raw(sm, (size_t)n_ff * sizeof(float));
-            free(sa); free(sm);
-        }
+        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2", bi);
+        flux2_split_smooth(st, smk, H, n_ff, &out_attn->smooth, &out_mlp->smooth);
         return 0;
     }
 
@@ -1302,18 +1273,8 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         }
         /* Optional SmoothQuant smooth — column-split [H+n_ff] -> [H] (attn) + [n_ff] (mlp) */
         char smk[256];
-        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2.smooth", bi);
-        int smidx = safetensors_find(st, smk);
-        if (smidx >= 0) {
-            const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
-            float *sa = (float *)malloc((size_t)H    * sizeof(float));
-            float *sm = (float *)malloc((size_t)n_ff * sizeof(float));
-            for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)src[k]     << 16; memcpy(&sa[k], &b, 4); }
-            for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)src[H + k] << 16; memcpy(&sm[k], &b, 4); }
-            out_attn->smooth = (float *)hip_upload_raw(sa, (size_t)H    * sizeof(float));
-            out_mlp->smooth  = (float *)hip_upload_raw(sm, (size_t)n_ff * sizeof(float));
-            free(sa); free(sm);
-        }
+        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2", bi);
+        flux2_split_smooth(st, smk, H, n_ff, &out_attn->smooth, &out_mlp->smooth);
         return 0;
     }
 
