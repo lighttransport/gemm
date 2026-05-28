@@ -135,6 +135,9 @@ struct hip_flux2_runner {
     int use_fp8;   /* 1 = raw FP8 weights + LUT GEMM (4x less VRAM) */
     int use_fp8_opt; /* 1 = 128x128 tiled FP8 LUT GEMM (fast path) */
     int use_wmma;  /* 1 = use gfx12 FP8 WMMA matrix cores for GEMM */
+    int fp8_bf16_blocks; /* per-block FP8 quality routing: blocks 0..K-1 (flat: dblk then
+                          * sblk) use BF16-act × FP8-wt (cos ~0.999); rest use pipe32
+                          * FP8×FP8 (cos ~0.985). env FLUX2_FP8_BF16_BLOCKS, default 0. */
 
     /* CPU model (for arch params + VAE fallback) */
     flux2_dit_model *dit;
@@ -633,13 +636,26 @@ static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
     }
 }
 
-/* Tag the next op_gemm_wt call's input for per-linear amax accumulation. No-op
- * unless FLUX2_CALIB_DUMP is set. Static buffer is fine for the single-threaded step. */
+/* Tag the next op_gemm_wt call. Used by BOTH:
+ *   (1) calibration dump (op_gemm_wt taps r->calib_name when FLUX2_CALIB_DUMP is set)
+ *   (2) FP8 per-block quality routing (op_gemm_wt parses block idx from r->calib_name
+ *       to decide bf16-act vs fp8-act fp8 GEMM, env FLUX2_FP8_BF16_BLOCKS).
+ * Always set (cheap: vsnprintf into a static buffer; single-threaded step). */
 static void flux2_calib_tag(hip_flux2_runner *r, const char *fmt, ...) {
-    if (!r->calib_dump_path) return;
     static char buf[128];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     r->calib_name = buf;
+}
+
+/* Parse "double_blocks.N.*" or "single_blocks.N.*" -> flat block index (sblk offset by
+ * n_dbl). Returns -1 for any other tag (img_in / time_in / modulation / final_layer)
+ * which never gets per-block routing. */
+static int flux2_block_idx(const char *name, int n_dbl) {
+    if (!name) return -1;
+    int n = 0;
+    if (strncmp(name, "double_blocks.", 14) == 0)        { n = atoi(name + 14); return n; }
+    if (strncmp(name, "single_blocks.", 14) == 0)        { n = atoi(name + 14); return n_dbl + n; }
+    return -1;
 }
 
 /* Dispatch: INT4 (qint4!=NULL) vs INT8 (wscale!=NULL) vs FP8 (scale >= 0) vs F32. */
@@ -665,7 +681,16 @@ static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
         return;
     }
     if (W->scale >= 0.0f) {
-        if (r->use_wmma == 2 &&
+        /* Per-block quality routing: tagged blocks [0, fp8_bf16_blocks) use BF16-act path
+         * (cos ~0.999) when use_wmma == 2; the rest stay on pipe32. */
+        int bidx = flux2_block_idx(r->calib_name, r->n_dbl);
+        int force_bf16 = (r->use_wmma == 2 && r->fp8_bf16_blocks > 0 &&
+                          bidx >= 0 && bidx < r->fp8_bf16_blocks &&
+                          r->fn_gemm_fp8_bf16_wmma != NULL);
+        if (force_bf16) {
+            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
+        }
+        else if (r->use_wmma == 2 &&
             op_gemm_fp8_pipe32(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok) == 0)
             ; /* pipe32 FP8xFP8 handled it */
         else if (r->use_wmma == 2 && r->fn_gemm_fp8_bf16_wmma)
@@ -874,6 +899,14 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         if (v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) r->use_wmma = 0;
         else if (v && strcmp(v, "1") == 0)                          r->use_wmma = 1;
         else                                                        r->use_wmma = 2;
+    }
+    /* Per-block FP8 quality routing: K = FLUX2_FP8_BF16_BLOCKS (default 0 = all FP8×FP8).
+     * Flat block index (double_blocks first, then single_blocks): blocks [0, K) use the
+     * higher-quality BF16-act × FP8-wt kernel (cos ~0.999), rest stay on pipe32 (~0.985). */
+    {
+        const char *v = getenv("FLUX2_FP8_BF16_BLOCKS");
+        r->fp8_bf16_blocks = v ? atoi(v) : 0;
+        if (r->fp8_bf16_blocks < 0) r->fp8_bf16_blocks = 0;
     }
 
     /* Get function handles */
