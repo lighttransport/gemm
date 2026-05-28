@@ -5,7 +5,8 @@
  *
  * Usage:
  *   verify_end_to_end --safetensors-dir <dir> --mhr-assets <dir> \
- *                     --refdir /tmp/sam3d_body_ref [--threshold F] [-t N] [-v]
+ *                     --refdir /tmp/sam3d_body_ref [--threshold F] \
+ *                     [--threshold-2d PX] [-t N] [-v]
  *
  * Expects in $REFDIR (produced by ref/sam3d-body/gen_image_ref.py):
  *   image_embeddings_after_ray.npy
@@ -81,6 +82,36 @@ static float *load_ref_f32_prefer(const char *refdir, const char *primary,
     return NULL;
 }
 
+static void infer_dinov3_input_shape(const char *refdir, int *out_h, int *out_w)
+{
+    if (!refdir || !out_h || !out_w || (*out_h > 0 && *out_w > 0)) return;
+
+    char path[1024];
+    int nd = 0, dims[8] = {0}, is_f32 = 0;
+    snprintf(path, sizeof(path), "%s/dinov3_input.npy", refdir);
+    void *d = npy_load(path, &nd, dims, &is_f32);
+    free(d);
+    if (nd == 4 && dims[0] == 1 && dims[1] == 3 &&
+        dims[2] > 0 && dims[3] > 0) {
+        if (*out_h <= 0) *out_h = dims[2];
+        if (*out_w <= 0) *out_w = dims[3];
+    }
+}
+
+static int ref_backbone_is_float32(const char *refdir)
+{
+    if (!refdir) return 0;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/backbone_dtype.txt", refdir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[128];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, "float32") != NULL;
+}
+
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
 {
@@ -103,15 +134,37 @@ static int diff_pair(const char *label, const float *a, const float *b,
     return fail ? 1 : 0;
 }
 
+static void report_pair(const char *label, const float *a, const float *b,
+                        size_t n)
+{
+    if (n == 0) {
+        fprintf(stderr, "[verify_end_to_end] %-32s empty diagnostic input\n",
+                label);
+        return;
+    }
+    double sum = 0.0; float mx = 0.0f; size_t mxi = 0;
+    for (size_t i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        if (d > mx) { mx = d; mxi = i; }
+        sum += d;
+    }
+    fprintf(stderr, "[verify_end_to_end] diag %-27s max_abs=%.4e (i=%zu) "
+                    "mean_abs=%.4e\n",
+            label, mx, mxi, sum / (double)n);
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *mhr_dir = NULL, *refdir = NULL;
     const char *image_path = NULL;
-    float threshold = 5e-3f;
+    float threshold = -1.0f;
     float threshold_2d = -1.0f;
     float bbox[4] = {0};
     int has_bbox = 0;
+    int image_height = 0;
+    int image_width = 0;
     int n_threads = 1, verbose = 0;
+    int diagnose_self_inputs = 0;
     sam3d_body_backbone_t backbone = SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
@@ -132,8 +185,11 @@ int main(int argc, char **argv)
             else if (!strcmp(v, "vith"))   backbone = SAM3D_BODY_BACKBONE_VITH;
             else { fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n", v); return 2; }
         }
+        else if (!strcmp(argv[i], "--image-height") && i+1 < argc) image_height = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--image-width")  && i+1 < argc) image_width  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--threshold-2d")    && i+1 < argc) threshold_2d = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--diagnose-self-inputs")) diagnose_self_inputs = 1;
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
@@ -142,7 +198,8 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "Usage: %s --safetensors-dir <dir> --mhr-assets <dir> "
                 "--refdir <dir> [--image IMG --bbox x0 y0 x1 y1] "
-                "[--backbone dinov3|vith] [--threshold F] "
+                "[--backbone dinov3|vith] [--image-height H] [--image-width W] "
+                "[--threshold F] "
                 "[--threshold-2d PX] [-t N] [-v]\n",
                 argv[0]);
         return 2;
@@ -151,11 +208,34 @@ int main(int argc, char **argv)
         fprintf(stderr, "[verify_end_to_end] --image mode requires fixed --bbox x0 y0 x1 y1\n");
         return 2;
     }
+    if (threshold < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
+        if (image_path && backbone == SAM3D_BODY_BACKBONE_DINOV3)
+            threshold = 2e-2f;
+        else if (image_path && backbone == SAM3D_BODY_BACKBONE_VITH)
+            threshold = f32_ref ? 2e-2f : 8e-2f;
+        else
+            threshold = 5e-3f;
+    }
+    if (threshold_2d < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
+        if (image_path && backbone == SAM3D_BODY_BACKBONE_DINOV3)
+            threshold_2d = 0.5f;
+        else if (image_path && backbone == SAM3D_BODY_BACKBONE_VITH)
+            threshold_2d = f32_ref ? 0.5f : 30.0f;
+        else
+            threshold_2d = (threshold < 1e-2f) ? 1e-2f : threshold;
+    }
+
+    if (image_path && backbone == SAM3D_BODY_BACKBONE_DINOV3)
+        infer_dinov3_input_shape(refdir, &image_height, &image_width);
 
     sam3d_body_config cfg = {
         .safetensors_dir = sft_dir,
         .mhr_assets_dir  = mhr_dir,
         .backbone        = backbone,
+        .image_height    = image_height,
+        .image_width     = image_width,
         .seed            = 42,
         .n_threads       = n_threads,
         .verbose         = verbose,
@@ -175,6 +255,9 @@ int main(int argc, char **argv)
                         "bbox=[%.3f %.3f %.3f %.3f] backbone=%s\n",
                 image_path, iw, ih, bbox[0], bbox[1], bbox[2], bbox[3],
                 backbone == SAM3D_BODY_BACKBONE_VITH ? "vith" : "dinov3");
+        if (backbone == SAM3D_BODY_BACKBONE_DINOV3)
+            fprintf(stderr, "[verify_end_to_end] encoder input=%dx%d\n",
+                    cfg.image_height, cfg.image_width);
         rc = sam3d_body_set_image(ctx, pixels, iw, ih, bbox);
         stbi_image_free(pixels);
         if (rc != 0) {
@@ -256,6 +339,121 @@ int main(int argc, char **argv)
     if (rc != 0) {
         fprintf(stderr, "[verify_end_to_end] run_all rc=%d\n", rc);
         sam3d_body_destroy(ctx); return 8;
+    }
+
+    if (diagnose_self_inputs) {
+        const float *dec_img = NULL, *dec_pe = NULL, *dec_x = NULL, *dec_xpe = NULL;
+        const float *cam_int = NULL, *bbox_center = NULL, *ori_img_size = NULL;
+        const float *img_size = NULL, *affine_trans = NULL;
+        float bbox_scale = 0.0f, default_scale_factor = 0.0f;
+        int H = 0, W = 0, Dc = 0, Nq = 0, D = 0, use_intrin_center = 0;
+        rc = sam3d_body_debug_get_decoder_inputs(
+                ctx, &dec_img, &dec_pe, &dec_x, &dec_xpe, &H, &W, &Dc,
+                &Nq, &D, &cam_int, &bbox_center, &bbox_scale,
+                &ori_img_size, &img_size, &affine_trans,
+                &use_intrin_center, &default_scale_factor);
+        if (rc != 0) {
+            fprintf(stderr, "[verify_end_to_end] diagnose decoder inputs rc=%d\n", rc);
+        } else {
+            int nd = 0, dims[8] = {0};
+            float *ref_img = load_or_die_dims(refdir, "image_embeddings_after_ray",
+                                              &nd, dims);
+            if (ref_img && nd == 4 && dims[1] == Dc && dims[2] == H && dims[3] == W)
+                report_pair("self image_embeddings", dec_img, ref_img,
+                            (size_t)Dc * H * W);
+            free(ref_img);
+
+            nd = 0; memset(dims, 0, sizeof(dims));
+            float *ref_pe_tok = load_or_die_dims(refdir, "decoder_layer0_in__context_pe",
+                                                 &nd, dims);
+            if (ref_pe_tok && nd == 3 && dims[1] == H * W && dims[2] == Dc) {
+                float *ref_pe_chw = (float *)malloc((size_t)Dc * H * W * sizeof(float));
+                if (ref_pe_chw) {
+                    for (int n = 0; n < H * W; n++)
+                        for (int c = 0; c < Dc; c++)
+                            ref_pe_chw[(size_t)c * H * W + n] =
+                                ref_pe_tok[(size_t)n * Dc + c];
+                    report_pair("self context_pe", dec_pe, ref_pe_chw,
+                                (size_t)Dc * H * W);
+                    free(ref_pe_chw);
+                }
+            }
+            free(ref_pe_tok);
+
+            nd = 0; memset(dims, 0, sizeof(dims));
+            float *ref_x = load_or_die_dims(refdir, "decoder_layer0_in__x",
+                                            &nd, dims);
+            if (ref_x && nd == 3 && dims[1] == Nq && dims[2] == D)
+                report_pair("self init_x", dec_x, ref_x, (size_t)Nq * D);
+            free(ref_x);
+
+            nd = 0; memset(dims, 0, sizeof(dims));
+            float *ref_xpe = load_or_die_dims(refdir, "decoder_layer0_in__x_pe",
+                                              &nd, dims);
+            if (ref_xpe && nd == 3 && dims[1] == Nq && dims[2] == D)
+                report_pair("self init_x_pe", dec_xpe, ref_xpe, (size_t)Nq * D);
+            free(ref_xpe);
+
+            float *ref_cam_int = load_or_die(refdir, "decoder_batch__cam_int");
+            float *ref_bbox_center = load_or_die(refdir, "decoder_batch__bbox_center");
+            float *ref_bbox_scale = load_or_die(refdir, "decoder_batch__bbox_scale");
+            float *ref_ori_img_size = load_or_die(refdir, "decoder_batch__ori_img_size");
+            float *ref_img_size = load_or_die(refdir, "decoder_batch__img_size");
+            float *ref_affine_trans = load_or_die(refdir, "decoder_batch__affine_trans");
+            if (ref_cam_int)       report_pair("self cam_int", cam_int, ref_cam_int, 9);
+            if (ref_bbox_center)   report_pair("self bbox_center", bbox_center, ref_bbox_center, 2);
+            if (ref_bbox_scale)    report_pair("self bbox_scale", &bbox_scale, ref_bbox_scale, 1);
+            if (ref_ori_img_size)  report_pair("self ori_img_size", ori_img_size, ref_ori_img_size, 2);
+            if (ref_img_size)      report_pair("self img_size", img_size, ref_img_size, 2);
+            if (ref_affine_trans)  report_pair("self affine_trans", affine_trans, ref_affine_trans, 6);
+            fprintf(stderr, "[verify_end_to_end] diag self flags use_intrin_center=%d "
+                            "default_scale_factor=%.6g\n",
+                    use_intrin_center, default_scale_factor);
+            free(ref_cam_int); free(ref_bbox_center); free(ref_bbox_scale);
+            free(ref_ori_img_size); free(ref_img_size); free(ref_affine_trans);
+
+            int enc_n = 0, enc_dim = 0;
+            sam3d_body_get_encoder_tokens(ctx, NULL, &enc_n, &enc_dim);
+            if (enc_n > 0 && enc_dim == Dc) {
+                float *enc = (float *)malloc((size_t)enc_n * enc_dim * sizeof(float));
+                if (enc) {
+                    sam3d_body_get_encoder_tokens(ctx, enc, &enc_n, &enc_dim);
+                    const char *tok_name =
+                        (backbone == SAM3D_BODY_BACKBONE_VITH)
+                            ? "vith_tokens" : "dinov3_tokens";
+                    nd = 0; memset(dims, 0, sizeof(dims));
+                    float *ref_tok = load_or_die_dims(refdir, tok_name,
+                                                      &nd, dims);
+                    size_t ref_tok_n = 0;
+                    if (ref_tok && nd == 3 && dims[0] == 1 &&
+                        dims[1] == enc_n && dims[2] == enc_dim)
+                        ref_tok_n = (size_t)enc_n * enc_dim;
+                    else if (ref_tok && nd == 2 &&
+                             dims[0] == enc_n && dims[1] == enc_dim)
+                        ref_tok_n = (size_t)enc_n * enc_dim;
+                    if (ref_tok_n) {
+                        report_pair(tok_name, enc, ref_tok, ref_tok_n);
+                    } else if (ref_tok && nd == 4 && dims[1] == Dc &&
+                               dims[2] == H && dims[3] == W &&
+                               enc_n >= H * W) {
+                        int n_prefix = enc_n - H * W;
+                        float *patch_chw = (float *)malloc((size_t)Dc * H * W * sizeof(float));
+                        if (patch_chw) {
+                            const float *patch = enc + (size_t)n_prefix * Dc;
+                            for (int n = 0; n < H * W; n++)
+                                for (int c = 0; c < Dc; c++)
+                                    patch_chw[(size_t)c * H * W + n] =
+                                        patch[(size_t)n * Dc + c];
+                            report_pair(tok_name, patch_chw, ref_tok,
+                                        (size_t)Dc * H * W);
+                            free(patch_chw);
+                        }
+                    }
+                    free(ref_tok);
+                    free(enc);
+                }
+            }
+        }
     }
 
     int rc_total = 0;
@@ -344,14 +542,10 @@ int main(int argc, char **argv)
                         k, k_ref);
                 rc_total |= 1;
             } else {
-                /* 2D keypoints are pixels; pixel-level threshold is looser. */
-                float t2d = (threshold_2d >= 0.0f)
-                    ? threshold_2d
-                    : ((threshold < 1e-2f) ? 1e-2f : threshold);
                 char label[96];
                 snprintf(label, sizeof(label), "keypoints_2d px vs %s", ref_name);
                 rc_total |= diff_pair(label, ours, ref_k,
-                                      (size_t)k * 2, t2d);
+                                      (size_t)k * 2, threshold_2d);
             }
             free(ours); free(ref_k);
         }

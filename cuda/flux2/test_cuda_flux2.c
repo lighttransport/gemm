@@ -187,6 +187,40 @@ static int test_init(void) {
  * Micro-tests for the new MMA kernels. No model weights required — only the
  * NVRTC module needs to compile cleanly, so this runs quickly. */
 
+static int test_kernel_split_selector(void) {
+    fprintf(stderr, "  [kernel] FLUX2_FA2_SPLIT_F32 selector... ");
+    int fail = 0;
+    fail |= (flux2_f32_split_kv_from_env(NULL, 2048) != 0);
+    fail |= (flux2_f32_split_kv_from_env("0", 2048) != 0);
+    fail |= (flux2_f32_split_kv_from_env("1", 2048) != 1024);
+    fail |= (flux2_f32_split_kv_from_env("512", 2048) != 512);
+    fail |= (flux2_f32_split_kv_from_env("auto", 1024) != 0);
+    fail |= (flux2_f32_split_kv_from_env("auto", 2048) != 0);
+    fail |= (flux2_f32_split_kv_from_env("auto", 4608) != 0);
+    fail |= (flux2_f32_split_kv_from_env("garbage", 2048) != 0);
+    fail |= (flux2_f32_split_kv_from_env("12x", 2048) != 0);
+    fail |= (flux2_f32_split_kv_from_env("-4", 2048) != 0);
+    fail |= (!flux2_f32_split_env_is_auto("auto"));
+    fail |= (flux2_f32_split_env_is_auto("1024"));
+    fail |= (flux2_f32_split_env_is_auto(NULL));
+    fail |= (flux2_f32_split_apply_tensor_attn_priority("auto", 256, 1) != 0);
+    fail |= (flux2_f32_split_apply_tensor_attn_priority("auto", 256, 0) != 256);
+    fail |= (flux2_f32_split_apply_tensor_attn_priority("256", 256, 1) != 256);
+    fail |= (flux2_bf16_split_kv_from_env(NULL, 4608) != 0);
+    fail |= (flux2_bf16_split_kv_from_env("0", 4608) != 0);
+    fail |= (flux2_bf16_split_kv_from_env("1", 4608) != 1024);
+    fail |= (flux2_bf16_split_kv_from_env("512", 4608) != 512);
+    fail |= (flux2_bf16_split_kv_from_env("auto", 2048) != 1024);
+    fail |= (flux2_bf16_split_kv_from_env("auto", 4608) != 0);
+    fail |= (flux2_bf16_split_kv_from_env("garbage", 4608) != 0);
+    if (fail) {
+        fprintf(stderr, "FAIL\n");
+        return 1;
+    }
+    fprintf(stderr, "OK\n");
+    return 0;
+}
+
 /* Test 1: f32_to_bf16_bulk (AVX2 path vs scalar fallback).
  * Pure host-side — checks the AVX2 and scalar branches agree bit-for-bit. */
 static int test_kernel_f32_to_bf16_bulk(void) {
@@ -244,6 +278,11 @@ static int test_kernel_gemm_bf16(cuda_flux2_runner *r) {
 
     /* CPU F32 ref (using BF16-rounded W to match what the kernel sees) */
     float *W_deq = (float *)malloc(n_w * sizeof(float));
+    if (!W_deq) {
+        free(W); free(X); free(Y_gpu); free(Y_cpu); free(W_bf);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
     for (size_t i = 0; i < n_w; i++) {
         unsigned int b = ((unsigned int)W_bf[i]) << 16;
         memcpy(&W_deq[i], &b, 4);
@@ -260,12 +299,25 @@ static int test_kernel_gemm_bf16(cuda_flux2_runner *r) {
     /* Upload, launch, download */
     CUdeviceptr d_W = gpu_upload_bytes(W_bf, n_w * sizeof(uint16_t));
     CUdeviceptr d_X = gpu_upload_f32(X, (int)n_x);
-    CUdeviceptr d_Y;
-    cuMemAlloc(&d_Y, n_y * sizeof(float));
+    CUdeviceptr d_Y = 0;
+#define FLUX2_BF16_GEMM_TEST_CU(call, label) do { \
+        CUresult _fe = (call); \
+        if (_fe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_fe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_W || !d_X) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    FLUX2_BF16_GEMM_TEST_CU(cuMemAlloc(&d_Y, n_y * sizeof(float)), "alloc output");
     op_gemm_bf16(r, d_Y, d_W, d_X, 0, N, K, M);
-    cuCtxSynchronize();
-    cuMemcpyDtoH(Y_gpu, d_Y, n_y * sizeof(float));
+    FLUX2_BF16_GEMM_TEST_CU(cuCtxSynchronize(), "gemm sync");
+    FLUX2_BF16_GEMM_TEST_CU(cuMemcpyDtoH(Y_gpu, d_Y, n_y * sizeof(float)),
+                            "output copy");
     cuMemFree(d_W); cuMemFree(d_X); cuMemFree(d_Y);
+    d_W = d_X = d_Y = 0;
 
     /* Compare: BF16 has ~1/256 relative precision. For near-zero reference
      * values, a direct abs threshold based on the expected RMS magnitude of
@@ -286,7 +338,15 @@ static int test_kernel_gemm_bf16(cuda_flux2_runner *r) {
         return 1;
     }
     fprintf(stderr, "OK (max_abs=%.6g rms_cpu=%.6g)\n", max_abs, rms_cpu);
+#undef FLUX2_BF16_GEMM_TEST_CU
     return 0;
+fail:
+    if (d_W) cuMemFree(d_W);
+    if (d_X) cuMemFree(d_X);
+    if (d_Y) cuMemFree(d_Y);
+    free(W); free(X); free(Y_gpu); free(Y_cpu); free(W_bf);
+#undef FLUX2_BF16_GEMM_TEST_CU
+    return 1;
 }
 
 /* Test 3: flash_attn_fp8 MMA vs flash_attn_fp8_ref scalar.
@@ -322,26 +382,53 @@ static int test_kernel_fp8_attn(cuda_flux2_runner *r) {
     CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
     CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
     CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
-    CUdeviceptr d_out;
-    cuMemAlloc(&d_out, n_elems * sizeof(float));
+    CUdeviceptr d_out = 0;
+    int saved_attn = r->use_fp8_attn;
+    const char *old_ref_env = getenv("FLUX2_FP8_ATTN_REF");
+    char *old_ref_copy = old_ref_env ? (char *)malloc(strlen(old_ref_env) + 1) : NULL;
+    if (old_ref_env && !old_ref_copy) {
+        fprintf(stderr, "FAIL (host OOM env copy)\n");
+        goto fail;
+    }
+    if (old_ref_copy) strcpy(old_ref_copy, old_ref_env);
+#define FLUX2_FP8_ATTN_TEST_CU(call, label) do { \
+        CUresult _fe = (call); \
+        if (_fe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_fe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    FLUX2_FP8_ATTN_TEST_CU(cuMemAlloc(&d_out, n_elems * sizeof(float)), "alloc output");
 
     /* Run MMA path */
-    int saved_attn = r->use_fp8_attn;
     r->use_fp8_attn = 1;
     unsetenv("FLUX2_FP8_ATTN_REF");
     op_attn(r, d_out, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
-    cuCtxSynchronize();
-    cuMemcpyDtoH(out_mma, d_out, n_elems * sizeof(float));
+    FLUX2_FP8_ATTN_TEST_CU(cuCtxSynchronize(), "mma sync");
+    FLUX2_FP8_ATTN_TEST_CU(cuMemcpyDtoH(out_mma, d_out, n_elems * sizeof(float)),
+                           "mma copy");
 
     /* Run scalar ref path */
     setenv("FLUX2_FP8_ATTN_REF", "1", 1);
     op_attn(r, d_out, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
-    cuCtxSynchronize();
-    cuMemcpyDtoH(out_ref, d_out, n_elems * sizeof(float));
-    unsetenv("FLUX2_FP8_ATTN_REF");
+    FLUX2_FP8_ATTN_TEST_CU(cuCtxSynchronize(), "ref sync");
+    FLUX2_FP8_ATTN_TEST_CU(cuMemcpyDtoH(out_ref, d_out, n_elems * sizeof(float)),
+                           "ref copy");
+    if (old_ref_copy) {
+        setenv("FLUX2_FP8_ATTN_REF", old_ref_copy, 1);
+        free(old_ref_copy);
+        old_ref_copy = NULL;
+    } else {
+        unsetenv("FLUX2_FP8_ATTN_REF");
+    }
     r->use_fp8_attn = saved_attn;
 
     cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V); cuMemFree(d_out);
+    d_Q = d_K = d_V = d_out = 0;
 
     /* Compare — both paths quantize to the same FP8, so max diff should be small */
     float max_diff = 0.0f, mean_diff = 0.0f;
@@ -358,19 +445,977 @@ static int test_kernel_fp8_attn(cuda_flux2_runner *r) {
         return 1;
     }
     fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+#undef FLUX2_FP8_ATTN_TEST_CU
     return 0;
+fail:
+    r->use_fp8_attn = saved_attn;
+    if (old_ref_copy) {
+        setenv("FLUX2_FP8_ATTN_REF", old_ref_copy, 1);
+        free(old_ref_copy);
+    } else {
+        unsetenv("FLUX2_FP8_ATTN_REF");
+    }
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_out) cuMemFree(d_out);
+    free(Q); free(K); free(V); free(out_mma); free(out_ref);
+#undef FLUX2_FP8_ATTN_TEST_CU
+    return 1;
+}
+
+static void cpu_flash_attn_f32_ref(float *out, const float *Q, const float *K,
+                                   const float *V, int n_tok, int n_heads,
+                                   int head_dim) {
+    int dim = n_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    for (int qi = 0; qi < n_tok; qi++) {
+        for (int h = 0; h < n_heads; h++) {
+            float m_i = -1e30f, l_i = 0.0f;
+            float o_acc[128];
+            for (int d = 0; d < head_dim; d++) o_acc[d] = 0.0f;
+            for (int kj = 0; kj < n_tok; kj++) {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += Q[(size_t)qi * dim + h * head_dim + d] *
+                           K[(size_t)kj * dim + h * head_dim + d];
+                }
+                float score = dot * scale;
+                float new_max = fmaxf(m_i, score);
+                float alpha = expf(m_i - new_max);
+                float p = expf(score - new_max);
+                l_i = l_i * alpha + p;
+                for (int d = 0; d < head_dim; d++) {
+                    o_acc[d] = o_acc[d] * alpha +
+                               p * V[(size_t)kj * dim + h * head_dim + d];
+                }
+                m_i = new_max;
+            }
+            float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                out[(size_t)qi * dim + h * head_dim + d] = o_acc[d] * inv_l;
+        }
+    }
+}
+
+/* Test 4: split-key F32 flash attention partial+merge path vs baseline F32. */
+static int test_kernel_split_attn_f32(cuda_flux2_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_f32 split-key vs baseline... ");
+    if (!r->fn_flash_attn || !r->fn_flash_attn_split_partials || !r->fn_flash_attn_split_merge) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 128;
+    const int n_heads = 2;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_kv = 32;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    float *out_op = (float *)malloc(n_elems * sizeof(float));
+    float *out_cpu = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split || !out_op || !out_cpu) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+
+    rng_state = 20240517;
+    rng_cached_valid = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.35f;
+    cpu_flash_attn_f32_ref(out_cpu, Q, K, V, n_tok, n_heads, head_dim);
+
+    CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
+    CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
+    CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
+    CUdeviceptr d_ref = 0, d_split = 0, d_op = 0;
+#define FLUX2_SPLIT_TEST_CU(call, label) do { \
+        CUresult _fe = (call); \
+        if (_fe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_fe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    FLUX2_SPLIT_TEST_CU(cuMemAlloc(&d_ref, n_elems * sizeof(float)), "alloc ref");
+    FLUX2_SPLIT_TEST_CU(cuMemAlloc(&d_split, n_elems * sizeof(float)), "alloc split");
+    FLUX2_SPLIT_TEST_CU(cuMemAlloc(&d_op, n_elems * sizeof(float)), "alloc op");
+
+    int ntok = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    {
+        void *args[] = {&d_ref, &d_Q, &d_K, &d_V, &ntok, &nh, &hd};
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        FLUX2_SPLIT_TEST_CU(cuLaunchKernel(r->fn_flash_attn, (unsigned)n_heads, gy, 1,
+                                           128, 1, 1, smem, r->stream, args, NULL),
+                            "baseline launch");
+        FLUX2_SPLIT_TEST_CU(cuStreamSynchronize(r->stream), "baseline sync");
+        FLUX2_SPLIT_TEST_CU(cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)),
+                            "baseline copy");
+    }
+
+    if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+        fprintf(stderr, "FAIL (device OOM)\n");
+        goto fail;
+    }
+    {
+        void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr,
+                          &d_Q, &d_K, &d_V, &ntok, &nh, &hd, &sk};
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        FLUX2_SPLIT_TEST_CU(cuLaunchKernel(r->fn_flash_attn_split_partials,
+                                           (unsigned)n_heads, gy, (unsigned)n_splits,
+                                           128, 1, 1, smem, r->stream, p_args, NULL),
+                            "split partials launch");
+        void *m_args[] = {&d_split, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr, &ntok, &nh, &hd, &ns};
+        FLUX2_SPLIT_TEST_CU(cuLaunchKernel(r->fn_flash_attn_split_merge,
+                                           (unsigned)n_heads, (unsigned)n_tok, 1,
+                                           128, 1, 1, 0, r->stream, m_args, NULL),
+                            "split merge launch");
+        FLUX2_SPLIT_TEST_CU(cuStreamSynchronize(r->stream), "split sync");
+        FLUX2_SPLIT_TEST_CU(cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)),
+                            "split copy");
+    }
+
+    {
+        const char *old_env = getenv("FLUX2_FA2_SPLIT_F32");
+        char *old_env_copy = old_env ? (char *)malloc(strlen(old_env) + 1) : NULL;
+        if (old_env && !old_env_copy) {
+            fprintf(stderr, "FAIL (host OOM env copy)\n");
+            goto fail;
+        }
+        if (old_env_copy) strcpy(old_env_copy, old_env);
+        setenv("FLUX2_FA2_SPLIT_F32", "32", 1);
+        op_attn(r, d_op, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+        CUresult env_err = cuStreamSynchronize(r->stream);
+        if (env_err == CUDA_SUCCESS)
+            env_err = cuMemcpyDtoH(out_op, d_op, n_elems * sizeof(float));
+        if (old_env_copy) {
+            setenv("FLUX2_FA2_SPLIT_F32", old_env_copy, 1);
+            free(old_env_copy);
+        } else {
+            unsetenv("FLUX2_FA2_SPLIT_F32");
+        }
+        if (env_err != CUDA_SUCCESS) {
+            fprintf(stderr, "FAIL (op_attn split dispatch err=%d)\n", (int)env_err);
+            goto fail;
+        }
+    }
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_ref); cuMemFree(d_split); cuMemFree(d_op);
+    d_Q = d_K = d_V = d_ref = d_split = d_op = 0;
+
+    float max_diff = 0.0f, mean_diff = 0.0f, op_max_diff = 0.0f, cpu_max_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_split[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+        float od = fabsf(out_op[i] - out_ref[i]);
+        if (od > op_max_diff) op_max_diff = od;
+        float cd = fabsf(out_ref[i] - out_cpu[i]);
+        if (cd > cpu_max_diff) cpu_max_diff = cd;
+    }
+    mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
+    if (max_diff > 1e-4f || mean_diff > 1e-5f || op_max_diff > 1e-4f ||
+        cpu_max_diff > 1e-4f) {
+        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g cpu_max_diff=%.6g splits=%d)\n",
+                max_diff, mean_diff, op_max_diff, cpu_max_diff, n_splits);
+        return 1;
+    }
+    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g cpu_max_diff=%.6g splits=%d)\n",
+            max_diff, mean_diff, op_max_diff, cpu_max_diff, n_splits);
+#undef FLUX2_SPLIT_TEST_CU
+    return 0;
+fail:
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_ref) cuMemFree(d_ref);
+    if (d_split) cuMemFree(d_split);
+    if (d_op) cuMemFree(d_op);
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
+#undef FLUX2_SPLIT_TEST_CU
+    return 1;
+}
+
+static int test_kernel_split_attn_bf16(cuda_flux2_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_bf16 split-key typed/tc paths... ");
+    if (!r->fn_flash_attn_bf16 || !r->fn_cast_f32_to_bf16 || !r->fn_flash_attn_split_merge) {
+        fprintf(stderr, "SKIP (BF16 or merge kernels not loaded)\n");
+        return 0;
+    }
+    CUfunction split_bf16 = NULL;
+    if (cuModuleGetFunction(&split_bf16, r->mod, "flash_attn_bf16_split_partials") != CUDA_SUCCESS ||
+        !split_bf16) {
+        fprintf(stderr, "SKIP (BF16 split kernel not loaded)\n");
+        return 0;
+    }
+    CUfunction split_bf16_tc = NULL;
+    if (cuModuleGetFunction(&split_bf16_tc, r->mod, "flash_attn_bf16_tc_split_partials") != CUDA_SUCCESS ||
+        !split_bf16_tc) {
+        fprintf(stderr, "SKIP (BF16 tensor-core split kernel not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 128, n_heads = 2, head_dim = 128, split_kv = 32;
+    const int dim = n_heads * head_dim;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    float *out_tc = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split || !out_tc) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_tc);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+    rng_state = 20260520;
+    rng_cached_valid = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.35f;
+
+    CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
+    CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
+    CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
+    CUdeviceptr d_Qb = 0, d_Kb = 0, d_Vb = 0, d_ref = 0, d_split = 0, d_tc = 0;
+#define FLUX2_BF16_SPLIT_CU(call, label) do { \
+        CUresult _fe = (call); \
+        if (_fe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_fe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    FLUX2_BF16_SPLIT_CU(cuMemAlloc(&d_Qb, n_elems * sizeof(unsigned short)), "alloc Qb");
+    FLUX2_BF16_SPLIT_CU(cuMemAlloc(&d_Kb, n_elems * sizeof(unsigned short)), "alloc Kb");
+    FLUX2_BF16_SPLIT_CU(cuMemAlloc(&d_Vb, n_elems * sizeof(unsigned short)), "alloc Vb");
+    FLUX2_BF16_SPLIT_CU(cuMemAlloc(&d_ref, n_elems * sizeof(float)), "alloc ref");
+    FLUX2_BF16_SPLIT_CU(cuMemAlloc(&d_split, n_elems * sizeof(float)), "alloc split");
+    FLUX2_BF16_SPLIT_CU(cuMemAlloc(&d_tc, n_elems * sizeof(float)), "alloc tc");
+
+    int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    cast_buf_f32_to_bf16(r, d_Qb, d_Q, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Kb, d_K, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Vb, d_V, (int)n_elems);
+    {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        size_t smem = (size_t)(4 * 32 * 136 * 2);
+        void *args[] = {&d_ref, &d_Qb, &d_Kb, &d_Vb, &nt, &nh, &hd};
+        FLUX2_BF16_SPLIT_CU(cuLaunchKernel(r->fn_flash_attn_bf16,
+                                           (unsigned)n_heads, gy, 1,
+                                           128, 1, 1, smem, r->stream, args, NULL),
+                            "bf16 baseline launch");
+    }
+    if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+        fprintf(stderr, "FAIL (device OOM)\n");
+        goto fail;
+    }
+    {
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+        void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr,
+                          &d_Qb, &d_Kb, &d_Vb, &nt, &nh, &hd, &sk};
+        FLUX2_BF16_SPLIT_CU(cuLaunchKernel(split_bf16,
+                                           (unsigned)n_heads, gy, (unsigned)n_splits,
+                                           128, 1, 1, smem, r->stream, p_args, NULL),
+                            "bf16 split partials launch");
+        void *m_args[] = {&d_split, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr, &nt, &nh, &hd, &ns};
+        FLUX2_BF16_SPLIT_CU(cuLaunchKernel(r->fn_flash_attn_split_merge,
+                                           (unsigned)n_heads, (unsigned)n_tok, 1,
+                                           128, 1, 1, 0, r->stream, m_args, NULL),
+                            "bf16 split merge launch");
+    }
+    {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        size_t smem = (size_t)(4 * 32 * 136 * sizeof(unsigned short));
+        void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr,
+                          &d_Qb, &d_Kb, &d_Vb, &nt, &nh, &hd, &sk};
+        FLUX2_BF16_SPLIT_CU(cuLaunchKernel(split_bf16_tc,
+                                           (unsigned)n_heads, gy, (unsigned)n_splits,
+                                           128, 1, 1, smem, r->stream, p_args, NULL),
+                            "bf16 tensor-core split partials launch");
+        void *m_args[] = {&d_tc, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr, &nt, &nh, &hd, &ns};
+        FLUX2_BF16_SPLIT_CU(cuLaunchKernel(r->fn_flash_attn_split_merge,
+                                           (unsigned)n_heads, (unsigned)n_tok, 1,
+                                           128, 1, 1, 0, r->stream, m_args, NULL),
+                            "bf16 tensor-core split merge launch");
+    }
+    FLUX2_BF16_SPLIT_CU(cuStreamSynchronize(r->stream), "bf16 split sync");
+    FLUX2_BF16_SPLIT_CU(cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)), "copy ref");
+    FLUX2_BF16_SPLIT_CU(cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)), "copy split");
+    FLUX2_BF16_SPLIT_CU(cuMemcpyDtoH(out_tc, d_tc, n_elems * sizeof(float)), "copy tc");
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_Qb); cuMemFree(d_Kb); cuMemFree(d_Vb);
+    cuMemFree(d_ref); cuMemFree(d_split); cuMemFree(d_tc);
+    d_Q = d_K = d_V = d_Qb = d_Kb = d_Vb = d_ref = d_split = d_tc = 0;
+    float max_diff = 0.0f, mean_diff = 0.0f, tc_max_diff = 0.0f, tc_mean_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_split[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+        float td = fabsf(out_tc[i] - out_ref[i]);
+        if (td > tc_max_diff) tc_max_diff = td;
+        tc_mean_diff += td;
+    }
+    mean_diff /= (float)n_elems;
+    tc_mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_tc);
+    if (max_diff > 1e-2f || mean_diff > 2e-4f ||
+        tc_max_diff > 5e-4f || tc_mean_diff > 1e-4f) {
+        fprintf(stderr, "FAIL (typed_max=%.6g typed_mean=%.6g tc_max=%.6g tc_mean=%.6g splits=%d)\n",
+                max_diff, mean_diff, tc_max_diff, tc_mean_diff, n_splits);
+        return 1;
+    }
+    fprintf(stderr, "OK (typed_max=%.6g typed_mean=%.6g tc_max=%.6g tc_mean=%.6g splits=%d)\n",
+            max_diff, mean_diff, tc_max_diff, tc_mean_diff, n_splits);
+#undef FLUX2_BF16_SPLIT_CU
+    return 0;
+fail:
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_Qb) cuMemFree(d_Qb);
+    if (d_Kb) cuMemFree(d_Kb);
+    if (d_Vb) cuMemFree(d_Vb);
+    if (d_ref) cuMemFree(d_ref);
+    if (d_split) cuMemFree(d_split);
+    if (d_tc) cuMemFree(d_tc);
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_tc);
+#undef FLUX2_BF16_SPLIT_CU
+    return 1;
+}
+
+static int test_kernel_split_auto_prefers_tensor_attn(cuda_flux2_runner *r) {
+    fprintf(stderr, "  [kernel] FLUX2_FA2_SPLIT_F32 auto keeps tensor attention... ");
+    if (!r->fn_flash_attn_bf16 || !r->fn_cast_f32_to_bf16 ||
+        !r->fn_flash_attn || !r->fn_flash_attn_split_partials || !r->fn_flash_attn_split_merge) {
+        fprintf(stderr, "SKIP (BF16 or split kernels not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 128;
+    const int n_heads = 2;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_kv = 32;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_bf16 = (float *)malloc(n_elems * sizeof(float));
+    float *out_bf16_split = (float *)malloc(n_elems * sizeof(float));
+    float *out_auto = (float *)malloc(n_elems * sizeof(float));
+    float *out_f32 = (float *)malloc(n_elems * sizeof(float));
+    float *out_forced = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_bf16 || !out_bf16_split || !out_auto || !out_f32 || !out_forced) {
+        free(Q); free(K); free(V); free(out_bf16); free(out_bf16_split);
+        free(out_auto); free(out_f32); free(out_forced);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+
+    rng_state = 20260519;
+    rng_cached_valid = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.7f;
+
+    CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
+    CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
+    CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
+    CUdeviceptr d_bf16 = 0, d_bf16_split = 0, d_auto = 0, d_f32 = 0, d_forced = 0;
+    const char *old_env = getenv("FLUX2_FA2_SPLIT_F32");
+    char *old_env_copy = old_env ? (char *)malloc(strlen(old_env) + 1) : NULL;
+    const char *old_bf16_split_env = getenv("FLUX2_BF16_SPLIT_KV");
+    char *old_bf16_split_env_copy = old_bf16_split_env ? (char *)malloc(strlen(old_bf16_split_env) + 1) : NULL;
+    int saved_bf16_attn = r->use_bf16_attn;
+#define FLUX2_SPLIT_AUTO_CU(call, label) do { \
+        CUresult _fe = (call); \
+        if (_fe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_fe); \
+            goto fail; \
+        } \
+    } while (0)
+    if ((old_env && !old_env_copy) || (old_bf16_split_env && !old_bf16_split_env_copy)) {
+        fprintf(stderr, "FAIL (host OOM env copy)\n");
+        goto fail;
+    }
+    if (old_env_copy) strcpy(old_env_copy, old_env);
+    if (old_bf16_split_env_copy) strcpy(old_bf16_split_env_copy, old_bf16_split_env);
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_bf16, n_elems * sizeof(float)), "alloc bf16");
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_bf16_split, n_elems * sizeof(float)), "alloc bf16 split");
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_auto, n_elems * sizeof(float)), "alloc auto");
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_f32, n_elems * sizeof(float)), "alloc f32");
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_forced, n_elems * sizeof(float)), "alloc forced");
+
+    r->use_bf16_attn = 1;
+    unsetenv("FLUX2_FA2_SPLIT_F32");
+    op_attn(r, d_bf16, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "bf16 sync");
+    FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_bf16, d_bf16, n_elems * sizeof(float)), "bf16 copy");
+
+    setenv("FLUX2_BF16_SPLIT_KV", "32", 1);
+    op_attn(r, d_bf16_split, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "bf16 split sync");
+    FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_bf16_split, d_bf16_split, n_elems * sizeof(float)), "bf16 split copy");
+    if (old_bf16_split_env_copy) {
+        setenv("FLUX2_BF16_SPLIT_KV", old_bf16_split_env_copy, 1);
+    } else {
+        unsetenv("FLUX2_BF16_SPLIT_KV");
+    }
+
+    setenv("FLUX2_FA2_SPLIT_F32", "auto", 1);
+    op_attn(r, d_auto, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "auto sync");
+    FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_auto, d_auto, n_elems * sizeof(float)), "auto copy");
+
+    {
+        int ntok = n_tok, nh = n_heads, hd = head_dim;
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+        void *f32_args[] = {&d_f32, &d_Q, &d_K, &d_V, &ntok, &nh, &hd};
+        FLUX2_SPLIT_AUTO_CU(cuLaunchKernel(r->fn_flash_attn, (unsigned)nh, gy, 1,
+                                           128, 1, 1, smem, r->stream, f32_args, NULL),
+                            "f32 launch");
+        FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "f32 sync");
+        FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_f32, d_f32, n_elems * sizeof(float)), "f32 copy");
+
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            fprintf(stderr, "FAIL (split workspace)\n");
+            goto fail;
+        }
+        setenv("FLUX2_FA2_SPLIT_F32", "32", 1);
+        op_attn(r, d_forced, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+        FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "forced sync");
+        FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_forced, d_forced, n_elems * sizeof(float)), "forced copy");
+    }
+
+    if (old_env_copy) {
+        setenv("FLUX2_FA2_SPLIT_F32", old_env_copy, 1);
+    } else {
+        unsetenv("FLUX2_FA2_SPLIT_F32");
+    }
+    free(old_env_copy);
+    old_env_copy = NULL;
+    if (old_bf16_split_env_copy) {
+        setenv("FLUX2_BF16_SPLIT_KV", old_bf16_split_env_copy, 1);
+    } else {
+        unsetenv("FLUX2_BF16_SPLIT_KV");
+    }
+    free(old_bf16_split_env_copy);
+    old_bf16_split_env_copy = NULL;
+    r->use_bf16_attn = saved_bf16_attn;
+
+    float auto_bf16_max = 0.0f, bf16_split_max = 0.0f;
+    float forced_f32_max = 0.0f, bf16_f32_max = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float da = fabsf(out_auto[i] - out_bf16[i]);
+        float ds = fabsf(out_bf16_split[i] - out_bf16[i]);
+        float df = fabsf(out_forced[i] - out_f32[i]);
+        float db = fabsf(out_bf16[i] - out_f32[i]);
+        if (da > auto_bf16_max) auto_bf16_max = da;
+        if (ds > bf16_split_max) bf16_split_max = ds;
+        if (df > forced_f32_max) forced_f32_max = df;
+        if (db > bf16_f32_max) bf16_f32_max = db;
+    }
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_bf16); cuMemFree(d_bf16_split); cuMemFree(d_auto); cuMemFree(d_f32); cuMemFree(d_forced);
+    free(Q); free(K); free(V); free(out_bf16); free(out_bf16_split);
+    free(out_auto); free(out_f32); free(out_forced);
+    if (auto_bf16_max > 0.0f || bf16_split_max > 1e-3f ||
+        forced_f32_max > 1e-4f || bf16_f32_max < 1e-7f) {
+        fprintf(stderr, "FAIL (auto_bf16=%.6g bf16_split=%.6g forced_f32=%.6g bf16_f32=%.6g)\n",
+                auto_bf16_max, bf16_split_max, forced_f32_max, bf16_f32_max);
+        return 1;
+    }
+    fprintf(stderr, "OK (auto_bf16=%.6g bf16_split=%.6g forced_f32=%.6g bf16_f32=%.6g)\n",
+            auto_bf16_max, bf16_split_max, forced_f32_max, bf16_f32_max);
+#undef FLUX2_SPLIT_AUTO_CU
+    return 0;
+
+fail:
+    r->use_bf16_attn = saved_bf16_attn;
+    if (old_env_copy) {
+        setenv("FLUX2_FA2_SPLIT_F32", old_env_copy, 1);
+        free(old_env_copy);
+    } else if (old_env) {
+        setenv("FLUX2_FA2_SPLIT_F32", old_env, 1);
+    } else {
+        unsetenv("FLUX2_FA2_SPLIT_F32");
+    }
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_bf16) cuMemFree(d_bf16);
+    if (d_bf16_split) cuMemFree(d_bf16_split);
+    if (d_auto) cuMemFree(d_auto);
+    if (d_f32) cuMemFree(d_f32);
+    if (d_forced) cuMemFree(d_forced);
+    if (old_bf16_split_env_copy) {
+        setenv("FLUX2_BF16_SPLIT_KV", old_bf16_split_env_copy, 1);
+        free(old_bf16_split_env_copy);
+    } else if (old_bf16_split_env) {
+        setenv("FLUX2_BF16_SPLIT_KV", old_bf16_split_env, 1);
+    } else {
+        unsetenv("FLUX2_BF16_SPLIT_KV");
+    }
+    free(Q); free(K); free(V); free(out_bf16); free(out_bf16_split);
+    free(out_auto); free(out_f32); free(out_forced);
+#undef FLUX2_SPLIT_AUTO_CU
+    return 1;
+}
+
+static float time_flux2_f32_attn(cuda_flux2_runner *r, CUfunction fn,
+                                 CUdeviceptr out, CUdeviceptr q,
+                                 CUdeviceptr k, CUdeviceptr v,
+                                 int n_tok, int n_heads, int head_dim,
+                                 int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int ntok = n_tok, nh = n_heads, hd = head_dim;
+    unsigned gy = (unsigned)((n_tok + 3) / 4);
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    void *args[] = {&out, &q, &k, &v, &ntok, &nh, &hd};
+    if (cuLaunchKernel(fn, (unsigned)n_heads, gy, 1, 128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(fn, (unsigned)n_heads, gy, 1, 128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static float time_flux2_split_attn(cuda_flux2_runner *r,
+                                   CUdeviceptr out, CUdeviceptr q,
+                                   CUdeviceptr k, CUdeviceptr v,
+                                   int n_tok, int n_heads, int head_dim,
+                                   int split_kv, int n_splits, int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int ntok = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    unsigned gy = (unsigned)((n_tok + 3) / 4);
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr,
+                      &q, &k, &v, &ntok, &nh, &hd, &sk};
+    void *m_args[] = {&out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr, &ntok, &nh, &hd, &ns};
+    if (cuLaunchKernel(r->fn_flash_attn_split_partials, (unsigned)n_heads, gy, (unsigned)n_splits,
+                       128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuLaunchKernel(r->fn_flash_attn_split_merge, (unsigned)n_heads, (unsigned)n_tok, 1,
+                       128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(r->fn_flash_attn_split_partials, (unsigned)n_heads, gy, (unsigned)n_splits,
+                           128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+        if (cuLaunchKernel(r->fn_flash_attn_split_merge, (unsigned)n_heads, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static float time_flux2_bf16_attn(cuda_flux2_runner *r,
+                                  CUdeviceptr out, CUdeviceptr qb,
+                                  CUdeviceptr kb, CUdeviceptr vb,
+                                  int n_tok, int n_heads, int head_dim,
+                                  int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int ntok = n_tok, nh = n_heads, hd = head_dim;
+    unsigned gy = (unsigned)((n_tok + 63) / 64);
+    size_t smem = (size_t)(4 * 32 * 136 * 2);
+    void *args[] = {&out, &qb, &kb, &vb, &ntok, &nh, &hd};
+    if (cuLaunchKernel(r->fn_flash_attn_bf16, (unsigned)n_heads, gy, 1,
+                       128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(r->fn_flash_attn_bf16, (unsigned)n_heads, gy, 1,
+                           128, 1, 1, smem, r->stream, args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static float time_flux2_bf16_split_attn(cuda_flux2_runner *r,
+                                        CUdeviceptr out, CUdeviceptr qb,
+                                        CUdeviceptr kb, CUdeviceptr vb,
+                                        int n_tok, int n_heads, int head_dim,
+                                        int split_kv, int n_splits, int repeats) {
+    CUevent start = NULL, stop = NULL;
+    if (cuEventCreate(&start, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    if (cuEventCreate(&stop, CU_EVENT_DEFAULT) != CUDA_SUCCESS) goto fail;
+    int ntok = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    unsigned gy = (unsigned)((n_tok + 63) / 64);
+    size_t smem = (size_t)(4 * 32 * 136 * sizeof(unsigned short));
+    void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr,
+                      &qb, &kb, &vb, &ntok, &nh, &hd, &sk};
+    void *m_args[] = {&out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr, &ntok, &nh, &hd, &ns};
+    if (cuLaunchKernel(r->fn_flash_attn_bf16_tc_split_partials,
+                       (unsigned)n_heads, gy, (unsigned)n_splits,
+                       128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuLaunchKernel(r->fn_flash_attn_split_merge, (unsigned)n_heads, (unsigned)n_tok, 1,
+                       128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventRecord(start, r->stream) != CUDA_SUCCESS) goto fail;
+    for (int i = 0; i < repeats; i++) {
+        if (cuLaunchKernel(r->fn_flash_attn_bf16_tc_split_partials,
+                           (unsigned)n_heads, gy, (unsigned)n_splits,
+                           128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
+        if (cuLaunchKernel(r->fn_flash_attn_split_merge, (unsigned)n_heads, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, m_args, NULL) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuEventRecord(stop, r->stream) != CUDA_SUCCESS) goto fail;
+    if (cuEventSynchronize(stop) != CUDA_SUCCESS) goto fail;
+    float ms = 0.0f;
+    if (cuEventElapsedTime(&ms, start, stop) != CUDA_SUCCESS) goto fail;
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+fail:
+    if (start) cuEventDestroy(start);
+    if (stop) cuEventDestroy(stop);
+    return -1.0f;
+}
+
+static int test_kernel_split_attn_f32_bench(cuda_flux2_runner *r, int n_tok,
+                                            int n_heads, const char *label,
+                                            int repeats) {
+    fprintf(stderr, "  [kernel] flash_attn_f32 split-key %s bench... ", label);
+    if (!r->fn_flash_attn || !r->fn_flash_attn_split_partials || !r->fn_flash_attn_split_merge) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_candidates[] = {128, 256, 384, 512, 768, 1024, 1536, 2048};
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+    rng_state = 20260518;
+    rng_cached_valid = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.25f;
+
+    CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
+    CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
+    CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
+    CUdeviceptr d_ref = 0, d_split = 0;
+    if (!d_Q || !d_K || !d_V ||
+        cuMemAlloc(&d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+        cuMemFree(d_ref); cuMemFree(d_split);
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (device alloc/upload)\n");
+        return 1;
+    }
+
+    float base_ms = time_flux2_f32_attn(r, r->fn_flash_attn, d_ref, d_Q, d_K, d_V,
+                                        n_tok, n_heads, head_dim, repeats);
+    if (base_ms < 0.0f ||
+        cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+        cuMemFree(d_ref); cuMemFree(d_split);
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (baseline timing/copy)\n");
+        return 1;
+    }
+
+    float best_ms = 1e30f, best_max_diff = 0.0f, best_mean_diff = 0.0f;
+    int best_split_kv = 0, best_n_splits = 0;
+    for (int ci = 0; ci < (int)(sizeof(split_candidates) / sizeof(split_candidates[0])); ci++) {
+        int split_kv = split_candidates[ci];
+        int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (n_splits <= 1) continue;
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (device OOM split_kv=%d)\n", split_kv);
+            return 1;
+        }
+        float split_ms = time_flux2_split_attn(r, d_split, d_Q, d_K, d_V,
+                                               n_tok, n_heads, head_dim,
+                                               split_kv, n_splits, repeats);
+        if (split_ms < 0.0f ||
+            cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (split_kv=%d timing/copy)\n", split_kv);
+            return 1;
+        }
+        float max_diff = 0.0f, mean_diff = 0.0f;
+        for (size_t i = 0; i < n_elems; i++) {
+            float d = fabsf(out_split[i] - out_ref[i]);
+            if (d > max_diff) max_diff = d;
+            mean_diff += d;
+        }
+        mean_diff /= (float)n_elems;
+        if (max_diff > 2e-4f || mean_diff > 2e-5f) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (split_kv=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms)\n",
+                    split_kv, max_diff, mean_diff, base_ms, split_ms);
+            return 1;
+        }
+        if (split_ms < best_ms) {
+            best_ms = split_ms;
+            best_max_diff = max_diff;
+            best_mean_diff = mean_diff;
+            best_split_kv = split_kv;
+            best_n_splits = n_splits;
+        }
+    }
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_ref); cuMemFree(d_split);
+    free(Q); free(K); free(V); free(out_ref); free(out_split);
+    fprintf(stderr, "OK (best_split_kv=%d splits=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms speedup=%.2fx)\n",
+            best_split_kv, best_n_splits, best_max_diff, best_mean_diff,
+            base_ms, best_ms, base_ms / (best_ms + 1e-9f));
+    return 0;
+}
+
+static int test_kernel_split_attn_f32_2048(cuda_flux2_runner *r) {
+    return test_kernel_split_attn_f32_bench(r, 2048, 1, "2048-token", 3);
+}
+
+static int test_kernel_split_attn_f32_4608(cuda_flux2_runner *r) {
+    return test_kernel_split_attn_f32_bench(r, 4608, 1, "4608-token", 2);
+}
+
+static int test_kernel_split_attn_f32_4608_flux2_heads(cuda_flux2_runner *r) {
+    /* Production Flux.2 attention shape: hidden=3072 = 24 heads * 128. */
+    return test_kernel_split_attn_f32_bench(r, 4608, 24, "4608-token/24-head", 2);
+}
+
+static int test_kernel_split_attn_bf16_bench(cuda_flux2_runner *r, int n_tok,
+                                             int n_heads, const char *label,
+                                             int repeats) {
+    fprintf(stderr, "  [kernel] flash_attn_bf16 split-key %s bench... ", label);
+    if (!r->fn_flash_attn_bf16 || !r->fn_flash_attn_bf16_tc_split_partials ||
+        !r->fn_cast_f32_to_bf16 || !r->fn_flash_attn_split_merge) {
+        fprintf(stderr, "SKIP (BF16 split kernels not loaded)\n");
+        return 0;
+    }
+
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_candidates[] = {128, 256, 384, 512, 768, 1024, 1536, 2048};
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+    rng_state = 20260521;
+    rng_cached_valid = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.25f;
+
+    CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
+    CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
+    CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
+    CUdeviceptr d_Qb = 0, d_Kb = 0, d_Vb = 0, d_ref = 0, d_split = 0;
+#define FLUX2_BF16_BENCH_CLEANUP() do { \
+        if (d_Q) cuMemFree(d_Q); \
+        if (d_K) cuMemFree(d_K); \
+        if (d_V) cuMemFree(d_V); \
+        if (d_Qb) cuMemFree(d_Qb); \
+        if (d_Kb) cuMemFree(d_Kb); \
+        if (d_Vb) cuMemFree(d_Vb); \
+        if (d_ref) cuMemFree(d_ref); \
+        if (d_split) cuMemFree(d_split); \
+        free(Q); free(K); free(V); free(out_ref); free(out_split); \
+    } while (0)
+    if (!d_Q || !d_K || !d_V ||
+        cuMemAlloc(&d_Qb, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_Kb, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_Vb, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        FLUX2_BF16_BENCH_CLEANUP();
+        fprintf(stderr, "FAIL (device alloc/upload)\n");
+        return 1;
+    }
+    cast_buf_f32_to_bf16(r, d_Qb, d_Q, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Kb, d_K, (int)n_elems);
+    cast_buf_f32_to_bf16(r, d_Vb, d_V, (int)n_elems);
+
+    float base_ms = time_flux2_bf16_attn(r, d_ref, d_Qb, d_Kb, d_Vb,
+                                         n_tok, n_heads, head_dim, repeats);
+    if (base_ms < 0.0f ||
+        cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+        FLUX2_BF16_BENCH_CLEANUP();
+        fprintf(stderr, "FAIL (baseline timing/copy)\n");
+        return 1;
+    }
+
+    float best_ms = 1e30f, best_max_diff = 0.0f, best_mean_diff = 0.0f;
+    int best_split_kv = 0, best_n_splits = 0;
+    for (int ci = 0; ci < (int)(sizeof(split_candidates) / sizeof(split_candidates[0])); ci++) {
+        int split_kv = split_candidates[ci];
+        int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (n_splits <= 1) continue;
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            FLUX2_BF16_BENCH_CLEANUP();
+            fprintf(stderr, "FAIL (device OOM split_kv=%d)\n", split_kv);
+            return 1;
+        }
+        float split_ms = time_flux2_bf16_split_attn(r, d_split, d_Qb, d_Kb, d_Vb,
+                                                    n_tok, n_heads, head_dim,
+                                                    split_kv, n_splits, repeats);
+        if (split_ms < 0.0f ||
+            cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float)) != CUDA_SUCCESS) {
+            FLUX2_BF16_BENCH_CLEANUP();
+            fprintf(stderr, "FAIL (split_kv=%d timing/copy)\n", split_kv);
+            return 1;
+        }
+        float max_diff = 0.0f, mean_diff = 0.0f;
+        for (size_t i = 0; i < n_elems; i++) {
+            float d = fabsf(out_split[i] - out_ref[i]);
+            if (d > max_diff) max_diff = d;
+            mean_diff += d;
+        }
+        mean_diff /= (float)n_elems;
+        if (max_diff > 2e-3f || mean_diff > 2e-4f) {
+            FLUX2_BF16_BENCH_CLEANUP();
+            fprintf(stderr, "FAIL (split_kv=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms)\n",
+                    split_kv, max_diff, mean_diff, base_ms, split_ms);
+            return 1;
+        }
+        if (split_ms < best_ms) {
+            best_ms = split_ms;
+            best_max_diff = max_diff;
+            best_mean_diff = mean_diff;
+            best_split_kv = split_kv;
+            best_n_splits = n_splits;
+        }
+    }
+    FLUX2_BF16_BENCH_CLEANUP();
+#undef FLUX2_BF16_BENCH_CLEANUP
+    fprintf(stderr, "OK (best_split_kv=%d splits=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms speedup=%.2fx)\n",
+            best_split_kv, best_n_splits, best_max_diff, best_mean_diff,
+            base_ms, best_ms, base_ms / (best_ms + 1e-9f));
+    return 0;
+}
+
+static int test_kernel_split_attn_bf16_2048(cuda_flux2_runner *r) {
+    return test_kernel_split_attn_bf16_bench(r, 2048, 1, "2048-token", 3);
+}
+
+static int test_kernel_split_attn_bf16_4608_flux2_heads(cuda_flux2_runner *r) {
+    return test_kernel_split_attn_bf16_bench(r, 4608, 24, "4608-token/24-head", 2);
 }
 
 static int test_kernels(void) {
     fprintf(stderr, "=== Kernel Unit Tests ===\n");
     int fail = 0;
     /* Host-side test first — doesn't need the runner */
+    fail += test_kernel_split_selector();
     fail += test_kernel_f32_to_bf16_bulk();
 
     cuda_flux2_runner *r = cuda_flux2_init(0, 0);
     if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
     fail += test_kernel_gemm_bf16(r);
     fail += test_kernel_fp8_attn(r);
+    fail += test_kernel_split_attn_f32(r);
+    fail += test_kernel_split_attn_bf16(r);
+    fail += test_kernel_split_auto_prefers_tensor_attn(r);
+    fail += test_kernel_split_attn_bf16_2048(r);
+    fail += test_kernel_split_attn_bf16_4608_flux2_heads(r);
+    fail += test_kernel_split_attn_f32_2048(r);
+    fail += test_kernel_split_attn_f32_4608(r);
+    fail += test_kernel_split_attn_f32_4608_flux2_heads(r);
     cuda_flux2_free(r);
 
     if (fail) {
@@ -637,12 +1682,74 @@ static int test_text_enc(const char *enc_path, const char *tok_path,
     return 0;
 }
 
+static int test_text_enc_gpu_repeat(const char *enc_path, const char *tok_path,
+                                    const char *prompt, int device_id) {
+    fprintf(stderr, "=== Flux.2 Klein GPU Text Encoder Repeat Test ===\n");
+    fprintf(stderr, "Prompt: '%s'\n", prompt);
+
+    int n_tok_a = 0, n_tok_b = 0, n_embd = 0;
+    struct timespec t0, t1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    flux2_text_enc *a = flux2_text_enc_load_gpu(enc_path, tok_path, device_id);
+    if (!a) return 1;
+    n_embd = a->n_embd;
+    float *hidden_a = flux2_text_enc_encode(a, prompt, &n_tok_a);
+    flux2_text_enc_free(a);
+    if (!hidden_a) return 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "GPU text enc A: %.2f s (%d tokens x %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_a, n_embd);
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    flux2_text_enc *b = flux2_text_enc_load_gpu(enc_path, tok_path, device_id);
+    if (!b) { free(hidden_a); return 1; }
+    if (b->n_embd != n_embd) {
+        fprintf(stderr, "Embedding dim mismatch: A=%d B=%d\n", n_embd, b->n_embd);
+        flux2_text_enc_free(b);
+        free(hidden_a);
+        return 1;
+    }
+    float *hidden_b = flux2_text_enc_encode(b, prompt, &n_tok_b);
+    flux2_text_enc_free(b);
+    if (!hidden_b) { free(hidden_a); return 1; }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "GPU text enc B: %.2f s (%d tokens x %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_b, n_embd);
+
+    if (n_tok_a != n_tok_b) {
+        fprintf(stderr, "Token count mismatch: A=%d B=%d\n", n_tok_a, n_tok_b);
+        free(hidden_a);
+        free(hidden_b);
+        return 1;
+    }
+
+    size_t total = (size_t)n_tok_a * n_embd;
+    float max_diff = 0.0f;
+    size_t max_idx = 0;
+    for (size_t i = 0; i < total; i++) {
+        float d = fabsf(hidden_a[i] - hidden_b[i]);
+        if (d > max_diff) {
+            max_diff = d;
+            max_idx = i;
+        }
+    }
+    fprintf(stderr, "GPU repeat max_diff=%.9f at idx=%zu\n", max_diff, max_idx);
+    for (int i = 0; i < 6 && i < n_embd; i++) {
+        fprintf(stderr, "  tok0[%d] A=%.6f B=%.6f\n", i, hidden_a[i], hidden_b[i]);
+    }
+
+    free(hidden_a);
+    free(hidden_b);
+    return (max_diff <= 1.0e-6f) ? 0 : 1;
+}
+
 static int run_generate_once(cuda_flux2_runner *r,
                          const char *prompt,
                          const float *txt_hidden, int n_txt, int enc_embd,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
-                         const char *out_path) {
+                         const char *out_path, int dump_intermediates) {
     struct timespec t_start, t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -659,6 +1766,11 @@ static int run_generate_once(cuda_flux2_runner *r,
     int ps = (r->pin == lc * 4) ? 2 : 1;
     int n_img = (lat_h / ps) * (lat_w / ps);
     int pin = r->pin;
+    if (lat_h <= 0 || lat_w <= 0 || (lat_h % ps) != 0 || (lat_w % ps) != 0) {
+        fprintf(stderr, "generate: output size %dx%d is incompatible with latent patch size ps=%d\n",
+                out_w, out_h, ps);
+        return 1;
+    }
 
     fprintf(stderr, "Latent: [%d, %d, %d], ps=%d, n_img=%d, pin=%d, n_txt=%d, txt_dim=%d\n",
             lc, lat_h, lat_w, ps, n_img, pin, n_txt, r->txt_dim);
@@ -666,10 +1778,27 @@ static int run_generate_once(cuda_flux2_runner *r,
     rng_state = seed;
     size_t lat_sz = (size_t)lc * lat_h * lat_w;
     float *latent = (float *)malloc(lat_sz * sizeof(float));
+    if (!latent) return 1;
     for (size_t i = 0; i < lat_sz; i++) latent[i] = randn();
 
     float *img_tok = (float *)malloc((size_t)n_img * pin * sizeof(float));
     float *vel_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
+    float *vel_lat = (float *)calloc(lat_sz, sizeof(float));
+    float *txt_uncond = NULL;
+    float *vel_uncond = NULL;
+    if (!img_tok || !vel_out || !vel_lat) {
+        free(img_tok); free(vel_out); free(vel_lat); free(latent);
+        return 1;
+    }
+    if (!is_distilled && cfg_scale > 1.0f) {
+        txt_uncond = (float *)calloc((size_t)n_txt * r->txt_dim, sizeof(float));
+        vel_uncond = (float *)malloc((size_t)n_img * pin * sizeof(float));
+        if (!txt_uncond || !vel_uncond) {
+            free(txt_uncond); free(vel_uncond);
+            free(img_tok); free(vel_out); free(vel_lat); free(latent);
+            return 1;
+        }
+    }
 
     qimg_scheduler sched;
     if (is_distilled) flux2_sched_distilled(&sched, n_steps);
@@ -689,7 +1818,8 @@ static int run_generate_once(cuda_flux2_runner *r,
         if (is_distilled || cfg_scale <= 1.0f) {
             if (cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
                                     t_sigma, 0.0f, vel_out) != 0) {
-                free(img_tok); free(vel_out); free(latent);
+                free(txt_uncond); free(vel_uncond);
+                free(img_tok); free(vel_out); free(vel_lat); free(latent);
                 return 1;
             }
             /* Velocity stats */
@@ -697,19 +1827,16 @@ static int run_generate_once(cuda_flux2_runner *r,
             for(int i=0;i<n_img*pin;i++){if(vel_out[i]<vmn)vmn=vel_out[i];if(vel_out[i]>vmx)vmx=vel_out[i];vsum+=vel_out[i];}
             fprintf(stderr, "    vel: min=%.4f max=%.4f mean=%.6f\n", vmn, vmx, vsum/(n_img*pin));
         } else {
-            float *txt_uncond = (float *)calloc((size_t)n_txt * r->txt_dim, sizeof(float));
-            float *vel_uncond = (float *)malloc((size_t)n_img * pin * sizeof(float));
             if (cuda_flux2_dit_step(r, img_tok, n_img, txt_uncond, n_txt,
                                     t_sigma, 0.0f, vel_uncond) != 0 ||
                 cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
                                     t_sigma, 0.0f, vel_out) != 0) {
                 free(txt_uncond); free(vel_uncond);
-                free(img_tok); free(vel_out); free(latent);
+                free(img_tok); free(vel_out); free(vel_lat); free(latent);
                 return 1;
             }
             for (int i = 0; i < n_img * pin; i++)
                 vel_out[i] = vel_uncond[i] + cfg_scale * (vel_out[i] - vel_uncond[i]);
-            free(txt_uncond); free(vel_uncond);
         }
 
         {
@@ -717,16 +1844,17 @@ static int run_generate_once(cuda_flux2_runner *r,
             if (err != CUDA_SUCCESS) {
                 fprintf(stderr, "generate: cuCtxSynchronize failed after DiT step %d/%d (%d)\n",
                         step + 1, n_steps, (int)err);
-                free(img_tok); free(vel_out); free(latent);
+                free(txt_uncond); free(vel_uncond);
+                free(img_tok); free(vel_out); free(vel_lat); free(latent);
                 return 1;
             }
         }
 
-        float *vel_lat = (float *)calloc(lat_sz, sizeof(float));
+        memset(vel_lat, 0, lat_sz * sizeof(float));
         flux2_unpatchify(vel_lat, vel_out, lc, lat_h, lat_w, ps);
 
         /* Save raw velocity for comparison */
-        {
+        if (dump_intermediates) {
             char path[64];
             snprintf(path, sizeof(path), "cuda_flux2_vel%d.npy", step);
             int sh3[] = {(int)lc, lat_h, lat_w};
@@ -734,10 +1862,9 @@ static int run_generate_once(cuda_flux2_runner *r,
         }
 
         qimg_sched_step(latent, vel_lat, (int)lat_sz, step, &sched);
-        free(vel_lat);
 
         /* Save per-step latent for comparison */
-        {
+        if (dump_intermediates) {
             char path[64];
             snprintf(path, sizeof(path), "cuda_flux2_step%d.npy", step);
             int sh3[] = {(int)lc, lat_h, lat_w};
@@ -752,14 +1879,15 @@ static int run_generate_once(cuda_flux2_runner *r,
     fprintf(stderr, "Denoising: %.1f s\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
-    free(img_tok); free(vel_out);
+    free(txt_uncond); free(vel_uncond);
+    free(img_tok); free(vel_out); free(vel_lat);
 
     /* Save final latent and text hidden states for comparison */
-    {
+    if (dump_intermediates) {
         int sh3[] = {(int)lc, lat_h, lat_w};
         save_npy_f32("cuda_flux2_latent_final.npy", latent, 3, sh3);
     }
-    if (txt_hidden) {
+    if (dump_intermediates && txt_hidden) {
         int sh2[] = {n_txt, (int)r->txt_dim};
         save_npy_f32("cuda_flux2_text_hidden.npy", txt_hidden, 2, sh2);
     }
@@ -769,6 +1897,10 @@ static int run_generate_once(cuda_flux2_runner *r,
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
+    if (!rgb) {
+        free(latent);
+        return 1;
+    }
     if (cuda_flux2_vae_decode(r, latent, lat_h, lat_w, rgb) != 0) {
         free(rgb); free(latent);
         return 1;
@@ -801,11 +1933,15 @@ static int run_generate(const char *dit_path, const char *vae_path,
                          const char *prompt,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
-                         int use_gpu_enc, int device_id, int repeat,
-                         const char *out_override) {
+                         int use_gpu_enc, int keep_gpu_enc, int device_id, int repeat,
+                         const char *out_override, int dump_intermediates) {
     fprintf(stderr, "\n=== Flux.2 Klein GPU Pipeline ===\n");
     fprintf(stderr, "Runs: %d\n", repeat);
+    fprintf(stderr, "Intermediate dumps: %s\n", dump_intermediates ? "on" : "off");
     if (use_gpu_enc) fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
+    if (use_gpu_enc && keep_gpu_enc) {
+        fprintf(stderr, "GPU text encoder residency: keep alive through DiT/VAE generation\n");
+    }
 
     fprintf(stderr, "\n[setup] Text encoder (%s)...\n", use_gpu_enc ? "GPU" : "CPU");
     struct timespec t0, t1;
@@ -815,38 +1951,58 @@ static int run_generate(const char *dit_path, const char *vae_path,
         : flux2_text_enc_load_safetensors(enc_path, tok_path);
     if (!enc) return 1;
 
+    int rc = 1;
+    flux2_text_enc *enc_hold = NULL;
+    float *txt_hidden_raw = NULL;
+    float *txt_hidden = NULL;
+    cuda_flux2_runner *r = NULL;
     int n_txt = 0;
     int enc_embd = enc->n_embd;
-    float *txt_hidden_raw = flux2_text_enc_encode(enc, prompt, &n_txt);
-    flux2_text_enc_free(enc);
-    if (!txt_hidden_raw) return 1;
+
+    txt_hidden_raw = flux2_text_enc_encode(enc, prompt, &n_txt);
+    if (!txt_hidden_raw) {
+        flux2_text_enc_free(enc);
+        goto cleanup;
+    }
+    if (use_gpu_enc && keep_gpu_enc) {
+        enc_hold = enc;
+    } else {
+        flux2_text_enc_free(enc);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "Shared text enc: %.1f s (%d real tokens × %d)\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_txt, enc_embd);
 
     /* Front-pad text to 512 tokens with zeros (matches ComfyUI Flux2.extra_conds) */
     const int FLUX2_KLEIN_TXT_LEN = 512;
-    float *txt_hidden = (float *)calloc((size_t)FLUX2_KLEIN_TXT_LEN * enc_embd, sizeof(float));
+    txt_hidden = (float *)calloc((size_t)FLUX2_KLEIN_TXT_LEN * enc_embd, sizeof(float));
+    if (!txt_hidden) goto cleanup;
     int pad_front = FLUX2_KLEIN_TXT_LEN - n_txt;
     if (pad_front < 0) pad_front = 0;
     int real_txt = (n_txt < FLUX2_KLEIN_TXT_LEN) ? n_txt : FLUX2_KLEIN_TXT_LEN;
     memcpy(txt_hidden + (size_t)pad_front * enc_embd, txt_hidden_raw,
            (size_t)real_txt * enc_embd * sizeof(float));
-    free(txt_hidden_raw);
+    free(txt_hidden_raw); txt_hidden_raw = NULL;
     n_txt = FLUX2_KLEIN_TXT_LEN;
     fprintf(stderr, "Padded text to %d tokens (front-pad zeros)\n", n_txt);
 
     fprintf(stderr, "\n[setup] Init CUDA + load DiT + VAE...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    cuda_flux2_runner *r = cuda_flux2_init(device_id, 1);
-    if (!r) { free(txt_hidden); return 1; }
-    if (cuda_flux2_load_dit(r, dit_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
-    if (cuda_flux2_load_vae(r, vae_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
+    r = cuda_flux2_init(device_id, 1);
+    if (!r) goto cleanup;
+    if (cuda_flux2_load_dit(r, dit_path) != 0) {
+        if (enc_hold) fprintf(stderr, "DiT load failed with GPU text encoder resident; retry without --keep-gpu-enc on lower-VRAM cards.\n");
+        goto cleanup;
+    }
+    if (cuda_flux2_load_vae(r, vae_path) != 0) {
+        if (enc_hold) fprintf(stderr, "VAE load failed with GPU text encoder resident; retry without --keep-gpu-enc on lower-VRAM cards.\n");
+        goto cleanup;
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "Shared init+load: %.1f s\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
-    int rc = 0;
+    rc = 0;
     for (int i = 0; i < repeat; i++) {
         char out_path[512];
         if (out_override && repeat == 1) snprintf(out_path, sizeof(out_path), "%s", out_override);
@@ -854,12 +2010,16 @@ static int run_generate(const char *dit_path, const char *vae_path,
         else snprintf(out_path, sizeof(out_path), "cuda_flux2_output_%02d.ppm", i);
         fprintf(stderr, "\n--- Run %d/%d ---\n", i + 1, repeat);
         rc = run_generate_once(r, prompt, txt_hidden, n_txt, enc_embd, out_h, out_w, n_steps,
-                               seed + (uint64_t)i, is_distilled, cfg_scale, out_path);
+                               seed + (uint64_t)i, is_distilled, cfg_scale, out_path,
+                               dump_intermediates);
         if (rc != 0) break;
     }
 
+cleanup:
     free(txt_hidden);
-    cuda_flux2_free(r);
+    free(txt_hidden_raw);
+    if (enc_hold) flux2_text_enc_free(enc_hold);
+    if (r) cuda_flux2_free(r);
     return rc;
 }
 
@@ -872,7 +2032,8 @@ int main(int argc, char **argv) {
     const char *mode = NULL;
 
     int out_h = 256, out_w = 256, n_steps = 4, repeat = 1, n_txt = 8;
-    int is_distilled = 1, use_gpu_enc = 0, device_id = 0;
+    int is_distilled = 1, use_gpu_enc = 0, keep_gpu_enc = 0, device_id = 0;
+    int dump_intermediates = 1;
     const char *out_path = NULL;
     float cfg_scale = 1.0f;
     float img_scale = 0.1f, txt_scale = 0.1f;
@@ -888,11 +2049,14 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-dit")  == 0) mode = "dit";
         else if (strcmp(argv[i], "--test-vae")  == 0) mode = "vae";
         else if (strcmp(argv[i], "--test-text-enc") == 0) mode = "text";
+        else if (strcmp(argv[i], "--test-text-gpu") == 0) mode = "text_gpu";
         else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
         else if (strcmp(argv[i], "--generate")  == 0) mode = "gen";
         else if (strcmp(argv[i], "--base")       == 0) { is_distilled = 0; n_steps = 20; }
         else if (strcmp(argv[i], "--distilled")  == 0) { is_distilled = 1; n_steps = 4; }
         else if (strcmp(argv[i], "--gpu-enc")    == 0) use_gpu_enc = 1;
+        else if (strcmp(argv[i], "--keep-gpu-enc") == 0) { use_gpu_enc = 1; keep_gpu_enc = 1; }
+        else if (strcmp(argv[i], "--no-dumps") == 0) dump_intermediates = 0;
         else if (strcmp(argv[i], "--dit")    == 0 && i+1<argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae")    == 0 && i+1<argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc")    == 0 && i+1<argc) enc_path = argv[++i];
@@ -915,14 +2079,19 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--verbose")== 0 && i+1<argc) verbose  = atoi(argv[++i]);
         else if (strcmp(argv[i], "--out")    == 0 && i+1<argc) out_path = argv[++i];
     }
+    if (flux2_env_enabled("FLUX2_KEEP_GPU_ENC")) {
+        use_gpu_enc = 1;
+        keep_gpu_enc = 1;
+    }
+    if (flux2_env_enabled("FLUX2_NO_DUMPS")) dump_intermediates = 0;
 
     if (!mode) {
         fprintf(stderr,
-            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--test-kernels|--generate]\n"
+            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--test-text-gpu|--test-kernels|--generate]\n"
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
-            "          [--base|--distilled] [--gpu-enc] [--device N]\n",
+            "          [--base|--distilled] [--gpu-enc] [--keep-gpu-enc] [--no-dumps] [--device N]\n",
             argv[0]);
         return 1;
     }
@@ -937,11 +2106,12 @@ int main(int argc, char **argv) {
                                                    repeat, no_cpu_ref);
     if (strcmp(mode, "vae")  == 0) return test_vae(vae_path, out_h/8, out_w/8);
     if (strcmp(mode, "text") == 0) return test_text_enc(enc_path, tok_path, prompt, device_id);
+    if (strcmp(mode, "text_gpu") == 0) return test_text_enc_gpu_repeat(enc_path, tok_path, prompt, device_id);
     if (strcmp(mode, "gen")  == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,
-                            cfg_scale, use_gpu_enc, device_id, repeat,
-                            out_path);
+                            cfg_scale, use_gpu_enc, keep_gpu_enc, device_id, repeat,
+                            out_path, dump_intermediates);
 
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 1;

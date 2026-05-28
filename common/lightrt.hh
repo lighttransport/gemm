@@ -191,41 +191,41 @@ private:
 
 struct alignas(16) Vec3 {
   float x, y, z;
-  
+
   Vec3() noexcept : x(0.0f), y(0.0f), z(0.0f) {}
   Vec3(float x_, float y_, float z_) noexcept : x(x_), y(y_), z(z_) {}
-  
+
   Vec3 operator+(const Vec3& v) const noexcept {
     return Vec3(x + v.x, y + v.y, z + v.z);
   }
-  
+
   Vec3 operator-(const Vec3& v) const noexcept {
     return Vec3(x - v.x, y - v.y, z - v.z);
   }
-  
+
   Vec3 operator*(float s) const noexcept {
     return Vec3(x * s, y * s, z * s);
   }
-  
+
   Vec3 operator/(float s) const noexcept {
     float inv = 1.0f / s;
     return Vec3(x * inv, y * inv, z * inv);
   }
-  
+
   float dot(const Vec3& v) const noexcept {
     return x * v.x + y * v.y + z * v.z;
   }
-  
+
   Vec3 cross(const Vec3& v) const noexcept {
     return Vec3(y * v.z - z * v.y,
                 z * v.x - x * v.z,
                 x * v.y - y * v.x);
   }
-  
+
   float length() const noexcept {
     return std::sqrt(x * x + y * y + z * z);
   }
-  
+
   Vec3 normalize() const noexcept {
     float len = length();
     if (len > 0.0f) {
@@ -548,14 +548,14 @@ struct MultiHitResult {
 struct alignas(16) AABB {
   Vec3 min;
   Vec3 max;
-  
+
   AABB() noexcept {
     min = Vec3(kInfinity, kInfinity, kInfinity);
     max = Vec3(-kInfinity, -kInfinity, -kInfinity);
   }
-  
+
   AABB(const Vec3& min_, const Vec3& max_) noexcept : min(min_), max(max_) {}
-  
+
   void expand(const Vec3& p) noexcept {
     min.x = std::min(min.x, p.x);
     min.y = std::min(min.y, p.y);
@@ -564,7 +564,7 @@ struct alignas(16) AABB {
     max.y = std::max(max.y, p.y);
     max.z = std::max(max.z, p.z);
   }
-  
+
   void expand(const AABB& b) noexcept {
     min.x = std::min(min.x, b.min.x);
     min.y = std::min(min.y, b.min.y);
@@ -573,27 +573,27 @@ struct alignas(16) AABB {
     max.y = std::max(max.y, b.max.y);
     max.z = std::max(max.z, b.max.z);
   }
-  
+
   Vec3 center() const noexcept {
     return (min + max) * 0.5f;
   }
-  
+
   Vec3 extents() const noexcept {
     return max - min;
   }
-  
+
   float surfaceArea() const noexcept {
     Vec3 d = extents();
     return 2.0f * (d.x * d.y + d.y * d.z + d.z * d.x);
   }
-  
+
   int longestAxis() const noexcept {
     Vec3 d = extents();
     if (d.x > d.y && d.x > d.z) return 0;
     if (d.y > d.z) return 1;
     return 2;
   }
-  
+
   // Ray-AABB intersection test
   bool intersect(const Ray& ray, float& tmin_out, float& tmax_out) const noexcept;
 
@@ -1233,7 +1233,7 @@ inline float dequantizeFloat(uint16_t value, float min_val, float max_val) noexc
 struct QuantizedAABB {
   uint16_t min[3];
   uint16_t max[3];
-  
+
   void quantize(const AABB& aabb, const Vec3& global_min, const Vec3& global_max) noexcept {
     min[0] = quantizeFloat(aabb.min.x, global_min.x, global_max.x);
     min[1] = quantizeFloat(aabb.min.y, global_min.y, global_max.y);
@@ -1242,7 +1242,7 @@ struct QuantizedAABB {
     max[1] = quantizeFloat(aabb.max.y, global_min.y, global_max.y);
     max[2] = quantizeFloat(aabb.max.z, global_min.z, global_max.z);
   }
-  
+
   AABB dequantize(const Vec3& global_min, const Vec3& global_max) const noexcept {
     AABB result;
     result.min.x = dequantizeFloat(min[0], global_min.x, global_max.x);
@@ -1292,11 +1292,11 @@ inline uint16_t floatToFP16(float value) noexcept {
   // Software fallback for ARM NEON
   uint32_t bits;
   std::memcpy(&bits, &value, sizeof(float));
-  
+
   uint32_t sign = (bits >> 16) & 0x8000;
   int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
   uint32_t mantissa = bits & 0x7FFFFF;
-  
+
   if (exponent <= 0) {
     // Denormal or zero
     return static_cast<uint16_t>(sign);
@@ -1304,7 +1304,7 @@ inline uint16_t floatToFP16(float value) noexcept {
     // Infinity or overflow
     return static_cast<uint16_t>(sign | 0x7C00);
   }
-  
+
   return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
 #endif
 }
@@ -1320,7 +1320,7 @@ inline float fp16ToFloat(uint16_t value) noexcept {
   uint32_t sign = (value & 0x8000) << 16;
   int32_t exponent = (value >> 10) & 0x1F;
   uint32_t mantissa = value & 0x3FF;
-  
+
   if (exponent == 0) {
     // Denormal or zero
     if (mantissa == 0) {
@@ -1343,7 +1343,7 @@ inline float fp16ToFloat(uint16_t value) noexcept {
     std::memcpy(&result, &bits, sizeof(float));
     return result;
   }
-  
+
   uint32_t bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
   float result;
   std::memcpy(&result, &bits, sizeof(float));
@@ -1357,21 +1357,21 @@ inline float fp16ToFloat(uint16_t value) noexcept {
 
 struct BVHNode {
   AABB bounds;
-  
+
   union {
     // Interior node
     struct {
       uint32_t left_child;   // Index to left child
       uint32_t right_child;  // Index to right child
     };
-    
+
     // Leaf node
     struct {
       uint32_t prim_offset;  // Offset into primitive indices
       uint32_t prim_count;   // Number of primitives
     };
   };
-  
+
   // Flags: bit 0 = is_leaf, bits 1-2 = split axis (0=x, 1=y, 2=z)
   uint32_t flags;
   uint32_t padding; // Ensure alignment
@@ -1672,19 +1672,19 @@ public:
   // Delete copy operations
   BVH(const BVH&) = delete;
   BVH& operator=(const BVH&) = delete;
-  
+
   // Build BVH from primitives (AABBs)
   // prim_aabbs: Bounding boxes of primitives
   // Returns true on success
   bool build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& config = BVHBuildConfig()) noexcept;
-  
+
   // Traverse BVH and find closest intersection
   // Returns primitive index or kInvalidIndex if no hit
   uint32_t traverse(const Ray& ray, float& hit_t) const noexcept;
-  
+
   // Traverse BVH using SIMD optimizations
   uint32_t traverseSIMD(const Ray& ray, float& hit_t) const noexcept;
-  
+
   // Get BVH statistics
   struct Stats {
     uint32_t num_nodes;
@@ -1693,7 +1693,7 @@ public:
     float avg_leaf_size;
     float sah_cost;
   };
-  
+
   Stats getStats() const noexcept;
 
   // Refit BVH bounds from updated primitive AABBs
@@ -1760,14 +1760,14 @@ private:
   std::vector<AABB> prim_aabbs_;
   BVHBuildConfig config_;
   std::atomic<uint32_t> node_allocator_;
-  
+
   // Recursive build
   uint32_t buildRecursive(
     uint32_t* indices,
     uint32_t num_prims,
     uint32_t depth,
     const AABB* precomputed_bounds = nullptr) noexcept;
-  
+
   // Split methods
   struct SplitResult {
     int axis;
@@ -1776,7 +1776,7 @@ private:
     AABB left_bounds;   // Precomputed left child bounds
     AABB right_bounds;  // Precomputed right child bounds
   };
-  
+
   SplitResult findBestSplit(
     const uint32_t* indices,
     uint32_t num_prims,
@@ -1894,7 +1894,7 @@ private:
 
   CollapseResult collapseBinaryNode(const BVH& binary_bvh, uint32_t binary_idx) const noexcept;
   uint32_t buildRecursive(const BVH& binary_bvh, uint32_t binary_idx) noexcept;
-  
+
   void quantizeNodes() noexcept;
 };
 
@@ -1906,7 +1906,7 @@ private:
 struct BLAS {
   BVH bvh;
   std::vector<AABB> primitives;  // Primitive AABBs
-  
+
   bool build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& config = BVHBuildConfig()) noexcept {
     primitives = prim_aabbs;
     return bvh.build(prim_aabbs, config);
@@ -1919,7 +1919,7 @@ struct BLASInstance {
   float transform[12];     // 3x4 transformation matrix (row-major)
   float inv_transform[12]; // Inverse transformation
   AABB bounds;             // Transformed world-space bounds
-  
+
   BLASInstance() noexcept : blas_id(kInvalidIndex) {
     // Identity transform
     std::memset(transform, 0, sizeof(transform));
@@ -1927,7 +1927,7 @@ struct BLASInstance {
     transform[0] = transform[5] = transform[10] = 1.0f;
     inv_transform[0] = inv_transform[5] = inv_transform[10] = 1.0f;
   }
-  
+
   // Transform point from world to local space
   Vec3 worldToLocal(const Vec3& p) const noexcept {
     return Vec3(
@@ -1936,7 +1936,7 @@ struct BLASInstance {
       inv_transform[8] * p.x + inv_transform[9] * p.y + inv_transform[10] * p.z + inv_transform[11]
     );
   }
-  
+
   // Transform direction from world to local space
   Vec3 worldToLocalDir(const Vec3& d) const noexcept {
     return Vec3(
@@ -1952,10 +1952,10 @@ class TLAS {
 public:
   TLAS() noexcept = default;
   ~TLAS() noexcept = default;
-  
+
   // Build TLAS from BLAS instances
   bool build(const std::vector<BLASInstance>& instances, const BVHBuildConfig& config = BVHBuildConfig()) noexcept;
-  
+
   // Traverse TLAS and find closest intersection
   // Returns instance index and primitive index, or kInvalidIndex if no hit
   struct TraceResult {
@@ -1963,12 +1963,12 @@ public:
     uint32_t primitive_id;
     float t;
   };
-  
+
   TraceResult trace(const Ray& ray, const std::vector<BLAS>& blas_array) const noexcept;
-  
+
   const BVH& getBVH() const noexcept { return bvh_; }
   const std::vector<BLASInstance>& getInstances() const noexcept { return instances_; }
-  
+
 private:
   BVH bvh_;
   std::vector<BLASInstance> instances_;
@@ -3178,36 +3178,36 @@ static constexpr size_t kRayContextAlignment = 32;
 
 /*
   Memory Alignment Requirements:
-  
+
   - 16-byte alignment: Used for Vec3, Ray, and base RayContext
     - Required for SIMD packet traversal
     - Aligns 3-vector components to 16-byte boundary
     - Enables efficient SIMD operations (128-bit registers)
-  
+
   - 32-byte alignment: Used for AVX/SSE2 RayContext
     - Required for AVX/SSE2 packet traversal
     - Aligns RayContext for AVX instructions
     - Enables 128-bit register operations
-  
+
   Why 16 bytes?
     - Vec3 stores 3 floats (12 bytes) + padding to 16 bytes
     - Enables SIMD operations without padding overhead
     - Minimum for 128-bit SIMD register alignment
-  
+
   TaskSystem Memory Manager:
-    
+
     The TaskSystem provides a thread pool with work-stealing:
-    
+
     - Initialization: TaskSystem::initialize() uses hardware concurrency
     - Thread safety: Uses static members with RAII guard (TaskSystemGuard)
     - Automatic shutdown: RAII guard destructor calls shutdown on exit
-    
+
     Memory Allocation Patterns:
-    
+
     1. No explicit allocator - Uses standard std::vector and std::queue
     2. Static state - All TaskSystem state is static (singleton-like)
     3. No external allocation - No custom memory pools or arenas
-    
+
     Queue Size: Max tasks in queue before blocking is unlimited
     (uses std::queue which grows dynamically)
 */
@@ -3218,29 +3218,29 @@ static constexpr size_t kRayContextAlignment = 32;
 
 /*
   SIMD Memory Alignment Requirements:
-  
+
   AVX/SSE2 RayContext (32-byte aligned):
   - Stores SIMD-optimized ray data for packet traversal
   - Uses _mm_set_ps() for AVX/SSE2 intrinsics
   - 128-bit register alignment required
-  
+
   Memory Manager Notes:
-  
+
   - All core types are 16-byte aligned (alignas(16))
   - No external dependencies
   - C++17 compatible compiler
   - SIMD-friendly design
-  
+
   Constants and Configuration:
-  
+
   - kAlignment: 16 bytes for SIMD traversal
   - kRayContextAlignment: 32 bytes for AVX/SSE2
   - kEpsilon: 1e-6f (near-zero threshold)
   - kInvalidIndex: 0xFFFFFFFF (no-hit result)
   - kInfinity: infinity for traversal limits
-  
+
   Memory Stats:
-  
+
   - Track TaskSystem memory usage (queue size, thread count)
   - Monitor alignment overhead (16 vs 32 byte)
 */
