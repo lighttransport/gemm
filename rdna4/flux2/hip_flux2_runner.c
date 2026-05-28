@@ -324,6 +324,27 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                 out.wscale = (float *)hip_upload_raw(safetensors_data(st, sidx), sn * sizeof(float));
             }
         }
+        /* Optional SmoothQuant smooth tensor (lam ≥ 1, per-K-channel) — bf16 -> f32. */
+        if (wname) {
+            const char *wsuf = strstr(wname, ".weight");
+            if (wsuf) {
+                char base[256]; int blen = (int)(wsuf - wname);
+                if (blen > 0 && blen < (int)sizeof(base)) {
+                    memcpy(base, wname, blen); base[blen] = 0;
+                    char smk[260]; snprintf(smk, sizeof(smk), "%s.smooth", base);
+                    int smidx = safetensors_find(st, smk);
+                    if (smidx >= 0) {
+                        const uint64_t *ssh = safetensors_shape(st, smidx);
+                        size_t sn = (size_t)ssh[0];
+                        float *sf = (float *)malloc(sn * sizeof(float));
+                        const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+                        for (size_t i = 0; i < sn; i++) { uint32_t b = (uint32_t)src[i] << 16; memcpy(&sf[i], &b, 4); }
+                        out.smooth = (float *)hip_upload_raw(sf, sn * sizeof(float));
+                        free(sf);
+                    }
+                }
+            }
+        }
         return out;
     }
 
@@ -463,11 +484,11 @@ static void op_gemm_fp8_bf16_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, flo
     hipModuleLaunchKernel(r->fn_gemm_fp8_bf16_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, args, NULL);
 }
 
-/* INT8 W8A8: dynamic per-token int8 act quant (smooth=NULL) + int8×int8 WMMA with
- * fused dequant (xscale[t]*wscale[o]) + bias. Mirrors qimg op_gemm_int8 + the fp8
- * pipe32 lazy-scratch pattern. wscale = device per-output-row scale [n_out]. */
+/* INT8 W8A8: per-token int8 act quant (optional SmoothQuant divide by lam if W->smooth
+ * is non-NULL) + int8×int8 WMMA with fused dequant (xscale[t]*wscale[o]) + bias. Math
+ * with smooth: Wq*ws = W*lam (post-smooth weight); Xq*xscale = X/lam; product = W @ X. */
 static void op_gemm_int8(hip_flux2_runner *r, void *Y, void *Wq, float *wscale,
-                         void *X, void *bias, int n_out, int n_in, int n_tok) {
+                         float *smooth, void *X, void *bias, int n_out, int n_in, int n_tok) {
     int M_pad = ((n_tok + 127) / 128) * 128;
     size_t need_x = (size_t)M_pad * (size_t)n_in;     /* int8 bytes */
     size_t need_s = (size_t)M_pad * sizeof(float);
@@ -479,7 +500,6 @@ static void op_gemm_int8(hip_flux2_runner *r, void *Y, void *Wq, float *wscale,
         if (r->d_act_iscale) hipFree(r->d_act_iscale);
         hipMalloc((void **)&r->d_act_iscale, need_s); r->act_isc_cap = need_s;
     }
-    void *smooth = NULL;
     void *qa[] = {&X, &smooth, &r->d_act_int8, &r->d_act_iscale, &n_tok, &n_in};
     hipModuleLaunchKernel(r->fn_quant_act_int8, (unsigned)n_tok, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
     static int i8_dp4a = -1; if (i8_dp4a < 0) i8_dp4a = getenv("FLUX2_INT8_DP4A") ? 1 : 0;
@@ -677,7 +697,7 @@ static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
         return;
     }
     if (W->wscale) {
-        op_gemm_int8(r, Y, W->w, W->wscale, X, bias, n_out, n_in, n_tok);
+        op_gemm_int8(r, Y, W->w, W->wscale, W->smooth, X, bias, n_out, n_in, n_tok);
         return;
     }
     if (W->scale >= 0.0f) {
@@ -1227,6 +1247,20 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         if (ws) {
             out_attn->wscale = (float *)hip_upload_raw(ws, (size_t)H * sizeof(float));
             out_mlp->wscale  = (float *)hip_upload_raw(ws, (size_t)H * sizeof(float));
+        }
+        /* Optional SmoothQuant smooth — column-split [H+n_ff] -> [H] (attn) + [n_ff] (mlp) */
+        char smk[256];
+        snprintf(smk, sizeof(smk), "single_blocks.%d.linear2.smooth", bi);
+        int smidx = safetensors_find(st, smk);
+        if (smidx >= 0) {
+            const uint16_t *src = (const uint16_t *)safetensors_data(st, smidx);
+            float *sa = (float *)malloc((size_t)H    * sizeof(float));
+            float *sm = (float *)malloc((size_t)n_ff * sizeof(float));
+            for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)src[k]     << 16; memcpy(&sa[k], &b, 4); }
+            for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)src[H + k] << 16; memcpy(&sm[k], &b, 4); }
+            out_attn->smooth = (float *)hip_upload_raw(sa, (size_t)H    * sizeof(float));
+            out_mlp->smooth  = (float *)hip_upload_raw(sm, (size_t)n_ff * sizeof(float));
+            free(sa); free(sm);
         }
         return 0;
     }
