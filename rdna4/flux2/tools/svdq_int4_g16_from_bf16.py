@@ -34,15 +34,23 @@ MAIN_DBLK = ["img_attn.qkv", "img_attn.proj", "img_mlp.0", "img_mlp.2",
 MAIN_SBLK = ["linear1", "linear2"]
 
 
-def rtn_g16_pack(R_f32: torch.Tensor):
+def rtn_pack(R_f32: torch.Tensor, group: int = 16):
+    """Per-(out, group-of-K) symmetric RTN int4. Returns (qint4 u8[out, in/2],
+    wscale bf16[out, in/group]). group=16 pairs with gemm_int4w_g16_*; group=64
+    pairs with the smooth-aware gemm_int4w_bf16a_wmma_t (better SmoothQuant composability)."""
     out, n_in = R_f32.shape
-    assert n_in % 16 == 0
-    Rg = R_f32.view(out, n_in // 16, 16)
+    assert n_in % group == 0, f"n_in={n_in} must be divisible by group={group}"
+    Rg = R_f32.view(out, n_in // group, group)
     scale = Rg.abs().amax(dim=2).clamp(min=1e-8) / 7.0
-    q = torch.round(R_f32 / scale.repeat_interleave(16, dim=1)).clamp(-7, 7).to(torch.int8)
+    q = torch.round(R_f32 / scale.repeat_interleave(group, dim=1)).clamp(-7, 7).to(torch.int8)
     qu = (q.to(torch.int16) & 0xF).to(torch.uint8)
     lo = qu[:, 0::2]; hi = qu[:, 1::2]
     return (lo | (hi << 4)).contiguous(), scale.to(torch.bfloat16).contiguous()
+
+
+# Backward-compat alias (older calls)
+def rtn_g16_pack(R_f32):
+    return rtn_pack(R_f32, group=16)
 
 
 def svd_split(W_bf16: torch.Tensor, rank: int):
@@ -100,8 +108,12 @@ def main():
     ap.add_argument("--calib", default=None, help="Activation amax safetensors from FLUX2_CALIB_DUMP. Enables SmoothQuant lambda.")
     ap.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant alpha (default 0.5)")
     ap.add_argument("--clip", type=float, default=4.0,
-                    help="SmoothQuant lambda clip [1/clip, clip] (default 4.0; mild to keep per-group g16 viable)")
+                    help="SmoothQuant lambda clip [1/clip, clip] (default 4.0; raise to 1e3 for g64 + smooth)")
+    ap.add_argument("--group-size", type=int, default=None, choices=[16, 64],
+                    help="Int4 group size. Default: 64 when --calib (g64+smooth-aware kernel), else 16.")
     a = ap.parse_args()
+    if a.group_size is None:
+        a.group_size = 64 if a.calib else 16
     calib = load_calib(a.calib)
     if a.calib:
         print(f"calib: {len(calib)} amax entries from {a.calib} (alpha={a.alpha})", file=sys.stderr)
@@ -124,6 +136,7 @@ def main():
         W = src.get_tensor(k)
         name = f"{prefix}.{suf}"
         amax = calib.get(name)
+        lam = None
         if amax is not None:
             lam = smooth_lambda(W, amax, a.alpha, a.clip)          # [in] F32
             W_eff = (W.float() * lam.unsqueeze(0)).to(torch.bfloat16)
@@ -133,7 +146,11 @@ def main():
                 print(f"[warn] no calib for {name} -> lam=1", file=sys.stderr)
             W_eff = W
         lu, ld, R = svd_split(W_eff, a.rank)
-        q, s = rtn_g16_pack(R)
+        if lam is not None and a.group_size == 64:
+            # Pre-divide lora_down by smooth so the runtime LoRA branch can use raw X:
+            #   lora_down_eff @ x = (lora_down / lam) @ x = lora_down @ (x/lam) = lora_down @ x_smooth
+            ld = (ld.float() / lam.unsqueeze(0)).to(torch.bfloat16)
+        q, s = rtn_pack(R, group=a.group_size)
         bk = f"{name}.bias"
         out[f"{name}.qint4"]     = q
         out[f"{name}.wscale"]    = s
