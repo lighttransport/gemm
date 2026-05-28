@@ -12,7 +12,7 @@ CUEW = ../cuew.c ../cuew.h
 
 .PHONY: all clean cublas probe w4a4 help
 
-BINS = cublas_fp4_gemm mma_fp4_probe fp4_gemm_test fp4_w4a4_gemm fp4_w4a4_qkv_test fp4_w4a4_opt
+BINS = cublas_fp4_gemm mma_fp4_probe fp4_gemm_test fp4_w4a4_gemm fp4_w4a4_qkv_test fp4_w4a4_opt flux2_fp4_w4a4_test
 
 all: $(BINS)
 
@@ -40,6 +40,11 @@ fp4_w4a4_qkv_test: fp4_w4a4_qkv_test.c $(CUEW)
 # shipped in cuda/qimg) vs cp.async double-buffer; all bit-exact, ~4-6x over naive
 fp4_w4a4_opt: fp4_w4a4_opt.c $(CUEW)
 	$(CC) $(CFLAGS) -o $@ fp4_w4a4_opt.c ../cuew.c $(LDFLAGS)
+
+# Exercise the shared cuda/fp4_w4a4.h API at FLUX.2-Klein shapes, verify the
+# dispatch (quant+gemm+combine) matches a CPU reference bit-for-bit.
+flux2_fp4_w4a4_test: flux2_fp4_w4a4_test.c ../fp4_w4a4.h $(CUEW)
+	$(CC) $(CFLAGS) -o $@ flux2_fp4_w4a4_test.c ../cuew.c $(LDFLAGS)
 
 cublas: cublas_fp4_gemm
 	./cublas_fp4_gemm
