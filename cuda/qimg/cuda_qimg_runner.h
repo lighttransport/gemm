@@ -128,6 +128,15 @@ static const char *qimg_kernel_src =
 "    dst[i] = d_fp8_to_f16_lut[src[i]];\n"
 "}\n"
 "\n"
+/* Bulk dequant kernel: convert [n] FP8 bytes → [n] BF16 values using LUT.
+ * Byte-identical to the CPU qimg_st_upload_bf16 path (same d_fp8_to_bf16_lut). */
+"__global__ void dequant_fp8_to_bf16(const unsigned char *__restrict__ src,\n"
+"    unsigned short *__restrict__ dst, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    dst[i] = d_fp8_to_bf16_lut[src[i]];\n"
+"}\n"
+"\n"
 
 /* Per-head RMSNorm: x[N, dim], w[head_dim], n_heads, head_dim */
 "__global__ void rmsnorm_per_head_f32(float *__restrict__ x,\n"
@@ -445,6 +454,9 @@ static const char *qimg_kernel_src =
  * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
 "__device__ __constant__ float d_fp8_to_f32_lut[256];\n"
 "\n"
+/* NVFP4 E2M1 code -> value LUT (16 entries), for the W4A16 mod GEMV. */
+"__device__ __constant__ float d_e2m1_lut[16];\n"
+"\n"
 "/* FP8 LUT GEMM: dequant weights via constant memory LUT, F32 inputs+accum.\n"
 " * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */\n"
 "__global__ void gemm_fp8w_f32(float *Y, const unsigned char *W, const float *X,\n"
@@ -509,6 +521,36 @@ static const char *qimg_kernel_src =
 "    #pragma unroll\n"
 "    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);\n"
 "    if (lane == 0) Y[row] = acc + (bias ? bias[row] : 0.f);\n"
+"}\n"
+"\n"
+
+/* gemv_fp4w_f32: NVFP4 weight-only (W4A16) n_tok==1 matvec for the adaLN mod
+ * projection. Y[o] = (sum_k E2M1[code(o,k)] * e4m3(WS[o,k/16]) * X[k]) * WCWT[o] + bias[o].
+ * QW: uint32 [n_out, n_in/8] (8 e2m1 codes/uint, low nibble=low k). WS: uint8
+ * [n_out, n_in/16] e4m3 group scales. WCWT: f32 [n_out] per-row scale. One warp
+ * per row; X cached in shared; warp-shuffle reduce. Grid (ceil(n_out/8),1,1),
+ * Block 256 (=8 rows). Shared n_in*4 bytes. Mirrors gemv_fp8w_f32. */
+"__global__ void gemv_fp4w_f32(float *Y, const unsigned int *QW,\n"
+"    const unsigned char *WS, const float *WCWT, const float *X,\n"
+"    const float *bias, int n_out, int n_in) {\n"
+"    extern __shared__ float gx4_smx[];\n"
+"    int tid = threadIdx.x;\n"
+"    for (int i = tid; i < n_in; i += blockDim.x) gx4_smx[i] = X[i];\n"
+"    __syncthreads();\n"
+"    int warp = tid >> 5, lane = tid & 31;\n"
+"    int row = blockIdx.x * (blockDim.x >> 5) + warp;\n"
+"    if (row >= n_out) return;\n"
+"    const unsigned int  *qw = QW + (size_t)row * (n_in >> 3);\n"
+"    const unsigned char *ws = WS + (size_t)row * (n_in >> 4);\n"
+"    float acc = 0.f;\n"
+"    for (int k = lane; k < n_in; k += 32) {\n"
+"        unsigned int packed = qw[k >> 3];\n"
+"        int code = (packed >> ((k & 7) * 4)) & 0xF;\n"
+"        acc += d_e2m1_lut[code] * d_fp8_to_f32_lut[ws[k >> 4]] * gx4_smx[k];\n"
+"    }\n"
+"    #pragma unroll\n"
+"    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);\n"
+"    if (lane == 0) Y[row] = acc * WCWT[row] + (bias ? bias[row] : 0.f);\n"
 "}\n"
 "\n"
 
@@ -1233,7 +1275,13 @@ typedef struct { CUdeviceptr qw, ws, wcwt, pd, pu; } qimg_fp4_lin;
 enum { FP4_TO_Q=0, FP4_TO_K, FP4_TO_V, FP4_TO_OUT,
        FP4_ADD_Q, FP4_ADD_K, FP4_ADD_V, FP4_ADD_OUT,
        FP4_IMG_FC1, FP4_IMG_FC2, FP4_TXT_FC1, FP4_TXT_FC2, FP4_NLIN };
-typedef struct { qimg_fp4_lin lin[FP4_NLIN]; } qimg_fp4_block;
+typedef struct {
+    qimg_fp4_lin lin[FP4_NLIN];
+    /* use_mod_fp4: NVFP4 (W4A16) adaLN mod, resident so all 60 blocks fit (no
+     * streaming). qw/ws/wcwt are the mod matrix [6*dim, dim]; pd/pu unused. */
+    qimg_fp4_lin img_mod, txt_mod;
+    CUdeviceptr img_mod_b, txt_mod_b;   /* f32 [6*dim] biases (resident) */
+} qimg_fp4_block;
 
 typedef enum {
     QIMG_CFG_BUF_IMG_C = 0,
@@ -1288,6 +1336,7 @@ struct cuda_qimg_runner {
     CUfunction gemm_f32_f32;     /* pure F32 GEMM (highest precision) */
     CUfunction gemm_fp8w_f32;   /* FP8 weight (LUT dequant) × F32 input */
     CUfunction gemv_fp8w_f32;   /* FP8 weight matvec (n_tok==1 fast path, e.g. adaLN mod) */
+    CUfunction gemv_fp4w_f32;   /* NVFP4 W4A16 mod matvec (use_mod_fp4) */
     CUfunction gemm_opt_f16;    /* optimized 128×128 tiled F16 GEMM */
     CUfunction gemm_opt_fp8;    /* optimized 128×128 tiled FP8 LUT GEMM */
     CUfunction gemm_fp8_mma;    /* mma.sync m16n8k32 FP8 tensor-core GEMM (sm_89+) */
@@ -1308,6 +1357,7 @@ struct cuda_qimg_runner {
     CUfunction rmsnorm_per_head;
     CUfunction adaln_modulate;
     CUfunction dequant_fp8_to_f16;  /* GPU-side FP8→F16 via LUT */
+    CUfunction dequant_fp8_to_bf16; /* GPU-side FP8→BF16 via LUT (load-time pd/pu cast) */
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
     int use_fp8_mma;   /* 1 to use mma.sync FP8 tensor-core GEMM (env QIMG_FP8_MMA=1) */
     int use_fp8_mma_bf16; /* 1 to prefer BF16-X variant (env QIMG_FP8_MMA_BF16=0 opts out) */
@@ -1399,6 +1449,10 @@ struct cuda_qimg_runner {
     /* DiT config */
     int dit_dim, dit_n_heads, dit_head_dim, dit_n_blocks;
     int dit_in_ch, dit_txt_dim, dit_mlp_h;
+    /* Target image pixels (H*W) for the upcoming generate, set by the caller
+     * BEFORE load so the W4A4 preload reservation can be sized to the actual
+     * resolution (more blocks resident at <=512^2). 0 = unknown -> conservative. */
+    size_t dit_target_pixels;
 
     /* Safetensors context (mmap'd) */
     void *dit_st;
@@ -1493,6 +1547,7 @@ struct cuda_qimg_runner {
 
     /* ---- Stage 2: native W4A4 OMMA FP4 path (guarded by use_w4a4) ---- */
     int use_w4a4;                 /* 1 when DiT checkpoint is the OMMA FP4 layout */
+    int use_mod_fp4;              /* 1 when adaLN mod is NVFP4 (W4A16) resident, not FP8 stream */
     CUmodule fp4_module;          /* separate sm_120a module (block-scale mma) */
     CUfunction k_fp4_quant;       /* fp4_quant_act */
     CUfunction k_w4a4_gemm;       /* w4a4_gemm (naive block-scale mma; fallback) */
@@ -1504,6 +1559,13 @@ struct cuda_qimg_runner {
     int lowrank_bf16;            /* FP4 low-rank: 1 = bf16 cuBLAS GEMM (pd/pu bf16), 0 = fp8 op_gemm */
     CUdeviceptr d_x_bf16, d_la_bf16;  /* bf16-low-rank scratch: X cast, la cast */
     size_t x_bf16_n, la_bf16_n;
+    /* Load-time GPU-side FP8→BF16 cast for pd/pu (QIMG_LOAD_GPU_CAST, default on):
+     * raw fp8 H2D from the pinned mmap into a reused temp, then dequant_fp8_to_bf16
+     * writes the final bf16 buffer. Eliminates the single-threaded CPU conversion +
+     * pageable H2D. d_fp8_cast_tmp is freed at the end of qimg_load_fp4_weights. */
+    int load_gpu_cast;
+    CUdeviceptr d_fp8_cast_tmp;
+    size_t fp8_cast_tmp_n;
     int prof_block_count;
 };
 
@@ -1717,6 +1779,49 @@ static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     return d;
 }
 
+/* Grow the reused FP8→BF16 cast temp device buffer to hold >= nbytes. */
+static int qimg_ensure_fp8_cast_tmp(cuda_qimg_runner *r, size_t nbytes) {
+    if (r->d_fp8_cast_tmp && r->fp8_cast_tmp_n >= nbytes) return 0;
+    if (r->d_fp8_cast_tmp) { cuMemFree(r->d_fp8_cast_tmp); r->d_fp8_cast_tmp = 0; r->fp8_cast_tmp_n = 0; }
+    CUdeviceptr d = checked_cuMemAlloc(nbytes);
+    if (!d) return -1;
+    r->d_fp8_cast_tmp = d; r->fp8_cast_tmp_n = nbytes;
+    return 0;
+}
+
+/* GPU-side FP8→BF16 upload for the FP4 low-rank pd/pu (QIMG_LOAD_GPU_CAST path):
+ * raw fp8 H2D from the pinned mmap into a reused temp, then dequant_fp8_to_bf16
+ * writes the final bf16 device buffer. Byte-identical to qimg_st_upload_bf16 for
+ * FP8 source — same d_fp8_to_bf16_lut, and E4M3 NaN→0.0 so the NaN-only rounding
+ * difference never triggers. Non-FP8 dtypes fall back to the CPU path. All ops on
+ * r->stream; the shared temp is stream-ordered (kernel N reads before H2D N+1). */
+static CUdeviceptr qimg_st_upload_bf16_gpucast(cuda_qimg_runner *r,
+                                               st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return 0;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (strcmp(dtype, "F8_E4M3") != 0 && strcmp(dtype, "F8_E4M3FN") != 0)
+        return qimg_st_upload_bf16(st, name);   /* only FP8 source benefits */
+    size_t n = safetensors_nbytes(st, idx);     /* fp8: 1 byte/elem => n elements */
+    if (qimg_ensure_fp8_cast_tmp(r, n) != 0)
+        return qimg_st_upload_bf16(st, name);   /* temp OOM -> CPU fallback */
+    cuMemcpyHtoDAsync(r->d_fp8_cast_tmp, safetensors_data(st, idx), n, r->stream);
+    CUdeviceptr dst = checked_cuMemAlloc(n * sizeof(uint16_t));
+    if (!dst) return 0;
+    int ni = (int)n;
+    void *args[] = { &r->d_fp8_cast_tmp, &dst, &ni };
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    CUresult rc = cuLaunchKernel(r->dequant_fp8_to_bf16, blocks, 1, 1, 256, 1, 1,
+                                 0, r->stream, args, NULL);
+    if (rc != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg: dequant_fp8_to_bf16 launch failed (%d) for %s\n",
+                (int)rc, name);
+        cuMemFree(dst);
+        return qimg_st_upload_bf16(st, name);
+    }
+    return dst;
+}
+
 /* Async HtoD on r->stream — queues after pending compute kernels, stream
  * ordering serializes scratch-slot writes with prior compute so no explicit
  * cuStreamSynchronize is needed between block loads. */
@@ -1894,6 +1999,7 @@ static int qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b
     /* Upload weight: FP8 raw for native GEMM, F16 for MMA, or F32 fallback */
     #define BLK_W(field, suffix) do { if (ok) { \
         if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident, not here */ \
+        if (r->use_mod_fp4 && strstr(suffix, "mod")) break; /* mod-FP4: mod resident in fp4_blocks */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_int8) { \
             b->field = qimg_st_upload_int8_fat(st, name, r->use_int8_smooth); \
@@ -2153,6 +2259,7 @@ static int qimg_load_block_into_slot_ex(cuda_qimg_runner *r, int block_idx,
     int ok = 1;
 #define UPLOAD_FP8(field, suffix, _bytes) do { if (ok) { \
         if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident */ \
+        if (r->use_mod_fp4 && strstr(suffix, "mod")) break; /* mod-FP4: mod resident in fp4_blocks */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_int8) { \
             if (qimg_upload_int8_fat_async_r(r, st, name, b->field, s) != 0) ok = 0; \
@@ -2247,6 +2354,12 @@ static int qimg_stage_block_pinned(cuda_qimg_runner *r, int block_idx) {
     int idxs[64]; size_t sizes[64], offs[64];
     int n = 0;
     for (int i = 0; suffixes[i]; i++) {
+        /* W4A4: the attn/mlp weight matrices live resident in fp4_blocks[]; the
+         * slot path streams only the mod matrices (+ F32 norms/biases). Staging
+         * the resident weights wasted ~3x the pinned RAM and memcpy (and they are
+         * never uploaded), so skip them. Mirrors the UPLOAD_FP8 W4A4 guard. */
+        if (r->use_w4a4 && strstr(suffixes[i], ".weight")
+            && !strstr(suffixes[i], "mod") && !strstr(suffixes[i], "norm")) continue;
         snprintf(name, sizeof(name), "transformer_blocks.%d.%s", block_idx, suffixes[i]);
         int idx = safetensors_find(st, name);
         if (idx < 0) continue;
@@ -3466,6 +3579,25 @@ static void op_gemm_fp4(cuda_qimg_runner *r, CUdeviceptr Y, qimg_fp4_lin *w,
     cuLaunchKernel(r->k_w4a4_combine,(unsigned)((tot+255)/256),1,1,256,1,1,0,r->stream,ca,NULL);
 }
 
+/* adaLN mod matvec (n_tok==1): Y[6*dim] = mod_w @ silu(t_embed) + bias.
+ * use_mod_fp4 -> resident NVFP4 W4A16 via gemv_fp4w_f32 (block L, is_img picks
+ * img_mod/txt_mod). Otherwise the dense FP8/F16 op_gemm on the streamed block
+ * weight (blk_w/blk_b). Runs on r->stream like op_gemm. */
+static void op_mod_matvec(cuda_qimg_runner *r, CUdeviceptr Y, int L, int is_img,
+                          CUdeviceptr blk_w, CUdeviceptr blk_b, CUdeviceptr X, int dim) {
+    if (r->use_mod_fp4) {
+        qimg_fp4_lin *m = is_img ? &r->fp4_blocks[L].img_mod : &r->fp4_blocks[L].txt_mod;
+        CUdeviceptr bias = is_img ? r->fp4_blocks[L].img_mod_b : r->fp4_blocks[L].txt_mod_b;
+        int n_out = 6 * dim, n_in = dim;
+        unsigned gx = (unsigned)((n_out + 7) / 8);
+        void *a[] = { &Y, &m->qw, &m->ws, &m->wcwt, &X, &bias, &n_out, &n_in };
+        cuLaunchKernel(r->gemv_fp4w_f32, gx, 1, 1, 256, 1, 1,
+                       (unsigned)n_in * sizeof(float), r->stream, a, NULL);
+    } else {
+        op_gemm(r, Y, blk_w, X, blk_b, 6 * dim, dim, 1);
+    }
+}
+
 /* Load all blocks' FP4 W4A4 weights resident (qweight/wscales/wcwt/proj_down/proj_up).
  * ~8 GB for 60 blocks. mod/norms/biases continue to stream via the dense path. */
 static const char *qimg_fp4_bases[FP4_NLIN] = {
@@ -3490,13 +3622,41 @@ static int qimg_load_fp4_weights(cuda_qimg_runner *r) {
              * cuBLAS GEMM path) or raw fp8 (for the legacy fp8 op_gemm path). */
 #define QF_LDPROJ(field, suf) do { \
             snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.%s", b, qimg_fp4_bases[i], suf); \
-            L->field = r->lowrank_bf16 ? qimg_st_upload_bf16(st, nm) : qimg_st_upload_fp8_raw(st, nm); \
+            L->field = r->lowrank_bf16 \
+                ? (r->load_gpu_cast ? qimg_st_upload_bf16_gpucast(r, st, nm) \
+                                    : qimg_st_upload_bf16(st, nm)) \
+                : qimg_st_upload_fp8_raw(st, nm); \
             if (!L->field) return -1; } while(0)
             QF_LDPROJ(pd, "proj_down_fp8"); QF_LDPROJ(pu, "proj_up_fp8");
 #undef QF_LDPROJ
             snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wcwt", b, qimg_fp4_bases[i]);
             L->wcwt = qimg_st_upload_f32(st, nm); if (!L->wcwt) return -1;
         }
+        /* mod-FP4 (W4A16): load img_mod/txt_mod as resident NVFP4 (qw/ws/wcwt) +
+         * f32 bias, so the adaLN mod no longer streams. */
+        if (r->use_mod_fp4) {
+            struct { qimg_fp4_lin *L; CUdeviceptr *bias; const char *base; } mods[2] = {
+                { &r->fp4_blocks[b].img_mod, &r->fp4_blocks[b].img_mod_b, "img_mod.1" },
+                { &r->fp4_blocks[b].txt_mod, &r->fp4_blocks[b].txt_mod_b, "txt_mod.1" } };
+            for (int m = 0; m < 2; m++) {
+                qimg_fp4_lin *L = mods[m].L;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.qweight_fp4", b, mods[m].base);
+                L->qw = qimg_st_upload_fp8_raw(st, nm); if (!L->qw) return -1;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wscales_fp4", b, mods[m].base);
+                L->ws = qimg_st_upload_fp8_raw(st, nm); if (!L->ws) return -1;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wcwt", b, mods[m].base);
+                L->wcwt = qimg_st_upload_f32(st, nm); if (!L->wcwt) return -1;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.bias", b, mods[m].base);
+                *mods[m].bias = qimg_st_upload_f32(st, nm); if (!*mods[m].bias) return -1;
+            }
+        }
+    }
+    /* GPU-cast path queued async work on r->stream and shares one temp buffer;
+     * sync once here (instead of per-tensor) so the H2D + casts overlap, then
+     * release the temp (only needed during load). */
+    if (r->load_gpu_cast) {
+        cuStreamSynchronize(r->stream);
+        if (r->d_fp8_cast_tmp) { cuMemFree(r->d_fp8_cast_tmp); r->d_fp8_cast_tmp = 0; r->fp8_cast_tmp_n = 0; }
     }
     if (r->verbose) fprintf(stderr, "cuda_qimg: loaded FP4 W4A4 weights for %d blocks (resident)\n", nb);
     return 0;
@@ -3789,6 +3949,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gemm_f32_f32, "gemm_f32_f32");
     GET(gemm_fp8w_f32, "gemm_fp8w_f32");
     GET(gemv_fp8w_f32, "gemv_fp8w_f32");
+    GET(gemv_fp4w_f32, "gemv_fp4w_f32");
     GET(gemm_opt_f16, "gemm_opt_f16");
     GET(gemm_opt_fp8, "gemm_opt_fp8");
     if (cuModuleGetFunction(&r->gemm_fp8_mma, module, "gemm_fp8_scaled_f32") != CUDA_SUCCESS)
@@ -4064,6 +4225,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(truncate_bf16, "truncate_bf16_f32");
     GET(quantize_fp8_rt, "quantize_fp8_roundtrip_f32");
     GET(dequant_fp8_to_f16, "dequant_fp8_to_f16");
+    GET(dequant_fp8_to_bf16, "dequant_fp8_to_bf16");
     #undef GET
 
     /* Upload FP8→F16 LUT to GPU constant memory */
@@ -4090,6 +4252,15 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
             if (verbose)
                 fprintf(stderr, "cuda_qimg: FP8→F32 LUT uploaded\n");
         }
+        /* NVFP4 E2M1 code->value LUT (for gemv_fp4w_f32 / use_mod_fp4). Matches the
+         * E2M1 table in nunchaku_fp4_repack_omma.py. */
+        static const float e2m1_vals[16] = {
+            0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+           -0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f };
+        CUdeviceptr d_e2m1; size_t e2m1_sz;
+        if (cuModuleGetGlobal(&d_e2m1, &e2m1_sz, module, "d_e2m1_lut") == CUDA_SUCCESS
+            && e2m1_sz == 16 * sizeof(float))
+            cuMemcpyHtoD(d_e2m1, e2m1_vals, 16 * sizeof(float));
     }
 
     /* Upload FP8→BF16 LUT to GPU constant memory (for gemm_bf16_pipe_f32) */
@@ -4228,6 +4399,30 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
                 r->lowrank_bf16 = 0;
             }
         }
+        /* Load-time GPU-side FP8→BF16 cast of pd/pu (default on; QIMG_LOAD_GPU_CAST=0
+         * forces the legacy single-threaded CPU conversion). Only active for the bf16
+         * low-rank path and when the cast kernel resolved. Byte-identical output. */
+        {
+            const char *gc = getenv("QIMG_LOAD_GPU_CAST");
+            r->load_gpu_cast = (!gc || atoi(gc) != 0) && r->lowrank_bf16 && r->dequant_fp8_to_bf16;
+            if (r->load_gpu_cast && r->verbose)
+                fprintf(stderr, "cuda_qimg: pd/pu FP8->BF16 cast on GPU (QIMG_LOAD_GPU_CAST)\n");
+        }
+        /* mod-FP4 (W4A16): if the checkpoint stores the adaLN mod as NVFP4
+         * (img_mod.1.qweight_fp4) keep all 60 blocks resident — no dense-mod
+         * streaming. Needs the gemv_fp4w_f32 kernel. Lossy vs FP8 mod (no
+         * SVDQuant low-rank correction); QIMG_MOD_FP4=0 disables (only useful on a
+         * checkpoint that ALSO has the FP8 mod weight; the modfp4 file has only FP4). */
+        if (safetensors_find(st, "transformer_blocks.0.img_mod.1.qweight_fp4") >= 0) {
+            const char *me = getenv("QIMG_MOD_FP4");
+            int want = (!me || atoi(me) != 0);
+            if (want && r->gemv_fp4w_f32) {
+                r->use_mod_fp4 = 1;
+                fprintf(stderr, "cuda_qimg: adaLN mod = NVFP4 W4A16 resident (all blocks)\n");
+            } else if (want && !r->gemv_fp4w_f32) {
+                fprintf(stderr, "cuda_qimg: mod-FP4 checkpoint but gemv_fp4w_f32 missing — FP8 mod path will fail\n");
+            }
+        }
         if (qimg_load_fp4_weights(r) != 0) {
             fprintf(stderr, "cuda_qimg: FP4 resident weight load failed (OOM?)\n"); return -1;
         }
@@ -4261,6 +4456,7 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         size_t free_mem = 0, total_mem = 0;
         size_t block_bytes;
         if (r->use_int8) block_bytes = 344ULL * 1024 * 1024; /* INT8: 1 byte + per-channel f32 scale */
+        else if (r->use_mod_fp4) block_bytes = 2ULL * 1024 * 1024; /* mod resident in fp4_blocks; dense block = norms+biases only (~0.25 MB) -> preload all 60 */
         else if (r->use_w4a4) block_bytes = 130ULL * 1024 * 1024;   /* W4A4: dense block = mod+norms+biases only */
         else if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
@@ -4268,19 +4464,23 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
 
         /* Reserve the on-demand scratch slot(s) up front. Each slot is one
          * "block worth" of FP8 weights plus tiny F32 biases, so reserving =
-         * pre-allocating now gives a tighter and more accurate fit. */
-        if (qimg_alloc_scratch_block(r) == 0) {
-            if (r->verbose)
-                fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
-        } else {
-            fprintf(stderr, "cuda_qimg: scratch slot alloc failed\n");
-        }
-        if (qimg_want_pipeline(r)) {
-            if (qimg_alloc_scratch_block_b(r) == 0) {
+         * pre-allocating now gives a tighter and more accurate fit.
+         * mod-FP4: the dense block is just norms/biases (~0.25 MB) and all 60
+         * preload, so there is no streaming — skip the (mod-sized) slots. */
+        if (!r->use_mod_fp4) {
+            if (qimg_alloc_scratch_block(r) == 0) {
                 if (r->verbose)
-                    fprintf(stderr, "cuda_qimg: 2nd scratch slot allocated (double-buffer H2D)\n");
+                    fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
             } else {
-                fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed — single-slot streaming\n");
+                fprintf(stderr, "cuda_qimg: scratch slot alloc failed\n");
+            }
+            if (qimg_want_pipeline(r)) {
+                if (qimg_alloc_scratch_block_b(r) == 0) {
+                    if (r->verbose)
+                        fprintf(stderr, "cuda_qimg: 2nd scratch slot allocated (double-buffer H2D)\n");
+                } else {
+                    fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed — single-slot streaming\n");
+                }
             }
         }
 
@@ -4292,13 +4492,30 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         size_t act_mb = 250;
         /* W4A4 needs much more headroom: op_gemm_fp4 scratch (Ac/As/D/la/lo) +
          * the low-rank op_gemm scratch are allocated lazily during step 1 (after
-         * preload), on top of the activation working set and CFG double-buffers. */
-        if (r->use_w4a4) act_mb = 3072;
+         * preload), on top of the activation working set and CFG double-buffers.
+         * The working set scales with image tokens (= pixels/256). When the caller
+         * told us the target resolution (dit_target_pixels) reserve resolution-
+         * aware: ~1.1 GB @256², ~1.5 GB @512², ~3.0 GB @1024² — this lets <=512²
+         * preload ~30/60 blocks instead of 13, cutting streamed blocks (and thus
+         * bounce-staging) without risking a high-res OOM. Unknown -> conservative
+         * 3 GB. The eviction backstop (qimg_evict_preloaded_until_free) recovers
+         * from any under-estimate. Output is byte-identical either way. */
+        if (r->use_w4a4) {
+            act_mb = 3072;  /* safe default when target resolution is unknown */
+            if (r->dit_target_pixels > 0)
+                act_mb = 1024 + r->dit_target_pixels / 512;  /* 1024 + tokens/2 */
+        }
         const char *ws_env = getenv("QIMG_WORKSPACE_MB");
         if (ws_env) act_mb = (size_t)atoi(ws_env);
         size_t workspace = act_mb * 1024 * 1024;
         int max_preload = (free_mem > workspace)
             ? (int)((free_mem - workspace) / block_bytes) : 0;
+        /* mod-FP4: the mod weights are resident in fp4_blocks[], so the dense
+         * gpu_blocks[] are just norms+biases (~0.25 MB each, ~15 MB for all 60).
+         * There is no streaming path (no scratch slot), so ALL 60 must be resident
+         * regardless of the activation reservation — they cost almost nothing and
+         * the step allocates its workspace from the remaining free memory. */
+        if (r->use_mod_fp4) max_preload = r->dit_n_blocks;
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
         const char *_mp_env = getenv("QIMG_MAX_PRELOAD");
         if (_mp_env) {
@@ -4939,14 +5156,14 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
 
         qimg_block_gpu blk;
         int slot_used = -1;  /* which double-buffer slot (0/1) this block consumed */
-        /* Use img_mod_w (not attn_q_w) to detect a preloaded block: under W4A4
-         * the dense attn/mlp weights live in fp4_blocks[] so gpu_blocks[L].attn_q_w
-         * is NULL even when the block IS preloaded — only the streamed mod/bias
-         * tensors land in gpu_blocks[L]. img_mod_w is populated in both the FP8
-         * and W4A4 preload paths. (The old attn_q_w check made every W4A4 block
-         * miss preload: they re-streamed in the single-slot path, and in the
-         * pipeline path fell through to slot_used=(L-n_preloaded)%2 < 0 → OOB.) */
-        if (L < r->n_preloaded && r->gpu_blocks[L].img_mod_w) {
+        /* Use attn_q_b (the to_q F32 bias) to detect a preloaded block — it is
+         * loaded via BLK_F32 in EVERY path (FP8 / W4A4 / mod-FP4), unlike
+         * attn_q_w (NULL under W4A4: weights resident in fp4_blocks[]) or
+         * img_mod_w (NULL under mod-FP4: the mod is resident in fp4_blocks[]).
+         * (The old attn_q_w check made every W4A4 block miss preload: they
+         * re-streamed in the single-slot path, and in the pipeline path fell
+         * through to slot_used=(L-n_preloaded)%2 < 0 → OOB.) */
+        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_b) {
             blk = r->gpu_blocks[L];
         } else if (use_pipeline) {
             int od = L - r->n_preloaded;
@@ -4965,8 +5182,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         /* Modulation + shared block forward */
         cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
-        op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
-        op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        op_mod_matvec(r, d_img_mod, L, 1, blk.img_mod_w, blk.img_mod_b, d_t_silu, dim);
+        op_mod_matvec(r, d_txt_mod, L, 0, blk.txt_mod_w, blk.txt_mod_b, d_t_silu, dim);
         qimg_fwd_state_t _st;
         _st.d_img = d_img; _st.d_txt = d_txt;
         _st.d_q = d_q; _st.d_k = d_k; _st.d_v = d_v; _st.d_attn_out = d_attn_out;
@@ -5093,9 +5310,11 @@ static int qimg_evict_preloaded_until_free(cuda_qimg_runner *r,
      * remain resident; high-index ones use the on-demand scratch slot). */
     while (r->n_preloaded > 0 && free_mem < want) {
         int idx = r->n_preloaded - 1;
-        if (r->gpu_blocks[idx].attn_q_w) {
-            qimg_free_block(&r->gpu_blocks[idx]);
-        }
+        /* qimg_free_block frees whatever the block holds — attn_q_w etc. under
+         * FP8/F16, or img_mod_w/txt_mod_w under W4A4 (where attn_q_w is NULL).
+         * The old `if (attn_q_w)` guard skipped W4A4 blocks, so eviction freed
+         * ZERO bytes and looped to n_preloaded=0 without recovering memory. */
+        qimg_free_block(&r->gpu_blocks[idx]);
         r->n_preloaded--;
         evicted++;
         cuMemGetInfo(&free_mem, &total_mem);
@@ -5389,10 +5608,9 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
         qimg_block_gpu blk;
         int slot_used = -1;
-        /* img_mod_w (not attn_q_w): under W4A4 the dense attn/mlp weights are in
-         * fp4_blocks[], so attn_q_w is NULL even for preloaded blocks. See the
-         * matching note in cuda_qimg_dit_step. */
-        if (L < r->n_preloaded && r->gpu_blocks[L].img_mod_w) {
+        /* attn_q_b (to_q F32 bias) is loaded in every path; attn_q_w is NULL under
+         * W4A4 and img_mod_w is NULL under mod-FP4. See cuda_qimg_dit_step. */
+        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_b) {
             blk = r->gpu_blocks[L];
         } else if (use_pipeline) {
             int od = L - r->n_preloaded;
@@ -5409,8 +5627,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         /* Modulation (shared between cond/uncond) — always on r->stream */
         cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
-        op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
-        op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        op_mod_matvec(r, d_img_mod, L, 1, blk.img_mod_w, blk.img_mod_b, d_t_silu, dim);
+        op_mod_matvec(r, d_txt_mod, L, 0, blk.txt_mod_w, blk.txt_mod_b, d_t_silu, dim);
 
         /* --- Cond pass (on r->stream). Skips img MLP; adaLN2 output goes
          * into the first half of d_img_mlp_in for the batched MLP below. --- */
