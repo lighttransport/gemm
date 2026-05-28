@@ -36,6 +36,8 @@
 #include "server_sam3.h"
 #endif
 
+#include "server_llm.h"
+
 #include "../common/qwen_image_text_encoder.h"
 #include "../common/qwen_image_dit.h"
 #include "../common/qwen_image_vae.h"
@@ -67,7 +69,8 @@
 typedef struct {
     char *name;
     char *model_dir;
-    char *dit;
+    char *dit;        /* fp8/bf16 DiT (diffusion_models/) — loaded via hip_qimg_load_dit       */
+    char *dit_int4;   /* logical-int4 Nunchaku DiT (diffusion_models_int4/) — hip_qimg_load_dit_int4; NULL if absent */
     char *vae;
     char *enc;
     char *bias;
@@ -91,6 +94,10 @@ typedef struct {
     const char *sam3_merges;
     const char *sam3_ref_url;     /* http://host:port forwarded via /v1/ref/sam3   */
     const char *sam3_1_ref_url;   /* http://host:port forwarded via /v1/ref/sam3.1 */
+    const char *qwen_ref_url;     /* http://host:port pytorch/comfyui fp8 reference bridge (backend=pytorch) */
+    const char *llm_model;
+    const char *llm_mmproj;
+    llm_state g_llm;
     int device;
     int mcp_stdio;
     int stdio_mode;
@@ -115,12 +122,93 @@ typedef struct {
     int height;
 } image_result;
 
+/* Per-phase execution trace for a qwen-image run — lets a REST client confirm
+ * each stage actually ran on the GPU (device label + wall time + work counts).
+ * device strings: "hip" | "cuda" | "cpu". */
+typedef struct {
+    int    valid;
+    char   gpu_name[128];     /* HIP device marketing name, empty if init failed */
+    char   enc_device[8];     /* text encoder: hip/cuda/cpu (from qimg_text_enc use_gpu) */
+    double enc_ms;
+    int    n_txt;
+    char   dit_device[8];     /* DiT denoising loop */
+    double dit_load_ms;
+    double dit_ms;
+    int    dit_steps;
+    char   vae_device[8];     /* VAE decode */
+    double vae_load_ms;
+    double vae_ms;
+    double total_ms;
+} qwen_run_debug;
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
 static pthread_mutex_t g_infer_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int sig) {
     (void)sig;
     g_stop = 1;
+}
+
+/* ---- Live progress for the single in-flight inference job ----
+ * One inference runs at a time (g_infer_mu). Connection threads serving
+ * GET /v1/progress read this snapshot so the web UI can show the current
+ * phase + DiT step count while a job runs. */
+typedef struct {
+    pthread_mutex_t mu;
+    int      active;        /* 1 while a job is running */
+    uint64_t job_id;        /* bumped at each job start */
+    char     model[24];
+    char     precision[8];
+    char     phase[24];     /* idle|starting|encode|dit_load|dit|vae_load|vae|done */
+    int      dit_step;
+    int      dit_total;
+    char     gpu[128];
+    double   started_ms;
+} progress_state;
+
+static progress_state g_prog = {
+    PTHREAD_MUTEX_INITIALIZER, 0, 0, "", "", "idle", 0, 0, "", 0.0
+};
+
+static void progress_begin(const char *model, const char *precision) {
+    pthread_mutex_lock(&g_prog.mu);
+    g_prog.active = 1;
+    g_prog.job_id++;
+    snprintf(g_prog.model, sizeof(g_prog.model), "%s", model ? model : "");
+    snprintf(g_prog.precision, sizeof(g_prog.precision), "%s", precision ? precision : "");
+    snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", "starting");
+    g_prog.dit_step = 0; g_prog.dit_total = 0;
+    g_prog.gpu[0] = 0;
+    g_prog.started_ms = now_ms();
+    pthread_mutex_unlock(&g_prog.mu);
+}
+static void progress_phase(const char *phase) {
+    pthread_mutex_lock(&g_prog.mu);
+    snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", phase ? phase : "");
+    pthread_mutex_unlock(&g_prog.mu);
+}
+static void progress_gpu(const char *gpu) {
+    pthread_mutex_lock(&g_prog.mu);
+    snprintf(g_prog.gpu, sizeof(g_prog.gpu), "%s", gpu ? gpu : "");
+    pthread_mutex_unlock(&g_prog.mu);
+}
+static void progress_dit(int step, int total) {
+    pthread_mutex_lock(&g_prog.mu);
+    snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", "dit");
+    g_prog.dit_step = step; g_prog.dit_total = total;
+    pthread_mutex_unlock(&g_prog.mu);
+}
+static void progress_end(void) {
+    pthread_mutex_lock(&g_prog.mu);
+    g_prog.active = 0;
+    snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", "done");
+    pthread_mutex_unlock(&g_prog.mu);
 }
 
 static void sbuf_init(sbuf *b) {
@@ -257,7 +345,16 @@ static int variant_detect_paths(qwen_variant *v) {
         "text_encoder/*.safetensors",
         "text_encoder/*.gguf",
     };
+    /* Logical-int4 (Nunchaku/SVDQuant W4A16) DiT — kept in its own subdir so the
+     * fp8/bf16 dit glob above never picks it up. Optional: a variant without it
+     * simply advertises fp8 only. See tools/nunchaku_convert_logical.py. */
+    static const char *dit_int4_pats[] = {
+        "diffusion_models_int4/*.safetensors",
+        "diffusion-models-int4/*.safetensors",
+        "diffusion_models/int4/*.safetensors",
+    };
     v->dit = variant_first_glob(v->model_dir, dit_pats, (int)(sizeof(dit_pats)/sizeof(*dit_pats)));
+    v->dit_int4 = variant_first_glob(v->model_dir, dit_int4_pats, (int)(sizeof(dit_int4_pats)/sizeof(*dit_int4_pats)));
     v->vae = variant_first_glob(v->model_dir, vae_pats, (int)(sizeof(vae_pats)/sizeof(*vae_pats)));
     v->enc = variant_first_glob(v->model_dir, enc_pats, (int)(sizeof(enc_pats)/sizeof(*enc_pats)));
     /* Skip multimodal projector if a real encoder sits alongside. */
@@ -280,7 +377,7 @@ static int variant_detect_paths(qwen_variant *v) {
 }
 
 static void variant_free(qwen_variant *v) {
-    free(v->name); free(v->model_dir); free(v->dit); free(v->vae);
+    free(v->name); free(v->model_dir); free(v->dit); free(v->dit_int4); free(v->vae);
     free(v->enc); free(v->bias); free(v->kind);
     memset(v, 0, sizeof(*v));
 }
@@ -305,9 +402,17 @@ static int qwen_variants_parse(server_config *cfg, const char *spec) {
             fprintf(stderr, "[qwen-variants] bad entry '%s' (want name:dir)\n", tok);
             continue;
         }
+        /* Entry syntax: name:dir  or  name:dir:int4_path
+         * The optional 3rd field is an explicit logical-int4 DiT file (overrides
+         * the diffusion_models_int4/ auto-detection — handy when the converted
+         * file lives elsewhere, e.g. nunchaku/, or has an ambiguous name). */
         *colon = '\0';
+        char *rest = colon + 1;
+        char *explicit_int4 = NULL;
+        char *colon2 = strchr(rest, ':');
+        if (colon2) { *colon2 = '\0'; explicit_int4 = colon2 + 1; }
         arr[k].name = xstrdup(tok);
-        arr[k].model_dir = xstrdup(colon + 1);
+        arr[k].model_dir = xstrdup(rest);
         if (variant_detect_paths(&arr[k]) != 0) {
             fprintf(stderr, "[qwen-variants] '%s' at %s: missing dit/vae/enc (dit=%s vae=%s enc=%s)\n",
                     arr[k].name, arr[k].model_dir,
@@ -317,8 +422,18 @@ static int qwen_variants_parse(server_config *cfg, const char *spec) {
             variant_free(&arr[k]);
             continue;
         }
-        fprintf(stderr, "[qwen-variants] %s (%s): dit=%s\n",
-                arr[k].name, arr[k].kind, arr[k].dit);
+        if (explicit_int4 && *explicit_int4) {
+            if (access(explicit_int4, R_OK) == 0) {
+                free(arr[k].dit_int4);
+                arr[k].dit_int4 = xstrdup(explicit_int4);
+            } else {
+                fprintf(stderr, "[qwen-variants] '%s': explicit int4 path not readable, ignoring: %s\n",
+                        arr[k].name, explicit_int4);
+            }
+        }
+        fprintf(stderr, "[qwen-variants] %s (%s): dit=%s int4=%s\n",
+                arr[k].name, arr[k].kind, arr[k].dit,
+                arr[k].dit_int4 ? arr[k].dit_int4 : "(none)");
         k++;
     }
     free(dup);
@@ -630,36 +745,74 @@ static int qwen_cpu_generate(const char *dit_path, const char *vae_path,
 #endif
 }
 
-static int qwen_hip_generate(const char *dit_path, const char *vae_path,
+static int qwen_hip_generate(const char *dit_path, const char *dit_int4_path,
+                             const char *vae_path,
                              const char *enc_path, const char *prompt,
                              int out_h, int out_w, int n_steps,
-                             uint64_t seed, int device,
-                             image_result *result, char *err, size_t err_cap) {
+                             uint64_t seed, int device, int use_int4,
+                             image_result *result, qwen_run_debug *dbg,
+                             char *err, size_t err_cap) {
 #if defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE) && defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
-    if (!dit_path || !vae_path || !enc_path) {
-        snprintf(err, err_cap, "qwen-image hip requires dit, vae, and text_encoder paths");
+    if (!vae_path || !enc_path) {
+        snprintf(err, err_cap, "qwen-image hip requires vae and text_encoder paths");
         return -1;
     }
+    /* The int4 (Nunchaku W4A16) path uses its own logical checkpoint + loader;
+     * fp8/bf16 uses the regular DiT (FP8xFP8 GEMM is default-on internally). */
+    const char *load_dit = use_int4 ? dit_int4_path : dit_path;
+    if (!load_dit || !load_dit[0]) {
+        snprintf(err, err_cap, use_int4
+            ? "qwen-image int4 precision requested but no logical-int4 DiT is available for this variant"
+            : "qwen-image hip requires a dit path");
+        return -1;
+    }
+    if (dbg) { memset(dbg, 0, sizeof(*dbg)); dbg->valid = 1; }
+    double t_run0 = now_ms();
     hip_qimg_runner *r = hip_qimg_init(device, 1);
     if (!r) { snprintf(err, err_cap, "failed to initialize HIP runner"); return -1; }
+    { char gpu_name[128] = {0};
+      hip_qimg_device_name(r, gpu_name, sizeof(gpu_name));
+      progress_gpu(gpu_name);
+      if (dbg) snprintf(dbg->gpu_name, sizeof(dbg->gpu_name), "%s", gpu_name); }
 
     int n_txt = 0;
+    progress_phase("encode");
+    double t_enc0 = now_ms();
     qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, NULL, device);
     float *txt_tokens = NULL;
+    const char *enc_dev = "cpu";
     if (enc) {
+        /* use_gpu: 0=cpu transformer, 1=cuda runner, 2=hip runner */
+        enc_dev = (enc->use_gpu == 2) ? "hip" : (enc->use_gpu == 1) ? "cuda" : "cpu";
         txt_tokens = qimg_text_enc_encode(enc, prompt ? prompt : "", &n_txt);
         qimg_text_enc_free(enc);
     }
+    double enc_ms = now_ms() - t_enc0;
+    if (dbg) {
+        snprintf(dbg->enc_device, sizeof(dbg->enc_device), "%s", enc_dev);
+        dbg->enc_ms = enc_ms;
+        dbg->n_txt = n_txt;
+    }
+    fprintf(stderr, "[qwen-hip] text-encode: device=%s tokens=%d %.1f ms\n", enc_dev, n_txt, enc_ms);
     if (!txt_tokens) {
         hip_qimg_free(r);
         snprintf(err, err_cap, "failed to encode prompt with HIP text encoder");
         return -1;
     }
 
-    if (hip_qimg_load_dit(r, dit_path) != 0) {
+    progress_phase("dit_load");
+    double t_ditload0 = now_ms();
+    int lrc = use_int4 ? hip_qimg_load_dit_int4(r, load_dit)
+                       : hip_qimg_load_dit(r, load_dit);
+    double ditload_ms = now_ms() - t_ditload0;
+    if (dbg) dbg->dit_load_ms = ditload_ms;
+    fprintf(stderr, "[qwen-hip] dit-load (%s): %.1f ms (%s)\n",
+            use_int4 ? "int4" : "fp8", ditload_ms, load_dit);
+    if (lrc != 0) {
         free(txt_tokens);
         hip_qimg_free(r);
-        snprintf(err, err_cap, "failed to load HIP DiT: %s", dit_path);
+        snprintf(err, err_cap, "failed to load HIP %s DiT: %s",
+                 use_int4 ? "int4" : "fp8", load_dit);
         return -1;
     }
 
@@ -689,25 +842,46 @@ static int qwen_hip_generate(const char *dit_path, const char *vae_path,
     qimg_scheduler sched;
     qimg_sched_init(&sched);
     qimg_sched_set_timesteps(&sched, n_steps, n_img + n_txt);
+    double t_dit0 = now_ms();
     for (int step = 0; step < n_steps; step++) {
         float t = sched.sigmas[step] * 1000.0f;
         float dt = sched.dt[step];
+        progress_dit(step + 1, n_steps);
+        double t_step0 = now_ms();
         if (hip_qimg_dit_step(r, img_tokens, n_img, txt_tokens, n_txt, t, vel) != 0) {
             free(latent); free(img_tokens); free(vel); free(txt_tokens); hip_qimg_free(r);
             snprintf(err, err_cap, "HIP DiT step failed at step %d", step + 1);
             return -1;
         }
         for (int i = 0; i < n_img * in_ch; i++) img_tokens[i] += dt * vel[i];
+        fprintf(stderr, "[qwen-hip] dit-step %d/%d (hip): %.1f ms\n",
+                step + 1, n_steps, now_ms() - t_step0);
     }
+    double dit_ms = now_ms() - t_dit0;
+    if (dbg) {
+        snprintf(dbg->dit_device, sizeof(dbg->dit_device), "%s", "hip");
+        dbg->dit_ms = dit_ms;
+        dbg->dit_steps = n_steps;
+    }
+    fprintf(stderr, "[qwen-hip] dit-total (hip): %d steps, %.1f ms (%.1f ms/step)\n",
+            n_steps, dit_ms, n_steps > 0 ? dit_ms / n_steps : 0.0);
 
     qimg_dit_unpatchify(latent, img_tokens, n_img, lat_ch, lat_h, lat_w, ps);
     qimg_dit_unnormalize_latent(latent, lat_ch, lat_h, lat_w);
 
+    /* Reclaim DiT VRAM before VAE — int4 keeps 14 GB resident, leaving too
+     * little for the decoder on a 16 GB card. Denoise is done; DiT not needed. */
+    hip_qimg_unload_dit(r);
+
+    progress_phase("vae_load");
+    double t_vaeload0 = now_ms();
     if (hip_qimg_load_vae(r, vae_path) != 0) {
         free(latent); free(img_tokens); free(vel); free(txt_tokens); hip_qimg_free(r);
         snprintf(err, err_cap, "failed to load HIP VAE: %s", vae_path);
         return -1;
     }
+    double vaeload_ms = now_ms() - t_vaeload0;
+    if (dbg) dbg->vae_load_ms = vaeload_ms;
 
     float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
     if (!rgb) {
@@ -715,11 +889,20 @@ static int qwen_hip_generate(const char *dit_path, const char *vae_path,
         snprintf(err, err_cap, "out of memory allocating RGB");
         return -1;
     }
+    progress_phase("vae");
+    double t_vae0 = now_ms();
     if (hip_qimg_vae_decode(r, latent, lat_h, lat_w, rgb) != 0) {
         free(rgb); free(latent); free(img_tokens); free(vel); free(txt_tokens); hip_qimg_free(r);
         snprintf(err, err_cap, "HIP VAE decode failed");
         return -1;
     }
+    double vae_ms = now_ms() - t_vae0;
+    if (dbg) {
+        snprintf(dbg->vae_device, sizeof(dbg->vae_device), "%s", "hip");
+        dbg->vae_ms = vae_ms;
+        dbg->total_ms = now_ms() - t_run0;
+    }
+    fprintf(stderr, "[qwen-hip] vae-decode (hip): load %.1f ms, decode %.1f ms\n", vaeload_ms, vae_ms);
 
     int rc = png_from_chw_float(rgb, out_h, out_w, result, err, err_cap);
     free(rgb);
@@ -730,8 +913,9 @@ static int qwen_hip_generate(const char *dit_path, const char *vae_path,
     hip_qimg_free(r);
     return rc;
 #else
-    (void)dit_path; (void)vae_path; (void)enc_path; (void)prompt; (void)out_h; (void)out_w;
-    (void)n_steps; (void)seed; (void)device; (void)result;
+    (void)dit_path; (void)dit_int4_path; (void)vae_path; (void)enc_path; (void)prompt;
+    (void)out_h; (void)out_w; (void)n_steps; (void)seed; (void)device; (void)use_int4;
+    (void)result; (void)dbg;
     snprintf(err, err_cap, "qwen-image hip backend was not compiled");
     return -1;
 #endif
@@ -807,8 +991,11 @@ static char *build_qwen_infer_body_from_mcp_args(json_val *args) {
         int steps = args ? json_int(args, "steps", 20) : 20;
         int device = args ? json_int(args, "device", 0) : 0;
         unsigned long long seed = args ? json_u64(args, "seed", 42) : 42;
-        sbuf_printf(&b, "{\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%llu,\"device\":%d}",
-                    width, height, steps, seed, device);
+        const char *precision = args ? json_str(args, "precision", "fp8") : "fp8";
+        char *pc = json_escape_dup(precision);
+        sbuf_printf(&b, "{\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%llu,\"device\":%d,\"precision\":\"%s\"}",
+                    width, height, steps, seed, device, pc);
+        free(pc);
     }
     sbuf_append(&b, "}");
     free(be);
@@ -818,7 +1005,9 @@ static char *build_qwen_infer_body_from_mcp_args(json_val *args) {
 
 /* Build a sam3 segmentation infer-body from MCP tool arguments. */
 static char *build_sam3_infer_body_from_mcp_args(json_val *args, const char *model_id) {
-    const char *backend = args ? json_str(args, "backend", "cpu") : "cpu";
+    const int is_sam31 = (model_id && strcmp(model_id, "sam3.1") == 0);
+    const char *default_backend = is_sam31 ? "cuda" : "cpu";
+    const char *backend = args ? json_str(args, "backend", default_backend) : default_backend;
     const char *text = args ? json_str(args, "text", "") : "";
     const char *image_b64 = args ? json_str(args, "image_base64", "") : "";
     char *be = json_escape_dup(backend);
@@ -839,8 +1028,14 @@ static char *build_sam3_infer_body_from_mcp_args(json_val *args, const char *mod
         double st = args ? json_f64(args, "score_threshold", 0.3) : 0.3;
         double mt = args ? json_f64(args, "mask_threshold",  0.5) : 0.5;
         int mm    = args ? json_int(args, "max_masks",       16)  : 16;
-        sbuf_printf(&b, "{\"score_threshold\":%.3f,\"mask_threshold\":%.3f,\"max_masks\":%d}",
-                    st, mt, mm);
+        int device = args ? json_int(args, "device", 0) : 0;
+        const char *precision = args ? json_str(args, "precision", "fp16") : "fp16";
+        char *pr = json_escape_dup(precision);
+        sbuf_printf(&b,
+                    "{\"score_threshold\":%.3f,\"mask_threshold\":%.3f,"
+                    "\"max_masks\":%d,\"device\":%d,\"precision\":\"%s\"}",
+                    st, mt, mm, device, pr);
+        free(pr);
     }
     sbuf_append(&b, "}");
     free(be); free(tx); free(ib);
@@ -950,6 +1145,9 @@ static char *mcp_sam3_result_from_infer(const char *idbuf, const char *infer_res
     return out.ptr;
 }
 
+/* Defined after the HTTP-client helpers (http_forward/parse_http_response). */
+static char *qwen_ref_proxy(const char *ref_url, const char *body, size_t body_len, int *status);
+
 static char *infer_json(const server_config *cfg, const char *body, size_t body_len, int *status) {
     *status = 200;
     json_val *root = json_parse(body, (int)body_len);
@@ -973,13 +1171,18 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
     const char *variant_name = params ? json_str(params, "variant", "") : "";
     const qwen_variant *qv = qwen_variants_find(cfg, variant_name);
     const char *qv_dit  = qv ? qv->dit  : cfg->qwen_dit;
+    const char *qv_dit4 = qv ? qv->dit_int4 : NULL;
     const char *qv_vae  = qv ? qv->vae  : cfg->qwen_vae;
     const char *qv_enc  = qv ? qv->enc  : cfg->qwen_enc;
     const char *qv_bias = qv && qv->bias ? qv->bias : cfg->qwen_enc_bias;
     const char *dit = weights ? json_str(weights, "dit", qv_dit) : qv_dit;
+    const char *dit_int4 = weights ? json_str(weights, "dit_int4", qv_dit4 ? qv_dit4 : "") : (qv_dit4 ? qv_dit4 : "");
     const char *vae = weights ? json_str(weights, "vae", qv_vae) : qv_vae;
     const char *enc = weights ? json_str(weights, "text_encoder", qv_enc) : qv_enc;
     const char *bias = weights ? json_str(weights, "text_encoder_bias", qv_bias) : qv_bias;
+    /* Precision: "fp8" (default, regular DiT) or "int4" (Nunchaku W4A16 logical DiT). */
+    const char *precision = params ? json_str(params, "precision", "fp8") : "fp8";
+    int use_int4 = (strcmp(precision, "int4") == 0);
     int width = params ? json_int(params, "width", 256) : 256;
     int height = params ? json_int(params, "height", 256) : 256;
     int steps = params ? json_int(params, "steps", 20) : 20;
@@ -988,6 +1191,7 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
 
     char err[1024] = {0};
     image_result img = {0};
+    qwen_run_debug hipdbg = {0};
     int rc = -1;
 
     if (strcmp(model, "qwen-image") == 0 && strcmp(task, "text-to-image") == 0) {
@@ -996,19 +1200,45 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
             json_free(root);
             return json_error_response("invalid_params", "width and height must be positive multiples of 16, steps must be positive");
         }
-        if ((strcmp(backend, "cpu") == 0 || strcmp(backend, "hip") == 0) &&
-            (!dit || !dit[0] || !vae || !vae[0] || !enc || !enc[0])) {
+        const int is_cpu = (strcmp(backend, "cpu") == 0);
+        const int is_hip = (strcmp(backend, "hip") == 0);
+        /* "pytorch"/"comfyui" = external PyTorch fp8 reference, proxied to
+         * --qwen-ref-url. Weights live in the bridge, so the local dit/vae/enc
+         * paths are not required for this backend. */
+        const int is_pytorch = (strcmp(backend, "pytorch") == 0 || strcmp(backend, "comfyui") == 0);
+        /* int4 (Nunchaku W4A16) is HIP-only. */
+        const char *want_dit = use_int4 ? dit_int4 : dit;
+        if (use_int4 && !is_hip) {
             *status = 400;
-            snprintf(err, sizeof(err), "qwen-image backend %s requires dit, vae, and text_encoder paths", backend);
+            snprintf(err, sizeof(err), "qwen-image int4 precision is only available on the hip backend");
+        } else
+        if ((is_cpu || is_hip) &&
+            (!want_dit || !want_dit[0] || !vae || !vae[0] || !enc || !enc[0])) {
+            *status = 400;
+            snprintf(err, sizeof(err), "qwen-image backend %s (%s) requires dit, vae, and text_encoder paths",
+                     backend, use_int4 ? "int4" : "fp8");
         } else
         if (pthread_mutex_trylock(&g_infer_mu) != 0) {
             snprintf(err, sizeof(err), "another inference request is currently running");
             *status = 429;
         } else {
-            if (strcmp(backend, "cpu") == 0) {
+            progress_begin(model, use_int4 ? "int4" : "fp8");
+            if (is_cpu) {
                 rc = qwen_cpu_generate(dit, vae, enc, bias, prompt, height, width, steps, seed, &img, err, sizeof(err));
-            } else if (strcmp(backend, "hip") == 0) {
-                rc = qwen_hip_generate(dit, vae, enc, prompt, height, width, steps, seed, device, &img, err, sizeof(err));
+            } else if (is_hip) {
+                rc = qwen_hip_generate(dit, dit_int4, vae, enc, prompt, height, width, steps, seed, device, use_int4, &img, &hipdbg, err, sizeof(err));
+            } else if (is_pytorch) {
+                /* Forward the verbatim request body to the external fp8 bridge.
+                 * Its response already matches our /v1/infer schema, so we
+                 * early-return it directly (bypassing the local image builder).
+                 * g_infer_mu is held throughout so the bridge — sharing the one
+                 * GPU — never runs concurrently with a HIP job. */
+                progress_phase("pytorch");
+                char *pj = qwen_ref_proxy(cfg->qwen_ref_url, body, body_len, status);
+                progress_end();
+                pthread_mutex_unlock(&g_infer_mu);
+                json_free(root);
+                return pj;
             } else if (strcmp(backend, "cuda") == 0 || strcmp(backend, "vulkan") == 0) {
                 snprintf(err, sizeof(err), "qwen-image backend %s is parsed but not implemented in this server build", backend);
                 *status = 501;
@@ -1016,6 +1246,7 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
                 snprintf(err, sizeof(err), "unknown backend: %s", backend);
                 *status = 400;
             }
+            progress_end();
             pthread_mutex_unlock(&g_infer_mu);
         }
     } else if ((strcmp(model, "sam3") == 0 || strcmp(model, "sam3.1") == 0)
@@ -1294,10 +1525,17 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
         *status = 400;
     }
 
+    /* model/task/backend point into `root`; copy them into owned strings before
+     * json_free(root), otherwise the later base64_encode (which reuses the freed
+     * heap) corrupts them — a use-after-free. */
+    char *m = json_escape_dup(model);
+    char *t = json_escape_dup(task);
+    char *be = json_escape_dup(backend);
     json_free(root);
 
     if (rc != 0) {
         if (*status == 200) *status = 500;
+        free(m); free(t); free(be);
         if (*status == 501) return json_error_response("not_implemented", err);
         if (*status == 429) return json_error_response("busy", err);
         if (*status == 400) return json_error_response("bad_request", err);
@@ -1308,18 +1546,39 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
     free(img.png);
     if (!b64) {
         *status = 500;
+        free(m); free(t); free(be);
         return json_error_response("encode_failed", "failed to base64 encode image");
     }
-    char *m = json_escape_dup(model);
-    char *t = json_escape_dup(task);
-    char *be = json_escape_dup(backend);
     sbuf out;
     sbuf_init(&out);
     sbuf_printf(&out,
         "{\"ok\":true,\"model\":\"%s\",\"task\":\"%s\",\"backend\":\"%s\","
         "\"outputs\":[{\"type\":\"image\",\"mime\":\"image/png\",\"width\":%d,\"height\":%d,"
-        "\"data_base64\":\"%s\"}],\"timings_ms\":{\"total\":0}}",
+        "\"data_base64\":\"%s\"}]",
         m, t, be, img.width, img.height, b64);
+    /* Real per-phase trace (HIP runs only) — proves which device each stage ran
+     * on and how long it took. timings_ms mirrors total/infer for convenience. */
+    if (hipdbg.valid) {
+        char *gn = json_escape_dup(hipdbg.gpu_name);
+        sbuf_printf(&out,
+            ",\"timings_ms\":{\"total\":%.1f,\"text_encode\":%.1f,\"dit_load\":%.1f,"
+            "\"dit\":%.1f,\"vae_load\":%.1f,\"vae\":%.1f},"
+            "\"debug\":{\"gpu\":\"%s\",\"precision\":\"%s\","
+            "\"text_encoder\":{\"device\":\"%s\",\"ms\":%.1f,\"n_tokens\":%d},"
+            "\"dit\":{\"device\":\"%s\",\"steps\":%d,\"ms\":%.1f,\"ms_per_step\":%.1f,\"load_ms\":%.1f},"
+            "\"vae\":{\"device\":\"%s\",\"ms\":%.1f,\"load_ms\":%.1f}}",
+            hipdbg.total_ms, hipdbg.enc_ms, hipdbg.dit_load_ms, hipdbg.dit_ms,
+            hipdbg.vae_load_ms, hipdbg.vae_ms,
+            gn, use_int4 ? "int4" : "fp8",
+            hipdbg.enc_device, hipdbg.enc_ms, hipdbg.n_txt,
+            hipdbg.dit_device, hipdbg.dit_steps, hipdbg.dit_ms,
+            hipdbg.dit_steps > 0 ? hipdbg.dit_ms / hipdbg.dit_steps : 0.0, hipdbg.dit_load_ms,
+            hipdbg.vae_device, hipdbg.vae_ms, hipdbg.vae_load_ms);
+        free(gn);
+    } else {
+        sbuf_append(&out, ",\"timings_ms\":{\"total\":0}");
+    }
+    sbuf_append(&out, "}");
     free(m); free(t); free(be); free(b64);
     return out.ptr;
 }
@@ -1370,6 +1629,25 @@ static void send_response(int fd, int status, const char *ctype, const void *bod
     if (body_len) send_all(fd, body, body_len);
 }
 
+/* Snapshot of the in-flight inference job for GET /v1/progress. */
+static char *progress_json(void) {
+    pthread_mutex_lock(&g_prog.mu);
+    char *gpu = json_escape_dup(g_prog.gpu);
+    char *ph  = json_escape_dup(g_prog.phase);
+    char *pr  = json_escape_dup(g_prog.precision);
+    char *md  = json_escape_dup(g_prog.model);
+    double elapsed = g_prog.active ? (now_ms() - g_prog.started_ms) : 0.0;
+    sbuf b; sbuf_init(&b);
+    sbuf_printf(&b,
+        "{\"ok\":true,\"active\":%s,\"job_id\":%llu,\"model\":\"%s\",\"precision\":\"%s\","
+        "\"phase\":\"%s\",\"dit_step\":%d,\"dit_total\":%d,\"gpu\":\"%s\",\"elapsed_ms\":%.0f}",
+        g_prog.active ? "true" : "false", (unsigned long long)g_prog.job_id,
+        md, pr, ph, g_prog.dit_step, g_prog.dit_total, gpu, elapsed);
+    free(gpu); free(ph); free(pr); free(md);
+    pthread_mutex_unlock(&g_prog.mu);
+    return b.ptr;
+}
+
 static char *models_json(const server_config *cfg) {
     sbuf out;
     sbuf_init(&out);
@@ -1381,14 +1659,23 @@ static char *models_json(const server_config *cfg) {
 #if defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
         ",\"hip\""
 #endif
-        "],\"variants\":[");
+        );
+    /* The PyTorch/ComfyUI fp8 reference is advertised only when a bridge URL is
+     * configured (--qwen-ref-url), since it is an out-of-process backend. */
+    if (cfg && cfg->qwen_ref_url && *cfg->qwen_ref_url)
+        sbuf_append(&out, ",\"pytorch\"");
+    sbuf_append(&out, "],\"variants\":[");
     if (cfg) {
         for (int i = 0; i < cfg->qwen_variant_count; i++) {
             const qwen_variant *v = &cfg->qwen_variants[i];
             char *en = json_escape_dup(v->name);
             char *ek = json_escape_dup(v->kind ? v->kind : "");
-            sbuf_printf(&out, "%s{\"name\":\"%s\",\"kind\":\"%s\"}",
-                        i ? "," : "", en, ek);
+            /* Advertise the precisions this variant can serve: fp8 always (the
+             * regular DiT is required for a valid variant); int4 only when a
+             * logical-int4 checkpoint sits alongside (HIP backend only). */
+            sbuf_printf(&out, "%s{\"name\":\"%s\",\"kind\":\"%s\",\"precisions\":[\"fp8\"%s]}",
+                        i ? "," : "", en, ek,
+                        v->dit_int4 ? ",\"int4\"" : "");
             free(en); free(ek);
         }
     }
@@ -1407,9 +1694,29 @@ static char *models_json(const server_config *cfg) {
 #endif
         "\"},");
     sbuf_append(&out,
-        "{\"id\":\"sam3.1\",\"tasks\":[\"segmentation\"],\"backends\":[\"cpu\",\"cuda\"],"
-        "\"status\":\"pending_runner\",\"note\":\"see cuda/sam3.1/PORT.md\"}"
-        "]}");
+        "{\"id\":\"sam3.1\",\"tasks\":[\"segmentation\"],\"backends\":["
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
+        "\"cuda\""
+#endif
+        "],\"status\":\""
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
+        "ready"
+#else
+        "stub"
+#endif
+        "\",\"note\":\"cuda backend only\"},");
+    /* LLM/VLM model (if loaded) */
+    if (cfg && cfg->g_llm.loaded) {
+        char *mp = json_escape_dup(cfg->g_llm.model_path);
+        sbuf_printf(&out,
+            "{\"id\":\"%s\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"cpu\"],\"is_vlm\":%s}",
+            mp, cfg->g_llm.is_vlm ? "true" : "false");
+        free(mp);
+    } else {
+        sbuf_append(&out,
+            "{\"id\":\"(llm)\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"cpu\"],\"note\":\"pass --model to load\"}");
+    }
+    sbuf_append(&out, "]}");
     return out.ptr;
 }
 
@@ -1418,7 +1725,8 @@ static char *health_json(void) {
     sbuf_init(&b);
     sbuf_printf(&b,
         "{\"ok\":true,\"server\":\"diffusion-server\",\"compiled\":{\"qwen_image\":%s,"
-        "\"qwen_image_cpu\":%s,\"qwen_image_hip\":%s,\"sam3\":%s,\"mcp\":%s}}",
+        "\"qwen_image_cpu\":%s,\"qwen_image_hip\":%s,\"sam3\":%s,"
+        "\"sam3_1_cuda\":%s,\"mcp\":%s}}",
 #if defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE)
         "true",
 #else
@@ -1435,6 +1743,11 @@ static char *health_json(void) {
         "false",
 #endif
 #if defined(DIFFUSION_SERVER_ENABLE_SAM3)
+        "true",
+#else
+        "false",
+#endif
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
         "true",
 #else
         "false",
@@ -1701,7 +2014,44 @@ static void proxy_ref(int fd, const char *ref_url, const char *method,
     bbuf_free(&resp);
 }
 
-static void handle_client(int fd, const server_config *cfg) {
+/* Forward a qwen-image text-to-image request to the external PyTorch/ComfyUI
+ * fp8 reference bridge and return its response body as an owned string. Unlike
+ * proxy_ref (which writes straight to the socket), this returns the body so the
+ * caller can early-return it from infer_json while still holding g_infer_mu. */
+static char *qwen_ref_proxy(const char *ref_url, const char *body, size_t body_len, int *status) {
+    if (!ref_url || !*ref_url) {
+        *status = 503;
+        return json_error_response("ref_not_configured",
+            "pytorch/comfyui backend needs --qwen-ref-url pointing at qwen_ref_bridge.py");
+    }
+    bbuf resp; bbuf_init(&resp);
+    int rc = http_forward(ref_url, "POST", "/v1/infer", body, body_len, &resp);
+    if (rc != 0) {
+        bbuf_free(&resp);
+        *status = 502;
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "proxy to %s failed (rc=%d) — is the qwen fp8 ref bridge running?", ref_url, rc);
+        return json_error_response("ref_unreachable", msg);
+    }
+    int st = 500; char ctype[128] = "application/json";
+    size_t off = 0, rlen = 0;
+    const char *raw = parse_http_response(&resp, &st, ctype, sizeof(ctype), &off, &rlen);
+    if (!raw) {
+        bbuf_free(&resp);
+        *status = 502;
+        return json_error_response("ref_bad_response", "malformed response from qwen fp8 ref bridge");
+    }
+    char *out = (char *)malloc(rlen + 1);
+    if (!out) { bbuf_free(&resp); *status = 500; return json_error_response("oom", "out of memory"); }
+    memcpy(out, raw + off, rlen);
+    out[rlen] = 0;
+    *status = st;
+    bbuf_free(&resp);
+    return out;
+}
+
+static void handle_client(int fd, server_config *cfg) {
     bbuf req;
     bbuf_init(&req);
     char tmp[READ_CHUNK];
@@ -1745,11 +2095,166 @@ static void handle_client(int fd, const server_config *cfg) {
         char *j = models_json(cfg);
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
+    } else if (strcmp(method, "GET") == 0 &&
+               (strcmp(path, "/progress") == 0 || strcmp(path, "/v1/progress") == 0)) {
+        char *j = progress_json();
+        send_response(fd, 200, "application/json", j, strlen(j));
+        free(j);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/infer") == 0) {
         int status = 200;
         char *j = infer_json(cfg, body, content_len, &status);
         send_response(fd, status, "application/json", j, strlen(j));
         free(j);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/chat/completions") == 0) {
+        json_val *root = json_parse(body, (int)content_len);
+        if (!root || root->type != JSON_OBJECT) {
+            if (root) json_free(root);
+            char *e = json_error_response("invalid_json", "request body must be a JSON object");
+            send_response(fd, 400, "application/json", e, strlen(e));
+            free(e);
+        } else {
+            json_val *messages = json_obj_get(root, "messages");
+            int max_tokens = json_int(root, "max_tokens", 512);
+            float temperature = (float)json_f64(root, "temperature", 0.7);
+            float top_p = (float)json_f64(root, "top_p", 0.9);
+            int seed = json_int(root, "seed", 0);
+            json_val *stop_arr = json_obj_get(root, "stop");
+            int stream = json_int(root, "stream", 0);
+
+            if (!messages || messages->type != JSON_ARRAY) {
+                char *e = json_error_response("invalid_messages", "\"messages\" must be a non-empty array");
+                send_response(fd, 400, "application/json", e, strlen(e));
+                free(e);
+            } else if (pthread_mutex_trylock(&g_infer_mu) != 0) {
+                char *e = json_error_response("busy", "another inference request is currently running");
+                send_response(fd, 429, "application/json", e, strlen(e));
+                free(e);
+            } else if (!cfg->g_llm.loaded) {
+                char *e = json_error_response("no_model", "no LLM/VLM model loaded (pass --model to the server)");
+                send_response(fd, 503, "application/json", e, strlen(e));
+                free(e);
+                pthread_mutex_unlock(&g_infer_mu);
+            } else {
+                if (stream) {
+                    char sse_hdr[256];
+                    snprintf(sse_hdr, sizeof(sse_hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Connection: close\r\n"
+                        "Access-Control-Allow-Origin: *\r\n\r\n");
+                    send_all(fd, sse_hdr, strlen(sse_hdr));
+
+                    char err2[1024] = {0};
+                    int rc = llm_chat_completion_stream((llm_state *)&cfg->g_llm, fd, messages,
+                                                          max_tokens, temperature, top_p, seed,
+                                                          stop_arr, err2, sizeof(err2));
+                    if (rc != 0) {
+                        char err_sse[1024];
+                        snprintf(err_sse, sizeof(err_sse), "data: {\"error\":\"%s\"}\n\n", err2);
+                        send(fd, err_sse, strlen(err_sse), 0);
+                        send(fd, "data: [DONE]\n\n", 14, 0);
+                    }
+                } else {
+                    char err2[1024] = {0};
+                    int st = 200;
+                    char *resp = llm_chat_completion((llm_state *)&cfg->g_llm, messages,
+                                                      max_tokens, temperature, top_p, seed,
+                                                      stop_arr, &st, err2, sizeof(err2));
+                    progress_end();
+                    pthread_mutex_unlock(&g_infer_mu);
+                    if (resp) {
+                        send_response(fd, st, "application/json", resp, strlen(resp));
+                        free(resp);
+                    } else {
+                        char *e = json_error_response("inference_failed", err2);
+                        send_response(fd, st, "application/json", e, strlen(e));
+                        free(e);
+                    }
+                    json_free(root);
+                    bbuf_free(&req);
+                    return;
+                }
+                progress_end();
+                pthread_mutex_unlock(&g_infer_mu);
+            }
+            json_free(root);
+        }
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/completions") == 0) {
+        json_val *root = json_parse(body, (int)content_len);
+        if (!root || root->type != JSON_OBJECT) {
+            if (root) json_free(root);
+            char *e = json_error_response("invalid_json", "request body must be a JSON object");
+            send_response(fd, 400, "application/json", e, strlen(e));
+            free(e);
+        } else {
+            const char *prompt = json_str(root, "prompt", "");
+            int max_tokens = json_int(root, "max_tokens", 512);
+            float temperature = (float)json_f64(root, "temperature", 0.7);
+            float top_p = (float)json_f64(root, "top_p", 0.9);
+            int seed = json_int(root, "seed", 0);
+            json_val *stop_arr = json_obj_get(root, "stop");
+            int stream = json_int(root, "stream", 0);
+
+            if (!prompt || !*prompt) {
+                char *e = json_error_response("invalid_prompt", "\"prompt\" is required");
+                send_response(fd, 400, "application/json", e, strlen(e));
+                free(e);
+            } else if (pthread_mutex_trylock(&g_infer_mu) != 0) {
+                char *e = json_error_response("busy", "another inference request is currently running");
+                send_response(fd, 429, "application/json", e, strlen(e));
+                free(e);
+            } else if (!cfg->g_llm.loaded) {
+                char *e = json_error_response("no_model", "no LLM/VLM model loaded (pass --model to the server)");
+                send_response(fd, 503, "application/json", e, strlen(e));
+                free(e);
+                pthread_mutex_unlock(&g_infer_mu);
+            } else {
+                if (stream) {
+                    char sse_hdr[256];
+                    snprintf(sse_hdr, sizeof(sse_hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Connection: close\r\n"
+                        "Access-Control-Allow-Origin: *\r\n\r\n");
+                    send_all(fd, sse_hdr, strlen(sse_hdr));
+
+                    char err2[1024] = {0};
+                    int rc = llm_text_completion_stream((llm_state *)&cfg->g_llm, fd, prompt,
+                                                         max_tokens, temperature, top_p, seed,
+                                                         stop_arr, err2, sizeof(err2));
+                    if (rc != 0) {
+                        char err_sse[1024];
+                        snprintf(err_sse, sizeof(err_sse), "data: {\"error\":\"%s\"}\n\n", err2);
+                        send(fd, err_sse, strlen(err_sse), 0);
+                        send(fd, "data: [DONE]\n\n", 14, 0);
+                    }
+                } else {
+                    char err2[1024] = {0};
+                    int st = 200;
+                    char *resp = llm_text_completion((llm_state *)&cfg->g_llm, prompt,
+                                                      max_tokens, temperature, top_p, seed,
+                                                      stop_arr, &st, err2, sizeof(err2));
+                    progress_end();
+                    pthread_mutex_unlock(&g_infer_mu);
+                    if (resp) {
+                        send_response(fd, st, "application/json", resp, strlen(resp));
+                        free(resp);
+                    } else {
+                        char *e = json_error_response("inference_failed", err2);
+                        send_response(fd, st, "application/json", e, strlen(e));
+                        free(e);
+                    }
+                    json_free(root);
+                    bbuf_free(&req);
+                    return;
+                }
+                progress_end();
+                pthread_mutex_unlock(&g_infer_mu);
+            }
+            json_free(root);
+        }
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3/infer") == 0) {
         proxy_ref(fd, cfg->sam3_ref_url, "POST", "/v1/infer", body, content_len);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3.1/infer") == 0) {
@@ -1772,6 +2277,18 @@ static void handle_client(int fd, const server_config *cfg) {
         free(e);
     }
     bbuf_free(&req);
+}
+
+/* Per-connection worker so reads (e.g. GET /v1/progress) can be served while a
+ * long /v1/infer is running on another thread. Inference itself stays
+ * serialized by g_infer_mu (concurrent infer attempts get HTTP 429). */
+typedef struct { int fd; server_config *cfg; } conn_arg;
+static void *conn_thread(void *p) {
+    conn_arg *a = (conn_arg *)p;
+    handle_client(a->fd, a->cfg);
+    close(a->fd);
+    free(a);
+    return NULL;
 }
 
 static int run_http(const server_config *cfg) {
@@ -1808,8 +2325,17 @@ static int run_http(const server_config *cfg) {
             perror("accept");
             break;
         }
-        handle_client(cfd, cfg);
-        close(cfd);
+        conn_arg *a = (conn_arg *)malloc(sizeof(*a));
+        if (a) { a->fd = cfd; a->cfg = cfg; }
+        pthread_t th;
+        if (!a || pthread_create(&th, NULL, conn_thread, a) != 0) {
+            /* fall back to inline handling if thread spawn fails */
+            free(a);
+            handle_client(cfd, cfg);
+            close(cfd);
+        } else {
+            pthread_detach(th);
+        }
     }
     close(fd);
     return 0;
@@ -1919,9 +2445,17 @@ static int run_mcp_stdio(const server_config *cfg) {
                    "\"weights\":{\"type\":\"object\",\"additionalProperties\":false,"
                    "\"properties\":{\"ckpt\":{\"type\":\"string\"},\"vocab\":{\"type\":\"string\"},"
                    "\"merges\":{\"type\":\"string\"}}}},\"required\":[\"text\",\"image_base64\"]}},"
-                   "{\"name\":\"sam3_1_segment\",\"description\":\"Segment with SAM 3.1 (runner port in progress; currently 501)\","
+                   "{\"name\":\"sam3_1_segment\",\"description\":\"Segment an image by text phrase with SAM 3.1 (CUDA backend)\","
                    "\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false,"
-                   "\"properties\":{\"text\":{\"type\":\"string\"},\"image_base64\":{\"type\":\"string\"}}}}"
+                   "\"properties\":{\"backend\":{\"type\":\"string\",\"enum\":[\"cuda\"]},"
+                   "\"text\":{\"type\":\"string\"},\"image_base64\":{\"type\":\"string\"},"
+                   "\"score_threshold\":{\"type\":\"number\"},\"mask_threshold\":{\"type\":\"number\"},"
+                   "\"max_masks\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64},"
+                   "\"device\":{\"type\":\"integer\",\"minimum\":0},"
+                   "\"precision\":{\"type\":\"string\",\"enum\":[\"fp16\",\"fp32\",\"bf16\",\"fp8\",\"int4\"]},"
+                   "\"weights\":{\"type\":\"object\",\"additionalProperties\":false,"
+                   "\"properties\":{\"ckpt\":{\"type\":\"string\"},\"vocab\":{\"type\":\"string\"},"
+                   "\"merges\":{\"type\":\"string\"}}}},\"required\":[\"text\",\"image_base64\"]}}"
                    "]}}\n", idbuf);
             fflush(stdout);
         } else if (strcmp(method, "tools/call") == 0) {
@@ -1977,13 +2511,17 @@ static void usage(const char *prog) {
         "  --qwen-vae <path>\n"
         "  --qwen-enc <path>\n"
         "  --qwen-enc-bias <path>\n"
-        "  --qwen-variants <spec>   name:dir,name:dir (or env QWEN_IMAGE_VARIANTS)\n"
+        "  --qwen-variants <spec>   name:dir[:int4_path],...  (or env QWEN_IMAGE_VARIANTS)\n"
+        "                           optional 3rd field = explicit logical-int4 DiT file\n"
         "  --sam3-ckpt <path>       default sam3.model.safetensors\n"
         "  --sam3-ckpt-v31 <path>   default sam3.1.model.safetensors (cuda only)\n"
         "  --sam3-vocab <path>      CLIP BPE vocab.json\n"
         "  --sam3-merges <path>     CLIP BPE merges.txt\n"
         "  --sam3-ref-url <url>     proxy /v1/ref/sam3/*   to URL (pytorch ref, sam3)\n"
         "  --sam3-1-ref-url <url>   proxy /v1/ref/sam3.1/* to URL (pytorch ref, sam3.1)\n"
+        "  --qwen-ref-url <url>     qwen-image backend=pytorch -> fp8 bridge URL (or env QWEN_IMAGE_REF_URL)\n"
+        "  --model <path>           LLM/VLM GGUF model file for OpenAI-compatible endpoints\n"
+        "  --mmproj <path>          (optional) multimodal projector GGUF for VLM (vision)\n"
         "  --device <n>             default 0\n"
         "  --stdio                  line-delimited JSON transport for local debugging\n"
         "  --mcp-stdio              run MCP stdio mode when compiled\n",
@@ -2012,6 +2550,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--sam3-merges") == 0 && i + 1 < argc) cfg.sam3_merges = argv[++i];
         else if (strcmp(argv[i], "--sam3-ref-url") == 0 && i + 1 < argc) cfg.sam3_ref_url = argv[++i];
         else if (strcmp(argv[i], "--sam3-1-ref-url") == 0 && i + 1 < argc) cfg.sam3_1_ref_url = argv[++i];
+        else if (strcmp(argv[i], "--qwen-ref-url") == 0 && i + 1 < argc) cfg.qwen_ref_url = argv[++i];
+        else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) cfg.llm_model = argv[++i];
+        else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) cfg.llm_mmproj = argv[++i];
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) cfg.device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stdio") == 0) cfg.stdio_mode = 1;
         else if (strcmp(argv[i], "--mcp-stdio") == 0) cfg.mcp_stdio = 1;
@@ -2022,10 +2563,27 @@ int main(int argc, char **argv) {
         const char *e = getenv("QWEN_IMAGE_VARIANTS");
         if (e && *e) cfg.qwen_variants_spec = e;
     }
+    /* Env fallback for the pytorch/comfyui fp8 reference bridge URL. */
+    if (!cfg.qwen_ref_url) {
+        const char *e = getenv("QWEN_IMAGE_REF_URL");
+        if (e && *e) cfg.qwen_ref_url = e;
+    }
     qwen_variants_parse(&cfg, cfg.qwen_variants_spec);
+
+    /* Initialize LLM/VLM model if --model was provided */
+    if (cfg.llm_model) {
+        fprintf(stderr, "Loading LLM/VLM model: %s\n", cfg.llm_model);
+        if (cfg.llm_mmproj)
+            fprintf(stderr, "  mmproj: %s\n", cfg.llm_mmproj);
+        if (llm_init(&cfg.g_llm, cfg.llm_model, cfg.llm_mmproj) != 0) {
+            fprintf(stderr, "Failed to load model, continuing without LLM/VLM support\n");
+        }
+    }
+
     if (cfg.stdio_mode) return run_stdio(&cfg);
     if (cfg.mcp_stdio) return run_mcp_stdio(&cfg);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGPIPE, SIG_IGN);  /* a client that drops mid-write must not kill us */
     return run_http(&cfg);
 }

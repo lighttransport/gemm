@@ -20,6 +20,12 @@
 #include "gguf_loader.h"
 #include "ggml_dequant.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define TF_MAYBE_UNUSED __attribute__((unused))
+#else
+#define TF_MAYBE_UNUSED
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,6 +38,8 @@ typedef struct {
     int      n_cols;     /* number of elements per row */
     int      n_dims;     /* up to 4 for GGUF tensors */
     uint64_t dims[4];
+    float    scale;      /* optional external scale for safetensors FP8 weights */
+    int      has_scale;
 } qtensor;
 
 typedef struct {
@@ -907,9 +915,9 @@ static void *tf_fused_ffn_silu_worker(void *arg) {
     return NULL;
 }
 
-static void tf_qmatvec_fused2_silu_pool(transformer_model *m, float *dst,
-                                          const qtensor *gate_mat, const qtensor *up_mat,
-                                          const float *x, int n_rows) {
+static void TF_MAYBE_UNUSED tf_qmatvec_fused2_silu_pool(transformer_model *m, float *dst,
+                                                         const qtensor *gate_mat, const qtensor *up_mat,
+                                                         const float *x, int n_rows) {
     int nt = m->n_threads;
     if (nt <= 1 || !m->pool_alive) {
         tf_fused_ffn_silu_task t = {dst, gate_mat, up_mat, x, 0, n_rows};
@@ -1115,8 +1123,8 @@ static void tf_qmatvec_expert_pool(transformer_model *m, float *dst, const qtens
 }
 
 /* Legacy multi-threaded version (pthread_create per call) */
-static void tf_qmatvec_mt(float *dst, const qtensor *mat, const float *x, int n_rows,
-                           int n_threads, float **thread_tmp) {
+static void TF_MAYBE_UNUSED tf_qmatvec_mt(float *dst, const qtensor *mat, const float *x, int n_rows,
+                                          int n_threads, float **thread_tmp) {
     if (n_threads <= 1 || n_rows < n_threads * 4) {
         tf_qmatvec(dst, mat, x, n_rows, thread_tmp[0]);
         return;
@@ -3172,6 +3180,7 @@ static inline void tf_barrier(transformer_model *m, int tid, int *local_sense, i
         tf_hw_barrier_w0();
     }
 #else
+    (void)tid;
     tf_spin_barrier(m, local_sense, nt);
 #endif
 }
@@ -3361,7 +3370,6 @@ static void *tf_persistent_worker(void *arg) {
                 int saved_alive = m->pool_alive;
                 m->pool_alive = 0;  /* disable pool dispatch */
                 const int n_expert = m->n_expert;
-                const int n_top = m->n_expert_used;
                 const int n_ff_exp = m->n_ff_expert;
                 tf_qmatvec_pool(m, m->ffn_buf1, &layer->ffn_gate_inp, m->xb, n_expert);
                 tf_softmax(m->ffn_buf1, n_expert);
@@ -4136,8 +4144,8 @@ void transformer_resize_kv_for_tp(transformer_model *model,
 
 /* Column-parallel matvec: compute rows [row_start, row_end) of mat, output to dst[0..count).
  * Used for QKV, gate, up projections where each TP rank computes a subset of output rows. */
-static void tf_qmatvec_row_slice(transformer_model *m, float *dst, const qtensor *mat,
-                                  const float *x, int row_start, int row_end) {
+static void TF_MAYBE_UNUSED tf_qmatvec_row_slice(transformer_model *m, float *dst, const qtensor *mat,
+                                                 const float *x, int row_start, int row_end) {
     int count = row_end - row_start;
     if (count <= 0) return;
     /* Create a virtual qtensor pointing to the slice */
@@ -4188,9 +4196,9 @@ static void tf_qmatvec_col_slice(float *dst, const qtensor *mat, const float *x_
 }
 
 /* Row-parallel matvec with pool threading: col_slice + allreduce. */
-static void tf_qmatvec_col_slice_pool(transformer_model *m, float *dst, const qtensor *mat,
-                                       const float *x_local, int n_rows,
-                                       int col_start, int col_end) {
+static void TF_MAYBE_UNUSED tf_qmatvec_col_slice_pool(transformer_model *m, float *dst, const qtensor *mat,
+                                                      const float *x_local, int n_rows,
+                                                      int col_start, int col_end) {
     /* Single-threaded col-slice (threading within rows is hard for col-slice) */
     tf_qmatvec_col_slice(dst, mat, x_local, n_rows, col_start, col_end, m->matvec_tmp);
     /* Allreduce partial sums across TP ranks */
@@ -4286,9 +4294,9 @@ static void *tf_gemm_worker(void *arg) {
 
 /* Multi-threaded GEMM for F16 weight matrices: Y[n_rows, N] = W[n_rows, K] × X[N, K]^T
  * Output Y is row-major: Y[row][tok], Y_stride >= N. */
-static void tf_gemm_f16_mt(float *Y, const qtensor *mat, const float *X,
-                            int n_rows, int N, int Y_stride, int X_stride,
-                            int n_threads) {
+static void TF_MAYBE_UNUSED tf_gemm_f16_mt(float *Y, const qtensor *mat, const float *X,
+                                           int n_rows, int N, int Y_stride, int X_stride,
+                                           int n_threads) {
     if (mat->type != GGML_TYPE_F16) {
         /* Fallback: per-token matvec for non-F16 weights (AVX2 dot product) */
         int n_cols = mat->n_cols;
@@ -4530,10 +4538,10 @@ static void *tf_gemm_fused2_worker(void *arg) {
     return NULL;
 }
 
-static void tf_gemm_f16_mt_fused2(float *Y1, const qtensor *mat1,
-                                    float *Y2, const qtensor *mat2,
-                                    const float *X, int n_rows, int N,
-                                    int out_stride, int X_stride, int n_threads) {
+static void TF_MAYBE_UNUSED tf_gemm_f16_mt_fused2(float *Y1, const qtensor *mat1,
+                                                  float *Y2, const qtensor *mat2,
+                                                  const float *X, int n_rows, int N,
+                                                  int out_stride, int X_stride, int n_threads) {
     const uint16_t *W1 = (const uint16_t *)mat1->data;
     const uint16_t *W2 = (const uint16_t *)mat2->data;
     int K = mat1->n_cols;
@@ -4810,7 +4818,7 @@ typedef struct {
     int head_dim, kv_dim, q_dim, gqa_ratio, max_seq_len;
 } tf_batch_attn_task;
 
-static void *tf_batch_attn_worker(void *arg) {
+static TF_MAYBE_UNUSED void *tf_batch_attn_worker(void *arg) {
     tf_batch_attn_task *t = (tf_batch_attn_task *)arg;
     float scale = 1.0f / sqrtf((float)t->head_dim);
     int hd = t->head_dim;

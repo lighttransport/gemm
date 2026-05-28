@@ -6,8 +6,7 @@
  * model backbone, and the ~9 copies of `*_make_tensor()` that each of
  * those headers grew independently.
  *
- * Supports F32 / F16 / BF16 input tensors; BF16 is converted to F32
- * in a freshly malloc'd buffer (mmap'd data is read-only). The 4-slot
+ * Supports F32 / F16 / BF16 input tensors. The 4-slot
  * `dims[]` array holds the first up-to-4 dimensions; `n_rows` /
  * `n_cols` flatten the full shape for 2D GEMM-style access
  * (n_rows = shape[0], n_cols = prod(shape[1..nd])).
@@ -50,18 +49,17 @@ typedef struct {
 /* Build a qtensor from a safetensors tensor index.
  *
  * Returns a zeroed qtensor on negative idx or on unsupported dtype.
- * For BF16, allocates a freshly malloc'd F32 buffer; ownership of that
- * buffer is currently held by the consumer's dequant pipeline (which
- * keeps a parallel free-list). qt_make_tensor itself does not track it. */
+ * BF16 tensors keep their mmap'd u16 storage and are dequantized by the
+ * common GGML BF16 helpers, so large BF16 GEMMs can avoid an eager F32
+ * expansion. */
 static inline qtensor qt_make_tensor(st_context *st, int idx) {
     qtensor t = {0};
     if (idx < 0) return t;
     t.data = safetensors_data(st, idx);
     const char *dt = safetensors_dtype(st, idx);
-    int is_bf16 = 0;
     if      (strcmp(dt, "F32")  == 0) t.type = GGML_TYPE_F32;
     else if (strcmp(dt, "F16")  == 0) t.type = GGML_TYPE_F16;
-    else if (strcmp(dt, "BF16") == 0) { t.type = GGML_TYPE_F32; is_bf16 = 1; }
+    else if (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_BF16;
     else return (qtensor){0};
 
     int ndims_full = safetensors_ndims(st, idx);
@@ -81,16 +79,6 @@ static inline qtensor qt_make_tensor(st_context *st, int idx) {
         t.n_rows = 1;
     }
 
-    if (is_bf16) {
-        size_t numel = (size_t)t.n_cols * (size_t)t.n_rows;
-        float *buf = (float *)malloc(numel * sizeof(float));
-        const uint16_t *src = (const uint16_t *)t.data;
-        for (size_t i = 0; i < numel; i++) {
-            uint32_t bits = (uint32_t)src[i] << 16;
-            memcpy(&buf[i], &bits, 4);
-        }
-        t.data = buf;
-    }
     return t;
 }
 
@@ -132,6 +120,9 @@ static inline float *qt_dequant(const qtensor *t) {
     if (t->type == GGML_TYPE_F16) {
         const uint16_t *src = (const uint16_t *)t->data;
         for (int i = 0; i < n; i++) buf[i] = ggml_fp16_to_fp32(src[i]);
+    } else if (t->type == GGML_TYPE_BF16) {
+        const uint16_t *src = (const uint16_t *)t->data;
+        dequantize_row_bf16(src, buf, n);
     } else if (t->type == GGML_TYPE_F32) {
         memcpy(buf, t->data, (size_t)n * sizeof(float));
     } else {
@@ -160,6 +151,9 @@ static inline void qt_dequant_row(const qtensor *t, int row, float *dst) {
     if (t->type == GGML_TYPE_F16) {
         const uint16_t *src = (const uint16_t *)t->data + (size_t)row * n;
         for (int i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(src[i]);
+    } else if (t->type == GGML_TYPE_BF16) {
+        const uint16_t *src = (const uint16_t *)t->data + (size_t)row * n;
+        dequantize_row_bf16(src, dst, n);
     } else if (t->type == GGML_TYPE_F32) {
         memcpy(dst, (const float *)t->data + (size_t)row * n,
                (size_t)n * sizeof(float));

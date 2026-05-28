@@ -330,7 +330,17 @@ cd ../../cuda/hy3d
 
 ---
 
-## Resume prompt (Phase 4.9.2 — paint UNet FP8 GEMM dispatch)
+## Phase 4.9.2 — paint UNet FP8 GEMM dispatch (LANDED)
+
+Root cause of the idx-535 OOB: cuMemAlloc failures (CUDA_ERROR_OUT_OF_MEMORY)
+on the per-forward `skip_push_copy` path once FP8 + F32 weights coexisted in
+VRAM. Fix: tighten registration to `n_out%256==0 && n_in%32==0` and free the
+F32 source buffer immediately after FP8 prequant — registered weights only
+ever take the FP8 path. Default flipped ON. 1-step CFG-3 chain with FP8 ON:
+mask_mismatch=4558, uv-raster 9713/16384, max_diff=4.284e-01, ~15.2 s/forward
+(was 22.21 s baseline, ~32 % speedup).
+
+## Resume prompt (superseded — kept for history)
 
 Continue Phase 4.9.2 of `cuda/hy3d_paint`: route paint UNet linears through TC GEMM
 to close the ~22× gap vs PyTorch (currently 22.21 s/forward on RTX 5060 Ti / sm120).

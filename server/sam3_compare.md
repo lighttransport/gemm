@@ -8,7 +8,7 @@ By default it talks to three servers:
 
 | Port | Process                    | Models                 |
 |------|----------------------------|------------------------|
-| 8080 | C `diffusion-server`       | sam3 (cpu/cuda), sam3.1 (cpu/cuda) |
+| 8080 | C `diffusion-server`       | sam3 (cpu/cuda), sam3.1 (cuda) |
 | 8082 | `ref/sam3/sam3_ref_server.py`   | sam3 (pytorch)  |
 | 8081 | `ref/sam3.1/sam3_1_ref_server.py` | sam3.1 (pytorch) |
 

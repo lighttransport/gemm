@@ -17,7 +17,9 @@
 
 #include "cuda_da3_runner.h"
 #include "../cuew.h"
+#include "../cublasew.h"
 #include "../cuda_kernels_common.h"
+#include "../cuda_fp8_mma_kernels.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 
@@ -67,6 +69,15 @@ static const char *cuda_da3_specific_kernels =
 "    float inv = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
 "    if (tid < head_dim)\n"
 "        v[tid] = (val - mean) * inv * w[tid] + b[tid];\n"
+"}\n"
+"\n"
+"/* ---- DA3: cast_f32_to_f16 ---- */\n"
+"__global__ void da3_cast_f32_to_f16(const float *src, half_raw *dst, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    unsigned short h;\n"
+"    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(src[i]));\n"
+"    dst[i] = h;\n"
 "}\n"
 "\n"
 "/* ---- 5. rope_2d_f32: 2D RoPE with stride ---- */\n"
@@ -469,6 +480,10 @@ typedef struct {
     CUdeviceptr ffn_gate_up_w, ffn_gate_up_b;
     CUdeviceptr ffn_up_w, ffn_up_b;
     CUdeviceptr ffn_down_w, ffn_down_b;
+    float attn_qkv_w_scale, attn_out_w_scale;
+    float ffn_gate_up_w_scale, ffn_up_w_scale, ffn_down_w_scale;
+    CUdeviceptr attn_qkv_w_scale_d, attn_out_w_scale_d;
+    CUdeviceptr ffn_gate_up_w_scale_d, ffn_up_w_scale_d, ffn_down_w_scale_d;
     int has_qk_norm, has_swiglu;
     int qkv_rows, qkv_cols;
     int out_rows, out_cols;
@@ -535,7 +550,24 @@ struct cuda_da3_runner {
     CUfunction fn_channel_layernorm_f32;  /* Per-position channel LayerNorm */
     CUfunction fn_silu_f32;       /* SiLU for CameraDec MLP */
     CUfunction fn_sigmoid_f32;    /* Sigmoid for sky segmentation */
+    CUfunction fn_da3_cast_f32_to_f16;
+    CUfunction fn_reduce_max_abs_per_row_f32;
+    CUfunction fn_gemm_fp8_pipe_perrow_f32;
+    CUfunction fn_gemm_fp8_pipe_perrow_mt4_f32;
+    CUfunction fn_gemm_fp8_pipe_perrow_mt4_wpr_f32;
     int use_fp8;                   /* 1 if FP8 MMA available */
+    int use_fp8_w_perrow;          /* DA3_FP8_W_PERROW=1: experimental W per-row scales */
+    int use_cublas_gemm;           /* 1 if cuBLAS tensor-core GEMM is available */
+    int use_mma_gemm;              /* 1 if in-repo FP16 MMA GEMM is enabled */
+    int use_mma_attn;              /* DA3_MMA_ATTN=1: opt into faster MMA attention */
+    int cublas_need_f16_x;         /* Blackwell fallback for F16xF32 unsupported */
+    int sm_version;
+    cublasew_context *cublas;
+    int use_graph;                 /* DA3_GRAPH=1: graph depth-only fixed-shape path */
+    int graph_valid;
+    int graph_w, graph_h;
+    CUgraph depth_graph;
+    CUgraphExec depth_graph_exec;
 
     /* Model params */
     int n_blocks, dim, n_heads, head_dim, ffn_hidden;
@@ -563,6 +595,10 @@ struct cuda_da3_runner {
     /* Scratch buffers */
     CUdeviceptr d_hidden, d_hidden2, d_ln_buf, d_qkv, d_attn_out;
     CUdeviceptr d_ffn_buf, d_ffn_mid, d_proj_out;
+    CUdeviceptr d_gemm_x_f16;
+    size_t d_gemm_x_f16_cap;
+    CUdeviceptr d_row_max_buf;
+    size_t d_row_max_buf_cap;
     CUdeviceptr d_pos_y, d_pos_x;         /* local blocks: actual grid positions */
     CUdeviceptr d_pos_y_nd, d_pos_x_nd;   /* global blocks: pos_nodiff (all 1s) */
     CUdeviceptr d_features[4]; /* saved backbone features (post-block output) */
@@ -678,16 +714,38 @@ struct cuda_da3_runner {
 
 static int da3_compile_kernels(cuda_da3_runner *r) {
     /* Concatenate shared + DA3-specific kernel source */
+    const char *env_fp8 = getenv("DA3_FP8_BACKBONE");
+    int want_fp8_src = (env_fp8 && env_fp8[0] != '0') ? 1 : 0;
     size_t len1 = strlen(cuda_kernels_common_src);
     size_t len2 = strlen(cuda_da3_specific_kernels);
-    char *full_src = (char *)malloc(len1 + len2 + 1);
-    memcpy(full_src, cuda_kernels_common_src, len1);
-    memcpy(full_src + len1, cuda_da3_specific_kernels, len2 + 1);
+    const char *fp8_open =
+        "/* DA3 FP8 helpers: fp8_mma_kernels_src expects to_bf16(float). */\n"
+        "__device__ __constant__ unsigned short d_fp8_to_bf16_lut[256];\n"
+        "__device__ __forceinline__ float to_bf16(float f) {\n"
+        "    unsigned int b; memcpy(&b, &f, 4);\n"
+        "    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) {\n"
+        "        unsigned int qn = 0x7FC00000u; float r; memcpy(&r, &qn, 4); return r;\n"
+        "    }\n"
+        "    unsigned int rnd = 0x7FFFu + ((b >> 16) & 1u);\n"
+        "    b = (b + rnd) & 0xFFFF0000u;\n"
+        "    float out; memcpy(&out, &b, 4); return out;\n"
+        "}\n";
+    size_t len3 = want_fp8_src ? strlen(fp8_open) : 0;
+    size_t len4 = want_fp8_src ? strlen(fp8_mma_kernels_src) : 0;
+    char *full_src = (char *)malloc(len1 + len3 + len4 + len2 + 1);
+    char *p = full_src;
+    memcpy(p, cuda_kernels_common_src, len1); p += len1;
+    if (want_fp8_src) {
+        memcpy(p, fp8_open, len3); p += len3;
+        memcpy(p, fp8_mma_kernels_src, len4); p += len4;
+    }
+    memcpy(p, cuda_da3_specific_kernels, len2 + 1);
 
     int sm = cu_compile_kernels(&r->module, r->device, full_src,
                                  "da3_kernels.cu", r->verbose, "cuda_da3");
     free(full_src);
     if (sm < 0) return -1;
+    r->sm_version = sm;
 
     CUresult err;
 #define GET_FN(name) do { \
@@ -729,18 +787,22 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
     GET_FN(conv_gemm_f16_f32);
     GET_FN(groupnorm_f32);
     GET_FN(channel_layernorm_f32);
+    GET_FN(da3_cast_f32_to_f16);
 
     /* FP8 E4M3 GEMM: only available on sm_89+ (Ada/Blackwell) */
-    r->use_fp8 = (sm >= 89);
+    r->use_fp8 = (want_fp8_src && sm >= 89);
     if (r->use_fp8) {
         GET_FN(gemm_fp8_f32);
+        GET_FN(reduce_max_abs_per_row_f32);
+        GET_FN(gemm_fp8_pipe_perrow_f32);
+        GET_FN(gemm_fp8_pipe_perrow_mt4_f32);
+        GET_FN(gemm_fp8_pipe_perrow_mt4_wpr_f32);
     }
 
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "cuda_da3: %d kernels compiled (fp8=%d)\n",
-                r->use_fp8 ? 26 : 25, r->use_fp8);
+        fprintf(stderr, "cuda_da3: kernels compiled (fp8=%d)\n", r->use_fp8);
     return 0;
 }
 
@@ -829,6 +891,119 @@ static CUdeviceptr upload_tensor_fp8_e4m3(const qtensor *t) {
     return d;
 }
 
+/* Upload tensor to GPU as scaled FP8 E4M3. The returned scale satisfies
+ * original_value ~= fp8_value * scale. */
+static CUdeviceptr upload_tensor_fp8_e4m3_scaled(const qtensor *t, float *scale_out) {
+    if (scale_out) *scale_out = 1.0f;
+    if (!t->data) return 0;
+    int n = 1;
+    for (int d = 0; d < t->n_dims; d++) n *= (int)t->dims[d];
+    float max_abs = 0.0f;
+    if (t->type == GGML_TYPE_F16) {
+        const uint16_t *src = (const uint16_t *)t->data;
+        for (int i = 0; i < n; i++) {
+            float v = ggml_fp16_to_fp32(src[i]);
+            float a = fabsf(v);
+            if (a > max_abs) max_abs = a;
+        }
+    } else if (t->type == GGML_TYPE_F32) {
+        const float *src = (const float *)t->data;
+        for (int i = 0; i < n; i++) {
+            float a = fabsf(src[i]);
+            if (a > max_abs) max_abs = a;
+        }
+    }
+    float scale = (max_abs > 1.0e-12f) ? (max_abs / 448.0f) : 1.0f;
+    if (scale_out) *scale_out = scale;
+
+    uint8_t *buf = (uint8_t *)malloc((size_t)n);
+    if (t->type == GGML_TYPE_F16) {
+        const uint16_t *src = (const uint16_t *)t->data;
+        for (int i = 0; i < n; i++) buf[i] = f32_to_fp8_e4m3(ggml_fp16_to_fp32(src[i]) / scale);
+    } else if (t->type == GGML_TYPE_F32) {
+        const float *src = (const float *)t->data;
+        for (int i = 0; i < n; i++) buf[i] = f32_to_fp8_e4m3(src[i] / scale);
+    } else {
+        memset(buf, 0, (size_t)n);
+    }
+    CUdeviceptr d;
+    if (cuMemAlloc(&d, (size_t)n) != CUDA_SUCCESS) { free(buf); return 0; }
+    cuMemcpyHtoD(d, buf, (size_t)n);
+    free(buf);
+    return d;
+}
+
+/* Upload [n_out, n_in] weight with one FP8 scale per output row. */
+static CUdeviceptr upload_tensor_fp8_e4m3_scaled_perrow(const qtensor *t, CUdeviceptr *scale_dev_out) {
+    if (scale_dev_out) *scale_dev_out = 0;
+    if (!t->data || t->n_rows <= 0 || t->n_cols <= 0) return 0;
+    int n_out = t->n_rows;
+    int n_in = t->n_cols;
+    size_t n = (size_t)n_out * n_in;
+    uint8_t *buf = (uint8_t *)malloc(n);
+    float *scales = (float *)malloc((size_t)n_out * sizeof(float));
+    if (!buf || !scales) {
+        free(buf);
+        free(scales);
+        return 0;
+    }
+
+    for (int r = 0; r < n_out; r++) {
+        float max_abs = 0.0f;
+        for (int c = 0; c < n_in; c++) {
+            size_t idx = (size_t)r * n_in + c;
+            float v = 0.0f;
+            if (t->type == GGML_TYPE_F16)
+                v = ggml_fp16_to_fp32(((const uint16_t *)t->data)[idx]);
+            else if (t->type == GGML_TYPE_F32)
+                v = ((const float *)t->data)[idx];
+            float a = fabsf(v);
+            if (a > max_abs) max_abs = a;
+        }
+        float scale = (max_abs > 1.0e-12f) ? (max_abs / 448.0f) : 1.0f;
+        scales[r] = scale;
+        for (int c = 0; c < n_in; c++) {
+            size_t idx = (size_t)r * n_in + c;
+            float v = 0.0f;
+            if (t->type == GGML_TYPE_F16)
+                v = ggml_fp16_to_fp32(((const uint16_t *)t->data)[idx]);
+            else if (t->type == GGML_TYPE_F32)
+                v = ((const float *)t->data)[idx];
+            buf[idx] = f32_to_fp8_e4m3(v / scale);
+        }
+    }
+
+    CUdeviceptr d = 0, d_scale = 0;
+    if (cuMemAlloc(&d, n) != CUDA_SUCCESS) {
+        free(buf);
+        free(scales);
+        return 0;
+    }
+    if (cuMemAlloc(&d_scale, (size_t)n_out * sizeof(float)) != CUDA_SUCCESS) {
+        cuMemFree(d);
+        free(buf);
+        free(scales);
+        return 0;
+    }
+    cuMemcpyHtoD(d, buf, n);
+    cuMemcpyHtoD(d_scale, scales, (size_t)n_out * sizeof(float));
+    if (scale_dev_out) *scale_dev_out = d_scale;
+    free(buf);
+    free(scales);
+    return d;
+}
+
+static CUdeviceptr upload_backbone_weight(cuda_da3_runner *r, const qtensor *t,
+                                          float *scale, CUdeviceptr *scale_d) {
+    if (scale) *scale = 1.0f;
+    if (scale_d) *scale_d = 0;
+    if (!r->use_fp8)
+        return upload_tensor_f32_as_f16(t);
+    if (r->use_fp8_w_perrow)
+        return upload_tensor_fp8_e4m3_scaled_perrow(t, scale_d);
+    return upload_tensor_fp8_e4m3_scaled(t, scale);
+}
+
 /* Upload ConvTranspose2d weight transposed for GEMM-based deconv.
  * Input layout: [Ci, Co, kH, kW] (PyTorch ConvTranspose2d).
  * Output layout: [kH*kW*Co, Ci] as FP16 (GEMM W matrix).
@@ -908,6 +1083,38 @@ cuda_da3_runner *cuda_da3_init(int device_id, int verbose) {
         fprintf(stderr, "cuda_da3: kernel compilation failed\n");
         free(r);
         return NULL;
+    }
+
+    {
+        const char *env_mma = getenv("DA3_MMA_GEMM");
+        r->use_mma_gemm = !(env_mma && env_mma[0] == '0');
+    }
+
+    {
+        const char *env_graph = getenv("DA3_GRAPH");
+        r->use_graph = (env_graph && env_graph[0] != '0') ? 1 : 0;
+    }
+
+    {
+        const char *env_attn = getenv("DA3_MMA_ATTN");
+        r->use_mma_attn = (env_attn && env_attn[0] != '0') ? 1 : 0;
+    }
+
+    {
+        const char *env_wpr = getenv("DA3_FP8_W_PERROW");
+        r->use_fp8_w_perrow = (env_wpr && env_wpr[0] != '0') ? 1 : 0;
+    }
+
+    {
+        const char *env = getenv("DA3_CUBLAS_GEMM");
+        int want_cublas = (env && env[0] != '0') || (!env && r->sm_version < 120);
+        if (want_cublas && cublasewCreate(&r->cublas, r->stream) == 0) {
+            r->use_cublas_gemm = 1;
+        } else if (want_cublas && r->verbose >= 1) {
+            fprintf(stderr, "cuda_da3: cuBLAS GEMM unavailable, using custom kernels\n");
+        } else if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_da3: using custom tensor-core GEMM kernels\n");
+        }
     }
 
     return r;
@@ -1938,6 +2145,11 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
     r->qk_norm_start = qknorm_start;
     r->head_features = head_features;
     r->use_swiglu = has_swiglu;
+    if (r->use_fp8 && embed_dim < 768) {
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_da3: scaled FP8 backbone disabled for dim=%d shapes\n", embed_dim);
+        r->use_fp8 = 0;
+    }
 
     r->grid_h = r->image_size / r->patch_size;
     r->grid_w = r->grid_h;
@@ -1989,7 +2201,7 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
 #define ST_LOAD_BACKBONE_W(field, fmt, ...) \
     snprintf(name, sizeof(name), fmt, __VA_ARGS__); \
     t = da3s_tensor(st, map, map_count, name); \
-    ly->field = r->use_fp8 ? upload_tensor_fp8_e4m3(&t) : upload_tensor_f32_as_f16(&t);
+    ly->field = upload_backbone_weight(r, &t, &ly->field##_scale, &ly->field##_scale_d);
 
         ST_LOAD_F32(ln1_w, "da3.blk.%d.ln1.weight", L)
         ST_LOAD_F32(ln1_b, "da3.blk.%d.ln1.bias", L)
@@ -2732,7 +2944,6 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
         sp_h[1] = sp_w[1] = (gh - 1) * 2 + 2;
         sp_h[2] = sp_w[2] = gh;
         sp_h[3] = sp_w[3] = (gh + 2 - 3) / 2 + 1;
-        int max_hw = sp_h[0] * sp_w[0];
         int fused_h = sp_h[0] * 2, fused_w = sp_w[0] * 2;
         int fused_hw = fused_h * fused_w;
 
@@ -2873,30 +3084,130 @@ static void kl_layernorm(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
 
 static void kl_gemm(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W_f16,
                      CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
+    if (r->use_cublas_gemm && r->cublas) {
+        int ok = -1;
+        if (!r->cublas_need_f16_x) {
+            ok = cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, Y, W_f16, X,
+                                                   n_tok, n_out, n_in);
+            if (ok != 0) r->cublas_need_f16_x = 1;
+        }
+        if (ok != 0 && r->cublas_need_f16_x) {
+            size_t need = (size_t)n_tok * n_in * sizeof(uint16_t);
+            if (need > r->d_gemm_x_f16_cap) {
+                if (r->d_gemm_x_f16) cuMemFree(r->d_gemm_x_f16);
+                r->d_gemm_x_f16 = 0;
+                r->d_gemm_x_f16_cap = 0;
+                if (cuMemAlloc(&r->d_gemm_x_f16, need) == CUDA_SUCCESS) {
+                    r->d_gemm_x_f16_cap = need;
+                }
+            }
+            if (r->d_gemm_x_f16) {
+                int n = n_tok * n_in;
+                void *cargs[] = {&X, &r->d_gemm_x_f16, &n};
+                cuLaunchKernel(r->fn_da3_cast_f32_to_f16,
+                               (unsigned)((n + 255) / 256), 1, 1,
+                               256, 1, 1, 0, r->stream, cargs, NULL);
+                ok = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, Y, W_f16,
+                                                           r->d_gemm_x_f16,
+                                                           n_tok, n_out, n_in);
+            }
+        }
+        if (ok == 0) {
+            if (bias) {
+                void *bargs[] = {&Y, &bias, &n_out, &n_tok};
+                cuLaunchKernel(r->fn_add_bias_f32,
+                               (unsigned)(((size_t)n_out * n_tok + 255) / 256),
+                               1, 1, 256, 1, 1, 0, r->stream, bargs, NULL);
+            }
+            return;
+        }
+    }
+
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
-    /* Use tiled GEMM (correct) instead of MMA GEMM (has output mapping bug) */
-    unsigned gx = (unsigned)((n_out + 63) / 64);
-    unsigned gy = (unsigned)((n_tok + 15) / 16);
-    cuLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,
-                   0, r->stream, args, NULL);
+    if (r->use_mma_gemm && (n_in % 16) == 0) {
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(r->fn_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
+                       16 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+    } else {
+        unsigned gx = (unsigned)((n_out + 63) / 64);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,
+                       0, r->stream, args, NULL);
+    }
 }
 
-static void kl_gemm_fp8(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W_fp8,
-                          CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
-    void *args[] = {&Y, &W_fp8, &X, &bias, &n_out, &n_in, &n_tok};
+static int kl_gemm_fp8_scaled(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W_fp8,
+                              CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in,
+                              int n_tok, float w_scale, CUdeviceptr w_scale_pr) {
+    if (!r->fn_reduce_max_abs_per_row_f32 || !r->fn_gemm_fp8_pipe_perrow_f32 ||
+        n_tok < 16 || (n_out % 256) != 0 || (n_in % 32) != 0) {
+        return -1;
+    }
+
+    size_t need = (size_t)n_tok * sizeof(float);
+    if (need > r->d_row_max_buf_cap) {
+        if (r->d_row_max_buf) cuMemFree(r->d_row_max_buf);
+        r->d_row_max_buf = 0;
+        r->d_row_max_buf_cap = 0;
+        if (cuMemAlloc(&r->d_row_max_buf, need) != CUDA_SUCCESS)
+            return -1;
+        r->d_row_max_buf_cap = need;
+    }
+
+    void *rargs[] = {&r->d_row_max_buf, &X, &n_tok, &n_in};
+    cuLaunchKernel(r->fn_reduce_max_abs_per_row_f32, (unsigned)n_tok, 1, 1,
+                   256, 1, 1, 0, r->stream, rargs, NULL);
+
+    if (w_scale_pr && r->fn_gemm_fp8_pipe_perrow_mt4_wpr_f32) {
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        gx = (gx + 3u) & ~3u;
+        gy = (gy + 3u) & ~3u;
+        size_t smem = 2048 + 8192 * 2 + 512 + 1024;
+        void *args[] = {&Y, &W_fp8, &X, &bias, &n_out, &n_in, &n_tok, &w_scale_pr, &r->d_row_max_buf};
+        cuLaunchKernel(r->fn_gemm_fp8_pipe_perrow_mt4_wpr_f32, gx, gy, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+        return 0;
+    }
+
+    void *args[] = {&Y, &W_fp8, &X, &bias, &n_out, &n_in, &n_tok, &w_scale, &r->d_row_max_buf};
     unsigned gx = (unsigned)((n_out + 255) / 256);
-    unsigned gy = (unsigned)((n_tok + 15) / 16);
-    cuLaunchKernel(r->fn_gemm_fp8_f32, gx, gy, 1, 128, 1, 1,
-                   16 * 32 * (unsigned)sizeof(float), r->stream, args, NULL);
+    if (r->fn_gemm_fp8_pipe_perrow_mt4_f32 && n_tok >= 64 && (n_tok % 64) == 0) {
+        unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+        gx = (gx + 3u) & ~3u;
+        gy4 = (gy4 + 3u) & ~3u;
+        size_t smem = 2048 + 8192 * 2 + 512;
+        cuLaunchKernel(r->fn_gemm_fp8_pipe_perrow_mt4_f32, gx, gy4, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+    } else {
+        unsigned gy = (unsigned)((n_tok + 31) / 32);
+        gx = (gx + 3u) & ~3u;
+        gy = (gy + 3u) & ~3u;
+        size_t smem = 1024 + 8192 * 2 + 256;
+        cuLaunchKernel(r->fn_gemm_fp8_pipe_perrow_f32, gx, gy, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+    }
+    return 0;
 }
 
 /* Dispatch backbone GEMM: FP8 if available, else FP16 */
 static void kl_backbone_gemm(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W,
-                               CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
-    if (r->use_fp8)
-        kl_gemm_fp8(r, Y, W, X, bias, n_out, n_in, n_tok);
-    else
-        kl_gemm(r, Y, W, X, bias, n_out, n_in, n_tok);
+                               CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in,
+                               int n_tok, float w_scale, CUdeviceptr w_scale_pr) {
+    if (r->use_fp8) {
+        if (kl_gemm_fp8_scaled(r, Y, W, X, bias, n_out, n_in, n_tok, w_scale, w_scale_pr) == 0)
+            return;
+        /* Shape not covered by the scaled pipe. Fall through to the legacy raw
+         * FP8 kernel for opt-in experiments only. */
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(r->fn_gemm_fp8_f32, gx, gy, 1, 128, 1, 1,
+                       16 * 32 * (unsigned)sizeof(float), r->stream, args, NULL);
+        return;
+    }
+    kl_gemm(r, Y, W, X, bias, n_out, n_in, n_tok);
 }
 
 static void kl_qk_layernorm(cuda_da3_runner *r, CUdeviceptr vec, CUdeviceptr w,
@@ -2937,7 +3248,15 @@ static void kl_attn_prefill(cuda_da3_runner *r, CUdeviceptr out, CUdeviceptr qkv
                               int n_tok, int dim, int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
     void *args[] = {&out, &qkv, &K_t, &V_t, &n_tok, &dim, &n_heads, &head_dim, &scale};
-    /* Use tiled FlashAttention (no MMA) — MMA attn_prefill_f32 has fragment mapping bug */
+    if (r->use_mma_attn) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        cuLaunchKernel(r->fn_attn_prefill_f32,
+                       (unsigned)n_heads, gy, 1,
+                       128, 1, 1, 0, r->stream, args, NULL);
+        return;
+    }
+    /* Scalar tiled attention is the default precision path. MMA attention is
+     * faster but has small numeric drift, so it is opt-in via DA3_MMA_ATTN=1. */
     int bq = 64, bkv = 16;
     unsigned smem_size = (unsigned)(2 * bkv * head_dim * sizeof(float));
     unsigned gy = (unsigned)((n_tok + bq - 1) / bq);
@@ -3042,18 +3361,14 @@ static void kl_conv2d(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
                    0, r->stream, args, NULL);
 }
 
-/* Conv2d via scalar kernel (MMA conv_gemm has fragment mapping bug on sm_86).
+/* Conv2d fallback for shapes the tensor-core kernel cannot cover.
  * Weight w_f16 is FP16 [Co, Ci*kH*kW]. conv2d_f32 expects F32 weight,
- * so we dequant to F32 on host, upload, and use the scalar kernel.
- * For correctness first — can optimize later with a tiled non-MMA variant. */
-static void kl_conv_gemm(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
-                           CUdeviceptr w_f16, CUdeviceptr bias, int H, int W,
-                           int Ci, int Co, int kH, int kW, int stride, int pad) {
-    /* Dequant F16 weight to F32 on device would be ideal but conv2d_f32
-     * actually reads F32 weights. Use the existing kl_conv2d which accepts F32. */
+ * so we dequant to F32 on host, upload, and use the scalar kernel. */
+static void kl_conv_scalar_f16_weight(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
+                                      CUdeviceptr w_f16, CUdeviceptr bias, int H, int W,
+                                      int Ci, int Co, int kH, int kW, int stride, int pad) {
     int K = Ci * kH * kW;
     int n = Co * K;
-    /* Download F16 weights, convert to F32, re-upload */
     uint16_t *h_w16 = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
     float *h_w32 = (float *)malloc((size_t)n * sizeof(float));
     cuMemcpyDtoH(h_w16, w_f16, (size_t)n * sizeof(uint16_t));
@@ -3064,6 +3379,25 @@ static void kl_conv_gemm(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
     free(h_w16); free(h_w32);
     kl_conv2d(r, dst, src, d_w32, bias, H, W, Ci, Co, kH, kW, stride, pad);
     cuMemFree(d_w32);
+}
+
+static void kl_conv_gemm(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
+                           CUdeviceptr w_f16, CUdeviceptr bias, int H, int W,
+                           int Ci, int Co, int kH, int kW, int stride, int pad) {
+    int K = Ci * kH * kW;
+    if ((K % 16) == 0) {
+        int Ho = (H + 2 * pad - kH) / stride + 1;
+        int Wo = (W + 2 * pad - kW) / stride + 1;
+        int M = Ho * Wo;
+        void *args[] = {&dst, &src, &w_f16, &bias, &H, &W, &Ci, &Co,
+                        &kH, &kW, &stride, &pad};
+        unsigned gx = (unsigned)((Co + 63) / 64);
+        unsigned gy = (unsigned)((M + 63) / 64);
+        cuLaunchKernel(r->fn_conv_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
+                       64 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+        return;
+    }
+    kl_conv_scalar_f16_weight(r, dst, src, w_f16, bias, H, W, Ci, Co, kH, kW, stride, pad);
 }
 
 /* GEMM-based ConvTranspose2d for stride-aligned case (kH==stride, kW==stride).
@@ -3143,6 +3477,21 @@ static void kl_sigmoid_inplace(cuda_da3_runner *r, CUdeviceptr x, int n) {
     void *args[] = {&x, &n};
     cuLaunchKernel(r->fn_sigmoid_f32, (unsigned)grid, 1, 1, 256, 1, 1,
                    0, r->stream, args, NULL);
+}
+
+static void da3_download_depth_result(cuda_da3_runner *r, da3_full_result *result,
+                                      int img_w, int img_h) {
+    size_t result_sz = (size_t)2 * img_h * img_w * sizeof(float);
+    float *h_result = (float *)malloc(result_sz);
+    cuMemcpyDtoH(h_result, r->d_result, result_sz);
+    result->width = img_w;
+    result->height = img_h;
+    result->depth = (float *)malloc((size_t)img_w * img_h * sizeof(float));
+    result->confidence = (float *)malloc((size_t)img_w * img_h * sizeof(float));
+    memcpy(result->depth, h_result, (size_t)img_w * img_h * sizeof(float));
+    memcpy(result->confidence, h_result + img_h * img_w,
+           (size_t)img_w * img_h * sizeof(float));
+    free(h_result);
 }
 
 /* RCU: relu -> conv3x3 -> relu -> conv3x3 + residual
@@ -3550,6 +3899,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     int gh = r->grid_h, gw = r->grid_w;
     int ps = r->patch_size;
     int target_h = gh * ps, target_w = gw * ps;
+    int graph_capture = 0;
+    int graph_eligible = (r->use_graph && r->verbose == 0 &&
+                          output_flags == DA3_OUTPUT_DEPTH && pose_in == NULL);
 
     double t0, t1;
     struct timespec ts;
@@ -3567,6 +3919,31 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     }
     CUdeviceptr d_img_raw = r->d_img_raw;
     cuMemcpyHtoD(d_img_raw, rgb, img_bytes);
+
+    if (graph_eligible) {
+        size_t result_sz = (size_t)2 * img_h * img_w * sizeof(float);
+        if (result_sz > r->d_result_cap) {
+            if (r->d_result) cuMemFree(r->d_result);
+            cuMemAlloc(&r->d_result, result_sz);
+            r->d_result_cap = result_sz;
+        }
+        if (r->graph_valid && r->graph_w == img_w && r->graph_h == img_h) {
+            cuGraphLaunch(r->depth_graph_exec, r->stream);
+            cuStreamSynchronize(r->stream);
+            da3_download_depth_result(r, &result, img_w, img_h);
+            return result;
+        }
+        if (r->graph_valid) {
+            if (r->depth_graph_exec) cuGraphExecDestroy(r->depth_graph_exec);
+            if (r->depth_graph) cuGraphDestroy(r->depth_graph);
+            r->depth_graph_exec = 0;
+            r->depth_graph = 0;
+            r->graph_valid = 0;
+        }
+        if (cuStreamBeginCapture(r->stream, CU_STREAM_CAPTURE_MODE_GLOBAL) == CUDA_SUCCESS) {
+            graph_capture = 1;
+        }
+    }
 
     /* Resize + normalize on GPU -> d_img_norm [3, target_h, target_w] */
     {
@@ -3662,7 +4039,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     int do_prof = (r->verbose >= 2);
     double prof_ln = 0, prof_gemm = 0, prof_bias = 0, prof_qknorm = 0;
     double prof_rope = 0, prof_attn = 0, prof_act = 0, prof_ls = 0, prof_feat = 0;
-    double pt0, pt1;
+    double pt0 = 0.0, pt1;
 
 #define PROF_START() do { if (do_prof) { cuStreamSynchronize(r->stream); \
     clock_gettime(CLOCK_MONOTONIC, &ts); pt0 = ts.tv_sec + ts.tv_nsec * 1e-9; } } while(0)
@@ -3698,7 +4075,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* 2. QKV projection (bias fused) */
         PROF_START();
         kl_backbone_gemm(r, r->d_qkv, ly->attn_qkv_w, r->d_ln_buf, ly->attn_qkv_b,
-                 ly->qkv_rows, ly->qkv_cols, nt);
+                 ly->qkv_rows, ly->qkv_cols, nt, ly->attn_qkv_w_scale, ly->attn_qkv_w_scale_d);
         PROF_END(prof_gemm);
 
         /* 3. QK Normalization (stride=3*dim for interleaved QKV) */
@@ -3844,7 +4221,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* 6. Output projection (bias fused) */
         PROF_START();
         kl_backbone_gemm(r, r->d_proj_out, ly->attn_out_w, r->d_attn_out, ly->attn_out_b,
-                 ly->out_rows, ly->out_cols, nt);
+                 ly->out_rows, ly->out_cols, nt, ly->attn_out_w_scale, ly->attn_out_w_scale_d);
         PROF_END(prof_gemm);
 
         /* Debug: dump attn proj output at block 4 */
@@ -3885,7 +4262,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
             /* SwiGLU: gate_up projection (bias fused) */
             PROF_START();
             kl_backbone_gemm(r, r->d_ffn_buf, ly->ffn_gate_up_w, r->d_ln_buf, ly->ffn_gate_up_b,
-                     ly->ffn_gu_rows, ly->ffn_gu_cols, nt);
+                     ly->ffn_gu_rows, ly->ffn_gu_cols, nt, ly->ffn_gate_up_w_scale, ly->ffn_gate_up_w_scale_d);
             PROF_END(prof_gemm);
             /* SwiGLU activation -> d_ffn_mid */
             PROF_START();
@@ -3895,20 +4272,20 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
             /* Down projection (bias fused) */
             PROF_START();
             kl_backbone_gemm(r, r->d_proj_out, ly->ffn_down_w, r->d_ffn_mid, ly->ffn_down_b,
-                     ly->ffn_down_rows, hid, nt);
+                     ly->ffn_down_rows, hid, nt, ly->ffn_down_w_scale, ly->ffn_down_w_scale_d);
             PROF_END(prof_gemm);
         } else if (ly->ffn_up_w) {
             /* GELU MLP (bias fused) */
             PROF_START();
             kl_backbone_gemm(r, r->d_ffn_buf, ly->ffn_up_w, r->d_ln_buf, ly->ffn_up_b,
-                     ly->ffn_up_rows, ly->ffn_up_cols, nt);
+                     ly->ffn_up_rows, ly->ffn_up_cols, nt, ly->ffn_up_w_scale, ly->ffn_up_w_scale_d);
             PROF_END(prof_gemm);
             PROF_START();
             kl_gelu(r, r->d_ffn_buf, nt * ly->ffn_up_rows);
             PROF_END(prof_act);
             PROF_START();
             kl_backbone_gemm(r, r->d_proj_out, ly->ffn_down_w, r->d_ffn_buf, ly->ffn_down_b,
-                     ly->ffn_down_rows, ly->ffn_up_rows, nt);
+                     ly->ffn_down_rows, ly->ffn_up_rows, nt, ly->ffn_down_w_scale, ly->ffn_down_w_scale_d);
             PROF_END(prof_gemm);
         }
 
@@ -3971,7 +4348,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
 #undef PROF_END
 
     /* Synchronize after backbone */
-    cuStreamSynchronize(r->stream);
+    if (!graph_capture)
+        cuStreamSynchronize(r->stream);
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -4194,75 +4572,71 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     /* Level 3 (deepest, no deeper input) → upsample to level 2 adapter size */
     gpu_refinenet(r, 3, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
                   0, 0, 0, feat, r->d_dpt_fused,
-                  sp_h[2], sp_w[2]);
-    int fh = sp_h[2], fw = sp_w[2];
+                  sp_h[3], sp_w[3]);
+    int fh = sp_h[3], fw = sp_w[3];
 
     /* Level 2 → upsample to level 1 adapter size */
     gpu_refinenet(r, 2, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
                   r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
-                  sp_h[1], sp_w[1]);
-    fh = sp_h[1]; fw = sp_w[1];
+                  sp_h[2], sp_w[2]);
+    fh = sp_h[2]; fw = sp_w[2];
 
     /* Level 1 → upsample to level 0 adapter size */
     gpu_refinenet(r, 1, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
                   r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
-                  sp_h[0], sp_w[0]);
-    fh = sp_h[0]; fw = sp_w[0];
+                  sp_h[1], sp_w[1]);
+    fh = sp_h[1]; fw = sp_w[1];
 
-    /* Level 0 → scale_factor=2 (0 means use 2x) */
+    /* Level 0 stays at fusion resolution. The PyTorch reference applies the
+     * output convolutions at path1 resolution and upsamples only final logits. */
     gpu_refinenet(r, 0, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
                   r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
-                  0, 0);
-    fh = sp_h[0] * 2; fw = sp_w[0] * 2;  /* 296×296 */
+                  sp_h[0], sp_w[0]);
+    fh = sp_h[0]; fw = sp_w[0];  /* 148×148 for DA3-Small */
     DPT_PROF_END(dpt_refine);
 
-    /* Output convolutions — matching official DA3 DualDPT._forward_impl:
-     * 1. output_conv1 (neck): Conv2d(64→32, 3x3) — NO ReLU (applied in _fuse)
-     * 2. Bilinear upsample from patch-grid res (148) to model res (518)
-     * 3. Sinusoidal UV pos_embed (ratio=0.1)
-     * 4. output_conv2: Conv2d(32→32, 3x3) + ReLU + Conv2d(32→2, 1x1)
-     * 5. depth_activation: exp(depth), exp(conf)+1
+    /* Output convolutions at fusion resolution:
+     * 1. output_conv1 (neck): Conv2d(feat→feat/2, 3x3)
+     * 2. Sinusoidal UV pos_embed (ratio=0.1)
+     * 3. output_conv2: Conv2d(feat/2→out_mid, 3x3) + ReLU + Conv2d(out_mid→2, 1x1)
+     * 4. depth_activation: exp(depth), exp(conf)+1
+     * 5. Bilinear upsample final depth/confidence to original resolution
      */
     DPT_PROF_START();
     int feat_half = feat / 2;
     if (feat_half < 1) feat_half = 1;
     int out_mid = dw->out_mid > 0 ? dw->out_mid : feat_half; /* typically 32 */
-    int full_h = r->image_size, full_w = r->image_size;
-
     /* Step 1: neck (output_conv1): Conv2d(feat, feat/2, 3, pad=1) — NO ReLU */
     kl_conv_gemm(r, r->d_dpt_tmp, r->d_dpt_fused,
                   dw->neck_w, dw->neck_b,
                   fh, fw, feat, feat_half, 3, 3, 1, 1);
 
-    /* Step 2: Bilinear upsample from fused res to model res (296→518) */
-    kl_bilinear(r, r->d_dpt_fullres1, r->d_dpt_tmp, feat_half, fh, fw, full_h, full_w);
-
-    /* Step 3: DPT positional embedding (sinusoidal UV, ratio=0.1) */
+    /* Step 2: DPT positional embedding (sinusoidal UV, ratio=0.1) */
     {
-        float aspect = (float)full_w / (float)full_h;
+        float aspect = (float)fw / (float)fh;
         float ratio = 0.1f;
-        int total = feat_half * full_h * full_w;
+        int total = feat_half * fh * fw;
         int grid = (total + 255) / 256;
-        void *args[] = {&r->d_dpt_fullres1, &feat_half, &full_h, &full_w, &aspect, &ratio};
+        void *args[] = {&r->d_dpt_tmp, &feat_half, &fh, &fw, &aspect, &ratio};
         cuLaunchKernel(r->fn_dpt_pos_embed, (unsigned)grid, 1, 1, 256, 1, 1,
                        0, r->stream, args, NULL);
     }
 
-    /* Step 4: output_conv2 at full model resolution */
+    /* Step 3: output_conv2 at fusion resolution */
     /* Conv2d(feat/2, out_mid, 3, pad=1) + ReLU */
-    kl_conv_gemm(r, r->d_dpt_fullres2, r->d_dpt_fullres1,
+    kl_conv_gemm(r, r->d_dpt_tmp2, r->d_dpt_tmp,
                   dw->out_0_w, dw->out_0_b,
-                  full_h, full_w, feat_half, out_mid, 3, 3, 1, 1);
-    kl_relu_inplace(r, r->d_dpt_fullres2, out_mid * full_h * full_w);
+                  fh, fw, feat_half, out_mid, 3, 3, 1, 1);
+    kl_relu_inplace(r, r->d_dpt_tmp2, out_mid * fh * fw);
 
     /* Conv2d(out_mid, 2, 1) */
-    kl_conv2d(r, r->d_dpt_out, r->d_dpt_fullres2,
+    kl_conv2d(r, r->d_dpt_out, r->d_dpt_tmp2,
                dw->out_2_w, dw->out_2_b,
-               full_h, full_w, out_mid, 2, 1, 1, 1, 0);
+               fh, fw, out_mid, 2, 1, 1, 1, 0);
 
-    /* Step 5: depth_activation: exp(depth), exp(confidence)+1 */
+    /* Step 4: depth_activation: exp(depth), exp(confidence)+1 */
     {
-        int hw = full_h * full_w;
+        int hw = fh * fw;
         int grid = (hw + 255) / 256;
         void *args[] = {&r->d_dpt_out, &hw};
         cuLaunchKernel(r->fn_depth_activation, (unsigned)grid, 1, 1, 256, 1, 1,
@@ -4281,23 +4655,12 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         }
         CUdeviceptr d_result = r->d_result;
 
-        kl_bilinear(r, d_result, r->d_dpt_out, 2, full_h, full_w, img_h, img_w);
+        kl_bilinear(r, d_result, r->d_dpt_out, 2, fh, fw, img_h, img_w);
 
-        /* Synchronize before downloading */
-        cuStreamSynchronize(r->stream);
-
-        /* Download result to host */
-        float *h_result = (float *)malloc(result_sz);
-        cuMemcpyDtoH(h_result, d_result, result_sz);
-
-        result.width = img_w;
-        result.height = img_h;
-        result.depth = (float *)malloc((size_t)img_w * img_h * sizeof(float));
-        result.confidence = (float *)malloc((size_t)img_w * img_h * sizeof(float));
-        memcpy(result.depth, h_result, (size_t)img_w * img_h * sizeof(float));
-        memcpy(result.confidence, h_result + img_h * img_w,
-               (size_t)img_w * img_h * sizeof(float));
-        free(h_result);
+        if (!graph_capture) {
+            cuStreamSynchronize(r->stream);
+            da3_download_depth_result(r, &result, img_w, img_h);
+        }
     }
     DPT_PROF_END(dpt_upsample);
 
@@ -4320,6 +4683,41 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         fprintf(stderr, "    final_up:    %5.1f ms\n", dpt_upsample*1000);
     }
 
+    if (graph_capture) {
+        CUgraph g = 0;
+        CUresult end_err = cuStreamEndCapture(r->stream, &g);
+        if (end_err == CUDA_SUCCESS && g) {
+            CUgraphExec exec = 0;
+            CUresult inst_err = cuGraphInstantiate(&exec, g, 0);
+            if (inst_err == CUDA_SUCCESS && exec) {
+                r->depth_graph = g;
+                r->depth_graph_exec = exec;
+                r->graph_w = img_w;
+                r->graph_h = img_h;
+                r->graph_valid = 1;
+                cuGraphLaunch(exec, r->stream);
+                cuStreamSynchronize(r->stream);
+                da3_download_depth_result(r, &result, img_w, img_h);
+                return result;
+            }
+            if (getenv("DA3_GRAPH_DEBUG"))
+                fprintf(stderr, "cuda_da3: graph instantiate failed: %s\n",
+                        cuewErrorString(inst_err));
+            cuGraphDestroy(g);
+        } else if (getenv("DA3_GRAPH_DEBUG")) {
+            fprintf(stderr, "cuda_da3: stream end capture failed: %s graph=%p\n",
+                    cuewErrorString(end_err), (void *)g);
+        }
+        graph_capture = 0;
+        {
+            int saved_graph = r->use_graph;
+            r->use_graph = 0;
+            result = cuda_da3_predict_full(r, rgb, img_w, img_h, output_flags, pose_in);
+            r->use_graph = saved_graph;
+            return result;
+        }
+    }
+
     /* ─── Aux DPT (Phase 2): rays + sky segmentation ─── */
     if (r->dpt_aux.loaded && (output_flags & DA3_OUTPUT_RAYS)) {
         clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -4331,8 +4729,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* Only last level (index 3) is used — single output in d_aux_out[0].
          * After refinenet upsample fix, output is at fused resolution (2x level 0). */
         int oh = sp_h[0] * 2, ow = sp_w[0] * 2;
-        int aux_hw = oh * ow;
-
         /* Bilinear upsample 7 channels to original resolution.
          * d_dpt_tmp is too small (feat*fused_hw ≈ 5.6M) for 7*img_h*img_w (≈20M).
          * Allocate a temporary GPU buffer for the full-res output. */
@@ -4555,8 +4951,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         int mdim = r->metric.dim;
         int mn_heads = r->metric.n_heads;
         int mhead_dim = r->metric.head_dim;
-        int mstride_3dim = 3 * mdim;
-
         /* 1. Re-run patch embed with metric weights → d_hidden */
         {
             int img_dim = gw * ps;
@@ -4594,8 +4988,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
             kl_layernorm(r, r->d_ln_buf, r->d_hidden, ly->ln1_w, ly->ln1_b, nt, mdim);
 
             /* QKV projection */
-            kl_backbone_gemm(r, r->d_qkv, ly->attn_qkv_w, r->d_ln_buf, ly->attn_qkv_b,
-                             ly->qkv_rows, ly->qkv_cols, nt);
+            kl_gemm(r, r->d_qkv, ly->attn_qkv_w, r->d_ln_buf, ly->attn_qkv_b,
+                    ly->qkv_rows, ly->qkv_cols, nt);
 
             /* No QKNorm, no RoPE for metric backbone */
 
@@ -4609,8 +5003,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
             }
 
             /* Output projection */
-            kl_backbone_gemm(r, r->d_proj_out, ly->attn_out_w, r->d_attn_out, ly->attn_out_b,
-                             ly->out_rows, ly->out_cols, nt);
+            kl_gemm(r, r->d_proj_out, ly->attn_out_w, r->d_attn_out, ly->attn_out_b,
+                    ly->out_rows, ly->out_cols, nt);
 
             /* LayerScale + residual: hidden = hidden + ls1 * proj_out */
             kl_layerscale_add(r, r->d_hidden, r->d_proj_out, ly->ls1, mdim, nt * mdim);
@@ -4619,11 +5013,11 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
             kl_layernorm(r, r->d_ln_buf, r->d_hidden, ly->ln2_w, ly->ln2_b, nt, mdim);
 
             /* GELU MLP: up → gelu → down */
-            kl_backbone_gemm(r, r->d_ffn_buf, ly->ffn_up_w, r->d_ln_buf, ly->ffn_up_b,
-                             ly->ffn_up_rows, ly->ffn_up_cols, nt);
+            kl_gemm(r, r->d_ffn_buf, ly->ffn_up_w, r->d_ln_buf, ly->ffn_up_b,
+                    ly->ffn_up_rows, ly->ffn_up_cols, nt);
             kl_gelu(r, r->d_ffn_buf, nt * ly->ffn_up_rows);
-            kl_backbone_gemm(r, r->d_proj_out, ly->ffn_down_w, r->d_ffn_buf, ly->ffn_down_b,
-                             ly->ffn_down_rows, ly->ffn_down_cols, nt);
+            kl_gemm(r, r->d_proj_out, ly->ffn_down_w, r->d_ffn_buf, ly->ffn_down_b,
+                    ly->ffn_down_rows, ly->ffn_down_cols, nt);
 
             /* LayerScale + residual: hidden = hidden + ls2 * mlp_out */
             kl_layerscale_add(r, r->d_hidden, r->d_proj_out, ly->ls2, mdim, nt * mdim);
@@ -4810,22 +5204,27 @@ void cuda_da3_free(cuda_da3_runner *r) {
             if (ly->ln1_w) cuMemFree(ly->ln1_w);
             if (ly->ln1_b) cuMemFree(ly->ln1_b);
             if (ly->attn_qkv_w) cuMemFree(ly->attn_qkv_w);
+            if (ly->attn_qkv_w_scale_d) cuMemFree(ly->attn_qkv_w_scale_d);
             if (ly->attn_qkv_b) cuMemFree(ly->attn_qkv_b);
             if (ly->attn_q_norm_w) cuMemFree(ly->attn_q_norm_w);
             if (ly->attn_q_norm_b) cuMemFree(ly->attn_q_norm_b);
             if (ly->attn_k_norm_w) cuMemFree(ly->attn_k_norm_w);
             if (ly->attn_k_norm_b) cuMemFree(ly->attn_k_norm_b);
             if (ly->attn_out_w) cuMemFree(ly->attn_out_w);
+            if (ly->attn_out_w_scale_d) cuMemFree(ly->attn_out_w_scale_d);
             if (ly->attn_out_b) cuMemFree(ly->attn_out_b);
             if (ly->ls1) cuMemFree(ly->ls1);
             if (ly->ls2) cuMemFree(ly->ls2);
             if (ly->ln2_w) cuMemFree(ly->ln2_w);
             if (ly->ln2_b) cuMemFree(ly->ln2_b);
             if (ly->ffn_gate_up_w) cuMemFree(ly->ffn_gate_up_w);
+            if (ly->ffn_gate_up_w_scale_d) cuMemFree(ly->ffn_gate_up_w_scale_d);
             if (ly->ffn_gate_up_b) cuMemFree(ly->ffn_gate_up_b);
             if (ly->ffn_up_w) cuMemFree(ly->ffn_up_w);
+            if (ly->ffn_up_w_scale_d) cuMemFree(ly->ffn_up_w_scale_d);
             if (ly->ffn_up_b) cuMemFree(ly->ffn_up_b);
             if (ly->ffn_down_w) cuMemFree(ly->ffn_down_w);
+            if (ly->ffn_down_w_scale_d) cuMemFree(ly->ffn_down_w_scale_d);
             if (ly->ffn_down_b) cuMemFree(ly->ffn_down_b);
         }
         free(r->layers);
@@ -4851,6 +5250,8 @@ void cuda_da3_free(cuda_da3_runner *r) {
     if (r->d_ffn_buf) cuMemFree(r->d_ffn_buf);
     if (r->d_ffn_mid) cuMemFree(r->d_ffn_mid);
     if (r->d_proj_out) cuMemFree(r->d_proj_out);
+    if (r->d_gemm_x_f16) cuMemFree(r->d_gemm_x_f16);
+    if (r->d_row_max_buf) cuMemFree(r->d_row_max_buf);
     if (r->d_pos_y) cuMemFree(r->d_pos_y);
     if (r->d_pos_x) cuMemFree(r->d_pos_x);
     if (r->d_pos_y_nd) cuMemFree(r->d_pos_y_nd);
@@ -4942,8 +5343,10 @@ void cuda_da3_free(cuda_da3_runner *r) {
                 if (ly->ln1_w) cuMemFree(ly->ln1_w);
                 if (ly->ln1_b) cuMemFree(ly->ln1_b);
                 if (ly->attn_qkv_w) cuMemFree(ly->attn_qkv_w);
+                if (ly->attn_qkv_w_scale_d) cuMemFree(ly->attn_qkv_w_scale_d);
                 if (ly->attn_qkv_b) cuMemFree(ly->attn_qkv_b);
                 if (ly->attn_out_w) cuMemFree(ly->attn_out_w);
+                if (ly->attn_out_w_scale_d) cuMemFree(ly->attn_out_w_scale_d);
                 if (ly->attn_out_b) cuMemFree(ly->attn_out_b);
                 if (ly->ls1) cuMemFree(ly->ls1);
                 if (ly->ls2) cuMemFree(ly->ls2);
@@ -5061,10 +5464,13 @@ void cuda_da3_free(cuda_da3_runner *r) {
                 if (ly->ln2_w) cuMemFree(ly->ln2_w);
                 if (ly->ln2_b) cuMemFree(ly->ln2_b);
                 if (ly->ffn_gate_up_w) cuMemFree(ly->ffn_gate_up_w);
+                if (ly->ffn_gate_up_w_scale_d) cuMemFree(ly->ffn_gate_up_w_scale_d);
                 if (ly->ffn_gate_up_b) cuMemFree(ly->ffn_gate_up_b);
                 if (ly->ffn_up_w) cuMemFree(ly->ffn_up_w);
+                if (ly->ffn_up_w_scale_d) cuMemFree(ly->ffn_up_w_scale_d);
                 if (ly->ffn_up_b) cuMemFree(ly->ffn_up_b);
                 if (ly->ffn_down_w) cuMemFree(ly->ffn_down_w);
+                if (ly->ffn_down_w_scale_d) cuMemFree(ly->ffn_down_w_scale_d);
                 if (ly->ffn_down_b) cuMemFree(ly->ffn_down_b);
             }
             free(r->metric.layers);
@@ -5107,6 +5513,9 @@ void cuda_da3_free(cuda_da3_runner *r) {
     /* Free CPU model */
     if (r->cpu_model) da3_free(r->cpu_model);
 
+    if (r->cublas) cublasewDestroy(r->cublas);
+    if (r->depth_graph_exec) cuGraphExecDestroy(r->depth_graph_exec);
+    if (r->depth_graph) cuGraphDestroy(r->depth_graph);
     if (r->module) cuModuleUnload(r->module);
     if (r->stream) cuStreamDestroy(r->stream);
     if (r->context) cuCtxDestroy(r->context);

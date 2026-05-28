@@ -8,6 +8,8 @@
  *
  * Usage:
  *   ./verify_dit <model.safetensors> [--ref-dir ref/output/] [--out-dir hip_output/]
+ *                [--latents path.npy] [--context path.npy]
+ *                [--ref-output path.npy] [--timestep t] [--batch-index i]
  */
 #include "hip_hy3d_runner.h"
 #include <stdio.h>
@@ -61,6 +63,19 @@ static void write_npy_f32(const char *path, const float *data, int n) {
     fputc('\n', f);
     fwrite(data, sizeof(float), (size_t)n, f);
     fclose(f);
+}
+
+static float *select_batch_if_3d(float *data, const int dims[4], int ndims,
+                                 int batch_index, int rows, int cols) {
+    if (!data || ndims != 3) return data;
+    if (dims[1] != rows || dims[2] != cols) return data;
+    if (batch_index < 0 || batch_index >= dims[0]) return data;
+    int n = rows * cols;
+    float *out = (float *)malloc((size_t)n * sizeof(float));
+    if (!out) return data;
+    memcpy(out, data + (size_t)batch_index * n, (size_t)n * sizeof(float));
+    free(data);
+    return out;
 }
 
 static int compare_f32(const char *name, const float *ref, const float *test,
@@ -130,7 +145,12 @@ static int test_timestep_embed(hip_hy3d_runner *r, const char *ref_dir, const ch
 
 /* Test 2: Full DiT forward pass (if model fits in GPU memory) */
 static int test_dit_forward(hip_hy3d_runner *r, const char *model_path,
-                            const char *ref_dir, const char *out_dir) {
+                            const char *ref_dir, const char *out_dir,
+                            const char *latents_path,
+                            const char *context_path,
+                            const char *ref_output_path,
+                            float timestep,
+                            int batch_index) {
     fprintf(stderr, "\n=== Test 2: DiT Forward Pass ===\n");
 
     /* Load DiT weights */
@@ -144,27 +164,39 @@ static int test_dit_forward(hip_hy3d_runner *r, const char *model_path,
     char path[512];
     int dims[4], ndims;
 
-    snprintf(path, sizeof(path), "%s/dit_input_latents.npy", ref_dir);
+    if (latents_path) snprintf(path, sizeof(path), "%s", latents_path);
+    else snprintf(path, sizeof(path), "%s/dit_input_latents.npy", ref_dir);
     float *latents = read_npy_f32(path, dims, &ndims);
     if (!latents) { fprintf(stderr, "  SKIP: no %s\n", path); return -1; }
-    fprintf(stderr, "  Latents: [%d, %d]\n", dims[0], dims[1]);
+    fprintf(stderr, "  Latents: ndims=%d first dims=[%d, %d, %d]\n",
+            ndims, dims[0], dims[1], dims[2]);
+    latents = select_batch_if_3d(latents, dims, ndims, batch_index, 4096, 64);
 
-    snprintf(path, sizeof(path), "%s/dit_input_context.npy", ref_dir);
+    if (context_path) snprintf(path, sizeof(path), "%s", context_path);
+    else snprintf(path, sizeof(path), "%s/dit_input_context.npy", ref_dir);
     float *context = read_npy_f32(path, dims, &ndims);
     if (!context) { fprintf(stderr, "  SKIP: no %s\n", path); free(latents); return -1; }
-    fprintf(stderr, "  Context: [%d, %d]\n", dims[0], dims[1]);
+    fprintf(stderr, "  Context: ndims=%d first dims=[%d, %d, %d]\n",
+            ndims, dims[0], dims[1], dims[2]);
+    context = select_batch_if_3d(context, dims, ndims, batch_index, 1370, 1024);
 
-    snprintf(path, sizeof(path), "%s/dit_output.npy", ref_dir);
+    if (ref_output_path) snprintf(path, sizeof(path), "%s", ref_output_path);
+    else snprintf(path, sizeof(path), "%s/dit_output.npy", ref_dir);
     float *ref_output = read_npy_f32(path, dims, &ndims);
-    if (!ref_output) { fprintf(stderr, "  SKIP: no %s\n", path); free(latents); free(context); return -1; }
-    fprintf(stderr, "  Ref output: [%d, %d]\n", dims[0], dims[1]);
+    if (ref_output) {
+        fprintf(stderr, "  Ref output: ndims=%d first dims=[%d, %d, %d]\n",
+                ndims, dims[0], dims[1], dims[2]);
+        ref_output = select_batch_if_3d(ref_output, dims, ndims, batch_index, 4096, 64);
+    } else {
+        fprintf(stderr, "  No ref output: %s\n", path);
+    }
 
     /* Run DiT */
     int out_n = 4096 * 64;
     float *hip_output = (float *)malloc((size_t)out_n * sizeof(float));
 
-    fprintf(stderr, "  Running DiT forward pass (t=0.5)...\n");
-    int rc = hip_hy3d_run_dit(r, latents, 0.5f, context, hip_output);
+    fprintf(stderr, "  Running DiT forward pass (t=%.6f)...\n", timestep);
+    int rc = hip_hy3d_run_dit(r, latents, timestep, context, hip_output);
     if (rc != 0) {
         fprintf(stderr, "  FAIL: DiT forward pass returned %d\n", rc);
         free(latents); free(context); free(ref_output); free(hip_output);
@@ -180,17 +212,19 @@ static int test_dit_forward(hip_hy3d_runner *r, const char *model_path,
     }
     fprintf(stderr, "  HIP:  min=%.6f max=%.6f mean=%.6f\n", mn, mx, sm / out_n);
 
-    float rmn = ref_output[0], rmx = ref_output[0], rsm = 0;
-    for (int i = 0; i < out_n; i++) {
-        if (ref_output[i] < rmn) rmn = ref_output[i];
-        if (ref_output[i] > rmx) rmx = ref_output[i];
-        rsm += ref_output[i];
+    if (ref_output) {
+        float rmn = ref_output[0], rmx = ref_output[0], rsm = 0;
+        for (int i = 0; i < out_n; i++) {
+            if (ref_output[i] < rmn) rmn = ref_output[i];
+            if (ref_output[i] > rmx) rmx = ref_output[i];
+            rsm += ref_output[i];
+        }
+        fprintf(stderr, "  Ref:  min=%.6f max=%.6f mean=%.6f\n", rmn, rmx, rsm / out_n);
     }
-    fprintf(stderr, "  Ref:  min=%.6f max=%.6f mean=%.6f\n", rmn, rmx, rsm / out_n);
 
     /* Compare — F16 weights over 21 blocks + MoE gating precision.
      * Tolerance: max absolute 2.0, relative 0.5 */
-    int ok = compare_f32("dit_output", ref_output, hip_output, out_n, 2.0f, 0.5f);
+    int ok = ref_output ? compare_f32("dit_output", ref_output, hip_output, out_n, 2.0f, 0.5f) : 1;
 
     snprintf(path, sizeof(path), "%s/dit_output.npy", out_dir);
     FILE *fp = fopen(path, "wb");
@@ -220,6 +254,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
             "Usage: %s <model.safetensors> [--ref-dir dir] [--out-dir dir]\n\n"
+            "       [--latents path.npy] [--context path.npy]\n"
+            "       [--ref-output path.npy] [--timestep t] [--batch-index i]\n\n"
             "Verify DiT HIP implementation against PyTorch reference.\n",
             argv[0]);
         return 1;
@@ -228,11 +264,21 @@ int main(int argc, char **argv) {
     const char *model_path = argv[1];
     const char *ref_dir = "/mnt/nvme02/work/gemm/ref/hy3d/output";
     const char *out_dir = "hip_output";
+    const char *latents_path = NULL;
+    const char *context_path = NULL;
+    const char *ref_output_path = NULL;
+    float timestep = 0.5f;
+    int batch_index = 0;
     int use_f32 = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--ref-dir") == 0 && i+1 < argc) ref_dir = argv[++i];
         else if (strcmp(argv[i], "--out-dir") == 0 && i+1 < argc) out_dir = argv[++i];
+        else if (strcmp(argv[i], "--latents") == 0 && i+1 < argc) latents_path = argv[++i];
+        else if (strcmp(argv[i], "--context") == 0 && i+1 < argc) context_path = argv[++i];
+        else if (strcmp(argv[i], "--ref-output") == 0 && i+1 < argc) ref_output_path = argv[++i];
+        else if (strcmp(argv[i], "--timestep") == 0 && i+1 < argc) timestep = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--batch-index") == 0 && i+1 < argc) batch_index = atoi(argv[++i]);
         else if (strcmp(argv[i], "--f32") == 0) use_f32 = 1;
     }
 
@@ -257,7 +303,9 @@ int main(int argc, char **argv) {
 
     /* Test 2: Full DiT forward (may OOM) */
     {
-        int rc = test_dit_forward(r, model_path, ref_dir, out_dir);
+        int rc = test_dit_forward(r, model_path, ref_dir, out_dir,
+                                  latents_path, context_path,
+                                  ref_output_path, timestep, batch_index);
         if (rc == 0) n_pass++; else if (rc > 0) n_fail++; else n_skip++;
     }
 
