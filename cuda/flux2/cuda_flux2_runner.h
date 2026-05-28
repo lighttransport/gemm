@@ -75,6 +75,7 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
 #include "../../common/flux2_klein_dit.h"
 #include "../../common/flux2_klein_vae.h"
 #include "../gemm/cuda_gemm_ptx_kernels.h"  /* k_gemm_bf16_v7_src / k_gemm_f16_v7_src */
+#include "../fp4_w4a4.h"                    /* NVFP4 W4A4 OMMA GEMM (sm_120a) — optional */
 
 /* ---- Flux.2 Klein CUDA kernels ---- */
 
@@ -3069,6 +3070,10 @@ typedef struct {
     CUdeviceptr q_norm;    /* [head_dim] F32 */
     CUdeviceptr k_norm;    /* [head_dim] F32 */
     float qkv_scale, proj_scale, mlp_up_scale, mlp_dn_scale;  /* FP8 per-tensor scales */
+    /* NVFP4 W4A4 slots. Populated by flux2_load_fp4_lin when the checkpoint has
+     * <prefix>.qweight_fp4 (auto-detected). When .qw != 0 the forward dispatches
+     * via fp4_w4a4_gemm; otherwise it uses the FP8/BF16 path above. */
+    fp4_lin_t qkv4, proj4, mlp_up4, mlp_dn4;
 } flux2_gpu_stream_t;
 
 typedef struct {
@@ -3082,6 +3087,8 @@ typedef struct {
     CUdeviceptr q_norm;      /* [head_dim] F32 */
     CUdeviceptr k_norm;      /* [head_dim] F32 */
     float linear1_scale, l2_attn_scale, l2_mlp_scale;  /* FP8 per-tensor scales */
+    /* NVFP4 W4A4 slots (same convention as flux2_gpu_stream_t above). */
+    fp4_lin_t linear14, l2_attn4, l2_mlp4;
 } flux2_gpu_sblk_t;
 
 /* ---- VAE GPU weight cache (mirrors flux2_vae_resblock/attn/upsample) ---- */
@@ -3138,6 +3145,16 @@ struct cuda_flux2_runner {
     int use_f16_gemm;   /* 1 = use gemm_tiled_f16_f32 with F16 weights */
     int use_fp8_gemm;   /* 1 = use gemm_tiled_fp8_f32 with native FP8 weights */
     int fp8_bf16_act;   /* 1 = BF16 activation truncation (matches ComfyUI/PyTorch) */
+
+    /* NVFP4 W4A4 (sm_120a, Blackwell). Auto-detected at load when the
+     * checkpoint has *.qweight_fp4 — the runner uses fp4_w4a4_gemm for the 80
+     * quantized linears (FLUX.2-Klein nvfp4 from black-forest-labs, via
+     * modelopt_fp4_repack.py). Mixed BF16+NVFP4: embedders/modulation/norms/
+     * final_layer stay BF16 through the existing path; the per-block fp4_lin_t
+     * slots above carry the FP4 weights. */
+    int use_w4a4;
+    int use_w4a4_naive;   /* FLUX2_W4A4_NAIVE: force the naive w4a4_gemm oracle (A/B) */
+    fp4_w4a4_ctx fp4_ctx;
 
     /* CPU model (kept for arch params + VAE fallback) */
     flux2_dit_model *dit;
@@ -4555,6 +4572,43 @@ static CUdeviceptr gpu_upload_st_fp8(st_context *st, const char *wname, const ch
     }
 }
 
+/* ---- NVFP4 W4A4 loader ----
+ * Try to load an fp4_lin_t from the safetensors at <base>.qweight_fp4 /
+ * .wscales_fp4 / .wcwt. Returns 1 on success (L populated), 0 if not present
+ * (caller falls back to FP8/BF16). Layout matches cuda/fp4_w4a4.h and the
+ * output of modelopt_fp4_repack.py. pd/pu are NULL (ModelOpt has no low-rank). */
+static int flux2_try_load_fp4_lin(fp4_lin_t *L, st_context *st, const char *base) {
+    char nm[256];
+    snprintf(nm, sizeof(nm), "%s.qweight_fp4", base);
+    int qi = safetensors_find(st, nm);
+    if (qi < 0) { L->qw = L->ws = L->wcwt = L->pd = L->pu = 0; return 0; }
+    /* qweight_fp4: int32 [out, in/8] — upload raw bytes */
+    L->qw = gpu_upload_bytes(safetensors_data(st, qi),
+                             (size_t)safetensors_shape(st, qi)[0] *
+                             (size_t)safetensors_shape(st, qi)[1] * 4);
+    snprintf(nm, sizeof(nm), "%s.wscales_fp4", base);
+    int wi = safetensors_find(st, nm);
+    if (wi < 0) { fprintf(stderr, "flux2_fp4: %s missing wscales_fp4\n", base); return 0; }
+    L->ws = gpu_upload_bytes(safetensors_data(st, wi),
+                             (size_t)safetensors_shape(st, wi)[0] *
+                             (size_t)safetensors_shape(st, wi)[1]);
+    snprintf(nm, sizeof(nm), "%s.wcwt", base);
+    int ci = safetensors_find(st, nm);
+    if (ci < 0) { fprintf(stderr, "flux2_fp4: %s missing wcwt\n", base); return 0; }
+    int wcn = (int)safetensors_shape(st, ci)[0];
+    L->wcwt = gpu_upload_f32((const float *)safetensors_data(st, ci), wcn);
+    L->pd = L->pu = 0;
+    return L->qw && L->ws && L->wcwt;
+}
+
+/* Free the three FP4 sub-buffers of a slot. */
+static void flux2_free_fp4_lin(fp4_lin_t *L) {
+    if (L->qw)   cuMemFree(L->qw);
+    if (L->ws)   cuMemFree(L->ws);
+    if (L->wcwt) cuMemFree(L->wcwt);
+    L->qw = L->ws = L->wcwt = L->pd = L->pu = 0;
+}
+
 /* Sinusoidal timestep embedding (CPU, small) */
 static void flux2_ts_embed(float *out, float t, int dim) {
     int half = dim / 2;
@@ -4878,6 +4932,10 @@ static void free_stream(flux2_gpu_stream_t *gs) {
     if (gs->mlp_dn_w) cuMemFree(gs->mlp_dn_w);
     if (gs->q_norm)   cuMemFree(gs->q_norm);
     if (gs->k_norm)   cuMemFree(gs->k_norm);
+    flux2_free_fp4_lin(&gs->qkv4);
+    flux2_free_fp4_lin(&gs->proj4);
+    flux2_free_fp4_lin(&gs->mlp_up4);
+    flux2_free_fp4_lin(&gs->mlp_dn4);
 }
 
 int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
@@ -4896,6 +4954,33 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
     int f16 = r->use_f16_gemm;
     int bf16 = r->use_bf16_gemm;
     int fp8 = r->use_fp8_gemm;
+
+    /* NVFP4 W4A4 pre-detect: peek at block-0 to see if this is the ModelOpt-nvfp4
+     * → OMMA-repacked layout (see modelopt_fp4_repack.py). FP4 needs the
+     * safetensors loader (the only thing that knows how to read .qweight_fp4 /
+     * .wcwt / .wscales_fp4 + the BF16 pass-throughs); the alternative CPU-side
+     * model loader leaves the quantized linears as empty 0×0 matrices. Force
+     * BF16 path so the gpu_upload_st_fp8 globals materialize as BF16 to match
+     * W4A4 activation precision. FLUX2_FP4=0 disables auto-detect. */
+    {
+        st_context *probe = safetensors_open(path);
+        if (probe) {
+            int has_fp4 = (safetensors_find(probe,
+                          "double_blocks.0.img_attn.qkv.qweight_fp4") >= 0);
+            const char *env_fp4 = getenv("FLUX2_FP4");
+            int want_fp4 = env_fp4 ? !(env_fp4[0] == '0') : 1;
+            if (has_fp4 && want_fp4) {
+                /* Force a non-F32 source mode so we go through the FP8/BF16
+                 * loader (it's the only one that reads .qweight_fp4 / .wcwt /
+                 * .wscales_fp4 + the BF16 globals). FP4 + raw FP8 don't mix. */
+                if (!fp8 && !bf16 && !f16) { bf16 = 1; r->use_bf16_gemm = 1; }
+                fp8 = 0;
+                r->use_fp8_gemm = 0;
+            }
+            safetensors_close(probe);
+        }
+    }
+
     /* Use FP8 safetensors as source for all GEMM modes (it's the only on-disk
      * format available). The g_flux2_upload_mode global tells gpu_upload_st_fp8
      * how to materialize each weight on the GPU:
@@ -4923,6 +5008,48 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
     if (use_fp8_src) {
         st_fp8 = safetensors_open(path);
         if (!st_fp8) { fprintf(stderr, "cuda_flux2: failed to reopen %s for FP8\n", path); return -1; }
+    }
+
+    /* ---- NVFP4 W4A4 auto-detect ----
+     * If the checkpoint has *.qweight_fp4 for block-0 qkv, treat it as the
+     * ModelOpt-nvfp4 → OMMA-repacked layout (see modelopt_fp4_repack.py). The 80
+     * quantized linears go through fp4_w4a4_gemm; the BF16 globals (embedders,
+     * modulation, final_layer, norms) go through the existing gpu_upload_st_fp8
+     * with upload-mode = BF16 to match W4A4 activation precision. FLUX2_FP4=0
+     * disables auto-detect (forces BF16 path even if FP4 tensors are present).
+     * FLUX2_FP4=1 with a non-FP4 checkpoint warns and falls back. */
+    if (st_fp8) {
+        int has_fp4 = (safetensors_find(st_fp8,
+                       "double_blocks.0.img_attn.qkv.qweight_fp4") >= 0);
+        const char *env_fp4 = getenv("FLUX2_FP4");
+        int want_fp4 = env_fp4 ? !(env_fp4[0] == '0') : 1;  /* default ON when present */
+        if (has_fp4 && want_fp4) {
+            r->use_w4a4 = 1;
+            r->use_w4a4_naive = flux2_env_enabled("FLUX2_W4A4_NAIVE");
+            if (fp4_w4a4_compile(&r->fp4_ctx, r->stream, r->verbose) != 0) {
+                fprintf(stderr, "cuda_flux2: fp4_w4a4_compile FAILED — falling back to BF16\n");
+                r->use_w4a4 = 0;
+            } else {
+                r->fp4_ctx.use_naive = r->use_w4a4_naive;
+                /* Force BF16 pass-through for the non-quantized tensors (embedders,
+                 * modulation, final_layer). NVFP4 W4A4 expects BF16-ish activation
+                 * precision; raw-FP8 weights would mismatch the W4A4 path. Also
+                 * disable any FP8 GEMM flags that may be set in init. */
+                g_flux2_upload_mode = FLUX2_W_BF16;
+                r->use_fp8_gemm = 0;
+                r->fp8_bf16_act = 0;
+                r->use_fp8_mma = 0;
+                r->use_fp8_v7 = 0;
+                if (!r->use_bf16_gemm) r->use_bf16_gemm = 1;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "cuda_flux2: detected NVFP4 W4A4 checkpoint — using FP4 GEMM%s\n",
+                            r->use_w4a4_naive ? " (naive oracle)" : "");
+            }
+        } else if (has_fp4 && !want_fp4) {
+            if (r->verbose >= 1)
+                fprintf(stderr, "cuda_flux2: NVFP4 tensors present but FLUX2_FP4=0 — using BF16 path "
+                                "(this needs a dequant-bf16 checkpoint, otherwise loads will return 0)\n");
+        }
     }
 
     /* Initialize global weight scales to 1.0 */
@@ -4985,6 +5112,27 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
             snprintf(wn, sizeof(wn), "double_blocks.%d.txt_mlp.2.weight", i);
             snprintf(sn, sizeof(sn), "double_blocks.%d.txt_mlp.2.weight_scale", i);
             r->gpu_dblk[i].txt.mlp_dn_w = gpu_upload_st_fp8(st_fp8, wn, sn, &r->gpu_dblk[i].txt.mlp_dn_scale);
+            /* W4A4: try FP4 for each linear. Present linears overlay the FP8/BF16
+             * pointers (they were 0 since the FP4 file has no .weight for them). */
+            if (r->use_w4a4) {
+                char base[160];
+                snprintf(base, sizeof(base), "double_blocks.%d.img_attn.qkv", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].img.qkv4,    st_fp8, base);
+                snprintf(base, sizeof(base), "double_blocks.%d.img_attn.proj", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].img.proj4,   st_fp8, base);
+                snprintf(base, sizeof(base), "double_blocks.%d.img_mlp.0", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].img.mlp_up4, st_fp8, base);
+                snprintf(base, sizeof(base), "double_blocks.%d.img_mlp.2", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].img.mlp_dn4, st_fp8, base);
+                snprintf(base, sizeof(base), "double_blocks.%d.txt_attn.qkv", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].txt.qkv4,    st_fp8, base);
+                snprintf(base, sizeof(base), "double_blocks.%d.txt_attn.proj", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].txt.proj4,   st_fp8, base);
+                snprintf(base, sizeof(base), "double_blocks.%d.txt_mlp.0", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].txt.mlp_up4, st_fp8, base);
+                snprintf(base, sizeof(base), "double_blocks.%d.txt_mlp.2", i);
+                flux2_try_load_fp4_lin(&r->gpu_dblk[i].txt.mlp_dn4, st_fp8, base);
+            }
         } else {
             upload_stream(&r->gpu_dblk[i].img, &m->dblk[i].img, r->hd, f16);
             upload_stream(&r->gpu_dblk[i].txt, &m->dblk[i].txt, r->hd, f16);
@@ -5087,6 +5235,18 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
                 for (int j = 0; j < n; j++) { uint32_t b = (uint32_t)src[j] << 16; memcpy(&tmp[j], &b, 4); }
                 r->gpu_sblk[i].k_norm = gpu_upload_f32(tmp, n);
                 free(tmp);
+            }
+            /* W4A4: load FP4 for linear1 and the column-split linear2_attn / linear2_mlp.
+             * modelopt_fp4_repack.py emits the linear2 column-split as two separate FP4
+             * sub-linears (column-slice along K at H=3072 — aligns with block-16). */
+            if (r->use_w4a4) {
+                char base[160];
+                snprintf(base, sizeof(base), "single_blocks.%d.linear1", i);
+                flux2_try_load_fp4_lin(&r->gpu_sblk[i].linear14, st_fp8, base);
+                snprintf(base, sizeof(base), "single_blocks.%d.linear2_attn", i);
+                flux2_try_load_fp4_lin(&r->gpu_sblk[i].l2_attn4, st_fp8, base);
+                snprintf(base, sizeof(base), "single_blocks.%d.linear2_mlp", i);
+                flux2_try_load_fp4_lin(&r->gpu_sblk[i].l2_mlp4,  st_fp8, base);
             }
         } else {
             r->gpu_sblk[i].linear1_w = gpu_upload_mat_auto(&m->sblk[i].linear1, f16);
@@ -5221,6 +5381,28 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
     /* Macro: dispatch GEMM with per-weight scale (FP8-aware) */
     #define GEMM(Y, W, X, bias, nout, nin, ntok, scale) \
         op_gemm_scaled(r, Y, W, X, bias, nout, nin, ntok, scale)
+
+    /* GEMM4: dispatch via native NVFP4 W4A4 (fp4_w4a4_gemm) when slot4->qw is
+     * non-NULL, else fall back to the existing FP8/BF16 GEMM. row_off lets a
+     * single fused FP4 linear (qkv = [3H,H], linear1 = [3H+2nff,H]) be sliced
+     * along the OUTPUT (row) dim — rows are contiguous in [out, in/8] row-major
+     * so slicing is just a pointer offset on qw, ws, and wcwt.
+     *   slot4  : fp4_lin_t* for the full fused linear (or NULL)
+     *   row_off: starting row in the fused matrix (0 for non-fused)
+     *   nout   : number of output rows in this slice
+     *   W_fb / scale_fb : the FP8/BF16 weight + per-tensor scale to use when
+     *                     slot4 has no FP4 weights (mixed BF16+FP4 coexistence). */
+    #define GEMM4(slot4_ptr, row_off, Y, W_fb, X, bias, nout, nin, ntok, scale_fb) do { \
+        fp4_lin_t *_s = (slot4_ptr); int _ro = (row_off); int _no = (nout); int _ni = (nin); \
+        if (_s && _s->qw) { \
+            CUdeviceptr _qw = _s->qw   + (size_t)_ro * (_ni / 8) * 4; \
+            CUdeviceptr _ws = _s->ws   + (size_t)_ro * (_ni / 16); \
+            CUdeviceptr _wc = _s->wcwt + (size_t)_ro * 4; \
+            fp4_w4a4_gemm(&r->fp4_ctx, (Y), _qw, _ws, _wc, (X), (bias), _no, _ni, (ntok)); \
+        } else { \
+            op_gemm_scaled(r, (Y), (W_fb), (X), (bias), _no, _ni, (ntok), (scale_fb)); \
+        } \
+    } while (0)
     /* Macro: BF16 truncate buffer in-place when running BF16 inference mode */
     #define BF16(buf, n) do { if (r->fp8_bf16_act) op_bf16_trunc(r, buf, n); } while(0)
     #define FLUX2_CU_OR_CLEANUP(call, label) do { \
@@ -5333,9 +5515,9 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         CUdeviceptr img_q_w = b->img.qkv_w;
         CUdeviceptr img_k_w = b->img.qkv_w + (size_t)H * H * WE;
         CUdeviceptr img_v_w = b->img.qkv_w + (size_t)2 * H * H * WE;
-        GEMM(r->d_q, img_q_w, r->d_scratch1, d0, H, H, n_img, b->img.qkv_scale);
-        GEMM(r->d_k, img_k_w, r->d_scratch1, d0, H, H, n_img, b->img.qkv_scale);
-        GEMM(r->d_v, img_v_w, r->d_scratch1, d0, H, H, n_img, b->img.qkv_scale);
+        GEMM4(&b->img.qkv4, 0,     r->d_q, img_q_w, r->d_scratch1, d0, H, H, n_img, b->img.qkv_scale);
+        GEMM4(&b->img.qkv4, H,     r->d_k, img_k_w, r->d_scratch1, d0, H, H, n_img, b->img.qkv_scale);
+        GEMM4(&b->img.qkv4, 2 * H, r->d_v, img_v_w, r->d_scratch1, d0, H, H, n_img, b->img.qkv_scale);
 
         /* TXT stream: adaLN → QKV */
         op_adaln(r, r->d_scratch1, r->d_txt, mt_shift_a, mt_scale_a, n_txt, H);
@@ -5347,9 +5529,9 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         CUdeviceptr tq = r->d_q + (size_t)n_img * H * F;
         CUdeviceptr tk = r->d_k + (size_t)n_img * H * F;
         CUdeviceptr tv = r->d_v + (size_t)n_img * H * F;
-        GEMM(tq, txt_q_w, r->d_scratch1, d0, H, H, n_txt, b->txt.qkv_scale);
-        GEMM(tk, txt_k_w, r->d_scratch1, d0, H, H, n_txt, b->txt.qkv_scale);
-        GEMM(tv, txt_v_w, r->d_scratch1, d0, H, H, n_txt, b->txt.qkv_scale);
+        GEMM4(&b->txt.qkv4, 0,     tq, txt_q_w, r->d_scratch1, d0, H, H, n_txt, b->txt.qkv_scale);
+        GEMM4(&b->txt.qkv4, H,     tk, txt_k_w, r->d_scratch1, d0, H, H, n_txt, b->txt.qkv_scale);
+        GEMM4(&b->txt.qkv4, 2 * H, tv, txt_v_w, r->d_scratch1, d0, H, H, n_txt, b->txt.qkv_scale);
 
         /* Per-head RMSNorm on Q, K (separate norms for img/txt) */
         op_rmsnorm_ph(r, r->d_q, b->img.q_norm, n_img, nH, hd);
@@ -5435,9 +5617,9 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         BF16(r->d_attn_out, n_tot * H);
 
         /* Output projections (img and txt use different weights) */
-        GEMM(r->d_scratch1, b->img.proj_w, r->d_attn_out, d0, H, H, n_img, b->img.proj_scale);
+        GEMM4(&b->img.proj4, 0, r->d_scratch1, b->img.proj_w, r->d_attn_out, d0, H, H, n_img, b->img.proj_scale);
         CUdeviceptr txt_attn = r->d_attn_out + (size_t)n_img * H * F;
-        GEMM(r->d_scratch2, b->txt.proj_w, txt_attn, d0, H, H, n_txt, b->txt.proj_scale);
+        GEMM4(&b->txt.proj4, 0, r->d_scratch2, b->txt.proj_w, txt_attn,     d0, H, H, n_txt, b->txt.proj_scale);
 
         /* Gated residual */
         op_gated_add(r, r->d_img, r->d_scratch1, mi_gate_a, n_img, H);
@@ -5448,20 +5630,20 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         /* FFN img */
         op_adaln(r, r->d_scratch1, r->d_img, mi_shift_f, mi_scale_f, n_img, H);
         BF16(r->d_scratch1, n_img * H);
-        GEMM(r->d_scratch2, b->img.mlp_up_w, r->d_scratch1, d0, 2*n_ff, H, n_img, b->img.mlp_up_scale);
+        GEMM4(&b->img.mlp_up4, 0, r->d_scratch2, b->img.mlp_up_w, r->d_scratch1, d0, 2*n_ff, H, n_img, b->img.mlp_up_scale);
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_img, n_ff);
         BF16(r->d_scratch3, n_img * n_ff);
-        GEMM(r->d_scratch1, b->img.mlp_dn_w, r->d_scratch3, d0, H, n_ff, n_img, b->img.mlp_dn_scale);
+        GEMM4(&b->img.mlp_dn4, 0, r->d_scratch1, b->img.mlp_dn_w, r->d_scratch3, d0, H, n_ff, n_img, b->img.mlp_dn_scale);
         op_gated_add(r, r->d_img, r->d_scratch1, mi_gate_f, n_img, H);
         BF16(r->d_img, n_img * H);
 
         /* FFN txt */
         op_adaln(r, r->d_scratch1, r->d_txt, mt_shift_f, mt_scale_f, n_txt, H);
         BF16(r->d_scratch1, n_txt * H);
-        GEMM(r->d_scratch2, b->txt.mlp_up_w, r->d_scratch1, d0, 2*n_ff, H, n_txt, b->txt.mlp_up_scale);
+        GEMM4(&b->txt.mlp_up4, 0, r->d_scratch2, b->txt.mlp_up_w, r->d_scratch1, d0, 2*n_ff, H, n_txt, b->txt.mlp_up_scale);
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_txt, n_ff);
         BF16(r->d_scratch3, n_txt * n_ff);
-        GEMM(r->d_scratch1, b->txt.mlp_dn_w, r->d_scratch3, d0, H, n_ff, n_txt, b->txt.mlp_dn_scale);
+        GEMM4(&b->txt.mlp_dn4, 0, r->d_scratch1, b->txt.mlp_dn_w, r->d_scratch3, d0, H, n_ff, n_txt, b->txt.mlp_dn_scale);
         op_gated_add(r, r->d_txt, r->d_scratch1, mt_gate_f, n_txt, H);
         BF16(r->d_txt, n_txt * H);
     }
@@ -5502,10 +5684,10 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         CUdeviceptr gu_w = b->linear1_w + (size_t)3 * H * H * WE;
 
         _TS_BEG();
-        GEMM(r->d_q, q_w, r->d_scratch1, d0, H, H, n_tot, b->linear1_scale);
-        GEMM(r->d_k, k_w, r->d_scratch1, d0, H, H, n_tot, b->linear1_scale);
-        GEMM(r->d_v, v_w, r->d_scratch1, d0, H, H, n_tot, b->linear1_scale);
-        GEMM(r->d_scratch2, gu_w, r->d_scratch1, d0, 2*n_ff, H, n_tot, b->linear1_scale);
+        GEMM4(&b->linear14, 0,     r->d_q,        q_w,  r->d_scratch1, d0, H,      H, n_tot, b->linear1_scale);
+        GEMM4(&b->linear14, H,     r->d_k,        k_w,  r->d_scratch1, d0, H,      H, n_tot, b->linear1_scale);
+        GEMM4(&b->linear14, 2 * H, r->d_v,        v_w,  r->d_scratch1, d0, H,      H, n_tot, b->linear1_scale);
+        GEMM4(&b->linear14, 3 * H, r->d_scratch2, gu_w, r->d_scratch1, d0, 2*n_ff, H, n_tot, b->linear1_scale);
         _TS_END(_ts_lin1);
 
         /* Per-head Q/K norm + RoPE */
@@ -5545,6 +5727,7 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         _TS_BEG();
         int did_concat2 = 0;
         if (r->use_fp8_gemm && b->l2_attn_scale > 0.0f && b->l2_mlp_scale > 0.0f &&
+            !b->l2_attn4.qw && !b->l2_mlp4.qw &&
             r->use_fp8_v7 && r->fn_gemm_fp8_v7_concat2 &&
             (H % 64) == 0 && (n_ff % 64) == 0 && n_tot >= 256) {
             int rc = op_gemm_fp8_concat2(r, r->d_scratch1,
@@ -5555,14 +5738,17 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         }
         int can_addto = 0;
         if (!did_concat2) {
-            GEMM(r->d_scratch1, b->l2_attn_w, r->d_attn_out, d0, H, H, n_tot, b->l2_attn_scale);
+            GEMM4(&b->l2_attn4, 0, r->d_scratch1, b->l2_attn_w, r->d_attn_out, d0, H, H, n_tot, b->l2_attn_scale);
+            /* FP8 v7 add-into fused path is FP8-only; FP4 path always goes through
+             * the plain two-GEMM + op_add fallback below. */
             can_addto = (r->use_fp8_gemm && b->l2_mlp_scale > 0.0f && r->use_fp8_v7 &&
-                         r->fn_gemm_fp8_v7_fused && (n_ff % 64) == 0 && n_tot >= 256);
+                         r->fn_gemm_fp8_v7_fused && (n_ff % 64) == 0 && n_tot >= 256 &&
+                         !b->l2_mlp4.qw);
             if (can_addto) {
                 op_gemm_scaled_ex(r, r->d_scratch1, b->l2_mlp_w, r->d_scratch3, d0,
                                   H, n_ff, n_tot, b->l2_mlp_scale, 1);
             } else {
-                GEMM(r->d_scratch2, b->l2_mlp_w, r->d_scratch3, d0, H, n_ff, n_tot, b->l2_mlp_scale);
+                GEMM4(&b->l2_mlp4, 0, r->d_scratch2, b->l2_mlp_w, r->d_scratch3, d0, H, n_ff, n_tot, b->l2_mlp_scale);
             }
         }
         _TS_END(_ts_lin2);
@@ -5653,9 +5839,14 @@ void cuda_flux2_free(cuda_flux2_runner *r) {
             if (r->gpu_sblk[i].l2_mlp_w)   cuMemFree(r->gpu_sblk[i].l2_mlp_w);
             if (r->gpu_sblk[i].q_norm)     cuMemFree(r->gpu_sblk[i].q_norm);
             if (r->gpu_sblk[i].k_norm)     cuMemFree(r->gpu_sblk[i].k_norm);
+            flux2_free_fp4_lin(&r->gpu_sblk[i].linear14);
+            flux2_free_fp4_lin(&r->gpu_sblk[i].l2_attn4);
+            flux2_free_fp4_lin(&r->gpu_sblk[i].l2_mlp4);
         }
         free(r->gpu_sblk);
     }
+    /* NVFP4 W4A4 context (kernels + scratch) */
+    if (r->use_w4a4) fp4_w4a4_free(&r->fp4_ctx);
 
     /* Free global weights */
     if (r->d_img_in_w)  cuMemFree(r->d_img_in_w);
