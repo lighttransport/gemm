@@ -1352,6 +1352,41 @@ static const char hip_flux2_specific_kernels[] =
 "#endif\n"
 "\n"
 
+/* ---- INT4 W4A16 g64 fused — smooth-aware (ported verbatim from rdna4/qimg) ----
+ * Same tiling as gemm_int4w_g16_bf16a_wmma_t, but: (a) group size is 64 (composes
+ * better with SmoothQuant's per-K-channel lambda — within-group variance smaller as
+ * a fraction of group max), (b) the A-load folds X/smooth on the fly when `smooth`
+ * is non-NULL (no separate divide kernel needed), (c) wscale shape is [n_out, n_in/64].
+ * Quantizer pairs this with LoRA whose lora_down is pre-divided by smooth, so the
+ * runtime LoRA branch uses raw X (math: lora_down/lam @ x = lora_down @ (x/lam)). */
+"#if defined(__gfx1200__) || defined(__gfx1201__)\n"
+"__global__ void gemm_int4w_bf16a_wmma_t(float *Y, const unsigned char *qint4, const float *X,\n"
+"        const float *bias, const unsigned short *wscale, const float *smooth, int n_out, int n_in, int n_tok) {\n"
+"    int tid=threadIdx.x, wave_id=tid>>5, lane=tid&31, wM=wave_id&1, wN=wave_id>>1, half=lane>>4, idx=lane&15, k_off=half*8;\n"
+"    int cta_m0=blockIdx.y*128, cta_n0=blockIdx.x*128, ng=n_in/64;\n"
+"    __shared__ short smA[128*16]; __shared__ short smB[128*16];\n"
+"    typedef float float8 __attribute__((ext_vector_type(8))); typedef short bf16x8 __attribute__((ext_vector_type(8)));\n"
+"    float8 cv00={0,0,0,0,0,0,0,0}; float8 cv01=cv00,cv10=cv00,cv11=cv00,cv20=cv00,cv21=cv00,cv30=cv00,cv31=cv00;\n"
+"    for (int k=0;k<n_in;k+=16){\n"
+"        for (int it=0;it<8;it++){int e=tid*8+it,er=e>>4,ek=e&15,row=cta_m0+er,kp=k+ek;\n"
+"            float xv=(row<n_tok&&kp<n_in)?X[(long)row*n_in+kp]:0.f; if(smooth&&kp<n_in)xv/=smooth[kp];\n"
+"            unsigned xb; memcpy(&xb,&xv,4); smA[er*16+ek]=(short)(xb>>16);}\n"
+"        for (int it=0;it<8;it++){int e=tid*8+it,er=e>>4,ek=e&15,col=cta_n0+er,kp=k+ek; float wv=0.f;\n"
+"            if(col<n_out&&kp<n_in){unsigned char b=qint4[(long)col*(n_in/2)+(kp>>1)]; int nb=(kp&1)?(b>>4):(b&0xF); if(nb>=8)nb-=16;\n"
+"                unsigned su=(unsigned)wscale[(long)col*ng+kp/64]<<16; float s; memcpy(&s,&su,4); wv=(float)nb*s;}\n"
+"            unsigned wb; memcpy(&wb,&wv,4); smB[er*16+ek]=(short)(wb>>16);}\n"
+"        __syncthreads(); int a0r=wM*64,b0r=wN*32; bf16x8 a0,a1,a2,a3,b0,b1;\n"
+"        for(int i=0;i<8;i++){a0[i]=smA[(a0r+idx)*16+k_off+i];a1[i]=smA[(a0r+16+idx)*16+k_off+i];a2[i]=smA[(a0r+32+idx)*16+k_off+i];a3[i]=smA[(a0r+48+idx)*16+k_off+i];b0[i]=smB[(b0r+idx)*16+k_off+i];b1[i]=smB[(b0r+16+idx)*16+k_off+i];}\n"
+"        cv00=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b0,cv00);cv01=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b1,cv01);\n"
+"        cv10=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b0,cv10);cv11=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b1,cv11);\n"
+"        cv20=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b0,cv20);cv21=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b1,cv21);\n"
+"        cv30=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b0,cv30);cv31=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b1,cv31);__syncthreads();}\n"
+"    int wm0=cta_m0+wM*64,wn0=cta_n0+wN*32; float8 *ac[8]={&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31}; int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"    for(int t=0;t<8;t++){int col=wn0+ns[t]+idx; if(col>=n_out)continue; float bv=bias?bias[col]:0.f; float8 a=*ac[t]; for(int i=0;i<8;i++){int row=wm0+ms[t]+half*8+i; if(row<n_tok)Y[(long)row*n_out+col]=a[i]+bv;}}\n"
+"}\n"
+"#endif\n"
+"\n"
+
 /* ---- Calibration: per-input-channel running max-abs ----
  * X[n_tok, n_in] row-major; one thread per column j;
  * amax[j] = max(amax[j], max_i |X[i,j]|). amax must be pre-zeroed.
