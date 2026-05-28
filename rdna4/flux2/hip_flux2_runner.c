@@ -101,9 +101,10 @@ struct hip_flux2_runner {
     size_t act_i8_cap, act_isc_cap;
     int use_int8;                        /* 1 = INT8 W8A8 weights detected */
     /* INT4 W4A16 RTN g16 (+ optional SVDQuant LoRA + optional SmoothQuant) */
-    hipFunction_t fn_gemm_int4w_g16;     /* gemm_int4w_g16_bf16a_wmma_t */
+    hipFunction_t fn_gemm_int4w_g16;     /* gemm_int4w_g16_bf16a_wmma_t (no smooth) */
+    hipFunction_t fn_gemm_int4w_g64;     /* gemm_int4w_bf16a_wmma_t (g64 + smooth fused) */
     hipFunction_t fn_gemm_f32_f32_acc;   /* Y += W @ X, naive (LoRA step 2) */
-    hipFunction_t fn_div_by_smooth;      /* flux2_div_by_smooth_f32 */
+    hipFunction_t fn_div_by_smooth;      /* flux2_div_by_smooth_f32 (g16+smooth legacy) */
     hipFunction_t fn_calib_amax;         /* amax_per_col_f32 */
     float *d_lora_tmp;                   /* persistent [max_tok * max_rank] F32 scratch */
     size_t lora_tmp_cap;                 /* bytes */
@@ -228,12 +229,13 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                     size_t qn = (size_t)qsh[0] * qsh[1];                 /* u8 elems */
                     out.qint4 = hip_upload_raw(safetensors_data(st, qidx), qn);
                     out.n_in = (int)(qsh[1] * 2);
-                    out.group_size = 16;
+                    out.group_size = 16;                                 /* default; derived from wscale below */
                     int sidx = safetensors_find(st, sk);
                     if (sidx >= 0) {
-                        const uint64_t *ssh = safetensors_shape(st, sidx); /* [n_out, n_in/16] bf16 */
+                        const uint64_t *ssh = safetensors_shape(st, sidx); /* [n_out, n_in/group] bf16 */
                         size_t sn = (size_t)ssh[0] * ssh[1] * sizeof(uint16_t);
                         out.wscale_pg = hip_upload_raw(safetensors_data(st, sidx), sn);
+                        if (ssh[1] > 0) out.group_size = out.n_in / (int)ssh[1];
                     }
                     /* Optional SVDQuant LoRA branch: <base>.lora_up bf16 [out, r] +
                      * <base>.lora_down bf16 [r, in]. Dequant to F32 on upload (clean
@@ -577,11 +579,15 @@ static void flux2_calib_save(hip_flux2_runner *r) {
 static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
                          void *X, void *bias, int n_out, int n_in, int n_tok) {
     int n_in_ = n_in, n_out_ = n_out, n_tok_ = n_tok;
-    /* SmoothQuant: pre-divide X by lambda once into d_smooth_tmp, then use x_smooth
-     * for BOTH the main int4 GEMM (residual was stored as W_smooth = W*lambda) and
-     * the LoRA branch (decomposed from W_smooth). Math: W_smooth @ x_smooth = W @ x. */
+    /* Two int4 kernel paths, selected by W->group_size (derived from wscale shape):
+     *   g64  -> gemm_int4w_bf16a_wmma_t (smooth folded in A-load; LoRA on raw X
+     *           because quantizer pre-divided lora_down by smooth).
+     *   g16  -> gemm_int4w_g16_bf16a_wmma_t (no smooth fold; if smooth present, the
+     *           legacy divide-then-g16 path runs — broken at this group size, kept
+     *           for ABI symmetry but not recommended). */
     void *Xeff = X;
-    if (W->smooth && r->fn_div_by_smooth) {
+    int use_g64 = (W->group_size == 64 && r->fn_gemm_int4w_g64);
+    if (!use_g64 && W->smooth && r->fn_div_by_smooth) {
         size_t need = (size_t)n_tok * (size_t)n_in * sizeof(float);
         if (r->smooth_tmp_cap < need) {
             if (r->d_smooth_tmp) hipFree(r->d_smooth_tmp);
@@ -589,15 +595,22 @@ static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
         }
         void *out = r->d_smooth_tmp;
         void *dvargs[] = {&out, &X, &W->smooth, &n_tok_, &n_in_};
-        hipModuleLaunchKernel(r->fn_div_by_smooth,
-                              (unsigned)((n_in + 255) / 256),
+        hipModuleLaunchKernel(r->fn_div_by_smooth, (unsigned)((n_in + 255) / 256),
                               (unsigned)n_tok, 1, 256, 1, 1, 0, NULL, dvargs, NULL);
         Xeff = r->d_smooth_tmp;
     }
-    void *args[] = {&Y, &W->qint4, &W->wscale_pg, &Xeff, &bias, &n_out_, &n_in_, &n_tok_};
-    hipModuleLaunchKernel(r->fn_gemm_int4w_g16,
-                          (unsigned)((n_out + 127) / 128),
-                          (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, args, NULL);
+    if (use_g64) {
+        /* g64 kernel sig: (Y, qint4, X, bias, wscale, smooth, n_out, n_in, n_tok) */
+        void *args[] = {&Y, &W->qint4, &X, &bias, &W->wscale_pg, &W->smooth, &n_out_, &n_in_, &n_tok_};
+        hipModuleLaunchKernel(r->fn_gemm_int4w_g64,
+                              (unsigned)((n_out + 127) / 128),
+                              (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, args, NULL);
+    } else {
+        void *args[] = {&Y, &W->qint4, &W->wscale_pg, &Xeff, &bias, &n_out_, &n_in_, &n_tok_};
+        hipModuleLaunchKernel(r->fn_gemm_int4w_g16,
+                              (unsigned)((n_out + 127) / 128),
+                              (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, args, NULL);
+    }
     if (W->lora_up && W->lora_down && W->lora_rank > 0 && r->fn_gemm_f32_f32_acc) {
         int rk = W->lora_rank;
         size_t need = (size_t)n_tok * (size_t)r->max_lora_rank * sizeof(float);
@@ -607,11 +620,12 @@ static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
         }
         void *tmp = r->d_lora_tmp;
         void *nullbias = NULL;
-        /* Step 1: tmp[n_tok, r] = Xeff @ lora_down^T  (W_smooth's decomposition uses x_smooth) */
-        void *a1[] = {&tmp, &W->lora_down, &Xeff, &nullbias, &rk, &n_in_, &n_tok_};
+        /* g64 path: lora_down was pre-divided by smooth at quantize time -> use raw X.
+         * g16 path: lora_down is "raw" -> use Xeff (= X/smooth) so LoRA math matches. */
+        void *Xlora = use_g64 ? X : Xeff;
+        void *a1[] = {&tmp, &W->lora_down, &Xlora, &nullbias, &rk, &n_in_, &n_tok_};
         hipModuleLaunchKernel(r->fn_gemm, (unsigned)((rk + 63) / 64),
                               (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1, 0, NULL, a1, NULL);
-        /* Step 2: Y[n_tok, n_out] += tmp @ lora_up^T  (W=lora_up stored as [n_out, r]) */
         void *a2[] = {&Y, &W->lora_up, &tmp, &n_out_, &rk, &n_tok_};
         hipModuleLaunchKernel(r->fn_gemm_f32_f32_acc,
                               (unsigned)((n_out + 15) / 16),
@@ -887,6 +901,8 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
     /* INT4 W4A16 RTN g16 kernel (tolerate-missing on non-gfx12) + LoRA accumulating GEMM. */
     if (hipModuleGetFunction(&r->fn_gemm_int4w_g16, mod, "gemm_int4w_g16_bf16a_wmma_t") != hipSuccess)
         r->fn_gemm_int4w_g16 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_int4w_g64, mod, "gemm_int4w_bf16a_wmma_t") != hipSuccess)
+        r->fn_gemm_int4w_g64 = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_f32_f32_acc, mod, "gemm_f32_f32_acc") != hipSuccess)
         r->fn_gemm_f32_f32_acc = NULL;
     if (hipModuleGetFunction(&r->fn_div_by_smooth, mod, "flux2_div_by_smooth_f32") != hipSuccess)
@@ -1050,10 +1066,17 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         }
         const uint8_t *qsrc = (const uint8_t *)safetensors_data(st, qidx_i4);
         const uint8_t *ssrc = (const uint8_t *)safetensors_data(st, sidx_i4);
+        /* Derive group size from wscale shape [H, l2_in/group]. Must divide H, n_ff. */
+        const uint64_t *wsh = safetensors_shape(st, sidx_i4);
+        int gs = (wsh[1] > 0) ? (l2_in / (int)wsh[1]) : 16;
+        if (gs <= 0 || (H % gs) != 0 || (n_ff % gs) != 0) {
+            fprintf(stderr, "hip_flux2: linear2 group_size %d incompatible with H=%d n_ff=%d\n", gs, H, n_ff);
+            return -1;
+        }
         size_t row_bytes = (size_t)l2_in / 2;
-        size_t row_grps  = (size_t)l2_in / 16;
+        size_t row_grps  = (size_t)l2_in / gs;
         size_t a_bytes = (size_t)H / 2,  m_bytes = (size_t)n_ff / 2;
-        size_t a_grps  = (size_t)H / 16, m_grps  = (size_t)n_ff / 16;
+        size_t a_grps  = (size_t)H / gs, m_grps  = (size_t)n_ff / gs;
         uint8_t *qa = (uint8_t *)malloc((size_t)H * a_bytes);
         uint8_t *qm = (uint8_t *)malloc((size_t)H * m_bytes);
         uint8_t *sa = (uint8_t *)malloc((size_t)H * a_grps * sizeof(uint16_t));
@@ -1069,10 +1092,10 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         }
         out_attn->qint4 = hip_upload_raw(qa, (size_t)H*a_bytes);
         out_attn->wscale_pg = hip_upload_raw(sa, (size_t)H*a_grps*sizeof(uint16_t));
-        out_attn->n_in = H;    out_attn->group_size = 16; out_attn->scale = -1.0f;
+        out_attn->n_in = H;    out_attn->group_size = gs; out_attn->scale = -1.0f;
         out_mlp->qint4  = hip_upload_raw(qm, (size_t)H*m_bytes);
         out_mlp->wscale_pg  = hip_upload_raw(sm, (size_t)H*m_grps*sizeof(uint16_t));
-        out_mlp->n_in  = n_ff; out_mlp->group_size  = 16; out_mlp->scale  = -1.0f;
+        out_mlp->n_in  = n_ff; out_mlp->group_size  = gs; out_mlp->scale  = -1.0f;
         free(qa); free(qm); free(sa); free(sm);
 
         /* Optional SVDQuant LoRA: lora_up [H, r] is shared (output rows = H for both
