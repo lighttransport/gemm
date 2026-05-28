@@ -36,6 +36,8 @@
 #include "server_sam3.h"
 #endif
 
+#include "server_llm.h"
+
 #include "../common/qwen_image_text_encoder.h"
 #include "../common/qwen_image_dit.h"
 #include "../common/qwen_image_vae.h"
@@ -93,6 +95,9 @@ typedef struct {
     const char *sam3_ref_url;     /* http://host:port forwarded via /v1/ref/sam3   */
     const char *sam3_1_ref_url;   /* http://host:port forwarded via /v1/ref/sam3.1 */
     const char *qwen_ref_url;     /* http://host:port pytorch/comfyui fp8 reference bridge (backend=pytorch) */
+    const char *llm_model;
+    const char *llm_mmproj;
+    llm_state g_llm;
     int device;
     int mcp_stdio;
     int stdio_mode;
@@ -1699,8 +1704,19 @@ static char *models_json(const server_config *cfg) {
 #else
         "stub"
 #endif
-        "\",\"note\":\"cuda backend only\"}"
-        "]}");
+        "\",\"note\":\"cuda backend only\"},");
+    /* LLM/VLM model (if loaded) */
+    if (cfg && cfg->g_llm.loaded) {
+        char *mp = json_escape_dup(cfg->g_llm.model_path);
+        sbuf_printf(&out,
+            "{\"id\":\"%s\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"cpu\"],\"is_vlm\":%s}",
+            mp, cfg->g_llm.is_vlm ? "true" : "false");
+        free(mp);
+    } else {
+        sbuf_append(&out,
+            "{\"id\":\"(llm)\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"cpu\"],\"note\":\"pass --model to load\"}");
+    }
+    sbuf_append(&out, "]}");
     return out.ptr;
 }
 
@@ -2035,7 +2051,7 @@ static char *qwen_ref_proxy(const char *ref_url, const char *body, size_t body_l
     return out;
 }
 
-static void handle_client(int fd, const server_config *cfg) {
+static void handle_client(int fd, server_config *cfg) {
     bbuf req;
     bbuf_init(&req);
     char tmp[READ_CHUNK];
@@ -2089,6 +2105,156 @@ static void handle_client(int fd, const server_config *cfg) {
         char *j = infer_json(cfg, body, content_len, &status);
         send_response(fd, status, "application/json", j, strlen(j));
         free(j);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/chat/completions") == 0) {
+        json_val *root = json_parse(body, (int)content_len);
+        if (!root || root->type != JSON_OBJECT) {
+            if (root) json_free(root);
+            char *e = json_error_response("invalid_json", "request body must be a JSON object");
+            send_response(fd, 400, "application/json", e, strlen(e));
+            free(e);
+        } else {
+            json_val *messages = json_obj_get(root, "messages");
+            int max_tokens = json_int(root, "max_tokens", 512);
+            float temperature = (float)json_f64(root, "temperature", 0.7);
+            float top_p = (float)json_f64(root, "top_p", 0.9);
+            int seed = json_int(root, "seed", 0);
+            json_val *stop_arr = json_obj_get(root, "stop");
+            int stream = json_int(root, "stream", 0);
+
+            if (!messages || messages->type != JSON_ARRAY) {
+                char *e = json_error_response("invalid_messages", "\"messages\" must be a non-empty array");
+                send_response(fd, 400, "application/json", e, strlen(e));
+                free(e);
+            } else if (pthread_mutex_trylock(&g_infer_mu) != 0) {
+                char *e = json_error_response("busy", "another inference request is currently running");
+                send_response(fd, 429, "application/json", e, strlen(e));
+                free(e);
+            } else if (!cfg->g_llm.loaded) {
+                char *e = json_error_response("no_model", "no LLM/VLM model loaded (pass --model to the server)");
+                send_response(fd, 503, "application/json", e, strlen(e));
+                free(e);
+                pthread_mutex_unlock(&g_infer_mu);
+            } else {
+                if (stream) {
+                    char sse_hdr[256];
+                    snprintf(sse_hdr, sizeof(sse_hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Connection: close\r\n"
+                        "Access-Control-Allow-Origin: *\r\n\r\n");
+                    send_all(fd, sse_hdr, strlen(sse_hdr));
+
+                    char err2[1024] = {0};
+                    int rc = llm_chat_completion_stream((llm_state *)&cfg->g_llm, fd, messages,
+                                                          max_tokens, temperature, top_p, seed,
+                                                          stop_arr, err2, sizeof(err2));
+                    if (rc != 0) {
+                        char err_sse[1024];
+                        snprintf(err_sse, sizeof(err_sse), "data: {\"error\":\"%s\"}\n\n", err2);
+                        send(fd, err_sse, strlen(err_sse), 0);
+                        send(fd, "data: [DONE]\n\n", 14, 0);
+                    }
+                } else {
+                    char err2[1024] = {0};
+                    int st = 200;
+                    char *resp = llm_chat_completion((llm_state *)&cfg->g_llm, messages,
+                                                      max_tokens, temperature, top_p, seed,
+                                                      stop_arr, &st, err2, sizeof(err2));
+                    progress_end();
+                    pthread_mutex_unlock(&g_infer_mu);
+                    if (resp) {
+                        send_response(fd, st, "application/json", resp, strlen(resp));
+                        free(resp);
+                    } else {
+                        char *e = json_error_response("inference_failed", err2);
+                        send_response(fd, st, "application/json", e, strlen(e));
+                        free(e);
+                    }
+                    json_free(root);
+                    bbuf_free(&req);
+                    return;
+                }
+                progress_end();
+                pthread_mutex_unlock(&g_infer_mu);
+            }
+            json_free(root);
+        }
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/completions") == 0) {
+        json_val *root = json_parse(body, (int)content_len);
+        if (!root || root->type != JSON_OBJECT) {
+            if (root) json_free(root);
+            char *e = json_error_response("invalid_json", "request body must be a JSON object");
+            send_response(fd, 400, "application/json", e, strlen(e));
+            free(e);
+        } else {
+            const char *prompt = json_str(root, "prompt", "");
+            int max_tokens = json_int(root, "max_tokens", 512);
+            float temperature = (float)json_f64(root, "temperature", 0.7);
+            float top_p = (float)json_f64(root, "top_p", 0.9);
+            int seed = json_int(root, "seed", 0);
+            json_val *stop_arr = json_obj_get(root, "stop");
+            int stream = json_int(root, "stream", 0);
+
+            if (!prompt || !*prompt) {
+                char *e = json_error_response("invalid_prompt", "\"prompt\" is required");
+                send_response(fd, 400, "application/json", e, strlen(e));
+                free(e);
+            } else if (pthread_mutex_trylock(&g_infer_mu) != 0) {
+                char *e = json_error_response("busy", "another inference request is currently running");
+                send_response(fd, 429, "application/json", e, strlen(e));
+                free(e);
+            } else if (!cfg->g_llm.loaded) {
+                char *e = json_error_response("no_model", "no LLM/VLM model loaded (pass --model to the server)");
+                send_response(fd, 503, "application/json", e, strlen(e));
+                free(e);
+                pthread_mutex_unlock(&g_infer_mu);
+            } else {
+                if (stream) {
+                    char sse_hdr[256];
+                    snprintf(sse_hdr, sizeof(sse_hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Connection: close\r\n"
+                        "Access-Control-Allow-Origin: *\r\n\r\n");
+                    send_all(fd, sse_hdr, strlen(sse_hdr));
+
+                    char err2[1024] = {0};
+                    int rc = llm_text_completion_stream((llm_state *)&cfg->g_llm, fd, prompt,
+                                                         max_tokens, temperature, top_p, seed,
+                                                         stop_arr, err2, sizeof(err2));
+                    if (rc != 0) {
+                        char err_sse[1024];
+                        snprintf(err_sse, sizeof(err_sse), "data: {\"error\":\"%s\"}\n\n", err2);
+                        send(fd, err_sse, strlen(err_sse), 0);
+                        send(fd, "data: [DONE]\n\n", 14, 0);
+                    }
+                } else {
+                    char err2[1024] = {0};
+                    int st = 200;
+                    char *resp = llm_text_completion((llm_state *)&cfg->g_llm, prompt,
+                                                      max_tokens, temperature, top_p, seed,
+                                                      stop_arr, &st, err2, sizeof(err2));
+                    progress_end();
+                    pthread_mutex_unlock(&g_infer_mu);
+                    if (resp) {
+                        send_response(fd, st, "application/json", resp, strlen(resp));
+                        free(resp);
+                    } else {
+                        char *e = json_error_response("inference_failed", err2);
+                        send_response(fd, st, "application/json", e, strlen(e));
+                        free(e);
+                    }
+                    json_free(root);
+                    bbuf_free(&req);
+                    return;
+                }
+                progress_end();
+                pthread_mutex_unlock(&g_infer_mu);
+            }
+            json_free(root);
+        }
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3/infer") == 0) {
         proxy_ref(fd, cfg->sam3_ref_url, "POST", "/v1/infer", body, content_len);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3.1/infer") == 0) {
@@ -2116,7 +2282,7 @@ static void handle_client(int fd, const server_config *cfg) {
 /* Per-connection worker so reads (e.g. GET /v1/progress) can be served while a
  * long /v1/infer is running on another thread. Inference itself stays
  * serialized by g_infer_mu (concurrent infer attempts get HTTP 429). */
-typedef struct { int fd; const server_config *cfg; } conn_arg;
+typedef struct { int fd; server_config *cfg; } conn_arg;
 static void *conn_thread(void *p) {
     conn_arg *a = (conn_arg *)p;
     handle_client(a->fd, a->cfg);
@@ -2354,6 +2520,8 @@ static void usage(const char *prog) {
         "  --sam3-ref-url <url>     proxy /v1/ref/sam3/*   to URL (pytorch ref, sam3)\n"
         "  --sam3-1-ref-url <url>   proxy /v1/ref/sam3.1/* to URL (pytorch ref, sam3.1)\n"
         "  --qwen-ref-url <url>     qwen-image backend=pytorch -> fp8 bridge URL (or env QWEN_IMAGE_REF_URL)\n"
+        "  --model <path>           LLM/VLM GGUF model file for OpenAI-compatible endpoints\n"
+        "  --mmproj <path>          (optional) multimodal projector GGUF for VLM (vision)\n"
         "  --device <n>             default 0\n"
         "  --stdio                  line-delimited JSON transport for local debugging\n"
         "  --mcp-stdio              run MCP stdio mode when compiled\n",
@@ -2383,6 +2551,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--sam3-ref-url") == 0 && i + 1 < argc) cfg.sam3_ref_url = argv[++i];
         else if (strcmp(argv[i], "--sam3-1-ref-url") == 0 && i + 1 < argc) cfg.sam3_1_ref_url = argv[++i];
         else if (strcmp(argv[i], "--qwen-ref-url") == 0 && i + 1 < argc) cfg.qwen_ref_url = argv[++i];
+        else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) cfg.llm_model = argv[++i];
+        else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) cfg.llm_mmproj = argv[++i];
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) cfg.device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stdio") == 0) cfg.stdio_mode = 1;
         else if (strcmp(argv[i], "--mcp-stdio") == 0) cfg.mcp_stdio = 1;
@@ -2399,6 +2569,17 @@ int main(int argc, char **argv) {
         if (e && *e) cfg.qwen_ref_url = e;
     }
     qwen_variants_parse(&cfg, cfg.qwen_variants_spec);
+
+    /* Initialize LLM/VLM model if --model was provided */
+    if (cfg.llm_model) {
+        fprintf(stderr, "Loading LLM/VLM model: %s\n", cfg.llm_model);
+        if (cfg.llm_mmproj)
+            fprintf(stderr, "  mmproj: %s\n", cfg.llm_mmproj);
+        if (llm_init(&cfg.g_llm, cfg.llm_model, cfg.llm_mmproj) != 0) {
+            fprintf(stderr, "Failed to load model, continuing without LLM/VLM support\n");
+        }
+    }
+
     if (cfg.stdio_mode) return run_stdio(&cfg);
     if (cfg.mcp_stdio) return run_mcp_stdio(&cfg);
     signal(SIGINT, on_signal);
