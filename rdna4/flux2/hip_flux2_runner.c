@@ -49,6 +49,10 @@ typedef struct {
     void *qint4;       /* non-NULL => INT4: packed nibbles u8 [n_out, n_in/2] */
     void *wscale_pg;   /* INT4: per-group bf16 scale [n_out, n_in/group_size] */
     int   group_size;  /* INT4: 16 for our RTN g16 path */
+    /* INT4 SVDQuant LoRA branch (NULL when absent — plain RTN int4) */
+    float *lora_up;    /* F32 [n_out, lora_rank] (dequanted from bf16 on upload) */
+    float *lora_down;  /* F32 [lora_rank, n_in]  (shared across QKV row splits) */
+    int   lora_rank;   /* typically 32 */
 } flux2_hip_wt;
 
 typedef struct {
@@ -94,8 +98,12 @@ struct hip_flux2_runner {
     void *d_act_int8; float *d_act_iscale;
     size_t act_i8_cap, act_isc_cap;
     int use_int8;                        /* 1 = INT8 W8A8 weights detected */
-    /* INT4 W4A16 RTN g16 */
+    /* INT4 W4A16 RTN g16 (+ optional SVDQuant LoRA) */
     hipFunction_t fn_gemm_int4w_g16;     /* gemm_int4w_g16_bf16a_wmma_t */
+    hipFunction_t fn_gemm_f32_f32_acc;   /* Y += W @ X, naive (LoRA step 2) */
+    float *d_lora_tmp;                   /* persistent [max_tok * max_rank] F32 scratch */
+    size_t lora_tmp_cap;                 /* bytes */
+    int max_lora_rank;
     int use_int4;                        /* 1 = INT4 weights detected */
     hipFunction_t fn_gemm_fp8_bf16_wmma; /* BF16 act × FP8 wt (BF16 WMMA) */
     hipFunction_t fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
@@ -215,6 +223,33 @@ static flux2_hip_wt gpu_upload_st_wt(hip_flux2_runner *r, st_context *st,
                         const uint64_t *ssh = safetensors_shape(st, sidx); /* [n_out, n_in/16] bf16 */
                         size_t sn = (size_t)ssh[0] * ssh[1] * sizeof(uint16_t);
                         out.wscale_pg = hip_upload_raw(safetensors_data(st, sidx), sn);
+                    }
+                    /* Optional SVDQuant LoRA branch: <base>.lora_up bf16 [out, r] +
+                     * <base>.lora_down bf16 [r, in]. Dequant to F32 on upload (clean
+                     * arg type for the two F32 LoRA GEMMs). */
+                    char luk[260], ldk[260];
+                    snprintf(luk, sizeof(luk), "%s.lora_up",   base);
+                    snprintf(ldk, sizeof(ldk), "%s.lora_down", base);
+                    int luidx = safetensors_find(st, luk);
+                    int ldidx = safetensors_find(st, ldk);
+                    if (luidx >= 0 && ldidx >= 0) {
+                        const uint64_t *lush = safetensors_shape(st, luidx); /* [out, r] */
+                        const uint64_t *ldsh = safetensors_shape(st, ldidx); /* [r, in] */
+                        int rank = (int)lush[1];
+                        out.lora_rank = rank;
+                        if (rank > r->max_lora_rank) r->max_lora_rank = rank;
+                        /* bf16 -> f32 dequant on host (tensors are small: ~r * (out+in)) */
+                        size_t lun = (size_t)lush[0] * lush[1];
+                        size_t ldn = (size_t)ldsh[0] * ldsh[1];
+                        float *lufp = (float *)malloc(lun * sizeof(float));
+                        float *ldfp = (float *)malloc(ldn * sizeof(float));
+                        const uint16_t *lus = (const uint16_t *)safetensors_data(st, luidx);
+                        const uint16_t *lds = (const uint16_t *)safetensors_data(st, ldidx);
+                        for (size_t i = 0; i < lun; i++) { uint32_t b = (uint32_t)lus[i] << 16; memcpy(&lufp[i], &b, 4); }
+                        for (size_t i = 0; i < ldn; i++) { uint32_t b = (uint32_t)lds[i] << 16; memcpy(&ldfp[i], &b, 4); }
+                        out.lora_up   = (float *)hip_upload_raw(lufp, lun * sizeof(float));
+                        out.lora_down = (float *)hip_upload_raw(ldfp, ldn * sizeof(float));
+                        free(lufp); free(ldfp);
                     }
                     return out;
                 }
@@ -461,20 +496,42 @@ static void op_gemm_int8(hip_flux2_runner *r, void *Y, void *Wq, float *wscale,
 }
 
 /* INT4 W4A16 RTN g16: simple per-group dequant on the WMMA B-load — bf16 act, F32 accum.
- * Signature: (Y, qint4 [n_out,n_in/2], scales bf16 [n_out,n_in/16], X, bias, n_out, n_in, n_tok). */
-static void op_gemm_int4(hip_flux2_runner *r, void *Y, void *qint4, void *wscale_pg,
+ * Signature: (Y, qint4 [n_out,n_in/2], scales bf16 [n_out,n_in/16], X, bias, n_out, n_in, n_tok).
+ * Optional SVDQuant LoRA add: when lora_up/lora_down present, also computes
+ *   Y += lora_up @ (lora_down @ X) via two extra F32 GEMMs (rank-r inner dim, small). */
+static void op_gemm_int4(hip_flux2_runner *r, const flux2_hip_wt *W, void *Y,
                          void *X, void *bias, int n_out, int n_in, int n_tok) {
-    void *args[] = {&Y, &qint4, &wscale_pg, &X, &bias, &n_out, &n_in, &n_tok};
+    int n_in_ = n_in, n_out_ = n_out, n_tok_ = n_tok;
+    void *args[] = {&Y, &W->qint4, &W->wscale_pg, &X, &bias, &n_out_, &n_in_, &n_tok_};
     hipModuleLaunchKernel(r->fn_gemm_int4w_g16,
                           (unsigned)((n_out + 127) / 128),
                           (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, args, NULL);
+    if (W->lora_up && W->lora_down && W->lora_rank > 0 && r->fn_gemm_f32_f32_acc) {
+        int rk = W->lora_rank;
+        size_t need = (size_t)n_tok * (size_t)r->max_lora_rank * sizeof(float);
+        if (r->lora_tmp_cap < need) {
+            if (r->d_lora_tmp) hipFree(r->d_lora_tmp);
+            hipMalloc((void **)&r->d_lora_tmp, need); r->lora_tmp_cap = need;
+        }
+        void *tmp = r->d_lora_tmp;
+        void *nullbias = NULL;
+        /* Step 1: tmp[n_tok, r] = X @ lora_down^T  (W=lora_down stored as [r, n_in]) */
+        void *a1[] = {&tmp, &W->lora_down, &X, &nullbias, &rk, &n_in_, &n_tok_};
+        hipModuleLaunchKernel(r->fn_gemm, (unsigned)((rk + 63) / 64),
+                              (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1, 0, NULL, a1, NULL);
+        /* Step 2: Y[n_tok, n_out] += tmp @ lora_up^T  (W=lora_up stored as [n_out, r]) */
+        void *a2[] = {&Y, &W->lora_up, &tmp, &n_out_, &rk, &n_tok_};
+        hipModuleLaunchKernel(r->fn_gemm_f32_f32_acc,
+                              (unsigned)((n_out + 15) / 16),
+                              (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1, 0, NULL, a2, NULL);
+    }
 }
 
 /* Dispatch: INT4 (qint4!=NULL) vs INT8 (wscale!=NULL) vs FP8 (scale >= 0) vs F32. */
 static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
                        void *X, void *bias, int n_out, int n_in, int n_tok) {
     if (W->qint4) {
-        op_gemm_int4(r, Y, W->qint4, W->wscale_pg, X, bias, n_out, n_in, n_tok);
+        op_gemm_int4(r, W, Y, X, bias, n_out, n_in, n_tok);
         return;
     }
     if (W->wscale) {
@@ -507,6 +564,11 @@ static flux2_hip_wt wt_slice(const flux2_hip_wt *w, size_t elem_offset) {
         out.qint4 = (char *)w->qint4 + elem_offset / 2;
         if (w->wscale_pg && w->group_size > 0 && w->n_in > 0)
             out.wscale_pg = (char *)w->wscale_pg + (elem_offset / (size_t)w->group_size) * sizeof(uint16_t);
+        /* SVDQuant LoRA row-split: lora_up is per-output-row [n_out, r], advance by
+         * (row_offset * rank * 4 bytes). lora_down is shared across all output rows
+         * (same input columns), so it stays unchanged. */
+        if (w->lora_up && w->n_in > 0 && w->lora_rank > 0)
+            out.lora_up = (float *)((char *)w->lora_up + (elem_offset / (size_t)w->n_in) * (size_t)w->lora_rank * sizeof(float));
         return out;
     }
     /* INT8 and FP8 both store 1 byte/element; F32 stores 4. */
@@ -710,9 +772,11 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         r->fn_gemm_w8a8_wmma = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_w8a8_scalar, mod, "gemm_w8a8_perrow_f32") != hipSuccess)
         r->fn_gemm_w8a8_scalar = NULL;
-    /* INT4 W4A16 RTN g16 kernel (tolerate-missing on non-gfx12). */
+    /* INT4 W4A16 RTN g16 kernel (tolerate-missing on non-gfx12) + LoRA accumulating GEMM. */
     if (hipModuleGetFunction(&r->fn_gemm_int4w_g16, mod, "gemm_int4w_g16_bf16a_wmma_t") != hipSuccess)
         r->fn_gemm_int4w_g16 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_f32_f32_acc, mod, "gemm_f32_f32_acc") != hipSuccess)
+        r->fn_gemm_f32_f32_acc = NULL;
     hipModuleGetFunction(&r->fn_layernorm,   mod, "layernorm_f32");
     hipModuleGetFunction(&r->fn_silu,        mod, "silu_f32");
     hipModuleGetFunction(&r->fn_adaln,       mod, "adaln_modulate_f32");
@@ -825,6 +889,8 @@ static void free_wt(flux2_hip_wt *wt) {
     if (wt && wt->wscale) { hipFree(wt->wscale); wt->wscale = NULL; }
     if (wt && wt->qint4) { hipFree(wt->qint4); wt->qint4 = NULL; }
     if (wt && wt->wscale_pg) { hipFree(wt->wscale_pg); wt->wscale_pg = NULL; }
+    if (wt && wt->lora_up) { hipFree(wt->lora_up); wt->lora_up = NULL; }
+    if (wt && wt->lora_down) { hipFree(wt->lora_down); wt->lora_down = NULL; }
 }
 static void free_stream(flux2_hip_stream_t *gs) {
     free_wt(&gs->qkv);
@@ -886,6 +952,42 @@ static int load_linear2_split(hip_flux2_runner *r, st_context *st, int bi,
         out_mlp->wscale_pg  = hip_upload_raw(sm, (size_t)H*m_grps*sizeof(uint16_t));
         out_mlp->n_in  = n_ff; out_mlp->group_size  = 16; out_mlp->scale  = -1.0f;
         free(qa); free(qm); free(sa); free(sm);
+
+        /* Optional SVDQuant LoRA: lora_up [H, r] is shared (output rows = H for both
+         * halves) — upload twice to avoid free aliasing; lora_down [r, l2_in] column-
+         * splits to [r, H] (attn) and [r, n_ff] (mlp). Both summed at residual level
+         * because the two halves write to separate scratch buffers that are added. */
+        char luk[256], ldk[256];
+        snprintf(luk, sizeof(luk), "single_blocks.%d.linear2.lora_up",   bi);
+        snprintf(ldk, sizeof(ldk), "single_blocks.%d.linear2.lora_down", bi);
+        int luidx = safetensors_find(st, luk);
+        int ldidx = safetensors_find(st, ldk);
+        if (luidx >= 0 && ldidx >= 0) {
+            const uint64_t *lush = safetensors_shape(st, luidx); /* [H, r] */
+            const uint64_t *ldsh = safetensors_shape(st, ldidx); /* [r, l2_in] */
+            int rank = (int)lush[1];
+            if (rank > r->max_lora_rank) r->max_lora_rank = rank;
+            size_t lun = (size_t)lush[0] * lush[1];              /* H * r */
+            float *lufp = (float *)malloc(lun * sizeof(float));
+            const uint16_t *lus = (const uint16_t *)safetensors_data(st, luidx);
+            for (size_t i = 0; i < lun; i++) { uint32_t b = (uint32_t)lus[i] << 16; memcpy(&lufp[i], &b, 4); }
+            /* Two device copies of lora_up so free_wt doesn't double-free. */
+            out_attn->lora_up = (float *)hip_upload_raw(lufp, lun * sizeof(float));
+            out_mlp->lora_up  = (float *)hip_upload_raw(lufp, lun * sizeof(float));
+            out_attn->lora_rank = rank;
+            out_mlp->lora_rank  = rank;
+            /* Column-split lora_down */
+            const uint16_t *lds = (const uint16_t *)safetensors_data(st, ldidx);
+            float *lda = (float *)malloc((size_t)rank * H    * sizeof(float));
+            float *ldm = (float *)malloc((size_t)rank * n_ff * sizeof(float));
+            for (int i = 0; i < rank; i++) {
+                for (int k = 0; k < H;    k++) { uint32_t b = (uint32_t)lds[i * l2_in + k]       << 16; memcpy(&lda[i*H+k],    &b, 4); }
+                for (int k = 0; k < n_ff; k++) { uint32_t b = (uint32_t)lds[i * l2_in + H + k]   << 16; memcpy(&ldm[i*n_ff+k], &b, 4); }
+            }
+            out_attn->lora_down = (float *)hip_upload_raw(lda, (size_t)rank * H    * sizeof(float));
+            out_mlp->lora_down  = (float *)hip_upload_raw(ldm, (size_t)rank * n_ff * sizeof(float));
+            free(lufp); free(lda); free(ldm);
+        }
         return 0;
     }
 
@@ -1443,6 +1545,7 @@ void hip_flux2_free(hip_flux2_runner *r) {
     if (r->d_act_scales) hipFree(r->d_act_scales);
     if (r->d_act_int8)   hipFree(r->d_act_int8);
     if (r->d_act_iscale) hipFree(r->d_act_iscale);
+    if (r->d_lora_tmp)   hipFree(r->d_lora_tmp);
     if (r->mod) hipModuleUnload(r->mod);
     free(r);
 }
