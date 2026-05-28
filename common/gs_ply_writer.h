@@ -41,6 +41,12 @@ int gs_ply_write(const char *path, int n,
                  const float *scaling,  /* [n, 3] pre-exp log-scale          */
                  const float *rotation);/* [n, 4] quaternion (un-normalized) */
 
+/* Write rows already packed in the same 17-float property order emitted by
+ * gs_ply_write. This avoids repacking model outputs that already match the
+ * PLY layout. */
+int gs_ply_write_rows(const char *path, int n,
+                      const float *rows, int stride);
+
 #ifdef __cplusplus
 }
 #endif
@@ -118,6 +124,58 @@ int gs_ply_write(const char *path, int n,
     }
     if (fclose(f) != 0) {
         fprintf(stderr, "gs_ply_write: close failed\n");
+        return -5;
+    }
+    return 0;
+}
+
+int gs_ply_write_rows(const char *path, int n, const float *rows, int stride)
+{
+    if (!path || n < 0 || !rows || stride < 17)
+        return -1;
+    if (!gs_ply_is_little_endian()) {
+        fprintf(stderr, "gs_ply_write_rows: big-endian host not supported\n");
+        return -2;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "gs_ply_write_rows: cannot open %s for writing\n", path);
+        return -3;
+    }
+
+    fprintf(f,
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "element vertex %d\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property float nx\n"
+        "property float ny\n"
+        "property float nz\n"
+        "property float f_dc_0\n"
+        "property float f_dc_1\n"
+        "property float f_dc_2\n"
+        "property float opacity\n"
+        "property float scale_0\n"
+        "property float scale_1\n"
+        "property float scale_2\n"
+        "property float rot_0\n"
+        "property float rot_1\n"
+        "property float rot_2\n"
+        "property float rot_3\n"
+        "end_header\n", n);
+
+    for (int i = 0; i < n; i++) {
+        if (fwrite(rows + (size_t)i * stride, sizeof(float), 17, f) != 17) {
+            fprintf(stderr, "gs_ply_write_rows: short write on vertex %d\n", i);
+            fclose(f);
+            return -4;
+        }
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "gs_ply_write_rows: close failed\n");
         return -5;
     }
     return 0;

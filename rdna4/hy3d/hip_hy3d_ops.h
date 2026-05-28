@@ -61,6 +61,7 @@ typedef struct {
     hipFunction_t fourier_embed;
     hipFunction_t timestep_embed;
     hipFunction_t euler_step;
+    hipFunction_t round_f32_to_f16;
     hipFunction_t cfg_combine;
     hipFunction_t split_qkv;
     hipFunction_t split_kv;
@@ -116,6 +117,7 @@ static int hy3d_ops_load(hy3d_ops *ops, hipModule_t module, int sm_version) {
     GET_FN("fourier_embed_3d_f32",        fourier_embed);
     GET_FN("timestep_embed_f32",          timestep_embed);
     GET_FN("euler_step_f32",              euler_step);
+    GET_FN("round_f32_to_f16_f32",        round_f32_to_f16);
     GET_FN("cfg_combine_f32",             cfg_combine);
     GET_FN("split_qkv_interleaved_f32",   split_qkv);
     GET_FN("split_kv_interleaved_f32",    split_kv);
@@ -304,6 +306,14 @@ static inline void op_euler_step(hy3d_ops *ops, hipStream_t stream,
                                  float dt, int n) {
     void *args[] = {&x, &v, &dt, &n};
     hipModuleLaunchKernel(ops->euler_step, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, stream, args, NULL);
+}
+
+/* ---- Round F32 activations through F16, preserving F32 storage ---- */
+static inline void op_round_f32_to_f16(hy3d_ops *ops, hipStream_t stream,
+                                       void *x, int n) {
+    void *args[] = {&x, &n};
+    hipModuleLaunchKernel(ops->round_f32_to_f16, (unsigned)((n + 255) / 256), 1, 1,
                    256, 1, 1, 0, stream, args, NULL);
 }
 

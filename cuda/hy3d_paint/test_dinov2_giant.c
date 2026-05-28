@@ -32,6 +32,7 @@
 #include "../cuda_runner_common.h"
 #include "../cuda_kernels_common.h"
 #include "../hy3d/cuda_hy3d_kernels.h"
+#include "../cuda_fp8_mma_kernels.h"
 #include "cuda_paint_nn_kernels.h"
 #define SAFETENSORS_IMPLEMENTATION
 #include "../../common/safetensors.h"
@@ -41,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 /* ==== Config (DINOv2-giant @ 224) ======================================= */
 
@@ -73,6 +75,15 @@ typedef struct {
     CUdeviceptr ls1, ls2;        /* LayerScale lambda */
     CUdeviceptr w_in_w, w_in_b;  /* SwiGLU weights_in [FFN_FULL, HIDDEN] */
     CUdeviceptr w_out_w, w_out_b;/* SwiGLU weights_out [HIDDEN, FFN_HALF] */
+    /* Online-prequantized FP8 mirror + per-tensor scale (device float[1]).
+     * 0/0 if prequant is disabled or unavailable -> launch_gemm falls back
+     * to the F16 tiled path. */
+    CUdeviceptr q_w_fp8,   q_w_scale;
+    CUdeviceptr k_w_fp8,   k_w_scale;
+    CUdeviceptr v_w_fp8,   v_w_scale;
+    CUdeviceptr out_w_fp8, out_w_scale;
+    CUdeviceptr w_in_fp8,  w_in_scale;
+    CUdeviceptr w_out_fp8, w_out_scale;
 } layer_gpu;
 
 typedef struct {
@@ -91,6 +102,19 @@ typedef struct {
     CUfunction k_layerscale_add;
     CUfunction k_add;
     CUfunction k_silu_gate;
+    /* Optional tensor-core kernels (NULL if not present in module) */
+    CUfunction k_gemm_bf16_mt4;       /* gemm_bf16_pipe_mt4_scaled_f32 */
+    CUfunction k_gemm_bf16;           /* gemm_bf16_pipe_scaled_f32 (MT2 fallback) */
+    CUfunction k_flash_attn_hd64;     /* flash_attn_bf16_hd64 */
+    CUfunction k_reduce_max_abs;      /* per-tensor max|x| -> 1 float */
+    CUfunction k_quantize_fp8;        /* F32 -> e4m3 + scale writeback */
+    CUfunction k_cast_f32_to_bf16;    /* F32 -> BF16 cast */
+    CUfunction k_f16_to_f32;          /* f16_to_f32_buf */
+
+    /* Dispatch toggles (env-overridable) */
+    int use_bf16_attn;
+    int use_bf16_gemm;
+    int use_bf16_mt4;
 
     /* Embedding weights */
     CUdeviceptr patch_w;        /* F32 [1536, 3, 14, 14] */
@@ -110,6 +134,7 @@ typedef struct {
     CUdeviceptr d_attn;         /* [SEQ_LEN * HIDDEN] */
     CUdeviceptr d_h_in;         /* [SEQ_LEN * FFN_FULL] */
     CUdeviceptr d_h_mid;        /* [SEQ_LEN * FFN_HALF] */
+    CUdeviceptr d_qkv_bf16;     /* scratch [3 * SEQ_LEN * HIDDEN] BF16 (uint16) */
 } dinov2g;
 
 /* ==== Utility: F32 -> F16 raw upload (reuses cu_f32_to_f16) ============= */
@@ -259,17 +284,40 @@ static int dinov2g_init(dinov2g *r) {
     cuCtxCreate(&r->ctx, 0, r->dev);
     cuStreamCreate(&r->stream, 0);
 
-    /* Concatenate common + hy3d + paint_nn kernel sources, all already
-     * matched so that common opens extern "C", hy3d closes it, paint_nn
-     * re-opens + closes. */
+    /* Concat order:
+     *   cuda_kernels_common_src   (opens extern "C")
+     *   + cuda_hy3d_specific      (closes extern "C")
+     *   + extern "C" { LUT + to_bf16 + fp8_mma_kernels_src }   (BF16/FP8 MMA)
+     *   + cuda_paint_nn_kernels_src   (opens + closes its own extern "C")
+     */
+    const char *mma_open  =
+        "\nextern \"C\" {\n"
+        "__device__ __constant__ unsigned short d_fp8_to_bf16_lut[256];\n"
+        "__device__ __forceinline__ float to_bf16(float f) {\n"
+        "    unsigned int b; memcpy(&b, &f, 4);\n"
+        "    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) {\n"
+        "        unsigned int qn = 0x7FC00000u; float r; memcpy(&r, &qn, 4); return r;\n"
+        "    }\n"
+        "    unsigned int rnd = 0x7FFFu + ((b >> 16) & 1u);\n"
+        "    b = (b + rnd) & 0xFFFF0000u;\n"
+        "    float out; memcpy(&out, &b, 4); return out;\n"
+        "}\n";
+    const char *mma_close = "\n} /* extern C (fp8_mma_kernels) */\n";
     size_t l1 = strlen(cuda_kernels_common_src);
     size_t l2 = strlen(cuda_hy3d_specific_kernels);
+    size_t lo = strlen(mma_open);
+    size_t lm = strlen(fp8_mma_kernels_src);
+    size_t lc = strlen(mma_close);
     size_t l3 = strlen(cuda_paint_nn_kernels_src);
-    char *src = (char *)malloc(l1 + l2 + l3 + 1);
-    memcpy(src,           cuda_kernels_common_src, l1);
-    memcpy(src + l1,      cuda_hy3d_specific_kernels, l2);
-    memcpy(src + l1 + l2, cuda_paint_nn_kernels_src,  l3);
-    src[l1 + l2 + l3] = '\0';
+    char *src = (char *)malloc(l1 + l2 + lo + lm + lc + l3 + 1);
+    char *p = src;
+    memcpy(p, cuda_kernels_common_src, l1);    p += l1;
+    memcpy(p, cuda_hy3d_specific_kernels, l2); p += l2;
+    memcpy(p, mma_open, lo);                   p += lo;
+    memcpy(p, fp8_mma_kernels_src, lm);        p += lm;
+    memcpy(p, mma_close, lc);                  p += lc;
+    memcpy(p, cuda_paint_nn_kernels_src, l3);  p += l3;
+    *p = '\0';
 
     r->sm = cu_compile_kernels(&r->mod, r->dev, src,
                                 "dinov2g_kernels", 1, "DINOv2-G");
@@ -285,6 +333,62 @@ static int dinov2g_init(dinov2g *r) {
     cuModuleGetFunction(&r->k_add,            r->mod, "add_f32");
     cuModuleGetFunction(&r->k_silu_gate,      r->mod, "split_silu_gate_f32");
 
+#define GET_OPT(name, fld) \
+    if (cuModuleGetFunction(&r->fld, r->mod, name) != CUDA_SUCCESS) r->fld = NULL;
+    GET_OPT("gemm_bf16_pipe_mt4_scaled_f32", k_gemm_bf16_mt4);
+    GET_OPT("gemm_bf16_pipe_scaled_f32",     k_gemm_bf16);
+    GET_OPT("flash_attn_bf16_hd64",          k_flash_attn_hd64);
+    GET_OPT("reduce_max_abs_f32",            k_reduce_max_abs);
+    GET_OPT("quantize_to_fp8_e4m3",          k_quantize_fp8);
+    GET_OPT("cast_f32_to_bf16",              k_cast_f32_to_bf16);
+    GET_OPT("f16_to_f32_buf",                k_f16_to_f32);
+#undef GET_OPT
+
+    /* Upload FP8 e4m3 -> BF16 LUT (mirrors hy3d_init_fp8_to_bf16_lut). */
+    {
+        CUdeviceptr d_lut; size_t lut_sz;
+        if (cuModuleGetGlobal(&d_lut, &lut_sz, r->mod, "d_fp8_to_bf16_lut") == CUDA_SUCCESS &&
+            lut_sz == 256 * sizeof(uint16_t)) {
+            uint16_t lut[256];
+            for (int i = 0; i < 256; i++) {
+                int sign = (i >> 7) & 1;
+                int exp  = (i >> 3) & 0xF;
+                int mant = i & 0x7;
+                float v;
+                if (exp == 0 && mant == 0) v = 0.f;
+                else if (exp == 15 && mant == 7) v = 0.f; /* NaN -> 0 */
+                else if (exp == 0) v = ((float)mant / 8.f) * (1.f / 64.f);
+                else v = (1.f + (float)mant / 8.f) * exp2f((float)(exp - 7));
+                if (sign) v = -v;
+                uint32_t b; memcpy(&b, &v, 4);
+                uint32_t rb = 0x7FFFu + ((b >> 16) & 1u);
+                lut[i] = (uint16_t)((b + rb) >> 16);
+            }
+            cuMemcpyHtoD(d_lut, lut, sizeof(lut));
+        }
+    }
+
+    /* Env-driven dispatch flags. Defaults: BF16 fast paths ON. */
+    {
+        const char *e;
+        e = getenv("HY3D_BF16_ATTN");
+        r->use_bf16_attn = (r->k_flash_attn_hd64 && r->k_cast_f32_to_bf16 &&
+                            r->sm >= 80) ? ((e && e[0] == '0') ? 0 : 1) : 0;
+        e = getenv("HY3D_BF16_GEMM");
+        int bf16_gemm_ok = (r->k_gemm_bf16 && r->k_f16_to_f32 &&
+                            r->k_reduce_max_abs && r->k_quantize_fp8 &&
+                            r->sm >= 80);
+        /* Default OFF: per-tensor FP8 weight quant on DINOv2-giant FFN drifts
+         * the encoder output by ~16x vs F16 baseline. Opt-in via HY3D_BF16_GEMM=1
+         * for the ~36% speedup when downstream tolerates the drift. */
+        r->use_bf16_gemm = bf16_gemm_ok ? ((e && e[0] == '1') ? 1 : 0) : 0;
+        e = getenv("HY3D_BF16_MT4");
+        r->use_bf16_mt4 = (r->use_bf16_gemm && r->k_gemm_bf16_mt4)
+                          ? ((e && e[0] == '0') ? 0 : 1) : 0;
+        fprintf(stderr, "DINOv2-giant dispatch: BF16_ATTN=%d BF16_GEMM=%d MT4=%d sm=%d\n",
+                r->use_bf16_attn, r->use_bf16_gemm, r->use_bf16_mt4, r->sm);
+    }
+
     /* Scratch buffers */
     cuMemAlloc(&r->d_hidden, SEQ_LEN * HIDDEN * sizeof(float));
     cuMemAlloc(&r->d_normed, SEQ_LEN * HIDDEN * sizeof(float));
@@ -292,7 +396,51 @@ static int dinov2g_init(dinov2g *r) {
     cuMemAlloc(&r->d_attn,   SEQ_LEN * HIDDEN * sizeof(float));
     cuMemAlloc(&r->d_h_in,   SEQ_LEN * FFN_FULL * sizeof(float));
     cuMemAlloc(&r->d_h_mid,  SEQ_LEN * FFN_HALF * sizeof(float));
+    if (r->use_bf16_attn) {
+        cuMemAlloc(&r->d_qkv_bf16,
+                   (size_t)3 * SEQ_LEN * HIDDEN * sizeof(uint16_t));
+    }
     return 0;
+}
+
+/* Online F16 -> FP8 quantizer. Allocates [n] uint8 + [1] float on device.
+ * Returns 0 on success, -1 if any required kernel/alloc is missing. */
+static int dinov2g_quantize_w_fp8(dinov2g *r, CUdeviceptr d_w_f16, size_t n,
+                                   CUdeviceptr *out_fp8, CUdeviceptr *out_scale) {
+    *out_fp8 = 0; *out_scale = 0;
+    if (!r->use_bf16_gemm) return -1;
+    CUdeviceptr d_f32 = 0, d_max = 0, d_fp8 = 0, d_scale = 0;
+    if (cuMemAlloc(&d_f32, n * sizeof(float)) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_max, sizeof(float))     != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_fp8, n)                 != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_scale, sizeof(float))   != CUDA_SUCCESS) goto fail;
+    int ni = (int)n;
+    {
+        unsigned grid = (unsigned)((ni + 255) / 256);
+        void *args[] = {&d_f32, &d_w_f16, &ni};
+        cuLaunchKernel(r->k_f16_to_f32, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    }
+    cuMemsetD8Async(d_max, 0, sizeof(float), r->stream);
+    {
+        unsigned grid = (unsigned)((ni + 255) / 256);
+        void *args[] = {&d_max, &d_f32, &ni};
+        cuLaunchKernel(r->k_reduce_max_abs, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    }
+    {
+        unsigned grid = (unsigned)((ni + 255) / 256);
+        void *args[] = {&d_fp8, &d_scale, &d_f32, &d_max, &ni};
+        cuLaunchKernel(r->k_quantize_fp8, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    }
+    cuStreamSynchronize(r->stream);
+    cuMemFree(d_f32); cuMemFree(d_max);
+    *out_fp8 = d_fp8; *out_scale = d_scale;
+    return 0;
+fail:
+    if (d_f32)   cuMemFree(d_f32);
+    if (d_max)   cuMemFree(d_max);
+    if (d_fp8)   cuMemFree(d_fp8);
+    if (d_scale) cuMemFree(d_scale);
+    return -1;
 }
 
 static int dinov2g_load(dinov2g *r, const char *path) {
@@ -381,9 +529,27 @@ static int dinov2g_load(dinov2g *r, const char *path) {
 #undef FF32
 #undef FF16
 #undef FETCH
+
+        /* Online FP8 prequant: produces FP8 mirror + per-tensor scale.
+         * Errors -> 0/0; launch_gemm falls back to F16 tiled path. */
+        if (r->use_bf16_gemm) {
+            dinov2g_quantize_w_fp8(r, l->q_w,   (size_t)HIDDEN * HIDDEN,
+                                   &l->q_w_fp8,   &l->q_w_scale);
+            dinov2g_quantize_w_fp8(r, l->k_w,   (size_t)HIDDEN * HIDDEN,
+                                   &l->k_w_fp8,   &l->k_w_scale);
+            dinov2g_quantize_w_fp8(r, l->v_w,   (size_t)HIDDEN * HIDDEN,
+                                   &l->v_w_fp8,   &l->v_w_scale);
+            dinov2g_quantize_w_fp8(r, l->out_w, (size_t)HIDDEN * HIDDEN,
+                                   &l->out_w_fp8, &l->out_w_scale);
+            dinov2g_quantize_w_fp8(r, l->w_in_w,  (size_t)FFN_FULL * HIDDEN,
+                                   &l->w_in_fp8,  &l->w_in_scale);
+            dinov2g_quantize_w_fp8(r, l->w_out_w, (size_t)HIDDEN * FFN_HALF,
+                                   &l->w_out_fp8, &l->w_out_scale);
+        }
     }
     safetensors_close(st);
-    fprintf(stderr, "DINOv2-giant: weights loaded\n");
+    fprintf(stderr, "DINOv2-giant: weights loaded%s\n",
+            r->use_bf16_gemm ? " (+ FP8 prequant)" : "");
     return 0;
 }
 
@@ -397,19 +563,75 @@ static void launch_layernorm(dinov2g *r, CUdeviceptr dst, CUdeviceptr src,
                    256 * sizeof(float), r->stream, args, NULL);
 }
 
-/* Y[n_tok, n_out] = X[n_tok, n_in] @ W[n_out, n_in]^T + bias[n_out] */
-static void launch_gemm(dinov2g *r, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x,
-                         CUdeviceptr bias, int n_out, int n_in, int n_tok) {
-    void *args[] = { &y, &w, &x, &bias, &n_out, &n_in, &n_tok };
+/* Y[n_tok, n_out] = X[n_tok, n_in] @ W[n_out, n_in]^T + bias[n_out]
+ *   w_f16: F16 weight (always present, used for fallback)
+ *   w_fp8/w_scale: optional FP8 mirror + per-tensor scale (0/0 -> fallback)
+ *
+ * Dispatch ladder:
+ *   1. BF16 X * dequant'd FP8 W via LUT (MT4 if eligible, else MT2)
+ *      -> output is BF16-truncated F32 (high16 = BF16, low16 = 0)
+ *   2. F16 tiled fallback (existing scalar path; pure F32 output) */
+static void launch_gemm(dinov2g *r, CUdeviceptr y,
+                         CUdeviceptr w_f16,
+                         CUdeviceptr w_fp8, CUdeviceptr w_scale,
+                         CUdeviceptr x, CUdeviceptr bias,
+                         int n_out, int n_in, int n_tok) {
+    if (r->use_bf16_gemm && w_fp8 && w_scale &&
+        n_tok >= 16 && (n_in % 32) == 0 && (n_out % 256) == 0) {
+        void *args[] = {&y, &w_fp8, &x, &bias, &n_out, &n_in, &n_tok, &w_scale};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        gx = (gx + 3u) & ~3u;
+        if (r->use_bf16_mt4 && r->k_gemm_bf16_mt4) {
+            unsigned gy = (unsigned)((n_tok + 63) / 64);
+            gy = (gy + 3u) & ~3u;
+            size_t smem = 4096 + 8192 * 2;  /* 20 KB */
+            cuLaunchKernel(r->k_gemm_bf16_mt4, gx, gy, 1, 128, 1, 1,
+                           smem, r->stream, args, NULL);
+            return;
+        }
+        if (r->k_gemm_bf16) {
+            unsigned gy = (unsigned)((n_tok + 31) / 32);
+            gy = (gy + 3u) & ~3u;
+            size_t smem = 2048 + 8192 * 2;  /* 18 KB */
+            cuLaunchKernel(r->k_gemm_bf16, gx, gy, 1, 128, 1, 1,
+                           smem, r->stream, args, NULL);
+            return;
+        }
+    }
+    void *args[] = { &y, &w_f16, &x, &bias, &n_out, &n_in, &n_tok };
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     cuLaunchKernel(r->k_gemm, gx, gy, 1, 16, 16, 1, 0, r->stream, args, NULL);
 }
 
+static void launch_cast_f32_to_bf16(dinov2g *r, CUdeviceptr dst, CUdeviceptr src,
+                                     int n) {
+    void *args[] = {&src, &dst, &n};
+    cuLaunchKernel(r->k_cast_f32_to_bf16, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static void launch_attn(dinov2g *r, CUdeviceptr out, CUdeviceptr Q,
                          CUdeviceptr K, CUdeviceptr V, int n_tok) {
-    int q_len = n_tok, kv_len = n_tok, dim = HIDDEN;
-    int n_heads = HEADS, head_dim = HEAD_DIM;
+    int dim = HIDDEN, n_heads = HEADS, head_dim = HEAD_DIM;
+
+    if (r->use_bf16_attn && r->k_flash_attn_hd64 && r->d_qkv_bf16) {
+        int n_elem = n_tok * dim;
+        CUdeviceptr d_q = r->d_qkv_bf16;
+        CUdeviceptr d_k = r->d_qkv_bf16 + (CUdeviceptr)((size_t)n_elem * sizeof(uint16_t));
+        CUdeviceptr d_v = r->d_qkv_bf16 + (CUdeviceptr)((size_t)2 * n_elem * sizeof(uint16_t));
+        launch_cast_f32_to_bf16(r, d_q, Q, n_elem);
+        launch_cast_f32_to_bf16(r, d_k, K, n_elem);
+        launch_cast_f32_to_bf16(r, d_v, V, n_elem);
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        size_t smem = (size_t)(4 * 32 * 72 * 2);  /* matches hy3d hd64 */
+        void *args[] = {&out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+        cuLaunchKernel(r->k_flash_attn_hd64, (unsigned)n_heads, gy, 1,
+                       128, 1, 1, smem, r->stream, args, NULL);
+        return;
+    }
+
+    int q_len = n_tok, kv_len = n_tok;
     float scale = 1.0f / sqrtf((float)HEAD_DIM);
     int nt = 128;
     size_t smem = (size_t)(kv_len + nt) * sizeof(float);
@@ -493,22 +715,25 @@ static void dinov2g_run(dinov2g *r, const float *image_f32, float *out_f32) {
 
         /* Self-attention */
         launch_layernorm(r, r->d_normed, r->d_hidden, l->ln1_w, l->ln1_b, SEQ_LEN, HIDDEN);
-        launch_gemm(r, d_Q, l->q_w, r->d_normed, l->q_b, HIDDEN, HIDDEN, SEQ_LEN);
-        launch_gemm(r, d_K, l->k_w, r->d_normed, l->k_b, HIDDEN, HIDDEN, SEQ_LEN);
-        launch_gemm(r, d_V, l->v_w, r->d_normed, l->v_b, HIDDEN, HIDDEN, SEQ_LEN);
+        launch_gemm(r, d_Q, l->q_w, l->q_w_fp8, l->q_w_scale,
+                    r->d_normed, l->q_b, HIDDEN, HIDDEN, SEQ_LEN);
+        launch_gemm(r, d_K, l->k_w, l->k_w_fp8, l->k_w_scale,
+                    r->d_normed, l->k_b, HIDDEN, HIDDEN, SEQ_LEN);
+        launch_gemm(r, d_V, l->v_w, l->v_w_fp8, l->v_w_scale,
+                    r->d_normed, l->v_b, HIDDEN, HIDDEN, SEQ_LEN);
         launch_attn(r, r->d_attn, d_Q, d_K, d_V, SEQ_LEN);
-        launch_gemm(r, r->d_normed, l->out_w, r->d_attn, l->out_b,
-                    HIDDEN, HIDDEN, SEQ_LEN);
+        launch_gemm(r, r->d_normed, l->out_w, l->out_w_fp8, l->out_w_scale,
+                    r->d_attn, l->out_b, HIDDEN, HIDDEN, SEQ_LEN);
         launch_layerscale_add(r, r->d_hidden, r->d_normed, l->ls1,
                                SEQ_LEN * HIDDEN, HIDDEN);
 
         /* SwiGLU FFN */
         launch_layernorm(r, r->d_normed, r->d_hidden, l->ln2_w, l->ln2_b, SEQ_LEN, HIDDEN);
-        launch_gemm(r, r->d_h_in, l->w_in_w, r->d_normed, l->w_in_b,
-                    FFN_FULL, HIDDEN, SEQ_LEN);
+        launch_gemm(r, r->d_h_in, l->w_in_w, l->w_in_fp8, l->w_in_scale,
+                    r->d_normed, l->w_in_b, FFN_FULL, HIDDEN, SEQ_LEN);
         launch_silu_gate(r, r->d_h_in, r->d_h_mid, SEQ_LEN, FFN_HALF);
-        launch_gemm(r, r->d_normed, l->w_out_w, r->d_h_mid, l->w_out_b,
-                    HIDDEN, FFN_HALF, SEQ_LEN);
+        launch_gemm(r, r->d_normed, l->w_out_w, l->w_out_fp8, l->w_out_scale,
+                    r->d_h_mid, l->w_out_b, HIDDEN, FFN_HALF, SEQ_LEN);
         launch_layerscale_add(r, r->d_hidden, r->d_normed, l->ls2,
                                SEQ_LEN * HIDDEN, HIDDEN);
 
@@ -617,7 +842,14 @@ int main(int argc, char **argv) {
     if (dinov2g_load(&r, weights_path) != 0) return 1;
 
     float *output = (float *)malloc((size_t)SEQ_LEN * HIDDEN * sizeof(float));
-    dinov2g_run(&r, input, output);
+    {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        dinov2g_run(&r, input, output);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
+        fprintf(stderr, "DINOv2-giant: encoder forward = %.1f ms\n", ms);
+    }
 
     /* Basic stats */
     double mn = output[0], mx = output[0], sum = 0.0;

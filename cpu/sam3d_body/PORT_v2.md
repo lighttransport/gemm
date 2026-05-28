@@ -69,7 +69,9 @@ final bbox in pixel space (x0, y0, x1, y1)
   ImageNet norm — `do_normalize=false` per HF preprocessor_config.json).
   Diff vs `/tmp/rt_detr_ref/input.npy`: max_abs=0.094 mean_abs=0.0037
   (PIL antialiased bilinear differs at edges; mean is small enough
-  that detection is robust).
+  that detection is robust). The resize loop is now OpenMP-parallel over
+  output rows; in an 8-thread smoke, preprocess measured 1.872 ms while
+  forward remained the dominant 4.793 s cost.
 - R18-VD backbone forward (`rt_detr_forward_backbone`):
   stem 3-conv → maxpool 3×3/2 → 4 stages × 2 BasicBlocks. Stage-0
   uses a plain 1×1 shortcut (`shortcut.convolution.*`), stages 1-3
@@ -166,22 +168,31 @@ Steps:
 
 ### A2.3 — wire `--auto-bbox` into CPU runner (DONE 2026-04-26)
 
-`test_sam3d_body --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]
---image IMG ...` now runs RT-DETR-S to get the primary person bbox
-before sam3d_body's encoder. Default detector path is
+`test_sam3d_body --auto-bbox [--auto-bbox-fast] [--rt-detr-model PATH]
+[--auto-thresh F] --image IMG ...` now runs RT-DETR-S to get the
+primary person bbox before sam3d_body's encoder. Default detector path is
 `/mnt/disk01/models/rt_detr_s/model.safetensors`, default threshold
 is 0.5. Tested on `web/public/sam3_compare/person.jpg` → score 0.98,
 bbox (0.1, 5.9, 768.1, 1019.4), final OBJ V=18439 F=36874.
+`-t N` also calls `omp_set_num_threads(N)` before auto-bbox, so the
+existing CPU thread flag now controls RT-DETR preprocess/forward as
+well as the SAM3D-body MHR path. `--auto-bbox-fast` skips RT-DETR's
+3-layer decoder and uses encoder proposals; it is faster but can return
+a slightly looser crop, so the full decoder remains the default parity
+path.
 
 ### A2.4 — wire `--auto-bbox` into CUDA runner (DONE 2026-04-26)
 
-`test_cuda_sam3d_body --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]`
-runs RT-DETR-S host-side before the CUDA encoder. Detection on the
-person.jpg sample produces score=0.9797 bbox=(0.1, 5.9, 768.1, 1019.4)
-— matches the CPU runner exactly — and the CUDA pipeline emits
-V=18439 F=36874 OBJ. Wall time 8.77s (RT-DETR ~6.9s on 16 threads
-+ CUDA pipeline ~1.9s). RT-DETR stays on CPU; the CUDA TU only
-consumes the resulting bbox.
+`test_cuda_sam3d_body --auto-bbox [--auto-bbox-fast] [--rt-detr-model PATH]
+[--auto-thresh F]` runs RT-DETR-S host-side before the CUDA encoder. It
+now accepts `-t N` and applies it before auto-bbox, giving the CUDA CLI
+the same control over host-side RT-DETR/MHR OpenMP work as the CPU CLI.
+Detection on the person.jpg sample produces score=0.9797 bbox=(0.1,
+5.9, 768.0, 1019.4) and the CUDA pipeline emits V=18439 F=36874 OBJ.
+On sm_120 / 16 CPU threads, full RT-DETR detection measures ~1.94 s;
+`--auto-bbox-fast` uses encoder proposals (`detector=rt-detr-s-encoder`)
+and measures ~1.41 s with bbox=(0.0,0.6,764.2,1021.8). RT-DETR stays on
+CPU; the CUDA TU only consumes the resulting bbox.
 
 Implementation notes: `cuda/sam3d_body/test_cuda_sam3d_body.c`
 includes `common/rt_detr.h` with `RT_DETR_IMPLEMENTATION` defined,
@@ -310,14 +321,18 @@ again, instead of the post-hand-prompt 148-token shape.
 CPU and CUDA `verify_end_to_end --image IMG --bbox x0 y0 x1 y1`
 prefer `body_out_*` when present and fall back to legacy `out_*`
 refs. They also accept `--threshold-2d PX`, so meter-space and
-pixel-space gates can be set independently. Current DINOv3 fixed-bbox
+pixel-space gates can be set independently. Current DINOv3 512x384
 smoke on `samples/dancing.jpg`:
 
-- CPU: vertices max_abs=2.47e-2, kp3d max_abs=2.40e-2, kp2d max_abs=6.75 px
-- CUDA: vertices max_abs=2.43e-2, kp3d max_abs=2.36e-2, kp2d max_abs=6.78 px
+- CPU: vertices max_abs=3.17e-5, kp3d max_abs=3.15e-5, kp2d max_abs=9.95e-3 px
+- CUDA: vertices max_abs=3.20e-5, kp3d max_abs=3.15e-5, kp2d max_abs=9.46e-3 px
 
-Both pass with `--threshold 3e-2 --threshold-2d 10`; the remaining
-drift is the known raw encoder/preprocess floor, not decoder/MHR.
+Both pass with the default raw DINOv3 gates (`--threshold 2e-2
+--threshold-2d 0.5`). The previous 0.12 / 10 px drift was fixed by
+making `sam3d_body_preprocess_image` OpenCV-INTER_LINEAR exact and by
+matching upstream rectangular-DINOv3 ray geometry. The remaining 1.3 px
+raw drift was fixed by adding upstream's no-mask prompt embedding to the
+pre-ray image embeddings before `ray_cond_emb`.
 The same guarded ref gives exact override parity:
 `verify_end_to_end` without `--image` reports vertices max_abs=9.83e-7,
 kp3d max_abs=5.96e-7, and kp2d max_abs=4.88e-4 px. CUDA
@@ -380,16 +395,20 @@ After the fix:
   keypoints_3d max_abs=8.08e-7.
 
 ViT-H fixed-bbox refs generated from
-`/mnt/disk01/models/sam3d-body/vith` also pass through both
-self-driven verifiers. Current raw-image envelope:
+`/mnt/disk01/models/sam3d-body/vith` should be regenerated with
+`--backbone-dtype float32`; older BF16 or stale guarded dumps have a much
+larger apparent raw drift. Current float32 raw-image envelope:
 
-- CPU: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
-- CUDA: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
+- CPU: vertices max_abs=3.07e-5, kp3d max_abs=2.84e-5, kp2d max_abs=2.09e-2 px
+- CUDA: vertices max_abs=3.05e-5, kp3d max_abs=2.86e-5, kp2d max_abs=2.08e-2 px
 
-Both pass with `--backbone vith --threshold 1.5e-1 --threshold-2d 200`.
-Because the decoder/MHR override gates are exact, the remaining raw-image
-gap is the converted ViT-H encoder precision floor relative to PyTorch,
-not decoder or CUDA integration drift.
+Both now pass with the same raw-image defaults as DINOv3
+(`--threshold 2e-2 --threshold-2d 0.5`). If a legacy BF16 ref is used,
+the verifiers auto-select a looser internal default when thresholds are
+not supplied. The key fixes were preserving ViT-H's upstream 0.75-aspect
+512x512 transform for bbox/rays while keeping decoder `img_size` and
+`affine_trans` in the square 512x512 frame, and using the no-mask prompt
+embedding before ray conditioning.
 
 ### A1.6 — VITH decoder + MHR on CUDA (DONE 2026-04-26)
 
@@ -420,6 +439,33 @@ Current full-pipeline smoke (2026-04-30):
 cpu/sam3d_body/samples/dancing.jpg --bbox 727.537 111.031 1534.146
 1456.042 -o /tmp/sam3d_body_vith_cuda.obj` writes
 `V=18439 F=36874` plus the sidecar JSON.
+
+2026-05-13 update: `SAM3D_BODY_GPU_MHR=1` enables an opt-in hybrid
+GPU MHR path for the CUDA runner. The large MHR/cache tensors are now
+lazy-initialized on the first decoder run instead of during
+`cuda_sam3d_body_create`; warm fixed-bbox CLI `create/load` is back
+under a second, while the first `run_all` reports the one-time
+`mhr_cache` bucket explicitly. Shape/face blends, pose-correctives
+GEMV, rest combine, LBS, keypoint regression, and camera projection run
+on GPU; parameter transform and skeleton walk stay on CPU as a small
+tail after the GPU pose-corrective matvec optimization. The
+production decoder loop now keeps tokens/context/augment on device,
+uses persistent scratch for decoder layers and keypoint-token update,
+and runs row-0 norm/heads on GPU, reading back only pose/camera raw
+vectors for the CPU pose-decode/skeleton stages. `kp_token_update`
+reuses a cached device copy of image embeddings and persistent scratch,
+avoiding repeated per-layer image uploads and alloc/free churn. Dense
+PE now uses a device kernel that writes token-order PE directly from
+the cached Gaussian matrix; first-run `dense_pe` in the DINOv3 GPU-MHR
+path dropped from ~29 ms to ~0.2 ms. The GPU-MHR path also consumes
+encoder `d_proj` directly for ray conditioning and device token-order
+context, so the fixed-bbox timing sample now reports encoder `readback`
+0 ms, `encoder_permute` 0 ms, `ray_cond` ≈4.1 ms, `ctx_permute` ≈0.1
+ms. The production MHR pose-correctives projection now uses a
+row-parallel matvec kernel instead of generic one-thread-per-row GEMM,
+dropping total MHR time from ~34 ms to ~13 ms and the current fixed-bbox
+`run_all` sample to ≈1.29 s. Current DINOv3 and ViT-H raw-image gates
+stay green with kp2d max_abs≈9.9e-3 px and ≈2.1e-2 px.
 
 The user-facing surface caught up:
 - `test_cuda_sam3d_body --backbone vith` no longer prints the
@@ -480,12 +526,12 @@ the variant:
 Encoder geometry is cached on the ctx (`enc_grid_h, enc_grid_w,
 enc_n_prefix, enc_image_h, enc_image_w`) so `self_drive_decoder_inputs`
 no longer dereferences the variant-specific encoder model and works
-for both backbones unchanged. For vith, the ray_cond_xyz call subtracts
-64·a00 from the affine X-translation (`warp_for_rays[2] -= 64 * warp[0]`)
-so the rays at the (32, 24) grid map to the correct source pixels —
-equivalent to evaluating the original (512×512) affine at `x' = x + 64`.
-The same shifted warp is plumbed into `dec_cam_batch.affine_trans` and
-`img_size = (384, 512)`.
+for both backbones unchanged. ViT-H ray conditioning keeps the original
+512x512 ray image and center-crops the x ramp during downsampling, while
+the decoder camera batch still receives the shifted crop affine. Rectangular
+DINOv3 uses an explicit compatibility mode for upstream's transposed
+`meshgrid(indexing="xy")` + flatten/reinterpret behavior; `verify_ray_cond_xyz`
+on the 512x384 dump is at max_abs=1.79e-7.
 
 `ensure_decoder_loaded` now picks the variant-tagged decoder + mhr_head
 slices first (`sam3d_body_{dinov3,vith}_decoder.safetensors` etc.) and
@@ -531,8 +577,9 @@ Smoke (sm_120):
 - `--backbone dinov3 -o cuda_dinov3.obj` → V=18439 F=36874 (unchanged).
 - `--backbone vith -o cuda_vith.obj` → V=18439 F=36874; encoder +
   decoder + MHR complete.
-- `make verify-vith` (CUDA) → max_abs=3.53e-1 mean_abs=1.39e-2 (still
-  green; runner refactor didn't regress the verify path).
+- `make verify-vith` (CUDA, canonical float32 ref) →
+  max_abs=1.92e-4 mean_abs=2.70e-6; runner refactor didn't regress the
+  verify path.
 
 ### A1.3 — CUDA ViT-H encoder + verify_vith green (DONE 2026-04-26)
 
@@ -570,10 +617,11 @@ qkv_split → sdpa_f32 → proj → +residual → LN2 → fc1 → GELU → fc2 �
 (1, 1280, 32, 24) f32 from `/tmp/sam3d_body_vith_ref/`, calls
 `cuda_sam3d_body_debug_set_normalized_input` (relaxed to accept
 512×384 when ctx is VITH), `cuda_sam3d_body_run_encoder`, and diffs
-flat against ref. Result: **max_abs=3.53e-1 mean_abs=1.39e-2** —
-identical to CPU at the bf16 forward floor. DINOv3 verify still
-green at max=9.95e-1 mean=1.11e-2 (untouched). Gate set to
-5e-1 max / 2e-2 mean — same A1.2 budget.
+flat against ref. With canonical float32 refs, CUDA reports
+max_abs=1.92e-4 mean_abs=2.70e-6; CPU reports max_abs=2.43e-4
+mean_abs=2.74e-6. The verifiers detect `backbone_dtype.txt` and use
+tight float32 gates for canonical refs, while retaining the old loose
+BF16 diagnostic budget for config-dtype legacy refs.
 
 `Makefile` gained `verify_vith` build + `verify-vith` run target with
 `VITH_REFDIR=/tmp/sam3d_body_vith_ref`.
@@ -611,22 +659,18 @@ header rather than a retrofit:
 `/tmp/sam3d_body_vith_ref/` (produced by gen_image_ref.py with the
 ViT class hook), runs `sam3d_body_vit_encode_from_normalized` on the
 ImageNet-norm + W-axis-cropped tensor, diffs at the (py, px, d)
-level. Result: **max_abs=3.53e-1 mean_abs=1.39e-2** at 8 threads,
-13.6s wall.
+level. With the canonical float32 fixed-bbox ref, result is
+**max_abs=2.43e-4 mean_abs=2.74e-6** at 8 threads, 14.4s wall.
 
-CRITICAL pitfall logged: the **bf16 forward floor**. Upstream runs
-the backbone in bf16 (`FP16_TYPE: bfloat16` in
-`vith/model_config.yaml`), so the dumped tokens are bf16-rounded
-compounded over 32 blocks. Our fp32 forward drifts max≈3.5e-1
-mean≈1.4e-2 from that — verified IDENTICAL with fp32 weights
-(0% mantissa quant) AND with f16 weights (sliced default). The drift
-is purely the bf16-vs-fp32 forward mismatch, not a quant or kernel
-bug. Gate set to 5e-1 max / 2e-2 mean to track this floor; mean is
-the tight catch (a real port bug typically blows up mean before max).
-DINOv3 variant hits 1.5e-1 max on the same comparison because the
-SwiGLU·LayerScale·RoPE pattern compounds bf16 drift differently from
-GELU MLP — same regime, ViT-H just sits 2.3× hotter. Do not tighten
-the ViT-H gate without first switching to a bf16 forward path.
+BF16 pitfall logged: refs generated with upstream config dtype
+(`FP16_TYPE: bfloat16` in `vith/model_config.yaml`) are bf16-rounded
+through all 32 ViT-H blocks, so a fp32 C forward can show max≈3.5e-1
+mean≈1.4e-2 against those legacy/config dumps. That drift is the
+bf16-vs-fp32 forward mismatch, not a quant or kernel bug. Canonical
+refs should now be generated with `--backbone-dtype float32`; the
+standalone `verify_vith` tools detect `backbone_dtype.txt` and use
+tight f32 gates for those refs, while keeping the older loose gate only
+for BF16 diagnostic refs.
 
 ### A1.1 — convert_ckpt.py per-variant slices (DONE 2026-04-26)
 

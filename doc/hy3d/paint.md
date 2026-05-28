@@ -141,7 +141,8 @@ layer-by-layer diffing against a future CUDA port.
 ## CUDA port sequence
 
 Earliest → hardest. Each step has a small, testable slice. Status as of
-**2026-04-15**:
+**2026-05-10**: end-to-end paint chain runs natively on CUDA with the
+PyTorch reference only required for development / per-stage diffing.
 
 1. ✅ **xatlas UV unwrap** — `cuda/hy3d_paint/test_uv_unwrap.cc`. Matches
    Python `xatlas` binding on 2084 charts / 54413 verts.
@@ -159,15 +160,24 @@ Earliest → hardest. Each step has a small, testable slice. Status as of
    interpolation 37×37→16×16 (bilinear gave 6.3e-4, bicubic gives
    8.3e-8). Final output mean abs err **1.26e-03** (0.086% relative);
    same accumulation profile as DINOv2-L.
-5. ⏳ **Multiview SD-2.1 UNet** — pending (biggest piece). Reference
-   trace already available via `run_texturegen.py --trace-dir`.
-6. ⏳ **SD VAE decoder** — pending.
+5. ✅ **Multiview SD-2.1 UNet** — `cuda_paint_unet_runner.h` (~2.1k lines)
+   + `paint_stage_unet.c`. UniPC scheduler at 30 steps × 3-chunk CFG =
+   90 forwards per chain. TC dispatch: BF16 attention (FA2-style
+   `flash_attn_bf16_hd64*`), BF16 GEMM (`gemm_bf16_v7`), and native FP8
+   e4m3 GEMM (`gemm_fp8_v7_fused` + `_p2`). Per-chunk reference-attention
+   cache. Beff=12 (N_pbr=2 × N_gen=6). All bit-identical against the
+   PyTorch trace at the chain output (mask_mismatch=4558, max_diff=0.43).
+6. ✅ **SD VAE encoder + decoder** — `cuda_paint_vae_runner.h` +
+   `paint_stage_vae.c`. Same TC dispatch playbook as UNet (FP8/BF16
+   GEMM, FP8 conv via im2col). Encode 13 conditioning views + ref
+   image; decode 12 latent → 12×512² RGB views.
 7. 🟡 **Real-ESRGAN x4** — PyTorch reference dump landed
    (`ref/hy3d/dump_realesrgan.py`, commit `d817d5e`). Produces
    `/tmp/hy3d_resrgan/resrgan_{input,output,rdb0}.npy` (16.7M params,
    `[1,3,128,128]→[1,3,512,512]`). Native CUDA RRDBNet runner pending —
    needs only `conv2d_f32` + `leaky_relu_f32` kernels on top of the
-   existing common ops.
+   existing common ops. Optional for the base pipeline (chain runs
+   without it).
 8. ✅ **Back-projection bake** — `test_back_project.c` +
    `back_project_sample_f32` kernel. Round-trip F32 noise floor at
    three Htex/Himg ratios.
@@ -180,6 +190,133 @@ Earliest → hardest. Each step has a small, testable slice. Status as of
 The Python runner continues to work in parallel throughout; each CUDA
 step swaps in one piece at a time and is diffed against the trace
 dump from `run_texturegen.py --trace-dir`.
+
+## End-to-end pipeline runner
+
+`test_paint_pipeline.c` is the unified harness. The `chain` subcommand
+runs the full mesh → textured-OBJ flow:
+
+```
+./test_paint_pipeline chain <mesh.obj> <dinov2g.safetensors> <dinov2g_input.npy> \
+    <unet_wrapper.safetensors> <unet_inputs_dir> \
+    <vae.safetensors> <bp_ref_dir> <out_dir>
+```
+
+Per-stage wall-clock is printed via `[chain-time] <stage>: %.3fs`.
+`CHAIN_STEPS=N` and `CHAIN_CFG={2,3}` env vars override the defaults
+(30 steps, 3-chunk CFG).
+
+## Performance status (2026-05-10, RTX 5060 Ti / sm_120)
+
+End-to-end 30-step CFG-3 chain on `fujisan` input, 6 views @ 512²:
+
+| Stage           | Wall (s) | % of total | Notes |
+|-----------------|---------:|-----------:|-------|
+| view_maps       |     0.11 |       0.1% | trivial |
+| dinov2g         |     5.14 |       5.3% | encoder forward |
+| vae_encode      |     3.58 |       3.7% | 13 encodes |
+| **unet**        | **82.12**|  **84.7%** | 90 forwards (30 × CFG-3) |
+| vae_decode      |     5.81 |       6.0% | 12 latents → RGB |
+| xatlas+raster   |     0.08 |       0.1% | trivial |
+| back_project    |     0.05 |       0.1% | trivial (GPU bake) |
+| inpaint+write   |     0.01 |       0.0% | trivial (CPU) |
+| **TOTAL**       | **96.91**|     100%   | bit-identical (mask_mismatch=4558) |
+
+PyTorch reference: ~50.6 s end-to-end. Remaining gap: **1.92×**.
+
+The gap is dominated by the UNet (85% of wall). Per-kernel profile
+(PAINT_PROFILE=1, 4-step):
+
+| Kernel               | Total ms | Calls  | avg µs | Share |
+|----------------------|---------:|-------:|-------:|------:|
+| FA2 attention (`fn`) |   3 652  |  7 776 |    470 |  33%  |
+| FP8/BF16 GEMM (`f`)  |   2 516  | 16 251 |    155 |  23%  |
+| reduce_max_abs_f32   |   1 043  | 11 031 |     94 |   9%  |
+| group_norm_f32       |     819  |  8 964 |     91 |   8%  |
+| quantize_fp8_e4m3    |     731  | 11 031 |     66 |   7%  |
+| im2col_3x3_p1        |     639  |  7 053 |     91 |   6%  |
+| (others)             |   1 540  | 32 946 |     ~  |  14%  |
+
+## Tensor-core dispatch toggles
+
+All TC paths are env-gated and default ON. Set to `0` to disable:
+
+| Env var                  | Path                                        | Default |
+|--------------------------|---------------------------------------------|--------:|
+| `PAINT_BF16_ATTN`        | UNet attention via FA2 BF16 (hd=64)         | 1       |
+| `PAINT_BF16_GEMM`        | UNet linears via `gemm_bf16_v7`             | 1       |
+| `PAINT_FP8_GEMM`         | UNet BF16-pipe FP8 fallback (`gemm_fp8_mt4`)| 1       |
+| `PAINT_FP8_CONV`         | UNet 3×3 conv via im2col + FP8 GEMM         | 1       |
+| `PAINT_FP8_V7`           | UNet native e4m3 fused GEMM                 | 1       |
+| `PAINT_FP8_V7_P2`        | UNet 2×2 panel variant of v7                | 1       |
+| `PAINT_VAE_BF16_GEMM`    | VAE BF16 GEMM                               | 1       |
+| `PAINT_VAE_FP8_GEMM`     | VAE BF16-pipe FP8                           | 1       |
+| `PAINT_VAE_FP8_V7`       | VAE native e4m3 fused GEMM                  | 1       |
+| `PAINT_VAE_FP8_V7_P2`    | VAE 2×2 panel variant of v7                 | 1       |
+| `PAINT_VAE_FP8_CONV`     | VAE 3×3 conv via im2col + FP8 GEMM          | 1       |
+| `PAINT_VAE_FP8_MT4`      | VAE 4-tile FP8 GEMM dispatch                | 1       |
+| `PAINT_PROFILE`          | per-kernel cuEvent timing summary on exit   | 0       |
+| `PAINT_FP8_DEBUG`        | per-launch sync + abort-on-error            | 0       |
+| `PAINT_FA_BKV64`         | UNet attention BKV=64 variant (scaffold)    | 0       |
+| `PAINT_UNET_GRAPH`       | CUDA graph capture for UNet forward         | 0       |
+
+Disabling individual paths is useful for bisecting numeric drift; the
+`bf16` and `fp8` paths fall through to each other and finally to the
+F32 pipe so any combination is valid.
+
+## Remaining optimization opportunities
+
+The cheap levers are exhausted. Each remaining option is high-effort
+relative to its expected wall-clock impact, ordered roughly by ROI:
+
+1. **Warp-specialized FA2 (Plan A).** The attention kernel is the single
+   largest cost (33% of UNet kernel time). Plans B (3-stage cp.async at
+   BKV=64) and C (register-diet by fused P-pack) were both tried and
+   landed bit-identical but performance-neutral (B was actually 29%
+   slower). Confirmed the kernel is MMA-throughput-bound, not load- or
+   register-bound. The remaining lever is producer/consumer warp split:
+   1 warp continuously cp.async-loads K/V while 3 warps run MMA without
+   ever blocking on the load. Design notes live in
+   `~/.claude/projects/.../memory/project_hy3d_paint_fa2.md`. Estimated
+   upside: 15–25% on the attention kernel = 5–8% wall.
+2. **CUDA graph capture for the UNet forward**
+   (`PAINT_UNET_GRAPH=1`). Wired and tested; gave ~3% wall in earlier
+   measurements. Currently OFF by default because the kernels are
+   compute-bound and the saving is small relative to the capture
+   complexity. Worth re-measuring once Plan A lands (lower kernel cost
+   raises launch-overhead share).
+3. **Step-count reduction via a faster scheduler.** UniPC at 30 steps
+   is the largest single multiplier on UNet wall. DPM++ 2M Karras at
+   ~15 steps is a candidate; LCM-LoRA-style distillation (4–8 steps)
+   would be much bigger but requires retraining. **Quality constraint:**
+   user-visible PSNR drops below 45 dB at half-step counts on this
+   pipeline are unacceptable, so any scheduler change must be paired
+   with a quality measurement pass.
+4. **Drop CFG-3 to CFG-2.** Saves 33% of UNet calls. Risk: changes the
+   conditioning structure (uncond / ref / full) → the ref-attention
+   cache layout and chain output both shift. Earlier 2-chunk experiment
+   landed but was reverted to 3-chunk for production parity.
+5. **Stream overlap across CFG chunks.** All 90 forwards are currently
+   serialized on stream 0 with a per-chunk RA cache. Issuing the three
+   chunks of step `t+1` on separate streams while step `t`'s VAE work
+   runs would overlap latency only — the GPU is already 99% busy on
+   the kernel mix, so this is unlikely to move the needle.
+6. **Shrink reduce_max_abs + quantize_fp8 launch count.** 22k launches /
+   1.77 s combined. A grid-cap experiment made the kernel 36% faster in
+   isolation but slowed UNet wall by 5 s — shorter critical-path
+   kernels reduced overlap with concurrent ops. A safer win would fuse
+   the two (single launch, shared-memory max → quantize) but requires a
+   grid-level barrier (cooperative groups).
+7. **Real-ESRGAN x4 upsample.** Optional stage; currently skipped. If
+   added, it becomes a noticeable share of wall (small CNN, 16.7 M
+   params per view × 6 views).
+8. **Multi-GPU.** Out of scope for the 5060 Ti port.
+
+The FA2 BKV=64 variant (`flash_attn_bf16_hd64_xq_b64`, opt-in via
+`PAINT_FA_BKV64=1`) is kept in source as the scaffold for the Plan A
+warp-specialized port — it gets the BKV layout closer to FA2's
+canonical hd=64 shape but is 5% slower on its own. Don't ship it on
+by default.
 
 ## File layout
 
@@ -218,6 +355,6 @@ output mesh.
 
 ## Next milestone
 
-Native CUDA RRDBNet runner consuming `/tmp/hy3d_resrgan/resrgan_*.npy`.
-After that, the only remaining ML stages are the multiview SD-2.1 UNet
-and the SD VAE decoder.
+The native pipeline is feature-complete. Future work is the optimization
+queue above (Plan A FA2 warp-specialization is highest ROI) plus the
+optional Real-ESRGAN x4 upsample for the high-res variant of the chain.
