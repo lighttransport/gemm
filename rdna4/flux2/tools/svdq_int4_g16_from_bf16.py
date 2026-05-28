@@ -46,19 +46,50 @@ def rtn_g16_pack(R_f32: torch.Tensor):
 
 
 def svd_split(W_bf16: torch.Tensor, rank: int):
-    """W bf16 [out, in] -> (lora_up bf16[out, r], lora_down bf16[r, in], residual f32[out, in]).
-
-    F32 SVD on the bf16 weight (low-rank branch keeps the principal singular values; residual
-    has flatter spectrum -> RTN g16 sees less per-group dynamic range -> lower error).
-    """
+    """W bf16 [out, in] -> (lora_up bf16[out, r], lora_down bf16[r, in], residual f32[out, in])."""
     W = W_bf16.float()
-    # full_matrices=False gives U[m, k], S[k], Vh[k, n] with k=min(m,n) — we slice top-r.
     U, S, Vh = torch.linalg.svd(W, full_matrices=False)
     r = min(rank, S.numel())
-    lora_up = (U[:, :r] * S[:r]).contiguous()           # [out, r]
-    lora_dn = Vh[:r, :].contiguous()                    # [r, in]
-    R = W - lora_up @ lora_dn                           # f32 residual
+    lora_up = (U[:, :r] * S[:r]).contiguous()
+    lora_dn = Vh[:r, :].contiguous()
+    R = W - lora_up @ lora_dn
     return lora_up.to(torch.bfloat16), lora_dn.to(torch.bfloat16), R
+
+
+def smooth_lambda(W_bf16: torch.Tensor, amax: torch.Tensor, alpha: float = 0.5,
+                  clip: float = 1e3) -> torch.Tensor:
+    """SmoothQuant lambda[in] = amax^a / wmax^(1-a). lam>1 migrates activation outliers INTO
+    weights (kernel-side x/lam shrinks them). lam<1 amplifies low-activation channels which
+    qimg's int4 SVDQuant TOLERATES (the rank-r LoRA absorbs the outliers); see qimg's
+    [[project_qimg_int4_from_bf16]] note (lam>=1 is for int8, not int4)."""
+    W = W_bf16.float()
+    wmax = W.abs().amax(0).clamp(min=1e-8)
+    am = amax.clamp(min=1e-8)
+    lam = (am.pow(alpha) / wmax.pow(1.0 - alpha)).clamp(1.0 / clip, clip)
+    return lam
+
+
+def load_calib(path: str | None):
+    """Load per-linear amax dump and merge linear2 halves into a single concat. Returns
+    {linear_name: amax F32 [in]} keyed by the SVDQ-quant linear name (NOT linear2_attn/mlp)."""
+    if not path: return {}
+    out = {}
+    f = safe_open(path, "pt", "cpu")
+    # collect halves to merge
+    halves = {}    # base -> {'attn': tensor, 'mlp': tensor}
+    for k in f.keys():
+        if not k.endswith(".amax"): continue
+        name = k[:-len(".amax")]
+        if name.endswith(".linear2_attn") or name.endswith(".linear2_mlp"):
+            base = name.rsplit(".", 1)[0] + ".linear2"
+            tag  = "attn" if name.endswith("attn") else "mlp"
+            halves.setdefault(base, {})[tag] = f.get_tensor(k).float()
+        else:
+            out[name] = f.get_tensor(k).float()
+    for base, hv in halves.items():
+        if "attn" in hv and "mlp" in hv:
+            out[base] = torch.cat([hv["attn"], hv["mlp"]], dim=0)
+    return out
 
 
 def main():
@@ -66,7 +97,14 @@ def main():
     ap.add_argument("--bf16", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--rank", type=int, default=32, help="LoRA rank (default 32 = same as the Nunchaku-FLUX2-klein-9B checkpoint)")
+    ap.add_argument("--calib", default=None, help="Activation amax safetensors from FLUX2_CALIB_DUMP. Enables SmoothQuant lambda.")
+    ap.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant alpha (default 0.5)")
+    ap.add_argument("--clip", type=float, default=4.0,
+                    help="SmoothQuant lambda clip [1/clip, clip] (default 4.0; mild to keep per-group g16 viable)")
     a = ap.parse_args()
+    calib = load_calib(a.calib)
+    if a.calib:
+        print(f"calib: {len(calib)} amax entries from {a.calib} (alpha={a.alpha})", file=sys.stderr)
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     src = safe_open(a.bf16, "pt", "cpu")
@@ -84,19 +122,30 @@ def main():
         if k not in keys:
             print(f"[warn] missing {k}", file=sys.stderr); return
         W = src.get_tensor(k)
-        lu, ld, R = svd_split(W, a.rank)
+        name = f"{prefix}.{suf}"
+        amax = calib.get(name)
+        if amax is not None:
+            lam = smooth_lambda(W, amax, a.alpha, a.clip)          # [in] F32
+            W_eff = (W.float() * lam.unsqueeze(0)).to(torch.bfloat16)
+            out[f"{name}.smooth"] = lam.to(torch.bfloat16)
+        else:
+            if calib:                                              # had calib but missing this key
+                print(f"[warn] no calib for {name} -> lam=1", file=sys.stderr)
+            W_eff = W
+        lu, ld, R = svd_split(W_eff, a.rank)
         q, s = rtn_g16_pack(R)
-        bk = f"{prefix}.{suf}.bias"
-        out[f"{prefix}.{suf}.qint4"]     = q
-        out[f"{prefix}.{suf}.wscale"]    = s
-        out[f"{prefix}.{suf}.lora_up"]   = lu
-        out[f"{prefix}.{suf}.lora_down"] = ld
+        bk = f"{name}.bias"
+        out[f"{name}.qint4"]     = q
+        out[f"{name}.wscale"]    = s
+        out[f"{name}.lora_up"]   = lu
+        out[f"{name}.lora_down"] = ld
         if bk in keys:
             out[bk] = src.get_tensor(bk).to(torch.bfloat16); quant_keys.add(bk)
         quant_keys.add(k)
         n_done += 1
         if n_done % 10 == 0 or n_done == 80:
-            print(f"  [{n_done}/80] {prefix}.{suf}  W{tuple(W.shape)}  ({time.time()-t0:.1f}s)", file=sys.stderr)
+            tag = "smooth" if amax is not None else "no-smooth"
+            print(f"  [{n_done}/80] {name}  W{tuple(W.shape)} {tag}  ({time.time()-t0:.1f}s)", file=sys.stderr)
 
     for bi in range(n_dbl):
         for suf in MAIN_DBLK: quant_one(f"double_blocks.{bi}", suf)

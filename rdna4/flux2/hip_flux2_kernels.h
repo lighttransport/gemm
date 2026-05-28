@@ -1352,6 +1352,31 @@ static const char hip_flux2_specific_kernels[] =
 "#endif\n"
 "\n"
 
+/* ---- Calibration: per-input-channel running max-abs ----
+ * X[n_tok, n_in] row-major; one thread per column j;
+ * amax[j] = max(amax[j], max_i |X[i,j]|). amax must be pre-zeroed.
+ * Safe to call repeatedly to accumulate across steps/prompts. */
+"__global__ void amax_per_col_f32(float *__restrict__ amax, const float *__restrict__ X, int n_tok, int n_in) {\n"
+"    int j = blockIdx.x * blockDim.x + threadIdx.x; if (j >= n_in) return;\n"
+"    float m = amax[j];\n"
+"    for (int i = 0; i < n_tok; i++) { float v = X[(long)i*n_in + j]; v = v < 0.f ? -v : v; if (v > m) m = v; }\n"
+"    amax[j] = m;\n"
+"}\n"
+"\n"
+
+/* ---- SmoothQuant divide: y[m, k] = x[m, k] / smooth[k] ----
+ * Used as a pre-step before the int4 main GEMM when the checkpoint carries per-input-
+ * channel `smooth` (lambda from calibration). For LoRA: x_smooth is fed to both the
+ * residual GEMM and the LoRA branch (math: W_smooth = W*lambda; W_smooth @ x_smooth = W @ x). */
+"__global__ void flux2_div_by_smooth_f32(float *__restrict__ Y, const float *__restrict__ X,\n"
+"                                         const float *__restrict__ smooth, int n_tok, int n_in) {\n"
+"    int k = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int m = blockIdx.y;\n"
+"    if (k >= n_in || m >= n_tok) return;\n"
+"    Y[(long)m * n_in + k] = X[(long)m * n_in + k] / smooth[k];\n"
+"}\n"
+"\n"
+
 /* ---- BF16 WMMA self-attention (head_dim=128), ported from qimg
  * flash_attn_sa_wmma_f32. Replaces the scalar flash_attn_f32 — same math
  * (BF16 inputs, F32 accum, online softmax) so quality is preserved. ---- */
