@@ -119,6 +119,14 @@ void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r);
  * SC-VAE decoders, which otherwise OOM with the DiTs resident. Idempotent. */
 void cuda_trellis2_unload_dit_stages(cuda_trellis2_runner *r);
 
+/* Per-stage DiT unloads, for lazy load-run-free pipelining that caps the GPU
+ * peak at one DiT instead of all three resident at once. Each frees only that
+ * stage's weights (KV cache is kept — it is model-id keyed and recomputed by the
+ * next stage). All idempotent. */
+void cuda_trellis2_unload_stage1(cuda_trellis2_runner *r);
+void cuda_trellis2_unload_stage2(cuda_trellis2_runner *r);
+void cuda_trellis2_unload_stage3(cuda_trellis2_runner *r);
+
 /* Run shape decoder on GPU and allocate CPU output arrays.
  * slat: [N, 32], coords: [N, 4] int32.
  * out_feats/out_coords are malloc-owned by the caller. */
