@@ -306,25 +306,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n=== Loading weights ===\n");
     if (max_gpu_layers > 0)
         cuda_trellis2_set_max_gpu_layers(r, max_gpu_layers);
-    /* Load Stage 1 + decoder (DINOv3 may already be loaded via --image) */
+    /* Load Stage 1 + decoder (DINOv3 may already be loaded via --image).
+     * Stage 2/3 DiTs and the shape decoder are loaded LAZILY (load-run-free, one
+     * DiT resident at a time) at their pipeline points below: this caps the GPU
+     * peak at the single F32 Stage-1 DiT (~5.3 GB) instead of all three DiTs +
+     * shape decoder co-resident (~12.7 GB on this 16 GB card). The tex decoder
+     * was already lazy-loaded after the shape decode. */
     if (cuda_trellis2_load_weights(r, image_path ? NULL : NULL,
                                      stage1_path, decoder_path) != 0) {
         cuda_trellis2_free(r); free(features); return 1;
-    }
-    if (stage2_path) {
-        if (cuda_trellis2_load_stage2(r, stage2_path) != 0) {
-            cuda_trellis2_free(r); free(features); return 1;
-        }
-    }
-    if (stage2_path && shape_dec_path) {
-        if (cuda_trellis2_load_shape_decoder(r, shape_dec_path) != 0) {
-            cuda_trellis2_free(r); free(features); return 1;
-        }
-    }
-    if (stage3_path) {
-        if (cuda_trellis2_load_stage3(r, stage3_path) != 0) {
-            cuda_trellis2_free(r); free(features); return 1;
-        }
     }
 
     /* Generate or load initial noise */
@@ -469,6 +459,14 @@ int main(int argc, char **argv) {
     if (stage2_path && shape_dec_path) {
         fprintf(stderr, "\n=== Stage 2: Shape Flow Sampling (%d steps, cfg=%.1f) ===\n",
                 s2_steps, s2_cfg);
+
+        /* Lazy load: Stage 1 is done (occupancy decoded + coords extracted) — free
+         * its ~5.3 GB F32 DiT, then load Stage 2. Keeps only one DiT resident. */
+        cuda_trellis2_unload_stage1(r);
+        if (cuda_trellis2_load_stage2(r, stage2_path) != 0) {
+            fprintf(stderr, "Failed to load Stage 2\n");
+            cuda_trellis2_free(r); free(features); return 1;
+        }
 
         /* Extract sparse coords from occupancy.
          * PyTorch (dump_ground_truth.py): occ = decoded>0 at 64^3, then since
@@ -661,6 +659,14 @@ sparse_done:
         if (stage3_path) {
             fprintf(stderr, "\n=== Stage 3: Texture Flow Sampling (%d steps, no CFG) ===\n", s3_steps);
 
+            /* Lazy load: Stage 2 is done (shape slat s2_x is host-side) — free its
+             * DiT, then load Stage 3. */
+            cuda_trellis2_unload_stage2(r);
+            if (cuda_trellis2_load_stage3(r, stage3_path) != 0) {
+                fprintf(stderr, "Failed to load Stage 3\n");
+                cuda_trellis2_free(r); free(features); return 1;
+            }
+
             /* Normalize shape_slat for concat_cond */
             float *shape_norm = (float *)malloc((size_t)N_sparse * 32 * sizeof(float));
             for (int i = 0; i < N_sparse; i++)
@@ -731,6 +737,15 @@ sparse_done:
          * Stage 1) before decoding — otherwise the shape decode OOMs at its
          * finest level (~1.47M voxels) with the DiTs resident. */
         cuda_trellis2_unload_dit_stages(r);
+
+        /* Lazy load the shape decoder now that all DiTs are freed (it was NOT
+         * loaded upfront — see the lazy-load note at weight-load time). */
+        if (cuda_trellis2_load_shape_decoder(r, shape_dec_path) != 0) {
+            fprintf(stderr, "Failed to load shape decoder\n");
+            free(s2_x); free(sparse_coords); free(occupancy);
+            cuda_trellis2_free(r); free(features);
+            return 1;
+        }
 
         fprintf(stderr, "\n=== Shape Decoder (CUDA SC-VAE) ===\n");
 

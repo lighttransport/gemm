@@ -1120,6 +1120,31 @@ error — Stage-2's gap is CFG-amplified precision (a bf16-block Stage-2 mode wo
 no-CFG Stage-3 path is verified bit-close. Summary: single-step S2 0.99995 / S3 ~1.0; full-sampler
 **S2 0.985, S3 0.99998.**
 
+### Lazy per-stage DiT load — GPU peak 12.7 GB → 5.3 GB (2026-05-30)
+
+The harness previously loaded all three DiTs **+** the shape decoder upfront, so the peak hit
+~12.7 GB (only `3100/15850 MB free`) *before Stage 1 even ran* — dangerously tight on the 16 GB card
+and a hard wall for larger models. But the stages run strictly sequentially (S1 coords → S2 slat →
+S3 tex slat → shape decode → tex decode) and all inter-stage data is host-side, so only one DiT is
+ever needed at a time. New per-stage unloads (`cuda_trellis2_unload_stage1/2/3`, factored out of
+`unload_dit_stages`) let the harness **load-run-free** each stage in turn:
+
+```
+load Stage1 → run → unload_stage1 → load Stage2 → run → unload_stage2
+→ load Stage3 → run → unload_dit_stages → load shape_dec → decode
+→ unload_shape_dec → load tex_dec → decode    (tex_dec was already lazy)
+```
+
+Measured peak `free` per phase: S1 10530, S2 11260, S3 11260, post-unload 14868 MB → **peak usage
+~5.3 GB (was ~12.7 GB), a 58% cut.** Safe because the cross-attn KV cache is keyed by
+`(model_id, cond_hash)` (`runner.c:1656`), so each freshly-loaded stage recomputes its own KV instead
+of reusing the freed stage's; and the free helpers (`CU_FREE`, `dit_model_free_gpu`) zero their
+pointers, so the per-stage unloads + the bulk `unload_dit_stages` remain double-free safe.
+**Verified computation-neutral:** the e2e Stage-1 latent is byte-identical to the pre-change run
+(`max|diff|=0`), and the full image→colored-OBJ pipeline completes through every load/free transition
+with no OOM. (Same run also shows the Stage-2 `guidance_rescale` fix lifting the e2e tex-voxel count
+to **99.6%** of PyTorch's 1.468M, up from 93.8%.)
+
 **Full bf16-block port — Stage-1 latent 0.9895 → 0.99739 (2026-05-29).** The gap is NOT a bug. The
 FlowEuler sampler and every config value match `model_root/pipeline.json` exactly
 (`guidance_interval=[0.6,1.0]` on the rescaled t, `guidance_strength=7.5`, `guidance_rescale=0.7`,
