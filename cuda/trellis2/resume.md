@@ -25,6 +25,20 @@
 > The residual 0.0026 is irreducible (cuBLAS-vs-PyTorch bf16 round-points compounded
 > over 12 recursive Euler steps; single forward is already 0.9998).
 >
+> MULTI-PROMPT FOLLOW-UP (2026-05-30) — the 0.99739 win is T.png-SPECIFIC and the
+> PyTorch reference is BACKEND-DEPENDENT. Re-dumped T.png (same seed/noise/cond as the
+> canonical verify-dumps): 02_noise identical, 01_cond Δ=2e-5, but 03_ss_latent
+> cos=0.99752 vs canonical; two fresh runs are BIT-IDENTICAL → systematic dense-attn
+> backend diff (canonical flash_attn? vs this env's sdpa fallback), not run noise. So
+> PyTorch's own bf16 12-step latent only reproduces to ~0.9975 → 0.999 is unreachable
+> by anyone. On T.png bf16 lands inside the PyTorch cluster (0.9974/0.9976) and TF32
+> outside (0.9895/0.9934); but across 3 NEW images it is a WASH (bf16 0.983–0.996 vs
+> TF32 0.993–0.995, mean TF32 0.9941 ≳ bf16 0.9922 — refs deterministic, so real).
+> bf16 = "match a specific PyTorch bf16 run within its ~0.0025 backend ambiguity", NOT
+> a universal win. Keep TF32 default (more consistent + higher precision). Repro:
+> `/tmp/t2_dump_stub.py` (meta_path-stubs flex_gemm/cumesh/nvdiffrast/o_voxel; needs
+> `pip install --break-system-packages trimesh easydict`) + `dump_ground_truth.py --stage1-only`.
+>
 > ## STAGE-1 "GARBAGE OUTPUT" — RESOLVED (2026-05-29)
 >
 > The Stage-1 garbage + shape-decoder OOM crash (see "Latest CUDA e2e
