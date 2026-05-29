@@ -566,12 +566,18 @@ int main(int argc, char **argv) {
         float t_val = (dit_t != 0.5f) ? dit_t : (t_arr[0] / 1000.0f);
         int n_cond = (ond == 3) ? odims[1] : odims[0];  /* [1,1029,1024] or [1029,1024] */
         float *vel = (float *)malloc((size_t)N * 32 * sizeof(float));
-        double t0 = now_ms();
-        rc = is_tex ? hip_trellis2_tex_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel)
-                    : hip_trellis2_slat_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel);
-        if (rc != 0) { fprintf(stderr, "%s dit_step failed\n", is_tex?"tex":"slat"); return 1; }
-        fprintf(stderr, "%s single step: N=%d Cin=%d t=%.4f n_cond=%d  %.1f ms\n",
-                is_tex ? "tex" : "slat", N, Cin, t_val, n_cond, now_ms() - t0);
+        /* T2_STEP_ITERS>1: repeat the forward (KV cache persists across iters →
+         * iter 2+ are warm) and report the last iter's time. */
+        int iters = 1; { const char *e = getenv("T2_STEP_ITERS"); if (e && atoi(e) > 0) iters = atoi(e); }
+        double t0 = 0;
+        for (int it = 0; it < iters; it++) {
+            t0 = now_ms();
+            rc = is_tex ? hip_trellis2_tex_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel)
+                        : hip_trellis2_slat_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel);
+            if (rc != 0) { fprintf(stderr, "%s dit_step failed\n", is_tex?"tex":"slat"); return 1; }
+        }
+        fprintf(stderr, "%s step (iter %d/%d, warm): N=%d Cin=%d t=%.4f n_cond=%d  %.1f ms\n",
+                is_tex ? "tex" : "slat", iters, iters, N, Cin, t_val, n_cond, now_ms() - t0);
         print_stats("velocity", vel, N * 32);
         char out[1300];
         snprintf(out, sizeof(out), "%s/hip_%s_velocity.npy", output_dir, is_tex?"tex":"slat");
