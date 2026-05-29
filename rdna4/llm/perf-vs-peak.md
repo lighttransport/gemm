@@ -254,6 +254,155 @@ Measured on RX 9070 XT:
 
 Both bit-identical first/last decoded token ids → correctness PASS. **Perf-null** because hybrid decode is kernel-execution-bound, not launch-bound. Theoretical launch-overhead ceiling was ~1 ms/tok (200 kernels × 5 µs) ≈ 1.4% of 70 ms/tok, and the driver's existing stream-queue scheduling already amortizes most of that — leaving the captured-graph path effectively a wash. Kept landed because it removes a stale exclusion and brings hybrid to parity with non-hybrid graph eligibility.
 
+**Q5_K full-vocab decode matvec (✅ LANDED 2026-05-18)** — the short decode
+profile showed `matvec_q5_K_f32` as a disproportionate hotspot despite only
+9 calls: 63.7 ms total, ~7.1 ms/call. This is the full-vocab logits
+projection, so the default one-row-per-block kernel produced too many tiny
+blocks and too little work per block. Added `matvec_q5_K_mw_f32`, a
+one-warp-per-row variant with 8 rows per block, and made it the default
+Q5_K decode path. `LLM_Q5_K_MW=0` keeps the old kernel available for A/B
+and rollback.
+
+Measured on RX 9070 XT:
+
+| case | old Q5_K | new Q5_K MW | speedup |
+|---|---:|---:|---:|
+| microbench `Q5_K 248320x5120` | 7.096 ms/launch | **1.787 ms/launch** | **3.97x** |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 67.785 ms/tok | **63.404 ms/tok** | **1.07x** |
+| Qwen3.5-9B Q4_K_XL decode L=256, 16 tok | 45.179 ms/tok | **36.372 ms/tok** | **1.24x** |
+
+Correctness: `--verify-quant-kernels` passes 18/18 with the new default, and
+the 9B/27B A/B decode runs preserved first/last token ids.
+
+**IQ3_XXS decode matvec scale/sign load (✅ LANDED 2026-05-18)** — replaced
+the hot-kernel `memcpy` load of each IQ3_XXS scale/sign word with an explicit
+32-bit load. This is a narrow decode-kernel-internals cleanup, but it hits the
+largest remaining matvec family on the 27B path. Applied the same direct-load
+cleanup to `dequant_iq3_xxs_to_bf16` after validating it independently.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `IQ3_XXS 5120x5120` | 0.0538 ms | **0.0531 ms** | 1.01x |
+| microbench `IQ3_XXS 17408x5120` | 0.1557 ms | **0.1528 ms** | 1.02x |
+| microbench `IQ3_XXS 5120x17408` | 0.1617 ms | **0.1586 ms** | 1.02x |
+| profile `dequant_iq3_xxs_to_bf16` total | 137.4 ms | **135.9 ms** | 1.01x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 63.3-63.6 ms/tok | **62.8-62.9 ms/tok** | ~1.01x |
+
+Correctness: `--verify-quant-kernels` passes 18/18; 27B decoded first/last
+token ids unchanged. The dequant direct-load cleanup kept the same token ids
+and measured 5.854/6.004 ms/tok on two L=256 prefill runs. A related
+`dequant_iq3_xxs_to_bf16` warp-broadcast trial was not landed: it passed
+correctness but regressed the same 27B prefill bench from 6.083 to
+6.176 ms/tok.
+
+**IQ3_XXS decode matvec loop unroll (✅ LANDED 2026-05-18)** — added explicit
+unroll hints to the fixed 8 x 4 x 4 IQ3_XXS decode-matvec block loops. The
+compiler had not fully flattened the loop nest, and the hint materially
+reduced the hottest decode kernel without changing the arithmetic.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `IQ3_XXS 5120x5120` | 0.0531 ms | **0.0465 ms** | 1.14x |
+| microbench `IQ3_XXS 17408x5120` | 0.1528 ms | **0.1372 ms** | 1.11x |
+| microbench `IQ3_XXS 5120x17408` | 0.1586 ms | **0.1345 ms** | 1.18x |
+| profile `matvec_iq3_xxs_f32` total | 253.3 ms | **226.0 ms** | 1.12x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 62.8-62.9 ms/tok | **57.78 ms/tok** | 1.09x |
+
+Correctness: `--verify-quant-kernels` passes 18/18; 27B decoded first/last
+token ids unchanged.
+
+**Q6_K decode matvec loop unroll (✅ LANDED 2026-05-18)** — added explicit
+unroll hints to the fixed Q6_K half/32-element decode-matvec loops. This kept
+the existing one-block-per-row launch shape, avoiding the earlier MW variant
+that won microbench but regressed full decode.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q6_K 5120x5120` | 0.208 ms | **0.143 ms** | 1.46x |
+| microbench `Q6_K 17408x5120` | 0.635 ms | **0.426 ms** | 1.49x |
+| microbench `Q6_K 5120x17408` | 1.059 ms | **0.558 ms** | 1.90x |
+| profile `matvec_q6_K_f32` total | 93.2 ms | **62.0 ms** | 1.50x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 57.78 ms/tok | **53.94-53.99 ms/tok** | 1.07x |
+
+Correctness: `--verify-quant-kernels` passes 18/18; 27B decoded first/last
+token ids unchanged. Tried the analogous default Q4_K unroll in the same
+pass, but it regressed `Q4_K 5120x5120` from ~0.099 ms to ~0.200 ms/launch,
+so it was not landed.
+
+**Q6_K decode matvec 64-thread launch (✅ LANDED 2026-05-19)** — changed the
+default Q6_K one-row-per-block launch from 256 to 64 threads/block. Decode
+rows have only tens of 256-element K-blocks, so the old 256-thread block left
+most lanes idle and paid an 8-warp reduction. A 128-thread trial was slower on
+all sampled shapes, and a 32-thread trial only helped the smallest sampled
+shape while regressing the larger-row/longer-column cases.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q6_K 5120x5120` | 0.143 ms | **0.0899 ms** | **1.59x** |
+| microbench `Q6_K 17408x5120` | 0.426 ms | **0.2895 ms** | **1.47x** |
+| microbench `Q6_K 5120x17408` | 0.558 ms | **0.4696 ms** | **1.19x** |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 50.85-51.02 ms/tok | **50.12 ms/tok** | ~1.02x |
+| Qwen3.5-9B Q4_K_XL decode L=256, 16 tok | 25.57-25.62 ms/tok | **23.18 ms/tok** | ~1.10x |
+
+Correctness: `--verify-quant-kernels` passes 18/18. The change only alters
+the launch geometry of the existing Q6_K arithmetic.
+
+**Q6_K decode matvec scale-loop split (✅ LANDED 2026-05-20)** — split the
+hot 32-element Q6_K inner loop into two 16-element loops and precomputed the
+repeated `d * scale` factors per half-block. This keeps the same 64-thread
+launch shape and the same dequant arithmetic, but removes repeated scale
+multiplication and `l / 16` indexing from the inner loop.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q6_K 5120x5120` | 0.0895 ms | **0.0859 ms** | 1.04x |
+| microbench `Q6_K 17408x5120` | 0.2890 ms | **0.2780 ms** | 1.04x |
+| microbench `Q6_K 5120x17408` | 0.4693 ms | **0.4325 ms** | 1.09x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 50.12 ms/tok | **49.63 ms/tok** | ~1.01x |
+
+Correctness: `--verify-quant-kernels` passes 18/18. First/last decoded token
+ids for the 27B bench stayed `271` / `13`.
+
+**Q4_K decode matvec 64-thread launch (✅ LANDED 2026-05-18)** — changed the
+default Q4_K one-row-per-block launch from 256 to 64 threads/block. Decode
+rows have ~16-68 K-blocks, so the old 256-thread block left most lanes idle
+and paid an 8-warp reduction for little benefit. The 64-thread launch keeps
+the same kernel math and reduces reduction overhead.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q4_K 5120x5120` | 0.099 ms | **0.053 ms** | 1.87x |
+| microbench `Q4_K 17408x5120` | 0.306 ms | **0.157 ms** | 1.95x |
+| profile `matvec_q4_K_f32` total | 70.7 ms | **37.1 ms** | 1.91x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 53.94-53.99 ms/tok | **50.85-51.02 ms/tok** | 1.06x |
+| Qwen3.5-9B Q4_K_XL decode L=256, 16 tok | 36.37 ms/tok | **25.57-25.62 ms/tok** | 1.42x |
+
+Correctness: `--verify-quant-kernels` passes 18/18; 27B and 9B decoded
+first/last token ids unchanged. Tried two alternatives that were not landed:
+packed 8-row Q4_K MW launch (`Q4_K 5120x5120` worsened to 0.154 ms) and a
+paired low/high-nibble accumulator rewrite (0.102 ms).
+
+**Q6_K one-warp-per-row decode matvec (❌ TRIED 2026-05-18 — not landed)** —
+implemented the analogous MW launch shape behind `LLM_Q6_K_MW=1`. It passed
+`--verify-quant-kernels` and improved isolated Q6_K microbenches:
+5120x5120 0.208 → 0.192 ms/launch, 17408x5120 0.635 → 0.517 ms/launch,
+5120x17408 1.059 → 0.964 ms/launch. End-to-end 27B decode still regressed:
+63.615 ms/tok default vs 64.850 ms/tok with Q6_K MW at L=256, 16 decode
+tokens, same first/last token ids. Removed the experiment instead of keeping
+an opt-in path with misleading microbench results.
+
 **Decode fusion path (rmsnorm+matvec, matvec+residual, qknorm+RoPE+KV) — abandoned 2026-05-17.** Original Phase-2 plan was ~10–15% combined; after the Phase-1 null re-derivation showed the real ceiling at ~3% (launches + input-side VRAM round-trips are negligible vs the ~12 GB/tok weight-read budget). Real decode headroom is **inside the matvec kernels themselves** — per-matvec is at ~60% of memory peak per call, so ~40% × (matvec-fraction-of-time ≈ 50%) ≈ **~20% potential** from kernel internals (wider vectorized quant-weight reads, LDS pipelining, possibly WMMA-decode for quant types). That's a different project — kernel rewrite, not fusion — and is uncertain enough to be scoped separately when next picked up.
 
 ## 5. Realistic stacked-improvement ceiling

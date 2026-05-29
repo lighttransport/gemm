@@ -219,6 +219,18 @@ static const char hip_hy3d_specific_kernels[] =
 "\n"
 
 /* -------------------------------------------------------------------- */
+/* round_f32_to_f16_f32: emulate PyTorch scheduler output dtype cast      */
+/* -------------------------------------------------------------------- */
+"/* ---- round_f32_to_f16_f32: x = float(__float2half_rn(x)) ---- */\n"
+"__global__ void round_f32_to_f16_f32(float *x, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    __half h = __float2half_rn(x[i]);\n"
+"    x[i] = __half2float(h);\n"
+"}\n"
+"\n"
+
+/* -------------------------------------------------------------------- */
 /* cfg_combine_f32: out = uncond + scale * (cond - uncond)               */
 /* -------------------------------------------------------------------- */
 "/* ---- cfg_combine_f32: out = uncond + scale * (cond - uncond) ---- */\n"

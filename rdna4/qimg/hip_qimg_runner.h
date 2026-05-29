@@ -28,6 +28,7 @@
 #define HIP_QIMG_RUNNER_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,8 +37,16 @@ extern "C" {
 typedef struct hip_qimg_runner hip_qimg_runner;
 
 hip_qimg_runner *hip_qimg_init(int device_id, int verbose);
+/* Active HIP device marketing name into dst (proves GPU targeting). 0 on success. */
+int  hip_qimg_device_name(const hip_qimg_runner *r, char *dst, size_t cap);
 int  hip_qimg_load_dit(hip_qimg_runner *r, const char *safetensors_path);
+/* Load an offline-converted "logical" Nunchaku/SVDQuant INT4 DiT (W4A16, all blocks resident). */
+int  hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *safetensors_path);
+/* Deterministic on-GPU gate: dequant block-0 attn.to_q and compare to the host oracle. Requires the INT4 DiT loaded. */
+int  hip_qimg_test_int4_dequant(hip_qimg_runner *r);
 int  hip_qimg_load_vae(hip_qimg_runner *r, const char *safetensors_path);
+/* Free resident DiT weights to reclaim VRAM before VAE (int4 DiT is 14 GB). DiT unusable after. */
+void hip_qimg_unload_dit(hip_qimg_runner *r);
 void hip_qimg_free(hip_qimg_runner *r);
 
 /* Run single DiT denoising step on GPU.

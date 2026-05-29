@@ -7,7 +7,7 @@
  * Port of cuda_flux2_runner.h for AMD ROCm/HIP.
  *
  * Runs the 5 double-stream + 20 single-stream DiT blocks on GPU.
- * VAE decode falls back to CPU.
+ * VAE decode also runs on GPU.
  *
  * Usage:
  *   hip_flux2_runner *r = hip_flux2_init(0, 1);
@@ -47,7 +47,7 @@ int hip_flux2_dit_step(hip_flux2_runner *r,
                        const float *txt_tokens, int n_txt,
                        float timestep, float guidance, float *out);
 
-/* VAE decode (CPU fallback).
+/* VAE decode on GPU.
  *   latent:   [32, lat_h, lat_w] F32 (CPU)
  *   out_rgb:  [3, lat_h*8, lat_w*8] F32 (CPU, pre-allocated)
  * Returns 0 on success. */

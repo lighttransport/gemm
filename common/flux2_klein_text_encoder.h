@@ -104,6 +104,22 @@ typedef struct {
 } flux2_enc_gpu_cache;
 
 static flux2_enc_gpu_cache g_flux2_enc_gpu_cache = {0};
+#elif defined(HIP_LLM_RUNNER_H)
+typedef struct {
+    char model_path[512];
+    char tok_path[512];
+    int gpu_device;
+    int ref_count;
+    hip_llm_runner *model;
+    bpe_vocab *vocab;
+    gguf_context *tok_gguf;
+    int n_embd_inner;
+    int n_embd;
+    int n_vocab;
+    int n_layers;
+} flux2_enc_gpu_cache;
+
+static flux2_enc_gpu_cache g_flux2_enc_gpu_cache = {0};
 #endif
 
 /* ---- BF16 dequant helper ---- */
@@ -556,9 +572,96 @@ flux2_text_enc *flux2_text_enc_load_gpu(const char *model_path,
     g_flux2_enc_gpu_cache.n_vocab = enc->n_vocab;
     g_flux2_enc_gpu_cache.n_layers = enc->n_layers;
     return enc;
+#elif defined(HIP_LLM_RUNNER_H)
+    if (g_flux2_enc_gpu_cache.model &&
+        g_flux2_enc_gpu_cache.gpu_device == gpu_device &&
+        strcmp(g_flux2_enc_gpu_cache.model_path, model_path) == 0 &&
+        strcmp(g_flux2_enc_gpu_cache.tok_path, tok_gguf_path ? tok_gguf_path : "") == 0) {
+        flux2_text_enc *enc = (flux2_text_enc *)calloc(1, sizeof(flux2_text_enc));
+        if (!enc) return NULL;
+        g_flux2_enc_gpu_cache.ref_count++;
+        enc->model = g_flux2_enc_gpu_cache.model;
+        enc->vocab = g_flux2_enc_gpu_cache.vocab;
+        enc->gguf = g_flux2_enc_gpu_cache.tok_gguf;
+        enc->n_embd_inner = g_flux2_enc_gpu_cache.n_embd_inner;
+        enc->n_embd = g_flux2_enc_gpu_cache.n_embd;
+        enc->n_vocab = g_flux2_enc_gpu_cache.n_vocab;
+        enc->n_layers = g_flux2_enc_gpu_cache.n_layers;
+        enc->use_gpu = 1;
+        enc->owns_resources = 0;
+        fprintf(stderr, "flux2_text_enc: reusing cached GPU encoder\n");
+        return enc;
+    }
+
+    fprintf(stderr, "flux2_text_enc: GPU(HIP) %s (device %d)\n", model_path, gpu_device);
+
+    int is_gguf = 0;
+    size_t model_len = strlen(model_path);
+    if (model_len >= 5 && strcmp(model_path + model_len - 5, ".gguf") == 0) is_gguf = 1;
+
+    gguf_context *tok_gguf = NULL;
+    bpe_vocab *vocab = NULL;
+    if (tok_gguf_path) tok_gguf = gguf_open(tok_gguf_path, 1);
+    if (!tok_gguf && is_gguf) tok_gguf = gguf_open(model_path, 1);
+    if (!tok_gguf) { fprintf(stderr, "flux2_text_enc: failed to open tokenizer GGUF\n"); return NULL; }
+
+    vocab = bpe_vocab_load(tok_gguf);
+    if (!vocab) { gguf_close(tok_gguf); return NULL; }
+
+    hip_llm_runner *gpu_model = hip_llm_init(gpu_device, 1);
+    if (!gpu_model) { bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL; }
+
+    /* Encoder pads/truncates to <=512 tokens; cap the KV cache + batched buffers
+     * accordingly (2048 OOMs the 16 GB card alongside the F16 weights). */
+    const int ENC_MAX_SEQ = 512;
+    if (is_gguf) {
+        gguf_context *model_gguf = gguf_open(model_path, 1);
+        if (!model_gguf) { hip_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL; }
+        if (hip_llm_load_weights(gpu_model, model_gguf, ENC_MAX_SEQ) != 0) {
+            gguf_close(model_gguf);
+            hip_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
+        }
+        gguf_close(model_gguf);
+    } else {
+        if (hip_llm_load_weights_qwen3_safetensors(gpu_model, model_path, ENC_MAX_SEQ) != 0) {
+            hip_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
+        }
+    }
+
+    {
+        const int hs_layers[3] = {8, 17, 26};
+        if (hip_llm_set_hidden_snapshot_layers(gpu_model, hs_layers, 3) != 0) {
+            hip_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
+        }
+    }
+
+    flux2_text_enc *enc = (flux2_text_enc *)calloc(1, sizeof(flux2_text_enc));
+    enc->model        = gpu_model;
+    enc->vocab        = vocab;
+    enc->gguf         = tok_gguf;
+    enc->n_embd_inner = hip_llm_n_embd(gpu_model);
+    enc->n_embd       = 3 * hip_llm_n_embd(gpu_model);
+    enc->n_vocab      = hip_llm_n_vocab(gpu_model);
+    enc->n_layers     = hip_llm_n_layers(gpu_model);
+    enc->use_gpu      = 1;
+    enc->owns_resources = 0;
+
+    strncpy(g_flux2_enc_gpu_cache.model_path, model_path, sizeof(g_flux2_enc_gpu_cache.model_path) - 1);
+    strncpy(g_flux2_enc_gpu_cache.tok_path, tok_gguf_path ? tok_gguf_path : "",
+            sizeof(g_flux2_enc_gpu_cache.tok_path) - 1);
+    g_flux2_enc_gpu_cache.gpu_device = gpu_device;
+    g_flux2_enc_gpu_cache.ref_count = 1;
+    g_flux2_enc_gpu_cache.model = gpu_model;
+    g_flux2_enc_gpu_cache.vocab = vocab;
+    g_flux2_enc_gpu_cache.tok_gguf = tok_gguf;
+    g_flux2_enc_gpu_cache.n_embd_inner = enc->n_embd_inner;
+    g_flux2_enc_gpu_cache.n_embd = enc->n_embd;
+    g_flux2_enc_gpu_cache.n_vocab = enc->n_vocab;
+    g_flux2_enc_gpu_cache.n_layers = enc->n_layers;
+    return enc;
 #else
     (void)model_path; (void)tok_gguf_path; (void)gpu_device;
-    fprintf(stderr, "flux2_text_enc: GPU path requires CUDA_LLM_RUNNER_H\n");
+    fprintf(stderr, "flux2_text_enc: GPU path requires CUDA_LLM_RUNNER_H or HIP_LLM_RUNNER_H\n");
     return NULL;
 #endif
 }
@@ -580,6 +683,21 @@ void flux2_text_enc_free(flux2_text_enc *enc) {
             }
         } else if (enc->owns_resources) {
             cuda_llm_free((cuda_llm_runner *)enc->model);
+            bpe_vocab_free((bpe_vocab *)enc->vocab);
+            if (enc->gguf) gguf_close((gguf_context *)enc->gguf);
+        }
+#elif defined(HIP_LLM_RUNNER_H)
+        if (g_flux2_enc_gpu_cache.model == (hip_llm_runner *)enc->model &&
+            g_flux2_enc_gpu_cache.ref_count > 0) {
+            g_flux2_enc_gpu_cache.ref_count--;
+            if (g_flux2_enc_gpu_cache.ref_count == 0) {
+                hip_llm_free(g_flux2_enc_gpu_cache.model);
+                bpe_vocab_free(g_flux2_enc_gpu_cache.vocab);
+                if (g_flux2_enc_gpu_cache.tok_gguf) gguf_close(g_flux2_enc_gpu_cache.tok_gguf);
+                memset(&g_flux2_enc_gpu_cache, 0, sizeof(g_flux2_enc_gpu_cache));
+            }
+        } else if (enc->owns_resources) {
+            hip_llm_free((hip_llm_runner *)enc->model);
             bpe_vocab_free((bpe_vocab *)enc->vocab);
             if (enc->gguf) gguf_close((gguf_context *)enc->gguf);
         }
@@ -656,6 +774,23 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
             }
             if (cuda_llm_read_hidden_snapshots(gpu, dst, 3, n_inner) != 0) {
                 fprintf(stderr, "flux2_text_enc: cuda_llm_read_hidden_snapshots failed at token %d/%d\n",
+                        i + 1, n_tok);
+                free(hidden);
+                return NULL;
+            }
+        }
+#elif defined(HIP_LLM_RUNNER_H)
+        hip_llm_runner *gpu = (hip_llm_runner *)enc->model;
+        hip_llm_reset_state(gpu);
+        for (int i = 0; i < n_tok; i++) {
+            float *dst = hidden + (size_t)i * n_out;
+            if (!hip_llm_forward(gpu, toks[i], i)) {
+                fprintf(stderr, "flux2_text_enc: hip_llm_forward failed at token %d/%d\n", i + 1, n_tok);
+                free(hidden);
+                return NULL;
+            }
+            if (hip_llm_read_hidden_snapshots(gpu, dst, 3, n_inner) != 0) {
+                fprintf(stderr, "flux2_text_enc: hip_llm_read_hidden_snapshots failed at token %d/%d\n",
                         i + 1, n_tok);
                 free(hidden);
                 return NULL;
