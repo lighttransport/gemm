@@ -107,23 +107,26 @@
 > (1.9×), quality-neutral (single-step cosine Δ7e-7). **Build gotcha: the Makefile
 > tracks only .c deps — `touch` a .c after editing any header or it won't rebuild.**
 >
-> Remaining: Stage-3 FULL-sampler parity (Stage-2 now DONE — see below); the cuBLAS/plain
-> output-GEMM zero bug (group=25 sidesteps it); lazy per-stage DiT load to cut the
-> ~12.7 GB loading peak.
+> Remaining: the cuBLAS/plain output-GEMM zero bug (group=25 sidesteps it); lazy per-stage
+> DiT load to cut the ~12.7 GB loading peak; optional bf16-block Stage-2 to close the 0.985
+> CFG-amplified gap. **Stage-2/3 FULL-sampler parity now DONE — see below.**
 >
-> ## STAGE-2 FULL-SAMPLER PARITY + guidance_rescale FIX (2026-05-30)
+> ## STAGE-2/3 FULL-SAMPLER PARITY + Stage-2 guidance_rescale FIX (2026-05-30)
 >
-> Stage-2 single step was already corr **0.99995** (`verify_stage2` vs `06b`). New
-> **`verify_stage2_full`** runs the full 12-step sampler on PyTorch's EXACT inputs
-> (`06_shape_slat_noise_feats` + `06b_slat_dit_step_coords` + `06b_slat_dit_step_cond`,
-> zero neg-cond) and compares to `07_shape_slat_raw_feats`. **BUG FOUND + FIXED:**
-> `test_cuda_trellis2.c` had Stage-2 `s2_cfg_rescale=0.7f`, but pipeline.json
-> `shape_slat_sampler` is **0.5** (0.7 is Stage-1's value). Same bug RDNA4 already fixed
-> (`71d27ae`), but that only touched `rdna4/*`. Fix → full-sampler cosine vs `07`:
-> **0.946 → 0.985** (relL2 0.325→0.171). Residual 0.015 = fp16-vs-bf16 per-step
-> compounding (single step is 0.99995; same story as Stage 1). Stage-3 has CFG disabled
-> (strength=1.0) so no analogous bug. Run:
-> `verify_stage2_full <stage2.st> 06_…noise 06b_…coords 06b_…cond 07_…raw [cfg_rescale]`.
+> Single step was already corr **S2 0.99995** (`verify_stage2` vs `06b`), S3 ~1.0. New
+> **`verify_stage2_full` / `verify_stage3_full`** run the full 12-step sampler on PyTorch's
+> EXACT inputs and compare to `07_shape_slat_raw_feats` / `11_tex_slat_raw_feats`:
+> - **S2 full sampler: cosine 0.985** (relL2 0.171). **BUG FOUND + FIXED:**
+>   `test_cuda_trellis2.c` had Stage-2 `s2_cfg_rescale=0.7f`, but pipeline.json
+>   `shape_slat_sampler` is **0.5** (0.7 is Stage-1's value). Same bug RDNA4 fixed in
+>   `71d27ae` but that only touched `rdna4/*`. Fix raised parity **0.946 → 0.985**.
+> - **S3 full sampler: cosine 0.99998** (relL2 6.4e-3) — essentially exact. S3 has
+>   `guidance_strength=1.0` (CFG OFF), so it integrates only the raw per-step f16-vs-bf16
+>   diff. S2's 0.015 residual = its CFG=7.5 **amplifying** that same per-step diff ~7.5×
+>   before compounding. Neither sampler has a logic error; a bf16-block S2 mode would close it.
+> - Inputs: S2 `verify_stage2_full <s2.st> 06_…noise 06b_…coords 06b_…cond 07_…raw [cfg_rescale]`;
+>   S3 `verify_stage3_full <s3.st> 09_…noise 10_…concat_cond 10b_…coords 06b_…cond 11_…raw`.
+>   `neg_cond` is confirmed zero (dump_ground_truth.py:271) so the harness's zero uncond is right.
 
 The section below is the ORIGINAL shape-decoder resume prompt (rel L2 ~5e-7 on
 the Fujisan `N=128` SC-VAE smoke). That work is done; kept for reference.
