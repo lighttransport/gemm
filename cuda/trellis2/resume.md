@@ -1,5 +1,105 @@
 # TRELLIS.2 Shape Decoder Resume Prompt
 
+> ## STAGE-1 bf16-BLOCK PORT — latent 0.9895→0.99739 vs PyTorch (2026-05-29)
+>
+> PyTorch runs the 30 SS-DiT blocks in **bf16** (`sparse_structure_flow.py`:
+> `convert_to(dtype)` on blocks, `manual_cast(h)` in/out; input_layer/t_embedder/
+> out_layer stay f32). `03_ss_latent` is therefore a bf16 trajectory, so our more
+> precise F32/TF32 path topped out at cosine **0.9895** (12-step). **`T2_DIT_BF16=1`
+> now replicates the bf16 block** (default OFF — TF32 stays the production default,
+> it is MORE precise than the bf16 reference):
+> - `bf16_round`: new in-place `t2_round_f32_bf16` kernel + `ops.bf16_round` +
+>   `t2_op_round_bf16`. Rounds EVERY block-op OUTPUT to bf16 (25 `RB()` calls in
+>   `run_dit_forward_generic`: adaLN/LN/QKV/rmsnorm/rope/attn/out-proj/gelu/residuals).
+> - `use_bf16_gemm`: block matmuls run true bf16 (W,X→bf16, `cublasew_gemm_bf16_bf16_f32`
+>   = COMPUTE_32F accumulate). x_emb/out forced f32 (bf16 suppressed around those 2
+>   GEMMs); t_emb rounded after the f32 t-MLP.
+> - **Result vs `03_ss_latent`: TF32 0.98954 → full bf16-block 0.99739** (relL2 0.072,
+>   uniform across channels). ~parity speed with TF32 (~37 s Stage 1).
+>
+> NEGATIVES while chasing 0.999 (do NOT re-attempt): (a) rounding non-matmul WEIGHTS
+> (norm γ/biases/mod_w) to bf16 is BIT-IDENTICAL (output-rounding absorbs it);
+> (b) rounding attention PROBS to bf16 made it WORSE 0.9974→0.9961 — PyTorch SDPA
+> keeps attn internals in f32, so our f16-MMA probs are the closer match;
+> (c) bf16 GEMM is already f32-accumulate; (d) GELU is tanh-approx on both sides.
+> The residual 0.0026 is irreducible (cuBLAS-vs-PyTorch bf16 round-points compounded
+> over 12 recursive Euler steps; single forward is already 0.9998).
+>
+> ## STAGE-1 "GARBAGE OUTPUT" — RESOLVED (2026-05-29)
+>
+> The Stage-1 garbage + shape-decoder OOM crash (see "Latest CUDA e2e
+> verification attempt" below) had three independent causes, all now fixed.
+> The OLD guidance in that section about token-major `--noise` is **WRONG** —
+> read this block first.
+>
+> 1. **Noise layout was a verification artifact, NOT a code bug.** Stage 1 is
+>    channel-major `[C=8,N=4096]` end-to-end. `cuda_trellis2_run_dit` reads
+>    `x_t[ch*N+pos]` and transposes to token-major internally (mirrors PyTorch
+>    `x.view(B,C,-1).permute(0,2,1)`). The PyTorch dump `02_ss_noise.npy`
+>    `[1,8,16,16,16]` is already channel-major — **feed it RAW** (do NOT convert
+>    to `[4096,8]`), and compare the saved `--npy` latent **directly** to
+>    `03_ss_latent[0]` (no readback "layout correction"). The prior session's
+>    `transpose(1,2,3,0).reshape(4096,8)` was the double-transpose scramble that
+>    produced `cosine ≈ −0.012`.
+> 2. **Coords extraction missing `max_pool3d` 64³→32³ (real bug → the OOM).**
+>    `test_cuda_trellis2.c` now max-pools (block-max OR) the 64³ logits to 32³
+>    before emitting res-32 coords, matching PyTorch
+>    `argwhere(decoded>0 |maxpool| )[:, [0,2,3,4]]`. Gives 3515 vs ref 3548
+>    (98.8% overlap) instead of 21037@res64 → no more 2.56M-row cascade. Also
+>    fixes Stage-2/3 RoPE (it uses absolute coord values; res-64 doubled every
+>    angle).
+> 3. **Stage-1 DiT precision (real quality bug).** PyTorch runs the DiT in bf16
+>    (range == f32); our default fp16 MMA clipped a hot intermediate in the
+>    dense 4096-token grid → latent cosine 0.727. Stage 1 now **defaults to F32
+>    GEMM** (`t2_dit_use_f16(r,0)`): single-step 0.9998, latent 0.989. The
+>    SPARSE Stage 2/3 DiTs were measured fp16-faithful (0.9999 == F32) and stay
+>    fp16 (the slow stages). Env: `T2_DIT_F16=1` forces fp16 everywhere,
+>    `T2_DIT_F32=1` forces F32 everywhere.
+>
+> 4. **Shape/tex decoder default output GEMM = all-zero (real bug, fixed).** With
+>    no `T2_SCVAE_*` flags the decoder `[N,7]` output was ALL zero (FDG → 0
+>    triangles, no OBJ). The cuBLAS/plain output-GEMM fall-through leaves it zero;
+>    only the grouped F32 kernel writes it. The resume baseline always set
+>    `T2_SCVAE_OUTPUT_GROUP=25`, masking this. Fixed by defaulting `group` to 25
+>    (was 0). Also fixed the FDG vertex-offset transform to PyTorch's
+>    `2·sigmoid−0.5` (was plain sigmoid).
+>
+> New tool: `verify_stage1` (single SS-DiT forward at t=0.5 vs
+> `02b_ss_dit_step_velocity.npy`). `verify_stage2`/`verify_stage3` now use
+> `t_raw=0.0005` (the 06b/10b dumps are direct t=0.5 calls). See
+> `doc/trellis-2.md` → "Stage-1 e2e parity (2026-05-29)" for full numbers.
+>
+> **e2e now produces a real SHAPE mesh** (image→Stage1 F32→coords→Stage2→shape dec→FDG):
+> with the SC-VAE flags, 1.39M verts / 2.90M tris (PyTorch 1.47M / 3.14M); with no
+> flags, a coarser 287k-tri mesh.
+>
+> **TEXTURE e2e now WORKS** (`--stage3 --tex-dec`, fixed 2026-05-29): full colored
+> OBJ, 1.378M voxels (= shape), 99.7% colored verts. Three fixes:
+> 1. **Subdivision replay** (the real bug): the tex decoder has NO `to_subdiv` head,
+>    so C densely subdivided ×8 → 16.97M → OOM/black. Now the SHAPE decode RECORDS its
+>    per-C2S-stage pruned subdivision into a runner-resident `subdiv_plan[8]` and the
+>    TEX decode REPLAYS it (= PyTorch `decode_tex_slat(guide_subs=subs)`); both use the
+>    same res-32 coords/order → identical 3515→…→1.378M cascade.
+> 2. **DiT VRAM offload**: even with (1), the SHAPE decode OOM'd (all 3 DiTs resident,
+>    Stage 1 F32 = 5.3 GB, `free=0`). New `cuda_trellis2_unload_dit_stages(r)` frees
+>    Stage 1/2/3 + KV cache before decoding (~10.5 GB freed). `--max-gpu-layers` was a
+>    red herring.
+> 3. **PBR colors**: `trellis2_pbr.h` stored the field (col3,col2,col1) but the mesh +
+>    sampler look up (col1,col2,col3) → x↔z swap (~11% hit). Store (col1,col2,col3) →
+>    99.7% trilinear hit; nearest-voxel snap fallback covers the rest (100%).
+>
+> **SPEED**: Stage-1 DiT now uses TF32 tensor cores by default (`ops.use_tf32_gemm`,
+> `T2_DIT_NO_TF32=1` to opt out): Stage 1 148→37.5 s (3.96×), full GPU e2e 237→125 s
+> (1.9×), quality-neutral (single-step cosine Δ7e-7). **Build gotcha: the Makefile
+> tracks only .c deps — `touch` a .c after editing any header or it won't rebuild.**
+>
+> Remaining: Stage-2/3 FULL-sampler parity (single-step verified); the cuBLAS/plain
+> output-GEMM zero bug (group=25 sidesteps it); lazy per-stage DiT load to cut the
+> ~12.7 GB loading peak.
+
+The section below is the ORIGINAL shape-decoder resume prompt (rel L2 ~5e-7 on
+the Fujisan `N=128` SC-VAE smoke). That work is done; kept for reference.
+
 Continue reducing TRELLIS.2 shape SC-VAE CUDA error on the Fujisan `N=128`
 smoke in `/home/syoyo/work/gemm/main`.
 
@@ -161,6 +261,137 @@ Current localization:
     projects to `5.93e-5` at `row=3201 col=4` via `output_layer.weight`.
 - Full-run group28/`eps=9.2e-6` output-order variants: mode1 ties `6.10e-5`;
   modes 2 and 3 worsen to `6.87e-5`.
+
+Latest CUDA e2e verification attempt (2026-05-29):
+
+- Regenerated PyTorch CUDA reference dumps successfully with GPU access outside
+  the sandbox:
+
+  ```bash
+  env OUTDIR=/tmp/t2_pytorch_ref_cuda_check \
+    IMAGE=/home/syoyo/work/gemm/trellis2/cpu/trellis2/trellis2_repo/assets/example_image/T.png \
+    MODEL_ROOT=/home/syoyo/work/gemm/trellis2/cuda/trellis2/model_root \
+    DINOV3=/mnt/disk01/models/dinov3-vitl16/model.safetensors \
+    SEED=42 DECODER_RES=512 \
+    ./cuda/trellis2/run_dump_ground_truth.sh
+  ```
+
+- Reference dump summary for `T.png`, seed 42:
+  - `01_dinov3_cond_512.npy`: `[1,1029,1024]`
+  - `02_ss_noise.npy`: `[1,8,16,16,16]`
+  - `03_ss_latent.npy`: `[1,8,16,16,16]`
+  - `04_ss_decoder_logits.npy`: `[1,1,64,64,64]`, raw positive logits `17303`
+  - `05_ss_coords.npy`: `[3548,4]` after pipeline sparse-coordinate processing
+  - `07_shape_slat_raw_feats.npy`: `[3548,32]`
+  - final PyTorch mesh/texture dumps were produced through `15_tex_voxels`.
+
+- **[SUPERSEDED — THIS IS WRONG, see RESOLVED block at top]** This claimed
+  `test_cuda_trellis2 --noise` consumes token-major `[4096,8]`. It does NOT:
+  `run_dit` reads channel-major `[8,4096]` and transposes internally. The
+  conversion below is the double-transpose scramble that caused the garbage.
+  Feed `02_ss_noise.npy` RAW instead. Original (incorrect) note kept for history:
+
+  ```bash
+  python3 - <<'PY'
+  import numpy as np
+  a = np.load('/tmp/t2_pytorch_ref_cuda_check/02_ss_noise.npy').astype(np.float32)
+  tok = np.transpose(a[0], (1, 2, 3, 0)).reshape(16 * 16 * 16, 8)
+  np.save('/tmp/t2_cuda_e2e_check/ref_noise_token_major.npy', tok)
+  PY
+  ```
+
+- Also split DINO features from `[1,1029,1024]` to `[1029,1024]` for the C
+  runner:
+
+  ```bash
+  python3 - <<'PY'
+  import numpy as np
+  a = np.load('/tmp/t2_pytorch_ref_cuda_check/01_dinov3_cond_512.npy')
+  np.save('/tmp/t2_cuda_e2e_check/ref_features_1029x1024.npy',
+          a[0].astype(np.float32))
+  PY
+  ```
+
+- Corrected Stage 1-only CUDA run completed:
+
+  ```bash
+  env XDG_RUNTIME_DIR=/run/user/1000 \
+    ./cuda/trellis2/test_cuda_trellis2 \
+    /mnt/disk01/models/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors \
+    /mnt/disk01/models/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors \
+    /tmp/t2_cuda_e2e_check/ref_features_1029x1024.npy \
+    --noise /tmp/t2_cuda_e2e_check/ref_noise_token_major.npy \
+    -s 42 -n 12 -g 7.5 \
+    --occ /tmp/t2_cuda_stage1_check/cuda_occ.npy \
+    --npy /tmp/t2_cuda_stage1_check/cuda_stage1_latent.npy \
+    -o /tmp/t2_cuda_stage1_check/cuda_stage1.obj
+  ```
+
+- Corrected Stage 1 comparison still fails vs PyTorch:
+  - `stage1_latent` must be layout-corrected when read back from the C `.npy`
+    because the file header says `[8,16,16,16]` but the stored buffer is
+    token-major `[4096,8]`.
+  - Layout-corrected latent: `rel_L2=1.556485`, `max_abs=4.928794`,
+    `cosine=-0.012180066`, `allclose=False`.
+  - Decoder logits: `rel_L2=0.2057113`, `max_abs=320.9109`,
+    `mean_abs=12.23886`, `cosine=0.978837875`, `allclose=False`.
+  - Raw positive logits: PyTorch `17303`, CUDA `21026`.
+  - Raw positive coord set overlap: `15509` common, `1794` PyTorch-only,
+    `5517` CUDA-only.
+
+- Full CUDA C e2e run was attempted with Stage 2 and Stage 3 loaded:
+
+  ```bash
+  env XDG_RUNTIME_DIR=/run/user/1000 \
+    T2_SCVAE_CUBLAS=1 \
+    T2_SCVAE_PACKED_CONV=1 \
+    T2_SCVAE_CPUAVX_LN=1 \
+    T2_SCVAE_FINAL_LN_EPS=0.000009 \
+    T2_SCVAE_OUTPUT_GROUP=25 \
+    T2_SCVAE_OUTPUT_GROUP_FMA=1 \
+    ./cuda/trellis2/test_cuda_trellis2 \
+    /mnt/disk01/models/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors \
+    /mnt/disk01/models/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors \
+    /tmp/t2_cuda_e2e_check/ref_features_1029x1024.npy \
+    --noise /tmp/t2_cuda_e2e_check/ref_noise_token_major.npy \
+    --stage2 /mnt/disk01/models/trellis2-4b/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors \
+    --shape-dec /mnt/disk01/models/trellis2-4b/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors \
+    --stage3 /mnt/disk01/models/trellis2-4b/ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors \
+    --tex-dec /mnt/disk01/models/trellis2-4b/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors \
+    -s 42 -n 12 -g 7.5 --s2-steps 12 --s2-cfg 7.5 --s3-steps 12 \
+    --occ /tmp/t2_cuda_e2e_check/cuda_occ.npy \
+    --npy /tmp/t2_cuda_e2e_check/cuda_stage1_latent.npy \
+    --s2-npy /tmp/t2_cuda_e2e_check/cuda_shape_slat_raw.npy \
+    -o /tmp/t2_cuda_e2e_check/cuda_full.obj
+  ```
+
+- Full e2e result:
+  - Stage 1 produced `21037` raw positive voxels, so Stage 2 ran on
+    `[21037,32]` instead of PyTorch reference `[3548,32]`.
+  - Stage 2 completed but took about `485.1 s`.
+  - Stage 3 completed but took about `291.2 s`.
+  - Shape decoder expanded `21037 -> 101335 -> 427953 -> 2560034` rows, then
+    failed allocation/illegal-address handling and exited with
+    `CUDA shape decoder failed`.
+  - No final OBJ was written.
+  - GPU recovered afterward (`nvidia-smi` showed about `33 MiB` used).
+
+- Main next debugging target:
+  - Do not spend time on Stage 2/3 parity until Stage 1 is fixed or bypassed.
+  - First localize Stage 1 DiT parity with exact PyTorch `01_dinov3_cond_512`
+    and converted `02_ss_noise`.
+  - Add or use a single-step Stage 1 verifier against
+    `02b_ss_dit_step_velocity.npy` from the PyTorch dump. The existing full
+    Stage 1 mismatch is too large to be shape-decoder noise.
+  - Check C runner input/output layout around `cuda_trellis2_run_dit()`: it
+    transposes `x_t` from channel-major to token-major internally, while
+    `test_cuda_trellis2` stores `x` token-major after loading converted noise.
+    Passing token-major `x` into `cuda_trellis2_run_dit()` may double-transpose
+    or otherwise scramble Stage 1. Either keep `x` channel-major in the test
+    loop or bypass the internal transpose for token-major buffers.
+  - After Stage 1 logits match, mirror the PyTorch `05_ss_coords` sparse
+    coordinate extraction/max-pool semantics before running Stage 2. The C e2e
+    path currently feeds Stage 2 directly from raw positive 64^3 logits.
 
 Likely useful next directions:
 

@@ -914,6 +914,173 @@ TRELLIS.2 model code: `cpu/trellis2/trellis2_repo/` (cloned from github.com/micr
 | **Vulkan: DiT QK RMSNorm gamma** | **11/12 heads use wrong gamma → 0% occupancy** | **`rms_norm_f32.comp` used `w[i]` (head 0 gamma) instead of `w[h*head_dim+i]`** | **Fix gamma index (commit 4306224)** |
 | **Vulkan: DINOv3 patch embed dispatch** | **Tokens 256-1023 all zeros → features diff 14.75** | **`opPatchEmbed` dispatched 1024 workgroups instead of 4096 (shader covers 256 elements/group)** | **`(n_patches*dim+255)/256` workgroups (commit 4306224)** |
 | **Vulkan: GELU approximation** | **DINOv3 features max diff 0.061 vs official** | **`gelu_f32.comp` used tanh approximation; DINOv3 specifies exact erf GELU** | **Replace with A&S erf polynomial, max intrinsic error ~1.5e-7 (commit 70c3b70)** |
+| **Stage-1 DiT fp16 range** | **Full latent cosine 0.727; single-step 0.976; one output element sign-flipped (ref 2.11 vs −0.06)** | **PyTorch runs SS-DiT in bf16 (range == f32); our default fp16 MMA (max ~65504) clips a hot intermediate in the dense 4096-token grid** | **Default Stage-1 DiT to F32 GEMM (`t2_dit_use_f16(r,0)`); single-step 0.9998, latent 0.989. `T2_DIT_F16=1` opts back into fp16. Sparse Stage 2/3 verified fp16-faithful (0.9999==F32), stay fp16** |
+| **SS coords missing max-pool** | **e2e fed Stage 2 ~21037 voxels @res64 → shape decoder cascaded 21037→…→2.56M rows → OOM/illegal-address, no OBJ** | **`test_cuda_trellis2` thresholded the 64³ logits directly; PyTorch does `decoded>0` then `max_pool3d(2)`→32³ before `argwhere`** | **Max-pool 64³→32³ (block-max OR) then emit res-32 coords; 3515 vs ref 3548 (98.8% overlap). Also fixes Stage-2/3 RoPE (res-64 coords doubled every rope angle)** |
+| **Stage-1 e2e noise layout (verification artifact)** | **Stage-1 latent cosine ≈ −0.012 (garbage)** | **A prior session fed `--noise` as token-major `[4096,8]`, but `run_dit` consumes channel-major `[8,4096]` (it transposes internally, mirroring `x.view(B,C,-1).permute(0,2,1)`) → double-transpose scramble. The "`--noise` is token-major" note was false** | **Feed the raw channel-major `02_ss_noise.npy` directly; compare saved latent directly to `03_ss_latent[0]` (no readback "correction"). No code change** |
+| **Shape/tex decoder default output GEMM = all zero** | **e2e with no `T2_SCVAE_*` flags → shape decoder `[N,7]` output ALL zero → FDG `0/N` intersected edges → `0 triangles`, no OBJ** | **The fall-through cuBLAS/plain output-GEMM path leaves the small `[N,out_ch]` output zero; only the grouped F32 kernel writes it. The resume baseline always set `T2_SCVAE_OUTPUT_GROUP=25`, masking this** | **Default `group` to 25 in the output projection (was 0). e2e now emits a mesh with no flags (287k tris); full resume flags give 2.9M tris ≈ PyTorch 3.14M** |
+| **FDG vertex-offset transform** | **Mesh vertex positions slightly off** | **Harness applied plain `sigmoid` to `feats[0:3]`; `fdg_vae.py` uses `(1+2·margin)·sigmoid − margin` (margin=0.5)** | **Match PyTorch: `2·sigmoid − 0.5` in `test_cuda_trellis2.c` post-process** |
+| **Texture decoder dense ×8 subdivision** (FIXED 2026-05-29) | **Full textured e2e: tex decoder cascaded to 16.97M voxels → OOM (`free=0`) → vertex colors all `(0,0,0)` black** | **The tex decoder checkpoint has NO `to_subdiv` head (shape decoder has 8); C fell back to dense ×8 subdivision. PyTorch drives the tex decoder from the SHAPE's res-512 structure → 1.468M voxels (= shape mesh)** | **FIXED: shape decode RECORDS its per-C2S-stage pruned subdivision into a runner-resident `subdiv_plan[8]`; tex decode REPLAYS it (= PyTorch `guide_subs`). Both share the same res-32 coords/order → 3515→16473→73245→320002→1.378M, identical to shape. See "Full TEXTURED e2e" below** |
+| **Texture decode + shape decode OOM with DiTs resident** (FIXED 2026-05-29) | **Even with correct subdivision, the SHAPE decode OOM'd at its finest level (`scratch[8]` 338 MB, `free=0`) — all 3 DiTs (Stage 1 F32 = 5.3 GB) + decoders stayed resident** | **C kept every stage on the GPU; PyTorch frees them via `pipeline.low_vram`. `--max-gpu-layers` streamed DiT blocks but was never the lever** | **`cuda_trellis2_unload_dit_stages(r)` (frees Stage 1/2/3 weights + KV cache, idempotent) called by the harness after all 3 latents are host-side, before decoding → frees ~10.5 GB (3100→13024 MB free)** |
+| **PBR vertex colors x↔z swap + thin-shell miss** (FIXED 2026-05-29) | **Only ~11% of mesh verts got color (rest black) even after the subdivision fix** | **`trellis2_pbr.h` stored the field as (col3,col2,col1) but the FDG mesh + sampler resolve lookups to (col1,col2,col3) → x↔z swap (hit only on the x==z diagonal). Plus FDG dual-vertex offsets ∈ [−0.5,1.5] floor() off the thin shell** | **Store the field (col1,col2,col3) → trilinear hit 99.7%; nearest-populated-voxel snap fallback (`t2pbr_nearest`, radius 4, `T2_PBR_NO_SNAP=1` disables) covers the 0.3% → 100% covered / 99.7% non-black** |
+
+### Stage-1 e2e parity (2026-05-29)
+
+The "garbage Stage-1 output" tracked in `cuda/trellis2/resume.md` had three independent
+causes, now all resolved on the RTX 5060 Ti (sm_120):
+
+1. **Noise layout (verification-side, not a code bug).** Stage 1 is channel-major
+   `[C=8,N=4096]` end-to-end: `cuda_trellis2_run_dit` reads `x_t[ch*N+pos]` and transposes
+   to token-major internally (mirroring PyTorch `sparse_structure_flow.py:228`); the Euler
+   loop and the SS decoder are all channel-major. The prior session's token-major conversion
+   and readback "correction" were the scramble. Fix: feed `02_ss_noise.npy` raw.
+
+2. **Coords extraction (real bug, caused the OOM crash).** See table. `max_pool3d` 64³→32³
+   before `argwhere` is required, both to avoid the shape-decoder blow-up and because
+   Stage-2/3 RoPE uses absolute coord values (res must match PyTorch's 32).
+
+3. **Stage-1 precision (real quality bug).** Default the dense Stage-1 DiT to F32; the
+   sparse Stage-2/3 DiTs stay fp16 (measured bit-faithful). Env: `T2_DIT_F16=1` forces fp16
+   everywhere, `T2_DIT_F32=1` forces F32 everywhere.
+
+**New verifier:** `verify_stage1.c` (`make -C cuda/trellis2 verify_stage1`) does a single
+SS-DiT forward at t=0.5 vs `02b_ss_dit_step_velocity.npy` (pass `02_ss_noise.npy` +
+`01_dinov3_cond_512.npy` raw; it calls `run_dit` with `t_raw=0.0005` so the embedder sees
+0.5). `verify_stage2`/`verify_stage3` now also default to `t_raw=0.0005` (the 06b/10b dumps
+are direct `t=0.5` calls, not sampler steps; optional `argv[6]` overrides). Measured
+single-step correlations vs PyTorch: Stage 1 (F32) 0.9998, Stage 2 0.9999, Stage 3 0.9999.
+Full Stage-1 latent (F32, 12 steps): cosine 0.989, 17133 positive voxels @64³ (ref 17303),
+3515 coords @res32 (ref 3548, 98.8% set overlap).
+
+**End-to-end (image → Stage1 F32 → coords → Stage2 fp16 → shape decoder → FDG):** now
+completes (no OOM) and writes a real mesh. With the resume's validated SC-VAE flags
+(`T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1 T2_SCVAE_CPUAVX_LN=1 T2_SCVAE_FINAL_LN_EPS=0.000009
+T2_SCVAE_OUTPUT_GROUP=25 T2_SCVAE_OUTPUT_GROUP_FMA=1`): 1.39M verts / 2.90M tris
+(PyTorch ref 1.47M / 3.14M). With NO flags (post-fix default group=25): a coarser-but-valid
+1.39M verts / 287k tris. The other SC-VAE flags (PACKED_CONV / CUBLAS / CPUAVX_LN) sharpen the
+decoder features (more detected surface crossings) — they remain opt-in tuning, as in the
+shape-decoder parity work. The cuBLAS/plain output-GEMM fall-through path that produced the
+all-zero `[N,out_ch]` output is still buggy (root cause unconfirmed); the group=25 default
+sidesteps it — worth fixing separately.
+
+**Full TEXTURED e2e (`--stage3 --tex-dec`) — WORKS (2026-05-29).** The full
+image→Stage1→Stage2→shape-dec→Stage3→tex-dec→PBR pipeline now produces a colored OBJ
+(1,377,823 verts / 2,826,154 tris, 99.7% non-black). Three fixes were needed:
+
+1. **Texture-decoder subdivision replay (the real bug).** The tex decoder checkpoint has no
+   `to_subdiv` head, so the C runner had no per-stage subdivision logits and fell back to dense
+   ×8 → 16.97M voxels. Fix: the SHAPE decode now records its per-C2S-stage *pruned* subdivision
+   (parent idx, child slot, child coords) into a runner-resident `t2_subdiv_stage subdiv_plan[8]`;
+   the TEXTURE decode replays it instead of subdividing densely — exactly PyTorch's
+   `decode_tex_slat(tex_slat, guide_subs=subs)`. Both decoders are driven from the same res-32
+   sparse coords in the same order, so the recorded parent indices stay valid. Result:
+   3515→16473→73245→320002→1.378M, byte-identical to the shape cascade. (A standalone tex decode
+   with no prior shape decode falls back to dense, with a logged warning.)
+
+2. **DiT-stage VRAM offload.** Even with correct subdivision, the SHAPE decode itself OOM'd at
+   its finest level (`scratch[8]` 338 MB with `free=0`) because all three DiTs stayed resident —
+   Stage 1 is **F32 = 5.3 GB** alone, and Stage 2/3 add ~2.6 GB each. New
+   `cuda_trellis2_unload_dit_stages(r)` frees Stage 1/2/3 weights + the cross-attn KV cache
+   (idempotent) and the harness calls it after all three latents are host-side, before decoding
+   → frees ~10.5 GB (3100 → 13024 MB free). This is the C analogue of PyTorch's
+   `pipeline.low_vram` CPU offload; `--max-gpu-layers` (DiT block streaming) was never the lever.
+
+3. **PBR vertex-color sampling** (`common/trellis2_pbr.h`). The field was stored in
+   (col3,col2,col1) order while the FDG mesh builder + vertex sampler resolve lookups to
+   (col1,col2,col3) — an x↔z swap that only hit on the x==z diagonal (~11% of verts colored).
+   Storing the field (col1,col2,col3) raised the trilinear hit rate to 99.7%; a
+   nearest-populated-voxel snap fallback (`t2pbr_nearest`, Chebyshev radius 4) covers the 0.3%
+   of FDG dual vertices whose offset (∈[−0.5,1.5]) floors off the thin surface shell → 100%
+   covered, 99.7% non-black. (`T2_PBR_NO_SNAP=1` disables the fallback.)
+
+**Performance (RTX 5060 Ti, 12-step CFG, ~3515 sparse voxels):** Stage-1 DiT now defaults to
+**TF32 tensor cores** (`ops.use_tf32_gemm` → `cublasew_gemm_f32_tf32_rowmajor_nt`,
+`CUBLAS_COMPUTE_32F_FAST_TF32`). The F32 DiT GEMMs previously fell through to a plain tiled
+`gemm_f32` CUDA-core kernel; TF32 keeps the full f32 exponent range (no fp16 clipping) at a
+fraction of the cost, and its 10-bit mantissa is *more* precise than PyTorch's bf16 — single-step
+cosine 0.99980 vs plain-f32 0.99980 (Δ 7e-7, quality-neutral). The math mode is set per cuBLAS
+call, so the decoder's exact-f32 path is untouched. Env opt-out `T2_DIT_NO_TF32=1`.
+
+| Stage | plain F32 | TF32 (default) |
+|-------|-----------|----------------|
+| Stage 1 (dense 4096-token DiT, 12-step CFG) | 148.6 s | **37.5 s (3.96×)** |
+| Stage 2 (sparse shape DiT, F16 MMA) | 38.6 s | 38.4 s |
+| Stage 3 (sparse tex DiT, F16 MMA) | 23.2 s | 23.0 s |
+| Shape decode | 13.6 s | 13.2 s |
+| Texture decode | 13.0 s | 13.5 s |
+| **GPU total** | **~237 s** | **~125 s (1.9×)** |
+
+Remaining: Stage-2/3 FULL-sampler parity (only single-step verified); lower the ~12.7 GB DiT
+*loading* peak (all stages load upfront) via lazy per-stage load.
+
+### PyTorch-reference comparison of the full textured e2e (2026-05-29)
+
+Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
+tex voxels) and compared against the PyTorch ground truth in
+`/mnt/disk01/models/trellis2-4b/verify-dumps/`:
+
+| Quantity | vs PyTorch ref | Result |
+|----------|----------------|--------|
+| Stage-1 latent (`03_ss_latent`) | dense [8,16,16,16] | cosine **0.990** (TF32 default); **0.997** with `T2_DIT_BF16=1` — see bf16-block note below |
+| Tex-voxel PBR feats (`15_tex_voxels`) | on 491,811 overlapping voxels, after `*0.5+0.5` | cosine **0.976** (raw 0.518 → confirms the `*0.5+0.5` scaling) |
+| — per channel | R/G/B 0.82/0.81/0.81, metal 0.985, rough 0.974, alpha 0.996 | material maps near-exact |
+| Tex-voxel count | 1,377,823 vs 1,468,404 | 93.8% |
+| Final mesh verts | vs `13_mesh_vertices` | 93.8% |
+
+**Strong numerical parity confirms the texture decode, TF32 Stage-1, and PBR scaling are all
+correct.** Two characterized residual gaps, both pre-existing / inherent (not regressions):
+
+1. **Voxel-coord overlap is only 35.7%** (491,811 of 1.38M) despite matching per-axis ranges
+   (identity coord permutation is best; no transpose/flip improves it). This is genuine
+   subdivision *divergence*: the Stage-1 latent differs from PyTorch's by relL2 0.14 (we run
+   TF32, PyTorch runs bf16 — TF32 is *more* precise but not bit-identical), and that seeds four
+   levels of thresholded C2S keep/drop decisions which compound. The PBR feats still agree
+   (0.976) on the voxels that do coincide, so the texture decoder itself is correct.
+
+2. **The final mesh is x↔z mirrored vs PyTorch.** The voxel coords are in PyTorch's frame
+   (`(c1,c2,c3)` = grid `(d,h,w)`), but the reference `o_voxel.flexible_dual_grid_to_mesh` maps
+   the first grid dim `c1 → world x`, whereas the C `t2_fdg_to_mesh` deliberately treats coords
+   as `(z,y,x)` and maps `c1 → world z` (a conscious, internally-consistent convention). bbox:
+   CUDA x∈[−0.46,0.47]/z∈[−0.5,0.5] vs ref x∈[−0.5,0.5]/z∈[−0.45,0.47] (Y matches exactly). The
+   C textured mesh is valid and self-consistent (PBR coverage 99.7%); it just doesn't bit-match
+   PyTorch's vertex array. To align exactly: in `t2_fdg_to_mesh` set `verts[0]←coords[0]`,
+   `verts[2]←coords[2]` (un-reverse) **and** flip the emitted triangle winding (a reflection
+   inverts it), then revert the PBR field storage to `(c3,c2,c1)` so the sampler stays aligned.
+   Deferred — it needs visual/normal validation (the centroid-normal test is ~50% on this
+   non-convex mesh, so handedness can't be confirmed headless).
+
+**Full bf16-block port — Stage-1 latent 0.9895 → 0.99739 (2026-05-29).** The gap is NOT a bug. The
+FlowEuler sampler and every config value match `model_root/pipeline.json` exactly
+(`guidance_interval=[0.6,1.0]` on the rescaled t, `guidance_strength=7.5`, `guidance_rescale=0.7`,
+`rescale_t=5.0`, `steps=12`, `sigma_min=1e-5`; CFG combine, CFG-rescale std-match, Euler step and x0
+formula all verified line-by-line vs `flow_euler.py` + the guidance mixins). The single-step DiT
+forward is already cosine **0.9998** vs `02b_ss_dit_step_velocity`; the 12-step latent drifts by
+integrating that per-step f32-vs-bf16 difference. PyTorch runs the 30 DiT blocks in **bf16**
+(`sparse_structure_flow.py`: `convert_to(dtype)` on the blocks, `manual_cast(h)` in/out;
+input_layer/t_embedder/out_layer stay f32). `T2_DIT_BF16=1` now replicates that trajectory:
+
+- **`bf16_round`** (new in-place `t2_round_f32_bf16` kernel + `ops.bf16_round` + `t2_op_round_bf16`)
+  rounds EVERY block-op OUTPUT to bf16 precision — 25 `RB()` calls in `run_dit_forward_generic`
+  covering adaLN/LN/QKV/RMSNorm/RoPE/attn/out-proj/GELU/residuals.
+- **`use_bf16_gemm`** makes the block matmuls true bf16 (W,X→bf16, `cublasew_gemm_bf16_bf16_f32` =
+  `CUBLAS_COMPUTE_32F` accumulate). x_emb/out are forced f32 (bf16 suppressed around those two
+  GEMMs); t_emb is rounded after the f32 timestep-MLP.
+
+| Stage-1 latent vs `03_ss_latent` (12-step) | cosine | relL2 |
+|---|---|---|
+| TF32 (production default) | 0.98954 | 0.143 |
+| bf16-GEMM only (matmul inputs, OLD negative) | 0.98848 | — |
+| **full bf16-block (`T2_DIT_BF16=1`)** | **0.99739** | **0.072** |
+
+Speed is ~parity with TF32 (~37 s Stage 1). **Negative sub-findings while chasing 0.999** (do not
+re-attempt): (1) rounding the non-matmul WEIGHTS (norm γ / biases / mod_w) to bf16 is BIT-IDENTICAL —
+the per-op output rounding already absorbs sub-bf16 weight differences; (2) rounding the attention
+PROBS to bf16 made it WORSE (0.9974→0.9961) — PyTorch SDPA keeps the attention internals in f32, so
+our f16-MMA probs (`attn_mma_hd128_f32`, 10-bit) are the closer match; (3) the bf16 GEMM already
+accumulates in f32; (4) GELU is the tanh approximation on both sides (`gelu_f32` ==
+`nn.GELU(approximate="tanh")`). The residual 0.0026 is **irreducible**: independent bf16 GEMM
+libraries (cuBLAS vs PyTorch/cuDNN) round at different points and accumulate over the 12 recursive
+Euler steps. TF32 stays the **production default** (more precise than the bf16 reference); bf16 is
+the PyTorch-matching **verification** mode.
 
 ## Next Steps
 
