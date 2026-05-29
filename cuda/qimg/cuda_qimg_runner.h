@@ -128,6 +128,15 @@ static const char *qimg_kernel_src =
 "    dst[i] = d_fp8_to_f16_lut[src[i]];\n"
 "}\n"
 "\n"
+/* Bulk dequant kernel: convert [n] FP8 bytes → [n] BF16 values using LUT.
+ * Byte-identical to the CPU qimg_st_upload_bf16 path (same d_fp8_to_bf16_lut). */
+"__global__ void dequant_fp8_to_bf16(const unsigned char *__restrict__ src,\n"
+"    unsigned short *__restrict__ dst, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    dst[i] = d_fp8_to_bf16_lut[src[i]];\n"
+"}\n"
+"\n"
 
 /* Per-head RMSNorm: x[N, dim], w[head_dim], n_heads, head_dim */
 "__global__ void rmsnorm_per_head_f32(float *__restrict__ x,\n"
@@ -445,6 +454,9 @@ static const char *qimg_kernel_src =
  * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
 "__device__ __constant__ float d_fp8_to_f32_lut[256];\n"
 "\n"
+/* NVFP4 E2M1 code -> value LUT (16 entries), for the W4A16 mod GEMV. */
+"__device__ __constant__ float d_e2m1_lut[16];\n"
+"\n"
 "/* FP8 LUT GEMM: dequant weights via constant memory LUT, F32 inputs+accum.\n"
 " * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */\n"
 "__global__ void gemm_fp8w_f32(float *Y, const unsigned char *W, const float *X,\n"
@@ -486,6 +498,59 @@ static const char *qimg_kernel_src =
 "        if (out_base+32+tx < n_out) Y[row*n_out+out_base+32+tx] = acc2 + (bias?bias[out_base+32+tx]:0.f);\n"
 "        if (out_base+48+tx < n_out) Y[row*n_out+out_base+48+tx] = acc3 + (bias?bias[out_base+48+tx]:0.f);\n"
 "    }\n"
+"}\n"
+"\n"
+
+/* gemv_fp8w_f32: dedicated n_tok==1 matvec, Y[n_out] = W[n_out,n_in] @ X[n_in] + bias.
+ * One warp per output row; X cached in dynamic shared (reused by all rows in the
+ * block); fp8 weight reads coalesced across the warp; warp-shuffle reduction.
+ * Memory-bound (~8x the 16x16 tiled kernel, which wastes 15/16 rows for n_tok=1).
+ * Grid: (ceil(n_out/8),1,1) Block: 256 (=8 warps=8 rows). Shared: n_in*4 bytes. */
+"__global__ void gemv_fp8w_f32(float *Y, const unsigned char *W, const float *X,\n"
+"    const float *bias, int n_out, int n_in, int n_tok) {\n"
+"    extern __shared__ float gx_smx[];\n"
+"    int tid = threadIdx.x;\n"
+"    for (int i = tid; i < n_in; i += blockDim.x) gx_smx[i] = X[i];\n"
+"    __syncthreads();\n"
+"    int warp = tid >> 5, lane = tid & 31;\n"
+"    int row = blockIdx.x * (blockDim.x >> 5) + warp;\n"
+"    if (row >= n_out) return;\n"
+"    const unsigned char *w = W + (size_t)row * n_in;\n"
+"    float acc = 0.f;\n"
+"    for (int k = lane; k < n_in; k += 32) acc += d_fp8_to_f32_lut[w[k]] * gx_smx[k];\n"
+"    #pragma unroll\n"
+"    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);\n"
+"    if (lane == 0) Y[row] = acc + (bias ? bias[row] : 0.f);\n"
+"}\n"
+"\n"
+
+/* gemv_fp4w_f32: NVFP4 weight-only (W4A16) n_tok==1 matvec for the adaLN mod
+ * projection. Y[o] = (sum_k E2M1[code(o,k)] * e4m3(WS[o,k/16]) * X[k]) * WCWT[o] + bias[o].
+ * QW: uint32 [n_out, n_in/8] (8 e2m1 codes/uint, low nibble=low k). WS: uint8
+ * [n_out, n_in/16] e4m3 group scales. WCWT: f32 [n_out] per-row scale. One warp
+ * per row; X cached in shared; warp-shuffle reduce. Grid (ceil(n_out/8),1,1),
+ * Block 256 (=8 rows). Shared n_in*4 bytes. Mirrors gemv_fp8w_f32. */
+"__global__ void gemv_fp4w_f32(float *Y, const unsigned int *QW,\n"
+"    const unsigned char *WS, const float *WCWT, const float *X,\n"
+"    const float *bias, int n_out, int n_in) {\n"
+"    extern __shared__ float gx4_smx[];\n"
+"    int tid = threadIdx.x;\n"
+"    for (int i = tid; i < n_in; i += blockDim.x) gx4_smx[i] = X[i];\n"
+"    __syncthreads();\n"
+"    int warp = tid >> 5, lane = tid & 31;\n"
+"    int row = blockIdx.x * (blockDim.x >> 5) + warp;\n"
+"    if (row >= n_out) return;\n"
+"    const unsigned int  *qw = QW + (size_t)row * (n_in >> 3);\n"
+"    const unsigned char *ws = WS + (size_t)row * (n_in >> 4);\n"
+"    float acc = 0.f;\n"
+"    for (int k = lane; k < n_in; k += 32) {\n"
+"        unsigned int packed = qw[k >> 3];\n"
+"        int code = (packed >> ((k & 7) * 4)) & 0xF;\n"
+"        acc += d_e2m1_lut[code] * d_fp8_to_f32_lut[ws[k >> 4]] * gx4_smx[k];\n"
+"    }\n"
+"    #pragma unroll\n"
+"    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);\n"
+"    if (lane == 0) Y[row] = acc * WCWT[row] + (bias ? bias[row] : 0.f);\n"
 "}\n"
 "\n"
 
@@ -1201,6 +1266,23 @@ typedef struct {
     CUdeviceptr txt_mlp_fc1_w, txt_mlp_fc1_b, txt_mlp_fc2_w, txt_mlp_fc2_b;
 } qimg_block_gpu;
 
+/* ---- Stage 2: native W4A4 OMMA FP4 weights (resident, per block) ----
+ * Each quantized linear: qweight u32[out,in/8] (8 e2m1 codes/uint), wscales
+ * u8[out,in/16] (e4m3 group scales), wcwt f32[out] (wcscales*wtscale),
+ * proj_down/proj_up fp8 e4m3 (low-rank, used via op_gemm). Bias reuses the
+ * dense block's *_b fields. */
+typedef struct { CUdeviceptr qw, ws, wcwt, pd, pu; } qimg_fp4_lin;
+enum { FP4_TO_Q=0, FP4_TO_K, FP4_TO_V, FP4_TO_OUT,
+       FP4_ADD_Q, FP4_ADD_K, FP4_ADD_V, FP4_ADD_OUT,
+       FP4_IMG_FC1, FP4_IMG_FC2, FP4_TXT_FC1, FP4_TXT_FC2, FP4_NLIN };
+typedef struct {
+    qimg_fp4_lin lin[FP4_NLIN];
+    /* use_mod_fp4: NVFP4 (W4A16) adaLN mod, resident so all 60 blocks fit (no
+     * streaming). qw/ws/wcwt are the mod matrix [6*dim, dim]; pd/pu unused. */
+    qimg_fp4_lin img_mod, txt_mod;
+    CUdeviceptr img_mod_b, txt_mod_b;   /* f32 [6*dim] biases (resident) */
+} qimg_fp4_block;
+
 typedef enum {
     QIMG_CFG_BUF_IMG_C = 0,
     QIMG_CFG_BUF_IMG_U,
@@ -1253,6 +1335,8 @@ struct cuda_qimg_runner {
     CUfunction gemm_fp8_f32;     /* native FP8 GEMM (sm_89+) */
     CUfunction gemm_f32_f32;     /* pure F32 GEMM (highest precision) */
     CUfunction gemm_fp8w_f32;   /* FP8 weight (LUT dequant) × F32 input */
+    CUfunction gemv_fp8w_f32;   /* FP8 weight matvec (n_tok==1 fast path, e.g. adaLN mod) */
+    CUfunction gemv_fp4w_f32;   /* NVFP4 W4A16 mod matvec (use_mod_fp4) */
     CUfunction gemm_opt_f16;    /* optimized 128×128 tiled F16 GEMM */
     CUfunction gemm_opt_fp8;    /* optimized 128×128 tiled FP8 LUT GEMM */
     CUfunction gemm_fp8_mma;    /* mma.sync m16n8k32 FP8 tensor-core GEMM (sm_89+) */
@@ -1273,6 +1357,7 @@ struct cuda_qimg_runner {
     CUfunction rmsnorm_per_head;
     CUfunction adaln_modulate;
     CUfunction dequant_fp8_to_f16;  /* GPU-side FP8→F16 via LUT */
+    CUfunction dequant_fp8_to_bf16; /* GPU-side FP8→BF16 via LUT (load-time pd/pu cast) */
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
     int use_fp8_mma;   /* 1 to use mma.sync FP8 tensor-core GEMM (env QIMG_FP8_MMA=1) */
     int use_fp8_mma_bf16; /* 1 to prefer BF16-X variant (env QIMG_FP8_MMA_BF16=0 opts out) */
@@ -1290,6 +1375,21 @@ struct cuda_qimg_runner {
     CUfunction reduce_max_abs_per_row;
     CUdeviceptr d_row_max_buf;     /* [max_n_tok] f32, lazily allocated */
     size_t      row_max_buf_n;
+    /* INT8 W8A8 dynamic path (auto-enabled when DiT weights load as I8).
+     * Bit-exact int8xint8->int32 GEMM for reproducible CUDA<->HIP verify. */
+    int use_int8;
+    int use_int8_smooth;   /* SmoothQuant variant: fat buffer has a [n_in] smooth scale */
+    CUfunction quant_act_perrow_int8;   /* X f32 -> Xq int8 + xscale[n_tok] */
+    CUfunction gemm_w8a8_perrow;        /* int8 GEMM, naive (any shape) */
+    CUfunction gemm_int8_s32;           /* OUR pure int8 mma GEMM -> int32 (no cuBLAS) */
+    CUfunction dequant_int32_to_bf16;   /* int32 GEMM out -> bf16 (xscale*wscale+bias) */
+    int use_cublas_int8;                /* cuBLAS int8 GemmEx available (verify oracle) */
+    CUdeviceptr d_yi32_int8;            /* int32 GEMM output scratch */
+    size_t yi32_int8_n;
+    CUdeviceptr d_xq_int8;              /* [max_n_tok * max_n_in] int8, lazily grown */
+    size_t      xq_int8_n;
+    CUdeviceptr d_x_iscale;             /* [max_n_tok] f32 per-token act scale */
+    size_t      x_iscale_n;
     /* cuBLAS-LT FP8 path (env QIMG_CUBLASLT_FP8=1, default 1 if loaded). */
     int use_cublaslt_fp8;
     struct cublasew_context *cublaslt_ctx;
@@ -1349,6 +1449,10 @@ struct cuda_qimg_runner {
     /* DiT config */
     int dit_dim, dit_n_heads, dit_head_dim, dit_n_blocks;
     int dit_in_ch, dit_txt_dim, dit_mlp_h;
+    /* Target image pixels (H*W) for the upcoming generate, set by the caller
+     * BEFORE load so the W4A4 preload reservation can be sized to the actual
+     * resolution (more blocks resident at <=512^2). 0 = unknown -> conservative. */
+    size_t dit_target_pixels;
 
     /* Safetensors context (mmap'd) */
     void *dit_st;
@@ -1393,6 +1497,29 @@ struct cuda_qimg_runner {
     CUevent     block_barrier_unc;   /* uncond-done barrier */
     CUevent     mod_ready;           /* modulation computed (both streams wait on this) */
 
+    /* CUDA graph capture of the per-step DiT block loop (opt-in QIMG_CUDA_GRAPH=1).
+     * After warmup the block loop is a fixed kernel sequence: all scratch allocs
+     * are stable, streamed weights come from fixed pinned sources into the fixed
+     * single scratch slot, and the bf16 low-rank cuBLAS calls reuse a cached
+     * plan + preallocated workspace. We capture that sequence once and replay it
+     * each denoise step, dropping ~7800 kernel launches/step. Requires the
+     * default single-stream single-slot config (no QIMG_PIPELINE / QIMG_CFG_STREAMS).
+     *
+     * MEASURED (2026-05-27, RTX 5060 Ti): byte-identical output but NO speedup
+     * (256^2 1.14->1.14, 512^2 1.80->1.80 s/step). Launch overhead is NOT the
+     * bottleneck here — the step is bound by GPU compute + serialized H2D
+     * weight streaming (which the graph reproduces, still serialized by the
+     * single-slot dependency); the CPU stays ahead of the GPU because the FP4
+     * kernels are large. Kept as correct, default-OFF scaffolding: it would only
+     * pay off if combined with H2D/compute overlap (double-buffer pipeline) or if
+     * future fusion shrinks the kernels enough to expose launch latency. */
+    int         qg_enabled;     /* QIMG_CUDA_GRAPH requested */
+    int         qg_warm;        /* warmup steps completed (capture once >= 2) */
+    int         qg_ready;       /* qg_exec valid for the captured shape */
+    CUgraph     qg_graph;
+    CUgraphExec qg_exec;
+    int         qg_n_img, qg_n_txt_c, qg_n_txt_u;  /* shape graph was captured for */
+
     /* Main CFG DiT activation slots. These buffers are reused across denoise
      * steps and grown on demand for larger resolutions/text lengths. */
     cu_buf_slot cfg_slots[QIMG_CFG_BUF_COUNT];
@@ -1417,6 +1544,28 @@ struct cuda_qimg_runner {
     double prof_attnout_ms;   /* attn out proj + gated_add */
     double prof_imgmlp_ms;    /* adaLN2 img + img MLP fc1+gelu+fc2 + gated_add */
     double prof_txtmlp_ms;    /* adaLN2 txt + txt MLP fc1+gelu+fc2 + gated_add */
+
+    /* ---- Stage 2: native W4A4 OMMA FP4 path (guarded by use_w4a4) ---- */
+    int use_w4a4;                 /* 1 when DiT checkpoint is the OMMA FP4 layout */
+    int use_mod_fp4;              /* 1 when adaLN mod is NVFP4 (W4A16) resident, not FP8 stream */
+    CUmodule fp4_module;          /* separate sm_120a module (block-scale mma) */
+    CUfunction k_fp4_quant;       /* fp4_quant_act */
+    CUfunction k_w4a4_gemm;       /* w4a4_gemm (naive block-scale mma; fallback) */
+    CUfunction k_w4a4_gemm_opt;   /* w4a4_gemm_opt (shared-mem tiled + cp.async double-buffer) */
+    CUfunction k_w4a4_combine;    /* w4a4_combine: Y=D*wcwt+lora+bias */
+    qimg_fp4_block *fp4_blocks;   /* [dit_n_blocks] resident FP4 weights */
+    CUdeviceptr d_fp4_ac, d_fp4_as, d_fp4_d, d_fp4_la, d_fp4_lo;  /* op_gemm_fp4 scratch */
+    size_t fp4_ac_n, fp4_as_n, fp4_d_n, fp4_la_n, fp4_lo_n;
+    int lowrank_bf16;            /* FP4 low-rank: 1 = bf16 cuBLAS GEMM (pd/pu bf16), 0 = fp8 op_gemm */
+    CUdeviceptr d_x_bf16, d_la_bf16;  /* bf16-low-rank scratch: X cast, la cast */
+    size_t x_bf16_n, la_bf16_n;
+    /* Load-time GPU-side FP8→BF16 cast for pd/pu (QIMG_LOAD_GPU_CAST, default on):
+     * raw fp8 H2D from the pinned mmap into a reused temp, then dequant_fp8_to_bf16
+     * writes the final bf16 buffer. Eliminates the single-threaded CPU conversion +
+     * pageable H2D. d_fp8_cast_tmp is freed at the end of qimg_load_fp4_weights. */
+    int load_gpu_cast;
+    CUdeviceptr d_fp8_cast_tmp;
+    size_t fp8_cast_tmp_n;
     int prof_block_count;
 };
 
@@ -1515,6 +1664,48 @@ static void qimg_init_fp8_to_f32_lut(void) {
     qimg_cuda_fp8_to_f32_lut_init = 1;
 }
 
+/* Upload safetensor as BF16 (for the FP4 low-rank pd/pu: dequant fp8->bf16 at load
+ * so la/lo run as plain bf16 cuBLAS GEMMs with no per-call fp8 quant/dequant). */
+static inline uint16_t qimg_f32_to_bf16_rne(float f) {
+    uint32_t bits; memcpy(&bits, &f, 4);
+    uint32_t r = bits + 0x7FFFu + ((bits >> 16) & 1u);   /* round to nearest even */
+    return (uint16_t)(r >> 16);
+}
+static CUdeviceptr qimg_st_upload_bf16(st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return 0;
+    const uint64_t *shape = safetensors_shape(st, idx);
+    int ndims = safetensors_ndims(st, idx);
+    size_t n = 1;
+    for (int d = 0; d < ndims; d++) n *= shape[d];
+    const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
+    const char *dtype = safetensors_dtype(st, idx);
+    uint16_t *bf = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!bf) return 0;
+    if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0) {
+        qimg_init_fp8_to_f32_lut();
+        for (size_t i = 0; i < n; i++) bf[i] = qimg_f32_to_bf16_rne(qimg_cuda_fp8_to_f32_lut[src[i]]);
+    } else if (strcmp(dtype, "BF16") == 0) {
+        memcpy(bf, src, n * 2);
+    } else if (strcmp(dtype, "F32") == 0) {
+        const float *f32 = (const float *)src;
+        for (size_t i = 0; i < n; i++) bf[i] = qimg_f32_to_bf16_rne(f32[i]);
+    } else {
+        fprintf(stderr, "qimg: unsupported dtype '%s' for bf16 upload %s\n", dtype, name);
+        free(bf); return 0;
+    }
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, n * sizeof(uint16_t));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg: BF16 upload cuMemAlloc(%.1f MB) FAILED (err=%d) for %s\n",
+                (float)(n * 2) / (1 << 20), (int)err, name);
+        free(bf); return 0;
+    }
+    cuMemcpyHtoD(d, bf, n * sizeof(uint16_t));
+    free(bf);
+    return d;
+}
+
 /* Checked cuMemAlloc — returns 0 on failure */
 static CUdeviceptr checked_cuMemAlloc(size_t nbytes) {
     CUdeviceptr d = 0;
@@ -1588,6 +1779,49 @@ static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     return d;
 }
 
+/* Grow the reused FP8→BF16 cast temp device buffer to hold >= nbytes. */
+static int qimg_ensure_fp8_cast_tmp(cuda_qimg_runner *r, size_t nbytes) {
+    if (r->d_fp8_cast_tmp && r->fp8_cast_tmp_n >= nbytes) return 0;
+    if (r->d_fp8_cast_tmp) { cuMemFree(r->d_fp8_cast_tmp); r->d_fp8_cast_tmp = 0; r->fp8_cast_tmp_n = 0; }
+    CUdeviceptr d = checked_cuMemAlloc(nbytes);
+    if (!d) return -1;
+    r->d_fp8_cast_tmp = d; r->fp8_cast_tmp_n = nbytes;
+    return 0;
+}
+
+/* GPU-side FP8→BF16 upload for the FP4 low-rank pd/pu (QIMG_LOAD_GPU_CAST path):
+ * raw fp8 H2D from the pinned mmap into a reused temp, then dequant_fp8_to_bf16
+ * writes the final bf16 device buffer. Byte-identical to qimg_st_upload_bf16 for
+ * FP8 source — same d_fp8_to_bf16_lut, and E4M3 NaN→0.0 so the NaN-only rounding
+ * difference never triggers. Non-FP8 dtypes fall back to the CPU path. All ops on
+ * r->stream; the shared temp is stream-ordered (kernel N reads before H2D N+1). */
+static CUdeviceptr qimg_st_upload_bf16_gpucast(cuda_qimg_runner *r,
+                                               st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return 0;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (strcmp(dtype, "F8_E4M3") != 0 && strcmp(dtype, "F8_E4M3FN") != 0)
+        return qimg_st_upload_bf16(st, name);   /* only FP8 source benefits */
+    size_t n = safetensors_nbytes(st, idx);     /* fp8: 1 byte/elem => n elements */
+    if (qimg_ensure_fp8_cast_tmp(r, n) != 0)
+        return qimg_st_upload_bf16(st, name);   /* temp OOM -> CPU fallback */
+    cuMemcpyHtoDAsync(r->d_fp8_cast_tmp, safetensors_data(st, idx), n, r->stream);
+    CUdeviceptr dst = checked_cuMemAlloc(n * sizeof(uint16_t));
+    if (!dst) return 0;
+    int ni = (int)n;
+    void *args[] = { &r->d_fp8_cast_tmp, &dst, &ni };
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    CUresult rc = cuLaunchKernel(r->dequant_fp8_to_bf16, blocks, 1, 1, 256, 1, 1,
+                                 0, r->stream, args, NULL);
+    if (rc != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg: dequant_fp8_to_bf16 launch failed (%d) for %s\n",
+                (int)rc, name);
+        cuMemFree(dst);
+        return qimg_st_upload_bf16(st, name);
+    }
+    return dst;
+}
+
 /* Async HtoD on r->stream — queues after pending compute kernels, stream
  * ordering serializes scratch-slot writes with prior compute so no explicit
  * cuStreamSynchronize is needed between block loads. */
@@ -1616,6 +1850,77 @@ static int qimg_st_upload_fp8_raw_async_r(struct cuda_qimg_runner *r,
     size_t nbytes = safetensors_nbytes(st, idx);
     if (nbytes != dst_nbytes) return -1;
     cuMemcpyHtoDAsync(dst, qimg_tensor_host_src(r, st, idx), nbytes, s);
+    return 0;
+}
+
+/* ---- INT8 fat-buffer weight upload ----
+ * Builds [scale: n_out f32][int8 weights: n_out*n_in] in one device buffer from
+ * the "<w>.weight" (I8) + "<w>.weight_scale" (F32) safetensors pair, so the
+ * op_gemm int8 path can read wscale=W, Wq=W+sbytes. */
+static int qimg_int8_scale_name(const char *wname, char *out, size_t outsz) {
+    size_t L = strlen(wname);
+    if (L < 7 || strcmp(wname + L - 7, ".weight") != 0) return -1;
+    snprintf(out, outsz, "%.*s.weight_scale", (int)(L - 7), wname);
+    return 0;
+}
+
+/* SmoothQuant per-input-channel scale companion name (<base>.smooth_scale). */
+static int qimg_int8_smooth_name(const char *wname, char *out, size_t outsz) {
+    size_t L = strlen(wname);
+    if (L < 7 || strcmp(wname + L - 7, ".weight") != 0) return -1;
+    snprintf(out, outsz, "%.*s.smooth_scale", (int)(L - 7), wname);
+    return 0;
+}
+
+/* Resident (synchronous) fat upload. Returns device ptr or 0.
+ * Layout: [wscale n_out f32] [smooth n_in f32 (if with_smooth)] [wq n_out*n_in i8]. */
+static CUdeviceptr qimg_st_upload_int8_fat(st_context *st, const char *wname, int with_smooth) {
+    int widx = safetensors_find(st, wname);
+    if (widx < 0) return 0;
+    char sname[256], mname[256];
+    if (qimg_int8_scale_name(wname, sname, sizeof(sname)) != 0) return 0;
+    int sidx = safetensors_find(st, sname);
+    if (sidx < 0) return 0;
+    size_t wbytes = safetensors_nbytes(st, widx);
+    size_t sbytes = safetensors_nbytes(st, sidx);
+    int midx = -1; size_t mbytes = 0;
+    if (with_smooth) {
+        if (qimg_int8_smooth_name(wname, mname, sizeof(mname)) != 0) return 0;
+        midx = safetensors_find(st, mname);
+        if (midx < 0) return 0;
+        mbytes = safetensors_nbytes(st, midx);
+    }
+    CUdeviceptr d = checked_cuMemAlloc(sbytes + mbytes + wbytes);
+    if (!d) return 0;
+    cuMemcpyHtoD(d, safetensors_data(st, sidx), sbytes);
+    if (with_smooth) cuMemcpyHtoD(d + sbytes, safetensors_data(st, midx), mbytes);
+    cuMemcpyHtoD(d + sbytes + mbytes, safetensors_data(st, widx), wbytes);
+    return d;
+}
+
+/* Streaming (async) fat upload into a pre-sized fat slot.
+ * Layout matches qimg_st_upload_int8_fat (with_smooth from r->use_int8_smooth). */
+static int qimg_upload_int8_fat_async_r(struct cuda_qimg_runner *r, st_context *st,
+                                        const char *wname, CUdeviceptr dst, CUstream s) {
+    int widx = safetensors_find(st, wname);
+    if (widx < 0) return -1;
+    char sname[256], mname[256];
+    if (qimg_int8_scale_name(wname, sname, sizeof(sname)) != 0) return -1;
+    int sidx = safetensors_find(st, sname);
+    if (sidx < 0) return -1;
+    size_t wbytes = safetensors_nbytes(st, widx);
+    size_t sbytes = safetensors_nbytes(st, sidx);
+    size_t mbytes = 0; int midx = -1;
+    if (r->use_int8_smooth) {
+        if (qimg_int8_smooth_name(wname, mname, sizeof(mname)) != 0) return -1;
+        midx = safetensors_find(st, mname);
+        if (midx < 0) return -1;
+        mbytes = safetensors_nbytes(st, midx);
+    }
+    cuMemcpyHtoDAsync(dst, qimg_tensor_host_src(r, st, sidx), sbytes, s);
+    if (r->use_int8_smooth)
+        cuMemcpyHtoDAsync(dst + sbytes, qimg_tensor_host_src(r, st, midx), mbytes, s);
+    cuMemcpyHtoDAsync(dst + sbytes + mbytes, qimg_tensor_host_src(r, st, widx), wbytes, s);
     return 0;
 }
 
@@ -1693,8 +1998,12 @@ static int qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b
 
     /* Upload weight: FP8 raw for native GEMM, F16 for MMA, or F32 fallback */
     #define BLK_W(field, suffix) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident, not here */ \
+        if (r->use_mod_fp4 && strstr(suffix, "mod")) break; /* mod-FP4: mod resident in fp4_blocks */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        if (r->use_fp8_gemm) { \
+        if (r->use_int8) { \
+            b->field = qimg_st_upload_int8_fat(st, name, r->use_int8_smooth); \
+        } else if (r->use_fp8_gemm) { \
             b->field = qimg_st_upload_fp8_raw(st, name); \
         } else if (r->use_f16_gemm) { \
             b->field = qimg_st_upload_f16(st, name); \
@@ -1750,6 +2059,22 @@ static void qimg_free_block(qimg_block_gpu *b) {
     }
 }
 
+/* Double-buffered weight streaming overlaps each streamed block's H2D copy with
+ * the previous block's compute (second scratch slot + copy_stream). It is
+ * byte-identical to the single-slot synchronous path.
+ *   - W4A4: ON by default — the streamed slot is mod-only (~113 MB) and the FP4
+ *     step is so fast that the serialized H2D is a large fraction; big win
+ *     (512^2 1.48 -> 1.12, 256^2 0.84 -> 0.50 s/step). QIMG_PIPELINE=0 opts out.
+ *   - FP8/int8: OFF by default — the streamed slot is a full block (~324 MB) so
+ *     the 2nd slot eats preload headroom, and the benefit is marginal (compute
+ *     is cheap, H2D dominates regardless). Opt IN with QIMG_PIPELINE=1.
+ * Any explicit QIMG_PIPELINE value overrides the per-path default. */
+static int qimg_want_pipeline(const cuda_qimg_runner *r) {
+    const char *e = getenv("QIMG_PIPELINE");
+    if (e) return e[0] != '0';
+    return r->use_w4a4;
+}
+
 /* Allocate the per-runner scratch block slot once. Reserves one block's
  * worth of device memory so on-demand loads can just H2D-copy into the
  * existing buffers instead of cuMemAlloc/cuMemFree per block. Assumes
@@ -1764,10 +2089,16 @@ static int qimg_alloc_scratch_block(cuda_qimg_runner *r) {
     memset(b, 0, sizeof(*b));
     int ok = 1;
 #define ALLOC_FROM_ST(field, suffix) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
         int _ti = safetensors_find(st, name); \
         if (_ti < 0) { ok = 0; break; } \
         size_t _nb = safetensors_nbytes(st, _ti); \
+        if (r->use_int8) { \
+            const uint64_t *_sh = safetensors_shape(st, _ti); \
+            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-out-channel scale */ \
+            if (r->use_int8_smooth) _nb += (size_t)_sh[1] * sizeof(float); /* + per-in smooth */ \
+        } \
         if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
     } } while(0)
 #define ALLOC_F32(field, suffix) do { if (ok) { \
@@ -1836,10 +2167,16 @@ static int qimg_alloc_scratch_block_b(cuda_qimg_runner *r) {
     memset(b, 0, sizeof(*b));
     int ok = 1;
 #define ALLOC_FROM_ST(field, suffix) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
         int _ti = safetensors_find(st, name); \
         if (_ti < 0) { ok = 0; break; } \
         size_t _nb = safetensors_nbytes(st, _ti); \
+        if (r->use_int8) { \
+            const uint64_t *_sh = safetensors_shape(st, _ti); \
+            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-out-channel scale */ \
+            if (r->use_int8_smooth) _nb += (size_t)_sh[1] * sizeof(float); /* + per-in smooth */ \
+        } \
         if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
     } } while(0)
 #define ALLOC_F32(field, suffix) do { if (ok) { \
@@ -1921,8 +2258,12 @@ static int qimg_load_block_into_slot_ex(cuda_qimg_runner *r, int block_idx,
     char name[256];
     int ok = 1;
 #define UPLOAD_FP8(field, suffix, _bytes) do { if (ok) { \
+        if (r->use_w4a4 && !strstr(suffix, "mod")) break; /* W4A4: weights resident */ \
+        if (r->use_mod_fp4 && strstr(suffix, "mod")) break; /* mod-FP4: mod resident in fp4_blocks */ \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        if (qimg_st_upload_fp8_raw_async_r(r, st, name, b->field, _bytes, s) != 0) ok = 0; \
+        if (r->use_int8) { \
+            if (qimg_upload_int8_fat_async_r(r, st, name, b->field, s) != 0) ok = 0; \
+        } else if (qimg_st_upload_fp8_raw_async_r(r, st, name, b->field, _bytes, s) != 0) ok = 0; \
     } } while(0)
 #define UPLOAD_F32(field, suffix, _nelem) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
@@ -2013,6 +2354,12 @@ static int qimg_stage_block_pinned(cuda_qimg_runner *r, int block_idx) {
     int idxs[64]; size_t sizes[64], offs[64];
     int n = 0;
     for (int i = 0; suffixes[i]; i++) {
+        /* W4A4: the attn/mlp weight matrices live resident in fp4_blocks[]; the
+         * slot path streams only the mod matrices (+ F32 norms/biases). Staging
+         * the resident weights wasted ~3x the pinned RAM and memcpy (and they are
+         * never uploaded), so skip them. Mirrors the UPLOAD_FP8 W4A4 guard. */
+        if (r->use_w4a4 && strstr(suffixes[i], ".weight")
+            && !strstr(suffixes[i], "mod") && !strstr(suffixes[i], "norm")) continue;
         snprintf(name, sizeof(name), "transformer_blocks.%d.%s", block_idx, suffixes[i]);
         int idx = safetensors_find(st, name);
         if (idx < 0) continue;
@@ -2052,6 +2399,115 @@ static void op_bf16_trunc(cuda_qimg_runner *r, CUdeviceptr x, int n);  /* forwar
 static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
+
+    /* INT8 W8A8 dynamic path — highest priority when enabled. Quantizes X
+     * per-token-row to int8, does int8xint8->int32 GEMM (bit-exact across HW),
+     * dequants with xscale[t]*wscale[o], adds bias. The weight pointer W is a
+     * fat buffer: [wscale: n_out f32][smooth: n_in f32 (SmoothQuant only)][wq: n_out*n_in int8]. */
+    if (r->use_int8 && r->gemm_w8a8_perrow && r->quant_act_perrow_int8) {
+        CUdeviceptr wscale = W;
+        /* SmoothQuant: per-input-channel scale s lives between wscale and wq;
+         * the activation is divided by s in the quant (W was pre-multiplied by s
+         * offline, so the GEMM math is unchanged but quantizes far more cleanly). */
+        CUdeviceptr smooth = r->use_int8_smooth ? (W + (size_t)n_out * sizeof(float)) : 0;
+        size_t woff = (size_t)n_out * sizeof(float)
+                    + (r->use_int8_smooth ? (size_t)n_in * sizeof(float) : 0);
+        CUdeviceptr Wq = W + woff;
+
+        /* Conforming-shape int8 GEMM: quant X -> int8, int32 GEMM, dequant to bf16.
+         * The GEMM is OUR OWN gemm_int8_s32 mma kernel by default (no cuBLAS, so the
+         * HIP port can mirror it exactly). Our kernel and cuBLAS GemmEx both compute
+         * the EXACT int32 dot product (order-independent), so their int32 outputs are
+         * bit-identical; the shared per-token quant + per-(row x channel) dequant make
+         * the final bf16 identical regardless of which GEMM ran. QIMG_INT8_CUBLAS=1
+         * swaps in cuBLAS (A/B + perf oracle). Verified bit-for-bit by
+         * test_cuda_qimg --test-int8-gemm. */
+        if ((r->gemm_int8_s32 || r->use_cublas_int8) && r->quant_act_perrow_int8 &&
+            r->dequant_int32_to_bf16 &&
+            n_tok >= 16 && (n_out % 256) == 0 && (n_in % 32) == 0 && !r->use_old_gemm) {
+            size_t need_q = (size_t)n_tok * n_in;
+            size_t need_s = (size_t)n_tok * sizeof(float);
+            size_t need_y = (size_t)n_tok * n_out * sizeof(int);
+            int ok = 1;
+            if (need_q > r->xq_int8_n) {
+                if (r->d_xq_int8) cuMemFree(r->d_xq_int8);
+                r->d_xq_int8 = 0;
+                if (cuMemAlloc(&r->d_xq_int8, need_q) == CUDA_SUCCESS) r->xq_int8_n = need_q;
+                else { r->xq_int8_n = 0; ok = 0; }
+            }
+            if (ok && need_s > r->x_iscale_n) {
+                if (r->d_x_iscale) cuMemFree(r->d_x_iscale);
+                r->d_x_iscale = 0;
+                if (cuMemAlloc(&r->d_x_iscale, need_s) == CUDA_SUCCESS) r->x_iscale_n = need_s;
+                else { r->x_iscale_n = 0; ok = 0; }
+            }
+            if (ok && need_y > r->yi32_int8_n) {
+                if (r->d_yi32_int8) cuMemFree(r->d_yi32_int8);
+                r->d_yi32_int8 = 0;
+                if (cuMemAlloc(&r->d_yi32_int8, need_y) == CUDA_SUCCESS) r->yi32_int8_n = need_y;
+                else { r->yi32_int8_n = 0; ok = 0; }
+            }
+            if (ok) {
+                void *qa[] = {&X, &smooth, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+                cuLaunchKernel(r->quant_act_perrow_int8, (unsigned)n_tok, 1, 1,
+                               256, 1, 1, 0, r->stream, qa, NULL);
+                int gemm_ran = 0;
+                int want_cublas = r->use_cublas_int8 && r->cublaslt_ctx &&
+                                  getenv("QIMG_INT8_CUBLAS") &&
+                                  (n_out % 4) == 0 && (n_in % 4) == 0 && (n_tok % 4) == 0;
+                if (want_cublas) {
+                    if (cublasew_gemm_int8_s32_rowmajor_nt(r->cublaslt_ctx, r->d_yi32_int8,
+                            Wq, r->d_xq_int8, n_tok, n_out, n_in) == 0) gemm_ran = 1;
+                    /* cuBLAS rejected -> fall back to our kernel below. */
+                }
+                if (!gemm_ran && r->gemm_int8_s32) {
+                    void *ga[] = {&r->d_yi32_int8, &Wq, &r->d_xq_int8, &n_out, &n_in, &n_tok};
+                    unsigned gx = (unsigned)((n_out + 255) / 256); gx = (gx + 3u) & ~3u;
+                    unsigned gy = (unsigned)((n_tok +  31) /  32); gy = (gy + 3u) & ~3u;
+                    size_t smem = 1024 + 8192 * 2;
+                    cuLaunchKernel(r->gemm_int8_s32, gx, gy, 1, 128, 1, 1,
+                                   smem, r->stream, ga, NULL);
+                    gemm_ran = 1;
+                }
+                if (gemm_ran) {
+                    void *da[] = {&Y, &r->d_yi32_int8, &r->d_x_iscale, &wscale,
+                                  &bias, &n_out, &n_tok};
+                    unsigned dgx = (unsigned)((n_out + 255) / 256);
+                    cuLaunchKernel(r->dequant_int32_to_bf16, dgx, (unsigned)n_tok, 1,
+                                   256, 1, 1, 0, r->stream, da, NULL);
+                    return;
+                }
+            }
+        }
+
+        size_t need_q = (size_t)n_tok * n_in;
+        if (need_q > r->xq_int8_n) {
+            if (r->d_xq_int8) cuMemFree(r->d_xq_int8);
+            r->d_xq_int8 = 0;
+            if (cuMemAlloc(&r->d_xq_int8, need_q) == CUDA_SUCCESS) r->xq_int8_n = need_q;
+            else r->xq_int8_n = 0;
+        }
+        size_t need_s = (size_t)n_tok * sizeof(float);
+        if (need_s > r->x_iscale_n) {
+            if (r->d_x_iscale) cuMemFree(r->d_x_iscale);
+            r->d_x_iscale = 0;
+            if (cuMemAlloc(&r->d_x_iscale, need_s) == CUDA_SUCCESS) r->x_iscale_n = need_s;
+            else r->x_iscale_n = 0;
+        }
+        if (r->d_xq_int8 && r->d_x_iscale) {
+            void *qa[] = {&X, &smooth, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+            cuLaunchKernel(r->quant_act_perrow_int8, (unsigned)n_tok, 1, 1,
+                           256, 1, 1, 0, r->stream, qa, NULL);
+            void *ga[] = {&Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale, &bias,
+                          &n_out, &n_in, &n_tok};
+            unsigned gx = (unsigned)((n_out + 127) / 128);
+            cuLaunchKernel(r->gemm_w8a8_perrow, gx, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, ga, NULL);
+            op_bf16_trunc(r, Y, n_out * n_tok);
+            return;
+        }
+        /* OOM → fall through (very unlikely) */
+    }
 
     /* cuBLAS-LT FP8 e4m3 path — highest priority. Quantizes X to FP8 with a
      * per-tensor scale = max(|X|)/448, calls cublasLtMatmul (BF16 output),
@@ -2275,6 +2731,20 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         cuLaunchKernel(r->gemm_opt_fp8, gx, gy, 1, 256, 1, 1,
                        0, r->stream, args, NULL);
         return;  /* BF16 truncation fused into kernel */
+    }
+
+    /* n_tok==1 matvec (e.g. adaLN modulation img_mod/txt_mod): the 16×16 tiled
+     * fallback wastes 15/16 of its token-rows on a single token. Use the dedicated
+     * warp-per-output-row matvec (X cached in shared) — memory-bound, ~8× faster.
+     * n_in must fit dynamic shared (48 KB → n_in ≤ 12288; mod n_in=3072). */
+    if (n_tok == 1 && r->use_fp8_gemm && r->gemv_fp8w_f32 && !r->use_old_gemm &&
+        (size_t)n_in * sizeof(float) <= 48u * 1024) {
+        void *gv[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 7) / 8);   /* 8 warps/block = 8 rows/block */
+        cuLaunchKernel(r->gemv_fp8w_f32, gx, 1, 1, 256, 1, 1,
+                       (unsigned)(n_in * sizeof(float)), r->stream, gv, NULL);
+        op_bf16_trunc(r, Y, n_out);
+        return;
     }
 
     /* Fallback: old 16×16 tiled kernels */
@@ -2890,7 +3360,526 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
 }
 
 
+/* ==================== Stage 2: native W4A4 OMMA FP4 ====================
+ * Block-scale mma needs sm_120a, so these compile into a SEPARATE module
+ * (the runner's main module is sm_120). Layout validated in cuda/fp4/. */
+static const char *qimg_fp4_kernel_src =
+"__device__ __forceinline__ unsigned char qf_f32_to_e4m3(float v){\n"
+"  unsigned short p; asm(\"cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;\":\"=h\"(p):\"f\"(v),\"f\"(v)); return p&0xFF; }\n"
+"__device__ __forceinline__ float qf_e4m3_dec(unsigned char b){int e=(b>>3)&0xF,m=b&7;\n"
+"  if(e==0) return (m/8.0f)*0.015625f; return (1.0f+m/8.0f)*exp2f((float)(e-7)); }\n"
+"__device__ __forceinline__ unsigned char qf_near_e2m1(float q){\n"
+"  unsigned char s=q<0?8:0; float a=fabsf(q); unsigned char c;\n"
+"  if(a<0.25f)c=0;else if(a<0.75f)c=1;else if(a<1.25f)c=2;else if(a<1.75f)c=3;\n"
+"  else if(a<2.5f)c=4;else if(a<3.5f)c=5;else if(a<5.0f)c=6;else c=7; return s|c; }\n"
+"extern \"C\" __global__ void fp4_quant_act(const float* X, unsigned int* Ac, unsigned char* As, int M, int K){\n"
+"  int ng=K>>4; long gi=(long)blockIdx.x*blockDim.x+threadIdx.x; if(gi>=(long)M*ng) return;\n"
+"  int m=gi/ng, grp=gi%ng; long k0=(long)grp*16;\n"
+"  float amax=0; for(int i=0;i<16;i++){float v=fabsf(X[(long)m*K+k0+i]); amax=fmaxf(amax,v);}\n"
+"  float sc=amax*0.16666667f; unsigned char sb=qf_f32_to_e4m3(sc); float sd=qf_e4m3_dec(sb);\n"
+"  float inv = sd>0.f? 1.0f/sd : 0.f; As[(long)m*ng+grp]=sb;\n"
+"  for(int u=0;u<2;u++){ unsigned int v=0; for(int i=0;i<8;i++){ long k=k0+u*8+i;\n"
+"      float q=X[(long)m*K+k]*inv; v|=((unsigned)qf_near_e2m1(q))<<(i*4);} Ac[(long)m*(K>>3)+grp*2+u]=v; } }\n"
+"extern \"C\" __global__ void w4a4_gemm(const unsigned int* A, const unsigned int* B,\n"
+"     const unsigned char* sA, const unsigned char* sB, float* D, int M, int N, int K){\n"
+"  int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5; int lane=threadIdx.x&31;\n"
+"  int ntn=N>>3; int tm=warp/ntn, tn=warp%ntn; int M0=tm*16, N0=tn*8; if(M0>=M) return;\n"
+"  int g=lane>>2, t=lane&3; int Ku=K>>3, Kg=K>>4;\n"
+"  long rA0=(long)(M0+g)*Ku, rA1=(long)(M0+g+8)*Ku, cB=(long)(N0+g)*Ku;\n"
+"  int saRow=(t==0)?(M0+g):(t==1)?(M0+g+8):-1; int sbCol=(t==0)?(N0+g):-1;\n"
+"  float d0=0.f,d1=0.f,d2=0.f,d3=0.f; int nkc=K>>6;\n"
+"  for(int kc=0;kc<nkc;kc++){\n"
+"    unsigned int a0=A[rA0+kc*8+t],a1=A[rA1+kc*8+t],a2=A[rA0+kc*8+t+4],a3=A[rA1+kc*8+t+4];\n"
+"    unsigned int b0=B[cB+kc*8+t],b1=B[cB+kc*8+t+4];\n"
+"    unsigned int sfa=0x38383838u,sfb=0x38383838u;\n"
+"    if(saRow>=0){const unsigned char*p=&sA[(long)saRow*Kg+kc*4]; sfa=p[0]|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);}\n"
+"    if(sbCol>=0){const unsigned char*p=&sB[(long)sbCol*Kg+kc*4]; sfb=p[0]|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);}\n"
+"    asm volatile(\"mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 \"\n"
+"      \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0,0}, %11, {0,0};\"\n"
+"      : \"+f\"(d0),\"+f\"(d1),\"+f\"(d2),\"+f\"(d3)\n"
+"      : \"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1),\"r\"(sfa),\"r\"(sfb));\n"
+"  }\n"
+"  D[(long)(M0+g)*N+N0+2*t]=d0; D[(long)(M0+g)*N+N0+2*t+1]=d1;\n"
+"  D[(long)(M0+g+8)*N+N0+2*t]=d2; D[(long)(M0+g+8)*N+N0+2*t+1]=d3; }\n"
+"extern \"C\" __global__ void w4a4_combine(float* Y, const float* D, const float* wcwt,\n"
+"     const float* lo, const float* bias, int n_tok, int n_out){\n"
+"  long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)n_tok*n_out) return;\n"
+"  int o=i%n_out; Y[i]=D[i]*wcwt[o]+lo[i]+(bias?bias[o]:0.f); }\n"
+/* ---- Optimized W4A4 GEMM: BM=64 BN=128 BK=64 tile, 256 threads (8 warps 2x4),
+ * each warp computes 32x32 = 2 m-subtiles x 4 n-subtiles. A/B/scale tiles are
+ * staged in shared memory once per K-tile and reused across the warp's subtiles
+ * (A-frags reused across N, B-frags across M), cutting the redundant global
+ * traffic of the naive 1-warp-per-16x8 kernel by ~8x. Bit-identical to the naive
+ * w4a4_gemm (verified vs the naive oracle for full + partial M/N blocks and vs a
+ * CPU reference in cuda/fp4/fp4_w4a4_opt.c); ~4-6x faster (15 -> 62-72 TOPS).
+ * M/N guarded (any n_tok/n_out); requires K%64==0 (true for all qimg linears). ---- */
+"#define BM 64\n"
+"#define BN 128\n"
+"#define BK 64\n"
+"#define WN_WARPS 4\n"
+"#define MSUB 2\n"
+"#define NSUB 4\n"
+"extern \"C\" __global__ __launch_bounds__(256) void w4a4_gemm_opt(\n"
+"    const unsigned int* __restrict__ A, const unsigned int* __restrict__ B,\n"
+"    const unsigned char* __restrict__ sA, const unsigned char* __restrict__ sB,\n"
+"    float* __restrict__ D, int M, int N, int K){\n"
+"  __shared__ unsigned int  smA[BM][BK/8];\n"
+"  __shared__ unsigned int  smB[BN][BK/8];\n"
+"  __shared__ unsigned char smSA[BM][BK/16];\n"
+"  __shared__ unsigned char smSB[BN][BK/16];\n"
+"  int bm0=blockIdx.y*BM, bn0=blockIdx.x*BN;\n"
+"  int tid=threadIdx.x, warp=tid>>5, lane=tid&31;\n"
+"  int wm=warp/WN_WARPS, wn=warp%WN_WARPS;\n"
+"  int g=lane>>2, t=lane&3;\n"
+"  long Ku=K>>3, Kg=K>>4;\n"
+"  float acc[MSUB][NSUB][4];\n"
+"  #pragma unroll\n"
+"  for(int i=0;i<MSUB;i++)for(int j=0;j<NSUB;j++)for(int e=0;e<4;e++)acc[i][j][e]=0.f;\n"
+"  int nkt=K/BK;\n"
+"  for(int kt=0; kt<nkt; kt++){\n"
+"    long k0u=(long)kt*(BK/8), k0g=(long)kt*(BK/16);\n"
+"    for(int idx=tid; idx<BM*(BK/8); idx+=256){ int r=idx/(BK/8), c=idx%(BK/8);\n"
+"      int gr=bm0+r; smA[r][c]=(gr<M)?A[(long)gr*Ku+k0u+c]:0u; }\n"
+"    for(int idx=tid; idx<BN*(BK/8); idx+=256){ int r=idx/(BK/8), c=idx%(BK/8);\n"
+"      int gr=bn0+r; smB[r][c]=(gr<N)?B[(long)gr*Ku+k0u+c]:0u; }\n"
+"    for(int idx=tid; idx<BM*(BK/16); idx+=256){ int r=idx/(BK/16), c=idx%(BK/16);\n"
+"      int gr=bm0+r; smSA[r][c]=(gr<M)?sA[(long)gr*Kg+k0g+c]:0x38; }\n"
+"    for(int idx=tid; idx<BN*(BK/16); idx+=256){ int r=idx/(BK/16), c=idx%(BK/16);\n"
+"      int gr=bn0+r; smSB[r][c]=(gr<N)?sB[(long)gr*Kg+k0g+c]:0x38; }\n"
+"    __syncthreads();\n"
+"    unsigned int af[MSUB][4], sfa[MSUB], bf[NSUB][2], sfb[NSUB];\n"
+"    #pragma unroll\n"
+"    for(int i=0;i<MSUB;i++){ int mr=wm*(BM/2)+i*16;\n"
+"      af[i][0]=smA[mr+g][t]; af[i][1]=smA[mr+g+8][t];\n"
+"      af[i][2]=smA[mr+g][t+4]; af[i][3]=smA[mr+g+8][t+4];\n"
+"      unsigned int s=0x38383838u;\n"
+"      if(t==0){const unsigned char*p=smSA[mr+g]; s=p[0]|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);}\n"
+"      else if(t==1){const unsigned char*p=smSA[mr+g+8]; s=p[0]|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);}\n"
+"      sfa[i]=s; }\n"
+"    #pragma unroll\n"
+"    for(int j=0;j<NSUB;j++){ int nr=wn*(BN/WN_WARPS)+j*8;\n"
+"      bf[j][0]=smB[nr+g][t]; bf[j][1]=smB[nr+g][t+4];\n"
+"      unsigned int s=0x38383838u;\n"
+"      if(t==0){const unsigned char*p=smSB[nr+g]; s=p[0]|(p[1]<<8)|(p[2]<<16)|(p[3]<<24);}\n"
+"      sfb[j]=s; }\n"
+"    #pragma unroll\n"
+"    for(int i=0;i<MSUB;i++)\n"
+"      #pragma unroll\n"
+"      for(int j=0;j<NSUB;j++){\n"
+"        asm volatile(\"mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 \"\n"
+"          \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0,0}, %11, {0,0};\"\n"
+"          : \"+f\"(acc[i][j][0]),\"+f\"(acc[i][j][1]),\"+f\"(acc[i][j][2]),\"+f\"(acc[i][j][3])\n"
+"          : \"r\"(af[i][0]),\"r\"(af[i][1]),\"r\"(af[i][2]),\"r\"(af[i][3]),\n"
+"            \"r\"(bf[j][0]),\"r\"(bf[j][1]),\"r\"(sfa[i]),\"r\"(sfb[j]));\n"
+"      }\n"
+"    __syncthreads();\n"
+"  }\n"
+"  #pragma unroll\n"
+"  for(int i=0;i<MSUB;i++)\n"
+"    #pragma unroll\n"
+"    for(int j=0;j<NSUB;j++){\n"
+"      int mr=bm0+wm*(BM/2)+i*16, nc=bn0+wn*(BN/WN_WARPS)+j*8;\n"
+"      int row0=mr+g, row1=mr+g+8, col=nc+2*t;\n"
+"      if(col<N){\n"
+"        if(row0<M){D[(long)row0*N+col]=acc[i][j][0]; D[(long)row0*N+col+1]=acc[i][j][1];}\n"
+"        if(row1<M){D[(long)row1*N+col]=acc[i][j][2]; D[(long)row1*N+col+1]=acc[i][j][3];}\n"
+"      }\n"
+"    }\n"
+"}\n"
+"#undef BM\n#undef BN\n#undef BK\n#undef WN_WARPS\n#undef MSUB\n#undef NSUB\n";
+
+static int qimg_compile_fp4(cuda_qimg_runner *r) {
+    if (r->fp4_module) return 0;
+    nvrtcProgram prog;
+    if (nvrtcCreateProgram(&prog, qimg_fp4_kernel_src, "qimg_fp4.cu", 0, NULL, NULL) != NVRTC_SUCCESS) return -1;
+    const char *opts[] = { "--gpu-architecture=sm_120a" };
+    nvrtcResult cr = nvrtcCompileProgram(prog, 1, opts);
+    if (cr != NVRTC_SUCCESS) {
+        size_t ls=0; nvrtcGetProgramLogSize(prog,&ls); char*lg=(char*)malloc(ls+1);
+        nvrtcGetProgramLog(prog,lg); lg[ls]=0;
+        fprintf(stderr,"cuda_qimg: FP4 kernel compile FAILED:\n%s\n",lg); free(lg);
+        nvrtcDestroyProgram(&prog); return -1;
+    }
+    CUmodule m=NULL; size_t bs=0;
+    if (nvrtcGetCUBINSize && nvrtcGetCUBINSize(prog,&bs)==NVRTC_SUCCESS && bs>0) {
+        char*bl=(char*)malloc(bs); nvrtcGetCUBIN(prog,bl); nvrtcDestroyProgram(&prog);
+        if (cuModuleLoadData(&m,bl)!=CUDA_SUCCESS) { m=NULL; } free(bl);
+    } else {
+        size_t ps=0; nvrtcGetPTXSize(prog,&ps); char*x=(char*)malloc(ps); nvrtcGetPTX(prog,x);
+        nvrtcDestroyProgram(&prog); if (cuModuleLoadData(&m,x)!=CUDA_SUCCESS) { m=NULL; } free(x);
+    }
+    if (!m) return -1;
+    r->fp4_module = m;
+    if (cuModuleGetFunction(&r->k_fp4_quant, m, "fp4_quant_act")!=CUDA_SUCCESS) return -1;
+    if (cuModuleGetFunction(&r->k_w4a4_gemm, m, "w4a4_gemm")!=CUDA_SUCCESS) return -1;
+    if (cuModuleGetFunction(&r->k_w4a4_gemm_opt, m, "w4a4_gemm_opt")!=CUDA_SUCCESS) return -1;
+    if (cuModuleGetFunction(&r->k_w4a4_combine, m, "w4a4_combine")!=CUDA_SUCCESS) return -1;
+    if (r->verbose) fprintf(stderr,"cuda_qimg: FP4 W4A4 OMMA kernels compiled (sm_120a)\n");
+    return 0;
+}
+
+/* op_gemm_fp4: native W4A4. Y[tok,out] = (quant(X) @W_fp4)*wcwt + (X@pd^T)@pu^T + bias. */
+static void op_gemm_fp4(cuda_qimg_runner *r, CUdeviceptr Y, qimg_fp4_lin *w,
+                        CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
+    int Mpad = ((n_tok + 15) / 16) * 16;
+    size_t ac=(size_t)Mpad*(n_in/8)*4, as=(size_t)Mpad*(n_in/16);
+    size_t dsz=(size_t)Mpad*n_out*4, lasz=(size_t)Mpad*128*4, losz=(size_t)Mpad*n_out*4;
+#define QF_GROW(ptr,cap,need) do{ if((need)>(cap)){ if(ptr)cuMemFree(ptr); \
+    if(cuMemAlloc(&(ptr),(need))!=CUDA_SUCCESS){(ptr)=0;(cap)=0;} else (cap)=(need);} }while(0)
+    QF_GROW(r->d_fp4_ac,r->fp4_ac_n,ac); QF_GROW(r->d_fp4_as,r->fp4_as_n,as);
+    QF_GROW(r->d_fp4_d,r->fp4_d_n,dsz);  QF_GROW(r->d_fp4_la,r->fp4_la_n,lasz);
+    QF_GROW(r->d_fp4_lo,r->fp4_lo_n,losz);
+    if (r->lowrank_bf16) {  /* bf16 cast scratch for X and la */
+        QF_GROW(r->d_x_bf16,  r->x_bf16_n,  (size_t)n_tok*n_in*2);
+        QF_GROW(r->d_la_bf16, r->la_bf16_n, (size_t)n_tok*128*2);
+    }
+#undef QF_GROW
+    /* 1. activation quant -> Ac, As (n_tok rows) */
+    long ng = (long)n_tok * (n_in/16);
+    void *qa[] = {&X,&r->d_fp4_ac,&r->d_fp4_as,&n_tok,&n_in};
+    cuLaunchKernel(r->k_fp4_quant,(unsigned)((ng+255)/256),1,1,256,1,1,0,r->stream,qa,NULL);
+    /* 2. W4A4 block-scale GEMM. Default = optimized tiled+cp.async kernel (2D grid,
+     * BM=64 x BN=128 per block, true n_tok rows with M/N guards). QIMG_W4A4_NAIVE=1
+     * forces the original 1-warp-per-16x8 kernel (Mpad rows, ~5-7x slower). */
+    if (getenv("QIMG_W4A4_NAIVE")) {
+        int nw=(Mpad/16)*(n_out/8), th=128, bl=(nw*32+th-1)/th;
+        void *ga[] = {&r->d_fp4_ac,&w->qw,&r->d_fp4_as,&w->ws,&r->d_fp4_d,&Mpad,&n_out,&n_in};
+        cuLaunchKernel(r->k_w4a4_gemm,(unsigned)bl,1,1,th,1,1,0,r->stream,ga,NULL);
+    } else {
+        unsigned bx=(unsigned)((n_out+127)/128), by=(unsigned)((n_tok+63)/64);
+        void *ga[] = {&r->d_fp4_ac,&w->qw,&r->d_fp4_as,&w->ws,&r->d_fp4_d,&n_tok,&n_out,&n_in};
+        cuLaunchKernel(r->k_w4a4_gemm_opt,bx,by,1,256,1,1,0,r->stream,ga,NULL);
+    }
+    /* 3. low-rank (SVDQuant residual): la=X@pd^T [tok,128], lo=la@pu^T [tok,out].
+     * QIMG_FP4_NO_LOWRANK=1 skips it (lo=0) — a profiling A/B knob to isolate the
+     * low-rank cost; PRODUCES A WRONG IMAGE (low-rank correction dropped). */
+    if (getenv("QIMG_FP4_NO_LOWRANK")) {
+        cuMemsetD8Async(r->d_fp4_lo, 0, (size_t)n_tok*n_out*4, r->stream);
+    } else if (r->lowrank_bf16 && r->d_x_bf16 && r->d_la_bf16) {
+        /* BF16 cuBLAS path: cast X->bf16, la=X@pd^T, cast la->bf16, lo=la@pu^T.
+         * pd/pu are resident bf16; no per-call fp8 max-reduce/quant/expand. Output
+         * is f32 directly. More accurate (bf16 X) than the fp8 path it replaces. */
+        cast_buf_f32_to_bf16(r, r->d_x_bf16, X, n_tok*n_in);
+        int rc = cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx,
+                     r->d_fp4_la, w->pd, r->d_x_bf16, n_tok, 128, n_in);
+        cast_buf_f32_to_bf16(r, r->d_la_bf16, r->d_fp4_la, n_tok*128);
+        rc |= cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx,
+                     r->d_fp4_lo, w->pu, r->d_la_bf16, n_tok, n_out, 128);
+        if (rc != 0) {  /* cuBLAS rejected -> should not happen; zero the residual */
+            fprintf(stderr, "cuda_qimg: bf16 low-rank GEMM failed (rc=%d)\n", rc);
+            cuMemsetD8Async(r->d_fp4_lo, 0, (size_t)n_tok*n_out*4, r->stream);
+        }
+    } else {
+        op_gemm(r, r->d_fp4_la, w->pd, X, 0, 128, n_in, n_tok);
+        op_gemm(r, r->d_fp4_lo, w->pu, r->d_fp4_la, 0, n_out, 128, n_tok);
+    }
+    /* 4. combine: Y = D*wcwt + lo + bias */
+    long tot = (long)n_tok * n_out;
+    void *ca[] = {&Y,&r->d_fp4_d,&w->wcwt,&r->d_fp4_lo,&bias,&n_tok,&n_out};
+    cuLaunchKernel(r->k_w4a4_combine,(unsigned)((tot+255)/256),1,1,256,1,1,0,r->stream,ca,NULL);
+}
+
+/* adaLN mod matvec (n_tok==1): Y[6*dim] = mod_w @ silu(t_embed) + bias.
+ * use_mod_fp4 -> resident NVFP4 W4A16 via gemv_fp4w_f32 (block L, is_img picks
+ * img_mod/txt_mod). Otherwise the dense FP8/F16 op_gemm on the streamed block
+ * weight (blk_w/blk_b). Runs on r->stream like op_gemm. */
+static void op_mod_matvec(cuda_qimg_runner *r, CUdeviceptr Y, int L, int is_img,
+                          CUdeviceptr blk_w, CUdeviceptr blk_b, CUdeviceptr X, int dim) {
+    if (r->use_mod_fp4) {
+        qimg_fp4_lin *m = is_img ? &r->fp4_blocks[L].img_mod : &r->fp4_blocks[L].txt_mod;
+        CUdeviceptr bias = is_img ? r->fp4_blocks[L].img_mod_b : r->fp4_blocks[L].txt_mod_b;
+        int n_out = 6 * dim, n_in = dim;
+        unsigned gx = (unsigned)((n_out + 7) / 8);
+        void *a[] = { &Y, &m->qw, &m->ws, &m->wcwt, &X, &bias, &n_out, &n_in };
+        cuLaunchKernel(r->gemv_fp4w_f32, gx, 1, 1, 256, 1, 1,
+                       (unsigned)n_in * sizeof(float), r->stream, a, NULL);
+    } else {
+        op_gemm(r, Y, blk_w, X, blk_b, 6 * dim, dim, 1);
+    }
+}
+
+/* Load all blocks' FP4 W4A4 weights resident (qweight/wscales/wcwt/proj_down/proj_up).
+ * ~8 GB for 60 blocks. mod/norms/biases continue to stream via the dense path. */
+static const char *qimg_fp4_bases[FP4_NLIN] = {
+    "attn.to_q","attn.to_k","attn.to_v","attn.to_out.0",
+    "attn.add_q_proj","attn.add_k_proj","attn.add_v_proj","attn.to_add_out",
+    "img_mlp.net.0.proj","img_mlp.net.2","txt_mlp.net.0.proj","txt_mlp.net.2" };
+static int qimg_load_fp4_weights(cuda_qimg_runner *r) {
+    st_context *st = (st_context *)r->dit_st;
+    int nb = r->dit_n_blocks;
+    r->fp4_blocks = (qimg_fp4_block *)calloc((size_t)nb, sizeof(qimg_fp4_block));
+    if (!r->fp4_blocks) return -1;
+    char nm[256];
+    for (int b = 0; b < nb; b++) {
+        for (int i = 0; i < FP4_NLIN; i++) {
+            qimg_fp4_lin *L = &r->fp4_blocks[b].lin[i];
+#define QF_LD(field, suf) do { \
+            snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.%s", b, qimg_fp4_bases[i], suf); \
+            L->field = qimg_st_upload_fp8_raw(st, nm); if (!L->field) return -1; } while(0)
+            QF_LD(qw, "qweight_fp4"); QF_LD(ws, "wscales_fp4");
+#undef QF_LD
+            /* low-rank pd/pu: bf16 (dequant fp8->bf16, for the plumbing-free bf16
+             * cuBLAS GEMM path) or raw fp8 (for the legacy fp8 op_gemm path). */
+#define QF_LDPROJ(field, suf) do { \
+            snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.%s", b, qimg_fp4_bases[i], suf); \
+            L->field = r->lowrank_bf16 \
+                ? (r->load_gpu_cast ? qimg_st_upload_bf16_gpucast(r, st, nm) \
+                                    : qimg_st_upload_bf16(st, nm)) \
+                : qimg_st_upload_fp8_raw(st, nm); \
+            if (!L->field) return -1; } while(0)
+            QF_LDPROJ(pd, "proj_down_fp8"); QF_LDPROJ(pu, "proj_up_fp8");
+#undef QF_LDPROJ
+            snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wcwt", b, qimg_fp4_bases[i]);
+            L->wcwt = qimg_st_upload_f32(st, nm); if (!L->wcwt) return -1;
+        }
+        /* mod-FP4 (W4A16): load img_mod/txt_mod as resident NVFP4 (qw/ws/wcwt) +
+         * f32 bias, so the adaLN mod no longer streams. */
+        if (r->use_mod_fp4) {
+            struct { qimg_fp4_lin *L; CUdeviceptr *bias; const char *base; } mods[2] = {
+                { &r->fp4_blocks[b].img_mod, &r->fp4_blocks[b].img_mod_b, "img_mod.1" },
+                { &r->fp4_blocks[b].txt_mod, &r->fp4_blocks[b].txt_mod_b, "txt_mod.1" } };
+            for (int m = 0; m < 2; m++) {
+                qimg_fp4_lin *L = mods[m].L;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.qweight_fp4", b, mods[m].base);
+                L->qw = qimg_st_upload_fp8_raw(st, nm); if (!L->qw) return -1;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wscales_fp4", b, mods[m].base);
+                L->ws = qimg_st_upload_fp8_raw(st, nm); if (!L->ws) return -1;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.wcwt", b, mods[m].base);
+                L->wcwt = qimg_st_upload_f32(st, nm); if (!L->wcwt) return -1;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.bias", b, mods[m].base);
+                *mods[m].bias = qimg_st_upload_f32(st, nm); if (!*mods[m].bias) return -1;
+            }
+        }
+    }
+    /* GPU-cast path queued async work on r->stream and shares one temp buffer;
+     * sync once here (instead of per-tensor) so the H2D + casts overlap, then
+     * release the temp (only needed during load). */
+    if (r->load_gpu_cast) {
+        cuStreamSynchronize(r->stream);
+        if (r->d_fp8_cast_tmp) { cuMemFree(r->d_fp8_cast_tmp); r->d_fp8_cast_tmp = 0; r->fp8_cast_tmp_n = 0; }
+    }
+    if (r->verbose) fprintf(stderr, "cuda_qimg: loaded FP4 W4A4 weights for %d blocks (resident)\n", nb);
+    return 0;
+}
+
+
 /* ---- Init ---- */
+
+/* ---- INT8 W8A8 dynamic GEMM kernels (runner-local) ----
+ * int8 x int8 -> int32 accumulate is associative & lossless, so the GEMM is
+ * BIT-EXACT across CUDA/HIP regardless of tiling/thread mapping (unlike FP8,
+ * whose e4m3 rounding + accumulation order differ per hardware). This is the
+ * whole reason for the INT8 path: reproducible CUDA<->HIP layer verification.
+ *
+ * Weight buffer is a "fat" layout so op_gemm needs no extra scale argument and
+ * the scale travels with the weight pointer through the streaming loader:
+ *     W = [ per-out-channel scale : n_out * f32 ][ int8 weights : n_out*n_in ]
+ * Dequant: w_bf16[o,i] = wq[o,i] * wscale[o].
+ * Activations are quantized dynamically per token-row (no calibration):
+ *     xscale[t] = max(|X[t,:]|)/127 ; xq[t,k] = clamp(rint(X[t,k]/xscale), -127,127)
+ *     y[t,o] = (sum_k xq[t,k]*wq[o,k]) * (xscale[t]*wscale[o]) + bias[o]
+ */
+static const char *int8_kernels_src =
+"extern \"C\" {\n"
+/* Per-token-row activation quant: one CTA per row, 256 threads. Writes
+ * xq[n_tok,n_in] (int8) and xscale[n_tok]. Same max-reduce as the fp8 path.
+ * Optional SmoothQuant: if `smooth` (per-input-channel s[n_in]) is non-NULL, the
+ * effective activation is X[i]/smooth[i] (outliers migrated into the weights
+ * offline as W*s), which makes the per-token int8 scale far less coarse. */
+"__global__ void quant_act_perrow_int8(const float *X, const float *smooth,\n"
+"                                      signed char *Xq,\n"
+"                                      float *xscale, int n_tok, int n_in) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_tok) return;\n"
+"    const float *xr = X + (long)row * n_in;\n"
+"    signed char *qr = Xq + (long)row * n_in;\n"
+"    float v = 0.0f;\n"
+"    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {\n"
+"        float xe = smooth ? (xr[i] / smooth[i]) : xr[i];\n"
+"        float a = fabsf(xe); if (a > v) v = a;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) {\n"
+"        float o = __shfl_xor_sync(0xFFFFFFFF, v, off); if (o > v) v = o;\n"
+"    }\n"
+"    __shared__ float warp_max[8];\n"
+"    int wid = threadIdx.x / 32;\n"
+"    if ((threadIdx.x & 31) == 0) warp_max[wid] = v;\n"
+"    __syncthreads();\n"
+"    __shared__ float s_scale;\n"
+"    if (wid == 0) {\n"
+"        v = (threadIdx.x < (blockDim.x / 32)) ? warp_max[threadIdx.x] : 0.0f;\n"
+"        for (int off = 16; off > 0; off >>= 1) {\n"
+"            float o = __shfl_xor_sync(0xFFFFFFFF, v, off); if (o > v) v = o;\n"
+"        }\n"
+"        if (threadIdx.x == 0) {\n"
+"            float sc = (v > 1e-30f) ? (v / 127.0f) : 1.0f;\n"
+"            xscale[row] = sc; s_scale = sc;\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float sc = s_scale;\n"
+"    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {\n"
+"        float xe = smooth ? (xr[i] / smooth[i]) : xr[i];\n"
+"        float q = rintf(xe / sc);\n"
+"        if (q > 127.0f) q = 127.0f; else if (q < -127.0f) q = -127.0f;\n"
+"        qr[i] = (signed char)q;\n"
+"    }\n"
+"}\n"
+/* W8A8 GEMM. One thread per output element (o,t); full k-reduction in int32
+ * via dp4a (4 int8/step). n_in is always a multiple of 4 for qimg linears. */
+"__global__ void gemm_w8a8_perrow_f32(float *Y, const signed char *Wq,\n"
+"                                     const float *wscale, const signed char *Xq,\n"
+"                                     const float *xscale, const float *bias,\n"
+"                                     int n_out, int n_in, int n_tok) {\n"
+"    int o = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int t = blockIdx.y;\n"
+"    if (o >= n_out || t >= n_tok) return;\n"
+"    const int *w4 = (const int *)(Wq + (long)o * n_in);\n"
+"    const int *x4 = (const int *)(Xq + (long)t * n_in);\n"
+"    int acc = 0;\n"
+"    int n4 = n_in >> 2;\n"
+"    for (int i = 0; i < n4; i++) acc = __dp4a(w4[i], x4[i], acc);\n"
+"    for (int i = n4 << 2; i < n_in; i++)\n"
+"        acc += (int)Wq[(long)o*n_in+i] * (int)Xq[(long)t*n_in+i];\n"
+"    float s = xscale[t] * wscale[o];\n"
+"    float y = (float)acc * s;\n"
+"    if (bias) y += bias[o];\n"
+"    Y[(long)t * n_out + o] = y;\n"
+"}\n"
+"#if __CUDA_ARCH__ >= 800\n"
+/* OUR OWN pure int8 x int8 -> int32 GEMM (mma.sync.m16n8k32.s32.s8.s8.s32), no
+ * cuBLAS. Inputs are already int8 (Xq quantized per-token by quant_act_perrow_int8);
+ * output is the RAW int32 dot product (dequant is the separate dequant_int32_to_bf16
+ * kernel). This is a drop-in for cublasGemmEx's int32 contract, so the two can be
+ * compared bit-for-bit (both compute the exact integer sum -> identical regardless of
+ * tiling). Same 4x4 CTA swizzle + cp.async double-buffered W + direct A-fragment load
+ * as the fused kernel; the only differences are int8-X load (no quant) and int32 store
+ * (no dequant). Gate (caller): n_out%256==0, n_in%32==0, n_tok>=16. The HIP port can
+ * mirror this kernel exactly. */
+"__global__ __launch_bounds__(128, 4)\n"
+"void gemm_int8_s32(int *C, const signed char *W, const signed char *Xq,\n"
+"                   int n_out, int n_in, int n_tok) {\n"
+"    extern __shared__ unsigned char i8s32_smem[];\n"
+"    signed char *smX  = (signed char *)i8s32_smem;\n"                /* 32 x 32 s8 = 1024 */
+"    signed char *smW0 = (signed char *)(i8s32_smem + 1024);\n"      /* double-buffered W */
+"    signed char *smW1 = (signed char *)(i8s32_smem + 1024 + 8192);\n"
+"    int blk_lin = blockIdx.y * gridDim.x + blockIdx.x;\n"
+"    int npx_ = gridDim.x; int npy_ = gridDim.y;\n"
+"    int panels_m_ = (npy_ + 3) >> 2;\n"
+"    int per_panel_ = 16;\n"
+"    int panel_id_ = blk_lin / per_panel_;\n"
+"    int in_panel_ = blk_lin - panel_id_ * per_panel_;\n"
+"    int panel_m_id_ = panel_id_ - (panel_id_ / panels_m_) * panels_m_;\n"
+"    int panel_n_id_ = panel_id_ / panels_m_;\n"
+"    int m_in_ = in_panel_ & 3; int n_in__ = in_panel_ >> 2;\n"
+"    int tile_m_ = (panel_m_id_ << 2) + m_in_;\n"
+"    int tile_n_ = (panel_n_id_ << 2) + n_in__;\n"
+"    if (tile_m_ >= npy_ || tile_n_ >= npx_) return;\n"
+"    int tok_base = tile_m_ * 32;\n"
+"    int warp_id  = threadIdx.x / 32;\n"
+"    int out_base_cta = tile_n_ * 256;\n"
+"    int out_base = out_base_cta + warp_id * 64;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int gid  = lane / 4; int tid4 = lane & 3; int tid = threadIdx.x;\n"
+"    if (tok_base >= n_tok) return;\n"
+"    if (out_base_cta >= n_out) return;\n"
+"    int d0[2][8]; int d1[2][8]; int d2[2][8]; int d3[2][8];\n"
+"#pragma unroll\n"
+"    for (int mt = 0; mt < 2; mt++)\n"
+"#pragma unroll\n"
+"        for (int i = 0; i < 8; i++) { d0[mt][i]=0; d1[mt][i]=0; d2[mt][i]=0; d3[mt][i]=0; }\n"
+"    int n_ktiles = n_in / 32;\n"
+"#define LOAD_W_S32(buf, ktile) do {\\\n"
+"        int _k = (ktile) * 32;\\\n"
+"        int _r0 = 2 * tid; int _r1 = _r0 + 1;\\\n"
+"        unsigned int _d0 = (unsigned int)__cvta_generic_to_shared((buf) + _r0 * 32);\\\n"
+"        unsigned int _d1 = (unsigned int)__cvta_generic_to_shared((buf) + _r1 * 32);\\\n"
+"        const signed char *_s0 = W + (size_t)(out_base_cta + _r0) * n_in + _k;\\\n"
+"        const signed char *_s1 = W + (size_t)(out_base_cta + _r1) * n_in + _k;\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d0),     \"l\"(_s0));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d0+16),  \"l\"(_s0+16));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d1),     \"l\"(_s1));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d1+16),  \"l\"(_s1+16));\\\n"
+"    } while (0)\n"
+"    LOAD_W_S32(smW0, 0); asm volatile(\"cp.async.commit_group;\\n\");\n"
+"    if (n_ktiles > 1) { LOAD_W_S32(smW1, 1); asm volatile(\"cp.async.commit_group;\\n\"); }\n"
+"    for (int kt = 0; kt < n_ktiles; kt++) {\n"
+"        int k = kt * 32;\n"
+"        signed char *smW_cur = (kt & 1) ? smW1 : smW0;\n"
+"        /* Load this k-tile of Xq into smX (raw int8 copy, no quant). */\n"
+"        int srow = tid / 4; int scol = (tid & 3) * 8;\n"
+"        int grow = tok_base + srow;\n"
+"        unsigned int p0 = 0, p1 = 0;\n"
+"        if (grow < n_tok) {\n"
+"            const unsigned int *xp = (const unsigned int *)(Xq + (long)grow * n_in + k + scol);\n"
+"            p0 = xp[0]; p1 = xp[1];\n"
+"        }\n"
+"        *(unsigned int *)(smX + srow * 32 + scol    ) = p0;\n"
+"        *(unsigned int *)(smX + srow * 32 + scol + 4) = p1;\n"
+"        if (n_ktiles - kt >= 2) asm volatile(\"cp.async.wait_group 1;\\n\");\n"
+"        else                    asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"        __syncthreads();\n"
+"        unsigned int a0[2], a1[2], a2[2], a3[2];\n"
+"#pragma unroll\n"
+"        for (int mt = 0; mt < 2; mt++) {\n"
+"            int mr = mt * 16;\n"
+"            a0[mt] = *(const unsigned int *)(smX + (mr + gid    ) * 32 + tid4 * 4);\n"
+"            a1[mt] = *(const unsigned int *)(smX + (mr + gid + 8) * 32 + tid4 * 4);\n"
+"            a2[mt] = *(const unsigned int *)(smX + (mr + gid    ) * 32 + tid4 * 4 + 16);\n"
+"            a3[mt] = *(const unsigned int *)(smX + (mr + gid + 8) * 32 + tid4 * 4 + 16);\n"
+"        }\n"
+"#pragma unroll\n"
+"        for (int nt = 0; nt < 8; nt++) {\n"
+"            int bc_local = warp_id * 64 + nt * 8 + gid;\n"
+"            const signed char *bp = smW_cur + bc_local * 32 + tid4 * 4;\n"
+"            unsigned int b0 = *(const unsigned int *)bp;\n"
+"            unsigned int b1 = *(const unsigned int *)(bp + 16);\n"
+"#pragma unroll\n"
+"            for (int mt = 0; mt < 2; mt++) {\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
+"                    : \"+r\"(d0[mt][nt]), \"+r\"(d1[mt][nt]), \"+r\"(d2[mt][nt]), \"+r\"(d3[mt][nt])\n"
+"                    : \"r\"(a0[mt]), \"r\"(a1[mt]), \"r\"(a2[mt]), \"r\"(a3[mt]), \"r\"(b0), \"r\"(b1));\n"
+"            }\n"
+"        }\n"
+"        if (kt + 2 < n_ktiles) {\n"
+"            signed char *smW_next = ((kt + 2) & 1) ? smW1 : smW0;\n"
+"            LOAD_W_S32(smW_next, kt + 2); asm volatile(\"cp.async.commit_group;\\n\");\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"#undef LOAD_W_S32\n"
+"#pragma unroll\n"
+"    for (int mt = 0; mt < 2; mt++) {\n"
+"        int mr = mt * 16;\n"
+"        int yr0 = tok_base + mr + gid; int yr1 = yr0 + 8;\n"
+"#pragma unroll\n"
+"        for (int nt = 0; nt < 8; nt++) {\n"
+"            int yc0 = out_base + nt * 8 + tid4 * 2; int yc1 = yc0 + 1;\n"
+"            if (yr0 < n_tok && yc0 < n_out) C[(long)yr0*n_out+yc0] = d0[mt][nt];\n"
+"            if (yr0 < n_tok && yc1 < n_out) C[(long)yr0*n_out+yc1] = d1[mt][nt];\n"
+"            if (yr1 < n_tok && yc0 < n_out) C[(long)yr1*n_out+yc0] = d2[mt][nt];\n"
+"            if (yr1 < n_tok && yc1 < n_out) C[(long)yr1*n_out+yc1] = d3[mt][nt];\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#endif\n"
+/* Dequant the int32 GEMM output (from our gemm_int8_s32 or cuBLAS int8 GemmEx) to bf16.
+ * C is [n_tok, n_out] row-major int32 (== col-major [n_out,n_tok] ldc=n_out).
+ * y[t,o] = C[t,o] * (xscale[t] * wscale[o]) + bias[o]. 2-D grid avoids per-elem div. */
+"__global__ void dequant_int32_to_bf16(float *Y, const int *C,\n"
+"                                      const float *xscale, const float *wscale,\n"
+"                                      const float *bias, int n_out, int n_tok) {\n"
+"    int o = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int t = blockIdx.y;\n"
+"    if (o >= n_out || t >= n_tok) return;\n"
+"    long idx = (long)t * n_out + o;\n"
+"    float y = (float)C[idx] * (xscale[t] * wscale[o]);\n"
+"    if (bias) y += bias[o];\n"
+"    Y[idx] = to_bf16(y);\n"
+"}\n"
+"}\n";
 
 cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) {
@@ -2913,7 +3902,10 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     CUstream stream;
     CU_CHECK_NULL(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
 
-    if (verbose) {
+    {
+        /* Print the device line unconditionally (not just under --verbose): the
+         * compare server parses "cuda_qimg: <name> (sm_..)" for its progress/device
+         * readout, and it's a single concise, harmless line for every caller. */
         char name[256]; cuDeviceGetName(name, sizeof(name), dev);
         size_t mem; cuDeviceTotalMem(&mem, dev);
         fprintf(stderr, "cuda_qimg: %s (sm_%d, %.1f GB)\n", name, sm, (float)mem/(1<<30));
@@ -2930,15 +3922,17 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     size_t len1 = strlen(cuda_kernels_common_src);
     size_t len2 = strlen(qimg_kernel_src);
     size_t len3 = strlen(fp8_mma_kernels_src);
+    size_t len4 = strlen(int8_kernels_src);  /* own extern "C" block */
     size_t lo = strlen(mma_open);
     size_t lc = strlen(mma_close);
-    char *full_src = (char *)malloc(len1 + len2 + lo + len3 + lc + 1);
+    char *full_src = (char *)malloc(len1 + len2 + lo + len3 + lc + len4 + 1);
     char *p = full_src;
     memcpy(p, cuda_kernels_common_src, len1); p += len1;
     memcpy(p, qimg_kernel_src, len2);         p += len2;
     memcpy(p, mma_open, lo);                  p += lo;
     memcpy(p, fp8_mma_kernels_src, len3);     p += len3;
     memcpy(p, mma_close, lc);                 p += lc;
+    memcpy(p, int8_kernels_src, len4);        p += len4;
     *p = '\0';
 
     CUmodule module;
@@ -2954,6 +3948,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gemm_f16_f32, "gemm_tiled_f16_f32");  /* Use tiled (correct) kernel, not MMA (has fragment mapping bug) */
     GET(gemm_f32_f32, "gemm_f32_f32");
     GET(gemm_fp8w_f32, "gemm_fp8w_f32");
+    GET(gemv_fp8w_f32, "gemv_fp8w_f32");
+    GET(gemv_fp4w_f32, "gemv_fp4w_f32");
     GET(gemm_opt_f16, "gemm_opt_f16");
     GET(gemm_opt_fp8, "gemm_opt_fp8");
     if (cuModuleGetFunction(&r->gemm_fp8_mma, module, "gemm_fp8_scaled_f32") != CUDA_SUCCESS)
@@ -2974,6 +3970,14 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_fp8_pipe_perrow_mt4_concat3 = NULL;
     if (cuModuleGetFunction(&r->reduce_max_abs_per_row, module, "reduce_max_abs_per_row_f32") != CUDA_SUCCESS)
         r->reduce_max_abs_per_row = NULL;
+    if (cuModuleGetFunction(&r->quant_act_perrow_int8, module, "quant_act_perrow_int8") != CUDA_SUCCESS)
+        r->quant_act_perrow_int8 = NULL;
+    if (cuModuleGetFunction(&r->gemm_w8a8_perrow, module, "gemm_w8a8_perrow_f32") != CUDA_SUCCESS)
+        r->gemm_w8a8_perrow = NULL;
+    if (cuModuleGetFunction(&r->gemm_int8_s32, module, "gemm_int8_s32") != CUDA_SUCCESS)
+        r->gemm_int8_s32 = NULL;
+    if (cuModuleGetFunction(&r->dequant_int32_to_bf16, module, "dequant_int32_to_bf16") != CUDA_SUCCESS)
+        r->dequant_int32_to_bf16 = NULL;
     if (cuModuleGetFunction(&r->quant_f32_to_fp8_e4m3, module, "quant_f32_to_fp8_e4m3") != CUDA_SUCCESS)
         r->quant_f32_to_fp8_e4m3 = NULL;
     if (cuModuleGetFunction(&r->compute_x_scale_from_max, module, "compute_x_scale_from_max") != CUDA_SUCCESS)
@@ -3071,6 +4075,16 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
                 fprintf(stderr, "cuda_qimg: parallel CFG streams enabled\n");
         }
     }
+    /* CUDA graph capture of the per-step DiT block loop: opt-in via
+     * QIMG_CUDA_GRAPH=1. Incompatible with the multi-stream CFG path and the
+     * double-buffer pipeline, which are checked again at capture time. */
+    r->qg_enabled = (getenv("QIMG_CUDA_GRAPH") != NULL);
+    if (r->qg_enabled && r->uncond_stream) {
+        fprintf(stderr, "cuda_qimg: QIMG_CUDA_GRAPH ignored (incompatible with QIMG_CFG_STREAMS)\n");
+        r->qg_enabled = 0;
+    }
+    if (r->qg_enabled && verbose)
+        fprintf(stderr, "cuda_qimg: CUDA graph capture of DiT block loop enabled\n");
     /* FP8 flash attention: opt-in via QIMG_FP8_ATTN=1. */
     r->use_fp8_attn = 0;
     {
@@ -3211,6 +4225,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(truncate_bf16, "truncate_bf16_f32");
     GET(quantize_fp8_rt, "quantize_fp8_roundtrip_f32");
     GET(dequant_fp8_to_f16, "dequant_fp8_to_f16");
+    GET(dequant_fp8_to_bf16, "dequant_fp8_to_bf16");
     #undef GET
 
     /* Upload FP8→F16 LUT to GPU constant memory */
@@ -3237,6 +4252,15 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
             if (verbose)
                 fprintf(stderr, "cuda_qimg: FP8→F32 LUT uploaded\n");
         }
+        /* NVFP4 E2M1 code->value LUT (for gemv_fp4w_f32 / use_mod_fp4). Matches the
+         * E2M1 table in nunchaku_fp4_repack_omma.py. */
+        static const float e2m1_vals[16] = {
+            0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+           -0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f };
+        CUdeviceptr d_e2m1; size_t e2m1_sz;
+        if (cuModuleGetGlobal(&d_e2m1, &e2m1_sz, module, "d_e2m1_lut") == CUDA_SUCCESS
+            && e2m1_sz == 16 * sizeof(float))
+            cuMemcpyHtoD(d_e2m1, e2m1_vals, 16 * sizeof(float));
     }
 
     /* Upload FP8→BF16 LUT to GPU constant memory (for gemm_bf16_pipe_f32) */
@@ -3260,6 +4284,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
 /* Upload weight: raw FP8 for native GEMM, or upload FP8 + GPU dequant to F16 */
 static CUdeviceptr qimg_upload_weight_auto(cuda_qimg_runner *r,
                                             st_context *st, const char *name) {
+    if (r->use_int8)
+        return qimg_st_upload_int8_fat(st, name, r->use_int8_smooth);
     if (r->use_fp8_gemm)
         return qimg_st_upload_fp8_raw(st, name);
     if (r->use_f16_gemm)
@@ -3312,6 +4338,99 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         }
     }
 
+    /* Auto-detect INT8 W8A8 weights: peek a representative linear's dtype. If
+     * "I8", switch to the bit-exact int8 GEMM path and disable all FP8/F16
+     * paths (their dispatch in op_gemm is bypassed by the use_int8 branch, but
+     * clear the flags so the loaders take the fat-buffer route). */
+    {
+        int pidx = safetensors_find(st, "transformer_blocks.0.attn.to_q.weight");
+        if (pidx < 0) pidx = safetensors_find(st, "img_in.weight");
+        if (pidx >= 0 && strcmp(safetensors_dtype(st, pidx), "I8") == 0) {
+            if (!r->gemm_w8a8_perrow || !r->quant_act_perrow_int8) {
+                fprintf(stderr, "cuda_qimg: INT8 weights but int8 kernels missing\n");
+                return -1;
+            }
+            r->use_int8 = 1;
+            r->use_fp8_gemm = 0; r->use_f16_gemm = 0; r->use_old_gemm = 0;
+            r->use_fp8_pipe_perrow = 0; r->use_fp8_pipe = 0;
+            r->use_fp8_mma = 0; r->use_fp8_mma_bf16 = 0; r->use_bf16_mma = 0;
+            r->use_cublaslt_fp8 = 0;
+            /* SmoothQuant variant: a per-input-channel .smooth_scale companion
+             * exists. The fat buffer then carries [wscale][smooth][wq] and the
+             * quant divides X by smooth (W was pre-scaled by smooth offline). */
+            r->use_int8_smooth =
+                (safetensors_find(st, "transformer_blocks.0.attn.to_q.smooth_scale") >= 0);
+            fprintf(stderr, "cuda_qimg: INT8 W8A8 weights detected — bit-exact int8 GEMM path%s\n",
+                    r->use_int8_smooth ? " (SmoothQuant)" : "");
+            /* Default int8 GEMM = OUR gemm_int8_s32 mma kernel (no cuBLAS dependency,
+             * so the HIP port can mirror it exactly). cuBLAS int8 GemmEx is set up as
+             * the bit-exact verification oracle (both compute the exact int32 sum):
+             * QIMG_INT8_CUBLAS=1 uses it for the run instead of ours; --test-int8-gemm
+             * compares the two int32 outputs. QIMG_DISABLE_INT8_CUBLAS=1 skips the
+             * oracle setup. */
+            if (!getenv("QIMG_DISABLE_INT8_CUBLAS") && r->dequant_int32_to_bf16) {
+                if (!r->cublaslt_ctx) cublasewCreate(&r->cublaslt_ctx, r->stream);
+                if (r->cublaslt_ctx) r->use_cublas_int8 = 1;
+            }
+            if (r->gemm_int8_s32)
+                fprintf(stderr, "cuda_qimg: INT8 GEMM = own gemm_int8_s32 (cuBLAS oracle %s)\n",
+                        r->use_cublas_int8 ? "available" : "off");
+            else if (r->use_cublas_int8)
+                fprintf(stderr, "cuda_qimg: INT8 GEMM = cuBLAS GemmEx (own kernel unavailable)\n");
+        }
+    }
+
+    /* ---- Stage 2: detect & load native W4A4 OMMA FP4 layout ---- */
+    if (safetensors_find(st, "transformer_blocks.0.attn.to_q.qweight_fp4") >= 0) {
+        r->use_w4a4 = 1;
+        if (qimg_compile_fp4(r) != 0) {
+            fprintf(stderr, "cuda_qimg: FP4 W4A4 kernel compile failed\n"); return -1;
+        }
+        /* Low-rank (SVDQuant residual) GEMM: default to a plain bf16 cuBLAS path
+         * (pd/pu dequant'd fp8->bf16 at load) which drops the per-call fp8
+         * quant/dequant plumbing (~118 ms/step at 512^2) and is more accurate;
+         * needs the cuBLAS ctx + bulk f32->bf16 cast. QIMG_LOWRANK_FP8=1 forces
+         * the legacy fp8 op_gemm path. Falls back if either is unavailable. */
+        r->lowrank_bf16 = !getenv("QIMG_LOWRANK_FP8");
+        if (r->lowrank_bf16) {
+            if (!r->cublaslt_ctx) cublasewCreate(&r->cublaslt_ctx, r->stream);
+            if (!r->cublaslt_ctx || !r->cast_f32_to_bf16) {
+                fprintf(stderr, "cuda_qimg: bf16 low-rank unavailable (cublas/cast missing) -> fp8\n");
+                r->lowrank_bf16 = 0;
+            }
+        }
+        /* Load-time GPU-side FP8→BF16 cast of pd/pu (default on; QIMG_LOAD_GPU_CAST=0
+         * forces the legacy single-threaded CPU conversion). Only active for the bf16
+         * low-rank path and when the cast kernel resolved. Byte-identical output. */
+        {
+            const char *gc = getenv("QIMG_LOAD_GPU_CAST");
+            r->load_gpu_cast = (!gc || atoi(gc) != 0) && r->lowrank_bf16 && r->dequant_fp8_to_bf16;
+            if (r->load_gpu_cast && r->verbose)
+                fprintf(stderr, "cuda_qimg: pd/pu FP8->BF16 cast on GPU (QIMG_LOAD_GPU_CAST)\n");
+        }
+        /* mod-FP4 (W4A16): if the checkpoint stores the adaLN mod as NVFP4
+         * (img_mod.1.qweight_fp4) keep all 60 blocks resident — no dense-mod
+         * streaming. Needs the gemv_fp4w_f32 kernel. Lossy vs FP8 mod (no
+         * SVDQuant low-rank correction); QIMG_MOD_FP4=0 disables (only useful on a
+         * checkpoint that ALSO has the FP8 mod weight; the modfp4 file has only FP4). */
+        if (safetensors_find(st, "transformer_blocks.0.img_mod.1.qweight_fp4") >= 0) {
+            const char *me = getenv("QIMG_MOD_FP4");
+            int want = (!me || atoi(me) != 0);
+            if (want && r->gemv_fp4w_f32) {
+                r->use_mod_fp4 = 1;
+                fprintf(stderr, "cuda_qimg: adaLN mod = NVFP4 W4A16 resident (all blocks)\n");
+            } else if (want && !r->gemv_fp4w_f32) {
+                fprintf(stderr, "cuda_qimg: mod-FP4 checkpoint but gemv_fp4w_f32 missing — FP8 mod path will fail\n");
+            }
+        }
+        if (qimg_load_fp4_weights(r) != 0) {
+            fprintf(stderr, "cuda_qimg: FP4 resident weight load failed (OOM?)\n"); return -1;
+        }
+        if (r->verbose)
+            fprintf(stderr, "cuda_qimg: W4A4 OMMA path active (low-rank=%s)\n",
+                    r->lowrank_bf16 ? "bf16 cuBLAS" : "fp8 op_gemm");
+    }
+
     /* Upload global weights — FP8 raw if native GEMM, else GPU dequant to F16 */
     #define GW(nm) qimg_upload_weight_auto(r, st, nm)
     /* Helper: upload + GPU dequant if not using native FP8 */
@@ -3336,25 +4455,32 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     {
         size_t free_mem = 0, total_mem = 0;
         size_t block_bytes;
-        if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
+        if (r->use_int8) block_bytes = 344ULL * 1024 * 1024; /* INT8: 1 byte + per-channel f32 scale */
+        else if (r->use_mod_fp4) block_bytes = 2ULL * 1024 * 1024; /* mod resident in fp4_blocks; dense block = norms+biases only (~0.25 MB) -> preload all 60 */
+        else if (r->use_w4a4) block_bytes = 130ULL * 1024 * 1024;   /* W4A4: dense block = mod+norms+biases only */
+        else if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
         else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
 
         /* Reserve the on-demand scratch slot(s) up front. Each slot is one
          * "block worth" of FP8 weights plus tiny F32 biases, so reserving =
-         * pre-allocating now gives a tighter and more accurate fit. */
-        if (qimg_alloc_scratch_block(r) == 0) {
-            if (r->verbose)
-                fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
-        } else {
-            fprintf(stderr, "cuda_qimg: scratch slot alloc failed\n");
-        }
-        if (getenv("QIMG_PIPELINE")) {
-            if (qimg_alloc_scratch_block_b(r) == 0) {
+         * pre-allocating now gives a tighter and more accurate fit.
+         * mod-FP4: the dense block is just norms/biases (~0.25 MB) and all 60
+         * preload, so there is no streaming — skip the (mod-sized) slots. */
+        if (!r->use_mod_fp4) {
+            if (qimg_alloc_scratch_block(r) == 0) {
                 if (r->verbose)
-                    fprintf(stderr, "cuda_qimg: 2nd scratch slot allocated\n");
+                    fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
             } else {
-                fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed\n");
+                fprintf(stderr, "cuda_qimg: scratch slot alloc failed\n");
+            }
+            if (qimg_want_pipeline(r)) {
+                if (qimg_alloc_scratch_block_b(r) == 0) {
+                    if (r->verbose)
+                        fprintf(stderr, "cuda_qimg: 2nd scratch slot allocated (double-buffer H2D)\n");
+                } else {
+                    fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed — single-slot streaming\n");
+                }
             }
         }
 
@@ -3364,11 +4490,32 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
          * ~200 MB. Reserve 250 MB to leave headroom. Override with
          * QIMG_WORKSPACE_MB=N for higher resolutions. */
         size_t act_mb = 250;
+        /* W4A4 needs much more headroom: op_gemm_fp4 scratch (Ac/As/D/la/lo) +
+         * the low-rank op_gemm scratch are allocated lazily during step 1 (after
+         * preload), on top of the activation working set and CFG double-buffers.
+         * The working set scales with image tokens (= pixels/256). When the caller
+         * told us the target resolution (dit_target_pixels) reserve resolution-
+         * aware: ~1.1 GB @256², ~1.5 GB @512², ~3.0 GB @1024² — this lets <=512²
+         * preload ~30/60 blocks instead of 13, cutting streamed blocks (and thus
+         * bounce-staging) without risking a high-res OOM. Unknown -> conservative
+         * 3 GB. The eviction backstop (qimg_evict_preloaded_until_free) recovers
+         * from any under-estimate. Output is byte-identical either way. */
+        if (r->use_w4a4) {
+            act_mb = 3072;  /* safe default when target resolution is unknown */
+            if (r->dit_target_pixels > 0)
+                act_mb = 1024 + r->dit_target_pixels / 512;  /* 1024 + tokens/2 */
+        }
         const char *ws_env = getenv("QIMG_WORKSPACE_MB");
         if (ws_env) act_mb = (size_t)atoi(ws_env);
         size_t workspace = act_mb * 1024 * 1024;
         int max_preload = (free_mem > workspace)
             ? (int)((free_mem - workspace) / block_bytes) : 0;
+        /* mod-FP4: the mod weights are resident in fp4_blocks[], so the dense
+         * gpu_blocks[] are just norms+biases (~0.25 MB each, ~15 MB for all 60).
+         * There is no streaming path (no scratch slot), so ALL 60 must be resident
+         * regardless of the activation reservation — they cost almost nothing and
+         * the step allocates its workspace from the remaining free memory. */
+        if (r->use_mod_fp4) max_preload = r->dit_n_blocks;
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
         const char *_mp_env = getenv("QIMG_MAX_PRELOAD");
         if (_mp_env) {
@@ -3452,6 +4599,8 @@ int cuda_qimg_load_vae(cuda_qimg_runner *r, const char *path) {
 
 void cuda_qimg_free(cuda_qimg_runner *r) {
     if (!r) return;
+    if (r->qg_exec)  { cuGraphExecDestroy(r->qg_exec); r->qg_exec = NULL; }
+    if (r->qg_graph) { cuGraphDestroy(r->qg_graph);    r->qg_graph = NULL; }
     /* Free preloaded blocks */
     if (r->gpu_blocks) {
         for (int i = 0; i < r->n_preloaded; i++)
@@ -3489,6 +4638,10 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->d_x_scale_f32) cuMemFree(r->d_x_scale_f32);
     if (r->d_w_scale_one) cuMemFree(r->d_w_scale_one);
     if (r->cublaslt_ctx) cublasewDestroy(r->cublaslt_ctx);
+    /* INT8 W8A8 scratch (quantized X, per-token scale, int32 GEMM output) */
+    if (r->d_xq_int8)   cuMemFree(r->d_xq_int8);
+    if (r->d_x_iscale)  cuMemFree(r->d_x_iscale);
+    if (r->d_yi32_int8) cuMemFree(r->d_yi32_int8);
     /* BF16 attention workspace */
     if (r->d_q_bf16) cuMemFree(r->d_q_bf16);
     if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
@@ -3559,6 +4712,7 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUstream s = r->stream;
     int dim = r->dit_dim, nh = r->dit_n_heads, hd = r->dit_head_dim, mlp_h = r->dit_mlp_h;
     int n_img = st->n_img, n_txt = st->n_txt, n_total = st->n_total;
+    qimg_fp4_block *fp4 = r->use_w4a4 ? &r->fp4_blocks[L] : NULL;
     CUdeviceptr d_img = st->d_img, d_txt = st->d_txt;
     CUdeviceptr d_q = st->d_q, d_k = st->d_k, d_v = st->d_v;
     CUdeviceptr d_attn_out = st->d_attn_out;
@@ -3595,7 +4749,13 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUdeviceptr d_img_q = d_q + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_img_k = d_k + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_img_v = d_v + (size_t)n_txt * dim * sizeof(float);
-    if (op_gemm_qkv_fused(r, d_img_q, d_img_k, d_img_v,
+    if (fp4) {
+        /* W4A4: the FP8 qkv .weight is not loaded (NULL) — must NOT enter the
+         * fused FP8 path (it would read NULL weights). Go straight to op_gemm_fp4. */
+        op_gemm_fp4(r, d_img_q, &fp4->lin[FP4_TO_Q], d_scratch1, blk->attn_q_b, dim, dim, n_img);
+        op_gemm_fp4(r, d_img_k, &fp4->lin[FP4_TO_K], d_scratch1, blk->attn_k_b, dim, dim, n_img);
+        op_gemm_fp4(r, d_img_v, &fp4->lin[FP4_TO_V], d_scratch1, blk->attn_v_b, dim, dim, n_img);
+    } else if (op_gemm_qkv_fused(r, d_img_q, d_img_k, d_img_v,
                           blk->attn_q_w, blk->attn_k_w, blk->attn_v_w, d_scratch1,
                           blk->attn_q_b, blk->attn_k_b, blk->attn_v_b,
                           dim, dim, n_img) != 0) {
@@ -3608,7 +4768,11 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUdeviceptr d_txt_q = d_q;
     CUdeviceptr d_txt_k = d_k;
     CUdeviceptr d_txt_v = d_v;
-    if (op_gemm_qkv_fused(r, d_txt_q, d_txt_k, d_txt_v,
+    if (fp4) {
+        op_gemm_fp4(r, d_txt_q, &fp4->lin[FP4_ADD_Q], d_scratch2, blk->attn_add_q_b, dim, dim, n_txt);
+        op_gemm_fp4(r, d_txt_k, &fp4->lin[FP4_ADD_K], d_scratch2, blk->attn_add_k_b, dim, dim, n_txt);
+        op_gemm_fp4(r, d_txt_v, &fp4->lin[FP4_ADD_V], d_scratch2, blk->attn_add_v_b, dim, dim, n_txt);
+    } else if (op_gemm_qkv_fused(r, d_txt_q, d_txt_k, d_txt_v,
                           blk->attn_add_q_w, blk->attn_add_k_w, blk->attn_add_v_w, d_scratch2,
                           blk->attn_add_q_b, blk->attn_add_k_b, blk->attn_add_v_b,
                           dim, dim, n_txt) != 0) {
@@ -3652,8 +4816,13 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     /* Output projections */
     CUdeviceptr d_img_attn = d_attn_out + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_txt_attn = d_attn_out;
+    if (fp4) {
+        op_gemm_fp4(r, d_scratch1, &fp4->lin[FP4_TO_OUT], d_img_attn, blk->attn_out_b, dim, dim, n_img);
+        op_gemm_fp4(r, d_scratch2, &fp4->lin[FP4_ADD_OUT], d_txt_attn, blk->attn_add_out_b, dim, dim, n_txt);
+    } else {
     op_gemm(r, d_scratch1, blk->attn_out_w, d_img_attn, blk->attn_out_b, dim, dim, n_img);
     op_gemm(r, d_scratch2, blk->attn_add_out_w, d_txt_attn, blk->attn_add_out_b, dim, dim, n_txt);
+    }
 
     /* Gated residual */
     op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
@@ -3665,7 +4834,16 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
      * external buffer and skip the MLP + gated_add — the caller will do a
      * CFG-batched MLP across cond+uncond before running its own gated_add. */
     if (img_mlp_in_external) {
+        /* CFG path (fp4 and non-fp4 alike): write adaLN2 to the external buffer
+         * and defer the (batched) img MLP + gated_add to the caller. Running it
+         * locally would overflow the txt-sized d_scratch3 with n_img*mlp_h. */
         op_adaln(r, img_mlp_in_external, d_img, img_sh2, img_sc2, n_img, dim);
+    } else if (fp4) {
+        op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
+        op_gemm_fp4(r, d_scratch3, &fp4->lin[FP4_IMG_FC1], d_scratch1, blk->img_mlp_fc1_b, mlp_h, dim, n_img);
+        op_gelu(r, d_scratch3, n_img * mlp_h);
+        op_gemm_fp4(r, d_scratch1, &fp4->lin[FP4_IMG_FC2], d_scratch3, blk->img_mlp_fc2_b, dim, mlp_h, n_img);
+        op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
     } else {
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
         /* Try fused FP8 MLP (BF16 hidden, no F32 intermediate). adaLN output is in
@@ -3692,6 +4870,13 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     /* Text MLP — try fused FP8 first (BF16 hidden, no F32 intermediate),
      * fall back to op_gemm_gelu+op_gemm if not available. */
     op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
+    if (fp4) {
+        op_gemm_fp4(r, d_scratch3, &fp4->lin[FP4_TXT_FC1], d_scratch2, blk->txt_mlp_fc1_b, mlp_h, dim, n_txt);
+        op_gelu(r, d_scratch3, n_txt * mlp_h);
+        op_gemm_fp4(r, d_scratch2, &fp4->lin[FP4_TXT_FC2], d_scratch3, blk->txt_mlp_fc2_b, dim, mlp_h, n_txt);
+        op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
+        goto txt_mlp_done;
+    }
     if (op_mlp_fp8(r, d_scratch3, d_scratch2,
                    blk->txt_mlp_fc1_w, blk->txt_mlp_fc1_b,
                    blk->txt_mlp_fc2_w, blk->txt_mlp_fc2_b,
@@ -3936,15 +5121,16 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
      *  - slot_ready[i] : fires when copy_stream finished filling slot i
      *  - slot_free[i]  : fires when r->stream finished reading slot i
      */
-    /* Double-buffered on-demand block load is OFF by default — measured
-     * identical to the single-slot path (7.19 s/step at 512x512 with
-     * max_preload=12 → 48 on-demand blocks, pipeline on vs off differs
-     * by 10 ms). The copy engine on sm_89+ GPUs already runs concurrent
-     * with SM compute even when both are queued on one stream, so manual
-     * double-buffering adds event overhead without unlocking new parallelism.
-     * Kept behind QIMG_PIPELINE=1 for future experimentation. */
+    /* Double-buffered on-demand block load is ON by default (opt out with
+     * QIMG_PIPELINE=0). An earlier note claimed "no benefit" — that was the
+     * FP8 era (7.19 s/step) where compute dwarfed the H2D, AND the pipeline was
+     * broken for W4A4 (the preload check tested attn_q_w, which is NULL under
+     * W4A4, so every block fell into the pipeline branch with slot_used<0 and
+     * crashed). With FP4 the step is ~1.1 s and the streamed mod-weight H2D is a
+     * large serialized fraction on r->stream; overlapping it onto copy_stream is
+     * byte-identical and a large win (512^2 1.48 -> 1.12, 256^2 0.84 -> 0.50). */
     int use_pipeline = 0;
-    if (getenv("QIMG_PIPELINE") && r->scratch_block_b_ready &&
+    if (qimg_want_pipeline(r) && r->scratch_block_b_ready &&
         r->n_preloaded < r->dit_n_blocks) {
         use_pipeline = 1;
     }
@@ -3970,7 +5156,14 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
 
         qimg_block_gpu blk;
         int slot_used = -1;  /* which double-buffer slot (0/1) this block consumed */
-        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+        /* Use attn_q_b (the to_q F32 bias) to detect a preloaded block — it is
+         * loaded via BLK_F32 in EVERY path (FP8 / W4A4 / mod-FP4), unlike
+         * attn_q_w (NULL under W4A4: weights resident in fp4_blocks[]) or
+         * img_mod_w (NULL under mod-FP4: the mod is resident in fp4_blocks[]).
+         * (The old attn_q_w check made every W4A4 block miss preload: they
+         * re-streamed in the single-slot path, and in the pipeline path fell
+         * through to slot_used=(L-n_preloaded)%2 < 0 → OOB.) */
+        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_b) {
             blk = r->gpu_blocks[L];
         } else if (use_pipeline) {
             int od = L - r->n_preloaded;
@@ -3989,8 +5182,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         /* Modulation + shared block forward */
         cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
-        op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
-        op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        op_mod_matvec(r, d_img_mod, L, 1, blk.img_mod_w, blk.img_mod_b, d_t_silu, dim);
+        op_mod_matvec(r, d_txt_mod, L, 0, blk.txt_mod_w, blk.txt_mod_b, d_t_silu, dim);
         qimg_fwd_state_t _st;
         _st.d_img = d_img; _st.d_txt = d_txt;
         _st.d_q = d_q; _st.d_k = d_k; _st.d_v = d_v; _st.d_attn_out = d_attn_out;
@@ -4117,9 +5310,11 @@ static int qimg_evict_preloaded_until_free(cuda_qimg_runner *r,
      * remain resident; high-index ones use the on-demand scratch slot). */
     while (r->n_preloaded > 0 && free_mem < want) {
         int idx = r->n_preloaded - 1;
-        if (r->gpu_blocks[idx].attn_q_w) {
-            qimg_free_block(&r->gpu_blocks[idx]);
-        }
+        /* qimg_free_block frees whatever the block holds — attn_q_w etc. under
+         * FP8/F16, or img_mod_w/txt_mod_w under W4A4 (where attn_q_w is NULL).
+         * The old `if (attn_q_w)` guard skipped W4A4 blocks, so eviction freed
+         * ZERO bytes and looped to n_preloaded=0 without recovering memory. */
+        qimg_free_block(&r->gpu_blocks[idx]);
         r->n_preloaded--;
         evicted++;
         cuMemGetInfo(&free_mem, &total_mem);
@@ -4211,6 +5406,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     double alloc_t0 = 0;
     if (alloc_timing) { cuStreamSynchronize(s); alloc_t0 = (double)clock()/CLOCKS_PER_SEC; }
     int rc = -1;
+    int qg_capturing = 0;   /* CUDA-graph capture in progress (function-scope so
+                             * 'cleanup' can end a capture aborted by a goto). */
     CUdeviceptr d_img_c = 0, d_img_u = 0;
     CUdeviceptr d_txt_c = 0, d_txt_u = 0;
     CUdeviceptr d_img_in = 0;
@@ -4352,10 +5549,10 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         fprintf(stderr, "  [alloc] %6.3fs (free now: %.2f GB)\n", dt, (float)fm/(1<<30));
     }
 
-    /* ---- 4. Block loop with optional double-buffered on-demand loading.
-     *       OFF by default — see dit_step comment above. ---- */
+    /* ---- 4. Block loop with double-buffered on-demand loading.
+     *       ON by default (QIMG_PIPELINE=0 opts out) — see dit_step comment. ---- */
     int use_pipeline = 0;
-    if (getenv("QIMG_PIPELINE") && r->scratch_block_b_ready &&
+    if (qimg_want_pipeline(r) && r->scratch_block_b_ready &&
         r->n_preloaded < r->dit_n_blocks) {
         use_pipeline = 1;
     }
@@ -4372,6 +5569,38 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
     int vae_blk_timing = (getenv("QIMG_BLK_TIMING") != NULL);
     double blk_t0 = 0;
+
+    /* ---- CUDA graph: replay a previously-captured block loop, or capture it
+     *      now after warmup. The captured region is exactly the for(L) loop
+     *      below; the per-step input uploads + timestep embedding (above) and
+     *      the final proj + DtoH (below) stay outside the graph. Requires the
+     *      default single-stream single-slot config; the multi-stream CFG path,
+     *      double-buffer pipeline, and any per-step host sync (verbose /
+     *      *_timing / profile_block) gate it off. ---- */
+    int qg_active = (r->qg_enabled && !use_pipeline && r->uncond_stream == NULL
+                     && r->verbose < 2 && !alloc_timing && !vae_blk_timing
+                     && !r->profile_block);
+    int qg_shape_ok = (r->qg_ready && r->qg_n_img == n_img
+                       && r->qg_n_txt_c == n_txt_cond && r->qg_n_txt_u == n_txt_uncond);
+    qg_capturing = 0;       /* (declared at function top for the cleanup path) */
+    int qg_did_replay = 0;
+    if (qg_active && qg_shape_ok) {
+        if (cuGraphLaunch(r->qg_exec, s) == CUDA_SUCCESS) qg_did_replay = 1;
+        else r->qg_enabled = 0;   /* replay failed unexpectedly: run the loop instead */
+    }
+    if (qg_active && r->qg_ready && !qg_shape_ok) {
+        /* Shape changed since capture (new resolution / prompt length): drop the
+         * stale graph and recapture for the new shape below. */
+        if (r->qg_exec)  { cuGraphExecDestroy(r->qg_exec); r->qg_exec = NULL; }
+        if (r->qg_graph) { cuGraphDestroy(r->qg_graph);    r->qg_graph = NULL; }
+        r->qg_ready = 0;
+    }
+    for (int attempt = 0; !qg_did_replay && attempt < 2; attempt++) {
+      qg_capturing = 0;
+      if (attempt == 0 && qg_active && r->qg_warm >= 2 && !r->qg_ready) {
+          if (cuStreamBeginCapture_v2(s, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) == CUDA_SUCCESS)
+              qg_capturing = 1;
+      }
     for (int L = 0; L < r->dit_n_blocks; L++) {
         if (vae_blk_timing) { cuStreamSynchronize(s); blk_t0 = (double)clock()/CLOCKS_PER_SEC; }
         if (r->verbose && (L % 10 == 0 || L == r->dit_n_blocks - 1))
@@ -4379,7 +5608,9 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
         qimg_block_gpu blk;
         int slot_used = -1;
-        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+        /* attn_q_b (to_q F32 bias) is loaded in every path; attn_q_w is NULL under
+         * W4A4 and img_mod_w is NULL under mod-FP4. See cuda_qimg_dit_step. */
+        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_b) {
             blk = r->gpu_blocks[L];
         } else if (use_pipeline) {
             int od = L - r->n_preloaded;
@@ -4396,8 +5627,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         /* Modulation (shared between cond/uncond) — always on r->stream */
         cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
-        op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
-        op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        op_mod_matvec(r, d_img_mod, L, 1, blk.img_mod_w, blk.img_mod_b, d_t_silu, dim);
+        op_mod_matvec(r, d_txt_mod, L, 0, blk.txt_mod_w, blk.txt_mod_b, d_t_silu, dim);
 
         /* --- Cond pass (on r->stream). Skips img MLP; adaLN2 output goes
          * into the first half of d_img_mlp_in for the batched MLP below. --- */
@@ -4441,10 +5672,20 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         /* --- CFG-batched img MLP. W is loaded once for both cond and uncond. --- */
         {
             int two_n_img = 2 * n_img;
-            op_gemm_gelu(r, d_img_mlp_h, blk.img_mlp_fc1_w, d_img_mlp_in, blk.img_mlp_fc1_b,
-                         mlp_h, dim, two_n_img);
-            op_gemm(r, d_img_mlp_out, blk.img_mlp_fc2_w, d_img_mlp_h, blk.img_mlp_fc2_b,
-                    dim, mlp_h, two_n_img);
+            if (r->use_w4a4) {
+                /* W4A4: native FP4 GEMM for the batched (2*n_img) MLP. */
+                qimg_fp4_block *fp4b = &r->fp4_blocks[L];
+                op_gemm_fp4(r, d_img_mlp_h, &fp4b->lin[FP4_IMG_FC1], d_img_mlp_in,
+                            blk.img_mlp_fc1_b, mlp_h, dim, two_n_img);
+                op_gelu(r, d_img_mlp_h, two_n_img * mlp_h);
+                op_gemm_fp4(r, d_img_mlp_out, &fp4b->lin[FP4_IMG_FC2], d_img_mlp_h,
+                            blk.img_mlp_fc2_b, dim, mlp_h, two_n_img);
+            } else {
+                op_gemm_gelu(r, d_img_mlp_h, blk.img_mlp_fc1_w, d_img_mlp_in, blk.img_mlp_fc1_b,
+                             mlp_h, dim, two_n_img);
+                op_gemm(r, d_img_mlp_out, blk.img_mlp_fc2_w, d_img_mlp_h, blk.img_mlp_fc2_b,
+                        dim, mlp_h, two_n_img);
+            }
             CUdeviceptr img_g2 = d_img_mod + (size_t)5 * dim * sizeof(float);
             op_gated_add(r, d_img_c, d_img_mlp_out_c, img_g2, n_img, dim);
             op_gated_add(r, d_img_u, d_img_mlp_out_u, img_g2, n_img, dim);
@@ -4471,6 +5712,34 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             fprintf(stderr, "  [blk %2d] %.3fs%s\n", L, dt,
                     L < r->n_preloaded ? "" : " (on-demand)");
         }
+    }
+      if (!qg_capturing) {
+          if (attempt == 0 && qg_active) r->qg_warm++;
+          break;   /* normal run: the loop executed once */
+      }
+      /* End the capture and instantiate. On success the loop's kernels were
+       * only recorded (not executed), so launch the graph once for this step.
+       * On failure, discard, disable graphs, and let attempt=1 re-run the loop
+       * for real (capture mode produced no GPU side effects). */
+      {
+          CUgraph qg_g = NULL;
+          CUresult qg_ec = cuStreamEndCapture(s, &qg_g);
+          qg_capturing = 0;
+          if (qg_ec == CUDA_SUCCESS && qg_g &&
+              cuGraphInstantiateWithFlags(&r->qg_exec, qg_g, 0) == CUDA_SUCCESS) {
+              r->qg_graph = qg_g;
+              r->qg_ready = 1;
+              r->qg_n_img = n_img; r->qg_n_txt_c = n_txt_cond; r->qg_n_txt_u = n_txt_uncond;
+              QIMG_CFG_CU_OR_CLEANUP(cuGraphLaunch(r->qg_exec, s), "cuda graph first launch");
+              if (getenv("QIMG_CUDA_GRAPH_VERBOSE"))
+                  fprintf(stderr, "cuda_qimg: DiT block loop captured into CUDA graph\n");
+              break;
+          }
+          if (qg_g) cuGraphDestroy(qg_g);
+          r->qg_enabled = 0;
+          fprintf(stderr, "cuda_qimg: CUDA graph capture failed (end=%d) — disabled, re-running step\n",
+                  (int)qg_ec);
+      }
     }
     if (r->verbose) fprintf(stderr, "\n");
 
@@ -4503,6 +5772,15 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
     /* Cleanup */
 cleanup:
+    if (qg_capturing) {
+        /* A fatal error (e.g. block slot OOM) aborted the loop mid-capture.
+         * End the capture so the stream isn't left in a capturing state. */
+        CUgraph qg_abort = NULL;
+        cuStreamEndCapture(s, &qg_abort);
+        if (qg_abort) cuGraphDestroy(qg_abort);
+        qg_capturing = 0;
+        r->qg_enabled = 0;
+    }
     if (rc == 0 && r->profile_block && r->prof_block_count > 0) {
         double n = (double)r->prof_block_count;
         double tot = r->prof_qkv_ms + r->prof_qknorm_ms + r->prof_attn_ms
