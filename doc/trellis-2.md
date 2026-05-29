@@ -1077,7 +1077,7 @@ C-internally-consistent order → **99.7% coverage**; the swapped `(col3,col2,co
   `t2_pbr_sample_vertices` diagnostic prints this live (`T2 PBR: … covered N (X%)`; `T2_PBR_QUIET=1`
   silences, `T2_PBR_NO_SNAP=1` disables the nearest-voxel fallback).
 
-### Stage-2 FULL-sampler parity + a `guidance_rescale` bug (2026-05-30)
+### Stage-2/3 FULL-sampler parity + a Stage-2 `guidance_rescale` bug (2026-05-30)
 
 The Stage-2 (shape SLat) DiT single step was already verified (`verify_stage2` vs
 `06b_slat_dit_step_velocity`: **corr 0.99995**). New `verify_stage2_full` closes the loop on
@@ -1107,6 +1107,18 @@ steps integrate the per-step f16/TF32-vs-bf16 difference. A Stage-2 "bf16-block"
 rescale_t=3.0, strength=7.5, rescale=0.5, interval=[0.6,1.0], σ_min=1e-5) now match pipeline.json.
 Stage 3 (`tex_slat_sampler`) has `guidance_strength=1.0` → CFG fully disabled, so its
 `guidance_interval=[0.6,0.9]`/`guidance_rescale=0.0` are moot and the harness is already correct there.
+
+**Stage-3 full sampler is essentially exact — and it explains Stage-2's residual.** `verify_stage3_full`
+feeds PyTorch's exact Stage-3 inputs (noise `09_tex_slat_noise_feats`, re-normalized shape concat_cond
+`10_tex_concat_cond_feats`, coords `10b_tex_dit_step_coords`, image cond) through the 12-step loop —
+each step's DiT input is the `[N,64]` concat of the current state with concat_cond — and compares to
+`11_tex_slat_raw_feats`: **cosine 0.999980, relL2 6.4e-3.** Stage 3 runs with `guidance_strength=1.0`
+(CFG fully disabled), so it integrates only the *raw* per-step f16-vs-bf16 difference → near-perfect.
+Stage 2's larger 0.015 residual is therefore explained: its `guidance_strength=7.5` **amplifies** that
+same per-step difference ~7.5× before it compounds over 12 Euler steps. So neither sampler has a logic
+error — Stage-2's gap is CFG-amplified precision (a bf16-block Stage-2 mode would close it), and the
+no-CFG Stage-3 path is verified bit-close. Summary: single-step S2 0.99995 / S3 ~1.0; full-sampler
+**S2 0.985, S3 0.99998.**
 
 **Full bf16-block port — Stage-1 latent 0.9895 → 0.99739 (2026-05-29).** The gap is NOT a bug. The
 FlowEuler sampler and every config value match `model_root/pipeline.json` exactly
