@@ -132,6 +132,7 @@ typedef struct {
     dit_block_gpu *blocks;
     CUdeviceptr rope_cos, rope_sin;
     int n_rope_freqs, rope_axis_dim;
+    int use_f16;          /* 1 = fp16 MMA path, 0 = F32 GEMM (default, matches bf16) */
 } dit_model_gpu;
 
 typedef struct {
@@ -161,6 +162,23 @@ typedef struct {
     int use_f16;
     int loaded;
 } t2_scvae_dec_gpu;
+
+/* Per-C2S-stage subdivision recorded during the SHAPE decode and replayed by the
+ * TEXTURE decode. The texture decoder checkpoint has no `to_subdiv` head, so the
+ * PyTorch image-to-3D pipeline feeds it the shape decoder's per-level subdivision
+ * (decode_tex_slat(..., guide_subs=subs)). We reproduce that by recording the
+ * shape side's (parent idx, child slot, child coords) at each stage and replaying
+ * it on the texture side instead of the dense x8 fallback (which explodes to
+ * ~17M voxels and OOMs the card). Both decoders are driven from the same res-32
+ * sparse coords in the same order, so the recorded indices stay valid. */
+typedef struct {
+    int      valid;
+    int      n_parent;   /* parent voxel count this subdivision was computed from */
+    int      n_new;      /* child voxel count kept */
+    int32_t *idx;        /* [n_new] parent index into the stage's coord array */
+    int32_t *subidx;     /* [n_new] child slot 0..7 */
+    int32_t *coords;     /* [n_new*4] child coords (b,z,y,x) */
+} t2_subdiv_stage;
 
 /* ======================================================================== */
 /* Runner struct                                                            */
@@ -223,6 +241,10 @@ struct cuda_trellis2_runner {
     t2_scvae_dec_gpu shape_dec;
     t2_scvae_dec_gpu tex_dec;
 
+    /* Subdivision plan recorded by the shape decoder, replayed by the texture
+     * decoder (which has no to_subdiv head). Indexed by C2S stage (0..3). */
+    t2_subdiv_stage subdiv_plan[8];
+
     /* Cross-attention KV cache (precomputed per-block, reused across timesteps).
      * Slot 0 is the active nonzero condition, slot 1 is the all-zero CFG condition. */
     CUdeviceptr ca_kv_cache_K[2][DIT_DEPTH];
@@ -255,6 +277,22 @@ static void ensure_scratch(cuda_trellis2_runner *r, int idx, size_t bytes) {
         return;
     }
     r->scratch_size[idx] = bytes;
+}
+
+/* Free any recorded shape-decoder subdivision plan (call before a new shape
+ * decode and at runner teardown). Safe to call repeatedly. */
+static void t2_subdiv_plan_free(cuda_trellis2_runner *r) {
+    for (int i = 0; i < 8; i++) {
+        free(r->subdiv_plan[i].idx);
+        free(r->subdiv_plan[i].subidx);
+        free(r->subdiv_plan[i].coords);
+        r->subdiv_plan[i].idx = NULL;
+        r->subdiv_plan[i].subidx = NULL;
+        r->subdiv_plan[i].coords = NULL;
+        r->subdiv_plan[i].valid = 0;
+        r->subdiv_plan[i].n_parent = 0;
+        r->subdiv_plan[i].n_new = 0;
+    }
 }
 
 /* ======================================================================== */
@@ -621,6 +659,10 @@ void cuda_trellis2_set_max_gpu_layers(cuda_trellis2_runner *r, int n) {
         fprintf(stderr, "T2: layer streaming enabled: max %d layers on GPU\n", n);
 }
 
+void cuda_trellis2_free_buffer(void *p) {
+    free(p);
+}
+
 void cuda_trellis2_free(cuda_trellis2_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->context);
@@ -673,7 +715,10 @@ void cuda_trellis2_free(cuda_trellis2_runner *r) {
 
     scvae_decoder_free_gpu(&r->shape_dec);
     scvae_decoder_free_gpu(&r->tex_dec);
+    t2_subdiv_plan_free(r);
 
+    CU_FREE(r->ops.bf16_w);
+    CU_FREE(r->ops.bf16_x);
     if (r->ops.cublas) cublasewDestroy(r->ops.cublas);
     cuModuleUnload(r->module);
     cuStreamDestroy(r->stream);
@@ -685,13 +730,35 @@ void cuda_trellis2_free(cuda_trellis2_runner *r) {
 /* Weight loading                                                           */
 /* ======================================================================== */
 
+/* DiT precision policy (Stage 1/2/3). PyTorch runs the DiT blocks in bf16,
+ * whose exponent range equals f32. Our fp16 MMA path (max ~65504) can clip hot
+ * intermediates. Measured single-step vs PyTorch (t=0.5) on RTX 5060 Ti:
+ *   Stage 1 (dense 4096 tok): fp16 corr 0.976 / latent cosine 0.727  -> NEEDS F32
+ *                             F32  corr 0.9998 / latent cosine 0.989
+ *   Stage 2 (sparse 3548 tok): fp16 corr 0.99995 == F32 0.99995      -> fp16 ok
+ *   Stage 3 (sparse 3548 tok): fp16 corr 0.99997 == F32 0.99997      -> fp16 ok
+ * So Stage 1 defaults to F32; sparse Stage 2/3 stay on fp16 (the slow stages,
+ * already bit-faithful). `default_f16` is the per-stage default; env overrides:
+ * T2_DIT_F16=1 forces fp16 everywhere, T2_DIT_F32=1 forces F32 everywhere.
+ * Pre-Volta (no F16 MMA) always uses F32. */
+static int t2_dit_use_f16(cuda_trellis2_runner *r, int default_f16) {
+    if (r->ops.sm_version < 70) return 0;
+    const char *f16 = getenv("T2_DIT_F16");
+    if (f16 && atoi(f16)) return 1;
+    const char *f32 = getenv("T2_DIT_F32");
+    if (f32 && atoi(f32)) return 0;
+    return default_f16;
+}
+
 static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     fprintf(stderr, "T2: loading DiT from %s (%d tensors)\n", path, st->n_tensors);
 
     int v = r->verbose;
-    int use_f16 = (r->ops.sm_version >= 70);
+    /* Stage 1 defaults to F32 (fp16 clips a hot intermediate: latent cosine
+     * 0.727 vs 0.989). T2_DIT_F16=1 opts back into the faster fp16 path. */
+    int use_f16 = t2_dit_use_f16(r, 0);
 
     /* Timestep MLP and modulation: always F32 (n_tok=1, modulation reads directly) */
     r->dit_t_fc1_w = t2_upload_f32(st, "t_embedder.mlp.0.weight", v);
@@ -992,7 +1059,9 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
     if (!st) return -1;
     fprintf(stderr, "T2: loading %s from %s (%d tensors)\n", label, path, st->n_tensors);
     int v = r->verbose;
-    int use_f16 = (r->ops.sm_version >= 70);
+    /* Stage 2/3 (sparse) default to fp16: measured bit-faithful vs PyTorch
+     * (corr 0.9999 == F32) and these are the slow stages. T2_DIT_F32=1 forces F32. */
+    int use_f16 = t2_dit_use_f16(r, 1);
 
     m->n_blocks = DIT_DEPTH;
     m->model_channels = DIT_DIM;
@@ -1001,6 +1070,7 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
     m->ffn_hidden = DIT_FFN;
     m->cond_dim = DIT_COND_DIM;
     m->blocks = blocks_arr;
+    m->use_f16 = use_f16;
 
     /* Detect in_channels and out_channels from weight shapes */
     {
@@ -1285,6 +1355,49 @@ void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r) {
     if (r) scvae_decoder_free_gpu(&r->tex_dec);
 }
 
+/* Free the Stage 1/2/3 DiT GPU weights (and the shared cross-attn KV cache) once
+ * all three latents have been produced. The SC-VAE decoders need the VRAM: Stage 1
+ * alone is F32 (~5.3 GB) and all three resident leave ~0 MB free, which OOMs the
+ * shape decode at its finest level (~1.47M voxels). PyTorch frees these via its
+ * low_vram CPU offload; here the decoder inputs (coords, shape slat, tex slat) are
+ * already host-side, so the GPU weights are dead. Safe to call once before
+ * decoding; idempotent (CU_FREE / dit_*_free_gpu NULL every pointer). */
+void cuda_trellis2_unload_dit_stages(cuda_trellis2_runner *r) {
+    if (!r) return;
+    cuCtxSetCurrent(r->context);
+
+    /* Stage 1 DiT */
+    CU_FREE(r->dit_t_fc1_w); CU_FREE(r->dit_t_fc1_b);
+    CU_FREE(r->dit_t_fc2_w); CU_FREE(r->dit_t_fc2_b);
+    CU_FREE(r->dit_mod_w); CU_FREE(r->dit_mod_b);
+    CU_FREE(r->dit_x_emb_w); CU_FREE(r->dit_x_emb_b);
+    CU_FREE(r->dit_out_w); CU_FREE(r->dit_out_b);
+    for (int i = 0; i < DIT_DEPTH; i++)
+        dit_block_free_gpu(&r->dit_blocks[i]);
+    CU_FREE(r->dit_rope_cos);
+    CU_FREE(r->dit_rope_sin);
+
+    /* Stage 2 + Stage 3 DiT */
+    dit_model_free_gpu(&r->stage2);
+    dit_model_free_gpu(&r->stage3);
+    r->stage2_loaded = 0;
+    r->stage3_loaded = 0;
+
+    /* Cross-attn KV cache (shared across DiT stages; dead once they are). */
+    for (int i = 0; i < DIT_DEPTH; i++) {
+        for (int slot = 0; slot < 2; slot++) {
+            CU_FREE(r->ca_kv_cache_K[slot][i]);
+            CU_FREE(r->ca_kv_cache_V[slot][i]);
+        }
+    }
+    cuda_trellis2_invalidate_kv_cache(r);
+
+    size_t free_mem = 0, total_mem = 0;
+    cuMemGetInfo(&free_mem, &total_mem);
+    fprintf(stderr, "T2: unloaded DiT stages 1/2/3 + KV cache (GPU free=%.0f MB / %.0f MB)\n",
+            free_mem / 1048576.0, total_mem / 1048576.0);
+}
+
 int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
                                 const char *dinov3_path,
                                 const char *stage1_path,
@@ -1492,9 +1605,21 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     CUdeviceptr d_ca_V   = d_ca_K + ca_kv_sz;
     CUdeviceptr d_split_V = d_ca_V + ca_kv_sz;
 
-    /* 1. Input embedding: [N, DIT_IN_CH] -> [N, D] */
-    t2_op_gemm(ops, stream, d_hidden, x_emb_w, d_x, x_emb_b,
-               D, in_ch, N);
+    /* bf16-block port (ops->bf16_round, set by T2_DIT_BF16): round a buffer to
+     * bf16 precision after each block op so the DiT runs PyTorch's bf16 trajectory.
+     * No-op when bf16_round==0 (TF32/F16/F32 paths unaffected). */
+    #define RB(buf, cnt) do { if (ops->bf16_round) t2_op_round_bf16(ops, stream, (buf), (long)(cnt)); } while (0)
+
+    /* 1. Input embedding: [N, DIT_IN_CH] -> [N, D].
+     * PyTorch keeps input_layer in f32, then casts h to bf16 before the blocks.
+     * Force f32 here (suppress bf16-GEMM) and round h to bf16 afterwards. */
+    {
+        int _sb = ops->use_bf16_gemm; ops->use_bf16_gemm = 0;
+        t2_op_gemm(ops, stream, d_hidden, x_emb_w, d_x, x_emb_b,
+                   D, in_ch, N);
+        ops->use_bf16_gemm = _sb;
+    }
+    RB(d_hidden, (long)N * D);   /* manual_cast(h, bf16) */
 
     if (r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_hidden, 16); fprintf(stderr, "  input_emb: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
 
@@ -1520,6 +1645,7 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     t2_op_gemm_f32(ops, stream, d_temb, t_fc2_w, d_normed, t_fc2_b,
                D, D, 1);
     /* Now d_temb = [D] timestep embedding */
+    RB(d_temb, (long)D);   /* manual_cast(t_emb, bf16) */
 
     if (r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_temb, 16); fprintf(stderr, "  t_emb_mlp: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
 
@@ -1561,6 +1687,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
             if (blk->ca_k_norm)
                 t2_op_rms_norm_perhead(ops, stream, r->ca_kv_cache_K[cache_slot][bi], blk->ca_k_norm,
                                       ctx_len, H, HD, D);
+            RB(r->ca_kv_cache_K[cache_slot][bi], (long)ctx_len * D);
+            RB(r->ca_kv_cache_V[cache_slot][bi], (long)ctx_len * D);
             if (blk_streamed) { cuStreamSynchronize(stream); dit_block_free_gpu(blk); }
         }
         r->ca_kv_cache_n_blocks[cache_slot] = n_blocks;
@@ -1584,10 +1712,16 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
             streamed = 1;
         }
 
+        /* (Rounding this block's non-matmul weights — norm gammas, biases, mod_bias
+         * — to bf16 was tried and is BIT-IDENTICAL: the per-op output rounding (RB)
+         * already absorbs sub-bf16 weight differences, so it is omitted. Matmul
+         * weights are bf16'd per-call by the bf16-GEMM path.) */
+
         /* 3a. Modulation: SiLU(t_emb) @ mod_w + mod_b + block_bias -> [6*D] */
         t2_op_modulation(ops, stream, d_mod, d_temb,
                          mod_w, mod_b, blk->mod_bias,
                          D, 6 * D);
+        RB(d_mod, (long)6 * D);
 
         if (bi == 0 && r->verbose >= 2) { cuStreamSynchronize(stream); float _d[8]; cuMemcpyDtoH(_d, d_mod, 32); fprintf(stderr, "  mod_block0: [:8]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3],_d[4],_d[5],_d[6],_d[7]); }
         if (bi == 0 && r->verbose >= 2) { float _s[4]; cuMemcpyDtoH(_s, d_mod+(size_t)D*sizeof(float), 16); fprintf(stderr, "  scale_sa: [:4]=%.6f %.6f %.6f %.6f\n", _s[0],_s[1],_s[2],_s[3]); }
@@ -1604,12 +1738,14 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         /* adaLN: LN(hidden) * (1+scale) + shift */
         t2_op_adaln(ops, stream, d_normed, d_hidden,
                     d_shift_sa, d_scale_sa, N, D);
+        RB(d_normed, (long)N * D);
 
         if (bi == 0 && r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_normed, 16); fprintf(stderr, "  adaln_out: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
 
         /* QKV projection: [N, D] -> [N, 3*D] */
         t2_op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, blk->sa_qkv_b,
                    3 * D, D, N);
+        RB(d_qkv, (long)N * 3 * D);
 
         /* Split QKV -> Q, K, V (standard chunk, NOT interleaved)
          * IMPORTANT: Q must NOT alias d_attn since the attention kernel reads Q
@@ -1624,10 +1760,14 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         if (bi==0 && r->verbose>=2) dbg4("V_raw", d_V, stream);
 
         /* QK RMSNorm (per-head, gamma [n_heads * head_dim]) */
-        if (blk->sa_q_norm)
+        if (blk->sa_q_norm) {
             t2_op_rms_norm_perhead(ops, stream, d_Q, blk->sa_q_norm, N, H, HD, D);
-        if (blk->sa_k_norm)
+            RB(d_Q, (long)N * D);
+        }
+        if (blk->sa_k_norm) {
             t2_op_rms_norm_perhead(ops, stream, d_K, blk->sa_k_norm, N, H, HD, D);
+            RB(d_K, (long)N * D);
+        }
 
         if (bi==0 && r->verbose>=2) dbg4("Q_rmsnorm", d_Q, stream);
         if (bi==0 && r->verbose>=2) dbg4("K_rmsnorm", d_K, stream);
@@ -1637,6 +1777,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                       N, D, H, HD, n_freqs, axis_dim);
         t2_op_rope_3d(ops, stream, d_K, rope_cos, rope_sin,
                       N, D, H, HD, n_freqs, axis_dim);
+        RB(d_Q, (long)N * D);
+        RB(d_K, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("Q_rope", d_Q, stream);
         if (bi==0 && r->verbose>=2) dbg4("K_rope", d_K, stream);
@@ -1662,16 +1804,19 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
 
         /* Self-attention — output goes to d_attn (d_Q is separate buffer) */
         t2_op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N, D, H, HD);
+        RB(d_attn, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("attn_out", d_attn, stream);
 
         /* Output projection + gated residual */
         t2_op_gemm(ops, stream, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b,
                    D, D, N);
+        RB(d_normed, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("sa_proj", d_normed, stream);
 
         t2_op_gated_add(ops, stream, d_hidden, d_normed, d_gate_sa, N * D, D);
+        RB(d_hidden, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("h_after_sa", d_hidden, stream);
 
@@ -1680,12 +1825,14 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         /* LayerNorm (affine) */
         t2_op_layernorm(ops, stream, d_normed, d_hidden,
                         blk->norm2_w, blk->norm2_b, N, D);
+        RB(d_normed, (long)N * D);
 
         /* Q from tokens */
         t2_op_gemm(ops, stream, d_cross_Q, blk->ca_q_w, d_normed, blk->ca_q_b,
                    D, D, N);
         if (blk->ca_q_norm)
             t2_op_rms_norm_perhead(ops, stream, d_cross_Q, blk->ca_q_norm, N, H, HD, D);
+        RB(d_cross_Q, (long)N * D);
 
         /* KV from conditioning (cached — precomputed above) */
         CUdeviceptr d_ca_K_cached = r->ca_kv_cache_K[cache_slot][bi];
@@ -1694,34 +1841,42 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         /* Cross-attention (using cached KV) */
         t2_op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K_cached, d_ca_V_cached,
                          N, ctx_len, D, H, HD);
+        RB(d_attn, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("cross_attn_out", d_attn, stream);
 
         /* Cross-attn output + residual (no gate) */
         t2_op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b,
                    D, D, N);
+        RB(d_normed, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("ca_proj", d_normed, stream);
 
         t2_op_add(ops, stream, d_hidden, d_normed, N * D);
+        RB(d_hidden, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("h_after_ca", d_hidden, stream);
 
         /* === MLP === */
         t2_op_adaln(ops, stream, d_normed, d_hidden,
                     d_shift_mlp, d_scale_mlp, N, D);
+        RB(d_normed, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("mlp_adaln", d_normed, stream);
 
         t2_op_gemm(ops, stream, d_mlp, blk->mlp_fc1_w, d_normed, blk->mlp_fc1_b,
                    FFN, D, N);
+        RB(d_mlp, (long)N * FFN);
         t2_op_gelu(ops, stream, d_mlp, N * FFN);
+        RB(d_mlp, (long)N * FFN);
         t2_op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b,
                    D, FFN, N);
+        RB(d_normed, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("mlp_out", d_normed, stream);
 
         t2_op_gated_add(ops, stream, d_hidden, d_normed, d_gate_mlp, N * D, D);
+        RB(d_hidden, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("h_after_mlp", d_hidden, stream);
 
@@ -1746,7 +1901,10 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         }
     }
 
-    /* 4. Final LayerNorm (no affine) + output projection */
+    /* 4. Final LayerNorm (no affine) + output projection.
+     * PyTorch casts h back to f32 here, then runs out_layer in f32 (the final LN
+     * reads the bf16 h but computes/outputs f32; out_layer is f32). So suppress
+     * bf16-GEMM for the out projection and do NOT round its output. */
     {
         float eps = 1e-6f;
         int D_arg = D;
@@ -1754,8 +1912,13 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         cuLaunchKernel(ops->layernorm_noaffine, (unsigned)N, 1, 1,
                        256, 1, 1, 512 * sizeof(float), stream, ln_args, NULL);
     }
-    t2_op_gemm(ops, stream, d_output, out_w, d_hidden, out_b,
-               out_ch, D, N);
+    {
+        int _sb = ops->use_bf16_gemm; ops->use_bf16_gemm = 0;
+        t2_op_gemm(ops, stream, d_output, out_w, d_hidden, out_b,
+                   out_ch, D, N);
+        ops->use_bf16_gemm = _sb;
+    }
+    #undef RB
 }
 
 /* Stage 1 wrapper — uses F16 MMA if weights are F16, else F32 */
@@ -1766,12 +1929,50 @@ static void run_dit_forward(cuda_trellis2_runner *r,
     /* Save GEMM mode and set appropriate mode for Stage 1 */
     int saved_f32 = r->ops.use_f32_gemm;
     int saved_mma = r->ops.use_mma_gemm;
+    int saved_tf32 = r->ops.use_tf32_gemm;
+    int saved_bf16 = r->ops.use_bf16_gemm;
+    int saved_round = r->ops.bf16_round;
     if (r->dit_use_f16) {
         r->ops.use_f32_gemm = 0;
         r->ops.use_mma_gemm = 1;
     } else {
         r->ops.use_f32_gemm = 1;
         r->ops.use_mma_gemm = 0;
+        /* T2_DIT_BF16=1 (default OFF): full bf16 DiT-block port for matching the
+         * PyTorch reference. PyTorch runs the 30 DiT blocks in bf16 (input_layer/
+         * t_embedder/out_layer stay f32; h is cast to bf16 before the blocks and
+         * back to f32 after). We replicate that trajectory: bf16_round rounds every
+         * block-op OUTPUT to bf16 precision (LN/adaLN/attn/rope/gelu/residuals), and
+         * use_bf16_gemm makes every block matmul a true bf16 matmul (W,X->bf16, f32
+         * accumulate via CUBLAS_COMPUTE_32F).
+         *   RESULT (2026-05-29, 12-step Stage-1 latent cosine vs 03_ss_latent):
+         *     TF32 (default)        0.98954
+         *     bf16-GEMM only        0.98848  (NEGATIVE: matmul inputs only)
+         *     full bf16-block port  0.99739  (this path)  <- 0.990 -> 0.997
+         *   The bf16 block is the lever (the gap was the non-matmul ops, not the
+         *   matmuls). Negative sub-findings while chasing 0.999:
+         *     - rounding non-matmul WEIGHTS (norm gammas/biases/mod_w) to bf16 is
+         *       BIT-IDENTICAL — the per-op output rounding already absorbs it.
+         *     - rounding attention PROBS to bf16 made it WORSE (0.9974->0.9961):
+         *       PyTorch SDPA keeps the attention internals in f32, so our f16-MMA
+         *       probs are already the closer match (see attn_mma_hd128_f32).
+         *   The residual 0.0026 is irreducible: independent bf16 GEMM libraries
+         *   (cuBLAS vs PyTorch/cuDNN) round at different points and accumulate over
+         *   the 12 recursive Euler steps (single forward is already cosine 0.9998).
+         * Default remains TF32 (fast, f32 range, MORE precise than the bf16 ref —
+         * use it for production quality); opt out of TF32 with T2_DIT_NO_TF32=1.
+         * NOTE: bf16 mode mutates nothing persistent but re-casts weights per GEMM
+         * (a resident bf16 weight cache would speed it up; ~parity with TF32 today). */
+        const char *want_bf16 = getenv("T2_DIT_BF16");
+        if (want_bf16 && atoi(want_bf16) && r->ops.cublas &&
+            r->ops.cast_f32_to_bf16 && r->ops.round_bf16) {
+            r->ops.use_bf16_gemm = 1;
+            r->ops.bf16_round = 1;
+            r->ops.use_tf32_gemm = 0;
+        } else {
+            const char *no_tf32 = getenv("T2_DIT_NO_TF32");
+            r->ops.use_tf32_gemm = (r->ops.cublas && !(no_tf32 && atoi(no_tf32))) ? 1 : 0;
+        }
     }
 
     run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
@@ -1786,6 +1987,9 @@ static void run_dit_forward(cuda_trellis2_runner *r,
 
     r->ops.use_f32_gemm = saved_f32;
     r->ops.use_mma_gemm = saved_mma;
+    r->ops.use_tf32_gemm = saved_tf32;
+    r->ops.use_bf16_gemm = saved_bf16;
+    r->ops.bf16_round = saved_round;
 }
 
 /* Stage 2 wrapper — uses F16 MMA GEMM if available (weights stored as F16) */
@@ -1796,15 +2000,20 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
                                      CUdeviceptr d_cond, CUdeviceptr d_output,
                                      int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin,
                                      int model_id, uint64_t cond_hash, int cache_slot) {
-    /* Save GEMM mode and set F16 MMA if available */
+    /* Save GEMM mode and set precision per the model's loaded weight format.
+     * m->use_f16 mirrors the Stage-1 r->dit_use_f16 policy (default F32). */
     int saved_f32 = r->ops.use_f32_gemm;
     int saved_mma = r->ops.use_mma_gemm;
-    if (r->ops.sm_version >= 70) {
+    int saved_tf32 = r->ops.use_tf32_gemm;
+    if (m->use_f16) {
         r->ops.use_f32_gemm = 0;
         r->ops.use_mma_gemm = 1;
     } else {
         r->ops.use_f32_gemm = 1;
         r->ops.use_mma_gemm = 0;
+        /* F32 sparse DiT (only under T2_DIT_F32): TF32 tensor cores, as Stage 1. */
+        const char *no_tf32 = getenv("T2_DIT_NO_TF32");
+        r->ops.use_tf32_gemm = (r->ops.cublas && !(no_tf32 && atoi(no_tf32))) ? 1 : 0;
     }
 
     run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
@@ -1819,6 +2028,7 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
 
     r->ops.use_f32_gemm = saved_f32;
     r->ops.use_mma_gemm = saved_mma;
+    r->ops.use_tf32_gemm = saved_tf32;
 }
 
 /* ======================================================================== */
@@ -1984,6 +2194,15 @@ float *cuda_trellis2_predict(cuda_trellis2_runner *r,
         fprintf(stderr, "T2: predict requires DINOv3, Stage 1 DiT, and decoder weights\n");
         return NULL;
     }
+
+    /* Make predict() safe to call repeatedly on a reused runner (e.g. a
+     * long-lived server that keeps weights resident). The CUDA context is
+     * thread-affine but a threaded server dispatches each request on a
+     * different thread, and the cross-attention KV cache still holds the
+     * PREVIOUS call's conditioning. Re-bind the context to the calling thread
+     * and drop stale KV so the result depends only on (image, seed, steps). */
+    cuCtxSetCurrent(r->context);
+    cuda_trellis2_invalidate_kv_cache(r);
 
     const int N = DIT_N_TOKENS;
     const int C = DIT_IN_CH;
@@ -2841,6 +3060,16 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
         }
     }
 
+    /* The shape decoder has per-stage to_subdiv heads (subdiv_w); the texture
+     * decoder has none. A "recording" (shape) decode stores its per-stage
+     * subdivision; a "replaying" (texture) decode reuses it (PyTorch guide_subs).
+     * Reset any stale plan at the start of a full recording decode. */
+    int dec_is_recording = 0;
+    for (int st = 0; st < 4; st++)
+        if (dec->c2s[st].conv1_w && dec->c2s[st].subdiv_w) dec_is_recording = 1;
+    if (dec_is_recording && start_stage < 0)
+        t2_subdiv_plan_free(r);
+
     /* Run ConvNeXt blocks + C2S for each stage */
     int first_stage = (start_stage >= 0) ? start_stage : 0;
     for (int stage = first_stage; stage < 4; stage++) {
@@ -2932,7 +3161,39 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
 
             int32_t *sub_idx = NULL, *sub_subidx = NULL, *new_coords = NULL;
             int N_new = 0;
-            if (t2_make_subdiv_from_logits_host(sub_logits, cur_coords, N, dense_subdiv,
+
+            /* Texture decode (no subdiv head): replay the shape decoder's recorded
+             * subdivision for this stage instead of densely subdividing x8 (which
+             * explodes to ~17M voxels and OOMs). Both decoders are driven from the
+             * same res-32 coords in the same order, so the parent count must match;
+             * if it does not (e.g. a standalone texture decode with no prior shape
+             * decode), fall through to the dense path. */
+            int replayed = 0;
+            if (dense_subdiv && stage < 8 && r->subdiv_plan[stage].valid &&
+                r->subdiv_plan[stage].n_parent == N) {
+                t2_subdiv_stage *p = &r->subdiv_plan[stage];
+                N_new = p->n_new;
+                sub_idx    = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
+                sub_subidx = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
+                new_coords = (int32_t *)malloc((size_t)N_new * 4 * sizeof(int32_t));
+                if (sub_idx && sub_subidx && new_coords) {
+                    memcpy(sub_idx,    p->idx,    (size_t)N_new * sizeof(int32_t));
+                    memcpy(sub_subidx, p->subidx, (size_t)N_new * sizeof(int32_t));
+                    memcpy(new_coords, p->coords, (size_t)N_new * 4 * sizeof(int32_t));
+                    replayed = 1;
+                    fprintf(stderr, "T2: %s: stage %d replaying shape subdivision "
+                            "(%d -> %d voxels)\n", label, stage, N, N_new);
+                } else {
+                    free(sub_idx); free(sub_subidx); free(new_coords);
+                    sub_idx = sub_subidx = new_coords = NULL; N_new = 0;
+                }
+            } else if (dense_subdiv && stage < 8 && !r->subdiv_plan[stage].valid) {
+                fprintf(stderr, "T2: %s: stage %d has no recorded subdivision; "
+                        "falling back to dense x8 subdivision\n", label, stage);
+            }
+
+            if (!replayed &&
+                t2_make_subdiv_from_logits_host(sub_logits, cur_coords, N, dense_subdiv,
                                                 &sub_idx, &sub_subidx, &new_coords,
                                                 &N_new) != 0) {
                 fprintf(stderr, "T2: %s: c2s produced no voxels at stage %d\n", label, stage);
@@ -2943,6 +3204,26 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 return -1;
             }
             free(sub_logits);
+
+            /* Shape decode: record this stage's subdivision so a subsequent texture
+             * decode can replay it (PyTorch decode_tex_slat(..., guide_subs=subs)). */
+            if (!dense_subdiv && stage < 8) {
+                t2_subdiv_stage *p = &r->subdiv_plan[stage];
+                free(p->idx); free(p->subidx); free(p->coords);
+                p->idx    = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
+                p->subidx = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
+                p->coords = (int32_t *)malloc((size_t)N_new * 4 * sizeof(int32_t));
+                if (p->idx && p->subidx && p->coords) {
+                    memcpy(p->idx,    sub_idx,    (size_t)N_new * sizeof(int32_t));
+                    memcpy(p->subidx, sub_subidx, (size_t)N_new * sizeof(int32_t));
+                    memcpy(p->coords, new_coords, (size_t)N_new * 4 * sizeof(int32_t));
+                    p->n_parent = N; p->n_new = N_new; p->valid = 1;
+                } else {
+                    free(p->idx); free(p->subidx); free(p->coords);
+                    p->idx = p->subidx = NULL; p->coords = NULL;
+                    p->valid = 0; p->n_parent = 0; p->n_new = 0;
+                }
+            }
 
             CUdeviceptr d_sub_idx = cu_upload_raw(sub_idx, (size_t)N_new * sizeof(int32_t));
             CUdeviceptr d_sub_subidx = cu_upload_raw(sub_subidx, (size_t)N_new * sizeof(int32_t));
@@ -3187,8 +3468,12 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     cuMemAlloc(&d_output, (size_t)N * out_ch * sizeof(float));
     int output_done = 0;
     {
+        /* Default to the grouped F32 output kernel (group=25, the resume-validated
+         * value). The fall-through cuBLAS/plain path below leaves the small [N,out_ch]
+         * output ALL ZERO here (shape/tex decoder), so FDG finds no surface and emits
+         * 0 triangles. Callers can still override the value or set =0 to opt out. */
         const char *group_env = getenv("T2_SCVAE_OUTPUT_GROUP");
-        int group = group_env && group_env[0] ? atoi(group_env) : 0;
+        int group = group_env && group_env[0] ? atoi(group_env) : 25;
         if (group > 0 &&
             t2_op_gemm_f32_group(ops, s, d_output, dec->out_w, d_feats,
                                  dec->out_b, out_ch, C, N, group) == 0) {

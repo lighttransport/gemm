@@ -106,8 +106,23 @@ typedef struct {
     int use_mma_gemm;   /* 1=use MMA tensor core GEMM (sm_70+, F16 weights) */
     int use_cublas_f32; /* 1=route F32 GEMMs through cuBLAS when available */
     int use_cublas_pedantic;
+    int use_tf32_gemm;  /* 1=route F32 GEMMs through TF32 tensor cores (DiT;
+                         * f32 exponent range so no fp16 clipping, ~1e-3 rel err) */
+    int use_bf16_gemm;  /* 1=cast F32 W/X to bf16 and matmul (f32 accumulate) to
+                         * match PyTorch's bf16 DiT reference trajectory (NEGATIVE
+                         * result: GEMM-input casting alone barely moves cosine —
+                         * superseded by bf16_round, default off scaffolding) */
+    int bf16_round;     /* 1=round each DiT-block op output to bf16 precision (kept
+                         * in f32 buffers) so the block runs the bf16 trajectory;
+                         * paired with use_tf32_gemm (TF32 on bf16-valued inputs ==
+                         * a bf16 matmul). Matches PyTorch's bf16 DiT blocks. */
     int use_packed_sparse_conv; /* 1=pack valid rows before sparse conv GEMM */
     cublasew_context *cublas;
+    /* Scratch for the bf16 GEMM path (grown on demand; bf16 = 2 bytes/elem). */
+    CUfunction cast_f32_to_bf16;
+    CUfunction round_bf16;  /* in-place f32 -> bf16-precision -> f32 (bf16_round) */
+    CUdeviceptr bf16_w, bf16_x;
+    size_t bf16_w_cap, bf16_x_cap;  /* capacity in elements */
 } t2_ops;
 
 static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
@@ -153,6 +168,15 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("split_kv_interleaved_f32",  split_kv);
     GET_FN("broadcast_add_f32",       broadcast_add);
     GET_FN("add_bias_f32",            add_bias);
+
+    /* Optional bf16 cast/round kernels (for the bf16 DiT paths). Tolerant lookup:
+     * if absent (e.g. an older cached module) the bf16 paths stay disabled. */
+    if (cuModuleGetFunction(&ops->cast_f32_to_bf16, module, "t2_cast_f32_to_bf16")
+            != CUDA_SUCCESS)
+        ops->cast_f32_to_bf16 = NULL;
+    if (cuModuleGetFunction(&ops->round_bf16, module, "t2_round_f32_bf16")
+            != CUDA_SUCCESS)
+        ops->round_bf16 = NULL;
 
     if (sm_version >= 70) {
         GET_FN("attn_prefill_f32",    attn_prefill);
@@ -209,6 +233,16 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
 /* ======================================================================== */
 /* Launch wrappers                                                          */
 /* ======================================================================== */
+
+/* In-place round a buffer to bf16 precision (kept as f32). No-op if the kernel
+ * is missing or n<=0. Used by the bf16-block DiT path (ops->bf16_round). */
+static inline void t2_op_round_bf16(t2_ops *ops, CUstream s,
+                                    CUdeviceptr x, long n) {
+    if (!ops->round_bf16 || n <= 0) return;
+    void *args[] = {&x, &n};
+    cuLaunchKernel(ops->round_bf16, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
 
 static inline void t2_op_gemm(t2_ops *ops, CUstream s,
                                 CUdeviceptr Y, CUdeviceptr W,
@@ -340,6 +374,56 @@ static inline void t2_op_gemm(t2_ops *ops, CUstream s,
                 void *bargs[] = {&Y, &bias, &n_out, &n_tok};
                 cuLaunchKernel(ops->add_bias,
                                (unsigned)((n_out * n_tok + 255) / 256), 1, 1,
+                               256, 1, 1, 0, s, bargs, NULL);
+            }
+            return;
+        }
+    }
+    if (ops->use_f32_gemm && ops->use_bf16_gemm && ops->cublas && ops->cast_f32_to_bf16) {
+        /* bf16 matmul to match PyTorch's bf16 DiT reference: cast W (f32, == exact
+         * bf16 upcast) and X (f32 activations) to bf16, then bf16-in/f32-accumulate
+         * GEMM. Scratch grown on demand (W re-cast each call — fine for accuracy
+         * testing; a resident bf16 weight cache would remove the W re-cast). */
+        size_t wn = (size_t)n_out * n_in, xn = (size_t)n_tok * n_in;
+        if (ops->bf16_w_cap < wn) {
+            if (ops->bf16_w) cuMemFree(ops->bf16_w);
+            ops->bf16_w_cap = (cuMemAlloc(&ops->bf16_w, wn * 2) == CUDA_SUCCESS) ? wn : 0;
+        }
+        if (ops->bf16_x_cap < xn) {
+            if (ops->bf16_x) cuMemFree(ops->bf16_x);
+            ops->bf16_x_cap = (cuMemAlloc(&ops->bf16_x, xn * 2) == CUDA_SUCCESS) ? xn : 0;
+        }
+        if (ops->bf16_w_cap >= wn && ops->bf16_x_cap >= xn) {
+            long wn_l = (long)wn, xn_l = (long)xn;
+            void *wa[] = {&W, &ops->bf16_w, &wn_l};
+            cuLaunchKernel(ops->cast_f32_to_bf16, (unsigned)((wn + 255) / 256), 1, 1, 256, 1, 1, 0, s, wa, NULL);
+            void *xa[] = {&X, &ops->bf16_x, &xn_l};
+            cuLaunchKernel(ops->cast_f32_to_bf16, (unsigned)((xn + 255) / 256), 1, 1, 256, 1, 1, 0, s, xa, NULL);
+            if (cublasewSetStream(ops->cublas, s) == 0 &&
+                cublasew_gemm_bf16_bf16_f32_rowmajor_nt(ops->cublas, Y, ops->bf16_w, ops->bf16_x,
+                                                        n_tok, n_out, n_in) == 0) {
+                if (bias) {
+                    void *bargs[] = {&Y, &bias, &n_out, &n_tok};
+                    cuLaunchKernel(ops->add_bias,
+                                   (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                                   256, 1, 1, 0, s, bargs, NULL);
+                }
+                return;
+            }
+        }
+    }
+    if (ops->use_f32_gemm && ops->use_tf32_gemm && ops->cublas) {
+        /* DiT default: TF32 tensor-core GEMM. F32 weights/activations in & out,
+         * f32 exponent range (no fp16 clipping of hot intermediates), TF32-reduced
+         * mantissa (~1e-3 rel err — more precise than PyTorch's bf16). Far faster
+         * than the plain tiled f32 kernel on the dense 4096-token Stage-1 grid. */
+        if (cublasewSetStream(ops->cublas, s) == 0 &&
+            cublasew_gemm_f32_tf32_rowmajor_nt(ops->cublas, Y, W, X,
+                                               n_tok, n_out, n_in) == 0) {
+            if (bias) {
+                void *bargs[] = {&Y, &bias, &n_out, &n_tok};
+                cuLaunchKernel(ops->add_bias,
+                               (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
                                256, 1, 1, 0, s, bargs, NULL);
             }
             return;

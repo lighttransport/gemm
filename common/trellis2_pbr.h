@@ -104,18 +104,20 @@ t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
         f.feats[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 
-    /* Strip batch dimension from coords: [N, 4] -> [N, 3].
-     * Reference tex_dec emits cols (batch, X, Y, Z) — verified against
-     * cuda/trellis2/verify-dumps/15_tex_voxels.coords.npy where col1
-     * matches mesh.vertices[0] across all rows. The hash key packs as
-     * (axis0 << 40) | (axis1 << 20) | axis2 and the sampler reads
-     * vertices[0]→x→hash-axis2, vertices[2]→z→hash-axis0; to keep
-     * storage and lookup consistent we put Z at axis0, X at axis2. */
+    /* Strip batch dimension from coords: [N, 4] -> [N, 3], matching the mesh
+     * builder's axis convention so the field and the vertex sampler agree.
+     *
+     * t2_fdg_to_mesh reads coords3 = (col1, col2, col3) and emits
+     *   vertices[0] (world x) from col3,  vertices[2] (world z) from col1.
+     * t2_pbr_sample_vertices maps vertices[0]->ix and vertices[2]->iz, then
+     * looks up hash(iz, iy, ix) = hash(col1, col2, col3). So the field MUST be
+     * stored in (col1, col2, col3) order. The previous (col3, col2, col1) order
+     * swapped x<->z, so lookups only hit on the x==z diagonal (~11% coverage). */
     f.coords = (int32_t *)malloc((size_t)N * 3 * sizeof(int32_t));
     for (int i = 0; i < N; i++) {
-        f.coords[i * 3 + 0] = coords[i * 4 + 3];  /* Z (col3) -> hash axis0 */
-        f.coords[i * 3 + 1] = coords[i * 4 + 2];  /* Y (col2) -> hash axis1 */
-        f.coords[i * 3 + 2] = coords[i * 4 + 1];  /* X (col1) -> hash axis2 */
+        f.coords[i * 3 + 0] = coords[i * 4 + 1];  /* col1 -> hash axis0 (iz) */
+        f.coords[i * 3 + 1] = coords[i * 4 + 2];  /* col2 -> hash axis1 (iy) */
+        f.coords[i * 3 + 2] = coords[i * 4 + 3];  /* col3 -> hash axis2 (ix) */
     }
 
     /* Build hash table */
@@ -148,8 +150,9 @@ static int t2pbr_lookup(const t2_pbr_field *f, int z, int y, int x) {
     }
 }
 
-/* Trilinear interpolation from sparse voxel field */
-static void t2pbr_trilinear(const t2_pbr_field *f, float fz, float fy, float fx,
+/* Trilinear interpolation from sparse voxel field. Returns total corner weight
+ * (0 = no populated voxel in the 2x2x2 neighborhood = a sampling miss). */
+static float t2pbr_trilinear(const t2_pbr_field *f, float fz, float fy, float fx,
                               float out[6]) {
     int iz = (int)floorf(fz), iy = (int)floorf(fy), ix = (int)floorf(fx);
     float dz = fz - iz, dy = fy - iy, dx = fx - ix;
@@ -175,20 +178,68 @@ static void t2pbr_trilinear(const t2_pbr_field *f, float fz, float fy, float fx,
         float inv = 1.0f / total_w;
         for (int c = 0; c < 6; c++) out[c] *= inv;
     }
+    return total_w;
+}
+
+/* Snap to the nearest populated voxel within `max_r` (Chebyshev). Used when
+ * trilinear misses: an FDG dual vertex sits at coord+offset with offset in
+ * [-0.5, 1.5], so floor() can land a voxel off the source, and on the thin
+ * surface shell the 2x2x2 neighborhood is then empty. Returns 1 on hit. */
+static int t2pbr_nearest(const t2_pbr_field *f, float fz, float fy, float fx,
+                          int max_r, float out[6]) {
+    int rz = (int)lroundf(fz), ry = (int)lroundf(fy), rx = (int)lroundf(fx);
+    for (int R = 0; R <= max_r; R++) {
+        int best = -1; long bestd = 1L << 60;
+        for (int dz = -R; dz <= R; dz++)
+        for (int dy = -R; dy <= R; dy++)
+        for (int dx = -R; dx <= R; dx++) {
+            /* only the new Chebyshev shell at radius R */
+            if (R > 0 && abs(dz) < R && abs(dy) < R && abs(dx) < R) continue;
+            int ni = t2pbr_lookup(f, rz + dz, ry + dy, rx + dx);
+            if (ni < 0) continue;
+            long d = (long)dz*dz + (long)dy*dy + (long)dx*dx;
+            if (d < bestd) { bestd = d; best = ni; }
+        }
+        if (best >= 0) {
+            const float *feat = f->feats + best * 6;
+            for (int c = 0; c < 6; c++) out[c] = feat[c];
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void t2_pbr_sample_vertices(const t2_pbr_field *field,
                               const float *vertices, int n_verts,
                               t2_pbr_attr *out) {
     float res = (float)field->resolution;
+    int diag = 1;
+    const char *qd = getenv("T2_PBR_QUIET"); if (qd && atoi(qd)) diag = 0;
+    /* Trilinear miss falls back to nearest populated voxel (FDG dual-vertex
+     * offsets can push the floor() cell off the thin surface shell). Disable
+     * the fallback with T2_PBR_NO_SNAP=1 (then misses stay black). */
+    int snap = 1;
+    const char *ns = getenv("T2_PBR_NO_SNAP"); if (ns && atoi(ns)) snap = 0;
+    long hits = 0, snapped = 0;
+    float vmin[3] = {1e30f,1e30f,1e30f}, vmax[3] = {-1e30f,-1e30f,-1e30f};
     for (int i = 0; i < n_verts; i++) {
         /* Vertex position [-0.5, 0.5] -> voxel coords [0, resolution) */
         float vx = (vertices[i * 3 + 0] + 0.5f) * res;
         float vy = (vertices[i * 3 + 1] + 0.5f) * res;
         float vz = (vertices[i * 3 + 2] + 0.5f) * res;
+        if (diag) {
+            if (vz < vmin[0]) vmin[0] = vz; if (vz > vmax[0]) vmax[0] = vz;
+            if (vy < vmin[1]) vmin[1] = vy; if (vy > vmax[1]) vmax[1] = vy;
+            if (vx < vmin[2]) vmin[2] = vx; if (vx > vmax[2]) vmax[2] = vx;
+        }
 
         float attr[6];
-        t2pbr_trilinear(field, vz, vy, vx, attr);
+        float w = t2pbr_trilinear(field, vz, vy, vx, attr);
+        if (w > 0) {
+            hits++;
+        } else if (snap && t2pbr_nearest(field, vz, vy, vx, 4, attr)) {
+            snapped++;
+        }
 
         out[i].r = attr[0];
         out[i].g = attr[1];
@@ -196,6 +247,24 @@ void t2_pbr_sample_vertices(const t2_pbr_field *field,
         out[i].metallic = attr[3];
         out[i].roughness = attr[4];
         out[i].alpha = attr[5];
+    }
+    if (diag) {
+        /* Field coord ranges (z,y,x = hash axis0,1,2). */
+        int fmin[3] = {1<<30,1<<30,1<<30}, fmax[3] = {-(1<<30),-(1<<30),-(1<<30)};
+        for (int i = 0; i < field->N; i++)
+            for (int a = 0; a < 3; a++) {
+                int c = field->coords[i*3+a];
+                if (c < fmin[a]) fmin[a] = c; if (c > fmax[a]) fmax[a] = c;
+            }
+        long covered = hits + snapped;
+        fprintf(stderr,
+            "T2 PBR: %d verts: trilinear %ld (%.1f%%) + snap %ld -> covered %ld (%.1f%%); res=%.0f\n"
+            "  vertex->voxel range  z[%.1f,%.1f] y[%.1f,%.1f] x[%.1f,%.1f]\n"
+            "  field voxel range    z[%d,%d] y[%d,%d] x[%d,%d]\n",
+            n_verts, hits, 100.0 * hits / (n_verts ? n_verts : 1), snapped,
+            covered, 100.0 * covered / (n_verts ? n_verts : 1), res,
+            vmin[0], vmax[0], vmin[1], vmax[1], vmin[2], vmax[2],
+            fmin[0], fmax[0], fmin[1], fmax[1], fmin[2], fmax[2]);
     }
 }
 
