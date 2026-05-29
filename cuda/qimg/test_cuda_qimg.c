@@ -1589,6 +1589,214 @@ static int test_kernels(void) {
     return fail;
 }
 
+/* ---- INT8 W8A8 GEMM self-test (no model needed; exercises op_gemm int8 path) ----
+ * Validates (a) correctness vs a CPU int8 reference (cos ~1) and vs an f32
+ * dequant-weight reference (quant quality), and (b) run-to-run BIT-EXACT
+ * determinism — the core reproducibility property that motivates int8. */
+static int test_int8_gemm(void) {
+    fprintf(stderr, "=== INT8 W8A8 GEMM self-test ===\n");
+    cuda_qimg_runner *r = cuda_qimg_init(0, 1);
+    if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    if (!r->gemm_w8a8_perrow || !r->quant_act_perrow_int8) {
+        fprintf(stderr, "FAIL: int8 kernels not loaded\n"); cuda_qimg_free(r); return 1;
+    }
+    r->use_int8 = 1;  /* force the int8 path in op_gemm */
+    /* Mirror load_dit's auto-detect: default GEMM = OUR gemm_int8_s32; set up
+     * cuBLAS as the verification oracle. QIMG_INT8_CUBLAS=1 uses cuBLAS for the run. */
+    if (!getenv("QIMG_DISABLE_INT8_CUBLAS") && r->dequant_int32_to_bf16 && r->cublaslt_ctx)
+        r->use_cublas_int8 = 1;
+    int will_cublas = r->use_cublas_int8 && getenv("QIMG_INT8_CUBLAS");
+    fprintf(stderr, "  int8 GEMM: %s (cuBLAS oracle %s)\n",
+            will_cublas ? "cuBLAS GemmEx" : (r->gemm_int8_s32 ? "own gemm_int8_s32" : "naive"),
+            r->use_cublas_int8 ? "available" : "off");
+
+    struct { int N, K, M; const char *label; } cases[] = {
+        {512, 256, 64,   "small"},
+        {3072, 3072, 64, "attn-proj"},
+        {12288, 3072, 16,"mlp-fc1"},
+        {18432, 3072, 1, "modulation n_tok=1"},
+        {64, 3072, 64,   "proj_out"},
+    };
+    int n_cases = (int)(sizeof(cases)/sizeof(cases[0]));
+    int all_ok = 1;
+    rng_state = 1234567;
+
+    for (int c = 0; c < n_cases; c++) {
+        int N = cases[c].N, K = cases[c].K, M = cases[c].M;
+        size_t nW = (size_t)N*K, nX = (size_t)M*K, nY = (size_t)M*N;
+        float *Wf = (float*)malloc(nW*sizeof(float));
+        float *Xf = (float*)malloc(nX*sizeof(float));
+        float *Bf = (float*)malloc((size_t)N*sizeof(float));
+        for (size_t i=0;i<nW;i++) Wf[i] = randn()*0.05f;
+        for (size_t i=0;i<nX;i++) Xf[i] = randn()*0.5f;
+        for (int i=0;i<N;i++)     Bf[i] = randn()*0.1f;
+
+        /* per-channel symmetric int8 quant of W (same as quantize_int8.py) */
+        float *wscale = (float*)malloc((size_t)N*sizeof(float));
+        signed char *Wq = (signed char*)malloc(nW);
+        for (int o=0;o<N;o++){
+            float amax=0; for(int k=0;k<K;k++){float a=fabsf(Wf[(size_t)o*K+k]); if(a>amax)amax=a;}
+            float sc = amax>0 ? amax/127.0f : 1e-12f; wscale[o]=sc;
+            for(int k=0;k<K;k++){ float q=rintf(Wf[(size_t)o*K+k]/sc);
+                if(q>127)q=127; else if(q<-127)q=-127; Wq[(size_t)o*K+k]=(signed char)q; }
+        }
+        /* fat weight buffer: [wscale N f32][Wq N*K int8] */
+        size_t fatbytes = (size_t)N*sizeof(float) + nW;
+        unsigned char *fat = (unsigned char*)malloc(fatbytes);
+        memcpy(fat, wscale, (size_t)N*sizeof(float));
+        memcpy(fat + (size_t)N*sizeof(float), Wq, nW);
+
+        CUdeviceptr dW=0,dX=0,dB=0,dY=0;
+        cuMemAlloc(&dW, fatbytes);              cuMemcpyHtoD(dW, fat, fatbytes);
+        cuMemAlloc(&dX, nX*sizeof(float));      cuMemcpyHtoD(dX, Xf, nX*sizeof(float));
+        cuMemAlloc(&dB, (size_t)N*sizeof(float));cuMemcpyHtoD(dB, Bf, (size_t)N*sizeof(float));
+        cuMemAlloc(&dY, nY*sizeof(float));
+
+        cuMemsetD8(dY, 0, nY*sizeof(float));
+        op_gemm(r, dY, dW, dX, dB, N, K, M);
+        cuStreamSynchronize(r->stream);
+        float *Yg = (float*)malloc(nY*sizeof(float));
+        cuMemcpyDtoH(Yg, dY, nY*sizeof(float));
+        /* determinism: rerun, compare bit-exact */
+        cuMemsetD8(dY, 0, nY*sizeof(float));
+        op_gemm(r, dY, dW, dX, dB, N, K, M);
+        cuStreamSynchronize(r->stream);
+        float *Yg2 = (float*)malloc(nY*sizeof(float));
+        cuMemcpyDtoH(Yg2, dY, nY*sizeof(float));
+        int det = (memcmp(Yg, Yg2, nY*sizeof(float)) == 0);
+
+        /* perf: time the int8 GEMM in isolation */
+        {
+            for (int w=0;w<10;w++) op_gemm(r, dY, dW, dX, dB, N, K, M);
+            cuStreamSynchronize(r->stream);
+            struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+            int iters=200;
+            for (int it=0; it<iters; it++) op_gemm(r, dY, dW, dX, dB, N, K, M);
+            cuStreamSynchronize(r->stream);
+            clock_gettime(CLOCK_MONOTONIC,&t1);
+            double ms=((t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)*1e-6)/iters;
+            double tops=2.0*N*K*M/(ms*1e-3)/1e12;
+            fprintf(stderr,"    [perf] %-20s %.3f ms/call  %.1f TOPS\n", cases[c].label, ms, tops);
+        }
+
+        /* CPU references */
+        double dot=0,na=0,nb=0,maxabs=0, dotf=0,naf=0,nbf=0;
+        for (int t=0;t<M;t++){
+            float xmax=0; for(int k=0;k<K;k++){float a=fabsf(Xf[(size_t)t*K+k]); if(a>xmax)xmax=a;}
+            float xsc = xmax>1e-30f ? xmax/127.0f : 1.0f;
+            signed char *xq=(signed char*)malloc(K);
+            for(int k=0;k<K;k++){float q=rintf(Xf[(size_t)t*K+k]/xsc);
+                if(q>127)q=127; else if(q<-127)q=-127; xq[k]=(signed char)q;}
+            for (int o=0;o<N;o++){
+                long acc=0; const signed char *wr=Wq+(size_t)o*K;
+                for(int k=0;k<K;k++) acc += (int)xq[k]*(int)wr[k];
+                float y = (float)acc * (xsc*wscale[o]) + Bf[o];
+                unsigned int bits; memcpy(&bits,&y,4);
+                bits += 0x7FFFu + ((bits>>16)&1u); bits &= 0xFFFF0000u; memcpy(&y,&bits,4);
+                float g = Yg[(size_t)t*N+o];
+                double d=(double)g-y; if(fabs(d)>maxabs)maxabs=fabs(d);
+                dot+=(double)g*y; na+=(double)g*g; nb+=(double)y*y;
+                double yf=Bf[o]; for(int k=0;k<K;k++) yf+=(double)Xf[(size_t)t*K+k]*(double)wr[k]*wscale[o];
+                dotf+=(double)g*yf; naf+=(double)g*g; nbf+=yf*yf;
+            }
+            free(xq);
+        }
+        double cos  = dot/(sqrt(na)*sqrt(nb)+1e-30);
+        double cosf = dotf/(sqrt(naf)*sqrt(nbf)+1e-30);
+        int ok = (cos>0.999) && (cosf>0.99) && det;
+        if(!ok) all_ok=0;
+        fprintf(stderr, "  %-20s N=%-5d K=%-4d M=%-4d  cos(int8)=%.6f cos(f32)=%.5f maxabs=%.2e det=%s -> %s\n",
+                cases[c].label,N,K,M,cos,cosf,maxabs,det?"yes":"NO",ok?"PASS":"FAIL");
+
+        cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY);
+        free(Wf);free(Xf);free(Bf);free(wscale);free(Wq);free(fat);free(Yg);free(Yg2);
+    }
+
+    /* Perf-only at realistic n_tok (real workload: n_img=256 @256^2, 1024 @512^2). */
+    fprintf(stderr, "  --- perf at realistic M (no correctness) ---\n");
+    struct { int N,K,M; const char *l; } pc[] = {
+        {3072,3072,256,"attn M=256"}, {12288,3072,256,"mlp_fc1 M=256"},
+        {3072,12288,256,"mlp_fc2 M=256"}, {3072,3072,1024,"attn M=1024"},
+        {12288,3072,1024,"mlp_fc1 M=1024"},
+    };
+    for (int c=0;c<(int)(sizeof(pc)/sizeof(pc[0]));c++){
+        int N=pc[c].N,K=pc[c].K,M=pc[c].M; size_t nW=(size_t)N*K;
+        unsigned char *fat=(unsigned char*)calloc((size_t)N*4+nW,1);
+        for(int o=0;o<N;o++) ((float*)fat)[o]=0.01f;
+        CUdeviceptr dW=0,dX=0,dB=0,dY=0;
+        cuMemAlloc(&dW,(size_t)N*4+nW); cuMemcpyHtoD(dW,fat,(size_t)N*4+nW);
+        cuMemAlloc(&dX,(size_t)M*K*4); cuMemsetD8(dX,1,(size_t)M*K*4);
+        cuMemAlloc(&dB,(size_t)N*4); cuMemsetD8(dB,0,(size_t)N*4);
+        cuMemAlloc(&dY,(size_t)M*N*4);
+        for(int w=0;w<10;w++) op_gemm(r,dY,dW,dX,dB,N,K,M);
+        cuStreamSynchronize(r->stream);
+        struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+        int iters=100; for(int it=0;it<iters;it++) op_gemm(r,dY,dW,dX,dB,N,K,M);
+        cuStreamSynchronize(r->stream); clock_gettime(CLOCK_MONOTONIC,&t1);
+        double ms=((t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)*1e-6)/iters;
+        fprintf(stderr,"    %-16s %.3f ms/call  %.1f TOPS\n",pc[c].l,ms,2.0*N*K*M/(ms*1e-3)/1e12);
+        cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY); free(fat);
+    }
+
+    /* ===== VERIFY: our gemm_int8_s32 vs cuBLAS int8 GemmEx, at the int32 level =====
+     * Both compute the EXACT integer dot product, so they must be bit-identical (and
+     * equal to a CPU int32 reference). Feeds identical int8 Wq/Xq (incl +-127) to both,
+     * compares the raw int32 outputs element-by-element. This is the cleanest check:
+     * integer equality, no floating-point ULP ambiguity. */
+    if (r->gemm_int8_s32 && r->use_cublas_int8 && r->cublaslt_ctx) {
+        fprintf(stderr, "  --- VERIFY: own gemm_int8_s32 vs cuBLAS GemmEx (int32, bit-exact) ---\n");
+        struct { int N,K,M; const char *l; } vc[] = {
+            {3072,3072,256,"attn"}, {12288,3072,256,"mlp_fc1"},
+            {3072,12288,256,"mlp_fc2"}, {3072,3072,1024,"attn M=1024"},
+            {256,3072,64,"small"},
+        };
+        for (int c=0;c<(int)(sizeof(vc)/sizeof(vc[0]));c++){
+            int N=vc[c].N,K=vc[c].K,M=vc[c].M;
+            signed char *Wq=(signed char*)malloc((size_t)N*K);
+            signed char *Xq=(signed char*)malloc((size_t)M*K);
+            srand(1000+c);
+            for(size_t i=0;i<(size_t)N*K;i++){int v=(rand()%255)-127; if(rand()%20==0)v=(rand()&1)?127:-127; Wq[i]=(signed char)v;}
+            for(size_t i=0;i<(size_t)M*K;i++){int v=(rand()%255)-127; if(rand()%20==0)v=(rand()&1)?127:-127; Xq[i]=(signed char)v;}
+            CUdeviceptr dWq=0,dXq=0,dCo=0,dCc=0;
+            cuMemAlloc(&dWq,(size_t)N*K); cuMemcpyHtoD(dWq,Wq,(size_t)N*K);
+            cuMemAlloc(&dXq,(size_t)M*K); cuMemcpyHtoD(dXq,Xq,(size_t)M*K);
+            cuMemAlloc(&dCo,(size_t)M*N*sizeof(int)); cuMemsetD8(dCo,0,(size_t)M*N*sizeof(int));
+            cuMemAlloc(&dCc,(size_t)M*N*sizeof(int)); cuMemsetD8(dCc,0,(size_t)M*N*sizeof(int));
+            /* our kernel */
+            void *ga[]={&dCo,&dWq,&dXq,&N,&K,&M};
+            unsigned gx=((N+255)/256); gx=(gx+3u)&~3u;
+            unsigned gy=((M+31)/32);   gy=(gy+3u)&~3u;
+            cuLaunchKernel(r->gemm_int8_s32,gx,gy,1,128,1,1,1024+8192*2,r->stream,ga,NULL);
+            /* cuBLAS */
+            int rc=cublasew_gemm_int8_s32_rowmajor_nt(r->cublaslt_ctx,dCc,dWq,dXq,M,N,K);
+            cuStreamSynchronize(r->stream);
+            int *Co=(int*)malloc((size_t)M*N*sizeof(int)), *Cc=(int*)malloc((size_t)M*N*sizeof(int));
+            cuMemcpyDtoH(Co,dCo,(size_t)M*N*sizeof(int));
+            cuMemcpyDtoH(Cc,dCc,(size_t)M*N*sizeof(int));
+            long mism_oc=0,maxd_oc=0, mism_cpu=0; long total=(long)M*N;
+            for(int t=0;t<M;t++)for(int o=0;o<N;o++){
+                long acc=0; const signed char *wr=Wq+(size_t)o*K,*xr=Xq+(size_t)t*K;
+                for(int k=0;k<K;k++) acc+=(int)xr[k]*(int)wr[k];
+                long g=Co[(size_t)t*N+o], b=Cc[(size_t)t*N+o];
+                long d=g-b; if(d<0)d=-d; if(d>maxd_oc)maxd_oc=d; if(d)mism_oc++;
+                if(g!=acc)mism_cpu++;
+            }
+            int vok = (rc==0) && (mism_oc==0) && (mism_cpu==0);
+            if(!vok) all_ok=0;
+            fprintf(stderr,"  %-12s N=%-5d K=%-5d M=%-4d  ours-vs-cuBLAS=%ld/%ld (max|d|=%ld)  ours-vs-CPU=%ld/%ld  cuBLAS_rc=%d -> %s\n",
+                    vc[c].l,N,K,M, mism_oc,total,maxd_oc, mism_cpu,total, rc, vok?"BIT-EXACT":"MISMATCH");
+            cuMemFree(dWq);cuMemFree(dXq);cuMemFree(dCo);cuMemFree(dCc);
+            free(Wq);free(Xq);free(Co);free(Cc);
+        }
+    } else {
+        fprintf(stderr, "  --- VERIFY skipped (need both own kernel + cuBLAS oracle) ---\n");
+    }
+
+    cuda_qimg_free(r);
+    fprintf(stderr, "RESULT: %s\n", all_ok?"PASS":"FAIL");
+    return all_ok?0:1;
+}
+
 int main(int argc, char **argv) {
     const char *dit_path = "/mnt/nvme02/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
     const char *vae_path = "/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors";
@@ -1596,6 +1804,7 @@ int main(int argc, char **argv) {
     const char *enc_st_path = getenv("QIMG_TEXT_ENCODER_ST");
     const char *prompt = "a red apple on a white table";
     int custom_prompt = 0;
+    const char *out_path = "cuda_qimg_output.ppm";  /* --generate image output (PPM) */
     const char *mode = NULL;
     int out_h = 256, out_w = 256, n_steps = 20;
     int force_f16 = 0, no_cfg = 0;
@@ -1606,6 +1815,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
         else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
+        else if (strcmp(argv[i], "--test-int8-gemm") == 0) mode = "int8gemm";
         else if (strcmp(argv[i], "--test-vae") == 0) mode = "vae";
         else if (strcmp(argv[i], "--generate") == 0) mode = "gen";
         else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
@@ -1622,14 +1832,16 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--width") == 0 && i+1 < argc) out_w = atoi(argv[++i]);
         else if (strcmp(argv[i], "--steps") == 0 && i+1 < argc) n_steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (uint64_t)atoll(argv[++i]);
+        else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out_path = argv[++i];
     }
 
     if (mode && strcmp(mode, "kernels") == 0) return test_kernels();
+    if (mode && strcmp(mode, "int8gemm") == 0) return test_int8_gemm();
 
     if (!mode) {
         fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--test-kernels|--generate\n"
                 "  --dit <st>  --vae <st>  --enc <gguf>  --enc-st <st>  --prompt <text>\n"
-                "  --height <h>  --width <w>  --steps <n>  --seed <s>  --no-fp8\n", argv[0]);
+                "  --height <h>  --width <w>  --steps <n>  --seed <s>  --out <ppm>  --no-fp8\n", argv[0]);
         return 1;
     }
 
@@ -1675,6 +1887,7 @@ int main(int argc, char **argv) {
     clock_t t0;
     if (r) {
         t0 = clock();
+        r->dit_target_pixels = (size_t)out_h * out_w;  /* size W4A4 preload to the resolution */
         if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     }
@@ -1900,6 +2113,7 @@ int main(int argc, char **argv) {
         if (force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; }
         if (force_f16 == 4) { r->use_old_gemm = 1; }
         t0 = clock();
+        r->dit_target_pixels = (size_t)out_h * out_w;  /* size W4A4 preload to the resolution */
         if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
@@ -1936,6 +2150,21 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++)
             if (strcmp(argv[i], "--cfg-scale") == 0 && i+1 < argc)
                 cfg_scale = (float)atof(argv[++i]);
+
+        /* Debug dumps for HIP layer-by-layer verify (compare_cuda_dumps.py):
+         * the exact embeddings + sigma schedule the CUDA DiT saw, raw f32
+         * row-major. Cond [n_txt,3584], uncond [n_txt_neg,3584], sigmas[n+1]. */
+        if (r->verbose >= 3) {
+            FILE *tf = fopen("cuda_txt_pos.bin", "wb");
+            if (tf) { fwrite(txt_hidden, sizeof(float), (size_t)n_txt*txt_dim, tf); fclose(tf);
+                fprintf(stderr, "  Saved cuda_txt_pos.bin [%d, %d]\n", n_txt, txt_dim); }
+            FILE *nf = fopen("cuda_txt_neg.bin", "wb");
+            if (nf) { fwrite(txt_neg_hidden, sizeof(float), (size_t)n_txt_neg*txt_dim, nf); fclose(nf);
+                fprintf(stderr, "  Saved cuda_txt_neg.bin [%d, %d]\n", n_txt_neg, txt_dim); }
+            FILE *gf = fopen("cuda_sigmas.bin", "wb");
+            if (gf) { fwrite(sched.sigmas, sizeof(float), (size_t)n_steps+1, gf); fclose(gf);
+                fprintf(stderr, "  Saved cuda_sigmas.bin [%d]\n", n_steps+1); }
+        }
 
         /* Patchify + denoising loop with CFG */
         float *img_tokens = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
@@ -2130,7 +2359,7 @@ int main(int argc, char **argv) {
         free(latent);
 
         /* Save */
-        save_ppm("cuda_qimg_output.ppm", rgb, out_h, out_w);
+        save_ppm(out_path, rgb, out_h, out_w);
         free(rgb);
     }
 
