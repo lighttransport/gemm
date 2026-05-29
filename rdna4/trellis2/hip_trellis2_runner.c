@@ -2143,8 +2143,12 @@ static double t2_now_ms(void) {
 }
 static int g_dit_prof = -1;
 static double g_dit_t_sa, g_dit_t_ca, g_dit_t_mlp, g_dit_t_kv, g_dit_t_io;
+/* Finer SLAT/tex breakdown (T2_DIT_PROF=1). */
+static double g_slat_t_sagemm, g_slat_t_saflash, g_slat_t_samisc,
+              g_slat_t_ca, g_slat_t_mlp, g_slat_t_kv, g_slat_t_io;
 #define DITPROF_SYNC() do { if (g_dit_prof) hipDeviceSynchronize(); } while (0)
 #define DITPROF_T()    (g_dit_prof ? t2_now_ms() : 0.0)
+#define SLATPROF_ADD(acc) do { if (g_dit_prof) { hipDeviceSynchronize(); (acc) += t2_now_ms() - _pt; _pt = t2_now_ms(); } } while (0)
 
 static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump_block) {
     if (!r->dit_loaded) { fprintf(stderr, "T2-HIP: DiT not loaded\n"); return -1; }
@@ -3037,6 +3041,10 @@ static int slat_ensure_cond_scratch(hip_trellis2_runner *r, int n_cond) {
  * everywhere; scalar attention so any N works. */
 static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
     if (!r->slat_loaded) { fprintf(stderr, "T2-HIP: SLAT DiT not loaded\n"); return -1; }
+    if (g_dit_prof < 0) { const char *e = getenv("T2_DIT_PROF"); g_dit_prof = (e && atoi(e)) ? 1 : 0; }
+    if (g_dit_prof) { g_slat_t_sagemm = g_slat_t_saflash = g_slat_t_samisc =
+                      g_slat_t_ca = g_slat_t_mlp = g_slat_t_kv = g_slat_t_io = 0; }
+    double _pt = DITPROF_T();
 
     /* Input embedding: x_t [N, 32] -> [N, DIT_DIM] */
     gemm(r, r->d_slat_h, &r->slat_input, r->d_slat_x_in,
@@ -3049,6 +3057,7 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
     void *d_t_out = r->d_slat_attn_out; /* repurpose scratch for FC2 output */
     gemm(r, d_t_out, &r->slat_t_fc2, r->d_slat_t_silu,
          r->slat_t_fc2.b, DIT_DIM, DIT_DIM, 1);
+    SLATPROF_ADD(g_slat_t_io);
 
     /* Rebuild cross-attn KV cache if needed */
     if (!r->slat_ca_kv_valid) {
@@ -3070,6 +3079,7 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
         r->slat_ca_kv_valid = 1;
         r->slat_ca_kv_len   = n_cond;
     }
+    SLATPROF_ADD(g_slat_t_kv);
 
     /* Shared modulation: d_mod_base = silu(t_emb)*mod_w + mod_b */
     {
@@ -3084,6 +3094,7 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
                               DIT_DIM * sizeof(float), 0, args, NULL);
     }
 
+    SLATPROF_ADD(g_slat_t_io);
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
         t2_block_gpu *b = &r->slat_blocks[bi];
 
@@ -3107,9 +3118,11 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
         void *gate_mlp  = mod + 5 * DIT_DIM;
 
         /* ---- Self-attention ---- */
+        SLATPROF_ADD(g_slat_t_samisc);  /* per-block modulation */
         run_adaln(r, r->d_slat_ln_h, r->d_slat_h, shift_sa, scale_sa, N, DIT_DIM);
         slat_gemm(r, r->d_slat_qkv, &b->sa_qkv, r->d_slat_ln_h, b->sa_qkv.b,
                   3 * DIT_DIM, DIT_DIM, N, bi, 0);
+        SLATPROF_ADD(g_slat_t_sagemm);  /* adaln folded + qkv proj */
 
         /* Split QKV */
         {
@@ -3138,11 +3151,14 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
         }
         /* WMMA flash self-attn — kernels (b16_db, bc32_v2) mask N internally
          * so SLAT's variable N works without padding. Scalar fallback otherwise. */
+        SLATPROF_ADD(g_slat_t_samisc);  /* split, qk-rmsnorm, rope */
         run_flash_sa(r, r->d_slat_attn_out, NULL,
                      r->d_slat_Q, r->d_slat_K, r->d_slat_V, N, /*qkv_stride*/0);
+        SLATPROF_ADD(g_slat_t_saflash);
         slat_gemm(r, r->d_slat_ln_h, &b->sa_out, r->d_slat_attn_out, b->sa_out.b,
                   DIT_DIM, DIT_DIM, N, bi, 1);
         run_gated_add(r, r->d_slat_h, r->d_slat_ln_h, gate_sa, N, DIT_DIM);
+        SLATPROF_ADD(g_slat_t_sagemm);  /* out proj + gated add */
 
         /* ---- Cross-attention ---- */
         run_layernorm(r, r->d_slat_ln_h, r->d_slat_h, b->norm2_w, b->norm2_b, N, DIT_DIM);
@@ -3157,6 +3173,7 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
                   DIT_DIM, DIT_DIM, N, bi, 4);
         /* No gate on cross-attn — direct residual */
         run_residual_add(r, r->d_slat_h, r->d_slat_ln_h, N * DIT_DIM);
+        SLATPROF_ADD(g_slat_t_ca);
 
         /* ---- MLP ---- */
         run_adaln(r, r->d_slat_ln_h, r->d_slat_h, shift_mlp, scale_mlp, N, DIT_DIM);
@@ -3166,12 +3183,22 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
         slat_gemm(r, r->d_slat_ln_h, &b->mlp_fc2, r->d_slat_mlp_mid, b->mlp_fc2.b,
                   DIT_DIM, DIT_FFN, N, bi, 6);
         run_gated_add(r, r->d_slat_h, r->d_slat_ln_h, gate_mlp, N, DIT_DIM);
+        SLATPROF_ADD(g_slat_t_mlp);
     }
 
     /* Final LN (no affine) + out_layer */
     run_ln_noaffine(r, r->d_slat_ln_h, r->d_slat_h, N, DIT_DIM);
     gemm(r, r->d_slat_vel_out, &r->slat_out, r->d_slat_ln_h, r->slat_out.b,
          SLAT_IN_CH, DIT_DIM, N);
+    SLATPROF_ADD(g_slat_t_io);
+    if (g_dit_prof) {
+        double sa = g_slat_t_sagemm + g_slat_t_saflash + g_slat_t_samisc;
+        double tot = sa + g_slat_t_ca + g_slat_t_mlp + g_slat_t_kv + g_slat_t_io;
+        fprintf(stderr, "T2-SLATPROF (N=%d n_cond=%d): total=%.1f ms | "
+                "SA=%.1f [gemm=%.1f flash=%.1f misc=%.1f]  CA=%.1f  MLP=%.1f  KV=%.1f  IO=%.1f\n",
+                N, n_cond, tot, sa, g_slat_t_sagemm, g_slat_t_saflash, g_slat_t_samisc,
+                g_slat_t_ca, g_slat_t_mlp, g_slat_t_kv, g_slat_t_io);
+    }
     /* No final sync — caller hipMemcpy D2H of d_slat_vel_out (line ~2809)
      * already synchronizes on default stream. Saves ~one hipDeviceSync per
      * step (negligible per-step but cleaner). */
