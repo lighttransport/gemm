@@ -51,6 +51,39 @@ The transformer_block verifier additionally needs
 ln -s /tmp/sam3d_ref/slat_dit_cond.npy /tmp/sam3d_trace/slat_dit_cond.npy
 ```
 
+## e2e correctness fix — PPE NaN under -ffast-math (commit 7fbb648)
+
+Real MoGe pointmaps have invalid (NaN) background pixels. `ppe_linear3_invalid_f32`
+used `isfinite()` to substitute `invalid_xyz_token` for them, but HIPRTC builds with
+`-ffast-math` (`-ffinite-math-only`) so `isfinite()` folds to constant `true` → NaN
+pixels took the valid path → `W·NaN = NaN` → NaN cond tokens → NaN SS-DiT latent →
+garbage 262144-voxel occupancy → broken/garbage mesh. The per-stage verifiers all
+passed because they feed clean reference inputs; only the real-pointmap e2e hit the
+path. Fixed with a bit-pattern non-finite check (exponent==0xFF). cond_fuser now
+matches the PyTorch ref (`mean_abs` nan→4.2e-7) and the e2e produces a clean finite
+mesh. **Audit other kernels for `isfinite`/`isnan`/`isinf` — same trap applies.**
+
+Validation aids (this host): on-host PyTorch dump at
+`/mnt/disk1/models/sam3d/sam3d_ref_new/` (pass as `--refdir`; has `input_image.npy`,
+`input_mask.npy`, `pointmap.npy` + every per-stage tensor). Gotchas: serialize e2e
+runs (overlapping processes corrupt a shared `-o` file; two models also OOM the 16 GB
+card), and consume the `\n` after `end_header` when byte-parsing the binary PLY.
+
+## Speed — BF16 WMMA GEMM (commit 6352c3c)
+
+`gemm_bf16w_bf16a_wmma_t` (ported from rdna4/trellis2, round-to-nearest-even bf16
+conversion) + a per-call dispatcher, gated by `SAM3D_WMMA` (default on; `=0` = exact
+F32). **Wired for DINOv2 only** so far: ~2.6× forward compute, e2e mesh negligibly
+changed (occupancy pos 6600→6626, gaussian distributions match) — DINOv2 is diffusion
+*conditioning*, so its bf16 error is absorbed. `verify_dinov2` max_abs 0.144 exceeds
+the strict 5e-2 F32 gate (expected for bf16), so judge by the e2e mesh, not that gate.
+
+TODO (bigger e2e win, not yet done): route SS-DiT / SLAT-DiT / SLAT-GS GEMMs through
+the same dispatcher. These are the *diffused* variable — bf16 error accumulates over
+sampler steps — so validate the e2e mesh per stage and keep `SAM3D_WMMA`-gated; only
+default-on if the mesh holds. Then optional hipBLASLt (rdna4/llm/mm_blaslt_bridge,
+more accurate) for the largest GEMMs, and carry both fixes to rdna4/sam3d_body.
+
 ## Reproducing the dumps
 
 See `ref/sam3d/README.md` for the CUDA-host workflow. The pytorch3d
