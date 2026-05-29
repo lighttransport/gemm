@@ -1020,7 +1020,7 @@ tex voxels) and compared against the PyTorch ground truth in
 
 | Quantity | vs PyTorch ref | Result |
 |----------|----------------|--------|
-| Stage-1 latent (`03_ss_latent`) | dense [8,16,16,16] | cosine **0.990** (TF32 default); **0.997** with `T2_DIT_BF16=1` — see bf16-block note below |
+| Stage-1 latent (`03_ss_latent`) | dense [8,16,16,16] | cosine **0.990** (TF32 default); **0.997** with `T2_DIT_BF16=1` (T.png) — ≈ PyTorch's own ~0.9975 backend floor; see bf16-block note + multi-prompt study below |
 | Tex-voxel PBR feats (`15_tex_voxels`) | on 491,811 overlapping voxels, after `*0.5+0.5` | cosine **0.976** (raw 0.518 → confirms the `*0.5+0.5` scaling) |
 | — per channel | R/G/B 0.82/0.81/0.81, metal 0.985, rough 0.974, alpha 0.996 | material maps near-exact |
 | Tex-voxel count | 1,377,823 vs 1,468,404 | 93.8% |
@@ -1077,10 +1077,48 @@ the per-op output rounding already absorbs sub-bf16 weight differences; (2) roun
 PROBS to bf16 made it WORSE (0.9974→0.9961) — PyTorch SDPA keeps the attention internals in f32, so
 our f16-MMA probs (`attn_mma_hd128_f32`, 10-bit) are the closer match; (3) the bf16 GEMM already
 accumulates in f32; (4) GELU is the tanh approximation on both sides (`gelu_f32` ==
-`nn.GELU(approximate="tanh")`). The residual 0.0026 is **irreducible**: independent bf16 GEMM
-libraries (cuBLAS vs PyTorch/cuDNN) round at different points and accumulate over the 12 recursive
-Euler steps. TF32 stays the **production default** (more precise than the bf16 reference); bf16 is
-the PyTorch-matching **verification** mode.
+`nn.GELU(approximate="tanh")`). The residual 0.0026 is **irreducible** — and the multi-prompt study
+below proves *why*: it is the scale of PyTorch's *own* run-to-run/backend non-reproducibility of the
+12-step bf16 latent. TF32 stays the **production default** (more precise, and — see below — more
+*consistent* across images); bf16 is the PyTorch-matching **verification** mode.
+
+> **Caveat (see "Multi-prompt study" below): the 0.99739 win is T.png-specific.** T.png is the only
+> image with a canonical reference, and it is a favorable case. Across a 4-image sample, bf16 vs TF32
+> is a wash, and both sit at the level of PyTorch's own backend reproducibility (~0.9975).
+
+### Multi-prompt study + PyTorch reference reproducibility (2026-05-30)
+
+Generated fresh PyTorch Stage-1 references for **3 new example images + T.png** and ran our pipeline
+(TF32 and bf16) on each image's *identical* noise+cond. (PyTorch here needs `trimesh`+`easydict` and a
+`meta_path` `MagicMock` stub for the uninstalled mesh/render CUDA exts `flex_gemm`/`cumesh`/
+`nvdiffrast`/`o_voxel` — Stage-1's dense SS-flow + DINOv3 + `flow_euler` don't use them; a `--stage1-only`
+flag was added to `dump_ground_truth.py`.)
+
+**The PyTorch reference is backend-dependent.** Re-dumping **T.png with the same seed/noise/cond** as
+the canonical 2026-05-26 dumps gives `02_ss_noise` **identical**, `01_cond` Δ=2e-5, but `03_ss_latent`
+**cosine = 0.99752** vs canonical. Two fresh runs in *this* env are **bit-identical (1.0)**, so the
+0.9975 gap is a systematic dense-attention **backend/version difference** (canonical likely used
+flash_attn; this env falls back to sdpa), not run noise. **PyTorch's own bf16 12-step SS-flow latent is
+therefore only reproducible to ~0.9975 across backends — so "0.999 vs the reference" is unreachable by
+*any* implementation.**
+
+| image | reference | ours TF32 | ours bf16 |
+|---|---|---|---|
+| T.png | canonical (older backend) | 0.98954 | **0.99738** |
+| T.png | sdpa (fresh) | 0.99344 | **0.99764** |
+| *PyTorch canon-vs-sdpa floor* | *(same image/noise/cond)* | | *0.99752* |
+| img1 | sdpa (fresh) | **0.99489** | 0.98268 |
+| img2 | sdpa (fresh) | 0.99513 | 0.99585 |
+| img3 | sdpa (fresh) | 0.99301 | 0.99256 |
+| **mean (4 imgs, sdpa refs)** | | **0.99412** | 0.99218 |
+
+On **T.png** our bf16 lands *inside* the PyTorch cluster (0.9974/0.9976 ≈ the 0.9975 PyTorch-vs-PyTorch
+floor) while TF32 sits *outside* it — bf16 wins. But across the **3 new images** (refs deterministic,
+so these are real, not noise) it is a **wash**: bf16 swings 0.983–0.996 while TF32 holds 0.993–0.995,
+and mean TF32 (0.9941) slightly edges bf16 (0.9922). Our CUDA attention is f16-MMA (neither flash_attn
+nor sdpa), adding image-dependent divergence on top. **Takeaway: bf16 faithfully reproduces a
+*particular* PyTorch bf16 run within PyTorch's own ~0.0025 backend ambiguity, but it is not a universal
+accuracy win — TF32 is the more consistent and higher-precision default.**
 
 ## Next Steps
 
