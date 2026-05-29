@@ -569,7 +569,10 @@ sparse_done:
         float *s2_zeros_cond = (float *)calloc((size_t)n_cond * 1024, sizeof(float));
         float s2_rescale_t = 3.0f;  /* Stage 2 uses rescale_t=3.0 */
         float s2_sigma_min = 1e-5f;
-        float s2_cfg_rescale = 0.7f;
+        /* pipeline.json shape_slat_sampler guidance_rescale = 0.5 (NOT 0.7 — that
+         * is Stage 1's value). Matches the rdna4 fix 71d27ae; verified by
+         * verify_stage2_full vs 07_shape_slat_raw_feats. */
+        float s2_cfg_rescale = 0.5f;
 
         struct timespec s2_t0_ts; clock_gettime(CLOCK_MONOTONIC, &s2_t0_ts);
         double s2_t0 = s2_t0_ts.tv_sec * 1000.0 + s2_t0_ts.tv_nsec / 1e6;
