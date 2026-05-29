@@ -107,9 +107,23 @@
 > (1.9×), quality-neutral (single-step cosine Δ7e-7). **Build gotcha: the Makefile
 > tracks only .c deps — `touch` a .c after editing any header or it won't rebuild.**
 >
-> Remaining: Stage-2/3 FULL-sampler parity (single-step verified); the cuBLAS/plain
+> Remaining: Stage-3 FULL-sampler parity (Stage-2 now DONE — see below); the cuBLAS/plain
 > output-GEMM zero bug (group=25 sidesteps it); lazy per-stage DiT load to cut the
 > ~12.7 GB loading peak.
+>
+> ## STAGE-2 FULL-SAMPLER PARITY + guidance_rescale FIX (2026-05-30)
+>
+> Stage-2 single step was already corr **0.99995** (`verify_stage2` vs `06b`). New
+> **`verify_stage2_full`** runs the full 12-step sampler on PyTorch's EXACT inputs
+> (`06_shape_slat_noise_feats` + `06b_slat_dit_step_coords` + `06b_slat_dit_step_cond`,
+> zero neg-cond) and compares to `07_shape_slat_raw_feats`. **BUG FOUND + FIXED:**
+> `test_cuda_trellis2.c` had Stage-2 `s2_cfg_rescale=0.7f`, but pipeline.json
+> `shape_slat_sampler` is **0.5** (0.7 is Stage-1's value). Same bug RDNA4 already fixed
+> (`71d27ae`), but that only touched `rdna4/*`. Fix → full-sampler cosine vs `07`:
+> **0.946 → 0.985** (relL2 0.325→0.171). Residual 0.015 = fp16-vs-bf16 per-step
+> compounding (single step is 0.99995; same story as Stage 1). Stage-3 has CFG disabled
+> (strength=1.0) so no analogous bug. Run:
+> `verify_stage2_full <stage2.st> 06_…noise 06b_…coords 06b_…cond 07_…raw [cfg_rescale]`.
 
 The section below is the ORIGINAL shape-decoder resume prompt (rel L2 ~5e-7 on
 the Fujisan `N=128` SC-VAE smoke). That work is done; kept for reference.

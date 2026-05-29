@@ -1077,6 +1077,37 @@ C-internally-consistent order → **99.7% coverage**; the swapped `(col3,col2,co
   `t2_pbr_sample_vertices` diagnostic prints this live (`T2 PBR: … covered N (X%)`; `T2_PBR_QUIET=1`
   silences, `T2_PBR_NO_SNAP=1` disables the nearest-voxel fallback).
 
+### Stage-2 FULL-sampler parity + a `guidance_rescale` bug (2026-05-30)
+
+The Stage-2 (shape SLat) DiT single step was already verified (`verify_stage2` vs
+`06b_slat_dit_step_velocity`: **corr 0.99995**). New `verify_stage2_full` closes the loop on
+the **full 12-step sampler**: it feeds PyTorch's *exact* inputs — initial noise
+`06_shape_slat_noise_feats`, coords `06b_slat_dit_step_coords`, positive cond
+`06b_slat_dit_step_cond`, zero neg-cond — through the same `FlowEulerGuidanceInterval` loop the
+e2e harness runs, then compares the raw output to `07_shape_slat_raw_feats`. This isolates the
+sampler from upstream Stage-1/coord divergence (PyTorch's `neg_cond` is confirmed *zero* —
+`dump_ground_truth.py` line 271 — so the harness's zero uncond is correct).
+
+**Bug found + fixed: Stage-2 `guidance_rescale` was 0.7, should be 0.5.** `model_root/pipeline.json`
+`shape_slat_sampler` specifies `guidance_rescale=0.5` (0.7 is *Stage 1's* `sparse_structure_sampler`
+value); `test_cuda_trellis2.c` had hardcoded `s2_cfg_rescale=0.7f`. This is the same bug the RDNA4
+side already fixed (commit `71d27ae` "fix SLAT guidance_rescale 0.7→0.5"), but that fix only touched
+`rdna4/*`, so the CUDA harness still carried it through the 2026-05-30 merge. Effect on Stage-2
+full-sampler parity vs `07`:
+
+| `cfg_rescale` | cosine | relL2 |
+|---|---|---|
+| **0.5** (pipeline.json, fixed) | **0.985** | 0.171 |
+| 0.7 (old harness) | 0.946 | 0.325 |
+
+The residual 0.015 (0.985, not ~1.0 like the single step) is the **same fp16-vs-PyTorch-bf16 per-step
+compounding** characterized for Stage 1: the single forward is corr 0.99995, but 12 recursive Euler
+steps integrate the per-step f16/TF32-vs-bf16 difference. A Stage-2 "bf16-block" mode (analogous to
+`T2_DIT_BF16` for Stage 1) would likely recover it; deferred. All six sampler params (steps=12,
+rescale_t=3.0, strength=7.5, rescale=0.5, interval=[0.6,1.0], σ_min=1e-5) now match pipeline.json.
+Stage 3 (`tex_slat_sampler`) has `guidance_strength=1.0` → CFG fully disabled, so its
+`guidance_interval=[0.6,0.9]`/`guidance_rescale=0.0` are moot and the harness is already correct there.
+
 **Full bf16-block port — Stage-1 latent 0.9895 → 0.99739 (2026-05-29).** The gap is NOT a bug. The
 FlowEuler sampler and every config value match `model_root/pipeline.json` exactly
 (`guidance_interval=[0.6,1.0]` on the rescaled t, `guidance_strength=7.5`, `guidance_rescale=0.7`,
