@@ -192,3 +192,10 @@ rdna4/trellis2/ref_block*.npy
 rdna4/trellis2/build_t2/
 cpu/trellis2/__pycache__/
 cpu/trellis2/trellis2_repo/
+cpu/trellis2/trellis2_repo
+
+# trellis2 CUDA reference local artifacts (regenerate via run_*.sh; model_root/ckpts is a symlink)
+cuda/trellis2/__pycache__/
+cuda/trellis2/trellis2_cuda_ref.egg-info/
+cuda/trellis2/model_root/
+cuda/trellis2/verify-dumps/
