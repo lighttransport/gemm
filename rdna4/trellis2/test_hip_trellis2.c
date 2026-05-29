@@ -185,6 +185,19 @@ static double now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static void report_vram(const char *stage) {
+    size_t free_b = 0, total_b = 0;
+    if (hip_trellis2_mem_info(&free_b, &total_b) != 0) {
+        fprintf(stderr, "[vram] %-32s unavailable\n", stage);
+        return;
+    }
+    double total_mb = (double)total_b / 1048576.0;
+    double free_mb = (double)free_b / 1048576.0;
+    double used_mb = (double)(total_b - free_b) / 1048576.0;
+    fprintf(stderr, "[vram] %-32s used=%7.1f MB free=%7.1f MB total=%7.1f MB\n",
+            stage, used_mb, free_mb, total_mb);
+}
+
 /* Euler step: x = x - dt * velocity  (flow matching sign convention) */
 static void euler_step(float *x, const float *v, float dt, int n) {
     for (int i = 0; i < n; i++) x[i] -= dt * v[i];
@@ -544,6 +557,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Init HIP device %d...\n", device_id);
     hip_trellis2_runner *r = hip_trellis2_init(device_id, verbose);
     if (!r) { fprintf(stderr, "HIP init failed\n"); return 1; }
+    report_vram("after init");
 
     /* --- Load weights --- */
     if (need_dit) {
@@ -553,6 +567,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "DiT load failed\n"); hip_trellis2_free(r); return 1;
         }
         fprintf(stderr, "  DiT loaded in %.1f ms\n", now_ms() - t0);
+        report_vram("after stage1 DiT load");
     }
     if (need_decoder) {
         fprintf(stderr, "Loading decoder: %s\n", dec_path);
@@ -561,6 +576,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Decoder load failed\n"); hip_trellis2_free(r); return 1;
         }
         fprintf(stderr, "  Decoder loaded in %.1f ms\n", now_ms() - t0);
+        report_vram("after stage1 decoder load");
     }
 
     /* --- Load features --- */
@@ -870,6 +886,7 @@ int main(int argc, char **argv) {
         free(neg_cond); free(vel_uncond); free(t_seq);
         fprintf(stderr, "Total DiT: %.1f ms (%.1f ms/step)\n",
                 t_total, t_total / n_steps);
+        report_vram("after stage1 DiT sampling");
         print_stats("final latent", x, N_TOK * IN_CH);
 
         /* Save latent */
@@ -893,6 +910,7 @@ int main(int argc, char **argv) {
             free(x); free(vel); free(occupancy); goto cleanup;
         }
         fprintf(stderr, "Decode: %.1f ms\n", now_ms() - t0);
+        report_vram("after stage1 decode");
         print_stats("occupancy", occupancy, OCC_N);
 
         int occ_count = 0;
@@ -961,6 +979,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  Freeing SS DiT + decoder to free VRAM for SLAT...\n");
             hip_trellis2_unload_dit(r);
             hip_trellis2_unload_decoder(r);
+            report_vram("after stage1 unload");
 
             /* Load SLAT DiT + shape_dec. */
             fprintf(stderr, "  Loading SLAT DiT: %s\n", slat_path);
@@ -968,11 +987,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  SLAT DiT load failed\n");
                 free(sparse_coords); goto cleanup;
             }
+            report_vram("after SLAT DiT load");
             fprintf(stderr, "  Loading shape_dec: %s\n", shape_dec_path);
             if (hip_trellis2_load_shape_dec(r, shape_dec_path) != 0) {
                 fprintf(stderr, "  shape_dec load failed\n");
                 free(sparse_coords); goto cleanup;
             }
+            report_vram("after shape_dec load");
 
             /* Parse normalization constants. */
             float slat_mean[32], slat_std[32];
@@ -1063,6 +1084,7 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "  SLAT total: %.1f ms (%.1f ms/step)\n",
                     t_total, t_total / slat_steps);
+            report_vram("after SLAT sampling");
             free(neg_cond); free(v_cond); free(v_uncond);
 
             /* Denormalize: x = x * std + mean. */
@@ -1110,6 +1132,7 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "  shape_dec: %.1f ms, mesh: %d verts, %d tris\n",
                     now_ms() - t_dec, mesh.n_verts, mesh.n_tris);
+            report_vram("after shape_dec run");
 
             if (write_obj(save_mesh_path, mesh.vertices, mesh.n_verts,
                           mesh.triangles, mesh.n_tris) == 0) {
@@ -1150,6 +1173,7 @@ int main(int argc, char **argv) {
                     hip_trellis2_unload_dit(r);
                     hip_trellis2_unload_decoder(r);
                     hip_trellis2_unload_slat_dit(r);
+                    report_vram("after SLAT unload");
 
                     /* Load tex DiT. */
                     fprintf(stderr, "  Loading tex DiT: %s\n", tex_dit_path);
@@ -1157,6 +1181,7 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "  tex DiT load failed\n");
                         free(shape_for_tex); goto tex_done;
                     }
+                    report_vram("after tex DiT load");
 
                     /* tex_x = cat(noise[32], shape_for_tex[32]) per voxel — only the
                      * noise half evolves; the shape half stays as fixed conditioning. */
@@ -1205,6 +1230,7 @@ int main(int argc, char **argv) {
                     }
                     fprintf(stderr, "  Tex SLAT total: %.1f ms (%.1f ms/step)\n",
                             t_total_tex, t_total_tex / tex_steps);
+                    report_vram("after tex DiT sampling");
                     free(v_tex); free(shape_for_tex);
 
                     /* Denormalize tex SLat: tex = noise_half * std + mean. */
@@ -1221,6 +1247,7 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "  tex_dec load failed\n");
                         free(tex_slat); goto tex_done;
                     }
+                    report_vram("after tex_dec load");
 
                     /* Run tex_dec → [N_dense, 6] feats + dense coords. */
                     double t_tdec = now_ms();
@@ -1233,6 +1260,7 @@ int main(int argc, char **argv) {
                     }
                     fprintf(stderr, "  tex_dec: %.1f ms, N_tex=%d\n",
                             now_ms() - t_tdec, N_tex);
+                    report_vram("after tex_dec run");
                     /* Per-channel tex_feats stats (raw decoder output, 6-ch PBR). */
                     {
                         int out_ch = 6;
@@ -1265,18 +1293,14 @@ int main(int argc, char **argv) {
                             pbr.N, pbr.resolution, pbr.hash_cap); fflush(stderr);
                     t2_pbr_attr *colors = (t2_pbr_attr *)malloc(
                         (size_t)mesh.n_verts * sizeof(t2_pbr_attr));
-                    /* hip_trellis2_run_shape_dec() applies a CPU-axis X/Z swap on
-                     * mesh.vertices before returning. tex_coords are still in the
-                     * native voxel order, so undo the swap into a temp buffer for
-                     * the PBR sampler. */
-                    float *pbr_verts = (float *)malloc((size_t)mesh.n_verts * 3 * sizeof(float));
-                    for (int vi = 0; vi < mesh.n_verts; vi++) {
-                        pbr_verts[vi*3+0] = mesh.vertices[vi*3+2];
-                        pbr_verts[vi*3+1] = mesh.vertices[vi*3+1];
-                        pbr_verts[vi*3+2] = mesh.vertices[vi*3+0];
-                    }
-                    t2_pbr_sample_vertices(&pbr, pbr_verts, mesh.n_verts, colors);
-                    free(pbr_verts);
+                    /* mesh.vertices come back in native voxel orientation (x is the
+                     * full-span axis, matching the CUDA reference 13_mesh_vertices
+                     * and tex_coords col1=X / col2=Y / col3=Z). The PBR field stores
+                     * and looks up in that same native order, so sample directly —
+                     * NO axis swap. (A prior X/Z swap here, meant to undo a shape_dec
+                     * swap that no longer happens, dropped the per-vertex hit rate to
+                     * ~10% — verified 99.9% with no swap against the CUDA dumps.) */
+                    t2_pbr_sample_vertices(&pbr, mesh.vertices, mesh.n_verts, colors);
                     fprintf(stderr, "  sampled %d verts; colors[0]=(%.3f,%.3f,%.3f) mr=(%.3f,%.3f)\n",
                             mesh.n_verts, colors[0].r, colors[0].g, colors[0].b,
                             colors[0].metallic, colors[0].roughness); fflush(stderr);
@@ -1299,6 +1323,7 @@ int main(int argc, char **argv) {
                     free(colors);
                     t2_pbr_free(&pbr);
                     free(tex_feats); free(tex_coords);
+                    report_vram("after PBR bake");
                     hip_trellis2_unload_tex_dec(r);
                 }
             }
@@ -1313,6 +1338,7 @@ int main(int argc, char **argv) {
 cleanup:
     if (features) free(features);
     if (noise)    free(noise);
+    report_vram("before runner free");
     hip_trellis2_free(r);
     return 0;
 }

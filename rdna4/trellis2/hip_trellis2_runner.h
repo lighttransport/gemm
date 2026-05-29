@@ -24,6 +24,7 @@
 #define HIP_TRELLIS2_RUNNER_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +45,9 @@ int hip_trellis2_load_decoder(hip_trellis2_runner *r, const char *safetensors_pa
 
 /* Free all resources. */
 void hip_trellis2_free(hip_trellis2_runner *r);
+
+/* Query current HIP device memory. Returns 0 on success. */
+int hip_trellis2_mem_info(size_t *free_bytes, size_t *total_bytes);
 
 /* Free SS DiT weights/scratch/KV. Reclaims ~5 GB on a 1.3B-param F32 DiT.
  * Safe to call after SS sampling completes. Subsequent dit_step calls will
