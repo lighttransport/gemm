@@ -39,12 +39,15 @@ enum {
     CUBLAS_SIDE_RIGHT = 1,  /* cublas*dgmm: C = A * diag(x) */
     CUDA_R_32F = 0,
     CUDA_R_16F = 2,
+    CUDA_R_8I = 3,
+    CUDA_R_32I = 10,
     CUDA_R_16BF = 14,
     CUDA_R_8F_E4M3 = 28,
     CUDA_R_8F_E5M2 = 29,
     CUBLAS_COMPUTE_16F = 64,
     CUBLAS_COMPUTE_32F = 68,
     CUBLAS_COMPUTE_32F_PEDANTIC = 69,
+    CUBLAS_COMPUTE_32I = 72,
     CUBLAS_COMPUTE_32F_FAST_TF32 = 77,
     CUBLAS_GEMM_DEFAULT = -1
 };
@@ -853,6 +856,37 @@ int cublasew_gemm_f32_pedantic_rowmajor_nt(cublasew_context *ctx,
                           &beta,
                           (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
                           CUBLAS_COMPUTE_32F_PEDANTIC,
+                          CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+/* INT8 W8A8 GEMM via cublasGemmEx: int8 x int8 -> int32 (CUBLAS_COMPUTE_32I).
+ * Row-major semantics Y[n_tok,n_out] = Xq[n_tok,n_in] @ Wq[n_out,n_in]^T, same
+ * transpose convention as the f32 *_rowmajor_nt wrappers. The int32 accumulate
+ * is order-independent, so the result is BIT-EXACT regardless of cuBLAS's
+ * tiling/algo (and identical to a HIP int8 GEMM with the same int8 inputs) —
+ * the whole point of the int8 path. Output d_Yi32 is int32 [n_tok,n_out]
+ * (= column-major [n_out,n_tok] with ldc=n_out); a separate kernel dequants it
+ * to bf16 with x_scale[t]*w_scale[o]+bias. Caller ensures n_out/n_in/n_tok are
+ * multiples of 4 (cuBLAS IMMA alignment); qimg linears always are. */
+int cublasew_gemm_int8_s32_rowmajor_nt(cublasew_context *ctx,
+                                       CUdeviceptr d_Yi32,
+                                       CUdeviceptr d_Wq,
+                                       CUdeviceptr d_Xq,
+                                       int n_tok,
+                                       int n_out,
+                                       int n_in) {
+    const int alpha = 1;
+    const int beta = 0;
+    if (!ctx || !ctx->handle) return -1;
+    return p_cublasGemmEx(ctx->handle,
+                          CUBLAS_OP_T, CUBLAS_OP_N,
+                          n_out, n_tok, n_in,
+                          &alpha,
+                          (const void *)(uintptr_t)d_Wq, CUDA_R_8I, n_in,
+                          (const void *)(uintptr_t)d_Xq, CUDA_R_8I, n_in,
+                          &beta,
+                          (void *)(uintptr_t)d_Yi32, CUDA_R_32I, n_out,
+                          CUBLAS_COMPUTE_32I,
                           CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
 

@@ -75,6 +75,29 @@ static void print_first_n(const char *label, const float *v, int n, int show) {
  * + scalar matvec on identical random raw bytes. */
 typedef void (*deq_row_fn)(const void *src, float *dst, int n);
 
+static int quant_type_from_name(const char *s) {
+    if (!s) return -1;
+    if (strcmp(s, "Q4_K") == 0)    return GGML_TYPE_Q4_K;
+    if (strcmp(s, "Q5_K") == 0)    return GGML_TYPE_Q5_K;
+    if (strcmp(s, "Q6_K") == 0)    return GGML_TYPE_Q6_K;
+    if (strcmp(s, "Q4_0") == 0)    return GGML_TYPE_Q4_0;
+    if (strcmp(s, "Q4_1") == 0)    return GGML_TYPE_Q4_1;
+    if (strcmp(s, "Q5_0") == 0)    return GGML_TYPE_Q5_0;
+    if (strcmp(s, "Q5_1") == 0)    return GGML_TYPE_Q5_1;
+    if (strcmp(s, "IQ2_XXS") == 0) return GGML_TYPE_IQ2_XXS;
+    if (strcmp(s, "IQ2_XS") == 0)  return GGML_TYPE_IQ2_XS;
+    if (strcmp(s, "IQ2_S") == 0)   return GGML_TYPE_IQ2_S;
+    if (strcmp(s, "IQ3_XXS") == 0) return GGML_TYPE_IQ3_XXS;
+    if (strcmp(s, "IQ3_S") == 0)   return GGML_TYPE_IQ3_S;
+    if (strcmp(s, "IQ1_S") == 0)   return GGML_TYPE_IQ1_S;
+    if (strcmp(s, "IQ1_M") == 0)   return GGML_TYPE_IQ1_M;
+    if (strcmp(s, "IQ4_NL") == 0)  return GGML_TYPE_IQ4_NL;
+    if (strcmp(s, "IQ4_XS") == 0)  return GGML_TYPE_IQ4_XS;
+    if (strcmp(s, "TQ1_0") == 0)   return GGML_TYPE_TQ1_0;
+    if (strcmp(s, "TQ2_0") == 0)   return GGML_TYPE_TQ2_0;
+    return -1;
+}
+
 static int run_verify_quant_kernels(void) {
     fprintf(stderr, "=== --verify-quant-kernels: A/B HIP matvec vs CPU dequant+matvec ===\n");
     fprintf(stderr, "Shape: n_rows=64, n_cols=512.  Pass threshold: rel_l2 < 1e-4.\n\n");
@@ -83,6 +106,13 @@ static int run_verify_quant_kernels(void) {
     if (!r) { fprintf(stderr, "hip_llm_init failed\n"); return 1; }
 
     struct { int type; const char *name; deq_row_fn fn; } cases[] = {
+        { GGML_TYPE_Q4_K,    "Q4_K",    dequantize_row_q4_K    },
+        { GGML_TYPE_Q5_K,    "Q5_K",    dequantize_row_q5_K    },
+        { GGML_TYPE_Q6_K,    "Q6_K",    dequantize_row_q6_K    },
+        { GGML_TYPE_Q4_0,    "Q4_0",    dequantize_row_q4_0    },
+        { GGML_TYPE_Q4_1,    "Q4_1",    dequantize_row_q4_1    },
+        { GGML_TYPE_Q5_0,    "Q5_0",    dequantize_row_q5_0    },
+        { GGML_TYPE_Q5_1,    "Q5_1",    dequantize_row_q5_1    },
         { GGML_TYPE_IQ2_XXS, "IQ2_XXS", dequantize_row_iq2_xxs },
         { GGML_TYPE_IQ2_XS,  "IQ2_XS",  dequantize_row_iq2_xs  },
         { GGML_TYPE_IQ2_S,   "IQ2_S",   dequantize_row_iq2_s   },
@@ -123,6 +153,53 @@ static int run_verify_quant_kernels(void) {
     return n_fail == 0 ? 0 : 2;
 }
 
+static int cmp_float_asc(const void *a, const void *b) {
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static int run_bench_quant_matvec(const char *type_name, int n_rows, int n_cols, int iters, int repeats) {
+    int type = quant_type_from_name(type_name);
+    if (type < 0 || n_rows <= 0 || n_cols <= 0 || iters <= 0 || repeats <= 0) {
+        fprintf(stderr, "Invalid --bench-quant-matvec args. Usage: --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]\n");
+        return 1;
+    }
+
+    hip_llm_runner *r = hip_llm_init(0, 0);
+    if (!r) { fprintf(stderr, "hip_llm_init failed\n"); return 1; }
+
+    float *samples = (float *)malloc((size_t)repeats * sizeof(float));
+    if (!samples) {
+        hip_llm_free(r);
+        return 1;
+    }
+    int rc = 0;
+    for (int rep = 0; rep < repeats; rep++) {
+        rc = hip_llm_bench_quant_matvec(r, type, n_rows, n_cols, 20, iters, &samples[rep]);
+        if (rc != 0) break;
+    }
+    hip_llm_free(r);
+    if (rc != 0) {
+        free(samples);
+        fprintf(stderr, "--bench-quant-matvec failed (type=%s rows=%d cols=%d iters=%d repeats=%d rc=%d)\n",
+                type_name, n_rows, n_cols, iters, repeats, rc);
+        return 1;
+    }
+
+    qsort(samples, (size_t)repeats, sizeof(float), cmp_float_asc);
+    float ms = samples[repeats / 2];
+    float min_ms = samples[0];
+    float max_ms = samples[repeats - 1];
+    double dot_ops = 2.0 * (double)n_rows * (double)n_cols;
+    double gops = dot_ops / (double)ms / 1.0e6;
+    fprintf(stderr,
+            "quant_matvec %s rows=%d cols=%d iters=%d repeats=%d: median %.6f ms/launch  %.2f GOP/s  range [%.6f, %.6f]\n",
+            type_name, n_rows, n_cols, iters, repeats, ms, gops, min_ms, max_ms);
+    free(samples);
+    return 0;
+}
+
 /* ---- Main ---- */
 
 static int argmax_logits(const float *logits, int n) {
@@ -145,11 +222,51 @@ int main(int argc, char **argv) {
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
+    const char *bench_qmv_type = NULL; /* --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS] */
+    int bench_qmv_rows = 0, bench_qmv_cols = 0, bench_qmv_iters = 0, bench_qmv_repeats = 1;
+
+    /* --st <qwen3.safetensors>: sanity-check the safetensors loader + hidden
+     * snapshots (text-encoder path). Loads, runs a few forwards, prints snapshot
+     * norms (finite + reasonable = loader OK), then exits. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--st") == 0 && i + 1 < argc) {
+            const char *st_path = argv[i + 1];
+            hip_llm_runner *r = hip_llm_init(0, 1);
+            if (!r || hip_llm_load_weights_qwen3_safetensors(r, st_path, 512) != 0) {
+                fprintf(stderr, "--st: load failed\n"); return 1;
+            }
+            int hs[3] = {8, 17, 26};
+            if (hip_llm_set_hidden_snapshot_layers(r, hs, 3) != 0) { fprintf(stderr, "--st: set snapshots failed\n"); return 1; }
+            int n = hip_llm_n_embd(r);
+            float *snap = (float *)malloc((size_t)3 * n * sizeof(float));
+            hip_llm_reset_state(r);
+            for (int pos = 0; pos < 5; pos++) {
+                int32_t tok = (int32_t)(100 + pos);
+                if (!hip_llm_forward(r, tok, pos)) { fprintf(stderr, "--st: forward failed at pos %d\n", pos); return 1; }
+                if (hip_llm_read_hidden_snapshots(r, snap, 3, n) != 0) { fprintf(stderr, "--st: read snapshots failed\n"); return 1; }
+                for (int s = 0; s < 3; s++) {
+                    double nn = 0; int nan = 0;
+                    for (int j = 0; j < n; j++) { float v = snap[s*n+j]; if (v != v) nan = 1; nn += (double)v*v; }
+                    printf("pos %d  layer[%d]  norm=%.4f  first=%.5f%s\n", pos, hs[s], sqrt(nn), snap[s*n], nan ? "  NaN!" : "");
+                }
+            }
+            free(snap); hip_llm_free(r);
+            return 0;
+        }
+    }
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--verify-quant-kernels") == 0) {
             verify_quant_kernels = 1;
+        } else if (strcmp(argv[i], "--bench-quant-matvec") == 0 && i + 4 < argc) {
+            bench_qmv_type = argv[++i];
+            bench_qmv_rows = atoi(argv[++i]);
+            bench_qmv_cols = atoi(argv[++i]);
+            bench_qmv_iters = atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                bench_qmv_repeats = atoi(argv[++i]);
+            }
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -172,6 +289,7 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
             fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
+            fprintf(stderr, "       [--verify-quant-kernels] [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]\n");
             return 1;
         }
     }
@@ -180,11 +298,16 @@ int main(int argc, char **argv) {
     if (verify_quant_kernels) {
         return run_verify_quant_kernels();
     }
+    if (bench_qmv_type) {
+        return run_bench_quant_matvec(bench_qmv_type, bench_qmv_rows, bench_qmv_cols,
+                                      bench_qmv_iters, bench_qmv_repeats);
+    }
 
     if (!model_path) {
         fprintf(stderr, "Usage: %s <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
         fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
         fprintf(stderr, "       [--verify-quant-kernels]   (standalone; no model needed)\n");
+        fprintf(stderr, "       [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]   (standalone)\n");
         return 1;
     }
 
