@@ -2899,6 +2899,9 @@ int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
         int has_smooth = safetensors_find(st, "blocks.0.self_attn.to_qkv.smooth_scale") >= 0;
         fprintf(stderr, "T2-HIP: SLAT DiT INT8 W8A8 enabled%s\n",
                 has_smooth ? " (SmoothQuant)" : "");
+        fprintf(stderr, "T2-HIP: NOTE INT8 SLAT GEMM is ~2.5x slower than bf16 here "
+                "(unoptimized W8A8 WMMA); bf16 SLAT fits 16 GB and is the recommended "
+                "default. Use INT8 only when memory-constrained.\n");
     }
 
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
@@ -3318,6 +3321,9 @@ int hip_trellis2_load_tex_dit(hip_trellis2_runner *r, const char *path) {
         int has_smooth = safetensors_find(st, "blocks.0.self_attn.to_qkv.smooth_scale") >= 0;
         fprintf(stderr, "T2-HIP: tex DiT INT8 W8A8 enabled%s\n",
                 has_smooth ? " (SmoothQuant)" : "");
+        fprintf(stderr, "T2-HIP: NOTE INT8 tex GEMM is ~2.5x slower than bf16 here "
+                "(unoptimized W8A8 WMMA); bf16 tex fits 16 GB and is the recommended "
+                "default. Use INT8 only when memory-constrained.\n");
     }
 
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
