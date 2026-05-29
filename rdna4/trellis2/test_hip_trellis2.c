@@ -185,6 +185,19 @@ static double now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static void report_vram(const char *stage) {
+    size_t free_b = 0, total_b = 0;
+    if (hip_trellis2_mem_info(&free_b, &total_b) != 0) {
+        fprintf(stderr, "[vram] %-32s unavailable\n", stage);
+        return;
+    }
+    double total_mb = (double)total_b / 1048576.0;
+    double free_mb = (double)free_b / 1048576.0;
+    double used_mb = (double)(total_b - free_b) / 1048576.0;
+    fprintf(stderr, "[vram] %-32s used=%7.1f MB free=%7.1f MB total=%7.1f MB\n",
+            stage, used_mb, free_mb, total_mb);
+}
+
 /* Euler step: x = x - dt * velocity  (flow matching sign convention) */
 static void euler_step(float *x, const float *v, float dt, int n) {
     for (int i = 0; i < n; i++) x[i] -= dt * v[i];
@@ -396,8 +409,13 @@ int main(int argc, char **argv) {
     int mode_mesh        = 0;
     int mode_tex         = 0;
     int mode_shape_only  = 0;
+    int mode_slat_step   = 0;
+    int mode_tex_step    = 0;
+    const char *step_dir = "rdna4/trellis2/verify-dumps-rocm-e2e-tex";
     const char *shape_feats_npy = NULL;
     const char *shape_coords_npy = NULL;
+    const char *slat_noise_npy = NULL;   /* verify: override SLAT init noise (CUDA 06) */
+    const char *slat_coords_npy = NULL;  /* verify: override SLAT coords (CUDA 05) */
 
     if (argc < 2) { print_usage(argv[0]); return 1; }
 
@@ -435,6 +453,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tex-res") && i+1 < argc) tex_res = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slat-steps") && i+1 < argc) slat_steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--shape-only"))    mode_shape_only = 1;
+        else if (!strcmp(argv[i], "--slat-step"))     mode_slat_step = 1;
+        else if (!strcmp(argv[i], "--tex-step"))      mode_tex_step = 1;
+        else if (!strcmp(argv[i], "--step-dir") && i+1 < argc) step_dir = argv[++i];
+        else if (!strcmp(argv[i], "--slat-noise-npy") && i+1 < argc) slat_noise_npy = argv[++i];
+        else if (!strcmp(argv[i], "--slat-coords-npy") && i+1 < argc) slat_coords_npy = argv[++i];
         else if (!strcmp(argv[i], "--shape-feats-npy") && i+1 < argc) shape_feats_npy = argv[++i];
         else if (!strcmp(argv[i], "--shape-coords-npy") && i+1 < argc) shape_coords_npy = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -444,7 +467,8 @@ int main(int argc, char **argv) {
 
     /* Default mode: full */
     if (!mode_full && !mode_dit_only && !mode_decode_only &&
-        !mode_dump_blocks && !mode_verify_step && !mode_dump_b0 && !mode_shape_only) {
+        !mode_dump_blocks && !mode_verify_step && !mode_dump_b0 && !mode_shape_only &&
+        !mode_slat_step && !mode_tex_step) {
         mode_full = 1;
     }
 
@@ -505,6 +529,70 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* Single-step SLAT/tex DiT velocity dump for precision iteration.
+     * Loads the CUDA reference single-step inputs (06b_/10b_*) from --step-dir,
+     * runs ONE forward, writes hip_{slat,tex}_velocity.npy. Compare vs the
+     * reference *_velocity.npy (bf16 = achievable ceiling, INT8 = the gap). */
+    if (mode_slat_step || mode_tex_step) {
+        int is_tex = mode_tex_step;
+        const char *dit = is_tex ? tex_dit_path : slat_path;
+        const char *pfx = is_tex ? "10b_tex_dit_step" : "06b_slat_dit_step";
+        if (!dit) {
+            fprintf(stderr, "Error: --%s-step requires --%s-dit\n",
+                    is_tex ? "tex" : "slat", is_tex ? "tex" : "slat");
+            return 1;
+        }
+        hip_trellis2_runner *r = hip_trellis2_init(device_id, verbose);
+        if (!r) { fprintf(stderr, "init failed\n"); return 1; }
+        int rc = is_tex ? hip_trellis2_load_tex_dit(r, dit)
+                        : hip_trellis2_load_slat_dit(r, dit);
+        if (rc != 0) { fprintf(stderr, "load %s dit failed\n", is_tex?"tex":"slat");
+            hip_trellis2_free(r); return 1; }
+        char path[1200]; int nd, dims[8];
+        snprintf(path, sizeof(path), "%s/%s_x_t.npy", step_dir, pfx);
+        float *x_t = read_npy_f32(path, &nd, dims);
+        int N = dims[0], Cin = dims[1];
+        int cnd, cdims[8];
+        snprintf(path, sizeof(path), "%s/%s_coords.npy", step_dir, pfx);
+        int32_t *coords = read_npy_i32(path, &cnd, cdims);
+        int tnd, tdims[8];
+        snprintf(path, sizeof(path), "%s/%s_t.npy", step_dir, pfx);
+        float *t_arr = read_npy_f32(path, &tnd, tdims);
+        int ond, odims[8];
+        snprintf(path, sizeof(path), "%s/%s_cond.npy", step_dir, pfx);
+        float *cond = read_npy_f32(path, &ond, odims);
+        if (!x_t || !coords || !t_arr || !cond) {
+            fprintf(stderr, "bad single-step inputs in %s\n", step_dir); return 1; }
+        /* The 06b/10b reference dumps bypass the sampler (direct model call at
+         * raw t), but hip_trellis2_*_dit_step multiplies t by 1000 (the sampler
+         * convention). So divide the reference t by 1000 to compensate (matches
+         * verify_slat_dit). --t overrides with a raw step-t for probing. */
+        float t_val = (dit_t != 0.5f) ? dit_t : (t_arr[0] / 1000.0f);
+        int n_cond = (ond == 3) ? odims[1] : odims[0];  /* [1,1029,1024] or [1029,1024] */
+        float *vel = (float *)malloc((size_t)N * 32 * sizeof(float));
+        /* T2_STEP_ITERS>1: repeat the forward (KV cache persists across iters →
+         * iter 2+ are warm) and report the last iter's time. */
+        int iters = 1; { const char *e = getenv("T2_STEP_ITERS"); if (e && atoi(e) > 0) iters = atoi(e); }
+        double t0 = 0;
+        for (int it = 0; it < iters; it++) {
+            t0 = now_ms();
+            rc = is_tex ? hip_trellis2_tex_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel)
+                        : hip_trellis2_slat_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel);
+            if (rc != 0) { fprintf(stderr, "%s dit_step failed\n", is_tex?"tex":"slat"); return 1; }
+        }
+        fprintf(stderr, "%s step (iter %d/%d, warm): N=%d Cin=%d t=%.4f n_cond=%d  %.1f ms\n",
+                is_tex ? "tex" : "slat", iters, iters, N, Cin, t_val, n_cond, now_ms() - t0);
+        print_stats("velocity", vel, N * 32);
+        char out[1300];
+        snprintf(out, sizeof(out), "%s/hip_%s_velocity.npy", output_dir, is_tex?"tex":"slat");
+        int vdims[2] = { N, 32 };
+        write_npy_f32(out, vel, vdims, 2);
+        fprintf(stderr, "Wrote %s\n", out);
+        free(x_t); free(coords); free(t_arr); free(cond); free(vel);
+        hip_trellis2_free(r);
+        return 0;
+    }
+
     /* Validate */
     int need_dit     = mode_full || mode_dit_only || mode_dump_blocks || mode_verify_step || mode_dump_b0;
     int need_decoder = mode_full || mode_decode_only || mode_verify_step;
@@ -544,6 +632,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Init HIP device %d...\n", device_id);
     hip_trellis2_runner *r = hip_trellis2_init(device_id, verbose);
     if (!r) { fprintf(stderr, "HIP init failed\n"); return 1; }
+    report_vram("after init");
 
     /* --- Load weights --- */
     if (need_dit) {
@@ -553,6 +642,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "DiT load failed\n"); hip_trellis2_free(r); return 1;
         }
         fprintf(stderr, "  DiT loaded in %.1f ms\n", now_ms() - t0);
+        report_vram("after stage1 DiT load");
     }
     if (need_decoder) {
         fprintf(stderr, "Loading decoder: %s\n", dec_path);
@@ -561,6 +651,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Decoder load failed\n"); hip_trellis2_free(r); return 1;
         }
         fprintf(stderr, "  Decoder loaded in %.1f ms\n", now_ms() - t0);
+        report_vram("after stage1 decoder load");
     }
 
     /* --- Load features --- */
@@ -870,6 +961,7 @@ int main(int argc, char **argv) {
         free(neg_cond); free(vel_uncond); free(t_seq);
         fprintf(stderr, "Total DiT: %.1f ms (%.1f ms/step)\n",
                 t_total, t_total / n_steps);
+        report_vram("after stage1 DiT sampling");
         print_stats("final latent", x, N_TOK * IN_CH);
 
         /* Save latent */
@@ -893,6 +985,7 @@ int main(int argc, char **argv) {
             free(x); free(vel); free(occupancy); goto cleanup;
         }
         fprintf(stderr, "Decode: %.1f ms\n", now_ms() - t0);
+        report_vram("after stage1 decode");
         print_stats("occupancy", occupancy, OCC_N);
 
         int occ_count = 0;
@@ -953,6 +1046,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  Sparse voxels (32^3 max-pool): %d\n", N_sparse);
             free(occ32); free(occupancy);
 
+            /* [verify] Override SLAT coords with a CUDA reference dump so the SLAT
+             * trajectory is directly comparable to CUDA 08 (bypasses HIP-vs-CUDA
+             * occupancy diff). Used with --slat-noise-npy. */
+            if (slat_coords_npy) {
+                int snd = 0, sdims[8] = {0};
+                int32_t *cc = read_npy_i32(slat_coords_npy, &snd, sdims);
+                if (cc && snd == 2 && sdims[1] == 4) {
+                    free(sparse_coords);
+                    sparse_coords = cc; N_sparse = sdims[0];
+                    fprintf(stderr, "  [verify] SLAT coords <- %s: N=%d\n", slat_coords_npy, N_sparse);
+                } else { fprintf(stderr, "  [verify] bad --slat-coords-npy, ignoring\n"); free(cc); }
+            }
+
             /* Free SS DiT + SS decoder before loading SLAT — SLAT's 1.3B F32
              * weights (~5 GB) on top of SS DiT (~5 GB) + decoder pushes a
              * 16 GB GPU into HMM page-fault thrashing. Unloading drops peak
@@ -961,6 +1067,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  Freeing SS DiT + decoder to free VRAM for SLAT...\n");
             hip_trellis2_unload_dit(r);
             hip_trellis2_unload_decoder(r);
+            report_vram("after stage1 unload");
 
             /* Load SLAT DiT + shape_dec. */
             fprintf(stderr, "  Loading SLAT DiT: %s\n", slat_path);
@@ -968,11 +1075,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  SLAT DiT load failed\n");
                 free(sparse_coords); goto cleanup;
             }
+            report_vram("after SLAT DiT load");
             fprintf(stderr, "  Loading shape_dec: %s\n", shape_dec_path);
             if (hip_trellis2_load_shape_dec(r, shape_dec_path) != 0) {
                 fprintf(stderr, "  shape_dec load failed\n");
                 free(sparse_coords); goto cleanup;
             }
+            report_vram("after shape_dec load");
 
             /* Parse normalization constants. */
             float slat_mean[32], slat_std[32];
@@ -990,15 +1099,35 @@ int main(int argc, char **argv) {
             float *s2_x = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
             rng_seed(seed + 1);
             for (int i = 0; i < N_sparse * SLAT_CH; i++) s2_x[i] = randn();
+            /* [verify] Override SLAT init noise with a CUDA reference dump (06) so
+             * the full 12-step trajectory is comparable to CUDA 08. */
+            if (slat_noise_npy) {
+                int snd = 0, sdims[8] = {0};
+                float *nn = read_npy_f32(slat_noise_npy, &snd, sdims);
+                if (nn && snd == 2 && sdims[0] == N_sparse && sdims[1] == SLAT_CH) {
+                    memcpy(s2_x, nn, (size_t)N_sparse * SLAT_CH * sizeof(float));
+                    fprintf(stderr, "  [verify] SLAT noise <- %s\n", slat_noise_npy);
+                } else {
+                    fprintf(stderr, "  [verify] --slat-noise-npy shape mismatch "
+                            "(got [%d,%d], want [%d,%d]), ignoring\n",
+                            sdims[0], sdims[1], N_sparse, SLAT_CH);
+                }
+                free(nn);
+            }
 
             /* CFG zero-cond buffer. */
             float *neg_cond = (float *)calloc((size_t)N_COND * COND_DIM, sizeof(float));
             float *v_cond   = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
             float *v_uncond = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
 
+            /* shape_slat_sampler params from pipeline.json: steps=12,
+             * guidance_strength=7.5, guidance_rescale=0.5 (NOT 0.7 — that's the
+             * sparse_structure_sampler value), guidance_interval=[0.6,1.0],
+             * rescale_t=3.0. The 0.7 here was wrong and diverged the 12-step
+             * trajectory (cos vs CUDA 08: 0.95 -> ~0.99 after fix). */
             const float s2_rescale_t = 3.0f;
             const float s2_cfg       = 7.5f;
-            const float s2_rescale   = 0.7f;
+            const float s2_rescale   = 0.5f;
             const float s2_sigma_min = 1e-5f;
 
             double t_total = 0;
@@ -1063,6 +1192,7 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "  SLAT total: %.1f ms (%.1f ms/step)\n",
                     t_total, t_total / slat_steps);
+            report_vram("after SLAT sampling");
             free(neg_cond); free(v_cond); free(v_uncond);
 
             /* Denormalize: x = x * std + mean. */
@@ -1110,6 +1240,7 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "  shape_dec: %.1f ms, mesh: %d verts, %d tris\n",
                     now_ms() - t_dec, mesh.n_verts, mesh.n_tris);
+            report_vram("after shape_dec run");
 
             if (write_obj(save_mesh_path, mesh.vertices, mesh.n_verts,
                           mesh.triangles, mesh.n_tris) == 0) {
@@ -1150,6 +1281,7 @@ int main(int argc, char **argv) {
                     hip_trellis2_unload_dit(r);
                     hip_trellis2_unload_decoder(r);
                     hip_trellis2_unload_slat_dit(r);
+                    report_vram("after SLAT unload");
 
                     /* Load tex DiT. */
                     fprintf(stderr, "  Loading tex DiT: %s\n", tex_dit_path);
@@ -1157,6 +1289,7 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "  tex DiT load failed\n");
                         free(shape_for_tex); goto tex_done;
                     }
+                    report_vram("after tex DiT load");
 
                     /* tex_x = cat(noise[32], shape_for_tex[32]) per voxel — only the
                      * noise half evolves; the shape half stays as fixed conditioning. */
@@ -1205,6 +1338,7 @@ int main(int argc, char **argv) {
                     }
                     fprintf(stderr, "  Tex SLAT total: %.1f ms (%.1f ms/step)\n",
                             t_total_tex, t_total_tex / tex_steps);
+                    report_vram("after tex DiT sampling");
                     free(v_tex); free(shape_for_tex);
 
                     /* Denormalize tex SLat: tex = noise_half * std + mean. */
@@ -1221,6 +1355,7 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "  tex_dec load failed\n");
                         free(tex_slat); goto tex_done;
                     }
+                    report_vram("after tex_dec load");
 
                     /* Run tex_dec → [N_dense, 6] feats + dense coords. */
                     double t_tdec = now_ms();
@@ -1233,6 +1368,7 @@ int main(int argc, char **argv) {
                     }
                     fprintf(stderr, "  tex_dec: %.1f ms, N_tex=%d\n",
                             now_ms() - t_tdec, N_tex);
+                    report_vram("after tex_dec run");
                     /* Per-channel tex_feats stats (raw decoder output, 6-ch PBR). */
                     {
                         int out_ch = 6;
@@ -1265,18 +1401,14 @@ int main(int argc, char **argv) {
                             pbr.N, pbr.resolution, pbr.hash_cap); fflush(stderr);
                     t2_pbr_attr *colors = (t2_pbr_attr *)malloc(
                         (size_t)mesh.n_verts * sizeof(t2_pbr_attr));
-                    /* hip_trellis2_run_shape_dec() applies a CPU-axis X/Z swap on
-                     * mesh.vertices before returning. tex_coords are still in the
-                     * native voxel order, so undo the swap into a temp buffer for
-                     * the PBR sampler. */
-                    float *pbr_verts = (float *)malloc((size_t)mesh.n_verts * 3 * sizeof(float));
-                    for (int vi = 0; vi < mesh.n_verts; vi++) {
-                        pbr_verts[vi*3+0] = mesh.vertices[vi*3+2];
-                        pbr_verts[vi*3+1] = mesh.vertices[vi*3+1];
-                        pbr_verts[vi*3+2] = mesh.vertices[vi*3+0];
-                    }
-                    t2_pbr_sample_vertices(&pbr, pbr_verts, mesh.n_verts, colors);
-                    free(pbr_verts);
+                    /* mesh.vertices come back in native voxel orientation (x is the
+                     * full-span axis, matching the CUDA reference 13_mesh_vertices
+                     * and tex_coords col1=X / col2=Y / col3=Z). The PBR field stores
+                     * and looks up in that same native order, so sample directly —
+                     * NO axis swap. (A prior X/Z swap here, meant to undo a shape_dec
+                     * swap that no longer happens, dropped the per-vertex hit rate to
+                     * ~10% — verified 99.9% with no swap against the CUDA dumps.) */
+                    t2_pbr_sample_vertices(&pbr, mesh.vertices, mesh.n_verts, colors);
                     fprintf(stderr, "  sampled %d verts; colors[0]=(%.3f,%.3f,%.3f) mr=(%.3f,%.3f)\n",
                             mesh.n_verts, colors[0].r, colors[0].g, colors[0].b,
                             colors[0].metallic, colors[0].roughness); fflush(stderr);
@@ -1299,6 +1431,7 @@ int main(int argc, char **argv) {
                     free(colors);
                     t2_pbr_free(&pbr);
                     free(tex_feats); free(tex_coords);
+                    report_vram("after PBR bake");
                     hip_trellis2_unload_tex_dec(r);
                 }
             }
@@ -1313,6 +1446,7 @@ int main(int argc, char **argv) {
 cleanup:
     if (features) free(features);
     if (noise)    free(noise);
+    report_vram("before runner free");
     hip_trellis2_free(r);
     return 0;
 }
