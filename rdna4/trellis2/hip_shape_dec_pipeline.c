@@ -60,6 +60,13 @@
  * ======================================================================== */
 
 static int g_use_triton_klin = 0;
+/* Latched on any dense-linear (klin) kernel launch failure. The klin wrappers
+ * (klin_bl / klin_bl_silu / run_convnext) are void and called in tight loops,
+ * so rather than thread a return code through every signature we set this flag
+ * and have hip_shape_dec_forward_ex() fail the whole decode. Catches the
+ * grid-Y-overflow class of bug that previously produced silent all-zero output
+ * (0 triangles / black texture) instead of an error. */
+static int g_shape_dec_lin_err = 0;
 static hipStream_t g_stream = NULL;
 static int g_use_blaslt = 0;
 static void *g_d_act_bf16 = NULL;
@@ -296,13 +303,29 @@ static void kadd(K *k, void *x, void *y, int n) {
     void *a[] = {&x, &y, &n};
     hipModuleLaunchKernel(k->add, (n+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
-static void klin(K *k, void *o, void *i, void *w, void *b, int N, int inC, int outC) {
-    int gx = (outC+15)/16, gy = (N+15)/16;
-    void *a[] = {&o, &i, &w, &b, &N, &inC, &outC};
+static int klin(K *k, void *o, void *i, void *w, void *b, int N, int inC, int outC) {
+    const int BM = 16;
+    const int max_grid_y = 60000;
+    const int max_rows = BM * max_grid_y;
     static int use_naive = -1;
     if (use_naive < 0) use_naive = (getenv("T2_LIN_NAIVE") && atoi(getenv("T2_LIN_NAIVE"))) ? 1 : 0;
     hipFunction_t fn = use_naive ? k->lin_naive : k->lin;
-    hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, g_stream, a, NULL);
+    for (int m0 = 0; m0 < N; m0 += max_rows) {
+        int M = (N - m0 < max_rows) ? (N - m0) : max_rows;
+        float *o_chunk = (float *)o + (size_t)m0 * outC;
+        float *i_chunk = (float *)i + (size_t)m0 * inC;
+        int gx = (outC + 15) / 16, gy = (M + 15) / 16;
+        void *a[] = {&o_chunk, &i_chunk, &w, &b, &M, &inC, &outC};
+        hipError_t err = hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1,
+                                               0, g_stream, a, NULL);
+        if (err != hipSuccess) {
+            fprintf(stderr, "T2-TEX: linear launch failed (N=%d inC=%d outC=%d, chunk=%d, err=%d)\n",
+                    N, inC, outC, M, (int)err);
+            g_shape_dec_lin_err = 1;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static void *get_bf16_weight(const float *host_w_f32, size_t n_elems) {
@@ -1063,6 +1086,7 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
                              int *out_Nf)
 {
     if (!ctx || !ctx->initialized) return -1;
+    g_shape_dec_lin_err = 0;
     g_stream = ctx->stream;
     const t2_shape_dec *dec = ctx->dec;
     K *k = &g_K;
@@ -1092,8 +1116,16 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     if (hipMalloc(&d_vals, (size_t)cap*sizeof(int32_t)) != hipSuccess) {
         fprintf(stderr, "T2-TEX: hipMalloc d_vals failed\n"); return -1;
     }
-    hipMemset(d_keys, 0, (size_t)cap*sizeof(uint64_t));
-    hipMemset(d_vals, 0xff, (size_t)cap*sizeof(int32_t));
+    /* Zero/-1 the hash on g_stream (NOT the default stream): hash_build runs on
+     * g_stream, which is created hipStreamNonBlocking and therefore does NOT
+     * implicitly synchronize with the default stream. A plain hipMemset (default
+     * stream) can land AFTER hash_build under non-default kernel scheduling
+     * (warm GPU / AMD_SERIALIZE_KERNEL / HSA_ENABLE_SDMA=0), wiping the freshly
+     * built table to -1 -> empty neighbor map -> ConvNeXt sees only self -> ~9%
+     * of voxels lost in the knife-edge to_subdiv threshold. Same-stream async
+     * memset orders correctly (matches the c2s fk/fv path). */
+    hipMemsetAsync(d_keys, 0,    (size_t)cap*sizeof(uint64_t), g_stream);
+    hipMemsetAsync(d_vals, 0xff, (size_t)cap*sizeof(int32_t),  g_stream);
     hash_build(k, d_keys, d_vals, cap_mask, d_coords, N);
 
     /* est_Nf for scratch sizing. */
@@ -1312,7 +1344,11 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     kln(k, d_feats, d_feats, NULL, NULL, cur_N, Cf, 0, 0);
     void *d_ow = get_f32_dev(dec->output_w, (size_t)out_ch*Cf*sizeof(float));
     void *d_ob = get_f32_dev(dec->output_b, (size_t)out_ch*sizeof(float));
-    klin(k, d_out, d_feats, d_ow, d_ob, cur_N, Cf, out_ch);
+    if (klin(k, d_out, d_feats, d_ow, d_ob, cur_N, Cf, out_ch) != 0) {
+        fprintf(stderr, "T2-TEX: output linear failed (cur_N=%d Cf=%d out_ch=%d) — "
+                "aborting shape_dec decode\n", cur_N, Cf, out_ch);
+        return -1;
+    }
 
     /* Persist d_coords too — promote to caller. d_coords by this point is
      * either the original or ds.coords, both heap-owned somewhere in our
@@ -1368,6 +1404,11 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     if (g_stream) hipStreamSynchronize(g_stream);
     c2s_free_all(&g_c2s);
 
+    if (g_shape_dec_lin_err) {
+        fprintf(stderr, "T2-TEX: a dense-linear launch failed during shape_dec decode "
+                "— output is unreliable\n");
+        return -1;
+    }
     return 0;
 }
 
