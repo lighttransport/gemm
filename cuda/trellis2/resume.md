@@ -107,9 +107,21 @@
 > (1.9×), quality-neutral (single-step cosine Δ7e-7). **Build gotcha: the Makefile
 > tracks only .c deps — `touch` a .c after editing any header or it won't rebuild.**
 >
-> Remaining: the cuBLAS/plain output-GEMM zero bug (group=25 sidesteps it); lazy per-stage
-> DiT load to cut the ~12.7 GB loading peak; optional bf16-block Stage-2 to close the 0.985
-> CFG-amplified gap. **Stage-2/3 FULL-sampler parity now DONE — see below.**
+> Remaining: the cuBLAS/plain output-GEMM zero bug (group=25 sidesteps it); optional bf16-block
+> Stage-2 to close the 0.985 CFG-amplified gap. **Stage-2/3 FULL-sampler parity DONE; lazy
+> per-stage DiT load DONE (peak 12.7→5.3 GB) — see below.**
+>
+> ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
+>
+> Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
+> before Stage 1 ran. Now: load-run-free one DiT at a time (stages are sequential, inter-stage
+> data is host-side). New `cuda_trellis2_unload_stage1/2/3` (factored from `unload_dit_stages`);
+> harness does unload_stage1→load S2→unload_stage2→load S3→unload_dit→load shape_dec→…(tex_dec
+> already lazy). Peak free/phase: S1 10530, S2 11260, S3 11260 → **peak ~5.3 GB (−58%)**. Safe:
+> KV cache is (model_id,cond_hash)-keyed so each stage recomputes its own; CU_FREE/dit_model_free
+> zero pointers (double-free safe). **Verified: e2e Stage-1 latent byte-identical to pre-change
+> run (max|diff|=0), full colored-OBJ pipeline completes with no OOM.** (cfg_rescale fix also
+> lifted e2e tex-voxel count to 99.6% of PyTorch, was 93.8%.)
 >
 > ## STAGE-2/3 FULL-SAMPLER PARITY + Stage-2 guidance_rescale FIX (2026-05-30)
 >

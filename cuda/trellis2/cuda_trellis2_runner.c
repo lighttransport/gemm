@@ -1355,18 +1355,14 @@ void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r) {
     if (r) scvae_decoder_free_gpu(&r->tex_dec);
 }
 
-/* Free the Stage 1/2/3 DiT GPU weights (and the shared cross-attn KV cache) once
- * all three latents have been produced. The SC-VAE decoders need the VRAM: Stage 1
- * alone is F32 (~5.3 GB) and all three resident leave ~0 MB free, which OOMs the
- * shape decode at its finest level (~1.47M voxels). PyTorch frees these via its
- * low_vram CPU offload; here the decoder inputs (coords, shape slat, tex slat) are
- * already host-side, so the GPU weights are dead. Safe to call once before
- * decoding; idempotent (CU_FREE / dit_*_free_gpu NULL every pointer). */
-void cuda_trellis2_unload_dit_stages(cuda_trellis2_runner *r) {
+/* Per-stage DiT unloads. Each is idempotent (CU_FREE / dit_model_free_gpu zero the
+ * pointers), so they are safe to call once after a stage finishes AND again via the
+ * bulk cuda_trellis2_unload_dit_stages() below. The shared cross-attn KV cache is NOT
+ * freed here — it is keyed by (model_id, cond_hash) and recomputed on the next stage's
+ * first forward, so it is reused/overwritten rather than leaked between stages. */
+void cuda_trellis2_unload_stage1(cuda_trellis2_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->context);
-
-    /* Stage 1 DiT */
     CU_FREE(r->dit_t_fc1_w); CU_FREE(r->dit_t_fc1_b);
     CU_FREE(r->dit_t_fc2_w); CU_FREE(r->dit_t_fc2_b);
     CU_FREE(r->dit_mod_w); CU_FREE(r->dit_mod_b);
@@ -1376,14 +1372,36 @@ void cuda_trellis2_unload_dit_stages(cuda_trellis2_runner *r) {
         dit_block_free_gpu(&r->dit_blocks[i]);
     CU_FREE(r->dit_rope_cos);
     CU_FREE(r->dit_rope_sin);
+}
 
-    /* Stage 2 + Stage 3 DiT */
+void cuda_trellis2_unload_stage2(cuda_trellis2_runner *r) {
+    if (!r) return;
+    cuCtxSetCurrent(r->context);
     dit_model_free_gpu(&r->stage2);
-    dit_model_free_gpu(&r->stage3);
     r->stage2_loaded = 0;
-    r->stage3_loaded = 0;
+}
 
-    /* Cross-attn KV cache (shared across DiT stages; dead once they are). */
+void cuda_trellis2_unload_stage3(cuda_trellis2_runner *r) {
+    if (!r) return;
+    cuCtxSetCurrent(r->context);
+    dit_model_free_gpu(&r->stage3);
+    r->stage3_loaded = 0;
+}
+
+/* Free ALL three DiT stages + the shared cross-attn KV cache, once all latents are
+ * produced and before the SC-VAE decoders (which need the VRAM: Stage 1 alone is F32
+ * ~5.3 GB, and all three resident leave ~0 MB free → the shape decode OOMs at its
+ * ~1.47M-voxel finest level). PyTorch frees these via its low_vram CPU offload.
+ * Idempotent. For lazy load-run-free pipelining, call the per-stage unloads above. */
+void cuda_trellis2_unload_dit_stages(cuda_trellis2_runner *r) {
+    if (!r) return;
+    cuCtxSetCurrent(r->context);
+
+    cuda_trellis2_unload_stage1(r);
+    cuda_trellis2_unload_stage2(r);
+    cuda_trellis2_unload_stage3(r);
+
+    /* Cross-attn KV cache (shared across DiT stages; dead once they all are). */
     for (int i = 0; i < DIT_DEPTH; i++) {
         for (int slot = 0; slot < 2; slot++) {
             CU_FREE(r->ca_kv_cache_K[slot][i]);
