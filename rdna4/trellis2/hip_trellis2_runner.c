@@ -1643,6 +1643,10 @@ int hip_trellis2_load_dit(hip_trellis2_runner *r, const char *path) {
     r->ca_kv_valid = 0;
     fprintf(stderr, "T2-HIP: DiT loaded (%d blocks, RoPE %d freqs)\n",
             DIT_DEPTH, r->n_rope_freqs);
+    if (r->use_fp8)
+        fprintf(stderr, "T2-HIP: NOTE FP8 SS DiT GEMM is ~3x slower than bf16 here "
+                "(unoptimized FP8 WMMA, ~2069 vs ~689 ms/step); bf16 SS DiT (2.6 GB) fits "
+                "16 GB and is the recommended default. Use FP8 only when memory-constrained.\n");
     return 0;
 }
 
