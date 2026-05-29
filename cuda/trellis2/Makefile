@@ -18,7 +18,7 @@ HDRS = cuda_trellis2_runner.h cuda_trellis2_kernels.h cuda_trellis2_ops.h \
 
 .PHONY: all clean
 
-all: test_cuda_trellis2 verify_decoder verify_stage1 verify_stage2 verify_stage3 verify_shape_decoder
+all: test_cuda_trellis2 verify_decoder verify_stage1 verify_stage2 verify_stage2_full verify_stage3 verify_shape_decoder
 
 test_cuda_trellis2: test_cuda_trellis2.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ test_cuda_trellis2.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
@@ -37,6 +37,9 @@ verify_stage1: verify_stage1.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(HDRS)
 verify_stage2: verify_stage2.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ verify_stage2.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
+verify_stage2_full: verify_stage2_full.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ verify_stage2_full.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
+
 verify_stage3: verify_stage3.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ verify_stage3.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
@@ -44,4 +47,4 @@ verify_shape_decoder: verify_shape_decoder.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_
 	$(CC) $(CFLAGS) -o $@ verify_shape_decoder.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 clean:
-	rm -f test_cuda_trellis2 verify_decoder verify_stage1 verify_stage2 verify_stage3 verify_shape_decoder libcuda_trellis2.so
+	rm -f test_cuda_trellis2 verify_decoder verify_stage1 verify_stage2 verify_stage2_full verify_stage3 verify_shape_decoder libcuda_trellis2.so
