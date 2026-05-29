@@ -229,6 +229,10 @@ def main():
                     help='Comma-separated shape-decoder mesh resolutions to extract '
                          '(e.g. "64,128,256,512"). The SC-VAE network runs identically '
                          'for all; only flexible_dual_grid_to_mesh grid_size varies.')
+    ap.add_argument('--stage1-only', action='store_true',
+                    help='Exit right after dumping 03_ss_latent (00/01/02/03 only); '
+                         'skips the SS decoder + Stage 2/3. Fast multi-image Stage-1 '
+                         'latent verification.')
     args = ap.parse_args()
 
     decoder_res = [int(r) for r in str(args.decoder_res).split(',') if r.strip()]
@@ -302,6 +306,10 @@ def main():
         dump_step_list(args.output_dir, '03_ss_pred_x_t', ss_out.pred_x_t)
     if pipeline.low_vram:
         flow_ss.cpu()
+
+    if args.stage1_only:
+        print('[stage1-only] dumped 00/01/02/03; skipping decoder + Stage 2/3', flush=True)
+        return
 
     decoder = pipeline.models['sparse_structure_decoder']
     if pipeline.low_vram:
