@@ -409,6 +409,9 @@ int main(int argc, char **argv) {
     int mode_mesh        = 0;
     int mode_tex         = 0;
     int mode_shape_only  = 0;
+    int mode_slat_step   = 0;
+    int mode_tex_step    = 0;
+    const char *step_dir = "rdna4/trellis2/verify-dumps-rocm-e2e-tex";
     const char *shape_feats_npy = NULL;
     const char *shape_coords_npy = NULL;
 
@@ -448,6 +451,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tex-res") && i+1 < argc) tex_res = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slat-steps") && i+1 < argc) slat_steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--shape-only"))    mode_shape_only = 1;
+        else if (!strcmp(argv[i], "--slat-step"))     mode_slat_step = 1;
+        else if (!strcmp(argv[i], "--tex-step"))      mode_tex_step = 1;
+        else if (!strcmp(argv[i], "--step-dir") && i+1 < argc) step_dir = argv[++i];
         else if (!strcmp(argv[i], "--shape-feats-npy") && i+1 < argc) shape_feats_npy = argv[++i];
         else if (!strcmp(argv[i], "--shape-coords-npy") && i+1 < argc) shape_coords_npy = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -457,7 +463,8 @@ int main(int argc, char **argv) {
 
     /* Default mode: full */
     if (!mode_full && !mode_dit_only && !mode_decode_only &&
-        !mode_dump_blocks && !mode_verify_step && !mode_dump_b0 && !mode_shape_only) {
+        !mode_dump_blocks && !mode_verify_step && !mode_dump_b0 && !mode_shape_only &&
+        !mode_slat_step && !mode_tex_step) {
         mode_full = 1;
     }
 
@@ -514,6 +521,64 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Wrote %s\n", save_mesh_path);
         hip_trellis2_shape_dec_mesh_free(&mesh);
         free(feats); free(coords);
+        hip_trellis2_free(r);
+        return 0;
+    }
+
+    /* Single-step SLAT/tex DiT velocity dump for precision iteration.
+     * Loads the CUDA reference single-step inputs (06b_/10b_*) from --step-dir,
+     * runs ONE forward, writes hip_{slat,tex}_velocity.npy. Compare vs the
+     * reference *_velocity.npy (bf16 = achievable ceiling, INT8 = the gap). */
+    if (mode_slat_step || mode_tex_step) {
+        int is_tex = mode_tex_step;
+        const char *dit = is_tex ? tex_dit_path : slat_path;
+        const char *pfx = is_tex ? "10b_tex_dit_step" : "06b_slat_dit_step";
+        if (!dit) {
+            fprintf(stderr, "Error: --%s-step requires --%s-dit\n",
+                    is_tex ? "tex" : "slat", is_tex ? "tex" : "slat");
+            return 1;
+        }
+        hip_trellis2_runner *r = hip_trellis2_init(device_id, verbose);
+        if (!r) { fprintf(stderr, "init failed\n"); return 1; }
+        int rc = is_tex ? hip_trellis2_load_tex_dit(r, dit)
+                        : hip_trellis2_load_slat_dit(r, dit);
+        if (rc != 0) { fprintf(stderr, "load %s dit failed\n", is_tex?"tex":"slat");
+            hip_trellis2_free(r); return 1; }
+        char path[1200]; int nd, dims[8];
+        snprintf(path, sizeof(path), "%s/%s_x_t.npy", step_dir, pfx);
+        float *x_t = read_npy_f32(path, &nd, dims);
+        int N = dims[0], Cin = dims[1];
+        int cnd, cdims[8];
+        snprintf(path, sizeof(path), "%s/%s_coords.npy", step_dir, pfx);
+        int32_t *coords = read_npy_i32(path, &cnd, cdims);
+        int tnd, tdims[8];
+        snprintf(path, sizeof(path), "%s/%s_t.npy", step_dir, pfx);
+        float *t_arr = read_npy_f32(path, &tnd, tdims);
+        int ond, odims[8];
+        snprintf(path, sizeof(path), "%s/%s_cond.npy", step_dir, pfx);
+        float *cond = read_npy_f32(path, &ond, odims);
+        if (!x_t || !coords || !t_arr || !cond) {
+            fprintf(stderr, "bad single-step inputs in %s\n", step_dir); return 1; }
+        /* The 06b/10b reference dumps bypass the sampler (direct model call at
+         * raw t), but hip_trellis2_*_dit_step multiplies t by 1000 (the sampler
+         * convention). So divide the reference t by 1000 to compensate (matches
+         * verify_slat_dit). --t overrides with a raw step-t for probing. */
+        float t_val = (dit_t != 0.5f) ? dit_t : (t_arr[0] / 1000.0f);
+        int n_cond = (ond == 3) ? odims[1] : odims[0];  /* [1,1029,1024] or [1029,1024] */
+        float *vel = (float *)malloc((size_t)N * 32 * sizeof(float));
+        double t0 = now_ms();
+        rc = is_tex ? hip_trellis2_tex_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel)
+                    : hip_trellis2_slat_dit_step(r, x_t, coords, N, t_val, cond, n_cond, vel);
+        if (rc != 0) { fprintf(stderr, "%s dit_step failed\n", is_tex?"tex":"slat"); return 1; }
+        fprintf(stderr, "%s single step: N=%d Cin=%d t=%.4f n_cond=%d  %.1f ms\n",
+                is_tex ? "tex" : "slat", N, Cin, t_val, n_cond, now_ms() - t0);
+        print_stats("velocity", vel, N * 32);
+        char out[1300];
+        snprintf(out, sizeof(out), "%s/hip_%s_velocity.npy", output_dir, is_tex?"tex":"slat");
+        int vdims[2] = { N, 32 };
+        write_npy_f32(out, vel, vdims, 2);
+        fprintf(stderr, "Wrote %s\n", out);
+        free(x_t); free(coords); free(t_arr); free(cond); free(vel);
         hip_trellis2_free(r);
         return 0;
     }
