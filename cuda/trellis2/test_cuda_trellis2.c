@@ -231,6 +231,7 @@ int main(int argc, char **argv) {
     int s2_steps = 12;
     float s2_cfg = 7.5f;
     const char *s2_npy_path = NULL;
+    const char *tex_npy_base = NULL;  /* dump tex_result coords+raw feats vs 15_tex_voxels */
     int n_threads = 4;
     int max_gpu_layers = 0;
     const char *image_path = NULL;
@@ -256,6 +257,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--s2-steps") && i+1 < argc) s2_steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--s2-cfg") && i+1 < argc) s2_cfg = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--s2-npy") && i+1 < argc) s2_npy_path = argv[++i];
+        else if (!strcmp(argv[i], "--tex-npy") && i+1 < argc) tex_npy_base = argv[++i];
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-gpu-layers") && i+1 < argc)
             max_gpu_layers = atoi(argv[++i]);
@@ -468,22 +470,51 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n=== Stage 2: Shape Flow Sampling (%d steps, cfg=%.1f) ===\n",
                 s2_steps, s2_cfg);
 
-        /* Extract sparse coords from occupancy */
+        /* Extract sparse coords from occupancy.
+         * PyTorch (dump_ground_truth.py): occ = decoded>0 at 64^3, then since
+         * 64 != 32 it max_pool3d(ratio=2)>0.5 down to 32^3, and
+         * coords = argwhere(occ)[:, [0,2,3,4]] = (B,D,H,W) at resolution 32.
+         * We reproduce that: build a 32^3 grid whose value is the MAX logit over
+         * each 2x2x2 block (block-max > 0  <=>  logical OR of occ at threshold 0),
+         * then extract res-32 coords in argwhere C-order (D outer, H, W inner).
+         * Stage-2/3 RoPE uses the absolute coord values, so the resolution MUST
+         * match PyTorch (res 32) — res-64 coords also doubled every rope angle. */
+        const int SS_R = 32;
+        float *pooled = (float *)malloc((size_t)SS_R * SS_R * SS_R * sizeof(float));
+        if (!pooled) {
+            fprintf(stderr, "Failed to allocate pooled occupancy\n");
+            free(occupancy); cuda_trellis2_free(r); free(features);
+            return 1;
+        }
+        for (int d = 0; d < SS_R; d++)
+            for (int h = 0; h < SS_R; h++)
+                for (int w = 0; w < SS_R; w++) {
+                    float m = -1e30f;
+                    for (int dz = 0; dz < 2; dz++)
+                        for (int dy = 0; dy < 2; dy++)
+                            for (int dx = 0; dx < 2; dx++) {
+                                float v = occupancy[(size_t)(2 * d + dz) * 64 * 64 +
+                                                    (2 * h + dy) * 64 + (2 * w + dx)];
+                                if (v > m) m = v;
+                            }
+                    pooled[(size_t)d * SS_R * SS_R + h * SS_R + w] = m;
+                }
+
         int N_sparse = 0;
-        for (int i = 0; i < 64 * 64 * 64; i++)
-            if (occupancy[i] > sparse_threshold) N_sparse++;
+        for (int i = 0; i < SS_R * SS_R * SS_R; i++)
+            if (pooled[i] > sparse_threshold) N_sparse++;
 
         int cap_applied = 0;
         if (max_sparse > 0 && N_sparse > max_sparse) {
             float *kept = (float *)malloc((size_t)N_sparse * sizeof(float));
             if (!kept) {
                 fprintf(stderr, "Failed to allocate sparse threshold scratch\n");
-                free(occupancy); cuda_trellis2_free(r); free(features);
+                free(pooled); free(occupancy); cuda_trellis2_free(r); free(features);
                 return 1;
             }
             int k = 0;
-            for (int i = 0; i < 64 * 64 * 64; i++)
-                if (occupancy[i] > sparse_threshold) kept[k++] = occupancy[i];
+            for (int i = 0; i < SS_R * SS_R * SS_R; i++)
+                if (pooled[i] > sparse_threshold) kept[k++] = pooled[i];
             qsort(kept, (size_t)N_sparse, sizeof(float), cmp_f32_desc);
             sparse_threshold = kept[max_sparse - 1];
             free(kept);
@@ -495,31 +526,34 @@ int main(int argc, char **argv) {
 
         if (N_sparse <= 0) {
             fprintf(stderr, "No sparse voxels above threshold %.4f\n", sparse_threshold);
-            free(occupancy); cuda_trellis2_free(r); free(features);
+            free(pooled); free(occupancy); cuda_trellis2_free(r); free(features);
             return 1;
         }
         int32_t *sparse_coords = (int32_t *)malloc((size_t)N_sparse * 4 * sizeof(int32_t));
         if (!sparse_coords) {
             fprintf(stderr, "Failed to allocate sparse coords\n");
-            free(occupancy); cuda_trellis2_free(r); free(features);
+            free(pooled); free(occupancy); cuda_trellis2_free(r); free(features);
             return 1;
         }
         int idx = 0;
-        for (int z = 0; z < 64; z++)
-            for (int y = 0; y < 64; y++)
-                for (int xi = 0; xi < 64; xi++)
-                    if (occupancy[z * 64 * 64 + y * 64 + xi] > sparse_threshold ||
-                        (cap_applied && idx < N_sparse &&
-                         occupancy[z * 64 * 64 + y * 64 + xi] == sparse_threshold)) {
+        for (int d = 0; d < SS_R; d++)
+            for (int h = 0; h < SS_R; h++)
+                for (int w = 0; w < SS_R; w++) {
+                    float v = pooled[(size_t)d * SS_R * SS_R + h * SS_R + w];
+                    if (v > sparse_threshold ||
+                        (cap_applied && idx < N_sparse && v == sparse_threshold)) {
                         sparse_coords[idx * 4 + 0] = 0;   /* batch */
-                        sparse_coords[idx * 4 + 1] = z;
-                        sparse_coords[idx * 4 + 2] = y;
-                        sparse_coords[idx * 4 + 3] = xi;
+                        sparse_coords[idx * 4 + 1] = d;   /* z (=D) */
+                        sparse_coords[idx * 4 + 2] = h;   /* y (=H) */
+                        sparse_coords[idx * 4 + 3] = w;   /* x (=W) */
                         idx++;
                         if (idx == N_sparse) goto sparse_done;
                     }
+                }
 sparse_done:
-        fprintf(stderr, "Sparse voxels: %d (threshold %.4f)\n", N_sparse, sparse_threshold);
+        free(pooled);
+        fprintf(stderr, "Sparse voxels: %d @res%d (threshold %.4f)\n",
+                N_sparse, SS_R, sparse_threshold);
 
         /* Generate noise [N, 32] for Stage 2 */
         int s2_ch = 32;
@@ -689,6 +723,12 @@ sparse_done:
             /* tex_slat (= s3_noise) kept alive for texture decoder */
         }
 
+        /* All three DiT latents are now host-side (sparse_coords, s2_x = shape
+         * slat, tex_slat). Free the DiT GPU weights (~10.5 GB incl. the F32
+         * Stage 1) before decoding — otherwise the shape decode OOMs at its
+         * finest level (~1.47M voxels) with the DiTs resident. */
+        cuda_trellis2_unload_dit_stages(r);
+
         fprintf(stderr, "\n=== Shape Decoder (CUDA SC-VAE) ===\n");
 
         t2_shape_dec_result result = {0};
@@ -703,13 +743,21 @@ sparse_done:
         free(s2_x);
         fprintf(stderr, "Shape decoder output: N=%d, C=%d\n", result.N, result.C);
 
-        /* Post-process: sigmoid on vertex offsets, softplus on split_weight */
+        /* Post-process to match fdg_vae.py (inference, voxel_margin=0.5):
+         *   vertices    = (1 + 2*margin)*sigmoid(f[0:3]) - margin
+         *   intersected = f[3:6] > 0   (raw logits; FDG tests > 0)
+         *   split_wt    = softplus(f[6]) */
+        const float voxel_margin = 0.5f;
+        int n_isect = 0;
         for (int i = 0; i < result.N; i++) {
             float *f = result.feats + i * 7;
             for (int j = 0; j < 3; j++)
-                f[j] = 1.0f / (1.0f + expf(-f[j]));
+                f[j] = (1.0f + 2.0f * voxel_margin) / (1.0f + expf(-f[j])) - voxel_margin;
             f[6] = logf(1.0f + expf(f[6]));
+            if (f[3] > 0.0f || f[4] > 0.0f || f[5] > 0.0f) n_isect++;
         }
+        fprintf(stderr, "FDG: %d/%d voxels have an intersected edge (feats[3:6]>0)\n",
+                n_isect, result.N);
 
         /* Extract coords without batch dim: [N, 3] from [N, 4] */
         int32_t *coords3 = (int32_t *)malloc((size_t)result.N * 3 * sizeof(int32_t));
@@ -753,6 +801,23 @@ sparse_done:
                     }
                     fprintf(stderr, "Texture decoder output: N=%d, C=%d\n",
                             tex_result.N, tex_result.C);
+
+                    /* Optional dump for PyTorch-ref comparison vs 15_tex_voxels.
+                     * feats are the RAW decoder output here (PBR *0.5+0.5 is
+                     * applied later inside t2_pbr_from_decoder). */
+                    if (tex_npy_base) {
+                        char p[600];
+                        float *cf = (float *)malloc((size_t)tex_result.N * 4 * sizeof(float));
+                        for (int k = 0; k < tex_result.N * 4; k++) cf[k] = (float)tex_result.coords[k];
+                        int cd[2] = { tex_result.N, 4 };
+                        snprintf(p, sizeof(p), "%s.coords.npy", tex_npy_base);
+                        write_npy_f32(p, cf, cd, 2);
+                        free(cf);
+                        int fd[2] = { tex_result.N, tex_result.C };
+                        snprintf(p, sizeof(p), "%s.feats.npy", tex_npy_base);
+                        write_npy_f32(p, tex_result.feats, fd, 2);
+                        fprintf(stderr, "Dumped tex voxels to %s.{coords,feats}.npy\n", tex_npy_base);
+                    }
 
                     /* Scale decoder output: * 0.5 + 0.5 -> [0,1] */
                     /* Build PBR field from texture decoder output */
