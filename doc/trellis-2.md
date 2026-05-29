@@ -1044,9 +1044,38 @@ correct.** Two characterized residual gaps, both pre-existing / inherent (not re
    C textured mesh is valid and self-consistent (PBR coverage 99.7%); it just doesn't bit-match
    PyTorch's vertex array. To align exactly: in `t2_fdg_to_mesh` set `verts[0]←coords[0]`,
    `verts[2]←coords[2]` (un-reverse) **and** flip the emitted triangle winding (a reflection
-   inverts it), then revert the PBR field storage to `(c3,c2,c1)` so the sampler stays aligned.
+   inverts it), **and — only as part of this same coupled change** — flip the PBR field storage
+   to `(c3,c2,c1)` so the sampler stays aligned. **Never flip the PBR storage alone**: with the
+   current `(z,y,x)` mesh builder the correct storage is `(col1,col2,col3)` (see the convention
+   note just below); `(c3,c2,c1)` on its own drops coverage 99.7% → 10.8%.
    Deferred — it needs visual/normal validation (the centroid-normal test is ~50% on this
    non-convex mesh, so handedness can't be confirmed headless).
+
+**PBR coordinate convention — why the field stores `(col1,col2,col3)`, and the PyTorch-validation
+trap (verified 2026-05-30).** The field storage order hinges on one fact: **C and the whole
+codebase use `(b,z,y,x)` sparse coords** (col1=z, col2=y, col3=x) — see `cuda_trellis2_runner.c`
+("child coords (b,z,y,x)"), `trellis2_shape_decoder.h` (`z=coords[i*4+1]`, `x=coords[i*4+3]`), and
+every sam3d SubMConv. **PyTorch instead uses `(b,x,y,z)` (col1=x)** — the two are *x↔z swapped*.
+In `15_tex_voxels.coords.npy` (PyTorch) col1 is the full-range axis and equals `mesh.vertices[0]`
+(world x); in the C `tex_vox.coords` col1 is *also* full-range but it is world **z** (the C mesh
+has world-z full-range / world-x medium — the mirror of PyTorch's mesh).
+
+Since the FDG mesh builder + sampler resolve a vertex to `hash(iz, iy, ix)` with `iz`←world-z and
+`ix`←world-x, the field must store **`(col1,col2,col3)`** (axis0/z←col1, axis2/x←col3). That is the
+C-internally-consistent order → **99.7% coverage**; the swapped `(col3,col2,col1)` → **10.8%**
+(hits only the x==z diagonal).
+
+- **TRAP: do NOT validate the PBR mapping against `15_tex_voxels.coords.npy`.** It is in PyTorch's
+  `(b,x,y,z)` frame, so matching "col1 == mesh.vertices[0]" against it yields the *opposite*
+  (wrong-for-C) order. This is exactly what misled commit `c040789` "fix X/Z axis swap" →
+  `(col3,col2,col1)`; at that time the C tex decoder was *also* broken (all coords collapsed to
+  `(0,0,0)`), so real C validation was impossible. `origin/trellis2` still carried that
+  `(col3,col2,col1)`; the 2026-05-30 merge **kept ours** (`(col1,col2,col3)`).
+- **Decisive validation = real C artifacts together.** Dump the C mesh (`-o cuda.obj`) and C tex
+  voxels (`--tex-npy`) from one e2e run, then build the field from `tex_vox.coords` and sample at
+  the OBJ vertices: `(col1,col2,col3)` → 99.7%, `(col3,col2,col1)` → 10.8%. The on-by-default
+  `t2_pbr_sample_vertices` diagnostic prints this live (`T2 PBR: … covered N (X%)`; `T2_PBR_QUIET=1`
+  silences, `T2_PBR_NO_SNAP=1` disables the nearest-voxel fallback).
 
 **Full bf16-block port — Stage-1 latent 0.9895 → 0.99739 (2026-05-29).** The gap is NOT a bug. The
 FlowEuler sampler and every config value match `model_root/pipeline.json` exactly
