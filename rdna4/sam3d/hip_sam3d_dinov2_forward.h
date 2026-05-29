@@ -32,6 +32,8 @@ extern "C" {
 typedef struct {
     hipFunction_t layernorm_token_f32;
     hipFunction_t gemm_f32_bias;
+    hipFunction_t gemm_wmma;     /* gemm_bf16w_bf16a_wmma_t (gfx12; optional) */
+    int           use_wmma;      /* 1 iff SAM3D_WMMA!=0 and gemm_wmma resolved */
     hipFunction_t qkv_split_f32;
     hipFunction_t sdpa_f32;
     hipFunction_t layerscale_add_f32;
@@ -62,7 +64,40 @@ static inline int cs3d_dinov2_fns_lookup(cs3d_dinov2_fns *f, hipModule_t mod)
     LOOKUP_(dinov2_prepend_cls_reg_f32);
     LOOKUP_(dinov2_add_pos_embed_f32);
 #undef LOOKUP_
+    /* Optional BF16-WMMA GEMM (gfx12). Default ON; SAM3D_WMMA=0 disables. */
+    f->use_wmma = 0;
+    f->gemm_wmma = NULL;
+    {
+        const char *e = getenv("SAM3D_WMMA");
+        if (!e || e[0] != '0') {
+            if (hipModuleGetFunction(&f->gemm_wmma, mod,
+                                     "gemm_bf16w_bf16a_wmma_t") == hipSuccess)
+                f->use_wmma = 1;
+        }
+    }
     return 0;
+}
+
+/* GEMM dispatch matching gemm_f32_bias semantics:
+ *   Y[N, Dout] = X[N, Din] * W[Dout, Din]^T + bias[Dout]
+ * Uses BF16 WMMA when enabled and dims are 16-aligned; else the scalar
+ * 16x16-tiled gemm_f32_bias. Stream 0 (matches all sam3d launches). */
+static inline int cs3d_dinov2_gemm(const cs3d_dinov2_fns *f,
+                                   hipDeviceptr_t Y, hipDeviceptr_t X,
+                                   hipDeviceptr_t W, hipDeviceptr_t bias,
+                                   int N, int Din, int Dout)
+{
+    if (f->use_wmma && f->gemm_wmma && (Dout % 16 == 0) && (Din % 16 == 0)) {
+        void *args[] = { &Y, &W, &X, &bias, &Dout, &Din, &N };
+        unsigned gx = (unsigned)((Dout + 127) / 128);
+        unsigned gy = (unsigned)((N + 127) / 128);
+        return hipModuleLaunchKernel(f->gemm_wmma, gx, gy, 1, 256, 1, 1,
+                                     0, 0, args, NULL) == hipSuccess ? 0 : -1;
+    }
+    void *args[] = { &Y, &X, &W, &bias, &N, &Din, &Dout };
+    unsigned gx = (unsigned)((N + 15) / 16), gy = (unsigned)((Dout + 15) / 16);
+    return hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1,
+                                 0, 0, args, NULL) == hipSuccess ? 0 : -1;
 }
 
 /* Workspace required by one block forward. Allocate once per stream;
@@ -161,11 +196,8 @@ static inline int cs3d_dinov2_block_forward(
     /* 2. QKV gemm: [n_tokens, dim] @ [3*dim, dim]^T + [3*dim] → [n_tokens, 3*dim]. */
     {
         int Dout = 3 * dim;
-        void *args[] = { &ws->qkv, &ws->ln_buf, &bw->qkv_w, &bw->qkv_b,
-                         &n_tokens, &dim, &Dout };
-        int gx = (n_tokens + 15) / 16, gy = (Dout + 15) / 16;
-        if (hipModuleLaunchKernel(f->gemm_f32_bias,
-                           gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_dinov2_gemm(f, ws->qkv, ws->ln_buf, bw->qkv_w, bw->qkv_b,
+                             n_tokens, dim, Dout) != 0) return -1;
     }
     /* 3. split fused QKV → Q, K, V. */
     {
@@ -189,12 +221,8 @@ static inline int cs3d_dinov2_block_forward(
     }
     /* 5. attn out_proj gemm: [n_tokens, dim] @ [dim, dim]^T + [dim] → [n_tokens, dim]. */
     {
-        int Dout = dim;
-        void *args[] = { &ws->proj_out, &ws->attn_out, &bw->proj_w, &bw->proj_b,
-                         &n_tokens, &dim, &Dout };
-        int gx = (n_tokens + 15) / 16, gy = (Dout + 15) / 16;
-        if (hipModuleLaunchKernel(f->gemm_f32_bias,
-                           gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_dinov2_gemm(f, ws->proj_out, ws->attn_out, bw->proj_w, bw->proj_b,
+                             n_tokens, dim, dim) != 0) return -1;
     }
     /* 6. ls1 + residual: hidden += proj_out * ls1. */
     {
@@ -214,11 +242,8 @@ static inline int cs3d_dinov2_block_forward(
     }
     /* 8. fc1 gemm: [n_tokens, dim] @ [ffn, dim]^T + [ffn] → [n_tokens, ffn]. */
     {
-        void *args[] = { &ws->ffn_buf, &ws->ln_buf, &bw->fc1_w, &bw->fc1_b,
-                         &n_tokens, &dim, &ffn };
-        int gx = (n_tokens + 15) / 16, gy = (ffn + 15) / 16;
-        if (hipModuleLaunchKernel(f->gemm_f32_bias,
-                           gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_dinov2_gemm(f, ws->ffn_buf, ws->ln_buf, bw->fc1_w, bw->fc1_b,
+                             n_tokens, dim, ffn) != 0) return -1;
     }
     /* 9. exact GELU in place. */
     {
@@ -230,12 +255,8 @@ static inline int cs3d_dinov2_block_forward(
     }
     /* 10. fc2 gemm: [n_tokens, ffn] @ [dim, ffn]^T + [dim] → [n_tokens, dim]. */
     {
-        int Dout = dim;
-        void *args[] = { &ws->proj_out, &ws->ffn_buf, &bw->fc2_w, &bw->fc2_b,
-                         &n_tokens, &ffn, &Dout };
-        int gx = (n_tokens + 15) / 16, gy = (Dout + 15) / 16;
-        if (hipModuleLaunchKernel(f->gemm_f32_bias,
-                           gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_dinov2_gemm(f, ws->proj_out, ws->ffn_buf, bw->fc2_w, bw->fc2_b,
+                             n_tokens, ffn, dim) != 0) return -1;
     }
     /* 11. ls2 + residual: hidden += proj_out * ls2. */
     {
