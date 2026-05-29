@@ -414,6 +414,8 @@ int main(int argc, char **argv) {
     const char *step_dir = "rdna4/trellis2/verify-dumps-rocm-e2e-tex";
     const char *shape_feats_npy = NULL;
     const char *shape_coords_npy = NULL;
+    const char *slat_noise_npy = NULL;   /* verify: override SLAT init noise (CUDA 06) */
+    const char *slat_coords_npy = NULL;  /* verify: override SLAT coords (CUDA 05) */
 
     if (argc < 2) { print_usage(argv[0]); return 1; }
 
@@ -454,6 +456,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--slat-step"))     mode_slat_step = 1;
         else if (!strcmp(argv[i], "--tex-step"))      mode_tex_step = 1;
         else if (!strcmp(argv[i], "--step-dir") && i+1 < argc) step_dir = argv[++i];
+        else if (!strcmp(argv[i], "--slat-noise-npy") && i+1 < argc) slat_noise_npy = argv[++i];
+        else if (!strcmp(argv[i], "--slat-coords-npy") && i+1 < argc) slat_coords_npy = argv[++i];
         else if (!strcmp(argv[i], "--shape-feats-npy") && i+1 < argc) shape_feats_npy = argv[++i];
         else if (!strcmp(argv[i], "--shape-coords-npy") && i+1 < argc) shape_coords_npy = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -1042,6 +1046,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  Sparse voxels (32^3 max-pool): %d\n", N_sparse);
             free(occ32); free(occupancy);
 
+            /* [verify] Override SLAT coords with a CUDA reference dump so the SLAT
+             * trajectory is directly comparable to CUDA 08 (bypasses HIP-vs-CUDA
+             * occupancy diff). Used with --slat-noise-npy. */
+            if (slat_coords_npy) {
+                int snd = 0, sdims[8] = {0};
+                int32_t *cc = read_npy_i32(slat_coords_npy, &snd, sdims);
+                if (cc && snd == 2 && sdims[1] == 4) {
+                    free(sparse_coords);
+                    sparse_coords = cc; N_sparse = sdims[0];
+                    fprintf(stderr, "  [verify] SLAT coords <- %s: N=%d\n", slat_coords_npy, N_sparse);
+                } else { fprintf(stderr, "  [verify] bad --slat-coords-npy, ignoring\n"); free(cc); }
+            }
+
             /* Free SS DiT + SS decoder before loading SLAT — SLAT's 1.3B F32
              * weights (~5 GB) on top of SS DiT (~5 GB) + decoder pushes a
              * 16 GB GPU into HMM page-fault thrashing. Unloading drops peak
@@ -1082,15 +1099,35 @@ int main(int argc, char **argv) {
             float *s2_x = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
             rng_seed(seed + 1);
             for (int i = 0; i < N_sparse * SLAT_CH; i++) s2_x[i] = randn();
+            /* [verify] Override SLAT init noise with a CUDA reference dump (06) so
+             * the full 12-step trajectory is comparable to CUDA 08. */
+            if (slat_noise_npy) {
+                int snd = 0, sdims[8] = {0};
+                float *nn = read_npy_f32(slat_noise_npy, &snd, sdims);
+                if (nn && snd == 2 && sdims[0] == N_sparse && sdims[1] == SLAT_CH) {
+                    memcpy(s2_x, nn, (size_t)N_sparse * SLAT_CH * sizeof(float));
+                    fprintf(stderr, "  [verify] SLAT noise <- %s\n", slat_noise_npy);
+                } else {
+                    fprintf(stderr, "  [verify] --slat-noise-npy shape mismatch "
+                            "(got [%d,%d], want [%d,%d]), ignoring\n",
+                            sdims[0], sdims[1], N_sparse, SLAT_CH);
+                }
+                free(nn);
+            }
 
             /* CFG zero-cond buffer. */
             float *neg_cond = (float *)calloc((size_t)N_COND * COND_DIM, sizeof(float));
             float *v_cond   = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
             float *v_uncond = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
 
+            /* shape_slat_sampler params from pipeline.json: steps=12,
+             * guidance_strength=7.5, guidance_rescale=0.5 (NOT 0.7 — that's the
+             * sparse_structure_sampler value), guidance_interval=[0.6,1.0],
+             * rescale_t=3.0. The 0.7 here was wrong and diverged the 12-step
+             * trajectory (cos vs CUDA 08: 0.95 -> ~0.99 after fix). */
             const float s2_rescale_t = 3.0f;
             const float s2_cfg       = 7.5f;
-            const float s2_rescale   = 0.7f;
+            const float s2_rescale   = 0.5f;
             const float s2_sigma_min = 1e-5f;
 
             double t_total = 0;
