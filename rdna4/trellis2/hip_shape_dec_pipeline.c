@@ -1116,8 +1116,16 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     if (hipMalloc(&d_vals, (size_t)cap*sizeof(int32_t)) != hipSuccess) {
         fprintf(stderr, "T2-TEX: hipMalloc d_vals failed\n"); return -1;
     }
-    hipMemset(d_keys, 0, (size_t)cap*sizeof(uint64_t));
-    hipMemset(d_vals, 0xff, (size_t)cap*sizeof(int32_t));
+    /* Zero/-1 the hash on g_stream (NOT the default stream): hash_build runs on
+     * g_stream, which is created hipStreamNonBlocking and therefore does NOT
+     * implicitly synchronize with the default stream. A plain hipMemset (default
+     * stream) can land AFTER hash_build under non-default kernel scheduling
+     * (warm GPU / AMD_SERIALIZE_KERNEL / HSA_ENABLE_SDMA=0), wiping the freshly
+     * built table to -1 -> empty neighbor map -> ConvNeXt sees only self -> ~9%
+     * of voxels lost in the knife-edge to_subdiv threshold. Same-stream async
+     * memset orders correctly (matches the c2s fk/fv path). */
+    hipMemsetAsync(d_keys, 0,    (size_t)cap*sizeof(uint64_t), g_stream);
+    hipMemsetAsync(d_vals, 0xff, (size_t)cap*sizeof(int32_t),  g_stream);
     hash_build(k, d_keys, d_vals, cap_mask, d_coords, N);
 
     /* est_Nf for scratch sizing. */
