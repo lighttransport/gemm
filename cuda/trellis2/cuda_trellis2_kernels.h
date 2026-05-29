@@ -1299,7 +1299,12 @@ static const char cuda_trellis2_kernel_source[] =
 /* FlashAttention with online softmax using m16n8k16 tensor core MMA.
  * Q/K/V: [N, dim] where dim = n_heads * head_dim (interleaved heads).
  * Grid: (n_heads, ceil(q_len/64)), Block: 128 threads = 4 warps.
- * Each warp processes 16 query tokens. */
+ * Each warp processes 16 query tokens.
+ * NOTE: scores/softmax are computed in f32 and the P matrix is cast to f16 (not
+ * bf16) for the P@V MMA. This deliberately matches PyTorch's bf16 DiT, whose SDPA
+ * (flash/mem-efficient) keeps the attention internals in f32 — only the linear
+ * layers are bf16. Rounding the probs to bf16 here was a NEGATIVE result (Stage-1
+ * latent cosine 0.9974 -> 0.9961 vs 03_ss_latent), so the f16-precision P stays. */
 "__global__ void attn_mma_hd128_f32(\n"
 "    float *out, const float *Q, const float *K, const float *V,\n"
 "    int q_len, int kv_len, int dim, int n_heads, int head_dim, float scale) {\n"
@@ -1634,6 +1639,31 @@ static const char cuda_trellis2_kernel_source[] =
 /* LayerNorm for sparse features: same as layernorm_f32 but just a reminder.
  * Already available as layernorm_f32 in common kernels. */
 
+/* f32 -> bf16 (round-to-nearest-even, raw 16-bit) for bf16 GEMM inputs.
+ * Replicates PyTorch's bf16 DiT matmuls (the reference latent is produced with
+ * the DiT blocks run in bfloat16). __float_as_uint avoids needing memcpy. */
+"__device__ __forceinline__ unsigned short t2_f32_to_bf16_bits(float f) {\n"
+"    unsigned int b = __float_as_uint(f);\n"
+"    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) return 0x7FC0;\n"
+"    unsigned int r = 0x7FFFu + ((b >> 16) & 1u);\n"
+"    return (unsigned short)((b + r) >> 16);\n"
+"}\n"
+"__global__ void t2_cast_f32_to_bf16(const float *src, unsigned short *dst, long n) {\n"
+"    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) dst[i] = t2_f32_to_bf16_bits(src[i]);\n"
+"}\n"
+/* In-place round f32 -> bf16-precision -> f32 (quantize each value to bf16's
+ * 8-bit significand, kept in an f32 buffer). Inserted after each DiT-block op so
+ * the activations carry bf16 precision, replicating PyTorch's bf16 block; paired
+ * with the bf16 GEMM (use_bf16_gemm: W,X->bf16, f32 accumulate) the block matmuls
+ * then run on bf16 inputs. (TF32 on the bf16-valued inputs would be equivalent.) */
+"__global__ void t2_round_f32_bf16(float *x, long n) {\n"
+"    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) {\n"
+"        unsigned short bf = t2_f32_to_bf16_bits(x[i]);\n"
+"        x[i] = __uint_as_float(((unsigned int)bf) << 16);\n"
+"    }\n"
+"}\n"
 "} /* close extern C from cuda_kernels_common */\n"
 ; /* end of kernel source string */
 
