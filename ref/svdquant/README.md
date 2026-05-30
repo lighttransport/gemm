@@ -49,12 +49,26 @@ reader of the same bytes with the same decode formula matches to f32 rounding.
 
 ## Optional
 
-- `--cross-check` — assert the low-rank+residual split matches deepcompressor's
-  definition (`deepcompressor/calib/lowrank.py`), if `deepcompressor` is
-  importable; gracefully skipped otherwise. Never on the default path.
-- `--real <ckpt.safetensors> --layer <key>` — pull a real `[out,in]` weight
-  (e.g. from `nunchaku_ref_dump.transformer_blocks.0.*.safetensors`) instead of
-  synthetic, for a stronger non-synthetic check.
+- `--cross-check` — drives deepcompressor's authoritative SVD low-rank branch
+  (`deepcompressor.nn.patch.lowrank.LowRankBranch`, exact `torch.linalg.svd`) and
+  diffs it against ours (randomized `torch.svd_lowrank`): residual energy,
+  effective-weight agreement, forward agreement. Observed: ours is within ~0.03%
+  of the exact-SVD residual lower bound, subspaces agree to ~3%. Also tries
+  deepcompressor's `simple_quantize` for a 4-bit RTN cross-check, skipped
+  gracefully when its CUDA C-extension build is unavailable. Never on the default
+  path; the whole check skips cleanly if deepcompressor isn't importable.
+- `--real <ckpt.safetensors> --layer <key>` — pull a real dense `[out,in]` weight
+  (synthetic activation).
+- `--real-nunchaku <dump.safetensors>` — derive a **real DiT-magnitude** weight
+  AND **real activation** from a Nunchaku SVDQuant ground-truth dump (e.g.
+  `nunchaku_ref_dump.transformer_blocks.0.*.safetensors`). The rank-128 low-rank
+  is decoded exactly via the installed Nunchaku packer; the int4-main residual is
+  de-swizzled with the in-repo perms (NOTE: that byte-swizzle is
+  nunchaku-version-specific, so the reconstructed Ŵ may not bit-match the original
+  layer — the driver reports the `Ŵ@(x/smooth)+b` vs real-`y` fidelity). The
+  point is realistic non-Gaussian weight statistics + real outlier activations to
+  stress SmoothQuant; the CPU/CUDA tests still pass (gates unchanged, quant floor
+  rises to ~0.08–0.13 as real weights are harder than Gaussian).
 
 `deepcompressor/` is a plain `git clone`
 (`https://github.com/mit-han-lab/deepcompressor`) kept as source-of-truth and
