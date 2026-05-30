@@ -221,6 +221,9 @@
 > cached focused wall time `6.52→3.10 s`. Full textured e2e is now `real 57.13`, byte-identical
 > to the GPU-DiT-load run for `stage1`, `stage2`, `tex_coords`, and `tex_feats`, with the same
 > `1,403,042 verts / 3,048,684 tris` and PBR `99.7%` / `100%`.
+> The same F16 upload helper is now also used by the dense Stage-1 occupancy decoder: load
+> `0.28→0.05 s`, verifier metrics unchanged, final e2e `real 56.85` and byte-identical to the
+> previous run.
 >
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
