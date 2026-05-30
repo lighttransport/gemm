@@ -131,8 +131,18 @@
 > the per-warp `if(qb>=q_len) return` (would hang others at the new `__syncthreads`; OOB queries
 > already guarded in Q-load + output-write). **1.54× on whole DiT, OUTPUT BYTE-IDENTICAL** (Stage-2
 > cosine 0.985411 unchanged). S1 34.2→21.9 (biggest, dense N=4096), S2 24.9→16.3, S3 14.9→9.8 =
-> **74→48 s**. Stage-2/fwd 1243→806 ms. **SESSION CUMULATIVE DiT 100.2→48.0 s = 2.09×** (modulation +
-> cuBLAS-TF32 + attn-staging). Mesh unchanged (1.47M verts 99.7%). NEXT: 2 decoders (~28s, sparse-conv).
+> **74→48 s**. Stage-2/fwd 1243→806 ms. Mesh unchanged (1.47M verts 99.7%).
+>
+> ## DiT PERF #3: RoPE reparallelization — DiT 48→44 s (2026-05-30)
+>
+> `rope_3d_f32` ran `for(h=threadIdx.x; h<n_heads; h+=blockDim.x)` → only n_heads=12 of 256 threads
+> active (same low-occupancy bug as modulation), ~1.38 ms/call ~13× off mem-floor. Reparallelized to
+> **one thread per (head,axis,freq) pair** (all 256 active, coalesced). Per-element independent (no
+> race); benign ~3e-5 cosine shift (S2 0.985411→0.985379, FMA reassociation, still ~0.985 floor).
+> S1 21.9→20.0, S2 16.3→14.8 (806→731 ms/fwd), S3 9.8→8.9 = **48→43.7 s**. Mesh valid 1.40M verts
+> 99.7% (count drifts 1.47→1.40M from accumulated benign numeric diffs shifting near-threshold subdiv).
+> **SESSION CUMULATIVE DiT 100.2→43.7 s = 2.29×** (modulation + cuBLAS-TF32 + attn-staging + rope);
+> S2/fwd 1924→731 ms (2.63×). NEXT: 2 decoders (~28s, sparse-conv gather/pack/GEMM/scatter, deeper effort).
 >
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
