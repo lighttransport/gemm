@@ -155,6 +155,23 @@
 > **COMBINED DiT+decoder 127.4→56.3 s = 2.26× this session.** NEXT: c2s conv2 pack build on 1.47M
 > children (~3.75+3.67 s, not cacheable) → would need GPU-side pack build (src/dst from gather map).
 >
+> ## DECODER PERF #2: GPU pack build from gather_map — c2s conv2 4.0→0.6 s (2026-05-30)
+>
+> The "NEXT" above is now implemented. New `sparse_pack_from_gather_map_f32` builds the packed
+> sparse-conv `(src_idx,dst_idx,M)` lists directly on GPU from the already-built `[N,27]`
+> `d_gather_map`; `T2_SCVAE_CPU_PACK_BUILD=1` forces the old CPU hash-loop builder for A/B.
+> The pack uses contiguous `[27,N]` GPU storage. Atomic row order inside each kernel position is
+> nondeterministic, but each destination row appears once per `k`, so scatter-add output is
+> byte-identical.
+>
+> A/B verifier on T.png dumps (`08_shape_slat_denorm_feats` + `05_ss_coords`, same SC-VAE flags):
+> GPU-pack vs CPU-pack output **byte-identical** (`max_abs=0`, `rel_L2=0`, coord mismatches `0`).
+> C2S timings, CPU-pack → GPU-pack: 1024→512 `202.7→102.9 ms`, 512→256 `337.8→126.7 ms`,
+> 256→128 `963.6→222.5 ms`, 128→64 `3993.0→600.9 ms`. Full textured e2e with default GPU-pack
+> completed: shape `N=1,403,042`, OBJ `1,403,042 verts / 3,048,684 tris`, texture decoder replayed
+> all 4 shape subdivisions, PBR coverage `99.7%` trilinear / `100%` covered. Full-run decoder C2S
+> stage-3 timings were shape `558.7 ms`, texture `509.2 ms`.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)

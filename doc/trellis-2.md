@@ -1123,9 +1123,32 @@ ConvNeXt collapse (shape decoder):
 **Decoder total 27.4 → 12.6 s = 2.18×** (shape 13.9→6.4 s, tex 13.5→6.2 s). Output is
 **byte-identical** (1,403,042 verts, 3,048,684 tris, 99.7% trilinear, 100% covered) — pure caching,
 zero numerical change. **Combined GPU pipeline this session: DiT+decoder 127.4 → 56.3 s = 2.26×.**
-Remaining decoder cost is now the c2s `conv2` pack build on the 1.47 M-child level (~3.75 s shape +
-3.67 s tex); not cacheable (unique level), would need a GPU-side pack build (derive src/dst from the
-gather map on-device) to eliminate the host hash loop + ~300 MB upload.
+The remaining decoder cost after this change was the c2s `conv2` pack build on the 1.47 M-child
+level (~3.75 s shape + 3.67 s tex); see the next section for the GPU-side builder that removes it.
+
+### Decoder GPU pack build from gather_map (2026-05-30) — c2s conv2 4.0 → 0.6 s
+
+The level cache cannot help the c2s `conv2` pack because it is the first sparse conv after each
+subdivision and therefore sees a new coordinate level. The old builder still did `N*27` CPU hash
+lookups and uploaded up to 54 index arrays. New kernel `sparse_pack_from_gather_map_f32` builds the
+same packed `(src_idx,dst_idx,M)` lists directly on GPU from the already-built `[N,27]` gather map.
+`T2_SCVAE_CPU_PACK_BUILD=1` keeps the old CPU builder available for A/B.
+
+A/B on the T.png verification dumps (`08_shape_slat_denorm_feats` + `05_ss_coords`) is
+**byte-identical** versus the CPU-pack path: feature `max_abs=0`, `rel_L2=0`, coord mismatches `0`.
+Focused shape-decoder C2S timings, CPU-pack → GPU-pack:
+
+| C2S level | CPU pack | GPU pack | speedup |
+|---|---:|---:|---:|
+| 1024 → 512 | 202.7 ms | 102.9 ms | 2.0× |
+| 512 → 256  | 337.8 ms | 126.7 ms | 2.7× |
+| 256 → 128  | 963.6 ms | 222.5 ms | 4.3× |
+| 128 → 64   | 3993.0 ms | 600.9 ms | 6.6× |
+
+Full textured e2e with default GPU-pack completed successfully: shape output `N=1,403,042`, OBJ
+`1,403,042` verts / `3,048,684` tris, texture decoder replayed all four shape subdivisions, and PBR
+coverage was `99.7%` trilinear / `100%` covered. In that full run, finest-level c2s timings were
+shape `558.7 ms` and texture `509.2 ms`.
 
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
