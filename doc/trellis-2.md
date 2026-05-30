@@ -1100,6 +1100,33 @@ subdivision decisions — equivalent quality, both ~0.985 vs PyTorch. Remaining 
 (~28 s, sparse-conv-bound — gather/pack/GEMM/scatter on up to 1.4 M voxels; no single hot kernel,
 a deeper effort) are now the largest cost.
 
+### Decoder packed-conv pack caching (2026-05-30) — decoder 27.4 → 12.6 s = 2.18×
+
+Profiling the decoder (`-t cuda` API trace) showed the time was not in any GPU kernel but in
+**thousands of synchronous host memory ops** — the per-block `t2_sparse_conv_pack_build`. The
+"packed" sparse-conv path (`T2_SCVAE_PACKED_CONV=1`, default) builds 27 per-offset src/dst index
+arrays by doing `N*27` CPU-side hash lookups and up to 54 HtoD uploads. That pack is a **pure
+function of (coords, hash)** and is *identical* across every ConvNeXt block at a resolution level,
+yet it was being rebuilt from scratch for each block.
+
+Fix: cache the pack in the runner keyed on `(coords ptr, N)`. A new level (the c2s `conv2` that
+produces the child voxels) rebuilds; every ConvNeXt block and the c2s `conv1` at a level reuse the
+cache. Invalidated at decode start and freed at decode end / `cuda_trellis2_free`. The per-stage
+ConvNeXt collapse (shape decoder):
+
+| ConvNeXt stage | blocks | before | after | speedup |
+|---|---|---|---|---|
+| stage 1 (res 256) | 16 | 1762 ms | 485 ms | 3.6× |
+| stage 2 (res 128) | 8  | 2016 ms | 338 ms | 6.0× |
+| stage 3 (res 64)  | 4  | 3251 ms | 279 ms | **11.6×** |
+
+**Decoder total 27.4 → 12.6 s = 2.18×** (shape 13.9→6.4 s, tex 13.5→6.2 s). Output is
+**byte-identical** (1,403,042 verts, 3,048,684 tris, 99.7% trilinear, 100% covered) — pure caching,
+zero numerical change. **Combined GPU pipeline this session: DiT+decoder 127.4 → 56.3 s = 2.26×.**
+Remaining decoder cost is now the c2s `conv2` pack build on the 1.47 M-child level (~3.75 s shape +
+3.67 s tex); not cacheable (unique level), would need a GPU-side pack build (derive src/dst from the
+gather map on-device) to eliminate the host hash loop + ~300 MB upload.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
