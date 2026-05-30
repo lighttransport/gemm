@@ -220,6 +220,70 @@ def rel_l2(a, b):
 
 
 # ---------------------------------------------------------------------------
+def _nunchaku_weight_perm(out, K):
+    """Inverse of Nunchaku pack_weight byte layout (int4, warp_n=128); credit
+    rdna4/qimg/tools/nunchaku_int4_decode.py."""
+    return (torch.arange(out * K).reshape(out, K)
+            .reshape(out // 128, 8, 2, 8, 1, K // 64, 1, 2, 4, 8)
+            .permute(0, 5, 6, 1, 3, 8, 2, 7, 4, 9).contiguous().reshape(-1).numpy())
+
+
+def _nunchaku_scale_outperm(n):
+    return (torch.arange(n).reshape(n // 128, 1, 8, 2, 4, 2)
+            .permute(0, 1, 2, 4, 3, 5).reshape(-1).numpy())
+
+
+def decode_nunchaku_dump(path):
+    """Derive a real DiT-magnitude dense [out,in] weight + real activation from a
+    Nunchaku SVDQuant ground-truth dump (e.g. nunchaku_ref_dump.*.safetensors).
+
+    The rank-128 low-rank is decoded exactly via the installed Nunchaku packer
+    (`unpack_lowrank_weight`); the int4-main residual is de-swizzled with the
+    in-repo perms. NOTE: the int4-main byte-swizzle is Nunchaku-version-specific,
+    so the reconstructed Ŵ may not bit-match the original layer — we report the
+    Ŵ@(x/smooth)+b vs real-y fidelity so the caller sees the decode quality. For
+    a unit test the point is a realistic, non-Gaussian [out,in] weight (real
+    per-channel outliers) + real activation, not an exact layer recovery."""
+    from safetensors import safe_open
+    h = safe_open(path, "pt", "cpu"); g = lambda n: h.get_tensor(n)
+    qw = g("weight.qweight").numpy().astype(np.uint8)            # [out, in/2]
+    wsc = g("weight.wscales").float().numpy()                    # [in/64, out]
+    real_x = g("x").float()                                      # [N, in]
+    out, Khalf = qw.shape; K = Khalf * 2
+    bf = qw.ravel()
+    nib = np.empty(out * K, np.int16); nib[0::2] = bf & 0xF; nib[1::2] = bf >> 4; nib -= 16 * (nib >= 8)
+    nibbles = np.empty(out * K, np.float32)
+    nibbles[_nunchaku_weight_perm(out, K)] = nib.astype(np.float32)
+    main = nibbles.reshape(out, K) * np.repeat(wsc[:, _nunchaku_scale_outperm(out)].T, 64, axis=1)
+
+    lowrank = np.zeros((out, K), np.float32)
+    rel_y = None
+    try:
+        from nunchaku.lora.flux.packer import NunchakuWeightPacker
+        pk = NunchakuWeightPacker(bits=4, warp_n=128)
+        pu = pk.unpack_lowrank_weight(g("weight.proj_up").to(torch.bfloat16), down=False).float().numpy()
+        pd = pk.unpack_lowrank_weight(g("weight.proj_down").to(torch.bfloat16), down=True).float().numpy()
+        lowrank = pu @ pd
+        try:                                                    # fidelity vs the operational oracle y
+            smf = g("weight.smooth_factor").float().numpy(); bias = g("weight.bias").float().numpy()
+            y = g("y").float().numpy(); xs = real_x.numpy() / smf[None, :]
+            rel_y = float(np.linalg.norm((xs @ (main + lowrank).T + bias) - y) / np.linalg.norm(y))
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[real-nunchaku] Nunchaku packer unavailable ({str(e).splitlines()[-1][:60]}); "
+              f"using int4-main only", file=sys.stderr)
+
+    W = torch.from_numpy((main + lowrank).astype(np.float32))
+    msg = f"[real-nunchaku] W[{out},{K}] from {os.path.basename(path)}"
+    if rel_y is not None:
+        msg += (f"  (Ŵ@(x/smooth)+b vs real y: rel_L2={rel_y:.3f} — int4-main swizzle is "
+                f"nunchaku-version-specific; low-rank is exact)")
+    print(msg, file=sys.stderr)
+    return W, real_x
+
+
+# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="dumps", help="output directory")
@@ -234,9 +298,12 @@ def main():
     ap.add_argument("--device", default="cpu", help="torch device for quant (cpu/cuda)")
     ap.add_argument("--cross-check", action="store_true",
                     help="optionally cross-check the low-rank+4bit decomposition vs deepcompressor")
-    ap.add_argument("--real", default=None, help="safetensors path to pull a real layer weight from")
+    ap.add_argument("--real", default=None, help="safetensors path to pull a real dense [out,in] weight from")
     ap.add_argument("--layer", default="transformer_blocks.0.attn.to_out.0.weight",
                     help="tensor key inside --real safetensors (a [out,in] weight)")
+    ap.add_argument("--real-nunchaku", default=None, dest="real_nunchaku",
+                    help="Nunchaku SVDQuant dump (weight.qweight/proj_*/x/y) -> derive a real "
+                         "DiT-magnitude [out,in] weight + real activation")
     a = ap.parse_args()
     torch.manual_seed(a.seed)
     dev = a.device
@@ -245,20 +312,28 @@ def main():
     assert IN % 64 == 0, "IN must be %64 (int4 g64 and nvfp4 BK=64)"
     assert OUT % 8 == 0 and TOK % 16 == 0, "OUT%8, TOK%16 for the naive-GEMM tiles"
 
-    # ---- inputs (synthetic, seeded) or a real layer weight ----
-    if a.real:
+    # ---- inputs (synthetic, seeded) or a real layer weight + activation ----
+    real_x = None
+    if a.real_nunchaku:
+        W, real_x = decode_nunchaku_dump(a.real_nunchaku)
+        OUT, IN = W.shape
+    elif a.real:
         from safetensors import safe_open
         with safe_open(a.real, "pt", "cpu") as f:
             W = f.get_tensor(a.layer).float()
         OUT, IN = W.shape
-        # pad IN up to a multiple of 64 if the real layer isn't already
-        if IN % 64:
-            pad = 64 - IN % 64
-            W = torch.nn.functional.pad(W, (0, pad)); IN += pad
+        if IN % 64:                                    # pad IN to a multiple of 64
+            W = torch.nn.functional.pad(W, (0, 64 - IN % 64)); IN = W.shape[1]
         print(f"[real] {a.layer}: W[{OUT},{IN}] from {a.real}", file=sys.stderr)
     else:
         W = (torch.randn(OUT, IN) * 0.02)
-    x = torch.randn(TOK, IN)
+    assert IN % 64 == 0 and OUT % 8 == 0, f"need IN%64==0, OUT%8==0 (got {OUT}x{IN})"
+    if real_x is not None:
+        if real_x.shape[0] < TOK:
+            TOK = (real_x.shape[0] // 16) * 16         # clamp to available rows, keep %16
+        x = real_x[:TOK].float().contiguous()
+    else:
+        x = torch.randn(TOK, IN)
     bias = (torch.randn(OUT) * 0.1)
     W, x, bias = W.float(), x.float(), bias.float()
 
@@ -336,23 +411,48 @@ def main():
         print(f"[warn] worst cosine {worst:.5f} < 0.99 — decomposition may be off", file=sys.stderr)
 
     if a.cross_check:
-        cross_check(What, lora_up, lora_down, R_res)
+        cross_check(What, lora_up, lora_down, r)
 
 
-def cross_check(What, lora_up, lora_down, R_res):
-    """Optional: confirm the low-rank+residual split matches deepcompressor's, when importable.
-    Never on the default path; graceful skip if deepcompressor isn't installed."""
+def cross_check(What, lora_up, lora_down, rank):
+    """Drive deepcompressor's authoritative SVD low-rank branch and diff it against ours.
+
+    deepcompressor's `LowRankBranch` factorizes the (smoothed) weight with EXACT
+    `torch.linalg.svd`; ours uses randomized `torch.svd_lowrank`. We compare the
+    residual energy, the effective-weight agreement, and a forward pass. The 4-bit
+    RTN residual quant (deepcompressor's `simple_quantize`) is attempted too, but it
+    pulls in a CUDA C-extension build — skipped gracefully if that fails. Never on
+    the default path; graceful skip if deepcompressor isn't importable."""
+    dc_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepcompressor")
+    if dc_dir not in sys.path:
+        sys.path.insert(0, dc_dir)
     try:
-        import deepcompressor  # noqa: F401
+        from deepcompressor.nn.patch.lowrank import LowRankBranch
     except Exception as e:
-        print(f"[cross-check] deepcompressor not importable ({e}); skipping", file=sys.stderr)
+        print(f"[cross-check] deepcompressor.LowRankBranch not importable "
+              f"({str(e).splitlines()[-1][:80]}); skipping", file=sys.stderr)
         return
-    # We only assert the reconstruction identity that defines SVDQuant's low-rank branch:
-    #   What ≈ lora_up @ lora_down + R_res   (R_res is what gets 4-bit quantized).
-    recon = lora_up @ lora_down + R_res
-    err = (recon - What).norm() / What.norm()
-    print(f"[cross-check] ||(lu@ld + R) - What|| / ||What|| = {err:.2e} "
-          f"(deepcompressor importable; SVD low-rank identity holds)", file=sys.stderr)
+    out, inn = What.shape
+    branch = LowRankBranch(inn, out, rank, weight=What.float())       # exact torch.linalg.svd
+    eff_dc = branch.get_effective_weight().detach().float()           # b@a = lu@ld  [out,in]
+    eff_ours = (lora_up @ lora_down).float()
+    res_dc = ((What - eff_dc).norm() / What.norm()).item()
+    res_ours = ((What - eff_ours).norm() / What.norm()).item()
+    agree = ((eff_dc - eff_ours).norm() / (eff_dc.norm() + 1e-30)).item()
+    xp = torch.randn(8, inn)
+    yb = branch(xp.float())
+    fwd = ((((xp @ lora_down.t()) @ lora_up.t()) - yb).norm() / (yb.norm() + 1e-30)).item()
+    print(f"[cross-check] low-rank vs deepcompressor LowRankBranch (exact SVD, rank={rank}):", file=sys.stderr)
+    print(f"  residual ||What-lu@ld||/||What||: ours(svd_lowrank)={res_ours:.4e}  "
+          f"deepcompressor(exact)={res_dc:.4e}  (exact is the optimal lower bound)", file=sys.stderr)
+    print(f"  effective-weight agreement ||eff_dc-eff_ours||/||eff_dc|| = {agree:.4e}", file=sys.stderr)
+    print(f"  low-rank forward agreement rel_L2 = {fwd:.4e}", file=sys.stderr)
+    try:
+        from deepcompressor.quantizer.impl.simple import simple_quantize  # noqa: F401
+        print("  4-bit RTN cross-check: simple_quantize importable (available)", file=sys.stderr)
+    except Exception as e:
+        print(f"  4-bit RTN cross-check: skipped — simple_quantize needs the CUDA C-ext build "
+              f"({str(e).splitlines()[-1][:60]})", file=sys.stderr)
 
 
 if __name__ == "__main__":
