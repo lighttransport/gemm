@@ -980,48 +980,50 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
 }
 
 static int load_decoder_weights(cuda_trellis2_runner *r, const char *path) {
+    double t_load0 = t2_now_ms();
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     fprintf(stderr, "T2: loading decoder from %s (%d tensors)\n", path, st->n_tensors);
     int v = r->verbose;
 
-    r->dec_conv_in_w = t2_upload_f32(st, "input_layer.weight", v);
-    r->dec_conv_in_b = t2_upload_f32(st, "input_layer.bias", v);
+    r->dec_conv_in_w = t2_upload_f32_fast(r, st, "input_layer.weight", v);
+    r->dec_conv_in_b = t2_upload_f32_fast(r, st, "input_layer.bias", v);
 
     /* Load ResBlock weights */
     #define LOAD_RES(rb, prefix) do { \
         char _n[256]; \
-        snprintf(_n, sizeof(_n), "%snorm1.weight", prefix); (rb).gn1_w = t2_upload_f32(st, _n, v>=2?v:0); \
-        snprintf(_n, sizeof(_n), "%snorm1.bias", prefix);   (rb).gn1_b = t2_upload_f32(st, _n, 0); \
-        snprintf(_n, sizeof(_n), "%sconv1.weight", prefix); (rb).conv1_w = t2_upload_f32(st, _n, 0); \
-        snprintf(_n, sizeof(_n), "%sconv1.bias", prefix);   (rb).conv1_b = t2_upload_f32(st, _n, 0); \
-        snprintf(_n, sizeof(_n), "%snorm2.weight", prefix); (rb).gn2_w = t2_upload_f32(st, _n, 0); \
-        snprintf(_n, sizeof(_n), "%snorm2.bias", prefix);   (rb).gn2_b = t2_upload_f32(st, _n, 0); \
-        snprintf(_n, sizeof(_n), "%sconv2.weight", prefix); (rb).conv2_w = t2_upload_f32(st, _n, 0); \
-        snprintf(_n, sizeof(_n), "%sconv2.bias", prefix);   (rb).conv2_b = t2_upload_f32(st, _n, 0); \
+        snprintf(_n, sizeof(_n), "%snorm1.weight", prefix); (rb).gn1_w = t2_upload_f32_fast(r, st, _n, v>=2?v:0); \
+        snprintf(_n, sizeof(_n), "%snorm1.bias", prefix);   (rb).gn1_b = t2_upload_f32_fast(r, st, _n, 0); \
+        snprintf(_n, sizeof(_n), "%sconv1.weight", prefix); (rb).conv1_w = t2_upload_f32_fast(r, st, _n, 0); \
+        snprintf(_n, sizeof(_n), "%sconv1.bias", prefix);   (rb).conv1_b = t2_upload_f32_fast(r, st, _n, 0); \
+        snprintf(_n, sizeof(_n), "%snorm2.weight", prefix); (rb).gn2_w = t2_upload_f32_fast(r, st, _n, 0); \
+        snprintf(_n, sizeof(_n), "%snorm2.bias", prefix);   (rb).gn2_b = t2_upload_f32_fast(r, st, _n, 0); \
+        snprintf(_n, sizeof(_n), "%sconv2.weight", prefix); (rb).conv2_w = t2_upload_f32_fast(r, st, _n, 0); \
+        snprintf(_n, sizeof(_n), "%sconv2.bias", prefix);   (rb).conv2_b = t2_upload_f32_fast(r, st, _n, 0); \
     } while(0)
 
     LOAD_RES(r->dec_middle[0], "middle_block.0.");
     LOAD_RES(r->dec_middle[1], "middle_block.1.");
     LOAD_RES(r->dec_res16[0],  "blocks.0.");
     LOAD_RES(r->dec_res16[1],  "blocks.1.");
-    r->dec_up1_w = t2_upload_f32(st, "blocks.2.conv.weight", v);
-    r->dec_up1_b = t2_upload_f32(st, "blocks.2.conv.bias", v);
+    r->dec_up1_w = t2_upload_f32_fast(r, st, "blocks.2.conv.weight", v);
+    r->dec_up1_b = t2_upload_f32_fast(r, st, "blocks.2.conv.bias", v);
     LOAD_RES(r->dec_res32[0],  "blocks.3.");
     LOAD_RES(r->dec_res32[1],  "blocks.4.");
-    r->dec_up2_w = t2_upload_f32(st, "blocks.5.conv.weight", v);
-    r->dec_up2_b = t2_upload_f32(st, "blocks.5.conv.bias", v);
+    r->dec_up2_w = t2_upload_f32_fast(r, st, "blocks.5.conv.weight", v);
+    r->dec_up2_b = t2_upload_f32_fast(r, st, "blocks.5.conv.bias", v);
     LOAD_RES(r->dec_res64[0],  "blocks.6.");
     LOAD_RES(r->dec_res64[1],  "blocks.7.");
-    r->dec_out_gn_w   = t2_upload_f32(st, "out_layer.0.weight", v);
-    r->dec_out_gn_b   = t2_upload_f32(st, "out_layer.0.bias", v);
-    r->dec_out_conv_w  = t2_upload_f32(st, "out_layer.2.weight", v);
-    r->dec_out_conv_b  = t2_upload_f32(st, "out_layer.2.bias", v);
+    r->dec_out_gn_w   = t2_upload_f32_fast(r, st, "out_layer.0.weight", v);
+    r->dec_out_gn_b   = t2_upload_f32_fast(r, st, "out_layer.0.bias", v);
+    r->dec_out_conv_w  = t2_upload_f32_fast(r, st, "out_layer.2.weight", v);
+    r->dec_out_conv_b  = t2_upload_f32_fast(r, st, "out_layer.2.bias", v);
 
     #undef LOAD_RES
 
     safetensors_close(st);
     fprintf(stderr, "T2: decoder loaded\n");
+    t2_timing_log("load_stage1_decoder", t_load0);
     return 0;
 }
 
