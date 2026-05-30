@@ -280,6 +280,15 @@ struct cuda_trellis2_runner {
     int ca_kv_cache_model_id[2];  /* which model's weights were cached */
     int ca_kv_cache_valid[2];
 
+    /* Sparse Stage-2/3 RoPE tables are a pure function of coords and n_freqs.
+     * Cache them across sampler steps to avoid repeated CPU sin/cos + HtoD. */
+    CUdeviceptr sparse_rope_cos[4];
+    CUdeviceptr sparse_rope_sin[4];
+    uint64_t sparse_rope_coord_hash[4];
+    int sparse_rope_N[4];
+    int sparse_rope_n_freqs[4];
+    int sparse_rope_valid[4];
+
     /* Scratch buffers (expanded to 12 for shape decoder use) */
     CUdeviceptr scratch[12];
     size_t      scratch_size[12];
@@ -750,6 +759,16 @@ void cuda_trellis2_free_buffer(void *p) {
 
 static void t2_sparse_conv_pack_free(t2_sparse_conv_pack *pack);  /* defined below */
 
+static void t2_sparse_rope_cache_free(cuda_trellis2_runner *r, int model_id) {
+    if (!r || model_id < 0 || model_id >= 4) return;
+    CU_FREE(r->sparse_rope_cos[model_id]);
+    CU_FREE(r->sparse_rope_sin[model_id]);
+    r->sparse_rope_coord_hash[model_id] = 0;
+    r->sparse_rope_N[model_id] = 0;
+    r->sparse_rope_n_freqs[model_id] = 0;
+    r->sparse_rope_valid[model_id] = 0;
+}
+
 void cuda_trellis2_free(cuda_trellis2_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->context);
@@ -761,6 +780,8 @@ void cuda_trellis2_free(cuda_trellis2_runner *r) {
 
     for (int i = 0; i < 12; i++)
         CU_FREE(r->scratch[i]);
+    for (int i = 0; i < 4; i++)
+        t2_sparse_rope_cache_free(r, i);
 
     CU_FREE(r->dit_t_fc1_w); CU_FREE(r->dit_t_fc1_b);
     CU_FREE(r->dit_t_fc2_w); CU_FREE(r->dit_t_fc2_b);
@@ -1538,6 +1559,7 @@ void cuda_trellis2_unload_stage2(cuda_trellis2_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->context);
     dit_model_free_gpu(&r->stage2);
+    t2_sparse_rope_cache_free(r, 2);
     r->stage2_loaded = 0;
 }
 
@@ -1545,6 +1567,7 @@ void cuda_trellis2_unload_stage3(cuda_trellis2_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->context);
     dit_model_free_gpu(&r->stage3);
+    t2_sparse_rope_cache_free(r, 3);
     r->stage3_loaded = 0;
 }
 
@@ -1833,7 +1856,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     if (cache_slot < 0 || cache_slot > 1) cache_slot = 0;
     int use_kv_cache = (r->ca_kv_cache_valid[cache_slot] &&
                         r->ca_kv_cache_model_id[cache_slot] == model_id &&
-                        r->ca_kv_cache_cond_hash[cache_slot] == cond_hash);
+                        r->ca_kv_cache_cond_hash[cache_slot] == cond_hash &&
+                        r->ca_kv_cache_n_blocks[cache_slot] == n_blocks);
     if (!use_kv_cache && d_cond) {
         /* Allocate/reallocate cache */
         size_t kv_sz = (size_t)ctx_len * D * sizeof(float);
@@ -2515,6 +2539,18 @@ static uint64_t t2_hash_f32_bytes(const float *data, size_t n) {
     return h;
 }
 
+static uint64_t t2_hash_i32_bytes(const int32_t *data, size_t n) {
+    if (!data) return 0;
+    const unsigned char *p = (const unsigned char *)data;
+    size_t bytes = n * sizeof(int32_t);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < bytes; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static int t2_all_zero_f32(const float *data, size_t n) {
     if (!data) return 0;
     for (size_t i = 0; i < n; i++) {
@@ -2526,6 +2562,88 @@ static int t2_all_zero_f32(const float *data, size_t n) {
 static int t2_cond_cache_slot(const float *cond_features, int ctx_len) {
     if (!cond_features) return 0;
     return t2_all_zero_f32(cond_features, (size_t)ctx_len * DIT_COND_DIM) ? 1 : 0;
+}
+
+static int t2_kv_cache_ready(const cuda_trellis2_runner *r, int slot,
+                              int model_id, uint64_t cond_hash,
+                              int n_blocks) {
+    return r && slot >= 0 && slot < 2 &&
+           r->ca_kv_cache_valid[slot] &&
+           r->ca_kv_cache_model_id[slot] == model_id &&
+           r->ca_kv_cache_cond_hash[slot] == cond_hash &&
+           r->ca_kv_cache_n_blocks[slot] == n_blocks;
+}
+
+static int t2_get_sparse_rope_tables(cuda_trellis2_runner *r, int model_id,
+                                      const dit_model_gpu *m,
+                                      const int32_t *coords, int N,
+                                      CUdeviceptr *out_cos,
+                                      CUdeviceptr *out_sin) {
+    if (!r || !m || !coords || !out_cos || !out_sin ||
+        model_id < 0 || model_id >= 4 || N <= 0) {
+        return -1;
+    }
+
+    int n_freqs = m->n_rope_freqs;
+    uint64_t coord_hash = t2_hash_i32_bytes(coords, (size_t)N * 4);
+    if (r->sparse_rope_valid[model_id] &&
+        r->sparse_rope_coord_hash[model_id] == coord_hash &&
+        r->sparse_rope_N[model_id] == N &&
+        r->sparse_rope_n_freqs[model_id] == n_freqs &&
+        r->sparse_rope_cos[model_id] &&
+        r->sparse_rope_sin[model_id]) {
+        *out_cos = r->sparse_rope_cos[model_id];
+        *out_sin = r->sparse_rope_sin[model_id];
+        return 0;
+    }
+
+    t2_sparse_rope_cache_free(r, model_id);
+
+    const float rope_theta = 10000.0f;
+    float *freqs = (float *)malloc((size_t)n_freqs * sizeof(float));
+    size_t table_sz = (size_t)N * 3 * n_freqs * sizeof(float);
+    float *cos_tab = (float *)malloc(table_sz);
+    float *sin_tab = (float *)malloc(table_sz);
+    if (!freqs || !cos_tab || !sin_tab) {
+        free(freqs); free(cos_tab); free(sin_tab);
+        return -1;
+    }
+
+    for (int j = 0; j < n_freqs; j++)
+        freqs[j] = 1.0f / powf(rope_theta, (float)j / (float)n_freqs);
+
+    for (int i = 0; i < N; i++) {
+        float c[3] = {
+            (float)coords[i * 4 + 1],
+            (float)coords[i * 4 + 2],
+            (float)coords[i * 4 + 3],
+        };
+        for (int axis = 0; axis < 3; axis++) {
+            for (int j = 0; j < n_freqs; j++) {
+                float theta = c[axis] * freqs[j];
+                size_t idx = (size_t)i * 3 * n_freqs + (size_t)axis * n_freqs + j;
+                cos_tab[idx] = cosf(theta);
+                sin_tab[idx] = sinf(theta);
+            }
+        }
+    }
+
+    r->sparse_rope_cos[model_id] = cu_upload_raw(cos_tab, table_sz);
+    r->sparse_rope_sin[model_id] = cu_upload_raw(sin_tab, table_sz);
+    free(freqs); free(cos_tab); free(sin_tab);
+
+    if (!r->sparse_rope_cos[model_id] || !r->sparse_rope_sin[model_id]) {
+        t2_sparse_rope_cache_free(r, model_id);
+        return -1;
+    }
+
+    r->sparse_rope_coord_hash[model_id] = coord_hash;
+    r->sparse_rope_N[model_id] = N;
+    r->sparse_rope_n_freqs[model_id] = n_freqs;
+    r->sparse_rope_valid[model_id] = 1;
+    *out_cos = r->sparse_rope_cos[model_id];
+    *out_sin = r->sparse_rope_sin[model_id];
+    return 0;
 }
 
 void cuda_trellis2_invalidate_kv_cache(cuda_trellis2_runner *r) {
@@ -2556,7 +2674,9 @@ int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
 
     CUdeviceptr d_x = cu_upload_raw(x_transposed, (size_t)N * in_ch * sizeof(float));
     free(x_transposed);
-    CUdeviceptr d_cond = cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+    int have_kv = t2_kv_cache_ready(r, cache_slot, 1, cond_hash, DIT_DEPTH);
+    CUdeviceptr d_cond = have_kv ? 0 :
+        cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
     CUdeviceptr d_out;
     cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
 
@@ -2571,7 +2691,9 @@ int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
             output[ch * N + pos] = out_flat[pos * in_ch + ch];
     free(out_flat);
 
-    cuMemFree(d_x); cuMemFree(d_cond); cuMemFree(d_out);
+    cuMemFree(d_x);
+    if (d_cond) cuMemFree(d_cond);
+    cuMemFree(d_out);
     return 0;
 }
 
@@ -4081,39 +4203,19 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
     uint64_t cond_hash = t2_hash_f32_bytes(cond_features, cond_n);
     int cache_slot = t2_cond_cache_slot(cond_features, ctx_len);
 
-    /* Compute 3D RoPE tables from sparse coords on CPU */
-    int n_freqs = m->n_rope_freqs;  /* 21 */
-    float rope_theta = 10000.0f;
-    float *freqs = (float *)malloc((size_t)n_freqs * sizeof(float));
-    for (int j = 0; j < n_freqs; j++)
-        freqs[j] = 1.0f / powf(rope_theta, (float)j / (float)n_freqs);
-
-    size_t table_sz = (size_t)N * 3 * n_freqs * sizeof(float);
-    float *cos_tab = (float *)malloc(table_sz);
-    float *sin_tab = (float *)malloc(table_sz);
-
-    for (int i = 0; i < N; i++) {
-        /* coords[i] = (batch, z, y, x) */
-        float cz = (float)coords[i * 4 + 1];
-        float cy = (float)coords[i * 4 + 2];
-        float cx = (float)coords[i * 4 + 3];
-        float c[3] = {cz, cy, cx};
-        for (int axis = 0; axis < 3; axis++) {
-            for (int j = 0; j < n_freqs; j++) {
-                float theta = c[axis] * freqs[j];
-                cos_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(theta);
-                sin_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(theta);
-            }
-        }
+    CUdeviceptr d_rope_cos = 0, d_rope_sin = 0;
+    if (t2_get_sparse_rope_tables(r, 2, m, coords, N,
+                                  &d_rope_cos, &d_rope_sin) != 0) {
+        fprintf(stderr, "T2: failed to build Stage 2 sparse RoPE tables\n");
+        return -1;
     }
 
-    CUdeviceptr d_rope_cos = cu_upload_raw(cos_tab, table_sz);
-    CUdeviceptr d_rope_sin = cu_upload_raw(sin_tab, table_sz);
-    free(freqs); free(cos_tab); free(sin_tab);
-
-    /* Upload input and conditioning */
+    /* Upload input and conditioning. The conditioning tensor is only needed when
+     * the per-block cross-attention KV cache is cold for this model/slot. */
     CUdeviceptr d_x = cu_upload_raw(x_t, (size_t)N * in_ch * sizeof(float));
-    CUdeviceptr d_cond = cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+    int have_kv = t2_kv_cache_ready(r, cache_slot, 2, cond_hash, m->n_blocks);
+    CUdeviceptr d_cond = have_kv ? 0 :
+        cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
     CUdeviceptr d_out;
     cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
 
@@ -4125,8 +4227,9 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
     cuStreamSynchronize(s);
     cuMemcpyDtoH(output, d_out, (size_t)N * in_ch * sizeof(float));
 
-    cuMemFree(d_x); cuMemFree(d_cond); cuMemFree(d_out);
-    cuMemFree(d_rope_cos); cuMemFree(d_rope_sin);
+    cuMemFree(d_x);
+    if (d_cond) cuMemFree(d_cond);
+    cuMemFree(d_out);
     return 0;
 }
 
@@ -4146,35 +4249,19 @@ int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
     uint64_t cond_hash = t2_hash_f32_bytes(cond_features, cond_n);
     int cache_slot = t2_cond_cache_slot(cond_features, ctx_len);
 
-    /* Compute 3D RoPE tables from sparse coords (same as Stage 2) */
-    int n_freqs = m->n_rope_freqs;
-    float rope_theta = 10000.0f;
-    float *freqs = (float *)malloc((size_t)n_freqs * sizeof(float));
-    for (int j = 0; j < n_freqs; j++)
-        freqs[j] = 1.0f / powf(rope_theta, (float)j / (float)n_freqs);
-
-    size_t table_sz = (size_t)N * 3 * n_freqs * sizeof(float);
-    float *cos_tab = (float *)malloc(table_sz);
-    float *sin_tab = (float *)malloc(table_sz);
-    for (int i = 0; i < N; i++) {
-        float cz = (float)coords[i * 4 + 1];
-        float cy = (float)coords[i * 4 + 2];
-        float cx = (float)coords[i * 4 + 3];
-        float c[3] = {cz, cy, cx};
-        for (int axis = 0; axis < 3; axis++)
-            for (int j = 0; j < n_freqs; j++) {
-                float theta = c[axis] * freqs[j];
-                cos_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(theta);
-                sin_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(theta);
-            }
+    CUdeviceptr d_rope_cos = 0, d_rope_sin = 0;
+    if (t2_get_sparse_rope_tables(r, 3, m, coords, N,
+                                  &d_rope_cos, &d_rope_sin) != 0) {
+        fprintf(stderr, "T2: failed to build Stage 3 sparse RoPE tables\n");
+        return -1;
     }
-    CUdeviceptr d_rope_cos = cu_upload_raw(cos_tab, table_sz);
-    CUdeviceptr d_rope_sin = cu_upload_raw(sin_tab, table_sz);
-    free(freqs); free(cos_tab); free(sin_tab);
 
-    /* Upload input [N, 64] and conditioning */
+    /* Upload input and conditioning. The conditioning tensor is only needed when
+     * the per-block cross-attention KV cache is cold for this model/slot. */
     CUdeviceptr d_x = cu_upload_raw(x_t, (size_t)N * in_ch * sizeof(float));
-    CUdeviceptr d_cond = cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+    int have_kv = t2_kv_cache_ready(r, cache_slot, 3, cond_hash, m->n_blocks);
+    CUdeviceptr d_cond = have_kv ? 0 :
+        cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
     int out_ch = m->out_channels;  /* 32 for Stage 3 */
     CUdeviceptr d_out;
     cuMemAlloc(&d_out, (size_t)N * out_ch * sizeof(float));
@@ -4186,8 +4273,9 @@ int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
     cuStreamSynchronize(s);
     cuMemcpyDtoH(output, d_out, (size_t)N * out_ch * sizeof(float));
 
-    cuMemFree(d_x); cuMemFree(d_cond); cuMemFree(d_out);
-    cuMemFree(d_rope_cos); cuMemFree(d_rope_sin);
+    cuMemFree(d_x);
+    if (d_cond) cuMemFree(d_cond);
+    cuMemFree(d_out);
     return 0;
 }
 
