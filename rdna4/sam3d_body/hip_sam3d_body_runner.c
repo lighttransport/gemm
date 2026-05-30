@@ -263,6 +263,8 @@ struct hip_sam3d_body_ctx {
     hipFunction_t fn_ray_cond_fourier, fn_conv1x1_chw, fn_ln_chw;
     hipFunction_t fn_linear_bias;
     hipFunction_t fn_gemm_f32, fn_add_two, fn_add_inplace, fn_gelu_inplace, fn_sdpa;
+    hipFunction_t fn_gemm_wmma_dec; /* gemm_bf16w_bf16a_wmma_t (F32-wt; gfx12) */
+    int           use_wmma_dec;     /* 1 iff SAM3D_BODY_WMMA_DEC!=0 and resolved */
     hipFunction_t fn_relu_inplace, fn_grid_sample, fn_kp_pelvis_norm,
                   fn_augment_overwrite_mask;
     /* ViT-H specific kernels. */
@@ -959,6 +961,21 @@ static int sb_compile(hip_sam3d_body_ctx *c) {
             if (hipModuleGetFunction(&c->fn_gemm_wmma, c->mod,
                                      "gemm_f16w_bf16a_wmma_t") == hipSuccess)
                 c->use_wmma = 1;
+        }
+    }
+    /* Decoder WMMA (F32-weight). Shares the SAM3D_BODY_WMMA gate (default on);
+     * measured ~2x on the 6 decoder transformer layers (43.8->22.4 ms) with
+     * 0.004% mean mesh-vertex drift. The cross-attn K/V GEMMs over the 1024
+     * encoder-context tokens fill the WMMA tile well; the 145-token self-attn
+     * underfills but still falls back cleanly. SAM3D_BODY_WMMA=0 disables both. */
+    c->use_wmma_dec = 0;
+    c->fn_gemm_wmma_dec = NULL;
+    {
+        const char *e = getenv("SAM3D_BODY_WMMA");
+        if (!e || e[0] != '0') {
+            if (hipModuleGetFunction(&c->fn_gemm_wmma_dec, c->mod,
+                                     "gemm_bf16w_bf16a_wmma_t") == hipSuccess)
+                c->use_wmma_dec = 1;
         }
     }
     return 0;
@@ -2825,6 +2842,19 @@ static int sb_dec_gemm(hip_sam3d_body_ctx *c, void *Y, const void *X,
                        const void *W, const void *b,
                        int N, int D_in, int D_out)
 {
+    /* BF16 WMMA (F32-weight) when opted in and dims 16-aligned; arg order
+     * {Y,W,X,bias,n_out,n_in,n_tok}, grid (ceil(n_out/128),ceil(n_tok/128)). */
+    if (c->use_wmma_dec && c->fn_gemm_wmma_dec &&
+        (D_out % 16 == 0) && (D_in % 16 == 0)) {
+        struct __attribute__((packed)) {
+            void *Y; const void *W; const void *X; const void *bias;
+            int n_out; int n_in; int n_tok;
+        } pw = { Y, W, X, b, D_out, D_in, N };
+        return sb_launch(c->fn_gemm_wmma_dec,
+                         (unsigned)((D_out + 127) / 128),
+                         (unsigned)((N + 127) / 128), 1, 256, 1, 1,
+                         0, &pw, sizeof(pw));
+    }
     struct __attribute__((packed)) {
         void *Y; const void *X; const void *W; const void *b;
         int N; int D_in; int D_out;
