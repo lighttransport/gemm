@@ -125,6 +125,7 @@ typedef struct {
     int use_packed_sparse_conv; /* 1=pack valid rows before sparse conv GEMM */
     cublasew_context *cublas;
     /* Scratch for the bf16 GEMM path (grown on demand; bf16 = 2 bytes/elem). */
+    CUfunction cast_bf16_to_f32;
     CUfunction cast_f32_to_bf16;
     CUfunction round_bf16;  /* in-place f32 -> bf16-precision -> f32 (bf16_round) */
     CUdeviceptr bf16_w, bf16_x;
@@ -177,6 +178,9 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
 
     /* Optional bf16 cast/round kernels (for the bf16 DiT paths). Tolerant lookup:
      * if absent (e.g. an older cached module) the bf16 paths stay disabled. */
+    if (cuModuleGetFunction(&ops->cast_bf16_to_f32, module, "t2_cast_bf16_to_f32")
+            != CUDA_SUCCESS)
+        ops->cast_bf16_to_f32 = NULL;
     if (cuModuleGetFunction(&ops->cast_f32_to_bf16, module, "t2_cast_f32_to_bf16")
             != CUDA_SUCCESS)
         ops->cast_f32_to_bf16 = NULL;
