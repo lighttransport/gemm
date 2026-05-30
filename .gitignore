@@ -173,6 +173,10 @@ ref/sam3.1/*
 !ref/sam3d-body/README.md
 !ref/ppd/
 !ref/ppd/*.py
+!ref/svdquant/
+!ref/svdquant/*.py
+!ref/svdquant/README.md
+!ref/svdquant/.gitignore
 result/
 
 # Local (uncommitted) runner scripts — per-box model paths / env
