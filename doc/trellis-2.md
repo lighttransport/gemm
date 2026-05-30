@@ -1253,6 +1253,20 @@ The default vertex-colored OBJ path also streams PBR sampling directly into the 
 (`real 55.40`) because float formatting dominates the remaining final OBJ write, but the final OBJ
 and all `.npy` dumps are byte-identical to the pre-stream no-sidecar run.
 
+### Sparse DiT setup caching (2026-05-31) — repeated setup removed, output unchanged
+
+The Stage 2/3 sparse DiT wrappers rebuilt sparse 3D RoPE tables and uploaded the conditioning tensor
+for every sampler forward, even though coords and conditioning are constant within each stage. The
+runner now caches sparse RoPE tables per model id keyed by `(coords hash, N, n_freqs)`, and the wrappers
+skip the conditioning HtoD upload once the per-block cross-attention KV cache is already hot for the
+same `(model_id, cond_hash, n_blocks)`.
+
+This removes repeated CPU `sin/cos` work, RoPE HtoD uploads, and the hot-step conditioning upload.
+The full textured e2e remains dominated by DiT math and OBJ formatting, so wall time is essentially
+flat but slightly lower: `real 55.40/55.48 -> 55.35` (`T2_TIMING program_total 55252.514 ms`). Final
+OBJ and saved dumps (`stage1`, Stage 2, `tex_coords`, `tex_feats`) are byte-identical to the previous
+run.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
