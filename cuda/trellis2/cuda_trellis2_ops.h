@@ -693,7 +693,11 @@ static inline void t2_op_modulation(t2_ops *ops, CUstream s,
                                       CUdeviceptr blk_bias,
                                       int dim, int out_dim) {
     void *args[] = {&out, &t_emb, &mod_w, &mod_b, &blk_bias, &dim, &out_dim};
-    cuLaunchKernel(ops->modulation, 1, 1, 1,
+    /* Warp-per-row: 256 threads/block = 8 warps = 8 output rows per block. Grid
+     * covers all out_dim rows so the whole GPU is used (was a single block). */
+    unsigned warps_per_block = 256u / 32u;
+    unsigned grid = (unsigned)(((size_t)out_dim + warps_per_block - 1) / warps_per_block);
+    cuLaunchKernel(ops->modulation, grid, 1, 1,
                    256, 1, 1, (size_t)dim * sizeof(float), s, args, NULL);
 }
 
