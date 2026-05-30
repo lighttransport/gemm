@@ -64,6 +64,11 @@ both operands, matching the encoder's existing bf16-rounded activation path). An
 `SAM3D_BODY_WMMA` (default on; `=0` = exact F16-tiled path). Decoder (6 layers,
 145 tokens) stays on `gemm_f32_bias` — too small for the 128-tile WMMA.
 
+Speed (dancing.jpg, DINOv3 backbone, warm, RX 9070 XT): encoder transformer
+blocks 664 ms → 219 ms = **3.04×**; encoder total 687 → 240 ms (2.86×); e2e
+wall-clock 1.69 → 1.28 s (1.32× — the rest is CPU MHR skinning + the F32 decoder,
+which WMMA doesn't touch).
+
 Quality: DINOv3 is the precision floor (verify_dinov3 max_abs 0.54 vs gate 1.5),
 but the e2e mesh tolerates bf16 well — body OBJ on dancing.jpg (V=18439 F=36874,
 identical topology) shows mean vertex displacement 0.0017 / max 0.0039 on a 1.725
