@@ -181,7 +181,7 @@ ResBlock3d: `GN(32) → SiLU → Conv3d → GN(32) → SiLU → Conv3d + skip`
 | Stage 1 DiT + decoder (same noise) | ✓ CORRECT | 94% IoU with PyTorch reference |
 | Full pipeline (random noise) | ✓ WORKS | 7.8% occupancy with seed=42 |
 | Stage 2 shape flow DiT | ✓ IMPLEMENTED | Generic DiT, sparse RoPE, 12-step Euler + CFG |
-| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | CUDA sparse ConvNeXt + C2S; host threshold compaction/hash build |
+| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | CUDA sparse ConvNeXt + C2S; GPU subdivision/hash/index default |
 | Stage 3 texture flow DiT | ✓ IMPLEMENTED | No CFG, [noise\|shape_norm] concat input |
 | Stage 3 texture decoder | ✓ IMPLEMENTED | CUDA dense C2S SC-VAE; vertex-color OBJ export by default |
 | Cross-attn KV cache | ✓ IMPLEMENTED | Precomputed for all 30 blocks, saves ~2160 dispatches/stage |
@@ -488,7 +488,7 @@ Current localization on the shape smoke:
     `2:7:2,3:0:2` -> `7.64e-5`, `2:1:2,3:0:2` -> `8.53e-5`,
     `3:0:2,3:1:2` -> `7.91e-5`, and `2:1:2,2:7:2,3:0:2` -> `8.55e-5`.
   - `T2SD_STOP_AFTER_C2S_OP=stage:7` returns `to_subdiv` logits as `[N,8]`
-    before host thresholding. All four stage logits are coordinate-exact and
+    before subdivision thresholding. All four stage logits are coordinate-exact and
     well away from topology flips on the worst rows. Minimum positive margins:
     stage0 `0.428`, stage1 `0.126`, stage2 `0.00242`, stage3 `0.00253`;
     largest negative logit in stage3 is `-0.000290`. The persistent worst rows
@@ -603,9 +603,9 @@ Fix notes:
   PyTorch vectorized-Welford-order paths for no-affine and affine SC-VAE
   LayerNorm. The final SC-VAE no-affine LayerNorm is bit-exact with PyTorch
   CUDA under `T2_SCVAE_FINAL_WELFORD_LN=1`.
-- C2S norm, sparse conv, gather, conv2, and residual repeat are CUDA kernels.
-  The remaining CPU work is subdivision-list synthesis from logits and sparse
-  hash-table construction/upload for each scale.
+- C2S norm, sparse conv, gather, conv2, residual repeat, subdivision-list
+  synthesis, and sparse hash/index construction are CUDA-default paths.
+  CPU fallback toggles remain for A/B and debugging.
 
 Texture decoder verification, RTX 5060 Ti, synthetic `N=1` input. The PyTorch
 reference tensors are persisted in `ref/trellis2/dumps/tex_scvae_tiny/`.
@@ -1150,6 +1150,40 @@ Full textured e2e with default GPU-pack completed successfully: shape output `N=
 coverage was `99.7%` trilinear / `100%` covered. In that full run, finest-level c2s timings were
 shape `558.7 ms` and texture `509.2 ms`.
 
+### Decoder GPU subdivision + sparse hash/index (2026-05-30) — focused shape decoder 11.5 → 6.5 s
+
+The next host bottleneck was C2S subdivision and sparse-index setup. The shape decoder now uses a
+stable two-pass GPU subdivision path: `c2s_count_subdiv_f32` counts kept child slots, the CPU computes
+the prefix offsets, and `c2s_write_subdiv_stable_f32` writes `idx`, `subidx`, and child coords in the
+same parent/child order as the old CPU path. That stability matters: an earlier atomic compaction
+changed row order and broke byte-level parity. The sparse hash table is also built on GPU via
+`sparse_hash_insert_coords_f32`, then the existing gather-map kernel runs from that device hash.
+
+Defaults and A/B toggles:
+
+- Packed sparse conv is default-on. Use `T2_SCVAE_NO_PACKED_CONV=1` or `T2_SCVAE_PACKED_CONV=0` to
+  opt out.
+- `T2_SCVAE_CPU_SUBDIV=1` restores host subdivision synthesis.
+- `T2_SCVAE_CPU_HASH_BUILD=1` or `T2_SCVAE_CPU_GATHER_MAP=1` restores host hash/gather-map setup.
+- `T2_SCVAE_CPU_PACK_BUILD=1` restores the legacy host pack builder and now also keeps the CPU hash
+  available for that builder.
+- `T2_TIMING=1` prints load, sparse-index, pack-build, and subdivision timings.
+- DiT loaders skip unused GPU-to-CPU block copies in the default full-GPU mode. Set
+  `T2_DIT_KEEP_CPU_BLOCKS=1` when debugging or using block streaming.
+
+Focused A/B on the T.png verification dumps (`08_shape_slat_denorm_feats` + `05_ss_coords`) is
+**byte-identical** versus the CPU-subdivision/hash/pack fallback: feature `max_abs=0`, `rel_L2=0`,
+coord mismatches `0`. Cached shape-decoder wall time on RTX 5060 Ti:
+
+| Path | wall time | finest sparse index | finest C2S |
+|---|---:|---:|---:|
+| CPU subdiv/hash/pack fallback | 11.54 s | 190.6 ms | 4149.8 ms |
+| GPU default | **6.52 s** | **38.3 ms** | **392.8 ms** |
+
+Full textured e2e with the new defaults completed in `real 87.50`: Stage 1/2/3 sampler
+`19.9/14.8/8.9 s`, shape output `N=1,403,042`, OBJ `1,403,042` verts / `3,048,684` tris, and PBR
+coverage `99.7%` trilinear / `100%` covered.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
@@ -1405,8 +1439,8 @@ accuracy win — TF32 is the more consistent and higher-precision default.**
 ## Next Steps
 
 ### CUDA
-1. **GPU subdivision compaction/hash build**: Move `to_subdiv` threshold compaction
-   and sparse hash construction/upload fully onto GPU for the shape decoder.
+1. **Remaining decoder hot spots**: Profile the post-GPU-subdivision decoder path
+   again; remaining time is mostly ConvNeXt sparse conv/GEMM/scatter at large N.
 2. **PBR atlas export**: Fix/verify the UV chart packer; vertex-colored OBJ is the
    default texture output for now, `T2_PBR_TEXTURE_MAP=1` opts into atlas maps.
 3. **Fresh Stage 2/3 DiT reference dumps**: Persist current PyTorch flow-model

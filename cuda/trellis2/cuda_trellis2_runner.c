@@ -42,6 +42,22 @@
 /* Model constants                                                          */
 /* ======================================================================== */
 
+static int t2_timing_enabled(void) {
+    const char *v = getenv("T2_TIMING");
+    return (v && v[0] && atoi(v) != 0) ? 1 : 0;
+}
+
+static double t2_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static void t2_timing_log(const char *label, double t0_ms) {
+    if (t2_timing_enabled())
+        fprintf(stderr, "T2_TIMING: %s %.3f ms\n", label, t2_now_ms() - t0_ms);
+}
+
 /* DINOv3 ViT-L/16 */
 #define DINO_HIDDEN     1024
 #define DINO_HEADS      16
@@ -767,7 +783,13 @@ static int t2_dit_use_f16(cuda_trellis2_runner *r, int default_f16) {
     return default_f16;
 }
 
+static int t2_dit_keep_cpu_blocks(cuda_trellis2_runner *r) {
+    const char *keep = getenv("T2_DIT_KEEP_CPU_BLOCKS");
+    return (r->max_gpu_layers > 0 || (keep && atoi(keep))) ? 1 : 0;
+}
+
 static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
+    double t_load0 = t2_now_ms();
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     fprintf(stderr, "T2: loading DiT from %s (%d tensors)\n", path, st->n_tensors);
@@ -837,10 +859,16 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
         if (L == 0 && !blk->sa_qkv_w)
             fprintf(stderr, "T2: WARNING: block 0 self_attn missing\n");
 
-        /* Save CPU copy for layer streaming */
-        cuStreamSynchronize(0);
-        dit_block_save_cpu_copy(&r->dit_blocks_cpu[L], blk, use_f16,
-                                 DIT_DIM, DIT_HEADS, DIT_HEAD_DIM, DIT_FFN, DIT_COND_DIM);
+        /* Save CPU copies only when layer streaming/debug explicitly needs them.
+         * The default full-GPU path used to upload every block then copy it back
+         * to CPU even though the copies were never read; skipping that removes a
+         * large cold-load cost without changing forward numerics. */
+        if (t2_dit_keep_cpu_blocks(r)) {
+            cuStreamSynchronize(0);
+            dit_block_save_cpu_copy(&r->dit_blocks_cpu[L], blk, use_f16,
+                                    DIT_DIM, DIT_HEADS, DIT_HEAD_DIM,
+                                    DIT_FFN, DIT_COND_DIM);
+        }
 
         /* If streaming enabled, free GPU weights for blocks beyond limit */
         if (r->max_gpu_layers > 0 && L >= r->max_gpu_layers)
@@ -888,6 +916,7 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
       int on_gpu = r->max_gpu_layers > 0 ? (r->max_gpu_layers < DIT_DEPTH ? r->max_gpu_layers : DIT_DEPTH) : DIT_DEPTH;
       fprintf(stderr, "T2: DiT loaded (%d blocks, %d on GPU, weights=%s, GPU %.0f/%.0f MB free)\n",
               DIT_DEPTH, on_gpu, use_f16 ? "F16" : "F32", fr/1048576.0, to/1048576.0); }
+    t2_timing_log("load_stage1_dit", t_load0);
     return 0;
 }
 
@@ -1072,6 +1101,7 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
                                     dit_model_gpu *m, dit_block_gpu *blocks_arr,
                                     dit_block_cpu *blocks_cpu_arr,
                                     const char *label) {
+    double t_load0 = t2_now_ms();
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     fprintf(stderr, "T2: loading %s from %s (%d tensors)\n", label, path, st->n_tensors);
@@ -1151,10 +1181,12 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
         #undef BLK2W
         #undef BLK2B
 
-        /* Save CPU copy for layer streaming */
-        cuStreamSynchronize(0);
-        dit_block_save_cpu_copy(&blocks_cpu_arr[L], blk, use_f16,
-                                 DIT_DIM, DIT_HEADS, DIT_HEAD_DIM, DIT_FFN, DIT_COND_DIM);
+        if (t2_dit_keep_cpu_blocks(r)) {
+            cuStreamSynchronize(0);
+            dit_block_save_cpu_copy(&blocks_cpu_arr[L], blk, use_f16,
+                                    DIT_DIM, DIT_HEADS, DIT_HEAD_DIM,
+                                    DIT_FFN, DIT_COND_DIM);
+        }
 
         if (r->max_gpu_layers > 0 && L >= r->max_gpu_layers)
             dit_block_free_gpu(blk);
@@ -1171,6 +1203,11 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
       fprintf(stderr, "T2: %s loaded (%d blocks, %d on GPU, in_ch=%d, weights=%s, GPU %.0f/%.0f MB free)\n",
               label, m->n_blocks, on_gpu, m->in_channels, use_f16 ? "F16" : "F32",
               fr/1048576.0, to/1048576.0); }
+    {
+        char timing_label[128];
+        snprintf(timing_label, sizeof(timing_label), "load_%s", label);
+        t2_timing_log(timing_label, t_load0);
+    }
     return 0;
 }
 
@@ -1265,6 +1302,7 @@ static int cuda_trellis2_load_scvae_decoder(cuda_trellis2_runner *r,
                                              t2_scvae_dec_gpu *dec,
                                              const char *path,
                                              const char *label) {
+    double t_load0 = t2_now_ms();
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     fprintf(stderr, "T2: loading %s from %s (%d tensors)\n", label, path, st->n_tensors);
@@ -1358,6 +1396,11 @@ static int cuda_trellis2_load_scvae_decoder(cuda_trellis2_runner *r,
 
     fprintf(stderr, "T2: %s loaded (GPU=%s, out_ch=%d)\n",
             label, use_f16 ? "F16" : "F32", dec->out_channels);
+    {
+        char timing_label[128];
+        snprintf(timing_label, sizeof(timing_label), "load_%s", label);
+        t2_timing_log(timing_label, t_load0);
+    }
     return 0;
 }
 
@@ -2663,6 +2706,94 @@ static int t2_make_subdiv_from_logits_host(const float *logits,
     return 0;
 }
 
+static int t2_make_subdiv_from_logits_gpu(cuda_trellis2_runner *r,
+                                           CUdeviceptr d_logits,
+                                           CUdeviceptr d_coords,
+                                           int N,
+                                           int dense,
+                                           int32_t **out_idx,
+                                           int32_t **out_subidx,
+                                           int32_t **out_coords,
+                                           int *out_N,
+                                           CUdeviceptr *out_d_idx,
+                                           CUdeviceptr *out_d_subidx,
+                                           CUdeviceptr *out_d_coords) {
+    if (t2_env_flag("T2_SCVAE_CPU_SUBDIV") ||
+        !r->ops.c2s_count_subdiv || !r->ops.c2s_write_subdiv_stable)
+        return -1;
+    if (!dense && !d_logits) return -1;
+
+    double t0 = t2_now_ms();
+    CUdeviceptr d_idx = 0, d_subidx = 0, d_new_coords = 0;
+    CUdeviceptr d_counts = 0, d_offsets = 0;
+    int *counts = NULL, *offsets = NULL;
+    if (cuMemAlloc(&d_counts, (size_t)N * sizeof(int32_t)) != CUDA_SUCCESS) goto fail;
+    t2_op_c2s_count_subdiv(&r->ops, r->stream, d_counts, d_logits, N, dense);
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+
+    counts = (int *)malloc((size_t)N * sizeof(int));
+    offsets = (int *)malloc((size_t)N * sizeof(int));
+    if (!counts || !offsets) goto fail;
+    if (cuMemcpyDtoH(counts, d_counts, (size_t)N * sizeof(int32_t)) != CUDA_SUCCESS)
+        goto fail;
+    int N_new = 0;
+    for (int i = 0; i < N; i++) {
+        if (counts[i] < 0 || counts[i] > 8) goto fail;
+        offsets[i] = N_new;
+        N_new += counts[i];
+    }
+    if (N_new <= 0 || N_new > N * 8) goto fail;
+
+    if (cuMemAlloc(&d_offsets, (size_t)N * sizeof(int32_t)) != CUDA_SUCCESS) goto fail;
+    if (cuMemcpyHtoD(d_offsets, offsets, (size_t)N * sizeof(int32_t)) != CUDA_SUCCESS)
+        goto fail;
+    if (cuMemAlloc(&d_idx, (size_t)N_new * sizeof(int32_t)) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_subidx, (size_t)N_new * sizeof(int32_t)) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_new_coords, (size_t)N_new * 4 * sizeof(int32_t)) != CUDA_SUCCESS) goto fail;
+    t2_op_c2s_write_subdiv_stable(&r->ops, r->stream, d_idx, d_subidx,
+                                  d_new_coords, d_offsets, d_logits, d_coords,
+                                  N, dense);
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+
+    int32_t *idx = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
+    int32_t *subidx = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
+    int32_t *new_coords = (int32_t *)malloc((size_t)N_new * 4 * sizeof(int32_t));
+    if (!idx || !subidx || !new_coords) {
+        free(idx); free(subidx); free(new_coords);
+        goto fail;
+    }
+    if (cuMemcpyDtoH(idx, d_idx, (size_t)N_new * sizeof(int32_t)) != CUDA_SUCCESS ||
+        cuMemcpyDtoH(subidx, d_subidx, (size_t)N_new * sizeof(int32_t)) != CUDA_SUCCESS ||
+        cuMemcpyDtoH(new_coords, d_new_coords, (size_t)N_new * 4 * sizeof(int32_t)) != CUDA_SUCCESS) {
+        free(idx); free(subidx); free(new_coords);
+        goto fail;
+    }
+
+    *out_idx = idx;
+    *out_subidx = subidx;
+    *out_coords = new_coords;
+    *out_N = N_new;
+    *out_d_idx = d_idx;
+    *out_d_subidx = d_subidx;
+    *out_d_coords = d_new_coords;
+    cuMemFree(d_counts);
+    cuMemFree(d_offsets);
+    free(counts);
+    free(offsets);
+    t2_timing_log("c2s_subdiv_gpu", t0);
+    return 0;
+
+fail:
+    if (d_counts) cuMemFree(d_counts);
+    if (d_offsets) cuMemFree(d_offsets);
+    if (d_idx) cuMemFree(d_idx);
+    if (d_subidx) cuMemFree(d_subidx);
+    if (d_new_coords) cuMemFree(d_new_coords);
+    free(counts);
+    free(offsets);
+    return -1;
+}
+
 static void t2_free_sparse_gpu_index(sp3d_hash *hash,
                                       CUdeviceptr d_hash_keys,
                                       CUdeviceptr d_hash_vals,
@@ -2745,6 +2876,7 @@ static int t2_sparse_conv_pack_build_gpu(cuda_trellis2_runner *r,
     memset(pack, 0, sizeof(*pack));
     if (!gather_map || !r->ops.sparse_pack_from_gather_map) return -1;
 
+    double t0 = t2_now_ms();
     CUdeviceptr d_src = 0, d_dst = 0, d_counts = 0;
     size_t idx_bytes = (size_t)27 * (size_t)N * sizeof(int);
     if (cuMemAlloc(&d_src, idx_bytes) != CUDA_SUCCESS) goto fail;
@@ -2772,6 +2904,7 @@ static int t2_sparse_conv_pack_build_gpu(cuda_trellis2_runner *r,
             pack->dst_idx[k] = d_dst + (size_t)k * (size_t)N * sizeof(int);
         }
     }
+    t2_timing_log("sparse_pack_gpu", t0);
     return 0;
 
 fail:
@@ -2869,7 +3002,47 @@ static int t2_build_sparse_gpu_index(cuda_trellis2_runner *r,
                                       sp3d_hash **out_hash,
                                       CUdeviceptr *out_hash_keys,
                                       CUdeviceptr *out_hash_vals,
-                                      CUdeviceptr *out_gather_map) {
+                                      CUdeviceptr *out_gather_map,
+                                      int *out_hash_cap) {
+    int hash_cap = 16;
+    while (hash_cap < 2 * N) hash_cap *= 2;
+
+    if (!t2_env_flag("T2_SCVAE_CPU_HASH_BUILD") &&
+        !t2_env_flag("T2_SCVAE_CPU_GATHER_MAP") &&
+        !t2_env_flag("T2_SCVAE_CPU_PACK_BUILD") &&
+        r->ops.sparse_hash_insert_coords) {
+        double t0 = t2_now_ms();
+        CUdeviceptr d_hash_keys = 0, d_hash_vals = 0, d_gather_map = 0;
+        if (cuMemAlloc(&d_hash_keys, (size_t)hash_cap * sizeof(uint64_t)) != CUDA_SUCCESS)
+            goto gpu_fail;
+        if (cuMemAlloc(&d_hash_vals, (size_t)hash_cap * sizeof(int32_t)) != CUDA_SUCCESS)
+            goto gpu_fail;
+        if (cuMemAlloc(&d_gather_map, (size_t)N * 27 * sizeof(int32_t)) != CUDA_SUCCESS)
+            goto gpu_fail;
+        cuMemsetD8Async(d_hash_keys, 0xff, (size_t)hash_cap * sizeof(uint64_t), r->stream);
+        cuMemsetD8Async(d_hash_vals, 0xff, (size_t)hash_cap * sizeof(int32_t), r->stream);
+        t2_op_sparse_hash_insert_coords(&r->ops, r->stream, d_hash_keys,
+                                        d_hash_vals, d_coords, N, hash_cap);
+        t2_op_sparse_build_gather_map(&r->ops, r->stream, d_gather_map, d_coords, N,
+                                      d_hash_keys, d_hash_vals, hash_cap);
+        if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS)
+            goto gpu_fail;
+        *out_hash = NULL;
+        *out_hash_keys = d_hash_keys;
+        *out_hash_vals = d_hash_vals;
+        *out_gather_map = d_gather_map;
+        if (out_hash_cap) *out_hash_cap = hash_cap;
+        t2_timing_log("sparse_index_gpu", t0);
+        return 0;
+
+gpu_fail:
+        if (d_gather_map) cuMemFree(d_gather_map);
+        if (d_hash_keys) cuMemFree(d_hash_keys);
+        if (d_hash_vals) cuMemFree(d_hash_vals);
+        fprintf(stderr, "T2: GPU sparse index build failed; falling back to CPU hash build\n");
+    }
+
+    double t0 = t2_now_ms();
     sp3d_hash *hash = sp3d_hash_build(coords, N);
     if (!hash) return -1;
     CUdeviceptr d_hash_keys = cu_upload_raw(hash->keys, (size_t)hash->capacity * sizeof(uint64_t));
@@ -2903,6 +3076,8 @@ static int t2_build_sparse_gpu_index(cuda_trellis2_runner *r,
     *out_hash_keys = d_hash_keys;
     *out_hash_vals = d_hash_vals;
     *out_gather_map = d_gather_map;
+    if (out_hash_cap) *out_hash_cap = hash->capacity;
+    t2_timing_log("sparse_index_cpu", t0);
     return 0;
 }
 
@@ -3101,7 +3276,10 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
         const char *ped = getenv("T2_SCVAE_CUBLAS_PEDANTIC");
         ops->use_cublas_pedantic = (ped && atoi(ped)) ? 1 : 0;
         const char *packed_conv = getenv("T2_SCVAE_PACKED_CONV");
-        ops->use_packed_sparse_conv = (packed_conv && atoi(packed_conv)) ? 1 : 0;
+        const char *no_packed_conv = getenv("T2_SCVAE_NO_PACKED_CONV");
+        ops->use_packed_sparse_conv = packed_conv
+            ? (atoi(packed_conv) ? 1 : 0)
+            : ((no_packed_conv && atoi(no_packed_conv)) ? 0 : 1);
         if (ops->use_cublas_f32) {
             fprintf(stderr, "T2: %s: using cuBLAS F32 GEMM%s\n", label,
                     ops->use_cublas_pedantic ? " (pedantic)" : "");
@@ -3164,6 +3342,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
 
     sp3d_hash *hash = NULL;
     CUdeviceptr d_hash_keys = 0, d_hash_vals = 0, d_gather_map = 0;
+    int hash_cap = 0;
 
     if (start_stage < 0) {
         const char *flag = getenv("T2SD_STOP_AFTER_LATENT");
@@ -3184,14 +3363,14 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     if (start_stage < 4) {
         if (t2_build_sparse_gpu_index(r, cur_coords, N, d_coords,
                                       &hash, &d_hash_keys, &d_hash_vals,
-                                      &d_gather_map) != 0) {
+                                      &d_gather_map, &hash_cap) != 0) {
             cuMemFree(d_feats); cuMemFree(d_coords); free(cur_coords);
             T2_RESTORE_SCVAE_GEMM();
             return -1;
         }
 
         fprintf(stderr, "T2: %s: gather map built (N=%d, hash_cap=%d)\n",
-                label, N, hash->capacity);
+                label, N, hash_cap);
     }
 
     {
@@ -3272,8 +3451,9 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
         double dt_conv = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
         fprintf(stderr, "T2: %s: stage %d convnext %.1f ms\n", label, stage, dt_conv);
 
-        /* C2S upsampling. Subdivision list is synthesized on host from GPU
-         * logits; norm/conv/gather/conv2/residual stay on CUDA. */
+        /* C2S upsampling. Default path compacts subdivision decisions on GPU
+         * and keeps the new coord table device-resident for the next sparse
+         * index build; T2_SCVAE_CPU_SUBDIV=1 restores the legacy host path. */
         if (dec->c2s[stage].conv1_w) {
             int C_in = C;
             int C_out = dec->channels[stage + 1];
@@ -3281,9 +3461,10 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
             int C_in8 = C_in / 8;
 
             float *sub_logits = NULL;
+            CUdeviceptr d_logits = 0;
+            CUdeviceptr d_sub_idx = 0, d_sub_subidx = 0, d_new_coords = 0;
             int dense_subdiv = dec->c2s[stage].subdiv_w ? 0 : 1;
             if (!dense_subdiv) {
-                CUdeviceptr d_logits = 0;
                 cuMemAlloc(&d_logits, (size_t)N * 8 * sizeof(float));
                 t2_op_gemm(ops, s, d_logits,
                            dec->c2s[stage].subdiv_w,
@@ -3301,10 +3482,6 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                     T2_RESTORE_SCVAE_GEMM();
                     return rc;
                 }
-                sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
-                cuStreamSynchronize(s);
-                cuMemcpyDtoH(sub_logits, d_logits, (size_t)N * 8 * sizeof(float));
-                cuMemFree(d_logits);
             }
 
             int32_t *sub_idx = NULL, *sub_subidx = NULL, *new_coords = NULL;
@@ -3340,18 +3517,34 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                         "falling back to dense x8 subdivision\n", label, stage);
             }
 
-            if (!replayed &&
-                t2_make_subdiv_from_logits_host(sub_logits, cur_coords, N, dense_subdiv,
-                                                &sub_idx, &sub_subidx, &new_coords,
-                                                &N_new) != 0) {
-                fprintf(stderr, "T2: %s: c2s produced no voxels at stage %d\n", label, stage);
-                free(sub_logits);
-                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
-                cuMemFree(d_feats); cuMemFree(d_coords); free(cur_coords);
-                T2_RESTORE_SCVAE_GEMM();
-                return -1;
+            if (!replayed) {
+                if (t2_make_subdiv_from_logits_gpu(r, d_logits, d_coords, N, dense_subdiv,
+                                                   &sub_idx, &sub_subidx, &new_coords,
+                                                   &N_new, &d_sub_idx, &d_sub_subidx,
+                                                   &d_new_coords) != 0) {
+                    if (!dense_subdiv) {
+                        sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
+                        cuStreamSynchronize(s);
+                        cuMemcpyDtoH(sub_logits, d_logits, (size_t)N * 8 * sizeof(float));
+                    }
+                    if (t2_make_subdiv_from_logits_host(sub_logits, cur_coords, N, dense_subdiv,
+                                                        &sub_idx, &sub_subidx, &new_coords,
+                                                        &N_new) != 0) {
+                        fprintf(stderr, "T2: %s: c2s produced no voxels at stage %d\n", label, stage);
+                        free(sub_logits);
+                        if (d_logits) cuMemFree(d_logits);
+                        t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                        cuMemFree(d_feats); cuMemFree(d_coords); free(cur_coords);
+                        T2_RESTORE_SCVAE_GEMM();
+                        return -1;
+                    }
+                }
             }
             free(sub_logits);
+            if (d_logits) {
+                cuMemFree(d_logits);
+                d_logits = 0;
+            }
 
             /* Shape decode: record this stage's subdivision so a subsequent texture
              * decode can replay it (PyTorch decode_tex_slat(..., guide_subs=subs)). */
@@ -3373,8 +3566,10 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 }
             }
 
-            CUdeviceptr d_sub_idx = cu_upload_raw(sub_idx, (size_t)N_new * sizeof(int32_t));
-            CUdeviceptr d_sub_subidx = cu_upload_raw(sub_subidx, (size_t)N_new * sizeof(int32_t));
+            if (!d_sub_idx)
+                d_sub_idx = cu_upload_raw(sub_idx, (size_t)N_new * sizeof(int32_t));
+            if (!d_sub_subidx)
+                d_sub_subidx = cu_upload_raw(sub_subidx, (size_t)N_new * sizeof(int32_t));
             free(sub_idx); free(sub_subidx);
 
             ensure_scratch(r, 8, (size_t)N * C_in * sizeof(float));
@@ -3401,6 +3596,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                                                out_feats, out_coords, out_N, out_C);
                 cuMemFree(d_sub_idx);
                 cuMemFree(d_sub_subidx);
+                if (d_new_coords) cuMemFree(d_new_coords);
                 free(new_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
@@ -3424,6 +3620,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_expanded);
                 cuMemFree(d_sub_idx);
                 cuMemFree(d_sub_subidx);
+                if (d_new_coords) cuMemFree(d_new_coords);
                 free(new_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
@@ -3454,6 +3651,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_sub_subidx);
                 cuMemFree(d_h_fine);
                 cuMemFree(d_x_fine);
+                if (d_new_coords) cuMemFree(d_new_coords);
                 free(new_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
@@ -3477,10 +3675,15 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
             cur_coords = new_coords;
             N = N_new;
             C = C_out;
-            d_coords = cu_upload_raw(cur_coords, (size_t)N * 4 * sizeof(int32_t));
+            if (d_new_coords) {
+                d_coords = d_new_coords;
+                d_new_coords = 0;
+            } else {
+                d_coords = cu_upload_raw(cur_coords, (size_t)N * 4 * sizeof(int32_t));
+            }
             if (t2_build_sparse_gpu_index(r, cur_coords, N, d_coords,
                                           &hash, &d_hash_keys, &d_hash_vals,
-                                          &d_gather_map) != 0) {
+                                          &d_gather_map, &hash_cap) != 0) {
                 cuMemFree(d_h_fine); cuMemFree(d_x_fine); cuMemFree(d_coords);
                 free(cur_coords);
                 T2_RESTORE_SCVAE_GEMM();
