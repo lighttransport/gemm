@@ -1737,6 +1737,10 @@ static const char cuda_trellis2_kernel_source[] =
 /* f32 -> bf16 (round-to-nearest-even, raw 16-bit) for bf16 GEMM inputs.
  * Replicates PyTorch's bf16 DiT matmuls (the reference latent is produced with
  * the DiT blocks run in bfloat16). __float_as_uint avoids needing memcpy. */
+"__global__ void t2_cast_bf16_to_f32(const unsigned short *src, float *dst, long n) {\n"
+"    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) dst[i] = __uint_as_float(((unsigned int)src[i]) << 16);\n"
+"}\n"
 "__device__ __forceinline__ unsigned short t2_f32_to_bf16_bits(float f) {\n"
 "    unsigned int b = __float_as_uint(f);\n"
 "    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) return 0x7FC0;\n"
