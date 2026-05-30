@@ -80,6 +80,12 @@ block forward (slatdit_gemm). Each falls back to gemm_f32_bias when SAM3D_WMMA=0
 dims aren't 16-aligned. Stream 0 throughout. Attention (sdpa) stays scalar — the
 reusable WMMA flash-attn hardcodes head_dim=128 and sam3d uses 64.
 
+Speed (image→splat, 25/25-step, warm, RX 9070 XT): e2e **833.8 → 669.6 s = 1.25×**
+(WMMA off vs on). The modest e2e ratio (vs 2.6× on the DINOv2 GEMMs alone) is
+because the pipeline is dominated by NON-GEMM work WMMA can't touch — the scalar
+`sdpa_f32` self-attention and the CPU-driven SLAT ODE. Those, plus a head_dim=64
+WMMA flash-attn, are the real e2e levers; GEMM WMMA was the safe first pass.
+
 Quality (judge by e2e mesh, not the strict per-stage F32 gates — bf16 max_abs ~1e-2
 on the diffused latent is expected and over those gates):
   - DINOv2 (conditioning): occupancy 6600→6626, distributions match (2-step).
