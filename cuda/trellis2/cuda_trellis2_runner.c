@@ -538,6 +538,59 @@ static CUdeviceptr t2_upload_f32(st_context *st, const char *name, int verbose) 
     return d;
 }
 
+/* Fast path for BF16 checkpoints loaded as F32: upload the raw 16-bit tensor and
+ * expand on GPU. This preserves the exact same F32 values as the CPU conversion
+ * while halving host-to-device traffic for the large DiT weights. */
+static CUdeviceptr t2_upload_f32_fast(cuda_trellis2_runner *r,
+                                      st_context *st,
+                                      const char *name,
+                                      int verbose) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) {
+        if (verbose) fprintf(stderr, "  [MISSING] %s\n", name);
+        return 0;
+    }
+    const char *dtype = safetensors_dtype(st, idx);
+    if (!r || !r->ops.cast_bf16_to_f32 || strcmp(dtype, "BF16") != 0 ||
+        (getenv("T2_CPU_BF16_UPLOAD") && atoi(getenv("T2_CPU_BF16_UPLOAD")))) {
+        return t2_upload_f32(st, name, verbose);
+    }
+
+    size_t nbytes = safetensors_nbytes(st, idx);
+    size_t n_elem = nbytes / 2;
+    CUdeviceptr d_bf16 = 0, d_f32 = 0;
+    if (cuMemAlloc(&d_bf16, nbytes) != CUDA_SUCCESS)
+        return t2_upload_f32(st, name, verbose);
+    if (cuMemAlloc(&d_f32, n_elem * sizeof(float)) != CUDA_SUCCESS)
+        goto fail;
+    if (cuMemcpyHtoDAsync(d_bf16, safetensors_data(st, idx), nbytes,
+                          r->stream) != CUDA_SUCCESS)
+        goto fail;
+    long n = (long)n_elem;
+    void *args[] = {&d_bf16, &d_f32, &n};
+    if (cuLaunchKernel(r->ops.cast_bf16_to_f32, (unsigned)((n_elem + 255) / 256),
+                       1, 1, 256, 1, 1, 0, r->stream, args, NULL) != CUDA_SUCCESS)
+        goto fail;
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS)
+        goto fail;
+    cuMemFree(d_bf16);
+
+    if (verbose >= 2) {
+        const uint64_t *sh = safetensors_shape(st, idx);
+        int nd = safetensors_ndims(st, idx);
+        fprintf(stderr, "  %s: BF16 [", name);
+        for (int d2 = 0; d2 < nd; d2++) fprintf(stderr, "%s%lu", d2?",":"", (unsigned long)sh[d2]);
+        fprintf(stderr, "] -> F32 GPU via BF16 upload (%.1f MB H2D)\n",
+                (float)nbytes / (1024*1024));
+    }
+    return d_f32;
+
+fail:
+    if (d_bf16) cuMemFree(d_bf16);
+    if (d_f32) cuMemFree(d_f32);
+    return t2_upload_f32(st, name, verbose);
+}
+
 /* Upload safetensors tensor as F16 on GPU (handles F16, BF16, F32 source).
  * Halves GPU memory compared to F32, enables MMA tensor core GEMM. */
 static CUdeviceptr t2_upload_f16(st_context *st, const char *name, int verbose) {
@@ -800,19 +853,19 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
     int use_f16 = t2_dit_use_f16(r, 0);
 
     /* Timestep MLP and modulation: always F32 (n_tok=1, modulation reads directly) */
-    r->dit_t_fc1_w = t2_upload_f32(st, "t_embedder.mlp.0.weight", v);
-    r->dit_t_fc1_b = t2_upload_f32(st, "t_embedder.mlp.0.bias", v);
-    r->dit_t_fc2_w = t2_upload_f32(st, "t_embedder.mlp.2.weight", v);
-    r->dit_t_fc2_b = t2_upload_f32(st, "t_embedder.mlp.2.bias", v);
-    r->dit_mod_w   = t2_upload_f32(st, "adaLN_modulation.1.weight", v);
-    r->dit_mod_b   = t2_upload_f32(st, "adaLN_modulation.1.bias", v);
+    r->dit_t_fc1_w = t2_upload_f32_fast(r, st, "t_embedder.mlp.0.weight", v);
+    r->dit_t_fc1_b = t2_upload_f32_fast(r, st, "t_embedder.mlp.0.bias", v);
+    r->dit_t_fc2_w = t2_upload_f32_fast(r, st, "t_embedder.mlp.2.weight", v);
+    r->dit_t_fc2_b = t2_upload_f32_fast(r, st, "t_embedder.mlp.2.bias", v);
+    r->dit_mod_w   = t2_upload_f32_fast(r, st, "adaLN_modulation.1.weight", v);
+    r->dit_mod_b   = t2_upload_f32_fast(r, st, "adaLN_modulation.1.bias", v);
 
     /* Input/output embedding and block weights: F16 if supported */
-    #define UPW(name) (use_f16 ? t2_upload_f16(st, name, v) : t2_upload_f32(st, name, v))
+    #define UPW(name) (use_f16 ? t2_upload_f16(st, name, v) : t2_upload_f32_fast(r, st, name, v))
     r->dit_x_emb_w = UPW("input_layer.weight");
-    r->dit_x_emb_b = t2_upload_f32(st, "input_layer.bias", v);
+    r->dit_x_emb_b = t2_upload_f32_fast(r, st, "input_layer.bias", v);
     r->dit_out_w   = UPW("out_layer.weight");
-    r->dit_out_b   = t2_upload_f32(st, "out_layer.bias", v);
+    r->dit_out_b   = t2_upload_f32_fast(r, st, "out_layer.bias", v);
 
     if (!r->dit_t_fc1_w) fprintf(stderr, "T2: WARNING: t_embedder missing\n");
     if (!r->dit_mod_w)   fprintf(stderr, "T2: WARNING: adaLN_modulation missing\n");
@@ -826,7 +879,7 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
         #define BLKW(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
                               UPW(name))
         #define BLKB(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
-                              t2_upload_f32(st, name, v >= 2 ? v : 0))
+                              t2_upload_f32_fast(r, st, name, v >= 2 ? v : 0))
 
         blk->sa_qkv_w    = BLKW("self_attn.to_qkv.weight");
         blk->sa_qkv_b    = BLKB("self_attn.to_qkv.bias");
@@ -1136,19 +1189,19 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
 
     /* Timestep MLP and modulation: keep F32 (n_tok=1, GEMM perf irrelevant).
      * Modulation kernel reads weights as F32 directly. */
-    m->t_fc1_w = t2_upload_f32(st, "t_embedder.mlp.0.weight", v);
-    m->t_fc1_b = t2_upload_f32(st, "t_embedder.mlp.0.bias", v);
-    m->t_fc2_w = t2_upload_f32(st, "t_embedder.mlp.2.weight", v);
-    m->t_fc2_b = t2_upload_f32(st, "t_embedder.mlp.2.bias", v);
-    m->mod_w   = t2_upload_f32(st, "adaLN_modulation.1.weight", v);
-    m->mod_b   = t2_upload_f32(st, "adaLN_modulation.1.bias", v);
+    m->t_fc1_w = t2_upload_f32_fast(r, st, "t_embedder.mlp.0.weight", v);
+    m->t_fc1_b = t2_upload_f32_fast(r, st, "t_embedder.mlp.0.bias", v);
+    m->t_fc2_w = t2_upload_f32_fast(r, st, "t_embedder.mlp.2.weight", v);
+    m->t_fc2_b = t2_upload_f32_fast(r, st, "t_embedder.mlp.2.bias", v);
+    m->mod_w   = t2_upload_f32_fast(r, st, "adaLN_modulation.1.weight", v);
+    m->mod_b   = t2_upload_f32_fast(r, st, "adaLN_modulation.1.bias", v);
 
     /* Input/output embedding: F16 weight, F32 bias */
-    #define UPW(name) (use_f16 ? t2_upload_f16(st, name, v) : t2_upload_f32(st, name, v))
+    #define UPW(name) (use_f16 ? t2_upload_f16(st, name, v) : t2_upload_f32_fast(r, st, name, v))
     m->x_emb_w = UPW("input_layer.weight");
-    m->x_emb_b = t2_upload_f32(st, "input_layer.bias", v);
+    m->x_emb_b = t2_upload_f32_fast(r, st, "input_layer.bias", v);
     m->out_w   = UPW("out_layer.weight");
-    m->out_b   = t2_upload_f32(st, "out_layer.bias", v);
+    m->out_b   = t2_upload_f32_fast(r, st, "out_layer.bias", v);
 
     for (int L = 0; L < m->n_blocks; L++) {
         dit_block_gpu *blk = &m->blocks[L];
@@ -1156,7 +1209,7 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
         #define BLK2W(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
                                UPW(name))
         #define BLK2B(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
-                               t2_upload_f32(st, name, v >= 2 ? v : 0))
+                               t2_upload_f32_fast(r, st, name, v >= 2 ? v : 0))
         blk->sa_qkv_w  = BLK2W("self_attn.to_qkv.weight");
         blk->sa_qkv_b  = BLK2B("self_attn.to_qkv.bias");
         blk->sa_q_norm  = BLK2B("self_attn.q_rms_norm.gamma");

@@ -1184,6 +1184,27 @@ Full textured e2e with the new defaults completed in `real 87.50`: Stage 1/2/3 s
 `19.9/14.8/8.9 s`, shape output `N=1,403,042`, OBJ `1,403,042` verts / `3,048,684` tris, and PBR
 coverage `99.7%` trilinear / `100%` covered.
 
+### GPU BF16-to-F32 DiT weight upload (2026-05-30) — full e2e 87.5 → 64.0 s
+
+The F32 DiT path still loaded BF16 checkpoints by converting each tensor to F32 on the CPU, then
+uploading the expanded 4-byte weights. The loader now uploads raw BF16 and expands to the exact same
+F32 values on GPU with `t2_cast_bf16_to_f32`, cutting host-to-device traffic in half for Stage 1/2/3
+DiTs. `T2_CPU_BF16_UPLOAD=1` restores the old CPU conversion path for A/B.
+
+Measured RTX 5060 Ti load times:
+
+| DiT stage | CPU BF16→F32 upload | GPU BF16→F32 upload |
+|---|---:|---:|
+| Stage 1 | 8.42 s | **1.03 s** |
+| Stage 2 | 8.39 s | **0.89 s** |
+| Stage 3 | 8.91 s | **0.94 s** |
+
+Verification is byte-identical where the old dumps are available: Stage 1 latent, Stage 2 raw slat,
+texture coords, and texture features all compare `max_abs=0`. Focused verifier metrics are unchanged
+(`verify_stage1` cosine `0.99980245`, Stage 2 full sampler cosine `0.985379`, Stage 3 full sampler
+cosine `0.999980`). Full textured e2e with cached kernels is now `real 64.04`, with the same
+`1,403,042` verts / `3,048,684` tris and PBR `99.7%` trilinear / `100%` covered.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
@@ -1439,8 +1460,9 @@ accuracy win — TF32 is the more consistent and higher-precision default.**
 ## Next Steps
 
 ### CUDA
-1. **Remaining decoder hot spots**: Profile the post-GPU-subdivision decoder path
-   again; remaining time is mostly ConvNeXt sparse conv/GEMM/scatter at large N.
+1. **SC-VAE decoder load path**: Shape/texture decoder loads still spend ~3.7 s
+   each in CPU F16/BF16→F32 conversion plus sparse-conv weight transpose. Move
+   conversion/transpose to GPU or cache the expanded decoder weights.
 2. **PBR atlas export**: Fix/verify the UV chart packer; vertex-colored OBJ is the
    default texture output for now, `T2_PBR_TEXTURE_MAP=1` opts into atlas maps.
 3. **Fresh Stage 2/3 DiT reference dumps**: Persist current PyTorch flow-model
