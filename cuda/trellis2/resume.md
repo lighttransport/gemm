@@ -246,6 +246,13 @@
 > (`stage1`, Stage2, `tex_coords`, `tex_feats`). Cached full textured e2e: `real 55.11`,
 > `T2_TIMING program_total 54998.957 ms`.
 >
+> ## DiT WRAPPER SCRATCH I/O — allocator churn removed (2026-05-31)
+>
+> Stage1/2/3 public DiT wrappers now reuse runner scratch slots for transient d_x/d_out and cold
+> d_cond instead of `cuMemAlloc/cuMemFree` on every sampler forward. Forward activations still use
+> their own scratch slots. Byte-identical final OBJ/dumps; cached full textured e2e `real 55.05`,
+> `T2_TIMING program_total 54964.562 ms`. Small wall win, mainly removes driver allocator churn.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
