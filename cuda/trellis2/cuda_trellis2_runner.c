@@ -2675,9 +2675,17 @@ static void t2_free_sparse_gpu_index(sp3d_hash *hash,
 
 static void t2_sparse_conv_pack_free(t2_sparse_conv_pack *pack) {
     if (!pack) return;
-    for (int k = 0; k < 27; k++) {
-        if (pack->src_idx[k]) cuMemFree(pack->src_idx[k]);
-        if (pack->dst_idx[k]) cuMemFree(pack->dst_idx[k]);
+    if (pack->src_storage) {
+        cuMemFree(pack->src_storage);
+    } else {
+        for (int k = 0; k < 27; k++)
+            if (pack->src_idx[k]) cuMemFree(pack->src_idx[k]);
+    }
+    if (pack->dst_storage) {
+        cuMemFree(pack->dst_storage);
+    } else {
+        for (int k = 0; k < 27; k++)
+            if (pack->dst_idx[k]) cuMemFree(pack->dst_idx[k]);
     }
     memset(pack, 0, sizeof(*pack));
 }
@@ -2731,6 +2739,49 @@ static int t2_sparse_conv_pack_build(const int32_t *coords, int N,
     return 0;
 }
 
+static int t2_sparse_conv_pack_build_gpu(cuda_trellis2_runner *r,
+                                          CUdeviceptr gather_map, int N,
+                                          t2_sparse_conv_pack *pack) {
+    memset(pack, 0, sizeof(*pack));
+    if (!gather_map || !r->ops.sparse_pack_from_gather_map) return -1;
+
+    CUdeviceptr d_src = 0, d_dst = 0, d_counts = 0;
+    size_t idx_bytes = (size_t)27 * (size_t)N * sizeof(int);
+    if (cuMemAlloc(&d_src, idx_bytes) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_dst, idx_bytes) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_counts, 27 * sizeof(int)) != CUDA_SUCCESS) goto fail;
+    if (cuMemsetD8Async(d_counts, 0, 27 * sizeof(int), r->stream) != CUDA_SUCCESS)
+        goto fail;
+
+    t2_op_sparse_pack_from_gather_map(&r->ops, r->stream, d_src, d_dst,
+                                      d_counts, gather_map, N);
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+
+    int counts[27];
+    if (cuMemcpyDtoH(counts, d_counts, sizeof(counts)) != CUDA_SUCCESS) goto fail;
+    cuMemFree(d_counts);
+    d_counts = 0;
+
+    pack->src_storage = d_src;
+    pack->dst_storage = d_dst;
+    for (int k = 0; k < 27; k++) {
+        if (counts[k] < 0 || counts[k] > N) goto fail;
+        pack->M[k] = counts[k];
+        if (counts[k] > 0) {
+            pack->src_idx[k] = d_src + (size_t)k * (size_t)N * sizeof(int);
+            pack->dst_idx[k] = d_dst + (size_t)k * (size_t)N * sizeof(int);
+        }
+    }
+    return 0;
+
+fail:
+    if (d_counts) cuMemFree(d_counts);
+    if (d_src) cuMemFree(d_src);
+    if (d_dst) cuMemFree(d_dst);
+    memset(pack, 0, sizeof(*pack));
+    return -1;
+}
+
 static void t2_run_sparse_conv3d(cuda_trellis2_runner *r,
                                   CUdeviceptr dst,
                                   CUdeviceptr feats,
@@ -2763,20 +2814,30 @@ static void t2_run_sparse_conv3d(cuda_trellis2_runner *r,
     }
     int use_lt = t2_shape_debug_sparse_value("T2SD_SPARSE_LT",
                                              stage, block, op, NULL);
-    if (ops->use_f32_gemm && use_packed && hash &&
+    if (ops->use_f32_gemm && use_packed && (gather_map || hash) &&
         ops->sparse_pack_rows && ops->scatter_add_rows) {
         /* Reuse the level-cached pack if it matches (coords ptr + N). Every
          * ConvNeXt block at a resolution level — and the c2s conv1 — share the
          * same pack; only a new level (c2s conv2 onward) rebuilds it. This turns
          * the host-side build (N*27 CPU hash lookups + up to 54 HtoD) from
-         * once-per-conv into once-per-level. */
+         * once-per-conv into once-per-level. The default builder now derives
+         * the same row lists from the already-built GPU gather map, avoiding
+         * the remaining per-level CPU hash walk; T2_SCVAE_CPU_PACK_BUILD=1
+         * forces the legacy host builder for A/B checks. */
         if (!(r->pack_cache_valid && r->pack_cache_coords == coords &&
               r->pack_cache_N == N)) {
             if (r->pack_cache_valid) {
                 t2_sparse_conv_pack_free(&r->pack_cache);
                 r->pack_cache_valid = 0;
             }
-            if (t2_sparse_conv_pack_build(coords, N, hash, &r->pack_cache) == 0) {
+            int pack_ok = -1;
+            if (!t2_env_flag("T2_SCVAE_CPU_PACK_BUILD"))
+                pack_ok = t2_sparse_conv_pack_build_gpu(r, gather_map, N,
+                                                        &r->pack_cache);
+            if (pack_ok != 0 && hash)
+                pack_ok = t2_sparse_conv_pack_build(coords, N, hash,
+                                                    &r->pack_cache);
+            if (pack_ok == 0) {
                 r->pack_cache_coords = coords;
                 r->pack_cache_N = N;
                 r->pack_cache_valid = 1;

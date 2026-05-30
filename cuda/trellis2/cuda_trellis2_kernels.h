@@ -1526,6 +1526,23 @@ static const char cuda_trellis2_kernel_source[] =
 "    gathered[idx] = (ni >= 0) ? feats[(size_t)ni * C + c] : 0.0f;\n"
 "}\n\n"
 
+/* Build packed sparse-conv row lists directly from gather_map on GPU.
+ * For a fixed kernel position k, each destination row appears at most once, so
+ * the atomic ordering does not affect the final scatter-add result. */
+"__global__ void sparse_pack_from_gather_map_f32(\n"
+"    int *src_all, int *dst_all, int *counts, const int *gather_map, int N) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = N * 27;\n"
+"    if (idx >= total) return;\n"
+"    int row = idx / 27;\n"
+"    int k = idx - row * 27;\n"
+"    int src = gather_map[idx];\n"
+"    if (src < 0) return;\n"
+"    int m = atomicAdd(counts + k, 1);\n"
+"    src_all[(size_t)k * N + m] = src;\n"
+"    dst_all[(size_t)k * N + m] = row;\n"
+"}\n\n"
+
 /* Pack sparse source rows for a PyTorch-like valid-row sparse conv GEMM. */
 "__global__ void sparse_pack_rows_f32(\n"
 "    float *packed, const float *feats, const int *src_idx, int M, int C) {\n"
