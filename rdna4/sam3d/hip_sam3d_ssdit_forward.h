@@ -34,6 +34,8 @@ extern "C" {
 
 typedef struct {
     hipFunction_t gemm;        /* gemm_f32_bias */
+    hipFunction_t gemm_wmma;   /* gemm_bf16w_bf16a_wmma_t (gfx12; optional) */
+    int           use_wmma;    /* 1 iff SAM3D_WMMA!=0 and gemm_wmma resolved */
     hipFunction_t mod_ln;      /* modulated_ln_f32 */
     hipFunction_t ln;          /* layernorm_token_f32 */
     hipFunction_t qkv_split;   /* qkv_split_f32 */
@@ -112,7 +114,41 @@ int cs3d_ssdit_fns_lookup(cs3d_ssdit_fns *f, hipModule_t mod)
     if (hipModuleGetFunction(&f->gelu,      mod, "gelu_tanh_inplace_f32")  != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->gated,     mod, "gated_residual_add_f32") != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->resadd,    mod, "residual_add_f32")       != hipSuccess) return -1;
+    /* Optional BF16-WMMA GEMM (gfx12). Default on; SAM3D_WMMA=0 disables. */
+    f->use_wmma = 0;
+    f->gemm_wmma = NULL;
+    {
+        const char *e = getenv("SAM3D_WMMA");
+        if (!e || e[0] != '0') {
+            if (hipModuleGetFunction(&f->gemm_wmma, mod,
+                                     "gemm_bf16w_bf16a_wmma_t") == hipSuccess)
+                f->use_wmma = 1;
+        }
+    }
     return 0;
+}
+
+/* GEMM dispatch for SS-DiT. `args` follows gemm_f32_bias's layout:
+ *   {Y, X, W, bias, N, Din, Dout} with Y[N,Dout]=X[N,Din]*W[Dout,Din]^T+bias.
+ * Routes to BF16 WMMA when enabled and dims 16-aligned; else gemm_f32_bias.
+ * Stream 0 (matches every sam3d launch). */
+static inline int ssdit_gemm(const cs3d_ssdit_fns *f, void **args)
+{
+    int N = *(int *)args[4], Din = *(int *)args[5], Dout = *(int *)args[6];
+    if (f->use_wmma && f->gemm_wmma && (Dout % 16 == 0) && (Din % 16 == 0)) {
+        hipDeviceptr_t Y = *(hipDeviceptr_t *)args[0];
+        hipDeviceptr_t X = *(hipDeviceptr_t *)args[1];
+        hipDeviceptr_t W = *(hipDeviceptr_t *)args[2];
+        hipDeviceptr_t B = *(hipDeviceptr_t *)args[3];
+        void *wargs[] = { &Y, &W, &X, &B, &Dout, &Din, &N };
+        unsigned gx = (unsigned)((Dout + 127) / 128);
+        unsigned gy = (unsigned)((N + 127) / 128);
+        return hipModuleLaunchKernel(f->gemm_wmma, gx, gy, 1, 256, 1, 1,
+                                     0, 0, wargs, NULL) == hipSuccess ? 0 : -1;
+    }
+    unsigned gx = (unsigned)((N + 15) / 16), gy = (unsigned)((Dout + 15) / 16);
+    return hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0,
+                                 args, NULL) == hipSuccess ? 0 : -1;
 }
 
 static int cs3d_ssdit_alloc_(hipDeviceptr_t *out, size_t bytes, size_t *tot) {
@@ -189,7 +225,8 @@ static int sa_qkv_path(const cs3d_ssdit_fns *f,
         unsigned gx = (N + 15) / 16, gy = (D3 + 15) / 16;
         void *args[] = { &d_qkv, &d_x, (void *)&sw->sa_qkv_w, (void *)&sw->sa_qkv_b,
                          &N, &dim, &D3 };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned grid = (unsigned)((N * dim + 255) / 256);
@@ -275,13 +312,15 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
         unsigned gx = (N_s + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->t_s, &ws->sdpa_s, (void *)&swsh->sa_out_w, (void *)&swsh->sa_out_b,
                          &N_s, &dim, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned gx = (N_p + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->t_p, &ws->sdpa_p, (void *)&swp->sa_out_w, (void *)&swp->sa_out_b,
                          &N_p, &dim, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     /* gated residual_msa */
     {
@@ -312,22 +351,26 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
         unsigned gx = (N_s + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->qx_s, &ws->h_s, (void *)&swsh->xa_q_w, (void *)&swsh->xa_q_b,
                          &N_s, &dim, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned gx = (N_p + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->qx_p, &ws->h_p, (void *)&swp->xa_q_w, (void *)&swp->xa_q_b,
                          &N_p, &dim, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned gx = (N_c + 15) / 16, gy = (D2 + 15) / 16;
         void *args[] = { &ws->kvs_x, &d_cond, (void *)&swsh->xa_kv_w, (void *)&swsh->xa_kv_b,
                          &N_c, &dim, &D2 };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
         void *ap[] = { &ws->kvp_x, &d_cond, (void *)&swp->xa_kv_w, (void *)&swp->xa_kv_b,
                        &N_c, &dim, &D2 };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, ap, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, ap) != 0) return -1;
     }
     {
         unsigned grid = (unsigned)((N_c * dim + 255) / 256);
@@ -349,13 +392,15 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
         unsigned gx = (N_s + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->t_s, &ws->o_s, (void *)&swsh->xa_out_w, (void *)&swsh->xa_out_b,
                          &N_s, &dim, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned gx = (N_p + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->t_p, &ws->o_p, (void *)&swp->xa_out_w, (void *)&swp->xa_out_b,
                          &N_p, &dim, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         int total = N_s * dim;
@@ -384,13 +429,15 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
         unsigned gx = (N_s + 15) / 16, gy = (mlp_h + 15) / 16;
         void *args[] = { &ws->m1s, &ws->h_s, (void *)&swsh->mlp_fc1_w, (void *)&swsh->mlp_fc1_b,
                          &N_s, &dim, &mlp_h };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned gx = (N_p + 15) / 16, gy = (mlp_h + 15) / 16;
         void *args[] = { &ws->m1p, &ws->h_p, (void *)&swp->mlp_fc1_w, (void *)&swp->mlp_fc1_b,
                          &N_p, &dim, &mlp_h };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         int total = N_s * mlp_h;
@@ -408,13 +455,15 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
         unsigned gx = (N_s + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->t_s, &ws->m1s, (void *)&swsh->mlp_fc2_w, (void *)&swsh->mlp_fc2_b,
                          &N_s, &mlp_h, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned gx = (N_p + 15) / 16, gy = (dim + 15) / 16;
         void *args[] = { &ws->t_p, &ws->m1p, (void *)&swp->mlp_fc2_w, (void *)&swp->mlp_fc2_b,
                          &N_p, &mlp_h, &dim };
-        if (hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        (void)gx; (void)gy;
+        if (ssdit_gemm(f, args) != 0) return -1;
     }
     {
         unsigned grid = (unsigned)((N_s * dim + 255) / 256);
