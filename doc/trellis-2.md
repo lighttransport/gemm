@@ -1071,10 +1071,34 @@ for dense Stage 1 (N=4096, the heaviest attention):
 | Stage 3 (sparse tex) | 23.2 s | 14.9 s | **9.8 s** |
 | **DiT total** | **100.2 s** | 74.0 s | **48.0 s** |
 
-**Cumulative DiT speedup this session: 100.2 → 48.0 s = 2.09×** (modulation warp-per-row + Stage-2/3
-cuBLAS-TF32 + attention K/V staging). Per-forward Stage-2: 1924 → 806 ms (2.39×). Mesh unchanged
-(1.47 M verts, 3.22 M tris, 99.7% trilinear / 100% covered). Remaining levers: the two decoders
-(~28 s, sparse-conv-bound) are now the largest non-DiT cost.
+**Cumulative DiT (after attention staging): 100.2 → 48.0 s = 2.09×** (modulation warp-per-row +
+Stage-2/3 cuBLAS-TF32 + attention K/V staging). Per-forward Stage-2: 1924 → 806 ms (2.39×).
+
+### RoPE reparallelization — DiT 48→44 s (2026-05-30)
+
+`rope_3d_f32` ran `for (h = threadIdx.x; h < n_heads; h += blockDim.x)`, so only **`n_heads`=12 of
+the 256 threads** per block were active (the rest idle) and each rotated a whole head's 128 dims
+serially — at ~1.38 ms for a [N,1536] read+write (~0.1 ms memory floor) it was ~13× off, the same
+low-occupancy bug class as `modulation_f32`. Reparallelized to **one thread per (head, axis, freq)
+complex-pair** (all 256 threads active, coalesced). Per-element-independent, so no race; the math is
+the same, though restructuring lets the compiler contract `re*c - im*s` into FMAs differently → a
+benign ~3e-5 cosine shift (Stage-2 0.985411 → 0.985379, still at the ~0.985 floor vs PyTorch — the
+same class as the TF32/bf16 reassociations we already accept).
+
+| Stage | +attn-staging | **+rope-opt** |
+|-------|---------------|----------------|
+| Stage 1 | 21.9 s | **20.0 s** |
+| Stage 2 | 16.3 s | **14.8 s** (806 → 731 ms/forward) |
+| Stage 3 |  9.8 s | **8.9 s** |
+| **DiT total** | 48.0 s | **43.7 s** |
+
+**Cumulative DiT this session: 100.2 → 43.7 s = 2.29×** (modulation warp-per-row + Stage-2/3
+cuBLAS-TF32 + attention K/V staging + RoPE reparallelization); per-forward Stage-2 1924 → 731 ms
+(2.63×). Mesh stays valid (1.40 M verts, 3.05 M tris, 99.7% trilinear / 100% covered); the count
+drifts 1.47 M → 1.40 M as the accumulated benign numerical differences shift near-threshold
+subdivision decisions — equivalent quality, both ~0.985 vs PyTorch. Remaining lever: the two decoders
+(~28 s, sparse-conv-bound — gather/pack/GEMM/scatter on up to 1.4 M voxels; no single hot kernel,
+a deeper effort) are now the largest cost.
 
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
