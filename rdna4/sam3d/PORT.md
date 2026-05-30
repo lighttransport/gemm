@@ -72,17 +72,25 @@ card), and consume the `\n` after `end_header` when byte-parsing the binary PLY.
 ## Speed — BF16 WMMA GEMM (commit 6352c3c)
 
 `gemm_bf16w_bf16a_wmma_t` (ported from rdna4/trellis2, round-to-nearest-even bf16
-conversion) + a per-call dispatcher, gated by `SAM3D_WMMA` (default on; `=0` = exact
-F32). **Wired for DINOv2 only** so far: ~2.6× forward compute, e2e mesh negligibly
-changed (occupancy pos 6600→6626, gaussian distributions match) — DINOv2 is diffusion
-*conditioning*, so its bf16 error is absorbed. `verify_dinov2` max_abs 0.144 exceeds
-the strict 5e-2 F32 gate (expected for bf16), so judge by the e2e mesh, not that gate.
+conversion) + per-call dispatchers, gated by `SAM3D_WMMA` (default on; `=0` = exact
+F32). **Now wired across DINOv2 + SS-DiT + SLAT DiT** (commits 6352c3c, b606cae,
+af6810e). Coverage: DINOv2 block GEMMs (cs3d_dinov2_gemm), SS-DiT block forward
+(ssdit_gemm), SLAT IO/input/final-layer hooks (cs3d_slat_gemm) and SLAT transformer
+block forward (slatdit_gemm). Each falls back to gemm_f32_bias when SAM3D_WMMA=0 or
+dims aren't 16-aligned. Stream 0 throughout. Attention (sdpa) stays scalar — the
+reusable WMMA flash-attn hardcodes head_dim=128 and sam3d uses 64.
 
-TODO (bigger e2e win, not yet done): route SS-DiT / SLAT-DiT / SLAT-GS GEMMs through
-the same dispatcher. These are the *diffused* variable — bf16 error accumulates over
-sampler steps — so validate the e2e mesh per stage and keep `SAM3D_WMMA`-gated; only
-default-on if the mesh holds. Then optional hipBLASLt (rdna4/llm/mm_blaslt_bridge,
-more accurate) for the largest GEMMs, and carry both fixes to rdna4/sam3d_body.
+Quality (judge by e2e mesh, not the strict per-stage F32 gates — bf16 max_abs ~1e-2
+on the diffused latent is expected and over those gates):
+  - DINOv2 (conditioning): occupancy 6600→6626, distributions match (2-step).
+  - SS-DiT (diffused occupancy var, the dominant shift): full-step occupied-voxel
+    IoU 0.82 vs F32, centroids + distributions match, zero nonfinite. The IoU is
+    dominated by threshold jitter on the occupancy field; gaussian *values* match.
+  - SLAT (refines features on the fixed voxel set): incremental IoU 0.9967 vs
+    SS-DiT-only — structurally negligible.
+
+TODO: optional hipBLASLt (rdna4/llm/mm_blaslt_bridge, more accurate than bf16 WMMA)
+for the largest GEMMs; carry the PPE NaN fix + WMMA to rdna4/sam3d_body.
 
 ## Reproducing the dumps
 
