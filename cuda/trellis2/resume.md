@@ -144,6 +144,17 @@
 > **SESSION CUMULATIVE DiT 100.2→43.7 s = 2.29×** (modulation + cuBLAS-TF32 + attn-staging + rope);
 > S2/fwd 1924→731 ms (2.63×). NEXT: 2 decoders (~28s, sparse-conv gather/pack/GEMM/scatter, deeper effort).
 >
+> ## DECODER PERF: packed-conv pack caching — decoder 27.4→12.6 s = 2.18× (2026-05-30)
+>
+> `-t cuda` API trace showed decoder time was NOT in any GPU kernel but in thousands of synchronous
+> host memory ops: `t2_sparse_conv_pack_build` (N*27 CPU hash lookups + ≤54 HtoD) was rebuilt for
+> EVERY ConvNeXt block, though the pack is a pure fn of (coords,hash) and identical across all blocks
+> at a level. Cache it in the runner keyed on (coords ptr, N); only a new level (c2s conv2) rebuilds.
+> ConvNeXt shape: stage1 1762→485 (3.6×), stage2 2016→338 (6.0×), stage3 3251→279 ms (11.6×).
+> Decoder 27.4→12.6 s; output BYTE-IDENTICAL (1403042 verts, 99.7%, pure caching). Commit 0dd2a6d.
+> **COMBINED DiT+decoder 127.4→56.3 s = 2.26× this session.** NEXT: c2s conv2 pack build on 1.47M
+> children (~3.75+3.67 s, not cacheable) → would need GPU-side pack build (src/dst from gather map).
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
