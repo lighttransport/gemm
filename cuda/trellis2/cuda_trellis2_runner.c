@@ -538,9 +538,9 @@ static CUdeviceptr t2_upload_f32(st_context *st, const char *name, int verbose) 
     return d;
 }
 
-/* Fast path for BF16 checkpoints loaded as F32: upload the raw 16-bit tensor and
+/* Fast path for F16/BF16 checkpoints loaded as F32: upload the raw 16-bit tensor and
  * expand on GPU. This preserves the exact same F32 values as the CPU conversion
- * while halving host-to-device traffic for the large DiT weights. */
+ * while halving host-to-device traffic for the large DiT/SC-VAE weights. */
 static CUdeviceptr t2_upload_f32_fast(cuda_trellis2_runner *r,
                                       st_context *st,
                                       const char *name,
@@ -551,8 +551,14 @@ static CUdeviceptr t2_upload_f32_fast(cuda_trellis2_runner *r,
         return 0;
     }
     const char *dtype = safetensors_dtype(st, idx);
-    if (!r || !r->ops.cast_bf16_to_f32 || strcmp(dtype, "BF16") != 0 ||
-        (getenv("T2_CPU_BF16_UPLOAD") && atoi(getenv("T2_CPU_BF16_UPLOAD")))) {
+    int is_bf16 = strcmp(dtype, "BF16") == 0;
+    int is_f16 = strcmp(dtype, "F16") == 0;
+    int cpu_bf16 = getenv("T2_CPU_BF16_UPLOAD") && atoi(getenv("T2_CPU_BF16_UPLOAD"));
+    int cpu_f16 = getenv("T2_CPU_F16_UPLOAD") && atoi(getenv("T2_CPU_F16_UPLOAD"));
+    CUfunction cast_fn = r ? (is_bf16 ? r->ops.cast_bf16_to_f32 :
+                              is_f16  ? r->ops.cast_f16_to_f32 : NULL) : NULL;
+    if (!r || !cast_fn || (!is_bf16 && !is_f16) ||
+        (is_bf16 && cpu_bf16) || (is_f16 && cpu_f16)) {
         return t2_upload_f32(st, name, verbose);
     }
 
@@ -568,7 +574,7 @@ static CUdeviceptr t2_upload_f32_fast(cuda_trellis2_runner *r,
         goto fail;
     long n = (long)n_elem;
     void *args[] = {&d_bf16, &d_f32, &n};
-    if (cuLaunchKernel(r->ops.cast_bf16_to_f32, (unsigned)((n_elem + 255) / 256),
+    if (cuLaunchKernel(cast_fn, (unsigned)((n_elem + 255) / 256),
                        1, 1, 256, 1, 1, 0, r->stream, args, NULL) != CUDA_SUCCESS)
         goto fail;
     if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS)
@@ -578,9 +584,9 @@ static CUdeviceptr t2_upload_f32_fast(cuda_trellis2_runner *r,
     if (verbose >= 2) {
         const uint64_t *sh = safetensors_shape(st, idx);
         int nd = safetensors_ndims(st, idx);
-        fprintf(stderr, "  %s: BF16 [", name);
+        fprintf(stderr, "  %s: %s [", name, dtype);
         for (int d2 = 0; d2 < nd; d2++) fprintf(stderr, "%s%lu", d2?",":"", (unsigned long)sh[d2]);
-        fprintf(stderr, "] -> F32 GPU via BF16 upload (%.1f MB H2D)\n",
+        fprintf(stderr, "] -> F32 GPU via 16-bit upload (%.1f MB H2D)\n",
                 (float)nbytes / (1024*1024));
     }
     return d_f32;
@@ -1288,7 +1294,8 @@ int cuda_trellis2_load_stage3(cuda_trellis2_runner *r, const char *stage3_path) 
 
 /* Upload sparse conv weight transposed: [out_C, 27, in_C] -> [27, out_C, in_C]
  * This layout enables gather-GEMM: for each k in 0..26, use weight[k*out_C*in_C] */
-static CUdeviceptr t2_upload_conv_transposed(st_context *st, const char *name,
+static CUdeviceptr t2_upload_conv_transposed(cuda_trellis2_runner *r,
+                                               st_context *st, const char *name,
                                                int out_C, int in_C, int v,
                                                int use_f16) {
     int idx = safetensors_find(st, name);
@@ -1296,8 +1303,41 @@ static CUdeviceptr t2_upload_conv_transposed(st_context *st, const char *name,
     const char *dtype = safetensors_dtype(st, idx);
     void *data = safetensors_data(st, idx);
 
-    /* First convert to F32 on CPU */
     size_t n_elem = (size_t)out_C * 27 * in_C;
+    size_t nbytes = safetensors_nbytes(st, idx);
+
+    if (!use_f16) {
+        int is_f16 = strcmp(dtype, "F16") == 0;
+        int is_bf16 = strcmp(dtype, "BF16") == 0;
+        int cpu_conv = getenv("T2_CPU_SCVAE_CONV_UPLOAD") &&
+                       atoi(getenv("T2_CPU_SCVAE_CONV_UPLOAD"));
+        int cpu_f16 = getenv("T2_CPU_F16_UPLOAD") && atoi(getenv("T2_CPU_F16_UPLOAD"));
+        int cpu_bf16 = getenv("T2_CPU_BF16_UPLOAD") && atoi(getenv("T2_CPU_BF16_UPLOAD"));
+        CUfunction fn = r ? (is_f16 ? r->ops.conv_transpose_f16_to_f32 :
+                             is_bf16 ? r->ops.conv_transpose_bf16_to_f32 : NULL) : NULL;
+        if (r && fn && !cpu_conv && !(is_f16 && cpu_f16) && !(is_bf16 && cpu_bf16)) {
+            CUdeviceptr d_src = 0, d_dst = 0;
+            if (cuMemAlloc(&d_src, nbytes) == CUDA_SUCCESS &&
+                cuMemAlloc(&d_dst, n_elem * sizeof(float)) == CUDA_SUCCESS &&
+                cuMemcpyHtoDAsync(d_src, data, nbytes, r->stream) == CUDA_SUCCESS) {
+                long total = (long)n_elem;
+                void *args[] = {&d_src, &d_dst, &out_C, &in_C};
+                if (cuLaunchKernel(fn, (unsigned)((total + 255) / 256),
+                                   1, 1, 256, 1, 1, 0, r->stream, args, NULL) == CUDA_SUCCESS &&
+                    cuStreamSynchronize(r->stream) == CUDA_SUCCESS) {
+                    cuMemFree(d_src);
+                    if (v >= 2)
+                        fprintf(stderr, "  %s: [%d,27,%d] -> [27,%d,%d] F32 GPU via 16-bit upload\n",
+                                name, out_C, in_C, out_C, in_C);
+                    return d_dst;
+                }
+            }
+            if (d_src) cuMemFree(d_src);
+            if (d_dst) cuMemFree(d_dst);
+        }
+    }
+
+    /* Fallback: convert/transpose on CPU, then upload. */
     float *f32 = (float *)malloc(n_elem * sizeof(float));
     const uint16_t *src16 = (const uint16_t *)data;
 
@@ -1371,8 +1411,8 @@ static int cuda_trellis2_load_scvae_decoder(cuda_trellis2_runner *r,
     dec->use_f16 = use_f16;
 
     /* Weight names match: blocks.{stage}.{block}.{component} */
-    #define UPW(n) (use_f16 ? t2_upload_f16(st, n, v) : t2_upload_f32(st, n, v))
-    #define UPB(n) t2_upload_f32(st, n, v)
+    #define UPW(n) (use_f16 ? t2_upload_f16(st, n, v) : t2_upload_f32_fast(r, st, n, v))
+    #define UPB(n) t2_upload_f32_fast(r, st, n, v)
 
     dec->from_latent_w = UPW("from_latent.weight");
     dec->from_latent_b = UPB("from_latent.bias");
@@ -1402,7 +1442,7 @@ static int cuda_trellis2_load_scvae_decoder(cuda_trellis2_runner *r,
             char name[256];
             #define CN(suf) (snprintf(name, sizeof(name), "blocks.%d.%d.%s", s, b, suf), name)
             dec->convnext[s][b].conv_w = t2_upload_conv_transposed(
-                st, CN("conv.weight"), C, C, v, use_f16);
+                r, st, CN("conv.weight"), C, C, v, use_f16);
             dec->convnext[s][b].conv_b = UPB(CN("conv.bias"));
             dec->convnext[s][b].norm_w = UPB(CN("norm.weight"));
             dec->convnext[s][b].norm_b = UPB(CN("norm.bias"));
@@ -1421,10 +1461,10 @@ static int cuda_trellis2_load_scvae_decoder(cuda_trellis2_runner *r,
             dec->c2s[s].norm1_w = UPB(C2S("norm1.weight"));
             dec->c2s[s].norm1_b = UPB(C2S("norm1.bias"));
             dec->c2s[s].conv1_w = t2_upload_conv_transposed(
-                st, C2S("conv1.weight"), C_out * 8, C, v, use_f16);
+                r, st, C2S("conv1.weight"), C_out * 8, C, v, use_f16);
             dec->c2s[s].conv1_b = UPB(C2S("conv1.bias"));
             dec->c2s[s].conv2_w = t2_upload_conv_transposed(
-                st, C2S("conv2.weight"), C_out, C_out, v, use_f16);
+                r, st, C2S("conv2.weight"), C_out, C_out, v, use_f16);
             dec->c2s[s].conv2_b = UPB(C2S("conv2.bias"));
             /* to_subdiv may be missing (texture decoder) */
             snprintf(name, sizeof(name), "blocks.%d.%d.to_subdiv.weight", s, nblk[s]);

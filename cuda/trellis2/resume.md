@@ -208,6 +208,20 @@
 > `tex_coords`, `tex_feats`). Full textured e2e with cached kernels is now `real 64.04`, same
 > `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered.
 >
+> ## LOAD PERF #2: GPU F16 SC-VAE upload + sparse-conv transpose — e2e 64.0→57.1 s (2026-05-30)
+>
+> Shape/texture decoder loads had the same CPU expansion issue plus a sparse-conv layout transform:
+> `[out,27,in] -> [27,out,in]`. New `t2_cast_f16_to_f32` handles dense F16/BF16 tensor expansion on
+> GPU, and `t2_conv3d_transpose_f16_to_f32` / `t2_conv3d_transpose_bf16_to_f32` upload raw 16-bit
+> sparse-conv weights and transpose while expanding to F32. CPU fallbacks: `T2_CPU_F16_UPLOAD=1`,
+> `T2_CPU_BF16_UPLOAD=1`, and `T2_CPU_SCVAE_CONV_UPLOAD=1`.
+>
+> Shape decoder load `3.72→0.31 s`; texture decoder load `3.73→0.31 s`. Focused shape-decoder
+> output is **byte-identical** vs CPU conversion/transpose (`max_abs=0`, coord mismatches `0`);
+> cached focused wall time `6.52→3.10 s`. Full textured e2e is now `real 57.13`, byte-identical
+> to the GPU-DiT-load run for `stage1`, `stage2`, `tex_coords`, and `tex_feats`, with the same
+> `1,403,042 verts / 3,048,684 tris` and PBR `99.7%` / `100%`.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
