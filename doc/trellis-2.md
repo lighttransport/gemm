@@ -565,6 +565,9 @@ Additional debug knobs for this path:
 - `T2_VERIFY_PROJECT_OUT=1`: verifier-only diagnostic for 64-channel
   intermediate comparisons. It reports the max output-layer-weighted feature
   error without changing the CUDA decoder path.
+- `T2_WRITE_SHAPE_OBJ=1` or `--write-shape-obj`: write the optional
+  `<output>_shape.obj` debug sidecar. By default the CUDA harness writes only
+  the requested final OBJ path to avoid duplicating million-vertex mesh output.
 
 Small end-to-end smoke:
 
@@ -586,7 +589,8 @@ env XDG_RUNTIME_DIR=/run/user/1000 T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1 \
 Measured in the Stage 3 smoke below: Stage 1 one step produced all-negative
 occupancy, so the smoke uses top-N sparse selection. Stage 2 DiT one step
 `586.8 ms`; CUDA SC-VAE shape decoder emitted `N=918,C=7`; shape OBJ written
-to `/tmp/trellis2_e2e_check_n16.obj_shape.obj`.
+to the requested output path. Use `--write-shape-obj` to also emit the
+`<output>_shape.obj` debug sidecar.
 
 Fix notes:
 
@@ -1232,6 +1236,22 @@ The same F16 upload helper is also used by the dense Stage 1 occupancy decoder. 
 but now visible under `T2_TIMING`: CPU conversion `0.28 s`, GPU expansion `0.05 s`. `verify_decoder`
 metrics are unchanged, and the final full e2e is `real 56.85` with byte-identical dumps versus the
 previous SC-VAE-load run.
+
+### Output-side tail trimming (2026-05-30) — full e2e 57.0 → 55.4 s
+
+Coarse `T2_TIMING` brackets now cover the post-sampler pipeline: Stage-1 structure decode, sparse
+coord extraction, shape/texture SC-VAE decode totals, FDG mesh extraction, PBR field build, texture
+dump, OBJ writes, and program total. The first full profile showed the hidden tail was mostly output:
+`fdg_write_shape_obj 1.63 s`, `pbr_sample_vertices 0.39 s`, and `pbr_write_colored_obj 2.36 s`.
+
+The CUDA harness now skips the redundant `<output>_shape.obj` sidecar by default. The requested final
+OBJ is still written in all paths; set `T2_WRITE_SHAPE_OBJ=1` or pass `--write-shape-obj` to restore
+the debug sidecar. This avoids a duplicate 110 MB OBJ and cuts the textured e2e to `real 55.47`.
+
+The default vertex-colored OBJ path also streams PBR sampling directly into the writer, avoiding the
+`n_verts * sizeof(t2_pbr_attr)` color array (`~32 MiB` at `1,403,042` verts). Wall time is flat
+(`real 55.40`) because float formatting dominates the remaining final OBJ write, but the final OBJ
+and all `.npy` dumps are byte-identical to the pre-stream no-sidecar run.
 
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
