@@ -86,8 +86,13 @@ on the diffused latent is expected and over those gates):
   - SS-DiT (diffused occupancy var, the dominant shift): full-step occupied-voxel
     IoU 0.82 vs F32, centroids + distributions match, zero nonfinite. The IoU is
     dominated by threshold jitter on the occupancy field; gaussian *values* match.
-  - SLAT (refines features on the fixed voxel set): incremental IoU 0.9967 vs
+  - SLAT (refines features on the fixed voxel set): incremental IoU 0.99 vs
     SS-DiT-only — structurally negligible.
+  - Full pipeline sign-off (25/25-step, full all-WMMA vs full F32): occupied-voxel
+    IoU 0.82 (4246 F32 vs 3935 WMMA voxels, 3686 shared), centroids
+    (0.500,0.539,0.514)/(0.503,0.527,0.514), op 5.73/5.68, scale -9.87/-9.79,
+    dc -1.747/-1.747, zero nonfinite. Matches the SS-DiT-only full-step figure —
+    SLAT adds no further drift, consistent with the 0.99 incremental IoU.
 
 TODO: optional hipBLASLt (rdna4/llm/mm_blaslt_bridge, more accurate than bf16 WMMA)
 for the largest GEMMs; carry the PPE NaN fix + WMMA to rdna4/sam3d_body.
