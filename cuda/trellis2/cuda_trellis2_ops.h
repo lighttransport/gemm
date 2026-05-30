@@ -21,6 +21,8 @@ typedef struct {
     int M[27];
     CUdeviceptr src_idx[27];
     CUdeviceptr dst_idx[27];
+    CUdeviceptr src_storage;
+    CUdeviceptr dst_storage;
 } t2_sparse_conv_pack;
 
 typedef struct {
@@ -92,6 +94,7 @@ typedef struct {
     /* Sparse conv kernels */
     CUfunction sparse_build_gather_map;
     CUfunction sparse_gather;
+    CUfunction sparse_pack_from_gather_map;
     CUfunction sparse_pack_rows;
     CUfunction scatter_add_rows;
     CUfunction scatter_add;
@@ -217,6 +220,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     /* Sparse conv kernels */
     GET_FN("sparse_build_gather_map_f32", sparse_build_gather_map);
     GET_FN("sparse_gather_f32",           sparse_gather);
+    GET_FN("sparse_pack_from_gather_map_f32", sparse_pack_from_gather_map);
     GET_FN("sparse_pack_rows_f32",        sparse_pack_rows);
     GET_FN("scatter_add_rows_f32",        scatter_add_rows);
     GET_FN("scatter_add_f32",             scatter_add);
@@ -914,6 +918,21 @@ static inline void t2_op_sparse_gather(t2_ops *ops, CUstream s,
     int total = N * C;
     void *args[] = {&gathered, &feats, &gather_map, &N, &C, &k_idx};
     cuLaunchKernel(ops->sparse_gather, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Build packed sparse-conv row lists from an existing gather map.
+ * src_all/dst_all: [27, N] int32, counts: [27] int32 */
+static inline void t2_op_sparse_pack_from_gather_map(t2_ops *ops, CUstream s,
+                                                       CUdeviceptr src_all,
+                                                       CUdeviceptr dst_all,
+                                                       CUdeviceptr counts,
+                                                       CUdeviceptr gather_map,
+                                                       int N) {
+    int total = N * 27;
+    void *args[] = {&src_all, &dst_all, &counts, &gather_map, &N};
+    cuLaunchKernel(ops->sparse_pack_from_gather_map,
+                   (unsigned)((total + 255) / 256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
 }
 
