@@ -120,8 +120,19 @@
 > 0.985372→0.985397. (2) **Stage-2/3 default F16-MMA → F32+cuBLAS-TF32** (`load_sparse_dit` line
 > ~1064 `t2_dit_use_f16(r,0)`; `T2_DIT_F16=1` restores MMA): 1.36×, cosine →0.985343, F32 5.3GB OK
 > w/ lazy load. Combined Stage-2 sampler 1924→1243 ms/fwd (1.55×). e2e DiT: S1 38.4→34.2, S2
-> 38.6→24.9, S3 23.2→14.9 = 100.2→74.0 s (1.35×). NEXT: attn_mma_hd128 (35%, needs FA2) + decoders
-> (~28s, c2s 128→64 = 5s). `verify_stage2_full` now prints `>>> Sampler loop: … ms/forward`.
+> 38.6→24.9, S3 23.2→14.9 = 100.2→74.0 s (1.35×). `verify_stage2_full` now prints `>>> Sampler loop: … ms/forward`.
+>
+> ## DiT PERF #2: attention K/V shared-staging — DiT 74→48 s, byte-identical (2026-05-30)
+>
+> `attn_mma_hd128_f32` (35% of DiT) is already a hand FA (online softmax, m16n8k16 MMA), but its 4
+> warps/block (diff query rows, SAME KV) each RE-READ K/V from global per 16-tok tile = 4× redundant
+> traffic (memory-bound, ~5 TFLOPS). Fix: **stage each 16-tok K/V tile into shared once/block (f32, so
+> all cvt/MMA/softmax byte-identical), all 4 warps read shared**; coalesced staging load. Had to drop
+> the per-warp `if(qb>=q_len) return` (would hang others at the new `__syncthreads`; OOB queries
+> already guarded in Q-load + output-write). **1.54× on whole DiT, OUTPUT BYTE-IDENTICAL** (Stage-2
+> cosine 0.985411 unchanged). S1 34.2→21.9 (biggest, dense N=4096), S2 24.9→16.3, S3 14.9→9.8 =
+> **74→48 s**. Stage-2/fwd 1243→806 ms. **SESSION CUMULATIVE DiT 100.2→48.0 s = 2.09×** (modulation +
+> cuBLAS-TF32 + attn-staging). Mesh unchanged (1.47M verts 99.7%). NEXT: 2 decoders (~28s, sparse-conv).
 >
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >

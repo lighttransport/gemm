@@ -1043,9 +1043,38 @@ End-to-end DiT (RTX 5060 Ti, 12-step CFG, ~3519 sparse voxels):
 Mesh output unchanged in quality (1.47 M verts, 3.22 M tris, 99.7% trilinear / 100% covered); the
 final voxel count shifts <1% (1.462 M→1.472 M) from the F16-vs-TF32 Stage-2 numerical difference,
 both equally ~0.985 vs PyTorch. **Next levers** (untouched): `attn_mma_hd128_f32` (34.8%, the
-materialized O(N²) self-attn — would need an FA2-style kernel, larger effort) and the two decoders
-(~28 s combined, dominated by the `c2s 128→64` upsample to 1.47 M voxels at ~5 s and the
-329 K-voxel stage-3 ConvNeXt at ~3.3 s). `verify_stage2_full` now prints `>>> Sampler loop: … ms/forward`.
+materialized O(N²) self-attn) and the two decoders (~28 s combined, dominated by the `c2s 128→64`
+upsample to 1.47 M voxels at ~5 s and the 329 K-voxel stage-3 ConvNeXt at ~3.3 s).
+`verify_stage2_full` now prints `>>> Sampler loop: … ms/forward`.
+
+### Attention K/V shared-memory staging — DiT 74→48 s, byte-identical (2026-05-30)
+
+The `attn_mma_hd128_f32` kernel (35% of the DiT forward) is already a hand-written FlashAttention
+(online softmax, `mma.sync.m16n8k16` tensor cores, O(N) memory) — but each block runs **4 warps over
+different query rows and the SAME KV**, and every warp re-read K and V straight from global memory
+each 16-token tile. That's 4× redundant K/V traffic, and profiling-by-arithmetic (the kernel runs at
+~5 TFLOPS, far below compute peak) said it was memory-bound. Fix: **stage each 16-token K/V tile into
+shared memory once per block** (as f32, so every downstream `cvt`/MMA/softmax op is byte-identical),
+then all 4 warps read from shared. The coalesced staging load replaces the scattered per-warp global
+reads. One required change: the per-warp `if (qb>=q_len) return;` early-out had to go (a returned warp
+would hang the others at the new `__syncthreads`) — OOB query rows are already guarded in the Q load
+and the output write, so those warps just do harmless wasted compute.
+
+**Result: 1.54× on the whole DiT, output byte-identical** (Stage-2 sampler cosine 0.985411 — exactly
+the pre-staging value). The win is uniform because all three stages share the kernel, and is *largest*
+for dense Stage 1 (N=4096, the heaviest attention):
+
+| Stage | original | +mod+cuBLAS-TF32 (`1b8253c`) | **+attn K/V staging** |
+|-------|----------|------------------------------|------------------------|
+| Stage 1 (dense 4096) | 38.4 s | 34.2 s | **21.9 s** |
+| Stage 2 (sparse shape) | 38.6 s | 24.9 s | **16.3 s** |
+| Stage 3 (sparse tex) | 23.2 s | 14.9 s | **9.8 s** |
+| **DiT total** | **100.2 s** | 74.0 s | **48.0 s** |
+
+**Cumulative DiT speedup this session: 100.2 → 48.0 s = 2.09×** (modulation warp-per-row + Stage-2/3
+cuBLAS-TF32 + attention K/V staging). Per-forward Stage-2: 1924 → 806 ms (2.39×). Mesh unchanged
+(1.47 M verts, 3.22 M tris, 99.7% trilinear / 100% covered). Remaining levers: the two decoders
+(~28 s, sparse-conv-bound) are now the largest non-DiT cost.
 
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
