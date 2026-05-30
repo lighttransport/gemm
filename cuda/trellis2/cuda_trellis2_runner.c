@@ -2677,13 +2677,21 @@ int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
         for (int ch = 0; ch < in_ch; ch++)
             x_transposed[pos * in_ch + ch] = x_t[ch * N + pos];
 
-    CUdeviceptr d_x = cu_upload_raw(x_transposed, (size_t)N * in_ch * sizeof(float));
+    size_t x_bytes = (size_t)N * in_ch * sizeof(float);
+    ensure_scratch(r, 4, x_bytes);
+    CUdeviceptr d_x = r->scratch[4];
+    cuMemcpyHtoD(d_x, x_transposed, x_bytes);
     free(x_transposed);
     int have_kv = t2_kv_cache_ready(r, cache_slot, 1, cond_hash, DIT_DEPTH);
-    CUdeviceptr d_cond = have_kv ? 0 :
-        cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
-    CUdeviceptr d_out;
-    cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
+    CUdeviceptr d_cond = 0;
+    if (!have_kv) {
+        size_t cond_bytes = (size_t)ctx_len * DIT_COND_DIM * sizeof(float);
+        ensure_scratch(r, 6, cond_bytes);
+        d_cond = r->scratch[6];
+        cuMemcpyHtoD(d_cond, cond_features, cond_bytes);
+    }
+    ensure_scratch(r, 5, x_bytes);
+    CUdeviceptr d_out = r->scratch[5];
 
     run_dit_forward(r, d_x, timestep, d_cond, d_out, cond_hash, cache_slot);
 
@@ -2696,9 +2704,6 @@ int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
             output[ch * N + pos] = out_flat[pos * in_ch + ch];
     free(out_flat);
 
-    cuMemFree(d_x);
-    if (d_cond) cuMemFree(d_cond);
-    cuMemFree(d_out);
     return 0;
 }
 
@@ -4217,12 +4222,20 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
 
     /* Upload input and conditioning. The conditioning tensor is only needed when
      * the per-block cross-attention KV cache is cold for this model/slot. */
-    CUdeviceptr d_x = cu_upload_raw(x_t, (size_t)N * in_ch * sizeof(float));
+    size_t x_bytes = (size_t)N * in_ch * sizeof(float);
+    ensure_scratch(r, 4, x_bytes);
+    CUdeviceptr d_x = r->scratch[4];
+    cuMemcpyHtoD(d_x, x_t, x_bytes);
     int have_kv = t2_kv_cache_ready(r, cache_slot, 2, cond_hash, m->n_blocks);
-    CUdeviceptr d_cond = have_kv ? 0 :
-        cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
-    CUdeviceptr d_out;
-    cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
+    CUdeviceptr d_cond = 0;
+    if (!have_kv) {
+        size_t cond_bytes = (size_t)ctx_len * DIT_COND_DIM * sizeof(float);
+        ensure_scratch(r, 6, cond_bytes);
+        d_cond = r->scratch[6];
+        cuMemcpyHtoD(d_cond, cond_features, cond_bytes);
+    }
+    ensure_scratch(r, 5, x_bytes);
+    CUdeviceptr d_out = r->scratch[5];
 
     /* Run Stage 2 DiT forward */
     run_sparse_dit_forward(r, m, r->stage2_blocks_cpu,
@@ -4230,11 +4243,8 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
                             2, cond_hash, cache_slot);
 
     cuStreamSynchronize(s);
-    cuMemcpyDtoH(output, d_out, (size_t)N * in_ch * sizeof(float));
+    cuMemcpyDtoH(output, d_out, x_bytes);
 
-    cuMemFree(d_x);
-    if (d_cond) cuMemFree(d_cond);
-    cuMemFree(d_out);
     return 0;
 }
 
@@ -4263,24 +4273,30 @@ int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
 
     /* Upload input and conditioning. The conditioning tensor is only needed when
      * the per-block cross-attention KV cache is cold for this model/slot. */
-    CUdeviceptr d_x = cu_upload_raw(x_t, (size_t)N * in_ch * sizeof(float));
+    size_t x_bytes = (size_t)N * in_ch * sizeof(float);
+    ensure_scratch(r, 4, x_bytes);
+    CUdeviceptr d_x = r->scratch[4];
+    cuMemcpyHtoD(d_x, x_t, x_bytes);
     int have_kv = t2_kv_cache_ready(r, cache_slot, 3, cond_hash, m->n_blocks);
-    CUdeviceptr d_cond = have_kv ? 0 :
-        cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+    CUdeviceptr d_cond = 0;
+    if (!have_kv) {
+        size_t cond_bytes = (size_t)ctx_len * DIT_COND_DIM * sizeof(float);
+        ensure_scratch(r, 6, cond_bytes);
+        d_cond = r->scratch[6];
+        cuMemcpyHtoD(d_cond, cond_features, cond_bytes);
+    }
     int out_ch = m->out_channels;  /* 32 for Stage 3 */
-    CUdeviceptr d_out;
-    cuMemAlloc(&d_out, (size_t)N * out_ch * sizeof(float));
+    size_t out_bytes = (size_t)N * out_ch * sizeof(float);
+    ensure_scratch(r, 5, out_bytes);
+    CUdeviceptr d_out = r->scratch[5];
 
     run_sparse_dit_forward(r, m, r->stage3_blocks_cpu,
                             d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin,
                             3, cond_hash, cache_slot);
 
     cuStreamSynchronize(s);
-    cuMemcpyDtoH(output, d_out, (size_t)N * out_ch * sizeof(float));
+    cuMemcpyDtoH(output, d_out, out_bytes);
 
-    cuMemFree(d_x);
-    if (d_cond) cuMemFree(d_cond);
-    cuMemFree(d_out);
     return 0;
 }
 

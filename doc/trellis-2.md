@@ -1278,6 +1278,14 @@ This keeps outputs byte-identical and trims a few milliseconds from every DiT fo
 full textured e2e is `real 55.11` (`T2_TIMING program_total 54998.957 ms`), with byte-identical final
 OBJ and saved dumps versus the sparse-setup-cache run.
 
+### DiT wrapper scratch I/O reuse (2026-05-31) — allocator churn removed
+
+The public Stage 1/2/3 DiT wrappers no longer allocate/free device input, output, and cold conditioning
+buffers for every forward. They reuse runner scratch slots for those transient buffers, while the
+forward core still owns its separate activation scratch. This is byte-identical and mostly removes
+driver allocator overhead rather than math: cached full textured e2e is `real 55.05`
+(`T2_TIMING program_total 54964.562 ms`).
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
