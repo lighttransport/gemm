@@ -256,6 +256,8 @@ struct hip_sam3d_body_ctx {
     hipFunction_t fn_resize, fn_patch, fn_prepend;
     hipFunction_t fn_bf16_round;
     hipFunction_t fn_ln, fn_gemm_tiled;
+    hipFunction_t fn_gemm_wmma;   /* gemm_f16w_bf16a_wmma_t (gfx12; optional) */
+    int           use_wmma;       /* 1 iff SAM3D_BODY_WMMA!=0 and resolved */
     hipFunction_t fn_rope_qk, fn_kv_tx, fn_fa;
     hipFunction_t fn_silu_mul, fn_layerscale_add;
     hipFunction_t fn_ray_cond_fourier, fn_conv1x1_chw, fn_ln_chw;
@@ -947,6 +949,18 @@ static int sb_compile(hip_sam3d_body_ctx *c) {
     BIND(fn_mhr_blend,      "mhr_blend_combine_f32");
     BIND(fn_mhr_lbs,        "mhr_lbs_skin_f32");
     #undef BIND
+    /* Optional BF16-WMMA encoder GEMM (gfx12). Default on; SAM3D_BODY_WMMA=0
+     * disables. F16-weight variant — encoder weights are F16 on device. */
+    c->use_wmma = 0;
+    c->fn_gemm_wmma = NULL;
+    {
+        const char *e = getenv("SAM3D_BODY_WMMA");
+        if (!e || e[0] != '0') {
+            if (hipModuleGetFunction(&c->fn_gemm_wmma, c->mod,
+                                     "gemm_f16w_bf16a_wmma_t") == hipSuccess)
+                c->use_wmma = 1;
+        }
+    }
     return 0;
 }
 
@@ -963,6 +977,25 @@ static int sb_launch(hipFunction_t fn, unsigned gx, unsigned gy, unsigned gz,
         return -1;
     }
     return 0;
+}
+
+/* Encoder GEMM dispatch: Y[n_tok,n_out] = X[n_tok,n_in] * W[n_out,n_in]^T +
+ * bias[n_out], W in F16. Routes to BF16 WMMA when enabled and dims are
+ * 16-aligned, else the scalar gemm_tiled_f16_f32. Both share the packed-struct
+ * arg layout {Y,W,X,bias,n_out,n_in,n_tok}. */
+static int sb_enc_gemm(hip_sam3d_body_ctx *c, void *Y, const void *W,
+                       const void *X, const void *bias,
+                       int n_out, int n_in, int n_tok) {
+    struct __attribute__((packed)) {
+        void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
+    } p = { Y, W, X, bias, n_out, n_in, n_tok };
+    if (c->use_wmma && c->fn_gemm_wmma && (n_out % 16 == 0) && (n_in % 16 == 0))
+        return sb_launch(c->fn_gemm_wmma, (unsigned)((n_out + 127) / 128),
+                         (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1,
+                         0, &p, sizeof(p));
+    return sb_launch(c->fn_gemm_tiled, (unsigned)((n_out + 63) / 64),
+                     (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1,
+                     0, &p, sizeof(p));
 }
 
 static int sb_precision_is_bf16(const hip_sam3d_body_ctx *ctx)
@@ -1440,17 +1473,9 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
         }
 
         /* QKV: d_qkv <- gemm(qkv_w, d_ln) + qkv_b.  Out cols = 3*D. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
-                    3 * D, D, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((3 * D + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
+                        3 * D, D, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
 
         /* qkv_split_f32: split d_qkv (N, 3D) into Q=d_kt, K=d_vt, V=d_proj
          * each (N, D) row-major. */
@@ -1480,17 +1505,9 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
         }
 
         /* proj: d_proj <- gemm(proj_w, d_attn) + proj_b. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_proj, b->proj_w, ctx->d_attn, b->proj_b,
-                    D, D, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((D + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_proj, b->proj_w, ctx->d_attn, b->proj_b,
+                        D, D, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
 
         /* residual: d_tok += d_proj (no LayerScale for ViT-H). */
         {
@@ -1515,17 +1532,9 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
         }
 
         /* fc1: d_gate <- gemm(fc1_w, d_ln) + fc1_b.  (N, FFN) */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_gate, b->fc1_w, ctx->d_ln, b->fc1_b,
-                    FFN, D, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_gate, b->fc1_w, ctx->d_ln, b->fc1_b,
+                        FFN, D, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
 
         /* GELU in-place. */
         {
@@ -1539,17 +1548,9 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
         }
 
         /* fc2: d_proj <- gemm(fc2_w, d_gate) + fc2_b.  (N, D) */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_proj, b->fc2_w, ctx->d_gate, b->fc2_b,
-                    D, FFN, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((D + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_proj, b->fc2_w, ctx->d_gate, b->fc2_b,
+                        D, FFN, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
 
         /* residual: d_tok += d_proj. */
         {
@@ -1803,17 +1804,9 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
             return HIP_SAM3D_BODY_E_LOAD;
 
         /* QKV: d_qkv <- gemm(qkv_w, d_ln) + qkv_b. Out cols = 3*D. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
-                    3 * SB_DIM, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((3 * SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
+                        3 * SB_DIM, SB_DIM, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_qkv, N_TOK * 3 * SB_DIM) < 0)
             return HIP_SAM3D_BODY_E_LOAD;
 
@@ -1861,17 +1854,9 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
             return HIP_SAM3D_BODY_E_LOAD;
 
         /* Output projection: d_proj <- gemm(proj_w, d_attn) + proj_b. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_proj, b->proj_w, ctx->d_attn, b->proj_b,
-                    SB_DIM, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_proj, b->proj_w, ctx->d_attn, b->proj_b,
+                        SB_DIM, SB_DIM, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_proj, N_TOK * SB_DIM) < 0)
             return HIP_SAM3D_BODY_E_LOAD;
 
@@ -1902,26 +1887,12 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
             return HIP_SAM3D_BODY_E_LOAD;
 
         /* SwiGLU: d_gate <- gemm(w1, d_ln) + b1; d_up <- gemm(w2, d_ln) + b2. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } pg = { ctx->d_gate, b->w1_w, ctx->d_ln, b->w1_b,
-                     SB_FFN, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &pg, sizeof(pg)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } pu = { ctx->d_up, b->w2_w, ctx->d_ln, b->w2_b,
-                     SB_FFN, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &pu, sizeof(pu)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_gate, b->w1_w, ctx->d_ln, b->w1_b,
+                        SB_FFN, SB_DIM, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
+        if (sb_enc_gemm(ctx, ctx->d_up, b->w2_w, ctx->d_ln, b->w2_b,
+                        SB_FFN, SB_DIM, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_gate, N_TOK * SB_FFN) < 0)
             return HIP_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_up, N_TOK * SB_FFN) < 0)
@@ -1941,17 +1912,9 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
             return HIP_SAM3D_BODY_E_LOAD;
 
         /* w3: d_proj <- gemm(w3, d_gate) + b3.   (FFN→D)  reuse d_proj */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_proj, b->w3_w, ctx->d_gate, b->w3_b,
-                    SB_DIM, SB_FFN, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return HIP_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_enc_gemm(ctx, ctx->d_proj, b->w3_w, ctx->d_gate, b->w3_b,
+                        SB_DIM, SB_FFN, N_TOK) < 0)
+            return HIP_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_proj, N_TOK * SB_DIM) < 0)
             return HIP_SAM3D_BODY_E_LOAD;
 
