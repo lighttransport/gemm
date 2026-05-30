@@ -1205,6 +1205,29 @@ texture coords, and texture features all compare `max_abs=0`. Focused verifier m
 cosine `0.999980`). Full textured e2e with cached kernels is now `real 64.04`, with the same
 `1,403,042` verts / `3,048,684` tris and PBR `99.7%` trilinear / `100%` covered.
 
+### GPU F16 SC-VAE upload + sparse-conv transpose (2026-05-30) — full e2e 64.0 → 57.1 s
+
+The shape and texture SC-VAE checkpoints are F16-heavy. Their previous F32 load path converted dense
+weights on CPU and also transposed sparse-conv weights from `[out,27,in]` to `[27,out,in]` on CPU.
+The loader now uploads raw 16-bit tensors and expands on GPU with `t2_cast_f16_to_f32`; sparse-conv
+weights use `t2_conv3d_transpose_f16_to_f32` or `t2_conv3d_transpose_bf16_to_f32` to combine upload,
+conversion, and transpose. CPU fallbacks remain available with `T2_CPU_F16_UPLOAD=1`,
+`T2_CPU_BF16_UPLOAD=1`, and `T2_CPU_SCVAE_CONV_UPLOAD=1`.
+
+Measured load times:
+
+| Decoder | CPU conversion/transpose | GPU upload/transpose |
+|---|---:|---:|
+| Shape SC-VAE | 3.72 s | **0.31 s** |
+| Texture SC-VAE | 3.73 s | **0.31 s** |
+
+Focused shape-decoder output is **byte-identical** versus the CPU conversion/transpose fallback:
+feature `max_abs=0`, `rel_L2=0`, coord mismatches `0`. Cached focused decoder wall time is now
+`3.10 s` (was `6.52 s` after GPU subdivision/index). Full textured e2e is now `real 57.13`, and the
+full-run dumps remain byte-identical to the prior GPU-DiT-load run for Stage 1, Stage 2, texture
+coords, and texture features. Mesh/PBR output is unchanged: `1,403,042` verts / `3,048,684` tris,
+PBR `99.7%` trilinear / `100%` covered.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
@@ -1460,9 +1483,8 @@ accuracy win — TF32 is the more consistent and higher-precision default.**
 ## Next Steps
 
 ### CUDA
-1. **SC-VAE decoder load path**: Shape/texture decoder loads still spend ~3.7 s
-   each in CPU F16/BF16→F32 conversion plus sparse-conv weight transpose. Move
-   conversion/transpose to GPU or cache the expanded decoder weights.
+1. **Remaining decoder compute hot spots**: Profile the post-load decoder path
+   again; remaining time is mostly ConvNeXt sparse conv/GEMM/scatter at large N.
 2. **PBR atlas export**: Fix/verify the UV chart packer; vertex-colored OBJ is the
    default texture output for now, `T2_PBR_TEXTURE_MAP=1` opts into atlas maps.
 3. **Fresh Stage 2/3 DiT reference dumps**: Persist current PyTorch flow-model

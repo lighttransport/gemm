@@ -125,9 +125,12 @@ typedef struct {
     int use_packed_sparse_conv; /* 1=pack valid rows before sparse conv GEMM */
     cublasew_context *cublas;
     /* Scratch for the bf16 GEMM path (grown on demand; bf16 = 2 bytes/elem). */
+    CUfunction cast_f16_to_f32;
     CUfunction cast_bf16_to_f32;
     CUfunction cast_f32_to_bf16;
     CUfunction round_bf16;  /* in-place f32 -> bf16-precision -> f32 (bf16_round) */
+    CUfunction conv_transpose_f16_to_f32;
+    CUfunction conv_transpose_bf16_to_f32;
     CUdeviceptr bf16_w, bf16_x;
     size_t bf16_w_cap, bf16_x_cap;  /* capacity in elements */
 } t2_ops;
@@ -178,6 +181,9 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
 
     /* Optional bf16 cast/round kernels (for the bf16 DiT paths). Tolerant lookup:
      * if absent (e.g. an older cached module) the bf16 paths stay disabled. */
+    if (cuModuleGetFunction(&ops->cast_f16_to_f32, module, "t2_cast_f16_to_f32")
+            != CUDA_SUCCESS)
+        ops->cast_f16_to_f32 = NULL;
     if (cuModuleGetFunction(&ops->cast_bf16_to_f32, module, "t2_cast_bf16_to_f32")
             != CUDA_SUCCESS)
         ops->cast_bf16_to_f32 = NULL;
@@ -187,6 +193,12 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     if (cuModuleGetFunction(&ops->round_bf16, module, "t2_round_f32_bf16")
             != CUDA_SUCCESS)
         ops->round_bf16 = NULL;
+    if (cuModuleGetFunction(&ops->conv_transpose_f16_to_f32, module,
+                            "t2_conv3d_transpose_f16_to_f32") != CUDA_SUCCESS)
+        ops->conv_transpose_f16_to_f32 = NULL;
+    if (cuModuleGetFunction(&ops->conv_transpose_bf16_to_f32, module,
+                            "t2_conv3d_transpose_bf16_to_f32") != CUDA_SUCCESS)
+        ops->conv_transpose_bf16_to_f32 = NULL;
 
     if (sm_version >= 70) {
         GET_FN("attn_prefill_f32",    attn_prefill);
