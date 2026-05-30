@@ -1776,7 +1776,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
      * 0: hidden [N * D]
      * 1: QKV / MLP shared [max(3*N*D, N*FFN)]
      * 2: attn_out + normed [2 * N * D]
-     * 3: mod[6*D] + t_emb[D] + cross_Q[N*D] + ca_K[ctx*D] + ca_V[ctx*D] */
+     * 3: mod[6*D] + mod_base[6*D] + t_emb[D] + cross_Q[N*D]
+     *    + ca_K[ctx*D] + ca_V[ctx*D] */
     size_t qkv_sz = (size_t)3 * N * D * sizeof(float);
     size_t mlp_sz = (size_t)N * FFN * sizeof(float);
     size_t ca_kv_gemm_sz = (size_t)ctx_len * 2 * D * sizeof(float);  /* cross-attn KV GEMM */
@@ -1784,7 +1785,7 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     if (ca_kv_gemm_sz > sh1) sh1 = ca_kv_gemm_sz;
     size_t ca_kv_sz = (size_t)ctx_len * D * sizeof(float);
     /* t_emb MLP outputs D floats (not 256), needs D-sized buffer */
-    size_t buf3_sz = (size_t)(6*D + D) * sizeof(float)
+    size_t buf3_sz = (size_t)(12*D + D) * sizeof(float)
                    + (size_t)N * D * sizeof(float) + 2 * ca_kv_sz
                    + (size_t)N * D * sizeof(float); /* split V space */
 
@@ -1799,8 +1800,9 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     CUdeviceptr d_attn   = r->scratch[2];
     CUdeviceptr d_normed = r->scratch[2] + (size_t)N * D * sizeof(float);
 
-    CUdeviceptr d_mod    = r->scratch[3];
-    CUdeviceptr d_temb   = d_mod + (size_t)6 * D * sizeof(float);
+    CUdeviceptr d_mod      = r->scratch[3];
+    CUdeviceptr d_mod_base = d_mod + (size_t)6 * D * sizeof(float);
+    CUdeviceptr d_temb     = d_mod_base + (size_t)6 * D * sizeof(float);
     CUdeviceptr d_cross_Q = d_temb + (size_t)D * sizeof(float);  /* t_emb is D floats, not 256 */
     CUdeviceptr d_ca_K   = d_cross_Q + (size_t)N * D * sizeof(float);
     CUdeviceptr d_ca_V   = d_ca_K + ca_kv_sz;
@@ -1849,6 +1851,10 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     RB(d_temb, (long)D);   /* manual_cast(t_emb, bf16) */
 
     if (r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_temb, 16); fprintf(stderr, "  t_emb_mlp: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
+
+    /* Shared adaLN modulation. The block loop only adds blk->mod_bias. */
+    t2_op_modulation(ops, stream, d_mod_base, d_temb,
+                     mod_w, mod_b, 0, D, 6 * D);
 
     /* Precompute cross-attention KV for all blocks if not cached.
      * KV depends on block weights (different per block) but NOT on timestep or x_t.
@@ -1919,10 +1925,9 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
          * already absorbs sub-bf16 weight differences, so it is omitted. Matmul
          * weights are bf16'd per-call by the bf16-GEMM path.) */
 
-        /* 3a. Modulation: SiLU(t_emb) @ mod_w + mod_b + block_bias -> [6*D] */
-        t2_op_modulation(ops, stream, d_mod, d_temb,
-                         mod_w, mod_b, blk->mod_bias,
-                         D, 6 * D);
+        /* 3a. Modulation: shared adaLN(t_emb) base + block_bias -> [6*D] */
+        t2_op_modulation_add_bias(ops, stream, d_mod, d_mod_base,
+                                  blk->mod_bias, 6 * D);
         RB(d_mod, (long)6 * D);
 
         if (bi == 0 && r->verbose >= 2) { cuStreamSynchronize(stream); float _d[8]; cuMemcpyDtoH(_d, d_mod, 32); fprintf(stderr, "  mod_block0: [:8]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3],_d[4],_d[5],_d[6],_d[7]); }

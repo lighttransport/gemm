@@ -65,6 +65,7 @@ typedef struct {
     CUfunction adaln;
     CUfunction gated_add;
     CUfunction modulation;
+    CUfunction modulation_add_bias;
     CUfunction rope_3d;
     CUfunction rms_norm_perhead;
     CUfunction conv3d_k3;
@@ -210,6 +211,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("adaln_f32",               adaln);
     GET_FN("gated_add_f32",           gated_add);
     GET_FN("modulation_f32",          modulation);
+    GET_FN("modulation_add_bias_f32", modulation_add_bias);
     GET_FN("rope_3d_f32",             rope_3d);
     GET_FN("rms_norm_perhead_f32",    rms_norm_perhead);
     GET_FN("conv3d_k3_f32",           conv3d_k3);
@@ -725,6 +727,17 @@ static inline void t2_op_modulation(t2_ops *ops, CUstream s,
     unsigned grid = (unsigned)(((size_t)out_dim + warps_per_block - 1) / warps_per_block);
     cuLaunchKernel(ops->modulation, grid, 1, 1,
                    256, 1, 1, (size_t)dim * sizeof(float), s, args, NULL);
+}
+
+static inline void t2_op_modulation_add_bias(t2_ops *ops, CUstream s,
+                                               CUdeviceptr out,
+                                               CUdeviceptr base,
+                                               CUdeviceptr blk_bias,
+                                               int n) {
+    void *args[] = {&out, &base, &blk_bias, &n};
+    cuLaunchKernel(ops->modulation_add_bias,
+                   (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
 }
 
 static inline void t2_op_rope_3d(t2_ops *ops, CUstream s,
