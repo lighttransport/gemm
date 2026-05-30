@@ -1,0 +1,5 @@
+# External reference checkout — cloned, not vendored into history.
+deepcompressor/
+# Generated reference tensors.
+dumps/
+__pycache__/
