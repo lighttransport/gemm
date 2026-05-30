@@ -65,6 +65,13 @@ int t2_pbr_write_colored_obj(const char *path,
                                int n_verts, int n_tris,
                                const t2_pbr_attr *colors);
 
+/* Write OBJ with colors sampled directly from the PBR field. This avoids a
+ * full per-vertex color array for large meshes. */
+int t2_pbr_write_sampled_colored_obj(const char *path,
+                                       const float *vertices, const int *triangles,
+                                       int n_verts, int n_tris,
+                                       const t2_pbr_field *field);
+
 /* Write OBJ + MTL with per-triangle UV mapping and PBR texture maps.
  * Generates: <base>.obj, <base>.mtl, <base>_basecolor.ppm,
  *            <base>_roughness.ppm, <base>_metallic.ppm
@@ -209,10 +216,71 @@ static int t2pbr_nearest(const t2_pbr_field *f, float fz, float fy, float fx,
     return 0;
 }
 
+static int t2pbr_sample_vertex_attr(const t2_pbr_field *field,
+                                     const float *vertex, int snap,
+                                     t2_pbr_attr *out, float voxel_pos[3]) {
+    float res = (float)field->resolution;
+    float vx = (vertex[0] + 0.5f) * res;
+    float vy = (vertex[1] + 0.5f) * res;
+    float vz = (vertex[2] + 0.5f) * res;
+    if (voxel_pos) {
+        voxel_pos[0] = vz;
+        voxel_pos[1] = vy;
+        voxel_pos[2] = vx;
+    }
+
+    float attr[6];
+    int hit_kind = 0;  /* 0=miss, 1=trilinear, 2=snap */
+    float w = t2pbr_trilinear(field, vz, vy, vx, attr);
+    if (w > 0) {
+        hit_kind = 1;
+    } else if (snap && t2pbr_nearest(field, vz, vy, vx, 4, attr)) {
+        hit_kind = 2;
+    }
+
+    out->r = attr[0];
+    out->g = attr[1];
+    out->b = attr[2];
+    out->metallic = attr[3];
+    out->roughness = attr[4];
+    out->alpha = attr[5];
+    return hit_kind;
+}
+
+static void t2pbr_update_vrange(const float voxel_pos[3],
+                                 float vmin[3], float vmax[3]) {
+    for (int a = 0; a < 3; a++) {
+        float v = voxel_pos[a];
+        if (v < vmin[a]) vmin[a] = v;
+        if (v > vmax[a]) vmax[a] = v;
+    }
+}
+
+static void t2pbr_print_sample_diag(const t2_pbr_field *field, int n_verts,
+                                     long hits, long snapped,
+                                     const float vmin[3], const float vmax[3]) {
+    int fmin[3] = {1<<30,1<<30,1<<30}, fmax[3] = {-(1<<30),-(1<<30),-(1<<30)};
+    for (int i = 0; i < field->N; i++) {
+        for (int a = 0; a < 3; a++) {
+            int c = field->coords[i*3+a];
+            if (c < fmin[a]) fmin[a] = c;
+            if (c > fmax[a]) fmax[a] = c;
+        }
+    }
+    long covered = hits + snapped;
+    fprintf(stderr,
+        "T2 PBR: %d verts: trilinear %ld (%.1f%%) + snap %ld -> covered %ld (%.1f%%); res=%d\n"
+        "  vertex->voxel range  z[%.1f,%.1f] y[%.1f,%.1f] x[%.1f,%.1f]\n"
+        "  field voxel range    z[%d,%d] y[%d,%d] x[%d,%d]\n",
+        n_verts, hits, 100.0 * hits / (n_verts ? n_verts : 1), snapped,
+        covered, 100.0 * covered / (n_verts ? n_verts : 1), field->resolution,
+        vmin[0], vmax[0], vmin[1], vmax[1], vmin[2], vmax[2],
+        fmin[0], fmax[0], fmin[1], fmax[1], fmin[2], fmax[2]);
+}
+
 void t2_pbr_sample_vertices(const t2_pbr_field *field,
                               const float *vertices, int n_verts,
                               t2_pbr_attr *out) {
-    float res = (float)field->resolution;
     int diag = 1;
     const char *qd = getenv("T2_PBR_QUIET"); if (qd && atoi(qd)) diag = 0;
     /* Trilinear miss falls back to nearest populated voxel (FDG dual-vertex
@@ -223,48 +291,18 @@ void t2_pbr_sample_vertices(const t2_pbr_field *field,
     long hits = 0, snapped = 0;
     float vmin[3] = {1e30f,1e30f,1e30f}, vmax[3] = {-1e30f,-1e30f,-1e30f};
     for (int i = 0; i < n_verts; i++) {
-        /* Vertex position [-0.5, 0.5] -> voxel coords [0, resolution) */
-        float vx = (vertices[i * 3 + 0] + 0.5f) * res;
-        float vy = (vertices[i * 3 + 1] + 0.5f) * res;
-        float vz = (vertices[i * 3 + 2] + 0.5f) * res;
-        if (diag) {
-            if (vz < vmin[0]) vmin[0] = vz; if (vz > vmax[0]) vmax[0] = vz;
-            if (vy < vmin[1]) vmin[1] = vy; if (vy > vmax[1]) vmax[1] = vy;
-            if (vx < vmin[2]) vmin[2] = vx; if (vx > vmax[2]) vmax[2] = vx;
-        }
-
-        float attr[6];
-        float w = t2pbr_trilinear(field, vz, vy, vx, attr);
-        if (w > 0) {
+        float voxel_pos[3];
+        int hit_kind = t2pbr_sample_vertex_attr(
+            field, vertices + i * 3, snap, &out[i], diag ? voxel_pos : NULL);
+        if (diag) t2pbr_update_vrange(voxel_pos, vmin, vmax);
+        if (hit_kind == 1) {
             hits++;
-        } else if (snap && t2pbr_nearest(field, vz, vy, vx, 4, attr)) {
+        } else if (hit_kind == 2) {
             snapped++;
         }
-
-        out[i].r = attr[0];
-        out[i].g = attr[1];
-        out[i].b = attr[2];
-        out[i].metallic = attr[3];
-        out[i].roughness = attr[4];
-        out[i].alpha = attr[5];
     }
     if (diag) {
-        /* Field coord ranges (z,y,x = hash axis0,1,2). */
-        int fmin[3] = {1<<30,1<<30,1<<30}, fmax[3] = {-(1<<30),-(1<<30),-(1<<30)};
-        for (int i = 0; i < field->N; i++)
-            for (int a = 0; a < 3; a++) {
-                int c = field->coords[i*3+a];
-                if (c < fmin[a]) fmin[a] = c; if (c > fmax[a]) fmax[a] = c;
-            }
-        long covered = hits + snapped;
-        fprintf(stderr,
-            "T2 PBR: %d verts: trilinear %ld (%.1f%%) + snap %ld -> covered %ld (%.1f%%); res=%.0f\n"
-            "  vertex->voxel range  z[%.1f,%.1f] y[%.1f,%.1f] x[%.1f,%.1f]\n"
-            "  field voxel range    z[%d,%d] y[%d,%d] x[%d,%d]\n",
-            n_verts, hits, 100.0 * hits / (n_verts ? n_verts : 1), snapped,
-            covered, 100.0 * covered / (n_verts ? n_verts : 1), res,
-            vmin[0], vmax[0], vmin[1], vmax[1], vmin[2], vmax[2],
-            fmin[0], fmax[0], fmin[1], fmax[1], fmin[2], fmax[2]);
+        t2pbr_print_sample_diag(field, n_verts, hits, snapped, vmin, vmax);
     }
 }
 
@@ -290,6 +328,52 @@ int t2_pbr_write_colored_obj(const char *path,
     }
 
     /* Write faces (1-indexed) */
+    for (int i = 0; i < n_tris; i++) {
+        fprintf(f, "f %d %d %d\n",
+                triangles[i*3]+1, triangles[i*3+1]+1, triangles[i*3+2]+1);
+    }
+
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%d verts, %d tris, with vertex colors)\n",
+            path, n_verts, n_tris);
+    return 0;
+}
+
+int t2_pbr_write_sampled_colored_obj(const char *path,
+                                       const float *vertices, const int *triangles,
+                                       int n_verts, int n_tris,
+                                       const t2_pbr_field *field) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "# TRELLIS.2 textured mesh: %d verts, %d tris\n", n_verts, n_tris);
+
+    int diag = 1;
+    const char *qd = getenv("T2_PBR_QUIET"); if (qd && atoi(qd)) diag = 0;
+    int snap = 1;
+    const char *ns = getenv("T2_PBR_NO_SNAP"); if (ns && atoi(ns)) snap = 0;
+    long hits = 0, snapped = 0;
+    float vmin[3] = {1e30f,1e30f,1e30f}, vmax[3] = {-1e30f,-1e30f,-1e30f};
+
+    for (int i = 0; i < n_verts; i++) {
+        t2_pbr_attr color;
+        float voxel_pos[3];
+        int hit_kind = t2pbr_sample_vertex_attr(
+            field, vertices + i * 3, snap, &color, diag ? voxel_pos : NULL);
+        if (diag) t2pbr_update_vrange(voxel_pos, vmin, vmax);
+        if (hit_kind == 1) {
+            hits++;
+        } else if (hit_kind == 2) {
+            snapped++;
+        }
+        fprintf(f, "v %f %f %f %f %f %f\n",
+                vertices[i*3], vertices[i*3+1], vertices[i*3+2],
+                color.r, color.g, color.b);
+    }
+
+    if (diag) {
+        t2pbr_print_sample_diag(field, n_verts, hits, snapped, vmin, vmax);
+    }
+
     for (int i = 0; i < n_tris; i++) {
         fprintf(f, "f %d %d %d\n",
                 triangles[i*3]+1, triangles[i*3+1]+1, triangles[i*3+2]+1);
