@@ -107,9 +107,9 @@
 > (1.9×), quality-neutral (single-step cosine Δ7e-7). **Build gotcha: the Makefile
 > tracks only .c deps — `touch` a .c after editing any header or it won't rebuild.**
 >
-> Remaining: the cuBLAS/plain output-GEMM zero bug (group=25 sidesteps it); optional bf16-block
-> Stage-2 to close the 0.985 CFG-amplified gap. **Stage-2/3 FULL-sampler parity DONE; lazy
-> per-stage DiT load DONE (peak 12.7→5.3 GB) — see below.**
+> Remaining: the cuBLAS/plain output-GEMM zero bug (group=25 sidesteps it). **Stage-2/3 FULL-sampler
+> parity DONE; lazy per-stage DiT load DONE (peak 12.7→5.3 GB); Stage-2 bf16-block (`T2_SLAT_BF16`)
+> measured = 0.986, the CFG-amplified cross-impl floor, NOT 0.999 — see below.**
 >
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
@@ -135,10 +135,26 @@
 > - **S3 full sampler: cosine 0.99998** (relL2 6.4e-3) — essentially exact. S3 has
 >   `guidance_strength=1.0` (CFG OFF), so it integrates only the raw per-step f16-vs-bf16
 >   diff. S2's 0.015 residual = its CFG=7.5 **amplifying** that same per-step diff ~7.5×
->   before compounding. Neither sampler has a logic error; a bf16-block S2 mode would close it.
+>   before compounding. Neither sampler has a logic error.
 > - Inputs: S2 `verify_stage2_full <s2.st> 06_…noise 06b_…coords 06b_…cond 07_…raw [cfg_rescale]`;
 >   S3 `verify_stage3_full <s3.st> 09_…noise 10_…concat_cond 10b_…coords 06b_…cond 11_…raw`.
 >   `neg_cond` is confirmed zero (dump_ground_truth.py:271) so the harness's zero uncond is right.
+>
+> ## STAGE-2 0.999 ATTEMPT → measured the floor: bf16-block `T2_SLAT_BF16` = 0.986, NOT 0.999 (2026-05-30)
+>
+> Implemented the predicted bf16-block port (`T2_SLAT_BF16`, default OFF; same mechanism as Stage-1
+> `T2_DIT_BF16`, requires `T2_DIT_F32=1`). **It does NOT reach 0.999 — the gap is an irreducible
+> cross-impl floor, not a bug.** `verify_stage2_full` cosine: F16 0.985372, F32+TF32 0.985343,
+> **F32+bf16-block 0.986218** (+0.0008 only). Three facts pin it: (1) sampler math provably matches
+> PyTorch incl. the CFG-rescale std — `SparseTensor.std(dim=[1])`=mean over ch THEN segment_reduce over
+> voxels = per-sample/global std for B=1, == our harness (modulo Bessel); (2) F16≈F32 so it is NOT
+> precision (bf16-block helps far less than Stage-1's 0.989→0.997 jump → most of the gap is the
+> materialized-MMA-vs-flash-attn per-step diff, identical in F16/F32); (3) magnitude fits CFG exactly:
+> single-step 0.99995 → per-step relL2 0.010, full relL2 0.173 = 17.3× ≈ guidance 7.5 × √9 guided steps.
+> **0.999 needs bit-exact PyTorch bf16+flash-attn replication — same floor as Stage-1's ~0.9975, larger
+> due to CFG.** Best = `T2_SLAT_BF16` 0.986, kept as default-OFF parity scaffolding (e2e stays F16 for
+> speed). Decisive next test (re-dump `07` to measure reference backend floor) blocked by sparse-flow
+> ext deps the PyTorch stub lacks. Full analysis: `doc/trellis-2.md` "T2_SLAT_BF16 bf16-block mode".
 
 The section below is the ORIGINAL shape-decoder resume prompt (rel L2 ~5e-7 on
 the Fujisan `N=128` SC-VAE smoke). That work is done; kept for reference.
