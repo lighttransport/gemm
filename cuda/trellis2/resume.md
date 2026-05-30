@@ -194,6 +194,20 @@
 > in `real 87.50`: Stage1/2/3 sampler `19.9/14.8/8.9 s`, shape `1,403,042 verts / 3,048,684 tris`,
 > and PBR `99.7%` trilinear / `100%` covered.
 >
+> ## LOAD PERF: GPU BF16→F32 DiT weight upload — e2e 87.5→64.0 s (2026-05-30)
+>
+> F32 DiT loads used to convert every BF16 safetensors tensor to F32 on CPU, then upload 4-byte
+> weights. New loader path uploads raw BF16 and expands to identical F32 on GPU with
+> `t2_cast_bf16_to_f32`, halving H2D traffic for all Stage 1/2/3 DiTs. `T2_CPU_BF16_UPLOAD=1`
+> restores the old CPU conversion path for A/B.
+>
+> Measured load timings, GPU BF16 upload vs CPU conversion: Stage1 `1.03 s` vs `8.42 s`, Stage2
+> `0.89 s` vs `8.39 s`, Stage3 `0.94 s` vs `8.91 s`. Sampler outputs are unchanged: Stage1
+> single-forward metrics identical, Stage2 full sampler still cosine `0.985379`, Stage3 full sampler
+> still cosine `0.999980`; prior full-run dumps compare byte-identical (`stage1`, `stage2`,
+> `tex_coords`, `tex_feats`). Full textured e2e with cached kernels is now `real 64.04`, same
+> `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
