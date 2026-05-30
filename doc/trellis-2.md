@@ -1012,6 +1012,41 @@ call, so the decoder's exact-f32 path is untouched. Env opt-out `T2_DIT_NO_TF32=
 Remaining: Stage-2/3 FULL-sampler parity (only single-step verified); lower the ~12.7 GB DiT
 *loading* peak (all stages load upfront) via lazy per-stage load.
 
+### DiT profiling → Stage-2/3 cuBLAS-TF32 + modulation fix — DiT 100→74 s (2026-05-30)
+
+`nsys` kernel profiling of the full Stage-2 sampler (`verify_stage2_full`) pinned the DiT-forward
+cost: **`gemm_f16_f32` 46.7%, `attn_mma_hd128_f32` 34.8%, `modulation_f32` 10.1%**, rope 4.4%, the
+rest ~4%. Two of these were inefficiencies, not inherent cost:
+
+1. **`modulation_f32` was launched as a SINGLE block** (`grid=1`, 256 threads) for a
+   `[9216,1536]·[1536]` adaLN mod matvec — using 1 of ~50 SMs, with uncoalesced stride-1536 reads
+   → 6.4 ms/call. Rewrote it **warp-per-row** (one warp per output row, coalesced dot + warp-shuffle
+   reduction, grid = `ceil(out_dim/8)` blocks). ~10% off **every** stage (Stage 1 38.4→34.2 s),
+   numerically equivalent (Stage-2 cosine 0.985372→0.985397, a benign reduction-order delta).
+
+2. **Stage 2/3 used the hand-written F16-MMA `gemm_f16_f32`** — profiling showed it was the #1 cost
+   *and* slower per-voxel than Stage 1's cuBLAS TF32 despite fewer tokens. Switched the Stage-2/3
+   default from F16-MMA to **F32 + cuBLAS TF32** (matches Stage 1; `T2_DIT_F16=1` restores the old
+   MMA path). cuBLAS TF32 = **1.36×** on the Stage-2 sampler (1924→1417 ms/forward), equivalent
+   accuracy (cosine 0.985372→0.985343). VRAM (F32 5.3 GB vs F16 2.5 GB) is fine under the default
+   lazy per-stage load (one DiT resident). Combined with (1): **Stage-2 1924→1243 ms/forward (1.55×)**.
+
+End-to-end DiT (RTX 5060 Ti, 12-step CFG, ~3519 sparse voxels):
+
+| Stage | before | after | speedup |
+|-------|--------|-------|---------|
+| Stage 1 (dense 4096) | 38.4 s | **34.2 s** | 1.12× (modulation only — already cuBLAS) |
+| Stage 2 (sparse shape) | 38.6 s | **24.9 s** | **1.55×** |
+| Stage 3 (sparse tex) | 23.2 s | **14.9 s** | **1.56×** |
+| **DiT total** | **100.2 s** | **74.0 s** | **1.35× (−26 s)** |
+
+Mesh output unchanged in quality (1.47 M verts, 3.22 M tris, 99.7% trilinear / 100% covered); the
+final voxel count shifts <1% (1.462 M→1.472 M) from the F16-vs-TF32 Stage-2 numerical difference,
+both equally ~0.985 vs PyTorch. **Next levers** (untouched): `attn_mma_hd128_f32` (34.8%, the
+materialized O(N²) self-attn — would need an FA2-style kernel, larger effort) and the two decoders
+(~28 s combined, dominated by the `c2s 128→64` upsample to 1.47 M voxels at ~5 s and the
+329 K-voxel stage-3 ConvNeXt at ~3.3 s). `verify_stage2_full` now prints `>>> Sampler loop: … ms/forward`.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`

@@ -1059,9 +1059,14 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
     if (!st) return -1;
     fprintf(stderr, "T2: loading %s from %s (%d tensors)\n", label, path, st->n_tensors);
     int v = r->verbose;
-    /* Stage 2/3 (sparse) default to fp16: measured bit-faithful vs PyTorch
-     * (corr 0.9999 == F32) and these are the slow stages. T2_DIT_F32=1 forces F32. */
-    int use_f16 = t2_dit_use_f16(r, 1);
+    /* Stage 2/3 (sparse) default to F32 + cuBLAS TF32 (matches Stage 1). Profiling
+     * (nsys, 2026-05-30) showed the hand-written F16-MMA gemm_f16_f32 was the #1
+     * Stage-2 cost (46.7%) and SLOWER per-token than Stage 1's cuBLAS TF32, despite
+     * fewer voxels: full Stage-2 sampler 1924 -> 1417 ms/forward (1.36x) switching
+     * F16-MMA -> cuBLAS TF32, with equivalent accuracy (cosine 0.985372 -> 0.985343).
+     * VRAM (F32 = 5.3 GB vs F16 2.5 GB) is fine under the default lazy per-stage load
+     * (one DiT resident at a time). T2_DIT_F16=1 forces the old fp16 MMA path. */
+    int use_f16 = t2_dit_use_f16(r, 0);
 
     m->n_blocks = DIT_DEPTH;
     m->model_channels = DIT_DIM;
