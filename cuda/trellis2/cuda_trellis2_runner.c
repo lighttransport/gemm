@@ -2023,15 +2023,36 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
     int saved_f32 = r->ops.use_f32_gemm;
     int saved_mma = r->ops.use_mma_gemm;
     int saved_tf32 = r->ops.use_tf32_gemm;
+    int saved_bf16 = r->ops.use_bf16_gemm;
+    int saved_round = r->ops.bf16_round;
     if (m->use_f16) {
         r->ops.use_f32_gemm = 0;
         r->ops.use_mma_gemm = 1;
     } else {
         r->ops.use_f32_gemm = 1;
         r->ops.use_mma_gemm = 0;
-        /* F32 sparse DiT (only under T2_DIT_F32): TF32 tensor cores, as Stage 1. */
-        const char *no_tf32 = getenv("T2_DIT_NO_TF32");
-        r->ops.use_tf32_gemm = (r->ops.cublas && !(no_tf32 && atoi(no_tf32))) ? 1 : 0;
+        /* T2_SLAT_BF16=1 (default OFF): bf16 DiT-block port for the sparse Stage 2/3
+         * flows — identical mechanism to Stage 1's T2_DIT_BF16. PyTorch runs the SLAT
+         * flow blocks in bf16, and Stage 2's CFG=7.5 amplifies the per-step f16-vs-bf16
+         * difference ~7.5x (hence full-sampler cosine 0.985 vs 07 despite single-step
+         * 0.99995). Replicating bf16 should recover it. REQUIRES F32-loaded weights
+         * (run with T2_DIT_F32=1): the per-GEMM F32->bf16 cast then recovers the exact
+         * original bf16 (bf16->F32 at load is lossless; F16-loaded weights would be
+         * doubly lossy and the cast kernel expects F32 input). bf16_round rounds every
+         * block-op output; use_bf16_gemm makes block matmuls true bf16; x_emb/out stay
+         * f32 (suppressed inside run_dit_forward_generic). Stage 3 has no CFG so it is
+         * already 0.99998 and gains little; the lever is Stage 2. */
+        const char *want_bf16 = getenv("T2_SLAT_BF16");
+        if (want_bf16 && atoi(want_bf16) && r->ops.cublas &&
+            r->ops.cast_f32_to_bf16 && r->ops.round_bf16) {
+            r->ops.use_bf16_gemm = 1;
+            r->ops.bf16_round = 1;
+            r->ops.use_tf32_gemm = 0;
+        } else {
+            /* F32 sparse DiT (only under T2_DIT_F32): TF32 tensor cores, as Stage 1. */
+            const char *no_tf32 = getenv("T2_DIT_NO_TF32");
+            r->ops.use_tf32_gemm = (r->ops.cublas && !(no_tf32 && atoi(no_tf32))) ? 1 : 0;
+        }
     }
 
     run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
@@ -2047,6 +2068,8 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
     r->ops.use_f32_gemm = saved_f32;
     r->ops.use_mma_gemm = saved_mma;
     r->ops.use_tf32_gemm = saved_tf32;
+    r->ops.use_bf16_gemm = saved_bf16;
+    r->ops.bf16_round = saved_round;
 }
 
 /* ======================================================================== */

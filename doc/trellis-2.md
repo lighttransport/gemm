@@ -1103,7 +1103,8 @@ full-sampler parity vs `07`:
 The residual 0.015 (0.985, not ~1.0 like the single step) is the **same fp16-vs-PyTorch-bf16 per-step
 compounding** characterized for Stage 1: the single forward is corr 0.99995, but 12 recursive Euler
 steps integrate the per-step f16/TF32-vs-bf16 difference. A Stage-2 "bf16-block" mode (analogous to
-`T2_DIT_BF16` for Stage 1) would likely recover it; deferred. All six sampler params (steps=12,
+`T2_DIT_BF16` for Stage 1) was then implemented as `T2_SLAT_BF16` (see the dated note below) — it
+improves but does **not** close the gap, confirming a cross-implementation floor. All six sampler params (steps=12,
 rescale_t=3.0, strength=7.5, rescale=0.5, interval=[0.6,1.0], σ_min=1e-5) now match pipeline.json.
 Stage 3 (`tex_slat_sampler`) has `guidance_strength=1.0` → CFG fully disabled, so its
 `guidance_interval=[0.6,0.9]`/`guidance_rescale=0.0` are moot and the harness is already correct there.
@@ -1116,9 +1117,55 @@ each step's DiT input is the `[N,64]` concat of the current state with concat_co
 (CFG fully disabled), so it integrates only the *raw* per-step f16-vs-bf16 difference → near-perfect.
 Stage 2's larger 0.015 residual is therefore explained: its `guidance_strength=7.5` **amplifies** that
 same per-step difference ~7.5× before it compounds over 12 Euler steps. So neither sampler has a logic
-error — Stage-2's gap is CFG-amplified precision (a bf16-block Stage-2 mode would close it), and the
+error — Stage-2's gap is CFG-amplified precision (the `T2_SLAT_BF16` mode below tests this directly), and the
 no-CFG Stage-3 path is verified bit-close. Summary: single-step S2 0.99995 / S3 ~1.0; full-sampler
 **S2 0.985, S3 0.99998.**
+
+### Stage-2 `T2_SLAT_BF16` bf16-block mode — measured the floor: 0.985 → 0.986, not 0.999 (2026-05-30)
+
+Implemented the predicted bf16-block port for the sparse SLAT flows as `T2_SLAT_BF16` (default OFF;
+in `run_sparse_dit_forward`, the exact mechanism as Stage 1's `T2_DIT_BF16`: `use_bf16_gemm=1` +
+`bf16_round=1`, x_emb/out stay f32; requires F32-loaded weights, i.e. run with `T2_DIT_F32=1` so the
+per-GEMM F32→bf16 cast recovers the original bf16 exactly). Goal was Stage-2 full-sampler cosine 0.999.
+**Result: it does not get there. The gap is a genuine cross-implementation floor, not a fixable bug.**
+
+`verify_stage2_full` (cosine vs `07_shape_slat_raw_feats`):
+
+| Stage-2 precision mode | full-sampler cosine |
+|---|---|
+| F16 weights + f16-MMA (default) | 0.985372 |
+| F32 weights + TF32 (`T2_DIT_F32=1`) | 0.985343 |
+| F32 weights + **bf16-block** (`T2_DIT_F32=1 T2_SLAT_BF16=1`) | **0.986218** |
+
+Three independent facts pin the residual to an *irreducible* per-step cross-implementation difference,
+amplified by CFG — **not** a sampler-logic or precision bug we can chase to 0.999:
+
+1. **The sampler math is provably correct.** Verified line-by-line against the TRELLIS.2 PyTorch source
+   (`flow_euler.py`, `classifier_free_guidance_mixin.py`, `guidance_interval_mixin.py`): the t-schedule
+   `t·rt/(1+(rt−1)·t)`, the interval check on the *rescaled* t, the CFG combine
+   `strength·v_cond+(1−strength)·v_uncond`, and the CFG-rescale std-matching all match. The one subtle
+   point — PyTorch's CFG-rescale std is `x_0.std(dim=list(range(1,ndim)))`, and `SparseTensor` has
+   `ndim=2`/`shape=[B,32]`, so `reduce(dim=[1])` means `feats.mean(dim=1)` *then* `segment_reduce` over
+   voxels per batch = a per-sample (for B=1, **global**) std, exactly what our harness computes (modulo a
+   negligible Bessel `/(n−1)` vs `/n`). No bug.
+2. **It is not block precision.** F16 (0.985372) ≈ F32+TF32 (0.985343); matching PyTorch's bf16 round
+   points (bf16-block) only nudges it to 0.986218 (+0.0008). If the gap were weight/GEMM precision, F32
+   would beat F16 and bf16-block would jump like Stage 1 did (0.989→0.997). It does neither — bf16-block
+   helps *less* here than for Stage 1, which means most of the Stage-2 gap is something bf16-block does
+   not touch (the materialized-f16-MMA-vs-flash-attn per-step difference, identical in F16 and F32).
+3. **The magnitude is exactly what CFG=7.5 predicts.** Single-step forward is cosine 0.99995 → per-step
+   relL2 ≈ 0.010. Full-sampler relL2 ≈ 0.173 (cosine 0.985). That is 17.3× growth — squarely within the
+   `guidance_strength=7.5` × √(9 guided steps) = 22.5 upper bound. Stage 2 amplifies the faithful-but-
+   not-bit-exact per-step velocity ~7.5× in `(v_cond−v_uncond)` and compounds it over the 9 guided Euler
+   steps. Stage 3 (no CFG, strength=1.0) integrates the *raw* per-step diff → 0.99998, the unamplified floor.
+
+**Conclusion: 0.999 for Stage 2 is not reachable without bit-exactly replicating PyTorch's bf16+flash-attn
+forward** (the same irreducible floor as Stage-1's ~0.9975, just larger because CFG amplifies it). The
+best achievable here is `T2_SLAT_BF16` = **0.986**, which is the principled reference-matching mode and is
+kept as default-OFF scaffolding (the e2e default stays F16 Stage-2/3 for speed; this is correctness-parity
+tooling, not a quality lever). The decisive remaining confirmation — re-dumping `07` in this environment to
+measure the reference's own backend reproducibility floor — is blocked by the sparse-flow ext deps the
+PyTorch stub does not cover (`flex_gemm`/sparse-attn), so it is left as future work.
 
 ### Lazy per-stage DiT load — GPU peak 12.7 GB → 5.3 GB (2026-05-30)
 
