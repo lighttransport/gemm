@@ -54,6 +54,25 @@ Writes `V=18439 F=36874` (~1.2 MiB OBJ) on the human_object sample.
 - `verify_end_to_end` — scaffold only, mirrors the CUDA status (the
   upstream pipeline isn't wired into the verifier yet).
 
+## Speed — BF16 WMMA GEMM for the encoder (commit 6f9f1c0)
+
+The encoder backbone (DINOv3-H+ / ViT-H, ~9 GEMMs/block × 32 blocks — the
+dominant cost) stores F16 weights, so `gemm_f16w_bf16a_wmma_t` is an F16-weight
+variant of sam3d's BF16 WMMA kernel (`half_to_float` at SMEM load, RNE bf16 for
+both operands, matching the encoder's existing bf16-rounded activation path). An
+`sb_enc_gemm()` dispatcher routes all 9 encoder GEMMs through it, gated by
+`SAM3D_BODY_WMMA` (default on; `=0` = exact F16-tiled path). Decoder (6 layers,
+145 tokens) stays on `gemm_f32_bias` — too small for the 128-tile WMMA.
+
+Quality: DINOv3 is the precision floor (verify_dinov3 max_abs 0.54 vs gate 1.5),
+but the e2e mesh tolerates bf16 well — body OBJ on dancing.jpg (V=18439 F=36874,
+identical topology) shows mean vertex displacement 0.0017 / max 0.0039 on a 1.725
+bbox diagonal (0.099% / 0.22%), zero nonfinite, WMMA vs F16-tiled.
+
+The sam3d PPE `-ffast-math`/`isfinite` NaN fix has no analogue here: sam3d_body
+masks invalid points via explicit host-passed `int *invalid` flags, not runtime
+`isfinite`.
+
 ## Reproducing the dumps
 
 The `/tmp/sam3d_body_ref/` dumps come from a CUDA host running
