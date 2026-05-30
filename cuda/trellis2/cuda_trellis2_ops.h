@@ -92,9 +92,12 @@ typedef struct {
     CUfunction attn_mma_hd128;
 
     /* Sparse conv kernels */
+    CUfunction sparse_hash_insert_coords;
     CUfunction sparse_build_gather_map;
     CUfunction sparse_gather;
     CUfunction sparse_pack_from_gather_map;
+    CUfunction c2s_count_subdiv;
+    CUfunction c2s_write_subdiv_stable;
     CUfunction sparse_pack_rows;
     CUfunction scatter_add_rows;
     CUfunction scatter_add;
@@ -218,9 +221,12 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     }
 
     /* Sparse conv kernels */
+    GET_FN("sparse_hash_insert_coords_f32", sparse_hash_insert_coords);
     GET_FN("sparse_build_gather_map_f32", sparse_build_gather_map);
     GET_FN("sparse_gather_f32",           sparse_gather);
     GET_FN("sparse_pack_from_gather_map_f32", sparse_pack_from_gather_map);
+    GET_FN("c2s_count_subdiv_f32",        c2s_count_subdiv);
+    GET_FN("c2s_write_subdiv_stable_f32", c2s_write_subdiv_stable);
     GET_FN("sparse_pack_rows_f32",        sparse_pack_rows);
     GET_FN("scatter_add_rows_f32",        scatter_add_rows);
     GET_FN("scatter_add_f32",             scatter_add);
@@ -895,6 +901,18 @@ static inline void t2_op_pixel_shuffle_3d(t2_ops *ops, CUstream s,
 /* Sparse convolution ops                                                    */
 /* ======================================================================== */
 
+/* Build hash table from coords on GPU. hash_keys must be initialized to
+ * 0xffffffffffffffff and hash_vals to -1 before launch. */
+static inline void t2_op_sparse_hash_insert_coords(t2_ops *ops, CUstream s,
+                                                     CUdeviceptr hash_keys,
+                                                     CUdeviceptr hash_vals,
+                                                     CUdeviceptr coords,
+                                                     int N, int hash_cap) {
+    void *args[] = {&hash_keys, &hash_vals, &coords, &N, &hash_cap};
+    cuLaunchKernel(ops->sparse_hash_insert_coords, (unsigned)((N + 255) / 256),
+                   1, 1, 256, 1, 1, 0, s, args, NULL);
+}
+
 /* Build gather map: for each voxel, find neighbor indices via hash table.
  * out_map: [N, 27] int32 on GPU */
 static inline void t2_op_sparse_build_gather_map(t2_ops *ops, CUstream s,
@@ -918,6 +936,30 @@ static inline void t2_op_sparse_gather(t2_ops *ops, CUstream s,
     int total = N * C;
     void *args[] = {&gathered, &feats, &gather_map, &N, &C, &k_idx};
     cuLaunchKernel(ops->sparse_gather, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_c2s_count_subdiv(t2_ops *ops, CUstream s,
+                                            CUdeviceptr counts,
+                                            CUdeviceptr logits,
+                                            int N, int dense) {
+    void *args[] = {&counts, &logits, &N, &dense};
+    cuLaunchKernel(ops->c2s_count_subdiv, (unsigned)((N + 255) / 256),
+                   1, 1, 256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_c2s_write_subdiv_stable(t2_ops *ops, CUstream s,
+                                                   CUdeviceptr out_idx,
+                                                   CUdeviceptr out_subidx,
+                                                   CUdeviceptr out_coords,
+                                                   CUdeviceptr offsets,
+                                                   CUdeviceptr logits,
+                                                   CUdeviceptr coords,
+                                                   int N, int dense) {
+    void *args[] = {&out_idx, &out_subidx, &out_coords, &offsets,
+                    &logits, &coords, &N, &dense};
+    cuLaunchKernel(ops->c2s_write_subdiv_stable,
+                   (unsigned)((N + 255) / 256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
 }
 
