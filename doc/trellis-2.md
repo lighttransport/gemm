@@ -1228,6 +1228,11 @@ full-run dumps remain byte-identical to the prior GPU-DiT-load run for Stage 1, 
 coords, and texture features. Mesh/PBR output is unchanged: `1,403,042` verts / `3,048,684` tris,
 PBR `99.7%` trilinear / `100%` covered.
 
+The same F16 upload helper is also used by the dense Stage 1 occupancy decoder. Its load time is small
+but now visible under `T2_TIMING`: CPU conversion `0.28 s`, GPU expansion `0.05 s`. `verify_decoder`
+metrics are unchanged, and the final full e2e is `real 56.85` with byte-identical dumps versus the
+previous SC-VAE-load run.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
