@@ -245,6 +245,16 @@ struct cuda_trellis2_runner {
      * decoder (which has no to_subdiv head). Indexed by C2S stage (0..3). */
     t2_subdiv_stage subdiv_plan[8];
 
+    /* Cached packed-sparse-conv index set for the current resolution level. The
+     * pack (27 src/dst index arrays) is a pure function of (coords, hash) and is
+     * IDENTICAL across all ConvNeXt blocks at a level, but t2_sparse_conv_pack_build
+     * is host-side (N*27 CPU hash lookups + up to 54 HtoD uploads). Caching it keyed
+     * on (coords ptr, N) turns the per-block rebuild into one build per level. */
+    t2_sparse_conv_pack pack_cache;
+    const int32_t *pack_cache_coords;
+    int pack_cache_N;
+    int pack_cache_valid;
+
     /* Cross-attention KV cache (precomputed per-block, reused across timesteps).
      * Slot 0 is the active nonzero condition, slot 1 is the all-zero CFG condition. */
     CUdeviceptr ca_kv_cache_K[2][DIT_DEPTH];
@@ -663,9 +673,16 @@ void cuda_trellis2_free_buffer(void *p) {
     free(p);
 }
 
+static void t2_sparse_conv_pack_free(t2_sparse_conv_pack *pack);  /* defined below */
+
 void cuda_trellis2_free(cuda_trellis2_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->context);
+
+    if (r->pack_cache_valid) {
+        t2_sparse_conv_pack_free(&r->pack_cache);
+        r->pack_cache_valid = 0;
+    }
 
     for (int i = 0; i < 12; i++)
         CU_FREE(r->scratch[i]);
@@ -2748,12 +2765,27 @@ static void t2_run_sparse_conv3d(cuda_trellis2_runner *r,
                                              stage, block, op, NULL);
     if (ops->use_f32_gemm && use_packed && hash &&
         ops->sparse_pack_rows && ops->scatter_add_rows) {
-        t2_sparse_conv_pack pack;
-        if (t2_sparse_conv_pack_build(coords, N, hash, &pack) == 0) {
+        /* Reuse the level-cached pack if it matches (coords ptr + N). Every
+         * ConvNeXt block at a resolution level — and the c2s conv1 — share the
+         * same pack; only a new level (c2s conv2 onward) rebuilds it. This turns
+         * the host-side build (N*27 CPU hash lookups + up to 54 HtoD) from
+         * once-per-conv into once-per-level. */
+        if (!(r->pack_cache_valid && r->pack_cache_coords == coords &&
+              r->pack_cache_N == N)) {
+            if (r->pack_cache_valid) {
+                t2_sparse_conv_pack_free(&r->pack_cache);
+                r->pack_cache_valid = 0;
+            }
+            if (t2_sparse_conv_pack_build(coords, N, hash, &r->pack_cache) == 0) {
+                r->pack_cache_coords = coords;
+                r->pack_cache_N = N;
+                r->pack_cache_valid = 1;
+            }
+        }
+        if (r->pack_cache_valid) {
             t2_op_sparse_conv3d_packed(ops, r->stream, dst, feats, weight, bias,
-                                       &pack, scratch, scratch2, in_C, out_C,
-                                       N, use_lt);
-            t2_sparse_conv_pack_free(&pack);
+                                       &r->pack_cache, scratch, scratch2,
+                                       in_C, out_C, N, use_lt);
             return;
         }
         fprintf(stderr, "T2: packed sparse conv setup failed; using gather-GEMM\n");
@@ -2979,6 +3011,15 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     *out_coords = NULL;
     if (out_N) *out_N = 0;
     if (out_C) *out_C = 0;
+
+    /* Invalidate any packed-conv pack cached from a prior decode (its coords
+     * pointer could alias a new allocation and cause a false hit). */
+    if (r->pack_cache_valid) {
+        t2_sparse_conv_pack_free(&r->pack_cache);
+        r->pack_cache_valid = 0;
+    }
+    r->pack_cache_coords = NULL;
+    r->pack_cache_N = 0;
 
     /* Match GEMM mode to the loaded shape decoder weight precision. */
     int saved_f32 = ops->use_f32_gemm;
@@ -3574,6 +3615,10 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     cuMemFree(d_feats);
     cuMemFree(d_coords);
     t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+    if (r->pack_cache_valid) {
+        t2_sparse_conv_pack_free(&r->pack_cache);
+        r->pack_cache_valid = 0;
+    }
 
     T2_RESTORE_SCVAE_GEMM();
     #undef T2_RESTORE_SCVAE_GEMM
