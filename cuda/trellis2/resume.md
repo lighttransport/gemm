@@ -172,6 +172,28 @@
 > all 4 shape subdivisions, PBR coverage `99.7%` trilinear / `100%` covered. Full-run decoder C2S
 > stage-3 timings were shape `558.7 ms`, texture `509.2 ms`.
 >
+> ## DECODER PERF #3: GPU subdivision + sparse hash/index — shape decoder 11.5→6.5 s (2026-05-30)
+>
+> The remaining C2S host work is now mostly gone. Shape-decoder subdivision uses a stable GPU
+> count/prefix/write path (`c2s_count_subdiv_f32` + `c2s_write_subdiv_stable_f32`), preserving the
+> exact CPU parent/child row order. Sparse hash/index construction now defaults to GPU
+> `sparse_hash_insert_coords_f32` + gather-map build, so the finest level no longer spends ~190 ms
+> on CPU hash construction/upload. Packed sparse conv is now default-on; opt out with
+> `T2_SCVAE_NO_PACKED_CONV=1` or `T2_SCVAE_PACKED_CONV=0`.
+>
+> Legacy toggles for A/B: `T2_SCVAE_CPU_SUBDIV=1`, `T2_SCVAE_CPU_HASH_BUILD=1`,
+> `T2_SCVAE_CPU_GATHER_MAP=1`, and `T2_SCVAE_CPU_PACK_BUILD=1`. `T2_SCVAE_CPU_PACK_BUILD=1` now also
+> keeps a CPU hash available so the legacy pack builder is actually exercised. `T2_TIMING=1` prints
+> load/index/pack/subdivision timings. DiT loaders also skip unused GPU→CPU block copies in the
+> default full-GPU path; `T2_DIT_KEEP_CPU_BLOCKS=1` keeps the old copies for streaming/debug.
+>
+> A/B verifier on T.png dumps is exact: GPU-default vs CPU-subdiv/hash/pack output
+> **byte-identical** (`max_abs=0`, `rel_L2=0`, coord mismatches `0`). Focused shape-decoder cached
+> wall time: CPU fallback `real 11.54` → GPU default `real 6.52`. Finest-level sparse index:
+> `190.6→38.3 ms`; finest C2S: `4149.8→392.8 ms`. Full textured e2e with the new defaults completed
+> in `real 87.50`: Stage1/2/3 sampler `19.9/14.8/8.9 s`, shape `1,403,042 verts / 3,048,684 tris`,
+> and PBR `99.7%` trilinear / `100%` covered.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
