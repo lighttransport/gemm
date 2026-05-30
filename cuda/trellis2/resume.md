@@ -225,6 +225,18 @@
 > `0.28→0.05 s`, verifier metrics unchanged, final e2e `real 56.85` and byte-identical to the
 > previous run.
 >
+> ## SPARSE DiT SETUP CACHE — remove repeated Stage-2/3 RoPE + cond uploads (2026-05-31)
+>
+> Stage-2/3 sparse DiT wrappers rebuilt CPU RoPE tables and uploaded them every sampler forward even
+> though coords are constant for the stage. They also uploaded the conditioning tensor every forward
+> even after the cross-attn KV cache was hot. Runner now caches sparse RoPE tables per model id keyed
+> on `(coords hash, N, n_freqs)` and skips cond HtoD when KV cache matches
+> `(model_id, cond_hash, n_blocks)`. Unload/free paths release the cached RoPE buffers.
+>
+> This is a setup/VRAM-transient cleanup, not a major math win: full textured e2e `real 55.40/55.48`
+> → `55.35` (`T2_TIMING program_total 55252.514 ms`). Final OBJ and dumps are byte-identical to the
+> previous run (`stage1`, Stage2, `tex_coords`, `tex_feats`).
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
