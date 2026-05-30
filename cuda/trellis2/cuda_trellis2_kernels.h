@@ -81,6 +81,14 @@ static const char cuda_trellis2_kernel_source[] =
 "    }\n"
 "}\n\n"
 
+/* ---- Modulation block bias: out = shared_base + per_block_bias ---- */
+"__global__ void modulation_add_bias_f32(\n"
+"    float *out, const float *base, const float *blk_bias, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    out[i] = base[i] + (blk_bias ? blk_bias[i] : 0.0f);\n"
+"}\n\n"
+
 /* ---- 3D RoPE for dense grid (complex-pair convention) ---- */
 /* Official TRELLIS.2: view_as_complex pairs (x[2k], x[2k+1]) then multiply by phase.
  * Phase layout: [n_freqs_z, n_freqs_y, n_freqs_x, padding] complex values.

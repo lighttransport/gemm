@@ -1267,6 +1267,17 @@ flat but slightly lower: `real 55.40/55.48 -> 55.35` (`T2_TIMING program_total 5
 OBJ and saved dumps (`stage1`, Stage 2, `tex_coords`, `tex_feats`) are byte-identical to the previous
 run.
 
+### Shared DiT modulation base (2026-05-31) — full e2e 55.35 -> 55.11 s
+
+The DiT block modulation is `adaLN_modulation(t_emb) + blocks[i].modulation`. The first term is shared
+by all 30 blocks in a forward, but the runner recomputed the full `9216 x 1536` matvec once per block.
+The forward path now computes the shared modulation base once, then uses a tiny
+`modulation_add_bias_f32` kernel to add each block's bias before the existing bf16-round hook.
+
+This keeps outputs byte-identical and trims a few milliseconds from every DiT forward. Cached-kernel
+full textured e2e is `real 55.11` (`T2_TIMING program_total 54998.957 ms`), with byte-identical final
+OBJ and saved dumps versus the sparse-setup-cache run.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`

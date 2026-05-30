@@ -237,6 +237,15 @@
 > → `55.35` (`T2_TIMING program_total 55252.514 ms`). Final OBJ and dumps are byte-identical to the
 > previous run (`stage1`, Stage2, `tex_coords`, `tex_feats`).
 >
+> ## DiT PERF #4: shared adaLN modulation base — e2e 55.35→55.11 s (2026-05-31)
+>
+> `adaLN_modulation(t_emb)` is shared across all 30 blocks in a DiT forward; only
+> `blocks[i].modulation` differs. The runner previously recomputed the full 9216×1536 modulation
+> matvec for every block. It now computes the shared base once per forward and applies block bias with
+> `modulation_add_bias_f32` before the existing bf16-round hook. Byte-identical final OBJ/dumps
+> (`stage1`, Stage2, `tex_coords`, `tex_feats`). Cached full textured e2e: `real 55.11`,
+> `T2_TIMING program_total 54998.957 ms`.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
