@@ -111,6 +111,18 @@
 > parity DONE; lazy per-stage DiT load DONE (peak 12.7→5.3 GB); Stage-2 bf16-block (`T2_SLAT_BF16`)
 > measured = 0.986, the CFG-amplified cross-impl floor, NOT 0.999 — see below.**
 >
+> ## DiT PERF: profiling → modulation fix + Stage-2/3 cuBLAS-TF32 — DiT 100→74 s (2026-05-30)
+>
+> `nsys` on `verify_stage2_full`: DiT forward = gemm_f16_f32 46.7% + attn_mma_hd128_f32 34.8% +
+> modulation_f32 10.1% + rope 4.4%. Two wins (both DEFAULT-ON now, mesh still correct 1.47M verts):
+> (1) **modulation_f32** was a SINGLE-block launch (grid=1, 1/50 SMs, uncoalesced) → rewrote
+> warp-per-row (coalesced + shuffle reduce, grid=ceil(out_dim/8)); ~10% off every stage, cosine
+> 0.985372→0.985397. (2) **Stage-2/3 default F16-MMA → F32+cuBLAS-TF32** (`load_sparse_dit` line
+> ~1064 `t2_dit_use_f16(r,0)`; `T2_DIT_F16=1` restores MMA): 1.36×, cosine →0.985343, F32 5.3GB OK
+> w/ lazy load. Combined Stage-2 sampler 1924→1243 ms/fwd (1.55×). e2e DiT: S1 38.4→34.2, S2
+> 38.6→24.9, S3 23.2→14.9 = 100.2→74.0 s (1.35×). NEXT: attn_mma_hd128 (35%, needs FA2) + decoders
+> (~28s, c2s 128→64 = 5s). `verify_stage2_full` now prints `>>> Sampler loop: … ms/forward`.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)
