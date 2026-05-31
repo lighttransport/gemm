@@ -281,6 +281,9 @@
 > - The retained FDG/PBR voxel hash now uses `3*N` slots instead of `4*N`. At the current
 >   `N=1,403,042` tail this cuts the borrowed hash live set by about 16.8 MB, with a small
 >   lookup-cost tradeoff.
+> - `cuda_trellis2_clear_subdiv_plan()` frees the recorded shape-subdivision guide after
+>   texture decode has consumed it. The full path releases about 41.5 MiB of host plan arrays
+>   before the CPU PBR/OBJ tail.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
@@ -298,6 +301,9 @@
 > - file-output exactness run after `3*N` retained hash: `real 54.79`,
 >   `T2_TIMING program_total 54702.957 ms`, FDG mesh `368.019 ms`,
 >   PBR writer `2766.115 ms`, final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
+> - file-output exactness run after early subdivision-plan clear: `real 55.04`,
+>   `T2_TIMING program_total 54946.725 ms` (noisy FDG extract `472.903 ms` in this run),
+>   final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
 > Rejected in this pass: widening `attn_mma_hd128_f32` from 4 warps/64 query rows per CTA to
 > 8 warps/128 rows per CTA. Arithmetic stayed row-local, but hot DiT steps regressed
