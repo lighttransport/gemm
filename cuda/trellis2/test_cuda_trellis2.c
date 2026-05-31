@@ -43,6 +43,23 @@
 #include <stdint.h>
 #include <time.h>
 
+static double t2_harness_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static int t2_harness_timing_enabled(void) {
+    const char *v = getenv("T2_TIMING");
+    return v && v[0] && atoi(v) != 0;
+}
+
+static void t2_harness_timing_log(const char *label, double t0_ms) {
+    if (t2_harness_timing_enabled())
+        fprintf(stderr, "T2_TIMING: %s %.3f ms\n",
+                label, t2_harness_now_ms() - t0_ms);
+}
+
 /* ---- .npy reader ---- */
 static float *read_npy_f32(const char *path, int *ndim, int *dims) {
     FILE *f = fopen(path, "rb");
@@ -179,6 +196,8 @@ static const float tex_slat_mean[32] = {3.501659f, 2.212398f, 2.226094f, 0.25109
 static const float tex_slat_std[32]  = {2.665652f, 2.743913f, 2.765121f, 2.595319f, 3.037293f, 2.291316f, 2.144656f, 2.911822f, 2.969419f, 2.501689f, 2.154811f, 3.163343f, 2.621215f, 2.381943f, 3.186697f, 3.021588f, 2.295916f, 3.234985f, 3.233086f, 2.260140f, 2.874801f, 2.810596f, 3.292720f, 2.674999f, 2.680878f, 2.372054f, 2.451546f, 2.353556f, 2.995195f, 2.379849f, 2.786195f, 2.775190f};
 
 int main(int argc, char **argv) {
+    double program_t0_ms = t2_harness_now_ms();
+
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <stage1.st> <decoder.st> <features.npy> [options]\n\n"
                 "Options:\n"
@@ -208,6 +227,7 @@ int main(int argc, char **argv) {
                 "  --stage3 <path>      Stage 3 texture flow model .safetensors\n"
                 "  --tex-dec <path>     Texture decoder .safetensors\n"
                 "  --s3-steps <N>       Stage 3 Euler steps (default: 12)\n"
+                "  --write-shape-obj    Also write <output>_shape.obj debug sidecar\n"
                 , argv[0]);
         return 1;
     }
@@ -239,6 +259,8 @@ int main(int argc, char **argv) {
     const char *stage3_path = NULL;
     const char *tex_dec_path = NULL;
     int s3_steps = 12;
+    const char *write_shape_env = getenv("T2_WRITE_SHAPE_OBJ");
+    int write_shape_obj = write_shape_env && atoi(write_shape_env) != 0;
 
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
@@ -266,6 +288,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--stage3") && i+1 < argc) stage3_path = argv[++i];
         else if (!strcmp(argv[i], "--tex-dec") && i+1 < argc) tex_dec_path = argv[++i];
         else if (!strcmp(argv[i], "--s3-steps") && i+1 < argc) s3_steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--write-shape-obj")) write_shape_obj = 1;
     }
     (void)n_threads;
 
@@ -427,7 +450,9 @@ int main(int argc, char **argv) {
     /* Decode */
     fprintf(stderr, "\n=== Structure Decoder ===\n");
     float *occupancy = (float *)malloc(64 * 64 * 64 * sizeof(float));
+    double stage1_dec_t0 = t2_harness_now_ms();
     cuda_trellis2_run_decoder(r, x, occupancy);
+    t2_harness_timing_log("stage1_structure_decoder_total", stage1_dec_t0);
     free(x);
 
     struct timespec t1_ts; clock_gettime(CLOCK_MONOTONIC, &t1_ts);
@@ -477,6 +502,7 @@ int main(int argc, char **argv) {
          * then extract res-32 coords in argwhere C-order (D outer, H, W inner).
          * Stage-2/3 RoPE uses the absolute coord values, so the resolution MUST
          * match PyTorch (res 32) — res-64 coords also doubled every rope angle. */
+        double sparse_extract_t0 = t2_harness_now_ms();
         const int SS_R = 32;
         float *pooled = (float *)malloc((size_t)SS_R * SS_R * SS_R * sizeof(float));
         if (!pooled) {
@@ -550,8 +576,11 @@ int main(int argc, char **argv) {
                 }
 sparse_done:
         free(pooled);
+        free(occupancy);
+        occupancy = NULL;
         fprintf(stderr, "Sparse voxels: %d @res%d (threshold %.4f)\n",
                 N_sparse, SS_R, sparse_threshold);
+        t2_harness_timing_log("stage2_sparse_extract_cpu", sparse_extract_t0);
 
         /* Generate noise [N, 32] for Stage 2 */
         int s2_ch = 32;
@@ -737,6 +766,8 @@ sparse_done:
          * Stage 1) before decoding — otherwise the shape decode OOMs at its
          * finest level (~1.47M voxels) with the DiTs resident. */
         cuda_trellis2_unload_dit_stages(r);
+        free(features);
+        features = NULL;
 
         /* Lazy load the shape decoder now that all DiTs are freed (it was NOT
          * loaded upfront — see the lazy-load note at weight-load time). */
@@ -750,6 +781,7 @@ sparse_done:
         fprintf(stderr, "\n=== Shape Decoder (CUDA SC-VAE) ===\n");
 
         t2_shape_dec_result result = {0};
+        double shape_decode_t0 = t2_harness_now_ms();
         if (cuda_trellis2_run_shape_decoder_alloc(r, s2_x, sparse_coords, N_sparse,
                                                   &result.feats, &result.coords,
                                                   &result.N, &result.C) != 0) {
@@ -758,6 +790,8 @@ sparse_done:
             cuda_trellis2_free(r); free(features);
             return 1;
         }
+        t2_harness_timing_log("shape_decoder_cuda_total", shape_decode_t0);
+        cuda_trellis2_unload_shape_decoder(r);
         free(s2_x);
         fprintf(stderr, "Shape decoder output: N=%d, C=%d\n", result.N, result.C);
 
@@ -765,42 +799,44 @@ sparse_done:
          *   vertices    = (1 + 2*margin)*sigmoid(f[0:3]) - margin
          *   intersected = f[3:6] > 0   (raw logits; FDG tests > 0)
          *   split_wt    = softplus(f[6]) */
+        double shape_post_t0 = t2_harness_now_ms();
         const float voxel_margin = 0.5f;
         int n_isect = 0;
+        int max_coord = 0;
         for (int i = 0; i < result.N; i++) {
             float *f = result.feats + i * 7;
             for (int j = 0; j < 3; j++)
                 f[j] = (1.0f + 2.0f * voxel_margin) / (1.0f + expf(-f[j])) - voxel_margin;
             f[6] = logf(1.0f + expf(f[6]));
             if (f[3] > 0.0f || f[4] > 0.0f || f[5] > 0.0f) n_isect++;
+            for (int j = 1; j <= 3; j++)
+                if (result.coords[i * 4 + j] > max_coord)
+                    max_coord = result.coords[i * 4 + j];
         }
         fprintf(stderr, "FDG: %d/%d voxels have an intersected edge (feats[3:6]>0)\n",
                 n_isect, result.N);
-
-        /* Extract coords without batch dim: [N, 3] from [N, 4] */
-        int32_t *coords3 = (int32_t *)malloc((size_t)result.N * 3 * sizeof(int32_t));
-        for (int i = 0; i < result.N; i++) {
-            coords3[i * 3 + 0] = result.coords[i * 4 + 1];  /* z */
-            coords3[i * 3 + 1] = result.coords[i * 4 + 2];  /* y */
-            coords3[i * 3 + 2] = result.coords[i * 4 + 3];  /* x */
-        }
+        t2_harness_timing_log("shape_postprocess_cpu", shape_post_t0);
 
         /* FDG mesh extraction */
         float aabb[6] = {-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f};
-        int max_coord = 0;
-        for (int i = 0; i < result.N * 3; i++)
-            if (coords3[i] > max_coord) max_coord = coords3[i];
         float vs = (aabb[3] - aabb[0]) / (float)(max_coord + 1);
 
         fprintf(stderr, "\n=== FDG Mesh (voxel_size=%.4f, max_coord=%d) ===\n", vs, max_coord);
-        t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
+        double fdg_mesh_t0 = t2_harness_now_ms();
+        t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh_bzyx_with_hash(
+            result.coords, result.feats, result.N, vs, aabb);
+        t2_harness_timing_log("fdg_mesh_extract_cpu", fdg_mesh_t0);
+        t2_shape_dec_result_free(&result);
 
         if (fdg_mesh.n_tris > 0) {
-            /* Always write shape-only mesh first */
-            {
+            /* Optional debug sidecar. The requested output path is still written
+             * below, either as shape-only OBJ or as textured/color OBJ. */
+            if (write_shape_obj) {
                 char shape_path[512];
                 snprintf(shape_path, sizeof(shape_path), "%s_shape.obj", obj_path);
+                double write_shape_t0 = t2_harness_now_ms();
                 t2_fdg_write_obj(shape_path, &fdg_mesh);
+                t2_harness_timing_log("fdg_write_shape_obj", write_shape_t0);
             }
 
             if (tex_slat && stage3_path && tex_dec_path) {
@@ -809,14 +845,26 @@ sparse_done:
                 cuda_trellis2_unload_shape_decoder(r);
                 if (cuda_trellis2_load_texture_decoder(r, tex_dec_path) == 0) {
                     t2_shape_dec_result tex_result = {0};
-                    if (cuda_trellis2_run_texture_decoder_alloc(r, tex_slat, sparse_coords, N_sparse,
-                                                                &tex_result.feats, &tex_result.coords,
-                                                                &tex_result.N, &tex_result.C) != 0) {
+                    double tex_decode_t0 = t2_harness_now_ms();
+                    int tex_decode_rc = cuda_trellis2_run_texture_decoder_alloc(
+                        r, tex_slat, sparse_coords, N_sparse,
+                        &tex_result.feats, &tex_result.coords,
+                        &tex_result.N, &tex_result.C);
+                    cuda_trellis2_unload_texture_decoder(r);
+                    cuda_trellis2_clear_subdiv_plan(r);
+                    cuda_trellis2_free(r);
+                    r = NULL;
+                    free(tex_slat);
+                    tex_slat = NULL;
+                    free(sparse_coords);
+                    sparse_coords = NULL;
+                    if (tex_decode_rc != 0) {
                         fprintf(stderr, "CUDA texture decoder failed, writing shape-only mesh\n");
                         t2_fdg_write_obj(obj_path, &fdg_mesh);
                         t2_shape_dec_result_free(&tex_result);
                         goto texture_done;
                     }
+                    t2_harness_timing_log("texture_decoder_cuda_total", tex_decode_t0);
                     fprintf(stderr, "Texture decoder output: N=%d, C=%d\n",
                             tex_result.N, tex_result.C);
 
@@ -824,6 +872,7 @@ sparse_done:
                      * feats are the RAW decoder output here (PBR *0.5+0.5 is
                      * applied later inside t2_pbr_from_decoder). */
                     if (tex_npy_base) {
+                        double tex_dump_t0 = t2_harness_now_ms();
                         char p[600];
                         float *cf = (float *)malloc((size_t)tex_result.N * 4 * sizeof(float));
                         for (int k = 0; k < tex_result.N * 4; k++) cf[k] = (float)tex_result.coords[k];
@@ -835,58 +884,77 @@ sparse_done:
                         snprintf(p, sizeof(p), "%s.feats.npy", tex_npy_base);
                         write_npy_f32(p, tex_result.feats, fd, 2);
                         fprintf(stderr, "Dumped tex voxels to %s.{coords,feats}.npy\n", tex_npy_base);
+                        t2_harness_timing_log("texture_dump_npy", tex_dump_t0);
                     }
 
                     /* Scale decoder output: * 0.5 + 0.5 -> [0,1] */
                     /* Build PBR field from texture decoder output */
-                    int max_c = 0;
-                    for (int i = 0; i < tex_result.N; i++) {
-                        for (int j = 1; j <= 3; j++)
-                            if (tex_result.coords[i*4+j] > max_c)
-                                max_c = tex_result.coords[i*4+j];
-                    }
-                    int tex_res = max_c + 1;
+                    /* Texture decode replays the shape decoder's subdivision
+                     * plan, so its final coords share the shape mesh extent. */
+                    int tex_res = max_coord + 1;
                     fprintf(stderr, "\n=== PBR Texture Baking (res=%d) ===\n", tex_res);
 
-                    t2_pbr_field pbr = t2_pbr_from_decoder(
-                        tex_result.feats, tex_result.coords, tex_result.N, tex_res);
-
-                    /* Sample PBR at mesh vertices */
-                    t2_pbr_attr *colors = (t2_pbr_attr *)malloc(
-                        (size_t)fdg_mesh.n_verts * sizeof(t2_pbr_attr));
-                    t2_pbr_sample_vertices(&pbr, fdg_mesh.vertices, fdg_mesh.n_verts, colors);
+                    double pbr_build_t0 = t2_harness_now_ms();
+                    t2_pbr_field pbr = t2_pbr_from_decoder_take_with_hash(
+                        tex_result.feats, tex_result.coords, tex_result.N, tex_res,
+                        fdg_mesh.hash_keys, fdg_mesh.hash_vals, fdg_mesh.hash_cap);
+                    tex_result.feats = NULL;
+                    t2_harness_timing_log("pbr_field_build_cpu", pbr_build_t0);
+                    t2_shape_dec_result_free(&tex_result);
 
                     /* The UV atlas writer is still experimental; default to
                      * vertex-colored OBJ so texture decode smoke tests do not
                      * depend on chart packing. */
                     const char *write_atlas = getenv("T2_PBR_TEXTURE_MAP");
                     if (write_atlas && atoi(write_atlas)) {
+                        t2_pbr_attr *colors = (t2_pbr_attr *)malloc(
+                            (size_t)fdg_mesh.n_verts * sizeof(t2_pbr_attr));
+                        double pbr_sample_t0 = t2_harness_now_ms();
+                        t2_pbr_sample_vertices(&pbr, fdg_mesh.vertices,
+                                               fdg_mesh.n_verts, colors);
+                        t2_harness_timing_log("pbr_sample_vertices_cpu", pbr_sample_t0);
+
                         char base[512];
                         snprintf(base, sizeof(base), "%s", obj_path);
                         char *dot = strrchr(base, '.');
                         if (dot) *dot = '\0';
+                        double write_tex_t0 = t2_harness_now_ms();
                         t2_pbr_write_textured_obj(base, fdg_mesh.vertices, fdg_mesh.triangles,
                                                    fdg_mesh.n_verts, fdg_mesh.n_tris, colors, 1024);
+                        t2_harness_timing_log("pbr_write_textured_obj", write_tex_t0);
+                        free(colors);
                     } else {
-                        t2_pbr_write_colored_obj(obj_path, fdg_mesh.vertices, fdg_mesh.triangles,
-                                                 fdg_mesh.n_verts, fdg_mesh.n_tris, colors);
+                        double write_color_t0 = t2_harness_now_ms();
+                        t2_pbr_write_sampled_colored_obj(
+                            obj_path, fdg_mesh.vertices, fdg_mesh.triangles,
+                            fdg_mesh.n_verts, fdg_mesh.n_tris, &pbr);
+                        t2_harness_timing_log("pbr_write_sampled_colored_obj",
+                                              write_color_t0);
                     }
 
-                    free(colors);
                     t2_pbr_free(&pbr);
                     t2_shape_dec_result_free(&tex_result);
                 } else {
                     fprintf(stderr, "Failed to load texture decoder, writing shape-only mesh\n");
+                    cuda_trellis2_clear_subdiv_plan(r);
+                    cuda_trellis2_free(r);
+                    r = NULL;
+                    double write_fallback_t0 = t2_harness_now_ms();
                     t2_fdg_write_obj(obj_path, &fdg_mesh);
+                    t2_harness_timing_log("fdg_write_fallback_obj", write_fallback_t0);
                 }
 texture_done:
                 ;
             } else {
+                cuda_trellis2_clear_subdiv_plan(r);
+                cuda_trellis2_free(r);
+                r = NULL;
+                double write_fdg_t0 = t2_harness_now_ms();
                 t2_fdg_write_obj(obj_path, &fdg_mesh);
+                t2_harness_timing_log("fdg_write_obj", write_fdg_t0);
             }
         }
 
-        free(coords3);
         t2_fdg_mesh_free(&fdg_mesh);
         t2_shape_dec_result_free(&result);
         free(sparse_coords);
@@ -935,11 +1003,15 @@ texture_done:
         }
 
         float bounds[6] = {0, 0, 0, 1, 1, 1};
+        double mc_t0 = t2_harness_now_ms();
         mc_mesh mesh = mc_marching_cubes(mc_input, mc_n, mc_n, mc_n, mc_threshold, bounds);
+        t2_harness_timing_log("marching_cubes_cpu", mc_t0);
         fprintf(stderr, "Marching cubes: %d vertices, %d triangles\n", mesh.n_verts, mesh.n_tris);
 
         if (mesh.n_tris > 0) {
+            double mc_write_t0 = t2_harness_now_ms();
             mc_write_obj(obj_path, &mesh);
+            t2_harness_timing_log("marching_cubes_write_obj", mc_write_t0);
             fprintf(stderr, "Wrote %s\n", obj_path);
         }
         mc_mesh_free(&mesh);
@@ -951,5 +1023,6 @@ texture_done:
     cuda_trellis2_free(r);
 
     fprintf(stderr, "\nDone.\n");
+    t2_harness_timing_log("program_total", program_t0_ms);
     return 0;
 }
