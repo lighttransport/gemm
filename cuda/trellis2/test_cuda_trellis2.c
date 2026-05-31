@@ -823,7 +823,8 @@ sparse_done:
 
         fprintf(stderr, "\n=== FDG Mesh (voxel_size=%.4f, max_coord=%d) ===\n", vs, max_coord);
         double fdg_mesh_t0 = t2_harness_now_ms();
-        t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh_bzyx(result.coords, result.feats, result.N, vs, aabb);
+        t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh_bzyx_with_hash(
+            result.coords, result.feats, result.N, vs, aabb);
         t2_harness_timing_log("fdg_mesh_extract_cpu", fdg_mesh_t0);
         t2_shape_dec_result_free(&result);
 
