@@ -302,6 +302,12 @@ struct hip_sam3d_body_ctx {
     void *d_pc_lw;                    /* resident LW [55317,3000] f32 (633 MiB) */
     void *d_pc_h;                     /* scratch h  [3000] f32 */
     void *d_pc_out;                   /* scratch out [55317] f32 */
+    /* GPU blend_shape/face_expressions combine (resident vectors). */
+    void *d_blend_vec;               /* resident blend vectors [45,55317] (10 MiB) */
+    void *d_blend_base;              /* resident base_shape [55317] f32 */
+    void *d_face_vec;                /* resident face vectors [72,55317] (16 MiB) */
+    void *d_blend_coeffs;            /* scratch coeffs [72] f32 (max of 45,72) */
+    void *d_blend_out;               /* scratch out [55317] f32 */
 
     /* device runtime buffers. */
     void    *d_img_u8;  size_t img_u8_cap;   /* (Hin, Win, 3) u8, host-resized */
@@ -1042,6 +1048,31 @@ static int sb_pc_matvec_gpu(void *user, const float *h, float *out_offsets) {
     return 0;
 }
 
+/* GPU blend_shape/face_expressions combine: out[V*3] = (which?0:base) +
+ * sum_n coeffs[n]*vec[n,V*3], on resident vectors. which 0=blend, 1=face.
+ * The CPU loops these with a 221KB stride per basis → ~15ms(blend)/~4ms(face)
+ * cold in-pipeline; on GPU the resident matrix is read at HBM BW (~0.03ms). */
+static int sb_blend_combine_gpu(void *user, int which, const float *coeffs,
+                                int n_basis, float *out_verts) {
+    hip_sam3d_body_ctx *c = (hip_sam3d_body_ctx *)user;
+    const int VD = S3DM_N_VERTS * 3;  /* 55317 */
+    if (hipMemcpy(c->d_blend_coeffs, coeffs, (size_t)n_basis * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) return -1;
+    void *vec  = which ? c->d_face_vec : c->d_blend_vec;
+    void *base = which ? NULL          : c->d_blend_base;
+    /* mhr_blend_combine_f32(out, coeffs, vectors, base, N_basis, V_d) */
+    struct __attribute__((packed)) {
+        void *out; const void *coeffs; const void *vectors; const void *base;
+        int N_basis, V_d;
+    } p = { c->d_blend_out, c->d_blend_coeffs, vec, base, n_basis, VD };
+    unsigned bx = 256, gx = (unsigned)((VD + bx - 1) / bx);
+    if (sb_launch(c->fn_mhr_blend, gx, 1, 1, bx, 1, 1, 0, &p, sizeof(p)) < 0)
+        return -1;
+    if (hipMemcpy(out_verts, c->d_blend_out, (size_t)VD * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess) return -1;
+    return 0;
+}
+
 /* Upload LW resident and install the GPU matvec hook on cpu_mhr.
  * No-op unless SAM3D_MHR_GPU=1 and pc_linear_weight is loaded. */
 static int sb_mhr_gpu_setup(hip_sam3d_body_ctx *c) {
@@ -1082,6 +1113,37 @@ static int sb_mhr_gpu_setup(hip_sam3d_body_ctx *c) {
         fprintf(stderr, "sam3d_body: MHR pose_correctives matvec on GPU "
                 "(LW %.0f MiB resident, kernel=%s)\n", (double)OUT * HID * 4 / 1048576.0,
                 c->fn_mhr_pc_matvec ? "mhr_pc_matvec_f32" : "gemm_f32_bias");
+
+    /* blend_shape / face_expressions on GPU with resident vectors (the real
+     * in-pipeline hot stages: ~15ms blend + ~4ms face cold on CPU). Only if the
+     * kernel + assets are present; soft (CPU fallback) on any miss. */
+    const int VD = S3DM_N_VERTS * 3;
+    const float *BV = (const float *)c->cpu_mhr->blend_shape_vectors.data;
+    const float *BB = (const float *)c->cpu_mhr->blend_base_shape.data;
+    const float *FV = (const float *)c->cpu_mhr->face_shape_vectors.data;
+    if (c->fn_mhr_blend && BV && BB && FV) {
+        int ok = 1;
+        ok &= hipMalloc(&c->d_blend_vec,   (size_t)S3DM_N_SHAPE * VD * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_blend_base,  (size_t)VD * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_face_vec,    (size_t)S3DM_N_FACE  * VD * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_blend_coeffs,(size_t)S3DM_N_FACE * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_blend_out,   (size_t)VD * sizeof(float)) == hipSuccess;
+        if (ok) {
+            ok &= hipMemcpy(c->d_blend_vec, BV, (size_t)S3DM_N_SHAPE*VD*sizeof(float), hipMemcpyHostToDevice) == hipSuccess;
+            ok &= hipMemcpy(c->d_blend_base,BB, (size_t)VD*sizeof(float), hipMemcpyHostToDevice) == hipSuccess;
+            ok &= hipMemcpy(c->d_face_vec,  FV, (size_t)S3DM_N_FACE*VD*sizeof(float), hipMemcpyHostToDevice) == hipSuccess;
+        }
+        if (ok) {
+            c->cpu_mhr->blend_user = c;
+            c->cpu_mhr->blend_combine_fn = sb_blend_combine_gpu;
+            if (c->verbose)
+                fprintf(stderr, "sam3d_body: MHR blend_shape+face on GPU "
+                        "(%.0f MiB vectors resident)\n",
+                        (double)(S3DM_N_SHAPE + S3DM_N_FACE) * VD * 4 / 1048576.0);
+        } else if (c->verbose) {
+            fprintf(stderr, "sam3d_body: MHR blend GPU setup failed — blend/face stay on CPU\n");
+        }
+    }
     return 0;
 }
 static int sb_gemm_tiled(hip_sam3d_body_ctx *c, void *p, size_t pb) {
@@ -1331,6 +1393,12 @@ load_decoder_and_mhr:
                 fprintf(stderr, "sam3d_body: MHR asset load failed (%s, %s)\n",
                         p1, p2);
                 hip_sam3d_body_destroy(c); return NULL;
+            }
+            /* Opt-in GPU offload of the MHR matvec + blend/face (SAM3D_MHR_GPU=1);
+             * no-op / soft CPU fallback otherwise. Must run after cpu_mhr loads. */
+            if (sb_mhr_gpu_setup(c) < 0) {
+                fprintf(stderr, "sam3d_body: MHR GPU setup failed — staying on CPU\n");
+                /* non-fatal: hooks left unset → CPU path */
             }
         }
     }
