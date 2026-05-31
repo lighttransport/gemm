@@ -143,6 +143,23 @@ is a single 166M-FMA dense matvec `out[55317] = LW[55317,3000] @ h[3000]`
   hook engaged. Warm steady-state per-call is closer (CPU ~20–24 ms vs GPU
   ~18–21 ms) since the non-matvec MHR stages (blend/face/skin) stay on CPU; the
   big win is eliminating the cold-start that single-shot inference always pays.
+- **Matvec kernel: `mhr_pc_matvec_f32`** replaces the N=1 `gemm_f32_bias` for the
+  hook (the 16×16-block GEMM wastes 15/16 lanes when N=1). One block (64 thr) per
+  output row, coalesced W reads, LDS reduce — a memory-bound GEMV. Soft handle
+  `fn_mhr_pc_matvec` (NULL → gemm_f32_bias fallback). Standalone `bench_pc_matvec`:
+  kernel **8.70 → 1.05 ms** (8.3×, **~600 GB/s ≈ HBM-bound floor**), per-call
+  4.08 → 1.61 ms, **14.98× vs CPU**; cos 1.0. Mesh f32-level (3.8e-6 vs CPU).
+- **HONEST e2e caveat (measured, `SAM3D_MHR_GPU_DEBUG=1`):** the hook is only
+  **1.6 ms/call** warm — ~9% of the ~18 ms per-call MHR. So the faster matvec
+  barely moves e2e (decoder ~237→234 ms). The residual ~16 ms is the CPU
+  blend/face/skin stages: ~5 ms *hot* in isolation but run **cold** in-pipeline
+  (their ~26 MB of asset matrices — blend 10 MB + face 16 MB — get evicted
+  between MHR calls by intervening decoder GPU/CPU work). The matvec kernel is
+  kept because it's strictly better and correct, but **the next real MHR lever
+  is moving blend/face/skin onto GPU with resident assets** (kernels
+  `mhr_blend_combine_f32`/`mhr_lbs_skin_f32` exist + are `verify_mhr`-validated)
+  — a larger port: the whole pose_correctives→blend→face→accumulate→skin tail
+  must stay GPU-resident to avoid re-downloads. Per-call ceiling ~16 ms × 7.
 
 ## Decoder norm_heads: drop dead full-token LayerNorm
 
