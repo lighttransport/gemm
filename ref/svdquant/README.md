@@ -2,7 +2,7 @@
 
 Self-contained PyTorch reference for the `cpu/svdquant` and `cuda/svdquant`
 unit tests. Pins the SVDQuant forward (SmoothQuant λ + rank-128 SVD low-rank +
-4-bit residual) for **INT4** and **NVFP4**, in both **W4A16** and **W4A4**.
+quantized residual) for **INT4**, **INT8**, and **NVFP4** coverage.
 
 ## What SVDQuant computes
 
@@ -16,9 +16,11 @@ y = act(x/λ) @ R_dec^T  +  (x @ lora_down_emit^T) @ lora_up^T  +  bias
 - residual term uses the **smoothed** activation `x/λ`; low-rank uses **raw** `x`;
 - `lora_down_emit = lora_down/λ` folds smoothing back so the two branches
   recombine to `W@x` (minus the 4-bit residual error);
-- `act(·)` = identity (W4A16) or 4-bit per-token-group quant→dequant (W4A4);
+- `act(·)` = identity (W4A16), 4-bit per-token-group quant→dequant (W4A4), or
+  8-bit per-token-group quant→dequant (W8A8);
 - INT4 residual = group-64 signed `[-7,7]`; NVFP4 residual = e2m1 group-16 with
-  e4m3 micro-scales + per-row `wcwt`.
+  e4m3 micro-scales + per-row `wcwt`; INT8 residual = group-64 signed
+  `[-127,127]`.
 
 ## Generate the dumps
 
@@ -43,6 +45,12 @@ Per case `<fmt>_<scope>_` where fmt∈{int4,nvfp4}, scope∈{w4a16,w4a4}:
 - W4A4 (either fmt): `xr_dq`(f32 TOK×IN) = the dequantized residual activation
   the driver used (the CPU consumes this so it need not re-implement e4m3/e2m1
   activation rounding).
+
+Additional CUDA IMMA case `int8_w8a8`: `residual`(f32 OUT×IN, the pre-quantized
+SVD residual for GPU encoding), `qint8`(u8 OUT×IN signed-int8 bytes),
+`wscale`(f32 OUT×IN/64), `xq`(u8 TOK×IN signed-int8 bytes), and
+`xscale`(f32 TOK×IN/64). The byte tensors are stored as `uint8` because the
+C loader intentionally supports only `f4`/`i4`/`u1`.
 
 `y_svdq` is computed by **decoding the dumped quantized tensors**, so a C/CUDA
 reader of the same bytes with the same decode formula matches to f32 rounding.
