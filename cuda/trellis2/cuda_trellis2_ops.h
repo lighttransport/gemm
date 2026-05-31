@@ -1017,6 +1017,16 @@ static inline void t2_op_broadcast_bias(t2_ops *ops, CUstream s,
                    256, 1, 1, 0, s, args, NULL);
 }
 
+/* Add row bias: dst[i*C + c] += bias[c] */
+static inline void t2_op_add_bias(t2_ops *ops, CUstream s,
+                                    CUdeviceptr dst, CUdeviceptr bias,
+                                    int N, int C) {
+    int total = N * C;
+    void *args[] = {&dst, &bias, &C, &N};
+    cuLaunchKernel(ops->add_bias, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
 /* Scatter add: dst += src */
 static inline void t2_op_scatter_add(t2_ops *ops, CUstream s,
                                        CUdeviceptr dst, CUdeviceptr src, int n) {
