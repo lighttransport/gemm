@@ -1310,6 +1310,24 @@ e2e with file output is `real 54.98` (`T2_TIMING program_total 54891.555 ms`, po
 `72.347 ms`, FDG mesh `375.963 ms`, PBR build `12.633 ms`), with the same
 `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` / `100%`.
 
+### Sparse SLAT DiT bf16 + zero-CFG fast path (2026-05-31)
+
+Stage 2/3 sparse DiT now defaults to the bf16 block trajectory when cuBLAS bf16
+and the cast kernels are available; set `T2_SLAT_BF16=0` to restore the old TF32
+path. Stage 2's all-zero CFG negative condition also defaults to a collapsed
+cross-attention residual path; set `T2_DIT_ZERO_COND_FAST=0` to force the full
+zero-condition KV cache and attention. The zero-CFG path avoids the second sparse
+DiT KV cache (`K+V` for 30 blocks at 1029x1536), saving about 379 MiB of VRAM.
+
+Focused verifier metrics on RTX 5060 Ti:
+
+- Stage 2 full sampler: `725.0 ms/forward`, cosine `0.985379` -> `618.1 ms/forward`,
+  cosine `0.988086`.
+- Stage 3 full sampler: `real 10.26`, cosine `0.999980` -> `real 9.42`,
+  cosine `0.999977`.
+- Full textured e2e with file output: prior `T2_TIMING program_total 54818.543 ms`
+  / `real 54.92`; new default `program_total 51859.578 ms` / `real 51.97`.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
