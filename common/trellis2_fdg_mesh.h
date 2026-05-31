@@ -86,7 +86,7 @@ static unsigned fdg_hash_slot(int64_t key, int capacity) {
 }
 
 static fdg_hash fdg_hash_build(const int32_t *coords, int N, int stride, int base) {
-    int cap = N * 4;  /* load factor 0.25 */
+    int cap = N * 3;  /* load factor ~0.33 */
     if (cap < 64) cap = 64;
     fdg_hash h;
     h.capacity = cap;
