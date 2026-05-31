@@ -42,6 +42,18 @@ make
 
 First run includes HIPRTC kernel compilation (~30-60 min on gfx1201 with ROCm 7.x).
 
+### Experimental gfx12 WMMA GEMM
+
+The default path uses the portable F16-weight/F32-accumulate tiled GEMM. On RDNA4/gfx12,
+an opt-in WMMA GEMM path can be enabled for DA3-Giant GEMM-heavy runs:
+
+```
+DA3_GEMM_WMMA=1 ./test_hip_da3 /path/to/DA3-Giant/model.safetensors --gaussians
+```
+
+Set `DA3_GEMM_WMMA_DEBUG=1` to print the first GEMM routing decision. Unsupported
+targets or ineligible shapes fall back to the default scalar tiled GEMM.
+
 ## Accuracy
 
 Verified against the official PyTorch DA3 implementation:
