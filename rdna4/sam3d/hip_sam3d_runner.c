@@ -25,6 +25,7 @@
 
 #include "hip_sam3d_runner.h"
 #include "../rocew.h"
+#include "hip_sam3d_wmma.h"
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
 
@@ -1596,11 +1597,11 @@ static int cs3d_slat_io_block_gpu_hook(void *user, int is_output,
     int twoCout = 2 * C_out, one = 1;
     { unsigned gx = 1, gy = (twoCout + 15) / 16;
       void *a[] = { &ws->d_emb, &ws->d_t_silu, &gb->emb_w, &gb->emb_b, &one, &dim, &twoCout };
-      if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess) goto done; }
+      if (cs3d_launch_gemm_args(fn->gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess) goto done; }
     if (gb->has_skip) {
         unsigned gx = (outN + 15) / 16, gy = (C_out + 15) / 16;
         void *a[] = { &ws->d_skip, &d_base, &gb->skip_w, &gb->skip_b, &outN, &C_in, &C_out };
-        if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess) goto done;
+        if (cs3d_launch_gemm_args(fn->gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess) goto done;
     } else {
         if (C_in != C_out ||
             hipMemcpyDtoD(ws->d_skip, d_base, (size_t)outN * C_out * sizeof(float)) != hipSuccess)
@@ -1696,7 +1697,7 @@ static int cs3d_slat_input_layer_gpu_hook(void *user, void *xp_void,
     { unsigned gx = (N + 15) / 16, gy = (outC + 15) / 16;
       void *a[] = { &ws->d_h1, &ws->d_in_feats, &ctx->gpu_slat_io.input_w,
                     &ctx->gpu_slat_io.input_b, &N, &C, &outC };
-      if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(fn->gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
 
     host_feats = (float *)malloc(out_bytes);
@@ -1764,7 +1765,7 @@ static int cs3d_slat_final_layer_gpu_hook(void *user, void *xp_void,
     { unsigned gx = (N + 15) / 16, gy = (outC + 15) / 16;
       void *a[] = { &ws->d_h2, &ws->d_h1, &ctx->gpu_slat_io.out_w,
                     &ctx->gpu_slat_io.out_b, &N, &C, &outC };
-      if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(fn->gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
 
     host_feats = (float *)malloc(out_bytes);
@@ -2249,7 +2250,7 @@ static int cs3d_gs_input_ape_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
       void *a[] = { &ws->d_h, &ws->d_in, &ctx->gpu_gs_head.input_w,
                     &ctx->gpu_gs_head.input_b, &N, &in_channels, &dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     int freq_dim = dim / 3 / 2;
     int filled = freq_dim * 2 * 3;
@@ -2316,7 +2317,7 @@ static int cs3d_gs_final_layer_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (out_channels + 15) / 16;
       void *a[] = { &ws->d_out, &ws->d_ln, &ctx->gpu_gs_head.out_w,
                     &ctx->gpu_gs_head.out_b, &N, &dim, &out_channels };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     host_out = (float *)malloc(out_bytes);
     if (!host_out) goto done;
@@ -2384,7 +2385,7 @@ static int cs3d_gs_mlp_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
       void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
                     &N, &dim, &hidden };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     { void *a[] = { &ws->d_mlp, &n_mlp };
       if (hipModuleLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
@@ -2393,7 +2394,7 @@ static int cs3d_gs_mlp_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
       void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
                     &N, &hidden, &dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
       if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -2635,7 +2636,7 @@ static int cs3d_gs_attn_block_gpu_hook(void *user,
       unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
       void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
                     &N, &dim, &qkv_dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
 
     for (int r = 0; r < n_runs; r++) {
@@ -2662,7 +2663,7 @@ static int cs3d_gs_attn_block_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
       void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
                     &N, &dim, &dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
       if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -2765,7 +2766,7 @@ static int cs3d_gs_block_gpu_hook(void *user,
       unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
       void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
                     &N, &dim, &qkv_dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
 
     for (int r = 0; r < n_runs; r++) {
@@ -2792,7 +2793,7 @@ static int cs3d_gs_block_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
       void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
                     &N, &dim, &dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
       if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -2807,7 +2808,7 @@ static int cs3d_gs_block_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
       void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
                     &N, &dim, &hidden };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     { void *a[] = { &ws->d_mlp, &n_mlp };
       if (hipModuleLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
@@ -2816,7 +2817,7 @@ static int cs3d_gs_block_gpu_hook(void *user,
     { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
       void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
                     &N, &hidden, &dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
       if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -2927,7 +2928,7 @@ static int cs3d_gs_stack_gpu_hook(void *user,
           unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
           void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
                         &N, &dim, &qkv_dim };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess) {
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess) {
               free(fwd); free(runs); goto done;
           } }
 
@@ -2961,7 +2962,7 @@ static int cs3d_gs_stack_gpu_hook(void *user,
         { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
           void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
                         &N, &dim, &dim };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
               goto done; }
         { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
           if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -2976,7 +2977,7 @@ static int cs3d_gs_stack_gpu_hook(void *user,
         { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
           void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
                         &N, &dim, &hidden };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
               goto done; }
         { void *a[] = { &ws->d_mlp, &n_mlp };
           if (hipModuleLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
@@ -2985,7 +2986,7 @@ static int cs3d_gs_stack_gpu_hook(void *user,
         { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
           void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
                         &N, &hidden, &dim };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
               goto done; }
         { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
           if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -3087,7 +3088,7 @@ static int cs3d_gs_transformer_gpu_forward(hip_sam3d_ctx *ctx,
     { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
       void *a[] = { &ws->d_h, &ws->d_in, &ctx->gpu_gs_head.input_w,
                     &ctx->gpu_gs_head.input_b, &N, &in_channels, &dim };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
     {
       int freq_dim = dim / 3 / 2;
@@ -3131,7 +3132,7 @@ static int cs3d_gs_transformer_gpu_forward(hip_sam3d_ctx *ctx,
           unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
           void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
                         &N, &dim, &qkv_dim };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess) {
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess) {
               free(fwd); free(runs); goto done;
           } }
 
@@ -3165,7 +3166,7 @@ static int cs3d_gs_transformer_gpu_forward(hip_sam3d_ctx *ctx,
         { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
           void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
                         &N, &dim, &dim };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
               goto done; }
         { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
           if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -3180,7 +3181,7 @@ static int cs3d_gs_transformer_gpu_forward(hip_sam3d_ctx *ctx,
         { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
           void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
                         &N, &dim, &hidden };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
               goto done; }
         { void *a[] = { &ws->d_mlp, &n_mlp };
           if (hipModuleLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
@@ -3189,7 +3190,7 @@ static int cs3d_gs_transformer_gpu_forward(hip_sam3d_ctx *ctx,
         { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
           void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
                         &N, &hidden, &dim };
-          if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+          if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
               goto done; }
         { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
           if (hipModuleLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
@@ -3205,7 +3206,7 @@ static int cs3d_gs_transformer_gpu_forward(hip_sam3d_ctx *ctx,
     { unsigned gx = (N + 15) / 16, gy = (out_channels + 15) / 16;
       void *a[] = { &ws->d_out, &ws->d_ln, &ctx->gpu_gs_head.out_w,
                     &ctx->gpu_gs_head.out_b, &N, &dim, &out_channels };
-      if (hipModuleLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_launch_gemm_args(gemm, cs3d_gemm_wmma(ctx->mod), a) != hipSuccess)
           goto done; }
 
     if (out_feats) {
