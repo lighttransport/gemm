@@ -64,6 +64,11 @@ static int64_t fdg_hash_key(int z, int y, int x) {
     return ((int64_t)z << 40) | ((int64_t)(y & 0xFFFFF) << 20) | (int64_t)(x & 0xFFFFF);
 }
 
+static unsigned fdg_hash_slot(int64_t key, int capacity) {
+    uint32_t h = (uint32_t)(((uint64_t)key * 0x9E3779B97F4A7C15ULL) >> 32);
+    return (unsigned)(((uint64_t)h * (uint32_t)capacity) >> 32);
+}
+
 static fdg_hash fdg_hash_build(const int32_t *coords, int N) {
     int cap = N * 4;  /* load factor 0.25 */
     if (cap < 64) cap = 64;
@@ -75,8 +80,11 @@ static fdg_hash fdg_hash_build(const int32_t *coords, int N) {
 
     for (int i = 0; i < N; i++) {
         int64_t key = fdg_hash_key(coords[i * 3], coords[i * 3 + 1], coords[i * 3 + 2]);
-        unsigned slot = (unsigned)(key * 0x9E3779B97F4A7C15ULL >> 32) % (unsigned)cap;
-        while (h.keys[slot] != -1) { slot = (slot + 1) % (unsigned)cap; }
+        unsigned slot = fdg_hash_slot(key, cap);
+        while (h.keys[slot] != -1) {
+            slot++;
+            if (slot == (unsigned)cap) slot = 0;
+        }
         h.keys[slot] = key;
         h.vals[slot] = i;
     }
@@ -85,11 +93,12 @@ static fdg_hash fdg_hash_build(const int32_t *coords, int N) {
 
 static int fdg_hash_lookup(const fdg_hash *h, int z, int y, int x) {
     int64_t key = fdg_hash_key(z, y, x);
-    unsigned slot = (unsigned)(key * 0x9E3779B97F4A7C15ULL >> 32) % (unsigned)h->capacity;
+    unsigned slot = fdg_hash_slot(key, h->capacity);
     while (1) {
         if (h->keys[slot] == key) return h->vals[slot];
         if (h->keys[slot] == -1) return -1;
-        slot = (slot + 1) % (unsigned)h->capacity;
+        slot++;
+        if (slot == (unsigned)h->capacity) slot = 0;
     }
 }
 
