@@ -63,6 +63,11 @@ verify_mhr: verify_mhr.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
 verify_end_to_end: verify_end_to_end.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
 	$(CC) $(CFLAGS) -fopenmp -o $@ verify_end_to_end.c $(RUNNER_SRC) $(CPU_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
+# Standalone numeric test: BF16-WMMA flash-attention (hd=64) vs scalar reference.
+test_fa_wmma: test_fa_wmma.c hip_sam3d_body_kernels.h ../rocew.h \
+              ../hip_kernels_common.h ../hip_runner_common.h $(ROCEW_SRC)
+	$(CC) $(CFLAGS) -o $@ test_fa_wmma.c $(ROCEW_SRC) $(LDFLAGS)
+
 MODELS ?= /mnt/disk1/models
 SFT    ?= $(MODELS)/sam3d-body/safetensors
 MHR    ?= $(MODELS)/sam3d-body/safetensors
