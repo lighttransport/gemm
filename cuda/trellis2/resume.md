@@ -273,6 +273,9 @@
 >   texture coords. The FDG mesh now retains its voxel hash until mesh free, so the PBR field borrows
 >   it instead of building a second hash over the same final coord set. This cuts the CPU live set
 >   during the OBJ/PBR tail and releases decoder GPU weights before CPU-only tail work.
+> - Texture SC-VAE replay now borrows the recorded shape subdivision host arrays instead of
+>   malloc+memcpy of `idx`, `subidx`, and coords at every C2S level. Ownership tracking keeps
+>   shape-generated coords freed normally while texture replay borrows the persistent guide plan.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
@@ -281,6 +284,9 @@
 >   PBR build `12.633 ms`,
 >   `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered, final OBJ
 >   byte-identical to `/tmp/t2_scratchio_e2e.obj`.
+> - file-output exactness run after replay-borrow: `real 54.85`,
+>   `T2_TIMING program_total 54772.645 ms`, texture decoder `1969.400 ms`,
+>   PBR build `13.064 ms`, final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
 > Rejected in this pass: widening `attn_mma_hd128_f32` from 4 warps/64 query rows per CTA to
 > 8 warps/128 rows per CTA. Arithmetic stayed row-local, but hot DiT steps regressed
