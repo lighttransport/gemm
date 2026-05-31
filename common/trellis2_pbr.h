@@ -34,9 +34,11 @@ typedef struct {
 /* Sparse PBR voxel field */
 typedef struct {
     float *feats;        /* [N, 6]: RGB, metallic, roughness, alpha */
-    int32_t *coords;     /* [N, 3]: z, y, x (no batch dim) */
+    int32_t *coords;     /* optional legacy coord copy; NULL for current builders */
     int N;
     int resolution;      /* grid resolution (e.g., 512) */
+    int coord_min[3];    /* z, y, x */
+    int coord_max[3];    /* z, y, x */
     /* Hash table for fast lookup */
     uint64_t *hash_keys;
     int32_t  *hash_vals;
@@ -49,6 +51,11 @@ typedef struct {
  * resolution: voxel grid resolution */
 t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
                                    int N, int resolution);
+
+/* Same as t2_pbr_from_decoder, but takes ownership of feats and scales/clamps
+ * it in-place. The returned field owns feats and frees it in t2_pbr_free. */
+t2_pbr_field t2_pbr_from_decoder_take(float *feats, const int32_t *coords,
+                                        int N, int resolution);
 
 /* Sample PBR attributes at mesh vertex positions via trilinear interpolation.
  * vertices: [n_verts, 3] in [-0.5, 0.5] normalized space
@@ -98,34 +105,34 @@ static uint64_t t2pbr_hash_key(int z, int y, int x) {
     return ((uint64_t)(z & 0xFFFFF) << 40) | ((uint64_t)(y & 0xFFFFF) << 20) | (uint64_t)(x & 0xFFFFF);
 }
 
-t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
-                                   int N, int resolution) {
+static t2_pbr_field t2_pbr_from_decoder_impl(float *owned_feats,
+                                               const float *feats,
+                                               const int32_t *coords,
+                                               int N, int resolution) {
     t2_pbr_field f = {0};
     f.N = N;
     f.resolution = resolution;
+    for (int a = 0; a < 3; a++) {
+        f.coord_min[a] = 1 << 30;
+        f.coord_max[a] = -(1 << 30);
+    }
 
     /* Copy and scale features: raw -> * 0.5 + 0.5 -> clamp [0,1] */
-    f.feats = (float *)malloc((size_t)N * 6 * sizeof(float));
+    f.feats = owned_feats ? owned_feats : (float *)malloc((size_t)N * 6 * sizeof(float));
     for (int i = 0; i < N * 6; i++) {
         float v = feats[i] * 0.5f + 0.5f;
         f.feats[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 
-    /* Strip batch dimension from coords: [N, 4] -> [N, 3], matching the mesh
-     * builder's axis convention so the field and the vertex sampler agree.
+    /* Use coords as (col1, col2, col3), matching the mesh builder's axis
+     * convention so the field and the vertex sampler agree.
      *
      * t2_fdg_to_mesh reads coords3 = (col1, col2, col3) and emits
      *   vertices[0] (world x) from col3,  vertices[2] (world z) from col1.
      * t2_pbr_sample_vertices maps vertices[0]->ix and vertices[2]->iz, then
      * looks up hash(iz, iy, ix) = hash(col1, col2, col3). So the field MUST be
-     * stored in (col1, col2, col3) order. The previous (col3, col2, col1) order
+     * indexed in (col1, col2, col3) order. The previous (col3, col2, col1) order
      * swapped x<->z, so lookups only hit on the x==z diagonal (~11% coverage). */
-    f.coords = (int32_t *)malloc((size_t)N * 3 * sizeof(int32_t));
-    for (int i = 0; i < N; i++) {
-        f.coords[i * 3 + 0] = coords[i * 4 + 1];  /* col1 -> hash axis0 (iz) */
-        f.coords[i * 3 + 1] = coords[i * 4 + 2];  /* col2 -> hash axis1 (iy) */
-        f.coords[i * 3 + 2] = coords[i * 4 + 3];  /* col3 -> hash axis2 (ix) */
-    }
 
     /* Build hash table */
     int cap = N * 4; if (cap < 64) cap = 64;
@@ -137,7 +144,16 @@ t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
     memset(f.hash_keys, 0xFF, (size_t)cap * sizeof(uint64_t));
 
     for (int i = 0; i < N; i++) {
-        uint64_t key = t2pbr_hash_key(f.coords[i*3], f.coords[i*3+1], f.coords[i*3+2]);
+        int z = coords[i * 4 + 1];
+        int y = coords[i * 4 + 2];
+        int x = coords[i * 4 + 3];
+        if (z < f.coord_min[0]) f.coord_min[0] = z;
+        if (y < f.coord_min[1]) f.coord_min[1] = y;
+        if (x < f.coord_min[2]) f.coord_min[2] = x;
+        if (z > f.coord_max[0]) f.coord_max[0] = z;
+        if (y > f.coord_max[1]) f.coord_max[1] = y;
+        if (x > f.coord_max[2]) f.coord_max[2] = x;
+        uint64_t key = t2pbr_hash_key(z, y, x);
         unsigned slot = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(cap - 1);
         while (f.hash_keys[slot] != (uint64_t)-1) slot = (slot + 1) & (unsigned)(cap - 1);
         f.hash_keys[slot] = key;
@@ -145,6 +161,16 @@ t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
     }
 
     return f;
+}
+
+t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
+                                   int N, int resolution) {
+    return t2_pbr_from_decoder_impl(NULL, feats, coords, N, resolution);
+}
+
+t2_pbr_field t2_pbr_from_decoder_take(float *feats, const int32_t *coords,
+                                        int N, int resolution) {
+    return t2_pbr_from_decoder_impl(feats, feats, coords, N, resolution);
 }
 
 static int t2pbr_lookup(const t2_pbr_field *f, int z, int y, int x) {
@@ -259,14 +285,6 @@ static void t2pbr_update_vrange(const float voxel_pos[3],
 static void t2pbr_print_sample_diag(const t2_pbr_field *field, int n_verts,
                                      long hits, long snapped,
                                      const float vmin[3], const float vmax[3]) {
-    int fmin[3] = {1<<30,1<<30,1<<30}, fmax[3] = {-(1<<30),-(1<<30),-(1<<30)};
-    for (int i = 0; i < field->N; i++) {
-        for (int a = 0; a < 3; a++) {
-            int c = field->coords[i*3+a];
-            if (c < fmin[a]) fmin[a] = c;
-            if (c > fmax[a]) fmax[a] = c;
-        }
-    }
     long covered = hits + snapped;
     fprintf(stderr,
         "T2 PBR: %d verts: trilinear %ld (%.1f%%) + snap %ld -> covered %ld (%.1f%%); res=%d\n"
@@ -275,7 +293,9 @@ static void t2pbr_print_sample_diag(const t2_pbr_field *field, int n_verts,
         n_verts, hits, 100.0 * hits / (n_verts ? n_verts : 1), snapped,
         covered, 100.0 * covered / (n_verts ? n_verts : 1), field->resolution,
         vmin[0], vmax[0], vmin[1], vmax[1], vmin[2], vmax[2],
-        fmin[0], fmax[0], fmin[1], fmax[1], fmin[2], fmax[2]);
+        field->coord_min[0], field->coord_max[0],
+        field->coord_min[1], field->coord_max[1],
+        field->coord_min[2], field->coord_max[2]);
 }
 
 void t2_pbr_sample_vertices(const t2_pbr_field *field,
