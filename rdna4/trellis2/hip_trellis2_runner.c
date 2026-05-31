@@ -152,6 +152,7 @@ struct hip_trellis2_runner {
     hipFunction_t fn_quant_act_int8; /* W8A8: F32 activations -> per-row I8 */
     hipFunction_t fn_gemm_w8a8;      /* W8A8 scalar fallback */
     hipFunction_t fn_gemm_w8a8_wmma; /* W8A8 gfx12 WMMA */
+    hipFunction_t fn_gemm_w8a8_pgr2; /* W8A8 gfx12 pipelined WMMA (fast) */
     hipFunction_t fn_calib_amax;     /* per-input-channel activation amax */
     hipFunction_t fn_pack_bf16;      /* pack_bf16_from_f32 — F32 -> BF16 for hipBLASLt */
     int use_wmma;                    /* 1 iff BF16 WMMA kernel is loaded & enabled */
@@ -707,7 +708,17 @@ static int gemm_int8(hip_trellis2_runner *r, void *Y, const t2_wt *wt,
     if (!wt->w || !wt->i8_wscale || !r->fn_quant_act_int8 || !r->fn_gemm_w8a8)
         return -1;
 
-    size_t xq_bytes = (size_t)n_tok * (size_t)n_in;
+    /* Pipelined pgr2 WMMA path: needs n_in%32==0, n_out%128==0, and the
+     * activation padded to a 128-row multiple (kernel reads padded rows, masks
+     * the store to row<n_tok). ~5x faster than the non-pipelined wmma kernel. */
+    const char *dp4a_env0 = getenv("T2_INT8_DP4A");
+    int force_dp4a0 = dp4a_env0 && atoi(dp4a_env0);
+    int use_pgr2 = (!force_dp4a0 && r->fn_gemm_w8a8_pgr2 &&
+                    (n_in % 32) == 0 && (n_out % 128) == 0);
+    int M_pad = ((n_tok + 127) / 128) * 128;
+    int xq_rows = use_pgr2 ? M_pad : n_tok;
+
+    size_t xq_bytes = (size_t)xq_rows * (size_t)n_in;
     if (xq_bytes > r->i8_xq_cap) {
         if (r->d_xq_int8) { hipDeviceSynchronize(); hipFree(r->d_xq_int8); r->d_xq_int8 = NULL; }
         if (hipMalloc(&r->d_xq_int8, xq_bytes) != hipSuccess) return -1;
@@ -730,6 +741,14 @@ static int gemm_int8(hip_trellis2_runner *r, void *Y, const t2_wt *wt,
     void *Wq = wt->w;
     void *wscale = wt->i8_wscale;
     const void *bias_arg = bias;
+    /* Pipelined pgr2 path (fastest): arg order (Y,Wq,Xq,bias,xscale,wscale,...). */
+    if (use_pgr2) {
+        void *pa[] = { &Y, &Wq, &r->d_xq_int8, &bias_arg, &r->d_x_iscale, &wscale,
+                       &n_out, &n_in, &n_tok, &M_pad };
+        return hipModuleLaunchKernel(r->fn_gemm_w8a8_pgr2,
+            (unsigned)(n_out / 128), (unsigned)(M_pad / 128),
+            1, 128, 1, 1, 0, 0, pa, NULL) == hipSuccess ? 0 : -1;
+    }
     void *ga[] = { &Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale,
                    &bias_arg, &n_out, &n_in, &n_tok };
     const char *dp4a_env = getenv("T2_INT8_DP4A");
@@ -1215,6 +1234,7 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
     r->fn_quant_act_int8 = NULL;
     r->fn_gemm_w8a8 = NULL;
     r->fn_gemm_w8a8_wmma = NULL;
+    r->fn_gemm_w8a8_pgr2 = NULL;
     r->fn_calib_amax = NULL;
     if (hipModuleGetFunction(&r->fn_calib_amax, r->mod, "t2_amax_per_col_f32") != hipSuccess)
         r->fn_calib_amax = NULL;
@@ -1224,6 +1244,8 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
         r->fn_gemm_w8a8 = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_w8a8_wmma, r->mod, "t2_gemm_w8a8_wmma") != hipSuccess)
         r->fn_gemm_w8a8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_pgr2, r->mod, "t2_gemm_w8a8_pgr2") != hipSuccess)
+        r->fn_gemm_w8a8_pgr2 = NULL;
     if (r->fn_quant_act_int8 && r->fn_gemm_w8a8) {
         fprintf(stderr, "T2-HIP: INT8 W8A8 GEMM kernels available%s\n",
                 r->fn_gemm_w8a8_wmma ? " (WMMA + DP4A fallback)" : " (DP4A fallback)");
@@ -2901,11 +2923,9 @@ int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
             return -1;
         }
         int has_smooth = safetensors_find(st, "blocks.0.self_attn.to_qkv.smooth_scale") >= 0;
-        fprintf(stderr, "T2-HIP: SLAT DiT INT8 W8A8 enabled%s\n",
-                has_smooth ? " (SmoothQuant)" : "");
-        fprintf(stderr, "T2-HIP: NOTE INT8 SLAT GEMM is ~2.5x slower than bf16 here "
-                "(unoptimized W8A8 WMMA); bf16 SLAT fits 16 GB and is the recommended "
-                "default. Use INT8 only when memory-constrained.\n");
+        fprintf(stderr, "T2-HIP: SLAT DiT INT8 W8A8 enabled%s%s\n",
+                has_smooth ? " (SmoothQuant)" : "",
+                r->fn_gemm_w8a8_pgr2 ? " [pgr2 pipelined WMMA — ~bf16 speed, half memory]" : "");
     }
 
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
@@ -3323,11 +3343,9 @@ int hip_trellis2_load_tex_dit(hip_trellis2_runner *r, const char *path) {
             return -1;
         }
         int has_smooth = safetensors_find(st, "blocks.0.self_attn.to_qkv.smooth_scale") >= 0;
-        fprintf(stderr, "T2-HIP: tex DiT INT8 W8A8 enabled%s\n",
-                has_smooth ? " (SmoothQuant)" : "");
-        fprintf(stderr, "T2-HIP: NOTE INT8 tex GEMM is ~2.5x slower than bf16 here "
-                "(unoptimized W8A8 WMMA); bf16 tex fits 16 GB and is the recommended "
-                "default. Use INT8 only when memory-constrained.\n");
+        fprintf(stderr, "T2-HIP: tex DiT INT8 W8A8 enabled%s%s\n",
+                has_smooth ? " (SmoothQuant)" : "",
+                r->fn_gemm_w8a8_pgr2 ? " [pgr2 pipelined WMMA — ~bf16 speed, half memory]" : "");
     }
 
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
