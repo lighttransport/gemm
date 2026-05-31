@@ -284,6 +284,9 @@
 > - `cuda_trellis2_clear_subdiv_plan()` frees the recorded shape-subdivision guide after
 >   texture decode has consumed it. The full path releases about 41.5 MiB of host plan arrays
 >   before the CPU PBR/OBJ tail.
+> - The harness now frees the CUDA runner in terminal mesh-writing paths before CPU-only
+>   PBR/OBJ work, releasing decoder scratch/context memory instead of keeping it live until
+>   process exit cleanup.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
@@ -303,6 +306,9 @@
 >   PBR writer `2766.115 ms`, final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 > - file-output exactness run after early subdivision-plan clear: `real 55.04`,
 >   `T2_TIMING program_total 54946.725 ms` (noisy FDG extract `472.903 ms` in this run),
+>   final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
+> - file-output exactness run after early runner release: `real 54.92`,
+>   `T2_TIMING program_total 54818.543 ms`, PBR writer `2746.047 ms`,
 >   final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
 > Rejected in this pass: widening `attn_mma_hd128_f32` from 4 warps/64 query rows per CTA to
