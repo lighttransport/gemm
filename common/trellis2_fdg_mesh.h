@@ -135,10 +135,14 @@ t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
     /* 2. Build spatial hash */
     fdg_hash hash = fdg_hash_build(coords, N);
 
-    /* 3. Find quads from intersected edges */
-    int max_quads = N * 3;
-    int *quads = (int *)malloc((size_t)max_quads * 4 * sizeof(int));
+    /* 3. Find quads from intersected edges and split them immediately.
+     * This preserves the old quad scan order while avoiding a large temporary
+     * quad list before the final triangle buffer. */
+    int max_tris = N * 3;
+    if (max_tris < 2) max_tris = 2;
+    int *tris = (int *)malloc((size_t)max_tris * 3 * sizeof(int));
     int n_quads = 0;
+    int n_tris = 0;
 
     for (int i = 0; i < N; i++) {
         int z = coords[i * 3], y = coords[i * 3 + 1], x = coords[i * 3 + 2];
@@ -158,39 +162,31 @@ t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
             }
             if (!valid) continue;
 
-            if (n_quads >= max_quads) {
-                max_quads *= 2;
-                quads = (int *)realloc(quads, (size_t)max_quads * 4 * sizeof(int));
+            if (n_tris + 2 > max_tris) {
+                max_tris *= 2;
+                tris = (int *)realloc(tris, (size_t)max_tris * 3 * sizeof(int));
             }
-            memcpy(quads + n_quads * 4, qi, 4 * sizeof(int));
+            float sw0 = feats[qi[0]*7+6] * feats[qi[2]*7+6];
+            float sw1 = feats[qi[1]*7+6] * feats[qi[3]*7+6];
+
+            if (sw0 > sw1) {
+                /* Split 1: (0,1,2), (0,2,3) */
+                tris[n_tris*3+0]=qi[0]; tris[n_tris*3+1]=qi[1]; tris[n_tris*3+2]=qi[2]; n_tris++;
+                tris[n_tris*3+0]=qi[0]; tris[n_tris*3+1]=qi[2]; tris[n_tris*3+2]=qi[3]; n_tris++;
+            } else {
+                /* Split 2: (0,1,3), (3,1,2) */
+                tris[n_tris*3+0]=qi[0]; tris[n_tris*3+1]=qi[1]; tris[n_tris*3+2]=qi[3]; n_tris++;
+                tris[n_tris*3+0]=qi[3]; tris[n_tris*3+1]=qi[1]; tris[n_tris*3+2]=qi[2]; n_tris++;
+            }
             n_quads++;
         }
     }
 
     fdg_hash_free(&hash);
-
-    /* 4. Split quads into triangles (choose split minimizing normal deviation) */
-    int *tris = (int *)malloc((size_t)n_quads * 6 * sizeof(int));
-    int n_tris = 0;
-
-    for (int q = 0; q < n_quads; q++) {
-        int *qi = quads + q * 4;
-
-        /* Use split_weight if available */
-        float sw0 = feats[qi[0]*7+6] * feats[qi[2]*7+6];
-        float sw1 = feats[qi[1]*7+6] * feats[qi[3]*7+6];
-
-        if (sw0 > sw1) {
-            /* Split 1: (0,1,2), (0,2,3) */
-            tris[n_tris*3+0]=qi[0]; tris[n_tris*3+1]=qi[1]; tris[n_tris*3+2]=qi[2]; n_tris++;
-            tris[n_tris*3+0]=qi[0]; tris[n_tris*3+1]=qi[2]; tris[n_tris*3+2]=qi[3]; n_tris++;
-        } else {
-            /* Split 2: (0,1,3), (3,1,2) */
-            tris[n_tris*3+0]=qi[0]; tris[n_tris*3+1]=qi[1]; tris[n_tris*3+2]=qi[3]; n_tris++;
-            tris[n_tris*3+0]=qi[3]; tris[n_tris*3+1]=qi[1]; tris[n_tris*3+2]=qi[2]; n_tris++;
-        }
+    if (n_tris > 0) {
+        int *shrunk = (int *)realloc(tris, (size_t)n_tris * 3 * sizeof(int));
+        if (shrunk) tris = shrunk;
     }
-    free(quads);
 
     mesh.vertices = verts;
     mesh.triangles = tris;

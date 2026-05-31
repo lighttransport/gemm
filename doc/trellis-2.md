@@ -1289,17 +1289,18 @@ driver allocator overhead rather than math: cached full textured e2e is `real 55
 ### FDG hash cleanup + shorter decode live ranges (2026-05-31)
 
 `trellis2_fdg_mesh.h` now maps spatial-hash slots with multiply-high reduction and branch wraparound
-instead of integer `%` in the hot insert/lookup/probe path. The logical scan order is unchanged, so
-the final textured OBJ remains byte-identical to the wrapper-scratch baseline.
+instead of integer `%` in the hot insert/lookup/probe path. It also splits each valid FDG quad
+directly into triangles as the quad is found, preserving the old scan order while dropping the large
+temporary quad list. The final textured OBJ remains byte-identical to the wrapper-scratch baseline.
 
 The CUDA harness also drops large host/GPU objects as soon as downstream stages have copied what they
 need: occupancy after sparse coord extraction, conditioning features after DiTs finish, shape decoder
 weights and shape output after FDG extraction, texture decoder weights after texture decode, and raw
 texture decoder output after the PBR field copy. This mainly lowers the CPU/GPU live set during the
 CPU mesh/PBR tail (roughly `~130 MiB` less host data during OBJ writing) without changing math. Final
-validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_fdghash_e2e.obj` succeeds; cached full textured
-e2e with file output is `real 55.28` (`T2_TIMING program_total 55182.616 ms`), with the usual OBJ
-formatting variance and the same `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` / `100%`.
+validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_fdgdirect_e2e.obj` succeeds; cached full textured
+e2e with file output is `real 55.08` (`T2_TIMING program_total 54986.447 ms`, FDG mesh
+`388.615 ms`), with the same `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` / `100%`.
 
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
