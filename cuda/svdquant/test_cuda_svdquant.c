@@ -6,14 +6,19 @@
  *   INT4 (w4a16 + w4a4) and NVFP4 w4a16 : host-decode the 4-bit residual weight
  *       to f32, then run the forward as pedantic FP32 cuBLAS GEMMs
  *       (residual + the two rank-128 low-rank GEMMs). This is a correctness
- *       test, not a perf path — there is no INT4 tensor-core kernel needed.
+ *       baseline.
+ *   INT4-as-INT8 w4a4 : GPU-decode INT4 nibbles to signed int8, GPU-quantize
+ *       activations to signed int8 in the same group-64 scale domain, then use
+ *       cuBLAS IMMA (s8 x s8 -> s32) per group.
+ *   INT8 w8a8 : GPU-encode the f32 residual and smoothed activations to true
+ *       signed int8 group-64, then use the same IMMA residual path.
  *   NVFP4 w4a4 : the native HW path — cuda/fp4_w4a4.h's fp4_w4a4_gemm runs the
  *       sm_120a block-scale mma.sync on the residual (quantizing the activation
  *       on-device); the low-rank branch + bias are added separately. Skipped
  *       gracefully if the kernel will not compile (non-sm_120a GPU).
  *
- * Gates rel_L2(impl, y_svdq): SGEMM cases <= 2e-4 (f32 reduction order);
- * NVFP4-w4a4 <= 1e-2 (the kernel re-quantizes activations vs numpy).
+ * Gates rel_L2(impl, y_svdq): SGEMM + INT8 MMA cases <= 2e-4; NVFP4-w4a4
+ * <= 1e-2 (the kernel re-quantizes activations vs numpy).
  *
  * Build: gcc -O2 -I.. -o test_cuda_svdquant test_cuda_svdquant.c \
  *            ../cuew.c ../cublasew.c -ldl -lm
@@ -27,6 +32,7 @@
 #include "cuew.h"
 #include "../cublasew.h"
 #include "../fp4_w4a4.h"
+#include "cuda_svdquant.h"
 
 #include "npy_io.h"
 #include "svdquant_cpu.h"   /* host decode/quant helpers, shared with the CPU test */
@@ -34,6 +40,8 @@
 #define CHECK_CUDA(call) do { CUresult e = (call); if (e != CUDA_SUCCESS) { \
     const char *s; cuGetErrorString(e, &s); \
     fprintf(stderr, "CUDA %s:%d: %s\n", __FILE__, __LINE__, s); exit(1); } } while (0)
+#define CHECK_SQ(call) do { if ((call) != 0) { \
+    fprintf(stderr, "cuda_svdquant %s:%d: %s failed\n", __FILE__, __LINE__, #call); exit(1); } } while (0)
 
 static const char *g_dir;
 
@@ -63,11 +71,15 @@ static double cosine(const float *a, const float *b, int n) {
 static CUdeviceptr up_f32(const float *h, size_t n) {
     CUdeviceptr d; CHECK_CUDA(cuMemAlloc(&d, n * 4)); CHECK_CUDA(cuMemcpyHtoD(d, h, n * 4)); return d;
 }
+static CUdeviceptr up_raw(const void *h, size_t bytes) {
+    CUdeviceptr d; CHECK_CUDA(cuMemAlloc(&d, bytes)); CHECK_CUDA(cuMemcpyHtoD(d, h, bytes)); return d;
+}
 
 /* globals shared across cases */
 static int OUT, IN, TOK, RANK;
 static cublasew_context *blas;
 static fp4_w4a4_ctx fp4ctx;
+static cuda_svdquant_ctx sqctx;
 static int have_fp4;
 static float *g_x, *g_bias, *g_yfp;
 
@@ -139,6 +151,85 @@ static void run_fp4_case(const float *xr, CUdeviceptr d_qw, CUdeviceptr d_ws, CU
     cuMemFree(d_xr); cuMemFree(d_resid);
 }
 
+/* INT4 W4A4 through INT8 MMA: GPU-decode qint4 -> i8, GPU-quantize xr -> i8. */
+static void run_int4_as_int8_case(const uint8_t *qint4, const float *wscale,
+                                  const float *smooth,
+                                  const float *lu, const float *ld, float *y) {
+    int ng = IN / 64;
+    CUdeviceptr d_x = up_f32(g_x, (size_t)TOK * IN);
+    CUdeviceptr d_smooth = up_f32(smooth, (size_t)IN);
+    CUdeviceptr d_qint4 = up_raw(qint4, (size_t)OUT * (IN / 2));
+    CUdeviceptr d_wscale = up_f32(wscale, (size_t)OUT * ng);
+    CUdeviceptr d_xr, d_xq, d_xscale, d_wq, d_resid;
+    CHECK_CUDA(cuMemAlloc(&d_xr, (size_t)TOK * IN * 4));
+    CHECK_CUDA(cuMemAlloc(&d_xq, (size_t)TOK * IN));
+    CHECK_CUDA(cuMemAlloc(&d_xscale, (size_t)TOK * ng * 4));
+    CHECK_CUDA(cuMemAlloc(&d_wq, (size_t)OUT * IN));
+    CHECK_CUDA(cuMemAlloc(&d_resid, (size_t)TOK * OUT * 4));
+
+    CHECK_SQ(cuda_svdquant_smooth_div(&sqctx, d_x, d_smooth, d_xr, TOK, IN));
+    CHECK_SQ(cuda_svdquant_quant_act_int4_g64(&sqctx, d_xr, d_xq, d_xscale, TOK, IN));
+    CHECK_SQ(cuda_svdquant_unpack_int4_to_i8(&sqctx, d_qint4, d_wq, OUT, IN));
+    CHECK_SQ(cuda_svdquant_int8_residual_mma(&sqctx, blas, d_resid, d_wq, d_xq,
+                                             d_wscale, d_xscale, TOK, OUT, IN));
+    CHECK_CUDA(cuCtxSynchronize());
+
+    float *resid = (float *)malloc((size_t)TOK * OUT * 4);
+    float *lo = (float *)malloc((size_t)TOK * OUT * 4);
+    CHECK_CUDA(cuMemcpyDtoH(resid, d_resid, (size_t)TOK * OUT * 4));
+    lowrank_host(lu, ld, lo);
+    assemble(y, resid, lo);
+    free(resid); free(lo);
+
+    cuMemFree(d_x); cuMemFree(d_smooth); cuMemFree(d_qint4); cuMemFree(d_wscale);
+    cuMemFree(d_xr); cuMemFree(d_xq); cuMemFree(d_xscale); cuMemFree(d_wq); cuMemFree(d_resid);
+}
+
+/* True W8A8 SVDQuant residual: GPU-encode f32 residual + xr to i8 group-64. */
+static void run_int8_w8a8_case(const float *R, const float *smooth,
+                               const float *lu, const float *ld, float *y) {
+    int ng = IN / 64;
+    CUdeviceptr d_x = up_f32(g_x, (size_t)TOK * IN);
+    CUdeviceptr d_smooth = up_f32(smooth, (size_t)IN);
+    CUdeviceptr d_R = up_f32(R, (size_t)OUT * IN);
+    CUdeviceptr d_xr, d_xq, d_xscale, d_wq, d_wscale, d_resid;
+    CHECK_CUDA(cuMemAlloc(&d_xr, (size_t)TOK * IN * 4));
+    CHECK_CUDA(cuMemAlloc(&d_xq, (size_t)TOK * IN));
+    CHECK_CUDA(cuMemAlloc(&d_xscale, (size_t)TOK * ng * 4));
+    CHECK_CUDA(cuMemAlloc(&d_wq, (size_t)OUT * IN));
+    CHECK_CUDA(cuMemAlloc(&d_wscale, (size_t)OUT * ng * 4));
+    CHECK_CUDA(cuMemAlloc(&d_resid, (size_t)TOK * OUT * 4));
+
+    CHECK_SQ(cuda_svdquant_smooth_div(&sqctx, d_x, d_smooth, d_xr, TOK, IN));
+    CHECK_SQ(cuda_svdquant_quant_act_int8_g64(&sqctx, d_xr, d_xq, d_xscale, TOK, IN));
+    CHECK_SQ(cuda_svdquant_quant_weight_int8_g64(&sqctx, d_R, d_wq, d_wscale, OUT, IN));
+    CHECK_SQ(cuda_svdquant_int8_residual_mma(&sqctx, blas, d_resid, d_wq, d_xq,
+                                             d_wscale, d_xscale, TOK, OUT, IN));
+    CHECK_CUDA(cuCtxSynchronize());
+
+    float *resid = (float *)malloc((size_t)TOK * OUT * 4);
+    float *lo = (float *)malloc((size_t)TOK * OUT * 4);
+    CHECK_CUDA(cuMemcpyDtoH(resid, d_resid, (size_t)TOK * OUT * 4));
+    lowrank_host(lu, ld, lo);
+    assemble(y, resid, lo);
+    free(resid); free(lo);
+
+    cuMemFree(d_x); cuMemFree(d_smooth); cuMemFree(d_R);
+    cuMemFree(d_xr); cuMemFree(d_xq); cuMemFree(d_xscale);
+    cuMemFree(d_wq); cuMemFree(d_wscale); cuMemFree(d_resid);
+}
+
+static int report_case(const char *name, const float *y, const float *y_svdq, double gate) {
+    double rl = rel_l2(y, y_svdq, TOK * OUT);
+    double csim = cosine(y, y_svdq, TOK * OUT);
+    double mx = (double)npy_max_abs_f32(y, y_svdq, TOK * OUT, NULL);
+    double rl_fp = rel_l2(y, g_yfp, TOK * OUT);
+    int ok = (rl <= gate);
+    printf("  %-16s rel_L2(svdq)=%.3e cos=%.7f max|d|=%.3e | rel_L2(fp)=%.4f  [gate %.0e]  %s\n",
+           name, rl, csim, mx, rl_fp, gate, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     g_dir = (argc > 1) ? argv[1] : "../../ref/svdquant/dumps";
 
@@ -152,12 +243,15 @@ int main(int argc, char **argv) {
     if (cublasewInit() != 0 || cublasewCreate(&blas, 0) != 0) {
         fprintf(stderr, "cublasew init failed\n"); return 1;
     }
+    if (cuda_svdquant_compile(&sqctx, dev, /*stream*/0, /*verbose*/0) != 0) {
+        fprintf(stderr, "cuda_svdquant compile failed\n"); return 1;
+    }
     have_fp4 = (fp4_w4a4_compile(&fp4ctx, /*stream*/0, /*verbose*/0) == 0);
 
     int nd, dms[8], f32;
     int32_t *dimv = (int32_t *)load("dims", &nd, dms, &f32);
     OUT = dimv[0]; IN = dimv[1]; TOK = dimv[2]; RANK = dimv[3]; free(dimv);
-    printf("svdquant CUDA test  dir=%s  OUT=%d IN=%d TOK=%d RANK=%d  fp4_hw=%s\n",
+    printf("svdquant CUDA test  dir=%s  OUT=%d IN=%d TOK=%d RANK=%d  int8_mma=yes fp4_hw=%s\n",
            g_dir, OUT, IN, TOK, RANK, have_fp4 ? "yes" : "no(skip nvfp4_w4a4)");
 
     g_x = load_f32("x"); g_bias = load_f32("bias"); g_yfp = load_f32("y_fp");
@@ -205,7 +299,7 @@ int main(int argc, char **argv) {
             float *wcwt = load_f32(key(pf, "_wcwt"));
             sq_unpack_nvfp4_residual(qw, ws, wcwt, R, OUT, IN, 16);
             if (is_fp4_hw) {   /* keep packed weights on device for the HW kernel */
-                d_qw = up_f32((const float *)qw, (size_t)OUT * (IN / 8));  /* i32 bytes, reuse helper */
+                d_qw = up_raw(qw, (size_t)OUT * (IN / 8) * sizeof(int32_t));
                 CHECK_CUDA(cuMemAlloc(&d_ws, (size_t)OUT * (IN / 16)));
                 CHECK_CUDA(cuMemcpyHtoD(d_ws, ws, (size_t)OUT * (IN / 16)));
                 d_wcwt = up_f32(wcwt, (size_t)OUT);
@@ -222,20 +316,39 @@ int main(int argc, char **argv) {
             run_sgemm_case(pf, R, xact, lu, ld, y);
         }
 
-        double rl = rel_l2(y, y_svdq, TOK * OUT);
-        double csim = cosine(y, y_svdq, TOK * OUT);
-        double mx = (double)npy_max_abs_f32(y, y_svdq, TOK * OUT, NULL);
-        double rl_fp = rel_l2(y, g_yfp, TOK * OUT);
-        int ok = (rl <= cs[ci].gate);
-        if (!ok) fail = 1;
-        printf("  %-12s rel_L2(svdq)=%.3e cos=%.7f max|d|=%.3e | rel_L2(fp)=%.4f  [gate %.0e]  %s\n",
-               pf, rl, csim, mx, rl_fp, cs[ci].gate, ok ? "PASS" : "FAIL");
+        fail |= report_case(pf, y, y_svdq, cs[ci].gate);
 
         free(smooth); free(lu); free(ld); free(y_svdq);
     }
 
+    {
+        const char *pf = "int4_w4a4";
+        float *smooth = load_f32(key(pf, "_smooth"));
+        float *lu = load_f32(key(pf, "_lora_up"));
+        float *ld = load_f32(key(pf, "_lora_down"));
+        float *y_svdq = load_f32(key(pf, "_y_svdq"));
+        uint8_t *qint4 = load_u8(key(pf, "_qint4"));
+        float *wscale = load_f32(key(pf, "_wscale"));
+        run_int4_as_int8_case(qint4, wscale, smooth, lu, ld, y);
+        fail |= report_case("int4_w4a4_i8mma", y, y_svdq, 2e-4);
+        free(smooth); free(lu); free(ld); free(y_svdq); free(qint4); free(wscale);
+    }
+
+    {
+        const char *pf = "int8_w8a8";
+        float *smooth = load_f32(key(pf, "_smooth"));
+        float *lu = load_f32(key(pf, "_lora_up"));
+        float *ld = load_f32(key(pf, "_lora_down"));
+        float *R = load_f32(key(pf, "_residual"));
+        float *y_svdq = load_f32(key(pf, "_y_svdq"));
+        run_int8_w8a8_case(R, smooth, lu, ld, y);
+        fail |= report_case("int8_w8a8_i8mma", y, y_svdq, 2e-4);
+        free(smooth); free(lu); free(ld); free(R); free(y_svdq);
+    }
+
     free(R); free(xr); free(xact); free(y); free(g_x); free(g_bias); free(g_yfp);
     if (have_fp4) fp4_w4a4_free(&fp4ctx);
+    cuda_svdquant_free(&sqctx);
     printf("%s\n", fail ? "RESULT: FAIL" : "RESULT: PASS");
     return fail;
 }
