@@ -51,6 +51,58 @@ The transformer_block verifier additionally needs
 ln -s /tmp/sam3d_ref/slat_dit_cond.npy /tmp/sam3d_trace/slat_dit_cond.npy
 ```
 
+## e2e correctness fix — PPE NaN under -ffast-math (commit 7fbb648)
+
+Real MoGe pointmaps have invalid (NaN) background pixels. `ppe_linear3_invalid_f32`
+used `isfinite()` to substitute `invalid_xyz_token` for them, but HIPRTC builds with
+`-ffast-math` (`-ffinite-math-only`) so `isfinite()` folds to constant `true` → NaN
+pixels took the valid path → `W·NaN = NaN` → NaN cond tokens → NaN SS-DiT latent →
+garbage 262144-voxel occupancy → broken/garbage mesh. The per-stage verifiers all
+passed because they feed clean reference inputs; only the real-pointmap e2e hit the
+path. Fixed with a bit-pattern non-finite check (exponent==0xFF). cond_fuser now
+matches the PyTorch ref (`mean_abs` nan→4.2e-7) and the e2e produces a clean finite
+mesh. **Audit other kernels for `isfinite`/`isnan`/`isinf` — same trap applies.**
+
+Validation aids (this host): on-host PyTorch dump at
+`/mnt/disk1/models/sam3d/sam3d_ref_new/` (pass as `--refdir`; has `input_image.npy`,
+`input_mask.npy`, `pointmap.npy` + every per-stage tensor). Gotchas: serialize e2e
+runs (overlapping processes corrupt a shared `-o` file; two models also OOM the 16 GB
+card), and consume the `\n` after `end_header` when byte-parsing the binary PLY.
+
+## Speed — BF16 WMMA GEMM (commit 6352c3c)
+
+`gemm_bf16w_bf16a_wmma_t` (ported from rdna4/trellis2, round-to-nearest-even bf16
+conversion) + per-call dispatchers, gated by `SAM3D_WMMA` (default on; `=0` = exact
+F32). **Now wired across DINOv2 + SS-DiT + SLAT DiT** (commits 6352c3c, b606cae,
+af6810e). Coverage: DINOv2 block GEMMs (cs3d_dinov2_gemm), SS-DiT block forward
+(ssdit_gemm), SLAT IO/input/final-layer hooks (cs3d_slat_gemm) and SLAT transformer
+block forward (slatdit_gemm). Each falls back to gemm_f32_bias when SAM3D_WMMA=0 or
+dims aren't 16-aligned. Stream 0 throughout. Attention (sdpa) stays scalar — the
+reusable WMMA flash-attn hardcodes head_dim=128 and sam3d uses 64.
+
+Speed (image→splat, 25/25-step, warm, RX 9070 XT): e2e **833.8 → 669.6 s = 1.25×**
+(WMMA off vs on). The modest e2e ratio (vs 2.6× on the DINOv2 GEMMs alone) is
+because the pipeline is dominated by NON-GEMM work WMMA can't touch — the scalar
+`sdpa_f32` self-attention and the CPU-driven SLAT ODE. Those, plus a head_dim=64
+WMMA flash-attn, are the real e2e levers; GEMM WMMA was the safe first pass.
+
+Quality (judge by e2e mesh, not the strict per-stage F32 gates — bf16 max_abs ~1e-2
+on the diffused latent is expected and over those gates):
+  - DINOv2 (conditioning): occupancy 6600→6626, distributions match (2-step).
+  - SS-DiT (diffused occupancy var, the dominant shift): full-step occupied-voxel
+    IoU 0.82 vs F32, centroids + distributions match, zero nonfinite. The IoU is
+    dominated by threshold jitter on the occupancy field; gaussian *values* match.
+  - SLAT (refines features on the fixed voxel set): incremental IoU 0.99 vs
+    SS-DiT-only — structurally negligible.
+  - Full pipeline sign-off (25/25-step, full all-WMMA vs full F32): occupied-voxel
+    IoU 0.82 (4246 F32 vs 3935 WMMA voxels, 3686 shared), centroids
+    (0.500,0.539,0.514)/(0.503,0.527,0.514), op 5.73/5.68, scale -9.87/-9.79,
+    dc -1.747/-1.747, zero nonfinite. Matches the SS-DiT-only full-step figure —
+    SLAT adds no further drift, consistent with the 0.99 incremental IoU.
+
+TODO: optional hipBLASLt (rdna4/llm/mm_blaslt_bridge, more accurate than bf16 WMMA)
+for the largest GEMMs; carry the PPE NaN fix + WMMA to rdna4/sam3d_body.
+
 ## Reproducing the dumps
 
 See `ref/sam3d/README.md` for the CUDA-host workflow. The pytorch3d

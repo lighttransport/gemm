@@ -1493,6 +1493,42 @@ static int cs3d_ensure_slat_io_gpu(hip_sam3d_ctx *ctx)
     return HIP_SAM3D_E_OK;
 }
 
+/* Shared WMMA dispatch for SLAT/GS hook GEMM sites. `args` follows the
+ * gemm_f32_bias layout {Y,X,W,bias,N,Din,Dout}. Routes to the BF16 WMMA
+ * kernel when SAM3D_WMMA!=0 and dims are 16-aligned, else gemm_fallback.
+ * Stream 0. The WMMA handle is resolved once and cached. */
+static int cs3d_slat_gemm(hip_sam3d_ctx *ctx, hipFunction_t gemm_fallback,
+                          void **args)
+{
+    static int wmma_enabled = -1;          /* -1 unresolved, 0 off, 1 on */
+    static hipFunction_t wmma_fn = NULL;
+    if (wmma_enabled < 0) {
+        const char *e = getenv("SAM3D_WMMA");
+        wmma_enabled = (!e || e[0] != '0') ? 1 : 0;
+        if (wmma_enabled &&
+            hipModuleGetFunction(&wmma_fn, ctx->mod,
+                                 "gemm_bf16w_bf16a_wmma_t") != hipSuccess) {
+            wmma_fn = NULL;
+            wmma_enabled = 0;
+        }
+    }
+    int N = *(int *)args[4], Din = *(int *)args[5], Dout = *(int *)args[6];
+    if (wmma_enabled && wmma_fn && (Dout % 16 == 0) && (Din % 16 == 0)) {
+        hipDeviceptr_t Y = *(hipDeviceptr_t *)args[0];
+        hipDeviceptr_t X = *(hipDeviceptr_t *)args[1];
+        hipDeviceptr_t W = *(hipDeviceptr_t *)args[2];
+        hipDeviceptr_t B = *(hipDeviceptr_t *)args[3];
+        void *wa[] = { &Y, &W, &X, &B, &Dout, &Din, &N };
+        unsigned gx = (unsigned)((Dout + 127) / 128);
+        unsigned gy = (unsigned)((N + 127) / 128);
+        return hipModuleLaunchKernel(wmma_fn, gx, gy, 1, 256, 1, 1,
+                                     0, 0, wa, NULL) == hipSuccess ? 0 : -1;
+    }
+    unsigned gx = (unsigned)((N + 15) / 16), gy = (unsigned)((Dout + 15) / 16);
+    return hipModuleLaunchKernel(gemm_fallback, gx, gy, 1, 16, 16, 1,
+                                 0, 0, args, NULL) == hipSuccess ? 0 : -1;
+}
+
 static int cs3d_slat_io_block_gpu_hook(void *user, int is_output,
                                        int block_idx, const void *bk_void,
                                        void *xp_void, const float *t_emb,
@@ -1596,11 +1632,11 @@ static int cs3d_slat_io_block_gpu_hook(void *user, int is_output,
     int twoCout = 2 * C_out, one = 1;
     { unsigned gx = 1, gy = (twoCout + 15) / 16;
       void *a[] = { &ws->d_emb, &ws->d_t_silu, &gb->emb_w, &gb->emb_b, &one, &dim, &twoCout };
-      if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess) goto done; }
+      if (cs3d_slat_gemm(ctx, fn->gemm, a) != 0) goto done; }
     if (gb->has_skip) {
         unsigned gx = (outN + 15) / 16, gy = (C_out + 15) / 16;
         void *a[] = { &ws->d_skip, &d_base, &gb->skip_w, &gb->skip_b, &outN, &C_in, &C_out };
-        if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess) goto done;
+        if (cs3d_slat_gemm(ctx, fn->gemm, a) != 0) goto done;
     } else {
         if (C_in != C_out ||
             hipMemcpyDtoD(ws->d_skip, d_base, (size_t)outN * C_out * sizeof(float)) != hipSuccess)
@@ -1696,7 +1732,7 @@ static int cs3d_slat_input_layer_gpu_hook(void *user, void *xp_void,
     { unsigned gx = (N + 15) / 16, gy = (outC + 15) / 16;
       void *a[] = { &ws->d_h1, &ws->d_in_feats, &ctx->gpu_slat_io.input_w,
                     &ctx->gpu_slat_io.input_b, &N, &C, &outC };
-      if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_slat_gemm(ctx, fn->gemm, a) != 0)
           goto done; }
 
     host_feats = (float *)malloc(out_bytes);
@@ -1764,7 +1800,7 @@ static int cs3d_slat_final_layer_gpu_hook(void *user, void *xp_void,
     { unsigned gx = (N + 15) / 16, gy = (outC + 15) / 16;
       void *a[] = { &ws->d_h2, &ws->d_h1, &ctx->gpu_slat_io.out_w,
                     &ctx->gpu_slat_io.out_b, &N, &C, &outC };
-      if (hipModuleLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != hipSuccess)
+      if (cs3d_slat_gemm(ctx, fn->gemm, a) != 0)
           goto done; }
 
     host_feats = (float *)malloc(out_bytes);
