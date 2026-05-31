@@ -11,6 +11,8 @@
  * API:
  *   t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
  *       int N, float voxel_size, const float aabb[6]);
+ *   t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
+ *       int N, float voxel_size, const float aabb[6]);
  *   void t2_fdg_mesh_free(t2_fdg_mesh *m);
  *   int t2_fdg_write_obj(const char *path, const t2_fdg_mesh *m);
  */
@@ -37,6 +39,10 @@ typedef struct {
  * aabb: [6] = (min_x, min_y, min_z, max_x, max_y, max_z) */
 t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
                               int N, float voxel_size, const float aabb[6]);
+
+/* Variant for coords stored as [N,4] int32 (batch, z, y, x). */
+t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
+                                   int N, float voxel_size, const float aabb[6]);
 
 void t2_fdg_mesh_free(t2_fdg_mesh *m);
 int t2_fdg_write_obj(const char *path, const t2_fdg_mesh *m);
@@ -69,7 +75,7 @@ static unsigned fdg_hash_slot(int64_t key, int capacity) {
     return (unsigned)(((uint64_t)h * (uint32_t)capacity) >> 32);
 }
 
-static fdg_hash fdg_hash_build(const int32_t *coords, int N) {
+static fdg_hash fdg_hash_build(const int32_t *coords, int N, int stride, int base) {
     int cap = N * 4;  /* load factor 0.25 */
     if (cap < 64) cap = 64;
     fdg_hash h;
@@ -79,7 +85,8 @@ static fdg_hash fdg_hash_build(const int32_t *coords, int N) {
     memset(h.keys, 0xFF, (size_t)cap * sizeof(int64_t));  /* -1 = empty */
 
     for (int i = 0; i < N; i++) {
-        int64_t key = fdg_hash_key(coords[i * 3], coords[i * 3 + 1], coords[i * 3 + 2]);
+        const int32_t *c = coords + (size_t)i * stride + base;
+        int64_t key = fdg_hash_key(c[0], c[1], c[2]);
         unsigned slot = fdg_hash_slot(key, cap);
         while (h.keys[slot] != -1) {
             slot++;
@@ -116,24 +123,26 @@ static const int edge_offsets[3][4][3] = {
     {{0,0,0}, {0,1,0}, {1,1,0}, {1,0,0}},
 };
 
-t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
-                              int N, float voxel_size, const float aabb[6]) {
+static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *feats,
+                                             int N, int stride, int base,
+                                             float voxel_size, const float aabb[6]) {
     t2_fdg_mesh mesh = {0};
 
     /* 1. Compute mesh vertices: (coord + dual_vertex) * voxel_size + aabb_min */
     float *verts = (float *)malloc((size_t)N * 3 * sizeof(float));
     for (int i = 0; i < N; i++) {
+        const int32_t *c = coords + (size_t)i * stride + base;
         /* feats[i, 0:3] = vertex offsets (sigmoid applied by caller) */
         float vx = feats[i * 7 + 0];
         float vy = feats[i * 7 + 1];
         float vz = feats[i * 7 + 2];
-        verts[i * 3 + 0] = ((float)coords[i * 3 + 2] + vx) * voxel_size + aabb[0];  /* x */
-        verts[i * 3 + 1] = ((float)coords[i * 3 + 1] + vy) * voxel_size + aabb[1];  /* y */
-        verts[i * 3 + 2] = ((float)coords[i * 3 + 0] + vz) * voxel_size + aabb[2];  /* z */
+        verts[i * 3 + 0] = ((float)c[2] + vx) * voxel_size + aabb[0];  /* x */
+        verts[i * 3 + 1] = ((float)c[1] + vy) * voxel_size + aabb[1];  /* y */
+        verts[i * 3 + 2] = ((float)c[0] + vz) * voxel_size + aabb[2];  /* z */
     }
 
     /* 2. Build spatial hash */
-    fdg_hash hash = fdg_hash_build(coords, N);
+    fdg_hash hash = fdg_hash_build(coords, N, stride, base);
 
     /* 3. Find quads from intersected edges and split them immediately.
      * This preserves the old quad scan order while avoiding a large temporary
@@ -145,7 +154,8 @@ t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
     int n_tris = 0;
 
     for (int i = 0; i < N; i++) {
-        int z = coords[i * 3], y = coords[i * 3 + 1], x = coords[i * 3 + 2];
+        const int32_t *c = coords + (size_t)i * stride + base;
+        int z = c[0], y = c[1], x = c[2];
         for (int axis = 0; axis < 3; axis++) {
             /* Check if this voxel's edge in this axis is intersected */
             if (feats[i * 7 + 3 + axis] <= 0.0f) continue;
@@ -195,6 +205,16 @@ t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
 
     fprintf(stderr, "fdg_mesh: %d verts, %d quads -> %d triangles\n", N, n_quads, n_tris);
     return mesh;
+}
+
+t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
+                              int N, float voxel_size, const float aabb[6]) {
+    return t2_fdg_to_mesh_strided(coords, feats, N, 3, 0, voxel_size, aabb);
+}
+
+t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
+                                   int N, float voxel_size, const float aabb[6]) {
+    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb);
 }
 
 void t2_fdg_mesh_free(t2_fdg_mesh *m) {
