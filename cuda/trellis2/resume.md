@@ -253,6 +253,29 @@
 > their own scratch slots. Byte-identical final OBJ/dumps; cached full textured e2e `real 55.05`,
 > `T2_TIMING program_total 54964.562 ms`. Small wall win, mainly removes driver allocator churn.
 >
+> ## FDG HASH + DECODE LIVE-RANGE CLEANUP (2026-05-31)
+>
+> Accepted:
+> - `trellis2_fdg_mesh.h` removes integer `%` from the hot spatial-hash insert/lookup/probe path,
+>   using multiply-high slot reduction and branch wraparound. Final OBJ is byte-identical to the
+>   wrapper-scratch baseline (`cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_fdghash_e2e.obj` => `0`).
+> - `test_cuda_trellis2.c` now frees/unloads data as soon as each downstream copy is complete:
+>   occupancy after sparse extraction, conditioning features after DiTs, shape decoder weights after
+>   shape decode, shape output/coords after FDG mesh extraction, texture decoder weights after texture
+>   decode, and raw texture output after PBR-field construction. This cuts the CPU live set during the
+>   OBJ/PBR tail by roughly `~130 MiB` and releases decoder GPU weights before CPU-only tail work.
+>
+> Validation:
+> - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
+> - final file-output exactness run: `real 55.28`, `T2_TIMING program_total 55182.616 ms`,
+>   FDG mesh `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered, final OBJ
+>   byte-identical to `/tmp/t2_scratchio_e2e.obj`.
+>
+> Rejected in this pass: widening `attn_mma_hd128_f32` from 4 warps/64 query rows per CTA to
+> 8 warps/128 rows per CTA. Arithmetic stayed row-local, but hot DiT steps regressed
+> (`Stage1 CFG ~1741 -> ~1788 ms`, `Stage2 CFG ~1466 -> ~1522 ms`, `Stage3 ~733 -> ~761 ms`), so the
+> kernel/launcher were reverted.
+>
 > ## LAZY PER-STAGE DiT LOAD — peak 12.7 → 5.3 GB (2026-05-30)
 >
 > Was: harness loaded all 3 DiTs + shape decoder upfront → ~12.7 GB peak (3100 MB free)

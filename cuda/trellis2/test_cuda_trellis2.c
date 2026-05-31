@@ -576,6 +576,8 @@ int main(int argc, char **argv) {
                 }
 sparse_done:
         free(pooled);
+        free(occupancy);
+        occupancy = NULL;
         fprintf(stderr, "Sparse voxels: %d @res%d (threshold %.4f)\n",
                 N_sparse, SS_R, sparse_threshold);
         t2_harness_timing_log("stage2_sparse_extract_cpu", sparse_extract_t0);
@@ -764,6 +766,8 @@ sparse_done:
          * Stage 1) before decoding — otherwise the shape decode OOMs at its
          * finest level (~1.47M voxels) with the DiTs resident. */
         cuda_trellis2_unload_dit_stages(r);
+        free(features);
+        features = NULL;
 
         /* Lazy load the shape decoder now that all DiTs are freed (it was NOT
          * loaded upfront — see the lazy-load note at weight-load time). */
@@ -787,6 +791,7 @@ sparse_done:
             return 1;
         }
         t2_harness_timing_log("shape_decoder_cuda_total", shape_decode_t0);
+        cuda_trellis2_unload_shape_decoder(r);
         free(s2_x);
         fprintf(stderr, "Shape decoder output: N=%d, C=%d\n", result.N, result.C);
 
@@ -827,6 +832,9 @@ sparse_done:
         double fdg_mesh_t0 = t2_harness_now_ms();
         t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
         t2_harness_timing_log("fdg_mesh_extract_cpu", fdg_mesh_t0);
+        free(coords3);
+        coords3 = NULL;
+        t2_shape_dec_result_free(&result);
 
         if (fdg_mesh.n_tris > 0) {
             /* Optional debug sidecar. The requested output path is still written
@@ -846,9 +854,16 @@ sparse_done:
                 if (cuda_trellis2_load_texture_decoder(r, tex_dec_path) == 0) {
                     t2_shape_dec_result tex_result = {0};
                     double tex_decode_t0 = t2_harness_now_ms();
-                    if (cuda_trellis2_run_texture_decoder_alloc(r, tex_slat, sparse_coords, N_sparse,
-                                                                &tex_result.feats, &tex_result.coords,
-                                                                &tex_result.N, &tex_result.C) != 0) {
+                    int tex_decode_rc = cuda_trellis2_run_texture_decoder_alloc(
+                        r, tex_slat, sparse_coords, N_sparse,
+                        &tex_result.feats, &tex_result.coords,
+                        &tex_result.N, &tex_result.C);
+                    cuda_trellis2_unload_texture_decoder(r);
+                    free(tex_slat);
+                    tex_slat = NULL;
+                    free(sparse_coords);
+                    sparse_coords = NULL;
+                    if (tex_decode_rc != 0) {
                         fprintf(stderr, "CUDA texture decoder failed, writing shape-only mesh\n");
                         t2_fdg_write_obj(obj_path, &fdg_mesh);
                         t2_shape_dec_result_free(&tex_result);
@@ -892,6 +907,7 @@ sparse_done:
                     t2_pbr_field pbr = t2_pbr_from_decoder(
                         tex_result.feats, tex_result.coords, tex_result.N, tex_res);
                     t2_harness_timing_log("pbr_field_build_cpu", pbr_build_t0);
+                    t2_shape_dec_result_free(&tex_result);
 
                     /* The UV atlas writer is still experimental; default to
                      * vertex-colored OBJ so texture decode smoke tests do not
