@@ -113,53 +113,39 @@ The dinov3 encoder attention used the scalar `flash_attn_tiled_f32`
   level, consistent with the standalone harness. Default OFF; flip on once you
   want the ~30 ms.
 
-## GPU MHR pose_correctives matvec (opt-in, default OFF) — validated gfx1201
+## GPU MHR offload (SAM3D_MHR_GPU=1, default OFF) — validated, ~9x on the mhr stage
 
-MHR skinning (CPU/OpenMP) is the dominant remaining decoder cost. Its hot path
-is a single 166M-FMA dense matvec `out[55317] = LW[55317,3000] @ h[3000]`
-(bias-free) in `pose_correctives`, run 7× (per decoder layer + final).
+The MHR pose_correctives dense matvec (out[55317]=LW[55317,3000]@h[3000], the
+166M-FMA hot path) + blend_shape/face_expressions are offloaded to GPU behind two
+plain-C hooks on the assets struct in common/sam3d_body_mhr.h (no HIP types in the
+shared header): pc_matvec_fn and blend_combine_fn. pose_correctives / blend_shape
+/ face_expressions call their hook when set and B==1, else run on CPU. Runner
+sb_mhr_gpu_setup (gated SAM3D_MHR_GPU=1) uploads weights resident (LW 633 MiB +
+blend/face 24 MiB), VRAM-guarded, and installs the hooks; the matvec uses
+mhr_pc_matvec_f32 (1 block/row, ~600 GB/s), blend/face reuse the
+verify_mhr-clean mhr_blend_combine_f32.
 
-- **Mechanism:** `common/sam3d_body_mhr.h` gained an optional plain-C callback
-  hook `pc_matvec_fn` on the assets struct; `pose_correctives` calls it instead
-  of the CPU matvec when set (no HIP types leak into the shared CPU header). The
-  runner installs `sb_pc_matvec_gpu` (runs `gemm_f32_bias` N=1, D_in=3000,
-  D_out=55317, b=NULL on resident LW) via `sb_mhr_gpu_setup` when
-  `SAM3D_MHR_GPU=1`. Constant is `S3DM_N_PC_H`(=3000); matvec is bias-free
-  (`pc_linear_weight` only — there is no `pc_linear_bias`).
-- **VRAM guard:** LW is 633 MiB resident; only engages if `hipMemGetInfo`
-  reports ≥ LW + ~1 GiB free, else stays on CPU (an unguarded reservation OOM'd
-  the downstream pipeline → `rc=4` when the box was VRAM-starved). Debug:
-  `SAM3D_MHR_GPU_DEBUG=1`.
-- **Isolated bench (`bench_pc_matvec`):** GPU matvec vs CPU reference cosine 1.0,
-  max_abs 1.3e-6; **5.92×** (CPU 24.1 ms → GPU 4.08 ms/call, LW resident).
-- **e2e correctness:** GPU-MHR vs CPU-MHR mesh **cosine 1.00000000, max vertex
-  diff 0.0 — bit-identical**. (Pipeline is deterministic: CPU-vs-CPU re-run also
-  0.0.)
-- **e2e perf** (dinov3 fujisan.jpg, all-WMMA, single cold run = real single-shot
-  inference): decoder **`mhr` 525.5 → 115.7 ms**, decoder **total 751.9 →
-  237.1 ms**. Most of the CPU cost is a **419 ms layer-0 cold-start** (OpenMP
-  thread spin-up + first-touch of the cold 633 MiB LW); GPU layer-0 is 21.8 ms
-  because LW is pre-resident — that vanished cold-start is dispositive proof the
-  hook engaged. Warm steady-state per-call is closer (CPU ~20–24 ms vs GPU
-  ~18–21 ms) since the non-matvec MHR stages (blend/face/skin) stay on CPU; the
-  big win is eliminating the cold-start that single-shot inference always pays.
-- **Matvec kernel: `mhr_pc_matvec_f32`** replaces the N=1 `gemm_f32_bias` for the
-  hook (the 16×16-block GEMM wastes 15/16 lanes when N=1). One block (64 thr) per
-  output row, coalesced W reads, LDS reduce — a memory-bound GEMV. Soft handle
-  `fn_mhr_pc_matvec` (NULL → gemm_f32_bias fallback). Standalone `bench_pc_matvec`:
-  kernel **8.70 → 1.05 ms** (8.3×, **~600 GB/s ≈ HBM-bound floor**), per-call
-  4.08 → 1.61 ms, **14.98× vs CPU**; cos 1.0. Mesh f32-level (3.8e-6 vs CPU).
-- **HONEST e2e caveat (measured, `SAM3D_MHR_GPU_DEBUG=1`):** the hook is only
-  **1.6 ms/call** warm — ~9% of the ~18 ms per-call MHR. So the faster matvec
-  barely moves e2e (decoder ~237→234 ms). The residual ~16 ms is the CPU
-  blend/face/skin stages: ~5 ms *hot* in isolation but run **cold** in-pipeline
-  (their ~26 MB of asset matrices — blend 10 MB + face 16 MB — get evicted
-  between MHR calls by intervening decoder GPU/CPU work). The matvec kernel is
-  kept because it's strictly better and correct, but **the next real MHR lever
-  is moving blend/face/skin onto GPU with resident assets** (kernels
-  `mhr_blend_combine_f32`/`mhr_lbs_skin_f32` exist + are `verify_mhr`-validated)
-  — a larger port: the whole pose_correctives→blend→face→accumulate→skin tail
-  must stay GPU-resident to avoid re-downloads. Per-call ceiling ~16 ms × 7.
+ENGAGEMENT (verified): SAM3D_MHR_GPU=1 prints both "... on GPU" setup lines; the
+matvec hook fires every in-loop call (SAM3D_MHR_GPU_DEBUG: "call #N kernel=matvec",
+~1.2 ms warm/call); per-stage profiler (SAM3D_MHR_STAGE_PROF=1) shows
+pose_correctives ~20 ms (CPU) -> ~1.3 ms (GPU), blend_shape ~0.2 ms.
+
+PERF — measured, 3 runs each, decoder `mhr` field:
+  CPU MHR: ~124 ms (118 / 130 / 125)
+  GPU MHR:  ~14 ms (14.2 / 14.0 / 14.2)
+=> ~9x on the mhr stage. decoder total ~250 -> ~140 ms.
+
+CORRECTNESS: e2e mesh GPU-MHR vs CPU-MHR cosine 1.00000000, max vertex diff
+1.0e-6 (f32 FMA order). Default path (no flags) unchanged (V=18439); CPU
+verifiers (verify_mhr/verify_decoder) + bench_mhr_stages still build (the shared
+mhr.h hooks are inert when unset).
+
+Note: the dense matvec was the bulk of MHR; the residual ~14 ms is the CPU
+sparse-matvec (NNZ=53136) + batch6D + skin + the H2D/D2H around the hooks. A
+caveat I hit and corrected: this only works because pose_correctives actually
+*dispatches* the hook (a->pc_matvec_fn && B==1) — an earlier revision installed
+the hook but omitted the dispatch line, so the matvec silently ran on CPU and
+showed no speedup. With the dispatch present it is the ~9x above.
 
 ## Decoder norm_heads: drop dead full-token LayerNorm
 
