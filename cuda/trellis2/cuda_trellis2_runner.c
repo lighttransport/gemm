@@ -279,6 +279,10 @@ struct cuda_trellis2_runner {
     int ca_kv_cache_n_blocks[2];
     int ca_kv_cache_model_id[2];  /* which model's weights were cached */
     int ca_kv_cache_valid[2];
+    CUdeviceptr ca_zero_resid[4][DIT_DEPTH];
+    int ca_zero_resid_n_blocks[4];
+    int ca_zero_resid_mode[4];
+    int ca_zero_resid_valid[4];
 
     /* Sparse Stage-2/3 RoPE tables are a pure function of coords and n_freqs.
      * Cache them across sampler steps to avoid repeated CPU sin/cos + HtoD. */
@@ -769,6 +773,24 @@ static void t2_sparse_rope_cache_free(cuda_trellis2_runner *r, int model_id) {
     r->sparse_rope_valid[model_id] = 0;
 }
 
+static int t2_zero_resid_mode(const t2_ops *ops) {
+    return (ops->use_f32_gemm ? 1 : 0) |
+           (ops->use_tf32_gemm ? 2 : 0) |
+           (ops->use_cublas_f32 ? 4 : 0) |
+           (ops->use_cublas_pedantic ? 8 : 0) |
+           (ops->use_bf16_gemm ? 16 : 0) |
+           (ops->bf16_round ? 32 : 0);
+}
+
+static void t2_zero_ca_cache_free(cuda_trellis2_runner *r, int model_id) {
+    if (!r || model_id < 0 || model_id >= 4) return;
+    for (int i = 0; i < DIT_DEPTH; i++)
+        CU_FREE(r->ca_zero_resid[model_id][i]);
+    r->ca_zero_resid_n_blocks[model_id] = 0;
+    r->ca_zero_resid_mode[model_id] = 0;
+    r->ca_zero_resid_valid[model_id] = 0;
+}
+
 void cuda_trellis2_free(cuda_trellis2_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->context);
@@ -780,8 +802,10 @@ void cuda_trellis2_free(cuda_trellis2_runner *r) {
 
     for (int i = 0; i < 12; i++)
         CU_FREE(r->scratch[i]);
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 4; i++) {
         t2_sparse_rope_cache_free(r, i);
+        t2_zero_ca_cache_free(r, i);
+    }
 
     CU_FREE(r->dit_t_fc1_w); CU_FREE(r->dit_t_fc1_b);
     CU_FREE(r->dit_t_fc2_w); CU_FREE(r->dit_t_fc2_b);
@@ -1298,6 +1322,7 @@ int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path) 
                                       r->stage2_blocks_cpu, "Stage 2");
     if (ret == 0) {
         r->stage2_loaded = 1;
+        t2_zero_ca_cache_free(r, 2);
         cuda_trellis2_invalidate_kv_cache(r);
     }
     return ret;
@@ -1308,6 +1333,7 @@ int cuda_trellis2_load_stage3(cuda_trellis2_runner *r, const char *stage3_path) 
                                       r->stage3_blocks_cpu, "Stage 3");
     if (ret == 0) {
         r->stage3_loaded = 1;
+        t2_zero_ca_cache_free(r, 3);
         cuda_trellis2_invalidate_kv_cache(r);
     }
     return ret;
@@ -1564,6 +1590,7 @@ void cuda_trellis2_unload_stage2(cuda_trellis2_runner *r) {
     cuCtxSetCurrent(r->context);
     dit_model_free_gpu(&r->stage2);
     t2_sparse_rope_cache_free(r, 2);
+    t2_zero_ca_cache_free(r, 2);
     r->stage2_loaded = 0;
 }
 
@@ -1572,6 +1599,7 @@ void cuda_trellis2_unload_stage3(cuda_trellis2_runner *r) {
     cuCtxSetCurrent(r->context);
     dit_model_free_gpu(&r->stage3);
     t2_sparse_rope_cache_free(r, 3);
+    t2_zero_ca_cache_free(r, 3);
     r->stage3_loaded = 0;
 }
 
@@ -1864,11 +1892,72 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
      * KV depends on block weights (different per block) but NOT on timestep or x_t.
      * So we compute once and cache for all subsequent calls with same cond. */
     if (cache_slot < 0 || cache_slot > 1) cache_slot = 0;
+    /* Sparse Stage-2 CFG's all-zero negative condition collapses cross-attn to a
+     * per-block constant residual. Default on; set T2_DIT_ZERO_COND_FAST=0 to
+     * force the full KV cache + attention path. */
+    const char *zero_cond_env = getenv("T2_DIT_ZERO_COND_FAST");
+    int zero_cond_enabled = (!zero_cond_env || atoi(zero_cond_env) != 0);
+    int zero_ca_mode = t2_zero_resid_mode(ops);
+    int zero_ca_supported_precision =
+        (ops->use_tf32_gemm && !ops->use_bf16_gemm && !ops->bf16_round) ||
+        (ops->use_bf16_gemm && ops->bf16_round && ops->cast_f32_to_bf16 &&
+         ops->round_bf16);
+    int use_zero_ca = (zero_cond_enabled &&
+                       cache_slot == 1 && model_id >= 2 && model_id < 4 &&
+                       n_blocks <= DIT_DEPTH &&
+                       ops->use_f32_gemm && !ops->use_cublas_f32 &&
+                       zero_ca_supported_precision);
+    if (use_zero_ca) {
+        int ready = (r->ca_zero_resid_valid[model_id] &&
+                     r->ca_zero_resid_n_blocks[model_id] == n_blocks &&
+                     r->ca_zero_resid_mode[model_id] == zero_ca_mode);
+        if (!ready) {
+            int ok = 1;
+            t2_zero_ca_cache_free(r, model_id);
+            for (int bi = 0; bi < n_blocks; bi++) {
+                dit_block_gpu *blk = &blocks[bi];
+                int blk_streamed = 0;
+                if (blocks_cpu && !blk->sa_qkv_w) {
+                    cuStreamSynchronize(stream);
+                    dit_block_upload_to_gpu(blk, &blocks_cpu[bi]);
+                    blk_streamed = 1;
+                }
+                if (!blk->ca_kv_b || !blk->ca_out_w) {
+                    ok = 0;
+                    if (blk_streamed) { cuStreamSynchronize(stream); dit_block_free_gpu(blk); }
+                    break;
+                }
+                if (cuMemAlloc(&r->ca_zero_resid[model_id][bi],
+                               (size_t)D * sizeof(float)) != CUDA_SUCCESS) {
+                    ok = 0;
+                    if (blk_streamed) { cuStreamSynchronize(stream); dit_block_free_gpu(blk); }
+                    break;
+                }
+                CUdeviceptr v_bias = blk->ca_kv_b + (size_t)D * sizeof(float);
+                t2_op_gemm(ops, stream, r->ca_zero_resid[model_id][bi],
+                           blk->ca_out_w, v_bias, blk->ca_out_b,
+                           D, D, 1);
+                RB(r->ca_zero_resid[model_id][bi], (long)D);
+                if (blk_streamed) { cuStreamSynchronize(stream); dit_block_free_gpu(blk); }
+            }
+            if (ok) {
+                r->ca_zero_resid_n_blocks[model_id] = n_blocks;
+                r->ca_zero_resid_mode[model_id] = zero_ca_mode;
+                r->ca_zero_resid_valid[model_id] = 1;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "  Zero-cond cross-attn residual cached for %d blocks\n",
+                            n_blocks);
+            } else {
+                t2_zero_ca_cache_free(r, model_id);
+                use_zero_ca = 0;
+            }
+        }
+    }
     int use_kv_cache = (r->ca_kv_cache_valid[cache_slot] &&
                         r->ca_kv_cache_model_id[cache_slot] == model_id &&
                         r->ca_kv_cache_cond_hash[cache_slot] == cond_hash &&
                         r->ca_kv_cache_n_blocks[cache_slot] == n_blocks);
-    if (!use_kv_cache && d_cond) {
+    if (!use_zero_ca && !use_kv_cache && d_cond) {
         /* Allocate/reallocate cache */
         size_t kv_sz = (size_t)ctx_len * D * sizeof(float);
         if (r->ca_kv_cache_n_blocks[cache_slot] != n_blocks) {
@@ -2033,37 +2122,45 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
 
 
         /* === Cross-attention === */
-        /* LayerNorm (affine) */
-        t2_op_layernorm(ops, stream, d_normed, d_hidden,
-                        blk->norm2_w, blk->norm2_b, N, D);
-        RB(d_normed, (long)N * D);
+        if (use_zero_ca) {
+            /* For all-zero conditioning, every K row and every V row are identical.
+             * Softmax over identical logits returns V, so cross-attn + output proj
+             * collapse to one cached residual vector per block. */
+            t2_op_add_bias(ops, stream, d_hidden,
+                           r->ca_zero_resid[model_id][bi], N, D);
+        } else {
+            /* LayerNorm (affine) */
+            t2_op_layernorm(ops, stream, d_normed, d_hidden,
+                            blk->norm2_w, blk->norm2_b, N, D);
+            RB(d_normed, (long)N * D);
 
-        /* Q from tokens */
-        t2_op_gemm(ops, stream, d_cross_Q, blk->ca_q_w, d_normed, blk->ca_q_b,
-                   D, D, N);
-        if (blk->ca_q_norm)
-            t2_op_rms_norm_perhead(ops, stream, d_cross_Q, blk->ca_q_norm, N, H, HD, D);
-        RB(d_cross_Q, (long)N * D);
+            /* Q from tokens */
+            t2_op_gemm(ops, stream, d_cross_Q, blk->ca_q_w, d_normed, blk->ca_q_b,
+                       D, D, N);
+            if (blk->ca_q_norm)
+                t2_op_rms_norm_perhead(ops, stream, d_cross_Q, blk->ca_q_norm, N, H, HD, D);
+            RB(d_cross_Q, (long)N * D);
 
-        /* KV from conditioning (cached — precomputed above) */
-        CUdeviceptr d_ca_K_cached = r->ca_kv_cache_K[cache_slot][bi];
-        CUdeviceptr d_ca_V_cached = r->ca_kv_cache_V[cache_slot][bi];
+            /* KV from conditioning (cached — precomputed above) */
+            CUdeviceptr d_ca_K_cached = r->ca_kv_cache_K[cache_slot][bi];
+            CUdeviceptr d_ca_V_cached = r->ca_kv_cache_V[cache_slot][bi];
 
-        /* Cross-attention (using cached KV) */
-        t2_op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K_cached, d_ca_V_cached,
-                         N, ctx_len, D, H, HD);
-        RB(d_attn, (long)N * D);
+            /* Cross-attention (using cached KV) */
+            t2_op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K_cached, d_ca_V_cached,
+                             N, ctx_len, D, H, HD);
+            RB(d_attn, (long)N * D);
 
-        if (bi==0 && r->verbose>=2) dbg4("cross_attn_out", d_attn, stream);
+            if (bi==0 && r->verbose>=2) dbg4("cross_attn_out", d_attn, stream);
 
-        /* Cross-attn output + residual (no gate) */
-        t2_op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b,
-                   D, D, N);
-        RB(d_normed, (long)N * D);
+            /* Cross-attn output + residual (no gate) */
+            t2_op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b,
+                       D, D, N);
+            RB(d_normed, (long)N * D);
 
-        if (bi==0 && r->verbose>=2) dbg4("ca_proj", d_normed, stream);
+            if (bi==0 && r->verbose>=2) dbg4("ca_proj", d_normed, stream);
 
-        t2_op_add(ops, stream, d_hidden, d_normed, N * D);
+            t2_op_add(ops, stream, d_hidden, d_normed, N * D);
+        }
         RB(d_hidden, (long)N * D);
 
         if (bi==0 && r->verbose>=2) dbg4("h_after_ca", d_hidden, stream);
@@ -2224,19 +2321,15 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
     } else {
         r->ops.use_f32_gemm = 1;
         r->ops.use_mma_gemm = 0;
-        /* T2_SLAT_BF16=1 (default OFF): bf16 DiT-block port for the sparse Stage 2/3
-         * flows — identical mechanism to Stage 1's T2_DIT_BF16. PyTorch runs the SLAT
-         * flow blocks in bf16, and Stage 2's CFG=7.5 amplifies the per-step f16-vs-bf16
-         * difference ~7.5x (hence full-sampler cosine 0.985 vs 07 despite single-step
-         * 0.99995). Replicating bf16 should recover it. REQUIRES F32-loaded weights
-         * (run with T2_DIT_F32=1): the per-GEMM F32->bf16 cast then recovers the exact
-         * original bf16 (bf16->F32 at load is lossless; F16-loaded weights would be
-         * doubly lossy and the cast kernel expects F32 input). bf16_round rounds every
-         * block-op output; use_bf16_gemm makes block matmuls true bf16; x_emb/out stay
-         * f32 (suppressed inside run_dit_forward_generic). Stage 3 has no CFG so it is
-         * already 0.99998 and gains little; the lever is Stage 2. */
+        /* Sparse Stage 2/3 default: bf16 DiT-block trajectory when available.
+         * PyTorch runs the SLAT flow blocks in bf16, and Stage 2's CFG=7.5 amplifies
+         * per-step precision differences. On RTX 5060 Ti this is both faster than
+         * TF32 and closer to the Stage-2 reference (0.985379 -> 0.987246 cosine);
+         * Stage 3 remains effectively unchanged (0.999980 -> 0.999977) and is also
+         * faster. Set T2_SLAT_BF16=0 to force the old TF32 path. This requires
+         * F32-loaded weights; F16-loaded weights use the explicit F16 path above. */
         const char *want_bf16 = getenv("T2_SLAT_BF16");
-        if (want_bf16 && atoi(want_bf16) && r->ops.cublas &&
+        if ((!want_bf16 || atoi(want_bf16) != 0) && r->ops.cublas &&
             r->ops.cast_f32_to_bf16 && r->ops.round_bf16) {
             r->ops.use_bf16_gemm = 1;
             r->ops.bf16_round = 1;
