@@ -97,6 +97,17 @@ typedef struct sam3d_body_mhr_assets_t {
      * that runs gemm_f32_bias on resident LW. NULL → CPU matvec. */
     void *pc_matvec_user;
     int (*pc_matvec_fn)(void *user, const float *h, float *out_offsets);
+
+    /* Optional GPU offload for the blend_shape / face_expressions combines
+     * (out[v,d] = base?base:0 + sum_n coeffs[n]*vectors[n,v,d]). These loop over
+     * the (45|72, 55317) vector matrix with a 221KB stride per basis vector —
+     * cache-hostile, ~15ms (blend) / ~4ms (face) cold in-pipeline. The runner
+     * sets this to a closure that runs mhr_blend_combine_f32 on resident
+     * vectors. which: 0=blend_shape (with base), 1=face_expressions (no base).
+     * NULL → CPU. */
+    void *blend_user;
+    int (*blend_combine_fn)(void *user, int which, const float *coeffs,
+                            int n_basis, float *out_verts);
 } sam3d_body_mhr_assets;
 
 /* ---- Public API --------------------------------------------------- */
@@ -234,6 +245,7 @@ int sam3d_body_mhr_forward(const sam3d_body_mhr_assets *a,
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include "safetensors.h"
 
 /* ---- tiny file-slurp helper for the JSON sidecar ------------------ */
@@ -692,6 +704,9 @@ int sam3d_body_mhr_blend_shape(const sam3d_body_mhr_assets *a,
     const float *BS = (const float *)a->blend_base_shape.data;    /* (V, 3)     */
     const int N = S3DM_N_SHAPE, V = S3DM_N_VERTS;
 
+    if (a->blend_combine_fn && B == 1)
+        return a->blend_combine_fn(a->blend_user, 0, shape_coeffs, N, out_verts);
+
     for (int b = 0; b < B; b++) {
         const float *c = shape_coeffs + (size_t)b * N;
         float *o = out_verts + (size_t)b * V * 3;
@@ -720,6 +735,9 @@ int sam3d_body_mhr_face_expressions(const sam3d_body_mhr_assets *a,
 
     const float *SV = (const float *)a->face_shape_vectors.data; /* (72, V, 3) */
     const int N = S3DM_N_FACE, V = S3DM_N_VERTS;
+
+    if (a->blend_combine_fn && B == 1)
+        return a->blend_combine_fn(a->blend_user, 1, face_coeffs, N, out_verts);
 
     for (int b = 0; b < B; b++) {
         const float *c = face_coeffs + (size_t)b * N;
@@ -828,6 +846,15 @@ int sam3d_body_mhr_pose_correctives(const sam3d_body_mhr_assets *a,
         /* ReLU */
         for (int i = 0; i < HID; i++)
             if (h[i] < 0.0f) h[i] = 0.0f;
+
+        /* GPU offload hook for the dense matvec (resident LW) if installed; else
+         * the CPU loop below. Only the dense matvec moves — the sparse/batch6D
+         * stays on host. */
+        if (a->pc_matvec_fn && B == 1) {
+            int hr = a->pc_matvec_fn(a->pc_matvec_user, h, out_verts);
+            if (hr != 0) { free(feat); free(h); return SAM3D_BODY_MHR_E_LOAD; }
+            continue;
+        }
 
         /* Dense matvec: out[b, row] = sum_c LW[row, c] * h[c], row in [0..55317).
          * 55317×3000 = 166M FMAs — the only nontrivial cost in MHR forward.
@@ -950,33 +977,54 @@ int sam3d_body_mhr_forward(const sam3d_body_mhr_assets *a,
     float *pc_v    = face_v + (size_t)B * V * 3;
 
     int r;
+    /* Optional in-pipeline per-stage profiling (SAM3D_MHR_STAGE_PROF=1). */
+    int prof = getenv("SAM3D_MHR_STAGE_PROF") ? 1 : 0;
+    struct timespec _ts; double _t0 = 0.0;
+    #define MHR_T0() do { if (prof) { clock_gettime(CLOCK_MONOTONIC,&_ts); \
+        _t0 = _ts.tv_sec*1e3 + _ts.tv_nsec*1e-6; } } while(0)
+    #define MHR_T1(lbl) do { if (prof) { clock_gettime(CLOCK_MONOTONIC,&_ts); \
+        fprintf(stderr,"  [mhr_stage] %-18s %7.3f ms\n", lbl, \
+            (_ts.tv_sec*1e3+_ts.tv_nsec*1e-6)-_t0); } } while(0)
+    MHR_T0();
     r = sam3d_body_mhr_parameter_transform(a, model_params, B, n_threads, jp);
     if (r) goto done;
+    MHR_T1("param_transform");
+    MHR_T0();
     r = sam3d_body_mhr_joint_params_to_local_skel(a, jp, B, lskel);
     if (r) goto done;
     r = sam3d_body_mhr_local_to_global_skel(a, lskel, B, out_global_skel);
     if (r) goto done;
+    MHR_T1("joint+walker");
+    MHR_T0();
     r = sam3d_body_mhr_blend_shape(a, shape, B, n_threads, rest_id);
     if (r) goto done;
+    MHR_T1("blend_shape");
+    MHR_T0();
     if (face) {
         r = sam3d_body_mhr_face_expressions(a, face, B, n_threads, face_v);
         if (r) goto done;
     } else {
         memset(face_v, 0, (size_t)B * V * 3 * sizeof(float));
     }
+    MHR_T1("face_expressions");
+    MHR_T0();
     if (apply_correctives) {
         r = sam3d_body_mhr_pose_correctives(a, jp, B, n_threads, pc_v);
         if (r) goto done;
     } else {
         memset(pc_v, 0, (size_t)B * V * 3 * sizeof(float));
     }
+    MHR_T1("pose_correctives");
+    MHR_T0();
     /* linear_model_unposed = rest_identity + face + pose_correctives. */
     size_t Ntot = (size_t)B * V * 3;
     for (size_t i = 0; i < Ntot; i++)
         rest_id[i] += face_v[i] + pc_v[i];
-
+    MHR_T1("accumulate");
+    MHR_T0();
     r = sam3d_body_mhr_skin_points(a, out_global_skel, rest_id, B,
                                    out_skinned_verts);
+    MHR_T1("skin_points");
 done:
     if (owned) free(buf);
     return r;
