@@ -15,8 +15,55 @@ drift table, and TODOs live in `doc/sam3d.md` and `cuda/sam3d/PORT.md`.
   early canary).
 - `MODELS ?= /mnt/disk1/models` (CUDA Makefile points at
   `/mnt/disk01/models` which doesn't exist on this host).
-- All GPU-resident stages keep fp32; bf16 follow-up out of scope, same
-  as `cuda/sam3d`.
+- All GPU-resident stages keep fp32 **by default**; an opt-in BF16-WMMA
+  GEMM path (`SAM3D_GEMM_WMMA=1`) was added on top — see below.
+
+## BF16-WMMA GEMM (opt-in, default OFF)
+
+The scalar `gemm_f32_bias` (one thread per output element) is replaced at
+launch time by a BF16-WMMA kernel `gemm_f32_bias_wmma` when the env var
+`SAM3D_GEMM_WMMA=1` is set (and the GPU is gfx1200/1201). Default is OFF, so
+the existing fp32 verifiers below are unaffected.
+
+- Kernel: `hip_sam3d_kernels.h` `gemm_f32_bias_wmma` — drop-in for
+  `gemm_f32_bias` (same args `Y,X,W,b,N,D_in,D_out`, F32 I/O). X and W are
+  round-to-nearest-even truncated to BF16 at SMEM load; accumulation is F32.
+  Adapted from the production `rdna4/hy3d gemm_f16w_bf16a_wmma_t` (F32 weights
+  here). Requires `D_in % 16 == 0` (all sam3d dims qualify); falls back to
+  scalar otherwise. CTA tile 128×128, 256 threads.
+- Dispatch: `hip_sam3d_wmma.h` — `cs3d_launch_gemm`/`cs3d_launch_gemm_args`
+  pick WMMA vs scalar and the launch geometry; `cs3d_gemm_wmma(mod)` resolves
+  the handle for call sites that only have a module. All ~56 `gemm_f32_bias`
+  launches (DINOv2, PPE, CondFuser, SS-DiT, SLAT-DiT, runner SLAT-IO/decode)
+  route through these.
+- Why opt-in: BF16 error (~1e-2) exceeds the tight DiT verifier gates
+  (`verify_ss_dit`/`verify_slat_*` = 5e-4); default-OFF keeps them valid. The
+  fa2 BF16 cos≈0 issue does NOT apply — it was a flash-attention
+  fragment/softmax-register interaction, not the WMMA instruction or GEMM
+  (the same builtin+pattern ships in vlm/qimg/trellis2/hy3d GEMMs).
+
+### Status (validated on RX 9070 XT / gfx1201)
+
+- Host code + HIPRTC device code compile clean (`make test_hip_sam3d`, all 56
+  GEMM sites). The new kernel shares the one HIPRTC string, so it compiles and
+  resolves alongside the rest.
+- Scalar default path is **unaffected / bit-identical** — `test_dinov2_block`
+  default: `use_wmma=0 -> scalar`, max_abs 1.192e-07 (== pre-change), PASS.
+- **WMMA path engages and is correct.** `SAM3D_GEMM_WMMA=1 ./test_dinov2_block`:
+  `use_wmma=1 gemm_wmma=<non-null> -> WMMA`, max_abs **3.505e-05** vs the f32
+  host reference (default scalar path: 1.192e-07), well under the 1e-3 test gate,
+  PASS. The handle `gemm_f32_bias_wmma` resolves from the module; the ~300×
+  larger (but still tiny) block-level error confirms the bf16 matrix engine is
+  doing the work while per-tile errors largely cancel over the block.
+- Debug hook: `SAM3D_GEMM_WMMA_DEBUG=1` prints the first dispatch decision.
+- Makefile: `hip_sam3d_wmma.h` added to `COMMON_HDRS` so edits trigger rebuilds.
+
+### Validation still to do (needs the full pipeline + an image/mask)
+
+1. `SAM3D_GEMM_WMMA=1 ./test_hip_sam3d ... <image> <mask>` gaussians vs the
+   fp32 run: count/bbox close, per-attribute cosine > 0.999.
+2. `SAM3D_GEMM_WMMA=1 ./verify_dinov2` (loose 5e-2 gate) passes.
+3. Record the e2e speedup (WMMA vs scalar).
 
 ## Verifier status (against CUDA-generated PyTorch dump)
 
