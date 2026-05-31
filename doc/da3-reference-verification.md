@@ -594,3 +594,23 @@ JPEG, PNG, BMP, TGA, PPM, HDR (Radiance), EXR (OpenEXR) -- via stb_image + tinye
 | `{base}.pgm` | PGM 16-bit | Grayscale depth (min/max normalized) |
 | `{base}_falsecolor.png` | PNG RGB 8-bit | Spectral colormap (DA3 PyTorch-matching) |
 | `{base}_depth.exr` | EXR fp16 | Raw depth values (CUDA only) |
+
+## RDNA4 BF16 WMMA backbone GEMM (commit 76596d4)
+
+RDNA4 (gfx1201) has BF16/F16 WMMA — the header's "no MMA" note refers only to FP8
+MMA. `gemm_f16w_bf16a_wmma_t` (F16-weight BF16-WMMA, shared with rdna4/sam3d_body)
+is appended to the da3 kernel source and dispatched from `kl_gemm` when
+`DA3_WMMA!=0` and the GEMM dims are 16-aligned, else the scalar
+`gemm_tiled_f16_f32`. All `kl_gemm` call sites (backbone QKV/proj/FFN + DPT
+projections) inherit it. Default on; `DA3_WMMA=0` restores the F16-tiled path.
+Attention stays scalar (head_dim=64; the reusable WMMA flash-attn hardcodes 128).
+
+**Quality** — DA3-Large (ViT-L 1024d/24-block), WMMA vs F16-tiled self-reference:
+depth-map **Pearson r = 0.9999557**, rel-MAE 0.59%, zero nonfinite, outputs
+genuinely differ (WMMA path confirmed active). Judge by depth correlation, not raw
+per-GEMM max_abs.
+
+**Speed** — the kernel is byte-identical to the one measured ~3.04x on equivalent
+ViT-L-class backbone blocks in sam3d_body. An inference-only da3 A/B isn't isolated
+here (test wall-clock is model-load-dominated); add a `hipEvent` timer around
+`hip_da3_run` for the direct backbone delta.
