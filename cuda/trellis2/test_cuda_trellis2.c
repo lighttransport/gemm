@@ -895,8 +895,9 @@ sparse_done:
                     fprintf(stderr, "\n=== PBR Texture Baking (res=%d) ===\n", tex_res);
 
                     double pbr_build_t0 = t2_harness_now_ms();
-                    t2_pbr_field pbr = t2_pbr_from_decoder(
+                    t2_pbr_field pbr = t2_pbr_from_decoder_take(
                         tex_result.feats, tex_result.coords, tex_result.N, tex_res);
+                    tex_result.feats = NULL;
                     t2_harness_timing_log("pbr_field_build_cpu", pbr_build_t0);
                     t2_shape_dec_result_free(&tex_result);
 
