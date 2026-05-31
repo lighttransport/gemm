@@ -885,13 +885,9 @@ sparse_done:
 
                     /* Scale decoder output: * 0.5 + 0.5 -> [0,1] */
                     /* Build PBR field from texture decoder output */
-                    int max_c = 0;
-                    for (int i = 0; i < tex_result.N; i++) {
-                        for (int j = 1; j <= 3; j++)
-                            if (tex_result.coords[i*4+j] > max_c)
-                                max_c = tex_result.coords[i*4+j];
-                    }
-                    int tex_res = max_c + 1;
+                    /* Texture decode replays the shape decoder's subdivision
+                     * plan, so its final coords share the shape mesh extent. */
+                    int tex_res = max_coord + 1;
                     fprintf(stderr, "\n=== PBR Texture Baking (res=%d) ===\n", tex_res);
 
                     double pbr_build_t0 = t2_harness_now_ms();
