@@ -181,7 +181,7 @@ ResBlock3d: `GN(32) → SiLU → Conv3d → GN(32) → SiLU → Conv3d + skip`
 | Stage 1 DiT + decoder (same noise) | ✓ CORRECT | 94% IoU with PyTorch reference |
 | Full pipeline (random noise) | ✓ WORKS | 7.8% occupancy with seed=42 |
 | Stage 2 shape flow DiT | ✓ IMPLEMENTED | Generic DiT, sparse RoPE, 12-step Euler + CFG |
-| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | CUDA sparse ConvNeXt + C2S; host threshold compaction/hash build |
+| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | CUDA sparse ConvNeXt + C2S; GPU subdivision/hash/index default |
 | Stage 3 texture flow DiT | ✓ IMPLEMENTED | No CFG, [noise\|shape_norm] concat input |
 | Stage 3 texture decoder | ✓ IMPLEMENTED | CUDA dense C2S SC-VAE; vertex-color OBJ export by default |
 | Cross-attn KV cache | ✓ IMPLEMENTED | Precomputed for all 30 blocks, saves ~2160 dispatches/stage |
@@ -488,7 +488,7 @@ Current localization on the shape smoke:
     `2:7:2,3:0:2` -> `7.64e-5`, `2:1:2,3:0:2` -> `8.53e-5`,
     `3:0:2,3:1:2` -> `7.91e-5`, and `2:1:2,2:7:2,3:0:2` -> `8.55e-5`.
   - `T2SD_STOP_AFTER_C2S_OP=stage:7` returns `to_subdiv` logits as `[N,8]`
-    before host thresholding. All four stage logits are coordinate-exact and
+    before subdivision thresholding. All four stage logits are coordinate-exact and
     well away from topology flips on the worst rows. Minimum positive margins:
     stage0 `0.428`, stage1 `0.126`, stage2 `0.00242`, stage3 `0.00253`;
     largest negative logit in stage3 is `-0.000290`. The persistent worst rows
@@ -565,6 +565,9 @@ Additional debug knobs for this path:
 - `T2_VERIFY_PROJECT_OUT=1`: verifier-only diagnostic for 64-channel
   intermediate comparisons. It reports the max output-layer-weighted feature
   error without changing the CUDA decoder path.
+- `T2_WRITE_SHAPE_OBJ=1` or `--write-shape-obj`: write the optional
+  `<output>_shape.obj` debug sidecar. By default the CUDA harness writes only
+  the requested final OBJ path to avoid duplicating million-vertex mesh output.
 
 Small end-to-end smoke:
 
@@ -586,7 +589,8 @@ env XDG_RUNTIME_DIR=/run/user/1000 T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1 \
 Measured in the Stage 3 smoke below: Stage 1 one step produced all-negative
 occupancy, so the smoke uses top-N sparse selection. Stage 2 DiT one step
 `586.8 ms`; CUDA SC-VAE shape decoder emitted `N=918,C=7`; shape OBJ written
-to `/tmp/trellis2_e2e_check_n16.obj_shape.obj`.
+to the requested output path. Use `--write-shape-obj` to also emit the
+`<output>_shape.obj` debug sidecar.
 
 Fix notes:
 
@@ -603,9 +607,9 @@ Fix notes:
   PyTorch vectorized-Welford-order paths for no-affine and affine SC-VAE
   LayerNorm. The final SC-VAE no-affine LayerNorm is bit-exact with PyTorch
   CUDA under `T2_SCVAE_FINAL_WELFORD_LN=1`.
-- C2S norm, sparse conv, gather, conv2, and residual repeat are CUDA kernels.
-  The remaining CPU work is subdivision-list synthesis from logits and sparse
-  hash-table construction/upload for each scale.
+- C2S norm, sparse conv, gather, conv2, residual repeat, subdivision-list
+  synthesis, and sparse hash/index construction are CUDA-default paths.
+  CPU fallback toggles remain for A/B and debugging.
 
 Texture decoder verification, RTX 5060 Ti, synthetic `N=1` input. The PyTorch
 reference tensors are persisted in `ref/trellis2/dumps/tex_scvae_tiny/`.
@@ -1012,6 +1016,318 @@ call, so the decoder's exact-f32 path is untouched. Env opt-out `T2_DIT_NO_TF32=
 Remaining: Stage-2/3 FULL-sampler parity (only single-step verified); lower the ~12.7 GB DiT
 *loading* peak (all stages load upfront) via lazy per-stage load.
 
+### DiT profiling → Stage-2/3 cuBLAS-TF32 + modulation fix — DiT 100→74 s (2026-05-30)
+
+`nsys` kernel profiling of the full Stage-2 sampler (`verify_stage2_full`) pinned the DiT-forward
+cost: **`gemm_f16_f32` 46.7%, `attn_mma_hd128_f32` 34.8%, `modulation_f32` 10.1%**, rope 4.4%, the
+rest ~4%. Two of these were inefficiencies, not inherent cost:
+
+1. **`modulation_f32` was launched as a SINGLE block** (`grid=1`, 256 threads) for a
+   `[9216,1536]·[1536]` adaLN mod matvec — using 1 of ~50 SMs, with uncoalesced stride-1536 reads
+   → 6.4 ms/call. Rewrote it **warp-per-row** (one warp per output row, coalesced dot + warp-shuffle
+   reduction, grid = `ceil(out_dim/8)` blocks). ~10% off **every** stage (Stage 1 38.4→34.2 s),
+   numerically equivalent (Stage-2 cosine 0.985372→0.985397, a benign reduction-order delta).
+
+2. **Stage 2/3 used the hand-written F16-MMA `gemm_f16_f32`** — profiling showed it was the #1 cost
+   *and* slower per-voxel than Stage 1's cuBLAS TF32 despite fewer tokens. Switched the Stage-2/3
+   default from F16-MMA to **F32 + cuBLAS TF32** (matches Stage 1; `T2_DIT_F16=1` restores the old
+   MMA path). cuBLAS TF32 = **1.36×** on the Stage-2 sampler (1924→1417 ms/forward), equivalent
+   accuracy (cosine 0.985372→0.985343). VRAM (F32 5.3 GB vs F16 2.5 GB) is fine under the default
+   lazy per-stage load (one DiT resident). Combined with (1): **Stage-2 1924→1243 ms/forward (1.55×)**.
+
+End-to-end DiT (RTX 5060 Ti, 12-step CFG, ~3519 sparse voxels):
+
+| Stage | before | after | speedup |
+|-------|--------|-------|---------|
+| Stage 1 (dense 4096) | 38.4 s | **34.2 s** | 1.12× (modulation only — already cuBLAS) |
+| Stage 2 (sparse shape) | 38.6 s | **24.9 s** | **1.55×** |
+| Stage 3 (sparse tex) | 23.2 s | **14.9 s** | **1.56×** |
+| **DiT total** | **100.2 s** | **74.0 s** | **1.35× (−26 s)** |
+
+Mesh output unchanged in quality (1.47 M verts, 3.22 M tris, 99.7% trilinear / 100% covered); the
+final voxel count shifts <1% (1.462 M→1.472 M) from the F16-vs-TF32 Stage-2 numerical difference,
+both equally ~0.985 vs PyTorch. **Next levers** (untouched): `attn_mma_hd128_f32` (34.8%, the
+materialized O(N²) self-attn) and the two decoders (~28 s combined, dominated by the `c2s 128→64`
+upsample to 1.47 M voxels at ~5 s and the 329 K-voxel stage-3 ConvNeXt at ~3.3 s).
+`verify_stage2_full` now prints `>>> Sampler loop: … ms/forward`.
+
+### Attention K/V shared-memory staging — DiT 74→48 s, byte-identical (2026-05-30)
+
+The `attn_mma_hd128_f32` kernel (35% of the DiT forward) is already a hand-written FlashAttention
+(online softmax, `mma.sync.m16n8k16` tensor cores, O(N) memory) — but each block runs **4 warps over
+different query rows and the SAME KV**, and every warp re-read K and V straight from global memory
+each 16-token tile. That's 4× redundant K/V traffic, and profiling-by-arithmetic (the kernel runs at
+~5 TFLOPS, far below compute peak) said it was memory-bound. Fix: **stage each 16-token K/V tile into
+shared memory once per block** (as f32, so every downstream `cvt`/MMA/softmax op is byte-identical),
+then all 4 warps read from shared. The coalesced staging load replaces the scattered per-warp global
+reads. One required change: the per-warp `if (qb>=q_len) return;` early-out had to go (a returned warp
+would hang the others at the new `__syncthreads`) — OOB query rows are already guarded in the Q load
+and the output write, so those warps just do harmless wasted compute.
+
+**Result: 1.54× on the whole DiT, output byte-identical** (Stage-2 sampler cosine 0.985411 — exactly
+the pre-staging value). The win is uniform because all three stages share the kernel, and is *largest*
+for dense Stage 1 (N=4096, the heaviest attention):
+
+| Stage | original | +mod+cuBLAS-TF32 (`1b8253c`) | **+attn K/V staging** |
+|-------|----------|------------------------------|------------------------|
+| Stage 1 (dense 4096) | 38.4 s | 34.2 s | **21.9 s** |
+| Stage 2 (sparse shape) | 38.6 s | 24.9 s | **16.3 s** |
+| Stage 3 (sparse tex) | 23.2 s | 14.9 s | **9.8 s** |
+| **DiT total** | **100.2 s** | 74.0 s | **48.0 s** |
+
+**Cumulative DiT (after attention staging): 100.2 → 48.0 s = 2.09×** (modulation warp-per-row +
+Stage-2/3 cuBLAS-TF32 + attention K/V staging). Per-forward Stage-2: 1924 → 806 ms (2.39×).
+
+### RoPE reparallelization — DiT 48→44 s (2026-05-30)
+
+`rope_3d_f32` ran `for (h = threadIdx.x; h < n_heads; h += blockDim.x)`, so only **`n_heads`=12 of
+the 256 threads** per block were active (the rest idle) and each rotated a whole head's 128 dims
+serially — at ~1.38 ms for a [N,1536] read+write (~0.1 ms memory floor) it was ~13× off, the same
+low-occupancy bug class as `modulation_f32`. Reparallelized to **one thread per (head, axis, freq)
+complex-pair** (all 256 threads active, coalesced). Per-element-independent, so no race; the math is
+the same, though restructuring lets the compiler contract `re*c - im*s` into FMAs differently → a
+benign ~3e-5 cosine shift (Stage-2 0.985411 → 0.985379, still at the ~0.985 floor vs PyTorch — the
+same class as the TF32/bf16 reassociations we already accept).
+
+| Stage | +attn-staging | **+rope-opt** |
+|-------|---------------|----------------|
+| Stage 1 | 21.9 s | **20.0 s** |
+| Stage 2 | 16.3 s | **14.8 s** (806 → 731 ms/forward) |
+| Stage 3 |  9.8 s | **8.9 s** |
+| **DiT total** | 48.0 s | **43.7 s** |
+
+**Cumulative DiT this session: 100.2 → 43.7 s = 2.29×** (modulation warp-per-row + Stage-2/3
+cuBLAS-TF32 + attention K/V staging + RoPE reparallelization); per-forward Stage-2 1924 → 731 ms
+(2.63×). Mesh stays valid (1.40 M verts, 3.05 M tris, 99.7% trilinear / 100% covered); the count
+drifts 1.47 M → 1.40 M as the accumulated benign numerical differences shift near-threshold
+subdivision decisions — equivalent quality, both ~0.985 vs PyTorch. Remaining lever: the two decoders
+(~28 s, sparse-conv-bound — gather/pack/GEMM/scatter on up to 1.4 M voxels; no single hot kernel,
+a deeper effort) are now the largest cost.
+
+### Decoder packed-conv pack caching (2026-05-30) — decoder 27.4 → 12.6 s = 2.18×
+
+Profiling the decoder (`-t cuda` API trace) showed the time was not in any GPU kernel but in
+**thousands of synchronous host memory ops** — the per-block `t2_sparse_conv_pack_build`. The
+"packed" sparse-conv path (`T2_SCVAE_PACKED_CONV=1`, default) builds 27 per-offset src/dst index
+arrays by doing `N*27` CPU-side hash lookups and up to 54 HtoD uploads. That pack is a **pure
+function of (coords, hash)** and is *identical* across every ConvNeXt block at a resolution level,
+yet it was being rebuilt from scratch for each block.
+
+Fix: cache the pack in the runner keyed on `(coords ptr, N)`. A new level (the c2s `conv2` that
+produces the child voxels) rebuilds; every ConvNeXt block and the c2s `conv1` at a level reuse the
+cache. Invalidated at decode start and freed at decode end / `cuda_trellis2_free`. The per-stage
+ConvNeXt collapse (shape decoder):
+
+| ConvNeXt stage | blocks | before | after | speedup |
+|---|---|---|---|---|
+| stage 1 (res 256) | 16 | 1762 ms | 485 ms | 3.6× |
+| stage 2 (res 128) | 8  | 2016 ms | 338 ms | 6.0× |
+| stage 3 (res 64)  | 4  | 3251 ms | 279 ms | **11.6×** |
+
+**Decoder total 27.4 → 12.6 s = 2.18×** (shape 13.9→6.4 s, tex 13.5→6.2 s). Output is
+**byte-identical** (1,403,042 verts, 3,048,684 tris, 99.7% trilinear, 100% covered) — pure caching,
+zero numerical change. **Combined GPU pipeline this session: DiT+decoder 127.4 → 56.3 s = 2.26×.**
+The remaining decoder cost after this change was the c2s `conv2` pack build on the 1.47 M-child
+level (~3.75 s shape + 3.67 s tex); see the next section for the GPU-side builder that removes it.
+
+### Decoder GPU pack build from gather_map (2026-05-30) — c2s conv2 4.0 → 0.6 s
+
+The level cache cannot help the c2s `conv2` pack because it is the first sparse conv after each
+subdivision and therefore sees a new coordinate level. The old builder still did `N*27` CPU hash
+lookups and uploaded up to 54 index arrays. New kernel `sparse_pack_from_gather_map_f32` builds the
+same packed `(src_idx,dst_idx,M)` lists directly on GPU from the already-built `[N,27]` gather map.
+`T2_SCVAE_CPU_PACK_BUILD=1` keeps the old CPU builder available for A/B.
+
+A/B on the T.png verification dumps (`08_shape_slat_denorm_feats` + `05_ss_coords`) is
+**byte-identical** versus the CPU-pack path: feature `max_abs=0`, `rel_L2=0`, coord mismatches `0`.
+Focused shape-decoder C2S timings, CPU-pack → GPU-pack:
+
+| C2S level | CPU pack | GPU pack | speedup |
+|---|---:|---:|---:|
+| 1024 → 512 | 202.7 ms | 102.9 ms | 2.0× |
+| 512 → 256  | 337.8 ms | 126.7 ms | 2.7× |
+| 256 → 128  | 963.6 ms | 222.5 ms | 4.3× |
+| 128 → 64   | 3993.0 ms | 600.9 ms | 6.6× |
+
+Full textured e2e with default GPU-pack completed successfully: shape output `N=1,403,042`, OBJ
+`1,403,042` verts / `3,048,684` tris, texture decoder replayed all four shape subdivisions, and PBR
+coverage was `99.7%` trilinear / `100%` covered. In that full run, finest-level c2s timings were
+shape `558.7 ms` and texture `509.2 ms`.
+
+### Decoder GPU subdivision + sparse hash/index (2026-05-30) — focused shape decoder 11.5 → 6.5 s
+
+The next host bottleneck was C2S subdivision and sparse-index setup. The shape decoder now uses a
+stable two-pass GPU subdivision path: `c2s_count_subdiv_f32` counts kept child slots, the CPU computes
+the prefix offsets, and `c2s_write_subdiv_stable_f32` writes `idx`, `subidx`, and child coords in the
+same parent/child order as the old CPU path. That stability matters: an earlier atomic compaction
+changed row order and broke byte-level parity. The sparse hash table is also built on GPU via
+`sparse_hash_insert_coords_f32`, then the existing gather-map kernel runs from that device hash.
+
+Defaults and A/B toggles:
+
+- Packed sparse conv is default-on. Use `T2_SCVAE_NO_PACKED_CONV=1` or `T2_SCVAE_PACKED_CONV=0` to
+  opt out.
+- `T2_SCVAE_CPU_SUBDIV=1` restores host subdivision synthesis.
+- `T2_SCVAE_CPU_HASH_BUILD=1` or `T2_SCVAE_CPU_GATHER_MAP=1` restores host hash/gather-map setup.
+- `T2_SCVAE_CPU_PACK_BUILD=1` restores the legacy host pack builder and now also keeps the CPU hash
+  available for that builder.
+- `T2_TIMING=1` prints load, sparse-index, pack-build, and subdivision timings.
+- DiT loaders skip unused GPU-to-CPU block copies in the default full-GPU mode. Set
+  `T2_DIT_KEEP_CPU_BLOCKS=1` when debugging or using block streaming.
+
+Focused A/B on the T.png verification dumps (`08_shape_slat_denorm_feats` + `05_ss_coords`) is
+**byte-identical** versus the CPU-subdivision/hash/pack fallback: feature `max_abs=0`, `rel_L2=0`,
+coord mismatches `0`. Cached shape-decoder wall time on RTX 5060 Ti:
+
+| Path | wall time | finest sparse index | finest C2S |
+|---|---:|---:|---:|
+| CPU subdiv/hash/pack fallback | 11.54 s | 190.6 ms | 4149.8 ms |
+| GPU default | **6.52 s** | **38.3 ms** | **392.8 ms** |
+
+Full textured e2e with the new defaults completed in `real 87.50`: Stage 1/2/3 sampler
+`19.9/14.8/8.9 s`, shape output `N=1,403,042`, OBJ `1,403,042` verts / `3,048,684` tris, and PBR
+coverage `99.7%` trilinear / `100%` covered.
+
+### GPU BF16-to-F32 DiT weight upload (2026-05-30) — full e2e 87.5 → 64.0 s
+
+The F32 DiT path still loaded BF16 checkpoints by converting each tensor to F32 on the CPU, then
+uploading the expanded 4-byte weights. The loader now uploads raw BF16 and expands to the exact same
+F32 values on GPU with `t2_cast_bf16_to_f32`, cutting host-to-device traffic in half for Stage 1/2/3
+DiTs. `T2_CPU_BF16_UPLOAD=1` restores the old CPU conversion path for A/B.
+
+Measured RTX 5060 Ti load times:
+
+| DiT stage | CPU BF16→F32 upload | GPU BF16→F32 upload |
+|---|---:|---:|
+| Stage 1 | 8.42 s | **1.03 s** |
+| Stage 2 | 8.39 s | **0.89 s** |
+| Stage 3 | 8.91 s | **0.94 s** |
+
+Verification is byte-identical where the old dumps are available: Stage 1 latent, Stage 2 raw slat,
+texture coords, and texture features all compare `max_abs=0`. Focused verifier metrics are unchanged
+(`verify_stage1` cosine `0.99980245`, Stage 2 full sampler cosine `0.985379`, Stage 3 full sampler
+cosine `0.999980`). Full textured e2e with cached kernels is now `real 64.04`, with the same
+`1,403,042` verts / `3,048,684` tris and PBR `99.7%` trilinear / `100%` covered.
+
+### GPU F16 SC-VAE upload + sparse-conv transpose (2026-05-30) — full e2e 64.0 → 57.1 s
+
+The shape and texture SC-VAE checkpoints are F16-heavy. Their previous F32 load path converted dense
+weights on CPU and also transposed sparse-conv weights from `[out,27,in]` to `[27,out,in]` on CPU.
+The loader now uploads raw 16-bit tensors and expands on GPU with `t2_cast_f16_to_f32`; sparse-conv
+weights use `t2_conv3d_transpose_f16_to_f32` or `t2_conv3d_transpose_bf16_to_f32` to combine upload,
+conversion, and transpose. CPU fallbacks remain available with `T2_CPU_F16_UPLOAD=1`,
+`T2_CPU_BF16_UPLOAD=1`, and `T2_CPU_SCVAE_CONV_UPLOAD=1`.
+
+Measured load times:
+
+| Decoder | CPU conversion/transpose | GPU upload/transpose |
+|---|---:|---:|
+| Shape SC-VAE | 3.72 s | **0.31 s** |
+| Texture SC-VAE | 3.73 s | **0.31 s** |
+
+Focused shape-decoder output is **byte-identical** versus the CPU conversion/transpose fallback:
+feature `max_abs=0`, `rel_L2=0`, coord mismatches `0`. Cached focused decoder wall time is now
+`3.10 s` (was `6.52 s` after GPU subdivision/index). Full textured e2e is now `real 57.13`, and the
+full-run dumps remain byte-identical to the prior GPU-DiT-load run for Stage 1, Stage 2, texture
+coords, and texture features. Mesh/PBR output is unchanged: `1,403,042` verts / `3,048,684` tris,
+PBR `99.7%` trilinear / `100%` covered.
+
+The same F16 upload helper is also used by the dense Stage 1 occupancy decoder. Its load time is small
+but now visible under `T2_TIMING`: CPU conversion `0.28 s`, GPU expansion `0.05 s`. `verify_decoder`
+metrics are unchanged, and the final full e2e is `real 56.85` with byte-identical dumps versus the
+previous SC-VAE-load run.
+
+### Output-side tail trimming (2026-05-30) — full e2e 57.0 → 55.4 s
+
+Coarse `T2_TIMING` brackets now cover the post-sampler pipeline: Stage-1 structure decode, sparse
+coord extraction, shape/texture SC-VAE decode totals, FDG mesh extraction, PBR field build, texture
+dump, OBJ writes, and program total. The first full profile showed the hidden tail was mostly output:
+`fdg_write_shape_obj 1.63 s`, `pbr_sample_vertices 0.39 s`, and `pbr_write_colored_obj 2.36 s`.
+
+The CUDA harness now skips the redundant `<output>_shape.obj` sidecar by default. The requested final
+OBJ is still written in all paths; set `T2_WRITE_SHAPE_OBJ=1` or pass `--write-shape-obj` to restore
+the debug sidecar. This avoids a duplicate 110 MB OBJ and cuts the textured e2e to `real 55.47`.
+
+The default vertex-colored OBJ path also streams PBR sampling directly into the writer, avoiding the
+`n_verts * sizeof(t2_pbr_attr)` color array (`~32 MiB` at `1,403,042` verts). Wall time is flat
+(`real 55.40`) because float formatting dominates the remaining final OBJ write, but the final OBJ
+and all `.npy` dumps are byte-identical to the pre-stream no-sidecar run.
+
+### Sparse DiT setup caching (2026-05-31) — repeated setup removed, output unchanged
+
+The Stage 2/3 sparse DiT wrappers rebuilt sparse 3D RoPE tables and uploaded the conditioning tensor
+for every sampler forward, even though coords and conditioning are constant within each stage. The
+runner now caches sparse RoPE tables per model id keyed by `(coords hash, N, n_freqs)`, and the wrappers
+skip the conditioning HtoD upload once the per-block cross-attention KV cache is already hot for the
+same `(model_id, cond_hash, n_blocks)`.
+
+This removes repeated CPU `sin/cos` work, RoPE HtoD uploads, and the hot-step conditioning upload.
+The full textured e2e remains dominated by DiT math and OBJ formatting, so wall time is essentially
+flat but slightly lower: `real 55.40/55.48 -> 55.35` (`T2_TIMING program_total 55252.514 ms`). Final
+OBJ and saved dumps (`stage1`, Stage 2, `tex_coords`, `tex_feats`) are byte-identical to the previous
+run.
+
+### Shared DiT modulation base (2026-05-31) — full e2e 55.35 -> 55.11 s
+
+The DiT block modulation is `adaLN_modulation(t_emb) + blocks[i].modulation`. The first term is shared
+by all 30 blocks in a forward, but the runner recomputed the full `9216 x 1536` matvec once per block.
+The forward path now computes the shared modulation base once, then uses a tiny
+`modulation_add_bias_f32` kernel to add each block's bias before the existing bf16-round hook.
+
+This keeps outputs byte-identical and trims a few milliseconds from every DiT forward. Cached-kernel
+full textured e2e is `real 55.11` (`T2_TIMING program_total 54998.957 ms`), with byte-identical final
+OBJ and saved dumps versus the sparse-setup-cache run.
+
+### DiT wrapper scratch I/O reuse (2026-05-31) — allocator churn removed
+
+The public Stage 1/2/3 DiT wrappers no longer allocate/free device input, output, and cold conditioning
+buffers for every forward. They reuse runner scratch slots for those transient buffers, while the
+forward core still owns its separate activation scratch. This is byte-identical and mostly removes
+driver allocator overhead rather than math: cached full textured e2e is `real 55.05`
+(`T2_TIMING program_total 54964.562 ms`).
+
+### FDG hash cleanup + shorter decode live ranges (2026-05-31)
+
+`trellis2_fdg_mesh.h` now maps spatial-hash slots with multiply-high reduction and branch wraparound
+instead of integer `%` in the hot insert/lookup/probe path. It also splits each valid FDG quad
+directly into triangles as the quad is found, preserving the old scan order while dropping the large
+temporary quad list. The FDG path also accepts decoder `[N,4]` `(batch,z,y,x)` coords directly, so
+the CUDA harness no longer builds a temporary `[N,3]` coord copy before mesh extraction. The final
+textured OBJ remains byte-identical to the wrapper-scratch baseline.
+
+The CUDA harness also drops large host/GPU objects as soon as downstream stages have copied what they
+need: occupancy after sparse coord extraction, conditioning features after DiTs finish, shape decoder
+weights and shape output after FDG extraction, texture decoder weights after texture decode, and raw
+texture decoder output after handing it to the PBR field. The PBR builder can now take ownership of
+the raw texture field and scale it in-place, while preserving the old copying API for other callers.
+Because texture decode replays the shape subdivision, the PBR resolution now reuses the shape
+`max_coord` instead of rescanning texture coords.
+The FDG mesh also retains its voxel hash so the PBR field can borrow it instead of building a second
+hash over the same final coordinate set.
+This mainly lowers the CPU/GPU live set during the CPU mesh/PBR tail without changing math. Final
+validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_borrowhash_e2e.obj` succeeds; cached full textured
+e2e with file output is `real 54.98` (`T2_TIMING program_total 54891.555 ms`, postprocess
+`72.347 ms`, FDG mesh `375.963 ms`, PBR build `12.633 ms`), with the same
+`1,403,042 verts / 3,048,684 tris`, PBR `99.7%` / `100%`.
+
+### Sparse SLAT DiT bf16 + zero-CFG fast path (2026-05-31)
+
+Stage 2/3 sparse DiT now defaults to the bf16 block trajectory when cuBLAS bf16
+and the cast kernels are available; set `T2_SLAT_BF16=0` to restore the old TF32
+path. Stage 2's all-zero CFG negative condition also defaults to a collapsed
+cross-attention residual path; set `T2_DIT_ZERO_COND_FAST=0` to force the full
+zero-condition KV cache and attention. The zero-CFG path avoids the second sparse
+DiT KV cache (`K+V` for 30 blocks at 1029x1536), saving about 379 MiB of VRAM.
+
+Focused verifier metrics on RTX 5060 Ti:
+
+- Stage 2 full sampler: `725.0 ms/forward`, cosine `0.985379` -> `618.1 ms/forward`,
+  cosine `0.988086`.
+- Stage 3 full sampler: `real 10.26`, cosine `0.999980` -> `real 9.42`,
+  cosine `0.999977`.
+- Full textured e2e with file output: prior `T2_TIMING program_total 54818.543 ms`
+  / `real 54.92`; new default `program_total 51859.578 ms` / `real 51.97`.
+
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
 Dumped the CUDA intermediates (`--npy` Stage-1 latent, `--s2-npy` shape slat, new `--tex-npy`
@@ -1267,8 +1583,8 @@ accuracy win — TF32 is the more consistent and higher-precision default.**
 ## Next Steps
 
 ### CUDA
-1. **GPU subdivision compaction/hash build**: Move `to_subdiv` threshold compaction
-   and sparse hash construction/upload fully onto GPU for the shape decoder.
+1. **Remaining decoder compute hot spots**: Profile the post-load decoder path
+   again; remaining time is mostly ConvNeXt sparse conv/GEMM/scatter at large N.
 2. **PBR atlas export**: Fix/verify the UV chart packer; vertex-colored OBJ is the
    default texture output for now, `T2_PBR_TEXTURE_MAP=1` opts into atlas maps.
 3. **Fresh Stage 2/3 DiT reference dumps**: Persist current PyTorch flow-model
