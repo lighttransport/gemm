@@ -110,9 +110,43 @@ int main(void){
     hipDeviceSynchronize(); double kern_ms=(now_ms()-tk0)/reps;
 
     printf("matvec 55317x3000 (avg of %d):\n", reps);
-    printf("  CPU (%d thr)     : %7.3f ms\n", nthr, cpu_ms);
-    printf("  GPU per-call     : %7.3f ms  (h up + launch + out down, LW resident)\n", gpu_ms);
-    printf("  GPU kernel-only  : %7.3f ms\n", kern_ms);
-    printf("  speedup (per-call vs CPU): %.2fx\n", cpu_ms/gpu_ms);
+    printf("  CPU (%d thr)          : %7.3f ms\n", nthr, cpu_ms);
+    printf("  GPU gemm_f32_bias N=1 : %7.3f ms/call  kernel %7.3f ms  (%.2fx vs CPU)\n",
+           gpu_ms, kern_ms, cpu_ms/gpu_ms);
+
+    /* ---- New: mhr_pc_matvec_f32 (bias-free GEMV, 1 block/row) ---- */
+    hipFunction_t fn2;
+    if (hipModuleGetFunction(&fn2, mod, "mhr_pc_matvec_f32") == hipSuccess) {
+        void *dY2; hipMalloc(&dY2, (size_t)OUT*sizeof(float));
+        /* bias-free CPU ref (production matvec has no bias) */
+        float *ref0 = malloc((size_t)OUT*sizeof(float));
+        for(int row=0;row<OUT;row++){ const float*W=LW+(size_t)row*HID; float a=0.f;
+            for(int c=0;c<HID;c++) a+=W[c]*h[c]; ref0[row]=a; }
+        int hid=HID, out=OUT;
+        struct __attribute__((packed)){ void*Y; const void*h,*W; int HID,OUT; }
+            p2={ dY2, dh, dW, hid, out };
+        void *cfg2[]={HIP_LAUNCH_PARAM_BUFFER_POINTER,&p2,HIP_LAUNCH_PARAM_BUFFER_SIZE,(void*)0,HIP_LAUNCH_PARAM_END};
+        size_t pb2=sizeof(p2); cfg2[3]=&pb2;
+        hipMemcpy(dh,h,(size_t)HID*sizeof(float),hipMemcpyHostToDevice);
+        hipModuleLaunchKernel(fn2,(unsigned)OUT,1,1,64,1,1,0,0,NULL,cfg2); hipDeviceSynchronize();
+        hipMemcpy(gpu,dY2,(size_t)OUT*sizeof(float),hipMemcpyDeviceToHost);
+        double mx=0,dot=0,na2=0,nb2=0;
+        for(int i=0;i<OUT;i++){double a=ref0[i],b=gpu[i];double d=fabs(a-b);if(d>mx)mx=d;dot+=a*b;na2+=a*a;nb2+=b*b;}
+        double tk2=now_ms();
+        for(int r=0;r<reps;r++) hipModuleLaunchKernel(fn2,(unsigned)OUT,1,1,64,1,1,0,0,NULL,cfg2);
+        hipDeviceSynchronize(); double kern2=(now_ms()-tk2)/reps;
+        double tp2=now_ms();
+        for(int r=0;r<reps;r++){ hipMemcpy(dh,h,(size_t)HID*sizeof(float),hipMemcpyHostToDevice);
+            hipModuleLaunchKernel(fn2,(unsigned)OUT,1,1,64,1,1,0,0,NULL,cfg2);
+            hipMemcpy(gpu,dY2,(size_t)OUT*sizeof(float),hipMemcpyDeviceToHost); }
+        hipDeviceSynchronize(); double pc2=(now_ms()-tp2)/reps;
+        printf("  GPU mhr_pc_matvec_f32 : %7.3f ms/call  kernel %7.3f ms  (%.2fx vs CPU)  cos=%.8f max_abs=%.3e\n",
+               pc2, kern2, cpu_ms/pc2, dot/(sqrt(na2*nb2)+1e-30), mx);
+        double bw = (double)OUT*HID*4 / (kern2*1e-3) / 1e9;
+        printf("  mhr_pc_matvec HBM BW  : %.0f GB/s (633 MiB LW / kernel time)\n", bw);
+        free(ref0); hipFree(dY2);
+    } else {
+        printf("  (mhr_pc_matvec_f32 not found)\n");
+    }
     return 0;
 }
