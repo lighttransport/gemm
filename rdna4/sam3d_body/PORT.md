@@ -54,7 +54,7 @@ Writes `V=18439 F=36874` (~1.2 MiB OBJ) on the human_object sample.
 - `verify_end_to_end` — scaffold only, mirrors the CUDA status (the
   upstream pipeline isn't wired into the verifier yet).
 
-## Speed — BF16 WMMA GEMM for the encoder (commit 6f9f1c0)
+## Speed — BF16 WMMA GEMM for the encoder (commit faeed73)
 
 The encoder backbone (DINOv3-H+ / ViT-H, ~9 GEMMs/block × 32 blocks — the
 dominant cost) stores F16 weights, so `gemm_f16w_bf16a_wmma_t` is an F16-weight
