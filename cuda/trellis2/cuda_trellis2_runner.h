@@ -113,6 +113,7 @@ int cuda_trellis2_load_texture_decoder(cuda_trellis2_runner *r, const char *path
 
 void cuda_trellis2_unload_shape_decoder(cuda_trellis2_runner *r);
 void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r);
+void cuda_trellis2_clear_subdiv_plan(cuda_trellis2_runner *r);
 
 /* Free the Stage 1/2/3 DiT GPU weights + cross-attn KV cache. Call after all
  * three latents are produced (their host-side outputs are kept) and before the
