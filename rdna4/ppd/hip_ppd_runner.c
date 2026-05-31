@@ -510,6 +510,95 @@ static const char hip_ppd_specific_kernels[] =
 "    Y[tok * n_out + out] = sum;\n"
 "}\n"
 "\n"
+    /* ---- gemm_f16w_bf16a_wmma_t: F16-weight x F32-act GEMM via BF16 WMMA
+     * (gfx12). Same transposed-B layout + arg order as gemm_tiled_f16_f32:
+     *   Y[n_tok,n_out] = X[n_tok,n_in] * W[n_out,n_in]^T + bias[n_out]
+     * Weights half_raw (half_to_float at SMEM load); activations F32. Both
+     * round-to-nearest-even bf16-truncated before the WMMA (matches the
+     * encoder's existing bf16-rounded activation path). Requires
+     * n_out%16==0 && n_in%16==0; caller falls back to gemm_tiled_f16_f32. */
+    "#if defined(__gfx1200__) || defined(__gfx1201__)\n"
+    "__global__ void gemm_f16w_bf16a_wmma_t(float *Y, const half_raw *W, const float *X,\n"
+    "                                       const float *bias, int n_out, int n_in, int n_tok) {\n"
+    "    int tid = threadIdx.x;\n"
+    "    int wave_id = tid >> 5;\n"
+    "    int lane    = tid & 31;\n"
+    "    int wM = wave_id & 1;\n"
+    "    int wN = wave_id >> 1;\n"
+    "    int half = lane >> 4;\n"
+    "    int idx  = lane & 15;\n"
+    "    int k_off = half * 8;\n"
+    "    int cta_m0 = blockIdx.y * 128;\n"
+    "    int cta_n0 = blockIdx.x * 128;\n"
+    "    __shared__ short smA[128*16];\n"
+    "    __shared__ short smB[128*16];\n"
+    "    typedef float float8 __attribute__((ext_vector_type(8)));\n"
+    "    typedef short bf16x8 __attribute__((ext_vector_type(8)));\n"
+    "    float8 cv00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};\n"
+    "    float8 cv01 = cv00, cv10 = cv00, cv11 = cv00, cv20 = cv00, cv21 = cv00, cv30 = cv00, cv31 = cv00;\n"
+    "    for (int k = 0; k < n_in; k += 16) {\n"
+    "        for (int it = 0; it < 8; it++) {\n"
+    "            int e = tid * 8 + it;\n"
+    "            int er = e >> 4;\n"
+    "            int ek = e & 15;\n"
+    "            int row = cta_m0 + er;\n"
+    "            int kp  = k + ek;\n"
+    "            float xv = (row < n_tok && kp < n_in) ? X[(long)row * n_in + kp] : 0.f;\n"
+    "            unsigned int xb; __builtin_memcpy(&xb, &xv, 4);\n"
+    "            xb += 0x7FFFu + ((xb >> 16) & 1u);\n"
+    "            smA[er * 16 + ek] = (short)(xb >> 16);\n"
+    "        }\n"
+    "        for (int it = 0; it < 8; it++) {\n"
+    "            int e = tid * 8 + it;\n"
+    "            int er = e >> 4;\n"
+    "            int ek = e & 15;\n"
+    "            int col = cta_n0 + er;\n"
+    "            int kp  = k + ek;\n"
+    "            float wv = (col < n_out && kp < n_in) ? half_to_float(W[(size_t)col * n_in + kp]) : 0.f;\n"
+    "            unsigned int wb; __builtin_memcpy(&wb, &wv, 4);\n"
+    "            wb += 0x7FFFu + ((wb >> 16) & 1u);\n"
+    "            smB[er * 16 + ek] = (short)(wb >> 16);\n"
+    "        }\n"
+    "        __syncthreads();\n"
+    "        int a_base_row = wM * 64;\n"
+    "        int b_base_row = wN * 32;\n"
+    "        bf16x8 a0, a1, a2, a3, b0, b1;\n"
+    "        for (int i = 0; i < 8; i++) {\n"
+    "            a0[i] = smA[(a_base_row + 0  + idx) * 16 + k_off + i];\n"
+    "            a1[i] = smA[(a_base_row + 16 + idx) * 16 + k_off + i];\n"
+    "            a2[i] = smA[(a_base_row + 32 + idx) * 16 + k_off + i];\n"
+    "            a3[i] = smA[(a_base_row + 48 + idx) * 16 + k_off + i];\n"
+    "            b0[i] = smB[(b_base_row + 0  + idx) * 16 + k_off + i];\n"
+    "            b1[i] = smB[(b_base_row + 16 + idx) * 16 + k_off + i];\n"
+    "        }\n"
+    "        cv00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, b0, cv00);\n"
+    "        cv01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, b1, cv01);\n"
+    "        cv10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, b0, cv10);\n"
+    "        cv11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, b1, cv11);\n"
+    "        cv20 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2, b0, cv20);\n"
+    "        cv21 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2, b1, cv21);\n"
+    "        cv30 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3, b0, cv30);\n"
+    "        cv31 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3, b1, cv31);\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    int wave_m0 = cta_m0 + wM * 64;\n"
+    "    int wave_n0 = cta_n0 + wN * 32;\n"
+    "    float8 *accs[8] = {&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31};\n"
+    "    int ms[8]       = {0,   0,  16, 16, 32, 32, 48, 48};\n"
+    "    int ns[8]       = {0,  16,   0, 16,  0, 16,  0, 16};\n"
+    "    for (int t = 0; t < 8; t++) {\n"
+    "        int col = wave_n0 + ns[t] + idx;\n"
+    "        if (col >= n_out) continue;\n"
+    "        float bv = bias ? bias[col] : 0.f;\n"
+    "        float8 acc = *accs[t];\n"
+    "        for (int i = 0; i < 8; i++) {\n"
+    "            int row = wave_m0 + ms[t] + half * 8 + i;\n"
+    "            if (row < n_tok)\n"
+    "                Y[(long)row * n_out + col] = acc[i] + bv;\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "#endif\n"
 "} /* extern C */\n"
 ;
 
@@ -566,6 +655,8 @@ struct hip_ppd_runner {
     /* Kernel function handles */
     hipFunction_t fn_layernorm_f32;
     hipFunction_t fn_gemm_tiled_f16_f32;
+    hipFunction_t fn_gemm_wmma;   /* gemm_f16w_bf16a_wmma_t (gfx12; optional) */
+    int           use_wmma;       /* 1 iff PPD_WMMA!=0 and gemm_wmma resolved */
     hipFunction_t fn_add_bias_f32;
     hipFunction_t fn_flash_attn_tiled_f32;
     hipFunction_t fn_flash_attn_f16kv_f32;
@@ -688,6 +779,17 @@ static int ppd_compile_kernels(hip_ppd_runner *r) {
     /* Shared kernels (from hip_kernels_common.h) */
     GET_FN(layernorm_f32);
     GET_FN(gemm_tiled_f16_f32);
+    /* Optional BF16-WMMA GEMM (gfx12). Default on; PPD_WMMA=0 disables. */
+    r->use_wmma = 0;
+    r->fn_gemm_wmma = NULL;
+    {
+        const char *e_wmma = getenv("PPD_WMMA");
+        if (!e_wmma || e_wmma[0] != '0') {
+            if (hipModuleGetFunction(&r->fn_gemm_wmma, r->module,
+                                     "gemm_f16w_bf16a_wmma_t") == hipSuccess)
+                r->use_wmma = 1;
+        }
+    }
     GET_FN(add_bias_f32);
     GET_FN(kv_transpose);
     GET_FN(gelu_f32);
@@ -1231,6 +1333,15 @@ static void kl_layernorm(hip_ppd_runner *r, void *dst, void *src,
 static void kl_gemm(hip_ppd_runner *r, void *Y, void *W_f16,
                      void *X, void *bias, int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
+    /* BF16 WMMA when enabled and dims 16-aligned; same arg layout, 128x128 tiles. */
+    if (r->use_wmma && r->fn_gemm_wmma &&
+        (n_out % 16 == 0) && (n_in % 16 == 0)) {
+        unsigned wx = (unsigned)((n_out + 127) / 128);
+        unsigned wy = (unsigned)((n_tok + 127) / 128);
+        hipModuleLaunchKernel(r->fn_gemm_wmma, wx, wy, 1, 256, 1, 1,
+                              0, r->stream, args, NULL);
+        return;
+    }
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     hipModuleLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,
