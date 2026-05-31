@@ -1536,6 +1536,10 @@ void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r) {
     if (r) scvae_decoder_free_gpu(&r->tex_dec);
 }
 
+void cuda_trellis2_clear_subdiv_plan(cuda_trellis2_runner *r) {
+    if (r) t2_subdiv_plan_free(r);
+}
+
 /* Per-stage DiT unloads. Each is idempotent (CU_FREE / dit_model_free_gpu zero the
  * pointers), so they are safe to call once after a stage finishes AND again via the
  * bulk cuda_trellis2_unload_dit_stages() below. The shared cross-attn KV cache is NOT
