@@ -257,8 +257,10 @@
 >
 > Accepted:
 > - `trellis2_fdg_mesh.h` removes integer `%` from the hot spatial-hash insert/lookup/probe path,
->   using multiply-high slot reduction and branch wraparound. Final OBJ is byte-identical to the
->   wrapper-scratch baseline (`cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_fdghash_e2e.obj` => `0`).
+>   using multiply-high slot reduction and branch wraparound. It also splits each valid FDG quad
+>   directly into triangles as the quad is found, preserving the old scan order while dropping the
+>   large temporary quad buffer. Final OBJ is byte-identical to the wrapper-scratch baseline
+>   (`cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_fdgdirect_e2e.obj` => `0`).
 > - `test_cuda_trellis2.c` now frees/unloads data as soon as each downstream copy is complete:
 >   occupancy after sparse extraction, conditioning features after DiTs, shape decoder weights after
 >   shape decode, shape output/coords after FDG mesh extraction, texture decoder weights after texture
@@ -267,8 +269,9 @@
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
-> - final file-output exactness run: `real 55.28`, `T2_TIMING program_total 55182.616 ms`,
->   FDG mesh `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered, final OBJ
+> - final file-output exactness run after direct split: `real 55.08`,
+>   `T2_TIMING program_total 54986.447 ms`, FDG mesh `388.615 ms`,
+>   `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered, final OBJ
 >   byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
 > Rejected in this pass: widening `attn_mma_hd128_f32` from 4 warps/64 query rows per CTA to
