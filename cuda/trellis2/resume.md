@@ -270,14 +270,15 @@
 >   ownership of the texture decoder output and scale/clamp it in-place (`t2_pbr_from_decoder_take`),
 >   while the existing copying API remains available for other callers. Since texture decode replays
 >   the shape subdivision, PBR resolution also reuses the shape `max_coord` instead of rescanning the
->   texture coords. This cuts the CPU live set during the OBJ/PBR tail and releases decoder GPU
->   weights before CPU-only tail work.
+>   texture coords. The FDG mesh now retains its voxel hash until mesh free, so the PBR field borrows
+>   it instead of building a second hash over the same final coord set. This cuts the CPU live set
+>   during the OBJ/PBR tail and releases decoder GPU weights before CPU-only tail work.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
-> - final file-output exactness run after PBR take path: `real 55.11`,
->   `T2_TIMING program_total 55010.783 ms`, postprocess `69.303 ms`, FDG mesh `370.555 ms`,
->   PBR build `123.056 ms`,
+> - final file-output exactness run after borrowed FDG hash: `real 54.98`,
+>   `T2_TIMING program_total 54891.555 ms`, postprocess `72.347 ms`, FDG mesh `375.963 ms`,
+>   PBR build `12.633 ms`,
 >   `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered, final OBJ
 >   byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
