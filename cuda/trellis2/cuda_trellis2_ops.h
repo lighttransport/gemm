@@ -21,6 +21,8 @@ typedef struct {
     int M[27];
     CUdeviceptr src_idx[27];
     CUdeviceptr dst_idx[27];
+    CUdeviceptr src_storage;
+    CUdeviceptr dst_storage;
 } t2_sparse_conv_pack;
 
 typedef struct {
@@ -63,6 +65,7 @@ typedef struct {
     CUfunction adaln;
     CUfunction gated_add;
     CUfunction modulation;
+    CUfunction modulation_add_bias;
     CUfunction rope_3d;
     CUfunction rms_norm_perhead;
     CUfunction conv3d_k3;
@@ -90,8 +93,12 @@ typedef struct {
     CUfunction attn_mma_hd128;
 
     /* Sparse conv kernels */
+    CUfunction sparse_hash_insert_coords;
     CUfunction sparse_build_gather_map;
     CUfunction sparse_gather;
+    CUfunction sparse_pack_from_gather_map;
+    CUfunction c2s_count_subdiv;
+    CUfunction c2s_write_subdiv_stable;
     CUfunction sparse_pack_rows;
     CUfunction scatter_add_rows;
     CUfunction scatter_add;
@@ -119,8 +126,12 @@ typedef struct {
     int use_packed_sparse_conv; /* 1=pack valid rows before sparse conv GEMM */
     cublasew_context *cublas;
     /* Scratch for the bf16 GEMM path (grown on demand; bf16 = 2 bytes/elem). */
+    CUfunction cast_f16_to_f32;
+    CUfunction cast_bf16_to_f32;
     CUfunction cast_f32_to_bf16;
     CUfunction round_bf16;  /* in-place f32 -> bf16-precision -> f32 (bf16_round) */
+    CUfunction conv_transpose_f16_to_f32;
+    CUfunction conv_transpose_bf16_to_f32;
     CUdeviceptr bf16_w, bf16_x;
     size_t bf16_w_cap, bf16_x_cap;  /* capacity in elements */
 } t2_ops;
@@ -171,12 +182,24 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
 
     /* Optional bf16 cast/round kernels (for the bf16 DiT paths). Tolerant lookup:
      * if absent (e.g. an older cached module) the bf16 paths stay disabled. */
+    if (cuModuleGetFunction(&ops->cast_f16_to_f32, module, "t2_cast_f16_to_f32")
+            != CUDA_SUCCESS)
+        ops->cast_f16_to_f32 = NULL;
+    if (cuModuleGetFunction(&ops->cast_bf16_to_f32, module, "t2_cast_bf16_to_f32")
+            != CUDA_SUCCESS)
+        ops->cast_bf16_to_f32 = NULL;
     if (cuModuleGetFunction(&ops->cast_f32_to_bf16, module, "t2_cast_f32_to_bf16")
             != CUDA_SUCCESS)
         ops->cast_f32_to_bf16 = NULL;
     if (cuModuleGetFunction(&ops->round_bf16, module, "t2_round_f32_bf16")
             != CUDA_SUCCESS)
         ops->round_bf16 = NULL;
+    if (cuModuleGetFunction(&ops->conv_transpose_f16_to_f32, module,
+                            "t2_conv3d_transpose_f16_to_f32") != CUDA_SUCCESS)
+        ops->conv_transpose_f16_to_f32 = NULL;
+    if (cuModuleGetFunction(&ops->conv_transpose_bf16_to_f32, module,
+                            "t2_conv3d_transpose_bf16_to_f32") != CUDA_SUCCESS)
+        ops->conv_transpose_bf16_to_f32 = NULL;
 
     if (sm_version >= 70) {
         GET_FN("attn_prefill_f32",    attn_prefill);
@@ -188,6 +211,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("adaln_f32",               adaln);
     GET_FN("gated_add_f32",           gated_add);
     GET_FN("modulation_f32",          modulation);
+    GET_FN("modulation_add_bias_f32", modulation_add_bias);
     GET_FN("rope_3d_f32",             rope_3d);
     GET_FN("rms_norm_perhead_f32",    rms_norm_perhead);
     GET_FN("conv3d_k3_f32",           conv3d_k3);
@@ -215,8 +239,12 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     }
 
     /* Sparse conv kernels */
+    GET_FN("sparse_hash_insert_coords_f32", sparse_hash_insert_coords);
     GET_FN("sparse_build_gather_map_f32", sparse_build_gather_map);
     GET_FN("sparse_gather_f32",           sparse_gather);
+    GET_FN("sparse_pack_from_gather_map_f32", sparse_pack_from_gather_map);
+    GET_FN("c2s_count_subdiv_f32",        c2s_count_subdiv);
+    GET_FN("c2s_write_subdiv_stable_f32", c2s_write_subdiv_stable);
     GET_FN("sparse_pack_rows_f32",        sparse_pack_rows);
     GET_FN("scatter_add_rows_f32",        scatter_add_rows);
     GET_FN("scatter_add_f32",             scatter_add);
@@ -693,8 +721,23 @@ static inline void t2_op_modulation(t2_ops *ops, CUstream s,
                                       CUdeviceptr blk_bias,
                                       int dim, int out_dim) {
     void *args[] = {&out, &t_emb, &mod_w, &mod_b, &blk_bias, &dim, &out_dim};
-    cuLaunchKernel(ops->modulation, 1, 1, 1,
+    /* Warp-per-row: 256 threads/block = 8 warps = 8 output rows per block. Grid
+     * covers all out_dim rows so the whole GPU is used (was a single block). */
+    unsigned warps_per_block = 256u / 32u;
+    unsigned grid = (unsigned)(((size_t)out_dim + warps_per_block - 1) / warps_per_block);
+    cuLaunchKernel(ops->modulation, grid, 1, 1,
                    256, 1, 1, (size_t)dim * sizeof(float), s, args, NULL);
+}
+
+static inline void t2_op_modulation_add_bias(t2_ops *ops, CUstream s,
+                                               CUdeviceptr out,
+                                               CUdeviceptr base,
+                                               CUdeviceptr blk_bias,
+                                               int n) {
+    void *args[] = {&out, &base, &blk_bias, &n};
+    cuLaunchKernel(ops->modulation_add_bias,
+                   (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
 }
 
 static inline void t2_op_rope_3d(t2_ops *ops, CUstream s,
@@ -887,6 +930,18 @@ static inline void t2_op_pixel_shuffle_3d(t2_ops *ops, CUstream s,
 /* Sparse convolution ops                                                    */
 /* ======================================================================== */
 
+/* Build hash table from coords on GPU. hash_keys must be initialized to
+ * 0xffffffffffffffff and hash_vals to -1 before launch. */
+static inline void t2_op_sparse_hash_insert_coords(t2_ops *ops, CUstream s,
+                                                     CUdeviceptr hash_keys,
+                                                     CUdeviceptr hash_vals,
+                                                     CUdeviceptr coords,
+                                                     int N, int hash_cap) {
+    void *args[] = {&hash_keys, &hash_vals, &coords, &N, &hash_cap};
+    cuLaunchKernel(ops->sparse_hash_insert_coords, (unsigned)((N + 255) / 256),
+                   1, 1, 256, 1, 1, 0, s, args, NULL);
+}
+
 /* Build gather map: for each voxel, find neighbor indices via hash table.
  * out_map: [N, 27] int32 on GPU */
 static inline void t2_op_sparse_build_gather_map(t2_ops *ops, CUstream s,
@@ -913,6 +968,45 @@ static inline void t2_op_sparse_gather(t2_ops *ops, CUstream s,
                    256, 1, 1, 0, s, args, NULL);
 }
 
+static inline void t2_op_c2s_count_subdiv(t2_ops *ops, CUstream s,
+                                            CUdeviceptr counts,
+                                            CUdeviceptr logits,
+                                            int N, int dense) {
+    void *args[] = {&counts, &logits, &N, &dense};
+    cuLaunchKernel(ops->c2s_count_subdiv, (unsigned)((N + 255) / 256),
+                   1, 1, 256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_c2s_write_subdiv_stable(t2_ops *ops, CUstream s,
+                                                   CUdeviceptr out_idx,
+                                                   CUdeviceptr out_subidx,
+                                                   CUdeviceptr out_coords,
+                                                   CUdeviceptr offsets,
+                                                   CUdeviceptr logits,
+                                                   CUdeviceptr coords,
+                                                   int N, int dense) {
+    void *args[] = {&out_idx, &out_subidx, &out_coords, &offsets,
+                    &logits, &coords, &N, &dense};
+    cuLaunchKernel(ops->c2s_write_subdiv_stable,
+                   (unsigned)((N + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Build packed sparse-conv row lists from an existing gather map.
+ * src_all/dst_all: [27, N] int32, counts: [27] int32 */
+static inline void t2_op_sparse_pack_from_gather_map(t2_ops *ops, CUstream s,
+                                                       CUdeviceptr src_all,
+                                                       CUdeviceptr dst_all,
+                                                       CUdeviceptr counts,
+                                                       CUdeviceptr gather_map,
+                                                       int N) {
+    int total = N * 27;
+    void *args[] = {&src_all, &dst_all, &counts, &gather_map, &N};
+    cuLaunchKernel(ops->sparse_pack_from_gather_map,
+                   (unsigned)((total + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
 /* Broadcast bias: dst[i*C + c] = bias[c] */
 static inline void t2_op_broadcast_bias(t2_ops *ops, CUstream s,
                                           CUdeviceptr dst, CUdeviceptr bias,
@@ -920,6 +1014,16 @@ static inline void t2_op_broadcast_bias(t2_ops *ops, CUstream s,
     int total = N * C;
     void *args[] = {&dst, &bias, &N, &C};
     cuLaunchKernel(ops->broadcast_bias, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Add row bias: dst[i*C + c] += bias[c] */
+static inline void t2_op_add_bias(t2_ops *ops, CUstream s,
+                                    CUdeviceptr dst, CUdeviceptr bias,
+                                    int N, int C) {
+    int total = N * C;
+    void *args[] = {&dst, &bias, &C, &N};
+    cuLaunchKernel(ops->add_bias, (unsigned)((total+255)/256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
 }
 
