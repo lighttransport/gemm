@@ -276,6 +276,8 @@
 > - Texture SC-VAE replay now borrows the recorded shape subdivision host arrays instead of
 >   malloc+memcpy of `idx`, `subidx`, and coords at every C2S level. Ownership tracking keeps
 >   shape-generated coords freed normally while texture replay borrows the persistent guide plan.
+> - The vertex-colored PBR OBJ writer now formats into stack lines and flushes through a 1 MiB
+>   text buffer, preserving `%f`/`%d` output bytes while reducing per-line stdio overhead.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
@@ -287,6 +289,9 @@
 > - file-output exactness run after replay-borrow: `real 54.85`,
 >   `T2_TIMING program_total 54772.645 ms`, texture decoder `1969.400 ms`,
 >   PBR build `13.064 ms`, final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
+> - file-output exactness run after buffered PBR OBJ writer: `real 54.70`,
+>   `T2_TIMING program_total 54604.078 ms`, PBR writer `2679.527 ms`,
+>   texture decoder `1958.490 ms`, final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
 > Rejected in this pass: widening `attn_mma_hd128_f32` from 4 warps/64 query rows per CTA to
 > 8 warps/128 rows per CTA. Arithmetic stayed row-local, but hot DiT steps regressed
