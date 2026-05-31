@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include "../rocew.h"
+#include "hip_sam3d_wmma.h"
 #include "hip_sam3d_slat_dit_gpu.h"
 
 #ifdef __cplusplus
@@ -11,7 +12,7 @@ extern "C" {
 #endif
 
 typedef struct {
-    hipFunction_t gemm, mod_ln, ln, qkv_split, kv_split, mhrms, sdpa;
+    hipFunction_t gemm, gemm_wmma, mod_ln, ln, qkv_split, kv_split, mhrms, sdpa;
     hipFunction_t gelu, gated, resadd, silu;
 } cs3d_slatdit_fns;
 
@@ -48,6 +49,8 @@ int  cs3d_slatdit_stack_forward(const cs3d_slatdit_fns *f, cs3d_slatdit_block_ws
 int cs3d_slatdit_fns_lookup(cs3d_slatdit_fns *f, hipModule_t mod)
 {
     if (hipModuleGetFunction(&f->gemm,      mod, "gemm_f32_bias")          != hipSuccess) return -1;
+    if (hipModuleGetFunction(&f->gemm_wmma, mod, "gemm_f32_bias_wmma") != hipSuccess)
+        f->gemm_wmma = NULL;
     if (hipModuleGetFunction(&f->mod_ln,    mod, "modulated_ln_f32")       != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->ln,        mod, "layernorm_token_f32")    != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->qkv_split, mod, "qkv_split_f32")          != hipSuccess) return -1;

@@ -90,6 +90,13 @@ typedef struct sam3d_body_mhr_assets_t {
 
     /* Backing buffer for parsed safetensors (kept alive until free). */
     void *_st;
+
+    /* Optional GPU offload hook for the pose_correctives dense matvec
+     * (out[55317] = LW[55317,3000] @ h[3000], bias-free), the 166M-FMA hot path.
+     * Plain C callback (no HIP types here) — the runner sets it to a closure
+     * that runs gemm_f32_bias on resident LW. NULL → CPU matvec. */
+    void *pc_matvec_user;
+    int (*pc_matvec_fn)(void *user, const float *h, float *out_offsets);
 } sam3d_body_mhr_assets;
 
 /* ---- Public API --------------------------------------------------- */
