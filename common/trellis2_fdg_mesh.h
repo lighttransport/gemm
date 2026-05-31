@@ -30,6 +30,9 @@ typedef struct {
     int   *triangles;   /* [n_tris, 3] */
     int    n_verts;
     int    n_tris;
+    int64_t *hash_keys; /* optional retained voxel hash for downstream sampling */
+    int     *hash_vals;
+    int      hash_cap;
 } t2_fdg_mesh;
 
 /* Extract mesh from shape decoder output.
@@ -107,10 +110,6 @@ static int fdg_hash_lookup(const fdg_hash *h, int z, int y, int x) {
         slot++;
         if (slot == (unsigned)h->capacity) slot = 0;
     }
-}
-
-static void fdg_hash_free(fdg_hash *h) {
-    free(h->keys); free(h->vals);
 }
 
 /* Edge neighbor offsets: for each axis (x,y,z), the 4 voxels sharing that edge */
@@ -192,7 +191,6 @@ static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *fe
         }
     }
 
-    fdg_hash_free(&hash);
     if (n_tris > 0) {
         int *shrunk = (int *)realloc(tris, (size_t)n_tris * 3 * sizeof(int));
         if (shrunk) tris = shrunk;
@@ -202,6 +200,9 @@ static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *fe
     mesh.triangles = tris;
     mesh.n_verts = N;
     mesh.n_tris = n_tris;
+    mesh.hash_keys = hash.keys;
+    mesh.hash_vals = hash.vals;
+    mesh.hash_cap = hash.capacity;
 
     fprintf(stderr, "fdg_mesh: %d verts, %d quads -> %d triangles\n", N, n_quads, n_tris);
     return mesh;
@@ -219,7 +220,9 @@ t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
 
 void t2_fdg_mesh_free(t2_fdg_mesh *m) {
     free(m->vertices); free(m->triangles);
+    free(m->hash_keys); free(m->hash_vals);
     m->vertices = NULL; m->triangles = NULL;
+    m->hash_keys = NULL; m->hash_vals = NULL; m->hash_cap = 0;
     m->n_verts = m->n_tris = 0;
 }
 

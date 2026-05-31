@@ -1302,10 +1302,12 @@ texture decoder output after handing it to the PBR field. The PBR builder can no
 the raw texture field and scale it in-place, while preserving the old copying API for other callers.
 Because texture decode replays the shape subdivision, the PBR resolution now reuses the shape
 `max_coord` instead of rescanning texture coords.
+The FDG mesh also retains its voxel hash so the PBR field can borrow it instead of building a second
+hash over the same final coordinate set.
 This mainly lowers the CPU/GPU live set during the CPU mesh/PBR tail without changing math. Final
-validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_pbrtake_e2e.obj` succeeds; cached full textured
-e2e with file output is `real 55.11` (`T2_TIMING program_total 55010.783 ms`, postprocess
-`69.303 ms`, FDG mesh `370.555 ms`, PBR build `123.056 ms`), with the same
+validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_borrowhash_e2e.obj` succeeds; cached full textured
+e2e with file output is `real 54.98` (`T2_TIMING program_total 54891.555 ms`, postprocess
+`72.347 ms`, FDG mesh `375.963 ms`, PBR build `12.633 ms`), with the same
 `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` / `100%`.
 
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)

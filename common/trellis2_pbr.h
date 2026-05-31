@@ -41,8 +41,10 @@ typedef struct {
     int coord_max[3];    /* z, y, x */
     /* Hash table for fast lookup */
     uint64_t *hash_keys;
-    int32_t  *hash_vals;
+    int      *hash_vals;
     int hash_cap;
+    int hash_borrowed;
+    int hash_power2;
 } t2_pbr_field;
 
 /* Create PBR field from texture decoder output.
@@ -56,6 +58,14 @@ t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
  * it in-place. The returned field owns feats and frees it in t2_pbr_free. */
 t2_pbr_field t2_pbr_from_decoder_take(float *feats, const int32_t *coords,
                                         int N, int resolution);
+
+/* Variant for callers that already have a voxel hash over the same coords in
+ * identical row order. The hash is borrowed and must outlive the PBR field. */
+t2_pbr_field t2_pbr_from_decoder_take_with_hash(float *feats, const int32_t *coords,
+                                                  int N, int resolution,
+                                                  const int64_t *hash_keys,
+                                                  const int *hash_vals,
+                                                  int hash_cap);
 
 /* Sample PBR attributes at mesh vertex positions via trilinear interpolation.
  * vertices: [n_verts, 3] in [-0.5, 0.5] normalized space
@@ -105,10 +115,18 @@ static uint64_t t2pbr_hash_key(int z, int y, int x) {
     return ((uint64_t)(z & 0xFFFFF) << 40) | ((uint64_t)(y & 0xFFFFF) << 20) | (uint64_t)(x & 0xFFFFF);
 }
 
+static unsigned t2pbr_hash_slot(uint64_t key, int capacity) {
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32);
+    return (unsigned)(((uint64_t)h * (uint32_t)capacity) >> 32);
+}
+
 static t2_pbr_field t2_pbr_from_decoder_impl(float *owned_feats,
                                                const float *feats,
                                                const int32_t *coords,
-                                               int N, int resolution) {
+                                               int N, int resolution,
+                                               const int64_t *borrow_hash_keys,
+                                               const int *borrow_hash_vals,
+                                               int borrow_hash_cap) {
     t2_pbr_field f = {0};
     f.N = N;
     f.resolution = resolution;
@@ -134,14 +152,23 @@ static t2_pbr_field t2_pbr_from_decoder_impl(float *owned_feats,
      * indexed in (col1, col2, col3) order. The previous (col3, col2, col1) order
      * swapped x<->z, so lookups only hit on the x==z diagonal (~11% coverage). */
 
-    /* Build hash table */
-    int cap = N * 4; if (cap < 64) cap = 64;
-    /* Round up to power of 2 */
-    int p = 1; while (p < cap) p <<= 1; cap = p;
-    f.hash_cap = cap;
-    f.hash_keys = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
-    f.hash_vals = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
-    memset(f.hash_keys, 0xFF, (size_t)cap * sizeof(uint64_t));
+    if (borrow_hash_keys && borrow_hash_vals && borrow_hash_cap > 0) {
+        f.hash_keys = (uint64_t *)borrow_hash_keys;
+        f.hash_vals = (int *)borrow_hash_vals;
+        f.hash_cap = borrow_hash_cap;
+        f.hash_borrowed = 1;
+        f.hash_power2 = 0;
+    } else {
+        /* Build hash table */
+        int cap = N * 4; if (cap < 64) cap = 64;
+        /* Round up to power of 2 */
+        int p = 1; while (p < cap) p <<= 1; cap = p;
+        f.hash_cap = cap;
+        f.hash_power2 = 1;
+        f.hash_keys = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
+        f.hash_vals = (int *)malloc((size_t)cap * sizeof(int));
+        memset(f.hash_keys, 0xFF, (size_t)cap * sizeof(uint64_t));
+    }
 
     for (int i = 0; i < N; i++) {
         int z = coords[i * 4 + 1];
@@ -153,9 +180,10 @@ static t2_pbr_field t2_pbr_from_decoder_impl(float *owned_feats,
         if (z > f.coord_max[0]) f.coord_max[0] = z;
         if (y > f.coord_max[1]) f.coord_max[1] = y;
         if (x > f.coord_max[2]) f.coord_max[2] = x;
+        if (f.hash_borrowed) continue;
         uint64_t key = t2pbr_hash_key(z, y, x);
-        unsigned slot = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(cap - 1);
-        while (f.hash_keys[slot] != (uint64_t)-1) slot = (slot + 1) & (unsigned)(cap - 1);
+        unsigned slot = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(f.hash_cap - 1);
+        while (f.hash_keys[slot] != (uint64_t)-1) slot = (slot + 1) & (unsigned)(f.hash_cap - 1);
         f.hash_keys[slot] = key;
         f.hash_vals[slot] = i;
     }
@@ -165,21 +193,37 @@ static t2_pbr_field t2_pbr_from_decoder_impl(float *owned_feats,
 
 t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
                                    int N, int resolution) {
-    return t2_pbr_from_decoder_impl(NULL, feats, coords, N, resolution);
+    return t2_pbr_from_decoder_impl(NULL, feats, coords, N, resolution, NULL, NULL, 0);
 }
 
 t2_pbr_field t2_pbr_from_decoder_take(float *feats, const int32_t *coords,
                                         int N, int resolution) {
-    return t2_pbr_from_decoder_impl(feats, feats, coords, N, resolution);
+    return t2_pbr_from_decoder_impl(feats, feats, coords, N, resolution, NULL, NULL, 0);
+}
+
+t2_pbr_field t2_pbr_from_decoder_take_with_hash(float *feats, const int32_t *coords,
+                                                  int N, int resolution,
+                                                  const int64_t *hash_keys,
+                                                  const int *hash_vals,
+                                                  int hash_cap) {
+    return t2_pbr_from_decoder_impl(feats, feats, coords, N, resolution,
+                                    hash_keys, hash_vals, hash_cap);
 }
 
 static int t2pbr_lookup(const t2_pbr_field *f, int z, int y, int x) {
     uint64_t key = t2pbr_hash_key(z, y, x);
-    unsigned slot = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(f->hash_cap - 1);
+    unsigned slot = f->hash_power2
+        ? ((unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(f->hash_cap - 1))
+        : t2pbr_hash_slot(key, f->hash_cap);
     for (;;) {
         if (f->hash_keys[slot] == key) return f->hash_vals[slot];
         if (f->hash_keys[slot] == (uint64_t)-1) return -1;
-        slot = (slot + 1) & (unsigned)(f->hash_cap - 1);
+        if (f->hash_power2) {
+            slot = (slot + 1) & (unsigned)(f->hash_cap - 1);
+        } else {
+            slot++;
+            if (slot == (unsigned)f->hash_cap) slot = 0;
+        }
     }
 }
 
@@ -328,7 +372,10 @@ void t2_pbr_sample_vertices(const t2_pbr_field *field,
 
 void t2_pbr_free(t2_pbr_field *f) {
     free(f->feats); free(f->coords);
-    free(f->hash_keys); free(f->hash_vals);
+    if (!f->hash_borrowed) {
+        free(f->hash_keys);
+        free(f->hash_vals);
+    }
     memset(f, 0, sizeof(*f));
 }
 
