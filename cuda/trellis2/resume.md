@@ -278,6 +278,9 @@
 >   shape-generated coords freed normally while texture replay borrows the persistent guide plan.
 > - The vertex-colored PBR OBJ writer now formats into stack lines and flushes through a 1 MiB
 >   text buffer, preserving `%f`/`%d` output bytes while reducing per-line stdio overhead.
+> - The retained FDG/PBR voxel hash now uses `3*N` slots instead of `4*N`. At the current
+>   `N=1,403,042` tail this cuts the borrowed hash live set by about 16.8 MB, with a small
+>   lookup-cost tradeoff.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
@@ -292,6 +295,9 @@
 > - file-output exactness run after buffered PBR OBJ writer: `real 54.70`,
 >   `T2_TIMING program_total 54604.078 ms`, PBR writer `2679.527 ms`,
 >   texture decoder `1958.490 ms`, final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
+> - file-output exactness run after `3*N` retained hash: `real 54.79`,
+>   `T2_TIMING program_total 54702.957 ms`, FDG mesh `368.019 ms`,
+>   PBR writer `2766.115 ms`, final OBJ byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
 > Rejected in this pass: widening `attn_mma_hd128_f32` from 4 warps/64 query rows per CTA to
 > 8 warps/128 rows per CTA. Arithmetic stayed row-local, but hot DiT steps regressed
