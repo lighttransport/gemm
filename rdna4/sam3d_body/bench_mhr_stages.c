@@ -5,6 +5,8 @@
  * Build: gcc -O3 -march=native -fopenmp -I. -I.. -o bench_mhr_stages \
  *          bench_mhr_stages.c ../rocew.c -ldl -lm   (rocew unused but links)
  */
+#define SAFETENSORS_IMPLEMENTATION
+#include "../../common/safetensors.h"
 #define SAM3D_BODY_MHR_IMPLEMENTATION
 #include "../../common/sam3d_body_mhr.h"
 #include <stdio.h>
