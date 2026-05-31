@@ -3586,12 +3586,19 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     /* Current CPU-side coords for subdivision-list synthesis. */
     int32_t *cur_coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
     memcpy(cur_coords, coords, (size_t)N * 4 * sizeof(int32_t));
+    int cur_coords_owned = 1;
+
+    #define T2_FREE_CUR_COORDS() do { \
+        if (cur_coords_owned) free(cur_coords); \
+        cur_coords = NULL; \
+        cur_coords_owned = 0; \
+    } while (0)
 
     if (start_stage < 4) {
         if (t2_build_sparse_gpu_index(r, cur_coords, N, d_coords,
                                       &hash, &d_hash_keys, &d_hash_vals,
                                       &d_gather_map, &hash_cap) != 0) {
-            cuMemFree(d_feats); cuMemFree(d_coords); free(cur_coords);
+            cuMemFree(d_feats); cuMemFree(d_coords); T2_FREE_CUR_COORDS();
             T2_RESTORE_SCVAE_GEMM();
             return -1;
         }
@@ -3608,7 +3615,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
             t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
             cuMemFree(d_feats);
             cuMemFree(d_coords);
-            free(cur_coords);
+            T2_FREE_CUR_COORDS();
             T2_RESTORE_SCVAE_GEMM();
             return rc;
         }
@@ -3657,7 +3664,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
                 cuMemFree(d_coords);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3667,7 +3674,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
                 cuMemFree(d_coords);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3705,13 +3712,15 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                     t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                     cuMemFree(d_feats);
                     cuMemFree(d_coords);
-                    free(cur_coords);
+                    T2_FREE_CUR_COORDS();
                     T2_RESTORE_SCVAE_GEMM();
                     return rc;
                 }
             }
 
             int32_t *sub_idx = NULL, *sub_subidx = NULL, *new_coords = NULL;
+            int sub_lists_owned = 1;
+            int new_coords_owned = 1;
             int N_new = 0;
 
             /* Texture decode (no subdiv head): replay the shape decoder's recorded
@@ -3725,18 +3734,16 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 r->subdiv_plan[stage].n_parent == N) {
                 t2_subdiv_stage *p = &r->subdiv_plan[stage];
                 N_new = p->n_new;
-                sub_idx    = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
-                sub_subidx = (int32_t *)malloc((size_t)N_new * sizeof(int32_t));
-                new_coords = (int32_t *)malloc((size_t)N_new * 4 * sizeof(int32_t));
-                if (sub_idx && sub_subidx && new_coords) {
-                    memcpy(sub_idx,    p->idx,    (size_t)N_new * sizeof(int32_t));
-                    memcpy(sub_subidx, p->subidx, (size_t)N_new * sizeof(int32_t));
-                    memcpy(new_coords, p->coords, (size_t)N_new * 4 * sizeof(int32_t));
+                if (p->idx && p->subidx && p->coords) {
+                    sub_idx = p->idx;
+                    sub_subidx = p->subidx;
+                    new_coords = p->coords;
+                    sub_lists_owned = 0;
+                    new_coords_owned = 0;
                     replayed = 1;
                     fprintf(stderr, "T2: %s: stage %d replaying shape subdivision "
                             "(%d -> %d voxels)\n", label, stage, N, N_new);
                 } else {
-                    free(sub_idx); free(sub_subidx); free(new_coords);
                     sub_idx = sub_subidx = new_coords = NULL; N_new = 0;
                 }
             } else if (dense_subdiv && stage < 8 && !r->subdiv_plan[stage].valid) {
@@ -3761,7 +3768,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                         free(sub_logits);
                         if (d_logits) cuMemFree(d_logits);
                         t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
-                        cuMemFree(d_feats); cuMemFree(d_coords); free(cur_coords);
+                        cuMemFree(d_feats); cuMemFree(d_coords); T2_FREE_CUR_COORDS();
                         T2_RESTORE_SCVAE_GEMM();
                         return -1;
                     }
@@ -3797,7 +3804,12 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 d_sub_idx = cu_upload_raw(sub_idx, (size_t)N_new * sizeof(int32_t));
             if (!d_sub_subidx)
                 d_sub_subidx = cu_upload_raw(sub_subidx, (size_t)N_new * sizeof(int32_t));
-            free(sub_idx); free(sub_subidx);
+            if (sub_lists_owned) {
+                free(sub_idx);
+                free(sub_subidx);
+            }
+            sub_idx = NULL;
+            sub_subidx = NULL;
 
             ensure_scratch(r, 8, (size_t)N * C_in * sizeof(float));
             ensure_scratch(r, 9, (size_t)N * ((C_in > C_exp) ? C_in : C_exp) * sizeof(float));
@@ -3824,11 +3836,11 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_sub_idx);
                 cuMemFree(d_sub_subidx);
                 if (d_new_coords) cuMemFree(d_new_coords);
-                free(new_coords);
+                if (new_coords_owned) free(new_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
                 cuMemFree(d_coords);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3848,11 +3860,11 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_sub_idx);
                 cuMemFree(d_sub_subidx);
                 if (d_new_coords) cuMemFree(d_new_coords);
-                free(new_coords);
+                if (new_coords_owned) free(new_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
                 cuMemFree(d_coords);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3879,11 +3891,11 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_h_fine);
                 cuMemFree(d_x_fine);
                 if (d_new_coords) cuMemFree(d_new_coords);
-                free(new_coords);
+                if (new_coords_owned) free(new_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
                 cuMemFree(d_coords);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3898,8 +3910,11 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
             t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
             hash = NULL; d_hash_keys = d_hash_vals = d_gather_map = 0;
 
-            free(cur_coords);
+            T2_FREE_CUR_COORDS();
             cur_coords = new_coords;
+            cur_coords_owned = new_coords_owned;
+            new_coords = NULL;
+            new_coords_owned = 0;
             N = N_new;
             C = C_out;
             if (d_new_coords) {
@@ -3912,7 +3927,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                                           &hash, &d_hash_keys, &d_hash_vals,
                                           &d_gather_map, &hash_cap) != 0) {
                 cuMemFree(d_h_fine); cuMemFree(d_x_fine); cuMemFree(d_coords);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return -1;
             }
@@ -3939,7 +3954,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_x_fine);
                 cuMemFree(d_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3958,7 +3973,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_x_fine);
                 cuMemFree(d_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3972,7 +3987,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 cuMemFree(d_x_fine);
                 cuMemFree(d_coords);
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -3994,7 +4009,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                 t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
                 cuMemFree(d_feats);
                 cuMemFree(d_coords);
-                free(cur_coords);
+                T2_FREE_CUR_COORDS();
                 T2_RESTORE_SCVAE_GEMM();
                 return rc;
             }
@@ -4029,7 +4044,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
         if (flag && atoi(flag)) {
             int rc = t2_shape_debug_return(s, d_feats, cur_coords, N, C,
                                            out_feats, out_coords, out_N, out_C);
-            free(cur_coords);
+            T2_FREE_CUR_COORDS();
             cuMemFree(d_feats);
             cuMemFree(d_coords);
             t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
@@ -4086,7 +4101,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     if (!host_feats || !host_coords) {
         free(host_feats); free(host_coords);
         cuMemFree(d_output);
-        free(cur_coords);
+        T2_FREE_CUR_COORDS();
         cuMemFree(d_feats);
         cuMemFree(d_coords);
         t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
@@ -4102,7 +4117,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     cuMemFree(d_output);
 
     /* Cleanup */
-    free(cur_coords);
+    T2_FREE_CUR_COORDS();
     cuMemFree(d_feats);
     cuMemFree(d_coords);
     t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
@@ -4112,6 +4127,7 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
     }
 
     T2_RESTORE_SCVAE_GEMM();
+    #undef T2_FREE_CUR_COORDS
     #undef T2_RESTORE_SCVAE_GEMM
     return 0;
 }
