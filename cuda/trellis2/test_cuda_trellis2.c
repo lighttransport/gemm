@@ -802,38 +802,29 @@ sparse_done:
         double shape_post_t0 = t2_harness_now_ms();
         const float voxel_margin = 0.5f;
         int n_isect = 0;
+        int max_coord = 0;
         for (int i = 0; i < result.N; i++) {
             float *f = result.feats + i * 7;
             for (int j = 0; j < 3; j++)
                 f[j] = (1.0f + 2.0f * voxel_margin) / (1.0f + expf(-f[j])) - voxel_margin;
             f[6] = logf(1.0f + expf(f[6]));
             if (f[3] > 0.0f || f[4] > 0.0f || f[5] > 0.0f) n_isect++;
+            for (int j = 1; j <= 3; j++)
+                if (result.coords[i * 4 + j] > max_coord)
+                    max_coord = result.coords[i * 4 + j];
         }
         fprintf(stderr, "FDG: %d/%d voxels have an intersected edge (feats[3:6]>0)\n",
                 n_isect, result.N);
-
-        /* Extract coords without batch dim: [N, 3] from [N, 4] */
-        int32_t *coords3 = (int32_t *)malloc((size_t)result.N * 3 * sizeof(int32_t));
-        for (int i = 0; i < result.N; i++) {
-            coords3[i * 3 + 0] = result.coords[i * 4 + 1];  /* z */
-            coords3[i * 3 + 1] = result.coords[i * 4 + 2];  /* y */
-            coords3[i * 3 + 2] = result.coords[i * 4 + 3];  /* x */
-        }
         t2_harness_timing_log("shape_postprocess_cpu", shape_post_t0);
 
         /* FDG mesh extraction */
         float aabb[6] = {-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f};
-        int max_coord = 0;
-        for (int i = 0; i < result.N * 3; i++)
-            if (coords3[i] > max_coord) max_coord = coords3[i];
         float vs = (aabb[3] - aabb[0]) / (float)(max_coord + 1);
 
         fprintf(stderr, "\n=== FDG Mesh (voxel_size=%.4f, max_coord=%d) ===\n", vs, max_coord);
         double fdg_mesh_t0 = t2_harness_now_ms();
-        t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
+        t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh_bzyx(result.coords, result.feats, result.N, vs, aabb);
         t2_harness_timing_log("fdg_mesh_extract_cpu", fdg_mesh_t0);
-        free(coords3);
-        coords3 = NULL;
         t2_shape_dec_result_free(&result);
 
         if (fdg_mesh.n_tris > 0) {
@@ -956,7 +947,6 @@ texture_done:
             }
         }
 
-        free(coords3);
         t2_fdg_mesh_free(&fdg_mesh);
         t2_shape_dec_result_free(&result);
         free(sparse_coords);
