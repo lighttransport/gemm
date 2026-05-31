@@ -406,13 +406,79 @@ int t2_pbr_write_colored_obj(const char *path,
     return 0;
 }
 
+typedef struct {
+    FILE *file;
+    char *data;
+    size_t size;
+    size_t used;
+    int error;
+} t2pbr_textbuf;
+
+static int t2pbr_textbuf_init(t2pbr_textbuf *b, FILE *file, size_t size) {
+    memset(b, 0, sizeof(*b));
+    b->file = file;
+    b->data = (char *)malloc(size);
+    if (!b->data) return -1;
+    b->size = size;
+    return 0;
+}
+
+static int t2pbr_textbuf_flush(t2pbr_textbuf *b) {
+    if (b->error) return -1;
+    if (b->used == 0) return 0;
+    if (fwrite(b->data, 1, b->used, b->file) != b->used) {
+        b->error = 1;
+        return -1;
+    }
+    b->used = 0;
+    return 0;
+}
+
+static int t2pbr_textbuf_write(t2pbr_textbuf *b, const char *s, size_t n) {
+    if (b->error) return -1;
+    if (n > b->size) {
+        if (t2pbr_textbuf_flush(b) != 0) return -1;
+        if (fwrite(s, 1, n, b->file) != n) {
+            b->error = 1;
+            return -1;
+        }
+        return 0;
+    }
+    if (b->used + n > b->size && t2pbr_textbuf_flush(b) != 0)
+        return -1;
+    memcpy(b->data + b->used, s, n);
+    b->used += n;
+    return 0;
+}
+
+static int t2pbr_textbuf_close(t2pbr_textbuf *b) {
+    int rc = t2pbr_textbuf_flush(b);
+    free(b->data);
+    memset(b, 0, sizeof(*b));
+    return rc;
+}
+
 int t2_pbr_write_sampled_colored_obj(const char *path,
                                        const float *vertices, const int *triangles,
                                        int n_verts, int n_tris,
                                        const t2_pbr_field *field) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    fprintf(f, "# TRELLIS.2 textured mesh: %d verts, %d tris\n", n_verts, n_tris);
+    t2pbr_textbuf wb;
+    if (t2pbr_textbuf_init(&wb, f, 1u << 20) != 0) {
+        fclose(f);
+        return -1;
+    }
+    char line[256];
+    int line_n = snprintf(line, sizeof(line),
+                          "# TRELLIS.2 textured mesh: %d verts, %d tris\n",
+                          n_verts, n_tris);
+    if (line_n < 0 || line_n >= (int)sizeof(line) ||
+        t2pbr_textbuf_write(&wb, line, (size_t)line_n) != 0) {
+        t2pbr_textbuf_close(&wb);
+        fclose(f);
+        return -1;
+    }
 
     int diag = 1;
     const char *qd = getenv("T2_PBR_QUIET"); if (qd && atoi(qd)) diag = 0;
@@ -432,9 +498,15 @@ int t2_pbr_write_sampled_colored_obj(const char *path,
         } else if (hit_kind == 2) {
             snapped++;
         }
-        fprintf(f, "v %f %f %f %f %f %f\n",
-                vertices[i*3], vertices[i*3+1], vertices[i*3+2],
-                color.r, color.g, color.b);
+        line_n = snprintf(line, sizeof(line), "v %f %f %f %f %f %f\n",
+                          vertices[i*3], vertices[i*3+1], vertices[i*3+2],
+                          color.r, color.g, color.b);
+        if (line_n < 0 || line_n >= (int)sizeof(line) ||
+            t2pbr_textbuf_write(&wb, line, (size_t)line_n) != 0) {
+            t2pbr_textbuf_close(&wb);
+            fclose(f);
+            return -1;
+        }
     }
 
     if (diag) {
@@ -442,11 +514,19 @@ int t2_pbr_write_sampled_colored_obj(const char *path,
     }
 
     for (int i = 0; i < n_tris; i++) {
-        fprintf(f, "f %d %d %d\n",
-                triangles[i*3]+1, triangles[i*3+1]+1, triangles[i*3+2]+1);
+        line_n = snprintf(line, sizeof(line), "f %d %d %d\n",
+                          triangles[i*3]+1, triangles[i*3+1]+1, triangles[i*3+2]+1);
+        if (line_n < 0 || line_n >= (int)sizeof(line) ||
+            t2pbr_textbuf_write(&wb, line, (size_t)line_n) != 0) {
+            t2pbr_textbuf_close(&wb);
+            fclose(f);
+            return -1;
+        }
     }
 
-    fclose(f);
+    int write_rc = t2pbr_textbuf_close(&wb);
+    int close_rc = fclose(f);
+    if (write_rc != 0 || close_rc != 0) return -1;
     fprintf(stderr, "Wrote %s (%d verts, %d tris, with vertex colors)\n",
             path, n_verts, n_tris);
     return 0;
