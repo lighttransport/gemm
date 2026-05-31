@@ -19,6 +19,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <time.h>
 
 static float *read_npy_f32(const char *p, int *nd, int *dd) {
     FILE *f=fopen(p,"rb"); if(!f) return NULL;
@@ -97,6 +98,8 @@ int main(int argc, char **argv) {
     float *v_cond   = (float *)malloc((size_t)N * C * sizeof(float));
     float *v_uncond = (float *)malloc((size_t)N * C * sizeof(float));
 
+    struct timespec lt0; clock_gettime(CLOCK_MONOTONIC, &lt0);
+    int n_fwd = 0;
     for (int step = 0; step < steps; step++) {
         float t_start = 1.0f - (float)step / (float)steps;
         float t_end   = 1.0f - (float)(step + 1) / (float)steps;
@@ -107,6 +110,7 @@ int main(int argc, char **argv) {
         if (apply_cfg) {
             cuda_trellis2_run_stage2_dit(r, x, t_cur, cond,        coords, N, v_cond);
             cuda_trellis2_run_stage2_dit(r, x, t_cur, zeros_cond,  coords, N, v_uncond);
+            n_fwd += 2;
             float *pred_v = v_uncond;
             for (int i = 0; i < N * C; i++)
                 pred_v[i] = cfg * v_cond[i] + (1.0f - cfg) * v_uncond[i];
@@ -131,11 +135,16 @@ int main(int argc, char **argv) {
             for (int i = 0; i < N * C; i++) x[i] -= (t_cur - t_next) * pred_v[i];
         } else {
             cuda_trellis2_run_stage2_dit(r, x, t_cur, cond, coords, N, v_cond);
+            n_fwd += 1;
             for (int i = 0; i < N * C; i++) x[i] -= (t_cur - t_next) * v_cond[i];
         }
         fprintf(stderr, "  step %2d/%d  t=%.4f->%.4f  %s\n",
                 step+1, steps, t_cur, t_next, apply_cfg ? "CFG" : "noG");
     }
+    struct timespec lt1; clock_gettime(CLOCK_MONOTONIC, &lt1);
+    double loop_ms = (lt1.tv_sec - lt0.tv_sec) * 1000.0 + (lt1.tv_nsec - lt0.tv_nsec) / 1e6;
+    fprintf(stderr, "\n>>> Sampler loop: %.1f s total, %d forwards, %.1f ms/forward\n",
+            loop_ms / 1000.0, n_fwd, loop_ms / n_fwd);
 
     /* Compare x (raw output) vs ref (07_shape_slat_raw_feats) */
     double sr=0, sc=0, sr2=0, sc2=0, src=0, sd2=0;
