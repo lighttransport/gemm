@@ -1298,11 +1298,13 @@ textured OBJ remains byte-identical to the wrapper-scratch baseline.
 The CUDA harness also drops large host/GPU objects as soon as downstream stages have copied what they
 need: occupancy after sparse coord extraction, conditioning features after DiTs finish, shape decoder
 weights and shape output after FDG extraction, texture decoder weights after texture decode, and raw
-texture decoder output after the PBR field copy. This mainly lowers the CPU/GPU live set during the
-CPU mesh/PBR tail (roughly `~130 MiB` less host data during OBJ writing) without changing math. Final
-validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_fdg4_e2e.obj` succeeds; cached full textured e2e
-with file output is `real 55.13` (`T2_TIMING program_total 55043.421 ms`, postprocess `68.448 ms`,
-FDG mesh `382.836 ms`), with the same `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` / `100%`.
+texture decoder output after handing it to the PBR field. The PBR builder can now take ownership of
+the raw texture field and scale it in-place, while preserving the old copying API for other callers.
+This mainly lowers the CPU/GPU live set during the CPU mesh/PBR tail without changing math. Final
+validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_pbrtake_e2e.obj` succeeds; cached full textured
+e2e with file output is `real 55.11` (`T2_TIMING program_total 55010.783 ms`, postprocess
+`69.303 ms`, FDG mesh `370.555 ms`, PBR build `123.056 ms`), with the same
+`1,403,042 verts / 3,048,684 tris`, PBR `99.7%` / `100%`.
 
 ### PyTorch-reference comparison of the full textured e2e (2026-05-29)
 
