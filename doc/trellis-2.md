@@ -1300,6 +1300,8 @@ need: occupancy after sparse coord extraction, conditioning features after DiTs 
 weights and shape output after FDG extraction, texture decoder weights after texture decode, and raw
 texture decoder output after handing it to the PBR field. The PBR builder can now take ownership of
 the raw texture field and scale it in-place, while preserving the old copying API for other callers.
+Because texture decode replays the shape subdivision, the PBR resolution now reuses the shape
+`max_coord` instead of rescanning texture coords.
 This mainly lowers the CPU/GPU live set during the CPU mesh/PBR tail without changing math. Final
 validation: `cmp /tmp/t2_scratchio_e2e.obj /tmp/t2_pbrtake_e2e.obj` succeeds; cached full textured
 e2e with file output is `real 55.11` (`T2_TIMING program_total 55010.783 ms`, postprocess
