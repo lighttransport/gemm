@@ -10,8 +10,8 @@
  * F16 weights on GPU, F32 compute. Single-stream sequential kernel launches.
  *
  * Key differences from CUDA version:
- *   - No MMA/tensor core kernels (RDNA4 has no MMA)
- *   - gemm_tiled_f16_f32 is the PRIMARY GEMM kernel
+ *   - gemm_tiled_f16_f32 is the default GEMM kernel
+ *   - Optional gfx12 WMMA GEMM is gated by DA3_GEMM_WMMA=1
  *   - No FP8 GEMM (no hardware FP8 MMA on RDNA4)
  *   - PTX inline ASM replaced with HIP builtins
  *
@@ -41,6 +41,89 @@
 /* ======================================================================== */
 
 static const char *hip_da3_specific_kernels =
+"\n"
+"typedef _Float16 da3_f16x8 __attribute__((ext_vector_type(8)));\n"
+"typedef float da3_float8 __attribute__((ext_vector_type(8)));\n"
+"__device__ __forceinline__ _Float16 da3_f16_bits_to_f16(half_raw h) {\n"
+"    _Float16 v;\n"
+"    __builtin_memcpy(&v, &h, 2);\n"
+"    return v;\n"
+"}\n"
+"\n"
+"/* ---- DA3: gemm_f16w_f16a_wmma_t: opt-in gfx12 WMMA GEMM ---- */\n"
+"/* Drop-in for gemm_tiled_f16_f32: Y[n_tok,n_out] = X[n_tok,n_in] * W[n_out,n_in]^T + bias. */\n"
+"#if defined(__gfx1200__) || defined(__gfx1201__)\n"
+"__global__ void gemm_f16w_f16a_wmma_t(float *Y, const half_raw *W, const float *X,\n"
+"                                       const float *bias, int n_out, int n_in, int n_tok) {\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int half = lane >> 4;\n"
+"    int idx = lane & 15;\n"
+"    int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    __shared__ _Float16 smA[128*32];\n"
+"    __shared__ _Float16 smB[128*32];\n"
+"    da3_float8 z = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};\n"
+"    da3_float8 cv00=z, cv01=z, cv10=z, cv11=z, cv20=z, cv21=z, cv30=z, cv31=z;\n"
+"    for (int k = 0; k < n_in; k += 32) {\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int e = tid * 16 + it;\n"
+"            int er = e >> 5, ek = e & 31;\n"
+"            int row = cta_m0 + er, kp = k + ek;\n"
+"            smA[e] = (row < n_tok && kp < n_in) ? (_Float16)X[(size_t)row * n_in + kp] : (_Float16)0.0f;\n"
+"        }\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int e = tid * 16 + it;\n"
+"            int er = e >> 5, ek = e & 31;\n"
+"            int col = cta_n0 + er, kp = k + ek;\n"
+"            smB[e] = (col < n_out && kp < n_in) ? da3_f16_bits_to_f16(W[(size_t)col * n_in + kp]) : (_Float16)0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 32;\n"
+"        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
+"            da3_f16x8 a0,a1,a2,a3,b0,b1;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                a0[i] = smA[(a_base + 0  + idx) * 32 + kk0 + k_off + i];\n"
+"                a1[i] = smA[(a_base + 16 + idx) * 32 + kk0 + k_off + i];\n"
+"                a2[i] = smA[(a_base + 32 + idx) * 32 + kk0 + k_off + i];\n"
+"                a3[i] = smA[(a_base + 48 + idx) * 32 + kk0 + k_off + i];\n"
+"                b0[i] = smB[(b_base + 0  + idx) * 32 + kk0 + k_off + i];\n"
+"                b1[i] = smB[(b_base + 16 + idx) * 32 + kk0 + k_off + i];\n"
+"            }\n"
+"            cv00 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, cv00);\n"
+"            cv01 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b1, cv01);\n"
+"            cv10 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b0, cv10);\n"
+"            cv11 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, cv11);\n"
+"            cv20 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a2, b0, cv20);\n"
+"            cv21 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a2, b1, cv21);\n"
+"            cv30 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a3, b0, cv30);\n"
+"            cv31 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a3, b1, cv31);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 32;\n"
+"    da3_float8 *accs[8] = {&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31};\n"
+"    int ms[8] = {0,0,16,16,32,32,48,48};\n"
+"    int ns[8] = {0,16,0,16,0,16,0,16};\n"
+"    for (int t = 0; t < 8; t++) {\n"
+"        int col = wave_n0 + ns[t] + idx;\n"
+"        if (col >= n_out) continue;\n"
+"        float bv = bias ? bias[col] : 0.0f;\n"
+"        da3_float8 acc = *accs[t];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int row = wave_m0 + ms[t] + half * 8 + i;\n"
+"            if (row < n_tok)\n"
+"                Y[(size_t)row * n_out + col] = acc[i] + bv;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#endif\n"
 "\n"
 "/* ---- DA3: qk_layernorm_f32: per-head LN on Q/K with stride ---- */\n"
 "/* stride = distance in floats between same element in consecutive tokens */\n"
@@ -406,6 +489,7 @@ struct hip_da3_runner {
     hipModule_t module;
     hipFunction_t fn_layernorm_f32;
     hipFunction_t fn_gemm_tiled_f16_f32;
+    hipFunction_t fn_gemm_f16w_f16a_wmma_t;
     hipFunction_t fn_flash_attn_tiled_f32;
     hipFunction_t fn_add_bias_f32;
     hipFunction_t fn_qk_layernorm_f32;
@@ -600,6 +684,10 @@ static int da3_compile_kernels(hip_da3_runner *r) {
     GET_FN(silu_f32);
 
     /* DA3-specific kernels */
+    if (hipModuleGetFunction(&r->fn_gemm_f16w_f16a_wmma_t,
+                             r->module, "gemm_f16w_f16a_wmma_t") != hipSuccess) {
+        r->fn_gemm_f16w_f16a_wmma_t = NULL;
+    }
     GET_FN(qk_layernorm_f32);
     GET_FN(rope_2d_f32);
     GET_FN(swiglu_f32);
@@ -619,7 +707,8 @@ static int da3_compile_kernels(hip_da3_runner *r) {
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "hip_da3: %d kernels compiled\n", 27);
+        fprintf(stderr, "hip_da3: %d kernels compiled\n",
+                27 + (r->fn_gemm_f16w_f16a_wmma_t ? 1 : 0));
     return 0;
 }
 
@@ -1890,9 +1979,37 @@ static void kl_layernorm(hip_da3_runner *r, void *dst, void *src,
        256 * sizeof(float), r->stream, args);
 }
 
+static int da3_use_gemm_wmma(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DA3_GEMM_WMMA");
+        cached = (e && *e && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static void kl_gemm(hip_da3_runner *r, void *Y, void *W_f16,
                      void *X, void *bias, int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
+    if (getenv("DA3_GEMM_WMMA_DEBUG")) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            int eligible = da3_use_gemm_wmma() && r->fn_gemm_f16w_f16a_wmma_t &&
+                           (n_in % 16 == 0) && n_tok >= 16 && n_out >= 16;
+            fprintf(stderr,
+                    "[da3_gemm] use_wmma=%d fn=%p shape=(tok=%d,out=%d,in=%d) -> %s\n",
+                    da3_use_gemm_wmma(), (void *)r->fn_gemm_f16w_f16a_wmma_t,
+                    n_tok, n_out, n_in, eligible ? "WMMA" : "scalar");
+        }
+    }
+    if (da3_use_gemm_wmma() && r->fn_gemm_f16w_f16a_wmma_t &&
+        (n_in % 16 == 0) && n_tok >= 16 && n_out >= 16) {
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        KL(r->fn_gemm_f16w_f16a_wmma_t, gx, gy, 1, 256, 1, 1, 0, r->stream, args);
+        return;
+    }
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     KL(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1, 0, r->stream, args);
