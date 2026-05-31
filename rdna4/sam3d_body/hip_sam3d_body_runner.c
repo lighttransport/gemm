@@ -298,6 +298,7 @@ struct hip_sam3d_body_ctx {
     sam3d_body_mhr_assets    *cpu_mhr;
     /* GPU pose_correctives matvec offload (SAM3D_MHR_GPU): LW resident. */
     int   mhr_gpu_pc;                 /* 1 if the GPU matvec hook is installed */
+    hipFunction_t fn_mhr_pc_matvec;   /* optimized GEMV (NULL → gemm_f32_bias) */
     void *d_pc_lw;                    /* resident LW [55317,3000] f32 (633 MiB) */
     void *d_pc_h;                     /* scratch h  [3000] f32 */
     void *d_pc_out;                   /* scratch out [55317] f32 */
@@ -1003,24 +1004,41 @@ static int sb_use_fa_wmma(void) {
  * cpu_mhr->pc_matvec_fn when SAM3D_MHR_GPU=1. `user` is the ctx. */
 static int sb_pc_matvec_gpu(void *user, const float *h, float *out_offsets) {
     hip_sam3d_body_ctx *c = (hip_sam3d_body_ctx *)user;
-    if (getenv("SAM3D_MHR_GPU_DEBUG")) {
-        static int n = 0; fprintf(stderr, "[sb_pc_matvec_gpu] fired #%d\n", ++n);
-    }
+    int dbg = getenv("SAM3D_MHR_GPU_DEBUG") ? 1 : 0;
+    double t0 = dbg ? sb_time_ms() : 0.0;
     const int HID = S3DM_N_PC_H;       /* 3000  */
     const int OUT = S3DM_N_VERTS * 3;  /* 55317 */
     if (hipMemcpy(c->d_pc_h, h, (size_t)HID * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess) return -1;
-    void *nb = NULL;
-    struct __attribute__((packed)) {
-        void *Y; const void *X; const void *W; const void *b; int N, D_in, D_out;
-    } p = { c->d_pc_out, c->d_pc_h, c->d_pc_lw, nb, 1, HID, OUT };
-    unsigned bx = 16, by = 16;
-    unsigned gx = (unsigned)((1   + bx - 1) / bx);
-    unsigned gy = (unsigned)((OUT + by - 1) / by);
-    if (sb_launch(c->fn_gemm_f32, gx, gy, 1, bx, by, 1, 0, &p, sizeof(p)) < 0)
-        return -1;
+    if (c->fn_mhr_pc_matvec) {
+        /* memory-bound GEMV (one block/row, ~600 GB/s) — ~8× the N=1
+         * gemm_f32_bias kernel which wastes 15/16 lanes per 16x16 block. */
+        int hid = HID, out = OUT;
+        struct __attribute__((packed)) {
+            void *Y; const void *h; const void *W; int HID, OUT;
+        } p = { c->d_pc_out, c->d_pc_h, c->d_pc_lw, hid, out };
+        if (sb_launch(c->fn_mhr_pc_matvec, (unsigned)OUT, 1, 1, 64, 1, 1,
+                      0, &p, sizeof(p)) < 0)
+            return -1;
+    } else {
+        void *nb = NULL;
+        struct __attribute__((packed)) {
+            void *Y; const void *X; const void *W; const void *b; int N, D_in, D_out;
+        } p = { c->d_pc_out, c->d_pc_h, c->d_pc_lw, nb, 1, HID, OUT };
+        unsigned bx = 16, by = 16;
+        unsigned gx = (unsigned)((1   + bx - 1) / bx);
+        unsigned gy = (unsigned)((OUT + by - 1) / by);
+        if (sb_launch(c->fn_gemm_f32, gx, gy, 1, bx, by, 1, 0, &p, sizeof(p)) < 0)
+            return -1;
+    }
     if (hipMemcpy(out_offsets, c->d_pc_out, (size_t)OUT * sizeof(float),
                   hipMemcpyDeviceToHost) != hipSuccess) return -1;
+    if (dbg) {
+        static int n = 0; static double tot = 0.0;
+        double dt = sb_time_ms() - t0; tot += dt;
+        fprintf(stderr, "[sb_pc_matvec_gpu] call #%d %.3f ms (cumulative %.3f, kernel=%s)\n",
+                ++n, dt, tot, c->fn_mhr_pc_matvec ? "matvec" : "gemm");
+    }
     return 0;
 }
 
@@ -1054,12 +1072,16 @@ static int sb_mhr_gpu_setup(hip_sam3d_body_ctx *c) {
     if (hipMalloc(&c->d_pc_out, (size_t)OUT * sizeof(float)) != hipSuccess) return -1;
     if (hipMemcpy(c->d_pc_lw, LW, (size_t)OUT * HID * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess) return -1;
+    /* Optimized GEMV kernel; soft (NULL → sb_pc_matvec_gpu uses gemm_f32_bias). */
+    if (hipModuleGetFunction(&c->fn_mhr_pc_matvec, c->mod, "mhr_pc_matvec_f32") != hipSuccess)
+        c->fn_mhr_pc_matvec = NULL;
     c->cpu_mhr->pc_matvec_user = c;
     c->cpu_mhr->pc_matvec_fn = sb_pc_matvec_gpu;
     c->mhr_gpu_pc = 1;
     if (c->verbose)
         fprintf(stderr, "sam3d_body: MHR pose_correctives matvec on GPU "
-                "(LW %.0f MiB resident)\n", (double)OUT * HID * 4 / 1048576.0);
+                "(LW %.0f MiB resident, kernel=%s)\n", (double)OUT * HID * 4 / 1048576.0,
+                c->fn_mhr_pc_matvec ? "mhr_pc_matvec_f32" : "gemm_f32_bias");
     return 0;
 }
 static int sb_gemm_tiled(hip_sam3d_body_ctx *c, void *p, size_t pb) {

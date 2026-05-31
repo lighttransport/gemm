@@ -269,6 +269,29 @@ static const char hip_sam3d_body_kernels_src[] =
     "    Y[(size_t)n * D_out + d] = acc;\n"
     "}\n"
 
+    /* mhr_pc_matvec_f32: memory-bound GEMV out[OUT] = W[OUT,HID] @ h[HID].
+     * Specialized for the MHR pose_correctives matvec (N=1) — gemm_f32_bias with
+     * N=1 wastes 15/16 lanes per 16x16 block. Here: one block (64 threads) per
+     * output row; threads stride over HID with coalesced W reads, LDS-reduce.
+     * Grid (OUT,), block (64,). h reused from L2 (12KB). */
+    "extern \"C\" __global__ void mhr_pc_matvec_f32(float *Y, const float *h,\n"
+    "                                              const float *W, int HID, int OUT) {\n"
+    "    int row = blockIdx.x;\n"
+    "    if (row >= OUT) return;\n"
+    "    int tid = threadIdx.x;\n"
+    "    const float *wr = W + (size_t)row * HID;\n"
+    "    float acc = 0.0f;\n"
+    "    for (int k = tid; k < HID; k += 64) acc += wr[k] * h[k];\n"
+    "    __shared__ float red[64];\n"
+    "    red[tid] = acc;\n"
+    "    __syncthreads();\n"
+    "    for (int s = 32; s > 0; s >>= 1) {\n"
+    "        if (tid < s) red[tid] += red[tid + s];\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    if (tid == 0) Y[row] = red[0];\n"
+    "}\n"
+    "\n"
     /* add_two_f32: out = a + b (element-wise). */
     "__global__ void add_two_f32(float *out, const float *a, const float *b,\n"
     "                            int n) {\n"
