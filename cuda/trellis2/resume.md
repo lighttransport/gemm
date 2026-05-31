@@ -266,13 +266,16 @@
 > - `test_cuda_trellis2.c` now frees/unloads data as soon as each downstream copy is complete:
 >   occupancy after sparse extraction, conditioning features after DiTs, shape decoder weights after
 >   shape decode, shape output/coords after FDG mesh extraction, texture decoder weights after texture
->   decode, and raw texture output after PBR-field construction. This cuts the CPU live set during the
->   OBJ/PBR tail by roughly `~130 MiB` and releases decoder GPU weights before CPU-only tail work.
+>   decode, and raw texture output after handing it to the PBR field. The PBR builder can now take
+>   ownership of the texture decoder output and scale/clamp it in-place (`t2_pbr_from_decoder_take`),
+>   while the existing copying API remains available for other callers. This cuts the CPU live set
+>   during the OBJ/PBR tail and releases decoder GPU weights before CPU-only tail work.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
-> - final file-output exactness run after direct coords: `real 55.13`,
->   `T2_TIMING program_total 55043.421 ms`, postprocess `68.448 ms`, FDG mesh `382.836 ms`,
+> - final file-output exactness run after PBR take path: `real 55.11`,
+>   `T2_TIMING program_total 55010.783 ms`, postprocess `69.303 ms`, FDG mesh `370.555 ms`,
+>   PBR build `123.056 ms`,
 >   `1,403,042 verts / 3,048,684 tris`, PBR `99.7%` trilinear / `100%` covered, final OBJ
 >   byte-identical to `/tmp/t2_scratchio_e2e.obj`.
 >
