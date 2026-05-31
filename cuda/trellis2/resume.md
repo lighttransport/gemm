@@ -268,8 +268,10 @@
 >   shape decode, shape output/coords after FDG mesh extraction, texture decoder weights after texture
 >   decode, and raw texture output after handing it to the PBR field. The PBR builder can now take
 >   ownership of the texture decoder output and scale/clamp it in-place (`t2_pbr_from_decoder_take`),
->   while the existing copying API remains available for other callers. This cuts the CPU live set
->   during the OBJ/PBR tail and releases decoder GPU weights before CPU-only tail work.
+>   while the existing copying API remains available for other callers. Since texture decode replays
+>   the shape subdivision, PBR resolution also reuses the shape `max_coord` instead of rescanning the
+>   texture coords. This cuts the CPU live set during the OBJ/PBR tail and releases decoder GPU
+>   weights before CPU-only tail work.
 >
 > Validation:
 > - no-dump `/dev/null` full textured e2e: `real 54.92`, `T2_TIMING program_total 54813.419 ms`.
