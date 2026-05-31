@@ -3,15 +3,16 @@ r"""gen_svdquant_ref.py — self-contained SVDQuant reference generator.
 
 Produces a deterministic, model-free ground-truth dump that pins the SVDQuant
 forward for the cpu/svdquant and cuda/svdquant unit tests. One synthetic Linear
-(OUT x IN) with seeded random weight/activation is quantized four ways:
+(OUT x IN) with seeded random weight/activation is quantized five ways:
 
-    A  int4_w4a16   group-64 signed[-7,7] residual,   activation f32
-    B  int4_w4a4    group-64 signed[-7,7] residual,   activation int4 g64
-    C  nvfp4_w4a16  e2m1 g16 + e4m3 scales residual,  activation f32
-    D  nvfp4_w4a4   e2m1 g16 + e4m3 scales residual,  activation e2m1 g16
+    A  int4_w4a16   group-64 signed[-7,7] residual,     activation f32
+    B  int4_w4a4    group-64 signed[-7,7] residual,     activation int4 g64
+    C  nvfp4_w4a16  e2m1 g16 + e4m3 scales residual,    activation f32
+    D  nvfp4_w4a4   e2m1 g16 + e4m3 scales residual,    activation e2m1 g16
+    E  int8_w8a8    group-64 signed[-127,127] residual, activation int8 g64
 
 The SVDQuant decomposition (SmoothQuant lambda + rank-128 SVD low-rank branch)
-is SHARED across all four cases; only the residual quantizer and the activation
+is SHARED across all cases; only the residual quantizer and the activation
 path differ. The forward every implementation must reproduce is
 
     y = act(x / lam) @ R_dec^T  +  (x @ lora_down_emit^T) @ lora_up^T  +  bias
@@ -58,6 +59,14 @@ def quant_int4_g64(R, group=64):                # R [out,in] -> (qint4 u8[out,in
     scale = (g.abs().amax(dim=2, keepdim=True) / 7.0).clamp(min=1e-12)
     q = torch.round(g / scale).clamp(-7, 7).to(torch.int8).reshape(out, k)
     return pack_nibbles(q), scale.reshape(out, k // group)
+
+
+def quant_int8_g64(R, group=64):                # R [out,in] -> (qint8 u8[out,in], wscale [out,in/g])
+    out, k = R.shape
+    g = R.reshape(out, k // group, group)
+    scale = (g.abs().amax(dim=2, keepdim=True) / 127.0).clamp(min=1e-12)
+    q = torch.round(g / scale).clamp(-127, 127).to(torch.int8).reshape(out, k)
+    return q.contiguous().view(torch.uint8), scale.reshape(out, k // group)
 
 
 def smoothing_lambda(W, amax, alpha, clip):     # W[out,in], amax[in] or None -> lambda[in]
@@ -136,6 +145,12 @@ def decode_int4_residual(qint4, wscale, out, inn, group=64):
     return nib * wscale.float().repeat_interleave(group, dim=1)
 
 
+def decode_int8_residual(qint8_u8, wscale, out, inn, group=64):
+    """Signed int8 bytes x per-group-64 scale -> R[out,in] f32."""
+    q = qint8_u8.contiguous().view(torch.int8).float().reshape(out, inn)
+    return q * wscale.float().repeat_interleave(group, dim=1)
+
+
 def quant_act_int4(xr, group=64):
     """Per-token per-group-64 symmetric int4 quant -> dequantized xr_dq[tok,in] f32.
     torch.round is round-half-to-even; the C side uses rintf (same mode)."""
@@ -144,6 +159,16 @@ def quant_act_int4(xr, group=64):
     scale = (g.abs().amax(dim=2, keepdim=True) / 7.0).clamp(min=1e-12)
     q = torch.round(g / scale).clamp(-7, 7)
     return (q * scale).reshape(tok, inn)
+
+
+def quant_act_int8(xr, group=64):
+    """Per-token per-group-64 symmetric int8 quant -> packed bytes, scale, dequant."""
+    tok, inn = xr.shape
+    g = xr.reshape(tok, inn // group, group)
+    scale = (g.abs().amax(dim=2, keepdim=True) / 127.0).clamp(min=1e-12)
+    q = torch.round(g / scale).clamp(-127, 127).to(torch.int8)
+    x_dq = (q.float() * scale).reshape(tok, inn)
+    return q.reshape(tok, inn).contiguous().view(torch.uint8), scale.reshape(tok, inn // group), x_dq
 
 
 def quant_act_nvfp4(xr, GS=16):
@@ -363,6 +388,10 @@ def main():
     wscale_f32 = wscale.float()
     R_int4 = decode_int4_residual(qint4, wscale_f32, OUT, IN, 64)
 
+    qint8, wscale8 = quant_int8_g64(R_res, 64)
+    wscale8_f32 = wscale8.float()
+    R_int8 = decode_int8_residual(qint8, wscale8_f32, OUT, IN, 64)
+
     qw, ws, wcwt = quant_nvfp4(R_res, dev, GS=16)
     R_nvfp4 = decode_nvfp4(qw, ws, wcwt, OUT, IN, dev, GS=16).float().cpu()
 
@@ -399,6 +428,25 @@ def main():
     emit("int4_w4a4", R_int4, "w4a4", "int4")
     emit("nvfp4_w4a16", R_nvfp4, "w4a16", "nvfp4")
     emit("nvfp4_w4a4", R_nvfp4, "w4a4", "nvfp4")
+
+    # True W8A8 SVDQuant target for CUDA IMMA. qint8/xq are dumped as uint8
+    # byte views because the C .npy reader intentionally supports only u1/i4/f4.
+    xr = x / lam.unsqueeze(0)
+    xq8, xscale8, x_int8 = quant_act_int8(xr, 64)
+    prefix = "int8_w8a8"
+    d(prefix + "_smooth", lam)
+    d(prefix + "_lora_up", lora_up)
+    d(prefix + "_lora_down", lora_down_emit)
+    d(prefix + "_residual", R_res)
+    d(prefix + "_qint8", qint8)
+    d(prefix + "_wscale", wscale8_f32)
+    d(prefix + "_xq", xq8)
+    d(prefix + "_xscale", xscale8.float())
+    y_svdq = forward_svdq(x_int8, x, R_int8, lora_up, lora_down_emit, bias)
+    d(prefix + "_y_svdq", y_svdq)
+    c = cosine(y_svdq, y_fp); rl = rel_l2(y_svdq, y_fp)
+    summary.append((prefix, c, rl))
+    print(f"  {prefix:14s} cos(y_svdq,y_fp)={c:.5f}  rel_L2(y_svdq,y_fp)={rl:.4f}", file=sys.stderr)
 
     d.write_manifest(extra={"out": OUT, "in": IN, "tokens": TOK, "rank": r,
                             "smooth": (not a.no_smooth), "seed": a.seed,
