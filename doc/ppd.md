@@ -115,3 +115,16 @@ Default CUDA inference prioritizes lower drift:
 3. Evaluate lower-drift fast attention before changing the default attention path. Any MMA/FP8 attention mode must be gated until it passes PyTorch drift checks on street and tiny images.
 4. Revisit FP8 only as an opt-in speed mode with full output comparison. Candidate work: per-row or per-channel weight scales, activation scaling, and selective FP16 fallback for sensitive DiT layers.
 5. Reduce Python reference overhead if it becomes part of CI. The current script is intended for local profiling and correctness checks, not fast automated testing.
+
+## RDNA4 BF16 WMMA GEMM (commit 4be8d1c)
+
+`gemm_f16w_bf16a_wmma_t` (F16-weight BF16-WMMA, shared with rdna4/sam3d_body and
+rdna4/da3) is appended to the ppd kernel source and dispatched from `kl_gemm` when
+`PPD_WMMA!=0` and dims are 16-aligned, else the scalar fallback. All `kl_gemm` call
+sites — the DA2 DINOv2 ViT-L semantic encoder and the 24-block x 4-Euler-step DiT —
+inherit it. Default on; `PPD_WMMA=0` restores the F16-tiled path. Attention stays
+scalar (head_dim=64).
+
+**Quality** — full ppd pipeline, WMMA vs F16-tiled depth map: **Pearson r =
+0.9999622**, rel-MAE 0.12% (8-bit PGM), WMMA path confirmed active. Matches da3;
+BF16 WMMA holds the depth correlation. (GPU-vs-PyTorch reference Pearson 0.999991.)
