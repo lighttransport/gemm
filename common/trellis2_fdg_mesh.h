@@ -13,6 +13,8 @@
  *       int N, float voxel_size, const float aabb[6]);
  *   t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
  *       int N, float voxel_size, const float aabb[6]);
+ *   t2_fdg_mesh t2_fdg_to_mesh_bzyx_with_hash(const int32_t *coords, const float *feats,
+ *       int N, float voxel_size, const float aabb[6]);
  *   void t2_fdg_mesh_free(t2_fdg_mesh *m);
  *   int t2_fdg_write_obj(const char *path, const t2_fdg_mesh *m);
  */
@@ -46,6 +48,11 @@ t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
 /* Variant for coords stored as [N,4] int32 (batch, z, y, x). */
 t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
                                    int N, float voxel_size, const float aabb[6]);
+
+/* Same as t2_fdg_to_mesh_bzyx, but retains the internal voxel hash in the
+ * returned mesh for downstream users that need coord->row lookup. */
+t2_fdg_mesh t2_fdg_to_mesh_bzyx_with_hash(const int32_t *coords, const float *feats,
+                                             int N, float voxel_size, const float aabb[6]);
 
 void t2_fdg_mesh_free(t2_fdg_mesh *m);
 int t2_fdg_write_obj(const char *path, const t2_fdg_mesh *m);
@@ -101,6 +108,11 @@ static fdg_hash fdg_hash_build(const int32_t *coords, int N, int stride, int bas
     return h;
 }
 
+static void fdg_hash_free(fdg_hash *h) {
+    free(h->keys); free(h->vals);
+    h->keys = NULL; h->vals = NULL; h->capacity = 0;
+}
+
 static int fdg_hash_lookup(const fdg_hash *h, int z, int y, int x) {
     int64_t key = fdg_hash_key(z, y, x);
     unsigned slot = fdg_hash_slot(key, h->capacity);
@@ -124,7 +136,8 @@ static const int edge_offsets[3][4][3] = {
 
 static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *feats,
                                              int N, int stride, int base,
-                                             float voxel_size, const float aabb[6]) {
+                                             float voxel_size, const float aabb[6],
+                                             int keep_hash) {
     t2_fdg_mesh mesh = {0};
 
     /* 1. Compute mesh vertices: (coord + dual_vertex) * voxel_size + aabb_min */
@@ -200,9 +213,13 @@ static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *fe
     mesh.triangles = tris;
     mesh.n_verts = N;
     mesh.n_tris = n_tris;
-    mesh.hash_keys = hash.keys;
-    mesh.hash_vals = hash.vals;
-    mesh.hash_cap = hash.capacity;
+    if (keep_hash) {
+        mesh.hash_keys = hash.keys;
+        mesh.hash_vals = hash.vals;
+        mesh.hash_cap = hash.capacity;
+    } else {
+        fdg_hash_free(&hash);
+    }
 
     fprintf(stderr, "fdg_mesh: %d verts, %d quads -> %d triangles\n", N, n_quads, n_tris);
     return mesh;
@@ -210,12 +227,17 @@ static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *fe
 
 t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
                               int N, float voxel_size, const float aabb[6]) {
-    return t2_fdg_to_mesh_strided(coords, feats, N, 3, 0, voxel_size, aabb);
+    return t2_fdg_to_mesh_strided(coords, feats, N, 3, 0, voxel_size, aabb, 0);
 }
 
 t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
                                    int N, float voxel_size, const float aabb[6]) {
-    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb);
+    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb, 0);
+}
+
+t2_fdg_mesh t2_fdg_to_mesh_bzyx_with_hash(const int32_t *coords, const float *feats,
+                                             int N, float voxel_size, const float aabb[6]) {
+    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb, 1);
 }
 
 void t2_fdg_mesh_free(t2_fdg_mesh *m) {
