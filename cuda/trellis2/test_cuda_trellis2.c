@@ -852,6 +852,8 @@ sparse_done:
                         &tex_result.N, &tex_result.C);
                     cuda_trellis2_unload_texture_decoder(r);
                     cuda_trellis2_clear_subdiv_plan(r);
+                    cuda_trellis2_free(r);
+                    r = NULL;
                     free(tex_slat);
                     tex_slat = NULL;
                     free(sparse_coords);
@@ -935,6 +937,8 @@ sparse_done:
                 } else {
                     fprintf(stderr, "Failed to load texture decoder, writing shape-only mesh\n");
                     cuda_trellis2_clear_subdiv_plan(r);
+                    cuda_trellis2_free(r);
+                    r = NULL;
                     double write_fallback_t0 = t2_harness_now_ms();
                     t2_fdg_write_obj(obj_path, &fdg_mesh);
                     t2_harness_timing_log("fdg_write_fallback_obj", write_fallback_t0);
@@ -943,6 +947,8 @@ texture_done:
                 ;
             } else {
                 cuda_trellis2_clear_subdiv_plan(r);
+                cuda_trellis2_free(r);
+                r = NULL;
                 double write_fdg_t0 = t2_harness_now_ms();
                 t2_fdg_write_obj(obj_path, &fdg_mesh);
                 t2_harness_timing_log("fdg_write_obj", write_fdg_t0);
