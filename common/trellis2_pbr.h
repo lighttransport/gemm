@@ -34,13 +34,17 @@ typedef struct {
 /* Sparse PBR voxel field */
 typedef struct {
     float *feats;        /* [N, 6]: RGB, metallic, roughness, alpha */
-    int32_t *coords;     /* [N, 3]: z, y, x (no batch dim) */
+    int32_t *coords;     /* optional legacy coord copy; NULL for current builders */
     int N;
     int resolution;      /* grid resolution (e.g., 512) */
+    int coord_min[3];    /* z, y, x */
+    int coord_max[3];    /* z, y, x */
     /* Hash table for fast lookup */
     uint64_t *hash_keys;
-    int32_t  *hash_vals;
+    int      *hash_vals;
     int hash_cap;
+    int hash_borrowed;
+    int hash_power2;
 } t2_pbr_field;
 
 /* Create PBR field from texture decoder output.
@@ -49,6 +53,19 @@ typedef struct {
  * resolution: voxel grid resolution */
 t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
                                    int N, int resolution);
+
+/* Same as t2_pbr_from_decoder, but takes ownership of feats and scales/clamps
+ * it in-place. The returned field owns feats and frees it in t2_pbr_free. */
+t2_pbr_field t2_pbr_from_decoder_take(float *feats, const int32_t *coords,
+                                        int N, int resolution);
+
+/* Variant for callers that already have a voxel hash over the same coords in
+ * identical row order. The hash is borrowed and must outlive the PBR field. */
+t2_pbr_field t2_pbr_from_decoder_take_with_hash(float *feats, const int32_t *coords,
+                                                  int N, int resolution,
+                                                  const int64_t *hash_keys,
+                                                  const int *hash_vals,
+                                                  int hash_cap);
 
 /* Sample PBR attributes at mesh vertex positions via trilinear interpolation.
  * vertices: [n_verts, 3] in [-0.5, 0.5] normalized space
@@ -64,6 +81,13 @@ int t2_pbr_write_colored_obj(const char *path,
                                const float *vertices, const int *triangles,
                                int n_verts, int n_tris,
                                const t2_pbr_attr *colors);
+
+/* Write OBJ with colors sampled directly from the PBR field. This avoids a
+ * full per-vertex color array for large meshes. */
+int t2_pbr_write_sampled_colored_obj(const char *path,
+                                       const float *vertices, const int *triangles,
+                                       int n_verts, int n_tris,
+                                       const t2_pbr_field *field);
 
 /* Write OBJ + MTL with per-triangle UV mapping and PBR texture maps.
  * Generates: <base>.obj, <base>.mtl, <base>_basecolor.ppm,
@@ -91,40 +115,75 @@ static uint64_t t2pbr_hash_key(int z, int y, int x) {
     return ((uint64_t)(z & 0xFFFFF) << 40) | ((uint64_t)(y & 0xFFFFF) << 20) | (uint64_t)(x & 0xFFFFF);
 }
 
-t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
-                                   int N, int resolution) {
+static unsigned t2pbr_hash_slot(uint64_t key, int capacity) {
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32);
+    return (unsigned)(((uint64_t)h * (uint32_t)capacity) >> 32);
+}
+
+static t2_pbr_field t2_pbr_from_decoder_impl(float *owned_feats,
+                                               const float *feats,
+                                               const int32_t *coords,
+                                               int N, int resolution,
+                                               const int64_t *borrow_hash_keys,
+                                               const int *borrow_hash_vals,
+                                               int borrow_hash_cap) {
     t2_pbr_field f = {0};
     f.N = N;
     f.resolution = resolution;
+    for (int a = 0; a < 3; a++) {
+        f.coord_min[a] = 1 << 30;
+        f.coord_max[a] = -(1 << 30);
+    }
 
     /* Copy and scale features: raw -> * 0.5 + 0.5 -> clamp [0,1] */
-    f.feats = (float *)malloc((size_t)N * 6 * sizeof(float));
+    f.feats = owned_feats ? owned_feats : (float *)malloc((size_t)N * 6 * sizeof(float));
     for (int i = 0; i < N * 6; i++) {
         float v = feats[i] * 0.5f + 0.5f;
         f.feats[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 
-    /* Strip batch dimension from coords: [N, 4] -> [N, 3] */
-    f.coords = (int32_t *)malloc((size_t)N * 3 * sizeof(int32_t));
-    for (int i = 0; i < N; i++) {
-        f.coords[i * 3 + 0] = coords[i * 4 + 1];  /* z */
-        f.coords[i * 3 + 1] = coords[i * 4 + 2];  /* y */
-        f.coords[i * 3 + 2] = coords[i * 4 + 3];  /* x */
+    /* Use coords as (col1, col2, col3), matching the mesh builder's axis
+     * convention so the field and the vertex sampler agree.
+     *
+     * t2_fdg_to_mesh reads coords3 = (col1, col2, col3) and emits
+     *   vertices[0] (world x) from col3,  vertices[2] (world z) from col1.
+     * t2_pbr_sample_vertices maps vertices[0]->ix and vertices[2]->iz, then
+     * looks up hash(iz, iy, ix) = hash(col1, col2, col3). So the field MUST be
+     * indexed in (col1, col2, col3) order. The previous (col3, col2, col1) order
+     * swapped x<->z, so lookups only hit on the x==z diagonal (~11% coverage). */
+
+    if (borrow_hash_keys && borrow_hash_vals && borrow_hash_cap > 0) {
+        f.hash_keys = (uint64_t *)borrow_hash_keys;
+        f.hash_vals = (int *)borrow_hash_vals;
+        f.hash_cap = borrow_hash_cap;
+        f.hash_borrowed = 1;
+        f.hash_power2 = 0;
+    } else {
+        /* Build hash table */
+        int cap = N * 4; if (cap < 64) cap = 64;
+        /* Round up to power of 2 */
+        int p = 1; while (p < cap) p <<= 1; cap = p;
+        f.hash_cap = cap;
+        f.hash_power2 = 1;
+        f.hash_keys = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
+        f.hash_vals = (int *)malloc((size_t)cap * sizeof(int));
+        memset(f.hash_keys, 0xFF, (size_t)cap * sizeof(uint64_t));
     }
 
-    /* Build hash table */
-    int cap = N * 4; if (cap < 64) cap = 64;
-    /* Round up to power of 2 */
-    int p = 1; while (p < cap) p <<= 1; cap = p;
-    f.hash_cap = cap;
-    f.hash_keys = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
-    f.hash_vals = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
-    memset(f.hash_keys, 0xFF, (size_t)cap * sizeof(uint64_t));
-
     for (int i = 0; i < N; i++) {
-        uint64_t key = t2pbr_hash_key(f.coords[i*3], f.coords[i*3+1], f.coords[i*3+2]);
-        unsigned slot = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(cap - 1);
-        while (f.hash_keys[slot] != (uint64_t)-1) slot = (slot + 1) & (unsigned)(cap - 1);
+        int z = coords[i * 4 + 1];
+        int y = coords[i * 4 + 2];
+        int x = coords[i * 4 + 3];
+        if (z < f.coord_min[0]) f.coord_min[0] = z;
+        if (y < f.coord_min[1]) f.coord_min[1] = y;
+        if (x < f.coord_min[2]) f.coord_min[2] = x;
+        if (z > f.coord_max[0]) f.coord_max[0] = z;
+        if (y > f.coord_max[1]) f.coord_max[1] = y;
+        if (x > f.coord_max[2]) f.coord_max[2] = x;
+        if (f.hash_borrowed) continue;
+        uint64_t key = t2pbr_hash_key(z, y, x);
+        unsigned slot = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(f.hash_cap - 1);
+        while (f.hash_keys[slot] != (uint64_t)-1) slot = (slot + 1) & (unsigned)(f.hash_cap - 1);
         f.hash_keys[slot] = key;
         f.hash_vals[slot] = i;
     }
@@ -132,18 +191,45 @@ t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
     return f;
 }
 
+t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
+                                   int N, int resolution) {
+    return t2_pbr_from_decoder_impl(NULL, feats, coords, N, resolution, NULL, NULL, 0);
+}
+
+t2_pbr_field t2_pbr_from_decoder_take(float *feats, const int32_t *coords,
+                                        int N, int resolution) {
+    return t2_pbr_from_decoder_impl(feats, feats, coords, N, resolution, NULL, NULL, 0);
+}
+
+t2_pbr_field t2_pbr_from_decoder_take_with_hash(float *feats, const int32_t *coords,
+                                                  int N, int resolution,
+                                                  const int64_t *hash_keys,
+                                                  const int *hash_vals,
+                                                  int hash_cap) {
+    return t2_pbr_from_decoder_impl(feats, feats, coords, N, resolution,
+                                    hash_keys, hash_vals, hash_cap);
+}
+
 static int t2pbr_lookup(const t2_pbr_field *f, int z, int y, int x) {
     uint64_t key = t2pbr_hash_key(z, y, x);
-    unsigned slot = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(f->hash_cap - 1);
+    unsigned slot = f->hash_power2
+        ? ((unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (unsigned)(f->hash_cap - 1))
+        : t2pbr_hash_slot(key, f->hash_cap);
     for (;;) {
         if (f->hash_keys[slot] == key) return f->hash_vals[slot];
         if (f->hash_keys[slot] == (uint64_t)-1) return -1;
-        slot = (slot + 1) & (unsigned)(f->hash_cap - 1);
+        if (f->hash_power2) {
+            slot = (slot + 1) & (unsigned)(f->hash_cap - 1);
+        } else {
+            slot++;
+            if (slot == (unsigned)f->hash_cap) slot = 0;
+        }
     }
 }
 
-/* Trilinear interpolation from sparse voxel field */
-static void t2pbr_trilinear(const t2_pbr_field *f, float fz, float fy, float fx,
+/* Trilinear interpolation from sparse voxel field. Returns total corner weight
+ * (0 = no populated voxel in the 2x2x2 neighborhood = a sampling miss). */
+static float t2pbr_trilinear(const t2_pbr_field *f, float fz, float fy, float fx,
                               float out[6]) {
     int iz = (int)floorf(fz), iy = (int)floorf(fy), ix = (int)floorf(fx);
     float dz = fz - iz, dy = fy - iy, dx = fx - ix;
@@ -169,33 +255,127 @@ static void t2pbr_trilinear(const t2_pbr_field *f, float fz, float fy, float fx,
         float inv = 1.0f / total_w;
         for (int c = 0; c < 6; c++) out[c] *= inv;
     }
+    return total_w;
+}
+
+/* Snap to the nearest populated voxel within `max_r` (Chebyshev). Used when
+ * trilinear misses: an FDG dual vertex sits at coord+offset with offset in
+ * [-0.5, 1.5], so floor() can land a voxel off the source, and on the thin
+ * surface shell the 2x2x2 neighborhood is then empty. Returns 1 on hit. */
+static int t2pbr_nearest(const t2_pbr_field *f, float fz, float fy, float fx,
+                          int max_r, float out[6]) {
+    int rz = (int)lroundf(fz), ry = (int)lroundf(fy), rx = (int)lroundf(fx);
+    for (int R = 0; R <= max_r; R++) {
+        int best = -1; long bestd = 1L << 60;
+        for (int dz = -R; dz <= R; dz++)
+        for (int dy = -R; dy <= R; dy++)
+        for (int dx = -R; dx <= R; dx++) {
+            /* only the new Chebyshev shell at radius R */
+            if (R > 0 && abs(dz) < R && abs(dy) < R && abs(dx) < R) continue;
+            int ni = t2pbr_lookup(f, rz + dz, ry + dy, rx + dx);
+            if (ni < 0) continue;
+            long d = (long)dz*dz + (long)dy*dy + (long)dx*dx;
+            if (d < bestd) { bestd = d; best = ni; }
+        }
+        if (best >= 0) {
+            const float *feat = f->feats + best * 6;
+            for (int c = 0; c < 6; c++) out[c] = feat[c];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int t2pbr_sample_vertex_attr(const t2_pbr_field *field,
+                                     const float *vertex, int snap,
+                                     t2_pbr_attr *out, float voxel_pos[3]) {
+    float res = (float)field->resolution;
+    float vx = (vertex[0] + 0.5f) * res;
+    float vy = (vertex[1] + 0.5f) * res;
+    float vz = (vertex[2] + 0.5f) * res;
+    if (voxel_pos) {
+        voxel_pos[0] = vz;
+        voxel_pos[1] = vy;
+        voxel_pos[2] = vx;
+    }
+
+    float attr[6];
+    int hit_kind = 0;  /* 0=miss, 1=trilinear, 2=snap */
+    float w = t2pbr_trilinear(field, vz, vy, vx, attr);
+    if (w > 0) {
+        hit_kind = 1;
+    } else if (snap && t2pbr_nearest(field, vz, vy, vx, 4, attr)) {
+        hit_kind = 2;
+    }
+
+    out->r = attr[0];
+    out->g = attr[1];
+    out->b = attr[2];
+    out->metallic = attr[3];
+    out->roughness = attr[4];
+    out->alpha = attr[5];
+    return hit_kind;
+}
+
+static void t2pbr_update_vrange(const float voxel_pos[3],
+                                 float vmin[3], float vmax[3]) {
+    for (int a = 0; a < 3; a++) {
+        float v = voxel_pos[a];
+        if (v < vmin[a]) vmin[a] = v;
+        if (v > vmax[a]) vmax[a] = v;
+    }
+}
+
+static void t2pbr_print_sample_diag(const t2_pbr_field *field, int n_verts,
+                                     long hits, long snapped,
+                                     const float vmin[3], const float vmax[3]) {
+    long covered = hits + snapped;
+    fprintf(stderr,
+        "T2 PBR: %d verts: trilinear %ld (%.1f%%) + snap %ld -> covered %ld (%.1f%%); res=%d\n"
+        "  vertex->voxel range  z[%.1f,%.1f] y[%.1f,%.1f] x[%.1f,%.1f]\n"
+        "  field voxel range    z[%d,%d] y[%d,%d] x[%d,%d]\n",
+        n_verts, hits, 100.0 * hits / (n_verts ? n_verts : 1), snapped,
+        covered, 100.0 * covered / (n_verts ? n_verts : 1), field->resolution,
+        vmin[0], vmax[0], vmin[1], vmax[1], vmin[2], vmax[2],
+        field->coord_min[0], field->coord_max[0],
+        field->coord_min[1], field->coord_max[1],
+        field->coord_min[2], field->coord_max[2]);
 }
 
 void t2_pbr_sample_vertices(const t2_pbr_field *field,
                               const float *vertices, int n_verts,
                               t2_pbr_attr *out) {
-    float res = (float)field->resolution;
+    int diag = 1;
+    const char *qd = getenv("T2_PBR_QUIET"); if (qd && atoi(qd)) diag = 0;
+    /* Trilinear miss falls back to nearest populated voxel (FDG dual-vertex
+     * offsets can push the floor() cell off the thin surface shell). Disable
+     * the fallback with T2_PBR_NO_SNAP=1 (then misses stay black). */
+    int snap = 1;
+    const char *ns = getenv("T2_PBR_NO_SNAP"); if (ns && atoi(ns)) snap = 0;
+    long hits = 0, snapped = 0;
+    float vmin[3] = {1e30f,1e30f,1e30f}, vmax[3] = {-1e30f,-1e30f,-1e30f};
     for (int i = 0; i < n_verts; i++) {
-        /* Vertex position [-0.5, 0.5] -> voxel coords [0, resolution) */
-        float vx = (vertices[i * 3 + 0] + 0.5f) * res;
-        float vy = (vertices[i * 3 + 1] + 0.5f) * res;
-        float vz = (vertices[i * 3 + 2] + 0.5f) * res;
-
-        float attr[6];
-        t2pbr_trilinear(field, vz, vy, vx, attr);
-
-        out[i].r = attr[0];
-        out[i].g = attr[1];
-        out[i].b = attr[2];
-        out[i].metallic = attr[3];
-        out[i].roughness = attr[4];
-        out[i].alpha = attr[5];
+        float voxel_pos[3];
+        int hit_kind = t2pbr_sample_vertex_attr(
+            field, vertices + i * 3, snap, &out[i], diag ? voxel_pos : NULL);
+        if (diag) t2pbr_update_vrange(voxel_pos, vmin, vmax);
+        if (hit_kind == 1) {
+            hits++;
+        } else if (hit_kind == 2) {
+            snapped++;
+        }
+    }
+    if (diag) {
+        t2pbr_print_sample_diag(field, n_verts, hits, snapped, vmin, vmax);
     }
 }
 
 void t2_pbr_free(t2_pbr_field *f) {
     free(f->feats); free(f->coords);
-    free(f->hash_keys); free(f->hash_vals);
+    if (!f->hash_borrowed) {
+        free(f->hash_keys);
+        free(f->hash_vals);
+    }
     memset(f, 0, sizeof(*f));
 }
 
@@ -221,6 +401,132 @@ int t2_pbr_write_colored_obj(const char *path,
     }
 
     fclose(f);
+    fprintf(stderr, "Wrote %s (%d verts, %d tris, with vertex colors)\n",
+            path, n_verts, n_tris);
+    return 0;
+}
+
+typedef struct {
+    FILE *file;
+    char *data;
+    size_t size;
+    size_t used;
+    int error;
+} t2pbr_textbuf;
+
+static int t2pbr_textbuf_init(t2pbr_textbuf *b, FILE *file, size_t size) {
+    memset(b, 0, sizeof(*b));
+    b->file = file;
+    b->data = (char *)malloc(size);
+    if (!b->data) return -1;
+    b->size = size;
+    return 0;
+}
+
+static int t2pbr_textbuf_flush(t2pbr_textbuf *b) {
+    if (b->error) return -1;
+    if (b->used == 0) return 0;
+    if (fwrite(b->data, 1, b->used, b->file) != b->used) {
+        b->error = 1;
+        return -1;
+    }
+    b->used = 0;
+    return 0;
+}
+
+static int t2pbr_textbuf_write(t2pbr_textbuf *b, const char *s, size_t n) {
+    if (b->error) return -1;
+    if (n > b->size) {
+        if (t2pbr_textbuf_flush(b) != 0) return -1;
+        if (fwrite(s, 1, n, b->file) != n) {
+            b->error = 1;
+            return -1;
+        }
+        return 0;
+    }
+    if (b->used + n > b->size && t2pbr_textbuf_flush(b) != 0)
+        return -1;
+    memcpy(b->data + b->used, s, n);
+    b->used += n;
+    return 0;
+}
+
+static int t2pbr_textbuf_close(t2pbr_textbuf *b) {
+    int rc = t2pbr_textbuf_flush(b);
+    free(b->data);
+    memset(b, 0, sizeof(*b));
+    return rc;
+}
+
+int t2_pbr_write_sampled_colored_obj(const char *path,
+                                       const float *vertices, const int *triangles,
+                                       int n_verts, int n_tris,
+                                       const t2_pbr_field *field) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    t2pbr_textbuf wb;
+    if (t2pbr_textbuf_init(&wb, f, 1u << 20) != 0) {
+        fclose(f);
+        return -1;
+    }
+    char line[256];
+    int line_n = snprintf(line, sizeof(line),
+                          "# TRELLIS.2 textured mesh: %d verts, %d tris\n",
+                          n_verts, n_tris);
+    if (line_n < 0 || line_n >= (int)sizeof(line) ||
+        t2pbr_textbuf_write(&wb, line, (size_t)line_n) != 0) {
+        t2pbr_textbuf_close(&wb);
+        fclose(f);
+        return -1;
+    }
+
+    int diag = 1;
+    const char *qd = getenv("T2_PBR_QUIET"); if (qd && atoi(qd)) diag = 0;
+    int snap = 1;
+    const char *ns = getenv("T2_PBR_NO_SNAP"); if (ns && atoi(ns)) snap = 0;
+    long hits = 0, snapped = 0;
+    float vmin[3] = {1e30f,1e30f,1e30f}, vmax[3] = {-1e30f,-1e30f,-1e30f};
+
+    for (int i = 0; i < n_verts; i++) {
+        t2_pbr_attr color;
+        float voxel_pos[3];
+        int hit_kind = t2pbr_sample_vertex_attr(
+            field, vertices + i * 3, snap, &color, diag ? voxel_pos : NULL);
+        if (diag) t2pbr_update_vrange(voxel_pos, vmin, vmax);
+        if (hit_kind == 1) {
+            hits++;
+        } else if (hit_kind == 2) {
+            snapped++;
+        }
+        line_n = snprintf(line, sizeof(line), "v %f %f %f %f %f %f\n",
+                          vertices[i*3], vertices[i*3+1], vertices[i*3+2],
+                          color.r, color.g, color.b);
+        if (line_n < 0 || line_n >= (int)sizeof(line) ||
+            t2pbr_textbuf_write(&wb, line, (size_t)line_n) != 0) {
+            t2pbr_textbuf_close(&wb);
+            fclose(f);
+            return -1;
+        }
+    }
+
+    if (diag) {
+        t2pbr_print_sample_diag(field, n_verts, hits, snapped, vmin, vmax);
+    }
+
+    for (int i = 0; i < n_tris; i++) {
+        line_n = snprintf(line, sizeof(line), "f %d %d %d\n",
+                          triangles[i*3]+1, triangles[i*3+1]+1, triangles[i*3+2]+1);
+        if (line_n < 0 || line_n >= (int)sizeof(line) ||
+            t2pbr_textbuf_write(&wb, line, (size_t)line_n) != 0) {
+            t2pbr_textbuf_close(&wb);
+            fclose(f);
+            return -1;
+        }
+    }
+
+    int write_rc = t2pbr_textbuf_close(&wb);
+    int close_rc = fclose(f);
+    if (write_rc != 0 || close_rc != 0) return -1;
     fprintf(stderr, "Wrote %s (%d verts, %d tris, with vertex colors)\n",
             path, n_verts, n_tris);
     return 0;
@@ -495,11 +801,11 @@ int t2_pbr_write_textured_obj(const char *base_path,
 
     /* Write texture images */
     char path_buf[512];
-    snprintf(path_buf, sizeof(path_buf), "%s_basecolor.png", base_path);
+    snprintf(path_buf, sizeof(path_buf), "%s_basecolor.ppm", base_path);
     t2pbr_write_image(path_buf, tex_bc, tex_size, tex_size);
     fprintf(stderr, "Wrote %s\n", path_buf);
 
-    snprintf(path_buf, sizeof(path_buf), "%s_metallic_roughness.png", base_path);
+    snprintf(path_buf, sizeof(path_buf), "%s_metallic_roughness.ppm", base_path);
     t2pbr_write_image(path_buf, tex_mr, tex_size, tex_size);
     fprintf(stderr, "Wrote %s\n", path_buf);
 
@@ -515,10 +821,10 @@ int t2_pbr_write_textured_obj(const char *base_path,
         fprintf(f, "# TRELLIS.2 PBR material\n");
         fprintf(f, "newmtl trellis2_pbr\n");
         fprintf(f, "Kd 1.0 1.0 1.0\n");
-        fprintf(f, "map_Kd %s_basecolor.png\n", bn);
+        fprintf(f, "map_Kd %s_basecolor.ppm\n", bn);
         fprintf(f, "# PBR extensions\n");
-        fprintf(f, "map_Pr %s_metallic_roughness.png\n", bn);  /* roughness map */
-        fprintf(f, "map_Pm %s_metallic_roughness.png\n", bn);  /* metallic map */
+        fprintf(f, "map_Pr %s_metallic_roughness.ppm\n", bn);  /* roughness map */
+        fprintf(f, "map_Pm %s_metallic_roughness.ppm\n", bn);  /* metallic map */
         fclose(f);
         fprintf(stderr, "Wrote %s\n", path_buf);
     }

@@ -208,6 +208,37 @@ Writes `V=18439 F=36874` (~1.2 MiB OBJ) on the human_object sample.
 - `verify_end_to_end` — scaffold only, mirrors the CUDA status (the
   upstream pipeline isn't wired into the verifier yet).
 
+## Speed — BF16 WMMA GEMM for the encoder (commit faeed73)
+
+The encoder backbone (DINOv3-H+ / ViT-H, ~9 GEMMs/block × 32 blocks — the
+dominant cost) stores F16 weights, so `gemm_f16w_bf16a_wmma_t` is an F16-weight
+variant of sam3d's BF16 WMMA kernel (`half_to_float` at SMEM load, RNE bf16 for
+both operands, matching the encoder's existing bf16-rounded activation path). An
+`sb_enc_gemm()` dispatcher routes all 9 encoder GEMMs through it, gated by
+`SAM3D_BODY_WMMA` (default on; `=0` = exact F16-tiled path).
+
+The decoder transformer (6 layers) also routes through WMMA via a sibling
+`gemm_bf16w_bf16a_wmma_t` (F32-weight variant — decoder weights are F32),
+`sb_dec_gemm()`, same `SAM3D_BODY_WMMA` gate. The cross-attn K/V GEMMs run over
+the 1024 encoder-context tokens, which fill the WMMA tile (the 145-token
+self-attn underfills but falls back cleanly); measured ~2.0× on the layers
+(43.8 → 22.0 ms).
+
+Speed (dancing.jpg, DINOv3 backbone, warm, RX 9070 XT): encoder transformer
+blocks 664 → 219 ms (**3.04×**); encoder total 687 → 240 ms (2.86×); decoder
+layers 43.8 → 22.0 ms (~2.0×); full pipeline (encoder+decoder WMMA) **e2e
+1.72 → 1.27 s = 1.35×**. The remaining e2e floor is CPU MHR skinning (~230 ms)
++ decoder norm_heads — neither is GEMM; MHR-on-GPU is the next lever.
+
+Quality: DINOv3 is the precision floor (verify_dinov3 max_abs 0.54 vs gate 1.5),
+but the e2e mesh tolerates bf16 well — full WMMA vs full F32 (V=18439 F=36874,
+identical topology) shows mean vertex displacement 0.0017 / max 0.0035 on a 1.725
+bbox diagonal (0.1% / 0.20%), zero nonfinite.
+
+The sam3d PPE `-ffast-math`/`isfinite` NaN fix has no analogue here: sam3d_body
+masks invalid points via explicit host-passed `int *invalid` flags, not runtime
+`isfinite`.
+
 ## Reproducing the dumps
 
 The `/tmp/sam3d_body_ref/` dumps come from a CUDA host running

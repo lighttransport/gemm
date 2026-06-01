@@ -235,6 +235,26 @@ def main():
 
     if pipeline.low_vram:
         flow_tex.to(pipeline.device)
+
+    # ---- 3b. Single-step tex DiT dump (for verify_tex_dit / HIP port) ----
+    # One forward pass on (noise || shape_for_tex) at t=0.5 with positive cond.
+    # Mirrors the 06b_* SLAT single-step capture.
+    with torch.no_grad():
+        t_step_tex = torch.tensor([0.5], device=pipeline.device, dtype=torch.float32)
+        x_t_step_feats = torch.cat([noise_tex_feats, shape_for_tex_feats], dim=-1)
+        x_t_step = noise_tex.replace(feats=x_t_step_feats)
+        v_step_tex = flow_tex(x_t_step, t_step_tex, cond_pos)
+    dump(args.output_dir, '10b_tex_dit_step_x_t', x_t_step_feats,
+         note=f'Tex-DiT single-step input feats [N,{in_ch_tex}] = cat(noise, shape_norm)')
+    dump(args.output_dir, '10b_tex_dit_step_coords', shape_slat.coords,
+         note='Tex-DiT single-step coords [N,4] (b,z,y,x)')
+    dump(args.output_dir, '10b_tex_dit_step_t', t_step_tex,
+         note='Tex-DiT single-step timestep t=0.5')
+    dump(args.output_dir, '10b_tex_dit_step_cond', cond_pos,
+         note='Tex-DiT single-step positive cond [1,N_cond,1024]')
+    dump(args.output_dir, '10b_tex_dit_step_velocity', v_step_tex.feats,
+         note='Tex-DiT single-step output velocity [N,32]')
+
     tex_params = {**pipeline.tex_slat_sampler_params}
     tex_out = pipeline.tex_slat_sampler.sample(
         flow_tex, noise_tex, concat_cond=concat_cond, **cond_512, **tex_params,
