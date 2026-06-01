@@ -61,6 +61,10 @@ void cuda_trellis2_invalidate_kv_cache(cuda_trellis2_runner *r);
 
 void cuda_trellis2_free(cuda_trellis2_runner *r);
 
+/* Free a buffer returned by cuda_trellis2_predict (a plain CPU malloc).
+ * Provided so ctypes/FFI callers free with this .so's allocator, not their own. */
+void cuda_trellis2_free_buffer(void *p);
+
 /* ---- Per-stage API (for testing/debugging) ---- */
 
 /* Run DINOv3 encoder. image_f32: [3, 512, 512] CHW normalized. output: [1029, 1024] */
@@ -109,6 +113,20 @@ int cuda_trellis2_load_texture_decoder(cuda_trellis2_runner *r, const char *path
 
 void cuda_trellis2_unload_shape_decoder(cuda_trellis2_runner *r);
 void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r);
+void cuda_trellis2_clear_subdiv_plan(cuda_trellis2_runner *r);
+
+/* Free the Stage 1/2/3 DiT GPU weights + cross-attn KV cache. Call after all
+ * three latents are produced (their host-side outputs are kept) and before the
+ * SC-VAE decoders, which otherwise OOM with the DiTs resident. Idempotent. */
+void cuda_trellis2_unload_dit_stages(cuda_trellis2_runner *r);
+
+/* Per-stage DiT unloads, for lazy load-run-free pipelining that caps the GPU
+ * peak at one DiT instead of all three resident at once. Each frees only that
+ * stage's weights (KV cache is kept — it is model-id keyed and recomputed by the
+ * next stage). All idempotent. */
+void cuda_trellis2_unload_stage1(cuda_trellis2_runner *r);
+void cuda_trellis2_unload_stage2(cuda_trellis2_runner *r);
+void cuda_trellis2_unload_stage3(cuda_trellis2_runner *r);
 
 /* Run shape decoder on GPU and allocate CPU output arrays.
  * slat: [N, 32], coords: [N, 4] int32.

@@ -65,10 +65,12 @@ int main(int argc, char **argv) {
     float *ref = read_npy_f32(argv[5], &nd, dd);
 
     float *output = (float *)malloc((size_t)N * C * sizeof(float));
-    /* t_raw=1.0: the function internally multiplies by 1000,
-     * so the model sees 1000.0 matching PyTorch's torch.tensor([1000*1.0]) */
-    float t_raw = 1.0f;
-    fprintf(stderr, "Running Stage 2 DiT (t_raw=%.1f, model sees %.1f)...\n", t_raw, t_raw * 1000.0f);
+    /* 06b_slat_dit_step_velocity is a DIRECT model forward at t=0.5
+     * (dump_ground_truth.py), NOT a sampler step. run_stage2_dit multiplies the
+     * timestep by 1000 internally, so pass 0.0005 -> embedder sees 0.5 and
+     * matches the dump. Optional argv[6] overrides t_raw. */
+    float t_raw = (argc > 6) ? (float)atof(argv[6]) : 0.0005f;
+    fprintf(stderr, "Running Stage 2 DiT (t_raw=%.4f, model sees t=%.1f)...\n", t_raw, t_raw * 1000.0f);
     cuda_trellis2_run_stage2_dit(r, noise, t_raw, cond, coords, N, output);
 
     /* Compare */
