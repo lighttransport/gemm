@@ -60,11 +60,18 @@
  * ======================================================================== */
 
 static int g_use_triton_klin = 0;
+/* Latched on any dense-linear (klin) kernel launch failure. The klin wrappers
+ * (klin_bl / klin_bl_silu / run_convnext) are void and called in tight loops,
+ * so rather than thread a return code through every signature we set this flag
+ * and have hip_shape_dec_forward_ex() fail the whole decode. Catches the
+ * grid-Y-overflow class of bug that previously produced silent all-zero output
+ * (0 triangles / black texture) instead of an error. */
+static int g_shape_dec_lin_err = 0;
 static hipStream_t g_stream = NULL;
 static int g_use_blaslt = 0;
 static void *g_d_act_bf16 = NULL;
 static size_t g_act_bf16_floats = 0;
-#define BF16_CACHE_N 256
+#define BF16_CACHE_N 1024
 static const float *g_bf16_keys[BF16_CACHE_N];
 static size_t g_bf16_lens[BF16_CACHE_N];
 static void *g_bf16_devs[BF16_CACHE_N];
@@ -74,13 +81,13 @@ static int g_use_triton = 0;
 static void *g_d_in_f16  = NULL;
 static void *g_d_out_f16 = NULL;
 static size_t g_in_f16_bytes = 0, g_out_f16_bytes = 0;
-#define F16_CACHE_N 256
+#define F16_CACHE_N 1024
 static const float *g_f16_keys[F16_CACHE_N];
 static size_t g_f16_lens[F16_CACHE_N];
 static void *g_f16_devs[F16_CACHE_N];
 static int g_f16_count = 0;
 
-#define F32_CACHE_N 512
+#define F32_CACHE_N 2048
 static const void *g_f32_keys[F32_CACHE_N];
 static size_t g_f32_lens[F32_CACHE_N];
 static void *g_f32_devs[F32_CACHE_N];
@@ -111,7 +118,7 @@ static void *get_f32_dev(const void *host_ptr, size_t n_bytes) {
  * Kernel function table
  * ======================================================================== */
 
-typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, conv_nmap_bf16_x8_db, gather27, gather27_v2, ln, silu, silu_bf16, gelu, add, lin, lin_naive, gather, resrep, pack_bf16, pack_f16, unpack_f16, splitk_reduce, dense_x8_db, dense_bf16in_x8_db; } K;
+typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, conv_nmap_bf16_x8_db, gather27, gather27_v2, ln, silu, silu_bf16, gelu, add, lin, lin_naive, gather, resrep, pack_bf16, pack_f16, unpack_f16, splitk_reduce, dense_x8_db, dense_bf16in_x8_db, build_nmap; } K;
 
 static K g_K = {0};
 
@@ -148,6 +155,12 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
                            void *w, void *b,
                            void *co, void *keys, void *vals, int cap_mask,
                            int N, int inC, int outC) {
+    static int s_path_dbg = -1;
+    if (s_path_dbg < 0) {
+        const char *e = getenv("T2_TEX_PATH_DBG");
+        s_path_dbg = (e && atoi(e)) ? 1 : 0;
+    }
+    #define PATH(tag) do { if (s_path_dbg) fprintf(stderr, "    spc N=%d inC=%d outC=%d path=%s nmap=%p\n", N, inC, outC, tag, nmap); } while (0)
     int triton_nmax = 0;
     {
         const char *e = getenv("T2_TRITON_NMAX");
@@ -161,16 +174,18 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
     if (!triton_skip && nmap && g_use_triton && host_w && k->pack_f16 &&
         (triton_nmax <= 0 || N <= triton_nmax) &&
         t2_triton_has_shape(N, inC, outC)) {
-        if (kspconv_nmap_triton(k, out, in, nmap, host_w, b, N, inC, outC) == 0) return;
+        if (kspconv_nmap_triton(k, out, in, nmap, host_w, b, N, inC, outC) == 0) { PATH("triton"); return; }
     }
     if (nmap && g_use_blaslt_spconv && g_use_blaslt && host_w && k->gather27 &&
         (inC % 16 == 0) && (outC % 16 == 0) && inC <= 512 && N >= 512) {
+        PATH("blaslt");
         kspconv_nmap_blaslt(k, out, in, nmap, host_w, b, N, inC, outC);
         return;
     }
     if (nmap) {
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x8 &&
             (inC % 16 == 0) && (outC % 64 == 0) && (N >= 32)) {
+            PATH("wmma_x8");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 31) / 32, gy = (outC + 63) / 64;
             hipFunction_t f = k->conv_nmap_bf16_x8;
@@ -181,6 +196,7 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x4 &&
             (inC % 16 == 0) && (outC % 32 == 0) && (N >= 32)) {
+            PATH("wmma_x4");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 31) / 32, gy = (outC + 31) / 32;
             hipModuleLaunchKernel(k->conv_nmap_bf16_x4, gx, gy, 1, 128, 1, 1, 0, g_stream, a, NULL);
@@ -188,6 +204,7 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x2 &&
             (inC % 16 == 0) && (outC % 32 == 0)) {
+            PATH("wmma_x2");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 15) / 16, gy = (outC + 31) / 32;
             hipModuleLaunchKernel(k->conv_nmap_bf16_x2, gx, gy, 1, 64, 1, 1, 0, g_stream, a, NULL);
@@ -195,6 +212,7 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16 &&
             (inC % 16 == 0) && (outC % 16 == 0)) {
+            PATH("wmma_x1");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 15) / 16, gy = (outC + 15) / 16;
             hipModuleLaunchKernel(k->conv_nmap_bf16, gx, gy, 1, 32, 1, 1, 0, g_stream, a, NULL);
@@ -202,13 +220,17 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         void *a[] = {&out, &in, &nmap, &w, &b, &inC, &outC};
         if ((outC % 64 == 0) && (inC % 32 == 0)) {
+            PATH("nmap_tiled_f32");
             hipModuleLaunchKernel(k->conv_nmap_tiled, N, outC / 64, 1, 64, 1, 1, 0, g_stream, a, NULL);
         } else {
+            PATH("nmap_scalar_f32");
             hipModuleLaunchKernel(k->conv_nmap, N, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
         }
         } else {
+        PATH("hash_kspconv");
         kspconv(k, out, in, co, w, b, keys, vals, cap_mask, N, inC, outC);
     }
+    #undef PATH
 }
 
 static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap,
@@ -281,13 +303,29 @@ static void kadd(K *k, void *x, void *y, int n) {
     void *a[] = {&x, &y, &n};
     hipModuleLaunchKernel(k->add, (n+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
-static void klin(K *k, void *o, void *i, void *w, void *b, int N, int inC, int outC) {
-    int gx = (outC+15)/16, gy = (N+15)/16;
-    void *a[] = {&o, &i, &w, &b, &N, &inC, &outC};
+static int klin(K *k, void *o, void *i, void *w, void *b, int N, int inC, int outC) {
+    const int BM = 16;
+    const int max_grid_y = 60000;
+    const int max_rows = BM * max_grid_y;
     static int use_naive = -1;
     if (use_naive < 0) use_naive = (getenv("T2_LIN_NAIVE") && atoi(getenv("T2_LIN_NAIVE"))) ? 1 : 0;
     hipFunction_t fn = use_naive ? k->lin_naive : k->lin;
-    hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, g_stream, a, NULL);
+    for (int m0 = 0; m0 < N; m0 += max_rows) {
+        int M = (N - m0 < max_rows) ? (N - m0) : max_rows;
+        float *o_chunk = (float *)o + (size_t)m0 * outC;
+        float *i_chunk = (float *)i + (size_t)m0 * inC;
+        int gx = (outC + 15) / 16, gy = (M + 15) / 16;
+        void *a[] = {&o_chunk, &i_chunk, &w, &b, &M, &inC, &outC};
+        hipError_t err = hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1,
+                                               0, g_stream, a, NULL);
+        if (err != hipSuccess) {
+            fprintf(stderr, "T2-TEX: linear launch failed (N=%d inC=%d outC=%d, chunk=%d, err=%d)\n",
+                    N, inC, outC, M, (int)err);
+            g_shape_dec_lin_err = 1;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static void *get_bf16_weight(const float *host_w_f32, size_t n_elems) {
@@ -656,6 +694,12 @@ static double now_ms(void) {
 static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *d_feats, void *d_coords, void *d_keys, void *d_vals, int cap_mask,
     void *d_tmp, void *d_mlp, void *d_nmap) {
+    static int s_block_time = -1;
+    if (s_block_time < 0) {
+        const char *e = getenv("T2_TEX_BLOCK_TIME");
+        s_block_time = (e && atoi(e)) ? 1 : 0;
+    }
+    double t_get0 = s_block_time ? now_ms() : 0;
     void *dwc = get_f32_dev(blk->conv_w, (size_t)C * 27 * C * sizeof(float));
     void *dwb = get_f32_dev(blk->conv_b, (size_t)C * sizeof(float));
     void *dnw = get_f32_dev(blk->norm_w, (size_t)C * sizeof(float));
@@ -664,9 +708,15 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *dm0b= get_f32_dev(blk->mlp0_b, (size_t)4*C*sizeof(float));
     void *dm2 = get_f32_dev(blk->mlp2_w, (size_t)C*4*C*sizeof(float));
     void *dm2b= get_f32_dev(blk->mlp2_b, (size_t)C*sizeof(float));
+    double t_get1 = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_get1 = now_ms(); }
     prof_init();
     kspconv_nmap_h(k, d_tmp, d_feats, d_nmap, blk->conv_w, dwc, dwb, d_coords, d_keys, d_vals, cap_mask, N, C, C);
+    double t_spc = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_spc = now_ms(); }
     kln(k, d_tmp, d_tmp, dnw, dnb, N, C, 1, 1);
+    double t_ln = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_ln = now_ms(); }
     static int s_klin_bf16 = -1;
     if (s_klin_bf16 < 0) {
         const char *e = getenv("T2_TEX_KLIN_BF16");
@@ -682,10 +732,24 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
         }
     }
     if (!used_bf16) {
+        static int s_dbg_cn = -1;
+        if (s_dbg_cn < 0) { const char *e=getenv("T2_TEX_DBG_CN"); s_dbg_cn = (e && atoi(e)) ? 1 : 0; }
+        if (s_dbg_cn) {
+            fprintf(stderr, "  cn mlp: N=%d C=%d d_tmp=%p d_mlp=%p mlp0_w=%p dm0=%p dm0b=%p mlp2_w=%p dm2=%p dm2b=%p\n",
+                    N, C, d_tmp, d_mlp, (void*)blk->mlp0_w, dm0, dm0b, (void*)blk->mlp2_w, dm2, dm2b);
+        }
         klin_bl_silu(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
         klin_bl(k, d_tmp, d_mlp, blk->mlp2_w, dm2, dm2b, N, 4*C, C);
     }
+    double t_mlp = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_mlp = now_ms(); }
     kadd(k, d_feats, d_tmp, N * C);
+    if (s_block_time) {
+        if (g_stream) hipStreamSynchronize(g_stream);
+        double t_end = now_ms();
+        fprintf(stderr, "    cn N=%d C=%d: get=%.1f spc=%.1f ln=%.1f mlp=%.1f(bf16=%d) add=%.1f tot=%.1f\n",
+                N, C, t_get1 - t_get0, t_spc - t_get1, t_ln - t_spc, t_mlp - t_ln, used_bf16, t_end - t_mlp, t_end - t_get0);
+    }
 }
 
 typedef struct { void *feats, *coords, *keys, *vals; int N, C, cap_mask; } DevSparse;
@@ -699,12 +763,29 @@ typedef struct {
     size_t didx_b, dsi_b;
     size_t dout_b, fk_b, fv_b;
 } C2SScratch;
+/* File-scope but freed at end of every forward_ex call (see c2s_free_all
+ * at the bottom of forward_ex). Previously persistent across calls, which
+ * carried stale hash entries in fk/fv from prior shape_dec invocations —
+ * the suspected cause of fast-path tex_dec GPU page faults and all-zero
+ * coord output. */
 static C2SScratch g_c2s = {0};
 static void c2s_grow(void **p, size_t *cap, size_t need) {
     if (need <= *cap) return;
     if (*p) hipFree(*p);
     hipMalloc(p, need);
     *cap = need;
+}
+static void c2s_free_all(C2SScratch *s) {
+    if (s->dn)   { hipFree(s->dn);   s->dn = NULL;   s->dn_b = 0; }
+    if (s->de)   { hipFree(s->de);   s->de = NULL;   s->de_b = 0; }
+    if (s->dhf)  { hipFree(s->dhf);  s->dhf = NULL;  s->dhf_b = 0; }
+    if (s->dxf)  { hipFree(s->dxf);  s->dxf = NULL;  s->dxf_b = 0; }
+    if (s->dhn)  { hipFree(s->dhn);  s->dhn = NULL;  s->dhn_b = 0; }
+    if (s->didx) { hipFree(s->didx); s->didx = NULL; s->didx_b = 0; }
+    if (s->dsi)  { hipFree(s->dsi);  s->dsi = NULL;  s->dsi_b = 0; }
+    if (s->dout) { hipFree(s->dout); s->dout = NULL; s->dout_b = 0; }
+    if (s->fk)   { hipFree(s->fk);   s->fk = NULL;   s->fk_b = 0; }
+    if (s->fv)   { hipFree(s->fv);   s->fv = NULL;   s->fv_b = 0; }
 }
 
 static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
@@ -745,15 +826,31 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     hipMemsetAsync(fk, 0,    (size_t)cap*sizeof(uint64_t), g_stream);
     hipMemsetAsync(fv, 0xff, (size_t)cap*sizeof(int32_t),  g_stream);
     hash_build(k, fk, fv, cm, dxc, Nf);
-    kspconv_nmap_h(k, dout, dhn, d_nmap_fine, blk->conv2_w, dc2w, dc2b, dxc, fk, fv, cm, Nf, Co, Co);
+    /* Build fine nmap if caller didn't provide one, so conv2 takes the
+     * WMMA / Triton path instead of hash_kspconv. */
+    void *d_nmap_fine_local = NULL;
+    void *d_nmap_fine_use = d_nmap_fine;
+    if (!d_nmap_fine_use && k->build_nmap && Nf > 0) {
+        if (hipMalloc(&d_nmap_fine_local, (size_t)Nf * 27 * sizeof(uint32_t)) == hipSuccess) {
+            void *a[] = {&d_nmap_fine_local, &dxc, &fk, &fv, &cm, &Nf};
+            int gx = (Nf + 7) / 8;
+            hipModuleLaunchKernel(k->build_nmap, gx, 1, 1, 27, 8, 1, 0, g_stream, a, NULL);
+            d_nmap_fine_use = d_nmap_fine_local;
+        }
+    }
+    kspconv_nmap_h(k, dout, dhn, d_nmap_fine_use, blk->conv2_w, dc2w, dc2b, dxc, fk, fv, cm, Nf, Co, Co);
+    if (d_nmap_fine_local) hipFree(d_nmap_fine_local);
     kresrep(k, dout, dxf, Nf, Co, Ci8);
     DevSparse ds = { dout, dxc, fk, fv, Nf, Co, cm };
     return ds;
 }
 
+/* When capture_h_* are non-NULL, retain host copies (ownership transferred
+ * to caller); otherwise host arrays are freed after upload. */
 static void synthesize_unguided_subdiv(
     const t2_shape_dec *dec, int stage_idx, void *d_feats, void *d_coords, int Nc,
-    void **out_d_idx, void **out_d_si, void **out_d_xc, int *out_Nf)
+    void **out_d_idx, void **out_d_si, void **out_d_xc, int *out_Nf,
+    int64_t **capture_h_idx, int64_t **capture_h_si, int32_t **capture_h_xc)
 {
     int Ci = dec->c2s[stage_idx].C_in;
     float *h_feats = (float *)malloc((size_t)Nc * Ci * sizeof(float));
@@ -769,6 +866,9 @@ static void synthesize_unguided_subdiv(
     if (rc != 0) {
         fprintf(stderr, "synthesize_unguided_subdiv: host helper failed rc=%d\n", rc);
         *out_d_idx = NULL; *out_d_si = NULL; *out_d_xc = NULL; *out_Nf = 0;
+        if (capture_h_idx) *capture_h_idx = NULL;
+        if (capture_h_si)  *capture_h_si  = NULL;
+        if (capture_h_xc)  *capture_h_xc  = NULL;
         return;
     }
 
@@ -776,7 +876,9 @@ static void synthesize_unguided_subdiv(
     *out_d_si  = hip_upload_raw(si,  (size_t)Nf * sizeof(int64_t));
     *out_d_xc  = hip_upload_raw(xc,  (size_t)Nf * 4 * sizeof(int32_t));
     *out_Nf = Nf;
-    free(idx); free(si); free(xc);
+    if (capture_h_idx) { *capture_h_idx = idx; } else { free(idx); }
+    if (capture_h_si)  { *capture_h_si  = si;  } else { free(si);  }
+    if (capture_h_xc)  { *capture_h_xc  = xc;  } else { free(xc);  }
 }
 
 /* ======================================================================== *
@@ -789,6 +891,10 @@ struct hip_shape_dec_ctx {
     const t2_shape_dec *dec;
     int verbose;
     int initialized;
+    /* Optional capture of per-stage subdiv arrays (host copies) so a
+     * downstream decoder (e.g. tex_dec) can be guided by this run. */
+    int capture_enabled;
+    hip_shape_dec_cache pending_cache;
 };
 
 static int g_ctx_init_done = 0;  /* file-scope globals init guard */
@@ -837,6 +943,7 @@ hip_shape_dec_ctx *hip_shape_dec_ctx_create(hipModule_t module,
         hipModuleGetFunction(&k->resrep, module, "t2_residual_repeat_f32");
         hipModuleGetFunction(&k->pack_bf16, module, "t2_pack_bf16_from_f32");
         hipModuleGetFunction(&k->pack_f16, module, "t2_pack_f16_from_f32");
+        hipModuleGetFunction(&k->build_nmap, module, "t2_build_nmap_f32");
         hipModuleGetFunction(&k->unpack_f16, module, "t2_unpack_f32_from_f16");
         hipModuleGetFunction(&k->splitk_reduce, module, "t2_splitk_reduce_to_f16");
 
@@ -878,6 +985,16 @@ hip_shape_dec_ctx *hip_shape_dec_ctx_create(hipModule_t module,
             if (e && strcmp(e, "0") == 0) g_use_wmma_spconv = 0;
             fprintf(stderr, "T2-TEX: WMMA spconv %s\n", g_use_wmma_spconv ? "enabled" : "disabled");
         }
+        {
+            /* Disabling JUST the blaslt-gather27 spconv path (keeps the
+             * BF16 GEMM bridge alive for everything else). Useful for
+             * isolating whether the blaslt or WMMA x8 path is faster
+             * per-stage; stage 1 ConvNeXt at C=512 currently routes to
+             * blaslt and dominates tex_dec wall (~1.1 s of 3.3 s). */
+            const char *e = getenv("T2_TEX_BLASLT_SPCONV");
+            if (e && strcmp(e, "0") == 0) g_use_blaslt_spconv = 0;
+            fprintf(stderr, "T2-TEX: blaslt spconv %s\n", g_use_blaslt_spconv ? "enabled" : "disabled");
+        }
 
         /* hipBLASLt init (default ON; T2_TEX_BLASLT=0 to disable). */
         {
@@ -914,7 +1031,49 @@ void hip_shape_dec_ctx_free(hip_shape_dec_ctx *ctx) {
     /* File-scope state (kernel handles, weight caches, scratch) is intentionally
      * leaked at process end — matches the original test's behaviour. The ctx
      * struct itself is what we own. */
-    if (ctx) free(ctx);
+    if (!ctx) return;
+    /* Drop any unclaimed captured cache. */
+    hip_shape_dec_cache_free(&ctx->pending_cache);
+    free(ctx);
+}
+
+void hip_shape_dec_set_capture(hip_shape_dec_ctx *ctx, int enable) {
+    if (!ctx) return;
+    ctx->capture_enabled = enable ? 1 : 0;
+    if (!enable) hip_shape_dec_cache_free(&ctx->pending_cache);
+}
+
+int hip_shape_dec_take_cache(hip_shape_dec_ctx *ctx, hip_shape_dec_cache *out) {
+    if (!ctx || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    int any = 0;
+    out->n_stages = ctx->pending_cache.n_stages;
+    for (int s = 0; s < 8; s++) {
+        out->gi[s]  = ctx->pending_cache.gi[s];
+        out->gs[s]  = ctx->pending_cache.gs[s];
+        out->gxc[s] = ctx->pending_cache.gxc[s];
+        out->gN[s]  = ctx->pending_cache.gN[s];
+        if (out->gN[s] > 0) any = 1;
+        ctx->pending_cache.gi[s]  = NULL;
+        ctx->pending_cache.gs[s]  = NULL;
+        ctx->pending_cache.gxc[s] = NULL;
+        ctx->pending_cache.gN[s]  = 0;
+    }
+    ctx->pending_cache.n_stages = 0;
+    return any ? 0 : -1;
+}
+
+void hip_shape_dec_cache_free(hip_shape_dec_cache *c) {
+    if (!c) return;
+    for (int s = 0; s < 8; s++) {
+        if (c->gi[s])  { free(c->gi[s]);  c->gi[s]  = NULL; }
+        if (c->gs[s])  { free(c->gs[s]);  c->gs[s]  = NULL; }
+        if (c->gxc[s]) { free(c->gxc[s]); c->gxc[s] = NULL; }
+        if (c->nmap_cn[s]) { free(c->nmap_cn[s]); c->nmap_cn[s] = NULL; }
+        if (c->nmap_pc[s]) { free(c->nmap_pc[s]); c->nmap_pc[s] = NULL; }
+        c->gN[s] = 0; c->nmap_cn_N[s] = 0; c->nmap_pc_N[s] = 0;
+    }
+    c->n_stages = 0;
 }
 
 int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
@@ -927,6 +1086,7 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
                              int *out_Nf)
 {
     if (!ctx || !ctx->initialized) return -1;
+    g_shape_dec_lin_err = 0;
     g_stream = ctx->stream;
     const t2_shape_dec *dec = ctx->dec;
     K *k = &g_K;
@@ -935,16 +1095,37 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     void *d_slat = hip_upload_raw(slat_feats, (size_t)N*slat_C*sizeof(float));
     void *d_flw = get_f32_dev(dec->from_latent_w, (size_t)C0*slat_C*sizeof(float));
     void *d_flb = get_f32_dev(dec->from_latent_b, (size_t)C0*sizeof(float));
-    void *d_feats = NULL; hipMalloc(&d_feats, (size_t)N*C0*sizeof(float));
+    void *d_feats = NULL;
+    hipError_t _e_df = hipMalloc(&d_feats, (size_t)N*C0*sizeof(float));
+    if (_e_df != hipSuccess || !d_feats) {
+        fprintf(stderr, "T2-TEX: hipMalloc d_feats(%zu) failed: %d\n",
+                (size_t)N*C0*sizeof(float), (int)_e_df);
+        return -1;
+    }
+    if (ctx->verbose)
+        fprintf(stderr, "T2-TEX: forward N=%d C0=%d d_slat=%p d_flw=%p d_flb=%p d_feats=%p\n",
+                N, C0, d_slat, d_flw, d_flb, d_feats);
     klin_bl(k, d_feats, d_slat, dec->from_latent_w, d_flw, d_flb, N, slat_C, C0);
 
     void *d_coords = hip_upload_raw(coords, (size_t)N*4*sizeof(int32_t));
     int cap = 1; while (cap < N*2) cap <<= 1; int cap_mask = cap - 1;
     void *d_keys=NULL, *d_vals=NULL;
-    hipMalloc(&d_keys, (size_t)cap*sizeof(uint64_t));
-    hipMalloc(&d_vals, (size_t)cap*sizeof(int32_t));
-    hipMemset(d_keys, 0, (size_t)cap*sizeof(uint64_t));
-    hipMemset(d_vals, 0xff, (size_t)cap*sizeof(int32_t));
+    if (hipMalloc(&d_keys, (size_t)cap*sizeof(uint64_t)) != hipSuccess) {
+        fprintf(stderr, "T2-TEX: hipMalloc d_keys failed\n"); return -1;
+    }
+    if (hipMalloc(&d_vals, (size_t)cap*sizeof(int32_t)) != hipSuccess) {
+        fprintf(stderr, "T2-TEX: hipMalloc d_vals failed\n"); return -1;
+    }
+    /* Zero/-1 the hash on g_stream (NOT the default stream): hash_build runs on
+     * g_stream, which is created hipStreamNonBlocking and therefore does NOT
+     * implicitly synchronize with the default stream. A plain hipMemset (default
+     * stream) can land AFTER hash_build under non-default kernel scheduling
+     * (warm GPU / AMD_SERIALIZE_KERNEL / HSA_ENABLE_SDMA=0), wiping the freshly
+     * built table to -1 -> empty neighbor map -> ConvNeXt sees only self -> ~9%
+     * of voxels lost in the knife-edge to_subdiv threshold. Same-stream async
+     * memset orders correctly (matches the c2s fk/fv path). */
+    hipMemsetAsync(d_keys, 0,    (size_t)cap*sizeof(uint64_t), g_stream);
+    hipMemsetAsync(d_vals, 0xff, (size_t)cap*sizeof(int32_t),  g_stream);
     hash_build(k, d_keys, d_vals, cap_mask, d_coords, N);
 
     /* est_Nf for scratch sizing. */
@@ -971,8 +1152,18 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
         if (mlp_f > max_mlp_floats) max_mlp_floats = mlp_f;
     }
     void *d_tmp=NULL, *d_mlp=NULL;
-    hipMalloc(&d_tmp, max_tmp_floats * sizeof(float));
-    hipMalloc(&d_mlp, max_mlp_floats * sizeof(float));
+    hipError_t _e_tmp = hipMalloc(&d_tmp, max_tmp_floats * sizeof(float));
+    hipError_t _e_mlp = hipMalloc(&d_mlp, max_mlp_floats * sizeof(float));
+    if (_e_tmp != hipSuccess || !d_tmp || _e_mlp != hipSuccess || !d_mlp) {
+        fprintf(stderr, "T2-TEX: hipMalloc scratch failed (tmp=%zuMB rc=%d, mlp=%zuMB rc=%d)\n",
+                max_tmp_floats * sizeof(float) / (1024*1024), (int)_e_tmp,
+                max_mlp_floats * sizeof(float) / (1024*1024), (int)_e_mlp);
+        return -1;
+    }
+    if (ctx->verbose)
+        fprintf(stderr, "T2-TEX: scratch d_tmp=%p (%zuMB) d_mlp=%p (%zuMB)\n",
+                d_tmp, max_tmp_floats * sizeof(float) / (1024*1024),
+                d_mlp, max_mlp_floats * sizeof(float) / (1024*1024));
 
     /* Optional cache uploads. */
     void *d_gi[T2SD_MAX_STAGES]={0}, *d_gs[T2SD_MAX_STAGES]={0}, *d_gxc[T2SD_MAX_STAGES]={0};
@@ -1033,15 +1224,40 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
         }
     }
 
+    static int s_stage_time = -1;
+    if (s_stage_time < 0) {
+        const char *e = getenv("T2_TEX_STAGE_TIME");
+        s_stage_time = (e && atoi(e)) ? 1 : 0;
+    }
     int cur_N = N;
+    void *d_nmap_built[T2SD_MAX_STAGES] = {0};
     /* Forward through all stages. */
     for (int s = 0; s < dec->n_stages; s++) {
         int nc = dec->n_convnext[s]; int ch = dec->channels[s];
         if (ctx->verbose)
             fprintf(stderr, "stage %d: %d ConvNeXt(C=%d), N=%d\n", s, nc, ch, cur_N);
+        /* If cache didn't provide nmap_cn for this stage, build it on the
+         * fly so kspconv_nmap_h can pick the WMMA / blaslt / Triton paths
+         * instead of falling to hash_kspconv (10× slower). */
+        void *d_nmap_use = d_nmap_cn[s];
+        if (!d_nmap_use && k->build_nmap && cur_N > 0) {
+            if (hipMalloc(&d_nmap_built[s], (size_t)cur_N * 27 * sizeof(uint32_t)) == hipSuccess) {
+                void *a[] = {&d_nmap_built[s], &d_coords, &d_keys, &d_vals, &cap_mask, &cur_N};
+                int gx = (cur_N + 7) / 8;
+                hipModuleLaunchKernel(k->build_nmap, gx, 1, 1, 27, 8, 1, 0, g_stream, a, NULL);
+                d_nmap_use = d_nmap_built[s];
+            }
+        }
+        if (s_stage_time && g_stream) hipStreamSynchronize(g_stream);
+        double cn_t0 = s_stage_time ? now_ms() : 0;
         for (int b = 0; b < nc; b++) {
             run_convnext(k, &dec->convnext[s][b], ch, cur_N,
-                d_feats, d_coords, d_keys, d_vals, cap_mask, d_tmp, d_mlp, d_nmap_cn[s]);
+                d_feats, d_coords, d_keys, d_vals, cap_mask, d_tmp, d_mlp, d_nmap_use);
+        }
+        if (s_stage_time) {
+            if (g_stream) hipStreamSynchronize(g_stream);
+            fprintf(stderr, "  stage %d ConvNeXt(%d blks, C=%d, N=%d): %.1f ms\n",
+                    s, nc, ch, cur_N, now_ms() - cn_t0);
         }
         if (dec->c2s[s].conv1_w) {
             void *d_idx_use = d_gi[s];
@@ -1051,8 +1267,26 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
             void *d_idx_owned = NULL, *d_si_owned = NULL, *d_xc_owned = NULL;
             void *d_feats_owned = NULL;
             if (Nf_use == 0 && dec->c2s[s].to_subdiv_w) {
+                int64_t **cap_idx = NULL, **cap_si = NULL;
+                int32_t **cap_xc = NULL;
+                if (ctx->capture_enabled && s < 8) {
+                    /* Drop any prior captured stage (re-running forward). */
+                    if (ctx->pending_cache.gi[s])  { free(ctx->pending_cache.gi[s]);  ctx->pending_cache.gi[s]  = NULL; }
+                    if (ctx->pending_cache.gs[s])  { free(ctx->pending_cache.gs[s]);  ctx->pending_cache.gs[s]  = NULL; }
+                    if (ctx->pending_cache.gxc[s]) { free(ctx->pending_cache.gxc[s]); ctx->pending_cache.gxc[s] = NULL; }
+                    ctx->pending_cache.gN[s] = 0;
+                    cap_idx = &ctx->pending_cache.gi[s];
+                    cap_si  = &ctx->pending_cache.gs[s];
+                    cap_xc  = &ctx->pending_cache.gxc[s];
+                }
                 synthesize_unguided_subdiv(dec, s, d_feats, d_coords, cur_N,
-                    &d_idx_owned, &d_si_owned, &d_xc_owned, &Nf_use);
+                    &d_idx_owned, &d_si_owned, &d_xc_owned, &Nf_use,
+                    cap_idx, cap_si, cap_xc);
+                if (ctx->capture_enabled && s < 8) {
+                    ctx->pending_cache.gN[s] = Nf_use;
+                    if (s + 1 > ctx->pending_cache.n_stages)
+                        ctx->pending_cache.n_stages = s + 1;
+                }
                 d_idx_use = d_idx_owned;
                 d_si_use  = d_si_owned;
                 d_xc_use  = d_xc_owned;
@@ -1077,10 +1311,18 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
                     dec->c2s[s].C_in, dec->c2s[s].C_out, Nf_use);
             void *d_fine = d_nmap_pc[s] ? d_nmap_pc[s]
                                         : (s+1 < T2SD_MAX_STAGES ? d_nmap_cn[s+1] : NULL);
+            if (s_stage_time && g_stream) hipStreamSynchronize(g_stream);
+            double c2s_t0 = s_stage_time ? now_ms() : 0;
             DevSparse ds = run_c2s(k, &dec->c2s[s], cur_N,
                 d_feats, d_coords, d_keys, d_vals, cap_mask,
                 d_idx_use, d_si_use, d_xc_use, Nf_use,
-                d_nmap_cn[s], d_fine);
+                d_nmap_use ? d_nmap_use : d_nmap_cn[s], d_fine);
+            if (s_stage_time) {
+                if (g_stream) hipStreamSynchronize(g_stream);
+                fprintf(stderr, "  stage %d C2S(%d->%d, Nc=%d->Nf=%d): %.1f ms\n",
+                        s, dec->c2s[s].C_in, dec->c2s[s].C_out, cur_N, Nf_use,
+                        now_ms() - c2s_t0);
+            }
             if (d_idx_owned) hipFree(d_idx_owned);
             if (d_si_owned)  hipFree(d_si_owned);
             if (d_feats_owned) hipFree(d_feats_owned);
@@ -1102,21 +1344,38 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     kln(k, d_feats, d_feats, NULL, NULL, cur_N, Cf, 0, 0);
     void *d_ow = get_f32_dev(dec->output_w, (size_t)out_ch*Cf*sizeof(float));
     void *d_ob = get_f32_dev(dec->output_b, (size_t)out_ch*sizeof(float));
-    klin(k, d_out, d_feats, d_ow, d_ob, cur_N, Cf, out_ch);
+    if (klin(k, d_out, d_feats, d_ow, d_ob, cur_N, Cf, out_ch) != 0) {
+        fprintf(stderr, "T2-TEX: output linear failed (cur_N=%d Cf=%d out_ch=%d) — "
+                "aborting shape_dec decode\n", cur_N, Cf, out_ch);
+        return -1;
+    }
 
     /* Persist d_coords too — promote to caller. d_coords by this point is
      * either the original or ds.coords, both heap-owned somewhere in our
      * scratch chain. We need a fresh buffer the caller can hipFree. */
     void *d_coords_out = NULL;
     hipMalloc(&d_coords_out, (size_t)cur_N * 4 * sizeof(int32_t));
-    hipMemcpyAsync(d_coords_out, d_coords, (size_t)cur_N * 4 * sizeof(int32_t),
-                   hipMemcpyDeviceToDevice, g_stream);
+    /* Sync the stream first then do a SYNC D2D copy on the default stream
+     * (which serializes with everything by default). hipMemcpyAsync on
+     * g_stream + hipStreamSync was not reliable on RDNA4/ROCm 7.2.2 for
+     * D2D over multi-MB buffers — saw all-zero coords on readback. */
+    if (g_stream) hipStreamSynchronize(g_stream);
+    hipMemcpy(d_coords_out, d_coords, (size_t)cur_N * 4 * sizeof(int32_t),
+              hipMemcpyDeviceToDevice);
 
     /* Ditto for d_out: callers expect to own this; transfer ownership of
      * d_out_persist directly. */
     *out_d_feats = (float *)d_out;
     *out_d_coords = (int32_t *)d_coords_out;
     *out_Nf = cur_N;
+
+    /* Drain g_stream BEFORE freeing transient buffers: the d_coords_out
+     * memcpy above is async on g_stream and its source is d_gxc[final],
+     * which we hipFree below. Without this sync, hipFree can unmap the
+     * source pages while the memcpy is still pending → caller reads zeros.
+     * This was the root cause of nondeterministic tex_coord collapse to
+     * (0,0,0) observed across e2e --tex runs. */
+    if (g_stream) hipStreamSynchronize(g_stream);
 
     /* Free transient buffers we own here. The persistent C2S scratch + cached
      * weights are intentionally kept across calls (file-scope state). */
@@ -1132,13 +1391,24 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
         if (d_gxc[s]) hipFree(d_gxc[s]);
         if (d_nmap_cn[s]) hipFree(d_nmap_cn[s]);
         if (d_nmap_pc[s]) hipFree(d_nmap_pc[s]);
+        if (d_nmap_built[s]) hipFree(d_nmap_built[s]);
     }
     /* d_feats from stage 0 was a fresh hipMalloc; later stages reassign to
      * persistent C2S scratch. We can't safely free that without double-freeing
      * the persistent buffer on next call — leak the stage-0 fresh allocation
      * as before. d_coords stage-0 was a fresh upload; same story. */
 
+    /* Free C2S scratch — was previously persistent across calls, but that
+     * leaves stale hash entries (g_c2s.fk/fv) which appear to trigger
+     * fast-path OOB reads in kspconv hash lookups. */
     if (g_stream) hipStreamSynchronize(g_stream);
+    c2s_free_all(&g_c2s);
+
+    if (g_shape_dec_lin_err) {
+        fprintf(stderr, "T2-TEX: a dense-linear launch failed during shape_dec decode "
+                "— output is unreliable\n");
+        return -1;
+    }
     return 0;
 }
 

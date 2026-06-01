@@ -71,6 +71,19 @@
 #define DIT_COND_DIM 1024
 #define DIT_T_HALF   128   /* sinusoidal embed half-dim (256/2) */
 
+#define T2_TEX_I8_PER_BLOCK 7
+static const char *const t2_tex_i8_suffix[T2_TEX_I8_PER_BLOCK] = {
+    "self_attn.to_qkv",
+    "self_attn.to_out",
+    "cross_attn.to_q",
+    "cross_attn.to_kv",
+    "cross_attn.to_out",
+    "mlp.mlp.0",
+    "mlp.mlp.2",
+};
+#define T2_SLAT_I8_PER_BLOCK T2_TEX_I8_PER_BLOCK
+#define t2_slat_i8_suffix t2_tex_i8_suffix
+
 /* Decoder */
 #define DEC_GRID   16
 #define DEC_OUT_GRID 64
@@ -88,6 +101,9 @@ typedef struct {
     void *w_bf16;     /* BF16 weight (raw bytes, [n_out, n_in]); used by hipBLASLt path */
     void *b;          /* F32 bias, device pointer (may be NULL) */
     float scale;      /* -1.0f = F32/BF16 weight; >=0.0f = FP8 per-tensor scale */
+    int is_int8;      /* 1 = w is raw I8 bytes; use W8A8 path with scales below */
+    void *i8_wscale;  /* F32 [n_out] per-output-channel scale */
+    void *i8_smooth;  /* optional F32 [n_in] SmoothQuant scale */
 } t2_wt;
 
 typedef struct {
@@ -133,11 +149,21 @@ struct hip_trellis2_runner {
     hipFunction_t fn_gemm;           /* gemm_tiled_f32_f32 (scalar F32 fallback) */
     hipFunction_t fn_gemm_wmma;      /* gemm_bf16w_bf16a_wmma_t (gfx12 only) */
     hipFunction_t fn_gemm_fp8_wmma;  /* gemm_fp8w_bf16a_wmma_t (gfx12 only) */
+    hipFunction_t fn_quant_act_int8; /* W8A8: F32 activations -> per-row I8 */
+    hipFunction_t fn_gemm_w8a8;      /* W8A8 scalar fallback */
+    hipFunction_t fn_gemm_w8a8_wmma; /* W8A8 gfx12 WMMA */
+    hipFunction_t fn_gemm_w8a8_pgr2; /* W8A8 gfx12 pipelined WMMA (fast) */
+    hipFunction_t fn_calib_amax;     /* per-input-channel activation amax */
     hipFunction_t fn_pack_bf16;      /* pack_bf16_from_f32 — F32 -> BF16 for hipBLASLt */
     int use_wmma;                    /* 1 iff BF16 WMMA kernel is loaded & enabled */
     int use_fp8;                     /* 1 iff FP8 LUT uploaded and any FP8 weight loaded */
+    int use_tex_int8;                /* 1 iff any tex DiT I8 block weight loaded */
+    int use_slat_int8;               /* 1 iff any SLAT/shape DiT I8 block weight loaded */
     int use_blaslt;                  /* 1 iff hipBLASLt path enabled (T2_BLASLT=1, default 1) */
     void *d_act_bf16;                /* scratch [4096*8192] BF16 (~64 MB) for activation cast */
+    void *d_xq_int8;                 /* scratch [n_tok*n_in] I8 activations */
+    float *d_x_iscale;               /* scratch [n_tok] F32 activation scales */
+    size_t i8_xq_cap, i8_is_cap;
     hipFunction_t fn_layernorm;      /* layernorm_f32 */
     hipFunction_t fn_layernorm_pack; /* layernorm_pack_bf16_f32 (fused) */
     hipFunction_t fn_adaln_pack;     /* adaln_pack_bf16_f32 (fused) */
@@ -238,6 +264,13 @@ struct hip_trellis2_runner {
 
     int dit_loaded;
 
+    const char *tex_calib_dump_path;
+    float *tex_calib_amax[DIT_DEPTH * T2_TEX_I8_PER_BLOCK];
+    int tex_calib_nin[DIT_DEPTH * T2_TEX_I8_PER_BLOCK];
+    const char *slat_calib_dump_path;
+    float *slat_calib_amax[DIT_DEPTH * T2_SLAT_I8_PER_BLOCK];
+    int slat_calib_nin[DIT_DEPTH * T2_SLAT_I8_PER_BLOCK];
+
     /* Block 0 debug sink (set by hip_trellis2_dump_b0_detail; zero otherwise) */
     hip_trellis2_b0_dbg *b0_dbg;
 
@@ -246,6 +279,20 @@ struct hip_trellis2_runner {
     hipStream_t        shape_dec_stream;
     t2_shape_dec      *shape_dec;
     hip_shape_dec_ctx *shape_dec_ctx;
+
+    /* ---- Tex decoder (independent slot; reuses same hierarchical 4-stage
+     * shape_dec architecture but with PBR out_channels). May coexist with the
+     * shape decoder on the same runner. */
+    hipModule_t        tex_dec_mod;
+    hipStream_t        tex_dec_stream;
+    t2_shape_dec      *tex_dec;
+    hip_shape_dec_ctx *tex_dec_ctx;
+
+    /* Per-stage subdiv arrays captured from the most recent shape_dec run;
+     * fed into tex_dec as its c2s guide (tex_dec has no to_subdiv head).
+     * Empty by default; populated after hip_trellis2_run_shape_dec. */
+    hip_shape_dec_cache subdiv_cache;
+    int                 subdiv_cache_valid;
 
     /* ---- SLAT DiT (sparse-latent flow DiT) ---- */
     int slat_loaded;
@@ -283,6 +330,40 @@ struct hip_trellis2_runner {
     void *d_slat_t_silu;   /* [DIT_DIM] */
     void *d_slat_mod_base; /* [6*DIT_DIM] */
     void *d_slat_mod;      /* [6*DIT_DIM] */
+
+    /* ---- Tex DiT (Stage 3, texture flow — sister of SLAT DiT) ----
+     * Identical 30-block architecture but in_channels=64 (noise_32 +
+     * shape_norm_32 concat) and out_channels=32. Independent weights, KV
+     * cache, scratch; runs after shape SLAT during e2e texgen. */
+    int tex_loaded;
+    t2_wt tex_input;     /* [DIT_DIM, 64] */
+    t2_wt tex_t_fc1;
+    t2_wt tex_t_fc2;
+    t2_wt tex_ada_mod;
+    t2_wt tex_out;       /* [32, DIT_DIM] */
+    t2_block_gpu tex_blocks[DIT_DEPTH];
+    void *d_tex_rope_cos;
+    void *d_tex_rope_sin;
+    int   tex_n_freqs;
+    int   tex_rope_cap;
+    void *tex_ca_K_cache[DIT_DEPTH];
+    void *tex_ca_V_cache[DIT_DEPTH];
+    int   tex_ca_kv_valid;
+    int   tex_ca_kv_len;
+    int   tex_ca_kv_cap;
+    const float *tex_ca_kv_cond_ptr;
+    void *d_tex_h, *d_tex_ln_h, *d_tex_qkv;
+    void *d_tex_Q, *d_tex_K, *d_tex_V;
+    void *d_tex_ca_Q, *d_tex_attn_out, *d_tex_mlp_mid;
+    void *d_tex_x_in;     /* [N, 64] */
+    void *d_tex_vel_out;  /* [N, 32] */
+    void *d_tex_cond;     /* [n_cond, 1024] */
+    int   tex_n_cap;
+    int   tex_cond_cap;
+    void *d_tex_t_emb;
+    void *d_tex_t_silu;
+    void *d_tex_mod_base;
+    void *d_tex_mod;
 };
 
 /* helper: hipMemcpy device buffer [n floats] to host if dst non-null */
@@ -498,6 +579,50 @@ static int st_upload_wt_bf16_pref(st_context *st, const char *weight_name,
     return 0;
 }
 
+static int t2_dtype_is_i8(const char *dtype) {
+    return dtype && (strcmp(dtype, "I8") == 0 || strcmp(dtype, "INT8") == 0);
+}
+
+static void t2_scale_name(const char *weight_name, const char *suffix,
+                          char *out, size_t outsz) {
+    size_t L = strlen(weight_name);
+    if (L > 7 && strcmp(weight_name + L - 7, ".weight") == 0)
+        snprintf(out, outsz, "%.*s.%s", (int)(L - 7), weight_name, suffix);
+    else
+        snprintf(out, outsz, "%s.%s", weight_name, suffix);
+}
+
+static int st_upload_wt_i8_pref(st_context *st, const char *weight_name,
+                                int prefer_bf16, t2_wt *wt, int verbose) {
+    memset(wt, 0, sizeof(*wt));
+    wt->scale = -1.0f;
+    int idx = safetensors_find(st, weight_name);
+    if (idx < 0) return 0;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (t2_dtype_is_i8(dtype)) {
+        size_t nb = safetensors_nbytes(st, idx);
+        wt->w = hip_upload_raw(safetensors_data(st, idx), nb);
+        wt->is_int8 = 1;
+        char scale_name[256], smooth_name[256];
+        t2_scale_name(weight_name, "weight_scale", scale_name, sizeof(scale_name));
+        t2_scale_name(weight_name, "smooth_scale", smooth_name, sizeof(smooth_name));
+        wt->i8_wscale = st_upload_f32(st, scale_name, verbose);
+        wt->i8_smooth = st_upload_f32(st, smooth_name, verbose);
+        if (!wt->i8_wscale) {
+            fprintf(stderr, "T2-HIP: INT8 weight %s missing %s\n",
+                    weight_name, scale_name);
+        }
+        if (verbose >= 2) {
+            fprintf(stderr, "  %s: I8 raw (%.1f MB)%s\n",
+                    weight_name, nb / 1048576.0,
+                    wt->i8_smooth ? " + SmoothQuant" : "");
+        }
+        return 0;
+    }
+    return st_upload_wt_bf16_pref(st, weight_name, prefer_bf16,
+                                  &wt->w_bf16, &wt->w, &wt->scale, verbose);
+}
+
 /* Upload raw BF16 bytes for hipBLASLt path. Returns NULL if tensor missing
  * or dtype is not BF16. Does NOT touch *out_scale. */
 static void *st_upload_bf16_raw(st_context *st, const char *weight_name, int verbose) {
@@ -521,6 +646,12 @@ static void *ensure_buf(void **buf, size_t bytes) {
 }
 
 static void free_hip(void **p) { if (*p) { hipFree(*p); *p = NULL; } }
+
+static void free_wt_int8_extra(t2_wt *wt) {
+    free_hip(&wt->i8_wscale);
+    free_hip(&wt->i8_smooth);
+    wt->is_int8 = 0;
+}
 
 /* ======================================================================== */
 /* RoPE phase precomputation                                               */
@@ -571,6 +702,68 @@ static void compute_rope_phases(int grid, int n_freqs,
 static void run_broadcast_bias(hip_trellis2_runner *r, void *out,
                                 const void *bias, int n_tok, int n_out);
 
+static int gemm_int8(hip_trellis2_runner *r, void *Y, const t2_wt *wt,
+                     const void *X, const void *bias,
+                     int n_out, int n_in, int n_tok) {
+    if (!wt->w || !wt->i8_wscale || !r->fn_quant_act_int8 || !r->fn_gemm_w8a8)
+        return -1;
+
+    /* Pipelined pgr2 WMMA path: needs n_in%32==0, n_out%128==0, and the
+     * activation padded to a 128-row multiple (kernel reads padded rows, masks
+     * the store to row<n_tok). ~5x faster than the non-pipelined wmma kernel. */
+    const char *dp4a_env0 = getenv("T2_INT8_DP4A");
+    int force_dp4a0 = dp4a_env0 && atoi(dp4a_env0);
+    int use_pgr2 = (!force_dp4a0 && r->fn_gemm_w8a8_pgr2 &&
+                    (n_in % 32) == 0 && (n_out % 128) == 0);
+    int M_pad = ((n_tok + 127) / 128) * 128;
+    int xq_rows = use_pgr2 ? M_pad : n_tok;
+
+    size_t xq_bytes = (size_t)xq_rows * (size_t)n_in;
+    if (xq_bytes > r->i8_xq_cap) {
+        if (r->d_xq_int8) { hipDeviceSynchronize(); hipFree(r->d_xq_int8); r->d_xq_int8 = NULL; }
+        if (hipMalloc(&r->d_xq_int8, xq_bytes) != hipSuccess) return -1;
+        r->i8_xq_cap = xq_bytes;
+    }
+    size_t scale_bytes = (size_t)n_tok * sizeof(float);
+    if (scale_bytes > r->i8_is_cap) {
+        if (r->d_x_iscale) { hipDeviceSynchronize(); hipFree(r->d_x_iscale); r->d_x_iscale = NULL; }
+        if (hipMalloc((void **)&r->d_x_iscale, scale_bytes) != hipSuccess) return -1;
+        r->i8_is_cap = scale_bytes;
+    }
+
+    const void *X_arg = X;
+    void *smooth = wt->i8_smooth;
+    void *qa[] = { &X_arg, &smooth, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in };
+    if (hipModuleLaunchKernel(r->fn_quant_act_int8,
+            (unsigned)n_tok, 1, 1, 256, 1, 1, 0, 0, qa, NULL) != hipSuccess)
+        return -1;
+
+    void *Wq = wt->w;
+    void *wscale = wt->i8_wscale;
+    const void *bias_arg = bias;
+    /* Pipelined pgr2 path (fastest): arg order (Y,Wq,Xq,bias,xscale,wscale,...). */
+    if (use_pgr2) {
+        void *pa[] = { &Y, &Wq, &r->d_xq_int8, &bias_arg, &r->d_x_iscale, &wscale,
+                       &n_out, &n_in, &n_tok, &M_pad };
+        return hipModuleLaunchKernel(r->fn_gemm_w8a8_pgr2,
+            (unsigned)(n_out / 128), (unsigned)(M_pad / 128),
+            1, 128, 1, 1, 0, 0, pa, NULL) == hipSuccess ? 0 : -1;
+    }
+    void *ga[] = { &Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale,
+                   &bias_arg, &n_out, &n_in, &n_tok };
+    const char *dp4a_env = getenv("T2_INT8_DP4A");
+    int force_dp4a = dp4a_env && atoi(dp4a_env);
+    if (!force_dp4a && r->fn_gemm_w8a8_wmma &&
+        (n_out % 16) == 0 && (n_in % 16) == 0) {
+        return hipModuleLaunchKernel(r->fn_gemm_w8a8_wmma,
+            (unsigned)((n_out + 127) / 128), (unsigned)((n_tok + 127) / 128),
+            1, 256, 1, 1, 0, 0, ga, NULL) == hipSuccess ? 0 : -1;
+    }
+    return hipModuleLaunchKernel(r->fn_gemm_w8a8,
+        (unsigned)((n_out + 127) / 128), (unsigned)n_tok,
+        1, 128, 1, 1, 0, 0, ga, NULL) == hipSuccess ? 0 : -1;
+}
+
 /* GEMM dispatcher.
  *
  * Y[n_tok, n_out] = X[n_tok, n_in] @ W[n_out, n_in]^T + (bias ? bias : 0)
@@ -584,6 +777,10 @@ static void run_broadcast_bias(hip_trellis2_runner *r, void *out,
 static int gemm(hip_trellis2_runner *r, void *Y, const t2_wt *wt, const void *X,
                 const void *bias, int n_out, int n_in, int n_tok) {
     const void *W = wt->w;
+
+    if (wt->is_int8) {
+        return gemm_int8(r, Y, wt, X, bias, n_out, n_in, n_tok);
+    }
 
     /* hipBLASLt BF16 path: when a BF16 weight is preloaded and bridge is up.
      * Y is F32 [n_tok, n_out]; X is F32 [n_tok, n_in] — pack to BF16 scratch.
@@ -645,6 +842,174 @@ static int gemm(hip_trellis2_runner *r, void *Y, const t2_wt *wt, const void *X,
     void *args[] = { &Y, &W, &X, &bias, &n_out, &n_in, &n_tok };
     return hipModuleLaunchKernel(r->fn_gemm,
         gdx, gdy, 1, 16, 16, 1, 0, 0, args, NULL) == hipSuccess ? 0 : -1;
+}
+
+static void t2_tex_calib_record(hip_trellis2_runner *r, const void *X,
+                                int n_tok, int n_in, int block, int slot) {
+    if (!r->tex_calib_dump_path || !r->fn_calib_amax || !X) return;
+    if (block < 0 || block >= DIT_DEPTH || slot < 0 || slot >= T2_TEX_I8_PER_BLOCK) return;
+    int idx = block * T2_TEX_I8_PER_BLOCK + slot;
+    if (!r->tex_calib_amax[idx]) {
+        if (hipMalloc((void **)&r->tex_calib_amax[idx], (size_t)n_in * sizeof(float)) != hipSuccess)
+            return;
+        hipMemset(r->tex_calib_amax[idx], 0, (size_t)n_in * sizeof(float));
+        r->tex_calib_nin[idx] = n_in;
+    }
+    void *amax = r->tex_calib_amax[idx];
+    void *args[] = { &amax, &X, &n_tok, &n_in };
+    hipModuleLaunchKernel(r->fn_calib_amax,
+        (unsigned)((n_in + 255) / 256), 1, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static int tex_gemm(hip_trellis2_runner *r, void *Y, t2_wt *wt, const void *X,
+                    const void *bias, int n_out, int n_in, int n_tok,
+                    int block, int slot) {
+    t2_tex_calib_record(r, X, n_tok, n_in, block, slot);
+    return gemm(r, Y, wt, X, bias, n_out, n_in, n_tok);
+}
+
+static void t2_tex_calib_dump(hip_trellis2_runner *r) {
+    if (!r->tex_calib_dump_path) return;
+    size_t total_floats = 0;
+    int present = 0;
+    for (int idx = 0; idx < DIT_DEPTH * T2_TEX_I8_PER_BLOCK; idx++) {
+        if (r->tex_calib_amax[idx]) {
+            total_floats += (size_t)r->tex_calib_nin[idx];
+            present++;
+        }
+    }
+    if (!present) {
+        fprintf(stderr, "T2-HIP: tex calib dump: no stats collected\n");
+        return;
+    }
+    char *json = (char *)malloc((size_t)present * 192 + 64);
+    float *data = (float *)malloc(total_floats * sizeof(float));
+    if (!json || !data) {
+        fprintf(stderr, "T2-HIP: tex calib dump: OOM\n");
+        free(json);
+        free(data);
+        return;
+    }
+    size_t jp = 0, foff = 0;
+    int first = 1;
+    jp += sprintf(json + jp, "{");
+    for (int b = 0; b < DIT_DEPTH; b++) {
+        for (int s = 0; s < T2_TEX_I8_PER_BLOCK; s++) {
+            int idx = b * T2_TEX_I8_PER_BLOCK + s;
+            if (!r->tex_calib_amax[idx]) continue;
+            int nin = r->tex_calib_nin[idx];
+            hipMemcpy(data + foff, r->tex_calib_amax[idx],
+                      (size_t)nin * sizeof(float), hipMemcpyDeviceToHost);
+            jp += sprintf(json + jp,
+                "%s\"blocks.%d.%s.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                first ? "" : ",", b, t2_tex_i8_suffix[s], nin,
+                foff * sizeof(float), (foff + (size_t)nin) * sizeof(float));
+            foff += (size_t)nin;
+            first = 0;
+        }
+    }
+    jp += sprintf(json + jp, "}");
+    while (jp % 8) json[jp++] = ' ';
+    FILE *f = fopen(r->tex_calib_dump_path, "wb");
+    if (!f) {
+        fprintf(stderr, "T2-HIP: tex calib dump: cannot open %s\n", r->tex_calib_dump_path);
+        free(json);
+        free(data);
+        return;
+    }
+    uint64_t hlen = (uint64_t)jp;
+    fwrite(&hlen, 8, 1, f);
+    fwrite(json, 1, jp, f);
+    fwrite(data, sizeof(float), foff, f);
+    fclose(f);
+    fprintf(stderr, "T2-HIP: tex calib dump wrote %d vectors (%zu floats) -> %s\n",
+            present, foff, r->tex_calib_dump_path);
+    free(json);
+    free(data);
+}
+
+static void t2_slat_calib_record(hip_trellis2_runner *r, const void *X,
+                                 int n_tok, int n_in, int block, int slot) {
+    if (!r->slat_calib_dump_path || !r->fn_calib_amax || !X) return;
+    if (block < 0 || block >= DIT_DEPTH || slot < 0 || slot >= T2_SLAT_I8_PER_BLOCK) return;
+    int idx = block * T2_SLAT_I8_PER_BLOCK + slot;
+    if (!r->slat_calib_amax[idx]) {
+        if (hipMalloc((void **)&r->slat_calib_amax[idx], (size_t)n_in * sizeof(float)) != hipSuccess)
+            return;
+        hipMemset(r->slat_calib_amax[idx], 0, (size_t)n_in * sizeof(float));
+        r->slat_calib_nin[idx] = n_in;
+    }
+    void *amax = r->slat_calib_amax[idx];
+    void *args[] = { &amax, &X, &n_tok, &n_in };
+    hipModuleLaunchKernel(r->fn_calib_amax,
+        (unsigned)((n_in + 255) / 256), 1, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static int slat_gemm(hip_trellis2_runner *r, void *Y, t2_wt *wt, const void *X,
+                     const void *bias, int n_out, int n_in, int n_tok,
+                     int block, int slot) {
+    t2_slat_calib_record(r, X, n_tok, n_in, block, slot);
+    return gemm(r, Y, wt, X, bias, n_out, n_in, n_tok);
+}
+
+static void t2_slat_calib_dump(hip_trellis2_runner *r) {
+    if (!r->slat_calib_dump_path) return;
+    size_t total_floats = 0;
+    int present = 0;
+    for (int idx = 0; idx < DIT_DEPTH * T2_SLAT_I8_PER_BLOCK; idx++) {
+        if (r->slat_calib_amax[idx]) {
+            total_floats += (size_t)r->slat_calib_nin[idx];
+            present++;
+        }
+    }
+    if (!present) {
+        fprintf(stderr, "T2-HIP: SLAT calib dump: no stats collected\n");
+        return;
+    }
+    char *json = (char *)malloc((size_t)present * 192 + 64);
+    float *data = (float *)malloc(total_floats * sizeof(float));
+    if (!json || !data) {
+        fprintf(stderr, "T2-HIP: SLAT calib dump: OOM\n");
+        free(json);
+        free(data);
+        return;
+    }
+    size_t jp = 0, foff = 0;
+    int first = 1;
+    jp += sprintf(json + jp, "{");
+    for (int b = 0; b < DIT_DEPTH; b++) {
+        for (int s = 0; s < T2_SLAT_I8_PER_BLOCK; s++) {
+            int idx = b * T2_SLAT_I8_PER_BLOCK + s;
+            if (!r->slat_calib_amax[idx]) continue;
+            int nin = r->slat_calib_nin[idx];
+            hipMemcpy(data + foff, r->slat_calib_amax[idx],
+                      (size_t)nin * sizeof(float), hipMemcpyDeviceToHost);
+            jp += sprintf(json + jp,
+                "%s\"blocks.%d.%s.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                first ? "" : ",", b, t2_slat_i8_suffix[s], nin,
+                foff * sizeof(float), (foff + (size_t)nin) * sizeof(float));
+            foff += (size_t)nin;
+            first = 0;
+        }
+    }
+    jp += sprintf(json + jp, "}");
+    while (jp % 8) json[jp++] = ' ';
+    FILE *f = fopen(r->slat_calib_dump_path, "wb");
+    if (!f) {
+        fprintf(stderr, "T2-HIP: SLAT calib dump: cannot open %s\n", r->slat_calib_dump_path);
+        free(json);
+        free(data);
+        return;
+    }
+    uint64_t hlen = (uint64_t)jp;
+    fwrite(&hlen, 8, 1, f);
+    fwrite(json, 1, jp, f);
+    fwrite(data, sizeof(float), foff, f);
+    fclose(f);
+    fprintf(stderr, "T2-HIP: SLAT calib dump wrote %d vectors (%zu floats) -> %s\n",
+            present, foff, r->slat_calib_dump_path);
+    free(json);
+    free(data);
 }
 
 /* LAUNCH macro intentionally removed — use pointer-array style directly */
@@ -866,6 +1231,38 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
         }
     }
 
+    r->fn_quant_act_int8 = NULL;
+    r->fn_gemm_w8a8 = NULL;
+    r->fn_gemm_w8a8_wmma = NULL;
+    r->fn_gemm_w8a8_pgr2 = NULL;
+    r->fn_calib_amax = NULL;
+    if (hipModuleGetFunction(&r->fn_calib_amax, r->mod, "t2_amax_per_col_f32") != hipSuccess)
+        r->fn_calib_amax = NULL;
+    if (hipModuleGetFunction(&r->fn_quant_act_int8, r->mod, "t2_quant_act_perrow_int8") != hipSuccess)
+        r->fn_quant_act_int8 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8, r->mod, "t2_gemm_w8a8_perrow_f32") != hipSuccess)
+        r->fn_gemm_w8a8 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_wmma, r->mod, "t2_gemm_w8a8_wmma") != hipSuccess)
+        r->fn_gemm_w8a8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_pgr2, r->mod, "t2_gemm_w8a8_pgr2") != hipSuccess)
+        r->fn_gemm_w8a8_pgr2 = NULL;
+    if (r->fn_quant_act_int8 && r->fn_gemm_w8a8) {
+        fprintf(stderr, "T2-HIP: INT8 W8A8 GEMM kernels available%s\n",
+                r->fn_gemm_w8a8_wmma ? " (WMMA + DP4A fallback)" : " (DP4A fallback)");
+    }
+    r->tex_calib_dump_path = getenv("T2_TEX_CALIB_DUMP");
+    if (r->tex_calib_dump_path && !r->tex_calib_dump_path[0]) r->tex_calib_dump_path = NULL;
+    if (r->tex_calib_dump_path) {
+        fprintf(stderr, "T2-HIP: T2_TEX_CALIB_DUMP active -> %s\n",
+                r->tex_calib_dump_path);
+    }
+    r->slat_calib_dump_path = getenv("T2_SLAT_CALIB_DUMP");
+    if (r->slat_calib_dump_path && !r->slat_calib_dump_path[0]) r->slat_calib_dump_path = NULL;
+    if (r->slat_calib_dump_path) {
+        fprintf(stderr, "T2-HIP: T2_SLAT_CALIB_DUMP active -> %s\n",
+                r->slat_calib_dump_path);
+    }
+
     fprintf(stderr, "T2-HIP: all %d kernels loaded OK\n", 24);
 
     /* Optional: hipBLASLt BF16 GEMM bridge (default ON; T2_BLASLT=0 disables).
@@ -918,10 +1315,14 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
     return r;
 }
 
-void hip_trellis2_free(hip_trellis2_runner *r) {
-    if (!r) return;
+int hip_trellis2_mem_info(size_t *free_bytes, size_t *total_bytes) {
+    if (!free_bytes || !total_bytes || !hipMemGetInfo) return -1;
+    hipError_t err = hipMemGetInfo(free_bytes, total_bytes);
+    return err == hipSuccess ? 0 : -1;
+}
 
-    /* DiT weights */
+void hip_trellis2_unload_dit(hip_trellis2_runner *r) {
+    if (!r) return;
     free_hip(&r->dit_input.w); free_hip(&r->dit_input.b);
     free_hip(&r->dit_t_fc1.w); free_hip(&r->dit_t_fc1.b);
     free_hip(&r->dit_t_fc2.w); free_hip(&r->dit_t_fc2.b);
@@ -946,19 +1347,105 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
         free_hip(&r->ca_V_cache[i]);
     }
 
-    /* Activation buffers */
     free_hip(&r->d_h); free_hip(&r->d_ln_h); free_hip(&r->d_qkv);
     free_hip(&r->d_Q); free_hip(&r->d_K); free_hip(&r->d_V);
     free_hip(&r->d_ca_Q); free_hip(&r->d_attn_out); free_hip(&r->d_mlp_mid);
     free_hip(&r->d_t_emb); free_hip(&r->d_t_silu);
     free_hip(&r->d_ada_out); free_hip(&r->d_mod); free_hip(&r->d_mod_base);
     free_hip(&r->d_noise); free_hip(&r->d_vel); free_hip(&r->d_cond);
+    r->ca_kv_valid = 0;
+}
 
-    /* Decoder */
+void hip_trellis2_unload_decoder(hip_trellis2_runner *r) {
+    if (!r) return;
+    free_hip(&r->dec_input.conv_w); free_hip(&r->dec_input.conv_b);
+    for (int i = 0; i < 2; i++) {
+        t2_dec_layer *L = &r->dec_mid[i];
+        free_hip(&L->conv_w); free_hip(&L->conv_b);
+        free_hip(&L->rb_ln1_w); free_hip(&L->rb_ln1_b);
+        free_hip(&L->rb_c1_w); free_hip(&L->rb_c1_b);
+        free_hip(&L->rb_ln2_w); free_hip(&L->rb_ln2_b);
+        free_hip(&L->rb_c2_w); free_hip(&L->rb_c2_b);
+    }
+    t2_dec_layer *groups[3] = { r->dec_res16, r->dec_res32, r->dec_res64 };
+    for (int g = 0; g < 3; g++) for (int i = 0; i < 2; i++) {
+        t2_dec_layer *L = &groups[g][i];
+        free_hip(&L->conv_w); free_hip(&L->conv_b);
+        free_hip(&L->rb_ln1_w); free_hip(&L->rb_ln1_b);
+        free_hip(&L->rb_c1_w); free_hip(&L->rb_c1_b);
+        free_hip(&L->rb_ln2_w); free_hip(&L->rb_ln2_b);
+        free_hip(&L->rb_c2_w); free_hip(&L->rb_c2_b);
+    }
+    free_hip(&r->dec_up1_w); free_hip(&r->dec_up1_b);
+    free_hip(&r->dec_up2_w); free_hip(&r->dec_up2_b);
+    free_hip(&r->dec_out_ln_w); free_hip(&r->dec_out_ln_b);
+    free_hip(&r->dec_out_w); free_hip(&r->dec_out_b);
     for (int i = 0; i < 4; i++) free_hip(&r->d_dec[i]);
+    r->dec_loaded = 0;
+}
+
+void hip_trellis2_unload_slat_dit(hip_trellis2_runner *r) {
+    if (!r || !r->slat_loaded) return;
+    free_hip(&r->slat_input.w); free_hip(&r->slat_input.b);
+    free_hip(&r->slat_t_fc1.w); free_hip(&r->slat_t_fc1.b);
+    free_hip(&r->slat_t_fc2.w); free_hip(&r->slat_t_fc2.b);
+    free_hip(&r->slat_ada_mod.w); free_hip(&r->slat_ada_mod.b);
+    free_hip(&r->slat_out.w); free_hip(&r->slat_out.b);
+    for (int i = 0; i < DIT_DEPTH; i++) {
+        t2_block_gpu *b = &r->slat_blocks[i];
+        free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.w_bf16); free_hip(&b->sa_qkv.b);
+        free_wt_int8_extra(&b->sa_qkv);
+        free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
+        free_hip(&b->sa_out.w); free_hip(&b->sa_out.w_bf16); free_hip(&b->sa_out.b);
+        free_wt_int8_extra(&b->sa_out);
+        free_hip(&b->norm2_w); free_hip(&b->norm2_b);
+        free_hip(&b->ca_q.w); free_hip(&b->ca_q.w_bf16); free_hip(&b->ca_q.b);
+        free_wt_int8_extra(&b->ca_q);
+        free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
+        free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.w_bf16); free_hip(&b->ca_kv.b);
+        free_wt_int8_extra(&b->ca_kv);
+        free_hip(&b->ca_out.w); free_hip(&b->ca_out.w_bf16); free_hip(&b->ca_out.b);
+        free_wt_int8_extra(&b->ca_out);
+        free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.w_bf16); free_hip(&b->mlp_fc1.b);
+        free_wt_int8_extra(&b->mlp_fc1);
+        free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.w_bf16); free_hip(&b->mlp_fc2.b);
+        free_wt_int8_extra(&b->mlp_fc2);
+        free_hip(&b->mod_bias);
+        free_hip(&r->slat_ca_K_cache[i]);
+        free_hip(&r->slat_ca_V_cache[i]);
+    }
+    free_hip(&r->d_slat_rope_cos); free_hip(&r->d_slat_rope_sin);
+    free_hip(&r->d_slat_h); free_hip(&r->d_slat_ln_h); free_hip(&r->d_slat_qkv);
+    free_hip(&r->d_slat_Q); free_hip(&r->d_slat_K); free_hip(&r->d_slat_V);
+    free_hip(&r->d_slat_ca_Q); free_hip(&r->d_slat_attn_out); free_hip(&r->d_slat_mlp_mid);
+    free_hip(&r->d_slat_x_in); free_hip(&r->d_slat_vel_out); free_hip(&r->d_slat_cond);
+    free_hip(&r->d_slat_t_emb); free_hip(&r->d_slat_t_silu);
+    free_hip(&r->d_slat_mod_base); free_hip(&r->d_slat_mod);
+    r->slat_loaded = 0;
+    r->use_slat_int8 = 0;
+    r->slat_ca_kv_valid = 0;
+}
+
+void hip_trellis2_free(hip_trellis2_runner *r) {
+    if (!r) return;
+
+    /* Drain any pending GPU work — the PBR sample / colored-OBJ path leaves
+     * kernels on auxiliary streams, and tearing down hipBLASLt while they
+     * complete surfaces as an "illegal memory access" inside hipblaslt.cpp
+     * (catch site is internal, not ours). Sync first to keep the error
+     * surface at the call site that actually faulted, not at teardown. */
+    hipDeviceSynchronize();
+
+    t2_slat_calib_dump(r);
+    t2_tex_calib_dump(r);
+
+    hip_trellis2_unload_dit(r);
+    hip_trellis2_unload_decoder(r);
 
     /* hipBLASLt cleanup */
     if (r->d_act_bf16) { hipFree(r->d_act_bf16); r->d_act_bf16 = NULL; }
+    free_hip(&r->d_xq_int8);
+    free_hip((void **)&r->d_x_iscale);
     if (r->use_blaslt) { mm_blaslt_destroy(); r->use_blaslt = 0; }
 
     if (r->mod) hipModuleUnload(r->mod);
@@ -969,6 +1456,18 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
     if (r->shape_dec_mod) { hipModuleUnload(r->shape_dec_mod); r->shape_dec_mod = NULL; }
     if (r->shape_dec_stream) { hipStreamDestroy(r->shape_dec_stream); r->shape_dec_stream = NULL; }
 
+    /* Tex decoder cleanup. */
+    if (r->tex_dec_ctx) { hip_shape_dec_ctx_free(r->tex_dec_ctx); r->tex_dec_ctx = NULL; }
+    if (r->tex_dec)     { t2_shape_dec_free(r->tex_dec); r->tex_dec = NULL; }
+    if (r->tex_dec_mod) { hipModuleUnload(r->tex_dec_mod); r->tex_dec_mod = NULL; }
+    if (r->tex_dec_stream) { hipStreamDestroy(r->tex_dec_stream); r->tex_dec_stream = NULL; }
+
+    /* Per-stage subdiv arrays shared between shape_dec and tex_dec. */
+    if (r->subdiv_cache_valid) {
+        hip_shape_dec_cache_free(&r->subdiv_cache);
+        r->subdiv_cache_valid = 0;
+    }
+
     /* SLAT DiT cleanup */
     if (r->slat_loaded) {
         free_hip(&r->slat_input.w); free_hip(&r->slat_input.b);
@@ -978,16 +1477,23 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
         free_hip(&r->slat_out.w); free_hip(&r->slat_out.b);
         for (int i = 0; i < DIT_DEPTH; i++) {
             t2_block_gpu *b = &r->slat_blocks[i];
-            free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.b);
+            free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.w_bf16); free_hip(&b->sa_qkv.b);
+            free_wt_int8_extra(&b->sa_qkv);
             free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
-            free_hip(&b->sa_out.w); free_hip(&b->sa_out.b);
+            free_hip(&b->sa_out.w); free_hip(&b->sa_out.w_bf16); free_hip(&b->sa_out.b);
+            free_wt_int8_extra(&b->sa_out);
             free_hip(&b->norm2_w); free_hip(&b->norm2_b);
-            free_hip(&b->ca_q.w); free_hip(&b->ca_q.b);
+            free_hip(&b->ca_q.w); free_hip(&b->ca_q.w_bf16); free_hip(&b->ca_q.b);
+            free_wt_int8_extra(&b->ca_q);
             free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
-            free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.b);
-            free_hip(&b->ca_out.w); free_hip(&b->ca_out.b);
-            free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.b);
-            free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.b);
+            free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.w_bf16); free_hip(&b->ca_kv.b);
+            free_wt_int8_extra(&b->ca_kv);
+            free_hip(&b->ca_out.w); free_hip(&b->ca_out.w_bf16); free_hip(&b->ca_out.b);
+            free_wt_int8_extra(&b->ca_out);
+            free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.w_bf16); free_hip(&b->mlp_fc1.b);
+            free_wt_int8_extra(&b->mlp_fc1);
+            free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.w_bf16); free_hip(&b->mlp_fc2.b);
+            free_wt_int8_extra(&b->mlp_fc2);
             free_hip(&b->mod_bias);
             free_hip(&r->slat_ca_K_cache[i]);
             free_hip(&r->slat_ca_V_cache[i]);
@@ -999,6 +1505,54 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
         free_hip(&r->d_slat_x_in); free_hip(&r->d_slat_vel_out); free_hip(&r->d_slat_cond);
         free_hip(&r->d_slat_t_emb); free_hip(&r->d_slat_t_silu);
         free_hip(&r->d_slat_mod_base); free_hip(&r->d_slat_mod);
+    }
+
+    /* Tex DiT cleanup */
+    if (r->tex_loaded) {
+        free_hip(&r->tex_input.w); free_hip(&r->tex_input.b);
+        free_hip(&r->tex_t_fc1.w); free_hip(&r->tex_t_fc1.b);
+        free_hip(&r->tex_t_fc2.w); free_hip(&r->tex_t_fc2.b);
+        free_hip(&r->tex_ada_mod.w); free_hip(&r->tex_ada_mod.b);
+        free_hip(&r->tex_out.w); free_hip(&r->tex_out.b);
+        for (int i = 0; i < DIT_DEPTH; i++) {
+            t2_block_gpu *b = &r->tex_blocks[i];
+            free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.w_bf16); free_hip(&b->sa_qkv.b);
+            free_wt_int8_extra(&b->sa_qkv);
+            free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
+            free_hip(&b->sa_out.w); free_hip(&b->sa_out.w_bf16); free_hip(&b->sa_out.b);
+            free_wt_int8_extra(&b->sa_out);
+            free_hip(&b->norm2_w); free_hip(&b->norm2_b);
+            free_hip(&b->ca_q.w); free_hip(&b->ca_q.w_bf16); free_hip(&b->ca_q.b);
+            free_wt_int8_extra(&b->ca_q);
+            free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
+            free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.w_bf16); free_hip(&b->ca_kv.b);
+            free_wt_int8_extra(&b->ca_kv);
+            free_hip(&b->ca_out.w); free_hip(&b->ca_out.w_bf16); free_hip(&b->ca_out.b);
+            free_wt_int8_extra(&b->ca_out);
+            free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.w_bf16); free_hip(&b->mlp_fc1.b);
+            free_wt_int8_extra(&b->mlp_fc1);
+            free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.w_bf16); free_hip(&b->mlp_fc2.b);
+            free_wt_int8_extra(&b->mlp_fc2);
+            free_hip(&b->mod_bias);
+            free_hip(&r->tex_ca_K_cache[i]);
+            free_hip(&r->tex_ca_V_cache[i]);
+        }
+        free_hip(&r->d_tex_rope_cos); free_hip(&r->d_tex_rope_sin);
+        free_hip(&r->d_tex_h); free_hip(&r->d_tex_ln_h); free_hip(&r->d_tex_qkv);
+        free_hip(&r->d_tex_Q); free_hip(&r->d_tex_K); free_hip(&r->d_tex_V);
+        free_hip(&r->d_tex_ca_Q); free_hip(&r->d_tex_attn_out); free_hip(&r->d_tex_mlp_mid);
+        free_hip(&r->d_tex_x_in); free_hip(&r->d_tex_vel_out); free_hip(&r->d_tex_cond);
+        free_hip(&r->d_tex_t_emb); free_hip(&r->d_tex_t_silu);
+        free_hip(&r->d_tex_mod_base); free_hip(&r->d_tex_mod);
+    }
+
+    for (int idx = 0; idx < DIT_DEPTH * T2_TEX_I8_PER_BLOCK; idx++) {
+        free_hip((void **)&r->tex_calib_amax[idx]);
+        r->tex_calib_nin[idx] = 0;
+    }
+    for (int idx = 0; idx < DIT_DEPTH * T2_SLAT_I8_PER_BLOCK; idx++) {
+        free_hip((void **)&r->slat_calib_amax[idx]);
+        r->slat_calib_nin[idx] = 0;
     }
 
     free(r);
@@ -1111,6 +1665,10 @@ int hip_trellis2_load_dit(hip_trellis2_runner *r, const char *path) {
     r->ca_kv_valid = 0;
     fprintf(stderr, "T2-HIP: DiT loaded (%d blocks, RoPE %d freqs)\n",
             DIT_DEPTH, r->n_rope_freqs);
+    if (r->use_fp8)
+        fprintf(stderr, "T2-HIP: NOTE FP8 SS DiT GEMM is ~3x slower than bf16 here "
+                "(unoptimized FP8 WMMA, ~2069 vs ~689 ms/step); bf16 SS DiT (2.6 GB) fits "
+                "16 GB and is the recommended default. Use FP8 only when memory-constrained.\n");
     return 0;
 }
 
@@ -1391,8 +1949,12 @@ static void run_flash_sa(hip_trellis2_runner *r, void *out, void *out_bf16,
     void *args[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim};
     void *args_bc32[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim, &out_bf16,
                          &qkv_stride};
-    if (r->use_wmma && r->fn_flash_sa_wmma_b16_db && head_dim == 128 && (N % 64) == 0) {
-        hipModuleLaunchKernel(r->fn_flash_sa_wmma_b16_db, n_heads, N / 64, 1, 128, 1, 1,
+    /* WMMA SA kernels: b16_db and bc32_v2 mask both Q-load (qi<N), K/V-load
+     * (kvi<N), softmax logits (kvi_col>=N → -inf), and output write (qi<N), so
+     * they accept any N. Round grid up to ceil(N/64); pad rows are no-ops. */
+    int gY64 = (N + 63) / 64;
+    if (r->use_wmma && r->fn_flash_sa_wmma_b16_db && head_dim == 128) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_b16_db, n_heads, gY64, 1, 128, 1, 1,
                               0, 0, args, NULL);
         return;
     }
@@ -1401,8 +1963,8 @@ static void run_flash_sa(hip_trellis2_runner *r, void *out, void *out_bf16,
                               0, 0, args, NULL);
         return;
     }
-    if (r->use_wmma && r->fn_flash_sa_wmma_bc32_v2 && head_dim == 128 && (N % 64) == 0) {
-        hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32_v2, n_heads, N / 64, 1, 128, 1, 1,
+    if (r->use_wmma && r->fn_flash_sa_wmma_bc32_v2 && head_dim == 128) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32_v2, n_heads, gY64, 1, 128, 1, 1,
                               0, 0, args_bc32, NULL);
         return;
     }
@@ -1433,8 +1995,12 @@ static void run_cross_attn(hip_trellis2_runner *r, void *out, void *out_bf16,
     int head_dim = DIT_HEAD_DIM;
     void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale};
     void *args_bc32[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale, &out_bf16};
-    if (r->use_wmma && r->fn_cross_attn_wmma_bc32_v2 && head_dim == 128 && (q_len % 64) == 0) {
-        hipModuleLaunchKernel(r->fn_cross_attn_wmma_bc32_v2, n_heads, q_len / 64, 1, 128, 1, 1,
+    /* cross_attn_wmma_bc32_v2 masks Q-load (qi<q_len) and output write
+     * (qi<q_len); KV-tile masking via (kvi<kv_len) handles arbitrary kv_len.
+     * Round grid up to ceil(q_len/64); pad rows are no-ops. */
+    int gY64 = (q_len + 63) / 64;
+    if (r->use_wmma && r->fn_cross_attn_wmma_bc32_v2 && head_dim == 128) {
+        hipModuleLaunchKernel(r->fn_cross_attn_wmma_bc32_v2, n_heads, gY64, 1, 128, 1, 1,
                               0, 0, args_bc32, NULL);
         return;
     }
@@ -1595,8 +2161,29 @@ int hip_trellis2_decode(hip_trellis2_runner *r, const float *latent, float *occu
 /* DiT forward                                                            */
 /* ======================================================================== */
 
+/* Coarse SS-DiT profiler: T2_DIT_PROF=1 prints per-section wall time
+ * (sync'd) accumulated across the 30 blocks. */
+static double t2_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+static int g_dit_prof = -1;
+static double g_dit_t_sa, g_dit_t_ca, g_dit_t_mlp, g_dit_t_kv, g_dit_t_io;
+/* Finer SLAT/tex breakdown (T2_DIT_PROF=1). */
+static double g_slat_t_sagemm, g_slat_t_saflash, g_slat_t_samisc,
+              g_slat_t_ca, g_slat_t_mlp, g_slat_t_kv, g_slat_t_io;
+#define DITPROF_SYNC() do { if (g_dit_prof) hipDeviceSynchronize(); } while (0)
+#define DITPROF_T()    (g_dit_prof ? t2_now_ms() : 0.0)
+#define SLATPROF_ADD(acc) do { if (g_dit_prof) { hipDeviceSynchronize(); (acc) += t2_now_ms() - _pt; _pt = t2_now_ms(); } } while (0)
+
 static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump_block) {
     if (!r->dit_loaded) { fprintf(stderr, "T2-HIP: DiT not loaded\n"); return -1; }
+    if (g_dit_prof < 0) {
+        const char *e = getenv("T2_DIT_PROF");
+        g_dit_prof = (e && atoi(e)) ? 1 : 0;
+    }
+    if (g_dit_prof) { g_dit_t_sa = g_dit_t_ca = g_dit_t_mlp = g_dit_t_kv = g_dit_t_io = 0; }
+    double _t0;
 
     /* ---- Input embedding: [n_tok, IN_CH] × [DIT_DIM, IN_CH]^T -> [n_tok, DIT_DIM] ---- */
     gemm(r, r->d_h, &r->dit_input, r->d_noise,
@@ -1616,6 +2203,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
          r->dit_t_fc2.b, DIT_DIM, DIT_DIM, 1);
 
     /* ---- Precompute cross-attention KV cache if not valid ---- */
+    DITPROF_SYNC(); _t0 = DITPROF_T();
     if (!r->ca_kv_valid) {
         if (r->verbose) fprintf(stderr, "T2-HIP: building CA KV cache (%d tokens)...\n", cond_len);
         for (int bi = 0; bi < DIT_DEPTH; bi++) {
@@ -1642,6 +2230,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         r->ca_kv_len = cond_len;
         if (r->verbose) fprintf(stderr, "T2-HIP: CA KV cache built\n");
     }
+    DITPROF_SYNC(); g_dit_t_kv += DITPROF_T() - _t0;
 
     /* ---- Per-block forward ---- */
     /* Pointer arithmetic helpers into d_ada_out/d_mod:
@@ -1709,6 +2298,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         }
 
         /* ---- Self-attention ---- */
+        DITPROF_SYNC(); _t0 = DITPROF_T();
         /* adaLN -> d_ln_h (and BF16 copy to scratch when fusion eligible) */
         if (norm_fuse_gate && r->use_blaslt && b->sa_qkv.w_bf16 && n_tok >= 8) {
             run_adaln_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
@@ -1804,8 +2394,10 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         /* Gated residual: d_h += gate_sa * d_ln_h */
         run_gated_add(r, r->d_h, r->d_ln_h, gate_sa, n_tok, DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_sa, r->d_h, (size_t)n_tok * DIT_DIM);
+        DITPROF_SYNC(); g_dit_t_sa += DITPROF_T() - _t0;
 
         /* ---- Cross-attention ---- */
+        DITPROF_SYNC(); _t0 = DITPROF_T();
         /* norm2 -> d_ln_h (with optional fused BF16 pack into scratch) */
         if (norm_fuse_gate && r->use_blaslt && b->ca_q.w_bf16 && n_tok >= 8) {
             run_layernorm_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
@@ -1849,8 +2441,10 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         /* Direct residual (no gate in cross-attn) — folded into GEMM when fused */
         if (!ca_res_fuse) run_residual_add(r, r->d_h, r->d_ln_h, n_tok * DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_ca, r->d_h, (size_t)n_tok * DIT_DIM);
+        DITPROF_SYNC(); g_dit_t_ca += DITPROF_T() - _t0;
 
         /* ---- MLP ---- */
+        DITPROF_SYNC(); _t0 = DITPROF_T();
         /* adaLN (scale2/shift2) -> d_ln_h (with optional fused BF16 pack) */
         if (norm_fuse_gate && r->use_blaslt && b->mlp_fc1.w_bf16 && n_tok >= 8) {
             run_adaln_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
@@ -1884,6 +2478,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         /* Gated residual: d_h += gate_mlp * d_ln_h */
         run_gated_add(r, r->d_h, r->d_ln_h, gate_mlp, n_tok, DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_mlp, r->d_h, (size_t)n_tok * DIT_DIM);
+        DITPROF_SYNC(); g_dit_t_mlp += DITPROF_T() - _t0;
 
         /* Optional block dump */
         if (dump_block == bi) {
@@ -1893,12 +2488,21 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
     }
 
     /* ---- Final LayerNorm (no affine) ---- */
+    DITPROF_SYNC(); _t0 = DITPROF_T();
     run_ln_noaffine(r, r->d_ln_h, r->d_h, n_tok, DIT_DIM);
 
     /* ---- Output projection: [n_tok, DIT_DIM] × [DIT_IN_CH, DIT_DIM]^T ---- */
     gemm(r, r->d_vel, &r->dit_out, r->d_ln_h, r->dit_out.b, DIT_IN_CH, DIT_DIM, n_tok);
 
     hipDeviceSynchronize();
+    if (g_dit_prof) {
+        g_dit_t_io += t2_now_ms() - _t0;
+        double tot = g_dit_t_kv + g_dit_t_sa + g_dit_t_ca + g_dit_t_mlp + g_dit_t_io;
+        fprintf(stderr, "T2-DIT-PROF: kv=%.1f sa=%.1f ca=%.1f mlp=%.1f io=%.1f total=%.1f ms "
+                "(%d blocks, n_tok=%d)\n",
+                g_dit_t_kv, g_dit_t_sa, g_dit_t_ca, g_dit_t_mlp, g_dit_t_io, tot,
+                DIT_DEPTH, n_tok);
+    }
     return DIT_DEPTH;  /* completed all blocks */
 }
 
@@ -2044,6 +2648,9 @@ int hip_trellis2_load_shape_dec(hip_trellis2_runner *r, const char *safetensors_
         fprintf(stderr, "T2-HIP: hip_shape_dec_ctx_create failed\n");
         return -1;
     }
+    /* Always capture per-stage subdiv arrays — tex_dec needs them as a guide
+     * (it has no to_subdiv head of its own). Small host buffers, ~MBs total. */
+    hip_shape_dec_set_capture(r->shape_dec_ctx, 1);
     return 0;
 }
 
@@ -2060,6 +2667,21 @@ int hip_trellis2_run_shape_dec(hip_trellis2_runner *r,
     int rc = hip_shape_dec_forward(r->shape_dec_ctx, slat_feats, coords, N, slat_C,
                                     &d_feats, &d_coords, &Nf);
     if (rc != 0 || Nf <= 0) return -1;
+
+    /* Pull per-stage subdiv arrays for the downstream tex_dec guide. */
+    if (r->subdiv_cache_valid) {
+        hip_shape_dec_cache_free(&r->subdiv_cache);
+        r->subdiv_cache_valid = 0;
+    }
+    if (hip_shape_dec_take_cache(r->shape_dec_ctx, &r->subdiv_cache) == 0) {
+        r->subdiv_cache_valid = 1;
+        if (r->verbose) {
+            fprintf(stderr, "T2-HIP: captured shape_dec subdiv cache:");
+            for (int s = 0; s < r->subdiv_cache.n_stages; s++)
+                fprintf(stderr, " s%d=%d", s, r->subdiv_cache.gN[s]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     if (r->shape_dec_stream) hipStreamSynchronize(r->shape_dec_stream);
     int out_ch = r->shape_dec->out_channels;
@@ -2125,6 +2747,94 @@ void hip_trellis2_shape_dec_mesh_free(hip_trellis2_mesh *m) {
     m->vertices = NULL; m->triangles = NULL; m->n_verts = 0; m->n_tris = 0;
 }
 
+/* ---- Tex decoder ---------------------------------------------------------
+ * Same 4-stage hierarchical sparse architecture as shape_dec, but trained for
+ * texture / PBR output (out_channels typically 6: albedo RGB + metallic +
+ * roughness + AO, or similar — final per-voxel channel count is taken from
+ * the checkpoint). Loaded into a separate runner slot so both decoders can
+ * coexist if the caller needs them at the same time. */
+
+int hip_trellis2_load_tex_dec(hip_trellis2_runner *r, const char *safetensors_path) {
+    if (!r) return -1;
+    if (r->tex_dec_ctx) {
+        fprintf(stderr, "T2-HIP: tex_dec already loaded\n");
+        return 0;
+    }
+    fprintf(stderr, "T2-HIP: loading tex_dec weights: %s\n", safetensors_path);
+    r->tex_dec = t2_shape_dec_load(safetensors_path);
+    if (!r->tex_dec) {
+        fprintf(stderr, "T2-HIP: t2_shape_dec_load (tex_dec) failed\n");
+        return -1;
+    }
+    if (hip_compile_kernels(&r->tex_dec_mod, r->device_id,
+                            hip_tex_dec_kernels_src, "tex_dec",
+                            r->verbose, "T2-HIP-TEX") <= 0) {
+        fprintf(stderr, "T2-HIP: tex_dec kernel compile failed\n");
+        t2_shape_dec_free(r->tex_dec); r->tex_dec = NULL;
+        return -1;
+    }
+    if (hipStreamCreateWithFlags(&r->tex_dec_stream, hipStreamNonBlocking) != hipSuccess) {
+        r->tex_dec_stream = NULL;
+    }
+    r->tex_dec_ctx = hip_shape_dec_ctx_create(r->tex_dec_mod, r->tex_dec_stream,
+                                               r->tex_dec, r->verbose);
+    if (!r->tex_dec_ctx) {
+        fprintf(stderr, "T2-HIP: hip_shape_dec_ctx_create (tex_dec) failed\n");
+        return -1;
+    }
+    fprintf(stderr, "T2-HIP: tex_dec loaded (out_channels=%d)\n",
+            r->tex_dec->out_channels);
+    return 0;
+}
+
+void hip_trellis2_unload_tex_dec(hip_trellis2_runner *r) {
+    if (!r) return;
+    if (r->tex_dec_ctx) { hip_shape_dec_ctx_free(r->tex_dec_ctx); r->tex_dec_ctx = NULL; }
+    if (r->tex_dec)     { t2_shape_dec_free(r->tex_dec); r->tex_dec = NULL; }
+    if (r->tex_dec_mod) { hipModuleUnload(r->tex_dec_mod); r->tex_dec_mod = NULL; }
+    if (r->tex_dec_stream) { hipStreamDestroy(r->tex_dec_stream); r->tex_dec_stream = NULL; }
+}
+
+int hip_trellis2_run_tex_dec(hip_trellis2_runner *r,
+                             const float *slat_feats,
+                             const int32_t *coords,
+                             int N, int slat_C,
+                             float **out_feats,
+                             int32_t **out_coords,
+                             int *out_N)
+{
+    if (!r || !r->tex_dec_ctx || !out_feats || !out_coords || !out_N) return -1;
+    *out_feats = NULL; *out_coords = NULL; *out_N = 0;
+
+    float *d_feats = NULL; int32_t *d_coords = NULL; int Nf = 0;
+    /* tex_dec has no to_subdiv head — drive its c2s with the per-stage
+     * subdivision arrays captured from the most recent shape_dec run. */
+    const hip_shape_dec_cache *cache =
+        r->subdiv_cache_valid ? &r->subdiv_cache : NULL;
+    if (!cache) {
+        fprintf(stderr, "T2-HIP: tex_dec needs shape_dec subdiv cache but none "
+                        "is available — run shape_dec first\n");
+        return -1;
+    }
+    int rc = hip_shape_dec_forward_ex(r->tex_dec_ctx, slat_feats, coords,
+                                       N, slat_C, cache,
+                                       &d_feats, &d_coords, &Nf);
+    if (rc != 0 || Nf <= 0) return -1;
+
+    if (r->tex_dec_stream) hipStreamSynchronize(r->tex_dec_stream);
+    int out_ch = r->tex_dec->out_channels;
+    float   *h_feats  = (float *)  malloc((size_t)Nf * out_ch * sizeof(float));
+    int32_t *h_coords = (int32_t *)malloc((size_t)Nf * 4      * sizeof(int32_t));
+    hipMemcpy(h_feats,  d_feats,  (size_t)Nf * out_ch * sizeof(float),   hipMemcpyDeviceToHost);
+    hipMemcpy(h_coords, d_coords, (size_t)Nf * 4      * sizeof(int32_t), hipMemcpyDeviceToHost);
+    hipFree(d_feats); hipFree(d_coords);
+
+    *out_feats  = h_feats;
+    *out_coords = h_coords;
+    *out_N      = Nf;
+    return 0;
+}
+
 /* ============================================================================
  * SLAT (Sparse-Latent) DiT — Phase 2 of #12
  *
@@ -2175,6 +2885,7 @@ static void slat_compute_rope_host(const int32_t *coords, int N,
 int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
     if (!r) return -1;
     fprintf(stderr, "T2-HIP: loading SLAT DiT weights: %s\n", path);
+    r->use_slat_int8 = 0;
     st_context *st = safetensors_open(path);
     if (!st) { fprintf(stderr, "T2-HIP: failed to open %s\n", path); return -1; }
     int v = r->verbose;
@@ -2203,41 +2914,63 @@ int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
         return -1;
     }
 
+    int slat_i8_probe = safetensors_find(st, "blocks.0.self_attn.to_qkv.weight");
+    int slat_i8 = slat_i8_probe >= 0 && t2_dtype_is_i8(safetensors_dtype(st, slat_i8_probe));
+    if (slat_i8) {
+        if (!r->fn_quant_act_int8 || !r->fn_gemm_w8a8) {
+            fprintf(stderr, "T2-HIP: SLAT DiT INT8 weights require W8A8 kernels\n");
+            safetensors_close(st);
+            return -1;
+        }
+        int has_smooth = safetensors_find(st, "blocks.0.self_attn.to_qkv.smooth_scale") >= 0;
+        fprintf(stderr, "T2-HIP: SLAT DiT INT8 W8A8 enabled%s%s\n",
+                has_smooth ? " (SmoothQuant)" : "",
+                r->fn_gemm_w8a8_pgr2 ? " [pgr2 pipelined WMMA — ~bf16 speed, half memory]" : "");
+    }
+
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
         char name[128];
         t2_block_gpu *b = &r->slat_blocks[bi];
         memset(b, 0, sizeof(*b));
         #define SBN(n) (snprintf(name,sizeof(name),"blocks.%d.%s",bi,n), name)
 
-        b->sa_qkv.w  = st_upload_f32(st, SBN("self_attn.to_qkv.weight"), v);
+        /* Per-block large GEMM weights: prefer BF16-raw upload so the gemm()
+         * hipBLASLt path activates. SLAT N is variable but hipBLASLt doesn't
+         * require N%64; the SS-DiT WMMA bc32 fast-paths do, hipBLASLt does not. */
+        st_upload_wt_i8_pref(st, SBN("self_attn.to_qkv.weight"), r->use_blaslt, &b->sa_qkv, v);
         b->sa_qkv.b  = st_upload_f32(st, SBN("self_attn.to_qkv.bias"),   v);
-        b->sa_qkv.scale = -1.0f;
         b->sa_q_norm = st_upload_f32(st, SBN("self_attn.q_rms_norm.gamma"), v);
         b->sa_k_norm = st_upload_f32(st, SBN("self_attn.k_rms_norm.gamma"), v);
-        b->sa_out.w  = st_upload_f32(st, SBN("self_attn.to_out.weight"), v);
+        st_upload_wt_i8_pref(st, SBN("self_attn.to_out.weight"), r->use_blaslt, &b->sa_out, v);
         b->sa_out.b  = st_upload_f32(st, SBN("self_attn.to_out.bias"),   v);
-        b->sa_out.scale = -1.0f;
 
         b->norm2_w   = st_upload_f32(st, SBN("norm2.weight"), v);
         b->norm2_b   = st_upload_f32(st, SBN("norm2.bias"),   v);
-        b->ca_q.w    = st_upload_f32(st, SBN("cross_attn.to_q.weight"), v);
+        st_upload_wt_i8_pref(st, SBN("cross_attn.to_q.weight"), r->use_blaslt, &b->ca_q, v);
         b->ca_q.b    = st_upload_f32(st, SBN("cross_attn.to_q.bias"),   v);
-        b->ca_q.scale = -1.0f;
         b->ca_q_norm = st_upload_f32(st, SBN("cross_attn.q_rms_norm.gamma"), v);
         b->ca_k_norm = st_upload_f32(st, SBN("cross_attn.k_rms_norm.gamma"), v);
-        b->ca_kv.w   = st_upload_f32(st, SBN("cross_attn.to_kv.weight"), v);
+        st_upload_wt_i8_pref(st, SBN("cross_attn.to_kv.weight"), r->use_blaslt, &b->ca_kv, v);
         b->ca_kv.b   = st_upload_f32(st, SBN("cross_attn.to_kv.bias"),   v);
-        b->ca_kv.scale = -1.0f;
-        b->ca_out.w  = st_upload_f32(st, SBN("cross_attn.to_out.weight"), v);
+        st_upload_wt_i8_pref(st, SBN("cross_attn.to_out.weight"), r->use_blaslt, &b->ca_out, v);
         b->ca_out.b  = st_upload_f32(st, SBN("cross_attn.to_out.bias"),   v);
-        b->ca_out.scale = -1.0f;
 
-        b->mlp_fc1.w = st_upload_f32(st, SBN("mlp.mlp.0.weight"), v);
+        st_upload_wt_i8_pref(st, SBN("mlp.mlp.0.weight"), r->use_blaslt, &b->mlp_fc1, v);
         b->mlp_fc1.b = st_upload_f32(st, SBN("mlp.mlp.0.bias"),   v);
-        b->mlp_fc1.scale = -1.0f;
-        b->mlp_fc2.w = st_upload_f32(st, SBN("mlp.mlp.2.weight"), v);
+        st_upload_wt_i8_pref(st, SBN("mlp.mlp.2.weight"), r->use_blaslt, &b->mlp_fc2, v);
         b->mlp_fc2.b = st_upload_f32(st, SBN("mlp.mlp.2.bias"),   v);
-        b->mlp_fc2.scale = -1.0f;
+
+        t2_wt *i8_wts[7] = { &b->sa_qkv, &b->sa_out, &b->ca_q, &b->ca_kv,
+                             &b->ca_out, &b->mlp_fc1, &b->mlp_fc2 };
+        for (int wi = 0; wi < 7; wi++) {
+            if (i8_wts[wi]->is_int8) {
+                r->use_slat_int8 = 1;
+                if (!i8_wts[wi]->i8_wscale) {
+                    safetensors_close(st);
+                    return -1;
+                }
+            }
+        }
 
         b->mod_bias  = st_upload_f32(st, SBN("modulation"), v);
         #undef SBN
@@ -2255,8 +2988,10 @@ int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
     hipMalloc(&r->d_slat_mod_base, 6 * DIT_DIM * sizeof(float));
     hipMalloc(&r->d_slat_mod,      6 * DIT_DIM * sizeof(float));
 
-    fprintf(stderr, "T2-HIP: SLAT DiT loaded (%d blocks, RoPE %d freqs/axis, F32)\n",
-            DIT_DEPTH, r->slat_n_freqs);
+    fprintf(stderr, "T2-HIP: SLAT DiT loaded (%d blocks, RoPE %d freqs/axis, %s)\n",
+            DIT_DEPTH, r->slat_n_freqs,
+            r->use_slat_int8 ? "INT8 W8A8 shape blocks" :
+            (r->use_blaslt ? "BF16+hipBLASLt" : "F32"));
     return 0;
 }
 
@@ -2333,6 +3068,10 @@ static int slat_ensure_cond_scratch(hip_trellis2_runner *r, int n_cond) {
  * everywhere; scalar attention so any N works. */
 static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
     if (!r->slat_loaded) { fprintf(stderr, "T2-HIP: SLAT DiT not loaded\n"); return -1; }
+    if (g_dit_prof < 0) { const char *e = getenv("T2_DIT_PROF"); g_dit_prof = (e && atoi(e)) ? 1 : 0; }
+    if (g_dit_prof) { g_slat_t_sagemm = g_slat_t_saflash = g_slat_t_samisc =
+                      g_slat_t_ca = g_slat_t_mlp = g_slat_t_kv = g_slat_t_io = 0; }
+    double _pt = DITPROF_T();
 
     /* Input embedding: x_t [N, 32] -> [N, DIT_DIM] */
     gemm(r, r->d_slat_h, &r->slat_input, r->d_slat_x_in,
@@ -2345,6 +3084,7 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
     void *d_t_out = r->d_slat_attn_out; /* repurpose scratch for FC2 output */
     gemm(r, d_t_out, &r->slat_t_fc2, r->d_slat_t_silu,
          r->slat_t_fc2.b, DIT_DIM, DIT_DIM, 1);
+    SLATPROF_ADD(g_slat_t_io);
 
     /* Rebuild cross-attn KV cache if needed */
     if (!r->slat_ca_kv_valid) {
@@ -2352,8 +3092,8 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
             t2_block_gpu *b = &r->slat_blocks[bi];
             /* ca_kv [n_cond, 2*DIT_DIM] using d_slat_qkv as temp (room for 3*DIT*N). */
             void *kv_tmp = r->d_slat_qkv;
-            gemm(r, kv_tmp, &b->ca_kv, r->d_slat_cond,
-                 b->ca_kv.b, 2 * DIT_DIM, DIT_COND_DIM, n_cond);
+            slat_gemm(r, kv_tmp, &b->ca_kv, r->d_slat_cond,
+                      b->ca_kv.b, 2 * DIT_DIM, DIT_COND_DIM, n_cond, bi, 3);
             void *K = r->slat_ca_K_cache[bi], *V = r->slat_ca_V_cache[bi];
             int M = n_cond, W = DIT_DIM;
             void *args[] = { &K, &V, &kv_tmp, &M, &W };
@@ -2366,6 +3106,7 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
         r->slat_ca_kv_valid = 1;
         r->slat_ca_kv_len   = n_cond;
     }
+    SLATPROF_ADD(g_slat_t_kv);
 
     /* Shared modulation: d_mod_base = silu(t_emb)*mod_w + mod_b */
     {
@@ -2380,6 +3121,7 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
                               DIT_DIM * sizeof(float), 0, args, NULL);
     }
 
+    SLATPROF_ADD(g_slat_t_io);
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
         t2_block_gpu *b = &r->slat_blocks[bi];
 
@@ -2403,9 +3145,11 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
         void *gate_mlp  = mod + 5 * DIT_DIM;
 
         /* ---- Self-attention ---- */
+        SLATPROF_ADD(g_slat_t_samisc);  /* per-block modulation */
         run_adaln(r, r->d_slat_ln_h, r->d_slat_h, shift_sa, scale_sa, N, DIT_DIM);
-        gemm(r, r->d_slat_qkv, &b->sa_qkv, r->d_slat_ln_h, b->sa_qkv.b,
-             3 * DIT_DIM, DIT_DIM, N);
+        slat_gemm(r, r->d_slat_qkv, &b->sa_qkv, r->d_slat_ln_h, b->sa_qkv.b,
+                  3 * DIT_DIM, DIT_DIM, N, bi, 0);
+        SLATPROF_ADD(g_slat_t_sagemm);  /* adaln folded + qkv proj */
 
         /* Split QKV */
         {
@@ -2432,60 +3176,59 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
             r->d_rope_cos = saved_cos; r->d_rope_sin = saved_sin;
             r->n_rope_freqs = saved_freqs;
         }
-        /* Scalar flash self-attn (any N). */
-        {
-            int n_heads = DIT_HEADS, head_dim = DIT_HEAD_DIM;
-            void *out = r->d_slat_attn_out;
-            void *Q = r->d_slat_Q, *K = r->d_slat_K, *V = r->d_slat_V;
-            int Nl = N;
-            void *args[] = { &out, &Q, &K, &V, &Nl, &n_heads, &head_dim };
-            int gY = (N + 3) / 4;
-            size_t smem = 2 * 16 * 128 * sizeof(float);
-            hipModuleLaunchKernel(r->fn_flash_sa, DIT_HEADS, gY, 1, 128, 1, 1,
-                                  smem, 0, args, NULL);
-        }
-        gemm(r, r->d_slat_ln_h, &b->sa_out, r->d_slat_attn_out, b->sa_out.b,
-             DIT_DIM, DIT_DIM, N);
+        /* WMMA flash self-attn — kernels (b16_db, bc32_v2) mask N internally
+         * so SLAT's variable N works without padding. Scalar fallback otherwise. */
+        SLATPROF_ADD(g_slat_t_samisc);  /* split, qk-rmsnorm, rope */
+        run_flash_sa(r, r->d_slat_attn_out, NULL,
+                     r->d_slat_Q, r->d_slat_K, r->d_slat_V, N, /*qkv_stride*/0);
+        SLATPROF_ADD(g_slat_t_saflash);
+        slat_gemm(r, r->d_slat_ln_h, &b->sa_out, r->d_slat_attn_out, b->sa_out.b,
+                  DIT_DIM, DIT_DIM, N, bi, 1);
         run_gated_add(r, r->d_slat_h, r->d_slat_ln_h, gate_sa, N, DIT_DIM);
+        SLATPROF_ADD(g_slat_t_sagemm);  /* out proj + gated add */
 
         /* ---- Cross-attention ---- */
         run_layernorm(r, r->d_slat_ln_h, r->d_slat_h, b->norm2_w, b->norm2_b, N, DIT_DIM);
-        gemm(r, r->d_slat_ca_Q, &b->ca_q, r->d_slat_ln_h, b->ca_q.b,
-             DIT_DIM, DIT_DIM, N);
+        slat_gemm(r, r->d_slat_ca_Q, &b->ca_q, r->d_slat_ln_h, b->ca_q.b,
+                  DIT_DIM, DIT_DIM, N, bi, 2);
         run_rms_norm_ph(r, r->d_slat_ca_Q, b->ca_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
-        /* Scalar cross-attn over cached K,V. */
-        {
-            float scale = 1.0f / sqrtf((float)DIT_HEAD_DIM);
-            int dim = DIT_DIM, n_heads = DIT_HEADS, head_dim = DIT_HEAD_DIM;
-            void *out = r->d_slat_attn_out;
-            void *Q = r->d_slat_ca_Q;
-            void *K = r->slat_ca_K_cache[bi], *V = r->slat_ca_V_cache[bi];
-            int q_len = N, kv_len = r->slat_ca_kv_len;
-            void *args[] = { &out, &Q, &K, &V, &q_len, &kv_len, &dim,
-                             &n_heads, &head_dim, &scale };
-            hipModuleLaunchKernel(r->fn_cross_attn, DIT_HEADS, q_len, 1, 128, 1, 1,
-                                  0, 0, args, NULL);
-        }
-        gemm(r, r->d_slat_ln_h, &b->ca_out, r->d_slat_attn_out, b->ca_out.b,
-             DIT_DIM, DIT_DIM, N);
+        /* WMMA cross-attn — bc32_v2 masks q_len internally. */
+        run_cross_attn(r, r->d_slat_attn_out, NULL,
+                       r->d_slat_ca_Q, r->slat_ca_K_cache[bi], r->slat_ca_V_cache[bi],
+                       N, r->slat_ca_kv_len);
+        slat_gemm(r, r->d_slat_ln_h, &b->ca_out, r->d_slat_attn_out, b->ca_out.b,
+                  DIT_DIM, DIT_DIM, N, bi, 4);
         /* No gate on cross-attn — direct residual */
         run_residual_add(r, r->d_slat_h, r->d_slat_ln_h, N * DIT_DIM);
+        SLATPROF_ADD(g_slat_t_ca);
 
         /* ---- MLP ---- */
         run_adaln(r, r->d_slat_ln_h, r->d_slat_h, shift_mlp, scale_mlp, N, DIT_DIM);
-        gemm(r, r->d_slat_mlp_mid, &b->mlp_fc1, r->d_slat_ln_h, b->mlp_fc1.b,
-             DIT_FFN, DIT_DIM, N);
+        slat_gemm(r, r->d_slat_mlp_mid, &b->mlp_fc1, r->d_slat_ln_h, b->mlp_fc1.b,
+                  DIT_FFN, DIT_DIM, N, bi, 5);
         run_gelu(r, r->d_slat_mlp_mid, N * DIT_FFN);
-        gemm(r, r->d_slat_ln_h, &b->mlp_fc2, r->d_slat_mlp_mid, b->mlp_fc2.b,
-             DIT_DIM, DIT_FFN, N);
+        slat_gemm(r, r->d_slat_ln_h, &b->mlp_fc2, r->d_slat_mlp_mid, b->mlp_fc2.b,
+                  DIT_DIM, DIT_FFN, N, bi, 6);
         run_gated_add(r, r->d_slat_h, r->d_slat_ln_h, gate_mlp, N, DIT_DIM);
+        SLATPROF_ADD(g_slat_t_mlp);
     }
 
     /* Final LN (no affine) + out_layer */
     run_ln_noaffine(r, r->d_slat_ln_h, r->d_slat_h, N, DIT_DIM);
     gemm(r, r->d_slat_vel_out, &r->slat_out, r->d_slat_ln_h, r->slat_out.b,
          SLAT_IN_CH, DIT_DIM, N);
-    hipDeviceSynchronize();
+    SLATPROF_ADD(g_slat_t_io);
+    if (g_dit_prof) {
+        double sa = g_slat_t_sagemm + g_slat_t_saflash + g_slat_t_samisc;
+        double tot = sa + g_slat_t_ca + g_slat_t_mlp + g_slat_t_kv + g_slat_t_io;
+        fprintf(stderr, "T2-SLATPROF (N=%d n_cond=%d): total=%.1f ms | "
+                "SA=%.1f [gemm=%.1f flash=%.1f misc=%.1f]  CA=%.1f  MLP=%.1f  KV=%.1f  IO=%.1f\n",
+                N, n_cond, tot, sa, g_slat_t_sagemm, g_slat_t_saflash, g_slat_t_samisc,
+                g_slat_t_ca, g_slat_t_mlp, g_slat_t_kv, g_slat_t_io);
+    }
+    /* No final sync — caller hipMemcpy D2H of d_slat_vel_out (line ~2809)
+     * already synchronizes on default stream. Saves ~one hipDeviceSync per
+     * step (negligible per-step but cleaner). */
     return 0;
 }
 
@@ -2526,11 +3269,14 @@ int hip_trellis2_slat_dit_step(hip_trellis2_runner *r,
         free(cs); free(sn);
     }
 
-    /* Timestep sinusoidal embed. SLAT runner takes raw t (sampler already
-     * scaled by 1000). */
+    /* Timestep sinusoidal embed. Match PyT flow_euler._inference_model which
+     * passes t*1000 to the model. Mirrors SS DiT runner convention so callers
+     * always pass raw t in [0,1]. Phase-2 dump (dump_rocm.py) bypasses the
+     * sampler with a raw-t direct model call; its verify test must pass
+     * t/1000 to compensate. */
     {
         void *out = r->d_slat_t_emb;
-        float t_val = t_value;
+        float t_val = t_value * 1000.0f;
         int dim = DIT_T_HALF * 2;
         void *args[] = { &out, &t_val, &dim };
         hipModuleLaunchKernel(r->fn_t_embed, (DIT_T_HALF + 255) / 256, 1, 1, 256, 1, 1,
@@ -2540,6 +3286,374 @@ int hip_trellis2_slat_dit_step(hip_trellis2_runner *r,
     if (slat_dit_forward(r, N, n_cond) != 0) return -1;
 
     hipMemcpy(out_vel, r->d_slat_vel_out, (size_t)N * SLAT_IN_CH * sizeof(float),
+              hipMemcpyDeviceToHost);
+    return 0;
+}
+
+/* ============================================================================
+ * Tex DiT (Stage 3, texture flow) — sister of SLAT DiT.
+ *
+ * Identical 30-block ModulatedTransformerCrossBlock to shape SLAT, but with
+ *   in_channels  = 64  (noise_32 + shape_norm_32 concatenated per voxel)
+ *   out_channels = 32  (texture-latent velocity)
+ * Independent weight set, KV cache, and scratch buffers. Same RoPE-3D
+ * computed from coords. Runs after shape SLAT during e2e texgen.
+ * ============================================================================ */
+
+#define TEX_IN_CH    64
+#define TEX_OUT_CH   32
+
+int hip_trellis2_load_tex_dit(hip_trellis2_runner *r, const char *path) {
+    if (!r) return -1;
+    fprintf(stderr, "T2-HIP: loading tex DiT weights: %s\n", path);
+    r->use_tex_int8 = 0;
+    st_context *st = safetensors_open(path);
+    if (!st) { fprintf(stderr, "T2-HIP: failed to open %s\n", path); return -1; }
+    int v = r->verbose;
+
+    r->tex_input.w   = st_upload_f32(st, "input_layer.weight", v);
+    r->tex_input.b   = st_upload_f32(st, "input_layer.bias",   v);
+    r->tex_input.scale = -1.0f;
+    r->tex_t_fc1.w   = st_upload_f32(st, "t_embedder.mlp.0.weight", v);
+    r->tex_t_fc1.b   = st_upload_f32(st, "t_embedder.mlp.0.bias",   v);
+    r->tex_t_fc1.scale = -1.0f;
+    r->tex_t_fc2.w   = st_upload_f32(st, "t_embedder.mlp.2.weight", v);
+    r->tex_t_fc2.b   = st_upload_f32(st, "t_embedder.mlp.2.bias",   v);
+    r->tex_t_fc2.scale = -1.0f;
+    r->tex_ada_mod.w = st_upload_f32(st, "adaLN_modulation.1.weight", v);
+    r->tex_ada_mod.b = st_upload_f32(st, "adaLN_modulation.1.bias",   v);
+    r->tex_ada_mod.scale = -1.0f;
+    r->tex_out.w     = st_upload_f32(st, "out_layer.weight", v);
+    r->tex_out.b     = st_upload_f32(st, "out_layer.bias",   v);
+    r->tex_out.scale = -1.0f;
+
+    if (!r->tex_input.w || !r->tex_t_fc1.w || !r->tex_t_fc2.w ||
+        !r->tex_ada_mod.w || !r->tex_out.w) {
+        fprintf(stderr, "T2-HIP: tex DiT top-level weight missing\n");
+        safetensors_close(st);
+        return -1;
+    }
+
+    int tex_i8_probe = safetensors_find(st, "blocks.0.self_attn.to_qkv.weight");
+    int tex_i8 = tex_i8_probe >= 0 && t2_dtype_is_i8(safetensors_dtype(st, tex_i8_probe));
+    if (tex_i8) {
+        if (!r->fn_quant_act_int8 || !r->fn_gemm_w8a8) {
+            fprintf(stderr, "T2-HIP: tex DiT INT8 weights require W8A8 kernels\n");
+            safetensors_close(st);
+            return -1;
+        }
+        int has_smooth = safetensors_find(st, "blocks.0.self_attn.to_qkv.smooth_scale") >= 0;
+        fprintf(stderr, "T2-HIP: tex DiT INT8 W8A8 enabled%s%s\n",
+                has_smooth ? " (SmoothQuant)" : "",
+                r->fn_gemm_w8a8_pgr2 ? " [pgr2 pipelined WMMA — ~bf16 speed, half memory]" : "");
+    }
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        char name[128];
+        t2_block_gpu *b = &r->tex_blocks[bi];
+        memset(b, 0, sizeof(*b));
+        #define TBN(n) (snprintf(name,sizeof(name),"blocks.%d.%s",bi,n), name)
+
+        st_upload_wt_i8_pref(st, TBN("self_attn.to_qkv.weight"), r->use_blaslt, &b->sa_qkv, v);
+        b->sa_qkv.b  = st_upload_f32(st, TBN("self_attn.to_qkv.bias"),   v);
+        b->sa_q_norm = st_upload_f32(st, TBN("self_attn.q_rms_norm.gamma"), v);
+        b->sa_k_norm = st_upload_f32(st, TBN("self_attn.k_rms_norm.gamma"), v);
+        st_upload_wt_i8_pref(st, TBN("self_attn.to_out.weight"), r->use_blaslt, &b->sa_out, v);
+        b->sa_out.b  = st_upload_f32(st, TBN("self_attn.to_out.bias"),   v);
+
+        b->norm2_w   = st_upload_f32(st, TBN("norm2.weight"), v);
+        b->norm2_b   = st_upload_f32(st, TBN("norm2.bias"),   v);
+        st_upload_wt_i8_pref(st, TBN("cross_attn.to_q.weight"), r->use_blaslt, &b->ca_q, v);
+        b->ca_q.b    = st_upload_f32(st, TBN("cross_attn.to_q.bias"),   v);
+        b->ca_q_norm = st_upload_f32(st, TBN("cross_attn.q_rms_norm.gamma"), v);
+        b->ca_k_norm = st_upload_f32(st, TBN("cross_attn.k_rms_norm.gamma"), v);
+        st_upload_wt_i8_pref(st, TBN("cross_attn.to_kv.weight"), r->use_blaslt, &b->ca_kv, v);
+        b->ca_kv.b   = st_upload_f32(st, TBN("cross_attn.to_kv.bias"),   v);
+        st_upload_wt_i8_pref(st, TBN("cross_attn.to_out.weight"), r->use_blaslt, &b->ca_out, v);
+        b->ca_out.b  = st_upload_f32(st, TBN("cross_attn.to_out.bias"),   v);
+
+        st_upload_wt_i8_pref(st, TBN("mlp.mlp.0.weight"), r->use_blaslt, &b->mlp_fc1, v);
+        b->mlp_fc1.b = st_upload_f32(st, TBN("mlp.mlp.0.bias"),   v);
+        st_upload_wt_i8_pref(st, TBN("mlp.mlp.2.weight"), r->use_blaslt, &b->mlp_fc2, v);
+        b->mlp_fc2.b = st_upload_f32(st, TBN("mlp.mlp.2.bias"),   v);
+
+        t2_wt *i8_wts[7] = { &b->sa_qkv, &b->sa_out, &b->ca_q, &b->ca_kv,
+                             &b->ca_out, &b->mlp_fc1, &b->mlp_fc2 };
+        for (int wi = 0; wi < 7; wi++) {
+            if (i8_wts[wi]->is_int8) {
+                r->use_tex_int8 = 1;
+                if (!i8_wts[wi]->i8_wscale) {
+                    safetensors_close(st);
+                    return -1;
+                }
+            }
+        }
+
+        b->mod_bias  = st_upload_f32(st, TBN("modulation"), v);
+        #undef TBN
+    }
+    safetensors_close(st);
+
+    r->tex_n_freqs = DIT_HEAD_DIM / 6;
+    r->tex_loaded = 1;
+    r->tex_ca_kv_valid = 0;
+    r->tex_ca_kv_cond_ptr = NULL;
+
+    hipMalloc(&r->d_tex_t_emb,    DIT_T_HALF * 2 * sizeof(float));
+    hipMalloc(&r->d_tex_t_silu,   DIT_DIM * sizeof(float));
+    hipMalloc(&r->d_tex_mod_base, 6 * DIT_DIM * sizeof(float));
+    hipMalloc(&r->d_tex_mod,      6 * DIT_DIM * sizeof(float));
+
+    fprintf(stderr, "T2-HIP: tex DiT loaded (%d blocks, RoPE %d freqs/axis, %s)\n",
+            DIT_DEPTH, r->tex_n_freqs,
+            r->use_tex_int8 ? "INT8 W8A8 tex blocks" :
+            (r->use_blaslt ? "BF16+hipBLASLt" : "F32"));
+    return 0;
+}
+
+void hip_trellis2_invalidate_tex_kv(hip_trellis2_runner *r) {
+    if (r) { r->tex_ca_kv_valid = 0; r->tex_ca_kv_cond_ptr = NULL; }
+}
+
+static int tex_ensure_n_scratch(hip_trellis2_runner *r, int N) {
+    if (N <= r->tex_n_cap) return 0;
+    free_hip(&r->d_tex_h);
+    free_hip(&r->d_tex_ln_h);
+    free_hip(&r->d_tex_qkv);
+    free_hip(&r->d_tex_Q);
+    free_hip(&r->d_tex_K);
+    free_hip(&r->d_tex_V);
+    free_hip(&r->d_tex_ca_Q);
+    free_hip(&r->d_tex_attn_out);
+    free_hip(&r->d_tex_mlp_mid);
+    free_hip(&r->d_tex_x_in);
+    free_hip(&r->d_tex_vel_out);
+    free_hip(&r->d_tex_rope_cos);
+    free_hip(&r->d_tex_rope_sin);
+
+    int cap = N;
+    if (cap < 4096) cap = 4096;
+    if (cap > SLAT_MAX_TOK) cap = SLAT_MAX_TOK;
+    if (cap < N) {
+        fprintf(stderr, "T2-HIP: tex N=%d exceeds max %d\n", N, SLAT_MAX_TOK);
+        return -1;
+    }
+    size_t fdim = (size_t)cap * DIT_DIM * sizeof(float);
+    if (hipMalloc(&r->d_tex_h,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_ln_h,     fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_qkv,      3 * fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_Q,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_K,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_V,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_ca_Q,     fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_attn_out, fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_mlp_mid,  (size_t)cap * DIT_FFN * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_x_in,     (size_t)cap * TEX_IN_CH  * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_vel_out,  (size_t)cap * TEX_OUT_CH * sizeof(float)) != hipSuccess) return -1;
+    size_t rope_bytes = (size_t)cap * 3 * r->tex_n_freqs * sizeof(float);
+    if (hipMalloc(&r->d_tex_rope_cos, rope_bytes) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_rope_sin, rope_bytes) != hipSuccess) return -1;
+
+    r->tex_n_cap = cap;
+    r->tex_rope_cap = cap;
+    return 0;
+}
+
+static int tex_ensure_cond_scratch(hip_trellis2_runner *r, int n_cond) {
+    if (n_cond <= r->tex_cond_cap) return 0;
+    free_hip(&r->d_tex_cond);
+    int cap = n_cond > SLAT_MAX_COND ? n_cond : SLAT_MAX_COND;
+    if (hipMalloc(&r->d_tex_cond, (size_t)cap * DIT_COND_DIM * sizeof(float)) != hipSuccess)
+        return -1;
+    r->tex_cond_cap = cap;
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        free_hip(&r->tex_ca_K_cache[bi]);
+        free_hip(&r->tex_ca_V_cache[bi]);
+        if (hipMalloc(&r->tex_ca_K_cache[bi], (size_t)cap * DIT_DIM * sizeof(float)) != hipSuccess) return -1;
+        if (hipMalloc(&r->tex_ca_V_cache[bi], (size_t)cap * DIT_DIM * sizeof(float)) != hipSuccess) return -1;
+    }
+    r->tex_ca_kv_cap = cap;
+    r->tex_ca_kv_valid = 0;
+    return 0;
+}
+
+static int tex_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
+    if (!r->tex_loaded) { fprintf(stderr, "T2-HIP: tex DiT not loaded\n"); return -1; }
+
+    /* Input embedding: x_t [N, 64] -> [N, DIT_DIM] */
+    gemm(r, r->d_tex_h, &r->tex_input, r->d_tex_x_in,
+         r->tex_input.b, DIT_DIM, TEX_IN_CH, N);
+
+    /* Timestep MLP */
+    gemm(r, r->d_tex_t_silu, &r->tex_t_fc1, r->d_tex_t_emb,
+         r->tex_t_fc1.b, DIT_DIM, DIT_T_HALF * 2, 1);
+    run_silu(r, r->d_tex_t_silu, DIT_DIM);
+    void *d_t_out = r->d_tex_attn_out;
+    gemm(r, d_t_out, &r->tex_t_fc2, r->d_tex_t_silu,
+         r->tex_t_fc2.b, DIT_DIM, DIT_DIM, 1);
+
+    /* Rebuild cross-attn KV cache if needed */
+    if (!r->tex_ca_kv_valid) {
+        for (int bi = 0; bi < DIT_DEPTH; bi++) {
+            t2_block_gpu *b = &r->tex_blocks[bi];
+            void *kv_tmp = r->d_tex_qkv;
+            tex_gemm(r, kv_tmp, &b->ca_kv, r->d_tex_cond,
+                     b->ca_kv.b, 2 * DIT_DIM, DIT_COND_DIM, n_cond, bi, 3);
+            void *K = r->tex_ca_K_cache[bi], *V = r->tex_ca_V_cache[bi];
+            int M = n_cond, W = DIT_DIM;
+            void *args[] = { &K, &V, &kv_tmp, &M, &W };
+            hipModuleLaunchKernel(r->fn_split_kv,
+                (n_cond * DIT_DIM + 255) / 256, 1, 1, 256, 1, 1,
+                0, 0, args, NULL);
+            run_rms_norm_ph(r, r->tex_ca_K_cache[bi], b->ca_k_norm,
+                             n_cond, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        }
+        r->tex_ca_kv_valid = 1;
+        r->tex_ca_kv_len   = n_cond;
+    }
+
+    /* Shared modulation */
+    {
+        void *out = r->d_tex_mod_base;
+        const void *t_emb = d_t_out;
+        const void *mod_w = r->tex_ada_mod.w, *mod_b = r->tex_ada_mod.b;
+        const void *blk_bias_null = NULL;
+        int dim = DIT_DIM, out_dim = 6 * DIT_DIM;
+        void *args[] = { &out, &t_emb, &mod_w, &mod_b, &blk_bias_null, &dim, &out_dim };
+        int gx = (out_dim + 255) / 256;
+        hipModuleLaunchKernel(r->fn_modulation_par, gx, 1, 1, 256, 1, 1,
+                              DIT_DIM * sizeof(float), 0, args, NULL);
+    }
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        t2_block_gpu *b = &r->tex_blocks[bi];
+
+        /* Per-block modulation */
+        {
+            void *out = r->d_tex_mod;
+            const void *base = r->d_tex_mod_base;
+            const void *blk_bias = b->mod_bias;
+            int n = 6 * DIT_DIM;
+            void *args[] = { &out, (void *)&base, (void *)&blk_bias, &n };
+            int gx = (n + 255) / 256;
+            hipModuleLaunchKernel(r->fn_mod_add_blkbias, gx, 1, 1, 256, 1, 1,
+                                  0, 0, args, NULL);
+        }
+        float *mod = (float *)r->d_tex_mod;
+        void *shift_sa  = mod + 0 * DIT_DIM;
+        void *scale_sa  = mod + 1 * DIT_DIM;
+        void *gate_sa   = mod + 2 * DIT_DIM;
+        void *shift_mlp = mod + 3 * DIT_DIM;
+        void *scale_mlp = mod + 4 * DIT_DIM;
+        void *gate_mlp  = mod + 5 * DIT_DIM;
+
+        /* Self-attention */
+        run_adaln(r, r->d_tex_ln_h, r->d_tex_h, shift_sa, scale_sa, N, DIT_DIM);
+        tex_gemm(r, r->d_tex_qkv, &b->sa_qkv, r->d_tex_ln_h, b->sa_qkv.b,
+                 3 * DIT_DIM, DIT_DIM, N, bi, 0);
+        {
+            void *Q = r->d_tex_Q, *K = r->d_tex_K, *V = r->d_tex_V;
+            const void *qkv = r->d_tex_qkv;
+            int Nl = N, W = DIT_DIM;
+            void *args[] = { &Q, &K, &V, &qkv, &Nl, &W };
+            hipModuleLaunchKernel(r->fn_split_qkv,
+                (N * DIT_DIM + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        }
+        run_rms_norm_ph(r, r->d_tex_Q, b->sa_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        run_rms_norm_ph(r, r->d_tex_K, b->sa_k_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        {
+            void *saved_cos = r->d_rope_cos, *saved_sin = r->d_rope_sin;
+            int saved_freqs = r->n_rope_freqs;
+            r->d_rope_cos = r->d_tex_rope_cos;
+            r->d_rope_sin = r->d_tex_rope_sin;
+            r->n_rope_freqs = r->tex_n_freqs;
+            run_rope_3d(r, r->d_tex_Q, N);
+            run_rope_3d(r, r->d_tex_K, N);
+            r->d_rope_cos = saved_cos; r->d_rope_sin = saved_sin;
+            r->n_rope_freqs = saved_freqs;
+        }
+        run_flash_sa(r, r->d_tex_attn_out, NULL,
+                     r->d_tex_Q, r->d_tex_K, r->d_tex_V, N, 0);
+        tex_gemm(r, r->d_tex_ln_h, &b->sa_out, r->d_tex_attn_out, b->sa_out.b,
+                 DIT_DIM, DIT_DIM, N, bi, 1);
+        run_gated_add(r, r->d_tex_h, r->d_tex_ln_h, gate_sa, N, DIT_DIM);
+
+        /* Cross-attention */
+        run_layernorm(r, r->d_tex_ln_h, r->d_tex_h, b->norm2_w, b->norm2_b, N, DIT_DIM);
+        tex_gemm(r, r->d_tex_ca_Q, &b->ca_q, r->d_tex_ln_h, b->ca_q.b,
+                 DIT_DIM, DIT_DIM, N, bi, 2);
+        run_rms_norm_ph(r, r->d_tex_ca_Q, b->ca_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        run_cross_attn(r, r->d_tex_attn_out, NULL,
+                       r->d_tex_ca_Q, r->tex_ca_K_cache[bi], r->tex_ca_V_cache[bi],
+                       N, r->tex_ca_kv_len);
+        tex_gemm(r, r->d_tex_ln_h, &b->ca_out, r->d_tex_attn_out, b->ca_out.b,
+                 DIT_DIM, DIT_DIM, N, bi, 4);
+        run_residual_add(r, r->d_tex_h, r->d_tex_ln_h, N * DIT_DIM);
+
+        /* MLP */
+        run_adaln(r, r->d_tex_ln_h, r->d_tex_h, shift_mlp, scale_mlp, N, DIT_DIM);
+        tex_gemm(r, r->d_tex_mlp_mid, &b->mlp_fc1, r->d_tex_ln_h, b->mlp_fc1.b,
+                 DIT_FFN, DIT_DIM, N, bi, 5);
+        run_gelu(r, r->d_tex_mlp_mid, N * DIT_FFN);
+        tex_gemm(r, r->d_tex_ln_h, &b->mlp_fc2, r->d_tex_mlp_mid, b->mlp_fc2.b,
+                 DIT_DIM, DIT_FFN, N, bi, 6);
+        run_gated_add(r, r->d_tex_h, r->d_tex_ln_h, gate_mlp, N, DIT_DIM);
+    }
+
+    run_ln_noaffine(r, r->d_tex_ln_h, r->d_tex_h, N, DIT_DIM);
+    gemm(r, r->d_tex_vel_out, &r->tex_out, r->d_tex_ln_h, r->tex_out.b,
+         TEX_OUT_CH, DIT_DIM, N);
+    /* No final sync — caller hipMemcpy D2H syncs default stream. */
+    return 0;
+}
+
+int hip_trellis2_tex_dit_step(hip_trellis2_runner *r,
+                               const float *x_t,
+                               const int32_t *coords, int N,
+                               float t_value,
+                               const float *cond, int n_cond,
+                               float *out_vel) {
+    if (!r || !r->tex_loaded) { fprintf(stderr, "T2-HIP: tex DiT not loaded\n"); return -1; }
+    if (N <= 0 || N > SLAT_MAX_TOK)        { fprintf(stderr, "T2-HIP: bad N=%d\n", N); return -1; }
+    if (n_cond <= 0 || n_cond > SLAT_MAX_COND) { fprintf(stderr, "T2-HIP: bad n_cond=%d\n", n_cond); return -1; }
+    if (tex_ensure_n_scratch(r, N) != 0)         return -1;
+    if (tex_ensure_cond_scratch(r, n_cond) != 0) return -1;
+
+    hipMemcpy(r->d_tex_x_in, x_t, (size_t)N * TEX_IN_CH * sizeof(float),
+              hipMemcpyHostToDevice);
+
+    if (cond != r->tex_ca_kv_cond_ptr || n_cond != r->tex_ca_kv_len) {
+        r->tex_ca_kv_valid = 0;
+    }
+    if (!r->tex_ca_kv_valid) {
+        hipMemcpy(r->d_tex_cond, cond, (size_t)n_cond * DIT_COND_DIM * sizeof(float),
+                  hipMemcpyHostToDevice);
+        r->tex_ca_kv_cond_ptr = cond;
+    }
+
+    {
+        size_t rb = (size_t)N * 3 * r->tex_n_freqs;
+        float *cs = (float *)malloc(rb * sizeof(float));
+        float *sn = (float *)malloc(rb * sizeof(float));
+        slat_compute_rope_host(coords, N, r->tex_n_freqs, 10000.0f, cs, sn);
+        hipMemcpy(r->d_tex_rope_cos, cs, rb * sizeof(float), hipMemcpyHostToDevice);
+        hipMemcpy(r->d_tex_rope_sin, sn, rb * sizeof(float), hipMemcpyHostToDevice);
+        free(cs); free(sn);
+    }
+
+    /* Same t×1000 convention as SLAT */
+    {
+        void *out = r->d_tex_t_emb;
+        float t_val = t_value * 1000.0f;
+        int dim = DIT_T_HALF * 2;
+        void *args[] = { &out, &t_val, &dim };
+        hipModuleLaunchKernel(r->fn_t_embed, (DIT_T_HALF + 255) / 256, 1, 1, 256, 1, 1,
+                              0, 0, args, NULL);
+    }
+
+    if (tex_dit_forward(r, N, n_cond) != 0) return -1;
+
+    hipMemcpy(out_vel, r->d_tex_vel_out, (size_t)N * TEX_OUT_CH * sizeof(float),
               hipMemcpyDeviceToHost);
     return 0;
 }
