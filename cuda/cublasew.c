@@ -890,6 +890,30 @@ int cublasew_gemm_int8_s32_rowmajor_nt(cublasew_context *ctx,
                           CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
 
+int cublasew_gemm_int8_s32_rowmajor_nt_strided(cublasew_context *ctx,
+                                               CUdeviceptr d_Yi32,
+                                               CUdeviceptr d_Wq,
+                                               int ld_w,
+                                               CUdeviceptr d_Xq,
+                                               int ld_x,
+                                               int n_tok,
+                                               int n_out,
+                                               int n_in) {
+    const int alpha = 1;
+    const int beta = 0;
+    if (!ctx || !ctx->handle || ld_w < n_in || ld_x < n_in) return -1;
+    return p_cublasGemmEx(ctx->handle,
+                          CUBLAS_OP_T, CUBLAS_OP_N,
+                          n_out, n_tok, n_in,
+                          &alpha,
+                          (const void *)(uintptr_t)d_Wq, CUDA_R_8I, ld_w,
+                          (const void *)(uintptr_t)d_Xq, CUDA_R_8I, ld_x,
+                          &beta,
+                          (void *)(uintptr_t)d_Yi32, CUDA_R_32I, n_out,
+                          CUBLAS_COMPUTE_32I,
+                          CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
 int cublasew_gemm_f32_pedantic_rowmajor_nt_strided(cublasew_context *ctx,
                                                    CUdeviceptr d_Y,
                                                    CUdeviceptr d_W_f32,
