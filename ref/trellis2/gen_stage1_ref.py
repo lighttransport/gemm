@@ -137,6 +137,9 @@ def main():
     parser.add_argument('--cfg',      type=float, default=7.5)
     parser.add_argument('--rescale',  type=float, default=0.7)
     parser.add_argument('--sigma-min', type=float, default=1e-5)
+    parser.add_argument('--features-only', action='store_true',
+                        help='Extract DINOv3 features to ref_features.npy and exit '
+                             '(used to feed the HIP runner, which has no DINOv3).')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -158,6 +161,10 @@ def main():
     np.save(os.path.join(args.output_dir, 'ref_features.npy'), feat_np)
     print(f'  saved ref_features.npy  {feat_np.shape}')
     del dino; torch.cuda.empty_cache()
+
+    if args.features_only:
+        print(f'\nDone (features-only). Output in {args.output_dir}/ref_features.npy')
+        return
 
     # ── Stage 1 DiT ─────────────────────────────────────────────────────────
     print('\n=== Stage 1 DiT ===')

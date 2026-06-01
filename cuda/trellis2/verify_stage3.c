@@ -65,8 +65,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ref: [%d, %d]\n", dd[0], out_ch);
 
     float *output = (float *)malloc((size_t)N * out_ch * sizeof(float));
-    fprintf(stderr, "Running Stage 3 DiT (t_raw=1.0)...\n");
-    cuda_trellis2_run_stage3_dit(r, xt, 1.0f, cond, coords, N, output);
+    /* 10b_tex_dit_step_velocity is a DIRECT model forward at t=0.5; the runner
+     * multiplies timestep by 1000 internally, so pass 0.0005 -> embedder sees
+     * 0.5. Optional argv[6] overrides t_raw. */
+    float t_raw = (argc > 6) ? (float)atof(argv[6]) : 0.0005f;
+    fprintf(stderr, "Running Stage 3 DiT (t_raw=%.4f, model sees t=%.1f)...\n", t_raw, t_raw * 1000.0f);
+    cuda_trellis2_run_stage3_dit(r, xt, t_raw, cond, coords, N, output);
 
     /* Compare */
     double sr=0,sc=0,sr2=0,sc2=0,src2=0;
