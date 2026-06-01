@@ -24,6 +24,7 @@ TEX_CNEXT    = test_hip_convnext
 TEX_C2S      = test_hip_c2s
 TEX_DEC_FULL = test_hip_tex_dec
 SLAT_DIT     = test_hip_slat_dit
+TEX_DIT      = test_hip_tex_dit
 
 COMMON_DEPS = hip_trellis2_runner.h hip_trellis2_kernels.h \
               ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
@@ -32,7 +33,7 @@ COMMON_DEPS = hip_trellis2_runner.h hip_trellis2_kernels.h \
 
 .PHONY: all clean run help verify-dit verify-dec
 
-all: $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC) $(TEX_SPCONV) $(TEX_CNEXT) $(TEX_C2S) $(TEX_DEC_FULL) $(SLAT_DIT)
+all: $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC) $(TEX_SPCONV) $(TEX_CNEXT) $(TEX_C2S) $(TEX_DEC_FULL) $(SLAT_DIT) $(TEX_DIT)
 
 PIPELINE_SRC = hip_shape_dec_pipeline.c
 PIPELINE_HDR = hip_shape_dec_pipeline.h
@@ -86,6 +87,12 @@ $(VERIFY_DEC): verify_decoder.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape
 
 $(SLAT_DIT): test_hip_slat_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS) ../../common/npy_io.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_slat_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+
+$(TEX_DIT): test_hip_tex_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS) ../../common/npy_io.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_tex_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+
+test_hip_slat_traj: test_hip_slat_traj.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS) ../../common/npy_io.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_slat_traj.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
 # Default weight paths — override on the command line
 DIT     ?= /path/to/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors
