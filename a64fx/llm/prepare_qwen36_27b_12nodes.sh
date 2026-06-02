@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Prepare Qwen3.6-27B BF16 shard package for 12-node runs.
+# Prepare Qwen3.6-27B BF16 shard package for multinode runs.
 #
 # This script:
 #  - finds the available shard family from a source file or directory,
-#  - copies all shards into the 12-node package root (default:
-#    ~/models/qwen36/27b/12nodes),
+#  - copies all shards into the package root (default:
+#    ~/models/qwen36/27b/<N>nodes, N defaults to 12),
 #  - verifies byte-level size for each copied shard.
 #
 # It does not split or quantize GGUF payloads. It only prepares the shard set.
@@ -12,10 +12,10 @@
 set -euo pipefail
 
 ROOT="${HOME}/models/qwen36/27b"
-PKG_ROOT="${ROOT}/12nodes"
+PKG_FALLBACK_NODES="${QWEN27B_PREPARE_NODES:-12}"
 
 SRC_INPUT="${1:-$ROOT}"
-DST_ROOT="${2:-$PKG_ROOT}"
+DST_ROOT="${2:-$ROOT/${PKG_FALLBACK_NODES}nodes}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
