@@ -49,6 +49,7 @@ typedef struct {
     /* precomputed recursive-doubling schedule */
     int             pof2, rem, nrounds, bcast_sid, newrank;
     int             use_bf16;                /* TP_AR_BF16=1: halve reduce payload */
+    int             robust;                  /* TP_AR_ROBUST=1: drain-per-recv + civac */
     uint64_t        seq;                     /* monotonic call counter            */
 } tp_comm;
 
@@ -72,6 +73,20 @@ static inline float tp_bf162f(uint16_t b) {
 }
 static inline float tp_bf16_round(float f) { return tp_bf162f(tp_f2bf16(f)); }
 
+/* Invalidate one cache line before reading an RDMA-written trailer (A64FX).
+ * A purely passive volatile-read spin can keep hitting a stale cached copy of the
+ * trailer line and never observe a Put that already landed in DRAM. `dc civac`
+ * (clean+invalidate to PoC, allowed at EL0) drops the line so the next read
+ * re-fetches from DRAM. SAFE ONLY because the recv slots are CPU-READ-ONLY after
+ * the startup memset+clean baseline (tp_comm_init flushes the dirty zeros to DRAM
+ * BEFORE registration), so a poll-time civac on a clean line is invalidate-only
+ * and never writes a stale zero back over a landed Put. Borrowed from
+ * a64fx/assetload/assetload_dist_bench.c (flag_inval, same uTofu collective). */
+static inline void tp_ar_flag_inval(const volatile void *p) {
+    __asm__ __volatile__("dc civac, %0" :: "r"(p) : "memory");
+    __asm__ __volatile__("dsb sy" ::: "memory");   /* wait for the DC op to complete */
+}
+
 /* slot s layout: [payload: max_count floats][seq trailer][... pad ...].
  * The sum trailer is at a fixed max_count*sizeof(float) offset, not after the
  * live payload. Calls may use different count values in one communicator
@@ -92,6 +107,30 @@ static inline size_t tp_ar_trailer_off(const tp_comm *c) { return (size_t)c->max
 static inline void tp_ar_drain_mrq(tp_comm *c) {
     struct utofu_mrq_notice nt;
     while (utofu_poll_mrq(c->vcq, 0, &nt) == UTOFU_SUCCESS) { /* discard */ }
+}
+
+/* Spin until recv-slot trailer `trl` reaches `tok`, then return. In ROBUST mode
+ * this is the fix for the large-M dropped-Put deadlock (`want=N+1 got=N`):
+ *  (1) drain our MRQ EACH spin AND once on completion — recursive doubling does
+ *      send(drains)/recv(notice lands) per round, so the last round's recv notice
+ *      leaks 1/reduce; over ~10^4 reduces the *receiver's* MRQ overflows, faults
+ *      the TNI, and inbound Puts silently stop landing. Draining per-recv keeps it
+ *      near-empty so the TNI never faults.
+ *  (2) civac the trailer line each spin — defeats a stale cached trailer masking a
+ *      delivered Put. Free on the fast path (loop body runs only while waiting).
+ * Non-robust path is byte-for-byte the original passive spin. */
+static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
+                              int sid, const char *what) {
+    double t0 = tp_ar_now();
+    while (*trl < tok) {
+        if (c->robust) { tp_ar_drain_mrq(c); tp_ar_flag_inval(trl); }
+        if (tp_ar_now() - t0 > TP_AR_TIMEOUT) {
+            fprintf(stderr, "tp_ar: rank %d %s timeout sid=%d want=%lu got=%lu\n",
+                    c->my_rank, what, sid, (unsigned long)tok, (unsigned long)*trl);
+            exit(1);
+        }
+    }
+    if (c->robust) tp_ar_drain_mrq(c);   /* consume THIS recv's RMT_PUT notice (no leak) */
 }
 
 /* one Put with BUSY-retry + local-completion drain (pp_runner idiom). */
@@ -139,13 +178,7 @@ static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int coun
 static void tp_ar_recv_add(tp_comm *c, int sid, float *buf, int count, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
     volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
-    double t0 = tp_ar_now();
-    while (*trl < tok)
-        if (tp_ar_now() - t0 > TP_AR_TIMEOUT) {
-            fprintf(stderr, "tp_ar: rank %d wait timeout sid=%d want=%lu got=%lu\n",
-                    c->my_rank, sid, (unsigned long)tok, (unsigned long)*trl);
-            exit(1);
-        }
+    tp_ar_wait(c, trl, tok, sid, "wait");
     if (c->use_bf16) {
         const uint16_t *r = (const uint16_t *)rb;
         for (int i = 0; i < count; i++)
@@ -159,13 +192,7 @@ static void tp_ar_recv_add(tp_comm *c, int sid, float *buf, int count, uint64_t 
 static void tp_ar_recv_copy(tp_comm *c, int sid, float *buf, int count, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
     volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
-    double t0 = tp_ar_now();
-    while (*trl < tok)
-        if (tp_ar_now() - t0 > TP_AR_TIMEOUT) {
-            fprintf(stderr, "tp_ar: rank %d bcast timeout sid=%d want=%lu got=%lu\n",
-                    c->my_rank, sid, (unsigned long)tok, (unsigned long)*trl);
-            exit(1);
-        }
+    tp_ar_wait(c, trl, tok, sid, "bcast");
     if (c->use_bf16) {
         const uint16_t *r = (const uint16_t *)rb;
         for (int i = 0; i < count; i++) buf[i] = tp_bf162f(r[i]);
@@ -231,13 +258,7 @@ static void tp_ar_send_argmax(tp_comm *c, int peer, int sid, const float *vi, ui
 static void tp_ar_recv_argmax(tp_comm *c, int sid, float *buf, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
     volatile uint64_t *trl = (volatile uint64_t *)(rb + (size_t)c->max_count * sizeof(float));
-    double t0 = tp_ar_now();
-    while (*trl < tok)
-        if (tp_ar_now() - t0 > TP_AR_TIMEOUT) {
-            fprintf(stderr, "tp_ar: rank %d argmax timeout sid=%d want=%lu got=%lu\n",
-                    c->my_rank, sid, (unsigned long)tok, (unsigned long)*trl);
-            exit(1);
-        }
+    tp_ar_wait(c, trl, tok, sid, "argmax");
     const float *r = (const float *)rb;
     int32_t oidx, cidx; memcpy(&oidx, &r[1], 4); memcpy(&cidx, &buf[1], 4);
     if (r[0] > buf[0] || (r[0] == buf[0] && oidx < cidx)) { buf[0] = r[0]; buf[1] = r[1]; }
@@ -248,13 +269,7 @@ static void tp_ar_recv_argmax(tp_comm *c, int sid, float *buf, uint64_t tok) {
 static void tp_ar_recv_copy_argmax(tp_comm *c, int sid, float *buf, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
     volatile uint64_t *trl = (volatile uint64_t *)(rb + (size_t)c->max_count * sizeof(float));
-    double t0 = tp_ar_now();
-    while (*trl < tok)
-        if (tp_ar_now() - t0 > TP_AR_TIMEOUT) {
-            fprintf(stderr, "tp_ar: rank %d argmax bcast timeout sid=%d want=%lu got=%lu\n",
-                    c->my_rank, sid, (unsigned long)tok, (unsigned long)*trl);
-            exit(1);
-        }
+    tp_ar_wait(c, trl, tok, sid, "argmax bcast");
     memcpy(buf, rb, 2 * sizeof(float));
 }
 
@@ -305,6 +320,13 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
         fprintf(stderr, "tp_ar: posix_memalign failed\n"); return -1;
     }
     memset(c->region, 0, region_sz);
+    /* Flush the dirty memset-zeros to DRAM BEFORE registration so the robust-path
+     * poll-time `dc civac` (tp_ar_flag_inval) can only ever pull a landed Put down
+     * from DRAM — never write a still-dirty stale zero back OVER a delivered Put.
+     * Establishes the clean cache baseline the assetload collective relies on. */
+    for (size_t off = 0; off < region_sz; off += TP_AR_LINE)
+        __asm__ __volatile__("dc civac, %0" :: "r"(c->region + off) : "memory");
+    __asm__ __volatile__("dsb sy" ::: "memory");
 
     int rc = utofu_reg_mem_with_stag(vcq, c->region, region_sz, TP_AR_STAG, 0, &c->base);
     if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: reg_mem rc=%d\n", rc); return -1; }
@@ -327,9 +349,10 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
     else                      c->newrank = my_rank - c->rem;
     c->seq = 0;
     c->use_bf16 = getenv("TP_AR_BF16") && atoi(getenv("TP_AR_BF16")) != 0;
+    c->robust   = getenv("TP_AR_ROBUST") ? atoi(getenv("TP_AR_ROBUST")) : 1;  /* default ON */
     if (my_rank == 0)
-        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s\n",
-                nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32");
+        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s robust=%d\n",
+                nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32", c->robust);
     return 0;
 }
 
