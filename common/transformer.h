@@ -10807,7 +10807,7 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
     int q_dim = n_heads * head_dim;
     int q2_dim = 2 * q_dim;
     int kv_dim = n_kv_heads * head_dim;
-    int gqa_ratio = n_heads / n_kv_heads;
+    int gqa_ratio = (m->gqa_group > 0) ? m->gqa_group : ((n_kv_heads > 0) ? n_heads / n_kv_heads : 1);
     if (layer->attn_q.n_rows != q2_dim || layer->attn_q.n_cols != n_embd ||
         layer->attn_k.n_rows != kv_dim || layer->attn_k.n_cols != n_embd ||
         layer->attn_v.n_rows != kv_dim || layer->attn_v.n_cols != n_embd ||
@@ -12213,6 +12213,20 @@ static int tf_tp_slice_ssm_layer(transformer_model *m, int layer_idx,
     return 0;
 }
 
+static inline void tf_tp_partition_range(int total, int parts, int part,
+                                        int *lo_out, int *hi_out) {
+    const int base = total / parts;
+    const int rem = total % parts;
+    int lo = part * base + ((part < rem) ? part : rem);
+    int hi = lo + base + ((part < rem) ? 1 : 0);
+    if (lo < 0) lo = 0;
+    if (hi < lo) hi = lo;
+    if (lo > total) lo = total;
+    if (hi > total) hi = total;
+    *lo_out = lo;
+    *hi_out = hi;
+}
+
 int transformer_tp_slice_weights(transformer_model *m, int tp_rank, int tp_size,
                                   int ssm_shard) {
     if (!m || tp_size <= 1) return 0;
@@ -12234,10 +12248,6 @@ int transformer_tp_slice_weights(transformer_model *m, int tp_rank, int tp_size,
      * gated on whether that component is actually being sharded. --- */
     int kv_replicate = 0;
     if (!getenv("TP_SKIP_ATTN")) {
-        if (n_heads % tp_size) {
-            fprintf(stderr, "tp_slice: n_heads=%d not divisible by tp_size=%d\n", n_heads, tp_size);
-            return -1;
-        }
         kv_replicate = (n_kv % tp_size) != 0;   /* 1 => replicate KV, shard Q only */
     }
     /* FFN: balanced, multiple-of-16 partition (uneven last rank, like the vocab shard)
@@ -12255,15 +12265,14 @@ int transformer_tp_slice_weights(transformer_model *m, int tp_rank, int tp_size,
     int ssm_ck = m->ssm_conv_kernel;
     if (ssm_shard) {
         if (!m->is_hybrid) { fprintf(stderr, "tp_slice: ssm_shard set but model is not hybrid\n"); return -1; }
-        if (ssm_dt % tp_size) {
-            fprintf(stderr, "tp_slice: ssm_dt_rank=%d not divisible by tp_size=%d\n", ssm_dt, tp_size);
-            return -1;
-        }
     }
-    int vh_lo = tp_rank * (ssm_dt / tp_size), vh_hi = vh_lo + ssm_dt / tp_size;
 
-    int qh_lo = tp_rank * (n_heads / tp_size), qh_hi = qh_lo + n_heads / tp_size;
-    int kh_lo = tp_rank * (n_kv   / tp_size),  kh_hi = kh_lo + n_kv   / tp_size;  /* unused if kv_replicate */
+    int qh_lo = 0, qh_hi = 0;
+    int kh_lo = 0, kh_hi = 0;
+    int vh_lo = 0, vh_hi = 0;
+    tf_tp_partition_range(n_heads, tp_size, tp_rank, &qh_lo, &qh_hi);
+    if (!kv_replicate) tf_tp_partition_range(n_kv, tp_size, tp_rank, &kh_lo, &kh_hi);
+    tf_tp_partition_range(ssm_dt, tp_size, tp_rank, &vh_lo, &vh_hi);
     int ff_lo = tp_rank * ff_chunk,            ff_hi = ff_lo + ff_chunk;          /* uneven: last rank shorter */
     if (ff_lo > n_ff) ff_lo = n_ff;
     if (ff_hi > n_ff) ff_hi = n_ff;
@@ -12272,6 +12281,8 @@ int transformer_tp_slice_weights(transformer_model *m, int tp_rank, int tp_size,
     int do_attn = !getenv("TP_SKIP_ATTN");
     int do_ffn  = !getenv("TP_SKIP_FFN");
     int do_ssm  = ssm_shard && !getenv("TP_SKIP_SSM");
+    if (do_attn && qh_hi <= qh_lo) do_attn = 0;
+    if (do_ssm && vh_hi <= vh_lo) do_ssm = 0;
 
     /* KV-replicate: full KV cache stays, so the kernel must map the GLOBAL query head
      * (qh_lo + local h) to its KV head; clean-divide rebases to a local cache (offset 0). */
@@ -12345,10 +12356,10 @@ int transformer_tp_slice_weights(transformer_model *m, int tp_rank, int tp_size,
 
     /* Mutate model dims to local so the forward loops compute the shard. KV heads
      * stay FULL when replicated (only Q-heads sharded). FFN is the uneven local width. */
-    if (do_attn) { m->n_heads = n_heads / tp_size; if (!kv_replicate) m->n_kv_heads = n_kv / tp_size; }
+    if (do_attn) { m->n_heads = qh_hi - qh_lo; if (!kv_replicate) m->n_kv_heads = kh_hi - kh_lo; }
     if (do_ffn)  { m->n_ff = ff_hi - ff_lo; }
     if (do_ssm) {
-        int loc_dt = ssm_dt / tp_size;
+        int loc_dt = vh_hi - vh_lo;
         m->ssm_dt_rank   = loc_dt;
         m->ssm_d_inner   = loc_dt * ssm_ds;
         m->ssm_qkv_dim   = 2 * ssm_ng * ssm_ds + loc_dt * ssm_ds;  /* Q+K full, V local */
@@ -13457,7 +13468,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
     int head_dim = m->head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int q_dim = n_heads * head_dim;
-    int gqa_ratio = n_heads / n_kv_heads;
+    int gqa_ratio = (m->gqa_group > 0) ? m->gqa_group : ((n_kv_heads > 0) ? n_heads / n_kv_heads : 1);
     int n_ff = m->n_ff;
 
     /* Profiling accumulators (ms) */
