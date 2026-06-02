@@ -973,10 +973,13 @@ int main(int argc, char **argv) {
      * prefill reduces the whole [M,n_embd] tile; tp_ar_callback chunks it by
      * max_count, so a max_count of n_embd makes prefill do M (=512) tiny reduces
      * per all-reduce point — pure Put-latency tax. Size the region for TP_AR_BATCH
-     * tokens (default 128 -> ~24MB region at n_embd=5120) so prefill reduces in
-     * ceil(M/BATCH) chunks (4 at M=512), each a single ~1.3MB bf16 Put < 16MiB.
-     * The argmax send is now 16 B regardless of max_count, so decode is unaffected. */
-    int ar_batch = (int)envl("TP_AR_BATCH", 128);
+     * tokens so prefill reduces in ceil(M/chunk) chunks. The default 512 saturates
+     * the 2097152-float (8MiB fp32 / 4MiB bf16) clamp below at n_embd=5120 (region
+     * ~72MB); measured M=1000 prefill 116.8->118.5 tok/s vs the old 128 default, no
+     * regression at smaller M (Workstream B sweep; AR is bandwidth- not latency-bound
+     * so the win saturates at the clamp). Safe to raise only post-Workstream-A (the
+     * MRQ-drain fix). The argmax send is 16 B regardless, so decode is unaffected. */
+    int ar_batch = (int)envl("TP_AR_BATCH", 512);
     if (ar_batch < 1) ar_batch = 1;
     long ar_max = (long)n_embd * ar_batch;
     if (ar_max > 2L * 1024 * 1024) ar_max = 2L * 1024 * 1024;  /* cap bf16 Put < 16MiB, region < ~75MB */
