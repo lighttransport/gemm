@@ -26,6 +26,30 @@ These are absolute ceilings.  Useful kernels must still keep packing, layout
 conversion, activation, KV writes, routing, and synchronization inside the same
 4.55 s budget for 1000 tokens.
 
+### Qwen3.6-27B BF16 (12-node launch prep)
+
+Local staging and launch path for the 27B BF16 split GGUF has been wired to use a
+shared source shard set plus per-node `/local` caches:
+
+- Source shard package target: `~/models/qwen36/27b/12nodes/`
+- Per-node staging path: `/local/qwen36/27b/`
+- Stage helper used by launchers: `a64fx/llm/stage_gguf_shards.sh`
+- 27B TP/PP launchers now pass the staged local first shard:
+  - `a64fx/llm/run_tp_27b.sh` (defaults to the 12-node shard directory)
+  - `a64fx/llm/run_pp_27b.sh`
+
+Usage pattern:
+
+```bash
+mkdir -p ~/models/qwen36/27b/12nodes
+cp ~/models/qwen36/27b/Qwen3.6-27B-BF16-00001-of-00002.gguf ~/models/qwen36/27b/12nodes/
+cp ~/models/qwen36/27b/Qwen3.6-27B-BF16-00002-of-00002.gguf ~/models/qwen36/27b/12nodes/
+NP=12 ./run_tp_27b.sh   # or ./run_pp_27b.sh
+```
+
+Set `SKIP_STAGE=1` if the `/local` cache is pre-populated and `QWEN27B_LOCAL_DIR`
+to override the staging root.
+
 ## Current optimized EP prefill status
 
 Implemented after the communication roofline:
