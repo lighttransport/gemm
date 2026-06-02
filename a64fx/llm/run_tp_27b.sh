@@ -11,6 +11,7 @@
 #   NP=6 ./run_tp_27b.sh            # TP=6: 4Q/4KV (REPLICATED) /2912-2848ff, dt_rank 48->8
 #   NP=8 ./run_tp_27b.sh            # TP=8: 3Q/1KV (shard) /2176ff,         dt_rank 48->6
 #   PROF=1 NP=4 ./run_tp_27b.sh     # use tp_runner_prof (-DTF_POOL_PROFILE decode breakdown)
+#   NP=11 ./run_tp_27b.sh           # TP=11 (unbalanced row shard, first node)
 #   NP=12 ./run_tp_27b.sh           # TP=12 (balanced row/col shard) /2048ff
 # 27B: n_heads=24 n_kv=4 n_ff=17408 dt_rank=48.
 #  - Q heads divide at 4/6/8; SSM dt at 4/6/8; vocab shard handles any remainder.
@@ -23,10 +24,11 @@ export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:/usr/local/bi
 LLM_DIR="$(cd "$(dirname "$0")" && pwd)"; cd "$LLM_DIR"
 UTOFU_DIR="$LLM_DIR/../utofu-tests"
 
-MODEL=${MODEL:-$HOME/models/qwen36/27b/12nodes/Qwen3.6-27B-BF16-00001-of-00002.gguf}
-QWEN27B_SOURCE=${QWEN27B_SOURCE:-$HOME/models/qwen36/27b}
-QWEN27B_PACKAGE=${QWEN27B_PACKAGE:-$HOME/models/qwen36/27b/12nodes}
 NP=${NP:-${PJM_NODE:-4}}
+QWEN27B_NODES=${QWEN27B_NODES:-$NP}
+QWEN27B_SOURCE=${QWEN27B_SOURCE:-$HOME/models/qwen36/27b}
+QWEN27B_PACKAGE=${QWEN27B_PACKAGE:-$HOME/models/qwen36/27b/${QWEN27B_NODES}nodes}
+MODEL=${MODEL:-$QWEN27B_PACKAGE/Qwen3.6-27B-BF16-00001-of-00002.gguf}
 
 if [ "${QWEN27B_PREPARE:-1}" != "0" ]; then
     chmod +x "$LLM_DIR/prepare_qwen36_27b_12nodes.sh"
