@@ -38,12 +38,24 @@ shared source shard set plus per-node `/local` caches:
   - `a64fx/llm/run_tp_27b.sh` (defaults to the 12-node shard directory)
   - `a64fx/llm/run_pp_27b.sh`
 
+If you want a deterministic, one-time shard preparation step before any run, use:
+
+```bash
+# Prepare/refresh the 12-node package from the shared source tree:
+bash a64fx/llm/prepare_qwen36_27b_12nodes.sh \
+  ~/models/qwen36/27b \
+  ~/models/qwen36/27b/12nodes
+```
+
+The script copies split-family shards and validates destination sizes. If a shard is
+already present and size-matched, it is reused. Use `QWEN27B_PREPARE=0` to
+skip this step in launchers when package layout is already valid.
+
 Usage pattern:
 
 ```bash
 mkdir -p ~/models/qwen36/27b/12nodes
-cp ~/models/qwen36/27b/Qwen3.6-27B-BF16-00001-of-00002.gguf ~/models/qwen36/27b/12nodes/
-cp ~/models/qwen36/27b/Qwen3.6-27B-BF16-00002-of-00002.gguf ~/models/qwen36/27b/12nodes/
+bash a64fx/llm/prepare_qwen36_27b_12nodes.sh
 NP=12 ./run_tp_27b.sh   # or ./run_pp_27b.sh
 ```
 
