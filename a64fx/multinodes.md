@@ -26,25 +26,25 @@ These are absolute ceilings.  Useful kernels must still keep packing, layout
 conversion, activation, KV writes, routing, and synchronization inside the same
 4.55 s budget for 1000 tokens.
 
-### Qwen3.6-27B BF16 (12-node launch prep)
+### Qwen3.6-27B BF16 (multinode launch prep)
 
 Local staging and launch path for the 27B BF16 split GGUF has been wired to use a
 shared source shard set plus per-node `/local` caches:
 
-- Source shard package target: `~/models/qwen36/27b/12nodes/`
+- Source shard package target: `~/models/qwen36/27b/<N>nodes/` (defaults to `12nodes`)
 - Per-node staging path: `/local/qwen36/27b/`
 - Stage helper used by launchers: `a64fx/llm/stage_gguf_shards.sh`
 - 27B TP/PP launchers now pass the staged local first shard:
-  - `a64fx/llm/run_tp_27b.sh` (defaults to the 12-node shard directory)
-  - `a64fx/llm/run_pp_27b.sh`
+- `a64fx/llm/run_tp_27b.sh` (defaults to `~/models/qwen36/27b/${QWEN27B_NODES:-NP}nodes/`)
+- `a64fx/llm/run_pp_27b.sh` (same default behavior)
 
 If you want a deterministic, one-time shard preparation step before any run, use:
 
 ```bash
-# Prepare/refresh the 12-node package from the shared source tree:
+# Prepare/refresh node-count-aware package from the shared source tree:
 bash a64fx/llm/prepare_qwen36_27b_12nodes.sh \
   ~/models/qwen36/27b \
-  ~/models/qwen36/27b/12nodes
+  ~/models/qwen36/27b/${QWEN27B_PREPARE_NODES:-12}nodes
 ```
 
 The script copies split-family shards and validates destination sizes. If a shard is
@@ -54,9 +54,9 @@ skip this step in launchers when package layout is already valid.
 Usage pattern:
 
 ```bash
-mkdir -p ~/models/qwen36/27b/12nodes
-bash a64fx/llm/prepare_qwen36_27b_12nodes.sh
-NP=12 ./run_tp_27b.sh   # or ./run_pp_27b.sh
+mkdir -p ~/models/qwen36/27b/11nodes
+QWEN27B_PREPARE_NODES=11 bash a64fx/llm/prepare_qwen36_27b_12nodes.sh
+NP=11 QWEN27B_NODES=11 ./run_tp_27b.sh   # or ./run_pp_27b.sh
 ```
 
 Set `SKIP_STAGE=1` if the `/local` cache is pre-populated and `QWEN27B_LOCAL_DIR`
