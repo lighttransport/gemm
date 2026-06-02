@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <limits.h>
 #include "gguf_loader.h"
 #include "ggml_dequant.h"
 #if defined(__ARM_FEATURE_SVE)
@@ -336,6 +337,8 @@ typedef struct {
     int tp_qhead_offset;       /* GLOBAL index of this rank's first query head, ADDED to the
                                 * local head before the /gqa_group kv lookup. 0 unless attention
                                 * is in KV-replicate mode (full KV cache, sharded Q only). */
+    int tp_kv_head_base;       /* LOCAL KV-head = GLOBAL KV-head - tp_kv_head_base in token cache. */
+    int tp_kv_head_count;      /* number of KV-head rows kept locally after TP slicing */
     int ssm_head_offset;       /* Stage B: global index of this rank's first V-head. The SSM
                                 * forward maps local head hl -> Q/K group (ssm_head_offset+hl)
                                 * % n_group (Q/K stay replicated, V-heads sharded). 0 if
@@ -474,7 +477,9 @@ void transformer_embed_token(transformer_model *model, int32_t token_id);
  * allreduce_fn: callback to allreduce(sum) a float buffer in-place.
  * allreduce_ctx: opaque context passed to allreduce_fn (e.g. parallel_config*).
  *
- * Constraints: n_heads % tp_size == 0, n_kv_heads % tp_size == 0, n_ff % tp_size == 0. */
+ * Constraints: n_heads % tp_size == 0, n_ff % tp_size == 0 with an uneven last shard.
+ * n_kv_heads may be uneven across tp_size; when so, KV cache is replicated and Q heads
+ * are offset with tp_qhead_offset so local->global kv lookup remains correct. */
 void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
                          void (*allreduce_fn)(float *buf, int count, void *ctx),
                          void *allreduce_ctx);
@@ -488,8 +493,10 @@ void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
  *   - ROW-parallel (input-col split, all-reduce): attn_output, ffn_down.
  * Call AFTER transformer_load and BEFORE transformer_build_panels (panels build
  * on the slice). Requires n_kv_heads % tp_size == 0 (clean GQA split; KV
- * replication for tp_size>n_kv_heads is not yet handled) and n_ff % tp_size with
- * the local count a multiple of 16. ssm_shard=0 leaves SSM tensors replicated
+ * replication for tp_size>n_kv_heads is handled (Q-only replication, local kv_head
+ * mapping handled via tp_qhead_offset). Requires a per-rank KV-base that is cleanly
+ * initialized by this routine. n_ff % tp_size still obeys uneven-tail layout with
+ * chunk size rounded up to multiple-of-16. ssm_shard=0 leaves SSM tensors replicated
  * (validation on models that fit); =1 also shards SSM V-heads (not yet impl).
  * Set TF_KEEP_BF16_SRC=1 — the bf16_pv reclaim assumes a contiguous source
  * range, wrong for row-parallel strided slices. Returns 0 on success. */
@@ -3898,6 +3905,7 @@ typedef struct {
     int head_dim, kv_dim, gqa_ratio, seq_len, max_seq_len;
     int qhead_base;          /* global index of local head 0: kv_h = (qhead_base+h)/gqa_ratio.
                               * 0 except in TP KV-replicate mode (full KV cache, sharded Q). */
+    int kv_head_base;        /* local KV-cache offset: LOCAL kv = GLOBAL kv - kv_head_base */
     int n_kv_heads;          /* needed to index per-(pos, kv_h) scales */
     int kv_dtype;            /* TF_KV_DTYPE_F32 / F16 / Q8 */
     int k_transposed;        /* 1 = K stored [kv_h][d][p] (FMLA-into-att path) */
@@ -3912,6 +3920,7 @@ static void *tf_attn_worker(void *arg) {
     int hd = t->head_dim;
     for (int h = t->head_start; h < t->head_end; h++) {
         int kv_h = (t->qhead_base + h) / t->gqa_ratio;
+        kv_h -= t->kv_head_base;
         const float *q_h = t->q + h * hd;
         float *att_h = t->att + h * t->max_seq_len;
         int seq_len = t->seq_len;
@@ -4340,6 +4349,7 @@ typedef struct {
     int chunk_start, chunk_end;  /* position range, half-open */
     int head_dim, kv_dim, gqa_ratio;
     int qhead_base;              /* global index of local head 0 (TP KV-replicate); else 0 */
+    int kv_head_base;            /* local KV-cache offset: LOCAL kv = GLOBAL kv - kv_head_base */
     int n_kv_heads, kv_dtype;
     float scale;                 /* 1 / sqrt(head_dim) */
     /* outputs */
@@ -4354,6 +4364,7 @@ static void *tf_fa_chunk_worker(void *arg) {
     int p0  = t->chunk_start;
     int p1  = t->chunk_end;
     int kv_h = (t->qhead_base + t->head) / t->gqa_ratio;
+    kv_h -= t->kv_head_base;
     const float *q_h = t->q + (size_t)t->head * hd;
     size_t kv_eb = (t->kv_dtype == TF_KV_DTYPE_F32) ? 4 :
                    (t->kv_dtype == TF_KV_DTYPE_F16) ? 2 : 1;
@@ -4637,7 +4648,7 @@ static inline void tf_attention_fa(transformer_model *m, int layer,
                 .head = h,
                 .chunk_start = p0, .chunk_end = p1,
                 .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                .qhead_base = m->tp_qhead_offset,
+                .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                 .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                 .scale = scale,
                 .m_local   = &m->fa_m[(size_t)h * n_chunks + c],
@@ -4653,11 +4664,12 @@ static inline void tf_attention_fa(transformer_model *m, int layer,
         ctasks[t] = (tf_fa_chunk_task){
             .q = m->q,
             .key_cache = m->key_cache[layer], .value_cache = m->value_cache[layer],
-            .head = 0, .chunk_start = 0, .chunk_end = 0,
-            .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-            .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype, .scale = scale,
-            .m_local = &m->fa_m[0], .l_local = &m->fa_l[0], .out_local = &m->fa_out[0],
-        };
+                .head = 0, .chunk_start = 0, .chunk_end = 0,
+                .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                .kv_head_base = m->tp_kv_head_base,
+                .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype, .scale = scale,
+                .m_local = &m->fa_m[0], .l_local = &m->fa_l[0], .out_local = &m->fa_out[0],
+            };
     }
     /* Handle n_chunk_tasks > nt by serializing extras after dispatch — for
      * the cases we care about (16 heads × 3 chunks on 48 threads) this
@@ -4829,6 +4841,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
      * replication (TP where n_kv % tp_size != 0, local ratio no longer == group). */
     m->gqa_group     = (m->n_kv_heads > 0) ? (m->n_heads / m->n_kv_heads) : 1;
     m->tp_qhead_offset = 0;
+    m->tp_kv_head_base  = 0;
+    m->tp_kv_head_count = m->n_kv_heads;
     m->n_layers    = tf_get_int(gguf, ARCH_KEY("block_count"), 36);
     m->n_ff        = tf_get_int(gguf, ARCH_KEY("feed_forward_length"), 12288);
     m->n_vocab     = tf_get_int(gguf, ARCH_KEY("vocab_size"), 0);
@@ -8669,7 +8683,7 @@ static void *tf_persistent_worker(void *arg) {
                         .head_start = h_start, .head_end = h_start + h_count,
                         .head_dim = head_dim, .kv_dim = kv_dim,
                         .gqa_ratio = gqa_ratio,
-                        .qhead_base = m->tp_qhead_offset,
+                        .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                         .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                         .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                         .k_transposed = m->kv_k_transposed,
@@ -8702,8 +8716,17 @@ static void *tf_persistent_worker(void *arg) {
             PW_MARK(barrier);
         }
 
-        /* Thread 0: residual + FFN norm (merged B5+B6: saves 1 barrier) */
+        /* Thread 0: residual + FFN norm (merged B5+B6: saves 1 barrier).
+         * TP: the row-parallel mixer output projection (attn_output / ssm_out)
+         * produced a PARTIAL sum on m->xb — all-reduce across the TP group
+         * before the residual add, mirroring the per-op decode path (~9427).
+         * tid 0 owns the uTofu collective; the B6 barrier below publishes the
+         * reduced+normed xb to all threads. Dormant unless TP decode is routed
+         * through the persistent worker (tp_size>1). */
         if (tid == 0) {
+            if (m->tp_size > 1 && m->tp_allreduce_fn &&
+                ((m->is_hybrid && layer->is_ssm) ? m->tp_ssm_sharded : m->tp_attn_sharded))
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             tf_vadd(m->x, m->xb, n_embd);
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         }
@@ -8741,8 +8764,13 @@ static void *tf_persistent_worker(void *arg) {
             PW_BARRIER();  /* B8: xb ready */
             PW_MARK(barrier);
 
-            /* Thread 0: residual */
-            if (tid == 0) tf_vadd(m->x, m->xb, n_embd);
+            /* Thread 0: residual. TP: ffn_down is row-parallel → partial sum,
+             * all-reduce before the residual add (mirrors per-op path ~9635). */
+            if (tid == 0) {
+                if (m->tp_size > 1 && m->tp_allreduce_fn && m->tp_ffn_sharded)
+                    m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
+                tf_vadd(m->x, m->xb, n_embd);
+            }
         } else {
             /* MoE: thread 0 only (complex routing) */
             if (tid == 0) {
@@ -9221,7 +9249,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                             .value_scales = m->value_scales ? m->value_scales[l] : NULL,
                             .head_start = hoff, .head_end = hoff + hcount,
                             .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                            .qhead_base = m->tp_qhead_offset,
+                            .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                             .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                             .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                             .k_transposed = m->kv_k_transposed,
@@ -9241,7 +9269,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                     .value_scales = m->value_scales ? m->value_scales[l] : NULL,
                     .head_start = 0, .head_end = n_heads,
                     .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                    .qhead_base = m->tp_qhead_offset,
+                    .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                     .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                     .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                     .k_transposed = m->kv_k_transposed,
@@ -9366,7 +9394,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                             .value_scales = m->value_scales ? m->value_scales[l] : NULL,
                             .head_start = hoff, .head_end = hoff + hcount,
                             .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                            .qhead_base = m->tp_qhead_offset,
+                            .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                             .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                             .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                             .k_transposed = m->kv_k_transposed,
@@ -9386,7 +9414,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                     .value_scales = m->value_scales ? m->value_scales[l] : NULL,
                     .head_start = 0, .head_end = n_heads,
                     .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                    .qhead_base = m->tp_qhead_offset,
+                    .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                     .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                     .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                     .k_transposed = m->kv_k_transposed,
@@ -10329,6 +10357,10 @@ typedef struct {
     int q2_dim;
     int kv_dim;
     int gqa_ratio;
+    int qhead_base;
+    int kv_head_base;
+    /* Keep each local Q-head aligned with the global KV slice:
+     * kv_h = (qhead_base + h)/gqa_ratio - kv_head_base. */
     int q_tile;
     int k_tile;
     size_t scratch_stack_cap;
@@ -10412,7 +10444,8 @@ static void *tf_attn_prefill_tile_worker(void *arg) {
         int q1 = q0 + q_tile;
         if (q1 > M) q1 = M;
         int q_rows = q1 - q0;
-        int kv_h = h / t->gqa_ratio;
+        int kv_h = (t->qhead_base + h) / t->gqa_ratio;
+        kv_h -= t->kv_head_base;
         const float *q2_base = t->Q2 + (size_t)q0 * t->q2_dim;
 
         for (int qi = 0; qi < q_rows; qi++) {
@@ -10793,7 +10826,7 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
                                         float *AOut, float *O,
                                         int tiled,
                                         tf_ep_prefill_detail *pd) {
-    if (!m->is_hybrid || layer->is_ssm || m->tp_attn_sharded) return 0;
+    if (layer->is_ssm) return 0;
     if (!tf_prefill_weight_batched(&layer->attn_q) ||
         !tf_prefill_weight_batched(&layer->attn_k) ||
         !tf_prefill_weight_batched(&layer->attn_v) ||
@@ -10855,10 +10888,16 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
         }
 
     int nt = (m->n_threads > 1 && m->pool_alive) ? m->n_threads : 1;
-    int q_tile = getenv("EP_PREFILL_ATTN_TILE_Q") ? atoi(getenv("EP_PREFILL_ATTN_TILE_Q")) : 32;
-    int k_tile = getenv("EP_PREFILL_ATTN_TILE_K") ? atoi(getenv("EP_PREFILL_ATTN_TILE_K")) : 256;
-    int attn_tiled_algo = getenv("EP_PREFILL_ATTN_TILE_ALGO") ? atoi(getenv("EP_PREFILL_ATTN_TILE_ALGO")) : 0;
-    const char *stack_env = getenv("EP_PREFILL_ATTN_TILE_STACK_BYTES");
+    const char *q_tile_env = getenv("TP_PREFILL_ATTN_TILE_Q");
+    const char *k_tile_env = getenv("TP_PREFILL_ATTN_TILE_K");
+    const char *algo_env = getenv("TP_PREFILL_ATTN_TILE_ALGO");
+    const char *stack_env = getenv("TP_PREFILL_ATTN_TILE_STACK_BYTES");
+    if (!q_tile_env) q_tile_env = getenv("EP_PREFILL_ATTN_TILE_Q");
+    if (!k_tile_env) k_tile_env = getenv("EP_PREFILL_ATTN_TILE_K");
+    if (!algo_env)  algo_env  = getenv("EP_PREFILL_ATTN_TILE_ALGO");
+    int q_tile = q_tile_env ? atoi(q_tile_env) : 32;
+    int k_tile = k_tile_env ? atoi(k_tile_env) : 256;
+    int attn_tiled_algo = algo_env ? atoi(algo_env) : 0;
     size_t stack_cap = 2u << 20; /* 2 MiB hard cap for per-task scratch by default */
     if (stack_env) {
     long long parsed = atoll(stack_env);
@@ -10887,7 +10926,9 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
                         .tid = ti, .nt = nt, .M = M,
                         .n_heads = n_heads, .n_kv_heads = n_kv_heads,
                         .head_dim = head_dim, .q_dim = q_dim, .q2_dim = q2_dim,
-                        .kv_dim = kv_dim, .gqa_ratio = gqa_ratio, .q_tile = q_tile,
+                        .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                        .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
+                        .q_tile = q_tile,
                         .k_tile = k_tile, .scratch_stack_cap = stack_cap, .algo = attn_tiled_algo,
                         .scale = 1.0f / sqrtf((float)head_dim),
                     };
@@ -10899,7 +10940,9 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
                 .tid = 0, .nt = 1, .M = M,
                 .n_heads = n_heads, .n_kv_heads = n_kv_heads,
                 .head_dim = head_dim, .q_dim = q_dim, .q2_dim = q2_dim,
-                .kv_dim = kv_dim, .gqa_ratio = gqa_ratio, .q_tile = q_tile,
+                .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
+                .q_tile = q_tile,
                 .k_tile = k_tile, .scratch_stack_cap = stack_cap, .algo = attn_tiled_algo,
                 .scale = 1.0f / sqrtf((float)head_dim),
             };
@@ -10958,7 +11001,7 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
                         .value_scales = m->value_scales ? m->value_scales[l] : NULL,
                         .head_start = hoff, .head_end = hoff + hcount,
                         .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                        .qhead_base = m->tp_qhead_offset,
+                        .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                         .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                         .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                         .k_transposed = m->kv_k_transposed,
@@ -10977,7 +11020,7 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
                 .value_scales = m->value_scales ? m->value_scales[l] : NULL,
                 .head_start = 0, .head_end = n_heads,
                 .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                .qhead_base = m->tp_qhead_offset,
+                .qhead_base = m->tp_qhead_offset, .kv_head_base = m->tp_kv_head_base,
                 .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                 .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
                 .k_transposed = m->kv_k_transposed,
@@ -11477,12 +11520,30 @@ static int tf_ssm_prefill_layer_bf16pv(transformer_model *m, int layer_idx,
     int d_inner = m->ssm_d_inner;
     int dt_rank = m->ssm_dt_rank;
     int d_state = m->ssm_d_state;
-    if (!layer->is_ssm || m->tp_ssm_sharded ||
+    /* TP V-head sharding row-slices ssm_alpha/ssm_beta to the local dt_rank
+     * (4-5 at TP=11): < 8 and not a multiple of 8, so tf_bf16_pv_alloc rejects
+     * them and they never get a bf16_pv panel — even though ssm_qkv/gate/out DO
+     * panelize (their sliced dims stay 8/16-aligned). Requiring alpha/beta
+     * panels here forced ALL 48 SSM layers onto the per-token fallback (the 25x
+     * TP-prefill cliff). tf_gemm_bf16pv_prefill already falls back to pooled
+     * matvecs for a panel-less weight, and these are tiny [n_embd x 4-5]
+     * projections, so dropping the alpha/beta panel requirement lets the whole
+     * SSM layer batch with negligible extra cost. Env-gated for a clean A/B;
+     * default preserves the legacy (panel-required) behavior. */
+    /* Default ON: validated on 27B TP=11 (fallback_layers 48->0, SSM mixer
+     * 6.47->2.54s). Pure gate relaxation — tf_gemm_bf16pv_prefill still uses an
+     * alpha/beta panel if one exists, so this never disables a panel, only lets
+     * the row-sliced (n_rows<8) sharded case batch via the pooled-matvec fallback.
+     * Set TP_PREFILL_SSM_NOPANEL_AB=0 to restore the legacy panel-required gate. */
+    int ssm_nopanel_ab = getenv("TP_PREFILL_SSM_NOPANEL_AB")
+                             ? (atoi(getenv("TP_PREFILL_SSM_NOPANEL_AB")) != 0) : 1;
+    if (!layer->is_ssm ||
         !tf_prefill_weight_batched(&layer->ssm_qkv) ||
         !tf_prefill_weight_batched(&layer->ssm_gate) ||
-        !tf_prefill_weight_batched(&layer->ssm_alpha) ||
-        !tf_prefill_weight_batched(&layer->ssm_beta) ||
-        !tf_prefill_weight_batched(&layer->ssm_out))
+        !tf_prefill_weight_batched(&layer->ssm_out) ||
+        (!ssm_nopanel_ab &&
+         (!tf_prefill_weight_batched(&layer->ssm_alpha) ||
+          !tf_prefill_weight_batched(&layer->ssm_beta))))
         return 0;
 
     double t0 = pd ? tf_wall_seconds() : 0.0;
@@ -11505,10 +11566,12 @@ static int tf_ssm_prefill_layer_bf16pv(transformer_model *m, int layer_idx,
     float norm_w[128];
     tf_dequant_row(&layer->ssm_norm, 0, norm_w);
     t0 = pd ? tf_wall_seconds() : 0.0;
-    int null_finish = getenv("EP_PREFILL_SSM_NULL_FINISH") ?
-        (atoi(getenv("EP_PREFILL_SSM_NULL_FINISH")) != 0) : 0;
-    int block_finish = getenv("EP_PREFILL_SSM_BLOCK") ?
-        (atoi(getenv("EP_PREFILL_SSM_BLOCK")) != 0) : 1;
+    const char *null_env = getenv("TP_PREFILL_SSM_NULL_FINISH");
+    const char *block_env = getenv("TP_PREFILL_SSM_BLOCK");
+    if (!null_env) null_env = getenv("EP_PREFILL_SSM_NULL_FINISH");
+    if (!block_env) block_env = getenv("EP_PREFILL_SSM_BLOCK");
+    int null_finish = null_env ? (atoi(null_env) != 0) : 0;
+    int block_finish = block_env ? (atoi(block_env) != 0) : 1;
     if (null_finish) {
         memset(S, 0, (size_t)M * (size_t)d_inner * sizeof(float));
     } else if (block_finish) {
@@ -11961,13 +12024,47 @@ static void *tf_prefill_ft_worker(void *arg) {
     }
     return NULL;
 }
+
+static inline int tf_prefill_env_int(const char *name1, const char *name2, int def) {
+    const char *v = getenv(name1);
+    if (!v) v = getenv(name2);
+    if (!v) return def;
+    if (!strcasecmp(v, "0") || !strcasecmp(v, "false") || !strcasecmp(v, "off") ||
+        !strcasecmp(v, "no")) return 0;
+    if (!strcasecmp(v, "1") || !strcasecmp(v, "true") || !strcasecmp(v, "on") ||
+        !strcasecmp(v, "yes")) return 1;
+    return atoi(v) != 0;
+}
+
+static inline void tf_prefill_allreduce(transformer_model *m, float *x, size_t n_floats) {
+    if (!m || !m->tp_allreduce_fn || m->tp_size <= 1 || !x) return;
+    const size_t step = (size_t)INT_MAX;
+    for (size_t i = 0; i < n_floats; ) {
+        size_t n = n_floats - i;
+        if (n > step) n = step;
+        m->tp_allreduce_fn(x + i, (int)n, m->tp_allreduce_ctx);
+        i += n;
+    }
+}
+#else
+static inline int tf_prefill_env_int(const char *name1, const char *name2, int def) {
+    const char *v = getenv(name1);
+    if (!v) v = getenv(name2);
+    if (!v) return def;
+    if (!strcasecmp(v, "0") || !strcasecmp(v, "false") || !strcasecmp(v, "off") ||
+        !strcasecmp(v, "no")) return 0;
+    if (!strcasecmp(v, "1") || !strcasecmp(v, "true") || !strcasecmp(v, "on") ||
+        !strcasecmp(v, "yes")) return 1;
+    return atoi(v) != 0;
+}
+static inline void tf_prefill_allreduce(transformer_model *m, float *x, size_t n_floats) {
+    (void)m; (void)x; (void)n_floats;
+}
 #endif
 
 float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int M, int pos0) {
     if (!m || !tokens || M <= 0 || !m->token_embd.data) return NULL;
-    /* Supported: dense (non-MoE) SwiGLU FFN, non-Gemma4, pool alive. The mixer is
-     * reused per-token from tf_forward_blocks_range (hybrid SSM/gated-attn or
-     * standard attention); only the dense FFN is batched. */
+    /* Supported: dense (non-MoE) SwiGLU FFN, non-Gemma4, pool alive. */
     if (m->use_moe || m->is_gemma4 || !m->pool_alive || m->n_threads <= 1) return NULL;
     if (m->n_ff <= 0 || !m->has_lm_head) return NULL;
     transformer_layer *l0 = &m->layers[0];
@@ -11984,12 +12081,19 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
     float *G  = (float *)malloc(ff_elems  * sizeof(float));
     float *U  = (float *)malloc(ff_elems  * sizeof(float));
     float *D  = (float *)malloc(emb_elems * sizeof(float));
+
     if (!X || !Xn || !G || !U || !D) {
         free(X); free(Xn); free(G); free(U); free(D);
         fprintf(stderr, "transformer_prefill_gemm: alloc failed (M=%d, need ~%.1f GB)\n",
                 M, (2.0 * ff_elems + 3.0 * emb_elems) * 4.0 / 1e9);
         return NULL;
     }
+
+    int do_ffn_allreduce = tf_prefill_env_int("TP_PREFILL_FFN_ALLREDUCE", "EP_PREFILL_FFN_ALLREDUCE", 1);
+    int do_attn_gemm = tf_prefill_env_int("TP_PREFILL_ATTN_GEMM", "EP_PREFILL_ATTN_GEMM", 1);
+    int do_ssm_gemm  = tf_prefill_env_int("TP_PREFILL_SSM_GEMM",  "EP_PREFILL_SSM_GEMM",  1);
+    int attn_tiled = tf_prefill_env_int("TP_PREFILL_ATTN_TILE",  "EP_PREFILL_ATTN_TILE", 1);
+    int null_gemm = tf_prefill_env_int("TP_PREFILL_NULL_GEMM", "EP_PREFILL_NULL_GEMM", 0);
 
     /* Per-CMG first-touch so each CMG's token-slice of X/Xn/G/U/D lands on its own
      * HBM stack, matching the exact M-partition tf_gemm_bf16pv_prefill uses (MR=8).
@@ -12015,6 +12119,9 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
             ft[t] = (tf_prefill_ft_task){ t, ncmg, nt, n_embd, n_ff, X, Xn, G, U, D, m_lo, m_hi };
         tf_pool_dispatch(m, tf_prefill_ft_worker, ft, sizeof(tf_prefill_ft_task));
     }
+#else
+    do_attn_gemm = 0;
+    do_ssm_gemm = 0;
 #endif
 
     /* Embed all prompt tokens into the residual stream. */
@@ -12026,20 +12133,100 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
     struct timespec ta, tb;
 
     int n_layers = m->n_layers;
+    int fallback_layers = 0;
+
+#if defined(__ARM_FEATURE_SVE)
+    float *Q2  = NULL, *K = NULL, *V = NULL, *AOut = NULL;
+    float *QKV = NULL, *Z = NULL, *Alpha = NULL, *Beta = NULL, *S = NULL;
+    float *Q_exp = NULL, *K_exp = NULL;
+    if (!null_gemm) {
+        size_t q2_elems = (size_t)M * 2 * m->n_heads * m->head_dim;
+        size_t kv_elems = (size_t)M * m->n_kv_heads * m->head_dim;
+        size_t qkv_elems = (size_t)M * m->ssm_qkv_dim;
+        size_t inner_elems = (size_t)M * m->ssm_d_inner;
+        size_t alpha_elems = (size_t)M * m->ssm_dt_rank;
+        size_t exp_elems = (size_t)m->ssm_dt_rank * (size_t)m->ssm_d_state;
+
+        if (q2_elems > 0) {
+            Q2 = (float *)malloc(q2_elems * sizeof(float));
+            K  = (float *)malloc(kv_elems * sizeof(float));
+            V  = (float *)malloc(kv_elems * sizeof(float));
+            AOut = (float *)malloc((size_t)M * m->n_embd * sizeof(float));
+        }
+        if (exp_elems > 0) {
+            Q_exp = (float *)malloc(exp_elems * sizeof(float));
+            K_exp = (float *)malloc(exp_elems * sizeof(float));
+        }
+        if (qkv_elems > 0) {
+            QKV = (float *)malloc(qkv_elems * sizeof(float));
+            Z = (float *)malloc(inner_elems * sizeof(float));
+            Alpha = (float *)malloc(alpha_elems * sizeof(float));
+            Beta = (float *)malloc(alpha_elems * sizeof(float));
+            S = (float *)malloc(inner_elems * sizeof(float));
+        }
+    }
+#endif
+
     for (int l = 0; l < n_layers; l++) {
         transformer_layer *layer = &m->layers[l];
-
-        /* --- Mixer per token (in position order: KV cache + SSM recurrence stay causal) --- */
+        int mixer_ok = 0;
         if (tf_prefill_prof) clock_gettime(CLOCK_MONOTONIC, &ta);
         m->prefill_ffn_skip = 1;
-        for (int t = 0; t < M; t++) {
-            int pos = pos0 + t;
-            memcpy(m->x, X + (size_t)t * n_embd, n_embd * sizeof(float));
-            tf_forward_blocks_range(m, pos, pos, pos, pos, l, l + 1); /* attn_norm + mixer + residual */
-            memcpy(X + (size_t)t * n_embd, m->x, n_embd * sizeof(float));
-            /* FFN-norm input for this token (m->x is post-mixer residual). */
-            tf_rmsnorm(Xn + (size_t)t * n_embd, m->x, &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
+
+        if (null_gemm) {
+            if (m->tp_size > 1 && m->tp_allreduce_fn &&
+                ((layer->is_ssm) ? m->tp_ssm_sharded : m->tp_attn_sharded)) {
+                tf_prefill_allreduce(m, X, emb_elems);
+            }
+            m->prefill_ffn_skip = 0;
+            if (tf_prefill_prof) t_mixer += 0.0;
+            if (do_ffn_allreduce && m->tp_size > 1 && m->tp_allreduce_fn && m->tp_ffn_sharded) {
+                tf_prefill_allreduce(m, X, emb_elems);
+            }
+            if (tf_prefill_prof) t_ffn += 0.0;
+            continue;
         }
+
+#if defined(__ARM_FEATURE_SVE)
+        if (layer->is_ssm && do_ssm_gemm && m->is_hybrid && QKV && Z && Alpha && Beta && S && K_exp && Q_exp) {
+            mixer_ok = tf_ssm_prefill_layer_bf16pv(m, l, X, M, Xn, QKV, Z, Alpha, Beta,
+                                                  S, AOut, Q_exp, K_exp, NULL);
+        } else if (!layer->is_ssm && do_attn_gemm && Q2 && K && V && AOut) {
+            mixer_ok = tf_attn_prefill_layer_bf16pv(m, layer, l, X, M, pos0, Xn, Q2, K, V,
+                                                  AOut, AOut, attn_tiled, NULL);
+        }
+#endif
+
+        if (!mixer_ok) {
+            if (tf_prefill_prof && !m->is_hybrid) {
+                fprintf(stderr, "  [TF_PREFILL_PROF] M=%d layer=%d mixer fallback: full per-token path\n", M, l);
+            }
+            fallback_layers++;
+            for (int t = 0; t < M; t++) {
+                int pos = pos0 + t;
+                memcpy(m->x, X + (size_t)t * n_embd, n_embd * sizeof(float));
+                tf_forward_blocks_range(m, pos, pos, pos, pos, l, l + 1); /* attn_norm + mixer + residual */
+                memcpy(X + (size_t)t * n_embd, m->x, n_embd * sizeof(float));
+                tf_rmsnorm(Xn + (size_t)t * n_embd, m->x, &layer->ffn_norm,
+                           n_embd, eps, m->matvec_tmp);
+            }
+            m->prefill_ffn_skip = 0;
+            if (tf_prefill_prof) {
+                clock_gettime(CLOCK_MONOTONIC, &tb);
+                t_mixer += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            }
+            tf_gemm_bf16pv_prefill(m, G, &layer->ffn_gate, Xn, M);
+            tf_gemm_bf16pv_prefill(m, U, &layer->ffn_up, Xn, M);
+            tf_silu_mul_flat_pool(m, G, G, U, ff_elems);
+            tf_gemm_bf16pv_prefill(m, D, &layer->ffn_down, G, M);
+            tf_vadd_flat_pool(m, X, D, emb_elems);
+            if (tf_prefill_prof) {
+                clock_gettime(CLOCK_MONOTONIC, &tb);
+                t_ffn += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            }
+            continue;
+        }
+
         m->prefill_ffn_skip = 0;
         if (tf_prefill_prof) {
             clock_gettime(CLOCK_MONOTONIC, &tb);
@@ -12047,27 +12234,52 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
             ta = tb;
         }
 
-        /* --- Batched dense SwiGLU FFN over all M tokens --- */
-        tf_gemm_bf16pv_prefill(m, G, &layer->ffn_gate, Xn, M);  /* G = Xn @ Wgate^T  [M,n_ff] */
-        tf_gemm_bf16pv_prefill(m, U, &layer->ffn_up,   Xn, M);  /* U = Xn @ Wup^T    [M,n_ff] */
-        tf_silu_mul_flat_pool(m, G, G, U, ff_elems);            /* G = silu(G) * U   [M,n_ff] (pooled) */
-        tf_gemm_bf16pv_prefill(m, D, &layer->ffn_down, G, M);   /* D = G  @ Wdown^T  [M,n_embd] */
-        tf_vadd_flat_pool(m, X, D, emb_elems);                  /* residual: X += D (pooled) */
+#if defined(__ARM_FEATURE_SVE)
+        if (m->tp_size > 1 && m->tp_allreduce_fn &&
+            ((layer->is_ssm) ? m->tp_ssm_sharded : m->tp_attn_sharded)) {
+            tf_prefill_allreduce(m, X, emb_elems);
+        }
+#endif
+
+        if (tf_prefill_prof) {
+            clock_gettime(CLOCK_MONOTONIC, &ta);
+        }
+        tf_gemm_bf16pv_prefill(m, G, &layer->ffn_gate, Xn, M);
+        tf_gemm_bf16pv_prefill(m, U, &layer->ffn_up, Xn, M);
+        tf_silu_mul_flat_pool(m, G, G, U, ff_elems);
+        tf_gemm_bf16pv_prefill(m, D, &layer->ffn_down, G, M);
+        tf_vadd_flat_pool(m, X, D, emb_elems);
+        if (do_ffn_allreduce && m->tp_size > 1 && m->tp_allreduce_fn && m->tp_ffn_sharded) {
+            tf_prefill_allreduce(m, X, emb_elems);
+        }
         if (tf_prefill_prof) {
             clock_gettime(CLOCK_MONOTONIC, &tb);
             t_ffn += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
         }
+#endif
     }
-    if (tf_prefill_prof)
-        fprintf(stderr, "  [TF_PREFILL_PROF] M=%d mixer(per-token)=%.2fs  FFN(batched-GEMM)=%.2fs\n",
-                M, t_mixer, t_ffn);
 
-    /* Final RMSNorm + lm_head on the last prompt token only. */
+    if (tf_prefill_prof) {
+        fprintf(stderr, "  [TF_PREFILL_PROF] M=%d mixer(gemm)=%.2fs  FFN(batched-GEMM)=%.2fs  fallback_layers=%d\n",
+                M, t_mixer, t_ffn, fallback_layers);
+    }
+
+    /* Final RMSNorm + lm_head on the last prompt token only.
+     * Under TP the lm_head (m->output) is VOCAB-SHARDED to m->output.n_rows
+     * (= tp_vocab_loc, e.g. 22576 at TP=11). Computing the full n_vocab rows
+     * reads m->output.data far past the local shard → SIGSEGV. Compute only the
+     * local shard; the caller's sample_argmax() does the cross-shard argmax
+     * all-reduce. n_rows == n_vocab when not sharded, so this is universal. */
     memcpy(m->x, X + (size_t)(M - 1) * n_embd, n_embd * sizeof(float));
     tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, eps, m->matvec_tmp);
-    tf_qmatvec_pool(m, m->logits, &m->output, m->x, n_vocab);
+    tf_qmatvec_pool(m, m->logits, &m->output, m->x, m->output.n_rows);
 
     free(X); free(Xn); free(G); free(U); free(D);
+#if defined(__ARM_FEATURE_SVE)
+    free(Q2); free(K); free(V); free(AOut);
+    free(QKV); free(Z); free(Alpha); free(Beta); free(S);
+    free(Q_exp); free(K_exp);
+#endif
     return m->logits;
 }
 
@@ -12285,8 +12497,11 @@ int transformer_tp_slice_weights(transformer_model *m, int tp_rank, int tp_size,
     if (do_ssm && vh_hi <= vh_lo) do_ssm = 0;
 
     /* KV-replicate: full KV cache stays, so the kernel must map the GLOBAL query head
-     * (qh_lo + local h) to its KV head; clean-divide rebases to a local cache (offset 0). */
+     * (qh_lo + local h) to its KV head; clean-divide sharding rebases to a local
+     * cache offset. */
     m->tp_qhead_offset = (do_attn && kv_replicate) ? qh_lo : 0;
+    m->tp_kv_head_base  = (do_attn && !kv_replicate) ? kh_lo : 0;
+    m->tp_kv_head_count = do_attn ? (kv_replicate ? n_kv : (kh_hi - kh_lo)) : n_kv;
 
     for (int l = 0; l < m->n_layers; l++) {
         transformer_layer *L = &m->layers[l];
@@ -12545,6 +12760,21 @@ float *transformer_compute_logits(transformer_model *model) {
 float *transformer_forward_partial(transformer_model *m, int cache_pos,
                                     int layer_start, int layer_end) {
     if (!m) return NULL;
+    /* Full-range forward with a live thread pool: route through the persistent
+     * worker (ONE pool dispatch/token, internal HW/spin barriers, fully
+     * parallel SSM) instead of the per-op block loop (~320 dispatches/token).
+     * The persistent worker carries the SAME TP all-reduce hooks as the per-op
+     * path (mixer-out after attn/ssm out-proj, ffn-down), issued tid-0-only in
+     * identical count+order, so TP decode stays byte-identical / lockstep-argmax
+     * safe. PP partial ranges (layer_start>0 or layer_end<n_layers) keep the
+     * per-op loop, which is the only path that supports partial layer spans.
+     * Env TP_DECODE_PERSIST=0 forces the per-op path for A/B. */
+    static int persist = -1;
+    if (persist < 0)
+        persist = getenv("TP_DECODE_PERSIST") ? atoi(getenv("TP_DECODE_PERSIST")) : 1;
+    if (persist && layer_start == 0 && layer_end == m->n_layers &&
+        m->n_threads > 1 && m->pool_alive)
+        return tf_forward_persistent(m, cache_pos, cache_pos, cache_pos, cache_pos);
     return tf_forward_blocks_range(m, cache_pos, cache_pos, cache_pos, cache_pos,
                                     layer_start, layer_end);
 }
@@ -13726,4 +13956,3 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 }
 
 #endif /* TRANSFORMER_IMPLEMENTATION */
-#endif /* TRANSFORMER_H */
