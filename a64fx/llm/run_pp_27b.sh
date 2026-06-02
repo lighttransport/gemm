@@ -26,8 +26,18 @@ cd "$LLM_DIR"
 UTOFU_DIR="$LLM_DIR/../utofu-tests"
 
 MODEL=${MODEL:-$HOME/models/qwen36/27b/12nodes/Qwen3.6-27B-BF16-00001-of-00002.gguf}
+QWEN27B_SOURCE=${QWEN27B_SOURCE:-$HOME/models/qwen36/27b}
+QWEN27B_PACKAGE=${QWEN27B_PACKAGE:-$HOME/models/qwen36/27b/12nodes}
 NP=${NP:-${PJM_NODE:-4}}
 export QWEN27B_LOCAL_DIR=${QWEN27B_LOCAL_DIR:-/local/qwen36/27b}
+
+if [ "${QWEN27B_PREPARE:-1}" != "0" ]; then
+    chmod +x "$LLM_DIR/prepare_qwen36_27b_12nodes.sh"
+    "$LLM_DIR/prepare_qwen36_27b_12nodes.sh" "$QWEN27B_SOURCE" "$QWEN27B_PACKAGE"
+    if [ "$MODEL" = "$QWEN27B_SOURCE/$(basename "$MODEL")" ]; then
+        MODEL="$QWEN27B_PACKAGE/$(basename "$MODEL")"
+    fi
+fi
 
 export GGUF_LAZY_MMAP=1
 export LLM_THREADS=${LLM_THREADS:-48}
