@@ -24,6 +24,20 @@ export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:/usr/local/bi
 LLM_DIR="$(cd "$(dirname "$0")" && pwd)"; cd "$LLM_DIR"
 UTOFU_DIR="$LLM_DIR/../utofu-tests"
 
+# Optional rank-placement file. When set (e.g. VCOORD=vcoord_no0.txt to exclude
+# the relative-(0,0,0) node so a co-located interactive session is not OOM-killed),
+# every mpiexec below is pinned to exactly those nodes, and the topo step is NOT
+# allowed to re-place ranks onto the excluded node. Empty => legacy behavior.
+MPI_PLACE=()
+if [ -n "${VCOORD:-}" ]; then
+    [ -f "$VCOORD" ] || { echo "VCOORD file not found: $VCOORD" >&2; exit 1; }
+    MPI_PLACE=(-vcoordfile "$VCOORD")
+    echo "[run_tp_27b] pinning all mpiexec to -vcoordfile $VCOORD"
+fi
+# Skip the topo-regeneration step (keep an externally-prepared tofu_topo.txt, e.g.
+# tofu_topo.txt.no0 already copied into place). SKIP_TOPO=1 to use as-is.
+SKIP_TOPO=${SKIP_TOPO:-0}
+
 NP=${NP:-${PJM_NODE:-4}}
 QWEN27B_NODES=${QWEN27B_NODES:-$NP}
 QWEN27B_SOURCE=${QWEN27B_SOURCE:-$HOME/models/qwen36/27b}
@@ -42,24 +56,55 @@ export GGUF_LAZY_MMAP=1
 export LLM_THREADS=${LLM_THREADS:-48}
 export OMP_NUM_THREADS=${LLM_THREADS}
 export TP_PROMPT=${TP_PROMPT:-"Hello, who are you?"}
+export TP_SYNTH_TOKENS=${TP_SYNTH_TOKENS:-0}
 export TP_MAXGEN=${TP_MAXGEN:-32}
+export TP_MAXSEQ=${TP_MAXSEQ:-0}
 export QWEN27B_LOCAL_DIR=${QWEN27B_LOCAL_DIR:-/local/qwen36/27b}
+export TP_PREFILL_ONLY=${TP_PREFILL_ONLY:-0}
+export TP_PREFILL_GEMM=${TP_PREFILL_GEMM:-1}
+export TP_PREFILL_ATTN_TILE=${TP_PREFILL_ATTN_TILE:-1}
+export TP_PREFILL_ATTN_TILE_Q=${TP_PREFILL_ATTN_TILE_Q:-32}
+export TP_PREFILL_ATTN_TILE_K=${TP_PREFILL_ATTN_TILE_K:-256}
+export TP_PREFILL_ATTN_TILE_ALGO=${TP_PREFILL_ATTN_TILE_ALGO:-0}
+export TP_PREFILL_ATTN_TILE_STACK_BYTES=${TP_PREFILL_ATTN_TILE_STACK_BYTES:-2097152}
+export TP_PREFILL_NULL_GEMM=${TP_PREFILL_NULL_GEMM:-0}
+export TP_PREFILL_SSM_GEMM=${TP_PREFILL_SSM_GEMM:-1}
+export TP_PREFILL_SSM_BLOCK=${TP_PREFILL_SSM_BLOCK:-1}
+export TP_PREFILL_SSM_NULL_FINISH=${TP_PREFILL_SSM_NULL_FINISH:-0}
+export TP_PREFILL_FFN_ALLREDUCE=${TP_PREFILL_FFN_ALLREDUCE:-1}
+export TP_AR_BF16=${TP_AR_BF16:-1}
+export TP_CACHE_SHARED=${TP_CACHE_SHARED:-auto}
+export TP_CACHE_DIR=${TP_CACHE_DIR:-"${QWEN27B_LOCAL_DIR}/tp_cache/${QWEN27B_NODES}"}
+export TP_CACHE_TAG=${TP_CACHE_TAG:-"tp_np${NP}"}
+export TP_CACHE_LOAD=${TP_CACHE_LOAD:-0}
+export TP_CACHE_SAVE=${TP_CACHE_SAVE:-0}
+export TP_DRY=${TP_DRY:-0}
+export TP_DRY_PREFILL=${TP_DRY_PREFILL:-$TP_DRY}
+export TP_DRY_DECODE=${TP_DRY_DECODE:-0}
+export TP_DRY_WORK_REPS=${TP_DRY_WORK_REPS:-0}
+export TP_DRY_AR_STEPS=${TP_DRY_AR_STEPS:-0}
+export TP_DRY_TOKEN_STEP=${TP_DRY_TOKEN_STEP:-1}
 # long-context perf sweep knobs (per-token decode cost vs ctx -> tp_curve_rank00.txt)
 [ -n "$TP_MAXSEQ" ]     && export TP_MAXSEQ
 [ -n "$TP_IGNORE_EOS" ] && export TP_IGNORE_EOS
 
 if [ "${SKIP_STAGE:-0}" != "1" ]; then
     chmod +x "$LLM_DIR/stage_gguf_shards.sh"
-    mpiexec -np "$NP" "$LLM_DIR/stage_gguf_shards.sh" "$MODEL" "$QWEN27B_LOCAL_DIR"
+    mpiexec -np "$NP" "${MPI_PLACE[@]}" "$LLM_DIR/stage_gguf_shards.sh" "$MODEL" "$QWEN27B_LOCAL_DIR"
 fi
 MODEL_LOCAL="$QWEN27B_LOCAL_DIR/$(basename "$MODEL")"
-if [ ! -f "$MODEL_LOCAL" ]; then
+# The /local existence check only makes sense when the launcher node is itself a
+# run node. With VCOORD set we deliberately exclude this (launcher) node from the
+# run, so its /local is empty by design — staging happened on the run nodes only.
+# Each rank verifies its own /local at load time, so skip the launcher-side check.
+if [ -z "${VCOORD:-}" ] && [ ! -f "$MODEL_LOCAL" ]; then
     echo "model local missing after stage: $MODEL_LOCAL" >&2
     exit 1
 fi
 
 echo "=== TP-only 27B decode on $NP node(s) ==="
 echo "model=$MODEL_LOCAL  source=$MODEL  threads=$LLM_THREADS  maxgen=$TP_MAXGEN"
+echo "knobs prefill_only=$TP_PREFILL_ONLY prefill_gemm=$TP_PREFILL_GEMM null_gemm=$TP_PREFILL_NULL_GEMM attn_tile=$TP_PREFILL_ATTN_TILE q=$TP_PREFILL_ATTN_TILE_Q k=$TP_PREFILL_ATTN_TILE_K algo=$TP_PREFILL_ATTN_TILE_ALGO stack=$TP_PREFILL_ATTN_TILE_STACK_BYTES ssm_gemm=$TP_PREFILL_SSM_GEMM ssm_block=$TP_PREFILL_SSM_BLOCK ssm_null=$TP_PREFILL_SSM_NULL_FINISH ffn_allreduce=$TP_PREFILL_FFN_ALLREDUCE ar_bf16=$TP_AR_BF16 cache_shared=$TP_CACHE_SHARED"
 
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
 if [ -n "$PROF" ]; then
@@ -71,10 +116,14 @@ else
 fi
 
 rm -f tp_run_*.txt tp_load_rank*.txt tp_perf_rank*.txt tp_stderr_rank*.txt
-mpiexec -np "$NP" "$UTOFU_DIR/tofu_topo_helper"
+if [ "$SKIP_TOPO" != "1" ]; then
+    mpiexec -np "$NP" "${MPI_PLACE[@]}" "$UTOFU_DIR/tofu_topo_helper"
+else
+    echo "[run_tp_27b] SKIP_TOPO=1: using existing tofu_topo.txt"
+fi
 echo "--- tofu topo ---"; cat tofu_topo.txt
 echo "--- launching $(basename "$BIN") (NP=$NP) ---"
-mpiexec -np "$NP" "$BIN" "$MODEL_LOCAL"
+mpiexec -np "$NP" "${MPI_PLACE[@]}" "$BIN" "$MODEL_LOCAL"
 echo "=== per-rank load/shard dims ==="; cat tp_load_rank*.txt 2>/dev/null
 echo "=== per-rank decode perf (compute/comm/GB-s) ==="; cat tp_perf_rank*.txt 2>/dev/null
 echo "=== rank0 decode output ==="; cat $(ls -t tp_run_*.txt | head -1) 2>/dev/null
