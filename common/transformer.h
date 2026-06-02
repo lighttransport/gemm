@@ -12129,7 +12129,10 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
         tf_dequant_row(&m->token_embd, tokens[t], X + (size_t)t * n_embd);
 
     int tf_prefill_prof = (getenv("TF_PREFILL_PROF") != NULL);
-    double t_mixer = 0.0, t_ffn = 0.0;
+    /* Per-phase split: t_attn (16 full-attn mixers), t_ssm (48 SSM mixers),
+     * t_ffn (batched FFN GEMM only), t_ar (mixer-out + FFN all-reduce, which the
+     * old {t_mixer,t_ffn}-only profiler dropped on the floor). */
+    double t_attn = 0.0, t_ssm = 0.0, t_ffn = 0.0, t_ar = 0.0;
     struct timespec ta, tb;
 
     int n_layers = m->n_layers;
@@ -12179,11 +12182,13 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
                 tf_prefill_allreduce(m, X, emb_elems);
             }
             m->prefill_ffn_skip = 0;
-            if (tf_prefill_prof) t_mixer += 0.0;
             if (do_ffn_allreduce && m->tp_size > 1 && m->tp_allreduce_fn && m->tp_ffn_sharded) {
                 tf_prefill_allreduce(m, X, emb_elems);
             }
-            if (tf_prefill_prof) t_ffn += 0.0;
+            if (tf_prefill_prof) {   /* null_gemm probe: all time here is pure AR+norm */
+                clock_gettime(CLOCK_MONOTONIC, &tb);
+                t_ar += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            }
             continue;
         }
 
@@ -12213,7 +12218,9 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
             m->prefill_ffn_skip = 0;
             if (tf_prefill_prof) {
                 clock_gettime(CLOCK_MONOTONIC, &tb);
-                t_mixer += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+                double dt = (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+                if (layer->is_ssm) t_ssm += dt; else t_attn += dt;
+                ta = tb;   /* so t_ffn below is FFN-only, not mixer+FFN */
             }
             tf_gemm_bf16pv_prefill(m, G, &layer->ffn_gate, Xn, M);
             tf_gemm_bf16pv_prefill(m, U, &layer->ffn_up, Xn, M);
@@ -12230,7 +12237,8 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
         m->prefill_ffn_skip = 0;
         if (tf_prefill_prof) {
             clock_gettime(CLOCK_MONOTONIC, &tb);
-            t_mixer += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            double dt = (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            if (layer->is_ssm) t_ssm += dt; else t_attn += dt;
             ta = tb;
         }
 
@@ -12241,27 +12249,34 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
         }
 #endif
 
-        if (tf_prefill_prof) {
-            clock_gettime(CLOCK_MONOTONIC, &ta);
+        if (tf_prefill_prof) {   /* mixer-out all-reduce (the old profiler dropped this) */
+            clock_gettime(CLOCK_MONOTONIC, &tb);
+            t_ar += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            ta = tb;
         }
         tf_gemm_bf16pv_prefill(m, G, &layer->ffn_gate, Xn, M);
         tf_gemm_bf16pv_prefill(m, U, &layer->ffn_up, Xn, M);
         tf_silu_mul_flat_pool(m, G, G, U, ff_elems);
         tf_gemm_bf16pv_prefill(m, D, &layer->ffn_down, G, M);
         tf_vadd_flat_pool(m, X, D, emb_elems);
+        if (tf_prefill_prof) {   /* FFN batched GEMM only (AR split out below) */
+            clock_gettime(CLOCK_MONOTONIC, &tb);
+            t_ffn += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            ta = tb;
+        }
         if (do_ffn_allreduce && m->tp_size > 1 && m->tp_allreduce_fn && m->tp_ffn_sharded) {
             tf_prefill_allreduce(m, X, emb_elems);
         }
-        if (tf_prefill_prof) {
+        if (tf_prefill_prof) {   /* FFN all-reduce */
             clock_gettime(CLOCK_MONOTONIC, &tb);
-            t_ffn += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            t_ar += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
         }
 #endif
     }
 
     if (tf_prefill_prof) {
-        fprintf(stderr, "  [TF_PREFILL_PROF] M=%d mixer(gemm)=%.2fs  FFN(batched-GEMM)=%.2fs  fallback_layers=%d\n",
-                M, t_mixer, t_ffn, fallback_layers);
+        fprintf(stderr, "  [TF_PREFILL_PROF] M=%d attn=%.2fs ssm=%.2fs ffn=%.2fs ar=%.2fs (mixer=%.2fs) fallback_layers=%d\n",
+                M, t_attn, t_ssm, t_ffn, t_ar, t_attn + t_ssm, fallback_layers);
     }
 
     /* Final RMSNorm + lm_head on the last prompt token only.
