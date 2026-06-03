@@ -227,6 +227,15 @@ typedef struct {
     float *att_pmax;         /* [n_threads * n_heads] per-thread per-head partial max,
                               * for the position-parallel softmax (kv_k_dp path). */
     float *att_psum;         /* [n_threads * n_heads] per-thread per-head partial sum_exp. */
+    int attn_pp;             /* position-parallel attention for the per-head (non-K_DP)
+                              * decode path. When a rank has few local heads (TP shards
+                              * 24 heads to 2-3/rank) the head-parallel worker idles
+                              * 45 of 48 threads; this splits each head's positions over
+                              * all threads (every thread does ALL local heads over its
+                              * p-chunk) with an intra-rank online-softmax merge, reusing
+                              * av_tmp/att_pmax/att_psum. Standard KV layout, global GQA
+                              * mapping. F16/F32 KV only. Default ON when eligible
+                              * (!kv_k_dp); opt out with TF_ATTN_PP=0. */
 
     /* Scratch buffers */
     float *x;        /* [n_embd] current hidden state */
@@ -3858,6 +3867,138 @@ static inline void tf_av_chunk_q8(const int8_t *V, const float *scales,
     }
 }
 
+/* ---- Position-parallel attention kernels (attn_pp, non-K_DP path) ----
+ * Standard KV layout K/V[p][kv_h][d] (kv_dim = n_kv_heads*head_dim row stride),
+ * per-head GLOBAL GQA mapping kv_h = (qhead_base + h)/gqa_ratio - kv_head_base
+ * — identical to tf_attn_worker, so results match head-parallel attention up to
+ * reduction order. Each thread computes ALL n_heads local heads over its
+ * p-range [p_lo,p_hi); the caller does the cross-thread online-softmax merge
+ * via att_pmax/att_psum + av_tmp reduce (shared with the K_DP path). att is
+ * indexed [h*max_seq_len + p]; out_tmp is the per-thread [n_heads*head_dim]
+ * partial (zeroed by the caller before AV). */
+static inline void tf_qk_chunk_pp_f16(const uint16_t *K, const float *q,
+                                      float *att, int p_lo, int p_hi,
+                                      int n_heads, int qhead_base, int gqa_ratio,
+                                      int kv_head_base, int head_dim, int kv_dim,
+                                      int max_seq_len, float scale) {
+    svbool_t pg = svptrue_b32();
+    int vl = (int)svcntw();
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = (qhead_base + h) / gqa_ratio - kv_head_base;
+        const float *q_h = q + (size_t)h * head_dim;
+        float *att_h = att + (size_t)h * max_seq_len;
+        for (int p = p_lo; p < p_hi; p++) {
+            const uint16_t *k_p = K + (size_t)p * kv_dim + (size_t)kv_h * head_dim;
+            if (p + 2 < p_hi)
+                __builtin_prefetch(K + (size_t)(p + 2) * kv_dim + (size_t)kv_h * head_dim, 0, 1);
+            svfloat32_t acc = svdup_f32(0.0f);
+            int d = 0;
+            for (; d + vl - 1 < head_dim; d += vl) {
+                svuint32_t ku = svld1uh_u32(pg, k_p + d);
+                svfloat32_t kf = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(ku));
+                acc = svmla_x(pg, acc, svld1(pg, q_h + d), kf);
+            }
+            if (d < head_dim) {
+                svbool_t pt = svwhilelt_b32(d, head_dim);
+                svuint32_t ku = svld1uh_u32(pt, k_p + d);
+                svfloat32_t kf = svcvt_f32_f16_x(pt, svreinterpret_f16_u32(ku));
+                acc = svmla_m(pt, acc, svld1(pt, q_h + d), kf);
+            }
+            att_h[p] = svaddv(pg, acc) * scale;
+        }
+    }
+}
+
+static inline void tf_qk_chunk_pp_f32(const float *K, const float *q,
+                                      float *att, int p_lo, int p_hi,
+                                      int n_heads, int qhead_base, int gqa_ratio,
+                                      int kv_head_base, int head_dim, int kv_dim,
+                                      int max_seq_len, float scale) {
+    svbool_t pg = svptrue_b32();
+    int vl = (int)svcntw();
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = (qhead_base + h) / gqa_ratio - kv_head_base;
+        const float *q_h = q + (size_t)h * head_dim;
+        float *att_h = att + (size_t)h * max_seq_len;
+        for (int p = p_lo; p < p_hi; p++) {
+            const float *k_p = K + (size_t)p * kv_dim + (size_t)kv_h * head_dim;
+            if (p + 2 < p_hi)
+                __builtin_prefetch(K + (size_t)(p + 2) * kv_dim + (size_t)kv_h * head_dim, 0, 1);
+            svfloat32_t acc = svdup_f32(0.0f);
+            int d = 0;
+            for (; d + vl - 1 < head_dim; d += vl)
+                acc = svmla_x(pg, acc, svld1(pg, q_h + d), svld1(pg, k_p + d));
+            if (d < head_dim) {
+                svbool_t pt = svwhilelt_b32(d, head_dim);
+                acc = svmla_m(pt, acc, svld1(pt, q_h + d), svld1(pt, k_p + d));
+            }
+            att_h[p] = svaddv(pg, acc) * scale;
+        }
+    }
+}
+
+static inline void tf_av_chunk_pp_f16(const uint16_t *V, const float *att,
+                                      float *out_tmp, int p_lo, int p_hi,
+                                      int n_heads, int qhead_base, int gqa_ratio,
+                                      int kv_head_base, int head_dim, int kv_dim,
+                                      int max_seq_len) {
+    svbool_t pg = svptrue_b32();
+    int vl = (int)svcntw();
+    for (int p = p_lo; p < p_hi; p++) {
+        const uint16_t *vp = V + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(V + (size_t)(p + 2) * kv_dim, 0, 1);
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = (qhead_base + h) / gqa_ratio - kv_head_base;
+            svfloat32_t a = svdup_f32(att[(size_t)h * max_seq_len + p]);
+            const uint16_t *v = vp + (size_t)kv_h * head_dim;
+            float *o = out_tmp + (size_t)h * head_dim;
+            int d = 0;
+            for (; d + vl - 1 < head_dim; d += vl) {
+                svuint32_t vu = svld1uh_u32(pg, v + d);
+                svfloat32_t vv = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(vu));
+                svst1(pg, o + d, svmla_x(pg, svld1(pg, o + d), a, vv));
+            }
+            if (d < head_dim) {
+                svbool_t pt = svwhilelt_b32(d, head_dim);
+                svuint32_t vu = svld1uh_u32(pt, v + d);
+                svfloat32_t vv = svcvt_f32_f16_x(pt, svreinterpret_f16_u32(vu));
+                svst1(pt, o + d, svmla_m(pt, svld1(pt, o + d), a, vv));
+            }
+        }
+    }
+}
+
+static inline void tf_av_chunk_pp_f32(const float *V, const float *att,
+                                      float *out_tmp, int p_lo, int p_hi,
+                                      int n_heads, int qhead_base, int gqa_ratio,
+                                      int kv_head_base, int head_dim, int kv_dim,
+                                      int max_seq_len) {
+    svbool_t pg = svptrue_b32();
+    int vl = (int)svcntw();
+    for (int p = p_lo; p < p_hi; p++) {
+        const float *vp = V + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(V + (size_t)(p + 2) * kv_dim, 0, 1);
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = (qhead_base + h) / gqa_ratio - kv_head_base;
+            svfloat32_t a = svdup_f32(att[(size_t)h * max_seq_len + p]);
+            const float *v = vp + (size_t)kv_h * head_dim;
+            float *o = out_tmp + (size_t)h * head_dim;
+            int d = 0;
+            for (; d + vl - 1 < head_dim; d += vl) {
+                svfloat32_t vv = svld1(pg, v + d);
+                svst1(pg, o + d, svmla_x(pg, svld1(pg, o + d), a, vv));
+            }
+            if (d < head_dim) {
+                svbool_t pt = svwhilelt_b32(d, head_dim);
+                svfloat32_t vv = svld1(pt, v + d);
+                svst1(pt, o + d, svmla_m(pt, svld1(pt, o + d), a, vv));
+            }
+        }
+    }
+}
+
 /* Reduce av_tmp across nt threads into out[head*head_dim + d_lo..d_hi].
  * Each thread is responsible for some (h, d-slice); the caller chooses the
  * partition so that all (h, d) are covered exactly once across the pool. */
@@ -5327,6 +5468,24 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             }
         }
     }
+    /* Position-parallel attention for the per-head (non-K_DP) decode path.
+     * Eligible when K_DP is off (n_heads != 16) so a TP-sharded rank with few
+     * local heads doesn't idle 45 of 48 threads in tf_attn_worker. Reuses the
+     * K_DP position-parallel machinery + buffers (av_tmp/att_pmax/att_psum) but
+     * with standard KV layout and the global GQA mapping. F16/F32 KV only
+     * (Q8 falls back to head-parallel). Default ON when eligible; TF_ATTN_PP=0
+     * opts out. Engages at runtime only when nt > n_heads (else no benefit). */
+    m->attn_pp = 0;
+    if (!m->kv_k_dp && !m->kv_k_transposed && !m->is_gemma4 &&
+        m->kv_dtype != TF_KV_DTYPE_Q8) {
+        const char *pp_env = getenv("TF_ATTN_PP");
+        int pp_want = 1;  /* default ON */
+        if (pp_env && (pp_env[0] == '0' || !strcmp(pp_env, "off") || !strcmp(pp_env, "no")))
+            pp_want = 0;
+        m->attn_pp = pp_want;
+        if (pp_want)
+            fprintf(stderr, "transformer: position-parallel attention enabled (attn_pp, n_heads=%d)\n", m->n_heads);
+    }
     int kv_dim = m->n_kv_heads * m->head_dim;
     m->key_cache    = (void  **)calloc(m->n_layers, sizeof(void  *));
     m->value_cache  = (void  **)calloc(m->n_layers, sizeof(void  *));
@@ -5474,8 +5633,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->k         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
     m->v         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
     m->att       = (float *)tf_aligned_calloc(256, m->n_heads * max_seq_len, sizeof(float));
-    if (m->kv_k_dp) {
-        m->q_packed = (float *)tf_aligned_calloc(256, (size_t)m->head_dim * m->n_heads, sizeof(float));
+    if (m->kv_k_dp || m->attn_pp) {
+        if (m->kv_k_dp)  /* q_packed is K_DP-only (attn_pp reads m->q directly) */
+            m->q_packed = (float *)tf_aligned_calloc(256, (size_t)m->head_dim * m->n_heads, sizeof(float));
         m->av_tmp = (float *)tf_aligned_calloc(256,
             (size_t)m->n_threads * m->n_heads * m->head_dim, sizeof(float));
         m->att_pmax = (float *)tf_aligned_calloc(256,
@@ -6152,7 +6312,7 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     if (model->use_moe && 2 * model->n_embd > max_dim) max_dim = 2 * model->n_embd;
     model->n_threads = n_threads;
     /* AV-parallel scratch sized by n_threads: reallocate if pool grew. */
-    if (model->kv_k_dp) {
+    if (model->kv_k_dp || model->attn_pp) {
         if (model->av_tmp) free(model->av_tmp);
         model->av_tmp = (float *)tf_aligned_calloc(256,
             (size_t)n_threads * model->n_heads * model->head_dim, sizeof(float));
@@ -8551,6 +8711,49 @@ static void *tf_persistent_worker(void *arg) {
                 PW_BARRIER();  /* att rows ready (+ att_pmax when tf_psm) */
                 PW_MARK(barrier);
                 pw_skip_qk = 1;
+            } else if (m->attn_pp && tf_psm && m->av_tmp && nt > n_heads && n_heads <= 64) {
+                /* Position-parallel attention for the per-head (non-K_DP) path:
+                 * every thread computes ALL local heads over its p-chunk, then the
+                 * shared online-softmax merge (att_pmax/att_psum + av_tmp reduce).
+                 * No Q packing — kernels read m->q directly (standard KV layout,
+                 * global GQA mapping). m->q is published by the B3 barrier above. */
+                int seq_len = position + 1;
+                float scale = 1.0f / sqrtf((float)head_dim);
+                long p_lo = (long)tid * seq_len / nt;
+                long p_hi = (long)(tid + 1) * seq_len / nt;
+                if (p_hi > p_lo) {
+                    if (m->kv_dtype == TF_KV_DTYPE_F32)
+                        tf_qk_chunk_pp_f32((const float *)m->key_cache[l], m->q, m->att,
+                                           (int)p_lo, (int)p_hi, n_heads,
+                                           m->tp_qhead_offset, gqa_ratio, m->tp_kv_head_base,
+                                           head_dim, kv_dim, m->max_seq_len, scale);
+                    else
+                        tf_qk_chunk_pp_f16((const uint16_t *)m->key_cache[l], m->q, m->att,
+                                           (int)p_lo, (int)p_hi, n_heads,
+                                           m->tp_qhead_offset, gqa_ratio, m->tp_kv_head_base,
+                                           head_dim, kv_dim, m->max_seq_len, scale);
+                }
+                /* Per-head partial max over this thread's p-range (same as K_DP). */
+                {
+                    svbool_t pgm = svptrue_b32();
+                    float *pmax = m->att_pmax + (size_t)tid * n_heads;
+                    for (int h = 0; h < n_heads; h++) {
+                        const float *ar = m->att + (size_t)h * m->max_seq_len;
+                        svfloat32_t vmax = svdup_f32(-INFINITY);
+                        long p = p_lo;
+                        for (; p + (long)svcntw() <= p_hi; p += (long)svcntw())
+                            vmax = svmax_f32_x(pgm, vmax, svld1_f32(pgm, ar + p));
+                        if (p < p_hi) {
+                            svbool_t pt = svwhilelt_b32((int)p, (int)p_hi);
+                            vmax = svmax_f32_m(pt, vmax, svld1_f32(pt, ar + p));
+                        }
+                        pmax[h] = svmaxv_f32(svptrue_b32(), vmax);
+                    }
+                }
+                PW_MARK(attn);
+                PW_BARRIER();  /* att rows + att_pmax ready */
+                PW_MARK(barrier);
+                pw_skip_qk = 1;
             }
 #endif
 
@@ -8561,7 +8764,8 @@ static void *tf_persistent_worker(void *arg) {
              * xb2 after the chunk pass. */
             int pw_skip_av = 0;
 #if defined(__ARM_FEATURE_SVE)
-            if (m->kv_k_dp && m->av_tmp) {
+            int use_attn_pp = m->attn_pp && tf_psm && nt > n_heads && n_heads <= 64;
+            if ((m->kv_k_dp || use_attn_pp) && m->av_tmp) {
                 int seq_len = position + 1;
                 long p_lo = (long)tid * seq_len / nt;
                 long p_hi = (long)(tid + 1) * seq_len / nt;
@@ -8605,26 +8809,39 @@ static void *tf_persistent_worker(void *arg) {
                  * (tf_psm) or normalized softmax (legacy). */
                 memset(my_tmp, 0, slice_n * sizeof(float));
                 if (p_hi > p_lo) {
-                    if (m->kv_dtype == TF_KV_DTYPE_F32)
-                        tf_av_chunk_f32((const float *)m->value_cache[l], m->att,
-                                        my_tmp, (int)p_lo, (int)p_hi,
-                                        n_heads, n_kv_heads, head_dim, m->max_seq_len);
-                    else if (m->kv_dtype == TF_KV_DTYPE_F16)
-                        tf_av_chunk_f16((const uint16_t *)m->value_cache[l], m->att,
-                                        my_tmp, (int)p_lo, (int)p_hi,
-                                        n_heads, n_kv_heads, head_dim, m->max_seq_len);
-                    else
-                        tf_av_chunk_q8((const int8_t *)m->value_cache[l], m->value_scales[l],
-                                       m->att, my_tmp, (int)p_lo, (int)p_hi,
-                                       n_heads, n_kv_heads, head_dim, m->max_seq_len);
+                    if (m->kv_k_dp) {
+                        if (m->kv_dtype == TF_KV_DTYPE_F32)
+                            tf_av_chunk_f32((const float *)m->value_cache[l], m->att,
+                                            my_tmp, (int)p_lo, (int)p_hi,
+                                            n_heads, n_kv_heads, head_dim, m->max_seq_len);
+                        else if (m->kv_dtype == TF_KV_DTYPE_F16)
+                            tf_av_chunk_f16((const uint16_t *)m->value_cache[l], m->att,
+                                            my_tmp, (int)p_lo, (int)p_hi,
+                                            n_heads, n_kv_heads, head_dim, m->max_seq_len);
+                        else
+                            tf_av_chunk_q8((const int8_t *)m->value_cache[l], m->value_scales[l],
+                                           m->att, my_tmp, (int)p_lo, (int)p_hi,
+                                           n_heads, n_kv_heads, head_dim, m->max_seq_len);
+                    } else {  /* attn_pp: standard V layout, global GQA mapping */
+                        if (m->kv_dtype == TF_KV_DTYPE_F32)
+                            tf_av_chunk_pp_f32((const float *)m->value_cache[l], m->att, my_tmp,
+                                               (int)p_lo, (int)p_hi, n_heads,
+                                               m->tp_qhead_offset, gqa_ratio, m->tp_kv_head_base,
+                                               head_dim, kv_dim, m->max_seq_len);
+                        else
+                            tf_av_chunk_pp_f16((const uint16_t *)m->value_cache[l], m->att, my_tmp,
+                                               (int)p_lo, (int)p_hi, n_heads,
+                                               m->tp_qhead_offset, gqa_ratio, m->tp_kv_head_base,
+                                               head_dim, kv_dim, m->max_seq_len);
+                    }
                 }
                 PW_MARK(attn);
                 PW_BARRIER();  /* av_tmp ready (+ att_psum when tf_psm) */
                 PW_MARK(barrier);
 
                 /* Global per-head 1/sum (redundant per thread) for the fold.
-                 * K_DP requires n_heads == SVE width (16); fixed bound avoids a
-                 * per-iteration alloca in this layer loop. */
+                 * K_DP has n_heads==16; attn_pp is gated to n_heads<=64; the
+                 * fixed bound avoids a per-iteration alloca in this layer loop. */
                 float ginv[64];
                 if (tf_psm) {
                     for (int h = 0; h < n_heads; h++) {
