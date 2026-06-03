@@ -141,6 +141,365 @@ static void build_chat_prompt(const gguf_context *gguf_main,
     }
 }
 
+static char *xstrdup_local(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = (char *)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+static int sb_reserve(char **buf, size_t *cap, size_t need) {
+    if (need <= *cap) return 0;
+    size_t nc = *cap ? *cap : 256;
+    while (nc < need) nc *= 2;
+    char *p = (char *)realloc(*buf, nc);
+    if (!p) return -1;
+    *buf = p;
+    *cap = nc;
+    return 0;
+}
+
+static int sb_appendn(char **buf, size_t *len, size_t *cap, const char *s, size_t n) {
+    if (sb_reserve(buf, cap, *len + n + 1) != 0) return -1;
+    memcpy(*buf + *len, s, n);
+    *len += n;
+    (*buf)[*len] = 0;
+    return 0;
+}
+
+static int sb_append(char **buf, size_t *len, size_t *cap, const char *s) {
+    return sb_appendn(buf, len, cap, s, strlen(s));
+}
+
+static char *json_escape_dup(const char *s) {
+    if (!s) s = "";
+    size_t cap = strlen(s) + 16, len = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    out[0] = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        char tmp[8];
+        const char *add = NULL;
+        size_t n = 0;
+        switch (*p) {
+            case '\\': add = "\\\\"; n = 2; break;
+            case '"':  add = "\\\""; n = 2; break;
+            case '\n': add = "\\n";  n = 2; break;
+            case '\r': add = "\\r";  n = 2; break;
+            case '\t': add = "\\t";  n = 2; break;
+            default:
+                if (*p < 0x20) {
+                    snprintf(tmp, sizeof(tmp), "\\u%04x", *p);
+                    add = tmp; n = 6;
+                } else {
+                    tmp[0] = (char)*p; tmp[1] = 0;
+                    add = tmp; n = 1;
+                }
+                break;
+        }
+        if (sb_appendn(&out, &len, &cap, add, n) != 0) {
+            free(out); return NULL;
+        }
+    }
+    return out;
+}
+
+static const char *json_find_key(const char *json, const char *key) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        p += strlen(pat);
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == ':') return p + 1;
+    }
+    return NULL;
+}
+
+static char *json_get_string_field(const char *json, const char *key, const char *def) {
+    const char *p = json_find_key(json, key);
+    if (!p) return def ? xstrdup_local(def) : NULL;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return def ? xstrdup_local(def) : NULL;
+    p++;
+    size_t cap = 128, len = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    out[0] = 0;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\') {
+            c = *p++;
+            if (!c) break;
+            switch (c) {
+                case 'n': c = '\n'; break;
+                case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;
+                case '"': case '\\': case '/': break;
+                case 'u':
+                    /* Requests from the Python wrapper are UTF-8 JSON. Keep
+                     * non-ASCII escapes as '?' instead of implementing full
+                     * UTF-16 decoding in this tiny control parser. */
+                    for (int i = 0; i < 4 && *p; i++) p++;
+                    c = '?';
+                    break;
+                default: break;
+            }
+        }
+        if (sb_appendn(&out, &len, &cap, &c, 1) != 0) {
+            free(out); return NULL;
+        }
+    }
+    return out;
+}
+
+static int json_get_int_field(const char *json, const char *key, int def) {
+    const char *p = json_find_key(json, key);
+    if (!p) return def;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    return (end && end != p) ? (int)v : def;
+}
+
+static int json_get_bool_field(const char *json, const char *key, int def) {
+    const char *p = json_find_key(json, key);
+    if (!p) return def;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (!strncmp(p, "true", 4)) return 1;
+    if (!strncmp(p, "false", 5)) return 0;
+    return def;
+}
+
+static char *decode_token_text(const bpe_vocab *vocab, int32_t token) {
+    const char *tok_str = bpe_token_to_str(vocab, token);
+    if (!tok_str) return xstrdup_local("");
+    int dec_len = 0;
+    char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
+    if (decoded) {
+        char *out = (char *)malloc((size_t)dec_len + 1);
+        if (out) {
+            memcpy(out, decoded, (size_t)dec_len);
+            out[dec_len] = 0;
+        }
+        free(decoded);
+        return out;
+    }
+    return xstrdup_local(tok_str);
+}
+
+typedef void (*llm_token_cb)(const char *text, int32_t token, void *user);
+
+/* Debug: when TF_DUMP_LOGITS is set, print final-logit health each gen step.
+ * Discriminates the "!!!!" degenerate-output failure mode: NaN/inf => numerical
+ * overflow in the forward; all-equal finite => uniform logits (structural);
+ * all-zero => hidden state never written into lm_head. step<0 = prefill row. */
+static void dump_logit_stats(const float *lg, int n, int step, int chosen) {
+    if (!getenv("TF_DUMP_LOGITS") || !lg || n <= 0) return;
+    float mn = lg[0], mx = lg[0];
+    double sum = 0;
+    long nnan = 0, ninf = 0, nz = 0, distinct1 = 0;
+    int amax = 0;
+    for (int j = 0; j < n; j++) {
+        float v = lg[j];
+        if (v != v) { nnan++; continue; }
+        if (v > 1e30f || v < -1e30f) { ninf++; }
+        if (v == 0.0f) nz++;
+        if (v != lg[0]) distinct1 = 1;
+        sum += v;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        if (v > lg[amax]) amax = j;
+    }
+    long finite = (long)n - nnan;
+    fprintf(stderr,
+        "[TF_DUMP_LOGITS] step=%d n=%d argmax=%d chosen=%d min=%.6g max=%.6g "
+        "mean=%.6g range=%.6g nan=%ld inf=%ld zeros=%ld all_equal=%s lg[0]=%.6g lg[argmax]=%.6g\n",
+        step, n, amax, chosen, mn, mx, finite ? sum / (double)finite : 0.0,
+        (double)mx - (double)mn, nnan, ninf, nz, distinct1 ? "no" : "YES",
+        lg[0], lg[amax]);
+    fflush(stderr);
+}
+
+static char *run_text_generation(gguf_context *gguf_main,
+                                 bpe_vocab *vocab,
+                                 transformer_model *model,
+                                 const char *user_prompt,
+                                 int max_gen,
+                                 int *out_prompt_tokens,
+                                 int *out_completion_tokens,
+                                 const char **out_finish_reason,
+                                 llm_token_cb on_token,
+                                 void *on_token_user,
+                                 char **err_msg) {
+    transformer_reset_runtime_state(model);
+
+    size_t prompt_cap = strlen(user_prompt) + 256;
+    char *text_before = (char *)malloc(prompt_cap);
+    char *text_after  = (char *)malloc(prompt_cap);
+    if (!text_before || !text_after) {
+        free(text_before); free(text_after);
+        if (err_msg) *err_msg = xstrdup_local("out of memory");
+        return NULL;
+    }
+    build_chat_prompt(gguf_main, user_prompt, 0,
+                      text_before, prompt_cap,
+                      text_after,  prompt_cap);
+
+    int tok_cap = model->max_seq_len > 256 ? model->max_seq_len : 256;
+    int32_t *tokens_before = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
+    int n_before = bpe_tokenize(vocab, text_before, -1, tokens_before, tok_cap);
+    free(text_before); free(text_after);
+    if (!tokens_before || n_before <= 0) {
+        free(tokens_before);
+        if (err_msg) *err_msg = xstrdup_local("tokenization failed");
+        return NULL;
+    }
+    if (n_before + max_gen >= model->max_seq_len) {
+        free(tokens_before);
+        if (err_msg) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "prompt plus max_tokens exceeds max_seq_len (%d)", model->max_seq_len);
+            *err_msg = xstrdup_local(buf);
+        }
+        return NULL;
+    }
+
+    float *logits = NULL;
+    int pos = 0;
+    if (getenv("TF_PREFILL_GEMM") && n_before > 0) {
+        logits = transformer_prefill_gemm(model, tokens_before, n_before, 0);
+        if (logits) pos = n_before;
+    }
+    if (!logits) {
+        for (int i = 0; i < n_before; i++) {
+            if (i == n_before - 1) logits = transformer_forward_logits(model, tokens_before[i], pos);
+            else transformer_forward(model, tokens_before[i], pos);
+            pos++;
+        }
+    }
+    free(tokens_before);
+    if (!logits) {
+        if (err_msg) *err_msg = xstrdup_local("model did not produce logits");
+        return NULL;
+    }
+
+    char *content = NULL;
+    size_t content_len = 0, content_cap = 0;
+    const char *finish = "length";
+    int n_gen = 0;
+    int32_t next = -1;
+    for (int g = 0; g < max_gen; g++) {
+        if (g > 0) {
+            logits = transformer_forward_logits(model, next, pos);
+            pos++;
+        }
+        if (!logits) {
+            finish = "error";
+            break;
+        }
+        next = 0;
+        for (int j = 1; j < model->n_vocab; j++) {
+            if (logits[j] > logits[next]) next = j;
+        }
+        dump_logit_stats(logits, model->n_vocab, g, next);
+        if (next == vocab->eos_id || next == vocab->eot_id) {
+            finish = "stop";
+            break;
+        }
+        char *piece = decode_token_text(vocab, next);
+        if (!piece) {
+            finish = "error";
+            break;
+        }
+        if (sb_append(&content, &content_len, &content_cap, piece) != 0) {
+            free(piece);
+            finish = "error";
+            break;
+        }
+        if (on_token) on_token(piece, next, on_token_user);
+        free(piece);
+        n_gen++;
+    }
+    if (!content) content = xstrdup_local("");
+    if (out_prompt_tokens) *out_prompt_tokens = n_before;
+    if (out_completion_tokens) *out_completion_tokens = n_gen;
+    if (out_finish_reason) *out_finish_reason = finish;
+    return content;
+}
+
+typedef struct {
+    const char *id;
+} stdio_token_ctx;
+
+static void stdio_token_event(const char *text, int32_t token, void *user) {
+    stdio_token_ctx *ctx = (stdio_token_ctx *)user;
+    char *eid = json_escape_dup(ctx->id ? ctx->id : "");
+    char *et = json_escape_dup(text);
+    printf("{\"id\":\"%s\",\"type\":\"token\",\"token\":%d,\"text\":\"%s\"}\n",
+           eid ? eid : "", token, et ? et : "");
+    fflush(stdout);
+    free(eid); free(et);
+}
+
+static int llm_serve_stdio(gguf_context *gguf_main,
+                           bpe_vocab *vocab,
+                           transformer_model *model,
+                           int default_max_gen) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("{\"type\":\"ready\",\"max_seq_len\":%d,\"n_vocab\":%d}\n",
+           model->max_seq_len, model->n_vocab);
+    fflush(stdout);
+
+    char *line = NULL;
+    size_t cap = 0;
+    while (getline(&line, &cap, stdin) >= 0) {
+        char *id = json_get_string_field(line, "id", "");
+        char *prompt = json_get_string_field(line, "prompt", NULL);
+        int max_gen = json_get_int_field(line, "max_tokens",
+                         json_get_int_field(line, "max_gen", default_max_gen));
+        int stream = json_get_bool_field(line, "stream", 0);
+        if (max_gen <= 0) max_gen = default_max_gen > 0 ? default_max_gen : 1;
+        if (max_gen > model->max_seq_len - 1) max_gen = model->max_seq_len - 1;
+
+        if (!prompt) {
+            char *eid = json_escape_dup(id ? id : "");
+            printf("{\"id\":\"%s\",\"type\":\"error\",\"error\":\"missing prompt\"}\n", eid ? eid : "");
+            fflush(stdout);
+            free(eid); free(id);
+            continue;
+        }
+
+        int prompt_tokens = 0, completion_tokens = 0;
+        const char *finish = "stop";
+        char *err = NULL;
+        stdio_token_ctx cbctx = { id };
+        char *content = run_text_generation(gguf_main, vocab, model, prompt, max_gen,
+                                            &prompt_tokens, &completion_tokens, &finish,
+                                            stream ? stdio_token_event : NULL, &cbctx, &err);
+        char *eid = json_escape_dup(id ? id : "");
+        if (!content) {
+            char *ee = json_escape_dup(err ? err : "generation failed");
+            printf("{\"id\":\"%s\",\"type\":\"error\",\"error\":\"%s\"}\n",
+                   eid ? eid : "", ee ? ee : "");
+            free(ee);
+        } else {
+            char *ec = json_escape_dup(content);
+            char *ef = json_escape_dup(finish);
+            printf("{\"id\":\"%s\",\"type\":\"final\",\"text\":\"%s\",\"finish_reason\":\"%s\","
+                   "\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}\n",
+                   eid ? eid : "", ec ? ec : "", ef ? ef : "stop",
+                   prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+            free(ec); free(ef);
+        }
+        fflush(stdout);
+        free(eid); free(content); free(err); free(prompt); free(id);
+    }
+    free(line);
+    return 0;
+}
+
 /* ── usage ────────────────────────────────────────────────────────── */
 
 static void usage(const char *p) {
@@ -157,7 +516,8 @@ static void usage(const char *p) {
         "  --no-deepstack            (disable deepstack injection)\n"
         "  --mmap                    (file-backed weights; slower per matvec)\n"
         "  --kv-dtype f32|f16|q8     (KV cache element format; default f16)\n"
-        "  --seed N                  (rng seed; default time-based)\n",
+        "  --seed N                  (rng seed; default time-based)\n"
+        "  --serve-stdio             (persistent JSONL control mode; text-only)\n",
         p);
 }
 
@@ -185,6 +545,7 @@ int main(int argc, char **argv) {
     int llm_threads = 1;
     int use_deepstack = 1;
     int use_mmap_main = 0;
+    int serve_stdio = 0;
     unsigned seed   = (unsigned)time(NULL);
 
     /* Positionals: first .gguf = model, second .gguf = mmproj, first image = image */
@@ -210,6 +571,8 @@ int main(int argc, char **argv) {
             use_deepstack = 0;
         } else if (!strcmp(a, "--mmap")) {
             use_mmap_main = 1;
+        } else if (!strcmp(a, "--serve-stdio")) {
+            serve_stdio = 1;
         } else if (!strcmp(a, "--kv-dtype") && i + 1 < argc) {
             const char *kv = argv[++i];
             if (strcmp(kv, "f32") && strcmp(kv, "fp32") &&
@@ -265,7 +628,10 @@ int main(int argc, char **argv) {
      * (4KB pages → dTLB thrashing on A64FX) but the only option when
      * the weights exceed available anonymous RAM (e.g. 17GB BF16 9B
      * model on 31GB node). */
-    gguf_context *gguf_main = gguf_open(model_path, use_mmap_main ? 1 : 0);
+    /* gguf_open_multi loads llama.cpp split GGUFs (NNNNN-of-MMMMM) when given any
+     * one shard; falls back to gguf_open() for single-file paths. Lets this
+     * single-node runner load the 2-file 27B for TP-free isolation. */
+    gguf_context *gguf_main = gguf_open_multi(model_path, use_mmap_main ? 1 : 0);
     if (!gguf_main) { fprintf(stderr, "failed to open main GGUF\n"); return 1; }
 
     bpe_vocab *vocab = bpe_vocab_load(gguf_main);
@@ -281,6 +647,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "      n_embd=%d n_layers=%d n_heads=%d n_vocab=%d (%.3f s)\n",
             model->n_embd, model->n_layers, model->n_heads, model->n_vocab,
             mono_sec() - t);
+
+    if (serve_stdio) {
+        if (mmproj_path || image_path) {
+            fprintf(stderr, "--serve-stdio is text-only; ignoring mmproj/image arguments\n");
+        }
+        int rc = llm_serve_stdio(gguf_main, vocab, model, max_gen);
+        transformer_free(model);
+        bpe_vocab_free(vocab);
+        gguf_close(gguf_main);
+        return rc;
+    }
 
     /* ── vision setup (optional) ── */
     vision_model    *vm    = NULL;
@@ -409,9 +786,29 @@ int main(int argc, char **argv) {
     int pos = 0;
     double t_pre = mono_sec();
     int trace_per_tok = getenv("LLM_TRACE_PER_TOK") ? 1 : 0;
+    float *logits = NULL;
+
+    /* Stage-1 batched-GEMM prefill (TF_PREFILL_GEMM): batch the dense FFN as a GEMM
+     * across the whole text prompt. Text-only (no interleaved vision) only. Writes the
+     * KV cache identically to the per-token path; returns last-token logits. NULL =>
+     * unsupported (no KV written yet) => fall through to the per-token loops below. */
+    int gemm_prefill_done = 0;
+    if (getenv("TF_PREFILL_GEMM") && n_vision_tokens == 0 && (n_before + n_after) > 0) {
+        int M = n_before + n_after;
+        int32_t *toks = (int32_t *)malloc((size_t)M * sizeof(int32_t));
+        if (toks) {
+            memcpy(toks, tokens_before, (size_t)n_before * sizeof(int32_t));
+            memcpy(toks + n_before, tokens_after, (size_t)n_after * sizeof(int32_t));
+            logits = transformer_prefill_gemm(model, toks, M, 0);
+            free(toks);
+            if (logits) { pos = M; gemm_prefill_done = 1; }
+        }
+        if (!gemm_prefill_done)
+            fprintf(stderr, "  TF_PREFILL_GEMM: unsupported config, using per-token prefill\n");
+    }
 
     /* text before */
-    for (int i = 0; i < n_before; i++) {
+    for (int i = 0; !gemm_prefill_done && i < n_before; i++) {
         double tt0 = trace_per_tok ? mono_sec() : 0.0;
         transformer_forward(model, tokens_before[i], pos);
         if (trace_per_tok) {
@@ -440,8 +837,7 @@ int main(int argc, char **argv) {
      * it; nothing to do here. */
 
     /* text after (last token returns logits) */
-    float *logits = NULL;
-    for (int i = 0; i < n_after; i++) {
+    for (int i = 0; !gemm_prefill_done && i < n_after; i++) {
         double tt0 = trace_per_tok ? mono_sec() : 0.0;
         if (i == n_after - 1) {
             logits = transformer_forward_logits(model, tokens_after[i], pos);
@@ -456,7 +852,7 @@ int main(int argc, char **argv) {
         pos++;
     }
     /* If text-only and there was no after-text (shouldn't happen), still need logits */
-    if (!logits && n_before > 0 && n_after == 0) {
+    if (!gemm_prefill_done && !logits && n_before > 0 && n_after == 0) {
         /* re-run last text token through logits */
         logits = transformer_forward_logits(model, tokens_before[n_before - 1], pos - 1);
     }
@@ -489,9 +885,11 @@ int main(int argc, char **argv) {
             if (logits[j] > logits[next]) next = j;
         }
 
+        dump_logit_stats(logits, model->n_vocab, g, next);
+
         if (next == vocab->eos_id || next == vocab->eot_id) {
             fprintf(stderr, "\n[eos %d]\n", next);
-            break;
+            if (!getenv("TF_NO_EOS_STOP")) break;
         }
 
         const char *tok_str = bpe_token_to_str(vocab, next);
