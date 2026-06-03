@@ -14,6 +14,7 @@
 CC      ?= fcc
 OPENMP  ?=
 DEBUG   ?=
+EXTRA_CFLAGS ?=
 
 LLM_DIR     := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 ROOT        := $(LLM_DIR)..
@@ -31,6 +32,12 @@ ifeq ($(CC),fcc)
     BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
     ASMC         := fcc
+    HWBLIB       := -lhwb
+else ifeq ($(CC),fccpx)
+    BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
+    BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
+    OMP_FLAG     := -fopenmp
+    ASMC         := fccpx
     HWBLIB       := -lhwb
 else ifeq ($(CC),gcc)
     BASE_CFLAGS  := -O3 -march=armv8.2-a+sve -ffp-contract=fast
@@ -64,6 +71,8 @@ ifdef DEBUG
     CFLAGS := $(subst -O3,-O0,$(CFLAGS)) -g
 endif
 
+CFLAGS += $(EXTRA_CFLAGS)
+
 # ── VLM object files (built by a64fx/vlm's Makefile) ──────────────────
 # We reuse the already-built artifacts so we don't double-compile the
 # vision encoder. Run `make CC=fcc OPENMP=1` in a64fx/vlm/ first.
@@ -84,9 +93,12 @@ VLM_OBJS := \
     $(VLM_BUILD)/kernels_micro_kernel_bf16B_8x3_pv.o
 
 MAIN_SRC := $(LLM_DIR)llm_runner.c
+PP_SRC   := $(LLM_DIR)pp_runner.c
+TP_SRC   := $(LLM_DIR)tp_runner.c
+EP_SRC   := $(LLM_DIR)ep_runner.c
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean vlm_objs
+.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner
 
 all: $(BUILD)/llm_runner
 
@@ -99,6 +111,30 @@ vlm_objs:
 
 $(BUILD)/llm_runner: $(MAIN_SRC) vlm_objs | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(MAIN_SRC) $(VLM_OBJS) $(LDFLAGS)
+
+# Multi-node pipeline-parallel decode runner (pure uTofu, no MPI in the binary;
+# mpiexec only places ranks). Links libtofucom for uTofu one-sided Put/barrier.
+pp_runner: $(BUILD)/pp_runner
+$(BUILD)/pp_runner: $(PP_SRC) vlm_objs | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(PP_SRC) $(VLM_OBJS) $(LDFLAGS) -ltofucom
+
+# Multi-node tensor-parallel decode runner (pure uTofu, no MPI in the binary).
+tp_runner: $(BUILD)/tp_runner
+$(BUILD)/tp_runner: $(TP_SRC) vlm_objs | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(TP_SRC) $(VLM_OBJS) $(LDFLAGS) -ltofucom
+
+# Same as tp_runner but with -DTF_POOL_PROFILE: dumps the per-dispatch work-vs-wait
+# and per-tid matvec/barrier/attn decode breakdown at pool shutdown. Separate binary
+# so production tp_runner stays profile-free.
+tp_runner_prof: $(BUILD)/tp_runner_prof
+$(BUILD)/tp_runner_prof: $(TP_SRC) vlm_objs | $(BUILD)
+	$(CC) $(CFLAGS) -DTF_POOL_PROFILE -o $@ $(TP_SRC) $(VLM_OBJS) $(LDFLAGS) -ltofucom
+
+# Multi-node expert-parallel decode runner for MoE models. Shards experts across
+# ranks; non-expert weights replicated. Pure uTofu, no MPI in the binary.
+ep_runner: $(BUILD)/ep_runner
+$(BUILD)/ep_runner: $(EP_SRC) | vlm_objs $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(EP_SRC) $(VLM_OBJS) $(LDFLAGS) -ltofucom
 
 clean:
 	rm -rf $(BUILD)
