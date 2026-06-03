@@ -87,6 +87,10 @@ export TP_DRY_TOKEN_STEP=${TP_DRY_TOKEN_STEP:-1}
 # long-context perf sweep knobs (per-token decode cost vs ctx -> tp_curve_rank00.txt)
 [ -n "$TP_MAXSEQ" ]     && export TP_MAXSEQ
 [ -n "$TP_IGNORE_EOS" ] && export TP_IGNORE_EOS
+# Forward debug/validation knobs to the ranks (mpiexec forwards EXPORTED env only;
+# without these, env-prefixed TF_ATTN_PP / TP_DUMP_TOKENS never reach the runner).
+export TF_ATTN_PP=${TF_ATTN_PP:-}
+export TP_DUMP_TOKENS=${TP_DUMP_TOKENS:-0}
 
 if [ "${SKIP_STAGE:-0}" != "1" ]; then
     chmod +x "$LLM_DIR/stage_gguf_shards.sh"
