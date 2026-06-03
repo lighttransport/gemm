@@ -761,6 +761,10 @@ static void tf_dequant_row(const qtensor *t, int row, float *dst) {
         case GGML_TYPE_IQ3_XXS: block_size = 256; type_size = 98;  break;
         case GGML_TYPE_IQ1_S:  block_size = 256; type_size = 50;  break;
         case GGML_TYPE_IQ4_NL: block_size = 32;  type_size = 18;  break;
+        case GGML_TYPE_Q4_0:   block_size = 32;  type_size = 18;  break;
+        case GGML_TYPE_Q4_1:   block_size = 32;  type_size = 20;  break;
+        case GGML_TYPE_Q5_0:   block_size = 32;  type_size = 22;  break;
+        case GGML_TYPE_Q5_1:   block_size = 32;  type_size = 24;  break;
         case GGML_TYPE_IQ3_S:  block_size = 256; type_size = 110; break;
         case GGML_TYPE_IQ2_S:  block_size = 256; type_size = 82;  break;
         case GGML_TYPE_IQ4_XS: block_size = 256; type_size = 136; break;
@@ -796,6 +800,10 @@ static int tf_is_supported_weight_type(uint32_t type) {
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
@@ -819,6 +827,10 @@ static size_t tf_row_bytes(uint32_t type, int n_cols) {
         case GGML_TYPE_IQ3_XXS: block_size = 256; type_size = 98;  break;
         case GGML_TYPE_IQ1_S:  block_size = 256; type_size = 50;  break;
         case GGML_TYPE_IQ4_NL: block_size = 32;  type_size = 18;  break;
+        case GGML_TYPE_Q4_0:   block_size = 32;  type_size = 18;  break;
+        case GGML_TYPE_Q4_1:   block_size = 32;  type_size = 20;  break;
+        case GGML_TYPE_Q5_0:   block_size = 32;  type_size = 22;  break;
+        case GGML_TYPE_Q5_1:   block_size = 32;  type_size = 24;  break;
         case GGML_TYPE_IQ3_S:  block_size = 256; type_size = 110; break;
         case GGML_TYPE_IQ2_S:  block_size = 256; type_size = 82;  break;
         case GGML_TYPE_IQ4_XS: block_size = 256; type_size = 136; break;
