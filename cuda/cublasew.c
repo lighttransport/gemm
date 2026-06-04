@@ -49,7 +49,8 @@ enum {
     CUBLAS_COMPUTE_32F_PEDANTIC = 69,
     CUBLAS_COMPUTE_32I = 72,
     CUBLAS_COMPUTE_32F_FAST_TF32 = 77,
-    CUBLAS_GEMM_DEFAULT = -1
+    CUBLAS_GEMM_DEFAULT = -1,
+    CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99
 };
 
 /* cuBLAS-LT enums (from cublasLt.h, version >= 11.4) */
@@ -1046,6 +1047,16 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
     const float alpha = 1.0f;
     const float beta = 0.0f;
     if (!ctx || !ctx->handle) return -1;
+    cublasStatus_t st = p_cublasGemmEx(ctx->handle,
+                                       CUBLAS_OP_T, CUBLAS_OP_N,
+                                       n_out, n_tok, n_in,
+                                       &alpha,
+                                       (const void *)(uintptr_t)d_W_f16, CUDA_R_16F, n_in,
+                                       (const void *)(uintptr_t)d_X_f16, CUDA_R_16F, n_in,
+                                       &beta,
+                                       (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
+                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS) return 0;
     return p_cublasGemmEx(ctx->handle,
                           CUBLAS_OP_T, CUBLAS_OP_N,
                           n_out, n_tok, n_in,
@@ -1197,6 +1208,16 @@ int cublasew_gemm_bf16_bf16_f32_rowmajor_nt(cublasew_context *ctx,
     const float alpha = 1.0f;
     const float beta = 0.0f;
     if (!ctx || !ctx->handle) return -1;
+    cublasStatus_t st = p_cublasGemmEx(ctx->handle,
+                                       CUBLAS_OP_T, CUBLAS_OP_N,
+                                       n_out, n_tok, n_in,
+                                       &alpha,
+                                       (const void *)(uintptr_t)d_W_bf16, CUDA_R_16BF, n_in,
+                                       (const void *)(uintptr_t)d_X_bf16, CUDA_R_16BF, n_in,
+                                       &beta,
+                                       (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
+                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS) return 0;
     return p_cublasGemmEx(ctx->handle,
                           CUBLAS_OP_T, CUBLAS_OP_N,
                           n_out, n_tok, n_in,

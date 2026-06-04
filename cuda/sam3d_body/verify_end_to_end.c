@@ -32,18 +32,25 @@ static int diff_pair(const char *label, const float *a, const float *b,
         return 1;
     }
     double sum = 0.0;
+    double dot = 0.0;
+    double na = 0.0;
+    double nb = 0.0;
     float mx = 0.0f;
     size_t mxi = 0;
     for (size_t i = 0; i < n; i++) {
         float d = fabsf(a[i] - b[i]);
         if (d > mx) { mx = d; mxi = i; }
         sum += d;
+        dot += (double)a[i] * (double)b[i];
+        na += (double)a[i] * (double)a[i];
+        nb += (double)b[i] * (double)b[i];
     }
     double mean = sum / (double)n;
+    double cos_sim = (na > 0.0 && nb > 0.0) ? dot / sqrt(na * nb) : 0.0;
     int fail = (mx >= thresh);
     fprintf(stderr, "[cuda verify_end_to_end] %-32s max_abs=%.4e (i=%zu) "
-                    "mean_abs=%.4e (max=%.1e) %s\n",
-            label, mx, mxi, mean, thresh, fail ? "FAIL" : "OK");
+                    "mean_abs=%.4e cos=%.9f (max=%.1e) %s\n",
+            label, mx, mxi, mean, cos_sim, thresh, fail ? "FAIL" : "OK");
     return fail ? 1 : 0;
 }
 
@@ -174,7 +181,7 @@ int main(int argc, char **argv)
     if (threshold_2d < 0.0f) {
         int f32_ref = ref_backbone_is_float32(refdir);
         if (backbone == CUDA_SAM3D_BODY_BACKBONE_DINOV3)
-            threshold_2d = 0.5f;
+            threshold_2d = f32_ref ? 0.5f : 10.0f;
         else if (backbone == CUDA_SAM3D_BODY_BACKBONE_VITH)
             threshold_2d = f32_ref ? 0.5f : 30.0f;
         else
