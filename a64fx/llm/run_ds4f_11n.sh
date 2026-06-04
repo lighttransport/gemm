@@ -79,6 +79,13 @@ export DS4F_BF16_PV=${DS4F_BF16_PV:-}
 # Dense is forced to FP8 on-demand; the synth dense knobs above are ignored.
 export DS4F_REAL=${DS4F_REAL:-0}
 export DS4F_STAGE_DIR=${DS4F_STAGE_DIR:-/local/ds4f}
+# DS4F_EXACT=1 swaps the dense forward stand-ins for the EXACT DeepSeek-V4-Flash
+# math (RoPE/YaRN, per-head q-norm, MQA sliding-window+sink attn, grouped low-rank
+# o-proj, sqrtsoftplus gate w/ selection bias, swiglu clamp). exact==0 is byte-
+# identical to the stand-in path. Meaningful only with DS4F_REAL=1 (real weights).
+export DS4F_EXACT=${DS4F_EXACT:-0}
+# DS4F_MHC=1 enables exact manifold-constrained hyper-connections (4-stream).
+export DS4F_MHC=${DS4F_MHC:-0}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
@@ -86,7 +93,7 @@ export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # bitwise-identical (lockstep preserved). Default off; flip to cut comm.
 export TP_AR_BF16=${TP_AR_BF16:-0}
 
-echo "=== DS4F EP harness on $NP node(s) ($([ "$DS4F_REAL" = 1 ] && echo "REAL weights <- $DS4F_STAGE_DIR" || echo synthetic)) ==="
+echo "=== DS4F EP harness on $NP node(s) ($([ "$DS4F_REAL" = 1 ] && echo "REAL weights <- $DS4F_STAGE_DIR" || echo synthetic)$([ "$DS4F_EXACT" = 1 ] && echo " EXACT-math")$([ "$DS4F_MHC" = 1 ] && echo " mHC")) ==="
 echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43} dense=$([ "$DS4F_REAL" = 1 ] && echo "FP8(real)" || ([ "$DS4F_FP8_BF16" = 1 ] && echo BF16 || echo FP8))"
 
 # ---- build (native fcc + OpenMP) ----
