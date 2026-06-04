@@ -548,6 +548,77 @@ static void ds4f_build_freqs(ds4f_model *m) {
                     c->original_seq_len);
 }
 
+/* ===================== Tier-B2 activation-quant / rotate kernels =====================
+ * QAT activation quantizers used by the (Tier-B2) compressor/indexer; mirror kernel.py.
+ * In-place, fused quant->dequant, with the model's power-of-2 ("ue8m0") block scale
+ *   s = 2^ceil(log2(amax/qmax))   (kernel.py fast_round_scale, exact bit trick).
+ * Validated standalone against tools/ds4f_q2_ref.py (a64fx/llm/ds4f_q2_test.c).
+ *
+ * NOTE on FP8 kv-quant (model.py:506 act_quant(kv[..,:-rd],64,..,inplace=True)): the
+ * reference's INPLACE fp8 path casts the snapped value through out_dtype=in_dtype=BF16
+ * (kernel.py:86-91) and s is a power of 2, so on already-bf16 kv it is an EXACT no-op —
+ * confirmed by model.py:527 ("kv could also use fp8 format, though current implementation
+ * uses bf16"). The exact attention path therefore deliberately omits it (Tier-B1 #3): it
+ * would not change logits. The FP4 path below is genuinely lossy (1-bit mantissa) and IS
+ * applied (indexer q at model.py:414, rotate=True compressor kv at 369-370).
+ *
+ * These are not yet wired (the Tier-B2 compressor/indexer is pending); kept here as the
+ * canonical validated implementations the compressor/indexer will call. */
+
+/* s = 2^ceil(log2(amax * max_inv)) via the IEEE-754 bit trick (kernel.py fast_round_scale).
+ * Bit-exact: ceil(log2(t)) = (exp(t)-127) + (mantissa(t)!=0). */
+static inline float ds4f_round_scale_pow2(float amax, float max_inv) {
+    float t = amax * max_inv;
+    uint32_t b; memcpy(&b, &t, 4);
+    int e = (int)((b >> 23) & 0xFFu) - 127 + ((b & 0x7FFFFFu) ? 1 : 0);
+    uint32_t sb = (uint32_t)((e + 127) & 0xFF) << 23;            /* 2^e */
+    float s; memcpy(&s, &sb, 4); return s;
+}
+
+/* RNE round of f to bf16 (8-bit significand). */
+static inline float ds4f_bf16_round(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    if ((u & 0x7FFFFFFFu) >= 0x7F800000u) return f;             /* nan/inf passthrough */
+    uint32_t r = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;/* round-to-nearest-even */
+    memcpy(&f, &r, 4); return f;
+}
+
+/* round v (|v|<=6) to nearest float4_e2m1 value, RNE. grid {0,.5,1,1.5,2,3,4,6}. */
+static inline float ds4f_fp4_e2m1_snap(float v) {
+    static const float g[8]  = {0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f};
+    static const int   ev[8] = {1,0,1,0,1,0,1,0};               /* mantissa-even flag */
+    float sign = v < 0.0f ? -1.0f : 1.0f, a = sign * v, best = g[0];
+    float bd = a < 0 ? -a : a; int bi = 0;
+    for (int i = 1; i < 8; i++) {
+        float d = a - g[i]; if (d < 0) d = -d;
+        if (d < bd - 1e-12f || (d <= bd + 1e-12f && ev[i] && !ev[bi])) { bd = d; bi = i; best = g[i]; }
+    }
+    return sign * best;
+}
+
+/* FP4 E2M1 block quant, fused quant->dequant, bf16 output (kernel.py fp4_quant inplace).
+ * block divides n. amax floored at 6*2^-126 (kernel.py). */
+static inline void ds4f_fp4_act_quant_inplace(float *x, int n, int block) {
+    for (int b0 = 0; b0 < n; b0 += block) {
+        int bn = (b0 + block <= n) ? block : n - b0;
+        float amax = 6.0f * 1.1754944e-38f;                     /* 6 * 2^-126 floor */
+        for (int j = 0; j < bn; j++) { float a = x[b0+j] < 0 ? -x[b0+j] : x[b0+j]; if (a > amax) amax = a; }
+        float s = ds4f_round_scale_pow2(amax, 1.0f/6.0f), inv = 1.0f/s;
+        for (int j = 0; j < bn; j++)
+            x[b0+j] = ds4f_bf16_round(ds4f_fp4_e2m1_snap(ds4f_clampf(x[b0+j]*inv, -6.0f, 6.0f)) * s);
+    }
+}
+
+/* randomized-Hadamard rotate (model.py rotate_activation = hadamard_transform * dim^-0.5).
+ * The call applies no random sign -> plain scaled Sylvester FWHT. n must be a power of 2. */
+static inline void ds4f_rotate_activation(float *x, int n) {
+    for (int h = 1; h < n; h <<= 1)
+        for (int i = 0; i < n; i += (h << 1))
+            for (int j = i; j < i + h; j++) { float a = x[j], b = x[j+h]; x[j] = a + b; x[j+h] = a - b; }
+    float sc = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) x[i] *= sc;
+}
+
 /* ===================== synthetic allocator ===================== */
 static inline int ds4f_n_owned(int n_experts, int ep_rank, int ep_size) {
     int c = 0; for (int e = 0; e < n_experts; e++) if (e % ep_size == ep_rank) c++; return c;
