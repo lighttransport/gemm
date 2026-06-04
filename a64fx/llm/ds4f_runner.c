@@ -71,13 +71,24 @@ int main(void) {
     int maxgen    = envi("DS4F_MAXGEN", 16);
     int maxpos    = envi("DS4F_MAXPOS", 4096);
     int layers    = envi("DS4F_LAYERS", 0);
+    int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* prefill synthetic KV to this ctx, decode from there */
 
     ds4f_config cfg = ds4f_default_config();
     cfg.max_pos = maxpos;
     if (layers > 0) cfg.n_layers = layers;
+    /* DS4F_FORCE_RATIO=R: override EVERY layer's compress_ratio to R (bypass the
+     * 0/1/last-dense rule) so a pure all-sparse asymptote can be measured. */
+    int force_ratio = envi("DS4F_FORCE_RATIO", 0);
+    if (force_ratio > 0)
+        for (int L = 0; L < cfg.n_layers; L++) cfg.compress_ratios[L] = force_ratio;
     if (prefill + maxgen > cfg.max_pos) {
         fprintf(stderr, "prefill+maxgen (%d) exceeds max_pos (%d)\n",
                 prefill + maxgen, cfg.max_pos);
+        return 1;
+    }
+    if (ctx_warm + maxgen > cfg.max_pos) {
+        fprintf(stderr, "ctx_warm+maxgen (%d) exceeds max_pos (%d)\n",
+                ctx_warm + maxgen, cfg.max_pos);
         return 1;
     }
 
@@ -91,11 +102,13 @@ int main(void) {
            n_threads, n_cmgs, prefill, maxgen, maxpos);
 
     int dense_bf16 = envi("DS4F_FP8_BF16", 0);
+    int dense_mxfp4 = envi("DS4F_DENSE_MXFP4", 0);      /* overrides FP8/BF16: 0.53 B/elem */
     const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
     int bf16_pv = (pv_e && *pv_e) ? (atoi(pv_e) != 0) : dense_bf16;
     size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16);
-    printf("arena reservation: %.2f GB   dense=%s\n", arena_est / (1024.0*1024.0*1024.0),
-           dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)");
+    const char *dlabel = dense_mxfp4 ? "MXFP4(split,0.53B)" :
+                         dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)";
+    printf("arena reservation: %.2f GB   dense=%s\n", arena_est / (1024.0*1024.0*1024.0), dlabel);
     fflush(stdout);
 
     double t_alloc0 = now_sec();
@@ -105,6 +118,11 @@ int main(void) {
     printf("alloc+first-touch: %.2f s   arena_used=%.2f GB   RSS=%.2f GB\n",
            t_alloc, m->arena_used / (1024.0*1024.0*1024.0),
            rss / (1024.0*1024.0*1024.0));
+    if (m->sparse) {
+        int nsp = 0; for (int L = 0; L < cfg.n_layers; L++) if (cfg.compress_ratios[L]) nsp++;
+        printf("sparse indexer: ON  topk=%d index_dim=%d  (%d/%d layers sparse; dense when nP<=topk)\n",
+               cfg.index_topk, cfg.index_head_dim, nsp, cfg.n_layers);
+    }
     fflush(stdout);
 
     int C = cfg.hidden;
@@ -134,13 +152,25 @@ int main(void) {
         printf("         last-hidden ||x||=%.3e  NaNs=%d\n", sqrt(xnorm), nan_count);
     }
 
+    /* ---- optional synthetic ctx-warm: prefill KV to a large context cheaply,
+     * so decode-attn cost at that ctx can be measured without npos real tokens.
+     * Decode then starts at pos=ctx_warm (overrides prefill base). ---- */
+    int dec_base = prefill;
+    if (ctx_warm > 0) {
+        double tw0 = now_sec();
+        ds4f_warm_kv(m, ctx_warm);
+        printf("\nctx-warm: filled synthetic KV [0,%d)  %.2f s  (decode from pos=%d)\n",
+               ctx_warm, now_sec()-tw0, ctx_warm);
+        dec_base = ctx_warm;
+    }
+
     /* ---- decode (M=1, token-at-a-time) ---- */
     memset(m->prof, 0, sizeof(m->prof));
     double t_dec0 = now_sec();
     size_t dec_bytes = 0;
     int last_tok = 0;
     for (int g = 0; g < maxgen; g++) {
-        int pos = prefill + g;
+        int pos = dec_base + g;
         for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
         m->bytes_read = 0;
         last_tok = ds4f_forward_token(m, x, pos);

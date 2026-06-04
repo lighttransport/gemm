@@ -60,11 +60,25 @@ export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
 export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
 export DS4F_LAYERS=${DS4F_LAYERS:-0}
 export DS4F_FP8_BF16=${DS4F_FP8_BF16:-0}
+# DS4F_DENSE_MXFP4=1 routes replicated dense through MXFP4 split (0.53 B/elem):
+# leaner than FP8 AND faster, but compute-bound so slower than bf16-pv. Lean
+# long-ctx default candidate. Overrides FP8/BF16.
+export DS4F_DENSE_MXFP4=${DS4F_DENSE_MXFP4:-0}
+# DS4F_SPARSE=1 enables the Stage-4 synthetic lightning-indexer attention: on
+# sparse layers (compress_ratios[L]!=0) with nP>index_topk, a cheap compressed
+# index selects topk positions and weighted-V runs over them only. Dense layers
+# (0/1/last) and short ctx (nP<=topk) stay full-attention (byte-identical).
+# HCA(R=128) layers go O(topk) flat; CSA(R=4) go O(nP/R). Default off.
+export DS4F_SPARSE=${DS4F_SPARSE:-0}
 # leave EMPTY when unset so the runner's auto-coupling (pv on iff predequant on)
 # decides; set DS4F_BF16_PV=0 to force plain bf16, =1 to force pv.
 export DS4F_BF16_PV=${DS4F_BF16_PV:-}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
+# TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
+# Synthetic harness => bf16-rounded reduce is quality-irrelevant; all ranks stay
+# bitwise-identical (lockstep preserved). Default off; flip to cut comm.
+export TP_AR_BF16=${TP_AR_BF16:-0}
 
 echo "=== DS4F synthetic EP harness on $NP node(s) ==="
 echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43} dense=$([ "$DS4F_FP8_BF16" = 1 ] && echo BF16 || echo FP8)"
