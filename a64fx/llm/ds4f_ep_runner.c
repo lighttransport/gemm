@@ -201,6 +201,8 @@ int main(void) {
     if (prefill + maxgen > cfg.max_pos) die("prefill+maxgen exceeds max_pos", -1);
 
     int dense_bf16 = envi("DS4F_FP8_BF16", 0);
+    const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
+    int bf16_pv = (pv_e && *pv_e) ? (atoi(pv_e) != 0) : dense_bf16;
     int no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
     size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16);
     if (MyRank == 0)
@@ -208,7 +210,7 @@ int main(void) {
                "layers=%d hidden=%d experts=%d active=%d  owned~%d/layer  dense=%s\n"
                "threads=%d prefill=%d maxgen=%d max_pos=%d  arena~%.2f GB/node\n",
                N, cfg.n_layers, cfg.hidden, cfg.n_experts, cfg.n_active, no,
-               dense_bf16 ? "BF16(predequant)" : "FP8(on-demand)",
+               dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)",
                n_threads, prefill, maxgen, maxpos, arena_est/(1024.0*1024.0*1024.0));
 
     /* ---- allocate this rank's synthetic shard (owned experts + replicated dense) ---- */

@@ -60,6 +60,9 @@ export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
 export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
 export DS4F_LAYERS=${DS4F_LAYERS:-0}
 export DS4F_FP8_BF16=${DS4F_FP8_BF16:-0}
+# leave EMPTY when unset so the runner's auto-coupling (pv on iff predequant on)
+# decides; set DS4F_BF16_PV=0 to force plain bf16, =1 to force pv.
+export DS4F_BF16_PV=${DS4F_BF16_PV:-}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 
