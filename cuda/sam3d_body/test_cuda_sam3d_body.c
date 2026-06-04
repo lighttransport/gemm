@@ -53,7 +53,8 @@ static void print_usage(const char *prog)
             "[--rt-detr-model PATH] [--auto-thresh F]] "
             "[--focal F] [-o body.obj] "
             "[--backbone dinov3|vith] "
-            "[--precision fp16|fp32|bf16] [--device N] [-t N] [-v]\n"
+            "[--precision fp16|fp32|bf16] [--device N] [-t N] "
+            "[--warmup N] [--repeat N] [-v]\n"
             "  %s SFT_DIR IMG.jpg ...   (legacy positional)\n",
             prog, prog);
 }
@@ -159,6 +160,8 @@ int main(int argc, char **argv)
     float focal_hint = 0;
     int device = 0, verbose = 0;
     int n_threads = 0;
+    int warmup = 0;
+    int repeat = 1;
     int auto_bbox = 0;
     int auto_bbox_fast = 0;
     int auto_bbox_used = 0;
@@ -185,6 +188,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--precision")  && i+1 < argc) precision  = argv[++i];
         else if (!strcmp(a, "--device")     && i+1 < argc) device     = atoi(argv[++i]);
         else if (!strcmp(a, "-t")           && i+1 < argc) n_threads  = atoi(argv[++i]);
+        else if (!strcmp(a, "--warmup")     && i+1 < argc) warmup     = atoi(argv[++i]);
+        else if (!strcmp(a, "--repeat")     && i+1 < argc) repeat     = atoi(argv[++i]);
         else if (!strcmp(a, "--focal")      && i+1 < argc) focal_hint = strtof(argv[++i], NULL);
         else if (!strcmp(a, "-o")           && i+1 < argc) out_path   = argv[++i];
         else if (!strcmp(a, "-v"))                         verbose    = 1;
@@ -279,9 +284,26 @@ int main(int argc, char **argv)
     if (focal_hint > 0) cuda_sam3d_body_set_focal(ctx, focal_hint);
     t_set_image_ms = cli_time_ms() - t0;
 
+    int rc = 0;
+    if (warmup < 0) warmup = 0;
+    for (int ri = 0; ri < warmup; ri++) {
+        rc = cuda_sam3d_body_run_all(ctx);
+        if (rc != 0) break;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "[test_cuda_sam3d_body] warmup run_all rc=%d\n", rc);
+        cuda_sam3d_body_destroy(ctx);
+        stbi_image_free(pixels);
+        return rc;
+    }
+
+    if (repeat <= 0) repeat = 1;
     t0 = cli_time_ms();
-    int rc = cuda_sam3d_body_run_all(ctx);
-    t_run_all_ms = cli_time_ms() - t0;
+    for (int ri = 0; ri < repeat; ri++) {
+        rc = cuda_sam3d_body_run_all(ctx);
+        if (rc != 0) break;
+    }
+    t_run_all_ms = (cli_time_ms() - t0) / (double)repeat;
     if (rc != 0) {
         fprintf(stderr, "[test_cuda_sam3d_body] run_all rc=%d\n", rc);
         cuda_sam3d_body_destroy(ctx);
