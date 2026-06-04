@@ -73,6 +73,12 @@ export DS4F_SPARSE=${DS4F_SPARSE:-0}
 # leave EMPTY when unset so the runner's auto-coupling (pv on iff predequant on)
 # decides; set DS4F_BF16_PV=0 to force plain bf16, =1 to force pv.
 export DS4F_BF16_PV=${DS4F_BF16_PV:-}
+# DS4F_REAL=1 loads REAL DeepSeek-V4-Flash weights from each node's staged blob
+# (rank<rr>.blob/.manifest in DS4F_STAGE_DIR) instead of the synthetic fill.
+# REQUIRES run_ds4f_stage_11n.sh to have run first (same vcoordfile/node set).
+# Dense is forced to FP8 on-demand; the synth dense knobs above are ignored.
+export DS4F_REAL=${DS4F_REAL:-0}
+export DS4F_STAGE_DIR=${DS4F_STAGE_DIR:-/local/ds4f}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
@@ -80,8 +86,8 @@ export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # bitwise-identical (lockstep preserved). Default off; flip to cut comm.
 export TP_AR_BF16=${TP_AR_BF16:-0}
 
-echo "=== DS4F synthetic EP harness on $NP node(s) ==="
-echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43} dense=$([ "$DS4F_FP8_BF16" = 1 ] && echo BF16 || echo FP8)"
+echo "=== DS4F EP harness on $NP node(s) ($([ "$DS4F_REAL" = 1 ] && echo "REAL weights <- $DS4F_STAGE_DIR" || echo synthetic)) ==="
+echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43} dense=$([ "$DS4F_REAL" = 1 ] && echo "FP8(real)" || ([ "$DS4F_FP8_BF16" = 1 ] && echo BF16 || echo FP8))"
 
 # ---- build (native fcc + OpenMP) ----
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
