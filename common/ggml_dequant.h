@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include "gguf_loader.h"
 
 #ifdef __cplusplus
@@ -1693,6 +1694,215 @@ static inline void matvec_sdot_8row(float *dst,
     dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
     dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
 }
+
+/* ========================================================================
+ * DeepSeek-V4-Flash on-demand dequant matvecs (split-layout FP8 + MXFP4).
+ *
+ * These live in the always-available (non-IMPLEMENTATION) region because they
+ * are static-inline kernels emitted into every TU that includes this header
+ * (ds4f.h / ds4f_runner.c). They keep weights quantized in HBM and dequant a
+ * panel into registers per token, in the proven 8-accumulator + final-svaddv
+ * shape. M=1 decode is HBM-BW-bound, so DRAM B/elem (FP8 ~1.0, MXFP4 ~0.53)
+ * is what matters; the f32 unpack overlaps HBM latency across 48 threads.
+ * ======================================================================== */
+
+/* Standard OCP MX E8M0 scale: biased exponent, value = 2^(x - 127).
+ * x==0xff is NaN (avoid in synthetic fill); x==0 maps to +0 here (OCP spec
+ * value 2^-127, irrelevant for the harness). NOTE: distinct from the GGML
+ * ggml_e8m0_to_fp32_half() which folds an extra ×0.5 — do NOT use that one. */
+static inline float ggml_e8m0_to_fp32(uint8_t x) {
+    uint32_t bits = (uint32_t)x << 23;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+/* MXFP4 e2m1 code -> value, as f32 (svtbl_f32 table form of kvalues_mxfp4). */
+static const float ds4f_kvalues_mxfp4_f32[16] = {
+    0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f,
+    0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f,
+};
+
+/* FP8 E4M3 (bias 7, exp==15 => NaN, no Inf) -> f32 bit pattern. Scalar form
+ * lifted from a64fx/fp8-conv/fp8_convert.h, used to build the 256-entry LUT
+ * the matvec gathers from (LUT gather ~0.70 cyc/elem, the validated winner). */
+static inline uint32_t ds4f_fp8_e4m3_to_fp32_bits(uint8_t x) {
+    uint8_t sign = (x >> 7) & 1;
+    uint8_t exp  = (x >> 3) & 0xF;
+    uint8_t mant = x & 0x7;
+    if (exp == 0) {
+        if (mant == 0) return (uint32_t)sign << 31;
+        int shift = 0;
+        while ((mant & 0x4) == 0) { mant <<= 1; shift++; }
+        mant &= 0x3;
+        exp = 127 - 7 - shift;
+        return ((uint32_t)sign << 31) | ((uint32_t)exp << 23) | ((uint32_t)mant << 20);
+    }
+    if (exp == 15) /* NaN */
+        return ((uint32_t)sign << 31) | (0xFFu << 23) | ((uint32_t)mant << 20);
+    uint32_t new_exp = exp + (127 - 7);
+    return ((uint32_t)sign << 31) | (new_exp << 23) | ((uint32_t)mant << 20);
+}
+
+/* Fill a caller-provided 256-entry LUT (call once at model init). */
+static inline void ds4f_init_fp8_e4m3_lut(uint32_t *lut) {
+    for (int i = 0; i < 256; i++) lut[i] = ds4f_fp8_e4m3_to_fp32_bits((uint8_t)i);
+}
+
+#if defined(__ARM_FEATURE_SVE)
+/* FP8 E4M3 dense matvec, 8 rows, on-demand dequant via L1-resident LUT gather.
+ * Weight = row-major FP8 bytes (1 B/elem); scale = per 128×128 block E8M0.
+ * The 8 rows are one row-block (caller keeps groups 8-aligned, and 128 is a
+ * multiple of 8 so a group never straddles a 128-row boundary), so for each
+ * 128-col tile a single E8M0 scalar applies to all 8 rows -> fold it into x
+ * once and reuse across the 8 gather+FMA streams. K must be a multiple of 128.
+ *   escale[cb] = E8M0 scale for (this row-block, col-block cb), length K/128. */
+static inline void matvec_fp8e4m3_8row(float *dst,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *escale, const uint32_t *lut,
+        const float *x, int K) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t a0 = svdup_f32(0.f), a1 = svdup_f32(0.f);
+    svfloat32_t a2 = svdup_f32(0.f), a3 = svdup_f32(0.f);
+    svfloat32_t a4 = svdup_f32(0.f), a5 = svdup_f32(0.f);
+    svfloat32_t a6 = svdup_f32(0.f), a7 = svdup_f32(0.f);
+    int vl = (int)svcntw();
+    for (int c0 = 0; c0 < K; c0 += 128) {
+        float s = ggml_e8m0_to_fp32(escale[c0 >> 7]);
+        svfloat32_t vs = svdup_f32(s);
+        for (int c = c0; c < c0 + 128; c += vl) {
+            svfloat32_t vxs = svmul_x(pg, svld1(pg, &x[c]), vs);
+            #define FP8_ROW(W, ACC) do {                                       \
+                svuint32_t idx  = svld1ub_u32(pg, (W) + c);                     \
+                svuint32_t bits = svld1_gather_u32index_u32(pg, lut, idx);      \
+                ACC = svmla_x(pg, ACC, svreinterpret_f32_u32(bits), vxs);       \
+            } while (0)
+            FP8_ROW(w0, a0); FP8_ROW(w1, a1); FP8_ROW(w2, a2); FP8_ROW(w3, a3);
+            FP8_ROW(w4, a4); FP8_ROW(w5, a5); FP8_ROW(w6, a6); FP8_ROW(w7, a7);
+            #undef FP8_ROW
+        }
+    }
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* Enable flush-to-zero (FPCR.FZ, bit 24) on the CURRENT thread. The magic FP8
+ * decode below builds a transient f32 subnormal (the multiply input) for E4M3
+ * subnormals; A64FX penalizes denormal operands by ~3.5x, so FTZ (flush those
+ * to 0) is REQUIRED for the magic path to win. Acceptable for the synthetic
+ * harness (values meaningless; E4M3 subnormals -> 0). Idempotent + per-thread. */
+static inline void ds4f_set_ftz(void) {
+    uint64_t fpcr; __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ull << 24); __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr));
+}
+
+/* FP8 E4M3 -> f32 via the DENORMAL MAGIC-MULTIPLY (no LUT, no gather, no select):
+ * build a tiny f32 from the 7 low bits, one fmul by 2^120 renormalizes BOTH
+ * normals and subnormals in hardware, then re-apply sign. ~6 ops/lane. REQUIRES
+ * FTZ (ds4f_set_ftz) on every calling thread or the subnormal multiply input
+ * triggers A64FX denormal microcode. exp==15 maps to a finite <=480 (not NaN),
+ * which is harmless / desirable for the harness. */
+static inline svfloat32_t ds4f_fp8_decode_magic_u32(svbool_t pg, svuint32_t b) {
+    svuint32_t sign = svlsl_n_u32_x(pg, svand_n_u32_x(pg, b, 0x80u), 24);
+    svuint32_t mag  = svlsl_n_u32_x(pg, svand_n_u32_x(pg, b, 0x7Fu), 20);
+    svfloat32_t f   = svmul_n_f32_x(pg, svreinterpret_f32_u32(mag), 0x1.0p+120f);
+    return svreinterpret_f32_u32(svorr_u32_x(pg, sign, svreinterpret_u32_f32(f)));
+}
+
+/* FP8 E4M3 dense matvec, 8 rows, magic-decode variant. Same args/contract as
+ * matvec_fp8e4m3_8row EXCEPT no LUT (decode is arithmetic). Packed 64-byte
+ * svld1_u8 load + svunpk to four u32 sub-vectors, magic-decode each, FMA against
+ * the per-128-block-scaled x. Faster than the gather variant in the HBM-stream
+ * (M=1 decode) regime: holds 75-140 Gmac/s vs the gather's 73-118 (+2..18%) and
+ * ~1.7-3x over bf16-predequant. Callers MUST ds4f_set_ftz() on each thread. */
+static inline void matvec_fp8e4m3_8row_magic(float *dst,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *escale, const float *x, int K) {
+    svbool_t pg = svptrue_b32();
+    svbool_t pb = svptrue_b8();
+    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f);
+    svfloat32_t a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
+    int vlb = (int)svcntb();   /* 64 bytes / iter on A64FX */
+    for (int c0 = 0; c0 < K; c0 += 128) {
+        float s = ggml_e8m0_to_fp32(escale[c0 >> 7]);
+        svfloat32_t vs = svdup_f32(s);
+        for (int c = c0; c < c0 + 128; c += vlb) {
+            svfloat32_t vx0 = svmul_x(pg, svld1(pg,&x[c]),    vs);
+            svfloat32_t vx1 = svmul_x(pg, svld1(pg,&x[c+16]), vs);
+            svfloat32_t vx2 = svmul_x(pg, svld1(pg,&x[c+32]), vs);
+            svfloat32_t vx3 = svmul_x(pg, svld1(pg,&x[c+48]), vs);
+            #define FP8_MAGIC_ROW(W, ACC) do {                                  \
+                svuint8_t  b   = svld1_u8(pb, (W) + c);                          \
+                svuint16_t l16 = svunpklo_u16(b), h16 = svunpkhi_u16(b);         \
+                svfloat32_t f0 = ds4f_fp8_decode_magic_u32(pg, svunpklo_u32(l16)); \
+                svfloat32_t f1 = ds4f_fp8_decode_magic_u32(pg, svunpkhi_u32(l16)); \
+                svfloat32_t f2 = ds4f_fp8_decode_magic_u32(pg, svunpklo_u32(h16)); \
+                svfloat32_t f3 = ds4f_fp8_decode_magic_u32(pg, svunpkhi_u32(h16)); \
+                ACC = svmla_x(pg, ACC, f0, vx0);                                 \
+                ACC = svmla_x(pg, ACC, f1, vx1);                                 \
+                ACC = svmla_x(pg, ACC, f2, vx2);                                 \
+                ACC = svmla_x(pg, ACC, f3, vx3);                                 \
+            } while (0)
+            FP8_MAGIC_ROW(w0,a0); FP8_MAGIC_ROW(w1,a1); FP8_MAGIC_ROW(w2,a2); FP8_MAGIC_ROW(w3,a3);
+            FP8_MAGIC_ROW(w4,a4); FP8_MAGIC_ROW(w5,a5); FP8_MAGIC_ROW(w6,a6); FP8_MAGIC_ROW(w7,a7);
+            #undef FP8_MAGIC_ROW
+        }
+    }
+    dst[0]=svaddv(pg,a0); dst[1]=svaddv(pg,a1); dst[2]=svaddv(pg,a2); dst[3]=svaddv(pg,a3);
+    dst[4]=svaddv(pg,a4); dst[5]=svaddv(pg,a5); dst[6]=svaddv(pg,a6); dst[7]=svaddv(pg,a7);
+}
+
+/* Split-layout MXFP4 (e2m1) expert matvec, 8 rows, W4A16 f32 (svtbl unpack).
+ * Weight = row-major packed nibbles (K/2 B/row); scale = per-32-block E8M0
+ * (K/32 B/row, per-row, unlike FP8's shared block). DRAM ~0.53 B/elem.
+ * Layout per 32-block of 16 bytes (matches dequantize_row_mxfp4): byte j low
+ * nibble -> element j, high nibble -> element j+16. Unpack both halves to f32
+ * via svtbl_f32 over the 16-entry kvalues table, accumulate the unscaled block
+ * dot, fold the per-row E8M0 scalar via one svmla. K must be a multiple of 32.
+ *   wr[r]: K/2 nibble bytes;  sr[r]: K/32 E8M0 bytes. */
+static inline void matvec_mxfp4_8row(float *dst,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *s0, const uint8_t *s1, const uint8_t *s2, const uint8_t *s3,
+        const uint8_t *s4, const uint8_t *s5, const uint8_t *s6, const uint8_t *s7,
+        const float *x, int K) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0 = svdup_f32(0.f), a1 = svdup_f32(0.f);
+    svfloat32_t a2 = svdup_f32(0.f), a3 = svdup_f32(0.f);
+    svfloat32_t a4 = svdup_f32(0.f), a5 = svdup_f32(0.f);
+    svfloat32_t a6 = svdup_f32(0.f), a7 = svdup_f32(0.f);
+    int nb = K / 32;
+    for (int b = 0; b < nb; b++) {
+        svfloat32_t vxlo = svld1(pg, &x[b * 32]);
+        svfloat32_t vxhi = svld1(pg, &x[b * 32 + 16]);
+        #define MXFP4_ROW(W, S, ACC) do {                                      \
+            svuint32_t braw = svld1ub_u32(pg, (W) + (size_t)b * 16);            \
+            svuint32_t lo = svand_n_u32_x(pg, braw, 0xf);                       \
+            svuint32_t hi = svand_n_u32_x(pg, svlsr_n_u32_x(pg, braw, 4), 0xf); \
+            svfloat32_t wlo = svtbl_f32(kv, lo);                               \
+            svfloat32_t whi = svtbl_f32(kv, hi);                               \
+            svfloat32_t p = svmul_x(pg, wlo, vxlo);                            \
+            p = svmla_x(pg, p, whi, vxhi);                                     \
+            float sc = ggml_e8m0_to_fp32((S)[b]);                             \
+            ACC = svmla_x(pg, ACC, p, svdup_f32(sc));                          \
+        } while (0)
+        MXFP4_ROW(w0, s0, a0); MXFP4_ROW(w1, s1, a1);
+        MXFP4_ROW(w2, s2, a2); MXFP4_ROW(w3, s3, a3);
+        MXFP4_ROW(w4, s4, a4); MXFP4_ROW(w5, s5, a5);
+        MXFP4_ROW(w6, s6, a6); MXFP4_ROW(w7, s7, a7);
+        #undef MXFP4_ROW
+    }
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+#endif /* __ARM_FEATURE_SVE */
 
 /* Tiled BF16 GEMM: Y[tok, row] = W[row, K] · X[tok, K]^T
  * Token-major output: Y[t * Y_stride + r].

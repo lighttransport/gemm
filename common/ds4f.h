@@ -81,7 +81,13 @@ static inline ds4f_config ds4f_default_config(void) {
 }
 
 /* ===================== tensor ===================== */
-typedef enum { DS4F_BF16 = 0, DS4F_FP8 = 1, DS4F_MXFP4 = 2, DS4F_F32 = 3 } ds4f_qtype;
+/* DS4F_BF16_PV: BF16 weights in the pair-interleaved layout consumed by
+ * matvec_bf16_8row_pv (p_odd predicated load, +22..28% over plain bf16,
+ * BYTE-IDENTICAL result). Layout is tied to the TYPE so fill and read can
+ * never disagree — use it ONLY for tensors read via the pv matvec (head,
+ * router, predequant dense), never for flat-read norms/embed. Same bytes as
+ * DS4F_BF16, no scale. */
+typedef enum { DS4F_BF16 = 0, DS4F_FP8 = 1, DS4F_MXFP4 = 2, DS4F_F32 = 3, DS4F_BF16_PV = 4 } ds4f_qtype;
 
 typedef struct {
     void    *w;       /* weight bytes */
@@ -94,10 +100,11 @@ typedef struct {
 static inline size_t ds4f_wbytes(ds4f_qtype t, int rows, int cols) {
     size_t n = (size_t)rows * cols;
     switch (t) {
-        case DS4F_BF16: return n * 2;
-        case DS4F_FP8:  return n;          /* 1 B/elem */
-        case DS4F_MXFP4:return n / 2;      /* 2 nibbles/byte */
-        case DS4F_F32:  return n * 4;
+        case DS4F_BF16:    return n * 2;
+        case DS4F_BF16_PV: return n * 2;   /* same bytes, pair-interleaved layout */
+        case DS4F_FP8:     return n;       /* 1 B/elem */
+        case DS4F_MXFP4:   return n / 2;   /* 2 nibbles/byte */
+        case DS4F_F32:     return n * 4;
     }
     return 0;
 }
@@ -143,6 +150,19 @@ typedef struct {
      * through the BW-bound bf16 kernel ~400 GB/s instead of the gather-bound
      * fp8 kernel ~70 GB/s). Set via DS4F_FP8_BF16=1. Experts stay MXFP4. */
     ds4f_qtype dense_qt;
+    /* FP8 dense decode kernel: 0 = gather (LUT, bit-exact), 1 = magic-multiply
+     * (FTZ, ~6 ops/lane, no gather; +2..18% in the HBM-stream decode regime,
+     * subnormals flush to 0 -> values ~5e-5 off, fine for the harness). The
+     * magic path also enables FTZ on every pool worker. Set via DS4F_FP8_MAGIC=1. */
+    int fp8_magic;
+    /* BF16 matvec layout: 0 = row-major (matvec_bf16_8row), 1 = pair-interleaved
+     * (matvec_bf16_8row_pv, p_odd predicated-load, +22..28% over plain bf16 and
+     * BYTE-IDENTICAL — same column order + 8-row svaddv reduction). Applies to
+     * ALL DS4F_BF16 matvecs (predequant dense + router + lm-head). Fill writes
+     * the interleaved layout to match. Set via DS4F_BF16_PV=1; pairs naturally
+     * with DS4F_FP8_BF16=1 to route the dominant dense matvecs through pv. */
+    int bf16_pv;
+    ds4f_qtype bf16_mv_qt;  /* DS4F_BF16 or DS4F_BF16_PV; for router gate + lm-head */
     /* arena */
     uint8_t *arena; size_t arena_sz, arena_used;
     /* pool */
@@ -276,14 +296,32 @@ static void ds4f_mv_worker(void *arg, int tid, int nthr) {
             const uint16_t *w = base + (size_t)i * K;
             matvec_bf16_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K, x, K);
         }
+    } else if (t->type == DS4F_BF16_PV) {
+        /* pair-interleaved: group g (8 rows) stored as 4 pair-bufs of 2K hw
+         * each: [pAB(2K) | pCD | pEF | pGH], group stride 8K hw. */
+        const uint16_t *base = (const uint16_t *)t->w;
+        for (int i = r0; i + 7 < r1; i += 8) {
+            const uint16_t *g = base + (size_t)(i / 8) * 8 * K;
+            matvec_bf16_8row_pv(dst + i, g, g + 2*K, g + 4*K, g + 6*K, x, K);
+        }
     } else if (t->type == DS4F_FP8) {
         const uint8_t *base = (const uint8_t *)t->w;
         int sb_cols = (K + 127) / 128;
-        for (int i = r0; i + 7 < r1; i += 8) {
-            const uint8_t *w = base + (size_t)i * K;
-            const uint8_t *es = t->scale + (size_t)(i / 128) * sb_cols;
-            matvec_fp8e4m3_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
-                                es, T->m->fp8_lut, x, K);
+        if (T->m->fp8_magic) {
+            ds4f_set_ftz();   /* per-worker, idempotent; required by the magic decode */
+            for (int i = r0; i + 7 < r1; i += 8) {
+                const uint8_t *w = base + (size_t)i * K;
+                const uint8_t *es = t->scale + (size_t)(i / 128) * sb_cols;
+                matvec_fp8e4m3_8row_magic(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
+                                          es, x, K);
+            }
+        } else {
+            for (int i = r0; i + 7 < r1; i += 8) {
+                const uint8_t *w = base + (size_t)i * K;
+                const uint8_t *es = t->scale + (size_t)(i / 128) * sb_cols;
+                matvec_fp8e4m3_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
+                                    es, T->m->fp8_lut, x, K);
+            }
         }
     } else { /* DS4F_MXFP4 split */
         const uint8_t *base = (const uint8_t *)t->w; size_t rb = K / 2;
@@ -377,6 +415,19 @@ static void ds4f_fill_worker(void *arg, int tid, int nthr) {
     if (t->type == DS4F_BF16) {
         uint16_t *w = (uint16_t *)t->w;
         for (int i = r0; i < r1; i++) for (int j = 0; j < K; j++) w[(size_t)i*K+j] = ds4f_bf16_fill[(i+j)&15];
+    } else if (t->type == DS4F_BF16_PV) {
+        /* pair-interleaved layout (see matvec_bf16_8row_pv): group g of 8 rows
+         * stored as [pAB | pCD | pEF | pGH], each pair-buf 2K hw holding two
+         * rows interleaved (pair[2c]=rowA[c], pair[2c+1]=rowB[c]). r0/r1 are
+         * 8-aligned, so each row's pair-buf slot is well-defined. Logical W[i][j]
+         * is filled with the SAME value as DS4F_BF16, just at the pv address. */
+        uint16_t *w = (uint16_t *)t->w;
+        for (int i = r0; i < r1; i++) {
+            size_t gbase = (size_t)(i / 8) * 8 * K;     /* group base in hw */
+            int local = i & 7, pair = local >> 1, slot = local & 1;
+            uint16_t *pb = w + gbase + (size_t)pair * 2 * K;
+            for (int j = 0; j < K; j++) pb[2*j + slot] = ds4f_bf16_fill[(i+j)&15];
+        }
     } else if (t->type == DS4F_FP8) {
         uint8_t *w = (uint8_t *)t->w; int sbc = (K+127)/128;
         for (int i = r0; i < r1; i++) for (int j = 0; j < K; j++) w[(size_t)i*K+j] = ds4f_fp8_fill[(i+j)&15];
@@ -411,11 +462,24 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
     ds4f_init_fp8_e4m3_lut(m->fp8_lut);
+    /* Dense default is FP8 on-demand (lean ~21.6 GB/node, safe to 128K ctx).
+     * DS4F_FP8_BF16=1 predequants the replicated dense to BF16 (+6 GB, faster,
+     * intended ≤8K ctx). The pv pair-interleaved layout is byte-identical and
+     * strictly faster at zero memory cost, so it AUTO-ENABLES whenever predequant
+     * is on; DS4F_BF16_PV=0 is the explicit escape, =1 forces pv even in FP8 mode
+     * (only speeds the always-bf16 head+router then). Empty env string == unset. */
     {   const char *e = getenv("DS4F_FP8_BF16");
-        m->dense_qt = (e && atoi(e)) ? DS4F_BF16 : DS4F_FP8; }
+        int pre = (e && *e && atoi(e)) ? 1 : 0;
+        const char *p = getenv("DS4F_BF16_PV");
+        m->bf16_pv = (p && *p) ? (atoi(p) ? 1 : 0) : pre;   /* default: track predequant */
+        m->dense_qt = pre ? (m->bf16_pv ? DS4F_BF16_PV : DS4F_BF16) : DS4F_FP8;
+        m->bf16_mv_qt = m->bf16_pv ? DS4F_BF16_PV : DS4F_BF16; }
+    {   const char *e = getenv("DS4F_FP8_MAGIC");
+        m->fp8_magic = (e && *e && atoi(e)) ? 1 : 0; }
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
-    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size, m->dense_qt == DS4F_BF16);
+    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
+                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ|PROT_WRITE,
                                MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     if (m->arena == MAP_FAILED) { fprintf(stderr, "mmap %zu failed\n", m->arena_sz); abort(); }
@@ -431,8 +495,8 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
 
     int C = cfg.hidden;
     m->out_norm = (uint16_t *)ds4f_bump(m, (size_t)C*2, 64);
-    ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w;
-    m->head = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C);
+    ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w; /* flat gather */
+    m->head = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.vocab, C);       /* matvec'd -> pv when enabled */
 
     m->layers = (ds4f_layer *)calloc(cfg.n_layers, sizeof(ds4f_layer));
     int no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
@@ -449,7 +513,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wo_a = ds4f_new_tensor(m, dq, cfg.o_inter, C);
         ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads*4, 64);
-        ly->gate = ds4f_new_tensor(m, DS4F_BF16, cfg.n_experts, C);
+        ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv when enabled */
         ly->sh_w1 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
         ly->sh_w3 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
         ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter);

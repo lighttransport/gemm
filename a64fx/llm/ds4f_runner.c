@@ -91,9 +91,11 @@ int main(void) {
            n_threads, n_cmgs, prefill, maxgen, maxpos);
 
     int dense_bf16 = envi("DS4F_FP8_BF16", 0);
+    const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
+    int bf16_pv = (pv_e && *pv_e) ? (atoi(pv_e) != 0) : dense_bf16;
     size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16);
     printf("arena reservation: %.2f GB   dense=%s\n", arena_est / (1024.0*1024.0*1024.0),
-           dense_bf16 ? "BF16(predequant)" : "FP8(on-demand)");
+           dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)");
     fflush(stdout);
 
     double t_alloc0 = now_sec();
