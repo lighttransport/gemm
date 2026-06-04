@@ -549,6 +549,7 @@ void cuda_sam3d_destroy(cuda_sam3d_ctx *ctx)
         cs3d_ssdit_outer_ws_free(&ctx->gpu_ssdit_outer_ws);
         cs3d_ssdit_block_ws_free(&ctx->gpu_ssdit_block_ws);
     }
+    cs3d_ssdit_fns_free(&ctx->gpu_ssdit_fns.block);
     if (ctx->gpu_ssdit_loaded) cs3d_ssdit_gpu_free(&ctx->gpu_ssdit);
     if (ctx->cpu_ss_dit) sam3d_cpu_ss_dit_free(ctx->cpu_ss_dit);
     cs3d_free_nd(&ctx->occupancy);
@@ -565,6 +566,7 @@ void cuda_sam3d_destroy(cuda_sam3d_ctx *ctx)
     free(ctx->slat_hook_coords_cache);
     free(ctx->slat_hook_t_emb_cache);
     if (ctx->gpu_slatdit_ws_alloced) cs3d_slatdit_block_ws_free(&ctx->gpu_slatdit_ws);
+    cs3d_slatdit_fns_free(&ctx->gpu_slatdit_fns);
     if (ctx->gpu_slatdit_loaded)     cs3d_slatdit_gpu_free(&ctx->gpu_slatdit);
     if (ctx->gpu_slat_io.loaded)     cs3d_slat_io_gpu_free(&ctx->gpu_slat_io);
     cs3d_slat_io_ws_free(&ctx->gpu_slat_io_ws);
