@@ -128,6 +128,13 @@ int main(void) {
     int nshards = envi("DS4F_NSHARDS", 46);       /* real total (used in filename) */
     int slimit  = envi("DS4F_SHARD_LIMIT", 0);    /* cap iterations for smoke tests; 0 = all */
     int last    = (slimit > 0 && slimit < nshards) ? slimit : nshards;
+    /* Bound the HBM /local page cache during staging. The ~22 GB blob's dirty
+     * pages otherwise pile up in HBM (the "/local caching" that OOM-segfaulted
+     * the 11-node stage). Force writeback + drop cache every DS4F_STAGE_FLUSH_GB
+     * (default 2) GB written, and DONTNEED each source shard's clean mmap pages
+     * after use -> peak staging HBM ~= flush_gb (dirty) + one shard (clean). */
+    int flush_gb = envi("DS4F_STAGE_FLUSH_GB", 2);
+    uint64_t flush_bytes = (uint64_t)(flush_gb > 0 ? flush_gb : 2) << 30;
     if (rank < 0 || rank >= ep_size) {
         fprintf(stderr, "ds4f_stage: bad rank %d for ep_size %d\n", rank, ep_size);
         return 2;
@@ -155,6 +162,7 @@ int main(void) {
             rank, ep_size, 0, 0LL);
 
     uint64_t off = 0;                  /* current (aligned) blob offset */
+    uint64_t last_sync = 0;            /* blob bytes already flushed + dropped */
     long long n_dense = 0, n_expert = 0;
     uint64_t b_dense = 0, b_expert = 0;
     double t0 = now_sec();
@@ -195,7 +203,16 @@ int main(void) {
             if (cls == CLS_EXPERT) { n_expert++; b_expert += nb; }
             else                   { n_dense++;  b_dense  += nb; }
             kept++;
+
+            /* keep the blob's dirty page cache bounded in HBM */
+            if (off - last_sync >= flush_bytes) {
+                fdatasync(bfd);
+                posix_fadvise(bfd, 0, 0, POSIX_FADV_DONTNEED);
+                last_sync = off;
+            }
         }
+        /* drop this shard's source pages (clean, read-only) before the next */
+        madvise(st->map_base, st->map_size, MADV_DONTNEED);
         safetensors_close(st);
         double el = now_sec() - t0;
         double gb = (b_dense + b_expert) / 1e9;
@@ -213,6 +230,8 @@ int main(void) {
     fprintf(mf, "# DS4FMANIFEST rank=%02d ep_size=%02d n_tensors=%-12lld blob_bytes=%-18llu\n",
             rank, ep_size, n_total, (unsigned long long)b_total);
     fclose(mf);
+    fdatasync(bfd);                                  /* flush the tail dirty pages */
+    posix_fadvise(bfd, 0, 0, POSIX_FADV_DONTNEED);   /* release the blob cache from HBM */
     if (close(bfd) < 0) { fprintf(stderr, "ds4f_stage: close blob failed: %s\n", strerror(errno)); return 2; }
 
     printf("\nrank %d done: %lld tensors (%lld dense / %lld expert)\n", rank, n_total, n_dense, n_expert);

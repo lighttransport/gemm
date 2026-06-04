@@ -175,6 +175,9 @@ a64fx/llm/vc_*.txt
 a64fx/llm/exact_c.txt
 a64fx/llm/mhc_c.txt
 a64fx/llm/q2_c.txt
+a64fx/llm/tierb2_c.txt
+a64fx/llm/tierb2_py.txt
 a64fx/llm/tools/exact_py.txt
 a64fx/llm/tools/mhc_py.txt
 a64fx/llm/tools/q2_py.txt
+a64fx/llm/tools/tierb2_py.txt

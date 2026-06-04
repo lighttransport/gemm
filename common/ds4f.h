@@ -619,6 +619,189 @@ static inline void ds4f_rotate_activation(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] *= sc;
 }
 
+/* ===================== Tier-B2 sparse-attention primitives =====================
+ * Causal index helpers + the gather/online-softmax sparse attention kernel that
+ * the compressor/indexer feed. Standalone (plain pointers) so they validate against
+ * tools/ds4f_tierb2_ref.py (a64fx/llm/ds4f_tierb2_test.c) and the forward path wraps
+ * them. Mirror model.py get_window/get_compress_topk_idxs + kernel.py sparse_attn. */
+
+/* get_window_topk_idxs (prefill, start_pos==0): valid sliding-window positions for
+ * query s. Fills row[0..wq) (wq=min(seqlen,window)); -1 = masked slot. Returns wq. */
+static inline int ds4f_window_idx_prefill(int window, int seqlen, int s, int *row) {
+    int wq = seqlen < window ? seqlen : window;
+    int b = s - window + 1; if (b < 0) b = 0;
+    for (int c = 0; c < wq; c++) { int v = b + c; row[c] = (v > s) ? -1 : v; }
+    return wq;
+}
+
+/* get_compress_topk_idxs (prefill, start_pos==0): compressed positions for query s.
+ * col t covers raw [t*ratio,(t+1)*ratio); query s may attend t < (s+1)/ratio. The
+ * (s+1)/ratio threshold = arange(1,seqlen+1)//ratio. +offset shifts into the combined
+ * kv (window positions occupy [0,offset)). Fills row[0..ncol); -1 = masked. */
+static inline int ds4f_compress_idx_prefill(int ratio, int seqlen, int offset, int s, int *row) {
+    int ncol = seqlen / ratio, thr = (s + 1) / ratio;
+    for (int t = 0; t < ncol; t++) row[t] = (t >= thr) ? -1 : (t + offset);
+    return ncol;
+}
+
+/* sparse_attn (kernel.py sparse_attn_kernel): for each (query s, head hd) gather the
+ * topk kv positions named by topk_idxs[s] (-1 = skip), score q.kv*scale, online-softmax
+ * with attn_sink[hd] added to the denominator only, weighted-V. q[m*h*d], kv[n*d],
+ * sink[h], topk_idxs[m*topk], out o[m*h*d]. d = head_dim (kv is both K and V latent).
+ * Math identical to the Tier-B1 window worker, generalized to gathered indices. */
+static void ds4f_sparse_attn(const float *q, const float *kv, const float *sink,
+                             const int *topk_idxs, int m, int h, int d, int topk,
+                             float scale, float *o) {
+    float *sc = (float *)alloca((size_t)topk * sizeof(float));
+    int   *vi = (int   *)alloca((size_t)topk * sizeof(int));
+    for (int s = 0; s < m; s++) {
+        const int *idxr = topk_idxs + (size_t)s * topk;
+        for (int hd = 0; hd < h; hd++) {
+            const float *qd = q + ((size_t)s * h + hd) * d;
+            int nv = 0; float mx = -1e30f;
+            for (int t = 0; t < topk; t++) {
+                int idx = idxr[t]; if (idx < 0) continue;
+                const float *kvr = kv + (size_t)idx * d;
+                float acc = 0.f;
+                for (int dd = 0; dd < d; dd++) acc += qd[dd] * kvr[dd];
+                float sv = acc * scale; sc[nv] = sv; vi[nv] = idx; nv++;
+                if (sv > mx) mx = sv;
+            }
+            float denom = expf(sink[hd] - mx);
+            for (int k = 0; k < nv; k++) { float e = expf(sc[k] - mx); sc[k] = e; denom += e; }
+            float inv = 1.0f / denom;
+            float *od = o + ((size_t)s * h + hd) * d;
+            for (int dd = 0; dd < d; dd++) od[dd] = 0.f;
+            for (int k = 0; k < nv; k++) {
+                float w = sc[k] * inv; const float *kvr = kv + (size_t)vi[k] * d;
+                for (int dd = 0; dd < d; dd++) od[dd] += w * kvr[dd];
+            }
+        }
+    }
+}
+
+/* ===================== Tier-B2 compressor (prefill) =====================
+ * model.py Compressor.forward, start_pos==0: gated-pool x over `ratio` consecutive
+ * tokens into one compressed kv latent per window. The gate is PER-DIMENSION — for
+ * each output dim e the `P` sub-position values are combined with a softmax computed
+ * from the P score values at that same dim e (score.softmax(dim=2), kv*that, sum).
+ *
+ *   overlap (ratio==4, coff=2): P=2*ratio sub-positions. wkv/wgate emit 2*d dims;
+ *     dims [0,d)="overlap" half, [d,2d)="normal" half + per-slot bias ape[r][.].
+ *     compressed window w pools: sub p in [0,ratio) <- PREV window's overlap half
+ *     (raw pos (w-1)*ratio+p, dims [0,d)); sub p in [ratio,2ratio) <- CUR window's
+ *     normal half (raw pos w*ratio+(p-ratio), dims [d,2d)). w==0's prev half is
+ *     score=-inf => weight 0 (overlap_transform fill).
+ *   non-overlap (ratio!=4, coff=1): P=ratio, wkv/wgate emit d dims, window w pools
+ *     raw pos w*ratio+p over all d.
+ * Then RMSNorm(d), RoPE last rd dims at raw pos w*ratio. rotate=1 (indexer compressor):
+ * rotate_activation+fp4 over the d-vector. rotate=0 (layer compressor): the fp8-on-nope
+ * act_quant is a bf16 no-op (see header note) -> omitted. Remainder tokens feed decode
+ * state only (not the prefill compressed output of nwin=seqlen/ratio latents).
+ *
+ * x[seqlen*dim], wkv/wgate[(coff*d)*dim] row-major(out,in), ape[ratio*(coff*d)],
+ * norm_w bf16[d], rcos/rsin rope tables[pos*(rd/2)+k], out[nwin*d]. */
+static void ds4f_compress_prefill(
+    const float *x, int seqlen, int dim, int d, int rd, int ratio,
+    const float *wkv, const float *wgate, const float *ape,
+    const uint16_t *norm_w, const float *rcos, const float *rsin,
+    float eps, int rotate, float *out)
+{
+    int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff * d;
+    int cutoff = seqlen - seqlen % ratio, nwin = cutoff / ratio;
+    if (nwin <= 0) return;
+    float *kvl = (float *)malloc((size_t)cutoff * W * sizeof(float));
+    float *scl = (float *)malloc((size_t)cutoff * W * sizeof(float));
+    for (int pos = 0; pos < cutoff; pos++) {                  /* wkv/wgate linear */
+        const float *xp = x + (size_t)pos * dim;
+        for (int o = 0; o < W; o++) {
+            const float *wk = wkv + (size_t)o * dim, *wg = wgate + (size_t)o * dim;
+            float a = 0.f, b = 0.f;
+            for (int i = 0; i < dim; i++) { a += wk[i] * xp[i]; b += wg[i] * xp[i]; }
+            kvl[(size_t)pos * W + o] = a; scl[(size_t)pos * W + o] = b;
+        }
+    }
+    int P = overlap ? 2 * ratio : ratio;
+    float *ksub = (float *)alloca((size_t)P * sizeof(float));
+    float *ssub = (float *)alloca((size_t)P * sizeof(float));
+    for (int w = 0; w < nwin; w++) {
+        float *ow = out + (size_t)w * d;
+        for (int e = 0; e < d; e++) {
+            if (overlap) {
+                for (int p = 0; p < ratio; p++) {            /* prev-window overlap half */
+                    if (w == 0) { ksub[p] = 0.f; ssub[p] = -1e30f; }
+                    else {
+                        int pos = (w - 1) * ratio + p;
+                        ksub[p] = kvl[(size_t)pos * W + e];
+                        ssub[p] = scl[(size_t)pos * W + e] + ape[(size_t)p * W + e];
+                    }
+                }
+                for (int r = 0; r < ratio; r++) {            /* cur-window normal half */
+                    int pos = w * ratio + r, p = ratio + r;
+                    ksub[p] = kvl[(size_t)pos * W + d + e];
+                    ssub[p] = scl[(size_t)pos * W + d + e] + ape[(size_t)r * W + d + e];
+                }
+            } else {
+                for (int p = 0; p < ratio; p++) {
+                    int pos = w * ratio + p;
+                    ksub[p] = kvl[(size_t)pos * W + e];
+                    ssub[p] = scl[(size_t)pos * W + e] + ape[(size_t)p * W + e];
+                }
+            }
+            float mx = -1e30f; for (int p = 0; p < P; p++) if (ssub[p] > mx) mx = ssub[p];
+            float den = 0.f; for (int p = 0; p < P; p++) { float ex = expf(ssub[p] - mx); ssub[p] = ex; den += ex; }
+            float acc = 0.f; for (int p = 0; p < P; p++) acc += ksub[p] * (ssub[p] / den);
+            ow[e] = acc;
+        }
+        ds4f_rmsnorm(ow, ow, norm_w, d, eps);                /* norm over d */
+        ds4f_rope_apply(ow + (d - rd), rcos, rsin, w * ratio, rd / 2, 0);  /* rope @ w*ratio */
+        if (rotate) { ds4f_rotate_activation(ow, d); ds4f_fp4_act_quant_inplace(ow, d, 32); }
+    }
+    free(kvl); free(scl);
+}
+
+/* ===================== Tier-B2 indexer scoring + top-k =====================
+ * model.py Indexer.forward scoring (after q is wq_b-projected, RoPE'd, rotate+fp4'd
+ * and the compressor has filled kvc): index_score[t] = sum_h relu(q[h].kvc[t]) *
+ * weights[h]. q[H*hd] (one query's heads, contiguous), kvc[T*hd], weights[H]. */
+static void ds4f_index_score(const float *q, const float *kvc, const float *weights,
+                             int H, int hd, int T, float *score) {
+    for (int t = 0; t < T; t++) {
+        const float *kt = kvc + (size_t)t * hd;
+        float acc = 0.f;
+        for (int h = 0; h < H; h++) {
+            const float *qh = q + (size_t)h * hd;
+            float dot = 0.f;
+            for (int d = 0; d < hd; d++) dot += qh[d] * kt[d];
+            if (dot < 0.f) dot = 0.f;                       /* relu */
+            acc += dot * weights[h];
+        }
+        score[t] = acc;
+    }
+}
+
+/* masked top-k compressed-position selection (model.py Indexer topk + prefill causal
+ * mask): only t < thr are valid (thr = (query+1)/ratio); pick min(k,thr) by score
+ * (descending), write (t+offset) into sel[0..k) SORTED ASCENDING, pad with -1. The
+ * gather (sparse_attn) is order-invariant, so sorted output validates the SELECTED SET
+ * without depending on topk's unspecified tie order. */
+static void ds4f_index_topk(const float *score, int T, int thr, int k, int offset, int *sel) {
+    if (thr > T) thr = T;
+    int npick = k < thr ? k : thr;
+    int  *chosen = (int  *)alloca((size_t)(npick > 0 ? npick : 1) * sizeof(int));
+    char *used   = (char *)alloca((size_t)(thr > 0 ? thr : 1));
+    for (int t = 0; t < thr; t++) used[t] = 0;
+    for (int n = 0; n < npick; n++) {
+        int best = -1; float bv = -1e30f;
+        for (int t = 0; t < thr; t++) if (!used[t] && score[t] > bv) { bv = score[t]; best = t; }
+        used[best] = 1; chosen[n] = best;
+    }
+    for (int a = 0; a < npick; a++)                          /* sort ascending */
+        for (int b = a + 1; b < npick; b++)
+            if (chosen[b] < chosen[a]) { int tmp = chosen[a]; chosen[a] = chosen[b]; chosen[b] = tmp; }
+    for (int n = 0; n < k; n++) sel[n] = (n < npick) ? (chosen[n] + offset) : -1;
+}
+
 /* ===================== synthetic allocator ===================== */
 static inline int ds4f_n_owned(int n_experts, int ep_rank, int ep_size) {
     int c = 0; for (int e = 0; e < n_experts; e++) if (e % ep_size == ep_rank) c++; return c;
@@ -1050,6 +1233,22 @@ static void ds4f_blob_close(ds4f_blob *B) {
     free(B->e); B->e = NULL; B->n = 0;
 }
 
+/* After a tensor's bytes are copied blob->arena, its source pages in the blob
+ * mmap are dead weight in HBM. Drop the fully-contained INTERIOR pages (clean,
+ * read-only -> correctness-neutral: a re-fault would re-read identical file
+ * bytes) so the ~22 GB blob page cache does not pile up on top of the ~22 GB
+ * arena during load and overflow HBM. Aligned inward so a partial page shared
+ * with an adjacent (not-yet-copied) tensor is never dropped. Gated by
+ * DS4F_LOAD_DROP_BLOB (default on); set =0 to keep the old mmap-cached behavior. */
+static int ds4f_drop_blob = 1;
+static void ds4f_blob_drop(const ds4f_blob *B, uint64_t off, size_t nbytes) {
+    if (!ds4f_drop_blob || nbytes == 0) return;
+    long pg = sysconf(_SC_PAGESIZE); if (pg <= 0) pg = 4096;
+    uint64_t start = (off + (uint64_t)(pg - 1)) & ~(uint64_t)(pg - 1);  /* round up */
+    uint64_t end   = (off + nbytes) & ~(uint64_t)(pg - 1);             /* round down */
+    if (end > start) madvise(B->blob + start, (size_t)(end - start), MADV_DONTNEED);
+}
+
 /* ---- parallel copy/transform: blob src -> arena dst (NUMA first-touch via the
  * SAME rowsplit8 the matvec later uses, so each row block lands on its CMG) ---- */
 typedef struct { ds4f_tensor t; const uint8_t *src_w, *src_s; } ds4f_copy_task;
@@ -1127,6 +1326,8 @@ static void ds4f_load_q(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst, con
         ss = B->blob + se->off;
     }
     ds4f_copy_run(m, *dst, sw, ss);
+    ds4f_blob_drop(B, we->off, wb);                       /* release copied blob pages */
+    if (ss) ds4f_blob_drop(B, (uint64_t)(ss - B->blob), sb);
     m->bytes_read += wb + sb;
 }
 
@@ -1137,12 +1338,14 @@ static void ds4f_load_raw(ds4f_model *m, const ds4f_blob *B, void *dst,
     const ds4f_mani_ent *e = ds4f_need(B, name, ds4f_qtype_dtstr(type), wb);
     ds4f_tensor t = { dst, NULL, type, rows, cols };
     ds4f_copy_run(m, t, B->blob + e->off, NULL);
+    ds4f_blob_drop(B, e->off, wb);                        /* release copied blob pages */
     m->bytes_read += wb;
 }
 
 static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
                                   const char *blob_dir, int n_threads, int n_cmgs) {
     double t0 = ds4f_wall();
+    { const char *e = getenv("DS4F_LOAD_DROP_BLOB"); if (e && *e) ds4f_drop_blob = atoi(e); }
     if (!blob_dir || !*blob_dir) {
         const char *e = getenv("DS4F_STAGE_DIR");
         blob_dir = (e && *e) ? e : "/local/ds4f";

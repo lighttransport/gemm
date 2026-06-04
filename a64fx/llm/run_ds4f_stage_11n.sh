@@ -32,6 +32,12 @@ export DS4F_EP_SIZE=${DS4F_EP_SIZE:-$NP}
 export DS4F_MODEL_DIR=${DS4F_MODEL_DIR:-$HOME/models/ds4f}
 export DS4F_STAGE_DIR=${DS4F_STAGE_DIR:-/local/ds4f}
 export DS4F_NSHARDS=${DS4F_NSHARDS:-46}
+# Bound the HBM /local page cache while writing the ~22 GB blob. Without this the
+# blob's dirty pages pile up in HBM (the ~7 GB "/local caching" that OOM-segfaulted
+# the prior 11-node stage); the stager fdatasync+fadvise(DONTNEED)s every FLUSH_GB
+# and DONTNEEDs each source shard -> peak staging HBM ~= FLUSH_GB + one shard (well
+# under the ~11 GB/node target). Lower it if a node is still tight.
+export DS4F_STAGE_FLUSH_GB=${DS4F_STAGE_FLUSH_GB:-2}
 export DS4F_STATUS_DIR="$LLM_DIR"   # per-rank DONE files land on the shared FS
 
 # ---- generate the vcoordfile (all shape coords except $EXCLUDE) ----
