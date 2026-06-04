@@ -98,6 +98,9 @@ TP_SRC   := $(LLM_DIR)tp_runner.c
 EP_SRC   := $(LLM_DIR)ep_runner.c
 DS4F_SRC := $(LLM_DIR)ds4f_runner.c
 DS4F_EP_SRC := $(LLM_DIR)ds4f_ep_runner.c
+# header deps: ds4f.h / ggml_dequant.h are not in the .c prereqs, so editing them
+# would otherwise leave the binaries stale (a no-op `make`). Track them explicitly.
+DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ggml_dequant.h
 
 # ── Targets ────────────────────────────────────────────────────────────
 .PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner
@@ -141,14 +144,14 @@ $(BUILD)/ep_runner: $(EP_SRC) | vlm_objs $(BUILD)
 # DeepSeek-V4-Flash synthetic perf/plumbing harness (Stage 1, single node).
 # Self-contained: only common/ds4f.h (+ ggml_dequant.h). No vlm objs, no uTofu.
 ds4f_runner: $(BUILD)/ds4f_runner
-$(BUILD)/ds4f_runner: $(DS4F_SRC) | $(BUILD)
+$(BUILD)/ds4f_runner: $(DS4F_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_SRC) $(LDFLAGS)
 
 # DeepSeek-V4-Flash multinode EP harness (Stage 2, all-reduce combine).
 # Self-contained: common/ds4f.h + uTofu (a64fx/utofu-tests headers). Links
 # libtofucom for one-sided Put/barrier; no vlm objs.
 ds4f_ep_runner: $(BUILD)/ds4f_ep_runner
-$(BUILD)/ds4f_ep_runner: $(DS4F_EP_SRC) | $(BUILD)
+$(BUILD)/ds4f_ep_runner: $(DS4F_EP_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_EP_SRC) $(LDFLAGS) -ltofucom
 
 clean:
