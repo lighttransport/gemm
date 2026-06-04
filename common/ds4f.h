@@ -43,6 +43,11 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
 #include <arm_sve.h>
 
 #include "ggml_dequant.h"
@@ -82,6 +87,18 @@ typedef struct {
     int index_topk;     /* 512 */
     int index_head_dim; /* 128 */
     int compress_ratios[64];  /* per-layer; [0..n_layers), 0 = dense */
+    /* exact forward math (DS4F_EXACT; the synthetic stand-ins ignore these) */
+    int o_lora;             /* 1024 (o_lora_rank; o_inter = o_groups*o_lora) */
+    int window_size;        /* 128 sliding-window attention */
+    int n_hash_layers;      /* 3 (layers 0..2 route by token id, no bias) */
+    float swiglu_limit;     /* 10.0 (clamp up to [-lim,lim], gate to [...,lim]) */
+    /* RoPE/YaRN (precompute_freqs_cis): dense layers use rope_theta + no YaRN;
+     * sparse layers use compress_rope_theta + YaRN(original_seq_len,factor,beta_*) */
+    float rope_theta;            /* 10000 */
+    float compress_rope_theta;   /* 160000 */
+    int   rope_factor;           /* 16 */
+    int   beta_fast, beta_slow;  /* 32, 1 */
+    int   original_seq_len;      /* 65536 (YaRN orig ctx; 0 => YaRN off) */
     /* runtime */
     int max_pos;        /* KV cache capacity */
 } ds4f_config;
@@ -96,9 +113,18 @@ static inline ds4f_config ds4f_default_config(void) {
     c.hc_mult = 4; c.hc_iters = 20; c.hc_eps = 1e-6f; c.norm_eps = 1e-6f;
     /* lightning indexer (matches DeepSeek-V4-Flash config.json) */
     c.index_topk = 512; c.index_head_dim = 128;
-    /* compress_ratios: layers 0,1 and last = 0 (dense); else alternate CSA(4)/HCA(128) */
-    for (int L = 0; L < 64; L++) c.compress_ratios[L] = 0;
-    for (int L = 2; L < c.n_layers - 1; L++) c.compress_ratios[L] = (L & 1) ? 4 : 128;
+    /* exact-forward hyperparameters (config.json) */
+    c.o_lora = c.o_inter / c.o_groups;   /* 1024 */
+    c.window_size = 128; c.n_hash_layers = 3; c.swiglu_limit = 10.0f;
+    c.rope_theta = 10000.0f; c.compress_rope_theta = 160000.0f;
+    c.rope_factor = 16; c.beta_fast = 32; c.beta_slow = 1; c.original_seq_len = 65536;
+    /* compress_ratios: EXACT config.json array (layers 0,1 dense; then CSA(4)/HCA(128)
+     * alternating even/odd; index 43 dense=MTP). Picks per-layer RoPE config in exact
+     * mode (ratio!=0 => YaRN + compress_rope_theta). Only consulted when sparse/exact. */
+    static const int RATIOS[44] = {
+        0,0,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,
+        4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,0 };
+    for (int L = 0; L < 64; L++) c.compress_ratios[L] = (L < 44) ? RATIOS[L] : 0;
     return c;
 }
 
@@ -147,6 +173,7 @@ typedef struct {
     float *attn_sink;                 /* [n_heads] F32 */
     /* MoE */
     ds4f_tensor gate;                 /* BF16 [n_experts, hidden] router */
+    float *gate_bias;                 /* [n_experts] F32 selection bias (exact, layers>=n_hash); NULL=hash/synth */
     ds4f_tensor sh_w1, sh_w2, sh_w3;  /* shared expert (FP8) */
     ds4f_tensor *ex_w1, *ex_w2, *ex_w3; /* owned experts (MXFP4), indexed 0..n_owned-1 */
     int *owned_eid;                   /* global expert id of each owned slot */
@@ -205,6 +232,29 @@ typedef struct {
      * mixes Linear (hc_*_fn) is the only added matvec; collapse/expand are cheap
      * scalar folds. Set via DS4F_MHC=1. */
     int mhc;
+    /* exact DeepSeek-V4-Flash forward math (DS4F_EXACT): 0 = the synthetic
+     * stand-ins (silu o-proj, no RoPE/q-norm, bias-free gate; default, byte-
+     * identical to Stage 1-4b); 1 = the real math (per-head q-norm + RoPE/YaRN on
+     * q/kv, sliding-window(128)+sink attention, de-rotate + grouped low-rank
+     * o-proj, gate bias-select/unbiased-weight, swiglu clamp). With real weights
+     * this yields meaningful logits. Tier-B1 (this) is bit-faithful for
+     * dense+HCA layers and the sliding-window term of CSA layers. KNOWN
+     * omissions, all deferred to Tier-B2 (need extra plumbing, not just math):
+     *   1. stateful compressor/indexer long-range compressed-KV term on sparse
+     *      layers -> omits CSA compressed tokens at pos>=4 (needs Hadamard +
+     *      FP4 act-quant + raw-hidden history);
+     *   2. hash-layer routing (layers < n_hash_layers route by tid2eid[token_id])
+     *      -> falls back to score-based topk here (the harness threads a hidden
+     *      state, not a token id, per position);
+     *   3. act_quant FP8-sim of the kv non-rope dims (a QAT precision detail).
+     * RoPE/YaRN, per-head q-norm, sliding-window+sink attention, grouped low-rank
+     * o-proj, sqrtsoftplus gate (bias-select/unbiased-weight), and swiglu clamp
+     * are exact (validated vs pure-Python ref to 5e-8: ds4f_exact_test.c). */
+    int exact;
+    /* RoPE freqs tables (only built when exact): cos/sin[pos*half + k],
+     * half = qk_rope_dim/2. Two configs: dense (theta, no YaRN) + comp (YaRN). */
+    float *rope_dense_cos, *rope_dense_sin;
+    float *rope_comp_cos,  *rope_comp_sin;
     /* arena */
     uint8_t *arena; size_t arena_sz, arena_used;
     /* pool */
@@ -402,6 +452,31 @@ static void ds4f_matvec(ds4f_model *m, float *dst, const ds4f_tensor *t, const f
     ds4f_pool_run(m->pool, ds4f_mv_worker, &T);
 }
 
+/* a [nrows, cols] row-slice VIEW of tensor t starting at logical row row0 (no copy).
+ * row0 must be 8-aligned (kernel 8-row blocking) and, for FP8, 128-aligned (its
+ * scale is addressed in 128-row blocks). Used to drive the grouped low-rank
+ * o-projection (wo_a is block-diagonal: 8 groups of o_lora rows) as 8 matvecs. */
+static inline ds4f_tensor ds4f_row_slice(const ds4f_tensor *t, int row0, int nrows) {
+    ds4f_tensor v = *t; v.rows = nrows;
+    size_t wbpr;                              /* weight bytes per logical row */
+    switch (t->type) {
+        case DS4F_FP8:   wbpr = (size_t)t->cols;     break;
+        case DS4F_MXFP4: wbpr = (size_t)t->cols / 2; break;
+        case DS4F_F32:   wbpr = (size_t)t->cols * 4; break;
+        default:         wbpr = (size_t)t->cols * 2; break;   /* BF16 / BF16_PV */
+    }
+    v.w = (uint8_t *)t->w + (size_t)row0 * wbpr;
+    if (t->scale) {
+        if (t->type == DS4F_FP8)
+            v.scale = t->scale + (size_t)(row0 / 128) * ((t->cols + 127) / 128);
+        else if (t->type == DS4F_MXFP4)
+            v.scale = t->scale + (size_t)row0 * (t->cols / 32);
+    }
+    return v;
+}
+
+static inline float ds4f_clampf(float x, float lo, float hi){ return x < lo ? lo : (x > hi ? hi : x); }
+
 /* rmsnorm with BF16 weight, in/out f32 [n] */
 static void ds4f_rmsnorm(float *out, const float *x, const uint16_t *w, int n, float eps) {
     double ss = 0.0;
@@ -411,6 +486,67 @@ static void ds4f_rmsnorm(float *out, const float *x, const uint16_t *w, int n, f
 }
 
 static inline float ds4f_silu(float x){ return x / (1.0f + expf(-x)); }
+
+/* ===================== RoPE / YaRN (exact) =====================
+ * Mirrors model.py precompute_freqs_cis + apply_rotary_emb. Builds cos/sin tables
+ * [pos*half + k], half = dim/2, freq[k] = base^(-2k/dim). When original_seq_len>0
+ * applies the YaRN smooth ramp (low freqs interpolated by 1/factor, high freqs
+ * untouched) between the beta_fast/beta_slow correction dims. */
+static void ds4f_rope_table(float *cosb, float *sinb, int dim, int max_pos,
+                            double base, int factor, int beta_fast, int beta_slow,
+                            int original_seq_len) {
+    int half = dim / 2;
+    double freq[64];                          /* half <= 32 */
+    for (int k = 0; k < half; k++) freq[k] = 1.0 / pow(base, (2.0 * k) / dim);
+    if (original_seq_len > 0) {
+        double lo_d = dim * log((double)original_seq_len / ((double)beta_fast * 2.0 * M_PI)) / (2.0 * log(base));
+        double hi_d = dim * log((double)original_seq_len / ((double)beta_slow * 2.0 * M_PI)) / (2.0 * log(base));
+        double low = floor(lo_d); if (low < 0) low = 0;
+        double high = ceil(hi_d); if (high > dim - 1) high = dim - 1;
+        if (low == high) high += 0.001;
+        for (int k = 0; k < half; k++) {
+            double lin = ((double)k - low) / (high - low);
+            double ramp = lin < 0.0 ? 0.0 : (lin > 1.0 ? 1.0 : lin);
+            double smooth = 1.0 - ramp;       /* model.py: smooth = 1 - linear_ramp */
+            freq[k] = freq[k] / factor * (1.0 - smooth) + freq[k] * smooth;
+        }
+    }
+    for (int p = 0; p < max_pos; p++)
+        for (int k = 0; k < half; k++) {
+            double ang = (double)p * freq[k];
+            cosb[(size_t)p * half + k] = (float)cos(ang);
+            sinb[(size_t)p * half + k] = (float)sin(ang);
+        }
+}
+
+/* apply_rotary_emb on one rope segment v[dim] (consecutive pairs (v[2k],v[2k+1])
+ * as a complex), at position pos. inverse uses the conjugate (de-rotation). */
+static inline void ds4f_rope_apply(float *v, const float *cosb, const float *sinb,
+                                   int pos, int half, int inverse) {
+    const float *cs = cosb + (size_t)pos * half, *sn = sinb + (size_t)pos * half;
+    for (int k = 0; k < half; k++) {
+        float a = v[2 * k], b = v[2 * k + 1], c = cs[k], s = sn[k];
+        if (!inverse) { v[2 * k] = a * c - b * s; v[2 * k + 1] = a * s + b * c; }
+        else          { v[2 * k] = a * c + b * s; v[2 * k + 1] = -a * s + b * c; }
+    }
+}
+
+/* build the two RoPE tables (dense + compressed) when exact is on. */
+static void ds4f_build_freqs(ds4f_model *m) {
+    if (!m->exact) return;
+    ds4f_config *c = &m->cfg;
+    int dim = c->qk_rope_dim, half = dim / 2, P = c->max_pos;
+    size_t n = (size_t)P * half;
+    m->rope_dense_cos = (float *)aligned_alloc(64, n * 4);
+    m->rope_dense_sin = (float *)aligned_alloc(64, n * 4);
+    m->rope_comp_cos  = (float *)aligned_alloc(64, n * 4);
+    m->rope_comp_sin  = (float *)aligned_alloc(64, n * 4);
+    ds4f_rope_table(m->rope_dense_cos, m->rope_dense_sin, dim, P,
+                    c->rope_theta, c->rope_factor, c->beta_fast, c->beta_slow, 0);
+    ds4f_rope_table(m->rope_comp_cos, m->rope_comp_sin, dim, P,
+                    c->compress_rope_theta, c->rope_factor, c->beta_fast, c->beta_slow,
+                    c->original_seq_len);
+}
 
 /* ===================== synthetic allocator ===================== */
 static inline int ds4f_n_owned(int n_experts, int ep_rank, int ep_size) {
@@ -571,6 +707,8 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         m->sparse = (e && *e && atoi(e)) ? 1 : 0; }
     {   const char *e = getenv("DS4F_MHC");
         m->mhc = (e && *e && atoi(e)) ? 1 : 0; }
+    {   const char *e = getenv("DS4F_EXACT");
+        m->exact = (e && *e && atoi(e)) ? 1 : 0; }
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
     m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
@@ -692,6 +830,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     m->s_x4    = (float *)aligned_alloc(256, (size_t)cfg.hc_mult*C*4);
     m->s_resid = (float *)aligned_alloc(256, (size_t)cfg.hc_mult*C*4);
     m->s_xc    = (float *)aligned_alloc(256, (size_t)C*4);
+    ds4f_build_freqs(m);   /* RoPE/YaRN tables (only when exact) */
     return m;
 }
 
@@ -701,6 +840,414 @@ static void ds4f_free(ds4f_model *m) {
     if (m->arena && m->arena != MAP_FAILED) munmap(m->arena, m->arena_sz);
     free(m->layers);
     free(m);
+}
+
+/* ===================== real-weight loader (Stage 4b) =====================
+ *
+ * ds4f_load_real() builds a ds4f_model from the REAL DeepSeek-V4-Flash weights
+ * that ds4f_stage.c packed into THIS rank's node-local blob, replacing the
+ * synthetic fill of ds4f_alloc_synth. Same arena / scratch / forward wiring;
+ * only the bytes differ. The blob+manifest live at
+ *   <blob_dir>/rank<rr>.blob       packed weights (256B aligned/tensor)
+ *   <blob_dir>/rank<rr>.manifest   "<off> <nbytes> <dtype> <ndims> <shape..> <name>"
+ *
+ * Real dtypes (verified against the staged manifest):
+ *   dense MLA (wq_a/wq_b/wkv/wo_a/wo_b) + shared expert (w1/w2/w3)
+ *                                  = F8_E4M3 weight + F8_E8M0 128x128 block scale
+ *   routed experts (w1/w2/w3)      = I8 (2 fp4 nibbles/byte, float4_e2m1fn_x2)
+ *                                    + F8_E8M0 block-32 scale
+ *   router ffn.gate.weight, embed, lm_head, all norms = BF16 (row-major)
+ *   attn.attn_sink, hc_attn/ffn/head_*                = F32
+ *   ffn.gate.tid2eid (I64 routing table)              = ignored (not used here)
+ *
+ * Two upstream conventions are reconciled ON COPY so the EXISTING kernels
+ * dequant the right VALUES (not just the right bytes):
+ *   1. DeepSeek FP8 = float8_e4m3fn (exp==15 is FINITE, max 448; only
+ *      S.1111.111 = NaN). The real path builds the LUT with e4m3fn semantics
+ *      (ds4f_init_fp8_e4m3fn_lut), unlike the synth LUT (ds4f_init_fp8_e4m3_lut)
+ *      that maps every exp==15 to NaN. The E8M0 block-scale layout
+ *      [rows/128, cols/128] already matches matvec_fp8e4m3_8row's escale index.
+ *   2. DeepSeek packs experts as float4_e2m1fn_x2 SEQUENTIALLY (byte j ->
+ *      element 2j low / 2j+1 high) over the standard e2m1 table (max 6).
+ *      matvec_mxfp4_8row expects (byte j -> element j / j+16) interleave over a
+ *      2x table {0,1,2,3,4,6,8,12}. The copy REPACKS each 16-byte block into the
+ *      kernel layout AND DECREMENTS each E8M0 expert-scale byte by 1 (an exact
+ *      /2, pure power of two) to cancel the 2x value table. Result: the kernel
+ *      reproduces DeepSeek's e2m1 weights bit-for-bit (modulo the e==0 block,
+ *      which is ~0 anyway).
+ *
+ * The mHC/sparse forward math is still partly a stand-in (e.g. o-proj silu), so
+ * end-to-end logits are not yet bit-exact; this loader gets the WEIGHT bytes,
+ * footprint, and dequant VALUES right -- the prerequisite for a later exact
+ * forward -- and is the real-weight counterpart of the synthetic throughput
+ * harness. Any missing / wrong-dtype / wrong-size tensor aborts with a named
+ * error (the completeness + integrity check).
+ */
+
+/* float8_e4m3fn -> f32 bits. "fn" (finite): exp==15 is a normal value (max 448),
+ * only the single code S.1111.111 is NaN. Distinct from the synth-path
+ * ds4f_fp8_e4m3_to_fp32_bits() which maps all exp==15 to NaN. */
+static inline uint32_t ds4f_fp8_e4m3fn_to_fp32_bits(uint8_t x) {
+    uint8_t sign = (x >> 7) & 1, exp = (x >> 3) & 0xF, mant = x & 0x7;
+    if (exp == 0) {                              /* zero / subnormal */
+        if (mant == 0) return (uint32_t)sign << 31;
+        int sh = 0; while ((mant & 0x4) == 0) { mant <<= 1; sh++; }
+        mant &= 0x3;
+        uint32_t e = (uint32_t)(127 - 7 - sh);
+        return ((uint32_t)sign << 31) | (e << 23) | ((uint32_t)mant << 20);
+    }
+    if (exp == 15 && mant == 7)                  /* the one NaN code */
+        return ((uint32_t)sign << 31) | (0xFFu << 23) | (1u << 22);
+    uint32_t e = (uint32_t)exp + (127 - 7);      /* normal; exp==15 stays finite */
+    return ((uint32_t)sign << 31) | (e << 23) | ((uint32_t)mant << 20);
+}
+static inline void ds4f_init_fp8_e4m3fn_lut(uint32_t *lut) {
+    for (int i = 0; i < 256; i++) lut[i] = ds4f_fp8_e4m3fn_to_fp32_bits((uint8_t)i);
+}
+
+static inline double ds4f_wall(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* ---- manifest + blob ---- */
+typedef struct {
+    char      name[192];
+    uint64_t  off, nbytes;
+    char      dtype[16];
+    int       ndims;
+    long long shape[8];
+} ds4f_mani_ent;
+
+typedef struct {
+    ds4f_mani_ent *e; int n, cap;
+    int       rank, ep_size;
+    uint64_t  total_bytes;
+    uint8_t  *blob; size_t blob_sz; int blob_fd;
+} ds4f_blob;
+
+static const ds4f_mani_ent *ds4f_mani_find(const ds4f_blob *B, const char *name) {
+    for (int i = 0; i < B->n; i++)
+        if (strcmp(B->e[i].name, name) == 0) return &B->e[i];
+    return NULL;
+}
+
+/* parse <dir>/rank<rr>.manifest and mmap <dir>/rank<rr>.blob (read-only). The
+ * manifest is parsed single-threaded (strtok is fine), so no _GNU_SOURCE dep. */
+static int ds4f_blob_open(ds4f_blob *B, const char *dir, int rank) {
+    memset(B, 0, sizeof *B);
+    char mp[1200], bp[1200];
+    snprintf(mp, sizeof mp, "%s/rank%02d.manifest", dir, rank);
+    snprintf(bp, sizeof bp, "%s/rank%02d.blob", dir, rank);
+    FILE *mf = fopen(mp, "r");
+    if (!mf) { fprintf(stderr, "ds4f_load: cannot open %s: %s\n", mp, strerror(errno)); return -1; }
+    B->cap = 8192; B->e = (ds4f_mani_ent *)malloc((size_t)B->cap * sizeof(*B->e)); B->n = 0;
+    char line[1024];
+    while (fgets(line, sizeof line, mf)) {
+        if (line[0] == '#') {                    /* header carries rank / ep_size */
+            char *p;
+            if ((p = strstr(line, "rank=")))    B->rank    = atoi(p + 5);
+            if ((p = strstr(line, "ep_size="))) B->ep_size = atoi(p + 8);
+            continue;
+        }
+        if (B->n == B->cap) { B->cap *= 2; B->e = (ds4f_mani_ent *)realloc(B->e, (size_t)B->cap * sizeof(*B->e)); }
+        ds4f_mani_ent *t = &B->e[B->n];
+        char *tok = strtok(line, " \t\n");           if (!tok) continue; t->off    = strtoull(tok, NULL, 10);
+        tok = strtok(NULL, " \t\n");                 if (!tok) continue; t->nbytes = strtoull(tok, NULL, 10);
+        tok = strtok(NULL, " \t\n");                 if (!tok) continue; snprintf(t->dtype, sizeof t->dtype, "%s", tok);
+        tok = strtok(NULL, " \t\n");                 if (!tok) continue; t->ndims  = atoi(tok);
+        if (t->ndims < 0 || t->ndims > 8) t->ndims = 0;
+        for (int d = 0; d < t->ndims; d++) { tok = strtok(NULL, " \t\n"); t->shape[d] = tok ? strtoll(tok, NULL, 10) : 0; }
+        tok = strtok(NULL, " \t\n");                 if (!tok) continue; snprintf(t->name, sizeof t->name, "%s", tok);
+        B->total_bytes += t->nbytes;
+        B->n++;
+    }
+    fclose(mf);
+    B->blob_fd = open(bp, O_RDONLY);
+    if (B->blob_fd < 0) { fprintf(stderr, "ds4f_load: cannot open %s: %s\n", bp, strerror(errno)); free(B->e); B->e = NULL; return -1; }
+    struct stat sb;
+    if (fstat(B->blob_fd, &sb) != 0) { fprintf(stderr, "ds4f_load: fstat %s failed\n", bp); close(B->blob_fd); free(B->e); B->e = NULL; return -1; }
+    B->blob_sz = (size_t)sb.st_size;
+    B->blob = (uint8_t *)mmap(NULL, B->blob_sz, PROT_READ, MAP_PRIVATE, B->blob_fd, 0);
+    if (B->blob == MAP_FAILED) { fprintf(stderr, "ds4f_load: mmap %s (%zu) failed\n", bp, B->blob_sz); close(B->blob_fd); free(B->e); B->e = NULL; return -1; }
+    return 0;
+}
+
+static void ds4f_blob_close(ds4f_blob *B) {
+    if (B->blob && B->blob != MAP_FAILED) munmap(B->blob, B->blob_sz);
+    if (B->blob_fd > 0) close(B->blob_fd);
+    free(B->e); B->e = NULL; B->n = 0;
+}
+
+/* ---- parallel copy/transform: blob src -> arena dst (NUMA first-touch via the
+ * SAME rowsplit8 the matvec later uses, so each row block lands on its CMG) ---- */
+typedef struct { ds4f_tensor t; const uint8_t *src_w, *src_s; } ds4f_copy_task;
+
+static void ds4f_copy_worker(void *arg, int tid, int nthr) {
+    ds4f_copy_task *T = (ds4f_copy_task *)arg; ds4f_tensor *t = &T->t;
+    int rows = t->rows, K = t->cols;
+    if (t->type == DS4F_F32) {                   /* plain element split (rows may be <8 or 1-D) */
+        size_t n = (size_t)rows * K, per = n / nthr; int ex = (int)(n % nthr);
+        size_t i0 = per * tid + (tid < ex ? (size_t)tid : (size_t)ex);
+        size_t i1 = i0 + per + (tid < ex ? 1 : 0);
+        if (i1 > i0) memcpy((float *)t->w + i0, (const float *)T->src_w + i0, (i1 - i0) * 4);
+        return;
+    }
+    int r0, r1; ds4f_rowsplit8(rows, nthr, tid, &r0, &r1);
+    if (t->type == DS4F_BF16) {                  /* real BF16 = row-major -> direct */
+        if (r1 > r0) memcpy((uint16_t *)t->w + (size_t)r0 * K,
+                            (const uint16_t *)T->src_w + (size_t)r0 * K, (size_t)(r1 - r0) * K * 2);
+    } else if (t->type == DS4F_FP8) {            /* e4m3fn bytes row-major -> direct */
+        if (r1 > r0) memcpy((uint8_t *)t->w + (size_t)r0 * K, T->src_w + (size_t)r0 * K, (size_t)(r1 - r0) * K);
+        if (tid == 0)                            /* tiny 128x128 block scale; whole on tid0 (no 128-split race) */
+            memcpy(t->scale, T->src_s, ds4f_sbytes(DS4F_FP8, rows, K));
+    } else if (t->type == DS4F_MXFP4) {          /* fp4: repack sequential -> (j,j+16); scale e-=1 (x0.5) */
+        size_t rb = K / 2, sb = K / 32, nb = rb / 16;   /* nb = K/32 sixteen-byte blocks per row */
+        for (int i = r0; i < r1; i++) {
+            const uint8_t *sw = T->src_w + (size_t)i * rb; uint8_t *dw = (uint8_t *)t->w + (size_t)i * rb;
+            for (size_t b = 0; b < nb; b++) {
+                const uint8_t *s = sw + b * 16; uint8_t *d = dw + b * 16;
+                for (int j = 0; j < 16; j++) {   /* dst byte j: low = elem j, high = elem j+16 */
+                    uint8_t lo = (j & 1) ? (uint8_t)(s[j >> 1] >> 4)        : (uint8_t)(s[j >> 1] & 0xf);
+                    uint8_t hi = (j & 1) ? (uint8_t)(s[(j >> 1) + 8] >> 4)  : (uint8_t)(s[(j >> 1) + 8] & 0xf);
+                    d[j] = (uint8_t)((hi << 4) | lo);
+                }
+            }
+            const uint8_t *ss = T->src_s + (size_t)i * sb; uint8_t *ds = t->scale + (size_t)i * sb;
+            for (size_t j = 0; j < sb; j++) { uint8_t e = ss[j]; ds[j] = e ? (uint8_t)(e - 1) : 0; }
+        }
+    }
+}
+
+static void ds4f_copy_run(ds4f_model *m, ds4f_tensor dst, const uint8_t *sw, const uint8_t *ss) {
+    ds4f_copy_task T; T.t = dst; T.src_w = sw; T.src_s = ss;
+    ds4f_pool_run(m->pool, ds4f_copy_worker, &T);
+}
+
+static const char *ds4f_qtype_dtstr(ds4f_qtype q) {
+    switch (q) { case DS4F_FP8: return "F8_E4M3"; case DS4F_MXFP4: return "I8";
+                 case DS4F_F32: return "F32"; default: return "BF16"; }
+}
+
+/* find a manifest entry and assert its dtype + byte size; abort otherwise */
+static const ds4f_mani_ent *ds4f_need(const ds4f_blob *B, const char *name,
+                                      const char *dtype, size_t nbytes) {
+    const ds4f_mani_ent *e = ds4f_mani_find(B, name);
+    if (!e) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", name); abort(); }
+    if (strcmp(e->dtype, dtype) != 0) {
+        fprintf(stderr, "ds4f_load: '%s' dtype %s != expected %s\n", name, e->dtype, dtype); abort(); }
+    if (e->nbytes != nbytes) {
+        fprintf(stderr, "ds4f_load: '%s' nbytes %llu != expected %zu\n",
+                name, (unsigned long long)e->nbytes, nbytes); abort(); }
+    return e;
+}
+
+/* load a quantized matvec tensor (FP8/MXFP4/BF16) by BASE name (+.weight/.scale) */
+static void ds4f_load_q(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst, const char *base) {
+    char wn[256], sn[256];
+    snprintf(wn, sizeof wn, "%s.weight", base);
+    size_t wb = ds4f_wbytes(dst->type, dst->rows, dst->cols);
+    const ds4f_mani_ent *we = ds4f_need(B, wn, ds4f_qtype_dtstr(dst->type), wb);
+    const uint8_t *sw = B->blob + we->off, *ss = NULL;
+    size_t sb = ds4f_sbytes(dst->type, dst->rows, dst->cols);
+    if (sb) {
+        snprintf(sn, sizeof sn, "%s.scale", base);
+        const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", sb);
+        ss = B->blob + se->off;
+    }
+    ds4f_copy_run(m, *dst, sw, ss);
+    m->bytes_read += wb + sb;
+}
+
+/* load a raw BF16/F32 buffer (un-scaled) into a plain arena pointer */
+static void ds4f_load_raw(ds4f_model *m, const ds4f_blob *B, void *dst,
+                          const char *name, ds4f_qtype type, int rows, int cols) {
+    size_t wb = ds4f_wbytes(type, rows, cols);
+    const ds4f_mani_ent *e = ds4f_need(B, name, ds4f_qtype_dtstr(type), wb);
+    ds4f_tensor t = { dst, NULL, type, rows, cols };
+    ds4f_copy_run(m, t, B->blob + e->off, NULL);
+    m->bytes_read += wb;
+}
+
+static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
+                                  const char *blob_dir, int n_threads, int n_cmgs) {
+    double t0 = ds4f_wall();
+    if (!blob_dir || !*blob_dir) {
+        const char *e = getenv("DS4F_STAGE_DIR");
+        blob_dir = (e && *e) ? e : "/local/ds4f";
+    }
+    ds4f_blob B;
+    if (ds4f_blob_open(&B, blob_dir, ep_rank) != 0) {
+        fprintf(stderr, "ds4f_load_real: no staged blob for rank %d in %s (run ds4f_stage first)\n",
+                ep_rank, blob_dir);
+        return NULL;
+    }
+    if (B.ep_size && B.ep_size != ep_size) {
+        fprintf(stderr, "ds4f_load_real: staged ep_size %d != requested %d -- re-stage with DS4F_EP_SIZE=%d\n",
+                B.ep_size, ep_size, ep_size);
+        ds4f_blob_close(&B); return NULL;
+    }
+
+    ds4f_model *m = (ds4f_model *)calloc(1, sizeof(*m));
+    m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
+    m->n_threads = n_threads; m->n_cmgs = n_cmgs;
+    /* real dtypes: dense = FP8(e4m3fn), experts = MXFP4, router/head/embed/norm =
+     * BF16 row-major. The synth requant knobs (DS4F_FP8_BF16/DENSE_MXFP4/BF16_PV)
+     * do NOT apply to real bytes; forward-only knobs (sparse/mhc/fp8_magic) do. */
+    ds4f_init_fp8_e4m3fn_lut(m->fp8_lut);
+    m->dense_qt = DS4F_FP8; m->bf16_pv = 0; m->bf16_mv_qt = DS4F_BF16;
+    { const char *e = getenv("DS4F_FP8_MAGIC"); m->fp8_magic = (e && *e && atoi(e)) ? 1 : 0; }
+    { const char *e = getenv("DS4F_SPARSE");    m->sparse    = (e && *e && atoi(e)) ? 1 : 0; }
+    { const char *e = getenv("DS4F_MHC");       m->mhc       = (e && *e && atoi(e)) ? 1 : 0; }
+    { const char *e = getenv("DS4F_EXACT");     m->exact     = (e && *e && atoi(e)) ? 1 : 0; }
+    m->pool = ds4f_pool_start(n_threads, n_cmgs);
+
+    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size, 0 /* FP8 dense */);
+    m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m->arena == MAP_FAILED) { fprintf(stderr, "ds4f_load_real: arena mmap %zu failed\n", m->arena_sz); abort(); }
+#ifdef MADV_NOHUGEPAGE
+    madvise(m->arena, m->arena_sz, MADV_NOHUGEPAGE);   /* per-thread first-touch NUMA placement */
+#endif
+    m->arena_used = 0;
+
+    int C = cfg.hidden;
+    /* ---- allocate (bump order MIRRORS ds4f_alloc_synth exactly) ---- */
+    m->out_norm = (uint16_t *)ds4f_bump(m, (size_t)C * 2, 64);
+    ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w;
+    m->head = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C);
+    {   int hc = cfg.hc_mult, hd = hc * C;
+        m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc * hd * 4, 256);
+        m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc * 4, 64);
+        m->hc_head_scale = (float *)ds4f_bump(m, (size_t)4, 64); }
+
+    m->layers = (ds4f_layer *)calloc(cfg.n_layers, sizeof(ds4f_layer));
+    int no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
+    for (int L = 0; L < cfg.n_layers; L++) {
+        ds4f_layer *ly = &m->layers[L];
+        ly->attn_norm = (uint16_t *)ds4f_bump(m, (size_t)C * 2, 64);
+        ly->ffn_norm  = (uint16_t *)ds4f_bump(m, (size_t)C * 2, 64);
+        ly->q_norm    = (uint16_t *)ds4f_bump(m, (size_t)cfg.q_lora * 2, 64);
+        ly->kv_norm   = (uint16_t *)ds4f_bump(m, (size_t)cfg.kv_lora * 2, 64);
+        ly->wq_a = ds4f_new_tensor(m, DS4F_FP8, cfg.q_lora, C);
+        ly->wq_b = ds4f_new_tensor(m, DS4F_FP8, cfg.n_heads * cfg.q_head_dim, cfg.q_lora);
+        ly->wkv  = ds4f_new_tensor(m, DS4F_FP8, cfg.kv_lora, C);
+        ly->wo_a = ds4f_new_tensor(m, DS4F_FP8, cfg.o_inter, C);
+        ly->wo_b = ds4f_new_tensor(m, DS4F_FP8, C, cfg.o_inter);
+        ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads * 4, 64);
+        ly->gate = ds4f_new_tensor(m, DS4F_BF16, cfg.n_experts, C);
+        /* router selection bias (F32[n_experts]); only non-hash layers have it.
+         * Off-arena (tiny, read single-threaded in the exact gate, not a matvec). */
+        if (L >= cfg.n_hash_layers) ly->gate_bias = (float *)aligned_alloc(64, (size_t)cfg.n_experts * 4);
+        ly->sh_w1 = ds4f_new_tensor(m, DS4F_FP8, cfg.shared_inter, C);
+        ly->sh_w3 = ds4f_new_tensor(m, DS4F_FP8, cfg.shared_inter, C);
+        ly->sh_w2 = ds4f_new_tensor(m, DS4F_FP8, C, cfg.shared_inter);
+        ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
+        ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
+        ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
+        ly->owned_eid = (int *)calloc(no, sizeof(int));
+        ly->n_owned = no;
+        int slot = 0;
+        for (int e = 0; e < cfg.n_experts; e++) if (e % ep_size == ep_rank) {
+            ly->ex_w1[slot] = ds4f_new_tensor(m, DS4F_MXFP4, cfg.moe_inter, C);
+            ly->ex_w3[slot] = ds4f_new_tensor(m, DS4F_MXFP4, cfg.moe_inter, C);
+            ly->ex_w2[slot] = ds4f_new_tensor(m, DS4F_MXFP4, C, cfg.moe_inter);
+            ly->owned_eid[slot] = e; slot++;
+        }
+        {   int hc = cfg.hc_mult, mix = (2 + hc) * hc, hd = hc * C;
+            ly->hc_attn_fn    = (float *)ds4f_bump(m, (size_t)mix * hd * 4, 256);
+            ly->hc_attn_base  = (float *)ds4f_bump(m, (size_t)mix * 4, 64);
+            ly->hc_attn_scale = (float *)ds4f_bump(m, (size_t)3 * 4, 64);
+            ly->hc_ffn_fn     = (float *)ds4f_bump(m, (size_t)mix * hd * 4, 256);
+            ly->hc_ffn_base   = (float *)ds4f_bump(m, (size_t)mix * 4, 64);
+            ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3 * 4, 64); }
+        ly->kv_cache = (float *)ds4f_bump(m, (size_t)cfg.max_pos * cfg.kv_lora * 4, 256);
+    }
+
+    /* ---- copy REAL bytes by name (verify dtype/size; abort on any mismatch) ---- */
+    int mix = (2 + cfg.hc_mult) * cfg.hc_mult;
+    ds4f_load_raw(m, &B, m->out_norm,      "norm.weight",   DS4F_BF16, 1, C);
+    ds4f_load_raw(m, &B, m->embed,         "embed.weight",  DS4F_BF16, cfg.vocab, C);
+    ds4f_load_q  (m, &B, &m->head,         "head");
+    ds4f_load_raw(m, &B, m->hc_head_fn,    "hc_head_fn",    DS4F_F32, cfg.hc_mult, cfg.hc_mult * C);
+    ds4f_load_raw(m, &B, m->hc_head_base,  "hc_head_base",  DS4F_F32, 1, cfg.hc_mult);
+    ds4f_load_raw(m, &B, m->hc_head_scale, "hc_head_scale", DS4F_F32, 1, 1);
+
+    char nm[256];
+    for (int L = 0; L < cfg.n_layers; L++) {
+        ds4f_layer *ly = &m->layers[L];
+        #define DS4F_LN(field) (snprintf(nm, sizeof nm, "layers.%d.%s", L, field), nm)
+        ds4f_load_raw(m, &B, ly->attn_norm, DS4F_LN("attn_norm.weight"),     DS4F_BF16, 1, C);
+        ds4f_load_raw(m, &B, ly->ffn_norm,  DS4F_LN("ffn_norm.weight"),      DS4F_BF16, 1, C);
+        ds4f_load_raw(m, &B, ly->q_norm,    DS4F_LN("attn.q_norm.weight"),   DS4F_BF16, 1, cfg.q_lora);
+        ds4f_load_raw(m, &B, ly->kv_norm,   DS4F_LN("attn.kv_norm.weight"),  DS4F_BF16, 1, cfg.kv_lora);
+        ds4f_load_q  (m, &B, &ly->wq_a,     DS4F_LN("attn.wq_a"));
+        ds4f_load_q  (m, &B, &ly->wq_b,     DS4F_LN("attn.wq_b"));
+        ds4f_load_q  (m, &B, &ly->wkv,      DS4F_LN("attn.wkv"));
+        ds4f_load_q  (m, &B, &ly->wo_a,     DS4F_LN("attn.wo_a"));
+        ds4f_load_q  (m, &B, &ly->wo_b,     DS4F_LN("attn.wo_b"));
+        ds4f_load_raw(m, &B, ly->attn_sink, DS4F_LN("attn.attn_sink"),       DS4F_F32, 1, cfg.n_heads);
+        ds4f_load_q  (m, &B, &ly->gate,     DS4F_LN("ffn.gate"));
+        if (ly->gate_bias)   /* noaux_tc selection bias (F32[n_experts]); non-hash layers only */
+            ds4f_load_raw(m, &B, ly->gate_bias, DS4F_LN("ffn.gate.bias"), DS4F_F32, 1, cfg.n_experts);
+        ds4f_load_q  (m, &B, &ly->sh_w1,    DS4F_LN("ffn.shared_experts.w1"));
+        ds4f_load_q  (m, &B, &ly->sh_w3,    DS4F_LN("ffn.shared_experts.w3"));
+        ds4f_load_q  (m, &B, &ly->sh_w2,    DS4F_LN("ffn.shared_experts.w2"));
+        for (int s = 0; s < no; s++) {
+            int e = ly->owned_eid[s];
+            snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.w1", L, e); ds4f_load_q(m, &B, &ly->ex_w1[s], nm);
+            snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.w3", L, e); ds4f_load_q(m, &B, &ly->ex_w3[s], nm);
+            snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.w2", L, e); ds4f_load_q(m, &B, &ly->ex_w2[s], nm);
+        }
+        ds4f_load_raw(m, &B, ly->hc_attn_fn,    DS4F_LN("hc_attn_fn"),    DS4F_F32, mix, cfg.hc_mult * C);
+        ds4f_load_raw(m, &B, ly->hc_attn_base,  DS4F_LN("hc_attn_base"),  DS4F_F32, 1, mix);
+        ds4f_load_raw(m, &B, ly->hc_attn_scale, DS4F_LN("hc_attn_scale"), DS4F_F32, 1, 3);
+        ds4f_load_raw(m, &B, ly->hc_ffn_fn,     DS4F_LN("hc_ffn_fn"),     DS4F_F32, mix, cfg.hc_mult * C);
+        ds4f_load_raw(m, &B, ly->hc_ffn_base,   DS4F_LN("hc_ffn_base"),   DS4F_F32, 1, mix);
+        ds4f_load_raw(m, &B, ly->hc_ffn_scale,  DS4F_LN("hc_ffn_scale"),  DS4F_F32, 1, 3);
+        #undef DS4F_LN
+    }
+
+    double loaded_gb = (double)m->bytes_read / 1e9;
+    int n_tensors = B.n; uint64_t staged = B.total_bytes;
+    m->bytes_read = 0;                 /* runner resets per token; start clean */
+    ds4f_blob_close(&B);               /* arena holds the copies; release the blob mmap */
+
+    /* ---- scratch (identical to ds4f_alloc_synth) ---- */
+    int H = cfg.n_heads * cfg.q_head_dim;
+    m->s_hn    = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_qlat  = (float *)aligned_alloc(256, (size_t)cfg.q_lora * 4);
+    m->s_q     = (float *)aligned_alloc(256, (size_t)H * 4);
+    m->s_kvlat = (float *)aligned_alloc(256, (size_t)cfg.kv_lora * 4);
+    m->s_attn  = (float *)aligned_alloc(256, (size_t)H * 4);
+    m->s_oin   = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_o1    = (float *)aligned_alloc(256, (size_t)cfg.o_inter * 4);
+    m->s_o     = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_h2    = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_router= (float *)aligned_alloc(256, (size_t)cfg.n_experts * 4);
+    m->s_shg   = (float *)aligned_alloc(256, (size_t)cfg.shared_inter * 4);
+    m->s_shu   = (float *)aligned_alloc(256, (size_t)cfg.shared_inter * 4);
+    m->s_exg   = (float *)aligned_alloc(256, (size_t)cfg.moe_inter * 4);
+    m->s_exu   = (float *)aligned_alloc(256, (size_t)cfg.moe_inter * 4);
+    m->s_moe   = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_route = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_logits= (float *)aligned_alloc(256, (size_t)cfg.vocab * 4);
+    m->idx_blk_stride = cfg.max_pos > cfg.index_topk ? cfg.max_pos : cfg.index_topk;
+    m->s_idx_scores = (float *)aligned_alloc(256, (size_t)n_threads * m->idx_blk_stride * 4);
+    m->s_idx_sel    = (int   *)aligned_alloc(256, (size_t)n_threads * cfg.index_topk * 4);
+    m->s_x4    = (float *)aligned_alloc(256, (size_t)cfg.hc_mult * C * 4);
+    m->s_resid = (float *)aligned_alloc(256, (size_t)cfg.hc_mult * C * 4);
+    m->s_xc    = (float *)aligned_alloc(256, (size_t)C * 4);
+
+    double el = ds4f_wall() - t0;
+    fprintf(stderr,
+        "ds4f_load_real rank %d/%d: %d staged tensors, loaded %.2f GB "
+        "(FP8 e4m3fn dense + MXFP4 experts repacked, %d owned), arena %.2f GB, %.1f s, %.2f GB/s\n",
+        ep_rank, ep_size, n_tensors, loaded_gb, no, (double)m->arena_used / 1e9,
+        el, el > 0 ? loaded_gb / el : 0.0);
+    (void)staged;
+    ds4f_build_freqs(m);   /* RoPE/YaRN tables (only when exact) */
+    return m;
 }
 
 /* ===================== attention (pooled over heads) ===================== */
@@ -812,6 +1359,66 @@ static void ds4f_attn_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* ===================== exact attention (sliding window + sink + de-rotate) =====
+ * model.py Attention.forward, window term: q (already per-head-normed + RoPE'd)
+ * scores the kv latent (RoPE'd, stored in cache) over the last `win` positions;
+ * sink contributes exp(sink-max) to the denominator only; weighted-V over the
+ * same latent; the output's rope dims are de-rotated by the QUERY position. The
+ * long-range compressor/indexer term (sparse layers) is the Tier-B2 follow-up. */
+typedef struct {
+    ds4f_model *m; ds4f_layer *ly; int pos; float scale;
+    int win, half; const float *rcos, *rsin;
+} ds4f_attn_ex_task;
+
+static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
+    ds4f_attn_ex_task *T = (ds4f_attn_ex_task *)arg;
+    ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
+    int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora;
+    int rd = m->cfg.qk_rope_dim, nope = HD - rd, half = T->half;
+    int pos = T->pos, p_lo = pos - T->win + 1; if (p_lo < 0) p_lo = 0;
+    int nP = pos - p_lo + 1;
+    int nh = m->cfg.n_heads, per = nh / nthr, extra = nh % nthr;
+    int h0 = per*tid + (tid < extra ? tid : extra);
+    int h1 = h0 + per + (tid < extra ? 1 : 0);
+    float *sc = (float *)alloca((size_t)nP * 4);
+    for (int h = h0; h < h1; h++) {
+        const float *q = m->s_q + (size_t)h*HD;
+        float mx = -1e30f;
+        for (int j = 0; j < nP; j++) {
+            const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            float s = 0.f;
+            for (int d = 0; d < KV; d++) s += q[d]*kc[d];      /* HD==KV (512) */
+            s *= T->scale; sc[j] = s; if (s > mx) mx = s;
+        }
+        float snk = ly->attn_sink[h];
+        float denom = expf(snk - mx);
+        for (int j = 0; j < nP; j++) { sc[j] = expf(sc[j] - mx); denom += sc[j]; }
+        float inv = 1.0f/denom;
+        float *out = m->s_attn + (size_t)h*HD;
+        for (int d = 0; d < HD; d++) out[d] = 0.f;
+        for (int j = 0; j < nP; j++) {
+            float w = sc[j]*inv;
+            const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            for (int d = 0; d < HD; d++) out[d] += w*kc[d];
+        }
+        ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, half, 1);  /* de-rotate */
+    }
+}
+
+/* exact q: per-head RMS-normalize (no weight) over q_head_dim, then RoPE last rd. */
+static void ds4f_q_norm_rope(ds4f_model *m, float *q, int pos,
+                             const float *rcos, const float *rsin) {
+    ds4f_config *c = &m->cfg;
+    int HD = c->q_head_dim, rd = c->qk_rope_dim, half = rd/2, nope = HD - rd;
+    for (int h = 0; h < c->n_heads; h++) {
+        float *qh = q + (size_t)h*HD;
+        double ss = 0.0; for (int d = 0; d < HD; d++) ss += (double)qh[d]*qh[d];
+        float inv = 1.0f/sqrtf((float)(ss/HD) + c->norm_eps);
+        for (int d = 0; d < HD; d++) qh[d] *= inv;
+        ds4f_rope_apply(qh + nope, rcos, rsin, pos, half, 0);
+    }
+}
+
 /* ===================== MoE routing ===================== */
 static void ds4f_topk(const float *logits, int n, int k, int *idx, float *wt, float routed_scale) {
     /* sqrtsoftplus score, top-k by score, norm_topk_prob, routed_scale */
@@ -826,6 +1433,29 @@ static void ds4f_topk(const float *logits, int n, int k, int *idx, float *wt, fl
     float sum = 0.f; for (int i = 0; i < k; i++) if (idx[i] >= 0) sum += wt[i];
     if (sum <= 0) sum = 1.f;
     for (int i = 0; i < k; i++) wt[i] = (wt[i]/sum) * routed_scale;
+}
+
+/* Exact DeepSeek-V4-Flash gate (model.py Gate.forward, score_func=sqrtsoftplus):
+ *   score[e] = sqrt(softplus(logit[e]))          (UNBIASED)
+ *   select top-k by (score[e] + bias[e])         (bias for SELECTION ONLY)
+ *   weight[k] = score[idx[k]] (unbiased) / sum(selected scores) * route_scale
+ * With bias==NULL (synthetic, or hash layers where token-id routing is deferred)
+ * this is byte-identical to ds4f_topk. */
+static void ds4f_topk_exact(const float *logits, const float *bias, int n, int k,
+                            int *idx, float *wt, float routed_scale) {
+    float selkey[8], selsc[8];                   /* k <= n_active <= 8 */
+    for (int i = 0; i < k; i++) { idx[i] = -1; selkey[i] = -1e30f; selsc[i] = 0.f; }
+    for (int e = 0; e < n; e++) {
+        float z = logits[e];
+        float sp = (z > 0.f) ? z + log1pf(expf(-z)) : log1pf(expf(z));
+        float sc = sqrtf(sp < 0 ? 0 : sp);       /* unbiased sqrtsoftplus score */
+        float key = sc + (bias ? bias[e] : 0.f); /* biased selection key */
+        int lo = 0; for (int j = 1; j < k; j++) if (selkey[j] < selkey[lo]) lo = j;
+        if (key > selkey[lo]) { selkey[lo] = key; selsc[lo] = sc; idx[lo] = e; }
+    }
+    float sum = 0.f; for (int i = 0; i < k; i++) if (idx[i] >= 0) sum += selsc[i];
+    if (sum <= 0) sum = 1.f;
+    for (int i = 0; i < k; i++) wt[i] = (selsc[i] / sum) * routed_scale;
 }
 
 /* ===================== synthetic KV warm (ctx benchmark) =====================
@@ -991,6 +1621,11 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     if (m->mhc) for (int k = 0; k < hc; k++) memcpy(m->s_x4 + (size_t)k*C, x, (size_t)C*4);
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
+        /* exact RoPE table for this layer: sparse layers (compress_ratio!=0) use
+         * the YaRN/compress_rope_theta table, dense layers the plain rope_theta. */
+        int ratio = c->compress_ratios[L];
+        const float *rcos = m->exact ? (ratio ? m->rope_comp_cos : m->rope_dense_cos) : NULL;
+        const float *rsin = m->exact ? (ratio ? m->rope_comp_sin : m->rope_dense_sin) : NULL;
         /* ---- mHC pre (attn): collapse 4 streams -> attn input; save residual ---- */
         float *asrc = x;
         if (m->mhc) { DS4F_TIC();
@@ -1007,26 +1642,48 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn);
         ds4f_rmsnorm(m->s_qlat, m->s_qlat, ly->q_norm, c->q_lora, eps);
         ds4f_matvec(m, m->s_q, &ly->wq_b, m->s_qlat);            /* [n_heads*q_head_dim] */
+        if (m->exact) ds4f_q_norm_rope(m, m->s_q, pos, rcos, rsin); /* per-head norm + RoPE */
         ds4f_chk("q", L, m->s_q, H);
         ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn);          /* [kv_lora] */
         ds4f_rmsnorm(m->s_kvlat, m->s_kvlat, ly->kv_norm, KV, eps);
+        if (m->exact)                                            /* RoPE the kv rope dims */
+            ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
         ds4f_chk("kvlat", L, m->s_kvlat, KV);
         memcpy(ly->kv_cache + (size_t)pos*KV, m->s_kvlat, (size_t)KV*4);  /* append latent */
         DS4F_TOC(DS4F_P_QKV); }
         /* ---- attention ---- */
         { DS4F_TIC();
-        ds4f_attn_task at = { m, ly, pos, 1.0f/sqrtf((float)KV), c->compress_ratios[L] };
-        ds4f_pool_run(m->pool, ds4f_attn_worker, &at);          /* fills s_attn[H] */
+        if (m->exact) {
+            ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
+                                     c->window_size, c->qk_rope_dim/2, rcos, rsin };
+            ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at);
+        } else {
+            ds4f_attn_task at = { m, ly, pos, 1.0f/sqrtf((float)KV), c->compress_ratios[L] };
+            ds4f_pool_run(m->pool, ds4f_attn_worker, &at);      /* fills s_attn[H] */
+        }
         ds4f_chk("attn", L, m->s_attn, H);
         DS4F_TOC(DS4F_P_ATTN); }
         /* ---- o projection ---- */
         { DS4F_TIC();
         int og = c->o_groups; (void)H;
-        for (int i = 0; i < C; i++) m->s_oin[i] = 0.f;
-        for (int g = 0; g < og; g++) for (int i = 0; i < C; i++) m->s_oin[i] += m->s_attn[g*C + i];
-        ds4f_matvec(m, m->s_o1, &ly->wo_a, m->s_oin);           /* [o_inter] */
-        for (int i = 0; i < c->o_inter; i++) m->s_o1[i] = ds4f_silu(m->s_o1[i]);  /* stand-in nonlin */
-        ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);             /* [hidden] */
+        if (m->exact) {
+            /* grouped low-rank o-proj (block-diagonal wo_a, NO nonlinearity):
+             * s_attn is [og groups, n_heads/og*q_head_dim = C] already de-rotated;
+             * group g: o1[g*o_lora ..] = wo_a_rows[g*o_lora ..] @ s_attn[g*C ..].
+             * wo_a is FP8 -> o_lora(1024) rows are 128-aligned per group. */
+            int gin = H / og;                          /* 32768/8 = 4096 == C */
+            for (int g = 0; g < og; g++) {
+                ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
+                ds4f_matvec(m, m->s_o1 + (size_t)g * c->o_lora, &vg, m->s_attn + (size_t)g * gin);
+            }
+            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden], no silu */
+        } else {
+            for (int i = 0; i < C; i++) m->s_oin[i] = 0.f;
+            for (int g = 0; g < og; g++) for (int i = 0; i < C; i++) m->s_oin[i] += m->s_attn[g*C + i];
+            ds4f_matvec(m, m->s_o1, &ly->wo_a, m->s_oin);       /* [o_inter] */
+            for (int i = 0; i < c->o_inter; i++) m->s_o1[i] = ds4f_silu(m->s_o1[i]);  /* stand-in nonlin */
+            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden] */
+        }
         ds4f_chk("o", L, m->s_o, C);
         if (m->mhc) ds4f_hc_post(m, m->s_x4, m->s_resid, m->s_o, post_a, comb_a); /* expand 1->4 */
         else for (int i = 0; i < C; i++) x[i] += m->s_o[i];     /* plain-residual stand-in */
@@ -1048,7 +1705,11 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         { DS4F_TIC();
         ds4f_matvec(m, m->s_shg, &ly->sh_w1, m->s_h2);
         ds4f_matvec(m, m->s_shu, &ly->sh_w3, m->s_h2);
-        for (int i = 0; i < c->shared_inter; i++) m->s_shg[i] = ds4f_silu(m->s_shg[i]) * m->s_shu[i];
+        if (m->exact) { float lim = c->swiglu_limit;            /* clamp up both sides, gate max */
+            for (int i = 0; i < c->shared_inter; i++)
+                m->s_shg[i] = ds4f_silu(m->s_shg[i] > lim ? lim : m->s_shg[i]) * ds4f_clampf(m->s_shu[i], -lim, lim);
+        } else
+            for (int i = 0; i < c->shared_inter; i++) m->s_shg[i] = ds4f_silu(m->s_shg[i]) * m->s_shu[i];
         ds4f_chk("sh_gu", L, m->s_shg, c->shared_inter);
         ds4f_matvec(m, m->s_o, &ly->sh_w2, m->s_shg);            /* reuse s_o as tmp [hidden] */
         ds4f_chk("sh_out", L, m->s_o, C);
@@ -1060,7 +1721,10 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         ds4f_chk("router", L, m->s_router, c->n_experts);
         DS4F_TOC(DS4F_P_ROUTER); }
         int idx[8]; float wt[8];
-        ds4f_topk(m->s_router, c->n_experts, c->n_active, idx, wt, c->routed_scale);
+        if (m->exact)
+            ds4f_topk_exact(m->s_router, ly->gate_bias, c->n_experts, c->n_active, idx, wt, c->routed_scale);
+        else
+            ds4f_topk(m->s_router, c->n_experts, c->n_active, idx, wt, c->routed_scale);
         if (ds4f_dbg) { fprintf(stderr, "  L%-2d topk wt=", L);
             for (int k=0;k<c->n_active;k++) fprintf(stderr,"%.3f(e%d) ", wt[k], idx[k]);
             fprintf(stderr,"\n"); }
@@ -1072,7 +1736,11 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             int slot = e / m->ep_size;                           /* dense owned index */
             ds4f_matvec(m, m->s_exg, &ly->ex_w1[slot], m->s_h2);
             ds4f_matvec(m, m->s_exu, &ly->ex_w3[slot], m->s_h2);
-            for (int i = 0; i < c->moe_inter; i++) m->s_exg[i] = ds4f_silu(m->s_exg[i]) * m->s_exu[i];
+            if (m->exact) { float lim = c->swiglu_limit;
+                for (int i = 0; i < c->moe_inter; i++)
+                    m->s_exg[i] = ds4f_silu(m->s_exg[i] > lim ? lim : m->s_exg[i]) * ds4f_clampf(m->s_exu[i], -lim, lim);
+            } else
+                for (int i = 0; i < c->moe_inter; i++) m->s_exg[i] = ds4f_silu(m->s_exg[i]) * m->s_exu[i];
             ds4f_matvec(m, m->s_o, &ly->ex_w2[slot], m->s_exg);
             for (int i = 0; i < C; i++) m->s_route[i] += wt[k] * m->s_o[i];
         }
