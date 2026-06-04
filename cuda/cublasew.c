@@ -581,7 +581,9 @@ int cublasew_gemm_f32_lt_rowmajor_nt_beta1(cublasew_context *ctx,
     if (!ctx || !ctx->lt_handle) return -1;
     if (!g_cublaslt_available) return -1;
 
-    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasComputeType_t compute_type =
+        ctx->allow_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    st = p_cublasLtMatmulDescCreate(&desc, compute_type, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) goto fail;
     if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                           &op_n, sizeof(op_n)) != CUBLAS_STATUS_SUCCESS)
@@ -670,7 +672,9 @@ int cublasew_gemm_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
     if (!ctx || !ctx->lt_handle || !d_bias_f32) return -1;
     if (!g_cublaslt_available) return -1;
 
-    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasComputeType_t compute_type =
+        ctx->allow_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    st = p_cublasLtMatmulDescCreate(&desc, compute_type, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) { fail_step = "desc_create"; fail_status = st; goto fail; }
     if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                           &op_t, sizeof(op_t)) != CUBLAS_STATUS_SUCCESS) {
@@ -770,7 +774,9 @@ int cublasew_gemm_f32_lt_rowmajor_nt(cublasew_context *ctx,
     if (!ctx || !ctx->lt_handle) return -1;
     if (!g_cublaslt_available) return -1;
 
-    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasComputeType_t compute_type =
+        ctx->allow_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    st = p_cublasLtMatmulDescCreate(&desc, compute_type, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) { fail_step = "desc_create"; fail_status = st; goto fail; }
     if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                           &op_t, sizeof(op_t)) != CUBLAS_STATUS_SUCCESS) {
