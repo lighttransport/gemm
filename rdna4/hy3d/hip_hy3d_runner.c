@@ -281,6 +281,11 @@ struct hip_hy3d_runner {
 
     /* Load status */
     int dino_loaded, dit_loaded, vae_loaded;
+
+    /* Per-stage GPU timing */
+    int timing_enabled;
+    int timing_valid;
+    hy3d_stage_times timings;
 };
 
 static int hy3d_should_dump_latent(const struct hip_hy3d_runner *r, int step1) {
@@ -1008,6 +1013,118 @@ static void run_dinov2(hip_hy3d_runner *r, void *d_image, void *d_out) {
     }
 }
 
+/* fp16 DINOv2 forward — same structure as run_dinov2 but residual stream
+ * carries f16 through the 24 encoder layers using hipBLASLt fp16 GEMMs and
+ * WMMA fp16 self-attention.  patch_embed + cls_pos_embed stay f32 (run once);
+ * we cast to f16 once before the loop and back to f32 once at the end so the
+ * caller interface (f32 d_out) is unchanged.  Weights must already be f16. */
+static void run_dinov2_fp16(hip_hy3d_runner *r, void *d_image, void *d_out) {
+    hy3d_ops *ops = &r->ops;
+    hipStream_t stream = r->stream;
+    const int seq = DINO_SEQ_LEN;
+    const int dim = DINO_HIDDEN;
+    const int heads = DINO_HEADS;
+    const int hd = DINO_HEAD_DIM;
+    const int ffn = DINO_FFN;
+    const int ps = DINO_PATCH;
+    const int gw = DINO_IMG_SIZE / ps;
+
+    const size_t f16b = sizeof(uint16_t);
+    /* f32 buffers (one-shot patch+pos): scratch[0]=hidden_f32, scratch[2]=final_f32 */
+    ensure_scratch(r, 0, (size_t)seq * dim * sizeof(float));
+    ensure_scratch(r, 2, (size_t)seq * dim * sizeof(float));
+    /* f16 buffers: scratch[1] is multi-purpose, we partition it.  Need:
+     *   hidden_f16   [seq*dim]
+     *   qkv_f16      [3*seq*dim]
+     *   attn_f16     [seq*dim]
+     *   mlp_f16      [seq*ffn]
+     *   normed_f16   [seq*dim] */
+    size_t need = (size_t)seq * dim * f16b           /* hidden */
+                + (size_t)3 * seq * dim * f16b       /* qkv    */
+                + (size_t)seq * dim * f16b           /* attn   */
+                + (size_t)seq * ffn * f16b           /* mlp    */
+                + (size_t)seq * dim * f16b;          /* normed */
+    ensure_scratch(r, 1, need);
+
+    void *d_hidden_f32 = r->scratch[0];
+    char *p = (char *)r->scratch[1];
+    void *d_hidden = p;       p += (size_t)seq * dim * f16b;
+    void *d_qkv    = p;       p += (size_t)3 * seq * dim * f16b;
+    void *d_attn   = p;       p += (size_t)seq * dim * f16b;
+    void *d_mlp    = p;       p += (size_t)seq * ffn * f16b;
+    void *d_normed = p;
+    void *d_final_f32 = r->scratch[2];
+
+    /* 1. patch embed (f32) */
+    {
+        int gw2 = gw, dim2 = dim, ps2 = ps, img_w = DINO_IMG_SIZE, img_h = DINO_IMG_SIZE;
+        void *pw = r->dino_patch_w, *pb = r->dino_patch_b;
+        void *args[] = {&d_hidden_f32, &d_image, &pw, &pb, &gw2, &dim2, &ps2, &img_w, &img_h};
+        hipModuleLaunchKernel(ops->patch_embed,
+                       (unsigned)(gw * gw), 1, 1,
+                       256, 1, 1, 0, stream, args, NULL);
+    }
+
+    /* 2. cls + pos (f32) */
+    {
+        int n_tok = seq, d2 = dim;
+        void *cls = r->dino_cls_token, *pos = r->dino_pos_emb;
+        void *args[] = {&d_hidden_f32, &cls, &pos, &n_tok, &d2};
+        hipModuleLaunchKernel(ops->cls_pos_embed,
+                       (unsigned)((seq*dim+255)/256), 1, 1,
+                       256, 1, 1, 0, stream, args, NULL);
+    }
+
+    /* cast f32 -> f16 once */
+    op_cast_f32_to_f16(ops, stream, d_hidden, d_hidden_f32, seq * dim);
+
+    /* 3. Encoder layers (24x) in f16 */
+    for (int li = 0; li < DINO_LAYERS; li++) {
+        dino_layer_gpu *l = &r->dino_layers[li];
+
+        op_layernorm_f16(ops, stream, d_normed, d_hidden, l->ln1_w, l->ln1_b, seq, dim);
+
+        void *d_Q = d_qkv;
+        void *d_K = (char *)d_qkv + (size_t)seq * dim * f16b;
+        void *d_V = (char *)d_qkv + (size_t)2 * seq * dim * f16b;
+        op_gemm_f16_bias_f16d(ops, stream, d_Q, l->q_w, d_normed, l->q_b, dim, dim, seq);
+        op_gemm_f16_bias_f16d(ops, stream, d_K, l->k_w, d_normed, l->k_b, dim, dim, seq);
+        op_gemm_f16_bias_f16d(ops, stream, d_V, l->v_w, d_normed, l->v_b, dim, dim, seq);
+
+        if (op_self_attn_f16(ops, stream, d_attn, d_Q, d_K, d_V, seq, dim, heads, hd) != 0) {
+            fprintf(stderr, "HY3D: DINOv2 fp16 self-attn dispatch failed (head_dim=%d)\n", hd);
+            return;
+        }
+
+        op_gemm_f16_bias_f16d(ops, stream, d_normed, l->out_w, d_attn, l->out_b, dim, dim, seq);
+
+        if (l->ls1 && ops->layerscale_add_f16)
+            op_layerscale_add_f16(ops, stream, d_hidden, d_normed, l->ls1, seq * dim, dim);
+        else
+            op_add_f16(ops, stream, d_hidden, d_normed, seq * dim);
+
+        op_layernorm_f16(ops, stream, d_normed, d_hidden, l->ln2_w, l->ln2_b, seq, dim);
+        op_gemm_f16_bias_gelu_f16d(ops, stream, d_mlp, l->fc1_w, d_normed, l->fc1_b, ffn, dim, seq);
+        op_gemm_f16_bias_f16d(ops, stream, d_normed, l->fc2_w, d_mlp, l->fc2_b, dim, ffn, seq);
+
+        if (l->ls2 && ops->layerscale_add_f16)
+            op_layerscale_add_f16(ops, stream, d_hidden, d_normed, l->ls2, seq * dim, dim);
+        else
+            op_add_f16(ops, stream, d_hidden, d_normed, seq * dim);
+    }
+
+    /* 4. Final LN (f16 in, then cast to f32 out) */
+    if (r->dino_final_ln_w) {
+        /* Cast final hidden to f32, run f32 layernorm into d_out.  Avoids
+         * needing an f16 layernorm with f32 D output. */
+        op_cast_f16_to_f32(ops, stream, d_final_f32, d_hidden, seq * dim);
+        op_layernorm(ops, stream, d_out, d_final_f32,
+                     r->dino_final_ln_w, r->dino_final_ln_b, seq, dim);
+    } else {
+        op_cast_f16_to_f32(ops, stream, d_out, d_hidden, seq * dim);
+    }
+}
+
 /* precompute_dit_ca_kv removed -- K/V computed per-block inside run_dit_forward */
 
 /*
@@ -1023,89 +1140,33 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     const char *moe_fp16_env = getenv("HY3D_MOE_FP16");
     const int moe_fp16 = (moe_fp16_env && *moe_fp16_env && moe_fp16_env[0] != '0') ? 1 : 0;
 
-    /* Scratch layout within d_moe_scratch */
+    /* Scratch layout within d_moe_scratch.  d_weights replaces the host
+     * gate_weights buffer; sized [N_tok, DIT_N_EXPERTS]. */
     size_t off = 0;
-    void *d_gate   = (char *)d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
-    void *d_exp_h  = (char *)d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
-    void *d_exp_o  = (char *)d_moe_scratch + off; /* [N_tok * H_dim] reused */
+    void *d_gate    = (char *)d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
+    void *d_weights = (char *)d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
+    void *d_exp_h   = (char *)d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
+    void *d_exp_o   = (char *)d_moe_scratch + off; /* [N_tok * H_dim] */
 
-    /* Step 1: Compute gate logits: [N_tok, H_dim] @ [8, H_dim]^T -> [N_tok, 8] */
+    /* Step 1: Gate logits: [N_tok, H_dim] @ [E, H_dim]^T -> [N_tok, E] */
     op_gemm(ops, stream, d_gate, blk->moe_gate_w, d_input, NULL,
             DIT_N_EXPERTS, H_dim, N_tok);
     /* PyTorch fp16 pipeline routes experts from fp16 gate logits. HIP keeps
-     * activations in F32, so round gate logits before CPU softmax/top-k to
+     * activations in F32, so round gate logits before GPU softmax/top-k to
      * reduce route flips from tiny precision differences. */
     op_round_f32_to_f16(ops, stream, d_gate, N_tok * DIT_N_EXPERTS);
 
-    /* Step 2: Download gate logits, compute softmax + top-2 on CPU */
-    float *gate_cpu = (float *)malloc((size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
-    hipStreamSynchronize(stream);
-    hipMemcpy(gate_cpu, d_gate, (size_t)N_tok * DIT_N_EXPERTS * sizeof(float), hipMemcpyDeviceToHost);
+    /* Step 2: GPU softmax + top-K masking → d_weights (sparse, top-K only). */
+    op_moe_gate_softmax_topk(ops, stream, d_gate, d_weights,
+                             N_tok, DIT_N_EXPERTS, DIT_MOE_TOP_K);
 
-    /* Softmax over experts per token, then top-2 masking */
-    float *gate_weights = (float *)calloc((size_t)N_tok * DIT_N_EXPERTS, sizeof(float));
-    for (int t = 0; t < N_tok; t++) {
-        float *row = gate_cpu + t * DIT_N_EXPERTS;
-        /* Softmax */
-        float mx = row[0];
-        for (int e = 1; e < DIT_N_EXPERTS; e++)
-            if (row[e] > mx) mx = row[e];
-        float sum = 0.0f;
-        float softmax_vals[DIT_N_EXPERTS];
-        for (int e = 0; e < DIT_N_EXPERTS; e++) {
-            softmax_vals[e] = expf(row[e] - mx);
-            sum += softmax_vals[e];
-        }
-        float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-        for (int e = 0; e < DIT_N_EXPERTS; e++) {
-            softmax_vals[e] *= inv;
-            if (moe_fp16)
-                softmax_vals[e] = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(softmax_vals[e]));
-        }
-
-        /* Top-2 selection */
-        int top_idx[DIT_MOE_TOP_K];
-        float top_val[DIT_MOE_TOP_K];
-        for (int k = 0; k < DIT_MOE_TOP_K; k++) {
-            int best = -1;
-            float best_v = -1e30f;
-            for (int e = 0; e < DIT_N_EXPERTS; e++) {
-                int used = 0;
-                for (int kk = 0; kk < k; kk++)
-                    if (top_idx[kk] == e) { used = 1; break; }
-                if (!used && softmax_vals[e] > best_v) {
-                    best_v = softmax_vals[e];
-                    best = e;
-                }
-            }
-            top_idx[k] = best;
-            top_val[k] = best_v;
-        }
-
-        /* Ref MoEGate has norm_topk_prob=False — use raw softmax values as
-         * top-k weights (no renormalization). */
-        for (int k = 0; k < DIT_MOE_TOP_K; k++) {
-            if (top_idx[k] >= 0)
-                gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k];
-        }
-    }
-    free(gate_cpu);
-
-    /* Step 3: Zero out accumulator (d_output) */
+    /* Step 3: Zero accumulator. */
     hipMemsetAsync(d_output, 0, (size_t)N_tok * H_dim * sizeof(float), stream);
 
-    /* Step 4: For each expert, compute output and weighted-add */
-    float *expert_scale_cpu = (float *)malloc((size_t)N_tok * sizeof(float));
+    /* Step 4: All-experts × weighted-add on the GPU.  No host round-trip;
+     * the per-token zero-weight short-circuit happens inside the
+     * moe_weighted_add_f32 kernel. */
     for (int e = 0; e < DIT_N_EXPERTS; e++) {
-        /* Check if any token uses this expert */
-        int any_nonzero = 0;
-        for (int t = 0; t < N_tok; t++) {
-            expert_scale_cpu[t] = gate_weights[t * DIT_N_EXPERTS + e];
-            if (expert_scale_cpu[t] > 0.0f) any_nonzero = 1;
-        }
-        if (!any_nonzero) continue;
-
-        /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e */
         op_gemm(ops, stream, d_exp_h, blk->moe_expert_fc1_w[e], d_input,
                 blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
         if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
@@ -1114,41 +1175,11 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
         op_gemm(ops, stream, d_exp_o, blk->moe_expert_fc2_w[e], d_exp_h,
                 blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
         if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_o, N_tok * H_dim);
-
-        /* Scale-add: d_output[t,:] += scale[t] * d_exp_o[t,:]  (on CPU) */
-        hipStreamSynchronize(stream);
-        float *exp_out_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
-        float *accum_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
-        hipMemcpy(exp_out_cpu, d_exp_o, (size_t)N_tok * H_dim * sizeof(float), hipMemcpyDeviceToHost);
-        hipMemcpy(accum_cpu, d_output, (size_t)N_tok * H_dim * sizeof(float), hipMemcpyDeviceToHost);
-
-        for (int t = 0; t < N_tok; t++) {
-            float w = expert_scale_cpu[t];
-            if (w == 0.0f) continue;
-            if (moe_fp16)
-                w = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(w));
-            for (int j = 0; j < H_dim; j++) {
-                size_t idx = (size_t)t * H_dim + j;
-                if (moe_fp16) {
-                    float x = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(exp_out_cpu[idx]));
-                    float prod = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(w * x));
-                    accum_cpu[idx] = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(accum_cpu[idx] + prod));
-                } else {
-                    accum_cpu[idx] += w * exp_out_cpu[idx];
-                }
-            }
-        }
-
-        hipMemcpyAsync(d_output, accum_cpu,
-                          (size_t)N_tok * H_dim * sizeof(float), hipMemcpyHostToDevice, stream);
-        hipStreamSynchronize(stream);  /* copy reads from accum_cpu; must finish before free */
-        free(exp_out_cpu);
-        free(accum_cpu);
+        op_moe_weighted_add(ops, stream, d_output, d_exp_o, d_weights,
+                            e, DIT_N_EXPERTS, N_tok, H_dim);
     }
-    free(expert_scale_cpu);
-    free(gate_weights);
 
-    /* Step 5: Add shared expert output */
+    /* Step 5: Shared expert (always full weight). */
     op_gemm(ops, stream, d_exp_h, blk->moe_shared_fc1_w, d_input,
             blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
     if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
@@ -1161,10 +1192,486 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     if (moe_fp16) op_round_f32_to_f16(ops, stream, d_output, N_tok * H_dim);
 }
 
+#ifdef HY3D_HIPBLASLT_ENABLED
+/* MoE forward (FP16 path): input f16, output f32, weights f16, biases f32.
+ * Replaces the f32 op_gemm path with hipBLASLt fp16 GEMMs (with fused GELU
+ * on fc1 and bias on fc2). Cuts MoE GEMM time roughly in line with the
+ * non-MoE blocks (~3-4x in our DiT). */
+static void run_dit_moe_fp16(hip_hy3d_runner *r, dit_block_gpu *blk,
+                              void *d_input_f16, void *d_output_f32,
+                              int N_tok, void *d_moe_scratch) {
+    hy3d_ops *ops = &r->ops;
+    hipStream_t stream = r->stream;
+    const int H_dim = DIT_HIDDEN;
+    const int ffn = DIT_FFN;
+
+    /* Reuse the same scratch carve-up as run_dit_moe; sizes are upper bounds.
+     * d_exp_h is reinterpreted as f16 (smaller), so it fits within the
+     * f32-sized slot. */
+    size_t off = 0;
+    void *d_gate    = (char *)d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
+    void *d_weights = (char *)d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
+    void *d_exp_h_f16 = (char *)d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float); /* slot is f32-sized; we use f16 */
+    void *d_exp_o_f32 = (char *)d_moe_scratch + off; /* [N_tok * H_dim] f32 */
+
+    /* Step 1: Gate logits, fp16 input × fp16 weight → f32 output. */
+    op_gemm_f16(ops, stream, d_gate, blk->moe_gate_w, d_input_f16,
+                DIT_N_EXPERTS, H_dim, N_tok);
+
+    /* Step 2: GPU softmax + top-K → d_weights (sparse, top-K only). */
+    op_moe_gate_softmax_topk(ops, stream, d_gate, d_weights,
+                             N_tok, DIT_N_EXPERTS, DIT_MOE_TOP_K);
+
+    /* Step 3: Zero accumulator. */
+    hipMemsetAsync(d_output_f32, 0, (size_t)N_tok * H_dim * sizeof(float), stream);
+
+    /* Step 4: All-experts × weighted-add on the GPU. */
+    for (int e = 0; e < DIT_N_EXPERTS; e++) {
+        op_gemm_f16_bias_gelu_f16d(ops, stream, d_exp_h_f16,
+                                   blk->moe_expert_fc1_w[e], d_input_f16,
+                                   blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
+        op_gemm_f16_bias(ops, stream, d_exp_o_f32,
+                         blk->moe_expert_fc2_w[e], d_exp_h_f16,
+                         blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
+        op_moe_weighted_add(ops, stream, d_output_f32, d_exp_o_f32, d_weights,
+                            e, DIT_N_EXPERTS, N_tok, H_dim);
+    }
+
+    /* Step 5: Shared expert. */
+    op_gemm_f16_bias_gelu_f16d(ops, stream, d_exp_h_f16,
+                               blk->moe_shared_fc1_w, d_input_f16,
+                               blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    op_gemm_f16_bias(ops, stream, d_exp_o_f32,
+                     blk->moe_shared_fc2_w, d_exp_h_f16,
+                     blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
+    op_add(ops, stream, d_output_f32, d_exp_o_f32, N_tok * H_dim);
+}
+
+/* MoE forward (FP16 + top-K dispatch): only runs each expert on the tokens
+ * that picked it (top-K=2 of 8 ⇒ ~4× less expert FC work vs run_dit_moe_fp16).
+ *
+ * Layout in d_moe_scratch (164MB available — same slot as the dense version):
+ *   d_gate     [N_tok, E]      f32   (gate logits → softmax weights)
+ *   d_weights  [N_tok, E]      f32   (top-K mask × softmax probs)
+ *   d_counts   [E]             int   (per-expert dispatch counts)
+ *   d_perm     [E, N_tok]      int   (per-expert token indices)
+ *   d_packed_in[N_tok, H_dim]  f16   (gathered input rows)
+ *   d_packed_h [N_tok, ffn]    f16   (fc1 output, GELU fused)
+ *   d_packed_o [N_tok, H_dim]  f16   (fc2 output)
+ *   d_exp_o_f32[N_tok, H_dim]  f32   (shared-expert output)
+ * Requires one host sync per call to read counts. */
+static void run_dit_moe_fp16_topk(hip_hy3d_runner *r, dit_block_gpu *blk,
+                                   void *d_input_f16, void *d_output_f32,
+                                   int N_tok, void *d_moe_scratch) {
+    hy3d_ops *ops = &r->ops;
+    hipStream_t stream = r->stream;
+    const int H_dim = DIT_HIDDEN;
+    const int ffn = DIT_FFN;
+    const int E = DIT_N_EXPERTS;
+    const size_t f16b = sizeof(uint16_t);
+    const size_t f32b = sizeof(float);
+
+    size_t off = 0;
+    void *d_gate     = (char *)d_moe_scratch + off; off += (size_t)N_tok * E * f32b;
+    void *d_weights  = (char *)d_moe_scratch + off; off += (size_t)N_tok * E * f32b;
+    void *d_counts   = (char *)d_moe_scratch + off; off += (size_t)E * sizeof(int);
+    void *d_perm     = (char *)d_moe_scratch + off; off += (size_t)E * N_tok * sizeof(int);
+    void *d_packed_in= (char *)d_moe_scratch + off; off += (size_t)N_tok * H_dim * f16b;
+    void *d_packed_h = (char *)d_moe_scratch + off; off += (size_t)N_tok * ffn   * f16b;
+    void *d_packed_o = (char *)d_moe_scratch + off; off += (size_t)N_tok * H_dim * f16b;
+    void *d_exp_o_f32= (char *)d_moe_scratch + off; /* [N_tok * H_dim] f32 */
+
+    /* Step 1: Gate logits, fp16 input × fp16 weight → f32 output. */
+    op_gemm_f16(ops, stream, d_gate, blk->moe_gate_w, d_input_f16,
+                E, H_dim, N_tok);
+
+    /* Step 2: GPU softmax + top-K → d_weights (only top-K entries non-zero). */
+    op_moe_gate_softmax_topk(ops, stream, d_gate, d_weights,
+                             N_tok, E, DIT_MOE_TOP_K);
+
+    /* Step 3: Build per-expert dispatch (counts + permutations). */
+    hipMemsetAsync(d_counts, 0, (size_t)E * sizeof(int), stream);
+    op_moe_dispatch_build(ops, stream, d_weights, d_counts, d_perm, N_tok, E);
+
+    /* Step 4: Sync to read counts. */
+    int counts[16]; /* DIT_N_EXPERTS ≤ 16 */
+    hipMemcpyAsync(counts, d_counts, (size_t)E * sizeof(int),
+                   hipMemcpyDeviceToHost, stream);
+    hipStreamSynchronize(stream);
+
+    /* Step 5: Zero accumulator. */
+    hipMemsetAsync(d_output_f32, 0, (size_t)N_tok * H_dim * f32b, stream);
+
+    /* Step 6: Per-expert gather → fc1+GELU → fc2 → scatter+weighted-add. */
+    for (int e = 0; e < E; e++) {
+        int cnt = counts[e];
+        if (cnt == 0) continue;
+
+        void *e_perm = (char *)d_perm + (size_t)e * N_tok * sizeof(int);
+
+        op_moe_gather_f16(ops, stream, d_packed_in, d_input_f16, e_perm,
+                          cnt, H_dim);
+
+        op_gemm_f16_bias_gelu_f16d(ops, stream, d_packed_h,
+                                    blk->moe_expert_fc1_w[e], d_packed_in,
+                                    blk->moe_expert_fc1_b[e], ffn, H_dim, cnt);
+        op_gemm_f16_bias_f16d(ops, stream, d_packed_o,
+                               blk->moe_expert_fc2_w[e], d_packed_h,
+                               blk->moe_expert_fc2_b[e], H_dim, ffn, cnt);
+
+        op_moe_scatter_add_f16_to_f32(ops, stream, d_output_f32, d_packed_o,
+                                       e_perm, d_weights, e, E, cnt, H_dim);
+    }
+
+    /* Step 7: Shared expert (always all tokens). */
+    op_gemm_f16_bias_gelu_f16d(ops, stream, d_packed_h,
+                               blk->moe_shared_fc1_w, d_input_f16,
+                               blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    op_gemm_f16_bias(ops, stream, d_exp_o_f32,
+                     blk->moe_shared_fc2_w, d_packed_h,
+                     blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
+    op_add(ops, stream, d_output_f32, d_exp_o_f32, N_tok * H_dim);
+}
+#endif  /* HY3D_HIPBLASLT_ENABLED */
+
+/* Stage 2 (FP16 path): residual stream stays in fp16 end-to-end.
+ *
+ * Mirrors run_dit_forward block-for-block but uses:
+ *   - hipBLASLt fp16 GEMM with f32 accumulator (matches PyTorch fp16 Linear)
+ *   - rms_norm_f16 / layernorm_f16 (f32 internal reduction)
+ *   - flash_attn_sa_f16_wmma / cross_attn_f16_wmma (f32 softmax)
+ *   - GELU exact in f32 (via op_gemm_f16_bias_gelu_f16d epilogue)
+ *
+ * MoE blocks (15..20) cast the residual f16->f32 at the boundary, run the
+ * existing f32 MoE, then cast the result back. This is only ~30% of the
+ * blocks and the cast cost is dwarfed by the 8-expert FCs themselves.
+ *
+ * Boundary casts: d_latents (f32) -> f16 at entry; d_output stays f32 since
+ * the Euler step downstream consumes f32. */
+#ifdef HY3D_HIPBLASLT_ENABLED
+static void run_dit_forward_fp16(hip_hy3d_runner *r, void *d_latents,
+                                  float timestep, void *d_context,
+                                  void *d_output) {
+    hy3d_ops *ops = &r->ops;
+    hipStream_t stream = r->stream;
+    static int trace = -1;
+    if (trace < 0) {
+        const char *e = getenv("HY3D_FP16_TRACE");
+        trace = (e && *e && e[0] != '0') ? 1 : 0;
+    }
+    if (trace) { fprintf(stderr, "[fp16-trace] enter\n"); fflush(stderr); }
+    struct timespec _t_blk_prev;
+
+    const int N = DIT_INPUT_SIZE;
+    const int C = DIT_IN_CHANNELS;
+    const int H_dim = DIT_HIDDEN;
+    const int heads = DIT_HEADS;
+    const int hd = DIT_HEAD_DIM;
+    const int ffn = DIT_FFN;
+    const int ctx_len = DINO_SEQ_LEN;
+    const int N1 = N + 1;
+    const size_t f16b = sizeof(uint16_t);
+
+    /* --- Scratch sizes (most buffers half the size of the f32 path) --- */
+    size_t hidden_f16 = (size_t)N1 * H_dim * f16b;
+    size_t qkv_f16    = (size_t)3 * N1 * H_dim * f16b;
+    size_t mlp_f16    = (size_t)N1 * ffn * f16b;
+    size_t cat_f16    = (size_t)N1 * 2 * H_dim * f16b;
+    size_t kv_f16     = (size_t)ctx_len * H_dim * f16b;
+    size_t ctx_f16    = (size_t)ctx_len * DIT_CONTEXT_DIM * f16b;
+    size_t latents_f16 = (size_t)N * C * f16b;
+    /* MoE scratch (still f32): d_gate + d_weights + d_exp_h + d_exp_o */
+    size_t moe_scratch_sz = (size_t)N1 * (2 * DIT_N_EXPERTS + ffn + H_dim) * sizeof(float);
+    /* slot 1 hosts qkv/mlp(f16) OR moe_scratch(f32), whichever is bigger. */
+    size_t shared1 = qkv_f16;
+    if (mlp_f16 > shared1) shared1 = mlp_f16;
+    if (moe_scratch_sz > shared1) shared1 = moe_scratch_sz;
+    /* slot 3: temb + tmlp + cross_Q + cat_buf + ca_K + ca_V (all f16) */
+    size_t buf3 = (size_t)(H_dim + ffn) * f16b
+                + hidden_f16
+                + cat_f16
+                + 2 * kv_f16;
+    /* slot 4: one-shot fp16 cast scratch (latents_f16 + context_f16). */
+    size_t buf4 = latents_f16 + ctx_f16;
+    /* slot 5/6: MoE f32 in/out (used for the 6 MoE blocks). */
+    size_t moe_iof32 = (size_t)N1 * H_dim * sizeof(float);
+
+    ensure_scratch(r, 0, hidden_f16);
+    ensure_scratch(r, 1, shared1);
+    ensure_scratch(r, 2, 2 * hidden_f16);
+    ensure_scratch(r, 3, buf3);
+    ensure_scratch(r, 4, buf4);
+    ensure_scratch(r, 5, moe_iof32);
+    ensure_scratch(r, 6, moe_iof32);
+    /* GPU-resident skip stack (replaces CPU buffer + sync H2D/D2H per layer). */
+    size_t skip_stack_sz = (size_t)(DIT_HALF_DEPTH + 1) * hidden_f16;
+    ensure_scratch(r, 7, skip_stack_sz);
+
+    void *d_hidden  = r->scratch[0];
+    void *d_qkv     = r->scratch[1];          /* aliases d_mlp & moe scratch */
+    void *d_mlp     = r->scratch[1];
+    void *d_moe_scratch = r->scratch[1];
+    void *d_attn    = r->scratch[2];
+    void *d_normed  = (char *)r->scratch[2] + hidden_f16;
+    void *d_temb    = r->scratch[3];
+    void *d_tmlp    = (char *)d_temb    + (size_t)H_dim * f16b;
+    void *d_cross_Q = (char *)d_tmlp    + (size_t)ffn   * f16b;
+    void *d_cat_buf = (char *)d_cross_Q + hidden_f16;
+    void *d_ca_K    = (char *)d_cat_buf + cat_f16;
+    void *d_ca_V    = (char *)d_ca_K    + kv_f16;
+    void *d_latent_f16  = r->scratch[4];
+    void *d_ctx_f16     = (char *)d_latent_f16 + latents_f16;
+    void *d_moe_in_f32  = r->scratch[5];
+    void *d_moe_out_f32 = r->scratch[6];
+
+    /* GPU-resident skip stack (no host round-trips). */
+    size_t skip_entry_sz = hidden_f16;
+    void *d_skip_stack = r->scratch[7];
+
+    if (trace) { hipStreamSynchronize(stream); hipError_t e=hipGetLastError(); fprintf(stderr, "[fp16-trace] scratch ok err=%d\n",(int)e); fflush(stderr); }
+
+    /* 0a. Cast input boundaries to fp16 once. */
+    op_cast_f32_to_f16(ops, stream, d_latent_f16, d_latents, N * C);
+    if (trace) { hipStreamSynchronize(stream); hipError_t e=hipGetLastError(); fprintf(stderr, "[fp16-trace] cast latents err=%d d_latent_f16=%p d_latents=%p\n",(int)e, d_latent_f16, d_latents); fflush(stderr); }
+    op_cast_f32_to_f16(ops, stream, d_ctx_f16, d_context, ctx_len * DIT_CONTEXT_DIM);
+    if (trace) { hipStreamSynchronize(stream); hipError_t e=hipGetLastError(); fprintf(stderr, "[fp16-trace] cast ctx err=%d d_ctx_f16=%p d_context=%p\n",(int)e, d_ctx_f16, d_context); fflush(stderr); }
+
+    /* Zero-bias workspace: hipBLASLt _f16d epilogues require a bias pointer.
+     * Allocate once on first use, sized to the largest N we'll see (3*H_dim). */
+    static void *d_zero_bias = NULL;
+    if (!d_zero_bias) {
+        size_t zb_sz = (size_t)(3 * H_dim) * sizeof(float);
+        hipMalloc(&d_zero_bias, zb_sz);
+        hipMemsetAsync(d_zero_bias, 0, zb_sz, stream);
+        hipStreamSynchronize(stream);
+    }
+
+    /* 1. x_embedder: [N,C=64] -> [N, H_dim].  K=64 is too small for hipBLASLt
+     *    F16-D path on RDNA4 (illegal memory access); use the existing
+     *    tiled GEMM (F16 weight, F32 X/Y) on the F32 source latents, then
+     *    cast to F16. */
+    {
+        float *xemb_f32 = (float *)d_qkv;  /* repurpose qkv slot */
+        op_gemm(ops, stream, xemb_f32, r->dit_x_emb_w, d_latents,
+                r->dit_x_emb_b, H_dim, C, N);
+        op_cast_f32_to_f16(ops, stream, d_normed, xemb_f32, N * H_dim);
+    }
+
+    if (trace) { hipStreamSynchronize(stream); hipError_t e=hipGetLastError(); fprintf(stderr, "[fp16-trace] x_embed ok err=%d\n",(int)e); fflush(stderr); }
+
+    /* 2. Timestep embedding: small, do it in f32 then cast to f16.  We
+     *    repurpose d_qkv as a temporary f32 staging area. */
+    {
+        float *t_f32  = (float *)d_qkv;
+        float *t_mlp  = t_f32 + H_dim;
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] pre-tembed err=%d t_f32=%p\n", (int)e, t_f32); fflush(stderr); }
+        op_timestep_embed(ops, stream, t_f32, timestep, H_dim);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] tembed err=%d\n", (int)e); fflush(stderr); }
+        op_gemm(ops, stream, t_mlp, r->dit_t_mlp0_w, t_f32, r->dit_t_mlp0_b,
+                ffn, H_dim, 1);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] tmlp0 err=%d\n", (int)e); fflush(stderr); }
+        op_gelu_exact(ops, stream, t_mlp, ffn);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] tgelu err=%d\n", (int)e); fflush(stderr); }
+        /* Reuse t_f32 region for the second linear's f32 output */
+        op_gemm(ops, stream, t_f32, r->dit_t_mlp2_w, t_mlp, r->dit_t_mlp2_b,
+                H_dim, ffn, 1);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] tmlp2 err=%d\n", (int)e); fflush(stderr); }
+        op_cast_f32_to_f16(ops, stream, d_temb, t_f32, H_dim);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] temb_cast err=%d\n", (int)e); fflush(stderr); }
+    }
+
+    /* 3. Prepend timestep token -> d_hidden [N1, H_dim] f16 */
+    op_concat_first_f16(ops, stream, d_hidden, d_temb, d_normed, N, H_dim);
+    if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] concat_first err=%d\n", (int)e); fflush(stderr); }
+
+    int skip_sp = 0;
+
+    if (trace) {
+        hipStreamSynchronize(stream);
+        hipError_t err = hipGetLastError();
+        clock_gettime(CLOCK_MONOTONIC, &_t_blk_prev);
+        fprintf(stderr, "[fp16-trace] preamble done, last err=%d entering block loop\n", (int)err);
+        fflush(stderr);
+    }
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        dit_block_gpu *blk = &r->dit_blocks[bi];
+
+        /* Skip connection (blocks 11..20): pop, concat with d_hidden, project, LN */
+        if (blk->use_skip && skip_sp > 0) {
+            skip_sp--;
+            void *d_skip = (char *)d_skip_stack + (size_t)skip_sp * skip_entry_sz;
+            op_concat_last_dim_f16(ops, stream, d_cat_buf, d_skip, d_hidden, N1, H_dim);
+            op_gemm_f16_bias_f16d(ops, stream, d_hidden, blk->skip_linear_w, d_cat_buf,
+                                  blk->skip_linear_b, H_dim, 2 * H_dim, N1);
+            op_layernorm_f16(ops, stream, d_hidden, d_hidden,
+                             blk->skip_norm_w, blk->skip_norm_b, N1, H_dim);
+        }
+
+        /* Push hidden onto skip stack (blocks 0..DIT_HALF_DEPTH) */
+        if (bi <= DIT_HALF_DEPTH) {
+            void *d_skip = (char *)d_skip_stack + (size_t)skip_sp * skip_entry_sz;
+            hipMemcpyAsync(d_skip, d_hidden, skip_entry_sz, hipMemcpyDeviceToDevice, stream);
+            skip_sp++;
+        }
+
+        /* === Self-attention === */
+        op_layernorm_f16(ops, stream, d_normed, d_hidden, blk->norm1_w, blk->norm1_b, N1, H_dim);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d ln1 err=%d\n", bi, (int)e); fflush(stderr); }
+
+        /* Fused QKV GEMM (no bias in HunYuanDiT for SA QKV). */
+        op_gemm_f16_bias_f16d(ops, stream, d_qkv, blk->sa_qkv_w, d_normed,
+                              d_zero_bias, 3 * H_dim, H_dim, N1);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d sa_qkv err=%d\n", bi, (int)e); fflush(stderr); }
+
+        void *d_Q = d_attn;
+        void *d_K = d_normed;
+        /* d_V borrows scratch[5] (moe_in_f32, 32MB) — SA finishes before MoE
+         * input is written, and non-MoE blocks don't touch scratch[5]. */
+        void *d_V = r->scratch[5];
+        op_split_qkv_f16(ops, stream, d_Q, d_K, d_V, d_qkv, N1, heads, hd);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d split_qkv err=%d\n", bi, (int)e); fflush(stderr); }
+
+        if (blk->sa_q_norm_w)
+            op_rms_norm_f16(ops, stream, d_Q, blk->sa_q_norm_w, N1, heads, hd, H_dim);
+        if (blk->sa_k_norm_w)
+            op_rms_norm_f16(ops, stream, d_K, blk->sa_k_norm_w, N1, heads, hd, H_dim);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d sa_qknorm err=%d\n", bi, (int)e); fflush(stderr); }
+
+        /* WMMA flash-attention (f16 in/out, f32 softmax). */
+        if (op_self_attn_f16(ops, stream, d_attn, d_Q, d_K, d_V,
+                             N1, H_dim, heads, hd) != 0) {
+            fprintf(stderr, "HY3D fp16: WMMA self-attn unavailable\n");
+            return;
+        }
+
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d sa_attn err=%d\n", bi, (int)e); fflush(stderr); }
+        op_gemm_f16_bias_f16d(ops, stream, d_normed, blk->sa_out_w, d_attn,
+                              blk->sa_out_b, H_dim, H_dim, N1);
+        op_add_f16(ops, stream, d_hidden, d_normed, N1 * H_dim);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d sa_done err=%d\n", bi, (int)e); fflush(stderr); }
+
+        /* === Cross-attention === */
+        op_layernorm_f16(ops, stream, d_normed, d_hidden, blk->norm2_w, blk->norm2_b, N1, H_dim);
+
+        op_gemm_f16_bias_f16d(ops, stream, d_cross_Q, blk->ca_q_w, d_normed,
+                              d_zero_bias, H_dim, H_dim, N1);
+        if (blk->ca_q_norm_w)
+            op_rms_norm_f16(ops, stream, d_cross_Q, blk->ca_q_norm_w, N1, heads, hd, H_dim);
+
+        /* Fused KV from context. */
+        op_gemm_f16_bias_f16d(ops, stream, d_qkv, blk->ca_kv_w, d_ctx_f16,
+                              d_zero_bias, 2 * H_dim, DIT_CONTEXT_DIM, ctx_len);
+        op_split_kv_f16(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, heads, hd);
+
+        if (blk->ca_k_norm_w)
+            op_rms_norm_f16(ops, stream, d_ca_K, blk->ca_k_norm_w,
+                            ctx_len, heads, hd, H_dim);
+        void *use_ca_K = d_ca_K;
+        void *use_ca_V = d_ca_V;
+
+        if (op_cross_attn_f16(ops, stream, d_attn, d_cross_Q, use_ca_K, use_ca_V,
+                              N1, ctx_len, H_dim, heads, hd) != 0) {
+            fprintf(stderr, "HY3D fp16: WMMA cross-attn unavailable\n");
+            return;
+        }
+
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d ca_attn err=%d\n", bi, (int)e); fflush(stderr); }
+        op_gemm_f16_bias_f16d(ops, stream, d_normed, blk->ca_out_w, d_attn,
+                              blk->ca_out_b, H_dim, H_dim, N1);
+        op_add_f16(ops, stream, d_hidden, d_normed, N1 * H_dim);
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d ca_done err=%d\n", bi, (int)e); fflush(stderr); }
+
+        /* === MLP / MoE === */
+        if (blk->norm3_w) {
+            op_layernorm_f16(ops, stream, d_normed, d_hidden, blk->norm3_w, blk->norm3_b, N1, H_dim);
+        } else {
+            hipMemcpyAsync(d_normed, d_hidden, hidden_f16, hipMemcpyDeviceToDevice, stream);
+        }
+
+        if (blk->use_moe) {
+            /* FP16 MoE: fp16 input direct, f32 output, then cast back.
+             * HY3D_MOE_TOPK=1 enables true top-K dispatch (4× less FC work). */
+            static int topk_mode = -1;
+            if (topk_mode < 0) {
+                const char *e = getenv("HY3D_MOE_TOPK");
+                /* default on; HY3D_MOE_TOPK=0 disables. */
+                topk_mode = (e && *e && e[0] == '0') ? 0 : 1;
+            }
+            if (topk_mode) {
+                run_dit_moe_fp16_topk(r, blk, d_normed, d_moe_out_f32, N1, d_moe_scratch);
+            } else {
+                run_dit_moe_fp16(r, blk, d_normed, d_moe_out_f32, N1, d_moe_scratch);
+            }
+            op_cast_f32_to_f16(ops, stream, d_normed, d_moe_out_f32, N1 * H_dim);
+            op_add_f16(ops, stream, d_hidden, d_normed, N1 * H_dim);
+        } else {
+            /* fc1 with fused exact-GELU + f16d output, then fc2 + bias. */
+            op_gemm_f16_bias_gelu_f16d(ops, stream, d_mlp, blk->mlp_fc1_w, d_normed,
+                                       blk->mlp_fc1_b, ffn, H_dim, N1);
+            if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d mlp_fc1 err=%d\n", bi, (int)e); fflush(stderr); }
+            op_gemm_f16_bias_f16d(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp,
+                                  blk->mlp_fc2_b, H_dim, ffn, N1);
+            if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d mlp_fc2 err=%d\n", bi, (int)e); fflush(stderr); }
+            op_add_f16(ops, stream, d_hidden, d_normed, N1 * H_dim);
+            if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d mlp_done err=%d\n", bi, (int)e); fflush(stderr); }
+        }
+
+        if (trace) {
+            hipStreamSynchronize(stream);
+            struct timespec t_now;
+            clock_gettime(CLOCK_MONOTONIC, &t_now);
+            double ms = (t_now.tv_sec - _t_blk_prev.tv_sec) * 1000.0
+                      + (t_now.tv_nsec - _t_blk_prev.tv_nsec) / 1e6;
+            fprintf(stderr, "[fp16-trace] block %2d %s%s ms=%.1f\n",
+                    bi, blk->use_skip ? "skip+" : "     ",
+                    blk->use_moe ? "MoE" : "MLP", ms);
+            _t_blk_prev = t_now;
+        }
+
+        /* Per-block hidden dump kept for cross-comparison; emit f16 → f32 view. */
+        if (getenv("HY3D_DUMP_DIR") && (bi == 0 || bi == 5 || bi == 10 || bi == 11 ||
+            bi == 14 || bi == 15 || bi == 20)) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "hip_dit_block_fp16_%d.npy", bi);
+            /* convert to f32 into d_moe_out_f32 (free at this point), then dump */
+            op_cast_f16_to_f32(ops, stream, d_moe_out_f32, d_hidden, N1 * H_dim);
+            hy3d_dbg_dump_npy(stream, d_moe_out_f32, N1, H_dim, fname);
+        }
+        if (trace) { hipStreamSynchronize(stream); hipError_t e = hipGetLastError(); fprintf(stderr, "[fp16-trace] b%d end err=%d\n", bi, (int)e); fflush(stderr); }
+    }
+
+    /* 5. Final layer: strip timestep, LN, Linear -> f32 [N, C] */
+    op_strip_first_f16(ops, stream, d_normed, d_hidden, N1, H_dim);
+
+    void *d_ln_out = d_attn;
+    op_layernorm_f16(ops, stream, d_ln_out, d_normed,
+                     r->dit_final_ln_w, r->dit_final_ln_b, N, H_dim);
+
+    /* Final linear writes f32 directly (consumed by Euler step). */
+    op_gemm_f16_bias(ops, stream, d_output, r->dit_final_linear_w, d_ln_out,
+                     r->dit_final_linear_b, C, H_dim, N);
+}
+#endif  /* HY3D_HIPBLASLT_ENABLED */
+
 /* Stage 2: Single DiT forward pass */
 static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
                              float timestep, void *d_context,
                              void *d_output) {
+#ifdef HY3D_HIPBLASLT_ENABLED
+    {
+        static int fp16_mode = -1;
+        if (fp16_mode < 0) {
+            const char *e = getenv("HY3D_DIT_FP16");
+            /* default on; HY3D_DIT_FP16=0 disables. */
+            fp16_mode = (e && *e && e[0] == '0') ? 0 : 1;
+        }
+        if (fp16_mode) {
+            run_dit_forward_fp16(r, d_latents, timestep, d_context, d_output);
+            return;
+        }
+    }
+#endif
     hy3d_ops *ops = &r->ops;
     hipStream_t stream = r->stream;
     const int N = DIT_INPUT_SIZE;       /* 4096 */
@@ -1177,7 +1684,8 @@ static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
     const int N1 = N + 1;              /* 4097 (with prepended timestep token) */
 
     size_t mlp_sz = (size_t)N1 * ffn * sizeof(float);
-    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim) * sizeof(float);
+    /* d_gate + d_weights (both [N1, DIT_N_EXPERTS]) + d_exp_h [N1, ffn] + d_exp_o [N1, H_dim]. */
+    size_t moe_scratch_sz = (size_t)N1 * (2 * DIT_N_EXPERTS + ffn + H_dim) * sizeof(float);
     size_t mlp_moe_sz = mlp_sz > moe_scratch_sz ? mlp_sz : moe_scratch_sz;
     size_t cat_buf_sz = (size_t)N1 * 2 * H_dim * sizeof(float);
     size_t ca_kv_sz = (size_t)ctx_len * H_dim * sizeof(float);
@@ -1510,6 +2018,383 @@ static void run_vae_block(hip_hy3d_runner *r, vae_block_gpu *b,
     op_add(ops, stream, d_out, d_mlpo, N * W);
 }
 
+/* fp16 variant of run_vae_block: input/output f16, hipBLASLt fp16 GEMMs,
+ * WMMA self-attn, f32 reductions inside layernorm/qk_norm.  Weights must
+ * already be f16 (use_f32_gemm=0).  Bias buffers stay f32. */
+static void run_vae_block_fp16(hip_hy3d_runner *r, vae_block_gpu *b,
+                               void *d_in_f16, void *d_out_f16,
+                               void *d_scratch /* f16 scratch */,
+                               void *d_qk_f32   /* f32 buffer for qk_norm cast */,
+                               void *d_zero_bias_f32 /* f32 [3*W] zeros */,
+                               void *d_attn_f32 /* 3*N*W f32 (Q|K|V) for fallback attn */) {
+    hy3d_ops *ops = &r->ops;
+    hipStream_t stream = r->stream;
+    const int N = VAE_NUM_LATENTS;
+    const int W = VAE_WIDTH;
+    const int H = VAE_HEADS;
+    const int HD = VAE_HEAD_DIM;
+    const int MLP = 4 * W;
+
+    size_t off = 0;
+    void *d_ln1   = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_qkv   = (char *)d_scratch + off; off += (size_t)N * 3 * W * sizeof(uint16_t);
+    void *d_Q     = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_K     = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_V     = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_aout  = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_proj  = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_res1  = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_ln2   = (char *)d_scratch + off; off += (size_t)N * W * sizeof(uint16_t);
+    void *d_mlph  = (char *)d_scratch + off; off += (size_t)N * MLP * sizeof(uint16_t);
+    void *d_mlpo  = (char *)d_scratch + off;
+
+    op_layernorm_f16(ops, stream, d_ln1, d_in_f16, b->ln1_w, b->ln1_b, N, W);
+
+    /* Fused QKV via hipBLASLt fp16 (bias_f16d epilogue rejects NULL — pass
+     * a static zero-bias). */
+    op_gemm_f16_bias_f16d(ops, stream, d_qkv, b->qkv_w, d_ln1,
+                          d_zero_bias_f32, 3 * W, W, N);
+    op_split_qkv_f16(ops, stream, d_Q, d_K, d_V, d_qkv, N, H, HD);
+
+    if (b->use_qk_norm) {
+        /* Prefer f16 in-place (halves BW); fall back to cast-around f32. */
+        if (op_qk_layernorm_f16(ops, stream, d_Q, b->q_norm_w, b->q_norm_b,
+                                N, H, HD, W) != 0) {
+            op_cast_f16_to_f32(ops, stream, d_qk_f32, d_Q, N * W);
+            op_qk_layernorm(ops, stream, d_qk_f32, b->q_norm_w, b->q_norm_b, N, H, HD, W);
+            op_cast_f32_to_f16(ops, stream, d_Q, d_qk_f32, N * W);
+        }
+        if (op_qk_layernorm_f16(ops, stream, d_K, b->k_norm_w, b->k_norm_b,
+                                N, H, HD, W) != 0) {
+            op_cast_f16_to_f32(ops, stream, d_qk_f32, d_K, N * W);
+            op_qk_layernorm(ops, stream, d_qk_f32, b->k_norm_w, b->k_norm_b, N, H, HD, W);
+            op_cast_f32_to_f16(ops, stream, d_K, d_qk_f32, N * W);
+        }
+    }
+
+    /* Self-attn: try WMMA fp16 (head_dim=128 only).  ShapeVAE has hd=64
+     * so this always falls back; keep the conditional for portability. */
+    int rc = op_self_attn_f16(ops, stream, d_aout, d_Q, d_K, d_V, N, W, H, HD);
+    if (rc != 0) {
+        /* Fallback: cast Q/K/V f16->f32, run f32 scalar self-attn, cast
+         * aout f32->f16.  d_attn_f32 is 4*N*W f32: [Q|K|V|out]. */
+        size_t slot = (size_t)N * W * sizeof(float);
+        void *d_Qf = d_attn_f32;
+        void *d_Kf = (char *)d_attn_f32 + slot;
+        void *d_Vf = (char *)d_attn_f32 + 2 * slot;
+        void *d_Of = (char *)d_attn_f32 + 3 * slot;
+        op_cast_f16_to_f32(ops, stream, d_Qf, d_Q, N * W);
+        op_cast_f16_to_f32(ops, stream, d_Kf, d_K, N * W);
+        op_cast_f16_to_f32(ops, stream, d_Vf, d_V, N * W);
+        op_self_attn(ops, stream, d_Of, d_Qf, d_Kf, d_Vf, N, W, H, HD);
+        op_cast_f32_to_f16(ops, stream, d_aout, d_Of, N * W);
+    }
+
+    /* Output projection: f16 D for chaining (has bias). */
+    op_gemm_f16_bias_f16d(ops, stream, d_proj, b->proj_w, d_aout, b->proj_b, W, W, N);
+
+    /* res1 = in + proj */
+    hipMemcpyAsync(d_res1, d_in_f16, (size_t)N * W * sizeof(uint16_t),
+                   hipMemcpyDeviceToDevice, stream);
+    op_add_f16(ops, stream, d_res1, d_proj, N * W);
+
+    op_layernorm_f16(ops, stream, d_ln2, d_res1, b->ln2_w, b->ln2_b, N, W);
+
+    /* MLP fc + GELU fused into f16 D. */
+    op_gemm_f16_bias_gelu_f16d(ops, stream, d_mlph, b->mlp_fc_w, d_ln2,
+                               b->mlp_fc_b, MLP, W, N);
+
+    /* MLP proj. */
+    op_gemm_f16_bias_f16d(ops, stream, d_mlpo, b->mlp_proj_w, d_mlph,
+                          b->mlp_proj_b, W, MLP, N);
+
+    /* out = res1 + mlp_out */
+    hipMemcpyAsync(d_out_f16, d_res1, (size_t)N * W * sizeof(uint16_t),
+                   hipMemcpyDeviceToDevice, stream);
+    op_add_f16(ops, stream, d_out_f16, d_mlpo, N * W);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Hierarchical volume decoding helpers (CPU-side mask + dilate)             */
+/* ------------------------------------------------------------------------ */
+
+/* Mark voxels where (a) a sign flip occurs vs any of the 6 axis neighbors,
+ * or (b) |val| < 0.95.  Matches PyTorch extract_near_surface_volume_fn +
+ * the |val|<0.95 clause from HierarchicalVolumeDecoding. */
+static void hy3d_active_mask_3d(uint8_t *mask, const float *val, int R) {
+    int RR = R * R;
+#define IDX(x,y,z) ((x)*RR + (y)*R + (z))
+    for (int x = 0; x < R; x++) {
+        int xm = x > 0 ? x - 1 : 0;
+        int xp = x < R - 1 ? x + 1 : R - 1;
+        for (int y = 0; y < R; y++) {
+            int ym = y > 0 ? y - 1 : 0;
+            int yp = y < R - 1 ? y + 1 : R - 1;
+            for (int z = 0; z < R; z++) {
+                int zm = z > 0 ? z - 1 : 0;
+                int zp = z < R - 1 ? z + 1 : R - 1;
+                float v = val[IDX(x,y,z)];
+                int sv = (v > 0.0f) - (v < 0.0f);
+                int hit = 0;
+                if (fabsf(v) < 0.95f) hit = 1;
+                if (!hit) {
+                    float nb[6] = {
+                        val[IDX(xm,y,z)], val[IDX(xp,y,z)],
+                        val[IDX(x,ym,z)], val[IDX(x,yp,z)],
+                        val[IDX(x,y,zm)], val[IDX(x,y,zp)],
+                    };
+                    for (int k = 0; k < 6 && !hit; k++) {
+                        int sn = (nb[k] > 0.0f) - (nb[k] < 0.0f);
+                        if (sn != sv) hit = 1;
+                    }
+                }
+                mask[IDX(x,y,z)] = (uint8_t)hit;
+            }
+        }
+    }
+#undef IDX
+}
+
+/* In-place 3x3x3 dilate (uint8 mask). */
+static void hy3d_dilate_3x3x3(uint8_t *mask, int R) {
+    int RR = R * R;
+    size_t total = (size_t)R * R * R;
+    uint8_t *tmp = (uint8_t *)malloc(total);
+    memcpy(tmp, mask, total);
+#define IDX(x,y,z) ((x)*RR + (y)*R + (z))
+    for (int x = 0; x < R; x++) {
+        int x0 = x > 0 ? x - 1 : 0, x1 = x < R - 1 ? x + 1 : R - 1;
+        for (int y = 0; y < R; y++) {
+            int y0 = y > 0 ? y - 1 : 0, y1 = y < R - 1 ? y + 1 : R - 1;
+            for (int z = 0; z < R; z++) {
+                int z0 = z > 0 ? z - 1 : 0, z1 = z < R - 1 ? z + 1 : R - 1;
+                int hit = 0;
+                for (int dx = x0; dx <= x1 && !hit; dx++)
+                    for (int dy = y0; dy <= y1 && !hit; dy++)
+                        for (int dz = z0; dz <= z1 && !hit; dz++)
+                            if (tmp[IDX(dx,dy,dz)]) hit = 1;
+                mask[IDX(x,y,z)] = (uint8_t)hit;
+            }
+        }
+    }
+#undef IDX
+    free(tmp);
+}
+
+/* Geo-query context: bundles GPU scratch + model state for one shapevae run. */
+typedef struct {
+    hy3d_ops *ops;
+    hipStream_t stream;
+    void *d_coords, *d_fourier, *d_query_proj, *d_sdf_out, *d_geo_scratch;
+    void *d_g_K, *d_g_V;
+    /* Optional fp16 KV (NULL when fp16-attn path disabled). */
+    void *d_g_K_f16, *d_g_V_f16;
+    /* Optional fp16 batch scratch (NULL when fp16-attn path disabled). */
+    void *d_Q_f16, *d_aout_f16;
+    /* Optional fp16 batch scratch for VAE decoder fp16 path
+     * (d_g_in_f16: ln1 src; d_g_qkv_f16: Q after proj; d_g_proj_f16: c_proj out;
+     *  d_g_res_f16: residual; d_g_mlph_f16: MLP hidden 4*W; d_g_mlpo_f16: MLP out;
+     *  d_g_post_f16: post-residual; d_g_lnpost_f16: post-LN). */
+    void *d_g_ln1_f16, *d_g_proj_f16, *d_g_res_f16,
+         *d_g_ln3_f16, *d_g_mlph_f16, *d_g_mlpo_f16,
+         *d_g_post_f16, *d_g_lnpost_f16, *d_g_qknorm_f32;
+    void *d_g_zero_bias_f32;   /* [W] f32 zeros for c_q (no-bias GEMM) */
+    int use_dec_f16;
+    int batch_size;
+    int use_attn_f16;
+    vae_geo_decoder_gpu *g;
+    void *fourier_freqs;
+    int N, W;
+} hy3d_geo_ctx;
+
+/* Run geo-query for n_pts host coords; write n_pts SDF values to sdf_out. */
+static void hy3d_geo_query_run(hy3d_geo_ctx *c,
+                               const float *coords, int n_pts, float *sdf_out) {
+    if (n_pts <= 0) return;
+    const int N = c->N;
+    const int W = c->W;
+    vae_geo_decoder_gpu *g = c->g;
+    hy3d_ops *ops = c->ops;
+    hipStream_t stream = c->stream;
+
+    for (int start = 0; start < n_pts; start += c->batch_size) {
+        int count = (start + c->batch_size <= n_pts) ? c->batch_size : (n_pts - start);
+
+        hipMemcpyAsync(c->d_coords, coords + (size_t)start * 3,
+                       (size_t)count * 3 * sizeof(float),
+                       hipMemcpyHostToDevice, stream);
+
+        op_fourier_embed(ops, stream, c->d_fourier, c->d_coords, c->fourier_freqs,
+                         count, VAE_NUM_FREQS, VAE_FOURIER_DIM);
+
+        op_gemm(ops, stream, c->d_query_proj, g->query_proj_w, c->d_fourier,
+                g->query_proj_b, W, VAE_FOURIER_DIM, count);
+
+        if (c->use_dec_f16) {
+            /* fp16 path: residual stream from query_proj output to ln_post in
+             * f16, hipBLASLt for c_q/c_proj/mlp_fc/mlp_proj.  Fourier+query_proj
+             * stay f32 (small K=51) and final output stays f32 (N=1).  Q/K/V
+             * cross-attn uses the existing op_cross_attn_f16 kernel. */
+            void *d_in_f16   = c->d_g_ln1_f16;     /* count*W f16 — query_proj_f16 */
+            void *d_ln1_f16  = c->d_Q_f16;          /* reuse Q scratch */
+            void *d_Q_f16    = c->d_Q_f16;          /* same buffer (LN -> Q proj overwrites) */
+            void *d_aout_f16 = c->d_aout_f16;
+            void *d_proj_f16 = c->d_g_proj_f16;
+            void *d_res_f16  = c->d_g_res_f16;
+            void *d_ln3_f16  = c->d_g_ln3_f16;
+            void *d_mlph_f16 = c->d_g_mlph_f16;
+            void *d_mlpo_f16 = c->d_g_mlpo_f16;
+            void *d_post_f16 = c->d_g_post_f16;
+            void *d_lnpost_f16 = c->d_g_lnpost_f16;
+            void *d_qk_f32   = c->d_g_qknorm_f32;
+
+            op_cast_f32_to_f16(ops, stream, d_in_f16, c->d_query_proj, count * W);
+
+            /* LN1 (f16 in, f16 out) — uses ln1_w/b (f32) */
+            op_layernorm_f16(ops, stream, d_ln1_f16, d_in_f16,
+                             g->ln1_w, g->ln1_b, count, W);
+            /* Q proj (no bias).  bias_f16d epilogue requires a bias pointer —
+             * pass the pre-zeroed buffer. */
+            op_gemm_f16_bias_f16d(ops, stream, d_Q_f16, g->c_q_w, d_ln1_f16,
+                                  c->d_g_zero_bias_f32, W, W, count);
+            (void)d_qk_f32;
+            if (g->use_qk_norm) {
+                /* Prefer f16 in-place; fall back to cast-around f32. */
+                if (op_qk_layernorm_f16(ops, stream, d_Q_f16,
+                                        g->q_norm_w, g->q_norm_b,
+                                        count, VAE_HEADS, VAE_HEAD_DIM, W) != 0) {
+                    op_cast_f16_to_f32(ops, stream, c->d_g_qknorm_f32, d_Q_f16,
+                                       count * W);
+                    op_qk_layernorm(ops, stream, c->d_g_qknorm_f32,
+                                    g->q_norm_w, g->q_norm_b,
+                                    count, VAE_HEADS, VAE_HEAD_DIM, W);
+                    op_cast_f32_to_f16(ops, stream, d_Q_f16, c->d_g_qknorm_f32,
+                                       count * W);
+                }
+            }
+
+            /* Cross-attn: Q[count, W], K/V[N, W] all f16. */
+            int rc = op_cross_attn_f16(ops, stream, d_aout_f16,
+                                       d_Q_f16, c->d_g_K_f16, c->d_g_V_f16,
+                                       count, c->N, W, VAE_HEADS, VAE_HEAD_DIM);
+            if (rc != 0) {
+                fprintf(stderr, "HY3D: VAE decoder fp16 cross-attn failed\n");
+                return;
+            }
+
+            /* c_proj + bias, f16 D. */
+            op_gemm_f16_bias_f16d(ops, stream, d_proj_f16, g->c_proj_w,
+                                  d_aout_f16, g->c_proj_b, W, W, count);
+            /* res = query_proj_f16 + proj */
+            hipMemcpyAsync(d_res_f16, d_in_f16,
+                           (size_t)count * W * sizeof(uint16_t),
+                           hipMemcpyDeviceToDevice, stream);
+            op_add_f16(ops, stream, d_res_f16, d_proj_f16, count * W);
+
+            /* LN3 + MLP */
+            op_layernorm_f16(ops, stream, d_ln3_f16, d_res_f16,
+                             g->ln3_w, g->ln3_b, count, W);
+            op_gemm_f16_bias_gelu_f16d(ops, stream, d_mlph_f16, g->mlp_fc_w,
+                                       d_ln3_f16, g->mlp_fc_b, 4 * W, W, count);
+            op_gemm_f16_bias_f16d(ops, stream, d_mlpo_f16, g->mlp_proj_w,
+                                  d_mlph_f16, g->mlp_proj_b, W, 4 * W, count);
+            /* post = res + mlp_out */
+            hipMemcpyAsync(d_post_f16, d_res_f16,
+                           (size_t)count * W * sizeof(uint16_t),
+                           hipMemcpyDeviceToDevice, stream);
+            op_add_f16(ops, stream, d_post_f16, d_mlpo_f16, count * W);
+
+            /* Optional post-LN (f16). */
+            void *d_for_output_f32;
+            if (g->ln_post_w) {
+                op_layernorm_f16(ops, stream, d_lnpost_f16, d_post_f16,
+                                 g->ln_post_w, g->ln_post_b, count, W);
+                /* Cast to f32 for the final small-N output GEMM. */
+                op_cast_f16_to_f32(ops, stream, c->d_g_qknorm_f32,
+                                   d_lnpost_f16, count * W);
+                d_for_output_f32 = c->d_g_qknorm_f32;
+            } else {
+                op_cast_f16_to_f32(ops, stream, c->d_g_qknorm_f32,
+                                   d_post_f16, count * W);
+                d_for_output_f32 = c->d_g_qknorm_f32;
+            }
+
+            /* Final output GEMM: N=1, keep scalar f32 path. */
+            op_gemm(ops, stream, c->d_sdf_out, g->output_w, d_for_output_f32,
+                    g->output_b, 1, W, count);
+
+            hipMemcpyAsync(sdf_out + start, c->d_sdf_out,
+                           (size_t)count * sizeof(float),
+                           hipMemcpyDeviceToHost, stream);
+            continue;
+        }
+
+        size_t geo_off = 0;
+        void *d_g_ln1  = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
+        void *d_g_Q    = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
+        void *d_g_aout = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
+        void *d_g_proj = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
+        void *d_g_res  = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
+        void *d_g_ln3  = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
+        void *d_g_mlph = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * 4 * W * sizeof(float);
+        void *d_g_mlpo = (char *)c->d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
+        void *d_g_post = (char *)c->d_geo_scratch + geo_off;
+
+        op_layernorm(ops, stream, d_g_ln1, c->d_query_proj, g->ln1_w, g->ln1_b, count, W);
+        op_gemm(ops, stream, d_g_Q, g->c_q_w, d_g_ln1, NULL, W, W, count);
+
+        if (g->use_qk_norm) {
+            op_qk_layernorm(ops, stream, d_g_Q, g->q_norm_w, g->q_norm_b,
+                            count, VAE_HEADS, VAE_HEAD_DIM, W);
+        }
+
+        if (c->use_attn_f16) {
+            /* Cast Q f32->f16 (count*W elems), run WMMA cross-attn,
+             * cast output f16->f32 to keep downstream f32 path. */
+            op_cast_f32_to_f16(ops, stream, c->d_Q_f16, d_g_Q, count * W);
+            int rc = op_cross_attn_f16(ops, stream, c->d_aout_f16,
+                                       c->d_Q_f16, c->d_g_K_f16, c->d_g_V_f16,
+                                       count, N, W, VAE_HEADS, VAE_HEAD_DIM);
+            if (rc == 0) {
+                op_cast_f16_to_f32(ops, stream, d_g_aout, c->d_aout_f16, count * W);
+            } else {
+                /* WMMA path unavailable — fall back to scalar f32 attn. */
+                op_cross_attn(ops, stream, d_g_aout, d_g_Q, c->d_g_K, c->d_g_V,
+                              count, N, W, VAE_HEADS, VAE_HEAD_DIM);
+            }
+        } else {
+            op_cross_attn(ops, stream, d_g_aout, d_g_Q, c->d_g_K, c->d_g_V,
+                          count, N, W, VAE_HEADS, VAE_HEAD_DIM);
+        }
+
+        op_gemm(ops, stream, d_g_proj, g->c_proj_w, d_g_aout, g->c_proj_b, W, W, count);
+        hipMemcpyAsync(d_g_res, c->d_query_proj, (size_t)count * W * sizeof(float),
+                       hipMemcpyDeviceToDevice, stream);
+        op_add(ops, stream, d_g_res, d_g_proj, count * W);
+
+        op_layernorm(ops, stream, d_g_ln3, d_g_res, g->ln3_w, g->ln3_b, count, W);
+        op_gemm(ops, stream, d_g_mlph, g->mlp_fc_w, d_g_ln3, g->mlp_fc_b, 4 * W, W, count);
+        op_gelu_exact(ops, stream, d_g_mlph, count * 4 * W);
+        op_gemm(ops, stream, d_g_mlpo, g->mlp_proj_w, d_g_mlph, g->mlp_proj_b, W, 4 * W, count);
+        hipMemcpyAsync(d_g_post, d_g_res, (size_t)count * W * sizeof(float),
+                       hipMemcpyDeviceToDevice, stream);
+        op_add(ops, stream, d_g_post, d_g_mlpo, count * W);
+
+        if (g->ln_post_w) {
+            op_layernorm(ops, stream, d_g_ln1, d_g_post, g->ln_post_w, g->ln_post_b, count, W);
+        } else {
+            hipMemcpyAsync(d_g_ln1, d_g_post, (size_t)count * W * sizeof(float),
+                           hipMemcpyDeviceToDevice, stream);
+        }
+
+        op_gemm(ops, stream, c->d_sdf_out, g->output_w, d_g_ln1, g->output_b, 1, W, count);
+
+        hipMemcpyAsync(sdf_out + start, c->d_sdf_out,
+                       (size_t)count * sizeof(float), hipMemcpyDeviceToHost, stream);
+    }
+    hipStreamSynchronize(stream);
+}
+
 /* Stage 3: ShapeVAE decode + SDF query */
 static void run_shapevae(hip_hy3d_runner *r, void *d_latents,
                           int grid_res, float *sdf_out) {
@@ -1519,23 +2404,86 @@ static void run_shapevae(hip_hy3d_runner *r, void *d_latents,
     const int E = VAE_EMBED_DIM;
     const int W = VAE_WIDTH;
 
-    /* Allocate decoder buffers */
-    void *d_dec_a = gpu_alloc((size_t)N * W * sizeof(float));
-    void *d_dec_b = gpu_alloc((size_t)N * W * sizeof(float));
+    /* Decide decoder dtype: fp16 (hipBLASLt + WMMA-FA) when weights are f16
+     * and the FP16 kernels compiled in.  Default ON; HY3D_VAE_DEC_FP16=0
+     * forces the f32 fallback. */
+    int dec_fp16 = !ops->use_f32_gemm
+                   && ops->layernorm_f16 && ops->cast_f32_to_f16
+                   && ops->flash_attn_sa_f16_wmma;
+    {
+        const char *e = getenv("HY3D_VAE_DEC_FP16");
+        if (e && *e && e[0] == '0') dec_fp16 = 0;
+    }
 
-    /* VAE block scratch size */
-    size_t block_scratch = (size_t)N * (W * 12 + 4 * W * 4) * sizeof(float);
-    void *d_block_scratch = gpu_alloc(block_scratch);
+    void *d_cur = NULL, *d_next = NULL;
+    void *d_dec_a = NULL, *d_dec_b = NULL;
+    void *d_block_scratch = NULL;
+    void *d_qk_f32 = NULL;
+    void *d_zero_bias_f32 = NULL;
+    void *d_attn_f32 = NULL;
 
-    /* Post-KL projection: [N, E] -> [N, W] */
-    op_gemm(ops, stream, d_dec_a, r->vae_post_kl_w, d_latents, r->vae_post_kl_b, W, E, N);
+    if (dec_fp16) {
+        d_dec_a = gpu_alloc((size_t)N * W * sizeof(uint16_t));
+        d_dec_b = gpu_alloc((size_t)N * W * sizeof(uint16_t));
+        /* fp16 block scratch: layout in run_vae_block_fp16 is
+         *   ln1[N,W] + qkv[N,3W] + Q[N,W] + K[N,W] + V[N,W]
+         *   + aout[N,W] + proj[N,W] + res1[N,W] + ln2[N,W]
+         *   + mlph[N,4W] + mlpo[N,W]  =  N * 16W f16. */
+        size_t block_scratch = (size_t)N * (W * 16) * sizeof(uint16_t);
+        d_block_scratch = gpu_alloc(block_scratch);
+        d_qk_f32 = gpu_alloc((size_t)N * W * sizeof(float));
+        /* Zero bias for QKV (fused, no bias).  3*W floats. */
+        d_zero_bias_f32 = gpu_alloc((size_t)3 * W * sizeof(float));
+        hipMemsetAsync(d_zero_bias_f32, 0, (size_t)3 * W * sizeof(float), stream);
+        /* Self-attn fallback scratch (Q|K|V|Out) when WMMA hd!=128. */
+        d_attn_f32 = gpu_alloc((size_t)4 * N * W * sizeof(float));
 
-    /* Run transformer blocks */
-    void *d_cur = d_dec_a;
-    void *d_next = d_dec_b;
-    for (int i = 0; i < VAE_DEC_LAYERS; i++) {
-        run_vae_block(r, &r->vae_blocks[i], d_cur, d_next, d_block_scratch);
-        void *tmp = d_cur; d_cur = d_next; d_next = tmp;
+        /* Post-KL: f32 latent in, f16 dec_a out via fp16-D epilogue.
+         * Cast latent f32 -> f16 first, then run f16 GEMM. */
+        void *d_lat_f16 = gpu_alloc((size_t)N * E * sizeof(uint16_t));
+        op_cast_f32_to_f16(ops, stream, d_lat_f16, d_latents, N * E);
+        op_gemm_f16_bias_f16d(ops, stream, d_dec_a, r->vae_post_kl_w, d_lat_f16,
+                              r->vae_post_kl_b, W, E, N);
+        hipFree(d_lat_f16);
+
+        d_cur = d_dec_a;
+        d_next = d_dec_b;
+        for (int i = 0; i < VAE_DEC_LAYERS; i++) {
+            run_vae_block_fp16(r, &r->vae_blocks[i], d_cur, d_next,
+                               d_block_scratch, d_qk_f32,
+                               d_zero_bias_f32, d_attn_f32);
+            void *tmp = d_cur; d_cur = d_next; d_next = tmp;
+        }
+        /* d_cur (f16) now holds decoded latents.  Cast back to f32 in-place
+         * by allocating a fresh f32 buffer (geo-query path expects f32). */
+        void *d_dec_f32 = gpu_alloc((size_t)N * W * sizeof(float));
+        op_cast_f16_to_f32(ops, stream, d_dec_f32, d_cur, N * W);
+        hipFree(d_dec_a);
+        hipFree(d_dec_b);
+        hipFree(d_block_scratch);
+        hipFree(d_qk_f32);
+        hipFree(d_zero_bias_f32);
+        hipFree(d_attn_f32);
+        d_cur = d_dec_f32;  /* freed at end as d_dec_a */
+        d_dec_a = d_dec_f32;
+        d_dec_b = NULL;
+        d_block_scratch = NULL;
+        d_qk_f32 = NULL;
+        d_zero_bias_f32 = NULL;
+        d_attn_f32 = NULL;
+    } else {
+        d_dec_a = gpu_alloc((size_t)N * W * sizeof(float));
+        d_dec_b = gpu_alloc((size_t)N * W * sizeof(float));
+        size_t block_scratch = (size_t)N * (W * 12 + 4 * W * 4) * sizeof(float);
+        d_block_scratch = gpu_alloc(block_scratch);
+        op_gemm(ops, stream, d_dec_a, r->vae_post_kl_w, d_latents,
+                r->vae_post_kl_b, W, E, N);
+        d_cur = d_dec_a;
+        d_next = d_dec_b;
+        for (int i = 0; i < VAE_DEC_LAYERS; i++) {
+            run_vae_block(r, &r->vae_blocks[i], d_cur, d_next, d_block_scratch);
+            void *tmp = d_cur; d_cur = d_next; d_next = tmp;
+        }
     }
 
     /* d_cur now contains decoded latents [N, W] */
@@ -1548,105 +2496,261 @@ static void run_shapevae(hip_hy3d_runner *r, void *d_latents,
     void *d_query_proj = gpu_alloc((size_t)batch_size * W * sizeof(float));
     void *d_sdf_out = gpu_alloc((size_t)batch_size * sizeof(float));
 
-    size_t geo_scratch_sz = (size_t)batch_size * (W * 10 + 4 * W * 4) * sizeof(float);
+    /* Per-batch scratch (Q-side only — K/V are hoisted out of the loop). */
+    size_t geo_scratch_sz = (size_t)batch_size * (W * 8 + 4 * W * 4) * sizeof(float);
     void *d_geo_scratch = gpu_alloc(geo_scratch_sz);
 
-    float dx = (bounds[3] - bounds[0]) / (float)(grid_res - 1);
-    float dy = (bounds[4] - bounds[1]) / (float)(grid_res - 1);
-    float dz = (bounds[5] - bounds[2]) / (float)(grid_res - 1);
+    /* KV-side scratch: depends only on d_cur (decoded latents), constant across
+     * all batches.  Hoisted out of the per-batch loop. */
+    void *d_g_ln2 = gpu_alloc((size_t)N * W * sizeof(float));
+    void *d_g_KV  = gpu_alloc((size_t)N * 2 * W * sizeof(float));
+    void *d_g_K   = gpu_alloc((size_t)N * W * sizeof(float));
+    void *d_g_V   = gpu_alloc((size_t)N * W * sizeof(float));
 
-    for (int start = 0; start < total_points; start += batch_size) {
-        int count = (start + batch_size <= total_points) ? batch_size : (total_points - start);
-
-        float *coords = (float *)malloc((size_t)count * 3 * sizeof(float));
-        for (int i = 0; i < count; i++) {
-            int idx = start + i;
-            int iz = idx % grid_res;
-            int iy = (idx / grid_res) % grid_res;
-            int ix = idx / (grid_res * grid_res);
-            coords[i*3+0] = bounds[0] + ix * dx;
-            coords[i*3+1] = bounds[1] + iy * dy;
-            coords[i*3+2] = bounds[2] + iz * dz;
-        }
-        hipMemcpyAsync(d_coords, coords, (size_t)count * 3 * sizeof(float), hipMemcpyHostToDevice, stream);
-        free(coords);
-
-        op_fourier_embed(ops, stream, d_fourier, d_coords, r->vae_fourier_freqs,
-                         count, VAE_NUM_FREQS, VAE_FOURIER_DIM);
-
-        op_gemm(ops, stream, d_query_proj, r->vae_geo.query_proj_w, d_fourier,
-                r->vae_geo.query_proj_b, W, VAE_FOURIER_DIM, count);
-
-        /* Cross-attention with decoded latents */
+    {
         vae_geo_decoder_gpu *g = &r->vae_geo;
-
-        size_t geo_off = 0;
-        void *d_g_ln1  = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
-        void *d_g_ln2  = (char *)d_geo_scratch + geo_off; geo_off += (size_t)N * W * sizeof(float);
-        void *d_g_Q    = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
-        void *d_g_KV   = (char *)d_geo_scratch + geo_off; geo_off += (size_t)N * 2 * W * sizeof(float);
-        void *d_g_K    = (char *)d_geo_scratch + geo_off; geo_off += (size_t)N * W * sizeof(float);
-        void *d_g_V    = (char *)d_geo_scratch + geo_off; geo_off += (size_t)N * W * sizeof(float);
-        void *d_g_aout = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
-        void *d_g_proj = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
-        void *d_g_res  = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
-        void *d_g_ln3  = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
-        void *d_g_mlph = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * 4 * W * sizeof(float);
-        void *d_g_mlpo = (char *)d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
-        void *d_g_post = (char *)d_geo_scratch + geo_off;
-
-        op_layernorm(ops, stream, d_g_ln1, d_query_proj, g->ln1_w, g->ln1_b, count, W);
         op_layernorm(ops, stream, d_g_ln2, d_cur, g->ln2_w, g->ln2_b, N, W);
-
-        op_gemm(ops, stream, d_g_Q, g->c_q_w, d_g_ln1, NULL, W, W, count);
         op_gemm(ops, stream, d_g_KV, g->c_kv_w, d_g_ln2, NULL, 2 * W, W, N);
-
         op_split_kv(ops, stream, d_g_K, d_g_V, d_g_KV, N, VAE_HEADS, VAE_HEAD_DIM);
-
         if (g->use_qk_norm) {
-            op_qk_layernorm(ops, stream, d_g_Q, g->q_norm_w, g->q_norm_b,
-                            count, VAE_HEADS, VAE_HEAD_DIM, W);
             op_qk_layernorm(ops, stream, d_g_K, g->k_norm_w, g->k_norm_b,
                             N, VAE_HEADS, VAE_HEAD_DIM, W);
         }
-
-        op_cross_attn(ops, stream, d_g_aout, d_g_Q, d_g_K, d_g_V,
-                      count, N, W, VAE_HEADS, VAE_HEAD_DIM);
-
-        op_gemm(ops, stream, d_g_proj, g->c_proj_w, d_g_aout, g->c_proj_b, W, W, count);
-        hipMemcpyAsync(d_g_res, d_query_proj, (size_t)count * W * sizeof(float), hipMemcpyDeviceToDevice, stream);
-        op_add(ops, stream, d_g_res, d_g_proj, count * W);
-
-        op_layernorm(ops, stream, d_g_ln3, d_g_res, g->ln3_w, g->ln3_b, count, W);
-        op_gemm(ops, stream, d_g_mlph, g->mlp_fc_w, d_g_ln3, g->mlp_fc_b, 4 * W, W, count);
-        op_gelu_exact(ops, stream, d_g_mlph, count * 4 * W);
-        op_gemm(ops, stream, d_g_mlpo, g->mlp_proj_w, d_g_mlph, g->mlp_proj_b, W, 4 * W, count);
-        hipMemcpyAsync(d_g_post, d_g_res, (size_t)count * W * sizeof(float), hipMemcpyDeviceToDevice, stream);
-        op_add(ops, stream, d_g_post, d_g_mlpo, count * W);
-
-        if (g->ln_post_w) {
-            op_layernorm(ops, stream, d_g_ln1, d_g_post, g->ln_post_w, g->ln_post_b, count, W);
-        } else {
-            hipMemcpyAsync(d_g_ln1, d_g_post, (size_t)count * W * sizeof(float), hipMemcpyDeviceToDevice, stream);
-        }
-
-        op_gemm(ops, stream, d_sdf_out, g->output_w, d_g_ln1, g->output_b, 1, W, count);
-
-        hipMemcpyAsync(sdf_out + start, d_sdf_out,
-                          (size_t)count * sizeof(float), hipMemcpyDeviceToHost, stream);
     }
 
-    hipStreamSynchronize(stream);
+    /* Optional fp16 attention path: cast KV f32->f16 once, allocate Q/aout
+     * scratch in fp16, dispatch via op_cross_attn_f16 (WMMA).  Default ON. */
+    int use_attn_f16 = 1;
+    {
+        const char *e = getenv("HY3D_VAE_ATTN_F16");
+        if (e && *e && e[0] == '0') use_attn_f16 = 0;
+    }
+    /* WMMA cross-attn requires head_dim==128 (which we have) and f16 kernel
+     * compiled in. */
+    if (use_attn_f16 && !ops->cross_attn_f16_wmma) use_attn_f16 = 0;
+
+    /* Optional fp16 decoder per-batch query path: residual stream stays in
+     * f16 between query_proj and ln_post, hipBLASLt for c_q/c_proj/mlp.
+     * Default ON; HY3D_VAE_DEC_FP16=0 forces the f32 path. */
+    int use_dec_f16 = use_attn_f16
+                       && !ops->use_f32_gemm
+                       && ops->layernorm_f16 && ops->add_f16
+                       && ops->cast_f32_to_f16 && ops->cast_f16_to_f32;
+    {
+        const char *e = getenv("HY3D_VAE_DEC_FP16");
+        if (e && *e && e[0] == '0') use_dec_f16 = 0;
+    }
+
+    void *d_g_K_f16 = NULL, *d_g_V_f16 = NULL;
+    void *d_Q_f16 = NULL, *d_aout_f16 = NULL;
+    if (use_attn_f16 || use_dec_f16) {
+        d_g_K_f16  = gpu_alloc((size_t)N * W * sizeof(uint16_t));
+        d_g_V_f16  = gpu_alloc((size_t)N * W * sizeof(uint16_t));
+        d_Q_f16    = gpu_alloc((size_t)batch_size * W * sizeof(uint16_t));
+        d_aout_f16 = gpu_alloc((size_t)batch_size * W * sizeof(uint16_t));
+        op_cast_f32_to_f16(ops, stream, d_g_K_f16, d_g_K, N * W);
+        op_cast_f32_to_f16(ops, stream, d_g_V_f16, d_g_V, N * W);
+    }
+
+    /* Per-batch fp16 scratch + zero-bias for the decoder fp16 path. */
+    void *d_g_ln1_f16 = NULL, *d_g_proj_f16 = NULL, *d_g_res_f16 = NULL;
+    void *d_g_ln3_f16 = NULL, *d_g_mlph_f16 = NULL, *d_g_mlpo_f16 = NULL;
+    void *d_g_post_f16 = NULL, *d_g_lnpost_f16 = NULL;
+    void *d_g_qknorm_f32 = NULL, *d_g_zero_bias_f32 = NULL;
+    if (use_dec_f16) {
+        size_t f16_w = (size_t)batch_size * W * sizeof(uint16_t);
+        d_g_ln1_f16    = gpu_alloc(f16_w);
+        d_g_proj_f16   = gpu_alloc(f16_w);
+        d_g_res_f16    = gpu_alloc(f16_w);
+        d_g_ln3_f16    = gpu_alloc(f16_w);
+        d_g_mlph_f16   = gpu_alloc((size_t)batch_size * 4 * W * sizeof(uint16_t));
+        d_g_mlpo_f16   = gpu_alloc(f16_w);
+        d_g_post_f16   = gpu_alloc(f16_w);
+        d_g_lnpost_f16 = gpu_alloc(f16_w);
+        d_g_qknorm_f32 = gpu_alloc((size_t)batch_size * W * sizeof(float));
+        d_g_zero_bias_f32 = gpu_alloc((size_t)W * sizeof(float));
+        hipMemsetAsync(d_g_zero_bias_f32, 0, (size_t)W * sizeof(float), stream);
+    }
+
+    /* Build geo-query context (shared by dense and hierarchical paths). */
+    hy3d_geo_ctx ctx = {
+        .ops = ops, .stream = stream,
+        .d_coords = d_coords, .d_fourier = d_fourier,
+        .d_query_proj = d_query_proj, .d_sdf_out = d_sdf_out,
+        .d_geo_scratch = d_geo_scratch,
+        .d_g_K = d_g_K, .d_g_V = d_g_V,
+        .d_g_K_f16 = d_g_K_f16, .d_g_V_f16 = d_g_V_f16,
+        .d_Q_f16 = d_Q_f16, .d_aout_f16 = d_aout_f16,
+        .d_g_ln1_f16 = d_g_ln1_f16, .d_g_proj_f16 = d_g_proj_f16,
+        .d_g_res_f16 = d_g_res_f16, .d_g_ln3_f16 = d_g_ln3_f16,
+        .d_g_mlph_f16 = d_g_mlph_f16, .d_g_mlpo_f16 = d_g_mlpo_f16,
+        .d_g_post_f16 = d_g_post_f16, .d_g_lnpost_f16 = d_g_lnpost_f16,
+        .d_g_qknorm_f32 = d_g_qknorm_f32,
+        .d_g_zero_bias_f32 = d_g_zero_bias_f32,
+        .use_dec_f16 = use_dec_f16,
+        .batch_size = batch_size,
+        .use_attn_f16 = use_attn_f16,
+        .g = &r->vae_geo,
+        .fourier_freqs = r->vae_fourier_freqs,
+        .N = N, .W = W,
+    };
+
+    /* Decide path: hierarchical (default) vs dense (HY3D_VAE_HIER=0). */
+    int hier = 1;
+    {
+        const char *e = getenv("HY3D_VAE_HIER");
+        if (e && *e && e[0] == '0') hier = 0;
+        if (grid_res < 32) hier = 0;  /* too small to bother */
+    }
+
+    if (!hier) {
+        /* ---- Dense path: query every voxel. ---- */
+        float dx = (bounds[3] - bounds[0]) / (float)(grid_res - 1);
+        float dy = (bounds[4] - bounds[1]) / (float)(grid_res - 1);
+        float dz = (bounds[5] - bounds[2]) / (float)(grid_res - 1);
+        float *coords = (float *)malloc((size_t)total_points * 3 * sizeof(float));
+        for (int ix = 0; ix < grid_res; ix++)
+            for (int iy = 0; iy < grid_res; iy++)
+                for (int iz = 0; iz < grid_res; iz++) {
+                    int idx = (ix * grid_res + iy) * grid_res + iz;
+                    coords[idx * 3 + 0] = bounds[0] + ix * dx;
+                    coords[idx * 3 + 1] = bounds[1] + iy * dy;
+                    coords[idx * 3 + 2] = bounds[2] + iz * dz;
+                }
+        hy3d_geo_query_run(&ctx, coords, total_points, sdf_out);
+        free(coords);
+    } else {
+        /* ---- Hierarchical path: coarse dense + sparse near-surface fine. ---- */
+        int fine_res   = grid_res;
+        int coarse_res = grid_res / 2;
+        if (coarse_res < 16) coarse_res = 16;
+
+        int coarse_total = coarse_res * coarse_res * coarse_res;
+        float *coarse_coords = (float *)malloc((size_t)coarse_total * 3 * sizeof(float));
+        float *coarse_sdf    = (float *)malloc((size_t)coarse_total * sizeof(float));
+        float dxc = (bounds[3] - bounds[0]) / (float)(coarse_res - 1);
+        float dyc = (bounds[4] - bounds[1]) / (float)(coarse_res - 1);
+        float dzc = (bounds[5] - bounds[2]) / (float)(coarse_res - 1);
+        for (int ix = 0; ix < coarse_res; ix++)
+            for (int iy = 0; iy < coarse_res; iy++)
+                for (int iz = 0; iz < coarse_res; iz++) {
+                    int idx = (ix * coarse_res + iy) * coarse_res + iz;
+                    coarse_coords[idx * 3 + 0] = bounds[0] + ix * dxc;
+                    coarse_coords[idx * 3 + 1] = bounds[1] + iy * dyc;
+                    coarse_coords[idx * 3 + 2] = bounds[2] + iz * dzc;
+                }
+        if (r->verbose)
+            fprintf(stderr, "HY3D: VAE hier coarse pass at %d^3 (%d points)\n",
+                    coarse_res, coarse_total);
+        hy3d_geo_query_run(&ctx, coarse_coords, coarse_total, coarse_sdf);
+        free(coarse_coords);
+
+        /* Build active mask at coarse, project to fine, dilate twice. */
+        size_t fine_total_sz = (size_t)fine_res * fine_res * fine_res;
+        uint8_t *cmask = (uint8_t *)malloc((size_t)coarse_total);
+        uint8_t *fmask = (uint8_t *)calloc(fine_total_sz, 1);
+        hy3d_active_mask_3d(cmask, coarse_sdf, coarse_res);
+
+        int FRR = fine_res * fine_res, CRR = coarse_res * coarse_res;
+        for (int cx = 0; cx < coarse_res; cx++) {
+            int fx = cx * 2;
+            if (fx >= fine_res) continue;
+            for (int cy = 0; cy < coarse_res; cy++) {
+                int fy = cy * 2;
+                if (fy >= fine_res) continue;
+                for (int cz = 0; cz < coarse_res; cz++) {
+                    int fz = cz * 2;
+                    if (fz >= fine_res) continue;
+                    if (cmask[cx * CRR + cy * coarse_res + cz])
+                        fmask[fx * FRR + fy * fine_res + fz] = 1;
+                }
+            }
+        }
+        /* PyTorch dilates fine mask 2 times (since this is the last/only refine
+         * step → expand_num=0 → 2-0=2 dilations). */
+        hy3d_dilate_3x3x3(fmask, fine_res);
+        hy3d_dilate_3x3x3(fmask, fine_res);
+
+        /* Compact active fine voxels. */
+        int n_active = 0;
+        for (size_t i = 0; i < fine_total_sz; i++)
+            if (fmask[i]) n_active++;
+        if (r->verbose)
+            fprintf(stderr, "HY3D: VAE hier fine pass: %d active / %zu total (%.1f%%)\n",
+                    n_active, fine_total_sz, 100.0 * n_active / (double)fine_total_sz);
+
+        float dxf = (bounds[3] - bounds[0]) / (float)(fine_res - 1);
+        float dyf = (bounds[4] - bounds[1]) / (float)(fine_res - 1);
+        float dzf = (bounds[5] - bounds[2]) / (float)(fine_res - 1);
+        float *active_coords = (float *)malloc((size_t)n_active * 3 * sizeof(float));
+        int   *active_idx    = (int *)  malloc((size_t)n_active * sizeof(int));
+        {
+            int j = 0;
+            for (int ix = 0; ix < fine_res; ix++)
+                for (int iy = 0; iy < fine_res; iy++)
+                    for (int iz = 0; iz < fine_res; iz++) {
+                        int idx = ix * FRR + iy * fine_res + iz;
+                        if (!fmask[idx]) continue;
+                        active_coords[j * 3 + 0] = bounds[0] + ix * dxf;
+                        active_coords[j * 3 + 1] = bounds[1] + iy * dyf;
+                        active_coords[j * 3 + 2] = bounds[2] + iz * dzf;
+                        active_idx[j] = idx;
+                        j++;
+                    }
+        }
+        float *active_sdf = (float *)malloc((size_t)n_active * sizeof(float));
+        hy3d_geo_query_run(&ctx, active_coords, n_active, active_sdf);
+
+        /* Fill fine grid: default = nearest-upsampled coarse value (carries
+         * correct sign for inactive voxels, far from zero), overwrite at active. */
+        for (int fx = 0; fx < fine_res; fx++) {
+            int cx = fx / 2; if (cx >= coarse_res) cx = coarse_res - 1;
+            for (int fy = 0; fy < fine_res; fy++) {
+                int cy = fy / 2; if (cy >= coarse_res) cy = coarse_res - 1;
+                for (int fz = 0; fz < fine_res; fz++) {
+                    int cz = fz / 2; if (cz >= coarse_res) cz = coarse_res - 1;
+                    sdf_out[fx * FRR + fy * fine_res + fz] =
+                        coarse_sdf[cx * CRR + cy * coarse_res + cz];
+                }
+            }
+        }
+        for (int j = 0; j < n_active; j++)
+            sdf_out[active_idx[j]] = active_sdf[j];
+
+        free(coarse_sdf);
+        free(cmask); free(fmask);
+        free(active_coords); free(active_idx); free(active_sdf);
+    }
+    (void)total_points;
 
     /* Cleanup */
-    hipFree(d_dec_a);
-    hipFree(d_dec_b);
-    hipFree(d_block_scratch);
+    if (d_dec_a) hipFree(d_dec_a);
+    if (d_dec_b) hipFree(d_dec_b);
+    if (d_block_scratch) hipFree(d_block_scratch);
+    if (d_qk_f32) hipFree(d_qk_f32);
     hipFree(d_coords);
     hipFree(d_fourier);
     hipFree(d_query_proj);
     hipFree(d_sdf_out);
     hipFree(d_geo_scratch);
+    hipFree(d_g_ln2);
+    hipFree(d_g_KV);
+    hipFree(d_g_K);
+    hipFree(d_g_V);
+    if (d_g_K_f16) hipFree(d_g_K_f16);
+    if (d_g_V_f16) hipFree(d_g_V_f16);
+    if (d_Q_f16)   hipFree(d_Q_f16);
+    if (d_aout_f16) hipFree(d_aout_f16);
+    if (d_g_ln1_f16)    hipFree(d_g_ln1_f16);
+    if (d_g_proj_f16)   hipFree(d_g_proj_f16);
+    if (d_g_res_f16)    hipFree(d_g_res_f16);
+    if (d_g_ln3_f16)    hipFree(d_g_ln3_f16);
+    if (d_g_mlph_f16)   hipFree(d_g_mlph_f16);
+    if (d_g_mlpo_f16)   hipFree(d_g_mlpo_f16);
+    if (d_g_post_f16)   hipFree(d_g_post_f16);
+    if (d_g_lnpost_f16) hipFree(d_g_lnpost_f16);
+    if (d_g_qknorm_f32) hipFree(d_g_qknorm_f32);
+    if (d_g_zero_bias_f32) hipFree(d_g_zero_bias_f32);
 }
 
 /* ======================================================================== */
@@ -1816,6 +2920,109 @@ int hip_hy3d_set_init_contexts(hip_hy3d_runner *r,
     return 0;
 }
 
+#ifdef HY3D_HIPBLASLT_ENABLED
+/* Lever A: hipBLASLt plan pre-warm.
+ *
+ * One-shot CLI pays first-call plan-build (~120 ms × 5-7 unique HHS shapes
+ * across DiT + DINOv2) on every invocation.  Fire one dummy GEMM at every
+ * (M,N,K,dtype,epilogue) shape we'll hit during inference; the bridge plan
+ * cache hits warm thereafter.  Plan key is shape+dtype+epilogue — weight
+ * identity doesn't matter — so we recycle a single oversized scratch.
+ *
+ * Default ON; HY3D_PLAN_PREWARM=0 disables.  Fully transparent: no
+ * inference state changes. */
+static void prewarm_blaslt_plans(hip_hy3d_runner *r) {
+    static int prewarm_mode = -1;
+    if (prewarm_mode < 0) {
+        const char *e = getenv("HY3D_PLAN_PREWARM");
+        prewarm_mode = (e && *e && e[0] == '0') ? 0 : 1;
+    }
+    if (!prewarm_mode) return;
+
+    hy3d_ops *ops = &r->ops;
+    hipStream_t stream = r->stream;
+    if (r->verbose) fprintf(stderr, "HY3D: pre-warming hipBLASLt plans...\n");
+
+    /* Sized for the largest shape we touch:
+     *   max M = max(N1=4097, N=4096) = 4097
+     *   max K = max(2048, 4096, 8192) = 8192
+     *   max N_out = max(6144, 8192, 4096) = 8192
+     * Pick conservative caps so a single buffer covers Y (HHS f16 out and
+     * HSS f32 out), X, W, bias. */
+    const size_t max_M = 4097;
+    const size_t max_NK = 8192;
+    const size_t max_act_f16 = max_M * max_NK * sizeof(uint16_t);
+    const size_t max_W_f16   = max_NK * max_NK * sizeof(uint16_t);
+    const size_t max_act_f32 = max_M * max_NK * sizeof(float);
+    const size_t max_bias    = max_NK * sizeof(float);
+
+    void *d_X = NULL, *d_W = NULL, *d_Yh = NULL, *d_Yf = NULL, *d_B = NULL;
+    if (hipMalloc(&d_X, max_act_f16) != hipSuccess) goto done;
+    if (hipMalloc(&d_W, max_W_f16) != hipSuccess) goto done;
+    if (hipMalloc(&d_Yh, max_act_f16) != hipSuccess) goto done;
+    if (hipMalloc(&d_Yf, max_act_f32) != hipSuccess) goto done;
+    if (hipMalloc(&d_B, max_bias) != hipSuccess) goto done;
+    /* Zero bias (f32) so plan's epilogue reads valid memory. */
+    hipMemsetAsync(d_B, 0, max_bias, stream);
+    /* Zero inputs to keep numerics tame (not strictly needed). */
+    hipMemsetAsync(d_X, 0, max_act_f16, stream);
+    hipMemsetAsync(d_W, 0, max_W_f16, stream);
+    hipStreamSynchronize(stream);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* DiT HHS shapes (op_gemm_f16_bias_f16d). */
+    const int N1   = DIT_INPUT_SIZE + 1;       /* 4097 */
+    const int N0   = DIT_INPUT_SIZE;           /* 4096 */
+    const int H    = DIT_HIDDEN;               /* 2048 */
+    const int FFN  = DIT_FFN;                  /* 8192 */
+    const int CTX  = DINO_SEQ_LEN;             /* 1370 */
+    const int CDIM = DIT_CONTEXT_DIM;          /* 1024 */
+
+    /* sa_qkv */
+    op_gemm_f16_bias_f16d(ops, stream, d_Yh, d_W, d_X, d_B, 3 * H, H, N1);
+    /* sa_out / ca_q (same shape) */
+    op_gemm_f16_bias_f16d(ops, stream, d_Yh, d_W, d_X, d_B, H, H, N1);
+    /* skip_linear */
+    op_gemm_f16_bias_f16d(ops, stream, d_Yh, d_W, d_X, d_B, H, 2 * H, N1);
+    /* mlp_fc1 with fused gelu */
+    op_gemm_f16_bias_gelu_f16d(ops, stream, d_Yh, d_W, d_X, d_B, FFN, H, N1);
+    /* mlp_fc2 */
+    op_gemm_f16_bias_f16d(ops, stream, d_Yh, d_W, d_X, d_B, H, FFN, N1);
+    /* ca_kv on context */
+    op_gemm_f16_bias_f16d(ops, stream, d_Yh, d_W, d_X, d_B, 2 * H, CDIM, CTX);
+    /* DiT final linear: HSS (f16 in, f32 out, with bias). */
+    op_gemm_f16_bias(ops, stream, d_Yf, d_W, d_X, d_B, DIT_IN_CHANNELS, H, N0);
+
+    /* DINOv2 HHS shapes (per run_dinov2_fp16). */
+    const int DH    = DINO_HIDDEN;             /* 1024 */
+    const int DSEQ  = DINO_SEQ_LEN;            /* 1370 */
+    const int DFFN  = DINO_FFN;                /* 4096 */
+    /* q/k/v/out: (DSEQ, DH, DH) */
+    op_gemm_f16_bias_f16d(ops, stream, d_Yh, d_W, d_X, d_B, DH, DH, DSEQ);
+    /* fc1 with fused gelu: (DSEQ, DFFN, DH) */
+    op_gemm_f16_bias_gelu_f16d(ops, stream, d_Yh, d_W, d_X, d_B, DFFN, DH, DSEQ);
+    /* fc2: (DSEQ, DH, DFFN) */
+    op_gemm_f16_bias_f16d(ops, stream, d_Yh, d_W, d_X, d_B, DH, DFFN, DSEQ);
+
+    hipStreamSynchronize(stream);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (r->verbose) {
+        double ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                  + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        fprintf(stderr, "HY3D: plan pre-warm done in %.1f ms (10 shapes)\n", ms);
+    }
+
+done:
+    if (d_X)  hipFree(d_X);
+    if (d_W)  hipFree(d_W);
+    if (d_Yh) hipFree(d_Yh);
+    if (d_Yf) hipFree(d_Yf);
+    if (d_B)  hipFree(d_B);
+}
+#endif  /* HY3D_HIPBLASLT_ENABLED */
+
 int hip_hy3d_load_weights(hip_hy3d_runner *r,
                            const char *conditioner_path,
                            const char *model_path,
@@ -1828,6 +3035,13 @@ int hip_hy3d_load_weights(hip_hy3d_runner *r,
         return -1;
     if (vae_path && load_vae_weights(r, vae_path) != 0)
         return -1;
+
+#ifdef HY3D_HIPBLASLT_ENABLED
+    /* Lever A: pre-warm hipBLASLt plans for all DiT + DINOv2 hot shapes
+     * once after weights are loaded.  Saves ~600 ms on first DiT step
+     * and ~430 ms on the DINOv2 stage for one-shot CLI invocations. */
+    prewarm_blaslt_plans(r);
+#endif
 
     return 0;
 }
@@ -1851,6 +3065,27 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
+    /* Per-stage GPU timing events */
+    hipEvent_t ev_e2e_start = NULL, ev_e2e_end = NULL;
+    hipEvent_t ev_dino_start = NULL, ev_dino_end = NULL;
+    hipEvent_t ev_dit_start = NULL, ev_dit_end = NULL;
+    hipEvent_t ev_vae_start = NULL, ev_vae_end = NULL;
+    hipEvent_t ev_step_start[HY3D_MAX_DIT_STEPS] = {0};
+    hipEvent_t ev_step_end[HY3D_MAX_DIT_STEPS] = {0};
+    int n_steps_for_timing = (n_steps < HY3D_MAX_DIT_STEPS) ? n_steps : HY3D_MAX_DIT_STEPS;
+    if (r->timing_enabled) {
+        hipEventCreate(&ev_e2e_start);  hipEventCreate(&ev_e2e_end);
+        hipEventCreate(&ev_dino_start); hipEventCreate(&ev_dino_end);
+        hipEventCreate(&ev_dit_start);  hipEventCreate(&ev_dit_end);
+        hipEventCreate(&ev_vae_start);  hipEventCreate(&ev_vae_end);
+        for (int i = 0; i < n_steps_for_timing; i++) {
+            hipEventCreate(&ev_step_start[i]);
+            hipEventCreate(&ev_step_end[i]);
+        }
+        hipEventRecord(ev_e2e_start, r->stream);
+        hipEventRecord(ev_dino_start, r->stream);
+    }
+
     /* ---- Stage 1: DINOv2 image encoding ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 1 - DINOv2 encoding...\n");
 
@@ -1870,7 +3105,18 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
     }
 
     void *d_dino_out = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
-    run_dinov2(r, d_image, d_dino_out);
+    {
+        static int dino_fp16 = -1;
+        if (dino_fp16 < 0) {
+            const char *e = getenv("HY3D_DINO_FP16");
+            /* default on; HY3D_DINO_FP16=0 disables. */
+            dino_fp16 = (e && *e && e[0] == '0') ? 0 : 1;
+        }
+        if (dino_fp16 && !r->ops.use_f32_gemm)
+            run_dinov2_fp16(r, d_image, d_dino_out);
+        else
+            run_dinov2(r, d_image, d_dino_out);
+    }
     if (r->init_ctx_cond && r->init_ctx_n == DINO_SEQ_LEN * DIT_CONTEXT_DIM) {
         hipMemcpyAsync(d_dino_out, r->init_ctx_cond,
                        (size_t)r->init_ctx_n * sizeof(float),
@@ -1904,6 +3150,11 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
                 dmin, dmax, dsum / (DINO_SEQ_LEN * DINO_HIDDEN), nan_cnt,
                 has_nan ? " *** NaN DETECTED ***" : "");
         free(dino_full);
+    }
+
+    if (r->timing_enabled) {
+        hipEventRecord(ev_dino_end, r->stream);
+        hipEventRecord(ev_dit_start, r->stream);
     }
 
     /* ---- Stage 2: DiT diffusion with flow matching ---- */
@@ -1974,6 +3225,9 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
             fprintf(stderr, "  step %d/%d (t=%.4f)\n", step + 1, n_steps, model_t);
 
+        if (r->timing_enabled && step < n_steps_for_timing)
+            hipEventRecord(ev_step_start[step], r->stream);
+
         if (r->latent_dump_count > 0 && hy3d_should_dump_latent(r, step + 1)) {
             hy3d_dump_latent(stream, d_latents, DIT_INPUT_SIZE, DIT_IN_CHANNELS,
                              r->latent_dump_prefix, step + 1);
@@ -1984,7 +3238,6 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
 
         run_dit_forward(r, d_latents, model_t, d_dino_out, d_pred_cond);
         run_dit_forward(r, d_latents, model_t, d_uncond_ctx, d_pred_uncond);
-
         op_cfg_combine(ops, stream, d_pred_combined, d_pred_cond, d_pred_uncond,
                        guidance_scale, latent_size);
 
@@ -2001,6 +3254,9 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
          * then casts prev_sample back to model_output.dtype (fp16 here). Keep
          * F32 storage for the HIP kernels, but round values through fp16. */
         op_round_f32_to_f16(ops, stream, d_latents, latent_size);
+
+        if (r->timing_enabled && step < n_steps_for_timing)
+            hipEventRecord(ev_step_end[step], r->stream);
 
         /* NaN check after each step */
         if (r->verbose && step == 0) {
@@ -2042,12 +3298,21 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         free(lcpu);
     }
 
+    if (r->timing_enabled) {
+        hipEventRecord(ev_dit_end, r->stream);
+        hipEventRecord(ev_vae_start, r->stream);
+    }
+
     /* ---- Stage 3: ShapeVAE decode + SDF query ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 3 - ShapeVAE decode (grid %d^3)...\n", grid_res);
 
     int total_pts = grid_res * grid_res * grid_res;
     float *sdf_grid = (float *)malloc((size_t)total_pts * sizeof(float));
     run_shapevae(r, d_latents, grid_res, sdf_grid);
+    if (r->timing_enabled) {
+        hipEventRecord(ev_vae_end, r->stream);
+        hipEventRecord(ev_e2e_end, r->stream);
+    }
     hipFree(d_latents);
 
     /* SDF grid stats */
@@ -2082,7 +3347,44 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         fprintf(stderr, "HY3D: done in %.2fs (%d verts, %d tris)\n",
                 elapsed, result.n_verts, result.n_tris);
 
+    if (r->timing_enabled) {
+        hipEventSynchronize(ev_e2e_end);
+        memset(&r->timings, 0, sizeof(r->timings));
+        hipEventElapsedTime(&r->timings.dino_ms,      ev_dino_start, ev_dino_end);
+        hipEventElapsedTime(&r->timings.dit_total_ms, ev_dit_start,  ev_dit_end);
+        hipEventElapsedTime(&r->timings.vae_ms,       ev_vae_start,  ev_vae_end);
+        hipEventElapsedTime(&r->timings.e2e_ms,       ev_e2e_start,  ev_e2e_end);
+        r->timings.dit_steps = n_steps_for_timing;
+        for (int i = 0; i < n_steps_for_timing; i++) {
+            hipEventElapsedTime(&r->timings.dit_step_ms[i],
+                                ev_step_start[i], ev_step_end[i]);
+        }
+        r->timing_valid = 1;
+
+        hipEventDestroy(ev_e2e_start);  hipEventDestroy(ev_e2e_end);
+        hipEventDestroy(ev_dino_start); hipEventDestroy(ev_dino_end);
+        hipEventDestroy(ev_dit_start);  hipEventDestroy(ev_dit_end);
+        hipEventDestroy(ev_vae_start);  hipEventDestroy(ev_vae_end);
+        for (int i = 0; i < n_steps_for_timing; i++) {
+            hipEventDestroy(ev_step_start[i]);
+            hipEventDestroy(ev_step_end[i]);
+        }
+    }
+
     return result;
+}
+
+void hip_hy3d_set_per_stage_timing(hip_hy3d_runner *r, int enable) {
+    if (!r) return;
+    r->timing_enabled = enable ? 1 : 0;
+    if (!enable) r->timing_valid = 0;
+}
+
+int hip_hy3d_get_stage_times(const hip_hy3d_runner *r, hy3d_stage_times *out) {
+    if (!r || !out) return -1;
+    if (!r->timing_valid) return -1;
+    *out = r->timings;
+    return 0;
 }
 
 /* ======================================================================== */

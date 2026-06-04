@@ -101,6 +101,28 @@ int hip_hy3d_set_init_contexts(hip_hy3d_runner *r,
 /* Free runner and all GPU resources */
 void hip_hy3d_free(hip_hy3d_runner *r);
 
+/* ---- Per-stage GPU timing (hipEvent-based) ---- */
+
+#define HY3D_MAX_DIT_STEPS 64
+
+typedef struct {
+    float dino_ms;
+    float dit_total_ms;
+    float vae_ms;
+    float e2e_ms;
+    int   dit_steps;
+    float dit_step_ms[HY3D_MAX_DIT_STEPS];
+} hy3d_stage_times;
+
+/* Enable per-stage GPU timing collection (default off).
+ * When enabled, hip_hy3d_predict() populates the runner's internal
+ * hy3d_stage_times struct, retrievable via hip_hy3d_get_stage_times(). */
+void hip_hy3d_set_per_stage_timing(hip_hy3d_runner *r, int enable);
+
+/* Copy the latest stage timings into *out. Returns 0 on success,
+ * -1 if timing was never enabled or no run has completed. */
+int hip_hy3d_get_stage_times(const hip_hy3d_runner *r, hy3d_stage_times *out);
+
 /* ---- Per-stage verification API ---- */
 
 /* Run DINOv2 encoder only.
