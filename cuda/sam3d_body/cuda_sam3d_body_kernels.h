@@ -102,6 +102,24 @@ static const char cuda_sam3d_body_kernels_src[] =
     "    x[i] = __uint_as_float(u);\n"
     "}\n"
 
+    "static __device__ __forceinline__ unsigned short sam3db_f32_to_bf16_bits(float f) {\n"
+    "    unsigned int x = __float_as_uint(f);\n"
+    "    unsigned int r = 0x7fffu + ((x >> 16) & 1u);\n"
+    "    return (unsigned short)((x + r) >> 16);\n"
+    "}\n"
+    "__global__ void cast_f32_to_f16_sam3db(const float *src, unsigned short *dst, int n) {\n"
+    "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    if (i >= n) return;\n"
+    "    unsigned short h;\n"
+    "    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(src[i]));\n"
+    "    dst[i] = h;\n"
+    "}\n"
+    "__global__ void cast_f32_to_bf16_sam3db(const float *src, unsigned short *dst, int n) {\n"
+    "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    if (i >= n) return;\n"
+    "    dst[i] = sam3db_f32_to_bf16_bits(src[i]);\n"
+    "}\n"
+
     /* rope_apply_qk_rh_sam3d
      *
      * In-place rotate-half RoPE applied to Q and K slots of a fused QKV
