@@ -91,6 +91,15 @@ export TP_DRY_TOKEN_STEP=${TP_DRY_TOKEN_STEP:-1}
 # without these, env-prefixed TF_ATTN_PP / TP_DUMP_TOKENS never reach the runner).
 export TF_ATTN_PP=${TF_ATTN_PP:-}
 export TP_DUMP_TOKENS=${TP_DUMP_TOKENS:-0}
+# Per-rank lm_head isolation dump: post-final-norm hidden + local logit shard
+# (tp_lmhead_rank<NN>.txt). TP_DUMP_LMHEAD=N dumps the first N decode steps.
+export TP_DUMP_LMHEAD=${TP_DUMP_LMHEAD:-0}
+# Per-layer NaN localization: scan m->x / mixer-out each layer, write first
+# NaN-introducing layer/op to tp_nantrace_rank<NN>.txt. Requires the per-op
+# forward path (TP_DECODE_PERSIST=0) since the persistent worker isn't traced.
+export TP_NAN_TRACE=${TP_NAN_TRACE:-0}
+export TP_NAN_TRACE_STEPS=${TP_NAN_TRACE_STEPS:-2}
+export TP_DECODE_PERSIST=${TP_DECODE_PERSIST:-1}
 
 if [ "${SKIP_STAGE:-0}" != "1" ]; then
     chmod +x "$LLM_DIR/stage_gguf_shards.sh"
@@ -119,7 +128,7 @@ else
     BIN="$LLM_DIR/build/tp_runner"
 fi
 
-rm -f tp_run_*.txt tp_load_rank*.txt tp_perf_rank*.txt tp_stderr_rank*.txt
+rm -f tp_run_*.txt tp_load_rank*.txt tp_perf_rank*.txt tp_stderr_rank*.txt tp_lmhead_rank*.txt tp_nantrace_rank*.txt
 if [ "$SKIP_TOPO" != "1" ]; then
     mpiexec -np "$NP" "${MPI_PLACE[@]}" "$UTOFU_DIR/tofu_topo_helper"
 else
@@ -133,3 +142,16 @@ echo "=== per-rank decode perf (compute/comm/GB-s) ==="; cat tp_perf_rank*.txt 2
 echo "=== rank0 decode output ==="; cat $(ls -t tp_run_*.txt | head -1) 2>/dev/null
 echo "=== rank0 tp_slice + pool profile (captured stderr) ==="
 grep -E "tp_slice: rank|tf_pool:|numa: phase 1 done" tp_stderr_rank00.txt 2>/dev/null
+if [ "${TP_DUMP_LMHEAD:-0}" != "0" ]; then
+    echo "=== per-rank lm_head dump (hidden + local logit shard, step 0) ==="
+    for f in $(ls tp_lmhead_rank*.txt 2>/dev/null | sort); do
+        echo "--- $f ---"; sed -n '1,4p' "$f"
+    done
+fi
+if [ "${TP_NAN_TRACE:-0}" != "0" ]; then
+    echo "=== per-rank NaN trace: FIRST line where nan>0 (step 0 full forward) ==="
+    for f in $(ls tp_nantrace_rank*.txt 2>/dev/null | sort); do
+        first=$(grep -m1 -E "nan=[1-9]" "$f" || true)
+        echo "--- $f --- ${first:-<no NaN in trace>}"
+    done
+fi

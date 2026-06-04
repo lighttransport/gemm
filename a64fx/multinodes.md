@@ -62,6 +62,82 @@ NP=11 QWEN27B_NODES=11 ./run_tp_27b.sh   # or ./run_pp_27b.sh
 Set `SKIP_STAGE=1` if the `/local` cache is pre-populated and `QWEN27B_LOCAL_DIR`
 to override the staging root.
 
+## Qwen3.6-27B BF16 TP status
+
+- The non-hybrid attn tiled prefill path now runs for 27B/TP as intended.
+  A guard in `common/transformer.h` that blocked attention-batched prefill on
+  non-hybrid models has been removed; `transformer_prefill_gemm` now uses the
+  tiled attention path for TP sharded Qwen-style heads too.
+- `a64fx/llm/tp_pref_scale.sh` now supports:
+  - long-context synthetic prompts (`TP_PREF_SCALE_TARGETS`, e.g. `1000`),
+  - prefill+decode sweeps (`TP_PREF_SCALE_PREFILL_ONLY=0`,
+    `TP_PREF_SCALE_DECODE_TOKENS=<N>`),
+  - and optional cache-replay mode (`TP_PREF_SCALE_CACHE_MODE=1`) with explicit
+    `TP_PREF_SCALE_CACHE_DIR` + `TP_PREF_SCALE_CACHE_TAG`.
+- `a64fx/llm/tp_node_scale.sh` is added for node-count scaling sweeps; it calls
+  `tp_pref_scale.sh` for each NP and aggregates rows into one file.
+
+Example 11-node 1K-context prefill+decode probe:
+
+```bash
+QWEN27B_NODES=11 NP=11 \
+TP_PREF_SCALE_TARGETS=\"1000\" \
+TP_PREF_SCALE_PREFILL_ONLY=0 \
+TP_PREF_SCALE_DECODE_TOKENS=32 \
+TP_PREF_SCALE_CACHE_MODE=1 \
+TP_PREF_SCALE_CACHE_DIR=$HOME/models/qwen36/27b/cache \
+TP_SYNTH_TOKEN_ID=1 \
+TP_SYNTH_TOKENS=1000 \
+TP_PREFILL_GEMM=1 \
+bash a64fx/llm/tp_pref_scale.sh
+```
+
+Node scaling sketch (targets and mode preserved for every NP):
+
+```bash
+TP_NODE_SCALE_NODES=\"11 10 9 8\" \
+TP_NODE_SCALE_TARGETS=\"1000\" \
+TP_NODE_SCALE_PREFILL_ONLY=0 \
+TP_NODE_SCALE_DECODE_TOKENS=32 \
+bash a64fx/llm/tp_node_scale.sh
+```
+
+Latest TP-27B BF16 control surface in `tp_pref_scale.sh`:
+
+- `TP_PREFILL_ATTN_TILE=1` (enable tiled attention; `0` falls back to per-token)
+- `TP_PREFILL_ATTN_TILE_Q` (default `32`) and `TP_PREFILL_ATTN_TILE_K` (default `256`)
+- `TP_PREFILL_ATTN_TILE_ALGO` (`0` two-pass materialized, `1` online softmax, `2` packed three-pass, `3` packed two-pass)
+- `TP_PREFILL_ATTN_TILE_STACK_BYTES` (default `2,097,152`)
+- `TP_PREFILL_NULL_GEMM=1` (skip prefill GEMM work to isolate comm/KV-cache behavior)
+- `TP_PREFILL_SSM_BLOCK=1` (parallelized SSM finish) and
+  `TP_PREFILL_SSM_NULL_FINISH=1` (communication-only SSM finish check)
+- `TP_PREFILL_FFN_ALLREDUCE` (default `1`) and `TP_AR_BF16=1` (default on runner + scale script)
+
+For a first bottleneck check (null-gemm path) use:
+
+```bash
+TP_PREF_SCALE_TARGETS=1000 \
+TP_PREF_SCALE_PREFILL_ONLY=1 \
+TP_PREFILL_NULL_GEMM=1 \
+TP_PREFILL_SSM_NULL_FINISH=1 \
+TP_PREFILL_ATTN_TILE=1 \
+TP_PREFILL_ATTN_TILE_ALGO=2 \
+TP_PREFILL_ATTN_TILE_Q=64 \
+TP_PREFILL_ATTN_TILE_STACK_BYTES=2097152 \
+NP=11 QWEN27B_NODES=11 \
+bash a64fx/llm/tp_pref_scale.sh
+```
+
+Keep `TP_PREF_SCALE_CACHE_MODE=1` plus `TP_PREF_SCALE_CACHE_DIR=$HOME/models/qwen36/27b/cache`
+to measure warm+replay behavior over multinodes.
+
+`TP_CACHE_SHARED` (default `auto`) enables efficient cache reuse for replicated-KV
+TP layouts (for Qwen3.6-27B BF16 at TP=6,11,12): all ranks read and write
+**one shared checkpoint** at `.../<safe_model>_<tag>.shared.tpck` instead of per-rank
+files. If KV heads are non-replicated, the runner auto-falls back to per-rank checkpoints.
+When `TP_CACHE_PATH` is used with `N>1`, shared mode is forced to avoid rank-local
+file races.
+
 ## Current optimized EP prefill status
 
 Implemented after the communication roofline:
