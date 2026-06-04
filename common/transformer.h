@@ -310,6 +310,16 @@ typedef struct {
      * FFN + final RMSNorm, so transformer_prefill_gemm can batch the FFN as a GEMM. */
     int prefill_ffn_skip;
 
+    /* TP batched-GEMM prefill: when set, the batched mixers
+     * (tf_{ssm,attn}_prefill_layer_bf16pv) leave their PARTIAL out-projection in the
+     * O/AOut buffer and do NOT add it into the residual X. transformer_prefill_gemm then
+     * all-reduces that partial (summing the TP shards) and adds the full result to X
+     * exactly once — mirroring the per-op path (AR(xb); x += xb). Without this the AR
+     * summed the *replicated* residual N times: an N^2-per-layer blow-up (121x at TP=11,
+     * 2 reduces/layer) that overflowed float at ~layer 19 -> all-NaN logits -> "!!!!".
+     * EP and the per-op path never set it, so they keep the in-mixer residual add. */
+    int prefill_defer_resid;
+
     /* A64FX hardware barrier (libhwb / /dev/xos_hwb), env TF_HW_BARRIER=1.
      * Per-CMG EL0 BST hardware barrier + 4-way SW combine among CMG leaders.
      * The kernel group-assign that makes the EL0 BST register actually
@@ -5758,6 +5768,7 @@ void transformer_reset_runtime_state(transformer_model *model) {
     model->ds_embd = NULL;
     model->current_token_id = -1;
     model->prefill_ffn_skip = 0;
+    model->prefill_defer_resid = 0;
 
     if (model->key_cache) {
         for (int l = 0; l < model->n_layers; l++) {
@@ -9113,6 +9124,44 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
 
+/* ---- TP NaN-trace (env TP_NAN_TRACE): localize the first NaN-introducing layer/op.
+ * Per-rank append file tp_nantrace_rank<NN>.txt; gated to the first few full-range
+ * forward passes (TP_NAN_TRACE_STEPS, default 2). Only emits when tf_nantrace_active
+ * is set by tf_forward_blocks_range, so call sites need no extra guard. */
+static int tf_nantrace_active = 0;
+static void tf_nantrace_emit(transformer_model *m, int layer, const char *tag,
+                             const float *v, int n) {
+    if (!tf_nantrace_active) return;
+    int nan = 0, inf = 0; float mn = 1e30f, mx = -1e30f; double sum = 0;
+    for (int i = 0; i < n; i++) {
+        float x = v[i];
+        if (isnan(x)) { nan++; continue; }
+        if (isinf(x)) { inf++; continue; }
+        if (x < mn) mn = x; if (x > mx) mx = x; sum += x;
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "tp_nantrace_rank%02d.txt", m->tp_rank);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "L%02d %-12s n=%d nan=%d inf=%d min=%.4g max=%.4g mean=%.4g  v[0..3]=%.4g %.4g %.4g %.4g\n",
+            layer, tag, n, nan, inf, (double)mn, (double)mx,
+            n ? sum / n : 0.0, (double)v[0], (double)v[1], (double)v[2], (double)v[3]);
+    fclose(f);
+}
+
+/* GEMM-prefill NaN trace (env TP_NAN_TRACE): independent gate from the per-op
+ * trace so the two paths don't clobber tf_nantrace_active. Writes the same
+ * per-rank file with a PF/ tag. */
+static int tf_nantrace_pf = 0;
+static void tf_nantrace_emit_pf(transformer_model *m, int layer, const char *tag,
+                                const float *v, int n) {
+    if (!tf_nantrace_pf) return;
+    int saved = tf_nantrace_active;
+    tf_nantrace_active = 1;
+    tf_nantrace_emit(m, layer, tag, v, n);
+    tf_nantrace_active = saved;
+}
+
 static float *tf_forward_blocks_range(transformer_model *m, int position, int pos_t, int pos_h, int pos_w,
                                        int layer_start, int layer_end) {
     int n_embd = m->n_embd;
@@ -9125,6 +9174,20 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
     if (layer_end > m->n_layers) layer_end = m->n_layers;
     if (layer_start < 0) layer_start = 0;
+
+    /* TP NaN-trace gating: only the first few full-range forward passes. */
+    {
+        static int nt_init = -1, nt_steps = 2, nt_calls = 0;
+        if (nt_init < 0) {
+            nt_init = getenv("TP_NAN_TRACE") ? 1 : 0;
+            const char *s = getenv("TP_NAN_TRACE_STEPS");
+            if (s) nt_steps = atoi(s);
+        }
+        tf_nantrace_active = (nt_init && layer_start == 0 && layer_end >= m->n_layers
+                              && nt_calls < nt_steps);
+        if (tf_nantrace_active) nt_calls++;
+    }
+    tf_nantrace_emit(m, -1, "embed_in", m->x, n_embd);
 
     /* Gemma4: precompute per-layer inputs (token embedding + model projection, combined).
      * Uses heap allocation instead of alloca (total_ple = 256*42 = 10752 floats ≈ 43KB × 3). */
@@ -9667,10 +9730,15 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
          * ssm_out) produced a PARTIAL sum on m->xb — all-reduce across the TP
          * group before the residual add. SSM layers skip this when SSM is left
          * replicated (Stage A: every rank computed the full SSM output). */
+        tf_nantrace_emit(m, l, (m->is_hybrid && layer->is_ssm) ? "ssm_preAR" : "attn_preAR",
+                         m->xb, n_embd);
         if (m->tp_size > 1 && m->tp_allreduce_fn &&
             ((m->is_hybrid && layer->is_ssm) ? m->tp_ssm_sharded : m->tp_attn_sharded))
             m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
+        tf_nantrace_emit(m, l, (m->is_hybrid && layer->is_ssm) ? "ssm_postAR" : "attn_postAR",
+                         m->xb, n_embd);
         tf_vadd(m->x, m->xb, n_embd);
+        tf_nantrace_emit(m, l, "x_postmix", m->x, n_embd);
 
         /* Stage-1 batched-GEMM prefill: mixer done, FFN is batched separately. */
         if (m->prefill_ffn_skip) continue;
@@ -9887,6 +9955,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             const float *ds_slice = m->ds_embd + (1 + l) * n_embd;
             tf_vadd(m->x, ds_slice, n_embd);
         }
+
+        tf_nantrace_emit(m, l, "x_postffn", m->x, n_embd);
 
         if (m->debug_layers) {
             float ss = 0;
@@ -11266,7 +11336,8 @@ static int tf_attn_prefill_layer_bf16pv(transformer_model *m, transformer_layer 
 
     t0 = pd ? tf_wall_seconds() : 0.0;
     tf_gemm_bf16pv_prefill(m, O, &layer->attn_output, AOut, M);
-    tf_vadd_flat_pool(m, X, O, (size_t)M * n_embd);
+    if (!m->prefill_defer_resid)        /* TP defers: partial stays in O, added after AR */
+        tf_vadd_flat_pool(m, X, O, (size_t)M * n_embd);
     if (pd) pd->attn_out += tf_wall_seconds() - t0;
     return 1;
 }
@@ -11603,6 +11674,11 @@ typedef struct {
     int n_group;
     int dt_rank;
     int head_start, head_end;
+    int head_offset;   /* TP Stage-B: GLOBAL index of this rank's first V-head
+                        * (m->ssm_head_offset). Q/K are REPLICATED (full n_group
+                        * present) but V is sharded by local head, so the Q/K group
+                        * for local head h is the GLOBAL (head_offset+h) % n_group,
+                        * matching the per-op path (7462). 0 unsharded -> h % n_group. */
     float eps;
     float scale;
 } tf_ssm_prefill_finish_block_task;
@@ -11614,7 +11690,7 @@ static void *tf_ssm_prefill_finish_block_worker(void *arg) {
     size_t d_inner = (size_t)t->d_inner;
     size_t qkv_stride = (size_t)t->qkv_dim;
     for (int h = t->head_start; h < t->head_end; h++) {
-        int g = h % t->n_group;
+        int g = (t->head_offset + h) % t->n_group;   /* GLOBAL Q/K group (TP Stage-B) */
         float *state = t->rec_state + (size_t)h * d2;
         const float *q_base = t->QKV + (size_t)g * ds;
         const float *k_base = t->QKV + (size_t)t->n_group * ds + (size_t)g * ds;
@@ -11717,7 +11793,8 @@ static void tf_ssm_prefill_finish_block(transformer_model *m, transformer_layer 
                 .Alpha = Alpha, .Beta = Beta, .S = S, .norm_w = norm_w,
                 .M = M, .qkv_dim = qkv_dim, .d_inner = d_inner,
                 .d_state = d_state, .n_group = n_group, .dt_rank = dt_rank,
-                .head_start = hs, .head_end = he, .eps = eps, .scale = scale,
+                .head_start = hs, .head_end = he, .head_offset = m->ssm_head_offset,
+                .eps = eps, .scale = scale,
             };
         }
         tf_pool_dispatch(m, tf_ssm_prefill_finish_block_worker, tasks, sizeof(*tasks));
@@ -11727,7 +11804,8 @@ static void tf_ssm_prefill_finish_block(transformer_model *m, transformer_layer 
             .Alpha = Alpha, .Beta = Beta, .S = S, .norm_w = norm_w,
             .M = M, .qkv_dim = qkv_dim, .d_inner = d_inner,
             .d_state = d_state, .n_group = n_group, .dt_rank = dt_rank,
-            .head_start = 0, .head_end = dt_rank, .eps = eps, .scale = scale,
+            .head_start = 0, .head_end = dt_rank, .head_offset = m->ssm_head_offset,
+            .eps = eps, .scale = scale,
         };
         tf_ssm_prefill_finish_block_worker(&task);
     }
@@ -11820,7 +11898,8 @@ static int tf_ssm_prefill_layer_bf16pv(transformer_model *m, int layer_idx,
 
     t0 = pd ? tf_wall_seconds() : 0.0;
     tf_gemm_bf16pv_prefill(m, O, &layer->ssm_out, S, M);
-    tf_vadd_flat_pool(m, X, O, (size_t)M * n_embd);
+    if (!m->prefill_defer_resid)        /* TP defers: partial stays in O, added after AR */
+        tf_vadd_flat_pool(m, X, O, (size_t)M * n_embd);
     if (pd) pd->ssm_out += tf_wall_seconds() - t0;
     return 1;
 }
@@ -12318,6 +12397,7 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
         return NULL;
     }
 
+    tf_nantrace_pf = (getenv("TP_NAN_TRACE") != NULL);
     int do_ffn_allreduce = tf_prefill_env_int("TP_PREFILL_FFN_ALLREDUCE", "EP_PREFILL_FFN_ALLREDUCE", 1);
     int do_attn_gemm = tf_prefill_env_int("TP_PREFILL_ATTN_GEMM", "EP_PREFILL_ATTN_GEMM", 1);
     int do_ssm_gemm  = tf_prefill_env_int("TP_PREFILL_SSM_GEMM",  "EP_PREFILL_SSM_GEMM",  1);
@@ -12356,6 +12436,8 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
     /* Embed all prompt tokens into the residual stream. */
     for (int t = 0; t < M; t++)
         tf_dequant_row(&m->token_embd, tokens[t], X + (size_t)t * n_embd);
+    if (tf_nantrace_pf)
+        tf_nantrace_emit_pf(m, -1, "PFembed", X + (size_t)(M - 1) * n_embd, n_embd);
 
     int tf_prefill_prof = (getenv("TF_PREFILL_PROF") != NULL);
     /* Per-phase split: t_attn (16 full-attn mixers), t_ssm (48 SSM mixers),
@@ -12399,6 +12481,8 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
     }
 #endif
 
+    /* Batched mixers leave their PARTIAL out-projection in AOut; we all-reduce + add it. */
+    m->prefill_defer_resid = 1;
     for (int l = 0; l < n_layers; l++) {
         transformer_layer *layer = &m->layers[l];
         int mixer_ok = 0;
@@ -12455,6 +12539,9 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
             tf_gemm_bf16pv_prefill(m, U, &layer->ffn_up, Xn, M);
             tf_silu_mul_flat_pool(m, G, G, U, ff_elems);
             tf_gemm_bf16pv_prefill(m, D, &layer->ffn_down, G, M);
+            /* row-parallel ffn_down -> all-reduce the PARTIAL, then add to X (not AR(X)). */
+            if (do_ffn_allreduce && m->tp_size > 1 && m->tp_allreduce_fn && m->tp_ffn_sharded)
+                tf_prefill_allreduce(m, D, emb_elems);
             tf_vadd_flat_pool(m, X, D, emb_elems);
             if (tf_prefill_prof) {
                 clock_gettime(CLOCK_MONOTONIC, &tb);
@@ -12472,36 +12559,59 @@ float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int
         }
 
 #if defined(__ARM_FEATURE_SVE)
+        /* Mixer left its PARTIAL out-projection in AOut (prefill_defer_resid=1) and did
+         * NOT touch X. Sum the TP shards of the partial, THEN add the full result to the
+         * replicated residual exactly once. Never all-reduce X — that re-sums the
+         * replicated residual N times (the N^2/layer blow-up: 121x at TP=11 -> overflow
+         * -> all-NaN logits). Mirrors the per-op path (AR(xb); x += xb). */
         if (m->tp_size > 1 && m->tp_allreduce_fn &&
             ((layer->is_ssm) ? m->tp_ssm_sharded : m->tp_attn_sharded)) {
-            tf_prefill_allreduce(m, X, emb_elems);
+            tf_prefill_allreduce(m, AOut, emb_elems);
         }
+        tf_vadd_flat_pool(m, X, AOut, emb_elems);
 #endif
 
-        if (tf_prefill_prof) {   /* mixer-out all-reduce (the old profiler dropped this) */
+        if (tf_prefill_prof) {   /* mixer-out all-reduce + residual add */
             clock_gettime(CLOCK_MONOTONIC, &tb);
             t_ar += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
             ta = tb;
+        }
+        /* Recompute the FFN norm from the post-mixer residual: the batched mixer wrote
+         * Xn = attn_norm(X_in) for its own projections and never refreshed it, but the
+         * FFN needs ffn_norm(X_post_mixer). (The per-token fallback already does this.) */
+        for (int t = 0; t < M; t++)
+            tf_rmsnorm(Xn + (size_t)t * n_embd, X + (size_t)t * n_embd,
+                       &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
+        if (tf_nantrace_pf) {
+            tf_nantrace_emit_pf(m, l, layer->is_ssm ? "PFssm_mix" : "PFattn_mix",
+                                X  + (size_t)(M - 1) * n_embd, n_embd);
+            tf_nantrace_emit_pf(m, l, "PFffn_norm", Xn + (size_t)(M - 1) * n_embd, n_embd);
         }
         tf_gemm_bf16pv_prefill(m, G, &layer->ffn_gate, Xn, M);
         tf_gemm_bf16pv_prefill(m, U, &layer->ffn_up, Xn, M);
         tf_silu_mul_flat_pool(m, G, G, U, ff_elems);
         tf_gemm_bf16pv_prefill(m, D, &layer->ffn_down, G, M);
-        tf_vadd_flat_pool(m, X, D, emb_elems);
         if (tf_prefill_prof) {   /* FFN batched GEMM only (AR split out below) */
             clock_gettime(CLOCK_MONOTONIC, &tb);
             t_ffn += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
             ta = tb;
         }
+        /* row-parallel ffn_down -> all-reduce the PARTIAL (D), THEN add to X once.
+         * All-reducing X would re-sum the replicated residual (the N^2 blow-up). */
         if (do_ffn_allreduce && m->tp_size > 1 && m->tp_allreduce_fn && m->tp_ffn_sharded) {
-            tf_prefill_allreduce(m, X, emb_elems);
+            tf_prefill_allreduce(m, D, emb_elems);
         }
         if (tf_prefill_prof) {   /* FFN all-reduce */
             clock_gettime(CLOCK_MONOTONIC, &tb);
             t_ar += (tb.tv_sec - ta.tv_sec) + (tb.tv_nsec - ta.tv_nsec) * 1e-9;
+            ta = tb;
         }
+        tf_vadd_flat_pool(m, X, D, emb_elems);
+        if (tf_nantrace_pf)
+            tf_nantrace_emit_pf(m, l, "PFx_postffn", X + (size_t)(M - 1) * n_embd, n_embd);
 #endif
     }
+    m->prefill_defer_resid = 0;   /* restore: only the batched-mixer loop above defers */
 
     if (tf_prefill_prof) {
         fprintf(stderr, "  [TF_PREFILL_PROF] M=%d attn=%.2fs ssm=%.2fs ffn=%.2fs ar=%.2fs (mixer=%.2fs) fallback_layers=%d\n",
@@ -12989,6 +13099,67 @@ void transformer_set_hidden(transformer_model *model, const float *hidden) {
         memcpy(model->x, hidden, model->n_embd * sizeof(float));
 }
 
+/* TP=11 "!!!!" isolation (env TP_DUMP_LMHEAD=N, default 4 steps): per-rank dump
+ * of (a) the post-final-norm hidden m->x — the lm_head input, which under TP is
+ * REPLICATED so it must be byte-identical across ranks — and (b) this rank's
+ * local logit shard m->logits[0..nlog), captured right before the cross-rank
+ * argmax-allreduce. Diagnoses the localized "!!!!" bug:
+ *   hidden zero/garbage, or x[0..7] DIFFERS across ranks -> final-hidden
+ *     replication / final-norm path is broken (logits then collapse to uniform)
+ *   hidden healthy AND identical across ranks, but a rank's shard is
+ *     zero/uniform -> vocab-shard lm_head matvec/slice is broken (the 27B-only,
+ *     never-validated do_vocab path). */
+static void tf_tp_dump_lmhead(transformer_model *m, int nlog) {
+    const char *e = getenv("TP_DUMP_LMHEAD");
+    if (!e) return;
+    static int calls = 0;
+    int limit = atoi(e); if (limit <= 0) limit = 4;
+    if (calls >= limit) return;
+    int step = calls++;
+    int ne = m->n_embd;
+    float hmin = 1e30f, hmax = -1e30f; double hsum = 0, hasum = 0;
+    int hnan = 0, hinf = 0, hzero = 0;
+    for (int i = 0; i < ne; i++) {
+        float v = m->x[i];
+        if (v != v) { hnan++; continue; }
+        if (v > 1e30f || v < -1e30f) hinf++;
+        if (v == 0.0f) hzero++;
+        if (v < hmin) hmin = v;
+        if (v > hmax) hmax = v;
+        hsum += v; hasum += (v < 0 ? -v : v);
+    }
+    float lmin = 1e30f, lmax = -1e30f; double lsum = 0;
+    int lnan = 0, linf = 0, lzero = 0, largmax = 0;
+    float lbest = -1e30f;
+    for (int v = 0; v < nlog; v++) {
+        float x = m->logits[v];
+        if (x != x) { lnan++; continue; }
+        if (x > 1e30f || x < -1e30f) linf++;
+        if (x == 0.0f) lzero++;
+        if (x < lmin) lmin = x;
+        if (x > lmax) lmax = x;
+        if (x > lbest) { lbest = x; largmax = v; }
+        lsum += x;
+    }
+    char path[80];
+    snprintf(path, sizeof path, "tp_lmhead_rank%02d.txt", m->tp_rank < 0 ? 0 : m->tp_rank);
+    FILE *f = fopen(path, step == 0 ? "w" : "a");
+    if (!f) return;
+    fprintf(f, "step=%d rank=%d vocab_lo=%d vocab_loc=%d sharded=%d n_embd=%d\n",
+            step, m->tp_rank, m->tp_vocab_lo, nlog, m->tp_vocab_sharded, ne);
+    fprintf(f, "  HIDDEN min=%.6g max=%.6g mean=%.6g absmean=%.6g nan=%d inf=%d zeros=%d  x[0..7]=",
+            hmin, hmax, hsum / ne, hasum / ne, hnan, hinf, hzero);
+    for (int i = 0; i < 8 && i < ne; i++) fprintf(f, "%.6g ", m->x[i]);
+    fprintf(f, "\n");
+    fprintf(f, "  SHARD  min=%.6g max=%.6g mean=%.6g nan=%d inf=%d zeros=%d  local_argmax=%d(global=%d) val=%.6g  lg[0..3]=",
+            lmin, lmax, lsum / (nlog > 0 ? nlog : 1), lnan, linf, lzero,
+            largmax, largmax + m->tp_vocab_lo, lbest);
+    for (int v = 0; v < 4 && v < nlog; v++) fprintf(f, "%.6g ", m->logits[v]);
+    fprintf(f, "\n");
+    fflush(f);
+    fclose(f);
+}
+
 float *transformer_compute_logits(transformer_model *model) {
     if (!model || !model->has_lm_head) return NULL;
     /* When the LM head is vocab-sharded the output panel holds only this rank's
@@ -12998,6 +13169,7 @@ float *transformer_compute_logits(transformer_model *model) {
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
     tf_qmatvec_pool(model, model->logits, &model->output, model->x, nlog);
     TF_PROF_END("lm_head", 2.0 * nlog * model->n_embd, 0);
+    tf_tp_dump_lmhead(model, nlog);
     return model->logits;
 }
 

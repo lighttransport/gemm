@@ -36,3 +36,10 @@ See a64fx/doc/profiler.md
 ## a64fx SVE instructions
 
 See a64fx/doc/SVE_INSTRUCTION_REFERENCE.md a64fx/doc/SVE_INSTRUCTION_LATENCY.md
+
+
+## tempdir
+
+use /local as tempdir
+if /local not available, use ~/tmp
+
