@@ -67,6 +67,16 @@ cuda/int8/int8_gemm
 cuda/int8/int8_attention
 cuda/int8/int8_ffn
 cuda/int8/cublas_int8_gemm
+cuda/*/bench_*
+!cuda/*/bench_*.c
+cuda/*/cublas_*_gemm
+!cuda/*/cublas_*_gemm.c
+cuda/fp4/fp4_*
+!cuda/fp4/fp4_*.c
+cuda/fp4/flux2_fp4_w4a4_test
+!cuda/fp4/flux2_fp4_w4a4_test.c
+cuda/fp4/mma_fp4_probe
+!cuda/fp4/mma_fp4_probe.c
 cuda/sam3d/test_*
 !cuda/sam3d/test_*.c
 cuda/sam3d/verify_*
