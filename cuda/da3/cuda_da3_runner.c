@@ -520,6 +520,13 @@ struct cuda_da3_runner {
     CUmodule module;
     CUfunction fn_layernorm_f32;
     CUfunction fn_gemm_f16_f32;
+    CUfunction fn_gemm_f16_f32_mt2;
+    CUfunction fn_gemm_f16_f32_mt4;
+    CUfunction fn_gemm_f16_f32_mt4_n512;
+    CUfunction fn_gemm_f16_f32_mt4_ldx;
+    CUfunction fn_gemm_f16_f32_mt4_smw;
+    CUfunction fn_gemm_f16_f32_mt4_k32;
+    CUfunction fn_gemm_f16_f32_mt4_k32_n512;
     CUfunction fn_add_bias_f32;
     CUfunction fn_qk_layernorm_f32;
     CUfunction fn_rope_2d_f32;
@@ -533,6 +540,7 @@ struct cuda_da3_runner {
     CUfunction fn_relu_f32;
     CUfunction fn_depth_activation;
     CUfunction fn_bilinear_upsample_f32;
+    CUfunction fn_bilinear_upsample2_f32;
     CUfunction fn_conv2d_f32;
     CUfunction fn_dpt_extract_patches;
     CUfunction fn_dpt_concat_halves;
@@ -558,8 +566,17 @@ struct cuda_da3_runner {
     int use_fp8;                   /* 1 if FP8 MMA available */
     int use_fp8_w_perrow;          /* DA3_FP8_W_PERROW=1: experimental W per-row scales */
     int use_cublas_gemm;           /* 1 if cuBLAS tensor-core GEMM is available */
+    int cublas_gemm_policy;        /* 0=off, 1=auto, 2=force */
     int use_mma_gemm;              /* 1 if in-repo FP16 MMA GEMM is enabled */
     int use_mma_attn;              /* DA3_MMA_ATTN=1: opt into faster MMA attention */
+    int mma_gemm_mtile;            /* DA3_MMA_GEMM_MTILE=1|2|4 for custom GEMM */
+    int mma_gemm_nout;             /* DA3_MMA_GEMM_NOUT=256|512 for MT4 custom GEMM */
+    int use_mma_gemm_ldx;          /* DA3_MMA_GEMM_LDX=1: shared-F16 X ldmatrix path */
+    int use_mma_gemm_smw;          /* DA3_MMA_GEMM_SMW=1: shared-memory W tile path */
+    int use_mma_gemm_k32;          /* DA3_MMA_GEMM_K32: -1=auto, 0=off, 1=on */
+    int use_bilinear2;             /* DA3_BILINEAR2=1: experimental C=2 bilinear path */
+    int gemm_profile;              /* DA3_GEMM_PROFILE=1: synchronized per-GEMM timing */
+    int profile;                   /* DA3_PROFILE=1: synchronized timing without debug dumps */
     int cublas_need_f16_x;         /* Blackwell fallback for F16xF32 unsupported */
     int sm_version;
     cublasew_context *cublas;
@@ -756,6 +773,13 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
     /* Shared kernels (from cuda_kernels_common.h) */
     GET_FN(layernorm_f32);
     GET_FN(gemm_f16_f32);
+    GET_FN(gemm_f16_f32_mt2);
+    GET_FN(gemm_f16_f32_mt4);
+    GET_FN(gemm_f16_f32_mt4_n512);
+    GET_FN(gemm_f16_f32_mt4_ldx);
+    GET_FN(gemm_f16_f32_mt4_smw);
+    GET_FN(gemm_f16_f32_mt4_k32);
+    GET_FN(gemm_f16_f32_mt4_k32_n512);
     GET_FN(gemm_tiled_f16_f32);
     GET_FN(flash_attn_tiled_f32);
     GET_FN(add_bias_f32);
@@ -764,6 +788,7 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
     GET_FN(add_f32);
     GET_FN(relu_f32);
     GET_FN(bilinear_upsample_f32);
+    GET_FN(bilinear_upsample2_f32);
     GET_FN(kv_transpose);
     GET_FN(resize_normalize);
     GET_FN(patch_embed_conv2d);
@@ -1091,6 +1116,49 @@ cuda_da3_runner *cuda_da3_init(int device_id, int verbose) {
     }
 
     {
+        const char *env_mtile = getenv("DA3_MMA_GEMM_MTILE");
+        r->mma_gemm_mtile = env_mtile ? atoi(env_mtile) : 0;
+        if (r->mma_gemm_mtile != 0 && r->mma_gemm_mtile != 1 &&
+            r->mma_gemm_mtile != 2 && r->mma_gemm_mtile != 4) {
+            r->mma_gemm_mtile = 0;
+        }
+    }
+
+    {
+        const char *env_nout = getenv("DA3_MMA_GEMM_NOUT");
+        r->mma_gemm_nout = env_nout ? atoi(env_nout) : 0;
+        if (r->mma_gemm_nout != 0 && r->mma_gemm_nout != 256 &&
+            r->mma_gemm_nout != 512) {
+            r->mma_gemm_nout = 0;
+        }
+    }
+
+    {
+        const char *env_ldx = getenv("DA3_MMA_GEMM_LDX");
+        r->use_mma_gemm_ldx = (env_ldx && env_ldx[0] != '0') ? 1 : 0;
+    }
+
+    {
+        const char *env_smw = getenv("DA3_MMA_GEMM_SMW");
+        r->use_mma_gemm_smw = (env_smw && env_smw[0] != '0') ? 1 : 0;
+    }
+
+    {
+        const char *env_k32 = getenv("DA3_MMA_GEMM_K32");
+        r->use_mma_gemm_k32 = env_k32 ? ((env_k32[0] != '0') ? 1 : 0) : -1;
+    }
+
+    {
+        const char *env_bilinear2 = getenv("DA3_BILINEAR2");
+        r->use_bilinear2 = (env_bilinear2 && env_bilinear2[0] != '0') ? 1 : 0;
+    }
+
+    {
+        const char *env_gemm_profile = getenv("DA3_GEMM_PROFILE");
+        r->gemm_profile = (env_gemm_profile && env_gemm_profile[0] != '0') ? 1 : 0;
+    }
+
+    {
         const char *env_graph = getenv("DA3_GRAPH");
         r->use_graph = (env_graph && env_graph[0] != '0') ? 1 : 0;
     }
@@ -1101,19 +1169,35 @@ cuda_da3_runner *cuda_da3_init(int device_id, int verbose) {
     }
 
     {
+        const char *env_profile = getenv("DA3_PROFILE");
+        r->profile = (env_profile && env_profile[0] != '0') ? 1 : 0;
+    }
+
+    {
         const char *env_wpr = getenv("DA3_FP8_W_PERROW");
         r->use_fp8_w_perrow = (env_wpr && env_wpr[0] != '0') ? 1 : 0;
     }
 
     {
         const char *env = getenv("DA3_CUBLAS_GEMM");
-        int want_cublas = (env && env[0] != '0') || (!env && r->sm_version < 120);
+        int want_cublas = 1;
+        r->cublas_gemm_policy = 1;
+        if (env && env[0] == '0') {
+            want_cublas = 0;
+            r->cublas_gemm_policy = 0;
+        } else if (env && env[0] != '\0' && strcmp(env, "auto") != 0) {
+            r->cublas_gemm_policy = 2;
+        }
         if (want_cublas && cublasewCreate(&r->cublas, r->stream) == 0) {
             r->use_cublas_gemm = 1;
         } else if (want_cublas && r->verbose >= 1) {
             fprintf(stderr, "cuda_da3: cuBLAS GEMM unavailable, using custom kernels\n");
         } else if (r->verbose >= 1) {
             fprintf(stderr, "cuda_da3: using custom tensor-core GEMM kernels\n");
+        }
+        if (r->verbose >= 1 && r->use_cublas_gemm) {
+            fprintf(stderr, "cuda_da3: cuBLAS GEMM policy=%s\n",
+                    r->cublas_gemm_policy == 2 ? "force" : "auto");
         }
     }
 
@@ -3082,9 +3166,44 @@ static void kl_layernorm(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
                    256 * sizeof(float), r->stream, args, NULL);
 }
 
+static int da3_should_use_cublas_gemm(const cuda_da3_runner *r,
+                                      int n_out, int n_in, int n_tok) {
+    (void)n_out;
+    (void)n_in;
+    (void)n_tok;
+    if (r->cublas_gemm_policy == 2) return 1;
+    if (r->cublas_gemm_policy != 1) return 0;
+    /* On the tested Blackwell path, cuBLAS is slower for DA3-small but much
+     * faster for large/giant. Model dimension is the stable discriminator. */
+    return r->dim >= 1024;
+}
+
+static int da3_should_use_mt2_mma_gemm(const cuda_da3_runner *r,
+                                       int n_out, int n_in, int n_tok) {
+    return r->dim >= 1024 && n_out >= 256 && n_tok >= 32 && (n_in % 16) == 0;
+}
+
+static int da3_custom_mma_gemm_mtile(const cuda_da3_runner *r,
+                                     int n_out, int n_in, int n_tok) {
+    if (!da3_should_use_mt2_mma_gemm(r, n_out, n_in, n_tok)) return 1;
+    if (r->mma_gemm_mtile == 1 || r->mma_gemm_mtile == 2 || r->mma_gemm_mtile == 4)
+        return r->mma_gemm_mtile;
+    return 4;
+}
+
 static void kl_gemm(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W_f16,
                      CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
-    if (r->use_cublas_gemm && r->cublas) {
+    struct timespec gp_ts;
+    double gp_t0 = 0.0;
+    int gp_mtile = 0, gp_use_k32 = 0, gp_use_n512 = 0, gp_mma = 0;
+    if (r->gemm_profile) {
+        cuStreamSynchronize(r->stream);
+        clock_gettime(CLOCK_MONOTONIC, &gp_ts);
+        gp_t0 = gp_ts.tv_sec + gp_ts.tv_nsec * 1e-9;
+    }
+
+    if (r->use_cublas_gemm && r->cublas &&
+        da3_should_use_cublas_gemm(r, n_out, n_in, n_tok)) {
         int ok = -1;
         if (!r->cublas_need_f16_x) {
             ok = cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, Y, W_f16, X,
@@ -3126,14 +3245,64 @@ static void kl_gemm(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W_f16,
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
     if (r->use_mma_gemm && (n_in % 16) == 0) {
         unsigned gx = (unsigned)((n_out + 255) / 256);
-        unsigned gy = (unsigned)((n_tok + 15) / 16);
-        cuLaunchKernel(r->fn_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
-                       16 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+        int mtile = da3_custom_mma_gemm_mtile(r, n_out, n_in, n_tok);
+        gp_mma = 1;
+        gp_mtile = mtile;
+        if (mtile == 4) {
+            unsigned gy = (unsigned)((n_tok + 63) / 64);
+            int use_n512 = (r->mma_gemm_nout == 512 && n_out >= 512 &&
+                            !r->use_mma_gemm_ldx && !r->use_mma_gemm_smw);
+            gx = use_n512 ? (unsigned)((n_out + 511) / 512) : gx;
+            int use_k32 = (r->use_mma_gemm_k32 > 0) ||
+                          (r->use_mma_gemm_k32 < 0 && r->dim >= 1536);
+            gp_use_n512 = use_n512;
+            gp_use_k32 = use_k32 && (n_in % 32) == 0;
+            if (use_k32 && (n_in % 32) == 0) {
+                if (use_n512) {
+                    cuLaunchKernel(r->fn_gemm_f16_f32_mt4_k32_n512, gx, gy, 1, 256, 1, 1,
+                                   64 * 32 * (unsigned)sizeof(float), r->stream, args, NULL);
+                } else {
+                    cuLaunchKernel(r->fn_gemm_f16_f32_mt4_k32, gx, gy, 1, 128, 1, 1,
+                                   64 * 32 * (unsigned)sizeof(float), r->stream, args, NULL);
+                }
+            } else if (r->use_mma_gemm_smw) {
+                cuLaunchKernel(r->fn_gemm_f16_f32_mt4_smw, gx, gy, 1, 128, 1, 1,
+                               64 * 16 * (unsigned)sizeof(float) +
+                               256 * 16 * (unsigned)sizeof(uint16_t),
+                               r->stream, args, NULL);
+            } else if (r->use_mma_gemm_ldx) {
+                cuLaunchKernel(r->fn_gemm_f16_f32_mt4_ldx, gx, gy, 1, 128, 1, 1,
+                               64 * 16 * (unsigned)sizeof(uint16_t), r->stream, args, NULL);
+            } else if (use_n512) {
+                cuLaunchKernel(r->fn_gemm_f16_f32_mt4_n512, gx, gy, 1, 256, 1, 1,
+                               64 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+            } else {
+                cuLaunchKernel(r->fn_gemm_f16_f32_mt4, gx, gy, 1, 128, 1, 1,
+                               64 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+            }
+        } else if (mtile == 2) {
+            unsigned gy = (unsigned)((n_tok + 31) / 32);
+            cuLaunchKernel(r->fn_gemm_f16_f32_mt2, gx, gy, 1, 128, 1, 1,
+                           32 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+        } else {
+            unsigned gy = (unsigned)((n_tok + 15) / 16);
+            cuLaunchKernel(r->fn_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
+                           16 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+        }
     } else {
         unsigned gx = (unsigned)((n_out + 63) / 64);
         unsigned gy = (unsigned)((n_tok + 15) / 16);
         cuLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
+    }
+    if (r->gemm_profile) {
+        cuStreamSynchronize(r->stream);
+        clock_gettime(CLOCK_MONOTONIC, &gp_ts);
+        double gp_t1 = gp_ts.tv_sec + gp_ts.tv_nsec * 1e-9;
+        fprintf(stderr,
+                "GEMM_PROFILE n_out=%d n_in=%d n_tok=%d bias=%d mma=%d mtile=%d k32=%d n512=%d ms=%.4f\n",
+                n_out, n_in, n_tok, bias ? 1 : 0, gp_mma, gp_mtile,
+                gp_use_k32, gp_use_n512, (gp_t1 - gp_t0) * 1000.0);
     }
 }
 
@@ -3425,6 +3594,14 @@ static void kl_deconv_gemm_scatter(cuda_da3_runner *r, CUdeviceptr dst,
 
 static void kl_bilinear(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
                            int C, int Hi, int Wi, int Ho, int Wo) {
+    if (r->use_bilinear2 && C == 2) {
+        int hw = Ho * Wo;
+        int grid = (hw + 255) / 256;
+        void *args[] = {&dst, &src, &Hi, &Wi, &Ho, &Wo};
+        cuLaunchKernel(r->fn_bilinear_upsample2_f32, (unsigned)grid, 1, 1, 256, 1, 1,
+                       0, r->stream, args, NULL);
+        return;
+    }
     int total = C * Ho * Wo;
     int grid = (total + 255) / 256;
     void *args[] = {&dst, &src, &C, &Hi, &Wi, &Ho, &Wo};
@@ -4035,8 +4212,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
 
     int stride_3dim = 3 * dim; /* stride for Q/K in interleaved QKV buffer */
 
-    /* Per-kernel-type profiling (verbose >= 2) */
-    int do_prof = (r->verbose >= 2);
+    /* Per-kernel-type profiling. DA3_PROFILE avoids verbose debug dumps. */
+    int do_prof = (r->profile || r->verbose >= 2);
     double prof_ln = 0, prof_gemm = 0, prof_bias = 0, prof_qknorm = 0;
     double prof_rope = 0, prof_attn = 0, prof_act = 0, prof_ls = 0, prof_feat = 0;
     double pt0 = 0.0, pt1;
@@ -4077,6 +4254,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         kl_backbone_gemm(r, r->d_qkv, ly->attn_qkv_w, r->d_ln_buf, ly->attn_qkv_b,
                  ly->qkv_rows, ly->qkv_cols, nt, ly->attn_qkv_w_scale, ly->attn_qkv_w_scale_d);
         PROF_END(prof_gemm);
+
+        CUdeviceptr K_t = r->d_ffn_buf;
+        CUdeviceptr V_t = r->d_ffn_buf + (size_t)nt * dim * sizeof(float);
 
         /* 3. QK Normalization (stride=3*dim for interleaved QKV) */
         if (L >= r->qk_norm_start && ly->has_qk_norm) {
@@ -4207,8 +4387,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
 
         /* 5a. Transpose K,V to contiguous per-head layout (reuse d_ffn_buf) */
         {
-            CUdeviceptr K_t = r->d_ffn_buf;
-            CUdeviceptr V_t = r->d_ffn_buf + (size_t)nt * dim * sizeof(float);
             kl_kv_transpose(r, K_t, V_t, r->d_qkv, nt, dim, r->n_heads, r->head_dim);
 
             /* 5b. Multi-head attention (full sequence) */
@@ -4518,9 +4696,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         kl_gemm(r, r->d_dpt_proj, dw->proj_w[fi], r->d_dpt_ln, dw->proj_b[fi],
                  oc_val, head_dim_in, np);
 
-        /* 3b. DPT pos_embed (sinusoidal UV, ratio=0.1) in token-major layout */
+        /* 4. Official DualDPT per-stage UV pos_embed before spatial resize. */
         {
-            float aspect = (float)r->image_size / (float)r->image_size; /* 1.0 for square */
+            float aspect = (float)gw / (float)gh;
             float ratio = 0.1f;
             int total = np * oc_val;
             int grid = (total + 255) / 256;
@@ -4529,7 +4707,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                            0, r->stream, args, NULL);
         }
 
-        /* 4-5. Spatial alignment + reshape */
+        /* 5. Spatial alignment + reshape */
         if (fi == 0) {
             /* GEMM-based ConvTranspose2d 4x4 stride 4 (skip tok_to_chw) */
             /* d_dpt_proj[np,oc_val] is already token-major = [Hi*Wi, Ci] */
@@ -4587,20 +4765,22 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                   sp_h[1], sp_w[1]);
     fh = sp_h[1]; fw = sp_w[1];
 
-    /* Level 0 stays at fusion resolution. The PyTorch reference applies the
-     * output convolutions at path1 resolution and upsamples only final logits. */
+    /* Level 0 uses FeatureFusionBlock's default scale_factor=2. The official
+     * DA3 head then upsamples the neck output to the model resolution before
+     * adding UV position embedding and applying output_conv2. */
     gpu_refinenet(r, 0, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
                   r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
-                  sp_h[0], sp_w[0]);
-    fh = sp_h[0]; fw = sp_w[0];  /* 148×148 for DA3-Small */
+                  0, 0);
+    fh = sp_h[0] * 2; fw = sp_w[0] * 2;  /* 296×296 for DA3-Small */
     DPT_PROF_END(dpt_refine);
 
-    /* Output convolutions at fusion resolution:
+    /* Official DA3 output path:
      * 1. output_conv1 (neck): Conv2d(feat→feat/2, 3x3)
-     * 2. Sinusoidal UV pos_embed (ratio=0.1)
-     * 3. output_conv2: Conv2d(feat/2→out_mid, 3x3) + ReLU + Conv2d(out_mid→2, 1x1)
-     * 4. depth_activation: exp(depth), exp(conf)+1
-     * 5. Bilinear upsample final depth/confidence to original resolution
+     * 2. Bilinear upsample neck to model resolution (518×518 for Small)
+     * 3. Sinusoidal UV pos_embed (ratio=0.1)
+     * 4. output_conv2: Conv2d(feat/2→out_mid, 3x3) + ReLU + Conv2d(out_mid→2, 1x1)
+     * 5. depth_activation: exp(depth), exp(conf)+1
+     * 6. Bilinear upsample final depth/confidence to original resolution
      */
     DPT_PROF_START();
     int feat_half = feat / 2;
@@ -4611,32 +4791,37 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                   dw->neck_w, dw->neck_b,
                   fh, fw, feat, feat_half, 3, 3, 1, 1);
 
-    /* Step 2: DPT positional embedding (sinusoidal UV, ratio=0.1) */
+    /* Step 2: upsample neck to model resolution. */
+    int full_h = r->image_size, full_w = r->image_size;
+    kl_bilinear(r, r->d_dpt_fullres1, r->d_dpt_tmp,
+                feat_half, fh, fw, full_h, full_w);
+
+    /* Step 3: DPT positional embedding (sinusoidal UV, ratio=0.1) */
     {
-        float aspect = (float)fw / (float)fh;
+        float aspect = (float)full_w / (float)full_h;
         float ratio = 0.1f;
-        int total = feat_half * fh * fw;
+        int total = feat_half * full_h * full_w;
         int grid = (total + 255) / 256;
-        void *args[] = {&r->d_dpt_tmp, &feat_half, &fh, &fw, &aspect, &ratio};
+        void *args[] = {&r->d_dpt_fullres1, &feat_half, &full_h, &full_w, &aspect, &ratio};
         cuLaunchKernel(r->fn_dpt_pos_embed, (unsigned)grid, 1, 1, 256, 1, 1,
                        0, r->stream, args, NULL);
     }
 
-    /* Step 3: output_conv2 at fusion resolution */
+    /* Step 4: output_conv2 at model resolution */
     /* Conv2d(feat/2, out_mid, 3, pad=1) + ReLU */
-    kl_conv_gemm(r, r->d_dpt_tmp2, r->d_dpt_tmp,
+    kl_conv_gemm(r, r->d_dpt_fullres2, r->d_dpt_fullres1,
                   dw->out_0_w, dw->out_0_b,
-                  fh, fw, feat_half, out_mid, 3, 3, 1, 1);
-    kl_relu_inplace(r, r->d_dpt_tmp2, out_mid * fh * fw);
+                  full_h, full_w, feat_half, out_mid, 3, 3, 1, 1);
+    kl_relu_inplace(r, r->d_dpt_fullres2, out_mid * full_h * full_w);
 
     /* Conv2d(out_mid, 2, 1) */
-    kl_conv2d(r, r->d_dpt_out, r->d_dpt_tmp2,
+    kl_conv2d(r, r->d_dpt_out, r->d_dpt_fullres2,
                dw->out_2_w, dw->out_2_b,
-               fh, fw, out_mid, 2, 1, 1, 1, 0);
+               full_h, full_w, out_mid, 2, 1, 1, 1, 0);
 
-    /* Step 4: depth_activation: exp(depth), exp(confidence)+1 */
+    /* Step 5: depth_activation: exp(depth), exp(confidence)+1 */
     {
-        int hw = fh * fw;
+        int hw = full_h * full_w;
         int grid = (hw + 255) / 256;
         void *args[] = {&r->d_dpt_out, &hw};
         cuLaunchKernel(r->fn_depth_activation, (unsigned)grid, 1, 1, 256, 1, 1,
@@ -4655,7 +4840,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         }
         CUdeviceptr d_result = r->d_result;
 
-        kl_bilinear(r, d_result, r->d_dpt_out, 2, fh, fw, img_h, img_w);
+        kl_bilinear(r, d_result, r->d_dpt_out, 2, full_h, full_w, img_h, img_w);
 
         if (!graph_capture) {
             cuStreamSynchronize(r->stream);
