@@ -31,6 +31,11 @@ ifeq ($(CC),fcc)
     BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
     ASMC         := fcc
+else ifeq ($(CC),fccpx)
+    BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
+    BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
+    OMP_FLAG     := -fopenmp
+    ASMC         := fccpx
 else ifeq ($(CC),gcc)
     BASE_CFLAGS  := -O3 -march=armv8.2-a+sve -ffp-contract=fast
     BASE_CFLAGS  += -Wall -Wno-unused-function -Wno-unused-variable

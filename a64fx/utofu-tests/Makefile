@@ -16,7 +16,7 @@ MPICC     = mpiclang
 MPICFLAGS = -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall
 TOFU      = -ltofucom
 
-all: tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench
+all: tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth
 
 # helper uses MPI + uTofu
 tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
@@ -58,6 +58,19 @@ pp_handoff_bench: pp_handoff_bench.c tofu_demo.h
 p2p_latbw_bench: p2p_latbw_bench.c tofu_demo.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
 
+# sum-all-reduce primitive (recursive doubling) correctness + latency: NO MPI
+tp_allreduce_test: tp_allreduce_test.c tofu_demo.h tp_allreduce.h
+	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
+
+# communication-only EP prefill roofline: allreduce and synthetic token dispatch, NO MPI
+ep_prefill_synth: ep_prefill_synth.c tofu_demo.h tp_allreduce.h
+	$(CC) $(CFLAGS) -o $@ $< $(TOFU) -lm
+
+# pure HBM bandwidth + measured-comm floor for MoE EP decode (no gemm): OpenMP, libnuma, NO MPI
+# comm term is folded in from tp_allreduce_test (run that separately under mpiexec)
+ep_bw_bench: ep_bw_bench.c
+	$(CC) $(CFLAGS) -fopenmp -o $@ $< -lm -lnuma
+
 # ring-attention comm/compute OVERLAP validation (real math): NO MPI, OpenMP
 ring_attn_overlap: ring_attn_overlap.c tofu_demo.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(TOFU)
@@ -67,6 +80,6 @@ ring_attn_async: ring_attn_async.c tofu_demo.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(TOFU) -lhwb
 
 clean:
-	rm -f tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench tofu_topo.txt
+	rm -f tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth tofu_topo.txt
 
 .PHONY: all clean
