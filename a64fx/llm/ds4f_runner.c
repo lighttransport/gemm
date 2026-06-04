@@ -111,8 +111,18 @@ int main(void) {
     printf("arena reservation: %.2f GB   dense=%s\n", arena_est / (1024.0*1024.0*1024.0), dlabel);
     fflush(stdout);
 
+    /* DS4F_REAL=1: load REAL weights from each node's staged blob (see
+     * run_ds4f_stage_11n.sh) instead of the synthetic fill. blob_dir defaults to
+     * DS4F_STAGE_DIR else /local/ds4f inside ds4f_load_real. The loader forces
+     * dense=FP8 on-demand (ignores the DS4F_FP8_BF16/DENSE_MXFP4 dense knobs;
+     * they only describe the synthetic fill). */
+    int real_weights = envi("DS4F_REAL", 0);
+    const char *blob_dir = getenv("DS4F_STAGE_DIR");
     double t_alloc0 = now_sec();
-    ds4f_model *m = ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    ds4f_model *m = real_weights
+        ? ds4f_load_real(cfg, ep_rank, ep_size, blob_dir, n_threads, n_cmgs)
+        : ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    if (!m) { fprintf(stderr, "model alloc/load failed\n"); return 1; }
     double t_alloc = now_sec() - t_alloc0;
     size_t rss = rss_bytes();
     printf("alloc+first-touch: %.2f s   arena_used=%.2f GB   RSS=%.2f GB\n",

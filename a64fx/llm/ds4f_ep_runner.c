@@ -213,9 +213,18 @@ int main(void) {
                dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)",
                n_threads, prefill, maxgen, maxpos, arena_est/(1024.0*1024.0*1024.0));
 
-    /* ---- allocate this rank's synthetic shard (owned experts + replicated dense) ---- */
+    /* ---- allocate this rank's shard (owned experts + replicated dense) ----
+     * DS4F_REAL=1: load REAL staged weights for THIS rank (rank<MyRank>.blob in
+     * DS4F_STAGE_DIR, else /local/ds4f) — the stager's PMIX_RANK pins the same
+     * physical node the topo assigns EP rank MyRank, so the blob rank matches.
+     * Else synthetic fill. Loader forces dense=FP8 (ignores the synth dense knobs). */
+    int real_weights = envi("DS4F_REAL", 0);
+    const char *blob_dir = getenv("DS4F_STAGE_DIR");
     double ta0 = now_sec();
-    ds4f_model *m = ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    ds4f_model *m = real_weights
+        ? ds4f_load_real(cfg, ep_rank, ep_size, blob_dir, n_threads, n_cmgs)
+        : ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    if (!m) { fprintf(stderr, "rank %d: model alloc/load failed\n", MyRank); exit(1); }
     double ta1 = now_sec();
     {   char tn[64]; snprintf(tn, sizeof tn, "ds4f_ep_load_rank%02d.txt", MyRank);
         FILE *tf = fopen(tn, "w");
