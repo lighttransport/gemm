@@ -133,6 +133,16 @@ int main(void) {
         printf("sparse indexer: ON  topk=%d index_dim=%d  (%d/%d layers sparse; dense when nP<=topk)\n",
                cfg.index_topk, cfg.index_head_dim, nsp, cfg.n_layers);
     }
+    if (m->tierb2) {
+        int ncsa = 0, nhca = 0;
+        for (int L = 0; L < cfg.n_layers; L++) {
+            if (cfg.compress_ratios[L] == 4) ncsa++;
+            else if (cfg.compress_ratios[L]) nhca++;
+        }
+        printf("Tier-B2: ON (exact forced)  index_topk=%d index_dim=%d index_heads=%d  "
+               "(%d CSA + %d HCA layers; compressed-KV folded into window softmax)\n",
+               cfg.index_topk, cfg.index_head_dim, cfg.index_n_heads, ncsa, nhca);
+    }
     fflush(stdout);
 
     int C = cfg.hidden;

@@ -86,6 +86,7 @@ typedef struct {
      * over them -> O(topk) instead of O(nP) at long context. */
     int index_topk;     /* 512 */
     int index_head_dim; /* 128 */
+    int index_n_heads;  /* 64  (Tier-B2 indexer scoring heads) */
     int compress_ratios[64];  /* per-layer; [0..n_layers), 0 = dense */
     /* exact forward math (DS4F_EXACT; the synthetic stand-ins ignore these) */
     int o_lora;             /* 1024 (o_lora_rank; o_inter = o_groups*o_lora) */
@@ -112,7 +113,7 @@ static inline ds4f_config ds4f_default_config(void) {
     c.routed_scale = 1.5f; c.max_pos = 4096;
     c.hc_mult = 4; c.hc_iters = 20; c.hc_eps = 1e-6f; c.norm_eps = 1e-6f;
     /* lightning indexer (matches DeepSeek-V4-Flash config.json) */
-    c.index_topk = 512; c.index_head_dim = 128;
+    c.index_topk = 512; c.index_head_dim = 128; c.index_n_heads = 64;
     /* exact-forward hyperparameters (config.json) */
     c.o_lora = c.o_inter / c.o_groups;   /* 1024 */
     c.window_size = 128; c.n_hash_layers = 3; c.swiglu_limit = 10.0f;
@@ -185,6 +186,24 @@ typedef struct {
     float *hc_attn_scale, *hc_ffn_scale; /* [3] */
     /* per-layer KV cache: [max_pos, kv_lora] F32 (latent, 1 kv head) */
     float *kv_cache;
+    /* ---- Tier-B2 (DS4F_TIERB2; off-arena, only on ratio!=0 layers) ----
+     * The stateful compressor/indexer long-range compressed-KV term that Tier-B1
+     * omits. The decode kernels (ds4f_compress_step/ds4f_index_step) take plain
+     * float weights, so these are dequantized at fill/load time (synth: junk-fill;
+     * real: bf16/f32/fp8 -> f32). All NULL unless m->tierb2 && compress_ratio!=0. */
+    float    *cmp_wkv, *cmp_wgate;   /* layer compressor (rotate=0): [coff*kv_lora, hidden] */
+    float    *cmp_ape;               /* [compress_ratio, coff*kv_lora] */
+    uint16_t *cmp_norm;              /* [kv_lora] bf16 */
+    float    *cmp_kv_state, *cmp_score_state;  /* [coff*ratio, coff*kv_lora] ring state */
+    float    *cmp_kv;                /* [max_pos/ratio, kv_lora] compressed latents */
+    /* indexer (CSA layers, compress_ratio==4 only) */
+    float    *idx_wq_b;              /* [index_n_heads*index_head_dim, q_lora] */
+    float    *idx_wproj;             /* [index_n_heads, hidden] */
+    float    *idx_cmp_wkv, *idx_cmp_wgate;  /* indexer compressor (rotate=1): [coff*index_head_dim, hidden] */
+    float    *idx_cmp_ape;           /* [4, coff*index_head_dim] */
+    uint16_t *idx_cmp_norm;          /* [index_head_dim] bf16 */
+    float    *idx_cmp_kv_state, *idx_cmp_score_state;  /* [coff*4, coff*index_head_dim] */
+    float    *idx_kv;                /* [max_pos/ratio, index_head_dim] indexer compressed */
 } ds4f_layer;
 
 typedef struct ds4f_pool ds4f_pool;
@@ -251,6 +270,14 @@ typedef struct {
      * o-proj, sqrtsoftplus gate (bias-select/unbiased-weight), and swiglu clamp
      * are exact (validated vs pure-Python ref to 5e-8: ds4f_exact_test.c). */
     int exact;
+    /* Tier-B2 stateful sparse attention (DS4F_TIERB2): 0 = Tier-B1 (default, the
+     * sliding-window-only term; byte-identical). 1 = ALSO run the per-layer
+     * compressor/indexer and fold the long-range compressed-KV term into the same
+     * softmax (the omission #1 above). Implies exact (reuses q-norm/RoPE/window).
+     * Off OR on a dense layer (ratio==0) == exact path, byte-identical. The decode
+     * kernels are bit-validated (ds4f_tierb2_test.c); here they are wired stateful
+     * token-at-a-time. Set via DS4F_TIERB2=1. */
+    int tierb2;
     /* RoPE freqs tables (only built when exact): cos/sin[pos*half + k],
      * half = qk_rope_dim/2. Two configs: dense (theta, no YaRN) + comp (YaRN). */
     float *rope_dense_cos, *rope_dense_sin;
@@ -270,6 +297,10 @@ typedef struct {
     /* sparse-indexer per-thread scratch: block scores [n_threads * idx_blk_stride]
      * and selected positions [n_threads * index_topk]. Only used when m->sparse. */
     float *s_idx_scores; int *s_idx_sel; int idx_blk_stride;
+    /* Tier-B2 per-token scratch (off-arena, only when m->tierb2): compressor output
+     * [kv_lora], indexer q [index_n_heads*index_head_dim] + score [max_pos/4],
+     * selected LOCAL compressed indices [max_pos/4] + their count for this layer. */
+    float *s_cmp_out, *s_idx_q, *s_idx_score; int *s_tb2_sel; int s_tb2_nsel;
     /* EP combine hook: if set, called once per layer on the routed-expert partial
      * [hidden] to sum it across the expert-parallel group (Stage 2 = tp_allreduce_sum).
      * Shared expert stays replicated (added locally). NULL => single-node (all owned). */
@@ -802,6 +833,158 @@ static void ds4f_index_topk(const float *score, int T, int thr, int k, int offse
     for (int n = 0; n < k; n++) sel[n] = (n < npick) ? (chosen[n] + offset) : -1;
 }
 
+/* ===================== Tier-B2 stateful decode =====================
+ * The token-at-a-time forward (ds4f_forward_token) runs the INCREMENTAL compressor:
+ * pos==0 is the seqlen==1 special case of model.py Compressor's start_pos==0 branch
+ * (seeds the ring state, no compressed token), pos>=1 is the start_pos>0 decode branch.
+ * The kv_state/score_state ring buffers persist across calls (one set per compressor).
+ * Validated bit-exact vs the incremental ref in tools/ds4f_tierb2_ref.py — the same
+ * compressed tokens the batched ds4f_compress_prefill would emit, produced one at a time.
+ *
+ * State shapes (model.py Compressor.__init__): kv_state[coff*ratio, W], score_state same,
+ * W = coff*head_dim, coff = 1+overlap, overlap = (ratio==4). overlap: rows [0,ratio) hold
+ * the previous (overlapping) window, [ratio,2ratio) the current; non-overlap: rows [0,ratio).
+ * reset = kv_state 0, score_state -1e30 (= model.py's -inf for the softmax: exp(-1e30-mx)->0). */
+static inline void ds4f_compress_state_reset(float *kv_state, float *score_state, int ratio, int d) {
+    int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff * d, rows = coff * ratio;
+    for (size_t i = 0; i < (size_t)rows * W; i++) { kv_state[i] = 0.f; score_state[i] = -1e30f; }
+}
+
+/* One incremental compressor step for the current token x[dim] at absolute `start_pos`.
+ * Updates kv_state/score_state in place; on a compress boundary fills out[d] with the new
+ * compressed latent (RMSNorm + RoPE @ first-token-of-block + optional rotate/fp4) and
+ * returns 1; otherwise returns 0 (out untouched). Mirrors model.py Compressor.forward
+ * seqlen==1: start_pos==0 seeds, start_pos>0 decodes. rotate=1 => indexer compressor. */
+static int ds4f_compress_step(
+    const float *x, int dim, int d, int rd, int ratio, int start_pos,
+    const float *wkv, const float *wgate, const float *ape, const uint16_t *norm_w,
+    const float *rcos, const float *rsin, float eps, int rotate,
+    float *kv_state, float *score_state, float *out)
+{
+    int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff * d;
+    float *kv = (float *)alloca((size_t)W * 4), *score = (float *)alloca((size_t)W * 4);
+    for (int o = 0; o < W; o++) {                            /* wkv/wgate linear */
+        const float *wk = wkv + (size_t)o * dim, *wg = wgate + (size_t)o * dim;
+        float a = 0.f, b = 0.f;
+        for (int i = 0; i < dim; i++) { a += wk[i] * x[i]; b += wg[i] * x[i]; }
+        kv[o] = a; score[o] = b;
+    }
+    if (start_pos == 0) {                                    /* seqlen==1 seed (no compress) */
+        int offset = overlap ? ratio : 0;                   /* remainder=1 slot */
+        for (int o = 0; o < W; o++) {
+            kv_state[(size_t)offset * W + o] = kv[o];
+            score_state[(size_t)offset * W + o] = score[o] + ape[o];   /* + ape[0] */
+        }
+        return 0;
+    }
+    int should = ((start_pos + 1) % ratio) == 0;
+    int apr = start_pos % ratio;
+    for (int o = 0; o < W; o++) score[o] += ape[(size_t)apr * W + o];  /* score += ape[start_pos%ratio] */
+    int P = overlap ? 2 * ratio : ratio;
+    float *ksub = (float *)alloca((size_t)P * 4), *ssub = (float *)alloca((size_t)P * 4);
+    if (overlap) {
+        int slot = ratio + apr;
+        for (int o = 0; o < W; o++) { kv_state[(size_t)slot*W+o] = kv[o]; score_state[(size_t)slot*W+o] = score[o]; }
+        if (should) {
+            for (int e = 0; e < d; e++) {                   /* cat([:ratio,:d],[ratio:,d:]) over rows, per col e */
+                for (int p = 0; p < ratio; p++) { ksub[p] = kv_state[(size_t)p*W+e];       ssub[p] = score_state[(size_t)p*W+e]; }
+                for (int p = 0; p < ratio; p++) { ksub[ratio+p] = kv_state[(size_t)(ratio+p)*W+d+e]; ssub[ratio+p] = score_state[(size_t)(ratio+p)*W+d+e]; }
+                float mx = -1e30f; for (int p = 0; p < P; p++) if (ssub[p] > mx) mx = ssub[p];
+                float den = 0.f; for (int p = 0; p < P; p++) { float ex = expf(ssub[p]-mx); ssub[p] = ex; den += ex; }
+                float acc = 0.f; for (int p = 0; p < P; p++) acc += ksub[p] * (ssub[p]/den);
+                out[e] = acc;
+            }
+            for (int p = 0; p < ratio; p++)                 /* shift current window -> overlap window */
+                for (int o = 0; o < W; o++) {
+                    kv_state[(size_t)p*W+o] = kv_state[(size_t)(ratio+p)*W+o];
+                    score_state[(size_t)p*W+o] = score_state[(size_t)(ratio+p)*W+o];
+                }
+        }
+    } else {
+        int slot = apr;
+        for (int o = 0; o < W; o++) { kv_state[(size_t)slot*W+o] = kv[o]; score_state[(size_t)slot*W+o] = score[o]; }
+        if (should) {
+            for (int e = 0; e < d; e++) {                   /* W==d; softmax over ratio rows */
+                for (int p = 0; p < ratio; p++) { ksub[p] = kv_state[(size_t)p*W+e]; ssub[p] = score_state[(size_t)p*W+e]; }
+                float mx = -1e30f; for (int p = 0; p < P; p++) if (ssub[p] > mx) mx = ssub[p];
+                float den = 0.f; for (int p = 0; p < P; p++) { float ex = expf(ssub[p]-mx); ssub[p] = ex; den += ex; }
+                float acc = 0.f; for (int p = 0; p < P; p++) acc += ksub[p] * (ssub[p]/den);
+                out[e] = acc;
+            }
+        }
+    }
+    if (!should) return 0;
+    ds4f_rmsnorm(out, out, norm_w, d, eps);
+    ds4f_rope_apply(out + (d - rd), rcos, rsin, start_pos + 1 - ratio, rd / 2, 0);  /* first token of block */
+    if (rotate) { ds4f_rotate_activation(out, d); ds4f_fp4_act_quant_inplace(out, d, 32); }
+    return 1;
+}
+
+/* get_window_topk_idxs (decode, seqlen==1, start_pos>0): window-ring SLOT indices, newest
+ * window in chronological order, -1 for not-yet-filled. Always fills `window` columns. */
+static inline int ds4f_window_idx_decode(int window, int start_pos, int *row) {
+    if (start_pos >= window - 1) {
+        int sp = start_pos % window, c = 0;
+        for (int v = sp + 1; v < window; v++) row[c++] = v;
+        for (int v = 0; v <= sp; v++) row[c++] = v;
+    } else {
+        int c = 0;
+        for (int v = 0; v <= start_pos; v++) row[c++] = v;
+        for (; c < window; c++) row[c] = -1;
+    }
+    return window;
+}
+
+/* get_compress_topk_idxs (decode, seqlen==1, start_pos>0): arange(0,(start_pos+1)//ratio)+offset.
+ * Used by HCA(128) layers (no indexer). Returns the count n; fills row[0..n). */
+static inline int ds4f_compress_idx_decode(int ratio, int start_pos, int offset, int *row) {
+    int n = (start_pos + 1) / ratio;
+    for (int t = 0; t < n; t++) row[t] = t + offset;
+    return n;
+}
+
+/* Indexer decode step (model.py Indexer.forward, seqlen==1, start_pos>0): project q via wq_b,
+ * per-head RoPE(last rd)+rotate+fp4; step the OWN (rotate) compressor (fills idx_kv_cache);
+ * weights = weights_proj(x) * (hd^-0.5 * H^-0.5); index_score over idx_kv_cache[:end//ratio];
+ * select top-min(k,T) compressed positions (+offset). q_scr[H*hd], score_scr[>=T], sel[k]. */
+static int ds4f_index_step(
+    const float *x, int dim, const float *qr, int qlora,
+    int H, int hd, int rd, int ratio, int start_pos, int offset, int k,
+    const float *wq_b, const float *weights_proj,
+    const float *cwkv, const float *cwgate, const float *cape, const uint16_t *cnorm,
+    const float *rcos, const float *rsin, float eps,
+    float *comp_kv_state, float *comp_score_state, float *idx_kv_cache,
+    float *q_scr, float *score_scr, int *sel)
+{
+    int end_pos = start_pos + 1, half = rd / 2;
+    for (int o = 0; o < H * hd; o++) {                       /* q = wq_b(qr) */
+        const float *w = wq_b + (size_t)o * qlora; float a = 0.f;
+        for (int i = 0; i < qlora; i++) a += w[i] * qr[i];
+        q_scr[o] = a;
+    }
+    for (int h = 0; h < H; h++) {                            /* RoPE + rotate + fp4 per head */
+        float *qh = q_scr + (size_t)h * hd;
+        ds4f_rope_apply(qh + (hd - rd), rcos, rsin, start_pos, half, 0);
+        ds4f_rotate_activation(qh, hd);
+        ds4f_fp4_act_quant_inplace(qh, hd, 32);
+    }
+    float *comp_out = (float *)alloca((size_t)hd * 4);       /* own compressor (rotate=1) */
+    if (ds4f_compress_step(x, dim, hd, rd, ratio, start_pos, cwkv, cwgate, cape, cnorm,
+                           rcos, rsin, eps, 1, comp_kv_state, comp_score_state, comp_out))
+        memcpy(idx_kv_cache + (size_t)(start_pos / ratio) * hd, comp_out, (size_t)hd * 4);
+    float sm = (float)(1.0 / sqrt((double)hd)), wscale = sm * (float)(1.0 / sqrt((double)H));
+    float *weights = (float *)alloca((size_t)H * 4);
+    for (int h = 0; h < H; h++) {
+        const float *w = weights_proj + (size_t)h * dim; float a = 0.f;
+        for (int i = 0; i < dim; i++) a += w[i] * x[i];
+        weights[h] = a * wscale;
+    }
+    int T = end_pos / ratio;
+    ds4f_index_score(q_scr, idx_kv_cache, weights, H, hd, T, score_scr);
+    ds4f_index_topk(score_scr, T, T, k, offset, sel);        /* decode: no causal mask (thr=T) */
+    return T;
+}
+
 /* ===================== synthetic allocator ===================== */
 static inline int ds4f_n_owned(int n_experts, int ep_rank, int ep_size) {
     int c = 0; for (int e = 0; e < n_experts; e++) if (e % ep_size == ep_rank) c++; return c;
@@ -930,6 +1113,67 @@ static ds4f_tensor ds4f_new_tensor(ds4f_model *m, ds4f_qtype type, int rows, int
     return t;
 }
 
+/* Tier-B2 off-arena allocation (+ optional synth fill) of the per-layer compressor/
+ * indexer float weights, ring state, and compressed-KV caches. The decode kernels
+ * take plain float weights, so these live OUTSIDE the quantized arena (calloc) — and
+ * therefore do not perturb the arena bump offsets, so enabling Tier-B2 leaves every
+ * synthetic dense weight/scratch byte-identical (the off==on proof at ratio==0).
+ * fill!=0 => same deterministic F32/BF16 junk fill as the synth path (bounded by the
+ * in-kernel RMSNorm); fill==0 => zeroed, for ds4f_load_real to overwrite by name.
+ * Only ratio!=0 layers allocate; the indexer is CSA(ratio==4)-only. Gated by caller. */
+static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
+    ds4f_config *c = &m->cfg;
+    int C = c->hidden, KV = c->kv_lora, ihd = c->index_head_dim, iH = c->index_n_heads;
+    int qlora = c->q_lora, np = c->max_pos;
+    /* model-level per-token scratch (allocated once) */
+    m->s_cmp_out   = (float *)aligned_alloc(256, (size_t)KV*4);
+    m->s_idx_q     = (float *)aligned_alloc(256, (size_t)iH*ihd*4);
+    m->s_idx_score = (float *)aligned_alloc(256, (size_t)np*4);
+    m->s_tb2_sel   = (int   *)aligned_alloc(256, (size_t)np*4);
+    for (int L = 0; L < c->n_layers; L++) {
+        int ratio = c->compress_ratios[L];
+        if (ratio == 0) continue;
+        ds4f_layer *ly = &m->layers[L];
+        int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff*KV;
+        int nslot = np / ratio;
+        ly->cmp_wkv   = (float *)aligned_alloc(256, (size_t)W*C*4);
+        ly->cmp_wgate = (float *)aligned_alloc(256, (size_t)W*C*4);
+        ly->cmp_ape   = (float *)aligned_alloc(256, (size_t)ratio*W*4);
+        ly->cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)KV*2 + 63) & ~63u);
+        ly->cmp_kv_state    = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
+        ly->cmp_score_state = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
+        ly->cmp_kv = (float *)aligned_alloc(256, (size_t)nslot*KV*4);
+        ds4f_compress_state_reset(ly->cmp_kv_state, ly->cmp_score_state, ratio, KV);
+        if (fill) {
+            ds4f_tensor t1 = { ly->cmp_wkv,   NULL, DS4F_F32, W, C };       ds4f_fill(m, t1);
+            ds4f_tensor t2 = { ly->cmp_wgate, NULL, DS4F_F32, W, C };       ds4f_fill(m, t2);
+            ds4f_tensor t3 = { ly->cmp_ape,   NULL, DS4F_F32, ratio, W };   ds4f_fill(m, t3);
+            ds4f_tensor t4 = { ly->cmp_norm,  NULL, DS4F_BF16, 1, KV };     ds4f_fill(m, t4);
+        }
+        if (ratio == 4) {                                       /* indexer (CSA only) */
+            int icoff = 2, iW = icoff*ihd;                      /* index ratio==4 => overlap */
+            ly->idx_wq_b  = (float *)aligned_alloc(256, (size_t)iH*ihd*qlora*4);
+            ly->idx_wproj = (float *)aligned_alloc(256, (size_t)iH*C*4);
+            ly->idx_cmp_wkv   = (float *)aligned_alloc(256, (size_t)iW*C*4);
+            ly->idx_cmp_wgate = (float *)aligned_alloc(256, (size_t)iW*C*4);
+            ly->idx_cmp_ape   = (float *)aligned_alloc(256, (size_t)ratio*iW*4);
+            ly->idx_cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)ihd*2 + 63) & ~63u);
+            ly->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
+            ly->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
+            ly->idx_kv = (float *)aligned_alloc(256, (size_t)nslot*ihd*4);
+            ds4f_compress_state_reset(ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ratio, ihd);
+            if (fill) {
+                ds4f_tensor u1 = { ly->idx_wq_b,      NULL, DS4F_F32, iH*ihd, qlora }; ds4f_fill(m, u1);
+                ds4f_tensor u2 = { ly->idx_wproj,     NULL, DS4F_F32, iH, C };         ds4f_fill(m, u2);
+                ds4f_tensor u3 = { ly->idx_cmp_wkv,   NULL, DS4F_F32, iW, C };         ds4f_fill(m, u3);
+                ds4f_tensor u4 = { ly->idx_cmp_wgate, NULL, DS4F_F32, iW, C };         ds4f_fill(m, u4);
+                ds4f_tensor u5 = { ly->idx_cmp_ape,   NULL, DS4F_F32, ratio, iW };     ds4f_fill(m, u5);
+                ds4f_tensor u6 = { ly->idx_cmp_norm,  NULL, DS4F_BF16, 1, ihd };       ds4f_fill(m, u6);
+            }
+        }
+    }
+}
+
 static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
                                     int n_threads, int n_cmgs) {
     ds4f_model *m = (ds4f_model *)calloc(1, sizeof(*m));
@@ -963,6 +1207,9 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         m->mhc = (e && *e && atoi(e)) ? 1 : 0; }
     {   const char *e = getenv("DS4F_EXACT");
         m->exact = (e && *e && atoi(e)) ? 1 : 0; }
+    {   const char *e = getenv("DS4F_TIERB2");
+        m->tierb2 = (e && *e && atoi(e)) ? 1 : 0; }
+    if (m->tierb2) m->exact = 1;   /* Tier-B2 reuses the exact q-norm/RoPE/window path */
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
     m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
@@ -1085,6 +1332,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     m->s_resid = (float *)aligned_alloc(256, (size_t)cfg.hc_mult*C*4);
     m->s_xc    = (float *)aligned_alloc(256, (size_t)C*4);
     ds4f_build_freqs(m);   /* RoPE/YaRN tables (only when exact) */
+    if (m->tierb2) ds4f_alloc_tb2(m, 1);   /* off-arena compressor/indexer (synth fill) */
     return m;
 }
 
@@ -1342,6 +1590,129 @@ static void ds4f_load_raw(ds4f_model *m, const ds4f_blob *B, void *dst,
     m->bytes_read += wb;
 }
 
+/* ---- Tier-B2 weight conversion: real bytes -> plain f32 (the compressor/indexer
+ * kernels consume float* weights + bf16 norms, so FP8/BF16 sources are widened at
+ * load time). Off-arena destinations; same blob-drop discipline as the dense path. */
+typedef struct { float *dst; const uint16_t *src; size_t n; } ds4f_bf16f32_task;
+static void ds4f_bf16f32_worker(void *arg, int tid, int nthr) {
+    ds4f_bf16f32_task *T = (ds4f_bf16f32_task *)arg;
+    size_t n = T->n, per = n / nthr; int ex = (int)(n % nthr);
+    size_t i0 = per * tid + (size_t)(tid < ex ? tid : ex);
+    size_t i1 = i0 + per + (tid < ex ? 1 : 0);
+    for (size_t i = i0; i < i1; i++) {
+        uint32_t b = (uint32_t)T->src[i] << 16;   /* bf16 -> f32: zero-extend mantissa */
+        memcpy(&T->dst[i], &b, 4);
+    }
+}
+static void ds4f_load_bf16_to_f32(ds4f_model *m, const ds4f_blob *B, float *dst,
+                                  const char *name, int rows, int cols) {
+    size_t wb = ds4f_wbytes(DS4F_BF16, rows, cols);
+    const ds4f_mani_ent *e = ds4f_need(B, name, "BF16", wb);
+    ds4f_bf16f32_task T = { dst, (const uint16_t *)(B->blob + e->off), (size_t)rows * cols };
+    ds4f_pool_run(m->pool, ds4f_bf16f32_worker, &T);
+    ds4f_blob_drop(B, e->off, wb);
+    m->bytes_read += wb;
+}
+
+/* dequant a real FP8 e4m3fn [rows,cols] tensor (+E8M0 128x128 block scale) -> f32.
+ * Mirrors matvec_fp8e4m3_8row EXACTLY: value = reinterpret(lut[byte]) * 2^(e-127),
+ * scale block = escale[(row/128)*sb_cols + col/128]. Plain row split (no 8-align). */
+typedef struct { float *dst; const uint8_t *w, *es; const uint32_t *lut;
+                 int rows, cols, sbc; } ds4f_fp8f32_task;
+static void ds4f_fp8f32_worker(void *arg, int tid, int nthr) {
+    ds4f_fp8f32_task *T = (ds4f_fp8f32_task *)arg;
+    int rows = T->rows, K = T->cols, sbc = T->sbc;
+    int per = rows / nthr, ex = rows % nthr;
+    int r0 = per * tid + (tid < ex ? tid : ex);
+    int r1 = r0 + per + (tid < ex ? 1 : 0);
+    for (int r = r0; r < r1; r++) {
+        const uint8_t *wr  = T->w  + (size_t)r * K;
+        const uint8_t *esr = T->es + (size_t)(r >> 7) * sbc;
+        float *dr = T->dst + (size_t)r * K;
+        for (int c = 0; c < K; c++) {
+            uint32_t bits = T->lut[wr[c]]; float v; memcpy(&v, &bits, 4);
+            dr[c] = v * ggml_e8m0_to_fp32(esr[c >> 7]);
+        }
+    }
+}
+static void ds4f_load_fp8_to_f32(ds4f_model *m, const ds4f_blob *B, float *dst,
+                                 const char *base, int rows, int cols) {
+    char wn[256], sn[256];
+    snprintf(wn, sizeof wn, "%s.weight", base);
+    snprintf(sn, sizeof sn, "%s.scale",  base);
+    size_t wb = ds4f_wbytes(DS4F_FP8, rows, cols), sb = ds4f_sbytes(DS4F_FP8, rows, cols);
+    const ds4f_mani_ent *we = ds4f_need(B, wn, "F8_E4M3", wb);
+    const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", sb);
+    ds4f_fp8f32_task T = { dst, B->blob + we->off, B->blob + se->off, m->fp8_lut,
+                           rows, cols, (cols + 127) / 128 };
+    ds4f_pool_run(m->pool, ds4f_fp8f32_worker, &T);
+    ds4f_blob_drop(B, we->off, wb);
+    ds4f_blob_drop(B, se->off, sb);
+    m->bytes_read += wb + sb;
+}
+
+/* ---- dense load-time PROMOTE: staged source (FP8 e4m3fn+E8M0, or BF16) -> arena
+ * dest m->dense_qt / m->bf16_mv_qt (FP8 | BF16 | BF16_PV). FP8->BF16 is EXACT (e4m3's
+ * 3-bit mantissa * 2^k block scale fits bf16's 7-bit mantissa with no rounding), so
+ * the pv promote changes ONLY speed, not output. Same-dtype falls back to the direct
+ * ds4f_load_q copy => default (no promote knob) is byte-identical to the FP8 path. */
+typedef struct { ds4f_tensor t; const uint8_t *src_w, *src_s; const uint32_t *lut; int src_fp8; } ds4f_promote_task;
+static void ds4f_promote_worker(void *arg, int tid, int nthr) {
+    ds4f_promote_task *T = (ds4f_promote_task *)arg; ds4f_tensor *t = &T->t;
+    int rows = t->rows, K = t->cols, sbc = (K + 127) / 128;
+    int r0, r1; ds4f_rowsplit8(rows, nthr, tid, &r0, &r1);   /* 8-aligned -> pv groups intact */
+    for (int i = r0; i < r1; i++) {
+        const uint8_t  *fw = T->src_fp8 ? T->src_w + (size_t)i * K : NULL;
+        const uint16_t *bw = T->src_fp8 ? NULL : (const uint16_t *)T->src_w + (size_t)i * K;
+        const uint8_t  *es = T->src_fp8 ? T->src_s + (size_t)(i >> 7) * sbc : NULL;
+        uint16_t *d; int slot = 0;
+        if (t->type == DS4F_BF16_PV) {                       /* pair-interleaved address */
+            int local = i & 7, pair = local >> 1; slot = local & 1;
+            d = (uint16_t *)t->w + (size_t)(i / 8) * 8 * K + (size_t)pair * 2 * K;
+        } else {                                             /* plain BF16 row */
+            d = (uint16_t *)t->w + (size_t)i * K; slot = 0;
+        }
+        int step = (t->type == DS4F_BF16_PV) ? 2 : 1;
+        for (int j = 0; j < K; j++) {
+            uint16_t hv;
+            if (T->src_fp8) {
+                uint32_t bits = T->lut[fw[j]]; float v; memcpy(&v, &bits, 4);
+                hv = ds4f_f32_bf16(v * ggml_e8m0_to_fp32(es[j >> 7]));
+            } else hv = bw[j];                               /* bf16 -> bf16 (exact relayout) */
+            d[step * j + slot] = hv;
+        }
+    }
+}
+static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst, const char *base) {
+    char wn[256];
+    snprintf(wn, sizeof wn, "%s.weight", base);
+    const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
+    if (!we) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", wn); abort(); }
+    int rows = dst->rows, K = dst->cols;
+    int src_fp8 = (strcmp(we->dtype, "F8_E4M3") == 0), src_bf16 = (strcmp(we->dtype, "BF16") == 0);
+    if (!src_fp8 && !src_bf16) { fprintf(stderr, "ds4f_load_dense: '%s' src dtype %s unsupported\n", wn, we->dtype); abort(); }
+    if ((src_fp8 && dst->type == DS4F_FP8) || (src_bf16 && dst->type == DS4F_BF16)) {
+        ds4f_load_q(m, B, dst, base); return;                /* no promote: direct copy */
+    }
+    if (dst->type != DS4F_BF16 && dst->type != DS4F_BF16_PV) {
+        fprintf(stderr, "ds4f_load_dense: '%s' dest dtype %d unsupported "
+                        "(real MXFP4 dense promote is lossy/NYI; use DS4F_FP8_BF16=1)\n", wn, dst->type); abort(); }
+    size_t wb = src_fp8 ? ds4f_wbytes(DS4F_FP8, rows, K) : ds4f_wbytes(DS4F_BF16, rows, K);
+    if (we->nbytes != wb) { fprintf(stderr, "ds4f_load_dense: '%s' nbytes %llu != %zu\n", wn, (unsigned long long)we->nbytes, wb); abort(); }
+    const uint8_t *sw = B->blob + we->off, *ss = NULL; size_t sb = 0;
+    if (src_fp8) {
+        char sn[256]; snprintf(sn, sizeof sn, "%s.scale", base);
+        sb = ds4f_sbytes(DS4F_FP8, rows, K);
+        const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", sb);
+        ss = B->blob + se->off;
+    }
+    ds4f_promote_task T = { *dst, sw, ss, m->fp8_lut, src_fp8 };
+    ds4f_pool_run(m->pool, ds4f_promote_worker, &T);
+    ds4f_blob_drop(B, we->off, wb);
+    if (ss) ds4f_blob_drop(B, (uint64_t)(ss - B->blob), sb);
+    m->bytes_read += wb + sb;
+}
+
 static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
                                   const char *blob_dir, int n_threads, int n_cmgs) {
     double t0 = ds4f_wall();
@@ -1365,18 +1736,29 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     ds4f_model *m = (ds4f_model *)calloc(1, sizeof(*m));
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
-    /* real dtypes: dense = FP8(e4m3fn), experts = MXFP4, router/head/embed/norm =
-     * BF16 row-major. The synth requant knobs (DS4F_FP8_BF16/DENSE_MXFP4/BF16_PV)
-     * do NOT apply to real bytes; forward-only knobs (sparse/mhc/fp8_magic) do. */
+    /* real dtypes: staged dense = FP8(e4m3fn), experts = MXFP4, router/head/embed/
+     * norm = BF16 row-major. DS4F_FP8_BF16=1 PROMOTES the replicated dense FP8->bf16
+     * at load time (EXACT: e4m3 fits bf16) and auto-enables the pv pair-interleaved
+     * layout -> ~1.7x faster matvecs at +~6 GB; DS4F_BF16_PV=0 forces plain bf16, =1
+     * forces pv. Mirrors ds4f_alloc_synth's knobs. (DENSE_MXFP4 dense is lossy from
+     * real FP8 => NYI; the loader aborts if requested.) */
     ds4f_init_fp8_e4m3fn_lut(m->fp8_lut);
-    m->dense_qt = DS4F_FP8; m->bf16_pv = 0; m->bf16_mv_qt = DS4F_BF16;
+    {   const char *e = getenv("DS4F_FP8_BF16");
+        int pre = (e && *e && atoi(e)) ? 1 : 0;
+        const char *p = getenv("DS4F_BF16_PV");
+        m->bf16_pv = (p && *p) ? (atoi(p) ? 1 : 0) : pre;
+        m->dense_qt = pre ? (m->bf16_pv ? DS4F_BF16_PV : DS4F_BF16) : DS4F_FP8;
+        m->bf16_mv_qt = m->bf16_pv ? DS4F_BF16_PV : DS4F_BF16; }
     { const char *e = getenv("DS4F_FP8_MAGIC"); m->fp8_magic = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_SPARSE");    m->sparse    = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_MHC");       m->mhc       = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_EXACT");     m->exact     = (e && *e && atoi(e)) ? 1 : 0; }
+    { const char *e = getenv("DS4F_TIERB2");    m->tierb2    = (e && *e && atoi(e)) ? 1 : 0; }
+    if (m->tierb2) m->exact = 1;   /* Tier-B2 reuses the exact q-norm/RoPE/window path */
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
-    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size, 0 /* FP8 dense */);
+    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
+                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (m->arena == MAP_FAILED) { fprintf(stderr, "ds4f_load_real: arena mmap %zu failed\n", m->arena_sz); abort(); }
@@ -1389,7 +1771,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     /* ---- allocate (bump order MIRRORS ds4f_alloc_synth exactly) ---- */
     m->out_norm = (uint16_t *)ds4f_bump(m, (size_t)C * 2, 64);
     ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w;
-    m->head = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C);
+    m->head = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.vocab, C);   /* matvec'd -> pv when promoted */
     {   int hc = cfg.hc_mult, hd = hc * C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc * hd * 4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc * 4, 64);
@@ -1403,19 +1785,20 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->ffn_norm  = (uint16_t *)ds4f_bump(m, (size_t)C * 2, 64);
         ly->q_norm    = (uint16_t *)ds4f_bump(m, (size_t)cfg.q_lora * 2, 64);
         ly->kv_norm   = (uint16_t *)ds4f_bump(m, (size_t)cfg.kv_lora * 2, 64);
-        ly->wq_a = ds4f_new_tensor(m, DS4F_FP8, cfg.q_lora, C);
-        ly->wq_b = ds4f_new_tensor(m, DS4F_FP8, cfg.n_heads * cfg.q_head_dim, cfg.q_lora);
-        ly->wkv  = ds4f_new_tensor(m, DS4F_FP8, cfg.kv_lora, C);
-        ly->wo_a = ds4f_new_tensor(m, DS4F_FP8, cfg.o_inter, C);
-        ly->wo_b = ds4f_new_tensor(m, DS4F_FP8, C, cfg.o_inter);
+        ds4f_qtype dq = m->dense_qt;                            /* FP8 | BF16 | BF16_PV */
+        ly->wq_a = ds4f_new_tensor(m, dq, cfg.q_lora, C);
+        ly->wq_b = ds4f_new_tensor(m, dq, cfg.n_heads * cfg.q_head_dim, cfg.q_lora);
+        ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
+        ly->wo_a = ds4f_new_tensor(m, dq, cfg.o_inter, C);
+        ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads * 4, 64);
-        ly->gate = ds4f_new_tensor(m, DS4F_BF16, cfg.n_experts, C);
+        ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv */
         /* router selection bias (F32[n_experts]); only non-hash layers have it.
          * Off-arena (tiny, read single-threaded in the exact gate, not a matvec). */
         if (L >= cfg.n_hash_layers) ly->gate_bias = (float *)aligned_alloc(64, (size_t)cfg.n_experts * 4);
-        ly->sh_w1 = ds4f_new_tensor(m, DS4F_FP8, cfg.shared_inter, C);
-        ly->sh_w3 = ds4f_new_tensor(m, DS4F_FP8, cfg.shared_inter, C);
-        ly->sh_w2 = ds4f_new_tensor(m, DS4F_FP8, C, cfg.shared_inter);
+        ly->sh_w1 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
+        ly->sh_w3 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
+        ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter);
         ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
@@ -1437,12 +1820,13 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3 * 4, 64); }
         ly->kv_cache = (float *)ds4f_bump(m, (size_t)cfg.max_pos * cfg.kv_lora * 4, 256);
     }
+    if (m->tierb2) ds4f_alloc_tb2(m, 0);   /* off-arena compressor/indexer (load by name below) */
 
     /* ---- copy REAL bytes by name (verify dtype/size; abort on any mismatch) ---- */
     int mix = (2 + cfg.hc_mult) * cfg.hc_mult;
     ds4f_load_raw(m, &B, m->out_norm,      "norm.weight",   DS4F_BF16, 1, C);
     ds4f_load_raw(m, &B, m->embed,         "embed.weight",  DS4F_BF16, cfg.vocab, C);
-    ds4f_load_q  (m, &B, &m->head,         "head");
+    ds4f_load_dense(m, &B, &m->head,       "head");
     ds4f_load_raw(m, &B, m->hc_head_fn,    "hc_head_fn",    DS4F_F32, cfg.hc_mult, cfg.hc_mult * C);
     ds4f_load_raw(m, &B, m->hc_head_base,  "hc_head_base",  DS4F_F32, 1, cfg.hc_mult);
     ds4f_load_raw(m, &B, m->hc_head_scale, "hc_head_scale", DS4F_F32, 1, 1);
@@ -1455,18 +1839,18 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ds4f_load_raw(m, &B, ly->ffn_norm,  DS4F_LN("ffn_norm.weight"),      DS4F_BF16, 1, C);
         ds4f_load_raw(m, &B, ly->q_norm,    DS4F_LN("attn.q_norm.weight"),   DS4F_BF16, 1, cfg.q_lora);
         ds4f_load_raw(m, &B, ly->kv_norm,   DS4F_LN("attn.kv_norm.weight"),  DS4F_BF16, 1, cfg.kv_lora);
-        ds4f_load_q  (m, &B, &ly->wq_a,     DS4F_LN("attn.wq_a"));
-        ds4f_load_q  (m, &B, &ly->wq_b,     DS4F_LN("attn.wq_b"));
-        ds4f_load_q  (m, &B, &ly->wkv,      DS4F_LN("attn.wkv"));
-        ds4f_load_q  (m, &B, &ly->wo_a,     DS4F_LN("attn.wo_a"));
-        ds4f_load_q  (m, &B, &ly->wo_b,     DS4F_LN("attn.wo_b"));
+        ds4f_load_dense(m, &B, &ly->wq_a,   DS4F_LN("attn.wq_a"));
+        ds4f_load_dense(m, &B, &ly->wq_b,   DS4F_LN("attn.wq_b"));
+        ds4f_load_dense(m, &B, &ly->wkv,    DS4F_LN("attn.wkv"));
+        ds4f_load_dense(m, &B, &ly->wo_a,   DS4F_LN("attn.wo_a"));
+        ds4f_load_dense(m, &B, &ly->wo_b,   DS4F_LN("attn.wo_b"));
         ds4f_load_raw(m, &B, ly->attn_sink, DS4F_LN("attn.attn_sink"),       DS4F_F32, 1, cfg.n_heads);
-        ds4f_load_q  (m, &B, &ly->gate,     DS4F_LN("ffn.gate"));
+        ds4f_load_dense(m, &B, &ly->gate,   DS4F_LN("ffn.gate"));
         if (ly->gate_bias)   /* noaux_tc selection bias (F32[n_experts]); non-hash layers only */
             ds4f_load_raw(m, &B, ly->gate_bias, DS4F_LN("ffn.gate.bias"), DS4F_F32, 1, cfg.n_experts);
-        ds4f_load_q  (m, &B, &ly->sh_w1,    DS4F_LN("ffn.shared_experts.w1"));
-        ds4f_load_q  (m, &B, &ly->sh_w3,    DS4F_LN("ffn.shared_experts.w3"));
-        ds4f_load_q  (m, &B, &ly->sh_w2,    DS4F_LN("ffn.shared_experts.w2"));
+        ds4f_load_dense(m, &B, &ly->sh_w1,  DS4F_LN("ffn.shared_experts.w1"));
+        ds4f_load_dense(m, &B, &ly->sh_w3,  DS4F_LN("ffn.shared_experts.w3"));
+        ds4f_load_dense(m, &B, &ly->sh_w2,  DS4F_LN("ffn.shared_experts.w2"));
         for (int s = 0; s < no; s++) {
             int e = ly->owned_eid[s];
             snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.w1", L, e); ds4f_load_q(m, &B, &ly->ex_w1[s], nm);
@@ -1479,6 +1863,28 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ds4f_load_raw(m, &B, ly->hc_ffn_fn,     DS4F_LN("hc_ffn_fn"),     DS4F_F32, mix, cfg.hc_mult * C);
         ds4f_load_raw(m, &B, ly->hc_ffn_base,   DS4F_LN("hc_ffn_base"),   DS4F_F32, 1, mix);
         ds4f_load_raw(m, &B, ly->hc_ffn_scale,  DS4F_LN("hc_ffn_scale"),  DS4F_F32, 1, 3);
+        if (m->tierb2 && cfg.compress_ratios[L]) {
+            /* Tier-B2 layer compressor + (CSA-only) lightning indexer. BF16 weights
+             * widened to f32, F32 ape direct, BF16 norm direct -- shapes mirror
+             * ds4f_alloc_tb2. The indexer's internal compressor is always coff=2. */
+            int ratio = cfg.compress_ratios[L];
+            int coff = (ratio == 4) ? 2 : 1, W = coff * cfg.kv_lora;
+            ds4f_load_bf16_to_f32(m, &B, ly->cmp_wkv,   DS4F_LN("attn.compressor.wkv.weight"),   W, C);
+            ds4f_load_bf16_to_f32(m, &B, ly->cmp_wgate, DS4F_LN("attn.compressor.wgate.weight"), W, C);
+            ds4f_load_raw        (m, &B, ly->cmp_ape,   DS4F_LN("attn.compressor.ape"),  DS4F_F32, ratio, W);
+            ds4f_load_raw        (m, &B, ly->cmp_norm,  DS4F_LN("attn.compressor.norm.weight"), DS4F_BF16, 1, cfg.kv_lora);
+            if (ratio == 4) {                          /* CSA layer => indexer present */
+                int iW = 2 * cfg.index_head_dim;       /* indexer compressor coff=2 */
+                ds4f_load_fp8_to_f32 (m, &B, ly->idx_wq_b,  DS4F_LN("attn.indexer.wq_b"),
+                                      cfg.index_n_heads * cfg.index_head_dim, cfg.q_lora);
+                ds4f_load_bf16_to_f32(m, &B, ly->idx_wproj, DS4F_LN("attn.indexer.weights_proj.weight"),
+                                      cfg.index_n_heads, C);
+                ds4f_load_bf16_to_f32(m, &B, ly->idx_cmp_wkv,   DS4F_LN("attn.indexer.compressor.wkv.weight"),   iW, C);
+                ds4f_load_bf16_to_f32(m, &B, ly->idx_cmp_wgate, DS4F_LN("attn.indexer.compressor.wgate.weight"), iW, C);
+                ds4f_load_raw        (m, &B, ly->idx_cmp_ape,   DS4F_LN("attn.indexer.compressor.ape"),  DS4F_F32, ratio, iW);
+                ds4f_load_raw        (m, &B, ly->idx_cmp_norm,  DS4F_LN("attn.indexer.compressor.norm.weight"), DS4F_BF16, 1, cfg.index_head_dim);
+            }
+        }
         #undef DS4F_LN
     }
 
@@ -1690,6 +2096,106 @@ static void ds4f_q_norm_rope(ds4f_model *m, float *q, int pos,
         float inv = 1.0f/sqrtf((float)(ss/HD) + c->norm_eps);
         for (int d = 0; d < HD; d++) qh[d] *= inv;
         ds4f_rope_apply(qh + nope, rcos, rsin, pos, half, 0);
+    }
+}
+
+/* ===================== Tier-B2 attention worker + prepare =====================
+ * tb2 worker = the exact sliding-window worker PLUS the compressed-KV term folded
+ * into the SAME online softmax. The window latents (ly->kv_cache, RoPE'd @ abs pos)
+ * and the compressed latents (ly->cmp_kv, RoPE'd @ their block's first token) both
+ * score against q (RoPE'd @ query pos); sink contributes exp(sink-max) to the
+ * denominator once; weighted-V over the union; the output rope dims are de-rotated
+ * by the QUERY position (model.py de-rotates o once, regardless of kv origin).
+ * m->s_tb2_sel[0..nsel) holds LOCAL indices into ly->cmp_kv (already offset-stripped
+ * by ds4f_tb2_prepare). nsel==0 => identical to the window-only exact worker. */
+static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
+    ds4f_attn_ex_task *T = (ds4f_attn_ex_task *)arg;
+    ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
+    int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora;
+    int rd = m->cfg.qk_rope_dim, nope = HD - rd;
+    int pos = T->pos, p_lo = pos - T->win + 1; if (p_lo < 0) p_lo = 0;
+    int nP = pos - p_lo + 1;
+    int nsel = m->s_tb2_nsel, total = nP + nsel;
+    const int *sel = m->s_tb2_sel; const float *cmp = ly->cmp_kv;
+    int nh = m->cfg.n_heads, per = nh / nthr, extra = nh % nthr;
+    int h0 = per*tid + (tid < extra ? tid : extra);
+    int h1 = h0 + per + (tid < extra ? 1 : 0);
+    float *sc = (float *)alloca((size_t)(total > 0 ? total : 1) * 4);
+    for (int h = h0; h < h1; h++) {
+        const float *q = m->s_q + (size_t)h*HD;
+        float mx = -1e30f;
+        for (int j = 0; j < nP; j++) {                          /* window term */
+            const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*kc[d];
+            s *= T->scale; sc[j] = s; if (s > mx) mx = s;
+        }
+        for (int j = 0; j < nsel; j++) {                        /* compressed term */
+            const float *kc = cmp + (size_t)sel[j]*KV;
+            float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*kc[d];
+            s *= T->scale; sc[nP + j] = s; if (s > mx) mx = s;
+        }
+        float denom = expf(ly->attn_sink[h] - mx);
+        for (int j = 0; j < total; j++) { sc[j] = expf(sc[j] - mx); denom += sc[j]; }
+        float inv = 1.0f/denom;
+        float *out = m->s_attn + (size_t)h*HD;
+        for (int d = 0; d < HD; d++) out[d] = 0.f;
+        for (int j = 0; j < nP; j++) {
+            float w = sc[j]*inv; const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            for (int d = 0; d < HD; d++) out[d] += w*kc[d];
+        }
+        for (int j = 0; j < nsel; j++) {
+            float w = sc[nP + j]*inv; const float *kc = cmp + (size_t)sel[j]*KV;
+            for (int d = 0; d < HD; d++) out[d] += w*kc[d];
+        }
+        ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, T->half, 1);  /* de-rotate @ query pos */
+    }
+}
+
+/* Step the per-layer compressor (and, on CSA layers, the indexer) for the current
+ * token at absolute position `pos`, then fill m->s_tb2_sel/s_tb2_nsel with the LOCAL
+ * compressed indices this query attends. Token-at-a-time: pos==0 seeds the ring state
+ * (no compressed token yet), pos>=1 decodes; on a compress boundary a new compressed
+ * latent lands in ly->cmp_kv[pos/ratio]. Input is m->s_hn (attn_norm output); the
+ * indexer's q-lora input is m->s_qlat (q_norm(wq_a(s_hn))). For HCA(128) layers every
+ * available compressed token is attended (arange); for CSA(4) the indexer scores them
+ * and selects top-min(index_topk, T). ratio==0 (dense) => no-op, nsel=0. */
+static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
+                             const float *rcos, const float *rsin) {
+    m->s_tb2_nsel = 0;
+    if (ratio == 0) return;
+    ds4f_config *c = &m->cfg;
+    int KV = c->kv_lora, ihd = c->index_head_dim, rd = c->qk_rope_dim; float eps = c->norm_eps;
+    int offset = c->window_size;                                /* decode combined-buffer offset */
+    /* layer compressor (rotate=0): input s_hn -> cmp_kv[pos/ratio] on a boundary */
+    if (ds4f_compress_step(m->s_hn, c->hidden, KV, rd, ratio, pos,
+                           ly->cmp_wkv, ly->cmp_wgate, ly->cmp_ape, ly->cmp_norm,
+                           rcos, rsin, eps, 0,
+                           ly->cmp_kv_state, ly->cmp_score_state, m->s_cmp_out))
+        memcpy(ly->cmp_kv + (size_t)(pos/ratio)*KV, m->s_cmp_out, (size_t)KV*4);
+    int T = (pos + 1) / ratio;
+    if (ratio == 4) {                                           /* CSA: indexer-selected */
+        if (pos == 0) {                                         /* seed indexer compressor ring */
+            float *seed = (float *)alloca((size_t)ihd * 4);     /* index_step drives it for pos>=1 */
+            ds4f_compress_step(m->s_hn, c->hidden, ihd, rd, ratio, 0,
+                               ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
+                               rcos, rsin, eps, 1,
+                               ly->idx_cmp_kv_state, ly->idx_cmp_score_state, seed);
+            return;                                             /* T==0, nothing compressed yet */
+        }
+        int k = c->index_topk;
+        ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, c->q_lora,
+                        c->index_n_heads, ihd, rd, ratio, pos, offset, k,
+                        ly->idx_wq_b, ly->idx_wproj,
+                        ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
+                        rcos, rsin, eps,
+                        ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,
+                        m->s_idx_q, m->s_idx_score, m->s_tb2_sel);
+        int nsel = 0;                                           /* compact + strip offset -> local idx */
+        for (int i = 0; i < k; i++) { int v = m->s_tb2_sel[i]; if (v < 0) break; m->s_tb2_sel[nsel++] = v - offset; }
+        m->s_tb2_nsel = nsel;
+    } else {                                                    /* HCA: all compressed tokens */
+        for (int t = 0; t < T; t++) m->s_tb2_sel[t] = t;
+        m->s_tb2_nsel = T;
     }
 }
 
@@ -1927,7 +2433,14 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         DS4F_TOC(DS4F_P_QKV); }
         /* ---- attention ---- */
         { DS4F_TIC();
-        if (m->exact) {
+        if (m->tierb2 && ratio) {
+            /* Tier-B2: step the compressor/indexer (single-thread, fills s_tb2_sel),
+             * then the window+compressed worker. ratio==0 (dense) falls to exact. */
+            ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin);
+            ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
+                                     c->window_size, c->qk_rope_dim/2, rcos, rsin };
+            ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+        } else if (m->exact) {
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
             ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at);
