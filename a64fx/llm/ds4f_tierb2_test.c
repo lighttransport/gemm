@@ -129,7 +129,7 @@ static void run_indexer(const char *tag, long base, int seqlen, int dim, int qlo
             float a = 0.f; for (int i = 0; i < dim; i++) a += w[i] * xs[i];
             weights[h] = a * wscale;
         }
-        ds4f_index_score(qheads, kvc, weights, H, hd, T, score);
+        ds4f_index_score(qheads, kvc, weights, H, hd, T, score, NULL);
         int thr = (s + 1) / ratio, tlim = thr < T ? thr : T;
         for (int t = 0; t < tlim; t++) {
             snprintf(nm, sizeof nm, "%s_is_%d_%d", tag, s, t); emit(nm, (double)score[t]);
@@ -171,7 +171,7 @@ static void run_compress_decode(const char *tag, long base, int npos, int dim, i
     for (int pos = 0; pos < npos; pos++) {
         int did = ds4f_compress_step(x + (size_t)pos * dim, dim, d, rd, ratio, pos,
                                      wkv, wgate, ape, nw, cosb, sinb, 1e-6f, rotate,
-                                     kvst, scst, out);
+                                     kvst, scst, out, NULL);
         if (did)
             for (int e = 0; e < d; e++) {
                 snprintf(nm, sizeof nm, "%s_%d_%d", tag, pos, e); emit(nm, (double)out[e]);
@@ -220,14 +220,14 @@ static void run_indexer_decode(const char *tag, long base, int npos, int dim, in
     for (int pos = 0; pos < npos; pos++) {
         if (pos == 0) {                                       /* seed compressor only */
             ds4f_compress_step(x, dim, hd, rd, ratio, 0, cwkv, cwgate, cape, cnorm,
-                               cosb, sinb, eps, 1, kvst, scst, comp_out);
+                               cosb, sinb, eps, 1, kvst, scst, comp_out, NULL);
             continue;
         }
         int T = ds4f_index_step(x + (size_t)pos * dim, dim, qr + (size_t)pos * qlora, qlora,
                                 H, hd, rd, ratio, pos, offset, k,
                                 wqb, wproj, cwkv, cwgate, cape, cnorm,
                                 cosb, sinb, eps, kvst, scst, idx_kv,
-                                q_scr, score_scr, sel);
+                                q_scr, score_scr, sel, NULL);
         if (T == 0) continue;
         for (int t = 0; t < T; t++) {
             snprintf(nm, sizeof nm, "%s_is_%d_%d", tag, pos, t); emit(nm, (double)score_scr[t]);
