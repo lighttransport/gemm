@@ -170,7 +170,7 @@ static void run_compress_decode(const char *tag, long base, int npos, int dim, i
     char nm[40];
     for (int pos = 0; pos < npos; pos++) {
         int did = ds4f_compress_step(x + (size_t)pos * dim, dim, d, rd, ratio, pos,
-                                     wkv, wgate, ape, nw, cosb, sinb, 1e-6f, rotate,
+                                     wkv, wgate, 0, ape, nw, cosb, sinb, 1e-6f, rotate,
                                      kvst, scst, out, NULL);
         if (did)
             for (int e = 0; e < d; e++) {
@@ -219,13 +219,13 @@ static void run_indexer_decode(const char *tag, long base, int npos, int dim, in
     char nm[48];
     for (int pos = 0; pos < npos; pos++) {
         if (pos == 0) {                                       /* seed compressor only */
-            ds4f_compress_step(x, dim, hd, rd, ratio, 0, cwkv, cwgate, cape, cnorm,
+            ds4f_compress_step(x, dim, hd, rd, ratio, 0, cwkv, cwgate, 0, cape, cnorm,
                                cosb, sinb, eps, 1, kvst, scst, comp_out, NULL);
             continue;
         }
         int T = ds4f_index_step(x + (size_t)pos * dim, dim, qr + (size_t)pos * qlora, qlora,
                                 H, hd, rd, ratio, pos, offset, k,
-                                wqb, wproj, cwkv, cwgate, cape, cnorm,
+                                wqb, wproj, 0, cwkv, cwgate, cape, cnorm,
                                 cosb, sinb, eps, kvst, scst, idx_kv,
                                 q_scr, score_scr, sel, NULL);
         if (T == 0) continue;

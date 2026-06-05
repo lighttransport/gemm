@@ -188,18 +188,19 @@ typedef struct {
     float *kv_cache;
     /* ---- Tier-B2 (DS4F_TIERB2; off-arena, only on ratio!=0 layers) ----
      * The stateful compressor/indexer long-range compressed-KV term that Tier-B1
-     * omits. The decode kernels (ds4f_compress_step/ds4f_index_step) take plain
-     * float weights, so these are dequantized at fill/load time (synth: junk-fill;
-     * real: bf16/f32/fp8 -> f32). All NULL unless m->tierb2 && compress_ratio!=0. */
-    float    *cmp_wkv, *cmp_wgate;   /* layer compressor (rotate=0): [coff*kv_lora, hidden] */
+     * omits. The matvec weights are stored bf16 (sources are bf16/FP8-e4m3, both
+     * lossless into bf16) and widened in-lane by the pooled SVE kernels — half the
+     * bytes, bit-identical to the prior f32-widened arena. ape stays f32, norm bf16.
+     * All NULL unless m->tierb2 && compress_ratio!=0. */
+    uint16_t *cmp_wkv, *cmp_wgate;   /* layer compressor (rotate=0): [coff*kv_lora, hidden] bf16 */
     float    *cmp_ape;               /* [compress_ratio, coff*kv_lora] */
     uint16_t *cmp_norm;              /* [kv_lora] bf16 */
     float    *cmp_kv_state, *cmp_score_state;  /* [coff*ratio, coff*kv_lora] ring state */
     float    *cmp_kv;                /* [max_pos/ratio, kv_lora] compressed latents */
     /* indexer (CSA layers, compress_ratio==4 only) */
-    float    *idx_wq_b;              /* [index_n_heads*index_head_dim, q_lora] */
-    float    *idx_wproj;             /* [index_n_heads, hidden] */
-    float    *idx_cmp_wkv, *idx_cmp_wgate;  /* indexer compressor (rotate=1): [coff*index_head_dim, hidden] */
+    uint16_t *idx_wq_b;              /* [index_n_heads*index_head_dim, q_lora] bf16 (FP8 src, lossless) */
+    uint16_t *idx_wproj;             /* [index_n_heads, hidden] bf16 */
+    uint16_t *idx_cmp_wkv, *idx_cmp_wgate;  /* indexer compressor (rotate=1): [coff*index_head_dim, hidden] bf16 */
     float    *idx_cmp_ape;           /* [4, coff*index_head_dim] */
     uint16_t *idx_cmp_norm;          /* [index_head_dim] bf16 */
     float    *idx_cmp_kv_state, *idx_cmp_score_state;  /* [coff*4, coff*index_head_dim] */
@@ -844,6 +845,56 @@ static void ds4f_cmpmv_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* ---- bf16-weight variants (same accumulation shape, weight widened in-lane) ----
+ * The compressor/indexer weights are stored bf16 (their sources are bf16/FP8-e4m3,
+ * both of which fit bf16 losslessly), so widen(stored_bf16) == the f32-widened value
+ * BIT-EXACTLY: svld1uh zero-extends the halfword, <<16 reconstructs the f32 the f32
+ * path would have loaded => the svmla inputs (and thus svaddv) are bit-identical to
+ * ds4f_f32mv_worker / ds4f_cmpmv_worker. Half the weight bytes for identical output. */
+typedef struct { float *out; const uint16_t *w; const float *x; int rows, cols; } ds4f_bf16mv_task;
+static void ds4f_bf16mv_worker(void *arg, int tid, int nthr) {
+    ds4f_bf16mv_task *T = (ds4f_bf16mv_task *)arg;
+    int rows = T->rows, cols = T->cols, vl = (int)svcntw();
+    int per = rows / nthr, extra = rows % nthr;
+    int o0 = per * tid + (tid < extra ? tid : extra);
+    int o1 = o0 + per + (tid < extra ? 1 : 0);
+    const float *x = T->x;
+    for (int o = o0; o < o1; o++) {
+        const uint16_t *w = T->w + (size_t)o * cols;
+        svfloat32_t acc = svdup_f32(0.f);
+        for (int i = 0; i < cols; i += vl) {
+            svbool_t pg = svwhilelt_b32(i, cols);
+            svfloat32_t wf = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, w + i), 16));
+            acc = svmla_f32_x(pg, acc, wf, svld1(pg, x + i));
+        }
+        T->out[o] = svaddv_f32(svptrue_b32(), acc);
+    }
+}
+
+typedef struct { float *kv, *score; const uint16_t *wkv, *wgate; const float *x; int W, dim; } ds4f_cmpmv_bf16_task;
+static void ds4f_cmpmv_bf16_worker(void *arg, int tid, int nthr) {
+    ds4f_cmpmv_bf16_task *T = (ds4f_cmpmv_bf16_task *)arg;
+    int W = T->W, dim = T->dim, vl = (int)svcntw();
+    int per = W / nthr, extra = W % nthr;
+    int o0 = per * tid + (tid < extra ? tid : extra);
+    int o1 = o0 + per + (tid < extra ? 1 : 0);
+    const float *x = T->x;
+    for (int o = o0; o < o1; o++) {
+        const uint16_t *wk = T->wkv + (size_t)o * dim, *wg = T->wgate + (size_t)o * dim;
+        svfloat32_t a = svdup_f32(0.f), b = svdup_f32(0.f);
+        for (int i = 0; i < dim; i += vl) {
+            svbool_t pg = svwhilelt_b32(i, dim);
+            svfloat32_t xv = svld1(pg, x + i);
+            svfloat32_t wkf = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wk + i), 16));
+            svfloat32_t wgf = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wg + i), 16));
+            a = svmla_f32_x(pg, a, wkf, xv);
+            b = svmla_f32_x(pg, b, wgf, xv);
+        }
+        svbool_t pt = svptrue_b32();
+        T->kv[o] = svaddv_f32(pt, a); T->score[o] = svaddv_f32(pt, b);
+    }
+}
+
 /* index_score parallelized over compressed positions t: score[t] = sum_h
  * relu(q[h].kvc[t]) * weights[h]. q[H*hd], kvc[T*hd], weights[H]. */
 typedef struct { const float *q, *kvc, *weights; int H, hd, T; float *score; } ds4f_idxsc_task;
@@ -942,18 +993,21 @@ static inline void ds4f_compress_state_reset(float *kv_state, float *score_state
  * seqlen==1: start_pos==0 seeds, start_pos>0 decodes. rotate=1 => indexer compressor. */
 static int ds4f_compress_step(
     const float *x, int dim, int d, int rd, int ratio, int start_pos,
-    const float *wkv, const float *wgate, const float *ape, const uint16_t *norm_w,
+    const void *wkv, const void *wgate, int w_bf16, const float *ape, const uint16_t *norm_w,
     const float *rcos, const float *rsin, float eps, int rotate,
     float *kv_state, float *score_state, float *out, ds4f_pool *pool)
 {
     int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff * d;
     float *kv = (float *)alloca((size_t)W * 4), *score = (float *)alloca((size_t)W * 4);
-    if (pool) {                                             /* pooled SVE kv/gate matvec */
-        ds4f_cmpmv_task ct = { kv, score, wkv, wgate, x, W, dim };
+    if (pool && w_bf16) {                                   /* pooled SVE, bf16 weights */
+        ds4f_cmpmv_bf16_task ct = { kv, score, (const uint16_t *)wkv, (const uint16_t *)wgate, x, W, dim };
+        ds4f_pool_run(pool, ds4f_cmpmv_bf16_worker, &ct);
+    } else if (pool) {                                      /* pooled SVE, f32 weights */
+        ds4f_cmpmv_task ct = { kv, score, (const float *)wkv, (const float *)wgate, x, W, dim };
         ds4f_pool_run(pool, ds4f_cmpmv_worker, &ct);
-    } else
+    } else                                                  /* serial f32 (validation/test) */
     for (int o = 0; o < W; o++) {                            /* wkv/wgate linear */
-        const float *wk = wkv + (size_t)o * dim, *wg = wgate + (size_t)o * dim;
+        const float *wk = (const float *)wkv + (size_t)o * dim, *wg = (const float *)wgate + (size_t)o * dim;
         float a = 0.f, b = 0.f;
         for (int i = 0; i < dim; i++) { a += wk[i] * x[i]; b += wg[i] * x[i]; }
         kv[o] = a; score[o] = b;
@@ -1039,19 +1093,22 @@ static inline int ds4f_compress_idx_decode(int ratio, int start_pos, int offset,
 static int ds4f_index_step(
     const float *x, int dim, const float *qr, int qlora,
     int H, int hd, int rd, int ratio, int start_pos, int offset, int k,
-    const float *wq_b, const float *weights_proj,
-    const float *cwkv, const float *cwgate, const float *cape, const uint16_t *cnorm,
+    const void *wq_b, const void *weights_proj, int w_bf16,
+    const void *cwkv, const void *cwgate, const float *cape, const uint16_t *cnorm,
     const float *rcos, const float *rsin, float eps,
     float *comp_kv_state, float *comp_score_state, float *idx_kv_cache,
     float *q_scr, float *score_scr, int *sel, ds4f_pool *pool)
 {
     int end_pos = start_pos + 1, half = rd / 2;
-    if (pool) {                                              /* q = wq_b(qr), pooled SVE */
-        ds4f_f32mv_task qt = { q_scr, wq_b, qr, H * hd, qlora };
+    if (pool && w_bf16) {                                    /* q = wq_b(qr), pooled bf16 */
+        ds4f_bf16mv_task qt = { q_scr, (const uint16_t *)wq_b, qr, H * hd, qlora };
+        ds4f_pool_run(pool, ds4f_bf16mv_worker, &qt);
+    } else if (pool) {                                       /* q = wq_b(qr), pooled f32 */
+        ds4f_f32mv_task qt = { q_scr, (const float *)wq_b, qr, H * hd, qlora };
         ds4f_pool_run(pool, ds4f_f32mv_worker, &qt);
-    } else
+    } else                                                   /* serial f32 (validation/test) */
     for (int o = 0; o < H * hd; o++) {                       /* q = wq_b(qr) */
-        const float *w = wq_b + (size_t)o * qlora; float a = 0.f;
+        const float *w = (const float *)wq_b + (size_t)o * qlora; float a = 0.f;
         for (int i = 0; i < qlora; i++) a += w[i] * qr[i];
         q_scr[o] = a;
     }
@@ -1062,18 +1119,22 @@ static int ds4f_index_step(
         ds4f_fp4_act_quant_inplace(qh, hd, 32);
     }
     float *comp_out = (float *)alloca((size_t)hd * 4);       /* own compressor (rotate=1) */
-    if (ds4f_compress_step(x, dim, hd, rd, ratio, start_pos, cwkv, cwgate, cape, cnorm,
+    if (ds4f_compress_step(x, dim, hd, rd, ratio, start_pos, cwkv, cwgate, w_bf16, cape, cnorm,
                            rcos, rsin, eps, 1, comp_kv_state, comp_score_state, comp_out, pool))
         memcpy(idx_kv_cache + (size_t)(start_pos / ratio) * hd, comp_out, (size_t)hd * 4);
     float sm = (float)(1.0 / sqrt((double)hd)), wscale = sm * (float)(1.0 / sqrt((double)H));
     float *weights = (float *)alloca((size_t)H * 4);
-    if (pool) {                                              /* weights = weights_proj(x), pooled */
-        ds4f_f32mv_task wt = { weights, weights_proj, x, H, dim };
+    if (pool && w_bf16) {                                    /* weights = weights_proj(x), pooled bf16 */
+        ds4f_bf16mv_task wt = { weights, (const uint16_t *)weights_proj, x, H, dim };
+        ds4f_pool_run(pool, ds4f_bf16mv_worker, &wt);
+        for (int h = 0; h < H; h++) weights[h] *= wscale;
+    } else if (pool) {                                       /* weights = weights_proj(x), pooled f32 */
+        ds4f_f32mv_task wt = { weights, (const float *)weights_proj, x, H, dim };
         ds4f_pool_run(pool, ds4f_f32mv_worker, &wt);
         for (int h = 0; h < H; h++) weights[h] *= wscale;
-    } else
+    } else                                                   /* serial f32 (validation/test) */
     for (int h = 0; h < H; h++) {
-        const float *w = weights_proj + (size_t)h * dim; float a = 0.f;
+        const float *w = (const float *)weights_proj + (size_t)h * dim; float a = 0.f;
         for (int i = 0; i < dim; i++) a += w[i] * x[i];
         weights[h] = a * wscale;
     }
@@ -1234,8 +1295,8 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
         ds4f_layer *ly = &m->layers[L];
         int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff*KV;
         int nslot = np / ratio;
-        ly->cmp_wkv   = (float *)aligned_alloc(256, (size_t)W*C*4);
-        ly->cmp_wgate = (float *)aligned_alloc(256, (size_t)W*C*4);
+        ly->cmp_wkv   = (uint16_t *)aligned_alloc(256, (size_t)W*C*2);
+        ly->cmp_wgate = (uint16_t *)aligned_alloc(256, (size_t)W*C*2);
         ly->cmp_ape   = (float *)aligned_alloc(256, (size_t)ratio*W*4);
         ly->cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)KV*2 + 63) & ~63u);
         ly->cmp_kv_state    = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
@@ -1243,17 +1304,17 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
         ly->cmp_kv = (float *)aligned_alloc(256, (size_t)nslot*KV*4);
         ds4f_compress_state_reset(ly->cmp_kv_state, ly->cmp_score_state, ratio, KV);
         if (fill) {
-            ds4f_tensor t1 = { ly->cmp_wkv,   NULL, DS4F_F32, W, C };       ds4f_fill(m, t1);
-            ds4f_tensor t2 = { ly->cmp_wgate, NULL, DS4F_F32, W, C };       ds4f_fill(m, t2);
+            ds4f_tensor t1 = { ly->cmp_wkv,   NULL, DS4F_BF16, W, C };      ds4f_fill(m, t1);
+            ds4f_tensor t2 = { ly->cmp_wgate, NULL, DS4F_BF16, W, C };      ds4f_fill(m, t2);
             ds4f_tensor t3 = { ly->cmp_ape,   NULL, DS4F_F32, ratio, W };   ds4f_fill(m, t3);
             ds4f_tensor t4 = { ly->cmp_norm,  NULL, DS4F_BF16, 1, KV };     ds4f_fill(m, t4);
         }
         if (ratio == 4) {                                       /* indexer (CSA only) */
             int icoff = 2, iW = icoff*ihd;                      /* index ratio==4 => overlap */
-            ly->idx_wq_b  = (float *)aligned_alloc(256, (size_t)iH*ihd*qlora*4);
-            ly->idx_wproj = (float *)aligned_alloc(256, (size_t)iH*C*4);
-            ly->idx_cmp_wkv   = (float *)aligned_alloc(256, (size_t)iW*C*4);
-            ly->idx_cmp_wgate = (float *)aligned_alloc(256, (size_t)iW*C*4);
+            ly->idx_wq_b  = (uint16_t *)aligned_alloc(256, (size_t)iH*ihd*qlora*2);
+            ly->idx_wproj = (uint16_t *)aligned_alloc(256, (size_t)iH*C*2);
+            ly->idx_cmp_wkv   = (uint16_t *)aligned_alloc(256, (size_t)iW*C*2);
+            ly->idx_cmp_wgate = (uint16_t *)aligned_alloc(256, (size_t)iW*C*2);
             ly->idx_cmp_ape   = (float *)aligned_alloc(256, (size_t)ratio*iW*4);
             ly->idx_cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)ihd*2 + 63) & ~63u);
             ly->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
@@ -1261,10 +1322,10 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             ly->idx_kv = (float *)aligned_alloc(256, (size_t)nslot*ihd*4);
             ds4f_compress_state_reset(ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ratio, ihd);
             if (fill) {
-                ds4f_tensor u1 = { ly->idx_wq_b,      NULL, DS4F_F32, iH*ihd, qlora }; ds4f_fill(m, u1);
-                ds4f_tensor u2 = { ly->idx_wproj,     NULL, DS4F_F32, iH, C };         ds4f_fill(m, u2);
-                ds4f_tensor u3 = { ly->idx_cmp_wkv,   NULL, DS4F_F32, iW, C };         ds4f_fill(m, u3);
-                ds4f_tensor u4 = { ly->idx_cmp_wgate, NULL, DS4F_F32, iW, C };         ds4f_fill(m, u4);
+                ds4f_tensor u1 = { ly->idx_wq_b,      NULL, DS4F_BF16, iH*ihd, qlora }; ds4f_fill(m, u1);
+                ds4f_tensor u2 = { ly->idx_wproj,     NULL, DS4F_BF16, iH, C };         ds4f_fill(m, u2);
+                ds4f_tensor u3 = { ly->idx_cmp_wkv,   NULL, DS4F_BF16, iW, C };         ds4f_fill(m, u3);
+                ds4f_tensor u4 = { ly->idx_cmp_wgate, NULL, DS4F_BF16, iW, C };         ds4f_fill(m, u4);
                 ds4f_tensor u5 = { ly->idx_cmp_ape,   NULL, DS4F_F32, ratio, iW };     ds4f_fill(m, u5);
                 ds4f_tensor u6 = { ly->idx_cmp_norm,  NULL, DS4F_BF16, 1, ihd };       ds4f_fill(m, u6);
             }
@@ -1749,6 +1810,46 @@ static void ds4f_load_fp8_to_f32(ds4f_model *m, const ds4f_blob *B, float *dst,
     m->bytes_read += wb + sb;
 }
 
+/* FP8 e4m3fn (+E8M0 block scale) -> bf16. value = lut[byte]*2^(e-127); e4m3's 3-bit
+ * mantissa * a power-of-2 scale has only its top 3 f32 mantissa bits set (low 16 are
+ * zero), so the f32->bf16 truncation drops only zero bits => EXACT, and widen(bf16)
+ * reproduces the same f32 ds4f_load_fp8_to_f32 would have stored. Half the bytes. */
+typedef struct { uint16_t *dst; const uint8_t *w, *es; const uint32_t *lut;
+                 int rows, cols, sbc; } ds4f_fp8bf16_task;
+static void ds4f_fp8bf16_worker(void *arg, int tid, int nthr) {
+    ds4f_fp8bf16_task *T = (ds4f_fp8bf16_task *)arg;
+    int rows = T->rows, K = T->cols, sbc = T->sbc;
+    int per = rows / nthr, ex = rows % nthr;
+    int r0 = per * tid + (tid < ex ? tid : ex);
+    int r1 = r0 + per + (tid < ex ? 1 : 0);
+    for (int r = r0; r < r1; r++) {
+        const uint8_t *wr  = T->w  + (size_t)r * K;
+        const uint8_t *esr = T->es + (size_t)(r >> 7) * sbc;
+        uint16_t *dr = T->dst + (size_t)r * K;
+        for (int c = 0; c < K; c++) {
+            uint32_t bits = T->lut[wr[c]]; float v; memcpy(&v, &bits, 4);
+            v *= ggml_e8m0_to_fp32(esr[c >> 7]);
+            uint32_t fb; memcpy(&fb, &v, 4);
+            dr[c] = (uint16_t)(fb >> 16);                 /* f32 -> bf16 (dropped bits are zero) */
+        }
+    }
+}
+static void ds4f_load_fp8_to_bf16(ds4f_model *m, const ds4f_blob *B, uint16_t *dst,
+                                  const char *base, int rows, int cols) {
+    char wn[256], sn[256];
+    snprintf(wn, sizeof wn, "%s.weight", base);
+    snprintf(sn, sizeof sn, "%s.scale",  base);
+    size_t wb = ds4f_wbytes(DS4F_FP8, rows, cols), sb = ds4f_sbytes(DS4F_FP8, rows, cols);
+    const ds4f_mani_ent *we = ds4f_need(B, wn, "F8_E4M3", wb);
+    const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", sb);
+    ds4f_fp8bf16_task T = { dst, B->blob + we->off, B->blob + se->off, m->fp8_lut,
+                            rows, cols, (cols + 127) / 128 };
+    ds4f_pool_run(m->pool, ds4f_fp8bf16_worker, &T);
+    ds4f_blob_drop(B, we->off, wb);
+    ds4f_blob_drop(B, se->off, sb);
+    m->bytes_read += wb + sb;
+}
+
 /* ---- dense load-time PROMOTE: staged source (FP8 e4m3fn+E8M0, or BF16) -> arena
  * dest m->dense_qt / m->bf16_mv_qt (FP8 | BF16 | BF16_PV). FP8->BF16 is EXACT (e4m3's
  * 3-bit mantissa * 2^k block scale fits bf16's 7-bit mantissa with no rounding), so
@@ -1962,23 +2063,24 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ds4f_load_raw(m, &B, ly->hc_ffn_base,   DS4F_LN("hc_ffn_base"),   DS4F_F32, 1, mix);
         ds4f_load_raw(m, &B, ly->hc_ffn_scale,  DS4F_LN("hc_ffn_scale"),  DS4F_F32, 1, 3);
         if (m->tierb2 && cfg.compress_ratios[L]) {
-            /* Tier-B2 layer compressor + (CSA-only) lightning indexer. BF16 weights
-             * widened to f32, F32 ape direct, BF16 norm direct -- shapes mirror
-             * ds4f_alloc_tb2. The indexer's internal compressor is always coff=2. */
+            /* Tier-B2 layer compressor + (CSA-only) lightning indexer. Matvec weights
+             * stored bf16 (BF16 src = plain copy; FP8 wq_b -> bf16, lossless), F32 ape
+             * direct, BF16 norm direct -- shapes mirror ds4f_alloc_tb2. The indexer's
+             * internal compressor is always coff=2. */
             int ratio = cfg.compress_ratios[L];
             int coff = (ratio == 4) ? 2 : 1, W = coff * cfg.kv_lora;
-            ds4f_load_bf16_to_f32(m, &B, ly->cmp_wkv,   DS4F_LN("attn.compressor.wkv.weight"),   W, C);
-            ds4f_load_bf16_to_f32(m, &B, ly->cmp_wgate, DS4F_LN("attn.compressor.wgate.weight"), W, C);
+            ds4f_load_raw        (m, &B, ly->cmp_wkv,   DS4F_LN("attn.compressor.wkv.weight"),   DS4F_BF16, W, C);
+            ds4f_load_raw        (m, &B, ly->cmp_wgate, DS4F_LN("attn.compressor.wgate.weight"), DS4F_BF16, W, C);
             ds4f_load_raw        (m, &B, ly->cmp_ape,   DS4F_LN("attn.compressor.ape"),  DS4F_F32, ratio, W);
             ds4f_load_raw        (m, &B, ly->cmp_norm,  DS4F_LN("attn.compressor.norm.weight"), DS4F_BF16, 1, cfg.kv_lora);
             if (ratio == 4) {                          /* CSA layer => indexer present */
                 int iW = 2 * cfg.index_head_dim;       /* indexer compressor coff=2 */
-                ds4f_load_fp8_to_f32 (m, &B, ly->idx_wq_b,  DS4F_LN("attn.indexer.wq_b"),
+                ds4f_load_fp8_to_bf16(m, &B, ly->idx_wq_b,  DS4F_LN("attn.indexer.wq_b"),
                                       cfg.index_n_heads * cfg.index_head_dim, cfg.q_lora);
-                ds4f_load_bf16_to_f32(m, &B, ly->idx_wproj, DS4F_LN("attn.indexer.weights_proj.weight"),
-                                      cfg.index_n_heads, C);
-                ds4f_load_bf16_to_f32(m, &B, ly->idx_cmp_wkv,   DS4F_LN("attn.indexer.compressor.wkv.weight"),   iW, C);
-                ds4f_load_bf16_to_f32(m, &B, ly->idx_cmp_wgate, DS4F_LN("attn.indexer.compressor.wgate.weight"), iW, C);
+                ds4f_load_raw        (m, &B, ly->idx_wproj, DS4F_LN("attn.indexer.weights_proj.weight"),
+                                      DS4F_BF16, cfg.index_n_heads, C);
+                ds4f_load_raw        (m, &B, ly->idx_cmp_wkv,   DS4F_LN("attn.indexer.compressor.wkv.weight"),   DS4F_BF16, iW, C);
+                ds4f_load_raw        (m, &B, ly->idx_cmp_wgate, DS4F_LN("attn.indexer.compressor.wgate.weight"), DS4F_BF16, iW, C);
                 ds4f_load_raw        (m, &B, ly->idx_cmp_ape,   DS4F_LN("attn.indexer.compressor.ape"),  DS4F_F32, ratio, iW);
                 ds4f_load_raw        (m, &B, ly->idx_cmp_norm,  DS4F_LN("attn.indexer.compressor.norm.weight"), DS4F_BF16, 1, cfg.index_head_dim);
             }
@@ -2266,7 +2368,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
     int offset = c->window_size;                                /* decode combined-buffer offset */
     /* layer compressor (rotate=0): input s_hn -> cmp_kv[pos/ratio] on a boundary */
     if (ds4f_compress_step(m->s_hn, c->hidden, KV, rd, ratio, pos,
-                           ly->cmp_wkv, ly->cmp_wgate, ly->cmp_ape, ly->cmp_norm,
+                           ly->cmp_wkv, ly->cmp_wgate, 1, ly->cmp_ape, ly->cmp_norm,
                            rcos, rsin, eps, 0,
                            ly->cmp_kv_state, ly->cmp_score_state, m->s_cmp_out, m->pool))
         memcpy(ly->cmp_kv + (size_t)(pos/ratio)*KV, m->s_cmp_out, (size_t)KV*4);
@@ -2275,7 +2377,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         if (pos == 0) {                                         /* seed indexer compressor ring */
             float *seed = (float *)alloca((size_t)ihd * 4);     /* index_step drives it for pos>=1 */
             ds4f_compress_step(m->s_hn, c->hidden, ihd, rd, ratio, 0,
-                               ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
+                               ly->idx_cmp_wkv, ly->idx_cmp_wgate, 1, ly->idx_cmp_ape, ly->idx_cmp_norm,
                                rcos, rsin, eps, 1,
                                ly->idx_cmp_kv_state, ly->idx_cmp_score_state, seed, m->pool);
             return;                                             /* T==0, nothing compressed yet */
@@ -2283,7 +2385,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         int k = c->index_topk;
         ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, c->q_lora,
                         c->index_n_heads, ihd, rd, ratio, pos, offset, k,
-                        ly->idx_wq_b, ly->idx_wproj,
+                        ly->idx_wq_b, ly->idx_wproj, 1,
                         ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
                         rcos, rsin, eps,
                         ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,
