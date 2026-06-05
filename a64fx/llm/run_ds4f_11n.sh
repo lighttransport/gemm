@@ -58,6 +58,11 @@ export DS4F_CMGS=${DS4F_CMGS:-4}
 export DS4F_PREFILL=${DS4F_PREFILL:-8}
 export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
 export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
+# DS4F_CTX_WARM>0 fills synthetic KV+compressed caches to this ctx, then decodes
+# from there (deterministic + rank-independent => lockstep preserved). Lets us
+# measure long-ctx decode/attn cost without paying O(ctx^2) real prefill. Needs
+# DS4F_MAXPOS > DS4F_CTX_WARM + DS4F_MAXGEN.
+export DS4F_CTX_WARM=${DS4F_CTX_WARM:-0}
 export DS4F_LAYERS=${DS4F_LAYERS:-0}
 export DS4F_FP8_BF16=${DS4F_FP8_BF16:-0}
 # DS4F_DENSE_MXFP4=1 routes replicated dense through MXFP4 split (0.53 B/elem):
