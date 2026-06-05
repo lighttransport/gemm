@@ -179,8 +179,9 @@ int main(void) {
     if (ctx_warm > 0) {
         double tw0 = now_sec();
         ds4f_warm_kv(m, ctx_warm);
-        printf("\nctx-warm: filled synthetic KV [0,%d)  %.2f s  (decode from pos=%d)\n",
-               ctx_warm, now_sec()-tw0, ctx_warm);
+        ds4f_warm_tb2(m, ctx_warm);   /* fill compressed caches too (no-op unless tierb2) */
+        printf("\nctx-warm: filled synthetic KV%s [0,%d)  %.2f s  (decode from pos=%d)\n",
+               m->tierb2 ? "+compressed" : "", ctx_warm, now_sec()-tw0, ctx_warm);
         dec_base = ctx_warm;
     }
 
@@ -209,10 +210,10 @@ int main(void) {
     }
 
     /* per-phase profile (only populated when DS4F_PROF=1) */
-    double psum = 0; for (int i = 0; i < 8; i++) psum += m->prof[i];
+    double psum = 0; for (int i = 0; i < DS4F_NPHASE; i++) psum += m->prof[i];
     if (psum > 0 && maxgen > 0) {
         printf("\nper-phase decode profile (ms/tok, %% of accounted):\n");
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < DS4F_NPHASE; i++) {
             double ms = m->prof[i] / maxgen * 1e3;
             if (ms <= 0) continue;
             printf("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*m->prof[i]/psum);

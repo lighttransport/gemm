@@ -346,10 +346,10 @@ int main(void) {
             logmsg("         %.2f GB/tok-weights  argmax=%d  NaNs=%d  RSS=%.2f GB\n",
                    (dec_bytes/(double)maxgen)/1e9, last_tok, nan_count, rss_bytes()/1e9);
         }
-        double psum = 0; for (int i = 0; i < 8; i++) psum += m->prof[i];
+        double psum = 0; for (int i = 0; i < DS4F_NPHASE; i++) psum += m->prof[i];
         if (psum > 0 && maxgen > 0) {
             logmsg("per-phase decode (ms/tok):\n");
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < DS4F_NPHASE; i++) {
                 double ms = m->prof[i]/maxgen*1e3; if (ms <= 0) continue;
                 logmsg("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*m->prof[i]/psum);
             }
