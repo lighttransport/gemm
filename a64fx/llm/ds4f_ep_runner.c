@@ -171,6 +171,8 @@ int main(void) {
     int maxpos    = envi("DS4F_MAXPOS", 4096);
     int layers    = envi("DS4F_LAYERS", 0);
     int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* fill synthetic KV+compressed to this ctx, decode from there */
+    int prefill_batch = envi("DS4F_PREFILL_BATCH", 0);   /* >0: batched M-token GEMM prefill (needs exact + dense bf16) */
+    if (prefill_batch > DS4F_MAX_MTILE) prefill_batch = DS4F_MAX_MTILE;
 
     /* ---- uTofu bootstrap (single TNI) ---- */
     utofu_tni_id_t *tni_ids = NULL; size_t num_tnis = 0;
@@ -276,31 +278,75 @@ int main(void) {
      * ordering as tp_runner.c (robust barrier at :969 ahead of tp_comm_init :988). */
     barrier_robust(1);
 
-    /* ---- all-reduce comm region (hidden floats) + wire model hook ---- */
+    /* ---- batched-prefill eligibility + size the all-reduce comm region so a whole
+     * [M,C] partial fits in ONE tp_allreduce_sum. ep_ar_callback chunks by max_count,
+     * so if max_count stayed = hidden the [M*hidden] partial would split into M sums
+     * and the per-layer latency amortization (the big cluster lever) would be lost.
+     * The argmax/decode sends only Put `count`-sized payloads, so the enlarged slot
+     * costs no extra decode bandwidth (see tp_ar_send_argmax). ---- */
+    if (prefill_batch > 0 && !m->exact) {
+        if (MyRank == 0) logmsg("DS4F_PREFILL_BATCH needs DS4F_EXACT=1; using token-at-a-time prefill\n");
+        prefill_batch = 0;
+    }
+    if (prefill_batch > 0 && (m->mhc || m->tierb2)) {
+        if (MyRank == 0) logmsg("DS4F_PREFILL_BATCH unsupported with mHC/Tier-B2; using token-at-a-time prefill\n");
+        prefill_batch = 0;
+    }
+    if (prefill_batch > 0 && !dense_bf16 && MyRank == 0)
+        logmsg("WARN: DS4F_PREFILL_BATCH without DS4F_FP8_BF16=1 -> dense falls back to per-token matvec (no speedup)\n");
+    int ar_mtile = (prefill_batch > 0 && prefill > 0)
+                 ? (prefill_batch < prefill ? prefill_batch : prefill) : 1;
+
+    /* ---- all-reduce comm region (hidden*ar_mtile floats) + wire model hook ---- */
     static tp_comm comm;
-    if (tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, cfg.hidden, barrier) != 0)
+    if (tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, cfg.hidden * ar_mtile, barrier) != 0)
         die("tp_comm_init", -1);
     m->ar_cb = ep_ar_callback; m->ar_ctx = &comm;
 
     barrier_robust(1);   /* everyone past load + comm init (robust: tolerate skew) */
-    if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill\n", N);
+    if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill%s\n",
+                            N, prefill_batch > 0 ? " [batched M-token GEMM]" : "");
 
     int C = cfg.hidden;
     float *x = (float *)aligned_alloc(256, (size_t)C * 4);
 
-    /* ---- prefill (synthetic, identical activations on every rank) ---- */
+    /* ---- prefill (synthetic, identical activations on every rank) ----
+     * Batched path (prefill_batch>0): ds4f_forward_prefill processes M tokens per call
+     * so each weight is read from HBM once per M-tile (compute-bound) and the per-layer
+     * EP all-reduce fires ONCE per tile instead of once per token (latency amortized
+     * M-fold). The sm_next() draw order is identical to the sequential path, so X is
+     * bit-identical on every rank -> replicated dense + lockstep argmax preserved. ---- */
     double t_pf0 = now_sec(); size_t pf_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
+    int nan_count = 0; double xnorm = 0.0; int pf_last_tok = -1;
     sm_state = 0xD5F00D;   /* SAME seed on every rank -> replicated dense + valid all-reduce */
-    for (int p = 0; p < prefill; p++) {
-        for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
-        m->bytes_read = 0;
-        ds4f_forward_token(m, x, p);
-        pf_bytes += m->bytes_read;
+    if (prefill_batch > 0 && prefill > 0) {
+        ds4f_alloc_prefill_batch(m, ar_mtile);
+        float *X  = (float *)aligned_alloc(256, (size_t)ar_mtile * C * 4);
+        int   *bt = (int *)malloc((size_t)ar_mtile * sizeof(int));
+        for (int base = 0; base < prefill; base += ar_mtile) {
+            int M = prefill - base < ar_mtile ? prefill - base : ar_mtile;
+            for (int mm = 0; mm < M; mm++)
+                for (int i = 0; i < C; i++) X[mm*C+i] = (float)(sm_next() * 2.0 - 1.0);
+            m->bytes_read = 0;
+            ds4f_forward_prefill(m, X, M, base, bt);
+            pf_bytes += m->bytes_read;
+            pf_last_tok = bt[M-1];
+        }
+        int Mlast = prefill % ar_mtile; if (Mlast == 0) Mlast = ar_mtile;
+        const float *xl = m->p_x + (size_t)(Mlast-1)*C;
+        for (int i = 0; i < C; i++) { if (!(xl[i] == xl[i])) nan_count++; xnorm += (double)xl[i]*xl[i]; }
+        free(X); free(bt);
+    } else {
+        for (int p = 0; p < prefill; p++) {
+            for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
+            m->bytes_read = 0;
+            pf_last_tok = ds4f_forward_token(m, x, p);
+            pf_bytes += m->bytes_read;
+        }
+        for (int i = 0; i < C; i++) { if (!(x[i] == x[i])) nan_count++; xnorm += (double)x[i]*x[i]; }
     }
     double t_pf = now_sec() - t_pf0;
     double pf_ar = g_ar_secs; long pf_calls = g_ar_calls;
-    int nan_count = 0; double xnorm = 0.0;
-    for (int i = 0; i < C; i++) { if (!(x[i] == x[i])) nan_count++; xnorm += (double)x[i]*x[i]; }
 
     barrier();   /* lockstep check between phases */
 
@@ -338,8 +384,9 @@ int main(void) {
         if (rf) {
             fprintf(rf, "rank %d/%d  owned=%d/layer  RSS=%.2f GB\n", MyRank, N, no, rss_bytes()/1e9);
             if (prefill > 0)
-                fprintf(rf, "prefill: %d tok  %.1f ms/tok  %.2f tok/s  comm %.1f%%  ar_calls=%ld\n",
-                        prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf, pf_calls);
+                fprintf(rf, "prefill: %d tok  %.1f ms/tok  %.2f tok/s  comm %.1f%%  ar_calls=%ld  argmax=%d%s\n",
+                        prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf, pf_calls,
+                        pf_last_tok, prefill_batch > 0 ? "  [batched]" : "");
             if (maxgen > 0)
                 fprintf(rf, "decode:  %d tok  %.1f ms/tok  %.2f tok/s  comm %.1f%%  %.1f GB/s-weights\n",
                         maxgen, t_dec/maxgen*1e3, maxgen/t_dec, 100.0*dec_ar/t_dec,
@@ -352,8 +399,9 @@ int main(void) {
     if (MyRank == 0) {
         logmsg("\n=== rank0 summary (%d nodes, EP all-reduce combine) ===\n", N);
         if (prefill > 0)
-            logmsg("prefill: %d tok  %.1f ms/tok  %.2f tok/s   comm %.1f%%\n",
-                   prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf);
+            logmsg("prefill: %d tok  %.1f ms/tok  %.2f tok/s   comm %.1f%% (ar_calls=%ld argmax=%d)%s\n",
+                   prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf, pf_calls, pf_last_tok,
+                   prefill_batch > 0 ? "  [batched]" : "");
         if (maxgen > 0) {
             logmsg("decode:  %d tok  %.1f ms/tok  %.2f tok/s   comm %.1f%% (%.0f us/tok)\n",
                    maxgen, t_dec/maxgen*1e3, maxgen/t_dec, 100.0*dec_ar/t_dec, dec_ar/maxgen*1e6);

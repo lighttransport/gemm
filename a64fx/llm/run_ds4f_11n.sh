@@ -56,6 +56,12 @@ export LLM_THREADS=${LLM_THREADS:-48}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$LLM_THREADS}
 export DS4F_CMGS=${DS4F_CMGS:-4}
 export DS4F_PREFILL=${DS4F_PREFILL:-8}
+# DS4F_PREFILL_BATCH=M_TILE>0 runs prefill as M-token GEMM tiles (needs EXACT+FP8_BF16).
+# Sweet spot on 11 nodes is 64 (32L: batch64 70 tok/s > batch32 66 > batch128 59).
+# M>=128 regresses (dense p_x/o_proj activations blow the 8MB/CMG L2). Default 0 (off).
+# (Attention is now GEMM-ified per-head-block so its 32MB q/attn buffers no longer
+#  bound L2 — that is why the old M>=128 cliff softened and 64 now wins.)
+export DS4F_PREFILL_BATCH=${DS4F_PREFILL_BATCH:-0}
 export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
 export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
 # DS4F_CTX_WARM>0 fills synthetic KV+compressed caches to this ctx, then decodes
@@ -69,6 +75,12 @@ export DS4F_FP8_BF16=${DS4F_FP8_BF16:-0}
 # leaner than FP8 AND faster, but compute-bound so slower than bf16-pv. Lean
 # long-ctx default candidate. Overrides FP8/BF16.
 export DS4F_DENSE_MXFP4=${DS4F_DENSE_MXFP4:-0}
+# DS4F_Q8_DENSE=1 repacks the dominant dense (qkv/o_proj/shared, 64% of prefill)
+# from bf16-pv to int8 W8A8 after fill, so the prefill GEMM runs svdot (4x int8
+# MACs/FMLA). Router gate + lm-head stay bf16-pv (argmax protection). REQUIRES
+# DS4F_FP8_BF16=1 (the bf16-pv source). Quality is argmax-exact (int8 rel-L2 ~1%),
+# NOT bit-similar. Net dense memory SHRINKS (q8 ~1.03 B/elem < bf16 2 B/elem).
+export DS4F_Q8_DENSE=${DS4F_Q8_DENSE:-0}
 # DS4F_SPARSE=1 enables the Stage-4 synthetic lightning-indexer attention: on
 # sparse layers (compress_ratios[L]!=0) with nP>index_topk, a cheap compressed
 # index selects topk positions and weighted-V runs over them only. Dense layers
