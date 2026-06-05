@@ -148,29 +148,112 @@ int main(void) {
     int C = cfg.hidden;
     float *x = (float *)aligned_alloc(256, (size_t)C * 4);
 
-    /* ---- prefill (sequential token-at-a-time; batched deferred) ---- */
-    sm_state = 0xD5F00D ^ ((uint64_t)ep_rank << 32);
-    double t_pf0 = now_sec();
-    size_t pf_bytes = 0;
-    for (int p = 0; p < prefill; p++) {
-        for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
-        m->bytes_read = 0;
-        ds4f_forward_token(m, x, p);
-        pf_bytes += m->bytes_read;
+    /* batched-prefill knobs:
+     *   DS4F_PREFILL_BATCH = M_TILE > 0  -> process prefill in M-token GEMM tiles
+     *                                       (needs DS4F_EXACT=1 + DS4F_FP8_BF16=1).
+     *   DS4F_PREFILL_CHECK = 1           -> also run token-at-a-time and diff the
+     *                                       per-token argmax + final hidden state. */
+    int prefill_batch = envi("DS4F_PREFILL_BATCH", 0);
+    int prefill_check = envi("DS4F_PREFILL_CHECK", 0);
+    if (prefill_batch > DS4F_MAX_MTILE) prefill_batch = DS4F_MAX_MTILE;
+    if (prefill_batch > 0 && !m->exact) {
+        fprintf(stderr, "DS4F_PREFILL_BATCH requires DS4F_EXACT=1 (batched path is exact-only)\n");
+        return 1;
     }
-    double t_pf = now_sec() - t_pf0;
 
-    /* check finiteness of the last prefill hidden state */
+    sm_state = 0xD5F00D ^ ((uint64_t)ep_rank << 32);
+    double t_pf = 0; size_t pf_bytes = 0;
     int nan_count = 0; double xnorm = 0.0;
-    for (int i = 0; i < C; i++) { if (!(x[i] == x[i])) nan_count++; xnorm += (double)x[i]*x[i]; }
+
+    if (prefill_check && prefill_batch > 0 && prefill > 0) {
+        /* ---- correctness mode: batched vs token-at-a-time on identical inputs ---- */
+        int M = prefill < prefill_batch ? prefill : prefill_batch;
+        printf("\n[PREFILL_CHECK] batched(M=%d) vs token-at-a-time, %d tokens\n", M, M);
+        float *X  = (float *)aligned_alloc(256, (size_t)M * C * 4);
+        for (int mm = 0; mm < M; mm++)
+            for (int i = 0; i < C; i++) X[mm*C+i] = (float)(sm_next() * 2.0 - 1.0);
+        ds4f_alloc_prefill_batch(m, M);
+        int *bt = (int *)malloc((size_t)M * 4);
+        ds4f_forward_prefill(m, X, M, 0, bt);
+        float *bh = (float *)aligned_alloc(256, (size_t)M * C * 4);
+        memcpy(bh, m->p_x, (size_t)M * C * 4);
+        int mism = 0; double maxabs = 0.0, maxmag = 0.0; int nnan = 0;
+        for (int mm = 0; mm < M; mm++) {
+            memcpy(x, X + (size_t)mm*C, (size_t)C*4);
+            int tk = ds4f_forward_token(m, x, mm);
+            if (tk != bt[mm]) { mism++;
+                if (mism <= 5) printf("  arg mismatch tok %d: batch=%d token=%d\n", mm, bt[mm], tk); }
+            for (int i = 0; i < C; i++) {
+                double a = x[i], b = bh[(size_t)mm*C+i], d = fabs(a - b);
+                if (d > maxabs) maxabs = d;
+                if (fabs(a) > maxmag) maxmag = fabs(a);
+                if (!(b == b)) nnan++;
+            }
+        }
+        /* hidden magnitudes are huge with synthetic weights (||x|| ~1e6+), so gate
+         * on the RELATIVE diff (GEMM K-tile reassociation ~1e-4) and exact argmax. */
+        double maxrel = maxabs / (maxmag + 1e-6);
+        int pass = (mism == 0) && (maxrel < 1e-3) && (nnan == 0);
+        printf("  argmax mismatches: %d/%d   max-abs=%.3e (rel %.3e, |x|max=%.3e)   NaNs: %d\n",
+               mism, M, maxabs, maxrel, maxmag, nnan);
+        printf("  => %s\n", pass ? "PASS" : "FAIL");
+        free(X); free(bt); free(bh);
+        free(x); ds4f_free(m);
+        return pass ? 0 : 1;
+    }
+
+    if (prefill_batch > 0 && prefill > 0) {
+        /* ---- batched prefill (M-token GEMM tiles) ---- */
+        ds4f_alloc_prefill_batch(m, prefill_batch);
+        float *X = (float *)aligned_alloc(256, (size_t)prefill_batch * C * 4);
+        int *bt = (int *)malloc((size_t)prefill_batch * 4);
+        double t_pf0 = now_sec();
+        for (int base = 0; base < prefill; base += prefill_batch) {
+            int M = prefill - base < prefill_batch ? prefill - base : prefill_batch;
+            for (int mm = 0; mm < M; mm++)
+                for (int i = 0; i < C; i++) X[mm*C+i] = (float)(sm_next() * 2.0 - 1.0);
+            m->bytes_read = 0;
+            ds4f_forward_prefill(m, X, M, base, bt);
+            pf_bytes += m->bytes_read;
+        }
+        t_pf = now_sec() - t_pf0;
+        /* finiteness of the last tile's last token (kept in p_x) */
+        int Mlast = prefill % prefill_batch; if (Mlast == 0) Mlast = prefill_batch;
+        const float *xl = m->p_x + (size_t)(Mlast-1)*C;
+        for (int i = 0; i < C; i++) { if (!(xl[i] == xl[i])) nan_count++; xnorm += (double)xl[i]*xl[i]; }
+        free(X); free(bt);
+    } else {
+        /* ---- prefill (sequential token-at-a-time) ---- */
+        double t_pf0 = now_sec();
+        for (int p = 0; p < prefill; p++) {
+            for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
+            m->bytes_read = 0;
+            ds4f_forward_token(m, x, p);
+            pf_bytes += m->bytes_read;
+        }
+        t_pf = now_sec() - t_pf0;
+        for (int i = 0; i < C; i++) { if (!(x[i] == x[i])) nan_count++; xnorm += (double)x[i]*x[i]; }
+    }
 
     if (prefill > 0) {
         double per = t_pf / prefill;
-        printf("\nprefill: %d tok  %.1f ms/tok  %.2f tok/s   %.1f GB/s/tok-weights\n",
+        printf("\nprefill: %d tok  %.1f ms/tok  %.2f tok/s   %.1f GB/s/tok-weights%s\n",
                prefill, per*1e3, prefill / t_pf,
-               (pf_bytes / (double)prefill) / per / 1e9);
+               (pf_bytes / (double)prefill) / per / 1e9,
+               prefill_batch > 0 ? "  [batched]" : "");
         printf("         last-hidden ||x||=%.3e  NaNs=%d\n", sqrt(xnorm), nan_count);
     }
+    /* per-phase prefill profile (DS4F_PROF=1; printed before decode wipes m->prof) */
+    { double psum = 0; for (int i = 0; i < DS4F_NPHASE; i++) psum += m->prof[i];
+      if (psum > 0 && prefill > 0) {
+        printf("\nper-phase prefill profile (ms/tok, %% of accounted):\n");
+        for (int i = 0; i < DS4F_NPHASE; i++) {
+            double ms = m->prof[i] / prefill * 1e3;
+            if (ms <= 0) continue;
+            printf("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*m->prof[i]/psum);
+        }
+        printf("  %-9s %7.3f ms  (sum of accounted phases)\n", "TOTAL", psum/prefill*1e3);
+      } }
 
     /* ---- optional synthetic ctx-warm: prefill KV to a large context cheaply,
      * so decode-attn cost at that ctx can be measured without npos real tokens.
