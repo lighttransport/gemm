@@ -42,15 +42,24 @@ typedef struct {
     CUfunction mhrms;       /* multi_head_rmsnorm_f32 */
     CUfunction sdpa;        /* sdpa_f32 */
     CUfunction flash_attn;  /* flash_attn_sep_hd64_f32 */
+    CUfunction cast_f16;    /* cast_f32_to_f16_sam3d */
+    CUfunction cast_bf16;   /* cast_f32_to_bf16_sam3d */
+    CUfunction add_bias;    /* add_bias_rows_f32 */
     CUfunction gelu;        /* gelu_tanh_inplace_f32 */
     CUfunction gated;       /* gated_residual_add_f32 */
     CUfunction resadd;      /* residual_add_f32 */
     cublasew_context *cublas;
+    CUdeviceptr gemm_x16;
+    CUdeviceptr gemm_w16;
+    size_t gemm_x16_cap;
+    size_t gemm_w16_cap;
     int use_cublas_gemm;
     int use_flash_attn;
+    int mma_precision;      /* 0=f32, 1=fp16, 2=bf16 */
 } cs3d_ssdit_fns;
 
 int cs3d_ssdit_fns_lookup(cs3d_ssdit_fns *fns, CUmodule mod);
+void cs3d_ssdit_fns_set_precision(cs3d_ssdit_fns *fns, const char *precision);
 void cs3d_ssdit_fns_free(cs3d_ssdit_fns *fns);
 
 /* Per-block scratch workspace. Sized to handle the maximum N_s/N_p/N_c
@@ -120,6 +129,9 @@ int cs3d_ssdit_fns_lookup(cs3d_ssdit_fns *f, CUmodule mod)
         const char *fa_env = getenv("SAM3D_SSDIT_FLASH_ATTN");
         f->use_flash_attn = (!fa_env || fa_env[0] != '0');
     }
+    if (cuModuleGetFunction(&f->cast_f16,  mod, "cast_f32_to_f16_sam3d")  != CUDA_SUCCESS) return -1;
+    if (cuModuleGetFunction(&f->cast_bf16, mod, "cast_f32_to_bf16_sam3d") != CUDA_SUCCESS) return -1;
+    if (cuModuleGetFunction(&f->add_bias,  mod, "add_bias_rows_f32")      != CUDA_SUCCESS) return -1;
     if (cuModuleGetFunction(&f->gelu,      mod, "gelu_tanh_inplace_f32")  != CUDA_SUCCESS) return -1;
     if (cuModuleGetFunction(&f->gated,     mod, "gated_residual_add_f32") != CUDA_SUCCESS) return -1;
     if (cuModuleGetFunction(&f->resadd,    mod, "residual_add_f32")       != CUDA_SUCCESS) return -1;
@@ -132,20 +144,95 @@ int cs3d_ssdit_fns_lookup(cs3d_ssdit_fns *f, CUmodule mod)
     return 0;
 }
 
+void cs3d_ssdit_fns_set_precision(cs3d_ssdit_fns *f, const char *precision)
+{
+    if (!f) return;
+    const char *env = getenv("SAM3D_MMA_GEMM");
+    if (env && env[0] == '0') {
+        f->mma_precision = 0;
+        return;
+    }
+    const char *p = precision && precision[0] ? precision : "fp16";
+    if (!strcmp(p, "bf16")) f->mma_precision = 2;
+    else if (!strcmp(p, "fp16")) f->mma_precision = 1;
+    else f->mma_precision = 0;
+}
+
 void cs3d_ssdit_fns_free(cs3d_ssdit_fns *f)
 {
     if (!f) return;
     if (f->cublas) cublasewDestroy(f->cublas);
+    if (f->gemm_x16) cuMemFree(f->gemm_x16);
+    if (f->gemm_w16) cuMemFree(f->gemm_w16);
     f->cublas = NULL;
+    f->gemm_x16 = 0;
+    f->gemm_w16 = 0;
+    f->gemm_x16_cap = 0;
+    f->gemm_w16_cap = 0;
     f->use_cublas_gemm = 0;
     f->use_flash_attn = 0;
+    f->mma_precision = 0;
+}
+
+static int cs3d_ssdit_ensure_u16(CUdeviceptr *ptr, size_t *cap, size_t n_elem)
+{
+    size_t bytes = n_elem * sizeof(unsigned short);
+    if (*ptr && *cap >= bytes) return 0;
+    if (*ptr) cuMemFree(*ptr);
+    *ptr = 0;
+    *cap = 0;
+    if (cuMemAlloc(ptr, bytes) != CUDA_SUCCESS) return -1;
+    *cap = bytes;
+    return 0;
+}
+
+static int cs3d_ssdit_cast_u16(const cs3d_ssdit_fns *f,
+                               CUdeviceptr d_src, CUdeviceptr d_dst, int n)
+{
+    CUfunction fn = (f->mma_precision == 2) ? f->cast_bf16 : f->cast_f16;
+    void *args[] = { &d_src, &d_dst, &n };
+    return (cuLaunchKernel(fn, (unsigned)((n + 255) / 256), 1, 1,
+                           256, 1, 1, 0, 0, args, NULL) == CUDA_SUCCESS) ? 0 : -1;
+}
+
+static int cs3d_ssdit_add_bias(const cs3d_ssdit_fns *f,
+                               CUdeviceptr d_out, CUdeviceptr d_b, int N, int M)
+{
+    int total = N * M;
+    void *args[] = { &d_out, &d_b, &N, &M };
+    return (cuLaunchKernel(f->add_bias, (unsigned)((total + 255) / 256), 1, 1,
+                           256, 1, 1, 0, 0, args, NULL) == CUDA_SUCCESS) ? 0 : -1;
 }
 
 static int cs3d_ssdit_gemm(const cs3d_ssdit_fns *f,
                            CUdeviceptr d_out, CUdeviceptr d_in,
-                           CUdeviceptr d_w, CUdeviceptr d_b,
+                           CUdeviceptr d_w, CUdeviceptr d_w16, CUdeviceptr d_b,
                            int N, int K, int M)
 {
+    if (f->use_cublas_gemm && f->cublas && f->mma_precision &&
+        (d_w16 || N >= 128) && K >= 64 && M >= 64 && (K % 8) == 0 && (M % 8) == 0) {
+        cs3d_ssdit_fns *mf = (cs3d_ssdit_fns *)f;
+        size_t xn = (size_t)N * (size_t)K;
+        size_t wn = (size_t)M * (size_t)K;
+        CUdeviceptr use_w16 = d_w16;
+        int have_w16 = use_w16 != 0;
+        if (cs3d_ssdit_ensure_u16(&mf->gemm_x16, &mf->gemm_x16_cap, xn) == 0 &&
+            (have_w16 || cs3d_ssdit_ensure_u16(&mf->gemm_w16, &mf->gemm_w16_cap, wn) == 0) &&
+            cs3d_ssdit_cast_u16(f, d_in, mf->gemm_x16, (int)xn) == 0 &&
+            (have_w16 || cs3d_ssdit_cast_u16(f, d_w,  mf->gemm_w16, (int)wn) == 0)) {
+            if (!have_w16) use_w16 = mf->gemm_w16;
+            int ok = (f->mma_precision == 2)
+                ? cublasew_gemm_bf16_bf16_f32_rowmajor_nt(
+                      f->cublas, d_out, use_w16, mf->gemm_x16, N, M, K)
+                : cublasew_gemm_f16_f16_f32_rowmajor_nt(
+                      f->cublas, d_out, use_w16, mf->gemm_x16, N, M, K);
+            if (ok == 0) {
+                if (d_b && cs3d_ssdit_add_bias(f, d_out, d_b, N, M) < 0) return -1;
+                return 0;
+            }
+        }
+    }
+    if (!d_w) return -1;
     if (f->use_cublas_gemm && f->cublas) {
         int ok = d_b
             ? cublasew_gemm_f32_lt_bias_rowmajor_nt(f->cublas, d_out, d_w, d_in,
@@ -254,7 +341,7 @@ static int sa_qkv_path(const cs3d_ssdit_fns *f,
 {
     int D3 = 3 * dim;
     {
-        if (cs3d_ssdit_gemm(f, d_qkv, d_x, sw->sa_qkv_w, sw->sa_qkv_b,
+        if (cs3d_ssdit_gemm(f, d_qkv, d_x, sw->sa_qkv_w, sw->sa_qkv_w16, sw->sa_qkv_b,
                        N, dim, D3) < 0) return -1;
     }
     {
@@ -330,11 +417,11 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
                         N_p, N_kv, H, D_h, scale) < 0) return -1;
     /* sa_out per stream. */
     {
-        if (cs3d_ssdit_gemm(f, ws->t_s, ws->sdpa_s, swsh->sa_out_w,
+        if (cs3d_ssdit_gemm(f, ws->t_s, ws->sdpa_s, swsh->sa_out_w, swsh->sa_out_w16,
                        swsh->sa_out_b, N_s, dim, dim) < 0) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->t_p, ws->sdpa_p, swp->sa_out_w,
+        if (cs3d_ssdit_gemm(f, ws->t_p, ws->sdpa_p, swp->sa_out_w, swp->sa_out_w16,
                        swp->sa_out_b, N_p, dim, dim) < 0) return -1;
     }
     /* gated residual_msa */
@@ -363,17 +450,17 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
     }
     /* === cross-attn === */
     {
-        if (cs3d_ssdit_gemm(f, ws->qx_s, ws->h_s, swsh->xa_q_w,
+        if (cs3d_ssdit_gemm(f, ws->qx_s, ws->h_s, swsh->xa_q_w, swsh->xa_q_w16,
                        swsh->xa_q_b, N_s, dim, dim) < 0) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->qx_p, ws->h_p, swp->xa_q_w,
+        if (cs3d_ssdit_gemm(f, ws->qx_p, ws->h_p, swp->xa_q_w, swp->xa_q_w16,
                        swp->xa_q_b, N_p, dim, dim) < 0) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->kvs_x, d_cond, swsh->xa_kv_w,
+        if (cs3d_ssdit_gemm(f, ws->kvs_x, d_cond, swsh->xa_kv_w, swsh->xa_kv_w16,
                        swsh->xa_kv_b, N_c, dim, D2) < 0) return -1;
-        if (cs3d_ssdit_gemm(f, ws->kvp_x, d_cond, swp->xa_kv_w,
+        if (cs3d_ssdit_gemm(f, ws->kvp_x, d_cond, swp->xa_kv_w, swp->xa_kv_w16,
                        swp->xa_kv_b, N_c, dim, D2) < 0) return -1;
     }
     {
@@ -388,11 +475,11 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
     if (cs3d_ssdit_attn(f, ws->o_p, ws->qx_p, ws->Kp, ws->Vp,
                         N_p, N_c, H, D_h, scale) < 0) return -1;
     {
-        if (cs3d_ssdit_gemm(f, ws->t_s, ws->o_s, swsh->xa_out_w,
+        if (cs3d_ssdit_gemm(f, ws->t_s, ws->o_s, swsh->xa_out_w, swsh->xa_out_w16,
                        swsh->xa_out_b, N_s, dim, dim) < 0) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->t_p, ws->o_p, swp->xa_out_w,
+        if (cs3d_ssdit_gemm(f, ws->t_p, ws->o_p, swp->xa_out_w, swp->xa_out_w16,
                        swp->xa_out_b, N_p, dim, dim) < 0) return -1;
     }
     {
@@ -419,11 +506,11 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
                            (unsigned)smem, 0, ap, NULL) != CUDA_SUCCESS) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->m1s, ws->h_s, swsh->mlp_fc1_w,
+        if (cs3d_ssdit_gemm(f, ws->m1s, ws->h_s, swsh->mlp_fc1_w, swsh->mlp_fc1_w16,
                        swsh->mlp_fc1_b, N_s, dim, mlp_h) < 0) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->m1p, ws->h_p, swp->mlp_fc1_w,
+        if (cs3d_ssdit_gemm(f, ws->m1p, ws->h_p, swp->mlp_fc1_w, swp->mlp_fc1_w16,
                        swp->mlp_fc1_b, N_p, dim, mlp_h) < 0) return -1;
     }
     {
@@ -439,11 +526,11 @@ int cs3d_ssdit_block_forward(const cs3d_ssdit_fns *f,
         if (cuLaunchKernel(f->gelu, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL) != CUDA_SUCCESS) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->t_s, ws->m1s, swsh->mlp_fc2_w,
+        if (cs3d_ssdit_gemm(f, ws->t_s, ws->m1s, swsh->mlp_fc2_w, swsh->mlp_fc2_w16,
                        swsh->mlp_fc2_b, N_s, mlp_h, dim) < 0) return -1;
     }
     {
-        if (cs3d_ssdit_gemm(f, ws->t_p, ws->m1p, swp->mlp_fc2_w,
+        if (cs3d_ssdit_gemm(f, ws->t_p, ws->m1p, swp->mlp_fc2_w, swp->mlp_fc2_w16,
                        swp->mlp_fc2_b, N_p, mlp_h, dim) < 0) return -1;
     }
     {

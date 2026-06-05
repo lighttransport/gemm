@@ -1379,6 +1379,24 @@ static int sb_precision_is_supported(const char *p)
            !strcmp(p, "fp16") || !strcmp(p, "fp32");
 }
 
+static int sb_env_is_zero(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] == '0';
+}
+
+static int sb_body_cublas_gemm_enabled(const cuda_sam3d_body_ctx *ctx)
+{
+    if (!ctx || sb_precision_is_fp32(ctx)) return getenv("SAM3D_BODY_CUBLAS_GEMM") != NULL;
+    return !sb_env_is_zero("SAM3D_BODY_CUBLAS_GEMM");
+}
+
+static int sb_env_is_set_nonzero(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] && v[0] != '0';
+}
+
 static int sb_bf16_round(cuda_sam3d_body_ctx *ctx, void *x, int n)
 {
     if (!sb_precision_is_bf16(ctx) || !x || n <= 0) return 0;
@@ -1429,7 +1447,7 @@ static int sb_gemm_encoder(cuda_sam3d_body_ctx *ctx, void *Y,
         gp_t0 = sb_time_ms();
     }
     if (ctx && ctx->use_cublas && !sb_precision_is_fp32(ctx) &&
-        getenv("SAM3D_BODY_CUBLAS_GEMM")) {
+        sb_body_cublas_gemm_enabled(ctx)) {
         if (sb_cast_gemm_x16(ctx, X, n_tok * n_in) == 0) {
             int ok = sb_precision_is_bf16(ctx)
                 ? cublasew_gemm_bf16_bf16_f32_rowmajor_nt(
@@ -1474,7 +1492,7 @@ static int sb_gemm_encoder(cuda_sam3d_body_ctx *ctx, void *Y,
     }
 
     if (ctx && ctx->use_cublas && sb_precision_is_fp32(ctx) &&
-        getenv("SAM3D_BODY_CUBLAS_GEMM") &&
+        sb_body_cublas_gemm_enabled(ctx) &&
         cublasew_gemm_f32_pedantic_rowmajor_nt(ctx->cublas,
                                                (CUdeviceptr)(uintptr_t)Y,
                                                (CUdeviceptr)(uintptr_t)W,
@@ -1566,9 +1584,10 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
         fprintf(stderr, "sam3d_body: kernel compile failed\n");
         free(c); return NULL;
     }
-    if ((getenv("SAM3D_BODY_CUBLAS_GEMM") ||
-         getenv("SAM3D_BODY_CUBLAS_PATCH") ||
-         getenv("SAM3D_BODY_CUBLAS_ATTN")) &&
+    if (((!sb_precision_is_fp32(c) && sb_body_cublas_gemm_enabled(c)) ||
+         sb_env_is_set_nonzero("SAM3D_BODY_CUBLAS_GEMM") ||
+         sb_env_is_set_nonzero("SAM3D_BODY_CUBLAS_PATCH") ||
+         sb_env_is_set_nonzero("SAM3D_BODY_CUBLAS_ATTN")) &&
         cublasewCreate(&c->cublas, 0) == 0) {
         c->use_cublas = 1;
         if (c->verbose >= 1)
@@ -2462,7 +2481,7 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         ((sb_precision_is_fp32(ctx) && getenv("SAM3D_BODY_CUBLAS_PATCH")) ||
          (!sb_precision_is_fp32(ctx) &&
           (getenv("SAM3D_BODY_CUBLAS_PATCH") ||
-           getenv("SAM3D_BODY_CUBLAS_GEMM"))));
+           sb_body_cublas_gemm_enabled(ctx))));
     if (use_cublas_patch) {
         const int K_PATCH = 3 * SB_PATCH * SB_PATCH;
         if (!ctx->d_patch_cols) {
