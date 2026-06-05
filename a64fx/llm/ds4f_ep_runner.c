@@ -170,6 +170,7 @@ int main(void) {
     int maxgen    = envi("DS4F_MAXGEN", 16);
     int maxpos    = envi("DS4F_MAXPOS", 4096);
     int layers    = envi("DS4F_LAYERS", 0);
+    int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* fill synthetic KV+compressed to this ctx, decode from there */
 
     /* ---- uTofu bootstrap (single TNI) ---- */
     utofu_tni_id_t *tni_ids = NULL; size_t num_tnis = 0;
@@ -199,6 +200,7 @@ int main(void) {
     cfg.max_pos = maxpos;
     if (layers > 0) cfg.n_layers = layers;
     if (prefill + maxgen > cfg.max_pos) die("prefill+maxgen exceeds max_pos", -1);
+    if (ctx_warm + maxgen > cfg.max_pos) die("ctx_warm+maxgen exceeds max_pos", -1);
 
     int dense_bf16 = envi("DS4F_FP8_BF16", 0);
     const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
@@ -208,10 +210,10 @@ int main(void) {
     if (MyRank == 0)
         logmsg("=== DS4F EP synthetic harness (Stage 2): %d ranks ===\n"
                "layers=%d hidden=%d experts=%d active=%d  owned~%d/layer  dense=%s\n"
-               "threads=%d prefill=%d maxgen=%d max_pos=%d  arena~%.2f GB/node\n",
+               "threads=%d prefill=%d maxgen=%d max_pos=%d ctx_warm=%d  arena~%.2f GB/node\n",
                N, cfg.n_layers, cfg.hidden, cfg.n_experts, cfg.n_active, no,
                dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)",
-               n_threads, prefill, maxgen, maxpos, arena_est/(1024.0*1024.0*1024.0));
+               n_threads, prefill, maxgen, maxpos, ctx_warm, arena_est/(1024.0*1024.0*1024.0));
 
     /* ---- allocate this rank's shard (owned experts + replicated dense) ----
      * DS4F_REAL=1: load REAL staged weights for THIS rank (rank<MyRank>.blob in
@@ -302,12 +304,24 @@ int main(void) {
 
     barrier();   /* lockstep check between phases */
 
+    /* ---- optional long-ctx warm: fill synthetic KV + compressed caches to ctx_warm,
+     * then decode from there. Deterministic (fixed per-layer seeds) + rank-independent
+     * (local caches only, no all-reduce) -> lockstep preserved. Lets us measure decode
+     * cost at long ctx without paying O(ctx^2) real prefill. ---- */
+    int dec_base = prefill;
+    if (ctx_warm > 0) {
+        ds4f_warm_kv(m, ctx_warm);
+        ds4f_warm_tb2(m, ctx_warm);
+        dec_base = ctx_warm;
+        if (MyRank == 0) logmsg("warmed synthetic KV+compressed caches to ctx=%d; decoding from there\n", ctx_warm);
+    }
+
     /* ---- decode (M=1, token-at-a-time) ---- */
     memset(m->prof, 0, sizeof(m->prof));
     double t_dec0 = now_sec(); size_t dec_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int last_tok = 0;
     for (int g = 0; g < maxgen; g++) {
-        int pos = prefill + g;
+        int pos = dec_base + g;
         for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
         m->bytes_read = 0;
         last_tok = ds4f_forward_token(m, x, pos);

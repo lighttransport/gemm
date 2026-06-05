@@ -13,15 +13,21 @@ in `~/.claude/plans/plan-deepseek-v4-flash-iterative-prism.md`.
 ## TL;DR
 
 ```sh
-# inside a live 12-node alloc (shape 2x3x2), from a64fx/llm:
-./run_ds4f_stage_11n.sh                          # 1. shard weights -> each node's /local (~22 GB/node)
-DS4F_REAL=1 DS4F_EXACT=1 ./run_ds4f_11n.sh        # 2. exact Tier-B1 forward on the 11 EP nodes
+# inside a live 12-node alloc (shape 2x3x2; 1 node reserved for agent/claude control),
+# from a64fx/llm:
+./run_ds4f_stage_11n.sh                                  # 1. shard weights -> each node's /local (~22 GB/node)
+DS4F_REAL=1 DS4F_EXACT=1 ./run_ds4f_11n.sh                # 2. exact Tier-B1 forward on the 11 EP nodes
+DS4F_REAL=1 DS4F_TIERB2=1 ./run_ds4f_11n.sh              # 2b. Tier-B2 compressor/indexer (reuses blobs)
+DS4F_REAL=1 DS4F_FP8_BF16=1 ./run_ds4f_11n.sh           # 2c. bf16-pv dense promote (fast decode)
+./run_ds4f_longctx_11n.sh                                # 2d. long-ctx Tier-B2 bench (O(topk) payoff)
 ```
 
-Both launchers default to `NP=11`, `EXCLUDE=0,0,0` (drops the claude/login-colocated
-node), and regenerate `vcoord_ds4f.txt` + the Tofu topology for the *current* alloc.
-Last validated (job 49092345, 2026-06-05): `rc=0`, NaNs=0, argmax=122293,
-prefill 10.44 / decode 10.16 tok/s, arena 22.18 / RSS 21.81 GB/node.
+All launchers default to `NP=11`, `EXCLUDE=0,0,0` (drops the agent/claude-colocated
+node — the 12th node is reserved for agent control and would OOM under the ~22 GB load),
+and regenerate `vcoord_ds4f.txt` + the Tofu topology for the *current* alloc. Steps 2b–2d
+reuse the Step-1 blobs (no re-stage). Last Tier-B1 validation (job 49092345, 2026-06-05):
+`rc=0`, NaNs=0, argmax=122293, prefill 10.44 / decode 10.16 tok/s, arena 22.18 /
+RSS 21.81 GB/node. Per-config numbers are in Steps 2–2d.
 
 ## Files (branch `ds4f`)
 
@@ -33,6 +39,7 @@ prefill 10.44 / decode 10.16 tok/s, arena 22.18 / RSS 21.81 GB/node.
 | `a64fx/llm/ds4f_stage.c` | sharded safetensors → per-node `/local/ds4f/rank<rr>.blob` stager |
 | `a64fx/llm/run_ds4f_stage_11n.sh` | stage launcher (mpiexec, PMIX_RANK self-ID) |
 | `a64fx/llm/run_ds4f_11n.sh` | run launcher (vcoord + topo + mpiexec) |
+| `a64fx/llm/run_ds4f_longctx_11n.sh` | long-ctx Tier-B2 bench wrapper (ctx-warm + sentinel) |
 | `a64fx/utofu-tests/tofu_topo_helper` | MPI program that writes `tofu_topo.txt` (rank→coords) |
 
 Build is native `fcc`/`FCC` (NOT `fccpx`/`FCCpx`); binaries run directly, **no `pjsub`**
@@ -127,6 +134,47 @@ matvec-bound (o_proj 29 % + qkv 19 % + shared 11 %); comm ~20 % is the EP all-re
 Amdahl floor (same as synthetic). MXFP4-dense is NOT promotable from real FP8 (lossy) —
 `ds4f_load_dense` aborts on an MXFP4 dense dest.
 
+## Step 2d — long-context Tier-B2 run (the O(topk) payoff)
+
+```sh
+./run_ds4f_longctx_11n.sh                       # ctx=16384, combined bf16-pv + Tier-B2
+DS4F_CTX_WARM=8192 ./run_ds4f_longctx_11n.sh    # a lower curve point
+```
+
+The wrapper sets `DS4F_CTX_WARM=N`: after the (short) prefill, `ds4f_warm_kv(m,N)` +
+`ds4f_warm_tb2(m,N)` fill the synthetic KV + compressed (`cmp_kv` / `idx_kv`) caches to
+`N` positions, then decode runs from `pos=N`. Both fills are **deterministic** (fixed
+per-layer splitmix64 seeds) and **rank-independent** (local caches only, no all-reduce)
+⇒ lockstep is preserved across all 11 ranks. This measures decode/attn cost at long
+context **without** the O(ctx²) cost of a real prefill of that length. `DS4F_MAXPOS`
+auto-sizes to `CTX_WARM + MAXGEN + 256` (the runner asserts `ctx_warm + maxgen ≤ max_pos`).
+
+Validated (combined `DS4F_REAL=1 DS4F_FP8_BF16=1 DS4F_TIERB2=1`, reused blobs,
+EXCLUDE=0,0,0, prefill 8 + decode 16, all rc=0 / 11/11 / NaNs=0 / argmax lockstep):
+
+| ctx | attn ms | tb2prep ms | qkv | o_proj | decode tok/s | RSS GB | argmax |
+|---|---|---|---|---|---|---|---|
+| 24 (baseline) | 4.11 | 16.86 | 18.71 | 29.48 | 10.10 | 27.51 | 98198 |
+| 8192 | 88.97 | 113.96 | 18.76 | 28.58 | 3.56 | 28.23 | 16 |
+| 16384 | 95.96 | 159.68 | 18.85 | 28.56 | 3.00 | 28.95 | 10973 |
+| 32768 | — OOM (`rc=137`) — | | | | | | |
+
+- **O(topk) payoff (real weights):** doubling ctx 8192→16384 grew `attn` only **+7.9 %**.
+  The CSA compressed-attn term is capped at `index_topk=512` in both (T = ctx/4 = 2048 →
+  4096, both > 512) ⇒ CSA attn flat; the +7.9 % is the HCA(128) portion (ctx/128). Had
+  attn scaled with T (no cap), ctx=16384 would be ~2800 ms (4.11 × 680) — **the cap saves
+  ~29×**.
+- **The new long-ctx ceiling is the index *scan*, not attention.** `tb2prep` grew
+  **+40 %** per 2× ctx (≈linear) and is now **41–48 % of decode** — `index_score` scans
+  all T = ctx/4 compressed `idx_kv` positions to rank the top-512. It reads *activations*,
+  so it is immune to both the topk cap and the bf16 weight-quant (Step 2 follow-up). The
+  weight-bound qkv/o_proj are perfectly ctx-flat. Decode dropped only −16 % for a 2× ctx
+  step (sub-linear; a dense O(ctx) model would roughly halve).
+- **HBM ceiling (f32 KV):** `kv_cache = max_pos · 512 · 4B · 43 layers`. ctx=16384
+  (RSS 28.95 GB) is the safe top; **ctx=32768 OOM-kills** (`rc=137`) — the load completes
+  @ 27.51 GB (lazy pages), then the warm faults the full ~2.9 GB KV + compressed caches
+  past usable HBM. An **f16 KV cache** would double the headroom to reach 32K+ (a TODO).
+
 ## OPS gotchas (each cost a real cycle)
 
 1. **A job restart wipes `/local` AND moves the alloc.** A new `pjsub`/restart →
@@ -216,6 +264,41 @@ decode M>1 to amortize the 43 per-layer all-reduces.
 | `DS4F_STAGE_FLUSH_GB` | 2 | stager HBM dirty-cache flush granularity |
 | `DS4F_STAGE_DIR` | `/local/ds4f` | per-node blob dir |
 | `DS4F_PREFILL` / `DS4F_MAXGEN` | 8 / 16 | prefill / decode token counts |
+| `DS4F_CTX_WARM` | 0 | >0 = warm synthetic KV+compressed caches to this ctx, decode from there (long-ctx bench, Step 2d); deterministic + rank-independent (lockstep-safe) |
+| `DS4F_MAXPOS` | 4096 | KV/compressed cache capacity; must exceed `CTX_WARM+MAXGEN` (f32 KV: ~ctx16384 fits, 32768 OOMs) |
 | `DS4F_LAYERS` | 0 (=43) | layer count (small = smoke) |
 | `LLM_THREADS` | 48 | OpenMP threads/node |
 | `SKIP_TOPO` | unset | 1 = reuse existing `tofu_topo.txt` (**never across jobs**) |
+
+## Current state (2026-06-05)
+
+Everything below is **DONE + validated** on the 11 EP nodes (real DeepSeek-V4-Flash
+weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
+
+- **Tier-B1 exact dense forward** (Step 2): RoPE/YaRN, per-head q-norm, MQA sliding-window
+  + sink attn, grouped low-rank o-proj, sqrtsoftplus gate, swiglu clamp — argmax=122293,
+  10.16 tok/s FP8 dense.
+- **Tier-B2 compressor/indexer** (Step 2b): stateful 21-CSA + 20-HCA decode path, real
+  weights loaded by name; bf16 weight-quant (`037a2d1`, −37 % tb2prep, argmax-exact);
+  pooled+SVE compressor/indexer kernels (`f648b79`, 14× over the f32-reference path).
+- **bf16-pv dense promote** (Step 2c): lossless FP8→bf16-pv at load, decode 16.73 tok/s
+  (+65 %).
+- **Long-ctx Tier-B2** (Step 2d): O(topk) payoff confirmed — attn +7.9 % per 2× ctx
+  (capped at `index_topk=512`); the index *scan* is the new long-ctx ceiling. ctx-warm
+  infra (`ds4f_ep_runner.c` `DS4F_CTX_WARM` + `run_ds4f_longctx_11n.sh`) is the only
+  **uncommitted** piece as of this writing → committed alongside this doc.
+
+## Remaining work (priority order)
+
+1. **SVE/quant kernels for the `index_score` scan** — the confirmed long-ctx bottleneck
+   (`tb2prep` 41–48 % of decode at ctx ≥ 8K, O(ctx/ratio), reads `idx_kv` *activations*
+   so weight-quant can't help). Currently pooled-f32 over `idx_kv`; quantize `idx_kv` +
+   SVE-dot the scan to lift long-ctx decode.
+2. **f16 KV cache** — halve the KV footprint (`kv_cache` is f32 today) to reach ctx ≥ 32K
+   without OOM; the f32 build caps at ~ctx16384 (RSS 28.95 GB).
+3. **Batched decode / prefill M > 1** — amortize the 43 per-layer EP all-reduces
+   (comm ~20 % Amdahl floor at M=1). Needs packed-B GEMM kernels; note the known A64FX
+   batched-prefill regression (`project_batched_prefill_finding`).
+4. **fp4 compressor/indexer weights** — LOSSY, low value (the bf16 weights are already
+   bit-exact and the `index_score`/RoPE/fp4 overhead, not the weights, is the `tb2prep`
+   floor). Only if HBM pressure justifies.
