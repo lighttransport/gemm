@@ -168,10 +168,10 @@ void cs3d_ssdit_outer_ws_free(cs3d_ssdit_outer_ws *ws)
 
 static int outer_gemm_fns(const cs3d_ssdit_outer_fns *fns,
                           CUdeviceptr d_out, CUdeviceptr d_in,
-                          CUdeviceptr d_w, CUdeviceptr d_b,
+                          CUdeviceptr d_w, CUdeviceptr d_w16, CUdeviceptr d_b,
                           int N, int K, int M)
 {
-    if (cs3d_ssdit_gemm(&fns->block, d_out, d_in, d_w, d_b, N, K, M) == 0)
+    if (cs3d_ssdit_gemm(&fns->block, d_out, d_in, d_w, d_w16, d_b, N, K, M) == 0)
         return 0;
     unsigned gx = (N + 15) / 16, gy = (M + 15) / 16;
     void *args[] = { &d_out, &d_in, &d_w, &d_b, &N, &K, &M };
@@ -184,8 +184,8 @@ static int build_t_emb(const cs3d_ssdit_outer_fns *fns,
                        const cs3d_ssdit_gpu *g,
                        cs3d_ssdit_outer_ws *ws,
                        CUdeviceptr d_out, float t,
-                       CUdeviceptr fc1_w, CUdeviceptr fc1_b,
-                       CUdeviceptr fc2_w, CUdeviceptr fc2_b)
+                       CUdeviceptr fc1_w, CUdeviceptr fc1_w16, CUdeviceptr fc1_b,
+                       CUdeviceptr fc2_w, CUdeviceptr fc2_w16, CUdeviceptr fc2_b)
 {
     int half = g->freq_dim / 2;
     int dim  = g->dim;
@@ -196,14 +196,14 @@ static int build_t_emb(const cs3d_ssdit_outer_fns *fns,
     }
     /* h1 = fc1(emb) [1, dim]. Reuse t_silu as h1 scratch. */
     int N1 = 1;
-    if (outer_gemm_fns(fns, ws->t_silu, ws->freq_buf, fc1_w, fc1_b,
+    if (outer_gemm_fns(fns, ws->t_silu, ws->freq_buf, fc1_w, fc1_w16, fc1_b,
                        N1, g->freq_dim, dim) < 0) return -1;
     {
         unsigned grid = (unsigned)((dim + 255) / 256);
         void *args[] = { &ws->t_silu, &dim };
         if (cuLaunchKernel(fns->silu, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL) != CUDA_SUCCESS) return -1;
     }
-    if (outer_gemm_fns(fns, d_out, ws->t_silu, fc2_w, fc2_b,
+    if (outer_gemm_fns(fns, d_out, ws->t_silu, fc2_w, fc2_w16, fc2_b,
                        N1, dim, dim) < 0) return -1;
     return 0;
 }
@@ -240,7 +240,7 @@ int cs3d_ssdit_outer_forward(const cs3d_ssdit_gpu       *g,
         if (cuMemcpyHtoD(ws->in_proj_tmp, latents_in[SAM3D_SS_LAT_SHAPE],
                          (size_t)L->token_len * L->in_channels * sizeof(float)) != CUDA_SUCCESS) return -1;
         if (outer_gemm_fns(fns, ws->xs, ws->in_proj_tmp,
-                           L->input_w, L->input_b, L->token_len,
+                           L->input_w, L->input_w16, L->input_b, L->token_len,
                            L->in_channels, dim) < 0) return -1;
         int total = L->token_len * dim;
         unsigned grid = (unsigned)((total + 255) / 256);
@@ -256,7 +256,7 @@ int cs3d_ssdit_outer_forward(const cs3d_ssdit_gpu       *g,
                              (size_t)L->token_len * L->in_channels * sizeof(float)) != CUDA_SUCCESS) return -1;
             CUdeviceptr d_dst = ws->xp + off * sizeof(float);
             if (outer_gemm_fns(fns, d_dst, ws->in_proj_tmp,
-                               L->input_w, L->input_b, L->token_len,
+                               L->input_w, L->input_w16, L->input_b, L->token_len,
                                L->in_channels, dim) < 0) return -1;
             int total = L->token_len * dim;
             unsigned grid = (unsigned)((total + 255) / 256);
@@ -268,12 +268,12 @@ int cs3d_ssdit_outer_forward(const cs3d_ssdit_gpu       *g,
 
     /* === t/d embedder === */
     if (build_t_emb(fns, g, ws, ws->t_emb, t,
-                    g->t_emb_fc1_w, g->t_emb_fc1_b,
-                    g->t_emb_fc2_w, g->t_emb_fc2_b) < 0) return -1;
+                    g->t_emb_fc1_w, g->t_emb_fc1_w16, g->t_emb_fc1_b,
+                    g->t_emb_fc2_w, g->t_emb_fc2_w16, g->t_emb_fc2_b) < 0) return -1;
     if (g->is_shortcut) {
         if (build_t_emb(fns, g, ws, ws->d_emb, d,
-                        g->d_emb_fc1_w, g->d_emb_fc1_b,
-                        g->d_emb_fc2_w, g->d_emb_fc2_b) < 0) return -1;
+                        g->d_emb_fc1_w, g->d_emb_fc1_w16, g->d_emb_fc1_b,
+                        g->d_emb_fc2_w, g->d_emb_fc2_w16, g->d_emb_fc2_b) < 0) return -1;
         int total = dim;
         unsigned grid = (unsigned)((total + 255) / 256);
         void *args[] = { &ws->t_emb, &ws->d_emb, &total };
@@ -292,7 +292,8 @@ int cs3d_ssdit_outer_forward(const cs3d_ssdit_gpu       *g,
         /* mod6 = adaln_w @ t_silu + adaln_b   shape [1, 6*dim]. */
         int six_d = 6 * dim;
         if (outer_gemm_fns(fns, ws->mod6, ws->t_silu,
-                           g->blocks[b].adaln_w, g->blocks[b].adaln_b,
+                           g->blocks[b].adaln_w, g->blocks[b].adaln_w16,
+                           g->blocks[b].adaln_b,
                            1, dim, six_d) < 0) return -1;
         if (cs3d_ssdit_block_forward(&fns->block, ws_block, &g->blocks[b],
                                      ws->mod6,
@@ -316,7 +317,7 @@ int cs3d_ssdit_outer_forward(const cs3d_ssdit_gpu       *g,
         CUdeviceptr d_proj_out;
         if (cuMemAlloc(&d_proj_out, (size_t)total * sizeof(float)) != CUDA_SUCCESS) return -1;
         if (outer_gemm_fns(fns, d_proj_out, ws->ln_tmp,
-                           L->out_w, L->out_b, L->token_len, dim,
+                           L->out_w, L->out_w16, L->out_b, L->token_len, dim,
                            L->in_channels) < 0) {
             cuMemFree(d_proj_out); return -1;
         }
@@ -339,7 +340,7 @@ int cs3d_ssdit_outer_forward(const cs3d_ssdit_gpu       *g,
             CUdeviceptr d_proj_out;
             if (cuMemAlloc(&d_proj_out, (size_t)total * sizeof(float)) != CUDA_SUCCESS) return -1;
             if (outer_gemm_fns(fns, d_proj_out, ws->ln_tmp,
-                               L->out_w, L->out_b, L->token_len, dim,
+                               L->out_w, L->out_w16, L->out_b, L->token_len, dim,
                                L->in_channels) < 0) {
                 cuMemFree(d_proj_out); return -1;
             }

@@ -64,7 +64,7 @@ int main(int argc, char **argv)
     if (cuCtxCreate(&cu_ctx, 0, dev) != CUDA_SUCCESS) return 5;
 
     cs3d_ssdit_gpu g;
-    if (cs3d_ssdit_gpu_load(&g, m, verbose) < 0) {
+    if (cs3d_ssdit_gpu_load(&g, m, NULL, "fp32", 0, verbose) < 0) {
         fprintf(stderr, "cs3d_ssdit_gpu_load failed\n");
         return 7;
     }
