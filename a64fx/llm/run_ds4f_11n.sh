@@ -86,6 +86,10 @@ export DS4F_STAGE_DIR=${DS4F_STAGE_DIR:-/local/ds4f}
 export DS4F_EXACT=${DS4F_EXACT:-0}
 # DS4F_MHC=1 enables exact manifold-constrained hyper-connections (4-stream).
 export DS4F_MHC=${DS4F_MHC:-0}
+# DS4F_TIERB2=1 enables the stateful compressor/indexer (CSA/HCA) decode path.
+# Implies EXACT (q-norm/RoPE/window). With DS4F_REAL=1 the compressor/indexer
+# tensors (staged as dense) are loaded by name and widened to f32 at load time.
+export DS4F_TIERB2=${DS4F_TIERB2:-0}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
@@ -93,7 +97,7 @@ export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # bitwise-identical (lockstep preserved). Default off; flip to cut comm.
 export TP_AR_BF16=${TP_AR_BF16:-0}
 
-echo "=== DS4F EP harness on $NP node(s) ($([ "$DS4F_REAL" = 1 ] && echo "REAL weights <- $DS4F_STAGE_DIR" || echo synthetic)$([ "$DS4F_EXACT" = 1 ] && echo " EXACT-math")$([ "$DS4F_MHC" = 1 ] && echo " mHC")) ==="
+echo "=== DS4F EP harness on $NP node(s) ($([ "$DS4F_REAL" = 1 ] && echo "REAL weights <- $DS4F_STAGE_DIR" || echo synthetic)$([ "$DS4F_EXACT" = 1 ] && echo " EXACT-math")$([ "$DS4F_TIERB2" = 1 ] && echo " TierB2")$([ "$DS4F_MHC" = 1 ] && echo " mHC")) ==="
 echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43} dense=$([ "$DS4F_REAL" = 1 ] && echo "FP8(real)" || ([ "$DS4F_FP8_BF16" = 1 ] && echo BF16 || echo FP8))"
 
 # ---- build (native fcc + OpenMP) ----

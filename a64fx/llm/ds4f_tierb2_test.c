@@ -144,6 +144,103 @@ static void run_indexer(const char *tag, long base, int seqlen, int dim, int qlo
     free(qheads); free(weights); free(score); free(sel);
 }
 
+/* ---- decode: incremental Compressor via ds4f_compress_step (state ring) ---- */
+static void run_compress_decode(const char *tag, long base, int npos, int dim, int d,
+                                int rd, int ratio, int rotate) {
+    int coff = (ratio == 4) ? 2 : 1, W = coff * d, half = rd / 2, rows = coff * ratio;
+    float *wkv = malloc((size_t)W * dim * 4), *wgate = malloc((size_t)W * dim * 4);
+    float *ape = malloc((size_t)ratio * W * 4);
+    uint16_t *nw = malloc((size_t)d * 2);
+    float *x = malloc((size_t)npos * dim * 4);
+    float *cosb = malloc((size_t)npos * half * 4), *sinb = malloc((size_t)npos * half * 4);
+    for (int o = 0; o < W; o++)
+        for (int i = 0; i < dim; i++) {
+            wkv[o * dim + i] = gv(base + o, i);
+            wgate[o * dim + i] = gv(base + 1000 + o, i);
+        }
+    for (int r = 0; r < ratio; r++)
+        for (int c = 0; c < W; c++) ape[r * W + c] = gv(base + 2000 + r, c);
+    for (int e = 0; e < d; e++) nw[e] = ds4f_f32_bf16(gv(base + 3000, e));
+    for (int pos = 0; pos < npos; pos++)
+        for (int i = 0; i < dim; i++) x[pos * dim + i] = gv(base + 4000 + pos, i);
+    rope_table(npos, rd, 10000.0f, cosb, sinb);
+    float *kvst = malloc((size_t)rows * W * 4), *scst = malloc((size_t)rows * W * 4);
+    ds4f_compress_state_reset(kvst, scst, ratio, d);
+    float *out = malloc((size_t)d * 4);
+    char nm[40];
+    for (int pos = 0; pos < npos; pos++) {
+        int did = ds4f_compress_step(x + (size_t)pos * dim, dim, d, rd, ratio, pos,
+                                     wkv, wgate, ape, nw, cosb, sinb, 1e-6f, rotate,
+                                     kvst, scst, out);
+        if (did)
+            for (int e = 0; e < d; e++) {
+                snprintf(nm, sizeof nm, "%s_%d_%d", tag, pos, e); emit(nm, (double)out[e]);
+            }
+    }
+    free(wkv); free(wgate); free(ape); free(nw); free(x); free(cosb); free(sinb);
+    free(kvst); free(scst); free(out);
+}
+
+/* ---- decode: incremental Indexer via ds4f_index_step (seed @pos0, score @pos>0) ---- */
+static void run_indexer_decode(const char *tag, long base, int npos, int dim, int qlora,
+                               int H, int hd, int rd, int ratio, int k, int offset) {
+    int half = rd / 2, Wc = 2 * hd, rows = 2 * ratio; float eps = 1e-6f;  /* overlap, ratio==4 */
+    float *wqb = malloc((size_t)H * hd * qlora * 4), *wproj = malloc((size_t)H * dim * 4);
+    float *cwkv = malloc((size_t)Wc * dim * 4), *cwgate = malloc((size_t)Wc * dim * 4);
+    float *cape = malloc((size_t)ratio * Wc * 4);
+    uint16_t *cnorm = malloc((size_t)hd * 2);
+    float *x = malloc((size_t)npos * dim * 4), *qr = malloc((size_t)npos * qlora * 4);
+    float *cosb = malloc((size_t)npos * half * 4), *sinb = malloc((size_t)npos * half * 4);
+    for (int o = 0; o < H * hd; o++)
+        for (int i = 0; i < qlora; i++) wqb[o * qlora + i] = gv(base + o, i);
+    for (int h = 0; h < H; h++)
+        for (int i = 0; i < dim; i++) wproj[h * dim + i] = gv(base + 100 + h, i);
+    for (int o = 0; o < Wc; o++)
+        for (int i = 0; i < dim; i++) {
+            cwkv[o * dim + i] = gv(base + 200 + o, i);
+            cwgate[o * dim + i] = gv(base + 300 + o, i);
+        }
+    for (int r = 0; r < ratio; r++)
+        for (int c = 0; c < Wc; c++) cape[r * Wc + c] = gv(base + 400 + r, c);
+    for (int e = 0; e < hd; e++) cnorm[e] = ds4f_f32_bf16(gv(base + 500, e));
+    for (int pos = 0; pos < npos; pos++)
+        for (int i = 0; i < dim; i++) x[pos * dim + i] = gv(base + 600 + pos, i);
+    for (int pos = 0; pos < npos; pos++)
+        for (int i = 0; i < qlora; i++) qr[pos * qlora + i] = gv(base + 700 + pos, i);
+    rope_table(npos, rd, 10000.0f, cosb, sinb);
+
+    float *kvst = malloc((size_t)rows * Wc * 4), *scst = malloc((size_t)rows * Wc * 4);
+    ds4f_compress_state_reset(kvst, scst, ratio, hd);
+    int ncomp = npos / ratio + 1;
+    float *idx_kv = calloc((size_t)ncomp * hd, 4);
+    float *q_scr = malloc((size_t)H * hd * 4), *score_scr = malloc((size_t)ncomp * 4);
+    float *comp_out = malloc((size_t)hd * 4);
+    int *sel = malloc((size_t)k * sizeof(int));
+    char nm[48];
+    for (int pos = 0; pos < npos; pos++) {
+        if (pos == 0) {                                       /* seed compressor only */
+            ds4f_compress_step(x, dim, hd, rd, ratio, 0, cwkv, cwgate, cape, cnorm,
+                               cosb, sinb, eps, 1, kvst, scst, comp_out);
+            continue;
+        }
+        int T = ds4f_index_step(x + (size_t)pos * dim, dim, qr + (size_t)pos * qlora, qlora,
+                                H, hd, rd, ratio, pos, offset, k,
+                                wqb, wproj, cwkv, cwgate, cape, cnorm,
+                                cosb, sinb, eps, kvst, scst, idx_kv,
+                                q_scr, score_scr, sel);
+        if (T == 0) continue;
+        for (int t = 0; t < T; t++) {
+            snprintf(nm, sizeof nm, "%s_is_%d_%d", tag, pos, t); emit(nm, (double)score_scr[t]);
+        }
+        for (int n = 0; n < k; n++) {
+            snprintf(nm, sizeof nm, "%s_it_%d_%d", tag, pos, n); emit(nm, (double)sel[n]);
+        }
+    }
+    free(wqb); free(wproj); free(cwkv); free(cwgate); free(cape); free(cnorm);
+    free(x); free(qr); free(cosb); free(sinb);
+    free(kvst); free(scst); free(idx_kv); free(q_scr); free(score_scr); free(comp_out); free(sel);
+}
+
 int main(void) {
     OUT = fopen("tierb2_c.txt", "w");
     if (!OUT) { perror("tierb2_c.txt"); return 1; }
@@ -210,6 +307,29 @@ int main(void) {
 
     /* ---- 6. Indexer (prefill scoring + masked top-k) ---- */
     run_indexer("ix", 8000, 12, 6, 6, 4, 8, 4, 4, 2, 100);
+
+    /* ---- 7. window/compress index helpers (decode, start_pos>0) ---- */
+    enum { WD_WIN = 4 };
+    for (int sp = 1; sp < 10; sp++) {
+        int row[WD_WIN]; ds4f_window_idx_decode(WD_WIN, sp, row);
+        for (int c = 0; c < WD_WIN; c++) {
+            snprintf(nm, sizeof nm, "wd_%d_%d", sp, c); emit(nm, (double)row[c]);
+        }
+    }
+    for (int sp = 1; sp < 10; sp++) {
+        int row[16], n = ds4f_compress_idx_decode(3, sp, 100, row);
+        for (int t = 0; t < n; t++) {
+            snprintf(nm, sizeof nm, "cd_%d_%d", sp, t); emit(nm, (double)row[t]);
+        }
+    }
+
+    /* ---- 8. Compressor (stateful incremental decode) ---- */
+    run_compress_decode("c1d", 5000, 10, 6, 8, 4, 4, 1);   /* overlap + rotate (indexer compressor) */
+    run_compress_decode("c2d", 5000, 10, 6, 8, 4, 4, 0);   /* overlap, no rotate (layer compressor) */
+    run_compress_decode("c3d", 6000, 8, 6, 8, 4, 2, 0);    /* non-overlap (ratio!=4) */
+
+    /* ---- 9. Indexer (stateful incremental decode) ---- */
+    run_indexer_decode("ixd", 8000, 12, 6, 6, 4, 8, 4, 4, 2, 100);
 
     fclose(OUT);
     printf("wrote tierb2_c.txt\n");

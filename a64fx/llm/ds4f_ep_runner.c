@@ -225,6 +225,16 @@ int main(void) {
         ? ds4f_load_real(cfg, ep_rank, ep_size, blob_dir, n_threads, n_cmgs)
         : ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
     if (!m) { fprintf(stderr, "rank %d: model alloc/load failed\n", MyRank); exit(1); }
+    if (MyRank == 0 && m->tierb2) {
+        int ncsa = 0, nhca = 0;
+        for (int L = 0; L < cfg.n_layers; L++) {
+            if (cfg.compress_ratios[L] == 4) ncsa++;
+            else if (cfg.compress_ratios[L]) nhca++;
+        }
+        logmsg("Tier-B2: ON (exact forced)  index_topk=%d index_dim=%d index_heads=%d  "
+               "(%d CSA + %d HCA layers; compressed-KV folded into window softmax)\n",
+               cfg.index_topk, cfg.index_head_dim, cfg.index_n_heads, ncsa, nhca);
+    }
     double ta1 = now_sec();
     {   char tn[64]; snprintf(tn, sizeof tn, "ds4f_ep_load_rank%02d.txt", MyRank);
         FILE *tf = fopen(tn, "w");
