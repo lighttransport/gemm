@@ -125,7 +125,7 @@ int main(int argc, char **argv)
     if (cs3d_slatdit_fns_lookup(&fns, mod) != 0) return 7;
 
     cs3d_slatdit_gpu g;
-    if (cs3d_slatdit_gpu_load_transformer(&g, m, verbose) != 0) return 5;
+    if (cs3d_slatdit_gpu_load_transformer(&g, m, NULL, "fp32", 0, verbose) != 0) return 5;
     cs3d_slatdit_block_ws ws;
     if (cs3d_slatdit_block_ws_alloc(&ws, N, Nc, g.dim, g.mlp_hidden) != 0) return 5;
 
