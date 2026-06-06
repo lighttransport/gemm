@@ -164,12 +164,12 @@ EXCLUDE=0,0,0, prefill 8 + decode 16, all rc=0 / 11/11 / NaNs=0 / argmax lockste
   4096, both > 512) ⇒ CSA attn flat; the +7.9 % is the HCA(128) portion (ctx/128). Had
   attn scaled with T (no cap), ctx=16384 would be ~2800 ms (4.11 × 680) — **the cap saves
   ~29×**.
-- **The new long-ctx ceiling is the index *scan*, not attention.** `tb2prep` grew
-  **+40 %** per 2× ctx (≈linear) and is now **41–48 % of decode** — `index_score` scans
-  all T = ctx/4 compressed `idx_kv` positions to rank the top-512. It reads *activations*,
-  so it is immune to both the topk cap and the bf16 weight-quant (Step 2 follow-up). The
-  weight-bound qkv/o_proj are perfectly ctx-flat. Decode dropped only −16 % for a 2× ctx
-  step (sub-linear; a dense O(ctx) model would roughly halve).
+- **`tb2prep` grew +40 % per 2× ctx and was 41–48 % of decode.** *(SUPERSEDED — Step 2g
+  root-caused this: the ctx-linear growth was `ds4f_index_topk`'s O(k·T) selection, not the
+  `index_score` scan (1.2 %) nor the projections (~14 %). Fixed to O(T·log k); `tb2prep` is now
+  ~12 % of decode. See "Current state" Step 2g.)* The scan reads T = ctx/4 compressed `idx_kv`
+  positions to rank the top-512 — *activations*, immune to the topk cap and bf16 weight-quant;
+  the weight-bound qkv/o_proj are ctx-flat.
 - **HBM ceiling — it is the *weight* footprint, not KV.** The bf16 KV cache (Step 2e) is
   now landed and halves `kv_cache` to `max_pos · 512 · 2B · 43L`, yet **ctx=32768 still
   OOM-kills** under the gen config. The dominant resident cost is the **27.5 GB replicated
@@ -225,10 +225,11 @@ Step 2d O(topk) table above is the lighter mHC-off sparse-path characterization:
 | 32768 | — | | | | | **OOM-kill** (sig=9 during warm-fill) |
 | 65536 | — | | | | | died pre-load (PMIx — 32768-OOM aftermath, see OPS note) |
 
-- Real-model decode is **~2.7–3 tok/s at 10–16K ctx** — below the 10–15 tok/s target. The
-  dominant cost is **`tb2prep`** (the compressor/indexer `index_score` O(ctx/ratio) scan,
-  38–43 %) then **attn** (~27 %); both read *activations*, so weight-quant can't help them.
-  This is the same long-ctx ceiling Step 2d identified, now measured under the full mHC path.
+- Real-model decode *was* **~2.7–3 tok/s at 10–16K ctx** with `tb2prep` dominant (38–43 %).
+  *(SUPERSEDED — Step 2g: `tb2prep`'s cost was `ds4f_index_topk` (O(k·T)), not the `index_score`
+  scan. Fixed → **5.21 tok/s @ctx10240**, `tb2prep` ~12 %; **attn (48 %) is now dominant**. See
+  "Current state" Step 2g.)* Both `tb2prep` and `attn` read *activations*, so weight-quant
+  can't help them; int8 KV would cut `attn`.
 - **bf16 KV did not raise the ctx ceiling much** — the blocker is the 27.5 GB weight base
   (see the HBM note above), not KV precision. ctx ≤ ~16K is the safe top under
   `DS4F_FP8_BF16=1`; reaching 32K needs `DS4F_FP8_BF16=0` (FP8 dense, −6 GB) and/or int8 KV.
@@ -427,15 +428,51 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
   corrupted compressor ring-state → NaNs; size to `max(max_pos, index_topk)`), and the
   mHC-off architecture gap. Gen-mode + tokenizer + bf16 KV + these fixes are **uncommitted**
   as of this writing.
+- **Single-node decode roofline + FUSED FP8→bf16 prefill GEMM** (Step 2f, `affb141`/`7426330`):
+  `ds4f_decode_bw_bench.c` rooflines every weight rep cold-HBM (node R≈720 GB/s) — bf16 is
+  BW-bound (~85 % R) and 2–3× faster/matvec than dequant-bound FP8; scalar/NEON and
+  double-buffer **refuted**. The fused tile-dequant GEMM makes `DS4F_FP8_BF16=0` prefill ~88 %
+  of the +6 GB bf16-resident speed (kills the +6 GB without losing prefill).
+- **int8/SVE `index_score` scan** (`ae1167d`): resident per-position int8 (`DS4F_IDX_INT8`,
+  default off). **argmax-exact (96/96) on real weights**, f32 path bit-identical, but a
+  confirmed **negative for ≤16k decode** (the `DS4F_P_TB2SCAN` sub-timer proved the scan is
+  1.2 % of decode, not the bottleneck).
+- **Fast `index_topk` — the real decode bottleneck, FIXED (Step 2g, uncommitted).** Full
+  per-component `tb2_prepare` profiling (`DS4F_P_TB2{QPROJ,ROPE,ICMP,WPROJ,LCMP,TOPK}` sub-timers)
+  found the actual hot line: of `tb2prep`'s 126 ms @ctx10240, the projections/compressor sum to
+  only **~17.7 ms** — the remaining **108.7 ms (86 % of `tb2prep`, 37 % of decode) is
+  `ds4f_index_topk`**, the O(k·T) repeated-linear-scan selection (+ O(k²) sort). Replaced with an
+  O(T·log k) **size-`npick` min-heap → τ threshold → merge {score>τ} ∪ lowest-index {score==τ}**
+  that produces the *identical* selected set & order. **Result: decode 3.38 → 5.21 tok/s
+  @ctx10240 (+54 %, 1.54×); `tb2topk` 108.7 → 4.19 ms (25.9×).** Validated: `tools/topk_equiv_test.c`
+  432 adversarial trials (T≤4096, k=512, heavy ties, all-equal, relu-sparse, thr<T) **diff-empty**
+  vs naive; 11-node real-weight ctx-warm A/B **argmax-exact 223/81819 fast==naive**, NaNs=0, RSS
+  unchanged, lockstep held. New default; `DS4F_TOPK_NAIVE=1` keeps the O(k·T) reference. Scales
+  BETTER with ctx (was the steepest ctx-linear decode term).
 
 ## Remaining work (priority order)
 
-1. **SVE/quant kernels for the `index_score` scan** — the confirmed long-ctx bottleneck
-   (`tb2prep` 41–48 % of decode at ctx ≥ 8K, O(ctx/ratio), reads `idx_kv` *activations*
-   so weight-quant can't help). Currently pooled-f32 over `idx_kv`; quantize `idx_kv` +
-   SVE-dot the scan to lift long-ctx decode.
+> **Bottleneck history (both prior hypotheses were WRONG; resolved Step 2g).** (1) The
+> "`index_score` scan is the long-ctx bottleneck" framing was wrong — the `DS4F_P_TB2SCAN`
+> sub-timer showed the scan is only **1.2 % of decode**. (2) The follow-up "the other 97 % of
+> `tb2prep` is O(1) projections/compressor" correction was *also* wrong — full per-component
+> sub-timers showed those projections/compressor sum to only **~17.7 ms** (~14 % of `tb2prep`).
+> The real cost was **`ds4f_index_topk` = 108.7 ms = 86 % of `tb2prep` = 37 % of decode**, an
+> O(k·T) ctx-linear selection. It is now O(T·log k) (Step 2g above) and `tb2prep` is down to
+> ~22 ms (11.6 % of decode). **Lesson: measure the one untimed op before theorizing — the gap
+> between `tb2prep` and the sum of its sub-timers was the whole story.**
+
+1. **Attention is now the dominant decode cost (91 ms = 48 %).** With `index_topk` fixed,
+   `attn` + `o_proj` (29 ms, 15 %) are the next levers at testable (≤16k) ctx. `attn` reads the
+   (bf16) KV cache and the compressed-KV window — characterize it (sliding-window softmax vs
+   compressed-KV gather vs the score matvec) before optimizing; likely BW-bound on the KV read
+   (so int8 KV — item 2 — would cut it too) rather than issue-bound. The `tb2prep` projections/
+   compressor (~18 ms total) are now small; not worth chasing until `attn`/`o_proj` are addressed.
+   - *Done & shelved:* **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`). argmax-exact
+     (96/96), f32 path bit-identical, gated default-off, but zero ≤16k decode win (Amdahl 1.2 % +
+     M=1 q-quant cancellation). Keep as the 256k building block.
 2. **256k decode without degradation (10–15 tok/s)** — the original long-ctx target, NOT
-   reached this session. Two independent blockers, both characterized:
+   reached. Two independent blockers, both characterized:
    - **Memory:** bf16 KV (done, Step 2e) was not enough — ctx=32768 still OOMs because the
      27.5 GB replicated dense weights (inflated +6 GB by `DS4F_FP8_BF16=1`) dominate, not KV.
      Levers: `DS4F_FP8_BF16=0` (FP8 dense, −6 GB, slower) and **int8 KV** (quarter the f32
@@ -451,12 +488,55 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
      distribution — the per-channel scheme + calibration window still need argmax-exact
      confirmation on real latents (alloc-blocked). Implementation: `kv_cache` uint16→int8 +
      `kv_scale[layer][512]` (calibrate during prefill/warm), dequant at the latent-read sites.
-   - **Speed:** even at 10–16K, decode is ~2.7–3 tok/s (target 10–15), bound by `tb2prep`
-     (the `index_score` O(ctx/ratio) scan, 38–43 %, item 1) + attn (~27 %). At 256k the scan
-     dominates outright — int8/SVE `index_score` is the prerequisite for the tok/s target.
+   - **Speed:** after the `index_topk` fix (Step 2g) decode is **5.21 tok/s @ctx10240** (target
+     10–15), now bound by **attn (48 %)** + o_proj (15 %) — see item 1. At 256k the index *scan*
+     additionally grows to dominate — int8/SVE `index_score` (done, `ae1167d`) is the 256k
+     prerequisite but does not move ≤16k.
 3. **Batched decode / prefill M > 1** — amortize the 43 per-layer EP all-reduces
    (comm ~20 % Amdahl floor at M=1). Needs packed-B GEMM kernels; note the known A64FX
    batched-prefill regression (`project_batched_prefill_finding`).
 4. **fp4 compressor/indexer weights** — LOSSY, low value (the bf16 weights are already
    bit-exact and the `index_score`/RoPE/fp4 overhead, not the weights, is the `tb2prep`
    floor). Only if HBM pressure justifies.
+
+## Next session — resuming prompt
+
+> **TASK: attack the new dominant decode cost — `attn` (91 ms = 48 % of decode @ctx10240),
+> then `o_proj` (29 ms = 15 %).** The `index_topk` bottleneck is FIXED (Step 2g: decode
+> 3.38 → 5.21 tok/s, gated `DS4F_TOPK_NAIVE=1` for the reference); `tb2prep` is now only 22 ms
+> (11.6 %), so don't chase it further.
+>
+> Branch `ds4f`. UNCOMMITTED as of this writing: the fast `index_topk` + per-component
+> `tb2prep` sub-timers (`common/ds4f_impl.h`, `common/ds4f.h`: `prof[16]`/`DS4F_NPHASE=16`/
+> `DS4F_P_TB2{QPROJ,ROPE,ICMP,WPROJ,LCMP,TOPK}`), the psum fixes (`ds4f_ep_runner.c`,
+> `ds4f_runner.c` — exclude TB2* sub-timers), `DS4F_TOPK_NAIVE` export in `run_ds4f_11n.sh`,
+> `tools/topk_equiv_test.c`, and this doc + memory. **Commit when the user asks.**
+>
+> **Step 1 (measure — do this first):** `attn` has no sub-timers yet. Add them *inside* the
+> attention path (mirror the `DS4F_P_TB2*` pattern: fwd-decl `ds4f_now`, static ns accumulators,
+> fold into `m->prof[]`; enum/`DS4F_NPHASE`/`ds4f_prof_names` in `common/ds4f.h`) to split `attn`
+> across: sliding-window softmax over bf16 KV, compressed-KV (cmp_kv) window gather/softmax, and
+> the per-head score matvec. Run the ctx-warm A/B (`DS4F_PROF=1 DS4F_QUIET=1 DS4F_CTX_WARM=10240
+> SKIP_TOPO=1 ./run_ds4f_longctx_11n.sh`, sentinel, lockstep-safe). **The biggest sub-line is the
+> target.**
+>
+> **Step 2 (optimize the dominant one):** hypothesis — `attn` is BW-bound on the bf16 KV read
+> (it grows with ctx). If so it is the SAME lever as **int8 KV** (item 2 of Remaining work):
+> halving KV bytes cuts the attn read directly *and* unblocks 32k+ memory. The int8-KV scheme is
+> already de-risked (static per-channel scale, `tools/int8kv_probe.c`); wiring = `kv_cache`
+> uint16→int8 + `kv_scale[layer][512]` calibrated during warm/prefill, dequant at the latent-read
+> sites. Validate argmax-exact on real weights. If `attn` is instead issue-bound on the score
+> matvec, SVE/magic that kernel. Gate any behavior change behind a flag.
+>
+> **GATES (non-negotiable):** native `fcc`/`FCC` (never `fccpx`); run binaries directly in the
+> alloc, NO `pjsub`; NP=11 `EXCLUDE=0,0,0` (node 0 is claude — running ~22 GB there OOM-kills the
+> session); validate **argmax-exact + selected-set, never bit-equality**; keep cross-rank
+> lockstep; `DS4F_MHC=1` for any coherence check; keep multi-node output compact
+> (`DS4F_QUIET=1` / log+sentinel, never `cat` all 11 rank files); **don't probe ctx past ~16k**
+> on a shared alloc (one OOM-kill degrades PMIx → loses the whole alloc, ~21 min re-stage); use
+> `/local` else `~/tmp`; commit only when asked, message ends
+> `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+>
+> **If a job restart wipes /local / moves the alloc:** re-stage (Step 1 of this doc) + regenerate
+> topo (never `SKIP_TOPO=1` across jobs). The single-node pinned bench (`ds4f_decode_bw_bench.c`,
+> cores 12–59) is the alloc-free vehicle to roofline a new KV/attn kernel before wiring it.

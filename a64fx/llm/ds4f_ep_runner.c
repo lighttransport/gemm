@@ -485,7 +485,9 @@ int main(void) {
             logmsg("         %.2f GB/tok-weights  argmax=%d  NaNs=%d  RSS=%.2f GB\n",
                    (dec_bytes/(double)maxgen)/1e9, last_tok, nan_count, rss_bytes()/1e9);
         }
-        double psum = 0; for (int i = 0; i < DS4F_NPHASE; i++) psum += m->prof[i];
+        /* psum = top-level phases only (0..TB2PREP); TB2SCAN.. are SUB-timers of TB2PREP and
+         * would double-count. Their printed % is then a clean "% of decode" reading. */
+        double psum = 0; for (int i = 0; i <= DS4F_P_TB2PREP; i++) psum += m->prof[i];
         if (psum > 0 && maxgen > 0) {
             logmsg("per-phase decode (ms/tok):\n");
             for (int i = 0; i < DS4F_NPHASE; i++) {
