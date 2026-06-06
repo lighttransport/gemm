@@ -43,3 +43,21 @@ See a64fx/doc/SVE_INSTRUCTION_REFERENCE.md a64fx/doc/SVE_INSTRUCTION_LATENCY.md
 use /local as tempdir
 if /local not available, use ~/tmp
 
+## interactive sessions: keep multi-node output compact (context hygiene)
+
+Multi-node DS4F runs emit per-rank status files (×11) that are **lockstep-identical**
+(perf/argmax/RSS match across all ranks by design), so reading all of them into an
+interactive session burns context for no information. Keep runs lean:
+
+- `DS4F_QUIET=1 ./run_ds4f_11n.sh` — prints only counts (`load=11/11 perf=11/11`) + the
+  rank0 head instead of `cat`-ing every `ds4f_ep_{load,perf}_rank*.txt`. Full files stay on
+  disk for inspection.
+- `DS4F_STAGE_COMPACT=1 ./run_ds4f_stage_11n.sh` — prints only `done=N/NP`, not all 11
+  byte-identical stage lines.
+- `run_ds4f_longctx_11n.sh` / `run_ds4f_gen_11n.sh` already redirect the full run to a log
+  and print only a compact **sentinel** block — use them as the model for new runners.
+- General practice: **redirect a run's full output to a log file, then read back only the
+  sentinel / a few `grep`'d lines** — never `cat` all per-rank files into the conversation.
+  Rank0 + a cross-rank lockstep count check is sufficient (the scripts already verify
+  `argmax_distinct_across_ranks==1`).
+

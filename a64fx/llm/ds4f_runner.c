@@ -150,7 +150,8 @@ int main(void) {
 
     /* batched-prefill knobs:
      *   DS4F_PREFILL_BATCH = M_TILE > 0  -> process prefill in M-token GEMM tiles
-     *                                       (needs DS4F_EXACT=1 + DS4F_FP8_BF16=1).
+     *                                       (needs DS4F_EXACT=1; FP8 dense batches
+     *                                        via tile-dequant, FP8_BF16=1 optional).
      *   DS4F_PREFILL_CHECK = 1           -> also run token-at-a-time and diff the
      *                                       per-token argmax + final hidden state. */
     int prefill_batch = envi("DS4F_PREFILL_BATCH", 0);
