@@ -123,6 +123,9 @@ export DS4F_IDX_INT8=${DS4F_IDX_INT8:-0}
 # fast O(T*log k) heap+merge (selected set & order bit-identical; validated 432 trials +
 # argmax-exact on real weights). The naive path was ~108ms/tok (37% of decode @ctx10240).
 export DS4F_TOPK_NAIVE=${DS4F_TOPK_NAIVE:-0}
+# DS4F_ATTN_SVE=0 forces the OLD scalar decode-attn inner loops (reference). Default 1 =
+# SVE-widened dot/axpy over kv_lora=512 (PV bit-exact; QK dot reorders, argmax-safe).
+export DS4F_ATTN_SVE=${DS4F_ATTN_SVE:-1}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
