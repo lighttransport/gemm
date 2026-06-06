@@ -680,7 +680,7 @@ int main(int argc, char **argv) {
         snprintf(text_before, sizeof(text_before), "<|im_start|>user\n<|vision_start|>");
         snprintf(text_after, sizeof(text_after),
                  "<|vision_end|>%s<|im_end|>\n"
-                 "<|im_start|>assistant\n",
+                 "<|im_start|>assistant\n<think>\n",
                  user_prompt);
     }
 
@@ -770,6 +770,7 @@ int main(int argc, char **argv) {
     qwen_decode_state decode_state = init_decode_state(vocab);
     reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
     int32_t next_token = argmax_i32(logits, n_vocab);
+    double gen_t0 = get_time_ms();
 
     for (int g = 0; g < max_gen; g++) {
         emit_visible_token(vocab, &decode_state, next_token);
@@ -793,8 +794,13 @@ int main(int argc, char **argv) {
         }
         next_token = argmax_i32(logits, n_vocab);
     }
+    double gen_t1 = get_time_ms();
     printf("\n");
     fprintf(stderr, "[thought: %d/%d tokens used]\n", rb.count, rb.budget);
+    fprintf(stderr, "  [Decode: %d tokens in %.0f ms (%.2f ms/tok, %.1f tok/s)]\n",
+            max_gen, gen_t1 - gen_t0,
+            (gen_t1 - gen_t0) / (max_gen > 0 ? max_gen : 1),
+            max_gen / ((gen_t1 - gen_t0) / 1000.0));
 
     /* ---- 10. Cleanup ---- */
     fprintf(stderr, "\nCleaning up...\n");
