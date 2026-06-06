@@ -354,6 +354,21 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
             const uint16_t *w = base + (size_t)i * K;
             matvec_bf16_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K, x, K);
         }
+    } else if (t->type == DS4F_Q8_PV) {
+        /* int8 W8A8 (DS4F_Q8_DENSE). Like the regular Q8_PV matvec, but the block-
+         * diagonal x differs per group => re-quantize x only when the group changes
+         * (groups are glora-aligned and glora%8==0, so a quantize lands on a block
+         * boundary). Bit-exact to the per-group ds4f_matvec Q8 path (same xq/xs, same
+         * (i/8)*gb weight offset). */
+        const uint8_t *base = (const uint8_t *)t->w;
+        size_t gb = (size_t)(K / 64) * 528;
+        int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
+        int cur_g = -1;
+        for (int i = r0; i + 7 < r1; i += 8) {
+            int g = i / glora;
+            if (g != cur_g) { ds4f_quant_x_sdot_into(T->xbase + (size_t)g * gin, K, xq, xs); cur_g = g; }
+            matvec_sdot_8row(dst + i, base + (size_t)(i / 8) * gb, xq, xs, K);
+        }
     } else if (t->type == DS4F_FP8) {
         const uint8_t *base = (const uint8_t *)t->w;
         int sb_cols = (K + 127) / 128;
@@ -2248,6 +2263,10 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     { const char *e = getenv("DS4F_MHC");       m->mhc       = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_EXACT");     m->exact     = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_TIERB2");    m->tierb2    = (e && *e && atoi(e)) ? 1 : 0; }
+    /* DS4F_Q8_DENSE=1: repack the dominant dense (bf16-pv) -> int8 W8A8 after load
+     * (svdot, ~1 B/elem -> halves dense matvec HBM bytes AND reclaims the bf16 src).
+     * Was only wired into ds4f_alloc_synth; mirror it here so the REAL path honors it. */
+    { const char *e = getenv("DS4F_Q8_DENSE");  m->q8_dense  = (e && *e && atoi(e)) ? 1 : 0; }
     if (m->tierb2) m->exact = 1;   /* Tier-B2 reuses the exact q-norm/RoPE/window path */
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
