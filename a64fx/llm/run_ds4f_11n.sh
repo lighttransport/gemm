@@ -71,6 +71,10 @@ export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
 export DS4F_CTX_WARM=${DS4F_CTX_WARM:-0}
 export DS4F_LAYERS=${DS4F_LAYERS:-0}
 export DS4F_FP8_BF16=${DS4F_FP8_BF16:-0}
+# DS4F_FP8_MAGIC=1 uses the gather-free "magic" FP8->f32 decode matvec (FTZ subnormals,
+# exp==15 -> large finite) instead of the LUT-gather kernel; only active when dense is
+# FP8 (DS4F_FP8_BF16=0). Default 0 (gather). Flip pending real-weight argmax-exact gate.
+export DS4F_FP8_MAGIC=${DS4F_FP8_MAGIC:-0}
 # DS4F_DENSE_MXFP4=1 routes replicated dense through MXFP4 split (0.53 B/elem):
 # leaner than FP8 AND faster, but compute-bound so slower than bf16-pv. Lean
 # long-ctx default candidate. Overrides FP8/BF16.
@@ -107,6 +111,14 @@ export DS4F_MHC=${DS4F_MHC:-0}
 # Implies EXACT (q-norm/RoPE/window). With DS4F_REAL=1 the compressor/indexer
 # tensors (staged as dense) are loaded by name and widened to f32 at load time.
 export DS4F_TIERB2=${DS4F_TIERB2:-0}
+# DS4F_IDX_INT8=1 swaps the Tier-B2 indexer index_score f32 svmla scan for a RESIDENT int8/SVE
+# svdot scan: idx_kv quantized ONCE at write (per-position absmax scale) into idx_kv8, read int8
+# directly (4 int8 MACs/lane). idx_kv is Hadamard-rotated+fp4'd at write so per-position int8 is
+# safe. VALIDATED argmax-exact on real weights (96/96 ids). But NO decode win at <=16k ctx: the
+# scan is only 1.2% of decode (TB2SCAN sub-timer), and M=1's per-query int8 quant (~85us) cancels
+# the scan's 1.85x parallel win. Default 0 (f32). Projected payoff only at >=256k ctx (untestable,
+# OOM). Kept as a gated building block. Conditional alloc => zero cost when off.
+export DS4F_IDX_INT8=${DS4F_IDX_INT8:-0}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
