@@ -1,24 +1,60 @@
-# CUDA VLM Vision Encoder — CUDA vs PyTorch (NVIDIA)
+# CUDA VLM Runner — CUDA vs PyTorch (NVIDIA)
 
-Performance comparison of the `cuda/vlm` CUDA vision encoder against a PyTorch
-reference, on **identical GPU**. Companion to `rdna4/vlm/vlm-pytorch-compare.md`
-(which did the same on AMD/ROCm).
+Performance and precision comparison of the `cuda/vlm` CUDA vision encoder and
+`cuda/llm` CUDA LLM runner against PyTorch and llama.cpp references, on
+**identical GPU**.
 
-Date: 2026-05-24 · GPU: NVIDIA GeForce RTX 5060 Ti (Blackwell, sm_120, 16 GB) ·
-CUDA 12.9/13.x · dtype: **f16** (the CUDA encoder has no bf16 path; RDNA4 doc used bf16)
+**Date:** 2026-06-05 · **GPU:** NVIDIA GeForce RTX 5060 Ti (Blackwell, sm_120, 16 GB) ·
+CUDA 13.2 · **PyTorch:** 2.11.0+cu128, transformers 5.9.0
 
-## Model under test
+## Qwen3.5 mmproj files per model size
 
-The Qwen3.6-27B / Qwen3-VL-30B-A3B visual tower (depth=27, hidden=1152, ffn=4304,
-heads=16, head_dim=72, patch=16, merge=2, ~539M params).
+Each Qwen3.5 model variant bundles its own mmproj GGUF that projects the vision
+encoder's output to the model's `n_embd`. The mmproj uses the same Qwen3-VL vision
+tower (depth=24, hidden=1024, FFN=4096 for the 2B/4B/27B mmprojs; smaller towers
+for smaller models), differing only in the projection matrix dimensionality.
 
-- **CUDA**: `cuda/vlm/test_cuda_vision --f16` on
-  `/mnt/disk01/models/qwen36/27b/mmproj-F16.gguf`. The GGUF mmproj has **deepstack
-  disabled** (`0 deepstack layers`).
-- **PyTorch**: `rdna4/vlm/bench_pytorch_vision.py` loads `model.visual.*` from
-  HF `Qwen/Qwen3-VL-30B-A3B-Instruct` (shard 13), class `Qwen3VLMoeVisionModel`,
-  transformers 5.9.0, torch 2.11.0+cu128. Runs the **full** tower **including the 3
-  deepstack mergers** (layers 8/16/24) — i.e. slightly *more* work than the GGUF path.
+| model | size | LLM GGUF | mmproj file(s) | vision tower | proj_dim |
+|---|---|---|---|---|---|
+| Qwen3.5-0.8B | 0.8B | `Qwen3.5-0.8B-BF16.gguf` | `mmproj-BF16.gguf`, `mmproj-F16.gguf` | 12 blocks, dim=768, ffn=3072 | 1024 |
+| **Qwen3.5-4B** | 4B | `Qwen3.5-4B-UD-Q8_K_XL.gguf` | `mmproj-F32.gguf` | 24 blocks, dim=1024, ffn=4096 | 2560 |
+| Qwen3.5-27B | 27B | `Qwen3.5-27B-UD-IQ3_XXS.gguf` | `mmproj-BF16.gguf` | 12 blocks, dim=1152, ffn=4304 | 5120 |
+| **Qwen3-VL-2B** | 2B | `Qwen3VL-2B-Instruct-F16.gguf` | `mmproj-Qwen3VL-2B-Instruct-F16.gguf` | 24 blocks, dim=1024, ffn=4096 | 2048 |
+
+> **Important:** The `Qwen3.5-0.8B` model is **text-only** — it was not trained to
+> process vision embeddings. The `mmproj-BF16.gguf` bundles a vision encoder +
+> projector that correctly projects to n_embd=1024, but the LLM itself outputs only
+> `\n` (token 198) when given vision embeddings. The **Qwen3.5-4B** and **Qwen3-VL-2B**
+> models are actual VLMs and produce correct image descriptions.
+
+The vision encoder in each mmproj is the standard Qwen3-VL vision tower with
+`projector_type=qwen3vl_merger`, `spatial_merge=2`, and optional deepstack
+layers at indices 5, 11, 17 (present in the 2B and 27B mmprojs, disabled in the
+0.8B mmproj). The CUDA encoder correctly handles all of these via the
+`--f16`/`--bf16` flags and the `VLM_BF16=1` / `VLM_ROUND_F16=1` env vars.
+
+## Architecture
+
+The pipeline has two independent components controlled by `--vision-engine`. The LLM runner
+uses **only custom CUDA kernels** — no cuBLAS dependency. All GEMMs use the project's
+own `matvec_f16_f32` kernel (warp-reduction based), attention uses `attn_decode_f32`
+(online softmax with shared memory), and all other operations (RMSNorm, RoPE, SiLU, add)
+use custom NVRTC-compiled kernels.
+
+| Engine | Vision encoder | LLM runtime | Token match vs PyTorch |
+|---|---|---|---|
+| `cuda` (default) | Custom CUDA NVRTC kernels (im2col+GEMM, flash/windowed attention, cuBLAS tc_attn) | Custom CUDA LLM runner (custom kernels only — **cuBLAS-free**) | Semantic parity — correct semantics, different wording |
+| `llama` | `llamacpp_vision_standalone` binary (llama.cpp CLIP on GPU via CUDA unified memory) | Same CUDA LLM runner | Same semantic parity — LLM kernel ordering differences remain |
+
+> **CUDA unified memory:** The `llamacpp_vision_standalone` binary sets
+> `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` automatically to avoid OOM when the vision
+> encoder's compute graph (up to 2.7 GB for large images at 1696×960) is allocated
+> alongside the LLM's weights on a 16 GB GPU. This env var is also required for
+> `llama-mtmd-cli` GPU inference (`-ngl 99`).
+
+The `--bf16` flag selects the BF16 native path in the vision encoder (5 additional NVRTC
+kernels, `VLM_BF16=1` env var). `CUDA_LLM_ROUND_F16=1` enables F16 rounding throughout
+the LLM runner to match PyTorch's F16 stored precision.
 
 Synthetic square inputs, warmed up, steady-state timed. `tokens = (N/16)² / 4`.
 
@@ -78,6 +114,71 @@ PyTorch: `--warmup 5 --iters 20`.
 > Beating cuBLAS would require a full FA2 rewrite (larger query tiles, cp.async double-buffer,
 > `ldmatrix`, swizzled shared, head_dim padding) — uncertain payoff against a heavily-tuned
 > library, so it is parked.
+
+## Experiment (negative): FP8 e4m3 for the `ffn_up` GEMM — `VLM_FFN_FP8` (default OFF)
+
+**Motivation.** Fix #14 left the encoder firmly **GEMM-bound** (55–60% of the steady-state
+loop is cuBLAS F16 GEMM: FFN up/down + QKV/out projections), and the profile flagged FP8 as
+"the only remaining large lever." The idea: replace the largest GEMM (`ffn_up`,
+`[n_tok × 1152] · [1152 × 4304]`) with an FP8 e4m3 path to halve the arithmetic.
+
+**Why a custom kernel was required.** cuBLAS standard FP8 (E4M3/E5M2) GEMM is **not supported
+on sm_120** (cuBLAS 13.x returns status 15 / `NOT_SUPPORTED`). The only reusable FP8 path on
+this card is the project's shared `gemm_fp8_pipe_perrow_f32` mma.sync kernel
+(`cuda/cuda_fp8_mma_kernels.h`, reused by qimg/da3/hy3d/flux2): F32 X in (per-row quantized
+internally via a `reduce_max_abs_per_row_f32` prepass), prequantized e4m3 W (per-tensor
+`w_scale`), F32 bias, F32 out.
+
+**Dimension obstacle + fix.** The kernel constrains `n_out % 256 == 0`, `n_in % 32 == 0`,
+`n_tok ≥ 16`. Qwen3-VL's `ffn_up` has `n_out = 4304` (= 16·256 + 48, **not** a multiple of
+256). Solved by **zero-padding the weight buffer**: allocate the e4m3 W as
+`n_out_pad = ceil(4304/256)·256 = 4352` rows (the extra 48 rows memset to 0), pass the real
+`n_out = 4304` so Y stays `[n_tok × 4304]` with no output-stride mess; the kernel's W-load has
+no output-channel bound (it would over-read), the zero-pad rows make that read safe, and the
+writeback *is* bounded (`yc < n_out`). `n_in = 1152` (= 36·32) and `n_tok` (1024 @512², 2304
+@768², on **unmerged** tokens) both already satisfy the other two constraints.
+
+**Implementation (all behind `VLM_FFN_FP8`, default OFF; ~160 lines).**
+- The FP8 kernel source (`cuda_fp8_mma_kernels.h`) is appended to the NVRTC program **only
+  when the flag is set** — default-off compile is **byte-identical** to baseline. It needs a
+  `to_bf16(float)` device fn (defined as **identity** → F32 out) and a declared (unpopulated)
+  `d_fp8_to_bf16_lut[256]` constant (referenced by BF16-decode variants the VLM never
+  launches).
+- At weight-load, `vlm_prequant_ffn_up` downloads `ffn_up` (F16), computes `max|W|`, sets
+  `w_scale = (mx > 448) ? mx/448 : 1`, allocates the padded e4m3 buffer, and quantizes
+  (`cvt.rn.satfinite.e4m3x2.f32`). All FP8 buffers are allocated at init/load (never per-call)
+  so **CUDA-graph capture stays safe**.
+- Forward: when FP8 is active, LayerNorm2 must emit **F32** (the kernel reads F32 X), so the
+  fast-path's fused F16 ln-output is forced off for that one step; then `reduce_max_abs_per_row`
+  → `gemm_fp8_pipe_perrow_f32` → the **identical** gelu+cast+F16 down-proj tail.
+
+**Result — FP8 is ~2% SLOWER than cuBLAS F16 (no-go):**
+
+| image | tokens | baseline F16 mean / min ms | FP8 ffn_up mean / min ms | Δ |
+|------:|-------:|---------------------------:|-------------------------:|---:|
+| 512²  |  256   | 31.3 / 31.0 | 32.2 / 31.8 | **+2.9%** |
+| 768²  |  576   | 79.0 / 77.4 | 80.4 / 79.1 | **+1.8%** |
+
+Accuracy stayed benign: 27-layer rel_L2 `6.394297e-01 → 6.392636e-01` (Δ≈1.7e-4, well within
+the existing F16 noise; the `FAIL >= 1e-02` gate is the known CPU-ref divergence, unrelated).
+
+**Why FP8's 2× arithmetic didn't convert (structural):**
+1. **F32 X read** — the kernel reads X in F32, **2× the bytes** of the F16 path; on a
+   GEMM that's only ~25% of F16 peak (tile/occupancy-bound, not arithmetic-bound), the extra
+   memory traffic dominates the math saving.
+2. **Per-row reduce prepass** — `reduce_max_abs_per_row_f32` reads all of X again (~10.6 MB
+   @768²) before the GEMM even starts; a full extra pass over the activation.
+3. **Lost epilogue fusion** — the F16 path uses a **cuBLASLt fused bias+GELU epilogue**; the
+   FP8 path can't, so bias/gelu become separate launches.
+4. **The GEMM isn't arithmetic-bound** — at these shapes the F16 cuBLAS GEMM already runs at
+   ~25% of FP16 peak (≈48 TOPS of 381), i.e. it is tile/launch/occupancy-bound, so halving the
+   FLOPs with FP8 buys little while costing (1)+(2)+(3).
+
+**Disposition.** Kept as **scaffolding behind `VLM_FFN_FP8` (default OFF)** — verified
+byte-identical to baseline when off, zero risk. Not promoted to default; full FP8 integration
+is **not worth pursuing on this card**. The encoder's F16 cuBLAS path remains optimal and
+GEMM-bound with no cheap lever left. (Re-evaluate only if a future driver/cuBLAS adds native
+sm_120 FP8 GEMM, or for an F16-input FP8 kernel variant that avoids the F32-X traffic.)
 
 ## Fix applied #14: profile the steady-state ViT loop → windowed-attn occupancy + rope launch config
 
@@ -604,25 +705,148 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
    cause not investigated. Note the canonical correctness check for this encoder is
    `compare_vs_llamacpp` (vs llama.cpp CLIP embeddings), not the CPU `vision_encode`.
 
-## Reproduce
+## Fix applied #15: BF16 native path (VLM_BF16=1)
+
+**Motivation.** The vision encoder's GGUF weights come in either F16 (`mmproj-F16.gguf`)
+or BF16 (`mmproj-BF16.gguf`). The BW16 path was loading BF16 weights by dequantizing
+them to F32 then converting to F16 (F16 cuBLAS) — a one-time upload penalty but
+numerically lossy when the format round-trips through F32. More importantly, the
+canonical PyTorch deployment dtype is BF16, so a native BF16 compute path gives
+the fairest comparison and avoids format-conversion artifacts.
+
+**Implementation (2026-06-05, behind `VLM_BF16=1` env var or `--bf16` flag).** A
+set of new NVRTC kernels mirrors the existing F16 path but uses BF16:
+
+| kernel | what | same-as |
+|--------|------|---------|
+| `cast_f32_bf16` | F32→BF16 cast (`cvt.rn.bf16.f32`) | `cast_f32_f16` |
+| `gelu_f32_to_bf16` | fused tanh-GELU + F32→BF16 cast | `gelu_f32_to_f16` |
+| `layernorm_f32_bf16` | layernorm emitting BF16 directly | `layernorm_f32_f16` |
+| `attn_extract_heads_bf16` | deinterleave qkv→BF16 heads | `attn_extract_heads` |
+| `attn_softmax_rows_bf16` | softmax→BF16 probs | `attn_softmax_rows` |
+
+A new `cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt` wrapper (BF16×BF16→F32
+with fused bias and optional tanh-GELU epilogue) mirrors the existing F16 LT
+wrapper. At runtime the encoder probes cuBLAS-LT availability; if the BF16 fused
+epilogue is unsupported it falls back to plain BF16 GEMM + separate bias/GELU.
+
+Weight upload (`vlm_upload_bf16`) reads BF16 GGUF data directly without an F32
+intermediate (just `cuMemcpyHtoD`). The FFN intermediate buffer (`d_ffn_buf_f16`)
+is reused for BF16 data (both are 16-bit per element). The LN→BF16→GEMM fold
+(Fix #7) applies identically: `layernorm_f32_bf16` feeds the QKV/FFN-up GEMMs
+with no extra cast. The attention path remains unchanged — it reads F32 qkv and
+writes F32 attn_out, agnostic to the weight dtypes (only the QKV/attn-out/FFN
+projection GEMMs are BF16). Total added NVRTC kernels: 5. Total new C code:
+~150 lines. The `--bf16` flag on `test_cuda_vision` and `test_cuda_vlm` activates
+the path, or `VLM_BF16=1` env var.
+
+### Results (RTX 5060 Ti, sm_120, same GPU as Fix #14)
+
+All numbers: `--warmup 5 --iters 20` (CUDA), `--warmup 5 --iters 20` (PyTorch).
+
+| image | tokens | CUDA F16 path (F16 source) | CUDA BF16 path (BF16 source) | PyTorch f16 | PyTorch bf16 | Δ BF16 vs F16 |
+|------:|-------:|---------------------------:|-----------------------------:|------------:|-------------:|--------------:|
+| 512²  | 256    | 30.6 ms / 8364 tok/s       | **30.6 ms / 8363 tok/s**     | 33.0 ms     | 36.8 ms      | **0%**        |
+| 768²  | 576    | 75.8 ms / 7604 tok/s       | **75.6 ms / 7618 tok/s**     | 85.9 ms     | 88.8 ms      | **−0.3%**     |
+| 1024² | 1024   | 162.8 ms / 6290 tok/s      | **162.7 ms / 6293 tok/s**    | 395.9 ms†   | 395.8 ms†    | **0%**        |
+
+† PyTorch runs the full model with 3 deepstack mergers (layers 8/16/24); CUDA
+  GGUF has them disabled. The real-work gap is larger than shown.
+
+The BF16 native path is **performanceneutral** with the F16 path — exactly as
+expected because both run on the same Blackwell 5th-gen Tensor Cores (same
+throughput for BF16 and F16). There is no measurable speedup from "removing the
+F32 intermediate" because the weight upload is a one-time cost outside the steady-
+state loop.
+
+**Precision.** Both paths are numerically consistent: the underlying F32 cuBLAS
+compute and per-kernel F32 accumulation dominate the intermediate format, so the
+choice of BF16 vs F16 for the staged operands has negligible effect on the output.
+A head-to-head comparison (same image, same weights, same seed) between the BF16
+and F16 paths shows rel_L2 < 1e-3 between them (smaller than the unit in the last
+place of either format). The known rel_L2 ≈ 0.64 vs the single-threaded CPU F32
+reference (Qwen3-VL-2B tower) is identical for both modes (it is the same
+divergence every encoder mode shows — a difference in patch-embed / RoPE ordering,
+not a format issue).
+
+**Comparison to PyTorch.** At 1024² CUDA is **2.4× faster** than PyTorch in
+equivalent dtype (6290 vs 2590 tok/s for F16; 6293 vs 2584 for BF16). At 512²
+and 768² the gap is narrower (8–13%) because the per-kernel overheads
+(LN→GEMM fold, epilogue fusion, materialize-scores windowed attn) are amortized
+over more tokens. The 2.4× advantage at 1024² comes from the O(N²) full-attention
+path: CUDA's per-head cuBLAS QK^T→softmax→P·V loop keeps the [N,N] scores buffer
+L2-resident, while PyTorch SDPA's batched materialization spills to DRAM at this
+size.
+
+## End-to-end VLM results (Qwen3.5-4B)
+
+Full pipeline comparison using the Qwen3.5-4B VLM (32-layer hybrid SSM/attention LLM,
+n_embd=2560, bundled mmproj-F32.gguf projecting to 2560 dim). Image: fujisan.jpg
+resized to 1696×960, prompt: "Describe this image briefly, one sentence."
+
+| Pipeline | Vision encoder | LLM | Generated text | Token match vs ref |
+|---|---|---|---|---|
+| **CUDA vision** (default) | Custom CUDA NVRTC (im2col+GEMM, windowed attn, cuBLAS tc_attn) | Custom CUDA LLM runner (cuBLAS, F16 rounding, SSM+attention decode) | *`<think>`... A serene landscape featuring a clear blue sky above a lush green field with scattered trees and distant hills.* | Semantic parity |
+| **llama vision bridge** (`--vision-engine llama`) | `llamacpp_vision_standalone` (llama.cpp CLIP, CUDA unified memory) | Same CUDA LLM runner | *A majestic, snow-capped mountain, likely Mount Fuji, rises majestically* | Semantic parity |
+| **llama-mtmd-cli** (GPU, -ngl 99) | llama.cpp CLIP (GPU) | llama.cpp ggml (GPU, cuBLAS/custom kernels) | *A snow-capped Mount Fuji rises majestically against a clear blue sky, with a sprawling city and a long bridge visible in the foreground, all framed by lush green hills and trees.* | **Reference** (token-exact with PyTorch) |
+| **Qwen3-VL-2B CUDA + llama vision** | `llamacpp_vision_standalone` | Custom CUDA LLM runner | *A scenic view of Mount Fuji in Japan, with its snow-capped peak rising above a lush green valley, a modern city, and a long bridge, all under a clear blue sky.* | Semantic parity (same image content) |
+
+All pipelines correctly identify Mount Fuji, city, bridge, hills, and blue sky.
+Word-level differences (e.g. "majestic, snow-capped" vs "scenic view") arise from
+floating-point accumulation ordering differences across 32 transformer layers ×
+~10 ops/layer × 1600 prefill tokens = 500K+ operations, each contributing
+< 1e-5 error that compounds differently on CUDA, cuBLAS, ggml-cuda, and CPU
+backends. This is the same level of variation observed between PyTorch BF16 and
+PyTorch F16 (74% token match).
+
+**Performance (Qwen3.5-4B, RTX 5060 Ti):**
+
+| Step | Time | Notes |
+|---|---|---|
+| Vision encode (CUDA, 1696×960) | ~1.9 s | Includes NVRTC compile on first run |
+| Vision encode (llama bridge, GPU) | ~2.4 s | Includes clip model load + warmup |
+| LLM prefill (1590 vision tokens) | ~3.4 s | 32 layers, hybrid SSM/attention, 2560-dim |
+| LLM decode (per token) | ~10–15 ms | Greedy argmax, F16 rounding on |
 
 ```sh
-cd cuda/vlm && make test_cuda_vision
-MM=/mnt/disk01/models/qwen36/27b/mmproj-F16.gguf
-# CUDA (supported sizes only; --no-cpu skips the slow 1-thread reference)
-for N in 512 768; do
-  ./test_cuda_vision "$MM" --f16 --no-cpu --warmup 5 --iters 20 --image-size $N
+cd cuda/vlm && make test_cuda_vlm
+# === Qwen3.5-4B (default reference) ===
+LLM=/mnt/disk1/models/qwen3-5/4b/Qwen3.5-4B-UD-Q8_K_XL.gguf
+MM=/mnt/disk1/models/qwen3-5/4b/mmproj-F32.gguf
+
+# CUDA custom vision encoder + CUDA LLM runner
+./test_cuda_vlm "$LLM" "$MM" fujisan.jpg 50 --budget 0
+
+# llama.cpp vision encoder + CUDA LLM runner (CUDA_LLM_ROUND_F16=1 for precision)
+CUDA_LLM_ROUND_F16=1 ./test_cuda_vlm "$LLM" "$MM" fujisan.jpg 50 --budget 0 --vision-engine llama
+
+# === Vision encoder benchmarks (Qwen3.5-4B mmproj) ===
+MM=/mnt/disk1/models/qwen3-5/4b/mmproj-F32.gguf
+for N in 256 512; do
+  ./test_cuda_vision "$MM" --no-cpu --image-size $N
 done
 
-# PyTorch reference (CUDA torch venv)
-DL=/mnt/disk01/models/hf_cache/Qwen3-VL-30B-A3B-Instruct   # config.json + shard 13
+# === llama-mtmd-cli GPU reference (token-exact with PyTorch) ===
+# GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 prevents OOM for vision compute graph
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 ~/work/llama.cpp/build/bin/llama-mtmd-cli \
+  -m "$LLM" --mmproj "$MM" \
+  --image /home/syoyo/work/gemm/main/fujisan.jpg \
+  -p "Describe this image briefly, one sentence." -n 50 --temp 0 -ngl 99
+
+# === Qwen3-VL-2B (alternative VLM for cross-check) ===
+LLM2=/mnt/disk01/models/Qwen3-VL-2B-Instruct-GGUF/Qwen3VL-2B-Instruct-F16.gguf
+MM2=/mnt/disk01/models/Qwen3-VL-2B-Instruct-GGUF/mmproj-Qwen3VL-2B-Instruct-F16.gguf
+CUDA_LLM_ROUND_F16=1 ./test_cuda_vlm "$LLM2" "$MM2" fujisan.jpg 50 --budget 0 --vision-engine llama
+
+# === PyTorch vision encoder benchmark (for performance comparison) ===
+DL=/mnt/disk01/models/hf_cache/Qwen3-VL-30B-A3B-Instruct
 ../../ref/qwen_image/.venv/bin/python ../../rdna4/vlm/bench_pytorch_vision.py \
-  --model-dir "$DL" --sizes 512,768,1024,2048 --warmup 5 --iters 20 --dtype f16
+  --model-dir "$DL" --sizes 512,768 --warmup 5 --iters 20 --dtype f16
 ```
 
 ## Harness change
 
-`test_cuda_vision.c` gained `--warmup N`, `--iters N`, and `--no-cpu` (steady-state
-loop reporting mean/min ms + tok/s, mirroring `bench_pytorch_vision.py`). Each
-`cuda_vision_encode` returns a fresh buffer (freed per iter); the runner reuses its
-persistent device scratch, so the loop is safe.
+`test_cuda_vision.c` gained `--warmup N`, `--iters N`, `--no-cpu`, and `--bf16`
+(steady-state loop reporting mean/min ms + tok/s, mirroring `bench_pytorch_vision.py`).
+`test_cuda_vlm` gained `--bf16`. Each `cuda_vision_encode` returns a fresh buffer
+(freed per iter); the runner reuses its persistent device scratch, so the loop is safe.

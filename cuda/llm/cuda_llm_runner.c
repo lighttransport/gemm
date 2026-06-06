@@ -4743,11 +4743,9 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
         return NULL;
     }
 
-    if (!getenv("CUDA_LLM_DISABLE_CUBLAS") &&
-        cublasewCreate(&r->cublas, r->stream) == 0) {
-        r->use_cublas = 1;
-        if (verbose >= 1) fprintf(stderr, "cuda_llm: cuBLAS GEMM fast path enabled\n");
-    }
+    /* cuBLAS is intentionally disabled — all GEMMs use custom CUDA kernels
+     * for deterministic, cuBLAS-free operation. */
+    r->use_cublas = 0;
 
     /* Enable dp4a INT8 path for sm >= 6.1 (Pascal+) unless disabled */
     {
@@ -8888,24 +8886,7 @@ static void launch_batch_embed_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
-    if (n_tokens > 1 && r->use_cublas && r->cublas) {
-        CUdeviceptr w_f16 = (weight_type == GGML_TYPE_F16) ? mat : mat_f16;
-        if (w_f16) {
-            /* Try mixed F16×F32 first (fast path, pre-Blackwell) */
-            if (cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, dst, w_f16, input, n_tokens, out_dim, in_dim) == 0) {
-                return;
-            }
-            /* Fallback: convert F32 input to F16, use all-F16 GEMM (Blackwell) */
-            if (r->d_batch_f16_scratch) {
-                int n_elems = n_tokens * in_dim;
-                void *cvt_args[] = { &r->d_batch_f16_scratch, &input, &n_elems };
-                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, cvt_args, NULL);
-                if (cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, w_f16, r->d_batch_f16_scratch, n_tokens, out_dim, in_dim) == 0) {
-                    return;
-                }
-            }
-        }
-    }
+    /* cuBLAS-free: use custom kernels only */
 
     if (weight_type == GGML_TYPE_Q8_0) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
