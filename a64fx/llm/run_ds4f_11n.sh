@@ -131,6 +131,10 @@ export DS4F_ATTN_SVE=${DS4F_ATTN_SVE:-1}
 # cross-CMG barriers/layer + load imbalance; BIT-EXACT, same kernel+accum order). o_proj
 # was 28.8ms/tok = 25.6% of decode @ctx10240 (the dominant phase after attn/topk fixes).
 export DS4F_OPROJ_FUSE=${DS4F_OPROJ_FUSE:-1}
+# DS4F_QNR_PAR=0 forces the OLD serial per-head q-norm+RoPE (reference). Default 1 =
+# split the n_heads heads across the pool (BIT-EXACT: heads independent, same per-head
+# double-accum/scale/RoPE). Was 7.18ms/tok = 7.7% of decode @ctx10240 (scalar, serial on tid0).
+export DS4F_QNR_PAR=${DS4F_QNR_PAR:-1}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).

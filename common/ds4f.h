@@ -343,7 +343,7 @@ typedef struct {
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
-    double prof[16];
+    double prof[20];
 } ds4f_model;
 
 /* phase ids for ds4f_model.prof[]. TB2SCAN..TB2LCMP are SUB-timers of TB2PREP (they
@@ -357,15 +357,18 @@ typedef struct {
  *   tb2lcmp  = layer compressor (the top-of-tb2_prepare cmp_kv write) (O(1))
  *   tb2topk  = index_topk top-k selection (O(k*T) naive scan!) -- the real ctx-scaling cost
  * tb2prep - (sum of these) = glue. These isolate where the index decode time actually goes. */
-#define DS4F_NPHASE 16
+#define DS4F_NPHASE 20
 enum { DS4F_P_QKV=0, DS4F_P_ATTN=1, DS4F_P_OPROJ=2, DS4F_P_SHARED=3,
        DS4F_P_ROUTER=4, DS4F_P_EXPERTS=5, DS4F_P_HEAD=6, DS4F_P_OTHER=7,
        DS4F_P_TB2PREP=8, DS4F_P_TB2SCAN=9,
        DS4F_P_TB2QPROJ=10, DS4F_P_TB2ROPE=11, DS4F_P_TB2ICMP=12,
-       DS4F_P_TB2WPROJ=13, DS4F_P_TB2LCMP=14, DS4F_P_TB2TOPK=15 };
-static const char *ds4f_prof_names[16] = {
+       DS4F_P_TB2WPROJ=13, DS4F_P_TB2LCMP=14, DS4F_P_TB2TOPK=15,
+       /* QKV_A..QKV_ROPE are SUB-timers of QKV (like TB2SCAN.. are of TB2PREP) */
+       DS4F_P_QKV_A=16, DS4F_P_QKV_B=17, DS4F_P_QKV_KV=18, DS4F_P_QKV_ROPE=19 };
+static const char *ds4f_prof_names[20] = {
     "qkv_proj","attn","o_proj","shared","router","experts","head","other","tb2prep","tb2scan",
-    "tb2qproj","tb2rope","tb2icmp","tb2wproj","tb2lcmp","tb2topk" };
+    "tb2qproj","tb2rope","tb2icmp","tb2wproj","tb2lcmp","tb2topk",
+    "qkv_wqa","qkv_wqb","qkv_wkv","qkv_rope" };
 
 /* ===================== thread pool (pinned, spin) ===================== */
 typedef void (*ds4f_fn)(void *arg, int tid, int nthr);

@@ -2623,6 +2623,31 @@ static void ds4f_q_norm_rope(ds4f_model *m, float *q, int pos,
         ds4f_rope_apply(qh + nope, rcos, rsin, pos, half, 0);
     }
 }
+/* Parallel q-norm+RoPE: the n_heads heads are independent and write disjoint qh slices,
+ * so splitting heads across threads is BIT-EXACT to the serial loop (same per-head double
+ * accumulation order, same scale, same RoPE). Decode runs this serially on tid0 between the
+ * wq_b/wkv pool dispatches; it was 7.18 ms/tok = 7.7% of decode @ctx10240 (64 heads * HD=512
+ * scalar dot+scale * 43 layers, scalar-issue-bound). One pool_run amortizes that over 48 cores. */
+typedef struct { ds4f_model *m; float *q; int pos; const float *rcos, *rsin; } ds4f_qnr_task;
+static void ds4f_qnr_worker(void *arg, int tid, int nthr) {
+    ds4f_qnr_task *T = (ds4f_qnr_task *)arg;
+    ds4f_config *c = &T->m->cfg;
+    int HD = c->q_head_dim, rd = c->qk_rope_dim, half = rd/2, nope = HD - rd, nh = c->n_heads;
+    int h0 = (int)((long)nh * tid / nthr), h1 = (int)((long)nh * (tid+1) / nthr);
+    for (int h = h0; h < h1; h++) {
+        float *qh = T->q + (size_t)h*HD;
+        double ss = 0.0; for (int d = 0; d < HD; d++) ss += (double)qh[d]*qh[d];
+        float inv = 1.0f/sqrtf((float)(ss/HD) + c->norm_eps);
+        for (int d = 0; d < HD; d++) qh[d] *= inv;
+        ds4f_rope_apply(qh + nope, T->rcos, T->rsin, T->pos, half, 0);
+    }
+}
+static int ds4f_qnr_par = -1;        /* DS4F_QNR_PAR: 1=pool-parallel (default), 0=serial ref */
+static void ds4f_q_norm_rope_par(ds4f_model *m, float *q, int pos,
+                                 const float *rcos, const float *rsin) {
+    ds4f_qnr_task T = { m, q, pos, rcos, rsin };
+    ds4f_pool_run(m->pool, ds4f_qnr_worker, &T);
+}
 
 /* ===================== Tier-B2 attention worker + prepare =====================
  * tb2 worker = the exact sliding-window worker PLUS the compressed-KV term folded
@@ -3367,6 +3392,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     if (ds4f_prof_on < 0) { const char *e = getenv("DS4F_PROF"); ds4f_prof_on = e ? atoi(e) : 0; }
     if (ds4f_attn_sve < 0) { const char *e = getenv("DS4F_ATTN_SVE"); ds4f_attn_sve = e ? atoi(e) : 1; }
     if (ds4f_oproj_fuse < 0) { const char *e = getenv("DS4F_OPROJ_FUSE"); ds4f_oproj_fuse = e ? atoi(e) : 1; }
+    if (ds4f_qnr_par < 0) { const char *e = getenv("DS4F_QNR_PAR"); ds4f_qnr_par = e ? atoi(e) : 1; }
     /* exact mHC: carry x as hc_mult residual streams (s_x4). Expand the single
      * embedding x[C] into 4 identical streams; collapse back at the head. When
      * m->mhc==0 the plain-residual stand-in below runs unchanged (byte-identical). */
@@ -3393,12 +3419,15 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         { DS4F_TIC();
         ds4f_rmsnorm(m->s_hn, asrc, ly->attn_norm, C, eps);
         ds4f_chk("attn_norm", L, m->s_hn, C);
-        ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn);
+        { DS4F_TIC(); ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn); DS4F_TOC(DS4F_P_QKV_A); }
         ds4f_rmsnorm(m->s_qlat, m->s_qlat, ly->q_norm, c->q_lora, eps);
-        ds4f_matvec(m, m->s_q, &ly->wq_b, m->s_qlat);            /* [n_heads*q_head_dim] */
-        if (m->exact) ds4f_q_norm_rope(m, m->s_q, pos, rcos, rsin); /* per-head norm + RoPE */
+        { DS4F_TIC(); ds4f_matvec(m, m->s_q, &ly->wq_b, m->s_qlat); DS4F_TOC(DS4F_P_QKV_B); } /* [n_heads*q_head_dim] */
+        if (m->exact) { DS4F_TIC();
+            if (ds4f_qnr_par) ds4f_q_norm_rope_par(m, m->s_q, pos, rcos, rsin);
+            else              ds4f_q_norm_rope(m, m->s_q, pos, rcos, rsin);
+            DS4F_TOC(DS4F_P_QKV_ROPE); } /* per-head norm + RoPE */
         ds4f_chk("q", L, m->s_q, H);
-        ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn);          /* [kv_lora] */
+        { DS4F_TIC(); ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn); DS4F_TOC(DS4F_P_QKV_KV); }  /* [kv_lora] */
         ds4f_rmsnorm(m->s_kvlat, m->s_kvlat, ly->kv_norm, KV, eps);
         if (m->exact)                                            /* RoPE the kv rope dims */
             ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
