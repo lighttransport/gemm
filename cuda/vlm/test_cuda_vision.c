@@ -96,22 +96,32 @@ static void compare_outputs(const float *cpu, const float *gpu, int n,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <mmproj.gguf> [--f16] [--image-size N]\n"
-                        "                          [--warmup N] [--iters N] [--no-cpu]\n",
+        fprintf(stderr, "Usage: %s <mmproj.gguf> [--f16] [--bf16] [--image-size N]\n"
+                        "                          [--warmup N] [--iters N] [--no-cpu]\n"
+                        "                          [--dump-out <file.bin>]\n",
                 argv[0]);
         return 1;
     }
 
     const char *model_path = argv[1];
     int use_f16 = 0;
+    int use_bf16 = 0;
+    /* Detect VLM_BF16 env var before mode print */
+    {
+        const char *e = getenv("VLM_BF16");
+        if (e && atoi(e) && !use_f16) use_bf16 = 1;
+    }
     int image_size = 0;  /* 0 = use model default */
     int verbose = 1;
     int warmup = 0;      /* steady-state warmup encodes (timing not counted) */
     int iters = 1;       /* timed encodes; >1 enables steady-state bench mode */
     int no_cpu = 0;      /* skip the 1-thread CPU reference (slow at large sizes) */
+    const char *dump_out = NULL;  /* if set, dump GPU output to this file */
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--f16") == 0) use_f16 = 1;
+        else if (strcmp(argv[i], "--bf16") == 0) use_bf16 = 1;
+        else if (strcmp(argv[i], "--f32") == 0) { use_f16 = 0; use_bf16 = 0; }
         else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) verbose = 2;
         else if (strcmp(argv[i], "--no-cpu") == 0) no_cpu = 1;
         else if (strcmp(argv[i], "--image-size") == 0 && i + 1 < argc) {
@@ -124,11 +134,14 @@ int main(int argc, char **argv) {
             iters = atoi(argv[++i]);
             if (iters < 1) iters = 1;
         }
+        else if (strcmp(argv[i], "--dump-out") == 0 && i + 1 < argc) {
+            dump_out = argv[++i];
+        }
     }
 
     printf("=== CUDA Vision Encoder Test ===\n");
     printf("Model: %s\n", model_path);
-    printf("Mode:  %s\n", use_f16 ? "F16 (performance)" : "F32 (verification)");
+    printf("Mode:  %s\n", use_bf16 ? "BF16 (native)" : (use_f16 ? "F16 (performance)" : "F32 (verification)"));
 
     /* Load GGUF */
     printf("\nLoading GGUF model...\n");
@@ -156,7 +169,8 @@ int main(int argc, char **argv) {
 
     printf("Image size: %dx%d\n", image_size, image_size);
 
-    /* Init CUDA vision encoder */
+    /* Init CUDA vision encoder (BF16 mode via VLM_BF16 env var) */
+    if (use_bf16) setenv("VLM_BF16", "1", 1);
     printf("\nInitializing CUDA vision encoder...\n");
     cuda_vision_runner *cuda_r = cuda_vision_init(0, verbose, use_f16);
     if (!cuda_r) {
@@ -171,7 +185,7 @@ int main(int argc, char **argv) {
      * before load_weights, which derives max_patches from max_pixels and allocates. */
     cuda_vision_set_max_pixels(cuda_r, image_size * image_size);
 
-    printf("Loading CUDA weights...\n");
+    printf("Loading CUDA weights (BF16: %d)...\n", use_bf16);
     if (cuda_vision_load_weights(cuda_r, gguf) != 0) {
         fprintf(stderr, "Failed to load CUDA weights\n");
         cuda_vision_free(cuda_r);
@@ -254,20 +268,38 @@ int main(int argc, char **argv) {
     printf("GPU time: mean %.1f ms  min %.1f ms  max %.1f ms  (%d iters, %d warmup)\n",
            gpu_mean, gpu_min, gpu_max, iters, warmup);
 
+    /* Dump GPU output to file if requested */
+    if (dump_out && gpu_result) {
+        FILE *fout = fopen(dump_out, "wb");
+        if (fout) {
+            int n_dump = actual_n_merged * total_embd;
+            int32_t hdr[4] = { actual_n_merged, total_embd, image_size, image_size };
+            fwrite(hdr, sizeof(int32_t), 4, fout);
+            fwrite(gpu_result, sizeof(float), n_dump, fout);
+            fclose(fout);
+            printf("  Dumped GPU output (%d tokens x %d dim) to %s\n",
+                   actual_n_merged, total_embd, dump_out);
+        } else {
+            fprintf(stderr, "Failed to open %s for writing\n", dump_out);
+        }
+    }
+
     /* Correctness comparison (only when CPU reference was computed) */
-    float threshold = use_f16 ? 1e-2f : 1e-4f;
+    float threshold = (use_f16 || use_bf16) ? 1e-2f : 1e-4f;
     if (cpu_result) {
         printf("\nComparing %d merged tokens x %d embd = %d floats\n",
                actual_n_merged, total_embd, total_floats);
-        compare_outputs(cpu_result, gpu_result, total_floats,
-                         use_f16 ? "F16 GPU vs CPU" : "F32 GPU vs CPU", threshold);
+        const char *dtype_label = use_bf16 ? "BF16" : (use_f16 ? "F16" : "F32");
+        char compare_label[64];
+        snprintf(compare_label, sizeof(compare_label), "%s GPU vs CPU", dtype_label);
+        compare_outputs(cpu_result, gpu_result, total_floats, compare_label, threshold);
     }
 
     /* Timing summary + throughput (tok/s on merged tokens) */
     printf("\n=== Timing Summary ===\n");
     printf("  Image:          %dx%d  (%d merged tokens)\n",
            image_size, image_size, actual_n_merged);
-    printf("  dtype:          %s\n", use_f16 ? "F16" : "F32");
+    printf("  dtype:          %s\n", use_bf16 ? "BF16" : (use_f16 ? "F16" : "F32"));
     if (cpu_result) {
         printf("  CPU (1 thread): %.1f ms\n", cpu_ms);
         printf("  Speedup:        %.1fx\n", cpu_ms / gpu_mean);
