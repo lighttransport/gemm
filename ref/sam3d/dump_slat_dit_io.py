@@ -115,6 +115,8 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dump-trace", action="store_true",
                     help="dump per-stage activations for C-vs-pytorch debugging")
+    ap.add_argument("--device", default="cpu",
+                    help="torch device for model forward (cpu or cuda)")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -123,13 +125,24 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_float32_matmul_precision("highest")
-    device = torch.device("cpu")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("[dump_slat_dit_io] cuda requested but unavailable; using cpu",
+              file=sys.stderr)
+        device = torch.device("cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
 
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
     import sam3d_objects  # noqa: F401
     from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
-    _install_spconv_cpu_bias_patch()
+    if device.type == "cpu":
+        _install_spconv_cpu_bias_patch()
 
     full = OmegaConf.load(args.slat_yaml)
     backbone_cfg = full.module.generator.backbone.reverse_fn.backbone
@@ -169,6 +182,8 @@ def main():
 
     if args.cond_npy and os.path.exists(args.cond_npy):
         cond = np.load(args.cond_npy).astype(np.float32)
+        if cond.ndim == 2:
+            cond = cond[None]
     else:
         cond = rng.standard_normal((1, args.cond_tokens, 1024)).astype(np.float32)
 
