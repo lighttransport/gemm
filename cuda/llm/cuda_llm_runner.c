@@ -3854,6 +3854,43 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- dequant_iq2_s_to_f16: IQ2_S weight matrix -> F16 ---- */\n"
+"__global__ void dequant_iq2_s_to_f16(half_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x * 8 + threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 82;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    half_raw *dst_row = dst + (size_t)row * n_cols;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 82;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *qh = bp + 66;\n"
+"        const unsigned char *scales = bp + 74;\n"
+"        const unsigned char *signs = bp + 34;\n"
+"        half_raw *d_b = dst_row + b * 256;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;\n"
+"            float db1 = d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                float dl = (l < 2) ? db0 : db1;\n"
+"                int grid_idx = qs[l] | ((qh[ib32] << (8-2*l)) & 0x300);\n"
+"                unsigned long long grid_val = iq2s_grid_dev[grid_idx];\n"
+"                unsigned char s = signs[l];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    float w = dl * (float)(unsigned char)(grid_val >> (8*j)) * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    d_b[ib32 * 32 + l * 8 + j] = float_to_half(w);\n"
+"                }\n"
+"            }\n"
+"            qs += 4;\n"
+"            signs += 4;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "/* Batched softplus+bias+mul: out[t, i] = softplus(in[t, i] + bias[i]) * a[i] */\n"
 "__global__ void batch_softplus_mul_f32(float *out, const float *in, const float *bias,\n"
 "                                        const float *a, int n, int n_tokens) {\n"
@@ -4549,6 +4586,7 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_q2_K;
     CUfunction fn_batch_matvec_q3_K;
     CUfunction fn_batch_matvec_iq2_s;
+    CUfunction fn_dequant_iq2_s_to_f16;
     CUfunction fn_batch_matvec_iq3_xxs;
     CUfunction fn_batch_matvec_iq3_s;
     CUfunction fn_batch_matvec_q4_K;
@@ -4955,6 +4993,7 @@ lookup_funcs:
     GET_FUNC(batch_matvec_q2_K);
     GET_FUNC(batch_matvec_q3_K);
     GET_FUNC(batch_matvec_iq2_s);
+    GET_FUNC(dequant_iq2_s_to_f16);
     GET_FUNC(batch_matvec_iq3_xxs);
     GET_FUNC(batch_matvec_iq3_s);
     GET_FUNC(batch_matvec_q4_K);
@@ -9191,8 +9230,24 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_S) {
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_batch_matvec_iq2_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+        CUdeviceptr d_f16 = 0;
+        CUresult err = cuMemAlloc(&d_f16, f16_bytes);
+        if (err != CUDA_SUCCESS) {
+            /* Fallback to the original quantized kernel if allocation fails */
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_iq2_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        } else {
+            {
+                void *args[] = { &d_f16, &mat, &out_dim, &in_dim };
+                cuLaunchKernel(r->fn_dequant_iq2_s_to_f16, (out_dim+7)/8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            }
+            {
+                void *a[] = { &dst, &d_f16, &input, &out_dim, &in_dim, &n_tokens };
+                cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+            }
+            cuMemFree(d_f16);
+        }
     } else if (weight_type == GGML_TYPE_IQ3_XXS) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq3_xxs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
