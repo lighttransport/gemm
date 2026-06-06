@@ -79,11 +79,17 @@ export DS4F_FP8_MAGIC=${DS4F_FP8_MAGIC:-0}
 # leaner than FP8 AND faster, but compute-bound so slower than bf16-pv. Lean
 # long-ctx default candidate. Overrides FP8/BF16.
 export DS4F_DENSE_MXFP4=${DS4F_DENSE_MXFP4:-0}
-# DS4F_Q8_DENSE=1 repacks the dominant dense (qkv/o_proj/shared, 64% of prefill)
-# from bf16-pv to int8 W8A8 after fill, so the prefill GEMM runs svdot (4x int8
-# MACs/FMLA). Router gate + lm-head stay bf16-pv (argmax protection). REQUIRES
-# DS4F_FP8_BF16=1 (the bf16-pv source). Quality is argmax-exact (int8 rel-L2 ~1%),
-# NOT bit-similar. Net dense memory SHRINKS (q8 ~1.03 B/elem < bf16 2 B/elem).
+# DS4F_Q8_DENSE=1 repacks the 8 dominant dense tensors/layer (wq_a/wq_b/wkv/wo_a/wo_b/
+# sh_w1/sh_w3/sh_w2) from bf16-pv to int8 W8A8 after load, so both decode matvec and prefill
+# GEMM run svdot (~1.03 B/elem from HBM = half of bf16). Router gate + lm-head stay bf16-pv
+# (argmax protection). REQUIRES DS4F_FP8_BF16=1 (the bf16-pv source); warn+no-op otherwise.
+# The bf16 src is reclaimed via MADV_DONTNEED so net dense memory SHRINKS. VALIDATED: real-
+# weight gen A/B is TOKEN-IDENTICAL to bf16 (per-64-block absmax scale preserves the greedy
+# trajectory); decode 11.88->13.03 tok/s @ctx10240, RSS -5.5 GB. LOSSY (synthetic argmax
+# shifts), so default OFF here to keep this base runner the clean bf16-pv reference; the
+# perf/memory wrappers (run_ds4f_longctx_11n.sh, run_ds4f_gen_11n.sh) default it ON. (Lever 2l;
+# the per-group o-proj fallback OPROJ_FUSE=0 is auto-overridden to fused for Q8 -- ds4f_row_slice
+# can't slice the int8 layout.)
 export DS4F_Q8_DENSE=${DS4F_Q8_DENSE:-0}
 # DS4F_SPARSE=1 enables the Stage-4 synthetic lightning-indexer attention: on
 # sparse layers (compress_ratios[L]!=0) with nP>index_topk, a cheap compressed

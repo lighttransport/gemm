@@ -3508,7 +3508,10 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
              * group g: o1[g*o_lora ..] = wo_a_rows[g*o_lora ..] @ s_attn[g*C ..].
              * wo_a is FP8 -> o_lora(1024) rows are 128-aligned per group. */
             int gin = H / og;                          /* 32768/8 = 4096 == C */
-            if (ds4f_oproj_fuse) {                     /* fused block-diagonal: 1 dispatch */
+            /* Q8_PV wo_a: the per-group reference fallback uses ds4f_row_slice, which can't
+             * slice the 528B int8 group layout (-> NaN). Only the fused block-diagonal path
+             * indexes Q8 groups correctly, so force it for Q8 regardless of the flag. */
+            if (ds4f_oproj_fuse || ly->wo_a.type == DS4F_Q8_PV) { /* fused block-diagonal: 1 dispatch */
                 ds4f_matvec_blockdiag(m, m->s_o1, &ly->wo_a, m->s_attn, gin, c->o_lora);
             } else for (int g = 0; g < og; g++) {      /* reference: og separate dispatches */
                 ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
