@@ -966,6 +966,50 @@ static void ds4f_idxsc_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* --- RESIDENT int8/SVE indexer scan (gated DS4F_IDX_INT8, default off) -----------------
+ * idx_kv is Hadamard-rotated + fp4-act-quantized at write (rotation kills outlier/sink
+ * channels), so PER-POSITION int8 is safe and slightly beats per-channel-static
+ * (tools/idxscore_probe.c: top-512 SELECTED-SET 510/512 vs 503/512). The cache is quantized
+ * ONCE at write (ds4f_idx_quant_pos, below) into idx_kv8 + a per-position scale; the scan
+ * reads int8 DIRECTLY => 4x fewer bytes moved AND svdot_s32 (4 int8 MACs/lane). The offline
+ * multi-thread BW probe (tools/idxscan_bw_probe.c) shows a constant ~1.87x over the f32
+ * svmla scan that SCALES to 48 threads -- the scan is compute-bound, NOT bandwidth-bound, so
+ * (unlike an on-the-fly-quant scan, which re-reads f32 and ties f32) the win survives at
+ * production thread counts. dot = sq[h]*pscale[t]*svdot(q8[h],k8[t]). Requires hd%svcntb()==0
+ * (hd=128). The dead on-the-fly variant was removed after it measured PARITY end-to-end. */
+static inline void ds4f_idx_quant_pos(const float *v, int hd, int8_t *out, float *pscale) {
+    float mx = 0.f;
+    for (int d = 0; d < hd; d++) { float a = v[d] < 0 ? -v[d] : v[d]; if (a > mx) mx = a; }
+    *pscale = mx * (1.0f / 127.0f);
+    float inv = mx > 0 ? 127.0f / mx : 0.0f;
+    for (int d = 0; d < hd; d++) { int q = (int)lrintf(v[d] * inv); q = q > 127 ? 127 : (q < -127 ? -127 : q); out[d] = (int8_t)q; }
+}
+typedef struct { const int8_t *q8, *k8; const float *sq, *pscale, *weights;
+                 int H, hd, T; float *score; } ds4f_idxsc8r_task;
+static void ds4f_idxsc8r_worker(void *arg, int tid, int nthr) {
+    ds4f_idxsc8r_task *Tk = (ds4f_idxsc8r_task *)arg;
+    int Tn = Tk->T, H = Tk->H, hd = Tk->hd;
+    int per = Tn / nthr, extra = Tn % nthr;
+    int t0 = per * tid + (tid < extra ? tid : extra), t1 = t0 + per + (tid < extra ? 1 : 0);
+    svbool_t pb = svptrue_b8(); int bf = (int)svcntb();
+    for (int t = t0; t < t1; t++) {
+        const int8_t *kt = Tk->k8 + (size_t)t * hd;
+        float ps = Tk->pscale[t], acc = 0.f;
+        for (int h = 0; h < H; h++) {
+            const int8_t *q8 = Tk->q8 + (size_t)h * hd;
+            svint32_t a = svdup_s32(0);
+            for (int d = 0; d < hd; d += bf) a = svdot_s32(a, svld1_s8(pb, q8 + d), svld1_s8(pb, kt + d));
+            float dot = Tk->sq[h] * ps * (float)svaddv_s32(svptrue_b32(), a);
+            if (dot < 0.f) dot = 0.f;                /* relu */
+            acc += dot * Tk->weights[h];
+        }
+        Tk->score[t] = acc;
+    }
+}
+
+static inline double ds4f_now(void);              /* fwd decl (defined w/ the profiler below) */
+static double ds4f_g_tb2scan = 0.0;               /* transfer accumulator: index_score scan-only ns */
+
 /* ===================== Tier-B2 indexer scoring + top-k =====================
  * model.py Indexer.forward scoring (after q is wq_b-projected, RoPE'd, rotate+fp4'd
  * and the compressor has filled kvc): index_score[t] = sum_h relu(q[h].kvc[t]) *
@@ -1141,6 +1185,7 @@ static int ds4f_index_step(
     const void *cwkv, const void *cwgate, const float *cape, const uint16_t *cnorm,
     const float *rcos, const float *rsin, float eps,
     float *comp_kv_state, float *comp_score_state, float *idx_kv_cache,
+    int8_t *idx_kv8, float *idx_pscale,
     float *q_scr, float *score_scr, int *sel, ds4f_pool *pool)
 {
     int end_pos = start_pos + 1, half = rd / 2;
@@ -1164,8 +1209,11 @@ static int ds4f_index_step(
     }
     float *comp_out = (float *)alloca((size_t)hd * 4);       /* own compressor (rotate=1) */
     if (ds4f_compress_step(x, dim, hd, rd, ratio, start_pos, cwkv, cwgate, w_bf16, cape, cnorm,
-                           rcos, rsin, eps, 1, comp_kv_state, comp_score_state, comp_out, pool))
-        memcpy(idx_kv_cache + (size_t)(start_pos / ratio) * hd, comp_out, (size_t)hd * 4);
+                           rcos, rsin, eps, 1, comp_kv_state, comp_score_state, comp_out, pool)) {
+        int slot = start_pos / ratio;
+        memcpy(idx_kv_cache + (size_t)slot * hd, comp_out, (size_t)hd * 4);
+        if (idx_kv8) ds4f_idx_quant_pos(comp_out, hd, idx_kv8 + (size_t)slot * hd, &idx_pscale[slot]);
+    }
     float sm = (float)(1.0 / sqrt((double)hd)), wscale = sm * (float)(1.0 / sqrt((double)H));
     float *weights = (float *)alloca((size_t)H * 4);
     if (pool && w_bf16) {                                    /* weights = weights_proj(x), pooled bf16 */
@@ -1183,7 +1231,24 @@ static int ds4f_index_step(
         weights[h] = a * wscale;
     }
     int T = end_pos / ratio;
-    ds4f_index_score(q_scr, idx_kv_cache, weights, H, hd, T, score_scr, pool);
+    double _scan_t0 = ds4f_now();
+    static int s_i8 = -1;
+    if (s_i8 < 0) { const char *e = getenv("DS4F_IDX_INT8"); s_i8 = (e && *e && atoi(e)) ? 1 : 0; }
+    if (s_i8 && idx_kv8 && pool && T >= 64 && (hd % 64) == 0) {  /* resident int8 scan */
+        int8_t *q8 = (int8_t *)alloca((size_t)H * hd);
+        float  *sq = (float *)alloca((size_t)H * 4);
+        for (int h = 0; h < H; h++) {                        /* per-head q quant (round-to-nearest absmax) */
+            const float *qh = q_scr + (size_t)h * hd; float mx = 0.f;
+            for (int d = 0; d < hd; d++) { float a = qh[d] < 0 ? -qh[d] : qh[d]; if (a > mx) mx = a; }
+            float inv = mx > 0 ? 127.0f / mx : 0.0f; sq[h] = mx * (1.0f / 127.0f);
+            for (int d = 0; d < hd; d++) { int v = (int)lrintf(qh[d] * inv); v = v > 127 ? 127 : (v < -127 ? -127 : v); q8[(size_t)h * hd + d] = (int8_t)v; }
+        }
+        ds4f_idxsc8r_task tk = { q8, idx_kv8, sq, idx_pscale, weights, H, hd, T, score_scr };
+        ds4f_pool_run(pool, ds4f_idxsc8r_worker, &tk);
+    } else {
+        ds4f_index_score(q_scr, idx_kv_cache, weights, H, hd, T, score_scr, pool);
+    }
+    ds4f_g_tb2scan += ds4f_now() - _scan_t0;                  /* scan-only sub-timer (folded by tb2_prepare) */
     ds4f_index_topk(score_scr, T, T, k, offset, sel);        /* decode: no causal mask (thr=T) */
     return T;
 }
@@ -1371,6 +1436,12 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             ly->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
             ly->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
             ly->idx_kv = (float *)aligned_alloc(256, (size_t)nslot*ihd*4);
+            { static int s_i8a = -1;   /* resident int8 mirror only when DS4F_IDX_INT8=1 (else zero cost) */
+              if (s_i8a < 0) { const char *e = getenv("DS4F_IDX_INT8"); s_i8a = (e && *e && atoi(e)) ? 1 : 0; }
+              if (s_i8a) {
+                ly->idx_kv8    = (int8_t *)aligned_alloc(256, ((size_t)nslot*ihd + 255) & ~255ull);
+                ly->idx_pscale = (float  *)aligned_alloc(256, ((size_t)nslot*4 + 255) & ~255ull);
+              } else { ly->idx_kv8 = NULL; ly->idx_pscale = NULL; } }
             ds4f_compress_state_reset(ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ratio, ihd);
             if (fill) {
                 ds4f_tensor u1 = { ly->idx_wq_b,      NULL, DS4F_BF16, iH*ihd, qlora }; ds4f_fill(m, u1);
@@ -2450,13 +2521,16 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
             return;                                             /* T==0, nothing compressed yet */
         }
         int k = c->index_topk;
+        double _scan_snap = ds4f_g_tb2scan;
         ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, c->q_lora,
                         c->index_n_heads, ihd, rd, ratio, pos, offset, k,
                         ly->idx_wq_b, ly->idx_wproj, 1,
                         ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
                         rcos, rsin, eps,
                         ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,
+                        ly->idx_kv8, ly->idx_pscale,
                         m->s_idx_q, m->s_idx_score, m->s_tb2_sel, m->pool);
+        m->prof[DS4F_P_TB2SCAN] += ds4f_g_tb2scan - _scan_snap;
         int nsel = 0;                                           /* compact + strip offset -> local idx */
         for (int i = 0; i < k; i++) { int v = m->s_tb2_sel[i]; if (v < 0) break; m->s_tb2_sel[nsel++] = v - offset; }
         m->s_tb2_nsel = nsel;
@@ -2564,6 +2638,7 @@ static void ds4f_warm_tb2(ds4f_model *m, int npos) {
                     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= (z >> 31);
                     ir[d] = (float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f;
                 }
+                if (ly->idx_kv8) ds4f_idx_quant_pos(ir, ihd, ly->idx_kv8 + (size_t)t*ihd, &ly->idx_pscale[t]);
             }
         }
     }

@@ -101,7 +101,7 @@ DS4F_EP_SRC := $(LLM_DIR)ds4f_ep_runner.c
 DS4F_DECBW_SRC := $(LLM_DIR)ds4f_decode_bw_bench.c
 # header deps: ds4f.h / ggml_dequant.h are not in the .c prereqs, so editing them
 # would otherwise leave the binaries stale (a no-op `make`). Track them explicitly.
-DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ggml_dequant.h
+DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ds4f_impl.h $(LLM_DIR)../../common/ggml_dequant.h
 
 # ── Targets ────────────────────────────────────────────────────────────
 .PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw

@@ -218,6 +218,8 @@ typedef struct {
     uint16_t *idx_cmp_norm;          /* [index_head_dim] bf16 */
     float    *idx_cmp_kv_state, *idx_cmp_score_state;  /* [coff*4, coff*index_head_dim] */
     float    *idx_kv;                /* [max_pos/ratio, index_head_dim] indexer compressed */
+    int8_t   *idx_kv8;               /* [max_pos/ratio, index_head_dim] resident int8 mirror (DS4F_IDX_INT8) */
+    float    *idx_pscale;            /* [max_pos/ratio] per-position int8 scale (absmax/127) */
 } ds4f_layer;
 
 typedef struct ds4f_pool ds4f_pool;
@@ -341,16 +343,18 @@ typedef struct {
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
-    double prof[9];
+    double prof[10];
 } ds4f_model;
 
-/* phase ids for ds4f_model.prof[] */
-#define DS4F_NPHASE 9
+/* phase ids for ds4f_model.prof[]. TB2SCAN is a SUB-timer of TB2PREP (the index_score
+ * scan only); it overlaps TB2PREP so the percentage column double-counts it -- read its
+ * absolute ms, not its %. */
+#define DS4F_NPHASE 10
 enum { DS4F_P_QKV=0, DS4F_P_ATTN=1, DS4F_P_OPROJ=2, DS4F_P_SHARED=3,
        DS4F_P_ROUTER=4, DS4F_P_EXPERTS=5, DS4F_P_HEAD=6, DS4F_P_OTHER=7,
-       DS4F_P_TB2PREP=8 };
-static const char *ds4f_prof_names[9] = {
-    "qkv_proj","attn","o_proj","shared","router","experts","head","other","tb2prep" };
+       DS4F_P_TB2PREP=8, DS4F_P_TB2SCAN=9 };
+static const char *ds4f_prof_names[10] = {
+    "qkv_proj","attn","o_proj","shared","router","experts","head","other","tb2prep","tb2scan" };
 
 /* ===================== thread pool (pinned, spin) ===================== */
 typedef void (*ds4f_fn)(void *arg, int tid, int nthr);
