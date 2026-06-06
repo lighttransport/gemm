@@ -2337,6 +2337,47 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
 static inline float    ds4f_bf16f(uint16_t b) { union { uint32_t u; float f; } z; z.u = (uint32_t)b << 16; return z.f; }
 static inline uint16_t ds4f_f32bf(float x)     { union { uint32_t u; float f; } z; z.f = x; return (uint16_t)((z.u + 0x7fffu + ((z.u >> 16) & 1u)) >> 16); }
 
+/* SVE attn-inner kernels (DS4F_ATTN_SVE). The decode attn worker was four SCALAR
+ * loops (dot/axpy over kv_lora=q_head_dim=512) with per-element bf16 decode — ~0.2
+ * GFLOP/s/core, scalar-issue/decode-bound, NOT bandwidth-bound (window=128 pos ~128KB
+ * + ~512 compressed pos ~1MB, both L2-resident). bf16 widen idiom = svld1uh<<16, which
+ * is BIT-EXACT to ds4f_bf16f (b<<16). The axpy keeps j-outer => per-lane accumulation
+ * order matches scalar exactly (bit-exact PV); only the dot's horizontal reduction
+ * reorders (tiny f32 reorder, argmax-safe; gated A/B confirms). */
+static inline float ds4f_sve_dot_bf16(const float *q, const uint16_t *k, int n) {
+    svfloat32_t acc = svdup_f32(0.f);
+    for (int d = 0; d < n; d += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(d, n);
+        svfloat32_t kf = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, k + d), 16));
+        acc = svmla_f32_x(pg, acc, svld1_f32(pg, q + d), kf);
+    }
+    return svaddv_f32(svptrue_b32(), acc);
+}
+static inline float ds4f_sve_dot_f32(const float *q, const float *k, int n) {
+    svfloat32_t acc = svdup_f32(0.f);
+    for (int d = 0; d < n; d += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(d, n);
+        acc = svmla_f32_x(pg, acc, svld1_f32(pg, q + d), svld1_f32(pg, k + d));
+    }
+    return svaddv_f32(svptrue_b32(), acc);
+}
+static inline void ds4f_sve_axpy_bf16(float *out, const uint16_t *k, float w, int n) {
+    svfloat32_t wv = svdup_f32(w);
+    for (int d = 0; d < n; d += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(d, n);
+        svfloat32_t kf = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, k + d), 16));
+        svst1_f32(pg, out + d, svmla_f32_x(pg, svld1_f32(pg, out + d), kf, wv));
+    }
+}
+static inline void ds4f_sve_axpy_f32(float *out, const float *k, float w, int n) {
+    svfloat32_t wv = svdup_f32(w);
+    for (int d = 0; d < n; d += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(d, n);
+        svst1_f32(pg, out + d, svmla_f32_x(pg, svld1_f32(pg, out + d), svld1_f32(pg, k + d), wv));
+    }
+}
+static int ds4f_attn_sve = -1;     /* DS4F_ATTN_SVE (default 1); 0 => scalar reference */
+
 /* ===================== attention (pooled over heads) ===================== */
 typedef struct { ds4f_model *m; ds4f_layer *ly; int pos; float scale; int ratio; } ds4f_attn_task;
 
@@ -2467,14 +2508,16 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
     int nh = m->cfg.n_heads, per = nh / nthr, extra = nh % nthr;
     int h0 = per*tid + (tid < extra ? tid : extra);
     int h1 = h0 + per + (tid < extra ? 1 : 0);
+    int sve = ds4f_attn_sve;
     float *sc = (float *)alloca((size_t)nP * 4);
     for (int h = h0; h < h1; h++) {
         const float *q = m->s_q + (size_t)h*HD;
         float mx = -1e30f;
         for (int j = 0; j < nP; j++) {
             const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            float s = 0.f;
-            for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]);      /* HD==KV (512) */
+            float s;                                                      /* HD==KV (512) */
+            if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
+            else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); }
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
         }
         float snk = ly->attn_sink[h];
@@ -2486,7 +2529,8 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
         for (int j = 0; j < nP; j++) {
             float w = sc[j]*inv;
             const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
+            if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
+            else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
         }
         ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, half, 1);  /* de-rotate */
     }
@@ -2527,18 +2571,23 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
     int nh = m->cfg.n_heads, per = nh / nthr, extra = nh % nthr;
     int h0 = per*tid + (tid < extra ? tid : extra);
     int h1 = h0 + per + (tid < extra ? 1 : 0);
+    int sve = ds4f_attn_sve;
     float *sc = (float *)alloca((size_t)(total > 0 ? total : 1) * 4);
     for (int h = h0; h < h1; h++) {
         const float *q = m->s_q + (size_t)h*HD;
         float mx = -1e30f;
-        for (int j = 0; j < nP; j++) {                          /* window term */
+        for (int j = 0; j < nP; j++) {                          /* window term (bf16 kv_cache) */
             const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]);
+            float s;
+            if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
+            else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); }
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
         }
-        for (int j = 0; j < nsel; j++) {                        /* compressed term */
+        for (int j = 0; j < nsel; j++) {                        /* compressed term (f32 cmp_kv) */
             const float *kc = cmp + (size_t)sel[j]*KV;
-            float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*kc[d];
+            float s;
+            if (sve) s = ds4f_sve_dot_f32(q, kc, KV);
+            else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*kc[d]; }
             s *= T->scale; sc[nP + j] = s; if (s > mx) mx = s;
         }
         float denom = expf(ly->attn_sink[h] - mx);
@@ -2548,11 +2597,13 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int j = 0; j < nP; j++) {
             float w = sc[j]*inv; const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
+            if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
+            else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
         }
         for (int j = 0; j < nsel; j++) {
             float w = sc[nP + j]*inv; const float *kc = cmp + (size_t)sel[j]*KV;
-            for (int d = 0; d < HD; d++) out[d] += w*kc[d];
+            if (sve) ds4f_sve_axpy_f32(out, kc, w, HD);
+            else for (int d = 0; d < HD; d++) out[d] += w*kc[d];
         }
         ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, T->half, 1);  /* de-rotate @ query pos */
     }
@@ -3240,6 +3291,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD;
     float eps = 1e-6f;
     if (ds4f_prof_on < 0) { const char *e = getenv("DS4F_PROF"); ds4f_prof_on = e ? atoi(e) : 0; }
+    if (ds4f_attn_sve < 0) { const char *e = getenv("DS4F_ATTN_SVE"); ds4f_attn_sve = e ? atoi(e) : 1; }
     /* exact mHC: carry x as hc_mult residual streams (s_x4). Expand the single
      * embedding x[C] into 4 identical streams; collapse back at the head. When
      * m->mhc==0 the plain-residual stand-in below runs unchanged (byte-identical). */
