@@ -3722,6 +3722,138 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
 "}\n"
 "\n"
+"/* Batched Q4_K matvec (float path) */\n"
+"__global__ void batch_matvec_q4_K(float *output, const unsigned char *mat, const float *input,\n"
+"                                    int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 144;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 144;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qs = bp + 16;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0, is = 0;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0;\n"
+"            float d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            for (int l = 0; l < 32; l++)\n"
+"                partial += (d1 * (q[l] & 0xF) - m1) * xb[yi++];\n"
+"            for (int l = 0; l < 32; l++)\n"
+"                partial += (d2 * (q[l] >> 4) - m2) * xb[yi++];\n"
+"            is += 2;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"/* Batched Q5_K matvec (float path) */\n"
+"__global__ void batch_matvec_q5_K(float *output, const unsigned char *mat, const float *input,\n"
+"                                    int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 176;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 176;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qh = bp + 16;\n"
+"        const unsigned char *qs = bp + 48;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0, is = 0;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0;\n"
+"            float d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int qhbit = (qh[l] >> (2*j)) & 1;\n"
+"                partial += (d1 * ((q[l] & 0xF) | (qhbit << 4)) - m1) * xb[yi++];\n"
+"            }\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int qhbit = (qh[l] >> (2*j + 1)) & 1;\n"
+"                partial += (d2 * ((q[l] >> 4) | (qhbit << 4)) - m2) * xb[yi++];\n"
+"            }\n"
+"            is += 2;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"/* Batched Q6_K matvec (float path) */\n"
+"__global__ void batch_matvec_q6_K(float *output, const unsigned char *mat, const float *input,\n"
+"                                    int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp;\n"
+"        const unsigned char *qh = bp + 128;\n"
+"        const signed char *sc = (const signed char *)(bp + 192);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        for (int half = 0; half < 2; half++) {\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int is = l / 16;\n"
+"                int q1 = (int)((ql[l] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;\n"
+"                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;\n"
+"                int q3 = (int)((ql[l] >> 4) | (((qh[l]>>4)&3)<<4)) - 32;\n"
+"                int q4 = (int)((ql[l+32] >> 4) | (((qh[l]>>6)&3)<<4)) - 32;\n"
+"                partial += d * sc[is+0] * q1 * xb[half*128+l];\n"
+"                partial += d * sc[is+2] * q2 * xb[half*128+l+32];\n"
+"                partial += d * sc[is+4] * q3 * xb[half*128+l+64];\n"
+"                partial += d * sc[is+6] * q4 * xb[half*128+l+96];\n"
+"            }\n"
+"            ql += 64; qh += 32; sc += 8;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
 "/* Batched softplus+bias+mul: out[t, i] = softplus(in[t, i] + bias[i]) * a[i] */\n"
 "__global__ void batch_softplus_mul_f32(float *out, const float *in, const float *bias,\n"
 "                                        const float *a, int n, int n_tokens) {\n"
@@ -4419,6 +4551,9 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_iq2_s;
     CUfunction fn_batch_matvec_iq3_xxs;
     CUfunction fn_batch_matvec_iq3_s;
+    CUfunction fn_batch_matvec_q4_K;
+    CUfunction fn_batch_matvec_q5_K;
+    CUfunction fn_batch_matvec_q6_K;
     CUfunction fn_batch_softplus_mul_f32;
     CUfunction fn_batch_rope_neox_f32;
     CUfunction fn_batch_conv1d_depthwise_silu_f32;
@@ -4822,6 +4957,9 @@ lookup_funcs:
     GET_FUNC(batch_matvec_iq2_s);
     GET_FUNC(batch_matvec_iq3_xxs);
     GET_FUNC(batch_matvec_iq3_s);
+    GET_FUNC(batch_matvec_q4_K);
+    GET_FUNC(batch_matvec_q5_K);
+    GET_FUNC(batch_matvec_q6_K);
     GET_FUNC(batch_softplus_mul_f32);
     GET_FUNC(batch_rope_neox_f32);
     GET_FUNC(batch_conv1d_depthwise_silu_f32);
@@ -9061,6 +9199,15 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
     } else if (weight_type == GGML_TYPE_IQ3_S) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq3_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_Q4_K) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_q4_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_Q5_K) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_q5_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_Q6_K) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_q6_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else {
         /* Fallback: sequential per-token matvec */
         for (int t = 0; t < n_tokens; t++) {
