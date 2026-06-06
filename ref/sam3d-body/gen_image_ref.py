@@ -21,6 +21,8 @@ Stages dumped (written only if that stage executed):
 Determinism:
   * torch.manual_seed + numpy seed
   * torch.set_float32_matmul_precision("highest")
+  * TF32 is disabled by default for CUDA matmul and cuDNN conv refs
+  * CUDA SDPA uses the math backend by default
 
 Usage:
   python ref/sam3d-body/gen_image_ref.py \\
@@ -76,6 +78,13 @@ def main():
                     help="dtype used for the DINOv3 backbone reference. "
                          "float32 matches the C runner; config preserves "
                          "the upstream checkpoint setting.")
+    ap.add_argument("--allow-tf32", action="store_true",
+                    help="allow CUDA TF32 matmul/cuDNN conv in the reference")
+    ap.add_argument("--sdp", default="math",
+                    choices=("math", "flash", "mem_efficient", "auto"),
+                    help="CUDA scaled-dot-product-attention backend")
+    ap.add_argument("--dump-dinov3-blocks", action="store_true",
+                    help="also dump DINOv3 residual stream after each block")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-run", action="store_true",
                     help="only dump the input image; skip the model")
@@ -102,6 +111,22 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_float32_matmul_precision("highest")
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
+        torch.backends.cudnn.benchmark = False
+    if hasattr(torch.backends, "cuda"):
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(args.sdp in ("flash", "auto"))
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(
+                args.sdp in ("mem_efficient", "auto"))
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(args.sdp in ("math", "auto"))
+    print(f"[gen_image_ref] allow_tf32={bool(args.allow_tf32)}",
+          file=sys.stderr)
+    print(f"[gen_image_ref] sdp={args.sdp}", file=sys.stderr)
 
     # Upstream repo ships no setup.py — add the clone directory to sys.path
     # so `import sam_3d_body` works without requiring `pip install -e`.
@@ -305,6 +330,74 @@ def main():
         elif cls in ("CameraHead", "FovHead"):
             m.register_forward_hook(cap("cam_params"))
             registered.append(("cam_params", name, cls))
+
+    if args.dump_dinov3_blocks:
+        enc = getattr(getattr(model, "backbone", None), "encoder", None)
+        if enc is not None and hasattr(enc, "prepare_tokens_with_masks"):
+            _orig_prepare_tokens = enc.prepare_tokens_with_masks
+            def _prepare_tokens_wrap(*a, **kw):
+                out = _orig_prepare_tokens(*a, **kw)
+                if isinstance(out, (tuple, list)) and len(out) >= 1:
+                    _store("dinov3_preblocks", _to_np(out[0]), once=True)
+                return out
+            enc.prepare_tokens_with_masks = _prepare_tokens_wrap
+            registered.append(("dinov3_preblocks",
+                               "backbone.encoder.prepare_tokens_with_masks",
+                               "method.wrap"))
+        for name, m in model.named_modules():
+            marker = ".encoder.blocks."
+            if marker not in name:
+                continue
+            tail = name.rsplit(marker, 1)[1]
+            if "." in tail:
+                continue
+            try:
+                block_idx = int(tail)
+            except ValueError:
+                continue
+            m.register_forward_hook(cap(f"dinov3_block{block_idx:02d}",
+                                        once=True))
+            registered.append((f"dinov3_block{block_idx:02d}", name,
+                               m.__class__.__name__))
+        for suffix, tag, mode in [
+            ("backbone.encoder.blocks.0.norm1", "dinov3_b00_norm1", "post"),
+            ("backbone.encoder.blocks.0.attn.qkv", "dinov3_b00_qkv", "post"),
+            ("backbone.encoder.blocks.0.attn.proj", "dinov3_b00_attn_preproj", "pre"),
+            ("backbone.encoder.blocks.0.attn.proj", "dinov3_b00_attn_proj", "post"),
+            ("backbone.encoder.blocks.0.norm2", "dinov3_b00_x_attn", "pre"),
+            ("backbone.encoder.blocks.0.norm2", "dinov3_b00_norm2", "post"),
+            ("backbone.encoder.blocks.0.mlp.w1", "dinov3_b00_mlp_w1", "post"),
+            ("backbone.encoder.blocks.0.mlp.w2", "dinov3_b00_mlp_w2", "post"),
+            ("backbone.encoder.blocks.0.mlp.w3", "dinov3_b00_mlp_act", "pre"),
+            ("backbone.encoder.blocks.0.mlp.w3", "dinov3_b00_mlp_w3", "post"),
+        ]:
+            for n, m in mods_by_name(suffix):
+                if mode == "pre":
+                    m.register_forward_pre_hook(cap_pre(tag, once=True))
+                else:
+                    m.register_forward_hook(cap(tag, once=True))
+                registered.append((tag, n, m.__class__.__name__))
+                break
+        for n, m in mods_by_name("backbone.encoder.blocks.0.attn"):
+            if hasattr(m, "apply_rope"):
+                _orig_apply_rope = m.apply_rope
+                def _apply_rope_wrap(q, k, rope, _orig=_orig_apply_rope):
+                    q2, k2 = _orig(q, k, rope)
+                    _store("dinov3_b00_q_rope",
+                           _to_np(q2.transpose(1, 2).reshape(
+                               q2.shape[0], q2.shape[2],
+                               q2.shape[1] * q2.shape[3])),
+                           once=True)
+                    _store("dinov3_b00_k_rope",
+                           _to_np(k2.transpose(1, 2).reshape(
+                               k2.shape[0], k2.shape[2],
+                               k2.shape[1] * k2.shape[3])),
+                           once=True)
+                    return q2, k2
+                m.apply_rope = _apply_rope_wrap
+                registered.append(("dinov3_b00_{q,k}_rope", n,
+                                   m.__class__.__name__ + ".wrap"))
+            break
 
     # --- Ray-cond projection: captures batch["ray_cond"] (as 2nd arg)
     #     and the projected image_embeddings_after_ray. Also monkey-patch

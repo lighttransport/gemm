@@ -3891,6 +3891,79 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Batched IQ2_S TensorCore matvec: 16 rows x 8 tokens via mma.sync */\n"
+"__global__ void batch_matvec_iq2_s_tc(float *output, const unsigned char *mat, const float *input,\n"
+"                                        int out_dim, int in_dim, int n_tokens) {\n"
+"    int lane = threadIdx.x;\n"
+"    int m_start = blockIdx.x * 16;\n"
+"    int t_start = blockIdx.y * 8;\n"
+"    if (m_start >= out_dim || t_start >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 82;\n"
+"    float rc[4] = {0, 0, 0, 0};\n"
+"    for (int k = 0; k < in_dim; k += 16) {\n"
+"        int a_row_off = lane / 2;\n"
+"        int a_col_off = (lane % 2) * 8;\n"
+"        int row = m_start + a_row_off;\n"
+"        int col_k = k + a_col_off;\n"
+"        int bi = col_k / 256;\n"
+"        int ib32 = (col_k % 256) / 32;\n"
+"        int tl = ((k + a_col_off) % 32) / 8;\n"
+"        const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"        const unsigned char *bp = rp + bi * 82;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        float db0 = d * (0.5f + (float)(bp[74+ib32] & 0xf)) * 0.25f;\n"
+"        float db1 = d * (0.5f + (float)(bp[74+ib32] >>  4)) * 0.25f;\n"
+"        float dl = (tl < 2) ? db0 : db1;\n"
+"        int gidx = bp[2+ib32*4+tl] | ((bp[66+ib32] << (8-2*tl)) & 0x300);\n"
+"        unsigned long long gv = iq2s_grid_dev[gidx];\n"
+"        unsigned char sgn = bp[34+ib32*4+tl];\n"
+"        half_raw w16[8];\n"
+"        for (int j = 0; j < 8; j++) {\n"
+"            float w = dl * (float)(unsigned char)(gv >> (8*j));\n"
+"            if ((sgn >> j) & 1) w = -w;\n"
+"            w16[j] = float_to_half(w);\n"
+"        }\n"
+"        unsigned int ra[4];\n"
+"        ra[0] = *(const unsigned int *)&w16[0]; ra[1] = *(const unsigned int *)&w16[2];\n"
+"        ra[2] = *(const unsigned int *)&w16[4]; ra[3] = *(const unsigned int *)&w16[6];\n"
+"        half_raw b16[4];\n"
+"        int b_tok_off = (lane / 8) * 2;\n"
+"        int b_k_off = ((lane % 8) / 2) * 2;\n"
+"        int t0 = t_start + b_tok_off, t1 = t_start + b_tok_off + 1;\n"
+"        int kk = k + b_k_off;\n"
+"        b16[0] = (t0 < n_tokens) ? float_to_half(input[(size_t)t0 * in_dim + kk])     : 0;\n"
+"        b16[1] = (t0 < n_tokens) ? float_to_half(input[(size_t)t0 * in_dim + kk + 1]) : 0;\n"
+"        b16[2] = (t1 < n_tokens) ? float_to_half(input[(size_t)t1 * in_dim + kk])     : 0;\n"
+"        b16[3] = (t1 < n_tokens) ? float_to_half(input[(size_t)t1 * in_dim + kk + 1]) : 0;\n"
+"        unsigned int rb[2];\n"
+"        rb[0] = *(const unsigned int *)&b16[0];\n"
+"        rb[1] = *(const unsigned int *)&b16[2];\n"
+"        asm volatile(\n"
+"            \"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\"\n"
+"            \" {%0, %1, %2, %3},\"\n"
+"            \" {%4, %5, %6, %7},\"\n"
+"            \" {%8, %9},\"\n"
+"            \" {%10, %11, %12, %13};\"\n"
+"            : \"=f\"(rc[0]), \"=f\"(rc[1]), \"=f\"(rc[2]), \"=f\"(rc[3])\n"
+"            : \"r\"(ra[0]), \"r\"(ra[1]), \"r\"(ra[2]), \"r\"(ra[3]),\n"
+"              \"r\"(rb[0]), \"r\"(rb[1]),\n"
+"              \"f\"(rc[0]), \"f\"(rc[1]), \"f\"(rc[2]), \"f\"(rc[3]));\n"
+"    }\n"
+"    int m0 = lane / 4, m1 = m0 + 8;\n"
+"    int n0 = (lane % 4) * 2, n1 = n0 + 1;\n"
+"    int token0 = t_start + n0, token1 = t_start + n1;\n"
+"    int row0 = m_start + m0, row1 = m_start + m1;\n"
+"    if (token0 < n_tokens) {\n"
+"        output[(size_t)token0 * out_dim + row0] = rc[0];\n"
+"        output[(size_t)token0 * out_dim + row1] = rc[2];\n"
+"    }\n"
+"    if (token1 < n_tokens) {\n"
+"        output[(size_t)token1 * out_dim + row0] = rc[1];\n"
+"        output[(size_t)token1 * out_dim + row1] = rc[3];\n"
+"    }\n"
+"}\n"
+"\n"
 "/* Batched softplus+bias+mul: out[t, i] = softplus(in[t, i] + bias[i]) * a[i] */\n"
 "__global__ void batch_softplus_mul_f32(float *out, const float *in, const float *bias,\n"
 "                                        const float *a, int n, int n_tokens) {\n"
@@ -4587,6 +4660,7 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_q3_K;
     CUfunction fn_batch_matvec_iq2_s;
     CUfunction fn_dequant_iq2_s_to_f16;
+    CUfunction fn_batch_matvec_iq2_s_tc;
     CUfunction fn_batch_matvec_iq3_xxs;
     CUfunction fn_batch_matvec_iq3_s;
     CUfunction fn_batch_matvec_q4_K;
@@ -4994,6 +5068,7 @@ lookup_funcs:
     GET_FUNC(batch_matvec_q3_K);
     GET_FUNC(batch_matvec_iq2_s);
     GET_FUNC(dequant_iq2_s_to_f16);
+    GET_FUNC(batch_matvec_iq2_s_tc);
     GET_FUNC(batch_matvec_iq3_xxs);
     GET_FUNC(batch_matvec_iq3_s);
     GET_FUNC(batch_matvec_q4_K);
@@ -9230,11 +9305,11 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_S) {
+        /* Dequant + F16 batch matvec: dequantize weights once, reuse for all tokens */
         size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
         CUdeviceptr d_f16 = 0;
         CUresult err = cuMemAlloc(&d_f16, f16_bytes);
         if (err != CUDA_SUCCESS) {
-            /* Fallback to the original quantized kernel if allocation fails */
             void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
             cuLaunchKernel(r->fn_batch_matvec_iq2_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
         } else {
