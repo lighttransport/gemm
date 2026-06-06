@@ -327,16 +327,37 @@ static void ds4f_matvec(ds4f_model *m, float *dst, const ds4f_tensor *t, const f
  * Token-major output. The bf16 path keeps each weight tile L1-resident across all
  * M tokens, so weights are read from HBM ~ONCE per GEMM instead of once per token
  * -> the M=1 BW-bound matvec becomes a compute-bound GEMM (the prefill speedup).
- * Only bf16 dense (DS4F_FP8_BF16=1, lossless FP8->bf16 promote) takes the true
- * GEMM; FP8/MXFP4 fall back to a per-token matvec loop (no M>1 quant GEMM yet)
- * with a one-time warning - the guardrail against the known 10x batched-prefill
- * regression. K-tile reassociation makes the result bit-SIMILAR (~1e-4), not
- * bit-identical, to the single-token matvec. */
+ * bf16 dense (DS4F_FP8_BF16=1) takes the true GEMM directly; FP8 dense (the
+ * default, memory-lean) takes a FUSED FP8->bf16 tile-dequant GEMM: each 8-row
+ * group's TILE_K FP8 sub-tile is dequanted into an 8 KB L1 PV pair-buffer (never
+ * written to HBM) and consumed across all M tokens by the same peak bf16 8x3 pv
+ * kernel -> compute-bound prefill at ~88% of the +6 GB resident-bf16 speed WITHOUT
+ * the +6 GB, bit-identical dequant to DS4F_FP8_BF16=1 (same LUT + 128-block scale +
+ * bf16 truncation). MXFP4 experts have their own group GEMM. Only DS4F_F32 (tiny
+ * mHC mixes) falls back to a per-token matvec loop. K-tile reassociation makes the
+ * result bit-SIMILAR (~1e-4) to the single-token matvec. */
 #ifndef DS4F_MAX_MTILE
 #define DS4F_MAX_MTILE 256          /* >=256 so each owned expert gets ~6 tokens to batch */
 #endif
 typedef struct { ds4f_model *m; float *Y; const ds4f_tensor *t;
                  const float *X; int M, Ystride, Xstride; } ds4f_gemm_task;
+/* thread-local L1 scratch for the FUSED FP8->bf16 prefill GEMM (grow-on-demand).
+ * Holds 4 PV pair-buffers (4 x 2*TILE_K halfwords = 8 KB for one 8-row group's
+ * current K-tile); the FP8 weight is dequanted into it tile-by-tile and consumed
+ * by the bf16 8x3 pv kernel without ever writing bf16 to HBM. EXACT vs the
+ * DS4F_FP8_BF16=1 resident path (identical LUT + 128-block E8M0 scale + bf16
+ * truncation, whose dropped f32 bits are zero) -- but no resident bf16 copy, no
+ * +6 GB. */
+static __thread uint16_t *ds4f_fp8t_buf = NULL;
+static __thread size_t    ds4f_fp8t_cap = 0;          /* in uint16_t elems */
+static inline uint16_t *ds4f_fp8bf16_tile(size_t need) {
+    if (need > ds4f_fp8t_cap) {
+        free(ds4f_fp8t_buf);
+        ds4f_fp8t_buf = (uint16_t *)malloc(need * sizeof(uint16_t));
+        ds4f_fp8t_cap = need;
+    }
+    return ds4f_fp8t_buf;
+}
 /* NOTE: a k-panel cache-blocking variant (k-tile OUTER, row-block INNER over a
  * panel of 8-row blocks) was tried to keep the activation tile L1/L2-resident
  * across the panel. It was NEUTRAL when TILE_K stayed 512 (bit-identical) and
@@ -427,22 +448,81 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
                 matvec_mxfp4_8row(Y+(size_t)mm*Ys+i, w0,w1,w2,w3,w4,w5,w6,w7,
                     s0,s1,s2,s3,s4,s5,s6,s7, X+(size_t)mm*Xs, K);
         }
+    } else if (t->type == DS4F_FP8) {
+        /* FP8 -> bf16 FUSED tile-dequant GEMM. For each 8-row group, dequant one
+         * TILE_K-wide FP8 sub-tile into a tiny L1 PV pair-buffer (8 rows x 512 bf16
+         * = 8 KB, never written to HBM) and immediately consume it across all M
+         * tokens with the peak 8x3 pv microkernel, accumulating over K tiles. This
+         * keeps the dequant L1-fused (no bf16 HBM round-trip) and reuses the exact
+         * matvec_bf16_8x3_pv_acc kernel the DS4F_FP8_BF16=1 path uses -> compute-
+         * bound prefill WITHOUT the +6 GB resident bf16 copy. argmax-exact vs the
+         * per-token FP8 matvec (K-tile reassoc ~1e-4; FP8->bf16 itself lossless). */
+        const uint8_t *wbase = (const uint8_t *)t->w;
+        const uint8_t *sbase = t->scale;
+        const uint32_t *lut = T->m->fp8_lut;
+        int sbc = (K + 127) / 128;
+        const int TK = 512;                       /* K-tile (mult of 128); 8x512 bf16 = 8 KB L1 */
+        uint16_t *pv = ds4f_fp8bf16_tile((size_t)4 * 2 * TK);  /* 4 pair-bufs x 2*TK hw */
+        svbool_t pg = svptrue_b32(); svbool_t ph = svptrue_b16();
+        int vl = (int)svcntw();
+        for (int i = r0; i + 7 < r1; i += 8) {
+            const uint8_t *es = sbase + (size_t)(i >> 7) * sbc;     /* i is 8-aligned -> 128-block via >>7 */
+            float acc[DS4F_MAX_MTILE][8];
+            for (int mm = 0; mm < M; mm++) for (int r = 0; r < 8; r++) acc[mm][r] = 0.f;
+            for (int k0 = 0; k0 < K; k0 += TK) {
+                int klen = K - k0 < TK ? K - k0 : TK;
+                /* dequant 8 rows x klen -> 4 PV pair-bufs: pb[2c+2j]=bf16(rowA[j]),
+                 * pb[2c+2j+1]=bf16(rowB[j]) (matches matvec_bf16_8row_pv's p_odd layout). */
+                for (int pr = 0; pr < 4; pr++) {
+                    uint16_t *pb = pv + (size_t)pr * 2 * TK;
+                    const uint8_t *wa = wbase + (size_t)(i + 2*pr)     * K;
+                    const uint8_t *wb = wbase + (size_t)(i + 2*pr + 1) * K;
+                    for (int c = 0; c < klen; c += vl) {
+                        int cc = k0 + c;       /* 16-chunk stays in one 128-scale block */
+                        svfloat32_t vs = svdup_f32(ggml_e8m0_to_fp32(es[cc >> 7]));
+                        svuint32_t ia = svld1ub_u32(pg, wa + cc);
+                        svuint32_t ib = svld1ub_u32(pg, wb + cc);
+                        svfloat32_t fa = svmul_x(pg, svreinterpret_f32_u32(svld1_gather_u32index_u32(pg, lut, ia)), vs);
+                        svfloat32_t fb = svmul_x(pg, svreinterpret_f32_u32(svld1_gather_u32index_u32(pg, lut, ib)), vs);
+                        svuint16_t a16 = svreinterpret_u16_u32(svlsr_n_u32_x(pg, svreinterpret_u32_f32(fa), 16));
+                        svuint16_t b16 = svreinterpret_u16_u32(svlsr_n_u32_x(pg, svreinterpret_u32_f32(fb), 16));
+                        svuint16_t ca = svuzp1_u16(a16, a16);   /* lanes 0..15 = bf16(rowA) */
+                        svuint16_t cb = svuzp1_u16(b16, b16);
+                        svst1_u16(ph, pb + 2*c, svzip1_u16(ca, cb));   /* [a0,b0,a1,b1,...] */
+                    }
+                }
+                const uint16_t *pA = pv, *pC = pv + 2*TK, *pE = pv + 4*TK, *pG = pv + 6*TK;
+                int mm = 0;
+                for (; mm + 2 < M; mm += 3)
+                    matvec_bf16_8x3_pv_acc(acc[mm], acc[mm+1], acc[mm+2], pA, pC, pE, pG,
+                                           X + (size_t)mm    *Xs + k0,
+                                           X + (size_t)(mm+1)*Xs + k0,
+                                           X + (size_t)(mm+2)*Xs + k0, klen);
+                for (; mm < M; mm++)
+                    matvec_bf16_8row_pv_acc(acc[mm], pA, pC, pE, pG, X + (size_t)mm*Xs + k0, klen);
+            }
+            for (int mm = 0; mm < M; mm++) {
+                float *y = Y + (size_t)mm*Ys + i;
+                for (int r = 0; r < 8; r++) y[r] = acc[mm][r];
+            }
+        }
     }
-    /* FP8/F32 never reach the worker (handled in ds4f_gemm). */
+    /* DS4F_F32 (tiny mHC mixes) never reaches the worker (handled in ds4f_gemm). */
 }
 static int ds4f_gemm_warned = 0;
 static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
                       const float *X, int M, int Ystride, int Xstride) {
     if (M > DS4F_MAX_MTILE) { fprintf(stderr, "ds4f_gemm: M=%d > DS4F_MAX_MTILE=%d\n", M, DS4F_MAX_MTILE); abort(); }
-    if (t->type == DS4F_BF16_PV || t->type == DS4F_BF16 || t->type == DS4F_MXFP4 || t->type == DS4F_Q8_PV) {
+    if (t->type == DS4F_BF16_PV || t->type == DS4F_BF16 || t->type == DS4F_MXFP4 ||
+        t->type == DS4F_Q8_PV   || t->type == DS4F_FP8) {
         m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols)    /* read once across all M */
-                       + ds4f_sbytes(t->type, t->rows, t->cols);   /* MXFP4 per-row scales */
+                       + ds4f_sbytes(t->type, t->rows, t->cols);   /* MXFP4/FP8 block scales */
         ds4f_gemm_task T = { m, Y, t, X, M, Ystride, Xstride };
         ds4f_pool_run(m->pool, ds4f_gemm_worker, &T);
     } else {
         if (!ds4f_gemm_warned) {
-            fprintf(stderr, "WARN: ds4f_gemm per-token matvec fallback (dtype %d != bf16) -> "
-                            "prefill will NOT speed up; set DS4F_FP8_BF16=1 for dense\n", t->type);
+            fprintf(stderr, "WARN: ds4f_gemm per-token matvec fallback (dtype %d, expected F32 mHC) -> "
+                            "prefill not batched for this tensor\n", t->type);
             ds4f_gemm_warned = 1;
         }
         for (int mm = 0; mm < M; mm++)         /* ds4f_matvec accounts bytes_read per call */
@@ -2623,8 +2703,11 @@ static void ds4f_hc_head(ds4f_model *m, const float *x4, float *y) {
  * BW-bound matvec into a compute-bound GEMM (the ~10x prefill lever). Attention
  * parallelizes over (token,head); routed experts stay per-token (MXFP4, no M>1
  * quant GEMM yet); the EP all-reduce is ONE [M,C] call per layer (vs M).
- * REQUIRES bf16 dense (DS4F_FP8_BF16=1): with FP8/MXFP4 dense the GEMM falls back
- * to per-token (no speedup). mHC / Tier-B2 are NOT supported (die-guarded). The
+ * FP8 dense (the default) batches via a FUSED FP8->bf16 tile-dequant GEMM
+ * (~5x over per-token sequential, ~88% of resident-bf16, no +6 GB); DS4F_FP8_BF16=1
+ * predequants to resident bf16 for the last ~12% of prefill speed at +6 GB. Only
+ * DS4F_F32 falls back to per-token (no speedup). mHC / Tier-B2 are NOT supported
+ * (die-guarded). The
  * GEMM K-tile reassociation makes the result bit-SIMILAR (~1e-4), not -identical,
  * to the per-token path; argmax matches. */
 

@@ -131,12 +131,27 @@ if [ "${SKIP_TOPO:-0}" != "1" ]; then
 else
     echo "[run_ds4f] SKIP_TOPO=1: using existing tofu_topo.txt"
 fi
-echo "--- tofu topo ($(wc -l < tofu_topo.txt) rows) ---"; cat tofu_topo.txt
+if [ "${DS4F_QUIET:-0}" = "1" ]; then
+    echo "--- tofu topo ($(wc -l < tofu_topo.txt) rows; DS4F_QUIET: see tofu_topo.txt) ---"
+else
+    echo "--- tofu topo ($(wc -l < tofu_topo.txt) rows) ---"; cat tofu_topo.txt
+fi
 
 # ---- launch the synthetic EP harness ----
 echo "--- launching ds4f_ep_runner (NP=$NP) ---"
 mpiexec -np "$NP" "${MPI_PLACE[@]}" "$BIN"
 
-echo "=== per-rank load (alloc + first-touch + RSS) ==="; cat ds4f_ep_load_rank*.txt 2>/dev/null
-echo "=== per-rank perf (compute / all-reduce comm / GB-s) ==="; cat ds4f_ep_perf_rank*.txt 2>/dev/null
-echo "=== rank0 summary ==="; cat ds4f_ep_rank00.txt 2>/dev/null
+# Per-rank files are rank-identical by lockstep design (perf/argmax/RSS match across all
+# ranks); DS4F_QUIET=1 prints only counts + the rank0 head, keeping interactive sessions
+# lean. Full per-rank files remain on disk (ds4f_ep_{load,perf}_rank*.txt) for inspection.
+if [ "${DS4F_QUIET:-0}" = "1" ]; then
+    nload=$(ls ds4f_ep_load_rank*.txt 2>/dev/null | wc -l)
+    nperf=$(ls ds4f_ep_perf_rank*.txt 2>/dev/null | wc -l)
+    echo "=== per-rank compact (load=$nload/$NP perf=$nperf/$NP; ranks lockstep-identical; full files on disk) ==="
+    echo "--- rank0 summary (first 20 lines; full in ds4f_ep_rank00.txt) ---"
+    head -20 ds4f_ep_rank00.txt 2>/dev/null
+else
+    echo "=== per-rank load (alloc + first-touch + RSS) ==="; cat ds4f_ep_load_rank*.txt 2>/dev/null
+    echo "=== per-rank perf (compute / all-reduce comm / GB-s) ==="; cat ds4f_ep_perf_rank*.txt 2>/dev/null
+    echo "=== rank0 summary ==="; cat ds4f_ep_rank00.txt 2>/dev/null
+fi

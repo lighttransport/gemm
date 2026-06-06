@@ -98,12 +98,13 @@ TP_SRC   := $(LLM_DIR)tp_runner.c
 EP_SRC   := $(LLM_DIR)ep_runner.c
 DS4F_SRC := $(LLM_DIR)ds4f_runner.c
 DS4F_EP_SRC := $(LLM_DIR)ds4f_ep_runner.c
+DS4F_DECBW_SRC := $(LLM_DIR)ds4f_decode_bw_bench.c
 # header deps: ds4f.h / ggml_dequant.h are not in the .c prereqs, so editing them
 # would otherwise leave the binaries stale (a no-op `make`). Track them explicitly.
 DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ggml_dequant.h
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner
+.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw
 
 all: $(BUILD)/llm_runner
 
@@ -153,6 +154,13 @@ $(BUILD)/ds4f_runner: $(DS4F_SRC) $(DS4F_HDRS) | $(BUILD)
 ds4f_ep_runner: $(BUILD)/ds4f_ep_runner
 $(BUILD)/ds4f_ep_runner: $(DS4F_EP_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_EP_SRC) $(LDFLAGS) -ltofucom
+
+# DeepSeek-V4-Flash single-node decode-bandwidth bench (no MPI, no vlm objs, no
+# model alloc). Reproduces the M=1 cold-HBM decode regime through the production
+# pinned pool to roofline FP8/bf16/MXFP4 dequant kernels. Runs directly on-node.
+ds4f_decode_bw: $(BUILD)/ds4f_decode_bw
+$(BUILD)/ds4f_decode_bw: $(DS4F_DECBW_SRC) $(DS4F_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(DS4F_DECBW_SRC) $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD)

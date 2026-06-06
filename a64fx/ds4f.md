@@ -233,6 +233,58 @@ Step 2d O(topk) table above is the lighter mHC-off sparse-path characterization:
   (see the HBM note above), not KV precision. ctx ≤ ~16K is the safe top under
   `DS4F_FP8_BF16=1`; reaching 32K needs `DS4F_FP8_BF16=0` (FP8 dense, −6 GB) and/or int8 KV.
 
+## Step 2f — single-node decode roofline + FP8 prefill tile-dequant (alloc-free)
+
+When the 11-node alloc is PMIx-degraded, this single-node, pthread-pinned bench
+(`a64fx/llm/ds4f_decode_bw_bench.c`, `make ds4f_decode_bw`, runs directly on-node, pins
+cores 12–59, leaves 0–11 + memory for the agent) rooflines every weight rep in the M=1
+cold-HBM decode regime. Two confounds in the old `ds4f_fp8_fast_bench.c` were fatal and
+are fixed here: **NUMA first-touch** (fill *through* the pool via `mmap`/`munmap` per pool
+— glibc `aligned_alloc` recycles already-faulted pages, pinning the whole pool to CMG0 and
+collapsing the read ceiling to single-CMG ~90 GB/s) and **cold cache** (a pool of P
+distinct matrices cycled per sweep). Trust shapes ≥16 MB only; smaller ones are
+barrier/L2-overhead-skewed. Gate = argmax+top5 vs an own-repr f32 reference (never bit-eq).
+
+**Node read ceiling R ≈ 720 GB/s** (1T 42 → 12T 466 → 24T 714 → 48T 719). The decisive,
+non-obvious result (it **inverts** the "FP8 = faster *and* −6 GB" premise):
+
+| 48T, ≥16 MB shapes | bf16 | fp8-gather | fp8-magic | scalar | neon |
+|---|---|---|---|---|---|
+| wo_a[8192,4096] 32 MB | **610** (85 % R) | 64 | 106 | 23 | 34 |
+| wo_b[4096,4096] 16 MB | **579** (93 % R) | 103 | 128 | 20 | 32 |
+| bigK[4096,8192] 32 MB | **307** (42 % R) | 85 | 73 | 18 | 32 |
+| wq_b[32768,1024] 32 MB | **373** (52 % R) | 50 | 56 | 13 | 27 |
+
+- **FP8 on-demand decode is dequant/issue-bound, not BW-bound** (8–20 % of R, still scaling
+  past 24T); **bf16-predequant is BW-bound** (~85 % of R) and **2.1–3.3× faster per dense
+  matvec** despite 2× the bytes. On A64FX, FP8 trades 2× memory for 2–3× slower decode —
+  speed vs memory is a fundamental tension, not a free win.
+- **magic ≥ gather** within FP8 on the dominant dense shapes (wo_a 1.66×, wo_b 1.24×);
+  gather wins only large-K (bigK 0.85×). magic flushes E4M3 subnormals via FTZ → argmax-exact
+  on synthetic, but a real-weight argmax check gates flipping `DS4F_FP8_MAGIC`'s default.
+- **scalar/NEON-128 refuted** for the matvec (3–7× slower than SVE-512) — the "free cores in
+  decode → short-vector lower latency" idea loses; the 48T matvec is decode-op-throughput bound.
+
+**Landed (validated single-node, argmax-exact): FP8→bf16 FUSED tile-dequant prefill GEMM.**
+`ds4f_gemm_worker` (`common/ds4f_impl.h`) now batches **FP8 dense** (the memory-lean default)
+instead of falling back to per-token matvec. The **fused** kernel: for each 8-row group it
+dequants one `TILE_K`-wide FP8 sub-tile (SVE LUT-gather + per-128-block E8M0 scale + `>>16`,
+bit-identical to the load-time predequant) **into a tiny 8 KB L1 PV pair-buffer** (`uzp1`+`zip1`
+interleave → the same `p_odd` layout the bf16 path uses), then immediately consumes it across all
+M tokens with the peak `matvec_bf16_8x3_pv_acc` microkernel, accumulating over K tiles. **No bf16
+HBM round-trip** and it reuses the exact bf16 microkernel — so the dequant hides behind the FMA
+pipeline. `DS4F_EXACT=1 DS4F_FP8_BF16=0 DS4F_PREFILL_BATCH=64 DS4F_PREFILL_CHECK=1` → argmax
+**0/64** mismatch, rel 8.5e-6 (K-tile reassoc; FP8→bf16 itself lossless).
+
+*Evolution of this lever:* the first version expanded the whole row-slice to a bf16 scratch then
+ran the plain `gemm_bf16_f32_tokmajor` — two penalties (bf16 HBM/L2 round-trip + the slower
+non-PV kernel) capped it at **~53% of the +6 GB bf16-resident path** (18.4 vs 39 tok/s). Fusing
+the dequant into the K-tile and switching to the PV 8×3 kernel removed both: **FP8 batched
+prefill is now ~88% of bf16-resident** (A/B at L=16, P=384: fused-FP8 ~85–92 vs bf16-resident
+~96–106 tok/s; equal within noise at L=8) — **with no +6 GB**. Decode (M=1) path untouched. The
+residual ~12% is the gather-bound dequant compute not 100% hidden; closing it would need the
+gather-free *magic* decode (real-weight-argmax-validation-blocked, FTZ subnormals).
+
 ## OPS gotchas (each cost a real cycle)
 
 1. **A job restart wipes `/local` AND moves the alloc.** A new `pjsub`/restart →
