@@ -9536,6 +9536,21 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                                        const float *embeddings, int embd_stride,
                                        int n_tokens, int start_pos) {
     if (cuda_llm_bind_context(r) != 0) return NULL;
+
+    /* MoE models: fall back to per-token forward (decode path handles MoE correctly) */
+    if (r->is_moe) {
+        float *result = NULL;
+        for (int t = 0; t < n_tokens; t++) {
+            if (token_ids)
+                result = cuda_llm_forward(r, token_ids[t], start_pos + t);
+            else if (embeddings)
+                result = cuda_llm_forward_embd(r, embeddings + (size_t)t * embd_stride, embd_stride, start_pos + t);
+            else
+                return NULL;
+            if (!result) return NULL;
+        }
+        return result;
+    }
     if (cuda_llm_ensure_batch_buffers(r, n_tokens) != 0) return NULL;
 
     int n_embd = r->n_embd;
