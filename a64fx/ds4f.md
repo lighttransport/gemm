@@ -542,7 +542,15 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
   directly attacks the ctx=32768 OOM ceiling** (the resident dense weights, not KV, are the wall —
   see Remaining-work item 2) and inverts the FP8-dense memory-vs-speed tradeoff for these 8 tensors
   (FP8-on-demand was −6 GB but *slower*; int8 W8A8 is −5.5 GB **and** faster). Gated `DS4F_Q8_DENSE`
-  (default off).
+  (default off in the base 11n runner — int8 is lossy so the synthetic argmax shifts, keep it the
+  clean bf16-pv reference; default **on** in the perf/memory wrappers longctx + gen, commit `36fcf48`).
+  *Two int8 RSS data points (safe band): ctx10240 = 22.40 GB (decode 13.03 tok/s), ctx16384 = 22.66 GB
+  (decode 12.34 tok/s) → KV slope ~0.26 GB/6144 ctx (~0.35 GB/8192).* **PROJECTED ctx-ceiling lift:**
+  bf16's 32768 OOM (rc=137, projected ~30.4 GB vs ~29–30 GB node ceiling) is a *weight*-footprint
+  wall, not KV. With int8 dense, ctx32768 projects to **~23.4–24.4 GB (5–6 GB headroom)** even on the
+  conservative bf16 slope, so **int8 dense alone should clear 32768 and likely reach ~64–128k** —
+  a 4–8× context jump, not just a decode-speed win. *Confirm on a FRESH alloc only* (the standing
+  rule forbids probing past 16k on a shared alloc — an OOM-kill degrades PMIx and loses the alloc).
 
 - **`TP_AR_BF16` REFUTED (negative result, not adopted).** Tested whether halving the EP all-reduce
   payload (f32 → bf16) cuts the ≈12.7 ms "other"/comm. It does **not**: comm dropped only **2.5 %**
