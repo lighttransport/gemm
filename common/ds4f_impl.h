@@ -322,6 +322,80 @@ static void ds4f_matvec(ds4f_model *m, float *dst, const ds4f_tensor *t, const f
     ds4f_pool_run(m->pool, ds4f_mv_worker, &T);
 }
 
+/* ---- block-diagonal matvec: the grouped o-proj wo_a [o_groups*glora rows, cols].
+ * Output row-block i (8-aligned; glora%8==0 so a block never straddles a group) uses
+ * input xbase + (i/glora)*gin. Fuses the o_groups separate ds4f_matvec dispatches into
+ * ONE pool_run -> kills (o_groups-1) cross-CMG barriers AND the load imbalance (glora=1024
+ * rows split across 48 threads = ~2.6 8-row groups/thread, poorly balanced; fused = all
+ * o_inter=8192 rows split evenly). BIT-EXACT to the per-group ds4f_matvec loop: same kernel,
+ * same per-row dot, same accumulation order (each row fully owned by one thread); using the
+ * FULL tensor + GLOBAL row index i reproduces ds4f_row_slice's byte/scale offsets exactly
+ * (PV: (i/8)*8*K; FP8/MXFP4 scale: i-indexed). Only the row->thread mapping changes. */
+typedef struct {
+    ds4f_model *m; float *dst; const ds4f_tensor *t; const float *xbase;
+    int gin, glora;
+} ds4f_mv_bd_task;
+static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
+    ds4f_mv_bd_task *T = (ds4f_mv_bd_task *)arg;
+    const ds4f_tensor *t = T->t; float *dst = T->dst;
+    int K = t->cols, gin = T->gin, glora = T->glora;
+    int r0, r1; ds4f_rowsplit8(t->rows, nthr, tid, &r0, &r1);
+    if (t->type == DS4F_BF16_PV) {
+        const uint16_t *base = (const uint16_t *)t->w;
+        for (int i = r0; i + 7 < r1; i += 8) {
+            const float *x = T->xbase + (size_t)(i / glora) * gin;
+            const uint16_t *g = base + (size_t)(i / 8) * 8 * K;
+            matvec_bf16_8row_pv(dst + i, g, g + 2*K, g + 4*K, g + 6*K, x, K);
+        }
+    } else if (t->type == DS4F_BF16) {
+        const uint16_t *base = (const uint16_t *)t->w;
+        for (int i = r0; i + 7 < r1; i += 8) {
+            const float *x = T->xbase + (size_t)(i / glora) * gin;
+            const uint16_t *w = base + (size_t)i * K;
+            matvec_bf16_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K, x, K);
+        }
+    } else if (t->type == DS4F_FP8) {
+        const uint8_t *base = (const uint8_t *)t->w;
+        int sb_cols = (K + 127) / 128;
+        if (T->m->fp8_magic) {
+            ds4f_set_ftz();
+            for (int i = r0; i + 7 < r1; i += 8) {
+                const float *x = T->xbase + (size_t)(i / glora) * gin;
+                const uint8_t *w = base + (size_t)i * K;
+                const uint8_t *es = t->scale + (size_t)(i / 128) * sb_cols;
+                matvec_fp8e4m3_8row_magic(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
+                                          es, x, K);
+            }
+        } else {
+            for (int i = r0; i + 7 < r1; i += 8) {
+                const float *x = T->xbase + (size_t)(i / glora) * gin;
+                const uint8_t *w = base + (size_t)i * K;
+                const uint8_t *es = t->scale + (size_t)(i / 128) * sb_cols;
+                matvec_fp8e4m3_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
+                                    es, T->m->fp8_lut, x, K);
+            }
+        }
+    } else if (t->type == DS4F_MXFP4) {
+        const uint8_t *base = (const uint8_t *)t->w; size_t rb = K / 2;
+        const uint8_t *sbase = t->scale; size_t sb = K / 32;
+        for (int i = r0; i + 7 < r1; i += 8) {
+            const float *x = T->xbase + (size_t)(i / glora) * gin;
+            const uint8_t *w = base + (size_t)i * rb;
+            const uint8_t *s = sbase + (size_t)i * sb;
+            matvec_mxfp4_8row(dst + i,
+                w, w+rb, w+2*rb, w+3*rb, w+4*rb, w+5*rb, w+6*rb, w+7*rb,
+                s, s+sb, s+2*sb, s+3*sb, s+4*sb, s+5*sb, s+6*sb, s+7*sb, x, K);
+        }
+    }
+}
+static int ds4f_oproj_fuse = -1;     /* DS4F_OPROJ_FUSE: 1=fused wo_a (default), 0=per-group ref */
+static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *t,
+                                  const float *xbase, int gin, int glora) {
+    ds4f_mv_bd_task T = { m, dst, t, xbase, gin, glora };
+    m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols) + ds4f_sbytes(t->type, t->rows, t->cols);
+    ds4f_pool_run(m->pool, ds4f_mv_bd_worker, &T);
+}
+
 /* ===================== batched (M>1) GEMM for prefill =====================
  * Y[t*Ystride + r] = sum_k W[r,k] * X[t*Xstride + k], for t in [0,M), r in [0,rows).
  * Token-major output. The bf16 path keeps each weight tile L1-resident across all
@@ -3292,6 +3366,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     float eps = 1e-6f;
     if (ds4f_prof_on < 0) { const char *e = getenv("DS4F_PROF"); ds4f_prof_on = e ? atoi(e) : 0; }
     if (ds4f_attn_sve < 0) { const char *e = getenv("DS4F_ATTN_SVE"); ds4f_attn_sve = e ? atoi(e) : 1; }
+    if (ds4f_oproj_fuse < 0) { const char *e = getenv("DS4F_OPROJ_FUSE"); ds4f_oproj_fuse = e ? atoi(e) : 1; }
     /* exact mHC: carry x as hc_mult residual streams (s_x4). Expand the single
      * embedding x[C] into 4 identical streams; collapse back at the head. When
      * m->mhc==0 the plain-residual stand-in below runs unchanged (byte-identical). */
@@ -3361,7 +3436,9 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
              * group g: o1[g*o_lora ..] = wo_a_rows[g*o_lora ..] @ s_attn[g*C ..].
              * wo_a is FP8 -> o_lora(1024) rows are 128-aligned per group. */
             int gin = H / og;                          /* 32768/8 = 4096 == C */
-            for (int g = 0; g < og; g++) {
+            if (ds4f_oproj_fuse) {                     /* fused block-diagonal: 1 dispatch */
+                ds4f_matvec_blockdiag(m, m->s_o1, &ly->wo_a, m->s_attn, gin, c->o_lora);
+            } else for (int g = 0; g < og; g++) {      /* reference: og separate dispatches */
                 ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
                 ds4f_matvec(m, m->s_o1 + (size_t)g * c->o_lora, &vg, m->s_attn + (size_t)g * gin);
             }
