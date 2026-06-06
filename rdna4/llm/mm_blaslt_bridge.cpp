@@ -5,6 +5,41 @@
 
 #include "mm_blaslt_bridge.h"
 
+#ifdef MM_BLASLT_DISABLE
+
+/* Build-time fallback for scalar verification on hosts without hipBLASLt dev files. */
+extern "C" int mm_blaslt_init(void) { return -1; }
+
+extern "C" int mm_blaslt_run_bf16(void *, const void *, const void *,
+                                  int, int, int, void *) { return -1; }
+
+extern "C" int mm_blaslt_run_bf16_bias(void *, const void *, const void *,
+                                       const void *, int, int, int, void *) {
+  return -1;
+}
+
+extern "C" int mm_blaslt_run_bf16_bias_residual(
+    void *, const void *, const void *, const void *, const void *,
+    int, int, int, void *) {
+  return -1;
+}
+
+extern "C" int mm_blaslt_run_bf16_bias_gelu_bf16d(
+    void *, const void *, const void *, const void *,
+    int, int, int, void *) {
+  return -1;
+}
+
+extern "C" int mm_blaslt_run_bf16_bias_bf16d(
+    void *, const void *, const void *, const void *,
+    int, int, int, void *) {
+  return -1;
+}
+
+extern "C" void mm_blaslt_destroy(void) {}
+
+#else
+
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
@@ -318,3 +353,5 @@ extern "C" void mm_blaslt_destroy(void) {
   }
   g_state.initialized = false;
 }
+
+#endif /* MM_BLASLT_DISABLE */
