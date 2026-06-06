@@ -77,6 +77,20 @@ static size_t rss_bytes(void) {
     return (size_t)res * (size_t)sysconf(_SC_PAGESIZE);
 }
 
+/* ---- real greedy generation (coding-task quality test) ---- */
+#define DS4F_EOS_ID 1
+/* token id -> input embedding (BF16 row [vocab,hidden] -> f32). The forward's
+ * first op is the input RMSNorm (no embedding scaling), so the raw widened row
+ * is exactly the activation ds4f_forward_token expects. */
+static void embed_lookup(const ds4f_model *m, int tok, float *x) {
+    int C = m->cfg.hidden;
+    if (tok < 0 || tok >= m->cfg.vocab) tok = 0;
+    const uint16_t *row = m->embed + (size_t)tok * C;
+    for (int i = 0; i < C; i++) {
+        union { uint32_t u; float f; } z; z.u = (uint32_t)row[i] << 16; x[i] = z.f;
+    }
+}
+
 /* ---- topology (tofu_topo.txt; written once by tofu_topo_helper) ---- */
 static int read_topo(uint8_t coords[][TOFU_NCOORDS]) {
     FILE *f = fopen(TOPO_PATH, "r");
@@ -173,6 +187,34 @@ int main(void) {
     int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* fill synthetic KV+compressed to this ctx, decode from there */
     int prefill_batch = envi("DS4F_PREFILL_BATCH", 0);   /* >0: batched M-token GEMM prefill (needs exact + dense bf16) */
     if (prefill_batch > DS4F_MAX_MTILE) prefill_batch = DS4F_MAX_MTILE;
+
+    /* ---- real greedy generation mode (coding-task quality test) ----
+     * DS4F_PROMPT_IDS=<file of whitespace-separated token ids> turns on real
+     * generation: prefill the prompt via embed-lookup, then greedy argmax decode
+     * with embed feedback (stop on eos). All ranks read the SAME prompt file and
+     * compute the SAME argmax (dense+head replicated) -> identical token feed ->
+     * cross-rank lockstep preserved with no extra broadcast. */
+    const char *prompt_ids_file = getenv("DS4F_PROMPT_IDS");
+    const char *gen_out_file    = getenv("DS4F_GEN_OUT");
+    int gen_mode = (prompt_ids_file && *prompt_ids_file);
+    int max_new  = envi("DS4F_MAX_NEW", 256);
+    int *prompt_ids = NULL, n_prompt = 0;
+    if (gen_mode) {
+        FILE *pfh = fopen(prompt_ids_file, "r");
+        if (!pfh) die("cannot open DS4F_PROMPT_IDS file", -1);
+        int cap = 1024; prompt_ids = (int *)malloc((size_t)cap*sizeof(int));
+        int v;
+        while (fscanf(pfh, "%d", &v) == 1) {
+            if (n_prompt >= cap) { cap *= 2; prompt_ids = (int *)realloc(prompt_ids, (size_t)cap*sizeof(int)); }
+            prompt_ids[n_prompt++] = v;
+        }
+        fclose(pfh);
+        if (n_prompt < 1) die("DS4F_PROMPT_IDS file has no ids", -1);
+        prefill = n_prompt;     /* prefill the whole prompt token-at-a-time */
+        maxgen  = max_new;      /* decode up to max_new new tokens */
+        prefill_batch = 0;      /* greedy feedback needs the per-token embedding */
+        ctx_warm = 0;           /* gen mode does not warm synthetic KV */
+    }
 
     /* ---- uTofu bootstrap (single TNI) ---- */
     utofu_tni_id_t *tni_ids = NULL; size_t num_tnis = 0;
@@ -337,12 +379,26 @@ int main(void) {
         for (int i = 0; i < C; i++) { if (!(xl[i] == xl[i])) nan_count++; xnorm += (double)xl[i]*xl[i]; }
         free(X); free(bt);
     } else {
+        int tf_check = gen_mode && envi("DS4F_TF_CHECK", 0);
+        int tf_correct = 0, tf_total = 0;
         for (int p = 0; p < prefill; p++) {
-            for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
+            if (gen_mode) embed_lookup(m, prompt_ids[p], x);
+            else for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
             m->bytes_read = 0;
             pf_last_tok = ds4f_forward_token(m, x, p);
             pf_bytes += m->bytes_read;
+            /* teacher-forcing sanity: does argmax(pos p) predict prompt_ids[p+1]?
+             * A correct LM hits ~50-80% on its own code text; ~0% == broken forward. */
+            if (tf_check && p+1 < prefill) {
+                int hit = (pf_last_tok == prompt_ids[p+1]);
+                tf_correct += hit; tf_total++;
+                if (MyRank == 0) logmsg("  TF p=%-2d in=%-6d pred=%-6d tgt=%-6d %s\n",
+                                        p, prompt_ids[p], pf_last_tok, prompt_ids[p+1], hit?"HIT":".");
+            }
         }
+        if (tf_check && MyRank == 0)
+            logmsg("TF_ACCURACY %d/%d = %.1f%% (prompt next-token; real LM ~50-80%%, broken ~0%%)\n",
+                   tf_correct, tf_total, tf_total ? 100.0*tf_correct/tf_total : 0.0);
         for (int i = 0; i < C; i++) { if (!(x[i] == x[i])) nan_count++; xnorm += (double)x[i]*x[i]; }
     }
     double t_pf = now_sec() - t_pf0;
@@ -366,12 +422,33 @@ int main(void) {
     memset(m->prof, 0, sizeof(m->prof));
     double t_dec0 = now_sec(); size_t dec_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int last_tok = 0;
-    for (int g = 0; g < maxgen; g++) {
-        int pos = dec_base + g;
-        for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
-        m->bytes_read = 0;
-        last_tok = ds4f_forward_token(m, x, pos);
-        dec_bytes += m->bytes_read;
+    int *gen_ids = NULL, n_gen = 0;
+    if (gen_mode) {
+        /* greedy: pf_last_tok is the prompt's first prediction (token at pos
+         * dec_base). Feed it back, argmax->embed->next, until eos or max_new.
+         * forward(x,pos) places `cur` at `pos` and predicts pos+1. */
+        gen_ids = (int *)malloc((size_t)(max_new + 1) * sizeof(int));
+        int cur = pf_last_tok, dec_steps = 0;
+        for (int g = 0; g < max_new; g++) {
+            gen_ids[n_gen++] = cur;
+            if (cur == DS4F_EOS_ID) break;
+            int pos = dec_base + g;
+            embed_lookup(m, cur, x);
+            m->bytes_read = 0;
+            cur = ds4f_forward_token(m, x, pos);
+            dec_bytes += m->bytes_read;
+            dec_steps++;
+        }
+        last_tok = cur;
+        maxgen = dec_steps;     /* report tok/s over actual decode forward calls */
+    } else {
+        for (int g = 0; g < maxgen; g++) {
+            int pos = dec_base + g;
+            for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
+            m->bytes_read = 0;
+            last_tok = ds4f_forward_token(m, x, pos);
+            dec_bytes += m->bytes_read;
+        }
     }
     double t_dec = now_sec() - t_dec0;
     double dec_ar = g_ar_secs;
@@ -416,8 +493,22 @@ int main(void) {
                 logmsg("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*m->prof[i]/psum);
             }
         }
+        /* gen mode: rank 0 writes the generated token-id stream for detokenize */
+        if (gen_mode && gen_out_file && *gen_out_file) {
+            FILE *gf = fopen(gen_out_file, "w");
+            if (gf) {
+                for (int i = 0; i < n_gen; i++) fprintf(gf, "%d%s", gen_ids[i], i+1 < n_gen ? " " : "\n");
+                fclose(gf);
+                logmsg("gen: wrote %d token ids to %s%s\n", n_gen, gen_out_file,
+                       (n_gen > 0 && gen_ids[n_gen-1] == DS4F_EOS_ID) ? " (eos)" : " (max_new)");
+            } else {
+                logmsg("gen: WARNING could not open DS4F_GEN_OUT=%s for write\n", gen_out_file);
+            }
+        }
     }
 
+    free(prompt_ids);
+    free(gen_ids);
     free(x);
     ds4f_free(m);
     return 0;

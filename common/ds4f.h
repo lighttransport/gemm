@@ -191,8 +191,14 @@ typedef struct {
     float *hc_attn_fn, *hc_ffn_fn;    /* [24,16384] */
     float *hc_attn_base, *hc_ffn_base;  /* [24] */
     float *hc_attn_scale, *hc_ffn_scale; /* [3] */
-    /* per-layer KV cache: [max_pos, kv_lora] F32 (latent, 1 kv head) */
-    float *kv_cache;
+    /* per-layer KV cache: [max_pos, kv_lora] BF16 (latent, 1 kv head).
+     * 2-byte storage halves the long-context KV footprint (the decode memory
+     * dominator) vs f32. BF16 (not FP16): the model is natively bfloat16 and the
+     * kv latents carry massive-activation dims (~1e4..1e5) that overflow FP16's
+     * 65504 ceiling -> Inf -> NaN; BF16 shares f32's exponent range and the
+     * model's 8-bit-mantissa reference precision (faithful, not lossy). Codec:
+     * ds4f_bf16f (bf16->f32 lsl) / ds4f_f32bf (f32->bf16 round) in ds4f_impl.h. */
+    uint16_t *kv_cache;
     /* ---- Tier-B2 (DS4F_TIERB2; off-arena, only on ratio!=0 layers) ----
      * The stateful compressor/indexer long-range compressed-KV term that Tier-B1
      * omits. The matvec weights are stored bf16 (sources are bf16/FP8-e4m3, both
