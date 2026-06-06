@@ -1137,7 +1137,7 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     {   int hc = c->hc_mult, mix = (2+hc)*hc, hd = hc*c->hidden;
         per_layer += 2*((size_t)mix*hd*4 + (size_t)mix*4 + 3*4) + 6*pad;            /* hc_attn/ffn fn+base+scale */
     }
-    per_layer += (size_t)c->max_pos * c->kv_lora * 4 + pad;                         /* kv cache */
+    per_layer += (size_t)c->max_pos * c->kv_lora * sizeof(uint16_t) + pad;          /* kv cache (bf16) */
 
     size_t total = per_layer * c->n_layers;
     total += ds4f_wbytes(DS4F_BF16, c->vocab, c->hidden) + pad;                     /* embed */
@@ -1248,11 +1248,18 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
     ds4f_config *c = &m->cfg;
     int C = c->hidden, KV = c->kv_lora, ihd = c->index_head_dim, iH = c->index_n_heads;
     int qlora = c->q_lora, np = c->max_pos;
+    /* ds4f_index_topk ALWAYS writes sel[0..index_topk) (real picks + -1 pad), and
+     * ds4f_index_score writes score[0..T) with T<=np/ratio. When max_pos < index_topk
+     * (e.g. short gen runs, np=216 < 512), an np-sized sel buffer overflows by
+     * (index_topk-np) ints of 0xFFFFFFFF (=NaN bit pattern) into adjacent heap, which
+     * (running after tb2_prepare's compressor write) corrupts the compressor ring
+     * state -> all-NaN cmp_kv from the 3rd compressed block on. Size to hold both. */
+    int nsel_cap = np > c->index_topk ? np : c->index_topk;
     /* model-level per-token scratch (allocated once) */
     m->s_cmp_out   = (float *)aligned_alloc(256, (size_t)KV*4);
     m->s_idx_q     = (float *)aligned_alloc(256, (size_t)iH*ihd*4);
-    m->s_idx_score = (float *)aligned_alloc(256, (size_t)np*4);
-    m->s_tb2_sel   = (int   *)aligned_alloc(256, (size_t)np*4);
+    m->s_idx_score = (float *)aligned_alloc(256, (size_t)nsel_cap*4);
+    m->s_tb2_sel   = (int   *)aligned_alloc(256, (size_t)nsel_cap*4);
     for (int L = 0; L < c->n_layers; L++) {
         int ratio = c->compress_ratios[L];
         if (ratio == 0) continue;
@@ -1402,7 +1409,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
             ly->hc_ffn_fn     = (float *)ds4f_bump(m, (size_t)mix*hd*4, 256);
             ly->hc_ffn_base   = (float *)ds4f_bump(m, (size_t)mix*4, 64);
             ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3*4, 64); }
-        ly->kv_cache   = (float *)ds4f_bump(m, (size_t)cfg.max_pos*cfg.kv_lora*4, 256);
+        ly->kv_cache   = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos*cfg.kv_lora*sizeof(uint16_t), 256);
     }
 
     /* parallel first-touch fill of all quantized tensors (compute-thread ==
@@ -1987,7 +1994,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             ly->hc_ffn_fn     = (float *)ds4f_bump(m, (size_t)mix * hd * 4, 256);
             ly->hc_ffn_base   = (float *)ds4f_bump(m, (size_t)mix * 4, 64);
             ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3 * 4, 64); }
-        ly->kv_cache = (float *)ds4f_bump(m, (size_t)cfg.max_pos * cfg.kv_lora * 4, 256);
+        ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos * cfg.kv_lora * sizeof(uint16_t), 256);
     }
     if (m->tierb2) ds4f_alloc_tb2(m, 0);   /* off-arena compressor/indexer (load by name below) */
 
@@ -2101,6 +2108,15 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     return m;
 }
 
+/* ---- bf16 KV-cache codec. The model is natively bf16 (torch_dtype=bfloat16);
+ * kv latents carry "massive activation" dims (~10^4..10^5) that overflow fp16's
+ * 65504 ceiling -> Inf -> NaN (context/token-dependent). bf16 shares f32's 8-bit
+ * exponent (no overflow) and matches the model's reference precision (8-bit
+ * mantissa), so it is faithful, not lossy, for a bf16 model. Same 2 B/elem as fp16.
+ * bf16->f32 is a 16-bit left shift; f32->bf16 is round-to-nearest-even. ---- */
+static inline float    ds4f_bf16f(uint16_t b) { union { uint32_t u; float f; } z; z.u = (uint32_t)b << 16; return z.f; }
+static inline uint16_t ds4f_f32bf(float x)     { union { uint32_t u; float f; } z; z.f = x; return (uint16_t)((z.u + 0x7fffu + ((z.u >> 16) & 1u)) >> 16); }
+
 /* ===================== attention (pooled over heads) ===================== */
 typedef struct { ds4f_model *m; ds4f_layer *ly; int pos; float scale; int ratio; } ds4f_attn_task;
 
@@ -2133,9 +2149,9 @@ static void ds4f_attn_worker(void *arg, int tid, int nthr) {
             /* (1) compressed index: representative key = block's first position
              * latent, dot over the first idim index dims (O(nBlk*idim)). */
             for (int b = 0; b < nBlk; b++) {
-                const float *kc = ly->kv_cache + (size_t)(b*R)*KV;
+                const uint16_t *kc = ly->kv_cache + (size_t)(b*R)*KV;
                 float s = 0.f;
-                for (int d = 0; d < idim; d++) s += q[d] * kc[d];
+                for (int d = 0; d < idim; d++) s += q[d] * ds4f_bf16f(kc[d]);
                 bs[b] = s;
             }
             /* (2) select top-mBlk blocks by index score (partial selection;
@@ -2165,9 +2181,9 @@ static void ds4f_attn_worker(void *arg, int tid, int nthr) {
              * which is <= stride, so this is in-bounds). */
             float *sc = bs;
             for (int j = 0; j < nsel; j++) {
-                const float *kc = ly->kv_cache + (size_t)sel[j]*KV;
+                const uint16_t *kc = ly->kv_cache + (size_t)sel[j]*KV;
                 float s = 0.f;
-                for (int d = 0; d < KV; d++) s += q[d] * kc[d];
+                for (int d = 0; d < KV; d++) s += q[d] * ds4f_bf16f(kc[d]);
                 s *= T->scale; sc[j] = s; if (s > mx) mx = s;
             }
             float snk = ly->attn_sink[h];
@@ -2178,8 +2194,8 @@ static void ds4f_attn_worker(void *arg, int tid, int nthr) {
             for (int d = 0; d < HD; d++) out[d] = 0.f;
             for (int j = 0; j < nsel; j++) {
                 float w = sc[j]*inv;
-                const float *kc = ly->kv_cache + (size_t)sel[j]*KV;
-                for (int d = 0; d < KV; d++) out[d] += w * kc[d];   /* V = latent */
+                const uint16_t *kc = ly->kv_cache + (size_t)sel[j]*KV;
+                for (int d = 0; d < KV; d++) out[d] += w * ds4f_bf16f(kc[d]);   /* V = latent */
             }
         }
         return;
@@ -2190,10 +2206,10 @@ static void ds4f_attn_worker(void *arg, int tid, int nthr) {
         const float *q = m->s_q + (size_t)h*HD;
         float mx = -1e30f;
         for (int p = 0; p < nP; p++) {
-            const float *kc = ly->kv_cache + (size_t)p*KV;
+            const uint16_t *kc = ly->kv_cache + (size_t)p*KV;
             float s = 0.f;
             /* score over the kv_lora latent dims (q_head_dim >= kv_lora; use first KV dims) */
-            for (int d = 0; d < KV; d++) s += q[d] * kc[d];
+            for (int d = 0; d < KV; d++) s += q[d] * ds4f_bf16f(kc[d]);
             s *= T->scale; sc[p] = s; if (s > mx) mx = s;
         }
         float snk = ly->attn_sink[h];
@@ -2204,8 +2220,8 @@ static void ds4f_attn_worker(void *arg, int tid, int nthr) {
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int p = 0; p < nP; p++) {
             float w = sc[p]*inv;
-            const float *kc = ly->kv_cache + (size_t)p*KV;
-            for (int d = 0; d < KV; d++) out[d] += w * kc[d];   /* V = latent */
+            const uint16_t *kc = ly->kv_cache + (size_t)p*KV;
+            for (int d = 0; d < KV; d++) out[d] += w * ds4f_bf16f(kc[d]);   /* V = latent */
         }
     }
 }
@@ -2236,9 +2252,9 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
         const float *q = m->s_q + (size_t)h*HD;
         float mx = -1e30f;
         for (int j = 0; j < nP; j++) {
-            const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
             float s = 0.f;
-            for (int d = 0; d < KV; d++) s += q[d]*kc[d];      /* HD==KV (512) */
+            for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]);      /* HD==KV (512) */
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
         }
         float snk = ly->attn_sink[h];
@@ -2249,8 +2265,8 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int j = 0; j < nP; j++) {
             float w = sc[j]*inv;
-            const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            for (int d = 0; d < HD; d++) out[d] += w*kc[d];
+            const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
         }
         ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, half, 1);  /* de-rotate */
     }
@@ -2296,8 +2312,8 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         const float *q = m->s_q + (size_t)h*HD;
         float mx = -1e30f;
         for (int j = 0; j < nP; j++) {                          /* window term */
-            const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*kc[d];
+            const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]);
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
         }
         for (int j = 0; j < nsel; j++) {                        /* compressed term */
@@ -2311,8 +2327,8 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         float *out = m->s_attn + (size_t)h*HD;
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int j = 0; j < nP; j++) {
-            float w = sc[j]*inv; const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            for (int d = 0; d < HD; d++) out[d] += w*kc[d];
+            float w = sc[j]*inv; const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+            for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
         }
         for (int j = 0; j < nsel; j++) {
             float w = sc[nP + j]*inv; const float *kc = cmp + (size_t)sel[j]*KV;
@@ -2419,15 +2435,15 @@ static void ds4f_warm_kv(ds4f_model *m, int npos) {
     int KV = m->cfg.kv_lora;
     if (npos > m->cfg.max_pos) npos = m->cfg.max_pos;
     for (int L = 0; L < m->cfg.n_layers; L++) {
-        float *kc = m->layers[L].kv_cache;
+        uint16_t *kc = m->layers[L].kv_cache;
         uint64_t s = 0x4B7700D5F0ull ^ ((uint64_t)L << 40);
         for (int p = 0; p < npos; p++) {
-            float *row = kc + (size_t)p*KV;
+            uint16_t *row = kc + (size_t)p*KV;
             for (int d = 0; d < KV; d++) {
                 s += 0x9E3779B97F4A7C15ull;
                 uint64_t z = s; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
                 z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= (z >> 31);
-                row[d] = (float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f;
+                row[d] = ds4f_f32bf((float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f);
             }
         }
     }
@@ -2677,6 +2693,15 @@ static void ds4f_pf_qnr_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* Widening SVE load: 16 consecutive bf16 latents -> svfloat32_t (shift, no fcvt).
+ * bf16 IS the top 16 bits of f32, so widening is just a 16-bit left shift:
+ * svld1uh_u32 zero-extends each bf16 into the low 16 bits of a 32-bit lane,
+ * lsl #16 moves it into the high half, reinterpret as f32. Lane count matches
+ * the b32 predicate, so it drops straight into the f32 kernels. */
+static inline svfloat32_t ds4f_ld_bf16x(svbool_t pg, const uint16_t *p) {
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
+}
+
 /* batched kv-latent post: rmsnorm + RoPE(rope dims) + append to kv_cache. token-parallel. */
 typedef struct { ds4f_model *m; ds4f_layer *ly; int pos0, M; const float *rcos, *rsin; } ds4f_pf_kv_task;
 static void ds4f_pf_kvpost_worker(void *arg, int tid, int nthr) {
@@ -2689,7 +2714,8 @@ static void ds4f_pf_kvpost_worker(void *arg, int tid, int nthr) {
         float *kv = m->p_kvlat + (size_t)mm*KV;
         ds4f_rmsnorm(kv, kv, ly->kv_norm, KV, 1e-6f);
         ds4f_rope_apply(kv + (KV - rd), T->rcos, T->rsin, T->pos0 + mm, rd/2, 0);
-        memcpy(ly->kv_cache + (size_t)(T->pos0 + mm)*KV, kv, (size_t)KV*4);
+        uint16_t *dst = ly->kv_cache + (size_t)(T->pos0 + mm)*KV;   /* f32 latent -> bf16 cache */
+        for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kv[d]);
     }
 }
 
@@ -2736,8 +2762,8 @@ static void ds4f_attn_prefill_worker(void *arg, int tid, int nthr) {
                 const float *q = m->p_q + (size_t)mm*H + (size_t)h*HD;
                 float mx = -1e30f;
                 for (int j = 0; j < nP; j++) {
-                    const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-                    float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*kc[d];
+                    const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+                    float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]);
                     s *= scale; sc[j] = s; if (s > mx) mx = s;
                 }
                 float denom = expf(ly->attn_sink[h] - mx);
@@ -2746,8 +2772,8 @@ static void ds4f_attn_prefill_worker(void *arg, int tid, int nthr) {
                 float *out = m->p_attn + (size_t)mm*H + (size_t)h*HD;
                 for (int d = 0; d < HD; d++) out[d] = 0.f;
                 for (int j = 0; j < nP; j++) {
-                    float w = sc[j]*inv; const float *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-                    for (int d = 0; d < HD; d++) out[d] += w*kc[d];
+                    float w = sc[j]*inv; const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+                    for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
                 }
                 ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, T->half, 1);
             }
@@ -2755,16 +2781,16 @@ static void ds4f_attn_prefill_worker(void *arg, int tid, int nthr) {
         }
         const float *qbase = m->p_q + (size_t)mm*H + (size_t)h0*HD;
         float *obase = m->p_attn + (size_t)mm*H + (size_t)h0*HD;
-        const float *kvc = ly->kv_cache + (size_t)p_lo*KV;   /* latent row j = kvc + j*KV */
+        const uint16_t *kvc = ly->kv_cache + (size_t)p_lo*KV;   /* latent row j = kvc + j*KV */
         #define QH(hh) (qbase + (size_t)(hh)*HD)
         /* ---- Phase 1: sc[hh][j] = scale * (q[hh] . kc[j]); kc[j] reused x HBLK ---- */
         for (int j = 0; j < nP; j++) {
-            const float *kc = kvc + (size_t)j*KV;
+            const uint16_t *kc = kvc + (size_t)j*KV;
             svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f),
                         a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
             for (int d = 0; d < KV; d += 16) {
                 svbool_t pg = svwhilelt_b32(d, KV);
-                svfloat32_t kv = svld1(pg, kc + d);
+                svfloat32_t kv = ds4f_ld_bf16x(pg, kc + d);
                 a0 = svmla_f32_x(pg, a0, svld1(pg, QH(0)+d), kv);
                 a1 = svmla_f32_x(pg, a1, svld1(pg, QH(1)+d), kv);
                 a2 = svmla_f32_x(pg, a2, svld1(pg, QH(2)+d), kv);
@@ -2795,7 +2821,7 @@ static void ds4f_attn_prefill_worker(void *arg, int tid, int nthr) {
             svfloat32_t o0=svdup_f32(0.f),o1=svdup_f32(0.f),o2=svdup_f32(0.f),o3=svdup_f32(0.f),
                         o4=svdup_f32(0.f),o5=svdup_f32(0.f),o6=svdup_f32(0.f),o7=svdup_f32(0.f);
             for (int j = 0; j < nP; j++) {
-                svfloat32_t kv = svld1(pg, kvc + (size_t)j*KV + d);
+                svfloat32_t kv = ds4f_ld_bf16x(pg, kvc + (size_t)j*KV + d);
                 o0 = svmla_f32_x(pg, o0, svdup_f32(sc[0*wpad+j]), kv);
                 o1 = svmla_f32_x(pg, o1, svdup_f32(sc[1*wpad+j]), kv);
                 o2 = svmla_f32_x(pg, o2, svdup_f32(sc[2*wpad+j]), kv);
@@ -3015,7 +3041,8 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         if (m->exact)                                            /* RoPE the kv rope dims */
             ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
         ds4f_chk("kvlat", L, m->s_kvlat, KV);
-        memcpy(ly->kv_cache + (size_t)pos*KV, m->s_kvlat, (size_t)KV*4);  /* append latent */
+        { uint16_t *dst = ly->kv_cache + (size_t)pos*KV;                  /* append latent (f32->bf16) */
+          for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(m->s_kvlat[d]); }
         DS4F_TOC(DS4F_P_QKV); }
         /* ---- Tier-B2 compressor/indexer step (timed apart from the attn worker) ---- */
         if (m->tierb2 && ratio) { DS4F_TIC();

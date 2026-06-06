@@ -170,10 +170,68 @@ EXCLUDE=0,0,0, prefill 8 + decode 16, all rc=0 / 11/11 / NaNs=0 / argmax lockste
   so it is immune to both the topk cap and the bf16 weight-quant (Step 2 follow-up). The
   weight-bound qkv/o_proj are perfectly ctx-flat. Decode dropped only −16 % for a 2× ctx
   step (sub-linear; a dense O(ctx) model would roughly halve).
-- **HBM ceiling (f32 KV):** `kv_cache = max_pos · 512 · 4B · 43 layers`. ctx=16384
-  (RSS 28.95 GB) is the safe top; **ctx=32768 OOM-kills** (`rc=137`) — the load completes
-  @ 27.51 GB (lazy pages), then the warm faults the full ~2.9 GB KV + compressed caches
-  past usable HBM. An **f16 KV cache** would double the headroom to reach 32K+ (a TODO).
+- **HBM ceiling — it is the *weight* footprint, not KV.** The bf16 KV cache (Step 2e) is
+  now landed and halves `kv_cache` to `max_pos · 512 · 2B · 43L`, yet **ctx=32768 still
+  OOM-kills** under the gen config. The dominant resident cost is the **27.5 GB replicated
+  dense weights** (inflated +6 GB by `DS4F_FP8_BF16=1`'s FP8→bf16 predequant), leaving only
+  ~2.5 GB for KV+compressed caches. Halving a ~1.4 GB KV term cannot offset a 27.5 GB base.
+  The real long-ctx levers are **shrinking the weights** (`DS4F_FP8_BF16=0` keeps dense FP8,
+  −6 GB, slower decode) and **int8 KV** — see Step 2e and Remaining work.
+
+## Step 2e — gen-quality + decode tok/s at 10k+ (real coding task, mHC + bf16 KV)
+
+End-to-end greedy generation on **real** DeepSeek-V4-Flash weights, production sparse path
+(`DS4F_REAL=1 DS4F_TIERB2=1 DS4F_FP8_BF16=1` + **`DS4F_MHC=1`**), via a pure-Python
+byte-level BPE tokenizer (`tools/ds4f_tokenizer.py`) and gen-mode in `ds4f_ep_runner.c`
+(`DS4F_PROMPT_IDS` / `DS4F_GEN_OUT` / `DS4F_MAX_NEW`, greedy argmax feedback, eos=1).
+
+```sh
+./run_ds4f_gen_11n.sh                          # built-in quicksort code-completion prompt
+PROMPT_FILE=my.txt MAX_NEW=200 ./run_ds4f_gen_11n.sh
+```
+
+**`DS4F_MHC=1` is REQUIRED for coherent output** — the model ships per-layer hyper-connection
+weights (`hc_attn_*`/`hc_ffn_*` + global `hc_head_*`, `hc_mult=4`, `hc_sinkhorn_iters=20`);
+the forward only uses them when `m->mhc` is set. With mHC **off** the residual collapses to a
+single stream → architecturally wrong → garbage tokens (the "argmax-exact vs batched
+reference" check does **not** catch this; it only verifies EP-path == single-node-path). The
+cheap reference-free gate is teacher-forcing next-token accuracy (`DS4F_TF_CHECK=1`):
+
+| config | TF next-token acc | gen output |
+|---|---|---|
+| mHC **off** | 0/23 = 0 % | `ايره peeled… 哈哈哈` (garbage) |
+| mHC **on** (`DS4F_MHC=1`) | 16/23 = **69.6 %** | correct recursive quicksort (below) |
+
+```
+def quicksort(arr):
+    """Sort a list of numbers in ascending order using the quicksort algorithm."""
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[0]
+    left  = [x for x in arr[1:] if x <= pivot]
+    right = [x for x in arr[1:] if x >  pivot]
+    return quicksort(left) + [pivot] + quicksort(right)         # ← model-generated, NaNs=0
+```
+
+**Decode tok/s at long context** (gen config: mHC + bf16 KV, prefill 8 + decode 16, all
+rc=0 / 11/11 / NaNs=0 / argmax lockstep). These are the *heavy* (mHC-on) numbers — the
+Step 2d O(topk) table above is the lighter mHC-off sparse-path characterization:
+
+| ctx | decode tok/s | tb2prep | attn | RSS GB | arena GB/node | status |
+|---|---|---|---|---|---|---|
+| 24 (gen, real prompt) | 5.93 | — | — | 27.51 | — | coherent quicksort, mHC |
+| 10240 | **2.99** | 38 % (126 ms) | 27 % (91 ms) | 27.96 | 26.11 | rc=0 |
+| 16384 | **2.68** | 43 % (160 ms) | 27 % | 28.22 | 26.36 | rc=0 |
+| 32768 | — | | | | | **OOM-kill** (sig=9 during warm-fill) |
+| 65536 | — | | | | | died pre-load (PMIx — 32768-OOM aftermath, see OPS note) |
+
+- Real-model decode is **~2.7–3 tok/s at 10–16K ctx** — below the 10–15 tok/s target. The
+  dominant cost is **`tb2prep`** (the compressor/indexer `index_score` O(ctx/ratio) scan,
+  38–43 %) then **attn** (~27 %); both read *activations*, so weight-quant can't help them.
+  This is the same long-ctx ceiling Step 2d identified, now measured under the full mHC path.
+- **bf16 KV did not raise the ctx ceiling much** — the blocker is the 27.5 GB weight base
+  (see the HBM note above), not KV precision. ctx ≤ ~16K is the safe top under
+  `DS4F_FP8_BF16=1`; reaching 32K needs `DS4F_FP8_BF16=0` (FP8 dense, −6 GB) and/or int8 KV.
 
 ## OPS gotchas (each cost a real cycle)
 
@@ -223,6 +281,17 @@ EXCLUDE=0,0,0, prefill 8 + decode 16, all rc=0 / 11/11 / NaNs=0 / argmax lockste
 5. **stdout is not forwarded** from `mpiexec`'d ranks — only file writes survive. Wait on
    the 11× per-rank files, NOT a stdout banner.
 
+6. **An OOM-kill (sig=9) degrades the remote PMIx service.** When a rank is `SIGKILL`ed
+   (HBM OOM during warm-fill, e.g. ctx=32768), it cannot finalize MPI cleanly, leaving the
+   `plexec`/PMIx daemon on that node in a bad state. **Every subsequent launch then dies
+   pre-load in ~3 s** with `[ERR.] PLE 0080 plexec PMIx service error occurred.(nid=…)` and
+   `rc=255`, `perf=0/11 load=0/11` — looks like a fresh crash but is aftermath. A short wait
+   (45 s, even 180 s) does **not** reliably clear it; recovery usually requires recycling the
+   alloc (new `pjsub` → `/local` wiped → re-stage Step 1, ~21 min). **Practical rule: don't
+   probe ctx past the known ceiling (~16K) on a shared alloc you don't want to lose** — one
+   OOM costs the whole allocation. The longctx wrapper now flags this (`rc≠0` with
+   `load=0/11` ⇒ pre-load failure) instead of reporting `crash_hits=0`.
+
 ## Output discipline (keep agent context small)
 
 Chain stage→run **detached** (`setsid nohup …`), funnel all output to log files, and
@@ -260,12 +329,14 @@ decode M>1 to amortize the 43 per-layer all-reduces.
 | `DS4F_TIERB2` | 0 | 1 = stateful compressor/indexer (CSA/HCA) decode; implies `EXACT`. Real weights load by name (validated, job 49092345) |
 | `DS4F_FP8_BF16` | 0 | 1 = predequant replicated dense FP8→bf16 at load (faster decode, +~6 GB); lossless (Step 2c, real-weight validated). Default = byte-identical FP8 |
 | `DS4F_BF16_PV` | (auto) | with `DS4F_FP8_BF16=1`: empty = pair-interleaved pv (fastest); `0` = plain bf16; `1` = force pv |
-| `DS4F_MHC` | 0 | 1 = exact manifold-constrained hyper-connections |
+| `DS4F_MHC` | 0 | 1 = exact manifold-constrained hyper-connections (`hc_mult=4`). **REQUIRED for coherent real generation** (Step 2e); gen wrapper defaults it on |
+| `DS4F_PROMPT_IDS` / `DS4F_GEN_OUT` / `DS4F_MAX_NEW` | — | gen-mode (Step 2e): prompt id file in, generated id file out, greedy decode budget (stops on eos=1) |
+| `DS4F_TF_CHECK` | 0 | 1 = teacher-forcing next-token accuracy gate (~0 % = broken forward, ~50–80 % = working); the cheap reference-free correctness check |
 | `DS4F_STAGE_FLUSH_GB` | 2 | stager HBM dirty-cache flush granularity |
 | `DS4F_STAGE_DIR` | `/local/ds4f` | per-node blob dir |
 | `DS4F_PREFILL` / `DS4F_MAXGEN` | 8 / 16 | prefill / decode token counts |
 | `DS4F_CTX_WARM` | 0 | >0 = warm synthetic KV+compressed caches to this ctx, decode from there (long-ctx bench, Step 2d); deterministic + rank-independent (lockstep-safe) |
-| `DS4F_MAXPOS` | 4096 | KV/compressed cache capacity; must exceed `CTX_WARM+MAXGEN` (f32 KV: ~ctx16384 fits, 32768 OOMs) |
+| `DS4F_MAXPOS` | 4096 | KV/compressed cache capacity; must exceed `CTX_WARM+MAXGEN`. KV is **bf16** (Step 2e); ctx ≤ ~16K fits, 32768 OOMs (weight-footprint-bound, not KV) |
 | `DS4F_LAYERS` | 0 (=43) | layer count (small = smoke) |
 | `LLM_THREADS` | 48 | OpenMP threads/node |
 | `SKIP_TOPO` | unset | 1 = reuse existing `tofu_topo.txt` (**never across jobs**) |
@@ -287,6 +358,14 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
   (capped at `index_topk=512`); the index *scan* is the new long-ctx ceiling. ctx-warm
   infra (`ds4f_ep_runner.c` `DS4F_CTX_WARM` + `run_ds4f_longctx_11n.sh`) is the only
   **uncommitted** piece as of this writing → committed alongside this doc.
+- **Gen-quality + decode tok/s** (Step 2e): real coding-task generation produces coherent
+  code (recursive quicksort) with **`DS4F_MHC=1`** (the key finding — mHC is required;
+  without it, garbage). bf16 KV cache landed (halves KV). Measured decode **2.99 tok/s @
+  ctx10240, 2.68 @ ctx16384** (mHC path; below the 10–15 target — `tb2prep`/attn bound).
+  Two bugs fixed en route: the **`s_tb2_sel` heap overflow** (`index_topk=512 > max_pos`
+  corrupted compressor ring-state → NaNs; size to `max(max_pos, index_topk)`), and the
+  mHC-off architecture gap. Gen-mode + tokenizer + bf16 KV + these fixes are **uncommitted**
+  as of this writing.
 
 ## Remaining work (priority order)
 
@@ -294,8 +373,15 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
    (`tb2prep` 41–48 % of decode at ctx ≥ 8K, O(ctx/ratio), reads `idx_kv` *activations*
    so weight-quant can't help). Currently pooled-f32 over `idx_kv`; quantize `idx_kv` +
    SVE-dot the scan to lift long-ctx decode.
-2. **f16 KV cache** — halve the KV footprint (`kv_cache` is f32 today) to reach ctx ≥ 32K
-   without OOM; the f32 build caps at ~ctx16384 (RSS 28.95 GB).
+2. **256k decode without degradation (10–15 tok/s)** — the original long-ctx target, NOT
+   reached this session. Two independent blockers, both characterized:
+   - **Memory:** bf16 KV (done, Step 2e) was not enough — ctx=32768 still OOMs because the
+     27.5 GB replicated dense weights (inflated +6 GB by `DS4F_FP8_BF16=1`) dominate, not KV.
+     Levers: `DS4F_FP8_BF16=0` (FP8 dense, −6 GB, slower) and **int8 KV** (quarter the f32
+     footprint). int8 KV + FP8 dense should clear 32K–64K; 256k needs int8 weights too.
+   - **Speed:** even at 10–16K, decode is ~2.7–3 tok/s (target 10–15), bound by `tb2prep`
+     (the `index_score` O(ctx/ratio) scan, 38–43 %, item 1) + attn (~27 %). At 256k the scan
+     dominates outright — int8/SVE `index_score` is the prerequisite for the tok/s target.
 3. **Batched decode / prefill M > 1** — amortize the 43 per-layer EP all-reduces
    (comm ~20 % Amdahl floor at M=1). Needs packed-B GEMM kernels; note the known A64FX
    batched-prefill regression (`project_batched_prefill_finding`).
