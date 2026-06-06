@@ -1307,6 +1307,24 @@ static inline int ds4f_compress_idx_decode(int ratio, int start_pos, int offset,
     return n;
 }
 
+/* Parallel per-head indexer RoPE+rotate+fp4 (the tb2rope sub-phase). Each index head writes a
+ * disjoint q_scr[h*hd..] slice and the three ops (rope_apply / rotate_activation /
+ * fp4_act_quant_inplace) touch only that slice + read-only rcos/rsin -> splitting heads across
+ * the pool is BIT-EXACT to the serial loop (same 2j pattern as decode q-norm). Was 4.68 ms/tok =
+ * 5.0% of decode @ctx10240, running fully serial on tid0 between the qproj and weights pool runs. */
+typedef struct { float *q_scr; int H, hd, rd, half, start_pos; const float *rcos, *rsin; } ds4f_tb2rope_task;
+static void ds4f_tb2rope_worker(void *arg, int tid, int nthr) {
+    ds4f_tb2rope_task *T = (ds4f_tb2rope_task *)arg;
+    int H = T->H, hd = T->hd, rd = T->rd, half = T->half;
+    int h0 = (int)((long)H * tid / nthr), h1 = (int)((long)H * (tid+1) / nthr);
+    for (int h = h0; h < h1; h++) {
+        float *qh = T->q_scr + (size_t)h * hd;
+        ds4f_rope_apply(qh + (hd - rd), T->rcos, T->rsin, T->start_pos, half, 0);
+        ds4f_rotate_activation(qh, hd);
+        ds4f_fp4_act_quant_inplace(qh, hd, 32);
+    }
+}
+
 /* Indexer decode step (model.py Indexer.forward, seqlen==1, start_pos>0): project q via wq_b,
  * per-head RoPE(last rd)+rotate+fp4; step the OWN (rotate) compressor (fills idx_kv_cache);
  * weights = weights_proj(x) * (hd^-0.5 * H^-0.5); index_score over idx_kv_cache[:end//ratio];
@@ -1337,7 +1355,13 @@ static int ds4f_index_step(
     }
     ds4f_g_tb2qproj += ds4f_now() - _tqp0;
     double _trp0 = ds4f_now();
-    for (int h = 0; h < H; h++) {                            /* RoPE + rotate + fp4 per head */
+    static int s_rope_par = -1;
+    if (s_rope_par < 0) { const char *e = getenv("DS4F_TB2ROPE_PAR"); s_rope_par = (e && *e) ? atoi(e) : 1; }
+    if (pool && s_rope_par) {                                /* per-head RoPE+rotate+fp4, pooled (bit-exact) */
+        ds4f_tb2rope_task rt = { q_scr, H, hd, rd, half, start_pos, rcos, rsin };
+        ds4f_pool_run(pool, ds4f_tb2rope_worker, &rt);
+    } else
+    for (int h = 0; h < H; h++) {                            /* RoPE + rotate + fp4 per head (serial ref) */
         float *qh = q_scr + (size_t)h * hd;
         ds4f_rope_apply(qh + (hd - rd), rcos, rsin, start_pos, half, 0);
         ds4f_rotate_activation(qh, hd);

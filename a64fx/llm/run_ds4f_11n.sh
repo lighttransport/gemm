@@ -135,6 +135,10 @@ export DS4F_OPROJ_FUSE=${DS4F_OPROJ_FUSE:-1}
 # split the n_heads heads across the pool (BIT-EXACT: heads independent, same per-head
 # double-accum/scale/RoPE). Was 7.18ms/tok = 7.7% of decode @ctx10240 (scalar, serial on tid0).
 export DS4F_QNR_PAR=${DS4F_QNR_PAR:-1}
+# DS4F_TB2ROPE_PAR=0 forces the OLD serial per-head indexer RoPE+rotate+fp4 (reference).
+# Default 1 = split the index_heads across the pool (BIT-EXACT, disjoint per-head slices).
+# Was 4.68ms/tok = 5.0% of decode @ctx10240 (scalar, serial on tid0 inside ds4f_index_step).
+export DS4F_TB2ROPE_PAR=${DS4F_TB2ROPE_PAR:-1}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
