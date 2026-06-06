@@ -3661,6 +3661,47 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
 "}\n"
 "\n"
+"/* Batched IQ2_XS matvec */\n"
+"__global__ void batch_matvec_iq2_xs(float *output, const unsigned char *mat, const float *input,\n"
+"                                      int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 74;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 74;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        const unsigned char *scales = bp + 2 + 64;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;\n"
+"            float db1 = d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                float dl = (l < 2) ? db0 : db1;\n"
+"                unsigned short qval = qs[4*ib32 + l];\n"
+"                unsigned long long grid_val = iq2xs_grid_dev[qval & 511];\n"
+"                unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    float w = dl * (float)(unsigned char)(grid_val >> (8*j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    partial += w * xb[yi++];\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
 "/* Batched IQ3_XXS matvec */\n"
 "__global__ void batch_matvec_iq3_xxs(float *output, const unsigned char *mat, const float *input,\n"
 "                                       int out_dim, int in_dim, int n_tokens) {\n"
@@ -4699,6 +4740,7 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_q2_K;
     CUfunction fn_batch_matvec_q3_K;
     CUfunction fn_batch_matvec_iq2_xxs;
+    CUfunction fn_batch_matvec_iq2_xs;
     CUfunction fn_batch_matvec_iq2_s;
     CUfunction fn_dequant_iq2_s_to_f16;
     CUfunction fn_batch_matvec_iq2_s_tc;
@@ -5108,6 +5150,7 @@ lookup_funcs:
     GET_FUNC(batch_matvec_q2_K);
     GET_FUNC(batch_matvec_q3_K);
     GET_FUNC(batch_matvec_iq2_xxs);
+    GET_FUNC(batch_matvec_iq2_xs);
     GET_FUNC(batch_matvec_iq2_s);
     GET_FUNC(dequant_iq2_s_to_f16);
     GET_FUNC(batch_matvec_iq2_s_tc);
@@ -9349,6 +9392,9 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
     } else if (weight_type == GGML_TYPE_IQ2_XXS) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq2_xxs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_IQ2_XS) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_iq2_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_S) {
         /* Dequant + F16 batch matvec: dequantize weights once, reuse for all tokens */
         size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
@@ -9750,7 +9796,10 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
         cuMemcpyDtoDAsync(r->d_x, d_last, (size_t)n_embd * sizeof(float), r->stream);
         launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, n_embd, eps);
         cuMemcpyDtoHAsync(r->h_output, r->d_x, (size_t)n_embd * sizeof(float), r->stream);
-        cuStreamSynchronize(r->stream);
+        if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) {
+            fprintf(stderr, "cuda_llm: prefill stream sync failed\n");
+            return NULL;
+        }
         result = r->h_output;
     }
 
