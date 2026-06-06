@@ -503,6 +503,19 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
   serial scalar per-head/per-row activation loops between pool dispatches are a recurring decode
   lever — parallelize the independent units across the pool, bit-exact when units are disjoint.)
 
+- **Parallel indexer RoPE+rotate+fp4 (tb2rope) — decode +5.2 % (Step 2k, committed).** Applying the
+  2j pattern to the biggest `tb2prep` sub-op: `ds4f_index_step`'s per-head `RoPE + rotate_activation
+  + fp4_act_quant_inplace` loop ran **fully serial on tid0** (between the qproj and weights pool
+  dispatches) — `tb2rope` = 4.68 ms/tok = 5.0 % of decode @ctx10240. Each of the `index_heads`=64
+  heads writes a disjoint `q_scr[h·hd..]` slice and all three ops touch only that slice (+ read-only
+  rcos/rsin), so splitting heads across the pool (`ds4f_tb2rope_worker`) is **BIT-EXACT**. **Result:
+  tb2rope 4.68 → 0.24 ms (19×); tb2prep 21.9 → 17.4 ms; decode 11.29 → 11.88 tok/s @ctx10240
+  (+5.2 %)**; total session decode **3.38 → 11.88 tok/s (3.51×)**. Gated `DS4F_TB2ROPE_PAR` (default
+  1; `=0` = serial reference). *Validation:* ctx-warm argmax **identical** (294/90465) + real-weight
+  64-tok gen A/B **token-identical** (64/64, diff-empty), NaNs=0, lockstep held, RSS unchanged.
+  (The other `tb2prep` sub-ops — lcmp/topk/scan/qproj — are already pooled or already-optimized, so
+  this was the one remaining pure-serial sub-op; tb2prep's residue is now matvec/scan-bound.)
+
 ## Remaining work (priority order)
 
 > **Bottleneck history (both prior hypotheses were WRONG; resolved Step 2g).** (1) The
@@ -515,16 +528,17 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 > ~22 ms (11.6 % of decode). **Lesson: measure the one untimed op before theorizing — the gap
 > between `tb2prep` and the sum of its sub-timers was the whole story.**
 
-1. **`o_proj` + `qkv_proj`/q-norm FIXED (Steps 2i+2j). New @ctx10240 breakdown** (decode
-   **11.29 tok/s**): tb2prep 21.9 (24 %), **other 12.7 (14 %, ≈comm)**, attn 13.9 (15 %),
-   **qkv_proj 12.0 (13 %)** [now `wq_b` 8.4 + wq_a 1.0 + wkv 0.7 + rope 0.48], **o_proj 11.6 (13 %)**,
-   shared 7.2, experts 4.5. The qkv `q_norm_rope` serial cost is gone (2j); what remains in qkv is
-   **`wq_b`[32768×1024] = 8.4 ms** alone — a single-tensor bf16-pv matvec at ~344 GB/s (≈48 % of
-   node BW; thin K=1024 → issue overhead, limited headroom, NUMA-local already so no 2i-style win).
-   The next ctx-FLAT levers are now the **per-layer all-reduce comm** (≈12.7 ms "other") and
-   **`tb2prep`** (21.9 ms) — the latter spread across rope 4.7 / lcmp 4.6 / topk 4.2 / scan 3.6 /
-   qproj 3.2 (no single dominant component) and partly ctx-linear; each tb2 sub-op is itself a
-   candidate for the same "parallelize the serial scalar loop" lever as 2j. *Note:* under
+1. **`o_proj`/q-norm/tb2rope FIXED (Steps 2i+2j+2k). New @ctx10240 breakdown** (decode
+   **11.88 tok/s**): **other 12.7 (≈comm, now the biggest)**, attn 13.9 (after psum reweight),
+   qkv_proj 12.0 [`wq_b` 8.4 + wq_a 1.0 + wkv 0.7 + rope 0.48], o_proj 11.6, **tb2prep 17.4** [lcmp
+   4.6 / topk 4.2 / scan 3.6 / qproj 3.2 / icmp 1.3 / rope 0.24], shared 7.2, experts 4.5. The three
+   serial-scalar artifacts (o-proj NUMA, q-norm, tb2rope) are all fixed. The remaining big phases are
+   now **fundamental**, not artifacts: **(a) comm ≈12.7 ms** = 43 per-layer EP all-reduces, ~147 µs
+   each for a 16 KB Put → **latency/sync-bound, NOT payload-bound** (`TP_AR_BF16` halves payload but
+   little time; the real fix is reducing the *number* of reduces = batched decode, item 3); **(b)
+   `wq_b`[32768×1024] = 8.4 ms** single-tensor bf16-pv matvec at ~344 GB/s (≈48 % node BW; thin
+   K=1024 → issue overhead, NUMA-local — little headroom); **(c) tb2prep residue** (lcmp/topk/scan/
+   qproj) all already pooled or already-O(T·log k), partly ctx-linear. *Note:* under
    `DS4F_FP8_BF16=1` (the longctx-runner default) these are bf16-pv matvecs, not FP8 — the
    magic/gather question only applies to the memory-lean `DS4F_FP8_BF16=0` path.
    - *Done & shelved:* **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`). argmax-exact
@@ -548,8 +562,9 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
      confirmation on real latents (alloc-blocked). Implementation: `kv_cache` uint16→int8 +
      `kv_scale[layer][512]` (calibrate during prefill/warm), dequant at the latent-read sites.
    - **Speed:** after the `index_topk` (2g) + SVE-attn (2h) + fused o-proj (2i) + parallel q-norm
-     (2j) fixes decode is **11.29 tok/s @ctx10240** — now IN the 10–15 target band — bound by tb2prep
-     + comm + wq_b (see item 1). At 256k the index *scan* additionally grows to dominate — int8/SVE `index_score`
+     (2j) + parallel tb2rope (2k) fixes decode is **11.88 tok/s @ctx10240** — now IN the 10–15 target
+     band — bound by comm + wq_b + tb2 residue (see item 1, all now fundamental). At 256k the index
+     *scan* additionally grows to dominate — int8/SVE `index_score`
      (done, `ae1167d`) is the 256k prerequisite but does not move ≤16k.
 3. **Batched decode / prefill M > 1** — amortize the 43 per-layer EP all-reduces
    (comm ~20 % Amdahl floor at M=1). Needs packed-B GEMM kernels; note the known A64FX
@@ -560,29 +575,29 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 
 ## Next session — resuming prompt
 
-> **TASK: push decode past 11.29 tok/s @ctx10240 toward 13–15.** `index_topk` (2g), SVE-attn (2h),
-> fused o-proj (2i), AND parallel q-norm+RoPE (2j) are all FIXED — decode is now **11.29 tok/s
-> @ctx10240** (was 3.38), IN the 10–15 target band. New breakdown: **tb2prep 21.9 (24 %), attn 13.9
-> (15 %), other 12.7 (14 %, ≈comm), qkv_proj 12.0 (13 %, now wq_b 8.4 + rope 0.48), o_proj 11.6
-> (13 %)**. Don't re-chase o_proj/attn/topk/q-norm.
+> **TASK: push decode past 11.88 tok/s @ctx10240 toward 13–15.** `index_topk` (2g), SVE-attn (2h),
+> fused o-proj (2i), parallel q-norm+RoPE (2j), AND parallel tb2rope (2k) are all FIXED — decode is
+> now **11.88 tok/s @ctx10240** (was 3.38), IN the 10–15 target band. New breakdown: **other 12.7
+> (≈comm), attn 13.9, qkv_proj 12.0 (wq_b 8.4), o_proj 11.6, tb2prep 17.4 (lcmp 4.6 / topk 4.2 /
+> scan 3.6 / qproj 3.2)**. Don't re-chase o_proj/attn/topk/q-norm/tb2rope.
 >
-> Branch `ds4f`, all committed: 2g `ee9046f`, 2h `c77729f`, 2i `bf01f1b`, 2j `<this commit>`.
+> Branch `ds4f`, all committed: 2g `ee9046f`, 2h `c77729f`, 2i `bf01f1b`, 2j `5433bcc`, 2k `<this>`.
 >
-> **Candidate levers (measure before implementing — the o_proj win was a NUMA artifact, q-norm was
-> a serial-scalar artifact; don't assume a structural cause without sub-timers):**
-> 1. **tb2prep (21.9 ms, the biggest single phase).** Spread across rope 4.7 / lcmp 4.6 / topk 4.2 /
->    scan 3.6 / qproj 3.2 — no single dominant component, partly ctx-linear. CHECK each sub-op for
->    the **2j pattern**: is `tb2rope` (per-head RoPE+rotate+fp4) or `tb2lcmp` (layer compressor) a
->    serial scalar loop on tid0? If so, parallelize across the pool (bit-exact if units are disjoint).
->    These are the highest-probability remaining wins now that the two big single-phase artifacts are
->    fixed. Both run per CSA layer.
-> 2. **Per-layer all-reduce comm (≈12.7 ms "other", 14 %).** `g_ar_secs` = 43 per-layer EP combines.
->    Levers: `TP_AR_BF16=1` (halve payload, already present), or overlap comm with compute, or
->    reduce all-reduce count. This is the M=1 Amdahl floor (item 3, batched decode).
-> 3. **qkv_proj (12.0 ms) — mostly tapped.** `wq_b`[32768×1024] = 8.4 ms is now the residue, a
->    single-tensor bf16-pv matvec at ~344 GB/s (≈48 % node BW; thin K=1024 → issue overhead,
->    NUMA-local already). Little structural headroom; only move is fusing `wq_a`+`wkv` (both read
->    `s_hn`, −1 barrier/layer, modest). Lower priority than tb2/comm.
+> **The three serial-scalar/NUMA single-phase artifacts are now all fixed (2i/2j/2k). What remains
+> is FUNDAMENTAL — expect diminishing returns and validate any numeric change:**
+> 1. **Per-layer all-reduce comm (≈12.7 ms "other", now the biggest).** `g_ar_secs` = 43 per-layer
+>    EP combines, ~147 µs each for a 16 KB Put → **latency/sync-bound, NOT payload-bound** (measured:
+>    16 KB at Tofu ~6.8 GB/s is ~2 µs of transfer, so the 147 µs is per-Put setup/sync). So
+>    `TP_AR_BF16=1` (halve payload) is predicted LOW-yield — verify once, then the real lever is
+>    cutting the *number* of reduces: **batched decode** (item 3, amortize 43 reduces over M tokens)
+>    or **fusing the two per-layer reduces** (route C*M @ ds4f_impl.h:3344 + s_route C @ :3517) into
+>    one. Architectural, not a quick win.
+> 2. **`wq_b`[32768×1024] = 8.4 ms** single-tensor bf16-pv matvec at ~344 GB/s (≈48 % node BW; thin
+>    K=1024 → issue overhead, NUMA-local). Little headroom; only move is fusing `wq_a`+`wkv` (both
+>    read `s_hn`, −1 barrier/layer, modest).
+> 3. **tb2prep residue (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2).** All already pooled (lcmp/qproj/
+>    scan matvecs) or already-O(T·log k) (topk), partly ctx-linear. Check each for thread imbalance or
+>    a remaining serial tail, but no pure-serial sub-op remains (tb2rope was the last).
 >
 > Gate any behavior change; validate via real-weight gen A/B (`run_ds4f_gen_11n.sh`, diff the
 > `GEN_OUT` token ids — empty diff = token-exact) PLUS the ctx-warm argmax (`DS4F_CTX_WARM=10240`
