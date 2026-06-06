@@ -17,10 +17,18 @@
 #     DS4F_CTX_WARM=8192 ./run_ds4f_longctx_11n.sh       # a lower curve point
 #     setsid nohup ./run_ds4f_longctx_11n.sh >/tmp/lc.out 2>&1 &   # detached + sentinel
 #
-# HBM note: kv_cache = max_pos * kv_lora(512) * 4B (f32) * 43 layers. ctx=16384 => RSS
-# ~28.9 GB (safe). ctx=32768 OOMs (~30.6 GB > usable HBM) for this f32-KV build; an f16
-# KV cache would double the headroom (a TODO lever). DS4F_MAXPOS auto-sizes to
-# CTX_WARM + MAXGEN + 256 headroom unless you set it explicitly.
+# HBM note: kv_cache is now bf16 = max_pos * kv_lora(512) * 2B * 43 layers (halved). Even
+# so, ctx<=~16384 is the safe top and ctx=32768 STILL OOM-kills under the gen config: the
+# resident cost is dominated by the ~27.5 GB replicated dense weights (inflated +6 GB by
+# DS4F_FP8_BF16=1), not KV, so halving a ~1.4 GB KV term doesn't move the ceiling. To go
+# past 16K use DS4F_FP8_BF16=0 (FP8 dense, -6 GB, slower decode) and/or int8 KV (TODO).
+# DS4F_MAXPOS auto-sizes to CTX_WARM + MAXGEN + 256 unless you set it explicitly.
+#
+# OOM-kill aftermath: a sig=9 OOM-kill leaves the remote plexec/PMIx service degraded, so
+# every SUBSEQUENT launch dies pre-load in ~3s with "PLE 0080 plexec PMIx service error"
+# (perf=0/11 load=0/11 rc=255). A short wait does not reliably clear it; the alloc usually
+# must be recycled (new pjsub -> /local wiped -> re-stage). Don't push ctx past the known
+# ceiling on a shared alloc you don't want to lose.
 set +e
 cd "$(dirname "$0")" || exit 2
 
@@ -49,7 +57,9 @@ t1=$(date +%s)
 perf=$(ls ds4f_ep_perf_rank*.txt 2>/dev/null | wc -l)
 load=$(ls ds4f_ep_load_rank*.txt 2>/dev/null | wc -l)
 topo=$(grep -m1 -E '^[0-9]' tofu_topo.txt 2>/dev/null)
-crash=$(grep -ciE 'segmentation|sigsegv|abort|MISSING tensor|dtype .* !=|nbytes .* !=|exceed limit|bad_alloc|out of memory|Killed|file not found|No such file' "$LOG")
+crash=$(grep -ciE 'segmentation|sigsegv|abort|MISSING tensor|dtype .* !=|nbytes .* !=|exceed limit|bad_alloc|out of memory|Killed|file not found|No such file|terminated with the signal|sig=9|PMIx service error|PLE 0[0-9]+ plexec' "$LOG")
+# pre-load death (sig=9 OOM aftermath / PMIx error) => 0 per-rank files despite rc!=0
+[ "$rc" != "0" ] && [ "$load" = "0" ] && echo "  [warn] rc=$rc with load=0/11 => pre-load failure (OOM-kill aftermath? PMIx degraded? see log)" >&2
 nan=$(grep -hoE 'NaNs?=[0-9]+' ds4f_ep_rank00.txt ds4f_ep_perf_rank00.txt 2>/dev/null | head -2 | tr '\n' ' ')
 args=$(grep -hoE 'argmax[ =]+[0-9]+' ds4f_ep_perf_rank*.txt 2>/dev/null | grep -oE '[0-9]+$' | sort -u | tr '\n' ' ')
 nuniq=$(echo $args | wc -w)
