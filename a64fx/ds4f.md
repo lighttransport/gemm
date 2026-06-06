@@ -379,6 +379,17 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
      27.5 GB replicated dense weights (inflated +6 GB by `DS4F_FP8_BF16=1`) dominate, not KV.
      Levers: `DS4F_FP8_BF16=0` (FP8 dense, −6 GB, slower) and **int8 KV** (quarter the f32
      footprint). int8 KV + FP8 dense should clear 32K–64K; 256k needs int8 weights too.
+     *int8-KV scheme de-risked* (`tools/int8kv_probe.c`, single-process, no alloc): the kv
+     latent's massive-activation channels (~1e3–1e5, the same ones that forced bf16-not-fp16)
+     make naive **per-token int8 catastrophic** (one sink dim sets the scale → 99 % of the
+     O(1) dims collapse to 0). The viable layout is a **static per-channel scale calibrated
+     on the first ~256 positions** (S5): L1-rel 0.0032 ≈ bf16, only 2.7 % of |·|>0.1 dims
+     >5 % off, and **streaming-decode-compatible** (sink channels are positionally consistent,
+     so early calibration holds for all later positions). 1 B/elem (+ a 512-float per-layer
+     per-channel scale, amortized). NOTE: probe uses a *representative synthetic* latent
+     distribution — the per-channel scheme + calibration window still need argmax-exact
+     confirmation on real latents (alloc-blocked). Implementation: `kv_cache` uint16→int8 +
+     `kv_scale[layer][512]` (calibrate during prefill/warm), dequant at the latent-read sites.
    - **Speed:** even at 10–16K, decode is ~2.7–3 tok/s (target 10–15), bound by `tb2prep`
      (the `index_score` O(ctx/ratio) scan, 38–43 %, item 1) + attn (~27 %). At 256k the scan
      dominates outright — int8/SVE `index_score` is the prerequisite for the tok/s target.
