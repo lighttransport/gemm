@@ -264,6 +264,15 @@ non-obvious result (it **inverts** the "FP8 = faster *and* −6 GB" premise):
   on synthetic, but a real-weight argmax check gates flipping `DS4F_FP8_MAGIC`'s default.
 - **scalar/NEON-128 refuted** for the matvec (3–7× slower than SVE-512) — the "free cores in
   decode → short-vector lower latency" idea loses; the 48T matvec is decode-op-throughput bound.
+- **double-buffer (decode∥GEMM) refuted by the roofline** (no prototype built). The premise
+  "cores are free in decode" is false — the matvec already runs on all 48 compute cores, so a
+  producer/consumer split *repartitions* them rather than adding any. The wall is FP/SIMD-pipe
+  issue of the dequant *arithmetic* (magic, the fast path, is FLA-bound — the load-pipe gather
+  is slower), a resource **shared** by dequant and FMA: partitioning rows across cores can't
+  raise aggregate FLA throughput, and magic still *scales* with cores at 48T (not plateaued),
+  so uniform all-core use already beats reserving a specialized producer set. A split would only
+  win if dequant were load-bound and FMA FLA-bound (disjoint pipes), but a single core's OoO
+  already overlaps the gather (load pipe) with the FMA (FLA pipe). Net: neutral-to-negative.
 
 **Landed (validated single-node, argmax-exact): FP8→bf16 FUSED tile-dequant prefill GEMM.**
 `ds4f_gemm_worker` (`common/ds4f_impl.h`) now batches **FP8 dense** (the memory-lean default)
