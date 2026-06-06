@@ -4045,6 +4045,74 @@ static const char *cuda_kernel_source =
 "        }\n"
 "}\n"
 "\n"
+"/* Batched IQ4_NL matvec */\n"
+"__global__ void batch_matvec_iq4_nl(float *output, const unsigned char *mat, const float *input,\n"
+"                                      int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 32;\n"
+"    int row_bytes = nb * 18;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 18;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const float *xb = x + b * 32;\n"
+"        float partial = 0.0f;\n"
+"        for (int j = 0; j < 16; j++) {\n"
+"            float v0 = d * (float)kvalues_iq4nl_dev[qs[j] & 0xf];\n"
+"            float v1 = d * (float)kvalues_iq4nl_dev[qs[j] >>  4];\n"
+"            partial += v0 * xb[j] + v1 * xb[j + 16];\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"/* Batched IQ4_XS matvec */\n"
+"__global__ void batch_matvec_iq4_xs(float *output, const unsigned char *mat, const float *input,\n"
+"                                      int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 136;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 136;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
+"        const unsigned char *scales_l = bp + 4;\n"
+"        const unsigned char *qs = bp + 8;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        for (int ib = 0; ib < 8; ib++) {\n"
+"            int ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4);\n"
+"            float dl = d * (float)(ls - 32);\n"
+"            for (int j = 0; j < 16; j++) {\n"
+"                float v0 = dl * (float)kvalues_iq4nl_dev[qs[j] & 0xf];\n"
+"                float v1 = dl * (float)kvalues_iq4nl_dev[qs[j] >>  4];\n"
+"                partial += v0 * xb[j] + v1 * xb[j + 16];\n"
+"            }\n"
+"            xb += 32;\n"
+"            qs += 16;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
 "/* Batched softplus+bias+mul: out[t, i] = softplus(in[t, i] + bias[i]) * a[i] */\n"
 "__global__ void batch_softplus_mul_f32(float *out, const float *in, const float *bias,\n"
 "                                        const float *a, int n, int n_tokens) {\n"
@@ -4742,6 +4810,8 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_iq2_xxs;
     CUfunction fn_batch_matvec_iq2_xs;
     CUfunction fn_batch_matvec_iq2_s;
+    CUfunction fn_batch_matvec_iq4_nl;
+    CUfunction fn_batch_matvec_iq4_xs;
     CUfunction fn_dequant_iq2_s_to_f16;
     CUfunction fn_batch_matvec_iq2_s_tc;
     CUfunction fn_batch_matvec_iq3_xxs;
@@ -5152,6 +5222,8 @@ lookup_funcs:
     GET_FUNC(batch_matvec_iq2_xxs);
     GET_FUNC(batch_matvec_iq2_xs);
     GET_FUNC(batch_matvec_iq2_s);
+    GET_FUNC(batch_matvec_iq4_nl);
+    GET_FUNC(batch_matvec_iq4_xs);
     GET_FUNC(dequant_iq2_s_to_f16);
     GET_FUNC(batch_matvec_iq2_s_tc);
     GET_FUNC(batch_matvec_iq3_xxs);
@@ -9420,6 +9492,12 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
     } else if (weight_type == GGML_TYPE_IQ3_S) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq3_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_IQ4_NL) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_iq4_nl, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_IQ4_XS) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_iq4_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q4_K) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q4_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
