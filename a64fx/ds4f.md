@@ -565,6 +565,28 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 
 ## Remaining work (priority order)
 
+### Remaining perf levers at a glance (post-2l, decode 13.03 tok/s @ctx10240)
+
+After six landed levers (2g–2l) decode is IN the 10–15 target band and every
+**single-phase serial/NUMA artifact is fixed**. The honest verdict: **pure
+decode-speed levers at ≤16k ctx are essentially exhausted** — the big remaining
+phases (comm, tb2prep, attn) are all *fundamental* (latency-bound / already-pooled
+/ near roofline). The real remaining gains are **structural** (batched decode, A)
+and **at higher ctx, unlocked by memory** (int8 KV, B / int8 index scan, F).
+
+| # | Lever | Attacks | Gain | Effort | Risk | Status |
+|---|-------|---------|------|--------|------|--------|
+| **A** | **Batched / speculative decode (M>1)** | comm 12.7 ms (biggest phase) + every dense matvec | **LARGE** — amortizes the 43 all-reduces/layer *and* reuses weights across M tokens; the **only real comm lever** (`TP_AR_BF16` refuted: latency- not payload-bound) | HIGH (packed-B GEMM; known A64FX batched-prefill regression) | MED | open — architectural (item 3) |
+| **B** | **int8 KV cache** (S5 static per-channel scale) | memory, *not* speed | unlocks **32K–64K** ctx → the regime where the index scan/topk levers finally pay off | HIGH (~15 `kv_cache` read sites incl. the 2h SVE attn loop) | MED-HIGH | de-risked on synthetic latents (L1-rel 0.0032); **real-latent argmax-exact pending** (alloc-gated) (item 2) |
+| **C** | **qkv matvec fusion** (`wq_a`+`wkv`, both read `s_hn`) | one pool barrier/layer | SMALL | LOW | LOW (bit-exact) | open — quick win |
+| **D** | **tb2prep residue audit** (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2 — the single biggest phase now) | tb2prep 17.5 ms | SMALL — no pure-serial sub-op remains; only thread-imbalance / a tail | LOW-MED | LOW | open — diminishing |
+| **E** | **FP8 magic decode default** | the memory-lean `DS4F_FP8_BF16=0` path *only* (N/A to int8/bf16-pv default) | MED for that path | LOW | LOW (argmax gate) | bench-validated (Step 2f); real-weight argmax pending |
+| **F** | **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`) | index scan @256k | **ZERO ≤16k**, LARGE @256k | DONE | — | shelved — 256k prerequisite only |
+| **G** | **fp4 compressor/indexer weights** | HBM footprint | LOW — lossy; the `tb2prep` floor is *compute* (RoPE/fp4/scan), not the weights | MED | MED (lossy) | only if HBM-pressured |
+
+Detail and rationale for each in the numbered items below; the per-phase decode
+breakdown that ranks them is item 1.
+
 > **Bottleneck history (both prior hypotheses were WRONG; resolved Step 2g).** (1) The
 > "`index_score` scan is the long-ctx bottleneck" framing was wrong — the `DS4F_P_TB2SCAN`
 > sub-timer showed the scan is only **1.2 % of decode**. (2) The follow-up "the other 97 % of
