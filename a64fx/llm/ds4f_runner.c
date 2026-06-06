@@ -245,7 +245,7 @@ int main(void) {
         printf("         last-hidden ||x||=%.3e  NaNs=%d\n", sqrt(xnorm), nan_count);
     }
     /* per-phase prefill profile (DS4F_PROF=1; printed before decode wipes m->prof) */
-    { double psum = 0; for (int i = 0; i < DS4F_NPHASE; i++) psum += m->prof[i];
+    { double psum = 0; for (int i = 0; i <= DS4F_P_TB2PREP; i++) psum += m->prof[i]; /* TB2* sub-timers excluded (overlap TB2PREP) */
       if (psum > 0 && prefill > 0) {
         printf("\nper-phase prefill profile (ms/tok, %% of accounted):\n");
         for (int i = 0; i < DS4F_NPHASE; i++) {
@@ -294,7 +294,7 @@ int main(void) {
     }
 
     /* per-phase profile (only populated when DS4F_PROF=1) */
-    double psum = 0; for (int i = 0; i < DS4F_NPHASE; i++) psum += m->prof[i];
+    double psum = 0; for (int i = 0; i <= DS4F_P_TB2PREP; i++) psum += m->prof[i]; /* TB2* sub-timers excluded (overlap TB2PREP) */
     if (psum > 0 && maxgen > 0) {
         printf("\nper-phase decode profile (ms/tok, %% of accounted):\n");
         for (int i = 0; i < DS4F_NPHASE; i++) {
