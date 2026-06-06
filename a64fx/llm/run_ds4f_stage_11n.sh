@@ -84,8 +84,14 @@ t1=$(date +%s)
 # ---- aggregate the per-rank DONE files (mpiexec drops stdout) ----
 echo "=== per-rank stage status ($((t1-t0)) s wall) ==="
 done=$(ls ds4f_stage_rank*.txt 2>/dev/null | wc -l)
-cat ds4f_stage_rank*.txt 2>/dev/null | sort
-echo "--- $done/$NP ranks reported DONE ---"
+# Per-rank stage lines are byte-identical except rank#/blob path; DS4F_STAGE_COMPACT=1
+# prints only the count, keeping interactive sessions lean (full files on disk).
+if [ "${DS4F_STAGE_COMPACT:-0}" = "1" ]; then
+    echo "--- $done/$NP ranks reported DONE (compact; per-rank files: $LLM_DIR/ds4f_stage_rank*.txt) ---"
+else
+    cat ds4f_stage_rank*.txt 2>/dev/null | sort
+    echo "--- $done/$NP ranks reported DONE ---"
+fi
 if [ "$done" -ne "$NP" ]; then
     echo "WARNING: only $done/$NP ranks finished — check node-local logs" >&2
     exit 1
