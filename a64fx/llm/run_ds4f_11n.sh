@@ -119,6 +119,10 @@ export DS4F_TIERB2=${DS4F_TIERB2:-0}
 # the scan's 1.85x parallel win. Default 0 (f32). Projected payoff only at >=256k ctx (untestable,
 # OOM). Kept as a gated building block. Conditional alloc => zero cost when off.
 export DS4F_IDX_INT8=${DS4F_IDX_INT8:-0}
+# DS4F_TOPK_NAIVE=1 forces the OLD O(k*T) linear-scan index_topk (reference). Default 0 =
+# fast O(T*log k) heap+merge (selected set & order bit-identical; validated 432 trials +
+# argmax-exact on real weights). The naive path was ~108ms/tok (37% of decode @ctx10240).
+export DS4F_TOPK_NAIVE=${DS4F_TOPK_NAIVE:-0}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).

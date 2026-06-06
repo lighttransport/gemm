@@ -1008,7 +1008,13 @@ static void ds4f_idxsc8r_worker(void *arg, int tid, int nthr) {
 }
 
 static inline double ds4f_now(void);              /* fwd decl (defined w/ the profiler below) */
-static double ds4f_g_tb2scan = 0.0;               /* transfer accumulator: index_score scan-only ns */
+static double ds4f_g_tb2scan = 0.0;               /* transfer accumulators: index_step component-only ns */
+static double ds4f_g_tb2qproj = 0.0;              /* idx wq_b q-projection */
+static double ds4f_g_tb2rope = 0.0;               /* per-head RoPE + rotate + fp4 */
+static double ds4f_g_tb2icmp = 0.0;               /* idx compressor (compress_step inside index_step) */
+static double ds4f_g_tb2wproj = 0.0;              /* weights_proj */
+static double ds4f_g_tb2lcmp = 0.0;               /* layer compressor (top of tb2_prepare) */
+static double ds4f_g_tb2topk = 0.0;               /* index_topk top-k selection */
 
 /* ===================== Tier-B2 indexer scoring + top-k =====================
  * model.py Indexer.forward scoring (after q is wq_b-projected, RoPE'd, rotate+fp4'd
@@ -1040,21 +1046,74 @@ static void ds4f_index_score(const float *q, const float *kvc, const float *weig
  * (descending), write (t+offset) into sel[0..k) SORTED ASCENDING, pad with -1. The
  * gather (sparse_attn) is order-invariant, so sorted output validates the SELECTED SET
  * without depending on topk's unspecified tie order. */
+/* Select the npick=min(k,thr) highest-scoring positions in [0,thr), tie-broken by lowest
+ * index, written to sel[0..npick) in ASCENDING index order (+offset), sel[npick..k)=-1.
+ * Default fast path is O(thr*log k + thr); set DS4F_TOPK_NAIVE=1 for the original O(k*thr)
+ * reference (the two produce an identical selected set & order -- the validation gate). */
 static void ds4f_index_topk(const float *score, int T, int thr, int k, int offset, int *sel) {
     if (thr > T) thr = T;
     int npick = k < thr ? k : thr;
-    int  *chosen = (int  *)alloca((size_t)(npick > 0 ? npick : 1) * sizeof(int));
-    char *used   = (char *)alloca((size_t)(thr > 0 ? thr : 1));
-    for (int t = 0; t < thr; t++) used[t] = 0;
-    for (int n = 0; n < npick; n++) {
-        int best = -1; float bv = -1e30f;
-        for (int t = 0; t < thr; t++) if (!used[t] && score[t] > bv) { bv = score[t]; best = t; }
-        used[best] = 1; chosen[n] = best;
+    static int s_naive = -1;
+    if (s_naive < 0) { const char *e = getenv("DS4F_TOPK_NAIVE"); s_naive = (e && *e && atoi(e)) ? 1 : 0; }
+    if (s_naive) {                                           /* original O(k*thr) selection + O(k^2) sort */
+        int  *chosen = (int  *)alloca((size_t)(npick > 0 ? npick : 1) * sizeof(int));
+        char *used   = (char *)alloca((size_t)(thr > 0 ? thr : 1));
+        for (int t = 0; t < thr; t++) used[t] = 0;
+        for (int n = 0; n < npick; n++) {
+            int best = -1; float bv = -1e30f;
+            for (int t = 0; t < thr; t++) if (!used[t] && score[t] > bv) { bv = score[t]; best = t; }
+            used[best] = 1; chosen[n] = best;
+        }
+        for (int a = 0; a < npick; a++)                      /* sort ascending */
+            for (int b = a + 1; b < npick; b++)
+                if (chosen[b] < chosen[a]) { int tmp = chosen[a]; chosen[a] = chosen[b]; chosen[b] = tmp; }
+        for (int n = 0; n < k; n++) sel[n] = (n < npick) ? (chosen[n] + offset) : -1;
+        return;
     }
-    for (int a = 0; a < npick; a++)                          /* sort ascending */
-        for (int b = a + 1; b < npick; b++)
-            if (chosen[b] < chosen[a]) { int tmp = chosen[a]; chosen[a] = chosen[b]; chosen[b] = tmp; }
-    for (int n = 0; n < k; n++) sel[n] = (n < npick) ? (chosen[n] + offset) : -1;
+    /* --- fast path --- */
+    if (npick <= 0) { for (int n = 0; n < k; n++) sel[n] = -1; return; }
+    if (npick >= thr) {                                      /* select everything in [0,thr) */
+        for (int n = 0; n < k; n++) sel[n] = (n < thr) ? (n + offset) : -1;
+        return;
+    }
+    /* min-heap of the npick largest scores -> heap[0] = npick-th largest = threshold tau */
+    float *heap = (float *)alloca((size_t)npick * sizeof(float));
+    int hn = 0;
+    for (int t = 0; t < thr; t++) {
+        float v = score[t];
+        if (hn < npick) {                                    /* push + sift-up */
+            int i = hn++; heap[i] = v;
+            while (i > 0) { int p = (i - 1) >> 1; if (heap[p] <= heap[i]) break;
+                            float tmp = heap[p]; heap[p] = heap[i]; heap[i] = tmp; i = p; }
+        } else if (v > heap[0]) {                            /* replace-min + sift-down */
+            heap[0] = v; int i = 0;
+            for (;;) { int l = 2*i+1, r = 2*i+2, s = i;
+                if (l < npick && heap[l] < heap[s]) s = l;
+                if (r < npick && heap[r] < heap[s]) s = r;
+                if (s == i) break; float tmp = heap[s]; heap[s] = heap[i]; heap[i] = tmp; i = s; }
+        }
+    }
+    float tau = heap[0];                                     /* npick-th largest score */
+    /* selected set = {t: score>tau} (all) + lowest-index (npick-G) of {t: score==tau}.
+     * Collect each group ascending, then merge -> ascending output (no O(k^2) sort). */
+    int *gt = (int *)alloca((size_t)npick * sizeof(int));
+    int *eq = (int *)alloca((size_t)npick * sizeof(int));
+    int ng = 0, ne = 0;
+    for (int t = 0; t < thr; t++) {
+        float v = score[t];
+        if (v > tau) { if (ng < npick) gt[ng++] = t; }
+        else if (v == tau) { if (ne < npick) eq[ne++] = t; }
+    }
+    int need_eq = npick - ng; if (need_eq > ne) need_eq = ne;   /* defensive (FP: should == npick-ng) */
+    int BIG = thr + 1, ia = 0, ib = 0, n = 0;
+    while (n < npick) {                                       /* merge two ascending lists */
+        int va = (ia < ng)      ? gt[ia] : BIG;
+        int vb = (ib < need_eq) ? eq[ib] : BIG;
+        if (va == BIG && vb == BIG) break;                   /* ran out (NaN/edge) -> pad below */
+        if (va <= vb) { sel[n++] = va + offset; ia++; }
+        else          { sel[n++] = vb + offset; ib++; }
+    }
+    for (; n < k; n++) sel[n] = -1;
 }
 
 /* ===================== Tier-B2 stateful decode =====================
@@ -1189,6 +1248,7 @@ static int ds4f_index_step(
     float *q_scr, float *score_scr, int *sel, ds4f_pool *pool)
 {
     int end_pos = start_pos + 1, half = rd / 2;
+    double _tqp0 = ds4f_now();
     if (pool && w_bf16) {                                    /* q = wq_b(qr), pooled bf16 */
         ds4f_bf16mv_task qt = { q_scr, (const uint16_t *)wq_b, qr, H * hd, qlora };
         ds4f_pool_run(pool, ds4f_bf16mv_worker, &qt);
@@ -1201,12 +1261,16 @@ static int ds4f_index_step(
         for (int i = 0; i < qlora; i++) a += w[i] * qr[i];
         q_scr[o] = a;
     }
+    ds4f_g_tb2qproj += ds4f_now() - _tqp0;
+    double _trp0 = ds4f_now();
     for (int h = 0; h < H; h++) {                            /* RoPE + rotate + fp4 per head */
         float *qh = q_scr + (size_t)h * hd;
         ds4f_rope_apply(qh + (hd - rd), rcos, rsin, start_pos, half, 0);
         ds4f_rotate_activation(qh, hd);
         ds4f_fp4_act_quant_inplace(qh, hd, 32);
     }
+    ds4f_g_tb2rope += ds4f_now() - _trp0;
+    double _tic0 = ds4f_now();
     float *comp_out = (float *)alloca((size_t)hd * 4);       /* own compressor (rotate=1) */
     if (ds4f_compress_step(x, dim, hd, rd, ratio, start_pos, cwkv, cwgate, w_bf16, cape, cnorm,
                            rcos, rsin, eps, 1, comp_kv_state, comp_score_state, comp_out, pool)) {
@@ -1214,8 +1278,10 @@ static int ds4f_index_step(
         memcpy(idx_kv_cache + (size_t)slot * hd, comp_out, (size_t)hd * 4);
         if (idx_kv8) ds4f_idx_quant_pos(comp_out, hd, idx_kv8 + (size_t)slot * hd, &idx_pscale[slot]);
     }
+    ds4f_g_tb2icmp += ds4f_now() - _tic0;
     float sm = (float)(1.0 / sqrt((double)hd)), wscale = sm * (float)(1.0 / sqrt((double)H));
     float *weights = (float *)alloca((size_t)H * 4);
+    double _twp0 = ds4f_now();
     if (pool && w_bf16) {                                    /* weights = weights_proj(x), pooled bf16 */
         ds4f_bf16mv_task wt = { weights, (const uint16_t *)weights_proj, x, H, dim };
         ds4f_pool_run(pool, ds4f_bf16mv_worker, &wt);
@@ -1230,6 +1296,7 @@ static int ds4f_index_step(
         for (int i = 0; i < dim; i++) a += w[i] * x[i];
         weights[h] = a * wscale;
     }
+    ds4f_g_tb2wproj += ds4f_now() - _twp0;
     int T = end_pos / ratio;
     double _scan_t0 = ds4f_now();
     static int s_i8 = -1;
@@ -1249,7 +1316,9 @@ static int ds4f_index_step(
         ds4f_index_score(q_scr, idx_kv_cache, weights, H, hd, T, score_scr, pool);
     }
     ds4f_g_tb2scan += ds4f_now() - _scan_t0;                  /* scan-only sub-timer (folded by tb2_prepare) */
+    double _topk_t0 = ds4f_now();
     ds4f_index_topk(score_scr, T, T, k, offset, sel);        /* decode: no causal mask (thr=T) */
+    ds4f_g_tb2topk += ds4f_now() - _topk_t0;
     return T;
 }
 
@@ -2505,11 +2574,13 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
     int KV = c->kv_lora, ihd = c->index_head_dim, rd = c->qk_rope_dim; float eps = c->norm_eps;
     int offset = c->window_size;                                /* decode combined-buffer offset */
     /* layer compressor (rotate=0): input s_hn -> cmp_kv[pos/ratio] on a boundary */
+    double _tlc0 = ds4f_now();
     if (ds4f_compress_step(m->s_hn, c->hidden, KV, rd, ratio, pos,
                            ly->cmp_wkv, ly->cmp_wgate, 1, ly->cmp_ape, ly->cmp_norm,
                            rcos, rsin, eps, 0,
                            ly->cmp_kv_state, ly->cmp_score_state, m->s_cmp_out, m->pool))
         memcpy(ly->cmp_kv + (size_t)(pos/ratio)*KV, m->s_cmp_out, (size_t)KV*4);
+    m->prof[DS4F_P_TB2LCMP] += ds4f_now() - _tlc0;
     int T = (pos + 1) / ratio;
     if (ratio == 4) {                                           /* CSA: indexer-selected */
         if (pos == 0) {                                         /* seed indexer compressor ring */
@@ -2521,7 +2592,8 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
             return;                                             /* T==0, nothing compressed yet */
         }
         int k = c->index_topk;
-        double _scan_snap = ds4f_g_tb2scan;
+        double _sc_snap = ds4f_g_tb2scan, _qp_snap = ds4f_g_tb2qproj, _rp_snap = ds4f_g_tb2rope,
+               _ic_snap = ds4f_g_tb2icmp, _wp_snap = ds4f_g_tb2wproj, _tk_snap = ds4f_g_tb2topk;
         ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, c->q_lora,
                         c->index_n_heads, ihd, rd, ratio, pos, offset, k,
                         ly->idx_wq_b, ly->idx_wproj, 1,
@@ -2530,7 +2602,12 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
                         ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,
                         ly->idx_kv8, ly->idx_pscale,
                         m->s_idx_q, m->s_idx_score, m->s_tb2_sel, m->pool);
-        m->prof[DS4F_P_TB2SCAN] += ds4f_g_tb2scan - _scan_snap;
+        m->prof[DS4F_P_TB2SCAN]  += ds4f_g_tb2scan  - _sc_snap;
+        m->prof[DS4F_P_TB2QPROJ] += ds4f_g_tb2qproj - _qp_snap;
+        m->prof[DS4F_P_TB2ROPE]  += ds4f_g_tb2rope  - _rp_snap;
+        m->prof[DS4F_P_TB2ICMP]  += ds4f_g_tb2icmp  - _ic_snap;
+        m->prof[DS4F_P_TB2WPROJ] += ds4f_g_tb2wproj - _wp_snap;
+        m->prof[DS4F_P_TB2TOPK]  += ds4f_g_tb2topk  - _tk_snap;
         int nsel = 0;                                           /* compact + strip offset -> local idx */
         for (int i = 0; i < k; i++) { int v = m->s_tb2_sel[i]; if (v < 0) break; m->s_tb2_sel[nsel++] = v - offset; }
         m->s_tb2_nsel = nsel;
