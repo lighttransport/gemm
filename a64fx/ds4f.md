@@ -516,6 +516,45 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
   (The other `tb2prep` sub-ops — lcmp/topk/scan/qproj — are already pooled or already-optimized, so
   this was the one remaining pure-serial sub-op; tb2prep's residue is now matvec/scan-bound.)
 
+- **int8 W8A8 dense — decode +9.7 % AND −5.5 GB RSS (Step 2l, committed `99b76ad`).** The ONLY lever
+  so far that cuts **both** speed and memory (every prior lever was speed-only). `DS4F_Q8_DENSE=1`
+  (requires `DS4F_FP8_BF16=1`) repacks the 8 dominant dense bf16-pv tensors/layer (`wq_a`, `wq_b`,
+  `wkv`, `wo_a`, `wo_b`, `sh_w1`, `sh_w3`, `sh_w2` = 344 total) → **int8 W8A8** (`matvec_sdot_8row`,
+  `svdot`, ~1.03 B/elem from HBM = **half** of bf16's 2 B) with a **per-64-block absmax scale**
+  (528 B/group = 16 B fp16 scales + 8×64 int8 — finer than per-row, preserves argmax fidelity).
+  After repack the bf16 source is reclaimed via `MADV_DONTNEED`, so resident memory **shrinks**.
+  Gate + head stay bf16-pv (argmax protection). **Result @ctx10240: decode 11.88 → 13.03 tok/s
+  (+9.7 %); RSS 27.95 → 22.40 GB (−5.5 GB); dense weight traffic 12.82 → 7.34 GB/tok.** Dense phases
+  ~halved: qkv_proj 11.97 → 7.50, o_proj 11.56 → 9.40, shared 7.19 → 6.13, `wq_b` 8.43 → 4.04. Total
+  session decode **3.38 → 13.03 tok/s (3.85×)**. *Validation:* real-weight gen A/B (quicksort, greedy,
+  `DS4F_MHC=1`, 48 new tok) is **TOKEN-IDENTICAL to the bf16 baseline** — prefill argmax 361, final
+  74433 in both; the per-64-block scale preserves the greedy trajectory exactly (better than the
+  "merely coherent" bar a lossy int8 transform would predict), NaNs=0, lockstep held. *Two bugs found
+  + fixed:* (a) `DS4F_Q8_DENSE` was read only in `ds4f_alloc_synth`, never in `ds4f_load_real` →
+  `m->q8_dense` stayed 0 and the promote was a silent no-op (mirror the env read into the real path);
+  (b) the Step-2i fused block-diagonal o-proj worker `ds4f_mv_bd_worker` had **no `DS4F_Q8_PV`
+  branch** → with int8 `wo_a`, `dst` (s_o1) was never written (0 on synth, NaN on real) — added a
+  Q8_PV branch that re-quantizes the per-group block-diagonal x only when the group changes
+  (`glora%8==0` ⇒ a quantize lands on a 64-block boundary), bit-exact to the per-group `ds4f_matvec`
+  Q8 path (same `xq`/`xs`, same `(i/8)*gb` weight offset). *Latent bug (documented, non-default):* the
+  per-group o-proj fallback (`DS4F_OPROJ_FUSE=0`) is broken for Q8 — `ds4f_row_slice` can't slice the
+  528 B int8 group layout; only the fused path (global `(i/8)*gb` indexing) is correct. **The −5.5 GB
+  directly attacks the ctx=32768 OOM ceiling** (the resident dense weights, not KV, are the wall —
+  see Remaining-work item 2) and inverts the FP8-dense memory-vs-speed tradeoff for these 8 tensors
+  (FP8-on-demand was −6 GB but *slower*; int8 W8A8 is −5.5 GB **and** faster). Gated `DS4F_Q8_DENSE`
+  (default off).
+
+- **`TP_AR_BF16` REFUTED (negative result, not adopted).** Tested whether halving the EP all-reduce
+  payload (f32 → bf16) cuts the ≈12.7 ms "other"/comm. It does **not**: comm dropped only **2.5 %**
+  (confirming the reduce is **latency/sync-bound, not payload-bound**) while argmax flipped 294 → 58
+  (bf16-rounding the reduce → not bit-exact). Also clarified the comm structure: the two `ar_cb` call
+  sites (`ds4f_impl.h:3393` PREFILL `[M,C]` and `:3570` DECODE `s_route[C]`) are **separate
+  prefill-vs-decode paths, NOT two reduces per pass** — decode is **one** all-reduce per layer × 43,
+  and layer N+1 needs layer N's reduced output (a hard sequential dependency in autoregressive M=1),
+  so the earlier "fuse the two per-layer reduces" idea was a misread and there is nothing to fuse. The
+  only real comm lever is cutting the *number of tokens-worth* of reduces = **batched / speculative
+  decode** (item 3), which is architectural.
+
 ## Remaining work (priority order)
 
 > **Bottleneck history (both prior hypotheses were WRONG; resolved Step 2g).** (1) The
@@ -528,19 +567,20 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 > ~22 ms (11.6 % of decode). **Lesson: measure the one untimed op before theorizing — the gap
 > between `tb2prep` and the sum of its sub-timers was the whole story.**
 
-1. **`o_proj`/q-norm/tb2rope FIXED (Steps 2i+2j+2k). New @ctx10240 breakdown** (decode
-   **11.88 tok/s**): **other 12.7 (≈comm, now the biggest)**, attn 13.9 (after psum reweight),
-   qkv_proj 12.0 [`wq_b` 8.4 + wq_a 1.0 + wkv 0.7 + rope 0.48], o_proj 11.6, **tb2prep 17.4** [lcmp
-   4.6 / topk 4.2 / scan 3.6 / qproj 3.2 / icmp 1.3 / rope 0.24], shared 7.2, experts 4.5. The three
-   serial-scalar artifacts (o-proj NUMA, q-norm, tb2rope) are all fixed. The remaining big phases are
-   now **fundamental**, not artifacts: **(a) comm ≈12.7 ms** = 43 per-layer EP all-reduces, ~147 µs
-   each for a 16 KB Put → **latency/sync-bound, NOT payload-bound** (`TP_AR_BF16` halves payload but
-   little time; the real fix is reducing the *number* of reduces = batched decode, item 3); **(b)
-   `wq_b`[32768×1024] = 8.4 ms** single-tensor bf16-pv matvec at ~344 GB/s (≈48 % node BW; thin
-   K=1024 → issue overhead, NUMA-local — little headroom); **(c) tb2prep residue** (lcmp/topk/scan/
-   qproj) all already pooled or already-O(T·log k), partly ctx-linear. *Note:* under
-   `DS4F_FP8_BF16=1` (the longctx-runner default) these are bf16-pv matvecs, not FP8 — the
-   magic/gather question only applies to the memory-lean `DS4F_FP8_BF16=0` path.
+1. **`o_proj`/q-norm/tb2rope FIXED (2i+2j+2k) + int8 W8A8 dense (2l). New @ctx10240 breakdown**
+   (decode **13.03 tok/s**): **other 12.7 (≈comm, now the biggest)**, attn 13.8, **tb2prep 17.5**
+   [lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2 / icmp 1.3 / rope 0.24], o_proj 9.4 (was 11.6 bf16),
+   qkv_proj 7.5 [`wq_b` 4.0 + wq_a 0.9 + wkv 0.7 + rope 0.44] (halved by int8), shared 6.1, experts
+   4.5. The three serial-scalar artifacts (o-proj NUMA, q-norm, tb2rope) are fixed AND the dense
+   matvecs are now int8 (half HBM). The remaining big phases are **fundamental**: **(a) comm ≈12.7 ms**
+   = 43 per-layer EP all-reduces, ~296 µs each for a 16 KB Put → **latency/sync-bound, NOT
+   payload-bound — `TP_AR_BF16` REFUTED** (ran it: comm −2.5 % only, argmax flipped 294→58; the real
+   fix is reducing the *number* of reduces = batched decode, item 3 — see Step 2l note above); **(b)
+   tb2prep residue** (lcmp/topk/scan/qproj) all already pooled or already-O(T·log k), partly ctx-linear
+   (now the single biggest phase); **(c) attn 13.8 ms** SVE-vectorized, L2-resident — near its floor.
+   *Note:* under `DS4F_FP8_BF16=1` (the longctx-runner default) the dense matvecs are bf16-pv (or int8
+   with `DS4F_Q8_DENSE=1`), not FP8 — the magic/gather question only applies to the memory-lean
+   `DS4F_FP8_BF16=0` path.
    - *Done & shelved:* **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`). argmax-exact
      (96/96), f32 path bit-identical, gated default-off, but zero ≤16k decode win (Amdahl 1.2 % +
      M=1 q-quant cancellation). Keep as the 256k building block.
@@ -548,8 +588,13 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
    reached. Two independent blockers, both characterized:
    - **Memory:** bf16 KV (done, Step 2e) was not enough — ctx=32768 still OOMs because the
      27.5 GB replicated dense weights (inflated +6 GB by `DS4F_FP8_BF16=1`) dominate, not KV.
-     Levers: `DS4F_FP8_BF16=0` (FP8 dense, −6 GB, slower) and **int8 KV** (quarter the f32
-     footprint). int8 KV + FP8 dense should clear 32K–64K; 256k needs int8 weights too.
+     **PARTIALLY LANDED: int8 W8A8 dense (Step 2l, `DS4F_Q8_DENSE`, commit `99b76ad`) takes RSS
+     27.95 → 22.40 GB (−5.5 GB) AND speeds decode +9.7 %** (token-identical) — the first "int8
+     weights" step toward 256k. **Retest ctx=32768 with `DS4F_Q8_DENSE=1` on a FRESH alloc** (NOT a
+     shared alloc — an OOM-kill degrades PMIx, see Step 2e OPS note). Other levers: `DS4F_FP8_BF16=0`
+     (FP8 dense, −6 GB, slower — now dominated by int8 W8A8 which is −5.5 GB AND faster) and **int8
+     KV** (quarter the f32 footprint). int8 dense + int8 KV should clear 32K–64K; 256k needs the
+     remaining dense int8 (gate/head still bf16) too.
      *int8-KV scheme de-risked* (`tools/int8kv_probe.c`, single-process, no alloc): the kv
      latent's massive-activation channels (~1e3–1e5, the same ones that forced bf16-not-fp16)
      make naive **per-token int8 catastrophic** (one sink dim sets the scale → 99 % of the
@@ -561,10 +606,10 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
      distribution — the per-channel scheme + calibration window still need argmax-exact
      confirmation on real latents (alloc-blocked). Implementation: `kv_cache` uint16→int8 +
      `kv_scale[layer][512]` (calibrate during prefill/warm), dequant at the latent-read sites.
-   - **Speed:** after the `index_topk` (2g) + SVE-attn (2h) + fused o-proj (2i) + parallel q-norm
-     (2j) + parallel tb2rope (2k) fixes decode is **11.88 tok/s @ctx10240** — now IN the 10–15 target
-     band — bound by comm + wq_b + tb2 residue (see item 1, all now fundamental). At 256k the index
-     *scan* additionally grows to dominate — int8/SVE `index_score`
+   - **Speed:** after `index_topk` (2g) + SVE-attn (2h) + fused o-proj (2i) + parallel q-norm (2j) +
+     parallel tb2rope (2k) + int8 W8A8 dense (2l) decode is **13.03 tok/s @ctx10240** — IN the 10–15
+     target band — bound by comm + tb2 residue + attn (see item 1, all now fundamental). At 256k the
+     index *scan* additionally grows to dominate — int8/SVE `index_score`
      (done, `ae1167d`) is the 256k prerequisite but does not move ≤16k.
 3. **Batched decode / prefill M > 1** — amortize the 43 per-layer EP all-reduces
    (comm ~20 % Amdahl floor at M=1). Needs packed-B GEMM kernels; note the known A64FX
@@ -575,29 +620,33 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 
 ## Next session — resuming prompt
 
-> **TASK: push decode past 11.88 tok/s @ctx10240 toward 13–15.** `index_topk` (2g), SVE-attn (2h),
-> fused o-proj (2i), parallel q-norm+RoPE (2j), AND parallel tb2rope (2k) are all FIXED — decode is
-> now **11.88 tok/s @ctx10240** (was 3.38), IN the 10–15 target band. New breakdown: **other 12.7
-> (≈comm), attn 13.9, qkv_proj 12.0 (wq_b 8.4), o_proj 11.6, tb2prep 17.4 (lcmp 4.6 / topk 4.2 /
-> scan 3.6 / qproj 3.2)**. Don't re-chase o_proj/attn/topk/q-norm/tb2rope.
+> **TASK: push decode past 13.03 tok/s @ctx10240 toward 14–15 (or pivot to the ctx=32768 memory
+> ceiling — see below).** `index_topk` (2g), SVE-attn (2h), fused o-proj (2i), parallel q-norm+RoPE
+> (2j), parallel tb2rope (2k), AND int8 W8A8 dense (2l) are all FIXED — decode is now **13.03 tok/s
+> @ctx10240** (was 3.38), IN the 10–15 target band. New breakdown: **other 12.7 (≈comm), tb2prep 17.5
+> (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2), attn 13.8, o_proj 9.4, qkv_proj 7.5 (wq_b 4.0)**.
+> Don't re-chase o_proj/attn/topk/q-norm/tb2rope/dense-matvec.
 >
-> Branch `ds4f`, all committed: 2g `ee9046f`, 2h `c77729f`, 2i `bf01f1b`, 2j `5433bcc`, 2k `<this>`.
+> Branch `ds4f`, all committed: 2g `ee9046f`, 2h `c77729f`, 2i `bf01f1b`, 2j `5433bcc`, 2k `d920923`,
+> 2l `99b76ad` (int8 W8A8 dense, −5.5 GB + +9.7 %).
 >
-> **The three serial-scalar/NUMA single-phase artifacts are now all fixed (2i/2j/2k). What remains
-> is FUNDAMENTAL — expect diminishing returns and validate any numeric change:**
+> **The serial-scalar/NUMA single-phase artifacts are all fixed (2i/2j/2k) and the dense matvecs are
+> now int8 (2l). What remains is FUNDAMENTAL — expect diminishing returns and validate any change:**
 > 1. **Per-layer all-reduce comm (≈12.7 ms "other", now the biggest).** `g_ar_secs` = 43 per-layer
->    EP combines, ~147 µs each for a 16 KB Put → **latency/sync-bound, NOT payload-bound** (measured:
->    16 KB at Tofu ~6.8 GB/s is ~2 µs of transfer, so the 147 µs is per-Put setup/sync). So
->    `TP_AR_BF16=1` (halve payload) is predicted LOW-yield — verify once, then the real lever is
->    cutting the *number* of reduces: **batched decode** (item 3, amortize 43 reduces over M tokens)
->    or **fusing the two per-layer reduces** (route C*M @ ds4f_impl.h:3344 + s_route C @ :3517) into
->    one. Architectural, not a quick win.
-> 2. **`wq_b`[32768×1024] = 8.4 ms** single-tensor bf16-pv matvec at ~344 GB/s (≈48 % node BW; thin
->    K=1024 → issue overhead, NUMA-local). Little headroom; only move is fusing `wq_a`+`wkv` (both
->    read `s_hn`, −1 barrier/layer, modest).
-> 3. **tb2prep residue (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2).** All already pooled (lcmp/qproj/
->    scan matvecs) or already-O(T·log k) (topk), partly ctx-linear. Check each for thread imbalance or
->    a remaining serial tail, but no pure-serial sub-op remains (tb2rope was the last).
+>    EP combines, ~296 µs each for a 16 KB Put → **latency/sync-bound, NOT payload-bound. `TP_AR_BF16`
+>    REFUTED** (ran it: comm −2.5 % only, argmax flipped 294→58 = bf16-rounds the reduce). The two
+>    `ar_cb` sites (`ds4f_impl.h:3393` PREFILL / `:3570` DECODE) are SEPARATE prefill/decode paths,
+>    NOT two reduces/pass — decode is ONE reduce/layer × 43 and layer N+1 needs layer N's reduced
+>    output (hard sequential dep in M=1, nothing to fuse). The only real lever is cutting the *number
+>    of tokens-worth* of reduces = **batched / speculative decode** (item 3). Architectural.
+> 2. **tb2prep residue (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2 = the single biggest phase now).**
+>    All already pooled (lcmp/qproj/scan matvecs) or already-O(T·log k) (topk), partly ctx-linear.
+>    Check for thread imbalance / a remaining serial tail, but no pure-serial sub-op remains.
+> 3. **PIVOT TO MEMORY: retest ctx=32768 with `DS4F_Q8_DENSE=1` on a FRESH alloc.** int8 dense's
+>    −5.5 GB is the first int8-weights step toward the 32768/256k OOM ceiling (resident dense weights,
+>    not KV, are the wall). Pair with int8 KV (de-risked, S5 static per-channel scale) for 32K–64K.
+>    Do NOT probe past ~16k on a shared alloc (OOM-kill degrades PMIx). [former item: `wq_b` is now
+>    4.0 ms after int8 — no longer a standalone lever.]
 >
 > Gate any behavior change; validate via real-weight gen A/B (`run_ds4f_gen_11n.sh`, diff the
 > `GEN_OUT` token ids — empty diff = token-exact) PLUS the ctx-warm argmax (`DS4F_CTX_WARM=10240`
