@@ -126,6 +126,11 @@ export DS4F_TOPK_NAIVE=${DS4F_TOPK_NAIVE:-0}
 # DS4F_ATTN_SVE=0 forces the OLD scalar decode-attn inner loops (reference). Default 1 =
 # SVE-widened dot/axpy over kv_lora=512 (PV bit-exact; QK dot reorders, argmax-safe).
 export DS4F_ATTN_SVE=${DS4F_ATTN_SVE:-1}
+# DS4F_OPROJ_FUSE=0 forces the OLD per-group o-proj (8 separate wo_a matvec dispatches,
+# reference). Default 1 = fused block-diagonal wo_a in ONE pool dispatch (kills 7
+# cross-CMG barriers/layer + load imbalance; BIT-EXACT, same kernel+accum order). o_proj
+# was 28.8ms/tok = 25.6% of decode @ctx10240 (the dominant phase after attn/topk fixes).
+export DS4F_OPROJ_FUSE=${DS4F_OPROJ_FUSE:-1}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).

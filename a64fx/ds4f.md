@@ -467,6 +467,26 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
   known-good coherent-gen baseline). So: synthetic-warm argmax is a SPEED signal only; gate any
   fp-reorder change on real-weight TF/gen, never synthetic argmax.
 
+- **Fused block-diagonal o-proj — o_proj 2.47×, decode +20 % (Step 2i, committed).** With `attn`
+  fixed, `o_proj` was the dominant decode phase (28.8 ms = 26 % @ctx10240). The grouped low-rank
+  o-proj ran the block-diagonal `wo_a` as **`o_groups`=8 SEPARATE `ds4f_matvec` dispatches**, each
+  `[o_lora=1024 × 4096]`. Two compounding costs: (1) 8 cross-CMG pool barriers/layer × 43 layers;
+  (2) **cross-CMG NUMA reads** — `ds4f_fill`/`ds4f_promote_worker` first-touch `wo_a` via
+  `rowsplit8(8192,…)` (thread *t* owns rows ~`[t·170,…]`), but each per-group matvec used
+  `rowsplit8(1024,…)` so thread *t* read rows `g·1024 + [its 1024-slice]` — first-touched on a
+  *different* CMG → remote HBM. Fused all 8 groups into ONE `ds4f_matvec_blockdiag` pool dispatch
+  (`ds4f_mv_bd_worker`): split the full `o_inter=8192` rows once via `rowsplit8` (matches the
+  first-touch → NUMA-local; well-balanced ~170 rows/thread), and pick the per-8-row-block input
+  `s_attn + (i/o_lora)·gin` (8-row blocks never straddle a group since `o_lora%8==0`). **BIT-EXACT**
+  (same kernel, same per-row dot/accum order; full-tensor + global row index reproduces
+  `ds4f_row_slice`'s byte/scale offsets — PV `(i/8)·8K`, FP8/MXFP4 `i`-indexed). **Result: o_proj
+  28.8 → 11.7 ms (2.47×, −17 ms); decode 8.72 → 10.47 tok/s @ctx10240 (+20 %)** — crosses the
+  10 tok/s target floor; total session decode **3.38 → 10.47 tok/s (3.10×)**. Gated `DS4F_OPROJ_FUSE`
+  (default 1; `=0` = per-group reference). *Validation:* ctx-warm argmax **identical** (294/90465,
+  fuse==ref — bit-exact, no flip) + real-weight 64-tok gen A/B **token-identical** (diff-empty),
+  NaNs=0, lockstep held, RSS unchanged. (Generalizable: any matvec whose per-call `rowsplit8` row
+  count ≠ the tensor's full row count reads cross-CMG — fuse to the full-tensor split.)
+
 ## Remaining work (priority order)
 
 > **Bottleneck history (both prior hypotheses were WRONG; resolved Step 2g).** (1) The
@@ -479,13 +499,19 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 > ~22 ms (11.6 % of decode). **Lesson: measure the one untimed op before theorizing — the gap
 > between `tb2prep` and the sum of its sub-timers was the whole story.**
 
-1. **`o_proj` is now the dominant decode phase (29 ms = 26 % @ctx10240).** With `index_topk`
-   (Step 2g) and `attn` (Step 2h, 91 → 13.8 ms) both fixed, the breakdown @ctx10240 is: o_proj 29,
-   tb2prep 22, qkv_proj 18.5, attn 13.8, other 14. `o_proj` is the grouped low-rank FP8 projection
-   (8× `wo_a` group matvecs [o_lora×H] + the `wo_b` matvec [hidden×o_inter]); `qkv_proj` (18.5 ms)
-   is the next after it. Both are FP8 weight matvecs ⇒ check they use the faster **magic** decode
-   kernel (`matvec_fp8e4m3_8row_magic`, `ggml_dequant.h`; the `ds4f_decode_bw` roofline found
-   magic ≥ gather) and are SVE-issue-efficient. These are O(1)-in-ctx, so the win is ctx-flat.
+1. **`o_proj` FIXED (Step 2i, fused block-diagonal → 2.47×). New @ctx10240 breakdown** (decode
+   **10.47 tok/s**): tb2prep 22 (24 %), qkv_proj 18.6 (20 %), attn 14 (15 %), other 12.7 (14 %,
+   ≈comm), **o_proj 11.7 (13 %)**, shared 7.2, experts 4.5. The next ctx-FLAT levers are **qkv_proj
+   (18.6 ms)** and the **per-layer all-reduce comm** (≈12.7 ms "other"). NOTE on qkv: its three
+   matvecs (`wq_a`[1024×4096], `wq_b`[32768×1024], `wkv`[512×4096]) are *single* tensors whose
+   per-call `rowsplit8` already matches the first-touch split → NUMA-local (so the Step-2i NUMA win
+   does **not** transfer); the only structural lever is fusing `wq_a`+`wkv` (both read `s_hn`) into
+   one dispatch (saves 1 barrier/layer — modest) — **measure the wq_a/wq_b/wkv sub-split first**
+   (likely `wq_b`-dominated and already near BW). `tb2prep` (22 ms) is now the single biggest phase
+   but is spread across rope 4.7 / lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2 (no single dominant
+   component) and is partly ctx-linear. *Note:* under `DS4F_FP8_BF16=1` (the longctx-runner default)
+   these are bf16-pv matvecs, not FP8 — the magic/gather question only applies to the memory-lean
+   `DS4F_FP8_BF16=0` path.
    - *Done & shelved:* **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`). argmax-exact
      (96/96), f32 path bit-identical, gated default-off, but zero ≤16k decode win (Amdahl 1.2 % +
      M=1 q-quant cancellation). Keep as the 256k building block.
@@ -506,10 +532,10 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
      distribution — the per-channel scheme + calibration window still need argmax-exact
      confirmation on real latents (alloc-blocked). Implementation: `kv_cache` uint16→int8 +
      `kv_scale[layer][512]` (calibrate during prefill/warm), dequant at the latent-read sites.
-   - **Speed:** after the `index_topk` (Step 2g) + SVE-attn (Step 2h) fixes decode is **8.75 tok/s
-     @ctx10240** (target 10–15), now bound by **o_proj (26 %)** + tb2prep + qkv_proj — see item 1.
-     At 256k the index *scan* additionally grows to dominate — int8/SVE `index_score` (done,
-     `ae1167d`) is the 256k prerequisite but does not move ≤16k.
+   - **Speed:** after the `index_topk` (2g) + SVE-attn (2h) + fused o-proj (2i) fixes decode is
+     **10.47 tok/s @ctx10240** — now IN the 10–15 target band — bound by tb2prep + qkv_proj + comm
+     (see item 1). At 256k the index *scan* additionally grows to dominate — int8/SVE `index_score`
+     (done, `ae1167d`) is the 256k prerequisite but does not move ≤16k.
 3. **Batched decode / prefill M > 1** — amortize the 43 per-layer EP all-reduces
    (comm ~20 % Amdahl floor at M=1). Needs packed-B GEMM kernels; note the known A64FX
    batched-prefill regression (`project_batched_prefill_finding`).
@@ -519,27 +545,33 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 
 ## Next session — resuming prompt
 
-> **TASK: attack the new dominant decode phase — `o_proj` (29 ms = 26 % of decode @ctx10240),
-> then `qkv_proj` (18.5 ms).** Both `index_topk` (Step 2g) and `attn` (Step 2h, 91 → 13.8 ms, SVE)
-> are FIXED — decode is now **8.75 tok/s @ctx10240** (was 3.38). Don't re-chase `attn`/`tb2prep`.
+> **TASK: push decode past 10.47 tok/s @ctx10240 toward 12–15.** `index_topk` (2g), SVE-attn (2h),
+> AND fused o-proj (2i) are all FIXED — decode is now **10.47 tok/s @ctx10240** (was 3.38), IN the
+> 10–15 target band. New breakdown: **tb2prep 22 (24 %), qkv_proj 18.6 (20 %), attn 14 (15 %),
+> other 12.7 (14 %, ≈comm), o_proj 11.7 (13 %)**. Don't re-chase o_proj/attn/topk.
 >
-> Branch `ds4f` (Step 2g committed `ee9046f`; Step 2h SVE-attn is UNCOMMITTED as of this writing:
-> `common/ds4f_impl.h` `ds4f_sve_{dot,axpy}_{bf16,f32}` + the two attn workers + `ds4f_attn_sve`
-> flag, `DS4F_ATTN_SVE` export in `run_ds4f_11n.sh`, this doc + memory — **commit when asked**).
+> Branch `ds4f`, all committed: 2g `ee9046f`, 2h `c77729f`, 2i `<this commit>`.
 >
-> **Step 1 (measure — do this first):** `o_proj` is one `DS4F_P_OPROJ` bucket; split it into the
-> 8× `wo_a` group matvecs vs the `wo_b` matvec with sub-timers (mirror the `DS4F_P_TB2*` pattern in
-> `common/ds4f.h`/`ds4f_impl.h`), and likewise check whether `qkv_proj`'s `wq_a`/`wq_b`/`wkv` are
-> magic or gather. Run the ctx-warm A/B (`DS4F_PROF=1 DS4F_QUIET=1 DS4F_CTX_WARM=10240 SKIP_TOPO=1
-> ./run_ds4f_longctx_11n.sh`, sentinel, lockstep-safe).
+> **Candidate levers (measure before implementing — the o_proj win was a NUMA artifact, don't
+> assume it transfers):**
+> 1. **qkv_proj (18.6 ms).** Add `wq_a`/`wq_b`/`wkv` sub-timers (mirror `DS4F_P_TB2*`). Its three
+>    matvecs are *single* tensors whose per-call `rowsplit8` already matches the promote first-touch
+>    split → already NUMA-local, so the 2i fusion win does NOT transfer. Expect `wq_b`[32768×1024]
+>    (well-balanced, 67 MB) to dominate and already be near BW. Only structural move: fuse `wq_a`+
+>    `wkv` (both read `s_hn`) into one dispatch (−1 barrier/layer, modest). If `wq_b` IS the cost
+>    and is near BW, qkv has little headroom — move to the comm or tb2 lever instead.
+> 2. **Per-layer all-reduce comm (≈12.7 ms "other", 13 %).** `g_ar_secs` = 43 per-layer EP combines.
+>    Levers: `TP_AR_BF16=1` (halve payload, already present), or overlap comm with compute, or
+>    reduce all-reduce count. This is the M=1 Amdahl floor (item 3, batched decode).
+> 3. **tb2prep (22 ms, the biggest single phase).** Spread across rope 4.7 / lcmp 4.6 / topk 4.2 /
+>    scan 3.6 / qproj 3.2 — no single dominant component, partly ctx-linear. `tb2rope` (per-head
+>    RoPE + rotate + fp4) and `tb2lcmp` (layer compressor) are the largest; both run per CSA layer.
 >
-> **Step 2 (optimize):** these are FP8 weight matvecs (M=1). Likely lever: ensure they dispatch
-> the **magic** decode kernel `matvec_fp8e4m3_8row_magic` (the `ds4f_decode_bw` roofline found
-> magic ≥ gather; check the M==1 dispatch in `ds4f_matvec`/`ds4f_impl.h` ~`:1337`), and confirm
-> the grouped `wo_a` matvecs aren't issue-bound on tiny per-group GEMMs (fuse/SVE if so). Gate any
-> behavior change; validate via `DS4F_TF_CHECK=1` real-weight gen (NOT synthetic-warm argmax — see
-> the Step 2h lesson: a reduction-order change flips synthetic junk-argmax but must be token-exact
-> on real TF/gen).
+> Gate any behavior change; validate via real-weight gen A/B (`run_ds4f_gen_11n.sh`, diff the
+> `GEN_OUT` token ids — empty diff = token-exact) PLUS the ctx-warm argmax (`DS4F_CTX_WARM=10240`
+> sentinel). Per the 2h lesson, an fp-reorder change can flip synthetic-warm argmax but MUST be
+> token-exact on real gen — that diff is the real gate. (A bit-exact change like 2i shows BOTH
+> identical, as a sanity cross-check.)
 >
 > **GATES (non-negotiable):** native `fcc`/`FCC` (never `fccpx`); run binaries directly in the
 > alloc, NO `pjsub`; NP=11 `EXCLUDE=0,0,0` (node 0 is claude — running ~22 GB there OOM-kills the
