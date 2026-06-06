@@ -449,6 +449,23 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
   vs naive; 11-node real-weight ctx-warm A/B **argmax-exact 223/81819 fast==naive**, NaNs=0, RSS
   unchanged, lockstep held. New default; `DS4F_TOPK_NAIVE=1` keeps the O(k·T) reference. Scales
   BETTER with ctx (was the steepest ctx-linear decode term).
+- **SVE decode-attn — attn 6.6×, decode +68 % (Step 2h, uncommitted).** With `index_topk` fixed,
+  `attn` was the dominant decode phase (91 ms = 48 % @ctx10240). The two attn workers
+  (`ds4f_attn_tb2_worker`, `ds4f_attn_exact_worker`) were four **scalar** loops — QK dot + PV axpy
+  over `kv_lora=q_head_dim=512`, with per-element bf16 decode — running at ~0.2 GFLOP/s/core
+  (scalar-issue/decode-bound, NOT bandwidth-bound: window=128 pos ~128 KB + ≤512 compressed pos
+  ~1 MB, both L2-resident — so the earlier "int8 KV would cut attn" guess was wrong; the lever is
+  vectorization). SVE-vectorized with the `svld1uh<<16` bf16-widen idiom (BIT-EXACT to `ds4f_bf16f`)
+  + `svmla`/`svaddv`. The PV axpy keeps the j-outer loop so per-lane accumulation order matches
+  scalar (bit-exact PV); only the QK dot's horizontal reduction reorders (tiny f32). **Result:
+  attn 91.1 → 13.8 ms (6.6×); decode 5.21 → 8.75 tok/s @ctx10240 (+68 %, 1.68×)** — total session
+  decode **3.38 → 8.75 tok/s (2.59×)**. Gated `DS4F_ATTN_SVE` (default 1; `=0` = scalar reference).
+  *Validation subtlety (recorded as a lesson):* the SYNTHETIC ctx-warm argmax FLIPPED (223→294)
+  under the reorder — but that is a near-tie over *junk* latents, **not** a regression. The real
+  gate is real-weight gen + `DS4F_TF_CHECK=1`: SVE vs scalar gave **identical TF pred sequence
+  (23/23) and identical 48-token greedy completion (diff-empty), TF_ACCURACY 69.6 % both** (the
+  known-good coherent-gen baseline). So: synthetic-warm argmax is a SPEED signal only; gate any
+  fp-reorder change on real-weight TF/gen, never synthetic argmax.
 
 ## Remaining work (priority order)
 
@@ -462,12 +479,13 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 > ~22 ms (11.6 % of decode). **Lesson: measure the one untimed op before theorizing — the gap
 > between `tb2prep` and the sum of its sub-timers was the whole story.**
 
-1. **Attention is now the dominant decode cost (91 ms = 48 %).** With `index_topk` fixed,
-   `attn` + `o_proj` (29 ms, 15 %) are the next levers at testable (≤16k) ctx. `attn` reads the
-   (bf16) KV cache and the compressed-KV window — characterize it (sliding-window softmax vs
-   compressed-KV gather vs the score matvec) before optimizing; likely BW-bound on the KV read
-   (so int8 KV — item 2 — would cut it too) rather than issue-bound. The `tb2prep` projections/
-   compressor (~18 ms total) are now small; not worth chasing until `attn`/`o_proj` are addressed.
+1. **`o_proj` is now the dominant decode phase (29 ms = 26 % @ctx10240).** With `index_topk`
+   (Step 2g) and `attn` (Step 2h, 91 → 13.8 ms) both fixed, the breakdown @ctx10240 is: o_proj 29,
+   tb2prep 22, qkv_proj 18.5, attn 13.8, other 14. `o_proj` is the grouped low-rank FP8 projection
+   (8× `wo_a` group matvecs [o_lora×H] + the `wo_b` matvec [hidden×o_inter]); `qkv_proj` (18.5 ms)
+   is the next after it. Both are FP8 weight matvecs ⇒ check they use the faster **magic** decode
+   kernel (`matvec_fp8e4m3_8row_magic`, `ggml_dequant.h`; the `ds4f_decode_bw` roofline found
+   magic ≥ gather) and are SVE-issue-efficient. These are O(1)-in-ctx, so the win is ctx-flat.
    - *Done & shelved:* **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`). argmax-exact
      (96/96), f32 path bit-identical, gated default-off, but zero ≤16k decode win (Amdahl 1.2 % +
      M=1 q-quant cancellation). Keep as the 256k building block.
@@ -488,10 +506,10 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
      distribution — the per-channel scheme + calibration window still need argmax-exact
      confirmation on real latents (alloc-blocked). Implementation: `kv_cache` uint16→int8 +
      `kv_scale[layer][512]` (calibrate during prefill/warm), dequant at the latent-read sites.
-   - **Speed:** after the `index_topk` fix (Step 2g) decode is **5.21 tok/s @ctx10240** (target
-     10–15), now bound by **attn (48 %)** + o_proj (15 %) — see item 1. At 256k the index *scan*
-     additionally grows to dominate — int8/SVE `index_score` (done, `ae1167d`) is the 256k
-     prerequisite but does not move ≤16k.
+   - **Speed:** after the `index_topk` (Step 2g) + SVE-attn (Step 2h) fixes decode is **8.75 tok/s
+     @ctx10240** (target 10–15), now bound by **o_proj (26 %)** + tb2prep + qkv_proj — see item 1.
+     At 256k the index *scan* additionally grows to dominate — int8/SVE `index_score` (done,
+     `ae1167d`) is the 256k prerequisite but does not move ≤16k.
 3. **Batched decode / prefill M > 1** — amortize the 43 per-layer EP all-reduces
    (comm ~20 % Amdahl floor at M=1). Needs packed-B GEMM kernels; note the known A64FX
    batched-prefill regression (`project_batched_prefill_finding`).
@@ -501,32 +519,27 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 
 ## Next session — resuming prompt
 
-> **TASK: attack the new dominant decode cost — `attn` (91 ms = 48 % of decode @ctx10240),
-> then `o_proj` (29 ms = 15 %).** The `index_topk` bottleneck is FIXED (Step 2g: decode
-> 3.38 → 5.21 tok/s, gated `DS4F_TOPK_NAIVE=1` for the reference); `tb2prep` is now only 22 ms
-> (11.6 %), so don't chase it further.
+> **TASK: attack the new dominant decode phase — `o_proj` (29 ms = 26 % of decode @ctx10240),
+> then `qkv_proj` (18.5 ms).** Both `index_topk` (Step 2g) and `attn` (Step 2h, 91 → 13.8 ms, SVE)
+> are FIXED — decode is now **8.75 tok/s @ctx10240** (was 3.38). Don't re-chase `attn`/`tb2prep`.
 >
-> Branch `ds4f`. UNCOMMITTED as of this writing: the fast `index_topk` + per-component
-> `tb2prep` sub-timers (`common/ds4f_impl.h`, `common/ds4f.h`: `prof[16]`/`DS4F_NPHASE=16`/
-> `DS4F_P_TB2{QPROJ,ROPE,ICMP,WPROJ,LCMP,TOPK}`), the psum fixes (`ds4f_ep_runner.c`,
-> `ds4f_runner.c` — exclude TB2* sub-timers), `DS4F_TOPK_NAIVE` export in `run_ds4f_11n.sh`,
-> `tools/topk_equiv_test.c`, and this doc + memory. **Commit when the user asks.**
+> Branch `ds4f` (Step 2g committed `ee9046f`; Step 2h SVE-attn is UNCOMMITTED as of this writing:
+> `common/ds4f_impl.h` `ds4f_sve_{dot,axpy}_{bf16,f32}` + the two attn workers + `ds4f_attn_sve`
+> flag, `DS4F_ATTN_SVE` export in `run_ds4f_11n.sh`, this doc + memory — **commit when asked**).
 >
-> **Step 1 (measure — do this first):** `attn` has no sub-timers yet. Add them *inside* the
-> attention path (mirror the `DS4F_P_TB2*` pattern: fwd-decl `ds4f_now`, static ns accumulators,
-> fold into `m->prof[]`; enum/`DS4F_NPHASE`/`ds4f_prof_names` in `common/ds4f.h`) to split `attn`
-> across: sliding-window softmax over bf16 KV, compressed-KV (cmp_kv) window gather/softmax, and
-> the per-head score matvec. Run the ctx-warm A/B (`DS4F_PROF=1 DS4F_QUIET=1 DS4F_CTX_WARM=10240
-> SKIP_TOPO=1 ./run_ds4f_longctx_11n.sh`, sentinel, lockstep-safe). **The biggest sub-line is the
-> target.**
+> **Step 1 (measure — do this first):** `o_proj` is one `DS4F_P_OPROJ` bucket; split it into the
+> 8× `wo_a` group matvecs vs the `wo_b` matvec with sub-timers (mirror the `DS4F_P_TB2*` pattern in
+> `common/ds4f.h`/`ds4f_impl.h`), and likewise check whether `qkv_proj`'s `wq_a`/`wq_b`/`wkv` are
+> magic or gather. Run the ctx-warm A/B (`DS4F_PROF=1 DS4F_QUIET=1 DS4F_CTX_WARM=10240 SKIP_TOPO=1
+> ./run_ds4f_longctx_11n.sh`, sentinel, lockstep-safe).
 >
-> **Step 2 (optimize the dominant one):** hypothesis — `attn` is BW-bound on the bf16 KV read
-> (it grows with ctx). If so it is the SAME lever as **int8 KV** (item 2 of Remaining work):
-> halving KV bytes cuts the attn read directly *and* unblocks 32k+ memory. The int8-KV scheme is
-> already de-risked (static per-channel scale, `tools/int8kv_probe.c`); wiring = `kv_cache`
-> uint16→int8 + `kv_scale[layer][512]` calibrated during warm/prefill, dequant at the latent-read
-> sites. Validate argmax-exact on real weights. If `attn` is instead issue-bound on the score
-> matvec, SVE/magic that kernel. Gate any behavior change behind a flag.
+> **Step 2 (optimize):** these are FP8 weight matvecs (M=1). Likely lever: ensure they dispatch
+> the **magic** decode kernel `matvec_fp8e4m3_8row_magic` (the `ds4f_decode_bw` roofline found
+> magic ≥ gather; check the M==1 dispatch in `ds4f_matvec`/`ds4f_impl.h` ~`:1337`), and confirm
+> the grouped `wo_a` matvecs aren't issue-bound on tiny per-group GEMMs (fuse/SVE if so). Gate any
+> behavior change; validate via `DS4F_TF_CHECK=1` real-weight gen (NOT synthetic-warm argmax — see
+> the Step 2h lesson: a reduction-order change flips synthetic junk-argmax but must be token-exact
+> on real TF/gen).
 >
 > **GATES (non-negotiable):** native `fcc`/`FCC` (never `fccpx`); run binaries directly in the
 > alloc, NO `pjsub`; NP=11 `EXCLUDE=0,0,0` (node 0 is claude — running ~22 GB there OOM-kills the
