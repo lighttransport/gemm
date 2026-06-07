@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+
 #if defined(__SSE4_2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
 #include <nmmintrin.h>
 #endif
@@ -4203,20 +4204,20 @@ static const char *cuda_kernel_source =
 "    for (int i = tid; i < n_embd; i += 256) s_xb[i] = xb[i];\n"
 "    __syncthreads();\n"
 "    const float *row = router_logits + (size_t)token * n_experts;\n"
-"    int best_idx[8] = {-1,-1,-1,-1,-1,-1,-1,-1};\n"
-"    float best_val[8] = {-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f};\n"
+"    int lbi[8] = {-1,-1,-1,-1,-1,-1,-1,-1};\n"
+"    float lbv[8] = {-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f};\n"
 "    for (int e = tid; e < n_experts; e += 256) {\n"
 "        float v = row[e];\n"
-"        if (v > best_val[n_used-1]) {\n"
-"            best_val[n_used-1] = v; best_idx[n_used-1] = e;\n"
-"            for (int i = n_used-2; i >= 0 && best_val[i+1] > best_val[i]; i--) {\n"
-"                float tv = best_val[i]; int ti = best_idx[i];\n"
-"                best_val[i] = best_val[i+1]; best_idx[i] = best_idx[i+1];\n"
-"                best_val[i+1] = tv; best_idx[i+1] = ti;\n"
+"        if (v > lbv[n_used-1]) {\n"
+"            lbv[n_used-1] = v; lbi[n_used-1] = e;\n"
+"            for (int i = n_used-2; i >= 0 && lbv[i+1] > lbv[i]; i--) {\n"
+"                float tv = lbv[i]; int ti = lbi[i];\n"
+"                lbv[i] = lbv[i+1]; lbi[i] = lbi[i+1];\n"
+"                lbv[i+1] = tv; lbi[i+1] = ti;\n"
 "            }\n"
 "        }\n"
 "    }\n"
-"    if (tid < n_used) { s_idx[tid] = best_idx[tid]; s_w[tid] = 1.0f/(1.0f+expf(-best_val[tid])); }\n"
+"    if (tid < n_used) { s_idx[tid] = lbi[tid]; s_w[tid] = 1.0f/(1.0f+expf(-lbv[tid])); }\n"
 "    __syncthreads();\n"
 "    float *accum = s_accum;\n"
 "    float *gate_buf = s_accum + n_embd;\n"
@@ -4329,7 +4330,7 @@ static const char *cuda_kernel_source =
 "    for (int i = tid; i < n_embd; i += 256) out[i] += accum[i];\n"
 "}\n"
 "\n"
-"/* Gather rows from batch buffer: dst[rows, cols] = src[indices[row], cols] */\n"
+"__global__ void moe_decode_fused_tc(float *output, const float *xb,\n""    const float *router_logits,\n""    const unsigned char *gate_exps, const unsigned char *up_exps, const unsigned char *down_exps,\n""    const unsigned short *shared_gate, const unsigned short *shared_up, const unsigned short *shared_down,\n""    const float *shared_gate_scalar,\n""    int n_experts, int n_used, int n_embd, int expert_ff,\n""    size_t stride_gu, size_t stride_d,\n""    int gate_type, int up_type, int down_type) {\n""    __shared__ float sx[2048];\n""    __shared__ float sg[512];\n""    __shared__ float su[512];\n""    __shared__ float sa[2048];\n""    __shared__ int sidx[8];\n""    __shared__ float sw[8];\n""    int tid = threadIdx.x;\n""    int warp = tid / 32;\n""    int lane = tid % 32;\n""\n""    for (int i = tid; i < n_embd; i += 128) sx[i] = xb[i];\n""    __syncthreads();\n""\n""    float lv[8]; int li[8];\n""    for (int i = 0; i < n_used; i++) { lv[i] = -1e38f; li[i] = -1; }\n""    for (int e = tid; e < n_experts; e += 128) {\n""        float v = router_logits[e];\n""        if (v > lv[n_used-1]) {\n""            lv[n_used-1] = v; li[n_used-1] = e;\n""            for (int i = n_used-2; i >= 0 && lv[i+1] > lv[i]; i--) {\n""                float xv = lv[i]; int xi = li[i];\n""                lv[i] = lv[i+1]; li[i] = li[i+1];\n""                lv[i+1] = xv; li[i+1] = xi;\n""            }\n""        }\n""    }\n""    for (int rr = 16; rr > 0; rr >>= 1) {\n""        if (tid + rr < 128) {\n""            for (int kk = 0; kk < n_used; kk++) {\n""                if (lv[kk] > lv[n_used-1]) {\n""                    lv[n_used-1] = lv[kk]; li[n_used-1] = li[kk];\n""                    for (int ii = n_used-2; ii >= 0 && lv[ii+1] > lv[ii]; ii--) {\n""                        float xv = lv[ii]; int xi = li[ii];\n""                        lv[ii] = lv[ii+1]; li[ii] = li[ii+1];\n""                        lv[ii+1] = xv; li[ii+1] = xi;\n""                    }\n""                }\n""            }\n""        }\n""        __syncthreads();\n""    }\n""    if (tid < n_used) { sidx[tid] = li[tid]; sw[tid] = 1.0f/(1.0f+expf(-lv[tid])); }\n""    __syncthreads();\n""\n""    for (int i = tid; i < n_embd; i += 128) sa[i] = 0.0f;\n""    __syncthreads();\n""\n""    for (int ei = 0; ei < n_used; ei++) {\n""        int eidx = sidx[ei];\n""        float wgt = sw[ei];\n""        for (int i = tid; i < expert_ff; i += 128) { sg[i] = 0.0f; su[i] = 0.0f; }\n""        __syncthreads();\n""\n""        int nb = n_embd / 256, rb = nb * 82;\n""        for (int r = warp; r < expert_ff; r += 4) {\n""            const unsigned char *rp = gate_exps + (size_t)eidx * stride_gu + (size_t)r * rb;\n""            float s = 0;\n""            for (int b = lane; b < nb; b += 32) {\n""                const unsigned char *bp = rp + b * 82;\n""                float d = half_to_float(*(const half_raw *)bp);\n""                const unsigned char *qs = bp + 2, *qh = bp + 66, *sc = bp + 74, *signp = bp + 34;\n""                const float *xx = sx + b * 256;\n""                float p = 0; int yi = 0;\n""                for (int ib = 0; ib < 8; ib++) {\n""                    float da = d * (0.5f + (sc[ib] & 0xf)) * 0.25f;\n""                    float db = d * (0.5f + (sc[ib] >> 4)) * 0.25f;\n""                    for (int lx = 0; lx < 4; lx++) {\n""                        float dl = (lx < 2) ? da : db;\n""                        int gid = qs[lx] | ((qh[ib] << (8-2*lx)) & 0x300);\n""                        const unsigned char *grd = (const unsigned char *)&iq2s_grid_dev[gid];\n""                        unsigned char sn = signp[lx];\n""                        for (int j = 0; j < 8; j++)\n""                            p += (dl * (float)grd[j] * ((sn & (1<<j))?-1.0f:1.0f)) * xx[yi++];\n""                    }\n""                    qs += 4; signp += 4;\n""                }\n""                s += p;\n""            }\n""            for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFF, s, o);\n""            if (lane == 0) sg[r] = s;\n""        }\n""        __syncthreads();\n""\n""        for (int r = warp; r < expert_ff; r += 4) {\n""            const unsigned char *rp = up_exps + (size_t)eidx * stride_gu + (size_t)r * rb;\n""            float s = 0;\n""            for (int b = lane; b < nb; b += 32) {\n""                const unsigned char *bp = rp + b * 82;\n""                float d = half_to_float(*(const half_raw *)bp);\n""                const unsigned char *qs = bp + 2, *qh = bp + 66, *sc = bp + 74, *signp = bp + 34;\n""                const float *xx = sx + b * 256;\n""                float p = 0; int yi = 0;\n""                for (int ib = 0; ib < 8; ib++) {\n""                    float da = d * (0.5f + (sc[ib] & 0xf)) * 0.25f;\n""                    float db = d * (0.5f + (sc[ib] >> 4)) * 0.25f;\n""                    for (int lx = 0; lx < 4; lx++) {\n""                        float dl = (lx < 2) ? da : db;\n""                        int gid = qs[lx] | ((qh[ib] << (8-2*lx)) & 0x300);\n""                        const unsigned char *grd = (const unsigned char *)&iq2s_grid_dev[gid];\n""                        unsigned char sn = signp[lx];\n""                        for (int j = 0; j < 8; j++)\n""                            p += (dl * (float)grd[j] * ((sn & (1<<j))?-1.0f:1.0f)) * xx[yi++];\n""                    }\n""                    qs += 4; signp += 4;\n""                }\n""                s += p;\n""            }\n""            for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFF, s, o);\n""            if (lane == 0) su[r] = s;\n""        }\n""        __syncthreads();\n""\n""        for (int i = tid; i < expert_ff; i += 128)\n""            sg[i] = (sg[i] / (1.0f + expf(-sg[i]))) * su[i];\n""        __syncthreads();\n""\n""        nb = expert_ff / 256; rb = nb * 110;\n""        for (int r = warp; r < n_embd; r += 4) {\n""            const unsigned char *rp = down_exps + (size_t)eidx * stride_d + (size_t)r * rb;\n""            float s = 0;\n""            for (int b = lane; b < nb; b += 32) {\n""                const unsigned char *bp = rp + b * 110;\n""                float d = half_to_float(*(const half_raw *)bp);\n""                const unsigned char *qs = bp + 2, *ss = qs + 64;\n""                const float *gg = sg + b * 256;\n""                float p = 0; int yi = 0;\n""                for (int ib = 0; ib < 8; ib++) {\n""                    unsigned int aux32;\n""                    memcpy(&aux32, ss + 4*ib, 4);\n""                    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n""                    for (int lx = 0; lx < 4; lx++) {\n""                        unsigned char sb = (unsigned char)ksigns_iq2xs_dev[(aux32>>(7*lx))&127];\n""                        unsigned int g1 = iq3xxs_grid_dev[qs[2*lx+0]];\n""                        unsigned int g2 = iq3xxs_grid_dev[qs[2*lx+1]];\n""                        for (int j = 0; j < 4; j++) {\n""                            float w0 = db*(float)(unsigned char)(g1>>(8*j))*((sb&(1<<j))?-1.0f:1.0f);\n""                            float w1 = db*(float)(unsigned char)(g2>>(8*j))*((sb&(1<<(j+4)))?-1.0f:1.0f);\n""                            p += w0*gg[yi+j] + w1*gg[yi+j+4];\n""                        }\n""                        yi += 8;\n""                    }\n""                    qs += 8;\n""                }\n""                s += p;\n""            }\n""            for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFF, s, o);\n""            if (lane == 0) sa[r] += wgt * s;\n""        }\n""        __syncthreads();\n""    }\n""\n""    {\n""        float gs = 0;\n""        for (int i = lane; i < n_embd; i += 32) gs += shared_gate_scalar[i] * sx[i];\n""        for (int o = 16; o > 0; o >>= 1) gs += __shfl_down_sync(0xFFFFFFFF, gs, o);\n""        float sscale = 1.0f/(1.0f+expf(-gs));\n""        for (int r = warp; r < expert_ff; r += 4) {\n""            float s = 0;\n""            for (int i = lane; i < n_embd; i += 32)\n""                s += half_to_float(shared_gate[(size_t)r*n_embd+i]) * sx[i];\n""            for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFF, s, o);\n""            if (lane == 0) sg[r] = s;\n""        }\n""        __syncthreads();\n""        for (int r = warp; r < expert_ff; r += 4) {\n""            float s = 0;\n""            for (int i = lane; i < n_embd; i += 32)\n""                s += half_to_float(shared_up[(size_t)r*n_embd+i]) * sx[i];\n""            for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFF, s, o);\n""            if (lane == 0) su[r] = s;\n""        }\n""        __syncthreads();\n""        for (int i = tid; i < expert_ff; i += 128)\n""            sg[i] = (sg[i]/(1.0f+expf(-sg[i])))*su[i];\n""        __syncthreads();\n""        for (int r = warp; r < n_embd; r += 4) {\n""            float s = 0;\n""            for (int i = lane; i < expert_ff; i += 32)\n""                s += half_to_float(shared_down[(size_t)r*expert_ff+i]) * sg[i];\n""            for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFF, s, o);\n""            if (lane == 0) sa[r] += sscale * s;\n""        }\n""        __syncthreads();\n""    }\n""\n""    for (int i = tid; i < n_embd; i += 128) output[i] = sa[i];\n""}\n"
 "__global__ void gather_rows_f32(float *dst, const float *src, const int *indices,\n"
 "                                 int n_rows, int n_cols) {\n"
 "    int row = blockIdx.x;\n"
@@ -4364,18 +4365,18 @@ static const char *cuda_kernel_source =
 "    const float *row = logits + (size_t)token * n_experts;\n"
 "    int tid = threadIdx.x;\n"
 "    /* Each thread scans a subset of experts, tracking top-k */\n"
-"    int best_idx[8]; float best_val[8];\n"
-"    for (int i = 0; i < k; i++) { best_idx[i] = -1; best_val[i] = -1e38f; }\n"
+"    int lbi[8]; float lbv[8];\n"
+"    for (int i = 0; i < k; i++) { lbi[i] = -1; lbv[i] = -1e38f; }\n"
 "    for (int e = tid; e < n_experts; e += blockDim.x) {\n"
 "        float v = row[e];\n"
-"        if (v > best_val[k-1]) {\n"
-"            best_val[k-1] = v;\n"
-"            best_idx[k-1] = e;\n"
+"        if (v > lbv[k-1]) {\n"
+"            lbv[k-1] = v;\n"
+"            lbi[k-1] = e;\n"
 "            /* Insertion sort: bubble down */\n"
-"            for (int i = k-2; i >= 0 && best_val[i+1] > best_val[i]; i--) {\n"
-"                float tv = best_val[i]; int ti = best_idx[i];\n"
-"                best_val[i] = best_val[i+1]; best_idx[i] = best_idx[i+1];\n"
-"                best_val[i+1] = tv; best_idx[i+1] = ti;\n"
+"            for (int i = k-2; i >= 0 && lbv[i+1] > lbv[i]; i--) {\n"
+"                float tv = lbv[i]; int ti = lbi[i];\n"
+"                lbv[i] = lbv[i+1]; lbi[i] = lbi[i+1];\n"
+"                lbv[i+1] = tv; lbi[i+1] = ti;\n"
 "            }\n"
 "        }\n"
 "    }\n"
@@ -4384,8 +4385,8 @@ static const char *cuda_kernel_source =
 "    __shared__ float s_vals[256];\n"
 "    __shared__ int s_idxs[256];\n"
 "    for (int i = 0; i < k; i++) {\n"
-"        s_vals[tid * k + i] = best_val[i];\n"
-"        s_idxs[tid * k + i] = best_idx[i];\n"
+"        s_vals[tid * k + i] = lbv[i];\n"
+"        s_idxs[tid * k + i] = lbi[i];\n"
 "    }\n"
 "    __syncthreads();\n"
 "    /* Tree reduction: merge pairs of threads */\n"
@@ -4396,20 +4397,20 @@ static const char *cuda_kernel_source =
 "                for (int j = 0; j < k; j++) {\n"
 "                    float ov = s_vals[(tid+stride)*k + j];\n"
 "                    int oi = s_idxs[(tid+stride)*k + j];\n"
-"                    if (oi >= 0 && ov > best_val[k-1]) {\n"
-"                        best_val[k-1] = ov; best_idx[k-1] = oi;\n"
-"                        for (int ii = k-2; ii >= 0 && best_val[ii+1] > best_val[ii]; ii--) {\n"
-"                            float tv = best_val[ii]; int ti = best_idx[ii];\n"
-"                            best_val[ii] = best_val[ii+1]; best_idx[ii] = best_idx[ii+1];\n"
-"                            best_val[ii+1] = tv; best_idx[ii+1] = ti;\n"
+"                    if (oi >= 0 && ov > lbv[k-1]) {\n"
+"                        lbv[k-1] = ov; lbi[k-1] = oi;\n"
+"                        for (int ii = k-2; ii >= 0 && lbv[ii+1] > lbv[ii]; ii--) {\n"
+"                            float tv = lbv[ii]; int ti = lbi[ii];\n"
+"                            lbv[ii] = lbv[ii+1]; lbi[ii] = lbi[ii+1];\n"
+"                            lbv[ii+1] = tv; lbi[ii+1] = ti;\n"
 "                        }\n"
 "                    }\n"
 "                }\n"
 "            }\n"
-"            s_vals[tid*k + 0] = best_val[0]; s_idxs[tid*k + 0] = best_idx[0];\n"
-"            s_vals[tid*k + 1] = best_val[1]; s_idxs[tid*k + 1] = best_idx[1];\n"
-"            s_vals[tid*k + 2] = best_val[2]; s_idxs[tid*k + 2] = best_idx[2];\n"
-"            s_vals[tid*k + 3] = best_val[3]; s_idxs[tid*k + 3] = best_idx[3];\n"
+"            s_vals[tid*k + 0] = lbv[0]; s_idxs[tid*k + 0] = lbi[0];\n"
+"            s_vals[tid*k + 1] = lbv[1]; s_idxs[tid*k + 1] = lbi[1];\n"
+"            s_vals[tid*k + 2] = lbv[2]; s_idxs[tid*k + 2] = lbi[2];\n"
+"            s_vals[tid*k + 3] = lbv[3]; s_idxs[tid*k + 3] = lbi[3];\n"
 "        }\n"
 "        __syncthreads();\n"
 "    }\n"
@@ -5213,6 +5214,14 @@ struct cuda_llm_runner {
     CUdeviceptr d_ple_proj;         /* F32 [n_embd] scratch */
     int current_token_id;           /* stashed for PLE lookup */
     int ple_use_f32;                /* 1 = keep PLE weights in F32 for accuracy */
+    /* AOT-compiled GPU kernels (moe_gpu_kernels.cubin, no device globals) */
+    CUmodule moe_gpu_mod;
+    CUfunction fn_moe_topk_gpu;
+    CUfunction fn_moe_shared_gate_gpu;
+    CUdeviceptr d_topk_idx;   /* [8] int */
+    CUdeviceptr d_topk_wgt;   /* [8] float */
+    int h_topk_idx[8];
+    float h_topk_wgt[8];
     /* Host-side PLE data (mmap pointers from GGUF, valid while GGUF is open) */
     qtensor h_ple_token_embd;       /* Q8_0 per_layer_token_embd */
     qtensor h_ple_model_proj;       /* BF16 per_layer_model_proj */
@@ -5580,6 +5589,19 @@ lookup_funcs:
 
     if (r->verbose >= 1) {
         fprintf(stderr, "cuda_llm: all kernels compiled successfully\n");
+
+        r->moe_gpu_mod = 0; r->fn_moe_topk_gpu = NULL; r->fn_moe_shared_gate_gpu = NULL;
+        {
+            const char *cp = "cuda/llm/moe_gpu_kernels.cubin";
+            FILE *fp = fopen(cp, "rb");
+            if (fp) { fseek(fp,0,SEEK_END); long sz=ftell(fp); fseek(fp,0,SEEK_SET);
+                char *d=(char*)malloc((size_t)sz); if(d){fread(d,1,(size_t)sz,fp);fclose(fp);
+                if(cuModuleLoadData(&r->moe_gpu_mod,d)==CUDA_SUCCESS){
+                    cuModuleGetFunction(&r->fn_moe_topk_gpu,r->moe_gpu_mod,"moe_topk_gpu");
+                    cuModuleGetFunction(&r->fn_moe_shared_gate_gpu,r->moe_gpu_mod,"moe_shared_gate_gpu");
+                }free(d);}else fclose(fp);
+            }
+        }
     }
     return 0;
 }
@@ -6614,6 +6636,8 @@ static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_
         r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
         if (!r->h_router_logits) return -1;
     }
+
+
 
     if (r->is_hybrid) {
         int d_inner = r->ssm_d_inner;
@@ -8286,7 +8310,7 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
     /* Simple selection sort for top-k (k is small, typically 8) */
     for (int ki = 0; ki < k; ki++) {
         float best = -1e30f;
-        int best_idx = -1;
+        int lbi = -1;
         for (int i = 0; i < n; i++) {
             /* Skip already selected */
             int skip = 0;
@@ -8294,9 +8318,9 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
                 if (out_idx[j] == i) { skip = 1; break; }
             }
             if (skip) continue;
-            if (logits[i] > best) { best = logits[i]; best_idx = i; }
+            if (logits[i] > best) { best = logits[i]; lbi = i; }
         }
-        out_idx[ki] = best_idx;
+        out_idx[ki] = lbi;
         out_weights[ki] = best;
     }
 
@@ -9326,142 +9350,80 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
 
         if (cl->is_moe) {
-            /* ---- MoE FFN ---- */
             int n_experts = r->n_experts;
-            int n_experts_used = r->n_experts_used;
+            int n_used = r->n_experts_used;
             int expert_ff = r->expert_ff;
             int shared_expert_ff = r->shared_expert_ff;
+            int topk_h_idx[8];
+            float topk_h_wgt[8];
 
-            /* 1. Router: logits = gate_inp @ xb → [n_experts] (F32 matvec) */
             launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
                              cl->moe_gate_rows, cl->moe_gate_cols);
 
-            /* 2. Top-k on CPU (sync + download n_experts floats → pick top-k + softmax) */
-            cuStreamSynchronize(r->stream);
-            cuMemcpyDtoH(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float));
-            int top_k_idx[64];  /* max 64 experts selected */
-            float top_k_weights[64];
-            moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_k_idx, top_k_weights);
-
-            /* MoE debug helper macro */
-            #define MOE_DBG_NORM(label, dptr, sz) do { \
-                if (r->debug_layers >= 2 && l == 0) { \
-                    cuStreamSynchronize(r->stream); \
-                    float _dbg[8]; int _dn = (sz) < 8 ? (sz) : 8; \
-                    cuMemcpyDtoH(_dbg, (dptr), _dn * sizeof(float)); \
-                    float _s = 0; for (int _i = 0; _i < _dn; _i++) _s += _dbg[_i]*_dbg[_i]; \
-                    fprintf(stderr, "  [L0 MoE] %s norm~%.4f first=[%.6f,%.6f,%.6f,%.6f]\n", \
-                            (label), sqrtf(_s*(float)(sz)/(float)_dn), _dbg[0],_dbg[1],_dbg[2],_dbg[3]); \
-                } } while(0)
-
-            /* Debug: routing info */
-            if (r->debug_layers >= 2 && l == 0) {
-                fprintf(stderr, "  [L0 MoE] router top-k:");
-                for (int e = 0; e < n_experts_used; e++)
-                    fprintf(stderr, " e%d(%.4f)", top_k_idx[e], top_k_weights[e]);
-                fprintf(stderr, "\n");
+            if (r->fn_moe_topk_gpu) {
+                if (!r->d_topk_idx) cuMemAlloc(&r->d_topk_idx, 8 * sizeof(int));
+                if (!r->d_topk_wgt) cuMemAlloc(&r->d_topk_wgt, 8 * sizeof(float));
+                void *tk_args[] = { &r->d_topk_idx, &r->d_topk_wgt,
+                                    &r->d_router_logits, &n_experts, &n_used };
+                CUresult _ce = cuLaunchKernel(r->fn_moe_topk_gpu, 1, 1, 1, 128, 1, 1,
+                              0, r->stream, tk_args, NULL);
+                if (_ce != CUDA_SUCCESS) fprintf(stderr, "  [MoE] topk launch err=%d\n", (int)_ce);
+                cuMemcpyDtoHAsync(r->h_topk_idx, r->d_topk_idx, 8 * sizeof(int), r->stream);
+                cuMemcpyDtoHAsync(r->h_topk_wgt, r->d_topk_wgt, 8 * sizeof(float), r->stream);
+                _ce = cuStreamSynchronize(r->stream);
+                if (_ce != CUDA_SUCCESS) fprintf(stderr, "  [MoE] topk sync err=%d\n", (int)_ce);
+                for (int i = 0; i < 8; i++) { topk_h_idx[i] = r->h_topk_idx[i]; topk_h_wgt[i] = r->h_topk_wgt[i]; }
+            } else {
+                cuStreamSynchronize(r->stream);
+                cuMemcpyDtoH(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float));
+                int tki[64]; float tkw[64];
+                moe_topk_softmax(r->h_router_logits, n_experts, n_used, tki, tkw);
+                for (int i = 0; i < 8; i++) { topk_h_idx[i] = tki[i]; topk_h_wgt[i] = tkw[i]; }
             }
 
-            /* 3. Zero accumulator */
             cuMemsetD32(r->d_moe_accum, 0, n_embd);
 
-            /* 4. For each selected expert */
-            for (int e = 0; e < n_experts_used; e++) {
-                int eidx = top_k_idx[e];
-                CUdeviceptr gate_w = cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu;
-                CUdeviceptr up_w   = cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu;
-                CUdeviceptr down_w = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
-
-                /* gate = expert_gate @ xb, up = expert_up @ xb */
-                if (launch_moe_expert_cublas(r, cl, r->d_gate, eidx, 0, r->d_xb, 1,
-                                              expert_ff, n_embd, 0) != 0)
-                    launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
-                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
-
-                if (launch_moe_expert_cublas(r, cl, r->d_up, eidx, 0, r->d_xb, 1,
-                                              expert_ff, n_embd, 0) != 0)
-                    launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
-                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
-
-                if (r->debug_layers >= 2 && l == 0 && e == 0) {
-                    MOE_DBG_NORM("e0 gate_out", r->d_gate, expert_ff);
-                    MOE_DBG_NORM("e0 up_out", r->d_up, expert_ff);
-
-                    /* CPU cross-check: verify Q2_K expert matvec for expert 0 */
-                    {
-                        cuStreamSynchronize(r->stream);
-                        /* Download FFN input (d_xb = post-norm) */
-                        float *cpu_xb = (float *)malloc(n_embd * sizeof(float));
-                        cuMemcpyDtoH(cpu_xb, r->d_xb, n_embd * sizeof(float));
-                        /* Download GPU gate output for comparison */
-                        float *gpu_gate_out = (float *)malloc(expert_ff * sizeof(float));
-                        cuMemcpyDtoH(gpu_gate_out, r->d_gate, expert_ff * sizeof(float));
-                        /* Download expert gate weight raw bytes from GPU */
-                        size_t exp_bytes = cl->moe_exp_stride_gu;
-                        unsigned char *gate_raw = (unsigned char *)malloc(exp_bytes);
-                        cuMemcpyDtoH(gate_raw, gate_w, exp_bytes);
-                        /* CPU dequant + matvec for a few rows */
-                        int exp_cols = cl->moe_exp_cols_gu;
-                        int exp_rows = cl->moe_exp_rows_gu;
-                        int row_bytes = (int)dequant_row_size(cl->moe_gate_exps_type, exp_cols);
-                        float *dqbuf = (float *)malloc(exp_cols * sizeof(float));
-                        fprintf(stderr, "  [L0 MoE CPU cross-check] exp type=%d rows=%d cols=%d stride=%zu row_bytes=%d\n",
-                                cl->moe_gate_exps_type, exp_rows, exp_cols, exp_bytes, row_bytes);
-                        fprintf(stderr, "  [L0 MoE CPU cross-check] xb_input first=[%.6f,%.6f,%.6f,%.6f]\n",
-                                cpu_xb[0], cpu_xb[1], cpu_xb[2], cpu_xb[3]);
-                        int check_rows[] = {0, 1, 10, 100, exp_rows/2, exp_rows-1};
-                        float max_err = 0;
-                        for (int ci = 0; ci < 6; ci++) {
-                            int row = check_rows[ci];
-                            if (row >= exp_rows) continue;
-                            dequant_row(cl->moe_gate_exps_type, gate_raw + (size_t)row * row_bytes, dqbuf, exp_cols);
-                            float cpu_dot = 0;
-                            for (int j = 0; j < exp_cols; j++) cpu_dot += dqbuf[j] * cpu_xb[j];
-                            float err = fabsf(cpu_dot - gpu_gate_out[row]);
-                            if (err > max_err) max_err = err;
-                            fprintf(stderr, "    row %3d: CPU=%.6f GPU=%.6f err=%.6f\n",
-                                    row, cpu_dot, gpu_gate_out[row], err);
-                        }
-                        fprintf(stderr, "    max_err=%.6f\n", max_err);
-                        free(cpu_xb); free(gpu_gate_out); free(gate_raw); free(dqbuf);
-                    }
+            if (r->debug_layers >= 2 && l == 0) {
+                fprintf(stderr, "  [L0 MoE] topk:");
+                for (int i = 0; i < n_used; i++) fprintf(stderr, " e%d(%.4f)", topk_h_idx[i], topk_h_wgt[i]);
+                fprintf(stderr, "\n");
+            }
+            for (int e = 0; e < n_used; e++) {
+                int eidx = topk_h_idx[e];
+                float wgt = topk_h_wgt[e];
+                if (eidx < 0 || eidx >= n_experts) {
+                    fprintf(stderr, "cuda_llm: invalid expert idx %d at layer %d\n", eidx, l);
+                    eidx = e % n_experts; /* safe fallback */
+                    wgt = 0.0f;
                 }
-
-                /* SiLU(gate) * up */
+                CUdeviceptr gw = cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu;
+                CUdeviceptr uw = cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu;
+                CUdeviceptr dw = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
+                launch_matvec_auto(r, r->d_gate, gw, r->d_xb,
+                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
+                launch_matvec_auto(r, r->d_up, uw, r->d_xb,
+                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
                 launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
-
-                /* down = expert_down @ gate → d_xb2 */
-                if (launch_moe_expert_cublas(r, cl, r->d_xb2, eidx, 1, r->d_gate, 1,
-                                              cl->moe_exp_rows_d, cl->moe_exp_cols_d, 0) != 0)
-                    launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
-                                      cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
-
-                if (r->debug_layers >= 2 && l == 0 && e == 0) {
-                    MOE_DBG_NORM("e0 silu_mul", r->d_gate, expert_ff);
-                    MOE_DBG_NORM("e0 down_out", r->d_xb2, n_embd);
-                }
-
-                /* Weighted accumulate: moe_accum += weight * xb2 */
-                launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_k_weights[e], n_embd);
+                launch_matvec_auto(r, r->d_xb2, dw, r->d_gate,
+                                  cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
+                launch_scale_add(r, r->d_moe_accum, r->d_xb2, wgt, n_embd);
             }
 
-            MOE_DBG_NORM("experts_accum", r->d_moe_accum, n_embd);
-
-            /* 5. Shared expert */
+            /* Shared expert */
             {
-                /* Compute gate scalar: sigmoid(dot(xb, shared_gate_w))
-                 * shared_gate_w is [n_embd] F32, treated as [1, n_embd] matvec → [1] */
-                launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb,
-                                 1, n_embd);
-                cuStreamSynchronize(r->stream);
-                float gate_val;
-                cuMemcpyDtoH(&gate_val, r->d_router_logits, sizeof(float));
-                float shared_scale = 1.0f / (1.0f + expf(-gate_val));  /* sigmoid */
-
-                if (r->debug_layers >= 2 && l == 0)
-                    fprintf(stderr, "  [L0 MoE] shared_gate=%.6f sigmoid=%.6f\n", gate_val, shared_scale);
-
-                /* Shared expert FFN: gate, up, silu_mul, down */
+                float shared_scale;
+                if (r->fn_moe_shared_gate_gpu) {
+                    void *sg_args[] = { &r->d_topk_wgt, &r->d_xb,
+                                        &cl->moe_shared_gate_w, &n_embd };
+                    cuLaunchKernel(r->fn_moe_shared_gate_gpu, 1, 1, 1, 128, 1, 1,
+                                  0, r->stream, sg_args, NULL);
+                    cuMemcpyDtoH(&shared_scale, r->d_topk_wgt, sizeof(float));
+                } else {
+                    launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+                    cuStreamSynchronize(r->stream);
+                    float gv; cuMemcpyDtoH(&gv, r->d_router_logits, sizeof(float));
+                    shared_scale = 1.0f / (1.0f + expf(-gv));
+                }
                 launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
                                   cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
                 launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
@@ -9469,19 +9431,10 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
                 launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
                                   cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
-
-                MOE_DBG_NORM("shared_down_out", r->d_xb2, n_embd);
-
-                /* moe_accum += shared_scale * xb2 */
                 launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
             }
 
-            MOE_DBG_NORM("final_moe_out", r->d_moe_accum, n_embd);
-            #undef MOE_DBG_NORM
-
-            /* 6. Copy accumulated result to xb for residual */
             cuMemcpyDtoDAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float), r->stream);
-
         } else {
             /* ---- Dense FFN ---- */
             /* FFN gate and up projections (fused, dp4a when Q8_0) */
@@ -11217,6 +11170,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
     free(r->swa_pattern);
     if (r->d_router_logits) cuMemFree(r->d_router_logits);
     if (r->d_moe_accum)    cuMemFree(r->d_moe_accum);
+    if (r->d_topk_idx)    cuMemFree(r->d_topk_idx);
+    if (r->d_topk_wgt)    cuMemFree(r->d_topk_wgt);
+    if (r->moe_gpu_mod)   cuModuleUnload(r->moe_gpu_mod);
     if (r->d_hidden_snapshots) cuMemFree(r->d_hidden_snapshots);
     free(r->h_router_logits);
     free(r->h_stage);

@@ -1,33 +1,36 @@
 # Makefile for CUDA LLM runner
-#
-# No nvcc required - kernels compiled at runtime via NVRTC.
-# Only needs gcc + CUDA runtime libraries (libcuda.so, libnvrtc.so) on the system.
 
 CC = gcc
+NVCC = nvcc
 CFLAGS = -O3 -Wall -Wextra -I.. -mavx2 -mfma -march=native
 LDFLAGS = -ldl -lm -lpthread
 
-# Sources
 CUEW_SRC = ../cuew.c
 CUBLASEW_SRC = ../cublasew.c
 RUNNER_SRC = cuda_llm_runner.c
 TEST_SRC = test_cuda_llm.c
+MOE_CUBIN = moe_gpu_kernels.cubin
 
-# Target
 TARGET = test_cuda_llm
 
-.PHONY: all clean run help
+.PHONY: all clean run help cubin
 
-all: $(TARGET)
+all: $(MOE_CUBIN) $(TARGET)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) cuda_llm_runner.h ../cuew.h ../cublasew.h
+cubin: $(MOE_CUBIN)
+
+$(MOE_CUBIN): moe_gpu_kernels.cu
+	$(NVCC) -cubin -arch=sm_120 -o $@ $<
+
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) \
+          cuda_llm_runner.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(MOE_CUBIN)
 
 help:
 	@echo "CUDA LLM Runner (NVRTC-based, no nvcc needed)"
