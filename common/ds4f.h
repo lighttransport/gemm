@@ -199,6 +199,26 @@ typedef struct {
      * model's 8-bit-mantissa reference precision (faithful, not lossy). Codec:
      * ds4f_bf16f (bf16->f32 lsl) / ds4f_f32bf (f32->bf16 round) in ds4f_impl.h. */
     uint16_t *kv_cache;
+    /* ---- int8 KV cache (DS4F_INT8_KV; S5 static per-channel scale) ----
+     * Halves the KV footprint (the 256k-ctx memory dominator). The kv latent's
+     * massive-activation channels (~1e3..1e5, positionally CONSISTENT) make naive
+     * per-token int8 catastrophic (one sink dim sets the scale -> O(1) dims -> 0).
+     * The viable layout is a STATIC per-channel scale calibrated on the first ~CAL
+     * positions and applied to all later positions (sinks are positionally stable
+     * so early calibration holds). When DS4F_INT8_KV is on, kv_cache is NULL and the
+     * store is kv_q (int8); reads dequant via kv_scale[channel]. Streaming: positions
+     * [0,CAL) stage to kv_calbuf (bf16) while the per-channel absmax accumulates; at
+     * pos>=CAL the scale freezes, calbuf is quantized into kv_q, and the read path
+     * switches to int8 (single hoisted branch on kv_frozen). LOSSY (~1% rel) ->
+     * argmax NOT bit-exact; coherence is the gate. Only the streaming exact/tierb2
+     * decode path is wired (batched prefill is incompatible & unused there). */
+    int8_t   *kv_q;        /* [max_pos, kv_lora] int8 store (NULL unless int8_kv) */
+    float    *kv_scale;    /* [kv_lora] per-channel dequant scale (absmax/127) */
+    float    *kv_iscale;   /* [kv_lora] 1/scale (quantize) */
+    float    *kv_absmax;   /* [kv_lora] running absmax during calibration */
+    uint16_t *kv_calbuf;   /* [CAL, kv_lora] bf16 staging until freeze */
+    int       kv_caln;     /* positions staged in calbuf */
+    int       kv_frozen;   /* 1 once scale frozen & calbuf quantized into kv_q */
     /* ---- Tier-B2 (DS4F_TIERB2; off-arena, only on ratio!=0 layers) ----
      * The stateful compressor/indexer long-range compressed-KV term that Tier-B1
      * omits. The matvec weights are stored bf16 (sources are bf16/FP8-e4m3, both
@@ -302,6 +322,12 @@ typedef struct {
      * kernels are bit-validated (ds4f_tierb2_test.c); here they are wired stateful
      * token-at-a-time. Set via DS4F_TIERB2=1. */
     int tierb2;
+    /* int8 KV cache (DS4F_INT8_KV): store the per-(layer,pos) kv latent as int8 with
+     * a static per-channel scale (S5) instead of bf16 -> half the KV footprint at long
+     * ctx. See ds4f_layer.kv_q. Requires exact (streaming decode path); incompatible
+     * with batched prefill (which is itself unused under tierb2). LOSSY (coherence
+     * gate, not bit-exact). Off by default. */
+    int int8_kv;
     /* RoPE freqs tables (only built when exact): cos/sin[pos*half + k],
      * half = qk_rope_dim/2. Two configs: dense (theta, no YaRN) + comp (YaRN). */
     float *rope_dense_cos, *rope_dense_sin;

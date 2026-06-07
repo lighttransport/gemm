@@ -1486,6 +1486,23 @@ static void *ds4f_bump(ds4f_model *m, size_t bytes, size_t align) {
     void *p = m->arena + off; m->arena_used = off + bytes; return p;
 }
 
+static int ds4f_int8kv_cal = -1;   /* DS4F_INT8KV_CAL: calibration window (default 256) */
+/* DS4F_INT8_KV: allocate the int8 KV store (kv_q, half the bf16 footprint) + the bf16
+ * calibration staging buffer + per-channel scale arrays, in-arena. The arena is sized for
+ * the bf16 cache (max_pos*KV*2); int8 (max_pos*KV + CAL*KV*2 + 3*KV*4) fits under that with
+ * slack, and only touched pages count toward RSS -> the KV footprint halves at long ctx. */
+static void ds4f_alloc_int8kv(ds4f_model *m, ds4f_layer *ly, const ds4f_config *cfg) {
+    int KV = cfg->kv_lora, CAL = ds4f_int8kv_cal > 0 ? ds4f_int8kv_cal : 256;
+    ly->kv_cache  = NULL;
+    ly->kv_q      = (int8_t   *)ds4f_bump(m, (size_t)cfg->max_pos * KV, 256);
+    ly->kv_calbuf = (uint16_t *)ds4f_bump(m, (size_t)CAL * KV * sizeof(uint16_t), 256);
+    ly->kv_scale  = (float    *)ds4f_bump(m, (size_t)KV * 4, 64);
+    ly->kv_iscale = (float    *)ds4f_bump(m, (size_t)KV * 4, 64);
+    ly->kv_absmax = (float    *)ds4f_bump(m, (size_t)KV * 4, 64);
+    ly->kv_caln = 0; ly->kv_frozen = 0;
+    for (int d = 0; d < KV; d++) ly->kv_absmax[d] = 0.f;
+}
+
 /* type-safe deterministic fill LUTs (avoid FP8-NaN / E8M0-NaN, keep magnitudes small) */
 static const uint16_t ds4f_bf16_fill[16] = { /* small ~±0.5..±0.06 bf16 */
     0x3F00,0xBE80,0x3E00,0xBD80,0x3D00,0xBC80,0x3C00,0xBC00,
@@ -1678,6 +1695,10 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     {   const char *e = getenv("DS4F_TIERB2");
         m->tierb2 = (e && *e && atoi(e)) ? 1 : 0; }
     if (m->tierb2) m->exact = 1;   /* Tier-B2 reuses the exact q-norm/RoPE/window path */
+    {   const char *e = getenv("DS4F_INT8_KV");  m->int8_kv = (e && *e && atoi(e)) ? 1 : 0; }
+    {   const char *e = getenv("DS4F_INT8KV_CAL"); ds4f_int8kv_cal = (e && *e) ? atoi(e) : 256;
+        if (ds4f_int8kv_cal < 1) ds4f_int8kv_cal = 1; }
+    if (m->int8_kv) m->exact = 1;   /* int8 KV uses the exact streaming decode path */
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
     m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
@@ -1742,7 +1763,8 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
             ly->hc_ffn_fn     = (float *)ds4f_bump(m, (size_t)mix*hd*4, 256);
             ly->hc_ffn_base   = (float *)ds4f_bump(m, (size_t)mix*4, 64);
             ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3*4, 64); }
-        ly->kv_cache   = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos*cfg.kv_lora*sizeof(uint16_t), 256);
+        if (m->int8_kv) ds4f_alloc_int8kv(m, ly, &cfg);            /* int8 KV store (half) + calbuf + scales */
+        else ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos*cfg.kv_lora*sizeof(uint16_t), 256);
     }
 
     /* parallel first-touch fill of all quantized tensors (compute-thread ==
@@ -2267,7 +2289,13 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
      * (svdot, ~1 B/elem -> halves dense matvec HBM bytes AND reclaims the bf16 src).
      * Was only wired into ds4f_alloc_synth; mirror it here so the REAL path honors it. */
     { const char *e = getenv("DS4F_Q8_DENSE");  m->q8_dense  = (e && *e && atoi(e)) ? 1 : 0; }
+    /* DS4F_INT8_KV=1: store the kv latent as int8 + static per-channel scale (S5) -> half
+     * the KV footprint at long ctx. Streaming exact decode path only (see ds4f_layer.kv_q). */
+    { const char *e = getenv("DS4F_INT8_KV");   m->int8_kv   = (e && *e && atoi(e)) ? 1 : 0; }
+    { const char *e = getenv("DS4F_INT8KV_CAL"); ds4f_int8kv_cal = (e && *e) ? atoi(e) : 256;
+      if (ds4f_int8kv_cal < 1) ds4f_int8kv_cal = 1; }
     if (m->tierb2) m->exact = 1;   /* Tier-B2 reuses the exact q-norm/RoPE/window path */
+    if (m->int8_kv) m->exact = 1;  /* int8 KV uses the exact streaming decode path */
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
     m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
@@ -2331,7 +2359,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             ly->hc_ffn_fn     = (float *)ds4f_bump(m, (size_t)mix * hd * 4, 256);
             ly->hc_ffn_base   = (float *)ds4f_bump(m, (size_t)mix * 4, 64);
             ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3 * 4, 64); }
-        ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos * cfg.kv_lora * sizeof(uint16_t), 256);
+        if (m->int8_kv) ds4f_alloc_int8kv(m, ly, &cfg);            /* int8 KV store (half) + calbuf + scales */
+        else ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos * cfg.kv_lora * sizeof(uint16_t), 256);
     }
     if (m->tierb2) ds4f_alloc_tb2(m, 0);   /* off-arena compressor/indexer (load by name below) */
 
@@ -2493,6 +2522,77 @@ static inline void ds4f_sve_axpy_f32(float *out, const float *k, float w, int n)
         svst1_f32(pg, out + d, svmla_f32_x(pg, svld1_f32(pg, out + d), svld1_f32(pg, k + d), wv));
     }
 }
+/* ---- int8 KV (DS4F_INT8_KV) codec: per-channel-scale dequant dot/axpy --------------
+ * The int8 store kv_q is dequantized in-lane as (int8 -> f32) * kv_scale[channel]. Same
+ * SVE structure as the bf16 widen path (svld1uh<<16) but with svld1sb (sign-extend int8)
+ * + svcvt + a per-channel scale multiply. The dot's horizontal reduction reorders (tiny
+ * f32 reorder, argmax-safe like the bf16 dot); the axpy keeps j-outer so per-lane
+ * accumulation order matches scalar. LOSSY by int8 (~1% rel) on top of that. */
+static inline float ds4f_sve_dot_i8s(const float *q, const int8_t *k, const float *sc, int n) {
+    svfloat32_t acc = svdup_f32(0.f);
+    for (int d = 0; d < n; d += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(d, n);
+        svfloat32_t kf = svcvt_f32_s32_x(pg, svld1sb_s32(pg, k + d));
+        kf = svmul_f32_x(pg, kf, svld1_f32(pg, sc + d));
+        acc = svmla_f32_x(pg, acc, svld1_f32(pg, q + d), kf);
+    }
+    return svaddv_f32(svptrue_b32(), acc);
+}
+static inline void ds4f_sve_axpy_i8s(float *out, const int8_t *k, const float *sc, float w, int n) {
+    svfloat32_t wv = svdup_f32(w);
+    for (int d = 0; d < n; d += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(d, n);
+        svfloat32_t kf = svcvt_f32_s32_x(pg, svld1sb_s32(pg, k + d));
+        kf = svmul_f32_x(pg, kf, svld1_f32(pg, sc + d));
+        svst1_f32(pg, out + d, svmla_f32_x(pg, svld1_f32(pg, out + d), kf, wv));
+    }
+}
+static inline float ds4f_scalar_dot_i8s(const float *q, const int8_t *k, const float *sc, int n) {
+    float s = 0.f; for (int d = 0; d < n; d++) s += q[d] * ((float)k[d] * sc[d]); return s;
+}
+static inline void ds4f_scalar_axpy_i8s(float *out, const int8_t *k, const float *sc, float w, int n) {
+    for (int d = 0; d < n; d++) out[d] += w * ((float)k[d] * sc[d]);
+}
+/* quantize one f32 latent row -> int8 with per-channel iscale (clamp to +/-127). */
+static inline void ds4f_kv_quant_row(const float *src, int8_t *dst, const float *iscale, int KV) {
+    for (int d = 0; d < KV; d++) {
+        int v = (int)lrintf(src[d] * iscale[d]);
+        if (v > 127) v = 127; else if (v < -127) v = -127;
+        dst[d] = (int8_t)v;
+    }
+}
+/* finalize the per-channel scale from the accumulated absmax and quantize the bf16
+ * calibration staging buffer into the int8 store. Called once per layer when the CAL-th
+ * position arrives (streaming) or at warm time (all positions present). */
+static void ds4f_kv_freeze(ds4f_layer *ly, int KV) {
+    for (int d = 0; d < KV; d++) {
+        float s = ly->kv_absmax[d] / 127.f; if (s < 1e-12f) s = 1e-12f;
+        ly->kv_scale[d] = s; ly->kv_iscale[d] = 1.f / s;
+    }
+    for (int p = 0; p < ly->kv_caln; p++) {
+        const uint16_t *src = ly->kv_calbuf + (size_t)p * KV;
+        int8_t *dst = ly->kv_q + (size_t)p * KV;
+        for (int d = 0; d < KV; d++) {
+            int v = (int)lrintf(ds4f_bf16f(src[d]) * ly->kv_iscale[d]);
+            if (v > 127) v = 127; else if (v < -127) v = -127;
+            dst[d] = (int8_t)v;
+        }
+    }
+    ly->kv_frozen = 1;
+}
+/* streaming append of one f32 latent at absolute `pos` into the int8 KV store. Stages to
+ * the bf16 calbuf (accumulating per-channel absmax) until CAL positions are seen, then
+ * freezes and quantizes directly. Positions arrive in order (pos == kv_caln pre-freeze). */
+static inline void ds4f_kv_append_i8(ds4f_layer *ly, const float *lat, int pos, int KV, int CAL) {
+    if (ly->kv_frozen) { ds4f_kv_quant_row(lat, ly->kv_q + (size_t)pos * KV, ly->kv_iscale, KV); return; }
+    if (pos >= CAL) { ds4f_kv_freeze(ly, KV); ds4f_kv_quant_row(lat, ly->kv_q + (size_t)pos * KV, ly->kv_iscale, KV); return; }
+    uint16_t *cb = ly->kv_calbuf + (size_t)pos * KV;
+    for (int d = 0; d < KV; d++) {
+        float v = lat[d]; cb[d] = ds4f_f32bf(v);
+        float a = v < 0 ? -v : v; if (a > ly->kv_absmax[d]) ly->kv_absmax[d] = a;
+    }
+    ly->kv_caln = pos + 1;
+}
 static int ds4f_attn_sve = -1;     /* DS4F_ATTN_SVE (default 1); 0 => scalar reference */
 
 /* ===================== attention (pooled over heads) ===================== */
@@ -2626,15 +2726,22 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
     int h0 = per*tid + (tid < extra ? tid : extra);
     int h1 = h0 + per + (tid < extra ? 1 : 0);
     int sve = ds4f_attn_sve;
+    int i8 = (m->int8_kv && ly->kv_frozen); const float *kvsc = ly->kv_scale;  /* int8 KV */
+    /* pre-freeze (calibration window) the window latents live in the bf16 calbuf, not kv_cache
+     * (NULL under int8_kv) nor kv_q (not yet quantized); freeze migrates calbuf->kv_q between
+     * tokens, so every written pos is wholly in one store -- no straddle. */
+    const uint16_t *kvbf = (m->int8_kv && !ly->kv_frozen) ? ly->kv_calbuf : ly->kv_cache;
     float *sc = (float *)alloca((size_t)nP * 4);
     for (int h = h0; h < h1; h++) {
         const float *q = m->s_q + (size_t)h*HD;
         float mx = -1e30f;
         for (int j = 0; j < nP; j++) {
-            const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
             float s;                                                      /* HD==KV (512) */
-            if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
-            else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); }
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+                s = sve ? ds4f_sve_dot_i8s(q, kc, kvsc, KV) : ds4f_scalar_dot_i8s(q, kc, kvsc, KV); }
+            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+                if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
+                else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); } }
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
         }
         float snk = ly->attn_sink[h];
@@ -2645,9 +2752,11 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int j = 0; j < nP; j++) {
             float w = sc[j]*inv;
-            const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
-            else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+                if (sve) ds4f_sve_axpy_i8s(out, kc, kvsc, w, HD); else ds4f_scalar_axpy_i8s(out, kc, kvsc, w, HD); }
+            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+                if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
+                else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]); }
         }
         ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, half, 1);  /* de-rotate */
     }
@@ -2714,15 +2823,22 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
     int h0 = per*tid + (tid < extra ? tid : extra);
     int h1 = h0 + per + (tid < extra ? 1 : 0);
     int sve = ds4f_attn_sve;
+    int i8 = (m->int8_kv && ly->kv_frozen); const float *kvsc = ly->kv_scale;  /* int8 KV */
+    /* pre-freeze (calibration window) the window latents live in the bf16 calbuf, not kv_cache
+     * (NULL under int8_kv) nor kv_q (not yet quantized); freeze migrates calbuf->kv_q between
+     * tokens, so every written pos is wholly in one store -- no straddle. */
+    const uint16_t *kvbf = (m->int8_kv && !ly->kv_frozen) ? ly->kv_calbuf : ly->kv_cache;
     float *sc = (float *)alloca((size_t)(total > 0 ? total : 1) * 4);
     for (int h = h0; h < h1; h++) {
         const float *q = m->s_q + (size_t)h*HD;
         float mx = -1e30f;
-        for (int j = 0; j < nP; j++) {                          /* window term (bf16 kv_cache) */
-            const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+        for (int j = 0; j < nP; j++) {                          /* window term (kv_cache) */
             float s;
-            if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
-            else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); }
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+                s = sve ? ds4f_sve_dot_i8s(q, kc, kvsc, KV) : ds4f_scalar_dot_i8s(q, kc, kvsc, KV); }
+            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+                if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
+                else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); } }
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
         }
         for (int j = 0; j < nsel; j++) {                        /* compressed term (f32 cmp_kv) */
@@ -2738,9 +2854,12 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         float *out = m->s_attn + (size_t)h*HD;
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int j = 0; j < nP; j++) {
-            float w = sc[j]*inv; const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
-            if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
-            else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
+            float w = sc[j]*inv;
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+                if (sve) ds4f_sve_axpy_i8s(out, kc, kvsc, w, HD); else ds4f_scalar_axpy_i8s(out, kc, kvsc, w, HD); }
+            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+                if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
+                else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]); }
         }
         for (int j = 0; j < nsel; j++) {
             float w = sc[nP + j]*inv; const float *kc = cmp + (size_t)sel[j]*KV;
@@ -2858,19 +2977,44 @@ static void ds4f_topk_exact(const float *logits, const float *bias, int n, int k
 static void ds4f_warm_kv(ds4f_model *m, int npos) {
     int KV = m->cfg.kv_lora;
     if (npos > m->cfg.max_pos) npos = m->cfg.max_pos;
+    int CAL = ds4f_int8kv_cal;
+    #define DS4F_WARMKV_NEXT() ( s += 0x9E3779B97F4A7C15ull, \
+        z = s, z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull, \
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull, z ^= (z >> 31), \
+        (float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f )
     for (int L = 0; L < m->cfg.n_layers; L++) {
-        uint16_t *kc = m->layers[L].kv_cache;
-        uint64_t s = 0x4B7700D5F0ull ^ ((uint64_t)L << 40);
-        for (int p = 0; p < npos; p++) {
-            uint16_t *row = kc + (size_t)p*KV;
-            for (int d = 0; d < KV; d++) {
-                s += 0x9E3779B97F4A7C15ull;
-                uint64_t z = s; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-                z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= (z >> 31);
-                row[d] = ds4f_f32bf((float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f);
+        ds4f_layer *ly = &m->layers[L];
+        uint64_t s = 0x4B7700D5F0ull ^ ((uint64_t)L << 40), z;
+        if (m->int8_kv) {
+            for (int d = 0; d < KV; d++) ly->kv_absmax[d] = 0.f;
+            int caln = npos < CAL ? npos : CAL;
+            for (int p = 0; p < caln; p++) {           /* stage calibration window (bf16) + absmax */
+                uint16_t *row = ly->kv_calbuf + (size_t)p*KV;
+                for (int d = 0; d < KV; d++) {
+                    float v = DS4F_WARMKV_NEXT(); row[d] = ds4f_f32bf(v);
+                    float a = v < 0 ? -v : v; if (a > ly->kv_absmax[d]) ly->kv_absmax[d] = a;
+                }
+            }
+            ly->kv_caln = caln;
+            if (npos >= CAL) {                         /* full window -> freeze + quantize the rest int8 */
+                ds4f_kv_freeze(ly, KV);
+                for (int p = CAL; p < npos; p++) {
+                    int8_t *row = ly->kv_q + (size_t)p*KV;
+                    for (int d = 0; d < KV; d++) {
+                        int iv = (int)lrintf(DS4F_WARMKV_NEXT() * ly->kv_iscale[d]);
+                        if (iv > 127) iv = 127; else if (iv < -127) iv = -127; row[d] = (int8_t)iv;
+                    }
+                }
+            }
+        } else {
+            uint16_t *kc = ly->kv_cache;
+            for (int p = 0; p < npos; p++) {
+                uint16_t *row = kc + (size_t)p*KV;
+                for (int d = 0; d < KV; d++) row[d] = ds4f_f32bf(DS4F_WARMKV_NEXT());
             }
         }
     }
+    #undef DS4F_WARMKV_NEXT
 }
 
 /* ===================== Tier-B2 compressed-state warm (ctx benchmark) =====================
@@ -3309,6 +3453,8 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     if (ds4f_prof_on < 0) { const char *e = getenv("DS4F_PROF"); ds4f_prof_on = e ? atoi(e) : 0; }
     if (!m->exact || m->mhc || m->tierb2) {
         fprintf(stderr, "ds4f_forward_prefill requires exact && !mhc && !tierb2\n"); abort(); }
+    if (m->int8_kv) {   /* batched kvpost/attn workers read the bf16 kv_cache (NULL under int8 KV) */
+        fprintf(stderr, "ds4f_forward_prefill incompatible with DS4F_INT8_KV (use token-at-a-time)\n"); abort(); }
     if (!m->p_x || m->m_tile < M) { fprintf(stderr, "prefill batch buffers too small (m_tile=%d M=%d)\n", m->m_tile, M); abort(); }
     for (int mm = 0; mm < M; mm++) memcpy(m->p_x + (size_t)mm*C, X + (size_t)mm*C, (size_t)C*4);
 
@@ -3475,7 +3621,8 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         if (m->exact)                                            /* RoPE the kv rope dims */
             ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
         ds4f_chk("kvlat", L, m->s_kvlat, KV);
-        { uint16_t *dst = ly->kv_cache + (size_t)pos*KV;                  /* append latent (f32->bf16) */
+        if (m->int8_kv) ds4f_kv_append_i8(ly, m->s_kvlat, pos, KV, ds4f_int8kv_cal);  /* int8 KV (S5) */
+        else { uint16_t *dst = ly->kv_cache + (size_t)pos*KV;             /* append latent (f32->bf16) */
           for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(m->s_kvlat[d]); }
         DS4F_TOC(DS4F_P_QKV); }
         /* ---- Tier-B2 compressor/indexer step (timed apart from the attn worker) ---- */
