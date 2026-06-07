@@ -105,7 +105,8 @@ int main(void) {
     int dense_mxfp4 = envi("DS4F_DENSE_MXFP4", 0);      /* overrides FP8/BF16: 0.53 B/elem */
     const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
     int bf16_pv = (pv_e && *pv_e) ? (atoi(pv_e) != 0) : dense_bf16;
-    size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16);
+    size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16,
+                                       envi("DS4F_TIERB2", 0) && !envi("DS4F_INT8_KV", 0));
     const char *dlabel = dense_mxfp4 ? "MXFP4(split,0.53B)" :
                          dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)";
     printf("arena reservation: %.2f GB   dense=%s\n", arena_est / (1024.0*1024.0*1024.0), dlabel);

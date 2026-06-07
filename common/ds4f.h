@@ -199,6 +199,14 @@ typedef struct {
      * model's 8-bit-mantissa reference precision (faithful, not lossy). Codec:
      * ds4f_bf16f (bf16->f32 lsl) / ds4f_f32bf (f32->bf16 round) in ds4f_impl.h. */
     uint16_t *kv_cache;
+    /* kv_cache capacity in positions, and the modulus for ring indexing. Under tierb2,
+     * sparse (compress_ratio!=0) layers only ever read the last window_size positions of
+     * kv_cache (older history is served by cmp_kv), so they ring-buffer at
+     * kv_slots==window_size; everything else (dense layers, non-tierb2 modes, int8_kv)
+     * keeps kv_slots==max_pos. All kv_cache indexing is (idx % kv_slots) -- when
+     * kv_slots==max_pos the modulus is a no-op (idx<max_pos), so it is bit-exact. Caps the
+     * kv_cache ctx-scaling cost to the 2 dense layers (long-ctx memory lever -> ~1M). */
+    int kv_slots;
     /* ---- int8 KV cache (DS4F_INT8_KV; S5 static per-channel scale) ----
      * Halves the KV footprint (the 256k-ctx memory dominator). The kv latent's
      * massive-activation channels (~1e3..1e5, positionally CONSISTENT) make naive
