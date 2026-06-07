@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "moe_grid_data.h"
 
 #if defined(__SSE4_2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
 #include <nmmintrin.h>
@@ -5218,10 +5219,14 @@ struct cuda_llm_runner {
     CUmodule moe_gpu_mod;
     CUfunction fn_moe_topk_gpu;
     CUfunction fn_moe_shared_gate_gpu;
+    CUfunction fn_moe_expert_fused;
     CUdeviceptr d_topk_idx;   /* [8] int */
     CUdeviceptr d_topk_wgt;   /* [8] float */
     int h_topk_idx[8];
     float h_topk_wgt[8];
+    CUdeviceptr d_grid_ksigns;  /* grid tables for cubin kernels */
+    CUdeviceptr d_grid_iq2s;
+    CUdeviceptr d_grid_iq3;
     /* Host-side PLE data (mmap pointers from GGUF, valid while GGUF is open) */
     qtensor h_ple_token_embd;       /* Q8_0 per_layer_token_embd */
     qtensor h_ple_model_proj;       /* BF16 per_layer_model_proj */
@@ -5599,6 +5604,9 @@ lookup_funcs:
                 if(cuModuleLoadData(&r->moe_gpu_mod,d)==CUDA_SUCCESS){
                     cuModuleGetFunction(&r->fn_moe_topk_gpu,r->moe_gpu_mod,"moe_topk_gpu");
                     cuModuleGetFunction(&r->fn_moe_shared_gate_gpu,r->moe_gpu_mod,"moe_shared_gate_gpu");
+                    cuModuleGetFunction(&r->fn_moe_expert_fused,r->moe_gpu_mod,"moe_expert_fused");
+                    /* Allocate and upload grid tables (passed as kernel params to avoid device global issues) */
+                    r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
                 }free(d);}else fclose(fp);
             }
         }
@@ -9354,87 +9362,114 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             int n_used = r->n_experts_used;
             int expert_ff = r->expert_ff;
             int shared_expert_ff = r->shared_expert_ff;
-            int topk_h_idx[8];
-            float topk_h_wgt[8];
 
             launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
                              cl->moe_gate_rows, cl->moe_gate_cols);
 
-            if (r->fn_moe_topk_gpu) {
+            /* Fused decode: GPU top-k + 8 parallel expert blocks + shared gate */
+            /* NOTE: moe_expert_fused disabled (dequant produces NaN — pointer issue in cubin).
+             * Use fallback path below until the cubin kernel is fixed. */
+            if (0 && r->fn_moe_expert_fused && r->fn_moe_topk_gpu) {
                 if (!r->d_topk_idx) cuMemAlloc(&r->d_topk_idx, 8 * sizeof(int));
                 if (!r->d_topk_wgt) cuMemAlloc(&r->d_topk_wgt, 8 * sizeof(float));
-                void *tk_args[] = { &r->d_topk_idx, &r->d_topk_wgt,
-                                    &r->d_router_logits, &n_experts, &n_used };
-                CUresult _ce = cuLaunchKernel(r->fn_moe_topk_gpu, 1, 1, 1, 128, 1, 1,
-                              0, r->stream, tk_args, NULL);
-                if (_ce != CUDA_SUCCESS) fprintf(stderr, "  [MoE] topk launch err=%d\n", (int)_ce);
-                cuMemcpyDtoHAsync(r->h_topk_idx, r->d_topk_idx, 8 * sizeof(int), r->stream);
-                cuMemcpyDtoHAsync(r->h_topk_wgt, r->d_topk_wgt, 8 * sizeof(float), r->stream);
-                _ce = cuStreamSynchronize(r->stream);
-                if (_ce != CUDA_SUCCESS) fprintf(stderr, "  [MoE] topk sync err=%d\n", (int)_ce);
-                for (int i = 0; i < 8; i++) { topk_h_idx[i] = r->h_topk_idx[i]; topk_h_wgt[i] = r->h_topk_wgt[i]; }
+                /* Lazy upload of grid tables to device (cubin kernels need them as params) */
+                if (!r->d_grid_ksigns) {
+                    /* data from moe_grid_data.h */
+                    /* data from moe_grid_data.h */
+                    /* data from moe_grid_data.h */
+                    // Can't use #include here directly — arrays are defined elsewhere
+                    // For now, allocate and the data will be filled below
+                }
+
+                void *tka[] = { &r->d_topk_idx, &r->d_topk_wgt,
+                                &r->d_router_logits, &n_experts, &n_used };
+                cuLaunchKernel(r->fn_moe_topk_gpu, 1,1,1, 128,1,1, 0, r->stream, tka, NULL);
+
+                cuMemsetD32(r->d_moe_accum, 0, n_embd);
+
+                {
+                    if (!r->d_grid_ksigns) {
+                        fprintf(stderr, "  [MoE] uploading grid tables...\n");
+                        CUresult ge = cuMemAlloc(&r->d_grid_ksigns, sizeof(_grid_ksigns));
+                        ge |= cuMemAlloc(&r->d_grid_iq2s, sizeof(_grid_iq2s));
+                        ge |= cuMemAlloc(&r->d_grid_iq3, sizeof(_grid_iq3));
+                        if (ge != CUDA_SUCCESS) {
+                            fprintf(stderr, "  [MoE] grid alloc failed!\n");
+                            r->d_grid_ksigns = 0;
+                        } else {
+                            cuMemcpyHtoD(r->d_grid_ksigns, _grid_ksigns, sizeof(_grid_ksigns));
+                            cuMemcpyHtoD(r->d_grid_iq2s, _grid_iq2s, sizeof(_grid_iq2s));
+                            cuMemcpyHtoD(r->d_grid_iq3, _grid_iq3, sizeof(_grid_iq3));
+                        }
+                    }
+                    CUdeviceptr d_ge = cl->moe_gate_exps_w;
+                    CUdeviceptr d_ue = cl->moe_up_exps_w;
+                    CUdeviceptr d_de = cl->moe_down_exps_w;
+                    void *efa[] = { &r->d_moe_accum, &r->d_xb,
+                                    &r->d_topk_idx, &r->d_topk_wgt,
+                                    &d_ge, &d_ue, &d_de,
+                                    &n_embd, &expert_ff,
+                                    &cl->moe_exp_stride_gu, &cl->moe_exp_stride_d,
+                                    &r->d_grid_ksigns, &r->d_grid_iq2s, &r->d_grid_iq3 };
+                    cuLaunchKernel(r->fn_moe_expert_fused, n_used,1,1, 128,1,1,
+                                   0, r->stream, efa, NULL);
+                }
+
+                {
+                    void *sga[] = { &r->d_topk_wgt, &r->d_xb,
+                                    &cl->moe_shared_gate_w, &n_embd };
+                    cuLaunchKernel(r->fn_moe_shared_gate_gpu, 1,1,1, 128,1,1,
+                                   0, r->stream, sga, NULL);
+                }
+
+                {
+                    float shared_scale;
+                    cuMemcpyDtoH(&shared_scale, r->d_topk_wgt, sizeof(float));
+                    launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                                      cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+                    launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                                      cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+                    launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+                    launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                                      cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+                    launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
+                }
+
+                cuMemcpyDtoDAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float), r->stream);
             } else {
+                /* Fallback: CPU top-k + per-expert matvecs */
                 cuStreamSynchronize(r->stream);
                 cuMemcpyDtoH(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float));
                 int tki[64]; float tkw[64];
                 moe_topk_softmax(r->h_router_logits, n_experts, n_used, tki, tkw);
-                for (int i = 0; i < 8; i++) { topk_h_idx[i] = tki[i]; topk_h_wgt[i] = tkw[i]; }
-            }
-
-            cuMemsetD32(r->d_moe_accum, 0, n_embd);
-
-            if (r->debug_layers >= 2 && l == 0) {
-                fprintf(stderr, "  [L0 MoE] topk:");
-                for (int i = 0; i < n_used; i++) fprintf(stderr, " e%d(%.4f)", topk_h_idx[i], topk_h_wgt[i]);
-                fprintf(stderr, "\n");
-            }
-            for (int e = 0; e < n_used; e++) {
-                int eidx = topk_h_idx[e];
-                float wgt = topk_h_wgt[e];
-                if (eidx < 0 || eidx >= n_experts) {
-                    fprintf(stderr, "cuda_llm: invalid expert idx %d at layer %d\n", eidx, l);
-                    eidx = e % n_experts; /* safe fallback */
-                    wgt = 0.0f;
+                int hti[8]; float htw[8];
+                for (int i = 0; i < 8; i++) { hti[i] = tki[i]; htw[i] = tkw[i]; }
+                cuMemsetD32(r->d_moe_accum, 0, n_embd);
+                for (int e = 0; e < n_used; e++) {
+                    int eidx = hti[e]; float wgt = htw[e];
+                    if (eidx < 0 || eidx >= n_experts) continue;
+                    CUdeviceptr gw = cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu;
+                    CUdeviceptr uw = cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu;
+                    CUdeviceptr dw = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
+                    launch_matvec_auto(r, r->d_gate, gw, r->d_xb, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
+                    launch_matvec_auto(r, r->d_up, uw, r->d_xb, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
+                    launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
+                    launch_matvec_auto(r, r->d_xb2, dw, r->d_gate, cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
+                    launch_scale_add(r, r->d_moe_accum, r->d_xb2, wgt, n_embd);
                 }
-                CUdeviceptr gw = cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu;
-                CUdeviceptr uw = cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu;
-                CUdeviceptr dw = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
-                launch_matvec_auto(r, r->d_gate, gw, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
-                launch_matvec_auto(r, r->d_up, uw, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
-                launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
-                launch_matvec_auto(r, r->d_xb2, dw, r->d_gate,
-                                  cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
-                launch_scale_add(r, r->d_moe_accum, r->d_xb2, wgt, n_embd);
-            }
-
-            /* Shared expert */
-            {
-                float shared_scale;
-                if (r->fn_moe_shared_gate_gpu) {
-                    void *sg_args[] = { &r->d_topk_wgt, &r->d_xb,
-                                        &cl->moe_shared_gate_w, &n_embd };
-                    cuLaunchKernel(r->fn_moe_shared_gate_gpu, 1, 1, 1, 128, 1, 1,
-                                  0, r->stream, sg_args, NULL);
-                    cuMemcpyDtoH(&shared_scale, r->d_topk_wgt, sizeof(float));
-                } else {
+                {
                     launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
                     cuStreamSynchronize(r->stream);
                     float gv; cuMemcpyDtoH(&gv, r->d_router_logits, sizeof(float));
-                    shared_scale = 1.0f / (1.0f + expf(-gv));
+                    float shared_scale = 1.0f / (1.0f + expf(-gv));
+                    launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb, cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+                    launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb, cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+                    launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+                    launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate, cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+                    launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
                 }
-                launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
-                                  cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
-                launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
-                                  cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
-                launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
-                launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
-                                  cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
-                launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
+                cuMemcpyDtoDAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float), r->stream);
             }
-
-            cuMemcpyDtoDAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float), r->stream);
         } else {
             /* ---- Dense FFN ---- */
             /* FFN gate and up projections (fused, dp4a when Q8_0) */
@@ -11172,6 +11207,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_moe_accum)    cuMemFree(r->d_moe_accum);
     if (r->d_topk_idx)    cuMemFree(r->d_topk_idx);
     if (r->d_topk_wgt)    cuMemFree(r->d_topk_wgt);
+    if (r->d_grid_ksigns) cuMemFree(r->d_grid_ksigns);
+    if (r->d_grid_iq2s)   cuMemFree(r->d_grid_iq2s);
+    if (r->d_grid_iq3)    cuMemFree(r->d_grid_iq3);
     if (r->moe_gpu_mod)   cuModuleUnload(r->moe_gpu_mod);
     if (r->d_hidden_snapshots) cuMemFree(r->d_hidden_snapshots);
     free(r->h_router_logits);
