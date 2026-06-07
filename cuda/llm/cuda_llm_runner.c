@@ -4184,6 +4184,31 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
 "}\n"
 "\n"
+"/* Gather rows from batch buffer: dst[rows, cols] = src[indices[row], cols] */\n"
+"__global__ void gather_rows_f32(float *dst, const float *src, const int *indices,\n"
+"                                 int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int idx = indices[row];\n"
+"    const float *s = src + (size_t)idx * n_cols;\n"
+"    float *d = dst + (size_t)row * n_cols;\n"
+"    for (int col = threadIdx.x; col < n_cols; col += blockDim.x)\n"
+"        d[col] = s[col];\n"
+"}\n"
+"\n"
+"/* Scatter-add weighted results: dst[indices[row], cols] += weight[row] * src[row, cols] */\n"
+"__global__ void scatter_add_weighted_f32(float *dst, const float *src, const int *indices,\n"
+"                                          const float *weights, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int idx = indices[row];\n"
+"    float w = weights[row];\n"
+"    float *d = dst + (size_t)idx * n_cols;\n"
+"    const float *s = src + (size_t)row * n_cols;\n"
+"    for (int col = threadIdx.x; col < n_cols; col += blockDim.x)\n"
+"        d[col] += w * s[col];\n"
+"}\n"
+"\n"
 "/* MoE top-k selection: for each token, find top-k expert indices and sigmoid weights */\n"
 "/* Input: logits[n_tokens, n_experts] F32 */\n"
 "/* Output: indices[n_tokens, k] int32, weights[n_tokens, k] float (pre-softmax sigmoid) */\n"
@@ -4956,6 +4981,8 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_iq4_nl;
     CUfunction fn_batch_matvec_iq4_xs;
     CUfunction fn_moe_topk_kernel;
+    CUfunction fn_gather_rows_f32;
+    CUfunction fn_scatter_add_weighted_f32;
     CUfunction fn_dequant_iq2_s_to_f16;
     CUfunction fn_dequant_iq2_xxs_to_f16;
     CUfunction fn_dequant_iq3_xxs_to_f16;
@@ -5371,6 +5398,8 @@ lookup_funcs:
     GET_FUNC(batch_matvec_iq4_nl);
     GET_FUNC(batch_matvec_iq4_xs);
     GET_FUNC(moe_topk_kernel);
+    GET_FUNC(gather_rows_f32);
+    GET_FUNC(scatter_add_weighted_f32);
     GET_FUNC(dequant_iq2_s_to_f16);
     GET_FUNC(dequant_iq2_xxs_to_f16);
     GET_FUNC(dequant_iq3_xxs_to_f16);
@@ -8147,7 +8176,8 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
 /* Forward declaration for MoE cuBLAS helper (used in cuda_llm_forward_blocks) */
 static int launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
     CUdeviceptr dst, int expert_idx, int is_down,
-    CUdeviceptr x, int out_dim, int in_dim);
+    CUdeviceptr x, int n_tokens, int out_dim, int in_dim,
+    CUdeviceptr d_x_f16);
 
 static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int apply_final_norm, int copy_to_host);
 
@@ -9196,13 +9226,13 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 CUdeviceptr down_w = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
 
                 /* gate = expert_gate @ xb, up = expert_up @ xb */
-                if (launch_moe_expert_cublas(r, cl, r->d_gate, eidx, 0, r->d_xb,
-                                              expert_ff, n_embd) != 0)
+                if (launch_moe_expert_cublas(r, cl, r->d_gate, eidx, 0, r->d_xb, 1,
+                                              expert_ff, n_embd, 0) != 0)
                     launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
                                       cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
 
-                if (launch_moe_expert_cublas(r, cl, r->d_up, eidx, 0, r->d_xb,
-                                              expert_ff, n_embd) != 0)
+                if (launch_moe_expert_cublas(r, cl, r->d_up, eidx, 0, r->d_xb, 1,
+                                              expert_ff, n_embd, 0) != 0)
                     launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
                                       cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
 
@@ -9254,8 +9284,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
 
                 /* down = expert_down @ gate → d_xb2 */
-                if (launch_moe_expert_cublas(r, cl, r->d_xb2, eidx, 1, r->d_gate,
-                                              cl->moe_exp_rows_d, cl->moe_exp_cols_d) != 0)
+                if (launch_moe_expert_cublas(r, cl, r->d_xb2, eidx, 1, r->d_gate, 1,
+                                              cl->moe_exp_rows_d, cl->moe_exp_cols_d, 0) != 0)
                     launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
                                       cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
 
@@ -9687,10 +9717,13 @@ static void launch_batch_embed_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
 }
 
 /* Helper: ensure F16 shadow exists for MoE expert, then run cuBLAS matvec.
+ * n_tokens = 1 for single-token decode, >1 for batched prefill.
+ * If d_x_f16 is non-zero, use it as pre-converted F16 input (avoids re-conversion).
  * Returns 0 on success (cuBLAS used), -1 to fall back to custom kernel. */
-static int __attribute__((used)) launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
+static int launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
     CUdeviceptr dst, int expert_idx, int is_down,
-    CUdeviceptr x, int out_dim, int in_dim) {
+    CUdeviceptr x, int n_tokens, int out_dim, int in_dim,
+    CUdeviceptr d_x_f16) {
     if (!r->use_cublas || !r->cublas) return -1;
     
     CUdeviceptr *w_f16;
@@ -9724,7 +9757,6 @@ static int __attribute__((used)) launch_moe_expert_cublas(cuda_llm_runner *r, cu
         if (expert_idx >= max_experts) return -1; /* Can't lazy-upload, fall back */
         
         if (!*w_f16) {
-            /* Allocate F16 buffer for up to 96 experts (384 MB) to avoid OOM */
             size_t f16_total = (size_t)rows * cols * sizeof(uint16_t) * max_experts;
             CUresult err = cuMemAlloc(w_f16, f16_total);
             if (err != CUDA_SUCCESS) return -1;
@@ -9736,24 +9768,29 @@ static int __attribute__((used)) launch_moe_expert_cublas(cuda_llm_runner *r, cu
         CUdeviceptr dst_ptr = *w_f16 + dst_off;
         void *args[] = { &dst_ptr, &src_ptr, &rows, &cols };
         cuLaunchKernel(fn_dequant, (rows+7)/8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-        cuStreamSynchronize(r->stream); /* Ensure dequant completes before GEMM */
+        cuStreamSynchronize(r->stream);
         cl->moe_f16_mask[word] |= (1ULL << bit);
     }
     
-    /* Convert F32 input to F16 for Blackwell F16×F16 GEMM */
-    CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
-    if (!d_x_f16) return -1;
+    /* Get or create F16 input buffer */
+    CUdeviceptr d_x_f16_local;
+    if (d_x_f16) {
+        d_x_f16_local = d_x_f16;  /* pre-converted (batched path) */
+    } else {
+        /* Single-token: convert F32→F16 on the fly */
+        d_x_f16_local = r->d_batch_f16_scratch;
+        if (!d_x_f16_local) return -1;
+        int n_elems = n_tokens * in_dim;
+        void *cv_args[] = { &d_x_f16_local, &x, &n_elems };
+        cuLaunchKernel(r->fn_convert_f32_to_f16,
+            (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, cv_args, NULL);
+    }
     
-    int n_elems = in_dim;
-    void *cv_args[] = { &d_x_f16, &x, &n_elems };
-    cuLaunchKernel(r->fn_convert_f32_to_f16,
-        (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, cv_args, NULL);
-    
-    /* cuBLAS F16×F16 GEMM: Y[1×out_dim] = X_F16[1×in_dim] × W_F16[out_dim×in_dim]^T */
+    /* cuBLAS F16×F16 GEMM: Y[n_tokens×out_dim] = X_F16[n_tokens×in_dim] × W_F16[out_dim×in_dim]^T */
     size_t f16_off = (size_t)expert_idx * rows * cols * sizeof(uint16_t);
     CUdeviceptr w_ptr = *w_f16 + f16_off;
     int ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas,
-        dst, w_ptr, d_x_f16, 1, out_dim, in_dim);
+        dst, w_ptr, d_x_f16_local, n_tokens, out_dim, in_dim);
     return (ret == 0) ? 0 : -1;
 }
 
@@ -10171,15 +10208,164 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
             cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
         }
 
-        launch_batch_matvec(r, d_batch_ff1, cl->ffn_gate_w, cl->ffn_gate_w_f16, d_batch_xb,
-                            n_ff, n_embd, n_tokens, cl->ffn_gate_type);
-        launch_batch_matvec(r, d_batch_ff2, cl->ffn_up_w, cl->ffn_up_w_f16, d_batch_xb,
-                            n_ff, n_embd, n_tokens, cl->ffn_up_type);
-        launch_silu_mul(r, d_batch_ff1, d_batch_ff2, n_tokens * n_ff);
-        launch_batch_matvec(r, d_batch_xb, cl->ffn_down_w, cl->ffn_down_w_f16, d_batch_ff1,
-                            n_embd, n_ff, n_tokens, cl->ffn_down_type);
-        launch_add(r, d_batch_x, d_batch_xb, n_tokens * n_embd);
-        if (do_prof) { cuStreamSynchronize(r->stream); prof_ffn_ms += get_time_ms() - _ft0; }
+        if (cl->is_moe) {
+            /* === Batched MoE FFN === */
+            int n_experts = r->n_experts;
+            int n_experts_used = r->n_experts_used;
+            int expert_ff = r->expert_ff;
+
+            /* 1. Router: logits[n_tokens, n_experts] = xb[n_tokens, n_embd] @ gate_inp[n_experts, n_embd]^T */
+            launch_batch_matvec(r, r->d_router_logits, cl->moe_gate_w, 0, d_batch_xb,
+                                n_experts, n_embd, n_tokens, GGML_TYPE_F32);
+
+            /* 2. Download router logits, compute top-k on CPU */
+            cuStreamSynchronize(r->stream);
+            cuMemcpyDtoH(r->h_router_logits, r->d_router_logits, (size_t)n_tokens * n_experts * sizeof(float));
+            int *h_indices = (int *)malloc((size_t)n_tokens * n_experts_used * sizeof(int));
+            float *h_weights = (float *)malloc((size_t)n_tokens * n_experts_used * sizeof(float));
+            for (int t = 0; t < n_tokens; t++) {
+                float *row = r->h_router_logits + (size_t)t * n_experts;
+                int idx[64]; float val[64];
+                for (int i = 0; i < n_experts_used; i++) { idx[i] = -1; val[i] = -1e38f; }
+                for (int e = 0; e < n_experts; e++) {
+                    float v = row[e];
+                    if (v > val[n_experts_used-1]) {
+                        val[n_experts_used-1] = v; idx[n_experts_used-1] = e;
+                        for (int i = n_experts_used-2; i >= 0 && val[i+1] > val[i]; i--) {
+                            float tv = val[i]; int ti = idx[i];
+                            val[i] = val[i+1]; idx[i] = idx[i+1];
+                            val[i+1] = tv; idx[i+1] = ti;
+                        }
+                    }
+                }
+                for (int i = 0; i < n_experts_used; i++) {
+                    h_indices[t * n_experts_used + i] = idx[i];
+                    h_weights[t * n_experts_used + i] = 1.0f / (1.0f + expf(-val[i]));
+                }
+            }
+
+            /* Zero accumulator in d_batch_xb (use as moe_accum for this layer) */
+            cuMemsetD32(d_batch_xb, 0, (size_t)n_tokens * n_embd);
+
+            /* 3. Count tokens per expert, then process each expert */
+            int *expert_counts = (int *)calloc(n_experts, sizeof(int));
+            for (int t = 0; t < n_tokens; t++)
+                for (int e = 0; e < n_experts_used; e++)
+                    expert_counts[h_indices[t * n_experts_used + e]]++;
+
+            /* Upload indices/weights to GPU */
+            int *d_idx; float *d_w;
+            cuMemAlloc(&d_idx, (size_t)n_tokens * n_experts_used * sizeof(int));
+            cuMemAlloc(&d_w, (size_t)n_tokens * n_experts_used * sizeof(float));
+            cuMemcpyHtoD(d_idx, h_indices, (size_t)n_tokens * n_experts_used * sizeof(int));
+            cuMemcpyHtoD(d_w, h_weights, (size_t)n_tokens * n_experts_used * sizeof(float));
+
+            for (int e = 0; e < n_experts; e++) {
+                int cnt = expert_counts[e];
+                if (cnt == 0) continue;
+
+                /* Build local indices: which tokens selected this expert */
+                int *local_tok = (int *)malloc(cnt * sizeof(int));
+                float *local_w = (float *)malloc(cnt * sizeof(float));
+                int pos = 0;
+                for (int t = 0; t < n_tokens; t++) {
+                    for (int ei = 0; ei < n_experts_used; ei++) {
+                        if (h_indices[t * n_experts_used + ei] == e) {
+                            local_tok[pos] = t;
+                            local_w[pos] = h_weights[t * n_experts_used + ei];
+                            pos++;
+                        }
+                    }
+                }
+
+                int *d_local_tok; float *d_local_w;
+                cuMemAlloc(&d_local_tok, cnt * sizeof(int));
+                cuMemAlloc(&d_local_w, cnt * sizeof(float));
+                cuMemcpyHtoD(d_local_tok, local_tok, cnt * sizeof(int));
+                cuMemcpyHtoD(d_local_w, local_w, cnt * sizeof(float));
+
+                /* Gather: copy cnt token vectors from d_batch_x to d_batch_ff1 */
+                {
+                    void *g_args[] = { &d_batch_ff1, &d_batch_xb, &d_local_tok, &cnt, &n_embd };
+                    cuLaunchKernel(r->fn_gather_rows_f32, cnt, 1, 1, 256, 1, 1, 0, r->stream, g_args, NULL);
+                }
+
+                /* Convert F32 gathered input → F16 */
+                int n_elems = cnt * n_embd;
+                CUdeviceptr d_gather_f16 = r->d_batch_f16_scratch;
+                if (d_gather_f16) {
+                    void *cv_args[] = { &d_gather_f16, &d_batch_ff1, &n_elems };
+                    cuLaunchKernel(r->fn_convert_f32_to_f16,
+                        (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, cv_args, NULL);
+                }
+
+                /* Gate: [cnt, expert_ff] = [cnt, n_embd] × [expert_ff, n_embd]^T */
+                CUdeviceptr gate_w = cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
+                CUdeviceptr up_w   = cl->moe_up_exps_w   + (size_t)e * cl->moe_exp_stride_gu;
+                CUdeviceptr down_w = cl->moe_down_exps_w  + (size_t)e * cl->moe_exp_stride_d;
+
+                /* Try cuBLAS on F16 shadow, fall back to per-token custom matvec */
+                if (launch_moe_expert_cublas(r, cl, d_batch_ff2, e, 0,
+                    d_batch_ff1, cnt, expert_ff, n_embd, d_gather_f16) != 0) {
+                    for (int i = 0; i < cnt; i++) {
+                        CUdeviceptr in_t = d_batch_ff1 + (size_t)i * n_embd * sizeof(float);
+                        CUdeviceptr out_t = d_batch_ff2 + (size_t)i * expert_ff * sizeof(float);
+                        launch_matvec_auto(r, out_t, gate_w, in_t, expert_ff, n_embd, cl->moe_gate_exps_type);
+                    }
+                }
+                /* Up: same pattern */
+                if (launch_moe_expert_cublas(r, cl, d_batch_mid, e, 0,
+                    d_batch_ff1, cnt, expert_ff, n_embd, d_gather_f16) != 0) {
+                    for (int i = 0; i < cnt; i++) {
+                        CUdeviceptr in_t = d_batch_ff1 + (size_t)i * n_embd * sizeof(float);
+                        CUdeviceptr out_t = d_batch_mid + (size_t)i * expert_ff * sizeof(float);
+                        launch_matvec_auto(r, out_t, up_w, in_t, expert_ff, n_embd, cl->moe_up_exps_type);
+                    }
+                }
+
+                /* SiLU(gate) * up */
+                launch_silu_mul(r, d_batch_ff2, d_batch_mid, cnt * expert_ff);
+
+                /* Down: [cnt, n_embd] = [cnt, expert_ff] × [n_embd, expert_ff]^T */
+                if (launch_moe_expert_cublas(r, cl, d_batch_ff1, e, 1,
+                    d_batch_ff2, cnt, n_embd, expert_ff, d_gather_f16) != 0) {
+                    for (int i = 0; i < cnt; i++) {
+                        CUdeviceptr in_t = d_batch_ff2 + (size_t)i * expert_ff * sizeof(float);
+                        CUdeviceptr out_t = d_batch_ff1 + (size_t)i * n_embd * sizeof(float);
+                        launch_matvec_auto(r, out_t, down_w, in_t, n_embd, expert_ff, cl->moe_down_exps_type);
+                    }
+                }
+
+                /* Scatter-add weighted: d_batch_xb[local_tok] += local_w * d_batch_ff1 */
+                {
+                    void *sa_args[] = { &d_batch_xb, &d_batch_ff1, &d_local_tok, &d_local_w, &cnt, &n_embd };
+                    cuLaunchKernel(r->fn_scatter_add_weighted_f32, cnt, 1, 1, 256, 1, 1, 0, r->stream, sa_args, NULL);
+                }
+
+                cuMemFree(d_local_tok);
+                cuMemFree(d_local_w);
+                free(local_tok);
+                free(local_w);
+            }
+
+            /* Add MoE result back to d_batch_x */
+            launch_add(r, d_batch_x, d_batch_xb, n_tokens * n_embd);
+
+            cuMemFree(d_idx); cuMemFree(d_w);
+            free(h_indices); free(h_weights); free(expert_counts);
+
+            if (do_prof) { cuStreamSynchronize(r->stream); prof_ffn_ms += get_time_ms() - _ft0; }
+        } else {
+            launch_batch_matvec(r, d_batch_ff1, cl->ffn_gate_w, cl->ffn_gate_w_f16, d_batch_xb,
+                                n_ff, n_embd, n_tokens, cl->ffn_gate_type);
+            launch_batch_matvec(r, d_batch_ff2, cl->ffn_up_w, cl->ffn_up_w_f16, d_batch_xb,
+                                n_ff, n_embd, n_tokens, cl->ffn_up_type);
+            launch_silu_mul(r, d_batch_ff1, d_batch_ff2, n_tokens * n_ff);
+            launch_batch_matvec(r, d_batch_xb, cl->ffn_down_w, cl->ffn_down_w_f16, d_batch_ff1,
+                                n_embd, n_ff, n_tokens, cl->ffn_down_type);
+            launch_add(r, d_batch_x, d_batch_xb, n_tokens * n_embd);
+            if (do_prof) { cuStreamSynchronize(r->stream); prof_ffn_ms += get_time_ms() - _ft0; }
+        }
 
         if (embeddings && l < r->n_deepstack && embd_stride > n_embd) {
             const float *base = embeddings + (size_t)(1 + l) * n_embd;
