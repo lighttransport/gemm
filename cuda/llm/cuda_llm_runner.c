@@ -4113,6 +4113,74 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
 "}\n"
 "\n"
+"/* MoE top-k selection: for each token, find top-k expert indices and sigmoid weights */\n"
+"/* Input: logits[n_tokens, n_experts] F32 */\n"
+"/* Output: indices[n_tokens, k] int32, weights[n_tokens, k] float (pre-softmax sigmoid) */\n"
+"__global__ void moe_topk_kernel(const float *logits, int *indices, float *weights,\n"
+"                                  int n_tokens, int n_experts, int k) {\n"
+"    int token = blockIdx.x;\n"
+"    if (token >= n_tokens) return;\n"
+"    const float *row = logits + (size_t)token * n_experts;\n"
+"    int tid = threadIdx.x;\n"
+"    /* Each thread scans a subset of experts, tracking top-k */\n"
+"    int best_idx[8]; float best_val[8];\n"
+"    for (int i = 0; i < k; i++) { best_idx[i] = -1; best_val[i] = -1e38f; }\n"
+"    for (int e = tid; e < n_experts; e += blockDim.x) {\n"
+"        float v = row[e];\n"
+"        if (v > best_val[k-1]) {\n"
+"            best_val[k-1] = v;\n"
+"            best_idx[k-1] = e;\n"
+"            /* Insertion sort: bubble down */\n"
+"            for (int i = k-2; i >= 0 && best_val[i+1] > best_val[i]; i--) {\n"
+"                float tv = best_val[i]; int ti = best_idx[i];\n"
+"                best_val[i] = best_val[i+1]; best_idx[i] = best_idx[i+1];\n"
+"                best_val[i+1] = tv; best_idx[i+1] = ti;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    /* Parallel reduction across threads: each thread has its top-k */\n"
+"    /* For simplicity: use shared memory to merge (k up to 8, 32 threads, 256 entries) */\n"
+"    __shared__ float s_vals[256];\n"
+"    __shared__ int s_idxs[256];\n"
+"    for (int i = 0; i < k; i++) {\n"
+"        s_vals[tid * k + i] = best_val[i];\n"
+"        s_idxs[tid * k + i] = best_idx[i];\n"
+"    }\n"
+"    __syncthreads();\n"
+"    /* Tree reduction: merge pairs of threads */\n"
+"    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {\n"
+"        if (tid < stride) {\n"
+"            for (int i = 0; i < k; i++) {\n"
+"                /* Merge s_vals[tid*k + i] into best list from other thread */\n"
+"                for (int j = 0; j < k; j++) {\n"
+"                    float ov = s_vals[(tid+stride)*k + j];\n"
+"                    int oi = s_idxs[(tid+stride)*k + j];\n"
+"                    if (oi >= 0 && ov > best_val[k-1]) {\n"
+"                        best_val[k-1] = ov; best_idx[k-1] = oi;\n"
+"                        for (int ii = k-2; ii >= 0 && best_val[ii+1] > best_val[ii]; ii--) {\n"
+"                            float tv = best_val[ii]; int ti = best_idx[ii];\n"
+"                            best_val[ii] = best_val[ii+1]; best_idx[ii] = best_idx[ii+1];\n"
+"                            best_val[ii+1] = tv; best_idx[ii+1] = ti;\n"
+"                        }\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            s_vals[tid*k + 0] = best_val[0]; s_idxs[tid*k + 0] = best_idx[0];\n"
+"            s_vals[tid*k + 1] = best_val[1]; s_idxs[tid*k + 1] = best_idx[1];\n"
+"            s_vals[tid*k + 2] = best_val[2]; s_idxs[tid*k + 2] = best_idx[2];\n"
+"            s_vals[tid*k + 3] = best_val[3]; s_idxs[tid*k + 3] = best_idx[3];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) {\n"
+"        for (int i = 0; i < k; i++) {\n"
+"            indices[token * k + i] = s_idxs[i];\n"
+"            float v = s_vals[i];\n"
+"            weights[token * k + i] = 1.0f / (1.0f + expf(-v));  /* sigmoid */\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "/* Batched softplus+bias+mul: out[t, i] = softplus(in[t, i] + bias[i]) * a[i] */\n"
 "__global__ void batch_softplus_mul_f32(float *out, const float *in, const float *bias,\n"
 "                                        const float *a, int n, int n_tokens) {\n"
@@ -4673,8 +4741,11 @@ typedef struct {
     int moe_gate_rows, moe_gate_cols;
 
     CUdeviceptr moe_gate_exps_w;    /* K-quant [expert_ff, n_embd, n_experts] — 3D packed */
+    CUdeviceptr moe_gate_exps_w_f16; /* F16 shadow for cuBLAS */
     CUdeviceptr moe_up_exps_w;      /* K-quant [expert_ff, n_embd, n_experts] */
+    CUdeviceptr moe_up_exps_w_f16;  /* F16 shadow for cuBLAS */
     CUdeviceptr moe_down_exps_w;    /* K-quant [n_embd, expert_ff, n_experts] */
+    CUdeviceptr moe_down_exps_w_f16; /* F16 shadow for cuBLAS */
     int moe_gate_exps_type, moe_up_exps_type, moe_down_exps_type;
     int moe_exp_rows_gu, moe_exp_cols_gu;   /* per-expert dims for gate/up: [expert_ff, n_embd] */
     int moe_exp_rows_d, moe_exp_cols_d;     /* per-expert dims for down: [n_embd, expert_ff] */
@@ -4812,6 +4883,7 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_iq2_s;
     CUfunction fn_batch_matvec_iq4_nl;
     CUfunction fn_batch_matvec_iq4_xs;
+    CUfunction fn_moe_topk_kernel;
     CUfunction fn_dequant_iq2_s_to_f16;
     CUfunction fn_batch_matvec_iq2_s_tc;
     CUfunction fn_batch_matvec_iq3_xxs;
@@ -5224,6 +5296,7 @@ lookup_funcs:
     GET_FUNC(batch_matvec_iq2_s);
     GET_FUNC(batch_matvec_iq4_nl);
     GET_FUNC(batch_matvec_iq4_xs);
+    GET_FUNC(moe_topk_kernel);
     GET_FUNC(dequant_iq2_s_to_f16);
     GET_FUNC(batch_matvec_iq2_s_tc);
     GET_FUNC(batch_matvec_iq3_xxs);
@@ -6021,6 +6094,50 @@ static int upload_3d_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t, size_t *ou
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_3d_kquant alloc failed (%zu bytes, type=%d, err=%d)\n", total_bytes, t->type, (int)err); return -1; }
     err = cuMemcpyHtoD(*d_ptr, t->data, total_bytes);
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_3d_kquant copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    return 0;
+}
+
+/* Upload F16 shadow of a 3D K-quant tensor for cuBLAS.
+ * Converts each expert's quantized rows to F16 on CPU, uploads as flat F16 array.
+ * The F16 shadow has the same layout as the raw data but with F16 elements.
+ * stride = row_bytes_per_expert_in_f16 (= rows_per_expert * cols * sizeof(uint16_t)) */
+static int upload_3d_kquant_f16(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t,
+                                  int rows_per_expert, int cols, size_t raw_stride) {
+    if (!r || !r->use_cublas || !t->data) { *d_ptr = 0; return 0; }
+    int n_experts = t->n_rows / rows_per_expert;
+    size_t f16_stride = (size_t)rows_per_expert * cols * sizeof(uint16_t);
+    size_t total_bytes = f16_stride * n_experts;
+    
+    /* Skip if very large to avoid OOM (allow up to 600 MB per tensor = full expert shadow) */
+    if (total_bytes > 600 * 1024 * 1024) {
+        fprintf(stderr, "cuda_llm: skipping F16 shadow for moe tensor (%zu MB > 400 MB limit)\n",
+                total_bytes / (1024*1024));
+        *d_ptr = 0; return 0;
+    }
+    
+    uint16_t *f16_buf = (uint16_t *)malloc(total_bytes);
+    if (!f16_buf) { fprintf(stderr, "cuda_llm: malloc failed for moe F16 shadow (%zu bytes)\n", total_bytes); *d_ptr = 0; return -1; }
+    float *row_tmp = (float *)malloc((size_t)cols * sizeof(float));
+    if (!row_tmp) { free(f16_buf); *d_ptr = 0; return -1; }
+    
+    size_t row_bytes = dequant_row_size(t->type, cols);
+    const uint8_t *base = (const uint8_t *)t->data;
+    
+    for (int e = 0; e < n_experts; e++) {
+        for (int r = 0; r < rows_per_expert; r++) {
+            dequant_row(t->type, base + (size_t)e * raw_stride + (size_t)r * row_bytes, row_tmp, cols);
+            for (int c = 0; c < cols; c++) {
+                f16_buf[(size_t)e * f16_stride / sizeof(uint16_t) + (size_t)r * cols + c] = cllm_f32_to_f16(row_tmp[c]);
+            }
+        }
+    }
+    free(row_tmp);
+    
+    CUresult err = cuMemAlloc(d_ptr, total_bytes);
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: moe F16 shadow cuMemAlloc failed (%zu bytes, err=%d)\n", total_bytes, (int)err); free(f16_buf); *d_ptr = 0; return -1; }
+    err = cuMemcpyHtoD(*d_ptr, f16_buf, total_bytes);
+    free(f16_buf);
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: moe F16 shadow cuMemcpyHtoD failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
 
@@ -6831,11 +6948,26 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             cl->moe_exp_cols_gu = t.n_cols;  /* n_embd (input dim) */
             cl->moe_exp_rows_gu = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;  /* expert_ff */
             if (upload_3d_kquant_raw(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+            /* F16 shadow for cuBLAS */
+            if (r->use_cublas) {
+                upload_3d_kquant_f16(r, &cl->moe_gate_exps_w_f16, &t,
+                                     cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                     cl->moe_exp_stride_gu);
+            } else {
+                cl->moe_gate_exps_w_f16 = 0;
+            }
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_up_exps_type = t.type;
             if (upload_3d_kquant_raw(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+            if (r->use_cublas) {
+                upload_3d_kquant_f16(r, &cl->moe_up_exps_w_f16, &t,
+                                     cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                     cl->moe_exp_stride_gu);
+            } else {
+                cl->moe_up_exps_w_f16 = 0;
+            }
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
@@ -6843,6 +6975,13 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             cl->moe_exp_cols_d = t.n_cols;   /* expert_ff (input dim) */
             cl->moe_exp_rows_d = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;  /* n_embd */
             if (upload_3d_kquant_raw(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d) != 0) return -1;
+            if (r->use_cublas) {
+                upload_3d_kquant_f16(r, &cl->moe_down_exps_w_f16, &t,
+                                     cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                                     cl->moe_exp_stride_d);
+            } else {
+                cl->moe_down_exps_w_f16 = 0;
+            }
 
             /* Shared expert gate: ffn_gate_inp_shexp [n_embd] F32 (1D sigmoid gate) */
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
@@ -10781,8 +10920,11 @@ void cuda_llm_free(cuda_llm_runner *r) {
             /* MoE weights */
             if (cl->moe_gate_w)             cuMemFree(cl->moe_gate_w);
             if (cl->moe_gate_exps_w)        cuMemFree(cl->moe_gate_exps_w);
+            if (cl->moe_gate_exps_w_f16)    cuMemFree(cl->moe_gate_exps_w_f16);
             if (cl->moe_up_exps_w)          cuMemFree(cl->moe_up_exps_w);
+            if (cl->moe_up_exps_w_f16)      cuMemFree(cl->moe_up_exps_w_f16);
             if (cl->moe_down_exps_w)        cuMemFree(cl->moe_down_exps_w);
+            if (cl->moe_down_exps_w_f16)    cuMemFree(cl->moe_down_exps_w_f16);
             if (cl->moe_shared_gate_w)      cuMemFree(cl->moe_shared_gate_w);
             if (cl->moe_shared_ffn_gate_w)  cuMemFree(cl->moe_shared_ffn_gate_w);
             if (cl->moe_shared_ffn_up_w)    cuMemFree(cl->moe_shared_ffn_up_w);
