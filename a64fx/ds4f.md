@@ -391,6 +391,7 @@ decode M>1 to amortize the 43 per-layer all-reduces.
 | `DS4F_TIERB2` | 0 | 1 = stateful compressor/indexer (CSA/HCA) decode; implies `EXACT`. Real weights load by name (validated, job 49092345) |
 | `DS4F_FP8_BF16` | 0 | 1 = predequant replicated dense FP8→bf16 at load (faster decode, +~6 GB); lossless (Step 2c, real-weight validated). Default = byte-identical FP8 |
 | `DS4F_BF16_PV` | (auto) | with `DS4F_FP8_BF16=1`: empty = pair-interleaved pv (fastest); `0` = plain bf16; `1` = force pv |
+| `DS4F_MXFP4_GEMM_TILE` | 0 (auto→16 in batched prefill) | M-threshold ≥ which the MXFP4 (expert/dense) **prefill** GEMM tile-dequants nibbles→bf16 once and reuses across M (1.38–1.72× @M≥16, lossless); `0` = off (svtbl per-pair, best at M≤4). **Auto-set to 16 when batched prefill is active (`ds4f_ep_runner.c`); explicit value overrides. Real-weight 11n: +7.9% prefill, token-exact (Step 2o)** |
 | `DS4F_MHC` | 0 | 1 = exact manifold-constrained hyper-connections (`hc_mult=4`). **REQUIRED for coherent real generation** (Step 2e); gen wrapper defaults it on |
 | `DS4F_PROMPT_IDS` / `DS4F_GEN_OUT` / `DS4F_MAX_NEW` | — | gen-mode (Step 2e): prompt id file in, generated id file out, greedy decode budget (stops on eos=1) |
 | `DS4F_TF_CHECK` | 0 | 1 = teacher-forcing next-token accuracy gate (~0 % = broken forward, ~50–80 % = working); the cheap reference-free correctness check |
@@ -403,10 +404,10 @@ decode M>1 to amortize the 43 per-layer all-reduces.
 | `LLM_THREADS` | 48 | OpenMP threads/node |
 | `SKIP_TOPO` | unset | 1 = reuse existing `tofu_topo.txt` (**never across jobs**) |
 
-## Current state (2026-06-05)
+## Current state (2026-06-07)
 
 Everything below is **DONE + validated** on the 11 EP nodes (real DeepSeek-V4-Flash
-weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
+weights), committed on branch `ds4f` (latest `8f38fb7`) except where noted:
 
 - **Tier-B1 exact dense forward** (Step 2): RoPE/YaRN, per-head q-norm, MQA sliding-window
   + sink attn, grouped low-rank o-proj, sqrtsoftplus gate, swiglu clamp — argmax=122293,
@@ -554,6 +555,12 @@ weights), committed on branch `ds4f` (latest `037a2d1`) except where noted:
 
 - **int8 KV cache — −0.35 GB RSS @16k (scales linearly), real-weight token-identical (Step 2m, `DS4F_INT8_KV`, commit `0d8b6d1`).** The KV-memory half of the 256k push (pairs with 2l's int8 *dense*). `DS4F_INT8_KV=1` stores each `(layer,pos)` window KV latent `[kv_lora=512]` as **int8** (1 B vs bf16's 2 B) with a **STATIC per-channel scale** calibrated on the first `DS4F_INT8KV_CAL` positions (default 256; S5 scheme, de-risked in `tools/int8kv_probe.c`, L1-rel 0.0032). The latent's massive-activation sink channels (~1e3–1e5) are positionally *consistent*, so early calibration holds — naive per-token int8 is catastrophic (one sink dim sets the scale → O(1) dims vanish). **Streaming design (no straddle):** positions `[0,CAL)` stage to a small bf16 `kv_calbuf` while per-channel absmax accumulates; at the first `pos≥CAL` the scale **freezes**, the calbuf is quantized into the int8 store `kv_q`, and reads switch to int8 — freeze happens *between* `forward_token` steps, so at any instant every written position is wholly in calbuf (unfrozen) **or** wholly in kv_q (frozen), and the read path is a single hoisted branch (`kvbf = !frozen ? kv_calbuf : kv_cache`; `i8 = int8_kv && frozen`). Arena stays bf16-sized (`MAP_NORESERVE` ⇒ RSS = touched pages ⇒ int8 realizes the win). **Scope:** `int8_kv` forces `m->exact=1` and aborts batched prefill, so only the **two** streaming exact/tb2 attn read workers needed int8 branches (the synthetic/batched-prefill workers never run under it) — far less than the "~15 sites" the table once feared. *Validation (real weights, 11n, `DS4F_MHC=1`):* (a) **coherence** — gen with `CAL=64` (freeze fires ~gen-token 40, ~96 tokens read the frozen int8 window) is **TOKEN-IDENTICAL** to the bf16 baseline (137/137 ids; int8 never flipped a greedy argmax — better than the "merely coherent" bar a lossy transform predicts); (b) **int8 path genuinely active** — the longctx16384 *synthetic* warm argmax flips 16→28 under int8 (a lossy transform DOES change synthetic compute, proving it's not bypassed; synthetic argmax is a speed signal only); (c) **memory** — longctx16384 RSS **22.66 → 22.31 GB (−0.35 GB)**, matching the predicted KV halving (16384·512·43 B ≈ 344 MB), NaN=0, lockstep, rc=0. The −0.35 GB at 16k is small (KV is a thin slice there) but **linear in ctx → ~5.7 GB at 256k**, where it compounds with 2l's −5.5 GB dense. *One bug found + fixed:* during the pre-freeze calibration window the read path fell into the bf16 branch but `kv_cache` is `NULL` under int8_kv → segfault; fixed by pointing the bf16 base at `kv_calbuf` while unfrozen (synthetic A/B confirms the calbuf-bf16 read is **bit-identical** to the kv_cache-bf16 path). Gated `DS4F_INT8_KV` (default **off** — lossy, keep bf16 the clean reference). LOSSY by design ⇒ argmax NOT *guaranteed* bit-exact (coherence is the gate); it merely *happened* to be token-identical on this gen.
 
+- **int8 compressed-latent cache (cmp_kv) — ctx ceiling ~200k → ~255k, real-weight token-identical (Step 2n, `DS4F_INT8_CMP`, uncommitted).** The Tier-B2 memory half of the 256k push (pairs with 2m's int8 *KV* and 2l's int8 *dense*). The Tier-B2 compressor cache `cmp_kv` (CSA 10,752 B/pos + HCA 320 B/pos = 11,072 B/pos f32) is the single largest off-arena allocation past ~64k. `DS4F_INT8_CMP=1` stores each compressed latent slot `[kv_lora=512]` as **int8** (¼ the f32 footprint) with the same **S5 static per-channel scale** scheme as int8 KV (2m): a small bf16 `cmp_calbuf` stages the first `DS4F_INT8CMP_CAL` *slots* (default 64) while per-channel absmax accumulates; at the first `slot≥CAL` the scale freezes, the calbuf quantizes into the int8 store `cmp_q`, and reads switch to int8 — freeze happens between `forward_token` steps so every slot is wholly in calbuf (unfrozen) or wholly in `cmp_q` (frozen), no straddle. Read path (`ds4f_attn_tb2_worker`) is a single hoisted **3-way** branch — `c_i8` frozen → `ds4f_sve_dot_i8s`/`ds4f_sve_axpy_i8s` over the per-channel scale; `cmpbf` pre-freeze → bf16 calbuf; else f32 (`DS4F_INT8_CMP=0`). Forces `m->exact=1`, tierb2-only. New fields `cmp_q/cmp_scale/cmp_iscale/cmp_absmax/cmp_calbuf/cmp_caln/cmp_frozen` in `ds4f_layer`; codec `ds4f_cmp_freeze`/`ds4f_cmp_append_i8` reuses the int8-KV i8s kernels. **slot = pos/ratio** (CSA ratio=4 ⇒ a slot every 4 positions). **THE MEASUREMENT GOTCHA (critical — see memory `project_ds4f_ctx_ceiling_measured`):** `cmp_kv`/`idx_kv` are THP-backed off-arena allocs that cost **real physical memory (MemFree) but are INVISIBLE to `/proc/self/statm` RSS** — at 131072 they are 2.72 GB physical with *zero* RSS change. **For any ctx-ceiling / OOM / memory-reduction work, validate against MemFree, NEVER RSS** (task #43 wrongly killed int8_cmp on an RSS A/B — RSS structurally cannot see the win). *Validation (synthetic longctx + real-weight gen, NP=11):* **(a) memory** — MemFree @131072 (FP8-on-demand dense + int8 KV) **4.52 → 5.57 GB = +1.05 GB**, EXACTLY the cmp_kv-only prediction (8,304 B/pos × 131072 = 1.04 GB); combined ceiling slope **36.7 → 28.7 KB/pos**; **(b) ceiling** — two-point MemFree fit lifts the hard ceiling (MemFree-2.0 floor) **~200k → ~255k** (safe MemFree-2.4 ~242k) — clears 262144 at the hard floor; **(c) coherence** — real-weight gen A/B with `CAL=8` (forces freeze@slot8 ⇒ pos32, within the ~160-pos eos-terminated gen) is **TOKEN-IDENTICAL** to f32 cmp_kv (137/137, first_diff=NONE), int8 frozen path genuinely exercised, NaN=0, lockstep, rc=0. *Gotcha when testing:* a short gen hits eos ~136 tok ⇒ total pos ~160 < 256, so the **prod `CAL=64` never freezes in a short gen** — lower `CAL` (e.g. 8) to exercise the int8 path, else you only test the bf16 calbuf. Gated `DS4F_INT8_CMP` (default **off**, zero cost when off), `DS4F_INT8CMP_CAL` = calib window in SLOTS (default 64). **The combined int8 memory stack is now FP8-on-demand dense + int8 KV + int8 cmp → ~255k ctx.** Next mem lever: **int8 `idx_kv`** (2,688 B/pos → +2 KB/pos saved, slope → 26.6, ceiling → ~270k+) for a robust 262144 margin.
+
+- **Direct MXFP4/FP8 GEMM register-dequant — MXFP4 tile-dequant +1.38–1.72× @M≥16 (real-weight 11n: +7.9% prefill, token-exact), FP8 confirmed already-optimal (Step 2o, `DS4F_MXFP4_GEMM_TILE`, uncommitted).** Investigated the user ask "optimize direct mxfp4/fp8 GEMM, decode to fp16/fp32 on register via SVE ld+insn". Two halves, both bench-driven (`ds4f_gemm_test` FP8+MXFP4 sweeps, 12T/1CMG, exp15-free synth, argmax + **relL2 vs f32 single-token ref**, never bit-equality):
+  - **FP8 — already optimal, no change.** The Step-2f on-demand tile-dequant (`svld1ub`→LUT-gather→f32→bf16 L1 tile→`8x3_pv`, no resident bf16, −6 GB) IS the on-register SVE-ld dequant. Confirmed **bf16-FMA COMPUTE-bound, not dequant-bound**: register **magic** decode (no gather/LUT) vs gather is **NEUTRAL** (1.00–1.06×, ~1 % at M≥32 — dequant amortizes over M). And magic needs **FTZ → flushes E4M3 subnormals to 0** (LOSSY: ~0.5 max-abs vs the LUT over K=4096), which would break this path's bit-parity with the `DS4F_FP8_BF16=1` resident-bf16 prefill → the gather (lossless) correctly stays; the gated magic GEMM path was **reverted**. Bonus finding: **FP8→bf16 is LOSSLESS** (e4m3's ≤3 mantissa bits × pow2 E8M0 scale fit bf16's 7) → the GEMM is **relL2 3e-7 vs the f32 matvec ref** (f32-faithful, not merely argmax-exact) — so the −6 GB on-demand FP8 prefill is numerically ~identical to a resident-bf16 copy. Magic's real win is the **HBM-bound M=1 decode** matvec (lever E), not the GEMM.
+  - **MXFP4 — NEW tile-dequant lever.** The expert GEMM (`matvec_mxfp4_8row_2x`, svtbl) is **dequant/issue-bound: FLAT ~84 Gmac/s from M=1 to M=64** (svtbl re-runs per token-pair, never amortizes), where FP8's tile-dequant scales 17→143. Added a gated **tile-dequant** path: dequant each 8-row group's nibbles **ONCE** (`svld1ub`→`svtbl`→×E8M0→bf16 L1 tile) and reuse across all M via the peak `8x3_pv` kernel. **LOSSLESS** (fp4×pow2 fits bf16 → relL2 **2e-7**, argmax-exact). Measured svtbl→tile: M=1 **0.33×** (tile loses — setup, no amortization), M=8 **1.08×** (crossover), **M=16 1.38× / M=32 1.53× / M=64 1.72×** (→147 Gmac/s, toward the bf16 compute peak). Gated `DS4F_MXFP4_GEMM_TILE` = **M-threshold** (default **0 = off**, keep svtbl which wins at M≤4; set ~8–16 to enable) — so it never regresses small M and is inert in production until enabled. Assumes vl==16 (A64FX SVE-512: each 16-elem chunk = lo/hi nibbles of one 32-block). **Real-weight 11n A/B — LANDED + VALIDATED (2026-06-08, alloc 49129596).** Batched-prefill perf (`REAL=1 EXACT=1`, MHC/Tier-B2 off — batched prefill is *disabled* under MHC/Tier-B2 so this synthetic-activation path on REAL MXFP4 bytes is the only vehicle; `FP8_BF16=1` dense, `PREFILL=512 PREFILL_BATCH=256`). **Token-EXACT:** argmax=108300 and prefill ‖x‖=7.626e+02 **bit-identical** across TILE∈{0,1,4,8,16} (6 runs), NaN=0, perf=11/11 lockstep — lossless on real weights at the activation-norm level, not just argmax. **Prefill +7.9%: 36.5 → 39.5 tok/s** (ms/tok 27.4→25.4, reproducible across repeat pairs), and **threshold-INSENSITIVE 1→16** (all give 25.3–25.4 ms/tok) ⇒ the compute-dominant experts carry **M≥16** in batched routing — *refuting the earlier "per-expert M may be small → neutral" caveat*. Comm% also fell 13→10 (faster expert-GEMM → less pre-all-reduce skew). Decode unchanged (18.95→18.92, expected — decode uses `mv_worker` not the GEMM path). **Recommended production setting: `DS4F_MXFP4_GEMM_TILE=16`** (full win; tiny-M experts stay on svtbl where single-node showed tile loses). *Regression check (single-node, alloc-free):* `ds4f_gemm_test` **205/205 OK** (BF16_PV/BF16/Q8_PV/FP8/MXFP4); `ds4f_exact_test` max-abs **5e-8** + `ds4f_tierb2_test` **2e-6** vs Python ref (header changes compile + forward math intact).
+
 - **`TP_AR_BF16` REFUTED (negative result, not adopted).** Tested whether halving the EP all-reduce
   payload (f32 → bf16) cuts the ≈12.7 ms "other"/comm. It does **not**: comm dropped only **2.5 %**
   (confirming the reduce is **latency/sync-bound, not payload-bound**) while argmax flipped 294 → 58
@@ -580,11 +587,14 @@ and **at higher ctx, unlocked by memory** (int8 KV, B / int8 index scan, F).
 |---|-------|---------|------|--------|------|--------|
 | **A** | **Batched / speculative decode (M>1)** | comm 12.7 ms (biggest phase) + every dense matvec | **LARGE** — amortizes the 43 all-reduces/layer *and* reuses weights across M tokens; the **only real comm lever** (`TP_AR_BF16` refuted: latency- not payload-bound) | HIGH (packed-B GEMM; known A64FX batched-prefill regression) | MED | open — architectural (item 3) |
 | **B** | **int8 KV cache** (S5 static per-channel scale, `DS4F_INT8_KV`, commit `0d8b6d1`) | memory, *not* speed | unlocks **32K–64K** ctx → the regime where the index scan/topk levers finally pay off | HIGH (only the 2 exact/tb2 attn read workers needed it — see Step 2m) | MED-HIGH | **LANDED + validated** — real-weight gen **token-identical** to bf16 (int8 never flipped an argmax over ~96 frozen-int8 tokens); longctx16384 RSS 22.66→22.31 GB (−0.35 GB, scales linearly → ~5.7 GB @256k), NaN=0, lockstep (item 2 / Step 2m) |
+| **B2** | **int8 cmp_kv** (Tier-B2 compressor cache, same S5 scheme, `DS4F_INT8_CMP`, uncommitted) | memory, *not* speed | **ctx ceiling ~200k → ~255k** — cmp_kv is the largest off-arena alloc past ~64k (11,072 B/pos f32 → ¼) | HIGH (only the 1 tb2 attn read worker; 3-way branch) | MED-HIGH | **LANDED + validated** — MemFree @131072 4.52→5.57 GB (+1.05 GB, exactly the 8,304 B/pos prediction), combined slope 36.7→28.7 KB/pos; real-gen A/B **token-identical** (CAL=8 exercises int8 frozen path), NaN=0, lockstep (Step 2n). **MEASURE VIA MemFree NOT RSS** (THP-invisible to statm) |
+| **B3** | **int8 idx_kv** (Tier-B2 indexer cache, same S5 scheme) | memory, *not* speed | ceiling ~255k → ~270k+ (robust 262144 margin) — 2,688 B/pos → +2 KB/pos saved, slope → 26.6 | MED (mirror B2) | MED | open — the documented next mem lever after B2 |
 | **C** | **qkv matvec fusion** (`wq_a`+`wkv`, both read `s_hn`) | one pool barrier/layer | SMALL | LOW | LOW (bit-exact) | open — quick win |
 | **D** | **tb2prep residue audit** (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2 — the single biggest phase now) | tb2prep 17.5 ms | SMALL — no pure-serial sub-op remains; only thread-imbalance / a tail | LOW-MED | LOW | open — diminishing |
 | **E** | **FP8 magic decode default** | the memory-lean `DS4F_FP8_BF16=0` path *only* (N/A to int8/bf16-pv default) | MED for that path | LOW | LOW (argmax gate) | bench-validated (Step 2f); real-weight argmax pending |
 | **F** | **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`) | index scan @256k | **ZERO ≤16k**, LARGE @256k | DONE | — | shelved — 256k prerequisite only |
 | **G** | **fp4 compressor/indexer weights** | HBM footprint | LOW — lossy; the `tb2prep` floor is *compute* (RoPE/fp4/scan), not the weights | MED | MED (lossy) | only if HBM-pressured |
+| **H** | **MXFP4 GEMM tile-dequant** (`DS4F_MXFP4_GEMM_TILE`=M-thr, default off; **prod=16**) | batched-**prefill** MXFP4 expert/dense GEMM at M≥8 | **1.38× @M16 / 1.53× @M32 / 1.72× @M64** kernel (svtbl flat ~84 Gmac/s, dequant-bound; tile→147); **real-weight 11n prefill +7.9% (36.5→39.5 tok/s)** | LOW (mirrors FP8 tile-dequant) | LOW (lossless, relL2 2e-7; real-weight argmax+‖x‖ token-EXACT; gated, svtbl kept for M≤4) | **LANDED + single-node + real-weight 11n VALIDATED** (Step 2o, 2026-06-08): token-exact across TILE 0–16, threshold-insensitive 1–16 ⇒ batched per-expert M≥16 |
 
 Detail and rationale for each in the numbered items below; the per-phase decode
 breakdown that ranks them is item 1.
@@ -616,10 +626,24 @@ breakdown that ranks them is item 1.
    - *Done & shelved:* **int8/SVE `index_score` scan** (`DS4F_IDX_INT8`, `ae1167d`). argmax-exact
      (96/96), f32 path bit-identical, gated default-off, but zero ≤16k decode win (Amdahl 1.2 % +
      M=1 q-quant cancellation). Keep as the 256k building block.
-2. **256k decode without degradation (10–15 tok/s)** — the original long-ctx target, NOT
-   reached. Two independent blockers, both characterized:
-   - **Memory:** bf16 KV (done, Step 2e) was not enough — ctx=32768 still OOMs because the
-     27.5 GB replicated dense weights (inflated +6 GB by `DS4F_FP8_BF16=1`) dominate, not KV.
+2. **256k decode without degradation (10–15 tok/s)** — the original long-ctx target. The
+   **MEMORY ceiling is now essentially CLEARED** (measured ~255k with the int8 stack below);
+   speed at long ctx remains the open blocker. Both characterized:
+   - **Memory — MEASURED CEILING ~255k (was thought 32k).** The combined int8 stack
+     **FP8-on-demand dense (`DS4F_FP8_BF16=0`) + int8 KV (2m) + int8 cmp_kv (2n)** reaches a
+     hard ceiling **~255k** (safe ~242k), a ~8× jump. Path: FP8-on-demand+int8-KV alone = ~200k
+     (131072 fits w/ 4.65 GB MemFree spare); int8 cmp_kv adds +1.05 GB @131072 → ~255k. **MEASURE
+     VIA MemFree, NEVER RSS** — `cmp_kv`/`idx_kv` are THP-backed, costing real physical memory but
+     invisible to `/proc/self/statm` (2.72 GB physical @131072, zero RSS delta). The next mem lever
+     for a robust 262144 margin is **int8 `idx_kv`** (lever B3, slope → 26.6, ceiling → ~270k+).
+     Clean-exit ceiling guard (`DS4F_WARM_MEMAVAIL_STOP_GB` → `_exit(42)`) makes ctx-probing on a
+     shared alloc PMIx-safe (rc=42 not OOM-kill 137). *(Historical:* bf16 KV alone (Step 2e) was
+     not enough — ctx=32768 OOM'd because the 27.5 GB replicated dense weights, inflated +6 GB by
+     `DS4F_FP8_BF16=1`, dominate, not KV.*)*
+     - **int8 W8A8 dense (Step 2l, `DS4F_Q8_DENSE`, commit `99b76ad`) takes RSS
+     27.95 → 22.40 GB (−5.5 GB) AND speeds decode +9.7 %** (token-identical) — the SPEED+memory int8
+     lever (pairs with FP8-on-demand for the pure-memory path). int8 dense + int8 KV + int8 cmp_kv
+     clears 32K–256K; the remaining gate/head are still bf16 (argmax protection).
      **PARTIALLY LANDED: int8 W8A8 dense (Step 2l, `DS4F_Q8_DENSE`, commit `99b76ad`) takes RSS
      27.95 → 22.40 GB (−5.5 GB) AND speeds decode +9.7 %** (token-identical) — the first "int8
      weights" step toward 256k. **Retest ctx=32768 with `DS4F_Q8_DENSE=1` on a FRESH alloc** (NOT a
@@ -652,12 +676,30 @@ breakdown that ranks them is item 1.
 
 ## Next session — resuming prompt
 
-> **TASK: push decode past 13.03 tok/s @ctx10240 toward 14–15 (or pivot to the ctx=32768 memory
-> ceiling — see below).** `index_topk` (2g), SVE-attn (2h), fused o-proj (2i), parallel q-norm+RoPE
-> (2j), parallel tb2rope (2k), AND int8 W8A8 dense (2l) are all FIXED — decode is now **13.03 tok/s
-> @ctx10240** (was 3.38), IN the 10–15 target band. New breakdown: **other 12.7 (≈comm), tb2prep 17.5
-> (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj 3.2), attn 13.8, o_proj 9.4, qkv_proj 7.5 (wq_b 4.0)**.
-> Don't re-chase o_proj/attn/topk/q-norm/tb2rope/dense-matvec.
+> **CURRENT TASK (2026-06-08): direct MXFP4/FP8 GEMM register-dequant — DONE + real-weight VALIDATED (Step 2o).**
+> The +6 GB `DS4F_FP8_BF16=1` master rep is ALREADY killed by the Step-2f on-demand FP8 tile-dequant
+> (`svld1ub`→f32→bf16 L1 tile→`8x3_pv`, no resident bf16) — and the `ds4f_gemm_test` FP8 sweep confirms it
+> is **bf16-FMA compute-bound** (magic vs gather neutral 1.00–1.06×) AND **f32-faithful** (relL2 3e-7 —
+> FP8→bf16 is lossless), so the gather stays and the register-magic GEMM path was reverted (magic+FTZ is
+> lossy: flushes E4M3 subnormals). The **MXFP4 GEMM tile-dequant** lever (`DS4F_MXFP4_GEMM_TILE`=M-thr,
+> default off) is LANDED: svtbl expert GEMM is dequant-bound (flat ~84 Gmac/s); tile-dequant nibbles→bf16
+> once + reuse across M = **1.38× @M16 / 1.53× @M32 / 1.72× @M64** (single-node, lossless relL2 2e-7).
+> **Real-weight 11n A/B DONE (alloc 49129596): token-EXACT (argmax=108300 + ‖x‖=7.626e+02 bit-identical
+> across TILE 0–16, NaN=0, lockstep) and prefill +7.9% (36.5→39.5 tok/s), threshold-insensitive 1–16
+> ⇒ batched per-expert M≥16 (refutes the old "M may be small" caveat).**
+> **WIRED ON BY DEFAULT (=16)** in the batched-prefill path (`ds4f_ep_runner.c`: when `prefill_batch>0` and
+> `DS4F_MXFP4_GEMM_TILE` unset → `m->mxfp4_gemm_tile=16`); inert elsewhere (decode uses `mv_worker`); explicit
+> env overrides incl. `=0`. Committed `c4834d7` (with Step 2n int8_cmp — entangled in the same files).
+> **NEXT (still open):** lever E real-weight argmax for FP8 magic **decode** (M=1, the actual on-register
+> win — distinct from the GEMM). Entry points: `ds4f_gemm_worker` MXFP4 tile branch (`ds4f_impl.h`, gated
+> `T->m->mxfp4_gemm_tile`), FP8 branch comment (same fn). Bench: `a64fx/llm/ds4f_gemm_test.c` (FP8+MXFP4
+> sweeps, argmax + relL2, cores 12+). (Prior decode-speed levers below are DONE.)
+>
+> **DONE — decode speed (don't re-chase):** `index_topk` (2g), SVE-attn (2h), fused o-proj (2i), parallel
+> q-norm+RoPE (2j), parallel tb2rope (2k), int8 W8A8 dense (2l) — decode **3.38 → 13.03 tok/s @ctx10240**,
+> IN the 10–15 band. Breakdown: **other 12.7 (≈comm), tb2prep 17.5 (lcmp 4.6 / topk 4.2 / scan 3.6 / qproj
+> 3.2), attn 13.8, o_proj 9.4, qkv_proj 7.5 (wq_b 4.0)**. Don't re-chase o_proj/attn/topk/q-norm/tb2rope/
+> dense-matvec — what remains there is FUNDAMENTAL (comm latency-bound, tb2prep already-pooled).
 >
 > Branch `ds4f`, all committed: 2g `ee9046f`, 2h `c77729f`, 2i `bf01f1b`, 2j `5433bcc`, 2k `d920923`,
 > 2l `99b76ad` (int8 W8A8 dense, −5.5 GB + +9.7 %).

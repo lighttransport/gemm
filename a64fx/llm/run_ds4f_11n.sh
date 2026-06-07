@@ -151,6 +151,13 @@ export DS4F_TB2ROPE_PAR=${DS4F_TB2ROPE_PAR:-1}
 # EXACT; incompatible with batched prefill. Default 0 (bf16 kv_cache). Off => zero cost.
 export DS4F_INT8_KV=${DS4F_INT8_KV:-0}
 export DS4F_INT8KV_CAL=${DS4F_INT8KV_CAL:-256}
+# DS4F_INT8_CMP=1 stores the Tier-B2 compressed-latent cache cmp_kv as int8 (same S5
+# static-per-channel scheme as INT8_KV, calibrated on the first DS4F_INT8CMP_CAL *slots*).
+# cmp_kv is the dominant tierb2 physical (THP) footprint at high ctx; int8 reclaims ~3/4
+# and lifts the ctx ceiling toward 256k. LOSSY -> coherence gate. Forces EXACT; tierb2 only.
+# Default 0 (f32 cmp_kv). Off => zero cost.
+export DS4F_INT8_CMP=${DS4F_INT8_CMP:-0}
+export DS4F_INT8CMP_CAL=${DS4F_INT8CMP_CAL:-64}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
