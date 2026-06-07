@@ -86,6 +86,10 @@ int main(int argc, char **argv) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
             max_seq_len = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--perf") == 0) {
+            max_tokens = 10;  /* short prompt, focus on prefill + decode perf */
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            max_tokens = 100;  /* 100-token prefill benchmark */
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
@@ -338,6 +342,48 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "Prefill logits failed\n");
         pass = 0;
+    }
+
+    /* Decode benchmark: N steps via prefill-then-decode */
+    {
+        int bench_decode_steps = 50;  /* generate this many tokens */
+        if (cuda_llm_reset_state(gpu) != 0) {
+            fprintf(stderr, "cuda_llm_reset_state failed before decode bench\n");
+            pass = 0;
+            goto cleanup;
+        }
+        /* Prefill the prompt first */
+        if (!cuda_llm_prefill(gpu, tokens, NULL, 0, max_tokens, 0)) {
+            fprintf(stderr, "Decode bench: prefill failed\n");
+            pass = 0;
+            goto cleanup;
+        }
+        /* Warm-up: run 5 decode steps */
+        int32_t token = tokens[max_tokens - 1];
+        for (int i = 0; i < 5; i++) {
+            float *logits = cuda_llm_forward_logits(gpu, token, max_tokens + i);
+            if (!logits) { fprintf(stderr, "Decode bench warm-up failed at step %d\n", i); break; }
+            /* Pick top token */
+            int n_v = cuda_llm_n_vocab(gpu);
+            token = 0; float best = -1e30f;
+            for (int j = 0; j < n_v; j++) if (logits[j] > best) { best = logits[j]; token = j; }
+        }
+        /* Timed decode */
+        double t_dec_start = get_time_ms();
+        for (int i = 0; i < bench_decode_steps; i++) {
+            float *logits = cuda_llm_forward_logits(gpu, token, max_tokens + 5 + i);
+            if (!logits) { fprintf(stderr, "Decode bench failed at step %d\n", i); pass = 0; break; }
+            int n_v = cuda_llm_n_vocab(gpu);
+            token = 0; float best = -1e30f;
+            for (int j = 0; j < n_v; j++) if (logits[j] > best) { best = logits[j]; token = j; }
+        }
+        double t_dec_end = get_time_ms();
+        double dec_ms = t_dec_end - t_dec_start;
+        fprintf(stderr, "\n=== Decode benchmark ===\n");
+        fprintf(stderr, "Decode: %d tokens in %.1f ms (%.1f tok/s, %.1f ms/tok)\n",
+                bench_decode_steps, dec_ms,
+                bench_decode_steps / (dec_ms / 1000.0),
+                dec_ms / bench_decode_steps);
     }
 
 cleanup:
