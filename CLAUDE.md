@@ -61,3 +61,31 @@ interactive session burns context for no information. Keep runs lean:
   Rank0 + a cross-rank lockstep count check is sufficient (the scripts already verify
   `argmax_distinct_across_ranks==1`).
 
+## ctx ceiling & memory: measure MemFree, NOT process RSS
+
+OOM-kill on these nodes is driven by **true physical memory** (fires at MemFree≈2.0 GB;
+MemTotal=31.81 GB, no cgroup limit, no swap). Some large allocations — notably the Tier-B2
+caches `cmp_kv`/`idx_kv` — are **physically resident (cost real MemFree) but DO NOT appear
+in `/proc/self/statm` RSS** (THP-backed; the one big alloc without `MADV_NOHUGEPAGE`). At
+ctx=131072 they cost **2.72 GB physical with zero RSS change**. So:
+
+- **For any ctx-ceiling / OOM / memory-reduction work, validate against MemFree (or
+  MemAvailable), never process RSS.** RSS-based footprint numbers undercount by the
+  Tier-B2 amount, and an RSS A/B test will falsely report a real memory lever as "no effect".
+- **Measured ceiling (FP8-on-demand dense `DS4F_FP8_BF16=0` + int8 KV `DS4F_INT8_KV=1`):
+  ~200k tokens** (131072 fits w/ ~4.65 GB MemFree spare; 262144 OOMs at warm_kv layer
+  ~27/43). This is ~6× the old "ctx=32768 OOMs" (that was the +6 GB bf16-predequant config).
+- **`DS4F_INT8_CMP=1` (default off) lifts the ceiling to ~255k hard / ~242k safe**: int8s the
+  Tier-B2 `cmp_kv` cache (the THP physical dominator above) via the same S5 static-per-channel
+  scheme as int8 KV. MemFree @131072 4.52→5.57 GB (+1.05 GB; combined slope 36.7→28.7 KB/pos).
+  Real-gen A/B token-identical to f32 cmp_kv. `DS4F_INT8CMP_CAL` = calib window in SLOTS
+  (default 64; cmp freezes at slot≥CAL ⇒ pos≥CAL×ratio). For a robust 262144 margin the next
+  lever is int8-ing `idx_kv` too (~+2 KB/pos). NOTE: a short eos-terminated gen (~160 pos) is
+  BELOW the CAL=64 freeze point (256 pos) — to validate the int8 frozen path in a short gen,
+  lower CAL (e.g. CAL=8) or it only exercises the pre-freeze bf16 calbuf.
+- **Safe ctx-probing on a shared alloc:** build with the warm-phase guard and set
+  `DS4F_WARM_RSS_TRACE=1 DS4F_WARM_MEMAVAIL_STOP_GB=2.4` — every rank `_exit(42)` cleanly
+  before the OOM-killer fires (verified rc=42, not 137 → **no PMIx/plexec degradation**).
+  Per-layer RSS/MemAvail/MemFree trace lands in `ds4f_ep_stderr_rank00.txt` (the runner
+  freopen's per-rank stderr there, not the .log).
+

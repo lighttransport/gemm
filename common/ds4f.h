@@ -229,7 +229,23 @@ typedef struct {
     float    *cmp_ape;               /* [compress_ratio, coff*kv_lora] */
     uint16_t *cmp_norm;              /* [kv_lora] bf16 */
     float    *cmp_kv_state, *cmp_score_state;  /* [coff*ratio, coff*kv_lora] ring state */
-    float    *cmp_kv;                /* [max_pos/ratio, kv_lora] compressed latents */
+    float    *cmp_kv;                /* [max_pos/ratio, kv_lora] compressed latents (NULL if int8_cmp) */
+    /* ---- int8 compressed-latent cache (DS4F_INT8_CMP) ----
+     * Same S5 static-per-channel scheme as kv_q above, applied to cmp_kv (slot-indexed,
+     * slot=pos/ratio). cmp_kv is a kv_lora latent feeding the same attention softmax as
+     * the int8 KV window, so per-channel-static is the de-risked layout. When on, cmp_kv
+     * is NULL and the store is cmp_q (int8); reads dequant via cmp_scale[channel]. Slots
+     * [0,CAL) stage to cmp_calbuf (bf16) accumulating per-channel absmax; at slot>=CAL the
+     * scale freezes, calbuf -> cmp_q, reads switch to int8. cmp_kv costs the bulk of the
+     * tierb2 physical (THP) footprint at high ctx; int8 reclaims ~3/4. LOSSY -> coherence
+     * gate, not bit-exact. Only the streaming exact/tierb2 path is wired. */
+    int8_t   *cmp_q;       /* [max_pos/ratio, kv_lora] int8 store (NULL unless int8_cmp) */
+    float    *cmp_scale;   /* [kv_lora] per-channel dequant scale (absmax/127) */
+    float    *cmp_iscale;  /* [kv_lora] 1/scale (quantize) */
+    float    *cmp_absmax;  /* [kv_lora] running absmax during calibration */
+    uint16_t *cmp_calbuf;  /* [CAL, kv_lora] bf16 staging until freeze */
+    int       cmp_caln;    /* slots staged in calbuf */
+    int       cmp_frozen;  /* 1 once scale frozen & calbuf quantized into cmp_q */
     /* indexer (CSA layers, compress_ratio==4 only) */
     uint16_t *idx_wq_b;              /* [index_n_heads*index_head_dim, q_lora] bf16 (FP8 src, lossless) */
     uint16_t *idx_wproj;             /* [index_n_heads, hidden] bf16 */
@@ -266,6 +282,14 @@ typedef struct {
      * subnormals flush to 0 -> values ~5e-5 off, fine for the harness). The
      * magic path also enables FTZ on every pool worker. Set via DS4F_FP8_MAGIC=1. */
     int fp8_magic;
+    /* MXFP4 GEMM (M>1 expert/dense): 0 = svtbl per-token-pair (matvec_mxfp4_8row_2x,
+     * default; the M=1 decode + small-M path -- ~84 Gmac/s, dequant re-run per pair);
+     * >0 = M threshold above which the GEMM tile-dequants each 8-row group's nibbles
+     * ONCE into a bf16 L1 tile (svtbl->bf16, lossless: fp4*pow2 fits bf16) and reuses
+     * it across all M tokens via the 8x3 bf16-pv kernel -> compute-bound, scales to
+     * ~140 Gmac/s at M>=32 where the flat-84 svtbl re-dequant is the wall. Set via
+     * DS4F_MXFP4_GEMM_TILE (e.g. 16). Crossover with svtbl is ~M=8-16. */
+    int mxfp4_gemm_tile;
     /* BF16 matvec layout: 0 = row-major (matvec_bf16_8row), 1 = pair-interleaved
      * (matvec_bf16_8row_pv, p_odd predicated-load, +22..28% over plain bf16 and
      * BYTE-IDENTICAL — same column order + 8-row svaddv reduction). Applies to
@@ -328,6 +352,12 @@ typedef struct {
      * with batched prefill (which is itself unused under tierb2). LOSSY (coherence
      * gate, not bit-exact). Off by default. */
     int int8_kv;
+    /* int8 compressed-latent cache (DS4F_INT8_CMP): store the per-(layer,slot) compressed
+     * cmp_kv latent as int8 with a static per-channel scale (S5), like int8_kv. cmp_kv is
+     * the dominant tierb2 physical (THP) footprint at high ctx; int8 reclaims ~3/4 and
+     * lifts the ctx ceiling toward 256k. See ds4f_layer.cmp_q. Requires exact/tierb2
+     * streaming. LOSSY (coherence gate). Off by default. */
+    int int8_cmp;
     /* RoPE freqs tables (only built when exact): cos/sin[pos*half + k],
      * half = qk_rope_dim/2. Two configs: dense (theta, no YaRN) + comp (YaRN). */
     float *rope_dense_cos, *rope_dense_sin;

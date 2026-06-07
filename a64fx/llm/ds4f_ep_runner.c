@@ -258,6 +258,30 @@ int main(void) {
                N, cfg.n_layers, cfg.hidden, cfg.n_experts, cfg.n_active, no,
                dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)",
                n_threads, prefill, maxgen, maxpos, ctx_warm, arena_est/(1024.0*1024.0*1024.0));
+    /* one-time per-node memory ceiling diagnostic: the OOM-killer (sig9) fires on the
+     * cgroup/physical limit, which may be << HBM total. Print it so the ctx ceiling is
+     * derived from the REAL usable budget, not the assumed 31.8 GB. */
+    if (MyRank == 0) {
+        const char *paths[] = { "/sys/fs/cgroup/memory.max",
+                                "/sys/fs/cgroup/memory/memory.limit_in_bytes", NULL };
+        for (int i = 0; paths[i]; i++) {
+            FILE *cf = fopen(paths[i], "r");
+            if (cf) { char buf[64] = {0}; if (fgets(buf, sizeof buf, cf)) {
+                for (char *p = buf; *p; p++) if (*p=='\n') *p=0;
+                double gb = atof(buf)/1e9;
+                logmsg("NODE_CGROUP_LIMIT %s = %s (%.2f GB)\n", paths[i], buf, gb>0?gb:-1); }
+                fclose(cf); break; }
+        }
+        FILE *mf = fopen("/proc/meminfo", "r");
+        if (mf) { char line[128];
+            while (fgets(line, sizeof line, mf))
+                if (!strncmp(line,"MemTotal",8) || !strncmp(line,"MemAvailable",12) ||
+                    !strncmp(line,"MemFree",7)  || !strncmp(line,"HugePages_Total",15) ||
+                    !strncmp(line,"Hugetlb",7)) {
+                    for (char *p=line; *p; p++) if (*p=='\n') *p=0;
+                    logmsg("NODE_MEMINFO %s\n", line); }
+            fclose(mf); }
+    }
 
     /* ---- allocate this rank's shard (owned experts + replicated dense) ----
      * DS4F_REAL=1: load REAL staged weights for THIS rank (rank<MyRank>.blob in
@@ -336,6 +360,16 @@ int main(void) {
     }
     if (prefill_batch > 0 && !dense_bf16 && MyRank == 0)
         logmsg("WARN: DS4F_PREFILL_BATCH without DS4F_FP8_BF16=1 -> dense falls back to per-token matvec (no speedup)\n");
+    /* MXFP4 GEMM tile-dequant default-ON for batched prefill (Step 2o). The svtbl expert
+     * GEMM is dequant-bound (flat ~84 Gmac/s); tile-dequanting nibbles->bf16 once + reusing
+     * across M wins at M>=16 (real-weight 11n A/B: +7.9% prefill, token-EXACT argmax+||x||,
+     * threshold-insensitive 1-16 => batched per-expert M>=16). LOSSLESS (relL2 2e-7), svtbl
+     * kept for M<16. Inert outside batched prefill (decode uses mv_worker, not gemm_worker).
+     * Explicit DS4F_MXFP4_GEMM_TILE overrides (incl. =0 to disable). */
+    if (prefill_batch > 0 && getenv("DS4F_MXFP4_GEMM_TILE") == NULL) {
+        m->mxfp4_gemm_tile = 16;
+        if (MyRank == 0) logmsg("batched prefill: MXFP4 GEMM tile-dequant default ON (DS4F_MXFP4_GEMM_TILE=16)\n");
+    }
     int ar_mtile = (prefill_batch > 0 && prefill > 0)
                  ? (prefill_batch < prefill ? prefill_batch : prefill) : 1;
 
@@ -413,7 +447,9 @@ int main(void) {
     int dec_base = prefill;
     if (ctx_warm > 0) {
         ds4f_warm_kv(m, ctx_warm);
+        if (MyRank == 0) logmsg("RSS_AFTER_WARMKV=%.2f GB\n", rss_bytes()/1e9);
         ds4f_warm_tb2(m, ctx_warm);
+        if (MyRank == 0) logmsg("RSS_AFTER_WARMTB2=%.2f GB (delta=cmp_kv/idx_kv)\n", rss_bytes()/1e9);
         dec_base = ctx_warm;
         if (MyRank == 0) logmsg("warmed synthetic KV+compressed caches to ctx=%d; decoding from there\n", ctx_warm);
     }
