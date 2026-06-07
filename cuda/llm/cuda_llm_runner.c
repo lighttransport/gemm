@@ -5304,9 +5304,20 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
         return NULL;
     }
 
-    /* cuBLAS is intentionally disabled — all GEMMs use custom CUDA kernels
-     * for deterministic, cuBLAS-free operation. */
-    r->use_cublas = 0;
+    /* Enable cuBLAS for verification/baseline when CUDA_LLM_USE_CUBLAS=1 */
+    {
+        const char *env = getenv("CUDA_LLM_USE_CUBLAS");
+        r->use_cublas = (env && atoi(env) > 0) ? 1 : 0;
+        if (r->use_cublas) {
+            if (cublasewInit() != 0 ||
+                cublasewCreate(&r->cublas, r->stream) != 0) {
+                fprintf(stderr, "cuda_llm: cuBLAS init failed, falling back to custom kernels\n");
+                r->use_cublas = 0;
+            } else if (verbose >= 1) {
+                fprintf(stderr, "cuda_llm: cuBLAS enabled (CUDA_LLM_USE_CUBLAS=1)\n");
+            }
+        }
+    }
 
     /* Enable dp4a INT8 path for sm >= 6.1 (Pascal+) unless disabled */
     {
@@ -5405,7 +5416,14 @@ static int upload_q8_0_raw(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor
 }
 
 static int upload_q8_0_shadow_f16(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t) {
-    if (!r || !r->use_cublas || !t->data || t->type != GGML_TYPE_Q8_0) {
+    /* Create F16 shadow when cuBLAS is enabled, for any non-F32 quantized type.
+     * Skip very large tensors (>200M elements = >400MB F16) to avoid OOM. */
+    if (!r || !r->use_cublas || !t->data ||
+        t->type == GGML_TYPE_F32) {
+        *d_ptr = 0;
+        return 0;
+    }
+    if ((size_t)t->n_rows * t->n_cols > 200000000) {
         *d_ptr = 0;
         return 0;
     }
@@ -9447,7 +9465,22 @@ static void launch_batch_embed_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
-    /* cuBLAS-free: use custom kernels only */
+    /* cuBLAS path: use F16 shadow + Tensor Core GEMM when available */
+    if (r->use_cublas && mat_f16) {
+        /* Convert F32 input to F16 (required for Blackwell Tensor Core GEMM) */
+        int n_elems = n_tokens * in_dim;
+        CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
+        if (d_x_f16) {
+            void *args[] = { &d_x_f16, &input, &n_elems };
+            cuLaunchKernel(r->fn_convert_f32_to_f16,
+                (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            int ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas,
+                dst, mat_f16, d_x_f16,
+                n_tokens, out_dim, in_dim);
+            if (ret == 0) return;
+        }
+        /* Fall through to custom kernel on failure */
+    }
 
     if (weight_type == GGML_TYPE_Q8_0) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
