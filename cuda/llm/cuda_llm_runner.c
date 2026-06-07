@@ -4184,6 +4184,151 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
 "}\n"
 "\n"
+"/* Fused MoE FFN: processes one token's 8 experts in a single block */\n"
+"/* grid = n_tokens, block = 256 */\n"
+"__global__ void moe_fused_ffn(float *output, const float *input,\n"
+"    const unsigned char *gate_exps, const unsigned char *up_exps, const unsigned char *down_exps,\n"
+"    const float *router_logits, int n_tokens, int n_experts, int n_used,\n"
+"    int n_embd, int expert_ff, size_t stride_gu, size_t stride_d,\n"
+"    int gate_type, int up_type, int down_type) {\n"
+"    int token = blockIdx.x;\n"
+"    if (token >= n_tokens) return;\n"
+"    __shared__ float s_accum[2048+512]; /* n_embd + expert_ff */\n"
+"    __shared__ float s_xb[2048];\n"
+"    __shared__ int s_idx[8];\n"
+"    __shared__ float s_w[8];\n"
+"    int tid = threadIdx.x;\n"
+"    int lane = tid % 32, warp = tid / 32;\n"
+"    const float *xb = input + (size_t)token * n_embd;\n"
+"    for (int i = tid; i < n_embd; i += 256) s_xb[i] = xb[i];\n"
+"    __syncthreads();\n"
+"    const float *row = router_logits + (size_t)token * n_experts;\n"
+"    int best_idx[8] = {-1,-1,-1,-1,-1,-1,-1,-1};\n"
+"    float best_val[8] = {-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f,-1e38f};\n"
+"    for (int e = tid; e < n_experts; e += 256) {\n"
+"        float v = row[e];\n"
+"        if (v > best_val[n_used-1]) {\n"
+"            best_val[n_used-1] = v; best_idx[n_used-1] = e;\n"
+"            for (int i = n_used-2; i >= 0 && best_val[i+1] > best_val[i]; i--) {\n"
+"                float tv = best_val[i]; int ti = best_idx[i];\n"
+"                best_val[i] = best_val[i+1]; best_idx[i] = best_idx[i+1];\n"
+"                best_val[i+1] = tv; best_idx[i+1] = ti;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    if (tid < n_used) { s_idx[tid] = best_idx[tid]; s_w[tid] = 1.0f/(1.0f+expf(-best_val[tid])); }\n"
+"    __syncthreads();\n"
+"    float *accum = s_accum;\n"
+"    float *gate_buf = s_accum + n_embd;\n"
+"    float *up_buf = gate_buf + expert_ff;\n"
+"    for (int i = tid; i < n_embd; i += 256) accum[i] = 0.0f;\n"
+"    __syncthreads();\n"
+"    for (int ei = 0; ei < n_used; ei++) {\n"
+"        int eidx = s_idx[ei];\n"
+"        float weight = s_w[ei];\n"
+"        for (int r = warp; r < expert_ff; r += 8) {\n"
+"            int nb = n_embd / 256, row_bytes = nb * 66;\n"
+"            const unsigned char *rp = gate_exps + (size_t)eidx * stride_gu + (size_t)r * row_bytes;\n"
+"            float sum = 0.0f;\n"
+"            for (int b = lane; b < nb; b += 32) {\n"
+"                const unsigned char *bp = rp + b * 66;\n"
+"                float d = half_to_float(*(const half_raw *)bp);\n"
+"                const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"                const float *xbb = s_xb + b * 256;\n"
+"                float p = 0.0f; int yi = 0;\n"
+"                for (int ib = 0; ib < 8; ib++) {\n"
+"                    unsigned int a0 = qs[4*ib] | ((unsigned int)qs[4*ib+1]<<16);\n"
+"                    unsigned int a1 = qs[4*ib+2] | ((unsigned int)qs[4*ib+3]<<16);\n"
+"                    float db = d * (0.5f + (float)(a1>>28)) * 0.25f;\n"
+"                    const unsigned char *a8 = (const unsigned char *)&a0;\n"
+"                    for (int l = 0; l < 4; l++) {\n"
+"                        unsigned long long gv = iq2xxs_grid_dev[a8[l]];\n"
+"                        unsigned char sn = ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                        for (int j = 0; j < 8; j++) {\n"
+"                            float w = db * (float)(unsigned char)(gv>>(8*j)) * ((sn&(1<<j))?-1.0f:1.0f);\n"
+"                            p += w * xbb[yi++];\n"
+"                        }\n"
+"                    }\n"
+"                }\n"
+"                sum += p;\n"
+"            }\n"
+"            for (int o=16; o>0; o>>=1) sum += __shfl_down_sync(0xFFFFFFFF, sum, o);\n"
+"            if (lane==0) gate_buf[r] = sum;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int r = warp; r < expert_ff; r += 8) {\n"
+"            int nb = n_embd / 256, row_bytes = nb * 66;\n"
+"            const unsigned char *rp = up_exps + (size_t)eidx * stride_gu + (size_t)r * row_bytes;\n"
+"            float sum = 0.0f;\n"
+"            for (int b = lane; b < nb; b += 32) {\n"
+"                const unsigned char *bp = rp + b * 66;\n"
+"                float d = half_to_float(*(const half_raw *)bp);\n"
+"                const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"                const float *xbb = s_xb + b * 256;\n"
+"                float p = 0.0f; int yi = 0;\n"
+"                for (int ib = 0; ib < 8; ib++) {\n"
+"                    unsigned int a0 = qs[4*ib] | ((unsigned int)qs[4*ib+1]<<16);\n"
+"                    unsigned int a1 = qs[4*ib+2] | ((unsigned int)qs[4*ib+3]<<16);\n"
+"                    float db = d * (0.5f + (float)(a1>>28)) * 0.25f;\n"
+"                    const unsigned char *a8 = (const unsigned char *)&a0;\n"
+"                    for (int l = 0; l < 4; l++) {\n"
+"                        unsigned long long gv = iq2xxs_grid_dev[a8[l]];\n"
+"                        unsigned char sn = ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                        for (int j = 0; j < 8; j++) {\n"
+"                            float w = db * (float)(unsigned char)(gv>>(8*j)) * ((sn&(1<<j))?-1.0f:1.0f);\n"
+"                            p += w * xbb[yi++];\n"
+"                        }\n"
+"                    }\n"
+"                }\n"
+"                sum += p;\n"
+"            }\n"
+"            for (int o=16; o>0; o>>=1) sum += __shfl_down_sync(0xFFFFFFFF, sum, o);\n"
+"            if (lane==0) up_buf[r] = sum;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int i = tid; i < expert_ff; i += 256) {\n"
+"            float g = gate_buf[i];\n"
+"            gate_buf[i] = (g/(1.0f+expf(-g))) * up_buf[i];\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int r = warp; r < n_embd; r += 8) {\n"
+"            int nb = expert_ff / 256, row_bytes = nb * 98;\n"
+"            const unsigned char *rp = down_exps + (size_t)eidx * stride_d + (size_t)r * row_bytes;\n"
+"            float sum = 0.0f;\n"
+"            for (int b = lane; b < nb; b += 32) {\n"
+"                const unsigned char *bp = rp + b * 98;\n"
+"                float d = half_to_float(*(const half_raw *)bp);\n"
+"                const unsigned char *qs = bp + 2, *ss = qs + 64;\n"
+"                const float *xbb = gate_buf + b * 256;\n"
+"                float p = 0.0f; int yi = 0;\n"
+"                for (int ib = 0; ib < 8; ib++) {\n"
+"                    unsigned int a32;\n"
+"                    memcpy(&a32, ss+4*ib, 4);\n"
+"                    float db = d * (0.5f + (float)(a32>>28)) * 0.5f;\n"
+"                    for (int l = 0; l < 4; l++) {\n"
+"                        unsigned char sg = (unsigned char)ksigns_iq2xs_dev[(a32>>(7*l))&127];\n"
+"                        unsigned int g1 = iq3xxs_grid_dev[qs[2*l+0]];\n"
+"                        unsigned int g2 = iq3xxs_grid_dev[qs[2*l+1]];\n"
+"                        for (int j = 0; j < 4; j++) {\n"
+"                            float w0 = db * (float)(unsigned char)(g1>>(8*j)) * ((sg&(1<<j))?-1.0f:1.0f);\n"
+"                            float w1 = db * (float)(unsigned char)(g2>>(8*j)) * ((sg&(1<<(j+4)))?-1.0f:1.0f);\n"
+"                            p += w0*xbb[yi+j] + w1*xbb[yi+j+4];\n"
+"                        }\n"
+"                        yi += 8;\n"
+"                    }\n"
+"                    qs += 8;\n"
+"                }\n"
+"                sum += p;\n"
+"            }\n"
+"            for (int o=16; o>0; o>>=1) sum += __shfl_down_sync(0xFFFFFFFF, sum, o);\n"
+"            if (lane==0) accum[r] += weight * sum;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float *out = output + (size_t)token * n_embd;\n"
+"    for (int i = tid; i < n_embd; i += 256) out[i] += accum[i];\n"
+"}\n"
+"\n"
 "/* Gather rows from batch buffer: dst[rows, cols] = src[indices[row], cols] */\n"
 "__global__ void gather_rows_f32(float *dst, const float *src, const int *indices,\n"
 "                                 int n_rows, int n_cols) {\n"
@@ -4983,6 +5128,7 @@ struct cuda_llm_runner {
     CUfunction fn_moe_topk_kernel;
     CUfunction fn_gather_rows_f32;
     CUfunction fn_scatter_add_weighted_f32;
+    CUfunction fn_moe_fused_ffn;
     CUfunction fn_dequant_iq2_s_to_f16;
     CUfunction fn_dequant_iq2_xxs_to_f16;
     CUfunction fn_dequant_iq3_xxs_to_f16;
@@ -5400,6 +5546,7 @@ lookup_funcs:
     GET_FUNC(moe_topk_kernel);
     GET_FUNC(gather_rows_f32);
     GET_FUNC(scatter_add_weighted_f32);
+    GET_FUNC(moe_fused_ffn);
     GET_FUNC(dequant_iq2_s_to_f16);
     GET_FUNC(dequant_iq2_xxs_to_f16);
     GET_FUNC(dequant_iq3_xxs_to_f16);
@@ -10209,151 +10356,33 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
         }
 
         if (cl->is_moe) {
-            /* === Batched MoE FFN === */
-            int n_experts = r->n_experts;
-            int n_experts_used = r->n_experts_used;
-            int expert_ff = r->expert_ff;
-
-            /* 1. Router: logits[n_tokens, n_experts] = xb[n_tokens, n_embd] @ gate_inp[n_experts, n_embd]^T */
+            /* Router: logits[n_tokens, n_experts] = xb @ gate_inp^T */
             launch_batch_matvec(r, r->d_router_logits, cl->moe_gate_w, 0, d_batch_xb,
-                                n_experts, n_embd, n_tokens, GGML_TYPE_F32);
+                                r->n_experts, n_embd, n_tokens, GGML_TYPE_F32);
 
-            /* 2. Download router logits, compute top-k on CPU */
-            cuStreamSynchronize(r->stream);
-            cuMemcpyDtoH(r->h_router_logits, r->d_router_logits, (size_t)n_tokens * n_experts * sizeof(float));
-            int *h_indices = (int *)malloc((size_t)n_tokens * n_experts_used * sizeof(int));
-            float *h_weights = (float *)malloc((size_t)n_tokens * n_experts_used * sizeof(float));
-            for (int t = 0; t < n_tokens; t++) {
-                float *row = r->h_router_logits + (size_t)t * n_experts;
-                int idx[64]; float val[64];
-                for (int i = 0; i < n_experts_used; i++) { idx[i] = -1; val[i] = -1e38f; }
-                for (int e = 0; e < n_experts; e++) {
-                    float v = row[e];
-                    if (v > val[n_experts_used-1]) {
-                        val[n_experts_used-1] = v; idx[n_experts_used-1] = e;
-                        for (int i = n_experts_used-2; i >= 0 && val[i+1] > val[i]; i--) {
-                            float tv = val[i]; int ti = idx[i];
-                            val[i] = val[i+1]; idx[i] = idx[i+1];
-                            val[i+1] = tv; idx[i+1] = ti;
-                        }
-                    }
-                }
-                for (int i = 0; i < n_experts_used; i++) {
-                    h_indices[t * n_experts_used + i] = idx[i];
-                    h_weights[t * n_experts_used + i] = 1.0f / (1.0f + expf(-val[i]));
-                }
+            /* Fused FFN: one kernel processes all tokens × experts on GPU */
+            {
+                float *args_f[14];
+                /* output=d_batch_x, input=d_batch_xb */
+                args_f[0] = (float *)d_batch_x;
+                args_f[1] = (float *)d_batch_xb;
+                /* gate_exps, up_exps, down_exps */
+                args_f[2] = (float *)cl->moe_gate_exps_w;
+                args_f[3] = (float *)cl->moe_up_exps_w;
+                args_f[4] = (float *)cl->moe_down_exps_w;
+                /* router_logits */
+                args_f[5] = (float *)r->d_router_logits;
+                /* integers */
+                int i6 = n_tokens, i7 = r->n_experts, i8 = r->n_experts_used;
+                int i9 = n_embd, i10 = r->expert_ff;
+                size_t sz11 = cl->moe_exp_stride_gu, sz12 = cl->moe_exp_stride_d;
+                int i13 = cl->moe_gate_exps_type, i14 = cl->moe_up_exps_type, i15 = cl->moe_down_exps_type;
+                /* Use void* array for cuLaunchKernel */
+                void *kargs[] = { &args_f[0], &args_f[1], &args_f[2], &args_f[3], &args_f[4],
+                                 &args_f[5], &i6, &i7, &i8, &i9, &i10, &sz11, &sz12,
+                                 &i13, &i14, &i15 };
+                cuLaunchKernel(r->fn_moe_fused_ffn, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, kargs, NULL);
             }
-
-            /* Zero accumulator in d_batch_xb (use as moe_accum for this layer) */
-            cuMemsetD32(d_batch_xb, 0, (size_t)n_tokens * n_embd);
-
-            /* 3. Count tokens per expert, then process each expert */
-            int *expert_counts = (int *)calloc(n_experts, sizeof(int));
-            for (int t = 0; t < n_tokens; t++)
-                for (int e = 0; e < n_experts_used; e++)
-                    expert_counts[h_indices[t * n_experts_used + e]]++;
-
-            /* Upload indices/weights to GPU */
-            int *d_idx; float *d_w;
-            cuMemAlloc(&d_idx, (size_t)n_tokens * n_experts_used * sizeof(int));
-            cuMemAlloc(&d_w, (size_t)n_tokens * n_experts_used * sizeof(float));
-            cuMemcpyHtoD(d_idx, h_indices, (size_t)n_tokens * n_experts_used * sizeof(int));
-            cuMemcpyHtoD(d_w, h_weights, (size_t)n_tokens * n_experts_used * sizeof(float));
-
-            for (int e = 0; e < n_experts; e++) {
-                int cnt = expert_counts[e];
-                if (cnt == 0) continue;
-
-                /* Build local indices: which tokens selected this expert */
-                int *local_tok = (int *)malloc(cnt * sizeof(int));
-                float *local_w = (float *)malloc(cnt * sizeof(float));
-                int pos = 0;
-                for (int t = 0; t < n_tokens; t++) {
-                    for (int ei = 0; ei < n_experts_used; ei++) {
-                        if (h_indices[t * n_experts_used + ei] == e) {
-                            local_tok[pos] = t;
-                            local_w[pos] = h_weights[t * n_experts_used + ei];
-                            pos++;
-                        }
-                    }
-                }
-
-                int *d_local_tok; float *d_local_w;
-                cuMemAlloc(&d_local_tok, cnt * sizeof(int));
-                cuMemAlloc(&d_local_w, cnt * sizeof(float));
-                cuMemcpyHtoD(d_local_tok, local_tok, cnt * sizeof(int));
-                cuMemcpyHtoD(d_local_w, local_w, cnt * sizeof(float));
-
-                /* Gather: copy cnt token vectors from d_batch_x to d_batch_ff1 */
-                {
-                    void *g_args[] = { &d_batch_ff1, &d_batch_xb, &d_local_tok, &cnt, &n_embd };
-                    cuLaunchKernel(r->fn_gather_rows_f32, cnt, 1, 1, 256, 1, 1, 0, r->stream, g_args, NULL);
-                }
-
-                /* Convert F32 gathered input → F16 */
-                int n_elems = cnt * n_embd;
-                CUdeviceptr d_gather_f16 = r->d_batch_f16_scratch;
-                if (d_gather_f16) {
-                    void *cv_args[] = { &d_gather_f16, &d_batch_ff1, &n_elems };
-                    cuLaunchKernel(r->fn_convert_f32_to_f16,
-                        (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, cv_args, NULL);
-                }
-
-                /* Gate: [cnt, expert_ff] = [cnt, n_embd] × [expert_ff, n_embd]^T */
-                CUdeviceptr gate_w = cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
-                CUdeviceptr up_w   = cl->moe_up_exps_w   + (size_t)e * cl->moe_exp_stride_gu;
-                CUdeviceptr down_w = cl->moe_down_exps_w  + (size_t)e * cl->moe_exp_stride_d;
-
-                /* Try cuBLAS on F16 shadow, fall back to per-token custom matvec */
-                if (launch_moe_expert_cublas(r, cl, d_batch_ff2, e, 0,
-                    d_batch_ff1, cnt, expert_ff, n_embd, d_gather_f16) != 0) {
-                    for (int i = 0; i < cnt; i++) {
-                        CUdeviceptr in_t = d_batch_ff1 + (size_t)i * n_embd * sizeof(float);
-                        CUdeviceptr out_t = d_batch_ff2 + (size_t)i * expert_ff * sizeof(float);
-                        launch_matvec_auto(r, out_t, gate_w, in_t, expert_ff, n_embd, cl->moe_gate_exps_type);
-                    }
-                }
-                /* Up: same pattern */
-                if (launch_moe_expert_cublas(r, cl, d_batch_mid, e, 0,
-                    d_batch_ff1, cnt, expert_ff, n_embd, d_gather_f16) != 0) {
-                    for (int i = 0; i < cnt; i++) {
-                        CUdeviceptr in_t = d_batch_ff1 + (size_t)i * n_embd * sizeof(float);
-                        CUdeviceptr out_t = d_batch_mid + (size_t)i * expert_ff * sizeof(float);
-                        launch_matvec_auto(r, out_t, up_w, in_t, expert_ff, n_embd, cl->moe_up_exps_type);
-                    }
-                }
-
-                /* SiLU(gate) * up */
-                launch_silu_mul(r, d_batch_ff2, d_batch_mid, cnt * expert_ff);
-
-                /* Down: [cnt, n_embd] = [cnt, expert_ff] × [n_embd, expert_ff]^T */
-                if (launch_moe_expert_cublas(r, cl, d_batch_ff1, e, 1,
-                    d_batch_ff2, cnt, n_embd, expert_ff, d_gather_f16) != 0) {
-                    for (int i = 0; i < cnt; i++) {
-                        CUdeviceptr in_t = d_batch_ff2 + (size_t)i * expert_ff * sizeof(float);
-                        CUdeviceptr out_t = d_batch_ff1 + (size_t)i * n_embd * sizeof(float);
-                        launch_matvec_auto(r, out_t, down_w, in_t, n_embd, expert_ff, cl->moe_down_exps_type);
-                    }
-                }
-
-                /* Scatter-add weighted: d_batch_xb[local_tok] += local_w * d_batch_ff1 */
-                {
-                    void *sa_args[] = { &d_batch_xb, &d_batch_ff1, &d_local_tok, &d_local_w, &cnt, &n_embd };
-                    cuLaunchKernel(r->fn_scatter_add_weighted_f32, cnt, 1, 1, 256, 1, 1, 0, r->stream, sa_args, NULL);
-                }
-
-                cuMemFree(d_local_tok);
-                cuMemFree(d_local_w);
-                free(local_tok);
-                free(local_w);
-            }
-
-            /* Add MoE result back to d_batch_x */
-            launch_add(r, d_batch_x, d_batch_xb, n_tokens * n_embd);
-
-            cuMemFree(d_idx); cuMemFree(d_w);
-            free(h_indices); free(h_weights); free(expert_counts);
-
             if (do_prof) { cuStreamSynchronize(r->stream); prof_ffn_ms += get_time_ms() - _ft0; }
         } else {
             launch_batch_matvec(r, d_batch_ff1, cl->ffn_gate_w, cl->ffn_gate_w_f16, d_batch_xb,
