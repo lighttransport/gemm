@@ -26,6 +26,17 @@ static inline float frand(void) {        /* ~U(-1,1) */
     rng = rng * 1664525u + 1013904223u;
     return ((float)(rng >> 8) / (float)(1u << 24)) * 2.0f - 1.0f;
 }
+/* one exp15/NaN-free E4M3 byte (so the magic decode == LUT decode bit-exactly,
+ * mirroring rand_fp8 in ds4f_decode_bw_bench.c): if exp bits are all-ones, clear
+ * one so exp<=14. Lets the magic GEMM dequant be validated against the LUT gather. */
+static inline uint8_t rand_fp8_byte(void) {
+    rng = rng * 1664525u + 1013904223u;
+    uint8_t b = (uint8_t)(rng >> 13);
+    if ((b & 0x78) == 0x78) b &= ~0x08;
+    return b;
+}
+static inline uint64_t rdcyc(void){ uint64_t v; __asm__ __volatile__("mrs %0, cntvct_el0":"=r"(v)); return v; }
+static inline uint64_t rdfreq(void){ uint64_t v; __asm__ __volatile__("mrs %0, cntfrq_el0":"=r"(v)); return v; }
 
 /* pack logical row-major W[rows][cols] of bf16 halfwords into a DS4F_BF16_PV
  * tensor's pair-interleaved buffer (mirrors ds4f_synth_worker / ds4f_promote). */
@@ -110,6 +121,117 @@ static int run_case(ds4f_model *m, ds4f_qtype type, int rows, int cols, int M) {
     return ok ? 0 : 1;
 }
 
+/* FP8 (DS4F_FP8) prefill GEMM correctness + throughput. This is the on-demand
+ * dequant path used under DS4F_FP8_BF16=0 (no resident bf16 copy, -6 GB): the
+ * GEMM reads each 8-row FP8 group once, dequants (LUT gather) into a small bf16
+ * L1 tile, and reuses it across all M tokens via the register-blocked bf16-pv
+ * kernel -- so the dequant amortizes over M and prefill stays compute-bound
+ * WITHOUT a second resident bf16 rep. Reference = single-token gather matvecs
+ * (f32, no bf16 truncation), so the GEMM is NOT bit-identical to the ref (it
+ * truncates weights to bf16); the gate is argmax-exact + a bf16-magnitude relL2
+ * bound, never bit-equality. NOTE: the GEMM uses gather, NOT the register magic
+ * decode -- magic+FTZ flushes E4M3 subnormals (lossy, breaks bf16-predequant
+ * parity) and the GEMM is compute-bound so it would be speed-neutral anyway
+ * (measured: gather vs magic 1.00-1.06x). Magic's win is the M=1 decode matvec. */
+static int run_fp8_case(ds4f_model *m, int rows, int cols, int M) {
+    int K = cols;
+    int ngrp128 = (rows + 127) / 128, sbc = (K + 127) / 128;
+    uint8_t *W  = (uint8_t *)aligned_alloc(256, ((size_t)rows*K + 255) & ~(size_t)255);
+    uint8_t *ES = (uint8_t *)aligned_alloc(256, ((size_t)ngrp128*sbc + 255) & ~(size_t)255);
+    for (size_t i = 0; i < (size_t)rows*K; i++) W[i] = rand_fp8_byte();
+    for (size_t i = 0; i < (size_t)ngrp128*sbc; i++) {
+        rng = rng*1664525u + 1013904223u; ES[i] = (uint8_t)(125 + (rng>>20)%5);  /* E8M0 ~ 1.0 */
+    }
+    ds4f_tensor t; memset(&t, 0, sizeof(t));
+    t.type = DS4F_FP8; t.rows = rows; t.cols = cols; t.w = W; t.scale = ES;
+
+    float *X = (float *)aligned_alloc(256, (size_t)M*cols*4);
+    for (size_t k = 0; k < (size_t)M*cols; k++) X[k] = frand();
+
+    /* single-token f32 gather matvec reference (argmax + relL2 base) */
+    float *Yref = (float *)aligned_alloc(256, (size_t)M*rows*4);
+    for (int mm = 0; mm < M; mm++) ds4f_matvec(m, Yref + (size_t)mm*rows, &t, X + (size_t)mm*cols);
+
+    float *Yg = (float *)aligned_alloc(256, (size_t)M*rows*4);
+    double freq = (double)rdfreq();
+    ds4f_gemm(m, Yg, &t, X, M, rows, cols);           /* warm */
+    uint64_t t0 = rdcyc(); ds4f_gemm(m, Yg, &t, X, M, rows, cols); uint64_t t1 = rdcyc();
+
+    double ms_g = (double)(t1-t0)/freq*1e3;
+    double sd = 0.0, sr = 0.0; int nbad = 0, amatch = 0;   /* relL2 = ||Yg-Yref|| / ||Yref|| */
+    for (size_t k = 0; k < (size_t)M*rows; k++) {
+        double d = (double)Yg[k]-(double)Yref[k]; sd += d*d; sr += (double)Yref[k]*(double)Yref[k];
+        if (!isfinite(Yg[k])) nbad++;
+    }
+    for (int mm = 0; mm < M; mm++) {
+        const float *r = Yref + (size_t)mm*rows, *a = Yg + (size_t)mm*rows;
+        int ar=0, aa=0; for (int i=1;i<rows;i++){ if(r[i]>r[ar])ar=i; if(a[i]>a[aa])aa=i; }
+        if (ar==aa) amatch++;
+    }
+    double relL2 = sr>0 ? sqrt(sd/sr) : 0.0;
+    double gmac = (double)rows*(double)K*(double)M;
+    int ok = (amatch == M && nbad == 0 && relL2 < 5e-2);   /* argmax-exact; relL2 < bf16-trunc bound */
+    printf("  FP8      rows=%-6d cols=%-5d M=%-3d  %7.2fms  %6.1f Gmac/s  relL2=%.2e argmax=%d/%d  %s\n",
+           rows, cols, M, ms_g, ms_g>0?gmac/(ms_g*1e6):0.0, relL2, amatch, M, ok?"OK":"FAIL");
+    free(W); free(ES); free(X); free(Yref); free(Yg);
+    return ok ? 0 : 1;
+}
+
+/* MXFP4 (DS4F_MXFP4) expert GEMM correctness + throughput. The expert weights are
+ * 2 fp4 nibbles/byte + per-32 E8M0 scale; the kernel (matvec_mxfp4_8row[_2x]) dequants
+ * the nibbles in-register via svtbl (NO gather, NO LUT, NO resident bf16) -- already
+ * the on-register SVE-ld+SVE-insn dequant the user asked for. GEMM is group-outer,
+ * token-inner, 2-token register-blocked so each 8-row group's nibbles are HBM-read
+ * once and the svtbl dequant amortizes across the M tokens. We feed random nibbles +
+ * E8M0~=1.0; both the single-token matvec ref and the GEMM read the same bytes, so the
+ * comparison is self-consistent (gate = argmax-exact + relL2; reassoc only). */
+static int run_mxfp4_case(ds4f_model *m, int rows, int cols, int M) {
+    int K = cols;
+    size_t wb = (size_t)rows * K / 2, sb = (size_t)rows * K / 32;
+    uint8_t *W  = (uint8_t *)aligned_alloc(256, (wb + 255) & ~(size_t)255);
+    uint8_t *S  = (uint8_t *)aligned_alloc(256, (sb + 255) & ~(size_t)255);
+    for (size_t i = 0; i < wb; i++) { rng = rng*1664525u + 1013904223u; W[i] = (uint8_t)(rng >> 24); }
+    for (size_t i = 0; i < sb; i++) { rng = rng*1664525u + 1013904223u; S[i] = (uint8_t)(126 + (rng>>20)%3); } /* E8M0 ~ 1.0 */
+    ds4f_tensor t; memset(&t, 0, sizeof(t));
+    t.type = DS4F_MXFP4; t.rows = rows; t.cols = cols; t.w = W; t.scale = S;
+
+    float *X = (float *)aligned_alloc(256, (size_t)M*cols*4);
+    for (size_t k = 0; k < (size_t)M*cols; k++) X[k] = frand();
+
+    float *Yref = (float *)aligned_alloc(256, (size_t)M*rows*4);
+    for (int mm = 0; mm < M; mm++) ds4f_matvec(m, Yref + (size_t)mm*rows, &t, X + (size_t)mm*cols);
+
+    float *Ys = (float *)aligned_alloc(256, (size_t)M*rows*4);   /* svtbl 2x path */
+    float *Yt = (float *)aligned_alloc(256, (size_t)M*rows*4);   /* tile-dequant path */
+    double freq = (double)rdfreq();
+    m->mxfp4_gemm_tile = 0;                            /* svtbl per-token-pair */
+    ds4f_gemm(m, Ys, &t, X, M, rows, cols);            /* warm */
+    uint64_t t0 = rdcyc(); ds4f_gemm(m, Ys, &t, X, M, rows, cols); uint64_t t1 = rdcyc();
+    m->mxfp4_gemm_tile = 1;                            /* tile-dequant (thr=1 => always on) */
+    ds4f_gemm(m, Yt, &t, X, M, rows, cols);            /* warm */
+    uint64_t t2 = rdcyc(); ds4f_gemm(m, Yt, &t, X, M, rows, cols); uint64_t t3 = rdcyc();
+    m->mxfp4_gemm_tile = 0;
+
+    double ms_s = (double)(t1-t0)/freq*1e3, ms_t = (double)(t3-t2)/freq*1e3;
+    double sd = 0.0, sr = 0.0; int nbad = 0, amatch = 0;   /* tile-dequant vs f32 ref */
+    for (size_t k = 0; k < (size_t)M*rows; k++) {
+        double d = (double)Yt[k]-(double)Yref[k]; sd += d*d; sr += (double)Yref[k]*(double)Yref[k];
+        if (!isfinite(Yt[k])) nbad++;
+    }
+    for (int mm = 0; mm < M; mm++) {
+        const float *r = Yref + (size_t)mm*rows, *a = Yt + (size_t)mm*rows;
+        int ar=0, aa=0; for (int i=1;i<rows;i++){ if(r[i]>r[ar])ar=i; if(a[i]>a[aa])aa=i; }
+        if (ar==aa) amatch++;
+    }
+    double relL2 = sr>0 ? sqrt(sd/sr) : 0.0;
+    double gmac = (double)rows*(double)K*(double)M;
+    int ok = (amatch == M && nbad == 0 && relL2 < 5e-2);
+    printf("  MXFP4    rows=%-6d cols=%-5d M=%-3d  svtbl=%7.2fms tile=%7.2fms %4.2fx  tile=%6.1f Gmac/s  relL2=%.2e argmax=%d/%d  %s\n",
+           rows, cols, M, ms_s, ms_t, ms_t>0?ms_s/ms_t:0.0, ms_t>0?gmac/(ms_t*1e6):0.0, relL2, amatch, M, ok?"OK":"FAIL");
+    free(W); free(S); free(X); free(Yref); free(Ys); free(Yt);
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     int nthr = (argc > 1) ? atoi(argv[1]) : 12;
     int ncmg = (argc > 2) ? atoi(argv[2]) : 1;
@@ -117,6 +239,7 @@ int main(int argc, char **argv) {
     ds4f_model m; memset(&m, 0, sizeof(m));
     m.n_threads = nthr; m.n_cmgs = ncmg;
     m.pool = ds4f_pool_start(nthr, ncmg);
+    ds4f_init_fp8_e4m3_lut(m.fp8_lut);    /* gather path needs the LUT */
 
     printf("ds4f_gemm_test  nthr=%d n_cmgs=%d\n", nthr, ncmg);
     int fails = 0;
@@ -141,6 +264,23 @@ int main(int argc, char **argv) {
         for (int s = 0; s < ns; s++)
             for (int mi = 0; mi < nM; mi++)
                 fails += run_case(&m, tys[ti], shapes[s].rows, shapes[s].cols, Ms[mi]);
+
+    /* FP8 on-demand prefill GEMM (DS4F_FP8_BF16=0, -6 GB): tile-dequant correctness
+     * (vs single-token f32 ref, argmax-exact + relL2) and throughput at the M values
+     * the prefill batches over. */
+    printf("\n--- FP8 on-demand prefill GEMM (tile-dequant, no resident bf16) ---\n");
+    for (int s = 0; s < ns; s++)
+        for (int mi = 0; mi < nM; mi++)
+            fails += run_fp8_case(&m, shapes[s].rows, shapes[s].cols, Ms[mi]);
+
+    /* MXFP4 expert GEMM: svtbl register dequant (no gather/LUT/resident bf16),
+     * group-outer 2-token-blocked. Real expert shapes: w1/w3 [moe_inter,hidden],
+     * w2 [hidden,moe_inter] with moe_inter=2048, hidden=4096. */
+    printf("\n--- MXFP4 expert GEMM (svtbl register dequant) ---\n");
+    struct { int rows, cols; } mxsh[] = { {2048, 4096}, {4096, 2048} };
+    for (int s = 0; s < (int)(sizeof(mxsh)/sizeof(mxsh[0])); s++)
+        for (int mi = 0; mi < nM; mi++)
+            fails += run_mxfp4_case(&m, mxsh[s].rows, mxsh[s].cols, Ms[mi]);
 
     ds4f_pool_stop(m.pool);
     printf("%s  (%d failure%s)\n", fails ? "FAIL" : "ALL OK", fails, fails == 1 ? "" : "s");
