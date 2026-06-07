@@ -5226,7 +5226,8 @@ struct cuda_llm_runner {
     float h_topk_wgt[8];
     CUdeviceptr d_grid_ksigns;  /* grid tables for cubin kernels */
     CUdeviceptr d_grid_iq2s;
-    CUdeviceptr d_grid_iq3;
+    CUdeviceptr d_grid_iq3;   /* iq3xxs_grid (256) — not used, keep for compat */
+    CUdeviceptr d_grid_iq3s;  /* iq3s_grid (512) — correct for IQ3_S down */
     /* Host-side PLE data (mmap pointers from GGUF, valid while GGUF is open) */
     qtensor h_ple_token_embd;       /* Q8_0 per_layer_token_embd */
     qtensor h_ple_model_proj;       /* BF16 per_layer_model_proj */
@@ -9367,8 +9368,9 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                              cl->moe_gate_rows, cl->moe_gate_cols);
 
             /* Fused decode: GPU top-k + 8 parallel expert blocks + shared gate */
-            /* NOTE: moe_expert_fused disabled (dequant produces NaN — pointer issue in cubin).
-             * Use fallback path below until the cubin kernel is fixed. */
+            /* Fused expert kernel disabled: 8 blocks × 128 threads underutilizes SMs.
+             * Each matvec needs grid=(out_dim/8) for full SM parallelism.
+             * Use fallback path (24 launches/layer × 65 blocks/launch = full occupancy). */
             if (0 && r->fn_moe_expert_fused && r->fn_moe_topk_gpu) {
                 if (!r->d_topk_idx) cuMemAlloc(&r->d_topk_idx, 8 * sizeof(int));
                 if (!r->d_topk_wgt) cuMemAlloc(&r->d_topk_wgt, 8 * sizeof(float));
@@ -9392,14 +9394,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                         fprintf(stderr, "  [MoE] uploading grid tables...\n");
                         CUresult ge = cuMemAlloc(&r->d_grid_ksigns, sizeof(_grid_ksigns));
                         ge |= cuMemAlloc(&r->d_grid_iq2s, sizeof(_grid_iq2s));
-                        ge |= cuMemAlloc(&r->d_grid_iq3, sizeof(_grid_iq3));
+                        ge |= cuMemAlloc(&r->d_grid_iq3s, sizeof(_grid_iq3s));
                         if (ge != CUDA_SUCCESS) {
                             fprintf(stderr, "  [MoE] grid alloc failed!\n");
                             r->d_grid_ksigns = 0;
                         } else {
                             cuMemcpyHtoD(r->d_grid_ksigns, _grid_ksigns, sizeof(_grid_ksigns));
                             cuMemcpyHtoD(r->d_grid_iq2s, _grid_iq2s, sizeof(_grid_iq2s));
-                            cuMemcpyHtoD(r->d_grid_iq3, _grid_iq3, sizeof(_grid_iq3));
+                            cuMemcpyHtoD(r->d_grid_iq3s, _grid_iq3s, sizeof(_grid_iq3s));
                         }
                     }
                     CUdeviceptr d_ge = cl->moe_gate_exps_w;
@@ -9410,7 +9412,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                                     &d_ge, &d_ue, &d_de,
                                     &n_embd, &expert_ff,
                                     &cl->moe_exp_stride_gu, &cl->moe_exp_stride_d,
-                                    &r->d_grid_ksigns, &r->d_grid_iq2s, &r->d_grid_iq3 };
+                                    &r->d_grid_ksigns, &r->d_grid_iq2s, &r->d_grid_iq3s };
                     cuLaunchKernel(r->fn_moe_expert_fused, n_used,1,1, 128,1,1,
                                    0, r->stream, efa, NULL);
                 }
@@ -11209,6 +11211,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_topk_wgt)    cuMemFree(r->d_topk_wgt);
     if (r->d_grid_ksigns) cuMemFree(r->d_grid_ksigns);
     if (r->d_grid_iq2s)   cuMemFree(r->d_grid_iq2s);
+    if (r->d_grid_iq3s)   cuMemFree(r->d_grid_iq3s);
     if (r->d_grid_iq3)    cuMemFree(r->d_grid_iq3);
     if (r->moe_gpu_mod)   cuModuleUnload(r->moe_gpu_mod);
     if (r->d_hidden_snapshots) cuMemFree(r->d_hidden_snapshots);

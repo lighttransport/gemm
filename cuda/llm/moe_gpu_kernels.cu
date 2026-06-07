@@ -92,28 +92,22 @@ extern "C" __global__ void moe_expert_fused(
     size_t stride_gu, size_t stride_d,
     const unsigned char *grid_ksigns,
     const unsigned long long *grid_iq2s,
-    const unsigned int *grid_iq3)
+    const unsigned int *grid_iq3s)
 {
     int ei = blockIdx.x;
     int eidx = expert_idx[ei];
     float wgt = expert_wgt[ei];
     if (eidx < 0) return;
 
-    __shared__ float sx[2048];
-    __shared__ float sg[512];
-    __shared__ float su[512];
+    __shared__ float sx[2048], sg[512], su[512];
 
     int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
 
-    /* DEBUG: write grid[0] to verify parameter-passing works */
-    if (tid == 0) {
-        accum[0] = (float)(unsigned char)(grid_iq2s[0] & 0xff);
-        accum[1] = (float)(unsigned char)(grid_ksigns[0]);
-    }
-    return;
-
     for (int i = tid; i < n_embd; i += 128) sx[i] = xb[i];
     __syncthreads();
+
+    /* DEBUG: init accum for this block */
+    if (tid == 0) { accum[0] = (float)(ei + 1) * 10.0f; }
 
     /* Gate IQ2_S */
     {
@@ -189,7 +183,7 @@ extern "C" __global__ void moe_expert_fused(
         sg[i] = (sg[i] / (1.0f + expf(-sg[i]))) * su[i];
     __syncthreads();
 
-    /* Down IQ3_S */
+    /* Down IQ3_S (correct layout: 110 bytes/block, iq3s_grid with 512 entries) */
     {
         int nb = expert_ff / 256, rb = nb * 110;
         for (int r = warp; r < n_embd; r += 4) {
@@ -198,30 +192,52 @@ extern "C" __global__ void moe_expert_fused(
             for (int b = lane; b < nb; b += 32) {
                 const unsigned char *bp = rp + (size_t)b * 110;
                 float d = __half2float(*(const __half *)bp);
-                const unsigned char *qs = bp+2, *ss = qs+64;
+                if (isnan(d)) d = 1.0f; /* safety: clamp NaN from bad pointer */
+                const unsigned char *qs = bp + 2;
+                const unsigned char *qh_base = bp + 2 + 64;
+                const unsigned char *signs_base = bp + 2 + 64 + 8;
+                const unsigned char *scales = bp + 2 + 64 + 8 + 32;
                 const float *gg = sg + b * 256;
-                float p = 0; int yi = 0;
-                for (int ib = 0; ib < 8; ib++) {
-                    unsigned aux32;
-                    memcpy(&aux32, ss + 4*ib, 4);
-                    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
-                    for (int lx = 0; lx < 4; lx++) {
-                        unsigned char sb = (unsigned char)grid_ksigns[(aux32>>(7*lx))&127];
-                        unsigned g1 = grid_iq3[qs[2*lx+0]];
-                        unsigned g2 = grid_iq3[qs[2*lx+1]];
+                float p = 0; int yi = 0, qhi = 0, si = 0;
+                for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+                    float db1 = d * (float)(1 + 2*(scales[ib32/2] & 0xf));
+                    float db2 = d * (float)(1 + 2*(scales[ib32/2] >>  4));
+                    for (int l = 0; l < 4; l++) {
+                        unsigned g1 = qs[2*l+0] | ((qh_base[qhi] << (8-2*l)) & 256);
+                        unsigned g2 = qs[2*l+1] | ((qh_base[qhi] << (7-2*l)) & 256);
+                        const unsigned char *grid1 = (const unsigned char *)&grid_iq3s[g1];
+                        const unsigned char *grid2 = (const unsigned char *)&grid_iq3s[g2];
+                        unsigned char sn = signs_base[si + l];
                         for (int j = 0; j < 4; j++) {
-                            float w0 = db*(float)(unsigned char)(g1>>(8*j))*((sb&(1<<j))?-1.0f:1.0f);
-                            float w1 = db*(float)(unsigned char)(g2>>(8*j))*((sb&(1<<(j+4)))?-1.0f:1.0f);
+                            float w0 = db1 * (float)grid1[j] * ((sn & (1<<j)) ? -1.0f : 1.0f);
+                            float w1 = db1 * (float)grid2[j] * ((sn & (1<<(j+4))) ? -1.0f : 1.0f);
                             p += w0*gg[yi+j] + w1*gg[yi+j+4];
                         }
                         yi += 8;
                     }
-                    qs += 8;
+                    qs += 8; si += 4;
+                    for (int l = 0; l < 4; l++) {
+                        unsigned g1 = qs[2*l+0] | ((qh_base[qhi+1] << (8-2*l)) & 256);
+                        unsigned g2 = qs[2*l+1] | ((qh_base[qhi+1] << (7-2*l)) & 256);
+                        const unsigned char *grid1 = (const unsigned char *)&grid_iq3s[g1];
+                        const unsigned char *grid2 = (const unsigned char *)&grid_iq3s[g2];
+                        unsigned char sn = signs_base[si + l];
+                        for (int j = 0; j < 4; j++) {
+                            float w0 = db2 * (float)grid1[j] * ((sn & (1<<j)) ? -1.0f : 1.0f);
+                            float w1 = db2 * (float)grid2[j] * ((sn & (1<<(j+4))) ? -1.0f : 1.0f);
+                            p += w0*gg[yi+j] + w1*gg[yi+j+4];
+                        }
+                        yi += 8;
+                    }
+                    qs += 8; si += 4; qhi += 2;
                 }
                 s += p;
             }
             for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffff, s, o);
-            if (lane == 0) atomicAdd(&accum[r], wgt * s);
+            if (lane == 0) {
+                float v = wgt * s;
+                if (!isnan(v)) atomicAdd(&accum[r], v);
+            }
         }
     }
 }
