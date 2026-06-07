@@ -145,6 +145,12 @@ export DS4F_QNR_PAR=${DS4F_QNR_PAR:-1}
 # Default 1 = split the index_heads across the pool (BIT-EXACT, disjoint per-head slices).
 # Was 4.68ms/tok = 5.0% of decode @ctx10240 (scalar, serial on tid0 inside ds4f_index_step).
 export DS4F_TB2ROPE_PAR=${DS4F_TB2ROPE_PAR:-1}
+# DS4F_INT8_KV=1 stores the window KV latent as int8 (per-channel STATIC scale calibrated
+# on the first DS4F_INT8KV_CAL positions; S5 scheme), halving the KV footprint (the long-ctx
+# memory dominator). LOSSY (~1% rel) -> argmax NOT bit-exact; coherence is the gate. Forces
+# EXACT; incompatible with batched prefill. Default 0 (bf16 kv_cache). Off => zero cost.
+export DS4F_INT8_KV=${DS4F_INT8_KV:-0}
+export DS4F_INT8KV_CAL=${DS4F_INT8KV_CAL:-256}
 export DS4F_PROF=${DS4F_PROF:-1}
 export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # TP_AR_BF16=1 halves the EP-combine reduce payload (16KB->8KB/all-reduce).
