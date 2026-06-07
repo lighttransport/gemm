@@ -9196,13 +9196,13 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 CUdeviceptr down_w = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
 
                 /* gate = expert_gate @ xb, up = expert_up @ xb */
-                if (!launch_moe_expert_cublas(r, cl, r->d_gate, eidx, 0, r->d_xb,
-                                              expert_ff, n_embd))
+                if (launch_moe_expert_cublas(r, cl, r->d_gate, eidx, 0, r->d_xb,
+                                              expert_ff, n_embd) != 0)
                     launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
                                       cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
 
-                if (!launch_moe_expert_cublas(r, cl, r->d_up, eidx, 0, r->d_xb,
-                                              expert_ff, n_embd))
+                if (launch_moe_expert_cublas(r, cl, r->d_up, eidx, 0, r->d_xb,
+                                              expert_ff, n_embd) != 0)
                     launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
                                       cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
 
@@ -9254,8 +9254,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
 
                 /* down = expert_down @ gate → d_xb2 */
-                if (!launch_moe_expert_cublas(r, cl, r->d_xb2, eidx, 1, r->d_gate,
-                                              cl->moe_exp_rows_d, cl->moe_exp_cols_d))
+                if (launch_moe_expert_cublas(r, cl, r->d_xb2, eidx, 1, r->d_gate,
+                                              cl->moe_exp_rows_d, cl->moe_exp_cols_d) != 0)
                     launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
                                       cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
 
@@ -9720,31 +9720,40 @@ static int __attribute__((used)) launch_moe_expert_cublas(cuda_llm_runner *r, cu
     /* Check if F16 shadow exists */
     int word = expert_idx / 64, bit = expert_idx % 64;
     if (!((cl->moe_f16_mask[word] >> bit) & 1)) {
+        int max_experts = r->n_experts < 96 ? r->n_experts : 96;
+        if (expert_idx >= max_experts) return -1; /* Can't lazy-upload, fall back */
+        
         if (!*w_f16) {
             /* Allocate F16 buffer for up to 96 experts (384 MB) to avoid OOM */
-            int max_experts = r->n_experts < 96 ? r->n_experts : 96;
             size_t f16_total = (size_t)rows * cols * sizeof(uint16_t) * max_experts;
             CUresult err = cuMemAlloc(w_f16, f16_total);
             if (err != CUDA_SUCCESS) return -1;
         }
-        /* If expert_idx >= max_experts, skip lazy upload — fall back to custom kernel */
-        size_t max_experts = (r->n_experts < 96 ? r->n_experts : 96);
-        if (expert_idx < (int)max_experts) {
-            size_t src_off = (size_t)expert_idx * raw_stride;
-            size_t dst_off = (size_t)expert_idx * rows * cols * sizeof(uint16_t);
-            CUdeviceptr src_ptr = w_quant + src_off;
-            CUdeviceptr dst_ptr = *w_f16 + dst_off;
-            void *args[] = { &dst_ptr, &src_ptr, &rows, &cols };
-            cuLaunchKernel(fn_dequant, (rows+7)/8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-            cl->moe_f16_mask[word] |= (1ULL << bit);
-        }
+        
+        size_t src_off = (size_t)expert_idx * raw_stride;
+        size_t dst_off = (size_t)expert_idx * rows * cols * sizeof(uint16_t);
+        CUdeviceptr src_ptr = w_quant + src_off;
+        CUdeviceptr dst_ptr = *w_f16 + dst_off;
+        void *args[] = { &dst_ptr, &src_ptr, &rows, &cols };
+        cuLaunchKernel(fn_dequant, (rows+7)/8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream); /* Ensure dequant completes before GEMM */
+        cl->moe_f16_mask[word] |= (1ULL << bit);
     }
-    /* If expert doesn't have F16 shadow, fall back */
     
-    /* cuBLAS GEMM */
+    /* Convert F32 input to F16 for Blackwell F16×F16 GEMM */
+    CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
+    if (!d_x_f16) return -1;
+    
+    int n_elems = in_dim;
+    void *cv_args[] = { &d_x_f16, &x, &n_elems };
+    cuLaunchKernel(r->fn_convert_f32_to_f16,
+        (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, cv_args, NULL);
+    
+    /* cuBLAS F16×F16 GEMM: Y[1×out_dim] = X_F16[1×in_dim] × W_F16[out_dim×in_dim]^T */
     size_t f16_off = (size_t)expert_idx * rows * cols * sizeof(uint16_t);
     CUdeviceptr w_ptr = *w_f16 + f16_off;
-    int ret = cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, dst, w_ptr, x, 1, out_dim, in_dim);
+    int ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas,
+        dst, w_ptr, d_x_f16, 1, out_dim, in_dim);
     return (ret == 0) ? 0 : -1;
 }
 
