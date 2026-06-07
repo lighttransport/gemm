@@ -250,7 +250,8 @@ int main(void) {
     const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
     int bf16_pv = (pv_e && *pv_e) ? (atoi(pv_e) != 0) : dense_bf16;
     int no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
-    size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16);
+    size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16,
+                                       envi("DS4F_TIERB2", 0) && !envi("DS4F_INT8_KV", 0));
     if (MyRank == 0)
         logmsg("=== DS4F EP synthetic harness (Stage 2): %d ranks ===\n"
                "layers=%d hidden=%d experts=%d active=%d  owned~%d/layer  dense=%s\n"

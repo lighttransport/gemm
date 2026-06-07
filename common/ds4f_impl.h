@@ -1505,7 +1505,10 @@ static inline int ds4f_n_owned(int n_experts, int ep_rank, int ep_size) {
     int c = 0; for (int e = 0; e < n_experts; e++) if (e % ep_size == ep_rank) c++; return c;
 }
 
-static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, int dense_bf16) {
+/* ring = (tierb2 && !int8_kv): sparse layers ring-buffer kv_cache at window_size, so
+ * size the per-layer kv term accordingly (else max_pos for all layers). MUST match the
+ * kv_slots condition in ds4f_alloc_synth/ds4f_load_real or the arena over/under-shoots. */
+static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, int dense_bf16, int ring) {
     size_t pad = 256; /* per-tensor alignment slack */
     ds4f_qtype dq = dense_bf16 ? DS4F_BF16 : DS4F_FP8;
     int no = ds4f_n_owned(c->n_experts, ep_rank, ep_size);
@@ -1529,9 +1532,14 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     {   int hc = c->hc_mult, mix = (2+hc)*hc, hd = hc*c->hidden;
         per_layer += 2*((size_t)mix*hd*4 + (size_t)mix*4 + 3*4) + 6*pad;            /* hc_attn/ffn fn+base+scale */
     }
-    per_layer += (size_t)c->max_pos * c->kv_lora * sizeof(uint16_t) + pad;          /* kv cache (bf16) */
+    /* kv cache (bf16) is summed per-layer below (ring buffer => sparse layers shrink to
+     * window_size; not part of the uniform per_layer term). */
 
     size_t total = per_layer * c->n_layers;
+    for (int L = 0; L < c->n_layers; L++) {                                         /* kv cache (bf16), per-layer */
+        size_t slots = ring ? (size_t)c->window_size : (size_t)c->max_pos;          /* all layers window under tierb2 */
+        total += slots * c->kv_lora * sizeof(uint16_t) + pad;
+    }
     total += ds4f_wbytes(DS4F_BF16, c->vocab, c->hidden) + pad;                     /* embed */
     total += ds4f_wbytes(DS4F_BF16, c->vocab, c->hidden) + pad;                     /* head */
     total += (size_t)c->hidden*2 + pad;                                            /* out_norm */
@@ -1787,7 +1795,8 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
     m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
-                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV);
+                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV,
+                                  m->tierb2 && !m->int8_kv);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ|PROT_WRITE,
                                MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     if (m->arena == MAP_FAILED) { fprintf(stderr, "mmap %zu failed\n", m->arena_sz); abort(); }
@@ -1848,8 +1857,20 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
             ly->hc_ffn_fn     = (float *)ds4f_bump(m, (size_t)mix*hd*4, 256);
             ly->hc_ffn_base   = (float *)ds4f_bump(m, (size_t)mix*4, 64);
             ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3*4, 64); }
+        /* kv_cache window ring buffer (long-ctx memory lever; the dominant ctx-scaling cost).
+         * Under tierb2 EVERY read of kv_cache is window-only: sparse (ratio!=0) layers use
+         * ds4f_attn_tb2_worker (window term + cmp_kv for long range); dense (ratio==0) layers
+         * use ds4f_attn_exact_worker (pure sliding window + sink). Neither reads kv_cache past
+         * the last window_size positions, and prefill is token-at-a-time (batched prefill is
+         * forced off under tierb2/MHC), so ALL layers need only window_size slots -- older
+         * history lives in cmp_kv. Caps kv_cache to a constant ~window_size*KV*43 regardless
+         * of ctx. Gated on m->tierb2: the non-tierb2 synthetic path (ds4f_attn_worker full
+         * read, or batched-prefill ds4f_attn_pf_task needing all M positions) needs full
+         * max_pos; int8_kv keeps max_pos (kv_q ring deferred). All kv_cache indexing is
+         * (idx % kv_slots), a no-op when kv_slots==max_pos (bit-exact). */
+        ly->kv_slots = (!m->int8_kv && m->tierb2) ? cfg.window_size : cfg.max_pos;
         if (m->int8_kv) ds4f_alloc_int8kv(m, ly, &cfg);            /* int8 KV store (half) + calbuf + scales */
-        else ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos*cfg.kv_lora*sizeof(uint16_t), 256);
+        else ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)ly->kv_slots*cfg.kv_lora*sizeof(uint16_t), 256);
     }
 
     /* parallel first-touch fill of all quantized tensors (compute-thread ==
@@ -2389,7 +2410,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
     m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
-                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV);
+                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV,
+                                  m->tierb2 && !m->int8_kv);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (m->arena == MAP_FAILED) { fprintf(stderr, "ds4f_load_real: arena mmap %zu failed\n", m->arena_sz); abort(); }
@@ -2449,8 +2471,11 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             ly->hc_ffn_fn     = (float *)ds4f_bump(m, (size_t)mix * hd * 4, 256);
             ly->hc_ffn_base   = (float *)ds4f_bump(m, (size_t)mix * 4, 64);
             ly->hc_ffn_scale  = (float *)ds4f_bump(m, (size_t)3 * 4, 64); }
+        /* kv_cache ring buffer: sparse layers need only window_size slots (older history
+         * served by cmp_kv); dense layers (0,1) keep max_pos. See ds4f_alloc_synth. */
+        ly->kv_slots = (!m->int8_kv && m->tierb2) ? cfg.window_size : cfg.max_pos;
         if (m->int8_kv) ds4f_alloc_int8kv(m, ly, &cfg);            /* int8 KV store (half) + calbuf + scales */
-        else ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)cfg.max_pos * cfg.kv_lora * sizeof(uint16_t), 256);
+        else ly->kv_cache = (uint16_t *)ds4f_bump(m, (size_t)ly->kv_slots * cfg.kv_lora * sizeof(uint16_t), 256);
     }
     if (m->tierb2) ds4f_alloc_tb2(m, 0);   /* off-arena compressor/indexer (load by name below) */
 
@@ -2858,9 +2883,9 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
         float mx = -1e30f;
         for (int j = 0; j < nP; j++) {
             float s;                                                      /* HD==KV (512) */
-            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 s = sve ? ds4f_sve_dot_i8s(q, kc, kvsc, KV) : ds4f_scalar_dot_i8s(q, kc, kvsc, KV); }
-            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+            else { const uint16_t *kc = kvbf + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
                 else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); } }
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
@@ -2873,9 +2898,9 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int j = 0; j < nP; j++) {
             float w = sc[j]*inv;
-            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 if (sve) ds4f_sve_axpy_i8s(out, kc, kvsc, w, HD); else ds4f_scalar_axpy_i8s(out, kc, kvsc, w, HD); }
-            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+            else { const uint16_t *kc = kvbf + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
                 else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]); }
         }
@@ -2959,9 +2984,9 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         float mx = -1e30f;
         for (int j = 0; j < nP; j++) {                          /* window term (kv_cache) */
             float s;
-            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 s = sve ? ds4f_sve_dot_i8s(q, kc, kvsc, KV) : ds4f_scalar_dot_i8s(q, kc, kvsc, KV); }
-            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+            else { const uint16_t *kc = kvbf + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
                 else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); } }
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
@@ -2985,9 +3010,9 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         for (int d = 0; d < HD; d++) out[d] = 0.f;
         for (int j = 0; j < nP; j++) {
             float w = sc[j]*inv;
-            if (i8) { const int8_t *kc = ly->kv_q + (size_t)(p_lo + j)*KV;
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 if (sve) ds4f_sve_axpy_i8s(out, kc, kvsc, w, HD); else ds4f_scalar_axpy_i8s(out, kc, kvsc, w, HD); }
-            else { const uint16_t *kc = kvbf + (size_t)(p_lo + j)*KV;
+            else { const uint16_t *kc = kvbf + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                 if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
                 else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]); }
         }
@@ -3180,7 +3205,11 @@ static void ds4f_warm_kv(ds4f_model *m, int npos) {
             }
         } else {
             uint16_t *kc = ly->kv_cache;
-            for (int p = 0; p < npos; p++) {
+            /* ring buffer: sparse layers hold only kv_slots(=window_size) slots; fill just
+             * those (the decode at pos=npos reads the window ((pos-w+1..pos) % kv_slots),
+             * all of which land in [0,kv_slots)). Dense layers have kv_slots==max_pos => npos. */
+            int nfill = (npos < ly->kv_slots) ? npos : ly->kv_slots;
+            for (int p = 0; p < nfill; p++) {
                 uint16_t *row = kc + (size_t)p*KV;
                 for (int d = 0; d < KV; d++) row[d] = ds4f_f32bf(DS4F_WARMKV_NEXT());
             }
@@ -3545,7 +3574,7 @@ static void ds4f_attn_prefill_worker(void *arg, int tid, int nthr) {
                 const float *q = m->p_q + (size_t)mm*H + (size_t)h*HD;
                 float mx = -1e30f;
                 for (int j = 0; j < nP; j++) {
-                    const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+                    const uint16_t *kc = ly->kv_cache + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                     float s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]);
                     s *= scale; sc[j] = s; if (s > mx) mx = s;
                 }
@@ -3555,7 +3584,7 @@ static void ds4f_attn_prefill_worker(void *arg, int tid, int nthr) {
                 float *out = m->p_attn + (size_t)mm*H + (size_t)h*HD;
                 for (int d = 0; d < HD; d++) out[d] = 0.f;
                 for (int j = 0; j < nP; j++) {
-                    float w = sc[j]*inv; const uint16_t *kc = ly->kv_cache + (size_t)(p_lo + j)*KV;
+                    float w = sc[j]*inv; const uint16_t *kc = ly->kv_cache + (size_t)((p_lo + j) % ly->kv_slots)*KV;
                     for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]);
                 }
                 ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, T->half, 1);
@@ -3833,7 +3862,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
         ds4f_chk("kvlat", L, m->s_kvlat, KV);
         if (m->int8_kv) ds4f_kv_append_i8(ly, m->s_kvlat, pos, KV, ds4f_int8kv_cal);  /* int8 KV (S5) */
-        else { uint16_t *dst = ly->kv_cache + (size_t)pos*KV;             /* append latent (f32->bf16) */
+        else { uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;  /* append latent (f32->bf16); ring for sparse layers */
           for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(m->s_kvlat[d]); }
         DS4F_TOC(DS4F_P_QKV); }
         /* ---- Tier-B2 compressor/indexer step (timed apart from the attn worker) ---- */
