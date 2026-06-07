@@ -3972,6 +3972,77 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- dequant_iq2_xxs_to_f16: IQ2_XXS expert slice -> F16 ---- */\n"
+"/* Writes rows_per_expert x n_cols F16 values to dst */\n"
+"__global__ void dequant_iq2_xxs_to_f16(half_raw *dst, const unsigned char *mat,\n"
+"                                         int rows, int cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= rows) return;\n"
+"    int nb = cols / 256;\n"
+"    int row_bytes = nb * 66;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    half_raw *dst_row = dst + (size_t)row * cols;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        half_raw *d_b = dst_row + b * 256;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                unsigned long long gv = iq2xxs_grid_dev[aux8[l]];\n"
+"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    float w = db * (float)(unsigned char)(gv >> (8*j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    d_b[ib32 * 32 + l * 8 + j] = float_to_half(w);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- dequant_iq3_xxs_to_f16: IQ3_XXS expert slice -> F16 ---- */\n"
+"__global__ void dequant_iq3_xxs_to_f16(half_raw *dst, const unsigned char *mat,\n"
+"                                         int rows, int cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= rows) return;\n"
+"    int nb = cols / 256;\n"
+"    int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    half_raw *dst_row = dst + (size_t)row * cols;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *scales_and_signs = qs + 64;\n"
+"        half_raw *d_b = dst_row + b * 256;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            unsigned int aux32;\n"
+"            memcpy(&aux32, scales_and_signs + 4*ib32, 4);\n"
+"            float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                unsigned char sgn = (unsigned char)ksigns_iq2xs_dev[(aux32 >> (7*l)) & 127];\n"
+"                unsigned int gv1 = iq3xxs_grid_dev[qs[2*l+0]];\n"
+"                unsigned int gv2 = iq3xxs_grid_dev[qs[2*l+1]];\n"
+"                for (int j = 0; j < 4; j++) {\n"
+"                    float w0 = db * (float)(unsigned char)(gv1 >> (8*j)) * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    float w1 = db * (float)(unsigned char)(gv2 >> (8*j)) * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"                    d_b[ib32 * 32 + l * 8 + j] = float_to_half(w0);\n"
+"                    d_b[ib32 * 32 + l * 8 + j + 4] = float_to_half(w1);\n"
+"                }\n"
+"            }\n"
+"            qs += 8;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "/* Batched IQ2_S TensorCore matvec: 16 rows x 8 tokens via mma.sync */\n"
 "__global__ void batch_matvec_iq2_s_tc(float *output, const unsigned char *mat, const float *input,\n"
 "                                        int out_dim, int in_dim, int n_tokens) {\n"
@@ -4746,6 +4817,7 @@ typedef struct {
     CUdeviceptr moe_up_exps_w_f16;  /* F16 shadow for cuBLAS */
     CUdeviceptr moe_down_exps_w;    /* K-quant [n_embd, expert_ff, n_experts] */
     CUdeviceptr moe_down_exps_w_f16; /* F16 shadow for cuBLAS */
+    uint64_t moe_f16_mask[4];       /* bitmask: which experts have F16 uploaded (256 bits) */
     int moe_gate_exps_type, moe_up_exps_type, moe_down_exps_type;
     int moe_exp_rows_gu, moe_exp_cols_gu;   /* per-expert dims for gate/up: [expert_ff, n_embd] */
     int moe_exp_rows_d, moe_exp_cols_d;     /* per-expert dims for down: [n_embd, expert_ff] */
@@ -4885,6 +4957,8 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_iq4_xs;
     CUfunction fn_moe_topk_kernel;
     CUfunction fn_dequant_iq2_s_to_f16;
+    CUfunction fn_dequant_iq2_xxs_to_f16;
+    CUfunction fn_dequant_iq3_xxs_to_f16;
     CUfunction fn_batch_matvec_iq2_s_tc;
     CUfunction fn_batch_matvec_iq3_xxs;
     CUfunction fn_batch_matvec_iq3_s;
@@ -5298,6 +5372,8 @@ lookup_funcs:
     GET_FUNC(batch_matvec_iq4_xs);
     GET_FUNC(moe_topk_kernel);
     GET_FUNC(dequant_iq2_s_to_f16);
+    GET_FUNC(dequant_iq2_xxs_to_f16);
+    GET_FUNC(dequant_iq3_xxs_to_f16);
     GET_FUNC(batch_matvec_iq2_s_tc);
     GET_FUNC(batch_matvec_iq3_xxs);
     GET_FUNC(batch_matvec_iq3_s);
@@ -6108,10 +6184,8 @@ static int upload_3d_kquant_f16(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qt
     size_t f16_stride = (size_t)rows_per_expert * cols * sizeof(uint16_t);
     size_t total_bytes = f16_stride * n_experts;
     
-    /* Skip if very large to avoid OOM (allow up to 600 MB per tensor = full expert shadow) */
-    if (total_bytes > 600 * 1024 * 1024) {
-        fprintf(stderr, "cuda_llm: skipping F16 shadow for moe tensor (%zu MB > 400 MB limit)\n",
-                total_bytes / (1024*1024));
+    /* For large expert tensors (>10 MB), skip bulk upload — lazy per-expert upload at runtime */
+    if (total_bytes > 10 * 1024 * 1024) {
         *d_ptr = 0; return 0;
     }
     
@@ -8070,6 +8144,11 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
 /* Public API: forward                                                      */
 /* ======================================================================== */
 
+/* Forward declaration for MoE cuBLAS helper (used in cuda_llm_forward_blocks) */
+static int launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
+    CUdeviceptr dst, int expert_idx, int is_down,
+    CUdeviceptr x, int out_dim, int in_dim);
+
 static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int apply_final_norm, int copy_to_host);
 
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
@@ -9117,10 +9196,15 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 CUdeviceptr down_w = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
 
                 /* gate = expert_gate @ xb, up = expert_up @ xb */
-                launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
-                launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
+                if (!launch_moe_expert_cublas(r, cl, r->d_gate, eidx, 0, r->d_xb,
+                                              expert_ff, n_embd))
+                    launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
+                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
+
+                if (!launch_moe_expert_cublas(r, cl, r->d_up, eidx, 0, r->d_xb,
+                                              expert_ff, n_embd))
+                    launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
+                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
 
                 if (r->debug_layers >= 2 && l == 0 && e == 0) {
                     MOE_DBG_NORM("e0 gate_out", r->d_gate, expert_ff);
@@ -9170,8 +9254,10 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
 
                 /* down = expert_down @ gate → d_xb2 */
-                launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
-                                  cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
+                if (!launch_moe_expert_cublas(r, cl, r->d_xb2, eidx, 1, r->d_gate,
+                                              cl->moe_exp_rows_d, cl->moe_exp_cols_d))
+                    launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
+                                      cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
 
                 if (r->debug_layers >= 2 && l == 0 && e == 0) {
                     MOE_DBG_NORM("e0 silu_mul", r->d_gate, expert_ff);
@@ -9598,6 +9684,68 @@ static void launch_batch_embed_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     cuLaunchKernel(r->fn_batch_embed_f16,
                    (n_embd + 255) / 256, n_tokens, 1,
                    256, 1, 1, 0, r->stream, a, NULL);
+}
+
+/* Helper: ensure F16 shadow exists for MoE expert, then run cuBLAS matvec.
+ * Returns 0 on success (cuBLAS used), -1 to fall back to custom kernel. */
+static int __attribute__((used)) launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
+    CUdeviceptr dst, int expert_idx, int is_down,
+    CUdeviceptr x, int out_dim, int in_dim) {
+    if (!r->use_cublas || !r->cublas) return -1;
+    
+    CUdeviceptr *w_f16;
+    CUdeviceptr w_quant;
+    int rows, cols, type;
+    size_t raw_stride;
+    CUfunction fn_dequant;
+    
+    if (is_down) {
+        w_f16 = &cl->moe_down_exps_w_f16;
+        w_quant = cl->moe_down_exps_w;
+        raw_stride = cl->moe_exp_stride_d;
+        type = cl->moe_down_exps_type;
+        rows = cl->moe_exp_rows_d;
+        cols = cl->moe_exp_cols_d;
+        fn_dequant = r->fn_dequant_iq3_xxs_to_f16;
+    } else {
+        w_f16 = &cl->moe_gate_exps_w_f16;
+        w_quant = cl->moe_gate_exps_w;
+        raw_stride = cl->moe_exp_stride_gu;
+        type = cl->moe_gate_exps_type;
+        rows = cl->moe_exp_rows_gu;
+        cols = cl->moe_exp_cols_gu;
+        fn_dequant = r->fn_dequant_iq2_xxs_to_f16;
+    }
+    
+    /* Check if F16 shadow exists */
+    int word = expert_idx / 64, bit = expert_idx % 64;
+    if (!((cl->moe_f16_mask[word] >> bit) & 1)) {
+        if (!*w_f16) {
+            /* Allocate F16 buffer for up to 96 experts (384 MB) to avoid OOM */
+            int max_experts = r->n_experts < 96 ? r->n_experts : 96;
+            size_t f16_total = (size_t)rows * cols * sizeof(uint16_t) * max_experts;
+            CUresult err = cuMemAlloc(w_f16, f16_total);
+            if (err != CUDA_SUCCESS) return -1;
+        }
+        /* If expert_idx >= max_experts, skip lazy upload — fall back to custom kernel */
+        size_t max_experts = (r->n_experts < 96 ? r->n_experts : 96);
+        if (expert_idx < (int)max_experts) {
+            size_t src_off = (size_t)expert_idx * raw_stride;
+            size_t dst_off = (size_t)expert_idx * rows * cols * sizeof(uint16_t);
+            CUdeviceptr src_ptr = w_quant + src_off;
+            CUdeviceptr dst_ptr = *w_f16 + dst_off;
+            void *args[] = { &dst_ptr, &src_ptr, &rows, &cols };
+            cuLaunchKernel(fn_dequant, (rows+7)/8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            cl->moe_f16_mask[word] |= (1ULL << bit);
+        }
+    }
+    /* If expert doesn't have F16 shadow, fall back */
+    
+    /* cuBLAS GEMM */
+    size_t f16_off = (size_t)expert_idx * rows * cols * sizeof(uint16_t);
+    CUdeviceptr w_ptr = *w_f16 + f16_off;
+    int ret = cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, dst, w_ptr, x, 1, out_dim, in_dim);
+    return (ret == 0) ? 0 : -1;
 }
 
 /* Helper: launch batched matvec for a given weight type */
