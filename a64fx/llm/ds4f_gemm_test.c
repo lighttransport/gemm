@@ -77,9 +77,13 @@ static int run_case(ds4f_model *m, ds4f_qtype type, int rows, int cols, int M) {
     /* Q8: repack the (bf16-pv) weights to int8 W8A8 in place before the GEMM. */
     if (is_q8) ds4f_repack_bf16pv_to_q8pv(m, &t);
 
-    /* batched GEMM, token-major (Ystride=rows, Xstride=cols) */
+    /* batched GEMM, token-major (Ystride=rows, Xstride=cols) — warm then timed */
     float *Ygemm = (float *)aligned_alloc(256, (size_t)M * rows * 4);
-    ds4f_gemm(m, Ygemm, &t, X, M, rows, cols);
+    double freq = (double)rdfreq();
+    ds4f_gemm(m, Ygemm, &t, X, M, rows, cols);                                        /* warm */
+    uint64_t tc0 = rdcyc(); ds4f_gemm(m, Ygemm, &t, X, M, rows, cols); uint64_t tc1 = rdcyc();
+    double ms_g = (double)(tc1 - tc0) / freq * 1e3;
+    double gmac = (double)M * rows * cols / 1e9;
 
     double maxabs = 0.0, maxrel = 0.0; int nbad = 0;
     for (size_t k = 0; k < (size_t)M * rows; k++) {
@@ -112,8 +116,8 @@ static int run_case(ds4f_model *m, ds4f_qtype type, int rows, int cols, int M) {
     const char *tn = is_q8 ? "Q8_PV" : (type == DS4F_BF16_PV ? "BF16_PV" : "BF16");
     int ok = is_q8 ? (maxrelL2 < 0.08 && nbad == 0)    /* int8 rel-L2 gate  */
                    : (maxabs < 1e-3 && nbad == 0);      /* bit-similar gate  */
-    printf("  %-8s rows=%-6d cols=%-5d M=%-3d  max-abs=%.3e  relL2=%.3e  argmax=%d/%d  nonfinite=%d  %s\n",
-           tn, rows, cols, M, maxabs, maxrelL2, amatch, M, nbad, ok ? "OK" : "FAIL");
+    printf("  %-8s rows=%-6d cols=%-5d M=%-3d  %7.3fms  %6.1f Gmac/s  max-abs=%.3e  relL2=%.3e  argmax=%d/%d  nonfinite=%d  %s\n",
+           tn, rows, cols, M, ms_g, ms_g > 0 ? gmac*1e3/ms_g : 0.0, maxabs, maxrelL2, amatch, M, nbad, ok ? "OK" : "FAIL");
 
     free(Wrm); free(worig);
     if (is_q8) munmap(t.w, ds4f_wbytes(DS4F_Q8_PV, rows, cols));
