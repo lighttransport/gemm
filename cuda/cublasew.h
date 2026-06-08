@@ -183,12 +183,25 @@ int cublasew_gemm_f16_f32_rowmajor_nt(cublasew_context *ctx,
  * Use when mixed F16×F32 is not supported (Blackwell).
  */
 int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
-                                           CUdeviceptr d_Y,
-                                           CUdeviceptr d_W_f16,
-                                           CUdeviceptr d_X_f16,
-                                           int n_tok,
-                                           int n_out,
-                                           int n_in);
+                                          CUdeviceptr d_Y,
+                                          CUdeviceptr d_W_f16,
+                                          CUdeviceptr d_X_f16,
+                                          int n_tok,
+                                          int n_out,
+                                          int n_in);
+
+/* Strided-batched F16×F16→F32 GEMM for MoE all-expert matmul.
+ * For each batch e: Y[e, n_tok, n_out] = X[n_tok, n_in] @ W[e, n_out, n_in]^T
+ * X is shared across all batches (strideB = 0).
+ * Returns 0 on success, -1 if cuBLAS strided-batched API not available. */
+int cublasew_gemm_f16_f16_f32_strided_batched(cublasew_context *ctx,
+                                               CUdeviceptr d_Y,
+                                               CUdeviceptr d_W_f16,
+                                               CUdeviceptr d_X_f16,
+                                               int n_tok,
+                                               int n_out,
+                                               int n_in,
+                                               int batch);
 
 /* Row-major Y[n_tok, n_out] = A[n_tok, n_in] * B[n_in, n_out].
  * A and B are FP16, Y is FP32, compute is FP32. `ld_y` is Y's row stride in
