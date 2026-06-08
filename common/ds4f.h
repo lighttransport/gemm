@@ -283,6 +283,8 @@ typedef struct {
                              * them; s_o is per-node partial -> reduced. 0/[0,n_heads) => replicated. */
     int oi0, oi_rows;       /* DS4F_TP_OPROJ: wo_a o_inter row-shard [oi0, oi0+oi_rows) (wo_b replicated).
                              * Needs FULL s_attn (reduced first under TP_ATTN). 0/==o_inter => replicated. */
+    int emb_r0, emb_rows;   /* DS4F_TP_EMBED: embed vocab-shard [emb_r0, emb_r0+emb_rows). The token's row
+                             * lives on one node; embed_lookup zero-fills + ar_cb-SUMs -> full (bit-exact). */
     uint16_t *out_norm;     /* BF16 [hidden] */
     /* global mHC head (collapses the 4 streams 1x before lm_head; NO sinkhorn) */
     float *hc_head_fn;      /* [hc_mult=4, hc_mult*hidden=16384] */
