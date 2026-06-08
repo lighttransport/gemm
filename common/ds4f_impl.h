@@ -1174,6 +1174,12 @@ static double ds4f_g_tb2topk = 0.0;               /* index_topk top-k selection 
  * model.py Indexer.forward scoring (after q is wq_b-projected, RoPE'd, rotate+fp4'd
  * and the compressor has filled kvc): index_score[t] = sum_h relu(q[h].kvc[t]) *
  * weights[h]. q[H*hd] (one query's heads, contiguous), kvc[T*hd], weights[H]. */
+/* DS4F_IDX_INT8 *replacement* mode: the f32 idx_kv scan (ds4f_index_score) runs ONLY when
+ * T < DS4F_IDX_F32_SLOTS; for T >= it the resident int8 idx_kv8 svdot scan is used (the
+ * `T >= DS4F_IDX_F32_SLOTS` branch in ds4f_index_step). So under idx_int8 the f32 idx_kv needs
+ * only this many slots, not full nslot -- cutting it ~2,688 B/pos -> 0 (the idx memory lever:
+ * slope 5.93 -> ~3.9 KB/pos, ctx ceiling ~1.12M -> ~1.7M). Keep in sync with that branch. */
+#define DS4F_IDX_F32_SLOTS 64
 static void ds4f_index_score(const float *q, const float *kvc, const float *weights,
                              int H, int hd, int T, float *score, ds4f_pool *pool) {
     if (pool && T >= 64) {
@@ -1453,7 +1459,11 @@ static int ds4f_index_step(
     if (ds4f_compress_step(x, dim, hd, rd, ratio, start_pos, cwkv, cwgate, w_bf16, cape, cnorm,
                            rcos, rsin, eps, 1, comp_kv_state, comp_score_state, comp_out, pool)) {
         int slot = start_pos / ratio;
-        memcpy(idx_kv_cache + (size_t)slot * hd, comp_out, (size_t)hd * 4);
+        /* idx_int8 replacement: the f32 idx_kv buffer is only DS4F_IDX_F32_SLOTS slots (the f32
+         * scan reads it only for T<that); skip the f32 write past it (the int8 idx_kv8 scan
+         * serves T>=that). When idx_kv8==NULL (f32 mode) idx_kv is full nslot -> always write. */
+        if (!idx_kv8 || slot < DS4F_IDX_F32_SLOTS)
+            memcpy(idx_kv_cache + (size_t)slot * hd, comp_out, (size_t)hd * 4);
         if (idx_kv8) ds4f_idx_quant_pos(comp_out, hd, idx_kv8 + (size_t)slot * hd, &idx_pscale[slot]);
     }
     ds4f_g_tb2icmp += ds4f_now() - _tic0;
@@ -1479,7 +1489,7 @@ static int ds4f_index_step(
     double _scan_t0 = ds4f_now();
     static int s_i8 = -1;
     if (s_i8 < 0) { const char *e = getenv("DS4F_IDX_INT8"); s_i8 = (e && *e && atoi(e)) ? 1 : 0; }
-    if (s_i8 && idx_kv8 && pool && T >= 64 && (hd % 64) == 0) {  /* resident int8 scan */
+    if (s_i8 && idx_kv8 && pool && T >= DS4F_IDX_F32_SLOTS && (hd % 64) == 0) {  /* resident int8 scan */
         int8_t *q8 = (int8_t *)alloca((size_t)H * hd);
         float  *sq = (float *)alloca((size_t)H * 4);
         for (int h = 0; h < H; h++) {                        /* per-head q quant (round-to-nearest absmax) */
@@ -1721,10 +1731,14 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             ly->idx_cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)ihd*2 + 63) & ~63u);
             ly->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
             ly->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
-            ly->idx_kv = (float *)aligned_alloc(256, (size_t)nslot*ihd*4);
-            { static int s_i8a = -1;   /* resident int8 mirror only when DS4F_IDX_INT8=1 (else zero cost) */
+            { static int s_i8a = -1;   /* DS4F_IDX_INT8: int8 idx_kv8 REPLACES f32 idx_kv (not additive) */
               if (s_i8a < 0) { const char *e = getenv("DS4F_IDX_INT8"); s_i8a = (e && *e && atoi(e)) ? 1 : 0; }
-              if (s_i8a) {
+              int use_i8 = s_i8a && (m->pool != NULL);   /* replacement needs the pooled int8 svdot scan */
+              /* f32 idx_kv: full nslot in f32 mode; only DS4F_IDX_F32_SLOTS slots under idx_int8
+               * (the f32 scan reads it only for T<that; T>=that uses idx_kv8) -> 2,688 B/pos -> 0. */
+              int idxf32 = use_i8 ? (nslot < DS4F_IDX_F32_SLOTS ? nslot : DS4F_IDX_F32_SLOTS) : nslot;
+              ly->idx_kv = (float *)aligned_alloc(256, (size_t)idxf32*ihd*4);
+              if (use_i8) {
                 ly->idx_kv8    = (int8_t *)aligned_alloc(256, ((size_t)nslot*ihd + 255) & ~255ull);
                 ly->idx_pscale = (float  *)aligned_alloc(256, ((size_t)nslot*4 + 255) & ~255ull);
               } else { ly->idx_kv8 = NULL; ly->idx_pscale = NULL; } }
@@ -3281,7 +3295,9 @@ static void ds4f_warm_tb2(ds4f_model *m, int npos) {
             }
             if (m->int8_cmp) ds4f_cmp_append_i8(ly, kr, t, KV, ds4f_int8cmp_cal);
             if (ratio == 4) {                                  /* indexer compressed key */
-                float *ir = ly->idx_kv + (size_t)t*ihd;
+                /* idx_int8: f32 idx_kv is only DS4F_IDX_F32_SLOTS slots -> ring the synthetic
+                 * write (content is junk; the warmed decode at high ctx reads int8 idx_kv8). */
+                float *ir = ly->idx_kv + (size_t)(ly->idx_kv8 ? (t % DS4F_IDX_F32_SLOTS) : t)*ihd;
                 for (int d = 0; d < ihd; d++) {
                     s += 0x9E3779B97F4A7C15ull; uint64_t z = s;
                     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
