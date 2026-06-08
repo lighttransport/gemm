@@ -247,7 +247,10 @@ typedef struct {
      * scale freezes, calbuf -> cmp_q, reads switch to int8. cmp_kv costs the bulk of the
      * tierb2 physical (THP) footprint at high ctx; int8 reclaims ~3/4. LOSSY -> coherence
      * gate, not bit-exact. Only the streaming exact/tierb2 path is wired. */
-    int8_t   *cmp_q;       /* [max_pos/ratio, kv_lora] int8 store (NULL unless int8_cmp) */
+    int8_t   *cmp_q;       /* [max_pos/ratio, kv_lora] int8 store (NULL unless int8_cmp && !int4_cmp) */
+    uint8_t  *cmp_q4;      /* [max_pos/ratio, kv_lora/2] int4 store, 2 signed-nibbles/byte (DS4F_INT4_CMP).
+                            * Halves the dominant ctx-cache (2768->1384 B/pos). Same S5 per-channel
+                            * cmp_scale, range +/-7. LOSSY (16 levels) -> coherence gate, not bit-exact. */
     float    *cmp_scale;   /* [kv_lora] per-channel dequant scale (absmax/127) */
     float    *cmp_iscale;  /* [kv_lora] 1/scale (quantize) */
     float    *cmp_absmax;  /* [kv_lora] running absmax during calibration */
@@ -377,6 +380,11 @@ typedef struct {
      * lifts the ctx ceiling toward 256k. See ds4f_layer.cmp_q. Requires exact/tierb2
      * streaming. LOSSY (coherence gate). Off by default. */
     int int8_cmp;
+    /* DS4F_INT4_CMP: refinement of int8_cmp -- stores cmp_kv as int4 (+/-7, 2/byte) instead of
+     * int8, halving the dominant ctx-cache (1384 vs 2768 B/pos) to push ctx past ~2.75M. Implies
+     * int8_cmp (reuses its calbuf/scales/exact-path/dispatch); selects cmp_q4 + the i4 codec.
+     * 16 levels of an already-compressed latent -> coherence gate (not token-identical). Off by default. */
+    int int4_cmp;
     /* RoPE freqs tables (only built when exact): cos/sin[pos*half + k],
      * half = qk_rope_dim/2. Two configs: dense (theta, no YaRN) + comp (YaRN). */
     float *rope_dense_cos, *rope_dense_sin;

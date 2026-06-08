@@ -1778,7 +1778,10 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             int CAL = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64;
             if (CAL > nslot) CAL = nslot > 0 ? nslot : 1;
             ly->cmp_kv     = NULL;
-            ly->cmp_q      = (int8_t *)aligned_alloc(256, ((size_t)nslot*KV + 255) & ~255ull);
+            if (m->int4_cmp)   /* int4: half the bytes (2 nibbles/byte) -- the dominant ctx-cache halved */
+                ly->cmp_q4 = (uint8_t *)aligned_alloc(256, ((size_t)nslot*(KV/2) + 255) & ~255ull);
+            else
+                ly->cmp_q  = (int8_t *)aligned_alloc(256, ((size_t)nslot*KV + 255) & ~255ull);
             ly->cmp_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
             ly->cmp_scale  = (float *)aligned_alloc(64, (size_t)KV*4);
             ly->cmp_iscale = (float *)aligned_alloc(64, (size_t)KV*4);
@@ -1877,6 +1880,8 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         if (ds4f_int8kv_cal < 1) ds4f_int8kv_cal = 1; }
     if (m->int8_kv) m->exact = 1;   /* int8 KV uses the exact streaming decode path */
     {   const char *e = getenv("DS4F_INT8_CMP"); m->int8_cmp = (e && *e && atoi(e)) ? 1 : 0; }
+    {   const char *e = getenv("DS4F_INT4_CMP"); m->int4_cmp = (e && *e && atoi(e)) ? 1 : 0;
+        if (m->int4_cmp) m->int8_cmp = 1; }  /* int4 cmp implies the int8_cmp infra (cmp_q4 sub-mode) */
     {   const char *e = getenv("DS4F_INT8CMP_CAL"); ds4f_int8cmp_cal = (e && *e) ? atoi(e) : 64;
         if (ds4f_int8cmp_cal < 1) ds4f_int8cmp_cal = 1; }
     if (m->int8_cmp) m->exact = 1;  /* int8 cmp uses the exact streaming tierb2 path */
@@ -2530,6 +2535,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     { const char *e = getenv("DS4F_INT8KV_CAL"); ds4f_int8kv_cal = (e && *e) ? atoi(e) : 256;
       if (ds4f_int8kv_cal < 1) ds4f_int8kv_cal = 1; }
     { const char *e = getenv("DS4F_INT8_CMP");  m->int8_cmp  = (e && *e && atoi(e)) ? 1 : 0; }
+    { const char *e = getenv("DS4F_INT4_CMP");  m->int4_cmp  = (e && *e && atoi(e)) ? 1 : 0;
+      if (m->int4_cmp) m->int8_cmp = 1; }   /* int4 cmp implies the int8_cmp infra (cmp_q4 sub-mode) */
     { const char *e = getenv("DS4F_INT8CMP_CAL"); ds4f_int8cmp_cal = (e && *e) ? atoi(e) : 64;
       if (ds4f_int8cmp_cal < 1) ds4f_int8cmp_cal = 1; }
     if (m->tierb2) m->exact = 1;   /* Tier-B2 reuses the exact q-norm/RoPE/window path */
@@ -2815,6 +2822,52 @@ static inline float ds4f_scalar_dot_i8s(const float *q, const int8_t *k, const f
 static inline void ds4f_scalar_axpy_i8s(float *out, const int8_t *k, const float *sc, float w, int n) {
     for (int d = 0; d < n; d++) out[d] += w * ((float)k[d] * sc[d]);
 }
+/* ---- int4 (DS4F_INT4_CMP) packed-nibble codec: 2 signed-4bit channels per byte; channel d in
+ * byte d/2 (low nibble if d even, high if d odd), value range +/-7, dequant *cmp_scale[d]. */
+#define DS4F_I4_SIGN(nb) (((int)(nb) ^ 8) - 8)   /* 4-bit two's-complement: 0..15 -> -8..7 */
+/* unpack the packed byte vector b (vl lanes) -> two f32 vectors in CHANNEL order:
+ * *c0 = channels [d..d+vl), *c1 = channels [d+vl..d+2vl). */
+static inline void ds4f_i4_unpack(svbool_t pg, svuint32_t b, svfloat32_t *c0, svfloat32_t *c1) {
+    svint32_t lo = svsub_n_s32_x(pg, svreinterpret_s32_u32(sveor_n_u32_x(pg, svand_n_u32_x(pg, b, 0x0Fu), 8u)), 8);
+    svint32_t hi = svsub_n_s32_x(pg, svreinterpret_s32_u32(sveor_n_u32_x(pg, svlsr_n_u32_x(pg, b, 4),      8u)), 8);
+    svfloat32_t lof = svcvt_f32_s32_x(pg, lo);   /* even channels e0,e1,... */
+    svfloat32_t hif = svcvt_f32_s32_x(pg, hi);   /* odd  channels o0,o1,... */
+    *c0 = svzip1_f32(lof, hif);                  /* [e0,o0,e1,o1,...] = channels d..d+vl-1   */
+    *c1 = svzip2_f32(lof, hif);                  /* channels d+vl..d+2vl-1                   */
+}
+static inline float ds4f_sve_dot_i4s(const float *q, const uint8_t *k4, const float *sc, int n) {
+    svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+    svfloat32_t acc = svdup_f32(0.f); int d = 0;
+    for (; d + 2*vl <= n; d += 2*vl) {
+        svfloat32_t c0, c1; ds4f_i4_unpack(pt, svld1ub_u32(pt, k4 + (d>>1)), &c0, &c1);
+        c0 = svmul_f32_x(pt, c0, svld1_f32(pt, sc + d));
+        c1 = svmul_f32_x(pt, c1, svld1_f32(pt, sc + d + vl));
+        acc = svmla_f32_x(pt, acc, svld1_f32(pt, q + d), c0);
+        acc = svmla_f32_x(pt, acc, svld1_f32(pt, q + d + vl), c1);
+    }
+    float s = svaddv_f32(pt, acc);
+    for (; d < n; d++) { int nb = (d & 1) ? (k4[d>>1] >> 4) : (k4[d>>1] & 0xF); s += q[d] * ((float)DS4F_I4_SIGN(nb) * sc[d]); }
+    return s;
+}
+static inline void ds4f_sve_axpy_i4s(float *out, const uint8_t *k4, const float *sc, float w, int n) {
+    svbool_t pt = svptrue_b32(); int vl = (int)svcntw(); svfloat32_t wv = svdup_f32(w); int d = 0;
+    for (; d + 2*vl <= n; d += 2*vl) {
+        svfloat32_t c0, c1; ds4f_i4_unpack(pt, svld1ub_u32(pt, k4 + (d>>1)), &c0, &c1);
+        c0 = svmul_f32_x(pt, c0, svld1_f32(pt, sc + d));
+        c1 = svmul_f32_x(pt, c1, svld1_f32(pt, sc + d + vl));
+        svst1_f32(pt, out + d,      svmla_f32_x(pt, svld1_f32(pt, out + d),      c0, wv));
+        svst1_f32(pt, out + d + vl, svmla_f32_x(pt, svld1_f32(pt, out + d + vl), c1, wv));
+    }
+    for (; d < n; d++) { int nb = (d & 1) ? (k4[d>>1] >> 4) : (k4[d>>1] & 0xF); out[d] += w * ((float)DS4F_I4_SIGN(nb) * sc[d]); }
+}
+static inline float ds4f_scalar_dot_i4s(const float *q, const uint8_t *k4, const float *sc, int n) {
+    float s = 0.f;
+    for (int d = 0; d < n; d++) { int nb = (d & 1) ? (k4[d>>1] >> 4) : (k4[d>>1] & 0xF); s += q[d] * ((float)DS4F_I4_SIGN(nb) * sc[d]); }
+    return s;
+}
+static inline void ds4f_scalar_axpy_i4s(float *out, const uint8_t *k4, const float *sc, float w, int n) {
+    for (int d = 0; d < n; d++) { int nb = (d & 1) ? (k4[d>>1] >> 4) : (k4[d>>1] & 0xF); out[d] += w * ((float)DS4F_I4_SIGN(nb) * sc[d]); }
+}
 /* quantize one f32 latent row -> int8 with per-channel iscale (clamp to +/-127). */
 static inline void ds4f_kv_quant_row(const float *src, int8_t *dst, const float *iscale, int KV) {
     for (int d = 0; d < KV; d++) {
@@ -2879,6 +2932,41 @@ static void ds4f_cmp_freeze(ds4f_layer *ly, int KV) {
 static inline void ds4f_cmp_append_i8(ds4f_layer *ly, const float *lat, int slot, int KV, int CAL) {
     if (ly->cmp_frozen) { ds4f_kv_quant_row(lat, ly->cmp_q + (size_t)slot * KV, ly->cmp_iscale, KV); return; }
     if (slot >= CAL) { ds4f_cmp_freeze(ly, KV); ds4f_kv_quant_row(lat, ly->cmp_q + (size_t)slot * KV, ly->cmp_iscale, KV); return; }
+    uint16_t *cb = ly->cmp_calbuf + (size_t)slot * KV;
+    for (int d = 0; d < KV; d++) {
+        float v = lat[d]; cb[d] = ds4f_f32bf(v);
+        float a = v < 0 ? -v : v; if (a > ly->cmp_absmax[d]) ly->cmp_absmax[d] = a;
+    }
+    ly->cmp_caln = slot + 1;
+}
+/* ---- int4 cmp codec (DS4F_INT4_CMP): mirrors the int8 cmp functions above with +/-7 range,
+ * 2 channels/byte packed into cmp_q4 (row stride KV/2). Reuses cmp_calbuf/absmax/caln/frozen. */
+static inline void ds4f_cmp_quant_row_i4(const float *src, uint8_t *dst, const float *iscale, int KV) {
+    for (int d = 0; d < KV; d += 2) {
+        int v0 = (int)lrintf(src[d]   * iscale[d]);   if (v0 > 7) v0 = 7; else if (v0 < -7) v0 = -7;
+        int v1 = (int)lrintf(src[d+1] * iscale[d+1]); if (v1 > 7) v1 = 7; else if (v1 < -7) v1 = -7;
+        dst[d>>1] = (uint8_t)(((v1 & 0xF) << 4) | (v0 & 0xF));
+    }
+}
+static void ds4f_cmp_freeze_i4(ds4f_layer *ly, int KV) {
+    for (int d = 0; d < KV; d++) {
+        float s = ly->cmp_absmax[d] / 7.f; if (s < 1e-12f) s = 1e-12f;
+        ly->cmp_scale[d] = s; ly->cmp_iscale[d] = 1.f / s;
+    }
+    for (int p = 0; p < ly->cmp_caln; p++) {
+        const uint16_t *src = ly->cmp_calbuf + (size_t)p * KV;
+        uint8_t *dst = ly->cmp_q4 + (size_t)p * (KV/2);
+        for (int d = 0; d < KV; d += 2) {
+            int v0 = (int)lrintf(ds4f_bf16f(src[d])   * ly->cmp_iscale[d]);   if (v0 > 7) v0 = 7; else if (v0 < -7) v0 = -7;
+            int v1 = (int)lrintf(ds4f_bf16f(src[d+1]) * ly->cmp_iscale[d+1]); if (v1 > 7) v1 = 7; else if (v1 < -7) v1 = -7;
+            dst[d>>1] = (uint8_t)(((v1 & 0xF) << 4) | (v0 & 0xF));
+        }
+    }
+    ly->cmp_frozen = 1;
+}
+static inline void ds4f_cmp_append_i4(ds4f_layer *ly, const float *lat, int slot, int KV, int CAL) {
+    if (ly->cmp_frozen) { ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)slot * (KV/2), ly->cmp_iscale, KV); return; }
+    if (slot >= CAL) { ds4f_cmp_freeze_i4(ly, KV); ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)slot * (KV/2), ly->cmp_iscale, KV); return; }
     uint16_t *cb = ly->cmp_calbuf + (size_t)slot * KV;
     for (int d = 0; d < KV; d++) {
         float v = lat[d]; cb[d] = ds4f_f32bf(v);
@@ -3117,7 +3205,8 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
      * (NULL under int8_kv) nor kv_q (not yet quantized); freeze migrates calbuf->kv_q between
      * tokens, so every written pos is wholly in one store -- no straddle. */
     const uint16_t *kvbf = (m->int8_kv && !ly->kv_frozen) ? ly->kv_calbuf : ly->kv_cache;
-    int c_i8 = (m->int8_cmp && ly->cmp_frozen); const float *cmpsc = ly->cmp_scale;  /* int8 cmp */
+    int c_i4 = (m->int4_cmp && ly->cmp_frozen);                                       /* int4 cmp (cmp_q4) */
+    int c_i8 = (m->int8_cmp && !m->int4_cmp && ly->cmp_frozen); const float *cmpsc = ly->cmp_scale;  /* int8 cmp */
     /* pre-freeze the compressed latents live in cmp_calbuf (bf16); freeze migrates
      * calbuf->cmp_q between tokens, so every slot is wholly in one store -- no straddle. */
     const uint16_t *cmpbf = (m->int8_cmp && !ly->cmp_frozen) ? ly->cmp_calbuf : NULL;
@@ -3136,7 +3225,9 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         }
         for (int j = 0; j < nsel; j++) {                        /* compressed term (cmp_kv) */
             float s;
-            if (c_i8) { const int8_t *kc = ly->cmp_q + (size_t)sel[j]*KV;
+            if (c_i4) { const uint8_t *kc = ly->cmp_q4 + (size_t)sel[j]*(KV/2);
+                s = sve ? ds4f_sve_dot_i4s(q, kc, cmpsc, KV) : ds4f_scalar_dot_i4s(q, kc, cmpsc, KV); }
+            else if (c_i8) { const int8_t *kc = ly->cmp_q + (size_t)sel[j]*KV;
                 s = sve ? ds4f_sve_dot_i8s(q, kc, cmpsc, KV) : ds4f_scalar_dot_i8s(q, kc, cmpsc, KV); }
             else if (cmpbf) { const uint16_t *kc = cmpbf + (size_t)sel[j]*KV;
                 if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
@@ -3161,7 +3252,9 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         }
         for (int j = 0; j < nsel; j++) {
             float w = sc[nP + j]*inv;
-            if (c_i8) { const int8_t *kc = ly->cmp_q + (size_t)sel[j]*KV;
+            if (c_i4) { const uint8_t *kc = ly->cmp_q4 + (size_t)sel[j]*(KV/2);
+                if (sve) ds4f_sve_axpy_i4s(out, kc, cmpsc, w, HD); else ds4f_scalar_axpy_i4s(out, kc, cmpsc, w, HD); }
+            else if (c_i8) { const int8_t *kc = ly->cmp_q + (size_t)sel[j]*KV;
                 if (sve) ds4f_sve_axpy_i8s(out, kc, cmpsc, w, HD); else ds4f_scalar_axpy_i8s(out, kc, cmpsc, w, HD); }
             else if (cmpbf) { const uint16_t *kc = cmpbf + (size_t)sel[j]*KV;
                 if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
@@ -3195,7 +3288,8 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
                            ly->cmp_wkv, ly->cmp_wgate, 1, ly->cmp_ape, ly->cmp_norm,
                            rcos, rsin, eps, 0,
                            ly->cmp_kv_state, ly->cmp_score_state, m->s_cmp_out, m->pool)) {
-        if (m->int8_cmp) ds4f_cmp_append_i8(ly, m->s_cmp_out, pos/ratio, KV, ds4f_int8cmp_cal);
+        if (m->int4_cmp) ds4f_cmp_append_i4(ly, m->s_cmp_out, pos/ratio, KV, ds4f_int8cmp_cal);
+        else if (m->int8_cmp) ds4f_cmp_append_i8(ly, m->s_cmp_out, pos/ratio, KV, ds4f_int8cmp_cal);
         else memcpy(ly->cmp_kv + (size_t)(pos/ratio)*KV, m->s_cmp_out, (size_t)KV*4);
     }
     m->prof[DS4F_P_TB2LCMP] += ds4f_now() - _tlc0;
@@ -3422,7 +3516,8 @@ static void ds4f_warm_tb2(ds4f_model *m, int npos) {
                 z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= (z >> 31);
                 kr[d] = (float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f;
             }
-            if (m->int8_cmp) ds4f_cmp_append_i8(ly, kr, t, KV, ds4f_int8cmp_cal);
+            if (m->int4_cmp) ds4f_cmp_append_i4(ly, kr, t, KV, ds4f_int8cmp_cal);
+            else if (m->int8_cmp) ds4f_cmp_append_i8(ly, kr, t, KV, ds4f_int8cmp_cal);
             if (ratio == 4) {                                  /* indexer compressed key */
                 /* idx_int8: f32 idx_kv is only DS4F_IDX_F32_SLOTS slots -> ring the synthetic
                  * write (content is junk; the warmed decode at high ctx reads int8 idx_kv8). */
