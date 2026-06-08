@@ -248,6 +248,77 @@ static int run_mxfp4_case(ds4f_model *m, int rows, int cols, int M) {
     return ok ? 0 : 1;
 }
 
+/* ===== Lever-2 fix(b) prototype: fp32 OUTER-PRODUCT GEMM =====================
+ * Vectorize 16 rows per SVE f32 vector; keep OP_NT tokens' accumulators in registers
+ * and broadcast the X scalars -> each weight vector W[16rows][k] is loaded ONCE per
+ * token-block (M/OP_NT times) instead of the dot-product kernel's once-per-token-triple
+ * (M/3) -> ~weight L1 traffic cut, targeting the ~30% LD_COMP_WAIT. Weights packed
+ * [rowblk][K][16] bf16 (widened to f32 by svld1uh+lsl16). fp32 accumulate (lossless,
+ * no fp16 overflow). OP_NT divides the bench M values {16,32,64}. */
+#define OP_RB 16
+#define OP_NT 8
+typedef struct { float *Y; const uint16_t *W; const float *X; int rows, K, M, Ys, Xs; } op_task;
+static void op_worker(void *arg, int tid, int nthr) {
+    op_task *T = (op_task *)arg;
+    int K = T->K, M = T->M, Xs = T->Xs, Ys = T->Ys, nrb = T->rows / OP_RB;
+    int per = nrb/nthr, ex = nrb%nthr, b0 = per*tid + (tid<ex?tid:ex), b1 = b0 + per + (tid<ex?1:0);
+    svbool_t pg = svptrue_b32();
+    for (int rb = b0; rb < b1; rb++) {
+        const uint16_t *Wb = T->W + (size_t)rb*K*OP_RB;
+        int row = rb*OP_RB;
+        for (int m0 = 0; m0 + OP_NT <= M; m0 += OP_NT) {   /* bench M in {16,32,64} -> exact multiple of OP_NT=8 */
+            svfloat32_t c0=svdup_f32(0),c1=svdup_f32(0),c2=svdup_f32(0),c3=svdup_f32(0),
+                        c4=svdup_f32(0),c5=svdup_f32(0),c6=svdup_f32(0),c7=svdup_f32(0);
+            const float *xb = T->X + m0;             /* X is TRANSPOSED [K][M]: 8 tokens at k are contiguous */
+            for (int k = 0; k < K; k++) {
+                svfloat32_t wv = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, Wb + (size_t)k*OP_RB), 16));
+                const float *xk = xb + (size_t)k*Xs;  /* Xs = M (transposed row stride) */
+                c0=svmla_n_f32_x(pg,c0,wv,xk[0]); c1=svmla_n_f32_x(pg,c1,wv,xk[1]);
+                c2=svmla_n_f32_x(pg,c2,wv,xk[2]); c3=svmla_n_f32_x(pg,c3,wv,xk[3]);
+                c4=svmla_n_f32_x(pg,c4,wv,xk[4]); c5=svmla_n_f32_x(pg,c5,wv,xk[5]);
+                c6=svmla_n_f32_x(pg,c6,wv,xk[6]); c7=svmla_n_f32_x(pg,c7,wv,xk[7]);
+            }
+            svst1_f32(pg,T->Y+(size_t)(m0+0)*Ys+row,c0); svst1_f32(pg,T->Y+(size_t)(m0+1)*Ys+row,c1);
+            svst1_f32(pg,T->Y+(size_t)(m0+2)*Ys+row,c2); svst1_f32(pg,T->Y+(size_t)(m0+3)*Ys+row,c3);
+            svst1_f32(pg,T->Y+(size_t)(m0+4)*Ys+row,c4); svst1_f32(pg,T->Y+(size_t)(m0+5)*Ys+row,c5);
+            svst1_f32(pg,T->Y+(size_t)(m0+6)*Ys+row,c6); svst1_f32(pg,T->Y+(size_t)(m0+7)*Ys+row,c7);
+        }
+    }
+}
+static int run_op_case(ds4f_model *m, int rows, int cols, int M) {
+    uint16_t *Wrm = (uint16_t *)malloc((size_t)rows*cols*2);
+    for (size_t k=0;k<(size_t)rows*cols;k++) Wrm[k]=ds4f_f32_bf16(frand());
+    int nrb = rows/OP_RB;
+    uint16_t *Wop = (uint16_t *)aligned_alloc(256,(size_t)rows*cols*2);
+    for (int rb=0;rb<nrb;rb++) for(int k=0;k<cols;k++) for(int r=0;r<OP_RB;r++)
+        Wop[((size_t)rb*cols+k)*OP_RB+r]=Wrm[((size_t)(rb*OP_RB+r))*cols+k];
+    float *X=(float*)aligned_alloc(256,(size_t)M*cols*4);
+    for(size_t k=0;k<(size_t)M*cols;k++) X[k]=frand();
+    /* reference: bf16-pv single-token matvec */
+    ds4f_tensor t; memset(&t,0,sizeof(t)); t.type=DS4F_BF16_PV; t.rows=rows; t.cols=cols;
+    t.w=aligned_alloc(256,(ds4f_wbytes(DS4F_BF16_PV,rows,cols)+255)&~(size_t)255);
+    pack_pv((uint16_t*)t.w,Wrm,rows,cols);
+    float *Yref=(float*)aligned_alloc(256,(size_t)M*rows*4);
+    for(int mm=0;mm<M;mm++) ds4f_matvec(m,Yref+(size_t)mm*rows,&t,X+(size_t)mm*cols);
+    float *Xt=(float*)aligned_alloc(256,(size_t)cols*M*4);   /* transpose X[M][cols] -> Xt[cols][M] */
+    for(int mm=0;mm<M;mm++) for(int k=0;k<cols;k++) Xt[(size_t)k*M+mm]=X[(size_t)mm*cols+k];
+    float *Yop=(float*)aligned_alloc(256,(size_t)M*rows*4);
+    op_task T={Yop,Wop,Xt,rows,cols,M,rows,M};            /* Xs=M (transposed stride) */
+    double freq=(double)rdfreq();
+    ds4f_pool_run(m->pool,op_worker,&T);  /* warm */
+    int niter=(getenv("DS4F_GEMM_NITER")?atoi(getenv("DS4F_GEMM_NITER")):20); double best=1e30;
+    for(int it=0;it<niter;it++){uint64_t a=rdcyc();ds4f_pool_run(m->pool,op_worker,&T);uint64_t b=rdcyc();
+        double ms=(double)(b-a)/freq*1e3; if(ms<best)best=ms;}
+    double gmac=(double)M*rows*cols/1e9, maxrelL2=0;
+    for(int mm=0;mm<M;mm++){const float*r=Yref+(size_t)mm*rows,*g=Yop+(size_t)mm*rows;
+        double num=0,den=0;for(int i=0;i<rows;i++){double e=(double)r[i]-g[i];num+=e*e;den+=(double)r[i]*r[i];}
+        double rl=sqrt(num)/(sqrt(den)+1e-12);if(rl>maxrelL2)maxrelL2=rl;}
+    printf("  OP_fp32  rows=%-6d cols=%-5d M=%-3d  %7.3fms  %6.1f Gmac/s  relL2=%.3e  %s\n",
+           rows,cols,M,best,best>0?gmac*1e3/best:0,maxrelL2, maxrelL2<1e-3?"OK":"FAIL");
+    free(Wrm);free(Wop);free(X);free(Xt);free(t.w);free(Yref);free(Yop);
+    return maxrelL2<1e-3?0:1;
+}
+
 int main(int argc, char **argv) {
     int nthr = (argc > 1) ? atoi(argv[1]) : 12;
     int ncmg = (argc > 2) ? atoi(argv[2]) : 1;
@@ -258,6 +329,13 @@ int main(int argc, char **argv) {
     ds4f_init_fp8_e4m3_lut(m.fp8_lut);    /* gather path needs the LUT */
 
     printf("ds4f_gemm_test  nthr=%d n_cmgs=%d\n", nthr, ncmg);
+    if (getenv("DS4F_OP_PROTO")) {   /* fp32 outer-product GEMM prototype vs the dot-product pv kernel */
+        printf("--- fp32 outer-product GEMM prototype (OP_NT=%d, vs BF16_PV dot-product) ---\n", OP_NT);
+        struct { int r, c; } sh[] = {{32768,1024},{8192,4096},{4096,8192},{2048,4096},{4096,2048},{1024,4096}};
+        int M2[] = {16,32,64}, f = 0;
+        for (int s=0;s<6;s++) for (int mi=0;mi<3;mi++) f += run_op_case(&m, sh[s].r, sh[s].c, M2[mi]);
+        ds4f_pool_stop(m.pool); return f?1:0;
+    }
     if (argc > 5) {   /* single bf16-pv shape for fapp profiling: nthr ncmg rows cols M (DS4F_GEMM_NITER loops) */
         int rows = atoi(argv[3]), cols = atoi(argv[4]), MM = atoi(argv[5]);
         int rc = run_case(&m, DS4F_BF16_PV, rows, cols, MM);
