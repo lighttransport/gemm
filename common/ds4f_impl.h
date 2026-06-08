@@ -1228,6 +1228,44 @@ static void ds4f_idxsc8r_worker(void *arg, int tid, int nthr) {
         Tk->score[t] = acc;
     }
 }
+/* int4 indexer cache (DS4F_IDX_INT4): same per-position scheme as ds4f_idx_quant_pos but +/-7,
+ * 2 nibbles/byte -> idx_kv8_4 = nslot*hd/2 bytes (672->336 B/pos). The scan unpacks each
+ * position's int4 key to an int8 temp (hd ops, amortized over H heads ~6%) then reuses svdot. */
+static inline void ds4f_idx_quant_pos_i4(const float *v, int hd, uint8_t *out, float *pscale) {
+    float mx = 0.f;
+    for (int d = 0; d < hd; d++) { float a = v[d] < 0 ? -v[d] : v[d]; if (a > mx) mx = a; }
+    *pscale = mx * (1.0f / 7.0f);
+    float inv = mx > 0 ? 7.0f / mx : 0.0f;
+    for (int d = 0; d < hd; d += 2) {
+        int q0 = (int)lrintf(v[d]   * inv); q0 = q0 > 7 ? 7 : (q0 < -7 ? -7 : q0);
+        int q1 = (int)lrintf(v[d+1] * inv); q1 = q1 > 7 ? 7 : (q1 < -7 ? -7 : q1);
+        out[d>>1] = (uint8_t)(((q1 & 0xF) << 4) | (q0 & 0xF));
+    }
+}
+typedef struct { const int8_t *q8; const uint8_t *k4; const float *sq, *pscale, *weights;
+                 int H, hd, T; float *score; } ds4f_idxsc8r4_task;
+static void ds4f_idxsc8r4_worker(void *arg, int tid, int nthr) {
+    ds4f_idxsc8r4_task *Tk = (ds4f_idxsc8r4_task *)arg;
+    int Tn = Tk->T, H = Tk->H, hd = Tk->hd;
+    int per = Tn / nthr, extra = Tn % nthr;
+    int t0 = per * tid + (tid < extra ? tid : extra), t1 = t0 + per + (tid < extra ? 1 : 0);
+    svbool_t pb = svptrue_b8(); int bf = (int)svcntb();
+    int8_t kt8[256];   /* unpacked int8 key (hd <= 256; indexer hd=128) */
+    for (int t = t0; t < t1; t++) {
+        const uint8_t *k4 = Tk->k4 + (size_t)t * (hd/2);
+        for (int b = 0; b < hd/2; b++) { int by = k4[b]; kt8[2*b] = (int8_t)(((by & 0xF) ^ 8) - 8); kt8[2*b+1] = (int8_t)(((by >> 4) ^ 8) - 8); }
+        float ps = Tk->pscale[t], acc = 0.f;
+        for (int h = 0; h < H; h++) {
+            const int8_t *q8 = Tk->q8 + (size_t)h * hd;
+            svint32_t a = svdup_s32(0);
+            for (int d = 0; d < hd; d += bf) a = svdot_s32(a, svld1_s8(pb, q8 + d), svld1_s8(pb, kt8 + d));
+            float dot = Tk->sq[h] * ps * (float)svaddv_s32(svptrue_b32(), a);
+            if (dot < 0.f) dot = 0.f;                /* relu */
+            acc += dot * Tk->weights[h];
+        }
+        Tk->score[t] = acc;
+    }
+}
 
 static inline double ds4f_now(void);              /* fwd decl (defined w/ the profiler below) */
 static double ds4f_g_tb2scan = 0.0;               /* transfer accumulators: index_step component-only ns */
@@ -1490,7 +1528,7 @@ static int ds4f_index_step(
     const void *cwkv, const void *cwgate, const float *cape, const uint16_t *cnorm,
     const float *rcos, const float *rsin, float eps,
     float *comp_kv_state, float *comp_score_state, float *idx_kv_cache,
-    int8_t *idx_kv8, float *idx_pscale,
+    int8_t *idx_kv8, uint8_t *idx_kv8_4, float *idx_pscale,
     float *q_scr, float *score_scr, int *sel, ds4f_pool *pool)
 {
     int end_pos = start_pos + 1, half = rd / 2;
@@ -1530,9 +1568,11 @@ static int ds4f_index_step(
         /* idx_int8 replacement: the f32 idx_kv buffer is only DS4F_IDX_F32_SLOTS slots (the f32
          * scan reads it only for T<that); skip the f32 write past it (the int8 idx_kv8 scan
          * serves T>=that). When idx_kv8==NULL (f32 mode) idx_kv is full nslot -> always write. */
-        if (!idx_kv8 || slot < DS4F_IDX_F32_SLOTS)
+        int int_mode = (idx_kv8 || idx_kv8_4);   /* int8 or int4 replacement active */
+        if (!int_mode || slot < DS4F_IDX_F32_SLOTS)
             memcpy(idx_kv_cache + (size_t)slot * hd, comp_out, (size_t)hd * 4);
-        if (idx_kv8) ds4f_idx_quant_pos(comp_out, hd, idx_kv8 + (size_t)slot * hd, &idx_pscale[slot]);
+        if (idx_kv8_4)     ds4f_idx_quant_pos_i4(comp_out, hd, idx_kv8_4 + (size_t)slot * (hd/2), &idx_pscale[slot]);
+        else if (idx_kv8)  ds4f_idx_quant_pos(comp_out, hd, idx_kv8 + (size_t)slot * hd, &idx_pscale[slot]);
     }
     ds4f_g_tb2icmp += ds4f_now() - _tic0;
     float sm = (float)(1.0 / sqrt((double)hd)), wscale = sm * (float)(1.0 / sqrt((double)H));
@@ -1555,10 +1595,13 @@ static int ds4f_index_step(
     ds4f_g_tb2wproj += ds4f_now() - _twp0;
     int T = end_pos / ratio;
     double _scan_t0 = ds4f_now();
-    static int s_i8 = -1;
+    static int s_i8 = -1, s_i4 = -1;
     if (s_i8 < 0) { const char *e = getenv("DS4F_IDX_INT8"); s_i8 = (e && *e && atoi(e)) ? 1 : 0; }
-    if (s_i8 && idx_kv8 && pool && T >= DS4F_IDX_F32_SLOTS && (hd % 64) == 0) {  /* resident int8 scan */
-        int8_t *q8 = (int8_t *)alloca((size_t)H * hd);
+    if (s_i4 < 0) { const char *e = getenv("DS4F_IDX_INT4"); s_i4 = (e && *e && atoi(e)) ? 1 : 0; }
+    int do_i4 = (s_i4 && idx_kv8_4 && pool && T >= DS4F_IDX_F32_SLOTS && (hd % 64) == 0);  /* resident int4 scan */
+    int do_i8 = (s_i8 && idx_kv8   && pool && T >= DS4F_IDX_F32_SLOTS && (hd % 64) == 0);  /* resident int8 scan */
+    if (do_i4 || do_i8) {
+        int8_t *q8 = (int8_t *)alloca((size_t)H * hd);       /* query stays int8 in both modes */
         float  *sq = (float *)alloca((size_t)H * 4);
         for (int h = 0; h < H; h++) {                        /* per-head q quant (round-to-nearest absmax) */
             const float *qh = q_scr + (size_t)h * hd; float mx = 0.f;
@@ -1566,8 +1609,10 @@ static int ds4f_index_step(
             float inv = mx > 0 ? 127.0f / mx : 0.0f; sq[h] = mx * (1.0f / 127.0f);
             for (int d = 0; d < hd; d++) { int v = (int)lrintf(qh[d] * inv); v = v > 127 ? 127 : (v < -127 ? -127 : v); q8[(size_t)h * hd + d] = (int8_t)v; }
         }
-        ds4f_idxsc8r_task tk = { q8, idx_kv8, sq, idx_pscale, weights, H, hd, T, score_scr };
-        ds4f_pool_run(pool, ds4f_idxsc8r_worker, &tk);
+        if (do_i4) { ds4f_idxsc8r4_task tk = { q8, idx_kv8_4, sq, idx_pscale, weights, H, hd, T, score_scr };
+                     ds4f_pool_run(pool, ds4f_idxsc8r4_worker, &tk); }
+        else       { ds4f_idxsc8r_task  tk = { q8, idx_kv8,   sq, idx_pscale, weights, H, hd, T, score_scr };
+                     ds4f_pool_run(pool, ds4f_idxsc8r_worker, &tk); }
     } else {
         ds4f_index_score(q_scr, idx_kv_cache, weights, H, hd, T, score_scr, pool);
     }
@@ -1808,17 +1853,20 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             ly->idx_cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)ihd*2 + 63) & ~63u);
             ly->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
             ly->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
-            { static int s_i8a = -1;   /* DS4F_IDX_INT8: int8 idx_kv8 REPLACES f32 idx_kv (not additive) */
+            { static int s_i8a = -1, s_i4a = -1;   /* DS4F_IDX_INT8/INT4: int store REPLACES f32 idx_kv */
               if (s_i8a < 0) { const char *e = getenv("DS4F_IDX_INT8"); s_i8a = (e && *e && atoi(e)) ? 1 : 0; }
-              int use_i8 = s_i8a && (m->pool != NULL);   /* replacement needs the pooled int8 svdot scan */
-              /* f32 idx_kv: full nslot in f32 mode; only DS4F_IDX_F32_SLOTS slots under idx_int8
-               * (the f32 scan reads it only for T<that; T>=that uses idx_kv8) -> 2,688 B/pos -> 0. */
+              if (s_i4a < 0) { const char *e = getenv("DS4F_IDX_INT4"); s_i4a = (e && *e && atoi(e)) ? 1 : 0; }
+              int use_i4 = s_i4a && (m->pool != NULL);   /* int4 idx_kv8_4: half of int8 (672->336 B/pos) */
+              int use_i8 = (s_i8a || s_i4a) && (m->pool != NULL);   /* either => int-replacement infra */
+              /* f32 idx_kv: full nslot in f32 mode; only DS4F_IDX_F32_SLOTS slots under int replacement
+               * (the f32 scan reads it only for T<that; T>=that uses idx_kv8/idx_kv8_4) -> 2,688 B/pos -> 0. */
               int idxf32 = use_i8 ? (nslot < DS4F_IDX_F32_SLOTS ? nslot : DS4F_IDX_F32_SLOTS) : nslot;
               ly->idx_kv = (float *)aligned_alloc(256, (size_t)idxf32*ihd*4);
               if (use_i8) {
-                ly->idx_kv8    = (int8_t *)aligned_alloc(256, ((size_t)nslot*ihd + 255) & ~255ull);
+                if (use_i4) ly->idx_kv8_4 = (uint8_t *)aligned_alloc(256, ((size_t)nslot*(ihd/2) + 255) & ~255ull);
+                else        ly->idx_kv8   = (int8_t  *)aligned_alloc(256, ((size_t)nslot*ihd     + 255) & ~255ull);
                 ly->idx_pscale = (float  *)aligned_alloc(256, ((size_t)nslot*4 + 255) & ~255ull);
-              } else { ly->idx_kv8 = NULL; ly->idx_pscale = NULL; } }
+              } else { ly->idx_kv8 = NULL; ly->idx_kv8_4 = NULL; ly->idx_pscale = NULL; } }
             ds4f_compress_state_reset(ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ratio, ihd);
             if (fill) {
                 ds4f_tensor u1 = { ly->idx_wq_b,      NULL, DS4F_BF16, iH*ihd, qlora }; ds4f_fill(m, u1);
@@ -3312,7 +3360,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
                         ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
                         rcos, rsin, eps,
                         ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,
-                        ly->idx_kv8, ly->idx_pscale,
+                        ly->idx_kv8, ly->idx_kv8_4, ly->idx_pscale,
                         m->s_idx_q, m->s_idx_score, m->s_tb2_sel, m->pool);
         m->prof[DS4F_P_TB2SCAN]  += ds4f_g_tb2scan  - _sc_snap;
         m->prof[DS4F_P_TB2QPROJ] += ds4f_g_tb2qproj - _qp_snap;
@@ -3521,14 +3569,16 @@ static void ds4f_warm_tb2(ds4f_model *m, int npos) {
             if (ratio == 4) {                                  /* indexer compressed key */
                 /* idx_int8: f32 idx_kv is only DS4F_IDX_F32_SLOTS slots -> ring the synthetic
                  * write (content is junk; the warmed decode at high ctx reads int8 idx_kv8). */
-                float *ir = ly->idx_kv + (size_t)(ly->idx_kv8 ? (t % DS4F_IDX_F32_SLOTS) : t)*ihd;
+                int idx_int = (ly->idx_kv8 || ly->idx_kv8_4);  /* int8 or int4 replacement => f32 idx_kv is ringed */
+                float *ir = ly->idx_kv + (size_t)(idx_int ? (t % DS4F_IDX_F32_SLOTS) : t)*ihd;
                 for (int d = 0; d < ihd; d++) {
                     s += 0x9E3779B97F4A7C15ull; uint64_t z = s;
                     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
                     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= (z >> 31);
                     ir[d] = (float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f;
                 }
-                if (ly->idx_kv8) ds4f_idx_quant_pos(ir, ihd, ly->idx_kv8 + (size_t)t*ihd, &ly->idx_pscale[t]);
+                if (ly->idx_kv8_4)     ds4f_idx_quant_pos_i4(ir, ihd, ly->idx_kv8_4 + (size_t)t*(ihd/2), &ly->idx_pscale[t]);
+                else if (ly->idx_kv8)  ds4f_idx_quant_pos(ir, ihd, ly->idx_kv8 + (size_t)t*ihd, &ly->idx_pscale[t]);
             }
         }
     }
