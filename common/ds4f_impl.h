@@ -87,6 +87,37 @@ static inline void ds4f_rowsplit8(int rows, int nthr, int tid, int *r0, int *r1)
     *r0 = g0 * 8; *r1 = g1 * 8; if (*r1 > rows) *r1 = rows;
 }
 
+/* ---- tensor-parallel (TP): shard a dense tensor's ROWS across the EP nodes ----
+ * Like ds4f_rowsplit8 but for `n` nodes with a configurable alignment (8 for bf16/bf16-pv,
+ * 128 for FP8 whose scale is 128-row-blocked). Node r owns aligned rows [*r0,*r1). */
+static inline void ds4f_tp_rowshard(int rows, int n, int r, int align, int *r0, int *r1) {
+    int blk = (rows + align - 1) / align;
+    int per = blk / n, extra = blk % n;
+    int g0 = per * r + (r < extra ? r : extra);
+    int g1 = g0 + per + (r < extra ? 1 : 0);
+    *r0 = g0 * align; *r1 = g1 * align; if (*r1 > rows) *r1 = rows;
+}
+/* DS4F_TP_HEAD: vocab-shard the lm_head across the EP group (8-aligned for bf16/bf16-pv).
+ * Sets r0/rows to this rank's shard; returns 1 when sharded, 0 (replicated, full vocab). */
+static inline int ds4f_tp_head_shard(int vocab, int ep_rank, int ep_size, int *r0, int *rows) {
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("DS4F_TP_HEAD"); s = (e && *e && atoi(e)) ? 1 : 0; }
+    if (!s || ep_size <= 1) { *r0 = 0; *rows = vocab; return 0; }
+    int a0, a1; ds4f_tp_rowshard(vocab, ep_size, ep_rank, 8, &a0, &a1);
+    *r0 = a0; *rows = a1 - a0; return 1;
+}
+/* DS4F_TP_SHARED: col-shard the shared-expert up/gate (sh_w1/sh_w3) over shared_inter
+ * (align = 128 for FP8 dst, else 8). sh_w2 stays REPLICATED; its down-proj contracts the
+ * full shared_inter over a zero-padded s_shg, so the per-node partial sums (folded into the
+ * routed-expert ar_cb reduce) to the full shared output. Returns 1 + r0/rows, else 0 + full. */
+static inline int ds4f_tp_shared_shard(int shared_inter, int ep_rank, int ep_size, int align, int *r0, int *rows) {
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("DS4F_TP_SHARED"); s = (e && *e && atoi(e)) ? 1 : 0; }
+    if (!s || ep_size <= 1) { *r0 = 0; *rows = shared_inter; return 0; }
+    int a0, a1; ds4f_tp_rowshard(shared_inter, ep_size, ep_rank, align, &a0, &a1);
+    *r0 = a0; *rows = a1 - a0; return 1;
+}
+
 /* ===================== helpers ===================== */
 static inline float ds4f_bf16(uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; memcpy(&f,&u,4); return f; }
 static inline uint16_t ds4f_f32_bf16(float f){ uint32_t u; memcpy(&u,&f,4); return (uint16_t)(u>>16); }
@@ -1533,8 +1564,9 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     per_layer += (size_t)c->n_heads*4 + pad;
     /* MoE */
     per_layer += ds4f_wbytes(DS4F_BF16, c->n_experts, c->hidden) + pad;            /* router */
-    per_layer += 2*(ds4f_wbytes(dq, c->shared_inter, c->hidden) + ds4f_sbytes(dq, c->shared_inter, c->hidden)) + 4*pad;
-    per_layer += ds4f_wbytes(dq, c->hidden, c->shared_inter) + ds4f_sbytes(dq, c->hidden, c->shared_inter) + 2*pad;
+    {   int shr0, shrows; ds4f_tp_shared_shard(c->shared_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &shr0, &shrows);  /* sh_w1+sh_w3 (TP col-shard) */
+        per_layer += 2*(ds4f_wbytes(dq, shrows, c->hidden) + ds4f_sbytes(dq, shrows, c->hidden)) + 4*pad; }
+    per_layer += ds4f_wbytes(dq, c->hidden, c->shared_inter) + ds4f_sbytes(dq, c->hidden, c->shared_inter) + 2*pad;  /* sh_w2 (replicated) */
     size_t per_ex = ds4f_wbytes(DS4F_MXFP4, c->moe_inter, c->hidden) + ds4f_sbytes(DS4F_MXFP4, c->moe_inter, c->hidden)
                   + ds4f_wbytes(DS4F_MXFP4, c->hidden, c->moe_inter) + ds4f_sbytes(DS4F_MXFP4, c->hidden, c->moe_inter)
                   + ds4f_wbytes(DS4F_MXFP4, c->moe_inter, c->hidden) + ds4f_sbytes(DS4F_MXFP4, c->moe_inter, c->hidden) + 6*pad;
@@ -1551,7 +1583,8 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
         total += slots * c->kv_lora * sizeof(uint16_t) + pad;
     }
     total += ds4f_wbytes(DS4F_BF16, c->vocab, c->hidden) + pad;                     /* embed */
-    total += ds4f_wbytes(DS4F_BF16, c->vocab, c->hidden) + pad;                     /* head */
+    {   int hr0, hrows; ds4f_tp_head_shard(c->vocab, ep_rank, ep_size, &hr0, &hrows); /* head (TP: vocab-shard) */
+        total += ds4f_wbytes(DS4F_BF16, hrows, c->hidden) + pad; }
     total += (size_t)c->hidden*2 + pad;                                            /* out_norm */
     {   int hc = c->hc_mult, hd = hc*c->hidden;
         total += (size_t)hc*hd*4 + (size_t)hc*4 + 4 + 3*pad;                        /* hc_head fn+base+scale */
@@ -1827,7 +1860,9 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     int C = cfg.hidden;
     m->out_norm = (uint16_t *)ds4f_bump(m, (size_t)C*2, 64);
     ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w; /* flat gather */
-    m->head = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.vocab, C);       /* matvec'd -> pv when enabled */
+    {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
+        m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }     /* matvec'd -> pv when enabled */
+    ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
     {   int hc = cfg.hc_mult, hd = hc*C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc*hd*4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc*4, 64);
@@ -1849,9 +1884,9 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads*4, 64);
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv when enabled */
-        ly->sh_w1 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
-        ly->sh_w3 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
-        ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter);
+        ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
+        ly->sh_w3 = ds4f_new_tensor(m, dq, m->sh_rows, C);
+        ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter); /* replicated (contracts full shared_inter) */
         ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
@@ -2364,6 +2399,41 @@ static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst,
     m->bytes_read += wb + sb;
 }
 
+/* TP row-shard load: copy only rows [r0, r0+dst->rows) of dense tensor 'base' into dst
+ * (dst->rows = shard count; full_rows = on-disk row count for the nbytes check). Reuses the
+ * bf16/fp8 -> bf16(_pv) promote, advancing the source by r0 rows. r0 must be 8-aligned
+ * (bf16-pv groups) and, for FP8 src, 128-aligned (its 128-row-blocked scale). */
+static void ds4f_load_dense_vshard(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst,
+                                   const char *base, int r0, int full_rows) {
+    char wn[256]; snprintf(wn, sizeof wn, "%s.weight", base);
+    const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
+    if (!we) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", wn); abort(); }
+    int K = dst->cols;
+    int src_fp8 = (strcmp(we->dtype, "F8_E4M3") == 0), src_bf16 = (strcmp(we->dtype, "BF16") == 0);
+    if (!src_fp8 && !src_bf16) { fprintf(stderr, "ds4f_load_dense_vshard: '%s' src %s unsupported\n", wn, we->dtype); abort(); }
+    int same = (src_fp8 && dst->type == DS4F_FP8) || (src_bf16 && dst->type == DS4F_BF16);  /* direct copy, no promote */
+    if (!same && dst->type != DS4F_BF16 && dst->type != DS4F_BF16_PV) { fprintf(stderr, "ds4f_load_dense_vshard: dst dtype %d NYI\n", dst->type); abort(); }
+    size_t fwb = src_fp8 ? ds4f_wbytes(DS4F_FP8, full_rows, K) : ds4f_wbytes(DS4F_BF16, full_rows, K);
+    if (we->nbytes != fwb) { fprintf(stderr, "ds4f_load_dense_vshard: '%s' nbytes %llu != full %zu\n", wn, (unsigned long long)we->nbytes, fwb); abort(); }
+    const uint8_t *sw, *ss = NULL;
+    if (src_fp8) {
+        sw = B->blob + we->off + (size_t)r0 * K;                 /* fp8: 1 byte/elem (r0 128-aligned) */
+        char sn[256]; snprintf(sn, sizeof sn, "%s.scale", base);
+        const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", ds4f_sbytes(DS4F_FP8, full_rows, K));
+        ss = B->blob + se->off + (size_t)(r0 / 128) * ((K + 127) / 128);
+    } else {
+        sw = B->blob + we->off + (size_t)r0 * K * 2;             /* bf16: 2 bytes/elem */
+    }
+    if (same) {                                                 /* FP8->FP8 / bf16->bf16: direct shard copy */
+        ds4f_copy_run(m, *dst, sw, ss);
+        m->bytes_read += ds4f_wbytes(dst->type, dst->rows, K) + ds4f_sbytes(dst->type, dst->rows, K);
+        return;
+    }
+    ds4f_promote_task T = { *dst, sw, ss, m->fp8_lut, src_fp8 };
+    ds4f_pool_run(m->pool, ds4f_promote_worker, &T);             /* fills dst->rows rows from the offset src */
+    m->bytes_read += ds4f_wbytes(src_fp8 ? DS4F_FP8 : DS4F_BF16, dst->rows, K);
+}
+
 static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
                                   const char *blob_dir, int n_threads, int n_cmgs) {
     double t0 = ds4f_wall();
@@ -2438,7 +2508,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     /* ---- allocate (bump order MIRRORS ds4f_alloc_synth exactly) ---- */
     m->out_norm = (uint16_t *)ds4f_bump(m, (size_t)C * 2, 64);
     ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w;
-    m->head = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.vocab, C);   /* matvec'd -> pv when promoted */
+    {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
+        m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }   /* matvec'd -> pv when promoted */
+    ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
     {   int hc = cfg.hc_mult, hd = hc * C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc * hd * 4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc * 4, 64);
@@ -2463,9 +2535,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         /* router selection bias (F32[n_experts]); only non-hash layers have it.
          * Off-arena (tiny, read single-threaded in the exact gate, not a matvec). */
         if (L >= cfg.n_hash_layers) ly->gate_bias = (float *)aligned_alloc(64, (size_t)cfg.n_experts * 4);
-        ly->sh_w1 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
-        ly->sh_w3 = ds4f_new_tensor(m, dq, cfg.shared_inter, C);
-        ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter);
+        ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
+        ly->sh_w3 = ds4f_new_tensor(m, dq, m->sh_rows, C);
+        ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter); /* replicated (contracts full shared_inter) */
         ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
@@ -2497,7 +2569,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     int mix = (2 + cfg.hc_mult) * cfg.hc_mult;
     ds4f_load_raw(m, &B, m->out_norm,      "norm.weight",   DS4F_BF16, 1, C);
     ds4f_load_raw(m, &B, m->embed,         "embed.weight",  DS4F_BF16, cfg.vocab, C);
-    ds4f_load_dense(m, &B, &m->head,       "head");
+    if (m->head_r0 || m->head.rows < cfg.vocab)                 /* TP: load only this node's vocab shard */
+        ds4f_load_dense_vshard(m, &B, &m->head, "head", m->head_r0, cfg.vocab);
+    else ds4f_load_dense(m, &B, &m->head,  "head");
     ds4f_load_raw(m, &B, m->hc_head_fn,    "hc_head_fn",    DS4F_F32, cfg.hc_mult, cfg.hc_mult * C);
     ds4f_load_raw(m, &B, m->hc_head_base,  "hc_head_base",  DS4F_F32, 1, cfg.hc_mult);
     ds4f_load_raw(m, &B, m->hc_head_scale, "hc_head_scale", DS4F_F32, 1, 1);
@@ -2519,8 +2593,13 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ds4f_load_dense(m, &B, &ly->gate,   DS4F_LN("ffn.gate"));
         if (ly->gate_bias)   /* noaux_tc selection bias (F32[n_experts]); non-hash layers only */
             ds4f_load_raw(m, &B, ly->gate_bias, DS4F_LN("ffn.gate.bias"), DS4F_F32, 1, cfg.n_experts);
-        ds4f_load_dense(m, &B, &ly->sh_w1,  DS4F_LN("ffn.shared_experts.w1"));
-        ds4f_load_dense(m, &B, &ly->sh_w3,  DS4F_LN("ffn.shared_experts.w3"));
+        if (m->sh_rows < cfg.shared_inter) {                    /* TP: col-shard sh_w1/sh_w3 (sh_w2 full) */
+            ds4f_load_dense_vshard(m, &B, &ly->sh_w1, DS4F_LN("ffn.shared_experts.w1"), m->sh_r0, cfg.shared_inter);
+            ds4f_load_dense_vshard(m, &B, &ly->sh_w3, DS4F_LN("ffn.shared_experts.w3"), m->sh_r0, cfg.shared_inter);
+        } else {
+            ds4f_load_dense(m, &B, &ly->sh_w1,  DS4F_LN("ffn.shared_experts.w1"));
+            ds4f_load_dense(m, &B, &ly->sh_w3,  DS4F_LN("ffn.shared_experts.w3"));
+        }
         ds4f_load_dense(m, &B, &ly->sh_w2,  DS4F_LN("ffn.shared_experts.w2"));
         for (int s = 0; s < no; s++) {
             int e = ly->owned_eid[s];
@@ -3824,6 +3903,8 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
       ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
     /* logits scratch reuses a per-token vocab buffer; allocate lazily once. */
     if (!m->p_logits) m->p_logits = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)c->vocab*4);
+    if (m->head.rows < c->vocab) {   /* TP head shard: batched-prefill head NYI (coherent gen is token-at-a-time) */
+        fprintf(stderr, "DS4F_TP_HEAD incompatible with batched prefill (use token-at-a-time gen)\n"); abort(); }
     ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, M, c->vocab, C);
     { ds4f_pf_argmax_task t = { m->p_logits, out_tok, c->vocab, M };
       ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t); }
@@ -3946,9 +4027,11 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         ds4f_rmsnorm(m->s_h2, fsrc, ly->ffn_norm, C, eps);
         ds4f_chk("ffn_norm", L, m->s_h2, C);
         for (int i = 0; i < C; i++) { m->s_moe[i] = 0.f; m->s_route[i] = 0.f; }
+        int tps = (m->sh_rows < c->shared_inter);              /* TP shared-expert (sh_w1/w3 col-shard) */
         { DS4F_TIC();
-        ds4f_matvec(m, m->s_shg, &ly->sh_w1, m->s_h2);
-        ds4f_matvec(m, m->s_shu, &ly->sh_w3, m->s_h2);
+        if (tps) { memset(m->s_shg, 0, (size_t)c->shared_inter*4); memset(m->s_shu, 0, (size_t)c->shared_inter*4); }
+        ds4f_matvec(m, m->s_shg + m->sh_r0, &ly->sh_w1, m->s_h2);  /* col-shard up/gate -> [sh_r0, sh_r0+sh_rows) */
+        ds4f_matvec(m, m->s_shu + m->sh_r0, &ly->sh_w3, m->s_h2);
         if (m->exact) { float lim = c->swiglu_limit;            /* clamp up both sides, gate max */
             for (int i = 0; i < c->shared_inter; i++)
                 m->s_shg[i] = ds4f_silu(m->s_shg[i] > lim ? lim : m->s_shg[i]) * ds4f_clampf(m->s_shu[i], -lim, lim);
@@ -3992,12 +4075,13 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         /* EP combine: sum the routed-expert partial across the expert-parallel
          * group (each rank owns a disjoint expert subset). Shared expert is
          * replicated, so it is NOT reduced — added locally below. */
+        if (tps) for (int i = 0; i < C; i++) m->s_route[i] += m->s_moe[i];  /* fold partial shared into routed -> ONE reduce */
         if (m->ar_cb) { DS4F_TIC(); m->ar_cb(m->s_route, C, m->ar_ctx); DS4F_TOC(DS4F_P_OTHER); }
         ds4f_chk("moe", L, m->s_route, C);
         if (m->mhc) {
-            for (int i = 0; i < C; i++) m->s_o[i] = m->s_moe[i] + m->s_route[i]; /* ffn output f(x) */
+            for (int i = 0; i < C; i++) m->s_o[i] = (tps ? 0.f : m->s_moe[i]) + m->s_route[i]; /* tps: shared already in s_route */
             ds4f_hc_post(m, m->s_x4, m->s_resid, m->s_o, post_f, comb_f);         /* expand 1->4 */
-        } else for (int i = 0; i < C; i++) x[i] += m->s_moe[i] + m->s_route[i];   /* shared(local)+routed(reduced) */
+        } else for (int i = 0; i < C; i++) x[i] += (tps ? 0.f : m->s_moe[i]) + m->s_route[i];  /* shared(local|folded)+routed */
         ds4f_chk("x+moe", L, m->mhc ? m->s_x4 : x, C);
     }
     /* head: mHC collapse 4 streams -> 1 (no sinkhorn), then out_norm + lm_head */
@@ -4005,7 +4089,17 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     if (m->mhc) { ds4f_hc_head(m, m->s_x4, m->s_xc); hsrc = m->s_xc; ds4f_chk("hc_head", -1, hsrc, C); }
     { DS4F_TIC();
     ds4f_rmsnorm(m->s_hn, hsrc, m->out_norm, C, eps);
-    ds4f_matvec(m, m->s_logits, &m->head, m->s_hn);
+    if (m->head.rows < c->vocab && m->ar_cb) {                 /* TP head: shard matvec -> zero-fill -> all-reduce-SUM */
+        /* each node computes only its vocab shard at s_logits[head_r0..]; zero the rest, then
+         * sum across the TP group. Shards are disjoint so the sum reconstructs the FULL logits
+         * BIT-EXACTLY (adding zeros is exact; each row's dot is identical to the replicated head)
+         * -> every node has identical full logits -> identical argmax (lockstep), no new collective. */
+        memset(m->s_logits, 0, (size_t)c->vocab * sizeof(float));
+        ds4f_matvec(m, m->s_logits + m->head_r0, &m->head, m->s_hn);
+        m->ar_cb(m->s_logits, c->vocab, m->ar_ctx);
+    } else {
+        ds4f_matvec(m, m->s_logits, &m->head, m->s_hn);        /* replicated: full head */
+    }
     int best = 0; float bv = m->s_logits[0];
     for (int v = 1; v < c->vocab; v++) if (m->s_logits[v] > bv) { bv = m->s_logits[v]; best = v; }
     DS4F_TOC(DS4F_P_HEAD);
