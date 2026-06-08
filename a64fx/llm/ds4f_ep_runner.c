@@ -184,6 +184,10 @@ static void ep_ar_callback(float *buf, int count, void *ctx) {
     }
     g_ar_secs += now_sec() - t0; g_ar_calls++;
 }
+/* (val, global-idx) argmax all-reduce callback (TP_HEAD batched-prefill head merge). */
+static void ep_argmax_callback(float *val, int32_t *idx, void *ctx) {
+    tp_allreduce_argmax((tp_comm *)ctx, val, idx);
+}
 /* MAX all-reduce callback (Phase-2 CP online-softmax combine: global per-head max). */
 static void ep_armax_callback(float *buf, int count, void *ctx) {
     tp_comm *c = (tp_comm *)ctx;
@@ -380,6 +384,14 @@ int main(void) {
         if (MyRank == 0) logmsg("DS4F_PREFILL_BATCH unsupported with mHC/Tier-B2; using token-at-a-time prefill\n");
         prefill_batch = 0;
     }
+    /* TP_ATTN shards wq_b by head -> batched prefill would need a per-layer [M,H] gather-reduce of
+     * p_attn before the block-diagonal o-proj (heads not group-aligned), which measured a net LOSS
+     * (comm ~57%, 37 < 47.85 tok/s). TP_ATTN is a decode-only memory lever; fall back to token-at-a-
+     * time prefill (which shards wq_b correctly via the decode TP path). TP_SHARED/TP_OPROJ compose. */
+    if (prefill_batch > 0 && getenv("DS4F_TP_ATTN") && atoi(getenv("DS4F_TP_ATTN"))) {
+        if (MyRank == 0) logmsg("DS4F_TP_ATTN (wq_b head-shard) is decode-only; using token-at-a-time prefill\n");
+        prefill_batch = 0;
+    }
     if (prefill_batch > 0 && !dense_bf16 && MyRank == 0)
         logmsg("WARN: DS4F_PREFILL_BATCH without DS4F_FP8_BF16=1 -> dense falls back to per-token matvec (no speedup)\n");
     /* MXFP4 GEMM tile-dequant default-ON for batched prefill (Step 2o). The svtbl expert
@@ -401,6 +413,7 @@ int main(void) {
         die("tp_comm_init", -1);
     m->ar_cb = ep_ar_callback; m->ar_ctx = &comm;
     m->ar_max_cb = ep_armax_callback; m->ar_max_ctx = &comm;
+    m->ar_argmax_cb = ep_argmax_callback; m->ar_argmax_ctx = &comm;
 
     barrier_robust(1);   /* everyone past load + comm init (robust: tolerate skew) */
     if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill%s\n",
