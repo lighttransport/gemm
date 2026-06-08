@@ -281,6 +281,8 @@ typedef struct {
     int attn_h0, attn_h1;   /* DS4F_TP_ATTN: this node's owned attention heads [attn_h0, attn_h1).
                              * wq_b holds those heads' rows; q-norm/RoPE + the attn worker process only
                              * them; s_o is per-node partial -> reduced. 0/[0,n_heads) => replicated. */
+    int oi0, oi_rows;       /* DS4F_TP_OPROJ: wo_a o_inter row-shard [oi0, oi0+oi_rows) (wo_b replicated).
+                             * Needs FULL s_attn (reduced first under TP_ATTN). 0/==o_inter => replicated. */
     uint16_t *out_norm;     /* BF16 [hidden] */
     /* global mHC head (collapses the 4 streams 1x before lm_head; NO sinkhorn) */
     float *hc_head_fn;      /* [hc_mult=4, hc_mult*hidden=16384] */
