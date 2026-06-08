@@ -204,10 +204,98 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Device-pointer variant for CUDA graph capture: position read from device memory */\n"
+"__global__ void rope_neox_f32_ptr(float *vec, int n_heads, int head_dim,\n"
+"                                   const int *pos_ptr,\n"
+"                                   float freq_base, int n_rope_pairs) {\n"
+"    int pos = *pos_ptr;\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    int half_dim = head_dim / 2;\n"
+"    if (j >= half_dim) return;\n"
+"    if (n_rope_pairs > 0 && j >= n_rope_pairs) return;\n"
+"    int pair_off = (n_rope_pairs > 0 && n_rope_pairs < half_dim) ? n_rope_pairs : half_dim;\n"
+"    int rope_dim = (n_rope_pairs > 0) ? 2 * n_rope_pairs : head_dim;\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float cos_t = cosf(theta);\n"
+"    float sin_t = sinf(theta);\n"
+"    float *vx = vec + h * head_dim;\n"
+"    float a = vx[j];\n"
+"    float b = vx[j + pair_off];\n"
+"    vx[j] = a * cos_t - b * sin_t;\n"
+"    vx[j + pair_off] = a * sin_t + b * cos_t;\n"
+"}\n"
+"\n"
+"/* Device-pointer variant of attn_decode_f32 for graph capture */\n"
+"__global__ void attn_decode_f32_ptr(float *out, const float *q,\n"
+"                                     const half_raw *key_cache, const half_raw *value_cache,\n"
+"                                     int n_heads, int n_kv_heads, int head_dim,\n"
+"                                     int kv_dim, const int *seq_len_ptr, float scale) {\n"
+"    int seq_len = *seq_len_ptr;\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int gqa_ratio = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa_ratio;\n"
+"    const float *q_h = q + h * head_dim;\n"
+"    int warp_id = tid / 32, lane = tid % 32;\n"
+"    float *scores = smem;\n"
+"    float local_max = -1e30f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        const half_raw *k_t = key_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"        float s = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) s += q_h[d] * half_to_float(k_t[d]);\n"
+"        s *= scale;\n"
+"        scores[t] = s;\n"
+"        if (s > local_max) local_max = s;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1)\n"
+"        local_max = max(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, off));\n"
+"    if ((tid & 0x1f) == 0) smem[0] = local_max;\n"
+"    __syncthreads();\n"
+"    local_max = smem[0];\n"
+"    __syncthreads();\n"
+"    float local_sum = 0.0f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        scores[t] = __expf(scores[t] - local_max);\n"
+"        local_sum += scores[t];\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1)\n"
+"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);\n"
+"    if ((tid & 0x1f) == 0) smem[0] = local_sum;\n"
+"    __syncthreads();\n"
+"    float inv_sum = 1.0f / smem[0];\n"
+"    float *out_h = out + h * head_dim;\n"
+"    float acc = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += nthreads) {\n"
+"        acc = 0.0f;\n"
+"        for (int t = 0; t < seq_len; t++)\n"
+"            acc += scores[t] * half_to_float(value_cache[(size_t)t * kv_dim + kv_h * head_dim + d]);\n"
+"        out_h[d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Device-pointer variant of kv_cache_store_f16 */\n"
+"__global__ void kv_cache_store_f16_ptr(half_raw *key_cache, half_raw *value_cache,\n"
+"                                        const float *k, const float *v,\n"
+"                                        const int *pos_ptr, int kv_dim) {\n"
+"    int position = *pos_ptr;\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < kv_dim) {\n"
+"        key_cache[(size_t)position * kv_dim + i] = float_to_half(k[i]);\n"
+"        value_cache[(size_t)position * kv_dim + i] = float_to_half(v[i]);\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- 7. attn_decode_f32: Flash-style decode attention with online softmax ---- */\n"
 "/* Fuses QK scoring + softmax + V accumulation into 2 passes over KV cache. */\n"
 "/* Pass 1: compute scores + online max/sum. Pass 2: V-weighted accumulation. */\n"
-"/* Grid: n_heads, blockDim: 256, shared: seq_len * sizeof(float) */\n"
+"/* Grid: n_heads, blockDim: 256, shared: max_seq_len * sizeof(float) */\n"
+"/* Original: takes seq_len by value; _ptr variant takes const int* for graph capture. */\n"
 "__global__ void attn_decode_f32(float *out, const float *q,\n"
 "                                 const half_raw *key_cache, const half_raw *value_cache,\n"
 "                                 int n_heads, int n_kv_heads, int head_dim,\n"
@@ -5062,7 +5150,10 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_f16_f32;
     CUfunction fn_qknorm_f32;
     CUfunction fn_rope_neox_f32;
+    CUfunction fn_rope_neox_f32_ptr;
+    CUfunction fn_attn_decode_f32_ptr;
     CUfunction fn_kv_cache_store_f16;
+    CUfunction fn_kv_cache_store_f16_ptr;
     CUfunction fn_attn_decode_f32;
     CUfunction fn_silu_mul_f32;
     CUfunction fn_add_f32;
@@ -5231,6 +5322,12 @@ struct cuda_llm_runner {
     CUdeviceptr d_grid_iq2s;
     CUdeviceptr d_grid_iq3;   /* iq3xxs_grid (256) — not used, keep for compat */
     CUdeviceptr d_grid_iq3s;  /* iq3s_grid (512) — correct for IQ3_S down */
+    /* Device buffers for graph-captured decode (position, seq_len — updated each step) */
+    CUdeviceptr d_pos_seq;    /* [2] int32: [position, seq_len] */
+    CUdeviceptr d_seq_ptr;    /* points to d_pos_seq[1] (seq_len) — persistent for graph capture */
+    CUgraph d_graph;
+    CUgraphExec d_graph_exec;
+    int graph_captured;
     /* Host-side PLE data (mmap pointers from GGUF, valid while GGUF is open) */
     qtensor h_ple_token_embd;       /* Q8_0 per_layer_token_embd */
     qtensor h_ple_model_proj;       /* BF16 per_layer_model_proj */
@@ -5488,7 +5585,10 @@ lookup_funcs:
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(qknorm_f32);
     GET_FUNC(rope_neox_f32);
+    GET_FUNC(rope_neox_f32_ptr);
+    GET_FUNC(attn_decode_f32_ptr);
     GET_FUNC(kv_cache_store_f16);
+    GET_FUNC(kv_cache_store_f16_ptr);
     GET_FUNC(attn_decode_f32);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
@@ -7878,34 +7978,33 @@ static inline void launch_rope(cuda_llm_runner *r, CUdeviceptr vec, int n_heads,
                                 int head_dim, int pos, float freq_base) {
     int half_dim = head_dim / 2;
     int n_rope_pairs = r->n_rope_pairs;
-    void *args[] = { &vec, &n_heads, &head_dim, &pos, &freq_base, &n_rope_pairs };
-    cuLaunchKernel(r->fn_rope_neox_f32,
-                   n_heads, 1, 1,
-                   half_dim, 1, 1,
-                   0, r->stream, args, NULL);
+    /* Use pointer variant when device buffer available (graph capture mode) */
+    CUfunction fn = r->d_pos_seq ? r->fn_rope_neox_f32_ptr : r->fn_rope_neox_f32;
+    void *pos_arg = r->d_pos_seq ? (void*)&r->d_pos_seq : (void*)&pos;
+    void *args[] = { &vec, &n_heads, &head_dim, pos_arg, &freq_base, &n_rope_pairs };
+    cuLaunchKernel(fn, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_kv_store(cuda_llm_runner *r, CUdeviceptr key_cache, CUdeviceptr value_cache,
                                     CUdeviceptr k, CUdeviceptr v, int position, int kv_dim) {
-    void *args[] = { &key_cache, &value_cache, &k, &v, &position, &kv_dim };
-    cuLaunchKernel(r->fn_kv_cache_store_f16,
-                   (kv_dim + 255) / 256, 1, 1,
-                   256, 1, 1,
-                   0, r->stream, args, NULL);
+    CUfunction fn = r->d_pos_seq ? r->fn_kv_cache_store_f16_ptr : r->fn_kv_cache_store_f16;
+    void *pos_arg = r->d_pos_seq ? (void*)&r->d_pos_seq : (void*)&position;
+    void *args[] = { &key_cache, &value_cache, &k, &v, pos_arg, &kv_dim };
+    cuLaunchKernel(fn, (kv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q,
                                      CUdeviceptr key_cache, CUdeviceptr value_cache,
                                      int n_heads, int n_kv_heads, int head_dim,
                                      int kv_dim, int seq_len, float scale) {
-    size_t smem = seq_len * sizeof(float);
-    /* Cap shared memory; for very long sequences this may need adjustment */
+    /* Use pointer variant when device buffer available (graph capture) */
+    CUfunction fn = r->d_pos_seq ? r->fn_attn_decode_f32_ptr : r->fn_attn_decode_f32;
+    /* seq_len is at d_seq_ptr (d_pos_seq[1]), pre-computed for graph-capture persistence */
+    void *sl_arg = r->d_pos_seq ? (void*)&r->d_seq_ptr : (void*)&seq_len;
+    size_t smem = (r->d_pos_seq ? (size_t)r->max_seq_len : seq_len) * sizeof(float);
     void *args[] = { &out, &q, &key_cache, &value_cache,
-                     &n_heads, &n_kv_heads, &head_dim, &kv_dim, &seq_len, &scale };
-    cuLaunchKernel(r->fn_attn_decode_f32,
-                   n_heads, 1, 1,
-                   256, 1, 1,
-                   smem, r->stream, args, NULL);
+                     &n_heads, &n_kv_heads, &head_dim, &kv_dim, sl_arg, &scale };
+    cuLaunchKernel(fn, n_heads, 1, 1, 256, 1, 1, (unsigned int)smem, r->stream, args, NULL);
 }
 
 static inline void launch_silu_mul(cuda_llm_runner *r, CUdeviceptr gate, CUdeviceptr up, int n) {
@@ -8602,11 +8701,29 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
         free(ple_host); free(proj_out); free(tok_ple); free(h_x);
     }
 
+    /* Upload position and seq_len to device for graph-captured ptr-variant kernels */
+    if (r->d_pos_seq) {
+        int ps[2] = {position, position + 1};
+        cuMemcpyHtoDAsync(r->d_pos_seq, ps, 2 * sizeof(int), r->stream);
+    }
+
     /* Decode profiling (debug_layers >= 2 and first 3 positions) */
     double dec_prof_ssm = 0, dec_prof_attn = 0, dec_prof_ffn = 0, dec_prof_proj = 0;
     int dec_do_prof = (r->debug_layers >= 2 && position < 3);
 
-    for (int l = 0; l < n_run_layers; l++) {
+    if (r->graph_captured == 1 && position > 0) {
+        cuStreamSynchronize(r->stream);
+        cuGraphLaunch(r->d_graph_exec, r->stream);
+        goto after_layers;
+    }
+    if (r->graph_captured == 0 && position == 0) {
+        cuStreamSynchronize(r->stream);
+        r->graph_captured = -1;
+        cuStreamBeginCapture(r->stream, CU_STREAM_CAPTURE_MODE_GLOBAL);
+    }
+    {
+    int l;
+    for (l = 0; l < n_run_layers; l++) {
         cuda_layer *cl = &r->layers[l];
 
         /* Pre-attention RMSNorm: xb = rmsnorm(x, attn_norm) */
@@ -9399,6 +9516,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             if (0 && r->fn_moe_iq2s_tc /* was expert_fused */ && r->fn_moe_topk_gpu) {
                 if (!r->d_topk_idx) cuMemAlloc(&r->d_topk_idx, 8 * sizeof(int));
                 if (!r->d_topk_wgt) cuMemAlloc(&r->d_topk_wgt, 8 * sizeof(float));
+                if (!r->d_pos_seq) { cuMemAlloc(&r->d_pos_seq, 2 * sizeof(int)); r->d_seq_ptr = r->d_pos_seq + sizeof(int); }
                 /* grid upload is in fallback path */
                 /* Lazy upload of grid tables to device (cubin kernels need them as params) */
                 if (!r->d_grid_ksigns) {
@@ -9463,6 +9581,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 if (r->fn_moe_iq2s_tc) {
                     if (!r->d_topk_idx) cuMemAlloc(&r->d_topk_idx, 8 * sizeof(int));
                     if (!r->d_topk_wgt) cuMemAlloc(&r->d_topk_wgt, 8 * sizeof(float));
+                if (!r->d_pos_seq) { cuMemAlloc(&r->d_pos_seq, 2 * sizeof(int)); r->d_seq_ptr = r->d_pos_seq + sizeof(int); }
                     if (r->d_topk_idx && r->d_topk_wgt) {
                         cuMemcpyHtoD(r->d_topk_idx, hti, 8 * sizeof(int));
                         cuMemcpyHtoD(r->d_topk_wgt, htw, 8 * sizeof(float));
@@ -9783,6 +9902,20 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             free(full_x);
         }
 
+    }
+    }
+
+after_layers:
+
+    /* End graph capture and instantiate */
+    if (r->graph_captured == -1 && position == 0) {
+        CUgraph _g;
+        CUresult _ge = cuStreamEndCapture(r->stream, &_g);
+        if (_ge == CUDA_SUCCESS && _g) {
+            _ge = cuGraphInstantiate(&r->d_graph_exec, _g, 0);
+            if (_ge == CUDA_SUCCESS) { r->d_graph = _g; r->graph_captured = 1; }
+            else r->graph_captured = 0;
+        } else r->graph_captured = 0;
     }
 
     if (dec_do_prof) {
@@ -11320,6 +11453,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
     free(r->swa_pattern);
     if (r->d_router_logits) cuMemFree(r->d_router_logits);
     if (r->d_moe_accum)    cuMemFree(r->d_moe_accum);
+    if (r->d_pos_seq)    cuMemFree(r->d_pos_seq);
+    if (r->d_graph_exec) cuGraphExecDestroy(r->d_graph_exec);
+    if (r->d_graph)      cuGraphDestroy(r->d_graph);
     if (r->d_topk_idx)    cuMemFree(r->d_topk_idx);
     if (r->d_topk_wgt)    cuMemFree(r->d_topk_wgt);
     if (r->d_grid_ksigns) cuMemFree(r->d_grid_ksigns);
