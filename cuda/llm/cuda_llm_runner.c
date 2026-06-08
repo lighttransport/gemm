@@ -5220,6 +5220,7 @@ struct cuda_llm_runner {
     CUfunction fn_moe_topk_gpu;
     CUfunction fn_moe_shared_gate_gpu;
     CUfunction fn_moe_iq2s_tc;
+    CUfunction fn_moe_iq3s_tc;
     CUdeviceptr d_topk_idx;   /* [8] int */
     CUdeviceptr d_topk_wgt;   /* [8] float */
     int h_topk_idx[8];
@@ -5607,6 +5608,7 @@ lookup_funcs:
                     cuModuleGetFunction(&r->fn_moe_shared_gate_gpu,r->moe_gpu_mod,"moe_shared_gate_gpu");
                     cuModuleGetFunction(&r->fn_moe_iq2s_tc /* was expert_fused */,r->moe_gpu_mod,"moe_expert_fused");
                     cuModuleGetFunction(&r->fn_moe_iq2s_tc,r->moe_gpu_mod,"moe_iq2s_tc");
+                    cuModuleGetFunction(&r->fn_moe_iq3s_tc,r->moe_gpu_mod,"moe_iq3s_tc");
                     /* Allocate and upload grid tables (passed as kernel params to avoid device global issues) */
                     r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
                 }free(d);}else fclose(fp);
@@ -6626,6 +6628,10 @@ static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_
         if (r->ssm_qkv_dim > xb2_dim) xb2_dim = r->ssm_qkv_dim;
         if (2 * q_dim > xb2_dim) xb2_dim = 2 * q_dim;
     }
+    if (r->is_moe) {
+        int tc_down_dim = r->n_experts_used * r->n_embd;
+        if (tc_down_dim > xb2_dim) xb2_dim = tc_down_dim;
+    }
 
     CHECK_CU(cuMemAlloc(&r->d_x,   max_dim * sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_xb,  max_dim * sizeof(float)));
@@ -7480,6 +7486,10 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     if (r->is_hybrid) {
         if (r->ssm_qkv_dim > xb2_dim) xb2_dim = r->ssm_qkv_dim;
         if (2 * q_dim > xb2_dim) xb2_dim = 2 * q_dim;
+    }
+    if (r->is_moe) {
+        int tc_down_dim = r->n_experts_used * r->n_embd;
+        if (tc_down_dim > xb2_dim) xb2_dim = tc_down_dim;
     }
 
     CHECK_CU(cuMemAlloc(&r->d_x,   max_dim * sizeof(float)));
@@ -9481,15 +9491,37 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                                        &cl->moe_exp_stride_gu };
                         cuLaunchKernel(r->fn_moe_iq2s_tc, expert_ff/16, n_used, 1, 32,1,1, 0, r->stream, ua, NULL);
                     }
+                    /* SiLU for all 8 experts (in-place on gate buffer) */
                     for (int e = 0; e < n_used; e++) {
-                        float wgt = htw[e];
                         CUdeviceptr gate_e = r->d_gate + (size_t)e * expert_ff * sizeof(float);
                         CUdeviceptr up_e   = r->d_up   + (size_t)e * expert_ff * sizeof(float);
-                        CUdeviceptr dw = cl->moe_down_exps_w + (size_t)hti[e] * cl->moe_exp_stride_d;
                         launch_silu_mul(r, gate_e, up_e, expert_ff);
-                        launch_matvec_auto(r, r->d_xb2, dw, gate_e,
-                                          cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
-                        launch_scale_add(r, r->d_moe_accum, r->d_xb2, wgt, n_embd);
+                    }
+
+                    /* IQ3_S TC down matvec for all 8 experts (1024 blocks) */
+                    if (r->fn_moe_iq3s_tc && r->d_grid_iq3s && cl->moe_down_exps_type == 21) {
+                        void *dna[] = { &r->d_xb2, &r->d_gate,
+                                       &cl->moe_down_exps_w,
+                                       &r->d_topk_idx, &r->d_grid_iq3s,
+                                       &n_used, &n_embd, &expert_ff,
+                                       &cl->moe_exp_stride_d };
+                        cuLaunchKernel(r->fn_moe_iq3s_tc, n_embd/16, n_used, 1, 32,1,1, 0, r->stream, dna, NULL);
+                        /* Accumulate from per-expert slices */
+                        for (int e = 0; e < n_used; e++) {
+                            float wgt = htw[e];
+                            CUdeviceptr down_e = r->d_xb2 + (size_t)e * n_embd * sizeof(float);
+                            launch_scale_add(r, r->d_moe_accum, down_e, wgt, n_embd);
+                        }
+                    } else {
+                        /* Scalar down per expert + accumulate */
+                        for (int e = 0; e < n_used; e++) {
+                            float wgt = htw[e];
+                            CUdeviceptr gate_e = r->d_gate + (size_t)e * expert_ff * sizeof(float);
+                            CUdeviceptr dw = cl->moe_down_exps_w + (size_t)hti[e] * cl->moe_exp_stride_d;
+                            launch_matvec_auto(r, r->d_xb2, dw, gate_e,
+                                              cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
+                            launch_scale_add(r, r->d_moe_accum, r->d_xb2, wgt, n_embd);
+                        }
                     }
                 } else {
                     /* Scalar fallback per expert */
