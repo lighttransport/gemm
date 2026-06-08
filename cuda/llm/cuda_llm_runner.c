@@ -5221,6 +5221,7 @@ struct cuda_llm_runner {
     CUfunction fn_moe_shared_gate_gpu;
     CUfunction fn_moe_iq2s_tc;
     CUfunction fn_moe_iq3s_tc;
+    CUfunction fn_moe_accum_gpu;
     CUdeviceptr d_topk_idx;   /* [8] int */
     CUdeviceptr d_topk_wgt;   /* [8] float */
     int h_topk_idx[8];
@@ -5609,6 +5610,7 @@ lookup_funcs:
                     cuModuleGetFunction(&r->fn_moe_iq2s_tc /* was expert_fused */,r->moe_gpu_mod,"moe_expert_fused");
                     cuModuleGetFunction(&r->fn_moe_iq2s_tc,r->moe_gpu_mod,"moe_iq2s_tc");
                     cuModuleGetFunction(&r->fn_moe_iq3s_tc,r->moe_gpu_mod,"moe_iq3s_tc");
+                    cuModuleGetFunction(&r->fn_moe_accum_gpu,r->moe_gpu_mod,"moe_accum_gpu");
                     /* Allocate and upload grid tables (passed as kernel params to avoid device global issues) */
                     r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
                 }free(d);}else fclose(fp);
@@ -9489,14 +9491,10 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                                        &r->d_topk_idx, &r->d_grid_iq2s,
                                        &n_used, &expert_ff, &n_embd,
                                        &cl->moe_exp_stride_gu };
-                        cuLaunchKernel(r->fn_moe_iq2s_tc, expert_ff/16, n_used, 1, 32,1,1, 0, r->stream, ua, NULL);
+                        cuLaunchKernel(r->fn_moe_iq2s_tc, expert_ff/64, n_used, 1, 128,1,1, 0, r->stream, ua, NULL);
                     }
-                    /* SiLU for all 8 experts (in-place on gate buffer) */
-                    for (int e = 0; e < n_used; e++) {
-                        CUdeviceptr gate_e = r->d_gate + (size_t)e * expert_ff * sizeof(float);
-                        CUdeviceptr up_e   = r->d_up   + (size_t)e * expert_ff * sizeof(float);
-                        launch_silu_mul(r, gate_e, up_e, expert_ff);
-                    }
+                    /* Fused SiLU: all 8 experts in one launch (n_used * expert_ff = 4096) */
+                    launch_silu_mul(r, r->d_gate, r->d_up, n_used * expert_ff);
 
                     /* IQ3_S TC down matvec for all 8 experts (1024 blocks) */
                     if (r->fn_moe_iq3s_tc && r->d_grid_iq3s && cl->moe_down_exps_type == 21) {
@@ -9506,12 +9504,19 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                                        &n_used, &n_embd, &expert_ff,
                                        &cl->moe_exp_stride_d };
                         cuLaunchKernel(r->fn_moe_iq3s_tc, n_embd/16, n_used, 1, 32,1,1, 0, r->stream, dna, NULL);
-                        /* Accumulate from per-expert slices */
+                        /* Fused accumulate: all 8 experts in one launch */
+                    if (r->fn_moe_accum_gpu) {
+                        void *aca[] = { &r->d_moe_accum, &r->d_xb2,
+                                        &r->d_topk_wgt, &n_used, &n_embd };
+                        cuLaunchKernel(r->fn_moe_accum_gpu, (n_embd+255)/256,1,1, 256,1,1,
+                                       0, r->stream, aca, NULL);
+                    } else {
                         for (int e = 0; e < n_used; e++) {
                             float wgt = htw[e];
                             CUdeviceptr down_e = r->d_xb2 + (size_t)e * n_embd * sizeof(float);
                             launch_scale_add(r, r->d_moe_accum, down_e, wgt, n_embd);
                         }
+                    }
                     } else {
                         /* Scalar down per expert + accumulate */
                         for (int e = 0; e < n_used; e++) {
@@ -9539,14 +9544,26 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                     }
                 }
                 {
-                    launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
-                    cuStreamSynchronize(r->stream);
-                    float gv; cuMemcpyDtoH(&gv, r->d_router_logits, sizeof(float));
-                    float shared_scale = 1.0f / (1.0f + expf(-gv));
-                    launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb, cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
-                    launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb, cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+                    float shared_scale;
+                    if (r->fn_moe_shared_gate_gpu) {
+                        void *sga[] = { &r->d_topk_wgt, &r->d_xb,
+                                        &cl->moe_shared_gate_w, &n_embd };
+                        cuLaunchKernel(r->fn_moe_shared_gate_gpu, 1,1,1, 128,1,1,
+                                       0, r->stream, sga, NULL);
+                        cuMemcpyDtoH(&shared_scale, r->d_topk_wgt, sizeof(float));
+                    } else {
+                        launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+                        cuStreamSynchronize(r->stream);
+                        float gv; cuMemcpyDtoH(&gv, r->d_router_logits, sizeof(float));
+                        shared_scale = 1.0f / (1.0f + expf(-gv));
+                    }
+                    launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                                      cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+                    launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                                      cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
                     launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
-                    launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate, cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+                    launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                                      cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
                     launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
                 }
                 cuMemcpyDtoDAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float), r->stream);

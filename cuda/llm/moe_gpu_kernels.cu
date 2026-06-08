@@ -209,3 +209,13 @@ extern "C" __global__ void moe_iq3s_tc(
     int m0 = lane / 4, m1 = m0 + 8;
     if ((lane & 3) == 0) { out[r0 + m0] = rc[0]; out[r0 + m1] = rc[2]; }
 }
+
+/* Fused accumulate: accum[i] += sum_e(wgt[e] * down[e*ne + i]) for all ne */
+extern "C" __global__ void moe_accum_gpu(float *accum, const float *down_buf,
+    const float *wgt, int n_used, int n_embd) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= n_embd) return;
+    float s = 0;
+    for (int e = 0; e < n_used; e++) s += wgt[e] * down_buf[(size_t)e * n_embd + i];
+    accum[i] += s;
+}
