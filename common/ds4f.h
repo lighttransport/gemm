@@ -278,6 +278,9 @@ typedef struct {
                              * (head.rows = shard row count). 0 + head.rows==vocab => replicated. */
     int sh_r0, sh_rows;     /* DS4F_TP_SHARED: shared_inter shard [sh_r0, sh_r0+sh_rows) for sh_w1/sh_w3
                              * (sh_w2 replicated). 0 + sh_rows==shared_inter => replicated shared expert. */
+    int attn_h0, attn_h1;   /* DS4F_TP_ATTN: this node's owned attention heads [attn_h0, attn_h1).
+                             * wq_b holds those heads' rows; q-norm/RoPE + the attn worker process only
+                             * them; s_o is per-node partial -> reduced. 0/[0,n_heads) => replicated. */
     uint16_t *out_norm;     /* BF16 [hidden] */
     /* global mHC head (collapses the 4 streams 1x before lm_head; NO sinkhorn) */
     float *hc_head_fn;      /* [hc_mult=4, hc_mult*hidden=16384] */
