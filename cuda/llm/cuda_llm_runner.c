@@ -4283,7 +4283,7 @@ static const char *cuda_kernel_source =
 "    int gate_type, int up_type, int down_type) {\n"
 "    int token = blockIdx.x;\n"
 "    if (token >= n_tokens) return;\n"
-"    __shared__ float s_accum[2048+512]; /* n_embd + expert_ff */\n"
+"    __shared__ float s_accum[2048+512+512]; /* n_embd + expert_ff + expert_ff (up_buf) */\n"
 "    __shared__ float s_xb[2048];\n"
 "    __shared__ int s_idx[8];\n"
 "    __shared__ float s_w[8];\n"
@@ -4382,31 +4382,28 @@ static const char *cuda_kernel_source =
 "        }\n"
 "        __syncthreads();\n"
 "        for (int r = warp; r < n_embd; r += 8) {\n"
-"            int nb = expert_ff / 256, row_bytes = nb * 98;\n"
+"            int nb = expert_ff / 256, row_bytes = nb * 66;\n"
 "            const unsigned char *rp = down_exps + (size_t)eidx * stride_d + (size_t)r * row_bytes;\n"
 "            float sum = 0.0f;\n"
 "            for (int b = lane; b < nb; b += 32) {\n"
-"                const unsigned char *bp = rp + b * 98;\n"
+"                const unsigned char *bp = rp + b * 66;\n"
 "                float d = half_to_float(*(const half_raw *)bp);\n"
-"                const unsigned char *qs = bp + 2, *ss = qs + 64;\n"
+"                const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
 "                const float *xbb = gate_buf + b * 256;\n"
 "                float p = 0.0f; int yi = 0;\n"
 "                for (int ib = 0; ib < 8; ib++) {\n"
-"                    unsigned int a32;\n"
-"                    memcpy(&a32, ss+4*ib, 4);\n"
-"                    float db = d * (0.5f + (float)(a32>>28)) * 0.5f;\n"
+"                    unsigned int a0 = qs[4*ib] | ((unsigned int)qs[4*ib+1]<<16);\n"
+"                    unsigned int a1 = qs[4*ib+2] | ((unsigned int)qs[4*ib+3]<<16);\n"
+"                    float db = d * (0.5f + (float)(a1>>28)) * 0.25f;\n"
+"                    const unsigned char *a8 = (const unsigned char *)&a0;\n"
 "                    for (int l = 0; l < 4; l++) {\n"
-"                        unsigned char sg = (unsigned char)ksigns_iq2xs_dev[(a32>>(7*l))&127];\n"
-"                        unsigned int g1 = iq3xxs_grid_dev[qs[2*l+0]];\n"
-"                        unsigned int g2 = iq3xxs_grid_dev[qs[2*l+1]];\n"
-"                        for (int j = 0; j < 4; j++) {\n"
-"                            float w0 = db * (float)(unsigned char)(g1>>(8*j)) * ((sg&(1<<j))?-1.0f:1.0f);\n"
-"                            float w1 = db * (float)(unsigned char)(g2>>(8*j)) * ((sg&(1<<(j+4)))?-1.0f:1.0f);\n"
-"                            p += w0*xbb[yi+j] + w1*xbb[yi+j+4];\n"
+"                        unsigned long long gv = iq2xxs_grid_dev[a8[l]];\n"
+"                        unsigned char sn = ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                        for (int j = 0; j < 8; j++) {\n"
+"                            float w = db * (float)(unsigned char)(gv>>(8*j)) * ((sn&(1<<j))?-1.0f:1.0f);\n"
+"                            p += w * xbb[yi++];\n"
 "                        }\n"
-"                        yi += 8;\n"
 "                    }\n"
-"                    qs += 8;\n"
 "                }\n"
 "                sum += p;\n"
 "            }\n"
@@ -10608,8 +10605,11 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
             {
                 int use_cublas = r->use_cublas && r->cublas && r->d_batch_f16_scratch;
                 if (use_cublas && cl->moe_gate_exps_type == GGML_TYPE_IQ2_XXS) {
-                    /* GPU top-k */
+                    /* GPU top-k + cuBLAS per-expert IQ2_XXS → FP16 + GEMM + scatter */
                     int tke = n_tokens * r->n_experts_used;
+                    int *h_tki = (int *)malloc(tke * sizeof(int));
+                    float *h_tkw = (float *)malloc(tke * sizeof(float));
+                    if (!h_tki || !h_tkw) { free(h_tki); free(h_tkw); return NULL; }
                     if (r->d_topk_idx_entries < tke) {
                         if (r->d_topk_idx) cuMemFree(r->d_topk_idx);
                         if (r->d_topk_wgt) cuMemFree(r->d_topk_wgt);
@@ -10621,22 +10621,11 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                     void *tka[] = { &r->d_topk_idx, &r->d_topk_wgt, &r->d_router_logits, &_ne, &_nu, &_nt };
                     cuLaunchKernel(r->fn_moe_topk_gpu, n_tokens,1,1, 128,1,1, 0, r->stream, tka, NULL); }
                     cuStreamSynchronize(r->stream);
-                    int *h_tki = (int *)malloc(tke * sizeof(int));
-                    float *h_tkw = (float *)malloc(tke * sizeof(float));
-                    if (!h_tki || !h_tkw) { free(h_tki); free(h_tkw); return NULL; }
                     cuMemcpyDtoH(h_tki, r->d_topk_idx, tke * sizeof(int));
                     cuMemcpyDtoH(h_tkw, r->d_topk_wgt, tke * sizeof(float));
-                    /* Per-expert cuBLAS: gather → dequant IQ2_XXS → cuBLAS GEMM → scatter */
                     CUdeviceptr d_gd = d_batch_mid;
                     CUdeviceptr d_eg = d_batch_ff1, d_eu = d_batch_ff2, d_ed = d_batch_wide;
                     int ec[256] = {0}; int etok[256][128]; float etw[256][128];
-                    for (int t = 0; t < n_tokens; t++)
-                        for (int ei = 0; ei < r->n_experts_used; ei++) {
-                            int eidx = h_tki[t * r->n_experts_used + ei];
-                            if (eidx < 0 || eidx >= 256) continue;
-                            int pos = ec[eidx]; if (pos >= 128) continue;
-                            etok[eidx][pos] = t; etw[eidx][pos] = h_tkw[t * r->n_experts_used + ei]; ec[eidx]++;
-                        }
                     CUdeviceptr d_f16w = 0;
                     cuMemAlloc(&d_f16w, (size_t)r->expert_ff * n_embd * sizeof(uint16_t));
                     for (int e = 0; e < r->n_experts; e++) {
