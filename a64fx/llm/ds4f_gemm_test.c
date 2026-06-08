@@ -19,6 +19,12 @@
  */
 #include "ds4f.h"
 #include <math.h>
+#ifdef DS4F_FAPP
+#include "fj_tool/fapp.h"
+#else
+#define fapp_start(n,a,b) ((void)0)
+#define fapp_stop(n,a,b)  ((void)0)
+#endif
 
 /* deterministic LCG so runs are reproducible (Date/rand-free) */
 static uint32_t rng = 0x12345678u;
@@ -81,11 +87,13 @@ static int run_case(ds4f_model *m, ds4f_qtype type, int rows, int cols, int M) {
     float *Ygemm = (float *)aligned_alloc(256, (size_t)M * rows * 4);
     double freq = (double)rdfreq();
     ds4f_gemm(m, Ygemm, &t, X, M, rows, cols);                                        /* warm */
-    int niter = 20; double best = 1e30;                                                /* min over iters (noise-robust) */
+    int niter = (getenv("DS4F_GEMM_NITER") ? atoi(getenv("DS4F_GEMM_NITER")) : 20); double best = 1e30;  /* min over iters */
+    fapp_start("gemm", 1, 0);
     for (int it = 0; it < niter; it++) {
         uint64_t tc0 = rdcyc(); ds4f_gemm(m, Ygemm, &t, X, M, rows, cols); uint64_t tc1 = rdcyc();
         double ms = (double)(tc1 - tc0) / freq * 1e3; if (ms < best) best = ms;
     }
+    fapp_stop("gemm", 1, 0);
     double ms_g = best;
     double gmac = (double)M * rows * cols / 1e9;
 
@@ -250,6 +258,11 @@ int main(int argc, char **argv) {
     ds4f_init_fp8_e4m3_lut(m.fp8_lut);    /* gather path needs the LUT */
 
     printf("ds4f_gemm_test  nthr=%d n_cmgs=%d\n", nthr, ncmg);
+    if (argc > 5) {   /* single bf16-pv shape for fapp profiling: nthr ncmg rows cols M (DS4F_GEMM_NITER loops) */
+        int rows = atoi(argv[3]), cols = atoi(argv[4]), MM = atoi(argv[5]);
+        int rc = run_case(&m, DS4F_BF16_PV, rows, cols, MM);
+        ds4f_pool_stop(m.pool); return rc;
+    }
     int fails = 0;
     /* shapes mirror real DS4F dense tensors (all K multiple of 512; rows %8==0) */
     struct { int rows, cols; } shapes[] = {
