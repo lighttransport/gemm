@@ -85,6 +85,15 @@ static size_t rss_bytes(void) {
 static void embed_lookup(const ds4f_model *m, int tok, float *x) {
     int C = m->cfg.hidden;
     if (tok < 0 || tok >= m->cfg.vocab) tok = 0;
+    if (m->emb_rows < m->cfg.vocab) {   /* DS4F_TP_EMBED: vocab-sharded -> owner fills its row, others zero */
+        for (int i = 0; i < C; i++) x[i] = 0.f;
+        if (tok >= m->emb_r0 && tok < m->emb_r0 + m->emb_rows) {
+            const uint16_t *row = m->embed + (size_t)(tok - m->emb_r0) * C;
+            for (int i = 0; i < C; i++) { union { uint32_t u; float f; } z; z.u = (uint32_t)row[i] << 16; x[i] = z.f; }
+        }
+        if (m->ar_cb) m->ar_cb(x, C, m->ar_ctx);   /* sum owner's row + zeros -> full embedding (BIT-EXACT) */
+        return;
+    }
     const uint16_t *row = m->embed + (size_t)tok * C;
     for (int i = 0; i < C; i++) {
         union { uint32_t u; float f; } z; z.u = (uint32_t)row[i] << 16; x[i] = z.f;

@@ -137,6 +137,15 @@ static inline int ds4f_tp_oproj_shard(int o_inter, int ep_rank, int ep_size, int
     int a0, a1; ds4f_tp_rowshard(o_inter, ep_size, ep_rank, align, &a0, &a1);
     *r0 = a0; *rows = a1 - a0; return 1;
 }
+/* DS4F_TP_EMBED: vocab-shard the input embedding (bf16, 8-aligned). embed_lookup fills only the
+ * owner's row + zeros, then ar_cb-SUMs -> the full embedding BIT-EXACT. Returns 1 + [r0,rows). */
+static inline int ds4f_tp_embed_shard(int vocab, int ep_rank, int ep_size, int *r0, int *rows) {
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("DS4F_TP_EMBED"); s = (e && *e && atoi(e)) ? 1 : 0; }
+    if (!s || ep_size <= 1) { *r0 = 0; *rows = vocab; return 0; }
+    int a0, a1; ds4f_tp_rowshard(vocab, ep_size, ep_rank, 8, &a0, &a1);
+    *r0 = a0; *rows = a1 - a0; return 1;
+}
 /* split this node's owned heads [m->attn_h0, m->attn_h1) across the thread pool (worker tid/nthr).
  * When TP_ATTN is off the range is [0, n_heads) so this matches the old per=nh/nthr split. */
 static inline void ds4f_head_split(const ds4f_model *m, int nthr, int tid, int *h0, int *h1) {
@@ -1613,7 +1622,8 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
         size_t slots = ring ? (size_t)c->window_size : (size_t)c->max_pos;          /* all layers window under tierb2 */
         total += slots * c->kv_lora * sizeof(uint16_t) + pad;
     }
-    total += ds4f_wbytes(DS4F_BF16, c->vocab, c->hidden) + pad;                     /* embed */
+    {   int er0, erows; ds4f_tp_embed_shard(c->vocab, ep_rank, ep_size, &er0, &erows);   /* embed (TP: vocab-shard) */
+        total += ds4f_wbytes(DS4F_BF16, erows, c->hidden) + pad; }
     {   int hr0, hrows; ds4f_tp_head_shard(c->vocab, ep_rank, ep_size, &hr0, &hrows); /* head (TP: vocab-shard) */
         total += ds4f_wbytes(DS4F_BF16, hrows, c->hidden) + pad; }
     total += (size_t)c->hidden*2 + pad;                                            /* out_norm */
@@ -1890,7 +1900,8 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
 
     int C = cfg.hidden;
     m->out_norm = (uint16_t *)ds4f_bump(m, (size_t)C*2, 64);
-    ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w; /* flat gather */
+    int er0, erows; ds4f_tp_embed_shard(cfg.vocab, ep_rank, ep_size, &er0, &erows); m->emb_r0 = er0; m->emb_rows = erows;  /* TP: vocab-shard */
+    ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, erows, C); m->embed = (uint16_t *)embed.w; /* flat gather */
     {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }     /* matvec'd -> pv when enabled */
     ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
@@ -2540,7 +2551,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     int C = cfg.hidden;
     /* ---- allocate (bump order MIRRORS ds4f_alloc_synth exactly) ---- */
     m->out_norm = (uint16_t *)ds4f_bump(m, (size_t)C * 2, 64);
-    ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, cfg.vocab, C); m->embed = (uint16_t *)embed.w;
+    { int er0, erows; ds4f_tp_embed_shard(cfg.vocab, ep_rank, ep_size, &er0, &erows); m->emb_r0 = er0; m->emb_rows = erows;  /* TP: vocab-shard */
+      ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, erows, C); m->embed = (uint16_t *)embed.w; }
     {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }   /* matvec'd -> pv when promoted */
     ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
@@ -2603,7 +2615,10 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     /* ---- copy REAL bytes by name (verify dtype/size; abort on any mismatch) ---- */
     int mix = (2 + cfg.hc_mult) * cfg.hc_mult;
     ds4f_load_raw(m, &B, m->out_norm,      "norm.weight",   DS4F_BF16, 1, C);
-    ds4f_load_raw(m, &B, m->embed,         "embed.weight",  DS4F_BF16, cfg.vocab, C);
+    if (m->emb_rows < cfg.vocab) {                          /* TP: load only this node's embed vocab shard */
+        ds4f_tensor et = { m->embed, NULL, DS4F_BF16, m->emb_rows, C };
+        ds4f_load_dense_vshard(m, &B, &et, "embed", m->emb_r0, cfg.vocab);
+    } else ds4f_load_raw(m, &B, m->embed,  "embed.weight",  DS4F_BF16, cfg.vocab, C);
     if (m->head_r0 || m->head.rows < cfg.vocab)                 /* TP: load only this node's vocab shard */
         ds4f_load_dense_vshard(m, &B, &m->head, "head", m->head_r0, cfg.vocab);
     else ds4f_load_dense(m, &B, &m->head,  "head");
