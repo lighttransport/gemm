@@ -427,6 +427,9 @@ typedef struct {
     void   *ar_ctx;
     void  (*ar_max_cb)(float *buf, int count, void *ctx);   /* MAX all-reduce (Phase-2 CP combine) */
     void   *ar_max_ctx;
+    void  (*ar_argmax_cb)(float *val, int32_t *idx, void *ctx);  /* (val,global-idx) argmax all-reduce
+                                                                  * (TP_HEAD batched-prefill head merge) */
+    void   *ar_argmax_ctx;
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
