@@ -122,12 +122,10 @@ extern "C" __global__ void moe_iq2s_tc(
 /*
  * moe_iq3s_tc: single-token IQ3_S TC matvec for ALL experts.
  * grid = (n_embd/16, n_used, 1) = (128, 8, 1) = 1024 blocks, 32 threads/block.
- * Matches IQ2_S TC pattern but uses IQ3_S layout (110 bytes/block, 512-entry grid).
  */
 extern "C" __global__ void moe_iq3s_tc(
     float *output, const float *input,
     const unsigned char *weights_base, const int *expert_idx,
-    const unsigned char *grid_ksigns,
     const unsigned int *grid_iq3s,
     int n_used, int n_embd, int expert_ff, size_t stride_d)
 {
@@ -138,6 +136,7 @@ extern "C" __global__ void moe_iq3s_tc(
     int lane = threadIdx.x;
     float *out = output + (size_t)ei * n_embd;
     int nb = expert_ff / 256, rb = nb * 110;
+    const float *xx = input + (size_t)ei * expert_ff;
 
     float rc[4] = {0,0,0,0};
     for (int k = 0; k < expert_ff; k += 16) {
@@ -146,27 +145,48 @@ extern "C" __global__ void moe_iq3s_tc(
         const unsigned char *bp = weights_base + (size_t)eidx * stride_d
                                 + (size_t)a_row * rb + bi * 110;
         float d = __half2float(*(const __half *)bp);
-        const unsigned char *qs = bp + 2;
-        const unsigned char *qh_base = bp + 2 + 64;
-        const unsigned char *signs_base = bp + 2 + 64 + 8;
-        const unsigned char *scales = bp + 2 + 64 + 8 + 32;
-        const float *xx = input + (size_t)ei * n_embd; /* per-expert input = SiLU output */
+        const unsigned char *qs0 = bp + 2;            /* qs base */
+        const unsigned char *qh_base = bp + 2 + 64;    /* qh (8 bytes) */
+        const unsigned char *signs_base = bp + 2 + 64 + 8; /* signs (32 bytes) */
+        const unsigned char *scales = bp + 2 + 64 + 8 + 32; /* scales (4 bytes) */
 
-        /* IQ3_S: 8 ib32 iterations, each covering 32 values */
-        int qhi = (col_k % 256) / 32;  /* which qh entry */
-        int tl = ((k + (lane%2)*8) % 32) / 8;  /* which 8-value group within 32 */
-        int sc_idx = qhi / 2;
+        /* Determine position within the 256-value block */
+        int pos_in_block = col_k % 256;
+        int ib32 = pos_in_block / 32;      /* 0..7: which 32-col group */
+        int tl = (pos_in_block % 32) / 8;  /* 0..3: which 8-col sub-group */
 
-        float db = d * (float)(1 + 2 * ((scales[sc_idx] >> (qhi%2*4 + tl/2*2)) & 0xf));
+        /* IQ3_S layout per 256-value block:
+         * qs: 64 bytes starting at bp+2, accessed as 4-byte-advancing by ib32
+         * qh_base: 8 bytes at bp+66
+         * signs: 32 bytes at bp+74
+         * scales: 4 bytes at bp+106 */
 
-        int gid = qs[tl] | ((qh_base[qhi] << (8-2*tl)) & 256);
-        const unsigned char *grd = (const unsigned char *)&grid_iq3s[gid];
-        unsigned char sgn = signs_base[qhi * 4 + tl];
+        /* For sub-group tl within ib32:
+         * Grid indices at qs_base[ib32*8 + tl*2 + 0] and qs_base[ib32*8 + tl*2 + 1]
+         * qh byte at qh_base[ib32], contributes bit 8 via (8-2*tl) shift
+         * Sign byte at signs_base[ib32*4 + tl]
+         * Scale nibble: ib32/2 gives byte index, ib32%2 gives high/low nibble */
+
+        int sc_byte = ib32 / 2;
+        int nib_shift = (ib32 % 2) * 4; /* ib32 even→low nibble(db1), odd→high nibble(db2) */
+        float db = d * (float)(1 + 2 * ((scales[sc_byte] >> nib_shift) & 0xf));
+
+        /* Each ib32 uses 8 qs bytes (4 lx × 2 bytes each). */
+        int qs_off = ib32 * 8 + tl * 2;
+        int g1 = qs0[qs_off + 0] | ((qh_base[ib32] << (8 - 2*tl)) & 256);
+        int g2 = qs0[qs_off + 1] | ((qh_base[ib32] << (7 - 2*tl)) & 256);
+
+        const unsigned char *grd1 = (const unsigned char *)&grid_iq3s[g1];
+        const unsigned char *grd2 = (const unsigned char *)&grid_iq3s[g2];
+        /* Signs: each ib32 uses 4 bytes (tl=0..3, one byte each) */
+        unsigned char sgn = signs_base[ib32 * 4 + tl];
 
         half w16[8];
-        for (int j = 0; j < 8; j++) {
-            float wv = db * (float)grd[j];
-            w16[j] = __float2half((sgn >> j) & 1 ? -wv : wv);
+        for (int j = 0; j < 4; j++) {
+            float w0 = db * (float)grd1[j];
+            float w1 = db * (float)grd2[j];
+            w16[j]     = __float2half((sgn & (1<<j))    ? -w0 : w0);
+            w16[j + 4] = __float2half((sgn & (1<<(j+4))) ? -w1 : w1);
         }
         unsigned ra[4];
         ra[0] = *(const unsigned *)&w16[0]; ra[1] = *(const unsigned *)&w16[2];
@@ -174,8 +194,8 @@ extern "C" __global__ void moe_iq3s_tc(
 
         half b16[4];
         int bk = ((lane % 8) / 2) * 2, kk = k + bk;
-        b16[0] = __float2half(xx[kk]); b16[1] = __float2half(xx[kk+1]);
-        b16[2] = __float2half(xx[kk]); b16[3] = __float2half(xx[kk+1]);
+        b16[0] = __float2half(xx[kk]);   b16[1] = __float2half(xx[kk+1]);
+        b16[2] = __float2half(xx[kk]);   b16[3] = __float2half(xx[kk+1]);
         unsigned rb2[2];
         rb2[0] = *(const unsigned *)&b16[0]; rb2[1] = *(const unsigned *)&b16[2];
 
