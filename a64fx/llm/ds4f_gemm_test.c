@@ -81,8 +81,12 @@ static int run_case(ds4f_model *m, ds4f_qtype type, int rows, int cols, int M) {
     float *Ygemm = (float *)aligned_alloc(256, (size_t)M * rows * 4);
     double freq = (double)rdfreq();
     ds4f_gemm(m, Ygemm, &t, X, M, rows, cols);                                        /* warm */
-    uint64_t tc0 = rdcyc(); ds4f_gemm(m, Ygemm, &t, X, M, rows, cols); uint64_t tc1 = rdcyc();
-    double ms_g = (double)(tc1 - tc0) / freq * 1e3;
+    int niter = 20; double best = 1e30;                                                /* min over iters (noise-robust) */
+    for (int it = 0; it < niter; it++) {
+        uint64_t tc0 = rdcyc(); ds4f_gemm(m, Ygemm, &t, X, M, rows, cols); uint64_t tc1 = rdcyc();
+        double ms = (double)(tc1 - tc0) / freq * 1e3; if (ms < best) best = ms;
+    }
+    double ms_g = best;
     double gmac = (double)M * rows * cols / 1e9;
 
     double maxabs = 0.0, maxrel = 0.0; int nbad = 0;
