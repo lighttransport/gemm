@@ -1,5 +1,5 @@
 /*
- * moe_gpu_kernels.cu — MoE GPU kernels.
+ * moe_gpu_kernels.cu — MoE GPU kernels for 35B-A3B decode.
  * AOT: nvcc -cubin -arch=sm_120 -o moe_gpu_kernels.cubin moe_gpu_kernels.cu
  */
 #include <cuda_runtime.h>
@@ -61,23 +61,16 @@ extern "C" __global__ void moe_shared_gate_gpu(
 }
 
 /*
- * moe_iq2s_tc: single-token IQ2_S TC matvec for ALL experts in one launch.
- * grid = (expert_ff/16, n_used, 1) = (32, 8, 1) = 256 blocks
- * block = 32 threads (1 warp)
- * Each block: processes 16 rows for one expert.
- * grid_iq2s: device pointer to IQ2_S grid table (1024 × ULL)
+ * moe_iq2s_tc: single-token IQ2_S TC matvec for ALL experts.
+ * grid = (expert_ff/16, n_used, 1) = (32, 8, 1) = 256 blocks, 32 threads/block.
  */
 extern "C" __global__ void moe_iq2s_tc(
-    float *output,           // [n_used * expert_ff]
-    const float *xb,         // [n_embd]
-    const unsigned char *weights_base,  // packed 3D: [stride * n_experts]
-    const int *expert_idx,   // [n_used]
+    float *output, const float *xb,
+    const unsigned char *weights_base, const int *expert_idx,
     const unsigned long long *grid_iq2s,
-    int n_used, int expert_ff, int n_embd,
-    size_t stride_gu)
+    int n_used, int expert_ff, int n_embd, size_t stride_gu)
 {
-    int ei = blockIdx.y;
-    int r0 = blockIdx.x * 16;
+    int ei = blockIdx.y, r0 = blockIdx.x * 16;
     int eidx = expert_idx[ei];
     if (eidx < 0 || r0 >= expert_ff) return;
 
@@ -87,53 +80,111 @@ extern "C" __global__ void moe_iq2s_tc(
 
     float rc[4] = {0,0,0,0};
     for (int k = 0; k < n_embd; k += 16) {
-        int a_row = r0 + lane / 2;
-        int col_k = k + (lane % 2) * 8;
-        int bi = col_k / 256;
-        int ib32 = (col_k % 256) / 32;
+        int a_row = r0 + lane / 2, col_k = k + (lane % 2) * 8;
+        int bi = col_k / 256, ib32 = (col_k % 256) / 32;
         int tl = ((k + (lane%2)*8) % 32) / 8;
         const unsigned char *bp = weights_base + (size_t)eidx * stride_gu
                                 + (size_t)a_row * rb + bi * 82;
         float d = __half2float(*(const __half *)bp);
         float db0 = d * (0.5f + (bp[74+ib32] & 0xf)) * 0.25f;
-        float db1 = d * (0.5f + (bp[74+ib32] >>  4)) * 0.25f;
-        float dl = (tl < 2) ? db0 : db1;
+        float db1 = d * (0.5f + (bp[74+ib32] >> 4)) * 0.25f;
         int gidx = bp[2+ib32*4+tl] | ((bp[66+ib32] << (8-2*tl)) & 0x300);
         unsigned long long gv = grid_iq2s[gidx];
         unsigned char sgn = bp[34+ib32*4+tl];
+        float dl = (tl < 2) ? db0 : db1;
         half w16[8];
         for (int j = 0; j < 8; j++) {
             float wv = dl * (float)(unsigned char)(gv >> (8*j));
-            if ((sgn >> j) & 1) wv = -wv;
-            w16[j] = __float2half(wv);
+            w16[j] = __float2half((sgn >> j) & 1 ? -wv : wv);
         }
         unsigned ra[4];
-        ra[0] = *(const unsigned *)&w16[0];
-        ra[1] = *(const unsigned *)&w16[2];
-        ra[2] = *(const unsigned *)&w16[4];
-        ra[3] = *(const unsigned *)&w16[6];
+        ra[0] = *(const unsigned *)&w16[0]; ra[1] = *(const unsigned *)&w16[2];
+        ra[2] = *(const unsigned *)&w16[4]; ra[3] = *(const unsigned *)&w16[6];
 
         half b16[4];
-        int bk = ((lane % 8) / 2) * 2;
-        int kk = k + bk;
-        b16[0] = __float2half(xb[kk]);
-        b16[1] = __float2half(xb[kk+1]);
-        b16[2] = __float2half(xb[kk]);
-        b16[3] = __float2half(xb[kk+1]);
+        int bk = ((lane % 8) / 2) * 2, kk = k + bk;
+        b16[0] = __float2half(xb[kk]); b16[1] = __float2half(xb[kk+1]);
+        b16[2] = __float2half(xb[kk]); b16[3] = __float2half(xb[kk+1]);
         unsigned rb2[2];
-        rb2[0] = *(const unsigned *)&b16[0];
-        rb2[1] = *(const unsigned *)&b16[2];
+        rb2[0] = *(const unsigned *)&b16[0]; rb2[1] = *(const unsigned *)&b16[2];
 
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
-            " {%0, %1, %2, %3},"
-            " {%4, %5, %6, %7},"
-            " {%8, %9},"
-            " {%10, %11, %12, %13};"
-            : "+f"(rc[0]), "+f"(rc[1]), "+f"(rc[2]), "+f"(rc[3])
-            : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]),
-              "r"(rb2[0]), "r"(rb2[1]),
-              "f"(rc[0]), "f"(rc[1]), "f"(rc[2]), "f"(rc[3]));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+            " {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "+f"(rc[0]),"+f"(rc[1]),"+f"(rc[2]),"+f"(rc[3])
+            : "r"(ra[0]),"r"(ra[1]),"r"(ra[2]),"r"(ra[3]),
+              "r"(rb2[0]),"r"(rb2[1]),
+              "f"(rc[0]),"f"(rc[1]),"f"(rc[2]),"f"(rc[3]));
+    }
+    int m0 = lane / 4, m1 = m0 + 8;
+    if ((lane & 3) == 0) { out[r0 + m0] = rc[0]; out[r0 + m1] = rc[2]; }
+}
+
+/*
+ * moe_iq3s_tc: single-token IQ3_S TC matvec for ALL experts.
+ * grid = (n_embd/16, n_used, 1) = (128, 8, 1) = 1024 blocks, 32 threads/block.
+ * Matches IQ2_S TC pattern but uses IQ3_S layout (110 bytes/block, 512-entry grid).
+ */
+extern "C" __global__ void moe_iq3s_tc(
+    float *output, const float *input,
+    const unsigned char *weights_base, const int *expert_idx,
+    const unsigned char *grid_ksigns,
+    const unsigned int *grid_iq3s,
+    int n_used, int n_embd, int expert_ff, size_t stride_d)
+{
+    int ei = blockIdx.y, r0 = blockIdx.x * 16;
+    int eidx = expert_idx[ei];
+    if (eidx < 0 || r0 >= n_embd) return;
+
+    int lane = threadIdx.x;
+    float *out = output + (size_t)ei * n_embd;
+    int nb = expert_ff / 256, rb = nb * 110;
+
+    float rc[4] = {0,0,0,0};
+    for (int k = 0; k < expert_ff; k += 16) {
+        int a_row = r0 + lane / 2, col_k = k + (lane % 2) * 8;
+        int bi = col_k / 256;
+        const unsigned char *bp = weights_base + (size_t)eidx * stride_d
+                                + (size_t)a_row * rb + bi * 110;
+        float d = __half2float(*(const __half *)bp);
+        const unsigned char *qs = bp + 2;
+        const unsigned char *qh_base = bp + 2 + 64;
+        const unsigned char *signs_base = bp + 2 + 64 + 8;
+        const unsigned char *scales = bp + 2 + 64 + 8 + 32;
+        const float *xx = input + (size_t)ei * n_embd; /* per-expert input = SiLU output */
+
+        /* IQ3_S: 8 ib32 iterations, each covering 32 values */
+        int qhi = (col_k % 256) / 32;  /* which qh entry */
+        int tl = ((k + (lane%2)*8) % 32) / 8;  /* which 8-value group within 32 */
+        int sc_idx = qhi / 2;
+
+        float db = d * (float)(1 + 2 * ((scales[sc_idx] >> (qhi%2*4 + tl/2*2)) & 0xf));
+
+        int gid = qs[tl] | ((qh_base[qhi] << (8-2*tl)) & 256);
+        const unsigned char *grd = (const unsigned char *)&grid_iq3s[gid];
+        unsigned char sgn = signs_base[qhi * 4 + tl];
+
+        half w16[8];
+        for (int j = 0; j < 8; j++) {
+            float wv = db * (float)grd[j];
+            w16[j] = __float2half((sgn >> j) & 1 ? -wv : wv);
+        }
+        unsigned ra[4];
+        ra[0] = *(const unsigned *)&w16[0]; ra[1] = *(const unsigned *)&w16[2];
+        ra[2] = *(const unsigned *)&w16[4]; ra[3] = *(const unsigned *)&w16[6];
+
+        half b16[4];
+        int bk = ((lane % 8) / 2) * 2, kk = k + bk;
+        b16[0] = __float2half(xx[kk]); b16[1] = __float2half(xx[kk+1]);
+        b16[2] = __float2half(xx[kk]); b16[3] = __float2half(xx[kk+1]);
+        unsigned rb2[2];
+        rb2[0] = *(const unsigned *)&b16[0]; rb2[1] = *(const unsigned *)&b16[2];
+
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+            " {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "+f"(rc[0]),"+f"(rc[1]),"+f"(rc[2]),"+f"(rc[3])
+            : "r"(ra[0]),"r"(ra[1]),"r"(ra[2]),"r"(ra[3]),
+              "r"(rb2[0]),"r"(rb2[1]),
+              "f"(rc[0]),"f"(rc[1]),"f"(rc[2]),"f"(rc[3]));
     }
     int m0 = lane / 4, m1 = m0 + 8;
     if ((lane & 3) == 0) { out[r0 + m0] = rc[0]; out[r0 + m1] = rc[2]; }
