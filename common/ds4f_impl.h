@@ -126,6 +126,17 @@ static inline int ds4f_tp_attn_shard(int n_heads, int ep_rank, int ep_size, int 
     if (!s || ep_size <= 1) { *h0 = 0; *h1 = n_heads; return 0; }
     ds4f_tp_rowshard(n_heads, ep_size, ep_rank, 1, h0, h1); return 1;
 }
+/* DS4F_TP_OPROJ: row-shard wo_a by o_inter (align 128 for FP8). The block-diagonal kernel
+ * picks each row's group via (goff+i)/o_lora, so the shard need NOT align to groups. wo_b stays
+ * replicated (it contracts the full o_inter, reconstructed by summing the partial s_o). The
+ * o_inter rows need the FULL s_attn -> reduce s_attn first when TP_ATTN. Returns 1 + [r0,rows). */
+static inline int ds4f_tp_oproj_shard(int o_inter, int ep_rank, int ep_size, int align, int *r0, int *rows) {
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("DS4F_TP_OPROJ"); s = (e && *e && atoi(e)) ? 1 : 0; }
+    if (!s || ep_size <= 1) { *r0 = 0; *rows = o_inter; return 0; }
+    int a0, a1; ds4f_tp_rowshard(o_inter, ep_size, ep_rank, align, &a0, &a1);
+    *r0 = a0; *rows = a1 - a0; return 1;
+}
 /* split this node's owned heads [m->attn_h0, m->attn_h1) across the thread pool (worker tid/nthr).
  * When TP_ATTN is off the range is [0, n_heads) so this matches the old per=nh/nthr split. */
 static inline void ds4f_head_split(const ds4f_model *m, int nthr, int tid, int *h0, int *h1) {
@@ -381,24 +392,24 @@ static void ds4f_matvec(ds4f_model *m, float *dst, const ds4f_tensor *t, const f
  * (PV: (i/8)*8*K; FP8/MXFP4 scale: i-indexed). Only the row->thread mapping changes. */
 typedef struct {
     ds4f_model *m; float *dst; const ds4f_tensor *t; const float *xbase;
-    int gin, glora;
+    int gin, glora, goff;   /* goff = global o_inter row offset of this (TP-sharded) wo_a -> group=(goff+i)/glora */
 } ds4f_mv_bd_task;
 static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
     ds4f_mv_bd_task *T = (ds4f_mv_bd_task *)arg;
     const ds4f_tensor *t = T->t; float *dst = T->dst;
-    int K = t->cols, gin = T->gin, glora = T->glora;
+    int K = t->cols, gin = T->gin, glora = T->glora, goff = T->goff;
     int r0, r1; ds4f_rowsplit8(t->rows, nthr, tid, &r0, &r1);
     if (t->type == DS4F_BF16_PV) {
         const uint16_t *base = (const uint16_t *)t->w;
         for (int i = r0; i + 7 < r1; i += 8) {
-            const float *x = T->xbase + (size_t)(i / glora) * gin;
+            const float *x = T->xbase + (size_t)((goff + i) / glora) * gin;
             const uint16_t *g = base + (size_t)(i / 8) * 8 * K;
             matvec_bf16_8row_pv(dst + i, g, g + 2*K, g + 4*K, g + 6*K, x, K);
         }
     } else if (t->type == DS4F_BF16) {
         const uint16_t *base = (const uint16_t *)t->w;
         for (int i = r0; i + 7 < r1; i += 8) {
-            const float *x = T->xbase + (size_t)(i / glora) * gin;
+            const float *x = T->xbase + (size_t)((goff + i) / glora) * gin;
             const uint16_t *w = base + (size_t)i * K;
             matvec_bf16_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K, x, K);
         }
@@ -413,7 +424,7 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
         int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
         int cur_g = -1;
         for (int i = r0; i + 7 < r1; i += 8) {
-            int g = i / glora;
+            int g = (goff + i) / glora;
             if (g != cur_g) { ds4f_quant_x_sdot_into(T->xbase + (size_t)g * gin, K, xq, xs); cur_g = g; }
             matvec_sdot_8row(dst + i, base + (size_t)(i / 8) * gb, xq, xs, K);
         }
@@ -423,7 +434,7 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
         if (T->m->fp8_magic) {
             ds4f_set_ftz();
             for (int i = r0; i + 7 < r1; i += 8) {
-                const float *x = T->xbase + (size_t)(i / glora) * gin;
+                const float *x = T->xbase + (size_t)((goff + i) / glora) * gin;
                 const uint8_t *w = base + (size_t)i * K;
                 const uint8_t *es = t->scale + (size_t)(i / 128) * sb_cols;
                 matvec_fp8e4m3_8row_magic(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
@@ -431,7 +442,7 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
             }
         } else {
             for (int i = r0; i + 7 < r1; i += 8) {
-                const float *x = T->xbase + (size_t)(i / glora) * gin;
+                const float *x = T->xbase + (size_t)((goff + i) / glora) * gin;
                 const uint8_t *w = base + (size_t)i * K;
                 const uint8_t *es = t->scale + (size_t)(i / 128) * sb_cols;
                 matvec_fp8e4m3_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
@@ -442,7 +453,7 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
         const uint8_t *base = (const uint8_t *)t->w; size_t rb = K / 2;
         const uint8_t *sbase = t->scale; size_t sb = K / 32;
         for (int i = r0; i + 7 < r1; i += 8) {
-            const float *x = T->xbase + (size_t)(i / glora) * gin;
+            const float *x = T->xbase + (size_t)((goff + i) / glora) * gin;
             const uint8_t *w = base + (size_t)i * rb;
             const uint8_t *s = sbase + (size_t)i * sb;
             matvec_mxfp4_8row(dst + i,
@@ -453,8 +464,8 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
 }
 static int ds4f_oproj_fuse = -1;     /* DS4F_OPROJ_FUSE: 1=fused wo_a (default), 0=per-group ref */
 static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *t,
-                                  const float *xbase, int gin, int glora) {
-    ds4f_mv_bd_task T = { m, dst, t, xbase, gin, glora };
+                                  const float *xbase, int gin, int glora, int goff) {
+    ds4f_mv_bd_task T = { m, dst, t, xbase, gin, glora, goff };
     m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols) + ds4f_sbytes(t->type, t->rows, t->cols);
     ds4f_pool_run(m->pool, ds4f_mv_bd_worker, &T);
 }
@@ -1578,7 +1589,8 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
         int qbr = (ah1 - ah0) * c->q_head_dim;
         per_layer += ds4f_wbytes(dq, qbr, c->q_lora) + ds4f_sbytes(dq, qbr, c->q_lora) + 2*pad; }
     per_layer += ds4f_wbytes(dq, c->kv_lora, c->hidden) + ds4f_sbytes(dq, c->kv_lora, c->hidden) + 2*pad;
-    per_layer += ds4f_wbytes(dq, c->o_inter, c->hidden) + ds4f_sbytes(dq, c->o_inter, c->hidden) + 2*pad;
+    {   int oir0, oirows; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &oir0, &oirows);  /* wo_a (TP o_inter shard) */
+        per_layer += ds4f_wbytes(dq, oirows, c->hidden) + ds4f_sbytes(dq, oirows, c->hidden) + 2*pad; }
     per_layer += ds4f_wbytes(dq, c->hidden, c->o_inter) + ds4f_sbytes(dq, c->hidden, c->o_inter) + 2*pad;
     per_layer += (size_t)c->n_heads*4 + pad;
     /* MoE */
@@ -1883,6 +1895,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }     /* matvec'd -> pv when enabled */
     ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
     ds4f_tp_attn_shard(cfg.n_heads, ep_rank, ep_size, &m->attn_h0, &m->attn_h1);  /* DS4F_TP_ATTN: head range */
+    ds4f_tp_oproj_shard(cfg.o_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->oi0, &m->oi_rows);  /* DS4F_TP_OPROJ: wo_a o_inter shard */
     {   int hc = cfg.hc_mult, hd = hc*C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc*hd*4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc*4, 64);
@@ -1900,7 +1913,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wq_a = ds4f_new_tensor(m, dq, cfg.q_lora, C);
         ly->wq_b = ds4f_new_tensor(m, dq, cfg.n_heads*cfg.q_head_dim, cfg.q_lora);
         ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
-        ly->wo_a = ds4f_new_tensor(m, dq, cfg.o_inter, C);
+        ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows, C);       /* TP: o_inter row-shard */
         ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads*4, 64);
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv when enabled */
@@ -2532,6 +2545,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }   /* matvec'd -> pv when promoted */
     ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
     ds4f_tp_attn_shard(cfg.n_heads, ep_rank, ep_size, &m->attn_h0, &m->attn_h1);  /* DS4F_TP_ATTN: head range */
+    ds4f_tp_oproj_shard(cfg.o_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->oi0, &m->oi_rows);  /* DS4F_TP_OPROJ: wo_a o_inter shard */
     {   int hc = cfg.hc_mult, hd = hc * C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc * hd * 4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc * 4, 64);
@@ -2549,7 +2563,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wq_a = ds4f_new_tensor(m, dq, cfg.q_lora, C);
         ly->wq_b = ds4f_new_tensor(m, dq, (m->attn_h1 - m->attn_h0) * cfg.q_head_dim, cfg.q_lora);  /* TP: owned heads */
         ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
-        ly->wo_a = ds4f_new_tensor(m, dq, cfg.o_inter, C);
+        ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows, C);       /* TP: o_inter row-shard */
         ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads * 4, 64);
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv */
@@ -2610,7 +2624,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             ds4f_load_dense_vshard(m, &B, &ly->wq_b, DS4F_LN("attn.wq_b"), m->attn_h0 * cfg.q_head_dim, cfg.n_heads * cfg.q_head_dim);
         else ds4f_load_dense(m, &B, &ly->wq_b,   DS4F_LN("attn.wq_b"));
         ds4f_load_dense(m, &B, &ly->wkv,    DS4F_LN("attn.wkv"));
-        ds4f_load_dense(m, &B, &ly->wo_a,   DS4F_LN("attn.wo_a"));
+        if (m->oi_rows < cfg.o_inter)                           /* TP: load only this node's o_inter rows */
+            ds4f_load_dense_vshard(m, &B, &ly->wo_a, DS4F_LN("attn.wo_a"), m->oi0, cfg.o_inter);
+        else ds4f_load_dense(m, &B, &ly->wo_a,   DS4F_LN("attn.wo_a"));
         ds4f_load_dense(m, &B, &ly->wo_b,   DS4F_LN("attn.wo_b"));
         ds4f_load_raw(m, &B, ly->attn_sink, DS4F_LN("attn.attn_sink"),       DS4F_F32, 1, cfg.n_heads);
         ds4f_load_dense(m, &B, &ly->gate,   DS4F_LN("ffn.gate"));
@@ -4007,21 +4023,23 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         { DS4F_TIC();
         int og = c->o_groups; (void)H;
         if (m->exact) {
-            /* grouped low-rank o-proj (block-diagonal wo_a, NO nonlinearity):
-             * s_attn is [og groups, n_heads/og*q_head_dim = C] already de-rotated;
-             * group g: o1[g*o_lora ..] = wo_a_rows[g*o_lora ..] @ s_attn[g*C ..].
-             * wo_a is FP8 -> o_lora(1024) rows are 128-aligned per group. */
             int gin = H / og;                          /* 32768/8 = 4096 == C */
-            /* Q8_PV wo_a: the per-group reference fallback uses ds4f_row_slice, which can't
-             * slice the 528B int8 group layout (-> NaN). Only the fused block-diagonal path
-             * indexes Q8 groups correctly, so force it for Q8 regardless of the flag. */
-            if (ds4f_oproj_fuse || ly->wo_a.type == DS4F_Q8_PV) { /* fused block-diagonal: 1 dispatch */
-                ds4f_matvec_blockdiag(m, m->s_o1, &ly->wo_a, m->s_attn, gin, c->o_lora);
+            int tpo = (m->oi_rows < c->o_inter);       /* TP: wo_a o_inter row-shard */
+            /* TP_ATTN leaves s_attn head-partial; the o_inter shard needs the FULL s_attn (each
+             * owned o_inter row contracts a whole group), so sum it first (disjoint heads + zeros
+             * => exact reconstruction). */
+            if (tpo && (m->attn_h1 - m->attn_h0 < c->n_heads) && m->ar_cb) m->ar_cb(m->s_attn, H, m->ar_ctx);
+            if (tpo) memset(m->s_o1, 0, (size_t)c->o_inter * sizeof(float));  /* only [oi0,oi0+oi_rows) computed */
+            /* block-diagonal wo_a (group g: o1[g*o_lora..] = wo_a[g*o_lora..] @ s_attn[g*gin..]);
+             * goff carries this node's o_inter offset so sharded rows pick the right group. TP / Q8_PV
+             * force the fused path (ds4f_row_slice can't slice the o_inter shard or the 528B Q8 layout). */
+            if (ds4f_oproj_fuse || tpo || ly->wo_a.type == DS4F_Q8_PV) {
+                ds4f_matvec_blockdiag(m, m->s_o1 + m->oi0, &ly->wo_a, m->s_attn, gin, c->o_lora, m->oi0);
             } else for (int g = 0; g < og; g++) {      /* reference: og separate dispatches */
                 ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
                 ds4f_matvec(m, m->s_o1 + (size_t)g * c->o_lora, &vg, m->s_attn + (size_t)g * gin);
             }
-            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden], no silu */
+            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden], partial under TP */
         } else {
             for (int i = 0; i < C; i++) m->s_oin[i] = 0.f;
             for (int g = 0; g < og; g++) for (int i = 0; i < C; i++) m->s_oin[i] += m->s_attn[g*C + i];
@@ -4029,7 +4047,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             for (int i = 0; i < c->o_inter; i++) m->s_o1[i] = ds4f_silu(m->s_o1[i]);  /* stand-in nonlin */
             ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden] */
         }
-        if ((m->attn_h1 - m->attn_h0 < c->n_heads) && m->ar_cb)  /* TP attn: sum per-node partial s_o -> full hidden */
+        if (((m->attn_h1 - m->attn_h0 < c->n_heads) || (m->oi_rows < c->o_inter)) && m->ar_cb)  /* TP attn/oproj: sum partial s_o -> full hidden */
             m->ar_cb(m->s_o, C, m->ar_ctx);
         ds4f_chk("o", L, m->s_o, C);
         if (m->mhc) ds4f_hc_post(m, m->s_x4, m->s_resid, m->s_o, post_a, comb_a); /* expand 1->4 */
