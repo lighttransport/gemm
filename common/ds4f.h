@@ -425,6 +425,8 @@ typedef struct {
      * Shared expert stays replicated (added locally). NULL => single-node (all owned). */
     void  (*ar_cb)(float *buf, int count, void *ctx);
     void   *ar_ctx;
+    void  (*ar_max_cb)(float *buf, int count, void *ctx);   /* MAX all-reduce (Phase-2 CP combine) */
+    void   *ar_max_ctx;
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */

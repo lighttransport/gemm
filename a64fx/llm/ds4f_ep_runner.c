@@ -184,6 +184,18 @@ static void ep_ar_callback(float *buf, int count, void *ctx) {
     }
     g_ar_secs += now_sec() - t0; g_ar_calls++;
 }
+/* MAX all-reduce callback (Phase-2 CP online-softmax combine: global per-head max). */
+static void ep_armax_callback(float *buf, int count, void *ctx) {
+    tp_comm *c = (tp_comm *)ctx;
+    int mc = c->max_count > 0 ? c->max_count : count;
+    double t0 = now_sec();
+    for (int off = 0; off < count; ) {
+        int n = count - off; if (n > mc) n = mc;
+        tp_allreduce_max(c, buf + off, n);
+        off += n;
+    }
+    g_ar_secs += now_sec() - t0; g_ar_calls++;
+}
 
 int main(void) {
     int rc;
@@ -388,10 +400,28 @@ int main(void) {
     if (tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, cfg.hidden * ar_mtile, barrier) != 0)
         die("tp_comm_init", -1);
     m->ar_cb = ep_ar_callback; m->ar_ctx = &comm;
+    m->ar_max_cb = ep_armax_callback; m->ar_max_ctx = &comm;
 
     barrier_robust(1);   /* everyone past load + comm init (robust: tolerate skew) */
     if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill%s\n",
                             N, prefill_batch > 0 ? " [batched M-token GEMM]" : "");
+
+    /* Stage-A self-test (post-barrier so every rank's comm is live): verify
+     * tp_allreduce_max == serial max + lockstep (every rank computes the same expected
+     * global max). Gated DS4F_CP_SELFTEST. Runs in lockstep on all ranks (seq stays aligned). */
+    if (getenv("DS4F_CP_SELFTEST") && atoi(getenv("DS4F_CP_SELFTEST"))) {
+        enum { NT = 19 };                         /* odd count: exercises the chunk tail */
+        float buf[NT], exq[NT];
+        for (int i = 0; i < NT; i++) {
+            buf[i] = (float)((MyRank + 1) * (i + 1)) - 137.5f;    /* per-rank, includes negatives */
+            exq[i] = (float)(N * (i + 1)) - 137.5f;               /* max over ranks is rank N-1 */
+        }
+        m->ar_max_cb(buf, NT, m->ar_max_ctx);
+        int bad = 0; float worst = 0.f;
+        for (int i = 0; i < NT; i++) { float d = buf[i] - exq[i]; d = d < 0 ? -d : d; if (d > worst) worst = d; if (d > 1e-3f) bad++; }
+        fprintf(stderr, "[CP_SELFTEST rank %d] tp_allreduce_max %s (bad=%d worst=%.3e)\n",
+                MyRank, bad ? "FAIL" : "PASS", bad, worst);
+    }
 
     int C = cfg.hidden;
     float *x = (float *)aligned_alloc(256, (size_t)C * 4);
