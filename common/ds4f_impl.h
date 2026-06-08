@@ -3960,16 +3960,17 @@ static void ds4f_pf_swiglu_worker(void *arg, int tid, int nthr) {
 }
 
 /* batched argmax over [M, vocab]; out_tok[mm] = argmax_v logits[mm][v]. */
-typedef struct { const float *logits; int *out; int vocab, M; } ds4f_pf_argmax_task;
+typedef struct { const float *logits; int *out; int vocab, M; int r0; float *val; } ds4f_pf_argmax_task;
 static void ds4f_pf_argmax_worker(void *arg, int tid, int nthr) {
     ds4f_pf_argmax_task *T = (ds4f_pf_argmax_task *)arg;
     int M = T->M, V = T->vocab, per = M/nthr, extra = M%nthr;
     int m0 = per*tid + (tid<extra?tid:extra), m1 = m0 + per + (tid<extra?1:0);
     for (int mm = m0; mm < m1; mm++) {
-        const float *lg = T->logits + (size_t)mm*V;
+        const float *lg = T->logits + (size_t)mm*V;       /* V = vocab, or hrows under TP_HEAD shard */
         int best = 0; float bv = lg[0];
         for (int v = 1; v < V; v++) if (lg[v] > bv) { bv = lg[v]; best = v; }
-        T->out[mm] = best;
+        T->out[mm] = T->r0 + best;                         /* r0 = head_r0 (0 unless TP_HEAD) -> global index */
+        if (T->val) T->val[mm] = bv;                       /* local max, merged across shards by the caller */
     }
 }
 
@@ -3988,6 +3989,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     if (!m->p_x || m->m_tile < M) { fprintf(stderr, "prefill batch buffers too small (m_tile=%d M=%d)\n", m->m_tile, M); abort(); }
     for (int mm = 0; mm < M; mm++) memcpy(m->p_x + (size_t)mm*C, X + (size_t)mm*C, (size_t)C*4);
 
+    int tps = (m->sh_rows < c->shared_inter);   /* TP shared-expert (sh_w1/w3 col-shard, sh_w2 full over zero-pad) */
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
         int ratio = c->compress_ratios[L];
@@ -4015,12 +4017,28 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         DS4F_TOC(DS4F_P_ATTN); }
         /* ---- grouped low-rank o-projection ---- */
         { DS4F_TIC();
-        for (int g = 0; g < og; g++) {
+        int tpo = (m->oi_rows < c->o_inter);   /* TP_OPROJ: wo_a o_inter row-shard (wo_b full over zero-pad) */
+        if (tpo) {
+            /* Only the owned o_inter rows [oi0, oi0+oi_rows) are computed. wo_a is block-diagonal:
+             * o_inter row r belongs to group r/o_lora, contracting that group's gin inputs. The shard
+             * may straddle group boundaries, so loop the overlapping groups and slice within the shard
+             * (local row = global - oi0). Then full wo_b over the zero-padded p_o1 -> per-node PARTIAL
+             * p_o, summed by the [M,C] attention-residual reduce below (mirrors the decode TP_OPROJ). */
+            memset(m->p_o1, 0, (size_t)M*c->o_inter*4);
+            int olora = c->o_lora, g_lo = m->oi0 / olora, g_hi = (m->oi0 + m->oi_rows - 1) / olora;
+            for (int g = g_lo; g <= g_hi; g++) {
+                int rlo = g*olora > m->oi0 ? g*olora : m->oi0;
+                int rhi = (g+1)*olora < m->oi0 + m->oi_rows ? (g+1)*olora : m->oi0 + m->oi_rows;
+                ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, rlo - m->oi0, rhi - rlo);
+                ds4f_gemm(m, m->p_o1 + rlo, &vg, m->p_attn + (size_t)g*gin, M, c->o_inter, H);
+            }
+        } else for (int g = 0; g < og; g++) {
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
             ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin,
                       M, c->o_inter, H);
         }
-        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, M, C, c->o_inter);
+        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, M, C, c->o_inter);   /* p_o = PARTIAL if tpo */
+        if (tpo && m->ar_cb) m->ar_cb(m->p_o, C*M, m->ar_ctx);        /* attention-residual reduce (sum partials) */
         for (int mm = 0; mm < M; mm++) { float *x = m->p_x + (size_t)mm*C, *o = m->p_o + (size_t)mm*C;
             for (int i = 0; i < C; i++) x[i] += o[i]; }
         DS4F_TOC(DS4F_P_OPROJ); }
@@ -4028,12 +4046,16 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         { DS4F_TIC();
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, M, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        ds4f_gemm(m, m->p_shg, &ly->sh_w1, m->p_h2, M, c->shared_inter, C);
-        ds4f_gemm(m, m->p_shu, &ly->sh_w3, m->p_h2, M, c->shared_inter, C);
+        /* TP_SHARED: sh_w1/w3 col-shard -> write the [sh_r0, sh_r0+sh_rows) columns of a zero-padded
+         * [M, shared_inter] buffer (Ystride=shared_inter); full sh_w2 over the zero-pad -> per-node
+         * PARTIAL p_moe, folded into the routed [M,C] reduce below (one reduce, like the decode path). */
+        if (tps) { memset(m->p_shg, 0, (size_t)M*c->shared_inter*4); memset(m->p_shu, 0, (size_t)M*c->shared_inter*4); }
+        ds4f_gemm(m, m->p_shg + m->sh_r0, &ly->sh_w1, m->p_h2, M, c->shared_inter, C);
+        ds4f_gemm(m, m->p_shu + m->sh_r0, &ly->sh_w3, m->p_h2, M, c->shared_inter, C);
         { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, M,
                                     c->shared_inter, c->shared_inter, c->swiglu_limit };
           ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
-        ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, M, C, c->shared_inter);   /* p_moe = shared out */
+        ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, M, C, c->shared_inter);   /* p_moe = shared out (PARTIAL if tps) */
         DS4F_TOC(DS4F_P_SHARED); }
         /* ---- FFN: router ---- */
         { DS4F_TIC();
@@ -4084,25 +4106,35 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
             }
         }
         DS4F_TOC(DS4F_P_EXPERTS); }
-        /* ---- EP combine: ONE [M,C] all-reduce (amortizes the per-op latency by M) ---- */
+        /* ---- EP combine: ONE [M,C] all-reduce (amortizes the per-op latency by M). Under TP_SHARED
+         * the partial shared p_moe is folded into p_route FIRST so it rides the same reduce. ---- */
+        if (tps) for (int mm = 0; mm < M; mm++) {
+            float *mo = m->p_moe + (size_t)mm*C, *ro = m->p_route + (size_t)mm*C;
+            for (int i = 0; i < C; i++) ro[i] += mo[i]; }
         if (m->ar_cb) { DS4F_TIC(); m->ar_cb(m->p_route, C*M, m->ar_ctx); DS4F_TOC(DS4F_P_OTHER); }
-        /* ---- residual: shared(local) + routed(reduced) ---- */
+        /* ---- residual: shared(local, or folded-into-route under tps) + routed(reduced) ---- */
         for (int mm = 0; mm < M; mm++) {
             float *x = m->p_x + (size_t)mm*C, *mo = m->p_moe + (size_t)mm*C, *ro = m->p_route + (size_t)mm*C;
-            for (int i = 0; i < C; i++) x[i] += mo[i] + ro[i];
+            for (int i = 0; i < C; i++) x[i] += (tps ? 0.f : mo[i]) + ro[i];
         }
     }
     /* ---- head: out_norm + lm_head over all M tokens, then per-token argmax ---- */
     { DS4F_TIC();
     { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, M, C, C };
       ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-    /* logits scratch reuses a per-token vocab buffer; allocate lazily once. */
+    /* logits scratch reuses a per-token vocab buffer; allocate lazily once (sized full vocab). */
     if (!m->p_logits) m->p_logits = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)c->vocab*4);
-    if (m->head.rows < c->vocab) {   /* TP head shard: batched-prefill head NYI (coherent gen is token-at-a-time) */
-        fprintf(stderr, "DS4F_TP_HEAD incompatible with batched prefill (use token-at-a-time gen)\n"); abort(); }
-    ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, M, c->vocab, C);
-    { ds4f_pf_argmax_task t = { m->p_logits, out_tok, c->vocab, M };
-      ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t); }
+    /* TP_HEAD: head is vocab-sharded (head.rows = hrows). GEMM the owned vocab rows -> p_logits[M, hrows];
+     * each token's local argmax (global index head_r0+best, local max value) is merged across the shards by
+     * ar_argmax_cb (M small 2-float argmax all-reduces, ONCE -- cheap, unlike a full [M,vocab] logit reduce). */
+    int hrows = m->head.rows, tph = (hrows < c->vocab);
+    ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, M, hrows, C);
+    { float *hval = tph ? (float *)alloca((size_t)M*4) : NULL;
+      ds4f_pf_argmax_task t = { m->p_logits, out_tok, hrows, M, m->head_r0, hval };
+      ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
+      if (tph && m->ar_argmax_cb)
+          for (int mm = 0; mm < M; mm++) { int32_t idx = out_tok[mm]; float v = hval[mm];
+              m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[mm] = idx; } }
     DS4F_TOC(DS4F_P_HEAD); }
 }
 
