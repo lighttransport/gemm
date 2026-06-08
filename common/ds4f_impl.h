@@ -117,6 +117,23 @@ static inline int ds4f_tp_shared_shard(int shared_inter, int ep_rank, int ep_siz
     int a0, a1; ds4f_tp_rowshard(shared_inter, ep_size, ep_rank, align, &a0, &a1);
     *r0 = a0; *rows = a1 - a0; return 1;
 }
+/* DS4F_TP_ATTN: shard the n_heads across the EP group (heads are independent -> align 1).
+ * wq_b gets the owned heads' rows; q-norm/attn workers process [h0,h1); the o-proj output is a
+ * per-node partial reduced via ar_cb. Returns 1 + [h0,h1), else 0 + [0,n_heads). */
+static inline int ds4f_tp_attn_shard(int n_heads, int ep_rank, int ep_size, int *h0, int *h1) {
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("DS4F_TP_ATTN"); s = (e && *e && atoi(e)) ? 1 : 0; }
+    if (!s || ep_size <= 1) { *h0 = 0; *h1 = n_heads; return 0; }
+    ds4f_tp_rowshard(n_heads, ep_size, ep_rank, 1, h0, h1); return 1;
+}
+/* split this node's owned heads [m->attn_h0, m->attn_h1) across the thread pool (worker tid/nthr).
+ * When TP_ATTN is off the range is [0, n_heads) so this matches the old per=nh/nthr split. */
+static inline void ds4f_head_split(const ds4f_model *m, int nthr, int tid, int *h0, int *h1) {
+    int lo = m->attn_h0, n = m->attn_h1 - m->attn_h0;
+    int per = n / nthr, extra = n % nthr;
+    *h0 = lo + per * tid + (tid < extra ? tid : extra);
+    *h1 = *h0 + per + (tid < extra ? 1 : 0);
+}
 
 /* ===================== helpers ===================== */
 static inline float ds4f_bf16(uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; memcpy(&f,&u,4); return f; }
@@ -1557,7 +1574,9 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     per_layer += (size_t)(c->hidden*2 + c->hidden*2 + c->q_lora*2 + c->kv_lora*2) + 4*pad;
     /* MLA dense (FP8 on-demand, or BF16 predequant) */
     per_layer += ds4f_wbytes(dq, c->q_lora, c->hidden) + ds4f_sbytes(dq, c->q_lora, c->hidden) + 2*pad;
-    per_layer += ds4f_wbytes(dq, c->n_heads*c->q_head_dim, c->q_lora) + ds4f_sbytes(dq, c->n_heads*c->q_head_dim, c->q_lora) + 2*pad;
+    {   int ah0, ah1; ds4f_tp_attn_shard(c->n_heads, ep_rank, ep_size, &ah0, &ah1);  /* wq_b (TP: owned heads) */
+        int qbr = (ah1 - ah0) * c->q_head_dim;
+        per_layer += ds4f_wbytes(dq, qbr, c->q_lora) + ds4f_sbytes(dq, qbr, c->q_lora) + 2*pad; }
     per_layer += ds4f_wbytes(dq, c->kv_lora, c->hidden) + ds4f_sbytes(dq, c->kv_lora, c->hidden) + 2*pad;
     per_layer += ds4f_wbytes(dq, c->o_inter, c->hidden) + ds4f_sbytes(dq, c->o_inter, c->hidden) + 2*pad;
     per_layer += ds4f_wbytes(dq, c->hidden, c->o_inter) + ds4f_sbytes(dq, c->hidden, c->o_inter) + 2*pad;
@@ -1863,6 +1882,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }     /* matvec'd -> pv when enabled */
     ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
+    ds4f_tp_attn_shard(cfg.n_heads, ep_rank, ep_size, &m->attn_h0, &m->attn_h1);  /* DS4F_TP_ATTN: head range */
     {   int hc = cfg.hc_mult, hd = hc*C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc*hd*4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc*4, 64);
@@ -2511,6 +2531,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }   /* matvec'd -> pv when promoted */
     ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
+    ds4f_tp_attn_shard(cfg.n_heads, ep_rank, ep_size, &m->attn_h0, &m->attn_h1);  /* DS4F_TP_ATTN: head range */
     {   int hc = cfg.hc_mult, hd = hc * C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc * hd * 4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc * 4, 64);
@@ -2526,7 +2547,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->kv_norm   = (uint16_t *)ds4f_bump(m, (size_t)cfg.kv_lora * 2, 64);
         ds4f_qtype dq = m->dense_qt;                            /* FP8 | BF16 | BF16_PV */
         ly->wq_a = ds4f_new_tensor(m, dq, cfg.q_lora, C);
-        ly->wq_b = ds4f_new_tensor(m, dq, cfg.n_heads * cfg.q_head_dim, cfg.q_lora);
+        ly->wq_b = ds4f_new_tensor(m, dq, (m->attn_h1 - m->attn_h0) * cfg.q_head_dim, cfg.q_lora);  /* TP: owned heads */
         ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
         ly->wo_a = ds4f_new_tensor(m, dq, cfg.o_inter, C);
         ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
@@ -2585,7 +2606,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ds4f_load_raw(m, &B, ly->q_norm,    DS4F_LN("attn.q_norm.weight"),   DS4F_BF16, 1, cfg.q_lora);
         ds4f_load_raw(m, &B, ly->kv_norm,   DS4F_LN("attn.kv_norm.weight"),  DS4F_BF16, 1, cfg.kv_lora);
         ds4f_load_dense(m, &B, &ly->wq_a,   DS4F_LN("attn.wq_a"));
-        ds4f_load_dense(m, &B, &ly->wq_b,   DS4F_LN("attn.wq_b"));
+        if (m->attn_h1 - m->attn_h0 < cfg.n_heads)              /* TP: load only owned heads' rows */
+            ds4f_load_dense_vshard(m, &B, &ly->wq_b, DS4F_LN("attn.wq_b"), m->attn_h0 * cfg.q_head_dim, cfg.n_heads * cfg.q_head_dim);
+        else ds4f_load_dense(m, &B, &ly->wq_b,   DS4F_LN("attn.wq_b"));
         ds4f_load_dense(m, &B, &ly->wkv,    DS4F_LN("attn.wkv"));
         ds4f_load_dense(m, &B, &ly->wo_a,   DS4F_LN("attn.wo_a"));
         ds4f_load_dense(m, &B, &ly->wo_b,   DS4F_LN("attn.wo_b"));
@@ -2842,10 +2865,8 @@ static void ds4f_attn_worker(void *arg, int tid, int nthr) {
     ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
     int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora, nP = T->pos + 1;
     /* split heads across threads */
-    int nh = m->cfg.n_heads;
-    int per = nh / nthr, extra = nh % nthr;
-    int h0 = per*tid + (tid < extra ? tid : extra);
-    int h1 = h0 + per + (tid < extra ? 1 : 0);
+    int nh = m->cfg.n_heads; (void)nh;
+    int h0, h1; ds4f_head_split(m, nthr, tid, &h0, &h1);        /* TP: only this node's owned heads */
     /* ---- sparse lightning-indexer gate (Stage 4) ----
      * On a sparse layer (ratio R>0) with more positions than the index budget,
      * a cheap compressed index over ceil(nP/R) blocks selects the top-mBlk
@@ -2961,9 +2982,8 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
     int rd = m->cfg.qk_rope_dim, nope = HD - rd, half = T->half;
     int pos = T->pos, p_lo = pos - T->win + 1; if (p_lo < 0) p_lo = 0;
     int nP = pos - p_lo + 1;
-    int nh = m->cfg.n_heads, per = nh / nthr, extra = nh % nthr;
-    int h0 = per*tid + (tid < extra ? tid : extra);
-    int h1 = h0 + per + (tid < extra ? 1 : 0);
+    int nh = m->cfg.n_heads; (void)nh;
+    int h0, h1; ds4f_head_split(m, nthr, tid, &h0, &h1);        /* TP: only this node's owned heads */
     int sve = ds4f_attn_sve;
     int i8 = (m->int8_kv && ly->kv_frozen); const float *kvsc = ly->kv_scale;  /* int8 KV */
     /* pre-freeze (calibration window) the window latents live in the bf16 calbuf, not kv_cache
@@ -3006,7 +3026,7 @@ static void ds4f_q_norm_rope(ds4f_model *m, float *q, int pos,
                              const float *rcos, const float *rsin) {
     ds4f_config *c = &m->cfg;
     int HD = c->q_head_dim, rd = c->qk_rope_dim, half = rd/2, nope = HD - rd;
-    for (int h = 0; h < c->n_heads; h++) {
+    for (int h = m->attn_h0; h < m->attn_h1; h++) {            /* TP: owned heads (skip q-norm of zero non-owned) */
         float *qh = q + (size_t)h*HD;
         double ss = 0.0; for (int d = 0; d < HD; d++) ss += (double)qh[d]*qh[d];
         float inv = 1.0f/sqrtf((float)(ss/HD) + c->norm_eps);
@@ -3023,8 +3043,8 @@ typedef struct { ds4f_model *m; float *q; int pos; const float *rcos, *rsin; } d
 static void ds4f_qnr_worker(void *arg, int tid, int nthr) {
     ds4f_qnr_task *T = (ds4f_qnr_task *)arg;
     ds4f_config *c = &T->m->cfg;
-    int HD = c->q_head_dim, rd = c->qk_rope_dim, half = rd/2, nope = HD - rd, nh = c->n_heads;
-    int h0 = (int)((long)nh * tid / nthr), h1 = (int)((long)nh * (tid+1) / nthr);
+    int HD = c->q_head_dim, rd = c->qk_rope_dim, half = rd/2, nope = HD - rd;
+    int h0, h1; ds4f_head_split(T->m, nthr, tid, &h0, &h1);    /* TP: owned heads only */
     for (int h = h0; h < h1; h++) {
         float *qh = T->q + (size_t)h*HD;
         double ss = 0.0; for (int d = 0; d < HD; d++) ss += (double)qh[d]*qh[d];
@@ -3058,9 +3078,8 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
     int nP = pos - p_lo + 1;
     int nsel = m->s_tb2_nsel, total = nP + nsel;
     const int *sel = m->s_tb2_sel; const float *cmp = ly->cmp_kv;
-    int nh = m->cfg.n_heads, per = nh / nthr, extra = nh % nthr;
-    int h0 = per*tid + (tid < extra ? tid : extra);
-    int h1 = h0 + per + (tid < extra ? 1 : 0);
+    int nh = m->cfg.n_heads; (void)nh;
+    int h0, h1; ds4f_head_split(m, nthr, tid, &h0, &h1);        /* TP: only this node's owned heads */
     int sve = ds4f_attn_sve;
     int i8 = (m->int8_kv && ly->kv_frozen); const float *kvsc = ly->kv_scale;  /* int8 KV */
     /* pre-freeze (calibration window) the window latents live in the bf16 calbuf, not kv_cache
@@ -3947,7 +3966,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         ds4f_chk("attn_norm", L, m->s_hn, C);
         { DS4F_TIC(); ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn); DS4F_TOC(DS4F_P_QKV_A); }
         ds4f_rmsnorm(m->s_qlat, m->s_qlat, ly->q_norm, c->q_lora, eps);
-        { DS4F_TIC(); ds4f_matvec(m, m->s_q, &ly->wq_b, m->s_qlat); DS4F_TOC(DS4F_P_QKV_B); } /* [n_heads*q_head_dim] */
+        { DS4F_TIC(); ds4f_matvec(m, m->s_q + (size_t)m->attn_h0 * c->q_head_dim, &ly->wq_b, m->s_qlat); DS4F_TOC(DS4F_P_QKV_B); } /* TP: owned heads of [n_heads*q_head_dim] */
         if (m->exact) { DS4F_TIC();
             if (ds4f_qnr_par) ds4f_q_norm_rope_par(m, m->s_q, pos, rcos, rsin);
             else              ds4f_q_norm_rope(m, m->s_q, pos, rcos, rsin);
@@ -3968,6 +3987,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             DS4F_TOC(DS4F_P_TB2PREP); }
         /* ---- attention ---- */
         { DS4F_TIC();
+        if (m->attn_h1 - m->attn_h0 < c->n_heads) memset(m->s_attn, 0, (size_t)H * sizeof(float));  /* TP: only owned heads filled -> partial s_attn */
         if (m->tierb2 && ratio) {
             /* window + indexer-selected compressed term (prepare ran above). */
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
@@ -4009,6 +4029,8 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             for (int i = 0; i < c->o_inter; i++) m->s_o1[i] = ds4f_silu(m->s_o1[i]);  /* stand-in nonlin */
             ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden] */
         }
+        if ((m->attn_h1 - m->attn_h0 < c->n_heads) && m->ar_cb)  /* TP attn: sum per-node partial s_o -> full hidden */
+            m->ar_cb(m->s_o, C, m->ar_ctx);
         ds4f_chk("o", L, m->s_o, C);
         if (m->mhc) ds4f_hc_post(m, m->s_x4, m->s_resid, m->s_o, post_a, comb_a); /* expand 1->4 */
         else for (int i = 0; i < C; i++) x[i] += m->s_o[i];     /* plain-residual stand-in */
