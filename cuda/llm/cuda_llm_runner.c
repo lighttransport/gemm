@@ -5222,6 +5222,7 @@ struct cuda_llm_runner {
     CUfunction fn_moe_iq2s_tc;
     CUfunction fn_moe_iq3s_tc;
     CUfunction fn_moe_accum_gpu;
+    CUfunction fn_moe_f16_tc;
     CUdeviceptr d_topk_idx;   /* [8] int */
     CUdeviceptr d_topk_wgt;   /* [8] float */
     int h_topk_idx[8];
@@ -5611,6 +5612,7 @@ lookup_funcs:
                     cuModuleGetFunction(&r->fn_moe_iq2s_tc,r->moe_gpu_mod,"moe_iq2s_tc");
                     cuModuleGetFunction(&r->fn_moe_iq3s_tc,r->moe_gpu_mod,"moe_iq3s_tc");
                     cuModuleGetFunction(&r->fn_moe_accum_gpu,r->moe_gpu_mod,"moe_accum_gpu");
+                    cuModuleGetFunction(&r->fn_moe_f16_tc,r->moe_gpu_mod,"moe_f16_tc");
                     /* Allocate and upload grid tables (passed as kernel params to avoid device global issues) */
                     r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
                 }free(d);}else fclose(fp);
@@ -9557,11 +9559,26 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                         float gv; cuMemcpyDtoH(&gv, r->d_router_logits, sizeof(float));
                         shared_scale = 1.0f / (1.0f + expf(-gv));
                     }
-                    launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
-                                      cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
-                    launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
-                                      cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+                    /* Shared expert via TC when weights are F16 */
+                    int sh_rows = cl->moe_shared_gate_rows;
+                    int sh_cols = cl->moe_shared_gate_cols;
+                    int su_rows = cl->moe_shared_up_rows;
+                    int sd_rows = cl->moe_shared_down_rows;
+                    int sd_cols = cl->moe_shared_down_cols;
+                    /* Shared expert: TC for gate/up (512×2048 F16), scalar for down (2048×512 needs more parallelism) */
+                    if (r->fn_moe_f16_tc && cl->moe_shared_gate_type == GGML_TYPE_F16) {
+                        void *sga[] = { &r->d_gate, &cl->moe_shared_ffn_gate_w, &r->d_xb, &sh_rows, &sh_cols };
+                        cuLaunchKernel(r->fn_moe_f16_tc, (sh_rows+15)/16,1,1, 32,1,1, 0, r->stream, sga, NULL);
+                        void *sua[] = { &r->d_up, &cl->moe_shared_ffn_up_w, &r->d_xb, &su_rows, &sh_cols };
+                        cuLaunchKernel(r->fn_moe_f16_tc, (su_rows+15)/16,1,1, 32,1,1, 0, r->stream, sua, NULL);
+                    } else {
+                        launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                                          cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+                        launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                                          cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+                    }
                     launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+                    /* Down matvec: scalar (more parallelism with 256 blocks × 256 threads) */
                     launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
                                       cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
                     launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
