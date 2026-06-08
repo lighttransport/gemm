@@ -227,7 +227,7 @@ static void run_indexer_decode(const char *tag, long base, int npos, int dim, in
                                 H, hd, rd, ratio, pos, offset, k,
                                 wqb, wproj, 0, cwkv, cwgate, cape, cnorm,
                                 cosb, sinb, eps, kvst, scst, idx_kv,
-                                NULL, NULL,        /* idx_kv8/idx_pscale: f32 path */
+                                NULL, NULL, NULL,  /* idx_kv8/idx_kv8_4/idx_pscale: f32 path */
                                 q_scr, score_scr, sel, NULL);
         if (T == 0) continue;
         for (int t = 0; t < T; t++) {

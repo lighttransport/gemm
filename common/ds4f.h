@@ -266,7 +266,9 @@ typedef struct {
     float    *idx_cmp_kv_state, *idx_cmp_score_state;  /* [coff*4, coff*index_head_dim] */
     float    *idx_kv;                /* [max_pos/ratio, index_head_dim] indexer compressed */
     int8_t   *idx_kv8;               /* [max_pos/ratio, index_head_dim] resident int8 mirror (DS4F_IDX_INT8) */
-    float    *idx_pscale;            /* [max_pos/ratio] per-position int8 scale (absmax/127) */
+    uint8_t  *idx_kv8_4;             /* [max_pos/ratio, index_head_dim/2] int4 (2/byte, +/-7), DS4F_IDX_INT4:
+                                      * half of idx_kv8 (672->336 B/pos); scan unpacks->int8 temp then svdot */
+    float    *idx_pscale;            /* [max_pos/ratio] per-position scale (absmax/127 int8, /7 int4) */
 } ds4f_layer;
 
 typedef struct ds4f_pool ds4f_pool;
