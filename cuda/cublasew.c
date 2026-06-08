@@ -125,6 +125,16 @@ typedef cublasStatus_t (*tcublasGemmEx)(cublasHandle_t,
                                         const void *,
                                         void *, cudaDataType_t, int,
                                         cublasComputeType_t, int);
+typedef cublasStatus_t (*tcublasGemmStridedBatchedEx)(cublasHandle_t,
+                                        cublasOperation_t,
+                                        cublasOperation_t,
+                                        int, int, int,
+                                        const void *,
+                                        const void *, cudaDataType_t, int, long long,
+                                        const void *, cudaDataType_t, int, long long,
+                                        const void *,
+                                        void *, cudaDataType_t, int, long long,
+                                        int, cublasComputeType_t, int);
 /* C[m,n] = diag(x) * A[m,n] (SIDE_LEFT) — column-major. Kernel-free per-row
  * scaling primitive; used to apply per-output-channel FP8 weight scales after
  * a per-tensor FP8 matmul. */
@@ -141,6 +151,7 @@ static tcublasDestroy_v2 p_cublasDestroy_v2;
 static tcublasSetStream_v2 p_cublasSetStream_v2;
 static tcublasSgemm_v2 p_cublasSgemm_v2;
 static tcublasGemmEx p_cublasGemmEx;
+static tcublasGemmStridedBatchedEx p_cublasGemmStridedBatchedEx;
 static tcublasSdgmm p_cublasSdgmm;
 static int g_cublas_init_done;
 static int g_cublas_available;
@@ -344,8 +355,9 @@ int cublasewInit(void) {
         return -1;
     }
 
-    /* Optional: only the per-row FP8 path needs it; tolerate absence. */
+    /* Optional: strided batched GEMM for MoE all-expert matmul */
     cublasew_load_symbol((void **)&p_cublasSdgmm, "cublasSdgmm");
+    cublasew_load_symbol((void **)&p_cublasGemmStridedBatchedEx, "cublasGemmStridedBatchedEx");
 
     g_cublas_available = 1;
     return 0;
@@ -1072,6 +1084,38 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
                           &beta,
                           (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+/* Strided-batched F16×F16→F32 GEMM for MoE all-expert matmul.
+ * For each batch e:
+ *   Y[e, n_tok, n_out] = X[n_tok, n_in] @ W[e, n_out, n_in]^T
+ * W has stride = n_out * n_in elements between batches.
+ * Y has stride = n_tok * n_out elements between batches.
+ * X is shared across all batches (strideB = 0). */
+int cublasew_gemm_f16_f16_f32_strided_batched(cublasew_context *ctx,
+                                               CUdeviceptr d_Y,
+                                               CUdeviceptr d_W_f16,
+                                               CUdeviceptr d_X_f16,
+                                               int n_tok,
+                                               int n_out,
+                                               int n_in,
+                                               int batch) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    if (!ctx || !ctx->handle || !p_cublasGemmStridedBatchedEx) return -1;
+    long long strideA = (long long)n_out * n_in;
+    long long strideC = (long long)n_tok * n_out;
+    cublasStatus_t st = p_cublasGemmStridedBatchedEx(ctx->handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n_out, n_tok, n_in,
+        &alpha,
+        (const void *)(uintptr_t)d_W_f16, CUDA_R_16F, n_in, strideA,
+        (const void *)(uintptr_t)d_X_f16, CUDA_R_16F, n_in, 0,
+        &beta,
+        (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out, strideC,
+        batch,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (st == CUBLAS_STATUS_SUCCESS) ? 0 : -1;
 }
 
 int cublasew_gemm_f16_f16_f32_rowmajor_nn(cublasew_context *ctx,

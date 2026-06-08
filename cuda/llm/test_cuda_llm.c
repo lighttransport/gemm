@@ -77,6 +77,7 @@ int main(int argc, char **argv) {
     const char *prompt = "Hello, how are you?";
     int max_tokens = 8;
     int max_seq_len = 256;
+    int large_bench = 0;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -90,6 +91,9 @@ int main(int argc, char **argv) {
             max_tokens = 10;  /* short prompt, focus on prefill + decode perf */
         } else if (strcmp(argv[i], "--bench") == 0) {
             max_tokens = 100;  /* 100-token prefill benchmark */
+        } else if (strcmp(argv[i], "--large-bench") == 0 && i + 1 < argc) {
+            max_tokens = atoi(argv[++i]);
+            large_bench = max_tokens;
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
@@ -98,6 +102,9 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (large_bench > 0 && max_seq_len < max_tokens) {
+        max_seq_len = max_tokens + 64;
+    }
     if (!model_path) {
         fprintf(stderr, "Usage: %s <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
         return 1;
@@ -247,7 +254,8 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 
-    /* Get logits from sequential forward_logits */
+    /* Get logits from sequential forward_logits (skip for large bench) */
+    if (!large_bench) {
     if (cuda_llm_reset_state(gpu) != 0) {
         fprintf(stderr, "cuda_llm_reset_state failed before sequential logits\n");
         pass = 0;
@@ -284,7 +292,9 @@ int main(int argc, char **argv) {
             }
         }
     }
+    } /* end !large_bench */
 
+    if (!large_bench) {
     if (cuda_llm_reset_state(gpu) != 0) {
         fprintf(stderr, "cuda_llm_reset_state failed before prefill hidden\n");
         pass = 0;
@@ -295,7 +305,6 @@ int main(int argc, char **argv) {
     double prefill_ms = get_time_ms() - t0;
     if (prefill_hidden) {
         float err = rel_l2_error(prefill_hidden, last_gpu_hidden, n_embd);
-        /* dp4a decode vs non-dp4a prefill will diverge — relax threshold */
         float ptol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
         fprintf(stderr, "Prefill hidden: %.1f ms (%.1f tok/s) rel_L2_vs_seq=%.6f\n",
                 prefill_ms, prefill_ms > 0 ? (1000.0 * max_tokens / prefill_ms) : 0.0, err);
@@ -317,7 +326,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Prefill logits: %.1f ms (%.1f tok/s)\n",
                 prefill_logits_ms,
                 prefill_logits_ms > 0 ? (1000.0 * max_tokens / prefill_logits_ms) : 0.0);
-        /* Print top-5 predicted tokens */
         int n_vocab_size = cuda_llm_n_vocab(gpu);
         if (n_vocab_size > 0) {
             int top5_ids[5] = {0};
@@ -342,6 +350,42 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "Prefill logits failed\n");
         pass = 0;
+    }
+    } /* end !large_bench */
+
+    /* Large batch prefill benchmark (synthetic tokens, no correctness) */
+    if (large_bench > 0) {
+        int bench_tokens = large_bench;
+        fprintf(stderr, "\n=== Large-batch prefill: %d tokens ===\n", bench_tokens);
+        if (cuda_llm_reset_state(gpu) != 0) {
+            fprintf(stderr, "cuda_llm_reset_state failed before large bench\n");
+            pass = 0; goto cleanup;
+        }
+        /* Create synthetic token IDs */
+        int32_t *big_tokens = (int32_t *)calloc((size_t)bench_tokens, sizeof(int32_t));
+        if (!big_tokens) { fprintf(stderr,"malloc failed\n"); pass=0; goto cleanup; }
+        /* Warm-up run */
+        if (!cuda_llm_prefill(gpu, big_tokens, NULL, 0, bench_tokens, 0)) {
+            fprintf(stderr, "Large bench warm-up prefill failed\n");
+            free(big_tokens); pass = 0; goto cleanup;
+        }
+        /* Timed run (reset state first for fair measurement) */
+        if (cuda_llm_reset_state(gpu) != 0) {
+            fprintf(stderr, "reset failed before timed run\n");
+            free(big_tokens); pass = 0; goto cleanup;
+        }
+        double t0 = get_time_ms();
+        float *result = cuda_llm_prefill(gpu, big_tokens, NULL, 0, bench_tokens, 0);
+        double ms = get_time_ms() - t0;
+        if (result) {
+            fprintf(stderr, "Large bench: %.1f ms (%.1f tok/s)\n",
+                    ms, ms > 0 ? (1000.0 * bench_tokens / ms) : 0.0);
+        } else {
+            fprintf(stderr, "Large bench prefill failed\n");
+            pass = 0;
+        }
+        free(big_tokens);
+        goto cleanup; /* skip decode bench after large bench */
     }
 
     /* Decode benchmark: N steps via prefill-then-decode */
