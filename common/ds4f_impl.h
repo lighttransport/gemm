@@ -557,7 +557,11 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
         }
     } else if (t->type == DS4F_BF16_PV) {
         const uint16_t *base = (const uint16_t *)t->w;
-        const int TILE_K = 512;                 /* mult of 16; 8 rows x 512 x2B = 8KB, L1-hot */
+        /* K-tile sized so the per-token X block (not the weights) drives L1 reuse: the old 512 reloaded
+         * X once PER TILE, throttling large M+K (the dominant cost). 4096 (min-of-20 bench: +20-40%
+         * across all dense shapes/M; K=8192 wo_b -> 2 tiles, larger regresses). DS4F_GEMM_TILE_K overrides. */
+        static int TILE_K = -1;
+        if (TILE_K < 0) { const char *e = getenv("DS4F_GEMM_TILE_K"); TILE_K = (e && atoi(e) > 0) ? (atoi(e) & ~15) : 4096; }
         for (int i = r0; i + 7 < r1; i += 8) {
             const uint16_t *g = base + (size_t)(i / 8) * 8 * K;
             float acc[DS4F_MAX_MTILE][8];
