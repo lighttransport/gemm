@@ -188,6 +188,23 @@ static void tp_ar_recv_add(tp_comm *c, int sid, float *buf, int count, uint64_t 
         for (int i = 0; i < count; i++) buf[i] += r[i];
     }
 }
+/* wait for recv slot `sid` trailer, then element-wise MAX its payload into buf.
+ * max is exact (the result is always one of the two inputs), so unlike the sum the
+ * bf16 path needs no symmetric-round trick: both partners compute max(Rf(buf),Rf(recv))
+ * over bf16-valued operands and end bitwise-equal; fp32 path is plain max. Deterministic
+ * (assoc/comm) => identical on every rank regardless of fold order => lockstep-safe. */
+static void tp_ar_recv_max(tp_comm *c, int sid, float *buf, int count, uint64_t tok) {
+    char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
+    volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
+    tp_ar_wait(c, trl, tok, sid, "max");
+    if (c->use_bf16) {
+        const uint16_t *r = (const uint16_t *)rb;
+        for (int i = 0; i < count; i++) { float v = tp_bf162f(r[i]), b = tp_bf16_round(buf[i]); buf[i] = v > b ? v : b; }
+    } else {
+        const float *r = (const float *)rb;
+        for (int i = 0; i < count; i++) if (r[i] > buf[i]) buf[i] = r[i];
+    }
+}
 /* same wait but overwrite (broadcast leg: receive the final reduced value). */
 static void tp_ar_recv_copy(tp_comm *c, int sid, float *buf, int count, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
@@ -225,6 +242,33 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
 
     /* 3. broadcast the result back to the folded-out even ranks. */
     if (mr < 2 * rem) {
+        if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, buf, count, tok);
+        else             tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok);
+    }
+}
+
+/* in-place MAX-all-reduce of buf[0..count). Same recursive-doubling schedule as
+ * tp_allreduce_sum, reduction op = element-wise max (tp_ar_recv_max). Used by the
+ * Phase-2 context-parallel online-softmax combine (global per-head max before the
+ * exp rescale). Must be called in lockstep with the sum all-reduces (shares seq). */
+static void tp_allreduce_max(tp_comm *c, float *buf, int count) {
+    if (c->nprocs == 1) return;
+    uint64_t tok = ++c->seq;
+    int mr = c->my_rank, rem = c->rem;
+
+    if (mr < 2 * rem) {                                   /* 1. pre-reduce fold even->odd */
+        if (mr % 2 == 0) tp_ar_send(c, mr + 1, 0, buf, count, tok);
+        else             tp_ar_recv_max(c, 0, buf, count, tok);
+    }
+    if (c->newrank != -1) {                               /* 2. recursive doubling */
+        for (int k = 0; k < c->nrounds; k++) {
+            int pnr = c->newrank ^ (1 << k);
+            int pr  = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+            tp_ar_send(c, pr, k + 1, buf, count, tok);
+            tp_ar_recv_max(c, k + 1, buf, count, tok);
+        }
+    }
+    if (mr < 2 * rem) {                                   /* 3. broadcast to folded-out evens */
         if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, buf, count, tok);
         else             tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok);
     }
