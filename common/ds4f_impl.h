@@ -1832,7 +1832,8 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
     m->s_idx_q     = (float *)aligned_alloc(256, (size_t)iH*ihd*4);
     m->s_idx_score = (float *)aligned_alloc(256, (size_t)nsel_cap*4);
     m->s_tb2_sel   = (int   *)aligned_alloc(256, (size_t)nsel_cap*4);
-    m->s_cmp_gather = (float *)aligned_alloc(256, (size_t)nsel_cap*KV*4);  /* CP: gathered selected cmp latents */
+    m->s_cmp_gather = (float *)aligned_alloc(256, (size_t)c->index_topk*KV*4);  /* CP: gathered selected cmp latents
+        (only ns<=index_topk slots ever written -- must NOT scale with nsel_cap=max(max_pos,topk): 16 GB @ 8M ctx) */
     for (int L = 0; L < c->n_layers; L++) {
         int ratio = c->compress_ratios[L];
         if (ratio == 0) continue;
