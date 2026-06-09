@@ -1543,6 +1543,7 @@ static void ds4f_tb2rope_worker(void *arg, int tid, int nthr) {
  * per-head RoPE(last rd)+rotate+fp4; step the OWN (rotate) compressor (fills idx_kv_cache);
  * weights = weights_proj(x) * (hd^-0.5 * H^-0.5); index_score over idx_kv_cache[:end//ratio];
  * select top-min(k,T) compressed positions (+offset). q_scr[H*hd], score_scr[>=T], sel[k]. */
+static void ds4f_cp_merge_topk(const float *, const float *, int, int, int, int *);  /* fwd (defined below) */
 static int ds4f_index_step(
     const float *x, int dim, const float *qr, int qlora,
     int H, int hd, int rd, int ratio, int start_pos, int offset, int k,
@@ -1552,8 +1553,11 @@ static int ds4f_index_step(
     float *comp_kv_state, float *comp_score_state, float *idx_kv_cache,
     int8_t *idx_kv8, uint8_t *idx_kv8_4, float *idx_pscale,
     float *q_scr, float *score_scr, int *sel, ds4f_pool *pool,
-    int idx_cp, int idx_s0, int idx_s1, void (*ar_cb)(float *, int, void *), void *ar_ctx)
+    int idx_cp, int idx_s0, int idx_s1, void (*ar_cb)(float *, int, void *), void *ar_ctx,
+    int ep_rank, int ep_size, float *cp_cand_slot, float *cp_cand_score)
 {
+    static int s_cp_merge = -1;   /* DS4F_CP_MERGE (default on): candidate-merge gather vs Option-A full-T */
+    if (s_cp_merge < 0) { const char *e = getenv("DS4F_CP_MERGE"); s_cp_merge = (e ? atoi(e) : 1); }
     int end_pos = start_pos + 1, half = rd / 2;
     double _tqp0 = ds4f_now();
     if (pool && w_bf16) {                                    /* q = wq_b(qr), pooled bf16 */
@@ -1625,6 +1629,7 @@ static int ds4f_index_step(
     if (s_i4 < 0) { const char *e = getenv("DS4F_IDX_INT4"); s_i4 = (e && *e && atoi(e)) ? 1 : 0; }
     int do_i4 = (s_i4 && idx_kv8_4 && pool && T >= DS4F_IDX_F32_SLOTS && (hd % 64) == 0);  /* resident int4 scan */
     int do_i8 = (s_i8 && idx_kv8   && pool && T >= DS4F_IDX_F32_SLOTS && (hd % 64) == 0);  /* resident int8 scan */
+    int sel_done = 0;   /* CP merge path fills sel directly -> skip the O(T) final topk */
     if (do_i4 || do_i8) {
         int8_t *q8 = (int8_t *)alloca((size_t)H * hd);       /* query stays int8 in both modes */
         float  *sq = (float *)alloca((size_t)H * 4);
@@ -1635,15 +1640,33 @@ static int ds4f_index_step(
             for (int d = 0; d < hd; d++) { int v = (int)lrintf(qh[d] * inv); v = v > 127 ? 127 : (v < -127 ? -127 : v); q8[(size_t)h * hd + d] = (int8_t)v; }
         }
         if (do_i4) {
-            /* CP: idx_kv8_4/idx_pscale are slot-sharded -> each node scans only its owned slots
-             * [idx_s0,idx_s1) (local base) writing GLOBAL score positions; zero the rest + ar_cb-SUM
-             * so every node ends with the full [0,T) score vector (== the replicated scan, exactly). */
-            int s0 = idx_cp ? idx_s0 : 0;
-            int hi = (idx_cp && idx_s1 < T) ? idx_s1 : T, nloc = hi - s0; if (nloc < 0) nloc = 0;
-            if (idx_cp) { for (int i = 0; i < T; i++) score_scr[i] = 0.f; }
-            ds4f_idxsc8r4_task tk = { q8, idx_kv8_4, sq, idx_pscale, weights, H, hd, nloc, s0, score_scr };
-            ds4f_pool_run(pool, ds4f_idxsc8r4_worker, &tk);
-            if (idx_cp && ar_cb) ar_cb(score_scr, T, ar_ctx);
+            int merge = idx_cp && s_cp_merge && ar_cb && cp_cand_slot && cp_cand_score && ep_size > 1;
+            int hi = (idx_cp && idx_s1 < T) ? idx_s1 : T;
+            if (merge) {
+                /* MERGE (decode win): scan owned slots -> LOCAL scores [0,nloc); local top-k -> candidates
+                 * {global slot, score}; gather N*k candidates (ar_cb-SUM, ~45 KB vs ~12 MB full-T); merge ->
+                 * global top-k. Exact to the replicated topk (tools/cpmerge_test). Skips the O(T) final topk. */
+                int nloc = hi - idx_s0; if (nloc < 0) nloc = 0;
+                ds4f_idxsc8r4_task tk = { q8, idx_kv8_4, sq, idx_pscale, weights, H, hd, nloc, 0, score_scr };
+                ds4f_pool_run(pool, ds4f_idxsc8r4_worker, &tk);
+                int *lsel = (int *)alloca((size_t)k * sizeof(int));
+                ds4f_index_topk(score_scr, nloc, nloc, k, idx_s0, lsel);   /* local idx -> GLOBAL cmp slot */
+                int base = ep_rank * k, ncand = ep_size * k;
+                for (int i = 0; i < ncand; i++) { cp_cand_slot[i] = 0.f; cp_cand_score[i] = 0.f; }
+                for (int j = 0; j < k; j++) { int g = lsel[j];
+                    cp_cand_slot[base + j]  = (g >= 0) ? (float)g : -1.f;
+                    cp_cand_score[base + j] = (g >= 0) ? score_scr[g - idx_s0] : 0.f; }
+                ar_cb(cp_cand_slot, ncand, ar_ctx); ar_cb(cp_cand_score, ncand, ar_ctx);
+                ds4f_cp_merge_topk(cp_cand_slot, cp_cand_score, ncand, k, offset, sel);
+                sel_done = 1;
+            } else {
+                /* Option A: scan owned -> GLOBAL score positions, zero rest + ar_cb-SUM full [0,T). */
+                int s0 = idx_cp ? idx_s0 : 0, nloc = hi - s0; if (nloc < 0) nloc = 0;
+                if (idx_cp) { for (int i = 0; i < T; i++) score_scr[i] = 0.f; }
+                ds4f_idxsc8r4_task tk = { q8, idx_kv8_4, sq, idx_pscale, weights, H, hd, nloc, s0, score_scr };
+                ds4f_pool_run(pool, ds4f_idxsc8r4_worker, &tk);
+                if (idx_cp && ar_cb) ar_cb(score_scr, T, ar_ctx);
+            }
         }
         else       { ds4f_idxsc8r_task  tk = { q8, idx_kv8,   sq, idx_pscale, weights, H, hd, T, score_scr };
                      ds4f_pool_run(pool, ds4f_idxsc8r_worker, &tk); }
@@ -1652,9 +1675,33 @@ static int ds4f_index_step(
     }
     ds4f_g_tb2scan += ds4f_now() - _scan_t0;                  /* scan-only sub-timer (folded by tb2_prepare) */
     double _topk_t0 = ds4f_now();
-    ds4f_index_topk(score_scr, T, T, k, offset, sel);        /* decode: no causal mask (thr=T) */
+    if (!sel_done) ds4f_index_topk(score_scr, T, T, k, offset, sel);  /* decode: no causal mask (thr=T) */
     ds4f_g_tb2topk += ds4f_now() - _topk_t0;
     return T;
+}
+
+/* CP idx-shard merge (decode win): combine N nodes' local top-k candidate lists {slot,score} into the
+ * global top-k -- replaces Option-A's full-[0,T) score gather + O(T) topk with an N*k-candidate gather
+ * (~45 KB vs ~12 MB @12M) + O(N*k log) sort. EXACT to the replicated topk (same rule: score desc, ties
+ * -> lowest slot, ascending output) -- proven 200/200 in tools/cpmerge_test.c. Slots carried as float
+ * (exact for slot < 2^24; T<=4M @16M ctx). cslot[i]<0 = padding (shard had <k owned slots). */
+typedef struct { float s; int idx; } ds4f_cpcand;
+static int ds4f_cpcand_cmp(const void *a, const void *b) {       /* score desc, ties -> lower slot */
+    const ds4f_cpcand *x = a, *y = b;
+    if (x->s > y->s) return -1; if (x->s < y->s) return 1;
+    return x->idx - y->idx;
+}
+static int ds4f_cpcand_cmp_idx(const void *a, const void *b) {   /* slot ascending */
+    return ((const ds4f_cpcand *)a)->idx - ((const ds4f_cpcand *)b)->idx;
+}
+static void ds4f_cp_merge_topk(const float *cslot, const float *cscore, int ncand, int k, int offset, int *sel) {
+    ds4f_cpcand *c = (ds4f_cpcand *)alloca((size_t)(ncand > 0 ? ncand : 1) * sizeof(ds4f_cpcand));
+    int nc = 0;
+    for (int i = 0; i < ncand; i++) if (cslot[i] >= 0.f) { c[nc].s = cscore[i]; c[nc].idx = (int)cslot[i]; nc++; }
+    qsort(c, nc, sizeof(ds4f_cpcand), ds4f_cpcand_cmp);          /* top-k by score (ties lower slot) */
+    int npick = k < nc ? k : nc;
+    qsort(c, npick, sizeof(ds4f_cpcand), ds4f_cpcand_cmp_idx);   /* emit ascending by slot (== index_topk) */
+    for (int n = 0; n < k; n++) sel[n] = (n < npick) ? (c[n].idx + offset) : -1;
 }
 
 /* ===================== synthetic allocator ===================== */
@@ -1846,6 +1893,9 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
     m->s_tb2_sel   = (int   *)aligned_alloc(256, (size_t)nsel_cap*4);
     m->s_cmp_gather = (float *)aligned_alloc(256, (size_t)c->index_topk*KV*4);  /* CP: gathered selected cmp latents
         (only ns<=index_topk slots ever written -- must NOT scale with nsel_cap=max(max_pos,topk): 16 GB @ 8M ctx) */
+    { int eps = m->ep_size > 0 ? m->ep_size : 1;               /* CP idx-merge candidate gather buffers */
+      m->s_cp_cand_slot  = (float *)aligned_alloc(256, ((size_t)eps*c->index_topk*4 + 255) & ~255ull);
+      m->s_cp_cand_score = (float *)aligned_alloc(256, ((size_t)eps*c->index_topk*4 + 255) & ~255ull); }
     for (int L = 0; L < c->n_layers; L++) {
         int ratio = c->compress_ratios[L];
         if (ratio == 0) continue;
@@ -3475,7 +3525,8 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
                         ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,
                         ly->idx_kv8, ly->idx_kv8_4, ly->idx_pscale,
                         m->s_idx_q, m->s_idx_score, m->s_tb2_sel, m->pool,
-                        ly->idx_cp_on, ly->idx_cp_s0, ly->idx_cp_s1, m->ar_cb, m->ar_ctx);
+                        ly->idx_cp_on, ly->idx_cp_s0, ly->idx_cp_s1, m->ar_cb, m->ar_ctx,
+                        m->ep_rank, m->ep_size, m->s_cp_cand_slot, m->s_cp_cand_score);
         m->prof[DS4F_P_TB2SCAN]  += ds4f_g_tb2scan  - _sc_snap;
         m->prof[DS4F_P_TB2QPROJ] += ds4f_g_tb2qproj - _qp_snap;
         m->prof[DS4F_P_TB2ROPE]  += ds4f_g_tb2rope  - _rp_snap;
