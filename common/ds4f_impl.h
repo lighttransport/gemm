@@ -146,6 +146,18 @@ static inline int ds4f_tp_embed_shard(int vocab, int ep_rank, int ep_size, int *
     int a0, a1; ds4f_tp_rowshard(vocab, ep_size, ep_rank, 8, &a0, &a1);
     *r0 = a0; *rows = a1 - a0; return 1;
 }
+/* DS4F_CP (Phase 2 context parallelism): shard the compressed-cache slots [0,S) by slot range across
+ * the EP nodes -- node r owns [s0,s1); S = max_pos/ratio (per layer). The per-node compressed caches
+ * (cmp_q4/idx_kv8_4) shrink to the owned slots (ceiling -> node-count x ctx); the indexer scans local
+ * slots -> local top-k, merged cross-node to the global top-k, and the selected latents are gathered
+ * (Stage C). 8-aligned (i4 nibble pairs / svdot blocks). Off => [0,S). Composes with the int4 caches. */
+static inline int ds4f_cp_slot_shard(int S, int ep_rank, int ep_size, int *s0, int *s1) {
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("DS4F_CP"); s = (e && *e && atoi(e)) ? 1 : 0; }
+    if (!s || ep_size <= 1) { *s0 = 0; *s1 = S; return 0; }
+    int a0, a1; ds4f_tp_rowshard(S, ep_size, ep_rank, 8, &a0, &a1);
+    *s0 = a0; *s1 = a1; return 1;
+}
 /* split this node's owned heads [m->attn_h0, m->attn_h1) across the thread pool (worker tid/nthr).
  * When TP_ATTN is off the range is [0, n_heads) so this matches the old per=nh/nthr split. */
 static inline void ds4f_head_split(const ds4f_model *m, int nthr, int tid, int *h0, int *h1) {
