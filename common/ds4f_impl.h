@@ -2889,6 +2889,55 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         #undef DS4F_LN
     }
 
+    /* DS4F_MTP scaffold: load the mtp.0 block (a dense transformer layer: MLA attn + 256-expert MoE,
+     * NO tier-B2 compressor) + the fusion (enorm/hnorm/norm + e_proj/h_proj + own HC-head). Reuses the
+     * main embed+head at forward. Experts EP-sharded; dense kept FULL (no TP) for the scaffold. The
+     * draft/verify spec-decode loop + the M=K verify rework are the follow-on (env-blocked this session). */
+    if (getenv("DS4F_MTP") && atoi(getenv("DS4F_MTP"))) {
+        ds4f_layer *mt = &m->mtp; char mn[256]; ds4f_qtype dq = m->dense_qt;
+        int C2 = cfg.hidden, hc = cfg.hc_mult, mix = (2 + hc) * hc, no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
+        #define MTPN(f) (snprintf(mn, sizeof mn, "mtp.0.%s", f), mn)
+        mt->attn_norm=(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,mt->attn_norm,MTPN("attn_norm.weight"),DS4F_BF16,1,C2);
+        mt->ffn_norm =(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,mt->ffn_norm, MTPN("ffn_norm.weight"), DS4F_BF16,1,C2);
+        mt->q_norm   =(uint16_t*)ds4f_bump(m,(size_t)cfg.q_lora*2,64);  ds4f_load_raw(m,&B,mt->q_norm, MTPN("attn.q_norm.weight"), DS4F_BF16,1,cfg.q_lora);
+        mt->kv_norm  =(uint16_t*)ds4f_bump(m,(size_t)cfg.kv_lora*2,64); ds4f_load_raw(m,&B,mt->kv_norm,MTPN("attn.kv_norm.weight"),DS4F_BF16,1,cfg.kv_lora);
+        mt->attn_sink=(float*)ds4f_bump(m,(size_t)cfg.n_heads*4,64);    ds4f_load_raw(m,&B,mt->attn_sink,MTPN("attn.attn_sink"),DS4F_F32,1,cfg.n_heads);
+        mt->wq_a=ds4f_new_tensor(m,dq,cfg.q_lora,C2);                        ds4f_load_dense(m,&B,&mt->wq_a,MTPN("attn.wq_a"));
+        mt->wq_b=ds4f_new_tensor(m,dq,cfg.n_heads*cfg.q_head_dim,cfg.q_lora); ds4f_load_dense(m,&B,&mt->wq_b,MTPN("attn.wq_b"));
+        mt->wkv =ds4f_new_tensor(m,dq,cfg.kv_lora,C2);                       ds4f_load_dense(m,&B,&mt->wkv,MTPN("attn.wkv"));
+        mt->wo_a=ds4f_new_tensor(m,dq,cfg.o_inter,C2);                       ds4f_load_dense(m,&B,&mt->wo_a,MTPN("attn.wo_a"));
+        mt->wo_b=ds4f_new_tensor(m,dq,C2,cfg.o_inter);                       ds4f_load_dense(m,&B,&mt->wo_b,MTPN("attn.wo_b"));
+        mt->gate=ds4f_new_tensor(m,m->bf16_mv_qt,cfg.n_experts,C2);          ds4f_load_dense(m,&B,&mt->gate,MTPN("ffn.gate"));
+        mt->gate_bias=(float*)aligned_alloc(64,(size_t)cfg.n_experts*4);     ds4f_load_raw(m,&B,mt->gate_bias,MTPN("ffn.gate.bias"),DS4F_F32,1,cfg.n_experts);
+        mt->sh_w1=ds4f_new_tensor(m,dq,cfg.shared_inter,C2);  ds4f_load_dense(m,&B,&mt->sh_w1,MTPN("ffn.shared_experts.w1"));
+        mt->sh_w3=ds4f_new_tensor(m,dq,cfg.shared_inter,C2);  ds4f_load_dense(m,&B,&mt->sh_w3,MTPN("ffn.shared_experts.w3"));
+        mt->sh_w2=ds4f_new_tensor(m,dq,C2,cfg.shared_inter);  ds4f_load_dense(m,&B,&mt->sh_w2,MTPN("ffn.shared_experts.w2"));
+        mt->ex_w1=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w2=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w3=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor));
+        mt->owned_eid=(int*)calloc(no,sizeof(int)); mt->n_owned=no;
+        { int slot=0; for (int e=0;e<cfg.n_experts;e++) if (e%ep_size==ep_rank) {
+            mt->ex_w1[slot]=ds4f_new_tensor(m,DS4F_MXFP4,cfg.moe_inter,C2);
+            mt->ex_w3[slot]=ds4f_new_tensor(m,DS4F_MXFP4,cfg.moe_inter,C2);
+            mt->ex_w2[slot]=ds4f_new_tensor(m,DS4F_MXFP4,C2,cfg.moe_inter);
+            snprintf(mn,sizeof mn,"mtp.0.ffn.experts.%d.w1",e); ds4f_load_q(m,&B,&mt->ex_w1[slot],mn);
+            snprintf(mn,sizeof mn,"mtp.0.ffn.experts.%d.w3",e); ds4f_load_q(m,&B,&mt->ex_w3[slot],mn);
+            snprintf(mn,sizeof mn,"mtp.0.ffn.experts.%d.w2",e); ds4f_load_q(m,&B,&mt->ex_w2[slot],mn);
+            mt->owned_eid[slot]=e; slot++; } }
+        mt->hc_attn_fn=(float*)ds4f_bump(m,(size_t)mix*hc*C2*4,256); mt->hc_attn_base=(float*)ds4f_bump(m,(size_t)mix*4,64); mt->hc_attn_scale=(float*)ds4f_bump(m,(size_t)3*4,64);
+        mt->hc_ffn_fn =(float*)ds4f_bump(m,(size_t)mix*hc*C2*4,256); mt->hc_ffn_base =(float*)ds4f_bump(m,(size_t)mix*4,64); mt->hc_ffn_scale =(float*)ds4f_bump(m,(size_t)3*4,64);
+        ds4f_load_raw(m,&B,mt->hc_attn_fn,MTPN("hc_attn_fn"),DS4F_F32,mix,hc*C2); ds4f_load_raw(m,&B,mt->hc_attn_base,MTPN("hc_attn_base"),DS4F_F32,1,mix); ds4f_load_raw(m,&B,mt->hc_attn_scale,MTPN("hc_attn_scale"),DS4F_F32,1,3);
+        ds4f_load_raw(m,&B,mt->hc_ffn_fn, MTPN("hc_ffn_fn"), DS4F_F32,mix,hc*C2); ds4f_load_raw(m,&B,mt->hc_ffn_base, MTPN("hc_ffn_base"), DS4F_F32,1,mix); ds4f_load_raw(m,&B,mt->hc_ffn_scale, MTPN("hc_ffn_scale"), DS4F_F32,1,3);
+        m->mtp_enorm=(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,m->mtp_enorm,MTPN("enorm.weight"),DS4F_BF16,1,C2);
+        m->mtp_hnorm=(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,m->mtp_hnorm,MTPN("hnorm.weight"),DS4F_BF16,1,C2);
+        m->mtp_norm =(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,m->mtp_norm, MTPN("norm.weight"), DS4F_BF16,1,C2);
+        m->mtp_e_proj=ds4f_new_tensor(m,dq,C2,C2); ds4f_load_dense(m,&B,&m->mtp_e_proj,MTPN("e_proj"));
+        m->mtp_h_proj=ds4f_new_tensor(m,dq,C2,C2); ds4f_load_dense(m,&B,&m->mtp_h_proj,MTPN("h_proj"));
+        { int hd=hc*C2; m->mtp_hc_fn=(float*)ds4f_bump(m,(size_t)hc*hd*4,256); m->mtp_hc_base=(float*)ds4f_bump(m,(size_t)hc*4,64); m->mtp_hc_scale=(float*)ds4f_bump(m,(size_t)4,64);
+          ds4f_load_raw(m,&B,m->mtp_hc_fn,MTPN("hc_head_fn"),DS4F_F32,hc,hd); ds4f_load_raw(m,&B,m->mtp_hc_base,MTPN("hc_head_base"),DS4F_F32,1,hc); ds4f_load_raw(m,&B,m->mtp_hc_scale,MTPN("hc_head_scale"),DS4F_F32,1,1); }
+        m->has_mtp=1;
+        #undef MTPN
+        fprintf(stderr,"ds4f_load_mtp: MTP block loaded (rank %d/%d, %d owned experts) -- forward stub only\n", ep_rank, ep_size, no);
+    }
+
     double loaded_gb = (double)m->bytes_read / 1e9;
     int n_tensors = B.n; uint64_t staged = B.total_bytes;
     m->bytes_read = 0;                 /* runner resets per token; start clean */
@@ -4305,6 +4354,20 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     DS4F_TOC(DS4F_P_HEAD); }
 }
 
+/* DS4F_MTP forward (STUB -- scaffold only). Predicts the token after `next_id` given the main model's
+ * last hidden state x[hidden] at `pos`. Reference (MTPBlock.forward, inference/model.py):
+ *   e  = enorm(embed(next_id));   h = hnorm(x)
+ *   xf = e_proj(e) + h_proj(h)                       // the MTP fusion
+ *   xf = <standard transformer block: attn + MoE>(xf, pos)   // m->mtp (reuses the per-layer body)
+ *   logits = head(norm=mtp_norm, hc=mtp_hc_*)(xf)    // shares the MAIN head weight (m->head)
+ * The block-forward body lives inline in ds4f_forward_token; extracting it (M=1) + the embed lookup +
+ * the draft/verify/accept loop (with KV rollback) is the follow-on -- and the spec VERIFY needs the
+ * M=K batched-decode rework (the per-token attn/tb2/KV/CP-gather path). Returns -1 until wired. */
+static int ds4f_mtp_predict(ds4f_model *m, const float *x, int next_id, int pos, float *logits_out) {
+    (void)x; (void)next_id; (void)pos; (void)logits_out;
+    if (!m->has_mtp) return -1;
+    return -1;   /* not yet wired into decode (scaffold: weights loaded + addressable via m->mtp / m->mtp_*) */
+}
 static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD;
