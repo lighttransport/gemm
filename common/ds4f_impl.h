@@ -1826,6 +1826,7 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
     m->s_idx_q     = (float *)aligned_alloc(256, (size_t)iH*ihd*4);
     m->s_idx_score = (float *)aligned_alloc(256, (size_t)nsel_cap*4);
     m->s_tb2_sel   = (int   *)aligned_alloc(256, (size_t)nsel_cap*4);
+    m->s_cmp_gather = (float *)aligned_alloc(256, (size_t)nsel_cap*KV*4);  /* CP: gathered selected cmp latents */
     for (int L = 0; L < c->n_layers; L++) {
         int ratio = c->compress_ratios[L];
         if (ratio == 0) continue;
@@ -1842,9 +1843,19 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             int CAL = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64;
             if (CAL > nslot) CAL = nslot > 0 ? nslot : 1;
             ly->cmp_kv     = NULL;
-            if (m->int4_cmp)   /* int4: half the bytes (2 nibbles/byte) -- the dominant ctx-cache halved */
-                ly->cmp_q4 = (uint8_t *)aligned_alloc(256, ((size_t)nslot*(KV/2) + 255) & ~255ull);
-            else
+            if (m->int4_cmp) {  /* int4: half the bytes (2 nibbles/byte) -- the dominant ctx-cache halved */
+                int nslot_q = nslot;
+                /* DS4F_CP (default) = the validated gather (cmp replicated). DS4F_CP_SHARD opt-in adds the
+                 * slot-sharding (the memory win) -- WIP: rank-0-correct but crashes at long decode (rc=139
+                 * @ MAX_NEW=48, fine @24); isolated to the shard (NOSHARD/gather-only is rc=0), cmp indices
+                 * provably in-bounds so the suspect is a heap-layout-exposed write -- needs focused debug. */
+                if (m->cp && ratio == 4 && getenv("DS4F_CP_SHARD") && atoi(getenv("DS4F_CP_SHARD"))) {
+                    int tail = nslot - CAL > 0 ? nslot - CAL : 0, t0, t1;
+                    ds4f_cp_slot_shard(tail, m->ep_rank, m->ep_size, &t0, &t1);
+                    ly->cp_on = 1; ly->cp_t0 = CAL + t0; ly->cp_t1 = CAL + t1; nslot_q = CAL + (t1 - t0);
+                }
+                ly->cmp_q4 = (uint8_t *)aligned_alloc(256, ((size_t)nslot_q*(KV/2) + 255) & ~255ull);
+            } else
                 ly->cmp_q  = (int8_t *)aligned_alloc(256, ((size_t)nslot*KV + 255) & ~255ull);
             ly->cmp_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
             ly->cmp_scale  = (float *)aligned_alloc(64, (size_t)KV*4);
@@ -2635,6 +2646,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     { const char *e = getenv("DS4F_INT8_CMP");  m->int8_cmp  = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_INT4_CMP");  m->int4_cmp  = (e && *e && atoi(e)) ? 1 : 0;
       if (m->int4_cmp) m->int8_cmp = 1; }   /* int4 cmp implies the int8_cmp infra (cmp_q4 sub-mode) */
+    { const char *e = getenv("DS4F_CP"); m->cp = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_INT8CMP_CAL"); ds4f_int8cmp_cal = (e && *e) ? atoi(e) : 64;
       if (ds4f_int8cmp_cal < 1) ds4f_int8cmp_cal = 1; }
     if (m->tierb2) m->exact = 1;   /* Tier-B2 reuses the exact q-norm/RoPE/window path */
@@ -3050,6 +3062,14 @@ static inline void ds4f_cmp_quant_row_i4(const float *src, uint8_t *dst, const f
         dst[d>>1] = (uint8_t)(((v1 & 0xF) << 4) | (v0 & 0xF));
     }
 }
+/* dequant one int4 cmp_q4 row -> f32 (for the CP gather: owner dequants its selected slots,
+ * ar_cb-SUM assembles the full selected set on every node so attention reads it as f32). */
+static inline void ds4f_cmp_deq_row_i4(const uint8_t *q4, const float *scale, int KV, float *out) {
+    for (int d = 0; d < KV; d++) {
+        int nb = (d & 1) ? (q4[d>>1] >> 4) : (q4[d>>1] & 0xF);
+        out[d] = (float)(((nb ^ 8) - 8)) * scale[d];
+    }
+}
 static void ds4f_cmp_freeze_i4(ds4f_layer *ly, int KV) {
     for (int d = 0; d < KV; d++) {
         float s = ly->cmp_absmax[d] / 7.f; if (s < 1e-12f) s = 1e-12f;
@@ -3067,8 +3087,13 @@ static void ds4f_cmp_freeze_i4(ds4f_layer *ly, int KV) {
     ly->cmp_frozen = 1;
 }
 static inline void ds4f_cmp_append_i4(ds4f_layer *ly, const float *lat, int slot, int KV, int CAL) {
-    if (ly->cmp_frozen) { ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)slot * (KV/2), ly->cmp_iscale, KV); return; }
-    if (slot >= CAL) { ds4f_cmp_freeze_i4(ly, KV); ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)slot * (KV/2), ly->cmp_iscale, KV); return; }
+    /* CP: map global slot -> local cmp_q4 index. [0,CAL) replicated (all nodes, local==slot, for the
+     * shared per-channel calibration); tail [CAL,nslot) sharded -> owner writes at CAL+(slot-cp_t0),
+     * others skip (loc<0). When cp_on==0 loc==slot (unchanged). The freeze always quantizes [0,CAL). */
+    int loc = slot;
+    if (ly->cp_on && slot >= CAL) loc = (slot >= ly->cp_t0 && slot < ly->cp_t1) ? CAL + (slot - ly->cp_t0) : -1;
+    if (ly->cmp_frozen) { if (loc >= 0) ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)loc * (KV/2), ly->cmp_iscale, KV); return; }
+    if (slot >= CAL) { ds4f_cmp_freeze_i4(ly, KV); if (loc >= 0) ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)loc * (KV/2), ly->cmp_iscale, KV); return; }
     uint16_t *cb = ly->cmp_calbuf + (size_t)slot * KV;
     for (int d = 0; d < KV; d++) {
         float v = lat[d]; cb[d] = ds4f_f32bf(v);
@@ -3308,6 +3333,8 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
      * tokens, so every written pos is wholly in one store -- no straddle. */
     const uint16_t *kvbf = (m->int8_kv && !ly->kv_frozen) ? ly->kv_calbuf : ly->kv_cache;
     int c_i4 = (m->int4_cmp && ly->cmp_frozen);                                       /* int4 cmp (cmp_q4) */
+    int c_cp = m->cp_gather;   /* CP: compressed term reads the gathered f32 latents s_cmp_gather[j*KV] */
+    const float *cg = m->s_cmp_gather;
     int c_i8 = (m->int8_cmp && !m->int4_cmp && ly->cmp_frozen); const float *cmpsc = ly->cmp_scale;  /* int8 cmp */
     /* pre-freeze the compressed latents live in cmp_calbuf (bf16); freeze migrates
      * calbuf->cmp_q between tokens, so every slot is wholly in one store -- no straddle. */
@@ -3327,7 +3354,9 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         }
         for (int j = 0; j < nsel; j++) {                        /* compressed term (cmp_kv) */
             float s;
-            if (c_i4) { const uint8_t *kc = ly->cmp_q4 + (size_t)sel[j]*(KV/2);
+            if (c_cp) { const float *kc = cg + (size_t)j*KV;   /* CP: gathered f32 latent (index j, not sel[j]) */
+                if (sve) s = ds4f_sve_dot_f32(q, kc, KV); else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*kc[d]; } }
+            else if (c_i4) { const uint8_t *kc = ly->cmp_q4 + (size_t)sel[j]*(KV/2);
                 s = sve ? ds4f_sve_dot_i4s(q, kc, cmpsc, KV) : ds4f_scalar_dot_i4s(q, kc, cmpsc, KV); }
             else if (c_i8) { const int8_t *kc = ly->cmp_q + (size_t)sel[j]*KV;
                 s = sve ? ds4f_sve_dot_i8s(q, kc, cmpsc, KV) : ds4f_scalar_dot_i8s(q, kc, cmpsc, KV); }
@@ -3354,7 +3383,9 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
         }
         for (int j = 0; j < nsel; j++) {
             float w = sc[nP + j]*inv;
-            if (c_i4) { const uint8_t *kc = ly->cmp_q4 + (size_t)sel[j]*(KV/2);
+            if (c_cp) { const float *kc = cg + (size_t)j*KV;
+                if (sve) ds4f_sve_axpy_f32(out, kc, w, HD); else for (int d = 0; d < HD; d++) out[d] += w*kc[d]; }
+            else if (c_i4) { const uint8_t *kc = ly->cmp_q4 + (size_t)sel[j]*(KV/2);
                 if (sve) ds4f_sve_axpy_i4s(out, kc, cmpsc, w, HD); else ds4f_scalar_axpy_i4s(out, kc, cmpsc, w, HD); }
             else if (c_i8) { const int8_t *kc = ly->cmp_q + (size_t)sel[j]*KV;
                 if (sve) ds4f_sve_axpy_i8s(out, kc, cmpsc, w, HD); else ds4f_scalar_axpy_i8s(out, kc, cmpsc, w, HD); }
@@ -4247,6 +4278,24 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         if (m->tierb2 && ratio) { DS4F_TIC();
             ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin);  /* fills s_tb2_sel/nsel */
             DS4F_TOC(DS4F_P_TB2PREP); }
+        /* ---- CP gather-selected (CSA only): dequant the selected cmp_q4 latents to f32 and ar_cb-SUM
+         * so every node holds the full selected set even though cmp_q4 is slot-sharded; attention reads
+         * s_cmp_gather instead of cmp_q4[sel]. Step A (cmp still replicated): only rank 0 contributes. */
+        m->cp_gather = 0;
+        if (m->cp && m->tierb2 && ratio == 4 && m->int4_cmp && ly->cmp_frozen && m->ar_cb) {
+            int ns = m->s_tb2_nsel, CAL = ds4f_int8cmp_cal;
+            memset(m->s_cmp_gather, 0, (size_t)ns*KV*4);
+            for (int j = 0; j < ns; j++) {        /* each node dequants the selected slots IT owns; ar_cb-SUM -> all */
+                int g = m->s_tb2_sel[j], loc;
+                if (!ly->cp_on)        loc = (m->ep_rank == 0) ? g : -1;                      /* Step A: full cmp on rank 0 */
+                else if (g < CAL)      loc = (m->ep_rank == 0) ? g : -1;                      /* replicated [0,CAL): rank 0 */
+                else                   loc = (g >= ly->cp_t0 && g < ly->cp_t1) ? CAL + (g - ly->cp_t0) : -1;  /* sharded tail: owner */
+                if (loc >= 0) ds4f_cmp_deq_row_i4(ly->cmp_q4 + (size_t)loc*(KV/2), ly->cmp_scale, KV,
+                                                  m->s_cmp_gather + (size_t)j*KV);
+            }
+            m->ar_cb(m->s_cmp_gather, ns*KV, m->ar_ctx);
+            m->cp_gather = 1;
+        }
         /* ---- attention ---- */
         { DS4F_TIC();
         if (m->attn_h1 - m->attn_h0 < c->n_heads) memset(m->s_attn, 0, (size_t)H * sizeof(float));  /* TP: only owned heads filled -> partial s_attn */

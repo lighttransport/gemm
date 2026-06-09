@@ -251,6 +251,8 @@ typedef struct {
     uint8_t  *cmp_q4;      /* [max_pos/ratio, kv_lora/2] int4 store, 2 signed-nibbles/byte (DS4F_INT4_CMP).
                             * Halves the dominant ctx-cache (2768->1384 B/pos). Same S5 per-channel
                             * cmp_scale, range +/-7. LOSSY (16 levels) -> coherence gate, not bit-exact. */
+    int       cp_on;       /* DS4F_CP: cmp_q4 slot-sharded ([0,CAL) replicated + [cp_t0,cp_t1) tail) */
+    int       cp_t0, cp_t1;/* this node's owned compressed-slot range in the sharded tail [CAL, nslot) */
     float    *cmp_scale;   /* [kv_lora] per-channel dequant scale (absmax/127) */
     float    *cmp_iscale;  /* [kv_lora] 1/scale (quantize) */
     float    *cmp_absmax;  /* [kv_lora] running absmax during calibration */
@@ -430,6 +432,10 @@ typedef struct {
     void  (*ar_argmax_cb)(float *val, int32_t *idx, void *ctx);  /* (val,global-idx) argmax all-reduce
                                                                   * (TP_HEAD batched-prefill head merge) */
     void   *ar_argmax_ctx;
+    int     cp;             /* DS4F_CP: context parallelism — compressed caches sharded by slot,
+                             * selected latents gathered (ar_cb-SUM) so attention reads a full set. */
+    float  *s_cmp_gather;   /* [index_topk * kv_lora] gathered selected cmp latents (f32) under CP */
+    int     cp_gather;      /* set per CSA layer in forward_token: attention reads s_cmp_gather (f32) */
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
