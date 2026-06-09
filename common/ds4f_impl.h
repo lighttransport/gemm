@@ -156,6 +156,12 @@ static inline int ds4f_cp_slot_shard(int S, int ep_rank, int ep_size, int *s0, i
     if (s < 0) { const char *e = getenv("DS4F_CP"); s = (e && *e && atoi(e)) ? 1 : 0; }
     if (!s || ep_size <= 1) { *s0 = 0; *s1 = S; return 0; }
     int a0, a1; ds4f_tp_rowshard(S, ep_size, ep_rank, 8, &a0, &a1);
+    /* ds4f_tp_rowshard clamps only r1 to `rows`, so a high rank whose 8-aligned block START exceeds S
+     * (small tail, S < n*align) comes back with a0 > S >= a1 -- an INVALID a1<a0 range. The dense shards
+     * never hit this (rows >> n*align); the small CP tail does. Clamp to a valid (possibly empty) range,
+     * else nslot_q = CAL+(a1-a0) < CAL and the replicated [0,CAL) freeze write overruns the alloc. */
+    if (a0 > S) a0 = S;
+    if (a1 < a0) a1 = a0;
     *s0 = a0; *s1 = a1; return 1;
 }
 /* split this node's owned heads [m->attn_h0, m->attn_h1) across the thread pool (worker tid/nthr).
@@ -1845,16 +1851,16 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             ly->cmp_kv     = NULL;
             if (m->int4_cmp) {  /* int4: half the bytes (2 nibbles/byte) -- the dominant ctx-cache halved */
                 int nslot_q = nslot;
-                /* DS4F_CP (default) = the validated gather (cmp replicated). DS4F_CP_SHARD opt-in adds the
-                 * slot-sharding (the memory win) -- WIP: rank-0-correct but crashes at long decode (rc=139
-                 * @ MAX_NEW=48, fine @24); isolated to the shard (NOSHARD/gather-only is rc=0), cmp indices
-                 * provably in-bounds so the suspect is a heap-layout-exposed write -- needs focused debug. */
+                /* DS4F_CP (default) = the validated gather (cmp replicated). DS4F_CP_SHARD adds the
+                 * slot-sharding (the memory win): cmp_q4 -> [0,CAL) replicated + [cp_t0,cp_t1) tail.
+                 * BYTE-IDENTICAL to CP-off (calibration replicated => same quant; gather reassembles). */
                 if (m->cp && ratio == 4 && getenv("DS4F_CP_SHARD") && atoi(getenv("DS4F_CP_SHARD"))) {
                     int tail = nslot - CAL > 0 ? nslot - CAL : 0, t0, t1;
                     ds4f_cp_slot_shard(tail, m->ep_rank, m->ep_size, &t0, &t1);
                     ly->cp_on = 1; ly->cp_t0 = CAL + t0; ly->cp_t1 = CAL + t1; nslot_q = CAL + (t1 - t0);
                 }
                 ly->cmp_q4 = (uint8_t *)aligned_alloc(256, ((size_t)nslot_q*(KV/2) + 255) & ~255ull);
+                ly->cp_nslot = nslot_q;   /* cmp_q4 slot capacity (DEBUG bounds guards) */
             } else
                 ly->cmp_q  = (int8_t *)aligned_alloc(256, ((size_t)nslot*KV + 255) & ~255ull);
             ly->cmp_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
@@ -3075,6 +3081,7 @@ static void ds4f_cmp_freeze_i4(ds4f_layer *ly, int KV) {
         float s = ly->cmp_absmax[d] / 7.f; if (s < 1e-12f) s = 1e-12f;
         ly->cmp_scale[d] = s; ly->cmp_iscale[d] = 1.f / s;
     }
+    if (ly->cmp_caln > ly->cp_nslot) { fprintf(stderr, "[CP-DBG freeze OOB] caln=%d cap=%d\n", ly->cmp_caln, ly->cp_nslot); fflush(stderr); abort(); }
     for (int p = 0; p < ly->cmp_caln; p++) {
         const uint16_t *src = ly->cmp_calbuf + (size_t)p * KV;
         uint8_t *dst = ly->cmp_q4 + (size_t)p * (KV/2);
@@ -3092,6 +3099,8 @@ static inline void ds4f_cmp_append_i4(ds4f_layer *ly, const float *lat, int slot
      * others skip (loc<0). When cp_on==0 loc==slot (unchanged). The freeze always quantizes [0,CAL). */
     int loc = slot;
     if (ly->cp_on && slot >= CAL) loc = (slot >= ly->cp_t0 && slot < ly->cp_t1) ? CAL + (slot - ly->cp_t0) : -1;
+    if (loc >= ly->cp_nslot) { fprintf(stderr, "[CP-DBG append OOB] slot=%d loc=%d cap=%d t0=%d t1=%d CAL=%d caln=%d\n",
+        slot, loc, ly->cp_nslot, ly->cp_t0, ly->cp_t1, CAL, ly->cmp_caln); fflush(stderr); abort(); }
     if (ly->cmp_frozen) { if (loc >= 0) ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)loc * (KV/2), ly->cmp_iscale, KV); return; }
     if (slot >= CAL) { ds4f_cmp_freeze_i4(ly, KV); if (loc >= 0) ds4f_cmp_quant_row_i4(lat, ly->cmp_q4 + (size_t)loc * (KV/2), ly->cmp_iscale, KV); return; }
     uint16_t *cb = ly->cmp_calbuf + (size_t)slot * KV;
@@ -4290,6 +4299,8 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
                 if (!ly->cp_on)        loc = (m->ep_rank == 0) ? g : -1;                      /* Step A: full cmp on rank 0 */
                 else if (g < CAL)      loc = (m->ep_rank == 0) ? g : -1;                      /* replicated [0,CAL): rank 0 */
                 else                   loc = (g >= ly->cp_t0 && g < ly->cp_t1) ? CAL + (g - ly->cp_t0) : -1;  /* sharded tail: owner */
+                if (loc >= ly->cp_nslot) { fprintf(stderr, "[CP-DBG gather OOB] j=%d g=%d loc=%d cap=%d t0=%d t1=%d ns=%d cap_g=%d\n",
+                    j, g, loc, ly->cp_nslot, ly->cp_t0, ly->cp_t1, ns, m->cfg.index_topk); fflush(stderr); abort(); }
                 if (loc >= 0) ds4f_cmp_deq_row_i4(ly->cmp_q4 + (size_t)loc*(KV/2), ly->cmp_scale, KV,
                                                   m->s_cmp_gather + (size_t)j*KV);
             }

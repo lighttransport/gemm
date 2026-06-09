@@ -253,6 +253,7 @@ typedef struct {
                             * cmp_scale, range +/-7. LOSSY (16 levels) -> coherence gate, not bit-exact. */
     int       cp_on;       /* DS4F_CP: cmp_q4 slot-sharded ([0,CAL) replicated + [cp_t0,cp_t1) tail) */
     int       cp_t0, cp_t1;/* this node's owned compressed-slot range in the sharded tail [CAL, nslot) */
+    int       cp_nslot;    /* cmp_q4 slot capacity (DEBUG bounds guards) */
     float    *cmp_scale;   /* [kv_lora] per-channel dequant scale (absmax/127) */
     float    *cmp_iscale;  /* [kv_lora] 1/scale (quantize) */
     float    *cmp_absmax;  /* [kv_lora] running absmax during calibration */
