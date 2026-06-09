@@ -440,6 +440,8 @@ typedef struct {
                              * selected latents gathered (ar_cb-SUM) so attention reads a full set. */
     float  *s_cmp_gather;   /* [index_topk * kv_lora] gathered selected cmp latents (f32) under CP */
     int     cp_gather;      /* set per CSA layer in forward_token: attention reads s_cmp_gather (f32) */
+    float  *s_cp_cand_slot; /* [ep_size*index_topk] CP idx-merge: gathered candidate slots (as float) */
+    float  *s_cp_cand_score;/* [ep_size*index_topk] CP idx-merge: gathered candidate scores */
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */

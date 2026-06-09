@@ -229,7 +229,8 @@ static void run_indexer_decode(const char *tag, long base, int npos, int dim, in
                                 cosb, sinb, eps, kvst, scst, idx_kv,
                                 NULL, NULL, NULL,  /* idx_kv8/idx_kv8_4/idx_pscale: f32 path */
                                 q_scr, score_scr, sel, NULL,
-                                0, 0, 0, NULL, NULL);  /* no CP idx-shard in the single-node test */
+                                0, 0, 0, NULL, NULL,
+                                0, 1, NULL, NULL);  /* no CP idx-shard/merge in the single-node test */
         if (T == 0) continue;
         for (int t = 0; t < T; t++) {
             snprintf(nm, sizeof nm, "%s_is_%d_%d", tag, pos, t); emit(nm, (double)score_scr[t]);
