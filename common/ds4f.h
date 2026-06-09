@@ -272,6 +272,9 @@ typedef struct {
     uint8_t  *idx_kv8_4;             /* [max_pos/ratio, index_head_dim/2] int4 (2/byte, +/-7), DS4F_IDX_INT4:
                                       * half of idx_kv8 (672->336 B/pos); scan unpacks->int8 temp then svdot */
     float    *idx_pscale;            /* [max_pos/ratio] per-position scale (absmax/127 int8, /7 int4) */
+    int       idx_cp_on;             /* DS4F_CP_IDX: idx_kv8_4/idx_pscale slot-sharded [idx_cp_s0,idx_cp_s1) */
+    int       idx_cp_s0, idx_cp_s1;  /* this node's owned indexer-slot range (per-slot scale -> no CAL replication) */
+    int       idx_cp_nslot;          /* idx_kv8_4 slot capacity (DEBUG bounds guard) */
 } ds4f_layer;
 
 typedef struct ds4f_pool ds4f_pool;
