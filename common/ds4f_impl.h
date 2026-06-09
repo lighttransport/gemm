@@ -1759,6 +1759,21 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     {   int hc = c->hc_mult, hd = hc*c->hidden;
         total += (size_t)hc*hd*4 + (size_t)hc*4 + 4 + 3*pad;                        /* hc_head fn+base+scale */
     }
+    if (getenv("DS4F_MTP") && atoi(getenv("DS4F_MTP"))) {   /* MTP block: a FULL (no-TP) dense layer + experts + fusion */
+        int no = ds4f_n_owned(c->n_experts, ep_rank, ep_size), hc = c->hc_mult, mix = (2 + hc) * hc;
+        size_t mtp = 0;
+        mtp += ds4f_wbytes(dq,c->q_lora,c->hidden) + ds4f_sbytes(dq,c->q_lora,c->hidden);
+        mtp += ds4f_wbytes(dq,c->n_heads*c->q_head_dim,c->q_lora) + ds4f_sbytes(dq,c->n_heads*c->q_head_dim,c->q_lora);
+        mtp += ds4f_wbytes(dq,c->kv_lora,c->hidden) + ds4f_sbytes(dq,c->kv_lora,c->hidden);
+        mtp += ds4f_wbytes(dq,c->o_inter,c->hidden) + ds4f_sbytes(dq,c->o_inter,c->hidden);
+        mtp += ds4f_wbytes(dq,c->hidden,c->o_inter) + ds4f_sbytes(dq,c->hidden,c->o_inter);
+        mtp += ds4f_wbytes(DS4F_BF16,c->n_experts,c->hidden);                                  /* gate */
+        mtp += (size_t)no * (2*(ds4f_wbytes(DS4F_MXFP4,c->moe_inter,c->hidden)+ds4f_sbytes(DS4F_MXFP4,c->moe_inter,c->hidden))
+                            + ds4f_wbytes(DS4F_MXFP4,c->hidden,c->moe_inter)+ds4f_sbytes(DS4F_MXFP4,c->hidden,c->moe_inter));
+        mtp += 2*(ds4f_wbytes(dq,c->hidden,c->hidden)+ds4f_sbytes(dq,c->hidden,c->hidden));    /* e_proj + h_proj */
+        mtp += (size_t)2*mix*hc*c->hidden*4 + (size_t)hc*hc*c->hidden*4;                       /* hc_attn/ffn/head fn */
+        total += mtp + (size_t)64*1024*1024 + 64*pad;                                          /* norms/base/scale + slack */
+    }
     total += 64u*1024*1024;                                                        /* slack */
     return total;
 }
@@ -2909,9 +2924,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         mt->wo_b=ds4f_new_tensor(m,dq,C2,cfg.o_inter);                       ds4f_load_dense(m,&B,&mt->wo_b,MTPN("attn.wo_b"));
         mt->gate=ds4f_new_tensor(m,m->bf16_mv_qt,cfg.n_experts,C2);          ds4f_load_dense(m,&B,&mt->gate,MTPN("ffn.gate"));
         mt->gate_bias=(float*)aligned_alloc(64,(size_t)cfg.n_experts*4);     ds4f_load_raw(m,&B,mt->gate_bias,MTPN("ffn.gate.bias"),DS4F_F32,1,cfg.n_experts);
-        mt->sh_w1=ds4f_new_tensor(m,dq,cfg.shared_inter,C2);  ds4f_load_dense(m,&B,&mt->sh_w1,MTPN("ffn.shared_experts.w1"));
-        mt->sh_w3=ds4f_new_tensor(m,dq,cfg.shared_inter,C2);  ds4f_load_dense(m,&B,&mt->sh_w3,MTPN("ffn.shared_experts.w3"));
-        mt->sh_w2=ds4f_new_tensor(m,dq,C2,cfg.shared_inter);  ds4f_load_dense(m,&B,&mt->sh_w2,MTPN("ffn.shared_experts.w2"));
+        /* the MTP ffn has NO shared expert (no mtp.0.ffn.shared_experts.* in the checkpoint) -> sh_w* stay
+         * NULL; the block-forward must skip the shared contribution for the MTP layer when wired. */
         mt->ex_w1=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w2=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w3=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor));
         mt->owned_eid=(int*)calloc(no,sizeof(int)); mt->n_owned=no;
         { int slot=0; for (int e=0;e<cfg.n_experts;e++) if (e%ep_size==ep_rank) {
