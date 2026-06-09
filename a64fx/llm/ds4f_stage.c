@@ -89,7 +89,12 @@ static long expert_id(const char *name) {
 enum { CLS_SKIP, CLS_DENSE, CLS_EXPERT };
 
 static int classify(const char *name, int rank, int ep_size) {
-    if (strncmp(name, "mtp.", 4) == 0) return CLS_SKIP;     /* MTP layer */
+    if (strncmp(name, "mtp.", 4) == 0) {                    /* MTP layer: skip unless DS4F_STAGE_MTP */
+        static int smtp = -1;
+        if (smtp < 0) { const char *e = getenv("DS4F_STAGE_MTP"); smtp = (e && atoi(e)) ? 1 : 0; }
+        if (!smtp) return CLS_SKIP;
+        /* else fall through: mtp.0.ffn.experts.N EP-sharded, rest dense (like a main layer) */
+    }
     long e = expert_id(name);
     if (e >= 0) return (e % ep_size == rank) ? CLS_EXPERT : CLS_SKIP;
     return CLS_DENSE;                                       /* replicated */

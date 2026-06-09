@@ -283,6 +283,15 @@ typedef struct {
     ds4f_config cfg;
     int ep_rank, ep_size;
     ds4f_layer *layers;
+    /* DS4F_MTP: the multi-token-prediction module (config num_nextn_predict_layers=1, tensors mtp.0.*).
+     * A full transformer Block (reuses ds4f_layer: attn + MoE) + the MTP fusion:
+     *   x' = e_proj(enorm(embed(next_id))) + h_proj(hnorm(x));  block(x'); head -> logits.
+     * Scaffolded (load + forward stub); the draft/verify spec-decode loop is the follow-on. */
+    int       has_mtp;                         /* DS4F_MTP loaded */
+    ds4f_layer mtp;                            /* the MTP block (attn + MoE), like a main layer */
+    uint16_t *mtp_enorm, *mtp_hnorm, *mtp_norm;/* BF16 [hidden] RMSNorm weights (embed/hidden/final) */
+    ds4f_tensor mtp_e_proj, mtp_h_proj;        /* [hidden,hidden] dense fusion projections */
+    float    *mtp_hc_fn, *mtp_hc_base, *mtp_hc_scale;  /* MTP head's HC params */
     uint16_t *embed;        /* BF16 [vocab, hidden] (unused in synth decode) */
     ds4f_tensor head;       /* BF16 [vocab, hidden] (TP: only this node's vocab-shard rows) */
     int head_r0;            /* DS4F_TP_HEAD: global vocab offset of this node's head shard
