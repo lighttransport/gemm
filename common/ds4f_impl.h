@@ -1649,7 +1649,10 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     per_layer += ds4f_wbytes(dq, c->kv_lora, c->hidden) + ds4f_sbytes(dq, c->kv_lora, c->hidden) + 2*pad;
     {   int oir0, oirows; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &oir0, &oirows);  /* wo_a (TP o_inter shard) */
         per_layer += ds4f_wbytes(dq, oirows, c->hidden) + ds4f_sbytes(dq, oirows, c->hidden) + 2*pad; }
-    per_layer += ds4f_wbytes(dq, c->hidden, c->o_inter) + ds4f_sbytes(dq, c->hidden, c->o_inter) + 2*pad;
+    {   int oir0, oir; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &oir0, &oir);
+        int wob_c = c->o_inter;                               /* wo_b (DS4F_TP_WOB: FP8 o_inter col-shard) */
+        if (oir < c->o_inter && !dense_bf16 && getenv("DS4F_TP_WOB") && atoi(getenv("DS4F_TP_WOB"))) wob_c = oir;
+        per_layer += ds4f_wbytes(dq, c->hidden, wob_c) + ds4f_sbytes(dq, c->hidden, wob_c) + 2*pad; }
     per_layer += (size_t)c->n_heads*4 + pad;
     /* MoE */
     per_layer += ds4f_wbytes(DS4F_BF16, c->n_experts, c->hidden) + pad;            /* router */
@@ -1982,7 +1985,9 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wq_b = ds4f_new_tensor(m, dq, cfg.n_heads*cfg.q_head_dim, cfg.q_lora);
         ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
         ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows, C);       /* TP: o_inter row-shard */
-        ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
+        {   const char *e = getenv("DS4F_TP_WOB");              /* wo_b: FP8 o_inter col-shard (pairs w/ TP_OPROJ) */
+            int wob_s = (m->oi_rows < cfg.o_inter) && dq == DS4F_FP8 && e && atoi(e);
+            ly->wo_b = ds4f_new_tensor(m, dq, C, wob_s ? m->oi_rows : cfg.o_inter); }
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads*4, 64);
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv when enabled */
         ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
@@ -2470,6 +2475,35 @@ static void ds4f_promote_worker(void *arg, int tid, int nthr) {
         }
     }
 }
+/* TP column-shard (FP8 only): copy columns [c0, c0+dst->cols) of the full [rows, Kfull] FP8 dense
+ * into dst -- strided per row (cols not contiguous) + the 128-blocked E8M0 scale columns. c0 and
+ * dst->cols 128-aligned. Used for wo_b under TP_OPROJ: bit-exact (s_o1 is already zero outside the
+ * owned o_inter slice, so the dropped columns multiplied zeros). */
+typedef struct { uint8_t *dw, *dscale; const uint8_t *sw, *ss; int rows, cols, Kfull, c0; } ds4f_cshard_task;
+static void ds4f_cshard_worker(void *arg, int tid, int nthr) {
+    ds4f_cshard_task *T = (ds4f_cshard_task *)arg;
+    int rows = T->rows, cols = T->cols, Kfull = T->Kfull, c0 = T->c0;
+    int r0, r1; ds4f_rowsplit8(rows, nthr, tid, &r0, &r1);
+    for (int i = r0; i < r1; i++)                                  /* FP8 weight: cols [c0,c0+cols) of row i */
+        memcpy(T->dw + (size_t)i*cols, T->sw + (size_t)i*Kfull + c0, (size_t)cols);
+    if (tid == 0) {                                                /* E8M0 scale (tiny): block-cols [c0/128,..) */
+        int srows = (rows+127)/128, sbcf = (Kfull+127)/128, sbc = (cols+127)/128, c0b = c0/128;
+        for (int si = 0; si < srows; si++) memcpy(T->dscale + (size_t)si*sbc, T->ss + (size_t)si*sbcf + c0b, (size_t)sbc);
+    }
+}
+static void ds4f_load_dense_cshard(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst,
+                                   const char *base, int c0, int Kfull) {
+    char wn[256]; snprintf(wn, sizeof wn, "%s.weight", base);
+    const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
+    if (!we) { fprintf(stderr, "cshard: MISSING '%s'\n", wn); abort(); }
+    if (strcmp(we->dtype, "F8_E4M3") != 0 || dst->type != DS4F_FP8) { fprintf(stderr, "cshard: FP8 src+dst only\n"); abort(); }
+    int rows = dst->rows, cols = dst->cols, sbcf = (Kfull+127)/128;
+    char sn[256]; snprintf(sn, sizeof sn, "%s.scale", base);
+    const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", (size_t)((rows+127)/128)*sbcf);
+    ds4f_cshard_task T = { (uint8_t *)dst->w, (uint8_t *)dst->scale, B->blob + we->off, B->blob + se->off, rows, cols, Kfull, c0 };
+    ds4f_pool_run(m->pool, ds4f_cshard_worker, &T);
+    m->bytes_read += (size_t)rows*cols;
+}
 static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst, const char *base) {
     char wn[256];
     snprintf(wn, sizeof wn, "%s.weight", base);
@@ -2635,7 +2669,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wq_b = ds4f_new_tensor(m, dq, (m->attn_h1 - m->attn_h0) * cfg.q_head_dim, cfg.q_lora);  /* TP: owned heads */
         ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
         ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows, C);       /* TP: o_inter row-shard */
-        ly->wo_b = ds4f_new_tensor(m, dq, C, cfg.o_inter);
+        {   const char *e = getenv("DS4F_TP_WOB");              /* wo_b: FP8 o_inter col-shard (pairs w/ TP_OPROJ) */
+            int wob_s = (m->oi_rows < cfg.o_inter) && dq == DS4F_FP8 && e && atoi(e);
+            ly->wo_b = ds4f_new_tensor(m, dq, C, wob_s ? m->oi_rows : cfg.o_inter); }
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads * 4, 64);
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv */
         /* router selection bias (F32[n_experts]); only non-hash layers have it.
@@ -2701,7 +2737,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         if (m->oi_rows < cfg.o_inter)                           /* TP: load only this node's o_inter rows */
             ds4f_load_dense_vshard(m, &B, &ly->wo_a, DS4F_LN("attn.wo_a"), m->oi0, cfg.o_inter);
         else ds4f_load_dense(m, &B, &ly->wo_a,   DS4F_LN("attn.wo_a"));
-        ds4f_load_dense(m, &B, &ly->wo_b,   DS4F_LN("attn.wo_b"));
+        if (ly->wo_b.cols < cfg.o_inter)                       /* wo_b col-shard: load only o_inter cols [oi0,..) */
+            ds4f_load_dense_cshard(m, &B, &ly->wo_b, DS4F_LN("attn.wo_b"), m->oi0, cfg.o_inter);
+        else ds4f_load_dense(m, &B, &ly->wo_b, DS4F_LN("attn.wo_b"));
         ds4f_load_raw(m, &B, ly->attn_sink, DS4F_LN("attn.attn_sink"),       DS4F_F32, 1, cfg.n_heads);
         ds4f_load_dense(m, &B, &ly->gate,   DS4F_LN("ffn.gate"));
         if (ly->gate_bias)   /* noaux_tc selection bias (F32[n_experts]); non-hash layers only */
@@ -4235,13 +4273,13 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
                 ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
                 ds4f_matvec(m, m->s_o1 + (size_t)g * c->o_lora, &vg, m->s_attn + (size_t)g * gin);
             }
-            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden], partial under TP */
+            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1 + (ly->wo_b.cols < c->o_inter ? m->oi0 : 0));  /* col-shard: owned o_inter slice. [hidden], partial under TP */
         } else {
             for (int i = 0; i < C; i++) m->s_oin[i] = 0.f;
             for (int g = 0; g < og; g++) for (int i = 0; i < C; i++) m->s_oin[i] += m->s_attn[g*C + i];
             ds4f_matvec(m, m->s_o1, &ly->wo_a, m->s_oin);       /* [o_inter] */
             for (int i = 0; i < c->o_inter; i++) m->s_o1[i] = ds4f_silu(m->s_o1[i]);  /* stand-in nonlin */
-            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1);         /* [hidden] */
+            ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1 + (ly->wo_b.cols < c->o_inter ? m->oi0 : 0));  /* col-shard: owned o_inter slice. [hidden] */
         }
         if (((m->attn_h1 - m->attn_h0 < c->n_heads) || (m->oi_rows < c->o_inter)) && m->ar_cb)  /* TP attn/oproj: sum partial s_o -> full hidden */
             m->ar_cb(m->s_o, C, m->ar_ctx);
