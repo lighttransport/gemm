@@ -19,9 +19,13 @@ prefill, commits 0abc74a…611432c). All defaults; **no hipBLASLt dependency**
 
 | test   | HIP @start | HIP now | llama.cpp | now vs llama |
 | ------ | ---------: | ------: | --------: | -----------: |
-| pp512  |  31.2 t/s | **774 t/s**  | 902 t/s | 0.86× |
-| pp1024 |  30.9 t/s | **1001 t/s** | 883 t/s | **1.13× FASTER** |
-| tg128  |  28.7 t/s | **75.7 t/s** |  83 t/s | 0.91× |
+| pp512  |  31.2 t/s | **921 t/s**  | 902 t/s | **1.02× FASTER** |
+| pp1024 |  30.9 t/s | **1290 t/s** | 883 t/s | **1.46× FASTER** |
+| tg128  |  28.7 t/s | **77.6 t/s** |  83 t/s | 0.94× |
+
+Final round: vectorized 16B GEMM tile loads (pp1024 1001→1285), fused SSM 4-matvec +
+attn q/k/v + residual+rmsnorm decode launches (decode 75.7→77.6). Negative: fused
+single-block router (serial dots).
 
 Phase log: decode 45→73 (fused all-expert decode MoE, 2 launches/layer) →74.8
 (fused SSM aux chain). Prefill 401→445 (own WMMA GEMM beats Tensile @256)
