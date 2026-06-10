@@ -67,6 +67,13 @@ Success criteria are mechanical (truncated model ⇒ garbage text): rc=0,
 authoritative under TP_HEAD — per-rank distinct=2 is the NORMAL local-argmax,
 not a divergence).
 
+**VALIDATED 2026-06-10 (12-node interactive):** stage LAYERS=10 → 11/11 in 791 s,
+20.07 GB/rank (2464 tensors). Real-weight run (EXACT+TierB2+mHC+TP-all, FP8 dense):
+load=11/11, NaNs=0, argmax=89596 identical on all 11 ranks, RSS 13.42 GB,
+22 tok/s decode @10 layers (comm 29% — 11-rank latency, shrinks per-layer at 64n).
+Tier-B2 banner "4 CSA + 6 HCA layers" matches the DS4P ratios for layers 0–9
+(incl. the new ratio-128 layer 0/1). Synth TP-all and ds4f regressions also green.
+
 **48/64-node batch (pjsub; /local is wiped per job ⇒ stage+run in ONE job):**
 
 ```sh
