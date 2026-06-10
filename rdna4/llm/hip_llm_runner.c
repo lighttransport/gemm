@@ -3327,6 +3327,85 @@ static const char *hip_kernel_source =
 "    int lane = threadIdx.x % 32; int row = blockIdx.x * 8 + threadIdx.x / 32;\n"
 "    if (row < n_rows) { const unsigned char *mat = base + (long long)eidx[slot] * stride; IQ2S_FU_BODY(sgrid) }\n"
 "}\n"
+"/* ======================================================================== */\n"
+"/* Fused quantized MoE GEMM (mmq-style): Y[cnt,N] = X[cnt,K] x W[N,K]^T with W   */\n"
+"/* kept QUANTIZED. One warp owns weight-row n; it dequants each weight group ONCE */\n"
+"/* (grid lookup) and reuses it across all cnt tokens — amortizing the dequant +   */\n"
+"/* weight read over the token tile. cnt <= 32 per launch (host chunks). X is f32. */\n"
+"/* ======================================================================== */\n"
+"__global__ void mmq_iq2s_f32(float *Y, const unsigned char *W, const float *X,\n"
+"                              int cnt, int N, int K) {\n"
+"    int warp = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int n = blockIdx.x * 8 + warp; if (n >= N) return;\n"
+"    int nb = K / 256;\n"
+"    const unsigned char *wrow = W + (size_t)n * nb * 82;\n"
+"    float acc[32];\n"
+"    for (int t = 0; t < cnt; t++) acc[t] = 0.0f;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
+"        const unsigned char *bp = wrow + b * 82;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned char scale = bp[74 + ib32];\n"
+"        float db = (l < 2) ? d * (0.5f + (float)(scale & 0xf)) * 0.25f\n"
+"                           : d * (0.5f + (float)(scale >>  4)) * 0.25f;\n"
+"        unsigned char qsl = bp[2 + ib32 * 4 + l];\n"
+"        unsigned char qh  = bp[66 + ib32];\n"
+"        int gi = qsl | ((qh << (8 - 2 * l)) & 0x300);\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[gi];\n"
+"        unsigned char s = bp[34 + ib32 * 4 + l];\n"
+"        float w8[8];\n"
+"        for (int j = 0; j < 8; j++) w8[j] = db * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"        int xbase = b * 256 + ib32 * 32 + l * 8;\n"
+"        for (int t = 0; t < cnt; t++) {\n"
+"            const float *xt = X + (size_t)t * K + xbase;\n"
+"            acc[t] += w8[0]*xt[0]+w8[1]*xt[1]+w8[2]*xt[2]+w8[3]*xt[3]\n"
+"                    + w8[4]*xt[4]+w8[5]*xt[5]+w8[6]*xt[6]+w8[7]*xt[7];\n"
+"        }\n"
+"    }\n"
+"    for (int t = 0; t < cnt; t++) {\n"
+"        float v = acc[t];\n"
+"        for (int o = 16; o > 0; o >>= 1) v += __shfl_down(v, o);\n"
+"        if (lane == 0) Y[(size_t)t * N + n] = v;\n"
+"    }\n"
+"}\n"
+"__global__ void mmq_iq3s_f32(float *Y, const unsigned char *W, const float *X,\n"
+"                              int cnt, int N, int K) {\n"
+"    int warp = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int n = blockIdx.x * 8 + warp; if (n >= N) return;\n"
+"    int nb = K / 256;\n"
+"    const unsigned char *wrow = W + (size_t)n * nb * 110;\n"
+"    float acc[32];\n"
+"    for (int t = 0; t < cnt; t++) acc[t] = 0.0f;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int g32 = g & 31; int sb = g32 >> 2; int l = g32 & 3;\n"
+"        const unsigned char *bp = wrow + b * 110;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned char sc = bp[106 + (sb >> 1)];\n"
+"        float db = d * (float)(1 + 2 * ((sb & 1) ? (sc >> 4) : (sc & 0xf)));\n"
+"        unsigned char qh = bp[66 + sb];\n"
+"        unsigned char qs0 = bp[2 + sb * 8 + 2 * l + 0];\n"
+"        unsigned char qs1 = bp[2 + sb * 8 + 2 * l + 1];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3s_grid_dev[qs0 | ((qh << (8 - 2 * l)) & 256)];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3s_grid_dev[qs1 | ((qh << (7 - 2 * l)) & 256)];\n"
+"        unsigned char s = bp[74 + sb * 4 + l];\n"
+"        float w8[8];\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            w8[j]   = db * (float)g1[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"            w8[j+4] = db * (float)g2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"        }\n"
+"        int xbase = b * 256 + sb * 32 + l * 8;\n"
+"        for (int t = 0; t < cnt; t++) {\n"
+"            const float *xt = X + (size_t)t * K + xbase;\n"
+"            acc[t] += w8[0]*xt[0]+w8[1]*xt[1]+w8[2]*xt[2]+w8[3]*xt[3]\n"
+"                    + w8[4]*xt[4]+w8[5]*xt[5]+w8[6]*xt[6]+w8[7]*xt[7];\n"
+"        }\n"
+"    }\n"
+"    for (int t = 0; t < cnt; t++) {\n"
+"        float v = acc[t];\n"
+"        for (int o = 16; o > 0; o >>= 1) v += __shfl_down(v, o);\n"
+"        if (lane == 0) Y[(size_t)t * N + n] = v;\n"
+"    }\n"
+"}\n"
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -4715,6 +4794,8 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_gather_rows;
     hipFunction_t fn_moe_scatter_accum;
     hipFunction_t fn_moe_row_scale_add;
+    hipFunction_t fn_mmq_iq2s_f32;   /* fused quantized MoE GEMM (gate/up) */
+    hipFunction_t fn_mmq_iq3s_f32;   /* fused quantized MoE GEMM (down) */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
@@ -5047,6 +5128,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_gather_rows);
     GET_FUNC(moe_scatter_accum);
     GET_FUNC(moe_row_scale_add);
+    GET_FUNC(mmq_iq2s_f32);
+    GET_FUNC(mmq_iq3s_f32);
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
@@ -6010,17 +6093,13 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          * the per-row loop has no host round-trips. Gate: LLM_MOE_PREFILL (default 1). */
         int eligible = !disabled;
         if (r->is_moe) {
-            /* Batched token-grouped MoE prefill (LLM_MOE_PREFILL=1, default OFF):
-             * SSM/attn projections batch via hipBLASLt and experts are grouped by
-             * token (gather → per-expert dequant+GEMM → scatter). CORRECT but NOT
-             * faster than per-token for this model: 256 experts / 8-used gives only
-             * ~16-32 tokens/expert even at max batch, and the bf16 dequant of each
-             * expert weight materializes the full weight regardless of token count,
-             * so traffic ≈ per-token plus 256 tiny-GEMM + dequant launches/layer.
-             * Default OFF (per-token prefill is ~48 tok/s, faster). A real win needs
-             * a fused QUANTIZED MoE GEMM (mmq-style, no bf16 materialization). */
+            /* Batched MoE prefill (LLM_MOE_PREFILL, default ON): SSM/attn projections
+             * batch via hipBLASLt; experts are grouped by token and run through the
+             * fused QUANTIZED MoE GEMM (mmq_iq2s/iq3s — weight stays quantized, dequant
+             * amortized over the token tile). Batch chunked to <=256 (Tensile plan
+             * limit). Prefill ~400 tok/s vs ~48 per-token (8x). Set =0 to disable. */
             const char *env_mp = getenv("LLM_MOE_PREFILL");
-            int moe_prefill = (env_mp ? atoi(env_mp) != 0 : 0);
+            int moe_prefill = (env_mp ? atoi(env_mp) != 0 : 1);
             r->moe_prefill_batched = moe_prefill;
             if (!moe_prefill || !r->moe_dev_dispatch_ok || !r->is_hybrid) eligible = 0;
         }
@@ -6645,40 +6724,50 @@ static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
 
 /* True if `type` has a per-call dequant kernel suitable for the batched path. */
 static inline int batch_qtype_ok(int type) {
-    return type == GGML_TYPE_F16     ||
+    return type == GGML_TYPE_F32     || type == GGML_TYPE_F16 ||
            type == GGML_TYPE_Q4_K    || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ2_XS  ||
            type == GGML_TYPE_IQ2_S   || type == GGML_TYPE_IQ3_S;
 }
 
-/* True if every projection weight of an attn+FFN layer has a batched path. */
+/* True if every projection weight of an attn+FFN layer has a batched path.
+ * For MoE layers the dense ffn_* weights are unused (the MoE FFN is batched
+ * separately by forward_moe_ffn_batched), so skip those checks. */
 static inline int layer_is_batched_eligible(const hip_layer *cl) {
+    int ffn_ok = cl->is_moe ? 1 :
+        (batch_qtype_ok(cl->ffn_gate_type) && batch_qtype_ok(cl->ffn_up_type) &&
+         batch_qtype_ok(cl->ffn_down_type));
     return batch_qtype_ok(cl->attn_q_type)      &&
            batch_qtype_ok(cl->attn_k_type)      &&
            batch_qtype_ok(cl->attn_v_type)      &&
-           batch_qtype_ok(cl->attn_output_type) &&
-           batch_qtype_ok(cl->ffn_gate_type)    &&
-           batch_qtype_ok(cl->ffn_up_type)      &&
-           batch_qtype_ok(cl->ffn_down_type);
+           batch_qtype_ok(cl->attn_output_type) && ffn_ok;
 }
 
-/* True if every SSM projection weight has a batched path. */
+/* True if every SSM projection weight has a batched path. MoE layers skip the
+ * dense ffn_* checks (MoE FFN batched separately). */
 static inline int ssm_layer_is_batched_eligible(const hip_layer *cl) {
+    int ffn_ok = cl->is_moe ? 1 :
+        (batch_qtype_ok(cl->ffn_gate_type) && batch_qtype_ok(cl->ffn_up_type) &&
+         batch_qtype_ok(cl->ffn_down_type));
     return batch_qtype_ok(cl->ssm_qkv_type)   &&
            batch_qtype_ok(cl->ssm_gate_type)  &&
            batch_qtype_ok(cl->ssm_alpha_type) &&
            batch_qtype_ok(cl->ssm_beta_type)  &&
-           batch_qtype_ok(cl->ssm_out_type)   &&
-           batch_qtype_ok(cl->ffn_gate_type)  &&
-           batch_qtype_ok(cl->ffn_up_type)    &&
-           batch_qtype_ok(cl->ffn_down_type);
+           batch_qtype_ok(cl->ssm_out_type)   && ffn_ok;
 }
 
 static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w,
                                       int type, int n_rows, int n_cols) {
     if (bf16_w) return bf16_w;
     switch (type) {
+        case GGML_TYPE_F32: {
+            /* F32 SSM weights (gate/alpha/beta/out on qwen35moe): truncate to bf16
+             * into the shared staging buffer on the fly. */
+            size_t n = (size_t)n_rows * n_cols;
+            launch_pack_bf16_from_f32(r, r->d_wbuf_bf16, raw_w, (int)n);
+            return r->d_wbuf_bf16;
+        }
         case GGML_TYPE_F16: {
             /* SSM weights are typically F16 and aren't pre-converted at load
              * (only attn+FFN F16 weights get cl->*_w_bf16). Convert into the
@@ -6987,6 +7076,19 @@ static inline void launch_moe_row_scale_add(hip_llm_runner *r, void *dst, void *
     long total = (long)M * n_embd;
     LAUNCH(r->fn_moe_row_scale_add, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, args);
 }
+/* Fused quantized MoE GEMM: Y[cnt,N] = X[cnt,K] x W[N,K]^T (W quantized in place).
+ * Tiles cnt into chunks of <=32 (the in-kernel acc[] cap). type = IQ2_S or IQ3_S. */
+static inline void launch_mmq(hip_llm_runner *r, void *Y, void *W, void *X,
+                               int cnt, int N, int K, int type) {
+    hipFunction_t fn = (type == GGML_TYPE_IQ3_S) ? r->fn_mmq_iq3s_f32 : r->fn_mmq_iq2s_f32;
+    for (int t0 = 0; t0 < cnt; t0 += 32) {
+        int cc = cnt - t0; if (cc > 32) cc = 32;
+        void *Yc = (float *)Y + (size_t)t0 * N;
+        void *Xc = (float *)X + (size_t)t0 * K;
+        void *args[] = { &Yc, &W, &Xc, &cc, &N, &K };
+        LAUNCH(fn, (unsigned)((N + 7) / 8), 1, 1, 256, 1, 1, 0, r->stream, args);
+    }
+}
 /* Expert-indexed DP4A matvec for IQ2_S/IQ3_S; activation pre-quantized to (qs,scale). */
 static inline void launch_matvec_expert_dp4a(hip_llm_runner *r, void *dst, void *base,
                                               void *qs, void *scale, int n_rows, int n_cols,
@@ -7263,33 +7365,34 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     hipMemcpyAsync(r->d_moe_gather_w, r->h_moe_gather_w, (size_t)total * sizeof(float),
                    hipMemcpyHostToDevice, r->stream);
 
-    /* 3. Gather activations grouped by expert, pack bf16. */
+    /* 3. Gather activations grouped by expert (f32, fed straight to mmq). */
     launch_moe_gather(r, r->d_moe_gather_in, r->d_xnorm_batch, r->d_moe_gather_src, total, n_embd);
-    launch_pack_bf16_from_f32(r, r->d_moe_gather_in_bf16, r->d_moe_gather_in, total * n_embd);
     hipMemsetAsync(r->d_moe_out_batch, 0, (size_t)M * n_embd * sizeof(float), r->stream);
 
-    /* 4. Per-expert GEMMs (dequant weight -> shared bf16 staging, then GEMM). */
+    /* 4. Per-expert fused QUANTIZED GEMMs (mmq): weight stays quantized, dequant
+     * amortized over the expert's token tile. Gate/up are IQ2_S, down is IQ3_S
+     * (mmq) or IQ4_XS (bf16 dequant+hipBLASLt fallback, 3 layers). */
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
         if (cnt == 0) continue;
         size_t off = (size_t)offs[e];
-        void *xin = (char *)r->d_moe_gather_in_bf16 + off * n_embd * 2;
-        void *gw = get_bf16_weight(r, (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu, NULL,
-                                   cl->moe_gate_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu);
-        if (!gw) return -1;
-        if (mm_blaslt_run_bf16((float *)r->d_moe_eg + off * eff, gw, xin, cnt, eff, n_embd, r->stream) != 0) return -1;
-        void *uw = get_bf16_weight(r, (char *)cl->moe_up_exps_w + (size_t)e * cl->moe_exp_stride_gu, NULL,
-                                   cl->moe_up_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu);
-        if (!uw) return -1;
-        if (mm_blaslt_run_bf16((float *)r->d_moe_eu + off * eff, uw, xin, cnt, eff, n_embd, r->stream) != 0) return -1;
+        float *xin = (float *)r->d_moe_gather_in + off * n_embd;
+        void *gate_w = (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
+        void *up_w   = (char *)cl->moe_up_exps_w   + (size_t)e * cl->moe_exp_stride_gu;
+        void *down_w = (char *)cl->moe_down_exps_w  + (size_t)e * cl->moe_exp_stride_d;
+        launch_mmq(r, (float *)r->d_moe_eg + off * eff, gate_w, xin, cnt, eff, n_embd, cl->moe_gate_exps_type);
+        launch_mmq(r, (float *)r->d_moe_eu + off * eff, up_w,   xin, cnt, eff, n_embd, cl->moe_up_exps_type);
         launch_silu_mul(r, (float *)r->d_moe_eg + off * eff, (float *)r->d_moe_eu + off * eff, cnt * eff);
-        launch_pack_bf16_from_f32(r, (char *)r->d_moe_esilu_bf16 + off * eff * 2,
-                                  (float *)r->d_moe_eg + off * eff, cnt * eff);
-        void *dw = get_bf16_weight(r, (char *)cl->moe_down_exps_w + (size_t)e * cl->moe_exp_stride_d, NULL,
-                                   cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d);
-        if (!dw) return -1;
-        if (mm_blaslt_run_bf16((float *)r->d_moe_eout + off * n_embd, dw,
-                               (char *)r->d_moe_esilu_bf16 + off * eff * 2, cnt, n_embd, eff, r->stream) != 0) return -1;
+        float *silu = (float *)r->d_moe_eg + off * eff;
+        if (cl->moe_down_exps_type == GGML_TYPE_IQ2_S || cl->moe_down_exps_type == GGML_TYPE_IQ3_S) {
+            launch_mmq(r, (float *)r->d_moe_eout + off * n_embd, down_w, silu, cnt, n_embd, eff, cl->moe_down_exps_type);
+        } else {
+            launch_pack_bf16_from_f32(r, (char *)r->d_moe_esilu_bf16 + off * eff * 2, silu, cnt * eff);
+            void *dw = get_bf16_weight(r, down_w, NULL, cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d);
+            if (!dw) return -1;
+            if (mm_blaslt_run_bf16((float *)r->d_moe_eout + off * n_embd, dw,
+                                   (char *)r->d_moe_esilu_bf16 + off * eff * 2, cnt, n_embd, eff, r->stream) != 0) return -1;
+        }
     }
 
     /* 5. Scatter + weighted accumulate into d_moe_out_batch. */
@@ -8152,8 +8255,16 @@ float *hip_llm_forward_batch_logits(hip_llm_runner *r,
 
 #ifdef LLM_HIPBLASLT_ENABLED
     if (batched_path_eligible(r, n_tokens)) {
-        if (embed_tokens_batch(r, tokens, n_tokens) != 0) return NULL;
-        if (forward_block_batched_dense(r, n_tokens, position_start) != 0) return NULL;
+        /* Chunk the batch: hipBLASLt/Tensile fails to build plans for this model's
+         * large SSM/MoE GEMM shapes at M>256, so process the prefill in <=256-token
+         * sub-batches. SSM conv/recurrent state and KV cache carry across chunks. */
+        int chunk = r->moe_prefill_batched ? 256 : n_tokens;
+        { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { chunk = atoi(e); if (chunk < 1) chunk = n_tokens; } }
+        for (int off = 0; off < n_tokens; off += chunk) {
+            int cc = n_tokens - off; if (cc > chunk) cc = chunk;
+            if (embed_tokens_batch(r, tokens + off, cc) != 0) return NULL;
+            if (forward_block_batched_dense(r, cc, position_start + off) != 0) return NULL;
+        }
         if (!r->has_lm_head) return NULL;
         /* lm_head only on last token — d_x already holds the last hidden row. */
         launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
@@ -8214,30 +8325,26 @@ float *hip_llm_forward_batch_embd(hip_llm_runner *r, const float *embds,
 
 #ifdef LLM_HIPBLASLT_ENABLED
     if (r->batch_path_ok && M >= r->gemm_m_threshold && M <= r->batch_max) {
-        /* Copy the M main embeddings (first n_embd floats of each row) into
-         * d_x_batch. Rows are non-contiguous in source when embd_stride > n_embd
-         * (deepstack layout), so issue one memcpy per row — M is small (a few
-         * hundred at most). */
-        for (int m = 0; m < M; m++) {
-            const float *src = embds + (size_t)m * embd_stride;
-            float *dst = (float *)r->d_x_batch + (size_t)m * n_embd;
-            hipMemcpyAsync(dst, src, (size_t)n_embd * sizeof(float),
-                           hipMemcpyHostToDevice, r->stream);
+        /* Chunk to <=256 rows (Tensile plan limit for this model's GEMMs); SSM/KV
+         * state carries across chunks. _ds_embd is offset per chunk so the layer
+         * loop's deepstack slice indexing (local row m) maps to the global row. */
+        int chunk = r->moe_prefill_batched ? 256 : M;
+        { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { chunk = atoi(e); if (chunk < 1) chunk = M; } }
+        for (int off = 0; off < M; off += chunk) {
+            int cc = M - off; if (cc > chunk) cc = chunk;
+            for (int m = 0; m < cc; m++) {
+                const float *src = embds + (size_t)(off + m) * embd_stride;
+                float *dst = (float *)r->d_x_batch + (size_t)m * n_embd;
+                hipMemcpyAsync(dst, src, (size_t)n_embd * sizeof(float),
+                               hipMemcpyHostToDevice, r->stream);
+            }
+            r->_ds_embd        = embds + (size_t)off * embd_stride;
+            r->_ds_embd_stride = embd_stride;
+            int rc = forward_block_batched_dense(r, cc, position_start + off);
+            r->_ds_embd        = NULL;
+            r->_ds_embd_stride = 0;
+            if (rc != 0) return NULL;
         }
-
-        /* DeepStack: the layer loop reads slices on the fly from the host
-         * pointer via hipMemcpyAsync per (layer, row). For VLM workloads
-         * with n_deepstack=3 and M ~ 260, that's ~780 small uploads — a
-         * known overhead but still vastly less than the per-token forward. */
-        r->_ds_embd        = embds;
-        r->_ds_embd_stride = embd_stride;
-
-        int rc = forward_block_batched_dense(r, M, position_start);
-
-        r->_ds_embd        = NULL;
-        r->_ds_embd_stride = 0;
-
-        if (rc != 0) return NULL;
 
         /* Hand back the last row's hidden state in r->h_output (same contract
          * as hip_llm_forward_embd). r->d_x already holds it after
