@@ -3616,6 +3616,20 @@ static const char *hip_kernel_source =
 "    if (tid == 0) { float t = 0; for (int w = 0; w < 8; w++) t += ws[w];\n"
 "        shared_scale[0] = 1.0f / (1.0f + expf(-t)); }\n"
 "}\n"
+"/* ---- res_rmsnorm_f32: x += res; xb = rmsnorm(x) * w. One block (n<=4096). */\n"
+"__global__ void res_rmsnorm_f32(float *x, const float *res, float *xb,\n"
+"        const float *w, int n, float eps) {\n"
+"    extern __shared__ float sd[];\n"
+"    int tid = threadIdx.x;\n"
+"    float ss = 0.0f;\n"
+"    for (int i = tid; i < n; i += blockDim.x) {\n"
+"        float v = x[i] + res[i]; x[i] = v; ss += v * v;\n"
+"    }\n"
+"    sd[tid] = ss; __syncthreads();\n"
+"    for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (tid < st) sd[tid] += sd[tid + st]; __syncthreads(); }\n"
+"    float inv = rsqrtf(sd[0] / n + eps);\n"
+"    for (int i = tid; i < n; i += blockDim.x) xb[i] = x[i] * inv * w[i];\n"
+"}\n"
 "/* ---- ssm_prep_f32: fused decode SSM aux chain (conv+silu+state, l2norm Q/K,  */\n"
 "/* repeat-tile to Q_exp/K_exp, alpha softplus, beta sigmoid). One launch       */\n"
 "/* replaces 7. grid = n_group blocks x 256 thr. Layout: conv_out =             */\n"
@@ -5411,6 +5425,7 @@ struct hip_llm_runner {
     hipFunction_t fn_ssm_matvec4_q6k;       /* decode: fused 4 SSM input matvecs */
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
+    hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
     hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
@@ -5772,6 +5787,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_matvec4_q6k);
     GET_FUNC(matvec_qkv_q6k);
     GET_FUNC(moe_route_decode);
+    GET_FUNC(res_rmsnorm_f32);
     GET_FUNC(gemm_bf16_own);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
@@ -8397,14 +8413,16 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
         }
 
-        /* Residual: x += xb */
-        launch_add(r, r->d_x, r->d_xb, n_embd);
-
-        /* FFN RMSNorm */
-        launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
+        /* Residual + FFN RMSNorm fused: x += xb; xb = rmsnorm(x)*w */
+        {
+            void *a[] = { &r->d_x, &r->d_xb, &r->d_xb, &cl->ffn_norm_w, &n_embd, &eps };
+            LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, a);
+        }
 
         if (cl->is_moe) {
             forward_moe_ffn(r, cl);
+            launch_add(r, r->d_x, r->d_moe_accum, n_embd);
+            goto ffn_done;
         } else {
             /* Dense FFN */
             launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
@@ -8420,6 +8438,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
 
+ffn_done:
         /* DeepStack injection */
         if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
             const float *ds_slice = r->_ds_embd + (1 + l) * n_embd;
