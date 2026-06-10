@@ -23,15 +23,23 @@ extern "C" {
 
 typedef struct {
     CUdeviceptr adaln_w, adaln_b;               /* [6D,D], [6D] */
+    CUdeviceptr adaln_w16;
     CUdeviceptr norm2_w, norm2_b;               /* [D], [D] */
     CUdeviceptr sa_qkv_w, sa_qkv_b;             /* [3D,D], [3D] */
+    CUdeviceptr sa_qkv_w16;
     CUdeviceptr sa_q_rms_gamma, sa_k_rms_gamma; /* [D], [D] */
     CUdeviceptr sa_out_w, sa_out_b;             /* [D,D], [D] */
+    CUdeviceptr sa_out_w16;
     CUdeviceptr xa_q_w, xa_q_b;                 /* [D,D], [D] */
+    CUdeviceptr xa_q_w16;
     CUdeviceptr xa_kv_w, xa_kv_b;               /* [2D,D], [2D] */
+    CUdeviceptr xa_kv_w16;
     CUdeviceptr xa_out_w, xa_out_b;             /* [D,D], [D] */
+    CUdeviceptr xa_out_w16;
     CUdeviceptr mlp_fc1_w, mlp_fc1_b;           /* [4D,D], [4D] */
+    CUdeviceptr mlp_fc1_w16;
     CUdeviceptr mlp_fc2_w, mlp_fc2_b;           /* [D,4D], [D] */
+    CUdeviceptr mlp_fc2_w16;
 } cs3d_slatdit_block_w;
 
 typedef struct {
@@ -50,6 +58,9 @@ typedef struct {
 
 int  cs3d_slatdit_gpu_load_transformer(cs3d_slatdit_gpu *g,
                                        const sam3d_slat_dit_model *m,
+                                       const char *cache_dir,
+                                       const char *precision,
+                                       int drop_mma_f32,
                                        int verbose);
 void cs3d_slatdit_gpu_free(cs3d_slatdit_gpu *g);
 
@@ -66,35 +77,62 @@ void cs3d_slatdit_gpu_free(cs3d_slatdit_gpu *g);
 #include <stdlib.h>
 #include <string.h>
 #include "../cuda_runner_common.h"
+#include "cuda_sam3d_mma_cache.h"
 
 static int cs3d_slatditg_upload(const qtensor *t, const char *name,
-                                CUdeviceptr *out_d, size_t *out_bytes)
+                                const char *cache_dir, const char *precision,
+                                CUdeviceptr *out_d, CUdeviceptr *out_d16,
+                                int drop_f32_if_u16,
+                                size_t *out_bytes, size_t *out_bytes16,
+                                int verbose)
 {
     if (!t || !t->data) {
         fprintf(stderr, "cs3d_slatdit_gpu: missing tensor %s\n", name);
         return -1;
     }
+    int n = qt_numel(t);
+    if (out_d) *out_d = 0;
+    if (out_d16) *out_d16 = 0;
+    if (out_d16 && drop_f32_if_u16 &&
+        cs3d_mma_upload_weight_u16(cache_dir, name, precision, NULL, n,
+                                   out_d16, out_bytes16, verbose) == 0) {
+        return 0;
+    }
+
     float *buf = qt_dequant(t);
     if (!buf) {
         fprintf(stderr, "cs3d_slatdit_gpu: dequant %s failed\n", name);
         return -1;
     }
-    int n = qt_numel(t);
     size_t nb = (size_t)n * sizeof(float);
-    CUdeviceptr d = cu_upload_raw(buf, nb);
-    free(buf);
-    if (!d) {
-        fprintf(stderr, "cs3d_slatdit_gpu: cuMemAlloc failed for %s (%zu bytes)\n",
-                name, nb);
+    CUdeviceptr d = 0;
+    if (!drop_f32_if_u16 || !out_d16) {
+        d = cu_upload_raw(buf, nb);
+        if (!d) {
+            fprintf(stderr, "cs3d_slatdit_gpu: cuMemAlloc failed for %s (%zu bytes)\n",
+                    name, nb);
+            free(buf);
+            return -1;
+        }
+    }
+    if (out_d16 &&
+        cs3d_mma_upload_weight_u16(cache_dir, name, precision, buf, n,
+                                   out_d16, out_bytes16, verbose) < 0) {
+        if (d) cuMemFree(d);
+        free(buf);
         return -1;
     }
-    *out_d = d;
-    *out_bytes += nb;
+    if (out_d) *out_d = d;
+    if (d && out_bytes) *out_bytes += nb;
+    free(buf);
     return 0;
 }
 
 int cs3d_slatdit_gpu_load_transformer(cs3d_slatdit_gpu *g,
                                       const sam3d_slat_dit_model *m,
+                                      const char *cache_dir,
+                                      const char *precision,
+                                      int drop_mma_f32,
                                       int verbose)
 {
     if (!g || !m) return -1;
@@ -111,23 +149,36 @@ int cs3d_slatdit_gpu_load_transformer(cs3d_slatdit_gpu *g,
                                                 sizeof(cs3d_slatdit_block_w));
     if (!g->blocks) return -1;
 
-    size_t tot = 0;
+    size_t tot = 0, tot16 = 0;
     for (int b = 0; b < m->n_blocks; b++) {
         const sam3d_slat_block *B = &m->blocks[b];
         cs3d_slatdit_block_w *D = &g->blocks[b];
-#define UP_(field) \
-        if (cs3d_slatditg_upload(&B->field, #field, &D->field, &tot) < 0) goto fail
-        UP_(adaln_w); UP_(adaln_b);
-        UP_(norm2_w); UP_(norm2_b);
-        UP_(sa_qkv_w); UP_(sa_qkv_b);
-        UP_(sa_q_rms_gamma); UP_(sa_k_rms_gamma);
-        UP_(sa_out_w); UP_(sa_out_b);
-        UP_(xa_q_w); UP_(xa_q_b);
-        UP_(xa_kv_w); UP_(xa_kv_b);
-        UP_(xa_out_w); UP_(xa_out_b);
-        UP_(mlp_fc1_w); UP_(mlp_fc1_b);
-        UP_(mlp_fc2_w); UP_(mlp_fc2_b);
-#undef UP_
+#define UPW_(field) \
+        do { \
+            char tag[128]; \
+            snprintf(tag, sizeof(tag), "slatdit.block%02d." #field, b); \
+            if (cs3d_slatditg_upload(&B->field, tag, cache_dir, precision, \
+                                     &D->field, &D->field ## 16, drop_mma_f32, &tot, &tot16, verbose) < 0) goto fail; \
+        } while (0)
+#define UPF_(field) \
+        do { \
+            char tag[128]; \
+            snprintf(tag, sizeof(tag), "slatdit.block%02d." #field, b); \
+            if (cs3d_slatditg_upload(&B->field, tag, cache_dir, precision, \
+                                     &D->field, NULL, 0, &tot, &tot16, verbose) < 0) goto fail; \
+        } while (0)
+        UPF_(adaln_w); UPF_(adaln_b);
+        UPF_(norm2_w); UPF_(norm2_b);
+        UPW_(sa_qkv_w); UPF_(sa_qkv_b);
+        UPF_(sa_q_rms_gamma); UPF_(sa_k_rms_gamma);
+        UPW_(sa_out_w); UPF_(sa_out_b);
+        UPW_(xa_q_w); UPF_(xa_q_b);
+        UPW_(xa_kv_w); UPF_(xa_kv_b);
+        UPW_(xa_out_w); UPF_(xa_out_b);
+        UPW_(mlp_fc1_w); UPF_(mlp_fc1_b);
+        UPW_(mlp_fc2_w); UPF_(mlp_fc2_b);
+#undef UPW_
+#undef UPF_
     }
 
     g->total_bytes = tot;
@@ -135,10 +186,11 @@ int cs3d_slatdit_gpu_load_transformer(cs3d_slatdit_gpu *g,
     if (verbose) {
         fprintf(stderr,
                 "cs3d_slatdit_gpu: loaded transformer blocks=%d D=%d H=%d D_h=%d "
-                "mlp_h=%d cond=%d %.1f MiB on device\n",
+                "mlp_h=%d cond=%d %.1f MiB f32 + %.1f MiB u16 on device\n",
                 g->n_blocks, g->dim, g->n_heads, g->head_dim,
                 g->mlp_hidden, g->cond_channels,
-                (double)tot / (1024.0 * 1024.0));
+                (double)tot / (1024.0 * 1024.0),
+                (double)tot16 / (1024.0 * 1024.0));
     }
     return 0;
 
@@ -154,16 +206,16 @@ void cs3d_slatdit_gpu_free(cs3d_slatdit_gpu *g)
         for (int b = 0; b < g->n_blocks; b++) {
             cs3d_slatdit_block_w *D = &g->blocks[b];
             CUdeviceptr *all[] = {
-                &D->adaln_w, &D->adaln_b,
+                &D->adaln_w, &D->adaln_b, &D->adaln_w16,
                 &D->norm2_w, &D->norm2_b,
-                &D->sa_qkv_w, &D->sa_qkv_b,
+                &D->sa_qkv_w, &D->sa_qkv_b, &D->sa_qkv_w16,
                 &D->sa_q_rms_gamma, &D->sa_k_rms_gamma,
-                &D->sa_out_w, &D->sa_out_b,
-                &D->xa_q_w, &D->xa_q_b,
-                &D->xa_kv_w, &D->xa_kv_b,
-                &D->xa_out_w, &D->xa_out_b,
-                &D->mlp_fc1_w, &D->mlp_fc1_b,
-                &D->mlp_fc2_w, &D->mlp_fc2_b,
+                &D->sa_out_w, &D->sa_out_b, &D->sa_out_w16,
+                &D->xa_q_w, &D->xa_q_b, &D->xa_q_w16,
+                &D->xa_kv_w, &D->xa_kv_b, &D->xa_kv_w16,
+                &D->xa_out_w, &D->xa_out_b, &D->xa_out_w16,
+                &D->mlp_fc1_w, &D->mlp_fc1_b, &D->mlp_fc1_w16,
+                &D->mlp_fc2_w, &D->mlp_fc2_b, &D->mlp_fc2_w16,
             };
             for (size_t i = 0; i < sizeof(all)/sizeof(all[0]); i++) {
                 if (*all[i]) { cuMemFree(*all[i]); *all[i] = 0; }

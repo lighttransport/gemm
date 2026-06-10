@@ -49,7 +49,8 @@ enum {
     CUBLAS_COMPUTE_32F_PEDANTIC = 69,
     CUBLAS_COMPUTE_32I = 72,
     CUBLAS_COMPUTE_32F_FAST_TF32 = 77,
-    CUBLAS_GEMM_DEFAULT = -1
+    CUBLAS_GEMM_DEFAULT = -1,
+    CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99
 };
 
 /* cuBLAS-LT enums (from cublasLt.h, version >= 11.4) */
@@ -124,6 +125,16 @@ typedef cublasStatus_t (*tcublasGemmEx)(cublasHandle_t,
                                         const void *,
                                         void *, cudaDataType_t, int,
                                         cublasComputeType_t, int);
+typedef cublasStatus_t (*tcublasGemmStridedBatchedEx)(cublasHandle_t,
+                                        cublasOperation_t,
+                                        cublasOperation_t,
+                                        int, int, int,
+                                        const void *,
+                                        const void *, cudaDataType_t, int, long long,
+                                        const void *, cudaDataType_t, int, long long,
+                                        const void *,
+                                        void *, cudaDataType_t, int, long long,
+                                        int, cublasComputeType_t, int);
 /* C[m,n] = diag(x) * A[m,n] (SIDE_LEFT) — column-major. Kernel-free per-row
  * scaling primitive; used to apply per-output-channel FP8 weight scales after
  * a per-tensor FP8 matmul. */
@@ -140,6 +151,7 @@ static tcublasDestroy_v2 p_cublasDestroy_v2;
 static tcublasSetStream_v2 p_cublasSetStream_v2;
 static tcublasSgemm_v2 p_cublasSgemm_v2;
 static tcublasGemmEx p_cublasGemmEx;
+static tcublasGemmStridedBatchedEx p_cublasGemmStridedBatchedEx;
 static tcublasSdgmm p_cublasSdgmm;
 static int g_cublas_init_done;
 static int g_cublas_available;
@@ -343,8 +355,9 @@ int cublasewInit(void) {
         return -1;
     }
 
-    /* Optional: only the per-row FP8 path needs it; tolerate absence. */
+    /* Optional: strided batched GEMM for MoE all-expert matmul */
     cublasew_load_symbol((void **)&p_cublasSdgmm, "cublasSdgmm");
+    cublasew_load_symbol((void **)&p_cublasGemmStridedBatchedEx, "cublasGemmStridedBatchedEx");
 
     g_cublas_available = 1;
     return 0;
@@ -580,7 +593,9 @@ int cublasew_gemm_f32_lt_rowmajor_nt_beta1(cublasew_context *ctx,
     if (!ctx || !ctx->lt_handle) return -1;
     if (!g_cublaslt_available) return -1;
 
-    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasComputeType_t compute_type =
+        ctx->allow_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    st = p_cublasLtMatmulDescCreate(&desc, compute_type, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) goto fail;
     if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                           &op_n, sizeof(op_n)) != CUBLAS_STATUS_SUCCESS)
@@ -669,7 +684,9 @@ int cublasew_gemm_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
     if (!ctx || !ctx->lt_handle || !d_bias_f32) return -1;
     if (!g_cublaslt_available) return -1;
 
-    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasComputeType_t compute_type =
+        ctx->allow_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    st = p_cublasLtMatmulDescCreate(&desc, compute_type, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) { fail_step = "desc_create"; fail_status = st; goto fail; }
     if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                           &op_t, sizeof(op_t)) != CUBLAS_STATUS_SUCCESS) {
@@ -769,7 +786,9 @@ int cublasew_gemm_f32_lt_rowmajor_nt(cublasew_context *ctx,
     if (!ctx || !ctx->lt_handle) return -1;
     if (!g_cublaslt_available) return -1;
 
-    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasComputeType_t compute_type =
+        ctx->allow_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    st = p_cublasLtMatmulDescCreate(&desc, compute_type, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) { fail_step = "desc_create"; fail_status = st; goto fail; }
     if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                           &op_t, sizeof(op_t)) != CUBLAS_STATUS_SUCCESS) {
@@ -1046,6 +1065,16 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
     const float alpha = 1.0f;
     const float beta = 0.0f;
     if (!ctx || !ctx->handle) return -1;
+    cublasStatus_t st = p_cublasGemmEx(ctx->handle,
+                                       CUBLAS_OP_T, CUBLAS_OP_N,
+                                       n_out, n_tok, n_in,
+                                       &alpha,
+                                       (const void *)(uintptr_t)d_W_f16, CUDA_R_16F, n_in,
+                                       (const void *)(uintptr_t)d_X_f16, CUDA_R_16F, n_in,
+                                       &beta,
+                                       (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
+                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS) return 0;
     return p_cublasGemmEx(ctx->handle,
                           CUBLAS_OP_T, CUBLAS_OP_N,
                           n_out, n_tok, n_in,
@@ -1055,6 +1084,38 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
                           &beta,
                           (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+/* Strided-batched F16×F16→F32 GEMM for MoE all-expert matmul.
+ * For each batch e:
+ *   Y[e, n_tok, n_out] = X[n_tok, n_in] @ W[e, n_out, n_in]^T
+ * W has stride = n_out * n_in elements between batches.
+ * Y has stride = n_tok * n_out elements between batches.
+ * X is shared across all batches (strideB = 0). */
+int cublasew_gemm_f16_f16_f32_strided_batched(cublasew_context *ctx,
+                                               CUdeviceptr d_Y,
+                                               CUdeviceptr d_W_f16,
+                                               CUdeviceptr d_X_f16,
+                                               int n_tok,
+                                               int n_out,
+                                               int n_in,
+                                               int batch) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    if (!ctx || !ctx->handle || !p_cublasGemmStridedBatchedEx) return -1;
+    long long strideA = (long long)n_out * n_in;
+    long long strideC = (long long)n_tok * n_out;
+    cublasStatus_t st = p_cublasGemmStridedBatchedEx(ctx->handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n_out, n_tok, n_in,
+        &alpha,
+        (const void *)(uintptr_t)d_W_f16, CUDA_R_16F, n_in, strideA,
+        (const void *)(uintptr_t)d_X_f16, CUDA_R_16F, n_in, 0,
+        &beta,
+        (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out, strideC,
+        batch,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (st == CUBLAS_STATUS_SUCCESS) ? 0 : -1;
 }
 
 int cublasew_gemm_f16_f16_f32_rowmajor_nn(cublasew_context *ctx,
@@ -1197,6 +1258,16 @@ int cublasew_gemm_bf16_bf16_f32_rowmajor_nt(cublasew_context *ctx,
     const float alpha = 1.0f;
     const float beta = 0.0f;
     if (!ctx || !ctx->handle) return -1;
+    cublasStatus_t st = p_cublasGemmEx(ctx->handle,
+                                       CUBLAS_OP_T, CUBLAS_OP_N,
+                                       n_out, n_tok, n_in,
+                                       &alpha,
+                                       (const void *)(uintptr_t)d_W_bf16, CUDA_R_16BF, n_in,
+                                       (const void *)(uintptr_t)d_X_bf16, CUDA_R_16BF, n_in,
+                                       &beta,
+                                       (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
+                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS) return 0;
     return p_cublasGemmEx(ctx->handle,
                           CUBLAS_OP_T, CUBLAS_OP_N,
                           n_out, n_tok, n_in,
@@ -1206,6 +1277,106 @@ int cublasew_gemm_bf16_bf16_f32_rowmajor_nt(cublasew_context *ctx,
                           &beta,
                           (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+/* BF16xBF16->{F32|F16} GEMM with a fused bias (and optional tanh-GELU) epilogue.
+ * y_f16=0: D is FP32; y_f16=1: D is FP16 (d_Y must point at an FP16 buffer). The
+ * bias is always FP32 regardless of output type (BIAS_DATA_TYPE forced to F32).
+ * Mirrors the F16 LT bias wrapper, swapping F16->BF16. */
+int cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
+                                                    CUdeviceptr d_Y,
+                                                    CUdeviceptr d_W_bf16,
+                                                    CUdeviceptr d_X_bf16,
+                                                    CUdeviceptr d_bias_f32,
+                                                    int gelu,
+                                                    int y_f16,
+                                                    int n_tok,
+                                                    int n_out,
+                                                    int n_in) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasLtMatmulDesc_t desc = NULL;
+    cublasLtMatrixLayout_t a_layout = NULL, b_layout = NULL, d_layout = NULL;
+    cublasLtMatmulHeuristicResult_t heur;
+    cublasStatus_t st;
+    int op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
+    int epilogue = gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+    int bias_dt = CUDA_R_32F;
+    int y_dt = y_f16 ? CUDA_R_16F : CUDA_R_32F;
+    void *biasp = (void *)(uintptr_t)d_bias_f32;
+    void *Wp = (void *)(uintptr_t)d_W_bf16;
+    void *Xp = (void *)(uintptr_t)d_X_bf16;
+    void *Yp = (void *)(uintptr_t)d_Y;
+
+    if (!ctx || !ctx->lt_handle || !d_bias_f32) return -1;
+    if (!g_cublaslt_available) return -1;
+
+    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                          &op_t, sizeof(op_t)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                          &op_n, sizeof(op_n)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                          &epilogue, sizeof(epilogue)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                          &biasp, sizeof(biasp)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                          &bias_dt, sizeof(bias_dt)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+
+    /* W is BF16 [n_out, n_in] row-major -> column-major [n_in, n_out], ld n_in. */
+    if (p_cublasLtMatrixLayoutCreate(&a_layout, CUDA_R_16BF,
+                                     (uint64_t)n_in, (uint64_t)n_out,
+                                     (int64_t)n_in) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    /* X is BF16 [n_tok, n_in] row-major -> column-major [n_in, n_tok], ld n_in. */
+    if (p_cublasLtMatrixLayoutCreate(&b_layout, CUDA_R_16BF,
+                                     (uint64_t)n_in, (uint64_t)n_tok,
+                                     (int64_t)n_in) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    /* Y is [n_tok, n_out] row-major -> column-major [n_out, n_tok], ld n_out. */
+    if (p_cublasLtMatrixLayoutCreate(&d_layout, (cudaDataType_t)y_dt,
+                                     (uint64_t)n_out, (uint64_t)n_tok,
+                                     (int64_t)n_out) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+
+    memset(&heur, 0, sizeof(heur));
+    if (cublasewLtGetHeuristic(ctx->lt_handle, desc,
+                               a_layout, b_layout,
+                               d_layout, d_layout,
+                               ctx->pref, &heur,
+                               gelu ? "bf16_gelubias_nt" : "bf16_bias_nt",
+                               n_tok, n_out, n_in) != 0)
+        goto fail;
+
+    st = p_cublasLtMatmul(ctx->lt_handle, desc,
+                          &alpha,
+                          Wp, a_layout,
+                          Xp, b_layout,
+                          &beta,
+                          Yp, d_layout,
+                          Yp, d_layout,
+                          (const void *)&heur.algo,
+                          (void *)(uintptr_t)ctx->d_workspace,
+                          ctx->workspace_bytes,
+                          ctx->stream);
+    if (d_layout) p_cublasLtMatrixLayoutDestroy(d_layout);
+    if (b_layout) p_cublasLtMatrixLayoutDestroy(b_layout);
+    if (a_layout) p_cublasLtMatrixLayoutDestroy(a_layout);
+    if (desc) p_cublasLtMatmulDescDestroy(desc);
+    return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+
+fail:
+    if (d_layout) p_cublasLtMatrixLayoutDestroy(d_layout);
+    if (b_layout) p_cublasLtMatrixLayoutDestroy(b_layout);
+    if (a_layout) p_cublasLtMatrixLayoutDestroy(a_layout);
+    if (desc) p_cublasLtMatmulDescDestroy(desc);
+    return -1;
 }
 
 /* ----- cuBLAS-LT FP8 e4m3 matmul ---------------------------------- */
