@@ -283,6 +283,140 @@ __global__ void mmq_iq2xxs_grouped_v5(float *out, const uint8_t *W, unsigned lon
     }
 }
 
+/* grouped MMQ v6: v5 + codebook staged in shared memory. The IQ2_XXS decode gathers
+   iq2xxs_grid[idx] (2KB, 256x u64) and ksigns[idx] (128B) with a per-lane random index,
+   needed immediately for the sW write — in global/constant that is an exposed ~200-cycle
+   latency repeated 64 rows x nsb sub-blocks. Stage both tables into shared once per block
+   so every gather hits shared (~30 cyc). Decode is latency-bound on this gather, so this
+   is the lever. +2176 B shared/block (fine at sm_120's 100KB/SM). */
+__global__ void mmq_iq2xxs_grouped_v6(float *out, const uint8_t *W, unsigned long long estride,
+                                       const signed char *cxq8, const float *cxs, const int *ebounds,
+                                       const int *worklist, int N, int K) {
+    __shared__ uint64_t sGrid[256]; __shared__ uint8_t sKs[128];
+    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=c_grid[i];
+    for (int i=threadIdx.x;i<128;i+=blockDim.x) sKs[i]=c_ksigns[i];
+    int packed = worklist[blockIdx.y];
+    int e = packed >> 16, g0 = packed & 0xffff;
+    int eb0 = ebounds[e], eb1 = ebounds[e+1];
+    int m_base = eb0 + g0 * (8*TG);
+    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int gid = lane>>2, tid = lane&3;
+    int n0 = blockIdx.x*64 + warp*16;
+    int nb = K/256, row_bytes = nb*66, nsb = K/32;
+    const uint8_t *We = W + (size_t)e*estride;
+    __shared__ signed char sX[8*TG][32]; __shared__ float sXs[8*TG];
+    __shared__ signed char sW[64][32]; __shared__ float sWs[64];
+    float f[TG][4]; for(int g=0;g<TG;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}
+    __syncthreads();   /* codebook staged */
+    for (int sb=0; sb<nsb; sb++) {
+        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;
+            const uint8_t *bp=We+(size_t)n*row_bytes+(sb/8)*66;
+            float d=h2f_dev(*(const uint16_t*)bp); const uint16_t *qs=(const uint16_t*)(bp+2); int ib=sb&7;
+            uint32_t a0=(uint32_t)qs[4*ib]|((uint32_t)qs[4*ib+1]<<16);
+            uint32_t a1=(uint32_t)qs[4*ib+2]|((uint32_t)qs[4*ib+3]<<16);
+            if (half==0) sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;
+            for(int l=half*2; l<half*2+2; l++){ uint8_t idx=(a0>>(8*l))&255; const uint8_t*g=(const uint8_t*)&sGrid[idx];
+                uint8_t s=sKs[(a1>>(7*l))&127];
+                for(int j=0;j<8;j++) sW[r][l*8+j]=(signed char)((int)g[j]*((s&(1<<j))?-1:1)); } }
+        for (int i=threadIdx.x;i<ntg*8*32;i+=blockDim.x){ int t=i/32,kk=i%32,m=m_base+t;
+            sX[t][kk]=(m<eb1)?cxq8[(size_t)m*K+sb*32+kk]:0; }
+        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }
+        __syncthreads();
+        int wr=warp*16;
+        int a0=pack4(&sW[wr+gid][tid*4]), a1=pack4(&sW[wr+gid+8][tid*4]);
+        int a2=pack4(&sW[wr+gid][tid*4+16]), a3=pack4(&sW[wr+gid+8][tid*4+16]);
+        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];
+        for (int g=0; g<ntg; g++) {
+            int b0=pack4(&sX[g*8+gid][tid*4]), b1=pack4(&sX[g*8+gid][tid*4+16]);
+            int c0=0,c1=0,c2=0,c3=0;
+            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                :"=r"(c0),"=r"(c1),"=r"(c2),"=r"(c3)
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(0),"r"(0),"r"(0),"r"(0));
+            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];
+            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;
+            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;
+        }
+        __syncthreads();
+    }
+    int n_a=n0+gid, n_b=n0+gid+8;
+    for (int g=0; g<ntg; g++) {
+        int m_a=m_base+g*8+tid*2, m_b=m_a+1;
+        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }
+        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }
+    }
+}
+
+/* grouped MMQ v7: v6 + COALESCED weight staging. The decode's global weight read is the
+   real bottleneck: each lane reads bp=We+n*row_bytes+... so a warp's 16 rows are
+   row_bytes (=528B for K=2048) apart -> 16 cache lines for ~160 useful bytes (~9-12x
+   amplification, kernel sits ~9x above its DRAM floor). But the 64 rows a block owns are
+   CONTIGUOUS in the expert matrix, so stage that 64*row_bytes tile into shared with a
+   fully-coalesced cooperative load, then decode from shared. Dynamic shared = 64*row_bytes. */
+__global__ void mmq_iq2xxs_grouped_v7(float *out, const uint8_t *W, unsigned long long estride,
+                                       const signed char *cxq8, const float *cxs, const int *ebounds,
+                                       const int *worklist, int N, int K) {
+    extern __shared__ unsigned char sWt[];   /* [64*row_bytes] raw weight tile */
+    __shared__ uint64_t sGrid[256]; __shared__ uint8_t sKs[128];
+    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=c_grid[i];
+    for (int i=threadIdx.x;i<128;i+=blockDim.x) sKs[i]=c_ksigns[i];
+    int packed = worklist[blockIdx.y];
+    int e = packed >> 16, g0 = packed & 0xffff;
+    int eb0 = ebounds[e], eb1 = ebounds[e+1];
+    int m_base = eb0 + g0 * (8*TG);
+    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int gid = lane>>2, tid = lane&3;
+    int n0 = blockIdx.x*64 + warp*16;
+    int nb = K/256, row_bytes = nb*66, nsb = K/32;
+    int tile_n0 = blockIdx.x*64;                 /* first row of the 64-row tile */
+    const uint8_t *We = W + (size_t)e*estride;
+    /* coalesced cooperative load of the contiguous 64-row weight tile */
+    int tile_bytes = 64*row_bytes;
+    const uint8_t *tile_src = We + (size_t)tile_n0*row_bytes;
+    for (int i=threadIdx.x;i<tile_bytes;i+=blockDim.x) sWt[i]=tile_src[i];
+    __shared__ signed char sX[8*TG][32]; __shared__ float sXs[8*TG];
+    __shared__ signed char sW[64][32]; __shared__ float sWs[64];
+    float f[TG][4]; for(int g=0;g<TG;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}
+    __syncthreads();
+    for (int sb=0; sb<nsb; sb++) {
+        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;
+            const uint8_t *bp=sWt+(size_t)(n-tile_n0)*row_bytes+(sb/8)*66;
+            float d=h2f_dev(*(const uint16_t*)bp); const uint16_t *qs=(const uint16_t*)(bp+2); int ib=sb&7;
+            uint32_t a0=(uint32_t)qs[4*ib]|((uint32_t)qs[4*ib+1]<<16);
+            uint32_t a1=(uint32_t)qs[4*ib+2]|((uint32_t)qs[4*ib+3]<<16);
+            if (half==0) sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;
+            for(int l=half*2; l<half*2+2; l++){ uint8_t idx=(a0>>(8*l))&255; const uint8_t*g=(const uint8_t*)&sGrid[idx];
+                uint8_t s=sKs[(a1>>(7*l))&127];
+                for(int j=0;j<8;j++) sW[r][l*8+j]=(signed char)((int)g[j]*((s&(1<<j))?-1:1)); } }
+        for (int i=threadIdx.x;i<ntg*8*32;i+=blockDim.x){ int t=i/32,kk=i%32,m=m_base+t;
+            sX[t][kk]=(m<eb1)?cxq8[(size_t)m*K+sb*32+kk]:0; }
+        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }
+        __syncthreads();
+        int wr=warp*16;
+        int a0=pack4(&sW[wr+gid][tid*4]), a1=pack4(&sW[wr+gid+8][tid*4]);
+        int a2=pack4(&sW[wr+gid][tid*4+16]), a3=pack4(&sW[wr+gid+8][tid*4+16]);
+        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];
+        for (int g=0; g<ntg; g++) {
+            int b0=pack4(&sX[g*8+gid][tid*4]), b1=pack4(&sX[g*8+gid][tid*4+16]);
+            int c0=0,c1=0,c2=0,c3=0;
+            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                :"=r"(c0),"=r"(c1),"=r"(c2),"=r"(c3)
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(0),"r"(0),"r"(0),"r"(0));
+            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];
+            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;
+            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;
+        }
+        __syncthreads();
+    }
+    int n_a=n0+gid, n_b=n0+gid+8;
+    for (int g=0; g<ntg; g++) {
+        int m_a=m_base+g*8+tid*2, m_b=m_a+1;
+        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }
+        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }
+    }
+}
+
 /* ---- weighted scatter: final[token] += wgt[c] * out_compact[c] ---- */
 __global__ void scatter_weighted(float *final_out, const float *out_compact, const int *ids_token,
                                   const float *cw, int total_rows, int N) {
@@ -432,6 +566,36 @@ int main(int argc,char**argv){
                m5, m4/m5, m1/m5, n_work, n_experts*gy);
         printf("v5 vs v1 out_compact: rel_L2 = %.6f  (expect ~0)\n", ev5);
         ok = ok && (ev5<1e-4);
+
+        /* ---- v6: v5 + shared-memory codebook staging ---- */
+        float *dOutC6; CUDA_CHECK(cudaMalloc(&dOutC6,(size_t)total*N*sizeof(float)));
+        CUDA_CHECK(cudaMemset(dOutC6,0,(size_t)total*N*sizeof(float)));
+        mmq_iq2xxs_grouped_v6<<<gg5,128>>>(dOutC6,dW,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+        CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        float *oc6=(float*)malloc((size_t)total*N*sizeof(float));
+        CUDA_CHECK(cudaMemcpy(oc6,dOutC6,(size_t)total*N*sizeof(float),cudaMemcpyDeviceToHost));
+        double ev6=rel_l2(oc6,oc1,total*N);
+        cudaEventRecord(t0); for(int i=0;i<it;i++) mmq_iq2xxs_grouped_v6<<<gg5,128>>>(dOutC6,dW,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+        cudaEventRecord(t1); cudaEventSynchronize(t1); float m6; cudaEventElapsedTime(&m6,t0,t1); m6/=it;
+        printf("grouped v6 (shared codebook): %.3f ms  (%.2fx vs v5, %.2fx vs v1)\n", m6, m5/m6, m1/m6);
+        printf("v6 vs v1 out_compact: rel_L2 = %.6f  (expect ~0)\n", ev6);
+        ok = ok && (ev6<1e-4);
+
+        /* ---- v7: v6 + coalesced contiguous weight-tile staging (dynamic shared) ---- */
+        int row_bytes = (K/256)*66, smem7 = 64*row_bytes;
+        cudaFuncSetAttribute(mmq_iq2xxs_grouped_v7, cudaFuncAttributeMaxDynamicSharedMemorySize, smem7);
+        float *dOutC7; CUDA_CHECK(cudaMalloc(&dOutC7,(size_t)total*N*sizeof(float)));
+        CUDA_CHECK(cudaMemset(dOutC7,0,(size_t)total*N*sizeof(float)));
+        mmq_iq2xxs_grouped_v7<<<gg5,128,smem7>>>(dOutC7,dW,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+        CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        float *oc7=(float*)malloc((size_t)total*N*sizeof(float));
+        CUDA_CHECK(cudaMemcpy(oc7,dOutC7,(size_t)total*N*sizeof(float),cudaMemcpyDeviceToHost));
+        double ev7=rel_l2(oc7,oc1,total*N);
+        cudaEventRecord(t0); for(int i=0;i<it;i++) mmq_iq2xxs_grouped_v7<<<gg5,128,smem7>>>(dOutC7,dW,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+        cudaEventRecord(t1); cudaEventSynchronize(t1); float m7; cudaEventElapsedTime(&m7,t0,t1); m7/=it;
+        printf("grouped v7 (coalesced tile, smem=%dB): %.3f ms  (%.2fx vs v6, %.2fx vs v1)\n", smem7, m7, m6/m7, m1/m7);
+        printf("v7 vs v1 out_compact: rel_L2 = %.6f  (expect ~0)\n", ev7);
+        ok = ok && (ev7<1e-4);
     }
     printf("%s\n", ok?"PASS (mul_mat_id mechanics correct)":"FAIL");
     return ok?0:1;
