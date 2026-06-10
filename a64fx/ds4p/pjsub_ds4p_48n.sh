@@ -1,8 +1,8 @@
 #!/bin/bash
 #PJM -g hp250467
-#PJM -L "freq=2000,eco_state=0,rscgrp=small,node=48,elapse=02:00:00"
+#PJM -L "freq=2000,eco_state=0,retention_state=0,rscgrp=small-s2,node=48,elapse=02:00:00"
 #PJM --mpi "proc=48"
-#PJM --llio localtmp-size=87Gi
+#PJM --llio localtmp-size=80Gi
 #PJM -j
 #
 # DeepSeek-V4-Pro full-model batch run on 48 A64FX nodes (self-contained:

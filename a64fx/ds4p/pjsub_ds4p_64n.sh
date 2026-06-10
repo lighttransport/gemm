@@ -1,13 +1,14 @@
 #!/bin/bash
 #PJM -g hp250467
-#PJM -L "freq=2000,eco_state=0,rscgrp=small,node=64,elapse=02:00:00"
+#PJM -L "freq=2000,eco_state=0,retention_state=0,rscgrp=small-s2,node=4x4x4:torus,elapse=02:00:00"
 #PJM --mpi "proc=64"
-#PJM --llio localtmp-size=87Gi
+#PJM --llio localtmp-size=80Gi
 #PJM -j
 #
-# DeepSeek-V4-Pro full-model batch run on 64 A64FX nodes (self-contained:
-# /local is wiped per job, so stage + run MUST share one job).
+# DeepSeek-V4-Pro full-model batch run on 64 A64FX nodes, 4x4x4 torus
+# (self-contained: /local is wiped per job, so stage + run MUST share one job).
 #
+#   sh ~/job-64.sh                                               # preferred (adds PJM_LLIO_GFSCACHE=/vol0006)
 #   pjsub --no-check-directory pjsub_ds4p_64n.sh                 # full 61 layers + gen
 #   pjsub --no-check-directory -x LAYERS=8 pjsub_ds4p_64n.sh     # smoke: 8 layers, no gen
 #
