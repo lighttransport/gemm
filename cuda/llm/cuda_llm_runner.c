@@ -4294,25 +4294,27 @@ static const char *cuda_kernel_source =
 "}\n"
 "static __device__ __forceinline__ int mmq_pack4(const signed char*p){\n"
 "    return (p[0]&0xff)|((p[1]&0xff)<<8)|((p[2]&0xff)<<16)|((p[3]&0xff)<<24); }\n"
-"/* grouped MMQ: one dispatch over all experts (grid.z=n_experts, WN=4 warps/block).\n"
-"   out[total][N] = compact_act @ expert_weight^T. grid=(N/64, ceil(max_tok/8), n_experts), block=128 */\n"
+"/* grouped MMQ (decode-amortized): one dispatch over all experts (grid.z=n_experts,\n"
+"   WN=4 warps/block). Each block decodes its 64 weight-rows for a sub-block ONCE\n"
+"   and reuses across up to TG=4 token-groups (32 tokens) of its expert — the\n"
+"   IQ2_XXS decode is the bottleneck, so amortizing it is the win (2.1x vs 8/block).\n"
+"   grid=(N/64, ceil(max_tok/32), n_experts), block=128 */\n"
 "__global__ void mmq_iq2xxs_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
 "                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
 "                                    int N, int K) {\n"
+"    const int TG = 4;\n"
 "    int e = blockIdx.z; int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
-"    int m0 = eb0 + blockIdx.y*8; if (m0 >= eb1) return;\n"
+"    int m_base = eb0 + blockIdx.y*(8*TG); if (m_base >= eb1) return;\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
 "    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
 "    int gid = lane>>2, tid = lane&3;\n"
 "    int n0 = blockIdx.x*64 + warp*16;\n"
 "    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
 "    const unsigned char *We = W + (size_t)e*estride;\n"
-"    __shared__ signed char sX[8][32]; __shared__ float sXs[8];\n"
+"    __shared__ signed char sX[32][32]; __shared__ float sXs[32];\n"
 "    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
-"    float f0=0,f1=0,f2=0,f3=0;\n"
+"    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
 "    for (int sb=0; sb<nsb; sb++) {\n"
-"        for (int i=threadIdx.x;i<8*32;i+=blockDim.x){ int tt=i/32,kk=i%32,m=m0+tt;\n"
-"            sX[tt][kk]=(m<eb1)?cxq8[(size_t)m*K+sb*32+kk]:0; }\n"
-"        if (threadIdx.x<8){ int m=m0+threadIdx.x; sXs[threadIdx.x]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
 "        if (lane<16){ int r=warp*16+lane, n=n0+lane;\n"
 "            const unsigned char *bp=We+(size_t)n*row_bytes+(sb/8)*66;\n"
 "            float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2); int ib=sb&7;\n"
@@ -4322,22 +4324,32 @@ static const char *cuda_kernel_source =
 "            for(int l=0;l<4;l++){ unsigned char idx=(a0>>(8*l))&255; const unsigned char *g=(const unsigned char*)&iq2xxs_grid_dev[idx];\n"
 "                unsigned char s=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
 "                for(int j=0;j<8;j++) sW[r][l*8+j]=(signed char)((int)g[j]*((s&(1<<j))?-1:1)); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*32;i+=blockDim.x){ int tt=i/32,kk=i%32,m=m_base+tt;\n"
+"            sX[tt][kk]=(m<eb1)?cxq8[(size_t)m*K+sb*32+kk]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
 "        __syncthreads();\n"
 "        int wr=warp*16;\n"
 "        int qa0=mmq_pack4(&sW[wr+gid][tid*4]), qa1=mmq_pack4(&sW[wr+gid+8][tid*4]);\n"
 "        int qa2=mmq_pack4(&sW[wr+gid][tid*4+16]), qa3=mmq_pack4(&sW[wr+gid+8][tid*4+16]);\n"
-"        int qb0=mmq_pack4(&sX[gid][tid*4]), qb1=mmq_pack4(&sX[gid][tid*4+16]);\n"
-"        int c0=0,c1=0,c2=0,c3=0;\n"
-"        asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
-"            :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
-"            :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
-"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8], xc0=sXs[tid*2], xc1=sXs[tid*2+1];\n"
-"        f0+=wr0*xc0*(float)c0; f1+=wr0*xc1*(float)c1; f2+=wr8*xc0*(float)c2; f3+=wr8*xc1*(float)c3;\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=mmq_pack4(&sX[g*8+gid][tid*4]), qb1=mmq_pack4(&sX[g*8+gid][tid*4+16]);\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
 "        __syncthreads();\n"
 "    }\n"
-"    int n_a=n0+gid, n_b=n0+gid+8, m_a=m0+tid*2, m_b=m0+tid*2+1;\n"
-"    if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f0; out[(size_t)m_a*N+n_b]=f2; }\n"
-"    if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f1; out[(size_t)m_b*N+n_b]=f3; }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
 "}\n"
 "/* weighted scatter: final[ids_token[c]] += cw[c]*out_compact[c]. grid=total, block=256 */\n"
 "__global__ void mmq_scatter_weighted(float *final_out, const float *out_compact,\n"
@@ -11357,9 +11369,9 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                         /* 2. grouped gate + up: out[total][ef] */
                         { unsigned long long st = cl->moe_exp_stride_gu; int nN = ef, nK = n_embd;
                           void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 7) / 8, r->n_experts, 128, 1, 1, 0, r->stream, ag, NULL);
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 31) / 32, r->n_experts, 128, 1, 1, 0, r->stream, ag, NULL);
                           void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 7) / 8, r->n_experts, 128, 1, 1, 0, r->stream, au, NULL); }
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 31) / 32, r->n_experts, 128, 1, 1, 0, r->stream, au, NULL); }
                         /* 3. silu: outg = silu(outg) * outu */
                         launch_silu_mul(r, r->d_mmq_outg, r->d_mmq_outu, total * ef);
                         /* 4. quantize silu result (ef cols) into cxq8 for the down matmul */
@@ -11369,7 +11381,7 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                         /* 5. grouped down: out[total][n_embd] */
                         { unsigned long long st = cl->moe_exp_stride_d; int nN = n_embd, nK = ef;
                           void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, (maxtok + 7) / 8, r->n_experts, 128, 1, 1, 0, r->stream, ad, NULL); }
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, (maxtok + 31) / 32, r->n_experts, 128, 1, 1, 0, r->stream, ad, NULL); }
                         /* 6. weighted scatter into d_batch_x (ids_token=etok, weights=etw) */
                         { int tr = total, nN = n_embd;
                           void *a[] = { &d_batch_x, &r->d_mmq_outd, &r->d_topk_idx, &r->d_topk_wgt, &tr, &nN };
