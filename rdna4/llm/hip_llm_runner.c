@@ -37,6 +37,16 @@
 
 #ifdef LLM_HIPBLASLT_ENABLED
 #include "mm_blaslt_bridge.h"
+#else
+/* No-hipBLASLt build: the batched prefill path stays fully functional via the
+ * self-owned WMMA GEMM (gemm_bf16_own); these stubs make the blaslt branch
+ * unreachable (init fails -> gemm_own forced on). */
+static int mm_blaslt_init(void) { return -1; }
+static int mm_blaslt_run_bf16(void *y, const void *w, const void *x,
+                              int M, int N, int K, void *stream) {
+    (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
+}
+#define LLM_HIPBLASLT_ENABLED 1   /* compile the batched path unconditionally */
 #endif
 
 /* ======================================================================== */
@@ -4121,6 +4131,210 @@ static const char *hip_kernel_source =
 "/* ===== Phase 3: causal WMMA flash-attention helpers ===== */\n"
 "typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));\n"
 "typedef float    float8 __attribute__((ext_vector_type(8)));\n"
+"typedef unsigned short bf16x8 __attribute__((ext_vector_type(8)));\n"
+"\n"
+"/* ---- Self-owned BF16 GEMM (no hipBLASLt): Y[M,N]f32 = X[M,K]bf16 x W[N,K]^T. */\n"
+"/* 128x128 CTA, 4 waves, WMMA 16x16x16, bounds-checked tails (ported vlm).     */\n"
+"__global__ void gemm_bf16_own(float *Y, const bf16_raw *W, const bf16_raw *X,\n"
+"                              int N, int K, int M) {\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int half = lane >> 4;\n"
+"    int idx = lane & 15;\n"
+"    int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    __shared__ unsigned short smA[128*32];\n"
+"    __shared__ unsigned short smB[128*32];\n"
+"    float8 z = {0,0,0,0,0,0,0,0};\n"
+"    float8 cv00=z,cv01=z,cv10=z,cv11=z,cv20=z,cv21=z,cv30=z,cv31=z;\n"
+"    for (int k = 0; k < K; k += 32) {\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int e = tid * 16 + it;\n"
+"            int er = e >> 5, ek = e & 31;\n"
+"            int row = cta_m0 + er, kp = k + ek;\n"
+"            smA[e] = (row < M && kp < K) ? X[(size_t)row * K + kp] : 0;\n"
+"        }\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int e = tid * 16 + it;\n"
+"            int er = e >> 5, ek = e & 31;\n"
+"            int col = cta_n0 + er, kp = k + ek;\n"
+"            smB[e] = (col < N && kp < K) ? W[(size_t)col * K + kp] : 0;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 32;\n"
+"        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
+"            bf16x8 a0,a1,a2,a3,b0,b1;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                a0[i]=smA[(a_base+0 +idx)*32+kk0+k_off+i];\n"
+"                a1[i]=smA[(a_base+16+idx)*32+kk0+k_off+i];\n"
+"                a2[i]=smA[(a_base+32+idx)*32+kk0+k_off+i];\n"
+"                a3[i]=smA[(a_base+48+idx)*32+kk0+k_off+i];\n"
+"                b0[i]=smB[(b_base+0 +idx)*32+kk0+k_off+i];\n"
+"                b1[i]=smB[(b_base+16+idx)*32+kk0+k_off+i];\n"
+"            }\n"
+"            cv00=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b0,cv00);\n"
+"            cv01=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b1,cv01);\n"
+"            cv10=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b0,cv10);\n"
+"            cv11=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b1,cv11);\n"
+"            cv20=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b0,cv20);\n"
+"            cv21=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b1,cv21);\n"
+"            cv30=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b0,cv30);\n"
+"            cv31=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b1,cv31);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 32;\n"
+"    float8 *accs[8] = {&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31};\n"
+"    int ms[8] = {0,0,16,16,32,32,48,48};\n"
+"    int ns[8] = {0,16,0,16,0,16,0,16};\n"
+"    for (int t = 0; t < 8; t++) {\n"
+"        int col = wave_n0 + ns[t] + idx;\n"
+"        if (col >= N) continue;\n"
+"        float8 acc = *accs[t];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int row = wave_m0 + ms[t] + half * 8 + i;\n"
+"            if (row >= M) continue;\n"
+"            Y[(size_t)row * N + col] = acc[i];\n"
+"        }\n"
+"    }\n"
+"}\n"
+"/* ---- Grouped MoE prefill kernels: blockIdx.y/z = expert. One launch per layer. */\n"
+"/* Dequant ALL experts' IQ2_S weights -> bf16 (skips experts with 0 tokens). */\n"
+"__global__ void dequant_iq2s_all(bf16_raw *dst, const unsigned char *base,\n"
+"        const int *offs, int rows, int cols, long long stride) {\n"
+"    int e = blockIdx.y;\n"
+"    if (offs[e + 1] == offs[e]) return;\n"
+"    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    if (row >= rows) return;\n"
+"    const unsigned char *mat = base + (long long)e * stride;\n"
+"    int nb = cols / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 82;\n"
+"    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 82;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned char scale = bp[74 + ib32];\n"
+"        float db = (l < 2) ? d * (0.5f + (float)(scale & 0xf)) * 0.25f\n"
+"                           : d * (0.5f + (float)(scale >>  4)) * 0.25f;\n"
+"        int gi = bp[2 + ib32*4 + l] | ((bp[66 + ib32] << (8 - 2*l)) & 0x300);\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[gi];\n"
+"        unsigned char s = bp[34 + ib32*4 + l];\n"
+"        int o = b * 256 + ib32 * 32 + l * 8;\n"
+"        for (int j = 0; j < 8; j++)\n"
+"            orow[o + j] = f32_to_bf16(db * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f));\n"
+"    }\n"
+"}\n"
+"__global__ void dequant_iq3s_all(bf16_raw *dst, const unsigned char *base,\n"
+"        const int *offs, int rows, int cols, long long stride) {\n"
+"    int e = blockIdx.y;\n"
+"    if (offs[e + 1] == offs[e]) return;\n"
+"    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    if (row >= rows) return;\n"
+"    const unsigned char *mat = base + (long long)e * stride;\n"
+"    int nb = cols / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 110;\n"
+"    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int g32 = g & 31; int sb = g32 >> 2; int l = g32 & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned char sc = bp[106 + (sb >> 1)];\n"
+"        float db = d * (float)(1 + 2 * ((sb & 1) ? (sc >> 4) : (sc & 0xf)));\n"
+"        unsigned char qh = bp[66 + sb];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3s_grid_dev[bp[2+sb*8+2*l]   | ((qh << (8-2*l)) & 256)];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3s_grid_dev[bp[2+sb*8+2*l+1] | ((qh << (7-2*l)) & 256)];\n"
+"        unsigned char s = bp[74 + sb*4 + l];\n"
+"        int o = b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            orow[o + j]     = f32_to_bf16(db * (float)g1[j] * ((s & (1 << j)) ? -1.0f : 1.0f));\n"
+"            orow[o + 4 + j] = f32_to_bf16(db * (float)g2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f));\n"
+"        }\n"
+"    }\n"
+"}\n"
+"/* Grouped GEMM: per expert e, Y[offs[e]..offs[e+1], 0..N) = X[offs[e].., K] x W_e^T. */\n"
+"__global__ void gemm_bf16_grouped(float *Y, const bf16_raw *Wall, const bf16_raw *X,\n"
+"                                  const int *offs, int N, int K) {\n"
+"    int e = blockIdx.z;\n"
+"    int m0 = offs[e], m1 = offs[e + 1];\n"
+"    int M = m1 - m0;\n"
+"    if (M <= 0 || (int)blockIdx.y * 128 >= M) return;\n"
+"    const bf16_raw *W = Wall + (size_t)e * N * K;\n"
+"    const bf16_raw *Xe = X + (size_t)m0 * K;\n"
+"    float *Ye = Y + (size_t)m0 * N;\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int half = lane >> 4;\n"
+"    int idx = lane & 15;\n"
+"    int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    __shared__ unsigned short smA[128*32];\n"
+"    __shared__ unsigned short smB[128*32];\n"
+"    float8 z = {0,0,0,0,0,0,0,0};\n"
+"    float8 cv00=z,cv01=z,cv10=z,cv11=z,cv20=z,cv21=z,cv30=z,cv31=z;\n"
+"    for (int k = 0; k < K; k += 32) {\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int el = tid * 16 + it;\n"
+"            int er = el >> 5, ek = el & 31;\n"
+"            int row = cta_m0 + er, kp = k + ek;\n"
+"            smA[el] = (row < M && kp < K) ? Xe[(size_t)row * K + kp] : 0;\n"
+"        }\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int el = tid * 16 + it;\n"
+"            int er = el >> 5, ek = el & 31;\n"
+"            int col = cta_n0 + er, kp = k + ek;\n"
+"            smB[el] = (col < N && kp < K) ? W[(size_t)col * K + kp] : 0;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 32;\n"
+"        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
+"            bf16x8 a0,a1,a2,a3,b0,b1;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                a0[i]=smA[(a_base+0 +idx)*32+kk0+k_off+i];\n"
+"                a1[i]=smA[(a_base+16+idx)*32+kk0+k_off+i];\n"
+"                a2[i]=smA[(a_base+32+idx)*32+kk0+k_off+i];\n"
+"                a3[i]=smA[(a_base+48+idx)*32+kk0+k_off+i];\n"
+"                b0[i]=smB[(b_base+0 +idx)*32+kk0+k_off+i];\n"
+"                b1[i]=smB[(b_base+16+idx)*32+kk0+k_off+i];\n"
+"            }\n"
+"            cv00=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b0,cv00);\n"
+"            cv01=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b1,cv01);\n"
+"            cv10=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b0,cv10);\n"
+"            cv11=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b1,cv11);\n"
+"            cv20=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b0,cv20);\n"
+"            cv21=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b1,cv21);\n"
+"            cv30=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b0,cv30);\n"
+"            cv31=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b1,cv31);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 32;\n"
+"    float8 *accs[8] = {&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31};\n"
+"    int ms[8] = {0,0,16,16,32,32,48,48};\n"
+"    int ns[8] = {0,16,0,16,0,16,0,16};\n"
+"    for (int t = 0; t < 8; t++) {\n"
+"        int col = wave_n0 + ns[t] + idx;\n"
+"        if (col >= N) continue;\n"
+"        float8 acc = *accs[t];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int row = wave_m0 + ms[t] + half * 8 + i;\n"
+"            if (row >= M) continue;\n"
+"            Ye[(size_t)row * N + col] = acc[i];\n"
+"        }\n"
+"    }\n"
+"}\n"
 "\n"
 "__device__ __forceinline__ half_raw f32_to_f16_bits(float v) {\n"
 "    __half hv = __float2half(v);\n"
@@ -4995,6 +5209,13 @@ struct hip_llm_runner {
     hipFunction_t fn_shexp_down_accum_q6k;  /* decode: shared expert down+scale-add */
     hipFunction_t fn_ssm_prep_f32;          /* decode: fused SSM aux chain */
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
+    hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
+    int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
+    hipFunction_t fn_dequant_iq2s_all;      /* all-expert dequant (grouped prefill) */
+    hipFunction_t fn_dequant_iq3s_all;
+    hipFunction_t fn_gemm_bf16_grouped;     /* per-expert grouped WMMA GEMM */
+    void *d_expw_bf16;                      /* [ne*rows*cols] bf16 staging (one type) */
+    int  *d_moe_offs;                       /* [ne+1] device expert offsets */
     int moe_fused_decode;            /* LLM_MOE_FUSED (default on if types match) */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
@@ -5255,6 +5476,9 @@ struct hip_llm_runner {
     int         graph_verbose;    /* env LLM_GRAPH_VERBOSE=1 */
 };
 
+static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
+                                  const void *X, int M, int N, int K, void *stream);
+
 /* ======================================================================== */
 /* HIPRTC kernel compilation                                                */
 /* ======================================================================== */
@@ -5336,6 +5560,10 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(shexp_gateup_silu_q6k);
     GET_FUNC(shexp_down_accum_q6k);
     GET_FUNC(ssm_prep_f32);
+    GET_FUNC(gemm_bf16_own);
+    GET_FUNC(dequant_iq2s_all);
+    GET_FUNC(dequant_iq3s_all);
+    GET_FUNC(gemm_bf16_grouped);
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
@@ -5457,6 +5685,8 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     { const char *e = getenv("LLM_MOE_FUSED"); if (e) r->moe_fused_decode = atoi(e) != 0; }
     r->ssm_fused_decode = 1;
     { const char *e = getenv("LLM_SSM_FUSED"); if (e) r->ssm_fused_decode = atoi(e) != 0; }
+    r->gemm_own = 0;
+    { const char *e = getenv("LLM_GEMM"); if (e && strcmp(e, "own") == 0) r->gemm_own = 1; }
     {
         const size_t QCAP = 8192;
         if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
@@ -6316,13 +6546,16 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             if (!moe_prefill || !r->moe_dev_dispatch_ok || !r->is_hybrid) eligible = 0;
         }
 
-        if (eligible) {
+        if (eligible && !r->gemm_own) {
             if (mm_blaslt_init() != 0) {
                 fprintf(stderr,
-                    "hip_llm: mm_blaslt_init failed; falling back to per-token GEMV\n");
-                eligible = 0;
+                    "hip_llm: mm_blaslt_init unavailable; using self-owned WMMA GEMM\n");
+                r->gemm_own = 1;
             }
         }
+        if (r->verbose >= 1 && eligible)
+            fprintf(stderr, "hip_llm: prefill GEMM backend = %s\n",
+                    r->gemm_own ? "own (WMMA, no hipBLASLt)" : "hipBLASLt");
 
         if (eligible) {
             int kv_dim = r->n_kv_heads * r->head_dim;
@@ -6402,7 +6635,12 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             CHECK_HIP(hipMalloc(&r->d_ffn_norm_batch_bf16,bm * r->n_embd * 2));
             CHECK_HIP(hipMalloc(&r->d_gate_batch,         bm * r->n_ff  * sizeof(float)));
             CHECK_HIP(hipMalloc(&r->d_up_batch,           bm * r->n_ff  * sizeof(float)));
-            CHECK_HIP(hipMalloc(&r->d_silu_batch_bf16,    bm * r->n_ff  * 2));
+            {
+                /* Also used as the packed ssm_out scratch — must hold d_inner. */
+                size_t silu_cols = (size_t)r->n_ff;
+                if (r->is_hybrid && (size_t)r->ssm_d_inner > silu_cols) silu_cols = r->ssm_d_inner;
+                CHECK_HIP(hipMalloc(&r->d_silu_batch_bf16, (size_t)bm * silu_cols * 2));
+            }
             CHECK_HIP(hipMalloc(&r->d_down_batch,         bm * r->n_embd * sizeof(float)));
 
             /* Hybrid gated-attn extra buffers: Q projection emits 2*q_dim per row. */
@@ -6477,6 +6715,16 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 CHECK_HIP(hipMalloc(&r->d_shared_scale_batch,  (size_t)bm * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_src,      TA * sizeof(int)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_w,        TA * sizeof(float)));
+                /* All-expert bf16 staging (one weight type at a time) + device offsets */
+                {
+                    size_t gu = (size_t)ne * r->expert_ff * r->n_embd * 2;
+                    size_t dn = (size_t)ne * r->n_embd * r->expert_ff * 2;
+                    size_t sz = gu > dn ? gu : dn;
+                    CHECK_HIP(hipMalloc(&r->d_expw_bf16, sz));
+                    CHECK_HIP(hipMalloc(&r->d_moe_offs, (size_t)(ne + 1) * sizeof(int)));
+                    if (r->verbose >= 1)
+                        fprintf(stderr, "hip_llm: grouped-expert staging %.0f MB\n", sz / 1048576.0);
+                }
                 r->h_router_batch    = (float *)malloc((size_t)bm * ne * sizeof(float));
                 r->h_moe_gather_src  = (int *)malloc(TA * sizeof(int));
                 r->h_moe_gather_w    = (float *)malloc(TA * sizeof(float));
@@ -6495,6 +6743,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
              * the first user call. Set LLM_PLAN_PREWARM=0 to skip. */
             const char *prewarm_env = getenv("LLM_PLAN_PREWARM");
             int do_prewarm = (prewarm_env == NULL) ? 1 : atoi(prewarm_env);
+            if (r->gemm_own) do_prewarm = 0;  /* own kernel needs no plan cache */
             if (do_prewarm && r->n_layers > 0) {
                 hip_layer *cl0 = &r->layers[0];
                 /* Representative Ms — covers small prompts, medium, and BMAX. */
@@ -6509,25 +6758,25 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 for (int wi = 0; wi < n_warm_Ms; wi++) {
                     int M = warm_Ms[wi];
                     if (cl0->attn_q_w_bf16)
-                        mm_blaslt_run_bf16(r->d_q_batch, cl0->attn_q_w_bf16,
+                        gemm_run_bf16_w(r, r->d_q_batch, cl0->attn_q_w_bf16,
                             r->d_xnorm_batch_bf16, M, q_dim, r->n_embd, r->stream);
                     if (cl0->attn_k_w_bf16)
-                        mm_blaslt_run_bf16(r->d_k_batch, cl0->attn_k_w_bf16,
+                        gemm_run_bf16_w(r, r->d_k_batch, cl0->attn_k_w_bf16,
                             r->d_xnorm_batch_bf16, M, kv_dim, r->n_embd, r->stream);
                     if (cl0->attn_v_w_bf16)
-                        mm_blaslt_run_bf16(r->d_v_batch, cl0->attn_v_w_bf16,
+                        gemm_run_bf16_w(r, r->d_v_batch, cl0->attn_v_w_bf16,
                             r->d_xnorm_batch_bf16, M, kv_dim, r->n_embd, r->stream);
                     if (cl0->attn_output_w_bf16)
-                        mm_blaslt_run_bf16(r->d_attn_proj_batch, cl0->attn_output_w_bf16,
+                        gemm_run_bf16_w(r, r->d_attn_proj_batch, cl0->attn_output_w_bf16,
                             r->d_attn_out_batch_bf16, M, r->n_embd, q_dim, r->stream);
                     if (cl0->ffn_gate_w_bf16)
-                        mm_blaslt_run_bf16(r->d_gate_batch, cl0->ffn_gate_w_bf16,
+                        gemm_run_bf16_w(r, r->d_gate_batch, cl0->ffn_gate_w_bf16,
                             r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
                     if (cl0->ffn_up_w_bf16)
-                        mm_blaslt_run_bf16(r->d_up_batch, cl0->ffn_up_w_bf16,
+                        gemm_run_bf16_w(r, r->d_up_batch, cl0->ffn_up_w_bf16,
                             r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
                     if (cl0->ffn_down_w_bf16)
-                        mm_blaslt_run_bf16(r->d_down_batch, cl0->ffn_down_w_bf16,
+                        gemm_run_bf16_w(r, r->d_down_batch, cl0->ffn_down_w_bf16,
                             r->d_silu_batch_bf16, M, r->n_embd, r->n_ff, r->stream);
                 }
                 hipStreamSynchronize(r->stream);
@@ -6611,6 +6860,22 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
 
 #define LAUNCH(fn, gx, gy, gz, bx, by, bz, smem, stream, args) \
     hipModuleLaunchKernel(fn, gx, gy, gz, bx, by, bz, smem, stream, args, NULL)
+
+/* GEMM router: hipBLASLt or self-owned WMMA GEMM (LLM_GEMM=own / no-blaslt build).
+ * Drop-in for mm_blaslt_run_bf16: Y[M,N]f32 = X[M,K]bf16 x W[N,K]^T bf16. */
+static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
+                                  const void *X, int M, int N, int K, void *stream) {
+    if (!r->gemm_own)
+        return mm_blaslt_run_bf16(Y, W, X, M, N, K, stream);
+    void *args[] = { &Y, &W, &X, &N, &K, &M };
+    hipError_t err = LAUNCH(r->fn_gemm_bf16_own, (unsigned)((N + 127) / 128),
+                            (unsigned)((M + 127) / 128), 1, 256, 1, 1, 0,
+                            (hipStream_t)stream, args);
+    if (err != hipSuccess)
+        fprintf(stderr, "hip_llm: gemm_bf16_own launch failed (M=%d N=%d K=%d err=%d)\n",
+                M, N, K, (int)err);
+    return err == hipSuccess ? 0 : -1;
+}
 
 static inline void launch_embed(hip_llm_runner *r, void *dst, void *embd_table,
                                 int token_id, int n_embd) {
@@ -7586,7 +7851,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     /* 1. Router GEMM: [M,ne] = xnorm[M,n_embd] x Wg[ne,n_embd] (Wg is F32 -> bf16). */
     launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16_moe, r->d_xnorm_batch, M * n_embd);
     launch_pack_bf16_from_f32(r, r->d_router_w_bf16, cl->moe_gate_w, ne * n_embd);
-    if (mm_blaslt_run_bf16(r->d_router_logits_batch, r->d_router_w_bf16,
+    if (gemm_run_bf16_w(r, r->d_router_logits_batch, r->d_router_w_bf16,
                            r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
 
     /* 2. Host top-K + softmax per token, group assignments by expert. */
@@ -7622,9 +7887,44 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     launch_moe_gather(r, r->d_moe_gather_in, r->d_xnorm_batch, r->d_moe_gather_src, total, n_embd);
     hipMemsetAsync(r->d_moe_out_batch, 0, (size_t)M * n_embd * sizeof(float), r->stream);
 
-    /* 4. Per-expert fused QUANTIZED GEMMs (mmq): weight stays quantized, dequant
-     * amortized over the expert's token tile. Gate/up are IQ2_S, down is IQ3_S
-     * (mmq) or IQ4_XS (bf16 dequant+hipBLASLt fallback, 3 layers). */
+    /* 4. Per-expert GEMMs.
+     * own-GEMM path: dequant the expert weight to bf16 once and run the WMMA
+     * GEMM — far faster than scalar mmq, which re-reads x per output row
+     * (mmq measured 65% of prefill). mmq remains the blaslt-build fallback. */
+    int use_wmma_exp = r->gemm_own;
+    /* Grouped path (own GEMM): per weight type, ONE all-expert dequant + ONE grouped
+     * GEMM (blockIdx.z=expert). ~8 launches/layer vs ~1500 in the per-expert loop. */
+    if (use_wmma_exp && r->d_expw_bf16 &&
+        cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
+        cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
+        cl->moe_down_exps_type == GGML_TYPE_IQ3_S) {
+        launch_pack_bf16_from_f32(r, r->d_moe_gather_in_bf16, r->d_moe_gather_in, total * n_embd);
+        hipMemcpyAsync(r->d_moe_offs, offs, (size_t)(ne + 1) * sizeof(int),
+                       hipMemcpyHostToDevice, r->stream);
+        unsigned mtiles = (unsigned)((M + 127) / 128); /* covers max per-expert cnt */
+        long long sgu = (long long)cl->moe_exp_stride_gu;
+        long long sdn = (long long)cl->moe_exp_stride_d;
+        /* gate */
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_gate_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+          LAUNCH(r->fn_dequant_iq2s_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eg, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
+          LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        /* up */
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_up_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+          LAUNCH(r->fn_dequant_iq2s_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eu, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
+          LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
+        launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, total * eff);
+        /* down */
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn };
+          LAUNCH(r->fn_dequant_iq3s_all, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eout, &r->d_expw_bf16, &r->d_moe_esilu_bf16, &r->d_moe_offs, &n_embd, &eff };
+          LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        goto experts_done;
+    }
+    if (use_wmma_exp)
+        launch_pack_bf16_from_f32(r, r->d_moe_gather_in_bf16, r->d_moe_gather_in, total * n_embd);
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
         if (cnt == 0) continue;
@@ -7633,6 +7933,29 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         void *gate_w = (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
         void *up_w   = (char *)cl->moe_up_exps_w   + (size_t)e * cl->moe_exp_stride_gu;
         void *down_w = (char *)cl->moe_down_exps_w  + (size_t)e * cl->moe_exp_stride_d;
+        if (use_wmma_exp) {
+            void *xin_bf16 = (char *)r->d_moe_gather_in_bf16 + off * n_embd * 2;
+            void *gw = get_bf16_weight(r, gate_w, NULL, cl->moe_gate_exps_type,
+                                       cl->moe_exp_rows_gu, cl->moe_exp_cols_gu);
+            if (!gw) return -1;
+            if (gemm_run_bf16_w(r, (float *)r->d_moe_eg + off * eff, gw, xin_bf16,
+                                cnt, eff, n_embd, r->stream) != 0) return -1;
+            void *uw = get_bf16_weight(r, up_w, NULL, cl->moe_up_exps_type,
+                                       cl->moe_exp_rows_gu, cl->moe_exp_cols_gu);
+            if (!uw) return -1;
+            if (gemm_run_bf16_w(r, (float *)r->d_moe_eu + off * eff, uw, xin_bf16,
+                                cnt, eff, n_embd, r->stream) != 0) return -1;
+            launch_silu_mul(r, (float *)r->d_moe_eg + off * eff, (float *)r->d_moe_eu + off * eff, cnt * eff);
+            launch_pack_bf16_from_f32(r, (char *)r->d_moe_esilu_bf16 + off * eff * 2,
+                                      (float *)r->d_moe_eg + off * eff, cnt * eff);
+            void *dw = get_bf16_weight(r, down_w, NULL, cl->moe_down_exps_type,
+                                       cl->moe_exp_rows_d, cl->moe_exp_cols_d);
+            if (!dw) return -1;
+            if (gemm_run_bf16_w(r, (float *)r->d_moe_eout + off * n_embd, dw,
+                                (char *)r->d_moe_esilu_bf16 + off * eff * 2,
+                                cnt, n_embd, eff, r->stream) != 0) return -1;
+            continue;
+        }
         launch_mmq(r, (float *)r->d_moe_eg + off * eff, gate_w, xin, cnt, eff, n_embd, cl->moe_gate_exps_type);
         launch_mmq(r, (float *)r->d_moe_eu + off * eff, up_w,   xin, cnt, eff, n_embd, cl->moe_up_exps_type);
         launch_silu_mul(r, (float *)r->d_moe_eg + off * eff, (float *)r->d_moe_eu + off * eff, cnt * eff);
@@ -7643,35 +7966,36 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             launch_pack_bf16_from_f32(r, (char *)r->d_moe_esilu_bf16 + off * eff * 2, silu, cnt * eff);
             void *dw = get_bf16_weight(r, down_w, NULL, cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d);
             if (!dw) return -1;
-            if (mm_blaslt_run_bf16((float *)r->d_moe_eout + off * n_embd, dw,
+            if (gemm_run_bf16_w(r, (float *)r->d_moe_eout + off * n_embd, dw,
                                    (char *)r->d_moe_esilu_bf16 + off * eff * 2, cnt, n_embd, eff, r->stream) != 0) return -1;
         }
     }
 
+experts_done:
     /* 5. Scatter + weighted accumulate into d_moe_out_batch. */
     launch_moe_scatter_accum(r, r->d_moe_out_batch, r->d_moe_eout, r->d_moe_gather_src,
                              r->d_moe_gather_w, total, n_embd);
 
     /* 6. Shared expert (dense over all M): gate logit -> sigmoid -> gate/up/silu/down -> row-scale add. */
     launch_pack_bf16_from_f32(r, r->d_router_w_bf16, cl->moe_shared_gate_w, n_embd);
-    if (mm_blaslt_run_bf16(r->d_shared_scale_batch, r->d_router_w_bf16,
+    if (gemm_run_bf16_w(r, r->d_shared_scale_batch, r->d_router_w_bf16,
                            r->d_xnorm_batch_bf16_moe, M, 1, n_embd, r->stream) != 0) return -1;
     launch_sigmoid_inplace(r, r->d_shared_scale_batch, M);
     {
         void *sg = get_bf16_weight(r, cl->moe_shared_ffn_gate_w, NULL, cl->moe_shared_gate_type,
                                    cl->moe_shared_gate_rows, cl->moe_shared_gate_cols);
         if (!sg) return -1;
-        if (mm_blaslt_run_bf16(r->d_moe_eg, sg, r->d_xnorm_batch_bf16_moe, M, sff, n_embd, r->stream) != 0) return -1;
+        if (gemm_run_bf16_w(r, r->d_moe_eg, sg, r->d_xnorm_batch_bf16_moe, M, sff, n_embd, r->stream) != 0) return -1;
         void *su = get_bf16_weight(r, cl->moe_shared_ffn_up_w, NULL, cl->moe_shared_up_type,
                                    cl->moe_shared_up_rows, cl->moe_shared_up_cols);
         if (!su) return -1;
-        if (mm_blaslt_run_bf16(r->d_moe_eu, su, r->d_xnorm_batch_bf16_moe, M, sff, n_embd, r->stream) != 0) return -1;
+        if (gemm_run_bf16_w(r, r->d_moe_eu, su, r->d_xnorm_batch_bf16_moe, M, sff, n_embd, r->stream) != 0) return -1;
         launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, M * sff);
         launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, M * sff);
         void *sd = get_bf16_weight(r, cl->moe_shared_ffn_down_w, NULL, cl->moe_shared_down_type,
                                    cl->moe_shared_down_rows, cl->moe_shared_down_cols);
         if (!sd) return -1;
-        if (mm_blaslt_run_bf16(r->d_moe_eout, sd, r->d_moe_esilu_bf16, M, n_embd, sff, r->stream) != 0) return -1;
+        if (gemm_run_bf16_w(r, r->d_moe_eout, sd, r->d_moe_esilu_bf16, M, n_embd, sff, r->stream) != 0) return -1;
         launch_moe_row_scale_add(r, r->d_moe_out_batch, r->d_moe_eout, r->d_shared_scale_batch, M, n_embd);
     }
 
@@ -8142,7 +8466,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 void *_w = get_bf16_weight(r, cl->w_field, NULL,                          \
                                 cl->type_field, cl->rows_field, cl->cols_field);          \
                 if (!_w) return -1;                                                       \
-                if (mm_blaslt_run_bf16(dst, _w, r->d_xnorm_batch_bf16, M,                 \
+                if (gemm_run_bf16_w(r, dst, _w, r->d_xnorm_batch_bf16, M,                 \
                                        cl->rows_field, n_embd, r->stream) != 0) return -1;\
             } while(0)
             SSM_GEMM(r->d_ssm_qkv_batch,   ssm_qkv_w,   ssm_qkv_type,   ssm_qkv_rows,   ssm_qkv_cols);
@@ -8226,7 +8550,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 void *ow = get_bf16_weight(r, cl->ssm_out_w, NULL,
                                 cl->ssm_out_type, cl->ssm_out_rows, cl->ssm_out_cols);
                 if (!ow) return -1;
-                if (mm_blaslt_run_bf16(r->d_attn_proj_batch, ow,
+                if (gemm_run_bf16_w(r, r->d_attn_proj_batch, ow,
                                        r->d_silu_batch_bf16, M,
                                        n_embd, d_inner, r->stream) != 0) return -1;
             }
@@ -8247,7 +8571,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             if (!qw) return -1;
             int q_proj_rows = cl->attn_q_rows;  /* q_dim or 2*q_dim */
             void *q_dst = is_gated_attn ? r->d_qfull_batch : r->d_q_batch;
-            if (mm_blaslt_run_bf16(q_dst, qw,
+            if (gemm_run_bf16_w(r, q_dst, qw,
                                    r->d_xnorm_batch_bf16, M, q_proj_rows, n_embd, r->stream) != 0) return -1;
             if (is_gated_attn) {
                 launch_deinterleave_qgate_batch(r, r->d_q_batch, r->d_attn_gate_batch,
@@ -8258,14 +8582,14 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             void *kw = get_bf16_weight(r, cl->attn_k_w, cl->attn_k_w_bf16,
                                        cl->attn_k_type, cl->attn_k_rows, cl->attn_k_cols);
             if (!kw) return -1;
-            if (mm_blaslt_run_bf16(r->d_k_batch, kw,
+            if (gemm_run_bf16_w(r, r->d_k_batch, kw,
                                    r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
         }
         {
             void *vw = get_bf16_weight(r, cl->attn_v_w, cl->attn_v_w_bf16,
                                        cl->attn_v_type, cl->attn_v_rows, cl->attn_v_cols);
             if (!vw) return -1;
-            if (mm_blaslt_run_bf16(r->d_v_batch, vw,
+            if (gemm_run_bf16_w(r, r->d_v_batch, vw,
                                    r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
         }
 
@@ -8358,7 +8682,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             void *ow = get_bf16_weight(r, cl->attn_output_w, cl->attn_output_w_bf16,
                                        cl->attn_output_type, cl->attn_output_rows, cl->attn_output_cols);
             if (!ow) return -1;
-            if (mm_blaslt_run_bf16(r->d_attn_proj_batch, ow,
+            if (gemm_run_bf16_w(r, r->d_attn_proj_batch, ow,
                                    r->d_attn_out_batch_bf16, M, n_embd, q_dim, r->stream) != 0) return -1;
         }
 
@@ -8397,14 +8721,14 @@ ffn_section:
             void *gw = get_bf16_weight(r, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
                                        cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols);
             if (!gw) return -1;
-            if (mm_blaslt_run_bf16(r->d_gate_batch, gw,
+            if (gemm_run_bf16_w(r, r->d_gate_batch, gw,
                                    r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
         }
         {
             void *uw = get_bf16_weight(r, cl->ffn_up_w, cl->ffn_up_w_bf16,
                                        cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols);
             if (!uw) return -1;
-            if (mm_blaslt_run_bf16(r->d_up_batch, uw,
+            if (gemm_run_bf16_w(r, r->d_up_batch, uw,
                                    r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
         }
 
@@ -8418,7 +8742,7 @@ ffn_section:
             void *dw = get_bf16_weight(r, cl->ffn_down_w, cl->ffn_down_w_bf16,
                                        cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols);
             if (!dw) return -1;
-            if (mm_blaslt_run_bf16(r->d_down_batch, dw,
+            if (gemm_run_bf16_w(r, r->d_down_batch, dw,
                                    r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
         }
 
@@ -8524,7 +8848,7 @@ float *hip_llm_forward_batch_logits(hip_llm_runner *r,
         /* Chunk the batch: hipBLASLt/Tensile fails to build plans for this model's
          * large SSM/MoE GEMM shapes at M>256, so process the prefill in <=256-token
          * sub-batches. SSM conv/recurrent state and KV cache carry across chunks. */
-        int chunk = r->moe_prefill_batched ? 256 : n_tokens;
+        int chunk = r->moe_prefill_batched ? (r->gemm_own ? r->batch_max : 256) : n_tokens;
         { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { chunk = atoi(e); if (chunk < 1) chunk = n_tokens; } }
         for (int off = 0; off < n_tokens; off += chunk) {
             int cc = n_tokens - off; if (cc > chunk) cc = chunk;
@@ -8594,7 +8918,7 @@ float *hip_llm_forward_batch_embd(hip_llm_runner *r, const float *embds,
         /* Chunk to <=256 rows (Tensile plan limit for this model's GEMMs); SSM/KV
          * state carries across chunks. _ds_embd is offset per chunk so the layer
          * loop's deepstack slice indexing (local row m) maps to the global row. */
-        int chunk = r->moe_prefill_batched ? 256 : M;
+        int chunk = r->moe_prefill_batched ? (r->gemm_own ? r->batch_max : 256) : M;
         { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { chunk = atoi(e); if (chunk < 1) chunk = M; } }
         for (int off = 0; off < M; off += chunk) {
             int cc = M - off; if (cc > chunk) cc = chunk;
