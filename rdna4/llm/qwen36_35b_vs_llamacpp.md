@@ -43,10 +43,18 @@ output unchanged (VLM still identifies Mt. Fuji).
   Restructuring to one lane/thread per element-group restored full occupancy:
   Q6_K (LM head + shared + attn, 43% of decode) 424→213 ms in the trace.
 - **Remaining hotspots**: `matvec_iq3_s_expert` 25%, `matvec_iq2_s_expert` 15% are
-  **compute-bound on grid-lookup dequant + per-element sign branches** (running at
-  ~3% of mem BW). Next lever = port llama.cpp's `vec_dot_iq{2,3}_s_q8_1` (q8_1
-  activation + DP4A integer dot + branchless SIMD sign via XOR/subtract), and/or
-  cache the iq2s/iq3s grids in `__constant__`/LDS. `deltanet_step_f32` is 9%.
+  **compute-bound on grid-lookup dequant + per-element sign handling** (running at
+  ~3% of mem BW). `deltanet_step_f32` is 9%.
+
+**DP4A port (commit 8472584) — tried, NEGATIVE, gated off.** Ported llama.cpp's
+int8-dot (`quantize_q8_32` per-32-block q8 activation + `__builtin_amdgcn_sudot4`,
+half-split for full lane occupancy). Validated correct (rel_l2 vs float ref: IQ2_S
+1.6e-3, IQ3_S 4.7e-3 = pure q8-activation error). But **44.6 vs 45.4 tok/s — ~2%
+slower**: these IQ matvecs are grid-lookup-dequant bound, not multiply bound, so
+DP4A (accelerates only the MAC) + q8-quantize + scalar sign-build is a net loss.
+Default `LLM_DECODE_DP4A=0`; F32 full-util kernels stay the decode path. To actually
+speed IQ2_S/IQ3_S one must cut the grid-lookup cost (LDS-cached grids — untried) or
+do SIMD sign (`__vsub4`/`__vcmpne4` are absent under HIPRTC).
 
 ## VLM (image) — fujisan_1024.png, 672 vision tokens, prompt "Describe this image in detail."
 
