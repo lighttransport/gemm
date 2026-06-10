@@ -46,6 +46,7 @@ static int mm_blaslt_run_bf16(void *y, const void *w, const void *x,
                               int M, int N, int K, void *stream) {
     (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
 }
+static void mm_blaslt_destroy(void) {}
 #define LLM_HIPBLASLT_ENABLED 1   /* compile the batched path unconditionally */
 #endif
 
@@ -4258,6 +4259,60 @@ static const char *hip_kernel_source =
 "        }\n"
 "    }\n"
 "}\n"
+"/* Batch top-K + softmax: one block per token. */\n"
+"__global__ void moe_topk_batch(const float *logits /*[M,ne]*/, int ne, int K,\n"
+"                                 int *tok_idx /*[M,K]*/, float *tok_w /*[M,K]*/) {\n"
+"    int m = blockIdx.x; int tid = threadIdx.x;\n"
+"    const float *lg = logits + (size_t)m * ne;\n"
+"    __shared__ float sval[256];\n"
+"    __shared__ int   sidx[256];\n"
+"    __shared__ int   chosen[64];\n"
+"    float my = (tid < ne) ? lg[tid] : -1e30f;\n"
+"    int *oi = tok_idx + (size_t)m * K; float *ow = tok_w + (size_t)m * K;\n"
+"    for (int ki = 0; ki < K; ki++) {\n"
+"        float v = my;\n"
+"        for (int j = 0; j < ki; j++) if (chosen[j] == tid) v = -1e30f;\n"
+"        sval[tid] = v; sidx[tid] = tid; __syncthreads();\n"
+"        for (int s = 128; s > 0; s >>= 1) {\n"
+"            if (tid < s && tid + s < 256) {\n"
+"                if (sval[tid+s] > sval[tid]) { sval[tid]=sval[tid+s]; sidx[tid]=sidx[tid+s]; }\n"
+"                else if (sval[tid+s] == sval[tid] && sidx[tid+s] < sidx[tid]) sidx[tid]=sidx[tid+s];\n"
+"            } __syncthreads();\n"
+"        }\n"
+"        if (tid == 0) { chosen[ki]=sidx[0]; oi[ki]=sidx[0]; ow[ki]=sval[0]; }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) {\n"
+"        float mx = ow[0]; for (int i=1;i<K;i++) if (ow[i]>mx) mx=ow[i];\n"
+"        float sum=0; for (int i=0;i<K;i++){ ow[i]=expf(ow[i]-mx); sum+=ow[i]; }\n"
+"        float inv=1.0f/sum; for (int i=0;i<K;i++) ow[i]*=inv;\n"
+"    }\n"
+"}\n"
+"/* Count per-expert assignments + exclusive prefix into offs (1 block, ne<=1024). */\n"
+"__global__ void moe_count_offs(const int *tok_idx, int M, int K, int ne,\n"
+"                                 int *offs /*[ne+1]*/, int *cursor /*[ne]*/) {\n"
+"    __shared__ int cnt[1024];\n"
+"    int tid = threadIdx.x;\n"
+"    for (int e = tid; e < ne; e += blockDim.x) cnt[e] = 0;\n"
+"    __syncthreads();\n"
+"    for (int t = tid; t < M * K; t += blockDim.x) atomicAdd(&cnt[tok_idx[t]], 1);\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        int acc = 0;\n"
+"        for (int e = 0; e < ne; e++) { offs[e] = acc; cursor[e] = acc; acc += cnt[e]; }\n"
+"        offs[ne] = acc;\n"
+"    }\n"
+"}\n"
+"/* Scatter assignments into expert-grouped order via atomic cursor. */\n"
+"__global__ void moe_fill_gather(const int *tok_idx, const float *tok_w, int M, int K,\n"
+"                                  int *cursor, int *gsrc, float *gw) {\n"
+"    int t = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (t >= M * K) return;\n"
+"    int e = tok_idx[t];\n"
+"    int p = atomicAdd(&cursor[e], 1);\n"
+"    gsrc[p] = t / K;\n"
+"    gw[p]   = tok_w[t];\n"
+"}\n"
 "/* Grouped GEMM: per expert e, Y[offs[e]..offs[e+1], 0..N) = X[offs[e].., K] x W_e^T. */\n"
 "__global__ void gemm_bf16_grouped(float *Y, const bf16_raw *Wall, const bf16_raw *X,\n"
 "                                  const int *offs, int N, int K) {\n"
@@ -5214,8 +5269,14 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_iq2s_all;      /* all-expert dequant (grouped prefill) */
     hipFunction_t fn_dequant_iq3s_all;
     hipFunction_t fn_gemm_bf16_grouped;     /* per-expert grouped WMMA GEMM */
+    hipFunction_t fn_moe_topk_batch;
+    hipFunction_t fn_moe_count_offs;
+    hipFunction_t fn_moe_fill_gather;
     void *d_expw_bf16;                      /* [ne*rows*cols] bf16 staging (one type) */
     int  *d_moe_offs;                       /* [ne+1] device expert offsets */
+    int  *d_tok_idx;                        /* [Mmax*K] per-token expert idx (GPU group) */
+    float *d_tok_w;                         /* [Mmax*K] per-token softmax w */
+    int  *d_cursor;                         /* [ne] scatter cursor */
     int moe_fused_decode;            /* LLM_MOE_FUSED (default on if types match) */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
@@ -5564,6 +5625,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
     GET_FUNC(gemm_bf16_grouped);
+    GET_FUNC(moe_topk_batch);
+    GET_FUNC(moe_count_offs);
+    GET_FUNC(moe_fill_gather);
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
@@ -5685,8 +5749,8 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     { const char *e = getenv("LLM_MOE_FUSED"); if (e) r->moe_fused_decode = atoi(e) != 0; }
     r->ssm_fused_decode = 1;
     { const char *e = getenv("LLM_SSM_FUSED"); if (e) r->ssm_fused_decode = atoi(e) != 0; }
-    r->gemm_own = 0;
-    { const char *e = getenv("LLM_GEMM"); if (e && strcmp(e, "own") == 0) r->gemm_own = 1; }
+    r->gemm_own = 1;  /* self-owned WMMA GEMM default (faster than blaslt path) */
+    { const char *e = getenv("LLM_GEMM"); if (e && strcmp(e, "blaslt") == 0) r->gemm_own = 0; }
     {
         const size_t QCAP = 8192;
         if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
@@ -6722,6 +6786,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                     size_t sz = gu > dn ? gu : dn;
                     CHECK_HIP(hipMalloc(&r->d_expw_bf16, sz));
                     CHECK_HIP(hipMalloc(&r->d_moe_offs, (size_t)(ne + 1) * sizeof(int)));
+                    CHECK_HIP(hipMalloc(&r->d_tok_idx, TA * sizeof(int)));
+                    CHECK_HIP(hipMalloc(&r->d_tok_w,   TA * sizeof(float)));
+                    CHECK_HIP(hipMalloc(&r->d_cursor,  (size_t)ne * sizeof(int)));
                     if (r->verbose >= 1)
                         fprintf(stderr, "hip_llm: grouped-expert staging %.0f MB\n", sz / 1048576.0);
                 }
@@ -7854,34 +7921,49 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     if (gemm_run_bf16_w(r, r->d_router_logits_batch, r->d_router_w_bf16,
                            r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
 
-    /* 2. Host top-K + softmax per token, group assignments by expert. */
-    hipMemcpyAsync(r->h_router_batch, r->d_router_logits_batch,
-                   (size_t)M * ne * sizeof(float), hipMemcpyDeviceToHost, r->stream);
-    hipStreamSynchronize(r->stream);
+    /* 2. Top-K + softmax per token, group assignments by expert.
+     * GPU grouping (no host sync) on the grouped path; host fallback otherwise. */
+    int total = M * K;
     int *offs = r->h_moe_offsets;
-    for (int e = 0; e <= ne; e++) offs[e] = 0;
-    for (int m = 0; m < M; m++) {
-        moe_topk_softmax(r->h_router_batch + (size_t)m * ne, ne, K,
-                         r->h_moe_tok_idx + (size_t)m * K, r->h_moe_tok_w + (size_t)m * K);
-        for (int k = 0; k < K; k++) offs[r->h_moe_tok_idx[(size_t)m * K + k] + 1]++;
+    int gpu_group = r->gemm_own && r->d_tok_idx &&
+        cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
+        cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
+        cl->moe_down_exps_type == GGML_TYPE_IQ3_S;
+    if (gpu_group) {
+        { void *a[] = { &r->d_router_logits_batch, &ne, &K, &r->d_tok_idx, &r->d_tok_w };
+          LAUNCH(r->fn_moe_topk_batch, M, 1, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_tok_idx, &M, &K, &ne, &r->d_moe_offs, &r->d_cursor };
+          LAUNCH(r->fn_moe_count_offs, 1, 1, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_tok_idx, &r->d_tok_w, &M, &K, &r->d_cursor,
+                        &r->d_moe_gather_src, &r->d_moe_gather_w };
+          LAUNCH(r->fn_moe_fill_gather, (M * K + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a); }
+    } else {
+        hipMemcpyAsync(r->h_router_batch, r->d_router_logits_batch,
+                       (size_t)M * ne * sizeof(float), hipMemcpyDeviceToHost, r->stream);
+        hipStreamSynchronize(r->stream);
+        for (int e = 0; e <= ne; e++) offs[e] = 0;
+        for (int m = 0; m < M; m++) {
+            moe_topk_softmax(r->h_router_batch + (size_t)m * ne, ne, K,
+                             r->h_moe_tok_idx + (size_t)m * K, r->h_moe_tok_w + (size_t)m * K);
+            for (int k = 0; k < K; k++) offs[r->h_moe_tok_idx[(size_t)m * K + k] + 1]++;
+        }
+        for (int e = 0; e < ne; e++) offs[e + 1] += offs[e];
+        {
+            int cursor[1024];
+            for (int e = 0; e < ne; e++) cursor[e] = offs[e];
+            for (int m = 0; m < M; m++)
+                for (int k = 0; k < K; k++) {
+                    int e = r->h_moe_tok_idx[(size_t)m * K + k];
+                    int p = cursor[e]++;
+                    r->h_moe_gather_src[p] = m;
+                    r->h_moe_gather_w[p]   = r->h_moe_tok_w[(size_t)m * K + k];
+                }
+        }
+        hipMemcpyAsync(r->d_moe_gather_src, r->h_moe_gather_src, (size_t)total * sizeof(int),
+                       hipMemcpyHostToDevice, r->stream);
+        hipMemcpyAsync(r->d_moe_gather_w, r->h_moe_gather_w, (size_t)total * sizeof(float),
+                       hipMemcpyHostToDevice, r->stream);
     }
-    for (int e = 0; e < ne; e++) offs[e + 1] += offs[e];
-    int total = offs[ne];
-    {
-        int cursor[1024];
-        for (int e = 0; e < ne; e++) cursor[e] = offs[e];
-        for (int m = 0; m < M; m++)
-            for (int k = 0; k < K; k++) {
-                int e = r->h_moe_tok_idx[(size_t)m * K + k];
-                int p = cursor[e]++;
-                r->h_moe_gather_src[p] = m;
-                r->h_moe_gather_w[p]   = r->h_moe_tok_w[(size_t)m * K + k];
-            }
-    }
-    hipMemcpyAsync(r->d_moe_gather_src, r->h_moe_gather_src, (size_t)total * sizeof(int),
-                   hipMemcpyHostToDevice, r->stream);
-    hipMemcpyAsync(r->d_moe_gather_w, r->h_moe_gather_w, (size_t)total * sizeof(float),
-                   hipMemcpyHostToDevice, r->stream);
 
     /* 3. Gather activations grouped by expert (f32, fed straight to mmq). */
     launch_moe_gather(r, r->d_moe_gather_in, r->d_xnorm_batch, r->d_moe_gather_src, total, n_embd);
@@ -7899,8 +7981,9 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
         cl->moe_down_exps_type == GGML_TYPE_IQ3_S) {
         launch_pack_bf16_from_f32(r, r->d_moe_gather_in_bf16, r->d_moe_gather_in, total * n_embd);
-        hipMemcpyAsync(r->d_moe_offs, offs, (size_t)(ne + 1) * sizeof(int),
-                       hipMemcpyHostToDevice, r->stream);
+        if (!gpu_group)
+            hipMemcpyAsync(r->d_moe_offs, offs, (size_t)(ne + 1) * sizeof(int),
+                           hipMemcpyHostToDevice, r->stream);
         unsigned mtiles = (unsigned)((M + 127) / 128); /* covers max per-expert cnt */
         long long sgu = (long long)cl->moe_exp_stride_gu;
         long long sdn = (long long)cl->moe_exp_stride_d;
