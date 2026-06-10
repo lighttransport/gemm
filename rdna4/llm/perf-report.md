@@ -5,6 +5,15 @@ full session arc: dense F16 prefill tuning (Track A), K-quant + IQ batched
 prefill (Track B1/B2), hybrid-SSM dispatcher + batched SSM projections, four
 IQ dequant kernels, and the VLM e2e batched-embed wiring.
 
+> **2026-06-10 update:** sections 1–7 below predate the Qwen3.6-35B-A3B
+> vs-llama.cpp campaign. See **section 8** for the current state — the runner
+> now BEATS llama.cpp ROCm on every metric (pp512 1055/902, pp1024 1536/883,
+> tg128 128.5/83) with a fully self-owned GEMM (no hipBLASLt). Several
+> "remaining opportunities" below have since landed in much stronger form
+> (Opp A superseded by warp-per-row deltanet; Opp E superseded by full hybrid
+> graph capture; Opp C landed for SSM weights; head_dim=256 FA landed).
+> Benchmark table: `qwen36_35b_vs_llamacpp.md`.
+
 ## 1. vs PyTorch ROCm reference — Qwen3-VL-2B F16
 
 Same model weights, same GPU, BF16/F16. PyTorch via `transformers 5.4.0` +
@@ -234,4 +243,87 @@ cd rdna4/vlm
 rocprofv3 --kernel-trace -d /tmp/prof -f csv -- \
   ./test_hip_llm /mnt/disk1/models/qwen36/27b/Qwen3.6-27B-UD-IQ3_XXS.gguf \
   --bench --gpu-only-bench --prefill-len 256 --decode 4
+```
+
+## 8. Qwen3.6-35B-A3B campaign — beating llama.cpp ROCm (2026-06-10)
+
+Target model: `Qwen3.6-35B-A3B-UD-IQ3_S.gguf` (12.73 GiB, arch `qwen35moe`:
+30 Delta-Net SSM + 10 gated-attn layers, 256-expert/8-used MoE on all 40,
+n_embd 2048, head_dim 256, vocab 248 320). Reference: llama.cpp ROCm
+`build_rocm722_rdna4_fa`, build 549b9d843, `-fa on`. Same GPU.
+
+### 8.1 Final numbers
+
+| metric | session start | final | llama.cpp | margin |
+|--------|--------------:|------:|----------:|-------:|
+| prefill pp512  | 31.2 t/s | **1055 t/s** | 902 t/s | **1.17×** |
+| prefill pp1024 | 30.9 t/s | **1536 t/s** | 883 t/s | **1.74×** |
+| decode tg128   | 28.7 t/s | **128.5 t/s** | 83.0 t/s | **1.55×** |
+| vision prefill (672 tok) | 33.9 ms/tok | **1.22 ms/tok** | — | 28× |
+
+Cumulative: prefill 50×, decode 4.5×. Every step bit-exact
+(`--verify-quant-kernels` 18/18) and output-preserving (greedy tokens stable;
+VLM still identifies Mt. Fuji on fujisan_1024.png). Defaults all-on; the
+`HIPBLASLT=0` build runs the identical batched path on the self-owned GEMM.
+
+### 8.2 Roofline (why 128.5 is ~61% of practical peak)
+
+Weights+state read per decoded token: **2.15 GB** = LM head Q6_K 417 MB +
+30 SSM layers × 41.5 MB + 10 attn layers × 36 MB + SSM state R/W 126 MB.
+At 600 GB/s board peak → 280 t/s; at realistic ~75% stream efficiency →
+**~210 t/s**. Final decode kernel sum 7.1 ms/tok + ~0.7 ms graph replay
+overhead. `ssm_matvec4_q6k` runs at 505 GB/s (at BW); Q6_K class near BW;
+the residual is IQ2_S/IQ3_S grid-dequant (compute-bound, ~1.8 ms), router
+top-K serialization (0.66 ms), and ~1.1 ms of small ops.
+
+### 8.3 Decode wins, in order (29 → 128.5 tok/s)
+
+| tok/s | change |
+|------:|--------|
+| 29→36 | GPU-side sync-free MoE dispatch (device top-K/softmax/sigmoid; expert-indexed matvecs) + HIP graph capture for hybrid MoE decode |
+| 36→45.5 | full warp/thread utilization in IQ2_S/IQ3_S/Q6_K matvecs (old kernels strided K by n_blocks; 6–25% lanes active on nb=2–8 shapes) |
+| 45→73 | fused all-expert decode MoE: gate+up+SiLU for all 8 experts in one launch (`blockIdx.y`=slot), down+weighted-accum in one |
+| 73→75 | fused SSM aux chain `ssm_prep_f32` (conv+SiLU+state, L2 norm, repeat-tile, softplus, sigmoid: 7→1) |
+| 75→78 | fused SSM 4-matvec `ssm_matvec4_q6k` (qkv+z+alpha+beta) + attn q/k/v fusion + residual+rmsnorm |
+| 78→83 | shared expert folded as slot K of the MoE kernels (Q6_K branch) + accum-zero in slot 0 |
+| 83→87 | `moe_router_fused`: all 256 router logits + shared-gate sigmoid in one grid; **last-finished block** (atomic+threadfence) runs top-K inline. MoE layer = 3 launches |
+| 87→102 | **warp-per-row deltanet**: was 32 blk × 128 thr (1 wave/CU, 68 GB/s, 4 serial passes); now 4 lanes/row × 32 cols in regs, single fused pass, float4 IO, shfl reductions |
+| 102→115 | `q6k_dot4`: vectorized Q6_K dot (dword ql/qh via memcpy on 2-aligned blocks + float4 x) in all six Q6_K kernels |
+| 115→116 | bf16 router weights (84→42 MB/tok; revealed router is latency- not BW-bound) |
+| 116→127 | IQ4_XS dtype slot in fused down — the 3 IQ4_XS layers had been ~40 per-expert launches each |
+| 127→128.5 | cross-layer fusion: MoE residual add folded into next layer's pre-attn rmsnorm |
+
+Decode is **launch-count bound, not bandwidth bound** (LM head was already at
+370 GB/s before any of this). Every win = fewer, fatter launches.
+
+### 8.4 Prefill wins (31 → 1536 tok/s @1024)
+
+1. Decode kernels carried per-token prefill 31→48 free.
+2. Fused quantized MoE GEMM (`mmq_iq2s/iq3s`) + the dispatch fix (MoE-aware
+   eligibility; F32 SSM weights batchable): 48→400. Tensile fails at M>256 →
+   chunked.
+3. Self-owned 128×128 WMMA bf16 GEMM (`gemm_bf16_own`, 256 thr) — beats
+   Tensile at chunk 256, removes the M>256 cap → chunk 1024: 400→445.
+4. Grouped all-expert dequant + grouped GEMM (`blockIdx.z`=expert) replaced
+   scalar mmq (65% of prefill): 445→772.
+5. GPU top-K/histogram/scatter (no per-layer host sync): 772→1001.
+6. Vectorized 16B GEMM tile fills: 1001→1285.
+7. Warp-per-row batch deltanet (state in regs across M): 1285→1536.
+
+### 8.5 Negatives (gated, don't retry)
+
+DP4A q8 IQ decode matvec (grid-dequant bound, ~2% slower); LDS-cached IQ
+grids (~1%); `__constant__` grids; Q6_K 128-thr; per-row batched MoE prefill;
+dequant→bf16+hipBLASLt per-expert experts (16–32 tok/expert too thin);
+single-block fused router (serial dots, −16%).
+
+### 8.6 Reproduce
+
+```sh
+cd rdna4/llm && make            # HIPBLASLT=0 for the no-blaslt build
+M=/mnt/disk1/models/qwen36/35b/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
+LLM_PREFILL_WARMUP=2 ./test_hip_llm $M -s 1300 --bench --gpu-only-bench \
+  --prefill-len 1024 --decode 128         # pp ~1536, tg ~128.5
+./test_hip_llm --verify-quant-kernels     # 18/18 PASS
+# llama.cpp: llama-bench -m $M --device ROCm0 -ngl 99 -fa on -p 512,1024 -n 128
 ```
