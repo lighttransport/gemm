@@ -29,6 +29,7 @@
 
 __constant__ uint64_t c_grid[256];
 __constant__ uint8_t  c_ksigns[128];
+__constant__ uint64_t c_signmask[128];  /* per 7-bit index: 8 bytes, each 0x00 or 0xFF */
 __device__ static float h2f_dev(uint16_t h){ return __half2float(*(const __half*)&h); }
 __device__ __forceinline__ int pack4(const int8_t*p){ return (p[0]&0xff)|((p[1]&0xff)<<8)|((p[2]&0xff)<<16)|((p[3]&0xff)<<24); }
 
@@ -417,6 +418,73 @@ __global__ void mmq_iq2xxs_grouped_v7(float *out, const uint8_t *W, unsigned lon
     }
 }
 
+/* grouped MMQ v8: v6 + BRANCHLESS vectorized sign application. The decode's per-byte
+   sign-multiply `(int)g[j]*((s&(1<<j))?-1:1)` over j<8 (~4-5 inst/elem, 8 byte stores)
+   is the decode-ALU bottleneck (kernel sits ~3% of int8-TC peak). Replace with a
+   two's-complement negate via __vsub4: (g^0xFF)-0xFF = -g, (g^0)-0 = g, per byte, using
+   a precomputed 8-byte 0x00/0xFF sign mask staged in shared. ~8 inst + 2 word stores for
+   the same 8 bytes. Bit-exact. */
+__global__ void mmq_iq2xxs_grouped_v8(float *out, const uint8_t *W, unsigned long long estride,
+                                       const signed char *cxq8, const float *cxs, const int *ebounds,
+                                       const int *worklist, int N, int K) {
+    __shared__ uint64_t sGrid[256]; __shared__ uint64_t sSignMask[128];
+    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=c_grid[i];
+    for (int i=threadIdx.x;i<128;i+=blockDim.x) sSignMask[i]=c_signmask[i];
+    int packed = worklist[blockIdx.y];
+    int e = packed >> 16, g0 = packed & 0xffff;
+    int eb0 = ebounds[e], eb1 = ebounds[e+1];
+    int m_base = eb0 + g0 * (8*TG);
+    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int gid = lane>>2, tid = lane&3;
+    int n0 = blockIdx.x*64 + warp*16;
+    int nb = K/256, row_bytes = nb*66, nsb = K/32;
+    const uint8_t *We = W + (size_t)e*estride;
+    __shared__ signed char sX[8*TG][32]; __shared__ float sXs[8*TG];
+    __shared__ signed char sW[64][32]; __shared__ float sWs[64];
+    float f[TG][4]; for(int g=0;g<TG;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}
+    __syncthreads();
+    for (int sb=0; sb<nsb; sb++) {
+        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;
+            const uint8_t *bp=We+(size_t)n*row_bytes+(sb/8)*66;
+            float d=h2f_dev(*(const uint16_t*)bp); const uint16_t *qs=(const uint16_t*)(bp+2); int ib=sb&7;
+            uint32_t a0=(uint32_t)qs[4*ib]|((uint32_t)qs[4*ib+1]<<16);
+            uint32_t a1=(uint32_t)qs[4*ib+2]|((uint32_t)qs[4*ib+3]<<16);
+            if (half==0) sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;
+            for(int l=half*2; l<half*2+2; l++){ uint8_t idx=(a0>>(8*l))&255;
+                uint64_t gv=sGrid[idx], m=sSignMask[(a1>>(7*l))&127];
+                uint32_t glo=(uint32_t)gv, ghi=(uint32_t)(gv>>32);
+                uint32_t mlo=(uint32_t)m,  mhi=(uint32_t)(m>>32);
+                *(uint32_t*)&sW[r][l*8]   = __vsub4(glo^mlo, mlo);
+                *(uint32_t*)&sW[r][l*8+4] = __vsub4(ghi^mhi, mhi); } }
+        for (int i=threadIdx.x;i<ntg*8*32;i+=blockDim.x){ int t=i/32,kk=i%32,m=m_base+t;
+            sX[t][kk]=(m<eb1)?cxq8[(size_t)m*K+sb*32+kk]:0; }
+        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }
+        __syncthreads();
+        int wr=warp*16;
+        int a0=pack4(&sW[wr+gid][tid*4]), a1=pack4(&sW[wr+gid+8][tid*4]);
+        int a2=pack4(&sW[wr+gid][tid*4+16]), a3=pack4(&sW[wr+gid+8][tid*4+16]);
+        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];
+        for (int g=0; g<ntg; g++) {
+            int b0=pack4(&sX[g*8+gid][tid*4]), b1=pack4(&sX[g*8+gid][tid*4+16]);
+            int c0=0,c1=0,c2=0,c3=0;
+            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                :"=r"(c0),"=r"(c1),"=r"(c2),"=r"(c3)
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(0),"r"(0),"r"(0),"r"(0));
+            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];
+            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;
+            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;
+        }
+        __syncthreads();
+    }
+    int n_a=n0+gid, n_b=n0+gid+8;
+    for (int g=0; g<ntg; g++) {
+        int m_a=m_base+g*8+tid*2, m_b=m_a+1;
+        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }
+        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }
+    }
+}
+
 /* ---- weighted scatter: final[token] += wgt[c] * out_compact[c] ---- */
 __global__ void scatter_weighted(float *final_out, const float *out_compact, const int *ids_token,
                                   const float *cw, int total_rows, int N) {
@@ -476,6 +544,10 @@ int main(int argc,char**argv){
     /* ---- device pipeline ---- */
     CUDA_CHECK(cudaMemcpyToSymbol(c_grid,iq2xxs_grid,sizeof(iq2xxs_grid)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_ksigns,ksigns_iq2xs,sizeof(ksigns_iq2xs)));
+    uint64_t signmask[128];
+    for(int i=0;i<128;i++){ uint8_t s=ksigns_iq2xs[i]; uint64_t m=0;
+        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(uint64_t)0xFF<<(8*j); signmask[i]=m; }
+    CUDA_CHECK(cudaMemcpyToSymbol(c_signmask,signmask,sizeof(signmask)));
     uint8_t *dW; float *dX,*dCxs,*dOutC,*dFinal,*dCw; int8_t *dCxq; int *dIdsTok,*dEbounds;
     CUDA_CHECK(cudaMalloc(&dW,(size_t)n_experts*estride));
     CUDA_CHECK(cudaMalloc(&dX,(size_t)n_tokens*K*sizeof(float)));
@@ -596,6 +668,20 @@ int main(int argc,char**argv){
         printf("grouped v7 (coalesced tile, smem=%dB): %.3f ms  (%.2fx vs v6, %.2fx vs v1)\n", smem7, m7, m6/m7, m1/m7);
         printf("v7 vs v1 out_compact: rel_L2 = %.6f  (expect ~0)\n", ev7);
         ok = ok && (ev7<1e-4);
+
+        /* ---- v8: v6 + branchless vectorized sign application (__vsub4) ---- */
+        float *dOutC8; CUDA_CHECK(cudaMalloc(&dOutC8,(size_t)total*N*sizeof(float)));
+        CUDA_CHECK(cudaMemset(dOutC8,0,(size_t)total*N*sizeof(float)));
+        mmq_iq2xxs_grouped_v8<<<gg5,128>>>(dOutC8,dW,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+        CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        float *oc8=(float*)malloc((size_t)total*N*sizeof(float));
+        CUDA_CHECK(cudaMemcpy(oc8,dOutC8,(size_t)total*N*sizeof(float),cudaMemcpyDeviceToHost));
+        double ev8=rel_l2(oc8,oc1,total*N);
+        cudaEventRecord(t0); for(int i=0;i<it;i++) mmq_iq2xxs_grouped_v8<<<gg5,128>>>(dOutC8,dW,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+        cudaEventRecord(t1); cudaEventSynchronize(t1); float m8; cudaEventElapsedTime(&m8,t0,t1); m8/=it;
+        printf("grouped v8 (branchless decode): %.3f ms  (%.2fx vs v6, %.2fx vs v1)\n", m8, m6/m8, m1/m8);
+        printf("v8 vs v1 out_compact: rel_L2 = %.6f  (expect ~0)\n", ev8);
+        ok = ok && (ev8<1e-4);
     }
     printf("%s\n", ok?"PASS (mul_mat_id mechanics correct)":"FAIL");
     return ok?0:1;
