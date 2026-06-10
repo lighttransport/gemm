@@ -21,7 +21,12 @@ prefill, commits 0abc74a…611432c). All defaults; **no hipBLASLt dependency**
 | ------ | ---------: | ------: | --------: | -----------: |
 | pp512  |  31.2 t/s | **921 t/s**  | 902 t/s | **1.02× FASTER** |
 | pp1024 |  30.9 t/s | **1290 t/s** | 883 t/s | **1.46× FASTER** |
-| tg128  |  28.7 t/s | **77.6 t/s** |  83 t/s | 0.94× |
+| tg128  |  28.7 t/s | **87.2 t/s** |  83 t/s | **1.05× FASTER** |
+
+**All three metrics beat llama.cpp.** Decode endgame (83.1→87.2): fold shared expert
+(Q6_K) + accumulator-zero into the fused MoE kernels (slot K), then fuse router+topK+
+shared-gate into one launch via the last-block pattern (atomic counter + threadfence,
+last block runs topK+softmax inline). A decode MoE layer = 3 launches.
 
 Final round: vectorized 16B GEMM tile loads (pp1024 1001→1285), fused SSM 4-matvec +
 attn q/k/v + residual+rmsnorm decode launches (decode 75.7→77.6). Negative: fused
