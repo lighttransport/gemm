@@ -3436,142 +3436,6 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "/* ======================================================================== */\n"
-"/* Gather F32 rows, quantize each 32-block to INT8+Q8_1 scale (one warp). */\n"
-"/* out_q[t*N+j] = quantize8(in[src[t]*N+j]), grid=(N/32,total,1), block=32 */\n"
-"__global__ void gather_quant_q8_1(signed char *out_q, float *out_s,\n"
-"        const float *in, const int *gather_src, int N, int total) {\n"
-"    int gj = blockIdx.x; int asgn = blockIdx.y; int lane = threadIdx.x;\n"
-"    int src = gather_src[asgn];\n"
-"    int j0 = gj * 32 + lane;\n"
-"    float v = (j0 < N) ? in[(size_t)src * N + j0] : 0.0f;\n"
-"    float a = fabsf(v);\n"
-"    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_down(a, o));\n"
-"    a = __shfl(a, 0);\n"
-"    float inv = (a > 0.0f) ? 127.0f / a : 0.0f;\n"
-"    if (lane == 0) out_s[(size_t)asgn * (N / 32) + gj] = a / 127.0f;\n"
-"    if (j0 < N) {\n"
-"        int q = (int)rintf(v * inv);\n"
-"        q = q > 127 ? 127 : (q < -127 ? -127 : q);\n"
-"        out_q[(size_t)asgn * N + j0] = (signed char)q;\n"
-"    }\n"
-"}\n"
-"/* Grouped MMQ for IQ2_S: direct quantized grouped GEMM via DP4A (gfx12).   */\n"
-"/* Grid(N/64,mtiles,ne) x128 thr. 2 lanes/row, 4 tokens/lane, 8 tokens/row. */\n"
-"__global__ void mmq_iq2s_grouped(float *Y, const unsigned char *W_base,\n"
-"        long long stride, const signed char *Xq, const float *Xs,\n"
-"        const int *offs, int N, int K) {\n"
-"    int e = blockIdx.z;\n"
-"    int m0 = offs[e], m1 = offs[e + 1];\n"
-"    int M = m1 - m0;\n"
-"    if (M <= 0 || (int)blockIdx.y * 128 >= M) return;\n"
-"    int t0 = blockIdx.y * 128;\n"
-"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
-"    int n = blockIdx.x * 64 + warp * 16 + (lane & 15);\n"
-"    int half = lane >> 4;\n"
-"    if (n >= N) return;\n"
-"    const unsigned char *W = W_base + (long long)e * stride;\n"
-"    int nb = K / 256;\n"
-"    const unsigned char *wrow = W + (size_t)n * nb * 82;\n"
-"    int t_limit = M - t0; if (t_limit > 128) t_limit = 128;\n"
-"    for (int tb = 0; tb < t_limit; tb += 8) {\n"
-"        int nt = t_limit - tb; if (nt > 8) nt = 8;\n"
-"        int tl = half * 4; if (tl >= nt) continue;\n"
-"        int t_lo = t0 + tb + tl;\n"
-"        float4 acc = {0,0,0,0};\n"
-"        for (int g = (lane & 15); g < nb * 16; g += 16) {\n"
-"            int b = g >> 4; int ib32 = g & 7;\n"
-"            const unsigned char *bp = wrow + b * 82;\n"
-"            float d = half_to_float(*(const half_raw *)bp);\n"
-"            unsigned char scb = bp[74 + ib32];\n"
-"            int ls0 = scb & 0xf, ls1 = scb >> 4;\n"
-"            float dw0 = d * (0.5f + (float)ls0) * 0.25f;\n"
-"            float dw1 = d * (0.5f + (float)ls1) * 0.25f;\n"
-"            for (int tt = 0; tt < 4; tt++) {\n"
-"                int t = t_lo + tt; if (t >= m1 || t >= t0 + t_limit) break;\n"
-"                const signed char *xq = Xq + (size_t)(m0 + t) * K;\n"
-"                int base_off = b * 256 + ib32 * 32;\n"
-"                const int *u0 = (const int *)(xq + base_off);\n"
-"                int sum0 = dp4a_hw(apply_sign4(bp[2+ib32*4+0]|((bp[66+ib32]<<8)&0x300),bp[34+ib32*4+0],0), u0[0], 0);\n"
-"                sum0 = dp4a_hw(apply_sign4(*(const unsigned int*)((const unsigned char*)&iq2s_grid_dev[bp[2+ib32*4+0]|((bp[66+ib32]<<8)&0x300)]+4),bp[34+ib32*4+0],4), u0[1], sum0);\n"
-"                int sum1 = dp4a_hw(apply_sign4(bp[2+ib32*4+1]|((bp[66+ib32]<<6)&0x300),bp[34+ib32*4+1],0), u0[2], 0);\n"
-"                sum1 = dp4a_hw(apply_sign4(*(const unsigned int*)((const unsigned char*)&iq2s_grid_dev[bp[2+ib32*4+1]|((bp[66+ib32]<<6)&0x300)]+4),bp[34+ib32*4+1],4), u0[3], sum1);\n"
-"                // half=0: l=0,1; half=1: l=2,3\n"
-"                int l0 = half * 2, l1 = half * 2 + 1;\n"
-"                int gi0 = bp[2+ib32*4+l0] | ((bp[66+ib32] << (8-2*l0)) & 0x300);\n"
-"                int gi1 = bp[2+ib32*4+l1] | ((bp[66+ib32] << (8-2*l1)) & 0x300);\n"
-"                int sum = dp4a_hw(apply_sign4(*(const unsigned int*)&iq2s_grid_dev[gi0],bp[34+ib32*4+l0],0), u0[l0*2], 0);\n"
-"                sum = dp4a_hw(apply_sign4(((const unsigned int*)&iq2s_grid_dev[gi0])[1],bp[34+ib32*4+l0],4), u0[l0*2+1], sum);\n"
-"                sum = dp4a_hw(apply_sign4(*(const unsigned int*)&iq2s_grid_dev[gi1],bp[34+ib32*4+l1],0), u0[l1*2], sum);\n"
-"                sum = dp4a_hw(apply_sign4(((const unsigned int*)&iq2s_grid_dev[gi1])[1],bp[34+ib32*4+l1],4), u0[l1*2+1], sum);\n"
-"                float dw = (half == 0) ? dw0 : dw1;\n"
-"                ((float*)&acc)[tt] += dw * (float)sum;\n"
-"            }\n"
-"        }\n"
-"        for (int tt = 0; tt < 4; tt++) {\n"
-"            float v = ((float*)&acc)[tt];\n"
-"            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);\n"
-"            int t = t_lo + tt; if (t >= m1 || t >= t0 + t_limit) break;\n"
-"            if ((lane & 15) == 0) Y[(size_t)(m0 + t) * N + n] = v;\n"
-"        }\n"
-"    }\n"
-"}\n"
-"/* Grouped MMQ for IQ3_S: direct quantized down projection. */\n"
-"__global__ void mmq_iq3s_grouped(float *Y, const unsigned char *W_base,\n"
-"        long long stride, const signed char *Xq, const float *Xs,\n"
-"        const int *offs, int N, int K) {\n"
-"    int e = blockIdx.z;\n"
-"    int m0 = offs[e], m1 = offs[e + 1];\n"
-"    int M = m1 - m0;\n"
-"    if (M <= 0 || (int)blockIdx.y * 128 >= M) return;\n"
-"    int t0 = blockIdx.y * 128;\n"
-"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
-"    int n = blockIdx.x * 64 + warp * 16 + (lane & 15);\n"
-"    int half = lane >> 4;\n"
-"    if (n >= N) return;\n"
-"    const unsigned char *W = W_base + (long long)e * stride;\n"
-"    int nb = K / 256;\n"
-"    const unsigned char *wrow = W + (size_t)n * nb * 110;\n"
-"    int t_limit = M - t0; if (t_limit > 128) t_limit = 128;\n"
-"    for (int tb = 0; tb < t_limit; tb += 8) {\n"
-"        int nt = t_limit - tb; if (nt > 8) nt = 8;\n"
-"        int tl = half * 4; if (tl >= nt) continue;\n"
-"        int t_lo = t0 + tb + tl;\n"
-"        float4 acc = {0,0,0,0};\n"
-"        for (int g = (lane & 15); g < nb * 32; g += 16) {\n"
-"            int b = g >> 5; int g32 = g & 31;\n"
-"            int sb = g32 >> 2; int l = g32 & 3;\n"
-"            if ((l >> 1) != half) continue;\n"
-"            const unsigned char *bp = wrow + b * 110;\n"
-"            float d = half_to_float(*(const half_raw *)bp);\n"
-"            unsigned char sc = bp[106 + (sb >> 1)];\n"
-"            float db = d * (float)(1 + 2 * ((sb & 1) ? (sc >> 4) : (sc & 0xf)));\n"
-"            unsigned char qh = bp[66 + sb];\n"
-"            int gi0 = bp[2 + sb*8 + 2*l] | ((qh << (8 - 2*l)) & 256);\n"
-"            int gi1 = bp[2 + sb*8 + 2*l + 1] | ((qh << (7 - 2*l)) & 256);\n"
-"            const signed char *g1 = (const signed char *)&iq3s_grid_dev[gi0];\n"
-"            const signed char *g2 = (const signed char *)&iq3s_grid_dev[gi1];\n"
-"            unsigned char sgn = bp[74 + sb*4 + l];\n"
-"            for (int tt = 0; tt < 4; tt++) {\n"
-"                int t = t_lo + tt; if (t >= m1 || t >= t0 + t_limit) break;\n"
-"                const signed char *xq = Xq + (size_t)(m0 + t) * K;\n"
-"                int base_off = b * 256 + sb * 32 + l * 8;\n"
-"                float p0 = (float)xq[base_off+0]*g1[0] + (float)xq[base_off+1]*g1[1]\n"
-"                       + (float)xq[base_off+2]*g1[2] + (float)xq[base_off+3]*g1[3];\n"
-"                float p1 = (float)xq[base_off+4]*g2[0] + (float)xq[base_off+5]*g2[1]\n"
-"                       + (float)xq[base_off+6]*g2[2] + (float)xq[base_off+7]*g2[3];\n"
-"                float s = (sgn & (1<<0))?-1:1; for(int j=1;j<4;j++) if(sgn&(1<<j)) s*=-1;\n"
-"                float s2 = (sgn & (1<<4))?-1:1; for(int j=5;j<8;j++) if(sgn&(1<<j)) s2*=-1;\n"
-"                ((float*)&acc)[tt] += db * (p0 * ((sgn & 1) ? -1.0f : 1.0f) + p1 * ((sgn & 0x10) ? -1.0f : 1.0f));\n"
-"            }\n"
-"        }\n"
-"        for (int tt = 0; tt < 4; tt++) {\n"
-"            float v = ((float*)&acc)[tt];\n"
-"            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);\n"
-"            int t = t_lo + tt; if (t >= m1 || t >= t0 + t_limit) break;\n"
-"            if ((lane & 15) == 0) Y[(size_t)(m0 + t) * N + n] = v;\n"
-"        }\n"
-"    }\n"
-"}\n"
 "/* Fused decode MoE matvecs: one launch covers all K selected experts.        */\n"
 "/* Cuts ~40 small dependent launches/layer to 2 (gate+up+silu, down+accum).   */\n"
 "/* blockIdx.y = expert slot; expert base resolved on-device from eidx[].      */\n"
@@ -6190,9 +6054,6 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_row_scale_add;
     hipFunction_t fn_mmq_iq2s_f32;   /* fused quantized MoE GEMM (gate/up) */
     hipFunction_t fn_mmq_iq3s_f32;   /* fused quantized MoE GEMM (down) */
-    hipFunction_t fn_gather_quant_q8_1;
-    hipFunction_t fn_mmq_iq2s_grouped;
-    hipFunction_t fn_mmq_iq3s_grouped;
     hipFunction_t fn_moe_gateup_silu_iq2s;  /* decode: all-K experts gate+up+silu */
     hipFunction_t fn_moe_down_accum_iq3s;   /* decode: all-K experts down+w-accum */
     hipFunction_t fn_shexp_gateup_silu_q6k; /* decode: shared expert gate+up+silu */
@@ -6230,7 +6091,6 @@ struct hip_llm_runner {
     int  *d_cursor;                         /* [ne] scatter cursor */
     int moe_fused_decode;            /* LLM_MOE_FUSED (default on if types match) */
     int moe_iq2_bm;                  /* IQ2_XXS/IQ3_XXS weights repacked block-major */
-    int moe_mmq;                     /* use MMQ (direct quantized grouped GEMM) */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
@@ -6355,8 +6215,6 @@ struct hip_llm_runner {
     void *d_moe_eg;              /* [Mmax*K, expert_ff] f32 expert gate */
     void *d_moe_eu;              /* [Mmax*K, expert_ff] f32 expert up */
     void *d_moe_esilu_bf16;      /* [Mmax*K, expert_ff] bf16 silu(gate)*up */
-    void *d_mmq_cxq8;            /* [Mmax*K, max(n_embd,eff)] int8 Q8_1 activations */
-    void *d_mmq_cxs;             /* [Mmax*K, max(n_embd,eff)/32] f32 Q8_1 scales */
     void *d_moe_eout;            /* [Mmax*K, n_embd] f32 expert outputs */
     void *d_moe_out_batch;       /* [Mmax, n_embd] f32 accumulated MoE output */
     void *d_xnorm_batch_bf16_moe;/* [Mmax, n_embd] bf16 normed input (router+shared) */
@@ -6574,9 +6432,6 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_row_scale_add);
     GET_FUNC(mmq_iq2s_f32);
     GET_FUNC(mmq_iq3s_f32);
-    GET_FUNC(gather_quant_q8_1);
-    GET_FUNC(mmq_iq2s_grouped);
-    GET_FUNC(mmq_iq3s_grouped);
     GET_FUNC(moe_gateup_silu_iq2s);
     GET_FUNC(moe_down_accum_iq3s);
     GET_FUNC(shexp_gateup_silu_q6k);
@@ -6728,9 +6583,6 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->moe_iq2_bm = 0;
     { const char *e = getenv("LLM_MOE_BM");
       if (e && atoi(e)) { r->moe_iq2_bm = 1; } }
-    r->moe_mmq = 0;
-    { const char *e = getenv("LLM_MOE_MMQ");
-      if (e && atoi(e)) { r->moe_mmq = 1; } }
     r->ssm_fused_decode = 1;
     { const char *e = getenv("LLM_SSM_FUSED"); if (e) r->ssm_fused_decode = atoi(e) != 0; }
     r->gemm_own = 1;  /* self-owned WMMA GEMM default (faster than blaslt path) */
@@ -7840,9 +7692,6 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 CHECK_HIP(hipMalloc(&r->d_moe_eg,              TA * eff * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_eu,              TA * eff * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_esilu_bf16,      TA * eff * 2));
-                { int _mmq_w = r->n_embd > eff ? r->n_embd : eff;
-                  CHECK_HIP(hipMalloc(&r->d_mmq_cxq8, TA * _mmq_w));
-                  CHECK_HIP(hipMalloc(&r->d_mmq_cxs,  TA * (_mmq_w / 32) * sizeof(float))); }
                 CHECK_HIP(hipMalloc(&r->d_moe_eout,            TA * r->n_embd * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_out_batch,       (size_t)bm * r->n_embd * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_xnorm_batch_bf16_moe,(size_t)bm * r->n_embd * 2));
@@ -9153,42 +9002,6 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
         goto experts_done;
     }
-
-    /* MMQ grouped path (direct quantized GEMM via DP4A). Gate: LLM_MOE_MMQ=1. */
-    /* MMQ path: gate+up via DP4A quantized grouped GEMM (LLM_MOE_MMQ=1).
-     * Activations quantized to INT8 once, reused for both gate and up. */
-    if (r->moe_mmq && r->gemm_own && r->d_expw_bf16 &&
-        cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
-        cl->moe_up_exps_type   == GGML_TYPE_IQ2_S) {
-        if (!gpu_group)
-            hipMemcpyAsync(r->d_moe_offs, offs, (size_t)(ne + 1) * sizeof(int),
-                           hipMemcpyHostToDevice, r->stream);
-        unsigned mtiles = (unsigned)((M + 127) / 128);
-        long long sgu = (long long)cl->moe_exp_stride_gu;
-        long long sdn = (long long)cl->moe_exp_stride_d;
-        int _nK = n_embd, _nN = eff;
-        /* quantize activations (F32 gather_in -> INT8). Single pass, reused for gate+up */
-        { int _nq = total * n_embd;
-          void *a[] = { &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_moe_gather_in, &_nq };
-          LAUNCH(r->fn_quantize_q8_32, (unsigned)((_nq + 31) / 32), 1, 1, 32, 1, 1, 0, r->stream, a); }
-        /* gate MMQ */
-        { void *a[] = { &r->d_moe_eg, &cl->moe_gate_exps_w, &sgu, &r->d_mmq_cxq8, &r->d_mmq_cxs,
-                        &r->d_moe_offs, &_nN, &_nK };
-          LAUNCH(r->fn_mmq_iq2s_grouped, (unsigned)((_nN + 63) / 64), mtiles, ne, 128, 1, 1, 0, r->stream, a); }
-        /* up MMQ (reuses same quantized activations) */
-        { void *a[] = { &r->d_moe_eu, &cl->moe_up_exps_w, &sgu, &r->d_mmq_cxq8, &r->d_mmq_cxs,
-                        &r->d_moe_offs, &_nN, &_nK };
-          LAUNCH(r->fn_mmq_iq2s_grouped, (unsigned)((_nN + 63) / 64), mtiles, ne, 128, 1, 1, 0, r->stream, a); }
-        launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
-        launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, total * eff);
-        /* down (existing dequant+GEMM, handles IQ3_S / IQ4_XS / IQ3_XXS) */
-        { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn };
-          LAUNCH(r->fn_dequant_iq3s_all, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
-        { void *a[] = { &r->d_moe_eout, &r->d_expw_bf16, &r->d_moe_esilu_bf16, &r->d_moe_offs, &n_embd, &eff };
-          LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
-        goto experts_done;
-    }
-
     /* Grouped path for IQ2_XXS gate/up + IQ3_XXS down (IQ2_M model). */
     if (use_wmma_exp && r->d_expw_bf16 &&
         cl->moe_gate_exps_type == GGML_TYPE_IQ2_XXS &&
