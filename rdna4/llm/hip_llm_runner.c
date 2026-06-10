@@ -3692,6 +3692,54 @@ static const char *hip_kernel_source =
 "    float inv = rsqrtf(sd[0] / n + eps);\n"
 "    for (int i = tid; i < n; i += blockDim.x) xb[i] = x[i] * inv * w[i];\n"
 "}\n"
+"/* ---- moe_router_fused: per-block expert dot, last block does topK+softmax. */\n"
+"/* grid = ne+1 blocks x 256 thr. Block ne = shared-gate dot + sigmoid. Counter */\n"
+"/* must be 0 before launch; the topk block resets it for the next layer.       */\n"
+"__global__ void moe_router_fused(const float *gate_w, const float *sgate_w,\n"
+"        const float *x, int ne, int K, int n_cols,\n"
+"        float *logits, int *out_idx, float *out_w, float *shared_scale,\n"
+"        unsigned int *counter) {\n"
+"    int e = blockIdx.x; int tid = threadIdx.x;\n"
+"    const float *wr = (e < ne) ? gate_w + (size_t)e * n_cols : sgate_w;\n"
+"    float p = 0.0f;\n"
+"    for (int j = tid; j < n_cols; j += blockDim.x) p += wr[j] * x[j];\n"
+"    for (int o = 16; o > 0; o >>= 1) p += __shfl_down(p, o);\n"
+"    __shared__ float ws[8];\n"
+"    if ((tid & 31) == 0) ws[tid >> 5] = p;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float t = 0; for (int w = 0; w < 8; w++) t += ws[w];\n"
+"        if (e < ne) logits[e] = t;\n"
+"        else shared_scale[0] = 1.0f / (1.0f + expf(-t));\n"
+"    }\n"
+"    __threadfence();\n"
+"    __shared__ unsigned int rank;\n"
+"    if (tid == 0) rank = atomicAdd(counter, 1u);\n"
+"    __syncthreads();\n"
+"    if (rank != (unsigned)ne) return;   /* only the last-finished block continues */\n"
+"    /* topK + softmax over logits[0..ne) */\n"
+"    __shared__ float sval[256]; __shared__ int sidx[256]; __shared__ int chosen[64];\n"
+"    float my = (tid < ne) ? logits[tid] : -1e30f;\n"
+"    for (int ki = 0; ki < K; ki++) {\n"
+"        float v = my;\n"
+"        for (int j = 0; j < ki; j++) if (chosen[j] == tid) v = -1e30f;\n"
+"        sval[tid] = v; sidx[tid] = tid; __syncthreads();\n"
+"        for (int st = 128; st > 0; st >>= 1) {\n"
+"            if (tid < st && tid + st < 256) {\n"
+"                if (sval[tid+st] > sval[tid]) { sval[tid]=sval[tid+st]; sidx[tid]=sidx[tid+st]; }\n"
+"                else if (sval[tid+st] == sval[tid] && sidx[tid+st] < sidx[tid]) sidx[tid]=sidx[tid+st];\n"
+"            } __syncthreads();\n"
+"        }\n"
+"        if (tid == 0) { chosen[ki]=sidx[0]; out_idx[ki]=sidx[0]; out_w[ki]=sval[0]; }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) {\n"
+"        float mx = out_w[0]; for (int i=1;i<K;i++) if (out_w[i]>mx) mx=out_w[i];\n"
+"        float sum=0; for (int i=0;i<K;i++){ out_w[i]=expf(out_w[i]-mx); sum+=out_w[i]; }\n"
+"        float inv=1.0f/sum; for (int i=0;i<K;i++) out_w[i]*=inv;\n"
+"        counter[0] = 0;  /* reset for next layer */\n"
+"    }\n"
+"}\n"
 "/* ---- ssm_prep_f32: fused decode SSM aux chain (conv+silu+state, l2norm Q/K,  */\n"
 "/* repeat-tile to Q_exp/K_exp, alpha softplus, beta sigmoid). One launch       */\n"
 "/* replaces 7. grid = n_group blocks x 256 thr. Layout: conv_out =             */\n"
@@ -5488,6 +5536,8 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
+    hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
+    unsigned int *d_router_counter;
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
     hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
@@ -5850,6 +5900,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_qkv_q6k);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
+    GET_FUNC(moe_router_fused);
     GET_FUNC(gemm_bf16_own);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
@@ -6735,6 +6786,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipMalloc(&r->d_moe_idx, r->n_experts_used * sizeof(int)));
         CHECK_HIP(hipMalloc(&r->d_moe_w,   r->n_experts_used * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_shared_scale, sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_router_counter, sizeof(unsigned int)));
+        CHECK_HIP(hipMemset(r->d_router_counter, 0, sizeof(unsigned int)));
         CHECK_HIP(hipMalloc(&r->d_moe_act8,
                             (size_t)(r->n_experts_used + 1) * r->expert_ff * sizeof(float)));
         /* Device-side expert dispatch is supported only when every routed-expert
@@ -8015,21 +8068,34 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     int expert_ff = r->expert_ff;
     int shared_expert_ff = r->shared_expert_ff;
 
-  int routed_fused = 0;
-  if (0) { /* fused router: NEGATIVE — serial per-thread dot slower than grid matvec */
-    /* Router + topK + softmax + shared-gate sigmoid in ONE launch. */
-    int ne_ = r->n_experts, K_ = n_experts_used, nc_ = cl->moe_gate_cols;
-    void *a[] = { &cl->moe_gate_w, &cl->moe_shared_gate_w, &r->d_xb, &ne_, &K_, &nc_,
-                  &r->d_moe_idx, &r->d_moe_w, &r->d_shared_scale };
-    LAUNCH(r->fn_moe_route_decode, 1, 1, 1, 256, 1, 1, 0, r->stream, a);
-    routed_fused = 1;
-  } else {
-    launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
-                     cl->moe_gate_rows, cl->moe_gate_cols);
+  /* Fully-fused MoE decode path: router+topk+sgate (1 launch, last-block topk),
+   * gateup incl. shared expert slot + accum zero (1), down incl. shared (1). */
+  if (r->moe_dev_dispatch_ok && r->moe_fused_decode && r->n_experts <= 256 &&
+      cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
+      cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
+      cl->moe_down_exps_type == GGML_TYPE_IQ3_S &&
+      shared_expert_ff == expert_ff &&
+      cl->moe_shared_gate_type == GGML_TYPE_Q6_K &&
+      cl->moe_shared_up_type   == GGML_TYPE_Q6_K &&
+      cl->moe_shared_down_type == GGML_TYPE_Q6_K) {
+      int ne_ = n_experts, K_ = n_experts_used, nc_ = n_embd;
+      void *a[] = { &cl->moe_gate_w, &cl->moe_shared_gate_w, &r->d_xb,
+                    &ne_, &K_, &nc_, &r->d_router_logits, &r->d_moe_idx, &r->d_moe_w,
+                    &r->d_shared_scale, &r->d_router_counter };
+      LAUNCH(r->fn_moe_router_fused, ne_ + 1, 1, 1, 256, 1, 1, 0, r->stream, a);
+      launch_moe_gateup_silu(r, cl, n_experts_used + 1,
+                             cl->moe_shared_ffn_gate_w, cl->moe_shared_ffn_up_w);
+      launch_moe_down_accum(r, cl, n_experts_used + 1, cl->moe_shared_ffn_down_w);
+      hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
+                    hipMemcpyDeviceToDevice, r->stream);
+      return;
   }
 
+  launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
+                   cl->moe_gate_rows, cl->moe_gate_cols);
+
   if (r->moe_dev_dispatch_ok) {
-    if (!routed_fused) launch_moe_topk(r);
+    launch_moe_topk(r);
 
     /* Fused all-experts path: 2 launches instead of ~40 small dependent ones.
      * Requires gate/up = IQ2_S and down = IQ3_S (covers 37/40 layers). */
@@ -8042,8 +8108,6 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             cl->moe_shared_up_type   == GGML_TYPE_Q6_K &&
             cl->moe_shared_down_type == GGML_TYPE_Q6_K;
         if (sh_fold) {
-            /* shared-expert gate scalar + sigmoid, then ONE gateup + ONE down for
-             * routed+shared together (accum zero folded into gateup slot 0). */
             launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
             launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
             launch_moe_gateup_silu(r, cl, n_experts_used + 1,
@@ -8100,10 +8164,8 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
 
 shared_expert:
     {
-        if (!routed_fused) {
-            launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
-            launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
-        }
+        launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+        launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
         if (r->moe_fused_decode &&
             cl->moe_shared_gate_type == GGML_TYPE_Q6_K &&
             cl->moe_shared_up_type   == GGML_TYPE_Q6_K &&
