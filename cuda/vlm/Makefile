@@ -5,7 +5,7 @@
 
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -I.. -mavx2 -mfma -march=native
-LDFLAGS = -ldl -lm -lpthread
+LDFLAGS = -ldl -lm -lpthread -lstdc++
 
 # Sources
 CUEW_SRC = ../cuew.c
@@ -19,6 +19,7 @@ TARGET = test_cuda_vision
 COMPARE = compare_vs_llamacpp
 VLM = test_cuda_vlm
 GEMMA4_VLM = test_cuda_gemma4_vlm
+LLAMACPP_VISION = llamacpp_vision_standalone
 
 .PHONY: all clean run help compare
 
@@ -30,8 +31,34 @@ $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_vision_encod
 $(COMPARE): compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_vision_encoder.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
 
-$(VLM): test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_vision_encoder.h ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h
-	$(CC) $(CFLAGS) -o $@ test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
+# llama.cpp vision bridge (for reference path)
+LLAMA_DIR ?= /home/syoyo/work/llama.cpp
+LLAMA_CXXFLAGS = -O2 -std=c++17 \
+	-I$(LLAMA_DIR)/tools/mtmd \
+	-I$(LLAMA_DIR)/ggml/include \
+	-I$(LLAMA_DIR)/include
+LLAMA_LDFLAGS = \
+	-L$(LLAMA_DIR)/build/bin \
+	-Wl,-rpath,$(LLAMA_DIR)/build/bin \
+	-lmtmd -lllama -lggml-base -lggml-cpu -lggml -lstdc++ -lm -lpthread
+
+LLAMACPP_VISION_BIN = llamacpp_vision_standalone
+
+$(LLAMACPP_VISION_BIN): llamacpp_vision_standalone.cpp
+	g++ -O2 -std=c++17 \
+	  $(LLAMA_CXXFLAGS) \
+	  -I$(LLAMA_DIR)/tools/mtmd/include/stb \
+	  -o $@ $< \
+	  -L$(LLAMA_DIR)/build/bin \
+	  -Wl,-rpath,$(LLAMA_DIR)/build/bin \
+	  -lmtmd -lllama -lggml-base -lggml-cpu -lggml -lm -lpthread
+
+$(VLM): test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LLAMACPP_BRIDGE_SO) \
+        cuda_vision_encoder.h ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h llamacpp_vision_bridge.h
+	$(CC) $(CFLAGS) -I$(LLAMA_DIR)/tools/mtmd -I$(LLAMA_DIR)/ggml/include -I$(LLAMA_DIR)/include \
+	  -o $@ test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) \
+	  -L. -Wl,-rpath,'$$ORIGIN' $(LLAMACPP_BRIDGE_SO) \
+	  $(LDFLAGS) $(LLAMA_LDFLAGS)
 
 $(GEMMA4_VLM): test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
