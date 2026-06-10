@@ -3482,6 +3482,63 @@ static const char *hip_kernel_source =
 "    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
 "    if (lane == 0) atomicAdd(&accum[row], ew[slot] * sum);\n"
 "}\n"
+"/* ---- ssm_prep_f32: fused decode SSM aux chain (conv+silu+state, l2norm Q/K,  */\n"
+"/* repeat-tile to Q_exp/K_exp, alpha softplus, beta sigmoid). One launch       */\n"
+"/* replaces 7. grid = n_group blocks x 256 thr. Layout: conv_out =             */\n"
+"/* [Q: n_group*d_state][K: n_group*d_state][V: rest of qkv_dim].               */\n"
+"__global__ void ssm_prep_f32(float *conv_out, float *conv_state,\n"
+"        const float *qkv_in, const float *conv_w,\n"
+"        float *alpha, float *beta, const float *dt_bias, const float *a_arr,\n"
+"        float *Q_exp, float *K_exp,\n"
+"        int qkv_dim, int conv_k, int d_state, int n_group, int dt_rank, float eps) {\n"
+"    int g = blockIdx.x; int tid = threadIdx.x;\n"
+"    int v_per_blk = (qkv_dim - 2 * n_group * d_state) / n_group;\n"
+"    /* conv channels owned by this block: Q group g, K group g, V slice g */\n"
+"    for (int t = tid; t < 2 * d_state + v_per_blk; t += blockDim.x) {\n"
+"        int j;\n"
+"        if (t < d_state) j = g * d_state + t;\n"
+"        else if (t < 2 * d_state) j = n_group * d_state + g * d_state + (t - d_state);\n"
+"        else j = 2 * n_group * d_state + g * v_per_blk + (t - 2 * d_state);\n"
+"        float sum = 0.0f;\n"
+"        for (int f = 0; f < conv_k - 1; f++)\n"
+"            sum += conv_w[j * conv_k + f] * conv_state[f * qkv_dim + j];\n"
+"        sum += conv_w[j * conv_k + (conv_k - 1)] * qkv_in[j];\n"
+"        conv_out[j] = sum / (1.0f + expf(-sum));\n"
+"        for (int f = 0; f < conv_k - 2; f++)\n"
+"            conv_state[f * qkv_dim + j] = conv_state[(f + 1) * qkv_dim + j];\n"
+"        conv_state[(conv_k - 2) * qkv_dim + j] = qkv_in[j];\n"
+"    }\n"
+"    /* alpha/beta prep on block 0 (dt_rank small) */\n"
+"    if (g == 0) {\n"
+"        for (int i = tid; i < dt_rank; i += blockDim.x) {\n"
+"            float x = alpha[i] + dt_bias[i];\n"
+"            float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));\n"
+"            alpha[i] = sp * a_arr[i];\n"
+"            beta[i]  = 1.0f / (1.0f + expf(-beta[i]));\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    /* L2 norm of Q group g and K group g (d_state each) */\n"
+"    __shared__ float sq[256], sk[256];\n"
+"    float aq = 0.0f, ak = 0.0f;\n"
+"    float *Qg = conv_out + g * d_state;\n"
+"    float *Kg = conv_out + n_group * d_state + g * d_state;\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) { aq += Qg[i]*Qg[i]; ak += Kg[i]*Kg[i]; }\n"
+"    sq[tid] = aq; sk[tid] = ak; __syncthreads();\n"
+"    for (int s = blockDim.x/2; s > 0; s >>= 1) {\n"
+"        if (tid < s) { sq[tid] += sq[tid+s]; sk[tid] += sk[tid+s]; } __syncthreads();\n"
+"    }\n"
+"    float iq = rsqrtf(sq[0] + eps), ik = rsqrtf(sk[0] + eps);\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) { Qg[i] *= iq; Kg[i] *= ik; }\n"
+"    __syncthreads();\n"
+"    /* repeat-tile: every head h with h % n_group == g gets this group's row */\n"
+"    for (int h = g; h < dt_rank; h += n_group) {\n"
+"        for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"            Q_exp[h * d_state + i] = Qg[i];\n"
+"            K_exp[h * d_state + i] = Kg[i];\n"
+"        }\n"
+"    }\n"
+"}\n"
 "/* ---- Fused shared-expert decode (Q6_K): gate+up+silu, then down+scale-add. ---- */\n"
 "__global__ void shexp_gateup_silu_q6k(float *out, const unsigned char *gw,\n"
 "        const unsigned char *uw, const float *x, int eff, int n_cols) {\n"
@@ -4936,6 +4993,8 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_down_accum_iq3s;   /* decode: all-K experts down+w-accum */
     hipFunction_t fn_shexp_gateup_silu_q6k; /* decode: shared expert gate+up+silu */
     hipFunction_t fn_shexp_down_accum_q6k;  /* decode: shared expert down+scale-add */
+    hipFunction_t fn_ssm_prep_f32;          /* decode: fused SSM aux chain */
+    int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
     int moe_fused_decode;            /* LLM_MOE_FUSED (default on if types match) */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
@@ -5276,6 +5335,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_down_accum_iq3s);
     GET_FUNC(shexp_gateup_silu_q6k);
     GET_FUNC(shexp_down_accum_q6k);
+    GET_FUNC(ssm_prep_f32);
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
@@ -5395,6 +5455,8 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     { const char *e = getenv("LLM_LDS_GRID"); if (e) r->lds_grid = atoi(e) != 0; }
     r->moe_fused_decode = 1;
     { const char *e = getenv("LLM_MOE_FUSED"); if (e) r->moe_fused_decode = atoi(e) != 0; }
+    r->ssm_fused_decode = 1;
+    { const char *e = getenv("LLM_SSM_FUSED"); if (e) r->ssm_fused_decode = atoi(e) != 0; }
     {
         const size_t QCAP = 8192;
         if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
@@ -7644,6 +7706,18 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             launch_matvec_auto(r, r->d_ssm_alpha,  cl->ssm_alpha_w, r->d_xb, cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
             launch_matvec_auto(r, r->d_ssm_beta,   cl->ssm_beta_w,  r->d_xb, cl->ssm_beta_rows,  cl->ssm_beta_cols,  cl->ssm_beta_type);
 
+            if (r->ssm_fused_decode &&
+                (qkv_dim - 2 * n_group * d_state) % n_group == 0 &&
+                dt_rank % n_group == 0 && d_state <= 256) {
+                /* Fused conv+silu+state, l2norm Q/K, repeat-tile, softplus, sigmoid:
+                 * 7 launches -> 1. */
+                void *args[] = { &r->d_ssm_conv_out, &cl->d_conv_state, &r->d_ssm_qkv,
+                                 &cl->ssm_conv1d_w, &r->d_ssm_alpha, &r->d_ssm_beta,
+                                 &cl->ssm_dt_bias, &cl->ssm_a,
+                                 &r->d_ssm_Q_exp, &r->d_ssm_K_exp,
+                                 &qkv_dim, &conv_k, &d_state, &n_group, &dt_rank, &eps };
+                LAUNCH(r->fn_ssm_prep_f32, n_group, 1, 1, 256, 1, 1, 0, r->stream, args);
+            } else {
             launch_softplus_mul(r, r->d_ssm_alpha, r->d_ssm_alpha, cl->ssm_dt_bias, cl->ssm_a, dt_rank);
             launch_sigmoid_inplace(r, r->d_ssm_beta, dt_rank);
 
@@ -7656,6 +7730,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
             launch_repeat_tile(r, r->d_ssm_Q_exp, r->d_ssm_conv_out, dt_rank, d_state, n_group);
             launch_repeat_tile(r, r->d_ssm_K_exp, K_raw, dt_rank, d_state, n_group);
+            }
 
             void *V_ptr = (void *)((char *)r->d_ssm_conv_out + (size_t)2 * n_group * d_state * sizeof(float));
 
