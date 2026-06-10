@@ -3622,6 +3622,66 @@ static const char *hip_kernel_source =
 "    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
 "    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; *dst = t; }\n"
 "}\n"
+"/* ---- matvec_down_residual_q6k: fused W_down * gate + x += result (Q6_K). */\n"
+"/* Replaces matvec + add (2 launches) with 1 per dense FFN decode layer.\n"
+" * x[row] += dot(W_down[row], gate). */\n"
+"__global__ void matvec_down_residual_q6k(float *x, const unsigned char *down_w,\n"
+"        const float *gate, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = down_w + (size_t)row * row_bytes;\n"
+"    int G = nb * 16;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 4; int rem = g & 15; int half = rem >> 3; int lp = rem & 7;\n"
+"        sum += q6k_dot4(row_ptr + b * 210, gate + b * 256, half, lp);\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; x[row] += t; }\n"
+"}\n"
+"/* ---- ffn_gate_up_silu_q6k: fused decode FFN gate + up matvec + SiLU (Q6_K). */\n"
+"__global__ void ffn_gate_up_silu_q6k(float *gate_out,\n"
+"        const unsigned char *gate_w, const unsigned char *up_w,\n"
+"        const float *x, int n_ff, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_ff) return;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 210;\n"
+"    int G = nb * 16;\n"
+"    /* Gate dot product */\n"
+"    const unsigned char *gp = gate_w + (size_t)row * row_bytes;\n"
+"    float gsum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 4; int rem = g & 15; int half = rem >> 3; int lp = rem & 7;\n"
+"        gsum += q6k_dot4(gp + b * 210, x + b * 256, half, lp);\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) gsum += __shfl_down(gsum, o);\n"
+"    __shared__ float sf[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) sf[wid] = gsum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += sf[w]; gsum = t; }\n"
+"    __syncthreads();\n"
+"    /* Up dot product */\n"
+"    const unsigned char *up = up_w + (size_t)row * row_bytes;\n"
+"    float usum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 4; int rem = g & 15; int half = rem >> 3; int lp = rem & 7;\n"
+"        usum += q6k_dot4(up + b * 210, x + b * 256, half, lp);\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) usum += __shfl_down(usum, o);\n"
+"    if (ln == 0) sf[wid] = usum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += sf[w]; usum = t; }\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float g = gsum / (1.0f + __expf(-gsum));\n"
+"        gate_out[row] = g * usum;\n"
+"    }\n"
+"}\n"
 "/* ---- moe_route_decode: router logits + topk + softmax + shared-gate sigmoid. */\n"
 "/* One block 256 thr: thread e = expert dot, then topk/softmax/sgate. */\n"
 "__global__ void moe_route_decode(const float *gate_w, const float *sgate_w,\n"
@@ -5518,6 +5578,14 @@ typedef struct {
     void *ssm_alpha_w;
     void *ssm_beta_w;
     void *ssm_out_w;
+
+    /* BF16 copies for hipBLASLt prefill GEMMs (Phase 2/3). NULL if not converted. */
+    void *ssm_qkv_w_bf16;
+    void *ssm_gate_w_bf16;
+    void *ssm_alpha_w_bf16;
+    void *ssm_beta_w_bf16;
+    void *ssm_out_w_bf16;
+
     void *ssm_a;
     void *ssm_dt_bias;
     void *ssm_conv1d_w;
@@ -5603,6 +5671,8 @@ struct hip_llm_runner {
     hipFunction_t fn_ssm_prep_f32;          /* decode: fused SSM aux chain */
     hipFunction_t fn_ssm_matvec4_q6k;       /* decode: fused 4 SSM input matvecs */
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
+    hipFunction_t fn_ffn_gate_up_silu_q6k;  /* decode: fused FFN gate+up+SiLU (Q6_K) */
+    hipFunction_t fn_matvec_down_residual_q6k; /* decode: fused down matvec + residual (Q6_K) */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
@@ -5970,6 +6040,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_prep_f32);
     GET_FUNC(ssm_matvec4_q6k);
     GET_FUNC(matvec_qkv_q6k);
+    GET_FUNC(ffn_gate_up_silu_q6k);
+    GET_FUNC(matvec_down_residual_q6k);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
     GET_FUNC(moe_router_fused);
@@ -7030,6 +7102,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 size_t n_g  = (size_t)cl->ffn_gate_rows * cl->ffn_gate_cols;
                 size_t n_u  = (size_t)cl->ffn_up_rows   * cl->ffn_up_cols;
                 size_t n_d  = (size_t)cl->ffn_down_rows * cl->ffn_down_cols;
+                size_t n_qkv  = (size_t)cl->ssm_qkv_rows  * cl->ssm_qkv_cols;
+                size_t n_sg   = (size_t)cl->ssm_gate_rows * cl->ssm_gate_cols;
+                size_t n_a    = (size_t)cl->ssm_alpha_rows * cl->ssm_alpha_cols;
+                size_t n_b    = (size_t)cl->ssm_beta_rows  * cl->ssm_beta_cols;
+                size_t n_so   = (size_t)cl->ssm_out_rows   * cl->ssm_out_cols;
                 if (n_q > max_w_elems) max_w_elems = n_q;
                 if (n_k > max_w_elems) max_w_elems = n_k;
                 if (n_v > max_w_elems) max_w_elems = n_v;
@@ -7037,6 +7114,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 if (n_g > max_w_elems) max_w_elems = n_g;
                 if (n_u > max_w_elems) max_w_elems = n_u;
                 if (n_d > max_w_elems) max_w_elems = n_d;
+                if (n_qkv > max_w_elems) max_w_elems = n_qkv;
+                if (n_sg  > max_w_elems) max_w_elems = n_sg;
+                if (n_a   > max_w_elems) max_w_elems = n_a;
+                if (n_b   > max_w_elems) max_w_elems = n_b;
+                if (n_so  > max_w_elems) max_w_elems = n_so;
                 #define DO_W(field, src, type, n) do {                                   \
                     if (cl->type == GGML_TYPE_F16) {                                     \
                         CHECK_HIP(hipMalloc(&cl->field, (n) * 2));                       \
@@ -7050,6 +7132,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 DO_W(ffn_gate_w_bf16,    ffn_gate_w,    ffn_gate_type,    n_g);
                 DO_W(ffn_up_w_bf16,      ffn_up_w,      ffn_up_type,      n_u);
                 DO_W(ffn_down_w_bf16,    ffn_down_w,    ffn_down_type,    n_d);
+                DO_W(ssm_qkv_w_bf16,     ssm_qkv_w,     ssm_qkv_type,     n_qkv);
+                DO_W(ssm_gate_w_bf16,    ssm_gate_w,    ssm_gate_type,    n_sg);
+                DO_W(ssm_alpha_w_bf16,   ssm_alpha_w,   ssm_alpha_type,   n_a);
+                DO_W(ssm_beta_w_bf16,    ssm_beta_w,    ssm_beta_type,    n_b);
+                DO_W(ssm_out_w_bf16,     ssm_out_w,     ssm_out_type,     n_so);
                 #undef DO_W
             }
             #undef CONV_IF_F16
@@ -8645,9 +8732,19 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
         } else {
             /* === Standard attention === */
-            launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
-            launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
-            launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            if (r->ssm_fused_decode &&
+                cl->attn_q_type == GGML_TYPE_Q6_K && cl->attn_k_type == GGML_TYPE_Q6_K &&
+                cl->attn_v_type == GGML_TYPE_Q6_K) {
+                int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
+                int nc = cl->attn_q_cols;
+                void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
+                              &qr, &kr, &vr, &nc, &r->d_xb };
+                LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 64, 1, 1, 0, r->stream, a);
+            } else {
+                launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+                launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+                launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            }
 
             /* Attention biases (Qwen2.5-VL) */
             if (cl->attn_q_bias) launch_add(r, r->d_q, cl->attn_q_bias, cl->attn_q_rows);
@@ -8687,18 +8784,30 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             goto ffn_done;
         } else {
             /* Dense FFN */
-            launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
-                          cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
-            launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
-                          cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
-
-            launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
-            launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
-                          cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+            if (r->ssm_fused_decode &&
+                cl->ffn_gate_type == GGML_TYPE_Q6_K && cl->ffn_up_type == GGML_TYPE_Q6_K) {
+                int n_ff = cl->ffn_gate_rows;
+                int nc = cl->ffn_gate_cols;
+                void *a[] = { &r->d_gate, &cl->ffn_gate_w, &cl->ffn_up_w, &r->d_xb, &n_ff, &nc };
+                LAUNCH(r->fn_ffn_gate_up_silu_q6k, n_ff, 1, 1, 64, 1, 1, 0, r->stream, a);
+            } else {
+                launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                              cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
+                launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                              cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+                launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
+            }
+            if (r->ssm_fused_decode && cl->ffn_down_type == GGML_TYPE_Q6_K) {
+                int nr = cl->ffn_down_rows; /* n_embd */
+                int nc = cl->ffn_down_cols; /* n_ff */
+                void *a[] = { &r->d_x, &cl->ffn_down_w, &r->d_gate, &nr, &nc };
+                LAUNCH(r->fn_matvec_down_residual_q6k, nr, 1, 1, 64, 1, 1, 0, r->stream, a);
+            } else {
+                launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
+                              cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+                launch_add(r, r->d_x, r->d_xb, n_embd);
+            }
         }
-
-        /* Residual: x += xb */
-        launch_add(r, r->d_x, r->d_xb, n_embd);
 
 ffn_done:
         /* DeepStack injection */
@@ -9010,7 +9119,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
             /* 4 input projections (qkv, gate, alpha, beta) batched */
             #define SSM_GEMM(dst, w_field, type_field, rows_field, cols_field) do {       \
-                void *_w = get_bf16_weight(r, cl->w_field, NULL,                          \
+                void *_w = get_bf16_weight(r, cl->w_field, cl->w_field##_bf16,            \
                                 cl->type_field, cl->rows_field, cl->cols_field);          \
                 if (!_w) return -1;                                                       \
                 if (gemm_run_bf16_w(r, dst, _w, r->d_xnorm_batch_bf16, M,                 \
@@ -9094,7 +9203,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
                                       r->d_ssm_out_batch, M * d_inner);
             {
-                void *ow = get_bf16_weight(r, cl->ssm_out_w, NULL,
+                void *ow = get_bf16_weight(r, cl->ssm_out_w, cl->ssm_out_w_bf16,
                                 cl->ssm_out_type, cl->ssm_out_rows, cl->ssm_out_cols);
                 if (!ow) return -1;
                 if (gemm_run_bf16_w(r, r->d_attn_proj_batch, ow,
@@ -9777,6 +9886,11 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->ssm_alpha_w)    hipFree(cl->ssm_alpha_w);
             if (cl->ssm_beta_w)     hipFree(cl->ssm_beta_w);
             if (cl->ssm_out_w)      hipFree(cl->ssm_out_w);
+            if (cl->ssm_qkv_w_bf16)   hipFree(cl->ssm_qkv_w_bf16);
+            if (cl->ssm_gate_w_bf16)  hipFree(cl->ssm_gate_w_bf16);
+            if (cl->ssm_alpha_w_bf16) hipFree(cl->ssm_alpha_w_bf16);
+            if (cl->ssm_beta_w_bf16)  hipFree(cl->ssm_beta_w_bf16);
+            if (cl->ssm_out_w_bf16)   hipFree(cl->ssm_out_w_bf16);
             if (cl->ssm_a)          hipFree(cl->ssm_a);
             if (cl->ssm_dt_bias)    hipFree(cl->ssm_dt_bias);
             if (cl->ssm_conv1d_w)   hipFree(cl->ssm_conv1d_w);

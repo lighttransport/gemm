@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -62,6 +63,53 @@ struct ShapeKeyHash {
     return h;
   }
 };
+
+/* Pinned algo index override per shape. Populated from MM_BLASLT_ALGO_PINS env var. */
+struct ShapeKeyInt {
+  int M, N, K, flags;
+  bool operator==(const ShapeKeyInt &o) const noexcept {
+    return M == o.M && N == o.N && K == o.K && flags == o.flags;
+  }
+};
+struct ShapeKeyIntHash {
+  size_t operator()(const ShapeKeyInt &k) const noexcept {
+    size_t h = static_cast<size_t>(k.M) * 0x9E3779B185EBCA87ull;
+    h ^= static_cast<size_t>(k.N) * 0xC2B2AE3D27D4EB4Full;
+    h ^= static_cast<size_t>(k.K) * 0x165667B19E3779F9ull;
+    h ^= static_cast<size_t>(k.flags) * 0x94D049BB133111EBull;
+    return h;
+  }
+};
+static std::unordered_map<ShapeKeyInt, int, ShapeKeyIntHash> g_pinned_algos;
+
+/* Parse MM_BLASLT_ALGO_PINS env var.
+ * Format: "MxNxK:algo,MxNxK:algo,..."  e.g. "1024x4096x4096:73624,256x4096x4096:4104" */
+static void parse_pinned_algos() {
+  const char *pins = std::getenv("MM_BLASLT_ALGO_PINS");
+  if (!pins) return;
+  const char *p = pins;
+  while (*p) {
+    int M = 0, N = 0, K = 0, algo = 0;
+    int n = 0;
+    if (std::sscanf(p, "%dx%dx%d:%d%n", &M, &N, &K, &algo, &n) >= 4 && n > 0) {
+      ShapeKeyInt key{M, N, K, 0};
+      g_pinned_algos[key] = algo;
+      p += n;
+      if (*p == ',') ++p;
+    } else {
+      break;
+    }
+  }
+  /* verbose count printed by mm_blaslt_init after g_state is available */
+}
+
+/* Env-var MM_BLASLT_ALGO_INDEX: force all shapes to use this algo index.
+ * Set to 0 to disable. Negative or unset = use heuristic. */
+static int g_force_algo_index = -1;
+
+/* Env-var MM_BLASLT_LIST_ALGOS: set to 1 to print all returned algos per shape.
+ * This does NOT run the algo — just queries the heuristic and prints indices. */
+static int g_list_algos = 0;
 
 struct State {
   hipblasLtHandle_t handle = nullptr;
@@ -128,15 +176,53 @@ int build_plan(int M, int N, int K, int flags, Plan &p) {
     std::fprintf(stderr, "[mm_blaslt] no algos for M=%d N=%d K=%d\n", M, N, K);
     return -1;
   }
-  /* Pick first valid algo. NOTE: heuristic order is not perf-ranked on
-   * gfx1201 (klin_dn picks a 2× slower algo than klin_up despite same FLOPs).
-   * Both naive sweep (dummy buffers) and deferred sweep (real buffers, after
-   * user's setattr) segfault inside hipBLASLt's matmul setup — driver bug
-   * triggered by back-to-back matmul calls without intermediate work. The
-   * remaining klin gap requires a non-hipBLASLt path (Triton AOT or WMMA). */
+
+  /* Pick best algo (first valid by default). Supports three override mechanisms:
+   * 1. MM_BLASLT_ALGO_INDEX=N  — force N for all shapes (for quick benchmarking).
+   * 2. MM_BLASLT_ALGO_PINS="MxNxK:algo,..."  — shape-specific pins.
+   * 3. MM_BLASLT_LIST_ALGOS=1  — print all heuristic algos (manual selection aid).
+   *
+   * NOTE: inline sweep (benchmark all algos → pick fastest) segfaults on gfx1201
+   * due to a hipBLASLt driver bug in back-to-back matmul. Pinning via env var
+   * avoids this. See also the self-owned WMMA GEMM path which is the long-term
+   * replacement for hipBLASLt on gfx1201. */
+  int desired_algo_idx = -1;
+  if (g_force_algo_index >= 0) {
+    desired_algo_idx = g_force_algo_index;
+  } else {
+    ShapeKeyInt sk{M, N, K, flags};
+    auto it = g_pinned_algos.find(sk);
+    if (it != g_pinned_algos.end()) {
+      desired_algo_idx = it->second;
+    }
+  }
+
   int best = -1;
   for (int i = 0; i < returned; ++i) {
-    if (results[i].state == HIPBLAS_STATUS_SUCCESS) { best = i; break; }
+    if (results[i].state != HIPBLAS_STATUS_SUCCESS) continue;
+    if (g_list_algos) {
+      std::fprintf(stderr,
+          "[mm_blaslt]  M=%d N=%d K=%d flags=%d  algo[%d/%d] idx=%d ws=%zu\n",
+          M, N, K, flags, i, returned,
+          hipblaslt_ext::getIndexFromAlgo(results[i].algo),
+          results[i].workspaceSize);
+    }
+    if (desired_algo_idx >= 0) {
+      int idx = hipblaslt_ext::getIndexFromAlgo(results[i].algo);
+      if (idx == desired_algo_idx) { best = i; break; }
+    } else if (best < 0) {
+      best = i;  /* first valid, no pin requested */
+    }
+  }
+  if (best < 0) {
+    if (g_list_algos) {
+      std::fprintf(stderr, "[mm_blaslt]  no match for pinned algo %d; falling back\n",
+                   desired_algo_idx);
+    }
+    /* Fallback: first valid algo */
+    for (int i = 0; i < returned; ++i) {
+      if (results[i].state == HIPBLAS_STATUS_SUCCESS) { best = i; break; }
+    }
   }
   if (best < 0) {
     std::fprintf(stderr, "[mm_blaslt] no successful algo for M=%d N=%d K=%d\n",
@@ -171,6 +257,21 @@ extern "C" int mm_blaslt_init(void) {
       sizeof(max_ws)));
   if (const char *v = std::getenv("MM_BLASLT_VERBOSE")) {
     g_state.verbose = std::atoi(v);
+  }
+  if (const char *v = std::getenv("MM_BLASLT_ALGO_INDEX")) {
+    g_force_algo_index = std::atoi(v);
+    if (g_state.verbose) {
+      std::fprintf(stderr, "[mm_blaslt] forcing algo index %d for all shapes\n",
+                   g_force_algo_index);
+    }
+  }
+  if (const char *v = std::getenv("MM_BLASLT_LIST_ALGOS")) {
+    g_list_algos = std::atoi(v) != 0;
+  }
+  parse_pinned_algos();
+  if (g_state.verbose && !g_pinned_algos.empty()) {
+    std::fprintf(stderr, "[mm_blaslt] %zu pinned algos loaded\n",
+                 g_pinned_algos.size());
   }
   g_state.initialized = true;
   return 0;
