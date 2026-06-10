@@ -239,3 +239,6 @@ cuda/qimg/int8_smooth_samples/
 cuda/qimg/int8_smooth_a075/
 cuda/qimg/fp4_svdquant_samples/
 cuda/qimg/fp8_reference/
+
+# scan chunked-prototype dev binary
+cuda/llm/scan/deltanet_chunk_test
