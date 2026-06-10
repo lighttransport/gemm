@@ -3209,6 +3209,95 @@ static const char *hip_kernel_source =
 "    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
 "    IQ2S_DP4A_BODY\n"
 "}\n"
+"/* ======================================================================== */\n"
+"/* LDS-cached grid decode matvecs: copy the iq2s/iq3s grid table into shared   */\n"
+"/* memory once per block so the divergent per-lane lookups hit LDS (~20 cyc)    */\n"
+"/* instead of L2 (~200 cyc). Same full-utilization math as the F32 kernels.     */\n"
+"/* ======================================================================== */\n"
+"#define IQ3S_FU_BODY(GRID) \\\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 110; \\\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes; \\\n"
+"    int G = nb * 32; float sum = 0.0f; \\\n"
+"    for (int g = lane; g < G; g += 32) { \\\n"
+"        int b = g >> 5; int g32 = g & 31; int sb = g32 >> 2; int l = g32 & 3; \\\n"
+"        const unsigned char *bp = row_ptr + b * 110; \\\n"
+"        float d = half_to_float(*(const half_raw *)bp); \\\n"
+"        unsigned char sc = bp[106 + (sb >> 1)]; \\\n"
+"        float db = d * (float)(1 + 2 * ((sb & 1) ? (sc >> 4) : (sc & 0xf))); \\\n"
+"        unsigned char qh = bp[66 + sb]; \\\n"
+"        unsigned char qs0 = bp[2 + sb * 8 + 2 * l + 0]; \\\n"
+"        unsigned char qs1 = bp[2 + sb * 8 + 2 * l + 1]; \\\n"
+"        const unsigned char *grid1 = (const unsigned char *)&GRID[qs0 | ((qh << (8 - 2 * l)) & 256)]; \\\n"
+"        const unsigned char *grid2 = (const unsigned char *)&GRID[qs1 | ((qh << (7 - 2 * l)) & 256)]; \\\n"
+"        unsigned char s = bp[74 + sb * 4 + l]; \\\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8; \\\n"
+"        float partial = 0.0f; \\\n"
+"        for (int j = 0; j < 4; j++) { \\\n"
+"            partial += db * (float)grid1[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j]; \\\n"
+"            partial += db * (float)grid2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f) * xb[j+4]; \\\n"
+"        } \\\n"
+"        sum += partial; \\\n"
+"    } \\\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o); \\\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"#define IQ2S_FU_BODY(GRID) \\\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 82; \\\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes; \\\n"
+"    int G = nb * 32; float sum = 0.0f; \\\n"
+"    for (int g = lane; g < G; g += 32) { \\\n"
+"        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3; \\\n"
+"        const unsigned char *bp = row_ptr + b * 82; \\\n"
+"        float d = half_to_float(*(const half_raw *)bp); \\\n"
+"        unsigned char scale = bp[74 + ib32]; \\\n"
+"        float db = (l < 2) ? d * (0.5f + (float)(scale & 0xf)) * 0.25f \\\n"
+"                           : d * (0.5f + (float)(scale >>  4)) * 0.25f; \\\n"
+"        unsigned char qsl = bp[2 + ib32 * 4 + l]; \\\n"
+"        unsigned char qh  = bp[66 + ib32]; \\\n"
+"        int grid_idx = qsl | ((qh << (8 - 2 * l)) & 0x300); \\\n"
+"        const unsigned char *grid = (const unsigned char *)&GRID[grid_idx]; \\\n"
+"        unsigned char s = bp[34 + ib32 * 4 + l]; \\\n"
+"        const float *xb = x + b * 256 + ib32 * 32 + l * 8; \\\n"
+"        float partial = 0.0f; \\\n"
+"        for (int j = 0; j < 8; j++) \\\n"
+"            partial += db * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j]; \\\n"
+"        sum += partial; \\\n"
+"    } \\\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o); \\\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"__global__ void matvec_iq3_s_lds_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    __shared__ unsigned int sgrid[512];\n"
+"    for (int i = threadIdx.x; i < 512; i += blockDim.x) sgrid[i] = iq3s_grid_dev[i];\n"
+"    __syncthreads();\n"
+"    int lane = threadIdx.x % 32; int row = blockIdx.x * 8 + threadIdx.x / 32;\n"
+"    if (row < n_rows) { IQ3S_FU_BODY(sgrid) }\n"
+"}\n"
+"__global__ void matvec_iq3_s_expert_lds_f32(float *dst, const unsigned char *base, const float *x,\n"
+"                                              int n_rows, int n_cols,\n"
+"                                              const int *eidx, int slot, long long stride) {\n"
+"    __shared__ unsigned int sgrid[512];\n"
+"    for (int i = threadIdx.x; i < 512; i += blockDim.x) sgrid[i] = iq3s_grid_dev[i];\n"
+"    __syncthreads();\n"
+"    int lane = threadIdx.x % 32; int row = blockIdx.x * 8 + threadIdx.x / 32;\n"
+"    if (row < n_rows) { const unsigned char *mat = base + (long long)eidx[slot] * stride; IQ3S_FU_BODY(sgrid) }\n"
+"}\n"
+"__global__ void matvec_iq2_s_lds_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    __shared__ unsigned long long sgrid[1024];\n"
+"    for (int i = threadIdx.x; i < 1024; i += blockDim.x) sgrid[i] = iq2s_grid_dev[i];\n"
+"    __syncthreads();\n"
+"    int lane = threadIdx.x % 32; int row = blockIdx.x * 8 + threadIdx.x / 32;\n"
+"    if (row < n_rows) { IQ2S_FU_BODY(sgrid) }\n"
+"}\n"
+"__global__ void matvec_iq2_s_expert_lds_f32(float *dst, const unsigned char *base, const float *x,\n"
+"                                              int n_rows, int n_cols,\n"
+"                                              const int *eidx, int slot, long long stride) {\n"
+"    __shared__ unsigned long long sgrid[1024];\n"
+"    for (int i = threadIdx.x; i < 1024; i += blockDim.x) sgrid[i] = iq2s_grid_dev[i];\n"
+"    __syncthreads();\n"
+"    int lane = threadIdx.x % 32; int row = blockIdx.x * 8 + threadIdx.x / 32;\n"
+"    if (row < n_rows) { const unsigned char *mat = base + (long long)eidx[slot] * stride; IQ2S_FU_BODY(sgrid) }\n"
+"}\n"
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -4603,6 +4692,12 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq3_s_dp4a;
     hipFunction_t fn_matvec_iq2_s_expert_dp4a;
     hipFunction_t fn_matvec_iq3_s_expert_dp4a;
+    /* LDS-cached grid decode path */
+    hipFunction_t fn_matvec_iq3_s_lds_f32;
+    hipFunction_t fn_matvec_iq3_s_expert_lds_f32;
+    hipFunction_t fn_matvec_iq2_s_lds_f32;
+    hipFunction_t fn_matvec_iq2_s_expert_lds_f32;
+    int lds_grid;        /* LLM_LDS_GRID: cache iq2s/iq3s grids in shared memory */
     void *d_act_q8;      /* int8 activation A (d_xb), per-32-block (<= 8192 cols) */
     void *d_act_scale;   /* per-32-block fp32 scale A */
     void *d_act_q8_b;    /* int8 activation B (expert d_gate for down-proj) */
@@ -4905,6 +5000,10 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq3_s_dp4a);
     GET_FUNC(matvec_iq2_s_expert_dp4a);
     GET_FUNC(matvec_iq3_s_expert_dp4a);
+    GET_FUNC(matvec_iq3_s_lds_f32);
+    GET_FUNC(matvec_iq3_s_expert_lds_f32);
+    GET_FUNC(matvec_iq2_s_lds_f32);
+    GET_FUNC(matvec_iq2_s_expert_lds_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_1_f32);
@@ -5007,6 +5106,8 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
      * future tuning (e.g. SIMD sign via __vsub4, LDS-cached grids). */
     r->decode_dp4a = 0;
     { const char *e = getenv("LLM_DECODE_DP4A"); if (e) r->decode_dp4a = atoi(e) != 0; }
+    r->lds_grid = 0;
+    { const char *e = getenv("LLM_LDS_GRID"); if (e) r->lds_grid = atoi(e) != 0; }
     {
         const size_t QCAP = 8192;
         if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
@@ -6342,23 +6443,29 @@ static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
  * full-utilization F32 fallback. Used by launch_matvec_auto + verify harness. */
 static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
-    if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    if (r->lds_grid) {
+        LAUNCH(r->fn_matvec_iq2_s_lds_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1,
+               1024 * sizeof(unsigned long long), r->stream, args);
+    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
         launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
-        void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_matvec_iq2_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq2_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a2);
     } else {
-        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
         LAUNCH(r->fn_matvec_iq2_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
     }
 }
 static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
-    if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    if (r->lds_grid) {
+        LAUNCH(r->fn_matvec_iq3_s_lds_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1,
+               512 * sizeof(unsigned int), r->stream, args);
+    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
         launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
-        void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_matvec_iq3_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq3_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a2);
     } else {
-        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
         LAUNCH(r->fn_matvec_iq3_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
     }
 }
@@ -6787,13 +6894,18 @@ static inline void launch_matvec_expert_auto(hip_llm_runner *r, void *dst, void 
                                               int slot, long long stride) {
     void *args[] = { &dst, &base, &x, &n_rows, &n_cols, &r->d_moe_idx, &slot, &stride };
     hipFunction_t fn;
-    switch (type) {
+    unsigned int smem = 0;
+    if (r->lds_grid && type == GGML_TYPE_IQ2_S) {
+        fn = r->fn_matvec_iq2_s_expert_lds_f32; smem = 1024 * sizeof(unsigned long long);
+    } else if (r->lds_grid && type == GGML_TYPE_IQ3_S) {
+        fn = r->fn_matvec_iq3_s_expert_lds_f32; smem = 512 * sizeof(unsigned int);
+    } else switch (type) {
         case GGML_TYPE_IQ2_S:  fn = r->fn_matvec_iq2_s_expert_f32;  break;
         case GGML_TYPE_IQ3_S:  fn = r->fn_matvec_iq3_s_expert_f32;  break;
         case GGML_TYPE_IQ4_XS: fn = r->fn_matvec_iq4_xs_expert_f32; break;
         default: fn = r->fn_matvec_iq2_s_expert_f32; break; /* gated by moe_dev_dispatch_ok */
     }
-    LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, smem, r->stream, args);
 }
 
 /* Top-K softmax for MoE routing */
