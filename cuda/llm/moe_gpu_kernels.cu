@@ -4,6 +4,7 @@
  */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <float.h>
 
 extern "C" __global__ void moe_topk_gpu(int *idx_out, float *wgt_out, const float *logits, int n_experts, int n_used, int n_tokens) {
     int token = blockIdx.x;
@@ -11,48 +12,72 @@ extern "C" __global__ void moe_topk_gpu(int *idx_out, float *wgt_out, const floa
     logits += (size_t)token * n_experts;
     idx_out += (size_t)token * n_used;
     wgt_out += (size_t)token * n_used;
-    int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    int tid = threadIdx.x;
     float tv[8]; int ti[8];
-    for (int i = 0; i < n_used; i++) { tv[i] = -1e38f; ti[i] = -1; }
-    int es = warp * (n_experts / 4), ee = es + (n_experts / 4);
-    if (warp == 3) ee = n_experts;
-    for (int e = es + lane; e < ee; e += 32) {
+    for (int i = 0; i < 8; i++) { tv[i] = -1e38f; ti[i] = -1; }
+    for (int e = tid; e < n_experts; e += blockDim.x) {
         float v = logits[e];
-        if (v > tv[n_used-1]) {
+        if (!(v == v)) v = -FLT_MAX;
+        if (v > tv[n_used-1] || (v == tv[n_used-1] && (ti[n_used-1] < 0 || e < ti[n_used-1]))) {
             tv[n_used-1] = v; ti[n_used-1] = e;
-            for (int i = n_used-2; i >= 0 && tv[i+1] > tv[i]; i--) {
+            for (int i = n_used-2; i >= 0 &&
+                 (tv[i+1] > tv[i] || (tv[i+1] == tv[i] && ti[i+1] >= 0 && (ti[i] < 0 || ti[i+1] < ti[i]))); i--) {
                 float xv = tv[i]; int xi = ti[i];
                 tv[i] = tv[i+1]; ti[i] = ti[i+1]; tv[i+1] = xv; ti[i+1] = xi;
             }
         }
     }
-    __shared__ float slv[32]; __shared__ int sli[32];
-    for (int i = lane; i < 8; i += 32) { slv[warp*8+i] = tv[i]; sli[warp*8+i] = ti[i]; }
+    __shared__ float slv[1024];
+    __shared__ int sli[1024];
+    int base = tid * 8;
+    for (int i = 0; i < 8; i++) {
+        slv[base + i] = tv[i];
+        sli[base + i] = ti[i];
+    }
     __syncthreads();
-    if (warp == 0 && lane < n_used) {
+    if (tid == 0) {
         float fv[8]; int fi[8];
-        for (int i = 0; i < n_used; i++) { fv[i] = slv[i]; fi[i] = sli[i]; }
-        for (int w = 1; w < 4; w++) {
-            int off = w * 8;
-            for (int k = 0; k < n_used; k++) {
-                int idx = sli[off + k]; if (idx < 0) continue;
-                float v = slv[off + k];
-                if (v > fv[n_used-1]) { fv[n_used-1] = v; fi[n_used-1] = idx;
-                    for (int ii = n_used-2; ii >= 0 && fv[ii+1] > fv[ii]; ii--) {
-                        float xv = fv[ii]; int xi = fi[ii];
-                        fv[ii] = fv[ii+1]; fi[ii] = fi[ii+1]; fv[ii+1] = xv; fi[ii+1] = xi;
-                    }
+        for (int i = 0; i < 8; i++) { fv[i] = -1e38f; fi[i] = -1; }
+        int n_cand = blockDim.x * 8;
+        for (int c = 0; c < n_cand; c++) {
+            int idx = sli[c];
+            if (idx < 0) continue;
+            float v = slv[c];
+            if (v > fv[n_used-1] || (v == fv[n_used-1] && (fi[n_used-1] < 0 || idx < fi[n_used-1]))) {
+                fv[n_used-1] = v; fi[n_used-1] = idx;
+                for (int ii = n_used-2; ii >= 0 &&
+                     (fv[ii+1] > fv[ii] || (fv[ii+1] == fv[ii] && fi[ii+1] >= 0 && (fi[ii] < 0 || fi[ii+1] < fi[ii]))); ii--) {
+                    float xv = fv[ii]; int xi = fi[ii];
+                    fv[ii] = fv[ii+1]; fi[ii] = fi[ii+1]; fv[ii+1] = xv; fi[ii+1] = xi;
                 }
             }
         }
-        idx_out[lane] = fi[lane]; wgt_out[lane] = 1.0f / (1.0f + expf(-fv[lane]));
+        float max_v = fv[0];
+        for (int i = 1; i < n_used; i++)
+            if (fv[i] > max_v) max_v = fv[i];
+        float sum = 0.0f;
+        for (int i = 0; i < n_used; i++)
+            sum += expf(fv[i] - max_v);
+        for (int i = 0; i < n_used; i++) {
+            idx_out[i] = fi[i];
+            wgt_out[i] = expf(fv[i] - max_v) / sum;
+        }
     }
 }
 
 extern "C" __global__ void moe_shared_gate_gpu(float *go, const float *xb, const float *gw, int ne) {
+    __shared__ float warp_sums[4];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
     float s = 0; for (int i = threadIdx.x; i < ne; i += 128) s += gw[i] * xb[i];
     for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffff, s, o);
-    if (threadIdx.x == 0) *go = 1.0f / (1.0f + expf(-s));
+    if (lane == 0) warp_sums[warp] = s;
+    __syncthreads();
+    if (warp == 0) {
+        s = (lane < 4) ? warp_sums[lane] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffff, s, o);
+        if (lane == 0) *go = 1.0f / (1.0f + expf(-s));
+    }
 }
 
 /* F16 TC matvec (shared expert) */
