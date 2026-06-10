@@ -1725,7 +1725,8 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
         per_layer += ds4f_wbytes(dq, qbr, c->q_lora) + ds4f_sbytes(dq, qbr, c->q_lora) + 2*pad; }
     per_layer += ds4f_wbytes(dq, c->kv_lora, c->hidden) + ds4f_sbytes(dq, c->kv_lora, c->hidden) + 2*pad;
     {   int oir0, oirows; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &oir0, &oirows);  /* wo_a (TP o_inter shard) */
-        per_layer += ds4f_wbytes(dq, oirows, c->hidden) + ds4f_sbytes(dq, oirows, c->hidden) + 2*pad; }
+        int gin = c->n_heads * c->q_head_dim / c->o_groups;  /* wo_a cols (== hidden for ds4f only) */
+        per_layer += ds4f_wbytes(dq, oirows, gin) + ds4f_sbytes(dq, oirows, gin) + 2*pad; }
     {   int oir0, oir; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &oir0, &oir);
         int wob_c = c->o_inter;                               /* wo_b (DS4F_TP_WOB: FP8 o_inter col-shard) */
         if (oir < c->o_inter && !dense_bf16 && getenv("DS4F_TP_WOB") && atoi(getenv("DS4F_TP_WOB"))) wob_c = oir;
@@ -2095,9 +2096,10 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->kv_norm   = (uint16_t *)ds4f_bump(m, (size_t)cfg.kv_lora*2, 64);
         ds4f_qtype dq = m->dense_qt;
         ly->wq_a = ds4f_new_tensor(m, dq, cfg.q_lora, C);
-        ly->wq_b = ds4f_new_tensor(m, dq, cfg.n_heads*cfg.q_head_dim, cfg.q_lora);
+        ly->wq_b = ds4f_new_tensor(m, dq, (m->attn_h1 - m->attn_h0) * cfg.q_head_dim, cfg.q_lora);  /* TP: owned heads (mirrors load_real; full wq_b would also OOB s_q under TP_ATTN) */
         ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
-        ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows, C);       /* TP: o_inter row-shard */
+        ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows,           /* TP: o_inter row-shard */
+                                   cfg.n_heads*cfg.q_head_dim/cfg.o_groups);  /* cols = gin (== hidden for ds4f only) */
         {   const char *e = getenv("DS4F_TP_WOB");              /* wo_b: FP8 o_inter col-shard (pairs w/ TP_OPROJ) */
             int wob_s = (m->oi_rows < cfg.o_inter) && dq == DS4F_FP8 && e && atoi(e);
             ly->wo_b = ds4f_new_tensor(m, dq, C, wob_s ? m->oi_rows : cfg.o_inter); }
@@ -2173,7 +2175,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     m->s_q     = (float *)aligned_alloc(256, (size_t)H*4);
     m->s_kvlat = (float *)aligned_alloc(256, (size_t)cfg.kv_lora*4);
     m->s_attn  = (float *)aligned_alloc(256, (size_t)H*4);
-    m->s_oin   = (float *)aligned_alloc(256, (size_t)C*4);
+    m->s_oin   = (float *)aligned_alloc(256, (size_t)(C > H/cfg.o_groups ? C : H/cfg.o_groups)*4);  /* stand-in needs gin=H/og floats */
     m->s_o1    = (float *)aligned_alloc(256, (size_t)cfg.o_inter*4);
     m->s_o     = (float *)aligned_alloc(256, (size_t)C*4);
     m->s_h2    = (float *)aligned_alloc(256, (size_t)C*4);
@@ -2782,7 +2784,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wq_a = ds4f_new_tensor(m, dq, cfg.q_lora, C);
         ly->wq_b = ds4f_new_tensor(m, dq, (m->attn_h1 - m->attn_h0) * cfg.q_head_dim, cfg.q_lora);  /* TP: owned heads */
         ly->wkv  = ds4f_new_tensor(m, dq, cfg.kv_lora, C);
-        ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows, C);       /* TP: o_inter row-shard */
+        ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows,           /* TP: o_inter row-shard */
+                                   cfg.n_heads*cfg.q_head_dim/cfg.o_groups);  /* cols = gin (== hidden for ds4f only) */
         {   const char *e = getenv("DS4F_TP_WOB");              /* wo_b: FP8 o_inter col-shard (pairs w/ TP_OPROJ) */
             int wob_s = (m->oi_rows < cfg.o_inter) && dq == DS4F_FP8 && e && atoi(e);
             ly->wo_b = ds4f_new_tensor(m, dq, C, wob_s ? m->oi_rows : cfg.o_inter); }
@@ -2920,7 +2923,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         mt->wq_a=ds4f_new_tensor(m,dq,cfg.q_lora,C2);                        ds4f_load_dense(m,&B,&mt->wq_a,MTPN("attn.wq_a"));
         mt->wq_b=ds4f_new_tensor(m,dq,cfg.n_heads*cfg.q_head_dim,cfg.q_lora); ds4f_load_dense(m,&B,&mt->wq_b,MTPN("attn.wq_b"));
         mt->wkv =ds4f_new_tensor(m,dq,cfg.kv_lora,C2);                       ds4f_load_dense(m,&B,&mt->wkv,MTPN("attn.wkv"));
-        mt->wo_a=ds4f_new_tensor(m,dq,cfg.o_inter,C2);                       ds4f_load_dense(m,&B,&mt->wo_a,MTPN("attn.wo_a"));
+        mt->wo_a=ds4f_new_tensor(m,dq,cfg.o_inter,cfg.n_heads*cfg.q_head_dim/cfg.o_groups); ds4f_load_dense(m,&B,&mt->wo_a,MTPN("attn.wo_a"));
         mt->wo_b=ds4f_new_tensor(m,dq,C2,cfg.o_inter);                       ds4f_load_dense(m,&B,&mt->wo_b,MTPN("attn.wo_b"));
         mt->gate=ds4f_new_tensor(m,m->bf16_mv_qt,cfg.n_experts,C2);          ds4f_load_dense(m,&B,&mt->gate,MTPN("ffn.gate"));
         mt->gate_bias=(float*)aligned_alloc(64,(size_t)cfg.n_experts*4);     ds4f_load_raw(m,&B,mt->gate_bias,MTPN("ffn.gate.bias"),DS4F_F32,1,cfg.n_experts);
@@ -2967,7 +2970,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     m->s_q     = (float *)aligned_alloc(256, (size_t)H * 4);
     m->s_kvlat = (float *)aligned_alloc(256, (size_t)cfg.kv_lora * 4);
     m->s_attn  = (float *)aligned_alloc(256, (size_t)H * 4);
-    m->s_oin   = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_oin   = (float *)aligned_alloc(256, (size_t)(C > H/cfg.o_groups ? C : H/cfg.o_groups) * 4);  /* stand-in needs gin=H/og floats */
     m->s_o1    = (float *)aligned_alloc(256, (size_t)cfg.o_inter * 4);
     m->s_o     = (float *)aligned_alloc(256, (size_t)C * 4);
     m->s_h2    = (float *)aligned_alloc(256, (size_t)C * 4);
@@ -4606,8 +4609,9 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             }
             ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1 + (ly->wo_b.cols < c->o_inter ? m->oi0 : 0));  /* col-shard: owned o_inter slice. [hidden], partial under TP */
         } else {
-            for (int i = 0; i < C; i++) m->s_oin[i] = 0.f;
-            for (int g = 0; g < og; g++) for (int i = 0; i < C; i++) m->s_oin[i] += m->s_attn[g*C + i];
+            int sgin = H / og;   /* stand-in group width = wo_a cols (== C for ds4f only) */
+            for (int i = 0; i < sgin; i++) m->s_oin[i] = 0.f;
+            for (int g = 0; g < og; g++) for (int i = 0; i < sgin; i++) m->s_oin[i] += m->s_attn[g*sgin + i];
             ds4f_matvec(m, m->s_o1, &ly->wo_a, m->s_oin);       /* [o_inter] */
             for (int i = 0; i < c->o_inter; i++) m->s_o1[i] = ds4f_silu(m->s_o1[i]);  /* stand-in nonlin */
             ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1 + (ly->wo_b.cols < c->o_inter ? m->oi0 : 0));  /* col-shard: owned o_inter slice. [hidden] */

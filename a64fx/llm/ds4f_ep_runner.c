@@ -41,7 +41,7 @@
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
 
-#define MAX_NODES 32
+#define MAX_NODES 96   /* DS4P targets 48-64 ranks (was 32 for the 11-node DS4F runs) */
 #define RUN_STAG  DEMO_STAG
 #define WAIT_TIMEOUT_SEC 300.0   /* tolerate cold first-touch skew across ranks */
 
@@ -265,7 +265,7 @@ int main(void) {
     if (MyRank == 0) g_log = fopen("ds4f_ep_rank00.txt", "w");
 
     int ep_rank = MyRank, ep_size = N;
-    ds4f_config cfg = ds4f_default_config();
+    ds4f_config cfg = ds4f_config_from_env();
     cfg.max_pos = maxpos;
     if (layers > 0) cfg.n_layers = layers;
     if (prefill + maxgen > cfg.max_pos) die("prefill+maxgen exceeds max_pos", -1);
