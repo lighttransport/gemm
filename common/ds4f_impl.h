@@ -4377,6 +4377,138 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     DS4F_TOC(DS4F_P_HEAD); }
 }
 
+/* M2b BATCHED VERIFY: run K positions [pos0, pos0+K) through the 43 layers + head with mHC + tier-B2,
+ * BATCHING the dense GEMMs + the per-layer reduce (the amortization) and LOOPING the per-position tier-B2
+ * attention in causal order (position k sees k-1's appended KV). COHERENT, not byte-identical to M=1 decode
+ * (the GEMM reassociates vs the matvec); the spec loop's committed tokens are the verify's self-consistent
+ * output. NO-TP path (full dense -- the moderate-ctx spec-decode regime; TP-compose is a later refinement),
+ * no CP (off at moderate ctx). Requires exact+mhc+tierb2, !int8_kv, ds4f_alloc_prefill_batch(>=K).
+ * out_tok[K] = per-position argmax; out_hc[K*hc*C] = per-position final HC state (for the next draft). */
+static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, int *out_tok, float *out_hc) {
+    ds4f_config *c = &m->cfg;
+    int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
+    float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
+    float pa[8][16], ca[8][64], pf[8][16], cf[8][64];    /* per-position sinkhorn weights (K<=8) */
+    if (!m->v_x4) { size_t vb = (size_t)m->m_tile*hcC*4;
+        m->v_x4 = (float *)aligned_alloc(256, vb); m->v_resid = (float *)aligned_alloc(256, vb); }
+    for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
+        memcpy(m->v_x4 + (size_t)k*hcC + (size_t)s*C, X + (size_t)k*C, (size_t)C*4);
+    for (int L = 0; L < c->n_layers; L++) {
+        ds4f_layer *ly = &m->layers[L];
+        int ratio = c->compress_ratios[L];
+        const float *rcos = ratio ? m->rope_comp_cos : m->rope_dense_cos;
+        const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;
+        /* mHC pre (attn): collapse each position's hc streams -> p_x[k]; save residual + sinkhorn weights */
+        for (int k = 0; k < K; k++) {
+            ds4f_hc_pre(m, m->v_x4 + (size_t)k*hcC, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
+                        m->p_x + (size_t)k*C, pa[k], ca[k]);
+            memcpy(m->v_resid + (size_t)k*hcC, m->v_x4 + (size_t)k*hcC, hcC*4);
+        }
+        /* batched q/kv projections */
+        { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, K, C, C };
+          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+        ds4f_gemm(m, m->p_qlat, &ly->wq_a, m->p_hn, K, c->q_lora, C);
+        { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, K, c->q_lora, c->q_lora };
+          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+        ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, K, H, c->q_lora);
+        { ds4f_pf_qnr_task t = { m, pos0, K, rcos, rsin };
+          ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
+        ds4f_gemm(m, m->p_kvlat, &ly->wkv, m->p_hn, K, KV, C);
+        /* per-position tier-B2 attention (causal: append KV then attend, in order) */
+        for (int k = 0; k < K; k++) {
+            int pos = pos0 + k;
+            float *kvl = m->p_kvlat + (size_t)k*KV;
+            ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
+            ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
+            { uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
+              for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]); }
+            memcpy(m->s_hn, m->p_hn + (size_t)k*C, (size_t)C*4);     /* compressor reads s_hn */
+            memcpy(m->s_q,  m->p_q  + (size_t)k*H, (size_t)H*4);     /* indexer + attention read s_q */
+            if (m->tierb2 && ratio) ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin);
+            m->cp_gather = 0;
+            if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
+                                          c->window_size, c->qk_rope_dim/2, rcos, rsin };
+                ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+            } else { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
+                                          c->window_size, c->qk_rope_dim/2, rcos, rsin };
+                ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
+            memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
+        }
+        /* batched grouped low-rank o-projection (no-TP) */
+        for (int g = 0; g < og; g++) {
+            ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
+            ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
+        }
+        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
+        for (int k = 0; k < K; k++)                                  /* mHC post (attn) */
+            ds4f_hc_post(m, m->v_x4 + (size_t)k*hcC, m->v_resid + (size_t)k*hcC, m->p_o + (size_t)k*C, pa[k], ca[k]);
+        /* mHC pre (ffn) */
+        for (int k = 0; k < K; k++) {
+            ds4f_hc_pre(m, m->v_x4 + (size_t)k*hcC, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
+                        m->p_x + (size_t)k*C, pf[k], cf[k]);
+            memcpy(m->v_resid + (size_t)k*hcC, m->v_x4 + (size_t)k*hcC, hcC*4);
+        }
+        { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, K, C, C };
+          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+        /* shared expert (no-TP) */
+        ds4f_gemm(m, m->p_shg, &ly->sh_w1, m->p_h2, K, c->shared_inter, C);
+        ds4f_gemm(m, m->p_shu, &ly->sh_w3, m->p_h2, K, c->shared_inter, C);
+        { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, K,
+                                    c->shared_inter, c->shared_inter, c->swiglu_limit };
+          ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
+        ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);
+        /* router + routed experts (bucketed batched GEMM, reuse the prefill scheme) */
+        ds4f_gemm(m, m->p_router, &ly->gate, m->p_h2, K, c->n_experts, C);
+        { int no = ly->n_owned;
+          for (int s = 0; s < no; s++) m->ex_cnt[s] = 0;
+          for (int k = 0; k < K; k++) {
+              int idx[8]; float wt[8];
+              ds4f_topk_exact(m->p_router + (size_t)k*c->n_experts, ly->gate_bias,
+                              c->n_experts, c->n_active, idx, wt, c->routed_scale);
+              float *route = m->p_route + (size_t)k*C;
+              for (int i = 0; i < C; i++) route[i] = 0.f;
+              for (int a = 0; a < c->n_active; a++) {
+                  int e = idx[a]; if (e < 0 || e % m->ep_size != m->ep_rank) continue;
+                  int slot = e / m->ep_size, p = m->ex_cnt[slot]++;
+                  m->ex_tok[(size_t)slot*m->m_tile + p] = k; m->ex_wt[(size_t)slot*m->m_tile + p] = wt[a];
+              }
+          }
+          for (int s = 0; s < no; s++) {
+              int cnt = m->ex_cnt[s]; if (!cnt) continue;
+              for (int p = 0; p < cnt; p++) { const float *h2 = m->p_h2 + (size_t)m->ex_tok[(size_t)s*m->m_tile+p]*C;
+                  float *xe = m->p_exX + (size_t)p*C; for (int i = 0; i < C; i++) xe[i] = h2[i]; }
+              ds4f_gemm(m, m->p_exG, &ly->ex_w1[s], m->p_exX, cnt, c->moe_inter, C);
+              ds4f_gemm(m, m->p_exU, &ly->ex_w3[s], m->p_exX, cnt, c->moe_inter, C);
+              { ds4f_pf_swiglu_task t = { m, m->p_exG, m->p_exU, c->moe_inter, cnt,
+                                          c->moe_inter, c->moe_inter, c->swiglu_limit };
+                ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
+              ds4f_gemm(m, m->p_exO, &ly->ex_w2[s], m->p_exG, cnt, C, c->moe_inter);
+              for (int p = 0; p < cnt; p++) { int k = m->ex_tok[(size_t)s*m->m_tile+p]; float w = m->ex_wt[(size_t)s*m->m_tile+p];
+                  float *route = m->p_route + (size_t)k*C; const float *o = m->p_exO + (size_t)p*C;
+                  for (int i = 0; i < C; i++) route[i] += w * o[i]; }
+          } }
+        if (m->ar_cb) m->ar_cb(m->p_route, C*K, m->ar_ctx);          /* EP combine: one [K,C] reduce */
+        for (int k = 0; k < K; k++) {                                /* moe out = shared + routed; mHC post (ffn) */
+            float *mo = m->p_moe + (size_t)k*C, *ro = m->p_route + (size_t)k*C, *o = m->p_o + (size_t)k*C;
+            for (int i = 0; i < C; i++) o[i] = mo[i] + ro[i];
+            ds4f_hc_post(m, m->v_x4 + (size_t)k*hcC, m->v_resid + (size_t)k*hcC, o, pf[k], cf[k]);
+        }
+    }
+    /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
+    for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
+    { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, K, C, C };
+      ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+    if (!m->p_logits) m->p_logits = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)c->vocab*4);
+    int hrows = m->head.rows, tph = (hrows < c->vocab);
+    ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, K, hrows, C);
+    { float *hval = tph ? (float *)alloca((size_t)K*4) : NULL;
+      ds4f_pf_argmax_task t = { m->p_logits, out_tok, hrows, K, m->head_r0, hval };
+      ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
+      if (tph && m->ar_argmax_cb) for (int k = 0; k < K; k++) { int32_t idx = out_tok[k]; float v = hval[k];
+          m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; } }
+    if (out_hc) memcpy(out_hc, m->v_x4, (size_t)K*hcC*4);
+}
+
 /* DS4F_MTP forward (STUB -- scaffold only). Predicts the token after `next_id` given the main model's
  * last hidden state x[hidden] at `pos`. Reference (MTPBlock.forward, inference/model.py):
  *   e  = enorm(embed(next_id));   h = hnorm(x)
