@@ -22,6 +22,32 @@ mmproj: `mmproj-F16.gguf` (Qwen3-VL vision tower).
 HIP cmd: `LLM_PREFILL_WARMUP=2 ./test_hip_llm <model> -s 1300 --bench --gpu-only-bench --prefill-len {512,1024} --decode 128`
 llama: `llama-bench -m <model> --device ROCm0 -ngl 99 -fa on -p 512,1024 -n 128 -r 3`
 
+### Decode optimization progress (2026-06-10)
+
+Decode (greedy, after a 64-token prefill, graph capture on):
+
+| build | decode tok/s | vs llama.cpp 83 |
+| ----- | -----------: | --------------: |
+| session start (commit db4a2e9)            | 29.1 | 2.85× slower |
+| + GPU-side sync-free MoE dispatch + graph (01aee4d) | 36.4 | 2.28× |
+| + full warp/thread util IQ2_S/IQ3_S/Q6_K matvec (4bb7e79) | **45.5** | **1.82×** |
+
+Net **+56%** so far; verified bit-exact (`--verify-quant-kernels` 18/18 PASS) and
+output unchanged (VLM still identifies Mt. Fuji).
+
+**Diagnostics (rocprofv3 kernel trace, decode, graph off):**
+- HIP-graph capture only adds ~4% → decode is **GPU-compute-bound**, not launch-bound.
+  The ~20% win from MoE dispatch came from removing 80 host syncs/token, not launches.
+- The dequant matvecs dominate. Original kernels strided the K dim by `n_blocks`
+  (nb), but MoE/attn/LM-head shapes have nb=2–8, leaving 6–25% of lanes/threads idle.
+  Restructuring to one lane/thread per element-group restored full occupancy:
+  Q6_K (LM head + shared + attn, 43% of decode) 424→213 ms in the trace.
+- **Remaining hotspots**: `matvec_iq3_s_expert` 25%, `matvec_iq2_s_expert` 15% are
+  **compute-bound on grid-lookup dequant + per-element sign branches** (running at
+  ~3% of mem BW). Next lever = port llama.cpp's `vec_dot_iq{2,3}_s_q8_1` (q8_1
+  activation + DP4A integer dot + branchless SIMD sign via XOR/subtract), and/or
+  cache the iq2s/iq3s grids in `__constant__`/LDS. `deltanet_step_f32` is 9%.
+
 ## VLM (image) — fujisan_1024.png, 672 vision tokens, prompt "Describe this image in detail."
 
 | stage                         | HIP test_hip_vlm | llama-mtmd-cli | llama.cpp / HIP |
