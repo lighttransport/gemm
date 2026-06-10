@@ -3493,6 +3493,129 @@ static const char *hip_kernel_source =
 "    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
 "    if (lane == 0) atomicAdd(&accum[row], ew[slot] * sum);\n"
 "}\n"
+"/* ---- ssm_matvec4_q6k: fused qkv(Q6K) + z(Q6K) + alpha(F32) + beta(F32) matvecs. */\n"
+"__global__ void ssm_matvec4_q6k(float *qkv, float *z, float *alpha, float *beta,\n"
+"        const unsigned char *wq, const unsigned char *wz,\n"
+"        const half_raw *wa, const half_raw *wb, const float *x,\n"
+"        int qkv_rows, int z_rows, int dt_rank, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    const unsigned char *mat = 0; float *dst = 0; int r = row;\n"
+"    if (r < qkv_rows) { mat = wq; dst = qkv + r; }\n"
+"    else { r -= qkv_rows;\n"
+"      if (r < z_rows) { mat = wz; dst = z + r; }\n"
+"      else { r -= z_rows;\n"
+"        const half_raw *wf = (r < dt_rank) ? wa + (size_t)r * n_cols : wb + (size_t)(r - dt_rank) * n_cols;\n"
+"        float *df = (r < dt_rank) ? alpha + r : beta + (r - dt_rank);\n"
+"        float sum = 0.0f;\n"
+"        for (int j = tid; j < n_cols; j += nthreads) sum += half_to_float(wf[j]) * x[j];\n"
+"        for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"        __shared__ float wsf[8]; int wid = tid/32, ln = tid%32;\n"
+"        if (ln == 0) wsf[wid] = sum; __syncthreads();\n"
+"        if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += wsf[w]; *df = t; }\n"
+"        return; } }\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = mat + (size_t)r * row_bytes;\n"
+"    int G = nb * 64; float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 6; int rem = g & 63; int half = rem >> 5; int l = rem & 31;\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp + half * 64;\n"
+"        const unsigned char *qh = bp + 128 + half * 32;\n"
+"        const signed char *sc = (const signed char *)(bp + 192 + half * 8);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        const float *xb = x + b * 256 + half * 128;\n"
+"        int hi = (l < 16) ? 0 : 1;\n"
+"        float sA = d * (float)sc[0 + hi], sB = d * (float)sc[2 + hi];\n"
+"        float sC = d * (float)sc[4 + hi], sD = d * (float)sc[6 + hi];\n"
+"        int q1 = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;\n"
+"        int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;\n"
+"        int q3 = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)) - 32;\n"
+"        int q4 = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)) - 32;\n"
+"        sum += sA*q1*xb[l] + sB*q2*xb[l+32] + sC*q3*xb[l+64] + sD*q4*xb[l+96];\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; *dst = t; }\n"
+"}\n"
+"/* ---- matvec_qkv_q6k: fused attn Q/K/V Q6_K matvecs (one launch). */\n"
+"__global__ void matvec_qkv_q6k(float *q, float *k, float *v,\n"
+"        const unsigned char *wq, const unsigned char *wk, const unsigned char *wv,\n"
+"        int q_rows, int k_rows, int v_rows, int n_cols, const float *x) {\n"
+"    int row = blockIdx.x;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    const unsigned char *mat; float *dst; int r = row;\n"
+"    if (r < q_rows) { mat = wq; dst = q + r; }\n"
+"    else if (r < q_rows + k_rows) { r -= q_rows; mat = wk; dst = k + r; }\n"
+"    else { r -= q_rows + k_rows; if (r >= v_rows) return; mat = wv; dst = v + r; }\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = mat + (size_t)r * row_bytes;\n"
+"    int G = nb * 64; float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 6; int rem = g & 63; int half = rem >> 5; int l = rem & 31;\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp + half * 64;\n"
+"        const unsigned char *qh = bp + 128 + half * 32;\n"
+"        const signed char *sc = (const signed char *)(bp + 192 + half * 8);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        const float *xb = x + b * 256 + half * 128;\n"
+"        int hi = (l < 16) ? 0 : 1;\n"
+"        float sA = d * (float)sc[0 + hi], sB = d * (float)sc[2 + hi];\n"
+"        float sC = d * (float)sc[4 + hi], sD = d * (float)sc[6 + hi];\n"
+"        int q1 = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;\n"
+"        int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;\n"
+"        int q3 = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)) - 32;\n"
+"        int q4 = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)) - 32;\n"
+"        sum += sA*q1*xb[l] + sB*q2*xb[l+32] + sC*q3*xb[l+64] + sD*q4*xb[l+96];\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; *dst = t; }\n"
+"}\n"
+"/* ---- moe_route_decode: router logits + topk + softmax + shared-gate sigmoid. */\n"
+"/* One block 256 thr: thread e = expert dot, then topk/softmax/sgate. */\n"
+"__global__ void moe_route_decode(const float *gate_w, const float *sgate_w,\n"
+"        const float *x, int ne, int K, int n_cols,\n"
+"        int *out_idx, float *out_w, float *shared_scale) {\n"
+"    int tid = threadIdx.x;\n"
+"    float my = -1e30f;\n"
+"    if (tid < ne) {\n"
+"        const float *wr = gate_w + (size_t)tid * n_cols;\n"
+"        float sum = 0.0f;\n"
+"        for (int j = 0; j < n_cols; j++) sum += wr[j] * x[j];\n"
+"        my = sum;\n"
+"    }\n"
+"    __shared__ float sval[256]; __shared__ int sidx[256]; __shared__ int chosen[64];\n"
+"    for (int ki = 0; ki < K; ki++) {\n"
+"        float v = my;\n"
+"        for (int j = 0; j < ki; j++) if (chosen[j] == tid) v = -1e30f;\n"
+"        sval[tid] = v; sidx[tid] = tid; __syncthreads();\n"
+"        for (int st = 128; st > 0; st >>= 1) {\n"
+"            if (tid < st && tid + st < 256) {\n"
+"                if (sval[tid+st] > sval[tid]) { sval[tid]=sval[tid+st]; sidx[tid]=sidx[tid+st]; }\n"
+"                else if (sval[tid+st] == sval[tid] && sidx[tid+st] < sidx[tid]) sidx[tid]=sidx[tid+st];\n"
+"            } __syncthreads();\n"
+"        }\n"
+"        if (tid == 0) { chosen[ki]=sidx[0]; out_idx[ki]=sidx[0]; out_w[ki]=sval[0]; }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) {\n"
+"        float mx = out_w[0]; for (int i=1;i<K;i++) if (out_w[i]>mx) mx=out_w[i];\n"
+"        float sum=0; for (int i=0;i<K;i++){ out_w[i]=expf(out_w[i]-mx); sum+=out_w[i]; }\n"
+"        float inv=1.0f/sum; for (int i=0;i<K;i++) out_w[i]*=inv;\n"
+"    }\n"
+"    /* shared-expert gate: 256-thread dot + sigmoid */\n"
+"    float p = 0.0f;\n"
+"    for (int j = tid; j < n_cols; j += 256) p += sgate_w[j] * x[j];\n"
+"    for (int o = 16; o > 0; o >>= 1) p += __shfl_down(p, o);\n"
+"    __shared__ float ws[8];\n"
+"    if ((tid & 31) == 0) ws[tid >> 5] = p;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < 8; w++) t += ws[w];\n"
+"        shared_scale[0] = 1.0f / (1.0f + expf(-t)); }\n"
+"}\n"
 "/* ---- ssm_prep_f32: fused decode SSM aux chain (conv+silu+state, l2norm Q/K,  */\n"
 "/* repeat-tile to Q_exp/K_exp, alpha softplus, beta sigmoid). One launch       */\n"
 "/* replaces 7. grid = n_group blocks x 256 thr. Layout: conv_out =             */\n"
@@ -5263,6 +5386,9 @@ struct hip_llm_runner {
     hipFunction_t fn_shexp_gateup_silu_q6k; /* decode: shared expert gate+up+silu */
     hipFunction_t fn_shexp_down_accum_q6k;  /* decode: shared expert down+scale-add */
     hipFunction_t fn_ssm_prep_f32;          /* decode: fused SSM aux chain */
+    hipFunction_t fn_ssm_matvec4_q6k;       /* decode: fused 4 SSM input matvecs */
+    hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
+    hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
     hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
@@ -5621,6 +5747,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(shexp_gateup_silu_q6k);
     GET_FUNC(shexp_down_accum_q6k);
     GET_FUNC(ssm_prep_f32);
+    GET_FUNC(ssm_matvec4_q6k);
+    GET_FUNC(matvec_qkv_q6k);
+    GET_FUNC(moe_route_decode);
     GET_FUNC(gemm_bf16_own);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
@@ -7780,11 +7909,21 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     int expert_ff = r->expert_ff;
     int shared_expert_ff = r->shared_expert_ff;
 
+  int routed_fused = 0;
+  if (0) { /* fused router: NEGATIVE — serial per-thread dot slower than grid matvec */
+    /* Router + topK + softmax + shared-gate sigmoid in ONE launch. */
+    int ne_ = r->n_experts, K_ = n_experts_used, nc_ = cl->moe_gate_cols;
+    void *a[] = { &cl->moe_gate_w, &cl->moe_shared_gate_w, &r->d_xb, &ne_, &K_, &nc_,
+                  &r->d_moe_idx, &r->d_moe_w, &r->d_shared_scale };
+    LAUNCH(r->fn_moe_route_decode, 1, 1, 1, 256, 1, 1, 0, r->stream, a);
+    routed_fused = 1;
+  } else {
     launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
                      cl->moe_gate_rows, cl->moe_gate_cols);
+  }
 
   if (r->moe_dev_dispatch_ok) {
-    launch_moe_topk(r);
+    if (!routed_fused) launch_moe_topk(r);
     hipMemsetAsync(r->d_moe_accum, 0, n_embd * sizeof(float), r->stream);
 
     /* Fused all-experts path: 2 launches instead of ~40 small dependent ones.
@@ -7838,8 +7977,10 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
 
 shared_expert:
     {
-        launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
-        launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
+        if (!routed_fused) {
+            launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+            launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
+        }
         if (r->moe_fused_decode &&
             cl->moe_shared_gate_type == GGML_TYPE_Q6_K &&
             cl->moe_shared_up_type   == GGML_TYPE_Q6_K &&
@@ -8108,10 +8249,20 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             int dt_rank = r->ssm_dt_rank;
             int conv_k  = r->ssm_conv_kernel;
 
+            if (r->ssm_fused_decode &&
+                cl->ssm_qkv_type == GGML_TYPE_Q6_K && cl->ssm_gate_type == GGML_TYPE_Q6_K &&
+                cl->ssm_alpha_type == GGML_TYPE_F16 && cl->ssm_beta_type == GGML_TYPE_F16) {
+                int qkv_rows = cl->ssm_qkv_rows, z_rows = cl->ssm_gate_rows, n_cols = cl->ssm_qkv_cols;
+                void *a[] = { &r->d_ssm_qkv, &r->d_ssm_z, &r->d_ssm_alpha, &r->d_ssm_beta,
+                              &cl->ssm_qkv_w, &cl->ssm_gate_w, &cl->ssm_alpha_w, &cl->ssm_beta_w,
+                              &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
+                LAUNCH(r->fn_ssm_matvec4_q6k, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 64, 1, 1, 0, r->stream, a);
+            } else {
             launch_matvec_auto(r, r->d_ssm_qkv,   cl->ssm_qkv_w,   r->d_xb, cl->ssm_qkv_rows,   cl->ssm_qkv_cols,   cl->ssm_qkv_type);
             launch_matvec_auto(r, r->d_ssm_z,      cl->ssm_gate_w,  r->d_xb, cl->ssm_gate_rows,  cl->ssm_gate_cols,  cl->ssm_gate_type);
             launch_matvec_auto(r, r->d_ssm_alpha,  cl->ssm_alpha_w, r->d_xb, cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
             launch_matvec_auto(r, r->d_ssm_beta,   cl->ssm_beta_w,  r->d_xb, cl->ssm_beta_rows,  cl->ssm_beta_cols,  cl->ssm_beta_type);
+            }
 
             if (r->ssm_fused_decode &&
                 (qkv_dim - 2 * n_group * d_state) % n_group == 0 &&
@@ -8153,12 +8304,21 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
         } else if (r->is_hybrid) {
             /* === Gated attention layer (Qwen3.5) === */
+            if (r->ssm_fused_decode &&
+                cl->attn_q_type == GGML_TYPE_Q6_K && cl->attn_k_type == GGML_TYPE_Q6_K &&
+                cl->attn_v_type == GGML_TYPE_Q6_K) {
+                int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
+                int nc = cl->attn_q_cols;
+                void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
+                              &qr, &kr, &vr, &nc, &r->d_xb };
+                LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 64, 1, 1, 0, r->stream, a);
+            } else {
             launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
                               cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
-            launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate, r->d_xb2, n_heads, head_dim);
-
             launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
             launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            }
+            launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate, r->d_xb2, n_heads, head_dim);
 
             if (cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, head_dim, eps);
