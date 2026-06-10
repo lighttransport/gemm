@@ -3740,6 +3740,53 @@ static const char *hip_kernel_source =
 "        counter[0] = 0;  /* reset for next layer */\n"
 "    }\n"
 "}\n"
+"/* ---- deltanet_step_warp_f32: warp-per-state-row decode recurrence.        */\n"
+"/* 8 warps/block; warp owns S[h,r,0..127] in regs (4 f32/lane). 512 blocks   */\n"
+"/* (32 heads x 16 row-warps) vs old 32 blocks; single S read+write.          */\n"
+"__global__ void deltanet_step_warp_f32(\n"
+"    float *state, float *out,\n"
+"    const float *Q, const float *K, const float *V,\n"
+"    const float *alpha, const float *beta, int d_state) {\n"
+"    int warps_per_head = d_state / 8;\n"
+"    int gw = blockIdx.x * 8 + (threadIdx.x >> 5);\n"
+"    int h = gw / warps_per_head;\n"
+"    int rb = gw % warps_per_head;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int rows_per_warp = 8;  /* 8 rows handled per warp, 4 lanes each */\n"
+"    int r = rb * rows_per_warp + (lane >> 2);\n"
+"    int c0 = (lane & 3) * 32;\n"
+"    float *S = state + ((size_t)h * d_state + r) * d_state + c0;\n"
+"    const float *k = K + h * d_state + c0;\n"
+"    const float *q = Q + h * d_state + c0;\n"
+"    float decay = expf(alpha[h]);\n"
+"    float b = beta[h];\n"
+"    float v_r = V[h * d_state + r];\n"
+"    float scale = rsqrtf((float)d_state);\n"
+"    float s_[32], k_[32], q_[32];\n"
+"    float sk = 0.0f;\n"
+"    for (int j = 0; j < 32; j += 4) {\n"
+"        float4 sv = *(const float4 *)&S[j];\n"
+"        float4 kv = *(const float4 *)&k[j];\n"
+"        float4 qv = *(const float4 *)&q[j];\n"
+"        s_[j+0]=sv.x*decay; s_[j+1]=sv.y*decay; s_[j+2]=sv.z*decay; s_[j+3]=sv.w*decay;\n"
+"        k_[j+0]=kv.x; k_[j+1]=kv.y; k_[j+2]=kv.z; k_[j+3]=kv.w;\n"
+"        q_[j+0]=qv.x; q_[j+1]=qv.y; q_[j+2]=qv.z; q_[j+3]=qv.w;\n"
+"        sk += s_[j]*k_[j] + s_[j+1]*k_[j+1] + s_[j+2]*k_[j+2] + s_[j+3]*k_[j+3];\n"
+"    }\n"
+"    /* reduce sk across the 4 lanes of this row (lanes r*4..r*4+3) */\n"
+"    sk += __shfl_xor(sk, 1); sk += __shfl_xor(sk, 2);\n"
+"    float delta = (v_r - sk) * b;\n"
+"    float o = 0.0f;\n"
+"    for (int j = 0; j < 32; j += 4) {\n"
+"        s_[j+0] += delta * k_[j+0]; s_[j+1] += delta * k_[j+1];\n"
+"        s_[j+2] += delta * k_[j+2]; s_[j+3] += delta * k_[j+3];\n"
+"        o += s_[j]*q_[j] + s_[j+1]*q_[j+1] + s_[j+2]*q_[j+2] + s_[j+3]*q_[j+3];\n"
+"        float4 sv = { s_[j+0], s_[j+1], s_[j+2], s_[j+3] };\n"
+"        *(float4 *)&S[j] = sv;\n"
+"    }\n"
+"    o += __shfl_xor(o, 1); o += __shfl_xor(o, 2);\n"
+"    if ((lane & 3) == 0) out[h * d_state + r] = o * scale;\n"
+"}\n"
 "/* ---- ssm_prep_f32: fused decode SSM aux chain (conv+silu+state, l2norm Q/K,  */\n"
 "/* repeat-tile to Q_exp/K_exp, alpha softplus, beta sigmoid). One launch       */\n"
 "/* replaces 7. grid = n_group blocks x 256 thr. Layout: conv_out =             */\n"
@@ -5537,6 +5584,7 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
+    hipFunction_t fn_deltanet_step_warp_f32; /* decode: warp-per-row deltanet */
     unsigned int *d_router_counter;
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
     hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
@@ -5901,6 +5949,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
     GET_FUNC(moe_router_fused);
+    GET_FUNC(deltanet_step_warp_f32);
     GET_FUNC(gemm_bf16_own);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
@@ -7773,7 +7822,13 @@ static inline void launch_deltanet_step(hip_llm_runner *r, void *state,
     void *out, void *Q, void *K, void *V,
     void *alpha, void *beta, int dt_rank, int d_state) {
     void *args[] = { &state, &out, &Q, &K, &V, &alpha, &beta, &d_state };
-    LAUNCH(r->fn_deltanet_step_f32, dt_rank, 1, 1, d_state, 1, 1, 0, r->stream, args);
+    if (r->ssm_fused_decode && d_state == 128) {
+        /* warp-per-row: 8 warps/block, 8 rows/warp -> blocks = heads*rows/64 */
+        int blocks = dt_rank * d_state / 64;
+        LAUNCH(r->fn_deltanet_step_warp_f32, blocks, 1, 1, 256, 1, 1, 0, r->stream, args);
+    } else {
+        LAUNCH(r->fn_deltanet_step_f32, dt_rank, 1, 1, d_state, 1, 1, 0, r->stream, args);
+    }
 }
 
 /* Fused multi-token DeltaNet step: M sequential token steps in one launch.
