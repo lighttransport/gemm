@@ -1697,17 +1697,18 @@ static const char *cuda_kernel_source =
 "};\n"
 "\n"
 "__global__ void matvec_iq2_xxs_f32(float *dst, const unsigned char *mat, const float *x,\n"
-"                                     int n_rows, int n_cols) {\n"
+"                                     int n_rows, int n_cols, int bm) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
 "    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 66;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
 "    for (int b = lane; b < nb; b += 32) {\n"
-"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        /* bm=1: block-major repacked weights (block b of all rows contiguous); bm=0: row-major. */\n"
+"        const unsigned char *bp = bm ? (mat + (size_t)b*n_rows*66 + (size_t)row*66)\n"
+"                                      : (mat + (size_t)row*row_bytes + (size_t)b*66);\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
 "        const float *xb = x + b * 256;\n"
@@ -7615,11 +7616,11 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
      * the cuBLAS fallback unchanged). NOTE: with the flag ON the decode matvec path (row-major)
      * is NOT yet block-major-aware — this is currently a prefill-throughput mode. */
     int moe_repack_bm = 0;
-    { const char *e = getenv("CUDA_LLM_MMQ_REPACK");
+    { const char *e = getenv("CUDA_LLM_MMQ_REPACK");   /* default ON with MMQ; set =0 to opt out */
       const char *m = getenv("CUDA_LLM_MOE_MMQ");
-      int repack_on = e && e[0] && strcmp(e, "0") != 0;
+      int repack_off = e && e[0] && strcmp(e, "0") == 0;
       int mmq_on = m && m[0] && strcmp(m, "0") != 0;  /* repack only with MMQ (block-major prefill path) */
-      moe_repack_bm = repack_on && mmq_on
+      moe_repack_bm = !repack_off && mmq_on
                       && (r->n_embd % 64 == 0) && (r->expert_ff % 64 == 0); }
     r->moe_iq2_bm = moe_repack_bm;
 
@@ -8713,11 +8714,23 @@ static inline void launch_matvec_q6_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, 
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
-static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
-                                        CUdeviceptr x, int n_rows, int n_cols) {
-    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+static inline void launch_matvec_iq2_xxs_ex(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                        CUdeviceptr x, int n_rows, int n_cols, int bm) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &bm };
     cuLaunchKernel(r->fn_matvec_iq2_xxs_f32,
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                        CUdeviceptr x, int n_rows, int n_cols) {
+    launch_matvec_iq2_xxs_ex(r, dst, mat, x, n_rows, n_cols, 0);
+}
+/* MoE expert matvec: routes IQ2_XXS to the block-major path when expert weights are repacked. */
+static inline void launch_moe_expert_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x, int n_rows, int n_cols, int type) {
+    if (r->moe_iq2_bm && type == GGML_TYPE_IQ2_XXS)
+        launch_matvec_iq2_xxs_ex(r, dst, mat, x, n_rows, n_cols, 1);
+    else
+        launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);
 }
 
 #define DEFINE_LAUNCH_MATVEC(name, fn_field) \
@@ -10245,7 +10258,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                             float wgt = htw[e];
                             CUdeviceptr gate_e = r->d_gate + (size_t)e * expert_ff * sizeof(float);
                             CUdeviceptr dw = cl->moe_down_exps_w + (size_t)hti[e] * cl->moe_exp_stride_d;
-                            launch_matvec_auto(r, r->d_xb2, dw, gate_e,
+                            launch_moe_expert_matvec(r, r->d_xb2, dw, gate_e,
                                               cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
                             launch_scale_add(r, r->d_moe_accum, r->d_xb2, wgt, n_embd);
                         }
@@ -10258,10 +10271,10 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                         CUdeviceptr gw = cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu;
                         CUdeviceptr uw = cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu;
                         CUdeviceptr dw = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
-                        launch_matvec_auto(r, r->d_gate, gw, r->d_xb, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
-                        launch_matvec_auto(r, r->d_up, uw, r->d_xb, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
+                        launch_moe_expert_matvec(r, r->d_gate, gw, r->d_xb, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
+                        launch_moe_expert_matvec(r, r->d_up, uw, r->d_xb, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
                         launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
-                        launch_matvec_auto(r, r->d_xb2, dw, r->d_gate, cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
+                        launch_moe_expert_matvec(r, r->d_xb2, dw, r->d_gate, cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
                         launch_scale_add(r, r->d_moe_accum, r->d_xb2, wgt, n_embd);
                     }
                 }
