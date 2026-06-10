@@ -52,9 +52,16 @@ half-split for full lane occupancy). Validated correct (rel_l2 vs float ref: IQ2
 1.6e-3, IQ3_S 4.7e-3 = pure q8-activation error). But **44.6 vs 45.4 tok/s — ~2%
 slower**: these IQ matvecs are grid-lookup-dequant bound, not multiply bound, so
 DP4A (accelerates only the MAC) + q8-quantize + scalar sign-build is a net loss.
-Default `LLM_DECODE_DP4A=0`; F32 full-util kernels stay the decode path. To actually
-speed IQ2_S/IQ3_S one must cut the grid-lookup cost (LDS-cached grids — untried) or
-do SIMD sign (`__vsub4`/`__vcmpne4` are absent under HIPRTC).
+Default `LLM_DECODE_DP4A=0`; F32 full-util kernels stay the decode path.
+
+**LDS-cached grids (commit ef3bd38) — tried, NEGATIVE, gated off.** Cache the iq2s
+(8KB) / iq3s (2KB) grid in `__shared__` per block (`LLM_LDS_GRID`). Bit-exact (rel_l2
+5e-8). Result **45.0 vs 45.4 tok/s — ~1% slower**: the grids are tiny and stay hot in
+L2, so lookups were never the bottleneck; the per-block copy + reduced occupancy cost
+more. **Conclusion:** IQ2_S/IQ3_S dequant is at a practical floor for this kernel
+design — neither the multiply (DP4A) nor the lookup (LDS) is the limiter, it's the
+aggregate scalar dequant work. Decode floor ≈ 45.5 tok/s. Higher-ROI next steps:
+`deltanet_step` fusion (9%) or Phase 2 (prefill, the 29× gap).
 
 ## VLM (image) — fujisan_1024.png, 672 vision tokens, prompt "Describe this image in detail."
 
