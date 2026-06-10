@@ -3787,6 +3787,53 @@ static const char *hip_kernel_source =
 "    o += __shfl_xor(o, 1); o += __shfl_xor(o, 2);\n"
 "    if ((lane & 3) == 0) out[h * d_state + r] = o * scale;\n"
 "}\n"
+"/* ---- deltanet_step_batch_warp_f32: warp-per-row M-step recurrence.        */\n"
+"/* 4 lanes/row x 32 cols in regs across M tokens; 8 rows/warp, 8 warps/blk.  */\n"
+"__global__ void deltanet_step_batch_warp_f32(\n"
+"    float *state, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M) {\n"
+"    int warps_per_head = d_state / 8;\n"
+"    int gw = blockIdx.x * 8 + (threadIdx.x >> 5);\n"
+"    int h = gw / warps_per_head;\n"
+"    int rb = gw % warps_per_head;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int r = rb * 8 + (lane >> 2);\n"
+"    int c0 = (lane & 3) * 32;\n"
+"    float *S = state + ((size_t)h * d_state + r) * d_state + c0;\n"
+"    float s_[32];\n"
+"    for (int j = 0; j < 32; j += 4) *(float4 *)&s_[j] = *(const float4 *)&S[j];\n"
+"    float scale = rsqrtf((float)d_state);\n"
+"    size_t per_tok = (size_t)dt_rank * d_state;\n"
+"    for (int m = 0; m < M; m++) {\n"
+"        const float *k = K_batch + (size_t)m * per_tok + h * d_state + c0;\n"
+"        const float *q = Q_batch + (size_t)m * per_tok + h * d_state + c0;\n"
+"        float v_r   = V_batch[(size_t)m * v_row_stride + h * d_state + r];\n"
+"        float decay = __expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        float b     = beta_batch[(size_t)m * dt_rank + h];\n"
+"        float k_[32], q_[32];\n"
+"        float sk = 0.0f;\n"
+"        for (int j = 0; j < 32; j += 4) {\n"
+"            float4 kv = *(const float4 *)&k[j];\n"
+"            float4 qv = *(const float4 *)&q[j];\n"
+"            k_[j]=kv.x;k_[j+1]=kv.y;k_[j+2]=kv.z;k_[j+3]=kv.w;\n"
+"            q_[j]=qv.x;q_[j+1]=qv.y;q_[j+2]=qv.z;q_[j+3]=qv.w;\n"
+"            s_[j]*=decay;s_[j+1]*=decay;s_[j+2]*=decay;s_[j+3]*=decay;\n"
+"            sk += s_[j]*k_[j]+s_[j+1]*k_[j+1]+s_[j+2]*k_[j+2]+s_[j+3]*k_[j+3];\n"
+"        }\n"
+"        sk += __shfl_xor(sk, 1); sk += __shfl_xor(sk, 2);\n"
+"        float delta = (v_r - sk) * b;\n"
+"        float o = 0.0f;\n"
+"        for (int j = 0; j < 32; j += 4) {\n"
+"            s_[j]+=delta*k_[j];s_[j+1]+=delta*k_[j+1];s_[j+2]+=delta*k_[j+2];s_[j+3]+=delta*k_[j+3];\n"
+"            o += s_[j]*q_[j]+s_[j+1]*q_[j+1]+s_[j+2]*q_[j+2]+s_[j+3]*q_[j+3];\n"
+"        }\n"
+"        o += __shfl_xor(o, 1); o += __shfl_xor(o, 2);\n"
+"        if ((lane & 3) == 0) out_batch[(size_t)m * per_tok + h * d_state + r] = o * scale;\n"
+"    }\n"
+"    for (int j = 0; j < 32; j += 4) *(float4 *)&S[j] = *(const float4 *)&s_[j];\n"
+"}\n"
 "/* ---- ssm_prep_f32: fused decode SSM aux chain (conv+silu+state, l2norm Q/K,  */\n"
 "/* repeat-tile to Q_exp/K_exp, alpha softplus, beta sigmoid). One launch       */\n"
 "/* replaces 7. grid = n_group blocks x 256 thr. Layout: conv_out =             */\n"
@@ -5585,6 +5632,7 @@ struct hip_llm_runner {
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
     hipFunction_t fn_deltanet_step_warp_f32; /* decode: warp-per-row deltanet */
+    hipFunction_t fn_deltanet_step_batch_warp_f32; /* prefill: warp-per-row M-step */
     unsigned int *d_router_counter;
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
     hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
@@ -5950,6 +5998,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(res_rmsnorm_f32);
     GET_FUNC(moe_router_fused);
     GET_FUNC(deltanet_step_warp_f32);
+    GET_FUNC(deltanet_step_batch_warp_f32);
     GET_FUNC(gemm_bf16_own);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
@@ -7842,8 +7891,14 @@ static inline void launch_deltanet_step_batch(hip_llm_runner *r, void *state,
     void *args[] = { &state, &out_batch, &Q_batch, &K_batch, &V_batch,
                      &alpha_batch, &beta_batch, &dt_rank, &d_state,
                      &v_row_stride, &M };
-    LAUNCH(r->fn_deltanet_step_batch_f32, dt_rank, 1, 1, d_state, 1, 1, 0,
-           r->stream, args);
+    if (d_state == 128) {
+        int blocks = dt_rank * d_state / 64;
+        LAUNCH(r->fn_deltanet_step_batch_warp_f32, blocks, 1, 1, 256, 1, 1, 0,
+               r->stream, args);
+    } else {
+        LAUNCH(r->fn_deltanet_step_batch_f32, dt_rank, 1, 1, d_state, 1, 1, 0,
+               r->stream, args);
+    }
 }
 
 static inline void launch_gated_rmsnorm_silu(hip_llm_runner *r, void *out,
