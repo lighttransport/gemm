@@ -4305,7 +4305,7 @@ static const char *cuda_kernel_source =
 "   (max_tok=163 vs mean 16). block=128 */\n"
 "__global__ void mmq_iq2xxs_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
 "                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
-"                                    const int *worklist, int N, int K) {\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
 "    const int TG = 4;\n"
 "    /* Stage the IQ2_XXS codebook into shared once per block (the per-lane random-index\n"
 "       gather is decode's latency source in global mem). sSignMask[i] = the 8 sign bits\n"
@@ -4332,7 +4332,10 @@ static const char *cuda_kernel_source =
 "    __syncthreads();\n"
 "    for (int sb=0; sb<nsb; sb++) {\n"
 "        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;  /* 32-lane decode: 2 lanes/row */\n"
-"            const unsigned char *bp=We+(size_t)n*row_bytes+(sb/8)*66;\n"
+"            /* bm=1: block-major repacked layout (block bg=(sb/8) of all N rows contiguous), so a\n"
+"               row-tile reads one 256-block coalesced (vs row_bytes-strided over-fetch). bm=0: row-major. */\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*66+(size_t)n*66)\n"
+"                                          : (We+(size_t)n*row_bytes+(size_t)(sb/8)*66);\n"
 "            float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2); int ib=sb&7;\n"
 "            unsigned int a0=(unsigned int)qs[4*ib]|((unsigned int)qs[4*ib+1]<<16);\n"
 "            unsigned int a1=(unsigned int)qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
@@ -5632,6 +5635,7 @@ struct cuda_llm_runner {
 
     /* MoE params */
     int is_moe;
+    int moe_iq2_bm;       /* IQ2_XXS expert weights repacked block-major (CUDA_LLM_MMQ_REPACK) */
     int n_experts;
     int n_experts_used;   /* top-k */
     int expert_ff;        /* per-expert FFN dim */
@@ -6894,8 +6898,11 @@ static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qt
 }
 
 /* Upload a 3D K-quant tensor (stacked experts) directly to GPU.
- * Returns per-expert byte stride via out_stride. */
-static int upload_3d_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t, size_t *out_stride) {
+ * Returns per-expert byte stride via out_stride.
+ * If repack_bm and type==IQ2_XXS: transpose each expert from row-major [N][nb][66] to
+ * block-major [nb][N][66] on the host before upload, so the MMQ kernel's per-row-tile read
+ * of one 256-block is contiguous (recovers the cache-line over-fetch). estride is unchanged. */
+static int upload_3d_kquant_raw_ex(CUdeviceptr *d_ptr, const qtensor *t, size_t *out_stride, int repack_bm) {
     if (!t->data) { *d_ptr = 0; return 0; }
     /* For 3D tensors: dims[0]=cols, dims[1]=rows_per_expert, dims[2]=n_experts
      * Total rows = dims[1] * dims[2] (already computed in t->n_rows by cllm_load_tensor) */
@@ -6903,11 +6910,35 @@ static int upload_3d_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t, size_t *ou
     int rows_per_expert = (t->n_dims >= 3) ? (int)t->dims[1] : t->n_rows;
     *out_stride = row_bytes * (size_t)rows_per_expert;
     size_t total_bytes = row_bytes * (size_t)t->n_rows;
+    const void *src = t->data;
+    void *repacked = NULL;
+    if (repack_bm && t->type == GGML_TYPE_IQ2_XXS && (t->n_cols % 256) == 0) {
+        int N = rows_per_expert, nb = t->n_cols / 256;
+        int n_exp = (int)(t->n_rows / rows_per_expert);
+        size_t estride = (size_t)N * nb * 66;
+        repacked = malloc(total_bytes);
+        if (!repacked) { fprintf(stderr, "cuda_llm: IQ2 repack malloc failed\n"); return -1; }
+        const unsigned char *s = (const unsigned char *)t->data;
+        unsigned char *d = (unsigned char *)repacked;
+        for (int e = 0; e < n_exp; e++) {
+            const unsigned char *se = s + (size_t)e * estride;
+            unsigned char *de = d + (size_t)e * estride;
+            for (int n = 0; n < N; n++)
+                for (int bg = 0; bg < nb; bg++)
+                    memcpy(de + (size_t)bg * N * 66 + (size_t)n * 66,
+                           se + (size_t)n * nb * 66 + (size_t)bg * 66, 66);
+        }
+        src = repacked;
+    }
     CUresult err = cuMemAlloc(d_ptr, total_bytes);
-    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_3d_kquant alloc failed (%zu bytes, type=%d, err=%d)\n", total_bytes, t->type, (int)err); return -1; }
-    err = cuMemcpyHtoD(*d_ptr, t->data, total_bytes);
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_3d_kquant alloc failed (%zu bytes, type=%d, err=%d)\n", total_bytes, t->type, (int)err); free(repacked); return -1; }
+    err = cuMemcpyHtoD(*d_ptr, src, total_bytes);
+    free(repacked);
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_3d_kquant copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
+}
+static int upload_3d_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t, size_t *out_stride) {
+    return upload_3d_kquant_raw_ex(d_ptr, t, out_stride, 0);
 }
 
 /* Upload F16 shadow of a 3D K-quant tensor for cuBLAS.
@@ -7577,6 +7608,21 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->layers = (cuda_layer *)calloc(r->n_layers, sizeof(cuda_layer));
     if (!r->layers) return -1;
 
+    /* MMQ block-major repack (opt-in CUDA_LLM_MMQ_REPACK, default OFF). Transpose IQ2_XXS
+     * expert weights to block-major at upload so the MMQ kernel reads each row-tile's 256-block
+     * contiguously (recovers the cache-line over-fetch → ~2500 tok/s prefill). The MMQ kernel
+     * is layout-parameterized (bm flag), so default-off keeps row-major everywhere (decode and
+     * the cuBLAS fallback unchanged). NOTE: with the flag ON the decode matvec path (row-major)
+     * is NOT yet block-major-aware — this is currently a prefill-throughput mode. */
+    int moe_repack_bm = 0;
+    { const char *e = getenv("CUDA_LLM_MMQ_REPACK");
+      const char *m = getenv("CUDA_LLM_MOE_MMQ");
+      int repack_on = e && e[0] && strcmp(e, "0") != 0;
+      int mmq_on = m && m[0] && strcmp(m, "0") != 0;  /* repack only with MMQ (block-major prefill path) */
+      moe_repack_bm = repack_on && mmq_on
+                      && (r->n_embd % 64 == 0) && (r->expert_ff % 64 == 0); }
+    r->moe_iq2_bm = moe_repack_bm;
+
     for (int l = 0; l < r->n_layers; l++) {
         char name[128];
         cuda_layer *cl = &r->layers[l];
@@ -7773,7 +7819,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             cl->moe_gate_exps_type = t.type;
             cl->moe_exp_cols_gu = t.n_cols;  /* n_embd (input dim) */
             cl->moe_exp_rows_gu = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;  /* expert_ff */
-            if (upload_3d_kquant_raw(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+            if (upload_3d_kquant_raw_ex(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu, moe_repack_bm) != 0) return -1;
             /* F16 shadow for cuBLAS */
             if (r->use_cublas) {
                 upload_3d_kquant_f16(r, &cl->moe_gate_exps_w_f16, &t,
@@ -7786,7 +7832,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_up_exps_type = t.type;
-            if (upload_3d_kquant_raw(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+            if (upload_3d_kquant_raw_ex(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu, moe_repack_bm) != 0) return -1;
             if (r->use_cublas) {
                 upload_3d_kquant_f16(r, &cl->moe_up_exps_w_f16, &t,
                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
@@ -7800,7 +7846,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             cl->moe_down_exps_type = t.type;
             cl->moe_exp_cols_d = t.n_cols;   /* expert_ff (input dim) */
             cl->moe_exp_rows_d = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;  /* n_embd */
-            if (upload_3d_kquant_raw(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d) != 0) return -1;
+            if (upload_3d_kquant_raw_ex(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d, moe_repack_bm) != 0) return -1;
             if (r->use_cublas) {
                 upload_3d_kquant_f16(r, &cl->moe_down_exps_w_f16, &t,
                                      cl->moe_exp_rows_d, cl->moe_exp_cols_d,
@@ -11413,10 +11459,11 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                           void *a[] = { &d_batch_xb, &r->d_topk_idx, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
                           cuLaunchKernel(r->fn_mmq_gather_quant_q8_1, n_embd / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 2. grouped gate + up: out[total][ef] */
+                        int bm = r->moe_iq2_bm;
                         { unsigned long long st = cl->moe_exp_stride_gu; int nN = ef, nK = n_embd;
-                          void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &nN, &nK };
+                          void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
                           cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, ag, NULL);
-                          void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &nN, &nK };
+                          void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
                           cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, au, NULL); }
                         /* 3. silu: outg = silu(outg) * outu */
                         launch_silu_mul(r, r->d_mmq_outg, r->d_mmq_outu, total * ef);
@@ -11426,7 +11473,7 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                           cuLaunchKernel(r->fn_mmq_quant_q8_1, ef / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 5. grouped down: out[total][n_embd] */
                         { unsigned long long st = cl->moe_exp_stride_d; int nN = n_embd, nK = ef;
-                          void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &nN, &nK };
+                          void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
                           cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, n_work, 1, 128, 1, 1, 0, r->stream, ad, NULL); }
                         /* 6. weighted scatter into d_batch_x (ids_token=etok, weights=etw) */
                         { int tr = total, nN = n_embd;
