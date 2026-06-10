@@ -77,9 +77,15 @@ Tier-B2 banner "4 CSA + 6 HCA layers" matches the DS4P ratios for layers 0–9
 **48/64-node batch (pjsub; /local is wiped per job ⇒ stage+run in ONE job):**
 
 ```sh
-pjsub --no-check-directory -x LAYERS=8 pjsub_ds4p_64n.sh   # smoke first
-pjsub --no-check-directory pjsub_ds4p_64n.sh               # full 61 layers + generation
+LAYERS=8 sh ~/job-64.sh   # smoke first (8 layers, no gen)
+sh ~/job-64.sh            # full 61 layers + generation
 ```
+
+`~/job-64.sh` submits `pjsub_ds4p_64n.sh` with the proven submission pattern
+(rscgrp=small-s2, node=4x4x4:torus, retention_state=0, `--llio
+localtmp-size=80Gi`, `PJM_LLIO_GFSCACHE=/vol0006` — model + repo are on
+/vol0006). Direct `pjsub --no-check-directory [-x LAYERS=8] pjsub_ds4p_64n.sh`
+also works (same #PJM directives, minus the GFSCACHE env).
 
 Phases are gated and emit `SENTINEL <phase>=...` lines; the job log is the single
 diagnostic artifact. First coherent text = phase 5 of the full 64-node job.
