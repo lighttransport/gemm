@@ -26,7 +26,7 @@
 #define TRITON_SPCONV_BRIDGE_H
 
 #ifdef TRITON_BRIDGE_USE_ROCEW
-#include "../../rocew.h"
+#include "../../../rocew.h"
 #else
 #include <hip/hip_runtime.h>
 #endif

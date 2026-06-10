@@ -7,7 +7,7 @@
  *
  * Usage:
  *   verify_ss_dit --safetensors-dir DIR --refdir /tmp/sam3d_ref
- *                 [--threshold F] [-v]
+ *                 [--precision fp16|bf16|fp32] [--threshold F] [-v]
  */
 
 #include "cuda_sam3d_runner.h"
@@ -44,6 +44,7 @@ static float *load_modality_f32(const char *refdir, const char *fragment,
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *yaml = NULL, *refdir = NULL;
+    const char *precision = "fp16";
     int verbose = 0;
     float threshold = 5e-2f;  /* bf16 inference-path floor */
 
@@ -52,6 +53,7 @@ int main(int argc, char **argv)
         if      (!strcmp(a, "--safetensors-dir") && i+1 < argc) sft_dir   = argv[++i];
         else if (!strcmp(a, "--pipeline-yaml")   && i+1 < argc) yaml      = argv[++i];
         else if (!strcmp(a, "--refdir")          && i+1 < argc) refdir    = argv[++i];
+        else if (!strcmp(a, "--precision")       && i+1 < argc) precision = argv[++i];
         else if (!strcmp(a, "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(a, "-v"))                              verbose   = 1;
         else if (!strcmp(a, "--use-ref-inputs"))                { /* implied */ }
@@ -60,7 +62,7 @@ int main(int argc, char **argv)
     if ((!sft_dir && !yaml) || !refdir) {
         fprintf(stderr,
                 "Usage: %s (--safetensors-dir DIR | --pipeline-yaml YAML) "
-                "--refdir DIR [--threshold F] [-v]\n", argv[0]);
+                "--refdir DIR [--precision fp16|bf16|fp32] [--threshold F] [-v]\n", argv[0]);
         return 2;
     }
 
@@ -68,7 +70,7 @@ int main(int argc, char **argv)
     cfg.safetensors_dir = sft_dir;
     cfg.pipeline_yaml   = yaml;
     cfg.verbose         = verbose;
-    cfg.precision       = "fp16";
+    cfg.precision       = precision;
     cfg.seed            = 42;
     cuda_sam3d_ctx *ctx = cuda_sam3d_create(&cfg);
     if (!ctx) { fprintf(stderr, "cuda_sam3d_create failed\n"); return 5; }
