@@ -4930,18 +4930,18 @@ static const char *hip_kernel_source =
 "/* ---- Grouped MoE prefill kernels: blockIdx.y/z = expert. One launch per layer. */\n"
 "/* Dequant ALL experts' IQ2_S weights -> bf16 (skips experts with 0 tokens). */\n"
 "__global__ void dequant_iq2s_all(bf16_raw *dst, const unsigned char *base,\n"
-"        const int *offs, int rows, int cols, long long stride) {\n"
+"        const int *offs, int rows, int cols, long long stride, int bm) {\n"
 "    int e = blockIdx.y;\n"
 "    if (offs[e + 1] == offs[e]) return;\n"
 "    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
 "    if (row >= rows) return;\n"
 "    const unsigned char *mat = base + (long long)e * stride;\n"
 "    int nb = cols / 256;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * nb * 82;\n"
 "    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
 "    for (int g = lane; g < nb * 32; g += 32) {\n"
 "        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
-"        const unsigned char *bp = row_ptr + b * 82;\n"
+"        const unsigned char *bp = bm ? (mat + (size_t)b * rows * 82 + (size_t)row * 82)\n"
+"                                     : (mat + (size_t)row * nb * 82 + (size_t)b * 82);\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        unsigned char scale = bp[74 + ib32];\n"
 "        float db = (l < 2) ? d * (0.5f + (float)(scale & 0xf)) * 0.25f\n"
@@ -4955,18 +4955,18 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "__global__ void dequant_iq3s_all(bf16_raw *dst, const unsigned char *base,\n"
-"        const int *offs, int rows, int cols, long long stride) {\n"
+"        const int *offs, int rows, int cols, long long stride, int bm) {\n"
 "    int e = blockIdx.y;\n"
 "    if (offs[e + 1] == offs[e]) return;\n"
 "    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
 "    if (row >= rows) return;\n"
 "    const unsigned char *mat = base + (long long)e * stride;\n"
 "    int nb = cols / 256;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * nb * 110;\n"
 "    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
 "    for (int g = lane; g < nb * 32; g += 32) {\n"
 "        int b = g >> 5; int g32 = g & 31; int sb = g32 >> 2; int l = g32 & 3;\n"
-"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        const unsigned char *bp = bm ? (mat + (size_t)b * rows * 110 + (size_t)row * 110)\n"
+"                                     : (mat + (size_t)row * nb * 110 + (size_t)b * 110);\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        unsigned char sc = bp[106 + (sb >> 1)];\n"
 "        float db = d * (float)(1 + 2 * ((sb & 1) ? (sc >> 4) : (sc & 0xf)));\n"
@@ -4982,18 +4982,18 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "__global__ void dequant_iq2_xxs_all(bf16_raw *dst, const unsigned char *base,\n"
-"        const int *offs, int rows, int cols, long long stride) {\n"
+"        const int *offs, int rows, int cols, long long stride, int bm) {\n"
 "    int e = blockIdx.y;\n"
 "    if (offs[e + 1] == offs[e]) return;\n"
 "    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
 "    if (row >= rows) return;\n"
 "    const unsigned char *mat = base + (long long)e * stride;\n"
 "    int nb = cols / 256;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * nb * 66;\n"
 "    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
 "    for (int g = lane; g < nb * 32; g += 32) {\n"
 "        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
-"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        const unsigned char *bp = bm ? (mat + (size_t)b * rows * 66 + (size_t)row * 66)\n"
+"                                     : (mat + (size_t)row * nb * 66 + (size_t)b * 66);\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
 "        unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
@@ -5008,18 +5008,18 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "__global__ void dequant_iq3_xxs_all(bf16_raw *dst, const unsigned char *base,\n"
-"        const int *offs, int rows, int cols, long long stride) {\n"
+"        const int *offs, int rows, int cols, long long stride, int bm) {\n"
 "    int e = blockIdx.y;\n"
 "    if (offs[e + 1] == offs[e]) return;\n"
 "    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
 "    if (row >= rows) return;\n"
 "    const unsigned char *mat = base + (long long)e * stride;\n"
 "    int nb = cols / 256;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * nb * 98;\n"
 "    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
 "    for (int g = lane; g < nb * 32; g += 32) {\n"
 "        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
-"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        const unsigned char *bp = bm ? (mat + (size_t)b * rows * 98 + (size_t)row * 98)\n"
+"                                     : (mat + (size_t)row * nb * 98 + (size_t)b * 98);\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs = bp + 2;\n"
 "        unsigned int aux32 = *(const unsigned int *)(bp + 66 + 4*ib32);\n"
@@ -6090,6 +6090,7 @@ struct hip_llm_runner {
     float *d_tok_w;                         /* [Mmax*K] per-token softmax w */
     int  *d_cursor;                         /* [ne] scatter cursor */
     int moe_fused_decode;            /* LLM_MOE_FUSED (default on if types match) */
+    int moe_iq2_bm;                  /* IQ2_XXS/IQ3_XXS weights repacked block-major */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
@@ -6579,6 +6580,9 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     { const char *e = getenv("LLM_LDS_GRID"); if (e) r->lds_grid = atoi(e) != 0; }
     r->moe_fused_decode = 1;
     { const char *e = getenv("LLM_MOE_FUSED"); if (e) r->moe_fused_decode = atoi(e) != 0; }
+    r->moe_iq2_bm = 0;
+    { const char *e = getenv("LLM_MOE_BM");
+      if (e && atoi(e)) { r->moe_iq2_bm = 1; } }
     r->ssm_fused_decode = 1;
     { const char *e = getenv("LLM_SSM_FUSED"); if (e) r->ssm_fused_decode = atoi(e) != 0; }
     r->gemm_own = 1;  /* self-owned WMMA GEMM default (faster than blaslt path) */
@@ -6770,6 +6774,47 @@ static int upload_3d_kquant_raw(void **d_ptr, const qtensor *t, size_t *out_stri
     hipError_t err = hipMalloc(d_ptr, total_bytes);
     if (err != hipSuccess) { fprintf(stderr, "hip_llm: upload_3d_kquant alloc failed (%zu bytes, type=%d, err=%d)\n", total_bytes, t->type, (int)err); return -1; }
     err = hipMemcpy(*d_ptr, t->data, total_bytes, hipMemcpyHostToDevice);
+    if (err != hipSuccess) { fprintf(stderr, "hip_llm: upload_3d_kquant copy failed\n"); hipFree(*d_ptr); *d_ptr = NULL; return -1; }
+    return 0;
+}
+/* Upload with optional block-major repack. When repack_bm=1 and type matches,
+ * transpose each expert from row-major [N][nb][bs] to block-major [nb][N][bs]
+ * on the host before upload, so the dequant kernel's per-row-tile read of one
+ * 256-block coalesces instead of stride (recovers cache-line over-fetch). */
+static int upload_3d_kquant_raw_bm(void **d_ptr, const qtensor *t, size_t *out_stride,
+                                    int repack_bm) {
+    if (!t->data) { *d_ptr = NULL; return 0; }
+    size_t row_bytes = dequant_row_size(t->type, t->n_cols);
+    int rows_per_expert = (t->n_dims >= 3) ? (int)t->dims[1] : t->n_rows;
+    *out_stride = row_bytes * (size_t)rows_per_expert;
+    size_t total_bytes = row_bytes * (size_t)t->n_rows;
+    int repackable = (t->n_cols % 256 == 0) &&
+        (t->type == GGML_TYPE_IQ2_XXS || t->type == GGML_TYPE_IQ3_XXS ||
+         t->type == GGML_TYPE_IQ2_S   || t->type == GGML_TYPE_IQ3_S);
+    const void *src = t->data;
+    void *repacked = NULL;
+    if (repack_bm && repackable) {
+        int nb = t->n_cols / 256, N = rows_per_expert, n_exp = t->n_rows / rows_per_expert;
+        size_t bs = row_bytes / nb;  /* bytes per 256-block */
+        size_t estride = (size_t)N * row_bytes;  /* per-expert byte stride */
+        repacked = malloc(total_bytes);
+        if (!repacked) { fprintf(stderr, "hip_llm: repack malloc failed\n"); return -1; }
+        const unsigned char *s = (const unsigned char *)t->data;
+        unsigned char *d = (unsigned char *)repacked;
+        for (int e = 0; e < n_exp; e++) {
+            const unsigned char *se = s + (size_t)e * estride;
+            unsigned char *de = d + (size_t)e * estride;
+            for (int n = 0; n < N; n++)
+                for (int bg = 0; bg < nb; bg++)
+                    memcpy(de + (size_t)bg * N * bs + (size_t)n * bs,
+                           se + (size_t)n * nb * bs + (size_t)bg * bs, bs);
+        }
+        src = repacked;
+    }
+    hipError_t err = hipMalloc(d_ptr, total_bytes);
+    if (err != hipSuccess) { fprintf(stderr, "hip_llm: upload_3d_kquant alloc failed (%zu bytes, type=%d, err=%d)\n", total_bytes, t->type, (int)err); free(repacked); return -1; }
+    err = hipMemcpy(*d_ptr, src, total_bytes, hipMemcpyHostToDevice);
+    free(repacked);
     if (err != hipSuccess) { fprintf(stderr, "hip_llm: upload_3d_kquant copy failed\n"); hipFree(*d_ptr); *d_ptr = NULL; return -1; }
     return 0;
 }
@@ -7258,19 +7303,19 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             cl->moe_gate_exps_type = t.type;
             cl->moe_exp_cols_gu = t.n_cols;
             cl->moe_exp_rows_gu = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;
-            if (upload_3d_kquant_raw(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+            if (upload_3d_kquant_raw_bm(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu, r->moe_iq2_bm) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
             cl->moe_up_exps_type = t.type;
-            if (upload_3d_kquant_raw(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+            if (upload_3d_kquant_raw_bm(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu, r->moe_iq2_bm) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
             cl->moe_down_exps_type = t.type;
             cl->moe_exp_cols_d = t.n_cols;
             cl->moe_exp_rows_d = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;
-            if (upload_3d_kquant_raw(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d) != 0) return -1;
+            if (upload_3d_kquant_raw_bm(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d, r->moe_iq2_bm) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
@@ -8937,20 +8982,21 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         unsigned mtiles = (unsigned)((M + 127) / 128); /* covers max per-expert cnt */
         long long sgu = (long long)cl->moe_exp_stride_gu;
         long long sdn = (long long)cl->moe_exp_stride_d;
+        int _bm = r->moe_iq2_bm;
         /* gate */
-        { void *a[] = { &r->d_expw_bf16, &cl->moe_gate_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_gate_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu, &_bm };
           LAUNCH(r->fn_dequant_iq2s_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eg, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
         /* up */
-        { void *a[] = { &r->d_expw_bf16, &cl->moe_up_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_up_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu, &_bm };
           LAUNCH(r->fn_dequant_iq2s_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eu, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
          launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
         launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, total * eff);
         /* down */
-        { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn };
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn, &_bm };
           LAUNCH(r->fn_dequant_iq3s_all, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eout, &r->d_expw_bf16, &r->d_moe_esilu_bf16, &r->d_moe_offs, &n_embd, &eff };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
@@ -8968,20 +9014,21 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         unsigned mtiles = (unsigned)((M + 127) / 128);
         long long sgu = (long long)cl->moe_exp_stride_gu;
         long long sdn = (long long)cl->moe_exp_stride_d;
+        int _bm2 = r->moe_iq2_bm;
         /* gate */
-        { void *a[] = { &r->d_expw_bf16, &cl->moe_gate_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_gate_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu, &_bm2 };
           LAUNCH(r->fn_dequant_iq2_xxs_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eg, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
         /* up */
-        { void *a[] = { &r->d_expw_bf16, &cl->moe_up_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_up_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu, &_bm2 };
           LAUNCH(r->fn_dequant_iq2_xxs_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eu, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
         launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
         launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, total * eff);
         /* down */
-        { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn };
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn, &_bm2 };
           LAUNCH(r->fn_dequant_iq3_xxs_all, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eout, &r->d_expw_bf16, &r->d_moe_esilu_bf16, &r->d_moe_offs, &n_embd, &eff };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
