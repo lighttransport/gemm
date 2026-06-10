@@ -44,9 +44,20 @@ prefill gap to llama.cpp (897 tok/s) is now **~18.6×**, not 28.8×.
 + WMMA flash-attn) for hybrid+MoE, with the MoE FFN per-row of the batch. Correct (VLM
 Mt. Fuji via the 672-token batched vision prefill). **Net-negative: 45.9 vs 48.3 tok/s
 @L512** — the per-token MoE FFN dominates both paths, so batching only SSM/attn is pure
-overhead. Default `LLM_MOE_PREFILL=0`. The real lever = **batched token-grouped
-experts** (mul_mat_id: gather tokens by expert → per-expert GEMM → scatter), which
-replaces the per-row MoE loop in this same dispatcher — not yet implemented.
+overhead.
+
+**Phase 2 increment 2 — batched token-grouped experts (commit bc05e2e, gated off).**
+Full `mul_mat_id`: router GEMM → host top-K → group assignments by expert → gather
+activations → per-expert dequant(IQ2_S/IQ3_S→bf16)+hipBLASLt GEMM (gate/up/silu/down)
+→ scatter-accumulate, with a dense batched shared expert. Correct (VLM Mt. Fuji).
+**Negative: 45.3–45.8 vs per-token 47.8–48.3 tok/s @ M=512/1024.** Structural cause:
+**256 experts / 8-used → only 16–32 tokens/expert** even at the max hybrid batch (1024),
+and bf16-dequanting each expert weight materializes the *full* weight regardless of
+token count → weight traffic ≈ per-token, plus 256 tiny GEMM + dequant launches/layer.
+The crossover needs far more tokens/expert than fits. **The only real prefill lever is
+a fused *quantized* MoE GEMM** (llama.cpp `mmq`: reads quantized weights directly, q8_1
+activation + dp4a, no bf16 materialization) — a large specialized kernel, deferred.
+Default `LLM_MOE_PREFILL=0`; per-token prefill (48.3 tok/s) remains the path.
 
 **Diagnostics (rocprofv3 kernel trace, decode, graph off):**
 - HIP-graph capture only adds ~4% → decode is **GPU-compute-bound**, not launch-bound.
