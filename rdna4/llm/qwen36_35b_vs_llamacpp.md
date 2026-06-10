@@ -19,9 +19,16 @@ prefill, commits 0abc74a…611432c). All defaults; **no hipBLASLt dependency**
 
 | test   | HIP @start | HIP now | llama.cpp | now vs llama |
 | ------ | ---------: | ------: | --------: | -----------: |
-| pp512  |  31.2 t/s | **921 t/s**  | 902 t/s | **1.02× FASTER** |
-| pp1024 |  30.9 t/s | **1290 t/s** | 883 t/s | **1.46× FASTER** |
-| tg128  |  28.7 t/s | **87.2 t/s** |  83 t/s | **1.05× FASTER** |
+| pp512  |  31.2 t/s | **1043 t/s** | 902 t/s | **1.16× FASTER** |
+| pp1024 |  30.9 t/s | **1541 t/s** | 883 t/s | **1.75× FASTER** |
+| tg128  |  28.7 t/s | **102.4 t/s** |  83 t/s | **1.23× FASTER** |
+
+**Deltanet warp-ization (the peak-analysis fix):** the recurrence ran 32 blocks x 128
+threads (4096 threads = 1 wave/CU, 68 GB/s, 4 serial passes). Warp-per-state-row
+(4 lanes x 32 cols in registers, single fused decay+update+output pass, float4 IO,
+shuffle reductions) = 16x parallelism. Decode 87->102; prefill batch variant (state
+in regs across M tokens) pp1024 1290->1541. Roofline: 2.15 GB/token => 280 t/s @600
+GB/s; now at 37% of board peak / ~50% of realistic 210.
 
 **All three metrics beat llama.cpp.** Decode endgame (83.1→87.2): fold shared expert
 (Q6_K) + accumulator-zero into the fused MoE kernels (slot K), then fuse router+topK+
