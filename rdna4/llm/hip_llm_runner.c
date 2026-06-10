@@ -5946,25 +5946,22 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         const char *env_dis = getenv("LLM_BATCH_DISABLE");
         int disabled = (env_dis && atoi(env_dis) != 0);
 
-        /* Eligibility: any model where every standard-attn/FFN layer has a
-         * batchable weight type. Hybrid models are allowed in B2 Phase 1 —
-         * SSM layers and qwen35 gated-attn layers go per-row via
-         * forward_one_layer(); only standard attn+FFN layers use the batched
-         * code below. MoE is still per-token (separate sub-project). */
-        int eligible = !disabled && !r->is_moe;
-
-        /* Per-layer type batchability is decided at dispatch time (not here).
-         * The gate only rejects MoE; everything else may have batchable layers,
-         * non-batchable layers, or SSM layers — and the layer loop in
-         * forward_block_batched_dense falls back to per-row for any layer
-         * whose weight type lacks a dequant kernel. (For non-hybrid dense
-         * models with all unsupported quants, the layer loop will per-row
-         * every layer, which is functionally equivalent to the old fallback.) */
-        if (eligible) {
-            for (int l = 0; l < r->n_layers; l++) {
-                hip_layer *cl = &r->layers[l];
-                if (cl->is_moe) { eligible = 0; break; }
-            }
+        /* Eligibility: any model where the standard-attn/SSM/FFN projections have a
+         * batchable weight type. Hybrid models use B2 Phase 2/3 for gated-attn / SSM.
+         * Phase 2 (prefill MoE): hybrid+MoE models are now eligible — the SSM and
+         * attention projections batch via hipBLASLt, and the MoE FFN runs per-row of
+         * the batch (forward_moe_ffn). Requires the sync-free device MoE dispatch so
+         * the per-row loop has no host round-trips. Gate: LLM_MOE_PREFILL (default 1). */
+        int eligible = !disabled;
+        if (r->is_moe) {
+            /* Phase 2 increment 1 (batch SSM/attn projections, MoE FFN per-row) is
+             * net-negative: the per-token MoE FFN dominates, and the sync-free MoE
+             * dispatch + full-util matvecs already make per-token prefill ~48 tok/s.
+             * Default OFF (don't regress); kept as the scaffold for the real win =
+             * batched token-grouped experts. Enable with LLM_MOE_PREFILL=1. */
+            const char *env_mp = getenv("LLM_MOE_PREFILL");
+            int moe_prefill = (env_mp ? atoi(env_mp) != 0 : 0);
+            if (!moe_prefill || !r->moe_dev_dispatch_ok || !r->is_hybrid) eligible = 0;
         }
 
         if (eligible) {
@@ -7000,6 +6997,116 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
  * can't yet batch (B2 Phase 1). When the same function is invoked from the
  * decode-time loop AND the batched-prefill per-row fallback, all that differs
  * is the pointer r->d_x and the value at *r->d_position. */
+/* MoE FFN for one token: reads the pre-normed input in r->d_xb and overwrites
+ * r->d_xb with the MoE output (router top-K experts + shared expert, weighted).
+ * Caller adds the residual. Shared by the decode layer body and the batched
+ * prefill per-row MoE loop. */
+static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
+    int n_embd = r->n_embd;
+    int n_experts = r->n_experts;
+    int n_experts_used = r->n_experts_used;
+    int expert_ff = r->expert_ff;
+    int shared_expert_ff = r->shared_expert_ff;
+
+    launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
+                     cl->moe_gate_rows, cl->moe_gate_cols);
+
+  if (r->moe_dev_dispatch_ok) {
+    launch_moe_topk(r);
+    hipMemsetAsync(r->d_moe_accum, 0, n_embd * sizeof(float), r->stream);
+
+    int gu_dp4a = r->decode_dp4a &&
+        (cl->moe_gate_exps_type == GGML_TYPE_IQ2_S || cl->moe_gate_exps_type == GGML_TYPE_IQ3_S) &&
+        (cl->moe_up_exps_type   == GGML_TYPE_IQ2_S || cl->moe_up_exps_type   == GGML_TYPE_IQ3_S);
+    int dn_dp4a = r->decode_dp4a &&
+        (cl->moe_down_exps_type == GGML_TYPE_IQ2_S || cl->moe_down_exps_type == GGML_TYPE_IQ3_S);
+    if (gu_dp4a)
+        launch_quantize_q8(r, r->d_xb, n_embd, r->d_act_q8, r->d_act_scale);
+
+    for (int e = 0; e < n_experts_used; e++) {
+        if (gu_dp4a) {
+            launch_matvec_expert_dp4a(r, r->d_gate, cl->moe_gate_exps_w, r->d_act_q8, r->d_act_scale,
+                              cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                              cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
+            launch_matvec_expert_dp4a(r, r->d_up, cl->moe_up_exps_w, r->d_act_q8, r->d_act_scale,
+                              cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                              cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
+        } else {
+            launch_matvec_expert_auto(r, r->d_gate, cl->moe_gate_exps_w, r->d_xb,
+                              cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                              cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
+            launch_matvec_expert_auto(r, r->d_up, cl->moe_up_exps_w, r->d_xb,
+                              cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                              cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
+        }
+        launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
+        if (dn_dp4a) {
+            launch_quantize_q8(r, r->d_gate, expert_ff, r->d_act_q8_b, r->d_act_scale_b);
+            launch_matvec_expert_dp4a(r, r->d_xb2, cl->moe_down_exps_w, r->d_act_q8_b, r->d_act_scale_b,
+                              cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                              cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
+        } else {
+            launch_matvec_expert_auto(r, r->d_xb2, cl->moe_down_exps_w, r->d_gate,
+                              cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                              cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
+        }
+        launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_moe_w, e, n_embd);
+    }
+
+    {
+        launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+        launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
+        launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                          cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+        launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                          cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+        launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+        launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                          cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+        launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_shared_scale, 0, n_embd);
+    }
+    hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
+                  hipMemcpyDeviceToDevice, r->stream);
+  } else {
+    hipDeviceSynchronize();
+    hipMemcpy(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float), hipMemcpyDeviceToHost);
+    int top_k_idx[64]; float top_k_weights[64];
+    moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_k_idx, top_k_weights);
+    hipMemset(r->d_moe_accum, 0, n_embd * sizeof(float));
+    for (int e = 0; e < n_experts_used; e++) {
+        int eidx = top_k_idx[e];
+        void *gate_w = (void *)((char *)cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu);
+        void *up_w   = (void *)((char *)cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu);
+        void *down_w = (void *)((char *)cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d);
+        launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
+                          cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
+        launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
+                          cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
+        launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
+        launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
+                          cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
+        launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_k_weights[e], n_embd);
+    }
+    {
+        launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+        hipDeviceSynchronize();
+        float gate_val;
+        hipMemcpy(&gate_val, r->d_router_logits, sizeof(float), hipMemcpyDeviceToHost);
+        float shared_scale = 1.0f / (1.0f + expf(-gate_val));
+        launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                          cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+        launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                          cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+        launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+        launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                          cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+        launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
+    }
+    hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
+                  hipMemcpyDeviceToDevice, r->stream);
+  }
+}
+
 static void forward_one_layer(hip_llm_runner *r, int l) {
     int n_embd     = r->n_embd;
     int n_heads    = r->n_heads;
@@ -7122,123 +7229,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
 
         if (cl->is_moe) {
-            /* MoE FFN */
-            int n_experts = r->n_experts;
-            int n_experts_used = r->n_experts_used;
-            int expert_ff = r->expert_ff;
-            int shared_expert_ff = r->shared_expert_ff;
-
-            launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
-                             cl->moe_gate_rows, cl->moe_gate_cols);
-
-          if (r->moe_dev_dispatch_ok) {
-            /* ---- Device-side, sync-free dispatch (graph-capturable) ---- */
-            launch_moe_topk(r);  /* d_router_logits -> d_moe_idx[k] + d_moe_w[k] */
-            hipMemsetAsync(r->d_moe_accum, 0, n_embd * sizeof(float), r->stream);
-
-            /* DP4A: experts (IQ2_S gate/up, IQ3_S down) via int8 dot. Quantize the
-             * shared d_xb activation once; down's d_gate is quantized per-expert. */
-            int gu_dp4a = r->decode_dp4a &&
-                (cl->moe_gate_exps_type == GGML_TYPE_IQ2_S || cl->moe_gate_exps_type == GGML_TYPE_IQ3_S) &&
-                (cl->moe_up_exps_type   == GGML_TYPE_IQ2_S || cl->moe_up_exps_type   == GGML_TYPE_IQ3_S);
-            int dn_dp4a = r->decode_dp4a &&
-                (cl->moe_down_exps_type == GGML_TYPE_IQ2_S || cl->moe_down_exps_type == GGML_TYPE_IQ3_S);
-            if (gu_dp4a)
-                launch_quantize_q8(r, r->d_xb, n_embd, r->d_act_q8, r->d_act_scale);
-
-            for (int e = 0; e < n_experts_used; e++) {
-                if (gu_dp4a) {
-                    launch_matvec_expert_dp4a(r, r->d_gate, cl->moe_gate_exps_w, r->d_act_q8, r->d_act_scale,
-                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                      cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
-                    launch_matvec_expert_dp4a(r, r->d_up, cl->moe_up_exps_w, r->d_act_q8, r->d_act_scale,
-                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                      cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
-                } else {
-                    launch_matvec_expert_auto(r, r->d_gate, cl->moe_gate_exps_w, r->d_xb,
-                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                      cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
-                    launch_matvec_expert_auto(r, r->d_up, cl->moe_up_exps_w, r->d_xb,
-                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                      cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
-                }
-                launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
-                if (dn_dp4a) {
-                    launch_quantize_q8(r, r->d_gate, expert_ff, r->d_act_q8_b, r->d_act_scale_b);
-                    launch_matvec_expert_dp4a(r, r->d_xb2, cl->moe_down_exps_w, r->d_act_q8_b, r->d_act_scale_b,
-                                      cl->moe_exp_rows_d, cl->moe_exp_cols_d,
-                                      cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
-                } else {
-                    launch_matvec_expert_auto(r, r->d_xb2, cl->moe_down_exps_w, r->d_gate,
-                                      cl->moe_exp_rows_d, cl->moe_exp_cols_d,
-                                      cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
-                }
-                launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_moe_w, e, n_embd);
-            }
-
-            /* Shared expert (fixed pointers; gate sigmoid computed on-device) */
-            {
-                launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
-                launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
-                launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
-                                  cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
-                launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
-                                  cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
-                launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
-                launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
-                                  cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
-                launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_shared_scale, 0, n_embd);
-            }
-
-            hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
-                          hipMemcpyDeviceToDevice, r->stream);
-          } else {
-            /* ---- Legacy host-sync dispatch (fallback for unsupported types) ---- */
-            hipDeviceSynchronize();
-            hipMemcpy(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float), hipMemcpyDeviceToHost);
-            int top_k_idx[64];
-            float top_k_weights[64];
-            moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_k_idx, top_k_weights);
-
-            hipMemset(r->d_moe_accum, 0, n_embd * sizeof(float));
-
-            for (int e = 0; e < n_experts_used; e++) {
-                int eidx = top_k_idx[e];
-                void *gate_w = (void *)((char *)cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu);
-                void *up_w   = (void *)((char *)cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu);
-                void *down_w = (void *)((char *)cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d);
-
-                launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
-                launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
-                launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
-                launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
-                                  cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
-                launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_k_weights[e], n_embd);
-            }
-
-            {
-                launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
-                hipDeviceSynchronize();
-                float gate_val;
-                hipMemcpy(&gate_val, r->d_router_logits, sizeof(float), hipMemcpyDeviceToHost);
-                float shared_scale = 1.0f / (1.0f + expf(-gate_val));
-
-                launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
-                                  cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
-                launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
-                                  cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
-                launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
-                launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
-                                  cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
-                launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
-            }
-
-            hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
-                          hipMemcpyDeviceToDevice, r->stream);
-          }
-
+            forward_moe_ffn(r, cl);
         } else {
             /* Dense FFN */
             launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
@@ -7792,6 +7783,22 @@ ffn_section:
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
         launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
                              cl->ffn_norm_w, n_embd, M, n_embd, eps);
+
+        /* ---- MoE FFN: per-row over the batch (Phase 2 increment 1). The router
+         * top-K + sparse experts are applied to each of the M normed rows; the
+         * attention/SSM projections above are already batched via hipBLASLt.
+         * (Batched token-grouped experts are the next increment.) ---- */
+        if (cl->is_moe) {
+            void *saved_xb = r->d_xb;
+            for (int m = 0; m < M; m++) {
+                r->d_xb = (char *)r->d_xnorm_batch + (size_t)m * n_embd * sizeof(float);
+                forward_moe_ffn(r, cl);  /* reads + overwrites that normed row */
+                launch_add(r, (float *)r->d_x_batch + (size_t)m * n_embd, r->d_xb, n_embd);
+            }
+            r->d_xb = saved_xb;
+            continue;
+        }
+
         launch_pack_bf16_from_f32(r, r->d_ffn_norm_batch_bf16,
                                   r->d_xnorm_batch, M * n_embd);
 
