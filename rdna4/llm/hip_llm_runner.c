@@ -3644,6 +3644,62 @@ static const char *hip_kernel_source =
 "    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
 "    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; x[row] += t; }\n"
 "}\n"
+"/* ---- matvec_out_gated_q6k: fused gated attention output matvec (Q6_K). */\n"
+"/* Fuses sigmoid_mul + output_w matvec into one launch.\n"
+" * out[row] = dot(W_out[row], sigmoid(gate) .* in). */\n"
+"__global__ void matvec_out_gated_q6k(float *out, const unsigned char *w_out,\n"
+"        const float *in, const float *gate, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = w_out + (size_t)row * row_bytes;\n"
+"    int G = nb * 16; float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 4; int rem = g & 15; int half = rem >> 3; int lp = rem & 7;\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp + half * 64 + lp * 4;\n"
+"        const unsigned char *qh = bp + 128 + half * 32 + lp * 4;\n"
+"        const signed char *sc = (const signed char *)(bp + 192 + half * 8);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        unsigned int qlo, qhi, qhv;\n"
+"        __builtin_memcpy(&qlo, ql, 4);\n"
+"        __builtin_memcpy(&qhi, ql + 32, 4);\n"
+"        __builtin_memcpy(&qhv, qh, 4);\n"
+"        int hi = (lp < 4) ? 0 : 1;\n"
+"        float sA = d * (float)sc[0 + hi], sB = d * (float)sc[2 + hi];\n"
+"        float sC = d * (float)sc[4 + hi], sD = d * (float)sc[6 + hi];\n"
+"        const float *x0 = in + b * 256 + half * 128 + lp * 4;\n"
+"        const float *g0 = gate + b * 256 + half * 128 + lp * 4;\n"
+"        float4 xv = *(const float4 *)x0;\n"
+"        float4 xv2 = *(const float4 *)(x0 + 32);\n"
+"        float4 xv3 = *(const float4 *)(x0 + 64);\n"
+"        float4 xv4 = *(const float4 *)(x0 + 96);\n"
+"        float4 gv = *(const float4 *)g0;\n"
+"        float4 gv2 = *(const float4 *)(g0 + 32);\n"
+"        float4 gv3 = *(const float4 *)(g0 + 64);\n"
+"        float4 gv4 = *(const float4 *)(g0 + 96);\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            int lo = (qlo >> (8*j)) & 0xFF, hi8 = (qhi >> (8*j)) & 0xFF, h2 = (qhv >> (8*j)) & 0xFF;\n"
+"            int q1 = (lo & 0xF) | ((h2 & 3) << 4); q1 -= 32;\n"
+"            int q2 = (hi8 & 0xF) | (((h2 >> 2) & 3) << 4); q2 -= 32;\n"
+"            int q3 = (lo >> 4) | (((h2 >> 4) & 3) << 4); q3 -= 32;\n"
+"            int q4 = (hi8 >> 4) | (((h2 >> 6) & 3) << 4); q4 -= 32;\n"
+"            float xa = (&xv.x)[j], xa2 = (&xv2.x)[j], xa3 = (&xv3.x)[j], xa4 = (&xv4.x)[j];\n"
+"            float ga = (&gv.x)[j], ga2 = (&gv2.x)[j], ga3 = (&gv3.x)[j], ga4 = (&gv4.x)[j];\n"
+"            float sg = 1.0f / (1.0f + __expf(-ga));\n"
+"            float sg2 = 1.0f / (1.0f + __expf(-ga2));\n"
+"            float sg3 = 1.0f / (1.0f + __expf(-ga3));\n"
+"            float sg4 = 1.0f / (1.0f + __expf(-ga4));\n"
+"            sum += sA * q1 * xa * sg + sB * q2 * xa2 * sg2\n"
+"                 + sC * q3 * xa3 * sg3 + sD * q4 * xa4 * sg4;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; out[row] = t; }\n"
+"}\n"
 "/* ---- ffn_gate_up_silu_q6k: fused decode FFN gate + up matvec + SiLU (Q6_K). */\n"
 "__global__ void ffn_gate_up_silu_q6k(float *gate_out,\n"
 "        const unsigned char *gate_w, const unsigned char *up_w,\n"
@@ -5673,6 +5729,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
     hipFunction_t fn_ffn_gate_up_silu_q6k;  /* decode: fused FFN gate+up+SiLU (Q6_K) */
     hipFunction_t fn_matvec_down_residual_q6k; /* decode: fused down matvec + residual (Q6_K) */
+    hipFunction_t fn_matvec_out_gated_q6k;     /* decode: fused gated output matvec (Q6_K) */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
@@ -6042,6 +6099,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_qkv_q6k);
     GET_FUNC(ffn_gate_up_silu_q6k);
     GET_FUNC(matvec_down_residual_q6k);
+    GET_FUNC(matvec_out_gated_q6k);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
     GET_FUNC(moe_router_fused);
@@ -8725,10 +8783,16 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                                    n_heads, n_kv_heads, head_dim, kv_dim, scale, smem_attn);
 
             int q_dim_local = n_heads * head_dim;
-            launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate, q_dim_local);
-
-            launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
-                              cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+            if (r->ssm_fused_decode && cl->attn_output_type == GGML_TYPE_Q6_K) {
+                int nr = cl->attn_output_rows;
+                int nc = cl->attn_output_cols;
+                void *a[] = { &r->d_xb, &cl->attn_output_w, &r->d_xb2, &r->d_attn_gate, &nr, &nc };
+                LAUNCH(r->fn_matvec_out_gated_q6k, nr, 1, 1, 64, 1, 1, 0, r->stream, a);
+            } else {
+                launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate, q_dim_local);
+                launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
+                                  cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+            }
 
         } else {
             /* === Standard attention === */
