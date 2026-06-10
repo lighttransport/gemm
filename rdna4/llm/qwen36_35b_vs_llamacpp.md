@@ -13,11 +13,15 @@ mmproj: `mmproj-F16.gguf` (Qwen3-VL vision tower).
 
 ## Text prefill/decode (no image)
 
-| test   | HIP test_hip_llm | llama.cpp llama-bench | llama.cpp / HIP |
-| ------ | ---------------: | --------------------: | --------------: |
-| pp512  |        31.2 tok/s |         897.5 tok/s   |        **28.8×** |
-| pp1024 |        30.9 tok/s |         887.9 tok/s   |        **28.7×** |
-| tg128  |        28.7 tok/s |          83.0 tok/s   |         **2.9×** |
+Original (session start) vs current (after decode + Phase 2 prefill optimization):
+
+| test   | HIP @start | HIP now | llama.cpp | llama.cpp / HIP now |
+| ------ | ---------: | ------: | --------: | ------------------: |
+| pp512  |  31.2 t/s | **393.7 t/s** | 897.5 t/s | **2.28×** |
+| pp1024 |  30.9 t/s | **401.4 t/s** | 887.9 t/s | **2.21×** |
+| tg128  |  28.7 t/s |  **45.5 t/s** |  83.0 t/s | **1.82×** |
+
+(was 28.8× / 28.7× / 2.9× at session start.) Details of each step below.
 
 HIP cmd: `LLM_PREFILL_WARMUP=2 ./test_hip_llm <model> -s 1300 --bench --gpu-only-bench --prefill-len {512,1024} --decode 128`
 llama: `llama-bench -m <model> --device ROCm0 -ngl 99 -fa on -p 512,1024 -n 128 -r 3`
@@ -36,8 +40,25 @@ Net **+56%** so far; verified bit-exact (`--verify-quant-kernels` 18/18 PASS) an
 output unchanged (VLM still identifies Mt. Fuji).
 
 **Side effect — prefill got faster too.** Per-token prefill reuses the same MoE
-dispatch + matvec kernels, so it rose **31.2 → 48.3 tok/s (+55%)** for free. The
-prefill gap to llama.cpp (897 tok/s) is now **~18.6×**, not 28.8×.
+dispatch + matvec kernels, so it rose **31.2 → 48.3 tok/s (+55%)** for free.
+
+**Fused quantized MoE GEMM (mmq) — the Phase 2 win (commit ed8a737, default ON).**
+`mmq_iq2s_f32`/`mmq_iq3s_f32`: `Y[cnt,N] = X[cnt,K] × W[N,K]^T` with W kept
+**quantized** — one warp owns a weight row, dequants each group once and reuses it
+across all `cnt` tokens (amortizing the grid-lookup/weight-read over the tile, no bf16
+materialization). Plus the dispatch fixes that finally route this model through the
+batched path (MoE-aware eligibility; F32 SSM weights made batchable; prefill chunked
+to ≤256 tokens to dodge a hipBLASLt/Tensile plan-build failure at M>256). Result:
+
+| | per-token | **mmq batched** | speedup |
+| --- | ---: | ---: | ---: |
+| text prefill @512   | 48.3 | **393.7 tok/s** | 8.1× |
+| text prefill @1024  | 47.5 | **401.4 tok/s** | 8.4× |
+| vision prefill (672)| 21.8 ms/tok | **2.96 ms/tok** | 7.4× |
+
+Decode unchanged (44–45 tok/s, per-token path); `--verify-quant-kernels` 18/18 PASS;
+VLM still identifies Mt. Fuji. **The prefill gap to llama.cpp (888 tok/s) is now ~2.2×,
+down from 28.8× at session start.**
 
 **Phase 2 prefill — increment 1 (scaffold, commit ee12d25, gated off).** Extracted
 `forward_moe_ffn()` and enabled the batched dispatcher (hipBLASLt SSM/attn projections
