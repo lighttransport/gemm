@@ -4869,7 +4869,7 @@ static const char *cuda_kernel_source =
 "                                         int n_tokens, int dt_rank, int d_state,\n"
 "                                         int n_group) {\n"
 "    int h = blockIdx.x;\n"
-"    int r = blockIdx.y;\n"
+"    int r = blockIdx.y * blockDim.y + threadIdx.y;\n"  /* blockDim.y warps/block, each an independent r (no shared, no sync) */
 "    int lane = threadIdx.x;\n"
 "    if (h >= dt_rank || r >= d_state) return;\n"
 "    int qkv_dim = 2 * n_group * d_state + dt_rank * d_state;\n"
@@ -10927,9 +10927,19 @@ static void launch_batch_deltanet_scan(cuda_llm_runner *r, CUdeviceptr out, CUde
                                         CUdeviceptr qkv, CUdeviceptr alpha, CUdeviceptr beta,
                                         int n_tokens, int dt_rank, int d_state, int n_group) {
     void *args[] = { &out, &state, &qkv, &alpha, &beta, &n_tokens, &dt_rank, &d_state, &n_group };
+    /* W independent warps/block (d_state==128 register path only) raises warps/SM past
+       the 1-warp/block occupancy cap. No shared/sync; r = blockIdx.y*W + threadIdx.y.
+       CUDA_LLM_SCAN_W in {1,2,4}; only used when d_state==128. */
+    static int scan_W = -1;
+    if (scan_W < 0) {
+        const char *e = getenv("CUDA_LLM_SCAN_W");
+        scan_W = e && e[0] ? atoi(e) : 4;
+        if (scan_W != 1 && scan_W != 2 && scan_W != 4) scan_W = 2;
+    }
+    int W = (d_state == 128 && (d_state % scan_W) == 0) ? scan_W : 1;
     cuLaunchKernel(r->fn_batch_deltanet_scan_f32,
-                   dt_rank, d_state, 1,
-                   32, 1, 1, sizeof(float) * d_state, r->stream, args, NULL);
+                   dt_rank, d_state / W, 1,
+                   32, W, 1, W > 1 ? 0 : sizeof(float) * d_state, r->stream, args, NULL);
 }
 
 static void launch_batch_l2_norm_heads_strided(cuda_llm_runner *r, CUdeviceptr vec,
