@@ -3001,6 +3001,35 @@ static const char *hip_kernel_source =
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) dst[i] += scale_ptr[slot] * src[i];\n"
 "}\n"
+"/* ---- Batched token-grouped MoE: gather / scatter-accumulate / row-scale ---- */\n"
+"/* gather: dst[i, :] = src[idx[i], :]  (assignment i pulls its token's row) */\n"
+"__global__ void moe_gather_rows(float *dst, const float *src, const int *idx,\n"
+"                                  int n_assign, int n_embd) {\n"
+"    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    long total = (long)n_assign * n_embd;\n"
+"    if (t >= total) return;\n"
+"    int i = t / n_embd; int j = t - (long)i * n_embd;\n"
+"    dst[t] = src[(long)idx[i] * n_embd + j];\n"
+"}\n"
+"/* scatter+accumulate: dst[idx[i], :] += w[i] * src[i, :]  (atomic; a token gets\n"
+"   one contribution per selected expert). */\n"
+"__global__ void moe_scatter_accum(float *dst, const float *src, const int *idx,\n"
+"                                    const float *w, int n_assign, int n_embd) {\n"
+"    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    long total = (long)n_assign * n_embd;\n"
+"    if (t >= total) return;\n"
+"    int i = t / n_embd; int j = t - (long)i * n_embd;\n"
+"    atomicAdd(&dst[(long)idx[i] * n_embd + j], w[i] * src[t]);\n"
+"}\n"
+"/* row-scale add: dst[m, :] += scale[m] * src[m, :]  (shared-expert gating). */\n"
+"__global__ void moe_row_scale_add(float *dst, const float *src, const float *scale,\n"
+"                                    int M, int n_embd) {\n"
+"    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    long total = (long)M * n_embd;\n"
+"    if (t >= total) return;\n"
+"    int m = t / n_embd;\n"
+"    dst[t] += scale[m] * src[t];\n"
+"}\n"
 "\n"
 "/* ---- expert-indexed matvec variants: base resolved from eidx[slot] ----   */\n"
 "__global__ void matvec_iq2_s_expert_f32(float *dst, const unsigned char *base, const float *x,\n"
@@ -4683,6 +4712,9 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_topk_softmax_gpu;
     hipFunction_t fn_sigmoid_scalar_f32;
     hipFunction_t fn_scale_add_dev_f32;
+    hipFunction_t fn_moe_gather_rows;
+    hipFunction_t fn_moe_scatter_accum;
+    hipFunction_t fn_moe_row_scale_add;
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
@@ -4794,6 +4826,27 @@ struct hip_llm_runner {
     float *d_moe_w;        /* [n_experts_used] softmax weights */
     float *d_shared_scale; /* [1] shared-expert sigmoid gate */
     int   moe_dev_dispatch_ok; /* 1 if all expert types are device-dispatchable */
+    /* Batched token-grouped MoE prefill (Phase 2) */
+    int   moe_prefill_batched;   /* LLM_MOE_PREFILL=1 enables the batched-expert path */
+    void *d_router_logits_batch; /* [Mmax, n_experts] f32 */
+    void *d_router_w_bf16;       /* [n_experts, n_embd] bf16 router weight (packed) */
+    void *d_moe_gather_in;       /* [Mmax*K, n_embd] f32 gathered activations */
+    void *d_moe_gather_in_bf16;  /* bf16 */
+    void *d_moe_eg;              /* [Mmax*K, expert_ff] f32 expert gate */
+    void *d_moe_eu;              /* [Mmax*K, expert_ff] f32 expert up */
+    void *d_moe_esilu_bf16;      /* [Mmax*K, expert_ff] bf16 silu(gate)*up */
+    void *d_moe_eout;            /* [Mmax*K, n_embd] f32 expert outputs */
+    void *d_moe_out_batch;       /* [Mmax, n_embd] f32 accumulated MoE output */
+    void *d_xnorm_batch_bf16_moe;/* [Mmax, n_embd] bf16 normed input (router+shared) */
+    void *d_shared_scale_batch;  /* [Mmax] f32 shared-gate sigmoid per token */
+    int  *d_moe_gather_src;      /* [Mmax*K] token index per assignment */
+    float *d_moe_gather_w;       /* [Mmax*K] softmax weight per assignment */
+    float *h_router_batch;       /* host [Mmax*n_experts] */
+    int   *h_moe_gather_src;     /* host [Mmax*K] expert-grouped token index */
+    float *h_moe_gather_w;       /* host [Mmax*K] expert-grouped weight */
+    int   *h_moe_tok_idx;        /* host [Mmax*K] per-token top-K expert idx */
+    float *h_moe_tok_w;          /* host [Mmax*K] per-token top-K softmax weight */
+    int   *h_moe_offsets;        /* host [n_experts+1] */
 
     /* GPU weights */
     int token_embd_type;
@@ -4991,6 +5044,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_topk_softmax_gpu);
     GET_FUNC(sigmoid_scalar_f32);
     GET_FUNC(scale_add_dev_f32);
+    GET_FUNC(moe_gather_rows);
+    GET_FUNC(moe_scatter_accum);
+    GET_FUNC(moe_row_scale_add);
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
@@ -5954,13 +6010,18 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          * the per-row loop has no host round-trips. Gate: LLM_MOE_PREFILL (default 1). */
         int eligible = !disabled;
         if (r->is_moe) {
-            /* Phase 2 increment 1 (batch SSM/attn projections, MoE FFN per-row) is
-             * net-negative: the per-token MoE FFN dominates, and the sync-free MoE
-             * dispatch + full-util matvecs already make per-token prefill ~48 tok/s.
-             * Default OFF (don't regress); kept as the scaffold for the real win =
-             * batched token-grouped experts. Enable with LLM_MOE_PREFILL=1. */
+            /* Batched token-grouped MoE prefill (LLM_MOE_PREFILL=1, default OFF):
+             * SSM/attn projections batch via hipBLASLt and experts are grouped by
+             * token (gather → per-expert dequant+GEMM → scatter). CORRECT but NOT
+             * faster than per-token for this model: 256 experts / 8-used gives only
+             * ~16-32 tokens/expert even at max batch, and the bf16 dequant of each
+             * expert weight materializes the full weight regardless of token count,
+             * so traffic ≈ per-token plus 256 tiny-GEMM + dequant launches/layer.
+             * Default OFF (per-token prefill is ~48 tok/s, faster). A real win needs
+             * a fused QUANTIZED MoE GEMM (mmq-style, no bf16 materialization). */
             const char *env_mp = getenv("LLM_MOE_PREFILL");
             int moe_prefill = (env_mp ? atoi(env_mp) != 0 : 0);
+            r->moe_prefill_batched = moe_prefill;
             if (!moe_prefill || !r->moe_dev_dispatch_ok || !r->is_hybrid) eligible = 0;
         }
 
@@ -6104,6 +6165,38 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 fprintf(stderr,
                     "hip_llm: Phase-2 batched path enabled (BMAX=%d, threshold=%d)\n",
                     batch_max, gemm_thresh);
+            }
+
+            /* Batched token-grouped MoE prefill buffers (LLM_MOE_PREFILL=1). */
+            if (r->is_moe && r->moe_prefill_batched) {
+                int bm = r->batch_max;
+                int ne = r->n_experts, K = r->n_experts_used;
+                int eff = r->expert_ff;
+                size_t TA = (size_t)bm * K;  /* max assignments */
+                CHECK_HIP(hipMalloc(&r->d_router_logits_batch, (size_t)bm * ne * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_router_w_bf16,       (size_t)ne * r->n_embd * 2));
+                CHECK_HIP(hipMalloc(&r->d_moe_gather_in,       TA * r->n_embd * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_moe_gather_in_bf16,  TA * r->n_embd * 2));
+                CHECK_HIP(hipMalloc(&r->d_moe_eg,              TA * eff * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_moe_eu,              TA * eff * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_moe_esilu_bf16,      TA * eff * 2));
+                CHECK_HIP(hipMalloc(&r->d_moe_eout,            TA * r->n_embd * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_moe_out_batch,       (size_t)bm * r->n_embd * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_xnorm_batch_bf16_moe,(size_t)bm * r->n_embd * 2));
+                CHECK_HIP(hipMalloc(&r->d_shared_scale_batch,  (size_t)bm * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_moe_gather_src,      TA * sizeof(int)));
+                CHECK_HIP(hipMalloc(&r->d_moe_gather_w,        TA * sizeof(float)));
+                r->h_router_batch    = (float *)malloc((size_t)bm * ne * sizeof(float));
+                r->h_moe_gather_src  = (int *)malloc(TA * sizeof(int));
+                r->h_moe_gather_w    = (float *)malloc(TA * sizeof(float));
+                r->h_moe_tok_idx     = (int *)malloc(TA * sizeof(int));
+                r->h_moe_tok_w       = (float *)malloc(TA * sizeof(float));
+                r->h_moe_offsets     = (int *)malloc((size_t)(ne + 1) * sizeof(int));
+                if (!r->h_router_batch || !r->h_moe_gather_src || !r->h_moe_gather_w ||
+                    !r->h_moe_tok_idx || !r->h_moe_tok_w || !r->h_moe_offsets) return -1;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "hip_llm: batched MoE prefill buffers: ~%.0f MB\n",
+                            (double)(TA * (r->n_embd*6 + eff*5)) / (1024.0*1024.0));
             }
 
             /* Plan pre-warm: fire the 7 hipBLASLt prefill GEMM shapes once at
@@ -6876,6 +6969,24 @@ static inline void launch_scale_add_dev(hip_llm_runner *r, void *dst, void *src,
     void *args[] = { &dst, &src, &scale_ptr, &slot, &n };
     LAUNCH(r->fn_scale_add_dev_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_moe_gather(hip_llm_runner *r, void *dst, void *src,
+                                      void *idx, int n_assign, int n_embd) {
+    void *args[] = { &dst, &src, &idx, &n_assign, &n_embd };
+    long total = (long)n_assign * n_embd;
+    LAUNCH(r->fn_moe_gather_rows, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_moe_scatter_accum(hip_llm_runner *r, void *dst, void *src,
+                                             void *idx, void *w, int n_assign, int n_embd) {
+    void *args[] = { &dst, &src, &idx, &w, &n_assign, &n_embd };
+    long total = (long)n_assign * n_embd;
+    LAUNCH(r->fn_moe_scatter_accum, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_moe_row_scale_add(hip_llm_runner *r, void *dst, void *src,
+                                             void *scale, int M, int n_embd) {
+    void *args[] = { &dst, &src, &scale, &M, &n_embd };
+    long total = (long)M * n_embd;
+    LAUNCH(r->fn_moe_row_scale_add, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, args);
+}
 /* Expert-indexed DP4A matvec for IQ2_S/IQ3_S; activation pre-quantized to (qs,scale). */
 static inline void launch_matvec_expert_dp4a(hip_llm_runner *r, void *dst, void *base,
                                               void *qs, void *scale, int n_rows, int n_cols,
@@ -7105,6 +7216,112 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
                   hipMemcpyDeviceToDevice, r->stream);
   }
+}
+
+/* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
+ * [M, n_embd] (pre-normed). Adds the MoE output into r->d_x_batch (residual).
+ * Experts are grouped by token: router GEMM -> host top-K -> gather by expert ->
+ * per-expert dequant+GEMM (gate/up/silu/down) -> scatter-accumulate; shared
+ * expert is dense over all M. Returns 0 on success. */
+static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
+    int n_embd = r->n_embd, ne = r->n_experts, K = r->n_experts_used;
+    int eff = r->expert_ff, sff = r->shared_expert_ff;
+    if (ne > 1024) return -1;  /* cursor[] cap */
+
+    /* 1. Router GEMM: [M,ne] = xnorm[M,n_embd] x Wg[ne,n_embd] (Wg is F32 -> bf16). */
+    launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16_moe, r->d_xnorm_batch, M * n_embd);
+    launch_pack_bf16_from_f32(r, r->d_router_w_bf16, cl->moe_gate_w, ne * n_embd);
+    if (mm_blaslt_run_bf16(r->d_router_logits_batch, r->d_router_w_bf16,
+                           r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
+
+    /* 2. Host top-K + softmax per token, group assignments by expert. */
+    hipMemcpyAsync(r->h_router_batch, r->d_router_logits_batch,
+                   (size_t)M * ne * sizeof(float), hipMemcpyDeviceToHost, r->stream);
+    hipStreamSynchronize(r->stream);
+    int *offs = r->h_moe_offsets;
+    for (int e = 0; e <= ne; e++) offs[e] = 0;
+    for (int m = 0; m < M; m++) {
+        moe_topk_softmax(r->h_router_batch + (size_t)m * ne, ne, K,
+                         r->h_moe_tok_idx + (size_t)m * K, r->h_moe_tok_w + (size_t)m * K);
+        for (int k = 0; k < K; k++) offs[r->h_moe_tok_idx[(size_t)m * K + k] + 1]++;
+    }
+    for (int e = 0; e < ne; e++) offs[e + 1] += offs[e];
+    int total = offs[ne];
+    {
+        int cursor[1024];
+        for (int e = 0; e < ne; e++) cursor[e] = offs[e];
+        for (int m = 0; m < M; m++)
+            for (int k = 0; k < K; k++) {
+                int e = r->h_moe_tok_idx[(size_t)m * K + k];
+                int p = cursor[e]++;
+                r->h_moe_gather_src[p] = m;
+                r->h_moe_gather_w[p]   = r->h_moe_tok_w[(size_t)m * K + k];
+            }
+    }
+    hipMemcpyAsync(r->d_moe_gather_src, r->h_moe_gather_src, (size_t)total * sizeof(int),
+                   hipMemcpyHostToDevice, r->stream);
+    hipMemcpyAsync(r->d_moe_gather_w, r->h_moe_gather_w, (size_t)total * sizeof(float),
+                   hipMemcpyHostToDevice, r->stream);
+
+    /* 3. Gather activations grouped by expert, pack bf16. */
+    launch_moe_gather(r, r->d_moe_gather_in, r->d_xnorm_batch, r->d_moe_gather_src, total, n_embd);
+    launch_pack_bf16_from_f32(r, r->d_moe_gather_in_bf16, r->d_moe_gather_in, total * n_embd);
+    hipMemsetAsync(r->d_moe_out_batch, 0, (size_t)M * n_embd * sizeof(float), r->stream);
+
+    /* 4. Per-expert GEMMs (dequant weight -> shared bf16 staging, then GEMM). */
+    for (int e = 0; e < ne; e++) {
+        int cnt = offs[e + 1] - offs[e];
+        if (cnt == 0) continue;
+        size_t off = (size_t)offs[e];
+        void *xin = (char *)r->d_moe_gather_in_bf16 + off * n_embd * 2;
+        void *gw = get_bf16_weight(r, (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu, NULL,
+                                   cl->moe_gate_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu);
+        if (!gw) return -1;
+        if (mm_blaslt_run_bf16((float *)r->d_moe_eg + off * eff, gw, xin, cnt, eff, n_embd, r->stream) != 0) return -1;
+        void *uw = get_bf16_weight(r, (char *)cl->moe_up_exps_w + (size_t)e * cl->moe_exp_stride_gu, NULL,
+                                   cl->moe_up_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu);
+        if (!uw) return -1;
+        if (mm_blaslt_run_bf16((float *)r->d_moe_eu + off * eff, uw, xin, cnt, eff, n_embd, r->stream) != 0) return -1;
+        launch_silu_mul(r, (float *)r->d_moe_eg + off * eff, (float *)r->d_moe_eu + off * eff, cnt * eff);
+        launch_pack_bf16_from_f32(r, (char *)r->d_moe_esilu_bf16 + off * eff * 2,
+                                  (float *)r->d_moe_eg + off * eff, cnt * eff);
+        void *dw = get_bf16_weight(r, (char *)cl->moe_down_exps_w + (size_t)e * cl->moe_exp_stride_d, NULL,
+                                   cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d);
+        if (!dw) return -1;
+        if (mm_blaslt_run_bf16((float *)r->d_moe_eout + off * n_embd, dw,
+                               (char *)r->d_moe_esilu_bf16 + off * eff * 2, cnt, n_embd, eff, r->stream) != 0) return -1;
+    }
+
+    /* 5. Scatter + weighted accumulate into d_moe_out_batch. */
+    launch_moe_scatter_accum(r, r->d_moe_out_batch, r->d_moe_eout, r->d_moe_gather_src,
+                             r->d_moe_gather_w, total, n_embd);
+
+    /* 6. Shared expert (dense over all M): gate logit -> sigmoid -> gate/up/silu/down -> row-scale add. */
+    launch_pack_bf16_from_f32(r, r->d_router_w_bf16, cl->moe_shared_gate_w, n_embd);
+    if (mm_blaslt_run_bf16(r->d_shared_scale_batch, r->d_router_w_bf16,
+                           r->d_xnorm_batch_bf16_moe, M, 1, n_embd, r->stream) != 0) return -1;
+    launch_sigmoid_inplace(r, r->d_shared_scale_batch, M);
+    {
+        void *sg = get_bf16_weight(r, cl->moe_shared_ffn_gate_w, NULL, cl->moe_shared_gate_type,
+                                   cl->moe_shared_gate_rows, cl->moe_shared_gate_cols);
+        if (!sg) return -1;
+        if (mm_blaslt_run_bf16(r->d_moe_eg, sg, r->d_xnorm_batch_bf16_moe, M, sff, n_embd, r->stream) != 0) return -1;
+        void *su = get_bf16_weight(r, cl->moe_shared_ffn_up_w, NULL, cl->moe_shared_up_type,
+                                   cl->moe_shared_up_rows, cl->moe_shared_up_cols);
+        if (!su) return -1;
+        if (mm_blaslt_run_bf16(r->d_moe_eu, su, r->d_xnorm_batch_bf16_moe, M, sff, n_embd, r->stream) != 0) return -1;
+        launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, M * sff);
+        launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, M * sff);
+        void *sd = get_bf16_weight(r, cl->moe_shared_ffn_down_w, NULL, cl->moe_shared_down_type,
+                                   cl->moe_shared_down_rows, cl->moe_shared_down_cols);
+        if (!sd) return -1;
+        if (mm_blaslt_run_bf16(r->d_moe_eout, sd, r->d_moe_esilu_bf16, M, n_embd, sff, r->stream) != 0) return -1;
+        launch_moe_row_scale_add(r, r->d_moe_out_batch, r->d_moe_eout, r->d_shared_scale_batch, M, n_embd);
+    }
+
+    /* 7. Residual: x_batch += moe_out. */
+    launch_add(r, r->d_x_batch, r->d_moe_out_batch, M * n_embd);
+    return 0;
 }
 
 static void forward_one_layer(hip_llm_runner *r, int l) {
@@ -7789,13 +8006,17 @@ ffn_section:
          * attention/SSM projections above are already batched via hipBLASLt.
          * (Batched token-grouped experts are the next increment.) ---- */
         if (cl->is_moe) {
-            void *saved_xb = r->d_xb;
-            for (int m = 0; m < M; m++) {
-                r->d_xb = (char *)r->d_xnorm_batch + (size_t)m * n_embd * sizeof(float);
-                forward_moe_ffn(r, cl);  /* reads + overwrites that normed row */
-                launch_add(r, (float *)r->d_x_batch + (size_t)m * n_embd, r->d_xb, n_embd);
+            if (r->moe_prefill_batched) {
+                if (forward_moe_ffn_batched(r, cl, M) != 0) return -1;
+            } else {
+                void *saved_xb = r->d_xb;
+                for (int m = 0; m < M; m++) {
+                    r->d_xb = (char *)r->d_xnorm_batch + (size_t)m * n_embd * sizeof(float);
+                    forward_moe_ffn(r, cl);  /* reads + overwrites that normed row */
+                    launch_add(r, (float *)r->d_x_batch + (size_t)m * n_embd, r->d_xb, n_embd);
+                }
+                r->d_xb = saved_xb;
             }
-            r->d_xb = saved_xb;
             continue;
         }
 
