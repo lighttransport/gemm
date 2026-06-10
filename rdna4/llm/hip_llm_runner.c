@@ -439,6 +439,36 @@ static const char *hip_kernel_source =
 "    c += (int)av[3] * (int)bv[3];\n"
 "    return c;\n"
 "}\n"
+"/* ---- hardware DP4A on RDNA4 (gfx12): signed 4x int8 MAC ---- */\n"
+"__device__ __forceinline__ int dp4a_hw(int a, int b, int c) {\n"
+"    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);\n"
+"}\n"
+"/* Build a packed int8x4 from 4 uint8 grid magnitudes, negating byte k when\n"
+"   sign bit (base+k) of sb is set (matches the scalar IQ sign convention). */\n"
+"__device__ __forceinline__ int apply_sign4(unsigned int g, unsigned int sb, int base) {\n"
+"    int r = 0; signed char *o = (signed char *)&r; const unsigned char *gb = (const unsigned char *)&g;\n"
+"    o[0] = (sb & (1u << (base+0))) ? -(int)gb[0] : (int)gb[0];\n"
+"    o[1] = (sb & (1u << (base+1))) ? -(int)gb[1] : (int)gb[1];\n"
+"    o[2] = (sb & (1u << (base+2))) ? -(int)gb[2] : (int)gb[2];\n"
+"    o[3] = (sb & (1u << (base+3))) ? -(int)gb[3] : (int)gb[3];\n"
+"    return r;\n"
+"}\n"
+"/* ---- quantize_q8_32: F32 vector -> int8 per-32-block + fp32 scale ---- */\n"
+"/* grid = n/32 blocks, blockDim 32 (one warp per 32-element block).          */\n"
+"__global__ void quantize_q8_32(signed char *qs, float *scale, const float *x, int n) {\n"
+"    int g = blockIdx.x; int lane = threadIdx.x; int idx = g * 32 + lane;\n"
+"    float v = (idx < n) ? x[idx] : 0.0f;\n"
+"    float a = fabsf(v);\n"
+"    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_down(a, o));\n"
+"    a = __shfl(a, 0);\n"
+"    float inv = (a > 0.0f) ? 127.0f / a : 0.0f;\n"
+"    if (lane == 0) scale[g] = a / 127.0f;\n"
+"    if (idx < n) {\n"
+"        int q = (int)rintf(v * inv);\n"
+"        q = q > 127 ? 127 : (q < -127 ? -127 : q);\n"
+"        qs[idx] = (signed char)q;\n"
+"    }\n"
+"}\n"
 "\n"
 "/* ---- 10. quantize_f32_to_int8: F32 vector -> INT8 + scale ---- */\n"
 "/* Single block, 256 threads. Writes scale_out[0] = absmax/127. */\n"
@@ -3085,6 +3115,100 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+"/* ======================================================================== */\n"
+"/* DP4A decode matvecs: q8 per-32-block activation + hardware int8 dot.       */\n"
+"/* Half-split: one lane per 16-element half so even nb=2 (down-proj) keeps     */\n"
+"/* full 32-lane occupancy. xq/xs are the activation pre-quantized by           */\n"
+"/* quantize_q8_32 (per-32-block scale). Grids fit int8 (iq2s<=43, iq3s<=15).   */\n"
+"/* ======================================================================== */\n"
+"#define IQ3S_DP4A_BODY \\\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 110; \\\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes; \\\n"
+"    int G = nb * 16; float sum = 0.0f; \\\n"
+"    for (int gg = lane; gg < G; gg += 32) { \\\n"
+"        int ibg = gg >> 1; int half = gg & 1; int b = ibg >> 3; int ib32 = ibg & 7; \\\n"
+"        const unsigned char *bp = row_ptr + b * 110; \\\n"
+"        float dw = half_to_float(*(const half_raw *)bp); \\\n"
+"        unsigned char qh = bp[66 + ib32]; \\\n"
+"        const unsigned char *qsb = bp + 2 + ib32 * 8; \\\n"
+"        const unsigned char *sgb = bp + 74 + ib32 * 4; \\\n"
+"        unsigned char scb = bp[106 + (ib32 >> 1)]; \\\n"
+"        int ls = (ib32 & 1) ? ((scb >> 4) & 0xf) : (scb & 0xf); \\\n"
+"        const int *u = (const int *)(xq + (size_t)(b * 8 + ib32) * 32); \\\n"
+"        float asc = xs[b * 8 + ib32]; \\\n"
+"        int sumi = 0; \\\n"
+"        for (int t = 0; t < 2; t++) { \\\n"
+"            int l0 = half * 4 + t * 2; \\\n"
+"            unsigned int gx = iq3s_grid_dev[qsb[l0]   | ((qh << (8 - l0)) & 0x100)]; \\\n"
+"            unsigned int gy = iq3s_grid_dev[qsb[l0+1] | ((qh << (7 - l0)) & 0x100)]; \\\n"
+"            unsigned char sb = sgb[l0 >> 1]; \\\n"
+"            sumi = dp4a_hw(apply_sign4(gx, sb, 0), u[l0],   sumi); \\\n"
+"            sumi = dp4a_hw(apply_sign4(gy, sb, 4), u[l0+1], sumi); \\\n"
+"        } \\\n"
+"        sum += dw * asc * (float)(1 + 2 * ls) * (float)sumi; \\\n"
+"    } \\\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o); \\\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"__global__ void matvec_iq3_s_dp4a(float *dst, const unsigned char *mat,\n"
+"                                  const signed char *xq, const float *xs,\n"
+"                                  int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    IQ3S_DP4A_BODY\n"
+"}\n"
+"__global__ void matvec_iq3_s_expert_dp4a(float *dst, const unsigned char *base,\n"
+"                                         const signed char *xq, const float *xs,\n"
+"                                         int n_rows, int n_cols,\n"
+"                                         const int *eidx, int slot, long long stride) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
+"    IQ3S_DP4A_BODY\n"
+"}\n"
+"#define IQ2S_DP4A_BODY \\\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 82; \\\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes; \\\n"
+"    int G = nb * 16; float sum = 0.0f; \\\n"
+"    for (int gg = lane; gg < G; gg += 32) { \\\n"
+"        int ibg = gg >> 1; int half = gg & 1; int b = ibg >> 3; int ib32 = ibg & 7; \\\n"
+"        const unsigned char *bp = row_ptr + b * 82; \\\n"
+"        float dw = half_to_float(*(const half_raw *)bp); \\\n"
+"        const unsigned char *qsb = bp + 2 + ib32 * 4; \\\n"
+"        unsigned char qh = bp[66 + ib32]; \\\n"
+"        const unsigned char *sgb = bp + 34 + ib32 * 4; \\\n"
+"        unsigned char scb = bp[74 + ib32]; \\\n"
+"        int ls = half ? (scb >> 4) : (scb & 0xf); \\\n"
+"        const int *u = (const int *)(xq + (size_t)(b * 8 + ib32) * 32); \\\n"
+"        float asc = xs[b * 8 + ib32]; \\\n"
+"        int sumi = 0; \\\n"
+"        for (int t = 0; t < 2; t++) { \\\n"
+"            int l = half * 2 + t; \\\n"
+"            int idx = qsb[l] | ((qh << (8 - 2 * l)) & 0x300); \\\n"
+"            const int *gp = (const int *)&iq2s_grid_dev[idx]; \\\n"
+"            unsigned char sb = sgb[l]; \\\n"
+"            sumi = dp4a_hw(apply_sign4(gp[0], sb, 0), u[l*2],   sumi); \\\n"
+"            sumi = dp4a_hw(apply_sign4(gp[1], sb, 4), u[l*2+1], sumi); \\\n"
+"        } \\\n"
+"        sum += dw * asc * 0.25f * ((float)ls + 0.5f) * (float)sumi; \\\n"
+"    } \\\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o); \\\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"__global__ void matvec_iq2_s_dp4a(float *dst, const unsigned char *mat,\n"
+"                                  const signed char *xq, const float *xs,\n"
+"                                  int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    IQ2S_DP4A_BODY\n"
+"}\n"
+"__global__ void matvec_iq2_s_expert_dp4a(float *dst, const unsigned char *base,\n"
+"                                         const signed char *xq, const float *xs,\n"
+"                                         int n_rows, int n_cols,\n"
+"                                         const int *eidx, int slot, long long stride) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
+"    IQ2S_DP4A_BODY\n"
+"}\n"
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -4473,6 +4597,17 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
+    /* DP4A decode path: per-32-block q8 activation + hardware int8 dot */
+    hipFunction_t fn_quantize_q8_32;
+    hipFunction_t fn_matvec_iq2_s_dp4a;
+    hipFunction_t fn_matvec_iq3_s_dp4a;
+    hipFunction_t fn_matvec_iq2_s_expert_dp4a;
+    hipFunction_t fn_matvec_iq3_s_expert_dp4a;
+    void *d_act_q8;      /* int8 activation A (d_xb), per-32-block (<= 8192 cols) */
+    void *d_act_scale;   /* per-32-block fp32 scale A */
+    void *d_act_q8_b;    /* int8 activation B (expert d_gate for down-proj) */
+    void *d_act_scale_b; /* per-32-block fp32 scale B */
+    int   decode_dp4a;   /* LLM_DECODE_DP4A (default on) */
     hipFunction_t fn_matvec_iq2_xxs_f32;
     hipFunction_t fn_matvec_q4_0_f32;
     hipFunction_t fn_matvec_q4_1_f32;
@@ -4764,6 +4899,12 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
+    /* DP4A decode path */
+    GET_FUNC(quantize_q8_32);
+    GET_FUNC(matvec_iq2_s_dp4a);
+    GET_FUNC(matvec_iq3_s_dp4a);
+    GET_FUNC(matvec_iq2_s_expert_dp4a);
+    GET_FUNC(matvec_iq3_s_expert_dp4a);
     GET_FUNC(matvec_iq2_xxs_f32);
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_1_f32);
@@ -4857,6 +4998,24 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
         hipStreamDestroy(r->stream);
         free(r);
         return NULL;
+    }
+
+    /* DP4A decode path (opt-in via LLM_DECODE_DP4A=1). Default OFF: on gfx1201
+     * the IQ2_S/IQ3_S matvecs are grid-lookup-dequant bound, not multiply bound,
+     * so int8 DP4A + q8 activation is ~2% slower than the full-utilization F32
+     * kernels. Kept gated/validated (rel_l2 ~1e-3 vs float ref) for reference and
+     * future tuning (e.g. SIMD sign via __vsub4, LDS-cached grids). */
+    r->decode_dp4a = 0;
+    { const char *e = getenv("LLM_DECODE_DP4A"); if (e) r->decode_dp4a = atoi(e) != 0; }
+    {
+        const size_t QCAP = 8192;
+        if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
+            hipMalloc(&r->d_act_scale,  (QCAP/32) * sizeof(float)) != hipSuccess ||
+            hipMalloc(&r->d_act_q8_b,   QCAP)                     != hipSuccess ||
+            hipMalloc(&r->d_act_scale_b,(QCAP/32) * sizeof(float)) != hipSuccess) {
+            fprintf(stderr, "hip_llm: q8 activation scratch alloc failed; DP4A disabled\n");
+            r->decode_dp4a = 0;
+        }
     }
 
     return r;
@@ -6173,8 +6332,36 @@ DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq4_xs, fn_matvec_iq4_xs_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq2_xs, fn_matvec_iq2_xs_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq3_xxs, fn_matvec_iq3_xxs_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq2_s, fn_matvec_iq2_s_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq3_s, fn_matvec_iq3_s_f32)
+/* Quantize a F32 activation vector x[n] -> int8 per-32-block (qs) + fp32 scale. */
+static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
+                                       void *qs, void *scale) {
+    void *args[] = { &qs, &scale, &x, &n };
+    LAUNCH(r->fn_quantize_q8_32, (n + 31) / 32, 1, 1, 32, 1, 1, 0, r->stream, args);
+}
+/* IQ2_S / IQ3_S: DP4A path when enabled (quantize x then int8 dot), else the
+ * full-utilization F32 fallback. Used by launch_matvec_auto + verify harness. */
+static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
+                                       void *x, int n_rows, int n_cols) {
+    if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
+        launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
+        void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq2_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    } else {
+        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq2_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    }
+}
+static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
+                                       void *x, int n_rows, int n_cols) {
+    if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
+        launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
+        void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq3_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    } else {
+        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq3_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    }
+}
 DEFINE_LAUNCH_MATVEC(iq1_s, fn_matvec_iq1_s_f32)
 DEFINE_LAUNCH_MATVEC(iq1_m, fn_matvec_iq1_m_f32)
 DEFINE_LAUNCH_MATVEC(tq1_0, fn_matvec_tq1_0_f32)
@@ -6585,6 +6772,15 @@ static inline void launch_scale_add_dev(hip_llm_runner *r, void *dst, void *src,
     void *args[] = { &dst, &src, &scale_ptr, &slot, &n };
     LAUNCH(r->fn_scale_add_dev_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
+/* Expert-indexed DP4A matvec for IQ2_S/IQ3_S; activation pre-quantized to (qs,scale). */
+static inline void launch_matvec_expert_dp4a(hip_llm_runner *r, void *dst, void *base,
+                                              void *qs, void *scale, int n_rows, int n_cols,
+                                              int type, int slot, long long stride) {
+    void *args[] = { &dst, &base, &qs, &scale, &n_rows, &n_cols, &r->d_moe_idx, &slot, &stride };
+    hipFunction_t fn = (type == GGML_TYPE_IQ3_S) ? r->fn_matvec_iq3_s_expert_dp4a
+                                                 : r->fn_matvec_iq2_s_expert_dp4a;
+    LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
 /* Expert-indexed matvec: base resolved on-device from r->d_moe_idx[slot]. */
 static inline void launch_matvec_expert_auto(hip_llm_runner *r, void *dst, void *base,
                                               void *x, int n_rows, int n_cols, int type,
@@ -6828,17 +7024,43 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             launch_moe_topk(r);  /* d_router_logits -> d_moe_idx[k] + d_moe_w[k] */
             hipMemsetAsync(r->d_moe_accum, 0, n_embd * sizeof(float), r->stream);
 
+            /* DP4A: experts (IQ2_S gate/up, IQ3_S down) via int8 dot. Quantize the
+             * shared d_xb activation once; down's d_gate is quantized per-expert. */
+            int gu_dp4a = r->decode_dp4a &&
+                (cl->moe_gate_exps_type == GGML_TYPE_IQ2_S || cl->moe_gate_exps_type == GGML_TYPE_IQ3_S) &&
+                (cl->moe_up_exps_type   == GGML_TYPE_IQ2_S || cl->moe_up_exps_type   == GGML_TYPE_IQ3_S);
+            int dn_dp4a = r->decode_dp4a &&
+                (cl->moe_down_exps_type == GGML_TYPE_IQ2_S || cl->moe_down_exps_type == GGML_TYPE_IQ3_S);
+            if (gu_dp4a)
+                launch_quantize_q8(r, r->d_xb, n_embd, r->d_act_q8, r->d_act_scale);
+
             for (int e = 0; e < n_experts_used; e++) {
-                launch_matvec_expert_auto(r, r->d_gate, cl->moe_gate_exps_w, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                  cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
-                launch_matvec_expert_auto(r, r->d_up, cl->moe_up_exps_w, r->d_xb,
-                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                  cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
+                if (gu_dp4a) {
+                    launch_matvec_expert_dp4a(r, r->d_gate, cl->moe_gate_exps_w, r->d_act_q8, r->d_act_scale,
+                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                      cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
+                    launch_matvec_expert_dp4a(r, r->d_up, cl->moe_up_exps_w, r->d_act_q8, r->d_act_scale,
+                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                      cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
+                } else {
+                    launch_matvec_expert_auto(r, r->d_gate, cl->moe_gate_exps_w, r->d_xb,
+                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                      cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
+                    launch_matvec_expert_auto(r, r->d_up, cl->moe_up_exps_w, r->d_xb,
+                                      cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                      cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
+                }
                 launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
-                launch_matvec_expert_auto(r, r->d_xb2, cl->moe_down_exps_w, r->d_gate,
-                                  cl->moe_exp_rows_d, cl->moe_exp_cols_d,
-                                  cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
+                if (dn_dp4a) {
+                    launch_quantize_q8(r, r->d_gate, expert_ff, r->d_act_q8_b, r->d_act_scale_b);
+                    launch_matvec_expert_dp4a(r, r->d_xb2, cl->moe_down_exps_w, r->d_act_q8_b, r->d_act_scale_b,
+                                      cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                                      cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
+                } else {
+                    launch_matvec_expert_auto(r, r->d_xb2, cl->moe_down_exps_w, r->d_gate,
+                                      cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                                      cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
+                }
                 launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_moe_w, e, n_embd);
             }
 
