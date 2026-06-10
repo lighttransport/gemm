@@ -2963,6 +2963,204 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+"/* ======================================================================== */\n"
+"/* MoE device-side dispatch kernels (sync-free, graph-capturable).          */\n"
+"/* Expert matvec variants resolve the per-expert weight base on-device from  */\n"
+"/* a device index buffer, so no host round-trip is needed for routing.       */\n"
+"/* ======================================================================== */\n"
+"\n"
+"/* ---- moe_topk_softmax_gpu: top-k by logit, softmax over the k selected ---- */\n"
+"/* One block, n threads. Parallel argmax reduction per round (k rounds), then  */\n"
+"/* softmax over the k selected. Bit-identical selection to the host path        */\n"
+"/* (ties broken by lowest index, matching the host '>' comparison).             */\n"
+"__global__ void moe_topk_softmax_gpu(const float *logits, int n, int k,\n"
+"                                       int *out_idx, float *out_w) {\n"
+"    __shared__ float sval[256];\n"
+"    __shared__ int   sidx[256];\n"
+"    __shared__ int   chosen[64];\n"
+"    int tid = threadIdx.x;\n"
+"    float my = (tid < n) ? logits[tid] : -1e30f;\n"
+"    for (int ki = 0; ki < k; ki++) {\n"
+"        float v = my;\n"
+"        /* mask already-selected indices */\n"
+"        for (int j = 0; j < ki; j++) if (chosen[j] == tid) v = -1e30f;\n"
+"        sval[tid] = v; sidx[tid] = tid;\n"
+"        __syncthreads();\n"
+"        for (int s = 128; s > 0; s >>= 1) {\n"
+"            if (tid < s && tid + s < 256) {\n"
+"                /* '>' so ties keep the lower index (smaller of the two) */\n"
+"                if (sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }\n"
+"                else if (sval[tid + s] == sval[tid] && sidx[tid + s] < sidx[tid]) { sidx[tid] = sidx[tid + s]; }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        if (tid == 0) { chosen[ki] = sidx[0]; out_idx[ki] = sidx[0]; out_w[ki] = sval[0]; }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) {\n"
+"        float mx = out_w[0];\n"
+"        for (int i = 1; i < k; i++) if (out_w[i] > mx) mx = out_w[i];\n"
+"        float sum = 0.0f;\n"
+"        for (int i = 0; i < k; i++) { out_w[i] = expf(out_w[i] - mx); sum += out_w[i]; }\n"
+"        float inv = 1.0f / sum;\n"
+"        for (int i = 0; i < k; i++) out_w[i] *= inv;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- sigmoid_scalar_f32: out[0] = sigmoid(in[0]) (shared-expert gate) ---- */\n"
+"__global__ void sigmoid_scalar_f32(float *out, const float *in) {\n"
+"    if (threadIdx.x == 0 && blockIdx.x == 0) out[0] = 1.0f / (1.0f + expf(-in[0]));\n"
+"}\n"
+"\n"
+"/* ---- scale_add_dev_f32: dst += scale_ptr[slot] * src (device scalar) ---- */\n"
+"__global__ void scale_add_dev_f32(float *dst, const float *src,\n"
+"                                    const float *scale_ptr, int slot, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) dst[i] += scale_ptr[slot] * src[i];\n"
+"}\n"
+"\n"
+"/* ---- expert-indexed matvec variants: base resolved from eidx[slot] ----   */\n"
+"__global__ void matvec_iq2_s_expert_f32(float *dst, const unsigned char *base, const float *x,\n"
+"                                          int n_rows, int n_cols,\n"
+"                                          const int *eidx, int slot, long long stride) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 82;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 82;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *qh = bp + 66;\n"
+"        const unsigned char *scales = bp + 74;\n"
+"        const unsigned char *signs = bp + 34;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;\n"
+"            float db1 = d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                float dl = (l < 2) ? db0 : db1;\n"
+"                int grid_idx = qs[l] | ((qh[ib32] << (8-2*l)) & 0x300);\n"
+"                const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[grid_idx];\n"
+"                unsigned char s = signs[l];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    float w = dl * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    partial += w * xb[yi++];\n"
+"                }\n"
+"            }\n"
+"            qs += 4;\n"
+"            signs += 4;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
+"__global__ void matvec_iq3_s_expert_f32(float *dst, const unsigned char *base, const float *x,\n"
+"                                          int n_rows, int n_cols,\n"
+"                                          const int *eidx, int slot, long long stride) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 110;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *qh_base = bp + 2 + 64;\n"
+"        const unsigned char *signs_base = bp + 2 + 64 + 8;\n"
+"        const unsigned char *scales = bp + 2 + 64 + 8 + 32;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        int qhi = 0, si = 0;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32 += 2) {\n"
+"            float db1 = d * (float)(1 + 2*(scales[ib32/2] & 0xf));\n"
+"            float db2 = d * (float)(1 + 2*(scales[ib32/2] >>  4));\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                const unsigned char *grid1 = (const unsigned char *)&iq3s_grid_dev[qs[2*l+0] | ((qh_base[qhi] << (8-2*l)) & 256)];\n"
+"                const unsigned char *grid2 = (const unsigned char *)&iq3s_grid_dev[qs[2*l+1] | ((qh_base[qhi] << (7-2*l)) & 256)];\n"
+"                unsigned char s = signs_base[si + l];\n"
+"                for (int j = 0; j < 4; j++) {\n"
+"                    float w0 = db1 * (float)grid1[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    float w1 = db1 * (float)grid2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"                    partial += w0 * xb[yi+j] + w1 * xb[yi+j+4];\n"
+"                }\n"
+"                yi += 8;\n"
+"            }\n"
+"            qs += 8; si += 4;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                const unsigned char *grid1 = (const unsigned char *)&iq3s_grid_dev[qs[2*l+0] | ((qh_base[qhi+1] << (8-2*l)) & 256)];\n"
+"                const unsigned char *grid2 = (const unsigned char *)&iq3s_grid_dev[qs[2*l+1] | ((qh_base[qhi+1] << (7-2*l)) & 256)];\n"
+"                unsigned char s = signs_base[si + l];\n"
+"                for (int j = 0; j < 4; j++) {\n"
+"                    float w0 = db2 * (float)grid1[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    float w1 = db2 * (float)grid2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"                    partial += w0 * xb[yi+j] + w1 * xb[yi+j+4];\n"
+"                }\n"
+"                yi += 8;\n"
+"            }\n"
+"            qhi += 2; qs += 8; si += 4;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
+"__global__ void matvec_iq4_xs_expert_f32(float *dst, const unsigned char *base, const float *x,\n"
+"                                           int n_rows, int n_cols,\n"
+"                                           const int *eidx, int slot, long long stride) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 136;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 136;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
+"        const unsigned char *scales_l = bp + 4;\n"
+"        const unsigned char *qs = bp + 8;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        for (int ib = 0; ib < 8; ib++) {\n"
+"            int ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4);\n"
+"            float dl = d * (float)(ls - 32);\n"
+"            for (int j = 0; j < 16; j++) {\n"
+"                float v0 = dl * (float)kvalues_iq4nl_dev[qs[j] & 0xf];\n"
+"                float v1 = dl * (float)kvalues_iq4nl_dev[qs[j] >>  4];\n"
+"                partial += v0 * xb[j] + v1 * xb[j + 16];\n"
+"            }\n"
+"            xb += 32;\n"
+"            qs += 16;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -4344,6 +4542,13 @@ struct hip_llm_runner {
     /* MoE kernels */
     hipFunction_t fn_scale_add_f32;
     hipFunction_t fn_matvec_f32_f32;
+    /* MoE device-side dispatch (sync-free, graph-capturable) */
+    hipFunction_t fn_moe_topk_softmax_gpu;
+    hipFunction_t fn_sigmoid_scalar_f32;
+    hipFunction_t fn_scale_add_dev_f32;
+    hipFunction_t fn_matvec_iq2_s_expert_f32;
+    hipFunction_t fn_matvec_iq3_s_expert_f32;
+    hipFunction_t fn_matvec_iq4_xs_expert_f32;
     hipFunction_t fn_matvec_iq2_xxs_f32;
     hipFunction_t fn_matvec_q4_0_f32;
     hipFunction_t fn_matvec_q4_1_f32;
@@ -4430,6 +4635,11 @@ struct hip_llm_runner {
     void *d_router_logits;
     void *d_moe_accum;
     float *h_router_logits;
+    /* MoE device-side dispatch buffers */
+    int  *d_moe_idx;       /* [n_experts_used] selected expert indices */
+    float *d_moe_w;        /* [n_experts_used] softmax weights */
+    float *d_shared_scale; /* [1] shared-expert sigmoid gate */
+    int   moe_dev_dispatch_ok; /* 1 if all expert types are device-dispatchable */
 
     /* GPU weights */
     int token_embd_type;
@@ -4623,6 +4833,13 @@ static int compile_kernels(hip_llm_runner *r) {
     /* MoE kernels */
     GET_FUNC(scale_add_f32);
     GET_FUNC(matvec_f32_f32);
+    /* MoE device-side dispatch */
+    GET_FUNC(moe_topk_softmax_gpu);
+    GET_FUNC(sigmoid_scalar_f32);
+    GET_FUNC(scale_add_dev_f32);
+    GET_FUNC(matvec_iq2_s_expert_f32);
+    GET_FUNC(matvec_iq3_s_expert_f32);
+    GET_FUNC(matvec_iq4_xs_expert_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_1_f32);
@@ -5458,6 +5675,27 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipMalloc(&r->d_moe_accum, r->n_embd * sizeof(float)));
         r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
         if (!r->h_router_logits) return -1;
+        /* Device-side dispatch buffers (sync-free MoE routing) */
+        CHECK_HIP(hipMalloc(&r->d_moe_idx, r->n_experts_used * sizeof(int)));
+        CHECK_HIP(hipMalloc(&r->d_moe_w,   r->n_experts_used * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_shared_scale, sizeof(float)));
+        /* Device-side expert dispatch is supported only when every routed-expert
+         * weight type has an expert-indexed kernel (IQ2_S / IQ3_S / IQ4_XS). */
+        r->moe_dev_dispatch_ok = 1;
+        for (int l = 0; l < r->n_layers; l++) {
+            hip_layer *cl = &r->layers[l];
+            if (!cl->is_moe) continue;
+            int ts[3] = { cl->moe_gate_exps_type, cl->moe_up_exps_type, cl->moe_down_exps_type };
+            for (int j = 0; j < 3; j++) {
+                if (ts[j] != GGML_TYPE_IQ2_S && ts[j] != GGML_TYPE_IQ3_S &&
+                    ts[j] != GGML_TYPE_IQ4_XS) { r->moe_dev_dispatch_ok = 0; }
+            }
+        }
+        if (r->verbose >= 1) {
+            fprintf(stderr, "hip_llm: MoE device-side dispatch %s\n",
+                    r->moe_dev_dispatch_ok ? "ENABLED (sync-free, graph-capturable)"
+                                           : "disabled (unsupported expert type)");
+        }
     }
 
     if (r->is_hybrid) {
@@ -6408,6 +6646,36 @@ static inline void launch_matvec_f32(hip_llm_runner *r, void *dst, void *mat,
     LAUNCH(r->fn_matvec_f32_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
+/* === MoE device-side dispatch launchers (sync-free, graph-capturable) === */
+static inline void launch_moe_topk(hip_llm_runner *r) {
+    int n = r->n_experts, k = r->n_experts_used;
+    void *args[] = { &r->d_router_logits, &n, &k, &r->d_moe_idx, &r->d_moe_w };
+    LAUNCH(r->fn_moe_topk_softmax_gpu, 1, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_sigmoid_scalar(hip_llm_runner *r, void *out, void *in) {
+    void *args[] = { &out, &in };
+    LAUNCH(r->fn_sigmoid_scalar_f32, 1, 1, 1, 1, 1, 1, 0, r->stream, args);
+}
+static inline void launch_scale_add_dev(hip_llm_runner *r, void *dst, void *src,
+                                          void *scale_ptr, int slot, int n) {
+    void *args[] = { &dst, &src, &scale_ptr, &slot, &n };
+    LAUNCH(r->fn_scale_add_dev_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+/* Expert-indexed matvec: base resolved on-device from r->d_moe_idx[slot]. */
+static inline void launch_matvec_expert_auto(hip_llm_runner *r, void *dst, void *base,
+                                              void *x, int n_rows, int n_cols, int type,
+                                              int slot, long long stride) {
+    void *args[] = { &dst, &base, &x, &n_rows, &n_cols, &r->d_moe_idx, &slot, &stride };
+    hipFunction_t fn;
+    switch (type) {
+        case GGML_TYPE_IQ2_S:  fn = r->fn_matvec_iq2_s_expert_f32;  break;
+        case GGML_TYPE_IQ3_S:  fn = r->fn_matvec_iq3_s_expert_f32;  break;
+        case GGML_TYPE_IQ4_XS: fn = r->fn_matvec_iq4_xs_expert_f32; break;
+        default: fn = r->fn_matvec_iq2_s_expert_f32; break; /* gated by moe_dev_dispatch_ok */
+    }
+    LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
 /* Top-K softmax for MoE routing */
 static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, float *out_weights) {
     for (int i = 0; i < k; i++) { out_idx[i] = -1; out_weights[i] = -1e30f; }
@@ -6631,6 +6899,43 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
                              cl->moe_gate_rows, cl->moe_gate_cols);
 
+          if (r->moe_dev_dispatch_ok) {
+            /* ---- Device-side, sync-free dispatch (graph-capturable) ---- */
+            launch_moe_topk(r);  /* d_router_logits -> d_moe_idx[k] + d_moe_w[k] */
+            hipMemsetAsync(r->d_moe_accum, 0, n_embd * sizeof(float), r->stream);
+
+            for (int e = 0; e < n_experts_used; e++) {
+                launch_matvec_expert_auto(r, r->d_gate, cl->moe_gate_exps_w, r->d_xb,
+                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                  cl->moe_gate_exps_type, e, (long long)cl->moe_exp_stride_gu);
+                launch_matvec_expert_auto(r, r->d_up, cl->moe_up_exps_w, r->d_xb,
+                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                  cl->moe_up_exps_type, e, (long long)cl->moe_exp_stride_gu);
+                launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
+                launch_matvec_expert_auto(r, r->d_xb2, cl->moe_down_exps_w, r->d_gate,
+                                  cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                                  cl->moe_down_exps_type, e, (long long)cl->moe_exp_stride_d);
+                launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_moe_w, e, n_embd);
+            }
+
+            /* Shared expert (fixed pointers; gate sigmoid computed on-device) */
+            {
+                launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+                launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
+                launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                                  cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+                launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                                  cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+                launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+                launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                                  cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+                launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_shared_scale, 0, n_embd);
+            }
+
+            hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
+                          hipMemcpyDeviceToDevice, r->stream);
+          } else {
+            /* ---- Legacy host-sync dispatch (fallback for unsupported types) ---- */
             hipDeviceSynchronize();
             hipMemcpy(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float), hipMemcpyDeviceToHost);
             int top_k_idx[64];
@@ -6655,7 +6960,6 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_k_weights[e], n_embd);
             }
 
-            /* Shared expert */
             {
                 launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
                 hipDeviceSynchronize();
@@ -6675,6 +6979,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
             hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
                           hipMemcpyDeviceToDevice, r->stream);
+          }
 
         } else {
             /* Dense FFN */
@@ -6755,10 +7060,11 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
      * state by one bogus step, so hip_llm_reset_state() is called after
      * capture to zero it back out (see decode-graph-capture-audit.md).
      *
-     * MoE stays gated: cl->is_moe branch synchronizes the stream and reads
-     * router logits to host for top-K selection — incompatible with capture. */
+     * MoE: capturable ONLY when device-side dispatch is active (moe_dev_dispatch_ok),
+     * i.e. router top-K + softmax + shared-gate sigmoid run on-device with no host
+     * sync. The legacy host-sync MoE path stays gated out. */
     r->graph_eligible =
-        !r->is_moe && !r->debug_layers;
+        !r->debug_layers && (!r->is_moe || r->moe_dev_dispatch_ok);
 
     if (!r->graph_eligible || r->graph_disabled) {
         if (r->verbose >= 1) {
