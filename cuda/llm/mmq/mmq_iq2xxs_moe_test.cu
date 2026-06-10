@@ -693,6 +693,70 @@ __global__ void mmq_iq2xxs_grouped_v9(float *out, const uint8_t *W, unsigned lon
     }
 }
 
+/* grouped MMQ v13: v11 reading BLOCK-MAJOR repacked weights. Weights transposed at load from
+   row-major [N][nb][66] to block-major [nb][N][66] so block bg of all N rows is contiguous:
+   bp = We + bg*N*66 + n*66. Validates the runner's load-time repack is bit-exact. */
+__global__ void mmq_iq2xxs_grouped_v13(float *out, const uint8_t *W, unsigned long long estride,
+                                       const signed char *cxq8, const float *cxs, const int *ebounds,
+                                       const int *worklist, int N, int K) {
+    __shared__ uint64_t sGrid[256]; __shared__ uint64_t sSignMask[128];
+    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=c_grid[i];
+    for (int i=threadIdx.x;i<128;i+=blockDim.x) sSignMask[i]=c_signmask[i];
+    int packed = worklist[blockIdx.y];
+    int e = packed >> 16, g0 = packed & 0xffff;
+    int eb0 = ebounds[e], eb1 = ebounds[e+1];
+    int m_base = eb0 + g0 * (8*TG);
+    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int gid = lane>>2, tid = lane&3;
+    int n0 = blockIdx.x*64 + warp*16;
+    int nb = K/256, nsb = K/32;
+    const uint8_t *We = W + (size_t)e*estride;
+    __shared__ signed char sX[8*TG][32]; __shared__ float sXs[8*TG];
+    __shared__ signed char sW[64][32]; __shared__ float sWs[64];
+    float f[TG][4]; for(int g=0;g<TG;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}
+    __syncthreads();
+    for (int sb=0; sb<nsb; sb++) {
+        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;
+            const uint8_t *bp=We+(size_t)(sb/8)*N*66+(size_t)n*66;   /* block-major */
+            float d=h2f_dev(*(const uint16_t*)bp); const uint16_t *qs=(const uint16_t*)(bp+2); int ib=sb&7;
+            uint32_t a0=(uint32_t)qs[4*ib]|((uint32_t)qs[4*ib+1]<<16);
+            uint32_t a1=(uint32_t)qs[4*ib+2]|((uint32_t)qs[4*ib+3]<<16);
+            if (half==0) sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;
+            for(int l=half*2; l<half*2+2; l++){ uint8_t idx=(a0>>(8*l))&255;
+                uint64_t gv=sGrid[idx], m=sSignMask[(a1>>(7*l))&127];
+                uint32_t glo=(uint32_t)gv, ghi=(uint32_t)(gv>>32);
+                uint32_t mlo=(uint32_t)m,  mhi=(uint32_t)(m>>32);
+                *(uint32_t*)&sW[r][l*8]   = __vsub4(glo^mlo, mlo);
+                *(uint32_t*)&sW[r][l*8+4] = __vsub4(ghi^mhi, mhi); } }
+        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int t=i>>3,j=i&7,m=m_base+t;
+            *(int*)&sX[t][j*4] = (m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }
+        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }
+        __syncthreads();
+        int wr=warp*16;
+        int a0=pack4a(&sW[wr+gid][tid*4]), a1=pack4a(&sW[wr+gid+8][tid*4]);
+        int a2=pack4a(&sW[wr+gid][tid*4+16]), a3=pack4a(&sW[wr+gid+8][tid*4+16]);
+        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];
+        for (int g=0; g<ntg; g++) {
+            int b0=pack4a(&sX[g*8+gid][tid*4]), b1=pack4a(&sX[g*8+gid][tid*4+16]);
+            int c0=0,c1=0,c2=0,c3=0;
+            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                :"=r"(c0),"=r"(c1),"=r"(c2),"=r"(c3)
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(0),"r"(0),"r"(0),"r"(0));
+            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];
+            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;
+            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;
+        }
+        __syncthreads();
+    }
+    int n_a=n0+gid, n_b=n0+gid+8;
+    for (int g=0; g<ntg; g++) {
+        int m_a=m_base+g*8+tid*2, m_b=m_a+1;
+        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }
+        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }
+    }
+}
+
 /* ---- weighted scatter: final[token] += wgt[c] * out_compact[c] ---- */
 __global__ void scatter_weighted(float *final_out, const float *out_compact, const int *ids_token,
                                   const float *cw, int total_rows, int N) {
@@ -932,6 +996,27 @@ int main(int argc,char**argv){
         printf("grouped v11 (vec act load): %.3f ms  (%.2fx vs v10, %.2fx vs v1)\n", m11, m10/m11, m1/m11);
         printf("v11 vs v1 out_compact: rel_L2 = %.6f  (expect ~0)\n", ev11);
         ok = ok && (ev11<1e-4);
+
+        /* ---- v13: block-major repacked weights (validate the runner's load-time repack) ---- */
+        { int Nrows=N, nbk=K/256; size_t est=(size_t)Nrows*nbk*66;
+          uint8_t *Wbm=(uint8_t*)malloc((size_t)n_experts*est);
+          for(int e=0;e<n_experts;e++){ const uint8_t*se=W+(size_t)e*est; uint8_t*de=Wbm+(size_t)e*est;
+              for(int n=0;n<Nrows;n++) for(int bg=0;bg<nbk;bg++)
+                  memcpy(de+(size_t)bg*Nrows*66+(size_t)n*66, se+(size_t)n*nbk*66+(size_t)bg*66, 66); }
+          uint8_t *dWbm; CUDA_CHECK(cudaMalloc(&dWbm,(size_t)n_experts*est));
+          CUDA_CHECK(cudaMemcpy(dWbm,Wbm,(size_t)n_experts*est,cudaMemcpyHostToDevice));
+          float *dOutC13; CUDA_CHECK(cudaMalloc(&dOutC13,(size_t)total*N*sizeof(float)));
+          CUDA_CHECK(cudaMemset(dOutC13,0,(size_t)total*N*sizeof(float)));
+          mmq_iq2xxs_grouped_v13<<<gg5,128>>>(dOutC13,dWbm,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+          CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+          float *oc13=(float*)malloc((size_t)total*N*sizeof(float));
+          CUDA_CHECK(cudaMemcpy(oc13,dOutC13,(size_t)total*N*sizeof(float),cudaMemcpyDeviceToHost));
+          double ev13=rel_l2(oc13,oc1,total*N);
+          cudaEventRecord(t0); for(int i=0;i<it;i++) mmq_iq2xxs_grouped_v13<<<gg5,128>>>(dOutC13,dWbm,estride,dCxq,dCxs,dEbounds,dWork,N,K);
+          cudaEventRecord(t1); cudaEventSynchronize(t1); float m13; cudaEventElapsedTime(&m13,t0,t1); m13/=it;
+          printf("grouped v13 (block-major): %.3f ms  (%.2fx vs v11, %.2fx vs v1)\n", m13, m11/m13, m1/m13);
+          printf("v13 vs v1 out_compact: rel_L2 = %.6f  (expect ~0 — validates repack)\n", ev13);
+          ok = ok && (ev13<1e-4); free(Wbm); }
     }
     printf("%s\n", ok?"PASS (mul_mat_id mechanics correct)":"FAIL");
     return ok?0:1;
