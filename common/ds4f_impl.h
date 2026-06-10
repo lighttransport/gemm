@@ -2947,9 +2947,12 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         m->mtp_h_proj=ds4f_new_tensor(m,dq,C2,C2); ds4f_load_dense(m,&B,&m->mtp_h_proj,MTPN("h_proj"));
         { int hd=hc*C2; m->mtp_hc_fn=(float*)ds4f_bump(m,(size_t)hc*hd*4,256); m->mtp_hc_base=(float*)ds4f_bump(m,(size_t)hc*4,64); m->mtp_hc_scale=(float*)ds4f_bump(m,(size_t)4,64);
           ds4f_load_raw(m,&B,m->mtp_hc_fn,MTPN("hc_head_fn"),DS4F_F32,hc,hd); ds4f_load_raw(m,&B,m->mtp_hc_base,MTPN("hc_head_base"),DS4F_F32,1,hc); ds4f_load_raw(m,&B,m->mtp_hc_scale,MTPN("hc_head_scale"),DS4F_F32,1,1); }
+        mt->kv_slots = cfg.window_size;   /* MTP: dense window attention -> window-size KV ring */
+        mt->kv_cache = (uint16_t *)aligned_alloc(256, ((size_t)mt->kv_slots*cfg.kv_lora*2 + 255) & ~255ull);
+        mt->sh_w1.w = mt->sh_w3.w = mt->sh_w2.w = NULL;   /* MTP has no shared expert (gate the shared step on sh_w1.w) */
         m->has_mtp=1;
         #undef MTPN
-        fprintf(stderr,"ds4f_load_mtp: MTP block loaded (rank %d/%d, %d owned experts) -- forward stub only\n", ep_rank, ep_size, no);
+        fprintf(stderr,"ds4f_load_mtp: MTP block loaded (rank %d/%d, %d owned experts)\n", ep_rank, ep_size, no);
     }
 
     double loaded_gb = (double)m->bytes_read / 1e9;
@@ -3925,21 +3928,27 @@ static void ds4f_hc_post(ds4f_model *m, float *x4, const float *resid, const flo
 
 /* hc_head: final collapse hc streams x4[hc*C] -> y[C] via per-stream sigmoid gate
  * (sigmoid(mixes*scale+base)+eps), NO sinkhorn. Mirrors ParallelHead.hc_head. */
-static void ds4f_hc_head(ds4f_model *m, const float *x4, float *y) {
+/* parameterized HC-head collapse (hc streams -> 1) -- the MTP head reuses it with its own
+ * hc_fn/base/scale. ds4f_hc_head is the main-model wrapper (m->hc_head_*). */
+static void ds4f_hc_head_p(ds4f_model *m, const float *x4, float *y,
+                           const float *hc_fn, const float *hc_base, const float *hc_scale) {
     ds4f_config *c = &m->cfg;
     int hc = c->hc_mult, C = c->hidden, hd = hc*C;
     double ss = 0.0; for (int i = 0; i < hd; i++) { float v = x4[i]; ss += (double)v*v; }
     float rsq = 1.0f/sqrtf((float)(ss/hd) + c->norm_eps);
     float mixes[16];
-    ds4f_tensor fnt = { (void*)m->hc_head_fn, NULL, DS4F_F32, hc, hd };
+    ds4f_tensor fnt = { (void*)hc_fn, NULL, DS4F_F32, hc, hd };
     ds4f_matvec(m, mixes, &fnt, x4);
     float pre[16];
     for (int k = 0; k < hc; k++)
-        pre[k] = ds4f_sigmoidf(mixes[k]*rsq*m->hc_head_scale[0] + m->hc_head_base[k]) + c->hc_eps;
+        pre[k] = ds4f_sigmoidf(mixes[k]*rsq*hc_scale[0] + hc_base[k]) + c->hc_eps;
     for (int d = 0; d < C; d++) {
         float a = 0.f; for (int k = 0; k < hc; k++) a += pre[k]*x4[(size_t)k*C+d];
         y[d] = a;
     }
+}
+static void ds4f_hc_head(ds4f_model *m, const float *x4, float *y) {
+    ds4f_hc_head_p(m, x4, y, m->hc_head_fn, m->hc_head_base, m->hc_head_scale);
 }
 
 /* Runs MLA + MoE for one token at position `pos`, hidden state in/out `x`[hidden].
@@ -4377,10 +4386,79 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
  * The block-forward body lives inline in ds4f_forward_token; extracting it (M=1) + the embed lookup +
  * the draft/verify/accept loop (with KV rollback) is the follow-on -- and the spec VERIFY needs the
  * M=K batched-decode rework (the per-token attn/tb2/KV/CP-gather path). Returns -1 until wired. */
-static int ds4f_mtp_predict(ds4f_model *m, const float *x, int next_id, int pos, float *logits_out) {
-    (void)x; (void)next_id; (void)pos; (void)logits_out;
+static int ds4f_mtp_predict(ds4f_model *m, const float *hc_state, const float *xe, int pos, float *logits_out) {
     if (!m->has_mtp) return -1;
-    return -1;   /* not yet wired into decode (scaffold: weights loaded + addressable via m->mtp / m->mtp_*) */
+    ds4f_config *c = &m->cfg;
+    int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD;
+    float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
+    ds4f_layer *mt = &m->mtp;
+    const float *rcos = m->rope_dense_cos, *rsin = m->rope_dense_sin;
+    /* the MTP dense is loaded FULL (no TP) -> override the dense-TP shard ranges to full for its forward;
+     * EP-sharded experts + the shared vocab head keep their sharding. Save/restore. */
+    int s_h0=m->attn_h0, s_h1=m->attn_h1, s_oi0=m->oi0, s_oir=m->oi_rows, s_shr0=m->sh_r0, s_shr=m->sh_rows;
+    m->attn_h0=0; m->attn_h1=c->n_heads; m->oi0=0; m->oi_rows=c->o_inter; m->sh_r0=0; m->sh_rows=c->shared_inter;
+    /* ---- fusion: s_x4[k] = e_proj(enorm(xe)) + h_proj(hnorm(hc_state[k])) ---- */
+    float *xn = (float *)alloca((size_t)C*4), *eo = (float *)alloca((size_t)C*4);
+    ds4f_rmsnorm(xn, xe, m->mtp_enorm, C, eps);
+    ds4f_matvec(m, eo, &m->mtp_e_proj, xn);                       /* e_out[C], broadcast over hc */
+    for (int k = 0; k < hc; k++) {
+        ds4f_rmsnorm(xn, hc_state + (size_t)k*C, m->mtp_hnorm, C, eps);
+        ds4f_matvec(m, m->s_xc, &m->mtp_h_proj, xn);
+        for (int i = 0; i < C; i++) m->s_x4[(size_t)k*C+i] = eo[i] + m->s_xc[i];
+    }
+    /* ---- one mHC layer (m->mtp): attn + MoE, NO tier-B2, NO shared expert ---- */
+    float post_a[16], comb_a[64], post_f[16], comb_f[64];
+    ds4f_hc_pre(m, m->s_x4, mt->hc_attn_fn, mt->hc_attn_scale, mt->hc_attn_base, m->s_xc, post_a, comb_a);
+    memcpy(m->s_resid, m->s_x4, hcC*4);
+    ds4f_rmsnorm(m->s_hn, m->s_xc, mt->attn_norm, C, eps);
+    ds4f_matvec(m, m->s_qlat, &mt->wq_a, m->s_hn);
+    ds4f_rmsnorm(m->s_qlat, m->s_qlat, mt->q_norm, c->q_lora, eps);
+    ds4f_matvec(m, m->s_q, &mt->wq_b, m->s_qlat);
+    ds4f_q_norm_rope_par(m, m->s_q, pos, rcos, rsin);
+    ds4f_matvec(m, m->s_kvlat, &mt->wkv, m->s_hn);
+    ds4f_rmsnorm(m->s_kvlat, m->s_kvlat, mt->kv_norm, KV, eps);
+    ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
+    { uint16_t *dst = mt->kv_cache + (size_t)(pos % mt->kv_slots)*KV;
+      for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(m->s_kvlat[d]); }
+    { ds4f_attn_ex_task at = { m, mt, pos, 1.0f/sqrtf((float)HD), c->window_size, c->qk_rope_dim/2, rcos, rsin };
+      ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
+    { int og = c->o_groups, gin = H/og;
+      ds4f_matvec_blockdiag(m, m->s_o1, &mt->wo_a, m->s_attn, gin, c->o_lora, 0);
+      ds4f_matvec(m, m->s_o, &mt->wo_b, m->s_o1); }
+    ds4f_hc_post(m, m->s_x4, m->s_resid, m->s_o, post_a, comb_a);
+    ds4f_hc_pre(m, m->s_x4, mt->hc_ffn_fn, mt->hc_ffn_scale, mt->hc_ffn_base, m->s_xc, post_f, comb_f);
+    memcpy(m->s_resid, m->s_x4, hcC*4);
+    ds4f_rmsnorm(m->s_h2, m->s_xc, mt->ffn_norm, C, eps);
+    for (int i = 0; i < C; i++) m->s_route[i] = 0.f;
+    ds4f_matvec(m, m->s_router, &mt->gate, m->s_h2);
+    { int idx[8]; float wt[8];
+      ds4f_topk_exact(m->s_router, mt->gate_bias, c->n_experts, c->n_active, idx, wt, c->routed_scale);
+      for (int k = 0; k < c->n_active; k++) {
+          int e = idx[k]; if (e < 0 || e % m->ep_size != m->ep_rank) continue;
+          int slot = e / m->ep_size;
+          ds4f_matvec(m, m->s_exg, &mt->ex_w1[slot], m->s_h2);
+          ds4f_matvec(m, m->s_exu, &mt->ex_w3[slot], m->s_h2);
+          float lim = c->swiglu_limit;
+          for (int i = 0; i < c->moe_inter; i++)
+              m->s_exg[i] = ds4f_silu(m->s_exg[i] > lim ? lim : m->s_exg[i]) * ds4f_clampf(m->s_exu[i], -lim, lim);
+          ds4f_matvec(m, m->s_o, &mt->ex_w2[slot], m->s_exg);
+          for (int i = 0; i < C; i++) m->s_route[i] += wt[k] * m->s_o[i];
+      } }
+    if (m->ar_cb) m->ar_cb(m->s_route, C, m->ar_ctx);            /* EP combine */
+    ds4f_hc_post(m, m->s_x4, m->s_resid, m->s_route, post_f, comb_f);
+    /* ---- MTP head: hc_head(mtp params) -> mtp_norm -> shared lm_head -> argmax ---- */
+    ds4f_hc_head_p(m, m->s_x4, m->s_xc, m->mtp_hc_fn, m->mtp_hc_base, m->mtp_hc_scale);
+    ds4f_rmsnorm(m->s_hn, m->s_xc, m->mtp_norm, C, eps);
+    if (m->head.rows < c->vocab && m->ar_cb) {
+        memset(m->s_logits, 0, (size_t)c->vocab*4);
+        ds4f_matvec(m, m->s_logits + m->head_r0, &m->head, m->s_hn);
+        m->ar_cb(m->s_logits, c->vocab, m->ar_ctx);
+    } else ds4f_matvec(m, m->s_logits, &m->head, m->s_hn);
+    int best = 0; { float bv = m->s_logits[0];
+        for (int v = 1; v < c->vocab; v++) if (m->s_logits[v] > bv) { bv = m->s_logits[v]; best = v; } }
+    if (logits_out) memcpy(logits_out, m->s_logits, (size_t)c->vocab*4);
+    m->attn_h0=s_h0; m->attn_h1=s_h1; m->oi0=s_oi0; m->oi_rows=s_oir; m->sh_r0=s_shr0; m->sh_rows=s_shr;
+    return best;
 }
 static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     ds4f_config *c = &m->cfg;

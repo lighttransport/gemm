@@ -447,6 +447,9 @@ int main(void) {
      * bit-identical on every rank -> replicated dense + lockstep argmax preserved. ---- */
     double t_pf0 = now_sec(); size_t pf_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int nan_count = 0; double xnorm = 0.0; int pf_last_tok = -1;
+    int mtp_on = gen_mode && m->has_mtp;   /* DS4F_MTP self-spec: maintain MTP KV (prefill+decode) + measure accept rate */
+    float *xe = mtp_on ? (float *)aligned_alloc(64, (size_t)C * 4) : NULL;
+    int mtp_prev_draft = -1, mtp_hits = 0, mtp_total = 0;
     sm_state = 0xD5F00D;   /* SAME seed on every rank -> replicated dense + valid all-reduce */
     if (prefill_batch > 0 && prefill > 0) {
         ds4f_alloc_prefill_batch(m, ar_mtile);
@@ -474,6 +477,11 @@ int main(void) {
             m->bytes_read = 0;
             pf_last_tok = ds4f_forward_token(m, x, p);
             pf_bytes += m->bytes_read;
+            if (mtp_on) {   /* maintain MTP KV over the prompt: process token@(p+1) at position p+1 */
+                int nt = (p + 1 < prefill) ? prompt_ids[p+1] : pf_last_tok;
+                embed_lookup(m, nt, xe);
+                mtp_prev_draft = ds4f_mtp_predict(m, m->s_x4, xe, p + 1, NULL);
+            }
             /* teacher-forcing sanity: does argmax(pos p) predict prompt_ids[p+1]?
              * A correct LM hits ~50-80% on its own code text; ~0% == broken forward. */
             if (tf_check && p+1 < prefill) {
@@ -527,9 +535,17 @@ int main(void) {
             cur = ds4f_forward_token(m, x, pos);
             dec_bytes += m->bytes_read;
             dec_steps++;
+            if (mtp_on) {   /* check last step's draft vs the real next token (alpha), then draft for the next */
+                if (mtp_prev_draft >= 0) { mtp_total++; if (mtp_prev_draft == cur) mtp_hits++; }
+                if (cur != DS4F_EOS_ID) { embed_lookup(m, cur, xe);
+                    mtp_prev_draft = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1, NULL); }
+            }
         }
         last_tok = cur;
         maxgen = dec_steps;     /* report tok/s over actual decode forward calls */
+        if (mtp_on && MyRank == 0)
+            logmsg("MTP_ALPHA %d/%d = %.1f%% (MTP draft == main next-tok; alpha -- the spec-decode gain predictor)\n",
+                   mtp_hits, mtp_total, mtp_total ? 100.0*mtp_hits/mtp_total : 0.0);
     } else {
         for (int g = 0; g < maxgen; g++) {
             int pos = dec_base + g;
