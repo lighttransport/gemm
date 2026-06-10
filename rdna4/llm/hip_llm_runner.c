@@ -3406,6 +3406,82 @@ static const char *hip_kernel_source =
 "        if (lane == 0) Y[(size_t)t * N + n] = v;\n"
 "    }\n"
 "}\n"
+"/* ======================================================================== */\n"
+"/* Fused decode MoE matvecs: one launch covers all K selected experts.        */\n"
+"/* Cuts ~40 small dependent launches/layer to 2 (gate+up+silu, down+accum).   */\n"
+"/* blockIdx.y = expert slot; expert base resolved on-device from eidx[].      */\n"
+"/* ======================================================================== */\n"
+"__global__ void moe_gateup_silu_iq2s(float *out /*[K,eff]*/,\n"
+"        const unsigned char *gate_base, const unsigned char *up_base,\n"
+"        const float *x, int eff, int n_cols,\n"
+"        const int *eidx, long long stride) {\n"
+"    int slot = blockIdx.y;\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id; if (row >= eff) return;\n"
+"    long long wb = (long long)eidx[slot] * stride;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 82;\n"
+"    int G = nb * 32;\n"
+"    float sg = 0.0f, su = 0.0f;\n"
+"    const unsigned char *grow = gate_base + wb + (size_t)row * row_bytes;\n"
+"    const unsigned char *urow = up_base   + wb + (size_t)row * row_bytes;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
+"        const float *xb = x + b * 256 + ib32 * 32 + l * 8;\n"
+"        #pragma unroll\n"
+"        for (int w = 0; w < 2; w++) {\n"
+"            const unsigned char *bp = (w ? urow : grow) + b * 82;\n"
+"            float d = half_to_float(*(const half_raw *)bp);\n"
+"            unsigned char scale = bp[74 + ib32];\n"
+"            float db = (l < 2) ? d * (0.5f + (float)(scale & 0xf)) * 0.25f\n"
+"                               : d * (0.5f + (float)(scale >>  4)) * 0.25f;\n"
+"            int gi = bp[2 + ib32*4 + l] | ((bp[66 + ib32] << (8 - 2*l)) & 0x300);\n"
+"            const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[gi];\n"
+"            unsigned char s = bp[34 + ib32*4 + l];\n"
+"            float p = 0.0f;\n"
+"            for (int j = 0; j < 8; j++)\n"
+"                p += db * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
+"            if (w) su += p; else sg += p;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) { sg += __shfl_down(sg, o); su += __shfl_down(su, o); }\n"
+"    if (lane == 0) {\n"
+"        float gate = sg / (1.0f + expf(-sg));   /* SiLU(gate) */\n"
+"        out[(size_t)slot * eff + row] = gate * su;\n"
+"    }\n"
+"}\n"
+"__global__ void moe_down_accum_iq3s(float *accum /*[n_embd]*/,\n"
+"        const unsigned char *down_base, const float *acts /*[K,eff]*/,\n"
+"        int n_embd, int eff, const int *eidx, const float *ew, long long stride) {\n"
+"    int slot = blockIdx.y;\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id; if (row >= n_embd) return;\n"
+"    const unsigned char *mat = down_base + (long long)eidx[slot] * stride;\n"
+"    const float *x = acts + (size_t)slot * eff;\n"
+"    int nb = eff / 256;\n"
+"    int row_bytes = nb * 110;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    int G = nb * 32;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int g32 = g & 31; int sb = g32 >> 2; int l = g32 & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned char sc = bp[106 + (sb >> 1)];\n"
+"        float db = d * (float)(1 + 2 * ((sb & 1) ? (sc >> 4) : (sc & 0xf)));\n"
+"        unsigned char qh = bp[66 + sb];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3s_grid_dev[bp[2+sb*8+2*l]   | ((qh << (8-2*l)) & 256)];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3s_grid_dev[bp[2+sb*8+2*l+1] | ((qh << (7-2*l)) & 256)];\n"
+"        unsigned char s = bp[74 + sb*4 + l];\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            sum += db * (float)g1[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
+"            sum += db * (float)g2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f) * xb[j+4];\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) atomicAdd(&accum[row], ew[slot] * sum);\n"
+"}\n"
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -4796,6 +4872,9 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_row_scale_add;
     hipFunction_t fn_mmq_iq2s_f32;   /* fused quantized MoE GEMM (gate/up) */
     hipFunction_t fn_mmq_iq3s_f32;   /* fused quantized MoE GEMM (down) */
+    hipFunction_t fn_moe_gateup_silu_iq2s;  /* decode: all-K experts gate+up+silu */
+    hipFunction_t fn_moe_down_accum_iq3s;   /* decode: all-K experts down+w-accum */
+    int moe_fused_decode;            /* LLM_MOE_FUSED (default on if types match) */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
@@ -4906,6 +4985,7 @@ struct hip_llm_runner {
     int  *d_moe_idx;       /* [n_experts_used] selected expert indices */
     float *d_moe_w;        /* [n_experts_used] softmax weights */
     float *d_shared_scale; /* [1] shared-expert sigmoid gate */
+    float *d_moe_act8;     /* [n_experts_used, expert_ff] fused decode activations */
     int   moe_dev_dispatch_ok; /* 1 if all expert types are device-dispatchable */
     /* Batched token-grouped MoE prefill (Phase 2) */
     int   moe_prefill_batched;   /* LLM_MOE_PREFILL=1 enables the batched-expert path */
@@ -5130,6 +5210,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_row_scale_add);
     GET_FUNC(mmq_iq2s_f32);
     GET_FUNC(mmq_iq3s_f32);
+    GET_FUNC(moe_gateup_silu_iq2s);
+    GET_FUNC(moe_down_accum_iq3s);
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
@@ -5247,6 +5329,8 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     { const char *e = getenv("LLM_DECODE_DP4A"); if (e) r->decode_dp4a = atoi(e) != 0; }
     r->lds_grid = 0;
     { const char *e = getenv("LLM_LDS_GRID"); if (e) r->lds_grid = atoi(e) != 0; }
+    r->moe_fused_decode = 1;
+    { const char *e = getenv("LLM_MOE_FUSED"); if (e) r->moe_fused_decode = atoi(e) != 0; }
     {
         const size_t QCAP = 8192;
         if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
@@ -6002,6 +6086,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipMalloc(&r->d_moe_idx, r->n_experts_used * sizeof(int)));
         CHECK_HIP(hipMalloc(&r->d_moe_w,   r->n_experts_used * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_shared_scale, sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_moe_act8,
+                            (size_t)r->n_experts_used * r->expert_ff * sizeof(float)));
         /* Device-side expert dispatch is supported only when every routed-expert
          * weight type has an expert-indexed kernel (IQ2_S / IQ3_S / IQ4_XS). */
         r->moe_dev_dispatch_ok = 1;
@@ -7089,6 +7175,21 @@ static inline void launch_mmq(hip_llm_runner *r, void *Y, void *W, void *X,
         LAUNCH(fn, (unsigned)((N + 7) / 8), 1, 1, 256, 1, 1, 0, r->stream, args);
     }
 }
+/* Fused decode MoE: all-K experts gate+up+silu in one launch, down+accum in one. */
+static inline void launch_moe_gateup_silu(hip_llm_runner *r, hip_layer *cl, int K) {
+    int eff = r->expert_ff, n_cols = r->n_embd;
+    long long stride = (long long)cl->moe_exp_stride_gu;
+    void *args[] = { &r->d_moe_act8, &cl->moe_gate_exps_w, &cl->moe_up_exps_w,
+                     &r->d_xb, &eff, &n_cols, &r->d_moe_idx, &stride };
+    LAUNCH(r->fn_moe_gateup_silu_iq2s, (eff + 7) / 8, K, 1, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_moe_down_accum(hip_llm_runner *r, hip_layer *cl, int K) {
+    int n_embd = r->n_embd, eff = r->expert_ff;
+    long long stride = (long long)cl->moe_exp_stride_d;
+    void *args[] = { &r->d_moe_accum, &cl->moe_down_exps_w, &r->d_moe_act8,
+                     &n_embd, &eff, &r->d_moe_idx, &r->d_moe_w, &stride };
+    LAUNCH(r->fn_moe_down_accum_iq3s, (n_embd + 7) / 8, K, 1, 256, 1, 1, 0, r->stream, args);
+}
 /* Expert-indexed DP4A matvec for IQ2_S/IQ3_S; activation pre-quantized to (qs,scale). */
 static inline void launch_matvec_expert_dp4a(hip_llm_runner *r, void *dst, void *base,
                                               void *qs, void *scale, int n_rows, int n_cols,
@@ -7228,6 +7329,17 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     launch_moe_topk(r);
     hipMemsetAsync(r->d_moe_accum, 0, n_embd * sizeof(float), r->stream);
 
+    /* Fused all-experts path: 2 launches instead of ~40 small dependent ones.
+     * Requires gate/up = IQ2_S and down = IQ3_S (covers 37/40 layers). */
+    if (r->moe_fused_decode &&
+        cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
+        cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
+        cl->moe_down_exps_type == GGML_TYPE_IQ3_S) {
+        launch_moe_gateup_silu(r, cl, n_experts_used);
+        launch_moe_down_accum(r, cl, n_experts_used);
+        goto shared_expert;
+    }
+
     int gu_dp4a = r->decode_dp4a &&
         (cl->moe_gate_exps_type == GGML_TYPE_IQ2_S || cl->moe_gate_exps_type == GGML_TYPE_IQ3_S) &&
         (cl->moe_up_exps_type   == GGML_TYPE_IQ2_S || cl->moe_up_exps_type   == GGML_TYPE_IQ3_S);
@@ -7266,6 +7378,7 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
         launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_moe_w, e, n_embd);
     }
 
+shared_expert:
     {
         launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
         launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
