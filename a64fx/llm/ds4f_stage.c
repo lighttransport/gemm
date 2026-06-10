@@ -30,11 +30,17 @@
  *   DS4F_EP_RANK=0 DS4F_EP_SIZE=11 ./build/ds4f_stage
  *
  * Env:
- *   DS4F_MODEL_DIR   model dir (default $HOME/models/ds4f)
+ *   DS4F_MODEL       "ds4f" (default) or "ds4p" (DeepSeek-V4-Pro: flips the
+ *                    model-dir/nshards defaults to ~/models/ds4p / 64)
+ *   DS4F_MODEL_DIR   model dir (default $HOME/models/<DS4F_MODEL>)
  *   DS4F_STAGE_DIR   output dir (default /local/ds4f, fallback $HOME/tmp/ds4f)
  *   DS4F_EP_RANK     this node's EP rank (default: MPI rank env, else 0)
  *   DS4F_EP_SIZE     number of EP ranks (default 11)
- *   DS4F_NSHARDS     shard count (default 46)
+ *   DS4F_NSHARDS     shard count (default 46; 64 for ds4p)
+ *   DS4F_STAGE_LAYERS  stage only layers.L.* with L < N (0 = all; embed/head/
+ *                    out-norm always staged).  Needed for layer-truncated
+ *                    12-node DS4P tests: the full 61-layer per-rank blob
+ *                    (~101 GB @11 ranks) exceeds the 87 GiB /local.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -95,6 +101,11 @@ static int classify(const char *name, int rank, int ep_size) {
         if (!smtp) return CLS_SKIP;
         /* else fall through: mtp.0.ffn.experts.N EP-sharded, rest dense (like a main layer) */
     }
+    if (strncmp(name, "layers.", 7) == 0) {                 /* layer-truncated stage (DS4F_STAGE_LAYERS) */
+        static int slay = -1;
+        if (slay < 0) slay = envi("DS4F_STAGE_LAYERS", 0);
+        if (slay > 0 && strtol(name + 7, NULL, 10) >= slay) return CLS_SKIP;
+    }
     long e = expert_id(name);
     if (e >= 0) return (e % ep_size == rank) ? CLS_EXPERT : CLS_SKIP;
     return CLS_DENSE;                                       /* replicated */
@@ -113,10 +124,12 @@ static int write_all(int fd, const void *buf, size_t n) {
 
 int main(void) {
     const char *home = getenv("HOME"); if (!home) home = ".";
+    const char *mtag = getenv("DS4F_MODEL");
+    int is_pro = (mtag && strcmp(mtag, "ds4p") == 0);
     char model_dir[1024], stage_dir[1024];
     {   const char *e = getenv("DS4F_MODEL_DIR");
         if (e && *e) snprintf(model_dir, sizeof model_dir, "%s", e);
-        else snprintf(model_dir, sizeof model_dir, "%s/models/ds4f", home); }
+        else snprintf(model_dir, sizeof model_dir, "%s/models/%s", home, is_pro ? "ds4p" : "ds4f"); }
     {   const char *e = getenv("DS4F_STAGE_DIR");
         if (e && *e) snprintf(stage_dir, sizeof stage_dir, "%s", e);
         else {
@@ -130,7 +143,7 @@ int main(void) {
 
     int rank    = detect_rank();
     int ep_size = envi("DS4F_EP_SIZE", 11);
-    int nshards = envi("DS4F_NSHARDS", 46);       /* real total (used in filename) */
+    int nshards = envi("DS4F_NSHARDS", is_pro ? 64 : 46);  /* real total (used in filename) */
     int slimit  = envi("DS4F_SHARD_LIMIT", 0);    /* cap iterations for smoke tests; 0 = all */
     int last    = (slimit > 0 && slimit < nshards) ? slimit : nshards;
     /* Bound the HBM /local page cache during staging. The ~22 GB blob's dirty

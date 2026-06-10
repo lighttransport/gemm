@@ -129,6 +129,34 @@ static inline ds4f_config ds4f_default_config(void) {
     return c;
 }
 
+/* DeepSeek-V4-Pro (~/models/ds4p, 805 GB / 64 shards): same deepseek_v4 graph as
+ * Flash (identical tensor names, tokenizer, MXFP4 expert packing, kv_lora=512,
+ * wo_a in-dim n_heads*q_head_dim/o_groups = 4096 in both) — pure dimension scaling.
+ * NOTE: no dense (ratio-0) decode layers — layers 0,1 are HCA(128); index 61 = MTP. */
+static inline ds4f_config ds4f_pro_config(void) {
+    ds4f_config c = ds4f_default_config();
+    c.n_layers = 61; c.hidden = 7168;
+    c.n_heads = 128;                       /* q_head_dim/qk_rope unchanged (512/64) */
+    c.q_lora = 1536;
+    c.o_inter = 16384; c.o_groups = 16;    /* o_lora stays 16384/16 = 1024 */
+    c.o_lora = c.o_inter / c.o_groups;
+    c.n_experts = 384; c.moe_inter = 3072; c.shared_inter = 3072;
+    c.routed_scale = 2.5f;
+    c.index_topk = 1024;                   /* index_head_dim/index_n_heads unchanged */
+    static const int RATIOS_P[62] = {
+        128, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0 };
+    for (int L = 0; L < 64; L++) c.compress_ratios[L] = (L < 62) ? RATIOS_P[L] : 0;
+    return c;
+}
+
+/* DS4F_MODEL=ds4p selects the Pro config (default: Flash). */
+static inline ds4f_config ds4f_config_from_env(void) {
+    const char *m = getenv("DS4F_MODEL");
+    return (m && strcmp(m, "ds4p") == 0) ? ds4f_pro_config() : ds4f_default_config();
+}
+
 /* ===================== tensor ===================== */
 /* DS4F_BF16_PV: BF16 weights in the pair-interleaved layout consumed by
  * matvec_bf16_8row_pv (p_odd predicated load, +22..28% over plain bf16,
