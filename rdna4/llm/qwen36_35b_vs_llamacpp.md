@@ -35,6 +35,19 @@ Decode (greedy, after a 64-token prefill, graph capture on):
 Net **+56%** so far; verified bit-exact (`--verify-quant-kernels` 18/18 PASS) and
 output unchanged (VLM still identifies Mt. Fuji).
 
+**Side effect — prefill got faster too.** Per-token prefill reuses the same MoE
+dispatch + matvec kernels, so it rose **31.2 → 48.3 tok/s (+55%)** for free. The
+prefill gap to llama.cpp (897 tok/s) is now **~18.6×**, not 28.8×.
+
+**Phase 2 prefill — increment 1 (scaffold, commit ee12d25, gated off).** Extracted
+`forward_moe_ffn()` and enabled the batched dispatcher (hipBLASLt SSM/attn projections
++ WMMA flash-attn) for hybrid+MoE, with the MoE FFN per-row of the batch. Correct (VLM
+Mt. Fuji via the 672-token batched vision prefill). **Net-negative: 45.9 vs 48.3 tok/s
+@L512** — the per-token MoE FFN dominates both paths, so batching only SSM/attn is pure
+overhead. Default `LLM_MOE_PREFILL=0`. The real lever = **batched token-grouped
+experts** (mul_mat_id: gather tokens by expert → per-expert GEMM → scatter), which
+replaces the per-row MoE loop in this same dispatcher — not yet implemented.
+
 **Diagnostics (rocprofv3 kernel trace, decode, graph off):**
 - HIP-graph capture only adds ~4% → decode is **GPU-compute-bound**, not launch-bound.
   The ~20% win from MoE dispatch came from removing 80 host syncs/token, not launches.
