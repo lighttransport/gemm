@@ -4262,6 +4262,92 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ================= IQ2_XXS MMQ (mul_mat_id) kernels =================\n"
+"   Grouped quantized MoE expert matmul: consume IQ2_XXS weights directly (no\n"
+"   F16 materialization) + q8_1 int8 activations via mma.sync.m16n8k32.s8.s8.s32.\n"
+"   Validated standalone in cuda/llm/mmq/. */\n"
+"/* gather rows by token index + quantize to q8_1 (per-32 scale). grid=(K/32,total), block=32 */\n"
+"__global__ void mmq_gather_quant_q8_1(const float *X, const int *ids_token,\n"
+"                                       signed char *cxq8, float *cxs, int total_rows, int K) {\n"
+"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x, k = kb*32 + t;\n"
+"    if (c >= total_rows) return;\n"
+"    int tok = ids_token[c];\n"
+"    float v = (k < K) ? X[(size_t)tok*K + k] : 0.0f;\n"
+"    float a = fabsf(v);\n"
+"    for (int o=16;o>0;o>>=1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
+"    float scale = a/127.0f, inv = scale>0.0f?1.0f/scale:0.0f;\n"
+"    int q=(int)rintf(v*inv); q=q<-127?-127:(q>127?127:q);\n"
+"    cxq8[(size_t)c*K + k] = (signed char)q;\n"
+"    if (t==0) cxs[(size_t)c*(K/32) + kb] = scale;\n"
+"}\n"
+"/* quantize compact rows (already gathered) to q8_1. grid=(K/32,total), block=32 */\n"
+"__global__ void mmq_quant_q8_1(const float *X, signed char *cxq8, float *cxs, int total_rows, int K) {\n"
+"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x, k = kb*32 + t;\n"
+"    if (c >= total_rows) return;\n"
+"    float v = (k < K) ? X[(size_t)c*K + k] : 0.0f;\n"
+"    float a = fabsf(v);\n"
+"    for (int o=16;o>0;o>>=1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
+"    float scale = a/127.0f, inv = scale>0.0f?1.0f/scale:0.0f;\n"
+"    int q=(int)rintf(v*inv); q=q<-127?-127:(q>127?127:q);\n"
+"    cxq8[(size_t)c*K + k] = (signed char)q;\n"
+"    if (t==0) cxs[(size_t)c*(K/32) + kb] = scale;\n"
+"}\n"
+"static __device__ __forceinline__ int mmq_pack4(const signed char*p){\n"
+"    return (p[0]&0xff)|((p[1]&0xff)<<8)|((p[2]&0xff)<<16)|((p[3]&0xff)<<24); }\n"
+"/* grouped MMQ: one dispatch over all experts (grid.z=n_experts, WN=4 warps/block).\n"
+"   out[total][N] = compact_act @ expert_weight^T. grid=(N/64, ceil(max_tok/8), n_experts), block=128 */\n"
+"__global__ void mmq_iq2xxs_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    int N, int K) {\n"
+"    int e = blockIdx.z; int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m0 = eb0 + blockIdx.y*8; if (m0 >= eb1) return;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[8][32]; __shared__ float sXs[8];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f0=0,f1=0,f2=0,f3=0;\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        for (int i=threadIdx.x;i<8*32;i+=blockDim.x){ int tt=i/32,kk=i%32,m=m0+tt;\n"
+"            sX[tt][kk]=(m<eb1)?cxq8[(size_t)m*K+sb*32+kk]:0; }\n"
+"        if (threadIdx.x<8){ int m=m0+threadIdx.x; sXs[threadIdx.x]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        if (lane<16){ int r=warp*16+lane, n=n0+lane;\n"
+"            const unsigned char *bp=We+(size_t)n*row_bytes+(sb/8)*66;\n"
+"            float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2); int ib=sb&7;\n"
+"            unsigned int a0=(unsigned int)qs[4*ib]|((unsigned int)qs[4*ib+1]<<16);\n"
+"            unsigned int a1=(unsigned int)qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"            sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;\n"
+"            for(int l=0;l<4;l++){ unsigned char idx=(a0>>(8*l))&255; const unsigned char *g=(const unsigned char*)&iq2xxs_grid_dev[idx];\n"
+"                unsigned char s=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                for(int j=0;j<8;j++) sW[r][l*8+j]=(signed char)((int)g[j]*((s&(1<<j))?-1:1)); } }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=mmq_pack4(&sW[wr+gid][tid*4]), qa1=mmq_pack4(&sW[wr+gid+8][tid*4]);\n"
+"        int qa2=mmq_pack4(&sW[wr+gid][tid*4+16]), qa3=mmq_pack4(&sW[wr+gid+8][tid*4+16]);\n"
+"        int qb0=mmq_pack4(&sX[gid][tid*4]), qb1=mmq_pack4(&sX[gid][tid*4+16]);\n"
+"        int c0=0,c1=0,c2=0,c3=0;\n"
+"        asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"            :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"            :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8], xc0=sXs[tid*2], xc1=sXs[tid*2+1];\n"
+"        f0+=wr0*xc0*(float)c0; f1+=wr0*xc1*(float)c1; f2+=wr8*xc0*(float)c2; f3+=wr8*xc1*(float)c3;\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8, m_a=m0+tid*2, m_b=m0+tid*2+1;\n"
+"    if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f0; out[(size_t)m_a*N+n_b]=f2; }\n"
+"    if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f1; out[(size_t)m_b*N+n_b]=f3; }\n"
+"}\n"
+"/* weighted scatter: final[ids_token[c]] += cw[c]*out_compact[c]. grid=total, block=256 */\n"
+"__global__ void mmq_scatter_weighted(float *final_out, const float *out_compact,\n"
+"                                      const int *ids_token, const float *cw, int total_rows, int N) {\n"
+"    int c = blockIdx.x; if (c>=total_rows) return;\n"
+"    int tok = ids_token[c]; float w = cw[c];\n"
+"    const float *s = out_compact + (size_t)c*N; float *d = final_out + (size_t)tok*N;\n"
+"    for (int n=threadIdx.x;n<N;n+=blockDim.x) atomicAdd(&d[n], w*s[n]);\n"
+"}\n"
+"\n"
 "/* ---- dequant_iq3_xxs_to_f16: IQ3_XXS expert slice -> F16 ---- */\n"
 "__global__ void dequant_iq3_xxs_to_f16(half_raw *dst, const unsigned char *mat,\n"
 "                                         int rows, int cols) {\n"
@@ -5449,6 +5535,11 @@ struct cuda_llm_runner {
     CUfunction fn_dequant_iq2_xxs_to_f16;
     CUfunction fn_dequant_iq2_xxs_pair_to_f16;
     CUfunction fn_dequant_iq2_xxs_triplet_to_f16;
+    /* IQ2_XXS MMQ (mul_mat_id) path */
+    CUfunction fn_mmq_gather_quant_q8_1;
+    CUfunction fn_mmq_quant_q8_1;
+    CUfunction fn_mmq_iq2xxs_grouped;
+    CUfunction fn_mmq_scatter_weighted;
     CUfunction fn_dequant_iq3_xxs_to_f16;
     CUfunction fn_batch_matvec_iq2_s_tc;
     CUfunction fn_batch_matvec_iq3_xxs;
@@ -5579,6 +5670,14 @@ struct cuda_llm_runner {
     CUdeviceptr d_moe_f16w;       /* [expert_ff * n_embd] F16 transient dequant scratch */
     CUdeviceptr d_moe_f16w2;      /* second F16 scratch for paired gate/up dequant */
     CUdeviceptr d_moe_f16w3;      /* third F16 scratch for triplet gate/up/down dequant */
+    /* IQ2_XXS MMQ (mul_mat_id) scratch — lazily allocated, sized for compacted rows */
+    CUdeviceptr d_mmq_cxq8;       /* int8 [total_rows * max(n_embd,expert_ff)] q8_1 activations */
+    CUdeviceptr d_mmq_cxs;        /* f32  [total_rows * max(n_embd,expert_ff)/32] q8_1 scales */
+    CUdeviceptr d_mmq_outg;       /* f32  [total_rows * expert_ff] gate out */
+    CUdeviceptr d_mmq_outu;       /* f32  [total_rows * expert_ff] up out */
+    CUdeviceptr d_mmq_outd;       /* f32  [total_rows * n_embd] down out */
+    CUdeviceptr d_mmq_ebounds;    /* int  [n_experts+1] expert bounds */
+    int d_mmq_alloc_rows;         /* allocated compact-row capacity (0 = unallocated) */
     float *h_router_logits;       /* host copy for top-k selection */
 
     /* GPU weights */
@@ -5906,6 +6005,10 @@ lookup_funcs:
     GET_FUNC(dequant_iq2_xxs_to_f16);
     GET_FUNC(dequant_iq2_xxs_pair_to_f16);
     GET_FUNC(dequant_iq2_xxs_triplet_to_f16);
+    GET_FUNC(mmq_gather_quant_q8_1);
+    GET_FUNC(mmq_quant_q8_1);
+    GET_FUNC(mmq_iq2xxs_grouped);
+    GET_FUNC(mmq_scatter_weighted);
     GET_FUNC(dequant_iq3_xxs_to_f16);
     GET_FUNC(batch_matvec_iq2_s_tc);
     GET_FUNC(batch_matvec_iq3_xxs);
@@ -11218,6 +11321,60 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                     cuMemcpyHtoD(r->d_topk_idx, etok, (size_t)tke * sizeof(int));
                     cuMemcpyHtoD(r->d_topk_wgt, etw, (size_t)tke * sizeof(float));
                     if (do_detail) { detail_ffn_pack_ms += get_time_ms() - _detail_t0; _detail_t0 = get_time_ms(); }
+                    const char *mmq_env = getenv("CUDA_LLM_MOE_MMQ");
+                    int use_mmq = mmq_env && mmq_env[0] && strcmp(mmq_env, "0") != 0 &&
+                        cl->moe_gate_exps_type == GGML_TYPE_IQ2_XXS &&
+                        cl->moe_up_exps_type == GGML_TYPE_IQ2_XXS &&
+                        cl->moe_down_exps_type == GGML_TYPE_IQ2_XXS &&
+                        (n_embd % 64 == 0) && (r->expert_ff % 64 == 0) &&
+                        r->fn_mmq_iq2xxs_grouped != NULL;
+                    if (use_mmq) {
+                        /* ===== IQ2_XXS MMQ (mul_mat_id) path: one grouped dispatch over all experts ===== */
+                        int total = offs[r->n_experts];           /* compacted (token,expert) rows */
+                        int ef = r->expert_ff;
+                        int maxcol = n_embd > ef ? n_embd : ef;
+                        if (r->d_mmq_alloc_rows < total) {
+                            if (r->d_mmq_cxq8) { cuMemFree(r->d_mmq_cxq8); cuMemFree(r->d_mmq_cxs);
+                                cuMemFree(r->d_mmq_outg); cuMemFree(r->d_mmq_outu); cuMemFree(r->d_mmq_outd); }
+                            if (cuMemAlloc(&r->d_mmq_cxq8, (size_t)total * maxcol) != CUDA_SUCCESS ||
+                                cuMemAlloc(&r->d_mmq_cxs, (size_t)total * (maxcol / 32) * sizeof(float)) != CUDA_SUCCESS ||
+                                cuMemAlloc(&r->d_mmq_outg, (size_t)total * ef * sizeof(float)) != CUDA_SUCCESS ||
+                                cuMemAlloc(&r->d_mmq_outu, (size_t)total * ef * sizeof(float)) != CUDA_SUCCESS ||
+                                cuMemAlloc(&r->d_mmq_outd, (size_t)total * n_embd * sizeof(float)) != CUDA_SUCCESS) {
+                                fprintf(stderr, "cuda_llm: MMQ buffer alloc failed\n");
+                                free(h_tki); free(h_tkw); free(ec); free(offs); free(cursor); free(etok); free(etw);
+                                return NULL;
+                            }
+                            if (!r->d_mmq_ebounds) cuMemAlloc(&r->d_mmq_ebounds, (size_t)(r->n_experts + 1) * sizeof(int));
+                            r->d_mmq_alloc_rows = total;
+                        }
+                        cuMemcpyHtoD(r->d_mmq_ebounds, offs, (size_t)(r->n_experts + 1) * sizeof(int));
+                        int maxtok = 0; for (int e = 0; e < r->n_experts; e++) if (ec[e] > maxtok) maxtok = ec[e];
+                        /* 1. gather d_batch_xb rows by ids_token (=etok in d_topk_idx) + quant to q8_1 */
+                        { int tr = total, kk = n_embd;
+                          void *a[] = { &d_batch_xb, &r->d_topk_idx, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
+                          cuLaunchKernel(r->fn_mmq_gather_quant_q8_1, n_embd / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+                        /* 2. grouped gate + up: out[total][ef] */
+                        { unsigned long long st = cl->moe_exp_stride_gu; int nN = ef, nK = n_embd;
+                          void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 7) / 8, r->n_experts, 128, 1, 1, 0, r->stream, ag, NULL);
+                          void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 7) / 8, r->n_experts, 128, 1, 1, 0, r->stream, au, NULL); }
+                        /* 3. silu: outg = silu(outg) * outu */
+                        launch_silu_mul(r, r->d_mmq_outg, r->d_mmq_outu, total * ef);
+                        /* 4. quantize silu result (ef cols) into cxq8 for the down matmul */
+                        { int tr = total, kk = ef;
+                          void *a[] = { &r->d_mmq_outg, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
+                          cuLaunchKernel(r->fn_mmq_quant_q8_1, ef / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+                        /* 5. grouped down: out[total][n_embd] */
+                        { unsigned long long st = cl->moe_exp_stride_d; int nN = n_embd, nK = ef;
+                          void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, (maxtok + 7) / 8, r->n_experts, 128, 1, 1, 0, r->stream, ad, NULL); }
+                        /* 6. weighted scatter into d_batch_x (ids_token=etok, weights=etw) */
+                        { int tr = total, nN = n_embd;
+                          void *a[] = { &d_batch_x, &r->d_mmq_outd, &r->d_topk_idx, &r->d_topk_wgt, &tr, &nN };
+                          cuLaunchKernel(r->fn_mmq_scatter_weighted, total, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+                    } else {
                     CUdeviceptr d_gd = d_batch_mid;
                     CUdeviceptr d_eg = d_batch_ff1, d_eu = d_batch_ff2, d_ed = d_batch_wide;
                     CUdeviceptr d_f16w = r->d_moe_f16w;
@@ -11294,6 +11451,7 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                         cuLaunchKernel(r->fn_scatter_add_weighted_f32, n_e, 1, 1, 256, 1, 1, 0, r->stream, sa, NULL); }
                         if (do_detail) { cuStreamSynchronize(r->stream); detail_exp_scatter_ms += get_time_ms() - _exp_t0; }
                     }
+                    }  /* end else (per-expert cuBLAS loop) */
                     if (do_detail) { cuStreamSynchronize(r->stream); detail_ffn_experts_ms += get_time_ms() - _detail_t0; _detail_t0 = get_time_ms(); }
                     free(h_tki); free(h_tkw); free(ec); free(offs); free(cursor); free(etok); free(etw);
                 } else {
@@ -12203,6 +12361,12 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_moe_f16w)     cuMemFree(r->d_moe_f16w);
     if (r->d_moe_f16w2)    cuMemFree(r->d_moe_f16w2);
     if (r->d_moe_f16w3)    cuMemFree(r->d_moe_f16w3);
+    if (r->d_mmq_cxq8)     cuMemFree(r->d_mmq_cxq8);
+    if (r->d_mmq_cxs)      cuMemFree(r->d_mmq_cxs);
+    if (r->d_mmq_outg)     cuMemFree(r->d_mmq_outg);
+    if (r->d_mmq_outu)     cuMemFree(r->d_mmq_outu);
+    if (r->d_mmq_outd)     cuMemFree(r->d_mmq_outd);
+    if (r->d_mmq_ebounds)  cuMemFree(r->d_mmq_ebounds);
     if (r->d_pos_seq)    cuMemFree(r->d_pos_seq);
     if (r->d_graph_exec) cuGraphExecDestroy(r->d_graph_exec);
     if (r->d_graph)      cuGraphDestroy(r->d_graph);
