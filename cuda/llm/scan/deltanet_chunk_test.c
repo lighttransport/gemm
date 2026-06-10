@@ -19,6 +19,23 @@
      S_out[r][c] = Gamma_{L-1}*S_in[r][c] + sum_j P(j->L-1)*Delta[j][r]*k_j[c]
 
    Build: gcc -O2 -o deltanet_chunk_test deltanet_chunk_test.c -lm
+
+   STATUS / CONCLUSION (2026-06):
+   - The chunked math is CORRECT (rel_L2 ~3e-7 vs sequential at L=16..128).
+   - A CUDA port was written and validated bit-approx (rel_L2_vs_seq 0.165, logits
+     0.087, matching the sequential kernel) AFTER a key numerical fix: the P(j->t)=
+     Gamma_t/Gamma_j ratio must be computed as the incremental PRODUCT prod_{i=j+1..t}
+     gamma_i (always <=1), never as a division — dividing by the cumulative decay
+     produces 0/0 NaN when a head's decay underflows toward 0 (the sequential form has
+     no such division). With the product form there is no clamp and no instability.
+   - But the CUDA port is a DEAD-END for PERFORMANCE on this GPU/model: one block per
+     head => only dt_rank=32 blocks (8192 threads) on a 36-SM GPU (~15% occupancy),
+     so scan went 30ms -> 279ms (9x SLOWER, 2765 -> 1172 tok/s). The chunked form trades
+     the original's massive parallelism (dt_rank*d_state = 4096 independent (h,r) warp
+     recurrences) for fewer/larger matmuls, but with only 32 heads the batch is far too
+     small to fill the GPU. Chunked linear-attention needs a large head/batch dimension
+     (or tensor-core GEMMs over a big batch) to win; 32 heads is not enough here.
+   - The original batch_deltanet_scan_f32 (+ W=4 warps/block) remains the best scan.
 */
 #include <stdio.h>
 #include <stdlib.h>
