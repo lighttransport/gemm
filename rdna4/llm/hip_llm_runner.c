@@ -8417,8 +8417,6 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
       launch_moe_gateup_silu(r, cl, n_experts_used + 1,
                              cl->moe_shared_ffn_gate_w, cl->moe_shared_ffn_up_w);
       launch_moe_down_accum(r, cl, n_experts_used + 1, cl->moe_shared_ffn_down_w);
-      hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
-                    hipMemcpyDeviceToDevice, r->stream);
       return;
   }
 
@@ -8444,8 +8442,6 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             launch_moe_gateup_silu(r, cl, n_experts_used + 1,
                                    cl->moe_shared_ffn_gate_w, cl->moe_shared_ffn_up_w);
             launch_moe_down_accum(r, cl, n_experts_used + 1, cl->moe_shared_ffn_down_w);
-            hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
-                          hipMemcpyDeviceToDevice, r->stream);
             return;
         }
         hipMemsetAsync(r->d_moe_accum, 0, n_embd * sizeof(float), r->stream);
@@ -8520,8 +8516,6 @@ shared_expert:
             launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_shared_scale, 0, n_embd);
         }
     }
-    hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
-                  hipMemcpyDeviceToDevice, r->stream);
   } else {
     hipDeviceSynchronize();
     hipMemcpy(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float), hipMemcpyDeviceToHost);
@@ -8557,8 +8551,6 @@ shared_expert:
                           cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
         launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
     }
-    hipMemcpyAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float),
-                  hipMemcpyDeviceToDevice, r->stream);
   }
 }
 
