@@ -13,15 +13,22 @@ mmproj: `mmproj-F16.gguf` (Qwen3-VL vision tower).
 
 ## Text prefill/decode (no image)
 
-Original (session start) vs current (after decode + Phase 2 prefill optimization):
+Session start → current (decode fusions + self-owned WMMA GEMM + GPU-grouped MoE
+prefill, commits 0abc74a…611432c). All defaults; **no hipBLASLt dependency**
+(HIPBLASLT=0 build = same numbers, 990 t/s pp1024):
 
-| test   | HIP @start | HIP now | llama.cpp | llama.cpp / HIP now |
-| ------ | ---------: | ------: | --------: | ------------------: |
-| pp512  |  31.2 t/s | **393.7 t/s** | 897.5 t/s | **2.28×** |
-| pp1024 |  30.9 t/s | **401.4 t/s** | 887.9 t/s | **2.21×** |
-| tg128  |  28.7 t/s |  **45.5 t/s** |  83.0 t/s | **1.82×** |
+| test   | HIP @start | HIP now | llama.cpp | now vs llama |
+| ------ | ---------: | ------: | --------: | -----------: |
+| pp512  |  31.2 t/s | **774 t/s**  | 902 t/s | 0.86× |
+| pp1024 |  30.9 t/s | **1001 t/s** | 883 t/s | **1.13× FASTER** |
+| tg128  |  28.7 t/s | **75.7 t/s** |  83 t/s | 0.91× |
 
-(was 28.8× / 28.7× / 2.9× at session start.) Details of each step below.
+Phase log: decode 45→73 (fused all-expert decode MoE, 2 launches/layer) →74.8
+(fused SSM aux chain). Prefill 401→445 (own WMMA GEMM beats Tensile @256)
+→772 (grouped all-expert dequant+GEMM, blockIdx.z=expert) →1001 (GPU-side top-K +
+histogram + scatter, no per-layer host sync). Vision prefill 33.9→1.54 ms/tok (22×).
+Decode is small-launch-latency bound (LM head already 370 GB/s); the mmq scalar GEMM
+was 65% of prefill until WMMA replaced it.
 
 HIP cmd: `LLM_PREFILL_WARMUP=2 ./test_hip_llm <model> -s 1300 --bench --gpu-only-bench --prefill-len {512,1024} --decode 128`
 llama: `llama-bench -m <model> --device ROCm0 -ngl 99 -fa on -p 512,1024 -n 128 -r 3`
