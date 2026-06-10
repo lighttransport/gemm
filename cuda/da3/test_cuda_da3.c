@@ -114,6 +114,64 @@ static double get_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static void free_input_list(char **paths, int n) {
+    if (!paths) return;
+    for (int i = 0; i < n; i++) free(paths[i]);
+    free(paths);
+}
+
+static char *copy_string(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = (char *)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+static int read_input_list(const char *path, char ***out_paths) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Cannot open input list: %s\n", path);
+        return -1;
+    }
+    int cap = 16;
+    int n = 0;
+    char **paths = (char **)calloc((size_t)cap, sizeof(char *));
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '\0' || *p == '#') continue;
+        char *e = p + strlen(p);
+        while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) e--;
+        *e = '\0';
+        if (n == cap) {
+            cap *= 2;
+            char **np = (char **)realloc(paths, (size_t)cap * sizeof(char *));
+            if (!np) {
+                fclose(f);
+                free_input_list(paths, n);
+                return -1;
+            }
+            paths = np;
+        }
+        paths[n] = copy_string(p);
+        if (!paths[n]) {
+            fclose(f);
+            free_input_list(paths, n);
+            return -1;
+        }
+        n++;
+    }
+    fclose(f);
+    if (n == 0) {
+        fprintf(stderr, "Input list is empty: %s\n", path);
+        free(paths);
+        return -1;
+    }
+    *out_paths = paths;
+    return n;
+}
+
 /* Generate a synthetic gradient image as uint8 RGB [h][w][3] */
 static uint8_t *generate_gradient(int width, int height) {
     uint8_t *img = (uint8_t *)malloc((size_t)width * height * 3);
@@ -182,7 +240,8 @@ static void print_stats(const char *name, const float *data, int n) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <da3.gguf|model.safetensors> [-i input.ppm] [-o output.pgm|output.exr]\n"
-                        "       [--npy path.npy] [--full] [--pose] [--rays] [--gaussians] [--repeat N] [-d device_id] [-v verbosity]\n"
+                        "       [--npy path.npy] [--input-list frames.txt] [--warmup N]\n"
+                        "       [--full] [--pose] [--rays] [--gaussians] [--repeat N] [-d device_id] [-v verbosity]\n"
                         "  .exr output: writes raw float channels (depth, confidence, rays, gaussians)\n"
                         "  .pgm output: writes normalized 16-bit depth only\n"
                         "  --npy:       writes raw float32 depth as NumPy .npy file\n",
@@ -192,6 +251,7 @@ int main(int argc, char **argv) {
 
     const char *model_path = argv[1];
     const char *input_path = NULL;
+    const char *input_list_path = NULL;
     const char *output_pgm = NULL;
     const char *npy_path = NULL;
     const char *npy_dir = NULL;
@@ -200,9 +260,11 @@ int main(int argc, char **argv) {
     int verbose = 1;
     int output_flags = DA3_OUTPUT_DEPTH;
     int repeat = 1;
+    int warmup = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_path = argv[++i];
+        else if (strcmp(argv[i], "--input-list") == 0 && i + 1 < argc) input_list_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) output_pgm = argv[++i];
         else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) device_id = atoi(argv[++i]);
         else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc) verbose = atoi(argv[++i]);
@@ -210,6 +272,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--npy-dir") == 0 && i + 1 < argc) npy_dir = argv[++i];
         else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) resize_mode = argv[++i];
         else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--full") == 0) output_flags = DA3_OUTPUT_ALL;
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
         else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
@@ -266,39 +329,76 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Prepare input image */
-    int img_w, img_h;
-    uint8_t *img;
-    if (input_path) {
-        img = img_load_resize(input_path, &img_w, &img_h, resize_mode);
-        if (!img) {
-            fprintf(stderr, "Failed to load %s\n", input_path);
+    /* Prepare input list. */
+    char **input_paths = NULL;
+    int n_inputs = 0;
+    if (input_list_path) {
+        n_inputs = read_input_list(input_list_path, &input_paths);
+        if (n_inputs <= 0) {
             cuda_da3_free(gpu);
             if (gguf) gguf_close(gguf);
             return 1;
         }
-        fprintf(stderr, "\nInput: %s (%dx%d)\n", input_path, img_w, img_h);
+        fprintf(stderr, "\nInput list: %s (%d frames)\n", input_list_path, n_inputs);
+    } else if (input_path) {
+        input_paths = (char **)calloc(1, sizeof(char *));
+        input_paths[0] = copy_string(input_path);
+        n_inputs = 1;
+        fprintf(stderr, "\nInput: %s\n", input_path);
     } else {
-        img_w = 518; img_h = 518;
-        img = generate_gradient(img_w, img_h);
-        fprintf(stderr, "\nInput: synthetic gradient (%dx%d)\n", img_w, img_h);
+        fprintf(stderr, "\nInput: synthetic gradient (518x518)\n");
     }
 
-    /* Run inference */
+    /* Run inference. For --input-list, repeat means repeated passes over the list. */
     if (repeat < 1) repeat = 1;
-    fprintf(stderr, "\n=== Running CUDA DA3 inference (flags=0x%02x, repeat=%d) ===\n",
-            output_flags, repeat);
+    if (warmup < 0) warmup = 0;
+    int measured_iters = repeat * (n_inputs > 0 ? n_inputs : 1);
+    fprintf(stderr, "\n=== Running CUDA DA3 inference (flags=0x%02x, repeat=%d, frames=%d, warmup=%d) ===\n",
+            output_flags, repeat, n_inputs > 0 ? n_inputs : 1, warmup);
     da3_full_result result = {0};
-    double elapsed = 0.0;
-    for (int ri = 0; ri < repeat; ri++) {
-        if (ri > 0) da3_full_result_free(&result);
+    double elapsed = 0.0, sum_elapsed = 0.0, min_elapsed = 1e30, max_elapsed = 0.0;
+    int measured_count = 0;
+    int total_iters = warmup + measured_iters;
+    for (int iter = 0; iter < total_iters; iter++) {
+        if (iter > 0) da3_full_result_free(&result);
+        int frame_idx = n_inputs > 0 ? (iter % n_inputs) : 0;
+        int img_w = 518, img_h = 518;
+        uint8_t *img = NULL;
+        if (n_inputs > 0) {
+            img = img_load_resize(input_paths[frame_idx], &img_w, &img_h, resize_mode);
+            if (!img) {
+                fprintf(stderr, "Failed to load %s\n", input_paths[frame_idx]);
+                da3_full_result_free(&result);
+                free_input_list(input_paths, n_inputs);
+                cuda_da3_free(gpu);
+                if (gguf) gguf_close(gguf);
+                return 1;
+            }
+        } else {
+            img = generate_gradient(img_w, img_h);
+        }
         double t0 = get_time_ms();
         result = cuda_da3_predict_full(gpu, img, img_w, img_h, output_flags, NULL);
         elapsed = get_time_ms() - t0;
-        fprintf(stderr, "Inference %d/%d: %.1f ms\n", ri + 1, repeat, elapsed);
+        free(img);
+        if (iter < warmup) {
+            fprintf(stderr, "Warmup %d/%d frame=%d: %.1f ms\n",
+                    iter + 1, warmup, frame_idx + 1, elapsed);
+        } else {
+            measured_count++;
+            sum_elapsed += elapsed;
+            if (elapsed < min_elapsed) min_elapsed = elapsed;
+            if (elapsed > max_elapsed) max_elapsed = elapsed;
+            fprintf(stderr, "Inference %d/%d frame=%d: %.1f ms\n",
+                    measured_count, measured_iters, frame_idx + 1, elapsed);
+        }
     }
 
-    fprintf(stderr, "\nTotal inference time: %.1f ms\n", elapsed);
+    if (measured_count > 0) {
+        fprintf(stderr, "\nTotal inference time: %.1f ms\n", elapsed);
+        fprintf(stderr, "Mean inference time: %.3f ms  min=%.3f ms  max=%.3f ms  n=%d\n",
+                sum_elapsed / measured_count, min_elapsed, max_elapsed, measured_count);
+    }
 
     /* Print statistics */
     int npix = result.width * result.height;
@@ -490,7 +590,7 @@ int main(int argc, char **argv) {
     }
 
     /* Cleanup */
-    free(img);
+    free_input_list(input_paths, n_inputs);
     da3_full_result_free(&result);
     cuda_da3_free(gpu);
     if (gguf) gguf_close(gguf);

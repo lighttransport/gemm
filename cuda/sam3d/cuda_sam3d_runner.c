@@ -467,6 +467,14 @@ cuda_sam3d_ctx *cuda_sam3d_create(const cuda_sam3d_config *cfg)
     if (c->cfg.ss_steps   <= 0) c->cfg.ss_steps   = 2;
     if (c->cfg.slat_steps <= 0) c->cfg.slat_steps = 12;
     if (c->cfg.cfg_scale  <= 0) c->cfg.cfg_scale  = 2.0f;
+    if (!c->cfg.precision || !c->cfg.precision[0]) c->cfg.precision = "fp16";
+    if (strcmp(c->cfg.precision, "fp16") &&
+        strcmp(c->cfg.precision, "bf16") &&
+        strcmp(c->cfg.precision, "fp32")) {
+        fprintf(stderr, "cuda_sam3d: unsupported precision '%s' (expected fp16, bf16 or fp32)\n",
+                c->cfg.precision);
+        free(c); return NULL;
+    }
 
     c->safetensors_dir_resolved = cs3d_resolve_safetensors_dir(cfg);
     if (!c->safetensors_dir_resolved) {
@@ -549,6 +557,7 @@ void cuda_sam3d_destroy(cuda_sam3d_ctx *ctx)
         cs3d_ssdit_outer_ws_free(&ctx->gpu_ssdit_outer_ws);
         cs3d_ssdit_block_ws_free(&ctx->gpu_ssdit_block_ws);
     }
+    cs3d_ssdit_fns_free(&ctx->gpu_ssdit_fns.block);
     if (ctx->gpu_ssdit_loaded) cs3d_ssdit_gpu_free(&ctx->gpu_ssdit);
     if (ctx->cpu_ss_dit) sam3d_cpu_ss_dit_free(ctx->cpu_ss_dit);
     cs3d_free_nd(&ctx->occupancy);
@@ -565,6 +574,7 @@ void cuda_sam3d_destroy(cuda_sam3d_ctx *ctx)
     free(ctx->slat_hook_coords_cache);
     free(ctx->slat_hook_t_emb_cache);
     if (ctx->gpu_slatdit_ws_alloced) cs3d_slatdit_block_ws_free(&ctx->gpu_slatdit_ws);
+    cs3d_slatdit_fns_free(&ctx->gpu_slatdit_fns);
     if (ctx->gpu_slatdit_loaded)     cs3d_slatdit_gpu_free(&ctx->gpu_slatdit);
     if (ctx->gpu_slat_io.loaded)     cs3d_slat_io_gpu_free(&ctx->gpu_slat_io);
     cs3d_slat_io_ws_free(&ctx->gpu_slat_io_ws);
@@ -1193,15 +1203,25 @@ static int cs3d_ensure_ssdit_gpu(cuda_sam3d_ctx *ctx, int n_cond_min)
     if (!m) return CUDA_SAM3D_E_LOAD;
 
     if (!ctx->gpu_ssdit_loaded) {
-        if (cs3d_ssdit_gpu_load(&ctx->gpu_ssdit, m, ctx->cfg.verbose) < 0) {
-            fprintf(stderr, "cuda_sam3d: gpu ss_dit weight upload failed\n");
-            return CUDA_SAM3D_E_LOAD;
-        }
-        ctx->gpu_ssdit_loaded = 1;
         if (cs3d_ssdit_outer_fns_lookup(&ctx->gpu_ssdit_fns, ctx->mod) < 0) {
             fprintf(stderr, "cuda_sam3d: gpu ss_dit fns lookup failed\n");
             return CUDA_SAM3D_E_LOAD;
         }
+        cs3d_ssdit_fns_set_precision(&ctx->gpu_ssdit_fns.block,
+                                      ctx->cfg.precision);
+        int drop_f32 = ctx->gpu_ssdit_fns.block.use_cublas_gemm &&
+                       ctx->gpu_ssdit_fns.block.mma_precision &&
+                       !(getenv("SAM3D_MMA_KEEP_F32_WEIGHTS") &&
+                         getenv("SAM3D_MMA_KEEP_F32_WEIGHTS")[0] != '0');
+        if (cs3d_ssdit_gpu_load(&ctx->gpu_ssdit, m,
+                                ctx->safetensors_dir_resolved,
+                                ctx->cfg.precision,
+                                drop_f32,
+                                ctx->cfg.verbose) < 0) {
+            fprintf(stderr, "cuda_sam3d: gpu ss_dit weight upload failed\n");
+            return CUDA_SAM3D_E_LOAD;
+        }
+        ctx->gpu_ssdit_loaded = 1;
     }
 
     if (ctx->gpu_ssdit_ws_alloced && n_cond_min > ctx->gpu_ssdit_ws_n_c) {
@@ -1426,15 +1446,25 @@ static int cs3d_ensure_slatdit_gpu(cuda_sam3d_ctx *ctx, int n_max, int n_cond)
     if (!m) return CUDA_SAM3D_E_LOAD;
 
     if (!ctx->gpu_slatdit_loaded) {
-        if (cs3d_slatdit_gpu_load_transformer(&ctx->gpu_slatdit, m, ctx->cfg.verbose) != 0) {
-            fprintf(stderr, "cuda_sam3d: gpu slat_dit transformer weight upload failed\n");
-            return CUDA_SAM3D_E_LOAD;
-        }
-        ctx->gpu_slatdit_loaded = 1;
         if (cs3d_slatdit_fns_lookup(&ctx->gpu_slatdit_fns, ctx->mod) != 0) {
             fprintf(stderr, "cuda_sam3d: gpu slat_dit fns lookup failed\n");
             return CUDA_SAM3D_E_LOAD;
         }
+        cs3d_slatdit_fns_set_precision(&ctx->gpu_slatdit_fns,
+                                        ctx->cfg.precision);
+        int drop_f32 = ctx->gpu_slatdit_fns.use_cublas_gemm &&
+                       ctx->gpu_slatdit_fns.mma_precision &&
+                       !(getenv("SAM3D_MMA_KEEP_F32_WEIGHTS") &&
+                         getenv("SAM3D_MMA_KEEP_F32_WEIGHTS")[0] != '0');
+        if (cs3d_slatdit_gpu_load_transformer(&ctx->gpu_slatdit, m,
+                                              ctx->safetensors_dir_resolved,
+                                              ctx->cfg.precision,
+                                              drop_f32,
+                                              ctx->cfg.verbose) != 0) {
+            fprintf(stderr, "cuda_sam3d: gpu slat_dit transformer weight upload failed\n");
+            return CUDA_SAM3D_E_LOAD;
+        }
+        ctx->gpu_slatdit_loaded = 1;
     }
 
     if (ctx->gpu_slatdit_ws_alloced &&
