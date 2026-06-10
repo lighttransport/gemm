@@ -4344,6 +4344,85 @@ static const char *hip_kernel_source =
 "    return (bf16_raw)(rounded >> 16);\n"
 "}\n"
 "\n"
+"/* Per-call dequant of IQ2_XXS (66 B/block) to BF16. */\n"
+"__global__ void dequant_iq2_xxs_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                          int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 66;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 66;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"    int tid = threadIdx.x;\n"
+"    int ib32 = tid >> 5;\n"
+"    int sub  = tid & 31;\n"
+"    int l    = sub >> 3;\n"
+"    int j    = sub & 7;\n"
+"    unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"    unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"    float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"    const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"    const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[aux8[l]];\n"
+"    unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"    float val = db * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
+"/* Per-call dequant of IQ1_S (50 B/block) to BF16. */\n"
+"__global__ void dequant_iq1_s_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 50;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 50;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs  = bp + 2;\n"
+"    const unsigned short *qh = (const unsigned short *)(bp + 2 + 32);\n"
+"    const float IQ1S_DELTA = 0.125f;\n"
+"    int tid   = threadIdx.x;\n"
+"    int ib    = tid >> 5;\n"
+"    int sub   = tid & 31;\n"
+"    int l     = sub >> 3;\n"
+"    int j     = sub & 7;\n"
+"    float dl  = d * (float)(2 * ((qh[ib] >> 12) & 7) + 1);\n"
+"    float delta = (qh[ib] & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
+"    int grid_idx = qs[ib * 4 + l] | (((qh[ib] >> (3*l)) & 7) << 8);\n"
+"    const signed char *grid = (const signed char *)&iq1s_grid_dev[grid_idx];\n"
+"    float val = dl * ((float)grid[j] + delta);\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
+"/* Per-call dequant of TQ1_0 (54 B/block) to BF16. */\n"
+"__global__ void dequant_tq1_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 54;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 54;\n"
+"    float d = half_to_float(*(const half_raw *)(bp + 52));\n"
+"    const unsigned char *qs  = bp;\n"
+"    const unsigned char *qh_ptr = bp + 48;\n"
+"    const unsigned char pow3[6] = {1, 3, 9, 27, 81, 243};\n"
+"    int tid = threadIdx.x;\n"
+"    unsigned char q; int xi;\n"
+"    if (tid < 240) {\n"
+"        int j = tid / 5, n = tid % 5;\n"
+"        q = qs[j] * pow3[n];\n"
+"    } else {\n"
+"        int j = (tid - 240) / 4, n = (tid - 240) % 4;\n"
+"        q = qh_ptr[j] * pow3[n];\n"
+"    }\n"
+"    xi = (((unsigned short)q * 3) >> 8);\n"
+"    float val = d * (float)(xi - 1);\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
 "/* Vectorized F32 -> BF16 packer. Each thread packs 4 floats; tail is scalar. */\n"
 "__global__ void pack_bf16_from_f32(bf16_raw *dst, const float *src, int n) {\n"
 "    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -4772,6 +4851,59 @@ static const char *hip_kernel_source =
 "        for (int j = 0; j < 4; j++) {\n"
 "            orow[o + j]     = f32_to_bf16(db * (float)g1[j] * ((s & (1 << j)) ? -1.0f : 1.0f));\n"
 "            orow[o + 4 + j] = f32_to_bf16(db * (float)g2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f));\n"
+"        }\n"
+"    }\n"
+"}\n"
+"__global__ void dequant_iq2_xxs_all(bf16_raw *dst, const unsigned char *base,\n"
+"        const int *offs, int rows, int cols, long long stride) {\n"
+"    int e = blockIdx.y;\n"
+"    if (offs[e + 1] == offs[e]) return;\n"
+"    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    if (row >= rows) return;\n"
+"    const unsigned char *mat = base + (long long)e * stride;\n"
+"    int nb = cols / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 66;\n"
+"    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"        unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"        float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"        const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[aux8[l]];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"        int o = b * 256 + ib32 * 32 + l * 8;\n"
+"        for (int j = 0; j < 8; j++)\n"
+"            orow[o + j] = f32_to_bf16(db * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f));\n"
+"    }\n"
+"}\n"
+"__global__ void dequant_iq3_xxs_all(bf16_raw *dst, const unsigned char *base,\n"
+"        const int *offs, int rows, int cols, long long stride) {\n"
+"    int e = blockIdx.y;\n"
+"    if (offs[e + 1] == offs[e]) return;\n"
+"    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    if (row >= rows) return;\n"
+"    const unsigned char *mat = base + (long long)e * stride;\n"
+"    int nb = cols / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 98;\n"
+"    bf16_raw *orow = dst + ((size_t)e * rows + row) * cols;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux32 = *(const unsigned int *)(bp + 66 + 4*ib32);\n"
+"        float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n"
+"        unsigned char signs = ksigns_iq2xs_dev[(aux32 >> (7*l)) & 127];\n"
+"        const unsigned char *grid1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*ib32 + 2*l]];\n"
+"        const unsigned char *grid2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*ib32 + 2*l + 1]];\n"
+"        int o = b * 256 + ib32 * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            orow[o + j]     = f32_to_bf16(db * (float)grid1[j] * ((signs & (1 << j)) ? -1.0f : 1.0f));\n"
+"            orow[o + 4 + j] = f32_to_bf16(db * (float)grid2[j] * ((signs & (1 << (j+4))) ? -1.0f : 1.0f));\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -5818,6 +5950,8 @@ struct hip_llm_runner {
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
     hipFunction_t fn_dequant_iq2s_all;      /* all-expert dequant (grouped prefill) */
     hipFunction_t fn_dequant_iq3s_all;
+    hipFunction_t fn_dequant_iq2_xxs_all;
+    hipFunction_t fn_dequant_iq3_xxs_all;
     hipFunction_t fn_gemm_bf16_grouped;     /* per-expert grouped WMMA GEMM */
     hipFunction_t fn_moe_topk_batch;
     hipFunction_t fn_moe_count_offs;
@@ -5876,6 +6010,9 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_iq2_xs_to_bf16;
     hipFunction_t fn_dequant_iq2_s_to_bf16;
     hipFunction_t fn_dequant_iq3_s_to_bf16;
+    hipFunction_t fn_dequant_iq1_s_to_bf16;
+    hipFunction_t fn_dequant_tq1_0_to_bf16;
+    hipFunction_t fn_dequant_iq2_xxs_to_bf16;
 
     /* Phase 3 flash-attention helpers */
     hipFunction_t fn_pack_f16_from_f32;
@@ -6185,6 +6322,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(gemm_bf16_own);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
+    GET_FUNC(dequant_iq2_xxs_all);
+    GET_FUNC(dequant_iq3_xxs_all);
     GET_FUNC(gemm_bf16_grouped);
     GET_FUNC(moe_topk_batch);
     GET_FUNC(moe_count_offs);
@@ -6228,6 +6367,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_iq2_xs_to_bf16);
     GET_FUNC(dequant_iq2_s_to_bf16);
     GET_FUNC(dequant_iq3_s_to_bf16);
+    GET_FUNC(dequant_iq1_s_to_bf16);
+    GET_FUNC(dequant_tq1_0_to_bf16);
+    GET_FUNC(dequant_iq2_xxs_to_bf16);
 
     GET_FUNC(pack_f16_from_f32);
     GET_FUNC(pack_kv_cache_f16);
@@ -7184,15 +7326,18 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          * the per-row loop has no host round-trips. Gate: LLM_MOE_PREFILL (default 1). */
         int eligible = !disabled;
         if (r->is_moe) {
-            /* Batched MoE prefill (LLM_MOE_PREFILL, default ON): SSM/attn projections
-             * batch via hipBLASLt; experts are grouped by token and run through the
-             * fused QUANTIZED MoE GEMM (mmq_iq2s/iq3s — weight stays quantized, dequant
-             * amortized over the token tile). Batch chunked to <=256 (Tensile plan
-             * limit). Prefill ~400 tok/s vs ~48 per-token (8x). Set =0 to disable. */
-            const char *env_mp = getenv("LLM_MOE_PREFILL");
-            int moe_prefill = (env_mp ? atoi(env_mp) != 0 : 1);
-            r->moe_prefill_batched = moe_prefill;
-            if (!moe_prefill || !r->moe_dev_dispatch_ok || !r->is_hybrid) eligible = 0;
+         /* Batched MoE prefill (LLM_MOE_PREFILL, default ON): SSM/attn projections
+              * batch via hipBLASLt; experts are grouped by token and run through the
+              * fused QUANTIZED MoE GEMM (mmq_iq2s/iq3s — weight stays quantized, dequant
+              * amortized over the token tile). Batch chunked to <=256 (Tensile plan
+              * limit). Prefill ~400 tok/s vs ~48 per-token (8x). Set =0 to disable.
+              * Does NOT require moe_dev_dispatch_ok — GPU grouping (topK/gather) works
+              * for any expert type; the batched MoE GEMM path dequantizes each expert's
+              * weights to BF16 on-the-fly via get_bf16_weight. */
+             const char *env_mp = getenv("LLM_MOE_PREFILL");
+             int moe_prefill = (env_mp ? atoi(env_mp) != 0 : 1);
+             r->moe_prefill_batched = moe_prefill;
+             if (!moe_prefill || !r->is_hybrid) eligible = 0;
         }
 
         if (eligible && !r->gemm_own) {
@@ -7838,13 +7983,15 @@ static inline void launch_pack_bf16_from_f32(hip_llm_runner *r, void *dst,
  * mat:  raw block-quant data, native stride per quant type.
  * Launch grid (n_rows, n_blocks_per_row), 256 threads/block (one per element). */
 #define DEFINE_LAUNCH_KQ_DEQUANT(qname)                                          \
-static inline void launch_dequant_##qname##_to_bf16(hip_llm_runner *r,           \
-                                                      void *dst, void *mat,      \
-                                                      int n_rows, int n_cols) {  \
+static inline int launch_dequant_##qname##_to_bf16(hip_llm_runner *r,           \
+                                                       void *dst, void *mat,      \
+                                                       int n_rows, int n_cols) {  \
     void *args[] = { &dst, &mat, &n_rows, &n_cols };                             \
     int n_blocks_per_row = n_cols / 256;                                         \
-    LAUNCH(r->fn_dequant_##qname##_to_bf16, n_rows, n_blocks_per_row, 1,         \
+    hipError_t e = LAUNCH(r->fn_dequant_##qname##_to_bf16, n_rows, n_blocks_per_row, 1,         \
            256, 1, 1, 0, r->stream, args);                                       \
+    if (e != hipSuccess) { fprintf(stderr, "hip_llm: dequant_" #qname " launch failed: %d\n", e); return -1; } \
+    return 0;                                                                     \
 }
 DEFINE_LAUNCH_KQ_DEQUANT(q4_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q5_K)
@@ -7854,6 +8001,9 @@ DEFINE_LAUNCH_KQ_DEQUANT(iq4_xs)
 DEFINE_LAUNCH_KQ_DEQUANT(iq2_xs)
 DEFINE_LAUNCH_KQ_DEQUANT(iq2_s)
 DEFINE_LAUNCH_KQ_DEQUANT(iq3_s)
+DEFINE_LAUNCH_KQ_DEQUANT(iq1_s)
+DEFINE_LAUNCH_KQ_DEQUANT(tq1_0)
+DEFINE_LAUNCH_KQ_DEQUANT(iq2_xxs)
 #undef DEFINE_LAUNCH_KQ_DEQUANT
 
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
@@ -7872,9 +8022,11 @@ static inline int batch_qtype_ok(int type) {
            type == GGML_TYPE_Q4_K    || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ2_XS  ||
-           type == GGML_TYPE_IQ2_S   || type == GGML_TYPE_IQ3_S;
+           type == GGML_TYPE_IQ2_S   || type == GGML_TYPE_IQ3_S   ||
+           type == GGML_TYPE_IQ1_S   || type == GGML_TYPE_TQ1_0   ||
+           type == GGML_TYPE_IQ2_XXS;
 }
-
+ 
 /* True if every projection weight of an attn+FFN layer has a batched path.
  * For MoE layers the dense ffn_* weights are unused (the MoE FFN is batched
  * separately by forward_moe_ffn_batched), so skip those checks. */
@@ -7944,7 +8096,17 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
         case GGML_TYPE_IQ3_S:
             launch_dequant_iq3_s_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
             return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ2_XXS:
+            launch_dequant_iq2_xxs_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ1_S:
+            if (launch_dequant_iq1_s_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_TQ1_0:
+            if (launch_dequant_tq1_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
         default:
+            fprintf(stderr, "hip_llm: get_bf16_weight: unsupported type %d for %dx%d\n", type, n_rows, n_cols);
             return NULL;  /* not batchable */
     }
 }
@@ -8563,7 +8725,6 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     int n_embd = r->n_embd, ne = r->n_experts, K = r->n_experts_used;
     int eff = r->expert_ff, sff = r->shared_expert_ff;
     if (ne > 1024) return -1;  /* cursor[] cap */
-
     /* 1. Router GEMM: [M,ne] = xnorm[M,n_embd] x Wg[ne,n_embd] (Wg is F32 -> bf16). */
     launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16_moe, r->d_xnorm_batch, M * n_embd);
     launch_pack_bf16_from_f32(r, r->d_router_w_bf16, cl->moe_gate_w, ne * n_embd);
@@ -8571,14 +8732,19 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                            r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
 
     /* 2. Top-K + softmax per token, group assignments by expert.
-     * GPU grouping (no host sync) on the grouped path; host fallback otherwise. */
+     * GPU grouping (no host sync) for supported quant types; host fallback otherwise. */
     int total = M * K;
     int *offs = r->h_moe_offsets;
-    int gpu_group = r->gemm_own && r->d_tok_idx &&
-        cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
-        cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
-        cl->moe_down_exps_type == GGML_TYPE_IQ3_S;
-    if (gpu_group) {
+    int gu_is_iq2s = cl->moe_gate_exps_type == GGML_TYPE_IQ2_S;
+    int gu_is_iq1s = cl->moe_gate_exps_type == GGML_TYPE_IQ1_S;
+    int gpu_group = r->gemm_own && r->d_tok_idx && cl->moe_down_exps_type == GGML_TYPE_IQ3_S &&
+        ((gu_is_iq2s && cl->moe_up_exps_type == GGML_TYPE_IQ2_S) ||
+         (gu_is_iq1s && cl->moe_up_exps_type == GGML_TYPE_IQ1_S));
+    int _gpu_ok = r->gemm_own && r->d_tok_idx && cl->moe_down_exps_type == GGML_TYPE_IQ3_XXS &&
+        ((cl->moe_gate_exps_type == GGML_TYPE_IQ1_S && cl->moe_up_exps_type == GGML_TYPE_IQ1_S) ||
+         (cl->moe_gate_exps_type == GGML_TYPE_IQ2_XXS && cl->moe_up_exps_type == GGML_TYPE_IQ2_XXS));
+    if (gpu_group || _gpu_ok) {
+        gpu_group = 1;
         { void *a[] = { &r->d_router_logits_batch, &ne, &K, &r->d_tok_idx, &r->d_tok_w };
           LAUNCH(r->fn_moe_topk_batch, M, 1, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_tok_idx, &M, &K, &ne, &r->d_moe_offs, &r->d_cursor };
@@ -8586,6 +8752,10 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         { void *a[] = { &r->d_tok_idx, &r->d_tok_w, &M, &K, &r->d_cursor,
                         &r->d_moe_gather_src, &r->d_moe_gather_w };
           LAUNCH(r->fn_moe_fill_gather, (M * K + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a); }
+        hipMemcpyAsync(r->h_moe_offsets, r->d_moe_offs, (size_t)(ne + 1) * sizeof(int),
+                       hipMemcpyDeviceToHost, r->stream);
+        hipStreamSynchronize(r->stream);
+
     } else {
         hipMemcpyAsync(r->h_router_batch, r->d_router_logits_batch,
                        (size_t)M * ne * sizeof(float), hipMemcpyDeviceToHost, r->stream);
@@ -8646,11 +8816,42 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
           LAUNCH(r->fn_dequant_iq2s_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eu, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
-        launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
+         launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
         launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, total * eff);
         /* down */
         { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn };
           LAUNCH(r->fn_dequant_iq3s_all, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eout, &r->d_expw_bf16, &r->d_moe_esilu_bf16, &r->d_moe_offs, &n_embd, &eff };
+          LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        goto experts_done;
+    }
+    /* Grouped path for IQ2_XXS gate/up + IQ3_XXS down (IQ2_M model). */
+    if (use_wmma_exp && r->d_expw_bf16 &&
+        cl->moe_gate_exps_type == GGML_TYPE_IQ2_XXS &&
+        cl->moe_up_exps_type   == GGML_TYPE_IQ2_XXS &&
+        cl->moe_down_exps_type == GGML_TYPE_IQ3_XXS) {
+        launch_pack_bf16_from_f32(r, r->d_moe_gather_in_bf16, r->d_moe_gather_in, total * n_embd);
+        if (!gpu_group)
+            hipMemcpyAsync(r->d_moe_offs, offs, (size_t)(ne + 1) * sizeof(int),
+                           hipMemcpyHostToDevice, r->stream);
+        unsigned mtiles = (unsigned)((M + 127) / 128);
+        long long sgu = (long long)cl->moe_exp_stride_gu;
+        long long sdn = (long long)cl->moe_exp_stride_d;
+        /* gate */
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_gate_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+          LAUNCH(r->fn_dequant_iq2_xxs_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eg, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
+          LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        /* up */
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_up_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+          LAUNCH(r->fn_dequant_iq2_xxs_all, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eu, &r->d_expw_bf16, &r->d_moe_gather_in_bf16, &r->d_moe_offs, &eff, &n_embd };
+          LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
+        launch_pack_bf16_from_f32(r, r->d_moe_esilu_bf16, r->d_moe_eg, total * eff);
+        /* down */
+        { void *a[] = { &r->d_expw_bf16, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn };
+          LAUNCH(r->fn_dequant_iq3_xxs_all, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eout, &r->d_expw_bf16, &r->d_moe_esilu_bf16, &r->d_moe_offs, &n_embd, &eff };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
         goto experts_done;
