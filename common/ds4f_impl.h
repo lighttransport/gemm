@@ -4386,6 +4386,37 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
  * The block-forward body lives inline in ds4f_forward_token; extracting it (M=1) + the embed lookup +
  * the draft/verify/accept loop (with KV rollback) is the follow-on -- and the spec VERIFY needs the
  * M=K batched-decode rework (the per-token attn/tb2/KV/CP-gather path). Returns -1 until wired. */
+/* Compressor ring-state snapshot/restore -- the ONLY per-position decode state that does not roll back
+ * trivially (the KV ring + frozen int4 slots self-heal on the next write). Speculative decode snapshots
+ * it before a draft position and restores on rejection. Validated in the frozen + no-HCA-slot regime
+ * (states-only; the calbuf/caln only change pre-freeze). Sizing via ds4f_tb2_snap_bytes. */
+static size_t ds4f_tb2_snap_bytes(ds4f_model *m) {
+    ds4f_config *c = &m->cfg; size_t tot = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        int ratio = c->compress_ratios[L]; if (!ratio) continue;
+        int coff = (ratio == 4) ? 2 : 1, W = coff*c->kv_lora;
+        tot += 2*(size_t)coff*ratio*W*4;
+        if (ratio == 4) { int iW = 2*c->index_head_dim; tot += 2*(size_t)2*ratio*iW*4; }
+    }
+    return tot;
+}
+static void ds4f_tb2_snap(ds4f_model *m, char *buf, int restore) {
+    ds4f_config *c = &m->cfg; size_t off = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        int ratio = c->compress_ratios[L]; if (!ratio) continue;
+        ds4f_layer *ly = &m->layers[L];
+        int coff = (ratio == 4) ? 2 : 1, W = coff*c->kv_lora; size_t sz = (size_t)coff*ratio*W*4;
+        char *a = (char *)ly->cmp_kv_state, *b = (char *)ly->cmp_score_state;
+        if (restore) memcpy(a, buf+off, sz); else memcpy(buf+off, a, sz); off += sz;
+        if (restore) memcpy(b, buf+off, sz); else memcpy(buf+off, b, sz); off += sz;
+        if (ratio == 4 && ly->idx_cmp_kv_state) {
+            int iW = 2*c->index_head_dim; size_t isz = (size_t)2*ratio*iW*4;
+            char *ia = (char *)ly->idx_cmp_kv_state, *ib = (char *)ly->idx_cmp_score_state;
+            if (restore) memcpy(ia, buf+off, isz); else memcpy(buf+off, ia, isz); off += isz;
+            if (restore) memcpy(ib, buf+off, isz); else memcpy(buf+off, ib, isz); off += isz;
+        }
+    }
+}
 static int ds4f_mtp_predict(ds4f_model *m, const float *hc_state, const float *xe, int pos, float *logits_out) {
     if (!m->has_mtp) return -1;
     ds4f_config *c = &m->cfg;

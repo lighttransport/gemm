@@ -448,6 +448,7 @@ int main(void) {
     double t_pf0 = now_sec(); size_t pf_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int nan_count = 0; double xnorm = 0.0; int pf_last_tok = -1;
     int mtp_on = gen_mode && m->has_mtp;   /* DS4F_MTP self-spec: maintain MTP KV (prefill+decode) + measure accept rate */
+    int spec_on = mtp_on && envi("DS4F_SPEC", 0);   /* DS4F_SPEC: gamma=1 speculative decode loop */
     float *xe = mtp_on ? (float *)aligned_alloc(64, (size_t)C * 4) : NULL;
     int mtp_prev_draft = -1, mtp_hits = 0, mtp_total = 0;
     sm_state = 0xD5F00D;   /* SAME seed on every rank -> replicated dense + valid all-reduce */
@@ -520,7 +521,41 @@ int main(void) {
     double t_dec0 = now_sec(); size_t dec_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int last_tok = 0;
     int *gen_ids = NULL, n_gen = 0;
-    if (gen_mode) {
+    if (spec_on) {
+        /* gamma=1 speculative decode (M2 step 1: LOOPED verify -> validates the loop LOGIC byte-identical
+         * to plain decode; the batched dense that makes it FASTER is M2b). Each step: draft token@(pos+2)
+         * with the MTP, verify pos+1 (commit) + pos+2 (speculative, input the draft). On accept emit 2
+         * tokens; on reject restore the compressor state + the saved hidden, redo pos+2 next step. */
+        size_t hcb = (size_t)m->cfg.hc_mult * C * 4;
+        gen_ids = (int *)malloc((size_t)(max_new + 2) * sizeof(int));
+        char *snap = (char *)malloc(ds4f_tb2_snap_bytes(m));
+        float *hc_save = (float *)aligned_alloc(64, hcb);
+        int pos = dec_base - 1, t_next = pf_last_tok, dec_steps = 0, accepts = 0, rejects = 0;
+        while (n_gen < max_new) {
+            gen_ids[n_gen++] = t_next;
+            if (t_next == DS4F_EOS_ID) break;
+            embed_lookup(m, t_next, xe);                              /* draft token@(pos+2) */
+            int d = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1, NULL);
+            embed_lookup(m, t_next, x); m->bytes_read = 0;            /* verify pos+1 (commit) */
+            int m1 = ds4f_forward_token(m, x, pos + 1);
+            dec_bytes += m->bytes_read; dec_steps++;
+            if (n_gen >= max_new) { t_next = m1; break; }
+            memcpy(hc_save, m->s_x4, hcb); ds4f_tb2_snap(m, snap, 0); /* verify pos+2 (speculative) */
+            embed_lookup(m, d, x); m->bytes_read = 0;
+            int m2 = ds4f_forward_token(m, x, pos + 2);
+            dec_bytes += m->bytes_read; dec_steps++;
+            if (d == m1) {                                           /* ACCEPT: 2 tokens this verify */
+                gen_ids[n_gen++] = m1; pos += 2; t_next = m2; accepts++;
+                if (m1 == DS4F_EOS_ID) break;
+            } else {                                                 /* REJECT: undo pos+2 */
+                ds4f_tb2_snap(m, snap, 1); memcpy(m->s_x4, hc_save, hcb);
+                pos += 1; t_next = m1; rejects++;
+            }
+        }
+        last_tok = t_next; maxgen = dec_steps; free(snap); free(hc_save);
+        if (MyRank == 0) logmsg("SPEC accepts=%d rejects=%d emitted=%d forwards=%d -> %.3f tok/forward (1.0=no spec)\n",
+                                accepts, rejects, n_gen, dec_steps, dec_steps ? (double)n_gen/dec_steps : 0.0);
+    } else if (gen_mode) {
         /* greedy: pf_last_tok is the prompt's first prediction (token at pos
          * dec_base). Feed it back, argmax->embed->next, until eos or max_new.
          * forward(x,pos) places `cur` at `pos` and predicts pos+1. */
