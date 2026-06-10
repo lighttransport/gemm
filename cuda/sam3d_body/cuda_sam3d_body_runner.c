@@ -274,6 +274,7 @@ struct cuda_sam3d_body_ctx {
     hipFunction_t fn_sentinel;
     hipFunction_t fn_resize, fn_patch, fn_patch_im2col, fn_prepend;
     hipFunction_t fn_bf16_round;
+    hipFunction_t fn_cast_f32_to_f16, fn_cast_f32_to_bf16;
     hipFunction_t fn_ln, fn_ln_sqrtdiv, fn_ln_welford, fn_ln_welford_warp;
     hipFunction_t fn_ln_torchvec;
     hipFunction_t fn_gemm_tiled, fn_gemm_tiled_f32;
@@ -302,7 +303,7 @@ struct cuda_sam3d_body_ctx {
     int weights_ready;
 
     /* encoder weights (device ptrs). */
-    void    *w_patch_w, *w_patch_b;    /* F32 (D, 3, P, P) / F32 (D,) */
+    void    *w_patch_w, *w_patch_w16, *w_patch_b; /* F32/F16|BF16 patch projection */
     void    *w_cls;                     /* F32 (1, 1, D) */
     void    *w_storage;                 /* F32 (1, S, D) */
     void    *w_rope_periods;            /* F32 (16,) */
@@ -374,6 +375,8 @@ struct cuda_sam3d_body_ctx {
     void    *d_attn;                          /* (N_TOK, D) attention output */
     void    *d_proj;                          /* (N_TOK, D) post-proj scratch */
     void    *d_gate, *d_up;                   /* (N_TOK, FFN) SwiGLU */
+    void    *d_gemm_x16;                      /* reusable fp16/bf16 activation cast scratch */
+    size_t   d_gemm_x16_cap;
 
     /* host-side runtime state. */
     uint8_t *image_rgb;  int img_w, img_h;
@@ -502,6 +505,39 @@ static void *sb_upload_f32(const st_context *st, const char *s, size_t expect_n)
     return hip_upload_raw(safetensors_data((st_context *)st, i), nb);
 }
 
+static uint16_t sb_f32_to_bf16_rne(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+
+static float sb_f16_to_f32(uint16_t h)
+{
+    uint32_t sign = ((uint32_t)h >> 15) & 1u;
+    uint32_t exp  = ((uint32_t)h >> 10) & 0x1fu;
+    uint32_t mant = (uint32_t)h & 0x3ffu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign << 31;
+        } else {
+            exp = 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; exp--; }
+            mant &= 0x3ffu;
+            f = (sign << 31) | ((exp + 127u - 15u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7f800000u | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + 127u - 15u) << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
 static void *sb_upload_f16(const st_context *st, const char *s, size_t expect_n) {
     int i = sb_find(st, s);
     if (i < 0) { fprintf(stderr, "sam3d_body: missing %s\n", s); return NULL; }
@@ -527,6 +563,55 @@ static void *sb_upload_f16(const st_context *st, const char *s, size_t expect_n)
         const float *src = (const float *)safetensors_data((st_context *)st, i);
         uint16_t *t = (uint16_t *)malloc(n * 2);
         for (size_t k = 0; k < n; k++) t[k] = hip_f32_to_f16(src[k]);
+        void *d = hip_upload_raw(t, n * 2);
+        free(t);
+        return d;
+    }
+    fprintf(stderr, "sam3d_body: %s unsupported dtype %s\n", s, dt);
+    return NULL;
+}
+
+static void *sb_upload_bf16(const st_context *st, const char *s, size_t expect_n) {
+    int i = sb_find(st, s);
+    if (i < 0) { fprintf(stderr, "sam3d_body: missing %s\n", s); return NULL; }
+    const char *dt = safetensors_dtype(st, i);
+    size_t nb = safetensors_nbytes(st, i);
+    size_t n;
+    if (!strcmp(dt, "BF16")) {
+        n = nb / 2;
+        if (expect_n && n != expect_n) {
+            fprintf(stderr, "sam3d_body: %s bf16 size mismatch: %zu vs %zu\n",
+                    s, n, expect_n);
+            return NULL;
+        }
+        return hip_upload_raw(safetensors_data((st_context *)st, i), nb);
+    }
+    if (!strcmp(dt, "F16")) {
+        n = nb / 2;
+        if (expect_n && n != expect_n) {
+            fprintf(stderr, "sam3d_body: %s f16→bf16 size mismatch: %zu vs %zu\n",
+                    s, n, expect_n);
+            return NULL;
+        }
+        const uint16_t *src = (const uint16_t *)safetensors_data((st_context *)st, i);
+        uint16_t *t = (uint16_t *)malloc(n * 2);
+        if (!t) return NULL;
+        for (size_t k = 0; k < n; k++) t[k] = sb_f32_to_bf16_rne(sb_f16_to_f32(src[k]));
+        void *d = hip_upload_raw(t, n * 2);
+        free(t);
+        return d;
+    }
+    if (!strcmp(dt, "F32")) {
+        n = nb / 4;
+        if (expect_n && n != expect_n) {
+            fprintf(stderr, "sam3d_body: %s f32→bf16 size mismatch: %zu vs %zu\n",
+                    s, n, expect_n);
+            return NULL;
+        }
+        const float *src = (const float *)safetensors_data((st_context *)st, i);
+        uint16_t *t = (uint16_t *)malloc(n * 2);
+        if (!t) return NULL;
+        for (size_t k = 0; k < n; k++) t[k] = sb_f32_to_bf16_rne(src[k]);
         void *d = hip_upload_raw(t, n * 2);
         free(t);
         return d;
@@ -626,22 +711,28 @@ static int sb_load_block(cuda_sam3d_body_ctx *c, int bi) {
     b->norm2_w = sb_upload_f32(c->st_enc, K("norm2.weight"), SB_DIM);
     b->norm2_b = sb_upload_f32(c->st_enc, K("norm2.bias"),   SB_DIM);
     const int fp32 = c->cfg.precision && !strcmp(c->cfg.precision, "fp32");
+    const int bf16 = c->cfg.precision && !strcmp(c->cfg.precision, "bf16");
     b->qkv_w   = fp32 ? sb_upload_f32(c->st_enc, K("attn.qkv.weight"), (size_t)3 * SB_DIM * SB_DIM)
-                       : sb_upload_f16(c->st_enc, K("attn.qkv.weight"), (size_t)3 * SB_DIM * SB_DIM);
+                       : bf16 ? sb_upload_bf16(c->st_enc, K("attn.qkv.weight"), (size_t)3 * SB_DIM * SB_DIM)
+                              : sb_upload_f16(c->st_enc, K("attn.qkv.weight"), (size_t)3 * SB_DIM * SB_DIM);
     b->qkv_b   = sb_upload_f32(c->st_enc, K("attn.qkv.bias"),   (size_t)3 * SB_DIM);
     b->proj_w  = fp32 ? sb_upload_f32(c->st_enc, K("attn.proj.weight"), (size_t)SB_DIM * SB_DIM)
-                       : sb_upload_f16(c->st_enc, K("attn.proj.weight"), (size_t)SB_DIM * SB_DIM);
+                       : bf16 ? sb_upload_bf16(c->st_enc, K("attn.proj.weight"), (size_t)SB_DIM * SB_DIM)
+                              : sb_upload_f16(c->st_enc, K("attn.proj.weight"), (size_t)SB_DIM * SB_DIM);
     b->proj_b  = sb_upload_f32(c->st_enc, K("attn.proj.bias"),   SB_DIM);
     b->ls1     = sb_upload_f32(c->st_enc, K("ls1.gamma"), SB_DIM);
     b->ls2     = sb_upload_f32(c->st_enc, K("ls2.gamma"), SB_DIM);
     b->w1_w    = fp32 ? sb_upload_f32(c->st_enc, K("mlp.w1.weight"), (size_t)SB_FFN * SB_DIM)
-                       : sb_upload_f16(c->st_enc, K("mlp.w1.weight"), (size_t)SB_FFN * SB_DIM);
+                       : bf16 ? sb_upload_bf16(c->st_enc, K("mlp.w1.weight"), (size_t)SB_FFN * SB_DIM)
+                              : sb_upload_f16(c->st_enc, K("mlp.w1.weight"), (size_t)SB_FFN * SB_DIM);
     b->w1_b    = sb_upload_f32(c->st_enc, K("mlp.w1.bias"),   SB_FFN);
     b->w2_w    = fp32 ? sb_upload_f32(c->st_enc, K("mlp.w2.weight"), (size_t)SB_FFN * SB_DIM)
-                       : sb_upload_f16(c->st_enc, K("mlp.w2.weight"), (size_t)SB_FFN * SB_DIM);
+                       : bf16 ? sb_upload_bf16(c->st_enc, K("mlp.w2.weight"), (size_t)SB_FFN * SB_DIM)
+                              : sb_upload_f16(c->st_enc, K("mlp.w2.weight"), (size_t)SB_FFN * SB_DIM);
     b->w2_b    = sb_upload_f32(c->st_enc, K("mlp.w2.bias"),   SB_FFN);
     b->w3_w    = fp32 ? sb_upload_f32(c->st_enc, K("mlp.w3.weight"), (size_t)SB_DIM * SB_FFN)
-                       : sb_upload_f16(c->st_enc, K("mlp.w3.weight"), (size_t)SB_DIM * SB_FFN);
+                       : bf16 ? sb_upload_bf16(c->st_enc, K("mlp.w3.weight"), (size_t)SB_DIM * SB_FFN)
+                              : sb_upload_f16(c->st_enc, K("mlp.w3.weight"), (size_t)SB_DIM * SB_FFN);
     b->w3_b    = sb_upload_f32(c->st_enc, K("mlp.w3.bias"),   SB_DIM);
     #undef K
     if (!b->norm1_w || !b->norm1_b || !b->norm2_w || !b->norm2_b ||
@@ -1205,6 +1296,8 @@ static int sb_compile(cuda_sam3d_body_ctx *c) {
     BIND(fn_patch_im2col, "patch_im2col_sam3d");
     BIND(fn_prepend,  "prepend_special_tokens");
     BIND(fn_bf16_round,     "bf16_round_inplace_f32");
+    BIND(fn_cast_f32_to_f16,  "cast_f32_to_f16_sam3db");
+    BIND(fn_cast_f32_to_bf16, "cast_f32_to_bf16_sam3db");
     BIND(fn_ln,             "layernorm_f32");
     BIND(fn_ln_sqrtdiv,     "layernorm_sqrtdiv_f32");
     BIND(fn_ln_welford,     "layernorm_welford_f32");
@@ -1286,6 +1379,24 @@ static int sb_precision_is_supported(const char *p)
            !strcmp(p, "fp16") || !strcmp(p, "fp32");
 }
 
+static int sb_env_is_zero(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] == '0';
+}
+
+static int sb_body_cublas_gemm_enabled(const cuda_sam3d_body_ctx *ctx)
+{
+    if (!ctx || sb_precision_is_fp32(ctx)) return getenv("SAM3D_BODY_CUBLAS_GEMM") != NULL;
+    return !sb_env_is_zero("SAM3D_BODY_CUBLAS_GEMM");
+}
+
+static int sb_env_is_set_nonzero(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] && v[0] != '0';
+}
+
 static int sb_bf16_round(cuda_sam3d_body_ctx *ctx, void *x, int n)
 {
     if (!sb_precision_is_bf16(ctx) || !x || n <= 0) return 0;
@@ -1296,12 +1407,92 @@ static int sb_bf16_round(cuda_sam3d_body_ctx *ctx, void *x, int n)
                      256, 1, 1, 0, &p, sizeof(p));
 }
 
+static int sb_ensure_gemm_x16(cuda_sam3d_body_ctx *ctx, size_t bytes)
+{
+    if (!ctx || bytes == 0) return -1;
+    if (ctx->d_gemm_x16_cap >= bytes && ctx->d_gemm_x16) return 0;
+    if (ctx->d_gemm_x16) hipFree(ctx->d_gemm_x16);
+    ctx->d_gemm_x16 = NULL;
+    ctx->d_gemm_x16_cap = 0;
+    if (hipMalloc(&ctx->d_gemm_x16, bytes) != hipSuccess)
+        return -1;
+    ctx->d_gemm_x16_cap = bytes;
+    return 0;
+}
+
+static int sb_cast_gemm_x16(cuda_sam3d_body_ctx *ctx, const void *X,
+                            int n_elem)
+{
+    if (!ctx || !X || n_elem <= 0) return -1;
+    if (sb_ensure_gemm_x16(ctx, (size_t)n_elem * sizeof(uint16_t)) < 0)
+        return -1;
+    struct __attribute__((packed)) {
+        const void *src; void *dst; int n;
+    } p = { X, ctx->d_gemm_x16, n_elem };
+    hipFunction_t fn = sb_precision_is_bf16(ctx)
+        ? ctx->fn_cast_f32_to_bf16
+        : ctx->fn_cast_f32_to_f16;
+    return sb_launch(fn, (unsigned)((n_elem + 255) / 256), 1, 1,
+                     256, 1, 1, 0, &p, sizeof(p));
+}
+
 static int sb_gemm_encoder(cuda_sam3d_body_ctx *ctx, void *Y,
                            const void *W, const void *X, const void *bias,
                            int n_out, int n_in, int n_tok)
 {
+    const int gemm_profile = getenv("SAM3D_BODY_GEMM_PROFILE") != NULL;
+    double gp_t0 = 0.0;
+    if (gemm_profile) {
+        hipDeviceSynchronize();
+        gp_t0 = sb_time_ms();
+    }
+    if (ctx && ctx->use_cublas && !sb_precision_is_fp32(ctx) &&
+        sb_body_cublas_gemm_enabled(ctx)) {
+        if (sb_cast_gemm_x16(ctx, X, n_tok * n_in) == 0) {
+            int ok = sb_precision_is_bf16(ctx)
+                ? cublasew_gemm_bf16_bf16_f32_rowmajor_nt(
+                      ctx->cublas, (CUdeviceptr)(uintptr_t)Y,
+                      (CUdeviceptr)(uintptr_t)W,
+                      (CUdeviceptr)(uintptr_t)ctx->d_gemm_x16,
+                      n_tok, n_out, n_in)
+                : cublasew_gemm_f16_f16_f32_rowmajor_nt(
+                      ctx->cublas, (CUdeviceptr)(uintptr_t)Y,
+                      (CUdeviceptr)(uintptr_t)W,
+                      (CUdeviceptr)(uintptr_t)ctx->d_gemm_x16,
+                      n_tok, n_out, n_in);
+            if (ok == 0) {
+                if (bias) {
+                    struct __attribute__((packed)) {
+                        void *x; const void *b; int N, D;
+                    } p = { Y, bias, n_tok, n_out };
+                    int total = n_tok * n_out;
+                    if (sb_launch(ctx->fn_add_bias_rows,
+                                  (unsigned)((total + 255) / 256), 1, 1,
+                                  256, 1, 1, 0, &p, sizeof(p)) < 0)
+                        return -1;
+                }
+                if (gemm_profile) {
+                    hipDeviceSynchronize();
+                    fprintf(stderr,
+                            "[sam3d_body][gemm] cublas_%s n_tok=%d n_out=%d n_in=%d bias=%d ms=%.3f\n",
+                            sb_precision_is_bf16(ctx) ? "bf16" : "fp16",
+                            n_tok, n_out, n_in, bias ? 1 : 0,
+                            sb_time_ms() - gp_t0);
+                }
+                return 0;
+            }
+            if (gemm_profile) {
+                hipDeviceSynchronize();
+                fprintf(stderr,
+                        "[sam3d_body][gemm] cublas_%s rejected n_tok=%d n_out=%d n_in=%d\n",
+                        sb_precision_is_bf16(ctx) ? "bf16" : "fp16",
+                        n_tok, n_out, n_in);
+            }
+        }
+    }
+
     if (ctx && ctx->use_cublas && sb_precision_is_fp32(ctx) &&
-        getenv("SAM3D_BODY_CUBLAS_GEMM") &&
+        sb_body_cublas_gemm_enabled(ctx) &&
         cublasew_gemm_f32_pedantic_rowmajor_nt(ctx->cublas,
                                                (CUdeviceptr)(uintptr_t)Y,
                                                (CUdeviceptr)(uintptr_t)W,
@@ -1317,6 +1508,12 @@ static int sb_gemm_encoder(cuda_sam3d_body_ctx *ctx, void *Y,
                           256, 1, 1, 0, &p, sizeof(p)) < 0)
                 return -1;
         }
+        if (gemm_profile) {
+            hipDeviceSynchronize();
+            fprintf(stderr,
+                    "[sam3d_body][gemm] cublas_fp32 n_tok=%d n_out=%d n_in=%d bias=%d ms=%.3f\n",
+                    n_tok, n_out, n_in, bias ? 1 : 0, sb_time_ms() - gp_t0);
+        }
         return 0;
     }
 
@@ -1325,10 +1522,18 @@ static int sb_gemm_encoder(cuda_sam3d_body_ctx *ctx, void *Y,
     struct __attribute__((packed)) {
         void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
     } p = { Y, W, X, bias, n_out, n_in, n_tok };
-    return sb_launch(fn,
-                     (unsigned)((n_out + 63) / 64),
-                     (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1,
-                     0, &p, sizeof(p));
+    int rc = sb_launch(fn,
+                       (unsigned)((n_out + 63) / 64),
+                       (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1,
+                       0, &p, sizeof(p));
+    if (gemm_profile) {
+        hipDeviceSynchronize();
+        fprintf(stderr,
+                "[sam3d_body][gemm] tiled_%s n_tok=%d n_out=%d n_in=%d bias=%d ms=%.3f\n",
+                sb_precision_is_fp32(ctx) ? "fp32" : "fp16",
+                n_tok, n_out, n_in, bias ? 1 : 0, sb_time_ms() - gp_t0);
+    }
+    return rc;
 }
 
 /* ===================== public API ===================== */
@@ -1379,14 +1584,14 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
         fprintf(stderr, "sam3d_body: kernel compile failed\n");
         free(c); return NULL;
     }
-    if (sb_precision_is_fp32(c) &&
-        (getenv("SAM3D_BODY_CUBLAS_GEMM") ||
-         getenv("SAM3D_BODY_CUBLAS_PATCH") ||
-         getenv("SAM3D_BODY_CUBLAS_ATTN")) &&
+    if (((!sb_precision_is_fp32(c) && sb_body_cublas_gemm_enabled(c)) ||
+         sb_env_is_set_nonzero("SAM3D_BODY_CUBLAS_GEMM") ||
+         sb_env_is_set_nonzero("SAM3D_BODY_CUBLAS_PATCH") ||
+         sb_env_is_set_nonzero("SAM3D_BODY_CUBLAS_ATTN")) &&
         cublasewCreate(&c->cublas, 0) == 0) {
         c->use_cublas = 1;
         if (c->verbose >= 1)
-            fprintf(stderr, "sam3d_body: cuBLAS fp32 path enabled\n");
+            fprintf(stderr, "sam3d_body: cuBLAS path enabled\n");
     }
 
     char path[512];
@@ -1451,6 +1656,13 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
     /* Non-block tensors. */
     c->w_patch_w       = sb_upload_f32(c->st_enc, "patch_embed.proj.weight",
                                        (size_t)SB_DIM * 3 * SB_PATCH * SB_PATCH);
+    if (!sb_precision_is_fp32(c)) {
+        c->w_patch_w16 = sb_precision_is_bf16(c)
+            ? sb_upload_bf16(c->st_enc, "patch_embed.proj.weight",
+                             (size_t)SB_DIM * 3 * SB_PATCH * SB_PATCH)
+            : sb_upload_f16(c->st_enc, "patch_embed.proj.weight",
+                            (size_t)SB_DIM * 3 * SB_PATCH * SB_PATCH);
+    }
     c->w_patch_b       = sb_upload_f32(c->st_enc, "patch_embed.proj.bias", SB_DIM);
     c->w_cls           = sb_upload_f32(c->st_enc, "cls_token", SB_DIM);
     c->w_storage       = sb_upload_f32(c->st_enc, "storage_tokens",
@@ -1458,7 +1670,8 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
     c->w_rope_periods  = sb_upload_f32(c->st_enc, "rope_embed.periods", 16);
     c->w_norm_w        = sb_upload_f32(c->st_enc, "norm.weight", SB_DIM);
     c->w_norm_b        = sb_upload_f32(c->st_enc, "norm.bias",   SB_DIM);
-    if (!c->w_patch_w || !c->w_patch_b || !c->w_cls || !c->w_storage ||
+    if (!c->w_patch_w || (!sb_precision_is_fp32(c) && !c->w_patch_w16) ||
+        !c->w_patch_b || !c->w_cls || !c->w_storage ||
         !c->w_rope_periods || !c->w_norm_w || !c->w_norm_b) {
         cuda_sam3d_body_destroy(c); return NULL;
     }
@@ -1586,7 +1799,7 @@ static void sb_free_dev(void *p) { if (p) hipFree(p); }
 void cuda_sam3d_body_destroy(cuda_sam3d_body_ctx *ctx)
 {
     if (!ctx) return;
-    sb_free_dev(ctx->w_patch_w); sb_free_dev(ctx->w_patch_b);
+    sb_free_dev(ctx->w_patch_w); sb_free_dev(ctx->w_patch_w16); sb_free_dev(ctx->w_patch_b);
     sb_free_dev(ctx->w_cls); sb_free_dev(ctx->w_storage);
     sb_free_dev(ctx->w_rope_periods);
     sb_free_dev(ctx->w_rope_cos); sb_free_dev(ctx->w_rope_sin);
@@ -1626,6 +1839,7 @@ void cuda_sam3d_body_destroy(cuda_sam3d_body_ctx *ctx)
     sb_free_dev(ctx->d_proj);
     sb_free_dev(ctx->d_gate);
     sb_free_dev(ctx->d_up);
+    sb_free_dev(ctx->d_gemm_x16);
     /* Decoder + MHR-head weights. */
     sb_dec_w *D = &ctx->dec;
     sb_free_dev(D->ray_cond_conv_w);
@@ -2208,9 +2422,9 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
             bbox_xyxy[0] = 0; bbox_xyxy[1] = 0;
             bbox_xyxy[2] = (float)ctx->img_w; bbox_xyxy[3] = (float)ctx->img_h;
         }
+        /* Upstream TopdownAffine always expands to the body prior aspect
+         * ratio first (0.75), then fixes again to the actual model W/H. */
         float aspect_ratio_pre = 0.75f;
-        if (IMG_H != IMG_W)
-            aspect_ratio_pre = (float)IMG_W / (float)IMG_H;
         sam3d_body_compute_bbox_affine(bbox_xyxy, /*padding=*/1.25f,
                                        aspect_ratio_pre, IMG_W, IMG_H,
                                        ctx->self_center, ctx->self_scale,
@@ -2262,8 +2476,13 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
     }
 
     /* patch embed → rows 5..5+n_patch */
-    if (sb_precision_is_fp32(ctx) && ctx->use_cublas &&
-        getenv("SAM3D_BODY_CUBLAS_PATCH")) {
+    const int use_cublas_patch =
+        ctx->use_cublas &&
+        ((sb_precision_is_fp32(ctx) && getenv("SAM3D_BODY_CUBLAS_PATCH")) ||
+         (!sb_precision_is_fp32(ctx) &&
+          (getenv("SAM3D_BODY_CUBLAS_PATCH") ||
+           sb_body_cublas_gemm_enabled(ctx))));
+    if (use_cublas_patch) {
         const int K_PATCH = 3 * SB_PATCH * SB_PATCH;
         if (!ctx->d_patch_cols) {
             if (hipMalloc(&ctx->d_patch_cols,
@@ -2283,12 +2502,32 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
         void *patch_out = (char *)ctx->d_tok +
             (size_t)(1 + SB_N_STORAGE) * SB_DIM * sizeof(float);
-        if (cublasew_gemm_f32_pedantic_rowmajor_nt(
-                ctx->cublas, (CUdeviceptr)(uintptr_t)patch_out,
-                (CUdeviceptr)(uintptr_t)ctx->w_patch_w,
-                (CUdeviceptr)(uintptr_t)ctx->d_patch_cols,
-                N_PATCH, SB_DIM, K_PATCH) != 0)
-            return CUDA_SAM3D_BODY_E_LOAD;
+        if (sb_precision_is_fp32(ctx)) {
+            if (cublasew_gemm_f32_pedantic_rowmajor_nt(
+                    ctx->cublas, (CUdeviceptr)(uintptr_t)patch_out,
+                    (CUdeviceptr)(uintptr_t)ctx->w_patch_w,
+                    (CUdeviceptr)(uintptr_t)ctx->d_patch_cols,
+                    N_PATCH, SB_DIM, K_PATCH) != 0)
+                return CUDA_SAM3D_BODY_E_LOAD;
+        } else {
+            if (!ctx->w_patch_w16 ||
+                sb_cast_gemm_x16(ctx, ctx->d_patch_cols,
+                                 N_PATCH * K_PATCH) < 0)
+                return CUDA_SAM3D_BODY_E_LOAD;
+            int ok = sb_precision_is_bf16(ctx)
+                ? cublasew_gemm_bf16_bf16_f32_rowmajor_nt(
+                      ctx->cublas, (CUdeviceptr)(uintptr_t)patch_out,
+                      (CUdeviceptr)(uintptr_t)ctx->w_patch_w16,
+                      (CUdeviceptr)(uintptr_t)ctx->d_gemm_x16,
+                      N_PATCH, SB_DIM, K_PATCH)
+                : cublasew_gemm_f16_f16_f32_rowmajor_nt(
+                      ctx->cublas, (CUdeviceptr)(uintptr_t)patch_out,
+                      (CUdeviceptr)(uintptr_t)ctx->w_patch_w16,
+                      (CUdeviceptr)(uintptr_t)ctx->d_gemm_x16,
+                      N_PATCH, SB_DIM, K_PATCH);
+            if (ok != 0)
+                return CUDA_SAM3D_BODY_E_LOAD;
+        }
         {
             struct __attribute__((packed)) {
                 void *x; const void *b; int N, D;
@@ -2902,12 +3141,10 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
         /* Recompute the same affine shape that run_encoder would have cached.
          * ViT-H still uses the upstream 512x512 canvas before W-axis crop. */
         int affine_w = IMG_W, affine_h = IMG_H;
-        float aspect_ratio_pre = is_vith ? 0.75f : 1.0f;
+        float aspect_ratio_pre = 0.75f;
         if (is_vith) {
             affine_w = SB_VITH_IMG_H;
             affine_h = SB_VITH_IMG_H;
-        } else if (IMG_H != IMG_W) {
-            aspect_ratio_pre = (float)IMG_W / (float)IMG_H;
         }
         sam3d_body_compute_bbox_affine(bbox_xyxy, /*padding=*/1.25f,
                                        aspect_ratio_pre,
@@ -4029,6 +4266,28 @@ static int sb_dec_gemm(cuda_sam3d_body_ctx *c, void *Y, const void *X,
                        const void *W, const void *b,
                        int N, int D_in, int D_out)
 {
+    if (c && c->use_cublas &&
+        (getenv("SAM3D_BODY_CUBLAS_DEC_GEMM") ||
+         getenv("SAM3D_BODY_CUBLAS_GEMM"))) {
+        int ok = cublasew_gemm_f32_pedantic_rowmajor_nt(
+            c->cublas, (CUdeviceptr)(uintptr_t)Y,
+            (CUdeviceptr)(uintptr_t)W,
+            (CUdeviceptr)(uintptr_t)X,
+            N, D_out, D_in);
+        if (ok == 0) {
+            if (b) {
+                struct __attribute__((packed)) {
+                    void *x; const void *bb; int N, D;
+                } p = { Y, b, N, D_out };
+                int total = N * D_out;
+                if (sb_launch(c->fn_add_bias_rows,
+                              (unsigned)((total + 255) / 256), 1, 1,
+                              256, 1, 1, 0, &p, sizeof(p)) < 0)
+                    return -1;
+            }
+            return 0;
+        }
+    }
     struct __attribute__((packed)) {
         void *Y; const void *X; const void *W; const void *b;
         int N; int D_in; int D_out;

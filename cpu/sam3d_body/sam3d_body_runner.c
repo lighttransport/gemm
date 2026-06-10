@@ -283,9 +283,9 @@ int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
         bbox_xyxy[0] = 0; bbox_xyxy[1] = 0;
         bbox_xyxy[2] = (float)ctx->img_w; bbox_xyxy[3] = (float)ctx->img_h;
     }
-    float aspect_ratio_pre = is_vith ? 0.75f : 1.0f;
-    if (!is_vith && IMG_H != IMG_W)
-        aspect_ratio_pre = (float)IMG_W / (float)IMG_H;
+    /* Upstream TopdownAffine always expands to the body prior aspect ratio
+     * first (0.75), then fixes again to the actual model input W/H. */
+    float aspect_ratio_pre = 0.75f;
     sam3d_body_compute_bbox_affine(bbox_xyxy, /*padding=*/1.25f,
                                    aspect_ratio_pre, IMG_W, IMG_H,
                                    ctx->self_center, ctx->self_scale,

@@ -145,12 +145,21 @@ typedef struct {
 
 gguf_context *gguf_open(const char *path, int use_mmap);
 void gguf_close(gguf_context *ctx);
-int gguf_find_key(const gguf_context *ctx, const char *key);
 const char *gguf_tensor_name(const gguf_context *ctx, int i);
 void *gguf_tensor_data(const gguf_context *ctx, int i);
 size_t gguf_tensor_size(const gguf_context *ctx, int i);
-const char *gguf_type_name(uint32_t type);
-const char *ggml_type_name(uint32_t type);
+static const char *gguf_type_name(uint32_t type);
+static const char *ggml_type_name(uint32_t type);
+/* Rename gguf_find_key to avoid symbol conflict with libggml-base (llama.cpp).
+ * Must appear before any function definition that calls gguf_find_key. */
+#define gguf_find_key gguf_find_key_internal
+static int gguf_find_key_internal(const gguf_context *ctx, const char *key) {
+    for (uint64_t i = 0; i < ctx->n_kv; i++) {
+        if (ctx->kv[i].key.str && strcmp(ctx->kv[i].key.str, key) == 0)
+            return (int)i;
+    }
+    return -1;
+}
 
 #ifdef __cplusplus
 }
@@ -213,7 +222,7 @@ static const struct { int block_size; int type_size; } ggml_type_info[] = {
     [GGML_TYPE_Q1_0]    = {128, 18},
 };
 
-const char *gguf_type_name(uint32_t type) {
+static const char *gguf_type_name(uint32_t type) {
     static const char *names[] = {
         "uint8","int8","uint16","int16","uint32","int32","float32",
         "bool","string","array","uint64","int64","float64"
@@ -222,7 +231,7 @@ const char *gguf_type_name(uint32_t type) {
     return "unknown";
 }
 
-const char *ggml_type_name(uint32_t type) {
+static const char *ggml_type_name(uint32_t type) {
     static const char *names[GGML_TYPE_COUNT] = {
         [GGML_TYPE_F32] = "F32", [GGML_TYPE_F16] = "F16",
         [GGML_TYPE_Q4_0] = "Q4_0", [GGML_TYPE_Q4_1] = "Q4_1",
@@ -500,24 +509,14 @@ void gguf_close(gguf_context *ctx) {
     free(ctx);
 }
 
-int gguf_find_key(const gguf_context *ctx, const char *key) {
-    for (uint64_t i = 0; i < ctx->n_kv; i++) {
-        if (ctx->kv[i].key.str && strcmp(ctx->kv[i].key.str, key) == 0)
-            return (int)i;
-    }
-    return -1;
-}
-
 const char *gguf_tensor_name(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
     return ctx->tensors[i].name.str;
 }
 
 void *gguf_tensor_data(const gguf_context *ctx, int i) {
-    if (i < 0 || (uint64_t)i >= ctx->n_tensors || !ctx->data) return NULL;
-    uint64_t offset = ctx->tensors[i].offset;
-    if (offset >= ctx->data_size) return NULL;  /* bounds check */
-    return ctx->data + offset;
+    if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
+    return ctx->data + ctx->tensors[i].offset;
 }
 
 size_t gguf_tensor_size(const gguf_context *ctx, int i) {
@@ -535,4 +534,5 @@ size_t gguf_tensor_size(const gguf_context *ctx, int i) {
 }
 
 #endif /* GGUF_LOADER_IMPLEMENTATION */
+
 #endif /* GGUF_LOADER_H */
