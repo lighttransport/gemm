@@ -4298,13 +4298,18 @@ static const char *cuda_kernel_source =
 "   WN=4 warps/block). Each block decodes its 64 weight-rows for a sub-block ONCE\n"
 "   and reuses across up to TG=4 token-groups (32 tokens) of its expert — the\n"
 "   IQ2_XXS decode is the bottleneck, so amortizing it is the win (2.1x vs 8/block).\n"
-"   grid=(N/64, ceil(max_tok/32), n_experts), block=128 */\n"
+"   Flattened work-list grid: blockIdx.y indexes a real (expert,group) pair in\n"
+"   worklist[] (packed (e<<16)|g), so grid=(N/64, n_work, 1) launches exactly the\n"
+"   non-empty blocks. This kills the ~80%% empty blocks AND the hot-expert tail that\n"
+"   the old (N/64, ceil(max_tok/32), n_experts) grid produced on skewed routing\n"
+"   (max_tok=163 vs mean 16). block=128 */\n"
 "__global__ void mmq_iq2xxs_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
 "                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
-"                                    int N, int K) {\n"
+"                                    const int *worklist, int N, int K) {\n"
 "    const int TG = 4;\n"
-"    int e = blockIdx.z; int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
-"    int m_base = eb0 + blockIdx.y*(8*TG); if (m_base >= eb1) return;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
 "    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
 "    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
 "    int gid = lane>>2, tid = lane&3;\n"
@@ -5689,6 +5694,7 @@ struct cuda_llm_runner {
     CUdeviceptr d_mmq_outu;       /* f32  [total_rows * expert_ff] up out */
     CUdeviceptr d_mmq_outd;       /* f32  [total_rows * n_embd] down out */
     CUdeviceptr d_mmq_ebounds;    /* int  [n_experts+1] expert bounds */
+    CUdeviceptr d_mmq_worklist;   /* int  [<= n_experts*ceil(maxtok/32)] packed (e<<16)|group */
     int d_mmq_alloc_rows;         /* allocated compact-row capacity (0 = unallocated) */
     float *h_router_logits;       /* host copy for top-k selection */
 
@@ -11358,20 +11364,43 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                                 return NULL;
                             }
                             if (!r->d_mmq_ebounds) cuMemAlloc(&r->d_mmq_ebounds, (size_t)(r->n_experts + 1) * sizeof(int));
+                            if (r->d_mmq_worklist) { cuMemFree(r->d_mmq_worklist); r->d_mmq_worklist = 0; }
+                            /* n_work = sum_e ceil(ec[e]/32) <= n_experts + total/32 */
+                            cuMemAlloc(&r->d_mmq_worklist, (size_t)(r->n_experts + total / 32 + 8) * sizeof(int));
                             r->d_mmq_alloc_rows = total;
                         }
                         cuMemcpyHtoD(r->d_mmq_ebounds, offs, (size_t)(r->n_experts + 1) * sizeof(int));
                         int maxtok = 0; for (int e = 0; e < r->n_experts; e++) if (ec[e] > maxtok) maxtok = ec[e];
+                        /* flattened work-list: one entry per real (expert,group) pair (group = 32 tokens) */
+                        int n_work = 0;
+                        { int *wl = (int *)alloca((size_t)(r->n_experts + total / 32 + 8) * sizeof(int));
+                          for (int e = 0; e < r->n_experts; e++) { int ng = (ec[e] + 31) / 32;
+                              for (int g = 0; g < ng; g++) wl[n_work++] = (e << 16) | g; }
+                          if (n_work == 0) wl[n_work++] = 0;  /* avoid 0-block launch */
+                          cuMemcpyHtoD(r->d_mmq_worklist, wl, (size_t)n_work * sizeof(int)); }
+                        if (getenv("CUDA_LLM_MOE_DUMP_DIST")) {
+                            static int dumped = 0;
+                            if (!dumped) { dumped = 1;
+                                int nz=0,h32=0,h64=0; long sum=0;
+                                int hist[9]={0,0,0,0,0,0,0,0,0};
+                                for (int e=0;e<r->n_experts;e++){ int c=ec[e]; sum+=c; if(c>0)nz++; if(c>32)h32++; if(c>64)h64++;
+                                    int b=c==0?0:(c<=8?1:c<=16?2:c<=24?3:c<=32?4:c<=48?5:c<=64?6:c<=96?7:8); hist[b]++; }
+                                fprintf(stderr,"[moe-dist] total=%d experts=%d maxtok=%d mean=%.1f nonzero=%d >32grp=%d >64=%d\n",
+                                        (int)sum, r->n_experts, maxtok, (double)sum/r->n_experts, nz, h32, h64);
+                                fprintf(stderr,"[moe-dist] hist =0:%d 1-8:%d 9-16:%d 17-24:%d 25-32:%d 33-48:%d 49-64:%d 65-96:%d 97+:%d\n",
+                                        hist[0],hist[1],hist[2],hist[3],hist[4],hist[5],hist[6],hist[7],hist[8]);
+                            }
+                        }
                         /* 1. gather d_batch_xb rows by ids_token (=etok in d_topk_idx) + quant to q8_1 */
                         { int tr = total, kk = n_embd;
                           void *a[] = { &d_batch_xb, &r->d_topk_idx, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
                           cuLaunchKernel(r->fn_mmq_gather_quant_q8_1, n_embd / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 2. grouped gate + up: out[total][ef] */
                         { unsigned long long st = cl->moe_exp_stride_gu; int nN = ef, nK = n_embd;
-                          void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 31) / 32, r->n_experts, 128, 1, 1, 0, r->stream, ag, NULL);
-                          void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, (maxtok + 31) / 32, r->n_experts, 128, 1, 1, 0, r->stream, au, NULL); }
+                          void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, ag, NULL);
+                          void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, au, NULL); }
                         /* 3. silu: outg = silu(outg) * outu */
                         launch_silu_mul(r, r->d_mmq_outg, r->d_mmq_outu, total * ef);
                         /* 4. quantize silu result (ef cols) into cxq8 for the down matmul */
@@ -11380,8 +11409,8 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                           cuLaunchKernel(r->fn_mmq_quant_q8_1, ef / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 5. grouped down: out[total][n_embd] */
                         { unsigned long long st = cl->moe_exp_stride_d; int nN = n_embd, nK = ef;
-                          void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, (maxtok + 31) / 32, r->n_experts, 128, 1, 1, 0, r->stream, ad, NULL); }
+                          void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, n_work, 1, 128, 1, 1, 0, r->stream, ad, NULL); }
                         /* 6. weighted scatter into d_batch_x (ids_token=etok, weights=etw) */
                         { int tr = total, nN = n_embd;
                           void *a[] = { &d_batch_x, &r->d_mmq_outd, &r->d_topk_idx, &r->d_topk_wgt, &tr, &nN };
@@ -12379,6 +12408,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_mmq_outu)     cuMemFree(r->d_mmq_outu);
     if (r->d_mmq_outd)     cuMemFree(r->d_mmq_outd);
     if (r->d_mmq_ebounds)  cuMemFree(r->d_mmq_ebounds);
+    if (r->d_mmq_worklist) cuMemFree(r->d_mmq_worklist);
     if (r->d_pos_seq)    cuMemFree(r->d_pos_seq);
     if (r->d_graph_exec) cuGraphExecDestroy(r->d_graph_exec);
     if (r->d_graph)      cuGraphDestroy(r->d_graph);
