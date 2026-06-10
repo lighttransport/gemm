@@ -70,6 +70,13 @@ static void print_first_n(const char *label, const float *v, int n, int show) {
     fprintf(stderr, " ...] norm=%.4f\n", vec_norm(v, n));
 }
 
+static uint32_t bench_lcg_next(uint32_t *state) {
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+#define BATCHED_PREFILL_MIN_TOKENS 33
+
 /* ---- Main ---- */
 
 int main(int argc, char **argv) {
@@ -78,6 +85,8 @@ int main(int argc, char **argv) {
     int max_tokens = 8;
     int max_seq_len = 256;
     int large_bench = 0;
+    int large_bench_random = 0;
+    uint32_t large_bench_seed = 1;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -94,10 +103,14 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--large-bench") == 0 && i + 1 < argc) {
             max_tokens = atoi(argv[++i]);
             large_bench = max_tokens;
+        } else if (strcmp(argv[i], "--large-bench-random") == 0) {
+            large_bench_random = 1;
+        } else if (strcmp(argv[i], "--large-bench-seed") == 0 && i + 1 < argc) {
+            large_bench_seed = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
-            fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len] [--large-bench N] [--large-bench-random] [--large-bench-seed N]\n", argv[0]);
             return 1;
         }
     }
@@ -144,6 +157,26 @@ int main(int argc, char **argv) {
 
     if (max_tokens > n_tokens) max_tokens = n_tokens;
 
+    int32_t prefill_tokens[512];
+    int prefill_token_count = max_tokens;
+    int repeated_prefill_tokens = 0;
+    for (int i = 0; i < prefill_token_count; i++) {
+        prefill_tokens[i] = tokens[i];
+    }
+    if (prefill_token_count > 0 && prefill_token_count < BATCHED_PREFILL_MIN_TOKENS) {
+        prefill_token_count = BATCHED_PREFILL_MIN_TOKENS;
+        if (prefill_token_count > (int)(sizeof(prefill_tokens) / sizeof(prefill_tokens[0]))) {
+            prefill_token_count = (int)(sizeof(prefill_tokens) / sizeof(prefill_tokens[0]));
+        }
+        for (int i = 0; i < prefill_token_count; i++) {
+            prefill_tokens[i] = tokens[i % max_tokens];
+        }
+        repeated_prefill_tokens = 1;
+    }
+    if (max_seq_len < prefill_token_count) {
+        max_seq_len = prefill_token_count;
+    }
+
     /* Load CPU reference model (may fail for MoE — run GPU-only in that case) */
     fprintf(stderr, "\n=== Loading CPU reference model ===\n");
     transformer_model *cpu_model = transformer_load(gguf, max_seq_len);
@@ -175,15 +208,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    cuda_llm_set_debug(gpu, 0);  /* 0=off, 2=per-layer norms+profile (adds sync overhead) */
+    {
+        const char *debug_env = getenv("CUDA_LLM_DEBUG");
+        const char *max_layers_env = getenv("CUDA_LLM_MAX_LAYERS");
+        cuda_llm_set_debug(gpu, debug_env ? atoi(debug_env) : 0);
+        if (max_layers_env) cuda_llm_set_max_layers(gpu, atoi(max_layers_env));
+    }
+    if (cuda_llm_reset_state(gpu) != 0) {
+        fprintf(stderr, "cuda_llm_reset_state failed before initial run\n");
+        cuda_llm_free(gpu);
+        if (cpu_model) transformer_free(cpu_model);
+        bpe_vocab_free(vocab);
+        gguf_close(gguf);
+        return 1;
+    }
     int n_embd = cuda_llm_n_embd(gpu);
+    int n_vocab_size = cuda_llm_n_vocab(gpu);
     fprintf(stderr, "\n=== Running %d tokens (n_embd=%d)%s ===\n",
             max_tokens, n_embd, gpu_only ? " [GPU-only]" : "");
 
     /* Run tokens through both */
     double total_cpu_ms = 0.0, total_gpu_ms = 0.0;
     int pass = 1;
+    int have_seq_logits = 0;
     float *last_gpu_hidden = (float *)malloc((size_t)n_embd * sizeof(float));
+    float *last_seq_logits = n_vocab_size > 0 ? (float *)malloc((size_t)n_vocab_size * sizeof(float)) : NULL;
     if (!last_gpu_hidden) {
         fprintf(stderr, "Failed to allocate last_gpu_hidden\n");
         cuda_llm_free(gpu);
@@ -192,7 +241,17 @@ int main(int argc, char **argv) {
         gguf_close(gguf);
         return 1;
     }
+    if (n_vocab_size > 0 && !last_seq_logits) {
+        fprintf(stderr, "Failed to allocate last_seq_logits\n");
+        free(last_gpu_hidden);
+        cuda_llm_free(gpu);
+        if (cpu_model) transformer_free(cpu_model);
+        bpe_vocab_free(vocab);
+        gguf_close(gguf);
+        return 1;
+    }
 
+    if (!large_bench) {
     for (int i = 0; i < max_tokens; i++) {
         int32_t token = tokens[i];
 
@@ -253,6 +312,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Speedup: %.1fx\n", total_cpu_ms / total_gpu_ms);
     }
     fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
+    } else {
+        fprintf(stderr, "\n=== Skipping decode path for large-batch prefill benchmark ===\n");
+    }
 
     /* Get logits from sequential forward_logits (skip for large bench) */
     if (!large_bench) {
@@ -263,14 +325,15 @@ int main(int argc, char **argv) {
     }
     {
         /* Run all tokens except last to build up state */
-        for (int t = 0; t + 1 < max_tokens; t++) {
-            cuda_llm_forward(gpu, tokens[t], t);
+        for (int t = 0; t + 1 < prefill_token_count; t++) {
+            cuda_llm_forward(gpu, prefill_tokens[t], t);
         }
         /* Get logits for the last token */
-        float *seq_logits = cuda_llm_forward_logits(gpu, tokens[max_tokens-1], max_tokens-1);
+        float *seq_logits = cuda_llm_forward_logits(gpu, prefill_tokens[prefill_token_count - 1], prefill_token_count - 1);
         if (seq_logits) {
-            int n_vocab_size = cuda_llm_n_vocab(gpu);
             if (n_vocab_size > 0) {
+                memcpy(last_seq_logits, seq_logits, (size_t)n_vocab_size * sizeof(float));
+                have_seq_logits = 1;
                 int top5_ids[5] = {0};
                 float top5_vals[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
                 for (int v = 0; v < n_vocab_size; v++) {
@@ -283,7 +346,7 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                fprintf(stderr, "Sequential top-5:");
+                fprintf(stderr, "Sequential top-5%s:", repeated_prefill_tokens ? " (batched prefill check)" : "");
                 for (int k = 0; k < 5; k++) {
                     const char *s = bpe_token_to_str(vocab, top5_ids[k]);
                     fprintf(stderr, " [%d]=%.4f('%s')", top5_ids[k], top5_vals[k], s ? s : "?");
@@ -296,19 +359,43 @@ int main(int argc, char **argv) {
 
     if (!large_bench) {
     if (cuda_llm_reset_state(gpu) != 0) {
+        fprintf(stderr, "cuda_llm_reset_state failed before sequential hidden replay\n");
+        pass = 0;
+        goto cleanup;
+    }
+    {
+        if (repeated_prefill_tokens) {
+            fprintf(stderr, "Prefill check uses %d tokens by repeating the prompt to force batched prefill\n",
+                    prefill_token_count);
+        }
+        float *seq_hidden = NULL;
+        for (int t = 0; t < prefill_token_count; t++) {
+            seq_hidden = cuda_llm_forward(gpu, prefill_tokens[t], t);
+            if (!seq_hidden) break;
+        }
+        if (seq_hidden) {
+            memcpy(last_gpu_hidden, seq_hidden, (size_t)n_embd * sizeof(float));
+        } else {
+            fprintf(stderr, "Sequential hidden replay failed\n");
+            pass = 0;
+            goto cleanup;
+        }
+    }
+
+    if (cuda_llm_reset_state(gpu) != 0) {
         fprintf(stderr, "cuda_llm_reset_state failed before prefill hidden\n");
         pass = 0;
         goto cleanup;
     }
     double t0 = get_time_ms();
-    float *prefill_hidden = cuda_llm_prefill(gpu, tokens, NULL, 0, max_tokens, 0);
+    float *prefill_hidden = cuda_llm_prefill(gpu, prefill_tokens, NULL, 0, prefill_token_count, 0);
     double prefill_ms = get_time_ms() - t0;
     if (prefill_hidden) {
         float err = rel_l2_error(prefill_hidden, last_gpu_hidden, n_embd);
         float ptol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
         fprintf(stderr, "Prefill hidden: %.1f ms (%.1f tok/s) rel_L2_vs_seq=%.6f\n",
-                prefill_ms, prefill_ms > 0 ? (1000.0 * max_tokens / prefill_ms) : 0.0, err);
-        if (err >= ptol) pass = 0;
+                prefill_ms, prefill_ms > 0 ? (1000.0 * prefill_token_count / prefill_ms) : 0.0, err);
+        if (!isfinite(err) || err >= ptol) pass = 0;
     } else {
         fprintf(stderr, "Prefill hidden failed\n");
         pass = 0;
@@ -320,13 +407,18 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     t0 = get_time_ms();
-    float *prefill_logits = cuda_llm_prefill_logits(gpu, tokens, NULL, 0, max_tokens, 0);
+    float *prefill_logits = cuda_llm_prefill_logits(gpu, prefill_tokens, NULL, 0, prefill_token_count, 0);
     double prefill_logits_ms = get_time_ms() - t0;
     if (prefill_logits) {
+        if (have_seq_logits && last_seq_logits && n_vocab_size > 0) {
+            float logit_err = rel_l2_error(prefill_logits, last_seq_logits, n_vocab_size);
+            float ptol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
+            fprintf(stderr, "Prefill logits rel_L2_vs_seq=%.6f\n", logit_err);
+            if (!isfinite(logit_err) || logit_err >= ptol) pass = 0;
+        }
         fprintf(stderr, "Prefill logits: %.1f ms (%.1f tok/s)\n",
                 prefill_logits_ms,
-                prefill_logits_ms > 0 ? (1000.0 * max_tokens / prefill_logits_ms) : 0.0);
-        int n_vocab_size = cuda_llm_n_vocab(gpu);
+                prefill_logits_ms > 0 ? (1000.0 * prefill_token_count / prefill_logits_ms) : 0.0);
         if (n_vocab_size > 0) {
             int top5_ids[5] = {0};
             float top5_vals[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
@@ -361,9 +453,18 @@ int main(int argc, char **argv) {
             fprintf(stderr, "cuda_llm_reset_state failed before large bench\n");
             pass = 0; goto cleanup;
         }
-        /* Create synthetic token IDs */
+        /* Create synthetic token IDs. Random mode is closer to llama-bench prompt processing. */
         int32_t *big_tokens = (int32_t *)calloc((size_t)bench_tokens, sizeof(int32_t));
         if (!big_tokens) { fprintf(stderr,"malloc failed\n"); pass=0; goto cleanup; }
+        if (large_bench_random) {
+            uint32_t rng = large_bench_seed ? large_bench_seed : 1u;
+            int vocab_n = vocab->n_tokens > 0 ? vocab->n_tokens : 1;
+            for (int i = 0; i < bench_tokens; i++) {
+                big_tokens[i] = (int32_t)(bench_lcg_next(&rng) % (uint32_t)vocab_n);
+            }
+            fprintf(stderr, "Large bench tokens: deterministic random seed=%u vocab=%d\n",
+                    large_bench_seed, vocab_n);
+        }
         /* Warm-up run */
         if (!cuda_llm_prefill(gpu, big_tokens, NULL, 0, bench_tokens, 0)) {
             fprintf(stderr, "Large bench warm-up prefill failed\n");
@@ -432,6 +533,7 @@ int main(int argc, char **argv) {
 
 cleanup:
     /* Cleanup */
+    free(last_seq_logits);
     free(last_gpu_hidden);
     cuda_llm_free(gpu);
     if (cpu_model) transformer_free(cpu_model);
