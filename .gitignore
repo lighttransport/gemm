@@ -216,3 +216,24 @@ cuda/trellis2/model_root/
 # dump contract). Use /* (not the bare dir) so the negation can re-include it.
 cuda/trellis2/verify-dumps/*
 !cuda/trellis2/verify-dumps/README.md
+
+# Reference dump artifacts (regenerate via the ref/*/gen_*.py scripts).
+# These are large .npy/.safetensors tensors that must never be committed.
+# The ref/* block above re-includes whole dirs (e.g. !ref/sam3d/), so their
+# dumps/ subdirs are NOT ignored by default — ignore them explicitly here.
+ref/sam3d/dumps/
+ref/sam3d-body/dumps/
+__pycache__/
+*.pyc
+
+# Stray root-level reference dumps / sample images (do not track)
+/nunchaku_ref_dump.*
+/fujisan.jpg
+/fujisan_mask.png
+
+# qimg quantization sample / reference image dumps (regenerate locally)
+cuda/qimg/int8_samples/
+cuda/qimg/int8_smooth_samples/
+cuda/qimg/int8_smooth_a075/
+cuda/qimg/fp4_svdquant_samples/
+cuda/qimg/fp8_reference/
