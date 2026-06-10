@@ -3502,7 +3502,7 @@ static const char *hip_kernel_source =
 "__global__ void moe_down_accum_iq3s(float *accum /*[n_embd]*/,\n"
 "        const unsigned char *down_base, const float *acts /*[K+1,eff]*/,\n"
 "        int n_embd, int eff, const int *eidx, const float *ew, long long stride,\n"
-"        int n_slots, const unsigned char *shd, const float *shscale) {\n"
+"        int n_slots, const unsigned char *shd, const float *shscale, int dtype) {\n"
 "    int slot = blockIdx.y;\n"
 "    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
 "    int row = blockIdx.x * 8 + warp_id; if (row >= n_embd) return;\n"
@@ -3522,6 +3522,28 @@ static const char *hip_kernel_source =
 "    }\n"
 "    const unsigned char *mat = down_base + (long long)eidx[slot] * stride;\n"
 "    int nb = eff / 256;\n"
+"    if (dtype == 1) {  /* IQ4_XS */\n"
+"        const unsigned char *row_ptr4 = mat + (size_t)row * nb * 136;\n"
+"        float sum4 = 0.0f;\n"
+"        for (int g = lane; g < nb * 8; g += 32) {\n"
+"            int b = g >> 3; int ib = g & 7;\n"
+"            const unsigned char *bp = row_ptr4 + b * 136;\n"
+"            float d = half_to_float(*(const half_raw *)bp);\n"
+"            unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
+"            const unsigned char *scales_l = bp + 4;\n"
+"            const unsigned char *qs = bp + 8 + ib * 16;\n"
+"            int ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4);\n"
+"            float dl = d * (float)(ls - 32);\n"
+"            const float *xb = x + b * 256 + ib * 32;\n"
+"            for (int j = 0; j < 16; j++) {\n"
+"                sum4 += dl * (float)kvalues_iq4nl_dev[qs[j] & 0xf] * xb[j];\n"
+"                sum4 += dl * (float)kvalues_iq4nl_dev[qs[j] >>  4] * xb[j + 16];\n"
+"            }\n"
+"        }\n"
+"        for (int o = 16; o > 0; o >>= 1) sum4 += __shfl_down(sum4, o);\n"
+"        if (lane == 0) atomicAdd(&accum[row], ew[slot] * sum4);\n"
+"        return;\n"
+"    }\n"
 "    int row_bytes = nb * 110;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    int G = nb * 32;\n"
@@ -3659,14 +3681,17 @@ static const char *hip_kernel_source =
 "/* ---- moe_router_fused: per-block expert dot, last block does topK+softmax. */\n"
 "/* grid = ne+1 blocks x 256 thr. Block ne = shared-gate dot + sigmoid. Counter */\n"
 "/* must be 0 before launch; the topk block resets it for the next layer.       */\n"
-"__global__ void moe_router_fused(const float *gate_w, const float *sgate_w,\n"
+"__global__ void moe_router_fused(const unsigned short *gate_w, const unsigned short *sgate_w,\n"
 "        const float *x, int ne, int K, int n_cols,\n"
 "        float *logits, int *out_idx, float *out_w, float *shared_scale,\n"
 "        unsigned int *counter) {\n"
 "    int e = blockIdx.x; int tid = threadIdx.x;\n"
-"    const float *wr = (e < ne) ? gate_w + (size_t)e * n_cols : sgate_w;\n"
+"    const unsigned short *wr = (e < ne) ? gate_w + (size_t)e * n_cols : sgate_w;\n"
 "    float p = 0.0f;\n"
-"    for (int j = tid; j < n_cols; j += blockDim.x) p += wr[j] * x[j];\n"
+"    for (int j = tid; j < n_cols; j += blockDim.x) {\n"
+"        unsigned int b16 = (unsigned int)wr[j] << 16; float w; __builtin_memcpy(&w, &b16, 4);\n"
+"        p += w * x[j];\n"
+"    }\n"
 "    for (int o = 16; o > 0; o >>= 1) p += __shfl_down(p, o);\n"
 "    __shared__ float ws[8];\n"
 "    if ((tid & 31) == 0) ws[tid >> 5] = p;\n"
@@ -5466,6 +5491,8 @@ typedef struct {
     /* MoE fields */
     int is_moe;
     void *moe_gate_w;
+    void *moe_gate_w_bf16;        /* bf16 router weights (fused decode) */
+    void *moe_shared_gate_w_bf16;
     int moe_gate_rows, moe_gate_cols;
     void *moe_gate_exps_w;
     void *moe_up_exps_w;
@@ -6105,6 +6132,26 @@ static int upload_f16_matrix(void **d_ptr, const qtensor *t) {
     return 0;
 }
 
+static int upload_norm_bf16(void **d_ptr, const qtensor *t, int n) {
+    if (!t->data) { *d_ptr = NULL; return 0; }
+    float *buf = (float *)malloc(n * sizeof(float));
+    if (!buf) return -1;
+    dequant_row(t->type, t->data, buf, n);
+    uint16_t *h = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!h) { free(buf); return -1; }
+    for (int i = 0; i < n; i++) {
+        uint32_t bits; memcpy(&bits, &buf[i], 4);
+        uint32_t r = bits + 0x7fff + ((bits >> 16) & 1);
+        h[i] = (uint16_t)(r >> 16);
+    }
+    free(buf);
+    if (hipMalloc(d_ptr, n * 2) != hipSuccess) { free(h); return -1; }
+    hipError_t err = hipMemcpy(*d_ptr, h, n * 2, hipMemcpyHostToDevice);
+    free(h);
+    if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
+    return 0;
+}
+
 static int upload_norm_f32(void **d_ptr, const qtensor *t, int n) {
     if (!t->data) { *d_ptr = NULL; return 0; }
     float *buf = (float *)malloc(n * sizeof(float));
@@ -6725,6 +6772,7 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             t = hllm_load_tensor(gguf, name, 1);
             cl->moe_gate_rows = t.n_rows; cl->moe_gate_cols = t.n_cols;
             if (upload_norm_f32(&cl->moe_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_bf16(&cl->moe_gate_w_bf16, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
@@ -6748,6 +6796,7 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
             if (upload_norm_f32(&cl->moe_shared_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_bf16(&cl->moe_shared_gate_w_bf16, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
@@ -7989,9 +8038,10 @@ static inline void launch_moe_down_accum(hip_llm_runner *r, hip_layer *cl, int n
                                          void *shd) {
     int n_embd = r->n_embd, eff = r->expert_ff;
     long long stride = (long long)cl->moe_exp_stride_d;
+    int dtype = (cl->moe_down_exps_type == GGML_TYPE_IQ4_XS) ? 1 : 0;
     void *args[] = { &r->d_moe_accum, &cl->moe_down_exps_w, &r->d_moe_act8,
                      &n_embd, &eff, &r->d_moe_idx, &r->d_moe_w, &stride,
-                     &n_slots, &shd, &r->d_shared_scale };
+                     &n_slots, &shd, &r->d_shared_scale, &dtype };
     LAUNCH(r->fn_moe_down_accum_iq3s, (n_embd + 7) / 8, n_slots, 1, 256, 1, 1, 0, r->stream, args);
 }
 /* Expert-indexed DP4A matvec for IQ2_S/IQ3_S; activation pre-quantized to (qs,scale). */
@@ -8131,13 +8181,13 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
   if (r->moe_dev_dispatch_ok && r->moe_fused_decode && r->n_experts <= 256 &&
       cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
       cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
-      cl->moe_down_exps_type == GGML_TYPE_IQ3_S &&
+      (cl->moe_down_exps_type == GGML_TYPE_IQ3_S || cl->moe_down_exps_type == GGML_TYPE_IQ4_XS) &&
       shared_expert_ff == expert_ff &&
       cl->moe_shared_gate_type == GGML_TYPE_Q6_K &&
       cl->moe_shared_up_type   == GGML_TYPE_Q6_K &&
       cl->moe_shared_down_type == GGML_TYPE_Q6_K) {
       int ne_ = n_experts, K_ = n_experts_used, nc_ = n_embd;
-      void *a[] = { &cl->moe_gate_w, &cl->moe_shared_gate_w, &r->d_xb,
+      void *a[] = { &cl->moe_gate_w_bf16, &cl->moe_shared_gate_w_bf16, &r->d_xb,
                     &ne_, &K_, &nc_, &r->d_router_logits, &r->d_moe_idx, &r->d_moe_w,
                     &r->d_shared_scale, &r->d_router_counter };
       LAUNCH(r->fn_moe_router_fused, ne_ + 1, 1, 1, 256, 1, 1, 0, r->stream, a);
