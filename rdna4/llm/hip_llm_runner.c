@@ -5607,6 +5607,7 @@ struct hip_llm_runner {
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
     hipFunction_t fn_deltanet_step_warp_f32; /* decode: warp-per-row deltanet */
+    int moe_add_pending;                    /* decode: pending x += d_moe_accum fold */
     hipFunction_t fn_deltanet_step_batch_warp_f32; /* prefill: warp-per-row M-step */
     unsigned int *d_router_counter;
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
@@ -8531,8 +8532,14 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
     float eps      = r->rms_norm_eps;
     hip_layer *cl  = &r->layers[l];
 
-    /* Pre-attention RMSNorm */
-    launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
+    /* Pre-attention RMSNorm; fused with pending MoE residual from previous layer. */
+    if (r->moe_add_pending) {
+        void *a[] = { &r->d_x, &r->d_moe_accum, &r->d_xb, &cl->attn_norm_w, &n_embd, &eps };
+        LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, a);
+        r->moe_add_pending = 0;
+    } else {
+        launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
+    }
 
         if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
@@ -8676,7 +8683,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
         if (cl->is_moe) {
             forward_moe_ffn(r, cl);
-            launch_add(r, r->d_x, r->d_moe_accum, n_embd);
+            r->moe_add_pending = 1;   /* folded into next layer's pre-attn norm */
             goto ffn_done;
         } else {
             /* Dense FFN */
@@ -8734,6 +8741,7 @@ static void forward_blocks_body(hip_llm_runner *r) {
         }
     }
     /* Final RMSNorm */
+    if (r->moe_add_pending) { launch_add(r, r->d_x, r->d_moe_accum, r->n_embd); r->moe_add_pending = 0; }
     launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
 }
 
