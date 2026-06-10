@@ -1,17 +1,20 @@
 # Standalone dev harness for the IQ2_XXS MMQ port.
 NVCC = nvcc
 ARCH = sm_120
-TARGET = mmq_iq2xxs_test
+TARGETS = mmq_iq2xxs_test mmq_iq2xxs_moe_test
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): mmq_iq2xxs_test.cu iq2xxs_tables.h
-	$(NVCC) -O3 -arch=$(ARCH) -o $@ mmq_iq2xxs_test.cu
+mmq_iq2xxs_test: mmq_iq2xxs_test.cu iq2xxs_tables.h
+	$(NVCC) -O3 -arch=$(ARCH) -o $@ $<
 
-run: $(TARGET)
-	./$(TARGET)
+mmq_iq2xxs_moe_test: mmq_iq2xxs_moe_test.cu iq2xxs_tables.h
+	$(NVCC) -O3 -arch=$(ARCH) -o $@ $<
+
+run: mmq_iq2xxs_test
+	./mmq_iq2xxs_test
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
 
 .PHONY: all run clean
