@@ -19,9 +19,15 @@ prefill, commits 0abc74a…611432c). All defaults; **no hipBLASLt dependency**
 
 | test   | HIP @start | HIP now | llama.cpp | now vs llama |
 | ------ | ---------: | ------: | --------: | -----------: |
-| pp512  |  31.2 t/s | **1043 t/s** | 902 t/s | **1.16× FASTER** |
-| pp1024 |  30.9 t/s | **1541 t/s** | 883 t/s | **1.75× FASTER** |
-| tg128  |  28.7 t/s | **102.4 t/s** |  83 t/s | **1.23× FASTER** |
+| pp512  |  31.2 t/s | **1055 t/s** | 902 t/s | **1.17× FASTER** |
+| pp1024 |  30.9 t/s | **1536 t/s** | 883 t/s | **1.74× FASTER** |
+| tg128  |  28.7 t/s | **128.5 t/s** |  83 t/s | **1.55× FASTER** |
+
+Toward-210 round (102→128.5): vectorized Q6_K dot (q6k_dot4: dword ql/qh + float4 x,
+in all Q6_K kernels) 102→115; bf16 router weights 115→116; IQ4_XS slot in the fused
+MoE down (3 layers were ~40 per-expert launches each) 116→127; cross-layer
+MoE-residual+norm fusion →128.5. Decode = 61% of realistic 210 t/s roofline; rest is
+IQ grid-dequant + router topk serialization + ~0.7ms graph overhead.
 
 **Deltanet warp-ization (the peak-analysis fix):** the recurrence ran 32 blocks x 128
 threads (4096 threads = 1 wave/CU, 68 GB/s, 4 serial passes). Warp-per-state-row
