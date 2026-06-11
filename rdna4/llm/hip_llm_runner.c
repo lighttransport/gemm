@@ -2862,35 +2862,26 @@ static const char *hip_kernel_source =
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 98;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    /* G=nb*32 group decomposition: one lane per 8-element (sub-block,l) group,  */\n"
+"    /* all 32 lanes active (was nb-stride: only nb of 32 lanes active).          */\n"
+"    int G = nb * 32;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
 "        const unsigned char *bp = row_ptr + b * 98;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs = bp + 2;\n"
-"        const unsigned char *scales_and_signs = qs + 64;  /* 32 bytes */\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        int yi = 0;\n"
-"        #pragma unroll\n"
-"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
-"            unsigned int aux32 = *(const unsigned int *)(scales_and_signs + 4*ib32);\n"
-"            float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n"
-"            #pragma unroll\n"
-"            for (int l = 0; l < 4; l++) {\n"
-"                unsigned char signs = ksigns_iq2xs_dev[(aux32 >> (7*l)) & 127];\n"
-"                const unsigned char *grid1 = (const unsigned char *)&iq3xxs_grid_dev[qs[2*l+0]];\n"
-"                const unsigned char *grid2 = (const unsigned char *)&iq3xxs_grid_dev[qs[2*l+1]];\n"
-"                #pragma unroll\n"
-"                for (int j = 0; j < 4; j++) {\n"
-"                    float w0 = db * (float)grid1[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
-"                    float w1 = db * (float)grid2[j] * ((signs & (1 << (j+4))) ? -1.0f : 1.0f);\n"
-"                    partial += w0 * xb[yi+j] + w1 * xb[yi+j+4];\n"
-"                }\n"
-"                yi += 8;\n"
-"            }\n"
-"            qs += 8;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            sum += w0 * xb[j] + w1 * xb[j+4];\n"
 "        }\n"
-"        sum += partial;\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
@@ -3775,6 +3766,74 @@ static const char *hip_kernel_source =
 "    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
 "    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; xb[row] = t; }\n"
 "}\n"
+"/* Precompute per-head RMSNorm inv_mean from ssm_out ONCE (it is independent of  */\n"
+"/* the output row). One warp per head; head h owns ssm_out[h*d_state .. +d_state].*/\n"
+"__global__ void ssm_inv_mean_f32(float *inv_mean, const float *ssm_out,\n"
+"        int dt_rank, int d_state, float eps) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int head = blockIdx.x * 8 + warp_id;\n"
+"    if (head >= dt_rank) return;\n"
+"    const float *p = ssm_out + (size_t)head * d_state;\n"
+"    float ss = 0.0f;\n"
+"    for (int i = lane; i < d_state; i += 32) { float v = p[i]; ss += v * v; }\n"
+"    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down(ss, o);\n"
+"    if (lane == 0) inv_mean[head] = rsqrtf(ss / (float)d_state + eps);\n"
+"}\n"
+"/* Warp-per-row SSM-out twin: reads precomputed inv_mean[head] (no Phase-1 atomic */\n"
+"/* sum-of-squares, no __shared__/__syncthreads). q6k_dot4-style float4 loads.     */\n"
+"__global__ void fused_ssm_out_gated_q6k_mw(float *xb, const unsigned char *w_out,\n"
+"        const float *ssm_out, const float *z, const float *norm_w,\n"
+"        const float *inv_mean, int n_rows, int n_cols, int dt_rank) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = w_out + (size_t)row * row_bytes;\n"
+"    int G = nb * 16;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 4; int rem = g & 15; int half = rem >> 3; int lp = rem & 7;\n"
+"        int head = b * 2 + half;\n"
+"        if (head >= dt_rank) continue;\n"
+"        float inv_m = inv_mean[head];\n"
+"        const float *zx0 = z + b * 256 + half * 128 + lp * 4;\n"
+"        const float *nw0 = norm_w + half * 128 + lp * 4;\n"
+"        float4 zv0 = *(const float4 *)zx0, zv32 = *(const float4 *)(zx0 + 32);\n"
+"        float4 zv64 = *(const float4 *)(zx0 + 64), zv96 = *(const float4 *)(zx0 + 96);\n"
+"        float4 nwv0 = *(const float4 *)nw0, nwv32 = *(const float4 *)(nw0 + 32);\n"
+"        float4 nwv64 = *(const float4 *)(nw0 + 64), nwv96 = *(const float4 *)(nw0 + 96);\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp + half * 64 + lp * 4;\n"
+"        const unsigned char *qh = bp + 128 + half * 32 + lp * 4;\n"
+"        const signed char *sc = (const signed char *)(bp + 192 + half * 8);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        unsigned int qlo, qhi, qhv;\n"
+"        __builtin_memcpy(&qlo, ql, 4);\n"
+"        __builtin_memcpy(&qhi, ql + 32, 4);\n"
+"        __builtin_memcpy(&qhv, qh, 4);\n"
+"        int hi = (lp < 4) ? 0 : 1;\n"
+"        float sA = d * (float)sc[0 + hi], sB = d * (float)sc[2 + hi];\n"
+"        float sC = d * (float)sc[4 + hi], sD = d * (float)sc[6 + hi];\n"
+"        const float *x0 = ssm_out + b * 256 + half * 128 + lp * 4;\n"
+"        float4 xv0 = *(const float4 *)x0, xv32 = *(const float4 *)(x0 + 32);\n"
+"        float4 xv64 = *(const float4 *)(x0 + 64), xv96 = *(const float4 *)(x0 + 96);\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            int lo = (qlo >> (8*j)) & 0xFF, hi8 = (qhi >> (8*j)) & 0xFF, h2 = (qhv >> (8*j)) & 0xFF;\n"
+"            int q1 = (lo & 0xF) | ((h2 & 3) << 4); q1 -= 32;\n"
+"            int q2 = (hi8 & 0xF) | (((h2 >> 2) & 3) << 4); q2 -= 32;\n"
+"            int q3 = (lo >> 4) | (((h2 >> 4) & 3) << 4); q3 -= 32;\n"
+"            int q4 = (hi8 >> 4) | (((h2 >> 6) & 3) << 4); q4 -= 32;\n"
+"            float s0 = (&xv0.x)[j] * inv_m * (&nwv0.x)[j] * ((&zv0.x)[j] / (1.0f + __expf(-(&zv0.x)[j])));\n"
+"            float s32 = (&xv32.x)[j] * inv_m * (&nwv32.x)[j] * ((&zv32.x)[j] / (1.0f + __expf(-(&zv32.x)[j])));\n"
+"            float s64 = (&xv64.x)[j] * inv_m * (&nwv64.x)[j] * ((&zv64.x)[j] / (1.0f + __expf(-(&zv64.x)[j])));\n"
+"            float s96 = (&xv96.x)[j] * inv_m * (&nwv96.x)[j] * ((&zv96.x)[j] / (1.0f + __expf(-(&zv96.x)[j])));\n"
+"            sum += sA * q1 * s0 + sB * q2 * s32 + sC * q3 * s64 + sD * q4 * s96;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) xb[row] = sum;\n"
+"}\n"
 "/* ---- ffn_gate_up_silu_q6k: fused decode FFN gate + up matvec + SiLU (Q6_K). */\n"
 "__global__ void ffn_gate_up_silu_q6k(float *gate_out,\n"
 "        const unsigned char *gate_w, const unsigned char *up_w,\n"
@@ -3867,6 +3926,54 @@ static const char *hip_kernel_source =
 "        gate_out[row] = g * usum;\n"
 "    }\n"
 "}\n"
+"/* Warp-per-row twin: one warp owns a row, G=nb*32 (all 32 lanes active), intra- */\n"
+"/* warp reduction only (no cross-warp __shared__/__syncthreads). 8 rows/block.   */\n"
+"__global__ void ffn_gate_up_silu_iq3xxs_mw(float *gate_out,\n"
+"        const unsigned char *gate_w, const unsigned char *up_w,\n"
+"        const float *x, int n_ff, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
+"    if (row >= n_ff) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 98;\n"
+"    int G = nb * 32;\n"
+"    float gsum = 0.0f, usum = 0.0f;\n"
+"    const unsigned char *gp = gate_w + (size_t)row * row_bytes;\n"
+"    const unsigned char *up = up_w + (size_t)row * row_bytes;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        const unsigned char *bp_g = gp + b * 98;\n"
+"        const unsigned char *bp_u = up + b * 98;\n"
+"        float d_g = half_to_float(*(const half_raw *)bp_g);\n"
+"        float d_u = half_to_float(*(const half_raw *)bp_u);\n"
+"        const unsigned char *qs_g = bp_g + 2, *qs_u = bp_u + 2;\n"
+"        unsigned int aux_g = *(const unsigned int *)(bp_g + 66 + 4*sb);\n"
+"        unsigned int aux_u = *(const unsigned int *)(bp_u + 66 + 4*sb);\n"
+"        float db_g = d_g * (0.5f + (float)(aux_g >> 28)) * 0.5f;\n"
+"        float db_u = d_u * (0.5f + (float)(aux_u >> 28)) * 0.5f;\n"
+"        unsigned char sgn_g = ksigns_iq2xs_dev[(aux_g >> (7*l)) & 127];\n"
+"        unsigned char sgn_u = ksigns_iq2xs_dev[(aux_u >> (7*l)) & 127];\n"
+"        const unsigned char *g1_g = (const unsigned char *)&iq3xxs_grid_dev[qs_g[8*sb+2*l]];\n"
+"        const unsigned char *g2_g = (const unsigned char *)&iq3xxs_grid_dev[qs_g[8*sb+2*l+1]];\n"
+"        const unsigned char *g1_u = (const unsigned char *)&iq3xxs_grid_dev[qs_u[8*sb+2*l]];\n"
+"        const unsigned char *g2_u = (const unsigned char *)&iq3xxs_grid_dev[qs_u[8*sb+2*l+1]];\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float xv0 = xb[j], xv1 = xb[j+4];\n"
+"            float wg0 = db_g * (float)g1_g[j] * ((sgn_g & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float wg1 = db_g * (float)g2_g[j] * ((sgn_g & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            float wu0 = db_u * (float)g1_u[j] * ((sgn_u & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float wu1 = db_u * (float)g2_u[j] * ((sgn_u & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            gsum += wg0 * xv0 + wg1 * xv1;\n"
+"            usum += wu0 * xv0 + wu1 * xv1;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) { gsum += __shfl_down(gsum, o); usum += __shfl_down(usum, o); }\n"
+"    if (lane == 0) {\n"
+"        float g = gsum / (1.0f + __expf(-gsum));\n"
+"        gate_out[row] = g * usum;\n"
+"    }\n"
+"}\n"
 "/* ---- matvec_down_residual_iq3xxs: fused down matvec + residual for IQ3_XXS. */\n"
 "__global__ void matvec_down_residual_iq3xxs(float *x, const unsigned char *down_w,\n"
 "        const float *gate, int n_rows, int n_cols) {\n"
@@ -3900,6 +4007,73 @@ static const char *hip_kernel_source =
 "    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
 "    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
 "    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; x[row] += t; }\n"
+"}\n"
+"/* Warp-per-row twin (G=nb*32, intra-warp reduction, 8 rows/block). */\n"
+"__global__ void matvec_down_residual_iq3xxs_mw(float *x, const unsigned char *down_w,\n"
+"        const float *gate, int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = down_w + (size_t)row * row_bytes;\n"
+"    int G = nb * 32;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *gb = gate + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float gv0 = gb[j], gv1 = gb[j+4];\n"
+"            float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            sum += w0 * gv0 + w1 * gv1;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) x[row] += sum;\n"
+"}\n"
+"/* Split-K warp-per-row twin: grid.y = KSPLIT warps cooperate per row over the   */\n"
+"/* nb-block range, atomicAdd partials into x[row] (residual already resident).    */\n"
+"/* Raises block count for low-row matvecs (down: 5120 rows) to fill the GPU.      */\n"
+"__global__ void matvec_down_residual_iq3xxs_splitk(float *x, const unsigned char *down_w,\n"
+"        const float *gate, int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int ks = blockIdx.y; int KS = gridDim.y;\n"
+"    int nb = n_cols / 256;\n"
+"    int b0 = ks * nb / KS, b1 = (ks + 1) * nb / KS;\n"
+"    int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = down_w + (size_t)row * row_bytes;\n"
+"    int sb = lane >> 2, l = lane & 3;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = b0; b < b1; b++) {\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *gb = gate + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float gv0 = gb[j], gv1 = gb[j+4];\n"
+"            float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            sum += w0 * gv0 + w1 * gv1;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) atomicAdd(&x[row], sum);\n"
 "}\n"
 "/* ---- matvec_qkv_iq3xxs: fused attn Q/K/V IQ3_XXS matvecs (one launch). */\n"
 "__global__ void matvec_qkv_iq3xxs(float *q, float *k, float *v,\n"
@@ -6499,14 +6673,22 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
     hipFunction_t fn_ffn_gate_up_silu_q6k;  /* decode: fused FFN gate+up+SiLU (Q6_K) */
     hipFunction_t fn_ffn_gate_up_silu_iq3xxs; /* decode: fused FFN gate+up+SiLU (IQ3_XXS) */
+    hipFunction_t fn_ffn_gate_up_silu_iq3xxs_mw; /* warp-per-row twin */
     hipFunction_t fn_matvec_down_residual_q6k; /* decode: fused down matvec + residual (Q6_K) */
     hipFunction_t fn_matvec_down_residual_iq3xxs; /* decode: fused down matvec + residual (IQ3_XXS) */
+    hipFunction_t fn_matvec_down_residual_iq3xxs_mw; /* warp-per-row twin */
+    hipFunction_t fn_matvec_down_residual_iq3xxs_splitk; /* split-K warp-per-row twin */
+    int down_ksplit;                        /* LLM_DOWN_KSPLIT (default 1) */
     hipFunction_t fn_matvec_qkv_iq3xxs;       /* decode: fused attn Q/K/V IQ3_XXS matvecs */
     hipFunction_t fn_matvec_out_gated_iq3xxs; /* decode: fused sigmoid_mul + output matvec (IQ3_XXS) */
     hipFunction_t fn_ssm_matvec4_iq3xxs;      /* decode: fused 4 SSM input matvecs (IQ3_XXS) */
     hipFunction_t fn_fused_ssm_out_gated_iq3xxs; /* decode: fused SSM out + gated RMSNorm (IQ3_XXS) */
     hipFunction_t fn_matvec_out_gated_q6k;     /* decode: fused gated output matvec (Q6_K) */
     hipFunction_t fn_fused_ssm_out_gated_q6k;  /* decode: fused SSM out + gated RMSNorm (Q6_K) */
+    hipFunction_t fn_fused_ssm_out_gated_q6k_mw; /* warp-per-row twin (precomputed inv_mean) */
+    hipFunction_t fn_ssm_inv_mean_f32;         /* precompute per-head RMSNorm inv_mean */
+    void *d_ssm_inv_mean;                       /* scratch: dt_rank floats */
+    int ssm_out_mw;                             /* LLM_SSM_OUT_MW */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
@@ -6515,6 +6697,8 @@ struct hip_llm_runner {
     hipFunction_t fn_deltanet_step_batch_warp_f32; /* prefill: warp-per-row M-step */
     unsigned int *d_router_counter;
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
+    int ffn_iq3_mw;                         /* LLM_FFN_IQ3_MW: warp-per-row FFN IQ3_XXS */
+    int mw_threads;                         /* LLM_MW_THREADS: threads/block for warp-per-row (default 256) */
     hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
     hipFunction_t fn_gemm_bf16_own_db;      /* double-buffered LDS variant */
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
@@ -6889,14 +7073,19 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_qkv_q6k);
     GET_FUNC(ffn_gate_up_silu_q6k);
     GET_FUNC(ffn_gate_up_silu_iq3xxs);
+    GET_FUNC(ffn_gate_up_silu_iq3xxs_mw);
     GET_FUNC(matvec_down_residual_q6k);
     GET_FUNC(matvec_down_residual_iq3xxs);
+    GET_FUNC(matvec_down_residual_iq3xxs_mw);
+    GET_FUNC(matvec_down_residual_iq3xxs_splitk);
     GET_FUNC(matvec_qkv_iq3xxs);
     GET_FUNC(matvec_out_gated_iq3xxs);
     GET_FUNC(ssm_matvec4_iq3xxs);
     GET_FUNC(fused_ssm_out_gated_iq3xxs);
     GET_FUNC(matvec_out_gated_q6k);
     GET_FUNC(fused_ssm_out_gated_q6k);
+    GET_FUNC(fused_ssm_out_gated_q6k_mw);
+    GET_FUNC(ssm_inv_mean_f32);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
     GET_FUNC(moe_router_fused);
@@ -7044,6 +7233,14 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     { const char *e = getenv("LLM_MOE_INT8");
       if (e && atoi(e)) { r->moe_int8 = 1; } }
     r->ssm_fused_decode = 1;
+    r->ffn_iq3_mw = 1;  /* warp-per-row gate_up: 313->400 GB/s, validated */
+    { const char *e = getenv("LLM_FFN_IQ3_MW"); if (e) r->ffn_iq3_mw = atoi(e) != 0; }
+    r->mw_threads = 256;
+    { const char *e = getenv("LLM_MW_THREADS"); if (e) { int t = atoi(e); if (t==64||t==128||t==256||t==512) r->mw_threads = t; } }
+    r->down_ksplit = 1;
+    { const char *e = getenv("LLM_DOWN_KSPLIT"); if (e) { r->down_ksplit = atoi(e); if (r->down_ksplit < 1) r->down_ksplit = 1; } }
+    r->ssm_out_mw = 1;  /* warp-per-row + precomputed inv_mean: 240->404 GB/s, validated */
+    { const char *e = getenv("LLM_SSM_OUT_MW"); if (e) r->ssm_out_mw = atoi(e) != 0; }
     { const char *e = getenv("LLM_SSM_FUSED"); if (e) r->ssm_fused_decode = atoi(e) != 0; }
     r->gemm_own = 1;  /* self-owned WMMA GEMM default (faster than blaslt path) */
     { const char *e = getenv("LLM_GEMM"); if (e && strcmp(e, "blaslt") == 0) r->gemm_own = 0; }
@@ -7899,6 +8096,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipMalloc(&r->d_ssm_Q_exp,     dt_rank * d_state * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ssm_K_exp,     dt_rank * d_state * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ssm_out,       d_inner * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_ssm_inv_mean,  (dt_rank > 0 ? dt_rank : 256) * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ssm_conv_out,  r->ssm_qkv_dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_attn_gate,     q_dim * sizeof(float)));
     }
@@ -9712,7 +9910,16 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                                 r->d_ssm_Q_exp, r->d_ssm_K_exp, V_ptr,
                                 r->d_ssm_alpha, r->d_ssm_beta, dt_rank, d_state);
 
-             if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_Q6_K) {
+             if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_Q6_K && r->ssm_out_mw) {
+                int nr = cl->ssm_out_rows;
+                int nc = cl->ssm_out_cols;
+                /* precompute per-head inv_mean once (independent of output row) */
+                void *ia[] = { &r->d_ssm_inv_mean, &r->d_ssm_out, &dt_rank, &d_state, &eps };
+                LAUNCH(r->fn_ssm_inv_mean_f32, (dt_rank + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, ia);
+                void *a[] = { &r->d_xb, &cl->ssm_out_w, &r->d_ssm_out, &r->d_ssm_z, &cl->ssm_norm_w,
+                              &r->d_ssm_inv_mean, &nr, &nc, &dt_rank };
+                LAUNCH(r->fn_fused_ssm_out_gated_q6k_mw, (nr + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_Q6_K) {
                 int nr = cl->ssm_out_rows;
                 int nc = cl->ssm_out_cols;
                 void *a[] = { &r->d_xb, &cl->ssm_out_w, &r->d_ssm_out, &r->d_ssm_z, &cl->ssm_norm_w,
@@ -9864,7 +10071,11 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int n_ff = cl->ffn_gate_rows;
                 int nc = cl->ffn_gate_cols;
                 void *a[] = { &r->d_gate, &cl->ffn_gate_w, &cl->ffn_up_w, &r->d_xb, &n_ff, &nc };
-                LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
+                if (r->ffn_iq3_mw) {
+                    int rpb = r->mw_threads / 32;
+                    LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs_mw, (n_ff + rpb - 1) / rpb, 1, 1, (unsigned)r->mw_threads, 1, 1, 0, r->stream, a);
+                } else
+                    LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                               cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
@@ -9881,7 +10092,12 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nr = cl->ffn_down_rows; /* n_embd */
                 int nc = cl->ffn_down_cols; /* n_ff */
                 void *a[] = { &r->d_x, &cl->ffn_down_w, &r->d_gate, &nr, &nc };
-                LAUNCH(r->fn_matvec_down_residual_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
+                /* down warp-per-row is neutral-to-worse (5120 rows underfill);
+                 * keep the original block-per-row unless split-K is requested. */
+                if (r->ffn_iq3_mw && r->down_ksplit > 1)
+                    LAUNCH(r->fn_matvec_down_residual_iq3xxs_splitk, (nr + 7) / 8, (unsigned)r->down_ksplit, 1, 256, 1, 1, 0, r->stream, a);
+                else
+                    LAUNCH(r->fn_matvec_down_residual_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                               cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
