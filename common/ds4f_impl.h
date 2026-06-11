@@ -3890,6 +3890,46 @@ static void ds4f_hc_sinkhorn(const float *mixes, const float *scale, const float
     }
 }
 
+/* DS4F_HC_PAR (WS1): pool-parallelize the mHC collapse/expand loops (the per-d-independent
+ * scalar work run on tid0 between pool dispatches, ~35% of real-gen decode). Default off.
+ * Splits the hidden dim C into contiguous per-thread ranges -- each output element is an
+ * independent reduction over k in fixed order => BIT-EXACT to the serial path (mirrors the
+ * validated ds4f_q_norm_rope_par / DS4F_TB2ROPE_PAR pattern). The RMS reduction + matvec +
+ * sinkhorn are left untouched (RMS would reassociate; matvec is already a pool_run). */
+static int ds4f_hc_par = -1;             /* 1=pool-parallel, 0=serial ref (default) */
+static inline int ds4f_hc_par_on(void) {
+    if (ds4f_hc_par < 0) { const char *e = getenv("DS4F_HC_PAR"); ds4f_hc_par = e ? atoi(e) : 0; }
+    return ds4f_hc_par;
+}
+/* collapse: y[d] = Σ_k pre[k]·x4[k*C+d]  (used by hc_pre and hc_head_p) */
+typedef struct { const float *x4, *pre; float *y; int hc, C; } ds4f_hccol_task;
+static void ds4f_hccol_worker(void *arg, int tid, int nthr) {
+    ds4f_hccol_task *T = (ds4f_hccol_task *)arg;
+    int C = T->C, hc = T->hc;
+    int d0 = (int)((long)C*tid/nthr), d1 = (int)((long)C*(tid+1)/nthr);
+    for (int d = d0; d < d1; d++) {
+        float a = 0.f;
+        for (int k = 0; k < hc; k++) a += T->pre[k]*T->x4[(size_t)k*C+d];
+        T->y[d] = a;
+    }
+}
+/* expand: x4[k,d] = post[k]·f[d] + Σ_j comb[j,k]·resid[j,d]  (used by hc_post). Loop nesting
+ * identical to the serial body below => bit-exact per (k,d). */
+typedef struct { float *x4; const float *resid, *f, *post, *comb; int hc, C; } ds4f_hcpost_task;
+static void ds4f_hcpost_worker(void *arg, int tid, int nthr) {
+    ds4f_hcpost_task *T = (ds4f_hcpost_task *)arg;
+    int C = T->C, hc = T->hc;
+    int d0 = (int)((long)C*tid/nthr), d1 = (int)((long)C*(tid+1)/nthr);
+    for (int k = 0; k < hc; k++) {
+        float pk = T->post[k]; float *ok = T->x4 + (size_t)k*C;
+        for (int d = d0; d < d1; d++) ok[d] = pk*T->f[d];
+        for (int j = 0; j < hc; j++) {
+            float cjk = T->comb[j*hc+k]; const float *rj = T->resid + (size_t)j*C;
+            for (int d = d0; d < d1; d++) ok[d] += cjk*rj[d];
+        }
+    }
+}
+
 /* hc_pre: x4[hc*C] (4 streams) -> collapsed y[C]; also yields post[hc], comb[hc*hc].
  * mixes = (fn @ flatten(x4)) * rsqrt(mean(x4^2)+norm_eps); sinkhorn; y[d]=Σ_k pre[k]·x4[k,d]. */
 static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
@@ -3905,7 +3945,10 @@ static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
     for (int mm = 0; mm < mix_hc; mm++) mixes[mm] *= rsq;
     float pre[16];
     ds4f_hc_sinkhorn(mixes, scale, base, hc, c->hc_iters, c->hc_eps, pre, post, comb);
-    for (int d = 0; d < C; d++) {
+    if (ds4f_hc_par_on()) {
+        ds4f_hccol_task T = { x4, pre, y, hc, C };
+        ds4f_pool_run(m->pool, ds4f_hccol_worker, &T);
+    } else for (int d = 0; d < C; d++) {
         float a = 0.f; for (int k = 0; k < hc; k++) a += pre[k]*x4[(size_t)k*C+d];
         y[d] = a;
     }
@@ -3916,6 +3959,11 @@ static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
 static void ds4f_hc_post(ds4f_model *m, float *x4, const float *resid, const float *f,
                          const float *post, const float *comb) {
     int hc = m->cfg.hc_mult, C = m->cfg.hidden;
+    if (ds4f_hc_par_on()) {
+        ds4f_hcpost_task T = { x4, resid, f, post, comb, hc, C };
+        ds4f_pool_run(m->pool, ds4f_hcpost_worker, &T);
+        return;
+    }
     for (int k = 0; k < hc; k++) {
         float pk = post[k]; float *ok = x4 + (size_t)k*C;
         for (int d = 0; d < C; d++) ok[d] = pk*f[d];
@@ -3942,7 +3990,10 @@ static void ds4f_hc_head_p(ds4f_model *m, const float *x4, float *y,
     float pre[16];
     for (int k = 0; k < hc; k++)
         pre[k] = ds4f_sigmoidf(mixes[k]*rsq*hc_scale[0] + hc_base[k]) + c->hc_eps;
-    for (int d = 0; d < C; d++) {
+    if (ds4f_hc_par_on()) {
+        ds4f_hccol_task T = { x4, pre, y, hc, C };
+        ds4f_pool_run(m->pool, ds4f_hccol_worker, &T);
+    } else for (int d = 0; d < C; d++) {
         float a = 0.f; for (int k = 0; k < hc; k++) a += pre[k]*x4[(size_t)k*C+d];
         y[d] = a;
     }
