@@ -1760,7 +1760,7 @@ static inline void matvec_bf16_8x3_pv_acc(float *acc0, float *acc1, float *acc2,
  * giving ~2× at the model's bandwidth regime. */
 static inline void matvec_sdot_8row(float *dst,
                                      const uint8_t *group, /* points at block 0 */
-                                     const int8_t *xq, const uint16_t *xscale,
+                                     const int8_t *xq, const float *xscale,
                                      int K) {
     svbool_t pg = svptrue_b32();
     svbool_t pb = svptrue_b8();
@@ -1773,7 +1773,7 @@ static inline void matvec_sdot_8row(float *dst,
         const uint8_t *blk = group + (size_t)b * 528;
         const uint16_t *scl = (const uint16_t *)blk;
         const int8_t *qs    = (const int8_t *)(blk + 16);
-        float xs = ggml_fp16_to_fp32(xscale[b]);
+        float xs = xscale[b];   /* fp32 activation scale (WS6: fp16 overflowed to Inf for amax>~8.3e6 -> 0*Inf=NaN) */
         svint8_t xv = svld1_s8(pb, xq + (size_t)b * 64);
         #define SDOT_ROW(R, ACC)                                              \
             do {                                                              \
@@ -1802,9 +1802,9 @@ static inline void matvec_sdot_8row(float *dst,
  * the SAME order as the single-token kernel => results match matvec_sdot_8row. */
 static inline void matvec_sdot_8row_3x(float *dst0, float *dst1, float *dst2,
                                        const uint8_t *group,
-                                       const int8_t *xq0, const uint16_t *xs0,
-                                       const int8_t *xq1, const uint16_t *xs1,
-                                       const int8_t *xq2, const uint16_t *xs2,
+                                       const int8_t *xq0, const float *xs0,
+                                       const int8_t *xq1, const float *xs1,
+                                       const int8_t *xq2, const float *xs2,
                                        int K) {
     svbool_t pg = svptrue_b32();
     svbool_t pb = svptrue_b8();
@@ -1819,9 +1819,9 @@ static inline void matvec_sdot_8row_3x(float *dst0, float *dst1, float *dst2,
         const uint8_t *bp = group + (size_t)blk * 528;
         const uint16_t *scl = (const uint16_t *)bp;
         const int8_t *qs    = (const int8_t *)(bp + 16);
-        float s0 = ggml_fp16_to_fp32(xs0[blk]);
-        float s1 = ggml_fp16_to_fp32(xs1[blk]);
-        float s2 = ggml_fp16_to_fp32(xs2[blk]);
+        float s0 = xs0[blk];   /* fp32 activation scale (WS6 overflow fix) */
+        float s1 = xs1[blk];
+        float s2 = xs2[blk];
         svint8_t xv0 = svld1_s8(pb, xq0 + (size_t)blk*64);
         svint8_t xv1 = svld1_s8(pb, xq1 + (size_t)blk*64);
         svint8_t xv2 = svld1_s8(pb, xq2 + (size_t)blk*64);
