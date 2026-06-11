@@ -9371,7 +9371,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 void *a[] = { &r->d_ssm_qkv, &r->d_ssm_z, &r->d_ssm_alpha, &r->d_ssm_beta,
                               &cl->ssm_qkv_w, &cl->ssm_gate_w, &cl->ssm_alpha_w, &cl->ssm_beta_w,
                               &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
-                LAUNCH(r->fn_ssm_matvec4_q6k, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 64, 1, 1, 0, r->stream, a);
+                LAUNCH(r->fn_ssm_matvec4_q6k, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
             launch_matvec_auto(r, r->d_ssm_qkv,   cl->ssm_qkv_w,   r->d_xb, cl->ssm_qkv_rows,   cl->ssm_qkv_cols,   cl->ssm_qkv_type);
             launch_matvec_auto(r, r->d_ssm_z,      cl->ssm_gate_w,  r->d_xb, cl->ssm_gate_rows,  cl->ssm_gate_cols,  cl->ssm_gate_type);
@@ -9416,7 +9416,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nc = cl->ssm_out_cols;
                 void *a[] = { &r->d_xb, &cl->ssm_out_w, &r->d_ssm_out, &r->d_ssm_z, &cl->ssm_norm_w,
                               &nr, &nc, &dt_rank, &d_state, &eps };
-                LAUNCH(r->fn_fused_ssm_out_gated_q6k, nr, 1, 1, 64, 1, 1, 0, r->stream, a);
+                LAUNCH(r->fn_fused_ssm_out_gated_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_gated_rmsnorm_silu(r, r->d_ssm_out, r->d_ssm_z, cl->ssm_norm_w,
                                          dt_rank, d_state, eps);
@@ -9433,7 +9433,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nc = cl->attn_q_cols;
                 void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
-                LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 64, 1, 1, 0, r->stream, a);
+                LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
             launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
                               cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
@@ -9464,7 +9464,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nr = cl->attn_output_rows;
                 int nc = cl->attn_output_cols;
                 void *a[] = { &r->d_xb, &cl->attn_output_w, &r->d_xb2, &r->d_attn_gate, &nr, &nc };
-                LAUNCH(r->fn_matvec_out_gated_q6k, nr, 1, 1, 64, 1, 1, 0, r->stream, a);
+                LAUNCH(r->fn_matvec_out_gated_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate, q_dim_local);
                 launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
@@ -9480,7 +9480,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nc = cl->attn_q_cols;
                 void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
-                LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 64, 1, 1, 0, r->stream, a);
+                LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
                 launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
@@ -9530,7 +9530,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int n_ff = cl->ffn_gate_rows;
                 int nc = cl->ffn_gate_cols;
                 void *a[] = { &r->d_gate, &cl->ffn_gate_w, &cl->ffn_up_w, &r->d_xb, &n_ff, &nc };
-                LAUNCH(r->fn_ffn_gate_up_silu_q6k, n_ff, 1, 1, 64, 1, 1, 0, r->stream, a);
+                LAUNCH(r->fn_ffn_gate_up_silu_q6k, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                               cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
@@ -9542,7 +9542,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nr = cl->ffn_down_rows; /* n_embd */
                 int nc = cl->ffn_down_cols; /* n_ff */
                 void *a[] = { &r->d_x, &cl->ffn_down_w, &r->d_gate, &nr, &nc };
-                LAUNCH(r->fn_matvec_down_residual_q6k, nr, 1, 1, 64, 1, 1, 0, r->stream, a);
+                LAUNCH(r->fn_matvec_down_residual_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                               cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
