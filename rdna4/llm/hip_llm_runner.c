@@ -5178,7 +5178,7 @@ static const char *hip_kernel_source =
 "}\n"
 "/* Per-call dequant of Q8_0 to BF16. The runner uploads Q8_0 in a PADDED 36-byte  */\n"
 "/* block: [d(f16) 2B][pad 2B][int8 qs[32]] (see upload_q8_0_raw / matvec_q8_0_f32).*/\n"
-"/* Same (n_rows, n_cols/256, 256-thread) launch; each thread maps to its element. */\n"
+"/* Same (n_rows, ceil(n_cols/256), 256-thread) launch; one element/thread. */\n"
 "__global__ void dequant_q8_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
 "                                       int n_rows, int n_cols) {\n"
 "    int row = blockIdx.x; int b = blockIdx.y;\n"
@@ -9080,7 +9080,6 @@ static inline int launch_dequant_##qname##_to_bf16(hip_llm_runner *r,           
     if (e != hipSuccess) { fprintf(stderr, "hip_llm: dequant_" #qname " launch failed: %d\n", e); return -1; } \
     return 0;                                                                     \
 }
-DEFINE_LAUNCH_KQ_DEQUANT(q8_0)
 DEFINE_LAUNCH_KQ_DEQUANT(q2_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q3_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q4_K)
@@ -9095,6 +9094,21 @@ DEFINE_LAUNCH_KQ_DEQUANT(iq1_s)
 DEFINE_LAUNCH_KQ_DEQUANT(tq1_0)
 DEFINE_LAUNCH_KQ_DEQUANT(iq2_xxs)
 #undef DEFINE_LAUNCH_KQ_DEQUANT
+
+static inline int launch_dequant_q8_0_to_bf16(hip_llm_runner *r,
+                                              void *dst, void *mat,
+                                              int n_rows, int n_cols) {
+    if ((n_cols % 32) != 0) return -1;
+    void *args[] = { &dst, &mat, &n_rows, &n_cols };
+    int chunks = (n_cols + 255) / 256;
+    hipError_t e = LAUNCH(r->fn_dequant_q8_0_to_bf16, n_rows, chunks, 1,
+                          256, 1, 1, 0, r->stream, args);
+    if (e != hipSuccess) {
+        fprintf(stderr, "hip_llm: dequant_q8_0 launch failed: %d\n", e);
+        return -1;
+    }
+    return 0;
+}
 
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
  * dequant into r->d_wbuf_bf16 if the weight is not F16-pre-converted.
@@ -9165,7 +9179,7 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             return r->d_wbuf_bf16;
         }
         case GGML_TYPE_Q8_0:
-            launch_dequant_q8_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            if (launch_dequant_q8_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q2_K:
             launch_dequant_q2_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
@@ -11493,6 +11507,7 @@ static int quant_matvec_block_info(int weight_type, int *blk_elems, int *blk_byt
     *blk_elems = 0;
     *blk_bytes = 0;
     switch (weight_type) {
+        case GGML_TYPE_Q8_0:    *blk_elems = 32;  *blk_bytes = 36;  break;
         case GGML_TYPE_Q2_K:    *blk_elems = 256; *blk_bytes = 84;  break;
         case GGML_TYPE_Q3_K:    *blk_elems = 256; *blk_bytes = 110; break;
         case GGML_TYPE_Q4_K:    *blk_elems = 256; *blk_bytes = 144; break;
