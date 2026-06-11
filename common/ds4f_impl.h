@@ -182,7 +182,7 @@ static inline uint16_t ds4f_f32_bf16(float f){ uint32_t u; memcpy(&u,&f,4); retu
  * matvec_sdot_8row consumes. Deterministic (absmax + round-to-nearest via svcvt,
  * same on every rank => lockstep preserved). K must be a multiple of 64. Mirrors
  * transformer.h's tf_quant_x_sdot_blocks (the proven sibling implementation). */
-static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, uint16_t *xs) {
+static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, float *xs) {
     svbool_t pg = svptrue_b32();
     svint32_t qlo = svdup_s32(-127), qhi = svdup_s32(127);
     int nb = K / 64;
@@ -194,7 +194,9 @@ static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, uin
                                      svmax_x(pg, svabs_x(pg, v2), svabs_x(pg, v3)));
         float amax = svmaxv_f32(pg, mx);
         float scale = amax / 127.0f, inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-        xs[b] = ggml_fp32_to_fp16(scale);
+        xs[b] = scale;   /* WS6: fp32 scale. fp16 overflowed to +Inf for amax > 127*65504 (~8.3e6)
+                          * -> dequant sc=ws*Inf=Inf -> 0*Inf=NaN in zero-dot lanes. int8 xq unchanged
+                          * (inv is fp32) so this is a pure scale-precision/overflow fix. */
         svfloat32_t vinv = svdup_f32(inv);
         int8_t *q = xq + (size_t)b * 64;
         #define DS4F_QX(V, OFF) do {                                          \
@@ -208,14 +210,14 @@ static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, uin
 }
 /* thread-local scratch for M-token activation quant (grow-on-demand) */
 static __thread int8_t   *ds4f_xq_buf = NULL;
-static __thread uint16_t *ds4f_xs_buf = NULL;
+static __thread float    *ds4f_xs_buf = NULL;   /* WS6: fp32 activation scale (was fp16 -> overflow NaN) */
 static __thread size_t    ds4f_xq_cap = 0;   /* in (M*K) int8 elems */
-static inline void ds4f_q8_xscratch(int M, int K, int8_t **xq, uint16_t **xs) {
+static inline void ds4f_q8_xscratch(int M, int K, int8_t **xq, float **xs) {
     size_t need = (size_t)M * K;
     if (need > ds4f_xq_cap) {
         free(ds4f_xq_buf); free(ds4f_xs_buf);
         ds4f_xq_buf = (int8_t *)malloc(need);
-        ds4f_xs_buf = (uint16_t *)malloc((size_t)M * (K / 64) * sizeof(uint16_t));
+        ds4f_xs_buf = (float *)malloc((size_t)M * (K / 64) * sizeof(float));
         ds4f_xq_cap = need;
     }
     *xq = ds4f_xq_buf; *xs = ds4f_xs_buf;
@@ -354,7 +356,7 @@ static void ds4f_mv_worker(void *arg, int tid, int nthr) {
          * per 8-row block (weight group L1-resident; ~1.03 B/elem from HBM). */
         const uint8_t *base = (const uint8_t *)t->w;
         size_t gb = (size_t)(K / 64) * 528;
-        int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
+        int8_t *xq; float *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
         ds4f_quant_x_sdot_into(x, K, xq, xs);
         for (int i = r0; i + 7 < r1; i += 8)
             matvec_sdot_8row(dst + i, base + (size_t)(i / 8) * gb, xq, xs, K);
@@ -478,7 +480,7 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
          * (i/8)*gb weight offset). */
         const uint8_t *base = (const uint8_t *)t->w;
         size_t gb = (size_t)(K / 64) * 528;
-        int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
+        int8_t *xq; float *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
         int cur_g = -1;
         for (int i = r0; i + 7 < r1; i += 8) {
             int g = (goff + i) / glora;
@@ -585,7 +587,7 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
          * blocked sdot keeps the FLA pipes fed; 1-2 token remainder single. */
         const uint8_t *base = (const uint8_t *)t->w;
         size_t gb = (size_t)(K / 64) * 528;
-        int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(M, K, &xq, &xs);
+        int8_t *xq; float *xs; ds4f_q8_xscratch(M, K, &xq, &xs);   /* per-thread TLS scratch */
         int nbq = K / 64;
         for (int mm = 0; mm < M; mm++)
             ds4f_quant_x_sdot_into(X + (size_t)mm * Xs, K,
