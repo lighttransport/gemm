@@ -3985,6 +3985,38 @@ static void ds4f_hcpost_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* WS1b: fuse the mHC RMS sum-of-squares INTO the mixes-matvec dispatch. The serial
+ * `ss = Σ x4^2` over hd=hc*hidden was ~35% of the "other" phase (latency-bound double
+ * accumulator chain on tid0, 89us/call). This worker computes the IDENTICAL F32 matvec
+ * rows (same per-row dot order as ds4f_mv_worker => mixes BIT-EXACT) AND a per-thread
+ * partial sum-of-squares of x4 over a disjoint hd slice; the caller combines partials in
+ * fixed tid order. The ss REASSOCIATES (parallel vs sequential double) => mixes*rsq and
+ * everything downstream is COHERENT, not bit-identical -> argmax gated by real-gen A/B.
+ * Gated DS4F_HC_RMSPAR (default off). */
+typedef struct { const float *fn, *x4; float *mixes; double *ssp; int rows, hd; } ds4f_hcmix_task;
+static void ds4f_hcmix_worker(void *arg, int tid, int nthr) {
+    ds4f_hcmix_task *T = (ds4f_hcmix_task *)arg;
+    int rows = T->rows, hd = T->hd;
+    int per = rows / nthr, extra = rows % nthr;          /* same row split as F32 mv_worker */
+    int f0 = per * tid + (tid < extra ? tid : extra);
+    int f1 = f0 + per + (tid < extra ? 1 : 0);
+    for (int i = f0; i < f1; i++) {
+        const float *w = T->fn + (size_t)i * hd;
+        float acc = 0.f;
+        for (int j = 0; j < hd; j++) acc += w[j] * T->x4[j];   /* identical inner => bit-exact */
+        T->mixes[i] = acc;
+    }
+    int d0 = (int)((long)hd * tid / nthr), d1 = (int)((long)hd * (tid+1) / nthr);
+    double s = 0.0;
+    for (int j = d0; j < d1; j++) { float v = T->x4[j]; s += (double)v*v; }
+    T->ssp[tid] = s;
+}
+static int ds4f_hc_rmspar = -1;
+static inline int ds4f_hc_rmspar_on(void) {
+    if (ds4f_hc_rmspar < 0) { const char *e = getenv("DS4F_HC_RMSPAR"); ds4f_hc_rmspar = e ? atoi(e) : 0; }
+    return ds4f_hc_rmspar;
+}
+
 /* hc_pre: x4[hc*C] (4 streams) -> collapsed y[C]; also yields post[hc], comb[hc*hc].
  * mixes = (fn @ flatten(x4)) * rsqrt(mean(x4^2)+norm_eps); sinkhorn; y[d]=Σ_k pre[k]·x4[k,d]. */
 static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
@@ -3992,11 +4024,25 @@ static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
                         float *y, float *post, float *comb) {
     ds4f_config *c = &m->cfg;
     int hc = c->hc_mult, C = c->hidden, hd = hc*C, mix_hc = (2+hc)*hc;
-    double ss = 0.0; for (int i = 0; i < hd; i++) { float v = x4[i]; ss += (double)v*v; }
-    float rsq = 1.0f/sqrtf((float)(ss/hd) + c->norm_eps);
     float mixes[64];                 /* mix_hc <= 24 for hc<=4 */
-    ds4f_tensor fnt = { (void*)fn, NULL, DS4F_F32, mix_hc, hd };
-    ds4f_matvec(m, mixes, &fnt, x4); /* threaded F32 Linear */
+    float rsq;
+    if (ds4f_hc_rmspar_on()) {       /* WS1b: fold the RMS sum-of-squares INTO the mixes-matvec
+                                      * dispatch (kills the 89us serial tid0 reduction). ss is a
+                                      * DOUBLE accumulation, so the parallel-vs-sequential reassoc
+                                      * (~1e-13) is far below the float rsq's epsilon => rsq, and
+                                      * thus the whole result, is bit-identical in practice. */
+        double ssp[64];
+        ds4f_hcmix_task T = { fn, x4, mixes, ssp, mix_hc, hd };
+        m->bytes_read += ds4f_wbytes(DS4F_F32, mix_hc, hd) + ds4f_sbytes(DS4F_F32, mix_hc, hd);
+        ds4f_pool_run(m->pool, ds4f_hcmix_worker, &T);
+        double ss = 0.0; for (int t = 0; t < m->pool->nthr; t++) ss += ssp[t];   /* fixed tid order */
+        rsq = 1.0f/sqrtf((float)(ss/hd) + c->norm_eps);
+    } else {
+        double ss = 0.0; for (int i = 0; i < hd; i++) { float v = x4[i]; ss += (double)v*v; }
+        rsq = 1.0f/sqrtf((float)(ss/hd) + c->norm_eps);
+        ds4f_tensor fnt = { (void*)fn, NULL, DS4F_F32, mix_hc, hd };
+        ds4f_matvec(m, mixes, &fnt, x4); /* threaded F32 Linear */
+    }
     for (int mm = 0; mm < mix_hc; mm++) mixes[mm] *= rsq;
     float pre[16];
     ds4f_hc_sinkhorn(mixes, scale, base, hc, c->hc_iters, c->hc_eps, pre, post, comb);

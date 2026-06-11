@@ -54,10 +54,23 @@ ceiling**; the 8x3-pv GEMM kernel runs at 7–13% of peak vs the 89% proven in
 **TOKEN-IDENTICAL** to off (64/64 ids, identical completion, NaNs=0, lockstep) and lifts real-gen
 decode **9.46 → 11.80 tok/s (+24.7%)**; the `other`/mHC phase drops **51.1 → 30.5 ms** (−40% of the
 phase). Below the optimistic 37→5 ms target — HC_PAR parallelized the collapse/expand fn-matvecs but
-`other` is still 30.5 ms (residual serial sinkhorn / 86× `memcpy(s_resid,s_x4)` / hc_head = a future
-**WS1b**). **Landed**: `DS4F_HC_PAR` now defaults ON in the perf wrappers (`run_ds4f_gen_11n.sh`,
-`run_ds4f_longctx_11n.sh`) and OFF in the base `run_ds4f_11n.sh` (clean reference) — mirrors the
-`Q8_DENSE` pattern. Code was already committed (ef0642e); the impl below is unchanged.
+`other` is still 30.5 ms. **Landed**: `DS4F_HC_PAR` now defaults ON in the perf wrappers
+(`run_ds4f_gen_11n.sh`, `run_ds4f_longctx_11n.sh`) and OFF in the base `run_ds4f_11n.sh` (clean
+reference) — mirrors the `Q8_DENSE` pattern. Code was already committed (ef0642e); the impl below
+is unchanged.
+
+**WS1b LANDED (2026-06-11): fold the mHC RMS into the mixes-matvec dispatch.** Measured the residual
+30.5 ms `other`: RMS sum-of-squares = 89 µs/call = **35% of `other`**, a serial latency-bound double
+reduction on tid0 (matvec 111 µs and collapse 61 µs are already-parallel and irreducible). `DS4F_HC_RMSPAR=1`
+runs a fused worker that computes the IDENTICAL F32 matvec rows AND a per-thread partial sum-of-squares
+of x4 over a disjoint slice; the caller combines partials in fixed tid order. Because `ss` is a **double**
+accumulation, the parallel-vs-sequential reassociation (~1e-13) is below the `float rsq` epsilon ⇒
+**BIT-IDENTICAL** result (mhc_test on-vs-off = 0.0 even at 48 threads; exact 5e-8 unchanged). 11n real-gen
+A/B **TOKEN-IDENTICAL** (64/64, NaNs=0, lockstep): `other` 30.5 → 24.1 ms, decode **11.80 → 12.77 tok/s
+(+8.2%)**. Cumulative WS1+WS1b vs pre-mHC-par: 9.46 → **12.77 tok/s (+35%)**, `other` 51.1 → 24.1 ms.
+Default ON in the perf wrappers, OFF in base. (A dead-end checked first: serializing the tiny mixes matvec
+— `DS4F_HC_MVSER` — was a **10× regression**; the 24-row matvec is latency-bound and *needs* the pool.)
+Remaining `other` (24.1 ms) is now the two irreducible parallel dispatches (matvec+collapse) per hc_pre.
 
 
 
