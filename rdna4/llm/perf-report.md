@@ -670,4 +670,22 @@ iq3_s; the FFN is unfused (separate gate/up/silu/down) but matvec-dominated.
 ### 12.3 Final Q2_K_XL (pp1024 / tg128)
 
 prefill **1364 t/s**, decode **30.0 t/s**. IQ3_XXS + 35B MoE models unaffected
-(1347/27.8, 1499/121); `--verify` 18/18.
+(1347/27.8, 1499/121); `--verify` 21/21.
+
+### 12.4 June 12 vs llama.cpp ROCm (RX 9070 XT, pp1024/tg128)
+
+`llama-bench` was run from `~/work/llama.cpp/build_rocm722_rdna4_fa`
+(`549b9d843`, build 9307) with `-ngl 99 -fa 1 -r 3`. The HIP runner was run
+with `LLM_PREFILL_WARMUP=2`.
+
+| model | runner | pp1024 | tg128 | note |
+|---|---:|---:|---:|---|
+| `Qwen3.5-27B-UD-Q2_K_XL` | llama.cpp ROCm | 686.85 | 29.69 | `qwen35 27B Q2_K - Medium` |
+| | HIP runner | **1362.01** | 29.64 | prefill **1.98x** llama.cpp; decode parity |
+| `Qwen3.6-27B-UD-IQ3_XXS` | llama.cpp ROCm | 1093.19 | 26.25 | `qwen35 27B IQ3_XXS - 3.0625 bpw` |
+| | HIP runner | **1348.37** | **27.45** | prefill **1.23x**, decode **1.05x** |
+
+Takeaway: Q2_K_XL decode has effectively closed the llama.cpp gap while the
+batched prefill path is nearly 2x faster. IQ3_XXS still has modest headroom but
+already leads llama.cpp on both metrics; the remaining decode limit is mostly
+IQ3_XXS gather/dequant plus dense-FFN traffic.
