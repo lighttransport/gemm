@@ -628,3 +628,46 @@ kernels held below their format cap by row count. Breaking ~400 on IQ3_XXS would
 need a cheaper decode (LDS-resident grid gather — prior-session negative on 35B,
 ~1%) or a different quantization. 50 tok/s is not reachable without changing the
 weight format (less traffic / simpler decode).
+
+---
+
+## 12. June 11 Session — Qwen3.5-27B-UD-Q2_K_XL support (prefill 14→1364, decode 14→30 t/s)
+
+A second 27B checkpoint with a different quant mix: FFN gate/up **Q2_K**, FFN down
+**Q3_K**, SSM in-proj **Q2_K**, ssm_out **Q5_K**, alpha/beta **Q8_0**, attn_gate
+**IQ3_XXS**, LM head **Q6_K**. None of Q2_K/Q3_K/Q8_0 were supported in the fast
+paths, so both prefill and decode were on slow fallbacks.
+
+### 12.1 Prefill 14 → 1364 t/s (98×) — batched-path support
+
+Q2_K/Q3_K/Q8_0 weren't batch-eligible → prefill ran per-token 1024× (72 s). Added
+dequant-to-bf16 kernels (one thread per output column, order matching each
+matvec) + wired into `get_bf16_weight` / `batch_qtype_ok` / `quant_matvec_block_info`.
+Bugs fixed: (a) Q8_0 uses the runner's **padded 36-byte** upload (`[d:2][pad:2]
+[qs:32]`), not native 34-byte; (b) `get_bf16_weight` cases must `return
+r->d_wbuf_bf16;` not `break;` (break → default NULL path → silent forward fail).
+Validated vs CPU ref: token-0 hidden rel_L2=3e-6, ≤0.02 across 64 layers (Q2_K
+2-bit through bf16; norms match). Commit `7b80065`.
+
+### 12.2 Decode 14 → 30 t/s (2.2×) — warp-per-row Q2_K/Q3_K matvecs
+
+`matvec_q2_K_f32`/`matvec_q3_K_f32` were block-per-row with 256 threads but only
+~nb (≈20) active → 116/189 GB/s. Added `G=nb*4` warp-per-row twins (one lane per
+64-element `(n0,half)` chunk: 16 qs bytes shared across all 4 scale-groups, no
+redundant reads, all 32 lanes active, intra-warp reduction — the Q4_K g4 pattern):
+
+| kernel | before | after |
+|---|---:|---:|
+| `matvec_q2_K_g4` | 116 GB/s (251 µs) | **458 GB/s** (64 µs) |
+| `matvec_q3_K_g4` | 189 GB/s (203 µs) | **443 GB/s** (87 µs) |
+
+Default ON (`LLM_Q2K_G4`/`LLM_Q3K_G4`). Decoded tokens bit-identical g4 on/off;
+CPU-ref rel_L2 unchanged. Q2_K/Q3_K hit ~450 GB/s (simpler decode, no IQ3_XXS
+grid gather), so Q2_K_XL decode (30 t/s) now **beats** the IQ3_XXS model (27.8).
+Commit `f293e53`. Remaining (small): q5_K ssm_out 342 GB/s (nb-stride, 6144 rows),
+iq3_s; the FFN is unfused (separate gate/up/silu/down) but matvec-dominated.
+
+### 12.3 Final Q2_K_XL (pp1024 / tg128)
+
+prefill **1364 t/s**, decode **30.0 t/s**. IQ3_XXS + 35B MoE models unaffected
+(1347/27.8, 1499/121); `--verify` 18/18.
