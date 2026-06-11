@@ -5030,6 +5030,87 @@ static const char *hip_kernel_source =
 "    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
+"/* Per-call dequant of Q2_K (84 B/block) to BF16. One thread per output column;  */\n"
+"/* column order matches matvec_q2_K_f32's xb traversal. Layout: scales[16] +     */\n"
+"/* qs[64] + d(f16)@80 + dmin(f16)@82. */\n"
+"__global__ void dequant_q2_K_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; int b = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 84;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 84;\n"
+"    const unsigned char *scales = bp;\n"
+"    const unsigned char *qs = bp + 16;\n"
+"    float d = half_to_float(*(const half_raw *)(bp + 80));\n"
+"    float dmin = half_to_float(*(const half_raw *)(bp + 82));\n"
+"    int c = threadIdx.x;\n"
+"    int n0 = c >> 7; int local = c & 127;\n"
+"    int j = local >> 5; int s16 = (local >> 4) & 1; int l = local & 15;\n"
+"    int is = n0 * 8 + j * 2 + s16;\n"
+"    unsigned char sc = scales[is];\n"
+"    float dl = d * (float)(sc & 0xF);\n"
+"    float ml = dmin * (float)(sc >> 4);\n"
+"    int qs_byte = n0 * 32 + s16 * 16 + l;\n"
+"    int shift = j * 2;\n"
+"    float val = dl * (float)((qs[qs_byte] >> shift) & 3) - ml;\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + c;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"/* Per-call dequant of Q3_K (110 B/block) to BF16. Layout: hmask[32] + qs[64] +  */\n"
+"/* scales[12]@96 + d(f16)@108. Column order matches matvec_q3_K_f32. */\n"
+"__global__ void dequant_q3_K_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; int b = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 110;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 110;\n"
+"    const unsigned char *hm = bp;\n"
+"    const unsigned char *qs = bp + 32;\n"
+"    const unsigned char *raw_sc = bp + 96;\n"
+"    float d_all = half_to_float(*(const half_raw *)(bp + 108));\n"
+"    unsigned int a0 = raw_sc[0]|(raw_sc[1]<<8)|(raw_sc[2]<<16)|(raw_sc[3]<<24);\n"
+"    unsigned int a1 = raw_sc[4]|(raw_sc[5]<<8)|(raw_sc[6]<<16)|(raw_sc[7]<<24);\n"
+"    unsigned int tmp = raw_sc[8]|(raw_sc[9]<<8)|(raw_sc[10]<<16)|(raw_sc[11]<<24);\n"
+"    unsigned int km1 = 0x03030303u, km2 = 0x0f0f0f0fu;\n"
+"    unsigned int aux[4];\n"
+"    aux[0] = (a0 & km2) | (((tmp >> 0) & km1) << 4);\n"
+"    aux[1] = (a1 & km2) | (((tmp >> 2) & km1) << 4);\n"
+"    aux[2] = ((a0 >> 4) & km2) | (((tmp >> 4) & km1) << 4);\n"
+"    aux[3] = ((a1 >> 4) & km2) | (((tmp >> 6) & km1) << 4);\n"
+"    const signed char *scales = (const signed char *)aux;\n"
+"    int c = threadIdx.x;\n"
+"    int n0 = c >> 7; int local = c & 127;\n"
+"    int j = local >> 5; int s16 = (local >> 4) & 1; int l = local & 15;\n"
+"    int is = n0 * 8 + j * 2 + s16;\n"
+"    int shift = j * 2;\n"
+"    unsigned char m_bit = (unsigned char)(1u << (n0 * 4 + j));\n"
+"    int hm_idx = s16 * 16 + l;\n"
+"    int qs_byte = n0 * 32 + s16 * 16 + l;\n"
+"    float dl = d_all * (float)((int)scales[is] - 32);\n"
+"    int qv = ((qs[qs_byte] >> shift) & 3) - ((hm[hm_idx] & m_bit) ? 0 : 4);\n"
+"    float val = dl * (float)qv;\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + c;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"/* Per-call dequant of Q8_0 to BF16. The runner uploads Q8_0 in a PADDED 36-byte  */\n"
+"/* block: [d(f16) 2B][pad 2B][int8 qs[32]] (see upload_q8_0_raw / matvec_q8_0_f32).*/\n"
+"/* Same (n_rows, n_cols/256, 256-thread) launch; each thread maps to its element. */\n"
+"__global__ void dequant_q8_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; int b = blockIdx.y;\n"
+"    int c = b * 256 + threadIdx.x;       /* global column 0..n_cols-1 */\n"
+"    if (c >= n_cols) return;\n"
+"    int n_blocks_per_row = n_cols / 32;\n"
+"    int row_bytes = n_blocks_per_row * 36;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    int blk = c >> 5; int within = c & 31;\n"
+"    const unsigned char *bp = rp + (size_t)blk * 36;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    signed char q = (signed char)bp[4 + within];\n"
+"    float val = d * (float)q;\n"
+"    size_t out_idx = (size_t)row * n_cols + c;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
 "\n"
 "/* Per-call dequant of IQ3_XXS (98 B/block, 256 elems) to BF16. Uses the\n"
 " * iq3xxs_grid_dev codebook + ksigns_iq2xs_dev sign table that were emitted\n"
@@ -6802,6 +6883,9 @@ struct hip_llm_runner {
     hipFunction_t fn_pack_bf16_from_f32;
     hipFunction_t fn_convert_f16_to_bf16;
     /* K-quant batched-prefill dequant kernels (write BF16 to a staging buffer) */
+    hipFunction_t fn_dequant_q8_0_to_bf16;
+    hipFunction_t fn_dequant_q2_K_to_bf16;
+    hipFunction_t fn_dequant_q3_K_to_bf16;
     hipFunction_t fn_dequant_q4_K_to_bf16;
     hipFunction_t fn_dequant_q5_K_to_bf16;
     hipFunction_t fn_dequant_q6_K_to_bf16;
@@ -7175,6 +7259,9 @@ static int compile_kernels(hip_llm_runner *r) {
 
     GET_FUNC(pack_bf16_from_f32);
     GET_FUNC(convert_f16_to_bf16);
+    GET_FUNC(dequant_q8_0_to_bf16);
+    GET_FUNC(dequant_q2_K_to_bf16);
+    GET_FUNC(dequant_q3_K_to_bf16);
     GET_FUNC(dequant_q4_K_to_bf16);
     GET_FUNC(dequant_q5_K_to_bf16);
     GET_FUNC(dequant_q6_K_to_bf16);
@@ -8888,6 +8975,9 @@ static inline int launch_dequant_##qname##_to_bf16(hip_llm_runner *r,           
     if (e != hipSuccess) { fprintf(stderr, "hip_llm: dequant_" #qname " launch failed: %d\n", e); return -1; } \
     return 0;                                                                     \
 }
+DEFINE_LAUNCH_KQ_DEQUANT(q8_0)
+DEFINE_LAUNCH_KQ_DEQUANT(q2_K)
+DEFINE_LAUNCH_KQ_DEQUANT(q3_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q4_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q5_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q6_K)
@@ -8914,6 +9004,8 @@ static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
 /* True if `type` has a per-call dequant kernel suitable for the batched path. */
 static inline int batch_qtype_ok(int type) {
     return type == GGML_TYPE_F32     || type == GGML_TYPE_F16 ||
+           type == GGML_TYPE_Q8_0    ||
+           type == GGML_TYPE_Q2_K    || type == GGML_TYPE_Q3_K ||
            type == GGML_TYPE_Q4_K    || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ2_XS  ||
@@ -8967,6 +9059,15 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             launch_convert_f16_to_bf16(r, r->d_wbuf_bf16, raw_w, (int)n);
             return r->d_wbuf_bf16;
         }
+        case GGML_TYPE_Q8_0:
+            launch_dequant_q8_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q2_K:
+            launch_dequant_q2_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q3_K:
+            launch_dequant_q3_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
         case GGML_TYPE_Q4_K:
             launch_dequant_q4_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
             return r->d_wbuf_bf16;
@@ -11287,6 +11388,8 @@ static int quant_matvec_block_info(int weight_type, int *blk_elems, int *blk_byt
     *blk_elems = 0;
     *blk_bytes = 0;
     switch (weight_type) {
+        case GGML_TYPE_Q2_K:    *blk_elems = 256; *blk_bytes = 84;  break;
+        case GGML_TYPE_Q3_K:    *blk_elems = 256; *blk_bytes = 110; break;
         case GGML_TYPE_Q4_K:    *blk_elems = 256; *blk_bytes = 144; break;
         case GGML_TYPE_Q5_K:    *blk_elems = 256; *blk_bytes = 176; break;
         case GGML_TYPE_Q6_K:    *blk_elems = 256; *blk_bytes = 210; break;
