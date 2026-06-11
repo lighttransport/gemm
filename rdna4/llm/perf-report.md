@@ -567,3 +567,64 @@ structural change (e.g. block-major dense-FFN weight repack), not micro-opts.
   over many shapes for est. 0.5–2%. Heuristic first-valid already gives 1.74×.
 - **INT8 dense FFN**: existing MoE int8 path applies no scales (unusable as-is);
   a correct scaled path is high-effort + quality risk. Deferred.
+
+---
+
+## 11. June 11 Session — 27B decode roofline + warp-per-row matvecs (23.3 → 27.8 tok/s)
+
+§10.3 called decode "at floor"; a proper roofline showed it was **at 54% of the
+achievable bandwidth**, and a kernel redesign recovered most of the per-layer gap.
+
+### 11.1 Roofline (the "is decode BW-bound?" answer)
+
+- Decode is **100% GPU-active** (44.4 ms/tok GPU vs 43 wall — graph capture
+  removed host gaps; no compute slack — float4 dequant was perfectly neutral).
+- Dense model → **~11.3 GB of weights read per token** (every weight, every tok).
+- **Achievable BW ceiling is format-dependent, not a flat 516:** the LM-head
+  Q5_K matvec hits 516 GB/s; Q4_K/Q6_K reach ~500–513; but **IQ3_XXS caps at
+  ~300–400 GB/s** — its grid-codebook gather (`iq3xxs_grid_dev[qs[...]]`, 32 lanes
+  gathering 32 distinct entries) + per-element sign decode is **ALU/ gather-bound**,
+  not BW-bound. Block size is irrelevant (gate_up flat at ~394 across 64/128/256
+  threads). So the 45 tok/s "pure-BW" target was optimistic: the dominant FFN is
+  IQ3_XXS.
+- Pre-redesign aggregate ≈ 278 GB/s = 54% of 516; the per-layer matvecs ran at
+  240–314 while only the giant LM-head matvec saturated.
+
+### 11.2 Root cause + fix
+
+Slow kernels were **block-per-row** (256 threads cooperate on one row → cross-warp
+`__shared__`+`__syncthreads` reduction = DRAM-idle), and `fused_ssm_out_gated_q6k`
+additionally recomputed the per-head RMSNorm sum-of-squares via **contended
+atomics in every one of the 5120 output-row blocks** (it is row-independent).
+
+Fix = transplant the in-tree **warp-per-row `G=nb*32` template**
+(`matvec_iq2_s_f32`: all 32 lanes active, intra-warp `__shfl` only). Per-call BW:
+
+| kernel | before | after | note |
+|---|---:|---:|---|
+| `ffn_gate_up_silu_iq3xxs` | 313 | **400** GB/s | IQ3_XXS ALU-capped (~400) |
+| `fused_ssm_out_gated_q6k` | 240 | **404** GB/s | + precompute inv_mean once (`ssm_inv_mean_f32`); drop atomic/barriers |
+| `matvec_q4_K_f32` (SSM in-proj) | 314 | **513** GB/s | `G=nb*4` (lane=64-elem chunk); Q4_K hits the ceiling |
+| `matvec_iq3_xxs_f32` (attn_gate) | 266 | **297** GB/s | nb-stride → `G=nb*32` (all lanes) |
+
+Net decode (canonical pp1024/tg128): **23.3 → 27.8 tok/s (+19%)**; argmax
+bit-identical, `--verify` 18/18, prefill unchanged (1350 t/s). Flags default ON:
+`LLM_FFN_IQ3_MW`, `LLM_SSM_OUT_MW`, `LLM_Q4K_G4`.
+
+### 11.3 What didn't move (shape/format-limited)
+
+- **FFN down** (IQ3_XXS [5120,17408], 5120 rows): warp-per-row *underfills*
+  (640 blocks) and split-K (`LLM_DOWN_KSPLIT`) only 287→303 GB/s — stuck at ~300
+  for IQ3_XXS at this row count. Kept on original block-per-row. (`_mw`/`splitk`
+  twins + `LLM_MW_THREADS` knob exist, gated off.)
+- **gate_up** is at the IQ3_XXS ALU ceiling (~400), not the 513 BW ceiling.
+
+### 11.4 Honest ceiling
+
+The realistic decode ceiling for this IQ3_XXS-heavy model is **~32–34 tok/s**
+(IQ3_XXS FFN ≈ 60% of traffic, ALU-capped ~300–400), not the 45–50 implied by a
+flat 516 GB/s. We reached 27.8; the remaining gap is the down + attn_gate IQ3_XXS
+kernels held below their format cap by row count. Breaking ~400 on IQ3_XXS would
+need a cheaper decode (LDS-resident grid gather — prior-session negative on 35B,
+~1%) or a different quantization. 50 tok/s is not reachable without changing the
+weight format (less traffic / simpler decode).
