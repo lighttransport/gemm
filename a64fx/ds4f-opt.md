@@ -103,9 +103,23 @@ bit-exact via build/ds4f_mhc_test + ds4f_exact_test 5e-8 + ds4f_tierb2_test 2e-6
 'other' phase with DS4F_PROF=1 on the single-node ds4f_runner (DS4F_MHC=1 DS4F_TIERB2=1). Target
 37→5 ms. Single A64FX node, no mpiexec. Don't commit; report before/after phase ms."
 
-## WS2 — dense matvec issue efficiency (decode: 31% → ≥55% of BW, +15–18%)
+## WS2 — dense matvec issue efficiency  ⏹ CLOSED / no clean win at production scale (2026-06-11)
 
-**Current**: decode matvecs 29.6 ms for 7.3 GB = 247 GB/s; `ds4f_decode_bw_bench.c` proves ~85%
+**FINISH (2026-06-11):** `DS4F_MV_FUSE` (the landed dispatch-fusion, commit 81575de) was validated
+on 11n real-gen for the first time: **TOKEN-IDENTICAL** but **+0.86% only** (12.77 → 12.88 tok/s,
+phases move both directions) — i.e. **NEUTRAL within noise**. The premise below ("the in-loop matvec
+loss is pool-dispatch/serial-gap overhead") does NOT hold at production scale: real-gen dense is **Q8
+(int8 svdot), which is issue/dequant-bound, not BW- or dispatch-bound** (`ds4f_decode_bw` confirms
+fp8/Q8 decode is ~10% of the 723 GB/s ceiling — a different regime from the bf16 80%-of-BW the "247
+vs 610" framing assumed). The matvec phases (qkv 7 + o_proj 9 + shared 6 + experts 5 + head 2 = 29 ms)
+are near the Q8 kernel's throughput, and fusing 2 dispatches/layer barely registers. `matvec_sdot_8row`
+already runs 8 independent row-accumulators and is svdot-throughput-bound, so the remaining idea
+(SVE prefetch / more accumulators) would help latency, not issue throughput — uncertain micro-opt, not
+a clean win. **MV_FUSE left default-OFF** (bit-exact but not worth enabling). WS2 is closed; the dense
+decode matvec is issue-bound and the realistic next decode lever is structural (MTP/spec). Original
+(refuted-at-scale) framing preserved below.
+
+**Current** (premise refuted at 11n — see above): decode matvecs 29.6 ms for 7.3 GB = 247 GB/s; `ds4f_decode_bw_bench.c` proves ~85%
 of the ~720 GB/s node read ceiling per matvec in isolation ⇒ the loss is in-loop: pool dispatch
 overhead (~10 `ds4f_pool_run` per layer), thread ramp, inter-matvec serial gaps, CMG locality of
 the Q8 528-byte blocks. **Target**: ≥440 GB/s in-loop (matvecs ≤ ~16 ms).
