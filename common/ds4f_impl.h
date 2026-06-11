@@ -408,6 +408,36 @@ static void ds4f_matvec(ds4f_model *m, float *dst, const ds4f_tensor *t, const f
     ds4f_pool_run(m->pool, ds4f_mv_worker, &T);
 }
 
+/* DS4F_MV_FUSE (WS2): run several INDEPENDENT matvecs in ONE pool_run so the thread
+ * wake + barrier is paid once instead of N times (decode does ~10 pool_run/layer; in-loop
+ * matvec BW is ~247 GB/s vs ~610 GB/s for the same matvec in isolation -> the gap is
+ * dispatch / serial-gap overhead, not the kernel). Each sub-matvec reuses ds4f_mv_worker
+ * with the IDENTICAL rowsplit8 + kernel + per-row dot order as a standalone ds4f_matvec
+ * => BIT-EXACT; only the barrier is shared. The CALLER must guarantee the list entries are
+ * mutually independent (no entry's x aliases another entry's dst). */
+static int ds4f_mv_fuse = -1;
+static inline int ds4f_mv_fuse_on(void) {
+    if (ds4f_mv_fuse < 0) { const char *e = getenv("DS4F_MV_FUSE"); ds4f_mv_fuse = e ? atoi(e) : 0; }
+    return ds4f_mv_fuse;
+}
+typedef struct { float *dst; const ds4f_tensor *t; const float *x; } ds4f_mv1;
+typedef struct { ds4f_model *m; const ds4f_mv1 *list; int n; } ds4f_mv_multi_task;
+static void ds4f_mv_multi_worker(void *arg, int tid, int nthr) {
+    ds4f_mv_multi_task *T = (ds4f_mv_multi_task *)arg;
+    for (int s = 0; s < T->n; s++) {
+        ds4f_mv_task sub = { T->m, T->list[s].dst, (const ds4f_tensor *)T->list[s].t, T->list[s].x };
+        ds4f_mv_worker(&sub, tid, nthr);
+    }
+}
+static void ds4f_matvec_multi(ds4f_model *m, const ds4f_mv1 *list, int n) {
+    for (int s = 0; s < n; s++) {
+        const ds4f_tensor *t = list[s].t;
+        m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols) + ds4f_sbytes(t->type, t->rows, t->cols);
+    }
+    ds4f_mv_multi_task T = { m, list, n };
+    ds4f_pool_run(m->pool, ds4f_mv_multi_worker, &T);
+}
+
 /* ---- block-diagonal matvec: the grouped o-proj wo_a [o_groups*glora rows, cols].
  * Output row-block i (8-aligned; glora%8==0 so a block never straddles a group) uses
  * input xbase + (i/glora)*gin. Fuses the o_groups separate ds4f_matvec dispatches into
@@ -4708,7 +4738,12 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         { DS4F_TIC();
         ds4f_rmsnorm(m->s_hn, asrc, ly->attn_norm, C, eps);
         ds4f_chk("attn_norm", L, m->s_hn, C);
-        { DS4F_TIC(); ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn); DS4F_TOC(DS4F_P_QKV_A); }
+        if (ds4f_mv_fuse_on()) {   /* wq_a + wkv both read s_hn -> ONE dispatch (wq_b depends on wq_a, stays separate). s_kvlat is independent of the q-path -> computing it early is bit-exact. */
+            DS4F_TIC();
+            ds4f_mv1 qkv[2] = { { m->s_qlat, &ly->wq_a, m->s_hn }, { m->s_kvlat, &ly->wkv, m->s_hn } };
+            ds4f_matvec_multi(m, qkv, 2);
+            DS4F_TOC(DS4F_P_QKV_A);
+        } else { DS4F_TIC(); ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn); DS4F_TOC(DS4F_P_QKV_A); }
         ds4f_rmsnorm(m->s_qlat, m->s_qlat, ly->q_norm, c->q_lora, eps);
         { DS4F_TIC(); ds4f_matvec(m, m->s_q + (size_t)m->attn_h0 * c->q_head_dim, &ly->wq_b, m->s_qlat); DS4F_TOC(DS4F_P_QKV_B); } /* TP: owned heads of [n_heads*q_head_dim] */
         if (m->exact) { DS4F_TIC();
@@ -4716,7 +4751,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             else              ds4f_q_norm_rope(m, m->s_q, pos, rcos, rsin);
             DS4F_TOC(DS4F_P_QKV_ROPE); } /* per-head norm + RoPE */
         ds4f_chk("q", L, m->s_q, H);
-        { DS4F_TIC(); ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn); DS4F_TOC(DS4F_P_QKV_KV); }  /* [kv_lora] */
+        if (!ds4f_mv_fuse_on()) { DS4F_TIC(); ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn); DS4F_TOC(DS4F_P_QKV_KV); }  /* [kv_lora]; fused with wq_a above when MV_FUSE */
         ds4f_rmsnorm(m->s_kvlat, m->s_kvlat, ly->kv_norm, KV, eps);
         if (m->exact)                                            /* RoPE the kv rope dims */
             ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
@@ -4818,8 +4853,14 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         int tps = (m->sh_rows < c->shared_inter);              /* TP shared-expert (sh_w1/w3 col-shard) */
         { DS4F_TIC();
         if (tps) { memset(m->s_shg, 0, (size_t)c->shared_inter*4); memset(m->s_shu, 0, (size_t)c->shared_inter*4); }
-        ds4f_matvec(m, m->s_shg + m->sh_r0, &ly->sh_w1, m->s_h2);  /* col-shard up/gate -> [sh_r0, sh_r0+sh_rows) */
-        ds4f_matvec(m, m->s_shu + m->sh_r0, &ly->sh_w3, m->s_h2);
+        if (ds4f_mv_fuse_on()) {   /* sh_w1 + sh_w3 both read s_h2 -> ONE dispatch */
+            ds4f_mv1 sh[2] = { { m->s_shg + m->sh_r0, &ly->sh_w1, m->s_h2 },
+                               { m->s_shu + m->sh_r0, &ly->sh_w3, m->s_h2 } };
+            ds4f_matvec_multi(m, sh, 2);
+        } else {
+            ds4f_matvec(m, m->s_shg + m->sh_r0, &ly->sh_w1, m->s_h2);  /* col-shard up/gate -> [sh_r0, sh_r0+sh_rows) */
+            ds4f_matvec(m, m->s_shu + m->sh_r0, &ly->sh_w3, m->s_h2);
+        }
         if (m->exact) { float lim = c->swiglu_limit;            /* clamp up both sides, gate max */
             for (int i = 0; i < c->shared_inter; i++)
                 m->s_shg[i] = ds4f_silu(m->s_shg[i] > lim ? lim : m->s_shg[i]) * ds4f_clampf(m->s_shu[i], -lim, lim);
@@ -4849,8 +4890,14 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             int e = idx[k]; if (e < 0) continue;
             if (e % m->ep_size != m->ep_rank) continue;          /* owned-only (Stage 1/local) */
             int slot = e / m->ep_size;                           /* dense owned index */
-            ds4f_matvec(m, m->s_exg, &ly->ex_w1[slot], m->s_h2);
-            ds4f_matvec(m, m->s_exu, &ly->ex_w3[slot], m->s_h2);
+            if (ds4f_mv_fuse_on()) {   /* ex_w1 + ex_w3 both read s_h2 -> ONE dispatch (per expert) */
+                ds4f_mv1 ex[2] = { { m->s_exg, &ly->ex_w1[slot], m->s_h2 },
+                                   { m->s_exu, &ly->ex_w3[slot], m->s_h2 } };
+                ds4f_matvec_multi(m, ex, 2);
+            } else {
+                ds4f_matvec(m, m->s_exg, &ly->ex_w1[slot], m->s_h2);
+                ds4f_matvec(m, m->s_exu, &ly->ex_w3[slot], m->s_h2);
+            }
             if (m->exact) { float lim = c->swiglu_limit;
                 for (int i = 0; i < c->moe_inter; i++)
                     m->s_exg[i] = ds4f_silu(m->s_exg[i] > lim ? lim : m->s_exg[i]) * ds4f_clampf(m->s_exu[i], -lim, lim);
