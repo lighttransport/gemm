@@ -101,7 +101,8 @@ int  hip_llm_batched_path_available(const hip_llm_runner *r);
 /* A/B verify the GPU matvec kernel for `weight_type` against a CPU reference.
  *
  * Generates a deterministic random raw block-quant matrix [n_rows, n_cols]
- * (native layout for `weight_type`) and an F32 input vector x[n_cols], runs
+ * (runner layout for `weight_type`; Q8_0 uses the runner's padded 36-byte
+ * block) and an F32 input vector x[n_cols], runs
  * the HIP matvec, then dequantizes the same bytes on CPU via `cpu_dequant_row`
  * and does a scalar dot-product per row. Reports rel-L2 vs the CPU reference
  * and the max absolute per-row error.
