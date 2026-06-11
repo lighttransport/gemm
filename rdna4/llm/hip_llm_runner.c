@@ -866,6 +866,43 @@ static const char *hip_kernel_source =
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
+"/* Q4_K warp-per-row, G=nb*4: one lane per 64-element chunk (32 qs bytes, low+   */\n"
+"/* high nibbles), all 32 lanes active, no redundant qs reads. 8 rows/block.      */\n"
+"__global__ void matvec_q4_K_g4_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 144;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    int G = nb * 4;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 2; int c = g & 3; int is = 2 * c;\n"
+"        const unsigned char *bp = row_ptr + b * 144;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        unsigned char sv0, mv0, sv1, mv1;\n"
+"        if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"        else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"        if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"        else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"        float d1 = d * sv0, m1 = dmin * mv0;\n"
+"        float d2 = d * sv1, m2 = dmin * mv1;\n"
+"        const unsigned char *q = bp + 16 + c * 32;\n"
+"        const float *xlo = x + b * 256 + c * 64;\n"
+"        const float *xhi = xlo + 32;\n"
+"        float partial = 0.0f;\n"
+"        for (int l = 0; l < 32; l++)\n"
+"            partial += (d1 * (q[l] & 0xF) - m1) * xlo[l] + (d2 * (q[l] >> 4) - m2) * xhi[l];\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
 "\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
@@ -6631,6 +6668,8 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q3_K_f32;
     hipFunction_t fn_matvec_q4_K_f32;
     hipFunction_t fn_matvec_q4_K_mw_f32;
+    hipFunction_t fn_matvec_q4_K_g4_f32;
+    int q4k_g4;                             /* LLM_Q4K_G4: warp-per-row G=nb*4 Q4_K */
     hipFunction_t fn_matvec_q5_K_f32;
     hipFunction_t fn_matvec_q5_K_mw_f32;
     hipFunction_t fn_matvec_q6_K_f32;
@@ -7031,6 +7070,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q3_K_f32);
     GET_FUNC(matvec_q4_K_f32);
     GET_FUNC(matvec_q4_K_mw_f32);
+    GET_FUNC(matvec_q4_K_g4_f32);
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q5_K_mw_f32);
     GET_FUNC(matvec_q6_K_f32);
@@ -7237,6 +7277,8 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     { const char *e = getenv("LLM_FFN_IQ3_MW"); if (e) r->ffn_iq3_mw = atoi(e) != 0; }
     r->mw_threads = 256;
     { const char *e = getenv("LLM_MW_THREADS"); if (e) { int t = atoi(e); if (t==64||t==128||t==256||t==512) r->mw_threads = t; } }
+    r->q4k_g4 = 1;  /* warp-per-row G=nb*4 Q4_K: 314->513 GB/s, validated */
+    { const char *e = getenv("LLM_Q4K_G4"); if (e) r->q4k_g4 = atoi(e) != 0; }
     r->down_ksplit = 1;
     { const char *e = getenv("LLM_DOWN_KSPLIT"); if (e) { r->down_ksplit = atoi(e); if (r->down_ksplit < 1) r->down_ksplit = 1; } }
     r->ssm_out_mw = 1;  /* warp-per-row + precomputed inv_mean: 240->404 GB/s, validated */
@@ -8711,7 +8753,9 @@ DEFINE_LAUNCH_MATVEC(q3_K, fn_matvec_q3_K_f32)
 static inline void launch_matvec_q4_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
-    if (r->quant_matvec_opt && n_rows <= 4096 && n_cols <= 4096) {
+    if (r->q4k_g4) {
+        LAUNCH(r->fn_matvec_q4_K_g4_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    } else if (r->quant_matvec_opt && n_rows <= 4096 && n_cols <= 4096) {
         LAUNCH(r->fn_matvec_q4_K_mw_f32, n_rows, 1, 1, 32, 1, 1, 0,
                r->stream, args);
     } else {
