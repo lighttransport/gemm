@@ -700,6 +700,43 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Q2_K warp-per-row, G=nb*4: one lane per 64-element chunk (n0,half) -> 16 qs    */\n"
+"/* bytes shared across all 4 scale-groups (no redundant reads), all 32 lanes      */\n"
+"/* active, intra-warp reduction. 8 rows/block. Q2_K: scales[16]+qs[64]+d@80+dmin@82.*/\n"
+"__global__ void matvec_q2_K_g4_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 84;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    int G = nb * 4;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 2; int gi = g & 3; int n0 = gi >> 1; int half = gi & 1;\n"
+"        const unsigned char *bp = row_ptr + b * 84;\n"
+"        const unsigned char *scales = bp;\n"
+"        const unsigned char *qsb = bp + 16 + n0 * 32 + half * 16;\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 80));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 82));\n"
+"        const float *xb = x + b * 256 + n0 * 128 + half * 16;\n"
+"        float partial = 0.0f;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sc = scales[n0 * 8 + j * 2 + half];\n"
+"            float dl = d * (float)(sc & 0xF);\n"
+"            float ml = dmin * (float)(sc >> 4);\n"
+"            int shift = j * 2;\n"
+"            const float *xj = xb + j * 32;\n"
+"            for (int l = 0; l < 16; l++)\n"
+"                partial += (dl * (float)((qsb[l] >> shift) & 3) - ml) * xj[l];\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
 "/* ---- 15. matvec_q3_K_f32: Q3_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q3_K block: 110 bytes = hmask[32] + qs[64] + scales[12] + d(f16), 256 elements */\n"
 "__global__ void matvec_q3_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -765,6 +802,53 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Q3_K warp-per-row, G=nb*4: one lane per 64-element chunk (n0,half), all 32     */\n"
+"/* lanes active, intra-warp reduction. 8 rows/block. */\n"
+"__global__ void matvec_q3_K_g4_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 110;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    int G = nb * 4;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 2; int gi = g & 3; int n0 = gi >> 1; int half = gi & 1;\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        const unsigned char *hmb = bp + half * 16;\n"
+"        const unsigned char *qsb = bp + 32 + n0 * 32 + half * 16;\n"
+"        const unsigned char *raw_sc = bp + 96;\n"
+"        float d_all = half_to_float(*(const half_raw *)(bp + 108));\n"
+"        unsigned int a0 = raw_sc[0]|(raw_sc[1]<<8)|(raw_sc[2]<<16)|(raw_sc[3]<<24);\n"
+"        unsigned int a1 = raw_sc[4]|(raw_sc[5]<<8)|(raw_sc[6]<<16)|(raw_sc[7]<<24);\n"
+"        unsigned int tmp = raw_sc[8]|(raw_sc[9]<<8)|(raw_sc[10]<<16)|(raw_sc[11]<<24);\n"
+"        unsigned int km1 = 0x03030303u, km2 = 0x0f0f0f0fu;\n"
+"        unsigned int aux[4];\n"
+"        aux[0] = (a0 & km2) | (((tmp >> 0) & km1) << 4);\n"
+"        aux[1] = (a1 & km2) | (((tmp >> 2) & km1) << 4);\n"
+"        aux[2] = ((a0 >> 4) & km2) | (((tmp >> 4) & km1) << 4);\n"
+"        aux[3] = ((a1 >> 4) & km2) | (((tmp >> 6) & km1) << 4);\n"
+"        const signed char *scales = (const signed char *)aux;\n"
+"        const float *xb = x + b * 256 + n0 * 128 + half * 16;\n"
+"        float partial = 0.0f;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float dl = d_all * (float)((int)scales[n0 * 8 + j * 2 + half] - 32);\n"
+"            int shift = j * 2;\n"
+"            unsigned char m_bit = (unsigned char)(1u << (n0 * 4 + j));\n"
+"            const float *xj = xb + j * 32;\n"
+"            for (int l = 0; l < 16; l++) {\n"
+"                int qv = ((qsb[l] >> shift) & 3) - ((hmb[l] & m_bit) ? 0 : 4);\n"
+"                partial += dl * (float)qv * xj[l];\n"
+"            }\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
 "/* ---- 16. matvec_q4_K_f32: Q4_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q4_K block: 144 bytes = d(f16) + dmin(f16) + scales[12] + qs[128], 256 elements */\n"
 "__global__ void matvec_q4_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -6746,7 +6830,10 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_embed_q8_0;
     hipFunction_t fn_matvec_q2_K_f32;
+    hipFunction_t fn_matvec_q2_K_g4_f32;
     hipFunction_t fn_matvec_q3_K_f32;
+    hipFunction_t fn_matvec_q3_K_g4_f32;
+    int q2k_g4, q3k_g4;                     /* LLM_Q2K_G4 / LLM_Q3K_G4 warp-per-row */
     hipFunction_t fn_matvec_q4_K_f32;
     hipFunction_t fn_matvec_q4_K_mw_f32;
     hipFunction_t fn_matvec_q4_K_g4_f32;
@@ -7151,7 +7238,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(embed_q8_0);
     GET_FUNC(matvec_q2_K_f32);
+    GET_FUNC(matvec_q2_K_g4_f32);
     GET_FUNC(matvec_q3_K_f32);
+    GET_FUNC(matvec_q3_K_g4_f32);
     GET_FUNC(matvec_q4_K_f32);
     GET_FUNC(matvec_q4_K_mw_f32);
     GET_FUNC(matvec_q4_K_g4_f32);
@@ -7365,6 +7454,8 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->mw_threads = 256;
     { const char *e = getenv("LLM_MW_THREADS"); if (e) { int t = atoi(e); if (t==64||t==128||t==256||t==512) r->mw_threads = t; } }
     r->q4k_g4 = 1;  /* warp-per-row G=nb*4 Q4_K: 314->513 GB/s, validated */
+    r->q2k_g4 = 1; { const char *e = getenv("LLM_Q2K_G4"); if (e) r->q2k_g4 = atoi(e) != 0; }
+    r->q3k_g4 = 1; { const char *e = getenv("LLM_Q3K_G4"); if (e) r->q3k_g4 = atoi(e) != 0; }
     { const char *e = getenv("LLM_Q4K_G4"); if (e) r->q4k_g4 = atoi(e) != 0; }
     r->down_ksplit = 1;
     { const char *e = getenv("LLM_DOWN_KSPLIT"); if (e) { r->down_ksplit = atoi(e); if (r->down_ksplit < 1) r->down_ksplit = 1; } }
@@ -8835,8 +8926,22 @@ static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat,
     LAUNCH(r->fn_field, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args); \
 }
 
-DEFINE_LAUNCH_MATVEC(q2_K, fn_matvec_q2_K_f32)
-DEFINE_LAUNCH_MATVEC(q3_K, fn_matvec_q3_K_f32)
+static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    if (r->q2k_g4)
+        LAUNCH(r->fn_matvec_q2_K_g4_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    else
+        LAUNCH(r->fn_matvec_q2_K_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_q3_K(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    if (r->q3k_g4)
+        LAUNCH(r->fn_matvec_q3_K_g4_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    else
+        LAUNCH(r->fn_matvec_q3_K_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
 static inline void launch_matvec_q4_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
