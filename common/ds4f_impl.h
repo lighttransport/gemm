@@ -3,14 +3,19 @@
  * #included at the end of ds4f.h after all public types are defined.
  * Do not #include this directly — include "ds4f.h". */
 
+/* DS4F_FLAGBAR: per-worker completion flag on its own cache line (kills the 47-way
+ * fetch_add contention of the centralized `done` counter; main spins on distinct lines). */
+typedef struct { _Atomic int v; char pad[64 - sizeof(_Atomic int)]; } ds4f_cacheline;
 struct ds4f_pool {
     int nthr, n_cmgs;
     pthread_t *threads;
     _Atomic int seq;
-    _Atomic int done;
+    _Atomic int done;            /* counter barrier (flagbar=0) */
     _Atomic int stop;
     ds4f_fn fn;
     void *arg;
+    ds4f_cacheline *donef;       /* per-worker flags (flagbar=1): donef[tid].v = last seq run */
+    int flagbar;                 /* DS4F_FLAGBAR, resolved once at pool_start */
 };
 
 #if defined(__aarch64__) && defined(__linux__)
@@ -43,7 +48,10 @@ static void *ds4f_worker(void *v) {
         if (atomic_load_explicit(&p->stop, memory_order_acquire)) break;
         last = atomic_load_explicit(&p->seq, memory_order_acquire);
         if (p->fn) p->fn(p->arg, tid, p->nthr);
-        atomic_fetch_add_explicit(&p->done, 1, memory_order_release);
+        if (p->flagbar)
+            atomic_store_explicit(&p->donef[tid].v, last, memory_order_release);  /* own cache line */
+        else
+            atomic_fetch_add_explicit(&p->done, 1, memory_order_release);
     }
     free(w);
     return NULL;
@@ -53,6 +61,9 @@ static ds4f_pool *ds4f_pool_start(int nthr, int n_cmgs) {
     ds4f_pool *p = (ds4f_pool *)calloc(1, sizeof(*p));
     p->nthr = nthr; p->n_cmgs = n_cmgs;
     atomic_store(&p->seq, 0); atomic_store(&p->done, 0); atomic_store(&p->stop, 0);
+    { const char *e = getenv("DS4F_FLAGBAR"); p->flagbar = e ? atoi(e) : 0; }
+    p->donef = (ds4f_cacheline *)aligned_alloc(64, (size_t)nthr * sizeof(ds4f_cacheline));
+    for (int t = 0; t < nthr; t++) atomic_store_explicit(&p->donef[t].v, 0, memory_order_relaxed);
     p->threads = (pthread_t *)calloc(nthr, sizeof(pthread_t));
     for (int t = 1; t < nthr; t++) {   /* main thread acts as tid 0 */
         ds4f_wctx *w = (ds4f_wctx *)malloc(sizeof(*w));
@@ -65,17 +76,29 @@ static ds4f_pool *ds4f_pool_start(int nthr, int n_cmgs) {
 
 static void ds4f_pool_run(ds4f_pool *p, ds4f_fn fn, void *arg) {
     p->fn = fn; p->arg = arg;
-    atomic_store_explicit(&p->done, 0, memory_order_relaxed);
-    atomic_fetch_add_explicit(&p->seq, 1, memory_order_release);
-    fn(arg, 0, p->nthr);                /* main = tid 0 */
-    while (atomic_load_explicit(&p->done, memory_order_acquire) < p->nthr - 1)
-        ds4f_relax();
+    if (p->flagbar) {
+        /* seq is single-producer (main only) -> load+1+store is race-free. Workers write
+         * donef[tid]=this seq when done; main waits each distinct line -> no shared-counter
+         * contention. Bit-identical to the counter path (same fn, same per-worker work). */
+        int s = atomic_load_explicit(&p->seq, memory_order_relaxed) + 1;
+        atomic_store_explicit(&p->seq, s, memory_order_release);
+        fn(arg, 0, p->nthr);            /* main = tid 0 */
+        for (int t = 1; t < p->nthr; t++)
+            while (atomic_load_explicit(&p->donef[t].v, memory_order_acquire) != s)
+                ds4f_relax();
+    } else {
+        atomic_store_explicit(&p->done, 0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&p->seq, 1, memory_order_release);
+        fn(arg, 0, p->nthr);            /* main = tid 0 */
+        while (atomic_load_explicit(&p->done, memory_order_acquire) < p->nthr - 1)
+            ds4f_relax();
+    }
 }
 
 static void ds4f_pool_stop(ds4f_pool *p) {
     atomic_store_explicit(&p->stop, 1, memory_order_release);
     for (int t = 1; t < p->nthr; t++) pthread_join(p->threads[t], NULL);
-    free(p->threads); free(p);
+    free(p->threads); free(p->donef); free(p);
 }
 
 /* row split into 8-aligned blocks for worker tid of nthr */
