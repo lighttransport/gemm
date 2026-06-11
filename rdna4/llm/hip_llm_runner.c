@@ -7974,6 +7974,20 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
              if (!moe_prefill || !r->is_hybrid) eligible = 0;
         }
 
+        /* Smart default for large DENSE (non-MoE) models: the FFN GEMMs have big
+         * N (n_ff) and K (n_embd), where hipBLASLt markedly outperforms the
+         * self-owned WMMA GEMM (measured 1.73x prefill on Qwen3.6-27B dense,
+         * n_embd=5120/n_ff=17408). The self-owned GEMM still wins for the 35B
+         * MoE grouped path (which requires gemm_own) and for small dense models
+         * (n_embd<4096, e.g. Qwen3-VL-2B), so restrict the flip accordingly.
+         * An explicit LLM_GEMM=own/blaslt always overrides. */
+        {
+            const char *eg = getenv("LLM_GEMM");
+            int user_forced = (eg && (strcmp(eg, "own") == 0 || strcmp(eg, "blaslt") == 0));
+            if (!user_forced && eligible && !r->is_moe && r->n_embd >= 4096) {
+                r->gemm_own = 0;  /* prefer hipBLASLt for large dense GEMMs */
+            }
+        }
         if (eligible && !r->gemm_own) {
             if (mm_blaslt_init() != 0) {
                 fprintf(stderr,
