@@ -3813,6 +3813,273 @@ static const char *hip_kernel_source =
 "        gate_out[row] = g * usum;\n"
 "    }\n"
 "}\n"
+"/* ---- ffn_gate_up_silu_iq3xxs: fused FFN gate+up+SiLU for IQ3_XXS weights. */\n"
+"__global__ void ffn_gate_up_silu_iq3xxs(float *gate_out,\n"
+"        const unsigned char *gate_w, const unsigned char *up_w,\n"
+"        const float *x, int n_ff, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_ff) return;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 98;\n"
+"    int G = nb * 32;\n"
+"    float gsum = 0.0f, usum = 0.0f;\n"
+"    const unsigned char *gp = gate_w + (size_t)row * row_bytes;\n"
+"    const unsigned char *up = up_w + (size_t)row * row_bytes;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        const unsigned char *bp_g = gp + b * 98;\n"
+"        const unsigned char *bp_u = up + b * 98;\n"
+"        float d_g = half_to_float(*(const half_raw *)bp_g);\n"
+"        float d_u = half_to_float(*(const half_raw *)bp_u);\n"
+"        const unsigned char *qs_g = bp_g + 2, *qs_u = bp_u + 2;\n"
+"        unsigned int aux_g = *(const unsigned int *)(bp_g + 66 + 4*sb);\n"
+"        unsigned int aux_u = *(const unsigned int *)(bp_u + 66 + 4*sb);\n"
+"        float db_g = d_g * (0.5f + (float)(aux_g >> 28)) * 0.5f;\n"
+"        float db_u = d_u * (0.5f + (float)(aux_u >> 28)) * 0.5f;\n"
+"        unsigned char sgn_g = ksigns_iq2xs_dev[(aux_g >> (7*l)) & 127];\n"
+"        unsigned char sgn_u = ksigns_iq2xs_dev[(aux_u >> (7*l)) & 127];\n"
+"        const unsigned char *g1_g = (const unsigned char *)&iq3xxs_grid_dev[qs_g[8*sb+2*l]];\n"
+"        const unsigned char *g2_g = (const unsigned char *)&iq3xxs_grid_dev[qs_g[8*sb+2*l+1]];\n"
+"        const unsigned char *g1_u = (const unsigned char *)&iq3xxs_grid_dev[qs_u[8*sb+2*l]];\n"
+"        const unsigned char *g2_u = (const unsigned char *)&iq3xxs_grid_dev[qs_u[8*sb+2*l+1]];\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float xv0 = xb[j], xv1 = xb[j+4];\n"
+"            float wg0 = db_g * (float)g1_g[j] * ((sgn_g & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float wg1 = db_g * (float)g2_g[j] * ((sgn_g & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            float wu0 = db_u * (float)g1_u[j] * ((sgn_u & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float wu1 = db_u * (float)g2_u[j] * ((sgn_u & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            gsum += wg0 * xv0 + wg1 * xv1;\n"
+"            usum += wu0 * xv0 + wu1 * xv1;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) { gsum += __shfl_down(gsum, o); usum += __shfl_down(usum, o); }\n"
+"    __shared__ float sf[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) { sf[wid] = gsum; } __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += sf[w]; gsum = t; }\n"
+"    __syncthreads();\n"
+"    if (ln == 0) { sf[wid] = usum; } __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += sf[w]; usum = t; }\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float g = gsum / (1.0f + __expf(-gsum));\n"
+"        gate_out[row] = g * usum;\n"
+"    }\n"
+"}\n"
+"/* ---- matvec_down_residual_iq3xxs: fused down matvec + residual for IQ3_XXS. */\n"
+"__global__ void matvec_down_residual_iq3xxs(float *x, const unsigned char *down_w,\n"
+"        const float *gate, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = down_w + (size_t)row * row_bytes;\n"
+"    int G = nb * 32;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *gb = gate + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float gv0 = gb[j], gv1 = gb[j+4];\n"
+"            float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            sum += w0 * gv0 + w1 * gv1;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; x[row] += t; }\n"
+"}\n"
+"/* ---- matvec_qkv_iq3xxs: fused attn Q/K/V IQ3_XXS matvecs (one launch). */\n"
+"__global__ void matvec_qkv_iq3xxs(float *q, float *k, float *v,\n"
+"        const unsigned char *wq, const unsigned char *wk, const unsigned char *wv,\n"
+"        int q_rows, int k_rows, int v_rows, int n_cols, const float *x) {\n"
+"    int row = blockIdx.x;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    const unsigned char *mat; float *dst; int r = row;\n"
+"    if (r < q_rows) { mat = wq; dst = q + r; }\n"
+"    else if (r < q_rows + k_rows) { r -= q_rows; mat = wk; dst = k + r; }\n"
+"    else { r -= q_rows + k_rows; if (r >= v_rows) return; mat = wv; dst = v + r; }\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = mat + (size_t)r * row_bytes;\n"
+"    int G = nb * 32; float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float xv0 = xb[j], xv1 = xb[j+4];\n"
+"            float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            sum += w0 * xv0 + w1 * xv1;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; *dst = t; }\n"
+"}\n"
+"/* ---- matvec_out_gated_iq3xxs: fused sigmoid_mul + output matvec for IQ3_XXS. */\n"
+"__global__ void matvec_out_gated_iq3xxs(float *out, const unsigned char *w_out,\n"
+"        const float *in, const float *gate, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = w_out + (size_t)row * row_bytes;\n"
+"    int G = nb * 32; float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *x0 = in + b * 256 + sb * 32 + l * 8;\n"
+"        const float *g0 = gate + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float sg0 = 1.0f / (1.0f + __expf(-g0[j]));\n"
+"            float sg1 = 1.0f / (1.0f + __expf(-g0[j+4]));\n"
+"            float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            sum += (w0 * x0[j] * sg0) + (w1 * x0[j+4] * sg1);\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; out[row] = t; }\n"
+"}\n"
+"/* ---- ssm_matvec4_iq3xxs: fused qkv + z + alpha + beta IQ3_XXS matvecs. */\n"
+"__global__ void ssm_matvec4_iq3xxs(float *qkv, float *z, float *alpha, float *beta,\n"
+"        const unsigned char *wq, const unsigned char *wz,\n"
+"        const half_raw *wa, const half_raw *wb, const float *x,\n"
+"        int qkv_rows, int z_rows, int dt_rank, int n_cols) {\n"
+"    int row = blockIdx.x; int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    const unsigned char *mat = 0; float *dst = 0; int r = row;\n"
+"    if (r < qkv_rows) { mat = wq; dst = qkv + r; }\n"
+"    else { r -= qkv_rows;\n"
+"      if (r < z_rows) { mat = wz; dst = z + r; }\n"
+"      else { r -= z_rows;\n"
+"        const half_raw *wf = (r < dt_rank) ? wa + (size_t)r * n_cols : wb + (size_t)(r - dt_rank) * n_cols;\n"
+"        float *df = (r < dt_rank) ? alpha + r : beta + (r - dt_rank);\n"
+"        float sum = 0.0f;\n"
+"        for (int j = tid; j < n_cols; j += nthreads) sum += half_to_float(wf[j]) * x[j];\n"
+"        for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"        __shared__ float wsf[8]; int wid = tid/32, ln = tid%32;\n"
+"        if (ln == 0) wsf[wid] = sum; __syncthreads();\n"
+"        if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += wsf[w]; *df = t; }\n"
+"        return; } }\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = mat + (size_t)r * row_bytes;\n"
+"    int G = nb * 32; float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float xv0 = xb[j], xv1 = xb[j+4];\n"
+"            float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            sum += w0 * xv0 + w1 * xv1;\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float ws[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) ws[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += ws[w]; *dst = t; }\n"
+"}\n"
+"/* ---- fused_ssm_out_gated_iq3xxs: fused gated RMSNorm + ssm_out matvec (IQ3_XXS). */\n"
+"__global__ void fused_ssm_out_gated_iq3xxs(float *xb, const unsigned char *w_out,\n"
+"        const float *ssm_out, const float *z, const float *norm_w,\n"
+"        int n_rows, int n_cols, int dt_rank, int d_state, float eps) {\n"
+"    int row = blockIdx.x; if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x; int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256; int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = w_out + (size_t)row * row_bytes;\n"
+"    int G = nb * 32;\n"
+"    float i_d_state = 1.0f / (float)d_state;\n"
+"    __shared__ float head_sq[256];\n"
+"    if (tid < dt_rank) head_sq[tid] = 0.0f;\n"
+"    __syncthreads();\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        int head = b * 8 + sb;\n"
+"        if (head >= dt_rank) continue;\n"
+"        const float *x0 = ssm_out + b * 256 + sb * 32 + l * 8;\n"
+"        float4 xv = *(const float4 *)x0;\n"
+"        atomicAdd(&head_sq[head], xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w);\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float sum = 0.0f;\n"
+"    for (int g = tid; g < G; g += nthreads) {\n"
+"        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
+"        int head = b * 8 + sb;\n"
+"        if (head >= dt_rank) continue;\n"
+"        float inv_mean = rsqrtf(head_sq[head] * i_d_state + eps);\n"
+"        const float *x0 = ssm_out + b * 256 + sb * 32 + l * 8;\n"
+"        const float *zx0 = z + b * 256 + sb * 32 + l * 8;\n"
+"        float4 xv = *(const float4 *)x0;\n"
+"        float4 zv = *(const float4 *)zx0;\n"
+"        float nw = norm_w[head];\n"
+"        float nv0 = xv.x * inv_mean * nw;\n"
+"        float nv1 = xv.y * inv_mean * nw;\n"
+"        float nv2 = xv.z * inv_mean * nw;\n"
+"        float nv3 = xv.w * inv_mean * nw;\n"
+"        float sg0 = 1.0f / (1.0f + __expf(-zv.x));\n"
+"        float sg1 = 1.0f / (1.0f + __expf(-zv.y));\n"
+"        float sg2 = 1.0f / (1.0f + __expf(-zv.z));\n"
+"        float sg3 = 1.0f / (1.0f + __expf(-zv.w));\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        sum += db * (float)g1[0] * ((sgn & 1) ? -nv0 : nv0) * sg0\n"
+"              + db * (float)g1[1] * ((sgn & 2) ? -nv1 : nv1) * sg1\n"
+"              + db * (float)g1[2] * ((sgn & 4) ? -nv2 : nv2) * sg2\n"
+"              + db * (float)g1[3] * ((sgn & 8) ? -nv3 : nv3) * sg3;\n"
+"        sum += db * (float)g2[0] * ((sgn & 16) ? -(nv0*sg0) : (nv0*sg0))\n"
+"              + db * (float)g2[1] * ((sgn & 32) ? -(nv1*sg1) : (nv1*sg1))\n"
+"              + db * (float)g2[2] * ((sgn & 64) ? -(nv2*sg2) : (nv2*sg2))\n"
+"              + db * (float)g2[3] * ((sgn & 128) ? -(nv3*sg3) : (nv3*sg3));\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    __shared__ float wsf[8]; int wid = tid/32, ln = tid%32;\n"
+"    if (ln == 0) wsf[wid] = sum; __syncthreads();\n"
+"    if (tid == 0) { float t = 0; for (int w = 0; w < nthreads/32; w++) t += wsf[w]; xb[row] = t; }\n"
+"}\n"
 "/* ---- moe_route_decode: router logits + topk + softmax + shared-gate sigmoid. */\n"
 "/* One block 256 thr: thread e = expert dot, then topk/softmax/sgate. */\n"
 "__global__ void moe_route_decode(const float *gate_w, const float *sgate_w,\n"
@@ -6231,7 +6498,13 @@ struct hip_llm_runner {
     hipFunction_t fn_ssm_matvec4_q6k;       /* decode: fused 4 SSM input matvecs */
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
     hipFunction_t fn_ffn_gate_up_silu_q6k;  /* decode: fused FFN gate+up+SiLU (Q6_K) */
+    hipFunction_t fn_ffn_gate_up_silu_iq3xxs; /* decode: fused FFN gate+up+SiLU (IQ3_XXS) */
     hipFunction_t fn_matvec_down_residual_q6k; /* decode: fused down matvec + residual (Q6_K) */
+    hipFunction_t fn_matvec_down_residual_iq3xxs; /* decode: fused down matvec + residual (IQ3_XXS) */
+    hipFunction_t fn_matvec_qkv_iq3xxs;       /* decode: fused attn Q/K/V IQ3_XXS matvecs */
+    hipFunction_t fn_matvec_out_gated_iq3xxs; /* decode: fused sigmoid_mul + output matvec (IQ3_XXS) */
+    hipFunction_t fn_ssm_matvec4_iq3xxs;      /* decode: fused 4 SSM input matvecs (IQ3_XXS) */
+    hipFunction_t fn_fused_ssm_out_gated_iq3xxs; /* decode: fused SSM out + gated RMSNorm (IQ3_XXS) */
     hipFunction_t fn_matvec_out_gated_q6k;     /* decode: fused gated output matvec (Q6_K) */
     hipFunction_t fn_fused_ssm_out_gated_q6k;  /* decode: fused SSM out + gated RMSNorm (Q6_K) */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
@@ -6615,7 +6888,13 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_matvec4_q6k);
     GET_FUNC(matvec_qkv_q6k);
     GET_FUNC(ffn_gate_up_silu_q6k);
+    GET_FUNC(ffn_gate_up_silu_iq3xxs);
     GET_FUNC(matvec_down_residual_q6k);
+    GET_FUNC(matvec_down_residual_iq3xxs);
+    GET_FUNC(matvec_qkv_iq3xxs);
+    GET_FUNC(matvec_out_gated_iq3xxs);
+    GET_FUNC(ssm_matvec4_iq3xxs);
+    GET_FUNC(fused_ssm_out_gated_iq3xxs);
     GET_FUNC(matvec_out_gated_q6k);
     GET_FUNC(fused_ssm_out_gated_q6k);
     GET_FUNC(moe_route_decode);
@@ -9372,6 +9651,14 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                               &cl->ssm_qkv_w, &cl->ssm_gate_w, &cl->ssm_alpha_w, &cl->ssm_beta_w,
                               &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
                 LAUNCH(r->fn_ssm_matvec4_q6k, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode &&
+                cl->ssm_qkv_type == GGML_TYPE_IQ3_XXS && cl->ssm_gate_type == GGML_TYPE_IQ3_XXS &&
+                cl->ssm_alpha_type == GGML_TYPE_F16 && cl->ssm_beta_type == GGML_TYPE_F16) {
+                int qkv_rows = cl->ssm_qkv_rows, z_rows = cl->ssm_gate_rows, n_cols = cl->ssm_qkv_cols;
+                void *a[] = { &r->d_ssm_qkv, &r->d_ssm_z, &r->d_ssm_alpha, &r->d_ssm_beta,
+                              &cl->ssm_qkv_w, &cl->ssm_gate_w, &cl->ssm_alpha_w, &cl->ssm_beta_w,
+                              &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
+                LAUNCH(r->fn_ssm_matvec4_iq3xxs, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
             launch_matvec_auto(r, r->d_ssm_qkv,   cl->ssm_qkv_w,   r->d_xb, cl->ssm_qkv_rows,   cl->ssm_qkv_cols,   cl->ssm_qkv_type);
             launch_matvec_auto(r, r->d_ssm_z,      cl->ssm_gate_w,  r->d_xb, cl->ssm_gate_rows,  cl->ssm_gate_cols,  cl->ssm_gate_type);
@@ -9411,12 +9698,18 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                                 r->d_ssm_Q_exp, r->d_ssm_K_exp, V_ptr,
                                 r->d_ssm_alpha, r->d_ssm_beta, dt_rank, d_state);
 
-            if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_Q6_K) {
+             if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_Q6_K) {
                 int nr = cl->ssm_out_rows;
                 int nc = cl->ssm_out_cols;
                 void *a[] = { &r->d_xb, &cl->ssm_out_w, &r->d_ssm_out, &r->d_ssm_z, &cl->ssm_norm_w,
                               &nr, &nc, &dt_rank, &d_state, &eps };
                 LAUNCH(r->fn_fused_ssm_out_gated_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_IQ3_XXS) {
+                int nr = cl->ssm_out_rows;
+                int nc = cl->ssm_out_cols;
+                void *a[] = { &r->d_xb, &cl->ssm_out_w, &r->d_ssm_out, &r->d_ssm_z, &cl->ssm_norm_w,
+                              &nr, &nc, &dt_rank, &d_state, &eps };
+                LAUNCH(r->fn_fused_ssm_out_gated_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_gated_rmsnorm_silu(r, r->d_ssm_out, r->d_ssm_z, cl->ssm_norm_w,
                                          dt_rank, d_state, eps);
@@ -9434,6 +9727,14 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode &&
+                cl->attn_q_type == GGML_TYPE_IQ3_XXS && cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
+                cl->attn_v_type == GGML_TYPE_IQ3_XXS) {
+                int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
+                int nc = cl->attn_q_cols;
+                void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
+                              &qr, &kr, &vr, &nc, &r->d_xb };
+                LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
             launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
                               cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
@@ -9465,6 +9766,11 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nc = cl->attn_output_cols;
                 void *a[] = { &r->d_xb, &cl->attn_output_w, &r->d_xb2, &r->d_attn_gate, &nr, &nc };
                 LAUNCH(r->fn_matvec_out_gated_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode && cl->attn_output_type == GGML_TYPE_IQ3_XXS) {
+                int nr = cl->attn_output_rows;
+                int nc = cl->attn_output_cols;
+                void *a[] = { &r->d_xb, &cl->attn_output_w, &r->d_xb2, &r->d_attn_gate, &nr, &nc };
+                LAUNCH(r->fn_matvec_out_gated_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate, q_dim_local);
                 launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
@@ -9481,6 +9787,14 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode &&
+                cl->attn_q_type == GGML_TYPE_IQ3_XXS && cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
+                cl->attn_v_type == GGML_TYPE_IQ3_XXS) {
+                int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
+                int nc = cl->attn_q_cols;
+                void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
+                              &qr, &kr, &vr, &nc, &r->d_xb };
+                LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
                 launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
@@ -9531,6 +9845,12 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nc = cl->ffn_gate_cols;
                 void *a[] = { &r->d_gate, &cl->ffn_gate_w, &cl->ffn_up_w, &r->d_xb, &n_ff, &nc };
                 LAUNCH(r->fn_ffn_gate_up_silu_q6k, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode &&
+                cl->ffn_gate_type == GGML_TYPE_IQ3_XXS && cl->ffn_up_type == GGML_TYPE_IQ3_XXS) {
+                int n_ff = cl->ffn_gate_rows;
+                int nc = cl->ffn_gate_cols;
+                void *a[] = { &r->d_gate, &cl->ffn_gate_w, &cl->ffn_up_w, &r->d_xb, &n_ff, &nc };
+                LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                               cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
@@ -9543,6 +9863,11 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                 int nc = cl->ffn_down_cols; /* n_ff */
                 void *a[] = { &r->d_x, &cl->ffn_down_w, &r->d_gate, &nr, &nc };
                 LAUNCH(r->fn_matvec_down_residual_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (r->ssm_fused_decode && cl->ffn_down_type == GGML_TYPE_IQ3_XXS) {
+                int nr = cl->ffn_down_rows; /* n_embd */
+                int nc = cl->ffn_down_cols; /* n_ff */
+                void *a[] = { &r->d_x, &cl->ffn_down_w, &r->d_gate, &nr, &nc };
+                LAUNCH(r->fn_matvec_down_residual_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
                 launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                               cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
