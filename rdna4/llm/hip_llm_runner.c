@@ -5034,7 +5034,63 @@ static const char *hip_kernel_source =
 "        }\n"
 "    }\n"
 "}\n"
-"/* Batch top-K + softmax: one block per token. */\n"
+
+"__global__ void dequant_iq2s_all_int8(char *dst, const unsigned char *base,\n"
+"        const int *offs, int rows, int cols, long long stride) {\n"
+"    int e = blockIdx.y;\n"
+"    if (offs[e + 1] == offs[e]) return;\n"
+"    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    if (row >= rows) return;\n"
+"    const unsigned char *mat = base + (long long)e * stride;\n"
+"    int nb = cols / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 82;\n"
+"    char *orow = dst + ((size_t)e * rows + row) * cols;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int gl = g & 31; int ib32 = gl >> 2; int l = gl & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 82;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned char scale = bp[74 + ib32];\n"
+"        float db = (l < 2) ? d * (0.5f + (float)(scale & 0xf)) * 0.25f\n"
+"                           : d * (0.5f + (float)(scale >>  4)) * 0.25f;\n"
+"        int gi = bp[2 + ib32*4 + l] | ((bp[66 + ib32] << (8 - 2*l)) & 0x300);\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[gi];\n"
+"        unsigned char s = bp[34 + ib32*4 + l];\n"
+"        int o = b * 256 + ib32 * 32 + l * 8;\n"
+"        for (int j = 0; j < 8; j++) {\n"
+"            float val = db * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"            orow[o + j] = (char)(int)rintf(val);\n"
+"        }\n"
+"    }\n"
+"}\n"
+"__global__ void dequant_iq3s_all_int8(char *dst, const unsigned char *base,\n"
+"        const int *offs, int rows, int cols, long long stride) {\n"
+"    int e = blockIdx.y;\n"
+"    if (offs[e + 1] == offs[e]) return;\n"
+"    int row = blockIdx.x * 8 + threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
+"    if (row >= rows) return;\n"
+"    const unsigned char *mat = base + (long long)e * stride;\n"
+"    int nb = cols / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 110;\n"
+"    char *orow = dst + ((size_t)e * rows + row) * cols;\n"
+"    for (int g = lane; g < nb * 32; g += 32) {\n"
+"        int b = g >> 5; int g32 = g & 31; int sb = g32 >> 2; int l = g32 & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned char sc = bp[106 + (sb >> 1)];\n"
+"        float db = d * (float)(1 + 2 * ((sb & 1) ? (sc >> 4) : (sc & 0xf)));\n"
+"        unsigned char qh = bp[66 + sb];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3s_grid_dev[bp[2+sb*8+2*l]   | ((qh << (8-2*l)) & 256)];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3s_grid_dev[bp[2+sb*8+2*l+1] | ((qh << (7-2*l)) & 256)];\n"
+"        unsigned char s = bp[74 + sb*4 + l];\n"
+"        int o = b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            float v0 = db * (float)g1[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"            float v1 = db * (float)g2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"            orow[o + j]     = (char)(int)rintf(v0);\n"
+"            orow[o + 4 + j] = (char)(int)rintf(v1);\n"
+"        }\n"
+"    }\n"
+"}\n""/* Batch top-K + softmax: one block per token. */\n"
 "__global__ void moe_topk_batch(const float *logits /*[M,ne]*/, int ne, int K,\n"
 "                                 int *tok_idx /*[M,K]*/, float *tok_w /*[M,K]*/) {\n"
 "    int m = blockIdx.x; int tid = threadIdx.x;\n"
@@ -5182,6 +5238,118 @@ static const char *hip_kernel_source =
 "    return *((half_raw*)&hv);\n"
 "}\n"
 "\n"
+
+"/* INT8 grouped GEMM: Y[t][n] = W_int8[n][:] * X_int8[t][:] via INT8 WMMA.     */\n"
+"/* Grid: (N/128, mtiles, ne) x 256 thr. Same layout as gemm_bf16_grouped but INT8. */\n"
+"__global__ void gemm_int8_grouped(float *Y, const signed char *Wall, const signed char *X,\n"
+"                                  const int *offs, int N, int K) {\n"
+"    typedef int i32x2 __attribute__((ext_vector_type(2)));\n"
+"    typedef int i32x8 __attribute__((ext_vector_type(8)));\n"
+"    int e = blockIdx.z;\n"
+"    int m0 = offs[e], m1 = offs[e + 1];\n"
+"    int M = m1 - m0;\n"
+"    if (M <= 0 || (int)blockIdx.y * 128 >= M) return;\n"
+"    const signed char *W = Wall + (size_t)e * N * K;\n"
+"    const signed char *Xe = X + (size_t)m0 * K;\n"
+"    float *Ye = Y + (size_t)m0 * N;\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int idx_lane = lane & 15;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    __shared__ signed char smA[128*32];\n"
+"    __shared__ signed char smB[128*32];\n"
+"    i32x8 z = {0,0,0,0,0,0,0,0};\n"
+"    i32x8 cv00=z,cv01=z,cv10=z,cv11=z,cv20=z,cv21=z,cv30=z,cv31=z;\n"
+"    int interior = (cta_m0 + 128 <= M) && (cta_n0 + 128 <= N) && ((K & 31) == 0);\n"
+"    for (int k = 0; k < K; k += 32) {\n"
+"        if (interior) {\n"
+"            int er = tid >> 1, ek = (tid & 1) * 16;\n"
+"            // Load smA: 16 INT8 per thread (2 chunks of 8)\n"
+"            for (int it = 0; it < 2; it++) {\n"
+"                int off = it * 8;\n"
+"                int a0 = Xe[(size_t)(cta_m0 + er) * K + k + ek + off];\n"
+"                smA[er * 32 + ek + off] = a0;\n"
+"            }\n"
+"            for (int it = 0; it < 2; it++) {\n"
+"                int off = it * 8;\n"
+"                int b0 = W[(size_t)(cta_n0 + er) * K + k + ek + off];\n"
+"                smB[er * 32 + ek + off] = b0;\n"
+"            }\n"
+"        } else {\n"
+"            for (int it = 0; it < 16; it++) {\n"
+"                int el = tid * 16 + it;\n"
+"                int er = el >> 5, ek = el & 31;\n"
+"                int row = cta_m0 + er, kp = k + ek;\n"
+"                smA[el] = (row < M && kp < K) ? Xe[(size_t)row * K + kp] : 0;\n"
+"            }\n"
+"            for (int it = 0; it < 16; it++) {\n"
+"                int el = tid * 16 + it;\n"
+"                int er = el >> 5, ek = el & 31;\n"
+"                int col = cta_n0 + er, kp = k + ek;\n"
+"                smB[el] = (col < N && kp < K) ? W[(size_t)col * K + kp] : 0;\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 32;\n"
+"        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
+"            // Load 8 INT8 values from smA row (a_base+0+idx_lane) at col kk0..kk0+7\n"
+"            int addr_a0 = (a_base + 0 + idx_lane) * 32 + kk0;\n"
+"            i32x2 a0 = { *(const int*)&smA[addr_a0], *(const int*)&smA[addr_a0 + 4] };\n"
+"            int addr_a1 = (a_base + 16 + idx_lane) * 32 + kk0;\n"
+"            i32x2 a1 = { *(const int*)&smA[addr_a1], *(const int*)&smA[addr_a1 + 4] };\n"
+"            int addr_a2 = (a_base + 32 + idx_lane) * 32 + kk0;\n"
+"            i32x2 a2 = { *(const int*)&smA[addr_a2], *(const int*)&smA[addr_a2 + 4] };\n"
+"            int addr_a3 = (a_base + 48 + idx_lane) * 32 + kk0;\n"
+"            i32x2 a3 = { *(const int*)&smA[addr_a3], *(const int*)&smA[addr_a3 + 4] };\n"
+"            int addr_b0 = (b_base + 0 + idx_lane) * 32 + kk0;\n"
+"            i32x2 b0 = { *(const int*)&smB[addr_b0], *(const int*)&smB[addr_b0 + 4] };\n"
+"            int addr_b1 = (b_base + 16 + idx_lane) * 32 + kk0;\n"
+"            i32x2 b1 = { *(const int*)&smB[addr_b1], *(const int*)&smB[addr_b1 + 4] };\n"
+"            cv00=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,cv00,false);\n"
+"            cv01=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b1,cv01,false);\n"
+"            cv10=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b0,cv10,false);\n"
+"            cv11=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b1,cv11,false);\n"
+"            cv20=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b0,cv20,false);\n"
+"            cv21=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b1,cv21,false);\n"
+"            cv30=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b0,cv30,false);\n"
+"            cv31=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b1,cv31,false);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 32;\n"
+"    i32x8 *accs[8] = {&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31};\n"
+"    int ms[8] = {0,0,16,16,32,32,48,48};\n"
+"    int ns[8] = {0,16,0,16,0,16,0,16};\n"
+"    // Convert INT32 accumulators to F32 and write output\n"
+"    int half = idx_lane >> 3;\n"
+"    for (int t = 0; t < 8; t++) {\n"
+"        int col = wave_n0 + ns[t] + idx_lane;\n"
+"        if (col >= N) continue;\n"
+"        i32x8 acc = *accs[t];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int row = wave_m0 + ms[t] + half * 8 + i;\n"
+"            if (row >= M) continue;\n"
+"            Ye[(size_t)row * N + col] = (float)acc[i];\n"
+"        }\n"
+"    }\n"
+"}\n"
+
+"/* Quantize F32 to INT8 (range-limited, per-element). */\n"
+"__global__ void quantize_f32_act_to_int8(signed char *dst, const float *src, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) {\n"
+"        float v = src[i];\n"
+"        int q = (int)rintf(v);\n"
+"        q = q > 127 ? 127 : (q < -127 ? -127 : q);\n"
+"        dst[i] = (signed char)q;\n"
+"    }\n"
+"}\n"
 "/* Vectorized F32 -> F16 packer (4 per thread). */\n"
 "__global__ void pack_f16_from_f32(half_raw *dst, const float *src, int n) {\n"
 "    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -6014,6 +6182,7 @@ struct hip_llm_runner {
     hipFunction_t fn_silu_mul_f32;
     hipFunction_t fn_add_f32;
     hipFunction_t fn_quantize_f32_to_int8;
+    hipFunction_t fn_quantize_f32_act_to_int8;
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_embed_q8_0;
@@ -6081,6 +6250,11 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_iq2_xxs_all;
     hipFunction_t fn_dequant_iq3_xxs_all;
     hipFunction_t fn_gemm_bf16_grouped;     /* per-expert grouped WMMA GEMM */
+    hipFunction_t fn_gemm_int8_grouped;     /* INT8 WMMA grouped GEMM */
+    hipFunction_t fn_dequant_iq2s_all_int8; /* dequant IQ2_S->INT8 (all experts) */
+    hipFunction_t fn_dequant_iq3s_all_int8; /* dequant IQ3_S->INT8 (all experts) */
+    void *d_expw_int8;                     /* [ne*N*K] int8 weight staging (one type) */
+    void *d_act_int8;                      /* [max_assignments*max_dim] int8 activations */
     hipFunction_t fn_moe_topk_batch;
     hipFunction_t fn_moe_count_offs;
     hipFunction_t fn_moe_fill_gather;
@@ -6091,6 +6265,7 @@ struct hip_llm_runner {
     int  *d_cursor;                         /* [ne] scatter cursor */
     int moe_fused_decode;            /* LLM_MOE_FUSED (default on if types match) */
     int moe_iq2_bm;                  /* IQ2_XXS/IQ3_XXS weights repacked block-major */
+    int moe_int8;                    /* use INT8 WMMA grouped GEMM */
     hipFunction_t fn_matvec_iq2_s_expert_f32;
     hipFunction_t fn_matvec_iq3_s_expert_f32;
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
@@ -6392,7 +6567,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
     GET_FUNC(quantize_f32_to_int8);
-    GET_FUNC(matvec_q8_0_dp4a);
+    GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(embed_q8_0);
     GET_FUNC(matvec_q2_K_f32);
@@ -6455,6 +6630,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_iq2_xxs_all);
     GET_FUNC(dequant_iq3_xxs_all);
     GET_FUNC(gemm_bf16_grouped);
+    GET_FUNC(gemm_int8_grouped);
+    GET_FUNC(dequant_iq2s_all_int8);
+    GET_FUNC(dequant_iq3s_all_int8);
     GET_FUNC(moe_topk_batch);
     GET_FUNC(moe_count_offs);
     GET_FUNC(moe_fill_gather);
@@ -6583,6 +6761,9 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->moe_iq2_bm = 0;
     { const char *e = getenv("LLM_MOE_BM");
       if (e && atoi(e)) { r->moe_iq2_bm = 1; } }
+    r->moe_int8 = 0;
+    { const char *e = getenv("LLM_MOE_INT8");
+      if (e && atoi(e)) { r->moe_int8 = 1; } }
     r->ssm_fused_decode = 1;
     { const char *e = getenv("LLM_SSM_FUSED"); if (e) r->ssm_fused_decode = atoi(e) != 0; }
     r->gemm_own = 1;  /* self-owned WMMA GEMM default (faster than blaslt path) */
@@ -7704,6 +7885,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                     size_t dn = (size_t)ne * r->n_embd * r->expert_ff * 2;
                     size_t sz = gu > dn ? gu : dn;
                     CHECK_HIP(hipMalloc(&r->d_expw_bf16, sz));
+                    CHECK_HIP(hipMalloc(&r->d_expw_int8, sz / 2));  /* INT8: 1 byte vs BF16's 2 */
+                    { size_t _act_sz = (size_t)TA * (r->n_embd > eff ? r->n_embd : eff);
+                      CHECK_HIP(hipMalloc(&r->d_act_int8, _act_sz)); }
                     CHECK_HIP(hipMalloc(&r->d_moe_offs, (size_t)(ne + 1) * sizeof(int)));
                     CHECK_HIP(hipMalloc(&r->d_tok_idx, TA * sizeof(int)));
                     CHECK_HIP(hipMalloc(&r->d_tok_w,   TA * sizeof(float)));
@@ -9000,6 +9184,44 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
           LAUNCH(r->fn_dequant_iq3s_all, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_moe_eout, &r->d_expw_bf16, &r->d_moe_esilu_bf16, &r->d_moe_offs, &n_embd, &eff };
           LAUNCH(r->fn_gemm_bf16_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        goto experts_done;
+    }
+    /* INT8 WMMA grouped path: quantize activations to INT8, dequant weights to INT8,
+     * then INT8 WMMA GEMM. 2x less BW than BF16 path. Gate: LLM_MOE_INT8=1 */
+    if (r->moe_int8 && r->d_act_int8 &&
+        cl->moe_gate_exps_type == GGML_TYPE_IQ2_S &&
+        cl->moe_up_exps_type   == GGML_TYPE_IQ2_S &&
+        cl->moe_down_exps_type == GGML_TYPE_IQ3_S) {
+        if (!gpu_group)
+            hipMemcpyAsync(r->d_moe_offs, offs, (size_t)(ne + 1) * sizeof(int),
+                           hipMemcpyHostToDevice, r->stream);
+        unsigned mtiles = (unsigned)((M + 127) / 128);
+        long long sgu = (long long)cl->moe_exp_stride_gu;
+        long long sdn = (long long)cl->moe_exp_stride_d;
+        /* quantize activations: F32 gather_in -> INT8 act */
+        { int _nq = total * n_embd;
+          void *a[] = { &r->d_act_int8, &r->d_moe_gather_in, &_nq };
+          LAUNCH(r->fn_quantize_f32_act_to_int8, (unsigned)((_nq + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, a); }
+        /* gate: dequant IQ2_S->INT8 + INT8 grouped GEMM */
+        { void *a[] = { &r->d_expw_int8, &cl->moe_gate_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+          LAUNCH(r->fn_dequant_iq2s_all_int8, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eg, &r->d_expw_int8, &r->d_act_int8, &r->d_moe_offs, &eff, &n_embd };
+          LAUNCH(r->fn_gemm_int8_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        /* up: reuses same INT8 activations, dequant weights again */
+        { void *a[] = { &r->d_expw_int8, &cl->moe_up_exps_w, &r->d_moe_offs, &eff, &n_embd, &sgu };
+          LAUNCH(r->fn_dequant_iq2s_all_int8, (unsigned)((eff + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eu, &r->d_expw_int8, &r->d_act_int8, &r->d_moe_offs, &eff, &n_embd };
+          LAUNCH(r->fn_gemm_int8_grouped, (unsigned)((eff + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
+        launch_silu_mul(r, r->d_moe_eg, r->d_moe_eu, total * eff);
+        /* quantize silu output -> INT8 for down */
+        { int _nq = total * eff;
+          void *a[] = { &r->d_act_int8, &r->d_moe_eg, &_nq };
+          LAUNCH(r->fn_quantize_f32_act_to_int8, (unsigned)((_nq + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, a); }
+        /* down: dequant IQ3_S->INT8 + INT8 grouped GEMM */
+        { void *a[] = { &r->d_expw_int8, &cl->moe_down_exps_w, &r->d_moe_offs, &n_embd, &eff, &sdn };
+          LAUNCH(r->fn_dequant_iq3s_all_int8, (unsigned)((n_embd + 7) / 8), ne, 1, 256, 1, 1, 0, r->stream, a); }
+        { void *a[] = { &r->d_moe_eout, &r->d_expw_int8, &r->d_act_int8, &r->d_moe_offs, &n_embd, &eff };
+          LAUNCH(r->fn_gemm_int8_grouped, (unsigned)((n_embd + 127) / 128), mtiles, ne, 256, 1, 1, 0, r->stream, a); }
         goto experts_done;
     }
     /* Grouped path for IQ2_XXS gate/up + IQ3_XXS down (IQ2_M model). */
