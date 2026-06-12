@@ -3640,6 +3640,43 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- Chunked batch_matvec_q8_0: 4 tokens per block (reduces weight reads 4x) ---- */\n"
+"__global__ void batch_matvec_q8_0_x4(float *output, const unsigned char *mat, const float *input,\n"
+"                                      int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= out_dim) return;\n"
+"    int t0 = blockIdx.y * 4;\n"
+"    int nt = n_tokens - t0;\n"
+"    if (nt > 4) nt = 4;\n"
+"    if (nt <= 0) return;\n"
+"    int nb = in_dim / 32;\n"
+"    int row_bytes = nb * 36;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum[4];\n"
+"    for (int t = 0; t < nt; t++) sum[t] = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 36;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        const signed char *qs = (const signed char *)(bp + 4);\n"
+"        float partial[4];\n"
+"        for (int t = 0; t < nt; t++) partial[t] = 0.0f;\n"
+"        for (int i = 0; i < 32; i++) {\n"
+"            float w = d * (float)qs[i];\n"
+"            for (int t = 0; t < nt; t++)\n"
+"                partial[t] += w * input[(size_t)(t0+t) * in_dim + b * 32 + i];\n"
+"        }\n"
+"        for (int t = 0; t < nt; t++) sum[t] += partial[t];\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            sum[t] += __shfl_down_sync(0xFFFFFFFF, sum[t], offset);\n"
+"    if (lane == 0)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            output[(size_t)(t0+t) * out_dim + row] = sum[t];\n"
+"}\n"
+"\n"
 "/* Batched Q2_K matvec: process n_tokens through weight matrix simultaneously */\n"
 "/* Grid: [ceil(out_dim/8), n_tokens], Block: 256 (8 warps) */\n"
 "__global__ void batch_matvec_q2_K(float *output, const unsigned char *mat, const float *input,\n"
@@ -5796,6 +5833,7 @@ struct cuda_llm_runner {
     CUfunction fn_bf16_to_f16_inplace;
     CUfunction fn_batch_embed_f16;
     CUfunction fn_batch_matvec_q8_0_f32;
+    CUfunction fn_batch_matvec_q8_0_x4;
     CUfunction fn_batch_matvec_q2_K;
     CUfunction fn_batch_matvec_q3_K;
     CUfunction fn_batch_matvec_iq2_xxs;
@@ -6280,6 +6318,7 @@ lookup_funcs:
     GET_FUNC(bf16_to_f16_inplace);
     GET_FUNC(batch_embed_f16);
     GET_FUNC(batch_matvec_q8_0_f32);
+    GET_FUNC(batch_matvec_q8_0_x4);
     GET_FUNC(batch_matvec_q2_K);
     GET_FUNC(batch_matvec_q3_K);
     GET_FUNC(batch_matvec_iq2_xxs);
@@ -11147,11 +11186,7 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
             CUdeviceptr d_f32 = r->d_f16_scratch;
             if (!d_f32) {
                 CUresult err = cuMemAlloc(&d_f32, 256*1024*1024);
-                if (err == CUDA_SUCCESS) {
-                    r->d_f16_scratch = d_f32;
-                    if (r->verbose >= 1)
-                        fprintf(stderr, "cuda_llm: F32 dequant scratch allocated (256 MB)\n");
-                }
+                if (err == CUDA_SUCCESS) r->d_f16_scratch = d_f32;
             }
             if (d_f32) {
                 int nb = in_dim / 32;
