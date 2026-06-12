@@ -730,9 +730,9 @@ extern "C" __global__ void moe_expert_fused_q4k(
     }
 }
 
-/* ---- dequant_q8_0_to_f16: Q8_0 weight matrix -> F16 ---- */
+/* ---- dequant_q8_0_to_f16: Q8_0 weight matrix -> F32 (F16 in name for backwards compat) ---- */
 extern "C" __global__ void dequant_q8_0_to_f16(
-    half *dst,
+    float *dst,
     const unsigned char *mat,
     int rows, int cols)
 {
@@ -745,12 +745,12 @@ extern "C" __global__ void dequant_q8_0_to_f16(
     int bk = bid % nb;
 
     const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 36;
-    half *d = dst + (size_t)row * cols + (size_t)bk * 32;
+    float *d = dst + (size_t)row * cols + (size_t)bk * 32;
 
     float scale = __half2float(*(const __half *)bp);
     const signed char *qs = (const signed char *)(bp + 4);
 
     for (int i = 0; i < 32; i++) {
-        d[i] = __float2half(scale * (float)qs[i]);
+        d[i] = scale * (float)qs[i];
     }
 }
