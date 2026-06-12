@@ -11181,7 +11181,7 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_f32_f32, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q8_0) {
-        /* Dequant Q8_0 → F32 + cuBLAS F32 GEMM for batched mode (read weights once) */
+        /* Dequant Q8_0 → F32 + cuBLAS F32 GEMM (reads weights once) */
         if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16 && r->cublas) {
             CUdeviceptr d_f32 = r->d_f16_scratch;
             if (!d_f32) {
@@ -11199,8 +11199,14 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
                 if (gemm_ret == 0) return;
             }
         }
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_batch_matvec_q8_0_f32, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        /* Fallback: x4 chunked (4 tok/block) or per-token */
+        if (n_tokens > 1 && r->fn_batch_matvec_q8_0_x4) {
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q8_0_x4, (out_dim+7)/8, (n_tokens+3)/4, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        } else {
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q8_0_f32, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        }
     } else if (weight_type == GGML_TYPE_Q2_K) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q2_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
