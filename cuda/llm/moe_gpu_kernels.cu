@@ -729,3 +729,28 @@ extern "C" __global__ void moe_expert_fused_q4k(
         __syncthreads();
     }
 }
+
+/* ---- dequant_q8_0_to_f16: Q8_0 weight matrix -> F16 ---- */
+extern "C" __global__ void dequant_q8_0_to_f16(
+    half *dst,
+    const unsigned char *mat,
+    int rows, int cols)
+{
+    int bid = blockIdx.x * 32 + threadIdx.x;
+    int nb = cols / 32, rb = nb * 36;
+    int total_blocks = rows * nb;
+    if (bid >= total_blocks) return;
+
+    int row = bid / nb;
+    int bk = bid % nb;
+
+    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 36;
+    half *d = dst + (size_t)row * cols + (size_t)bk * 32;
+
+    float scale = __half2float(*(const __half *)bp);
+    const signed char *qs = (const signed char *)(bp + 4);
+
+    for (int i = 0; i < 32; i++) {
+        d[i] = __float2half(scale * (float)qs[i]);
+    }
+}
