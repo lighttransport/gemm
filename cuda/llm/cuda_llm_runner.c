@@ -11179,7 +11179,29 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq4_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q4_K) {
-        if (n_tokens > 1 && r->fn_batch_matvec_q4_K_x4) {
+        /* Dequant + F16 matvec for batched mode (read weights once) */
+        if (n_tokens > 1 && r->fn_dequant_q4_K_to_f16 && r->fn_vision_linear_f16) {
+            size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+            CUdeviceptr d_f16 = 0;
+            CUresult err = cuMemAlloc(&d_f16, f16_bytes);
+            if (err == CUDA_SUCCESS) {
+                /* Dequant Q4_K blocks in parallel: grid = ceil(rows*nb / 128), block = 128 */
+                int nb = in_dim / 256;
+                int total_blocks = out_dim * nb;
+                int dequant_grid = (total_blocks + 127) / 128;
+                void *args[] = { &d_f16, &mat, &out_dim, &in_dim };
+                cuLaunchKernel(r->fn_dequant_q4_K_to_f16, dequant_grid, 1, 1, 128, 1, 1, 0, r->stream, args, NULL);
+                /* Use F16 matvec for the actual computation */
+                {
+                    void *a[] = { &dst, &d_f16, &input, &out_dim, &in_dim, &n_tokens };
+                    cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+                }
+                cuMemFree(d_f16);
+            } else {
+                void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+                cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, (n_tokens+3)/4, 1, 256, 1, 1, 0, r->stream, a, NULL);
+            }
+        } else if (n_tokens > 1 && r->fn_batch_matvec_q4_K_x4) {
             int n_groups = (n_tokens + 3) / 4;
             void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
             cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, n_groups, 1, 256, 1, 1, 0, r->stream, a, NULL);
