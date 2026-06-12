@@ -4194,7 +4194,7 @@ static const char *hip_kernel_source =
 "        }\n"
 "    }\n"
 "    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
-"    if (lane == 0) atomicAdd(&x[row], sum);\n"
+"    if (lane == 0) { float v = sum; if (!isnan(v)) atomicAdd(&x[row], v); }\n"
 "}\n"
 "/* ---- matvec_qkv_iq3xxs: fused attn Q/K/V IQ3_XXS matvecs (one launch). */\n"
 "__global__ void matvec_qkv_iq3xxs(float *q, float *k, float *v,\n"
