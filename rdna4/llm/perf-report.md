@@ -692,14 +692,17 @@ IQ3_XXS gather/dequant plus dense-FFN traffic.
 
 ### 12.5 Gemma4 12B (RX 9070 XT, Q6_K_XL)
 
-First-ever Gemma4 inference on AMD HIP (RDNA4). The GGUF lacks V weights for
-8 full-attention layers (shared-KV metadata issue), so output quality is
-unreliable. Performance numbers are valid for a 12B dense model with
-`n_embd=3840, n_heads=16, n_kv_heads=8, n_layers=48, head_dim=512/256`.
+First-ever Gemma4 inference on AMD HIP (RDNA4). llamba.cpp (build 7261) does not
+support the `gemma4` architecture at all, so no ROCm comparison is possible.
+The GGUF lacks V weights for 8 full-attention layers (shared-KV metadata issue),
+so output quality is unreliable. Performance numbers are valid for a 12B dense
+model with `n_embd=3840, n_heads=16, n_kv_heads=8, n_layers=48,
+head_dim=512/256`.
 
 | model | runner | pp6 | tg128 | note |
 |---|---:|---:|---:|---|
 | `Gemma4-12B-Q6_K_XL` | HIP runner | **47.7** | **44.4** | prefill=WMMA, decode=per-row quant matvec |
+| | llama.cpp ROCm | N/A | N/A | arch `gemma4` not implemented upstream |
 
 Configuration: hipBLASLt disabled (own WMMA backend); flash-attn unavailable
 (head_dim=512 > 256); all 48 layers processed per-token; F16 KV cache.
