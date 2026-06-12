@@ -10,19 +10,23 @@ CUBLASEW_SRC = ../cublasew.c
 RUNNER_SRC = cuda_llm_runner.c
 TEST_SRC = test_cuda_llm.c
 MOE_CUBIN = moe_gpu_kernels.cubin
+FA2_CUBIN = fa2_kernels.cubin
 
 TARGET = test_cuda_llm
 
 .PHONY: all clean run help cubin
 
-all: $(MOE_CUBIN) $(TARGET)
+all: $(MOE_CUBIN) $(FA2_CUBIN) $(TARGET)
 
-cubin: $(MOE_CUBIN)
+cubin: $(MOE_CUBIN) $(FA2_CUBIN)
 
 $(MOE_CUBIN): moe_gpu_kernels.cu
 	$(NVCC) -cubin -arch=sm_120 -o $@ $<
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) \
+$(FA2_CUBIN): fa2_kernels.cu
+	$(NVCC) -cubin -arch=sm_120 -o $@ $<
+
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(FA2_CUBIN) \
           cuda_llm_runner.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
