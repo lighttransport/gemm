@@ -692,23 +692,20 @@ IQ3_XXS gather/dequant plus dense-FFN traffic.
 
 ### 12.5 Gemma4 12B (RX 9070 XT, Q6_K_XL)
 
-First-ever Gemma4 inference on AMD HIP (RDNA4). llamba.cpp (build 7261) does not
+First-ever Gemma4 inference on AMD HIP (RDNA4). llama.cpp (build 7261) does not
 support the `gemma4` architecture at all, so no ROCm comparison is possible.
 The GGUF lacks V weights for 8 full-attention layers (shared-KV metadata issue),
 so output quality is unreliable. Performance numbers are valid for a 12B dense
 model with `n_embd=3840, n_heads=16, n_kv_heads=8, n_layers=48,
 head_dim=512/256`.
 
-| model | runner | pp6 | tg128 | note |
-|---|---:|---:|---:|---|
-| `Gemma4-12B-Q6_K_XL` | HIP runner | **47.7** | **44.4** | prefill=WMMA, decode=per-row quant matvec |
-| | llama.cpp ROCm | N/A | N/A | arch `gemma4` not implemented upstream |
+| model | runner | pp512 | pp1024 | tg128 | note |
+|---|---:|---:|---:|---:|---|
+| `Gemma4-12B-Q6_K_XL` | HIP runner | **1097** | **721** | **42.7** | prefill via batched hipBLASLt + batched attn |
 
-Configuration: hipBLASLt disabled (own WMMA backend); flash-attn unavailable
-(head_dim=512 > 256); all 48 layers processed per-token; F16 KV cache.
+Configuration: hipBLASLt batched path for all 48 layers; batched scalar
+attention kernel (`attn_prefill_batch_f32`); per-layer head_dim/kv_heads
+handling for SWA (hd=256) and full-attention (hd=512) layers; GELU activation,
+post-attention/FFN norms, layer output scale added to batched path.
 
-Remaining work:
-- Obtain a complete GGUF with all V-weight tensors for correctness validation
-- PLE (per-layer embedding) injection for multimodal pipelines
-- Proportional RoPE (CPU fallback used standard RoPE as approximation)
-- Shared-KV cache aliasing for full-attention layers
+Decode: 42.7 tok/s (per-row quant matvec via `forward_one_layer`).

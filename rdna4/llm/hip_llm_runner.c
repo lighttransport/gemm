@@ -6098,6 +6098,21 @@ static const char *hip_kernel_source =
 "    value_cache[cache_idx] = v_batch[batch_idx];\n"
 "}\n"
 "\n"
+"/* Variant with separate source/dest strides */\n"
+"__global__ void kv_cache_store_batch_strided(float *key_cache, float *value_cache,\n"
+"    const float *k_batch, const float *v_batch,\n"
+"    int position_start, int M, int kv_dim, int batch_stride) {\n"
+"    int total = M * kv_dim;\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (gid >= total) return;\n"
+"    int row = gid / kv_dim;\n"
+"    int i   = gid - row * kv_dim;\n"
+"    size_t cache_idx = (size_t)(position_start + row) * kv_dim + i;\n"
+"    size_t batch_idx = (size_t)row * batch_stride + i;\n"
+"    key_cache[cache_idx]   = k_batch[batch_idx];\n"
+"    value_cache[cache_idx] = v_batch[batch_idx];\n"
+"}\n"
+"\n"
 "/* Causal WMMA flash-attention for prefill. BQ=64, 4 waves, F16, GQA, head_dim<=128.\n"
 " * Q [M, n_heads*head_dim] F16, K_t/V_t [n_kv_heads, kv_len, head_dim] F16,\n"
 " * out [M, n_heads*head_dim] F32.\n"
@@ -6766,6 +6781,76 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Batched prefill attention: one block per (head, query_index).\n"
+" * Grid = (n_heads, M), blockDim = 256.\n"
+" * Shared memory: max(max_seq_len, 256) * sizeof(float) — max_seq_len for scores,\n"
+" * remainder used for reduction (the kernel only uses up to seq_len+256).\n"
+" * out, q are [M, n_heads, head_dim] strided; key_cache, value_cache are\n"
+" * [max_seq_len, kv_dim]. Each query attends causally to positions 0..pos. */\n"
+"__global__ void attn_prefill_batch_f32(float *out, const float *q,\n"
+"    const float *key_cache, const float *value_cache,\n"
+"    int n_heads, int n_kv_heads, int head_dim, int kv_dim,\n"
+"    int M, int position_start, float scale) {\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    int m = blockIdx.y;\n"
+"    if (h >= n_heads || m >= M) return;\n"
+"    int kv_h = h / (n_heads / n_kv_heads);\n"
+"    int pos = position_start + m;\n"
+"    int seq_len = pos + 1;\n"
+"    const float *qh = q + (size_t)m * n_heads * head_dim + h * head_dim;\n"
+"    float *out_h = out + (size_t)m * n_heads * head_dim + h * head_dim;\n"
+"    float *att_h = smem;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    /* Compute QK scores */\n"
+"    for (int p = tid; p < seq_len; p += nthreads) {\n"
+"        const float *kp = key_cache + (size_t)p * kv_dim + kv_h * head_dim;\n"
+"        float score = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) score += qh[d] * kp[d];\n"
+"        att_h[p] = score * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    /* Softmax: find max */\n"
+"    float max_s = att_h[0];\n"
+"    for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];\n"
+"    float sum_e = 0.0f;\n"
+"    for (int p = tid; p < seq_len; p += nthreads) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }\n"
+"    __syncthreads();\n"
+"    /* Reduce sum_e */\n"
+"    float *red = smem + seq_len;\n"
+"    red[tid] = sum_e;\n"
+"    __syncthreads();\n"
+"    for (int s = nthreads / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) red[tid] += red[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float inv_sum = 1.0f / red[0];\n"
+"    for (int p = tid; p < seq_len; p += nthreads) att_h[p] *= inv_sum;\n"
+"    __syncthreads();\n"
+"    /* Weighted sum of values */\n"
+"    for (int d = tid; d < head_dim; d += nthreads) {\n"
+"        float acc = 0.0f;\n"
+"        for (int p = 0; p < seq_len; p++) {\n"
+"            const float *vp = value_cache + (size_t)p * kv_dim + kv_h * head_dim;\n"
+"            acc += att_h[p] * vp[d];\n"
+"        }\n"
+"        out_h[d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Repack batch buffer from compact per-layer stride to padded max stride.\n"
+" * dst [M * dst_stride] = src [M * src_stride], copying n_per_row elements per row. */\n"
+"__global__ void repack_batch_f32(float *dst, const float *src,\n"
+"    int M, int n_per_row, int src_stride, int dst_stride) {\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = M * n_per_row;\n"
+"    if (gid >= total) return;\n"
+"    int row = gid / n_per_row;\n"
+"    int col = gid - row * n_per_row;\n"
+"    dst[(size_t)row * dst_stride + col] = src[(size_t)row * src_stride + col];\n"
+"}\n"
+"\n"
 "} /* extern \"C\" */\n"
 ;
 
@@ -7105,6 +7190,7 @@ struct hip_llm_runner {
     hipFunction_t fn_rope_neox_batch_f32;
     hipFunction_t fn_rope_mrope_batch_f32;
     hipFunction_t fn_kv_cache_store_batch;
+    hipFunction_t fn_kv_cache_store_batch_strided;
     hipFunction_t fn_flash_attn_wmma_f16_4w_causal;
     hipFunction_t fn_flash_attn_wmma_f16_4w_causal_hd256;
 
@@ -7337,6 +7423,7 @@ struct hip_llm_runner {
     hipFunction_t fn_scale_f32;
     hipFunction_t fn_raw_rmsnorm_heads_f32;
     hipFunction_t fn_attn_decode_swa_f32;
+    hipFunction_t fn_attn_prefill_batch_f32;
     int         cur_position;       /* host-side current position for SWA kernel */
 };
 
@@ -7496,6 +7583,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(scale_f32);
     GET_FUNC(raw_rmsnorm_heads_f32);
     GET_FUNC(attn_decode_swa_f32);
+    GET_FUNC(attn_prefill_batch_f32);
 
     GET_FUNC(pack_bf16_from_f32);
     GET_FUNC(convert_f16_to_bf16);
@@ -7519,6 +7607,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(rope_neox_batch_f32);
     GET_FUNC(rope_mrope_batch_f32);
     GET_FUNC(kv_cache_store_batch);
+    GET_FUNC(kv_cache_store_batch_strided);
     GET_FUNC(flash_attn_wmma_f16_4w_causal);
     GET_FUNC(flash_attn_wmma_f16_4w_causal_hd256);
 
@@ -8781,7 +8870,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         {
             const char *eg = getenv("LLM_GEMM");
             int user_forced = (eg && (strcmp(eg, "own") == 0 || strcmp(eg, "blaslt") == 0));
-            if (!user_forced && eligible && !r->is_moe && r->n_embd >= 4096) {
+            if (!user_forced && eligible && !r->is_moe && (r->n_embd >= 4096 || r->is_gemma4)) {
                 r->gemm_own = 0;  /* prefer hipBLASLt for large dense GEMMs */
             }
         }
@@ -9676,6 +9765,18 @@ static inline void launch_kv_store_batch(hip_llm_runner *r,
            r->stream, args);
 }
 
+/* Strided variant: kv_dim is the destination stride, batch_stride the source. */
+static inline void launch_kv_store_batch_strided(hip_llm_runner *r,
+    void *key_cache, void *value_cache,
+    void *k_batch, void *v_batch,
+    int position_start, int M, int kv_dim, int batch_stride) {
+    int total = M * kv_dim;
+    void *args[] = { &key_cache, &value_cache, &k_batch, &v_batch,
+                     &position_start, &M, &kv_dim, &batch_stride };
+    LAUNCH(r->fn_kv_cache_store_batch_strided, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
 static inline void launch_flash_attn_causal(hip_llm_runner *r,
                                              void *out, void *q_f16,
                                              void *k_f16, void *v_f16,
@@ -9700,6 +9801,21 @@ static inline void launch_flash_attn_causal(hip_llm_runner *r,
         LAUNCH(r->fn_flash_attn_wmma_f16_4w_causal_hd256, n_heads, q_blocks, 1, 128, 1, 1,
                smem_bytes, r->stream, args);
     }
+}
+
+/* Batched scalar attention for prefill: grid (n_heads, M), block 256.
+ * Works for any head_dim. Shared memory = (max_seq_len + 256) * sizeof(float)
+ * but the launch caller must allocate enough. */
+static inline void launch_attn_prefill_batch(hip_llm_runner *r,
+    void *out, void *q, void *key_cache, void *value_cache,
+    int n_heads, int n_kv_heads, int head_dim, int kv_dim,
+    int M, int position_start, float scale) {
+    void *args[] = { &out, &q, &key_cache, &value_cache,
+        &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+        &M, &position_start, &scale };
+    size_t smem = ((size_t)r->max_seq_len + 256) * sizeof(float);
+    LAUNCH(r->fn_attn_prefill_batch_f32, n_heads, M, 1, 256, 1, 1,
+           smem, r->stream, args);
 }
 
 /* SSM launch helpers */
@@ -11318,70 +11434,92 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                                 r->d_qfull_batch, n_heads, head_dim, M);
             }
         }
+
+        /* Gemma4 per-layer dimensions (used by K/V GEMMs, bias, QK-norm, RoPE, KV store, attention) */
+        int l_hd = head_dim, l_qdim = q_dim, l_kvdim = kv_dim, l_nkv = n_kv_heads;
+        if (r->is_gemma4) {
+            l_hd = cl->local_head_dim ? cl->local_head_dim : head_dim;
+            l_nkv = cl->local_kv_heads ? cl->local_kv_heads : n_kv_heads;
+            l_qdim = n_heads * l_hd;
+            l_kvdim = l_nkv * l_hd;
+        }
+
         {
             void *kw = get_bf16_weight(r, cl->attn_k_w, cl->attn_k_w_bf16,
                                        cl->attn_k_type, cl->attn_k_rows, cl->attn_k_cols);
             if (!kw) return -1;
             if (gemm_run_bf16_w(r, r->d_k_batch, kw,
-                                   r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+                                   r->d_xnorm_batch_bf16, M, l_kvdim, n_embd, r->stream) != 0) return -1;
         }
         {
             void *vw = get_bf16_weight(r, cl->attn_v_w, cl->attn_v_w_bf16,
                                        cl->attn_v_type, cl->attn_v_rows, cl->attn_v_cols);
-            if (!vw) return -1;
-            if (gemm_run_bf16_w(r, r->d_v_batch, vw,
-                                   r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+            if (!vw || cl->attn_v_rows <= 0) {
+                hipMemsetAsync(r->d_v_batch, 0, (size_t)M * l_kvdim * sizeof(float), r->stream);
+            } else if (gemm_run_bf16_w(r, r->d_v_batch, vw,
+                                           r->d_xnorm_batch_bf16, M, l_kvdim, n_embd, r->stream) != 0) return -1;
         }
 
-        /* ---- Biases (per-row loop kept; one launch per row is cheap, only 3 × M
-         *      ~ several thousand launches at L=1024 — defer to a batched bias kernel
-         *      if it shows up in profile. QK-norm is the heavy one and is batched.) ---- */
+        /* ---- Biases ---- */
         if (cl->attn_q_bias || cl->attn_k_bias || cl->attn_v_bias) {
             for (int m = 0; m < M; m++) {
-                float *qrow = (float *)r->d_q_batch + (size_t)m * q_dim;
-                float *krow = (float *)r->d_k_batch + (size_t)m * kv_dim;
-                float *vrow = (float *)r->d_v_batch + (size_t)m * kv_dim;
-                if (cl->attn_q_bias) launch_add(r, qrow, cl->attn_q_bias, q_dim);
-                if (cl->attn_k_bias) launch_add(r, krow, cl->attn_k_bias, kv_dim);
-                if (cl->attn_v_bias) launch_add(r, vrow, cl->attn_v_bias, kv_dim);
+                float *qrow = (float *)r->d_q_batch + (size_t)m * l_qdim;
+                float *krow = (float *)r->d_k_batch + (size_t)m * l_kvdim;
+                float *vrow = (float *)r->d_v_batch + (size_t)m * l_kvdim;
+                if (cl->attn_q_bias) launch_add(r, qrow, cl->attn_q_bias, l_qdim);
+                if (cl->attn_k_bias) launch_add(r, krow, cl->attn_k_bias, l_kvdim);
+                if (cl->attn_v_bias) launch_add(r, vrow, cl->attn_v_bias, l_kvdim);
             }
         }
         /* ---- QK-norm: batched over M rows ---- */
         if (cl->has_qk_norm) {
             if (cl->attn_q_norm_w)
                 launch_qknorm_batch(r, r->d_q_batch, cl->attn_q_norm_w,
-                                    n_heads,    head_dim, M, q_dim,  eps);
+                                    n_heads, l_hd, M, q_dim, eps);
             if (cl->attn_k_norm_w)
                 launch_qknorm_batch(r, r->d_k_batch, cl->attn_k_norm_w,
-                                    n_kv_heads, head_dim, M, kv_dim, eps);
+                                    l_nkv, l_hd, M, kv_dim, eps);
         }
 
         /* ---- Batched RoPE on Q and K (one launch each, grid=(n_heads, M)) ---- */
         if (r->use_mrope) {
             int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
             int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
-            launch_rope_mrope_batch(r, r->d_q_batch, n_heads,    head_dim,
+            launch_rope_mrope_batch(r, r->d_q_batch, n_heads,    l_hd,
                                     position_start, r->rope_freq_base,
                                     s0, s1, s2, s3, q_dim,  M);
-            launch_rope_mrope_batch(r, r->d_k_batch, n_kv_heads, head_dim,
+            launch_rope_mrope_batch(r, r->d_k_batch, l_nkv, l_hd,
                                     position_start, r->rope_freq_base,
                                     s0, s1, s2, s3, kv_dim, M);
         } else {
-            launch_rope_neox_batch(r, r->d_q_batch, n_heads,    head_dim,
+            launch_rope_neox_batch(r, r->d_q_batch, n_heads,    l_hd,
                                    position_start, r->rope_freq_base,
                                    r->n_rope_pairs, q_dim,  M);
-            launch_rope_neox_batch(r, r->d_k_batch, n_kv_heads, head_dim,
+            launch_rope_neox_batch(r, r->d_k_batch, l_nkv, l_hd,
                                    position_start, r->rope_freq_base,
                                    r->n_rope_pairs, kv_dim, M);
         }
 
-        /* ---- Batched KV cache store (M rows in one launch) ---- */
-        launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
-                              r->d_k_batch, r->d_v_batch,
-                              position_start, M, kv_dim);
+        /* ---- Batched KV cache store ---- */
+        if (r->is_gemma4) {
+            launch_kv_store_batch_strided(r, r->d_key_cache[l], r->d_value_cache[l],
+                                          r->d_k_batch, r->d_v_batch,
+                                          position_start, M, l_kvdim, kv_dim);
+        } else {
+            launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
+                                  r->d_k_batch, r->d_v_batch,
+                                  position_start, M, kv_dim);
+        }
 
-        /* ---- Attention: WMMA flash-attention if eligible, else per-row scalar ---- */
-        if (r->fa_path_ok) {
+        /* ---- Attention ---- */
+        if (r->is_gemma4) {
+            /* Gemma4: batched scalar attention for any head_dim */
+            float l_scale = 1.0f / sqrtf((float)l_hd);
+            launch_attn_prefill_batch(r, r->d_attn_out_batch, r->d_q_batch,
+                                       r->d_key_cache[l], r->d_value_cache[l],
+                                       n_heads, l_nkv, l_hd, l_kvdim,
+                                       M, position_start, l_scale);
+        } else if (r->fa_path_ok) {
             int kv_len = position_start + M;
             /* Pack K/V cache slice [0..kv_len) into transposed F16 scratch. */
             launch_pack_kv_cache_f16(r,
@@ -11416,18 +11554,27 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         }
 
         /* ---- Output projection: [M, q_dim] x W_o^T -> [M, n_embd] ---- */
+        int attn_out_elems = M * (r->is_gemma4 ? l_qdim : q_dim);
         launch_pack_bf16_from_f32(r, r->d_attn_out_batch_bf16,
-                                  r->d_attn_out_batch, M * q_dim);
+                                  r->d_attn_out_batch, attn_out_elems);
         {
             void *ow = get_bf16_weight(r, cl->attn_output_w, cl->attn_output_w_bf16,
                                        cl->attn_output_type, cl->attn_output_rows, cl->attn_output_cols);
             if (!ow) return -1;
+            int o_rows = r->is_gemma4 ? l_qdim : q_dim;
             if (gemm_run_bf16_w(r, r->d_attn_proj_batch, ow,
-                                   r->d_attn_out_batch_bf16, M, n_embd, q_dim, r->stream) != 0) return -1;
+                                   r->d_attn_out_batch_bf16, M, n_embd, o_rows, r->stream) != 0) return -1;
         }
 
         /* Residual: x_batch += attn_proj */
         launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
+
+        /* Gemma4: post-attention norm */
+        if (r->is_gemma4 && cl->post_attn_norm_w) {
+            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
+                                 cl->post_attn_norm_w, n_embd, M, n_embd, eps);
+            launch_add(r, r->d_x_batch, r->d_xnorm_batch, M * n_embd);
+        }
 
 ffn_section:
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
@@ -11473,7 +11620,13 @@ ffn_section:
         }
 
         /* SiLU(gate) * up — elementwise across [M, n_ff] */
-        launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+        if (r->is_gemma4) {
+            int n = M * n_ff;
+            void *a[] = { &r->d_gate_batch, &r->d_up_batch, &n };
+            LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        } else {
+            launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+        }
 
         /* Pack and down projection */
         launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
@@ -11486,8 +11639,22 @@ ffn_section:
                                    r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
         }
 
-        /* Residual */
-        launch_add(r, r->d_x_batch, r->d_down_batch, M * n_embd);
+        /* Residual + Gemma4 post-FFN norm */
+        if (r->is_gemma4 && cl->post_ffw_norm_w) {
+            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_down_batch,
+                                 cl->post_ffw_norm_w, n_embd, M, n_embd, eps);
+            launch_add(r, r->d_x_batch, r->d_xnorm_batch, M * n_embd);
+        } else {
+            launch_add(r, r->d_x_batch, r->d_down_batch, M * n_embd);
+        }
+
+        /* Gemma4 layer output scale */
+        if (r->is_gemma4 && cl->layer_scale_val != 1.0f) {
+            int n = M * n_embd;
+            float sv = cl->layer_scale_val;
+            void *a[] = { &r->d_x_batch, &sv, &n };
+            LAUNCH(r->fn_scale_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
 
         /* DeepStack injection (per-row) — keep parity with per-token path */
         if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
