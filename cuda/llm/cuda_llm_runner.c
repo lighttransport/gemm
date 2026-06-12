@@ -5345,11 +5345,13 @@ static const char *cuda_kernel_source =
 "\n"
 "/* ---- Fused causal softmax: applies causal mask + softmax to scores ---- */\n"
 "/* scores [n_q_tokens x seq_len] in-place. Grid: n_q_tokens. */\n"
+"/* tok_div = token index divisor for GQA groups (e.g., 2 for gqa_ratio=2) */\n"
 "__global__ void causal_softmax_f32(float *scores, int n_q_tokens,\n"
-"                                    int seq_len, int start_pos) {\n"
+"                                    int seq_len, int start_pos, int tok_div) {\n"
 "    int qi = blockIdx.x;\n"
 "    if (qi >= n_q_tokens) return;\n"
-"    int kv_lim = start_pos + qi + 1;\n"
+"    int tok = qi / tok_div;\n"
+"    int kv_lim = start_pos + tok + 1;\n"
 "    if (kv_lim > seq_len) kv_lim = seq_len;\n"
 "    int tid = threadIdx.x;\n"
 "    int nt = blockDim.x;\n"
@@ -11348,6 +11350,64 @@ static void launch_fa2_attention_swa(cuda_llm_runner *r, CUdeviceptr out, CUdevi
                          head_dim, kv_dim, adj_scale);
 }
 
+/* ---- cuBLAS-based D=512 attention: per-KV-head GEMM + softmax + GEMM ---- */
+/* Q_batch: F32 [n_tokens * q_dim]. K/V cache: F16 [max_seq_len * kv_dim].
+   Uses cuBLAS F16 GEMM for Q@K^T and P@V with custom causal softmax. */
+static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
+                                          CUdeviceptr key_cache, CUdeviceptr value_cache,
+                                          int n_tokens, int start_pos, int n_heads, int n_kv_heads,
+                                          int head_dim, int kv_dim, float scale) {
+    if (!r->cublas || !r->fn_fa2_attn_256 || !r->d_fa2_q_f16) return;
+    int gqa = n_heads / n_kv_heads;
+    int q_dim = n_heads * head_dim;
+    int sq = gqa * n_tokens;
+    int total_s = start_pos + n_tokens;
+    
+    /* Convert Q batch F32 to F16 */
+    int n_q = n_tokens * q_dim;
+    CUdeviceptr q_f16 = r->d_fa2_q_f16;
+    {
+        void *args[] = { &q_f16, &q_batch, &n_q };
+        cuLaunchKernel(r->fn_convert_f32_to_f16, (n_q+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    }
+
+    /* Scores scratch: F32 [sq * total_s] - reuse d_fa2_o_f16 as F32 */
+    CUdeviceptr scores = r->d_fa2_o_f16;
+
+    /* Per KV head: GEMM, softmax, GEMM */
+    for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+        /* Q_group: F16 [sq, head_dim] */
+        CUdeviceptr qg = q_f16 + (size_t)kv_h * gqa * head_dim * sizeof(uint16_t);
+        
+        /* K_head: F16 [total_s, head_dim] (interleaved stride = kv_dim) */
+        CUdeviceptr k_head = key_cache + (size_t)kv_h * head_dim * sizeof(uint16_t);
+        
+        /* Step 1: cuBLAS F16 GEMM: Q_group @ K^T -> scores [sq, total_s] F32 */
+        cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, scores, k_head, qg,
+                                               sq, total_s, head_dim);
+        
+        /* Step 2: Causal softmax on scores */
+        {
+            void *args[] = { &scores, &sq, &total_s, &start_pos, &gqa };
+            cuLaunchKernel(r->fn_causal_softmax_f32, sq, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+        }
+        
+        /* Step 3: cuBLAS F16 GEMM: P' @ V -> output [sq, head_dim] F32 */
+        /* scores are F32, but cuBLAS needs F16. Convert scores to F16 first. */
+        {
+            int n_scores = sq * total_s;
+            void *args[] = { &q_f16, &scores, &n_scores };  /* reuse q_f16 as F16 scores scratch */
+            cuLaunchKernel(r->fn_convert_f32_to_f16, (n_scores+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+        }
+        
+        CUdeviceptr v_head = value_cache + (size_t)kv_h * head_dim * sizeof(uint16_t);
+        CUdeviceptr out_group = out + (size_t)kv_h * gqa * head_dim * sizeof(float);
+        /* P(F16) @ V(F16)^T -> output F32: cublas computes C = A @ B^T */
+        cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, out_group, v_head, q_f16,
+                                               sq, head_dim, total_s);
+    }
+}
+
 /* Ensure pre-allocated batch buffers are large enough for n_tokens */
 static int cuda_llm_ensure_batch_buffers(cuda_llm_runner *r, int n_tokens) {
     if (n_tokens <= r->batch_buf_max_tokens) return 0;
@@ -12296,8 +12356,14 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                                     r->d_key_cache[kv_src], r->d_value_cache[kv_src],
                                     n_tokens, start_pos, n_heads, layer_kv_heads,
                                     hd, local_kv_dim, attn_scale);
+            } else if (r->cublas && r->fn_causal_softmax_f32 && r->d_fa2_q_f16) {
+                /* cuBLAS-based D=512 attention (per-KV-head GEMM + softmax + GEMM) */
+                launch_cublas_d512_attention(r, d_batch_xb2, d_batch_q,
+                                            r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                                            n_tokens, start_pos, n_heads, layer_kv_heads,
+                                            hd, local_kv_dim, attn_scale);
             } else if (r->fn_batch_attn_all_tokens_f32) {
-                /* Use all-tokens-per-head kernel for D=512 (reads KV once per head) */
+                /* All-tokens-per-head kernel for D=512 (reads KV once per head) */
                 int max_seq = start_pos + n_tokens;
                 size_t smem = (size_t)n_tokens * max_seq * sizeof(float);
                 void *a[] = { &d_batch_xb2, &d_batch_q,
