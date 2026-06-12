@@ -7678,6 +7678,8 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 if (n > r->n_layers) n = r->n_layers;
                 uint8_t *data = (uint8_t *)gguf->kv[idx].value.arr.data;
                 for (int i = 0; i < n; i++) r->swa_pattern[i] = data[i] ? 1 : 0;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "cuda_llm: Gemma4 SWA pattern loaded (%d layers, first=%d)\n", n, r->swa_pattern[0]);
             } else {
                 for (int i = 0; i < r->n_layers; i++)
                     r->swa_pattern[i] = ((i + 1) % 6 != 0) ? 1 : 0;
@@ -11179,24 +11181,24 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq4_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q4_K) {
-        /* Dequant + F16 matvec for batched mode (read weights once) */
-        if (n_tokens > 1 && r->fn_dequant_q4_K_to_f16 && r->fn_vision_linear_f16) {
+        /* Dequant + cuBLAS F16 GEMM for batched mode (read weights once) */
+        if (n_tokens > 1 && r->fn_dequant_q4_K_to_f16 && r->cublas) {
             size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
             CUdeviceptr d_f16 = 0;
             CUresult err = cuMemAlloc(&d_f16, f16_bytes);
             if (err == CUDA_SUCCESS) {
-                /* Dequant Q4_K blocks in parallel: grid = ceil(rows*nb / 128), block = 128 */
                 int nb = in_dim / 256;
                 int total_blocks = out_dim * nb;
                 int dequant_grid = (total_blocks + 127) / 128;
                 void *args[] = { &d_f16, &mat, &out_dim, &in_dim };
                 cuLaunchKernel(r->fn_dequant_q4_K_to_f16, dequant_grid, 1, 1, 128, 1, 1, 0, r->stream, args, NULL);
-                /* Use F16 matvec for the actual computation */
-                {
-                    void *a[] = { &dst, &d_f16, &input, &out_dim, &in_dim, &n_tokens };
-                    cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
-                }
+                int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_f16, input,
+                                                                      n_tokens, out_dim, in_dim);
+                if (r->verbose >= 1 && gemm_ret != 0)
+                    fprintf(stderr, "cuda_llm: cuBLAS GEMM Q4_K failed (%d, n_tok=%d, out=%d, in=%d)\n",
+                            gemm_ret, n_tokens, out_dim, in_dim);
                 cuMemFree(d_f16);
+                if (gemm_ret == 0) return;
             } else {
                 void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
                 cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, (n_tokens+3)/4, 1, 256, 1, 1, 0, r->stream, a, NULL);
@@ -11496,7 +11498,9 @@ static int cuda_llm_ensure_batch_buffers(cuda_llm_runner *r, int n_tokens) {
     if (r->d_batch_f16_scratch) { cuMemFree(r->d_batch_f16_scratch); r->d_batch_f16_scratch = 0; }
     /* Lazily create cuBLAS handle on first batch buffer allocation */
     if (r->use_cublas && !r->cublas) {
-        if (cublasewCreate(&r->cublas, r->stream) == 0 && r->verbose >= 1)
+        int cublas_ret = cublasewCreate(&r->cublas, r->stream);
+        fprintf(stderr, "cuda_llm: cuBLAS handle creation: ret=%d handle=%p\n", cublas_ret, (void*)r->cublas);
+        if (cublas_ret == 0 && r->verbose >= 1)
             fprintf(stderr, "cuda_llm: cuBLAS handle created\n");
     }
     if (r->use_cublas && r->cublas) {
@@ -12246,35 +12250,40 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
 
     /* Upload token embeddings */
     if (token_ids) {
-        /* Token ID path: use single-token forward for embedding, read back from GPU */
-        h_embd = (float *)malloc(batch_embd);
-        if (!h_embd) {
-            fprintf(stderr, "cuda_llm: generic prefill host embedding buffer alloc failed\n");
-            goto cleanup;
-        }
-        for (int t = 0; t < n_tokens; t++) {
-            /* Use the existing embed kernel (handles Q8_0 padding, Q4_K, etc.) */
-            if (r->token_embd_type == GGML_TYPE_Q8_0) {
-                launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
-            } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
-                launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
-            } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
-                int32_t tok = token_ids[t];
-                void *ea[] = { &r->d_x, &r->d_token_embd, &tok, &n_embd };
-                cuLaunchKernel(r->fn_embed_q4_K, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
-            } else {
-                launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+        /* Embed each token directly into batch buffer (no host round-trip) */
+        if (r->token_embd_type == GGML_TYPE_Q8_0) {
+            for (int t = 0; t < n_tokens; t++) {
+                CUdeviceptr dst = d_batch_x + (size_t)t * n_embd * sizeof(float);
+                launch_embed_q8_0(r, dst, r->d_token_embd, token_ids[t], n_embd);
+                if (r->is_gemma4) {
+                    void *args[] = { &dst, &r->embd_scale, &n_embd };
+                    cuLaunchKernel(r->fn_scale_f32, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                }
             }
-            if (r->is_gemma4) launch_scale(r, r->d_x, r->embd_scale, n_embd);
-            CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x,
-                                                         n_embd * sizeof(float), r->stream),
-                                       "embedding download");
+        } else {
+            h_embd = (float *)malloc(batch_embd);
+            if (!h_embd) { fprintf(stderr, "cuda_llm: generic prefill host embedding buffer alloc failed\n"); goto cleanup; }
+            for (int t = 0; t < n_tokens; t++) {
+                if (r->token_embd_type == GGML_TYPE_Q2_K) {
+                    launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+                } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
+                    int32_t tok = token_ids[t];
+                    void *ea[] = { &r->d_x, &r->d_token_embd, &tok, &n_embd };
+                    cuLaunchKernel(r->fn_embed_q4_K, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
+                } else {
+                    launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+                }
+                if (r->is_gemma4) launch_scale(r, r->d_x, r->embd_scale, n_embd);
+                CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x,
+                                                             n_embd * sizeof(float), r->stream),
+                                           "embedding download");
+            }
+            CLLM_PREFILL_CU_OR_CLEANUP(cuStreamSynchronize(r->stream), "embedding sync");
+            CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyHtoD(d_batch_x, h_embd, batch_embd),
+                                       "embedding batch upload");
+            free(h_embd);
+            h_embd = NULL;
         }
-        CLLM_PREFILL_CU_OR_CLEANUP(cuStreamSynchronize(r->stream), "embedding sync");
-        CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyHtoD(d_batch_x, h_embd, batch_embd),
-                                   "embedding batch upload");
-        free(h_embd);
-        h_embd = NULL;
     } else if (embeddings) {
         /* Pre-computed embeddings path */
         if (embd_stride == n_embd) {
@@ -12296,11 +12305,32 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     if (r->is_gemma4 && token_ids)
         r->current_token_id = token_ids[n_tokens - 1];
 
+    /* Lazily create cuBLAS handle and allocate FA2 F16 buffers */
+    if (r->use_cublas && !r->cublas) {
+        int cublas_ret = cublasewCreate(&r->cublas, r->stream);
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: cuBLAS handle creation: ret=%d\n", cublas_ret);
+    }
+    if (r->fn_fa2_attn_256 && !r->d_fa2_q_f16 && n_tokens > 0) {
+        int max_hd = (n_heads * r->head_dim_full) > (n_heads * r->head_dim_swa) ?
+                      (n_heads * r->head_dim_full) : (n_heads * r->head_dim_swa);
+        int max_s = n_tokens > 128 ? n_tokens : 128;
+        if (cuMemAlloc(&r->d_fa2_q_f16, (size_t)max_s * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
+            r->d_fa2_q_f16 = 0;
+        if (cuMemAlloc(&r->d_fa2_o_f16, (size_t)max_s * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
+            r->d_fa2_o_f16 = 0;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: FA2 F16 buffers allocated (max_tok=%d, max_hd=%d, q=%s, o=%s)\n",
+                    max_s, max_hd, r->d_fa2_q_f16 ? "OK" : "FAIL", r->d_fa2_o_f16 ? "OK" : "FAIL");
+    }
+
     int n_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < n_layers) n_layers = r->max_layers;
 
     /* Process transformer blocks */
+    double profile_layer_ms = 0;
     for (int l = 0; l < n_layers; l++) {
+        double _tl0 = get_time_ms();
         cuda_layer *cl = &r->layers[l];
         if (cl->is_ssm) {
             fprintf(stderr,
@@ -12320,6 +12350,8 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
           cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
 
         /* 2. Q/K/V projections (batched) */
+        if (r->debug_layers >= 3) cuStreamSynchronize(r->stream);
+        double _proj_t0 = (r->debug_layers >= 3) ? get_time_ms() : 0;
         launch_batch_matvec(r, d_batch_q, cl->attn_q_w, 0, d_batch_xb,
                             cl->attn_q_rows, cl->attn_q_cols, n_tokens, cl->attn_q_type);
         if (cl->shared_kv_source < 0) {
@@ -12337,10 +12369,11 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
         int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
         float attn_scale = 1.0f;
 
-        if (!cl->is_swa) {
-            /* ----- Batched path for full-attention layers ----- */
+        if (!cl->is_swa || start_pos + n_tokens <= r->swa_window_size) {
+            /* ----- Batched path for full-attention or non-wrapping SWA ----- */
             int total_q_heads = n_tokens * n_heads;
             int total_kv_heads = n_tokens * layer_kv_heads;
+            float rope_base = cl->is_swa ? r->rope_freq_base_swa : r->rope_freq_base;
 
             if (cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) {
@@ -12359,11 +12392,17 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                 }
             }
 
-            launch_batch_rope_with_factors(r, d_batch_q, n_heads, n_tokens, hd,
-                                           start_pos, r->d_rope_inv_freq_full);
-            if (cl->shared_kv_source < 0)
-                launch_batch_rope_with_factors(r, d_batch_k, layer_kv_heads, n_tokens, hd,
+            if (cl->is_swa) {
+                launch_batch_rope(r, d_batch_q, n_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa);
+                if (cl->shared_kv_source < 0)
+                    launch_batch_rope(r, d_batch_k, layer_kv_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa);
+            } else {
+                launch_batch_rope_with_factors(r, d_batch_q, n_heads, n_tokens, hd,
                                                start_pos, r->d_rope_inv_freq_full);
+                if (cl->shared_kv_source < 0)
+                    launch_batch_rope_with_factors(r, d_batch_k, layer_kv_heads, n_tokens, hd,
+                                                   start_pos, r->d_rope_inv_freq_full);
+            }
 
             if (cl->shared_kv_source < 0) {
                 void *kva[] = { &r->d_key_cache[l], &r->d_value_cache[l], &d_batch_k, &d_batch_v,
@@ -12373,19 +12412,19 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                                256, 1, 1, 0, r->stream, kva, NULL);
             }
 
-            if (hd == 256 && r->fn_fa2_attn_256 && r->d_fa2_q_f16) {
+            if (r->debug_layers >= 3) cuStreamSynchronize(r->stream);
+            double _attn_t0 = (r->debug_layers >= 3) ? get_time_ms() : 0;
+            if (n_tokens >= 64 && hd == 256 && r->fn_fa2_attn_256 && r->d_fa2_q_f16) {
                 launch_fa2_attention(r, d_batch_xb2, d_batch_q,
                                     r->d_key_cache[kv_src], r->d_value_cache[kv_src],
                                     n_tokens, start_pos, n_heads, layer_kv_heads,
                                     hd, local_kv_dim, attn_scale);
-            } else if (r->cublas && r->fn_causal_softmax_f32 && r->d_fa2_q_f16) {
-                /* cuBLAS-based D=512 attention (per-KV-head GEMM + softmax + GEMM) */
+            } else if (n_tokens >= 64 && r->cublas && r->fn_causal_softmax_f32 && r->d_fa2_q_f16) {
                 launch_cublas_d512_attention(r, d_batch_xb2, d_batch_q,
                                             r->d_key_cache[kv_src], r->d_value_cache[kv_src],
                                             n_tokens, start_pos, n_heads, layer_kv_heads,
                                             hd, local_kv_dim, attn_scale);
-            } else if (r->fn_batch_attn_all_tokens_f32) {
-                /* All-tokens-per-head kernel for D=512 (reads KV once per head) */
+            } else if (n_tokens >= 64 && r->fn_batch_attn_all_tokens_f32) {
                 int max_seq = start_pos + n_tokens;
                 size_t smem = (size_t)n_tokens * max_seq * sizeof(float);
                 void *a[] = { &d_batch_xb2, &d_batch_q,
@@ -12395,10 +12434,17 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                 cuLaunchKernel(r->fn_batch_attn_all_tokens_f32,
                                n_heads, 1, 1, 256, 1, 1, smem, r->stream, a, NULL);
             } else {
+                /* For smaller batches (<64 tokens), use batch_attn_causal_f32
+                   which has better occupancy (n_heads × n_tokens blocks) */
                 launch_batch_attention(r, d_batch_xb2, d_batch_q,
                                       r->d_key_cache[kv_src], r->d_value_cache[kv_src],
                                       n_tokens, start_pos, n_heads, layer_kv_heads,
                                       hd, local_kv_dim, attn_scale);
+            }
+            if (r->debug_layers >= 3) {
+                cuStreamSynchronize(r->stream);
+                double _attn_t1 = get_time_ms();
+                fprintf(stderr, "    layer %d attn: %.2f ms\n", l, _attn_t1 - _attn_t0);
             }
         } else {
             /* ----- Per-token path for SWA layers (circular KV cache) ----- */
@@ -12452,6 +12498,11 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
           void *a[] = { &d_batch_x, &d_batch_xb, &total };
           cuLaunchKernel(r->fn_vision_add, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
 
+        if (r->debug_layers >= 3) {
+            cuStreamSynchronize(r->stream);
+            double _proj_t1 = get_time_ms();
+            fprintf(stderr, "    layer %d proj+attn: %.2f ms\n", l, _proj_t1 - _proj_t0);
+        }
         /* 7. Batched FFN */
         cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd, r->stream);
         { void *a[] = { &d_batch_xb, &cl->ffn_norm_w, &n_embd, &eps, &n_tokens };
@@ -12552,6 +12603,17 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             void *a[] = { &d_batch_x, &sv, &total };
             cuLaunchKernel(r->fn_vision_scale, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
         }
+
+        if (r->debug_layers >= 2) {
+            cuStreamSynchronize(r->stream);
+            double _tl1 = get_time_ms();
+            fprintf(stderr, "  prefill layer %d/%d: %.1f ms (hd=%d, swa=%d, kv_h=%d)\n",
+                    l, n_layers, _tl1 - _tl0, hd, cl->is_swa, layer_kv_heads);
+        }
+    }
+    if (r->debug_layers >= 2) {
+        cuStreamSynchronize(r->stream);
+        fprintf(stderr, "cuda_llm: prefill %d layers done\n", n_layers);
     }
 
     /* Final RMSNorm on last token */
