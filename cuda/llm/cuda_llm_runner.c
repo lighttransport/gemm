@@ -5916,6 +5916,7 @@ struct cuda_llm_runner {
     CUfunction fn_moe_f16_tc;
     CUfunction fn_moe_prefill_q4k;
     CUfunction fn_dequant_q4_K_to_f16;
+    CUfunction fn_dequant_q8_0_to_f16;
     CUfunction fn_moe_expert_fused_q4k;
     CUdeviceptr d_topk_idx;   /* [n_used * max_tokens] int */
     CUdeviceptr d_topk_wgt;   /* [n_used * max_tokens] float */
@@ -6029,6 +6030,7 @@ struct cuda_llm_runner {
     CUdeviceptr d_batch_token_ids; /* [max_tokens] int32 */
     CUdeviceptr d_fa2_q_f16; /* [max_tokens * max_dim_h] F16 for FA2 Q input */
     CUdeviceptr d_fa2_o_f16; /* [max_tokens * max_dim_h] F16 for FA2 O output */
+    CUdeviceptr d_f16_scratch; /* [max_out * max_in] F16 dequant scratch for Q8_0 GEMM */
     CUdeviceptr d_batch_f16_scratch; /* [max_tokens * max_dim] F16 for cuBLAS input conversion */
 
     /* Host output buffer */
@@ -6360,6 +6362,7 @@ lookup_funcs:
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_f16_tc, "moe_f16_tc");
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_prefill_q4k, "moe_prefill_q4k");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_K_to_f16, "dequant_q4_K_to_f16");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16, "dequant_q8_0_to_f16");
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_expert_fused_q4k, "moe_expert_fused_q4k");
 #undef CLLM_LOAD_OPT_FUNC
                     r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
@@ -11132,6 +11135,28 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_f32_f32, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q8_0) {
+        /* Dequant Q8_0 → F32 + cuBLAS F32 GEMM for batched mode (read weights once) */
+        if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16 && r->cublas) {
+            CUdeviceptr d_f32 = r->d_f16_scratch;
+            if (!d_f32) {
+                CUresult err = cuMemAlloc(&d_f32, 256*1024*1024);
+                if (err == CUDA_SUCCESS) {
+                    r->d_f16_scratch = d_f32;
+                    if (r->verbose >= 1)
+                        fprintf(stderr, "cuda_llm: F32 dequant scratch allocated (256 MB)\n");
+                }
+            }
+            if (d_f32) {
+                int nb = in_dim / 32;
+                int total_blocks = out_dim * nb;
+                int dequant_grid = (total_blocks + 31) / 32;
+                void *args[] = { &d_f32, &mat, &out_dim, &in_dim };
+                cuLaunchKernel(r->fn_dequant_q8_0_to_f16, dequant_grid, 1, 1, 32, 1, 1, 0, r->stream, args, NULL);
+                int gemm_ret = cublasew_gemm_f32_rowmajor_nt(r->cublas, dst, d_f32, input,
+                                                              n_tokens, out_dim, in_dim);
+                if (gemm_ret == 0) return;
+            }
+        }
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q8_0_f32, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q2_K) {
@@ -11514,6 +11539,7 @@ static int cuda_llm_ensure_batch_buffers(cuda_llm_runner *r, int n_tokens) {
         int max_hd = q_dim > kv_dim ? q_dim : kv_dim;
         if (r->d_fa2_q_f16) { cuMemFree(r->d_fa2_q_f16); r->d_fa2_q_f16 = 0; }
         if (r->d_fa2_o_f16) { cuMemFree(r->d_fa2_o_f16); r->d_fa2_o_f16 = 0; }
+        if (r->d_f16_scratch) { cuMemFree(r->d_f16_scratch); r->d_f16_scratch = 0; }
         if (cuMemAlloc(&r->d_fa2_q_f16, (size_t)alloc_tokens * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
             r->d_fa2_q_f16 = 0;
         if (cuMemAlloc(&r->d_fa2_o_f16, (size_t)alloc_tokens * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
@@ -13205,6 +13231,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_batch_f16_scratch) cuMemFree(r->d_batch_f16_scratch);
     if (r->d_fa2_q_f16) cuMemFree(r->d_fa2_q_f16);
     if (r->d_fa2_o_f16) cuMemFree(r->d_fa2_o_f16);
+    if (r->d_f16_scratch) cuMemFree(r->d_f16_scratch);
 
     /* Free modules */
     if (r->module) cuModuleUnload(r->module);
