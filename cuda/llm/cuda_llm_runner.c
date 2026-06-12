@@ -9083,7 +9083,14 @@ static inline void launch_matvec_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdevi
 static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                        CUdeviceptr x, int n_rows, int n_cols, int weight_type) {
     switch (weight_type) {
-        case GGML_TYPE_Q8_0: launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_Q8_0:
+            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q8(r, dst, mat, r->d_xb_q81, r->d_xb_scale, n_rows, n_cols);
+            } else {
+                launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
         case GGML_TYPE_Q2_K:
             if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0) {
                 launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
