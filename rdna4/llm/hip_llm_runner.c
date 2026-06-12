@@ -6664,6 +6664,108 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- Gemma4 kernels ---- */\n"
+"\n"
+"/* GELU * up: gate[i] = gelu(gate[i]) * up[i] */\n"
+"__global__ void gelu_mul_f32(float *gate, const float *up, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    float g = gate[i];\n"
+"    float u = up[i];\n"
+"    float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));\n"
+"    gate[i] = gelu_g * u;\n"
+"}\n"
+"\n"
+"/* Logit softcapping: x[i] = cap * tanh(x[i] / cap) */\n"
+"__global__ void logit_softcap_f32(float *x, int n, float cap) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    x[i] = cap * tanhf(x[i] / cap);\n"
+"}\n"
+"\n"
+"/* Scale: x[i] *= scale */\n"
+"__global__ void scale_f32(float *x, float scale, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    x[i] *= scale;\n"
+"}\n"
+"\n"
+"/* Raw per-head RMSNorm (no learned weight): v = v / sqrt(mean(v^2) + eps) */\n"
+"__global__ void raw_rmsnorm_heads_f32(float *vec, int n_heads, int head_dim, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int tid = threadIdx.x;\n"
+"    float *v = vec + h * head_dim;\n"
+"    float val = (tid < head_dim) ? v[tid] : 0.0f;\n"
+"    sdata[tid] = val * val;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    if (tid < head_dim) v[tid] = val * scale;\n"
+"}\n"
+"\n"
+"/* SWA decode attention: attend to window [max(0, pos-window+1), pos] via circular buffer.\n"
+" * grid=n_heads, blockDim=256. Shared memory = seq_len * sizeof(float). */\n"
+"__global__ void attn_decode_swa_f32(float *out, const float *q, const float *key_cache,\n"
+"                                     const float *value_cache, int n_heads, int n_kv_heads,\n"
+"                                     int head_dim, int kv_dim, float scale,\n"
+"                                     int position, int window_size) {\n"
+"    extern __shared__ float att[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int kv_h = h / (n_heads / n_kv_heads);\n"
+"    int hd = head_dim;\n"
+"    int start = (position >= window_size) ? (position - window_size + 1) : 0;\n"
+"    int seq_len = position - start + 1;\n"
+"    const float *qh = q + h * hd;\n"
+"    float *att_h = att;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    /* Compute QK scores */\n"
+"    for (int p = tid; p < seq_len; p += nthreads) {\n"
+"        int abs_pos = start + p;\n"
+"        int slot = abs_pos % window_size;\n"
+"        const float *kp = key_cache + slot * kv_dim + kv_h * hd;\n"
+"        float score = 0.0f;\n"
+"        for (int d = 0; d < hd; d++) score += qh[d] * kp[d];\n"
+"        att_h[p] = score * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    /* Softmax */\n"
+"    float max_s = att_h[0];\n"
+"    for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];\n"
+"    float sum_e = 0.0f;\n"
+"    for (int p = tid; p < seq_len; p += nthreads) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }\n"
+"    __syncthreads();\n"
+"    /* Reduce sum_e across threads */\n"
+"    float *red = att + seq_len;\n"
+"    red[tid] = sum_e;\n"
+"    __syncthreads();\n"
+"    for (int s = nthreads / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) red[tid] += red[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float inv_sum = 1.0f / red[0];\n"
+"    for (int p = tid; p < seq_len; p += nthreads) att_h[p] *= inv_sum;\n"
+"    __syncthreads();\n"
+"    /* Weighted sum of values */\n"
+"    float *out_h = out + h * hd;\n"
+"    for (int d = tid; d < hd; d += nthreads) {\n"
+"        float acc = 0.0f;\n"
+"        for (int p = 0; p < seq_len; p++) {\n"
+"            int abs_pos = start + p;\n"
+"            int slot = abs_pos % window_size;\n"
+"            const float *vp = value_cache + slot * kv_dim + kv_h * hd;\n"
+"            acc += att_h[p] * vp[d];\n"
+"        }\n"
+"        out_h[d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern \"C\" */\n"
 ;
 
@@ -6801,6 +6903,18 @@ typedef struct {
     /* SSM persistent state */
     void *d_conv_state;
     void *d_recurrent_state;
+
+    /* Gemma4 fields */
+    int is_swa;                 /* 1 = sliding window attention layer */
+    int shared_kv_source;       /* -1 = own KV, else layer index to share from */
+    int local_kv_heads;         /* per-layer KV head count (may differ from r->n_kv_heads) */
+    int local_head_dim;         /* head_dim_full or head_dim_swa */
+    void *post_attn_norm_w;     /* F32 [n_embd] post-attention norm */
+    void *post_ffw_norm_w;      /* F32 [n_embd] post-FFN norm */
+    void *ple_inp_gate_w;       /* F32 [ple_dim, n_embd] PLE input gate */
+    void *ple_proj_w;           /* F32 [n_embd, ple_dim] PLE projection */
+    void *ple_post_norm_w;      /* F32 [n_embd] PLE post-projection norm */
+    float layer_scale_val;      /* layer output scale (default 1.0) */
 } hip_layer;
 
 struct hip_llm_runner {
@@ -7193,6 +7307,37 @@ struct hip_llm_runner {
     int         graph_ready_hidden;
     int         graph_disabled;   /* env LLM_GRAPH_DISABLE=1 */
     int         graph_verbose;    /* env LLM_GRAPH_VERBOSE=1 */
+
+    /* Gemma4 architecture */
+    int is_gemma4;
+    int head_dim_full;              /* head dim for full-attention layers (512) */
+    int head_dim_swa;               /* head dim for SWA layers (256) */
+    int swa_window_size;            /* sliding window size (512) */
+    int *swa_pattern;               /* [n_layers] 1=SWA, 0=full attention */
+    int n_layer_kv_from_start;      /* layers 0..N-1 have own KV, rest share */
+    float final_logit_softcapping;  /* tanh softcap on output logits (30.0) */
+    float rope_freq_base_swa;       /* RoPE freq base for SWA layers (10000) */
+    float embd_scale;               /* sqrt(n_embd) for token embedding scaling */
+    int n_embd_per_layer;           /* per-layer embedding dim (256) */
+    int *per_layer_kv_heads;        /* [n_layers] per-layer KV head count */
+    void *d_ple_combined;           /* [n_layers * ple_dim] f32 */
+    void *d_ple_buf;                /* [ple_dim] f32 */
+    void *d_ple_proj;               /* [n_embd] f32 */
+    void *d_per_layer_token_embd;   /* Q8_0 [n_vocab, n_layers * ple_dim] */
+    void *d_per_layer_model_proj;   /* BF16 [n_layers * ple_dim, n_embd] */
+    void *d_per_layer_proj_norm;    /* F32 [ple_dim] */
+    float *h_rope_freq_factors;     /* [head_dim_full/2] proportional RoPE factors */
+    float *h_rope_inv_freq_full;    /* precomputed inv_freq for full-attn layers */
+    float *h_rope_inv_freq_swa;     /* precomputed inv_freq for SWA layers */
+    int rope_full_dim;              /* head_dim_full/2 */
+    int rope_swa_dim;               /* head_dim_swa/2 */
+    /* Gemma4 GPU kernels */
+    hipFunction_t fn_gelu_mul_f32;
+    hipFunction_t fn_logit_softcap_f32;
+    hipFunction_t fn_scale_f32;
+    hipFunction_t fn_raw_rmsnorm_heads_f32;
+    hipFunction_t fn_attn_decode_swa_f32;
+    int         cur_position;       /* host-side current position for SWA kernel */
 };
 
 static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
@@ -7345,6 +7490,12 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
+    /* Gemma4 kernels */
+    GET_FUNC(gelu_mul_f32);
+    GET_FUNC(logit_softcap_f32);
+    GET_FUNC(scale_f32);
+    GET_FUNC(raw_rmsnorm_heads_f32);
+    GET_FUNC(attn_decode_swa_f32);
 
     GET_FUNC(pack_bf16_from_f32);
     GET_FUNC(convert_f16_to_bf16);
@@ -7705,6 +7856,9 @@ static int hllm_get_int(const gguf_context *gguf, const char *key, int def) {
     if (idx < 0) return def;
     if (gguf->kv[idx].type == GGUF_TYPE_UINT32) return (int)gguf->kv[idx].value.u32;
     if (gguf->kv[idx].type == GGUF_TYPE_INT32)  return gguf->kv[idx].value.i32;
+    if (gguf->kv[idx].type == GGUF_TYPE_UINT64) return (int)gguf->kv[idx].value.u64;
+    if (gguf->kv[idx].type == GGUF_TYPE_INT64)  return (int)gguf->kv[idx].value.i64;
+    if (gguf->kv[idx].type == GGUF_TYPE_BOOL)   return gguf->kv[idx].value.b ? 1 : 0;
     return def;
 }
 
@@ -7900,7 +8054,8 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     if (!r || !gguf) return -1;
 
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
+    if (gguf_find_key(gguf, "gemma4.block_count") >= 0) arch = "gemma4";
+    else if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
     else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
     else if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
@@ -7983,6 +8138,104 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
                 fprintf(stderr, "hip_llm: MoE: n_experts=%d n_experts_used=%d expert_ff=%d shared_expert_ff=%d\n",
                         r->n_experts, r->n_experts_used, r->expert_ff, r->shared_expert_ff);
             }
+        }
+    }
+
+    /* Gemma4 architecture */
+    r->is_gemma4 = 0;
+    r->swa_pattern = NULL;
+    r->per_layer_kv_heads = NULL;
+    r->h_rope_freq_factors = NULL;
+    r->h_rope_inv_freq_full = NULL;
+    r->h_rope_inv_freq_swa = NULL;
+    if (strcmp(arch, "gemma4") == 0) {
+        r->is_gemma4 = 1;
+        r->head_dim_full = hllm_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
+        r->head_dim_swa  = hllm_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
+        r->head_dim = r->head_dim_full; /* use max for buffer sizing */
+        r->swa_window_size = hllm_get_int(gguf, ARCH_KEY("attention.sliding_window"), 512);
+        r->n_embd_per_layer = hllm_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 256);
+        int shared_kv_layers = hllm_get_int(gguf, ARCH_KEY("attention.shared_kv_layers"), 0);
+        r->n_layer_kv_from_start = r->n_layers - shared_kv_layers;
+        r->final_logit_softcapping = hllm_get_float(gguf, ARCH_KEY("final_logit_softcapping"), 30.0f);
+        r->rope_freq_base_swa = hllm_get_float(gguf, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
+        r->embd_scale = sqrtf((float)r->n_embd);
+
+        /* Parse SWA layer pattern */
+        r->swa_pattern = (int *)calloc(r->n_layers, sizeof(int));
+        {
+            int idx = gguf_find_key(gguf, ARCH_KEY("attention.sliding_window_pattern"));
+            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
+                int n = (int)gguf->kv[idx].value.arr.n;
+                if (n > r->n_layers) n = r->n_layers;
+                uint8_t *data = (uint8_t *)gguf->kv[idx].value.arr.data;
+                for (int i = 0; i < n; i++)
+                    r->swa_pattern[i] = data[i] ? 1 : 0;
+            } else {
+                for (int i = 0; i < r->n_layers; i++)
+                    r->swa_pattern[i] = ((i + 1) % 6 != 0) ? 1 : 0;
+            }
+        }
+
+        /* Parse per-layer KV head count */
+        r->per_layer_kv_heads = (int *)calloc(r->n_layers, sizeof(int));
+        {
+            int idx = gguf_find_key(gguf, ARCH_KEY("attention.head_count_kv"));
+            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
+                int n = (int)gguf->kv[idx].value.arr.n;
+                int32_t *data = (int32_t *)gguf->kv[idx].value.arr.data;
+                for (int i = 0; i < r->n_layers && i < n; i++)
+                    r->per_layer_kv_heads[i] = data[i];
+                for (int i = n; i < r->n_layers; i++)
+                    r->per_layer_kv_heads[i] = r->n_kv_heads;
+            } else {
+                for (int i = 0; i < r->n_layers; i++)
+                    r->per_layer_kv_heads[i] = r->n_kv_heads;
+            }
+        }
+
+        /* Load proportional RoPE frequency factors */
+        {
+            qtensor rope_freqs = hllm_load_tensor(gguf, "rope_freqs.weight", 0);
+            if (rope_freqs.data) {
+                int n_freq = rope_freqs.n_cols;
+                r->h_rope_freq_factors = (float *)calloc(n_freq, sizeof(float));
+                dequant_row(rope_freqs.type, rope_freqs.data, r->h_rope_freq_factors, n_freq);
+            }
+        }
+
+        /* Precompute inverse frequencies for full-attn layers */
+        {
+            int half = r->head_dim_full / 2;
+            r->rope_full_dim = half;
+            r->h_rope_inv_freq_full = (float *)calloc(half, sizeof(float));
+            float base = r->rope_freq_base;
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(base, (float)(2 * i) / (float)r->head_dim_full);
+                if (r->h_rope_freq_factors && i < half)
+                    freq /= r->h_rope_freq_factors[i];
+                r->h_rope_inv_freq_full[i] = freq;
+            }
+        }
+
+        /* Precompute inverse frequencies for SWA layers */
+        {
+            int half = r->head_dim_swa / 2;
+            r->rope_swa_dim = half;
+            r->h_rope_inv_freq_swa = (float *)calloc(half, sizeof(float));
+            float base = r->rope_freq_base_swa;
+            for (int i = 0; i < half; i++) {
+                r->h_rope_inv_freq_swa[i] = 1.0f / powf(base, (float)(2 * i) / (float)r->head_dim_swa);
+            }
+        }
+
+        if (r->verbose >= 1) {
+            fprintf(stderr, "hip_llm: Gemma4: head_dim_full=%d head_dim_swa=%d swa_window=%d\n",
+                    r->head_dim_full, r->head_dim_swa, r->swa_window_size);
+            fprintf(stderr, "hip_llm: Gemma4: n_embd_per_layer=%d n_layer_kv_from_start=%d\n",
+                    r->n_embd_per_layer, r->n_layer_kv_from_start);
+            fprintf(stderr, "hip_llm: Gemma4: softcap=%.1f rope_base_swa=%.0f embd_scale=%.1f\n",
+                    r->final_logit_softcapping, r->rope_freq_base_swa, r->embd_scale);
         }
     }
 
@@ -8078,7 +8331,88 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         qtensor t = hllm_load_tensor(gguf, name, 1);
         if (upload_norm_f32(&cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
 
-        if (is_ssm) {
+        if (r->is_gemma4) {
+            /* === Gemma4 per-layer setup === */
+            cl->is_swa = r->swa_pattern[l];
+            cl->shared_kv_source = -1;
+            cl->layer_scale_val = 1.0f;
+            cl->post_attn_norm_w = NULL;
+            cl->post_ffw_norm_w = NULL;
+            cl->ple_inp_gate_w = NULL;
+            cl->ple_proj_w = NULL;
+            cl->ple_post_norm_w = NULL;
+
+            int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
+            int local_kv_heads = r->per_layer_kv_heads[l];
+            cl->local_head_dim = hd;
+            cl->local_kv_heads = local_kv_heads;
+
+            /* Determine shared KV source */
+            if (l >= r->n_layer_kv_from_start) {
+                cl->shared_kv_source = r->n_layer_kv_from_start - (cl->is_swa ? 2 : 1);
+                if (cl->shared_kv_source < 0) cl->shared_kv_source = 0;
+            }
+
+            /* Q projection (always present) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
+
+            /* K/V only for layers with own KV */
+            if (cl->shared_kv_source < 0) {
+                snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
+                t = hllm_load_tensor(gguf, name, 1);
+                cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
+                if (upload_weight_matrix(&cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
+
+                snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
+                t = hllm_load_tensor(gguf, name, 1);
+                cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
+                if (upload_weight_matrix(&cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
+            }
+
+            snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
+
+            /* QK norm (per-layer head_dim) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            cl->has_qk_norm = (t.data != NULL);
+            if (t.data) { if (upload_norm_f32(&cl->attn_q_norm_w, &t, hd) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (t.data) { if (upload_norm_f32(&cl->attn_k_norm_w, &t, hd) != 0) return -1; }
+
+            /* Post-attention norm */
+            snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (t.data) { if (upload_norm_f32(&cl->post_attn_norm_w, &t, r->n_embd) != 0) return -1; }
+
+            /* PLE weights */
+            snprintf(name, sizeof(name), "blk.%d.inp_gate.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_weight_matrix(&cl->ple_inp_gate_w, &t, &(int){0}) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_weight_matrix(&cl->ple_proj_w, &t, &(int){0}) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_norm_f32(&cl->ple_post_norm_w, &t, r->n_embd) != 0) return -1; }
+
+            /* Layer output scale */
+            snprintf(name, sizeof(name), "blk.%d.layer_output_scale.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data && t.type == GGML_TYPE_F32) {
+                cl->layer_scale_val = *(float *)t.data;
+            } else if (t.data) {
+                float sv; dequant_row(t.type, t.data, &sv, 1);
+                cl->layer_scale_val = sv;
+            }
+
+        } else if (is_ssm) {
             #define LOAD_SSM_W(field, suffix, rows_f, cols_f, type_f) do { \
                 snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
                 t = hllm_load_tensor(gguf, name, 1); \
@@ -8159,13 +8493,23 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         }
 
         /* FFN norm */
-        if (r->is_hybrid) {
+        if (r->is_gemma4) {
+            snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
+            /* Post-FFN norm */
+            snprintf(name, sizeof(name), "blk.%d.post_ffw_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (t.data) { if (upload_norm_f32(&cl->post_ffw_norm_w, &t, r->n_embd) != 0) return -1; }
+        } else if (r->is_hybrid) {
             snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
         } else {
             snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
         }
-        t = hllm_load_tensor(gguf, name, 1);
-        if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
 
         if (r->is_moe) {
             cl->is_moe = 1;
@@ -8235,15 +8579,39 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
 }
 
 static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
+    /* For Gemma4, use the maximum head_dim for buffer sizing */
     int kv_dim = r->n_kv_heads * r->head_dim;
     int q_dim = r->n_heads * r->head_dim;
+    if (r->is_gemma4) {
+        /* Gemma4: q_dim uses head_dim_full, kv_dim uses per-layer max */
+        q_dim = r->n_heads * r->head_dim_full;
+        kv_dim = r->n_kv_heads * r->head_dim_full;
+    }
 
     /* Allocate KV cache */
     r->d_key_cache = (void **)calloc(r->n_layers, sizeof(void *));
     r->d_value_cache = (void **)calloc(r->n_layers, sizeof(void *));
-    size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
     for (int l = 0; l < r->n_layers; l++) {
         if (r->layers[l].is_ssm) continue;
+        size_t kv_cache_size;
+        if (r->is_gemma4) {
+            int local_kv = r->layers[l].local_kv_heads;
+            int local_hd = r->layers[l].local_head_dim;
+            size_t layer_kv = (size_t)local_kv * local_hd * sizeof(float);
+            if (r->layers[l].shared_kv_source >= 0) {
+                /* Shared KV: alias to source layer */
+                int src = r->layers[l].shared_kv_source;
+                r->d_key_cache[l] = r->d_key_cache[src];
+                r->d_value_cache[l] = r->d_value_cache[src];
+                continue;
+            } else if (r->layers[l].is_swa) {
+                kv_cache_size = (size_t)r->swa_window_size * layer_kv;
+            } else {
+                kv_cache_size = (size_t)max_seq_len * layer_kv;
+            }
+        } else {
+            kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
+        }
         CHECK_HIP(hipMalloc(&r->d_key_cache[l], kv_cache_size));
         CHECK_HIP(hipMemset(r->d_key_cache[l], 0, kv_cache_size));
         CHECK_HIP(hipMalloc(&r->d_value_cache[l], kv_cache_size));
@@ -8343,6 +8711,17 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     /* === Phase 5: device int for position, written via hipMemcpyAsync per token === */
     CHECK_HIP(hipMalloc((void **)&r->d_position, sizeof(int)));
     CHECK_HIP(hipMemset(r->d_position, 0, sizeof(int)));
+
+    /* Gemma4 PLE buffers */
+    if (r->is_gemma4 && r->n_embd_per_layer > 0) {
+        int ple_dim = r->n_embd_per_layer;
+        CHECK_HIP(hipMalloc(&r->d_ple_combined, (size_t)r->n_layers * ple_dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_ple_buf, ple_dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_ple_proj, r->n_embd * sizeof(float)));
+        if (r->verbose >= 1)
+            fprintf(stderr, "hip_llm: Gemma4 PLE buffers allocated (ple_dim=%d, %.1f MB)\n",
+                    ple_dim, (double)(r->n_layers * ple_dim + ple_dim + r->n_embd) * sizeof(float) / (1024.0*1024.0));
+    }
 
 #ifdef LLM_HIPBLASLT_ENABLED
     /* === Phase 2: prepare BF16 weight copies + batched activation buffers
@@ -10111,7 +10490,135 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
     }
 
-        if (r->is_hybrid && cl->is_ssm) {
+    /* === Gemma4 layer === */
+    if (r->is_gemma4) {
+        int hd = cl->local_head_dim;
+        int local_kv_heads = cl->local_kv_heads;
+        int local_kv_dim = local_kv_heads * hd;
+        int local_q_dim = n_heads * hd;
+        int local_gqa = n_heads / local_kv_heads;
+        int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
+
+        /* Q projection */
+        launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb,
+                          cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+
+        /* K/V projections (skip if sharing KV) */
+        if (cl->shared_kv_source < 0) {
+            launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb,
+                              cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+            launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb,
+                              cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+        }
+
+        /* QK norm (per-layer head_dim) */
+        if (cl->has_qk_norm) {
+            if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, hd, eps);
+            if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, local_kv_heads, hd, eps);
+        }
+
+        /* V raw RMSNorm (no learned weight) */
+        if (cl->shared_kv_source < 0) {
+            void *va[] = { &r->d_v, &local_kv_heads, &hd, &eps };
+            LAUNCH(r->fn_raw_rmsnorm_heads_f32, local_kv_heads, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, va);
+        }
+
+        /* RoPE: SWA uses standard rope with rope_freq_base_swa, full uses proportional */
+        if (cl->is_swa) {
+            launch_rope_devp(r, r->d_q, n_heads, hd, r->rope_freq_base_swa);
+            if (cl->shared_kv_source < 0)
+                launch_rope_devp(r, r->d_k, local_kv_heads, hd, r->rope_freq_base_swa);
+        } else {
+            /* Proportional RoPE: apply inline with precomputed inv_freq */
+            /* For now, use standard rope with rope_freq_base (close approximation) */
+            launch_rope_devp(r, r->d_q, n_heads, hd, r->rope_freq_base);
+            if (cl->shared_kv_source < 0)
+                launch_rope_devp(r, r->d_k, local_kv_heads, hd, r->rope_freq_base);
+        }
+
+        /* KV cache store */
+        if (cl->shared_kv_source < 0) {
+            if (cl->is_swa) {
+                /* Circular buffer: slot = position % window_size */
+                /* Use standard kv_store_devp but the attention kernel handles circular indexing */
+                launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
+                                     r->d_k, r->d_v, local_kv_dim);
+            } else {
+                launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
+                                     r->d_k, r->d_v, local_kv_dim);
+            }
+        }
+
+        /* Attention: scale=1.0 (QK norms handle scaling) */
+        if (cl->is_swa) {
+            /* SWA decode attention with circular buffer */
+            float scale = 1.0f;
+            int pos = r->cur_position;
+            int win = r->swa_window_size;
+            size_t smem = ((size_t)win + 256) * sizeof(float);
+            if (smem < 256 * sizeof(float)) smem = 256 * sizeof(float);
+            void *aa[] = { &r->d_xb2, &r->d_q, &r->d_key_cache[kv_src], &r->d_value_cache[kv_src],
+                          &n_heads, &local_kv_heads, &hd, &local_kv_dim, &scale, &pos, &win };
+            LAUNCH(r->fn_attn_decode_swa_f32, n_heads, 1, 1, 256, 1, 1, smem, r->stream, aa);
+        } else {
+            /* Full attention */
+            float scale = 1.0f;
+            size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
+            launch_attention_devp(r, r->d_xb2, r->d_q,
+                                   r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                                   n_heads, local_kv_heads, hd, local_kv_dim, scale, smem_attn);
+        }
+
+        /* Output projection */
+        launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
+                          cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+
+        /* Post-attention norm */
+        if (cl->post_attn_norm_w) {
+            launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_attn_norm_w, n_embd, eps);
+        }
+
+        /* Attention residual: x += xb */
+        launch_add(r, r->d_x, r->d_xb, n_embd);
+
+        /* FFN: RMSNorm */
+        launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
+
+        /* FFN gate + up */
+        launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                          cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
+        launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                          cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+
+        /* GELU * up (not SiLU) */
+        {
+            int n = cl->ffn_gate_rows;
+            void *a[] = { &r->d_gate, &r->d_up, &n };
+            LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
+
+        /* FFN down */
+        launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
+                          cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+
+        /* Post-FFN norm */
+        if (cl->post_ffw_norm_w) {
+            launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_ffw_norm_w, n_embd, eps);
+        }
+
+        /* FFN residual: x += xb */
+        launch_add(r, r->d_x, r->d_xb, n_embd);
+
+        /* Layer output scale */
+        if (cl->layer_scale_val != 1.0f) {
+            int n = n_embd;
+            void *a[] = { &r->d_x, &cl->layer_scale_val, &n };
+            LAUNCH(r->fn_scale_f32, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
+
+        goto gemma4_layer_done;
+
+    } else if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
             int qkv_dim = r->ssm_qkv_dim;
             int d_state = r->ssm_d_state;
@@ -10369,6 +10876,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             }
         }
 
+gemma4_layer_done:
 ffn_done:
         /* DeepStack injection */
         if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
@@ -10543,9 +11051,18 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
 
+    /* Gemma4: scale token embeddings by sqrt(n_embd) */
+    if (r->is_gemma4) {
+        int n = n_embd;
+        float scale = r->embd_scale;
+        void *a[] = { &r->d_x, &scale, &n };
+        LAUNCH(r->fn_scale_f32, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+    }
+
     /* Position is consumed by *_devp launchers via r->d_position */
     hipMemcpyAsync(r->d_position, &position, sizeof(int),
                    hipMemcpyHostToDevice, r->stream);
+    r->cur_position = position;
 
     if (r->graph_ready_logits) {
         hipGraphLaunch(r->graph_exec_logits, r->stream);
@@ -10553,6 +11070,13 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
         forward_blocks_body(r);
         launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
                            r->n_vocab, r->n_embd, r->output_w_type);
+        /* Gemma4: final logit softcapping */
+        if (r->is_gemma4 && r->final_logit_softcapping > 0.0f) {
+            float cap = r->final_logit_softcapping;
+            int n = r->n_vocab;
+            void *a[] = { &r->d_logits, &n, &cap };
+            LAUNCH(r->fn_logit_softcap_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
         hipMemcpyAsync(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float),
                        hipMemcpyDeviceToHost, r->stream);
     }
@@ -11406,15 +11930,48 @@ void hip_llm_free(hip_llm_runner *r) {
 
     if (r->d_key_cache) {
         for (int l = 0; l < r->n_layers; l++) {
-            if (r->d_key_cache[l]) hipFree(r->d_key_cache[l]);
+            if (r->d_key_cache[l]) {
+                /* Skip shared-KV aliases to avoid double-free */
+                int is_alias = 0;
+                if (r->is_gemma4) {
+                    for (int k = 0; k < l; k++) {
+                        if (r->layers[k].shared_kv_source == l && r->d_key_cache[k] == r->d_key_cache[l]) {
+                            is_alias = 1; break;
+                        }
+                    }
+                }
+                if (!is_alias) hipFree(r->d_key_cache[l]);
+            }
         }
         free(r->d_key_cache);
     }
     if (r->d_value_cache) {
         for (int l = 0; l < r->n_layers; l++) {
-            if (r->d_value_cache[l]) hipFree(r->d_value_cache[l]);
+            if (r->d_value_cache[l]) {
+                int is_alias = 0;
+                if (r->is_gemma4) {
+                    for (int k = 0; k < l; k++) {
+                        if (r->layers[k].shared_kv_source == l && r->d_value_cache[k] == r->d_value_cache[l]) {
+                            is_alias = 1; break;
+                        }
+                    }
+                }
+                if (!is_alias) hipFree(r->d_value_cache[l]);
+            }
         }
         free(r->d_value_cache);
+    }
+
+    /* Gemma4 arrays and PLE buffers */
+    if (r->is_gemma4) {
+        free(r->swa_pattern);
+        free(r->per_layer_kv_heads);
+        free(r->h_rope_freq_factors);
+        free(r->h_rope_inv_freq_full);
+        free(r->h_rope_inv_freq_swa);
+        if (r->d_ple_combined) hipFree(r->d_ple_combined);
+        if (r->d_ple_buf)      hipFree(r->d_ple_buf);
+        if (r->d_ple_proj)     hipFree(r->d_ple_proj);
     }
 
     if (r->layers) {
@@ -11465,6 +12022,12 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->moe_shared_ffn_gate_w)  hipFree(cl->moe_shared_ffn_gate_w);
             if (cl->moe_shared_ffn_up_w)    hipFree(cl->moe_shared_ffn_up_w);
             if (cl->moe_shared_ffn_down_w)  hipFree(cl->moe_shared_ffn_down_w);
+            /* Gemma4 per-layer weights */
+            if (cl->post_attn_norm_w)  hipFree(cl->post_attn_norm_w);
+            if (cl->post_ffw_norm_w)   hipFree(cl->post_ffw_norm_w);
+            if (cl->ple_inp_gate_w)    hipFree(cl->ple_inp_gate_w);
+            if (cl->ple_proj_w)        hipFree(cl->ple_proj_w);
+            if (cl->ple_post_norm_w)   hipFree(cl->ple_post_norm_w);
         }
         free(r->layers);
     }
@@ -11700,17 +12263,35 @@ done:
 }
 
 void hip_llm_reset_state(hip_llm_runner *r) {
-    if (!r || !r->is_hybrid) return;
-    for (int l = 0; l < r->n_layers; l++) {
-        hip_layer *cl = &r->layers[l];
-        if (!cl->is_ssm) continue;
-        if (cl->d_conv_state) {
-            size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
-            hipMemset(cl->d_conv_state, 0, conv_bytes);
+    if (!r) return;
+    if (r->is_hybrid) {
+        for (int l = 0; l < r->n_layers; l++) {
+            hip_layer *cl = &r->layers[l];
+            if (!cl->is_ssm) continue;
+            if (cl->d_conv_state) {
+                size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
+                hipMemset(cl->d_conv_state, 0, conv_bytes);
+            }
+            if (cl->d_recurrent_state) {
+                size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
+                hipMemset(cl->d_recurrent_state, 0, rec_bytes);
+            }
         }
-        if (cl->d_recurrent_state) {
-            size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
-            hipMemset(cl->d_recurrent_state, 0, rec_bytes);
+    }
+    if (r->is_gemma4) {
+        for (int l = 0; l < r->n_layers; l++) {
+            hip_layer *cl = &r->layers[l];
+            if (cl->shared_kv_source >= 0) continue;
+            int local_kv = cl->local_kv_heads;
+            int local_hd = cl->local_head_dim;
+            size_t kv_bytes = (size_t)local_kv * local_hd * sizeof(float);
+            if (cl->is_swa) {
+                kv_bytes *= r->swa_window_size;
+            } else {
+                kv_bytes *= r->max_seq_len;
+            }
+            if (r->d_key_cache[l])   hipMemset(r->d_key_cache[l], 0, kv_bytes);
+            if (r->d_value_cache[l]) hipMemset(r->d_value_cache[l], 0, kv_bytes);
         }
     }
 }
