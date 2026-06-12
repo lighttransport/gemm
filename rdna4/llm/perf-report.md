@@ -695,17 +695,24 @@ IQ3_XXS gather/dequant plus dense-FFN traffic.
 First-ever Gemma4 inference on AMD HIP (RDNA4). llama.cpp (build 7261) does not
 support the `gemma4` architecture at all, so no ROCm comparison is possible.
 The GGUF lacks V weights for 8 full-attention layers (shared-KV metadata issue),
-so output quality is unreliable. Performance numbers are valid for a 12B dense
-model with `n_embd=3840, n_heads=16, n_kv_heads=8, n_layers=48,
-head_dim=512/256`.
+so output quality is unreliable.
 
-| model | runner | pp512 | pp1024 | tg128 | note |
-|---|---:|---:|---:|---:|---|
-| `Gemma4-12B-Q6_K_XL` | HIP runner | **1097** | **721** | **42.7** | prefill via batched hipBLASLt + batched attn |
+| model | runner | pp256 | pp512 | pp1024 | tg128 | note |
+|---|---:|---:|---:|---:|---:|---|
+| `Gemma4-12B-Q6_K_XL` | HIP runner | **1643** | **2515** | **3148** | **42.7** | `ms=24000`; prefill via batched hipBLASLt + batched attn |
 
 Configuration: hipBLASLt batched path for all 48 layers; batched scalar
-attention kernel (`attn_prefill_batch_f32`); per-layer head_dim/kv_heads
-handling for SWA (hd=256) and full-attention (hd=512) layers; GELU activation,
-post-attention/FFN norms, layer output scale added to batched path.
+attention kernel (shared_mem=97024 bytes reduces LDS occupancy → 1 block/CU →
+less KV-cache L1/L2 thrashing); per-layer head_dim/kv_heads handling for SWA
+(hd=256) and full-attention (hd=512) layers; GELU activation, post-attention/FFN
+norms, layer output scale added to batched path. Max-seq-len (`-s`) set to 24000
+to increase attention kernel shared memory allocation.
 
-Decode: 42.7 tok/s (per-row quant matvec via `forward_one_layer`).
+Key insight: larger attention-kernel shared memory (max_seq_len-based) limits
+concurrent blocks per CU, dramatically reducing L1/L2 cache contention from
+KV cache reads. This gave a 2.3x (pp512) to 4.4x (pp1024) improvement over the
+smaller smem configuration (8192).
+
+Decode: 42.7 tok/s (per-row quant matvec via `forward_one_layer`).  
+Known limitation: SWA KV cache circular buffer overflow at pp>1024 (window_size
+only 1024 but linear KV store does not wrap).
