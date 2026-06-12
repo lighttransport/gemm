@@ -6783,8 +6783,6 @@ static const char *hip_kernel_source =
 "\n"
 "/* Batched prefill attention: one block per (head, query_index).\n"
 " * Grid = (n_heads, M), blockDim = 256.\n"
-" * Shared memory: max(max_seq_len, 256) * sizeof(float) — max_seq_len for scores,\n"
-" * remainder used for reduction (the kernel only uses up to seq_len+256).\n"
 " * out, q are [M, n_heads, head_dim] strided; key_cache, value_cache are\n"
 " * [max_seq_len, kv_dim]. Each query attends causally to positions 0..pos. */\n"
 "__global__ void attn_prefill_batch_f32(float *out, const float *q,\n"
@@ -6803,21 +6801,25 @@ static const char *hip_kernel_source =
 "    float *att_h = smem;\n"
 "    int tid = threadIdx.x;\n"
 "    int nthreads = blockDim.x;\n"
-"    /* Compute QK scores */\n"
+"    /* Compute QK scores (float4 loads) */\n"
 "    for (int p = tid; p < seq_len; p += nthreads) {\n"
 "        const float *kp = key_cache + (size_t)p * kv_dim + kv_h * head_dim;\n"
-"        float score = 0.0f;\n"
-"        for (int d = 0; d < head_dim; d++) score += qh[d] * kp[d];\n"
-"        att_h[p] = score * scale;\n"
+"        float4 score4 = {0,0,0,0};\n"
+"        for (int d = 0; d < head_dim; d += 4) {\n"
+"            float4 qv = *(const float4*)(qh + d);\n"
+"            float4 kv = *(const float4*)(kp + d);\n"
+"            score4.x += qv.x * kv.x; score4.y += qv.y * kv.y;\n"
+"            score4.z += qv.z * kv.z; score4.w += qv.w * kv.w;\n"
+"        }\n"
+"        att_h[p] = (score4.x + score4.y + score4.z + score4.w) * scale;\n"
 "    }\n"
 "    __syncthreads();\n"
-"    /* Softmax: find max */\n"
+"    /* Softmax */\n"
 "    float max_s = att_h[0];\n"
 "    for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];\n"
 "    float sum_e = 0.0f;\n"
 "    for (int p = tid; p < seq_len; p += nthreads) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }\n"
 "    __syncthreads();\n"
-"    /* Reduce sum_e */\n"
 "    float *red = smem + seq_len;\n"
 "    red[tid] = sum_e;\n"
 "    __syncthreads();\n"
@@ -6828,14 +6830,16 @@ static const char *hip_kernel_source =
 "    float inv_sum = 1.0f / red[0];\n"
 "    for (int p = tid; p < seq_len; p += nthreads) att_h[p] *= inv_sum;\n"
 "    __syncthreads();\n"
-"    /* Weighted sum of values */\n"
-"    for (int d = tid; d < head_dim; d += nthreads) {\n"
-"        float acc = 0.0f;\n"
+"    /* Weighted sum of values (float4) */\n"
+"    for (int d = tid * 4; d < head_dim; d += nthreads * 4) {\n"
+"        float4 acc = {0.0f, 0.0f, 0.0f, 0.0f};\n"
 "        for (int p = 0; p < seq_len; p++) {\n"
 "            const float *vp = value_cache + (size_t)p * kv_dim + kv_h * head_dim;\n"
-"            acc += att_h[p] * vp[d];\n"
+"            float4 v = *(const float4*)(vp + d);\n"
+"            acc.x += att_h[p] * v.x; acc.y += att_h[p] * v.y;\n"
+"            acc.z += att_h[p] * v.z; acc.w += att_h[p] * v.w;\n"
 "        }\n"
-"        out_h[d] = acc;\n"
+"        *(float4*)(out_h + d) = acc;\n"
 "    }\n"
 "}\n"
 "\n"
@@ -9804,8 +9808,8 @@ static inline void launch_flash_attn_causal(hip_llm_runner *r,
 }
 
 /* Batched scalar attention for prefill: grid (n_heads, M), block 256.
- * Works for any head_dim. Shared memory = (max_seq_len + 256) * sizeof(float)
- * but the launch caller must allocate enough. */
+ * Shared memory sized for max_seq_len to limit occupancy (reducing L1/L2
+ * thrashing from KV cache reads). */
 static inline void launch_attn_prefill_batch(hip_llm_runner *r,
     void *out, void *q, void *key_cache, void *value_cache,
     int n_heads, int n_kv_heads, int head_dim, int kv_dim,
