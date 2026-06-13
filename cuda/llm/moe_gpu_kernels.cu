@@ -579,6 +579,43 @@ extern "C" __global__ void dequant_q4_K_to_f16(
 }
 
 /*
+ * dequant_q4_0_to_f16: Q4_0 weight matrix -> FP16 row-major [rows, cols].
+ * Mirrors dequant_q4_K_to_f16 for the gemma4 dequant->F16->cuBLAS batched-prefill
+ * path. Q4_0 GPU block = 18 bytes: half d @0, qs[16] @2; weight j =
+ * (qs[j]&0xF - 8)*d for j<16, (qs[j]>>4 - 8)*d for j+16 (matches matvec_q4_0_f32).
+ *
+ * ONE THREAD PER OUTPUT ELEMENT (not per block). Consecutive threads write
+ * consecutive F16 outputs -> fully coalesced 64-byte stores per warp, and the
+ * 32 threads of a block-region share the same scale `d` (broadcast read). This
+ * is the dequant_q6_K_to_f16 layout; the old per-block kernel issued strided
+ * 2-byte stores 64 bytes apart across a warp (uncoalesced). Launched 1D with
+ * grid=(rows*cols+255)/256, block=256; rows*cols <= 256MB/2 < 2^31 (lm_head is
+ * excluded from this path), so a uint32 element index is safe.
+ */
+extern "C" __global__ void dequant_q4_0_to_f16(
+    half *out,                 // [rows * cols] FP16 output
+    const unsigned char *mat,  // [rows * row_bytes] Q4_0 input
+    int rows, int cols)
+{
+    unsigned e = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned total = (unsigned)rows * (unsigned)cols;
+    if (e >= total) return;
+
+    unsigned ucols = (unsigned)cols;
+    unsigned nb = ucols >> 5;            // cols/32 (cols is a multiple of 32)
+    unsigned row = e / ucols;
+    unsigned col = e - row * ucols;
+    unsigned bk = col >> 5;              // block within row
+    unsigned local = col & 31;           // 0..31
+
+    const unsigned char *bp = mat + ((size_t)row * nb + bk) * 18;
+    float d = __half2float(*(const __half *)bp);
+    unsigned char q = bp[2 + (local & 15)];
+    int nib = (local < 16) ? (int)(q & 0x0F) : (int)(q >> 4);
+    out[e] = __float2half((float)(nib - 8) * d);
+}
+
+/*
  * moe_expert_fused_q4k: Fused per-expert Q4_K gate+up+SiLU+down for batched tokens.
  * One block per expert. Processes all n_e tokens sequentially within the block.
  * Eliminates all per-expert kernel launch overhead (gather, convert, dequant, cuBLAS, scatter).
@@ -727,5 +764,107 @@ extern "C" __global__ void moe_expert_fused_q4k(
             atomicAdd(&output[(size_t)tok * n_embd + r], wgt * s);
         }
         __syncthreads();
+    }
+}
+
+/* ---- dequant_q8_0_to_f16: Q8_0 weight matrix -> F32 (F16 in name for backwards compat) ---- */
+extern "C" __global__ void dequant_q8_0_to_f16(
+    float *dst,
+    const unsigned char *mat,
+    int rows, int cols)
+{
+    int bid = blockIdx.x * 32 + threadIdx.x;
+    int nb = cols / 32, rb = nb * 36;
+    int total_blocks = rows * nb;
+    if (bid >= total_blocks) return;
+
+    int row = bid / nb;
+    int bk = bid % nb;
+
+    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 36;
+    float *d = dst + (size_t)row * cols + (size_t)bk * 32;
+
+    float scale = __half2float(*(const __half *)bp);
+    const signed char *qs = (const signed char *)(bp + 4);
+
+    for (int i = 0; i < 32; i++) {
+        d[i] = scale * (float)qs[i];
+    }
+}
+
+/* ---- dequant_q8_0_to_f16_h: Q8_0 weight matrix -> real FP16 (half) ----
+ * Enables tensor-core F16 GEMM for Q8_0 QKV projections (vs F32 SIMT GEMM).
+ * GPU layout is 36 bytes/block (4-byte-aligned f16 scale + 32 int8). One warp
+ * per 32-element block, 8 blocks per 256-thread CUDA block; coalesced writes. */
+extern "C" __global__ void dequant_q8_0_to_f16_h(
+    half *out,
+    const unsigned char *mat,
+    int rows, int cols)
+{
+    int nb = cols / 32, rb = nb * 36;
+    int total = rows * nb;
+    int sb = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    if (sb >= total) return;
+    int lane = threadIdx.x & 31;
+    int row = sb / nb, bk = sb % nb;
+    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 36;
+    half *o = out + (size_t)row * cols + (size_t)bk * 32;
+    float scale = __half2float(*(const __half *)bp);
+    const signed char *qs = (const signed char *)(bp + 4);
+    o[lane] = __float2half(scale * (float)qs[lane]);
+}
+
+/* ---- dequant_q6_K_to_f16: Q6_K weight matrix -> FP16 ----
+ * Q6_K super-block = 256 elements in 210 bytes:
+ *   ql[128] (low 4 bits), qh[64] (high 2 bits), sc[16] (int8 scales), d (f16).
+ * One thread per 256-element block. Output layout matches matvec_q6_K_f32 so
+ * the dequanted F16 weight feeds cuBLAS F16 GEMM with identical math. */
+#define DQ6_SB_PER_BLOCK 4
+extern "C" __global__ void dequant_q6_K_to_f16(
+    half *out,
+    const unsigned char *mat,
+    int rows, int cols)
+{
+    /* Each CUDA block (256 threads) processes DQ6_SB_PER_BLOCK consecutive
+     * super-blocks; warp w (of 8) -> super-block (w/2), 64 threads decode its 256
+     * elements (4 each). More work per block amortizes launch/scheduling and
+     * keeps writes coalesced (consecutive output elements -> consecutive lanes). */
+    int nb = cols / 256, rb = nb * 210;
+    int total_sb = rows * nb;
+    int sb_base = blockIdx.x * DQ6_SB_PER_BLOCK;
+    int tpb = blockDim.x / DQ6_SB_PER_BLOCK;   /* threads per super-block = 64 */
+    int local = threadIdx.x / tpb;             /* which of the 4 super-blocks */
+    int lane = threadIdx.x % tpb;              /* 0..63 */
+    int sb = sb_base + local;
+
+    __shared__ unsigned char ss[DQ6_SB_PER_BLOCK][210];
+    if (sb < total_sb) {
+        int row = sb / nb, bk = sb % nb;
+        const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 210;
+        for (int i = lane; i < 210; i += tpb) ss[local][i] = bp[i];
+    }
+    __syncthreads();
+    if (sb >= total_sb) return;
+
+    int row = sb / nb, bk = sb % nb;
+    half *o = out + (size_t)row * cols + (size_t)bk * 256;
+    const unsigned char *s = ss[local];
+    float d = __half2float(*(const __half *)(s + 208));
+
+    for (int e = lane; e < 256; e += tpb) {
+    int half_i = e >> 7;                 /* 0 or 1 */
+    int r = e & 127;                     /* 0..127 */
+    int grp = r >> 5;                    /* 0..3 */
+    int l = r & 31;                      /* 0..31 */
+    const unsigned char *ql = s + half_i * 64;
+    const unsigned char *qh = s + 128 + half_i * 32;
+    const signed char *sc = (const signed char *)(s + 192) + half_i * 8;
+    int is = l >> 4;                     /* 0 or 1 */
+    int qval, scv;
+    if (grp == 0)      { qval = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)); scv = sc[is+0]; }
+    else if (grp == 1) { qval = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)); scv = sc[is+2]; }
+    else if (grp == 2) { qval = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)); scv = sc[is+4]; }
+    else               { qval = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)); scv = sc[is+6]; }
+    o[e] = __float2half(d * scv * (qval - 32));
     }
 }
