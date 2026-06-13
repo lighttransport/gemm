@@ -799,19 +799,21 @@ extern "C" __global__ void dequant_q6_K_to_f16(
     const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 210;
     half *o = out + (size_t)row * cols + (size_t)bk * 256;
 
-    __shared__ float sd;
-    if (threadIdx.x == 0) sd = __half2float(*(const __half *)(bp + 208));
+    /* Cooperatively stage the 210-byte super-block into shared memory so the 256
+     * decode threads don't each re-issue global loads (read amplification). */
+    __shared__ unsigned char s[210];
+    if (threadIdx.x < 210) s[threadIdx.x] = bp[threadIdx.x];
     __syncthreads();
-    float d = sd;
+    float d = __half2float(*(const __half *)(s + 208));
 
     int e = threadIdx.x;                 /* 0..255 */
     int half_i = e >> 7;                 /* 0 or 1 */
     int r = e & 127;                     /* 0..127 */
     int grp = r >> 5;                    /* 0..3 */
     int l = r & 31;                      /* 0..31 */
-    const unsigned char *ql = bp + half_i * 64;
-    const unsigned char *qh = bp + 128 + half_i * 32;
-    const signed char *sc = (const signed char *)(bp + 192) + half_i * 8;
+    const unsigned char *ql = s + half_i * 64;
+    const unsigned char *qh = s + 128 + half_i * 32;
+    const signed char *sc = (const signed char *)(s + 192) + half_i * 8;
     int is = l >> 4;                     /* 0 or 1 */
     int qval, scv;
     if (grp == 0)      { qval = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)); scv = sc[is+0]; }
