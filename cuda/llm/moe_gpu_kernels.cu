@@ -579,34 +579,40 @@ extern "C" __global__ void dequant_q4_K_to_f16(
 }
 
 /*
- * dequant_q4_0_to_f16: Q4_0 weight matrix -> FP16 row-major [rows, cols], one
- * thread per 32-element block. Mirrors dequant_q4_K_to_f16 for the gemma4
- * dequant->F16->cuBLAS batched-prefill path. Q4_0 GPU block = 18 bytes:
- * half d @0, qs[16] @2; weight j = (qs[j]&0xF - 8)*d for j<16,
- * (qs[j]>>4 - 8)*d for j+16 (matches matvec_q4_0_f32's x indexing).
+ * dequant_q4_0_to_f16: Q4_0 weight matrix -> FP16 row-major [rows, cols].
+ * Mirrors dequant_q4_K_to_f16 for the gemma4 dequant->F16->cuBLAS batched-prefill
+ * path. Q4_0 GPU block = 18 bytes: half d @0, qs[16] @2; weight j =
+ * (qs[j]&0xF - 8)*d for j<16, (qs[j]>>4 - 8)*d for j+16 (matches matvec_q4_0_f32).
+ *
+ * ONE THREAD PER OUTPUT ELEMENT (not per block). Consecutive threads write
+ * consecutive F16 outputs -> fully coalesced 64-byte stores per warp, and the
+ * 32 threads of a block-region share the same scale `d` (broadcast read). This
+ * is the dequant_q6_K_to_f16 layout; the old per-block kernel issued strided
+ * 2-byte stores 64 bytes apart across a warp (uncoalesced). Launched 1D with
+ * grid=(rows*cols+255)/256, block=256; rows*cols <= 256MB/2 < 2^31 (lm_head is
+ * excluded from this path), so a uint32 element index is safe.
  */
 extern "C" __global__ void dequant_q4_0_to_f16(
     half *out,                 // [rows * cols] FP16 output
     const unsigned char *mat,  // [rows * row_bytes] Q4_0 input
     int rows, int cols)
 {
-    int nb = cols / 32, rb = nb * 18;
-    int bid = blockIdx.x * 128 + threadIdx.x;
-    int total_blocks = rows * nb;
-    if (bid >= total_blocks) return;
+    unsigned e = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned total = (unsigned)rows * (unsigned)cols;
+    if (e >= total) return;
 
-    int row = bid / nb;
-    int bk = bid % nb;
+    unsigned ucols = (unsigned)cols;
+    unsigned nb = ucols >> 5;            // cols/32 (cols is a multiple of 32)
+    unsigned row = e / ucols;
+    unsigned col = e - row * ucols;
+    unsigned bk = col >> 5;              // block within row
+    unsigned local = col & 31;           // 0..31
 
-    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 18;
-    half *out_blk = out + (size_t)row * cols + (size_t)bk * 32;
-
+    const unsigned char *bp = mat + ((size_t)row * nb + bk) * 18;
     float d = __half2float(*(const __half *)bp);
-    const unsigned char *qs = bp + 2;
-    for (int j = 0; j < 16; j++) {
-        out_blk[j]      = __float2half((float)((int)(qs[j] & 0x0F) - 8) * d);
-        out_blk[j + 16] = __float2half((float)((int)(qs[j] >> 4)   - 8) * d);
-    }
+    unsigned char q = bp[2 + (local & 15)];
+    int nib = (local < 16) ? (int)(q & 0x0F) : (int)(q >> 4);
+    out[e] = __float2half((float)(nib - 8) * d);
 }
 
 /*
