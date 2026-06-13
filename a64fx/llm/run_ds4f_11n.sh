@@ -177,6 +177,20 @@ export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # Synthetic harness => bf16-rounded reduce is quality-irrelevant; all ranks stay
 # bitwise-identical (lockstep preserved). Default off; flip to cut comm.
 export TP_AR_BF16=${TP_AR_BF16:-0}
+# ---- ds4p / tensor-parallel / lean-cache knobs (export so mpiexec forwards them to ranks) ----
+# DS4F_MODEL=ds4p selects the DeepSeek-V4-Pro config (61L/7168/384E); empty = Flash.
+export DS4F_MODEL=${DS4F_MODEL:-}
+# Tensor-parallel dense sharding across the EP ranks (mandatory to fit ds4p): attn heads,
+# shared-expert up/gate, lm-head and embed are split N-ways instead of replicated.
+export DS4F_TP_ATTN=${DS4F_TP_ATTN:-0}
+export DS4F_TP_SHARED=${DS4F_TP_SHARED:-0}
+export DS4F_TP_HEAD=${DS4F_TP_HEAD:-0}
+export DS4F_TP_EMBED=${DS4F_TP_EMBED:-0}
+# DS4F_INT4_CMP=1 stores cmp_kv as int4 (implies INT8_CMP); leanest long-ctx cmp cache.
+export DS4F_INT4_CMP=${DS4F_INT4_CMP:-0}
+# Warm-phase ctx-ceiling guard (clean _exit(42) before OOM) + per-layer MemFree trace.
+export DS4F_WARM_RSS_TRACE=${DS4F_WARM_RSS_TRACE:-0}
+export DS4F_WARM_MEMAVAIL_STOP_GB=${DS4F_WARM_MEMAVAIL_STOP_GB:-1.5}
 
 echo "=== DS4F EP harness on $NP node(s) ($([ "$DS4F_REAL" = 1 ] && echo "REAL weights <- $DS4F_STAGE_DIR" || echo synthetic)$([ "$DS4F_EXACT" = 1 ] && echo " EXACT-math")$([ "$DS4F_TIERB2" = 1 ] && echo " TierB2")$([ "$DS4F_MHC" = 1 ] && echo " mHC")) ==="
 echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43} dense=$([ "$DS4F_REAL" = 1 ] && echo "FP8(real)" || ([ "$DS4F_FP8_BF16" = 1 ] && echo BF16 || echo FP8))"
