@@ -6072,6 +6072,9 @@ struct cuda_llm_runner {
     CUdeviceptr d_fa2_o_f16; /* [max_tokens * max_dim_h] F16 for FA2 O output / d512 F32 scores */
     CUdeviceptr d_fa2_scores_f16; /* [sq * total_s] F16 score matrix for cuBLAS-d512 attention */
     int fa2_buf_max_s; /* token capacity the d_fa2_* buffers were sized for */
+    CUdeviceptr d_swa_k_lin; /* [n_tokens * kv_dim] F16 linear K for batched windowed SWA prefill */
+    CUdeviceptr d_swa_v_lin; /* [n_tokens * kv_dim] F16 linear V */
+    int swa_lin_max_tokens;  /* token capacity the d_swa_*_lin buffers were sized for */
     CUdeviceptr d_f16_scratch; /* [max_out * max_in] F16 dequant scratch for Q8_0 GEMM */
     CUdeviceptr d_f16_scratch2; /* second weight-dequant buffer for double-buffered overlap */
     CUstream stream_dq;        /* weight dequant runs here, overlapping GEMM on the main stream */
@@ -7730,6 +7733,8 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         r->head_dim_swa  = cllm_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
         r->head_dim = r->head_dim_full; /* max for buffer sizing */
         r->swa_window_size = cllm_get_int(gguf, ARCH_KEY("attention.sliding_window"), 512);
+        { const char *we = getenv("CUDA_LLM_SWA_WINDOW"); /* test override */
+          if (we && atoi(we) > 0) r->swa_window_size = atoi(we); }
         r->n_embd_per_layer = cllm_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 256);
         int shared_kv_layers = cllm_get_int(gguf, ARCH_KEY("attention.shared_kv_layers"), 0);
         r->n_layer_kv_from_start = r->n_layers - shared_kv_layers;
@@ -11475,7 +11480,7 @@ static void launch_batch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevice
 static void launch_fa2_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
                                   CUdeviceptr key_cache, CUdeviceptr value_cache,
                                   int n_tokens, int start_pos, int n_heads, int n_kv_heads,
-                                  int head_dim, int kv_dim, float scale) {
+                                  int head_dim, int kv_dim, float scale, int window) {
     if (!r->fn_fa2_attn_256 || head_dim != 256) return;
     int q_dim = n_heads * head_dim;
     int hstride_q = q_dim;  /* Q layout: [n_tokens, q_dim] */
@@ -11500,7 +11505,7 @@ static void launch_fa2_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevicept
     int n_q_tiles = (n_tokens + FA2_BR_HOST - 1) / FA2_BR_HOST;
     size_t fa2_smem = 4 * FA2_BC_HOST * (head_dim + 8) * 2; /* 2 = sizeof(dt_t) = F16 */
     void *fa2_args[] = { &d_o_f16, &d_q_f16, &key_cache, &value_cache,
-                         &total_s, &head_dim, &hstride_q, &hstride_kv, &gqa_ratio, &scale };
+                         &total_s, &head_dim, &hstride_q, &hstride_kv, &gqa_ratio, &scale, &window };
     cuLaunchKernel(r->fn_fa2_attn_256,
         (unsigned)n_q_tiles, (unsigned)n_heads, 1,
         FA2_NTHR_HOST, 1, 1, (unsigned)fa2_smem, r->stream, fa2_args, NULL);
@@ -11530,7 +11535,7 @@ static void launch_fa2_attention_swa(cuda_llm_runner *r, CUdeviceptr out, CUdevi
     (void)kv_tokens;
     launch_fa2_attention(r, out, q_batch, k_sub, v_sub,
                          n_tokens, start_pos, n_heads, n_kv_heads,
-                         head_dim, kv_dim, adj_scale);
+                         head_dim, kv_dim, adj_scale, 0);
 }
 
 /* ---- cuBLAS-based D=512 attention: per-KV-head GEMM + softmax + GEMM ---- */
@@ -12554,6 +12559,22 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                     max_s, q_bytes/1048576.0, o_bytes/1048576.0,
                     (r->d_fa2_q_f16 && r->d_fa2_o_f16) ? "OK" : "FAIL");
     }
+    /* Linear F16 K/V scratch for batched windowed SWA prefill (start_pos==0,
+     * n_tokens > swa_window). The circular SWA cache can't hold all n_tokens at
+     * once, so attention reads a linear copy; the circular cache is filled with
+     * the window tail afterward for decode. */
+    if (r->is_gemma4 && r->swa_window_size > 0 && n_tokens > r->swa_window_size &&
+        start_pos == 0 && r->fn_fa2_attn_256 &&
+        (!r->d_swa_k_lin || n_tokens > r->swa_lin_max_tokens)) {
+        int max_kv = r->n_kv_heads * r->head_dim_swa;
+        size_t bytes = (size_t)n_tokens * max_kv * sizeof(uint16_t);
+        if (r->d_swa_k_lin) { cuMemFree(r->d_swa_k_lin); r->d_swa_k_lin = 0; }
+        if (r->d_swa_v_lin) { cuMemFree(r->d_swa_v_lin); r->d_swa_v_lin = 0; }
+        r->swa_lin_max_tokens = 0;
+        if (cuMemAlloc(&r->d_swa_k_lin, bytes) != CUDA_SUCCESS) r->d_swa_k_lin = 0;
+        if (cuMemAlloc(&r->d_swa_v_lin, bytes) != CUDA_SUCCESS) r->d_swa_v_lin = 0;
+        if (r->d_swa_k_lin && r->d_swa_v_lin) r->swa_lin_max_tokens = n_tokens;
+    }
 
     int n_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < n_layers) n_layers = r->max_layers;
@@ -12600,7 +12621,14 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
         int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
         float attn_scale = 1.0f;
 
-        if (!cl->is_swa || start_pos + n_tokens <= r->swa_window_size) {
+        /* Batched windowed SWA: when the prefill wraps the circular window, store
+         * K/V linearly and run a windowed FA2 instead of the slow per-token loop. */
+        int swa_lin = cl->is_swa && cl->shared_kv_source < 0 && start_pos == 0 &&
+                      n_tokens > r->swa_window_size && hd == 256 &&
+                      r->fn_fa2_attn_256 && r->fn_batch_kv_store_swa_f16 &&
+                      r->d_swa_k_lin && r->d_swa_v_lin && r->d_fa2_q_f16;
+
+        if (!cl->is_swa || start_pos + n_tokens <= r->swa_window_size || swa_lin) {
             /* ----- Batched path for full-attention or non-wrapping SWA ----- */
             int total_q_heads = n_tokens * n_heads;
             int total_kv_heads = n_tokens * layer_kv_heads;
@@ -12639,6 +12667,36 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                                                    start_pos, r->d_rope_inv_freq_full);
             }
 
+            if (swa_lin) {
+                /* Store K/V LINEARLY [n_tokens x kv_dim] (start_pos=0) for the
+                 * windowed FA2 read, then fill the circular cache window-tail for
+                 * decode continuation. */
+                int zero = 0;
+                void *lin[] = { &r->d_swa_k_lin, &r->d_swa_v_lin, &d_batch_k, &d_batch_v,
+                                &zero, &local_kv_dim, &n_tokens };
+                cuLaunchKernel(r->fn_batch_kv_store_f16,
+                               (local_kv_dim + 255) / 256, n_tokens, 1,
+                               256, 1, 1, 0, r->stream, lin, NULL);
+                /* Fill the circular cache with ONLY the last `window` tokens — each
+                 * maps to a unique slot, so no write race (storing all n_tokens
+                 * would race multiple positions onto the same slot). This leaves
+                 * the cache identical to the per-token path for decode. */
+                int tail = r->swa_window_size;
+                int tail_start = n_tokens - tail;
+                CUdeviceptr k_tail = d_batch_k + (size_t)tail_start * local_kv_dim * sizeof(float);
+                CUdeviceptr v_tail = d_batch_v + (size_t)tail_start * local_kv_dim * sizeof(float);
+                void *circ[] = { &r->d_key_cache[l], &r->d_value_cache[l], &k_tail, &v_tail,
+                                 &tail_start, &local_kv_dim, &tail, &r->swa_window_size };
+                cuLaunchKernel(r->fn_batch_kv_store_swa_f16,
+                               (local_kv_dim + 255) / 256, tail, 1,
+                               256, 1, 1, 0, r->stream, circ, NULL);
+                launch_fa2_attention(r, d_batch_xb2, d_batch_q,
+                                    r->d_swa_k_lin, r->d_swa_v_lin,
+                                    n_tokens, 0, n_heads, layer_kv_heads,
+                                    hd, local_kv_dim, attn_scale, r->swa_window_size);
+                goto swa_attn_done;
+            }
+
             if (cl->shared_kv_source < 0) {
                 void *kva[] = { &r->d_key_cache[l], &r->d_value_cache[l], &d_batch_k, &d_batch_v,
                                 &start_pos, &local_kv_dim, &n_tokens };
@@ -12650,10 +12708,12 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             if (r->debug_layers >= 3) cuStreamSynchronize(r->stream);
             double _attn_t0 = (r->debug_layers >= 3) ? get_time_ms() : 0;
             if (n_tokens >= 64 && hd == 256 && r->fn_fa2_attn_256 && r->d_fa2_q_f16) {
+                /* window=0: this branch only runs when start_pos+n_tokens<=window,
+                 * so causal == windowed and no extra masking is needed. */
                 launch_fa2_attention(r, d_batch_xb2, d_batch_q,
                                     r->d_key_cache[kv_src], r->d_value_cache[kv_src],
                                     n_tokens, start_pos, n_heads, layer_kv_heads,
-                                    hd, local_kv_dim, attn_scale);
+                                    hd, local_kv_dim, attn_scale, 0);
             } else if (n_tokens >= 64 && r->cublas && r->fn_causal_softmax_f32 && r->d_fa2_q_f16) {
                 launch_cublas_d512_attention(r, d_batch_xb2, d_batch_q,
                                             r->d_key_cache[kv_src], r->d_value_cache[kv_src],
@@ -12719,6 +12779,7 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                                     pos, r->swa_window_size, attn_scale);
             }
         }
+        swa_attn_done:;
 
         /* 4. Batched output projection */
         launch_batch_matvec(r, d_batch_xb, cl->attn_output_w, 0, d_batch_xb2,
@@ -13441,6 +13502,8 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_fa2_q_f16) cuMemFree(r->d_fa2_q_f16);
     if (r->d_fa2_o_f16) cuMemFree(r->d_fa2_o_f16);
     if (r->d_fa2_scores_f16) cuMemFree(r->d_fa2_scores_f16);
+    if (r->d_swa_k_lin) cuMemFree(r->d_swa_k_lin);
+    if (r->d_swa_v_lin) cuMemFree(r->d_swa_v_lin);
     if (r->d_f16_scratch2) cuMemFree(r->d_f16_scratch2);
     if (r->stream_dq) cuStreamDestroy(r->stream_dq);
     for (int i = 0; i < 2; i++) {
