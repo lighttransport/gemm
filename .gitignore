@@ -242,3 +242,29 @@ cuda/qimg/fp8_reference/
 
 # scan chunked-prototype dev binary
 cuda/llm/scan/deltanet_chunk_test
+
+# Python venv (tooling, e.g. git-filter-repo)
+.venv/
+
+# Vulkan CMake build directories (regenerate via cmake)
+vulkan/build/
+vulkan/build_t2/
+
+# Generated / compiled artifacts that must never be committed
+*.cubin
+*.spv
+*.npy
+*.bak
+profile.sqlite
+
+# Remaining test binaries (regenerate via make)
+common/test_bpe_tokenizer
+common/test_gguf_loader
+rdna4/da3/test_*
+!rdna4/da3/test_*.c
+rdna4/hy3d/test_hip_hy3d_debug
+rdna4/ppd/test_hip_ppd
+rdna4/qimg/test_hip_qimg
+rdna4/vlm/test_*
+!rdna4/vlm/test_*.c
+vulkan/hy3d/test_vulkan_hy3d
