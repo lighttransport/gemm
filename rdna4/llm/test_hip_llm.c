@@ -347,14 +347,29 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Vocab: %d tokens\n", vocab->n_tokens);
 
-    /* Tokenize prompt */
-    int32_t tokens[4096];
-    int n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, 4096);
+    /* Tokenize prompt. Buffer sized to hold a large --prefill-len pad. */
+    int tok_cap = (prefill_pad > 4096) ? (prefill_pad + 16) : 4096;
+    int32_t *tokens = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
+    if (!tokens) { fprintf(stderr, "tokens alloc failed\n"); return 1; }
+    int n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, tok_cap);
     if (n_tokens <= 0) {
         fprintf(stderr, "Tokenization failed\n");
         bpe_vocab_free(vocab);
         gguf_close(gguf);
         return 1;
+    }
+    /* Prepend BOS (Gemma expects it; bpe_tokenize here does not add it). Default to
+     * the GGUF's tokenizer.ggml.bos_token_id; LLM_ADD_BOS overrides (0 disables). */
+    {
+        int bos = -1;
+        const char *e = getenv("LLM_ADD_BOS");
+        if (e) bos = atoi(e);
+        else { int bi = gguf_find_key(gguf, "tokenizer.ggml.bos_token_id");
+               if (bi >= 0) bos = (int)gguf->kv[bi].value.u32; }
+        if (bos > 0 && (n_tokens == 0 || tokens[0] != bos)) {
+            for (int i = n_tokens; i > 0; i--) tokens[i] = tokens[i-1];
+            tokens[0] = bos; n_tokens++;
+        }
     }
     fprintf(stderr, "Prompt: \"%s\" -> %d tokens:", prompt, n_tokens);
     for (int i = 0; i < n_tokens && i < 32; i++) {
@@ -364,7 +379,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n");
 
     /* --prefill-len M: pad prompt by repeating last token until length == M */
-    if (prefill_pad > n_tokens && prefill_pad <= 4096) {
+    if (prefill_pad > n_tokens && prefill_pad <= tok_cap) {
         int32_t pad = tokens[n_tokens - 1];
         for (int i = n_tokens; i < prefill_pad; i++) tokens[i] = pad;
         n_tokens = prefill_pad;
@@ -482,13 +497,17 @@ int main(int argc, char **argv) {
         double decode_ms = 0.0, decode_tps = 0.0;
         int first_decode_tok = next_tok;
         if (decode_n > 0) {
+            int gen_text = (getenv("LLM_GEN_TEXT") != NULL);
+            if (gen_text) fprintf(stderr, "\n=== Generated text ===\n%s", bpe_token_to_str(vocab, next_tok));
             double t_dec0 = get_time_ms();
             for (int k = 0; k < decode_n; k++) {
                 int pos = n_prefill + k;
                 float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
                 if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
                 next_tok = argmax_logits(lg, n_vocab);
+                if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
             }
+            if (gen_text) fprintf(stderr, "\n=== end ===\n");
             double t_dec1 = get_time_ms();
             decode_ms = t_dec1 - t_dec0;
             decode_tps = (decode_ms > 0.0) ? (1000.0 * decode_n / decode_ms) : 0.0;
