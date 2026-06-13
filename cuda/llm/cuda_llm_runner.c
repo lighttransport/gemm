@@ -1463,6 +1463,26 @@ static const char *cuda_kernel_source =
 "    dst[i] = val;\n"
 "}\n"
 "\n"
+"/* ---- 18c. embed_q4_0: Q4_0 embedding lookup -> F32 ---- */\n"
+"/* Q4_0 block: 18 bytes = [half d][qs[16]], 32 elements; w[j]=(qs[j]&0xF-8)*d for\n"
+"   j<16, (qs[j-16]>>4-8)*d for j>=16 (matches matvec_q4_0_f32). */\n"
+"__global__ void embed_q4_0(float *dst, const unsigned char *embd_table,\n"
+"                             int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n_embd) return;\n"
+"    int nb_per_row = n_embd / 32;\n"
+"    int row_bytes = nb_per_row * 18;\n"
+"    const unsigned char *row = embd_table + (size_t)token_id * row_bytes;\n"
+"    int block_idx = i / 32;\n"
+"    int elem = i % 32;\n"
+"    const unsigned char *bp = row + block_idx * 18;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs = bp + 2;\n"
+"    unsigned char q = qs[elem & 15];\n"
+"    int v = (elem < 16) ? (int)(q & 0x0F) : (int)(q >> 4);\n"
+"    dst[i] = (float)(v - 8) * d;\n"
+"}\n"
+"\n"
 "/* ==== SSM Delta-Net kernels ==== */\n"
 "\n"
 "/* ---- 19. softplus_mul_f32: out[i] = softplus(in[i]+bias[i]) * a[i] ---- */\n"
@@ -2782,6 +2802,47 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 
+"/* ---- matvec_q4_0_q8_1_dp4a: Q4_0 weight x Q8_1 activation via dp4a ---- */\n"
+"/* 8 warps/block, each warp = one row; lane strides over 32-elem blocks. Q4_0\n"
+"   value=(nibble-8)*d_w; per block, dot = d_w*(d8*sum(nibble*a_int) - 8*s8) where\n"
+"   the Q8_1 block holds a_int (int8 x32), d8=scale, s8=d8*sum(a_int). The 18-byte\n"
+"   Q4_0 block leaves qs at offset 2 (not 4-aligned), so qs is read as bytes and\n"
+"   packed; the Q8_1 quants (x_q81, 36B blocks) ARE 4-aligned and read as int. */\n"
+"__global__ void matvec_q4_0_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 32;\n"
+"    int row_bytes = nb * 18;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sumf = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 18;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *q81 = x_q81 + (size_t)b * 36;\n"
+"        const int *u = (const int *)q81;\n"
+"        float d8 = half_to_float(*(const half_raw *)(q81 + 32));\n"
+"        float s8 = half_to_float(*(const half_raw *)(q81 + 34));\n"
+"        int acc = 0;\n"
+"        #pragma unroll\n"
+"        for (int k = 0; k < 4; k++) {\n"
+"            unsigned int c0 = qs[4*k], c1 = qs[4*k+1], c2 = qs[4*k+2], c3 = qs[4*k+3];\n"
+"            int v_lo = (int)((c0 & 0xF) | ((c1 & 0xF) << 8) | ((c2 & 0xF) << 16) | ((c3 & 0xF) << 24));\n"
+"            int v_hi = (int)((c0 >> 4)  | ((c1 >> 4)  << 8) | ((c2 >> 4)  << 16) | ((c3 >> 4)  << 24));\n"
+"            acc = dp4a_s8(v_lo, u[k],     acc);\n"
+"            acc = dp4a_s8(v_hi, u[k + 4], acc);\n"
+"        }\n"
+"        sumf += dw * (d8 * (float)acc - 8.0f * s8);\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);\n"
+"    if (lane == 0) dst[row] = sumf;\n"
+"}\n"
+
 "/* ---- matvec_q4_1_f32: Q4_1 matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_q4_1_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
@@ -3573,8 +3634,13 @@ static const char *cuda_kernel_source =
 "/* Convert F32 array to F16 in-place (output to separate buffer) */\n"
 "__global__ void convert_f32_to_f16(half_raw *out, const float *in, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    out[i] = float_to_half(in[i]);\n"
+"    if (i < n) out[i] = float_to_half(in[i]);\n"
+"}\n"
+"\n"
+"/* ---- convert_f16_to_f32: F16 to F32 conversion ---- */\n"
+"__global__ void convert_f16_to_f32(float *out, const half_raw *in, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) out[i] = half_to_float(in[i]);\n"
 "}\n"
 "\n"
 "__device__ __forceinline__ unsigned short bf16_to_f16_trunc(unsigned short v) {\n"
@@ -3633,6 +3699,43 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"/* ---- Chunked batch_matvec_q8_0: 4 tokens per block (reduces weight reads 4x) ---- */\n"
+"__global__ void batch_matvec_q8_0_x4(float *output, const unsigned char *mat, const float *input,\n"
+"                                      int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= out_dim) return;\n"
+"    int t0 = blockIdx.y * 4;\n"
+"    int nt = n_tokens - t0;\n"
+"    if (nt > 4) nt = 4;\n"
+"    if (nt <= 0) return;\n"
+"    int nb = in_dim / 32;\n"
+"    int row_bytes = nb * 36;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum[4];\n"
+"    for (int t = 0; t < nt; t++) sum[t] = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 36;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        const signed char *qs = (const signed char *)(bp + 4);\n"
+"        float partial[4];\n"
+"        for (int t = 0; t < nt; t++) partial[t] = 0.0f;\n"
+"        for (int i = 0; i < 32; i++) {\n"
+"            float w = d * (float)qs[i];\n"
+"            for (int t = 0; t < nt; t++)\n"
+"                partial[t] += w * input[(size_t)(t0+t) * in_dim + b * 32 + i];\n"
+"        }\n"
+"        for (int t = 0; t < nt; t++) sum[t] += partial[t];\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            sum[t] += __shfl_down_sync(0xFFFFFFFF, sum[t], offset);\n"
+"    if (lane == 0)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            output[(size_t)(t0+t) * out_dim + row] = sum[t];\n"
 "}\n"
 "\n"
 "/* Batched Q2_K matvec: process n_tokens through weight matrix simultaneously */\n"
@@ -3989,7 +4092,64 @@ static const char *cuda_kernel_source =
 "        sum += partial;\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"/* ---- Chunked batch_matvec_q4_K: processes 4 tokens per block ---- */\n"
+"__global__ void batch_matvec_q4_K_x4(float *output, const unsigned char *mat, const float *input,\n"
+"                                      int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= out_dim) return;\n"
+"    int t0 = blockIdx.y * 4;\n"
+"    int nt = n_tokens - t0;\n"
+"    if (nt > 4) nt = 4;\n"
+"    if (nt <= 0) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 144;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum[4];\n"
+"    for (int t = 0; t < nt; t++) sum[t] = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 144;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qs = bp + 16;\n"
+"        int yi = 0, is = 0;\n"
+"        float p0[4], p1[4];\n"
+"        for (int t = 0; t < nt; t++) p0[t] = 0.0f, p1[t] = 0.0f;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0;\n"
+"            float d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                float v0 = d1 * (q[l] & 0xF) - m1;\n"
+"                float v1 = d2 * (q[l] >> 4) - m2;\n"
+"                for (int t = 0; t < nt; t++) {\n"
+"                    const float *x = input + (size_t)(t0+t) * in_dim + (size_t)b * 256 + yi;\n"
+"                    p0[t] += v0 * x[0];\n"
+"                    p1[t] += v1 * x[0];\n"
+"                }\n"
+"                yi++;\n"
+"            }\n"
+"            is += 2;\n"
+"        }\n"
+"        for (int t = 0; t < nt; t++) sum[t] += p0[t] + p1[t];\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            sum[t] += __shfl_down_sync(0xFFFFFFFF, sum[t], offset);\n"
+"    if (lane == 0)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            output[(size_t)(t0+t) * out_dim + row] = sum[t];\n"
 "}\n"
 "\n"
 "/* Batched Q5_K matvec (float path) */\n"
@@ -4079,6 +4239,60 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
 "    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"\n"
+"/* ---- Chunked batch_matvec_q6_K: processes 4 tokens per block ---- */\n"
+"/* Grid: (out_dim/8, ceil(n_tokens/4)), blockDim: 256.\n"
+"   8 warps x 8 rows. Each warp loads 1 row of weights, processes 4 tokens. */\n"
+"__global__ void batch_matvec_q6_K_x4(float *output, const unsigned char *mat,\n"
+"                                      const float *input,\n"
+"                                      int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= out_dim) return;\n"
+"    int t0 = blockIdx.y * 4;\n"
+"    int nt = n_tokens - t0;\n"
+"    if (nt > 4) nt = 4;\n"
+"    if (nt <= 0) return;\n"
+"    int nb = in_dim / 256;\n"
+"    int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum[4];\n"
+"    for (int t = 0; t < nt; t++) sum[t] = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp;\n"
+"        const unsigned char *qh = bp + 128;\n"
+"        const signed char *sc = (const signed char *)(bp + 192);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        for (int half = 0; half < 2; half++) {\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int is = l / 16;\n"
+"                int q1 = (int)((ql[l] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;\n"
+"                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;\n"
+"                int q3 = (int)((ql[l] >> 4) | (((qh[l]>>4)&3)<<4)) - 32;\n"
+"                int q4 = (int)((ql[l+32] >> 4) | (((qh[l]>>6)&3)<<4)) - 32;\n"
+"                float w0 = d * sc[is+0] * q1;\n"
+"                float w1 = d * sc[is+2] * q2;\n"
+"                float w2 = d * sc[is+4] * q3;\n"
+"                float w3 = d * sc[is+6] * q4;\n"
+"                int b256 = b * 256 + half * 128;\n"
+"                for (int t = 0; t < nt; t++) {\n"
+"                    const float *x = input + (size_t)(t0+t) * in_dim + b256 + l;\n"
+"                    sum[t] += w0 * x[0] + w1 * x[32] + w2 * x[64] + w3 * x[96];\n"
+"                }\n"
+"            }\n"
+"            ql += 64; qh += 32; sc += 8;\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            sum[t] += __shfl_down_sync(0xFFFFFFFF, sum[t], offset);\n"
+"    if (lane == 0)\n"
+"        for (int t = 0; t < nt; t++)\n"
+"            output[(size_t)(t0+t) * out_dim + row] = sum[t];\n"
 "}\n"
 "\n"
 "/* ---- dequant_iq2_s_to_f16: IQ2_S weight matrix -> F16 ---- */\n"
@@ -4839,6 +5053,29 @@ static const char *cuda_kernel_source =
 "    v[j + pair_off] = v0 * sin_t + v1 * cos_t;\n"
 "}\n"
 "\n"
+"/* Batched factored RoPE: like rope_with_factors_f32 but derives a PER-TOKEN\n"
+"   position (start_pos + h/heads_per_token) instead of a single constant. The\n"
+"   non-batched rope_with_factors_f32 applies one position to every block, which\n"
+"   is only correct for a single token; batched prefill must rope token t at\n"
+"   start_pos+t. inv_freq holds the proportional/NTK-scaled frequencies. */\n"
+"__global__ void batch_rope_with_factors_f32(float *vec, int heads_per_token,\n"
+"                                             int total_heads, int head_dim,\n"
+"                                             int start_pos, const float *inv_freq,\n"
+"                                             int n_pairs) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= total_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    if (j >= n_pairs) return;\n"
+"    int token = h / heads_per_token;\n"
+"    int pos = start_pos + token;\n"
+"    float freq = (float)pos * inv_freq[j];\n"
+"    float cos_v = cosf(freq), sin_v = sinf(freq);\n"
+"    float *v = vec + (size_t)h * head_dim;\n"
+"    float r0 = v[j], r1 = v[j + n_pairs];\n"
+"    v[j]           = r0 * cos_v - r1 * sin_v;\n"
+"    v[j + n_pairs] = r0 * sin_v + r1 * cos_v;\n"
+"}\n"
+"\n"
 "/* Batched depthwise causal conv1d + SiLU over a token chunk.\n"
 "   data is laid out as [n_tokens, qkv_dim] and updated in-place to hold conv output. */\n"
 "__global__ void batch_conv1d_depthwise_silu_f32(float *data, float *conv_state,\n"
@@ -5153,6 +5390,127 @@ static const char *cuda_kernel_source =
 "        }\n"
 "        out_h[d] = acc;\n"
 "    }\n"
+"}\n"
+"\n"
+"\n"
+"/* ---- batch_attn_all_tokens_f32: all tokens per head, D=512 optimized ---- */\n"
+"/* Grid: (n_heads, 1), Block: 256. Reads KV cache ONCE per head for all tokens.\n"
+"   Uses shared memory for scores [n_tokens x seq_len]. */\n"
+"__global__ void batch_attn_all_tokens_f32(float *out, const float *q_batch,\n"
+"                                            const half_raw *key_cache, const half_raw *value_cache,\n"
+"                                            int n_tokens, int start_pos,\n"
+"                                            int n_heads, int n_kv_heads,\n"
+"                                            int head_dim, int kv_dim, float scale) {\n"
+"    extern __shared__ float smem[];\n"
+"    float *scores = smem;\n"
+"    int h = blockIdx.x;\n"
+"    int gqa_ratio = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa_ratio;\n"
+"    int q_dim = n_heads * head_dim;\n"
+"    int tid = threadIdx.x;\n"
+"    int nt = blockDim.x;\n"
+"    int max_seq = start_pos + n_tokens;\n"
+"\n"
+"    /* Compute QK scores: for each token qi, dot product over head_dim */\n"
+"    for (int qi = tid; qi < n_tokens; qi += nt) {\n"
+"        const float *q_h = q_batch + (size_t)qi * q_dim + h * head_dim;\n"
+"        int kv_lim = start_pos + qi + 1;\n"
+"        if (kv_lim > max_seq) kv_lim = max_seq;\n"
+"        int row_off = qi * max_seq;\n"
+"        float local_max = -1e30f;\n"
+"        for (int t = 0; t < kv_lim; t++) {\n"
+"            const half_raw *k_t = key_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"            float s = 0.0f;\n"
+"            for (int d = 0; d < head_dim; d++) s += q_h[d] * half_to_float(k_t[d]);\n"
+"            s *= scale;\n"
+"            scores[row_off + t] = s;\n"
+"            if (s > local_max) local_max = s;\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"\n"
+"    /* Softmax: find max, sum, normalize */\n"
+"    for (int qi = tid; qi < n_tokens; qi += nt) {\n"
+"        int kv_lim = start_pos + qi + 1;\n"
+"        if (kv_lim > max_seq) kv_lim = max_seq;\n"
+"        int row_off = qi * max_seq;\n"
+"        float mx = scores[row_off];\n"
+"        for (int t = 1; t < kv_lim; t++) if (scores[row_off + t] > mx) mx = scores[row_off + t];\n"
+"        float sum = 0.0f;\n"
+"        for (int t = 0; t < kv_lim; t++) {\n"
+"            float e = expf(scores[row_off + t] - mx);\n"
+"            scores[row_off + t] = e;\n"
+"            sum += e;\n"
+"        }\n"
+"        float inv = 1.0f / sum;\n"
+"        for (int t = 0; t < kv_lim; t++) scores[row_off + t] *= inv;\n"
+"    }\n"
+"    __syncthreads();\n"
+"\n"
+"    /* V accumulation: each thread handles a subset of d values */\n"
+"    for (int d = tid; d < head_dim; d += nt) {\n"
+"        for (int qi = 0; qi < n_tokens; qi++) {\n"
+"            int kv_lim = start_pos + qi + 1;\n"
+"            if (kv_lim > max_seq) kv_lim = max_seq;\n"
+"            float acc = 0.0f;\n"
+"            int row_off = qi * max_seq;\n"
+"            for (int t = 0; t < kv_lim; t++) {\n"
+"                const half_raw *v_t = value_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"                acc += scores[row_off + t] * half_to_float(v_t[d]);\n"
+"            }\n"
+"            float *out_h = out + (size_t)qi * q_dim + h * head_dim;\n"
+"            out_h[d] = acc;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- Fused causal softmax: applies causal mask + softmax to scores ---- */\n"
+"/* scores [n_q_tokens x seq_len] in-place. Grid: n_q_tokens. */\n"
+"/* tok_div = token index divisor for GQA groups (e.g., 2 for gqa_ratio=2) */\n"
+"__global__ void causal_softmax_f32(float *scores, int n_q_tokens,\n"
+"                                    int seq_len, int start_pos, int tok_div) {\n"
+"    int qi = blockIdx.x;\n"
+"    if (qi >= n_q_tokens) return;\n"
+"    int tok = qi / tok_div;\n"
+"    int kv_lim = start_pos + tok + 1;\n"
+"    if (kv_lim > seq_len) kv_lim = seq_len;\n"
+"    int tid = threadIdx.x;\n"
+"    int nt = blockDim.x;\n"
+"    float *row = scores + (size_t)qi * seq_len;\n"
+"    float mx = -1e30f;\n"
+"    for (int t = tid; t < kv_lim; t += nt)\n"
+"        if (row[t] > mx) mx = row[t];\n"
+"    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xFFFFFFFF, mx, off));\n"
+"    __shared__ float warp_vals[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) warp_vals[wid] = mx;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float m = warp_vals[0];\n"
+"        for (int w = 1; w < (nt + 31) / 32; w++) if (warp_vals[w] > m) m = warp_vals[w];\n"
+"        warp_vals[0] = m;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    mx = warp_vals[0];\n"
+"    float sum = 0.0f;\n"
+"    for (int t = tid; t < kv_lim; t += nt) {\n"
+"        float e = expf(row[t] - mx);\n"
+"        row[t] = e;\n"
+"        sum += e;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, off);\n"
+"    if (ln == 0) warp_vals[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float s = 0.0f;\n"
+"        for (int w = 0; w < (nt + 31) / 32; w++) s += warp_vals[w];\n"
+"        warp_vals[0] = 1.0f / s;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float inv = warp_vals[0];\n"
+"    for (int t = tid; t < kv_lim; t += nt) row[t] *= inv;\n"
+"    /* Zero out future positions */\n"
+"    for (int t = kv_lim + tid; t < seq_len; t += nt) row[t] = 0.0f;\n"
 "}\n"
 "\n"
 "/* Per-head RMSNorm for Q/K: normalize each head independently */\n"
@@ -5521,6 +5879,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q6_K_q8_1_dp4a;
     CUfunction fn_embed_q2_K;
     CUfunction fn_embed_q4_K;
+    CUfunction fn_embed_q4_0;
     /* SSM kernels */
     CUfunction fn_softplus_mul_f32;
     CUfunction fn_sigmoid_inplace_f32;
@@ -5539,6 +5898,7 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_f32_f32;
     CUfunction fn_matvec_iq2_xxs_f32;
     CUfunction fn_matvec_q4_0_f32;
+    CUfunction fn_matvec_q4_0_q8_1_dp4a;
     CUfunction fn_matvec_q4_1_f32;
     CUfunction fn_matvec_q5_0_f32;
     CUfunction fn_matvec_q5_1_f32;
@@ -5555,9 +5915,11 @@ struct cuda_llm_runner {
 
     /* Batched prefill kernels */
     CUfunction fn_convert_f32_to_f16;
+    CUfunction fn_convert_f16_to_f32;
     CUfunction fn_bf16_to_f16_inplace;
     CUfunction fn_batch_embed_f16;
     CUfunction fn_batch_matvec_q8_0_f32;
+    CUfunction fn_batch_matvec_q8_0_x4;
     CUfunction fn_batch_matvec_q2_K;
     CUfunction fn_batch_matvec_q3_K;
     CUfunction fn_batch_matvec_iq2_xxs;
@@ -5583,14 +5945,18 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_iq3_xxs;
     CUfunction fn_batch_matvec_iq3_s;
     CUfunction fn_batch_matvec_q4_K;
+    CUfunction fn_batch_matvec_q4_K_x4;
     CUfunction fn_batch_matvec_q5_K;
     CUfunction fn_batch_matvec_q6_K;
+    CUfunction fn_batch_matvec_q6_K_x4;
     CUfunction fn_batch_softplus_mul_f32;
     CUfunction fn_batch_rope_neox_f32;
     CUfunction fn_batch_conv1d_depthwise_silu_f32;
     CUfunction fn_batch_deltanet_scan_f32;
     CUfunction fn_batch_l2_norm_heads_strided_f32;
     CUfunction fn_batch_attn_causal_f32;
+    CUfunction fn_batch_attn_all_tokens_f32;
+    CUfunction fn_causal_softmax_f32;
     CUfunction fn_batch_kv_store_f16;
     CUfunction fn_batch_kv_store_swa_f16;
     CUfunction fn_batch_rmsnorm_f32;
@@ -5663,6 +6029,9 @@ struct cuda_llm_runner {
     int ple_use_f32;                /* 1 = keep PLE weights in F32 for accuracy */
     /* AOT-compiled GPU kernels (moe_gpu_kernels.cubin, no device globals) */
     CUmodule moe_gpu_mod;
+    /* FA2 Flash Attention NVRTC module (separately compiled for D=256) */
+    CUmodule fa2_mod;
+    CUfunction fn_fa2_attn_256;
     CUfunction fn_moe_topk_gpu;
     CUfunction fn_moe_shared_gate_gpu;
     CUfunction fn_moe_iq2s_tc;
@@ -5671,6 +6040,10 @@ struct cuda_llm_runner {
     CUfunction fn_moe_f16_tc;
     CUfunction fn_moe_prefill_q4k;
     CUfunction fn_dequant_q4_K_to_f16;
+    CUfunction fn_dequant_q4_0_to_f16;
+    CUfunction fn_dequant_q8_0_to_f16;
+    CUfunction fn_dequant_q8_0_to_f16_h;
+    CUfunction fn_dequant_q6_K_to_f16;
     CUfunction fn_moe_expert_fused_q4k;
     CUdeviceptr d_topk_idx;   /* [n_used * max_tokens] int */
     CUdeviceptr d_topk_wgt;   /* [n_used * max_tokens] float */
@@ -5701,6 +6074,7 @@ struct cuda_llm_runner {
     CUfunction fn_attn_decode_swa_f32;
     CUfunction fn_matvec_bf16_f32;
     CUfunction fn_rope_with_factors_f32;
+    CUfunction fn_batch_rope_with_factors_f32;
 
     /* MoE scratch buffers */
     CUdeviceptr d_router_logits;  /* [d_router_logits_entries] F32 */
@@ -5782,7 +6156,23 @@ struct cuda_llm_runner {
     CUdeviceptr d_batch_alpha;  /* [max_tokens * dt_rank] */
     CUdeviceptr d_batch_beta;   /* [max_tokens * dt_rank] */
     CUdeviceptr d_batch_token_ids; /* [max_tokens] int32 */
+    CUdeviceptr d_fa2_q_f16; /* [max_tokens * max_dim_h] F16 for FA2 Q input */
+    CUdeviceptr d_fa2_o_f16; /* [max_tokens * max_dim_h] F16 for FA2 O output / d512 F32 scores */
+    CUdeviceptr d_fa2_scores_f16; /* [sq * total_s] F16 score matrix for cuBLAS-d512 attention */
+    int fa2_buf_max_s; /* token capacity the d_fa2_* buffers were sized for */
+    size_t d512_cap_elems; /* effective per-chunk score-matrix cap (elems) the d_fa2_* buffers were sized for; the d512 attn loop must use this exact value to chunk so it never overflows the buffer */
+    CUdeviceptr d_swa_k_lin; /* [n_tokens * kv_dim] F16 linear K for batched windowed SWA prefill */
+    CUdeviceptr d_swa_v_lin; /* [n_tokens * kv_dim] F16 linear V */
+    int swa_lin_max_tokens;  /* token capacity the d_swa_*_lin buffers were sized for */
+    CUdeviceptr d_f16_scratch; /* [max_out * max_in] F16 dequant scratch for Q8_0 GEMM */
+    CUdeviceptr d_f16_scratch2; /* second weight-dequant buffer for double-buffered overlap */
+    CUstream stream_dq;        /* weight dequant runs here, overlapping GEMM on the main stream */
+    CUevent dq_evt[2];         /* dequant-done events (ping-pong) */
+    CUevent gemm_evt[2];       /* gemm-done events guarding buffer reuse (ping-pong) */
+    int dq_pp;                 /* ping-pong index */
+    int prefill_overlap;       /* 1 = double-buffer weight dequant vs GEMM */
     CUdeviceptr d_batch_f16_scratch; /* [max_tokens * max_dim] F16 for cuBLAS input conversion */
+    size_t batch_f16_scratch_bytes; /* current byte capacity of d_batch_f16_scratch */
 
     /* Host output buffer */
     float *h_output;     /* [n_embd] or [n_vocab] for logits */
@@ -5985,6 +6375,7 @@ lookup_funcs:
     GET_FUNC(matvec_q6_K_q8_1_dp4a);
     GET_FUNC(embed_q2_K);
     GET_FUNC(embed_q4_K);
+    GET_FUNC(embed_q4_0);
     /* SSM kernels */
     GET_FUNC(softplus_mul_f32);
     GET_FUNC(sigmoid_inplace_f32);
@@ -6003,6 +6394,7 @@ lookup_funcs:
     GET_FUNC(batch_matvec_f32_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
     GET_FUNC(matvec_q4_0_f32);
+    GET_FUNC(matvec_q4_0_q8_1_dp4a);
     GET_FUNC(matvec_q4_1_f32);
     GET_FUNC(matvec_q5_0_f32);
     GET_FUNC(matvec_q5_1_f32);
@@ -6025,11 +6417,14 @@ lookup_funcs:
     GET_FUNC(attn_decode_swa_f32);
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(rope_with_factors_f32);
+    GET_FUNC(batch_rope_with_factors_f32);
     /* Batched prefill kernels */
     GET_FUNC(convert_f32_to_f16);
+    GET_FUNC(convert_f16_to_f32);
     GET_FUNC(bf16_to_f16_inplace);
     GET_FUNC(batch_embed_f16);
     GET_FUNC(batch_matvec_q8_0_f32);
+    GET_FUNC(batch_matvec_q8_0_x4);
     GET_FUNC(batch_matvec_q2_K);
     GET_FUNC(batch_matvec_q3_K);
     GET_FUNC(batch_matvec_iq2_xxs);
@@ -6054,14 +6449,18 @@ lookup_funcs:
     GET_FUNC(batch_matvec_iq3_xxs);
     GET_FUNC(batch_matvec_iq3_s);
     GET_FUNC(batch_matvec_q4_K);
+    GET_FUNC(batch_matvec_q4_K_x4);
     GET_FUNC(batch_matvec_q5_K);
     GET_FUNC(batch_matvec_q6_K);
+    GET_FUNC(batch_matvec_q6_K_x4);
     GET_FUNC(batch_softplus_mul_f32);
     GET_FUNC(batch_rope_neox_f32);
     GET_FUNC(batch_conv1d_depthwise_silu_f32);
     GET_FUNC(batch_deltanet_scan_f32);
     GET_FUNC(batch_l2_norm_heads_strided_f32);
     GET_FUNC(batch_attn_causal_f32);
+    GET_FUNC(batch_attn_all_tokens_f32);
+    GET_FUNC(causal_softmax_f32);
     GET_FUNC(batch_kv_store_f16);
     GET_FUNC(batch_kv_store_swa_f16);
     GET_FUNC(batch_rmsnorm_f32);
@@ -6108,6 +6507,10 @@ lookup_funcs:
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_f16_tc, "moe_f16_tc");
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_prefill_q4k, "moe_prefill_q4k");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_K_to_f16, "dequant_q4_K_to_f16");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_0_to_f16, "dequant_q4_0_to_f16");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16, "dequant_q8_0_to_f16");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16_h, "dequant_q8_0_to_f16_h");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q6_K_to_f16, "dequant_q6_K_to_f16");
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_expert_fused_q4k, "moe_expert_fused_q4k");
 #undef CLLM_LOAD_OPT_FUNC
                     r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
@@ -6123,10 +6526,50 @@ lookup_funcs:
             fprintf(stderr, "cuda_llm: %s not found; AOT MoE kernels disabled\n", cp);
         }
     }
-    return 0;
+    /* Load FA2 flash attention cubin */
+    r->fa2_mod = 0; r->fn_fa2_attn_256 = NULL;
+    {
+        const char *cp = "cuda/llm/fa2_kernels.cubin";
+        FILE *fp = fopen(cp, "rb");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long sz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            char *d = (char *)malloc((size_t)sz);
+            if (d) {
+                size_t nr = fread(d, 1, (size_t)sz, fp);
+                fclose(fp);
+                if (nr == (size_t)sz && cuModuleLoadDataEx(&r->fa2_mod, d, 0, NULL, NULL) == CUDA_SUCCESS) {
+                    cuModuleGetFunction(&r->fn_fa2_attn_256, r->fa2_mod, "fa2_attn_f");
+                    /* fa2_attn_f uses 4*32*(head_dim+8)*sizeof(f16) dynamic smem
+                     * (= 67584 B for head_dim=256), which exceeds the 48 KB default.
+                     * Opt in to the larger dynamic-smem limit or the launch silently
+                     * fails (invalid argument) -> stale attention output. */
+                    if (r->fn_fa2_attn_256) {
+                        CUresult _sa = cuFuncSetAttribute(r->fn_fa2_attn_256,
+                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96*1024);
+                        if (_sa != CUDA_SUCCESS && r->verbose >= 1)
+                            fprintf(stderr, "cuda_llm: FA2 smem opt-in failed (err=%d)\n", (int)_sa);
+                    }
+                    if (r->verbose >= 1)
+                        fprintf(stderr, "cuda_llm: loaded %s (FA2 flash attention)\n", cp);
+                } else if (r->verbose >= 1) {
+                    fprintf(stderr, "cuda_llm: failed to load %s\n", cp);
+                }
+                free(d);
+            } else {
+                fclose(fp);
+            }
+        } else if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: %s not found; FA2 flash attention disabled\n", cp);
+        }
+    }
+
+return 0;
 }
 
 /* ======================================================================== */
+
 /* Public API: init                                                         */
 /* ======================================================================== */
 
@@ -6171,18 +6614,13 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
         return NULL;
     }
 
-    /* Enable cuBLAS for verification/baseline when CUDA_LLM_USE_CUBLAS=1 */
+    /* Enable cuBLAS for verification/baseline when CUDA_LLM_USE_CUBLAS=1.
+     * Handle is created lazily on first use to avoid CUDA context issues. */
     {
         const char *env = getenv("CUDA_LLM_USE_CUBLAS");
         r->use_cublas = (env && atoi(env) > 0) ? 1 : 0;
-        if (r->use_cublas) {
-            if (cublasewInit() != 0 ||
-                cublasewCreate(&r->cublas, r->stream) != 0) {
-                fprintf(stderr, "cuda_llm: cuBLAS init failed, falling back to custom kernels\n");
-                r->use_cublas = 0;
-            } else if (verbose >= 1) {
-                fprintf(stderr, "cuda_llm: cuBLAS enabled (CUDA_LLM_USE_CUBLAS=1)\n");
-            }
+        if (r->use_cublas && verbose >= 1) {
+            fprintf(stderr, "cuda_llm: cuBLAS enabled (fully lazy, set CUDA_LLM_USE_CUBLAS=1)\n");
         }
     }
 
@@ -6300,21 +6738,25 @@ static int upload_q8_0_raw(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor
     }
 
     CUresult err = cuMemAlloc(d_ptr, nbytes_padded);
-    if (err != CUDA_SUCCESS) { return -1; }
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_llm: upload_q8_0_raw alloc failed (%zu bytes, err=%d)\n", nbytes_padded, (int)err);
+        return -1;
+    }
     err = cuMemcpyHtoD(*d_ptr, padded, nbytes_padded);
     if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
 
 static int upload_q8_0_shadow_f16(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t) {
-    /* Create F16 shadow when cuBLAS is enabled, for any non-F32 quantized type.
-     * Skip very large tensors (>200M elements = >400MB F16) to avoid OOM. */
+    /* Create F16 shadow when cuBLAS is enabled, for smaller quantized types.
+     * Skip large tensors (>10M elements or >20MB F16) to avoid OOM. */
     if (!r || !r->use_cublas || !t->data ||
-        t->type == GGML_TYPE_F32) {
+        t->type == GGML_TYPE_F32 ||
+        (t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_F16)) {
         *d_ptr = 0;
         return 0;
     }
-    if ((size_t)t->n_rows * t->n_cols > 200000000) {
+    if ((int64_t)t->n_rows * t->n_cols > 10000000) {  /* >10M elements = >20MB F16 → skip */
         *d_ptr = 0;
         return 0;
     }
@@ -6342,7 +6784,10 @@ static int upload_q8_0_shadow_f16(cuda_llm_runner *r, CUdeviceptr *d_ptr, const 
     CUresult err = cuMemAlloc(d_ptr, nbytes);
     if (err != CUDA_SUCCESS) {
         *d_ptr = 0;
-        return -1;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: F16 shadow alloc failed (%zu bytes, type=%d, continuing without cuBLAS for this weight)\n",
+                    nbytes, t->type);
+        return 0;
     }
     err = cuMemcpyHtoD(*d_ptr, f16_buf, nbytes);
     if (err != CUDA_SUCCESS) {
@@ -6358,7 +6803,7 @@ static int upload_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
     size_t nbytes = dequant_row_size(t->type, t->n_cols) * (size_t)t->n_rows;
     CUresult err = cuMemAlloc(d_ptr, nbytes);
-    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_kquant_raw alloc failed (%zu bytes, type=%d, err=%d)\n", nbytes, t->type, (int)err); return -1; }
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_kquant_raw alloc failed (%zu bytes, type=%d, err=%d, n_cols=%d, n_rows=%d)\n", nbytes, t->type, (int)err, t->n_cols, t->n_rows); return -1; }
     err = cuMemcpyHtoD(*d_ptr, t->data, nbytes);
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_kquant_raw copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
@@ -7271,6 +7716,7 @@ static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_
 
 int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
+    if (cuda_llm_bind_context(r) != 0) return -1;
 
     /* Detect architecture prefix */
     const char *arch = "qwen2";
@@ -7368,11 +7814,20 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->swa_pattern = NULL;
     if (strcmp(arch, "gemma4") == 0) {
         r->is_gemma4 = 1;
+        /* The batched Gemma4 prefill is GEMM-based (dequant→F16→cuBLAS tensor cores),
+         * which is the whole point of the fast path — enable cuBLAS by default unless
+         * the user explicitly disabled it via CUDA_LLM_USE_CUBLAS=0. */
+        {
+            const char *ce = getenv("CUDA_LLM_USE_CUBLAS");
+            if (!ce || atoi(ce) != 0) r->use_cublas = 1;
+        }
         r->ple_use_f32 = 1; /* F32 PLE weights for accuracy (costs ~105MB extra VRAM) */
         r->head_dim_full = cllm_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
         r->head_dim_swa  = cllm_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
         r->head_dim = r->head_dim_full; /* max for buffer sizing */
         r->swa_window_size = cllm_get_int(gguf, ARCH_KEY("attention.sliding_window"), 512);
+        { const char *we = getenv("CUDA_LLM_SWA_WINDOW"); /* test override */
+          if (we && atoi(we) > 0) r->swa_window_size = atoi(we); }
         r->n_embd_per_layer = cllm_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 256);
         int shared_kv_layers = cllm_get_int(gguf, ARCH_KEY("attention.shared_kv_layers"), 0);
         r->n_layer_kv_from_start = r->n_layers - shared_kv_layers;
@@ -7393,6 +7848,8 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 if (n > r->n_layers) n = r->n_layers;
                 uint8_t *data = (uint8_t *)gguf->kv[idx].value.arr.data;
                 for (int i = 0; i < n; i++) r->swa_pattern[i] = data[i] ? 1 : 0;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "cuda_llm: Gemma4 SWA pattern loaded (%d layers, first=%d)\n", n, r->swa_pattern[0]);
             } else {
                 for (int i = 0; i < r->n_layers; i++)
                     r->swa_pattern[i] = ((i + 1) % 6 != 0) ? 1 : 0;
@@ -8551,6 +9008,22 @@ static inline void launch_rope_with_factors(cuda_llm_runner *r, CUdeviceptr vec,
                    n_heads, 1, 1, n_pairs, 1, 1, 0, r->stream, args, NULL);
 }
 
+/* Batched version: processes n_tokens * n_heads heads with position p0 for all */
+static inline void launch_batch_rope_with_factors(cuda_llm_runner *r, CUdeviceptr vec,
+                                                   int heads_per_token, int n_tokens,
+                                                   int head_dim, int start_pos,
+                                                   CUdeviceptr inv_freq) {
+    int total_heads = heads_per_token * n_tokens;
+    int n_pairs = head_dim / 2;
+    /* Per-token batched kernel: token = blockIdx.x / heads_per_token, pos =
+     * start_pos + token. The old fn_rope_with_factors_f32 applied a single
+     * constant position to every block — correct only for n_tokens==1, and a
+     * latent bug for batched prefill (every token roped at start_pos). */
+    void *args[] = { &vec, &heads_per_token, &total_heads, &head_dim, &start_pos, &inv_freq, &n_pairs };
+    cuLaunchKernel(r->fn_batch_rope_with_factors_f32,
+                   total_heads, 1, 1, n_pairs, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_bf16(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                        CUdeviceptr vec, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &vec, &n_rows, &n_cols };
@@ -8564,6 +9037,15 @@ static inline void launch_embed_q8_0(cuda_llm_runner *r, CUdeviceptr dst, CUdevi
                                       int token_id, int n_embd) {
     void *args[] = { &dst, &embd_table, &token_id, &n_embd };
     cuLaunchKernel(r->fn_embed_q8_0,
+                   (n_embd + 255) / 256, 1, 1,
+                   256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
+static inline void launch_embed_q4_0(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr embd_table,
+                                      int token_id, int n_embd) {
+    void *args[] = { &dst, &embd_table, &token_id, &n_embd };
+    cuLaunchKernel(r->fn_embed_q4_0,
                    (n_embd + 255) / 256, 1, 1,
                    256, 1, 1,
                    0, r->stream, args, NULL);
@@ -8686,6 +9168,13 @@ static inline void launch_matvec_q4_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, 
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+static inline void launch_matvec_q4_0_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q4_0_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -8781,7 +9270,14 @@ static inline void launch_matvec_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdevi
 static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                        CUdeviceptr x, int n_rows, int n_cols, int weight_type) {
     switch (weight_type) {
-        case GGML_TYPE_Q8_0: launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_Q8_0:
+            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q8(r, dst, mat, r->d_xb_q81, r->d_xb_scale, n_rows, n_cols);
+            } else {
+                launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
         case GGML_TYPE_Q2_K:
             if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0) {
                 launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
@@ -8823,7 +9319,14 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
             }
             break;
         case GGML_TYPE_IQ2_XXS: launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_Q4_0:    launch_matvec_q4_0(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_Q4_0:
+            if (r->use_dp4a && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q40_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q4_0_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_q4_0(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
         case GGML_TYPE_Q4_1:    launch_matvec_q4_1(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q5_0:    launch_matvec_q5_0(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q5_1:    launch_matvec_q5_1(r, dst, mat, x, n_rows, n_cols); break;
@@ -9093,6 +9596,8 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         void *args[] = { &r->d_x, &r->d_token_embd, &token_id, &n_embd };
         cuLaunchKernel(r->fn_embed_q4_K,
                        (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -9165,6 +9670,8 @@ int cuda_llm_forward_nohost(cuda_llm_runner *r, int32_t token_id, int position) 
         void *args[] = { &r->d_x, &r->d_token_embd, &token_id, &n_embd };
         cuLaunchKernel(r->fn_embed_q4_K,
                        (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -9313,10 +9820,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
     if (graph_enabled && r->graph_captured == 1 && position > 0) {
         cuStreamSynchronize(r->stream);
+        if (r->verbose >= 2 && position < 4)
+            fprintf(stderr, "cuda_llm: CUDA graph replay pos=%d\n", position);
         cuGraphLaunch(r->d_graph_exec, r->stream);
         goto after_layers;
     }
     if (graph_enabled && r->graph_captured == 0 && position == 0) {
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: CUDA graph capture starting\n");
         cuStreamSynchronize(r->stream);
         r->graph_captured = -1;
         cuStreamBeginCapture(r->stream, CU_STREAM_CAPTURE_MODE_GLOBAL);
@@ -10527,7 +11038,9 @@ after_layers:
         CUresult _ge = cuStreamEndCapture(r->stream, &_g);
         if (_ge == CUDA_SUCCESS && _g) {
             _ge = cuGraphInstantiate(&r->d_graph_exec, _g, 0);
-            if (_ge == CUDA_SUCCESS) { r->d_graph = _g; r->graph_captured = 1; }
+            if (_ge == CUDA_SUCCESS) { r->d_graph = _g; r->graph_captured = 1;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "cuda_llm: CUDA graph captured and instantiated\n"); }
             else r->graph_captured = 0;
         } else r->graph_captured = 0;
     }
@@ -10792,6 +11305,60 @@ static int launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
 }
 
 /* Helper: launch batched matvec for a given weight type */
+/* Dequant a Q6_K or Q8_0 weight to F16 + cuBLAS tensor-core F16 GEMM.
+ * When r->prefill_overlap, the weight dequant runs on a second stream into a
+ * ping-pong buffer so weight[i+1]'s dequant overlaps GEMM[i] (dequant is ~19%
+ * of prefill and fits entirely under the ~66% spent in GEMM). Returns 0 on
+ * success, -1 to fall back. The input F32->F16 convert stays on the main stream
+ * (ordered with the GEMM that reads it). */
+static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                    CUdeviceptr input, int out_dim, int in_dim,
+                                    int n_tokens, int weight_type) {
+    if (!r->cublas || !r->d_batch_f16_scratch || !r->fn_convert_f32_to_f16) return -1;
+    CUfunction dq_fn; int dq_grid, dq_block;
+    int nb;
+    if (weight_type == GGML_TYPE_Q6_K) {
+        if (!r->fn_dequant_q6_K_to_f16) return -1;
+        nb = in_dim / 256; dq_grid = (out_dim * nb + 3) / 4; dq_block = 256; dq_fn = r->fn_dequant_q6_K_to_f16;
+    } else if (weight_type == GGML_TYPE_Q8_0) {
+        if (!r->fn_dequant_q8_0_to_f16_h) return -1;
+        nb = in_dim / 32; dq_grid = (out_dim * nb + 7) / 8; dq_block = 256; dq_fn = r->fn_dequant_q8_0_to_f16_h;
+    } else if (weight_type == GGML_TYPE_Q4_0) {
+        if (!r->fn_dequant_q4_0_to_f16) return -1;
+        /* one thread per output element (coalesced); grid over rows*cols */
+        dq_block = 256; dq_grid = (int)(((size_t)out_dim * in_dim + 255) / 256); dq_fn = r->fn_dequant_q4_0_to_f16;
+    } else return -1;
+
+    size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+    if (w_f16_bytes > 256*1024*1024) return -1;
+    if (!r->d_f16_scratch) {
+        if (cuMemAlloc(&r->d_f16_scratch, 256*1024*1024) != CUDA_SUCCESS) return -1;
+    }
+
+    int overlap = r->prefill_overlap && r->stream_dq && r->d_f16_scratch2;
+    CUstream dq_stream = overlap ? r->stream_dq : r->stream;
+    int pp = overlap ? r->dq_pp : 0;
+    CUdeviceptr wbuf = (overlap && pp) ? r->d_f16_scratch2 : r->d_f16_scratch;
+
+    if (overlap) cuStreamWaitEvent(dq_stream, r->gemm_evt[pp], 0); /* buffer free? */
+    void *dq[] = { &wbuf, &mat, &out_dim, &in_dim };
+    cuLaunchKernel(dq_fn, dq_grid, 1, 1, dq_block, 1, 1, 0, dq_stream, dq, NULL);
+    if (overlap) cuEventRecord(r->dq_evt[pp], dq_stream);
+
+    /* input F32 -> F16 on the main stream */
+    int n_elems = n_tokens * in_dim;
+    CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
+    void *cv[] = { &d_x_f16, &input, &n_elems };
+    cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
+
+    if (overlap) cuStreamWaitEvent(r->stream, r->dq_evt[pp], 0); /* GEMM waits dequant */
+    int ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, wbuf, d_x_f16,
+                                                     n_tokens, out_dim, in_dim);
+    if (ret != 0) return -1;
+    if (overlap) { cuEventRecord(r->gemm_evt[pp], r->stream); r->dq_pp ^= 1; }
+    return 0;
+}
+
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
@@ -10802,7 +11369,7 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
     }
 
     /* cuBLAS path: use F16 shadow + Tensor Core GEMM when available */
-    if (r->use_cublas && mat_f16) {
+    if (r->use_cublas && mat_f16 && r->cublas) {
         /* Convert F32 input to F16 (required for Blackwell Tensor Core GEMM) */
         int n_elems = n_tokens * in_dim;
         CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
@@ -10827,8 +11394,32 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_f32_f32, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q8_0) {
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_batch_matvec_q8_0_f32, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        /* Dequant Q8_0 → F16 + cuBLAS tensor-core F16 GEMM (reads weights once).
+         * F16 tensor cores are far faster than the F32 SIMT GEMM the old path used. */
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
+        }
+        /* Legacy F32 dequant + SIMT GEMM fallback */
+        if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16 && r->cublas && r->d_f16_scratch) {
+            CUdeviceptr d_f32 = r->d_f16_scratch;
+            int nb = in_dim / 32;
+            int total_blocks = out_dim * nb;
+            int dequant_grid = (total_blocks + 31) / 32;
+            void *args[] = { &d_f32, &mat, &out_dim, &in_dim };
+            cuLaunchKernel(r->fn_dequant_q8_0_to_f16, dequant_grid, 1, 1, 32, 1, 1, 0, r->stream, args, NULL);
+            int gemm_ret = cublasew_gemm_f32_rowmajor_nt(r->cublas, dst, d_f32, input,
+                                                          n_tokens, out_dim, in_dim);
+            if (gemm_ret == 0) return;
+        }
+        /* Fallback: x4 chunked (4 tok/block) or per-token */
+        if (n_tokens > 1 && r->fn_batch_matvec_q8_0_x4) {
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q8_0_x4, (out_dim+7)/8, (n_tokens+3)/4, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        } else {
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q8_0_f32, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        }
     } else if (weight_type == GGML_TYPE_Q2_K) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q2_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
@@ -10875,15 +11466,71 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
     } else if (weight_type == GGML_TYPE_IQ4_XS) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq4_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_Q4_0) {
+        /* Dequant Q4_0 -> F16 (once) + cuBLAS F16 tensor-core GEMM, like Q6_K/Q8_0.
+         * launch_dequant_gemm_f16 also converts the F32 input to F16 (the GEMM
+         * needs F16 on both sides), applies the >256 MB guard (skips the 2 GB
+         * lm_head), and lazily allocates d_f16_scratch. */
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
+        }
+        /* Fallback (n_tokens==1, oversized lm_head, or no cuBLAS): per-token
+         * matvec_q4_0_f32, the known-correct decode kernel. */
+        for (int t = 0; t < n_tokens; t++) {
+            launch_matvec_q4_0(r, dst + (size_t)t * out_dim * sizeof(float), mat,
+                               input + (size_t)t * in_dim * sizeof(float), out_dim, in_dim);
+        }
     } else if (weight_type == GGML_TYPE_Q4_K) {
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_batch_matvec_q4_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        /* Dequant + cuBLAS F16 GEMM for batched mode (read weights once) */
+        if (n_tokens > 1 && r->fn_dequant_q4_K_to_f16 && r->cublas) {
+            size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+            CUdeviceptr d_f16 = 0;
+            CUresult err = cuMemAlloc(&d_f16, f16_bytes);
+            if (err == CUDA_SUCCESS) {
+                int nb = in_dim / 256;
+                int total_blocks = out_dim * nb;
+                int dequant_grid = (total_blocks + 127) / 128;
+                void *args[] = { &d_f16, &mat, &out_dim, &in_dim };
+                cuLaunchKernel(r->fn_dequant_q4_K_to_f16, dequant_grid, 1, 1, 128, 1, 1, 0, r->stream, args, NULL);
+                int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_f16, input,
+                                                                      n_tokens, out_dim, in_dim);
+                if (r->verbose >= 1 && gemm_ret != 0)
+                    fprintf(stderr, "cuda_llm: cuBLAS GEMM Q4_K failed (%d, n_tok=%d, out=%d, in=%d)\n",
+                            gemm_ret, n_tokens, out_dim, in_dim);
+                cuMemFree(d_f16);
+                if (gemm_ret == 0) return;
+            } else {
+                void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+                cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, (n_tokens+3)/4, 1, 256, 1, 1, 0, r->stream, a, NULL);
+            }
+        } else if (n_tokens > 1 && r->fn_batch_matvec_q4_K_x4) {
+            int n_groups = (n_tokens + 3) / 4;
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, n_groups, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        } else {
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q4_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        }
     } else if (weight_type == GGML_TYPE_Q5_K) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q5_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q6_K) {
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_batch_matvec_q6_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        /* Dequant Q6_K -> F16 (once) + cuBLAS F16 tensor-core GEMM (reads the
+         * weight once vs ceil(n_tokens/4)×; tensor cores; double-buffered overlap). */
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
+        }
+        /* Use chunked kernel (4 tokens/block) for batched mode, fallback for single token */
+        if (n_tokens > 1 && r->fn_batch_matvec_q6_K_x4) {
+            int n_groups = (n_tokens + 3) / 4;
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q6_K_x4, (out_dim+7)/8, n_groups, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        } else {
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q6_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        }
     } else {
         /* Fallback: sequential per-token matvec */
         for (int t = 0; t < n_tokens; t++) {
@@ -10965,7 +11612,179 @@ static void launch_batch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevice
                      &n_heads, &n_kv_heads, &head_dim, &kv_dim, &scale };
     cuLaunchKernel(r->fn_batch_attn_causal_f32,
                    n_heads, n_tokens, 1,
-                   256, 1, 1, smem, r->stream, args, NULL);
+                    256, 1, 1, smem, r->stream, args, NULL);
+}
+
+/* ---- FA2 Flash Attention launch helper (flat layout) ---- */
+/* Runs fa2_attn_f kernel for one layer's attention.
+   Q_batch: F32 [n_tokens * q_dim] -> converted to F16 on the fly
+   K/V cache: F16 [max_seq_len * kv_dim] flat layout
+   Output: F16 -> converted back to F32 [n_tokens * q_dim] */
+static void launch_fa2_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
+                                  CUdeviceptr key_cache, CUdeviceptr value_cache,
+                                  int n_tokens, int start_pos, int n_heads, int n_kv_heads,
+                                  int head_dim, int kv_dim, float scale, int window) {
+    if (!r->fn_fa2_attn_256 || head_dim != 256) return;
+    int q_dim = n_heads * head_dim;
+    int hstride_q = q_dim;  /* Q layout: [n_tokens, q_dim] */
+    int hstride_kv = kv_dim;  /* KV layout: [max_seq_len, kv_dim] */
+    int gqa_ratio = n_heads / n_kv_heads;
+
+    /* Convert Q from F32 to F16 */
+    int total_q = n_tokens * q_dim;
+    CUdeviceptr d_q_f16 = r->d_fa2_q_f16;
+    if (d_q_f16) {
+        void *args_conv[] = { &d_q_f16, &q_batch, &total_q };
+        cuLaunchKernel(r->fn_convert_f32_to_f16,
+            (total_q + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args_conv, NULL);
+    }
+    CUdeviceptr d_o_f16 = r->d_fa2_o_f16 ? r->d_fa2_o_f16 : d_q_f16;
+
+    /* Run FA2 - process all tokens in one call.
+     * Keys span [0, total_s); the n_tokens queries sit at global positions
+     * [start_pos, total_s). start_pos>0 (chunked prefill, queries attend a
+     * [history ++ chunk] key buffer) feeds q_off=start_pos; start_pos==0 gives
+     * n_q==S, q_off==0 -> byte-identical to the original kernel. */
+    int total_s = start_pos + n_tokens;
+    int fa2_n_q = n_tokens;
+    int fa2_q_off = start_pos;
+#define FA2_BR_HOST 64
+#define FA2_BC_HOST 32
+#define FA2_NTHR_HOST 128
+    int n_q_tiles = (n_tokens + FA2_BR_HOST - 1) / FA2_BR_HOST;
+    size_t fa2_smem = 4 * FA2_BC_HOST * (head_dim + 8) * 2; /* 2 = sizeof(dt_t) = F16 */
+    void *fa2_args[] = { &d_o_f16, &d_q_f16, &key_cache, &value_cache,
+                         &total_s, &head_dim, &hstride_q, &hstride_kv, &gqa_ratio, &scale, &window,
+                         &fa2_n_q, &fa2_q_off };
+    cuLaunchKernel(r->fn_fa2_attn_256,
+        (unsigned)n_q_tiles, (unsigned)n_heads, 1,
+        FA2_NTHR_HOST, 1, 1, (unsigned)fa2_smem, r->stream, fa2_args, NULL);
+
+    /* Convert output from F16 back to F32 */
+    if (r->fn_convert_f16_to_f32) {
+        void *args_deconv[] = { &out, &d_o_f16, &total_q };
+        cuLaunchKernel(r->fn_convert_f16_to_f32,
+            (total_q + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args_deconv, NULL);
+    }
+}
+
+/* ---- SWA FA2 launch helper ---- */
+static void launch_fa2_attention_swa(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
+                                      CUdeviceptr key_cache, CUdeviceptr value_cache,
+                                      int n_tokens, int start_pos, int n_heads, int n_kv_heads,
+                                      int head_dim, int kv_dim, int window_size, float scale) {
+    /* SWA: restrict KV range to window */
+    int first = (start_pos + n_tokens > window_size) ? (start_pos + n_tokens - window_size) : 0;
+    int kv_tokens = start_pos + n_tokens - first;
+    /* FA2 with offset: use key_cache + first * hstride_kv and V similarly */
+    CUdeviceptr k_sub = key_cache + (size_t)first * kv_dim * 2; /* 2 = sizeof(F16) */
+    CUdeviceptr v_sub = value_cache + (size_t)first * kv_dim * 2;
+    /* Adjust scale for windowed context */
+    float adj_scale = scale; /* FA2 handles causal mask internally */
+    int dummy;
+    (void)kv_tokens;
+    launch_fa2_attention(r, out, q_batch, k_sub, v_sub,
+                         n_tokens, start_pos, n_heads, n_kv_heads,
+                         head_dim, kv_dim, adj_scale, 0);
+}
+
+/* cuBLAS-d512 score scratch cap (elements): the [gqa*q_chunk x total_s] score
+ * matrix is bounded to this many elements by chunking the query dim. Without
+ * chunking, n_heads*N^2 is 4 GB+ at N=8192 and fails to allocate. Used as the
+ * ceiling both here and in the FA2 buffer sizing in cuda_llm_prefill.
+ * 16M elems = 64 MB F32 + 32 MB F16 score scratch (+128 MB Q). On a 16 GB card
+ * at 8192 tokens this leaves cuBLAS ~1 GB free for its on-demand GEMM workspace;
+ * a bigger cap (>=64M -> >=512 MB scratch) starves cuBLAS off the tensor-core
+ * path and the prefill collapses (>200s vs 5.5s). Chunking finer than this costs
+ * nothing measurable (8192 prefill: 16M=1483, 32M=1469 tok/s). The adaptive
+ * clamp in cuda_llm_prefill lowers it further when free memory is tighter. */
+#define D512_SCORE_CAP_ELEMS_DEFAULT ((size_t)16 * 1024 * 1024)
+/* Env override (in elements) lets tests force chunking at small n_tokens to
+ * validate the chunk-boundary math against the sequential path, or raise the
+ * cap on cards with more spare memory. */
+static size_t d512_score_cap_elems(void) {
+    const char *e = getenv("CUDA_LLM_D512_CAP");
+    if (e) { long v = atol(e); if (v > 0) return (size_t)v; }
+    return D512_SCORE_CAP_ELEMS_DEFAULT;
+}
+#define D512_SCORE_CAP_ELEMS (d512_score_cap_elems())
+
+/* ---- cuBLAS-based D=512 attention: per-KV-head GEMM + softmax + GEMM ---- */
+/* Q_batch: F32 [n_tokens * q_dim]. K/V cache: F16 [max_seq_len * kv_dim].
+   Uses cuBLAS F16 GEMM for Q@K^T and P@V with custom causal softmax.
+   The query dim is processed in chunks so the materialized score matrix stays
+   bounded (D512_SCORE_CAP_ELEMS) regardless of n_tokens. */
+static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
+                                          CUdeviceptr key_cache, CUdeviceptr value_cache,
+                                          int n_tokens, int start_pos, int n_heads, int n_kv_heads,
+                                          int head_dim, int kv_dim, float scale) {
+    if (!r->cublas || !r->fn_fa2_attn_256 || !r->d_fa2_q_f16 || !r->d_fa2_scores_f16) return;
+    int gqa = n_heads / n_kv_heads;
+    int q_dim = n_heads * head_dim;
+    int total_s = start_pos + n_tokens;
+
+    /* Convert the full Q batch F32 -> F16 once */
+    int n_q = n_tokens * q_dim;
+    CUdeviceptr q_f16 = r->d_fa2_q_f16;
+    {
+        void *args[] = { &q_f16, &q_batch, &n_q };
+        cuLaunchKernel(r->fn_convert_f32_to_f16, (n_q+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    }
+
+    /* Scores scratch: F32 [chunk_sq * total_s] (d_fa2_o_f16) + F16 copy
+     * (d_fa2_scores_f16). Both sized for one query-chunk in cuda_llm_prefill. */
+    CUdeviceptr scores = r->d_fa2_o_f16;
+    CUdeviceptr scores_f16 = r->d_fa2_scores_f16;
+
+    /* Chunk the query (token) dim so gqa*q_chunk*total_s <= cap. Computed with
+     * n_heads (worst-case gqa) and r->d512_cap_elems — the SAME cap the buffers
+     * were sized for in cuda_llm_prefill — so it matches the allocation exactly. */
+    size_t cap = r->d512_cap_elems ? r->d512_cap_elems : D512_SCORE_CAP_ELEMS;
+    int q_chunk = (int)(cap / ((size_t)n_heads * (size_t)total_s));
+    if (q_chunk < 1) q_chunk = 1;
+    if (q_chunk > n_tokens) q_chunk = n_tokens;
+
+    /* Per KV head: chunked GEMM, softmax, GEMM */
+    for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+        /* Q_group base: F16 [gqa*n_tokens, head_dim] for this kv-head */
+        CUdeviceptr qg = q_f16 + (size_t)kv_h * gqa * head_dim * sizeof(uint16_t);
+        /* K/V_head: F16 [total_s, head_dim] (interleaved stride = kv_dim) */
+        CUdeviceptr k_head = key_cache + (size_t)kv_h * head_dim * sizeof(uint16_t);
+        CUdeviceptr v_head = value_cache + (size_t)kv_h * head_dim * sizeof(uint16_t);
+        CUdeviceptr out_group = out + (size_t)kv_h * gqa * head_dim * sizeof(float);
+
+        for (int q0 = 0; q0 < n_tokens; q0 += q_chunk) {
+            int qc = n_tokens - q0;
+            if (qc > q_chunk) qc = q_chunk;
+            int chunk_sq = qc * gqa;
+            /* Rows for tokens [q0, q0+qc) are contiguous in qg (token is outer dim) */
+            CUdeviceptr qg_c = qg + (size_t)q0 * gqa * head_dim * sizeof(uint16_t);
+
+            /* Step 1: Q_chunk @ K^T -> scores [chunk_sq, total_s] F32 */
+            cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, scores, k_head, qg_c,
+                                                   chunk_sq, total_s, head_dim);
+
+            /* Step 2: causal softmax. Pass start_pos+q0 so each chunk row's
+             * kv_lim = (start_pos+q0) + local_tok + 1 = correct absolute limit. */
+            {
+                int sp = start_pos + q0;
+                void *args[] = { &scores, &chunk_sq, &total_s, &sp, &gqa };
+                cuLaunchKernel(r->fn_causal_softmax_f32, chunk_sq, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            }
+
+            /* Step 3: F32 scores -> F16 (cuBLAS needs F16 input) */
+            {
+                int n_scores = chunk_sq * total_s;
+                void *args[] = { &scores_f16, &scores, &n_scores };
+                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_scores+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            }
+
+            /* Step 4: P(F16) @ V(F16)^T -> out [chunk_sq, head_dim] F32 */
+            CUdeviceptr out_c = out_group + (size_t)q0 * gqa * head_dim * sizeof(float);
+            cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, out_c, v_head, scores_f16,
+                                                   chunk_sq, head_dim, total_s);
+        }
+    }
 }
 
 /* Ensure pre-allocated batch buffers are large enough for n_tokens */
@@ -11031,11 +11850,33 @@ static int cuda_llm_ensure_batch_buffers(cuda_llm_runner *r, int n_tokens) {
     int max_in_dim = n_embd > ff_dim ? n_embd : ff_dim;
     if (max_in_dim < qkv_dim) max_in_dim = qkv_dim;
     if (max_in_dim < d_inner) max_in_dim = d_inner;
-    if (r->d_batch_f16_scratch) { cuMemFree(r->d_batch_f16_scratch); r->d_batch_f16_scratch = 0; }
+    if (r->d_batch_f16_scratch) { cuMemFree(r->d_batch_f16_scratch); r->d_batch_f16_scratch = 0; r->batch_f16_scratch_bytes = 0; }
+    /* Lazily create cuBLAS handle on first batch buffer allocation */
+    if (r->use_cublas && !r->cublas) {
+        int cublas_ret = cublasewCreate(&r->cublas, r->stream);
+        fprintf(stderr, "cuda_llm: cuBLAS handle creation: ret=%d handle=%p\n", cublas_ret, (void*)r->cublas);
+        if (cublas_ret == 0 && r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: cuBLAS handle created\n");
+    }
     if (r->use_cublas && r->cublas) {
-        if (cuMemAlloc(&r->d_batch_f16_scratch, (size_t)alloc_tokens * max_in_dim * sizeof(uint16_t)) != CUDA_SUCCESS) {
+        size_t bytes = (size_t)alloc_tokens * max_in_dim * sizeof(uint16_t);
+        if (cuMemAlloc(&r->d_batch_f16_scratch, bytes) != CUDA_SUCCESS) {
             r->d_batch_f16_scratch = 0;
+        } else {
+            r->batch_f16_scratch_bytes = bytes;
         }
+    }
+
+    /* Allocate FA2 flash attention F16 buffers (Q and O conversion) */
+    if (r->fn_fa2_attn_256) {
+        int max_hd = q_dim > kv_dim ? q_dim : kv_dim;
+        if (r->d_fa2_q_f16) { cuMemFree(r->d_fa2_q_f16); r->d_fa2_q_f16 = 0; }
+        if (r->d_fa2_o_f16) { cuMemFree(r->d_fa2_o_f16); r->d_fa2_o_f16 = 0; }
+        if (r->d_f16_scratch) { cuMemFree(r->d_f16_scratch); r->d_f16_scratch = 0; }
+        if (cuMemAlloc(&r->d_fa2_q_f16, (size_t)alloc_tokens * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
+            r->d_fa2_q_f16 = 0;
+        if (cuMemAlloc(&r->d_fa2_o_f16, (size_t)alloc_tokens * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
+            r->d_fa2_o_f16 = 0;
     }
 
     if (r->is_moe) {
@@ -11150,6 +11991,8 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                     int32_t tok = token_ids[t];
                     void *ea[] = { &r->d_x, &r->d_token_embd, &tok, &n_embd };
                     cuLaunchKernel(r->fn_embed_q4_K, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
+                } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+                    launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
                 } else {
                     launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
                 }
@@ -11726,6 +12569,36 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                                            n_tokens, start_pos);
     }
 
+    /* Chunked prefill for long context on limited VRAM. The batched path below
+     * allocates O(n_tokens) F32 activation buffers (q/xb2/k/v/gate/up, ~2 GB at
+     * 16384); alongside the 10.4 GB weights these don't fit on a 16 GB card, and
+     * even an 8192 chunk leaves cuBLAS too little GEMM workspace (it falls off
+     * the tensor-core path -> >10x slower). Process the tokens in blocks,
+     * advancing start_pos, so each block's buffers stay bounded — every token's
+     * forward pass only needs its own hidden state plus the KV cache of all
+     * preceding tokens, which persists across blocks. The final block's
+     * last-token hidden state is the result. Chunk size is a multiple of
+     * swa_window so the circular SWA cache holds the window history in linear
+     * order at block boundaries (the fast cross-chunk windowed-FA2 path).
+     * Token-ids path only (the bench path); start_pos==0 entry only. */
+    {
+        int pchunk = 4096;
+        const char *e = getenv("CUDA_LLM_PREFILL_CHUNK");
+        if (e) { int v = atoi(e); if (v > 0) pchunk = v; }
+        if (r->swa_window_size > 0 && pchunk % r->swa_window_size != 0)
+            pchunk = (pchunk / r->swa_window_size + 1) * r->swa_window_size;
+        if (token_ids && start_pos == 0 && n_tokens > pchunk) {
+            float *last = NULL;
+            for (int off = 0; off < n_tokens; off += pchunk) {
+                int c = n_tokens - off;
+                if (c > pchunk) c = pchunk;
+                last = cuda_llm_prefill(r, token_ids + off, NULL, 0, c, off);
+                if (!last) return NULL;
+            }
+            return last;
+        }
+    }
+
     int n_embd = r->n_embd;
     int n_heads = r->n_heads;
     int n_ff = r->n_ff;
@@ -11763,40 +12636,52 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_k, (size_t)n_tokens * max_kv_dim * sizeof(float)), "alloc batch_k");
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_v, (size_t)n_tokens * max_kv_dim * sizeof(float)), "alloc batch_v");
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_xb2, (size_t)n_tokens * max_q_dim * sizeof(float)), "alloc batch_xb2");
+    /* FFN gate/up activations [n_tokens x n_ff]. Long-context prefill keeps these
+     * bounded by processing the sequence in token-chunks (see the chunked-prefill
+     * wrapper above) rather than chunking the FFN within a single pass — each
+     * prefill chunk is <= the size that already fits in 16 GB (e.g. 8192). */
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_gate, (size_t)n_tokens * n_ff * sizeof(float)), "alloc batch_gate");
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_up, (size_t)n_tokens * n_ff * sizeof(float)), "alloc batch_up");
 
     /* Upload token embeddings */
     if (token_ids) {
-        /* Token ID path: use single-token forward for embedding, read back from GPU */
-        h_embd = (float *)malloc(batch_embd);
-        if (!h_embd) {
-            fprintf(stderr, "cuda_llm: generic prefill host embedding buffer alloc failed\n");
-            goto cleanup;
-        }
-        for (int t = 0; t < n_tokens; t++) {
-            /* Use the existing embed kernel (handles Q8_0 padding, Q4_K, etc.) */
-            if (r->token_embd_type == GGML_TYPE_Q8_0) {
-                launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
-            } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
-                launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
-            } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
-                int32_t tok = token_ids[t];
-                void *ea[] = { &r->d_x, &r->d_token_embd, &tok, &n_embd };
-                cuLaunchKernel(r->fn_embed_q4_K, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
-            } else {
-                launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+        /* Embed each token directly into batch buffer (no host round-trip) */
+        if (r->token_embd_type == GGML_TYPE_Q8_0 || r->token_embd_type == GGML_TYPE_Q4_0) {
+            for (int t = 0; t < n_tokens; t++) {
+                CUdeviceptr dst = d_batch_x + (size_t)t * n_embd * sizeof(float);
+                if (r->token_embd_type == GGML_TYPE_Q8_0)
+                    launch_embed_q8_0(r, dst, r->d_token_embd, token_ids[t], n_embd);
+                else
+                    launch_embed_q4_0(r, dst, r->d_token_embd, token_ids[t], n_embd);
+                if (r->is_gemma4) {
+                    void *args[] = { &dst, &r->embd_scale, &n_embd };
+                    cuLaunchKernel(r->fn_scale_f32, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                }
             }
-            if (r->is_gemma4) launch_scale(r, r->d_x, r->embd_scale, n_embd);
-            CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x,
-                                                         n_embd * sizeof(float), r->stream),
-                                       "embedding download");
+        } else {
+            h_embd = (float *)malloc(batch_embd);
+            if (!h_embd) { fprintf(stderr, "cuda_llm: generic prefill host embedding buffer alloc failed\n"); goto cleanup; }
+            for (int t = 0; t < n_tokens; t++) {
+                if (r->token_embd_type == GGML_TYPE_Q2_K) {
+                    launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+                } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
+                    int32_t tok = token_ids[t];
+                    void *ea[] = { &r->d_x, &r->d_token_embd, &tok, &n_embd };
+                    cuLaunchKernel(r->fn_embed_q4_K, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
+                } else {
+                    launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+                }
+                if (r->is_gemma4) launch_scale(r, r->d_x, r->embd_scale, n_embd);
+                CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x,
+                                                             n_embd * sizeof(float), r->stream),
+                                           "embedding download");
+            }
+            CLLM_PREFILL_CU_OR_CLEANUP(cuStreamSynchronize(r->stream), "embedding sync");
+            CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyHtoD(d_batch_x, h_embd, batch_embd),
+                                       "embedding batch upload");
+            free(h_embd);
+            h_embd = NULL;
         }
-        CLLM_PREFILL_CU_OR_CLEANUP(cuStreamSynchronize(r->stream), "embedding sync");
-        CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyHtoD(d_batch_x, h_embd, batch_embd),
-                                   "embedding batch upload");
-        free(h_embd);
-        h_embd = NULL;
     } else if (embeddings) {
         /* Pre-computed embeddings path */
         if (embd_stride == n_embd) {
@@ -11818,11 +12703,156 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     if (r->is_gemma4 && token_ids)
         r->current_token_id = token_ids[n_tokens - 1];
 
+    /* Lazily create cuBLAS handle and allocate FA2 F16 buffers */
+    if (r->use_cublas && !r->cublas) {
+        int cublas_ret = cublasewCreate(&r->cublas, r->stream);
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: cuBLAS handle creation: ret=%d\n", cublas_ret);
+    }
+    /* F16 input-conversion scratch for batched cuBLAS GEMM (Q6_K/Q4_K/F16 paths).
+     * Every GEMM converts its [n_tokens x in_dim] F32 input into this buffer, so
+     * it must hold n_tokens * max(in_dim) F16 elements. The largest in_dim is the
+     * FFN-down (n_ff); the attention output projection (in_dim = n_heads*head_dim,
+     * 8192 for gemma4 full-attn) also exceeds n_embd, so size to the true max. */
+    if (r->use_cublas && r->cublas) {
+        int q_dim_full = n_heads * (r->is_gemma4 ? r->head_dim_full : r->head_dim);
+        size_t max_in = (size_t)n_ff;
+        if ((size_t)q_dim_full > max_in) max_in = (size_t)q_dim_full;
+        if ((size_t)n_embd   > max_in) max_in = (size_t)n_embd;
+        size_t need = (size_t)n_tokens * max_in * sizeof(uint16_t);
+        if (r->d_batch_f16_scratch && r->batch_f16_scratch_bytes < need) {
+            cuMemFree(r->d_batch_f16_scratch);
+            r->d_batch_f16_scratch = 0;
+        }
+        if (!r->d_batch_f16_scratch) {
+            if (cuMemAlloc(&r->d_batch_f16_scratch, need) == CUDA_SUCCESS)
+                r->batch_f16_scratch_bytes = need;
+            else
+                r->d_batch_f16_scratch = 0;
+        }
+    }
+    /* Double-buffered weight-dequant overlap (scaffolding, default OFF). Measured
+     * NO speedup on this GPU: dequant and the GEMM are both DRAM-bandwidth-bound,
+     * so overlapping them just shares the same bandwidth. Enable for A/B with
+     * CUDA_LLM_PREFILL_OVERLAP=1 (costs a 2nd 256MB weight buffer + stream). */
+    if (r->use_cublas && r->cublas && !r->stream_dq) {
+        const char *ov = getenv("CUDA_LLM_PREFILL_OVERLAP");
+        if (ov && atoi(ov) != 0) {
+            int ok = 1;
+            if (!r->d_f16_scratch && cuMemAlloc(&r->d_f16_scratch, 256*1024*1024) != CUDA_SUCCESS) ok = 0;
+            if (ok && cuMemAlloc(&r->d_f16_scratch2, 256*1024*1024) != CUDA_SUCCESS) ok = 0;
+            if (ok && cuStreamCreate(&r->stream_dq, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) ok = 0;
+            for (int i = 0; ok && i < 2; i++) {
+                if (cuEventCreate(&r->dq_evt[i], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) ok = 0;
+                if (ok && cuEventCreate(&r->gemm_evt[i], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) ok = 0;
+                if (ok) cuEventRecord(r->gemm_evt[i], r->stream); /* start signaled */
+            }
+            r->prefill_overlap = ok;
+            if (!ok && r->verbose >= 1)
+                fprintf(stderr, "cuda_llm: prefill dequant/GEMM overlap setup failed; using single stream\n");
+        }
+    }
+    r->dq_pp = 0;
+    /* Each prefill starts with both weight buffers free. */
+    if (r->prefill_overlap) {
+        cuEventRecord(r->gemm_evt[0], r->stream);
+        cuEventRecord(r->gemm_evt[1], r->stream);
+    }
+    if (r->fn_fa2_attn_256 && n_tokens > 0 &&
+        (!r->d_fa2_q_f16 || n_tokens > r->fa2_buf_max_s)) {
+        /* These buffers double as the cuBLAS-d512 attention scratch:
+         *   d_fa2_q_f16      holds the F16 Q [n_tokens x q_dim] (also FA2's Q),
+         *   d_fa2_o_f16      holds the F32 score matrix for ONE query-chunk (also
+         *                    FA2's F16 output),
+         *   d_fa2_scores_f16 holds the F16 copy of that score matrix.
+         * cuBLAS-d512 chunks the query dim so the score matrix is
+         * gqa*q_chunk*total_s (<= D512_SCORE_CAP_ELEMS), NOT gqa*n_tokens*total_s
+         * which is 4 GB+ at n_tokens=8192. q_chunk is recomputed identically in
+         * launch_cublas_d512_attention. An undersized buffer makes the GEMM
+         * write out of bounds. */
+        int max_hd = (n_heads * r->head_dim_full) > (n_heads * r->head_dim_swa) ?
+                      (n_heads * r->head_dim_full) : (n_heads * r->head_dim_swa);
+        int max_s = n_tokens > 128 ? n_tokens : 128;
+        size_t total_s = (size_t)start_pos + max_s;
+        size_t q_bytes = (size_t)max_s * max_hd * sizeof(uint16_t);   /* converted Q (full) */
+
+        /* Free the old buffers first so their bytes count as free memory. */
+        if (r->d_fa2_q_f16) { cuMemFree(r->d_fa2_q_f16); r->d_fa2_q_f16 = 0; }
+        if (r->d_fa2_o_f16) { cuMemFree(r->d_fa2_o_f16); r->d_fa2_o_f16 = 0; }
+        if (r->d_fa2_scores_f16) { cuMemFree(r->d_fa2_scores_f16); r->d_fa2_scores_f16 = 0; }
+        r->fa2_buf_max_s = 0;
+
+        /* Effective per-chunk score cap: the hard ceiling (env/default), further
+         * clamped by free GPU memory. The score scratch is o(F32)+sc(F16) = 6
+         * bytes/elem; we must leave a workspace margin free or cuBLAS's GEMMs fall
+         * off the tensor-core path onto a pathological no-workspace algorithm
+         * (measured: 8192-tok prefill 1483 -> <40 tok/s). q_chunk is recomputed
+         * from r->d512_cap_elems in launch_cublas_d512_attention to match exactly. */
+        size_t cap = D512_SCORE_CAP_ELEMS;
+        size_t free_b = 0, total_b = 0;
+        if (cuMemGetInfo(&free_b, &total_b) == CUDA_SUCCESS && free_b > 0) {
+            /* Only shrink below the ceiling to keep the d512 scratch ALLOC itself
+             * from failing (and disabling d512 -> slow fallback). The ceiling
+             * already bounds the scratch small enough to leave cuBLAS its GEMM
+             * workspace; this margin just covers buffers allocated later in the
+             * layer loop (d_f16_scratch + d_batch_f16_scratch ~0.5 GB). Keep it
+             * small so the common 8192 case stays at the ceiling (q_chunk~128)
+             * rather than over-chunking to q_chunk=1. */
+            const size_t margin = (size_t)512 * 1024 * 1024;
+            size_t reserve = q_bytes + margin;
+            size_t avail = free_b > reserve ? free_b - reserve : 0;
+            size_t cap_mem = avail / 6; /* 4 (F32) + 2 (F16) bytes per score elem */
+            if (cap_mem < cap) cap = cap_mem;
+            if (cap < (size_t)n_heads * total_s) cap = (size_t)n_heads * total_s; /* >=1 query token/chunk */
+        }
+        r->d512_cap_elems = cap;
+
+        int q_chunk = (int)(cap / ((size_t)n_heads * total_s));
+        if (q_chunk < 1) q_chunk = 1;
+        if (q_chunk > max_s) q_chunk = max_s;
+        size_t score_elems = (size_t)n_heads * q_chunk * total_s;     /* one chunk, worst-case gqa=n_heads */
+        size_t o_bytes = score_elems * sizeof(float);                 /* F32 scores (chunked) */
+        if (q_bytes > o_bytes) o_bytes = q_bytes;                     /* FA2 reuses d_fa2_o_f16 as F16 output */
+        size_t sc_bytes = score_elems * sizeof(uint16_t);             /* F16 scores (separate from Q) */
+        if (cuMemAlloc(&r->d_fa2_q_f16, q_bytes) != CUDA_SUCCESS)
+            r->d_fa2_q_f16 = 0;
+        if (cuMemAlloc(&r->d_fa2_o_f16, o_bytes) != CUDA_SUCCESS)
+            r->d_fa2_o_f16 = 0;
+        if (cuMemAlloc(&r->d_fa2_scores_f16, sc_bytes) != CUDA_SUCCESS)
+            r->d_fa2_scores_f16 = 0;
+        if (r->d_fa2_q_f16 && r->d_fa2_o_f16 && r->d_fa2_scores_f16) r->fa2_buf_max_s = max_s;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: FA2 F16 buffers allocated (max_tok=%d, q=%.1fMB, o=%.1fMB, q_chunk=%d, %s)\n",
+                    max_s, q_bytes/1048576.0, o_bytes/1048576.0, q_chunk,
+                    (r->d_fa2_q_f16 && r->d_fa2_o_f16) ? "OK" : "FAIL");
+    }
+    /* Linear F16 K/V scratch for batched windowed SWA prefill. The circular SWA
+     * cache can't hold all n_tokens at once, so attention reads a linear copy;
+     * the circular cache is filled with the window tail afterward for decode.
+     * For chunked prefill (start_pos>0, a multiple of swa_window) the buffer also
+     * holds a `swa_window` history prefix copied from the circular cache so the
+     * chunk's first tokens can attend across the chunk boundary — hence +window. */
+    if (r->is_gemma4 && r->swa_window_size > 0 && n_tokens > r->swa_window_size &&
+        (start_pos == 0 || start_pos % r->swa_window_size == 0) && r->fn_fa2_attn_256 &&
+        (!r->d_swa_k_lin || n_tokens + r->swa_window_size > r->swa_lin_max_tokens)) {
+        int max_kv = r->n_kv_heads * r->head_dim_swa;
+        size_t cap_tok = (size_t)n_tokens + r->swa_window_size; /* +window history prefix */
+        size_t bytes = cap_tok * max_kv * sizeof(uint16_t);
+        if (r->d_swa_k_lin) { cuMemFree(r->d_swa_k_lin); r->d_swa_k_lin = 0; }
+        if (r->d_swa_v_lin) { cuMemFree(r->d_swa_v_lin); r->d_swa_v_lin = 0; }
+        r->swa_lin_max_tokens = 0;
+        if (cuMemAlloc(&r->d_swa_k_lin, bytes) != CUDA_SUCCESS) r->d_swa_k_lin = 0;
+        if (cuMemAlloc(&r->d_swa_v_lin, bytes) != CUDA_SUCCESS) r->d_swa_v_lin = 0;
+        if (r->d_swa_k_lin && r->d_swa_v_lin) r->swa_lin_max_tokens = (int)cap_tok;
+    }
+
     int n_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < n_layers) n_layers = r->max_layers;
 
     /* Process transformer blocks */
+    double profile_layer_ms = 0;
     for (int l = 0; l < n_layers; l++) {
+        double _tl0 = get_time_ms();
         cuda_layer *cl = &r->layers[l];
         if (cl->is_ssm) {
             fprintf(stderr,
@@ -11842,6 +12872,8 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
           cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
 
         /* 2. Q/K/V projections (batched) */
+        if (r->debug_layers >= 3) cuStreamSynchronize(r->stream);
+        double _proj_t0 = (r->debug_layers >= 3) ? get_time_ms() : 0;
         launch_batch_matvec(r, d_batch_q, cl->attn_q_w, 0, d_batch_xb,
                             cl->attn_q_rows, cl->attn_q_cols, n_tokens, cl->attn_q_type);
         if (cl->shared_kv_source < 0) {
@@ -11855,27 +12887,167 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             }
         }
 
-        /* 3. Per-token Q/K norm + RoPE + KV store + attention (sequential per token) */
-        for (int t = 0; t < n_tokens; t++) {
-            int pos = start_pos + t;
-            CUdeviceptr q_t = d_batch_q + (size_t)t * local_q_dim * sizeof(float);
-            CUdeviceptr k_t = d_batch_k + (size_t)t * local_kv_dim * sizeof(float);
-            CUdeviceptr v_t = d_batch_v + (size_t)t * local_kv_dim * sizeof(float);
-            CUdeviceptr xb2_t = d_batch_xb2 + (size_t)t * local_q_dim * sizeof(float);
+        /* 3. Batched ops for non-SWA layers; per-token for SWA (circular cache) */
+        int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
+        float attn_scale = 1.0f;
 
-            /* Q/K norm */
+        /* Batched windowed SWA: when the prefill wraps the circular window, store
+         * K/V linearly and run a windowed FA2 instead of the slow per-token loop. */
+        int swa_aligned = (start_pos == 0) || (start_pos % r->swa_window_size == 0);
+        int swa_lin = cl->is_swa && cl->shared_kv_source < 0 && swa_aligned &&
+                      n_tokens > r->swa_window_size && hd == 256 &&
+                      r->fn_fa2_attn_256 && r->fn_batch_kv_store_swa_f16 &&
+                      r->d_swa_k_lin && r->d_swa_v_lin && r->d_fa2_q_f16;
+
+        if (!cl->is_swa || start_pos + n_tokens <= r->swa_window_size || swa_lin) {
+            /* ----- Batched path for full-attention or non-wrapping SWA ----- */
+            int total_q_heads = n_tokens * n_heads;
+            int total_kv_heads = n_tokens * layer_kv_heads;
+            float rope_base = cl->is_swa ? r->rope_freq_base_swa : r->rope_freq_base;
+
             if (cl->has_qk_norm) {
-                if (cl->attn_q_norm_w) launch_qknorm(r, q_t, cl->attn_q_norm_w, n_heads, hd, eps);
+                int bd = 1; while (bd < hd) bd <<= 1;
+                /* Q/K use the *weighted* per-head RMSNorm (qknorm_f32, 5 args), one
+                 * block per (token,head). Using raw_rmsnorm_heads_f32 here was a bug:
+                 * it takes 4 args so attn_q_norm_w was mis-marshalled into head_dim,
+                 * indexing vec[h*total_heads] -> OOB + wrong hidden states. */
+                if (cl->attn_q_norm_w) {
+                    void *qa[] = { &d_batch_q, &cl->attn_q_norm_w, &total_q_heads, &hd, &eps };
+                    cuLaunchKernel(r->fn_qknorm_f32, total_q_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, qa, NULL);
+                }
                 if (cl->shared_kv_source < 0) {
-                    if (cl->attn_k_norm_w) launch_qknorm(r, k_t, cl->attn_k_norm_w, layer_kv_heads, hd, eps);
-                    int bd = 1; while (bd < hd) bd <<= 1;
-                    void *va[] = { &v_t, &layer_kv_heads, &hd, &eps };
-                    cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, layer_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, va, NULL);
+                    if (cl->attn_k_norm_w) {
+                        void *ka[] = { &d_batch_k, &cl->attn_k_norm_w, &total_kv_heads, &hd, &eps };
+                        cuLaunchKernel(r->fn_qknorm_f32, total_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, ka, NULL);
+                    }
+                    /* V: raw (unweighted) per-head RMSNorm over all token*head rows */
+                    void *va[] = { &d_batch_v, &total_kv_heads, &hd, &eps };
+                    cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, total_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, va, NULL);
                 }
             }
 
-            /* RoPE */
             if (cl->is_swa) {
+                launch_batch_rope(r, d_batch_q, n_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa);
+                if (cl->shared_kv_source < 0)
+                    launch_batch_rope(r, d_batch_k, layer_kv_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa);
+            } else {
+                launch_batch_rope_with_factors(r, d_batch_q, n_heads, n_tokens, hd,
+                                               start_pos, r->d_rope_inv_freq_full);
+                if (cl->shared_kv_source < 0)
+                    launch_batch_rope_with_factors(r, d_batch_k, layer_kv_heads, n_tokens, hd,
+                                                   start_pos, r->d_rope_inv_freq_full);
+            }
+
+            if (swa_lin) {
+                int win = r->swa_window_size;
+                /* Chunked prefill (start_pos>0, a multiple of window): prepend a
+                 * `window` history prefix so the chunk's first tokens can attend
+                 * across the chunk boundary. Because start_pos is a multiple of
+                 * window, the circular cache already holds the last `window`
+                 * tokens in LINEAR position order, so a straight copy gives the
+                 * history. start_pos==0 -> hist=0 (no prefix, original behaviour). */
+                int hist = (start_pos > 0) ? win : 0;
+                if (hist > 0) {
+                    size_t hb = (size_t)win * local_kv_dim * sizeof(uint16_t);
+                    cuMemcpyDtoDAsync(r->d_swa_k_lin, r->d_key_cache[l], hb, r->stream);
+                    cuMemcpyDtoDAsync(r->d_swa_v_lin, r->d_value_cache[l], hb, r->stream);
+                }
+                /* Store this chunk's K/V LINEARLY after the prefix, at linear
+                 * positions [hist, hist+n_tokens). */
+                void *lin[] = { &r->d_swa_k_lin, &r->d_swa_v_lin, &d_batch_k, &d_batch_v,
+                                &hist, &local_kv_dim, &n_tokens };
+                cuLaunchKernel(r->fn_batch_kv_store_f16,
+                               (local_kv_dim + 255) / 256, n_tokens, 1,
+                               256, 1, 1, 0, r->stream, lin, NULL);
+                /* Fill the circular cache with ONLY the last `window` tokens — each
+                 * maps to a unique slot, so no write race (storing all n_tokens
+                 * would race multiple positions onto the same slot). This leaves
+                 * the cache identical to the per-token path for decode AND for the
+                 * next chunk's history prefix. Use the ABSOLUTE tail position so
+                 * the circular slots match (start_pos+tail_start)%window. */
+                int tail = win;
+                int tail_start = n_tokens - tail;          /* chunk-local */
+                int tail_abs = start_pos + tail_start;     /* absolute first-tail position */
+                CUdeviceptr k_tail = d_batch_k + (size_t)tail_start * local_kv_dim * sizeof(float);
+                CUdeviceptr v_tail = d_batch_v + (size_t)tail_start * local_kv_dim * sizeof(float);
+                void *circ[] = { &r->d_key_cache[l], &r->d_value_cache[l], &k_tail, &v_tail,
+                                 &tail_abs, &local_kv_dim, &tail, &win };
+                cuLaunchKernel(r->fn_batch_kv_store_swa_f16,
+                               (local_kv_dim + 255) / 256, tail, 1,
+                               256, 1, 1, 0, r->stream, circ, NULL);
+                /* Windowed FA2 over [history ++ chunk]: query i sits at linear key
+                 * position hist+i, so q_off=hist makes the kernel's causal+window
+                 * mask attend exactly [hist+i-window+1, hist+i]. */
+                launch_fa2_attention(r, d_batch_xb2, d_batch_q,
+                                    r->d_swa_k_lin, r->d_swa_v_lin,
+                                    n_tokens, hist, n_heads, layer_kv_heads,
+                                    hd, local_kv_dim, attn_scale, win);
+                goto swa_attn_done;
+            }
+
+            if (cl->shared_kv_source < 0) {
+                void *kva[] = { &r->d_key_cache[l], &r->d_value_cache[l], &d_batch_k, &d_batch_v,
+                                &start_pos, &local_kv_dim, &n_tokens };
+                cuLaunchKernel(r->fn_batch_kv_store_f16,
+                               (local_kv_dim + 255) / 256, n_tokens, 1,
+                               256, 1, 1, 0, r->stream, kva, NULL);
+            }
+
+            if (r->debug_layers >= 3) cuStreamSynchronize(r->stream);
+            double _attn_t0 = (r->debug_layers >= 3) ? get_time_ms() : 0;
+            if (n_tokens >= 64 && hd == 256 && r->fn_fa2_attn_256 && r->d_fa2_q_f16) {
+                /* window=0: this branch only runs when start_pos+n_tokens<=window,
+                 * so causal == windowed and no extra masking is needed. */
+                launch_fa2_attention(r, d_batch_xb2, d_batch_q,
+                                    r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                                    n_tokens, start_pos, n_heads, layer_kv_heads,
+                                    hd, local_kv_dim, attn_scale, 0);
+            } else if (n_tokens >= 64 && r->cublas && r->fn_causal_softmax_f32 && r->d_fa2_q_f16) {
+                launch_cublas_d512_attention(r, d_batch_xb2, d_batch_q,
+                                            r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                                            n_tokens, start_pos, n_heads, layer_kv_heads,
+                                            hd, local_kv_dim, attn_scale);
+            } else if (n_tokens >= 64 && r->fn_batch_attn_all_tokens_f32) {
+                int max_seq = start_pos + n_tokens;
+                size_t smem = (size_t)n_tokens * max_seq * sizeof(float);
+                void *a[] = { &d_batch_xb2, &d_batch_q,
+                              &r->d_key_cache[kv_src], &r->d_value_cache[kv_src],
+                              &n_tokens, &start_pos, &n_heads, &layer_kv_heads,
+                              &hd, &local_kv_dim, &attn_scale };
+                cuLaunchKernel(r->fn_batch_attn_all_tokens_f32,
+                               n_heads, 1, 1, 256, 1, 1, smem, r->stream, a, NULL);
+            } else {
+                /* For smaller batches (<64 tokens), use batch_attn_causal_f32
+                   which has better occupancy (n_heads × n_tokens blocks) */
+                launch_batch_attention(r, d_batch_xb2, d_batch_q,
+                                      r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                                      n_tokens, start_pos, n_heads, layer_kv_heads,
+                                      hd, local_kv_dim, attn_scale);
+            }
+            if (r->debug_layers >= 3) {
+                cuStreamSynchronize(r->stream);
+                double _attn_t1 = get_time_ms();
+                fprintf(stderr, "    layer %d attn: %.2f ms\n", l, _attn_t1 - _attn_t0);
+            }
+        } else {
+            /* ----- Per-token path for SWA layers (circular KV cache) ----- */
+            for (int t = 0; t < n_tokens; t++) {
+                int pos = start_pos + t;
+                CUdeviceptr q_t = d_batch_q + (size_t)t * local_q_dim * sizeof(float);
+                CUdeviceptr k_t = d_batch_k + (size_t)t * local_kv_dim * sizeof(float);
+                CUdeviceptr v_t = d_batch_v + (size_t)t * local_kv_dim * sizeof(float);
+                CUdeviceptr xb2_t = d_batch_xb2 + (size_t)t * local_q_dim * sizeof(float);
+
+                if (cl->has_qk_norm) {
+                    if (cl->attn_q_norm_w) launch_qknorm(r, q_t, cl->attn_q_norm_w, n_heads, hd, eps);
+                    if (cl->shared_kv_source < 0) {
+                        if (cl->attn_k_norm_w) launch_qknorm(r, k_t, cl->attn_k_norm_w, layer_kv_heads, hd, eps);
+                        int bd = 1; while (bd < hd) bd <<= 1;
+                        void *va[] = { &v_t, &layer_kv_heads, &hd, &eps };
+                        cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, layer_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, va, NULL);
+                    }
+                }
+
                 int half_swa = hd / 2, zero = 0;
                 void *qa[] = { &q_t, &n_heads, &hd, &pos, &r->rope_freq_base_swa, &zero };
                 cuLaunchKernel(r->fn_rope_neox_f32, n_heads, 1, 1, half_swa, 1, 1, 0, r->stream, qa, NULL);
@@ -11883,37 +13055,19 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                     void *ka[] = { &k_t, &layer_kv_heads, &hd, &pos, &r->rope_freq_base_swa, &zero };
                     cuLaunchKernel(r->fn_rope_neox_f32, layer_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, ka, NULL);
                 }
-            } else {
-                launch_rope_with_factors(r, q_t, n_heads, hd, pos, r->d_rope_inv_freq_full);
-                if (cl->shared_kv_source < 0)
-                    launch_rope_with_factors(r, k_t, layer_kv_heads, hd, pos, r->d_rope_inv_freq_full);
-            }
 
-            /* KV store */
-            if (cl->shared_kv_source < 0) {
-                if (cl->is_swa) {
+                if (cl->shared_kv_source < 0) {
                     int slot = pos % r->swa_window_size;
                     launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, slot, local_kv_dim);
-                } else {
-                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, pos, local_kv_dim);
                 }
-            }
 
-            /* Attention */
-            int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
-            float attn_scale = 1.0f;
-            if (cl->is_swa) {
                 launch_attention_swa(r, xb2_t, q_t,
                                     r->d_key_cache[kv_src], r->d_value_cache[kv_src],
                                     n_heads, layer_kv_heads, hd, local_kv_dim,
                                     pos, r->swa_window_size, attn_scale);
-            } else {
-                int seq_len = pos + 1;
-                launch_attention(r, xb2_t, q_t,
-                               r->d_key_cache[kv_src], r->d_value_cache[kv_src],
-                               n_heads, layer_kv_heads, hd, local_kv_dim, seq_len, attn_scale);
             }
         }
+        swa_attn_done:;
 
         /* 4. Batched output projection */
         launch_batch_matvec(r, d_batch_xb, cl->attn_output_w, 0, d_batch_xb2,
@@ -11928,6 +13082,11 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
           void *a[] = { &d_batch_x, &d_batch_xb, &total };
           cuLaunchKernel(r->fn_vision_add, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
 
+        if (r->debug_layers >= 3) {
+            cuStreamSynchronize(r->stream);
+            double _proj_t1 = get_time_ms();
+            fprintf(stderr, "    layer %d proj+attn: %.2f ms\n", l, _proj_t1 - _proj_t0);
+        }
         /* 7. Batched FFN */
         cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd, r->stream);
         { void *a[] = { &d_batch_xb, &cl->ffn_norm_w, &n_embd, &eps, &n_tokens };
@@ -12028,6 +13187,17 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             void *a[] = { &d_batch_x, &sv, &total };
             cuLaunchKernel(r->fn_vision_scale, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
         }
+
+        if (r->debug_layers >= 2) {
+            cuStreamSynchronize(r->stream);
+            double _tl1 = get_time_ms();
+            fprintf(stderr, "  prefill layer %d/%d: %.1f ms (hd=%d, swa=%d, kv_h=%d)\n",
+                    l, n_layers, _tl1 - _tl0, hd, cl->is_swa, layer_kv_heads);
+        }
+    }
+    if (r->debug_layers >= 2) {
+        cuStreamSynchronize(r->stream);
+        fprintf(stderr, "cuda_llm: prefill %d layers done\n", n_layers);
     }
 
     /* Final RMSNorm on last token */
@@ -12617,9 +13787,22 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_batch_beta)  cuMemFree(r->d_batch_beta);
     if (r->d_batch_token_ids) cuMemFree(r->d_batch_token_ids);
     if (r->d_batch_f16_scratch) cuMemFree(r->d_batch_f16_scratch);
+    if (r->d_fa2_q_f16) cuMemFree(r->d_fa2_q_f16);
+    if (r->d_fa2_o_f16) cuMemFree(r->d_fa2_o_f16);
+    if (r->d_fa2_scores_f16) cuMemFree(r->d_fa2_scores_f16);
+    if (r->d_swa_k_lin) cuMemFree(r->d_swa_k_lin);
+    if (r->d_swa_v_lin) cuMemFree(r->d_swa_v_lin);
+    if (r->d_f16_scratch2) cuMemFree(r->d_f16_scratch2);
+    if (r->stream_dq) cuStreamDestroy(r->stream_dq);
+    for (int i = 0; i < 2; i++) {
+        if (r->dq_evt[i]) cuEventDestroy(r->dq_evt[i]);
+        if (r->gemm_evt[i]) cuEventDestroy(r->gemm_evt[i]);
+    }
+    if (r->d_f16_scratch) cuMemFree(r->d_f16_scratch);
 
-    /* Free module */
+    /* Free modules */
     if (r->module) cuModuleUnload(r->module);
+    if (r->fa2_mod) cuModuleUnload(r->fa2_mod);
     if (r->cublas) cublasewDestroy(r->cublas);
 
     /* Free host buffer */
