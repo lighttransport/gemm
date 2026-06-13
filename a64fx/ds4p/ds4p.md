@@ -173,3 +173,32 @@ took ds4f 255k→12M ctx on 11 nodes (byte-identical to CP-off).
   (≥96 nodes). For co-serving, **108 = 96 ds4p(CP) + 12 ds4f** or **128 = 96 + 32** both work
   — CP, not the node count, is the enabler. Reserve more nodes only for headroom (finer cache
   shard + fewer owned experts) or higher context (CP scales the ceiling with node count).
+
+### How many CP contexts fit on 96+N nodes (ds4p only, each context ≤ 1M) — capacity equation
+Let **M = 96 + N** total EP ranks (= nodes, 1 rank/node). Per-node budget on a 31.8 GB node,
+~30 GB usable (≈2 GB OS/guard floor):
+
+    weights      W(M) ≈ 12 + 2.8·⌈384/M⌉ GB        # measured: 22.99 @ M=96/112 (owned 4),
+                                                    #           19.4 @ M=128 (3), 17.42 @ M=192 (2)
+    cache budget B(M) ≈ 30 − W(M) GB                # 7.0 @96, ~7.0 @112, ~10.6 @128, ~12.6 @192
+
+With CP the compressed Tier-B2 cache shards by slot across all M ranks, so per-node cache for
+K concurrent contexts totalling P positions (P ≤ K·1M) is
+
+    cache/node(P,K) ≈ ρ_sh·P/M  +  ρ_rep·P  +  K·σ
+        ρ_sh ≈ 1.84 KB/pos   # slot-sharded CSA cmp_q4 + idx_kv8_4 (the 1.84 GB CP freed at M=96 for 1×1M)
+        ρ_rep ≈ small        # replicated remainder: HCA cmp + 64-slot f32 idx
+        σ     = per-context NON-sharded scratch (mainly s_idx_scores ∝ max_pos) — to be pinned by a sweep
+
+⇒ max concurrent 1M-contexts:
+
+    K_max(M) ≈ ⌊ B(M) / ( ρ_sh·1M/M  +  ρ_rep·1M  +  σ ) ⌋
+
+The sharded term `ρ_sh·1M/M` is **tiny at M ≥ 96** (1.84 GB / M ≈ **19 MB per 1M-context at
+M=96**, 14 MB at M=128), so **CP removes the cache as the binding limit** — exactly as for ds4f
+(255k→12M on 11n became LOAD-PEAK-bound, not cache-bound). The ceiling on 96+N nodes is then
+**σ (per-context scratch) + the load-peak transient**, giving `K_max(M) ≈ B(M)/σ`, which **grows
+with M** because W(M) falls (more nodes → less weight → more budget) *and* the per-context shard
+shrinks. Measured single-context anchors (CP on): M=96 → MemFree **3.95 GB**, M=112 → **3.98 GB**
+— i.e. room for several more 1M contexts already at 96. **Next:** a K=2,4 concurrent-context
+sweep to pin σ (and the load-peak), turning K_max into a hard number per N.
