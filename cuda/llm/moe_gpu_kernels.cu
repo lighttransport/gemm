@@ -579,6 +579,37 @@ extern "C" __global__ void dequant_q4_K_to_f16(
 }
 
 /*
+ * dequant_q4_0_to_f16: Q4_0 weight matrix -> FP16 row-major [rows, cols], one
+ * thread per 32-element block. Mirrors dequant_q4_K_to_f16 for the gemma4
+ * dequant->F16->cuBLAS batched-prefill path. Q4_0 GPU block = 18 bytes:
+ * half d @0, qs[16] @2; weight j = (qs[j]&0xF - 8)*d for j<16,
+ * (qs[j]>>4 - 8)*d for j+16 (matches matvec_q4_0_f32's x indexing).
+ */
+extern "C" __global__ void dequant_q4_0_to_f16(
+    half *out,                 // [rows * cols] FP16 output
+    const unsigned char *mat,  // [rows * row_bytes] Q4_0 input
+    int rows, int cols)
+{
+    int nb = cols / 32, rb = nb * 18;
+    int bid = blockIdx.x * 128 + threadIdx.x;
+    int total_blocks = rows * nb;
+    if (bid >= total_blocks) return;
+
+    int row = bid / nb;
+    int bk = bid % nb;
+
+    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 18;
+    half *out_blk = out + (size_t)row * cols + (size_t)bk * 32;
+
+    float d = __half2float(*(const __half *)bp);
+    const unsigned char *qs = bp + 2;
+    for (int j = 0; j < 16; j++) {
+        out_blk[j]      = __float2half((float)((int)(qs[j] & 0x0F) - 8) * d);
+        out_blk[j + 16] = __float2half((float)((int)(qs[j] >> 4)   - 8) * d);
+    }
+}
+
+/*
  * moe_expert_fused_q4k: Fused per-expert Q4_K gate+up+SiLU+down for batched tokens.
  * One block per expert. Processes all n_e tokens sequentially within the block.
  * Eliminates all per-expert kernel launch overhead (gather, convert, dequant, cuBLAS, scatter).
