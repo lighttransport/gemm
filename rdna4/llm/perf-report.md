@@ -327,3 +327,365 @@ LLM_PREFILL_WARMUP=2 ./test_hip_llm $M -s 1300 --bench --gpu-only-bench \
 ./test_hip_llm --verify-quant-kernels     # 18/18 PASS
 # llama.cpp: llama-bench -m $M --device ROCm0 -ngl 99 -fa on -p 512,1024 -n 128
 ```
+
+---
+
+## 9. June 2026 Session — Prefill Decode Optimization Campaign
+
+**Hardware**: RX 9070 XT (gfx1201, ROCm 7.2, Wave32), 16 GB VRAM  
+**Target models**:  
+- `Qwen3.6-35B-A3B-UD-IQ3_S.gguf` (MoE, IQ3_S gate/up, IQ3_XXS down, n_embd=2048, 40 layers)  
+- `Qwen3.6-35B-A3B-UD-IQ2_M.gguf` (MoE, IQ2_XXS gate/up, IQ3_XXS down, n_embd=2048, 40 layers)  
+- `Qwen3.6-27B-UD-IQ3_XXS.gguf` (hybrid dense, IQ3_XXS all weights, n_embd=5120, 64 layers)
+
+### Final Benchmarks (June 11)
+
+| Model | Prefill pp1024 | Decode tg128 | Environment |
+|-------|:-------------:|:------------:|-----------|
+| IQ3_S (MoE, 35B) | **1521 tok/s** | **117 tok/s** | Default; `LLM_MOE_INT8=1` → 1485 |
+| IQ2_M (MoE, 35B) | **1515 tok/s** | **36 tok/s** | Baseline was 40 — 38× gain |
+| IQ3_XXS (dense, 27B) | **775 tok/s** | **23 tok/s** | Dense FFN n_ff=17408, n_embd=5120 |
+
+### What Was Done (commits chronological)
+
+| Commit | Optimization | Impact |
+|--------|-------------|--------|
+| `5f513d8` | **Batched MoE prefill for IQ1_S, IQ2_XXS, IQ3_XXS, TQ1_0** | IQ2_M: 40 → 1463 tok/s (**+36×**) |
+| | — Add dequant kernels for IQ1_S (50 B/block), TQ1_0 (54 B/block), IQ2_XXS (66 B/block) | |
+| | — Extend `batch_qtype_ok` and `get_bf16_weight` for all new types | |
+| | — Enable GPU grouping path for IQ1_S+IQ3_XXS, IQ2_XXS+IQ3_XXS | |
+| | — Remove `moe_dev_dispatch_ok` dependency for batched prefill eligibility | |
+| `2380139` | **Double-buffered LDS BF16 GEMM (`gemm_bf16_own_db`)** | gemm_bf16_own: 221→204 ms (**-7.7%**) |
+| | — 2x smA/smB tiles (32 KB LDS), K-loop stride 64 pipeline | |
+| | — Load phase N+1 issued during WMMA compute of phase N | |
+| `226b510` | **Block-major weight repack (`LLM_MOE_BM=1`)** | IQ3_S: neutral; IQ2_M: +3.5% |
+| | — Transpose: row-major [N][nb][bs] → block-major [nb][N][bs] at upload | |
+| | — Contiguous row-tile reads recover cache-line over-fetch | |
+| `66ad0a0` | **INT8 WMMA grouped GEMM (`LLM_MOE_INT8=1`)** | Comparable to BF16 path |
+| | — `dequant_iq2s_all_int8` / `dequant_iq3s_all_int8`: dequant to INT8 | |
+| | — `gemm_int8_grouped`: grouped GEMM via INT8 WMMA builtin | |
+| | — `quantize_f32_act_to_int8`: activation quantize | |
+| `4976141` | **Decode Q6_K matvec kernels: 64→256 threads** | Decode +0.5% |
+| | — Better GPU occupancy for Q6_K matvecs | |
+| `d873157` | **IQ3_XXS fused decode kernels** | 27B decode: 21.7→23.3 tok/s (**+7.4%**) |
+| | — `ffn_gate_up_silu_iq3xxs`, `matvec_down_residual_iq3xxs` | |
+| | — `matvec_qkv_iq3xxs`, `matvec_out_gated_iq3xxs` | |
+| | — `ssm_matvec4_iq3xxs`, `fused_ssm_out_gated_iq3xxs` | |
+
+### Abandoned Approaches
+
+| Approach | Reason |
+|----------|--------|
+| **Fused dequant+GEMM** (gemm_dequant_iq2s_grouped) | VGPR 84→99 → occupancy 75%→50%, net slower |
+| **MMQ DP4A grouped path** (LLM_MOE_MMQ=1) | DP4A (4 elem/inst) vs WMMA (4096 elem/inst); GPU timeout at pp1024 |
+
+### How to Reproduce (HIP runner)
+
+```bash
+# Build
+cd /mnt/disk1/work/gemm/main/rdna4/llm
+make HIPBLASLT=1
+
+# IQ3_S MoE model — prefill + decode benchmark
+LLM_PREFILL_WARMUP=2 ./test_hip_llm \
+  /mnt/disk1/models/qwen36/35b/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  -s 1300 --bench --gpu-only-bench --prefill-len 1024 --decode 128
+
+# IQ2_M MoE model
+LLM_PREFILL_WARMUP=2 ./test_hip_llm \
+  /mnt/disk1/models/qwen36/35b/Qwen3.6-35B-A3B-UD-IQ2_M.gguf \
+  -s 1300 --bench --gpu-only-bench --prefill-len 1024 --decode 128
+
+# 27B dense model
+LLM_PREFILL_WARMUP=2 ./test_hip_llm \
+  /mnt/disk1/models/qwen36/27b/Qwen3.6-27B-UD-IQ3_XXS.gguf \
+  -s 1300 --bench --gpu-only-bench --prefill-len 1024 --decode 128
+
+# Optional: INT8 WMMA (LLM_MOE_INT8=1), block-major repack (LLM_MOE_BM=1)
+
+# Verification
+./test_hip_llm --verify-quant-kernels      # 18/18 PASS expected
+
+# Profiling
+rm -rf /tmp/prof && LLM_PREFILL_WARMUP=2 rocprofv3 --kernel-trace -d /tmp/prof -f csv -- \
+  ./test_hip_llm /mnt/disk1/models/qwen36/35b/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  -s 1300 --bench --gpu-only-bench --prefill-len 1024 --decode 4
+awk -F',' 'NR>1{gsub(/"/,"",$8);k=$8;t=$11-$10;if(t>0){kt[k]+=t;kc[k]++}}
+  END{for(k in kt)printf "%s\t%d\t%.0f\n",k,kc[k],kt[k]}' \
+  /tmp/prof/radv/*.csv | sort -t$'\t' -k3 -rn | head -20
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `rdna4/llm/hip_llm_runner.c` | Main runner: struct, GPU kernel source, prefill/decode logic (~10900 lines) |
+| `rdna4/llm/hip_llm_runner.h` | Public API header |
+| `rdna4/llm/test_hip_llm.c` | Test harness |
+| `rdna4/llm/mm_blaslt_bridge.cpp` | hipBLASLt bridge with algo pinning |
+| `rdna4/llm/Makefile` | Build: `make HIPBLASLT=1` |
+| `rdna4/llm/perf-report.md` | This file |
+
+### Decode Path Launch Sequence
+
+```
+SSM layer (30 layers for 35B-A3B, 16 for 27B):
+  1. res_rmsnorm_f32 — residual + RMSNorm (fused)
+  2. ssm_matvec4_q6k/iq3xxs — 4 SSM input matvecs (fused)
+  3. ssm_prep_f32 — conv1d + l2norm + repeat + softplus + sigmoid (fused 7→1)
+  4. deltanet_step_warp_f32 — warp-per-row state recurrence
+  5. fused_ssm_out_gated — gated RMSNorm + SSM output matvec (fused)
+  6. (MoE: router+gateup+down) or (dense FFN: gate_up_silu + down_residual)
+
+Attention layer (10 layers for 35B-A3B, 48 for 27B):
+  1. res_rmsnorm_f32
+  2. matvec_qkv_q6k/iq3xxs — Q/K/V matvecs (fused)
+  3. deinterleave + qknorm + rope + kv_store
+  4. attn_decode_f32_devp — GQA attention
+  5. matvec_out_gated — sigmoid_mul + output matvec (fused)
+  6. res_rmsnorm_f32 (pre-FFN)
+  7. Dense FFN: gate_up_silu + down_residual (fused)
+```
+
+### Prefill Batched Path Eligibility
+
+Supported types in `batch_qtype_ok()`: F32, F16, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS, IQ2_XS, IQ2_S, IQ3_S, IQ1_S, TQ1_0, IQ2_XXS.
+
+Grouped MoE path activates for:
+- IQ2_S gate/up + IQ3_S down (IQ3_S model)
+- IQ2_XXS gate/up + IQ3_XXS down (IQ2_M model)
+- IQ1_S gate/up + IQ3_XXS down (27B model parts)
+
+Per-expert WMMA fallback handles all types via `get_bf16_weight` (on-the-fly dequant to BF16).
+
+### Decode Fused Kernel Conditions
+
+| Weight Type | FFN gate+up | FFN down | QKV | Output | SSM matvec4 | SSM out |
+|-------------|:---------:|:--------:|:---:|:-----:|:----------:|:-------:|
+| Q6_K | `ffn_gate_up_silu_q6k` | `matvec_down_residual_q6k` | `matvec_qkv_q6k` | `matvec_out_gated_q6k` | `ssm_matvec4_q6k` | `fused_ssm_out_gated_q6k` |
+| IQ3_XXS | `ffn_gate_up_silu_iq3xxs` | `matvec_down_residual_iq3xxs` | `matvec_qkv_iq3xxs` | `matvec_out_gated_iq3xxs` | `ssm_matvec4_iq3xxs` | `fused_ssm_out_gated_iq3xxs` |
+
+### IQ3_XXS Block Layout (98 bytes per 256 elements)
+
+```
+offset  0:  d       (half) — super-block scale
+offset  2:  qs[64]  — grid indices (8 sub-blocks × 8 bytes)
+offset 66:  sas[32] — scales_and_signs (8 sub-blocks × 4 bytes)
+```
+
+Dequant: `db = d * (0.5f + (aux32>>28)) * 0.5f`, grid via `iq3xxs_grid_dev[]`, signs via `ksigns_iq2xs_dev[]`.
+
+### Remaining Opportunities
+
+1. **Prefill: f32→int8 activation + int8 WMMA** — Already implemented but quantize overhead offsets 2× BW savings. Could win if quantize is fused into gather.
+2. **Decode: LLM head via top-K approximation** — `matvec_q6_K_f32` is ~9% of decode time.
+3. **Decode: Extend MoE decode kernels for IQ3_XXS** — Currently only IQ2_S DP4A and IQ3_S matvec.
+4. **Prefill: 27B dense FFN** — n_ff=17408 projections dominate; double-buffer helps but the GEMM is FLOPs-bound.
+5. **Decode: WMMA flash-attention decode for head_dim=256** — Could help at large seq_len.
+
+### Dead Ends (don't retry)
+
+- **MMQ DP4A grouped path** — DP4A too slow vs WMMA on gfx1201. GPU timeout at pp1024.
+- **Fused dequant+GEMM** — Higher VGPR → lower occupancy → net slower.
+- **Vectorized scatter** — 4× elements/thread increased atomic contention.
+- **Chunked DeltaNet scan** — Occupancy-bound: too few heads (32) to fill GPU.
+
+### Key Environment Variables
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `LLM_PREFILL_WARMUP` | 0 | Warmup runs before timed prefill |
+| `LLM_BATCH_DISABLE` | — | Force per-token fallback |
+| `LLM_MOE_FUSED` | 1 | Fused MoE decode kernels |
+| `LLM_MOE_BM` | 0 | Block-major weight repack |
+| `LLM_MOE_INT8` | 0 | INT8 WMMA grouped path |
+| `LLM_GEMM` | own* | `own` (WMMA) or `blaslt` (hipBLASLt). *Auto-flips to `blaslt` for large dense (non-MoE, n_embd≥4096) models — see §10. |
+
+---
+
+## 10. June 11 Session — 27B dense prefill 1.74× via hipBLASLt default
+
+**Target**: `Qwen3.6-27B-UD-IQ3_XXS.gguf` (dense hybrid: 48 DeltaNet-SSM +
+16 gated-attn, n_embd=5120, n_ff=17408, head_dim=256). Re-profiled the current
+build (the §4 breakdown was stale — predates the fused IQ3_XXS decode kernels).
+
+### 10.1 Headline
+
+| metric | before | after | change |
+|--------|-------:|------:|-------:|
+| prefill pp1024 | 771 t/s | **1346 t/s** | **1.74×** |
+| decode tg128 | 23.2 t/s | 23.2 t/s | unchanged |
+
+Decoded tokens bit-identical (greedy id stream stable); `--verify-quant-kernels`
+18/18. Commit `8b48e06`.
+
+### 10.2 The win — GEMM backend is model-dependent
+
+The self-owned `gemm_bf16_own_db` was the default (`gemm_own=1`) because it beats
+Tensile for the **35B MoE** (n_embd=2048) grouped path. But for the **27B dense**
+model's large FFN GEMMs (N=17408, K=5120), **hipBLASLt is 1.73× faster**
+(`LLM_GEMM=blaslt`: 771→1334 t/s). The §8.4 "own beats Tensile" finding was
+specific to the 35B's small-N shapes; it does not generalize to large dense
+GEMMs.
+
+Fix: in the prefill-eligibility block (`hip_llm_runner.c` ~7977), auto-default to
+hipBLASLt when `!is_moe && n_embd>=4096`. MoE keeps the self-owned grouped path
+(35B IQ3_S still 1515/117, IQ2_M unaffected); small dense models (n_embd<4096,
+e.g. Qwen3-VL-2B) keep `own`. Explicit `LLM_GEMM=own/blaslt` overrides. The VLM
+e2e (27B LLM prefill on Brooklyn Bridge) inherits the 1.74× for free.
+
+New prefill breakdown @pp1024 (760 ms): hipBLASLt Tensile GEMM 50%,
+`dequant_iq3_xxs_to_bf16` 19% (static FFN weights, re-dequanted per pass — can't
+cache to bf16, would OOM 16 GB), deltanet 5%, FA-hd256 3%, rest aux.
+
+### 10.3 Decode is at its architectural floor (two null attempts)
+
+Decode (43 ms/tok) is ~49% dense-FFN IQ3_XXS matvecs, ~22% SSM, the rest attn +
+LM head. Two attempts, both **null/negative** — do not retry:
+
+1. **Vectorize IQ3_XXS dequant** (float4 x-loads + dword grid reads, the
+   `q6k_dot4` pattern that won +13% on the 35B). **Exactly neutral** on 27B
+   (23.20→23.20). Reason: these kernels read the grid codebook from
+   `__device__ const` (constant cache, already fast) and `x` from L2; the
+   DRAM-resident weight bytes already stream coalesced. The inner loop was never
+   the bottleneck — float4 only adds register pressure. (The 35B win was in
+   different MoE kernels.) Reverted.
+2. **Q4_K SSM matvec → warp-per-row `mw` kernel** (mirroring the Q5_K mw default,
+   for the 64-thread one-block-per-row Q4_K decode matvec). **Regressed**
+   23.3→20.6: at n_cols=5120 (nb=20), the 32-lane warp runs only ~20 lanes
+   active with scattered 144-B block reads — worse than the 64-thread kernel.
+   Reverted.
+
+Decode is launch-count/latency bound across 64 layers (already heavily fused +
+graph-captured), matching the §8.3 conclusion. Real decode headroom would need a
+structural change (e.g. block-major dense-FFN weight repack), not micro-opts.
+
+### 10.4 Skipped (low ROI)
+
+- **hipBLASLt algo-pinning** (§Opp D): bridge supports `MM_BLASLT_ALGO_PINS` but
+  inline sweep segfaults on gfx1201; each shape has 64 candidates → external A/B
+  over many shapes for est. 0.5–2%. Heuristic first-valid already gives 1.74×.
+- **INT8 dense FFN**: existing MoE int8 path applies no scales (unusable as-is);
+  a correct scaled path is high-effort + quality risk. Deferred.
+
+---
+
+## 11. June 11 Session — 27B decode roofline + warp-per-row matvecs (23.3 → 27.8 tok/s)
+
+§10.3 called decode "at floor"; a proper roofline showed it was **at 54% of the
+achievable bandwidth**, and a kernel redesign recovered most of the per-layer gap.
+
+### 11.1 Roofline (the "is decode BW-bound?" answer)
+
+- Decode is **100% GPU-active** (44.4 ms/tok GPU vs 43 wall — graph capture
+  removed host gaps; no compute slack — float4 dequant was perfectly neutral).
+- Dense model → **~11.3 GB of weights read per token** (every weight, every tok).
+- **Achievable BW ceiling is format-dependent, not a flat 516:** the LM-head
+  Q5_K matvec hits 516 GB/s; Q4_K/Q6_K reach ~500–513; but **IQ3_XXS caps at
+  ~300–400 GB/s** — its grid-codebook gather (`iq3xxs_grid_dev[qs[...]]`, 32 lanes
+  gathering 32 distinct entries) + per-element sign decode is **ALU/ gather-bound**,
+  not BW-bound. Block size is irrelevant (gate_up flat at ~394 across 64/128/256
+  threads). So the 45 tok/s "pure-BW" target was optimistic: the dominant FFN is
+  IQ3_XXS.
+- Pre-redesign aggregate ≈ 278 GB/s = 54% of 516; the per-layer matvecs ran at
+  240–314 while only the giant LM-head matvec saturated.
+
+### 11.2 Root cause + fix
+
+Slow kernels were **block-per-row** (256 threads cooperate on one row → cross-warp
+`__shared__`+`__syncthreads` reduction = DRAM-idle), and `fused_ssm_out_gated_q6k`
+additionally recomputed the per-head RMSNorm sum-of-squares via **contended
+atomics in every one of the 5120 output-row blocks** (it is row-independent).
+
+Fix = transplant the in-tree **warp-per-row `G=nb*32` template**
+(`matvec_iq2_s_f32`: all 32 lanes active, intra-warp `__shfl` only). Per-call BW:
+
+| kernel | before | after | note |
+|---|---:|---:|---|
+| `ffn_gate_up_silu_iq3xxs` | 313 | **400** GB/s | IQ3_XXS ALU-capped (~400) |
+| `fused_ssm_out_gated_q6k` | 240 | **404** GB/s | + precompute inv_mean once (`ssm_inv_mean_f32`); drop atomic/barriers |
+| `matvec_q4_K_f32` (SSM in-proj) | 314 | **513** GB/s | `G=nb*4` (lane=64-elem chunk); Q4_K hits the ceiling |
+| `matvec_iq3_xxs_f32` (attn_gate) | 266 | **297** GB/s | nb-stride → `G=nb*32` (all lanes) |
+
+Net decode (canonical pp1024/tg128): **23.3 → 27.8 tok/s (+19%)**; argmax
+bit-identical, `--verify` 18/18, prefill unchanged (1350 t/s). Flags default ON:
+`LLM_FFN_IQ3_MW`, `LLM_SSM_OUT_MW`, `LLM_Q4K_G4`.
+
+### 11.3 What didn't move (shape/format-limited)
+
+- **FFN down** (IQ3_XXS [5120,17408], 5120 rows): warp-per-row *underfills*
+  (640 blocks) and split-K (`LLM_DOWN_KSPLIT`) only 287→303 GB/s — stuck at ~300
+  for IQ3_XXS at this row count. Kept on original block-per-row. (`_mw`/`splitk`
+  twins + `LLM_MW_THREADS` knob exist, gated off.)
+- **gate_up** is at the IQ3_XXS ALU ceiling (~400), not the 513 BW ceiling.
+
+### 11.4 Honest ceiling
+
+The realistic decode ceiling for this IQ3_XXS-heavy model is **~32–34 tok/s**
+(IQ3_XXS FFN ≈ 60% of traffic, ALU-capped ~300–400), not the 45–50 implied by a
+flat 516 GB/s. We reached 27.8; the remaining gap is the down + attn_gate IQ3_XXS
+kernels held below their format cap by row count. Breaking ~400 on IQ3_XXS would
+need a cheaper decode (LDS-resident grid gather — prior-session negative on 35B,
+~1%) or a different quantization. 50 tok/s is not reachable without changing the
+weight format (less traffic / simpler decode).
+
+---
+
+## 12. June 11 Session — Qwen3.5-27B-UD-Q2_K_XL support (prefill 14→1364, decode 14→30 t/s)
+
+A second 27B checkpoint with a different quant mix: FFN gate/up **Q2_K**, FFN down
+**Q3_K**, SSM in-proj **Q2_K**, ssm_out **Q5_K**, alpha/beta **Q8_0**, attn_gate
+**IQ3_XXS**, LM head **Q6_K**. None of Q2_K/Q3_K/Q8_0 were supported in the fast
+paths, so both prefill and decode were on slow fallbacks.
+
+### 12.1 Prefill 14 → 1364 t/s (98×) — batched-path support
+
+Q2_K/Q3_K/Q8_0 weren't batch-eligible → prefill ran per-token 1024× (72 s). Added
+dequant-to-bf16 kernels (one thread per output column, order matching each
+matvec) + wired into `get_bf16_weight` / `batch_qtype_ok` / `quant_matvec_block_info`.
+Bugs fixed: (a) Q8_0 uses the runner's **padded 36-byte** upload (`[d:2][pad:2]
+[qs:32]`), not native 34-byte; (b) `get_bf16_weight` cases must `return
+r->d_wbuf_bf16;` not `break;` (break → default NULL path → silent forward fail).
+Validated vs CPU ref: token-0 hidden rel_L2=3e-6, ≤0.02 across 64 layers (Q2_K
+2-bit through bf16; norms match). Commit `7b80065`.
+
+### 12.2 Decode 14 → 30 t/s (2.2×) — warp-per-row Q2_K/Q3_K matvecs
+
+`matvec_q2_K_f32`/`matvec_q3_K_f32` were block-per-row with 256 threads but only
+~nb (≈20) active → 116/189 GB/s. Added `G=nb*4` warp-per-row twins (one lane per
+64-element `(n0,half)` chunk: 16 qs bytes shared across all 4 scale-groups, no
+redundant reads, all 32 lanes active, intra-warp reduction — the Q4_K g4 pattern):
+
+| kernel | before | after |
+|---|---:|---:|
+| `matvec_q2_K_g4` | 116 GB/s (251 µs) | **458 GB/s** (64 µs) |
+| `matvec_q3_K_g4` | 189 GB/s (203 µs) | **443 GB/s** (87 µs) |
+
+Default ON (`LLM_Q2K_G4`/`LLM_Q3K_G4`). Decoded tokens bit-identical g4 on/off;
+CPU-ref rel_L2 unchanged. Q2_K/Q3_K hit ~450 GB/s (simpler decode, no IQ3_XXS
+grid gather), so Q2_K_XL decode (30 t/s) now **beats** the IQ3_XXS model (27.8).
+Commit `f293e53`. Remaining (small): q5_K ssm_out 342 GB/s (nb-stride, 6144 rows),
+iq3_s; the FFN is unfused (separate gate/up/silu/down) but matvec-dominated.
+
+### 12.3 Final Q2_K_XL (pp1024 / tg128)
+
+prefill **1364 t/s**, decode **30.0 t/s**. IQ3_XXS + 35B MoE models unaffected
+(1347/27.8, 1499/121); `--verify` 21/21.
+
+### 12.4 June 12 vs llama.cpp ROCm (RX 9070 XT, pp1024/tg128)
+
+`llama-bench` was run from `~/work/llama.cpp/build_rocm722_rdna4_fa`
+(`549b9d843`, build 9307) with `-ngl 99 -fa 1 -r 3`. The HIP runner was run
+with `LLM_PREFILL_WARMUP=2`.
+
+| model | runner | pp1024 | tg128 | note |
+|---|---:|---:|---:|---|
+| `Qwen3.5-27B-UD-Q2_K_XL` | llama.cpp ROCm | 686.85 | 29.69 | `qwen35 27B Q2_K - Medium` |
+| | HIP runner | **1362.01** | 29.64 | prefill **1.98x** llama.cpp; decode parity |
+| `Qwen3.6-27B-UD-IQ3_XXS` | llama.cpp ROCm | 1093.19 | 26.25 | `qwen35 27B IQ3_XXS - 3.0625 bpw` |
+| | HIP runner | **1348.37** | **27.45** | prefill **1.23x**, decode **1.05x** |
+
+Takeaway: Q2_K_XL decode has effectively closed the llama.cpp gap while the
+batched prefill path is nearly 2x faster. IQ3_XXS still has modest headroom but
+already leads llama.cpp on both metrics; the remaining decode limit is mostly
+IQ3_XXS gather/dequant plus dense-FFN traffic.
