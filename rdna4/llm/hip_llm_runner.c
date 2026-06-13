@@ -646,6 +646,25 @@ static const char *hip_kernel_source =
 "    dst[i] = (float)qs * scale;\n"
 "}\n"
 "\n"
+"/* ---- 13b. embed_q4_0: native Q4_0 embedding lookup -> F32 (no F16 round-trip). */\n"
+"/* Q4_0 18-byte/32-elem block; column order matches matvec_q4_0_f32 (cols 0..15 = */\n"
+"/* low nibble qs[col], 16..31 = high nibble qs[col-16], value = (nibble-8)*d).    */\n"
+"__global__ void embed_q4_0(float *dst, const unsigned char *embd_table,\n"
+"                             int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n_embd) return;\n"
+"    int n_blocks_per_row = n_embd / 32;\n"
+"    int row_bytes = n_blocks_per_row * 18;\n"
+"    const unsigned char *row = embd_table + (size_t)token_id * row_bytes;\n"
+"    int block_idx = i / 32;\n"
+"    int within = i % 32;\n"
+"    const unsigned char *bp = row + block_idx * 18;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs = bp + 2;\n"
+"    int nib = (within < 16) ? (int)(qs[within] & 0x0F) : (int)(qs[within - 16] >> 4);\n"
+"    dst[i] = (float)(nib - 8) * d;\n"
+"}\n"
+"\n"
 "/* ---- 14. matvec_q2_K_f32: Q2_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q2_K block: 84 bytes = scales[16] + qs[64] + d(f16) + dmin(f16), 256 elements */\n"
 "__global__ void matvec_q2_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -5195,6 +5214,27 @@ static const char *hip_kernel_source =
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
 "\n"
+"/* Per-call dequant of Q4_0 (native 18 B/block: [d(f16) 2B][qs[16] 16B], 32 elems) */\n"
+"/* to BF16. Nibble order matches matvec_q4_0_f32: cols 0..15 = low nibble qs[col],  */\n"
+"/* cols 16..31 = high nibble qs[col-16], value = (nibble - 8) * d. One elem/thread. */\n"
+"__global__ void dequant_q4_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; int b = blockIdx.y;\n"
+"    int c = b * 256 + threadIdx.x;       /* global column 0..n_cols-1 */\n"
+"    if (c >= n_cols) return;\n"
+"    int n_blocks_per_row = n_cols / 32;\n"
+"    int row_bytes = n_blocks_per_row * 18;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    int blk = c >> 5; int within = c & 31;\n"
+"    const unsigned char *bp = rp + (size_t)blk * 18;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs = bp + 2;\n"
+"    int nib = (within < 16) ? (int)(qs[within] & 0x0F) : (int)(qs[within - 16] >> 4);\n"
+"    float val = d * (float)(nib - 8);\n"
+"    size_t out_idx = (size_t)row * n_cols + c;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
 "/* Per-call dequant of IQ3_XXS (98 B/block, 256 elems) to BF16. Uses the\n"
 " * iq3xxs_grid_dev codebook + ksigns_iq2xs_dev sign table that were emitted\n"
 " * alongside matvec_iq3_xxs_f32. One thread per output element. */\n"
@@ -6807,7 +6847,10 @@ static const char *hip_kernel_source =
 "    if (i >= n) return;\n"
 "    float g = gate[i];\n"
 "    float u = up[i];\n"
-"    float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));\n"
+"    /* gelu_pytorch_tanh (Gemma's hidden_activation), matching ggml's tanh-approx\n"
+"     * GELU. Exact erf GELU differs by ~1e-3 and that per-FFN error accumulates\n"
+"     * over 48 layers into a garbled output on the Q4_0 QAT model. */\n"
+"    float gelu_g = g * 0.5f * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));\n"
 "    gate[i] = gelu_g * u;\n"
 "}\n"
 "\n"
@@ -7166,6 +7209,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_embed_q8_0;
+    hipFunction_t fn_embed_q4_0;
     hipFunction_t fn_matvec_q2_K_f32;
     hipFunction_t fn_matvec_q2_K_g4_f32;
     hipFunction_t fn_matvec_q3_K_f32;
@@ -7308,6 +7352,7 @@ struct hip_llm_runner {
     hipFunction_t fn_convert_f16_to_bf16;
     /* K-quant batched-prefill dequant kernels (write BF16 to a staging buffer) */
     hipFunction_t fn_dequant_q8_0_to_bf16;
+    hipFunction_t fn_dequant_q4_0_to_bf16;
     hipFunction_t fn_dequant_q2_K_to_bf16;
     hipFunction_t fn_dequant_q3_K_to_bf16;
     hipFunction_t fn_dequant_q4_K_to_bf16;
@@ -7613,6 +7658,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(embed_q8_0);
+    GET_FUNC(embed_q4_0);
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q2_K_g4_f32);
     GET_FUNC(matvec_q3_K_f32);
@@ -7733,6 +7779,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(pack_bf16_from_f32);
     GET_FUNC(convert_f16_to_bf16);
     GET_FUNC(dequant_q8_0_to_bf16);
+    GET_FUNC(dequant_q4_0_to_bf16);
     GET_FUNC(dequant_q2_K_to_bf16);
     GET_FUNC(dequant_q3_K_to_bf16);
     GET_FUNC(dequant_q4_K_to_bf16);
@@ -8520,9 +8567,16 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
     } else if (embd.type == GGML_TYPE_Q2_K) {
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
+    } else if (embd.type == GGML_TYPE_Q4_0) {
+        /* Keep Q4_0 token_embd raw + dedicated embed_q4_0 lookup. Dequanting the
+         * embedding to F16 (the generic path below) loses ~6e-4 of precision per
+         * element; over 48 layers that seed perturbation amplifies chaotically and
+         * garbles the output (the all-Q4_0 Gemma4 QAT model). matvec_q4_0 handles
+         * the tied lm_head at full precision too. */
+        if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
     } else if (embd.type == GGML_TYPE_Q3_K || embd.type == GGML_TYPE_Q4_K ||
                embd.type == GGML_TYPE_Q5_K || embd.type == GGML_TYPE_Q6_K ||
-               embd.type == GGML_TYPE_Q4_0 || embd.type == GGML_TYPE_Q4_1 ||
+               embd.type == GGML_TYPE_Q4_1 ||
                embd.type == GGML_TYPE_Q5_0 || embd.type == GGML_TYPE_Q5_1 ||
                embd.type == GGML_TYPE_IQ2_XXS || embd.type == GGML_TYPE_IQ2_XS ||
                embd.type == GGML_TYPE_IQ2_S   || embd.type == GGML_TYPE_IQ3_XXS ||
@@ -9562,6 +9616,12 @@ static inline void launch_embed_q8_0(hip_llm_runner *r, void *dst, void *embd_ta
     LAUNCH(r->fn_embed_q8_0, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_embed_q4_0(hip_llm_runner *r, void *dst, void *embd_table,
+                                      int token_id, int n_embd) {
+    void *args[] = { &dst, &embd_table, &token_id, &n_embd };
+    LAUNCH(r->fn_embed_q4_0, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
 static inline void launch_matvec_q8_f32(hip_llm_runner *r, void *dst, void *mat,
                                          void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -9768,6 +9828,21 @@ static inline int launch_dequant_q8_0_to_bf16(hip_llm_runner *r,
     return 0;
 }
 
+static inline int launch_dequant_q4_0_to_bf16(hip_llm_runner *r,
+                                              void *dst, void *mat,
+                                              int n_rows, int n_cols) {
+    if ((n_cols % 32) != 0) return -1;
+    void *args[] = { &dst, &mat, &n_rows, &n_cols };
+    int chunks = (n_cols + 255) / 256;
+    hipError_t e = LAUNCH(r->fn_dequant_q4_0_to_bf16, n_rows, chunks, 1,
+                          256, 1, 1, 0, r->stream, args);
+    if (e != hipSuccess) {
+        fprintf(stderr, "hip_llm: dequant_q4_0 launch failed: %d\n", e);
+        return -1;
+    }
+    return 0;
+}
+
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
  * dequant into r->d_wbuf_bf16 if the weight is not F16-pre-converted.
  * NOTE: returns r->d_wbuf_bf16 for non-F16 paths; the caller must consume the
@@ -9838,6 +9913,9 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
         }
         case GGML_TYPE_Q8_0:
             if (launch_dequant_q8_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q4_0:
+            if (launch_dequant_q4_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q2_K:
             launch_dequant_q2_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
@@ -10354,6 +10432,8 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
     /* 1. Token embedding lookup -> F32 (outside captured graph) */
     if (r->token_embd_type == GGML_TYPE_Q8_0) {
         launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
@@ -11403,6 +11483,8 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
     /* Embed (outside captured graph — token_id varies) */
     if (r->token_embd_type == GGML_TYPE_Q8_0) {
         launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
@@ -12012,6 +12094,8 @@ static int embed_tokens_batch(hip_llm_runner *r,
         float *row = (float *)r->d_x_batch + (size_t)m * n_embd;
         if (r->token_embd_type == GGML_TYPE_Q8_0) {
             launch_embed_q8_0(r, row, r->d_token_embd, tid, n_embd);
+        } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+            launch_embed_q4_0(r, row, r->d_token_embd, tid, n_embd);
         } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
             launch_embed_q2_K(r, row, r->d_token_embd, tid, n_embd);
         } else {

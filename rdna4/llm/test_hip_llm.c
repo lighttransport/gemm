@@ -415,6 +415,7 @@ int main(int argc, char **argv) {
         gguf_close(gguf);
         return 1;
     }
+    if (getenv("LLM_DEBUG_LAYERS")) hip_llm_set_debug(gpu, 1);
 
     /* Load weights to GPU */
     fprintf(stderr, "\n=== Loading weights to GPU ===\n");
