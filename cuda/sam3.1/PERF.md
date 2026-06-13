@@ -1,9 +1,10 @@
 # SAM 3.1 CUDA runner — performance notes
 
-End-to-end runtime is currently ~4× the PyTorch reference on the same
-GPU while producing slightly better-quality masks (IoU 0.98 vs ref,
-score 0.877 vs 0.841). This document captures the measured hot spots
-and the optimizations prioritized to close the gap.
+End-to-end runtime is still dominated by the custom ViT GEMM/attention
+path, while correctness is now close to the PyTorch reference
+(`0.9996` default final IoU, `0.9999` with `SAM3_PRECISION=fp32` on
+`fujisan.jpg` / `"mountain"`). This document captures the measured hot
+spots and the optimizations prioritized to close the speed gap.
 
 ## Current state (fp16 default)
 
@@ -15,7 +16,9 @@ and the optimizations prioritized to close the gap.
   `cuda_sam3_1_config.precision` field.
 - FPN conv projections deliberately kept F32 (1x1 and 3x3 over Ci up
   to 1024 — F16 compounds to ~0.5 max_abs drift here).
-- RoPE tables precomputed once at ctx creation.
+- RoPE tables are precomputed once at ctx creation.
+- DETR prompt construction includes the 32 text tokens plus the
+  image-conditioned geometry CLS token used by Meta's text-only path.
 - No cuBLAS / no flash-attention / no LN+GEMM fusion.
 
 ## Where the time goes (qualitative, based on 32 ViT blocks × 4 GEMMs)
@@ -36,15 +39,16 @@ ViT dominates the pipeline. Per block:
 ## Precision knob (implemented)
 
 `cuda_sam3_1_config.precision` / `params.precision` / `--precision`:
-- `fp16` (default): MMA tensor cores, fastest, ~1e-4 per-GEMM drift.
-- `fp32`: forces tiled F32-accum GEMM. Slower but avoids drift — use
-  this for reference-level accuracy checks.
+- `fp16` (default): F16 linear weights with MMA tensor cores, fastest.
+- `fp32`: uploads linear weights as F32 and uses the tiled F32 GEMM
+  path. Slower, but reduces ViT/FPN drift and is the reference-level
+  accuracy check path.
 - `bf16`, `fp8`: accepted but log a warning and fall back to fp16.
   Landing them requires new kernel variants (see "Follow-up work").
 
 ## Recommended optimizations (to close the 4× gap)
 
-Ordered by expected impact vs refactor cost. None are implemented yet.
+Ordered by expected impact vs refactor cost.
 
 1. **cuBLAS/cuBLASLt for ViT GEMMs** — the MMA m16n8k16 custom kernel
    lacks persistent scheduling and sophisticated tiling; cuBLAS

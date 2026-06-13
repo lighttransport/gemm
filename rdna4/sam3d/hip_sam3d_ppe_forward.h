@@ -21,6 +21,7 @@
 #define HIP_SAM3D_PPE_FORWARD_H_
 
 #include "../rocew.h"
+#include "hip_sam3d_wmma.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@ typedef struct {
     hipFunction_t ppe_window_pack_f32;
     hipFunction_t layernorm_token_f32;
     hipFunction_t gemm_f32_bias;
+    hipFunction_t gemm_wmma;   /* BF16-WMMA GEMM (gfx12; NULL otherwise) */
     hipFunction_t qkv_split_f32;
     hipFunction_t sdpa_batched_f32;
     hipFunction_t residual_add_f32;
@@ -58,6 +60,8 @@ static inline int cs3d_ppe_fns_lookup(cs3d_ppe_fns *f, hipModule_t mod)
     LOOKUP_(gelu_inplace_f32);
     LOOKUP_(ppe_cls_pos_extract_f32);
 #undef LOOKUP_
+    if (hipModuleGetFunction(&f->gemm_wmma, mod, "gemm_f32_bias_wmma") != hipSuccess)
+        f->gemm_wmma = NULL;
     return 0;
 }
 
@@ -167,10 +171,10 @@ static inline int cs3d_ppe_forward(
     }
     {
         int Dout = 3 * D;
-        int gx = (n_tok + 15) / 16, gy = (Dout + 15) / 16;
         void *args[] = { &ws->qkv, &ws->ln_buf, &bw->qkv_w, &bw->qkv_b,
                          &n_tok, &D, &Dout };
-        if (hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_launch_gemm(f->gemm_f32_bias, f->gemm_wmma, args,
+                           n_tok, D, Dout, 0) != hipSuccess) return -1;
     }
     {
         int total = n_tok * D, blocks = (total + 255) / 256;
@@ -187,10 +191,10 @@ static inline int cs3d_ppe_forward(
     }
     {
         int Dout = D;
-        int gx = (n_tok + 15) / 16, gy = (Dout + 15) / 16;
         void *args[] = { &ws->proj_out, &ws->attn_out, &bw->proj_w, &bw->proj_b,
                          &n_tok, &D, &Dout };
-        if (hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_launch_gemm(f->gemm_f32_bias, f->gemm_wmma, args,
+                           n_tok, D, Dout, 0) != hipSuccess) return -1;
     }
     {
         int n = n_tok * D, blocks = (n + 255) / 256;
@@ -205,10 +209,10 @@ static inline int cs3d_ppe_forward(
     }
     {
         int Dout = ffn;
-        int gx = (n_tok + 15) / 16, gy = (Dout + 15) / 16;
         void *args[] = { &ws->ffn_buf, &ws->ln_buf, &bw->fc1_w, &bw->fc1_b,
                          &n_tok, &D, &Dout };
-        if (hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_launch_gemm(f->gemm_f32_bias, f->gemm_wmma, args,
+                           n_tok, D, Dout, 0) != hipSuccess) return -1;
     }
     {
         int n = n_tok * ffn, blocks = (n + 255) / 256;
@@ -217,10 +221,10 @@ static inline int cs3d_ppe_forward(
     }
     {
         int Dout = D;
-        int gx = (n_tok + 15) / 16, gy = (Dout + 15) / 16;
         void *args[] = { &ws->proj_out, &ws->ffn_buf, &bw->fc2_w, &bw->fc2_b,
                          &n_tok, &ffn, &Dout };
-        if (hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1, 0, 0, args, NULL) != hipSuccess) return -1;
+        if (cs3d_launch_gemm(f->gemm_f32_bias, f->gemm_wmma, args,
+                           n_tok, ffn, Dout, 0) != hipSuccess) return -1;
     }
     {
         int n = n_tok * D, blocks = (n + 255) / 256;

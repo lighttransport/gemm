@@ -43,6 +43,14 @@ def main():
     parser.add_argument("--latents", type=str, default=None)
     parser.add_argument("--context", type=str, default=None)
     parser.add_argument("--timestep", type=float, default=0.5)
+    parser.add_argument("--device", type=str, default="cpu",
+                        help="torch device for the DiT forward, e.g. cpu or cuda")
+    parser.add_argument("--dtype", choices=["fp32", "fp16"], default="fp32",
+                        help="model/input dtype for the DiT forward")
+    parser.add_argument("--batch-index", type=int, default=0,
+                        help="batch item to select when input .npy is 3D")
+    parser.add_argument("--all-batches", action="store_true",
+                        help="keep all batches from 3D inputs; repeat single-batch latents to match context")
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -107,24 +115,39 @@ def main():
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(f"  Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
-    model = model.float().eval()  # CPU — DiT doesn't fit on small GPUs w/ activations
+    if args.dtype == "fp16" and args.device == "cpu":
+        raise ValueError("--dtype fp16 requires a non-CPU device")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA/ROCm device requested but torch.cuda.is_available() is false")
+    dtype = torch.float16 if args.dtype == "fp16" else torch.float32
+    model = model.eval().to(device=args.device, dtype=dtype)
     if args.latents:
         lat_np = np.load(args.latents)
-        latents = torch.from_numpy(lat_np if lat_np.ndim == 3 else lat_np[None, ...]).float()
+        if lat_np.ndim == 3 and not args.all_batches:
+            lat_np = lat_np[args.batch_index]
+        latents = torch.from_numpy(lat_np if lat_np.ndim == 3 else lat_np[None, ...])
     else:
         torch.manual_seed(42)
         latents = torch.randn(1, 4096, 64)
     if args.context:
         ctx_np = np.load(args.context)
-        context = torch.from_numpy(ctx_np if ctx_np.ndim == 3 else ctx_np[None, ...]).float()
+        if ctx_np.ndim == 3 and not args.all_batches:
+            ctx_np = ctx_np[args.batch_index]
+        context = torch.from_numpy(ctx_np if ctx_np.ndim == 3 else ctx_np[None, ...])
     else:
         if not args.latents:
             torch.manual_seed(42)
         context = torch.randn(1, 1370, 1024)
-    t = torch.full((latents.shape[0],), args.timestep)
+    if args.all_batches and latents.shape[0] == 1 and context.shape[0] > 1:
+        latents = latents.repeat(context.shape[0], 1, 1)
+    if latents.shape[0] != context.shape[0]:
+        raise ValueError(f"batch mismatch: latents={latents.shape[0]} context={context.shape[0]}")
+    latents = latents.to(device=args.device, dtype=dtype)
+    context = context.to(device=args.device, dtype=dtype)
+    t = torch.full((latents.shape[0],), args.timestep, device=args.device, dtype=dtype)
 
-    np.save(os.path.join(args.outdir, "dit_input_latents.npy"), latents.numpy()[0])
-    np.save(os.path.join(args.outdir, "dit_input_context.npy"), context.numpy()[0])
+    np.save(os.path.join(args.outdir, "dit_input_latents.npy"), latents.detach().float().cpu().numpy()[0])
+    np.save(os.path.join(args.outdir, "dit_input_context.npy"), context.detach().float().cpu().numpy()[0])
 
     # Hook every block to capture its output (after the block's residual stream).
     block_outs = {}
@@ -167,6 +190,8 @@ def main():
 
     out_np = output.float().cpu().numpy()[0]
     np.save(os.path.join(args.outdir, "dit_output.npy"), out_np)
+    if output.shape[0] > 1:
+        np.save(os.path.join(args.outdir, "dit_output_all.npy"), output.float().cpu().numpy())
     print(f"  Output: {out_np.shape}, mean={out_np.mean():.6f}, std={out_np.std():.6f}")
 
     # Save a few block outputs for per-block error localization.
@@ -193,7 +218,7 @@ def main():
             emb = t[:, None].float() * torch.exp(exp)[None, :]
             return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
 
-    t_emb = Timesteps(2048)(torch.tensor([0.5])).numpy()[0]
+    t_emb = Timesteps(2048)(torch.tensor([args.timestep], dtype=torch.float32)).numpy()[0]
     np.save(os.path.join(args.outdir, "dit_timestep_embed.npy"), t_emb)
     print(f"Saved to {args.outdir}/")
 

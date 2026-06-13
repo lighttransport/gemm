@@ -68,6 +68,12 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--size", type=int, default=518,
                     help="resize target (matches preprocessor)")
+    ap.add_argument("--device", default="cpu",
+                    help="torch device for model forward (cpu or cuda)")
+    ap.add_argument("--allow-tf32", action="store_true",
+                    help="allow TF32 matmul/cuDNN when running on CUDA")
+    ap.add_argument("--sdp", choices=("math", "default"), default="math",
+                    help="CUDA SDPA backend policy for reference generation")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -78,13 +84,44 @@ def main():
     from PIL import Image
     import sam3d_objects  # noqa: F401
 
+    try:
+        import xformers.ops
+
+        def sdpa_memory_efficient_attention(q, k, v, attn_bias=None,
+                                            p=0.0, scale=None, **_kw):
+            if q.ndim == 4:
+                q = q.permute(0, 2, 1, 3)
+                k = k.permute(0, 2, 1, 3)
+                v = v.permute(0, 2, 1, 3)
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias, dropout_p=p, scale=scale
+                )
+                return out.permute(0, 2, 1, 3)
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias, dropout_p=p, scale=scale
+            )
+
+        xformers.ops.memory_efficient_attention = sdpa_memory_efficient_attention
+    except Exception as e:
+        print(f"[dump_cond_tokens] xformers CPU fallback unavailable: {e}",
+              file=sys.stderr)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_float32_matmul_precision("highest")
 
-    # Force CPU — the torch+cu121 build ships kernels that may not
-    # match the local GPU arch; we only need fp32 reference tokens.
-    device = "cpu"
+    device = args.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print("[dump_cond_tokens] cuda requested but unavailable; using cpu",
+              file=sys.stderr)
+        device = "cpu"
+    if device.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
+        torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
+        if args.sdp == "math":
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
     dtype = torch.float32
 
     # 1. Load + preprocess inputs the same way the PreProcessor does:
@@ -218,7 +255,9 @@ def main():
     if "ppe_tokens" in caps:
         save(args.outdir, "ppe_tokens.npy", caps["ppe_tokens"][0])
 
-    save(args.outdir, "cond_tokens.npy", cond[0].detach().float().cpu().numpy())
+    cond_np = cond[0].detach().float().cpu().numpy()
+    save(args.outdir, "cond_tokens.npy", cond_np)
+    save(args.outdir, "cond_tokens_full.npy", cond_np)
     print(f"[dump_cond_tokens] cond shape={cond.shape}", file=sys.stderr)
     return 0
 

@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include "../rocew.h"
+#include "hip_sam3d_wmma.h"
 #include "hip_sam3d_slat_dit_gpu.h"
 
 #ifdef __cplusplus
@@ -11,8 +12,10 @@ extern "C" {
 #endif
 
 typedef struct {
-    hipFunction_t gemm, mod_ln, ln, qkv_split, kv_split, mhrms, sdpa;
+    hipFunction_t gemm, gemm_wmma, mod_ln, ln, qkv_split, kv_split, mhrms, sdpa;
     hipFunction_t gelu, gated, resadd, silu;
+    hipFunction_t gemm_wmma;   /* gemm_bf16w_bf16a_wmma_t (gfx12; optional) */
+    int           use_wmma;    /* 1 iff SAM3D_WMMA!=0 and gemm_wmma resolved */
 } cs3d_slatdit_fns;
 
 typedef struct {
@@ -48,6 +51,8 @@ int  cs3d_slatdit_stack_forward(const cs3d_slatdit_fns *f, cs3d_slatdit_block_ws
 int cs3d_slatdit_fns_lookup(cs3d_slatdit_fns *f, hipModule_t mod)
 {
     if (hipModuleGetFunction(&f->gemm,      mod, "gemm_f32_bias")          != hipSuccess) return -1;
+    if (hipModuleGetFunction(&f->gemm_wmma, mod, "gemm_f32_bias_wmma") != hipSuccess)
+        f->gemm_wmma = NULL;
     if (hipModuleGetFunction(&f->mod_ln,    mod, "modulated_ln_f32")       != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->ln,        mod, "layernorm_token_f32")    != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->qkv_split, mod, "qkv_split_f32")          != hipSuccess) return -1;
@@ -58,7 +63,40 @@ int cs3d_slatdit_fns_lookup(cs3d_slatdit_fns *f, hipModule_t mod)
     if (hipModuleGetFunction(&f->gated,     mod, "gated_residual_add_f32") != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->resadd,    mod, "residual_add_f32")       != hipSuccess) return -1;
     if (hipModuleGetFunction(&f->silu,      mod, "silu_inplace_f32")       != hipSuccess) return -1;
+    /* Optional BF16-WMMA GEMM (gfx12). Default on; SAM3D_WMMA=0 disables. */
+    f->use_wmma = 0;
+    f->gemm_wmma = NULL;
+    {
+        const char *e = getenv("SAM3D_WMMA");
+        if (!e || e[0] != '0') {
+            if (hipModuleGetFunction(&f->gemm_wmma, mod,
+                                     "gemm_bf16w_bf16a_wmma_t") == hipSuccess)
+                f->use_wmma = 1;
+        }
+    }
     return 0;
+}
+
+/* GEMM dispatch for SLAT transformer. `args` follows gemm_f32_bias layout
+ * {Y,X,W,bias,N,Din,Dout}. BF16 WMMA when enabled and dims 16-aligned, else
+ * gemm_f32_bias. Stream 0. */
+static int slatdit_gemm(const cs3d_slatdit_fns *f, void **args)
+{
+    int N = *(int *)args[4], Din = *(int *)args[5], Dout = *(int *)args[6];
+    if (f->use_wmma && f->gemm_wmma && (Dout % 16 == 0) && (Din % 16 == 0)) {
+        hipDeviceptr_t Y = *(hipDeviceptr_t *)args[0];
+        hipDeviceptr_t X = *(hipDeviceptr_t *)args[1];
+        hipDeviceptr_t W = *(hipDeviceptr_t *)args[2];
+        hipDeviceptr_t B = *(hipDeviceptr_t *)args[3];
+        void *wa[] = { &Y, &W, &X, &B, &Dout, &Din, &N };
+        unsigned gx = (unsigned)((Dout + 127) / 128);
+        unsigned gy = (unsigned)((N + 127) / 128);
+        return hipModuleLaunchKernel(f->gemm_wmma, gx, gy, 1, 256, 1, 1,
+                                     0, 0, wa, NULL) == hipSuccess ? 0 : -1;
+    }
+    unsigned gx = (unsigned)((N + 15) / 16), gy = (unsigned)((Dout + 15) / 16);
+    return hipModuleLaunchKernel(f->gemm, gx, gy, 1, 16, 16, 1, 0, 0,
+                                 args, NULL) == hipSuccess ? 0 : -1;
 }
 
 static int cs3d_slatdit_alloc_(hipDeviceptr_t *out, size_t bytes, size_t *tot)
@@ -108,7 +146,7 @@ int cs3d_slatdit_block_forward(const cs3d_slatdit_fns *f, cs3d_slatdit_block_ws 
     if (hipMemcpyDtoD(ws->t_silu, d_t_emb, (size_t)dim * sizeof(float)) != hipSuccess) return -1;
     { void *a[] = { &ws->t_silu, &dim }; if (hipModuleLaunchKernel(f->silu, (dim+255)/256,1,1,256,1,1,0,0,a,NULL) != hipSuccess) return -1; }
     { unsigned gx=1, gy=(six_dim+15)/16; void *a[] = { &ws->mod6, &ws->t_silu, (void *)&bd->adaln_w, (void *)&bd->adaln_b, &one, &dim, &six_dim };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     hipDeviceptr_t d_shift_msa = ws->mod6 + (size_t)0 * dim * sizeof(float);
     hipDeviceptr_t d_scale_msa = ws->mod6 + (size_t)1 * dim * sizeof(float);
     hipDeviceptr_t d_gate_msa  = ws->mod6 + (size_t)2 * dim * sizeof(float);
@@ -119,7 +157,7 @@ int cs3d_slatdit_block_forward(const cs3d_slatdit_fns *f, cs3d_slatdit_block_ws 
     { void *a[] = { &ws->h, &d_x, &d_shift_msa, &d_scale_msa, &N, &dim, &eps };
       if (hipModuleLaunchKernel(f->mod_ln, N,1,1,threads,1,1,(unsigned)ln_smem,0,a,NULL) != hipSuccess) return -1; }
     { unsigned gx=(N+15)/16, gy=(qkv_dim+15)/16; void *a[] = { &ws->qkv, &ws->h, (void *)&bd->sa_qkv_w, (void *)&bd->sa_qkv_b, &N, &dim, &qkv_dim };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     { void *a[] = { &ws->qkv, (void *)&bd->sa_q_rms_gamma, &N, &H, &D_h, &qkv_dim };
       if (hipModuleLaunchKernel(f->mhrms, H,N,1,64,1,1,(unsigned)rms_smem,0,a,NULL) != hipSuccess) return -1;
       hipDeviceptr_t kptr = ws->qkv + (size_t)dim * sizeof(float); void *ak[] = { &kptr, (void *)&bd->sa_k_rms_gamma, &N, &H, &D_h, &qkv_dim };
@@ -129,33 +167,33 @@ int cs3d_slatdit_block_forward(const cs3d_slatdit_fns *f, cs3d_slatdit_block_ws 
     { void *a[] = { &ws->sa, &ws->q, &ws->k, &ws->v, &N, &N, &H, &D_h, &attn_scale };
       if (hipModuleLaunchKernel(f->sdpa, N,H,1,256,1,1,(unsigned)sdpa_self_smem,0,a,NULL) != hipSuccess) return -1; }
     { unsigned gx=(N+15)/16, gy=(dim+15)/16; void *a[] = { &ws->proj, &ws->sa, (void *)&bd->sa_out_w, (void *)&bd->sa_out_b, &N, &dim, &dim };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     { void *a[] = { &d_x, &ws->proj, &d_gate_msa, &N, &dim };
       if (hipModuleLaunchKernel(f->gated, (n_elem+255)/256,1,1,256,1,1,0,0,a,NULL) != hipSuccess) return -1; }
 
     { void *a[] = { &ws->h, &d_x, (void *)&bd->norm2_w, (void *)&bd->norm2_b, &N, &dim, &eps, &affine };
       if (hipModuleLaunchKernel(f->ln, N,1,1,threads,1,1,(unsigned)ln_smem,0,a,NULL) != hipSuccess) return -1; }
     { unsigned gx=(N+15)/16, gy=(dim+15)/16; void *a[] = { &ws->q, &ws->h, (void *)&bd->xa_q_w, (void *)&bd->xa_q_b, &N, &dim, &dim };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     { unsigned gx=(Nc+15)/16, gy=(kv_dim+15)/16; void *a[] = { &ws->kv, &d_cond, (void *)&bd->xa_kv_w, (void *)&bd->xa_kv_b, &Nc, &dim, &kv_dim };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     { void *a[] = { &ws->K, &ws->V, &ws->kv, &Nc, &dim };
       if (hipModuleLaunchKernel(f->kv_split, (n_cd+255)/256,1,1,256,1,1,0,0,a,NULL) != hipSuccess) return -1; }
     { void *a[] = { &ws->xa, &ws->q, &ws->K, &ws->V, &N, &Nc, &H, &D_h, &attn_scale };
       if (hipModuleLaunchKernel(f->sdpa, N,H,1,256,1,1,(unsigned)sdpa_cross_smem,0,a,NULL) != hipSuccess) return -1; }
     { unsigned gx=(N+15)/16, gy=(dim+15)/16; void *a[] = { &ws->proj, &ws->xa, (void *)&bd->xa_out_w, (void *)&bd->xa_out_b, &N, &dim, &dim };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     { void *a[] = { &d_x, &ws->proj, &n_elem };
       if (hipModuleLaunchKernel(f->resadd, (n_elem+255)/256,1,1,256,1,1,0,0,a,NULL) != hipSuccess) return -1; }
 
     { void *a[] = { &ws->h, &d_x, &d_shift_mlp, &d_scale_mlp, &N, &dim, &eps };
       if (hipModuleLaunchKernel(f->mod_ln, N,1,1,threads,1,1,(unsigned)ln_smem,0,a,NULL) != hipSuccess) return -1; }
     { unsigned gx=(N+15)/16, gy=(hidden+15)/16; void *a[] = { &ws->mh, &ws->h, (void *)&bd->mlp_fc1_w, (void *)&bd->mlp_fc1_b, &N, &dim, &hidden };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     { void *a[] = { &ws->mh, &n_mh };
       if (hipModuleLaunchKernel(f->gelu, (n_mh+255)/256,1,1,256,1,1,0,0,a,NULL) != hipSuccess) return -1; }
     { unsigned gx=(N+15)/16, gy=(dim+15)/16; void *a[] = { &ws->mh2, &ws->mh, (void *)&bd->mlp_fc2_w, (void *)&bd->mlp_fc2_b, &N, &hidden, &dim };
-      if (hipModuleLaunchKernel(f->gemm, gx,gy,1,16,16,1,0,0,a,NULL) != hipSuccess) return -1; }
+      if (slatdit_gemm(f, a) != 0) return -1; }
     { void *a[] = { &d_x, &ws->mh2, &d_gate_mlp, &N, &dim };
       if (hipModuleLaunchKernel(f->gated, (n_elem+255)/256,1,1,256,1,1,0,0,a,NULL) != hipSuccess) return -1; }
     return 0;
