@@ -6072,6 +6072,7 @@ struct cuda_llm_runner {
     CUdeviceptr d_fa2_o_f16; /* [max_tokens * max_dim_h] F16 for FA2 O output / d512 F32 scores */
     CUdeviceptr d_fa2_scores_f16; /* [sq * total_s] F16 score matrix for cuBLAS-d512 attention */
     int fa2_buf_max_s; /* token capacity the d_fa2_* buffers were sized for */
+    size_t d512_cap_elems; /* effective per-chunk score-matrix cap (elems) the d_fa2_* buffers were sized for; the d512 attn loop must use this exact value to chunk so it never overflows the buffer */
     CUdeviceptr d_swa_k_lin; /* [n_tokens * kv_dim] F16 linear K for batched windowed SWA prefill */
     CUdeviceptr d_swa_v_lin; /* [n_tokens * kv_dim] F16 linear V */
     int swa_lin_max_tokens;  /* token capacity the d_swa_*_lin buffers were sized for */
@@ -11538,9 +11539,32 @@ static void launch_fa2_attention_swa(cuda_llm_runner *r, CUdeviceptr out, CUdevi
                          head_dim, kv_dim, adj_scale, 0);
 }
 
+/* cuBLAS-d512 score scratch cap (elements): the [gqa*q_chunk x total_s] score
+ * matrix is bounded to this many elements by chunking the query dim. Without
+ * chunking, n_heads*N^2 is 4 GB+ at N=8192 and fails to allocate. Used as the
+ * ceiling both here and in the FA2 buffer sizing in cuda_llm_prefill.
+ * 16M elems = 64 MB F32 + 32 MB F16 score scratch (+128 MB Q). On a 16 GB card
+ * at 8192 tokens this leaves cuBLAS ~1 GB free for its on-demand GEMM workspace;
+ * a bigger cap (>=64M -> >=512 MB scratch) starves cuBLAS off the tensor-core
+ * path and the prefill collapses (>200s vs 5.5s). Chunking finer than this costs
+ * nothing measurable (8192 prefill: 16M=1483, 32M=1469 tok/s). The adaptive
+ * clamp in cuda_llm_prefill lowers it further when free memory is tighter. */
+#define D512_SCORE_CAP_ELEMS_DEFAULT ((size_t)16 * 1024 * 1024)
+/* Env override (in elements) lets tests force chunking at small n_tokens to
+ * validate the chunk-boundary math against the sequential path, or raise the
+ * cap on cards with more spare memory. */
+static size_t d512_score_cap_elems(void) {
+    const char *e = getenv("CUDA_LLM_D512_CAP");
+    if (e) { long v = atol(e); if (v > 0) return (size_t)v; }
+    return D512_SCORE_CAP_ELEMS_DEFAULT;
+}
+#define D512_SCORE_CAP_ELEMS (d512_score_cap_elems())
+
 /* ---- cuBLAS-based D=512 attention: per-KV-head GEMM + softmax + GEMM ---- */
 /* Q_batch: F32 [n_tokens * q_dim]. K/V cache: F16 [max_seq_len * kv_dim].
-   Uses cuBLAS F16 GEMM for Q@K^T and P@V with custom causal softmax. */
+   Uses cuBLAS F16 GEMM for Q@K^T and P@V with custom causal softmax.
+   The query dim is processed in chunks so the materialized score matrix stays
+   bounded (D512_SCORE_CAP_ELEMS) regardless of n_tokens. */
 static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
                                           CUdeviceptr key_cache, CUdeviceptr value_cache,
                                           int n_tokens, int start_pos, int n_heads, int n_kv_heads,
@@ -11548,10 +11572,9 @@ static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CU
     if (!r->cublas || !r->fn_fa2_attn_256 || !r->d_fa2_q_f16 || !r->d_fa2_scores_f16) return;
     int gqa = n_heads / n_kv_heads;
     int q_dim = n_heads * head_dim;
-    int sq = gqa * n_tokens;
     int total_s = start_pos + n_tokens;
-    
-    /* Convert Q batch F32 to F16 */
+
+    /* Convert the full Q batch F32 -> F16 once */
     int n_q = n_tokens * q_dim;
     CUdeviceptr q_f16 = r->d_fa2_q_f16;
     {
@@ -11559,43 +11582,59 @@ static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CU
         cuLaunchKernel(r->fn_convert_f32_to_f16, (n_q+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
     }
 
-    /* Scores scratch: F32 [sq * total_s] - reuse d_fa2_o_f16 as F32 */
+    /* Scores scratch: F32 [chunk_sq * total_s] (d_fa2_o_f16) + F16 copy
+     * (d_fa2_scores_f16). Both sized for one query-chunk in cuda_llm_prefill. */
     CUdeviceptr scores = r->d_fa2_o_f16;
+    CUdeviceptr scores_f16 = r->d_fa2_scores_f16;
 
-    /* Per KV head: GEMM, softmax, GEMM */
+    /* Chunk the query (token) dim so gqa*q_chunk*total_s <= cap. Computed with
+     * n_heads (worst-case gqa) and r->d512_cap_elems — the SAME cap the buffers
+     * were sized for in cuda_llm_prefill — so it matches the allocation exactly. */
+    size_t cap = r->d512_cap_elems ? r->d512_cap_elems : D512_SCORE_CAP_ELEMS;
+    int q_chunk = (int)(cap / ((size_t)n_heads * (size_t)total_s));
+    if (q_chunk < 1) q_chunk = 1;
+    if (q_chunk > n_tokens) q_chunk = n_tokens;
+
+    /* Per KV head: chunked GEMM, softmax, GEMM */
     for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
-        /* Q_group: F16 [sq, head_dim] */
+        /* Q_group base: F16 [gqa*n_tokens, head_dim] for this kv-head */
         CUdeviceptr qg = q_f16 + (size_t)kv_h * gqa * head_dim * sizeof(uint16_t);
-        
-        /* K_head: F16 [total_s, head_dim] (interleaved stride = kv_dim) */
+        /* K/V_head: F16 [total_s, head_dim] (interleaved stride = kv_dim) */
         CUdeviceptr k_head = key_cache + (size_t)kv_h * head_dim * sizeof(uint16_t);
-        
-        /* Step 1: cuBLAS F16 GEMM: Q_group @ K^T -> scores [sq, total_s] F32 */
-        cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, scores, k_head, qg,
-                                               sq, total_s, head_dim);
-        
-        /* Step 2: Causal softmax on scores */
-        {
-            void *args[] = { &scores, &sq, &total_s, &start_pos, &gqa };
-            cuLaunchKernel(r->fn_causal_softmax_f32, sq, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-        }
-        
-        /* Step 3: cuBLAS F16 GEMM: P' @ V -> output [sq, head_dim] F32 */
-        /* scores are F32, but cuBLAS needs F16. Convert into a DEDICATED F16 scores
-         * buffer — reusing q_f16 here corrupts the Q of later kv-heads (n_scores
-         * far exceeds one head's Q span at large n_tokens). */
-        CUdeviceptr scores_f16 = r->d_fa2_scores_f16;
-        {
-            int n_scores = sq * total_s;
-            void *args[] = { &scores_f16, &scores, &n_scores };
-            cuLaunchKernel(r->fn_convert_f32_to_f16, (n_scores+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-        }
-
         CUdeviceptr v_head = value_cache + (size_t)kv_h * head_dim * sizeof(uint16_t);
         CUdeviceptr out_group = out + (size_t)kv_h * gqa * head_dim * sizeof(float);
-        /* P(F16) @ V(F16)^T -> output F32: cublas computes C = A @ B^T */
-        cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, out_group, v_head, scores_f16,
-                                               sq, head_dim, total_s);
+
+        for (int q0 = 0; q0 < n_tokens; q0 += q_chunk) {
+            int qc = n_tokens - q0;
+            if (qc > q_chunk) qc = q_chunk;
+            int chunk_sq = qc * gqa;
+            /* Rows for tokens [q0, q0+qc) are contiguous in qg (token is outer dim) */
+            CUdeviceptr qg_c = qg + (size_t)q0 * gqa * head_dim * sizeof(uint16_t);
+
+            /* Step 1: Q_chunk @ K^T -> scores [chunk_sq, total_s] F32 */
+            cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, scores, k_head, qg_c,
+                                                   chunk_sq, total_s, head_dim);
+
+            /* Step 2: causal softmax. Pass start_pos+q0 so each chunk row's
+             * kv_lim = (start_pos+q0) + local_tok + 1 = correct absolute limit. */
+            {
+                int sp = start_pos + q0;
+                void *args[] = { &scores, &chunk_sq, &total_s, &sp, &gqa };
+                cuLaunchKernel(r->fn_causal_softmax_f32, chunk_sq, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            }
+
+            /* Step 3: F32 scores -> F16 (cuBLAS needs F16 input) */
+            {
+                int n_scores = chunk_sq * total_s;
+                void *args[] = { &scores_f16, &scores, &n_scores };
+                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_scores+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            }
+
+            /* Step 4: P(F16) @ V(F16)^T -> out [chunk_sq, head_dim] F32 */
+            CUdeviceptr out_c = out_group + (size_t)q0 * gqa * head_dim * sizeof(float);
+            cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, out_c, v_head, scores_f16,
+                                                   chunk_sq, head_dim, total_s);
+        }
     }
 }
 
@@ -12528,25 +12567,59 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     if (r->fn_fa2_attn_256 && n_tokens > 0 &&
         (!r->d_fa2_q_f16 || n_tokens > r->fa2_buf_max_s)) {
         /* These buffers double as the cuBLAS-d512 attention scratch:
-         *   d_fa2_o_f16 holds the F32 score matrix [sq x total_s] for ONE kv-head,
-         *   d_fa2_q_f16 holds the F16 Q AND is reused as the F16 score matrix.
-         * sq = gqa * n_tokens and gqa peaks at n_heads (kv_heads=1 layers, e.g.
-         * Gemma4 layer 5), so the score matrix is up to n_heads*n_tokens*total_s.
-         * An undersized buffer makes the attention GEMM write out of bounds. */
+         *   d_fa2_q_f16      holds the F16 Q [n_tokens x q_dim] (also FA2's Q),
+         *   d_fa2_o_f16      holds the F32 score matrix for ONE query-chunk (also
+         *                    FA2's F16 output),
+         *   d_fa2_scores_f16 holds the F16 copy of that score matrix.
+         * cuBLAS-d512 chunks the query dim so the score matrix is
+         * gqa*q_chunk*total_s (<= D512_SCORE_CAP_ELEMS), NOT gqa*n_tokens*total_s
+         * which is 4 GB+ at n_tokens=8192. q_chunk is recomputed identically in
+         * launch_cublas_d512_attention. An undersized buffer makes the GEMM
+         * write out of bounds. */
         int max_hd = (n_heads * r->head_dim_full) > (n_heads * r->head_dim_swa) ?
                       (n_heads * r->head_dim_full) : (n_heads * r->head_dim_swa);
         int max_s = n_tokens > 128 ? n_tokens : 128;
         size_t total_s = (size_t)start_pos + max_s;
-        size_t score_elems = (size_t)n_heads * max_s * total_s;       /* worst-case gqa=n_heads */
-        size_t q_bytes = (size_t)max_s * max_hd * sizeof(uint16_t);   /* converted Q */
-        if (score_elems * sizeof(uint16_t) > q_bytes) q_bytes = score_elems * sizeof(uint16_t);
-        size_t o_bytes = score_elems * sizeof(float);                 /* F32 scores */
-        if ((size_t)max_s * max_hd * sizeof(uint16_t) > o_bytes) o_bytes = (size_t)max_s * max_hd * sizeof(uint16_t);
-        size_t sc_bytes = score_elems * sizeof(uint16_t);             /* F16 scores (separate from Q) */
+        size_t q_bytes = (size_t)max_s * max_hd * sizeof(uint16_t);   /* converted Q (full) */
+
+        /* Free the old buffers first so their bytes count as free memory. */
         if (r->d_fa2_q_f16) { cuMemFree(r->d_fa2_q_f16); r->d_fa2_q_f16 = 0; }
         if (r->d_fa2_o_f16) { cuMemFree(r->d_fa2_o_f16); r->d_fa2_o_f16 = 0; }
         if (r->d_fa2_scores_f16) { cuMemFree(r->d_fa2_scores_f16); r->d_fa2_scores_f16 = 0; }
         r->fa2_buf_max_s = 0;
+
+        /* Effective per-chunk score cap: the hard ceiling (env/default), further
+         * clamped by free GPU memory. The score scratch is o(F32)+sc(F16) = 6
+         * bytes/elem; we must leave a workspace margin free or cuBLAS's GEMMs fall
+         * off the tensor-core path onto a pathological no-workspace algorithm
+         * (measured: 8192-tok prefill 1483 -> <40 tok/s). q_chunk is recomputed
+         * from r->d512_cap_elems in launch_cublas_d512_attention to match exactly. */
+        size_t cap = D512_SCORE_CAP_ELEMS;
+        size_t free_b = 0, total_b = 0;
+        if (cuMemGetInfo(&free_b, &total_b) == CUDA_SUCCESS && free_b > 0) {
+            /* Only shrink below the ceiling to keep the d512 scratch ALLOC itself
+             * from failing (and disabling d512 -> slow fallback). The ceiling
+             * already bounds the scratch small enough to leave cuBLAS its GEMM
+             * workspace; this margin just covers buffers allocated later in the
+             * layer loop (d_f16_scratch + d_batch_f16_scratch ~0.5 GB). Keep it
+             * small so the common 8192 case stays at the ceiling (q_chunk~128)
+             * rather than over-chunking to q_chunk=1. */
+            const size_t margin = (size_t)512 * 1024 * 1024;
+            size_t reserve = q_bytes + margin;
+            size_t avail = free_b > reserve ? free_b - reserve : 0;
+            size_t cap_mem = avail / 6; /* 4 (F32) + 2 (F16) bytes per score elem */
+            if (cap_mem < cap) cap = cap_mem;
+            if (cap < (size_t)n_heads * total_s) cap = (size_t)n_heads * total_s; /* >=1 query token/chunk */
+        }
+        r->d512_cap_elems = cap;
+
+        int q_chunk = (int)(cap / ((size_t)n_heads * total_s));
+        if (q_chunk < 1) q_chunk = 1;
+        if (q_chunk > max_s) q_chunk = max_s;
+        size_t score_elems = (size_t)n_heads * q_chunk * total_s;     /* one chunk, worst-case gqa=n_heads */
+        size_t o_bytes = score_elems * sizeof(float);                 /* F32 scores (chunked) */
+        if (q_bytes > o_bytes) o_bytes = q_bytes;                     /* FA2 reuses d_fa2_o_f16 as F16 output */
+        size_t sc_bytes = score_elems * sizeof(uint16_t);             /* F16 scores (separate from Q) */
         if (cuMemAlloc(&r->d_fa2_q_f16, q_bytes) != CUDA_SUCCESS)
             r->d_fa2_q_f16 = 0;
         if (cuMemAlloc(&r->d_fa2_o_f16, o_bytes) != CUDA_SUCCESS)
@@ -12555,8 +12628,8 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             r->d_fa2_scores_f16 = 0;
         if (r->d_fa2_q_f16 && r->d_fa2_o_f16 && r->d_fa2_scores_f16) r->fa2_buf_max_s = max_s;
         if (r->verbose >= 1)
-            fprintf(stderr, "cuda_llm: FA2 F16 buffers allocated (max_tok=%d, q=%.1fMB, o=%.1fMB, %s)\n",
-                    max_s, q_bytes/1048576.0, o_bytes/1048576.0,
+            fprintf(stderr, "cuda_llm: FA2 F16 buffers allocated (max_tok=%d, q=%.1fMB, o=%.1fMB, q_chunk=%d, %s)\n",
+                    max_s, q_bytes/1048576.0, o_bytes/1048576.0, q_chunk,
                     (r->d_fa2_q_f16 && r->d_fa2_o_f16) ? "OK" : "FAIL");
     }
     /* Linear F16 K/V scratch for batched windowed SWA prefill (start_pos==0,
