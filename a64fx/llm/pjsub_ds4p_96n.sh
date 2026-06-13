@@ -16,7 +16,7 @@
 #PJM -L "rscgrp=small-s2,node=4x4x6:torus,elapse=02:00:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
 #PJM --mpi "proc=96"
-#PJM --llio localtmp-size=30Gi
+#PJM --llio localtmp-size=64Gi
 #PJM -x PJM_LLIO_GFSCACHE=/vol0004
 #PJM -j
 set -eu
