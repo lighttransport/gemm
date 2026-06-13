@@ -42,7 +42,13 @@ void fa2_attn_f(dt_t *O,
                 const dt_t *K,
                 const dt_t *V,
                 int S, int D_in, int hstride_q, int hstride_kv, int gqa_ratio, float scale,
-                int window) {
+                int window, int n_q, int q_off) {
+    /* n_q   = number of query rows in Q/O (queries are rows [0, n_q)).
+     * q_off = global position of query row 0 (query row gqr sits at position
+     *         q_off+gqr); keys are [0, S). For start_pos==0 prefill n_q==S and
+     *         q_off==0, byte-identical to the original single-S kernel. q_off>0
+     *         lets a chunk's queries attend a [history ++ chunk] key buffer
+     *         (chunked long-context prefill). */
     const float LOG2E = 1.4426950408889634f;
     float lscale = scale * LOG2E;
     int bh = blockIdx.y;
@@ -64,8 +70,10 @@ void fa2_attn_f(dt_t *O,
     uint32_t qfrag[FA2_DK][4];
     int gqr_a = warp_q0 + row_a;
     int gqr_b = warp_q0 + row_b;
-    int valid_a = (gqr_a < S);
-    int valid_b = (gqr_b < S);
+    int gpos_a = gqr_a + q_off;  /* global query positions for causal/window mask */
+    int gpos_b = gqr_b + q_off;
+    int valid_a = (gqr_a < n_q);
+    int valid_b = (gqr_b < n_q);
     for (int kk = 0; kk < FA2_DK; kk++) {
         int kbase = kk * 16;
         const dt_t *qa_lo = Qh + (size_t)gqr_a * hstride_q + kbase + col_g;
@@ -95,16 +103,17 @@ void fa2_attn_f(dt_t *O,
 
     int s_eff = S;
 #if FA2_CAUSAL
-    int q_blk_max = blockIdx.x * FA2_BR + FA2_BR;
+    /* Largest key any query in this block attends = q_off + block's max query. */
+    int q_blk_max = q_off + blockIdx.x * FA2_BR + FA2_BR;
     if (q_blk_max < s_eff) s_eff = q_blk_max;
 #endif
     int n_tiles = (s_eff + FA2_BC - 1) / FA2_BC;
     /* Sliding window: skip tiles entirely below the smallest query's lower bound.
-     * The smallest query in this block is blockIdx.x*FA2_BR. window=0 -> t_lo=0
-     * (causal path byte-identical). */
+     * The smallest query in this block sits at position q_off + blockIdx.x*FA2_BR.
+     * window=0 -> t_lo=0 (causal path byte-identical). */
     int t_lo = 0;
     if (window > 0) {
-        int klo = blockIdx.x * FA2_BR - window + 1;
+        int klo = q_off + blockIdx.x * FA2_BR - window + 1;
         if (klo > 0) t_lo = klo / FA2_BC;
     }
 
@@ -193,12 +202,12 @@ void fa2_attn_f(dt_t *O,
             int va0 = (kv_c0 < S), va1 = (kv_c1 < S);
             int vb0 = va0, vb1 = va1;
 #if FA2_CAUSAL
-            va0 = va0 && (kv_c0 <= gqr_a); va1 = va1 && (kv_c1 <= gqr_a);
-            vb0 = vb0 && (kv_c0 <= gqr_b); vb1 = vb1 && (kv_c1 <= gqr_b);
+            va0 = va0 && (kv_c0 <= gpos_a); va1 = va1 && (kv_c1 <= gpos_a);
+            vb0 = vb0 && (kv_c0 <= gpos_b); vb1 = vb1 && (kv_c1 <= gpos_b);
             /* Sliding-window lower bound: query q attends only to keys (q-window, q]. */
             if (window > 0) {
-                va0 = va0 && (kv_c0 > gqr_a - window); va1 = va1 && (kv_c1 > gqr_a - window);
-                vb0 = vb0 && (kv_c0 > gqr_b - window); vb1 = vb1 && (kv_c1 > gqr_b - window);
+                va0 = va0 && (kv_c0 > gpos_a - window); va1 = va1 && (kv_c1 > gpos_a - window);
+                vb0 = vb0 && (kv_c0 > gpos_b - window); vb1 = vb1 && (kv_c1 > gpos_b - window);
             }
 #endif
             sfrag[nn][0] = va0 ? sfrag[nn][0] * lscale : -1e30f;
@@ -282,11 +291,11 @@ void fa2_attn_f(dt_t *O,
     float inv_b = (l_b > 0.0f) ? 1.0f / l_b : 0.0f;
     for (int nn = 0; nn < FA2_DN; nn++) {
         int d_col = nn * 8 + col_g;
-        if (gqr_a < S) {
+        if (gqr_a < n_q) {
             Oh[(size_t)gqr_a * hstride_q + d_col + 0] = f2dt(ofrag[nn][0] * inv_a);
             Oh[(size_t)gqr_a * hstride_q + d_col + 1] = f2dt(ofrag[nn][1] * inv_a);
         }
-        if (gqr_b < S) {
+        if (gqr_b < n_q) {
             Oh[(size_t)gqr_b * hstride_q + d_col + 0] = f2dt(ofrag[nn][2] * inv_b);
             Oh[(size_t)gqr_b * hstride_q + d_col + 1] = f2dt(ofrag[nn][3] * inv_b);
         }
