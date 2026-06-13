@@ -75,11 +75,27 @@ static void print_first_n(const char *label, const float *v, int n, int show) {
  * + scalar matvec on identical random raw bytes. */
 typedef void (*deq_row_fn)(const void *src, float *dst, int n);
 
+static void dequantize_row_q8_0_padded(const void *src, float *dst, int n) {
+    const unsigned char *p = (const unsigned char *)src;
+    int nb = n / 32;
+    for (int b = 0; b < nb; b++) {
+        const unsigned char *bp = p + (size_t)b * 36;
+        uint16_t dh;
+        memcpy(&dh, bp, sizeof(dh));
+        float d = ggml_fp16_to_fp32(dh);
+        const signed char *qs = (const signed char *)(bp + 4);
+        for (int i = 0; i < 32; i++) dst[b * 32 + i] = d * (float)qs[i];
+    }
+}
+
 static int quant_type_from_name(const char *s) {
     if (!s) return -1;
+    if (strcmp(s, "Q2_K") == 0)    return GGML_TYPE_Q2_K;
+    if (strcmp(s, "Q3_K") == 0)    return GGML_TYPE_Q3_K;
     if (strcmp(s, "Q4_K") == 0)    return GGML_TYPE_Q4_K;
     if (strcmp(s, "Q5_K") == 0)    return GGML_TYPE_Q5_K;
     if (strcmp(s, "Q6_K") == 0)    return GGML_TYPE_Q6_K;
+    if (strcmp(s, "Q8_0") == 0)    return GGML_TYPE_Q8_0;
     if (strcmp(s, "Q4_0") == 0)    return GGML_TYPE_Q4_0;
     if (strcmp(s, "Q4_1") == 0)    return GGML_TYPE_Q4_1;
     if (strcmp(s, "Q5_0") == 0)    return GGML_TYPE_Q5_0;
@@ -106,9 +122,12 @@ static int run_verify_quant_kernels(void) {
     if (!r) { fprintf(stderr, "hip_llm_init failed\n"); return 1; }
 
     struct { int type; const char *name; deq_row_fn fn; } cases[] = {
+        { GGML_TYPE_Q2_K,    "Q2_K",    dequantize_row_q2_K    },
+        { GGML_TYPE_Q3_K,    "Q3_K",    dequantize_row_q3_K    },
         { GGML_TYPE_Q4_K,    "Q4_K",    dequantize_row_q4_K    },
         { GGML_TYPE_Q5_K,    "Q5_K",    dequantize_row_q5_K    },
         { GGML_TYPE_Q6_K,    "Q6_K",    dequantize_row_q6_K    },
+        { GGML_TYPE_Q8_0,    "Q8_0",    dequantize_row_q8_0_padded },
         { GGML_TYPE_Q4_0,    "Q4_0",    dequantize_row_q4_0    },
         { GGML_TYPE_Q4_1,    "Q4_1",    dequantize_row_q4_1    },
         { GGML_TYPE_Q5_0,    "Q5_0",    dequantize_row_q5_0    },
