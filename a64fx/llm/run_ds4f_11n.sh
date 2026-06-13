@@ -91,6 +91,19 @@ export DS4F_DENSE_MXFP4=${DS4F_DENSE_MXFP4:-0}
 # the per-group o-proj fallback OPROJ_FUSE=0 is auto-overridden to fused for Q8 -- ds4f_row_slice
 # can't slice the int8 layout.)
 export DS4F_Q8_DENSE=${DS4F_Q8_DENSE:-0}
+# DS4F_HC_PAR=1 parallelizes the mHC hc_pre/hc_post collapse/expand across the thread
+# pool (was ~serial-scalar on tid0, the "other" phase). BIT-EXACT (disjoint per-stream/
+# per-dim splits): real-weight 11n gen A/B TOKEN-IDENTICAL on vs off (64/64, NaNs=0,
+# lockstep, 2026-06-11). Only active under DS4F_MHC=1; decode "other" 51.1->30.5 ms =>
+# 9.46->11.80 tok/s (+24.7%). Default OFF here (clean reference); perf wrappers default ON.
+export DS4F_HC_PAR=${DS4F_HC_PAR:-0}
+# DS4F_HC_RMSPAR=1 (WS1b) folds the mHC RMS sum-of-squares INTO the mixes-matvec dispatch,
+# killing the ~89us/call serial tid0 double-reduction (~35% of the post-HC_PAR "other").
+# ss stays a double accumulation, so the parallel reassociation (~1e-13) is below the float
+# rsq epsilon => BIT-IDENTICAL result: real-weight 11n gen A/B TOKEN-IDENTICAL on vs off
+# (64/64, NaNs=0, lockstep, 2026-06-11). Only active under DS4F_MHC=1; decode "other"
+# 30.5->24.1 ms => 11.80->12.77 tok/s (+8.2%). Default OFF here (clean ref); perf wrappers ON.
+export DS4F_HC_RMSPAR=${DS4F_HC_RMSPAR:-0}
 # DS4F_SPARSE=1 enables the Stage-4 synthetic lightning-indexer attention: on
 # sparse layers (compress_ratios[L]!=0) with nP>index_topk, a cheap compressed
 # index selects topk positions and weighted-V runs over them only. Dense layers

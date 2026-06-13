@@ -3,14 +3,19 @@
  * #included at the end of ds4f.h after all public types are defined.
  * Do not #include this directly — include "ds4f.h". */
 
+/* DS4F_FLAGBAR: per-worker completion flag on its own cache line (kills the 47-way
+ * fetch_add contention of the centralized `done` counter; main spins on distinct lines). */
+typedef struct { _Atomic int v; char pad[64 - sizeof(_Atomic int)]; } ds4f_cacheline;
 struct ds4f_pool {
     int nthr, n_cmgs;
     pthread_t *threads;
     _Atomic int seq;
-    _Atomic int done;
+    _Atomic int done;            /* counter barrier (flagbar=0) */
     _Atomic int stop;
     ds4f_fn fn;
     void *arg;
+    ds4f_cacheline *donef;       /* per-worker flags (flagbar=1): donef[tid].v = last seq run */
+    int flagbar;                 /* DS4F_FLAGBAR, resolved once at pool_start */
 };
 
 #if defined(__aarch64__) && defined(__linux__)
@@ -43,7 +48,10 @@ static void *ds4f_worker(void *v) {
         if (atomic_load_explicit(&p->stop, memory_order_acquire)) break;
         last = atomic_load_explicit(&p->seq, memory_order_acquire);
         if (p->fn) p->fn(p->arg, tid, p->nthr);
-        atomic_fetch_add_explicit(&p->done, 1, memory_order_release);
+        if (p->flagbar)
+            atomic_store_explicit(&p->donef[tid].v, last, memory_order_release);  /* own cache line */
+        else
+            atomic_fetch_add_explicit(&p->done, 1, memory_order_release);
     }
     free(w);
     return NULL;
@@ -53,6 +61,9 @@ static ds4f_pool *ds4f_pool_start(int nthr, int n_cmgs) {
     ds4f_pool *p = (ds4f_pool *)calloc(1, sizeof(*p));
     p->nthr = nthr; p->n_cmgs = n_cmgs;
     atomic_store(&p->seq, 0); atomic_store(&p->done, 0); atomic_store(&p->stop, 0);
+    { const char *e = getenv("DS4F_FLAGBAR"); p->flagbar = e ? atoi(e) : 0; }
+    p->donef = (ds4f_cacheline *)aligned_alloc(64, (size_t)nthr * sizeof(ds4f_cacheline));
+    for (int t = 0; t < nthr; t++) atomic_store_explicit(&p->donef[t].v, 0, memory_order_relaxed);
     p->threads = (pthread_t *)calloc(nthr, sizeof(pthread_t));
     for (int t = 1; t < nthr; t++) {   /* main thread acts as tid 0 */
         ds4f_wctx *w = (ds4f_wctx *)malloc(sizeof(*w));
@@ -65,17 +76,29 @@ static ds4f_pool *ds4f_pool_start(int nthr, int n_cmgs) {
 
 static void ds4f_pool_run(ds4f_pool *p, ds4f_fn fn, void *arg) {
     p->fn = fn; p->arg = arg;
-    atomic_store_explicit(&p->done, 0, memory_order_relaxed);
-    atomic_fetch_add_explicit(&p->seq, 1, memory_order_release);
-    fn(arg, 0, p->nthr);                /* main = tid 0 */
-    while (atomic_load_explicit(&p->done, memory_order_acquire) < p->nthr - 1)
-        ds4f_relax();
+    if (p->flagbar) {
+        /* seq is single-producer (main only) -> load+1+store is race-free. Workers write
+         * donef[tid]=this seq when done; main waits each distinct line -> no shared-counter
+         * contention. Bit-identical to the counter path (same fn, same per-worker work). */
+        int s = atomic_load_explicit(&p->seq, memory_order_relaxed) + 1;
+        atomic_store_explicit(&p->seq, s, memory_order_release);
+        fn(arg, 0, p->nthr);            /* main = tid 0 */
+        for (int t = 1; t < p->nthr; t++)
+            while (atomic_load_explicit(&p->donef[t].v, memory_order_acquire) != s)
+                ds4f_relax();
+    } else {
+        atomic_store_explicit(&p->done, 0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&p->seq, 1, memory_order_release);
+        fn(arg, 0, p->nthr);            /* main = tid 0 */
+        while (atomic_load_explicit(&p->done, memory_order_acquire) < p->nthr - 1)
+            ds4f_relax();
+    }
 }
 
 static void ds4f_pool_stop(ds4f_pool *p) {
     atomic_store_explicit(&p->stop, 1, memory_order_release);
     for (int t = 1; t < p->nthr; t++) pthread_join(p->threads[t], NULL);
-    free(p->threads); free(p);
+    free(p->threads); free(p->donef); free(p);
 }
 
 /* row split into 8-aligned blocks for worker tid of nthr */
@@ -182,7 +205,7 @@ static inline uint16_t ds4f_f32_bf16(float f){ uint32_t u; memcpy(&u,&f,4); retu
  * matvec_sdot_8row consumes. Deterministic (absmax + round-to-nearest via svcvt,
  * same on every rank => lockstep preserved). K must be a multiple of 64. Mirrors
  * transformer.h's tf_quant_x_sdot_blocks (the proven sibling implementation). */
-static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, uint16_t *xs) {
+static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, float *xs) {
     svbool_t pg = svptrue_b32();
     svint32_t qlo = svdup_s32(-127), qhi = svdup_s32(127);
     int nb = K / 64;
@@ -194,7 +217,9 @@ static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, uin
                                      svmax_x(pg, svabs_x(pg, v2), svabs_x(pg, v3)));
         float amax = svmaxv_f32(pg, mx);
         float scale = amax / 127.0f, inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-        xs[b] = ggml_fp32_to_fp16(scale);
+        xs[b] = scale;   /* WS6: fp32 scale. fp16 overflowed to +Inf for amax > 127*65504 (~8.3e6)
+                          * -> dequant sc=ws*Inf=Inf -> 0*Inf=NaN in zero-dot lanes. int8 xq unchanged
+                          * (inv is fp32) so this is a pure scale-precision/overflow fix. */
         svfloat32_t vinv = svdup_f32(inv);
         int8_t *q = xq + (size_t)b * 64;
         #define DS4F_QX(V, OFF) do {                                          \
@@ -208,14 +233,14 @@ static inline void ds4f_quant_x_sdot_into(const float *x, int K, int8_t *xq, uin
 }
 /* thread-local scratch for M-token activation quant (grow-on-demand) */
 static __thread int8_t   *ds4f_xq_buf = NULL;
-static __thread uint16_t *ds4f_xs_buf = NULL;
+static __thread float    *ds4f_xs_buf = NULL;   /* WS6: fp32 activation scale (was fp16 -> overflow NaN) */
 static __thread size_t    ds4f_xq_cap = 0;   /* in (M*K) int8 elems */
-static inline void ds4f_q8_xscratch(int M, int K, int8_t **xq, uint16_t **xs) {
+static inline void ds4f_q8_xscratch(int M, int K, int8_t **xq, float **xs) {
     size_t need = (size_t)M * K;
     if (need > ds4f_xq_cap) {
         free(ds4f_xq_buf); free(ds4f_xs_buf);
         ds4f_xq_buf = (int8_t *)malloc(need);
-        ds4f_xs_buf = (uint16_t *)malloc((size_t)M * (K / 64) * sizeof(uint16_t));
+        ds4f_xs_buf = (float *)malloc((size_t)M * (K / 64) * sizeof(float));
         ds4f_xq_cap = need;
     }
     *xq = ds4f_xq_buf; *xs = ds4f_xs_buf;
@@ -354,7 +379,7 @@ static void ds4f_mv_worker(void *arg, int tid, int nthr) {
          * per 8-row block (weight group L1-resident; ~1.03 B/elem from HBM). */
         const uint8_t *base = (const uint8_t *)t->w;
         size_t gb = (size_t)(K / 64) * 528;
-        int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
+        int8_t *xq; float *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
         ds4f_quant_x_sdot_into(x, K, xq, xs);
         for (int i = r0; i + 7 < r1; i += 8)
             matvec_sdot_8row(dst + i, base + (size_t)(i / 8) * gb, xq, xs, K);
@@ -408,6 +433,36 @@ static void ds4f_matvec(ds4f_model *m, float *dst, const ds4f_tensor *t, const f
     ds4f_pool_run(m->pool, ds4f_mv_worker, &T);
 }
 
+/* DS4F_MV_FUSE (WS2): run several INDEPENDENT matvecs in ONE pool_run so the thread
+ * wake + barrier is paid once instead of N times (decode does ~10 pool_run/layer; in-loop
+ * matvec BW is ~247 GB/s vs ~610 GB/s for the same matvec in isolation -> the gap is
+ * dispatch / serial-gap overhead, not the kernel). Each sub-matvec reuses ds4f_mv_worker
+ * with the IDENTICAL rowsplit8 + kernel + per-row dot order as a standalone ds4f_matvec
+ * => BIT-EXACT; only the barrier is shared. The CALLER must guarantee the list entries are
+ * mutually independent (no entry's x aliases another entry's dst). */
+static int ds4f_mv_fuse = -1;
+static inline int ds4f_mv_fuse_on(void) {
+    if (ds4f_mv_fuse < 0) { const char *e = getenv("DS4F_MV_FUSE"); ds4f_mv_fuse = e ? atoi(e) : 0; }
+    return ds4f_mv_fuse;
+}
+typedef struct { float *dst; const ds4f_tensor *t; const float *x; } ds4f_mv1;
+typedef struct { ds4f_model *m; const ds4f_mv1 *list; int n; } ds4f_mv_multi_task;
+static void ds4f_mv_multi_worker(void *arg, int tid, int nthr) {
+    ds4f_mv_multi_task *T = (ds4f_mv_multi_task *)arg;
+    for (int s = 0; s < T->n; s++) {
+        ds4f_mv_task sub = { T->m, T->list[s].dst, (const ds4f_tensor *)T->list[s].t, T->list[s].x };
+        ds4f_mv_worker(&sub, tid, nthr);
+    }
+}
+static void ds4f_matvec_multi(ds4f_model *m, const ds4f_mv1 *list, int n) {
+    for (int s = 0; s < n; s++) {
+        const ds4f_tensor *t = list[s].t;
+        m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols) + ds4f_sbytes(t->type, t->rows, t->cols);
+    }
+    ds4f_mv_multi_task T = { m, list, n };
+    ds4f_pool_run(m->pool, ds4f_mv_multi_worker, &T);
+}
+
 /* ---- block-diagonal matvec: the grouped o-proj wo_a [o_groups*glora rows, cols].
  * Output row-block i (8-aligned; glora%8==0 so a block never straddles a group) uses
  * input xbase + (i/glora)*gin. Fuses the o_groups separate ds4f_matvec dispatches into
@@ -448,7 +503,7 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
          * (i/8)*gb weight offset). */
         const uint8_t *base = (const uint8_t *)t->w;
         size_t gb = (size_t)(K / 64) * 528;
-        int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
+        int8_t *xq; float *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
         int cur_g = -1;
         for (int i = r0; i + 7 < r1; i += 8) {
             int g = (goff + i) / glora;
@@ -555,7 +610,7 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
          * blocked sdot keeps the FLA pipes fed; 1-2 token remainder single. */
         const uint8_t *base = (const uint8_t *)t->w;
         size_t gb = (size_t)(K / 64) * 528;
-        int8_t *xq; uint16_t *xs; ds4f_q8_xscratch(M, K, &xq, &xs);
+        int8_t *xq; float *xs; ds4f_q8_xscratch(M, K, &xq, &xs);   /* per-thread TLS scratch */
         int nbq = K / 64;
         for (int mm = 0; mm < M; mm++)
             ds4f_quant_x_sdot_into(X + (size_t)mm * Xs, K,
@@ -3893,6 +3948,78 @@ static void ds4f_hc_sinkhorn(const float *mixes, const float *scale, const float
     }
 }
 
+/* DS4F_HC_PAR (WS1): pool-parallelize the mHC collapse/expand loops (the per-d-independent
+ * scalar work run on tid0 between pool dispatches, ~35% of real-gen decode). Default off.
+ * Splits the hidden dim C into contiguous per-thread ranges -- each output element is an
+ * independent reduction over k in fixed order => BIT-EXACT to the serial path (mirrors the
+ * validated ds4f_q_norm_rope_par / DS4F_TB2ROPE_PAR pattern). The RMS reduction + matvec +
+ * sinkhorn are left untouched (RMS would reassociate; matvec is already a pool_run). */
+static int ds4f_hc_par = -1;             /* 1=pool-parallel, 0=serial ref (default) */
+static inline int ds4f_hc_par_on(void) {
+    if (ds4f_hc_par < 0) { const char *e = getenv("DS4F_HC_PAR"); ds4f_hc_par = e ? atoi(e) : 0; }
+    return ds4f_hc_par;
+}
+/* collapse: y[d] = Σ_k pre[k]·x4[k*C+d]  (used by hc_pre and hc_head_p) */
+typedef struct { const float *x4, *pre; float *y; int hc, C; } ds4f_hccol_task;
+static void ds4f_hccol_worker(void *arg, int tid, int nthr) {
+    ds4f_hccol_task *T = (ds4f_hccol_task *)arg;
+    int C = T->C, hc = T->hc;
+    int d0 = (int)((long)C*tid/nthr), d1 = (int)((long)C*(tid+1)/nthr);
+    for (int d = d0; d < d1; d++) {
+        float a = 0.f;
+        for (int k = 0; k < hc; k++) a += T->pre[k]*T->x4[(size_t)k*C+d];
+        T->y[d] = a;
+    }
+}
+/* expand: x4[k,d] = post[k]·f[d] + Σ_j comb[j,k]·resid[j,d]  (used by hc_post). Loop nesting
+ * identical to the serial body below => bit-exact per (k,d). */
+typedef struct { float *x4; const float *resid, *f, *post, *comb; int hc, C; } ds4f_hcpost_task;
+static void ds4f_hcpost_worker(void *arg, int tid, int nthr) {
+    ds4f_hcpost_task *T = (ds4f_hcpost_task *)arg;
+    int C = T->C, hc = T->hc;
+    int d0 = (int)((long)C*tid/nthr), d1 = (int)((long)C*(tid+1)/nthr);
+    for (int k = 0; k < hc; k++) {
+        float pk = T->post[k]; float *ok = T->x4 + (size_t)k*C;
+        for (int d = d0; d < d1; d++) ok[d] = pk*T->f[d];
+        for (int j = 0; j < hc; j++) {
+            float cjk = T->comb[j*hc+k]; const float *rj = T->resid + (size_t)j*C;
+            for (int d = d0; d < d1; d++) ok[d] += cjk*rj[d];
+        }
+    }
+}
+
+/* WS1b: fuse the mHC RMS sum-of-squares INTO the mixes-matvec dispatch. The serial
+ * `ss = Σ x4^2` over hd=hc*hidden was ~35% of the "other" phase (latency-bound double
+ * accumulator chain on tid0, 89us/call). This worker computes the IDENTICAL F32 matvec
+ * rows (same per-row dot order as ds4f_mv_worker => mixes BIT-EXACT) AND a per-thread
+ * partial sum-of-squares of x4 over a disjoint hd slice; the caller combines partials in
+ * fixed tid order. The ss REASSOCIATES (parallel vs sequential double) => mixes*rsq and
+ * everything downstream is COHERENT, not bit-identical -> argmax gated by real-gen A/B.
+ * Gated DS4F_HC_RMSPAR (default off). */
+typedef struct { const float *fn, *x4; float *mixes; double *ssp; int rows, hd; } ds4f_hcmix_task;
+static void ds4f_hcmix_worker(void *arg, int tid, int nthr) {
+    ds4f_hcmix_task *T = (ds4f_hcmix_task *)arg;
+    int rows = T->rows, hd = T->hd;
+    int per = rows / nthr, extra = rows % nthr;          /* same row split as F32 mv_worker */
+    int f0 = per * tid + (tid < extra ? tid : extra);
+    int f1 = f0 + per + (tid < extra ? 1 : 0);
+    for (int i = f0; i < f1; i++) {
+        const float *w = T->fn + (size_t)i * hd;
+        float acc = 0.f;
+        for (int j = 0; j < hd; j++) acc += w[j] * T->x4[j];   /* identical inner => bit-exact */
+        T->mixes[i] = acc;
+    }
+    int d0 = (int)((long)hd * tid / nthr), d1 = (int)((long)hd * (tid+1) / nthr);
+    double s = 0.0;
+    for (int j = d0; j < d1; j++) { float v = T->x4[j]; s += (double)v*v; }
+    T->ssp[tid] = s;
+}
+static int ds4f_hc_rmspar = -1;
+static inline int ds4f_hc_rmspar_on(void) {
+    if (ds4f_hc_rmspar < 0) { const char *e = getenv("DS4F_HC_RMSPAR"); ds4f_hc_rmspar = e ? atoi(e) : 0; }
+    return ds4f_hc_rmspar;
+}
+
 /* hc_pre: x4[hc*C] (4 streams) -> collapsed y[C]; also yields post[hc], comb[hc*hc].
  * mixes = (fn @ flatten(x4)) * rsqrt(mean(x4^2)+norm_eps); sinkhorn; y[d]=Σ_k pre[k]·x4[k,d]. */
 static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
@@ -3900,15 +4027,32 @@ static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
                         float *y, float *post, float *comb) {
     ds4f_config *c = &m->cfg;
     int hc = c->hc_mult, C = c->hidden, hd = hc*C, mix_hc = (2+hc)*hc;
-    double ss = 0.0; for (int i = 0; i < hd; i++) { float v = x4[i]; ss += (double)v*v; }
-    float rsq = 1.0f/sqrtf((float)(ss/hd) + c->norm_eps);
     float mixes[64];                 /* mix_hc <= 24 for hc<=4 */
-    ds4f_tensor fnt = { (void*)fn, NULL, DS4F_F32, mix_hc, hd };
-    ds4f_matvec(m, mixes, &fnt, x4); /* threaded F32 Linear */
+    float rsq;
+    if (ds4f_hc_rmspar_on()) {       /* WS1b: fold the RMS sum-of-squares INTO the mixes-matvec
+                                      * dispatch (kills the 89us serial tid0 reduction). ss is a
+                                      * DOUBLE accumulation, so the parallel-vs-sequential reassoc
+                                      * (~1e-13) is far below the float rsq's epsilon => rsq, and
+                                      * thus the whole result, is bit-identical in practice. */
+        double ssp[64];
+        ds4f_hcmix_task T = { fn, x4, mixes, ssp, mix_hc, hd };
+        m->bytes_read += ds4f_wbytes(DS4F_F32, mix_hc, hd) + ds4f_sbytes(DS4F_F32, mix_hc, hd);
+        ds4f_pool_run(m->pool, ds4f_hcmix_worker, &T);
+        double ss = 0.0; for (int t = 0; t < m->pool->nthr; t++) ss += ssp[t];   /* fixed tid order */
+        rsq = 1.0f/sqrtf((float)(ss/hd) + c->norm_eps);
+    } else {
+        double ss = 0.0; for (int i = 0; i < hd; i++) { float v = x4[i]; ss += (double)v*v; }
+        rsq = 1.0f/sqrtf((float)(ss/hd) + c->norm_eps);
+        ds4f_tensor fnt = { (void*)fn, NULL, DS4F_F32, mix_hc, hd };
+        ds4f_matvec(m, mixes, &fnt, x4); /* threaded F32 Linear */
+    }
     for (int mm = 0; mm < mix_hc; mm++) mixes[mm] *= rsq;
     float pre[16];
     ds4f_hc_sinkhorn(mixes, scale, base, hc, c->hc_iters, c->hc_eps, pre, post, comb);
-    for (int d = 0; d < C; d++) {
+    if (ds4f_hc_par_on()) {
+        ds4f_hccol_task T = { x4, pre, y, hc, C };
+        ds4f_pool_run(m->pool, ds4f_hccol_worker, &T);
+    } else for (int d = 0; d < C; d++) {
         float a = 0.f; for (int k = 0; k < hc; k++) a += pre[k]*x4[(size_t)k*C+d];
         y[d] = a;
     }
@@ -3919,6 +4063,11 @@ static void ds4f_hc_pre(ds4f_model *m, const float *x4, const float *fn,
 static void ds4f_hc_post(ds4f_model *m, float *x4, const float *resid, const float *f,
                          const float *post, const float *comb) {
     int hc = m->cfg.hc_mult, C = m->cfg.hidden;
+    if (ds4f_hc_par_on()) {
+        ds4f_hcpost_task T = { x4, resid, f, post, comb, hc, C };
+        ds4f_pool_run(m->pool, ds4f_hcpost_worker, &T);
+        return;
+    }
     for (int k = 0; k < hc; k++) {
         float pk = post[k]; float *ok = x4 + (size_t)k*C;
         for (int d = 0; d < C; d++) ok[d] = pk*f[d];
@@ -3945,7 +4094,10 @@ static void ds4f_hc_head_p(ds4f_model *m, const float *x4, float *y,
     float pre[16];
     for (int k = 0; k < hc; k++)
         pre[k] = ds4f_sigmoidf(mixes[k]*rsq*hc_scale[0] + hc_base[k]) + c->hc_eps;
-    for (int d = 0; d < C; d++) {
+    if (ds4f_hc_par_on()) {
+        ds4f_hccol_task T = { x4, pre, y, hc, C };
+        ds4f_pool_run(m->pool, ds4f_hccol_worker, &T);
+    } else for (int d = 0; d < C; d++) {
         float a = 0.f; for (int k = 0; k < hc; k++) a += pre[k]*x4[(size_t)k*C+d];
         y[d] = a;
     }
@@ -4380,6 +4532,138 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     DS4F_TOC(DS4F_P_HEAD); }
 }
 
+/* M2b BATCHED VERIFY: run K positions [pos0, pos0+K) through the 43 layers + head with mHC + tier-B2,
+ * BATCHING the dense GEMMs + the per-layer reduce (the amortization) and LOOPING the per-position tier-B2
+ * attention in causal order (position k sees k-1's appended KV). COHERENT, not byte-identical to M=1 decode
+ * (the GEMM reassociates vs the matvec); the spec loop's committed tokens are the verify's self-consistent
+ * output. NO-TP path (full dense -- the moderate-ctx spec-decode regime; TP-compose is a later refinement),
+ * no CP (off at moderate ctx). Requires exact+mhc+tierb2, !int8_kv, ds4f_alloc_prefill_batch(>=K).
+ * out_tok[K] = per-position argmax; out_hc[K*hc*C] = per-position final HC state (for the next draft). */
+static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, int *out_tok, float *out_hc) {
+    ds4f_config *c = &m->cfg;
+    int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
+    float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
+    float pa[8][16], ca[8][64], pf[8][16], cf[8][64];    /* per-position sinkhorn weights (K<=8) */
+    if (!m->v_x4) { size_t vb = (size_t)m->m_tile*hcC*4;
+        m->v_x4 = (float *)aligned_alloc(256, vb); m->v_resid = (float *)aligned_alloc(256, vb); }
+    for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
+        memcpy(m->v_x4 + (size_t)k*hcC + (size_t)s*C, X + (size_t)k*C, (size_t)C*4);
+    for (int L = 0; L < c->n_layers; L++) {
+        ds4f_layer *ly = &m->layers[L];
+        int ratio = c->compress_ratios[L];
+        const float *rcos = ratio ? m->rope_comp_cos : m->rope_dense_cos;
+        const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;
+        /* mHC pre (attn): collapse each position's hc streams -> p_x[k]; save residual + sinkhorn weights */
+        for (int k = 0; k < K; k++) {
+            ds4f_hc_pre(m, m->v_x4 + (size_t)k*hcC, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
+                        m->p_x + (size_t)k*C, pa[k], ca[k]);
+            memcpy(m->v_resid + (size_t)k*hcC, m->v_x4 + (size_t)k*hcC, hcC*4);
+        }
+        /* batched q/kv projections */
+        { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, K, C, C };
+          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+        ds4f_gemm(m, m->p_qlat, &ly->wq_a, m->p_hn, K, c->q_lora, C);
+        { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, K, c->q_lora, c->q_lora };
+          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+        ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, K, H, c->q_lora);
+        { ds4f_pf_qnr_task t = { m, pos0, K, rcos, rsin };
+          ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
+        ds4f_gemm(m, m->p_kvlat, &ly->wkv, m->p_hn, K, KV, C);
+        /* per-position tier-B2 attention (causal: append KV then attend, in order) */
+        for (int k = 0; k < K; k++) {
+            int pos = pos0 + k;
+            float *kvl = m->p_kvlat + (size_t)k*KV;
+            ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
+            ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
+            { uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
+              for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]); }
+            memcpy(m->s_hn, m->p_hn + (size_t)k*C, (size_t)C*4);     /* compressor reads s_hn */
+            memcpy(m->s_q,  m->p_q  + (size_t)k*H, (size_t)H*4);     /* indexer + attention read s_q */
+            if (m->tierb2 && ratio) ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin);
+            m->cp_gather = 0;
+            if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
+                                          c->window_size, c->qk_rope_dim/2, rcos, rsin };
+                ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+            } else { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
+                                          c->window_size, c->qk_rope_dim/2, rcos, rsin };
+                ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
+            memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
+        }
+        /* batched grouped low-rank o-projection (no-TP) */
+        for (int g = 0; g < og; g++) {
+            ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
+            ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
+        }
+        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
+        for (int k = 0; k < K; k++)                                  /* mHC post (attn) */
+            ds4f_hc_post(m, m->v_x4 + (size_t)k*hcC, m->v_resid + (size_t)k*hcC, m->p_o + (size_t)k*C, pa[k], ca[k]);
+        /* mHC pre (ffn) */
+        for (int k = 0; k < K; k++) {
+            ds4f_hc_pre(m, m->v_x4 + (size_t)k*hcC, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
+                        m->p_x + (size_t)k*C, pf[k], cf[k]);
+            memcpy(m->v_resid + (size_t)k*hcC, m->v_x4 + (size_t)k*hcC, hcC*4);
+        }
+        { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, K, C, C };
+          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+        /* shared expert (no-TP) */
+        ds4f_gemm(m, m->p_shg, &ly->sh_w1, m->p_h2, K, c->shared_inter, C);
+        ds4f_gemm(m, m->p_shu, &ly->sh_w3, m->p_h2, K, c->shared_inter, C);
+        { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, K,
+                                    c->shared_inter, c->shared_inter, c->swiglu_limit };
+          ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
+        ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);
+        /* router + routed experts (bucketed batched GEMM, reuse the prefill scheme) */
+        ds4f_gemm(m, m->p_router, &ly->gate, m->p_h2, K, c->n_experts, C);
+        { int no = ly->n_owned;
+          for (int s = 0; s < no; s++) m->ex_cnt[s] = 0;
+          for (int k = 0; k < K; k++) {
+              int idx[8]; float wt[8];
+              ds4f_topk_exact(m->p_router + (size_t)k*c->n_experts, ly->gate_bias,
+                              c->n_experts, c->n_active, idx, wt, c->routed_scale);
+              float *route = m->p_route + (size_t)k*C;
+              for (int i = 0; i < C; i++) route[i] = 0.f;
+              for (int a = 0; a < c->n_active; a++) {
+                  int e = idx[a]; if (e < 0 || e % m->ep_size != m->ep_rank) continue;
+                  int slot = e / m->ep_size, p = m->ex_cnt[slot]++;
+                  m->ex_tok[(size_t)slot*m->m_tile + p] = k; m->ex_wt[(size_t)slot*m->m_tile + p] = wt[a];
+              }
+          }
+          for (int s = 0; s < no; s++) {
+              int cnt = m->ex_cnt[s]; if (!cnt) continue;
+              for (int p = 0; p < cnt; p++) { const float *h2 = m->p_h2 + (size_t)m->ex_tok[(size_t)s*m->m_tile+p]*C;
+                  float *xe = m->p_exX + (size_t)p*C; for (int i = 0; i < C; i++) xe[i] = h2[i]; }
+              ds4f_gemm(m, m->p_exG, &ly->ex_w1[s], m->p_exX, cnt, c->moe_inter, C);
+              ds4f_gemm(m, m->p_exU, &ly->ex_w3[s], m->p_exX, cnt, c->moe_inter, C);
+              { ds4f_pf_swiglu_task t = { m, m->p_exG, m->p_exU, c->moe_inter, cnt,
+                                          c->moe_inter, c->moe_inter, c->swiglu_limit };
+                ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
+              ds4f_gemm(m, m->p_exO, &ly->ex_w2[s], m->p_exG, cnt, C, c->moe_inter);
+              for (int p = 0; p < cnt; p++) { int k = m->ex_tok[(size_t)s*m->m_tile+p]; float w = m->ex_wt[(size_t)s*m->m_tile+p];
+                  float *route = m->p_route + (size_t)k*C; const float *o = m->p_exO + (size_t)p*C;
+                  for (int i = 0; i < C; i++) route[i] += w * o[i]; }
+          } }
+        if (m->ar_cb) m->ar_cb(m->p_route, C*K, m->ar_ctx);          /* EP combine: one [K,C] reduce */
+        for (int k = 0; k < K; k++) {                                /* moe out = shared + routed; mHC post (ffn) */
+            float *mo = m->p_moe + (size_t)k*C, *ro = m->p_route + (size_t)k*C, *o = m->p_o + (size_t)k*C;
+            for (int i = 0; i < C; i++) o[i] = mo[i] + ro[i];
+            ds4f_hc_post(m, m->v_x4 + (size_t)k*hcC, m->v_resid + (size_t)k*hcC, o, pf[k], cf[k]);
+        }
+    }
+    /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
+    for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
+    { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, K, C, C };
+      ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+    if (!m->p_logits) m->p_logits = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)c->vocab*4);
+    int hrows = m->head.rows, tph = (hrows < c->vocab);
+    ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, K, hrows, C);
+    { float *hval = tph ? (float *)alloca((size_t)K*4) : NULL;
+      ds4f_pf_argmax_task t = { m->p_logits, out_tok, hrows, K, m->head_r0, hval };
+      ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
+      if (tph && m->ar_argmax_cb) for (int k = 0; k < K; k++) { int32_t idx = out_tok[k]; float v = hval[k];
+          m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; } }
+    if (out_hc) memcpy(out_hc, m->v_x4, (size_t)K*hcC*4);
+}
+
 /* DS4F_MTP forward (STUB -- scaffold only). Predicts the token after `next_id` given the main model's
  * last hidden state x[hidden] at `pos`. Reference (MTPBlock.forward, inference/model.py):
  *   e  = enorm(embed(next_id));   h = hnorm(x)
@@ -4528,7 +4812,12 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         { DS4F_TIC();
         ds4f_rmsnorm(m->s_hn, asrc, ly->attn_norm, C, eps);
         ds4f_chk("attn_norm", L, m->s_hn, C);
-        { DS4F_TIC(); ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn); DS4F_TOC(DS4F_P_QKV_A); }
+        if (ds4f_mv_fuse_on()) {   /* wq_a + wkv both read s_hn -> ONE dispatch (wq_b depends on wq_a, stays separate). s_kvlat is independent of the q-path -> computing it early is bit-exact. */
+            DS4F_TIC();
+            ds4f_mv1 qkv[2] = { { m->s_qlat, &ly->wq_a, m->s_hn }, { m->s_kvlat, &ly->wkv, m->s_hn } };
+            ds4f_matvec_multi(m, qkv, 2);
+            DS4F_TOC(DS4F_P_QKV_A);
+        } else { DS4F_TIC(); ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn); DS4F_TOC(DS4F_P_QKV_A); }
         ds4f_rmsnorm(m->s_qlat, m->s_qlat, ly->q_norm, c->q_lora, eps);
         { DS4F_TIC(); ds4f_matvec(m, m->s_q + (size_t)m->attn_h0 * c->q_head_dim, &ly->wq_b, m->s_qlat); DS4F_TOC(DS4F_P_QKV_B); } /* TP: owned heads of [n_heads*q_head_dim] */
         if (m->exact) { DS4F_TIC();
@@ -4536,7 +4825,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             else              ds4f_q_norm_rope(m, m->s_q, pos, rcos, rsin);
             DS4F_TOC(DS4F_P_QKV_ROPE); } /* per-head norm + RoPE */
         ds4f_chk("q", L, m->s_q, H);
-        { DS4F_TIC(); ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn); DS4F_TOC(DS4F_P_QKV_KV); }  /* [kv_lora] */
+        if (!ds4f_mv_fuse_on()) { DS4F_TIC(); ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn); DS4F_TOC(DS4F_P_QKV_KV); }  /* [kv_lora]; fused with wq_a above when MV_FUSE */
         ds4f_rmsnorm(m->s_kvlat, m->s_kvlat, ly->kv_norm, KV, eps);
         if (m->exact)                                            /* RoPE the kv rope dims */
             ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
@@ -4639,8 +4928,14 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         int tps = (m->sh_rows < c->shared_inter);              /* TP shared-expert (sh_w1/w3 col-shard) */
         { DS4F_TIC();
         if (tps) { memset(m->s_shg, 0, (size_t)c->shared_inter*4); memset(m->s_shu, 0, (size_t)c->shared_inter*4); }
-        ds4f_matvec(m, m->s_shg + m->sh_r0, &ly->sh_w1, m->s_h2);  /* col-shard up/gate -> [sh_r0, sh_r0+sh_rows) */
-        ds4f_matvec(m, m->s_shu + m->sh_r0, &ly->sh_w3, m->s_h2);
+        if (ds4f_mv_fuse_on()) {   /* sh_w1 + sh_w3 both read s_h2 -> ONE dispatch */
+            ds4f_mv1 sh[2] = { { m->s_shg + m->sh_r0, &ly->sh_w1, m->s_h2 },
+                               { m->s_shu + m->sh_r0, &ly->sh_w3, m->s_h2 } };
+            ds4f_matvec_multi(m, sh, 2);
+        } else {
+            ds4f_matvec(m, m->s_shg + m->sh_r0, &ly->sh_w1, m->s_h2);  /* col-shard up/gate -> [sh_r0, sh_r0+sh_rows) */
+            ds4f_matvec(m, m->s_shu + m->sh_r0, &ly->sh_w3, m->s_h2);
+        }
         if (m->exact) { float lim = c->swiglu_limit;            /* clamp up both sides, gate max */
             for (int i = 0; i < c->shared_inter; i++)
                 m->s_shg[i] = ds4f_silu(m->s_shg[i] > lim ? lim : m->s_shg[i]) * ds4f_clampf(m->s_shu[i], -lim, lim);
@@ -4670,8 +4965,14 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             int e = idx[k]; if (e < 0) continue;
             if (e % m->ep_size != m->ep_rank) continue;          /* owned-only (Stage 1/local) */
             int slot = e / m->ep_size;                           /* dense owned index */
-            ds4f_matvec(m, m->s_exg, &ly->ex_w1[slot], m->s_h2);
-            ds4f_matvec(m, m->s_exu, &ly->ex_w3[slot], m->s_h2);
+            if (ds4f_mv_fuse_on()) {   /* ex_w1 + ex_w3 both read s_h2 -> ONE dispatch (per expert) */
+                ds4f_mv1 ex[2] = { { m->s_exg, &ly->ex_w1[slot], m->s_h2 },
+                                   { m->s_exu, &ly->ex_w3[slot], m->s_h2 } };
+                ds4f_matvec_multi(m, ex, 2);
+            } else {
+                ds4f_matvec(m, m->s_exg, &ly->ex_w1[slot], m->s_h2);
+                ds4f_matvec(m, m->s_exu, &ly->ex_w3[slot], m->s_h2);
+            }
             if (m->exact) { float lim = c->swiglu_limit;
                 for (int i = 0; i < c->moe_inter; i++)
                     m->s_exg[i] = ds4f_silu(m->s_exg[i] > lim ? lim : m->s_exg[i]) * ds4f_clampf(m->s_exu[i], -lim, lim);

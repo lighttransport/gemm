@@ -526,40 +526,56 @@ int main(void) {
          * to plain decode; the batched dense that makes it FASTER is M2b). Each step: draft token@(pos+2)
          * with the MTP, verify pos+1 (commit) + pos+2 (speculative, input the draft). On accept emit 2
          * tokens; on reject restore the compressor state + the saved hidden, redo pos+2 next step. */
-        size_t hcb = (size_t)m->cfg.hc_mult * C * 4;
+        size_t hcf = (size_t)m->cfg.hc_mult * C, hcb = hcf * 4;
+        int spec_batch = envi("DS4F_SPEC_BATCH", 0);   /* 1: BATCHED verify (M2b, COHERENT, the speedup) */
         gen_ids = (int *)malloc((size_t)(max_new + 2) * sizeof(int));
         char *snap = (char *)malloc(ds4f_tb2_snap_bytes(m));
-        float *hc_save = (float *)aligned_alloc(64, hcb);
+        float *hc_save = (float *)aligned_alloc(64, hcb), *Xin = NULL, *vhc = NULL;
+        if (spec_batch) { ds4f_alloc_prefill_batch(m, 2); Xin = (float *)aligned_alloc(64,(size_t)2*C*4); vhc = (float *)aligned_alloc(64, 2*hcb); }
         int pos = dec_base - 1, t_next = pf_last_tok, dec_steps = 0, accepts = 0, rejects = 0;
         while (n_gen < max_new) {
             gen_ids[n_gen++] = t_next;
             if (t_next == DS4F_EOS_ID) break;
             embed_lookup(m, t_next, xe);                              /* draft token@(pos+2) */
             int d = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1, NULL);
-            embed_lookup(m, t_next, x); m->bytes_read = 0;            /* verify pos+1 (commit) */
-            int m1 = ds4f_forward_token(m, x, pos + 1);
-            dec_bytes += m->bytes_read; dec_steps++;
-            if (n_gen >= max_new) { t_next = m1; break; }
-            memcpy(hc_save, m->s_x4, hcb); ds4f_tb2_snap(m, snap, 0); /* verify pos+2 (speculative) */
-            embed_lookup(m, d, x); m->bytes_read = 0;
-            int m2 = ds4f_forward_token(m, x, pos + 2);
-            dec_bytes += m->bytes_read; dec_steps++;
-            if (d == m1) {                                           /* ACCEPT: 2 tokens this verify */
-                gen_ids[n_gen++] = m1; pos += 2; t_next = m2; accepts++;
-                if (m1 == DS4F_EOS_ID) break;
-            } else {                                                 /* REJECT: undo pos+2 */
-                ds4f_tb2_snap(m, snap, 1); memcpy(m->s_x4, hc_save, hcb);
-                pos += 1; t_next = m1; rejects++;
+            if (spec_batch) {                                        /* M2b: ONE batched verify of pos+1,pos+2 */
+                embed_lookup(m, t_next, Xin); embed_lookup(m, d, Xin + C);
+                ds4f_tb2_snap(m, snap, 0);
+                int ot[2]; ds4f_forward_verify(m, Xin, 2, pos + 1, ot, vhc); dec_steps++;
+                int m1 = ot[0], m2 = ot[1];
+                if (n_gen >= max_new) { t_next = m1; break; }
+                if (d == m1) {                                       /* ACCEPT: both committed */
+                    gen_ids[n_gen++] = m1; t_next = m2; memcpy(m->s_x4, vhc + hcf, hcb); pos += 2; accepts++;
+                    if (m1 == DS4F_EOS_ID) break;
+                } else {                                             /* REJECT: undo pos+2, redo pos+1 (GEMM-consistent) */
+                    ds4f_tb2_snap(m, snap, 1); embed_lookup(m, t_next, Xin);
+                    ds4f_forward_verify(m, Xin, 1, pos + 1, ot, vhc); dec_steps++;
+                    t_next = ot[0]; memcpy(m->s_x4, vhc, hcb); pos += 1; rejects++;
+                }
+            } else {                                                /* M2 step 1: LOOPED verify (byte-identical) */
+                embed_lookup(m, t_next, x); m->bytes_read = 0;
+                int m1 = ds4f_forward_token(m, x, pos + 1);
+                dec_bytes += m->bytes_read; dec_steps++;
+                if (n_gen >= max_new) { t_next = m1; break; }
+                memcpy(hc_save, m->s_x4, hcb); ds4f_tb2_snap(m, snap, 0);
+                embed_lookup(m, d, x); m->bytes_read = 0;
+                int m2 = ds4f_forward_token(m, x, pos + 2);
+                dec_bytes += m->bytes_read; dec_steps++;
+                if (d == m1) { gen_ids[n_gen++] = m1; pos += 2; t_next = m2; accepts++; if (m1 == DS4F_EOS_ID) break; }
+                else { ds4f_tb2_snap(m, snap, 1); memcpy(m->s_x4, hc_save, hcb); pos += 1; t_next = m1; rejects++; }
             }
         }
-        last_tok = t_next; maxgen = dec_steps; free(snap); free(hc_save);
-        if (MyRank == 0) logmsg("SPEC accepts=%d rejects=%d emitted=%d forwards=%d -> %.3f tok/forward (1.0=no spec)\n",
-                                accepts, rejects, n_gen, dec_steps, dec_steps ? (double)n_gen/dec_steps : 0.0);
+        last_tok = t_next; maxgen = n_gen; free(snap); free(hc_save); free(Xin); free(vhc);
+        if (MyRank == 0) logmsg("SPEC%s accepts=%d rejects=%d emitted=%d forwards=%d -> %.3f tok/fwd (decode tok/s = real gen rate)\n",
+                                spec_batch?"_BATCH":"", accepts, rejects, n_gen, dec_steps, dec_steps ? (double)n_gen/dec_steps : 0.0);
     } else if (gen_mode) {
         /* greedy: pf_last_tok is the prompt's first prediction (token at pos
          * dec_base). Feed it back, argmax->embed->next, until eos or max_new.
          * forward(x,pos) places `cur` at `pos` and predicts pos+1. */
         gen_ids = (int *)malloc((size_t)(max_new + 1) * sizeof(int));
+        int gemm_decode = envi("DS4F_GEMM_DECODE", 0);   /* run each position through verify(K=1) -- the GEMM-path
+                                                          * decode that the batched spec verify is token-identical to */
+        if (gemm_decode) ds4f_alloc_prefill_batch(m, 2);
         int cur = pf_last_tok, dec_steps = 0;
         for (int g = 0; g < max_new; g++) {
             gen_ids[n_gen++] = cur;
@@ -567,7 +583,8 @@ int main(void) {
             int pos = dec_base + g;
             embed_lookup(m, cur, x);
             m->bytes_read = 0;
-            cur = ds4f_forward_token(m, x, pos);
+            if (gemm_decode) { int ot; ds4f_forward_verify(m, x, 1, pos, &ot, m->s_x4); cur = ot; }
+            else cur = ds4f_forward_token(m, x, pos);
             dec_bytes += m->bytes_read;
             dec_steps++;
             if (mtp_on) {   /* check last step's draft vs the real next token (alpha), then draft for the next */
