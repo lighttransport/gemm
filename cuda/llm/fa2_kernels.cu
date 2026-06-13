@@ -41,7 +41,8 @@ void fa2_attn_f(dt_t *O,
                 const dt_t *Q,
                 const dt_t *K,
                 const dt_t *V,
-                int S, int D_in, int hstride_q, int hstride_kv, int gqa_ratio, float scale) {
+                int S, int D_in, int hstride_q, int hstride_kv, int gqa_ratio, float scale,
+                int window) {
     const float LOG2E = 1.4426950408889634f;
     float lscale = scale * LOG2E;
     int bh = blockIdx.y;
@@ -98,19 +99,28 @@ void fa2_attn_f(dt_t *O,
     if (q_blk_max < s_eff) s_eff = q_blk_max;
 #endif
     int n_tiles = (s_eff + FA2_BC - 1) / FA2_BC;
+    /* Sliding window: skip tiles entirely below the smallest query's lower bound.
+     * The smallest query in this block is blockIdx.x*FA2_BR. window=0 -> t_lo=0
+     * (causal path byte-identical). */
+    int t_lo = 0;
+    if (window > 0) {
+        int klo = blockIdx.x * FA2_BR - window + 1;
+        if (klo > 0) t_lo = klo / FA2_BC;
+    }
 
-    // Prologue: cp.async tile 0 into buffer 0
+    // Prologue: cp.async tile t_lo into buffer 0
     {
         dt_t *dK_ = sK_buf[0];
         dt_t *dV_ = sV_buf[0];
         for (int idx = threadIdx.x; idx < total_u4; idx += blockDim.x) {
             int j_ = idx / row_u4;
             int dd_ = (idx - j_ * row_u4) * 8;
+            int kv_ = t_lo * FA2_BC + j_;
             unsigned dst_k = __cvta_generic_to_shared(dK_ + j_ * FA2_DP + dd_);
             unsigned dst_v = __cvta_generic_to_shared(dV_ + j_ * FA2_DP + dd_);
-            const void *src_k = (const void *)(Kh + (size_t)j_ * hstride_kv + dd_);
-            const void *src_v = (const void *)(Vh + (size_t)j_ * hstride_kv + dd_);
-            int src_bytes = (j_ < S) ? 16 : 0;
+            const void *src_k = (const void *)(Kh + (size_t)kv_ * hstride_kv + dd_);
+            const void *src_v = (const void *)(Vh + (size_t)kv_ * hstride_kv + dd_);
+            int src_bytes = (kv_ < S) ? 16 : 0;
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst_k), "l"(src_k), "r"(src_bytes));
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst_v), "l"(src_v), "r"(src_bytes));
         }
@@ -120,8 +130,8 @@ void fa2_attn_f(dt_t *O,
     int ldm_row_off = lane & 7;
     int ldm_col_xtra = (lane & 8) ? 8 : 0;
 
-    for (int t = 0; t < n_tiles; t++) {
-        int cur = t & 1;
+    for (int t = t_lo; t < n_tiles; t++) {
+        int cur = (t - t_lo) & 1;
         int nxt = 1 - cur;
         int kv0 = t * FA2_BC;
 
@@ -185,6 +195,11 @@ void fa2_attn_f(dt_t *O,
 #if FA2_CAUSAL
             va0 = va0 && (kv_c0 <= gqr_a); va1 = va1 && (kv_c1 <= gqr_a);
             vb0 = vb0 && (kv_c0 <= gqr_b); vb1 = vb1 && (kv_c1 <= gqr_b);
+            /* Sliding-window lower bound: query q attends only to keys (q-window, q]. */
+            if (window > 0) {
+                va0 = va0 && (kv_c0 > gqr_a - window); va1 = va1 && (kv_c1 > gqr_a - window);
+                vb0 = vb0 && (kv_c0 > gqr_b - window); vb1 = vb1 && (kv_c1 > gqr_b - window);
+            }
 #endif
             sfrag[nn][0] = va0 ? sfrag[nn][0] * lscale : -1e30f;
             sfrag[nn][1] = va1 ? sfrag[nn][1] * lscale : -1e30f;

@@ -231,8 +231,11 @@ int main(int argc, char **argv) {
     double total_cpu_ms = 0.0, total_gpu_ms = 0.0;
     int pass = 1;
     int have_seq_logits = 0;
+    int verify_decode = getenv("CUDA_LLM_VERIFY_DECODE") != NULL; /* compare 1st decode step (validates KV cache) */
+    int have_seq_decode = 0;
     float *last_gpu_hidden = (float *)malloc((size_t)n_embd * sizeof(float));
     float *last_seq_logits = n_vocab_size > 0 ? (float *)malloc((size_t)n_vocab_size * sizeof(float)) : NULL;
+    float *seq_decode_logits = (verify_decode && n_vocab_size > 0) ? (float *)malloc((size_t)n_vocab_size * sizeof(float)) : NULL;
     if (!last_gpu_hidden) {
         fprintf(stderr, "Failed to allocate last_gpu_hidden\n");
         cuda_llm_free(gpu);
@@ -354,6 +357,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "\n");
             }
         }
+        /* One decode step after the per-token prefill -> reference for the KV cache.
+         * Cache is at position prefill_token_count-1; forward a fixed token at the
+         * next position and capture its logits. */
+        if (verify_decode && seq_decode_logits && n_vocab_size > 0) {
+            float *dl = cuda_llm_forward_logits(gpu, prefill_tokens[0], prefill_token_count);
+            if (dl) { memcpy(seq_decode_logits, dl, (size_t)n_vocab_size * sizeof(float)); have_seq_decode = 1; }
+        }
     }
     } /* end !large_bench */
 
@@ -438,6 +448,18 @@ int main(int argc, char **argv) {
                 fprintf(stderr, " [%d]=%.4f('%s')", top5_ids[k], top5_vals[k], s ? s : "?");
             }
             fprintf(stderr, "\n");
+        }
+        /* Decode-step check: after the BATCHED prefill, forward the same fixed
+         * token at the next position and compare logits to the per-token reference.
+         * This validates the KV cache the batched prefill leaves behind (e.g. the
+         * windowed-SWA circular-cache population). */
+        if (verify_decode && have_seq_decode && seq_decode_logits && n_vocab_size > 0) {
+            float *dl = cuda_llm_forward_logits(gpu, prefill_tokens[0], prefill_token_count);
+            if (dl) {
+                float derr = rel_l2_error(dl, seq_decode_logits, n_vocab_size);
+                fprintf(stderr, "Decode-step logits rel_L2_vs_seq=%.6f\n", derr);
+                if (!isfinite(derr) || derr >= 0.05f) pass = 0;
+            }
         }
     } else {
         fprintf(stderr, "Prefill logits failed\n");
