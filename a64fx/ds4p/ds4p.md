@@ -174,31 +174,40 @@ took ds4f 255k→12M ctx on 11 nodes (byte-identical to CP-off).
   — CP, not the node count, is the enabler. Reserve more nodes only for headroom (finer cache
   shard + fewer owned experts) or higher context (CP scales the ceiling with node count).
 
-### How many CP contexts fit on 96+N nodes (ds4p only, each context ≤ 1M) — capacity equation
-Let **M = 96 + N** total EP ranks (= nodes, 1 rank/node). Per-node budget on a 31.8 GB node,
-~30 GB usable (≈2 GB OS/guard floor):
+### Single-context ceiling on 96+N nodes with CP (ds4p only) — MEASURED 2026-06-14
+**The EP runner is single-stream** (one sequence at a time; no KV pool / continuous batching),
+so "K concurrent ≤1M contexts" is not something it can serve — that needs a KV-pool serving mode
+(a separate feature). The measurable, meaningful quantity is the **max single-context length
+L_max(M)** with CP. (Earlier σ/K-concurrent capacity equation retracted — it assumed a pool the
+runner doesn't have.)
 
-    weights      W(M) ≈ 12 + 2.8·⌈384/M⌉ GB        # measured: 22.99 @ M=96/112 (owned 4),
-                                                    #           19.4 @ M=128 (3), 17.42 @ M=192 (2)
-    cache budget B(M) ≈ 30 − W(M) GB                # 7.0 @96, ~7.0 @112, ~10.6 @128, ~12.6 @192
+Per-node weights shrink as nodes are added (fewer owned experts):
 
-With CP the compressed Tier-B2 cache shards by slot across all M ranks, so per-node cache for
-K concurrent contexts totalling P positions (P ≤ K·1M) is
+    W(M) ≈ 12 + 2.8·⌈384/M⌉ GB    # measured: 22.99 @96/112 (owned 4), 19.4 @128 (3), 17.42 @192 (2)
+    cache budget B(M) ≈ 30 − W(M) GB
 
-    cache/node(P,K) ≈ ρ_sh·P/M  +  ρ_rep·P  +  K·σ
-        ρ_sh ≈ 1.84 KB/pos   # slot-sharded CSA cmp_q4 + idx_kv8_4 (the 1.84 GB CP freed at M=96 for 1×1M)
-        ρ_rep ≈ small        # replicated remainder: HCA cmp + 64-slot f32 idx
-        σ     = per-context NON-sharded scratch (mainly s_idx_scores ∝ max_pos) — to be pinned by a sweep
+CP shards the CSA `cmp_q4` + `idx_kv8_4` caches by slot across the M ranks (HCA `cmp_kv` stays
+REPLICATED — ds4p has 31 HCA layers). **Measured single-context, M=96, CP on, full warm:**
 
-⇒ max concurrent 1M-contexts:
+    max_pos   result
+    1M        OK   rc=0, warmtb2 DONE, MemFree 3.95 GB                         (job 49228435)
+    2M        FAIL loads (arena 22.99 GB) then FATAL barrier fan-in — comm regions starved
+    3M        FAIL OOM-killed at load (sig=9)
+    4M        FAIL OOM-killed at load                                          (job 49228703)
 
-    K_max(M) ≈ ⌊ B(M) / ( ρ_sh·1M/M  +  ρ_rep·1M  +  σ ) ⌋
+⇒ **L_max(96) ≈ 1–2M.** CP makes 1M **robust** (the cliff fix: MemFree 0.38→3.95 GB) but ds4p's
+ceiling gain is **modest** — NOT ds4f's 255k→12M-on-11n. ds4p's bigger graph (61L, 31 HCA layers
+whose cmp stays replicated, index_topk 1024) plus the **load-peak** (the max_pos-sized cache
+alloc + the ~30 GB blob transient, both committed at *load*) bind near ~2M on 96 nodes. The
+binding term is the **load-peak**, not the warmed footprint.
 
-The sharded term `ρ_sh·1M/M` is **tiny at M ≥ 96** (1.84 GB / M ≈ **19 MB per 1M-context at
-M=96**, 14 MB at M=128), so **CP removes the cache as the binding limit** — exactly as for ds4f
-(255k→12M on 11n became LOAD-PEAK-bound, not cache-bound). The ceiling on 96+N nodes is then
-**σ (per-context scratch) + the load-peak transient**, giving `K_max(M) ≈ B(M)/σ`, which **grows
-with M** because W(M) falls (more nodes → less weight → more budget) *and* the per-context shard
-shrinks. Measured single-context anchors (CP on): M=96 → MemFree **3.95 GB**, M=112 → **3.98 GB**
-— i.e. room for several more 1M contexts already at 96. **Next:** a K=2,4 concurrent-context
-sweep to pin σ (and the load-peak), turning K_max into a hard number per N.
+Effective per-node context cost (from 1M OK / 2M FAIL): **ρ_eff(96) ≈ 4 GB per +1M ctx** —
+i.e. CP shards the CSA part but the replicated-HCA + load-peak remainder is still ~budget-sized
+per 1M. It falls with M (CSA shard /M, smaller blob/cache-alloc), so
+
+    L_max(M) ≈ B(M) / ρ_eff(M),   ρ_eff(M) = ρ_csa/M + ρ_hca + (load-peak)/M     [ρ_eff(96) ≈ 4 GB/1M]
+
+⇒ ceiling **rises with N** (more EP → less weight, finer CSA shard, smaller load-peak): expect
+~2–4M at 128–192 nodes. To pin ρ_csa vs ρ_hca, run a 2-point (max_pos, M) sweep. To push >~2M on
+≤128 nodes, cut the **load-peak** (stream/free the blob during load) and shard the HCA cmp too —
+more EP nodes alone won't do it.
