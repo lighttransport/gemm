@@ -41,7 +41,7 @@
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
 
-#define MAX_NODES 96   /* DS4P targets 48-64 ranks (was 32 for the 11-node DS4F runs) */
+#define MAX_NODES 128  /* DS4P 96-node 1M run (96=8x12=6x16); 108 for co-serving. Was 96; 32 for 11-node DS4F */
 #define RUN_STAG  DEMO_STAG
 #define WAIT_TIMEOUT_SEC 300.0   /* tolerate cold first-touch skew across ranks */
 

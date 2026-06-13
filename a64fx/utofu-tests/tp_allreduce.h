@@ -31,8 +31,8 @@
 #ifndef TP_AR_STAG
 #define TP_AR_STAG 7                  /* steering tag for the all-reduce region  */
 #endif
-#define TP_AR_MAXN   32               /* max ranks in a TP group                 */
-#define TP_AR_NSTEP  8                /* recv slots: sid 0..ceil(log2 N)+1 (<=7)  */
+#define TP_AR_MAXN   128              /* max ranks in a TP/EP group (96/108 nodes; was 32 for 11-node ds4f) */
+#define TP_AR_NSTEP  9                /* recv slots: sid 0..ceil(log2 N)+1; 9 covers N<=128 (bcast_sid<=8) */
 #define TP_AR_LINE   256              /* A64FX cache line; each slot own-aligned  */
 #ifndef TP_AR_TIMEOUT
 #define TP_AR_TIMEOUT 60.0
