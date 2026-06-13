@@ -1794,6 +1794,57 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- matvec_iq2_xxs_q8_1_dp4a: IQ2_XXS weight x Q8_1 activation via dp4a (decode) ---- */\n"
+"/* 8 warps/block, one warp per row, lane strides over 256-blocks. Branchless int8\n"
+"   weight build: grid byte = magnitude, sign applied via per-byte two's complement\n"
+"   __vadd4((g ^ mask), mask & 0x01010101) so dp4a_s8 sees signed int8. IQ2_XXS is\n"
+"   zero-centered (signed) so there is no Q8_1 s8 offset term. Row-major weights. */\n"
+"__global__ void matvec_iq2_xxs_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                           const unsigned char *x_q81,\n"
+"                                           int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 66;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        const unsigned char *q81 = x_q81 + (size_t)(b * 8) * 36;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"            const unsigned char *aq = q81 + ib32 * 36;\n"
+"            const int *a = (const int *)aq;\n"
+"            float d8 = half_to_float(*(const half_raw *)(aq + 32));\n"
+"            int acc = 0;\n"
+"            #pragma unroll\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                unsigned long long gv = iq2xxs_grid_dev[(aux0 >> (8*l)) & 255];\n"
+"                unsigned int signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"                unsigned int slo = signs & 0xF, shi = (signs >> 4) & 0xF;\n"
+"                unsigned int mlo = ((slo&1)?0x000000FFu:0u)|((slo&2)?0x0000FF00u:0u)|((slo&4)?0x00FF0000u:0u)|((slo&8)?0xFF000000u:0u);\n"
+"                unsigned int mhi = ((shi&1)?0x000000FFu:0u)|((shi&2)?0x0000FF00u:0u)|((shi&4)?0x00FF0000u:0u)|((shi&8)?0xFF000000u:0u);\n"
+"                unsigned int glo = (unsigned int)(gv & 0xFFFFFFFFu);\n"
+"                unsigned int ghi = (unsigned int)(gv >> 32);\n"
+"                unsigned int wlo = __vadd4(glo ^ mlo, mlo & 0x01010101u);\n"
+"                unsigned int whi = __vadd4(ghi ^ mhi, mhi & 0x01010101u);\n"
+"                acc = dp4a_s8((int)wlo, a[2*l],     acc);\n"
+"                acc = dp4a_s8((int)whi, a[2*l + 1], acc);\n"
+"            }\n"
+"            sum += db * d8 * (float)acc;\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "__device__ static const unsigned long long iq2xs_grid_dev[512] = {\n"
 "    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,\n"
 "    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x080808080819192bULL,\n"
@@ -3160,6 +3211,57 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+"/* ---- matvec_iq3_xxs_q8_1_dp4a: IQ3_XXS weight x Q8_1 activation via dp4a (decode) ---- */\n"
+"/* Mirrors matvec_iq3_xxs_f32: 98-byte block = d + qs[64] + scales_and_signs[32];\n"
+"   uint32 grid (4 magnitudes), db = d*(0.5+(aux>>28))*0.5. Branchless signed int8 +\n"
+"   dp4a, no Q8_1 offset term (zero-centered). Row-major. */\n"
+"__global__ void matvec_iq3_xxs_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                           const unsigned char *x_q81,\n"
+"                                           int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *sas = qs + 64;\n"
+"        const unsigned char *q81 = x_q81 + (size_t)(b * 8) * 36;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            unsigned int aux32;\n"
+"            memcpy(&aux32, sas + 4*ib32, 4);\n"
+"            float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n"
+"            const unsigned char *aq = q81 + ib32 * 36;\n"
+"            const int *a = (const int *)aq;\n"
+"            float d8 = half_to_float(*(const half_raw *)(aq + 32));\n"
+"            const unsigned char *qsi = qs + ib32 * 8;\n"
+"            int acc = 0;\n"
+"            #pragma unroll\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                unsigned int signs = ksigns_iq2xs_dev[(aux32 >> (7*l)) & 127];\n"
+"                unsigned int g1 = iq3xxs_grid_dev[qsi[2*l+0]];\n"
+"                unsigned int g2 = iq3xxs_grid_dev[qsi[2*l+1]];\n"
+"                unsigned int slo = signs & 0xF, shi = (signs >> 4) & 0xF;\n"
+"                unsigned int mlo = ((slo&1)?0x000000FFu:0u)|((slo&2)?0x0000FF00u:0u)|((slo&4)?0x00FF0000u:0u)|((slo&8)?0xFF000000u:0u);\n"
+"                unsigned int mhi = ((shi&1)?0x000000FFu:0u)|((shi&2)?0x0000FF00u:0u)|((shi&4)?0x00FF0000u:0u)|((shi&8)?0xFF000000u:0u);\n"
+"                unsigned int w1 = __vadd4(g1 ^ mlo, mlo & 0x01010101u);\n"
+"                unsigned int w2 = __vadd4(g2 ^ mhi, mhi & 0x01010101u);\n"
+"                acc = dp4a_s8((int)w1, a[2*l],     acc);\n"
+"                acc = dp4a_s8((int)w2, a[2*l + 1], acc);\n"
+"            }\n"
+"            sum += db * d8 * (float)acc;\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- matvec_iq2_s_f32: IQ2_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq2_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -3205,6 +3307,61 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+"/* ---- matvec_iq2_s_q8_1_dp4a: IQ2_S weight x Q8_1 activation via dp4a (decode) ---- */\n"
+"/* Mirrors matvec_iq2_s_f32: 82B = d + qs[32]@2 + signs[32]@34 + qh[8]@66 + scales[8]@74;\n"
+"   uint64 grid (8 mag, 10-bit idx via qh), two scales per ib32 (l<2 vs l>=2) -> two\n"
+"   accumulators. Branchless signed int8 + dp4a, no Q8_1 offset term. Row-major. */\n"
+"__global__ void matvec_iq2_s_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                         const unsigned char *x_q81,\n"
+"                                         int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 82;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 82;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *signs = bp + 34;\n"
+"        const unsigned char *qh = bp + 66;\n"
+"        const unsigned char *scales = bp + 74;\n"
+"        const unsigned char *q81 = x_q81 + (size_t)(b * 8) * 36;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;\n"
+"            float db1 = d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
+"            const unsigned char *aq = q81 + ib32 * 36;\n"
+"            const int *a = (const int *)aq;\n"
+"            float d8 = half_to_float(*(const half_raw *)(aq + 32));\n"
+"            const unsigned char *qsi = qs + ib32 * 4;\n"
+"            const unsigned char *sgi = signs + ib32 * 4;\n"
+"            int acc0 = 0, acc1 = 0;\n"
+"            #pragma unroll\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                int gid = qsi[l] | ((qh[ib32] << (8-2*l)) & 0x300);\n"
+"                unsigned long long gv = iq2s_grid_dev[gid];\n"
+"                unsigned int s = sgi[l];\n"
+"                unsigned int slo = s & 0xF, shi = (s >> 4) & 0xF;\n"
+"                unsigned int mlo = ((slo&1)?0x000000FFu:0u)|((slo&2)?0x0000FF00u:0u)|((slo&4)?0x00FF0000u:0u)|((slo&8)?0xFF000000u:0u);\n"
+"                unsigned int mhi = ((shi&1)?0x000000FFu:0u)|((shi&2)?0x0000FF00u:0u)|((shi&4)?0x00FF0000u:0u)|((shi&8)?0xFF000000u:0u);\n"
+"                unsigned int glo = (unsigned int)(gv & 0xFFFFFFFFu);\n"
+"                unsigned int ghi = (unsigned int)(gv >> 32);\n"
+"                unsigned int wlo = __vadd4(glo ^ mlo, mlo & 0x01010101u);\n"
+"                unsigned int whi = __vadd4(ghi ^ mhi, mhi & 0x01010101u);\n"
+"                if (l < 2) { acc0 = dp4a_s8((int)wlo, a[2*l], acc0); acc0 = dp4a_s8((int)whi, a[2*l+1], acc0); }\n"
+"                else       { acc1 = dp4a_s8((int)wlo, a[2*l], acc1); acc1 = dp4a_s8((int)whi, a[2*l+1], acc1); }\n"
+"            }\n"
+"            sum += d8 * (db0 * (float)acc0 + db1 * (float)acc1);\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- matvec_iq3_s_f32: IQ3_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq3_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -3310,6 +3467,59 @@ static const char *cuda_kernel_source =
 "            qhi += 2; qs += 8; si += 4;\n"
 "        }\n"
 "    }\n"
+"}\n"
+"\n"
+"/* ---- matvec_iq3_s_q8_1_dp4a: IQ3_S weight x Q8_1 activation via dp4a (decode) ---- */\n"
+"/* Mirrors matvec_iq3_s_f32: 110B = d + qs[64]@2 + qh[8]@66 + signs[32]@74 + scales[4]@106;\n"
+"   uint32 grid (4 mag, 9-bit idx via qh bit 8), one scale per 32-block. Processed per\n"
+"   32-sub-block (imb). Branchless signed int8 + dp4a, no Q8_1 offset term. Row-major. */\n"
+"__global__ void matvec_iq3_s_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                         const unsigned char *x_q81,\n"
+"                                         int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 110;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs_base = bp + 2;\n"
+"        const unsigned char *qh_base = bp + 66;\n"
+"        const unsigned char *signs_base = bp + 74;\n"
+"        const unsigned char *scales = bp + 106;\n"
+"        const unsigned char *q81 = x_q81 + (size_t)(b * 8) * 36;\n"
+"        for (int imb = 0; imb < 8; imb++) {\n"
+"            float db = d * (float)(1 + 2*((imb & 1) ? (scales[imb>>1] >> 4) : (scales[imb>>1] & 0xf)));\n"
+"            unsigned int qhb = qh_base[imb];\n"
+"            const unsigned char *qsi = qs_base + imb * 8;\n"
+"            const unsigned char *sgi = signs_base + imb * 4;\n"
+"            const unsigned char *aq = q81 + imb * 36;\n"
+"            const int *a = (const int *)aq;\n"
+"            float d8 = half_to_float(*(const half_raw *)(aq + 32));\n"
+"            int acc = 0;\n"
+"            #pragma unroll\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                unsigned int g1 = iq3s_grid_dev[qsi[2*l+0] | ((qhb << (8-2*l)) & 256)];\n"
+"                unsigned int g2 = iq3s_grid_dev[qsi[2*l+1] | ((qhb << (7-2*l)) & 256)];\n"
+"                unsigned int s = sgi[l];\n"
+"                unsigned int slo = s & 0xF, shi = (s >> 4) & 0xF;\n"
+"                unsigned int mlo = ((slo&1)?0x000000FFu:0u)|((slo&2)?0x0000FF00u:0u)|((slo&4)?0x00FF0000u:0u)|((slo&8)?0xFF000000u:0u);\n"
+"                unsigned int mhi = ((shi&1)?0x000000FFu:0u)|((shi&2)?0x0000FF00u:0u)|((shi&4)?0x00FF0000u:0u)|((shi&8)?0xFF000000u:0u);\n"
+"                unsigned int w1 = __vadd4(g1 ^ mlo, mlo & 0x01010101u);\n"
+"                unsigned int w2 = __vadd4(g2 ^ mhi, mhi & 0x01010101u);\n"
+"                acc = dp4a_s8((int)w1, a[2*l],     acc);\n"
+"                acc = dp4a_s8((int)w2, a[2*l + 1], acc);\n"
+"            }\n"
+"            sum += db * d8 * (float)acc;\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
@@ -5985,6 +6195,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_f32_f32;
     CUfunction fn_batch_matvec_f32_f32;
     CUfunction fn_matvec_iq2_xxs_f32;
+    CUfunction fn_matvec_iq2_xxs_q8_1_dp4a;
     CUfunction fn_matvec_q4_0_f32;
     CUfunction fn_matvec_q4_0_q8_1_dp4a;
     CUfunction fn_matvec_q4_1_f32;
@@ -5996,6 +6207,9 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_iq3_xxs_f32;
     CUfunction fn_matvec_iq2_s_f32;
     CUfunction fn_matvec_iq3_s_f32;
+    CUfunction fn_matvec_iq3_xxs_q8_1_dp4a;
+    CUfunction fn_matvec_iq2_s_q8_1_dp4a;
+    CUfunction fn_matvec_iq3_s_q8_1_dp4a;
     CUfunction fn_matvec_iq1_s_f32;
     CUfunction fn_matvec_iq1_m_f32;
     CUfunction fn_matvec_tq1_0_f32;
@@ -6483,6 +6697,7 @@ lookup_funcs:
     GET_FUNC(matvec_f32_f32);
     GET_FUNC(batch_matvec_f32_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
+    GET_FUNC(matvec_iq2_xxs_q8_1_dp4a);
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_0_q8_1_dp4a);
     GET_FUNC(matvec_q4_1_f32);
@@ -6494,6 +6709,9 @@ lookup_funcs:
     GET_FUNC(matvec_iq3_xxs_f32);
     GET_FUNC(matvec_iq2_s_f32);
     GET_FUNC(matvec_iq3_s_f32);
+    GET_FUNC(matvec_iq3_xxs_q8_1_dp4a);
+    GET_FUNC(matvec_iq2_s_q8_1_dp4a);
+    GET_FUNC(matvec_iq3_s_q8_1_dp4a);
     GET_FUNC(matvec_iq1_s_f32);
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
@@ -9305,6 +9523,30 @@ static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CU
                                         CUdeviceptr x, int n_rows, int n_cols) {
     launch_matvec_iq2_xxs_ex(r, dst, mat, x, n_rows, n_cols, 0);
 }
+static inline void launch_matvec_iq2_xxs_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                              CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_iq2_xxs_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+static inline void launch_matvec_iq3_xxs_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                              CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_iq3_xxs_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+static inline void launch_matvec_iq2_s_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_iq2_s_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+static inline void launch_matvec_iq3_s_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_iq3_s_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
 /* MoE expert matvec: routes IQ2_XXS to the block-major path when expert weights are repacked. */
 static inline void launch_moe_expert_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                             CUdeviceptr x, int n_rows, int n_cols, int type) {
@@ -9410,7 +9652,14 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                 launch_matvec_q6_K(r, dst, mat, x, n_rows, n_cols);
             }
             break;
-        case GGML_TYPE_IQ2_XXS: launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_IQ2_XXS:
+            if (r->use_dp4a && (n_cols % 256) == 0 && !getenv("CUDA_LLM_NO_IQ2XXS_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_iq2_xxs_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
         case GGML_TYPE_Q4_0:
             if (r->use_dp4a && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q40_DP4A")) {
                 launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
@@ -9425,9 +9674,30 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
         case GGML_TYPE_IQ4_NL:  launch_matvec_iq4_nl(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_IQ4_XS:  launch_matvec_iq4_xs(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_IQ2_XS:  launch_matvec_iq2_xs(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_IQ3_XXS: launch_matvec_iq3_xxs(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_IQ2_S:   launch_matvec_iq2_s(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_IQ3_S:   launch_matvec_iq3_s(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_IQ3_XXS:
+            if (r->use_dp4a && (n_cols % 256) == 0 && !getenv("CUDA_LLM_NO_IQ3XXS_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_iq3_xxs_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_iq3_xxs(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
+        case GGML_TYPE_IQ2_S:
+            if (r->use_dp4a && (n_cols % 256) == 0 && !getenv("CUDA_LLM_NO_IQ2S_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_iq2_s_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_iq2_s(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
+        case GGML_TYPE_IQ3_S:
+            if (r->use_dp4a && (n_cols % 256) == 0 && !getenv("CUDA_LLM_NO_IQ3S_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_iq3_s_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_iq3_s(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
         case GGML_TYPE_IQ1_S:   launch_matvec_iq1_s(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_IQ1_M:   launch_matvec_iq1_m(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_TQ1_0:   launch_matvec_tq1_0(r, dst, mat, x, n_rows, n_cols); break;
