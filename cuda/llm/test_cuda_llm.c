@@ -157,16 +157,30 @@ int main(int argc, char **argv) {
 
     if (max_tokens > n_tokens) max_tokens = n_tokens;
 
-    int32_t prefill_tokens[512];
+    /* CUDA_LLM_PREFILL_REPEAT=N forces an N-token prefill (repeating the prompt)
+     * so the batched-vs-sequential verify covers chunked prefill (N > chunk). */
+    int prefill_cap = 512;
+    { const char *e = getenv("CUDA_LLM_PREFILL_REPEAT");
+      if (e) { int v = atoi(e); if (v > prefill_cap) prefill_cap = v; } }
+    int32_t *prefill_tokens = (int32_t *)malloc((size_t)prefill_cap * sizeof(int32_t));
     int prefill_token_count = max_tokens;
     int repeated_prefill_tokens = 0;
     for (int i = 0; i < prefill_token_count; i++) {
         prefill_tokens[i] = tokens[i];
     }
+    { const char *e = getenv("CUDA_LLM_PREFILL_REPEAT");
+      int want = e ? atoi(e) : 0;
+      if (want > prefill_token_count) {
+          if (want > prefill_cap) want = prefill_cap;
+          prefill_token_count = want;
+          for (int i = 0; i < prefill_token_count; i++) prefill_tokens[i] = tokens[i % max_tokens];
+          repeated_prefill_tokens = 1;
+      }
+    }
     if (prefill_token_count > 0 && prefill_token_count < BATCHED_PREFILL_MIN_TOKENS) {
         prefill_token_count = BATCHED_PREFILL_MIN_TOKENS;
-        if (prefill_token_count > (int)(sizeof(prefill_tokens) / sizeof(prefill_tokens[0]))) {
-            prefill_token_count = (int)(sizeof(prefill_tokens) / sizeof(prefill_tokens[0]));
+        if (prefill_token_count > prefill_cap) {
+            prefill_token_count = prefill_cap;
         }
         for (int i = 0; i < prefill_token_count; i++) {
             prefill_tokens[i] = tokens[i % max_tokens];
@@ -231,8 +245,11 @@ int main(int argc, char **argv) {
     double total_cpu_ms = 0.0, total_gpu_ms = 0.0;
     int pass = 1;
     int have_seq_logits = 0;
+    int verify_decode = getenv("CUDA_LLM_VERIFY_DECODE") != NULL; /* compare 1st decode step (validates KV cache) */
+    int have_seq_decode = 0;
     float *last_gpu_hidden = (float *)malloc((size_t)n_embd * sizeof(float));
     float *last_seq_logits = n_vocab_size > 0 ? (float *)malloc((size_t)n_vocab_size * sizeof(float)) : NULL;
+    float *seq_decode_logits = (verify_decode && n_vocab_size > 0) ? (float *)malloc((size_t)n_vocab_size * sizeof(float)) : NULL;
     if (!last_gpu_hidden) {
         fprintf(stderr, "Failed to allocate last_gpu_hidden\n");
         cuda_llm_free(gpu);
@@ -354,6 +371,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "\n");
             }
         }
+        /* One decode step after the per-token prefill -> reference for the KV cache.
+         * Cache is at position prefill_token_count-1; forward a fixed token at the
+         * next position and capture its logits. */
+        if (verify_decode && seq_decode_logits && n_vocab_size > 0) {
+            float *dl = cuda_llm_forward_logits(gpu, prefill_tokens[0], prefill_token_count);
+            if (dl) { memcpy(seq_decode_logits, dl, (size_t)n_vocab_size * sizeof(float)); have_seq_decode = 1; }
+        }
     }
     } /* end !large_bench */
 
@@ -439,6 +463,18 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "\n");
         }
+        /* Decode-step check: after the BATCHED prefill, forward the same fixed
+         * token at the next position and compare logits to the per-token reference.
+         * This validates the KV cache the batched prefill leaves behind (e.g. the
+         * windowed-SWA circular-cache population). */
+        if (verify_decode && have_seq_decode && seq_decode_logits && n_vocab_size > 0) {
+            float *dl = cuda_llm_forward_logits(gpu, prefill_tokens[0], prefill_token_count);
+            if (dl) {
+                float derr = rel_l2_error(dl, seq_decode_logits, n_vocab_size);
+                fprintf(stderr, "Decode-step logits rel_L2_vs_seq=%.6f\n", derr);
+                if (!isfinite(derr) || derr >= 0.05f) pass = 0;
+            }
+        }
     } else {
         fprintf(stderr, "Prefill logits failed\n");
         pass = 0;
@@ -481,6 +517,14 @@ int main(int argc, char **argv) {
         if (result) {
             fprintf(stderr, "Large bench: %.1f ms (%.1f tok/s)\n",
                     ms, ms > 0 ? (1000.0 * bench_tokens / ms) : 0.0);
+            /* Checksum of the last-token hidden state — lets two batched runs
+             * (e.g. chunked vs single-batch) be compared without the sequential
+             * oracle. Deterministic random tokens (--large-bench-random) make it
+             * reproducible across runs. */
+            double cs = 0.0; double cs2 = 0.0;
+            for (int i = 0; i < n_embd; i++) { cs += result[i]; cs2 += (double)result[i] * result[i]; }
+            fprintf(stderr, "Large bench hidden: sum=%.6f l2=%.6f h[0..4]=%.5f,%.5f,%.5f,%.5f\n",
+                    cs, cs2, result[0], result[1], result[2], result[3]);
         } else {
             fprintf(stderr, "Large bench prefill failed\n");
             pass = 0;
