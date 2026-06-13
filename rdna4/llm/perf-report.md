@@ -690,29 +690,63 @@ batched prefill path is nearly 2x faster. IQ3_XXS still has modest headroom but
 already leads llama.cpp on both metrics; the remaining decode limit is mostly
 IQ3_XXS gather/dequant plus dense-FFN traffic.
 
-### 12.5 Gemma4 12B (RX 9070 XT, Q6_K_XL)
+### 12.5 Gemma4 12B (RX 9070 XT, Q6_K_XL) — correct end-to-end + long context
 
-First-ever Gemma4 inference on AMD HIP (RDNA4). llama.cpp (build 7261) does not
-support the `gemma4` architecture at all, so no ROCm comparison is possible.
-The GGUF lacks V weights for 8 full-attention layers (shared-KV metadata issue),
-so output quality is unreliable.
+First Gemma4 inference on AMD HIP (RDNA4). The port now produces **coherent,
+correct output**, verified two ways: (a) per-layer activations match llama.cpp's
+`llama-eval-callback` on the same GGUF (layer-0 `attn_out`/`l_out` agree to quant
+noise, e.g. `l_out-0 = 0.181,-0.146,16.63` vs ref `0.177,-0.146,16.62`), and
+(b) greedy generation is fluent ("The capital of France is" → " Paris. ... Paris
+is the capital and most populous city of France"). llama.cpp (build 9445) is the
+reference; it loads this exact GGUF and is coherent, so the GGUF is good.
 
-| model | runner | pp256 | pp512 | pp1024 | tg128 | note |
-|---|---:|---:|---:|---:|---:|---|
-| `Gemma4-12B-Q6_K_XL` | HIP runner | **1643** | **2515** | **3148** | **42.7** | `ms=24000`; prefill via batched hipBLASLt + batched attn |
+**Architecture (Gemma4 "unified", confirmed from HF config + weights + llama.cpp):**
+- Full-attention layers (every 6th: 5,11,…,47) set **value = key**
+  (`attention_k_eq_v`); there is no `v_proj`. V is the *raw* k_proj output (pre
+  k_norm) passed through a weightless per-head RMS norm, and is **not** RoPE'd.
+- Full-attn uses `num_global_key_value_heads = 1` (one 512-wide KV head),
+  proportional RoPE (`rope_freqs`, base 1e6); SWA uses 8 KV heads, head_dim 256,
+  base 1e4. Attention scale is **1.0** (the Q/K norms set magnitude).
+- `x += post_attn_norm(Wo·attn)`; embeddings scaled by `sqrt(n_embd)`.
 
-Configuration: hipBLASLt batched path for all 48 layers; batched scalar
-attention kernel (shared_mem=97024 bytes reduces LDS occupancy → 1 block/CU →
-less KV-cache L1/L2 thrashing); per-layer head_dim/kv_heads handling for SWA
-(hd=256) and full-attention (hd=512) layers; GELU activation, post-attention/FFN
-norms, layer output scale added to batched path. Max-seq-len (`-s`) set to 24000
-to increase attention kernel shared memory allocation.
+**Bugs fixed to go from garbage → coherent** (the forward pass had never actually
+run before this work — attention was silently skipped by an over-LDS launch):
+bounded online-softmax flash attention (≤64 KB LDS); circular SWA KV cache
+(window+chunk; the old linear store overflowed past pp1024 and could hang the
+GPU); per-layer SWA stride fix (RoPE/QK-norm/KV-store used the global q/kv_dim,
+2× too wide for 256-wide SWA heads); V=K with the correct pre-norm/raw-rms-norm
+semantics; attention scale 1.0; the `x += post_attn_norm(attn_out)` residual
+order; per-layer RoPE base + full-rotation `rope_dim` + proportional `freq_factors`;
+head_dim-512-safe QK-norm and V-norm kernels; and — the last and decisive one —
+the `sqrt(n_embd)` embedding scale, which was applied only on the final-token
+`hip_llm_forward_logits` path and missing from both the per-token
+`hip_llm_forward` and the batched `embed_tokens_batch` prefill paths, so every
+prefill token's residual base was ~62× too small.
 
-Key insight: larger attention-kernel shared memory (max_seq_len-based) limits
-concurrent blocks per CU, dramatically reducing L1/L2 cache contention from
-KV cache reads. This gave a 2.3x (pp512) to 4.4x (pp1024) improvement over the
-smaller smem configuration (8192).
+**Prefill throughput** (`LLM_PREFILL_WARMUP=1`, correct full V=K computation). The 8
+full-attention layers (head_dim 512, 1 KV head, GQA 16) do real O(M²) work and
+dominate long-context cost. They run on a WMMA flash kernel by default
+(`GEMMA_FA_WMMA=0` reverts to the scalar online-softmax kernel):
 
-Decode: 42.7 tok/s (per-row quant matvec via `forward_one_layer`).  
-Known limitation: SWA KV cache circular buffer overflow at pp>1024 (window_size
-only 1024 but linear KV store does not wrap).
+| pp    | scalar | WMMA | speedup |
+|------:|-------:|-----:|--------:|
+| 512   | 1715   | 1809 | 1.05×   |
+| 2048  | 1006   | 1135 | 1.13×   |
+| 8192  | 543    | 774  | 1.43×   |
+| 16384 | 356    | 581  | 1.63×   |
+| 32768 | 152    | 324  | 2.13×   |
+
+The WMMA kernel (`flash_attn_wmma_hd512_causal`) splits the 512 head_dim across **4
+waves** so each wave's O accumulator (128 dims) stays in registers. head_dim 512 is
+the obstacle: a single-wave O accumulator is 256 VGPR / 32 KB LDS and collapses
+occupancy to 1 wave/CU — a naive 1-wave WMMA kernel was actually *slower* than
+scalar (390 vs 543 @pp8192). The 4-wave split has each wave contract only its 128
+dims into a partial QK score; the 4 partials are summed via LDS to the full score,
+which all waves softmax. It reads the F32 KV cache directly (no F16 pack) and keeps
+occupancy up, so the speedup grows with context. Throughput still falls with M
+(the work is genuinely O(M²)); an earlier revision claimed ~1084 @ pp32k by
+*skipping* the full-attn layers — fast but wrong, since their V is K, not missing.
+
+Decode ~45 tok/s. VRAM ~constant in context (full-attn KV is only 1 head → ~1 GB at
+32k); 12B Q6_K weights (~10.7 GB) dominate. Further headroom: F16 KV cache and
+double-buffered tile loads in the WMMA kernel.
