@@ -100,10 +100,18 @@ static void embed_lookup(const ds4f_model *m, int tok, float *x) {
     }
 }
 
-/* ---- topology (tofu_topo.txt; written once by tofu_topo_helper) ---- */
+/* ---- topology (tofu_topo.txt; written once by tofu_topo_helper) ----
+ * TOPO_PATH (default tofu_topo.txt) may be overridden per process via TOFU_TOPO_PATH
+ * so co-resident EP groups (e.g. ds4p on 96 nodes + ds4f on 12) can keep SEPARATE
+ * topo files in one allocation. tofu_topo_helper honors the same env. */
+static const char *topo_path(void) {
+    const char *t = getenv("TOFU_TOPO_PATH");
+    return (t && *t) ? t : TOPO_PATH;
+}
 static int read_topo(uint8_t coords[][TOFU_NCOORDS]) {
-    FILE *f = fopen(TOPO_PATH, "r");
-    if (!f) { perror("cannot open " TOPO_PATH); fprintf(stderr, "  (run tofu_topo_helper first)\n"); exit(1); }
+    const char *tp = topo_path();
+    FILE *f = fopen(tp, "r");
+    if (!f) { fprintf(stderr, "cannot open %s (run tofu_topo_helper first)\n", tp); exit(1); }
     int n = 0; char line[256];
     while (fgets(line, sizeof line, f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
@@ -111,12 +119,12 @@ static int read_topo(uint8_t coords[][TOFU_NCOORDS]) {
         unsigned r, c[TOFU_NCOORDS];
         if (sscanf(line, "%u %u %u %u %u %u %u", &r, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5]) != 7)
             { fprintf(stderr, "malformed line: %s", line); exit(1); }
-        if ((int)r != n) { fprintf(stderr, "%s ranks out of order\n", TOPO_PATH); exit(1); }
+        if ((int)r != n) { fprintf(stderr, "%s ranks out of order\n", tp); exit(1); }
         for (int k = 0; k < TOFU_NCOORDS; k++) coords[n][k] = (uint8_t)c[k];
         n++;
     }
     fclose(f);
-    if (n < 1) { fprintf(stderr, "%s lists %d node(s)\n", TOPO_PATH, n); exit(1); }
+    if (n < 1) { fprintf(stderr, "%s lists %d node(s)\n", tp, n); exit(1); }
     return n;
 }
 
@@ -255,7 +263,7 @@ int main(void) {
     N = read_topo(topo);
     MyRank = -1;
     for (int r = 0; r < N; r++) if (memcmp(topo[r], my_coords, TOFU_NCOORDS) == 0) MyRank = r;
-    if (MyRank == -1) { fprintf(stderr, "my coords not in %s\n", TOPO_PATH); exit(1); }
+    if (MyRank == -1) { fprintf(stderr, "my coords not in %s\n", topo_path()); exit(1); }
 
     /* FJ mpiexec drops per-rank stderr -> capture to a file so diagnostics survive */
     {   char en[64]; snprintf(en, sizeof en, "ds4f_ep_stderr_rank%02d.txt", MyRank);
