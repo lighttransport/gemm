@@ -195,6 +195,39 @@ Why pin one host:
 - reusing one ControlMaster connection avoids that mismatch and keeps the local
   endpoint stable across many client calls
 
+### Long sessions & reconnection
+
+`rscgrp=small` allows `elapse` up to `72:00:00`, so the bridge can stay up for
+days. Both ends of the tunnel are supervised and reconnect on drops, capped at
+`MAX_RETRY` (default 10) **consecutive** failures (a healthy re-establish resets
+the counter):
+
+- **Job side** (`pjsub_bash_http_1n.sh`): a supervisor loop monitors the reverse
+  `ssh -R` and, on drop, re-selects a reachable frontend and re-opens it. It runs
+  until PJM's `elapse` (or `KEEPALIVE_SECONDS`, if set). Knobs (passed through by
+  the submit script via `pjsub -x`): `MAX_RETRY`, `MONITOR_INTERVAL` (default 15 s),
+  `KEEPALIVE_SECONDS` (0 = run until elapse), `HEALTH_EVERY` (deep through-frontend
+  probe cadence, in ticks).
+- **Client/frontend side** (`watch_bash_http_local_tunnel.sh`): monitors the local
+  `ssh -L` ControlMaster and re-creates it (via `open_…sh`) on drop, with the same
+  retry semantics. Run it alongside the session:
+
+  ```sh
+  nohup tools/watch_bash_http_local_tunnel.sh > /tmp/ds4p-bash-http/watch.log 2>&1 &
+  ```
+
+Set the session length and retry budget at submit time:
+
+```sh
+ELAPSE=24:00:00 MAX_RETRY=20 \
+  DS4P_BASH_HTTP_TOKEN=... tools/submit_bash_http_1n_over_ssh.sh
+```
+
+`ELAPSE` (default `06:00:00`, max `72:00:00` for `rscgrp=small`) is applied via
+`pjsub -L`. Validated 2026-06-13 (job `49226425`): killing the compute's `ssh -R`
+triggered `reconnect attempt 1/10` → `re-established` within ~5 s, and killing the
+local ControlMaster let the watcher rebuild it — the session survived both.
+
 Operational notes:
 
 - local direct HTTP client access from this Codex sandbox may require an
