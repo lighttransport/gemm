@@ -2802,6 +2802,47 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 
+"/* ---- matvec_q4_0_q8_1_dp4a: Q4_0 weight x Q8_1 activation via dp4a ---- */\n"
+"/* 8 warps/block, each warp = one row; lane strides over 32-elem blocks. Q4_0\n"
+"   value=(nibble-8)*d_w; per block, dot = d_w*(d8*sum(nibble*a_int) - 8*s8) where\n"
+"   the Q8_1 block holds a_int (int8 x32), d8=scale, s8=d8*sum(a_int). The 18-byte\n"
+"   Q4_0 block leaves qs at offset 2 (not 4-aligned), so qs is read as bytes and\n"
+"   packed; the Q8_1 quants (x_q81, 36B blocks) ARE 4-aligned and read as int. */\n"
+"__global__ void matvec_q4_0_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 32;\n"
+"    int row_bytes = nb * 18;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sumf = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 18;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned char *q81 = x_q81 + (size_t)b * 36;\n"
+"        const int *u = (const int *)q81;\n"
+"        float d8 = half_to_float(*(const half_raw *)(q81 + 32));\n"
+"        float s8 = half_to_float(*(const half_raw *)(q81 + 34));\n"
+"        int acc = 0;\n"
+"        #pragma unroll\n"
+"        for (int k = 0; k < 4; k++) {\n"
+"            unsigned int c0 = qs[4*k], c1 = qs[4*k+1], c2 = qs[4*k+2], c3 = qs[4*k+3];\n"
+"            int v_lo = (int)((c0 & 0xF) | ((c1 & 0xF) << 8) | ((c2 & 0xF) << 16) | ((c3 & 0xF) << 24));\n"
+"            int v_hi = (int)((c0 >> 4)  | ((c1 >> 4)  << 8) | ((c2 >> 4)  << 16) | ((c3 >> 4)  << 24));\n"
+"            acc = dp4a_s8(v_lo, u[k],     acc);\n"
+"            acc = dp4a_s8(v_hi, u[k + 4], acc);\n"
+"        }\n"
+"        sumf += dw * (d8 * (float)acc - 8.0f * s8);\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);\n"
+"    if (lane == 0) dst[row] = sumf;\n"
+"}\n"
+
 "/* ---- matvec_q4_1_f32: Q4_1 matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_q4_1_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
@@ -5857,6 +5898,7 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_f32_f32;
     CUfunction fn_matvec_iq2_xxs_f32;
     CUfunction fn_matvec_q4_0_f32;
+    CUfunction fn_matvec_q4_0_q8_1_dp4a;
     CUfunction fn_matvec_q4_1_f32;
     CUfunction fn_matvec_q5_0_f32;
     CUfunction fn_matvec_q5_1_f32;
@@ -6352,6 +6394,7 @@ lookup_funcs:
     GET_FUNC(batch_matvec_f32_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
     GET_FUNC(matvec_q4_0_f32);
+    GET_FUNC(matvec_q4_0_q8_1_dp4a);
     GET_FUNC(matvec_q4_1_f32);
     GET_FUNC(matvec_q5_0_f32);
     GET_FUNC(matvec_q5_1_f32);
@@ -9125,6 +9168,13 @@ static inline void launch_matvec_q4_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, 
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+static inline void launch_matvec_q4_0_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q4_0_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -9269,7 +9319,14 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
             }
             break;
         case GGML_TYPE_IQ2_XXS: launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_Q4_0:    launch_matvec_q4_0(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_Q4_0:
+            if (r->use_dp4a && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q40_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q4_0_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_q4_0(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
         case GGML_TYPE_Q4_1:    launch_matvec_q4_1(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q5_0:    launch_matvec_q5_0(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q5_1:    launch_matvec_q5_1(r, dst, mat, x, n_rows, n_cols); break;
