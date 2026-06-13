@@ -106,3 +106,50 @@ diagnostic artifact. First coherent text = phase 5 of the full 64-node job.
   ranges) or Tofu-broadcast dense after one rank stages — cuts reads to ~1.1 TB.
 - 48-rank long-ctx: the DS4F ctx levers (window ring, int8/int4 cmp, CP shard)
   apply unchanged if headroom gets tight.
+
+## Long context (1M) and co-serving — validated 2026-06-14 (96 & 108 nodes)
+
+### >32-rank EP all-reduce (commit 5268f0b, prerequisite for ANY run past 32 nodes)
+The uTofu EP-combine all-reduce (`a64fx/utofu-tests/tp_allreduce.h`) was hardcoded
+`TP_AR_MAXN=32` (built for the 11-node DS4F runs) and FATAL'd at `tp_comm_init` for N>32.
+The Rabenseifner recursive-doubling schedule is already non-power-of-2 aware (runs at N=11),
+so only the static caps needed lifting: **`TP_AR_MAXN 32→128`, `TP_AR_NSTEP 8→9`** (recv
+slots; `bcast_sid = ⌈log2 N⌉+1 ≤ 8` for N≤128) and **`ds4f_ep_runner MAX_NODES 96→128`**.
+The N=11 ds4f path is unchanged.
+
+### ds4p @ 1M context → 96 nodes is the MINIMUM (job 49227903, end-to-end real-weight)
+`pjsub_ds4p_96n.sh` — 96 = 8×12 = 6×16, `node=4x4x6:torus`, `--llio localtmp-size=87Gi`,
+`DS4F_MODEL=ds4p DS4F_EP_SIZE=96` + all `DS4F_TP_*` + `DS4F_TIERB2 INT8_CMP INT4_CMP IDX_INT8`
++ `DS4F_MAXPOS=1048576`:
+- **Staging blob ~30+ GB/rank** (replicated FP8 dense for 61L/7168 + 4 MXFP4 experts +
+  compressor/indexer) ⇒ needs **`localtmp-size=87Gi`** — 30Gi and 64Gi both fail `No
+  space`/EC=2. 96/96 staged in ~17 min.
+- **Run:** load 96/96 (arena **22.99 GB/rank**, 4 experts/rank), `tp_ar: N=96 pof2=64 rem=32`,
+  `warmtb2 DONE` at ~1M, **MemFree 2.11 GB**, lockstep argmax across all 96 ranks, NaNs=0,
+  `SENTINEL ds4p_96n_1M=done`. Perf (memory-first): prefill 3.67 tok/s, decode 1.27 tok/s,
+  EP comm 8.1%.
+- **96 is the genuine minimum:** it finishes with only ~2 GB MemFree — at the guard floor.
+  The replicated ~5.4 GB Tier-B2 caches don't shard with EP/TP, so <96 OOMs and >96 adds NO
+  1M headroom (only context-parallelism shards the caches). **Validate via MemFree, not RSS.**
+
+### 108-node co-serving (96 ds4p + 12 ds4f) — mechanism validated; 1M is at the cliff (job 49228161)
+`pjsub_cosrv_108n.sh` splits ONE `node=6x6x3:torus` (108) allocation into disjoint
+vcoordfiles (96 ds4p + 12 ds4f), runs each EP group in its **own cwd** (`cosrv/<grp>`, which
+isolates `tofu_topo.txt` + the `ds4f_ep_*_rank*.txt` outputs) with a **separate uTofu
+communicator**, and launches both `mpiexec` groups **concurrently**. The runner honors
+**`TOFU_TOPO_PATH`** (commit 08534a7, default `tofu_topo.txt`) so groups read distinct topo
+files; the topo helper is unchanged (per-group cwd isolates its write).
+- **Co-residence WORKS:** clean split (96/12), per-group topo isolated (96/12 rows), ds4p
+  staged 96/96, two concurrent EP `mpiexec` groups coexisted on disjoint nodes. **ds4f
+  (synthetic, 12 nodes) ran clean** — `tp_ar: N=12 pof2=8 rem=4`, prefill 10.75 tok/s,
+  NaNs=0, RSS 20.62 GB, **rc=0**.
+- **ds4p @1M failed in DECODE (rc=1):** it loaded 96/96 and **warmed all 61 layers to ~1M**,
+  but at **MemFree 0.38 GB** (vs 2.11 GB standalone — the `/local` HBM page-cache of the
+  ~30 GB blob plus node-placement variance on the 6×6×3 subset ate the margin). Under that
+  pressure a decode EP all-reduce timed out (`tp_ar bcast timeout want=142 got=141`).
+- **Takeaway:** the 96 ds4p + 12 ds4f topology is sound (isolation + concurrency proven, ds4f
+  green), but **ds4p @ exactly 1M on 96 nodes has no memory margin and is not robust**. For a
+  production co-serve: run ds4p at a context with headroom (≤~512k frees several GB), or shard
+  the replicated Tier-B2 caches with context-parallelism — adding EP/TP nodes alone cannot buy
+  1M headroom. (ds4f here was synthetic to validate the mechanism; real ds4f is `DS4F_REAL=1`
+  + a 12-node stage away — validated separately at 11n.)
