@@ -255,8 +255,8 @@ struct hip_sam3d_body_ctx {
     hipFunction_t fn_sentinel;
     hipFunction_t fn_resize, fn_patch, fn_prepend;
     hipFunction_t fn_bf16_round;
-    hipFunction_t fn_ln, fn_gemm_tiled;
-    hipFunction_t fn_rope_qk, fn_kv_tx, fn_fa;
+    hipFunction_t fn_ln, fn_gemm_tiled, fn_gemm_wmma;
+    hipFunction_t fn_rope_qk, fn_kv_tx, fn_fa, fn_fa_wmma;
     hipFunction_t fn_silu_mul, fn_layerscale_add;
     hipFunction_t fn_ray_cond_fourier, fn_conv1x1_chw, fn_ln_chw;
     hipFunction_t fn_linear_bias;
@@ -296,6 +296,18 @@ struct hip_sam3d_body_ctx {
      * (deferred). cpu_mhr is NULL until cfg.mhr_assets_dir is set. */
     sam3d_body_decoder_model *cpu_dec;
     sam3d_body_mhr_assets    *cpu_mhr;
+    /* GPU pose_correctives matvec offload (SAM3D_MHR_GPU): LW resident. */
+    int   mhr_gpu_pc;                 /* 1 if the GPU matvec hook is installed */
+    hipFunction_t fn_mhr_pc_matvec;   /* optimized GEMV (NULL → gemm_f32_bias) */
+    void *d_pc_lw;                    /* resident LW [55317,3000] f32 (633 MiB) */
+    void *d_pc_h;                     /* scratch h  [3000] f32 */
+    void *d_pc_out;                   /* scratch out [55317] f32 */
+    /* GPU blend_shape/face_expressions combine (resident vectors). */
+    void *d_blend_vec;               /* resident blend vectors [45,55317] (10 MiB) */
+    void *d_blend_base;              /* resident base_shape [55317] f32 */
+    void *d_face_vec;                /* resident face vectors [72,55317] (16 MiB) */
+    void *d_blend_coeffs;            /* scratch coeffs [72] f32 (max of 45,72) */
+    void *d_blend_out;               /* scratch out [55317] f32 */
 
     /* device runtime buffers. */
     void    *d_img_u8;  size_t img_u8_cap;   /* (Hin, Win, 3) u8, host-resized */
@@ -923,6 +935,12 @@ static int sb_compile(hip_sam3d_body_ctx *c) {
     BIND(fn_bf16_round,     "bf16_round_inplace_f32");
     BIND(fn_ln,             "layernorm_f32");
     BIND(fn_gemm_tiled,     "gemm_tiled_f16_f32");
+    /* Opt-in BF16-WMMA encoder GEMM; gfx12-only, soft (NULL -> scalar fallback). */
+    if (hipModuleGetFunction(&c->fn_gemm_wmma, c->mod, "gemm_f16w_bf16a_wmma_t") != hipSuccess)
+        c->fn_gemm_wmma = NULL;
+    /* Opt-in BF16-WMMA flash-attention (head_dim=64); gfx12-only, soft. */
+    if (hipModuleGetFunction(&c->fn_fa_wmma, c->mod, "flash_attn_tiled_wmma_f32") != hipSuccess)
+        c->fn_fa_wmma = NULL;
     BIND(fn_rope_qk,        "rope_apply_qk_rh_sam3d");
     BIND(fn_kv_tx,          "kv_transpose");
     BIND(fn_fa,             "flash_attn_tiled_f32");
@@ -963,6 +981,189 @@ static int sb_launch(hipFunction_t fn, unsigned gx, unsigned gy, unsigned gz,
         return -1;
     }
     return 0;
+}
+
+/* Opt-in BF16-WMMA encoder GEMM dispatch (SAM3D_GEMM_WMMA=1, default OFF).
+ * gemm_tiled_f16_f32 and gemm_f16w_bf16a_wmma_t share the packed param
+ * layout {void*Y,W,X,bias; int n_out,n_in,n_tok}; only launch geometry
+ * differs. Reads n_out/n_in/n_tok from the param buffer and picks. */
+static int sb_use_gemm_wmma(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("SAM3D_GEMM_WMMA");
+        cached = (e && *e && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+static int sb_use_fa_wmma(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("SAM3D_FA_WMMA");
+        cached = (e && *e && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* GPU offload for the MHR pose_correctives dense matvec (the 166M-FMA hot path):
+ * out[55317] = LW[55317,3000] @ h[3000]  (bias-free), run as gemm_f32_bias with
+ * N=1, D_in=3000, D_out=55317 and b=NULL on the resident LW. Installed as
+ * cpu_mhr->pc_matvec_fn when SAM3D_MHR_GPU=1. `user` is the ctx. */
+static int sb_pc_matvec_gpu(void *user, const float *h, float *out_offsets) {
+    hip_sam3d_body_ctx *c = (hip_sam3d_body_ctx *)user;
+    int dbg = getenv("SAM3D_MHR_GPU_DEBUG") ? 1 : 0;
+    double t0 = dbg ? sb_time_ms() : 0.0;
+    const int HID = S3DM_N_PC_H;       /* 3000  */
+    const int OUT = S3DM_N_VERTS * 3;  /* 55317 */
+    if (hipMemcpy(c->d_pc_h, h, (size_t)HID * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) return -1;
+    if (c->fn_mhr_pc_matvec) {
+        /* memory-bound GEMV (one block/row, ~600 GB/s) — ~8× the N=1
+         * gemm_f32_bias kernel which wastes 15/16 lanes per 16x16 block. */
+        int hid = HID, out = OUT;
+        struct __attribute__((packed)) {
+            void *Y; const void *h; const void *W; int HID, OUT;
+        } p = { c->d_pc_out, c->d_pc_h, c->d_pc_lw, hid, out };
+        if (sb_launch(c->fn_mhr_pc_matvec, (unsigned)OUT, 1, 1, 64, 1, 1,
+                      0, &p, sizeof(p)) < 0)
+            return -1;
+    } else {
+        void *nb = NULL;
+        struct __attribute__((packed)) {
+            void *Y; const void *X; const void *W; const void *b; int N, D_in, D_out;
+        } p = { c->d_pc_out, c->d_pc_h, c->d_pc_lw, nb, 1, HID, OUT };
+        unsigned bx = 16, by = 16;
+        unsigned gx = (unsigned)((1   + bx - 1) / bx);
+        unsigned gy = (unsigned)((OUT + by - 1) / by);
+        if (sb_launch(c->fn_gemm_f32, gx, gy, 1, bx, by, 1, 0, &p, sizeof(p)) < 0)
+            return -1;
+    }
+    if (hipMemcpy(out_offsets, c->d_pc_out, (size_t)OUT * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess) return -1;
+    if (dbg) {
+        static int n = 0; static double tot = 0.0;
+        double dt = sb_time_ms() - t0; tot += dt;
+        fprintf(stderr, "[sb_pc_matvec_gpu] call #%d %.3f ms (cumulative %.3f, kernel=%s)\n",
+                ++n, dt, tot, c->fn_mhr_pc_matvec ? "matvec" : "gemm");
+    }
+    return 0;
+}
+
+/* GPU blend_shape/face_expressions combine: out[V*3] = (which?0:base) +
+ * sum_n coeffs[n]*vec[n,V*3], on resident vectors. which 0=blend, 1=face.
+ * The CPU loops these with a 221KB stride per basis → ~15ms(blend)/~4ms(face)
+ * cold in-pipeline; on GPU the resident matrix is read at HBM BW (~0.03ms). */
+static int sb_blend_combine_gpu(void *user, int which, const float *coeffs,
+                                int n_basis, float *out_verts) {
+    hip_sam3d_body_ctx *c = (hip_sam3d_body_ctx *)user;
+    const int VD = S3DM_N_VERTS * 3;  /* 55317 */
+    if (hipMemcpy(c->d_blend_coeffs, coeffs, (size_t)n_basis * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) return -1;
+    void *vec  = which ? c->d_face_vec : c->d_blend_vec;
+    void *base = which ? NULL          : c->d_blend_base;
+    /* mhr_blend_combine_f32(out, coeffs, vectors, base, N_basis, V_d) */
+    struct __attribute__((packed)) {
+        void *out; const void *coeffs; const void *vectors; const void *base;
+        int N_basis, V_d;
+    } p = { c->d_blend_out, c->d_blend_coeffs, vec, base, n_basis, VD };
+    unsigned bx = 256, gx = (unsigned)((VD + bx - 1) / bx);
+    if (sb_launch(c->fn_mhr_blend, gx, 1, 1, bx, 1, 1, 0, &p, sizeof(p)) < 0)
+        return -1;
+    if (hipMemcpy(out_verts, c->d_blend_out, (size_t)VD * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess) return -1;
+    return 0;
+}
+
+/* Upload LW resident and install the GPU matvec hook on cpu_mhr.
+ * No-op unless SAM3D_MHR_GPU=1 and pc_linear_weight is loaded. */
+static int sb_mhr_gpu_setup(hip_sam3d_body_ctx *c) {
+    if (!c->cpu_mhr) return 0;
+    const char *e = getenv("SAM3D_MHR_GPU");
+    if (!(e && *e && e[0] != '0')) return 0;
+    const int HID = S3DM_N_PC_H, OUT = S3DM_N_VERTS * 3;
+    const float *LW = (const float *)c->cpu_mhr->pc_linear_weight.data;
+    if (!LW) {
+        fprintf(stderr, "sam3d_body: SAM3D_MHR_GPU set but pc_linear_weight missing — staying on CPU\n");
+        return 0;
+    }
+    /* LW is 633 MiB resident. Only engage if there's headroom for it AND the
+     * rest of the pipeline (encoder/decoder buffers, ~1 GiB) — otherwise the
+     * downstream allocs OOM mid-run. Stay on CPU (correct, just slower) if not. */
+    size_t need = (size_t)OUT * HID * sizeof(float);
+    size_t headroom = 1024ull * 1024 * 1024;  /* ~1 GiB for pipeline buffers */
+    size_t freeb = 0, totb = 0;
+    if (hipMemGetInfo(&freeb, &totb) != hipSuccess) return 0;
+    if (freeb < need + headroom) {
+        fprintf(stderr, "sam3d_body: SAM3D_MHR_GPU set but only %.0f MiB free "
+                "(need %.0f + ~1024 headroom) — staying on CPU\n",
+                freeb / 1048576.0, need / 1048576.0);
+        return 0;
+    }
+    if (hipMalloc(&c->d_pc_lw,  (size_t)OUT * HID * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&c->d_pc_h,   (size_t)HID * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&c->d_pc_out, (size_t)OUT * sizeof(float)) != hipSuccess) return -1;
+    if (hipMemcpy(c->d_pc_lw, LW, (size_t)OUT * HID * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) return -1;
+    /* Optimized GEMV kernel; soft (NULL → sb_pc_matvec_gpu uses gemm_f32_bias). */
+    if (hipModuleGetFunction(&c->fn_mhr_pc_matvec, c->mod, "mhr_pc_matvec_f32") != hipSuccess)
+        c->fn_mhr_pc_matvec = NULL;
+    c->cpu_mhr->pc_matvec_user = c;
+    c->cpu_mhr->pc_matvec_fn = sb_pc_matvec_gpu;
+    c->mhr_gpu_pc = 1;
+    if (c->verbose)
+        fprintf(stderr, "sam3d_body: MHR pose_correctives matvec on GPU "
+                "(LW %.0f MiB resident, kernel=%s)\n", (double)OUT * HID * 4 / 1048576.0,
+                c->fn_mhr_pc_matvec ? "mhr_pc_matvec_f32" : "gemm_f32_bias");
+
+    /* blend_shape / face_expressions on GPU with resident vectors (the real
+     * in-pipeline hot stages: ~15ms blend + ~4ms face cold on CPU). Only if the
+     * kernel + assets are present; soft (CPU fallback) on any miss. */
+    const int VD = S3DM_N_VERTS * 3;
+    const float *BV = (const float *)c->cpu_mhr->blend_shape_vectors.data;
+    const float *BB = (const float *)c->cpu_mhr->blend_base_shape.data;
+    const float *FV = (const float *)c->cpu_mhr->face_shape_vectors.data;
+    if (c->fn_mhr_blend && BV && BB && FV) {
+        int ok = 1;
+        ok &= hipMalloc(&c->d_blend_vec,   (size_t)S3DM_N_SHAPE * VD * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_blend_base,  (size_t)VD * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_face_vec,    (size_t)S3DM_N_FACE  * VD * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_blend_coeffs,(size_t)S3DM_N_FACE * sizeof(float)) == hipSuccess;
+        ok &= hipMalloc(&c->d_blend_out,   (size_t)VD * sizeof(float)) == hipSuccess;
+        if (ok) {
+            ok &= hipMemcpy(c->d_blend_vec, BV, (size_t)S3DM_N_SHAPE*VD*sizeof(float), hipMemcpyHostToDevice) == hipSuccess;
+            ok &= hipMemcpy(c->d_blend_base,BB, (size_t)VD*sizeof(float), hipMemcpyHostToDevice) == hipSuccess;
+            ok &= hipMemcpy(c->d_face_vec,  FV, (size_t)S3DM_N_FACE*VD*sizeof(float), hipMemcpyHostToDevice) == hipSuccess;
+        }
+        if (ok) {
+            c->cpu_mhr->blend_user = c;
+            c->cpu_mhr->blend_combine_fn = sb_blend_combine_gpu;
+            if (c->verbose)
+                fprintf(stderr, "sam3d_body: MHR blend_shape+face on GPU "
+                        "(%.0f MiB vectors resident)\n",
+                        (double)(S3DM_N_SHAPE + S3DM_N_FACE) * VD * 4 / 1048576.0);
+        } else if (c->verbose) {
+            fprintf(stderr, "sam3d_body: MHR blend GPU setup failed — blend/face stay on CPU\n");
+        }
+    }
+    return 0;
+}
+static int sb_gemm_tiled(hip_sam3d_body_ctx *c, void *p, size_t pb) {
+    const unsigned char *pp = (const unsigned char *)p;
+    int n_out, n_in, n_tok;
+    memcpy(&n_out, pp + 4 * sizeof(void *) + 0, 4);
+    memcpy(&n_in,  pp + 4 * sizeof(void *) + 4, 4);
+    memcpy(&n_tok, pp + 4 * sizeof(void *) + 8, 4);
+    if (getenv("SAM3D_GEMM_WMMA_DEBUG")) {
+        static int once = 0;
+        if (!once) { once = 1;
+            fprintf(stderr, "[sb_gemm_tiled] use_wmma=%d fn=%p n_in=%d -> %s\n",
+                    sb_use_gemm_wmma(), (void *)c->fn_gemm_wmma, n_in,
+                    (sb_use_gemm_wmma() && c->fn_gemm_wmma && (n_in % 16 == 0)) ? "WMMA" : "scalar"); }
+    }
+    if (sb_use_gemm_wmma() && c->fn_gemm_wmma && (n_in % 16 == 0))
+        return sb_launch(c->fn_gemm_wmma, (unsigned)((n_out + 127) / 128),
+                         (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, p, pb);
+    return sb_launch(c->fn_gemm_tiled, (unsigned)((n_out + 63) / 64),
+                     (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1, 0, p, pb);
 }
 
 static int sb_precision_is_bf16(const hip_sam3d_body_ctx *ctx)
@@ -1192,6 +1393,12 @@ load_decoder_and_mhr:
                 fprintf(stderr, "sam3d_body: MHR asset load failed (%s, %s)\n",
                         p1, p2);
                 hip_sam3d_body_destroy(c); return NULL;
+            }
+            /* Opt-in GPU offload of the MHR matvec + blend/face (SAM3D_MHR_GPU=1);
+             * no-op / soft CPU fallback otherwise. Must run after cpu_mhr loads. */
+            if (sb_mhr_gpu_setup(c) < 0) {
+                fprintf(stderr, "sam3d_body: MHR GPU setup failed — staying on CPU\n");
+                /* non-fatal: hooks left unset → CPU path */
             }
         }
     }
@@ -1445,10 +1652,7 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } p = { ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
                     3 * D, D, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((3 * D + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
+            if (sb_gemm_tiled(ctx, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
 
@@ -1485,10 +1689,7 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } p = { ctx->d_proj, b->proj_w, ctx->d_attn, b->proj_b,
                     D, D, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((D + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
+            if (sb_gemm_tiled(ctx, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
 
@@ -1520,10 +1721,7 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } p = { ctx->d_gate, b->fc1_w, ctx->d_ln, b->fc1_b,
                     FFN, D, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
+            if (sb_gemm_tiled(ctx, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
 
@@ -1544,10 +1742,7 @@ static int hip_sam3d_body_run_encoder_vith(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } p = { ctx->d_proj, b->fc2_w, ctx->d_gate, b->fc2_b,
                     D, FFN, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((D + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
+            if (sb_gemm_tiled(ctx, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
 
@@ -1808,10 +2003,7 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } p = { ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
                     3 * SB_DIM, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((3 * SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
+            if (sb_gemm_tiled(ctx, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
         if (sb_bf16_round(ctx, ctx->d_qkv, N_TOK * 3 * SB_DIM) < 0)
@@ -1853,7 +2045,14 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
                     N_TOK, SB_DIM, SB_HEADS, SB_HEAD_DIM, scale };
             unsigned gy = (unsigned)((N_TOK + 63) / 64);
             unsigned shmem = 2u * 16u * 64u * sizeof(float);
-            if (sb_launch(ctx->fn_fa, SB_HEADS, gy, 1, 64, 1, 1,
+            /* Opt-in BF16-WMMA FA (SAM3D_FA_WMMA): block 128 (4 waves), static
+             * LDS (shmem 0). dinov3 head_dim is 64, which the kernel requires. */
+            int use_fa_wmma = sb_use_fa_wmma() && ctx->fn_fa_wmma && SB_HEAD_DIM == 64;
+            if (use_fa_wmma) {
+                if (sb_launch(ctx->fn_fa_wmma, SB_HEADS, gy, 1, 128, 1, 1,
+                              0, &p, sizeof(p)) < 0)
+                    return HIP_SAM3D_BODY_E_LOAD;
+            } else if (sb_launch(ctx->fn_fa, SB_HEADS, gy, 1, 64, 1, 1,
                           shmem, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
@@ -1866,10 +2065,7 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } p = { ctx->d_proj, b->proj_w, ctx->d_attn, b->proj_b,
                     SB_DIM, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
+            if (sb_gemm_tiled(ctx, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
         if (sb_bf16_round(ctx, ctx->d_proj, N_TOK * SB_DIM) < 0)
@@ -1907,19 +2103,13 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } pg = { ctx->d_gate, b->w1_w, ctx->d_ln, b->w1_b,
                      SB_FFN, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &pg, sizeof(pg)) < 0)
+            if (sb_gemm_tiled(ctx, &pg, sizeof(pg)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
             struct __attribute__((packed)) {
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } pu = { ctx->d_up, b->w2_w, ctx->d_ln, b->w2_b,
                      SB_FFN, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &pu, sizeof(pu)) < 0)
+            if (sb_gemm_tiled(ctx, &pu, sizeof(pu)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
         if (sb_bf16_round(ctx, ctx->d_gate, N_TOK * SB_FFN) < 0)
@@ -1946,10 +2136,7 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
                 void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
             } p = { ctx->d_proj, b->w3_w, ctx->d_gate, b->w3_b,
                     SB_DIM, SB_FFN, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
+            if (sb_gemm_tiled(ctx, &p, sizeof(p)) < 0)
                 return HIP_SAM3D_BODY_E_LOAD;
         }
         if (sb_bf16_round(ctx, ctx->d_proj, N_TOK * SB_DIM) < 0)
@@ -2286,8 +2473,10 @@ int hip_sam3d_body_run_decoder(hip_sam3d_body_ctx *ctx)
         if (li >= NL - 1) break;
 
         t0 = sb_time_ms();
+        /* tokens_norm output is unused downstream — only pose_raw/cam_raw (from
+         * row 0) feed the heads. Pass NULL so the LN runs on 1 row, not N_Q. */
         rc = hip_sam3d_body_debug_run_norm_and_heads(
-                ctx, tokens, N_Q, tokens_n, pose_raw, cam_raw);
+                ctx, tokens, N_Q, NULL, pose_raw, cam_raw);
         if (rc != 0) { rc_total = rc; goto cleanup; }
         t_norm_heads_ms[li] += sb_time_ms() - t0;
         for (int i = 0; i < 519; i++) pose519[i] = pose_raw[i] + ip[i];
@@ -2341,8 +2530,9 @@ int hip_sam3d_body_run_decoder(hip_sam3d_body_ctx *ctx)
     {
     const int ti = NL;
     double t0 = sb_time_ms();
+    /* tokens_norm output unused downstream (see per-layer note) — pass NULL. */
     rc = hip_sam3d_body_debug_run_norm_and_heads(
-            ctx, tokens, N_Q, tokens_n, pose_raw, cam_raw);
+            ctx, tokens, N_Q, NULL, pose_raw, cam_raw);
     if (rc != 0) { rc_total = rc; goto cleanup; }
     t_norm_heads_ms[ti] += sb_time_ms() - t0;
     for (int i = 0; i < 519; i++) pose519[i] = pose_raw[i] + ip[i];
@@ -2357,7 +2547,7 @@ int hip_sam3d_body_run_decoder(hip_sam3d_body_ctx *ctx)
     t0 = sb_time_ms();
     if (sam3d_body_mhr_forward((const sam3d_body_mhr_assets *)ctx->cpu_mhr,
                                mp_buf, shape_buf, face_buf,
-                               1, 1, /*n_threads=*/0, mhr_scratch,
+                               1, 1, /*n_threads=*/SAM3DB_MHR_THREADS(), mhr_scratch,
                                verts_cm, gskel_cm) != 0) {
         rc_total = -1; goto cleanup;
     }
@@ -3311,7 +3501,12 @@ int hip_sam3d_body_debug_run_norm_and_heads(hip_sam3d_body_ctx *ctx,
      * (the pose token) for the head MLPs. */
     float row0_scratch[SB_DEC_DIM];
     const int n_rows = tokens_norm ? N_q : 1;
-    int n_threads = SAM3DB_MHR_THREADS();
+    /* This path always runs with tokens_norm==NULL (n_rows==1): a 1-row LN plus
+     * two single-row head matvecs (D->D, D->519). That's ~2.6 MFLOP — far below
+     * the OpenMP fork/join break-even, so a 32-thread parallel region is pure
+     * overhead (it showed up as 2–31 ms of noise per call). Serialize it.
+     * (If a future caller passes tokens_norm, fall back to threaded.) */
+    int n_threads = (n_rows > 1) ? SAM3DB_MHR_THREADS() : 1;
 #if defined(_OPENMP)
     #pragma omp parallel for schedule(static) num_threads(n_threads)
 #else

@@ -43,6 +43,14 @@
         <a href="http://localhost:8085/qwen_image_compare">Qwen-Image (pytorch ref) <span class="pill cmp">side-by-side</span><span class="port">:8085</span></a>
         <div class="desc">Adds <code>pytorch-cuda</code> shell-out via <code>ref/qwen_image/qwen_image_server.py</code>.</div>
       </li>
+      <li>
+        <a href="http://localhost:8085/qwen-image-fp4">Qwen-Image FP4 (native W4A4) <span class="pill cmp">side-by-side</span><span class="port">:8085</span></a>
+        <div class="desc">Compares native 4-bit (Nunchaku NVFP4 SVDQuant, sm_120a W4A4 OMMA) vs FP8 on the CUDA backend. Same sidecar; run with <code>VARIANTS=fp4:&lt;dit&gt;,fp8:&lt;dit&gt;</code> (auto-defaults when the dits are present).</div>
+      </li>
+      <li>
+        <a href="http://localhost:8085/qwen-image">Qwen-Image <span class="pill">single</span><span class="port">:8085</span></a>
+        <div class="desc">Single-image generate on the CUDA sidecar with a <code>precision</code> mode picker: <code>fp8</code> or <code>fp4</code> (native NVFP4 W4A4 OMMA, sm_120a). Picking <code>fp4</code> runs the <code>ours-cuda</code> backend only and renders one image.</div>
+      </li>
     </ul>
   </section>
 

@@ -3944,6 +3944,15 @@ float *hip_vision_encode(hip_vision_runner *r, const float *rgb_norm, int width,
             int use_wmma_bf16_4w_pre = (fa_mode && strcmp(fa_mode, "wmma_bf16_4w_pre") == 0);
             int use_wmma_f16_4w_pre  = (fa_mode && strcmp(fa_mode, "wmma_f16_4w_pre")  == 0);
 
+            /* AUTO-SELECT: with no HIP_VLM_FA override and head_dim <= 80, default
+             * to the fastest WMMA kernel (BF16 4-wave, pre-packed K/V). PyTorch
+             * ROCm ref uses BF16. Set HIP_VLM_FA=tiled (or any non-wmma value) to
+             * force the scalar path. */
+            int fa_auto = (fa_mode == NULL);
+            if (fa_auto && head_dim <= 80) {
+                use_wmma_bf16_4w_pre = 1;
+            }
+
             /* Transpose K,V — choose precision matching the FA path. */
             int total = n_patches * dim;
             int grid_kv = (total + 255) / 256;

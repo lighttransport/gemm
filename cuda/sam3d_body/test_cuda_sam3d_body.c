@@ -5,7 +5,7 @@
  *   test_cuda_sam3d_body --safetensors-dir <DIR> --image <image.jpg>
  *       --mhr-assets <DIR>
  *       [--bbox x0 y0 x1 y1 | --auto-bbox] [--focal F]
- *       [-o body.obj] [--precision bf16|fp16] [--device N] [-v]
+ *       [-o body.obj] [--precision fp16|fp32|bf16] [--device N] [-v]
  *
  *   test_cuda_sam3d_body <safetensors-dir> <image.jpg> ...
  */
@@ -33,6 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 static double cli_time_ms(void)
 {
@@ -46,10 +49,12 @@ static void print_usage(const char *prog)
     fprintf(stderr,
             "Usage:\n"
             "  %s --safetensors-dir DIR --image IMG.jpg --mhr-assets DIR "
-            "[--bbox x0 y0 x1 y1 | --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]] "
+            "[--bbox x0 y0 x1 y1 | --auto-bbox [--auto-bbox-fast] "
+            "[--rt-detr-model PATH] [--auto-thresh F]] "
             "[--focal F] [-o body.obj] "
             "[--backbone dinov3|vith] "
-            "[--precision bf16|fp16] [--device N] [-v]\n"
+            "[--precision fp16|fp32|bf16] [--device N] [-t N] "
+            "[--warmup N] [--repeat N] [-v]\n"
             "  %s SFT_DIR IMG.jpg ...   (legacy positional)\n",
             prog, prog);
 }
@@ -150,11 +155,15 @@ int main(int argc, char **argv)
     const char *image_path = NULL;
     const char *mhr_assets = NULL;
     const char *out_path   = "body.obj";
-    const char *precision  = "bf16";
+    const char *precision  = "fp16";
     float bbox[4] = {0}; int has_bbox = 0;
     float focal_hint = 0;
     int device = 0, verbose = 0;
+    int n_threads = 0;
+    int warmup = 0;
+    int repeat = 1;
     int auto_bbox = 0;
+    int auto_bbox_fast = 0;
     int auto_bbox_used = 0;
     float auto_bbox_score = 0.0f;
     const char *rt_detr_model = "/mnt/disk01/models/rt_detr_s/model.safetensors";
@@ -178,10 +187,14 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--mhr-assets") && i+1 < argc) mhr_assets = argv[++i];
         else if (!strcmp(a, "--precision")  && i+1 < argc) precision  = argv[++i];
         else if (!strcmp(a, "--device")     && i+1 < argc) device     = atoi(argv[++i]);
+        else if (!strcmp(a, "-t")           && i+1 < argc) n_threads  = atoi(argv[++i]);
+        else if (!strcmp(a, "--warmup")     && i+1 < argc) warmup     = atoi(argv[++i]);
+        else if (!strcmp(a, "--repeat")     && i+1 < argc) repeat     = atoi(argv[++i]);
         else if (!strcmp(a, "--focal")      && i+1 < argc) focal_hint = strtof(argv[++i], NULL);
         else if (!strcmp(a, "-o")           && i+1 < argc) out_path   = argv[++i];
         else if (!strcmp(a, "-v"))                         verbose    = 1;
         else if (!strcmp(a, "--auto-bbox"))                auto_bbox  = 1;
+        else if (!strcmp(a, "--auto-bbox-fast")) { auto_bbox = 1; auto_bbox_fast = 1; }
         else if (!strcmp(a, "--rt-detr-model") && i+1 < argc) rt_detr_model = argv[++i];
         else if (!strcmp(a, "--auto-thresh")   && i+1 < argc) auto_thresh   = strtof(argv[++i], NULL);
         else if (!strcmp(a, "--backbone") && i+1 < argc) {
@@ -203,6 +216,9 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         return 2;
     }
+#if defined(_OPENMP)
+    if (n_threads > 0) omp_set_num_threads(n_threads);
+#endif
 
     double t0 = cli_time_ms();
     int iw = 0, ih = 0, ichan = 0;
@@ -211,6 +227,8 @@ int main(int argc, char **argv)
     t_decode_image_ms = cli_time_ms() - t0;
 
     if (auto_bbox && !has_bbox) {
+        if (auto_bbox_fast)
+            setenv("RT_DETR_ENCODER_ONLY", "1", 1);
         const double t_auto0 = cli_time_ms();
         t0 = cli_time_ms();
         rt_detr_t *det = rt_detr_load(rt_detr_model);
@@ -239,8 +257,9 @@ int main(int argc, char **argv)
         auto_bbox_used = 1;
         auto_bbox_score = box.score;
         fprintf(stderr, "[test_cuda_sam3d_body] auto-bbox: "
-                "detector=rt-detr-s score=%.4f threshold=%.3f image=%dx%d "
+                "detector=rt-detr-s%s score=%.4f threshold=%.3f image=%dx%d "
                 "bbox=(%.1f,%.1f,%.1f,%.1f)\n",
+                auto_bbox_fast ? "-encoder" : "",
                 box.score, auto_thresh, iw, ih,
                 box.x0, box.y0, box.x1, box.y1);
         t_auto_bbox_ms = cli_time_ms() - t_auto0;
@@ -265,9 +284,26 @@ int main(int argc, char **argv)
     if (focal_hint > 0) cuda_sam3d_body_set_focal(ctx, focal_hint);
     t_set_image_ms = cli_time_ms() - t0;
 
+    int rc = 0;
+    if (warmup < 0) warmup = 0;
+    for (int ri = 0; ri < warmup; ri++) {
+        rc = cuda_sam3d_body_run_all(ctx);
+        if (rc != 0) break;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "[test_cuda_sam3d_body] warmup run_all rc=%d\n", rc);
+        cuda_sam3d_body_destroy(ctx);
+        stbi_image_free(pixels);
+        return rc;
+    }
+
+    if (repeat <= 0) repeat = 1;
     t0 = cli_time_ms();
-    int rc = cuda_sam3d_body_run_all(ctx);
-    t_run_all_ms = cli_time_ms() - t0;
+    for (int ri = 0; ri < repeat; ri++) {
+        rc = cuda_sam3d_body_run_all(ctx);
+        if (rc != 0) break;
+    }
+    t_run_all_ms = (cli_time_ms() - t0) / (double)repeat;
     if (rc != 0) {
         fprintf(stderr, "[test_cuda_sam3d_body] run_all rc=%d\n", rc);
         cuda_sam3d_body_destroy(ctx);

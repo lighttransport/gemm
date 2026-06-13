@@ -1,0 +1,20 @@
+# build artifacts
+test_hip_hy3d
+verify_dinov2
+verify_dit
+verify_vae
+wmma_selftest
+
+# generated traces / benches / venvs
+traces/
+ref_env/.venv/
+bench/perf_results.md
+bench/layer_results.md
+
+# rocprof outputs
+rocp_*.csv
+rocp_*.json
+
+# uv lockfile + egg-info from ref_env
+ref_env/uv.lock
+ref_env/*.egg-info/

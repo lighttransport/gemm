@@ -26,7 +26,9 @@ typedef struct cuda_vision_runner cuda_vision_runner;
 /* Initialize CUDA vision encoder.
  * device_id: CUDA device index (0 = first GPU)
  * verbose: 0=quiet, 1=info, 2=debug, 3=dump PTX
- * use_f16: 0=F32 weights (exact match with CPU), 1=F16 weights (faster, ~1e-2 error) */
+ * use_f16: 0=F32 weights (exact match with CPU), 1=F16 weights (faster, ~1e-2 error)
+ * BF16 native mode: set VLM_BF16=1 env var (use_f16 must be 0; loads weights as BF16,
+ * intermediates as BF16, uses BF16 cuBLAS GEMMs) */
 cuda_vision_runner *cuda_vision_init(int device_id, int verbose, int use_f16);
 
 /* Set maximum pixel budget for dynamic resolution. Must be called BEFORE load_weights.

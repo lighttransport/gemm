@@ -34,16 +34,23 @@
 #include "sam3d_body_vit.h"
 #include "npy_io.h"
 
+static int ref_backbone_is_float32(const char *refdir)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/backbone_dtype.txt", refdir);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    char buf[64];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return strstr(buf, "float32") != NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
-    /* 32-layer ViT-H with vanilla GELU MLP. Upstream forward runs in
-     * bf16 (FP16_TYPE=bfloat16) so the reference is bf16-rounded
-     * compounded over 32 blocks; our fp32 forward drifts max≈3.5e-1
-     * mean≈1.4e-2 from that even with FP32 weights (verified
-     * 2026-04-26). Gate set to track the bf16 floor; tighten if
-     * we ever switch to a bf16 forward path. */
-    float threshold = 5e-1f;
+    float threshold = -1.0f;
     int n_threads = 1, verbose = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -64,6 +71,8 @@ int main(int argc, char **argv)
                 argv[0]);
         return 2;
     }
+    int f32_ref = ref_backbone_is_float32(refdir);
+    if (threshold < 0.0f) threshold = f32_ref ? 2e-3f : 6e-1f;
 
     char path[1024];
 
@@ -131,10 +140,10 @@ int main(int argc, char **argv)
         }
     }
     double mean_abs = sum / (double)n;
-    /* mean budget tracks the observed bf16 forward floor (≈1.4e-2)
-     * with a 1.5× headroom; a real bug typically blows up the mean
-     * before the max so this is a tight catch even at the loose max. */
-    float mean_gate = 2e-2f;
+    /* Float32 refs are the canonical parity target. Legacy/config BF16
+     * refs keep the older loose gate because upstream rounds through bf16
+     * over all 32 ViT-H blocks. */
+    float mean_gate = f32_ref ? 5e-5f : 2e-2f;
     fprintf(stderr,
             "[verify_vith] patches=(%d,%d) D=%d  "
             "max_abs=%.6e (d=%d py=%d px=%d) "

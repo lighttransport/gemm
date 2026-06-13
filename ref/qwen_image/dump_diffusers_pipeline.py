@@ -10,13 +10,77 @@ Run:
         --size 256 --steps 20 --suffix _256
 """
 import argparse
+import gc
 import time
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 DEFAULT_FP8_DIT = "/mnt/disk1/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors"
+
+
+class NativeFp8Linear(nn.Module):
+    def __init__(self, base: nn.Linear, name: str, out_dtype: torch.dtype):
+        super().__init__()
+        self.in_features = base.in_features
+        self.out_features = base.out_features
+        self.weight = base.weight
+        self.bias = base.bias
+        self.name = name
+        self.out_dtype = out_dtype
+
+    def forward(self, x):
+        w = self.weight
+        if x.is_cuda and w.is_cuda and w.dtype == torch.float8_e4m3fn and hasattr(torch, "_scaled_mm"):
+            shape = x.shape
+            x2 = x.reshape(-1, shape[-1])
+            x8 = torch.clamp(x2.float(), -448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+            scale = torch.ones((), device=x.device, dtype=torch.float32)
+            try:
+                y = torch._scaled_mm(
+                    x8,
+                    w.t().contiguous(),
+                    scale_a=scale,
+                    scale_b=scale,
+                    out_dtype=self.out_dtype,
+                    bias=self.bias,
+                )
+            except TypeError:
+                y = torch._scaled_mm(
+                    x8,
+                    w.t().contiguous(),
+                    scale_a=scale,
+                    scale_b=scale,
+                    out_dtype=self.out_dtype,
+                )
+                if self.bias is not None:
+                    y = y + self.bias.to(dtype=y.dtype)
+            if isinstance(y, tuple):
+                y = y[0]
+            return y.reshape(*shape[:-1], y.shape[-1])
+        return F.linear(x, w, self.bias)
+
+
+def patch_linears(module: nn.Module, out_dtype: torch.dtype, prefix: str = "") -> int:
+    patched = 0
+    for name, child in list(module.named_children()):
+        full = f"{prefix}.{name}" if prefix else name
+        if isinstance(child, nn.Linear):
+            setattr(module, name, NativeFp8Linear(child, full, out_dtype))
+            patched += 1
+        else:
+            patched += patch_linears(child, out_dtype, full)
+    return patched
+
+
+def count_dtypes(module: nn.Module):
+    counts = {}
+    for p in module.parameters():
+        counts[str(p.dtype)] = counts.get(str(p.dtype), 0) + p.numel()
+    return counts
 
 
 def main():
@@ -31,24 +95,40 @@ def main():
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cfg", type=float, default=4.0)
+    ap.add_argument("--fast", choices=["none", "fp8_matrix_mult"], default="none",
+                    help="fp8_matrix_mult preserves FP8 DiT weights and uses torch._scaled_mm with Comfy-style scale=1 activation FP8")
+    ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     ap.add_argument("--suffix", default="")
     args = ap.parse_args()
     sfx = args.suffix
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     import os
     from diffusers import QwenImagePipeline, QwenImageTransformer2DModel
 
     if args.fp8_dit and os.path.exists(args.fp8_dit):
         print(f"loading FP8 DiT from {args.fp8_dit}")
-        transformer = QwenImageTransformer2DModel.from_single_file(
-            args.fp8_dit, config=args.model, subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-        )
+        if args.fast == "fp8_matrix_mult":
+            transformer = QwenImageTransformer2DModel.from_single_file(
+                args.fp8_dit, config=args.model, subfolder="transformer",
+            )
+            print(f"transformer dtypes before fast patch: {count_dtypes(transformer)}")
+            patched = patch_linears(transformer, dtype)
+            print(f"ComfyUI --fast fp8_matrix_mult reference: patched {patched} nn.Linear modules")
+        else:
+            transformer = QwenImageTransformer2DModel.from_single_file(
+                args.fp8_dit, config=args.model, subfolder="transformer",
+                torch_dtype=dtype,
+            )
         pipe = QwenImagePipeline.from_pretrained(
-            args.model, transformer=transformer, torch_dtype=torch.bfloat16,
+            args.model, transformer=transformer, torch_dtype=dtype,
         )
     else:
-        pipe = QwenImagePipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+        if args.fast == "fp8_matrix_mult":
+            raise ValueError("--fast fp8_matrix_mult requires --fp8-dit with FP8 weights")
+        pipe = QwenImagePipeline.from_pretrained(args.model, torch_dtype=dtype)
+    if args.fast == "fp8_matrix_mult":
+        print(f"transformer dtypes after pipeline attach: {count_dtypes(pipe.transformer)}")
     pipe.enable_sequential_cpu_offload()
 
     # ---- 1. Text embeddings ----
@@ -63,9 +143,28 @@ def main():
         max_sequence_length=512,
     )
     prompt_embeds = out[0] if isinstance(out, tuple) else out
+    prompt_embeds_mask = out[1] if isinstance(out, tuple) and len(out) > 1 else None
     arr = prompt_embeds[0].detach().to(torch.float32).cpu().numpy()
     arr.tofile(f"apple_text{sfx}.bin")
     print(f"apple_text{sfx}.bin: {arr.shape} mean {arr.mean():.5f} std {arr.std():.5f}")
+    pipe.maybe_free_model_hooks()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    negative_prompt_embeds = None
+    negative_prompt_embeds_mask = None
+    if args.cfg > 1.0:
+        neg_out = pipe.encode_prompt(
+            prompt=[args.negative],
+            device=torch.device("cuda"),
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        negative_prompt_embeds = neg_out[0] if isinstance(neg_out, tuple) else neg_out
+        negative_prompt_embeds_mask = neg_out[1] if isinstance(neg_out, tuple) and len(neg_out) > 1 else None
+        pipe.maybe_free_model_hooks()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # ---- 2. Hook transformer for first input (init noise packed) and per-step latents ----
     captured = {}
@@ -93,8 +192,12 @@ def main():
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     out = pipe(
-        prompt=args.prompt,
-        negative_prompt=args.negative,
+        prompt=None,
+        negative_prompt=None,
+        prompt_embeds=prompt_embeds,
+        prompt_embeds_mask=prompt_embeds_mask,
+        negative_prompt_embeds=negative_prompt_embeds,
+        negative_prompt_embeds_mask=negative_prompt_embeds_mask,
         height=args.size,
         width=args.size,
         num_inference_steps=args.steps,

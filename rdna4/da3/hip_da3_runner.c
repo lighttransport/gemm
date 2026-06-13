@@ -10,8 +10,8 @@
  * F16 weights on GPU, F32 compute. Single-stream sequential kernel launches.
  *
  * Key differences from CUDA version:
- *   - No MMA/tensor core kernels (RDNA4 has no MMA)
- *   - gemm_tiled_f16_f32 is the PRIMARY GEMM kernel
+ *   - gemm_tiled_f16_f32 is the default GEMM kernel
+ *   - Optional gfx12 WMMA GEMM is gated by DA3_GEMM_WMMA=1
  *   - No FP8 GEMM (no hardware FP8 MMA on RDNA4)
  *   - PTX inline ASM replaced with HIP builtins
  *
@@ -41,6 +41,89 @@
 /* ======================================================================== */
 
 static const char *hip_da3_specific_kernels =
+"\n"
+"typedef _Float16 da3_f16x8 __attribute__((ext_vector_type(8)));\n"
+"typedef float da3_float8 __attribute__((ext_vector_type(8)));\n"
+"__device__ __forceinline__ _Float16 da3_f16_bits_to_f16(half_raw h) {\n"
+"    _Float16 v;\n"
+"    __builtin_memcpy(&v, &h, 2);\n"
+"    return v;\n"
+"}\n"
+"\n"
+"/* ---- DA3: gemm_f16w_f16a_wmma_t: opt-in gfx12 WMMA GEMM ---- */\n"
+"/* Drop-in for gemm_tiled_f16_f32: Y[n_tok,n_out] = X[n_tok,n_in] * W[n_out,n_in]^T + bias. */\n"
+"#if defined(__gfx1200__) || defined(__gfx1201__)\n"
+"__global__ void gemm_f16w_f16a_wmma_t(float *Y, const half_raw *W, const float *X,\n"
+"                                       const float *bias, int n_out, int n_in, int n_tok) {\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int half = lane >> 4;\n"
+"    int idx = lane & 15;\n"
+"    int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    __shared__ _Float16 smA[128*32];\n"
+"    __shared__ _Float16 smB[128*32];\n"
+"    da3_float8 z = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};\n"
+"    da3_float8 cv00=z, cv01=z, cv10=z, cv11=z, cv20=z, cv21=z, cv30=z, cv31=z;\n"
+"    for (int k = 0; k < n_in; k += 32) {\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int e = tid * 16 + it;\n"
+"            int er = e >> 5, ek = e & 31;\n"
+"            int row = cta_m0 + er, kp = k + ek;\n"
+"            smA[e] = (row < n_tok && kp < n_in) ? (_Float16)X[(size_t)row * n_in + kp] : (_Float16)0.0f;\n"
+"        }\n"
+"        for (int it = 0; it < 16; it++) {\n"
+"            int e = tid * 16 + it;\n"
+"            int er = e >> 5, ek = e & 31;\n"
+"            int col = cta_n0 + er, kp = k + ek;\n"
+"            smB[e] = (col < n_out && kp < n_in) ? da3_f16_bits_to_f16(W[(size_t)col * n_in + kp]) : (_Float16)0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 32;\n"
+"        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
+"            da3_f16x8 a0,a1,a2,a3,b0,b1;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                a0[i] = smA[(a_base + 0  + idx) * 32 + kk0 + k_off + i];\n"
+"                a1[i] = smA[(a_base + 16 + idx) * 32 + kk0 + k_off + i];\n"
+"                a2[i] = smA[(a_base + 32 + idx) * 32 + kk0 + k_off + i];\n"
+"                a3[i] = smA[(a_base + 48 + idx) * 32 + kk0 + k_off + i];\n"
+"                b0[i] = smB[(b_base + 0  + idx) * 32 + kk0 + k_off + i];\n"
+"                b1[i] = smB[(b_base + 16 + idx) * 32 + kk0 + k_off + i];\n"
+"            }\n"
+"            cv00 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, cv00);\n"
+"            cv01 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b1, cv01);\n"
+"            cv10 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b0, cv10);\n"
+"            cv11 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, cv11);\n"
+"            cv20 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a2, b0, cv20);\n"
+"            cv21 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a2, b1, cv21);\n"
+"            cv30 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a3, b0, cv30);\n"
+"            cv31 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a3, b1, cv31);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 32;\n"
+"    da3_float8 *accs[8] = {&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31};\n"
+"    int ms[8] = {0,0,16,16,32,32,48,48};\n"
+"    int ns[8] = {0,16,0,16,0,16,0,16};\n"
+"    for (int t = 0; t < 8; t++) {\n"
+"        int col = wave_n0 + ns[t] + idx;\n"
+"        if (col >= n_out) continue;\n"
+"        float bv = bias ? bias[col] : 0.0f;\n"
+"        da3_float8 acc = *accs[t];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int row = wave_m0 + ms[t] + half * 8 + i;\n"
+"            if (row < n_tok)\n"
+"                Y[(size_t)row * n_out + col] = acc[i] + bv;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#endif\n"
 "\n"
 "/* ---- DA3: qk_layernorm_f32: per-head LN on Q/K with stride ---- */\n"
 "/* stride = distance in floats between same element in consecutive tokens */\n"
@@ -324,6 +407,30 @@ static const char *hip_da3_specific_kernels =
 "    data[idx] += emb * ratio;\n"
 "}\n"
 "\n"
+"/* ---- sinusoidal_uv_posembed_tok: token-major [H*W,C] variant ---- */\n"
+"__global__ void sinusoidal_uv_posembed_tok(float *data, int C, int H, int W,\n"
+"                                            float span_x, float span_y, float ratio) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = C * H * W;\n"
+"    if (idx >= total) return;\n"
+"    int p = idx / C;\n"
+"    int c = idx % C;\n"
+"    int h = p / W, w = p % W;\n"
+"    int quarter = C / 4;\n"
+"    int band, is_cos;\n"
+"    float coord;\n"
+"    float u = (W > 1) ? span_x * (2.0f * w - (W - 1)) / (float)W : 0.0f;\n"
+"    float v = (H > 1) ? span_y * (2.0f * h - (H - 1)) / (float)H : 0.0f;\n"
+"    if (c < quarter) { band = c; coord = u; is_cos = 0; }\n"
+"    else if (c < 2*quarter) { band = c - quarter; coord = u; is_cos = 1; }\n"
+"    else if (c < 3*quarter) { band = c - 2*quarter; coord = v; is_cos = 0; }\n"
+"    else { band = c - 3*quarter; coord = v; is_cos = 1; }\n"
+"    float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);\n"
+"    float angle = coord * omega;\n"
+"    float emb = is_cos ? cosf(angle) : sinf(angle);\n"
+"    data[p * C + c] += emb * ratio;\n"
+"}\n"
+"\n"
 "} /* extern C */\n"
 ;
 
@@ -382,6 +489,7 @@ struct hip_da3_runner {
     hipModule_t module;
     hipFunction_t fn_layernorm_f32;
     hipFunction_t fn_gemm_tiled_f16_f32;
+    hipFunction_t fn_gemm_f16w_f16a_wmma_t;
     hipFunction_t fn_flash_attn_tiled_f32;
     hipFunction_t fn_add_bias_f32;
     hipFunction_t fn_qk_layernorm_f32;
@@ -406,6 +514,7 @@ struct hip_da3_runner {
     hipFunction_t fn_groupnorm_f32;
     hipFunction_t fn_channel_layernorm_f32;
     hipFunction_t fn_sinusoidal_uv_posembed;
+    hipFunction_t fn_sinusoidal_uv_posembed_tok;
     hipFunction_t fn_silu_f32;
 
     /* Model params */
@@ -575,6 +684,10 @@ static int da3_compile_kernels(hip_da3_runner *r) {
     GET_FN(silu_f32);
 
     /* DA3-specific kernels */
+    if (hipModuleGetFunction(&r->fn_gemm_f16w_f16a_wmma_t,
+                             r->module, "gemm_f16w_f16a_wmma_t") != hipSuccess) {
+        r->fn_gemm_f16w_f16a_wmma_t = NULL;
+    }
     GET_FN(qk_layernorm_f32);
     GET_FN(rope_2d_f32);
     GET_FN(swiglu_f32);
@@ -589,11 +702,13 @@ static int da3_compile_kernels(hip_da3_runner *r) {
     GET_FN(groupnorm_f32);
     GET_FN(channel_layernorm_f32);
     GET_FN(sinusoidal_uv_posembed);
+    GET_FN(sinusoidal_uv_posembed_tok);
 
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "hip_da3: %d kernels compiled\n", 26);
+        fprintf(stderr, "hip_da3: %d kernels compiled\n",
+                27 + (r->fn_gemm_f16w_f16a_wmma_t ? 1 : 0));
     return 0;
 }
 
@@ -1864,9 +1979,37 @@ static void kl_layernorm(hip_da3_runner *r, void *dst, void *src,
        256 * sizeof(float), r->stream, args);
 }
 
+static int da3_use_gemm_wmma(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DA3_GEMM_WMMA");
+        cached = (e && *e && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static void kl_gemm(hip_da3_runner *r, void *Y, void *W_f16,
                      void *X, void *bias, int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
+    if (getenv("DA3_GEMM_WMMA_DEBUG")) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            int eligible = da3_use_gemm_wmma() && r->fn_gemm_f16w_f16a_wmma_t &&
+                           (n_in % 16 == 0) && n_tok >= 16 && n_out >= 16;
+            fprintf(stderr,
+                    "[da3_gemm] use_wmma=%d fn=%p shape=(tok=%d,out=%d,in=%d) -> %s\n",
+                    da3_use_gemm_wmma(), (void *)r->fn_gemm_f16w_f16a_wmma_t,
+                    n_tok, n_out, n_in, eligible ? "WMMA" : "scalar");
+        }
+    }
+    if (da3_use_gemm_wmma() && r->fn_gemm_f16w_f16a_wmma_t &&
+        (n_in % 16 == 0) && n_tok >= 16 && n_out >= 16) {
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        KL(r->fn_gemm_f16w_f16a_wmma_t, gx, gy, 1, 256, 1, 1, 0, r->stream, args);
+        return;
+    }
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     KL(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1, 0, r->stream, args);
@@ -2011,6 +2154,34 @@ static void kl_add_inplace(hip_da3_runner *r, void *dst, void *src, int n) {
     int grid = (n + 255) / 256;
     void *args[] = {&dst, &src, &n};
     KL(r->fn_add_f32, (unsigned)grid, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
+static void kl_sinusoidal_uv_posembed_chw(hip_da3_runner *r, void *data,
+                                           int C, int H, int W) {
+    float aspect = (float)W / (float)H;
+    float diag = sqrtf(aspect * aspect + 1.0f);
+    float span_x = aspect / diag;
+    float span_y = 1.0f / diag;
+    float ratio = 0.1f;
+    int total = C * H * W;
+    int grid = (total + 255) / 256;
+    void *args[] = {&data, &C, &H, &W, &span_x, &span_y, &ratio};
+    KL(r->fn_sinusoidal_uv_posembed, (unsigned)grid, 1, 1, 256, 1, 1, 0,
+       r->stream, args);
+}
+
+static void kl_sinusoidal_uv_posembed_tok(hip_da3_runner *r, void *data,
+                                           int C, int H, int W) {
+    float aspect = (float)W / (float)H;
+    float diag = sqrtf(aspect * aspect + 1.0f);
+    float span_x = aspect / diag;
+    float span_y = 1.0f / diag;
+    float ratio = 0.1f;
+    int total = C * H * W;
+    int grid = (total + 255) / 256;
+    void *args[] = {&data, &C, &H, &W, &span_x, &span_y, &ratio};
+    KL(r->fn_sinusoidal_uv_posembed_tok, (unsigned)grid, 1, 1, 256, 1, 1, 0,
+       r->stream, args);
 }
 
 static void kl_channel_layernorm(hip_da3_runner *r, void *dst, void *src,
@@ -2250,6 +2421,8 @@ static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu2_c2_w[0], r->dpt_aux.fuse_rcu2_c2_b[0],
                      r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0],
                      sp_h[0] * 2, sp_w[0] * 2);
+
+    kl_sinusoidal_uv_posembed_chw(r, aux_fused, feat, sp_h[0] * 2, sp_w[0] * 2);
 
     /* Debug: check aux_fused values after refinenet */
     if (r->verbose >= 2) {
@@ -2663,6 +2836,7 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
         if (dw->norm_w) kl_layernorm(r, r->d_dpt_ln, r->d_dpt_cat, dw->norm_w, dw->norm_b, np, head_dim_in);
         else hipMemcpyAsync(r->d_dpt_ln, r->d_dpt_cat, (size_t)np*head_dim_in*sizeof(float), hipMemcpyDeviceToDevice, r->stream);
         kl_gemm(r, r->d_dpt_proj, dw->proj_w[fi], r->d_dpt_ln, dw->proj_b[fi], oc_val, head_dim_in, np);
+        kl_sinusoidal_uv_posembed_tok(r, r->d_dpt_proj, oc_val, gh, gw);
 
         if (fi == 0) kl_deconv_gemm_scatter(r, r->d_dpt_spatial[0], r->d_dpt_proj, dw->upsample_0_w, dw->upsample_0_b, r->d_dpt_ln, oc_val, oc_val, gh, gw, 4, 4, 4);
         else if (fi == 1) kl_deconv_gemm_scatter(r, r->d_dpt_spatial[1], r->d_dpt_proj, dw->upsample_1_w, dw->upsample_1_b, r->d_dpt_ln, oc_val, oc_val, gh, gw, 2, 2, 2);
@@ -2690,7 +2864,7 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
     /* Output convolutions — matching official DA3 DualDPT:
      * 1. neck (output_conv1): Conv3x3(feat→feat/2) — NO ReLU
      * 2. Bilinear upsample fused_res → model_res (296→518)
-     * 3. TODO: sinusoidal UV pos_embed (ratio=0.1)
+     * 3. sinusoidal UV pos_embed (ratio=0.1) — implemented just below
      * 4. out_0 (output_conv2[0]): Conv3x3(feat/2→out_mid) + ReLU
      * 5. out_2 (output_conv2[2]): Conv1x1(out_mid→2) */
     int feat_half = feat / 2; if (feat_half < 1) feat_half = 1;
@@ -2838,6 +3012,7 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
 
             kl_gemm(r, r->d_dpt_proj, gdw->proj_w[fi], r->d_dpt_ln, gdw->proj_b[fi],
                      oc_val, head_dim_in, np);
+            kl_sinusoidal_uv_posembed_tok(r, r->d_dpt_proj, oc_val, gh, gw);
 
             if (fi == 0)
                 kl_deconv_gemm_scatter(r, r->d_dpt_spatial[0], r->d_dpt_proj,
@@ -2864,8 +3039,10 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                           sp_h[fi], sp_w[fi], oc_val, feat, 3, 3, 1, 1);
         }
 
-        /* TODO: Inject merger features at level 0 (add to d_dpt_adapted[0]) */
-        /* For now, skip merger injection — just run standard DPT pipeline */
+        /* Merger features are injected later, after refinenet + neck conv
+         * (lines further down). Matches official gsdpt.py:109 which adds
+         * images_merger(images) to the upsampled neck output, not to the
+         * pre-refinenet adapter. */
 
         /* Bottom-up RefineNet fusion with GSDPT weights */
         gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
@@ -2928,6 +3105,24 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
             kl_bilinear(r, r->d_dpt_tmp2, r->d_gs_merged,
                          gs_feat_half, r->gs_merger_h, r->gs_merger_w, gs_fh, gs_fw);
             kl_add_inplace(r, r->d_dpt_tmp, r->d_dpt_tmp2, gs_feat_half * gs_fh * gs_fw);
+        }
+
+        /* Sinusoidal UV positional embedding (matches gsdpt.py:111-112,
+         * _add_pos_embed at ratio=0.1, omega_0=100 — same formula the main
+         * DPT head applies just before output_conv2). Per-stage and aux pos_embed
+         * sites in the official model remain unported (see pos-embed-status.md). */
+        {
+            float aspect_gs = (float)gs_fw / (float)gs_fh;
+            float diag_gs   = sqrtf(aspect_gs * aspect_gs + 1.0f);
+            float span_x_gs = aspect_gs / diag_gs;
+            float span_y_gs = 1.0f / diag_gs;
+            float ratio_gs  = 0.1f;
+            int   total_uv  = gs_feat_half * gs_fh * gs_fw;
+            int   grid_uv   = (total_uv + 255) / 256;
+            void *uv_args[] = {&r->d_dpt_tmp, &gs_feat_half, &gs_fh, &gs_fw,
+                               &span_x_gs, &span_y_gs, &ratio_gs};
+            KL(r->fn_sinusoidal_uv_posembed, (unsigned)grid_uv, 1, 1, 256, 1, 1, 0,
+               r->stream, uv_args);
         }
 
         /* output_conv2: Conv2d(128, 32, 3, pad=1) + ReLU + Conv2d(32, gs_oc, 1) */
