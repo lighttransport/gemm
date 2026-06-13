@@ -11346,11 +11346,11 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
                 CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
                 void *cv[] = { &d_x_f16, &input, &n_elems };
                 cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
-                /* weight Q6_K -> F16: one 256-thread block per 256-element super-block */
+                /* weight Q6_K -> F16: 256-thread block per 4 super-blocks */
                 int nb = in_dim / 256;
-                int total_blocks = out_dim * nb;
+                int total_sb = out_dim * nb;
                 void *dq[] = { &d_w_f16, &mat, &out_dim, &in_dim };
-                cuLaunchKernel(r->fn_dequant_q6_K_to_f16, total_blocks, 1, 1, 256, 1, 1, 0, r->stream, dq, NULL);
+                cuLaunchKernel(r->fn_dequant_q6_K_to_f16, (total_sb + 3) / 4, 1, 1, 256, 1, 1, 0, r->stream, dq, NULL);
                 int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_w_f16, d_x_f16,
                                                                       n_tokens, out_dim, in_dim);
                 if (gemm_ret == 0) return;
