@@ -754,3 +754,69 @@ extern "C" __global__ void dequant_q8_0_to_f16(
         d[i] = scale * (float)qs[i];
     }
 }
+
+/* ---- dequant_q8_0_to_f16_h: Q8_0 weight matrix -> real FP16 (half) ----
+ * Enables tensor-core F16 GEMM for Q8_0 QKV projections (vs F32 SIMT GEMM).
+ * GPU layout is 36 bytes/block (4-byte-aligned f16 scale + 32 int8). One warp
+ * per 32-element block, 8 blocks per 256-thread CUDA block; coalesced writes. */
+extern "C" __global__ void dequant_q8_0_to_f16_h(
+    half *out,
+    const unsigned char *mat,
+    int rows, int cols)
+{
+    int nb = cols / 32, rb = nb * 36;
+    int total = rows * nb;
+    int sb = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    if (sb >= total) return;
+    int lane = threadIdx.x & 31;
+    int row = sb / nb, bk = sb % nb;
+    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 36;
+    half *o = out + (size_t)row * cols + (size_t)bk * 32;
+    float scale = __half2float(*(const __half *)bp);
+    const signed char *qs = (const signed char *)(bp + 4);
+    o[lane] = __float2half(scale * (float)qs[lane]);
+}
+
+/* ---- dequant_q6_K_to_f16: Q6_K weight matrix -> FP16 ----
+ * Q6_K super-block = 256 elements in 210 bytes:
+ *   ql[128] (low 4 bits), qh[64] (high 2 bits), sc[16] (int8 scales), d (f16).
+ * One thread per 256-element block. Output layout matches matvec_q6_K_f32 so
+ * the dequanted F16 weight feeds cuBLAS F16 GEMM with identical math. */
+extern "C" __global__ void dequant_q6_K_to_f16(
+    half *out,
+    const unsigned char *mat,
+    int rows, int cols)
+{
+    /* One CUDA block (256 threads) per 256-element super-block; thread = output
+     * element e. Consecutive e -> consecutive threads -> fully coalesced F16
+     * writes (the old one-thread-per-block version wrote 256 strided elements
+     * per thread at ~43 GB/s; this hits stream bandwidth). */
+    int nb = cols / 256, rb = nb * 210;
+    int sb = blockIdx.x;                 /* super-block index */
+    if (sb >= rows * nb) return;
+    int row = sb / nb, bk = sb % nb;
+
+    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 210;
+    half *o = out + (size_t)row * cols + (size_t)bk * 256;
+
+    __shared__ float sd;
+    if (threadIdx.x == 0) sd = __half2float(*(const __half *)(bp + 208));
+    __syncthreads();
+    float d = sd;
+
+    int e = threadIdx.x;                 /* 0..255 */
+    int half_i = e >> 7;                 /* 0 or 1 */
+    int r = e & 127;                     /* 0..127 */
+    int grp = r >> 5;                    /* 0..3 */
+    int l = r & 31;                      /* 0..31 */
+    const unsigned char *ql = bp + half_i * 64;
+    const unsigned char *qh = bp + 128 + half_i * 32;
+    const signed char *sc = (const signed char *)(bp + 192) + half_i * 8;
+    int is = l >> 4;                     /* 0 or 1 */
+    int qval, scv;
+    if (grp == 0)      { qval = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)); scv = sc[is+0]; }
+    else if (grp == 1) { qval = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)); scv = sc[is+2]; }
+    else if (grp == 2) { qval = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)); scv = sc[is+4]; }
+    else               { qval = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)); scv = sc[is+6]; }
+    o[e] = __float2half(d * scv * (qval - 32));
+}
