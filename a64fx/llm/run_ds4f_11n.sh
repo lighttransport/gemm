@@ -188,6 +188,14 @@ export DS4F_TP_HEAD=${DS4F_TP_HEAD:-0}
 export DS4F_TP_EMBED=${DS4F_TP_EMBED:-0}
 # DS4F_INT4_CMP=1 stores cmp_kv as int4 (implies INT8_CMP); leanest long-ctx cmp cache.
 export DS4F_INT4_CMP=${DS4F_INT4_CMP:-0}
+# Context-parallel cache sharding (Phase 2): shard the compressed Tier-B2 caches by slot
+# range across the EP ranks so per-node cache ~ /N instead of replicated. DS4F_CP enables
+# (validated gather), DS4F_CP_SHARD shards cmp_q4, DS4F_CP_IDX shards idx_kv8_4 (needs
+# INT4_CMP + IDX_INT8); DS4F_CP_MERGE (default on) = cross-rank top-k candidate merge.
+export DS4F_CP=${DS4F_CP:-0}
+export DS4F_CP_SHARD=${DS4F_CP_SHARD:-0}
+export DS4F_CP_IDX=${DS4F_CP_IDX:-0}
+export DS4F_CP_MERGE=${DS4F_CP_MERGE:-1}
 # Warm-phase ctx-ceiling guard (clean _exit(42) before OOM) + per-layer MemFree trace.
 export DS4F_WARM_RSS_TRACE=${DS4F_WARM_RSS_TRACE:-0}
 export DS4F_WARM_MEMAVAIL_STOP_GB=${DS4F_WARM_MEMAVAIL_STOP_GB:-1.5}
