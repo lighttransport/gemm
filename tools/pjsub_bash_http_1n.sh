@@ -9,7 +9,10 @@
 
 set -euo pipefail
 
-FRONTEND_HOST=${FRONTEND_HOST:-login1.fugaku.r-ccs.riken.jp}
+# Frontend to reverse-tunnel back to. LOGIN_NODE (1..8) -> loginN.fugaku.r-ccs.riken.jp;
+# submit_bash_http_1n_over_ssh.sh overrides FRONTEND_* explicitly via pjsub -x.
+LOGIN_NODE=${LOGIN_NODE:-1}
+FRONTEND_HOST=${FRONTEND_HOST:-login${LOGIN_NODE}.fugaku.r-ccs.riken.jp}
 FRONTEND_SSH_TARGET=${FRONTEND_SSH_TARGET:-$FRONTEND_HOST}
 FRONTEND_SSH_TARGETS=${FRONTEND_SSH_TARGETS:-$FRONTEND_SSH_TARGET}
 FRONTEND_PORT=${FRONTEND_PORT:-21364}
