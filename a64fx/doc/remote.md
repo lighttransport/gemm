@@ -128,19 +128,26 @@ client sentinel: SENTINEL bash_http_client=OK
 ```
 
 For efficient local session management, do not rely on the load-balanced
-`fugaku` alias after the tunnel is open. Pin one concrete login host, here
-`login1.fugaku.r-ccs.riken.jp`, and reuse that same host for both:
+`fugaku` alias after the tunnel is open. Pin one concrete login host — by default
+`login1.fugaku.r-ccs.riken.jp` — and reuse that same host for both:
 
 - the local `ssh -L` owner
 - the compute node's reverse `ssh -R` target
 
-Procedure:
+The pinned frontend is configurable with `LOGIN_NODE` (1..8 →
+`loginN.fugaku.r-ccs.riken.jp`, default 1), a single knob honored by all four
+local-tunnel scripts so the local forward, the reverse tunnel, and teardown all
+agree on the same node. `DS4P_BASH_HTTP_TOKEN` (the bridge bearer token) must be
+set before launch — the submit script fails fast if it is unset. Procedure:
 
 ```sh
-tools/open_bash_http_local_tunnel.sh
-tools/submit_bash_http_1n_over_ssh.sh
+export DS4P_BASH_HTTP_TOKEN=...        # required: the bridge's bearer token
+export LOGIN_NODE=1                    # optional: pin loginN.fugaku.r-ccs.riken.jp (1..8)
+
+tools/open_bash_http_local_tunnel.sh   # local ssh -L + ControlMaster to loginN; writes state.env
+tools/submit_bash_http_1n_over_ssh.sh  # pjsub the 1-node bridge (reverse tunnel to loginN)
 python3 tools/test_bash_http_remote.py http://127.0.0.1:21364 "$DS4P_BASH_HTTP_TOKEN"
-tools/close_bash_http_local_tunnel.sh
+tools/close_bash_http_local_tunnel.sh  # tear down the local ControlMaster
 ```
 
 `open_bash_http_local_tunnel.sh` creates a ControlMaster connection to
@@ -154,6 +161,13 @@ local 127.0.0.1:21364 -> login1.fugaku.r-ccs.riken.jp:127.0.0.1:21364
 `submit_bash_http_1n_over_ssh.sh` reads that state file and submits the batch
 job with matching `FRONTEND_HOST` / `FRONTEND_SSH_TARGET`, so the compute node's
 reverse tunnel lands on the same pinned host that owns the local forward.
+`LOGIN_NODE` (or an explicit `REMOTE=`) overrides which frontend that is;
+otherwise the value recorded in `state.env` wins. The target is passed to `pjsub`
+as a single **hostname** — never an IP (compute nodes can't ssh the internal
+frontend IP) and never a comma-joined list (`pjsub -x` treats commas as variable
+separators and rejects the job at submit time, leaving it `ST=ERR` with no
+output). Re-validated 2026-06-13 with batch job `49226036` (default
+`LOGIN_NODE=1`; compute `a27-6108c`).
 
 Logic:
 
