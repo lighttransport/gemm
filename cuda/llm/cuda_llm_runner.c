@@ -6073,6 +6073,12 @@ struct cuda_llm_runner {
     CUdeviceptr d_fa2_scores_f16; /* [sq * total_s] F16 score matrix for cuBLAS-d512 attention */
     int fa2_buf_max_s; /* token capacity the d_fa2_* buffers were sized for */
     CUdeviceptr d_f16_scratch; /* [max_out * max_in] F16 dequant scratch for Q8_0 GEMM */
+    CUdeviceptr d_f16_scratch2; /* second weight-dequant buffer for double-buffered overlap */
+    CUstream stream_dq;        /* weight dequant runs here, overlapping GEMM on the main stream */
+    CUevent dq_evt[2];         /* dequant-done events (ping-pong) */
+    CUevent gemm_evt[2];       /* gemm-done events guarding buffer reuse (ping-pong) */
+    int dq_pp;                 /* ping-pong index */
+    int prefill_overlap;       /* 1 = double-buffer weight dequant vs GEMM */
     CUdeviceptr d_batch_f16_scratch; /* [max_tokens * max_dim] F16 for cuBLAS input conversion */
     size_t batch_f16_scratch_bytes; /* current byte capacity of d_batch_f16_scratch */
 
@@ -11170,6 +11176,56 @@ static int launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
 }
 
 /* Helper: launch batched matvec for a given weight type */
+/* Dequant a Q6_K or Q8_0 weight to F16 + cuBLAS tensor-core F16 GEMM.
+ * When r->prefill_overlap, the weight dequant runs on a second stream into a
+ * ping-pong buffer so weight[i+1]'s dequant overlaps GEMM[i] (dequant is ~19%
+ * of prefill and fits entirely under the ~66% spent in GEMM). Returns 0 on
+ * success, -1 to fall back. The input F32->F16 convert stays on the main stream
+ * (ordered with the GEMM that reads it). */
+static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                    CUdeviceptr input, int out_dim, int in_dim,
+                                    int n_tokens, int weight_type) {
+    if (!r->cublas || !r->d_batch_f16_scratch || !r->fn_convert_f32_to_f16) return -1;
+    CUfunction dq_fn; int dq_grid, dq_block;
+    int nb;
+    if (weight_type == GGML_TYPE_Q6_K) {
+        if (!r->fn_dequant_q6_K_to_f16) return -1;
+        nb = in_dim / 256; dq_grid = (out_dim * nb + 3) / 4; dq_block = 256; dq_fn = r->fn_dequant_q6_K_to_f16;
+    } else if (weight_type == GGML_TYPE_Q8_0) {
+        if (!r->fn_dequant_q8_0_to_f16_h) return -1;
+        nb = in_dim / 32; dq_grid = (out_dim * nb + 7) / 8; dq_block = 256; dq_fn = r->fn_dequant_q8_0_to_f16_h;
+    } else return -1;
+
+    size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+    if (w_f16_bytes > 256*1024*1024) return -1;
+    if (!r->d_f16_scratch) {
+        if (cuMemAlloc(&r->d_f16_scratch, 256*1024*1024) != CUDA_SUCCESS) return -1;
+    }
+
+    int overlap = r->prefill_overlap && r->stream_dq && r->d_f16_scratch2;
+    CUstream dq_stream = overlap ? r->stream_dq : r->stream;
+    int pp = overlap ? r->dq_pp : 0;
+    CUdeviceptr wbuf = (overlap && pp) ? r->d_f16_scratch2 : r->d_f16_scratch;
+
+    if (overlap) cuStreamWaitEvent(dq_stream, r->gemm_evt[pp], 0); /* buffer free? */
+    void *dq[] = { &wbuf, &mat, &out_dim, &in_dim };
+    cuLaunchKernel(dq_fn, dq_grid, 1, 1, dq_block, 1, 1, 0, dq_stream, dq, NULL);
+    if (overlap) cuEventRecord(r->dq_evt[pp], dq_stream);
+
+    /* input F32 -> F16 on the main stream */
+    int n_elems = n_tokens * in_dim;
+    CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
+    void *cv[] = { &d_x_f16, &input, &n_elems };
+    cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
+
+    if (overlap) cuStreamWaitEvent(r->stream, r->dq_evt[pp], 0); /* GEMM waits dequant */
+    int ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, wbuf, d_x_f16,
+                                                     n_tokens, out_dim, in_dim);
+    if (ret != 0) return -1;
+    if (overlap) { cuEventRecord(r->gemm_evt[pp], r->stream); r->dq_pp ^= 1; }
+    return 0;
+}
+
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
@@ -11207,27 +11263,9 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
     } else if (weight_type == GGML_TYPE_Q8_0) {
         /* Dequant Q8_0 → F16 + cuBLAS tensor-core F16 GEMM (reads weights once).
          * F16 tensor cores are far faster than the F32 SIMT GEMM the old path used. */
-        if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16_h && r->cublas &&
-            r->d_batch_f16_scratch && r->fn_convert_f32_to_f16) {
-            CUdeviceptr d_w_f16 = r->d_f16_scratch;
-            if (!d_w_f16) {
-                if (cuMemAlloc(&d_w_f16, 256*1024*1024) == CUDA_SUCCESS) r->d_f16_scratch = d_w_f16;
-            }
-            size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
-            if (d_w_f16 && w_f16_bytes <= 256*1024*1024) {
-                int n_elems = n_tokens * in_dim;
-                CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
-                void *cv[] = { &d_x_f16, &input, &n_elems };
-                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
-                int nb = in_dim / 32;
-                int total_blocks = out_dim * nb;
-                int dequant_grid = (total_blocks + 7) / 8;   /* 8 blocks/CUDA-block */
-                void *args[] = { &d_w_f16, &mat, &out_dim, &in_dim };
-                cuLaunchKernel(r->fn_dequant_q8_0_to_f16_h, dequant_grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-                int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_w_f16, d_x_f16,
-                                                                      n_tokens, out_dim, in_dim);
-                if (gemm_ret == 0) return;
-            }
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
         }
         /* Legacy F32 dequant + SIMT GEMM fallback */
         if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16 && r->cublas && r->d_f16_scratch) {
@@ -11330,34 +11368,11 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q5_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q6_K) {
-        /* Dequant Q6_K -> F16 (once) + cuBLAS F16 tensor-core GEMM for batched mode.
-         * This reads the weight matrix once instead of ceil(n_tokens/4) times, and
-         * runs the matmul on Blackwell tensor cores. Reused scratch (no per-call alloc). */
-        if (n_tokens > 1 && r->fn_dequant_q6_K_to_f16 && r->cublas &&
-            r->d_batch_f16_scratch && r->fn_convert_f32_to_f16) {
-            CUdeviceptr d_w_f16 = r->d_f16_scratch;
-            if (!d_w_f16) {
-                if (cuMemAlloc(&d_w_f16, 256*1024*1024) == CUDA_SUCCESS) r->d_f16_scratch = d_w_f16;
-            }
-            size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
-            if (d_w_f16 && w_f16_bytes <= 256*1024*1024) {
-                /* input F32 -> F16 */
-                int n_elems = n_tokens * in_dim;
-                CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
-                void *cv[] = { &d_x_f16, &input, &n_elems };
-                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
-                /* weight Q6_K -> F16: 256-thread block per 4 super-blocks */
-                int nb = in_dim / 256;
-                int total_sb = out_dim * nb;
-                void *dq[] = { &d_w_f16, &mat, &out_dim, &in_dim };
-                cuLaunchKernel(r->fn_dequant_q6_K_to_f16, (total_sb + 3) / 4, 1, 1, 256, 1, 1, 0, r->stream, dq, NULL);
-                int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_w_f16, d_x_f16,
-                                                                      n_tokens, out_dim, in_dim);
-                if (gemm_ret == 0) return;
-                if (r->verbose >= 1)
-                    fprintf(stderr, "cuda_llm: cuBLAS GEMM Q6_K failed (%d, n_tok=%d, out=%d, in=%d)\n",
-                            gemm_ret, n_tokens, out_dim, in_dim);
-            }
+        /* Dequant Q6_K -> F16 (once) + cuBLAS F16 tensor-core GEMM (reads the
+         * weight once vs ceil(n_tokens/4)×; tensor cores; double-buffered overlap). */
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
         }
         /* Use chunked kernel (4 tokens/block) for batched mode, fallback for single token */
         if (n_tokens > 1 && r->fn_batch_matvec_q6_K_x4) {
@@ -12478,6 +12493,33 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                 r->d_batch_f16_scratch = 0;
         }
     }
+    /* Double-buffered weight-dequant overlap (scaffolding, default OFF). Measured
+     * NO speedup on this GPU: dequant and the GEMM are both DRAM-bandwidth-bound,
+     * so overlapping them just shares the same bandwidth. Enable for A/B with
+     * CUDA_LLM_PREFILL_OVERLAP=1 (costs a 2nd 256MB weight buffer + stream). */
+    if (r->use_cublas && r->cublas && !r->stream_dq) {
+        const char *ov = getenv("CUDA_LLM_PREFILL_OVERLAP");
+        if (ov && atoi(ov) != 0) {
+            int ok = 1;
+            if (!r->d_f16_scratch && cuMemAlloc(&r->d_f16_scratch, 256*1024*1024) != CUDA_SUCCESS) ok = 0;
+            if (ok && cuMemAlloc(&r->d_f16_scratch2, 256*1024*1024) != CUDA_SUCCESS) ok = 0;
+            if (ok && cuStreamCreate(&r->stream_dq, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) ok = 0;
+            for (int i = 0; ok && i < 2; i++) {
+                if (cuEventCreate(&r->dq_evt[i], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) ok = 0;
+                if (ok && cuEventCreate(&r->gemm_evt[i], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) ok = 0;
+                if (ok) cuEventRecord(r->gemm_evt[i], r->stream); /* start signaled */
+            }
+            r->prefill_overlap = ok;
+            if (!ok && r->verbose >= 1)
+                fprintf(stderr, "cuda_llm: prefill dequant/GEMM overlap setup failed; using single stream\n");
+        }
+    }
+    r->dq_pp = 0;
+    /* Each prefill starts with both weight buffers free. */
+    if (r->prefill_overlap) {
+        cuEventRecord(r->gemm_evt[0], r->stream);
+        cuEventRecord(r->gemm_evt[1], r->stream);
+    }
     if (r->fn_fa2_attn_256 && n_tokens > 0 &&
         (!r->d_fa2_q_f16 || n_tokens > r->fa2_buf_max_s)) {
         /* These buffers double as the cuBLAS-d512 attention scratch:
@@ -13399,6 +13441,12 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_fa2_q_f16) cuMemFree(r->d_fa2_q_f16);
     if (r->d_fa2_o_f16) cuMemFree(r->d_fa2_o_f16);
     if (r->d_fa2_scores_f16) cuMemFree(r->d_fa2_scores_f16);
+    if (r->d_f16_scratch2) cuMemFree(r->d_f16_scratch2);
+    if (r->stream_dq) cuStreamDestroy(r->stream_dq);
+    for (int i = 0; i < 2; i++) {
+        if (r->dq_evt[i]) cuEventDestroy(r->dq_evt[i]);
+        if (r->gemm_evt[i]) cuEventDestroy(r->gemm_evt[i]);
+    }
     if (r->d_f16_scratch) cuMemFree(r->d_f16_scratch);
 
     /* Free modules */
