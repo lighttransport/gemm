@@ -5955,6 +5955,8 @@ struct cuda_llm_runner {
     CUfunction fn_moe_prefill_q4k;
     CUfunction fn_dequant_q4_K_to_f16;
     CUfunction fn_dequant_q8_0_to_f16;
+    CUfunction fn_dequant_q8_0_to_f16_h;
+    CUfunction fn_dequant_q6_K_to_f16;
     CUfunction fn_moe_expert_fused_q4k;
     CUdeviceptr d_topk_idx;   /* [n_used * max_tokens] int */
     CUdeviceptr d_topk_wgt;   /* [n_used * max_tokens] float */
@@ -6067,9 +6069,12 @@ struct cuda_llm_runner {
     CUdeviceptr d_batch_beta;   /* [max_tokens * dt_rank] */
     CUdeviceptr d_batch_token_ids; /* [max_tokens] int32 */
     CUdeviceptr d_fa2_q_f16; /* [max_tokens * max_dim_h] F16 for FA2 Q input */
-    CUdeviceptr d_fa2_o_f16; /* [max_tokens * max_dim_h] F16 for FA2 O output */
+    CUdeviceptr d_fa2_o_f16; /* [max_tokens * max_dim_h] F16 for FA2 O output / d512 F32 scores */
+    CUdeviceptr d_fa2_scores_f16; /* [sq * total_s] F16 score matrix for cuBLAS-d512 attention */
+    int fa2_buf_max_s; /* token capacity the d_fa2_* buffers were sized for */
     CUdeviceptr d_f16_scratch; /* [max_out * max_in] F16 dequant scratch for Q8_0 GEMM */
     CUdeviceptr d_batch_f16_scratch; /* [max_tokens * max_dim] F16 for cuBLAS input conversion */
+    size_t batch_f16_scratch_bytes; /* current byte capacity of d_batch_f16_scratch */
 
     /* Host output buffer */
     float *h_output;     /* [n_embd] or [n_vocab] for logits */
@@ -6402,6 +6407,8 @@ lookup_funcs:
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_prefill_q4k, "moe_prefill_q4k");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_K_to_f16, "dequant_q4_K_to_f16");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16, "dequant_q8_0_to_f16");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16_h, "dequant_q8_0_to_f16_h");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q6_K_to_f16, "dequant_q6_K_to_f16");
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_expert_fused_q4k, "moe_expert_fused_q4k");
 #undef CLLM_LOAD_OPT_FUNC
                     r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
@@ -6432,6 +6439,16 @@ lookup_funcs:
                 fclose(fp);
                 if (nr == (size_t)sz && cuModuleLoadDataEx(&r->fa2_mod, d, 0, NULL, NULL) == CUDA_SUCCESS) {
                     cuModuleGetFunction(&r->fn_fa2_attn_256, r->fa2_mod, "fa2_attn_f");
+                    /* fa2_attn_f uses 4*32*(head_dim+8)*sizeof(f16) dynamic smem
+                     * (= 67584 B for head_dim=256), which exceeds the 48 KB default.
+                     * Opt in to the larger dynamic-smem limit or the launch silently
+                     * fails (invalid argument) -> stale attention output. */
+                    if (r->fn_fa2_attn_256) {
+                        CUresult _sa = cuFuncSetAttribute(r->fn_fa2_attn_256,
+                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96*1024);
+                        if (_sa != CUDA_SUCCESS && r->verbose >= 1)
+                            fprintf(stderr, "cuda_llm: FA2 smem opt-in failed (err=%d)\n", (int)_sa);
+                    }
                     if (r->verbose >= 1)
                         fprintf(stderr, "cuda_llm: loaded %s (FA2 flash attention)\n", cp);
                 } else if (r->verbose >= 1) {
@@ -7695,6 +7712,13 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->swa_pattern = NULL;
     if (strcmp(arch, "gemma4") == 0) {
         r->is_gemma4 = 1;
+        /* The batched Gemma4 prefill is GEMM-based (dequant→F16→cuBLAS tensor cores),
+         * which is the whole point of the fast path — enable cuBLAS by default unless
+         * the user explicitly disabled it via CUDA_LLM_USE_CUBLAS=0. */
+        {
+            const char *ce = getenv("CUDA_LLM_USE_CUBLAS");
+            if (!ce || atoi(ce) != 0) r->use_cublas = 1;
+        }
         r->ple_use_f32 = 1; /* F32 PLE weights for accuracy (costs ~105MB extra VRAM) */
         r->head_dim_full = cllm_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
         r->head_dim_swa  = cllm_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
@@ -11181,23 +11205,41 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_f32_f32, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q8_0) {
-        /* Dequant Q8_0 → F32 + cuBLAS F32 GEMM (reads weights once) */
-        if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16 && r->cublas) {
-            CUdeviceptr d_f32 = r->d_f16_scratch;
-            if (!d_f32) {
-                CUresult err = cuMemAlloc(&d_f32, 256*1024*1024);
-                if (err == CUDA_SUCCESS) r->d_f16_scratch = d_f32;
+        /* Dequant Q8_0 → F16 + cuBLAS tensor-core F16 GEMM (reads weights once).
+         * F16 tensor cores are far faster than the F32 SIMT GEMM the old path used. */
+        if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16_h && r->cublas &&
+            r->d_batch_f16_scratch && r->fn_convert_f32_to_f16) {
+            CUdeviceptr d_w_f16 = r->d_f16_scratch;
+            if (!d_w_f16) {
+                if (cuMemAlloc(&d_w_f16, 256*1024*1024) == CUDA_SUCCESS) r->d_f16_scratch = d_w_f16;
             }
-            if (d_f32) {
+            size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+            if (d_w_f16 && w_f16_bytes <= 256*1024*1024) {
+                int n_elems = n_tokens * in_dim;
+                CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
+                void *cv[] = { &d_x_f16, &input, &n_elems };
+                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
                 int nb = in_dim / 32;
                 int total_blocks = out_dim * nb;
-                int dequant_grid = (total_blocks + 31) / 32;
-                void *args[] = { &d_f32, &mat, &out_dim, &in_dim };
-                cuLaunchKernel(r->fn_dequant_q8_0_to_f16, dequant_grid, 1, 1, 32, 1, 1, 0, r->stream, args, NULL);
-                int gemm_ret = cublasew_gemm_f32_rowmajor_nt(r->cublas, dst, d_f32, input,
-                                                              n_tokens, out_dim, in_dim);
+                int dequant_grid = (total_blocks + 7) / 8;   /* 8 blocks/CUDA-block */
+                void *args[] = { &d_w_f16, &mat, &out_dim, &in_dim };
+                cuLaunchKernel(r->fn_dequant_q8_0_to_f16_h, dequant_grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_w_f16, d_x_f16,
+                                                                      n_tokens, out_dim, in_dim);
                 if (gemm_ret == 0) return;
             }
+        }
+        /* Legacy F32 dequant + SIMT GEMM fallback */
+        if (n_tokens > 1 && r->fn_dequant_q8_0_to_f16 && r->cublas && r->d_f16_scratch) {
+            CUdeviceptr d_f32 = r->d_f16_scratch;
+            int nb = in_dim / 32;
+            int total_blocks = out_dim * nb;
+            int dequant_grid = (total_blocks + 31) / 32;
+            void *args[] = { &d_f32, &mat, &out_dim, &in_dim };
+            cuLaunchKernel(r->fn_dequant_q8_0_to_f16, dequant_grid, 1, 1, 32, 1, 1, 0, r->stream, args, NULL);
+            int gemm_ret = cublasew_gemm_f32_rowmajor_nt(r->cublas, dst, d_f32, input,
+                                                          n_tokens, out_dim, in_dim);
+            if (gemm_ret == 0) return;
         }
         /* Fallback: x4 chunked (4 tok/block) or per-token */
         if (n_tokens > 1 && r->fn_batch_matvec_q8_0_x4) {
@@ -11288,6 +11330,35 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q5_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q6_K) {
+        /* Dequant Q6_K -> F16 (once) + cuBLAS F16 tensor-core GEMM for batched mode.
+         * This reads the weight matrix once instead of ceil(n_tokens/4) times, and
+         * runs the matmul on Blackwell tensor cores. Reused scratch (no per-call alloc). */
+        if (n_tokens > 1 && r->fn_dequant_q6_K_to_f16 && r->cublas &&
+            r->d_batch_f16_scratch && r->fn_convert_f32_to_f16) {
+            CUdeviceptr d_w_f16 = r->d_f16_scratch;
+            if (!d_w_f16) {
+                if (cuMemAlloc(&d_w_f16, 256*1024*1024) == CUDA_SUCCESS) r->d_f16_scratch = d_w_f16;
+            }
+            size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+            if (d_w_f16 && w_f16_bytes <= 256*1024*1024) {
+                /* input F32 -> F16 */
+                int n_elems = n_tokens * in_dim;
+                CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
+                void *cv[] = { &d_x_f16, &input, &n_elems };
+                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
+                /* weight Q6_K -> F16: one 256-thread block per 256-element super-block */
+                int nb = in_dim / 256;
+                int total_blocks = out_dim * nb;
+                void *dq[] = { &d_w_f16, &mat, &out_dim, &in_dim };
+                cuLaunchKernel(r->fn_dequant_q6_K_to_f16, total_blocks, 1, 1, 256, 1, 1, 0, r->stream, dq, NULL);
+                int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_w_f16, d_x_f16,
+                                                                      n_tokens, out_dim, in_dim);
+                if (gemm_ret == 0) return;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "cuda_llm: cuBLAS GEMM Q6_K failed (%d, n_tok=%d, out=%d, in=%d)\n",
+                            gemm_ret, n_tokens, out_dim, in_dim);
+            }
+        }
         /* Use chunked kernel (4 tokens/block) for batched mode, fallback for single token */
         if (n_tokens > 1 && r->fn_batch_matvec_q6_K_x4) {
             int n_groups = (n_tokens + 3) / 4;
@@ -11454,7 +11525,7 @@ static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CU
                                           CUdeviceptr key_cache, CUdeviceptr value_cache,
                                           int n_tokens, int start_pos, int n_heads, int n_kv_heads,
                                           int head_dim, int kv_dim, float scale) {
-    if (!r->cublas || !r->fn_fa2_attn_256 || !r->d_fa2_q_f16) return;
+    if (!r->cublas || !r->fn_fa2_attn_256 || !r->d_fa2_q_f16 || !r->d_fa2_scores_f16) return;
     int gqa = n_heads / n_kv_heads;
     int q_dim = n_heads * head_dim;
     int sq = gqa * n_tokens;
@@ -11490,17 +11561,20 @@ static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CU
         }
         
         /* Step 3: cuBLAS F16 GEMM: P' @ V -> output [sq, head_dim] F32 */
-        /* scores are F32, but cuBLAS needs F16. Convert scores to F16 first. */
+        /* scores are F32, but cuBLAS needs F16. Convert into a DEDICATED F16 scores
+         * buffer — reusing q_f16 here corrupts the Q of later kv-heads (n_scores
+         * far exceeds one head's Q span at large n_tokens). */
+        CUdeviceptr scores_f16 = r->d_fa2_scores_f16;
         {
             int n_scores = sq * total_s;
-            void *args[] = { &q_f16, &scores, &n_scores };  /* reuse q_f16 as F16 scores scratch */
+            void *args[] = { &scores_f16, &scores, &n_scores };
             cuLaunchKernel(r->fn_convert_f32_to_f16, (n_scores+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
         }
-        
+
         CUdeviceptr v_head = value_cache + (size_t)kv_h * head_dim * sizeof(uint16_t);
         CUdeviceptr out_group = out + (size_t)kv_h * gqa * head_dim * sizeof(float);
         /* P(F16) @ V(F16)^T -> output F32: cublas computes C = A @ B^T */
-        cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, out_group, v_head, q_f16,
+        cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, out_group, v_head, scores_f16,
                                                sq, head_dim, total_s);
     }
 }
@@ -11568,7 +11642,7 @@ static int cuda_llm_ensure_batch_buffers(cuda_llm_runner *r, int n_tokens) {
     int max_in_dim = n_embd > ff_dim ? n_embd : ff_dim;
     if (max_in_dim < qkv_dim) max_in_dim = qkv_dim;
     if (max_in_dim < d_inner) max_in_dim = d_inner;
-    if (r->d_batch_f16_scratch) { cuMemFree(r->d_batch_f16_scratch); r->d_batch_f16_scratch = 0; }
+    if (r->d_batch_f16_scratch) { cuMemFree(r->d_batch_f16_scratch); r->d_batch_f16_scratch = 0; r->batch_f16_scratch_bytes = 0; }
     /* Lazily create cuBLAS handle on first batch buffer allocation */
     if (r->use_cublas && !r->cublas) {
         int cublas_ret = cublasewCreate(&r->cublas, r->stream);
@@ -11577,8 +11651,11 @@ static int cuda_llm_ensure_batch_buffers(cuda_llm_runner *r, int n_tokens) {
             fprintf(stderr, "cuda_llm: cuBLAS handle created\n");
     }
     if (r->use_cublas && r->cublas) {
-        if (cuMemAlloc(&r->d_batch_f16_scratch, (size_t)alloc_tokens * max_in_dim * sizeof(uint16_t)) != CUDA_SUCCESS) {
+        size_t bytes = (size_t)alloc_tokens * max_in_dim * sizeof(uint16_t);
+        if (cuMemAlloc(&r->d_batch_f16_scratch, bytes) != CUDA_SUCCESS) {
             r->d_batch_f16_scratch = 0;
+        } else {
+            r->batch_f16_scratch_bytes = bytes;
         }
     }
 
@@ -12385,17 +12462,55 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
         if (r->verbose >= 1)
             fprintf(stderr, "cuda_llm: cuBLAS handle creation: ret=%d\n", cublas_ret);
     }
-    if (r->fn_fa2_attn_256 && !r->d_fa2_q_f16 && n_tokens > 0) {
+    /* F16 input-conversion scratch for batched cuBLAS GEMM (Q6_K/Q4_K/F16 paths).
+     * Sized for n_tokens * max(n_embd, n_ff) F16 elements. Grown on demand. */
+    if (r->use_cublas && r->cublas) {
+        int max_in_dim = n_embd > n_ff ? n_embd : n_ff;
+        size_t need = (size_t)n_tokens * max_in_dim * sizeof(uint16_t);
+        if (r->d_batch_f16_scratch && r->batch_f16_scratch_bytes < need) {
+            cuMemFree(r->d_batch_f16_scratch);
+            r->d_batch_f16_scratch = 0;
+        }
+        if (!r->d_batch_f16_scratch) {
+            if (cuMemAlloc(&r->d_batch_f16_scratch, need) == CUDA_SUCCESS)
+                r->batch_f16_scratch_bytes = need;
+            else
+                r->d_batch_f16_scratch = 0;
+        }
+    }
+    if (r->fn_fa2_attn_256 && n_tokens > 0 &&
+        (!r->d_fa2_q_f16 || n_tokens > r->fa2_buf_max_s)) {
+        /* These buffers double as the cuBLAS-d512 attention scratch:
+         *   d_fa2_o_f16 holds the F32 score matrix [sq x total_s] for ONE kv-head,
+         *   d_fa2_q_f16 holds the F16 Q AND is reused as the F16 score matrix.
+         * sq = gqa * n_tokens and gqa peaks at n_heads (kv_heads=1 layers, e.g.
+         * Gemma4 layer 5), so the score matrix is up to n_heads*n_tokens*total_s.
+         * An undersized buffer makes the attention GEMM write out of bounds. */
         int max_hd = (n_heads * r->head_dim_full) > (n_heads * r->head_dim_swa) ?
                       (n_heads * r->head_dim_full) : (n_heads * r->head_dim_swa);
         int max_s = n_tokens > 128 ? n_tokens : 128;
-        if (cuMemAlloc(&r->d_fa2_q_f16, (size_t)max_s * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
+        size_t total_s = (size_t)start_pos + max_s;
+        size_t score_elems = (size_t)n_heads * max_s * total_s;       /* worst-case gqa=n_heads */
+        size_t q_bytes = (size_t)max_s * max_hd * sizeof(uint16_t);   /* converted Q */
+        if (score_elems * sizeof(uint16_t) > q_bytes) q_bytes = score_elems * sizeof(uint16_t);
+        size_t o_bytes = score_elems * sizeof(float);                 /* F32 scores */
+        if ((size_t)max_s * max_hd * sizeof(uint16_t) > o_bytes) o_bytes = (size_t)max_s * max_hd * sizeof(uint16_t);
+        size_t sc_bytes = score_elems * sizeof(uint16_t);             /* F16 scores (separate from Q) */
+        if (r->d_fa2_q_f16) { cuMemFree(r->d_fa2_q_f16); r->d_fa2_q_f16 = 0; }
+        if (r->d_fa2_o_f16) { cuMemFree(r->d_fa2_o_f16); r->d_fa2_o_f16 = 0; }
+        if (r->d_fa2_scores_f16) { cuMemFree(r->d_fa2_scores_f16); r->d_fa2_scores_f16 = 0; }
+        r->fa2_buf_max_s = 0;
+        if (cuMemAlloc(&r->d_fa2_q_f16, q_bytes) != CUDA_SUCCESS)
             r->d_fa2_q_f16 = 0;
-        if (cuMemAlloc(&r->d_fa2_o_f16, (size_t)max_s * max_hd * sizeof(uint16_t)) != CUDA_SUCCESS)
+        if (cuMemAlloc(&r->d_fa2_o_f16, o_bytes) != CUDA_SUCCESS)
             r->d_fa2_o_f16 = 0;
+        if (cuMemAlloc(&r->d_fa2_scores_f16, sc_bytes) != CUDA_SUCCESS)
+            r->d_fa2_scores_f16 = 0;
+        if (r->d_fa2_q_f16 && r->d_fa2_o_f16 && r->d_fa2_scores_f16) r->fa2_buf_max_s = max_s;
         if (r->verbose >= 1)
-            fprintf(stderr, "cuda_llm: FA2 F16 buffers allocated (max_tok=%d, max_hd=%d, q=%s, o=%s)\n",
-                    max_s, max_hd, r->d_fa2_q_f16 ? "OK" : "FAIL", r->d_fa2_o_f16 ? "OK" : "FAIL");
+            fprintf(stderr, "cuda_llm: FA2 F16 buffers allocated (max_tok=%d, q=%.1fMB, o=%.1fMB, %s)\n",
+                    max_s, q_bytes/1048576.0, o_bytes/1048576.0,
+                    (r->d_fa2_q_f16 && r->d_fa2_o_f16) ? "OK" : "FAIL");
     }
 
     int n_layers = r->n_layers;
@@ -12450,18 +12565,22 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             float rope_base = cl->is_swa ? r->rope_freq_base_swa : r->rope_freq_base;
 
             if (cl->has_qk_norm) {
+                int bd = 1; while (bd < hd) bd <<= 1;
+                /* Q/K use the *weighted* per-head RMSNorm (qknorm_f32, 5 args), one
+                 * block per (token,head). Using raw_rmsnorm_heads_f32 here was a bug:
+                 * it takes 4 args so attn_q_norm_w was mis-marshalled into head_dim,
+                 * indexing vec[h*total_heads] -> OOB + wrong hidden states. */
                 if (cl->attn_q_norm_w) {
                     void *qa[] = { &d_batch_q, &cl->attn_q_norm_w, &total_q_heads, &hd, &eps };
-                    int bd = 1; while (bd < hd) bd <<= 1;
-                    cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, total_q_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, qa, NULL);
+                    cuLaunchKernel(r->fn_qknorm_f32, total_q_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, qa, NULL);
                 }
                 if (cl->shared_kv_source < 0) {
-                    int bd = 1; while (bd < hd) bd <<= 1;
                     if (cl->attn_k_norm_w) {
                         void *ka[] = { &d_batch_k, &cl->attn_k_norm_w, &total_kv_heads, &hd, &eps };
-                        cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, total_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, ka, NULL);
+                        cuLaunchKernel(r->fn_qknorm_f32, total_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, ka, NULL);
                     }
-                    void *va[] = { &d_batch_v, &layer_kv_heads, &hd, &eps };
+                    /* V: raw (unweighted) per-head RMSNorm over all token*head rows */
+                    void *va[] = { &d_batch_v, &total_kv_heads, &hd, &eps };
                     cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, total_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, va, NULL);
                 }
             }
@@ -13279,6 +13398,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_batch_f16_scratch) cuMemFree(r->d_batch_f16_scratch);
     if (r->d_fa2_q_f16) cuMemFree(r->d_fa2_q_f16);
     if (r->d_fa2_o_f16) cuMemFree(r->d_fa2_o_f16);
+    if (r->d_fa2_scores_f16) cuMemFree(r->d_fa2_scores_f16);
     if (r->d_f16_scratch) cuMemFree(r->d_f16_scratch);
 
     /* Free modules */
