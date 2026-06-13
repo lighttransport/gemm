@@ -11325,7 +11325,8 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
         nb = in_dim / 32; dq_grid = (out_dim * nb + 7) / 8; dq_block = 256; dq_fn = r->fn_dequant_q8_0_to_f16_h;
     } else if (weight_type == GGML_TYPE_Q4_0) {
         if (!r->fn_dequant_q4_0_to_f16) return -1;
-        nb = in_dim / 32; dq_grid = (out_dim * nb + 127) / 128; dq_block = 128; dq_fn = r->fn_dequant_q4_0_to_f16;
+        /* one thread per output element (coalesced); grid over rows*cols */
+        dq_block = 256; dq_grid = (int)(((size_t)out_dim * in_dim + 255) / 256); dq_fn = r->fn_dequant_q4_0_to_f16;
     } else return -1;
 
     size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
