@@ -153,3 +153,23 @@ files; the topo helper is unchanged (per-group cwd isolates its write).
   the replicated Tier-B2 caches with context-parallelism — adding EP/TP nodes alone cannot buy
   1M headroom. (ds4f here was synthetic to validate the mechanism; real ds4f is `DS4F_REAL=1`
   + a 12-node stage away — validated separately at 11n.)
+
+### CP cache-sharding RESOLVES the cliff — validated 2026-06-14 (jobs 49228433, 49228435)
+Context parallelism (`DS4F_CP=1 DS4F_CP_SHARD=1 DS4F_CP_IDX=1` — shards the compressed
+`cmp_q4`/`idx_kv8_4` caches by slot range across the EP ranks; composes with int4 caches +
+`ar_cb`; `run_ds4f_11n.sh` forwards these) gives ds4p @1M the missing margin. Same lever that
+took ds4f 255k→12M ctx on 11 nodes (byte-identical to CP-off).
+- **ds4p @1M, ep=112, CP — `pjsub_ds4p_cp_112n.sh` (job 49228433, 112 = 96+16):** load
+  112/112, arena 22.98 GB/rank, `tp_ar N=112`, **`warmtb2 DONE` MemFree 3.98 GB** (vs 0.38 GB
+  without CP — caches now ~/112 per node), decode **clean (no all-reduce timeout)**,
+  `SENTINEL ds4p_cp_112n_1M=done`. prefill 3.76 / decode 0.99 tok/s.
+- **Fixed co-serving, 128 = 96 ds4p(CP) + 32 ds4f — `pjsub_cosrv_128n.sh` (job 49228435):**
+  **both groups rc=0.** ds4p(CP) `warmtb2 DONE` MemFree **3.95 GB**, decode clean; ds4f
+  (synth, `tp_ar N=32`) prefill 10.56 / decode 8.86 tok/s, NaNs=0, RSS 12.57 GB. Two
+  concurrent EP groups, isolated topo, both green — the 108n cliff (rc=1) is gone.
+- **Cost:** CP raises decode comm 8.1%→~29% (cross-rank top-k merge + per-CSA-layer latent
+  gather); ~1.0 tok/s decode (memory-first). ~20% more comm buys ~3.6 GB of 1M headroom.
+- **Recommendation (supersedes the cliff warning above):** run ds4p @1M with **CP on**
+  (≥96 nodes). For co-serving, **108 = 96 ds4p(CP) + 12 ds4f** or **128 = 96 + 32** both work
+  — CP, not the node count, is the enabler. Reserve more nodes only for headroom (finer cache
+  shard + fewer owned experts) or higher context (CP scales the ceiling with node count).
