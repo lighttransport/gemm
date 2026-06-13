@@ -40,17 +40,21 @@ DS4F_STAGE_COMPACT=1 NP=96 EXCLUDE=none ./run_ds4f_stage_11n.sh
 echo "=== topo (96 nodes) ==="
 mpiexec -np 96 -vcoordfile "$VC" "$UTOFU/tofu_topo_helper"
 
+# 1M is known-good (Job 49228435, MemFree 3.95 GB); 4M OOMs at LOAD (Job 49228703).
+# Sweep the in-between with FULL ctx_warm (the proven pattern — the 131072 shortcut broke
+# the CP decode path with rc=1). Save per-iter stderr so nothing is lost to overwrite.
 RES="$LLM/cp_sweep_results.txt"; : > "$RES"
-for CTX in 1048576 2097152 4194304 8388608; do
-  echo "=== CTX(max_pos)=$CTX ==="
+for CTX in 2097152 3145728; do
+  echo "=== CTX(max_pos)=$CTX (full warm) ==="
   rm -f ds4f_ep_stderr_rank00.txt ds4f_ep_load_rank00.txt
-  env DS4F_MAXPOS=$CTX DS4F_CTX_WARM=131072 DS4F_MAXGEN=2 DS4F_PREFILL=1 \
+  env DS4F_MAXPOS=$CTX DS4F_CTX_WARM=$((CTX-65536)) DS4F_MAXGEN=4 DS4F_PREFILL=1 \
     mpiexec -np 96 -vcoordfile "$VC" "$BIN" > "run_ctx_${CTX}.log" 2>&1
   rc=$?
-  mf=$(grep -hoE "warmtb2 DONE.*MemFree=[0-9.]+ GB" ds4f_ep_stderr_rank00.txt 2>/dev/null | grep -oE "MemFree=[0-9.]+" | tail -1)
+  cp -f ds4f_ep_stderr_rank00.txt "stderr_ctx_${CTX}.txt" 2>/dev/null
+  mf=$(grep -hoE "warmtb2 DONE.*MemFree=[0-9.]+ GB" "stderr_ctx_${CTX}.txt" 2>/dev/null | grep -oE "MemFree=[0-9.]+" | tail -1)
   ar=$(awk -F'arena_used=' 'NF>1{split($2,a," ");print a[1]}' ds4f_ep_load_rank00.txt 2>/dev/null | tail -1)
-  guard=$(grep -cE "MemAvailable too low|_exit|RSS over stop" ds4f_ep_stderr_rank00.txt 2>/dev/null)
-  echo "max_pos=$CTX rc=$rc arena=${ar}GB warmtb2_${mf:-NONE} guard_stop=$guard" | tee -a "$RES"
+  dec=$(grep -hoE "decode:.*tok/s" "stderr_ctx_${CTX}.txt" 2>/dev/null | tail -1)
+  echo "max_pos=$CTX rc=$rc arena=${ar}GB warmtb2_${mf:-NONE} | $dec" | tee -a "$RES"
 done
 echo "=== SWEEP RESULTS (ds4p CP, M=96) ==="; cat "$RES"
 echo "SENTINEL ds4p_cp_sweep_96n=done"
