@@ -4992,6 +4992,29 @@ static const char *cuda_kernel_source =
 "    v[j + pair_off] = v0 * sin_t + v1 * cos_t;\n"
 "}\n"
 "\n"
+"/* Batched factored RoPE: like rope_with_factors_f32 but derives a PER-TOKEN\n"
+"   position (start_pos + h/heads_per_token) instead of a single constant. The\n"
+"   non-batched rope_with_factors_f32 applies one position to every block, which\n"
+"   is only correct for a single token; batched prefill must rope token t at\n"
+"   start_pos+t. inv_freq holds the proportional/NTK-scaled frequencies. */\n"
+"__global__ void batch_rope_with_factors_f32(float *vec, int heads_per_token,\n"
+"                                             int total_heads, int head_dim,\n"
+"                                             int start_pos, const float *inv_freq,\n"
+"                                             int n_pairs) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= total_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    if (j >= n_pairs) return;\n"
+"    int token = h / heads_per_token;\n"
+"    int pos = start_pos + token;\n"
+"    float freq = (float)pos * inv_freq[j];\n"
+"    float cos_v = cosf(freq), sin_v = sinf(freq);\n"
+"    float *v = vec + (size_t)h * head_dim;\n"
+"    float r0 = v[j], r1 = v[j + n_pairs];\n"
+"    v[j]           = r0 * cos_v - r1 * sin_v;\n"
+"    v[j + n_pairs] = r0 * sin_v + r1 * cos_v;\n"
+"}\n"
+"\n"
 "/* Batched depthwise causal conv1d + SiLU over a token chunk.\n"
 "   data is laid out as [n_tokens, qkv_dim] and updated in-place to hold conv output. */\n"
 "__global__ void batch_conv1d_depthwise_silu_f32(float *data, float *conv_state,\n"
@@ -5987,6 +6010,7 @@ struct cuda_llm_runner {
     CUfunction fn_attn_decode_swa_f32;
     CUfunction fn_matvec_bf16_f32;
     CUfunction fn_rope_with_factors_f32;
+    CUfunction fn_batch_rope_with_factors_f32;
 
     /* MoE scratch buffers */
     CUdeviceptr d_router_logits;  /* [d_router_logits_entries] F32 */
@@ -6327,6 +6351,7 @@ lookup_funcs:
     GET_FUNC(attn_decode_swa_f32);
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(rope_with_factors_f32);
+    GET_FUNC(batch_rope_with_factors_f32);
     /* Batched prefill kernels */
     GET_FUNC(convert_f32_to_f16);
     GET_FUNC(convert_f16_to_f32);
@@ -8923,8 +8948,12 @@ static inline void launch_batch_rope_with_factors(cuda_llm_runner *r, CUdevicept
                                                    CUdeviceptr inv_freq) {
     int total_heads = heads_per_token * n_tokens;
     int n_pairs = head_dim / 2;
-    void *args[] = { &vec, &total_heads, &head_dim, &start_pos, &inv_freq, &n_pairs };
-    cuLaunchKernel(r->fn_rope_with_factors_f32,
+    /* Per-token batched kernel: token = blockIdx.x / heads_per_token, pos =
+     * start_pos + token. The old fn_rope_with_factors_f32 applied a single
+     * constant position to every block — correct only for n_tokens==1, and a
+     * latent bug for batched prefill (every token roped at start_pos). */
+    void *args[] = { &vec, &heads_per_token, &total_heads, &head_dim, &start_pos, &inv_freq, &n_pairs };
+    cuLaunchKernel(r->fn_batch_rope_with_factors_f32,
                    total_heads, 1, 1, n_pairs, 1, 1, 0, r->stream, args, NULL);
 }
 
@@ -11498,15 +11527,22 @@ static void launch_fa2_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevicept
     }
     CUdeviceptr d_o_f16 = r->d_fa2_o_f16 ? r->d_fa2_o_f16 : d_q_f16;
 
-    /* Run FA2 - process all tokens in one call */
+    /* Run FA2 - process all tokens in one call.
+     * Keys span [0, total_s); the n_tokens queries sit at global positions
+     * [start_pos, total_s). start_pos>0 (chunked prefill, queries attend a
+     * [history ++ chunk] key buffer) feeds q_off=start_pos; start_pos==0 gives
+     * n_q==S, q_off==0 -> byte-identical to the original kernel. */
     int total_s = start_pos + n_tokens;
+    int fa2_n_q = n_tokens;
+    int fa2_q_off = start_pos;
 #define FA2_BR_HOST 64
 #define FA2_BC_HOST 32
 #define FA2_NTHR_HOST 128
     int n_q_tiles = (n_tokens + FA2_BR_HOST - 1) / FA2_BR_HOST;
     size_t fa2_smem = 4 * FA2_BC_HOST * (head_dim + 8) * 2; /* 2 = sizeof(dt_t) = F16 */
     void *fa2_args[] = { &d_o_f16, &d_q_f16, &key_cache, &value_cache,
-                         &total_s, &head_dim, &hstride_q, &hstride_kv, &gqa_ratio, &scale, &window };
+                         &total_s, &head_dim, &hstride_q, &hstride_kv, &gqa_ratio, &scale, &window,
+                         &fa2_n_q, &fa2_q_off };
     cuLaunchKernel(r->fn_fa2_attn_256,
         (unsigned)n_q_tiles, (unsigned)n_heads, 1,
         FA2_NTHR_HOST, 1, 1, (unsigned)fa2_smem, r->stream, fa2_args, NULL);
@@ -12418,6 +12454,36 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                                            n_tokens, start_pos);
     }
 
+    /* Chunked prefill for long context on limited VRAM. The batched path below
+     * allocates O(n_tokens) F32 activation buffers (q/xb2/k/v/gate/up, ~2 GB at
+     * 16384); alongside the 10.4 GB weights these don't fit on a 16 GB card, and
+     * even an 8192 chunk leaves cuBLAS too little GEMM workspace (it falls off
+     * the tensor-core path -> >10x slower). Process the tokens in blocks,
+     * advancing start_pos, so each block's buffers stay bounded — every token's
+     * forward pass only needs its own hidden state plus the KV cache of all
+     * preceding tokens, which persists across blocks. The final block's
+     * last-token hidden state is the result. Chunk size is a multiple of
+     * swa_window so the circular SWA cache holds the window history in linear
+     * order at block boundaries (the fast cross-chunk windowed-FA2 path).
+     * Token-ids path only (the bench path); start_pos==0 entry only. */
+    {
+        int pchunk = 4096;
+        const char *e = getenv("CUDA_LLM_PREFILL_CHUNK");
+        if (e) { int v = atoi(e); if (v > 0) pchunk = v; }
+        if (r->swa_window_size > 0 && pchunk % r->swa_window_size != 0)
+            pchunk = (pchunk / r->swa_window_size + 1) * r->swa_window_size;
+        if (token_ids && start_pos == 0 && n_tokens > pchunk) {
+            float *last = NULL;
+            for (int off = 0; off < n_tokens; off += pchunk) {
+                int c = n_tokens - off;
+                if (c > pchunk) c = pchunk;
+                last = cuda_llm_prefill(r, token_ids + off, NULL, 0, c, off);
+                if (!last) return NULL;
+            }
+            return last;
+        }
+    }
+
     int n_embd = r->n_embd;
     int n_heads = r->n_heads;
     int n_ff = r->n_ff;
@@ -12455,6 +12521,10 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_k, (size_t)n_tokens * max_kv_dim * sizeof(float)), "alloc batch_k");
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_v, (size_t)n_tokens * max_kv_dim * sizeof(float)), "alloc batch_v");
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_xb2, (size_t)n_tokens * max_q_dim * sizeof(float)), "alloc batch_xb2");
+    /* FFN gate/up activations [n_tokens x n_ff]. Long-context prefill keeps these
+     * bounded by processing the sequence in token-chunks (see the chunked-prefill
+     * wrapper above) rather than chunking the FFN within a single pass — each
+     * prefill chunk is <= the size that already fits in 16 GB (e.g. 8192). */
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_gate, (size_t)n_tokens * n_ff * sizeof(float)), "alloc batch_gate");
     CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_up, (size_t)n_tokens * n_ff * sizeof(float)), "alloc batch_up");
 
@@ -12522,10 +12592,16 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             fprintf(stderr, "cuda_llm: cuBLAS handle creation: ret=%d\n", cublas_ret);
     }
     /* F16 input-conversion scratch for batched cuBLAS GEMM (Q6_K/Q4_K/F16 paths).
-     * Sized for n_tokens * max(n_embd, n_ff) F16 elements. Grown on demand. */
+     * Every GEMM converts its [n_tokens x in_dim] F32 input into this buffer, so
+     * it must hold n_tokens * max(in_dim) F16 elements. The largest in_dim is the
+     * FFN-down (n_ff); the attention output projection (in_dim = n_heads*head_dim,
+     * 8192 for gemma4 full-attn) also exceeds n_embd, so size to the true max. */
     if (r->use_cublas && r->cublas) {
-        int max_in_dim = n_embd > n_ff ? n_embd : n_ff;
-        size_t need = (size_t)n_tokens * max_in_dim * sizeof(uint16_t);
+        int q_dim_full = n_heads * (r->is_gemma4 ? r->head_dim_full : r->head_dim);
+        size_t max_in = (size_t)n_ff;
+        if ((size_t)q_dim_full > max_in) max_in = (size_t)q_dim_full;
+        if ((size_t)n_embd   > max_in) max_in = (size_t)n_embd;
+        size_t need = (size_t)n_tokens * max_in * sizeof(uint16_t);
         if (r->d_batch_f16_scratch && r->batch_f16_scratch_bytes < need) {
             cuMemFree(r->d_batch_f16_scratch);
             r->d_batch_f16_scratch = 0;
@@ -12632,21 +12708,24 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                     max_s, q_bytes/1048576.0, o_bytes/1048576.0, q_chunk,
                     (r->d_fa2_q_f16 && r->d_fa2_o_f16) ? "OK" : "FAIL");
     }
-    /* Linear F16 K/V scratch for batched windowed SWA prefill (start_pos==0,
-     * n_tokens > swa_window). The circular SWA cache can't hold all n_tokens at
-     * once, so attention reads a linear copy; the circular cache is filled with
-     * the window tail afterward for decode. */
+    /* Linear F16 K/V scratch for batched windowed SWA prefill. The circular SWA
+     * cache can't hold all n_tokens at once, so attention reads a linear copy;
+     * the circular cache is filled with the window tail afterward for decode.
+     * For chunked prefill (start_pos>0, a multiple of swa_window) the buffer also
+     * holds a `swa_window` history prefix copied from the circular cache so the
+     * chunk's first tokens can attend across the chunk boundary — hence +window. */
     if (r->is_gemma4 && r->swa_window_size > 0 && n_tokens > r->swa_window_size &&
-        start_pos == 0 && r->fn_fa2_attn_256 &&
-        (!r->d_swa_k_lin || n_tokens > r->swa_lin_max_tokens)) {
+        (start_pos == 0 || start_pos % r->swa_window_size == 0) && r->fn_fa2_attn_256 &&
+        (!r->d_swa_k_lin || n_tokens + r->swa_window_size > r->swa_lin_max_tokens)) {
         int max_kv = r->n_kv_heads * r->head_dim_swa;
-        size_t bytes = (size_t)n_tokens * max_kv * sizeof(uint16_t);
+        size_t cap_tok = (size_t)n_tokens + r->swa_window_size; /* +window history prefix */
+        size_t bytes = cap_tok * max_kv * sizeof(uint16_t);
         if (r->d_swa_k_lin) { cuMemFree(r->d_swa_k_lin); r->d_swa_k_lin = 0; }
         if (r->d_swa_v_lin) { cuMemFree(r->d_swa_v_lin); r->d_swa_v_lin = 0; }
         r->swa_lin_max_tokens = 0;
         if (cuMemAlloc(&r->d_swa_k_lin, bytes) != CUDA_SUCCESS) r->d_swa_k_lin = 0;
         if (cuMemAlloc(&r->d_swa_v_lin, bytes) != CUDA_SUCCESS) r->d_swa_v_lin = 0;
-        if (r->d_swa_k_lin && r->d_swa_v_lin) r->swa_lin_max_tokens = n_tokens;
+        if (r->d_swa_k_lin && r->d_swa_v_lin) r->swa_lin_max_tokens = (int)cap_tok;
     }
 
     int n_layers = r->n_layers;
@@ -12696,7 +12775,8 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
 
         /* Batched windowed SWA: when the prefill wraps the circular window, store
          * K/V linearly and run a windowed FA2 instead of the slow per-token loop. */
-        int swa_lin = cl->is_swa && cl->shared_kv_source < 0 && start_pos == 0 &&
+        int swa_aligned = (start_pos == 0) || (start_pos % r->swa_window_size == 0);
+        int swa_lin = cl->is_swa && cl->shared_kv_source < 0 && swa_aligned &&
                       n_tokens > r->swa_window_size && hd == 256 &&
                       r->fn_fa2_attn_256 && r->fn_batch_kv_store_swa_f16 &&
                       r->d_swa_k_lin && r->d_swa_v_lin && r->d_fa2_q_f16;
@@ -12741,32 +12821,49 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             }
 
             if (swa_lin) {
-                /* Store K/V LINEARLY [n_tokens x kv_dim] (start_pos=0) for the
-                 * windowed FA2 read, then fill the circular cache window-tail for
-                 * decode continuation. */
-                int zero = 0;
+                int win = r->swa_window_size;
+                /* Chunked prefill (start_pos>0, a multiple of window): prepend a
+                 * `window` history prefix so the chunk's first tokens can attend
+                 * across the chunk boundary. Because start_pos is a multiple of
+                 * window, the circular cache already holds the last `window`
+                 * tokens in LINEAR position order, so a straight copy gives the
+                 * history. start_pos==0 -> hist=0 (no prefix, original behaviour). */
+                int hist = (start_pos > 0) ? win : 0;
+                if (hist > 0) {
+                    size_t hb = (size_t)win * local_kv_dim * sizeof(uint16_t);
+                    cuMemcpyDtoDAsync(r->d_swa_k_lin, r->d_key_cache[l], hb, r->stream);
+                    cuMemcpyDtoDAsync(r->d_swa_v_lin, r->d_value_cache[l], hb, r->stream);
+                }
+                /* Store this chunk's K/V LINEARLY after the prefix, at linear
+                 * positions [hist, hist+n_tokens). */
                 void *lin[] = { &r->d_swa_k_lin, &r->d_swa_v_lin, &d_batch_k, &d_batch_v,
-                                &zero, &local_kv_dim, &n_tokens };
+                                &hist, &local_kv_dim, &n_tokens };
                 cuLaunchKernel(r->fn_batch_kv_store_f16,
                                (local_kv_dim + 255) / 256, n_tokens, 1,
                                256, 1, 1, 0, r->stream, lin, NULL);
                 /* Fill the circular cache with ONLY the last `window` tokens — each
                  * maps to a unique slot, so no write race (storing all n_tokens
                  * would race multiple positions onto the same slot). This leaves
-                 * the cache identical to the per-token path for decode. */
-                int tail = r->swa_window_size;
-                int tail_start = n_tokens - tail;
+                 * the cache identical to the per-token path for decode AND for the
+                 * next chunk's history prefix. Use the ABSOLUTE tail position so
+                 * the circular slots match (start_pos+tail_start)%window. */
+                int tail = win;
+                int tail_start = n_tokens - tail;          /* chunk-local */
+                int tail_abs = start_pos + tail_start;     /* absolute first-tail position */
                 CUdeviceptr k_tail = d_batch_k + (size_t)tail_start * local_kv_dim * sizeof(float);
                 CUdeviceptr v_tail = d_batch_v + (size_t)tail_start * local_kv_dim * sizeof(float);
                 void *circ[] = { &r->d_key_cache[l], &r->d_value_cache[l], &k_tail, &v_tail,
-                                 &tail_start, &local_kv_dim, &tail, &r->swa_window_size };
+                                 &tail_abs, &local_kv_dim, &tail, &win };
                 cuLaunchKernel(r->fn_batch_kv_store_swa_f16,
                                (local_kv_dim + 255) / 256, tail, 1,
                                256, 1, 1, 0, r->stream, circ, NULL);
+                /* Windowed FA2 over [history ++ chunk]: query i sits at linear key
+                 * position hist+i, so q_off=hist makes the kernel's causal+window
+                 * mask attend exactly [hist+i-window+1, hist+i]. */
                 launch_fa2_attention(r, d_batch_xb2, d_batch_q,
                                     r->d_swa_k_lin, r->d_swa_v_lin,
-                                    n_tokens, 0, n_heads, layer_kv_heads,
-                                    hd, local_kv_dim, attn_scale, r->swa_window_size);
+                                    n_tokens, hist, n_heads, layer_kv_heads,
+                                    hd, local_kv_dim, attn_scale, win);
                 goto swa_attn_done;
             }
 
