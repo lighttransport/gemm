@@ -782,31 +782,39 @@ extern "C" __global__ void dequant_q8_0_to_f16_h(
  *   ql[128] (low 4 bits), qh[64] (high 2 bits), sc[16] (int8 scales), d (f16).
  * One thread per 256-element block. Output layout matches matvec_q6_K_f32 so
  * the dequanted F16 weight feeds cuBLAS F16 GEMM with identical math. */
+#define DQ6_SB_PER_BLOCK 4
 extern "C" __global__ void dequant_q6_K_to_f16(
     half *out,
     const unsigned char *mat,
     int rows, int cols)
 {
-    /* One CUDA block (256 threads) per 256-element super-block; thread = output
-     * element e. Consecutive e -> consecutive threads -> fully coalesced F16
-     * writes (the old one-thread-per-block version wrote 256 strided elements
-     * per thread at ~43 GB/s; this hits stream bandwidth). */
+    /* Each CUDA block (256 threads) processes DQ6_SB_PER_BLOCK consecutive
+     * super-blocks; warp w (of 8) -> super-block (w/2), 64 threads decode its 256
+     * elements (4 each). More work per block amortizes launch/scheduling and
+     * keeps writes coalesced (consecutive output elements -> consecutive lanes). */
     int nb = cols / 256, rb = nb * 210;
-    int sb = blockIdx.x;                 /* super-block index */
-    if (sb >= rows * nb) return;
-    int row = sb / nb, bk = sb % nb;
+    int total_sb = rows * nb;
+    int sb_base = blockIdx.x * DQ6_SB_PER_BLOCK;
+    int tpb = blockDim.x / DQ6_SB_PER_BLOCK;   /* threads per super-block = 64 */
+    int local = threadIdx.x / tpb;             /* which of the 4 super-blocks */
+    int lane = threadIdx.x % tpb;              /* 0..63 */
+    int sb = sb_base + local;
 
-    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 210;
-    half *o = out + (size_t)row * cols + (size_t)bk * 256;
-
-    /* Cooperatively stage the 210-byte super-block into shared memory so the 256
-     * decode threads don't each re-issue global loads (read amplification). */
-    __shared__ unsigned char s[210];
-    if (threadIdx.x < 210) s[threadIdx.x] = bp[threadIdx.x];
+    __shared__ unsigned char ss[DQ6_SB_PER_BLOCK][210];
+    if (sb < total_sb) {
+        int row = sb / nb, bk = sb % nb;
+        const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 210;
+        for (int i = lane; i < 210; i += tpb) ss[local][i] = bp[i];
+    }
     __syncthreads();
+    if (sb >= total_sb) return;
+
+    int row = sb / nb, bk = sb % nb;
+    half *o = out + (size_t)row * cols + (size_t)bk * 256;
+    const unsigned char *s = ss[local];
     float d = __half2float(*(const __half *)(s + 208));
 
-    int e = threadIdx.x;                 /* 0..255 */
+    for (int e = lane; e < 256; e += tpb) {
     int half_i = e >> 7;                 /* 0 or 1 */
     int r = e & 127;                     /* 0..127 */
     int grp = r >> 5;                    /* 0..3 */
@@ -821,4 +829,5 @@ extern "C" __global__ void dequant_q6_K_to_f16(
     else if (grp == 2) { qval = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)); scv = sc[is+4]; }
     else               { qval = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)); scv = sc[is+6]; }
     o[e] = __float2half(d * scv * (qval - 32));
+    }
 }
