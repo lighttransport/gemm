@@ -1845,6 +1845,60 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- matvec_iq2_xxs_q8_1_dp4a_coal: coalesced-read variant of the kernel above ---- */\n"
+"/* lane -> qs-short (NOT lane -> block): the 32 lanes read 32 consecutive qs shorts of\n"
+"   ONE block => one fully coalesced 64-byte read, vs the strided 2-byte reads of the\n"
+"   per-block-per-lane kernel (~220 GB/s ceiling). Decomposition: g=lane/4 = ib32 group\n"
+"   (0..7), sub=lane%4 = l-subgroup (0..3). ib32=g needs exactly its 4 qs shorts, held\n"
+"   by lanes g*4..g*4+3; aux0/aux1 are gathered within the 4-lane group via __shfl. Each\n"
+"   lane decodes its 8 elements (2 dp4a); the 32 lanes (8 ib32 x 4 sub = whole 256-block)\n"
+"   are warp-reduced, accumulated over blocks. Bit-identical to matvec_iq2_xxs_q8_1_dp4a. */\n"
+"__global__ void matvec_iq2_xxs_q8_1_dp4a_coal(float *dst, const unsigned char *mat,\n"
+"                                                const unsigned char *x_q81,\n"
+"                                                int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 66;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    int g = lane >> 2;        /* ib32 group 0..7 */\n"
+"    int sub = lane & 3;       /* l-subgroup 0..3 */\n"
+"    int g4 = g << 2;          /* base lane of this group */\n"
+"    float sumf = 0.0f;\n"
+"    for (int b = 0; b < nb; b++) {\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        unsigned int qs_l = ((const unsigned short *)(bp + 2))[lane];  /* coalesced 64B */\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        unsigned int s0 = __shfl_sync(0xFFFFFFFFu, qs_l, g4 + 0);\n"
+"        unsigned int s1 = __shfl_sync(0xFFFFFFFFu, qs_l, g4 + 1);\n"
+"        unsigned int s2 = __shfl_sync(0xFFFFFFFFu, qs_l, g4 + 2);\n"
+"        unsigned int s3 = __shfl_sync(0xFFFFFFFFu, qs_l, g4 + 3);\n"
+"        unsigned int aux0 = s0 | (s1 << 16);\n"
+"        unsigned int aux1 = s2 | (s3 << 16);\n"
+"        float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"        unsigned long long gv = iq2xxs_grid_dev[(aux0 >> (8*sub)) & 255];\n"
+"        unsigned int signs = ksigns_iq2xs_dev[(aux1 >> (7*sub)) & 127];\n"
+"        unsigned int slo = signs & 0xF, shi = (signs >> 4) & 0xF;\n"
+"        unsigned int mlo = ((slo&1)?0x000000FFu:0u)|((slo&2)?0x0000FF00u:0u)|((slo&4)?0x00FF0000u:0u)|((slo&8)?0xFF000000u:0u);\n"
+"        unsigned int mhi = ((shi&1)?0x000000FFu:0u)|((shi&2)?0x0000FF00u:0u)|((shi&4)?0x00FF0000u:0u)|((shi&8)?0xFF000000u:0u);\n"
+"        unsigned int glo = (unsigned int)(gv & 0xFFFFFFFFu);\n"
+"        unsigned int ghi = (unsigned int)(gv >> 32);\n"
+"        unsigned int wlo = __vadd4(glo ^ mlo, mlo & 0x01010101u);\n"
+"        unsigned int whi = __vadd4(ghi ^ mhi, mhi & 0x01010101u);\n"
+"        const unsigned char *aq = x_q81 + (size_t)(b*8 + g) * 36;\n"
+"        const int *a = (const int *)aq;\n"
+"        float d8 = half_to_float(*(const half_raw *)(aq + 32));\n"
+"        int acc = dp4a_s8((int)wlo, a[2*sub], 0);\n"
+"        acc = dp4a_s8((int)whi, a[2*sub + 1], acc);\n"
+"        sumf += db * d8 * (float)acc;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sumf += __shfl_down_sync(0xFFFFFFFFu, sumf, offset);\n"
+"    if (lane == 0) dst[row] = sumf;\n"
+"}\n"
+"\n"
 "__device__ static const unsigned long long iq2xs_grid_dev[512] = {\n"
 "    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,\n"
 "    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x080808080819192bULL,\n"
@@ -6196,6 +6250,7 @@ struct cuda_llm_runner {
     CUfunction fn_batch_matvec_f32_f32;
     CUfunction fn_matvec_iq2_xxs_f32;
     CUfunction fn_matvec_iq2_xxs_q8_1_dp4a;
+    CUfunction fn_matvec_iq2_xxs_q8_1_dp4a_coal;
     CUfunction fn_matvec_q4_0_f32;
     CUfunction fn_matvec_q4_0_q8_1_dp4a;
     CUfunction fn_matvec_q4_1_f32;
@@ -6698,6 +6753,7 @@ lookup_funcs:
     GET_FUNC(batch_matvec_f32_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
     GET_FUNC(matvec_iq2_xxs_q8_1_dp4a);
+    GET_FUNC(matvec_iq2_xxs_q8_1_dp4a_coal);
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_0_q8_1_dp4a);
     GET_FUNC(matvec_q4_1_f32);
@@ -9526,8 +9582,11 @@ static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CU
 static inline void launch_matvec_iq2_xxs_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                               CUdeviceptr x_q81, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
-    cuLaunchKernel(r->fn_matvec_iq2_xxs_q8_1_dp4a,
-                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    /* Coalesced (lane->qs-short) variant is default; CUDA_LLM_NO_IQ2XXS_COAL falls
+       back to the strided (lane->block) kernel for A/B. */
+    CUfunction fn = (r->fn_matvec_iq2_xxs_q8_1_dp4a_coal && !getenv("CUDA_LLM_NO_IQ2XXS_COAL"))
+                    ? r->fn_matvec_iq2_xxs_q8_1_dp4a_coal : r->fn_matvec_iq2_xxs_q8_1_dp4a;
+    cuLaunchKernel(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 static inline void launch_matvec_iq3_xxs_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                               CUdeviceptr x_q81, int n_rows, int n_cols) {
