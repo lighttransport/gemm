@@ -1463,6 +1463,26 @@ static const char *cuda_kernel_source =
 "    dst[i] = val;\n"
 "}\n"
 "\n"
+"/* ---- 18c. embed_q4_0: Q4_0 embedding lookup -> F32 ---- */\n"
+"/* Q4_0 block: 18 bytes = [half d][qs[16]], 32 elements; w[j]=(qs[j]&0xF-8)*d for\n"
+"   j<16, (qs[j-16]>>4-8)*d for j>=16 (matches matvec_q4_0_f32). */\n"
+"__global__ void embed_q4_0(float *dst, const unsigned char *embd_table,\n"
+"                             int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n_embd) return;\n"
+"    int nb_per_row = n_embd / 32;\n"
+"    int row_bytes = nb_per_row * 18;\n"
+"    const unsigned char *row = embd_table + (size_t)token_id * row_bytes;\n"
+"    int block_idx = i / 32;\n"
+"    int elem = i % 32;\n"
+"    const unsigned char *bp = row + block_idx * 18;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs = bp + 2;\n"
+"    unsigned char q = qs[elem & 15];\n"
+"    int v = (elem < 16) ? (int)(q & 0x0F) : (int)(q >> 4);\n"
+"    dst[i] = (float)(v - 8) * d;\n"
+"}\n"
+"\n"
 "/* ==== SSM Delta-Net kernels ==== */\n"
 "\n"
 "/* ---- 19. softplus_mul_f32: out[i] = softplus(in[i]+bias[i]) * a[i] ---- */\n"
@@ -5818,6 +5838,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q6_K_q8_1_dp4a;
     CUfunction fn_embed_q2_K;
     CUfunction fn_embed_q4_K;
+    CUfunction fn_embed_q4_0;
     /* SSM kernels */
     CUfunction fn_softplus_mul_f32;
     CUfunction fn_sigmoid_inplace_f32;
@@ -5977,6 +5998,7 @@ struct cuda_llm_runner {
     CUfunction fn_moe_f16_tc;
     CUfunction fn_moe_prefill_q4k;
     CUfunction fn_dequant_q4_K_to_f16;
+    CUfunction fn_dequant_q4_0_to_f16;
     CUfunction fn_dequant_q8_0_to_f16;
     CUfunction fn_dequant_q8_0_to_f16_h;
     CUfunction fn_dequant_q6_K_to_f16;
@@ -6311,6 +6333,7 @@ lookup_funcs:
     GET_FUNC(matvec_q6_K_q8_1_dp4a);
     GET_FUNC(embed_q2_K);
     GET_FUNC(embed_q4_K);
+    GET_FUNC(embed_q4_0);
     /* SSM kernels */
     GET_FUNC(softplus_mul_f32);
     GET_FUNC(sigmoid_inplace_f32);
@@ -6441,6 +6464,7 @@ lookup_funcs:
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_f16_tc, "moe_f16_tc");
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_prefill_q4k, "moe_prefill_q4k");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_K_to_f16, "dequant_q4_K_to_f16");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_0_to_f16, "dequant_q4_0_to_f16");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16, "dequant_q8_0_to_f16");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16_h, "dequant_q8_0_to_f16_h");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q6_K_to_f16, "dequant_q6_K_to_f16");
@@ -8975,6 +8999,15 @@ static inline void launch_embed_q8_0(cuda_llm_runner *r, CUdeviceptr dst, CUdevi
                    0, r->stream, args, NULL);
 }
 
+static inline void launch_embed_q4_0(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr embd_table,
+                                      int token_id, int n_embd) {
+    void *args[] = { &dst, &embd_table, &token_id, &n_embd };
+    cuLaunchKernel(r->fn_embed_q4_0,
+                   (n_embd + 255) / 256, 1, 1,
+                   256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
 static inline void launch_quantize(cuda_llm_runner *r, CUdeviceptr dst_q, CUdeviceptr dst_scale,
                                     CUdeviceptr src, int n) {
     void *args[] = { &dst_q, &dst_scale, &src, &n };
@@ -9506,6 +9539,8 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         void *args[] = { &r->d_x, &r->d_token_embd, &token_id, &n_embd };
         cuLaunchKernel(r->fn_embed_q4_K,
                        (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -9578,6 +9613,8 @@ int cuda_llm_forward_nohost(cuda_llm_runner *r, int32_t token_id, int position) 
         void *args[] = { &r->d_x, &r->d_token_embd, &token_id, &n_embd };
         cuLaunchKernel(r->fn_embed_q4_K,
                        (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -11229,6 +11266,9 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     } else if (weight_type == GGML_TYPE_Q8_0) {
         if (!r->fn_dequant_q8_0_to_f16_h) return -1;
         nb = in_dim / 32; dq_grid = (out_dim * nb + 7) / 8; dq_block = 256; dq_fn = r->fn_dequant_q8_0_to_f16_h;
+    } else if (weight_type == GGML_TYPE_Q4_0) {
+        if (!r->fn_dequant_q4_0_to_f16) return -1;
+        nb = in_dim / 32; dq_grid = (out_dim * nb + 127) / 128; dq_block = 128; dq_fn = r->fn_dequant_q4_0_to_f16;
     } else return -1;
 
     size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
@@ -11368,6 +11408,21 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
     } else if (weight_type == GGML_TYPE_IQ4_XS) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq4_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_Q4_0) {
+        /* Dequant Q4_0 -> F16 (once) + cuBLAS F16 tensor-core GEMM, like Q6_K/Q8_0.
+         * launch_dequant_gemm_f16 also converts the F32 input to F16 (the GEMM
+         * needs F16 on both sides), applies the >256 MB guard (skips the 2 GB
+         * lm_head), and lazily allocates d_f16_scratch. */
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
+        }
+        /* Fallback (n_tokens==1, oversized lm_head, or no cuBLAS): per-token
+         * matvec_q4_0_f32, the known-correct decode kernel. */
+        for (int t = 0; t < n_tokens; t++) {
+            launch_matvec_q4_0(r, dst + (size_t)t * out_dim * sizeof(float), mat,
+                               input + (size_t)t * in_dim * sizeof(float), out_dim, in_dim);
+        }
     } else if (weight_type == GGML_TYPE_Q4_K) {
         /* Dequant + cuBLAS F16 GEMM for batched mode (read weights once) */
         if (n_tokens > 1 && r->fn_dequant_q4_K_to_f16 && r->cublas) {
@@ -11878,6 +11933,8 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                     int32_t tok = token_ids[t];
                     void *ea[] = { &r->d_x, &r->d_token_embd, &tok, &n_embd };
                     cuLaunchKernel(r->fn_embed_q4_K, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
+                } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+                    launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
                 } else {
                     launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
                 }
@@ -12531,10 +12588,13 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     /* Upload token embeddings */
     if (token_ids) {
         /* Embed each token directly into batch buffer (no host round-trip) */
-        if (r->token_embd_type == GGML_TYPE_Q8_0) {
+        if (r->token_embd_type == GGML_TYPE_Q8_0 || r->token_embd_type == GGML_TYPE_Q4_0) {
             for (int t = 0; t < n_tokens; t++) {
                 CUdeviceptr dst = d_batch_x + (size_t)t * n_embd * sizeof(float);
-                launch_embed_q8_0(r, dst, r->d_token_embd, token_ids[t], n_embd);
+                if (r->token_embd_type == GGML_TYPE_Q8_0)
+                    launch_embed_q8_0(r, dst, r->d_token_embd, token_ids[t], n_embd);
+                else
+                    launch_embed_q4_0(r, dst, r->d_token_embd, token_ids[t], n_embd);
                 if (r->is_gemma4) {
                     void *args[] = { &dst, &r->embd_scale, &n_embd };
                     cuLaunchKernel(r->fn_scale_f32, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
