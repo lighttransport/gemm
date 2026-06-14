@@ -4928,6 +4928,75 @@ static const char *cuda_kernel_source =
 "        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
 "    }\n"
 "}\n"
+"/* Prefill variant of mmq_iq2xxs_grouped with TG=16 (128 tokens/block instead of 32):\n"
+"   the decode-amortize kernel re-reads the weight ceil(n_tokens/(8*TG)) times, so a\n"
+"   bigger TG cuts the redundant weight reads ~4x for large prefill batches. f[16][4]\n"
+"   raises register use but stays within budget (TG=32 spills and is slower). Identical\n"
+"   math to grouped; worklist groups by 128. */\n"
+"__global__ void mmq_iq2xxs_grouped8(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 16;\n"
+"    __shared__ unsigned long long sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
+"    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq2xxs_grid_dev[i];\n"
+"    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
+"        unsigned long long m=0;\n"
+"        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(unsigned long long)0xFFu<<(8*j);\n"
+"        sSignMask[i]=m; }\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[128][32]; __shared__ float sXs[128];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*66+(size_t)n*66)\n"
+"                                          : (We+(size_t)n*row_bytes+(size_t)(sb/8)*66);\n"
+"            float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2); int ib=sb&7;\n"
+"            unsigned int a0=(unsigned int)qs[4*ib]|((unsigned int)qs[4*ib+1]<<16);\n"
+"            unsigned int a1=(unsigned int)qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"            if (half==0) sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;\n"
+"            for(int l=half*2;l<half*2+2;l++){ unsigned char idx=(a0>>(8*l))&255;\n"
+"                unsigned long long gv=sGrid[idx], m=sSignMask[(a1>>(7*l))&127];\n"
+"                unsigned int glo=(unsigned int)gv, ghi=(unsigned int)(gv>>32);\n"
+"                unsigned int mlo=(unsigned int)m,  mhi=(unsigned int)(m>>32);\n"
+"                *(unsigned int*)&sW[r][l*8]   = __vsub4(glo^mlo, mlo);\n"
+"                *(unsigned int*)&sW[r][l*8+4] = __vsub4(ghi^mhi, mhi); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4], qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
 "/* weighted scatter: final[ids_token[c]] += cw[c]*out_compact[c]. grid=total, block=256 */\n"
 "__global__ void mmq_scatter_weighted(float *final_out, const float *out_compact,\n"
 "                                      const int *ids_token, const float *cw, int total_rows, int N) {\n"
@@ -6282,6 +6351,7 @@ struct cuda_llm_runner {
     CUfunction fn_mmq_quant_q8_1;
     CUfunction fn_mmq_iq2xxs_grouped;
     CUfunction fn_mmq_scatter_weighted;
+    CUfunction fn_mmq_iq2xxs_grouped8;
     CUfunction fn_dequant_iq3_xxs_to_f16;
     CUfunction fn_dequant_q2_K_to_f16;
     CUfunction fn_dequant_iq3_s_to_f16;
@@ -6436,6 +6506,13 @@ struct cuda_llm_runner {
     CUdeviceptr d_mmq_ebounds;    /* int  [n_experts+1] expert bounds */
     CUdeviceptr d_mmq_worklist;   /* int  [<= n_experts*ceil(maxtok/32)] packed (e<<16)|group */
     int d_mmq_alloc_rows;         /* allocated compact-row capacity (0 = unallocated) */
+    /* Dense IQ2_XXS MMQ prefill scratch (non-MoE; tensor-core int8, weights read once) */
+    CUdeviceptr d_mmqd_cxq8;      /* int8 [rows*K] q8_1 activations */
+    CUdeviceptr d_mmqd_cxs;       /* f32  [rows*K/32] q8_1 scales */
+    CUdeviceptr d_mmqd_eb;        /* int  [2] = {0, n_tokens} */
+    CUdeviceptr d_mmqd_wl;        /* int  worklist */
+    size_t d_mmqd_cap;            /* allocated cxq8 capacity in bytes (0 = unallocated) */
+    int d_mmqd_wl_ntok;           /* n_tokens the cached worklist/eb were built for */
     float *h_router_logits;       /* host copy for top-k selection */
 
     /* GPU weights */
@@ -6793,6 +6870,7 @@ lookup_funcs:
     GET_FUNC(mmq_quant_q8_1);
     GET_FUNC(mmq_iq2xxs_grouped);
     GET_FUNC(mmq_scatter_weighted);
+    GET_FUNC(mmq_iq2xxs_grouped8);
     GET_FUNC(dequant_iq3_xxs_to_f16);
     GET_FUNC(dequant_q2_K_to_f16);
     GET_FUNC(dequant_iq3_s_to_f16);
@@ -11784,6 +11862,57 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     return 0;
 }
 
+/* Dense IQ2_XXS prefill via the validated MMQ int8 tensor-core kernel
+ * (mma.sync m16n8k32.s8.s8.s32). Decodes IQ2_XXS->int8 in shared memory and reads
+ * the 2-bit weight ONCE (no 8x F16 materialization like launch_dequant_gemm_f16).
+ * Treats the dense weight as a single expert with all n_tokens routed to it.
+ * dst is [n_tokens x out_dim] row-major (matches the cuBLAS path).
+ * Returns 0 on success, -1 to fall back. */
+static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                    CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
+    if (!r->fn_mmq_iq2xxs_grouped || !r->fn_mmq_quant_q8_1) return -1;
+    if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
+    size_t need_q8 = (size_t)n_tokens * in_dim;               /* int8 bytes */
+    if (r->d_mmqd_cap < need_q8) {
+        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
+        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
+        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
+        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
+        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {   /* rows*K/32*4 = need_q8/8 */
+            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
+        r->d_mmqd_cap = need_q8;
+    }
+    /* TG=8 prefill variant groups 64 tokens/block (halves weight re-reads vs the
+       decode-tuned TG=4); fall back to grouped (TG=4, 32-token groups) if absent. */
+    int use8 = (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use8 ? 128 : 32;   /* grouped8 uses TG=16 -> 128 tokens/block */
+    if (r->d_mmqd_wl_ntok != n_tokens) {
+        int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+        if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
+        if (r->d_mmqd_wl) { cuMemFree(r->d_mmqd_wl); r->d_mmqd_wl = 0; }
+        if (cuMemAlloc(&r->d_mmqd_wl, (size_t)n_work*sizeof(int)) != CUDA_SUCCESS) return -1;
+        int eb[2] = { 0, n_tokens };
+        cuMemcpyHtoD(r->d_mmqd_eb, eb, 2*sizeof(int));
+        int *wl = (int *)alloca((size_t)n_work*sizeof(int));
+        for (int g = 0; g < n_work; g++) wl[g] = g;   /* (e=0 << 16) | g */
+        cuMemcpyHtoD(r->d_mmqd_wl, wl, (size_t)n_work*sizeof(int));
+        r->d_mmqd_wl_ntok = n_tokens;
+    }
+    int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+    /* 1. quantize activation [n_tokens x in_dim] -> q8_1 (cxq8 int8 + cxs scales) */
+    { int tr = n_tokens, kk = in_dim;
+      void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
+      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/32, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+    /* 2. int8 tensor-core MMQ: out[token x out_dim] = W(IQ2_XXS row-major) x q8_1 act.
+       bm=0: the on-the-fly block-major repack was tried and is slower (its strided read
+       + extra launch outweigh the coalescing gain at TG>=8). */
+    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use8 ? r->fn_mmq_iq2xxs_grouped8 : r->fn_mmq_iq2xxs_grouped;
+      void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+      cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
+    return 0;
+}
+
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
@@ -11876,6 +12005,11 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
          * batch_matvec below. >256 MB guard skips the lm_head (which is Q3_K
          * here anyway); fits the largest 31B ffn weight (21504x5376 = 220 MB). */
         if (n_tokens > 1) {
+            /* Prefer the int8 tensor-core MMQ (reads 2-bit weight once, no F16
+               materialization); CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
+            if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+                launch_mmq_iq2xxs_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+                return;
             if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
                 return;
         }
