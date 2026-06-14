@@ -9235,10 +9235,13 @@ static inline void launch_embed(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
 static inline void launch_rmsnorm(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr x,
                                    CUdeviceptr w, int n, float eps) {
     void *args[] = { &dst, &x, &w, &n, &eps };
+    /* 1024 threads (32 warps) hides the load latency of the single-block reduction
+       far better than 256 (n_embd=5376 -> ~5 elems/thread). */
+    int nthr = (n >= 1024) ? 1024 : 256;
     cuLaunchKernel(r->fn_rmsnorm_f32,
                    1, 1, 1,
-                   256, 1, 1,
-                   256 * sizeof(float), r->stream, args, NULL);
+                   nthr, 1, 1,
+                   nthr * sizeof(float), r->stream, args, NULL);
 }
 
 static inline void launch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
