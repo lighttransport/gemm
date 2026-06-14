@@ -216,6 +216,86 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 6b. kv_cache_store_q8: quantize F32 K/V to INT8 with per-head scale and store ---- */\n"
+"__global__ void kv_cache_store_q8(signed char *key_cache_q8, signed char *value_cache_q8,\n"
+"                                    float *key_scale, float *value_scale,\n"
+"                                    const float *k, const float *v,\n"
+"                                    int position, int kv_dim, int n_kv_heads, int head_dim) {\n"
+"    int h = blockIdx.x;\n"
+"    int t = threadIdx.x;\n"
+"    if (h >= n_kv_heads || t >= head_dim) return;\n"
+"    int i = h * head_dim + t;\n"
+"    if (i >= kv_dim) return;\n"
+"    float kv = k[i], vv = v[i];\n"
+"    float ak = fabsf(kv), av = fabsf(vv);\n"
+"    for (int o = 16; o > 0; o >>= 1) { ak = fmaxf(ak, __shfl_xor_sync(0xffffffff, ak, o));\n"
+"                                         av = fmaxf(av, __shfl_xor_sync(0xffffffff, av, o)); }\n"
+"    if (t == 0) { key_scale[(size_t)position * n_kv_heads + h] = ak / 127.0f;\n"
+"                  value_scale[(size_t)position * n_kv_heads + h] = av / 127.0f; }\n"
+"    float iks = ak > 0.0f ? 127.0f / ak : 0.0f;\n"
+"    float ivs = av > 0.0f ? 127.0f / av : 0.0f;\n"
+"    int qk = (int)rintf(kv * iks); qk = qk < -127 ? -127 : (qk > 127 ? 127 : qk);\n"
+"    int qv = (int)rintf(vv * ivs); qv = qv < -127 ? -127 : (qv > 127 ? 127 : qv);\n"
+"    key_cache_q8[(size_t)position * kv_dim + i] = (signed char)qk;\n"
+"    value_cache_q8[(size_t)position * kv_dim + i] = (signed char)qv;\n"
+"}\n"
+"\n"
+"/* ---- 7q. attn_decode_q8: Flash-style decode attention reading INT8 quantized KV cache ---- */\n"
+"__global__ void attn_decode_q8(float *out, const float *q,\n"
+"                                 const signed char *key_cache_q8, const signed char *value_cache_q8,\n"
+"                                 const float *key_scale, const float *value_scale,\n"
+"                                 int n_heads, int n_kv_heads, int head_dim,\n"
+"                                 int kv_dim, int seq_len, float scale) {\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int tid = threadIdx.x, nthreads = blockDim.x;\n"
+"    int gqa_ratio = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa_ratio;\n"
+"    const float *q_h = q + h * head_dim;\n"
+"    int warp_id = tid / 32, lane = tid % 32;\n"
+"    float *scores = smem;\n"
+"    float local_max = -1e30f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        const signed char *k_t = key_cache_q8 + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"        float ks = key_scale[(size_t)t * n_kv_heads + kv_h];\n"
+"        float s = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) s += q_h[d] * ((float)k_t[d] * ks);\n"
+"        s *= scale;\n"
+"        scores[t] = s;\n"
+"        if (s > local_max) local_max = s;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1)\n"
+"        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, off));\n"
+"    __shared__ float wm[8];\n"
+"    if (lane == 0) wm[warp_id] = local_max;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) { float m = wm[0]; for (int w = 1; w < (nthreads+31)/32; w++) if(wm[w]>m) m=wm[w]; wm[0]=m; }\n"
+"    __syncthreads();\n"
+"    float max_val = wm[0];\n"
+"    float local_sum = 0.0f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        float e = expf(scores[t] - max_val); scores[t] = e; local_sum += e; }\n"
+"    for (int off = 16; off > 0; off >>= 1)\n"
+"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);\n"
+"    __shared__ float ws[8];\n"
+"    if (lane == 0) ws[warp_id] = local_sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) { float s = 0.0f; for (int w = 0; w < (nthreads+31)/32; w++) s+=ws[w]; ws[0]=1.0f/s; }\n"
+"    __syncthreads();\n"
+"    float inv_sum = ws[0];\n"
+"    for (int t = tid; t < seq_len; t += nthreads) scores[t] *= inv_sum;\n"
+"    __syncthreads();\n"
+"    float *out_h = out + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += nthreads) {\n"
+"        float acc = 0.0f;\n"
+"        for (int t = 0; t < seq_len; t++)\n"
+"            acc += scores[t] * ((float)value_cache_q8[(size_t)t * kv_dim + kv_h * head_dim + d] *\n"
+"                                value_scale[(size_t)t * n_kv_heads + kv_h]);\n"
+"        out_h[d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
 "/* Device-pointer variant for CUDA graph capture: position read from device memory */\n"
 "__global__ void rope_neox_f32_ptr(float *vec, int n_heads, int head_dim,\n"
 "                                   const int *pos_ptr,\n"
@@ -8069,6 +8149,8 @@ struct cuda_llm_runner {
     CUfunction fn_attn_decode_f32_ptr;
     CUfunction fn_kv_cache_store_f16;
     CUfunction fn_kv_cache_store_f16_ptr;
+    CUfunction fn_kv_cache_store_q8;
+    CUfunction fn_attn_decode_q8;
     CUfunction fn_attn_decode_f32;
     CUfunction fn_silu_mul_f32;
     CUfunction fn_add_f32;
@@ -8362,6 +8444,12 @@ struct cuda_llm_runner {
     /* KV cache: one allocation per layer */
     CUdeviceptr *d_key_cache;    /* [n_layers] -> [max_seq_len * kv_dim] F32 */
     CUdeviceptr *d_value_cache;
+    /* INT8 quantized KV cache (opt-in, CUDA_LLM_KV_CACHE_Q8) */
+    CUdeviceptr *d_key_cache_q8;  /* [n_layers] -> [max_seq_len * kv_dim] INT8 */
+    CUdeviceptr *d_value_cache_q8;
+    CUdeviceptr *d_key_scale;     /* [n_layers] -> [max_seq_len * n_kv_heads] F32 */
+    CUdeviceptr *d_value_scale;
+    int kv_cache_q8;              /* flag: use INT8 KV cache */
 
     /* Scratch buffers on GPU */
     CUdeviceptr d_x;     /* [n_embd] */
@@ -8608,6 +8696,8 @@ lookup_funcs:
     GET_FUNC(attn_decode_f32_ptr);
     GET_FUNC(kv_cache_store_f16);
     GET_FUNC(kv_cache_store_f16_ptr);
+    GET_FUNC(kv_cache_store_q8);
+    GET_FUNC(attn_decode_q8);
     GET_FUNC(attn_decode_f32);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
@@ -9571,17 +9661,16 @@ static int upload_weight_f32(CUdeviceptr *d_ptr, const qtensor *t) {
  * block-major repacked version. The launch helper passes bm=1. */
 static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t,
                                 int *out_type, const char *cache_name);
-static int upload_weight_matrix_bm(cuda_llm_runner *r, CUdeviceptr *d_ptr, CUdeviceptr *d_ptr_bm,
-                                   const qtensor *t, int *out_type, const char *cache_name) {
-    if (upload_weight_matrix(r, d_ptr, t, out_type, cache_name) != 0) return -1;
-    if (r->dense_bm && d_ptr_bm) {
-        CUdeviceptr bm_ptr = 0;
-        if (upload_kquant_raw_bm(&bm_ptr, t, 1) != 0) return -1;
-        if (bm_ptr) { cuMemFree(*d_ptr); *d_ptr = bm_ptr; }
-    }
-    if (!r->dense_bm && d_ptr_bm) *d_ptr_bm = 0;
-    return 0;
-}
+ static int upload_weight_matrix_bm(cuda_llm_runner *r, CUdeviceptr *d_ptr, CUdeviceptr *d_ptr_bm,
+                                    const qtensor *t, int *out_type, const char *cache_name) {
+     if (upload_weight_matrix(r, d_ptr, t, out_type, cache_name) != 0) return -1;
+     if (r->dense_bm && d_ptr_bm) {
+         if (upload_kquant_raw_bm(d_ptr_bm, t, 1) != 0) *d_ptr_bm = 0;
+     } else if (d_ptr_bm) {
+         *d_ptr_bm = 0;
+     }
+     return 0;
+ }
 
 static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t,
                                 int *out_type, const char *cache_name) {
@@ -10803,6 +10892,16 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     /* Allocate KV cache (skip SSM layers; Gemma4 has per-layer sizing) */
     r->d_key_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
     r->d_value_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+    r->kv_cache_q8 = getenv("CUDA_LLM_KV_CACHE_Q8") && !getenv("CUDA_LLM_NO_KV_CACHE_Q8");
+    if (r->kv_cache_q8) {
+        r->d_key_cache_q8 = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+        r->d_value_cache_q8 = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+        r->d_key_scale = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+        r->d_value_scale = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+    } else {
+        r->d_key_cache_q8 = NULL; r->d_value_cache_q8 = NULL;
+        r->d_key_scale = NULL; r->d_value_scale = NULL;
+    }
     int n_attn_layers = 0;
     if (r->is_gemma4) {
         for (int l = 0; l < r->n_layers; l++) {
@@ -10816,10 +10915,24 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             } else {
                 cache_sz = (size_t)max_seq_len * kv_dim * sizeof(uint16_t);
             }
-            CHECK_CU(cuMemAlloc(&r->d_key_cache[l], cache_sz));
-            CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, cache_sz));
-            CHECK_CU(cuMemAlloc(&r->d_value_cache[l], cache_sz));
-            CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, cache_sz));
+            if (r->kv_cache_q8) {
+                size_t q8_sz = (size_t)max_seq_len * kv_dim * sizeof(signed char);
+                size_t scale_sz = (size_t)max_seq_len * layer_kv_heads * sizeof(float);
+                CHECK_CU(cuMemAlloc(&r->d_key_cache_q8[l], q8_sz));
+                CHECK_CU(cuMemAlloc(&r->d_value_cache_q8[l], q8_sz));
+                CHECK_CU(cuMemAlloc(&r->d_key_scale[l], scale_sz));
+                CHECK_CU(cuMemAlloc(&r->d_value_scale[l], scale_sz));
+                /* Point FP16 cache to Q8 (prevents allocation; FP16 path unused) */
+                r->d_key_cache[l] = r->d_key_cache_q8[l];
+                r->d_value_cache[l] = r->d_value_cache_q8[l];
+                cuMemsetD8(r->d_key_scale[l], 0, scale_sz);
+                cuMemsetD8(r->d_value_scale[l], 0, scale_sz);
+            } else {
+                CHECK_CU(cuMemAlloc(&r->d_key_cache[l], cache_sz));
+                CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, cache_sz));
+                CHECK_CU(cuMemAlloc(&r->d_value_cache[l], cache_sz));
+                CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, cache_sz));
+            }
             n_attn_layers++;
         }
         /* Point shared layers to source */
@@ -10828,6 +10941,12 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             if (src >= 0 && src < r->n_layers) {
                 r->d_key_cache[l] = r->d_key_cache[src];
                 r->d_value_cache[l] = r->d_value_cache[src];
+                if (r->kv_cache_q8) {
+                    r->d_key_cache_q8[l] = r->d_key_cache_q8[src];
+                    r->d_value_cache_q8[l] = r->d_value_cache_q8[src];
+                    r->d_key_scale[l] = r->d_key_scale[src];
+                    r->d_value_scale[l] = r->d_value_scale[src];
+                }
             }
         }
         if (r->verbose >= 1) {
@@ -11264,11 +11383,24 @@ static inline void launch_rope(cuda_llm_runner *r, CUdeviceptr vec, int n_heads,
 
 static inline void launch_kv_store(cuda_llm_runner *r, CUdeviceptr key_cache, CUdeviceptr value_cache,
                                     CUdeviceptr k, CUdeviceptr v, int position, int kv_dim) {
+    if (r->kv_cache_q8) return; /* Q8 path handles store separately */
     int use_ptr = !r->disable_graph && r->d_pos_seq;
     CUfunction fn = use_ptr ? r->fn_kv_cache_store_f16_ptr : r->fn_kv_cache_store_f16;
     void *pos_arg = use_ptr ? (void*)&r->d_pos_seq : (void*)&position;
     void *args[] = { &key_cache, &value_cache, &k, &v, pos_arg, &kv_dim };
     cuLaunchKernel(fn, (kv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+static inline void launch_kv_store_q8(cuda_llm_runner *r, int layer,
+                                       CUdeviceptr k, CUdeviceptr v, int position, int kv_dim) {
+    if (!r->kv_cache_q8 || !r->fn_kv_cache_store_q8) return;
+    cuda_layer *cl = &r->layers[layer];
+    int n_kv_heads = cl->n_kv_heads;
+    int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
+    void *a[] = { &r->d_key_cache_q8[layer], &r->d_value_cache_q8[layer],
+                  &r->d_key_scale[layer], &r->d_value_scale[layer],
+                  &k, &v, &position, &kv_dim, &n_kv_heads, &hd };
+    cuLaunchKernel(r->fn_kv_cache_store_q8, n_kv_heads, 1, 1, hd, 1, 1, 0, r->stream, a, NULL);
 }
 
 static inline void launch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q,
@@ -11284,6 +11416,20 @@ static inline void launch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevic
     void *args[] = { &out, &q, &key_cache, &value_cache,
                      &n_heads, &n_kv_heads, &head_dim, &kv_dim, sl_arg, &scale };
     cuLaunchKernel(fn, n_heads, 1, 1, 256, 1, 1, (unsigned int)smem, r->stream, args, NULL);
+}
+
+/* Q8 quantized KV cache attention (INT8, per-head scale). Replaces FP16 attention. */
+static inline void launch_attention_q8(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q,
+                                        CUdeviceptr key_cache_q8, CUdeviceptr value_cache_q8,
+                                        CUdeviceptr key_scale, CUdeviceptr value_scale,
+                                        int n_heads, int n_kv_heads, int head_dim,
+                                        int kv_dim, int seq_len, float scale) {
+    if (!r->fn_attn_decode_q8) return;
+    size_t smem = (size_t)seq_len * sizeof(float);
+    void *args[] = { &out, &q, &key_cache_q8, &value_cache_q8,
+                     &key_scale, &value_scale,
+                     &n_heads, &n_kv_heads, &head_dim, &kv_dim, &seq_len, &scale };
+    cuLaunchKernel(r->fn_attn_decode_q8, n_heads, 1, 1, 256, 1, 1, (unsigned int)smem, r->stream, args, NULL);
 }
 
 static inline void launch_silu_mul(cuda_llm_runner *r, CUdeviceptr gate, CUdeviceptr up, int n) {
@@ -12330,10 +12476,12 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 if (cl->is_swa) {
                     int slot = position % r->swa_window_size;
                     launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                                   r->d_k, r->d_v, slot, local_kv_dim);
+                                    r->d_k, r->d_v, slot, local_kv_dim);
+                    if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, slot, local_kv_dim);
                 } else {
                     launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                                   r->d_k, r->d_v, position, local_kv_dim);
+                                    r->d_k, r->d_v, position, local_kv_dim);
+                    if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, position, local_kv_dim);
                 }
             }
 
@@ -12828,14 +12976,22 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
             /* KV cache */
             launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                           r->d_k, r->d_v, position, kv_dim);
+                            r->d_k, r->d_v, position, kv_dim);
+            if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, position, kv_dim);
 
             /* Attention decode */
             int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
-            launch_attention(r, r->d_xb2, r->d_q,
-                           r->d_key_cache[l], r->d_value_cache[l],
-                           n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            if (r->kv_cache_q8) {
+                launch_attention_q8(r, r->d_xb2, r->d_q,
+                                   r->d_key_cache_q8[l], r->d_value_cache_q8[l],
+                                   r->d_key_scale[l], r->d_value_scale[l],
+                                   n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            } else {
+                launch_attention(r, r->d_xb2, r->d_q,
+                                r->d_key_cache[l], r->d_value_cache[l],
+                                n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            }
 
             if (r->debug_layers >= 2 && l == 3) {
                 cuStreamSynchronize(r->stream);
@@ -12970,14 +13126,22 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
             /* Store K,V to cache */
             launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                           r->d_k, r->d_v, position, kv_dim);
+                            r->d_k, r->d_v, position, kv_dim);
+            if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, position, kv_dim);
 
             /* Attention decode */
             int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
-            launch_attention(r, r->d_xb2, r->d_q,
-                           r->d_key_cache[l], r->d_value_cache[l],
-                           n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            if (r->kv_cache_q8) {
+                launch_attention_q8(r, r->d_xb2, r->d_q,
+                                   r->d_key_cache_q8[l], r->d_value_cache_q8[l],
+                                   r->d_key_scale[l], r->d_value_scale[l],
+                                   n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            } else {
+                launch_attention(r, r->d_xb2, r->d_q,
+                                r->d_key_cache[l], r->d_value_cache[l],
+                                n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            }
 
             /* Output projection */
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
@@ -13779,10 +13943,10 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     if (!r->fn_mmq_iq2xxs_grouped || !r->fn_mmq_quant_q8_1) return -1;
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
     /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
-    int use_fused = (r->fn_mmq_iq2xxs_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
-    int use32_fallback = !use_fused && (r->fn_mmq_iq2xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
-    int use8 = !use32_fallback && (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    int use_fused = (r->fn_mmq_iq2xxs_fused32 != 0) && getenv("CUDA_LLM_MMQ_FUSED");
+    int use16 = !use_fused && (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use32 = !use_fused && !use16 && (r->fn_mmq_iq2xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
@@ -13797,7 +13961,7 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     }
     int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
     if (use_fused) {
-        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
         void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
         cuLaunchKernel(r->fn_mmq_iq2xxs_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
         return 0;
@@ -13815,8 +13979,8 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     { int tr = n_tokens, kk = in_dim;
       void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
       cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
-    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
-      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq2xxs_grouped32 : (use8 ? r->fn_mmq_iq2xxs_grouped8 : r->fn_mmq_iq2xxs_grouped);
+    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32 ? r->fn_mmq_iq2xxs_grouped32 : (use16 ? r->fn_mmq_iq2xxs_grouped8 : r->fn_mmq_iq2xxs_grouped);
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
       cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
     return 0;
@@ -13829,10 +13993,10 @@ static int launch_mmq_iq3xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     if (!r->fn_mmq_iq3xxs_grouped || !r->fn_mmq_quant_q8_1) return -1;
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
     /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
-    int use_fused = (r->fn_mmq_iq3xxs_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
-    int use32_fallback = !use_fused && (r->fn_mmq_iq3xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
-    int use8 = !use32_fallback && (r->fn_mmq_iq3xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    int use_fused = (r->fn_mmq_iq3xxs_fused32 != 0) && getenv("CUDA_LLM_MMQ_FUSED");
+    int use16 = !use_fused && (r->fn_mmq_iq3xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use32 = !use_fused && !use16 && (r->fn_mmq_iq3xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
@@ -13847,7 +14011,7 @@ static int launch_mmq_iq3xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     }
     int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
     if (use_fused) {
-        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
         void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
         cuLaunchKernel(r->fn_mmq_iq3xxs_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
         return 0;
@@ -13865,8 +14029,8 @@ static int launch_mmq_iq3xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     { int tr = n_tokens, kk = in_dim;
       void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
       cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
-    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
-      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq3xxs_grouped32 : (use8 ? r->fn_mmq_iq3xxs_grouped8 : r->fn_mmq_iq3xxs_grouped);
+    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32 ? r->fn_mmq_iq3xxs_grouped32 : (use16 ? r->fn_mmq_iq3xxs_grouped8 : r->fn_mmq_iq3xxs_grouped);
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
       cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
     return 0;
@@ -13880,10 +14044,10 @@ static int launch_mmq_q2_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
     if (!r->fn_mmq_q2_K_grouped || !r->fn_mmq_quant_q8_1) return -1;
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
     /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
-    int use_fused = (r->fn_mmq_q2_K_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
-    int use32_fallback = !use_fused && (r->fn_mmq_q2_K_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
-    int use8 = !use32_fallback && (r->fn_mmq_q2_K_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    int use_fused = (r->fn_mmq_q2_K_fused32 != 0) && getenv("CUDA_LLM_MMQ_FUSED");
+    int use16 = !use_fused && (r->fn_mmq_q2_K_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use32 = !use_fused && !use16 && (r->fn_mmq_q2_K_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
@@ -13898,7 +14062,7 @@ static int launch_mmq_q2_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
     }
     int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
     if (use_fused) {
-        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
         void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
         cuLaunchKernel(r->fn_mmq_q2_K_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
         return 0;
@@ -13916,8 +14080,8 @@ static int launch_mmq_q2_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
     { int tr = n_tokens, kk = in_dim;
       void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
       cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
-    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
-      CUfunction mmqfn = use32_fallback ? r->fn_mmq_q2_K_grouped32 : (use8 ? r->fn_mmq_q2_K_grouped8 : r->fn_mmq_q2_K_grouped);
+    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32 ? r->fn_mmq_q2_K_grouped32 : (use16 ? r->fn_mmq_q2_K_grouped8 : r->fn_mmq_q2_K_grouped);
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
       cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
     return 0;
@@ -13930,10 +14094,10 @@ static int launch_mmq_q3_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
     if (!r->fn_mmq_q3_K_grouped || !r->fn_mmq_quant_q8_1) return -1;
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
     /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
-    int use_fused = (r->fn_mmq_q3_K_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
-    int use32_fallback = !use_fused && (r->fn_mmq_q3_K_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
-    int use8 = !use32_fallback && (r->fn_mmq_q3_K_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    int use_fused = (r->fn_mmq_q3_K_fused32 != 0) && getenv("CUDA_LLM_MMQ_FUSED");
+    int use16 = !use_fused && (r->fn_mmq_q3_K_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use32 = !use_fused && !use16 && (r->fn_mmq_q3_K_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
@@ -13948,7 +14112,7 @@ static int launch_mmq_q3_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
     }
     int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
     if (use_fused) {
-        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
         void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
         cuLaunchKernel(r->fn_mmq_q3_K_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
         return 0;
@@ -13966,8 +14130,8 @@ static int launch_mmq_q3_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
     { int tr = n_tokens, kk = in_dim;
       void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
       cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
-    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
-      CUfunction mmqfn = use32_fallback ? r->fn_mmq_q3_K_grouped32 : (use8 ? r->fn_mmq_q3_K_grouped8 : r->fn_mmq_q3_K_grouped);
+    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32 ? r->fn_mmq_q3_K_grouped32 : (use16 ? r->fn_mmq_q3_K_grouped8 : r->fn_mmq_q3_K_grouped);
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
       cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
     return 0;
@@ -13981,10 +14145,10 @@ static int launch_mmq_iq3_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
     /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly,
        eliminating the separate mmq_quant_q8_1 launch and global memory round-trip. */
-    int use_fused = (r->fn_mmq_iq3_s_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
-    int use32_fallback = !use_fused && (r->fn_mmq_iq3_s_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
-    int use8 = !use32_fallback && (r->fn_mmq_iq3_s_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    int use_fused = (r->fn_mmq_iq3_s_fused32 != 0) && getenv("CUDA_LLM_MMQ_FUSED");
+    int use16 = !use_fused && (r->fn_mmq_iq3_s_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use32 = !use_fused && !use16 && (r->fn_mmq_iq3_s_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
@@ -13999,7 +14163,7 @@ static int launch_mmq_iq3_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
     }
     int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
     if (use_fused) {
-        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
         void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
         cuLaunchKernel(r->fn_mmq_iq3_s_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
         return 0;
@@ -14017,8 +14181,8 @@ static int launch_mmq_iq3_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
     { int tr = n_tokens, kk = in_dim;
       void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
       cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
-    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
-      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq3_s_grouped32 : (use8 ? r->fn_mmq_iq3_s_grouped8 : r->fn_mmq_iq3_s_grouped);
+    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32 ? r->fn_mmq_iq3_s_grouped32 : (use16 ? r->fn_mmq_iq3_s_grouped8 : r->fn_mmq_iq3_s_grouped);
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
       cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
     return 0;
@@ -14032,10 +14196,10 @@ static int launch_mmq_iq2_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
     if (!r->fn_mmq_iq2_s_grouped || !r->fn_mmq_quant_q8_1) return -1;
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
     /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
-    int use_fused = (r->fn_mmq_iq2_s_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
-    int use32_fallback = !use_fused && (r->fn_mmq_iq2_s_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
-    int use8 = !use32_fallback && (r->fn_mmq_iq2_s_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    int use_fused = (r->fn_mmq_iq2_s_fused32 != 0) && getenv("CUDA_LLM_MMQ_FUSED");
+    int use16 = !use_fused && (r->fn_mmq_iq2_s_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use32 = !use_fused && !use16 && (r->fn_mmq_iq2_s_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
@@ -14050,7 +14214,7 @@ static int launch_mmq_iq2_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
     }
     int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
     if (use_fused) {
-        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
         void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
         cuLaunchKernel(r->fn_mmq_iq2_s_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
         return 0;
@@ -14068,8 +14232,8 @@ static int launch_mmq_iq2_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
     { int tr = n_tokens, kk = in_dim;
       void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
       cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
-    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
-      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq2_s_grouped32 : (use8 ? r->fn_mmq_iq2_s_grouped8 : r->fn_mmq_iq2_s_grouped);
+    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32 ? r->fn_mmq_iq2_s_grouped32 : (use16 ? r->fn_mmq_iq2_s_grouped8 : r->fn_mmq_iq2_s_grouped);
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
       cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
     return 0;
@@ -15803,6 +15967,7 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                 if (cl->shared_kv_source < 0) {
                     int slot = pos % r->swa_window_size;
                     launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, slot, local_kv_dim);
+                    if (r->kv_cache_q8) launch_kv_store_q8(r, l, k_t, v_t, slot, local_kv_dim);
                 }
 
                 launch_attention_swa(r, xb2_t, q_t,
