@@ -1,0 +1,6 @@
+pyproject.toml
+hy3d_reference.egg-info/PKG-INFO
+hy3d_reference.egg-info/SOURCES.txt
+hy3d_reference.egg-info/dependency_links.txt
+hy3d_reference.egg-info/requires.txt
+hy3d_reference.egg-info/top_level.txt
