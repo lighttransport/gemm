@@ -216,6 +216,7 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+<<<<<<< HEAD
 "/* ---- 6b. kv_cache_store_q8: quantize F32 K/V to INT8 with per-head scale and store ---- */\n"
 "__global__ void kv_cache_store_q8(signed char *key_cache_q8, signed char *value_cache_q8,\n"
 "                                    float *key_scale, float *value_scale,\n"
@@ -296,6 +297,8 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "/* Device-pointer variant for CUDA graph capture: position read from device memory */\n"
 "__global__ void rope_neox_f32_ptr(float *vec, int n_heads, int head_dim,\n"
 "                                   const int *pos_ptr,\n"
@@ -907,6 +910,7 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+<<<<<<< HEAD
 "/* ---- dequant_q2_K_to_f16: Q2_K weight -> F16, element order matching matvec_q2_K_f32 ---- */\n"
 "/* For the gemma4 dequant->F16->cuBLAS batched-prefill path. 8 warps/block, 1 warp/row. */\n"
 "__global__ void dequant_q2_K_to_f16(half_raw *dst, const unsigned char *mat,\n"
@@ -946,6 +950,8 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "/* ---- 14b. quantize_f32_to_q8_1: per-32 block F32 -> Q8_1 (int8 qs[32] + half2(d,sum)) ---- */\n"
 "/* One warp per Q8_1 block; launch with blockDim=(32, N), grid=(n_blocks/N). */\n"
 "/* Output format: 36 bytes per block = 32 int8 qs + half d + half sum. */\n"
@@ -1874,6 +1880,7 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+<<<<<<< HEAD
 "/* ---- matvec_iq2_xxs_q8_1_dp4a: IQ2_XXS weight x Q8_1 activation via dp4a (decode) ---- */\n"
 "/* 8 warps/block, one warp per row, lane strides over 256-blocks. Branchless int8\n"
 "   weight build: grid byte = magnitude, sign applied via per-byte two's complement\n"
@@ -1979,6 +1986,8 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sumf;\n"
 "}\n"
 "\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "__device__ static const unsigned long long iq2xs_grid_dev[512] = {\n"
 "    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,\n"
 "    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x080808080819192bULL,\n"
@@ -3345,6 +3354,7 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+<<<<<<< HEAD
 "/* ---- matvec_iq3_xxs_q8_1_dp4a: IQ3_XXS weight x Q8_1 activation via dp4a (decode) ---- */\n"
 "/* Mirrors matvec_iq3_xxs_f32: 98-byte block = d + qs[64] + scales_and_signs[32];\n"
 "   uint32 grid (4 magnitudes), db = d*(0.5+(aux>>28))*0.5. Branchless signed int8 +\n"
@@ -3394,6 +3404,8 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sumf;\n"
 "}\n"
 "\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "/* ---- matvec_iq2_s_f32: IQ2_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq2_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -3439,6 +3451,7 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+<<<<<<< HEAD
 "/* ---- matvec_iq2_s_q8_1_dp4a: IQ2_S weight x Q8_1 activation via dp4a (decode) ---- */\n"
 "/* Mirrors matvec_iq2_s_f32: 82B = d + qs[32]@2 + signs[32]@34 + qh[8]@66 + scales[8]@74;\n"
 "   uint64 grid (8 mag, 10-bit idx via qh), two scales per ib32 (l<2 vs l>=2) -> two\n"
@@ -3489,6 +3502,8 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sumf;\n"
 "}\n"
 "\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "/* ---- matvec_iq3_s_f32: IQ3_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq3_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -3547,6 +3562,7 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+<<<<<<< HEAD
 "/* ---- dequant_iq3_s_to_f16: IQ3_S weight -> F16, element order matching matvec_iq3_s_f32 ---- */\n"
 "__global__ void dequant_iq3_s_to_f16(half_raw *dst, const unsigned char *mat,\n"
 "                                       int rows, int cols) {\n"
@@ -3642,6 +3658,8 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sumf;\n"
 "}\n"
 "\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -4754,6 +4772,7 @@ static const char *cuda_kernel_source =
 "/* Writes rows_per_expert x n_cols F16 values to dst */\n"
 "__global__ void dequant_iq2_xxs_to_f16(half_raw *dst, const unsigned char *mat,\n"
 "                                         int rows, int cols) {\n"
+<<<<<<< HEAD
 "    /* one thread per 32-element sub-block (ib32); coalesced F16 writes */\n"
 "    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    int units_per_row = cols >> 5;            /* (cols/256)*8 = cols/32 */\n"
@@ -4779,6 +4798,34 @@ static const char *cuda_kernel_source =
 "        for (int j = 0; j < 8; j++) {\n"
 "            float w = db * (float)(unsigned char)(gv >> (8*j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
 "            d_b[l * 8 + j] = float_to_half(w);\n"
+=======
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= rows) return;\n"
+"    int nb = cols / 256;\n"
+"    int row_bytes = nb * 66;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    half_raw *dst_row = dst + (size_t)row * cols;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        half_raw *d_b = dst_row + b * 256;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                unsigned long long gv = iq2xxs_grid_dev[aux8[l]];\n"
+"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    float w = db * (float)(unsigned char)(gv >> (8*j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    d_b[ib32 * 32 + l * 8 + j] = float_to_half(w);\n"
+"                }\n"
+"            }\n"
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "        }\n"
 "    }\n"
 "}\n"
@@ -4899,6 +4946,7 @@ static const char *cuda_kernel_source =
 "   F16 materialization) + q8_1 int8 activations via mma.sync.m16n8k32.s8.s8.s32.\n"
 "   Validated standalone in cuda/llm/mmq/. */\n"
 "/* gather rows by token index + quantize to q8_1 (per-32 scale). grid=(K/32,total), block=32 */\n"
+<<<<<<< HEAD
 "/* Optimized gather+quantize: 32 threads, 8 elements/thread = 256 K elements/block. */\n"
 "/* Grid: (K/256, total_rows). Requires K %% 256 == 0.                              */\n"
 "__global__ void mmq_gather_quant_q8_1(const float *X, const int *ids_token,\n"
@@ -4944,6 +4992,32 @@ static const char *cuda_kernel_source =
 "        cxq8[(size_t)c*K + k_base + g*32] = (signed char)q;\n"
 "        if (t == 0) cxs[(size_t)c*(K/32) + kb*8 + g] = scale;\n"
 "    }\n"
+=======
+"__global__ void mmq_gather_quant_q8_1(const float *X, const int *ids_token,\n"
+"                                       signed char *cxq8, float *cxs, int total_rows, int K) {\n"
+"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x, k = kb*32 + t;\n"
+"    if (c >= total_rows) return;\n"
+"    int tok = ids_token[c];\n"
+"    float v = (k < K) ? X[(size_t)tok*K + k] : 0.0f;\n"
+"    float a = fabsf(v);\n"
+"    for (int o=16;o>0;o>>=1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
+"    float scale = a/127.0f, inv = scale>0.0f?1.0f/scale:0.0f;\n"
+"    int q=(int)rintf(v*inv); q=q<-127?-127:(q>127?127:q);\n"
+"    cxq8[(size_t)c*K + k] = (signed char)q;\n"
+"    if (t==0) cxs[(size_t)c*(K/32) + kb] = scale;\n"
+"}\n"
+"/* quantize compact rows (already gathered) to q8_1. grid=(K/32,total), block=32 */\n"
+"__global__ void mmq_quant_q8_1(const float *X, signed char *cxq8, float *cxs, int total_rows, int K) {\n"
+"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x, k = kb*32 + t;\n"
+"    if (c >= total_rows) return;\n"
+"    float v = (k < K) ? X[(size_t)c*K + k] : 0.0f;\n"
+"    float a = fabsf(v);\n"
+"    for (int o=16;o>0;o>>=1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
+"    float scale = a/127.0f, inv = scale>0.0f?1.0f/scale:0.0f;\n"
+"    int q=(int)rintf(v*inv); q=q<-127?-127:(q>127?127:q);\n"
+"    cxq8[(size_t)c*K + k] = (signed char)q;\n"
+"    if (t==0) cxs[(size_t)c*(K/32) + kb] = scale;\n"
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "}\n"
 "static __device__ __forceinline__ int mmq_pack4(const signed char*p){\n"
 "    return (p[0]&0xff)|((p[1]&0xff)<<8)|((p[2]&0xff)<<16)|((p[3]&0xff)<<24); }\n"
@@ -4979,7 +5053,11 @@ static const char *cuda_kernel_source =
 "    int n0 = blockIdx.x*64 + warp*16;\n"
 "    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
 "    const unsigned char *We = W + (size_t)e*estride;\n"
+<<<<<<< HEAD
 "    __shared__ signed char sX[32][36]; __shared__ float sXs[32];\n"
+=======
+"    __shared__ signed char sX[32][32]; __shared__ float sXs[32];\n"
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
 "    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
 "    __syncthreads();\n"
@@ -5029,6 +5107,7 @@ static const char *cuda_kernel_source =
 "        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
 "    }\n"
 "}\n"
+<<<<<<< HEAD
 "/* Prefill variant of mmq_iq2xxs_grouped with TG=16 (128 tokens/block instead of 32):\n"
 "   the decode-amortize kernel re-reads the weight ceil(n_tokens/(8*TG)) times, so a\n"
 "   bigger TG cuts the redundant weight reads ~4x for large prefill batches. f[16][4]\n"
@@ -5098,6 +5177,8 @@ static const char *cuda_kernel_source =
 "        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
 "    }\n"
 "}\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "/* weighted scatter: final[ids_token[c]] += cw[c]*out_compact[c]. grid=total, block=256 */\n"
 "__global__ void mmq_scatter_weighted(float *final_out, const float *out_compact,\n"
 "                                      const int *ids_token, const float *cw, int total_rows, int N) {\n"
@@ -5144,6 +5225,7 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+<<<<<<< HEAD
 "/* Prefill variant of mmq_iq2xxs_grouped with TG=32 (256 tokens/block). */\n"
 "__global__ void mmq_iq2xxs_grouped32(float *out, const unsigned char *W, unsigned long long estride,\n"
 "                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
@@ -6923,6 +7005,8 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 "/* Batched IQ2_S TensorCore matvec: 16 rows x 8 tokens via mma.sync */\n"
 "__global__ void batch_matvec_iq2_s_tc(float *output, const unsigned char *mat, const float *input,\n"
 "                                        int out_dim, int in_dim, int n_tokens) {\n"
@@ -8016,6 +8100,7 @@ typedef struct {
     CUdeviceptr attn_norm_w;   /* F32 [n_embd] */
     CUdeviceptr attn_q_w;     /* F16 [n_rows * n_cols] */
     CUdeviceptr attn_q_w_f16; /* optional F16 shadow copy for batched Q8_0 prefill */
+<<<<<<< HEAD
     CUdeviceptr attn_q_w_bm;  /* block-major repacked (0 if not repacked) */
     CUdeviceptr attn_k_w;
     CUdeviceptr attn_k_w_f16;
@@ -8023,6 +8108,12 @@ typedef struct {
     CUdeviceptr attn_v_w;
     CUdeviceptr attn_v_w_f16;
     CUdeviceptr attn_v_w_bm;
+=======
+    CUdeviceptr attn_k_w;
+    CUdeviceptr attn_k_w_f16;
+    CUdeviceptr attn_v_w;
+    CUdeviceptr attn_v_w_f16;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     CUdeviceptr attn_q_norm_w; /* F32 [head_dim] */
     CUdeviceptr attn_k_norm_w; /* F32 [head_dim] */
     CUdeviceptr attn_q_bias;   /* F32 [q_dim], 0 if absent (Qwen2.5-VL) */
@@ -8030,6 +8121,7 @@ typedef struct {
     CUdeviceptr attn_v_bias;   /* F32 [kv_dim] */
     CUdeviceptr attn_output_w; /* F16 */
     CUdeviceptr attn_output_w_f16;
+<<<<<<< HEAD
     CUdeviceptr attn_output_w_bm;
     CUdeviceptr ffn_norm_w;    /* F32 [n_embd] */
     CUdeviceptr ffn_gate_w;    /* F16 */
@@ -8041,6 +8133,15 @@ typedef struct {
     CUdeviceptr ffn_down_w;    /* F16 */
     CUdeviceptr ffn_down_w_f16;
     CUdeviceptr ffn_down_w_bm;
+=======
+    CUdeviceptr ffn_norm_w;    /* F32 [n_embd] */
+    CUdeviceptr ffn_gate_w;    /* F16 */
+    CUdeviceptr ffn_gate_w_f16;
+    CUdeviceptr ffn_up_w;      /* F16 */
+    CUdeviceptr ffn_up_w_f16;
+    CUdeviceptr ffn_down_w;    /* F16 */
+    CUdeviceptr ffn_down_w_f16;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 
     /* Dimensions for matvec */
     int attn_q_rows, attn_q_cols;
@@ -8149,8 +8250,11 @@ struct cuda_llm_runner {
     CUfunction fn_attn_decode_f32_ptr;
     CUfunction fn_kv_cache_store_f16;
     CUfunction fn_kv_cache_store_f16_ptr;
+<<<<<<< HEAD
     CUfunction fn_kv_cache_store_q8;
     CUfunction fn_attn_decode_q8;
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     CUfunction fn_attn_decode_f32;
     CUfunction fn_silu_mul_f32;
     CUfunction fn_add_f32;
@@ -8192,8 +8296,11 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_f32_f32;
     CUfunction fn_batch_matvec_f32_f32;
     CUfunction fn_matvec_iq2_xxs_f32;
+<<<<<<< HEAD
     CUfunction fn_matvec_iq2_xxs_q8_1_dp4a;
     CUfunction fn_matvec_iq2_xxs_q8_1_dp4a_coal;
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     CUfunction fn_matvec_q4_0_f32;
     CUfunction fn_matvec_q4_0_q8_1_dp4a;
     CUfunction fn_matvec_q4_1_f32;
@@ -8205,9 +8312,12 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_iq3_xxs_f32;
     CUfunction fn_matvec_iq2_s_f32;
     CUfunction fn_matvec_iq3_s_f32;
+<<<<<<< HEAD
     CUfunction fn_matvec_iq3_xxs_q8_1_dp4a;
     CUfunction fn_matvec_iq2_s_q8_1_dp4a;
     CUfunction fn_matvec_iq3_s_q8_1_dp4a;
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     CUfunction fn_matvec_iq1_s_f32;
     CUfunction fn_matvec_iq1_m_f32;
     CUfunction fn_matvec_tq1_0_f32;
@@ -8240,6 +8350,7 @@ struct cuda_llm_runner {
     CUfunction fn_mmq_quant_q8_1;
     CUfunction fn_mmq_iq2xxs_grouped;
     CUfunction fn_mmq_scatter_weighted;
+<<<<<<< HEAD
     CUfunction fn_mmq_iq2xxs_grouped8;
     CUfunction fn_mmq_iq2xxs_grouped32;
     CUfunction fn_mmq_iq2xxs_fused32;
@@ -8271,6 +8382,9 @@ struct cuda_llm_runner {
     CUfunction fn_dequant_iq3_xxs_to_f16;
     CUfunction fn_dequant_q2_K_to_f16;
     CUfunction fn_dequant_iq3_s_to_f16;
+=======
+    CUfunction fn_dequant_iq3_xxs_to_f16;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     CUfunction fn_batch_matvec_iq2_s_tc;
     CUfunction fn_batch_matvec_iq3_xxs;
     CUfunction fn_batch_matvec_iq3_s;
@@ -8333,7 +8447,10 @@ struct cuda_llm_runner {
     /* MoE params */
     int is_moe;
     int moe_iq2_bm;       /* IQ2_XXS expert weights repacked block-major (CUDA_LLM_MMQ_REPACK) */
+<<<<<<< HEAD
     int dense_bm;         /* Dense weights repacked block-major (CUDA_LLM_DENSE_BM) */
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     int n_experts;
     int n_experts_used;   /* top-k */
     int expert_ff;        /* per-expert FFN dim */
@@ -8423,6 +8540,7 @@ struct cuda_llm_runner {
     CUdeviceptr d_mmq_ebounds;    /* int  [n_experts+1] expert bounds */
     CUdeviceptr d_mmq_worklist;   /* int  [<= n_experts*ceil(maxtok/32)] packed (e<<16)|group */
     int d_mmq_alloc_rows;         /* allocated compact-row capacity (0 = unallocated) */
+<<<<<<< HEAD
     /* Dense IQ2_XXS MMQ prefill scratch (non-MoE; tensor-core int8, weights read once) */
     CUdeviceptr d_mmqd_cxq8;      /* int8 [rows*K] q8_1 activations */
     CUdeviceptr d_mmqd_cxs;       /* f32  [rows*K/32] q8_1 scales */
@@ -8430,6 +8548,8 @@ struct cuda_llm_runner {
     CUdeviceptr d_mmqd_wl;        /* int  worklist */
     size_t d_mmqd_cap;            /* allocated cxq8 capacity in bytes (0 = unallocated) */
     int d_mmqd_wl_ntok;           /* n_tokens the cached worklist/eb were built for */
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     float *h_router_logits;       /* host copy for top-k selection */
 
     /* GPU weights */
@@ -8444,12 +8564,15 @@ struct cuda_llm_runner {
     /* KV cache: one allocation per layer */
     CUdeviceptr *d_key_cache;    /* [n_layers] -> [max_seq_len * kv_dim] F32 */
     CUdeviceptr *d_value_cache;
+<<<<<<< HEAD
     /* INT8 quantized KV cache (opt-in, CUDA_LLM_KV_CACHE_Q8) */
     CUdeviceptr *d_key_cache_q8;  /* [n_layers] -> [max_seq_len * kv_dim] INT8 */
     CUdeviceptr *d_value_cache_q8;
     CUdeviceptr *d_key_scale;     /* [n_layers] -> [max_seq_len * n_kv_heads] F32 */
     CUdeviceptr *d_value_scale;
     int kv_cache_q8;              /* flag: use INT8 KV cache */
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 
     /* Scratch buffers on GPU */
     CUdeviceptr d_x;     /* [n_embd] */
@@ -8696,8 +8819,11 @@ lookup_funcs:
     GET_FUNC(attn_decode_f32_ptr);
     GET_FUNC(kv_cache_store_f16);
     GET_FUNC(kv_cache_store_f16_ptr);
+<<<<<<< HEAD
     GET_FUNC(kv_cache_store_q8);
     GET_FUNC(attn_decode_q8);
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     GET_FUNC(attn_decode_f32);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
@@ -8739,8 +8865,11 @@ lookup_funcs:
     GET_FUNC(matvec_f32_f32);
     GET_FUNC(batch_matvec_f32_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
+<<<<<<< HEAD
     GET_FUNC(matvec_iq2_xxs_q8_1_dp4a);
     GET_FUNC(matvec_iq2_xxs_q8_1_dp4a_coal);
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_0_q8_1_dp4a);
     GET_FUNC(matvec_q4_1_f32);
@@ -8752,9 +8881,12 @@ lookup_funcs:
     GET_FUNC(matvec_iq3_xxs_f32);
     GET_FUNC(matvec_iq2_s_f32);
     GET_FUNC(matvec_iq3_s_f32);
+<<<<<<< HEAD
     GET_FUNC(matvec_iq3_xxs_q8_1_dp4a);
     GET_FUNC(matvec_iq2_s_q8_1_dp4a);
     GET_FUNC(matvec_iq3_s_q8_1_dp4a);
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     GET_FUNC(matvec_iq1_s_f32);
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
@@ -8795,6 +8927,7 @@ lookup_funcs:
     GET_FUNC(mmq_quant_q8_1);
     GET_FUNC(mmq_iq2xxs_grouped);
     GET_FUNC(mmq_scatter_weighted);
+<<<<<<< HEAD
     GET_FUNC(mmq_iq2xxs_grouped8);
     GET_FUNC(mmq_iq2xxs_grouped32);
     GET_FUNC(mmq_iq2xxs_fused32);
@@ -8821,6 +8954,9 @@ lookup_funcs:
     GET_FUNC(dequant_iq3_xxs_to_f16);
     GET_FUNC(dequant_q2_K_to_f16);
     GET_FUNC(dequant_iq3_s_to_f16);
+=======
+    GET_FUNC(dequant_iq3_xxs_to_f16);
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     GET_FUNC(batch_matvec_iq2_s_tc);
     GET_FUNC(batch_matvec_iq3_xxs);
     GET_FUNC(batch_matvec_iq3_s);
@@ -9185,6 +9321,7 @@ static int upload_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t) {
     return 0;
 }
 
+<<<<<<< HEAD
 /* Block-major repack for dense MMQ weights. Transforms row-major [N][nb][bs] to
  * block-major [nb][N][bs] so the kernel reads 64 contiguous rows per block group.
  * The original data is preserved (row-major stays on device for fallback paths). */
@@ -9210,6 +9347,8 @@ static int upload_kquant_raw_bm(CUdeviceptr *d_ptr_bm, const qtensor *t, int bm_
     return 0;
 }
 
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 /* F32 → F16 conversion (truncation, no rounding) */
 static uint16_t cllm_f32_to_f16(float f) {
     union { float f; uint32_t i; } u;
@@ -9656,6 +9795,7 @@ static int upload_weight_f32(CUdeviceptr *d_ptr, const qtensor *t) {
     return 0;
 }
 
+<<<<<<< HEAD
 /* Upload weight + optional block-major repack for dense MMQ.
  * When dense_bm is set, replaces the original row-major pointer with the
  * block-major repacked version. The launch helper passes bm=1. */
@@ -9672,6 +9812,8 @@ static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qt
      return 0;
  }
 
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t,
                                 int *out_type, const char *cache_name) {
     *out_type = t->type;
@@ -10496,6 +10638,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
       int mmq_on = m && m[0] && strcmp(m, "0") != 0;  /* repack only with MMQ (block-major prefill path) */
       moe_repack_bm = !repack_off && mmq_on
                       && (r->n_embd % 64 == 0) && (r->expert_ff % 64 == 0); }
+<<<<<<< HEAD
      r->moe_iq2_bm = moe_repack_bm;
     /* Dense weight block-major repack (opt-out CUDA_LLM_NO_DENSE_BM, default ON with MMQ).
      * Repacks all MMQ-compatible dense weights to block-major for contiguous 64-row reads. */
@@ -10504,6 +10647,9 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
       int mmq_possible = !getenv("CUDA_LLM_NO_MMQ_DENSE");
       r->dense_bm = !no_bm && mmq_possible; }
 
+=======
+    r->moe_iq2_bm = moe_repack_bm;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 
     for (int l = 0; l < r->n_layers; l++) {
         char name[128];
@@ -10587,12 +10733,17 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
+<<<<<<< HEAD
             if (upload_weight_matrix_bm(r, &cl->attn_q_w, &cl->attn_q_w_bm, &t, &cl->attn_q_type, name) != 0) return -1;
+=======
+            if (upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type, name) != 0) return -1;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
             if (upload_q8_0_shadow_f16(r, &cl->attn_q_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
+<<<<<<< HEAD
             if (upload_weight_matrix_bm(r, &cl->attn_k_w, &cl->attn_k_w_bm, &t, &cl->attn_k_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->attn_k_w_f16, &t) != 0) return -1;
 
@@ -10602,6 +10753,17 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             if (cl->has_v_proj) {
                 cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
                 if (upload_weight_matrix_bm(r, &cl->attn_v_w, &cl->attn_v_w_bm, &t, &cl->attn_v_type, name) != 0) return -1;
+=======
+            if (upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type, name) != 0) return -1;
+            if (upload_q8_0_shadow_f16(r, &cl->attn_k_w_f16, &t) != 0) return -1;
+
+            snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
+            t = cllm_load_tensor(gguf, name, r->is_gemma4 ? 0 : 1); /* optional for Gemma4 full-attn layers */
+            cl->has_v_proj = (t.data != NULL);
+            if (cl->has_v_proj) {
+                cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
+                if (upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type, name) != 0) return -1;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                 if (upload_q8_0_shadow_f16(r, &cl->attn_v_w_f16, &t) != 0) return -1;
             } else {
                 /* V = K for this layer (Gemma4 pattern) */
@@ -10616,7 +10778,11 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
+<<<<<<< HEAD
             if (upload_weight_matrix_bm(r, &cl->attn_output_w, &cl->attn_output_w_bm, &t, &cl->attn_output_type, name) != 0) return -1;
+=======
+            if (upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type, name) != 0) return -1;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
             if (upload_q8_0_shadow_f16(r, &cl->attn_output_w_f16, &t) != 0) return -1;
 
             /* QK norms (F32, optional) */
@@ -10777,19 +10943,31 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
+<<<<<<< HEAD
             if (upload_weight_matrix_bm(r, &cl->ffn_gate_w, &cl->ffn_gate_w_bm, &t, &cl->ffn_gate_type, name) != 0) return -1;
+=======
+            if (upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type, name) != 0) return -1;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
             if (upload_q8_0_shadow_f16(r, &cl->ffn_gate_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
+<<<<<<< HEAD
             if (upload_weight_matrix_bm(r, &cl->ffn_up_w, &cl->ffn_up_w_bm, &t, &cl->ffn_up_type, name) != 0) return -1;
+=======
+            if (upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type, name) != 0) return -1;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
             if (upload_q8_0_shadow_f16(r, &cl->ffn_up_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
+<<<<<<< HEAD
             if (upload_weight_matrix_bm(r, &cl->ffn_down_w, &cl->ffn_down_w_bm, &t, &cl->ffn_down_type, name) != 0) return -1;
+=======
+            if (upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type, name) != 0) return -1;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
             if (upload_q8_0_shadow_f16(r, &cl->ffn_down_w_f16, &t) != 0) return -1;
         }
 
@@ -10892,6 +11070,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     /* Allocate KV cache (skip SSM layers; Gemma4 has per-layer sizing) */
     r->d_key_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
     r->d_value_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+<<<<<<< HEAD
     r->kv_cache_q8 = getenv("CUDA_LLM_KV_CACHE_Q8") && !getenv("CUDA_LLM_NO_KV_CACHE_Q8");
     if (r->kv_cache_q8) {
         r->d_key_cache_q8 = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
@@ -10902,6 +11081,8 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         r->d_key_cache_q8 = NULL; r->d_value_cache_q8 = NULL;
         r->d_key_scale = NULL; r->d_value_scale = NULL;
     }
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     int n_attn_layers = 0;
     if (r->is_gemma4) {
         for (int l = 0; l < r->n_layers; l++) {
@@ -10915,6 +11096,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             } else {
                 cache_sz = (size_t)max_seq_len * kv_dim * sizeof(uint16_t);
             }
+<<<<<<< HEAD
             if (r->kv_cache_q8) {
                 size_t q8_sz = (size_t)max_seq_len * kv_dim * sizeof(signed char);
                 size_t scale_sz = (size_t)max_seq_len * layer_kv_heads * sizeof(float);
@@ -10933,6 +11115,12 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 CHECK_CU(cuMemAlloc(&r->d_value_cache[l], cache_sz));
                 CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, cache_sz));
             }
+=======
+            CHECK_CU(cuMemAlloc(&r->d_key_cache[l], cache_sz));
+            CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, cache_sz));
+            CHECK_CU(cuMemAlloc(&r->d_value_cache[l], cache_sz));
+            CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, cache_sz));
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
             n_attn_layers++;
         }
         /* Point shared layers to source */
@@ -10941,12 +11129,15 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             if (src >= 0 && src < r->n_layers) {
                 r->d_key_cache[l] = r->d_key_cache[src];
                 r->d_value_cache[l] = r->d_value_cache[src];
+<<<<<<< HEAD
                 if (r->kv_cache_q8) {
                     r->d_key_cache_q8[l] = r->d_key_cache_q8[src];
                     r->d_value_cache_q8[l] = r->d_value_cache_q8[src];
                     r->d_key_scale[l] = r->d_key_scale[src];
                     r->d_value_scale[l] = r->d_value_scale[src];
                 }
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
             }
         }
         if (r->verbose >= 1) {
@@ -11338,6 +11529,7 @@ static inline void launch_embed(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
 static inline void launch_rmsnorm(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr x,
                                    CUdeviceptr w, int n, float eps) {
     void *args[] = { &dst, &x, &w, &n, &eps };
+<<<<<<< HEAD
     /* 1024 threads (32 warps) hides the load latency of the single-block reduction
        far better than 256 (n_embd=5376 -> ~5 elems/thread). */
     int nthr = (n >= 1024) ? 1024 : 256;
@@ -11345,6 +11537,12 @@ static inline void launch_rmsnorm(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
                    1, 1, 1,
                    nthr, 1, 1,
                    nthr * sizeof(float), r->stream, args, NULL);
+=======
+    cuLaunchKernel(r->fn_rmsnorm_f32,
+                   1, 1, 1,
+                   256, 1, 1,
+                   256 * sizeof(float), r->stream, args, NULL);
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 }
 
 static inline void launch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
@@ -11383,7 +11581,10 @@ static inline void launch_rope(cuda_llm_runner *r, CUdeviceptr vec, int n_heads,
 
 static inline void launch_kv_store(cuda_llm_runner *r, CUdeviceptr key_cache, CUdeviceptr value_cache,
                                     CUdeviceptr k, CUdeviceptr v, int position, int kv_dim) {
+<<<<<<< HEAD
     if (r->kv_cache_q8) return; /* Q8 path handles store separately */
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     int use_ptr = !r->disable_graph && r->d_pos_seq;
     CUfunction fn = use_ptr ? r->fn_kv_cache_store_f16_ptr : r->fn_kv_cache_store_f16;
     void *pos_arg = use_ptr ? (void*)&r->d_pos_seq : (void*)&position;
@@ -11391,6 +11592,7 @@ static inline void launch_kv_store(cuda_llm_runner *r, CUdeviceptr key_cache, CU
     cuLaunchKernel(fn, (kv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+<<<<<<< HEAD
 static inline void launch_kv_store_q8(cuda_llm_runner *r, int layer,
                                        CUdeviceptr k, CUdeviceptr v, int position, int kv_dim) {
     if (!r->kv_cache_q8 || !r->fn_kv_cache_store_q8) return;
@@ -11403,6 +11605,8 @@ static inline void launch_kv_store_q8(cuda_llm_runner *r, int layer,
     cuLaunchKernel(r->fn_kv_cache_store_q8, n_kv_heads, 1, 1, hd, 1, 1, 0, r->stream, a, NULL);
 }
 
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 static inline void launch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q,
                                      CUdeviceptr key_cache, CUdeviceptr value_cache,
                                      int n_heads, int n_kv_heads, int head_dim,
@@ -11418,6 +11622,7 @@ static inline void launch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevic
     cuLaunchKernel(fn, n_heads, 1, 1, 256, 1, 1, (unsigned int)smem, r->stream, args, NULL);
 }
 
+<<<<<<< HEAD
 /* Q8 quantized KV cache attention (INT8, per-head scale). Replaces FP16 attention. */
 static inline void launch_attention_q8(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q,
                                         CUdeviceptr key_cache_q8, CUdeviceptr value_cache_q8,
@@ -11432,6 +11637,8 @@ static inline void launch_attention_q8(cuda_llm_runner *r, CUdeviceptr out, CUde
     cuLaunchKernel(r->fn_attn_decode_q8, n_heads, 1, 1, 256, 1, 1, (unsigned int)smem, r->stream, args, NULL);
 }
 
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 static inline void launch_silu_mul(cuda_llm_runner *r, CUdeviceptr gate, CUdeviceptr up, int n) {
     void *args[] = { &gate, &up, &n };
     cuLaunchKernel(r->fn_silu_mul_f32,
@@ -11697,6 +11904,7 @@ static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CU
                                         CUdeviceptr x, int n_rows, int n_cols) {
     launch_matvec_iq2_xxs_ex(r, dst, mat, x, n_rows, n_cols, 0);
 }
+<<<<<<< HEAD
 static inline void launch_matvec_iq2_xxs_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                               CUdeviceptr x_q81, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
@@ -11724,6 +11932,8 @@ static inline void launch_matvec_iq3_s_dp4a(cuda_llm_runner *r, CUdeviceptr dst,
     cuLaunchKernel(r->fn_matvec_iq3_s_q8_1_dp4a,
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 /* MoE expert matvec: routes IQ2_XXS to the block-major path when expert weights are repacked. */
 static inline void launch_moe_expert_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                             CUdeviceptr x, int n_rows, int n_cols, int type) {
@@ -11829,6 +12039,7 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                 launch_matvec_q6_K(r, dst, mat, x, n_rows, n_cols);
             }
             break;
+<<<<<<< HEAD
         case GGML_TYPE_IQ2_XXS:
             if (r->use_dp4a && (n_cols % 256) == 0 && !getenv("CUDA_LLM_NO_IQ2XXS_DP4A")) {
                 launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
@@ -11837,6 +12048,9 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                 launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols);
             }
             break;
+=======
+        case GGML_TYPE_IQ2_XXS: launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols); break;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
         case GGML_TYPE_Q4_0:
             if (r->use_dp4a && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q40_DP4A")) {
                 launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
@@ -11851,6 +12065,7 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
         case GGML_TYPE_IQ4_NL:  launch_matvec_iq4_nl(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_IQ4_XS:  launch_matvec_iq4_xs(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_IQ2_XS:  launch_matvec_iq2_xs(r, dst, mat, x, n_rows, n_cols); break;
+<<<<<<< HEAD
         case GGML_TYPE_IQ3_XXS:
             if (r->use_dp4a && (n_cols % 256) == 0 && !getenv("CUDA_LLM_NO_IQ3XXS_DP4A")) {
                 launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
@@ -11875,6 +12090,11 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                 launch_matvec_iq3_s(r, dst, mat, x, n_rows, n_cols);
             }
             break;
+=======
+        case GGML_TYPE_IQ3_XXS: launch_matvec_iq3_xxs(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_IQ2_S:   launch_matvec_iq2_s(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_IQ3_S:   launch_matvec_iq3_s(r, dst, mat, x, n_rows, n_cols); break;
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
         case GGML_TYPE_IQ1_S:   launch_matvec_iq1_s(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_IQ1_M:   launch_matvec_iq1_m(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_TQ1_0:   launch_matvec_tq1_0(r, dst, mat, x, n_rows, n_cols); break;
@@ -12476,12 +12696,19 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 if (cl->is_swa) {
                     int slot = position % r->swa_window_size;
                     launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
+<<<<<<< HEAD
                                     r->d_k, r->d_v, slot, local_kv_dim);
                     if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, slot, local_kv_dim);
                 } else {
                     launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
                                     r->d_k, r->d_v, position, local_kv_dim);
                     if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, position, local_kv_dim);
+=======
+                                   r->d_k, r->d_v, slot, local_kv_dim);
+                } else {
+                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
+                                   r->d_k, r->d_v, position, local_kv_dim);
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                 }
             }
 
@@ -12976,12 +13203,17 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
             /* KV cache */
             launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
+<<<<<<< HEAD
                             r->d_k, r->d_v, position, kv_dim);
             if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, position, kv_dim);
+=======
+                           r->d_k, r->d_v, position, kv_dim);
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 
             /* Attention decode */
             int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
+<<<<<<< HEAD
             if (r->kv_cache_q8) {
                 launch_attention_q8(r, r->d_xb2, r->d_q,
                                    r->d_key_cache_q8[l], r->d_value_cache_q8[l],
@@ -12992,6 +13224,11 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                                 r->d_key_cache[l], r->d_value_cache[l],
                                 n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
             }
+=======
+            launch_attention(r, r->d_xb2, r->d_q,
+                           r->d_key_cache[l], r->d_value_cache[l],
+                           n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 
             if (r->debug_layers >= 2 && l == 3) {
                 cuStreamSynchronize(r->stream);
@@ -13126,12 +13363,17 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
             /* Store K,V to cache */
             launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
+<<<<<<< HEAD
                             r->d_k, r->d_v, position, kv_dim);
             if (r->kv_cache_q8) launch_kv_store_q8(r, l, r->d_k, r->d_v, position, kv_dim);
+=======
+                           r->d_k, r->d_v, position, kv_dim);
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 
             /* Attention decode */
             int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
+<<<<<<< HEAD
             if (r->kv_cache_q8) {
                 launch_attention_q8(r, r->d_xb2, r->d_q,
                                    r->d_key_cache_q8[l], r->d_value_cache_q8[l],
@@ -13142,6 +13384,11 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                                 r->d_key_cache[l], r->d_value_cache[l],
                                 n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
             }
+=======
+            launch_attention(r, r->d_xb2, r->d_q,
+                           r->d_key_cache[l], r->d_value_cache[l],
+                           n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
 
             /* Output projection */
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
@@ -13884,6 +14131,7 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
         if (!r->fn_dequant_q4_0_to_f16) return -1;
         /* one thread per output element (coalesced); grid over rows*cols */
         dq_block = 256; dq_grid = (int)(((size_t)out_dim * in_dim + 255) / 256); dq_fn = r->fn_dequant_q4_0_to_f16;
+<<<<<<< HEAD
     } else if (weight_type == GGML_TYPE_IQ2_XXS) {
         if (!r->fn_dequant_iq2_xxs_to_f16) return -1;
         /* one thread per 32-elem sub-block (coalesced); grid over rows*cols/32 */
@@ -13900,6 +14148,8 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     } else if (weight_type == GGML_TYPE_IQ2_S) {
         if (!r->fn_dequant_iq2_s_to_f16) return -1;
         dq_block = 256; dq_grid = (out_dim + 7) / 8; dq_fn = r->fn_dequant_iq2_s_to_f16;
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
     } else return -1;
 
     size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
@@ -13932,6 +14182,7 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     return 0;
 }
 
+<<<<<<< HEAD
 /* Dense IQ2_XXS prefill via the validated MMQ int8 tensor-core kernel
  * (mma.sync m16n8k32.s8.s8.s32). Decodes IQ2_XXS->int8 in shared memory and reads
  * the 2-bit weight ONCE (no 8x F16 materialization like launch_dequant_gemm_f16).
@@ -14244,6 +14495,19 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
                                  int n_tokens, int weight_type) {
     /* cuBLAS path: use F16 shadow + Tensor Core GEMM when available (batched only). */
     if (n_tokens > 1 && r->use_cublas && mat_f16 && r->cublas) {
+=======
+static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                 CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
+                                 int n_tokens, int weight_type) {
+    if (n_tokens == 1) {
+        (void)mat_f16;
+        launch_matvec_auto(r, dst, mat, input, out_dim, in_dim, weight_type);
+        return;
+    }
+
+    /* cuBLAS path: use F16 shadow + Tensor Core GEMM when available */
+    if (r->use_cublas && mat_f16 && r->cublas) {
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
         /* Convert F32 input to F16 (required for Blackwell Tensor Core GEMM) */
         int n_elems = n_tokens * in_dim;
         CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
@@ -14295,6 +14559,7 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
             cuLaunchKernel(r->fn_batch_matvec_q8_0_f32, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
         }
     } else if (weight_type == GGML_TYPE_Q2_K) {
+<<<<<<< HEAD
         /* Prefer the int8 tensor-core MMQ for all batch sizes.
            CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
         if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
@@ -14332,12 +14597,24 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
             return;
         if (n_tokens > 1 && launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
             return;
+=======
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_q2_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_Q3_K) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_q3_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_F16) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_IQ2_XXS) {
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq2_xxs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_XS) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq2_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_S) {
+<<<<<<< HEAD
         /* Prefer the int8 tensor-core MMQ for all batch sizes. */
         if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
             launch_mmq_iq2_s_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
@@ -14362,6 +14639,30 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
             return;
         if (n_tokens > 1 && launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
             return;
+=======
+        /* Dequant + F16 batch matvec: dequantize weights once, reuse for all tokens */
+        size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
+        CUdeviceptr d_f16 = 0;
+        CUresult err = cuMemAlloc(&d_f16, f16_bytes);
+        if (err != CUDA_SUCCESS) {
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_iq2_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        } else {
+            {
+                void *args[] = { &d_f16, &mat, &out_dim, &in_dim };
+                cuLaunchKernel(r->fn_dequant_iq2_s_to_f16, (out_dim+7)/8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            }
+            {
+                void *a[] = { &dst, &d_f16, &input, &out_dim, &in_dim, &n_tokens };
+                cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+            }
+            cuMemFree(d_f16);
+        }
+    } else if (weight_type == GGML_TYPE_IQ3_XXS) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_iq3_xxs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_IQ3_S) {
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq3_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ4_NL) {
@@ -15184,10 +15485,13 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                         int total = offs[r->n_experts];           /* compacted (token,expert) rows */
                         int ef = r->expert_ff;
                         int maxcol = n_embd > ef ? n_embd : ef;
+<<<<<<< HEAD
                         /* Prefer larger token group size for better amortization. */
                         int use32 = (r->fn_mmq_iq2xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
                         int use16 = !use32 && (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
                         int grp = use32 ? 256 : (use16 ? 128 : 32);
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                         if (r->d_mmq_alloc_rows < total) {
                             if (r->d_mmq_cxq8) { cuMemFree(r->d_mmq_cxq8); cuMemFree(r->d_mmq_cxs);
                                 cuMemFree(r->d_mmq_outg); cuMemFree(r->d_mmq_outu); cuMemFree(r->d_mmq_outd); }
@@ -15202,17 +15506,31 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                             }
                             if (!r->d_mmq_ebounds) cuMemAlloc(&r->d_mmq_ebounds, (size_t)(r->n_experts + 1) * sizeof(int));
                             if (r->d_mmq_worklist) { cuMemFree(r->d_mmq_worklist); r->d_mmq_worklist = 0; }
+<<<<<<< HEAD
                             cuMemAlloc(&r->d_mmq_worklist, (size_t)(r->n_experts + total / grp + 8) * sizeof(int));
+=======
+                            /* n_work = sum_e ceil(ec[e]/32) <= n_experts + total/32 */
+                            cuMemAlloc(&r->d_mmq_worklist, (size_t)(r->n_experts + total / 32 + 8) * sizeof(int));
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                             r->d_mmq_alloc_rows = total;
                         }
                         cuMemcpyHtoD(r->d_mmq_ebounds, offs, (size_t)(r->n_experts + 1) * sizeof(int));
                         int maxtok = 0; for (int e = 0; e < r->n_experts; e++) if (ec[e] > maxtok) maxtok = ec[e];
+<<<<<<< HEAD
                         /* flattened work-list: one entry per real (expert,group) pair */
                         int n_work = 0;
                         { int *wl = (int *)alloca((size_t)(r->n_experts + total / grp + 8) * sizeof(int));
                           for (int e = 0; e < r->n_experts; e++) { int ng = (ec[e] + grp - 1) / grp;
                               for (int g = 0; g < ng; g++) wl[n_work++] = (e << 16) | g; }
                           if (n_work == 0) wl[n_work++] = 0;
+=======
+                        /* flattened work-list: one entry per real (expert,group) pair (group = 32 tokens) */
+                        int n_work = 0;
+                        { int *wl = (int *)alloca((size_t)(r->n_experts + total / 32 + 8) * sizeof(int));
+                          for (int e = 0; e < r->n_experts; e++) { int ng = (ec[e] + 31) / 32;
+                              for (int g = 0; g < ng; g++) wl[n_work++] = (e << 16) | g; }
+                          if (n_work == 0) wl[n_work++] = 0;  /* avoid 0-block launch */
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                           cuMemcpyHtoD(r->d_mmq_worklist, wl, (size_t)n_work * sizeof(int)); }
                         if (getenv("CUDA_LLM_MOE_DUMP_DIST")) {
                             static int dumped = 0;
@@ -15230,6 +15548,7 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                         /* 1. gather d_batch_xb rows by ids_token (=etok in d_topk_idx) + quant to q8_1 */
                         { int tr = total, kk = n_embd;
                           void *a[] = { &d_batch_xb, &r->d_topk_idx, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
+<<<<<<< HEAD
                           cuLaunchKernel(r->fn_mmq_gather_quant_q8_1, n_embd / 256, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 2. grouped gate + up: out[total][ef] */
                         int bm = r->moe_iq2_bm;
@@ -15239,16 +15558,34 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                           cuLaunchKernel(mmqfn, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, ag, NULL);
                           void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
                           cuLaunchKernel(mmqfn, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, au, NULL); }
+=======
+                          cuLaunchKernel(r->fn_mmq_gather_quant_q8_1, n_embd / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+                        /* 2. grouped gate + up: out[total][ef] */
+                        int bm = r->moe_iq2_bm;
+                        { unsigned long long st = cl->moe_exp_stride_gu; int nN = ef, nK = n_embd;
+                          void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, ag, NULL);
+                          void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, au, NULL); }
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                         /* 3. silu: outg = silu(outg) * outu */
                         launch_silu_mul(r, r->d_mmq_outg, r->d_mmq_outu, total * ef);
                         /* 4. quantize silu result (ef cols) into cxq8 for the down matmul */
                         { int tr = total, kk = ef;
                           void *a[] = { &r->d_mmq_outg, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
+<<<<<<< HEAD
                           cuLaunchKernel(r->fn_mmq_quant_q8_1, ef / 256, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 5. grouped down: out[total][n_embd] */
                         { unsigned long long st = cl->moe_exp_stride_d; int nN = n_embd, nK = ef;
                           void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
                           cuLaunchKernel(mmqfn, n_embd / 64, n_work, 1, 128, 1, 1, 0, r->stream, ad, NULL); }
+=======
+                          cuLaunchKernel(r->fn_mmq_quant_q8_1, ef / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+                        /* 5. grouped down: out[total][n_embd] */
+                        { unsigned long long st = cl->moe_exp_stride_d; int nN = n_embd, nK = ef;
+                          void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
+                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, n_work, 1, 128, 1, 1, 0, r->stream, ad, NULL); }
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                         /* 6. weighted scatter into d_batch_x (ids_token=etok, weights=etw) */
                         { int tr = total, nN = n_embd;
                           void *a[] = { &d_batch_x, &r->d_mmq_outd, &r->d_topk_idx, &r->d_topk_wgt, &tr, &nN };
@@ -15967,7 +16304,10 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                 if (cl->shared_kv_source < 0) {
                     int slot = pos % r->swa_window_size;
                     launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, slot, local_kv_dim);
+<<<<<<< HEAD
                     if (r->kv_cache_q8) launch_kv_store_q8(r, l, k_t, v_t, slot, local_kv_dim);
+=======
+>>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
                 }
 
                 launch_attention_swa(r, xb2_t, q_t,
