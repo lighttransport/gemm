@@ -1,261 +1,116 @@
-# MoE Batched Prefill Optimization — Continuation Guide
+# Gemma4-31B IQ2_XXS CUDA — decode/prefill optimization (resume guide)
 
-## Current State (June 2026)
+## Goal
+Push the gemma4-31B UD-IQ2_XXS model on RTX 5060 Ti (sm_120, 16 GB) toward
+**decode 30 tok/s** and **prefill pp512 960 tok/s** (llama.cpp on the same model+GPU
+does decode 32.6 / pp512 961, so both are achievable).
 
-**Hardware:** RTX 5060 Ti (GB206, sm_120), 16 GB GDDR7, 36 SMs  
-**Model:** Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf (35B, 256 experts, top-8, expert_ff=512, n_embd=2048)  
-**Quantization:** MoE gate/up/down = IQ2_XXS (type=16, 66 bytes/256-block), Attention/SSM projections = IQ2_XXS/IQ3_XXS
+## Model
+`/mnt/disk01/models/gemma4/31b/gemma-4-31B-it-UD-IQ2_XXS.gguf`
+- n_embd=5376, 60 layers, n_heads=32, n_kv_heads varies [16…,4 every 6th], head_dim_full=512,
+  head_dim_swa=256, swa_window=1024, n_ff=21504, softcap=30, weight-tied output (token_embd=Q3_K).
+- UD-mixed quant per tensor (verified via `python3 cpu/qwen_image/inspect_gguf.py <gguf>`):
+  - attn_q/k/o, ffn_gate/up = **IQ2_XXS**; attn_v = **IQ3_XXS** (every layer);
+    ffn_down = **Q2_K** (early ~7 layers) / **IQ2_XXS** (rest); a few layers carry **IQ3_S/IQ2_S**.
 
-### Latest Benchmark (June 2026)
-
-| Batch | tok/s | Profile |
+## Current state (committed this session, tree clean)
+| metric | session start | now |
 |---|---|---|
-| 512 (warm) | **~2810** | ~182ms; ffn experts≈68-88, **scan=30.2** (W=4), gemm≈35, attn core≈15 |
-| 512 (cold) | ~2500 | first-iteration / cold boost clock; always warm up + interleave A/B |
-| llama.cpp 512 | **2620.91** | `llama-bench -p 512 -n 0 -b 2048 -ub 512 -ngl -1 -fa auto` |
+| prefill pp512 | 116 | **418 t/s** |
+| prefill pp1024 | — | 467 |
+| decode tg | 18.9 | **22.3 t/s** |
 
-**IMPORTANT measurement note:** GPU boost clock makes cold runs read ~2500 and warm runs
-~2760-2810. Always warm up once and interleave the A/B (`CUDA_LLM_SCAN_W=1` vs `=4`, etc.)
-in a single loop, or the clock drift dwarfs the kernel delta.
+Commits (newest first): `0bf3f30` dense IQ2_XXS MMQ int8 TC prefill (265→418) ·
+`197b4d5` rmsnorm 256→1024 thr (decode 22.0→22.3) · `5ed93b4` coalesce
+iq3_xxs/iq2_s/iq3_s decode matvecs (18.9→22.0) · `4bd5e9f` IQ2_S/F16 prefill→cuBLAS (116→265).
 
-### Session results (June 2026): pushed toward 3000 → landed ~2810
-
-- **MMQ block-major weight repack** (`CUDA_LLM_MMQ_REPACK`, default-on) — the FFN lever, FFN
-  122→106ms. **DeltaNet scan W=4 warps/block** (`CUDA_LLM_SCAN_W`, default 4) — +2% occupancy win.
-- **3000 tok/s is NOT reachable on this GPU/model**, and the two walls are now established empirically:
-  1. The DeltaNet scan (30ms) is **latency-bound** on the sequential recurrence (see #4). W=4 is the
-     only safe lever; a shared-q/k variant was slower.
-  2. The **chunked-parallel scan** (the textbook way to break the sequential dependency) is correct
-     but **occupancy-bound here** — only 32 SSM heads = 32 blocks can't fill 36 SMs → 9× slower (see #4).
-  3. MMQ FFN is at its MoE floor; projection GEMMs are FLOPs-bound (fusion saves no FLOPs and needs
-     invasive strided-output plumbing).
-- Realistic warm ceiling **~2810** without a model/GPU with many more SSM heads (so the chunked batch
-  fills the GPU) or a chunked kernel parallelized across more than the head dimension.
-
-`cuda/llm/bench_prefill_compare.sh` compares llama.cpp and this runner on the same model:
-
+## Build / run / measure (cwd = cuda/llm)
 ```bash
-LD_LIBRARY_PATH=/usr/local/cuda/lib64 ./cuda/llm/bench_prefill_compare.sh \
-  /mnt/disk01/models/qwen35moe/35b/Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf 512 1
+cd /home/syoyo/work/gemm/main/cuda/llm && make            # NVRTC source is in cuda_llm_runner.c
+# prefill pp512:
+./test_cuda_llm <gguf> --large-bench 512 -s 1024 --large-bench-random --large-bench-seed 7
+# decode + correctness oracle (token-0 hidden must stay norm=2238.3601, byte-identical):
+./test_cuda_llm <gguf> -t "Hi" -n 1            # prints "Decode: .. tok/s" and "GPU [..] norm="
+# real-prompt prefill correctness (batched MMQ must match cuBLAS top-5):
+./test_cuda_llm <gguf> -t "The capital of France is" -n 1   # "Sequential top-5" line
 ```
+GOTCHAS: cwd resets to repo root between tool calls — `cd cuda/llm` each Bash call.
+NVRTC PTX cache `/tmp/cuda_llm_sm_120_v25_*.ptx` keys on source hash (auto-recompiles on edit;
+`rm` only if debugging stale parity). Profile decode with a sqlite time-window query on the LAST
+~2.75s (decode bench = 5 warm + 50 timed); `nsys ... -t cuda` then query
+`CUPTI_ACTIVITY_KIND_KERNEL` where `start > max(end)-2.75e9`. `--cuda-graph-trace=node` needed for
+decode (graph hides kernels). ncu blocked (ERR_NVGPUCTRPERM). The harness `rel_L2_vs_seq` is
+UNRELIABLE (2-bit × 60 layers → run-to-run flips); trust token-0 byte-equality + top-5 match instead.
+Sanitizer baseline = **240 benign CUDA_ERROR_INVALID_VALUE launch warnings** in --large-bench
+(present identically in baseline b9aacf9); only NEW `invalid read/write`/`misaligned` lines matter.
 
-Detailed bucket profiling is available without changing the normal benchmark path:
+## Where the time goes now
+**Prefill pp512 (1.22s):** `mmq_iq2xxs_grouped8` = 70% (re-reads each weight ~4×, n_work=ceil(512/128));
+dequant→cuBLAS for the minority types ~260ms (iq3_xxs v_proj 120ms + q2_K 100 + iq3_s 81 + iq2_s 80);
+mmq_quant_q8_1 (activation) 4%. **pp2048 = 131 t/s is ATTENTION-bound** (O(N²) full-attn d512), a
+separate axis — not the matvec path.
+**Decode (44.8ms/tok, fully GPU-bound, NO host gap):** iq2_xxs_coal 30.6ms (58%, ~248 GB/s — already
+matches llama.cpp's per-weight rate), lm_head F16 6.7ms, rest ~7ms.
 
-```bash
-CUDA_LLM_PREFILL_DETAIL=1 CUDA_LLM_USE_CUBLAS=1 LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
-  ./cuda/llm/test_cuda_llm /mnt/disk01/models/qwen35moe/35b/Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf \
-  --large-bench 512 --large-bench-random --large-bench-seed 1
+## Next levers (highest leverage first)
+1. **MMQ for the minority prefill types** (tractable, ~150ms → ~480 t/s). Adapt `mmq_iq2xxs_grouped8`
+   for IQ3_XXS first (v_proj, every layer, biggest at 120ms). IQ3_XXS = 98B blocks, uint32
+   `iq3xxs_grid_dev`, scales_and_signs[32]@66 — decode already worked out in the coalesced decode
+   kernel `matvec_iq3_xxs_q8_1_dp4a`. Then Q2_K/IQ3_S/IQ2_S (word-based, harder). Wire into
+   `launch_batch_matvec` like the IQ2_XXS case (`launch_mmq_iq2xxs_dense` is the template, ~line 11793).
+2. **Read-once MMQ GEMM for IQ2_XXS** (bigger lever toward 960, harder). The grouped kernel
+   re-reads the weight n_work=ceil(n_tok/(8·TG))× and is register-capped at TG=16 (TG=32 spills,
+   f[32][4]). A true GEMM tiling that K-splits and keeps the decoded weight tile resident across all
+   token columns would read the weight ~once. This is the llama.cpp mmq.cuh approach (MMQ_X/MMQ_Y
+   tiling). Substantial.
+3. **Prefill attention** for pp≥2048 (O(N²) full-attn d512 dominates there) — separate from matvec.
+4. **Decode 30** needs a full MMVQ-class rewrite (uniformly-efficient skinny matvecs); the dominant
+   iq2_xxs_coal already matches llama.cpp's rate so there's no single hot spot. Tractable-but-modest:
+   coalesce q2_K decode matvec (~0.8ms); a Q3_K lm_head needs both a coalesced matvec_q3_K AND an
+   embed_q3_K kernel + 4-site rewire (matvec_q3_K is strided; a strided Q3_K lm_head reading 1GB@66GB/s
+   would be SLOWER than the 2.8GB F16@424GB/s) — net ~+1 tok/s, deprioritized.
+
+## Key code anchors (cuda_llm_runner.c)
+- `launch_mmq_iq2xxs_dense` (~11793) — dense MMQ helper; quant act + 1-expert worklist + launch.
+  `use8`/TG=16 path via `mmq_iq2xxs_grouped8`; env `CUDA_LLM_NO_MMQ_DENSE`, `CUDA_LLM_MMQ_TG4`.
+- `mmq_iq2xxs_grouped8` (NVRTC, ~4935) — TG=16 prefill MMQ (copy of MoE `mmq_iq2xxs_grouped` ~4858).
+- `mmq_quant_q8_1` (~4836) — activation→q8_1 for MMQ; struct scratch `d_mmqd_*` (~6430).
+- `launch_batch_matvec` (~11860) — per-type prefill dispatch; IQ2_XXS case prefers MMQ then
+  `launch_dequant_gemm_f16` (~11730, dequant→F16→cuBLAS) fallback. IQ2_S/F16/IQ3_S in the f16 helper.
+- Coalesced decode matvecs: `matvec_iq2_xxs_q8_1_dp4a_coal` (~1856),
+  `matvec_iq3_xxs/iq2_s/iq3_s_q8_1_dp4a` (coalesced this session). Strided word-based: q2_K (~903),
+  q3_K (~1018). `launch_rmsnorm` (~9235, now 1024 thr).
+- Dead-ends (do NOT retry): on-the-fly block-major repack bm=1 (slower at TG≥8), 2-rows-per-warp
+  decode coal2 (regressed), prefill dequant/GEMM overlap (shares bandwidth), #pragma unroll on coal,
+  Q3_K lm_head (strided matvec_q3_K slower than F16; needs coalesce + embed_q3_K rewire first).
+
+## Full optimization ladder (for context)
+- **Decode 3.1→22.3 over the project:** (a) dp4a INT8 matvecs for all 4 IQ-codebook types
+  (`matvec_{iq2_xxs,iq3_xxs,iq2_s,iq3_s}_q8_1_dp4a`): quantize act→Q8_1 + INT8 `dp4a`, codebook signs
+  applied branchlessly `signed = __vadd4(grid^mask, mask&0x01010101u)` where `mask` expands 4 sign
+  bits to 4 bytes (zero-centered → no Q8_1 offset term) → 3.1→15.9. (b) Coalesced IQ2_XXS matvec
+  (`_coal`): lane→qs-uint16 (NOT lane→block) so 32 lanes read 32 consecutive shorts = one coalesced
+  64B load; decode g=lane/4=ib32, sub=lane%4, aux gathered via intra-4-lane-group `__shfl` →
+  219→295 GB/s, 15.9→19.2. (c) THIS session: same coalescing applied to iq3_xxs/iq2_s/iq3_s
+  (18.9→22.0, byte-identical) + rmsnorm 1024 threads (→22.3).
+- **Prefill 116→418 over this session:** (a) IQ2_S/F16 weights were on a naive per-token
+  `vision_linear_f16` (53% of GPU) → routed to cuBLAS like IQ2_XXS (116→265). (b) Dense IQ2_XXS MMQ
+  int8 tensor-core (reuse the MoE `mmq_iq2xxs_grouped`, mma.sync.m16n8k32.s8.s8.s32, weights read as
+  2-bit) → 265→312; TG=16 prefill variant (128 tok/block, fewer weight re-reads) → 312→418.
+
+## IQ2_XXS block layout (66 bytes / 256 elements) — for new MMQ/decode kernels
 ```
-
-Latest detail line after warm-up (CUDA_LLM_MOE_MMQ=1, scan W=4 default):
-
+offset 0:  d (half) super-block scale ; offset 2: qs[64] = 32 uint16
+per 256-block: 8 sub-blocks (ib32). For ib32: a0 = qs[4*ib]|(qs[4*ib+1]<<16),
+  a1 = qs[4*ib+2]|(qs[4*ib+3]<<16); db = d*(0.5 + (a1>>28))*0.25;
+  for l in 0..3: gv = iq2xxs_grid_dev[(a0>>(8*l))&255] (uint64, 8 int8 mags);
+    signs = ksigns_iq2xs_dev[(a1>>(7*l))&127]; 8 weights = ±(gv byte j).
 ```
-ssm[param=0.4 conv=7.0 norm=1.4 scan=30.2 gate=1.7]
-attn[prep=1.3 core=14.8 post=2.3]
-ffn[router=3.1 topk=7.9 pack=2.2 experts=68-88 shared=5.7]
-```
+IQ3_XXS (98B): d + qs[64]@2 (uint8 idx into uint32 `iq3xxs_grid_dev`) + scales_and_signs[32]@66
+  (uint32/ib32: db=d*(0.5+(sas>>28))*0.5, signs via ksigns). IQ2_S (82B): d + qs[32]@2 + signs[32]@34
+  + qh[8]@66 + scales[8]@74 (10-bit grid idx via qh, two scales/ib32). IQ3_S (110B): d + qs[64]@2 +
+  qh[8]@66 + signs[32]@74 + scales[4]@106 (9-bit idx via qh). Q2_K/Q3_K are word-based (load_u8x4).
 
-### Key Files
-
-| File | Purpose |
-|---|---|
-| `cuda/llm/cuda_llm_runner.c` | Main runner: struct, kernel strings, prefill/decode logic |
-| `cuda/llm/moe_gpu_kernels.cu` | AOT cubin kernels (top-k, dequant, fused, etc.) |
-| `cuda/llm/moe_gpu_kernels.cubin` | Compiled cubin for sm_120 |
-| `cuda/llm/test_cuda_llm.c` | Test harness: `--large-bench N` for synthetic prefill benchmark |
-| `cuda/cublasew.h/c` | cuBLAS wrapper: includes `cublasew_gemm_strided_batched` |
-| `cuda/llm/Makefile` | Build: `nvcc -cubin` + `gcc` for runner |
-
-### How to Reproduce
-
-```bash
-# Build
-cd /home/syoyo/work/gemm/main
-nvcc -cubin -arch=sm_120 -o cuda/llm/moe_gpu_kernels.cubin cuda/llm/moe_gpu_kernels.cu
-make -C cuda/llm
-
-# Quick test (6 tokens, normal flow)
-CUDA_LLM_USE_CUBLAS=1 LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
-  ./cuda/llm/test_cuda_llm /mnt/disk01/models/qwen35moe/35b/Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf -n 1
-
-# Large batch prefill benchmark (512 tokens)
-CUDA_LLM_USE_CUBLAS=1 LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
-  timeout 300 ./cuda/llm/test_cuda_llm /mnt/disk01/models/qwen35moe/35b/Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf \
-  --large-bench 512 --large-bench-random --large-bench-seed 1 2>&1 | grep -E "Large bench|profile|detail"
-```
-
-**Note:** First run compiles NVRTC kernels (~20s). Second run is the real measurement.
-
-## Architecture Details
-
-### MoE Prefill Flow (working path)
-
-```
-For each layer:
-  1. RMSNorm on d_batch_xb
-  2. SSM (30 layers) or Attention (10 layers)
-  3. Residual add: d_batch_x += d_batch_xb
-  4. FFN section:
-     a. Copy d_batch_x -> d_batch_xb (residual copy)
-     b. RMSNorm on d_batch_xb
-     c. Router: d_router_logits = d_batch_xb @ gate_inp^T (batched F32 matvec)
-     d. GPU top-k: fn_moe_topk_gpu (cubin) -> d_topk_idx, d_topk_wgt
-     e. Sync + copy top-k to host
-     f. For each unique expert with tokens:
-        - Gather rows -> d_batch_mid
-        - Convert F32->F16 -> d_batch_f16_scratch
-        - Dequant gate/up/down IQ2_XXS -> FP16 in one triplet launch -> d_moe_f16w{,2,3}
-        - cuBLAS GEMM gate: d_exp_gate = gathered @ gate_w^T
-        - cuBLAS GEMM up: d_exp_up = gathered @ up_w^T
-        - SiLU: d_exp_gate = silu(d_exp_gate) * d_exp_up
-        - Convert F32->F16 -> d_batch_f16_scratch
-        - cuBLAS GEMM down: d_exp_down = silu_gate @ down_w^T
-        - Scatter-add weighted: d_batch_x += weight * d_exp_down
-     g. Shared expert:
-        - shared gate scalar uses batched F32 matvec
-        - shared gate/up/down FFN use F16 shadows + cuBLAS when CUDA_LLM_USE_CUBLAS=1
-        - batched sigmoid-gated add accumulates into d_batch_x
-```
-
-### Buffer Sizes
-
-| Buffer | Size | Purpose |
-|---|---|---|
-| d_batch_x | alloc_tokens × n_embd | Layer output accumulator |
-| d_batch_xb | alloc_tokens × n_embd | RMSNorm'd input |
-| d_batch_ff1 | alloc_tokens × expert_ff | Expert gate output |
-| d_batch_ff2 | alloc_tokens × expert_ff | Expert up output |
-| d_batch_wide | alloc_tokens × wide_dim | Down output / general scratch |
-| d_batch_mid | alloc_tokens × mid_dim | Gathered input |
-| d_batch_f16_scratch | alloc_tokens × max_in_dim × 2 | F16 input conversion |
-| d_temp_f16 | expert_ff × n_embd × 2 | Transient IQ2_XXS→FP16 dequant buffer |
-| d_router_logits | n_tokens × n_experts | Router logits |
-| d_topk_idx | n_tokens × n_used | Top-k expert indices |
-| d_topk_wgt | n_tokens × n_used | Top-k softmax weights |
-
-### Correctness Notes
-
-- `CLLM_PREFILL_EXACT_MAX_TOKENS_DEFAULT=32`, so short and medium prompts use sequential exact prefill.
-- 21-token prefill-vs-seq parity prompt passes exactly: `rel_L2_vs_seq=0.000000`.
-- Batched large prefill still uses the optimized path above the cutoff; 512-token benchmark remains batched.
-- Forced one-token batched prefill now routes batched matvecs through the exact decode matvec kernels; layer-0 stop-after-SSM-residual parity is exact (`rel_L2_vs_seq=0.000000`) and full layer-0 parity is close (`rel_L2_vs_seq=0.000112`).
-- Forced batched mode for the 21-token parity prompt (`CUDA_LLM_PREFILL_EXACT_MAX_TOKENS=0`) is still approximate: `rel_L2_vs_seq=0.904984`, with similar but not identical top logits. Keep the exact cutoff enabled for small prompts.
-- Sequential decode MoE now avoids the incomplete shared-expert F16 TC helper and uses the scalar shared-gate path; the AOT `moe_shared_gate_gpu` reduction was also fixed to reduce all 4 warps.
-
-### Key Parameters
-
-```
-n_embd = 2048
-n_experts = 256
-n_experts_used = 8
-expert_ff = 512
-shared_expert_ff = 512
-stride_gu = 270336  (row_bytes × expert_ff = 528 × 512 for IQ2_XXS)
-stride_d = 270336   (same)
-dt_rank = 32
-d_state = 128
-n_group = 16
-```
-
-## Optimization Opportunities (highest leverage first)
-
-### 1. MMQ `mul_mat_id` for MoE experts — LANDED ✅ (the dominant win, 1578→2810)
-
-**Status:** DONE. `mmq_iq2xxs_grouped` (NVRTC, `CUDA_LLM_MOE_MMQ=1`) consumes IQ2_XXS weights +
-q8_1 int8 activations via `mma.sync m16n8k32.s8.s8.s32` over a flattened work-list grid. Optimization
-ladder (all bit-exact): decode-amortize → 32-lane → work-list grid → shared codebook → branchless
-`__vsub4` decode → direct int loads → vec act staging → **block-major weight repack** (the lever:
-row-major→block-major IQ2 at load, `CUDA_LLM_MMQ_REPACK` default-on, recovers ~2× cache-line
-over-fetch). FFN experts bucket now ~68-88ms. DEAD-ENDS (all no-op/slower, don't retry): coalesced
-full-tile shared-staging, activation dedup, double-buffer pipeline, llama.cpp tile-port, cuBLAS
-triplet path (3.5× slower). The repack was the only memory-LAYOUT fix that worked; tile/occupancy
-knobs all fought a layout problem. See memory `project_mmq_moe.md` for the full ladder.
-
-Relevant llama.cpp source:
-
-- `/home/syoyo/work/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu`: `ggml_cuda_mul_mat_id` dispatches MMQ when `ggml_cuda_should_use_mmq(src0->type, cc, ne12, n_experts)` is true.
-- `/home/syoyo/work/llama.cpp/ggml/src/ggml-cuda/mmq.cuh`: `mul_mat_q` consumes `ids_dst` and `expert_bounds` for compact MoE routing.
-
-### 2. Grouped MoE expert prefill fallback
-
-**Impact:** If MMQ port is too large, reduce launch count and dequant overhead in the current cuBLAS path.  
-**Current:** Build per-expert token lists on GPU or CPU, gather into `[expert, max_tokens_per_expert, n_embd]`, dequant all active expert weights with a 2D dequant kernel, then use strided/grouped batched GEMM and one scatter. This is lower risk than full MMQ but still writes full F16 expert weights, so it is likely less effective than llama.cpp's quantized MMQ path.
-
-### 3. Flash attention / MMA attention
-
-**Impact:** Current attention core is ~14.6ms at 512 tokens after warp-level QK parallelism.  
-**Current:** `batch_attn_causal_f32` now computes QK with 8 warps per query/head CTA. It is still scalar V accumulation over F32 Q and F16 KV cache. A true FlashAttention-style tiled kernel or llama.cpp fattn port may still help, but FFN is now the dominant gap.
-
-### 4. DeltaNet scan — EXHAUSTED (latency-bound; chunked alternative is occupancy-bound)
-
-**Impact:** SSM scan ~30ms (#2 kernel overall, ~17% of total).  
-**Current best:** register-shard fast path for `d_state==128` + **W=4 independent warps/block**
-(`CUDA_LLM_SCAN_W`, default 4, commit `3e342ca`). The 1-warp/block launch capped occupancy at
-the 32-blocks/SM limit (32 of 64 possible warps/SM); packing 4 independent warps/block (no shared,
-no barriers) lifts that to full occupancy → scan 33.6→30.2ms, +2% (~2760→2810 warm). Bit-correct.
-
-**The scan is LATENCY-bound on the sequential recurrence, not bandwidth-bound** — proven by:
-- A shared-q/k variant (R rows/block sharing per-token q/k via shared + `__syncthreads`) was
-  SLOWER at every R (scan 33→46-57ms): redundant q/k reads are L2-cached/cheap, and the per-token
-  barrier serializes warps, destroying the latency hiding many independent single-warp blocks give.
-- The **chunked-parallel scan (UT-transform / gated-delta rule) is a DEAD-END here.** Math validated
-  (CPU prototype `cuda/llm/scan/deltanet_chunk_test.c`, rel_L2 3e-7; CUDA port rel_L2_vs_seq 0.165
-  after fixing the `Γ_t/Γ_j` decay ratio to an incremental product — dividing by cumulative decay
-  = 0/0 NaN on decay underflow). But **9× SLOWER** (scan 30→279ms): one-block-per-head = only
-  `dt_rank=32` blocks (8192 threads) on 36 SMs (~15% occupancy). The chunked form trades the
-  original's 4096 independent (h,r) warp recurrences for fewer/larger matmuls, but 32 heads is far
-  too small a batch to fill the GPU. Chunked linear-attn needs a large head/batch dim (or big-batch
-  TC GEMMs) to win. Reverted from the runner; prototype + analysis retained (commits `3f1df91`, `cd580db`).
-
-### 5. GPU-side MoE dispatch
-
-**Impact:** Remove top-k readback and CPU packing overhead (~2ms directly, more if it enables grouped kernels).  
-**Current:** Top-k itself is cheap (~0.8ms), but the selected expert lists are still copied to host and repacked there. GPU-side prefix/count/fill would reduce synchronization and is a prerequisite for a clean grouped expert backend.
-
-### 6. Projection F16 shadows for more quantized weights
-
-**Impact:** Use Tensor Core GEMM for more projections at the cost of VRAM.  
-**Current:** The F16 shadow upload helper can dequant non-F32 2D tensors and is already used for several shared/projection paths. Extending this selectively to additional SSM/attention projections may help `gemm=35ms`, but VRAM pressure must be watched on the 16 GB card.
-
-## Key Technical Details
-
-### IQ2_XXS Block Layout (66 bytes per 256 elements)
-
-```
-offset 0:  d       (half) — super-block scale
-offset 2:  qs[64]  (16-bit words) — packed 2-bit indices + sub-block scales + signs
-```
-
-The 2-bit indices are packed into 16-bit words. Each group of 8 words (128 bits = 16 bytes) contains 64 2-bit indices. Sub-block scales and signs are in the high bits of the 16-bit words.
-
-Dequant pseudocode:
-```c
-float d = __half2float(bp[0:2]);
-const uint16_t *qs = (const uint16_t *)(bp + 2);
-for (int ib = 0; ib < 8; ib++) {
-    uint32_t a0 = qs[4*ib] | (qs[4*ib+1] << 16);  // 64 bits of indices
-    uint32_t a1 = qs[4*ib+2] | (qs[4*ib+3] << 16); // scale + sign info
-    float db = d * (0.5f + (float)(a1>>28)) * 0.25f;
-    for (int l = 0; l < 4; l++) {
-        uint64_t gv = iq2xxs_grid_dev[(uint8_t*)&a0[l]];  // grid table lookup
-        uint8_t sn = ksigns_iq2xs_dev[(a1 >> (7*l)) & 127];
-        for (int j = 0; j < 8; j++) {
-            float w = db * (float)(uint8_t)(gv >> (8*j)) * ((sn & (1<<j)) ? -1 : 1);
-            // dot product with input element
-        }
-    }
-}
-```
-
-### Changelog
-
-- `6cb4c38` — Initial MoE batched prefill: 396 tok/s (cuBLAS gather-scatter)
-- `f42bd3d` — Fix per-token fallback removal, shared memory fix: 417 tok/s
-- 2026-06-09 continuation — Disabled CUDA graph capture for hybrid/debug/partial forwards, fixed exact prefill replay baseline, fixed AOT shared-gate reduction, disabled incomplete decode shared-expert TC path, verified 21-token exact parity (`rel_L2=0`) and 512-token random prefill at 2534 tok/s.
-- 2026-06-09 divergence pass — Fixed forced one-token batched prefill divergence by dispatching `launch_batch_matvec(..., n_tokens=1)` through the decode matvec kernels, matched batched RMSNorm reduction order to decode, and aligned batched IQ2_XXS codebook lookup with the decode kernel. Verified layer-0 stop-after-residual `rel_L2=0.000000`, full layer-0 `rel_L2=0.000112`, normal 21-token parity `rel_L2=0.000000`, and 512-token random prefill at 2526 tok/s.
-
-### Test Harness Features
-
-- `--large-bench N`: Creates N synthetic token IDs (all zeros), runs warm-up + timed prefill
-- `--bench`: 100-token prefill with correctness comparison vs sequential
-- `-t "prompt"`: Text prompt with tokenization
+## Benchmark calibration (llama.cpp, same model+GPU)
+`~/work/llama.cpp/build/bin/llama-bench -m <gguf> -ngl 99 -p 512 -n 64` → pp512=961, tg=32.6.
+Both targets are real; the gap is the read-once MMQ GEMM (prefill) and a full MMVQ rewrite (decode).
