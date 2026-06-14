@@ -4819,30 +4819,51 @@ static const char *cuda_kernel_source =
 "   F16 materialization) + q8_1 int8 activations via mma.sync.m16n8k32.s8.s8.s32.\n"
 "   Validated standalone in cuda/llm/mmq/. */\n"
 "/* gather rows by token index + quantize to q8_1 (per-32 scale). grid=(K/32,total), block=32 */\n"
+"/* Optimized gather+quantize: 32 threads, 8 elements/thread = 256 K elements/block. */\n"
+"/* Grid: (K/256, total_rows). Requires K %% 256 == 0.                              */\n"
 "__global__ void mmq_gather_quant_q8_1(const float *X, const int *ids_token,\n"
 "                                       signed char *cxq8, float *cxs, int total_rows, int K) {\n"
-"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x, k = kb*32 + t;\n"
+"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x;\n"
 "    if (c >= total_rows) return;\n"
 "    int tok = ids_token[c];\n"
-"    float v = (k < K) ? X[(size_t)tok*K + k] : 0.0f;\n"
-"    float a = fabsf(v);\n"
-"    for (int o=16;o>0;o>>=1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
-"    float scale = a/127.0f, inv = scale>0.0f?1.0f/scale:0.0f;\n"
-"    int q=(int)rintf(v*inv); q=q<-127?-127:(q>127?127:q);\n"
-"    cxq8[(size_t)c*K + k] = (signed char)q;\n"
-"    if (t==0) cxs[(size_t)c*(K/32) + kb] = scale;\n"
+"    int k_base = kb * 256 + t;\n"
+"    float v[8];\n"
+"    for (int g = 0; g < 8; g++) {\n"
+"        int k = k_base + g * 32;\n"
+"        v[g] = (k < K) ? X[(size_t)tok*K + k] : 0.0f;\n"
+"    }\n"
+"    for (int g = 0; g < 8; g++) {\n"
+"        float a = fabsf(v[g]);\n"
+"        for (int o = 16; o > 0; o >>= 1)\n"
+"            a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
+"        float scale = a / 127.0f, inv = scale > 0.0f ? 1.0f / scale : 0.0f;\n"
+"        int q = (int)rintf(v[g] * inv); q = q < -127 ? -127 : (q > 127 ? 127 : q);\n"
+"        cxq8[(size_t)c*K + k_base + g*32] = (signed char)q;\n"
+"        if (t == 0) cxs[(size_t)c*(K/32) + kb*8 + g] = scale;\n"
+"    }\n"
 "}\n"
 "/* quantize compact rows (already gathered) to q8_1. grid=(K/32,total), block=32 */\n"
+"/* Optimized quantize: 32 threads, 8 elements/thread = 256 K elements/block. */\n"
+"/* Grid: (K/256, total_rows). Requires K %% 256 == 0. Each group of 32 gets  */\n"
+"/* its own scale (8 groups/block, 1 element/thread per group).              */\n"
 "__global__ void mmq_quant_q8_1(const float *X, signed char *cxq8, float *cxs, int total_rows, int K) {\n"
-"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x, k = kb*32 + t;\n"
+"    int kb = blockIdx.x, c = blockIdx.y, t = threadIdx.x;\n"
 "    if (c >= total_rows) return;\n"
-"    float v = (k < K) ? X[(size_t)c*K + k] : 0.0f;\n"
-"    float a = fabsf(v);\n"
-"    for (int o=16;o>0;o>>=1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
-"    float scale = a/127.0f, inv = scale>0.0f?1.0f/scale:0.0f;\n"
-"    int q=(int)rintf(v*inv); q=q<-127?-127:(q>127?127:q);\n"
-"    cxq8[(size_t)c*K + k] = (signed char)q;\n"
-"    if (t==0) cxs[(size_t)c*(K/32) + kb] = scale;\n"
+"    int k_base = kb * 256 + t;\n"
+"    float v[8];\n"
+"    for (int g = 0; g < 8; g++) {\n"
+"        int k = k_base + g * 32;\n"
+"        v[g] = (k < K) ? X[(size_t)c*K + k] : 0.0f;\n"
+"    }\n"
+"    for (int g = 0; g < 8; g++) {\n"
+"        float a = fabsf(v[g]);\n"
+"        for (int o = 16; o > 0; o >>= 1)\n"
+"            a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));\n"
+"        float scale = a / 127.0f, inv = scale > 0.0f ? 1.0f / scale : 0.0f;\n"
+"        int q = (int)rintf(v[g] * inv); q = q < -127 ? -127 : (q > 127 ? 127 : q);\n"
+"        cxq8[(size_t)c*K + k_base + g*32] = (signed char)q;\n"
+"        if (t == 0) cxs[(size_t)c*(K/32) + kb*8 + g] = scale;\n"
+"    }\n"
 "}\n"
 "static __device__ __forceinline__ int mmq_pack4(const signed char*p){\n"
 "    return (p[0]&0xff)|((p[1]&0xff)<<8)|((p[2]&0xff)<<16)|((p[3]&0xff)<<24); }\n"
@@ -4878,7 +4899,7 @@ static const char *cuda_kernel_source =
 "    int n0 = blockIdx.x*64 + warp*16;\n"
 "    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
 "    const unsigned char *We = W + (size_t)e*estride;\n"
-"    __shared__ signed char sX[32][32]; __shared__ float sXs[32];\n"
+"    __shared__ signed char sX[32][36]; __shared__ float sXs[32];\n"
 "    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
 "    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
 "    __syncthreads();\n"
@@ -4952,7 +4973,7 @@ static const char *cuda_kernel_source =
 "    int n0 = blockIdx.x*64 + warp*16;\n"
 "    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
 "    const unsigned char *We = W + (size_t)e*estride;\n"
-"    __shared__ signed char sX[128][32]; __shared__ float sXs[128];\n"
+"    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
 "    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
 "    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
 "    __syncthreads();\n"
@@ -5040,6 +5061,1785 @@ static const char *cuda_kernel_source =
 "            }\n"
 "            qs += 8;\n"
 "        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Prefill variant of mmq_iq2xxs_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_iq2xxs_grouped32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    __shared__ unsigned long long sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
+"    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq2xxs_grid_dev[i];\n"
+"    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
+"        unsigned long long m=0;\n"
+"        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(unsigned long long)0xFFu<<(8*j);\n"
+"        sSignMask[i]=m; }\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*66+(size_t)n*66)\n"
+"                                          : (We+(size_t)n*row_bytes+(size_t)(sb/8)*66);\n"
+"            float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2); int ib=sb&7;\n"
+"            unsigned int a0=(unsigned int)qs[4*ib]|((unsigned int)qs[4*ib+1]<<16);\n"
+"            unsigned int a1=(unsigned int)qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"            if (half==0) sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;\n"
+"            for(int l=half*2;l<half*2+2;l++){ unsigned char idx=(a0>>(8*l))&255;\n"
+"                unsigned long long gv=sGrid[idx], m=sSignMask[(a1>>(7*l))&127];\n"
+"                unsigned int glo=(unsigned int)gv, ghi=(unsigned int)(gv>>32);\n"
+"                unsigned int mlo=(unsigned int)m,  mhi=(unsigned int)(m>>32);\n"
+"                *(unsigned int*)&sW[r][l*8]   = __vsub4(glo^mlo, mlo);\n"
+"                *(unsigned int*)&sW[r][l*8+4] = __vsub4(ghi^mhi, mhi); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4], qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Fused prefill variant of mmq_iq2xxs_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_iq2xxs_fused32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const float *input, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    __shared__ unsigned long long sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
+"    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq2xxs_grid_dev[i];\n"
+"    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
+"        unsigned long long m=0;\n"
+"        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(unsigned long long)0xFFu<<(8*j);\n"
+"        sSignMask[i]=m; }\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*66+(size_t)n*66)\n"
+"                                          : (We+(size_t)n*row_bytes+(size_t)(sb/8)*66);\n"
+"            float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2); int ib=sb&7;\n"
+"            unsigned int a0=(unsigned int)qs[4*ib]|((unsigned int)qs[4*ib+1]<<16);\n"
+"            unsigned int a1=(unsigned int)qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"            if (half==0) sWs[r]=d*(0.5f+(float)(a1>>28))*0.25f;\n"
+"            for(int l=half*2;l<half*2+2;l++){ unsigned char idx=(a0>>(8*l))&255;\n"
+"                unsigned long long gv=sGrid[idx], m=sSignMask[(a1>>(7*l))&127];\n"
+"                unsigned int glo=(unsigned int)gv, ghi=(unsigned int)(gv>>32);\n"
+"                unsigned int mlo=(unsigned int)m,  mhi=(unsigned int)(m>>32);\n"
+"                *(unsigned int*)&sW[r][l*8]   = __vsub4(glo^mlo, mlo);\n"
+"                *(unsigned int*)&sW[r][l*8+4] = __vsub4(ghi^mhi, mhi); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            float v0=(m<eb1)?input[(size_t)m*K+sb*32+j*4+0]:0.0f;\n"
+"            float v1=(m<eb1)?input[(size_t)m*K+sb*32+j*4+1]:0.0f;\n"
+"            float v2=(m<eb1)?input[(size_t)m*K+sb*32+j*4+2]:0.0f;\n"
+"            float v3=(m<eb1)?input[(size_t)m*K+sb*32+j*4+3]:0.0f;\n"
+"            float local_max=fmaxf(fabsf(v0),fmaxf(fabsf(v1),fmaxf(fabsf(v2),fabsf(v3))));\n"
+"            unsigned mask=0xFF<<((threadIdx.x&31)&~7);\n"
+"            float a=local_max;\n"
+"            for(int o=4;o>0;o>>=1) a=fmaxf(a,__shfl_xor_sync(mask,a,o));\n"
+"            float scale=a/127.0f,inv=scale>0.0f?1.0f/scale:0.0f;\n"
+"            int q0=(int)rintf(v0*inv);q0=q0<-127?-127:(q0>127?127:q0);\n"
+"            int q1=(int)rintf(v1*inv);q1=q1<-127?-127:(q1>127?127:q1);\n"
+"            int q2=(int)rintf(v2*inv);q2=q2<-127?-127:(q2>127?127:q2);\n"
+"            int q3=(int)rintf(v3*inv);q3=q3<-127?-127:(q3>127?127:q3);\n"
+"            int packed=(unsigned char)q0|((unsigned char)q1<<8)|((unsigned char)q2<<16)|((unsigned char)q3<<24);\n"
+"            *(int*)&sX[tt][j*4]=packed;\n"
+"            if(j==0)sXs[tt]=scale; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4], qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* IQ3_XXS int8 tensor-core MMQ (multi-token grouped, TG=4, 32 tok/block). */\n"
+"__global__ void mmq_iq3xxs_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 4;\n"
+"    __shared__ unsigned int sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
+"    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq3xxs_grid_dev[i];\n"
+"    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
+"        unsigned long long m=0;\n"
+"        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(unsigned long long)0xFFu<<(8*j);\n"
+"        sSignMask[i]=m; }\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*98, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[32][36]; __shared__ float sXs[32];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*98+(size_t)n*98)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*98);\n"
+"            float d=half_to_float(*(const half_raw*)bp);\n"
+"            const unsigned char *qs = bp + 2;\n"
+"            const unsigned short *sas16 = (const unsigned short *)(bp + 66); int ib=sb&7;\n"
+"            unsigned int sas_word = (unsigned int)sas16[2*ib] | ((unsigned int)sas16[2*ib+1] << 16);\n"
+"            if (half==0) sWs[r]=d*(0.5f+(float)(sas_word>>28))*0.5f;\n"
+"            for(int l=half*2;l<half*2+2;l++){\n"
+"                unsigned int gv1=sGrid[qs[8*ib+2*l+0]], gv2=sGrid[qs[8*ib+2*l+1]];\n"
+"                unsigned long long m=sSignMask[(sas_word>>(7*l))&127];\n"
+"                unsigned int mlo=(unsigned int)m, mhi=(unsigned int)(m>>32);\n"
+"                *(unsigned int*)&sW[r][l*8]   = __vsub4(gv1^mlo, mlo);\n"
+"                *(unsigned int*)&sW[r][l*8+4] = __vsub4(gv2^mhi, mhi); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4], qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Prefill variant of mmq_iq3xxs_grouped with TG=16 (128 tokens/block). */\n"
+"__global__ void mmq_iq3xxs_grouped8(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 16;\n"
+"    __shared__ unsigned int sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
+"    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq3xxs_grid_dev[i];\n"
+"    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
+"        unsigned long long m=0;\n"
+"        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(unsigned long long)0xFFu<<(8*j);\n"
+"        sSignMask[i]=m; }\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*98, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*98+(size_t)n*98)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*98);\n"
+"            float d=half_to_float(*(const half_raw*)bp);\n"
+"            const unsigned char *qs = bp + 2;\n"
+"            const unsigned short *sas16 = (const unsigned short *)(bp + 66); int ib=sb&7;\n"
+"            unsigned int sas_word = (unsigned int)sas16[2*ib] | ((unsigned int)sas16[2*ib+1] << 16);\n"
+"            if (half==0) sWs[r]=d*(0.5f+(float)(sas_word>>28))*0.5f;\n"
+"            for(int l=half*2;l<half*2+2;l++){\n"
+"                unsigned int gv1=sGrid[qs[8*ib+2*l+0]], gv2=sGrid[qs[8*ib+2*l+1]];\n"
+"                unsigned long long m=sSignMask[(sas_word>>(7*l))&127];\n"
+"                unsigned int mlo=(unsigned int)m, mhi=(unsigned int)(m>>32);\n"
+"                *(unsigned int*)&sW[r][l*8]   = __vsub4(gv1^mlo, mlo);\n"
+"                *(unsigned int*)&sW[r][l*8+4] = __vsub4(gv2^mhi, mhi); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4], qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Prefill variant of mmq_iq3xxs_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_iq3xxs_grouped32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    __shared__ unsigned int sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
+"    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq3xxs_grid_dev[i];\n"
+"    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
+"        unsigned long long m=0;\n"
+"        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(unsigned long long)0xFFu<<(8*j);\n"
+"        sSignMask[i]=m; }\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*98, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*98+(size_t)n*98)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*98);\n"
+"            float d=half_to_float(*(const half_raw*)bp);\n"
+"            const unsigned char *qs = bp + 2;\n"
+"            const unsigned short *sas16 = (const unsigned short *)(bp + 66); int ib=sb&7;\n"
+"            unsigned int sas_word = (unsigned int)sas16[2*ib] | ((unsigned int)sas16[2*ib+1] << 16);\n"
+"            if (half==0) sWs[r]=d*(0.5f+(float)(sas_word>>28))*0.5f;\n"
+"            for(int l=half*2;l<half*2+2;l++){\n"
+"                unsigned int gv1=sGrid[qs[8*ib+2*l+0]], gv2=sGrid[qs[8*ib+2*l+1]];\n"
+"                unsigned long long m=sSignMask[(sas_word>>(7*l))&127];\n"
+"                unsigned int mlo=(unsigned int)m, mhi=(unsigned int)(m>>32);\n"
+"                *(unsigned int*)&sW[r][l*8]   = __vsub4(gv1^mlo, mlo);\n"
+"                *(unsigned int*)&sW[r][l*8+4] = __vsub4(gv2^mhi, mhi); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4], qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Fused prefill variant of mmq_iq3xxs_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_iq3xxs_fused32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const float *input, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    __shared__ unsigned int sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
+"    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq3xxs_grid_dev[i];\n"
+"    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
+"        unsigned long long m=0;\n"
+"        for(int j=0;j<8;j++) if(s&(1<<j)) m|=(unsigned long long)0xFFu<<(8*j);\n"
+"        sSignMask[i]=m; }\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*98, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*98+(size_t)n*98)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*98);\n"
+"            float d=half_to_float(*(const half_raw*)bp);\n"
+"            const unsigned char *qs = bp + 2;\n"
+"            const unsigned short *sas16 = (const unsigned short *)(bp + 66); int ib=sb&7;\n"
+"            unsigned int sas_word = (unsigned int)sas16[2*ib] | ((unsigned int)sas16[2*ib+1] << 16);\n"
+"            if (half==0) sWs[r]=d*(0.5f+(float)(sas_word>>28))*0.5f;\n"
+"            for(int l=half*2;l<half*2+2;l++){\n"
+"                unsigned int gv1=sGrid[qs[8*ib+2*l+0]], gv2=sGrid[qs[8*ib+2*l+1]];\n"
+"                unsigned long long m=sSignMask[(sas_word>>(7*l))&127];\n"
+"                unsigned int mlo=(unsigned int)m, mhi=(unsigned int)(m>>32);\n"
+"                *(unsigned int*)&sW[r][l*8]   = __vsub4(gv1^mlo, mlo);\n"
+"                *(unsigned int*)&sW[r][l*8+4] = __vsub4(gv2^mhi, mhi); } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            float v0=(m<eb1)?input[(size_t)m*K+sb*32+j*4+0]:0.0f;\n"
+"            float v1=(m<eb1)?input[(size_t)m*K+sb*32+j*4+1]:0.0f;\n"
+"            float v2=(m<eb1)?input[(size_t)m*K+sb*32+j*4+2]:0.0f;\n"
+"            float v3=(m<eb1)?input[(size_t)m*K+sb*32+j*4+3]:0.0f;\n"
+"            float local_max=fmaxf(fabsf(v0),fmaxf(fabsf(v1),fmaxf(fabsf(v2),fabsf(v3))));\n"
+"            unsigned mask=0xFF<<((threadIdx.x&31)&~7);\n"
+"            float a=local_max;\n"
+"            for(int o=4;o>0;o>>=1) a=fmaxf(a,__shfl_xor_sync(mask,a,o));\n"
+"            float scale=a/127.0f,inv=scale>0.0f?1.0f/scale:0.0f;\n"
+"            int q0=(int)rintf(v0*inv);q0=q0<-127?-127:(q0>127?127:q0);\n"
+"            int q1=(int)rintf(v1*inv);q1=q1<-127?-127:(q1>127?127:q1);\n"
+"            int q2=(int)rintf(v2*inv);q2=q2<-127?-127:(q2>127?127:q2);\n"
+"            int q3=(int)rintf(v3*inv);q3=q3<-127?-127:(q3>127?127:q3);\n"
+"            int packed=(unsigned char)q0|((unsigned char)q1<<8)|((unsigned char)q2<<16)|((unsigned char)q3<<24);\n"
+"            *(int*)&sX[tt][j*4]=packed;\n"
+"            if(j==0)sXs[tt]=scale; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4], qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 19g. mmq_q2_K_grouped: Q2_K weight x Q8_1 activation via int8 tensor-core MMQ ---- */\n"
+"/* Q2_K block: 84 bytes = scales[16] + qs[64] + d(f16) + dmin(f16), 256 elements.           */\n"
+"/* 2-MMA approach: weight = d*dl*qs_val - dmin*ml. C_plus = sum(dl*qs_val*x),                */\n"
+"/* C_minus = sum(ml*x). Result = d*d8*C_plus - dmin*d8*C_minus.                              */\n"
+"__global__ void mmq_q2_K_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 4;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*84, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sW_plus[64][32]; __shared__ signed char sW_minus[64][32];\n"
+"    __shared__ float sWs_d[64], sWs_dmin[64];\n"
+"    __shared__ signed char sX[32][36]; __shared__ float sXs[32];\n"
+"    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*84+(size_t)n*84)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*84);\n"
+"            float d_val  = half_to_float(*(const half_raw*)(bp + 80));\n"
+"            float dmin_val = half_to_float(*(const half_raw*)(bp + 82));\n"
+"            const unsigned char *scales = bp;\n"
+"            const unsigned char *qs_full = bp + 16;\n"
+"            int ib = sb & 7;\n"
+"            int n0_qs = (ib >> 2) * 32;\n"
+"            int shift = (ib & 3) * 2;\n"
+"            const unsigned char *qs = qs_full + n0_qs;\n"
+"            int sc0 = scales[2*ib], sc1 = scales[2*ib+1];\n"
+"            int dl0 = sc0 & 0xF, ml0 = sc0 >> 4;\n"
+"            int dl1 = sc1 & 0xF, ml1 = sc1 >> 4;\n"
+"            if (half==0){ sWs_d[r]=d_val; sWs_dmin[r]=dmin_val; }\n"
+"            int dl = half ? dl1 : dl0;\n"
+"            int ml = half ? ml1 : ml0;\n"
+"            int koff = half * 16;\n"
+"            for(int k=0;k<16;k++){\n"
+"                int raw = (qs[koff+k] >> shift) & 3;\n"
+"                sW_plus[r][koff+k] = (signed char)(dl * raw);\n"
+"                sW_minus[r][koff+k] = (signed char)ml; } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qp0=*(const int*)&sW_plus[wr+gid][tid*4],   qp1=*(const int*)&sW_plus[wr+gid+8][tid*4];\n"
+"        int qp2=*(const int*)&sW_plus[wr+gid][tid*4+16], qp3=*(const int*)&sW_plus[wr+gid+8][tid*4+16];\n"
+"        int qm0=*(const int*)&sW_minus[wr+gid][tid*4],   qm1=*(const int*)&sW_minus[wr+gid+8][tid*4];\n"
+"        int qm2=*(const int*)&sW_minus[wr+gid][tid*4+16], qm3=*(const int*)&sW_minus[wr+gid+8][tid*4+16];\n"
+"        float wr_d_0=sWs_d[wr+gid], wr_d_8=sWs_d[wr+gid+8];\n"
+"        float wr_m_0=sWs_dmin[wr+gid], wr_m_8=sWs_dmin[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int cp0=0,cp1=0,cp2=0,cp3=0, cm0=0,cm1=0,cm2=0,cm3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cp0),\"=r\"(cp1),\"=r\"(cp2),\"=r\"(cp3)\n"
+"                :\"r\"(qp0),\"r\"(qp1),\"r\"(qp2),\"r\"(qp3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cm0),\"=r\"(cm1),\"=r\"(cm2),\"=r\"(cm3)\n"
+"                :\"r\"(qm0),\"r\"(qm1),\"r\"(qm2),\"r\"(qm3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr_d_0*xc0*(float)cp0 - wr_m_0*xc0*(float)cm0;\n"
+"            f[g][1]+=wr_d_0*xc1*(float)cp1 - wr_m_0*xc1*(float)cm1;\n"
+"            f[g][2]+=wr_d_8*xc0*(float)cp2 - wr_m_8*xc0*(float)cm2;\n"
+"            f[g][3]+=wr_d_8*xc1*(float)cp3 - wr_m_8*xc1*(float)cm3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Prefill variant of mmq_q2_K_grouped with TG=16 (128 tokens/block). */\n"
+"__global__ void mmq_q2_K_grouped8(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 16;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*84, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sW_plus[64][32]; __shared__ signed char sW_minus[64][32];\n"
+"    __shared__ float sWs_d[64], sWs_dmin[64];\n"
+"    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
+"    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*84+(size_t)n*84)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*84);\n"
+"            float d_val  = half_to_float(*(const half_raw*)(bp + 80));\n"
+"            float dmin_val = half_to_float(*(const half_raw*)(bp + 82));\n"
+"            const unsigned char *scales = bp;\n"
+"            const unsigned char *qs_full = bp + 16;\n"
+"            int ib = sb & 7;\n"
+"            int n0_qs = (ib >> 2) * 32;\n"
+"            int shift = (ib & 3) * 2;\n"
+"            const unsigned char *qs = qs_full + n0_qs;\n"
+"            int sc0 = scales[2*ib], sc1 = scales[2*ib+1];\n"
+"            int dl0 = sc0 & 0xF, ml0 = sc0 >> 4;\n"
+"            int dl1 = sc1 & 0xF, ml1 = sc1 >> 4;\n"
+"            if (half==0){ sWs_d[r]=d_val; sWs_dmin[r]=dmin_val; }\n"
+"            int dl = half ? dl1 : dl0;\n"
+"            int ml = half ? ml1 : ml0;\n"
+"            int koff = half * 16;\n"
+"            for(int k=0;k<16;k++){\n"
+"                int raw = (qs[koff+k] >> shift) & 3;\n"
+"                sW_plus[r][koff+k] = (signed char)(dl * raw);\n"
+"                sW_minus[r][koff+k] = (signed char)ml; } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qp0=*(const int*)&sW_plus[wr+gid][tid*4],   qp1=*(const int*)&sW_plus[wr+gid+8][tid*4];\n"
+"        int qp2=*(const int*)&sW_plus[wr+gid][tid*4+16], qp3=*(const int*)&sW_plus[wr+gid+8][tid*4+16];\n"
+"        int qm0=*(const int*)&sW_minus[wr+gid][tid*4],   qm1=*(const int*)&sW_minus[wr+gid+8][tid*4];\n"
+"        int qm2=*(const int*)&sW_minus[wr+gid][tid*4+16], qm3=*(const int*)&sW_minus[wr+gid+8][tid*4+16];\n"
+"        float wr_d_0=sWs_d[wr+gid], wr_d_8=sWs_d[wr+gid+8];\n"
+"        float wr_m_0=sWs_dmin[wr+gid], wr_m_8=sWs_dmin[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int cp0=0,cp1=0,cp2=0,cp3=0, cm0=0,cm1=0,cm2=0,cm3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cp0),\"=r\"(cp1),\"=r\"(cp2),\"=r\"(cp3)\n"
+"                :\"r\"(qp0),\"r\"(qp1),\"r\"(qp2),\"r\"(qp3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cm0),\"=r\"(cm1),\"=r\"(cm2),\"=r\"(cm3)\n"
+"                :\"r\"(qm0),\"r\"(qm1),\"r\"(qm2),\"r\"(qm3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr_d_0*xc0*(float)cp0 - wr_m_0*xc0*(float)cm0;\n"
+"            f[g][1]+=wr_d_0*xc1*(float)cp1 - wr_m_0*xc1*(float)cm1;\n"
+"            f[g][2]+=wr_d_8*xc0*(float)cp2 - wr_m_8*xc0*(float)cm2;\n"
+"            f[g][3]+=wr_d_8*xc1*(float)cp3 - wr_m_8*xc1*(float)cm3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Prefill variant of mmq_q2_K_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_q2_K_grouped32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*84, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sW_plus[64][32]; __shared__ signed char sW_minus[64][32];\n"
+"    __shared__ float sWs_d[64], sWs_dmin[64];\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*84+(size_t)n*84)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*84);\n"
+"            float d_val  = half_to_float(*(const half_raw*)(bp + 80));\n"
+"            float dmin_val = half_to_float(*(const half_raw*)(bp + 82));\n"
+"            const unsigned char *scales = bp;\n"
+"            const unsigned char *qs_full = bp + 16;\n"
+"            int ib = sb & 7;\n"
+"            int n0_qs = (ib >> 2) * 32;\n"
+"            int shift = (ib & 3) * 2;\n"
+"            const unsigned char *qs = qs_full + n0_qs;\n"
+"            int sc0 = scales[2*ib], sc1 = scales[2*ib+1];\n"
+"            int dl0 = sc0 & 0xF, ml0 = sc0 >> 4;\n"
+"            int dl1 = sc1 & 0xF, ml1 = sc1 >> 4;\n"
+"            if (half==0){ sWs_d[r]=d_val; sWs_dmin[r]=dmin_val; }\n"
+"            int dl = half ? dl1 : dl0;\n"
+"            int ml = half ? ml1 : ml0;\n"
+"            int koff = half * 16;\n"
+"            for(int k=0;k<16;k++){\n"
+"                int raw = (qs[koff+k] >> shift) & 3;\n"
+"                sW_plus[r][koff+k] = (signed char)(dl * raw);\n"
+"                sW_minus[r][koff+k] = (signed char)ml; } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qp0=*(const int*)&sW_plus[wr+gid][tid*4],   qp1=*(const int*)&sW_plus[wr+gid+8][tid*4];\n"
+"        int qp2=*(const int*)&sW_plus[wr+gid][tid*4+16], qp3=*(const int*)&sW_plus[wr+gid+8][tid*4+16];\n"
+"        int qm0=*(const int*)&sW_minus[wr+gid][tid*4],   qm1=*(const int*)&sW_minus[wr+gid+8][tid*4];\n"
+"        int qm2=*(const int*)&sW_minus[wr+gid][tid*4+16], qm3=*(const int*)&sW_minus[wr+gid+8][tid*4+16];\n"
+"        float wr_d_0=sWs_d[wr+gid], wr_d_8=sWs_d[wr+gid+8];\n"
+"        float wr_m_0=sWs_dmin[wr+gid], wr_m_8=sWs_dmin[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int cp0=0,cp1=0,cp2=0,cp3=0, cm0=0,cm1=0,cm2=0,cm3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cp0),\"=r\"(cp1),\"=r\"(cp2),\"=r\"(cp3)\n"
+"                :\"r\"(qp0),\"r\"(qp1),\"r\"(qp2),\"r\"(qp3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cm0),\"=r\"(cm1),\"=r\"(cm2),\"=r\"(cm3)\n"
+"                :\"r\"(qm0),\"r\"(qm1),\"r\"(qm2),\"r\"(qm3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr_d_0*xc0*(float)cp0 - wr_m_0*xc0*(float)cm0;\n"
+"            f[g][1]+=wr_d_0*xc1*(float)cp1 - wr_m_0*xc1*(float)cm1;\n"
+"            f[g][2]+=wr_d_8*xc0*(float)cp2 - wr_m_8*xc0*(float)cm2;\n"
+"            f[g][3]+=wr_d_8*xc1*(float)cp3 - wr_m_8*xc1*(float)cm3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Fused prefill variant of mmq_q2_K_grouped with TG=32 (256 tokens/block).                    */\n"
+"/* Loads F32 activation directly and quantizes to int8 on-the-fly.                              */\n"
+"__global__ void mmq_q2_K_fused32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const float *input, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*84, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sW_plus[64][32]; __shared__ signed char sW_minus[64][32];\n"
+"    __shared__ float sWs_d[64], sWs_dmin[64];\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*84+(size_t)n*84)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*84);\n"
+"            float d_val  = half_to_float(*(const half_raw*)(bp + 80));\n"
+"            float dmin_val = half_to_float(*(const half_raw*)(bp + 82));\n"
+"            const unsigned char *scales = bp;\n"
+"            const unsigned char *qs_full = bp + 16;\n"
+"            int ib = sb & 7;\n"
+"            int n0_qs = (ib >> 2) * 32;\n"
+"            int shift = (ib & 3) * 2;\n"
+"            const unsigned char *qs = qs_full + n0_qs;\n"
+"            int sc0 = scales[2*ib], sc1 = scales[2*ib+1];\n"
+"            int dl0 = sc0 & 0xF, ml0 = sc0 >> 4;\n"
+"            int dl1 = sc1 & 0xF, ml1 = sc1 >> 4;\n"
+"            if (half==0){ sWs_d[r]=d_val; sWs_dmin[r]=dmin_val; }\n"
+"            int dl = half ? dl1 : dl0;\n"
+"            int ml = half ? ml1 : ml0;\n"
+"            int koff = half * 16;\n"
+"            for(int k=0;k<16;k++){\n"
+"                int raw = (qs[koff+k] >> shift) & 3;\n"
+"                sW_plus[r][koff+k] = (signed char)(dl * raw);\n"
+"                sW_minus[r][koff+k] = (signed char)ml; } }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            float v0=(m<eb1)?input[(size_t)m*K+sb*32+j*4+0]:0.0f;\n"
+"            float v1=(m<eb1)?input[(size_t)m*K+sb*32+j*4+1]:0.0f;\n"
+"            float v2=(m<eb1)?input[(size_t)m*K+sb*32+j*4+2]:0.0f;\n"
+"            float v3=(m<eb1)?input[(size_t)m*K+sb*32+j*4+3]:0.0f;\n"
+"            float local_max=fmaxf(fabsf(v0),fmaxf(fabsf(v1),fmaxf(fabsf(v2),fabsf(v3))));\n"
+"            unsigned mask=0xFF<<((threadIdx.x&31)&~7);\n"
+"            float a=local_max;\n"
+"            for(int o=4;o>0;o>>=1) a=fmaxf(a,__shfl_xor_sync(mask,a,o));\n"
+"            float scale=a/127.0f,inv=scale>0.0f?1.0f/scale:0.0f;\n"
+"            int q0=(int)rintf(v0*inv);q0=q0<-127?-127:(q0>127?127:q0);\n"
+"            int q1=(int)rintf(v1*inv);q1=q1<-127?-127:(q1>127?127:q1);\n"
+"            int q2=(int)rintf(v2*inv);q2=q2<-127?-127:(q2>127?127:q2);\n"
+"            int q3=(int)rintf(v3*inv);q3=q3<-127?-127:(q3>127?127:q3);\n"
+"            int packed=(unsigned char)q0|((unsigned char)q1<<8)|((unsigned char)q2<<16)|((unsigned char)q3<<24);\n"
+"            *(int*)&sX[tt][j*4]=packed;\n"
+"            if(j==0)sXs[tt]=scale; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qp0=*(const int*)&sW_plus[wr+gid][tid*4],   qp1=*(const int*)&sW_plus[wr+gid+8][tid*4];\n"
+"        int qp2=*(const int*)&sW_plus[wr+gid][tid*4+16], qp3=*(const int*)&sW_plus[wr+gid+8][tid*4+16];\n"
+"        int qm0=*(const int*)&sW_minus[wr+gid][tid*4],   qm1=*(const int*)&sW_minus[wr+gid+8][tid*4];\n"
+"        int qm2=*(const int*)&sW_minus[wr+gid][tid*4+16], qm3=*(const int*)&sW_minus[wr+gid+8][tid*4+16];\n"
+"        float wr_d_0=sWs_d[wr+gid], wr_d_8=sWs_d[wr+gid+8];\n"
+"        float wr_m_0=sWs_dmin[wr+gid], wr_m_8=sWs_dmin[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int cp0=0,cp1=0,cp2=0,cp3=0, cm0=0,cm1=0,cm2=0,cm3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cp0),\"=r\"(cp1),\"=r\"(cp2),\"=r\"(cp3)\n"
+"                :\"r\"(qp0),\"r\"(qp1),\"r\"(qp2),\"r\"(qp3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(cm0),\"=r\"(cm1),\"=r\"(cm2),\"=r\"(cm3)\n"
+"                :\"r\"(qm0),\"r\"(qm1),\"r\"(qm2),\"r\"(qm3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr_d_0*xc0*(float)cp0 - wr_m_0*xc0*(float)cm0;\n"
+"            f[g][1]+=wr_d_0*xc1*(float)cp1 - wr_m_0*xc1*(float)cm1;\n"
+"            f[g][2]+=wr_d_8*xc0*(float)cp2 - wr_m_8*xc0*(float)cm2;\n"
+"            f[g][3]+=wr_d_8*xc1*(float)cp3 - wr_m_8*xc1*(float)cm3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 19g2. mmq_q3_K_grouped: Q3_K weight x Q8_1 activation via int8 tensor-core MMQ ---- */\n"
+"/* Q3_K block: 110 bytes = hmask[32]+qs[64]+scales[12]+d(f16), 256 elements.                */\n"
+"/* Two dls per sub-block (dl0 k=0..15, dl1 k=16..31). Decode to int8 (-4..3), then           */\n"
+"/* 2 x m16n8k16 MMA per sub-block (no plus/minus split since Q3_K is naturally signed).       */\n"
+"__global__ void mmq_q3_K_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 4;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[32][36]; __shared__ float sXs[32];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)(bp + 108));\n"
+"            int ib = sb & 7;\n"
+"            /* Unpack 6-bit scales to int8 */\n"
+"            unsigned int aux[4];\n"
+"            *(unsigned int*)&aux[0] = *(const unsigned int*)(bp + 96);\n"
+"            *(unsigned int*)&aux[1] = *(const unsigned int*)(bp + 100);\n"
+"            *(unsigned int*)&aux[2] = *(const unsigned int*)(bp + 104);\n"
+"            unsigned int tmp = aux[2];\n"
+"            aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);\n"
+"            aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);\n"
+"            aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);\n"
+"            aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);\n"
+"            const signed char *scales = (const signed char *)aux;\n"
+"            float dl0 = d * (float)(scales[2*ib] - 32);\n"
+"            float dl1 = d * (float)(scales[2*ib+1] - 32);\n"
+"            if (half==0){ sWs_db0[r]=dl0; sWs_db1[r]=dl1; }\n"
+"            int q_base = (ib / 4) * 32;\n"
+"            int shift = (ib % 4) * 2;\n"
+"            int hm_bit = ib;\n"
+"            const unsigned char *hm = bp;\n"
+"            const unsigned char *qs = bp + 32;\n"
+"            int koff = half * 16;\n"
+"            for (int l = 0; l < 16; l++) {\n"
+"                int idx = koff + l;\n"
+"                int q_off = (idx < 16) ? 0 : 16;\n"
+"                int qv = (qs[q_base + q_off + l] >> shift) & 3;\n"
+"                int hmv = (hm[(idx < 16) ? l : (l + 16)] >> hm_bit) & 1;\n"
+"                sW[r][idx] = (signed char)(hmv ? qv : qv - 4);\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        /* MMA_0: k=0..15 */\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        /* MMA_1: k=16..31 */\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Prefill variant of mmq_q3_K_grouped with TG=16 (128 tokens/block). */\n"
+"__global__ void mmq_q3_K_grouped8(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 16;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)(bp + 108));\n"
+"            int ib = sb & 7;\n"
+"            unsigned int aux[4];\n"
+"            *(unsigned int*)&aux[0] = *(const unsigned int*)(bp + 96);\n"
+"            *(unsigned int*)&aux[1] = *(const unsigned int*)(bp + 100);\n"
+"            *(unsigned int*)&aux[2] = *(const unsigned int*)(bp + 104);\n"
+"            unsigned int tmp = aux[2];\n"
+"            aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);\n"
+"            aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);\n"
+"            aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);\n"
+"            aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);\n"
+"            const signed char *scales = (const signed char *)aux;\n"
+"            float dl0 = d * (float)(scales[2*ib] - 32);\n"
+"            float dl1 = d * (float)(scales[2*ib+1] - 32);\n"
+"            if (half==0){ sWs_db0[r]=dl0; sWs_db1[r]=dl1; }\n"
+"            int q_base = (ib / 4) * 32;\n"
+"            int shift = (ib % 4) * 2;\n"
+"            int hm_bit = ib;\n"
+"            const unsigned char *hm = bp;\n"
+"            const unsigned char *qs = bp + 32;\n"
+"            int koff = half * 16;\n"
+"            for (int l = 0; l < 16; l++) {\n"
+"                int idx = koff + l;\n"
+"                int q_off = (idx < 16) ? 0 : 16;\n"
+"                int qv = (qs[q_base + q_off + l] >> shift) & 3;\n"
+"                int hmv = (hm[(idx < 16) ? l : (l + 16)] >> hm_bit) & 1;\n"
+"                sW[r][idx] = (signed char)(hmv ? qv : qv - 4);\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Prefill variant of mmq_q3_K_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_q3_K_grouped32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)(bp + 108));\n"
+"            int ib = sb & 7;\n"
+"            unsigned int aux[4];\n"
+"            *(unsigned int*)&aux[0] = *(const unsigned int*)(bp + 96);\n"
+"            *(unsigned int*)&aux[1] = *(const unsigned int*)(bp + 100);\n"
+"            *(unsigned int*)&aux[2] = *(const unsigned int*)(bp + 104);\n"
+"            unsigned int tmp = aux[2];\n"
+"            aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);\n"
+"            aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);\n"
+"            aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);\n"
+"            aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);\n"
+"            const signed char *scales = (const signed char *)aux;\n"
+"            float dl0 = d * (float)(scales[2*ib] - 32);\n"
+"            float dl1 = d * (float)(scales[2*ib+1] - 32);\n"
+"            if (half==0){ sWs_db0[r]=dl0; sWs_db1[r]=dl1; }\n"
+"            int q_base = (ib / 4) * 32;\n"
+"            int shift = (ib % 4) * 2;\n"
+"            int hm_bit = ib;\n"
+"            const unsigned char *hm = bp;\n"
+"            const unsigned char *qs = bp + 32;\n"
+"            int koff = half * 16;\n"
+"            for (int l = 0; l < 16; l++) {\n"
+"                int idx = koff + l;\n"
+"                int q_off = (idx < 16) ? 0 : 16;\n"
+"                int qv = (qs[q_base + q_off + l] >> shift) & 3;\n"
+"                int hmv = (hm[(idx < 16) ? l : (l + 16)] >> hm_bit) & 1;\n"
+"                sW[r][idx] = (signed char)(hmv ? qv : qv - 4);\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Fused prefill variant of mmq_q3_K_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_q3_K_fused32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const float *input, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)(bp + 108));\n"
+"            int ib = sb & 7;\n"
+"            unsigned int aux[4];\n"
+"            *(unsigned int*)&aux[0] = *(const unsigned int*)(bp + 96);\n"
+"            *(unsigned int*)&aux[1] = *(const unsigned int*)(bp + 100);\n"
+"            *(unsigned int*)&aux[2] = *(const unsigned int*)(bp + 104);\n"
+"            unsigned int tmp = aux[2];\n"
+"            aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);\n"
+"            aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);\n"
+"            aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);\n"
+"            aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);\n"
+"            const signed char *scales = (const signed char *)aux;\n"
+"            float dl0 = d * (float)(scales[2*ib] - 32);\n"
+"            float dl1 = d * (float)(scales[2*ib+1] - 32);\n"
+"            if (half==0){ sWs_db0[r]=dl0; sWs_db1[r]=dl1; }\n"
+"            int q_base = (ib / 4) * 32;\n"
+"            int shift = (ib % 4) * 2;\n"
+"            int hm_bit = ib;\n"
+"            const unsigned char *hm = bp;\n"
+"            const unsigned char *qs = bp + 32;\n"
+"            int koff = half * 16;\n"
+"            for (int l = 0; l < 16; l++) {\n"
+"                int idx = koff + l;\n"
+"                int q_off = (idx < 16) ? 0 : 16;\n"
+"                int qv = (qs[q_base + q_off + l] >> shift) & 3;\n"
+"                int hmv = (hm[(idx < 16) ? l : (l + 16)] >> hm_bit) & 1;\n"
+"                sW[r][idx] = (signed char)(hmv ? qv : qv - 4);\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            float v0=(m<eb1)?input[(size_t)m*K+sb*32+j*4+0]:0.0f;\n"
+"            float v1=(m<eb1)?input[(size_t)m*K+sb*32+j*4+1]:0.0f;\n"
+"            float v2=(m<eb1)?input[(size_t)m*K+sb*32+j*4+2]:0.0f;\n"
+"            float v3=(m<eb1)?input[(size_t)m*K+sb*32+j*4+3]:0.0f;\n"
+"            float local_max=fmaxf(fabsf(v0),fmaxf(fabsf(v1),fmaxf(fabsf(v2),fabsf(v3))));\n"
+"            unsigned mask=0xFF<<((threadIdx.x&31)&~7);\n"
+"            float a=local_max;\n"
+"            for(int o=4;o>0;o>>=1) a=fmaxf(a,__shfl_xor_sync(mask,a,o));\n"
+"            float scale=a/127.0f,inv=scale>0.0f?1.0f/scale:0.0f;\n"
+"            int q0=(int)rintf(v0*inv);q0=q0<-127?-127:(q0>127?127:q0);\n"
+"            int q1=(int)rintf(v1*inv);q1=q1<-127?-127:(q1>127?127:q1);\n"
+"            int q2=(int)rintf(v2*inv);q2=q2<-127?-127:(q2>127?127:q2);\n"
+"            int q3=(int)rintf(v3*inv);q3=q3<-127?-127:(q3>127?127:q3);\n"
+"            int packed=(unsigned char)q0|((unsigned char)q1<<8)|((unsigned char)q2<<16)|((unsigned char)q3<<24);\n"
+"            *(int*)&sX[tt][j*4]=packed;\n"
+"            if(j==0)sXs[tt]=scale; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 19h. mmq_iq3_s_grouped: IQ3_S weight x Q8_1 activation via int8 tensor-core MMQ ---- */\n"
+"/* IQ3_S block: 110 bytes = d(f16)+qs[64]+qh[8]+signs[32]+scales[4], 256 elements.           */\n"
+"/* Single db per 32-element sub-block; 1 MMA per sub-block (k=32).                            */\n"
+"__global__ void mmq_iq3_s_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 4;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[32][36]; __shared__ float sXs[32];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            int pair = ib32 / 2, sub_in_pair = ib32 & 1;\n"
+"            if (half==0) sWs[r] = d * (float)(1 + 2 * (sub_in_pair ? (bp[106+pair] >> 4) : (bp[106+pair] & 0xf)));\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 8, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int g1_idx = (int)(bp[2+qs_off + 2*l + 0]) | ((qh_byte << (8-2*l)) & 256);\n"
+"                int g2_idx = (int)(bp[2+qs_off + 2*l + 1]) | ((qh_byte << (7-2*l)) & 256);\n"
+"                unsigned int gv1 = iq3s_grid_dev[g1_idx];\n"
+"                unsigned int gv2 = iq3s_grid_dev[g2_idx];\n"
+"                unsigned char sgn = bp[74+sign_off + l];\n"
+"                for (int j = 0; j < 4; j++) {\n"
+"                    int w1 = (int)(unsigned char)(gv1 >> (8*j));\n"
+"                    int w2 = (int)(unsigned char)(gv2 >> (8*j));\n"
+"                    sW[r][l*8 + j]     = (signed char)((sgn & (1 << j))     ? -w1 : w1);\n"
+"                    sW[r][l*8 + j + 4] = (signed char)((sgn & (1 << (j+4))) ? -w2 : w2);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4],   qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Prefill variant of mmq_iq3_s_grouped with TG=16 (128 tokens/block). */\n"
+"__global__ void mmq_iq3_s_grouped8(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 16;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            int pair = ib32 / 2, sub_in_pair = ib32 & 1;\n"
+"            if (half==0) sWs[r] = d * (float)(1 + 2 * (sub_in_pair ? (bp[106+pair] >> 4) : (bp[106+pair] & 0xf)));\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 8, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int g1_idx = (int)(bp[2+qs_off + 2*l + 0]) | ((qh_byte << (8-2*l)) & 256);\n"
+"                int g2_idx = (int)(bp[2+qs_off + 2*l + 1]) | ((qh_byte << (7-2*l)) & 256);\n"
+"                unsigned int gv1 = iq3s_grid_dev[g1_idx];\n"
+"                unsigned int gv2 = iq3s_grid_dev[g2_idx];\n"
+"                unsigned char sgn = bp[74+sign_off + l];\n"
+"                for (int j = 0; j < 4; j++) {\n"
+"                    int w1 = (int)(unsigned char)(gv1 >> (8*j));\n"
+"                    int w2 = (int)(unsigned char)(gv2 >> (8*j));\n"
+"                    sW[r][l*8 + j]     = (signed char)((sgn & (1 << j))     ? -w1 : w1);\n"
+"                    sW[r][l*8 + j + 4] = (signed char)((sgn & (1 << (j+4))) ? -w2 : w2);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4],   qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Prefill variant of mmq_iq3_s_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_iq3_s_grouped32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            int pair = ib32 / 2, sub_in_pair = ib32 & 1;\n"
+"            if (half==0) sWs[r] = d * (float)(1 + 2 * (sub_in_pair ? (bp[106+pair] >> 4) : (bp[106+pair] & 0xf)));\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 8, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int g1_idx = (int)(bp[2+qs_off + 2*l + 0]) | ((qh_byte << (8-2*l)) & 256);\n"
+"                int g2_idx = (int)(bp[2+qs_off + 2*l + 1]) | ((qh_byte << (7-2*l)) & 256);\n"
+"                unsigned int gv1 = iq3s_grid_dev[g1_idx];\n"
+"                unsigned int gv2 = iq3s_grid_dev[g2_idx];\n"
+"                unsigned char sgn = bp[74+sign_off + l];\n"
+"                for (int j = 0; j < 4; j++) {\n"
+"                    int w1 = (int)(unsigned char)(gv1 >> (8*j));\n"
+"                    int w2 = (int)(unsigned char)(gv2 >> (8*j));\n"
+"                    sW[r][l*8 + j]     = (signed char)((sgn & (1 << j))     ? -w1 : w1);\n"
+"                    sW[r][l*8 + j + 4] = (signed char)((sgn & (1 << (j+4))) ? -w2 : w2);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4],   qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Fused prefill variant of mmq_iq3_s_grouped with TG=32 (256 tokens/block).                 */\n"
+"/* Loads F32 activation directly and quantizes to int8 on-the-fly, eliminating the separate    */\n"
+"/* mmq_quant_q8_1 launch and the global-memory round-trip of cxq8/cxs.                         */\n"
+"__global__ void mmq_iq3_s_fused32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const float *input, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*110, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*110+(size_t)n*110)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*110);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            int pair = ib32 / 2, sub_in_pair = ib32 & 1;\n"
+"            if (half==0) sWs[r] = d * (float)(1 + 2 * (sub_in_pair ? (bp[106+pair] >> 4) : (bp[106+pair] & 0xf)));\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 8, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int g1_idx = (int)(bp[2+qs_off + 2*l + 0]) | ((qh_byte << (8-2*l)) & 256);\n"
+"                int g2_idx = (int)(bp[2+qs_off + 2*l + 1]) | ((qh_byte << (7-2*l)) & 256);\n"
+"                unsigned int gv1 = iq3s_grid_dev[g1_idx];\n"
+"                unsigned int gv2 = iq3s_grid_dev[g2_idx];\n"
+"                unsigned char sgn = bp[74+sign_off + l];\n"
+"                for (int j = 0; j < 4; j++) {\n"
+"                    int w1 = (int)(unsigned char)(gv1 >> (8*j));\n"
+"                    int w2 = (int)(unsigned char)(gv2 >> (8*j));\n"
+"                    sW[r][l*8 + j]     = (signed char)((sgn & (1 << j))     ? -w1 : w1);\n"
+"                    sW[r][l*8 + j + 4] = (signed char)((sgn & (1 << (j+4))) ? -w2 : w2);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        /* Fused quantize: load F32 from input, compute per-32-element scale, write int8 to sX */\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            float v0=(m<eb1)?input[(size_t)m*K+sb*32+j*4+0]:0.0f;\n"
+"            float v1=(m<eb1)?input[(size_t)m*K+sb*32+j*4+1]:0.0f;\n"
+"            float v2=(m<eb1)?input[(size_t)m*K+sb*32+j*4+2]:0.0f;\n"
+"            float v3=(m<eb1)?input[(size_t)m*K+sb*32+j*4+3]:0.0f;\n"
+"            float local_max=fmaxf(fabsf(v0),fmaxf(fabsf(v1),fmaxf(fabsf(v2),fabsf(v3))));\n"
+"            unsigned mask=0xFF<<((threadIdx.x&31)&~7);\n"
+"            float a=local_max;\n"
+"            for(int o=4;o>0;o>>=1) a=fmaxf(a,__shfl_xor_sync(mask,a,o));\n"
+"            float scale=a/127.0f,inv=scale>0.0f?1.0f/scale:0.0f;\n"
+"            int q0=(int)rintf(v0*inv);q0=q0<-127?-127:(q0>127?127:q0);\n"
+"            int q1=(int)rintf(v1*inv);q1=q1<-127?-127:(q1>127?127:q1);\n"
+"            int q2=(int)rintf(v2*inv);q2=q2<-127?-127:(q2>127?127:q2);\n"
+"            int q3=(int)rintf(v3*inv);q3=q3<-127?-127:(q3>127?127:q3);\n"
+"            int packed=(unsigned char)q0|((unsigned char)q1<<8)|((unsigned char)q2<<16)|((unsigned char)q3<<24);\n"
+"            *(int*)&sX[tt][j*4]=packed;\n"
+"            if(j==0)sXs[tt]=scale; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int qa0=*(const int*)&sW[wr+gid][tid*4],   qa1=*(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int qa2=*(const int*)&sW[wr+gid][tid*4+16], qa3=*(const int*)&sW[wr+gid+8][tid*4+16];\n"
+"        float wr0=sWs[wr+gid], wr8=sWs[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int qb0=*(const int*)&sX[g*8+gid][tid*4], qb1=*(const int*)&sX[g*8+gid][tid*4+16];\n"
+"            int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(qa0),\"r\"(qa1),\"r\"(qa2),\"r\"(qa3),\"r\"(qb0),\"r\"(qb1),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 19i. mmq_iq2_s_grouped: IQ2_S weight x Q8_1 activation via int8 tensor-core MMQ ---- */\n"
+"/* IQ2_S block: 82 bytes = d(f16)+qs[32]+signs[32]+qh[8]+scales[8], 256 elements.            */\n"
+"/* Two dbs per sub-block (db0 k=0..15, db1 k=16..31); 2 x m16n8k16 MMA per sub-block.          */\n"
+"__global__ void mmq_iq2_s_grouped(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 4;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*82, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[32][36]; __shared__ float sXs[32];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[4][4]; for(int g=0;g<4;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*82+(size_t)n*82)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*82);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            if (half==0){ sWs_db0[r]=d*(0.5f+(float)(bp[74+ib32]&0xf))*0.25f; sWs_db1[r]=d*(0.5f+(float)(bp[74+ib32]>>4))*0.25f; }\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 4, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int grid_idx = (int)(bp[2+qs_off + l]) | ((qh_byte << (8-2*l)) & 0x300);\n"
+"                unsigned long long gv = iq2s_grid_dev[grid_idx];\n"
+"                unsigned char sgn = bp[34+sign_off + l];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    int wv = (int)(unsigned char)(gv >> (8*j));\n"
+"                    sW[r][l*8 + j] = (signed char)((sgn & (1 << j)) ? -wv : wv);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        /* MMA_0: k=0..15 */\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        /* MMA_1: k=16..31 */\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"/* Prefill variant of mmq_iq2_s_grouped with TG=16 (128 tokens/block). */\n"
+"__global__ void mmq_iq2_s_grouped8(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 16;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*82, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*82+(size_t)n*82)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*82);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            if (half==0){ sWs_db0[r]=d*(0.5f+(float)(bp[74+ib32]&0xf))*0.25f; sWs_db1[r]=d*(0.5f+(float)(bp[74+ib32]>>4))*0.25f; }\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 4, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int grid_idx = (int)(bp[2+qs_off + l]) | ((qh_byte << (8-2*l)) & 0x300);\n"
+"                unsigned long long gv = iq2s_grid_dev[grid_idx];\n"
+"                unsigned char sgn = bp[34+sign_off + l];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    int wv = (int)(unsigned char)(gv >> (8*j));\n"
+"                    sW[r][l*8 + j] = (signed char)((sgn & (1 << j)) ? -wv : wv);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        /* MMA_0: k=0..15 */\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        /* MMA_1: k=16..31 */\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Prefill variant of mmq_iq2_s_grouped with TG=32 (256 tokens/block). */\n"
+"__global__ void mmq_iq2_s_grouped32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*82, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*82+(size_t)n*82)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*82);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            if (half==0){ sWs_db0[r]=d*(0.5f+(float)(bp[74+ib32]&0xf))*0.25f; sWs_db1[r]=d*(0.5f+(float)(bp[74+ib32]>>4))*0.25f; }\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 4, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int grid_idx = (int)(bp[2+qs_off + l]) | ((qh_byte << (8-2*l)) & 0x300);\n"
+"                unsigned long long gv = iq2s_grid_dev[grid_idx];\n"
+"                unsigned char sgn = bp[34+sign_off + l];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    int wv = (int)(unsigned char)(gv >> (8*j));\n"
+"                    sW[r][l*8 + j] = (signed char)((sgn & (1 << j)) ? -wv : wv);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            *(int*)&sX[tt][j*4]=(m<eb1)?*(const int*)&cxq8[(size_t)m*K+sb*32+j*4]:0; }\n"
+"        for (int t=threadIdx.x;t<ntg*8;t+=blockDim.x){ int m=m_base+t; sXs[t]=(m<eb1)?cxs[(size_t)m*nsb+sb]:0.0f; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        /* MMA_0: k=0..15 */\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        /* MMA_1: k=16..31 */\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Fused prefill variant of mmq_iq2_s_grouped with TG=32 (256 tokens/block).                    */\n"
+"/* Loads F32 activation directly and quantizes to int8 on-the-fly.                              */\n"
+"__global__ void mmq_iq2_s_fused32(float *out, const unsigned char *W, unsigned long long estride,\n"
+"                                    const float *input, const int *ebounds,\n"
+"                                    const int *worklist, int bm, int N, int K) {\n"
+"    const int TG = 32;\n"
+"    int packed = worklist[blockIdx.y]; int e = packed >> 16, g0 = packed & 0xffff;\n"
+"    int eb0 = ebounds[e], eb1 = ebounds[e+1];\n"
+"    int m_base = eb0 + g0*(8*TG);\n"
+"    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int gid = lane>>2, tid = lane&3;\n"
+"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int nb = K/256, row_bytes = nb*82, nsb = K/32;\n"
+"    const unsigned char *We = W + (size_t)e*estride;\n"
+"    __shared__ signed char sX[256][36]; __shared__ float sXs[256];\n"
+"    __shared__ signed char sW[64][32];\n"
+"    __shared__ float sWs_db0[64]; __shared__ float sWs_db1[64];\n"
+"    float f[32][4]; for(int g=0;g<32;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    __syncthreads();\n"
+"    for (int sb=0; sb<nsb; sb++) {\n"
+"        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
+"            const unsigned char *bp = bm ? (We+(size_t)(sb/8)*N*82+(size_t)n*82)\n"
+"                              : (We + (size_t)n*row_bytes + (size_t)(sb/8)*82);\n"
+"            float d = half_to_float(*(const half_raw*)bp);\n"
+"            int ib32 = sb & 7;\n"
+"            if (half==0){ sWs_db0[r]=d*(0.5f+(float)(bp[74+ib32]&0xf))*0.25f; sWs_db1[r]=d*(0.5f+(float)(bp[74+ib32]>>4))*0.25f; }\n"
+"            unsigned char qh_byte = bp[66+ib32];\n"
+"            int qs_off = ib32 * 4, sign_off = ib32 * 4;\n"
+"            for (int l = half*2; l < half*2+2; l++) {\n"
+"                int grid_idx = (int)(bp[2+qs_off + l]) | ((qh_byte << (8-2*l)) & 0x300);\n"
+"                unsigned long long gv = iq2s_grid_dev[grid_idx];\n"
+"                unsigned char sgn = bp[34+sign_off + l];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    int wv = (int)(unsigned char)(gv >> (8*j));\n"
+"                    sW[r][l*8 + j] = (signed char)((sgn & (1 << j)) ? -wv : wv);\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        for (int i=threadIdx.x;i<ntg*8*8;i+=blockDim.x){ int tt=i>>3,j=i&7,m=m_base+tt;\n"
+"            float v0=(m<eb1)?input[(size_t)m*K+sb*32+j*4+0]:0.0f;\n"
+"            float v1=(m<eb1)?input[(size_t)m*K+sb*32+j*4+1]:0.0f;\n"
+"            float v2=(m<eb1)?input[(size_t)m*K+sb*32+j*4+2]:0.0f;\n"
+"            float v3=(m<eb1)?input[(size_t)m*K+sb*32+j*4+3]:0.0f;\n"
+"            float local_max=fmaxf(fabsf(v0),fmaxf(fabsf(v1),fmaxf(fabsf(v2),fabsf(v3))));\n"
+"            unsigned mask=0xFF<<((threadIdx.x&31)&~7);\n"
+"            float a=local_max;\n"
+"            for(int o=4;o>0;o>>=1) a=fmaxf(a,__shfl_xor_sync(mask,a,o));\n"
+"            float scale=a/127.0f,inv=scale>0.0f?1.0f/scale:0.0f;\n"
+"            int q0=(int)rintf(v0*inv);q0=q0<-127?-127:(q0>127?127:q0);\n"
+"            int q1=(int)rintf(v1*inv);q1=q1<-127?-127:(q1>127?127:q1);\n"
+"            int q2=(int)rintf(v2*inv);q2=q2<-127?-127:(q2>127?127:q2);\n"
+"            int q3=(int)rintf(v3*inv);q3=q3<-127?-127:(q3>127?127:q3);\n"
+"            int packed=(unsigned char)q0|((unsigned char)q1<<8)|((unsigned char)q2<<16)|((unsigned char)q3<<24);\n"
+"            *(int*)&sX[tt][j*4]=packed;\n"
+"            if(j==0)sXs[tt]=scale; }\n"
+"        __syncthreads();\n"
+"        int wr=warp*16;\n"
+"        int a0_h0 = *(const int*)&sW[wr+gid][tid*4];\n"
+"        int a1_h0 = *(const int*)&sW[wr+gid+8][tid*4];\n"
+"        int b0_h0 = *(const int*)&sX[gid][tid*4];\n"
+"        float wr0_db0 = sWs_db0[wr+gid], wr8_db0 = sWs_db0[wr+gid+8];\n"
+"        int a0_h1 = *(const int*)&sW[wr+gid][16+tid*4];\n"
+"        int a1_h1 = *(const int*)&sW[wr+gid+8][16+tid*4];\n"
+"        int b0_h1 = *(const int*)&sX[gid][16+tid*4];\n"
+"        float wr0_db1 = sWs_db1[wr+gid], wr8_db1 = sWs_db1[wr+gid+8];\n"
+"        for (int g=0; g<ntg; g++) {\n"
+"            int b0_x = *(const int*)&sX[g*8+gid][tid*4];\n"
+"            int b1_x = *(const int*)&sX[g*8+gid][16+tid*4];\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h0),\"r\"(a1_h0),\"r\"(b0_h0),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db0*xc0*(float)c0; f[g][1]+=wr0_db0*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db0*xc0*(float)c2; f[g][3]+=wr8_db0*xc1*(float)c3; }\n"
+"            { int c0=0,c1=0,c2=0,c3=0;\n"
+"            asm(\"mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};\"\n"
+"                :\"=r\"(c0),\"=r\"(c1),\"=r\"(c2),\"=r\"(c3)\n"
+"                :\"r\"(a0_h1),\"r\"(a1_h1),\"r\"(b1_x),\"r\"(0),\"r\"(0),\"r\"(0),\"r\"(0));\n"
+"            float xc0=sXs[g*8+tid*2], xc1=sXs[g*8+tid*2+1];\n"
+"            f[g][0]+=wr0_db1*xc0*(float)c0; f[g][1]+=wr0_db1*xc1*(float)c1;\n"
+"            f[g][2]+=wr8_db1*xc0*(float)c2; f[g][3]+=wr8_db1*xc1*(float)c3; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int n_a=n0+gid, n_b=n0+gid+8;\n"
+"    for (int g=0; g<ntg; g++) {\n"
+"        int m_a=m_base+g*8+tid*2, m_b=m_a+1;\n"
+"        if (m_a<eb1){ out[(size_t)m_a*N+n_a]=f[g][0]; out[(size_t)m_a*N+n_b]=f[g][2]; }\n"
+"        if (m_b<eb1){ out[(size_t)m_b*N+n_a]=f[g][1]; out[(size_t)m_b*N+n_b]=f[g][3]; }\n"
 "    }\n"
 "}\n"
 "\n"
@@ -6136,10 +7936,13 @@ typedef struct {
     CUdeviceptr attn_norm_w;   /* F32 [n_embd] */
     CUdeviceptr attn_q_w;     /* F16 [n_rows * n_cols] */
     CUdeviceptr attn_q_w_f16; /* optional F16 shadow copy for batched Q8_0 prefill */
+    CUdeviceptr attn_q_w_bm;  /* block-major repacked (0 if not repacked) */
     CUdeviceptr attn_k_w;
     CUdeviceptr attn_k_w_f16;
+    CUdeviceptr attn_k_w_bm;
     CUdeviceptr attn_v_w;
     CUdeviceptr attn_v_w_f16;
+    CUdeviceptr attn_v_w_bm;
     CUdeviceptr attn_q_norm_w; /* F32 [head_dim] */
     CUdeviceptr attn_k_norm_w; /* F32 [head_dim] */
     CUdeviceptr attn_q_bias;   /* F32 [q_dim], 0 if absent (Qwen2.5-VL) */
@@ -6147,13 +7950,17 @@ typedef struct {
     CUdeviceptr attn_v_bias;   /* F32 [kv_dim] */
     CUdeviceptr attn_output_w; /* F16 */
     CUdeviceptr attn_output_w_f16;
+    CUdeviceptr attn_output_w_bm;
     CUdeviceptr ffn_norm_w;    /* F32 [n_embd] */
     CUdeviceptr ffn_gate_w;    /* F16 */
     CUdeviceptr ffn_gate_w_f16;
+    CUdeviceptr ffn_gate_w_bm;
     CUdeviceptr ffn_up_w;      /* F16 */
     CUdeviceptr ffn_up_w_f16;
+    CUdeviceptr ffn_up_w_bm;
     CUdeviceptr ffn_down_w;    /* F16 */
     CUdeviceptr ffn_down_w_f16;
+    CUdeviceptr ffn_down_w_bm;
 
     /* Dimensions for matvec */
     int attn_q_rows, attn_q_cols;
@@ -6352,6 +8159,33 @@ struct cuda_llm_runner {
     CUfunction fn_mmq_iq2xxs_grouped;
     CUfunction fn_mmq_scatter_weighted;
     CUfunction fn_mmq_iq2xxs_grouped8;
+    CUfunction fn_mmq_iq2xxs_grouped32;
+    CUfunction fn_mmq_iq2xxs_fused32;
+    /* IQ3_XXS MMQ (mul_mat_id) path */
+    CUfunction fn_mmq_iq3xxs_grouped;
+    CUfunction fn_mmq_iq3xxs_grouped8;
+    CUfunction fn_mmq_iq3xxs_grouped32;
+    CUfunction fn_mmq_iq3xxs_fused32;
+    /* Q2_K MMQ (dense prefill) path */
+    CUfunction fn_mmq_q2_K_grouped;
+    CUfunction fn_mmq_q2_K_grouped8;
+    CUfunction fn_mmq_q2_K_grouped32;
+    CUfunction fn_mmq_q2_K_fused32;
+    /* Q3_K MMQ (dense prefill) path */
+    CUfunction fn_mmq_q3_K_grouped;
+    CUfunction fn_mmq_q3_K_grouped8;
+    CUfunction fn_mmq_q3_K_grouped32;
+    CUfunction fn_mmq_q3_K_fused32;
+    /* IQ3_S MMQ (dense prefill) path */
+    CUfunction fn_mmq_iq3_s_grouped;
+    CUfunction fn_mmq_iq3_s_grouped8;
+    CUfunction fn_mmq_iq3_s_grouped32;
+    CUfunction fn_mmq_iq3_s_fused32;
+    /* IQ2_S MMQ (dense prefill) path */
+    CUfunction fn_mmq_iq2_s_grouped;
+    CUfunction fn_mmq_iq2_s_grouped8;
+    CUfunction fn_mmq_iq2_s_grouped32;
+    CUfunction fn_mmq_iq2_s_fused32;
     CUfunction fn_dequant_iq3_xxs_to_f16;
     CUfunction fn_dequant_q2_K_to_f16;
     CUfunction fn_dequant_iq3_s_to_f16;
@@ -6417,6 +8251,7 @@ struct cuda_llm_runner {
     /* MoE params */
     int is_moe;
     int moe_iq2_bm;       /* IQ2_XXS expert weights repacked block-major (CUDA_LLM_MMQ_REPACK) */
+    int dense_bm;         /* Dense weights repacked block-major (CUDA_LLM_DENSE_BM) */
     int n_experts;
     int n_experts_used;   /* top-k */
     int expert_ff;        /* per-expert FFN dim */
@@ -6871,6 +8706,28 @@ lookup_funcs:
     GET_FUNC(mmq_iq2xxs_grouped);
     GET_FUNC(mmq_scatter_weighted);
     GET_FUNC(mmq_iq2xxs_grouped8);
+    GET_FUNC(mmq_iq2xxs_grouped32);
+    GET_FUNC(mmq_iq2xxs_fused32);
+    GET_FUNC(mmq_iq3xxs_grouped);
+    GET_FUNC(mmq_iq3xxs_grouped8);
+    GET_FUNC(mmq_iq3xxs_grouped32);
+    GET_FUNC(mmq_iq3xxs_fused32);
+    GET_FUNC(mmq_q2_K_grouped);
+    GET_FUNC(mmq_q2_K_grouped8);
+    GET_FUNC(mmq_q2_K_grouped32);
+    GET_FUNC(mmq_q2_K_fused32);
+    GET_FUNC(mmq_q3_K_grouped);
+    GET_FUNC(mmq_q3_K_grouped8);
+    GET_FUNC(mmq_q3_K_grouped32);
+    GET_FUNC(mmq_q3_K_fused32);
+    GET_FUNC(mmq_iq3_s_grouped);
+    GET_FUNC(mmq_iq3_s_grouped8);
+    GET_FUNC(mmq_iq3_s_grouped32);
+    GET_FUNC(mmq_iq3_s_fused32);
+    GET_FUNC(mmq_iq2_s_grouped);
+    GET_FUNC(mmq_iq2_s_grouped8);
+    GET_FUNC(mmq_iq2_s_grouped32);
+    GET_FUNC(mmq_iq2_s_fused32);
     GET_FUNC(dequant_iq3_xxs_to_f16);
     GET_FUNC(dequant_q2_K_to_f16);
     GET_FUNC(dequant_iq3_s_to_f16);
@@ -7235,6 +9092,31 @@ static int upload_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t) {
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_kquant_raw alloc failed (%zu bytes, type=%d, err=%d, n_cols=%d, n_rows=%d)\n", nbytes, t->type, (int)err, t->n_cols, t->n_rows); return -1; }
     err = cuMemcpyHtoD(*d_ptr, t->data, nbytes);
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_kquant_raw copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    return 0;
+}
+
+/* Block-major repack for dense MMQ weights. Transforms row-major [N][nb][bs] to
+ * block-major [nb][N][bs] so the kernel reads 64 contiguous rows per block group.
+ * The original data is preserved (row-major stays on device for fallback paths). */
+static int upload_kquant_raw_bm(CUdeviceptr *d_ptr_bm, const qtensor *t, int bm_enabled) {
+    if (!t->data || !bm_enabled) { *d_ptr_bm = 0; return 0; }
+    int N = t->n_rows, nb = t->n_cols / 256;
+    int bs = (int)dequant_row_size(t->type, t->n_cols) / N; /* bytes per row */
+    if (bs <= 0 || nb <= 0) { *d_ptr_bm = 0; return 0; }
+    size_t row_bytes = (size_t)nb * bs;
+    size_t total = (size_t)N * row_bytes;
+    unsigned char *repacked = (unsigned char *)malloc(total);
+    if (!repacked) { *d_ptr_bm = 0; return -1; }
+    const unsigned char *src = (const unsigned char *)t->data;
+    for (int b = 0; b < nb; b++)
+        for (int n = 0; n < N; n++)
+            memcpy(repacked + ((size_t)b * N + n) * bs,
+                   src + ((size_t)n * nb + b) * bs, bs);
+    CUresult err = cuMemAlloc(d_ptr_bm, total);
+    if (err != CUDA_SUCCESS) { free(repacked); *d_ptr_bm = 0; return -1; }
+    err = cuMemcpyHtoD(*d_ptr_bm, repacked, total);
+    free(repacked);
+    if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr_bm); *d_ptr_bm = 0; return -1; }
     return 0;
 }
 
@@ -7681,6 +9563,23 @@ static int upload_weight_f32(CUdeviceptr *d_ptr, const qtensor *t) {
         *d_ptr = 0;
         return -1;
     }
+    return 0;
+}
+
+/* Upload weight + optional block-major repack for dense MMQ.
+ * When dense_bm is set, replaces the original row-major pointer with the
+ * block-major repacked version. The launch helper passes bm=1. */
+static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t,
+                                int *out_type, const char *cache_name);
+static int upload_weight_matrix_bm(cuda_llm_runner *r, CUdeviceptr *d_ptr, CUdeviceptr *d_ptr_bm,
+                                   const qtensor *t, int *out_type, const char *cache_name) {
+    if (upload_weight_matrix(r, d_ptr, t, out_type, cache_name) != 0) return -1;
+    if (r->dense_bm && d_ptr_bm) {
+        CUdeviceptr bm_ptr = 0;
+        if (upload_kquant_raw_bm(&bm_ptr, t, 1) != 0) return -1;
+        if (bm_ptr) { cuMemFree(*d_ptr); *d_ptr = bm_ptr; }
+    }
+    if (!r->dense_bm && d_ptr_bm) *d_ptr_bm = 0;
     return 0;
 }
 
@@ -8508,7 +10407,14 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
       int mmq_on = m && m[0] && strcmp(m, "0") != 0;  /* repack only with MMQ (block-major prefill path) */
       moe_repack_bm = !repack_off && mmq_on
                       && (r->n_embd % 64 == 0) && (r->expert_ff % 64 == 0); }
-    r->moe_iq2_bm = moe_repack_bm;
+     r->moe_iq2_bm = moe_repack_bm;
+    /* Dense weight block-major repack (opt-out CUDA_LLM_NO_DENSE_BM, default ON with MMQ).
+     * Repacks all MMQ-compatible dense weights to block-major for contiguous 64-row reads. */
+    { const char *e = getenv("CUDA_LLM_NO_DENSE_BM");
+      int no_bm = e && e[0] && strcmp(e, "0") != 0;
+      int mmq_possible = !getenv("CUDA_LLM_NO_MMQ_DENSE");
+      r->dense_bm = !no_bm && mmq_possible; }
+
 
     for (int l = 0; l < r->n_layers; l++) {
         char name[128];
@@ -8592,21 +10498,21 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type, name) != 0) return -1;
+            if (upload_weight_matrix_bm(r, &cl->attn_q_w, &cl->attn_q_w_bm, &t, &cl->attn_q_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->attn_q_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type, name) != 0) return -1;
+            if (upload_weight_matrix_bm(r, &cl->attn_k_w, &cl->attn_k_w_bm, &t, &cl->attn_k_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->attn_k_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
-            t = cllm_load_tensor(gguf, name, r->is_gemma4 ? 0 : 1); /* optional for Gemma4 full-attn layers */
+            t = cllm_load_tensor(gguf, name, r->is_gemma4 ? 0 : 1);
             cl->has_v_proj = (t.data != NULL);
             if (cl->has_v_proj) {
                 cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
-                if (upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type, name) != 0) return -1;
+                if (upload_weight_matrix_bm(r, &cl->attn_v_w, &cl->attn_v_w_bm, &t, &cl->attn_v_type, name) != 0) return -1;
                 if (upload_q8_0_shadow_f16(r, &cl->attn_v_w_f16, &t) != 0) return -1;
             } else {
                 /* V = K for this layer (Gemma4 pattern) */
@@ -8621,7 +10527,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type, name) != 0) return -1;
+            if (upload_weight_matrix_bm(r, &cl->attn_output_w, &cl->attn_output_w_bm, &t, &cl->attn_output_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->attn_output_w_f16, &t) != 0) return -1;
 
             /* QK norms (F32, optional) */
@@ -8782,19 +10688,19 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type, name) != 0) return -1;
+            if (upload_weight_matrix_bm(r, &cl->ffn_gate_w, &cl->ffn_gate_w_bm, &t, &cl->ffn_gate_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->ffn_gate_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type, name) != 0) return -1;
+            if (upload_weight_matrix_bm(r, &cl->ffn_up_w, &cl->ffn_up_w_bm, &t, &cl->ffn_up_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->ffn_up_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type, name) != 0) return -1;
+            if (upload_weight_matrix_bm(r, &cl->ffn_down_w, &cl->ffn_down_w_bm, &t, &cl->ffn_down_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->ffn_down_w_f16, &t) != 0) return -1;
         }
 
@@ -11872,20 +13778,11 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
                                     CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
     if (!r->fn_mmq_iq2xxs_grouped || !r->fn_mmq_quant_q8_1) return -1;
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
-    size_t need_q8 = (size_t)n_tokens * in_dim;               /* int8 bytes */
-    if (r->d_mmqd_cap < need_q8) {
-        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
-        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
-        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
-        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
-        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {   /* rows*K/32*4 = need_q8/8 */
-            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
-        r->d_mmqd_cap = need_q8;
-    }
-    /* TG=8 prefill variant groups 64 tokens/block (halves weight re-reads vs the
-       decode-tuned TG=4); fall back to grouped (TG=4, 32-token groups) if absent. */
-    int use8 = (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use8 ? 128 : 32;   /* grouped8 uses TG=16 -> 128 tokens/block */
+    /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
+    int use_fused = (r->fn_mmq_iq2xxs_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
+    int use32_fallback = !use_fused && (r->fn_mmq_iq2xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use8 = !use32_fallback && (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
@@ -11894,20 +13791,285 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
         int eb[2] = { 0, n_tokens };
         cuMemcpyHtoD(r->d_mmqd_eb, eb, 2*sizeof(int));
         int *wl = (int *)alloca((size_t)n_work*sizeof(int));
-        for (int g = 0; g < n_work; g++) wl[g] = g;   /* (e=0 << 16) | g */
+        for (int g = 0; g < n_work; g++) wl[g] = g;
         cuMemcpyHtoD(r->d_mmqd_wl, wl, (size_t)n_work*sizeof(int));
         r->d_mmqd_wl_ntok = n_tokens;
     }
     int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
-    /* 1. quantize activation [n_tokens x in_dim] -> q8_1 (cxq8 int8 + cxs scales) */
+    if (use_fused) {
+        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+        cuLaunchKernel(r->fn_mmq_iq2xxs_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
+        return 0;
+    }
+    size_t need_q8 = (size_t)n_tokens * in_dim;
+    if (r->d_mmqd_cap < need_q8) {
+        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
+        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
+        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
+        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
+        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {
+            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
+        r->d_mmqd_cap = need_q8;
+    }
     { int tr = n_tokens, kk = in_dim;
       void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
-      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/32, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
-    /* 2. int8 tensor-core MMQ: out[token x out_dim] = W(IQ2_XXS row-major) x q8_1 act.
-       bm=0: the on-the-fly block-major repack was tried and is slower (its strided read
-       + extra launch outweigh the coalescing gain at TG>=8). */
-    { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
-      CUfunction mmqfn = use8 ? r->fn_mmq_iq2xxs_grouped8 : r->fn_mmq_iq2xxs_grouped;
+      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq2xxs_grouped32 : (use8 ? r->fn_mmq_iq2xxs_grouped8 : r->fn_mmq_iq2xxs_grouped);
+      void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+      cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
+    return 0;
+}
+
+/* Dense IQ3_XXS prefill via the validated MMQ int8 tensor-core kernel.
+ * Same API and worklist convention as launch_mmq_iq2xxs_dense (IQ3_XXS variant). */
+static int launch_mmq_iq3xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                    CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
+    if (!r->fn_mmq_iq3xxs_grouped || !r->fn_mmq_quant_q8_1) return -1;
+    if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
+    /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
+    int use_fused = (r->fn_mmq_iq3xxs_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
+    int use32_fallback = !use_fused && (r->fn_mmq_iq3xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use8 = !use32_fallback && (r->fn_mmq_iq3xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    if (r->d_mmqd_wl_ntok != n_tokens) {
+        int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+        if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
+        if (r->d_mmqd_wl) { cuMemFree(r->d_mmqd_wl); r->d_mmqd_wl = 0; }
+        if (cuMemAlloc(&r->d_mmqd_wl, (size_t)n_work*sizeof(int)) != CUDA_SUCCESS) return -1;
+        int eb[2] = { 0, n_tokens };
+        cuMemcpyHtoD(r->d_mmqd_eb, eb, 2*sizeof(int));
+        int *wl = (int *)alloca((size_t)n_work*sizeof(int));
+        for (int g = 0; g < n_work; g++) wl[g] = g;
+        cuMemcpyHtoD(r->d_mmqd_wl, wl, (size_t)n_work*sizeof(int));
+        r->d_mmqd_wl_ntok = n_tokens;
+    }
+    int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+    if (use_fused) {
+        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+        cuLaunchKernel(r->fn_mmq_iq3xxs_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
+        return 0;
+    }
+    size_t need_q8 = (size_t)n_tokens * in_dim;
+    if (r->d_mmqd_cap < need_q8) {
+        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
+        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
+        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
+        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
+        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {
+            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
+        r->d_mmqd_cap = need_q8;
+    }
+    { int tr = n_tokens, kk = in_dim;
+      void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
+      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq3xxs_grouped32 : (use8 ? r->fn_mmq_iq3xxs_grouped8 : r->fn_mmq_iq3xxs_grouped);
+      void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+      cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
+    return 0;
+}
+
+/* Dense Q2_K prefill via the validated MMQ int8 tensor-core kernel.
+ * 2-MMA approach: weight = d*dl*qs_val - dmin*ml.
+ * Same API and worklist convention as launch_mmq_iq2xxs_dense. */
+static int launch_mmq_q2_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                  CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
+    if (!r->fn_mmq_q2_K_grouped || !r->fn_mmq_quant_q8_1) return -1;
+    if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
+    /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
+    int use_fused = (r->fn_mmq_q2_K_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
+    int use32_fallback = !use_fused && (r->fn_mmq_q2_K_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use8 = !use32_fallback && (r->fn_mmq_q2_K_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    if (r->d_mmqd_wl_ntok != n_tokens) {
+        int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+        if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
+        if (r->d_mmqd_wl) { cuMemFree(r->d_mmqd_wl); r->d_mmqd_wl = 0; }
+        if (cuMemAlloc(&r->d_mmqd_wl, (size_t)n_work*sizeof(int)) != CUDA_SUCCESS) return -1;
+        int eb[2] = { 0, n_tokens };
+        cuMemcpyHtoD(r->d_mmqd_eb, eb, 2*sizeof(int));
+        int *wl = (int *)alloca((size_t)n_work*sizeof(int));
+        for (int g = 0; g < n_work; g++) wl[g] = g;
+        cuMemcpyHtoD(r->d_mmqd_wl, wl, (size_t)n_work*sizeof(int));
+        r->d_mmqd_wl_ntok = n_tokens;
+    }
+    int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+    if (use_fused) {
+        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+        cuLaunchKernel(r->fn_mmq_q2_K_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
+        return 0;
+    }
+    size_t need_q8 = (size_t)n_tokens * in_dim;
+    if (r->d_mmqd_cap < need_q8) {
+        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
+        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
+        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
+        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
+        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {
+            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
+        r->d_mmqd_cap = need_q8;
+    }
+    { int tr = n_tokens, kk = in_dim;
+      void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
+      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32_fallback ? r->fn_mmq_q2_K_grouped32 : (use8 ? r->fn_mmq_q2_K_grouped8 : r->fn_mmq_q2_K_grouped);
+      void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+      cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
+    return 0;
+}
+
+/* Dense Q3_K prefill via the int8 tensor-core MMQ (2 x m16n8k16 per sub-block).
+ * Same API and worklist convention as launch_mmq_iq2xxs_dense. */
+static int launch_mmq_q3_K_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                  CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
+    if (!r->fn_mmq_q3_K_grouped || !r->fn_mmq_quant_q8_1) return -1;
+    if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
+    /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
+    int use_fused = (r->fn_mmq_q3_K_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
+    int use32_fallback = !use_fused && (r->fn_mmq_q3_K_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use8 = !use32_fallback && (r->fn_mmq_q3_K_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    if (r->d_mmqd_wl_ntok != n_tokens) {
+        int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+        if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
+        if (r->d_mmqd_wl) { cuMemFree(r->d_mmqd_wl); r->d_mmqd_wl = 0; }
+        if (cuMemAlloc(&r->d_mmqd_wl, (size_t)n_work*sizeof(int)) != CUDA_SUCCESS) return -1;
+        int eb[2] = { 0, n_tokens };
+        cuMemcpyHtoD(r->d_mmqd_eb, eb, 2*sizeof(int));
+        int *wl = (int *)alloca((size_t)n_work*sizeof(int));
+        for (int g = 0; g < n_work; g++) wl[g] = g;
+        cuMemcpyHtoD(r->d_mmqd_wl, wl, (size_t)n_work*sizeof(int));
+        r->d_mmqd_wl_ntok = n_tokens;
+    }
+    int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+    if (use_fused) {
+        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+        cuLaunchKernel(r->fn_mmq_q3_K_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
+        return 0;
+    }
+    size_t need_q8 = (size_t)n_tokens * in_dim;
+    if (r->d_mmqd_cap < need_q8) {
+        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
+        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
+        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
+        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
+        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {
+            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
+        r->d_mmqd_cap = need_q8;
+    }
+    { int tr = n_tokens, kk = in_dim;
+      void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
+      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32_fallback ? r->fn_mmq_q3_K_grouped32 : (use8 ? r->fn_mmq_q3_K_grouped8 : r->fn_mmq_q3_K_grouped);
+      void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+      cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
+    return 0;
+}
+
+/* Dense IQ3_S prefill via the validated MMQ int8 tensor-core kernel.
+ * Same API and worklist convention as launch_mmq_iq2xxs_dense (IQ3_S variant). */
+static int launch_mmq_iq3_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                    CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
+    if (!r->fn_mmq_iq3_s_grouped || !r->fn_mmq_quant_q8_1) return -1;
+    if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
+    /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly,
+       eliminating the separate mmq_quant_q8_1 launch and global memory round-trip. */
+    int use_fused = (r->fn_mmq_iq3_s_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
+    int use32_fallback = !use_fused && (r->fn_mmq_iq3_s_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use8 = !use32_fallback && (r->fn_mmq_iq3_s_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    if (r->d_mmqd_wl_ntok != n_tokens) {
+        int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+        if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
+        if (r->d_mmqd_wl) { cuMemFree(r->d_mmqd_wl); r->d_mmqd_wl = 0; }
+        if (cuMemAlloc(&r->d_mmqd_wl, (size_t)n_work*sizeof(int)) != CUDA_SUCCESS) return -1;
+        int eb[2] = { 0, n_tokens };
+        cuMemcpyHtoD(r->d_mmqd_eb, eb, 2*sizeof(int));
+        int *wl = (int *)alloca((size_t)n_work*sizeof(int));
+        for (int g = 0; g < n_work; g++) wl[g] = g;
+        cuMemcpyHtoD(r->d_mmqd_wl, wl, (size_t)n_work*sizeof(int));
+        r->d_mmqd_wl_ntok = n_tokens;
+    }
+    int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+    if (use_fused) {
+        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+        cuLaunchKernel(r->fn_mmq_iq3_s_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
+        return 0;
+    }
+    size_t need_q8 = (size_t)n_tokens * in_dim;
+    if (r->d_mmqd_cap < need_q8) {
+        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
+        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
+        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
+        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
+        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {
+            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
+        r->d_mmqd_cap = need_q8;
+    }
+    { int tr = n_tokens, kk = in_dim;
+      void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
+      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq3_s_grouped32 : (use8 ? r->fn_mmq_iq3_s_grouped8 : r->fn_mmq_iq3_s_grouped);
+      void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+      cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
+    return 0;
+}
+
+/* Dense IQ2_S prefill via the validated MMQ int8 tensor-core kernel.
+ * 2-MMA approach (m16n8k16 x 2 per sub-block).
+ * Same API and worklist convention as launch_mmq_iq2xxs_dense. */
+static int launch_mmq_iq2_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                    CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
+    if (!r->fn_mmq_iq2_s_grouped || !r->fn_mmq_quant_q8_1) return -1;
+    if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
+    /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
+    int use_fused = (r->fn_mmq_iq2_s_fused32 != 0) && !getenv("CUDA_LLM_NO_MMQ_FUSED");
+    int use32_fallback = !use_fused && (r->fn_mmq_iq2_s_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
+    int use8 = !use32_fallback && (r->fn_mmq_iq2_s_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+    int grp = use_fused ? 256 : (use32_fallback ? 256 : (use8 ? 128 : 32));
+    if (r->d_mmqd_wl_ntok != n_tokens) {
+        int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+        if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
+        if (r->d_mmqd_wl) { cuMemFree(r->d_mmqd_wl); r->d_mmqd_wl = 0; }
+        if (cuMemAlloc(&r->d_mmqd_wl, (size_t)n_work*sizeof(int)) != CUDA_SUCCESS) return -1;
+        int eb[2] = { 0, n_tokens };
+        cuMemcpyHtoD(r->d_mmqd_eb, eb, 2*sizeof(int));
+        int *wl = (int *)alloca((size_t)n_work*sizeof(int));
+        for (int g = 0; g < n_work; g++) wl[g] = g;
+        cuMemcpyHtoD(r->d_mmqd_wl, wl, (size_t)n_work*sizeof(int));
+        r->d_mmqd_wl_ntok = n_tokens;
+    }
+    int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
+    if (use_fused) {
+        unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+        void *a[] = { &dst, &mat, &st, &input, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
+        cuLaunchKernel(r->fn_mmq_iq2_s_fused32, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL);
+        return 0;
+    }
+    size_t need_q8 = (size_t)n_tokens * in_dim;
+    if (r->d_mmqd_cap < need_q8) {
+        if (r->d_mmqd_cxq8) cuMemFree(r->d_mmqd_cxq8);
+        if (r->d_mmqd_cxs)  cuMemFree(r->d_mmqd_cxs);
+        r->d_mmqd_cxq8 = 0; r->d_mmqd_cxs = 0; r->d_mmqd_cap = 0;
+        if (cuMemAlloc(&r->d_mmqd_cxq8, need_q8) != CUDA_SUCCESS) return -1;
+        if (cuMemAlloc(&r->d_mmqd_cxs, need_q8/8) != CUDA_SUCCESS) {
+            cuMemFree(r->d_mmqd_cxq8); r->d_mmqd_cxq8 = 0; return -1; }
+        r->d_mmqd_cap = need_q8;
+    }
+    { int tr = n_tokens, kk = in_dim;
+      void *a[] = { &input, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &tr, &kk };
+      cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+    { unsigned long long st = 0; int bm = r->dense_bm ? 1 : 0, nN = out_dim, nK = in_dim;
+      CUfunction mmqfn = use32_fallback ? r->fn_mmq_iq2_s_grouped32 : (use8 ? r->fn_mmq_iq2_s_grouped8 : r->fn_mmq_iq2_s_grouped);
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
       cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
     return 0;
@@ -11916,14 +14078,8 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
-    if (n_tokens == 1) {
-        (void)mat_f16;
-        launch_matvec_auto(r, dst, mat, input, out_dim, in_dim, weight_type);
-        return;
-    }
-
-    /* cuBLAS path: use F16 shadow + Tensor Core GEMM when available */
-    if (r->use_cublas && mat_f16 && r->cublas) {
+    /* cuBLAS path: use F16 shadow + Tensor Core GEMM when available (batched only). */
+    if (n_tokens > 1 && r->use_cublas && mat_f16 && r->cublas) {
         /* Convert F32 input to F16 (required for Blackwell Tensor Core GEMM) */
         int n_elems = n_tokens * in_dim;
         CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
@@ -11975,14 +14131,20 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
             cuLaunchKernel(r->fn_batch_matvec_q8_0_f32, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
         }
     } else if (weight_type == GGML_TYPE_Q2_K) {
-        /* Dequant Q2_K -> F16 (once) + cuBLAS F16 GEMM, like IQ2_XXS. */
-        if (n_tokens > 1) {
-            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
-                return;
-        }
+        /* Prefer the int8 tensor-core MMQ for all batch sizes.
+           CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
+        if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+            launch_mmq_q2_K_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+            return;
+        if (n_tokens > 1 && launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+            return;
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q2_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q3_K) {
+        /* Prefer the int8 tensor-core MMQ for all batch sizes. */
+        if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+            launch_mmq_q3_K_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+            return;
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q3_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_F16) {
@@ -11999,47 +14161,43 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_XXS) {
-        /* Dequant IQ2_XXS -> F16 (once) + cuBLAS F16 tensor-core GEMM, like Q4_0.
-         * The codebook decode is expensive; doing it once per weight (not per
-         * token) + a tensor-core GEMM is far faster than the per-token SIMT
-         * batch_matvec below. >256 MB guard skips the lm_head (which is Q3_K
-         * here anyway); fits the largest 31B ffn weight (21504x5376 = 220 MB). */
-        if (n_tokens > 1) {
-            /* Prefer the int8 tensor-core MMQ (reads 2-bit weight once, no F16
-               materialization); CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
-            if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
-                launch_mmq_iq2xxs_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
-                return;
-            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
-                return;
-        }
+        /* Prefer the int8 tensor-core MMQ for all batch sizes.
+           CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
+        if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+            launch_mmq_iq2xxs_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+            return;
+        if (n_tokens > 1 && launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+            return;
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq2_xxs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_XS) {
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq2_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_S) {
-        /* Dequant IQ2_S -> F16 (once) + cuBLAS F16 tensor-core GEMM, like IQ2_XXS. */
-        if (n_tokens > 1) {
-            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
-                return;
-        }
+        /* Prefer the int8 tensor-core MMQ for all batch sizes. */
+        if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+            launch_mmq_iq2_s_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+            return;
+        if (n_tokens > 1 && launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+            return;
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq2_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ3_XXS) {
-        /* Dequant IQ3_XXS -> F16 (once) + cuBLAS F16 GEMM, like IQ2_XXS. */
-        if (n_tokens > 1) {
-            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
-                return;
-        }
+        /* Prefer the int8 tensor-core MMQ for all batch sizes. */
+        if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+            launch_mmq_iq3xxs_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+            return;
+        if (n_tokens > 1 && launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+            return;
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq3_xxs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ3_S) {
-        /* Dequant IQ3_S -> F16 (once) + cuBLAS F16 GEMM, like IQ2_XXS. */
-        if (n_tokens > 1) {
-            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
-                return;
-        }
+        /* Prefer the int8 tensor-core MMQ for all batch sizes. */
+        if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+            launch_mmq_iq3_s_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+            return;
+        if (n_tokens > 1 && launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+            return;
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq3_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ4_NL) {
@@ -12862,6 +15020,10 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                         int total = offs[r->n_experts];           /* compacted (token,expert) rows */
                         int ef = r->expert_ff;
                         int maxcol = n_embd > ef ? n_embd : ef;
+                        /* Prefer larger token group size for better amortization. */
+                        int use32 = (r->fn_mmq_iq2xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG16") && !getenv("CUDA_LLM_MMQ_TG4");
+                        int use16 = !use32 && (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
+                        int grp = use32 ? 256 : (use16 ? 128 : 32);
                         if (r->d_mmq_alloc_rows < total) {
                             if (r->d_mmq_cxq8) { cuMemFree(r->d_mmq_cxq8); cuMemFree(r->d_mmq_cxs);
                                 cuMemFree(r->d_mmq_outg); cuMemFree(r->d_mmq_outu); cuMemFree(r->d_mmq_outd); }
@@ -12876,18 +15038,17 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                             }
                             if (!r->d_mmq_ebounds) cuMemAlloc(&r->d_mmq_ebounds, (size_t)(r->n_experts + 1) * sizeof(int));
                             if (r->d_mmq_worklist) { cuMemFree(r->d_mmq_worklist); r->d_mmq_worklist = 0; }
-                            /* n_work = sum_e ceil(ec[e]/32) <= n_experts + total/32 */
-                            cuMemAlloc(&r->d_mmq_worklist, (size_t)(r->n_experts + total / 32 + 8) * sizeof(int));
+                            cuMemAlloc(&r->d_mmq_worklist, (size_t)(r->n_experts + total / grp + 8) * sizeof(int));
                             r->d_mmq_alloc_rows = total;
                         }
                         cuMemcpyHtoD(r->d_mmq_ebounds, offs, (size_t)(r->n_experts + 1) * sizeof(int));
                         int maxtok = 0; for (int e = 0; e < r->n_experts; e++) if (ec[e] > maxtok) maxtok = ec[e];
-                        /* flattened work-list: one entry per real (expert,group) pair (group = 32 tokens) */
+                        /* flattened work-list: one entry per real (expert,group) pair */
                         int n_work = 0;
-                        { int *wl = (int *)alloca((size_t)(r->n_experts + total / 32 + 8) * sizeof(int));
-                          for (int e = 0; e < r->n_experts; e++) { int ng = (ec[e] + 31) / 32;
+                        { int *wl = (int *)alloca((size_t)(r->n_experts + total / grp + 8) * sizeof(int));
+                          for (int e = 0; e < r->n_experts; e++) { int ng = (ec[e] + grp - 1) / grp;
                               for (int g = 0; g < ng; g++) wl[n_work++] = (e << 16) | g; }
-                          if (n_work == 0) wl[n_work++] = 0;  /* avoid 0-block launch */
+                          if (n_work == 0) wl[n_work++] = 0;
                           cuMemcpyHtoD(r->d_mmq_worklist, wl, (size_t)n_work * sizeof(int)); }
                         if (getenv("CUDA_LLM_MOE_DUMP_DIST")) {
                             static int dumped = 0;
@@ -12905,24 +15066,25 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                         /* 1. gather d_batch_xb rows by ids_token (=etok in d_topk_idx) + quant to q8_1 */
                         { int tr = total, kk = n_embd;
                           void *a[] = { &d_batch_xb, &r->d_topk_idx, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
-                          cuLaunchKernel(r->fn_mmq_gather_quant_q8_1, n_embd / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+                          cuLaunchKernel(r->fn_mmq_gather_quant_q8_1, n_embd / 256, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 2. grouped gate + up: out[total][ef] */
                         int bm = r->moe_iq2_bm;
+                        CUfunction mmqfn = use32 ? r->fn_mmq_iq2xxs_grouped32 : (use16 ? r->fn_mmq_iq2xxs_grouped8 : r->fn_mmq_iq2xxs_grouped);
                         { unsigned long long st = cl->moe_exp_stride_gu; int nN = ef, nK = n_embd;
                           void *ag[] = { &r->d_mmq_outg, &cl->moe_gate_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, ag, NULL);
+                          cuLaunchKernel(mmqfn, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, ag, NULL);
                           void *au[] = { &r->d_mmq_outu, &cl->moe_up_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, au, NULL); }
+                          cuLaunchKernel(mmqfn, ef / 64, n_work, 1, 128, 1, 1, 0, r->stream, au, NULL); }
                         /* 3. silu: outg = silu(outg) * outu */
                         launch_silu_mul(r, r->d_mmq_outg, r->d_mmq_outu, total * ef);
                         /* 4. quantize silu result (ef cols) into cxq8 for the down matmul */
                         { int tr = total, kk = ef;
                           void *a[] = { &r->d_mmq_outg, &r->d_mmq_cxq8, &r->d_mmq_cxs, &tr, &kk };
-                          cuLaunchKernel(r->fn_mmq_quant_q8_1, ef / 32, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
+                          cuLaunchKernel(r->fn_mmq_quant_q8_1, ef / 256, total, 1, 32, 1, 1, 0, r->stream, a, NULL); }
                         /* 5. grouped down: out[total][n_embd] */
                         { unsigned long long st = cl->moe_exp_stride_d; int nN = n_embd, nK = ef;
                           void *ad[] = { &r->d_mmq_outd, &cl->moe_down_exps_w, &st, &r->d_mmq_cxq8, &r->d_mmq_cxs, &r->d_mmq_ebounds, &r->d_mmq_worklist, &bm, &nN, &nK };
-                          cuLaunchKernel(r->fn_mmq_iq2xxs_grouped, n_embd / 64, n_work, 1, 128, 1, 1, 0, r->stream, ad, NULL); }
+                          cuLaunchKernel(mmqfn, n_embd / 64, n_work, 1, 128, 1, 1, 0, r->stream, ad, NULL); }
                         /* 6. weighted scatter into d_batch_x (ids_token=etok, weights=etw) */
                         { int tr = total, nN = n_embd;
                           void *a[] = { &d_batch_x, &r->d_mmq_outd, &r->d_topk_idx, &r->d_topk_wgt, &tr, &nN };
