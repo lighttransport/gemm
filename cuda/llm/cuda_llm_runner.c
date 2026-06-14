@@ -4688,32 +4688,31 @@ static const char *cuda_kernel_source =
 "/* Writes rows_per_expert x n_cols F16 values to dst */\n"
 "__global__ void dequant_iq2_xxs_to_f16(half_raw *dst, const unsigned char *mat,\n"
 "                                         int rows, int cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
-"    if (row >= rows) return;\n"
+"    /* one thread per 32-element sub-block (ib32); coalesced F16 writes */\n"
+"    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int units_per_row = cols >> 5;            /* (cols/256)*8 = cols/32 */\n"
+"    long long total = (long long)rows * units_per_row;\n"
+"    if (tid >= total) return;\n"
+"    int row = (int)(tid / units_per_row);\n"
+"    int u = (int)(tid - (long long)row * units_per_row);\n"
+"    int b = u >> 3;        /* which 256-element block */\n"
+"    int ib32 = u & 7;      /* sub-block within it */\n"
 "    int nb = cols / 256;\n"
 "    int row_bytes = nb * 66;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
-"    half_raw *dst_row = dst + (size_t)row * cols;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
-"        const unsigned char *bp = row_ptr + b * 66;\n"
-"        float d = half_to_float(*(const half_raw *)bp);\n"
-"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
-"        half_raw *d_b = dst_row + b * 256;\n"
-"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
-"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
-"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
-"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
-"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
-"            for (int l = 0; l < 4; l++) {\n"
-"                unsigned long long gv = iq2xxs_grid_dev[aux8[l]];\n"
-"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
-"                for (int j = 0; j < 8; j++) {\n"
-"                    float w = db * (float)(unsigned char)(gv >> (8*j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
-"                    d_b[ib32 * 32 + l * 8 + j] = float_to_half(w);\n"
-"                }\n"
-"            }\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + (size_t)b * 66;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"    unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"    unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"    float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"    const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"    half_raw *d_b = dst + (size_t)row * cols + (size_t)b * 256 + ib32 * 32;\n"
+"    for (int l = 0; l < 4; l++) {\n"
+"        unsigned long long gv = iq2xxs_grid_dev[aux8[l]];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"        for (int j = 0; j < 8; j++) {\n"
+"            float w = db * (float)(unsigned char)(gv >> (8*j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"            d_b[l * 8 + j] = float_to_half(w);\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -11750,8 +11749,8 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
         dq_block = 256; dq_grid = (int)(((size_t)out_dim * in_dim + 255) / 256); dq_fn = r->fn_dequant_q4_0_to_f16;
     } else if (weight_type == GGML_TYPE_IQ2_XXS) {
         if (!r->fn_dequant_iq2_xxs_to_f16) return -1;
-        /* 8 warps/block, one warp per row (kernel computes nb=cols/256 internally) */
-        dq_block = 256; dq_grid = (out_dim + 7) / 8; dq_fn = r->fn_dequant_iq2_xxs_to_f16;
+        /* one thread per 32-elem sub-block (coalesced); grid over rows*cols/32 */
+        dq_block = 256; dq_grid = (int)(((size_t)out_dim * in_dim / 32 + 255) / 256); dq_fn = r->fn_dequant_iq2_xxs_to_f16;
     } else if (weight_type == GGML_TYPE_IQ3_XXS) {
         if (!r->fn_dequant_iq3_xxs_to_f16) return -1;
         dq_block = 256; dq_grid = (out_dim + 7) / 8; dq_fn = r->fn_dequant_iq3_xxs_to_f16;
@@ -11761,6 +11760,9 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     } else if (weight_type == GGML_TYPE_IQ3_S) {
         if (!r->fn_dequant_iq3_s_to_f16) return -1;
         dq_block = 256; dq_grid = (out_dim + 7) / 8; dq_fn = r->fn_dequant_iq3_s_to_f16;
+    } else if (weight_type == GGML_TYPE_IQ2_S) {
+        if (!r->fn_dequant_iq2_s_to_f16) return -1;
+        dq_block = 256; dq_grid = (out_dim + 7) / 8; dq_fn = r->fn_dequant_iq2_s_to_f16;
     } else return -1;
 
     size_t w_f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
@@ -11866,6 +11868,16 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_q3_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_F16) {
+        /* F16 weight is already F16: convert input -> F16 + cuBLAS tensor-core GEMM. */
+        if (n_tokens > 1 && r->cublas && r->d_batch_f16_scratch && r->fn_convert_f32_to_f16) {
+            int n_elems = n_tokens * in_dim;
+            CUdeviceptr d_x_f16 = r->d_batch_f16_scratch;
+            void *cv[] = { &d_x_f16, &input, &n_elems };
+            cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems+255)/256, 1, 1, 256, 1, 1, 0, r->stream, cv, NULL);
+            if (cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, mat, d_x_f16,
+                                                      n_tokens, out_dim, in_dim) == 0)
+                return;
+        }
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_XXS) {
@@ -11884,24 +11896,13 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq2_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_S) {
-        /* Dequant + F16 batch matvec: dequantize weights once, reuse for all tokens */
-        size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
-        CUdeviceptr d_f16 = 0;
-        CUresult err = cuMemAlloc(&d_f16, f16_bytes);
-        if (err != CUDA_SUCCESS) {
-            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-            cuLaunchKernel(r->fn_batch_matvec_iq2_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
-        } else {
-            {
-                void *args[] = { &d_f16, &mat, &out_dim, &in_dim };
-                cuLaunchKernel(r->fn_dequant_iq2_s_to_f16, (out_dim+7)/8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-            }
-            {
-                void *a[] = { &dst, &d_f16, &input, &out_dim, &in_dim, &n_tokens };
-                cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
-            }
-            cuMemFree(d_f16);
+        /* Dequant IQ2_S -> F16 (once) + cuBLAS F16 tensor-core GEMM, like IQ2_XXS. */
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
         }
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_iq2_s, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ3_XXS) {
         /* Dequant IQ3_XXS -> F16 (once) + cuBLAS F16 GEMM, like IQ2_XXS. */
         if (n_tokens > 1) {
