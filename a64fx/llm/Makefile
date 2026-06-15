@@ -102,9 +102,13 @@ DS4F_DECBW_SRC := $(LLM_DIR)ds4f_decode_bw_bench.c
 # header deps: ds4f.h / ggml_dequant.h are not in the .c prereqs, so editing them
 # would otherwise leave the binaries stale (a no-op `make`). Track them explicitly.
 DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ds4f_impl.h $(LLM_DIR)../../common/ggml_dequant.h
+# MiniMax-M3 (text) synthetic EP runner (a64fx/m3). Self-contained: common/m3.h +
+# m3_impl.h + uTofu. Links libtofucom; no vlm objs.
+M3_EP_SRC := $(LLM_DIR)../m3/m3_ep_runner.c
+M3_HDRS   := $(COMMON)/m3.h $(COMMON)/m3_impl.h $(COMMON)/ggml_dequant.h
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw
+.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw m3_ep_runner
 
 all: $(BUILD)/llm_runner
 
@@ -154,6 +158,19 @@ $(BUILD)/ds4f_runner: $(DS4F_SRC) $(DS4F_HDRS) | $(BUILD)
 ds4f_ep_runner: $(BUILD)/ds4f_ep_runner
 $(BUILD)/ds4f_ep_runner: $(DS4F_EP_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_EP_SRC) $(LDFLAGS) -ltofucom
+
+# MiniMax-M3 multinode EP harness (synthetic; GQA + sigmoid-MoE + SwiGLU-OAI).
+m3_ep_runner: $(BUILD)/m3_ep_runner
+$(BUILD)/m3_ep_runner: $(M3_EP_SRC) $(M3_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(M3_EP_SRC) $(LDFLAGS) -ltofucom
+
+# M3 weight stager (safetensors -> per-rank /local blob) and single-node real-weight test.
+m3_stage: $(BUILD)/m3_stage
+$(BUILD)/m3_stage: $(COMMON)/m3_stage.c $(COMMON)/safetensors.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(COMMON)/m3_stage.c $(LDFLAGS)
+m3_real_test: $(BUILD)/m3_real_test
+$(BUILD)/m3_real_test: $(LLM_DIR)../m3/m3_real_test.c $(M3_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)../m3/m3_real_test.c $(LDFLAGS)
 
 # DeepSeek-V4-Flash single-node decode-bandwidth bench (no MPI, no vlm objs, no
 # model alloc). Reproduces the M=1 cold-HBM decode regime through the production
