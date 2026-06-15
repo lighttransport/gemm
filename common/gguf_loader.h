@@ -141,31 +141,25 @@ typedef struct {
     size_t map_size;
     int fd;
 #endif
-    /* Multi-file (split) GGUF support. When n_files > 1, tensor i lives in
-     * segment tensor_seg[i]; its data pointer is seg_data[seg] + offset.
-     * For single-file GGUF, n_files==0 and tensor_seg==NULL (legacy path). */
-    int       n_files;
-    int      *tensor_seg;          /* [n_tensors], NULL when single-file       */
-    uint8_t  *seg_data[16];        /* per-segment data base (map_base+data_off) */
-    void     *seg_map_base[16];    /* per-segment mmap base (for munmap)        */
-    size_t    seg_map_size[16];
-    int       seg_fd[16];
-    size_t    seg_data_size[16];   /* per-segment tensor-data span (bounds)     */
 } gguf_context;
 
 gguf_context *gguf_open(const char *path, int use_mmap);
-/* Open a (possibly split) GGUF given any one shard path containing the
- * "-NNNNN-of-MMMMM.gguf" suffix; opens all M shards and merges their tensor
- * indices into one context. Falls back to gguf_open() for non-split paths.
- * KV metadata is taken from shard 1. */
-gguf_context *gguf_open_multi(const char *path, int use_mmap);
 void gguf_close(gguf_context *ctx);
-int gguf_find_key(const gguf_context *ctx, const char *key);
 const char *gguf_tensor_name(const gguf_context *ctx, int i);
 void *gguf_tensor_data(const gguf_context *ctx, int i);
 size_t gguf_tensor_size(const gguf_context *ctx, int i);
-const char *gguf_type_name(uint32_t type);
-const char *ggml_type_name(uint32_t type);
+static const char *gguf_type_name(uint32_t type);
+static const char *ggml_type_name(uint32_t type);
+/* Rename gguf_find_key to avoid symbol conflict with libggml-base (llama.cpp).
+ * Must appear before any function definition that calls gguf_find_key. */
+#define gguf_find_key gguf_find_key_internal
+static int gguf_find_key_internal(const gguf_context *ctx, const char *key) {
+    for (uint64_t i = 0; i < ctx->n_kv; i++) {
+        if (ctx->kv[i].key.str && strcmp(ctx->kv[i].key.str, key) == 0)
+            return (int)i;
+    }
+    return -1;
+}
 
 #ifdef __cplusplus
 }
@@ -228,7 +222,7 @@ static const struct { int block_size; int type_size; } ggml_type_info[] = {
     [GGML_TYPE_Q1_0]    = {128, 18},
 };
 
-const char *gguf_type_name(uint32_t type) {
+static const char *gguf_type_name(uint32_t type) {
     static const char *names[] = {
         "uint8","int8","uint16","int16","uint32","int32","float32",
         "bool","string","array","uint64","int64","float64"
@@ -237,7 +231,7 @@ const char *gguf_type_name(uint32_t type) {
     return "unknown";
 }
 
-const char *ggml_type_name(uint32_t type) {
+static const char *ggml_type_name(uint32_t type) {
     static const char *names[GGML_TYPE_COUNT] = {
         [GGML_TYPE_F32] = "F32", [GGML_TYPE_F16] = "F16",
         [GGML_TYPE_Q4_0] = "Q4_0", [GGML_TYPE_Q4_1] = "Q4_1",
@@ -449,11 +443,7 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->map_size = (size_t)st.st_size;
         {
             int flags = MAP_PRIVATE;
-            /* GGUF_LAZY_MMAP: skip MAP_POPULATE so pages fault in on first
-             * touch only. Required for pipeline-parallel loading where each
-             * node touches just its layer range (~1/N of a 50GB file). */
-            if (!getenv("NUMA_DISTRIBUTE") && !getenv("GGUF_LAZY_MMAP"))
-                flags |= MAP_POPULATE;
+            if (!getenv("NUMA_DISTRIBUTE")) flags |= MAP_POPULATE;
             ctx->map_base = mmap(NULL, ctx->map_size, PROT_READ, flags, ctx->fd, 0);
         }
         if (ctx->map_base == MAP_FAILED) { ctx->map_base = NULL; goto fail; }
@@ -494,96 +484,6 @@ fail:
     return NULL;
 }
 
-/* Open a (possibly split) GGUF. If `path` matches the llama.cpp split naming
- * "<prefix>-NNNNN-of-MMMMM.gguf", all MMMMM shards are opened and merged into a
- * single context: KV metadata is taken from shard 1, and the tensor index is the
- * concatenation of every shard's tensors with per-tensor `tensor_seg[]` recording
- * which shard's data segment each tensor lives in. Otherwise falls back to a plain
- * gguf_open(). Honors GGUF_LAZY_MMAP via gguf_open(). */
-gguf_context *gguf_open_multi(const char *path, int use_mmap) {
-    /* Locate the "-of-" marker and the "-NNNNN" shard-index field before it. */
-    const char *of = strstr(path, "-of-");
-    if (!of) return gguf_open(path, use_mmap);
-    int total = atoi(of + 4);
-    if (total <= 1) return gguf_open(path, use_mmap);
-    if (total > 16) { fprintf(stderr, "gguf: too many shards (%d > 16)\n", total); return NULL; }
-
-    /* Back up over the NNNNN digits preceding "-of-". */
-    const char *ds = of;
-    while (ds > path && ds[-1] >= '0' && ds[-1] <= '9') ds--;
-    if (ds == of || ds == path || ds[-1] != '-')      /* no "-NNNNN" field */
-        return gguf_open(path, use_mmap);
-    int width = (int)(of - ds);                        /* digit width (e.g. 5) */
-    size_t prefix_len = (size_t)((ds - 1) - path);     /* up to '-' before NNNNN */
-
-    /* The tail after MMMMM (e.g. ".gguf"). */
-    const char *tail = of + 4;
-    while (*tail >= '0' && *tail <= '9') tail++;
-
-    gguf_context *seg_ctx[16] = {0};
-    int ntot = 0;
-    for (int s = 0; s < total; s++) {
-        char fp[4096];
-        snprintf(fp, sizeof fp, "%.*s-%0*d-of-%0*d%s",
-                 (int)prefix_len, path, width, s + 1, width, total, tail);
-        gguf_context *c = gguf_open(fp, use_mmap);
-        if (!c) { fprintf(stderr, "gguf: failed to open shard %d/%d: %s\n", s + 1, total, fp); goto multi_fail; }
-        seg_ctx[s] = c;
-        ntot += (int)c->n_tensors;
-    }
-
-    /* Build the merged tensor index, transferring ownership of name strings and
-     * each shard's mmap/alloc to the base context (shard 0). */
-    {
-        gguf_tensor_info *merged = (gguf_tensor_info *)calloc(ntot ? ntot : 1, sizeof(gguf_tensor_info));
-        int *seg = (int *)malloc((ntot ? ntot : 1) * sizeof(int));
-        if (!merged || !seg) { free(merged); free(seg); goto multi_fail; }
-
-        int idx = 0;
-        for (int s = 0; s < total; s++) {
-            gguf_context *c = seg_ctx[s];
-            for (uint64_t i = 0; i < c->n_tensors; i++) {
-                merged[idx] = c->tensors[i];   /* shallow copy incl name.str ptr */
-                seg[idx] = s;
-                idx++;
-            }
-        }
-
-        gguf_context *base = seg_ctx[0];
-        for (int s = 0; s < total; s++) {
-            gguf_context *c = seg_ctx[s];
-            base->seg_data[s]      = c->data;        /* map_base+data_offset, or malloc base */
-            base->seg_data_size[s] = c->data_size;
-            base->seg_map_base[s]  = c->map_base;    /* NULL when !use_mmap */
-            base->seg_map_size[s]  = c->map_size;
-            base->seg_fd[s]        = c->fd;
-        }
-
-        free(base->tensors);                 /* shell only; names transferred to merged */
-        base->tensors    = merged;
-        base->n_tensors  = ntot;
-        base->tensor_seg = seg;
-        base->n_files    = total;
-
-        /* Detach shards 1..total-1: their tensor names + data maps are now owned
-         * by `base`. Free only KV metadata + the tensor-array shell + struct. */
-        for (int s = 1; s < total; s++) {
-            gguf_context *c = seg_ctx[s];
-            if (c->kv) {
-                for (uint64_t i = 0; i < c->n_kv; i++) gguf_free_kv(&c->kv[i]);
-                free(c->kv);
-            }
-            free(c->tensors);   /* shell only */
-            free(c);            /* map/fd/data ownership already moved to base */
-        }
-        return base;
-    }
-
-multi_fail:
-    for (int s = 0; s < total; s++) if (seg_ctx[s]) gguf_close(seg_ctx[s]);
-    return NULL;
-}
-
 void gguf_close(gguf_context *ctx) {
     if (!ctx) return;
     if (ctx->kv) {
@@ -593,22 +493,6 @@ void gguf_close(gguf_context *ctx) {
     if (ctx->tensors) {
         for (uint64_t i = 0; i < ctx->n_tensors; i++) free(ctx->tensors[i].name.str);
         free(ctx->tensors);
-    }
-    /* Multi-file: release the extra shards (seg 0 is ctx->map_base/ctx->data,
-     * freed by the single-file path below). */
-    if (ctx->tensor_seg) {
-        for (int s = 1; s < ctx->n_files; s++) {
-            if (ctx->use_mmap) {
-#ifndef _WIN32
-                if (ctx->seg_map_base[s]) munmap(ctx->seg_map_base[s], ctx->seg_map_size[s]);
-                if (ctx->seg_fd[s] > 0) close(ctx->seg_fd[s]);
-#endif
-            } else {
-                /* non-mmap: seg_data[s] is itself the malloc base */
-                free(ctx->seg_data[s]);
-            }
-        }
-        free(ctx->tensor_seg);
     }
     if (ctx->use_mmap) {
 #ifdef _WIN32
@@ -625,14 +509,6 @@ void gguf_close(gguf_context *ctx) {
     free(ctx);
 }
 
-int gguf_find_key(const gguf_context *ctx, const char *key) {
-    for (uint64_t i = 0; i < ctx->n_kv; i++) {
-        if (ctx->kv[i].key.str && strcmp(ctx->kv[i].key.str, key) == 0)
-            return (int)i;
-    }
-    return -1;
-}
-
 const char *gguf_tensor_name(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
     return ctx->tensors[i].name.str;
@@ -640,16 +516,7 @@ const char *gguf_tensor_name(const gguf_context *ctx, int i) {
 
 void *gguf_tensor_data(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
-    uint64_t offset = ctx->tensors[i].offset;
-    if (ctx->tensor_seg) {                          /* multi-file (split) GGUF */
-        int seg = ctx->tensor_seg[i];
-        if (seg < 0 || seg >= ctx->n_files || !ctx->seg_data[seg]) return NULL;
-        if (offset >= ctx->seg_data_size[seg]) return NULL;
-        return ctx->seg_data[seg] + offset;
-    }
-    if (!ctx->data) return NULL;
-    if (offset >= ctx->data_size) return NULL;  /* bounds check */
-    return ctx->data + offset;
+    return ctx->data + ctx->tensors[i].offset;
 }
 
 size_t gguf_tensor_size(const gguf_context *ctx, int i) {
@@ -667,4 +534,5 @@ size_t gguf_tensor_size(const gguf_context *ctx, int i) {
 }
 
 #endif /* GGUF_LOADER_IMPLEMENTATION */
+
 #endif /* GGUF_LOADER_H */
