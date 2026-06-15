@@ -61,18 +61,6 @@ static inline double m3_sm_next(void){
 static inline void m3_fill_bf16(uint16_t*w,size_t n,float amp){ for(size_t i=0;i<n;i++) w[i]=m3_f2bf((float)((m3_sm_next()*2.0-1.0)*amp)); }
 static inline void m3_fill_f32 (float   *w,size_t n,float amp){ for(size_t i=0;i<n;i++) w[i]=(float)((m3_sm_next()*2.0-1.0)*amp); }
 
-/* y[rows] = W[rows,cols](bf16) . x[cols]. OpenMP over 8-row blocks (disjoint outputs);
- * bit-identical to serial (no reassociation — each output is one independent dot). */
-static inline void m3_mv_bf16(float*restrict y,const uint16_t*W,const float*x,int rows,int cols){
-    int nb=rows/8;
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if(rows>=M3_PAR_MIN)
-#endif
-    for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint16_t*b=W+(size_t)r*cols;
-        matvec_bf16_8row(y+r,b,b+cols,b+2*(size_t)cols,b+3*(size_t)cols,
-                         b+4*(size_t)cols,b+5*(size_t)cols,b+6*(size_t)cols,b+7*(size_t)cols,x,cols); }
-    for(int r=nb*8;r<rows;r++) y[r]=vec_dot_bf16_f32(W+(size_t)r*cols,x,cols);
-}
 static inline void m3_mv_f32(float*restrict y,const float*W,const float*x,int rows,int cols){
     for(int r=0;r<rows;r++){ const float*w=W+(size_t)r*cols; double s=0; for(int i=0;i<cols;i++) s+=(double)w[i]*x[i]; y[r]=(float)s; }
 }
@@ -93,6 +81,104 @@ static inline float m3_swiglu_oai(float gate,float up,float alpha,float lim){
 static inline void m3_rope_head(float*v,const float*cosp,const float*sinp,int rotary_dim){
     int half=rotary_dim/2;
     for(int k=0;k<half;k++){ float c=cosp[k],s=sinp[k],a=v[k],b=v[k+half]; v[k]=a*c-b*s; v[k+half]=a*s+b*c; }
+}
+
+/* ===================== pinned spin pool (EXPERIMENTAL, M3_POOL=1, default OFF) ========
+ * Intent: beat the OpenMP 48-thread cross-CMG fork-join regression with a persistent
+ * pinned spin pool (pin within the job cpuset = cores 12-59 on A64FX; dispatch via an
+ * atomic seq, release/acquire ordering; disjoint row-slices -> bit-identical to serial).
+ * STATUS (2026-06-15): NOT working — node-dependent hangs and no speedup even when it
+ * runs (OpenMP-12 stays the practical best, ~7x). Root cause undiagnosed (instrumentation
+ * hung). Reaching full-48 likely needs NUMA-interleaved weights (each CMG reads local
+ * HBM) + pool-stability work. Default is OpenMP (m3_g_pool stays NULL unless M3_POOL=1). */
+#define M3_POOL_MAXT 64
+struct m3_pool {   /* m3.h forward-declares `typedef struct m3_pool m3_pool;` */
+    void (*fn)(void*,int,int); void *arg; int nthr;
+    pthread_t th[M3_POOL_MAXT]; int core[M3_POOL_MAXT];
+    _Atomic long seq; _Atomic long wdone[M3_POOL_MAXT]; volatile int stop;
+};
+static m3_pool *m3_g_pool=NULL;   /* one model per process; matvecs dispatch here */
+static int m3_pool_dbg=0;
+static _Atomic long m3_dbg_disp=0, m3_dbg_main=0, m3_dbg_wrk=0;
+
+static inline void m3_cpu_relax(void){ __asm__ __volatile__("yield":::"memory"); }
+static void m3_pin(int core){ cpu_set_t s; CPU_ZERO(&s); CPU_SET(core,&s); sched_setaffinity(0,sizeof s,&s); }
+typedef struct { m3_pool *p; int tid; } m3_wctx;
+static void* m3_worker(void *a){
+    m3_wctx *w=a; m3_pool *p=w->p; int tid=w->tid; m3_pin(p->core[tid]); long last=0;
+    if(m3_pool_dbg) fprintf(stderr,"[pool] worker %d started on core %d\n",tid,p->core[tid]);
+    for(;;){
+        while(atomic_load_explicit(&p->seq,memory_order_acquire)==last && !p->stop) m3_cpu_relax();
+        if(p->stop) break; last=atomic_load_explicit(&p->seq,memory_order_acquire);
+        p->fn(p->arg,tid,p->nthr);
+        atomic_store_explicit(&p->wdone[tid],last,memory_order_release);
+    }
+    return NULL;
+}
+static m3_pool* m3_pool_create(int nthr){
+    if(nthr<1)nthr=1; if(nthr>M3_POOL_MAXT)nthr=M3_POOL_MAXT;
+    { const char*e=getenv("M3_POOL_DEBUG"); m3_pool_dbg=(e&&*e)?atoi(e):0; }
+    /* pin within the job's actual cpuset (Fugaku: cores 12-59, not 0-N); cpus[] are
+     * the allowed cores in ascending order -> tid t pins to cpus[t]. On A64FX the 48
+     * compute cores group as 12 per CMG, so ascending order fills CMG0 first. */
+    cpu_set_t allowed; CPU_ZERO(&allowed);
+    int cpus[512], nc=0;
+    if(sched_getaffinity(0,sizeof allowed,&allowed)==0)
+        for(int c=0;c<512 && nc<M3_POOL_MAXT;c++) if(CPU_ISSET(c,&allowed)) cpus[nc++]=c;
+    if(nc<1){ for(int c=0;c<M3_POOL_MAXT;c++) cpus[c]=c; nc=M3_POOL_MAXT; }
+    if(nthr>nc) nthr=nc;
+    m3_pool *p=calloc(1,sizeof *p); p->nthr=nthr; atomic_store(&p->seq,0); p->stop=0;
+    for(int t=0;t<nthr;t++){ p->core[t]=cpus[t]; atomic_store(&p->wdone[t],0); }
+    m3_pin(p->core[0]);
+    for(int t=1;t<nthr;t++){ m3_wctx *w=malloc(sizeof *w); w->p=p; w->tid=t;
+        int rc=pthread_create(&p->th[t],NULL,m3_worker,w);
+        if(m3_pool_dbg) fprintf(stderr,"[pool] create worker %d rc=%d\n",t,rc); }
+    if(m3_pool_dbg) fprintf(stderr,"[pool] created nthr=%d\n",nthr);
+    return p;
+}
+static void m3_pool_run(m3_pool *p, void(*fn)(void*,int,int), void *arg){
+    if(!p || p->nthr<=1){ fn(arg,0,1); return; }
+    if(m3_pool_dbg) atomic_fetch_add_explicit(&m3_dbg_disp,1,memory_order_relaxed);
+    p->fn=fn; p->arg=arg;
+    long s=atomic_load_explicit(&p->seq,memory_order_relaxed)+1;
+    atomic_store_explicit(&p->seq,s,memory_order_release);   /* dispatch (publishes fn/arg) */
+    fn(arg,0,p->nthr);                                       /* main = tid 0 */
+    for(int t=1;t<p->nthr;t++) while(atomic_load_explicit(&p->wdone[t],memory_order_acquire)<s) m3_cpu_relax();
+}
+static void m3_pool_destroy(m3_pool *p){
+    if(!p) return;
+    if(m3_pool_dbg) fprintf(stderr,"[pool] nthr=%d dispatches=%ld main_blocks=%ld worker_blocks=%ld\n",
+                            p->nthr,(long)m3_dbg_disp,(long)m3_dbg_main,(long)m3_dbg_wrk);
+    p->stop=1; atomic_fetch_add(&p->seq,1);
+    for(int t=1;t<p->nthr;t++) pthread_join(p->th[t],NULL);
+    free(p);
+}
+
+/* matvec worker: y[rows] = W[rows,cols](bf16) . x[cols], rows partitioned by 8-blocks */
+typedef struct { float *y; const uint16_t *W; const float *x; int rows, cols; } m3_mvjob;
+static void m3_mv_worker(void *a,int tid,int nthr){
+    m3_mvjob *j=a; int nb=j->rows/8, per=(nb+nthr-1)/nthr, b0=tid*per, b1=b0+per; if(b1>nb)b1=nb;
+    for(int bi=b0;bi<b1;bi++){ int r=bi*8; const uint16_t *b=j->W+(size_t)r*j->cols;
+        matvec_bf16_8row(j->y+r,b,b+j->cols,b+2*(size_t)j->cols,b+3*(size_t)j->cols,
+                         b+4*(size_t)j->cols,b+5*(size_t)j->cols,b+6*(size_t)j->cols,b+7*(size_t)j->cols,j->x,j->cols); }
+    if(tid==0) for(int r=nb*8;r<j->rows;r++) j->y[r]=vec_dot_bf16_f32(j->W+(size_t)r*j->cols,j->x,j->cols);
+    if(m3_pool_dbg) atomic_fetch_add_explicit(tid==0?&m3_dbg_main:&m3_dbg_wrk,(long)(b1-b0),memory_order_relaxed);
+}
+
+/* y[rows] = W[rows,cols](bf16) . x[cols] over 8-row blocks (disjoint outputs -> bit-
+ * identical to serial). Default parallelism is OpenMP (validated ~7x @12 threads = 1 CMG;
+ * the cross-CMG fork-join wall caps it there). The experimental pinned pool (M3_POOL=1)
+ * is selected when m3_g_pool is set. */
+static void m3_mv_bf16(float*restrict y,const uint16_t*W,const float*x,int rows,int cols){
+    if(m3_g_pool && rows>=M3_PAR_MIN){ m3_mvjob j={y,(const uint16_t*)W,x,rows,cols}; m3_pool_run(m3_g_pool,m3_mv_worker,&j); return; }
+    int nb=rows/8;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows>=M3_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint16_t*b=W+(size_t)r*cols;
+        matvec_bf16_8row(y+r,b,b+cols,b+2*(size_t)cols,b+3*(size_t)cols,
+                         b+4*(size_t)cols,b+5*(size_t)cols,b+6*(size_t)cols,b+7*(size_t)cols,x,cols); }
+    for(int r=nb*8;r<rows;r++) y[r]=vec_dot_bf16_f32(W+(size_t)r*cols,x,cols);
 }
 
 /* ===================== arena fit estimate (synth uses malloc) ===================== */
@@ -126,6 +212,7 @@ static size_t m3_arena_size(const m3_config*c,int ep_rank,int ep_size){
 /* ===================== synthetic model ===================== */
 static void m3_free(m3_model*m){
     if(!m) return;
+    if(m->pool){ if(m3_g_pool==m->pool) m3_g_pool=NULL; m3_pool_destroy(m->pool); m->pool=NULL; }
     for(int l=0;l<m->cfg.n_layers;l++){
         m3_layer*L=&m->layers[l];
         free(L->input_norm);free(L->post_norm);
@@ -224,6 +311,7 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
     m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
     m->s_logits=malloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
+    if(m3_envi("M3_POOL",0)) m->pool=m3_g_pool=m3_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
     return m;
     #undef BF
     #undef FZ
@@ -342,6 +430,7 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
     m->s_logits=malloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
+    if(m3_envi("M3_POOL",0)) m->pool=m3_g_pool=m3_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
     return m;
 }
 
@@ -444,18 +533,13 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
                 m3_mv_bf16(m->s_exg,(uint16_t*)L->ex_w1[slot].w,h2,c->moe_inter,H);
                 m3_mv_bf16(m->s_exu,(uint16_t*)L->ex_w3[slot].w,h2,c->moe_inter,H);
                 for(int i=0;i<c->moe_inter;i++) m->s_exg[i]=m3_swiglu_oai(m->s_exg[i],m->s_exu[i],c->swiglu_alpha,c->swiglu_limit);
-#ifdef _OPENMP
-                #pragma omp parallel for schedule(static)
-#endif
-                for(int i=0;i<H;i++){ const uint16_t*wr=(uint16_t*)L->ex_w2[slot].w+(size_t)i*c->moe_inter; route[i]+=w*vec_dot_bf16_f32(wr,m->s_exg,c->moe_inter);} }
+                m3_mv_bf16(m->s_moe,(uint16_t*)L->ex_w2[slot].w,m->s_exg,H,c->moe_inter);
+                for(int i=0;i<H;i++) route[i]+=w*m->s_moe[i]; }
             /* shared expert: TP-sharded -> fold partial into route[] (one reduce); else replicated -> add after */
             m3_mv_bf16(m->s_shg,(uint16_t*)L->sh_w1.w,h2,L->sh_rows,H);
             m3_mv_bf16(m->s_shu,(uint16_t*)L->sh_w3.w,h2,L->sh_rows,H);
             for(int i=0;i<L->sh_rows;i++) m->s_shg[i]=m3_swiglu_oai(m->s_shg[i],m->s_shu[i],c->swiglu_alpha,c->swiglu_limit);
-#ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-#endif
-            for(int i=0;i<H;i++){ const uint16_t*wr=(uint16_t*)L->sh_w2.w+(size_t)i*L->sh_rows; m->s_sh[i]=vec_dot_bf16_f32(wr,m->s_shg,L->sh_rows); }
+            m3_mv_bf16(m->s_sh,(uint16_t*)L->sh_w2.w,m->s_shg,H,L->sh_rows);
             if(tp_sh) for(int i=0;i<H;i++) route[i]+=m->s_sh[i];
             if(m->ar_cb) m->ar_cb(route,H,m->ar_ctx);     /* EP-sum routed (+ shared if TP) */
             for(int i=0;i<H;i++) x[i]+=route[i] + (tp_sh?0.0f:m->s_sh[i]);
@@ -464,10 +548,7 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
             m3_mv_bf16(m->s_ff_g,(uint16_t*)L->ff_gate.w,h2,L->ff_rows,H);
             m3_mv_bf16(m->s_ff_u,(uint16_t*)L->ff_up.w,h2,L->ff_rows,H);
             for(int i=0;i<L->ff_rows;i++) m->s_ff_g[i]=m3_swiglu_oai(m->s_ff_g[i],m->s_ff_u[i],c->swiglu_alpha,c->swiglu_limit);
-#ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-#endif
-            for(int i=0;i<H;i++){ const uint16_t*wr=(uint16_t*)L->ff_down.w+(size_t)i*L->ff_rows; m->s_ff[i]=vec_dot_bf16_f32(wr,m->s_ff_g,L->ff_rows); }
+            m3_mv_bf16(m->s_ff,(uint16_t*)L->ff_down.w,m->s_ff_g,H,L->ff_rows);
             if(tp_ffn && m->ar_cb) m->ar_cb(m->s_ff,H,m->ar_ctx);
             for(int i=0;i<H;i++) x[i]+=m->s_ff[i];
         }
