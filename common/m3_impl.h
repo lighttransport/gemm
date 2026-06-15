@@ -99,6 +99,11 @@ struct m3_pool {   /* m3.h forward-declares `typedef struct m3_pool m3_pool;` */
 };
 static m3_pool *m3_g_pool=NULL;   /* one model per process; matvecs dispatch here */
 static int m3_pool_dbg=0;
+/* M3_DUMMY: idealized-compute ceiling. matvecs STREAM the weight bytes at full HBM BW
+ * (touch every cache line, no bf16->f32 widening, no FMA) -> models the actual memory
+ * read with compute removed; comm (ar_cb) + dispatch stay real. Reveals the
+ * comm+mem+dispatch floor = the practical tok/s ceiling if matvec were BW-perfect. */
+static int m3_dummy=0;
 static _Atomic long m3_dbg_disp=0, m3_dbg_main=0, m3_dbg_wrk=0;
 
 static inline void m3_cpu_relax(void){ __asm__ __volatile__("yield":::"memory"); }
@@ -170,6 +175,15 @@ static void m3_mv_worker(void *a,int tid,int nthr){
  * the cross-CMG fork-join wall caps it there). The experimental pinned pool (M3_POOL=1)
  * is selected when m3_g_pool is set. */
 static void m3_mv_bf16(float*restrict y,const uint16_t*W,const float*x,int rows,int cols){
+    if(m3_dummy){   /* stream every cache line of W at full BW; no widen/FMA (compute idealized) */
+        double acc=0;
+#ifdef _OPENMP
+        #pragma omp parallel for reduction(+:acc) schedule(static) if(rows>=M3_PAR_MIN)
+#endif
+        for(int r=0;r<rows;r++){ const uint16_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=32) s+=w[i]; acc+=s; }
+        float v=(float)(((long)acc)&1)*1e-30f; for(int r=0;r<rows;r++) y[r]=v;   /* defeat DCE, ~0 */
+        return;
+    }
     if(m3_g_pool && rows>=M3_PAR_MIN){ m3_mvjob j={y,(const uint16_t*)W,x,rows,cols}; m3_pool_run(m3_g_pool,m3_mv_worker,&j); return; }
     int nb=rows/8;
 #ifdef _OPENMP
@@ -311,6 +325,7 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
     m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
     m->s_logits=malloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
+    m3_dummy=m3_envi("M3_DUMMY",0);
     if(m3_envi("M3_POOL",0)) m->pool=m3_g_pool=m3_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
     return m;
     #undef BF
@@ -430,6 +445,7 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
     m->s_logits=malloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
+    m3_dummy=m3_envi("M3_DUMMY",0);
     if(m3_envi("M3_POOL",0)) m->pool=m3_g_pool=m3_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
     return m;
 }

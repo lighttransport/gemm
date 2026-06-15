@@ -51,6 +51,7 @@ export M3_DECODE=${M3_DECODE:-16}
 export M3_MAXPOS=${M3_MAXPOS:-512}
 export M3_LAYERS=${M3_LAYERS:-8}      # truncate (0 = full 60, won't fit small alloc)
 export M3_EXPERTS=${M3_EXPERTS:-0}    # 0 = full 128 (uneven e%NP ok); set smaller to shrink
+export M3_TP=${M3_TP:-0} M3_MSA=${M3_MSA:-1} M3_DUMMY=${M3_DUMMY:-0} M3_POOL=${M3_POOL:-0}
 
 # ---- build (native) ----
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
