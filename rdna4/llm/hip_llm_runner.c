@@ -171,23 +171,19 @@ static const char *hip_kernel_source =
 "    int h = blockIdx.x;\n"
 "    if (h >= n_heads) return;\n"
 "    int tid = threadIdx.x;\n"
+"    int NT  = blockDim.x;\n"
 "    float *v = vec + h * head_dim;\n"
-"\n"
-"    /* Each thread handles one element (head_dim <= 256 typically) */\n"
-"    float val = (tid < head_dim) ? v[tid] : 0.0f;\n"
-"    sdata[tid] = val * val;\n"
+"    /* grid-stride so head_dim may exceed blockDim (Gemma4 full-attn head_dim=512). */\n"
+"    float sum = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += NT) { float x = v[d]; sum += x * x; }\n"
+"    sdata[tid] = sum;\n"
 "    __syncthreads();\n"
-"\n"
-"    /* Reduction */\n"
-"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"    for (int s = NT / 2; s > 0; s >>= 1) {\n"
 "        if (tid < s) sdata[tid] += sdata[tid + s];\n"
 "        __syncthreads();\n"
 "    }\n"
-"\n"
 "    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
-"    if (tid < head_dim) {\n"
-"        v[tid] = val * scale * w[tid];\n"
-"    }\n"
+"    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
 "}\n"
 "\n"
 "/* ---- 4b. qknorm_batch_f32: per-row, per-head RMSNorm; grid=(n_heads, M) ---- */\n"
@@ -199,16 +195,19 @@ static const char *hip_kernel_source =
 "    int row = blockIdx.y;\n"
 "    if (h >= n_heads) return;\n"
 "    int tid = threadIdx.x;\n"
+"    int NT  = blockDim.x;\n"
 "    float *v = vec + (size_t)row * row_stride + h * head_dim;\n"
-"    float val = (tid < head_dim) ? v[tid] : 0.0f;\n"
-"    sdata[tid] = val * val;\n"
+"    /* grid-stride so head_dim may exceed blockDim (Gemma4 full-attn head_dim=512). */\n"
+"    float sum = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += NT) { float x = v[d]; sum += x * x; }\n"
+"    sdata[tid] = sum;\n"
 "    __syncthreads();\n"
-"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"    for (int s = NT / 2; s > 0; s >>= 1) {\n"
 "        if (tid < s) sdata[tid] += sdata[tid + s];\n"
 "        __syncthreads();\n"
 "    }\n"
 "    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
-"    if (tid < head_dim) v[tid] = val * scale * w[tid];\n"
+"    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
 "}\n"
 "\n"
 "/* ---- 5. rope_neox_f32: NeoX-style RoPE, pairs (j, j+pair_offset) ---- */\n"
@@ -645,6 +644,25 @@ static const char *hip_kernel_source =
 "    float scale = half_to_float(d_half);\n"
 "    signed char qs = *((const signed char *)(bp + 4) + block_off);  /* qs at offset 4 */\n"
 "    dst[i] = (float)qs * scale;\n"
+"}\n"
+"\n"
+"/* ---- 13b. embed_q4_0: native Q4_0 embedding lookup -> F32 (no F16 round-trip). */\n"
+"/* Q4_0 18-byte/32-elem block; column order matches matvec_q4_0_f32 (cols 0..15 = */\n"
+"/* low nibble qs[col], 16..31 = high nibble qs[col-16], value = (nibble-8)*d).    */\n"
+"__global__ void embed_q4_0(float *dst, const unsigned char *embd_table,\n"
+"                             int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n_embd) return;\n"
+"    int n_blocks_per_row = n_embd / 32;\n"
+"    int row_bytes = n_blocks_per_row * 18;\n"
+"    const unsigned char *row = embd_table + (size_t)token_id * row_bytes;\n"
+"    int block_idx = i / 32;\n"
+"    int within = i % 32;\n"
+"    const unsigned char *bp = row + block_idx * 18;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs = bp + 2;\n"
+"    int nib = (within < 16) ? (int)(qs[within] & 0x0F) : (int)(qs[within - 16] >> 4);\n"
+"    dst[i] = (float)(nib - 8) * d;\n"
 "}\n"
 "\n"
 "/* ---- 14. matvec_q2_K_f32: Q2_K matrix x F32 vector -> F32 ---- */\n"
@@ -5196,6 +5214,27 @@ static const char *hip_kernel_source =
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
 "\n"
+"/* Per-call dequant of Q4_0 (native 18 B/block: [d(f16) 2B][qs[16] 16B], 32 elems) */\n"
+"/* to BF16. Nibble order matches matvec_q4_0_f32: cols 0..15 = low nibble qs[col],  */\n"
+"/* cols 16..31 = high nibble qs[col-16], value = (nibble - 8) * d. One elem/thread. */\n"
+"__global__ void dequant_q4_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; int b = blockIdx.y;\n"
+"    int c = b * 256 + threadIdx.x;       /* global column 0..n_cols-1 */\n"
+"    if (c >= n_cols) return;\n"
+"    int n_blocks_per_row = n_cols / 32;\n"
+"    int row_bytes = n_blocks_per_row * 18;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    int blk = c >> 5; int within = c & 31;\n"
+"    const unsigned char *bp = rp + (size_t)blk * 18;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs = bp + 2;\n"
+"    int nib = (within < 16) ? (int)(qs[within] & 0x0F) : (int)(qs[within - 16] >> 4);\n"
+"    float val = d * (float)(nib - 8);\n"
+"    size_t out_idx = (size_t)row * n_cols + c;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
 "/* Per-call dequant of IQ3_XXS (98 B/block, 256 elems) to BF16. Uses the\n"
 " * iq3xxs_grid_dev codebook + ksigns_iq2xs_dev sign table that were emitted\n"
 " * alongside matvec_iq3_xxs_f32. One thread per output element. */\n"
@@ -6030,7 +6069,8 @@ static const char *hip_kernel_source =
 " * buffer. Grid: (n_heads, M), block: half_dim. */\n"
 "__global__ void rope_neox_batch_f32(float *vec_batch, int n_heads, int head_dim,\n"
 "                                     int position_start, float freq_base,\n"
-"                                     int n_rope_pairs, int row_stride) {\n"
+"                                     int n_rope_pairs, int row_stride,\n"
+"                                     const float *freq_factors) {\n"
 "    int h   = blockIdx.x;\n"
 "    int row = blockIdx.y;\n"
 "    if (h >= n_heads) return;\n"
@@ -6042,6 +6082,7 @@ static const char *hip_kernel_source =
 "    int rope_dim = (n_rope_pairs > 0) ? 2 * n_rope_pairs : head_dim;\n"
 "    int pos = position_start + row;\n"
 "    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    if (freq_factors) freq /= freq_factors[j];\n"
 "    float theta = (float)pos * freq;\n"
 "    float cos_t = cosf(theta);\n"
 "    float sin_t = sinf(theta);\n"
@@ -6094,6 +6135,23 @@ static const char *hip_kernel_source =
 "    int i   = gid - row * kv_dim;\n"
 "    size_t cache_idx = (size_t)(position_start + row) * kv_dim + i;\n"
 "    size_t batch_idx = (size_t)row * kv_dim + i;\n"
+"    key_cache[cache_idx]   = k_batch[batch_idx];\n"
+"    value_cache[cache_idx] = v_batch[batch_idx];\n"
+"}\n"
+"\n"
+"/* Variant with separate source/dest strides */\n"
+"__global__ void kv_cache_store_batch_strided(float *key_cache, float *value_cache,\n"
+"    const float *k_batch, const float *v_batch,\n"
+"    int position_start, int M, int kv_dim, int batch_stride, int cache_len) {\n"
+"    int total = M * kv_dim;\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (gid >= total) return;\n"
+"    int row = gid / kv_dim;\n"
+"    int i   = gid - row * kv_dim;\n"
+"    int pos = position_start + row;\n"
+"    int slot = (cache_len > 0) ? (pos % cache_len) : pos;\n"
+"    size_t cache_idx = (size_t)slot * kv_dim + i;\n"
+"    size_t batch_idx = (size_t)row * batch_stride + i;\n"
 "    key_cache[cache_idx]   = k_batch[batch_idx];\n"
 "    value_cache[cache_idx] = v_batch[batch_idx];\n"
 "}\n"
@@ -6457,6 +6515,120 @@ static const char *hip_kernel_source =
 "#undef FA_LLM_HD_MAX\n"
 "#undef FA_LLM_K_NB\n"
 "\n"
+"/* ---- head_dim=512 WMMA flash for Gemma4 full-attention (4 waves, head_dim split).\n"
+" * head_dim 512 makes a single-wave O accumulator 256 VGPR (or 32 KB LDS), which\n"
+" * collapses occupancy. Instead split the head_dim across 4 waves: each wave owns\n"
+" * 128 output dims, so its O lives in registers (8 f32x8 = 64 VGPR). For QK each\n"
+" * wave contracts only its 128 dims into a PARTIAL score; the 4 partials are summed\n"
+" * via LDS to the full score, which all waves then softmax. Reads the F32 KV cache\n"
+" * directly (K = RoPE'd key, V = un-RoPE'd normed key). LDS ~36.5 KB. BQ=16.\n"
+" * Grid: (n_heads, ceil(M/16)). Block: 128. */\n"
+"#define FW512_BQ 16\n"
+"#define FW512_BKV 16\n"
+"__global__ void flash_attn_wmma_hd512_causal(\n"
+"    float *out, const float *Q, const float *key_cache, const float *value_cache,\n"
+"    int M, int kv_len, int position_start, int n_heads, int n_kv_heads,\n"
+"    int head_dim, int kv_dim, float scale) {\n"
+"    int h  = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FW512_BQ;\n"
+"    int gqa = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa;\n"
+"    int q_dim = n_heads * head_dim;\n"
+"    int tid = threadIdx.x;\n"
+"    int wid = tid >> 5;       /* 0..3, which 128-dim head slice this wave owns */\n"
+"    int lid = tid & 31;\n"
+"    int half = lid >> 4;\n"
+"    int idx  = lid & 15;\n"
+"    int dbase = wid * 128;    /* this wave's head_dim offset */\n"
+"    extern __shared__ _Float16 smem512[];\n"
+"    _Float16 *smK = smem512;                  /* [16*512] f16 (key*512 + d) */\n"
+"    _Float16 *smV = smK + 16 * 512;           /* [16*512] f16 (d*16 + key)  */\n"
+"    float    *smScore = (float*)(smV + 16 * 512); /* [4*256] partial scores  */\n"
+"    _Float16 *smP = smK;                       /* [16*16] overlaps smK after QK */\n"
+"    /* Q for this wave's 8 k-chunks (128 dims), scaled. */\n"
+"    f16x8 q_reg[8];\n"
+"    for (int kb = 0; kb < 8; kb++)\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = dbase + kb * 16 + half * 8 + i;\n"
+"            int row = q0 + idx;\n"
+"            float v = (row < M && d < head_dim) ? Q[(size_t)row * q_dim + h * head_dim + d] : 0.0f;\n"
+"            q_reg[kb][i] = (_Float16)(v * scale);\n"
+"        }\n"
+"    float8 O_acc[8];\n"
+"    for (int kb = 0; kb < 8; kb++) for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"    int max_kv = position_start + q0 + FW512_BQ;\n"
+"    if (max_kv > kv_len) max_kv = kv_len;\n"
+"    int n_kv = (max_kv + FW512_BKV - 1) / FW512_BKV;\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        int kv0 = t * FW512_BKV;\n"
+"        for (int e = tid; e < 16 * 512; e += 128) {\n"
+"            int key = e >> 9; int d = e & 511;\n"
+"            int kpos = kv0 + key;\n"
+"            float kf = 0.0f, vf = 0.0f;\n"
+"            if (kpos < max_kv) {\n"
+"                size_t base = (size_t)kpos * kv_dim + kv_h * head_dim + d;\n"
+"                kf = key_cache[base]; vf = value_cache[base];\n"
+"            }\n"
+"            smK[key * 512 + d] = (_Float16)kf;\n"
+"            smV[d * 16 + key]  = (_Float16)vf;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        /* Partial QK over this wave's 128 dims. */\n"
+"        float8 sp = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < 8; kb++) {\n"
+"            f16x8 bK;\n"
+"            for (int i = 0; i < 8; i++) { int dpos = dbase + kb * 16 + half * 8 + i; bK[i] = smK[idx * 512 + dpos]; }\n"
+"            sp = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[kb], bK, sp);\n"
+"        }\n"
+"        /* Reduce the 4 waves' partial scores to the full score via LDS. */\n"
+"        for (int i = 0; i < 8; i++) smScore[wid * 256 + lid * 8 + i] = sp[i];\n"
+"        __syncthreads();\n"
+"        float8 score;\n"
+"        for (int i = 0; i < 8; i++)\n"
+"            score[i] = smScore[0 * 256 + lid * 8 + i] + smScore[1 * 256 + lid * 8 + i]\n"
+"                     + smScore[2 * 256 + lid * 8 + i] + smScore[3 * 256 + lid * 8 + i];\n"
+"        bool col_valid = (kv0 + idx) < max_kv;\n"
+"        for (int i = 0; i < 8; i++) score[i] = col_valid ? score[i] : -1e30f;\n"
+"        int k_global = kv0 + idx;\n"
+"        for (int i = 0; i < 8; i++) { int qg = position_start + q0 + half * 8 + i; if (qg < k_global) score[i] = -1e30f; }\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) { float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v,1,32)); v = fmaxf(v, __shfl_xor(v,2,32));\n"
+"            v = fmaxf(v, __shfl_xor(v,4,32)); v = fmaxf(v, __shfl_xor(v,8,32)); row_max[i] = v; }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) { float nm = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = (m_i[i] < -1e29f) ? 0.0f : __expf(m_i[i] - nm);\n"
+"            float ej = __expf(score[i] - nm); float s = ej;\n"
+"            s += __shfl_xor(s,1,32); s += __shfl_xor(s,2,32); s += __shfl_xor(s,4,32); s += __shfl_xor(s,8,32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s; m_i[i] = nm; score[i] = ej; }\n"
+"        for (int kb = 0; kb < 8; kb++) for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        __syncthreads();   /* before overwriting smK with smP */\n"
+"        for (int i = 0; i < 8; i++) smP[(half * 8 + i) * 16 + idx] = (_Float16)score[i];\n"
+"        __syncthreads();\n"
+"        f16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < 8; kb++) {\n"
+"            f16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) { int d_col = dbase + kb * 16 + idx; int kv_k = half * 8 + i; bv[i] = smV[d_col * 16 + kv_k]; }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int kb = 0; kb < 8; kb++)\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i; int d = dbase + kb * 16 + idx; int row = q0 + m_row;\n"
+"            if (row < M && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * q_dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"}\n"
+"#undef FW512_BQ\n"
+"#undef FW512_BKV\n"
+"\n"
 "/* ===== Phase 4: WMMA F16 matvec for decode (M=1) ===== */\n"
 "/* Computes dst[n_rows] = mat[n_rows, n_cols] * x[n_cols] using 16-row WMMA tiles.\n"
 " * x is staged into LDS as F16 once. 4 waves per WG, each wave handles its own\n"
@@ -6528,7 +6700,8 @@ static const char *hip_kernel_source =
 "\n"
 "__global__ void rope_neox_f32_devp(float *vec, int n_heads, int head_dim,\n"
 "                                    const int *pos_p,\n"
-"                                    float freq_base, int n_rope_pairs) {\n"
+"                                    float freq_base, int n_rope_pairs,\n"
+"                                    const float *freq_factors) {\n"
 "    int h = blockIdx.x;\n"
 "    if (h >= n_heads) return;\n"
 "    int j = threadIdx.x;\n"
@@ -6539,6 +6712,7 @@ static const char *hip_kernel_source =
 "    int rope_dim = (n_rope_pairs > 0) ? 2 * n_rope_pairs : head_dim;\n"
 "    int pos = *pos_p;\n"
 "    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    if (freq_factors) freq /= freq_factors[j];\n"
 "    float theta = (float)pos * freq;\n"
 "    float cos_t = cosf(theta);\n"
 "    float sin_t = sinf(theta);\n"
@@ -6580,12 +6754,13 @@ static const char *hip_kernel_source =
 "\n"
 "__global__ void kv_cache_store_devp(float *key_cache, float *value_cache,\n"
 "                                     const float *k, const float *v,\n"
-"                                     const int *pos_p, int kv_dim) {\n"
+"                                     const int *pos_p, int kv_dim, int cache_len) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < kv_dim) {\n"
 "        int position = *pos_p;\n"
-"        key_cache[(size_t)position * kv_dim + i] = k[i];\n"
-"        value_cache[(size_t)position * kv_dim + i] = v[i];\n"
+"        int slot = (cache_len > 0) ? (position % cache_len) : position;\n"
+"        key_cache[(size_t)slot * kv_dim + i] = k[i];\n"
+"        value_cache[(size_t)slot * kv_dim + i] = v[i];\n"
 "    }\n"
 "}\n"
 "\n"
@@ -6662,6 +6837,199 @@ static const char *hip_kernel_source =
 "        }\n"
 "        out_h[d] = acc;\n"
 "    }\n"
+"}\n"
+"\n"
+"/* ---- Gemma4 kernels ---- */\n"
+"\n"
+"/* GELU * up: gate[i] = gelu(gate[i]) * up[i] */\n"
+"__global__ void gelu_mul_f32(float *gate, const float *up, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    float g = gate[i];\n"
+"    float u = up[i];\n"
+"    /* gelu_pytorch_tanh (Gemma's hidden_activation), matching ggml's tanh-approx\n"
+"     * GELU. Exact erf GELU differs by ~1e-3 and that per-FFN error accumulates\n"
+"     * over 48 layers into a garbled output on the Q4_0 QAT model. */\n"
+"    float gelu_g = g * 0.5f * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));\n"
+"    gate[i] = gelu_g * u;\n"
+"}\n"
+"\n"
+"/* Logit softcapping: x[i] = cap * tanh(x[i] / cap) */\n"
+"__global__ void logit_softcap_f32(float *x, int n, float cap) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    x[i] = cap * tanhf(x[i] / cap);\n"
+"}\n"
+"\n"
+"/* Scale: x[i] *= scale */\n"
+"__global__ void scale_f32(float *x, float scale, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    x[i] *= scale;\n"
+"}\n"
+"\n"
+"\n"
+"/* Batched weightless per-head RMS norm. grid=(n_heads, M), block 256, smem 256 floats.\n"
+" * Handles head_dim > blockDim (e.g. 512) via a grid-stride loop, unlike the single\n"
+" * tid<head_dim variant above. Used for Gemma4 V normalization (V is rms-normed per head). */\n"
+"__global__ void raw_rmsnorm_heads_batch_f32(float *vec_batch, int n_heads, int head_dim,\n"
+"                                            int M, int row_stride, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x;\n"
+"    int row = blockIdx.y;\n"
+"    if (h >= n_heads || row >= M) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int NT = blockDim.x;\n"
+"    float *v = vec_batch + (size_t)row * row_stride + h * head_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += NT) { float x = v[d]; sum += x * x; }\n"
+"    sdata[tid] = sum; __syncthreads();\n"
+"    for (int s = NT / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    for (int d = tid; d < head_dim; d += NT) v[d] *= scale;\n"
+"}\n"
+"\n"
+"\n"
+"\n"
+"/* Flash (online-softmax) prefill attention. One block per (head, query row).\n"
+" * Bounded shared memory = (2*head_dim + 2*blockDim) floats regardless of seq_len,\n"
+" * so it scales to arbitrarily long sequences (pp32k) without exceeding LDS.\n"
+" *   window > 0 : sliding-window attention, keys restricted to [pos-window+1, pos].\n"
+" *   window == 0: full causal attention, keys [0, pos].\n"
+" *   cache_len  : circular cache size (slot = pos %% cache_len). For full-attn this\n"
+" *                equals max_seq_len so the modulo is a no-op. */\n"
+"__global__ void attn_prefill_flash_f32(float *out, const float *q,\n"
+"    const float *key_cache, const float *value_cache,\n"
+"    int n_heads, int n_kv_heads, int head_dim, int kv_dim,\n"
+"    int M, int position_start, float scale, int window, int cache_len) {\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    int m = blockIdx.y;\n"
+"    if (h >= n_heads || m >= M) return;\n"
+"    int kv_h = h / (n_heads / n_kv_heads);\n"
+"    int pos = position_start + m;\n"
+"    int lo = (window > 0 && (pos - window + 1) > 0) ? (pos - window + 1) : 0;\n"
+"    int hi = pos;\n"
+"    int tid = threadIdx.x;\n"
+"    int NT  = blockDim.x;\n"
+"    float *q_sh   = smem;                  /* head_dim */\n"
+"    float *acc_sh = q_sh + head_dim;       /* head_dim */\n"
+"    float *p_sh   = acc_sh + head_dim;     /* NT       */\n"
+"    float *red    = p_sh + NT;             /* NT       */\n"
+"    const float *qh = q + (size_t)m * n_heads * head_dim + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += NT) { q_sh[d] = qh[d] * scale; acc_sh[d] = 0.0f; }\n"
+"    __syncthreads();\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    for (int ts = lo; ts <= hi; ts += NT) {\n"
+"        int kpos = ts + tid;\n"
+"        int tile_n = hi - ts + 1; if (tile_n > NT) tile_n = NT;\n"
+"        float score = -1e30f;\n"
+"        if (kpos <= hi) {\n"
+"            int slot = (cache_len > 0) ? (kpos % cache_len) : kpos;\n"
+"            const float *kp = key_cache + (size_t)slot * kv_dim + kv_h * head_dim;\n"
+"            float s = 0.0f;\n"
+"            for (int d = 0; d < head_dim; d++) s += q_sh[d] * kp[d];\n"
+"            score = s;\n"
+"        }\n"
+"        red[tid] = score; __syncthreads();\n"
+"        for (int s2 = NT / 2; s2 > 0; s2 >>= 1) { if (tid < s2) red[tid] = fmaxf(red[tid], red[tid + s2]); __syncthreads(); }\n"
+"        float tile_max = red[0];\n"
+"        float new_m = fmaxf(m_i, tile_max);\n"
+"        float corr  = (m_i < -1e29f) ? 0.0f : __expf(m_i - new_m);\n"
+"        float pv = (kpos <= hi) ? __expf(score - new_m) : 0.0f;\n"
+"        __syncthreads();\n"
+"        p_sh[tid] = pv; red[tid] = pv; __syncthreads();\n"
+"        for (int s2 = NT / 2; s2 > 0; s2 >>= 1) { if (tid < s2) red[tid] += red[tid + s2]; __syncthreads(); }\n"
+"        float tile_sum = red[0];\n"
+"        l_i = l_i * corr + tile_sum;\n"
+"        for (int d = tid; d < head_dim; d += NT) {\n"
+"            float a = acc_sh[d] * corr;\n"
+"            for (int t = 0; t < tile_n; t++) {\n"
+"                int slot2 = (cache_len > 0) ? ((ts + t) % cache_len) : (ts + t);\n"
+"                a += p_sh[t] * value_cache[(size_t)slot2 * kv_dim + kv_h * head_dim + d];\n"
+"            }\n"
+"            acc_sh[d] = a;\n"
+"        }\n"
+"        m_i = new_m;\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;\n"
+"    float *out_h = out + (size_t)m * n_heads * head_dim + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += NT) out_h[d] = acc_sh[d] * inv;\n"
+"}\n"
+"\n"
+"/* Flash (online-softmax) decode attention (single query at *pos_p). Device-pointer\n"
+" * position so it is HIP-graph-capturable. Bounded shared memory. window/cache_len\n"
+" * semantics identical to attn_prefill_flash_f32. */\n"
+"__global__ void attn_decode_flash_f32_devp(float *out, const float *q,\n"
+"    const float *key_cache, const float *value_cache,\n"
+"    int n_heads, int n_kv_heads, int head_dim, int kv_dim,\n"
+"    const int *pos_p, float scale, int window, int cache_len) {\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int kv_h = h / (n_heads / n_kv_heads);\n"
+"    int pos = *pos_p;\n"
+"    int lo = (window > 0 && (pos - window + 1) > 0) ? (pos - window + 1) : 0;\n"
+"    int hi = pos;\n"
+"    int tid = threadIdx.x;\n"
+"    int NT  = blockDim.x;\n"
+"    float *q_sh   = smem;\n"
+"    float *acc_sh = q_sh + head_dim;\n"
+"    float *p_sh   = acc_sh + head_dim;\n"
+"    float *red    = p_sh + NT;\n"
+"    const float *qh = q + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += NT) { q_sh[d] = qh[d] * scale; acc_sh[d] = 0.0f; }\n"
+"    __syncthreads();\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    for (int ts = lo; ts <= hi; ts += NT) {\n"
+"        int kpos = ts + tid;\n"
+"        int tile_n = hi - ts + 1; if (tile_n > NT) tile_n = NT;\n"
+"        float score = -1e30f;\n"
+"        if (kpos <= hi) {\n"
+"            int slot = (cache_len > 0) ? (kpos % cache_len) : kpos;\n"
+"            const float *kp = key_cache + (size_t)slot * kv_dim + kv_h * head_dim;\n"
+"            float s = 0.0f;\n"
+"            for (int d = 0; d < head_dim; d++) s += q_sh[d] * kp[d];\n"
+"            score = s;\n"
+"        }\n"
+"        red[tid] = score; __syncthreads();\n"
+"        for (int s2 = NT / 2; s2 > 0; s2 >>= 1) { if (tid < s2) red[tid] = fmaxf(red[tid], red[tid + s2]); __syncthreads(); }\n"
+"        float tile_max = red[0];\n"
+"        float new_m = fmaxf(m_i, tile_max);\n"
+"        float corr  = (m_i < -1e29f) ? 0.0f : __expf(m_i - new_m);\n"
+"        float pv = (kpos <= hi) ? __expf(score - new_m) : 0.0f;\n"
+"        __syncthreads();\n"
+"        p_sh[tid] = pv; red[tid] = pv; __syncthreads();\n"
+"        for (int s2 = NT / 2; s2 > 0; s2 >>= 1) { if (tid < s2) red[tid] += red[tid + s2]; __syncthreads(); }\n"
+"        float tile_sum = red[0];\n"
+"        l_i = l_i * corr + tile_sum;\n"
+"        for (int d = tid; d < head_dim; d += NT) {\n"
+"            float a = acc_sh[d] * corr;\n"
+"            for (int t = 0; t < tile_n; t++) {\n"
+"                int slot2 = (cache_len > 0) ? ((ts + t) % cache_len) : (ts + t);\n"
+"                a += p_sh[t] * value_cache[(size_t)slot2 * kv_dim + kv_h * head_dim + d];\n"
+"            }\n"
+"            acc_sh[d] = a;\n"
+"        }\n"
+"        m_i = new_m;\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;\n"
+"    float *out_h = out + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += NT) out_h[d] = acc_sh[d] * inv;\n"
+"}\n"
+"\n"
+"/* Repack batch buffer from compact per-layer stride to padded max stride.\n"
+" * dst [M * dst_stride] = src [M * src_stride], copying n_per_row elements per row. */\n"
+"__global__ void repack_batch_f32(float *dst, const float *src,\n"
+"    int M, int n_per_row, int src_stride, int dst_stride) {\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = M * n_per_row;\n"
+"    if (gid >= total) return;\n"
+"    int row = gid / n_per_row;\n"
+"    int col = gid - row * n_per_row;\n"
+"    dst[(size_t)row * dst_stride + col] = src[(size_t)row * src_stride + col];\n"
 "}\n"
 "\n"
 "} /* extern \"C\" */\n"
@@ -6801,6 +7169,18 @@ typedef struct {
     /* SSM persistent state */
     void *d_conv_state;
     void *d_recurrent_state;
+
+    /* Gemma4 fields */
+    int is_swa;                 /* 1 = sliding window attention layer */
+    int shared_kv_source;       /* -1 = own KV, else layer index to share from */
+    int local_kv_heads;         /* per-layer KV head count (may differ from r->n_kv_heads) */
+    int local_head_dim;         /* head_dim_full or head_dim_swa */
+    void *post_attn_norm_w;     /* F32 [n_embd] post-attention norm */
+    void *post_ffw_norm_w;      /* F32 [n_embd] post-FFN norm */
+    void *ple_inp_gate_w;       /* F32 [ple_dim, n_embd] PLE input gate */
+    void *ple_proj_w;           /* F32 [n_embd, ple_dim] PLE projection */
+    void *ple_post_norm_w;      /* F32 [n_embd] PLE post-projection norm */
+    float layer_scale_val;      /* layer output scale (default 1.0) */
 } hip_layer;
 
 struct hip_llm_runner {
@@ -6829,6 +7209,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_embed_q8_0;
+    hipFunction_t fn_embed_q4_0;
     hipFunction_t fn_matvec_q2_K_f32;
     hipFunction_t fn_matvec_q2_K_g4_f32;
     hipFunction_t fn_matvec_q3_K_f32;
@@ -6971,6 +7352,7 @@ struct hip_llm_runner {
     hipFunction_t fn_convert_f16_to_bf16;
     /* K-quant batched-prefill dequant kernels (write BF16 to a staging buffer) */
     hipFunction_t fn_dequant_q8_0_to_bf16;
+    hipFunction_t fn_dequant_q4_0_to_bf16;
     hipFunction_t fn_dequant_q2_K_to_bf16;
     hipFunction_t fn_dequant_q3_K_to_bf16;
     hipFunction_t fn_dequant_q4_K_to_bf16;
@@ -6991,6 +7373,7 @@ struct hip_llm_runner {
     hipFunction_t fn_rope_neox_batch_f32;
     hipFunction_t fn_rope_mrope_batch_f32;
     hipFunction_t fn_kv_cache_store_batch;
+    hipFunction_t fn_kv_cache_store_batch_strided;
     hipFunction_t fn_flash_attn_wmma_f16_4w_causal;
     hipFunction_t fn_flash_attn_wmma_f16_4w_causal_hd256;
 
@@ -7193,6 +7576,44 @@ struct hip_llm_runner {
     int         graph_ready_hidden;
     int         graph_disabled;   /* env LLM_GRAPH_DISABLE=1 */
     int         graph_verbose;    /* env LLM_GRAPH_VERBOSE=1 */
+
+    /* Gemma4 architecture */
+    int is_gemma4;
+    int head_dim_full;              /* head dim for full-attention layers (512) */
+    int head_dim_swa;               /* head dim for SWA layers (256) */
+    int swa_window_size;            /* sliding window size (512) */
+    int *swa_pattern;               /* [n_layers] 1=SWA, 0=full attention */
+    int n_layer_kv_from_start;      /* layers 0..N-1 have own KV, rest share */
+    float final_logit_softcapping;  /* tanh softcap on output logits (30.0) */
+    float rope_freq_base_swa;       /* RoPE freq base for SWA layers (10000) */
+    float embd_scale;               /* sqrt(n_embd) for token embedding scaling */
+    int n_embd_per_layer;           /* per-layer embedding dim (256) */
+    int *per_layer_kv_heads;        /* [n_layers] per-layer KV head count */
+    void *d_ple_combined;           /* [n_layers * ple_dim] f32 */
+    void *d_ple_buf;                /* [ple_dim] f32 */
+    void *d_ple_proj;               /* [n_embd] f32 */
+    void *d_per_layer_token_embd;   /* Q8_0 [n_vocab, n_layers * ple_dim] */
+    void *d_per_layer_model_proj;   /* BF16 [n_layers * ple_dim, n_embd] */
+    void *d_per_layer_proj_norm;    /* F32 [ple_dim] */
+    float *h_rope_freq_factors;     /* [head_dim_full/2] proportional RoPE factors */
+    void  *d_rope_freq_factors;     /* GPU copy of the above (full-attn proportional rope) */
+    int    n_rope_freq_factors;     /* length of freq_factors (0 if absent) */
+    float *h_rope_inv_freq_full;    /* precomputed inv_freq for full-attn layers */
+    float *h_rope_inv_freq_swa;     /* precomputed inv_freq for SWA layers */
+    int rope_full_dim;              /* head_dim_full/2 */
+    int rope_swa_dim;               /* head_dim_swa/2 */
+    /* Gemma4 GPU kernels */
+    hipFunction_t fn_gelu_mul_f32;
+    hipFunction_t fn_logit_softcap_f32;
+    hipFunction_t fn_scale_f32;
+    hipFunction_t fn_raw_rmsnorm_heads_batch_f32;
+    hipFunction_t fn_attn_prefill_flash_f32;    /* bounded online-softmax prefill */
+    hipFunction_t fn_attn_decode_flash_f32_devp;/* bounded online-softmax decode  */
+    hipFunction_t fn_flash_attn_wmma_hd512_causal; /* WMMA full-attn (head_dim 512) */
+    int           gemma_fa_wmma;                /* use WMMA kernel for full-attn layers */
+    int         swa_cache_len;      /* circular SWA cache size = window + chunk */
+    int         gemma_prefill_chunk;/* prefill chunk size (<= swa_window) */
+    int         cur_position;       /* host-side current position for SWA kernel */
 };
 
 static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
@@ -7237,6 +7658,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(embed_q8_0);
+    GET_FUNC(embed_q4_0);
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q2_K_g4_f32);
     GET_FUNC(matvec_q3_K_f32);
@@ -7345,10 +7767,19 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
+    /* Gemma4 kernels */
+    GET_FUNC(gelu_mul_f32);
+    GET_FUNC(logit_softcap_f32);
+    GET_FUNC(scale_f32);
+    GET_FUNC(raw_rmsnorm_heads_batch_f32);
+    GET_FUNC(attn_prefill_flash_f32);
+    GET_FUNC(attn_decode_flash_f32_devp);
+    GET_FUNC(flash_attn_wmma_hd512_causal);
 
     GET_FUNC(pack_bf16_from_f32);
     GET_FUNC(convert_f16_to_bf16);
     GET_FUNC(dequant_q8_0_to_bf16);
+    GET_FUNC(dequant_q4_0_to_bf16);
     GET_FUNC(dequant_q2_K_to_bf16);
     GET_FUNC(dequant_q3_K_to_bf16);
     GET_FUNC(dequant_q4_K_to_bf16);
@@ -7368,6 +7799,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(rope_neox_batch_f32);
     GET_FUNC(rope_mrope_batch_f32);
     GET_FUNC(kv_cache_store_batch);
+    GET_FUNC(kv_cache_store_batch_strided);
     GET_FUNC(flash_attn_wmma_f16_4w_causal);
     GET_FUNC(flash_attn_wmma_f16_4w_causal_hd256);
 
@@ -7705,6 +8137,9 @@ static int hllm_get_int(const gguf_context *gguf, const char *key, int def) {
     if (idx < 0) return def;
     if (gguf->kv[idx].type == GGUF_TYPE_UINT32) return (int)gguf->kv[idx].value.u32;
     if (gguf->kv[idx].type == GGUF_TYPE_INT32)  return gguf->kv[idx].value.i32;
+    if (gguf->kv[idx].type == GGUF_TYPE_UINT64) return (int)gguf->kv[idx].value.u64;
+    if (gguf->kv[idx].type == GGUF_TYPE_INT64)  return (int)gguf->kv[idx].value.i64;
+    if (gguf->kv[idx].type == GGUF_TYPE_BOOL)   return gguf->kv[idx].value.b ? 1 : 0;
     return def;
 }
 
@@ -7900,7 +8335,8 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     if (!r || !gguf) return -1;
 
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
+    if (gguf_find_key(gguf, "gemma4.block_count") >= 0) arch = "gemma4";
+    else if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
     else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
     else if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
@@ -7986,13 +8422,134 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         }
     }
 
+    /* Gemma4 architecture */
+    r->is_gemma4 = 0;
+    r->swa_pattern = NULL;
+    r->per_layer_kv_heads = NULL;
+    r->h_rope_freq_factors = NULL;
+    r->h_rope_inv_freq_full = NULL;
+    r->h_rope_inv_freq_swa = NULL;
+    if (strcmp(arch, "gemma4") == 0) {
+        r->is_gemma4 = 1;
+        r->head_dim_full = hllm_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
+        r->head_dim_swa  = hllm_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
+        r->head_dim = r->head_dim_full; /* use max for buffer sizing */
+        r->swa_window_size = hllm_get_int(gguf, ARCH_KEY("attention.sliding_window"), 512);
+        /* Prefill chunk for SWA correctness: a query at position p attends to keys
+         * [p-window+1, p]. With a circular SWA cache the store of a whole chunk must
+         * not overwrite keys still needed by earlier queries in the same chunk, so
+         * the cache must hold window+chunk recent positions. We set chunk = window
+         * and cache = 2*window (capped to batch_max later at the call site). */
+        r->gemma_prefill_chunk = r->swa_window_size;
+        r->swa_cache_len = r->swa_window_size + r->gemma_prefill_chunk;
+        /* Gemma4 rotates the full per-layer head_dim (n_rot == head_dim for both SWA
+         * and full layers). Force n_rope_pairs=0 so the rope kernels derive rope_dim
+         * from the per-call head_dim instead of a single global value (which would be
+         * 512 and wrong for the 256-wide SWA heads). */
+        r->n_rope_pairs = 0;
+        /* WMMA flash kernel for the full-attention layers (head_dim 512), the O(M^2)
+         * long-context bottleneck. Splits the 512 head_dim across 4 waves so the O
+         * accumulator stays in registers (good occupancy); 1.1-1.4x+ faster than the
+         * scalar online-softmax kernel and growing with context. Default ON;
+         * GEMMA_FA_WMMA=0 falls back to the scalar kernel. */
+        { const char *e = getenv("GEMMA_FA_WMMA"); r->gemma_fa_wmma = (e && atoi(e) == 0) ? 0 : 1; }
+        r->n_embd_per_layer = hllm_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 256);
+        int shared_kv_layers = hllm_get_int(gguf, ARCH_KEY("attention.shared_kv_layers"), 0);
+        r->n_layer_kv_from_start = r->n_layers - shared_kv_layers;
+        r->final_logit_softcapping = hllm_get_float(gguf, ARCH_KEY("final_logit_softcapping"), 30.0f);
+        r->rope_freq_base_swa = hllm_get_float(gguf, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
+        r->embd_scale = sqrtf((float)r->n_embd);
+
+        /* Parse SWA layer pattern */
+        r->swa_pattern = (int *)calloc(r->n_layers, sizeof(int));
+        {
+            int idx = gguf_find_key(gguf, ARCH_KEY("attention.sliding_window_pattern"));
+            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
+                int n = (int)gguf->kv[idx].value.arr.n;
+                if (n > r->n_layers) n = r->n_layers;
+                uint8_t *data = (uint8_t *)gguf->kv[idx].value.arr.data;
+                for (int i = 0; i < n; i++)
+                    r->swa_pattern[i] = data[i] ? 1 : 0;
+            } else {
+                for (int i = 0; i < r->n_layers; i++)
+                    r->swa_pattern[i] = ((i + 1) % 6 != 0) ? 1 : 0;
+            }
+        }
+
+        /* Parse per-layer KV head count */
+        r->per_layer_kv_heads = (int *)calloc(r->n_layers, sizeof(int));
+        {
+            int idx = gguf_find_key(gguf, ARCH_KEY("attention.head_count_kv"));
+            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
+                int n = (int)gguf->kv[idx].value.arr.n;
+                int32_t *data = (int32_t *)gguf->kv[idx].value.arr.data;
+                for (int i = 0; i < r->n_layers && i < n; i++)
+                    r->per_layer_kv_heads[i] = data[i];
+                for (int i = n; i < r->n_layers; i++)
+                    r->per_layer_kv_heads[i] = r->n_kv_heads;
+            } else {
+                for (int i = 0; i < r->n_layers; i++)
+                    r->per_layer_kv_heads[i] = r->n_kv_heads;
+            }
+        }
+
+        /* Load proportional RoPE frequency factors (used by full-attention layers). */
+        r->d_rope_freq_factors = NULL;
+        r->n_rope_freq_factors = 0;
+        {
+            qtensor rope_freqs = hllm_load_tensor(gguf, "rope_freqs.weight", 0);
+            if (rope_freqs.data) {
+                int n_freq = rope_freqs.n_cols;
+                r->h_rope_freq_factors = (float *)calloc(n_freq, sizeof(float));
+                dequant_row(rope_freqs.type, rope_freqs.data, r->h_rope_freq_factors, n_freq);
+                r->n_rope_freq_factors = n_freq;
+                if (hipMalloc(&r->d_rope_freq_factors, (size_t)n_freq * sizeof(float)) == hipSuccess)
+                    hipMemcpy(r->d_rope_freq_factors, r->h_rope_freq_factors,
+                              (size_t)n_freq * sizeof(float), hipMemcpyHostToDevice);
+            }
+        }
+
+        /* Precompute inverse frequencies for full-attn layers */
+        {
+            int half = r->head_dim_full / 2;
+            r->rope_full_dim = half;
+            r->h_rope_inv_freq_full = (float *)calloc(half, sizeof(float));
+            float base = r->rope_freq_base;
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(base, (float)(2 * i) / (float)r->head_dim_full);
+                if (r->h_rope_freq_factors && i < half)
+                    freq /= r->h_rope_freq_factors[i];
+                r->h_rope_inv_freq_full[i] = freq;
+            }
+        }
+
+        /* Precompute inverse frequencies for SWA layers */
+        {
+            int half = r->head_dim_swa / 2;
+            r->rope_swa_dim = half;
+            r->h_rope_inv_freq_swa = (float *)calloc(half, sizeof(float));
+            float base = r->rope_freq_base_swa;
+            for (int i = 0; i < half; i++) {
+                r->h_rope_inv_freq_swa[i] = 1.0f / powf(base, (float)(2 * i) / (float)r->head_dim_swa);
+            }
+        }
+
+        if (r->verbose >= 1) {
+            fprintf(stderr, "hip_llm: Gemma4: head_dim_full=%d head_dim_swa=%d swa_window=%d\n",
+                    r->head_dim_full, r->head_dim_swa, r->swa_window_size);
+            fprintf(stderr, "hip_llm: Gemma4: n_embd_per_layer=%d n_layer_kv_from_start=%d\n",
+                    r->n_embd_per_layer, r->n_layer_kv_from_start);
+            fprintf(stderr, "hip_llm: Gemma4: softcap=%.1f rope_base_swa=%.0f embd_scale=%.1f\n",
+                    r->final_logit_softcapping, r->rope_freq_base_swa, r->embd_scale);
+        }
+    }
+
     r->n_deepstack = hllm_get_int(gguf, ARCH_KEY("n_deepstack_layers"), 0);
     if (r->verbose >= 1 && r->n_deepstack > 0) {
         fprintf(stderr, "hip_llm: n_deepstack=%d\n", r->n_deepstack);
     }
 
     #undef ARCH_KEY
-
 
     if (r->verbose >= 1) {
         fprintf(stderr, "hip_llm: arch=%s n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d\n",
@@ -8010,9 +8567,16 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
     } else if (embd.type == GGML_TYPE_Q2_K) {
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
+    } else if (embd.type == GGML_TYPE_Q4_0) {
+        /* Keep Q4_0 token_embd raw + dedicated embed_q4_0 lookup. Dequanting the
+         * embedding to F16 (the generic path below) loses ~6e-4 of precision per
+         * element; over 48 layers that seed perturbation amplifies chaotically and
+         * garbles the output (the all-Q4_0 Gemma4 QAT model). matvec_q4_0 handles
+         * the tied lm_head at full precision too. */
+        if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
     } else if (embd.type == GGML_TYPE_Q3_K || embd.type == GGML_TYPE_Q4_K ||
                embd.type == GGML_TYPE_Q5_K || embd.type == GGML_TYPE_Q6_K ||
-               embd.type == GGML_TYPE_Q4_0 || embd.type == GGML_TYPE_Q4_1 ||
+               embd.type == GGML_TYPE_Q4_1 ||
                embd.type == GGML_TYPE_Q5_0 || embd.type == GGML_TYPE_Q5_1 ||
                embd.type == GGML_TYPE_IQ2_XXS || embd.type == GGML_TYPE_IQ2_XS ||
                embd.type == GGML_TYPE_IQ2_S   || embd.type == GGML_TYPE_IQ3_XXS ||
@@ -8078,7 +8642,88 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         qtensor t = hllm_load_tensor(gguf, name, 1);
         if (upload_norm_f32(&cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
 
-        if (is_ssm) {
+        if (r->is_gemma4) {
+            /* === Gemma4 per-layer setup === */
+            cl->is_swa = r->swa_pattern[l];
+            cl->shared_kv_source = -1;
+            cl->layer_scale_val = 1.0f;
+            cl->post_attn_norm_w = NULL;
+            cl->post_ffw_norm_w = NULL;
+            cl->ple_inp_gate_w = NULL;
+            cl->ple_proj_w = NULL;
+            cl->ple_post_norm_w = NULL;
+
+            int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
+            int local_kv_heads = r->per_layer_kv_heads[l];
+            cl->local_head_dim = hd;
+            cl->local_kv_heads = local_kv_heads;
+
+            /* Determine shared KV source */
+            if (l >= r->n_layer_kv_from_start) {
+                cl->shared_kv_source = r->n_layer_kv_from_start - (cl->is_swa ? 2 : 1);
+                if (cl->shared_kv_source < 0) cl->shared_kv_source = 0;
+            }
+
+            /* Q projection (always present) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
+
+            /* K/V only for layers with own KV */
+            if (cl->shared_kv_source < 0) {
+                snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
+                t = hllm_load_tensor(gguf, name, 1);
+                cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
+                if (upload_weight_matrix(&cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
+
+                snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
+                t = hllm_load_tensor(gguf, name, 1);
+                cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
+                if (upload_weight_matrix(&cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
+            }
+
+            snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
+
+            /* QK norm (per-layer head_dim) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            cl->has_qk_norm = (t.data != NULL);
+            if (t.data) { if (upload_norm_f32(&cl->attn_q_norm_w, &t, hd) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (t.data) { if (upload_norm_f32(&cl->attn_k_norm_w, &t, hd) != 0) return -1; }
+
+            /* Post-attention norm */
+            snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (t.data) { if (upload_norm_f32(&cl->post_attn_norm_w, &t, r->n_embd) != 0) return -1; }
+
+            /* PLE weights */
+            snprintf(name, sizeof(name), "blk.%d.inp_gate.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_weight_matrix(&cl->ple_inp_gate_w, &t, &(int){0}) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_weight_matrix(&cl->ple_proj_w, &t, &(int){0}) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_norm_f32(&cl->ple_post_norm_w, &t, r->n_embd) != 0) return -1; }
+
+            /* Layer output scale */
+            snprintf(name, sizeof(name), "blk.%d.layer_output_scale.weight", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data && t.type == GGML_TYPE_F32) {
+                cl->layer_scale_val = *(float *)t.data;
+            } else if (t.data) {
+                float sv; dequant_row(t.type, t.data, &sv, 1);
+                cl->layer_scale_val = sv;
+            }
+
+        } else if (is_ssm) {
             #define LOAD_SSM_W(field, suffix, rows_f, cols_f, type_f) do { \
                 snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
                 t = hllm_load_tensor(gguf, name, 1); \
@@ -8159,13 +8804,23 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         }
 
         /* FFN norm */
-        if (r->is_hybrid) {
+        if (r->is_gemma4) {
+            snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
+            /* Post-FFN norm */
+            snprintf(name, sizeof(name), "blk.%d.post_ffw_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (t.data) { if (upload_norm_f32(&cl->post_ffw_norm_w, &t, r->n_embd) != 0) return -1; }
+        } else if (r->is_hybrid) {
             snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
         } else {
             snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
         }
-        t = hllm_load_tensor(gguf, name, 1);
-        if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
 
         if (r->is_moe) {
             cl->is_moe = 1;
@@ -8235,15 +8890,44 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
 }
 
 static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
+    /* For Gemma4, use the maximum head_dim for buffer sizing */
     int kv_dim = r->n_kv_heads * r->head_dim;
     int q_dim = r->n_heads * r->head_dim;
+    if (r->is_gemma4) {
+        /* Gemma4: q_dim uses head_dim_full, kv_dim uses per-layer max */
+        q_dim = r->n_heads * r->head_dim_full;
+        kv_dim = r->n_kv_heads * r->head_dim_full;
+    }
 
     /* Allocate KV cache */
     r->d_key_cache = (void **)calloc(r->n_layers, sizeof(void *));
     r->d_value_cache = (void **)calloc(r->n_layers, sizeof(void *));
-    size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
     for (int l = 0; l < r->n_layers; l++) {
         if (r->layers[l].is_ssm) continue;
+        size_t kv_cache_size;
+        if (r->is_gemma4) {
+            int local_kv = r->layers[l].local_kv_heads;
+            int local_hd = r->layers[l].local_head_dim;
+            size_t layer_kv = (size_t)local_kv * local_hd * sizeof(float);
+            if (r->layers[l].shared_kv_source >= 0) {
+                /* Shared KV: alias to source layer */
+                int src = r->layers[l].shared_kv_source;
+                r->d_key_cache[l] = r->d_key_cache[src];
+                r->d_value_cache[l] = r->d_value_cache[src];
+                continue;
+            } else if (r->layers[l].is_swa) {
+                /* Circular cache holds window+chunk recent positions (see loader). */
+                kv_cache_size = (size_t)r->swa_cache_len * layer_kv;
+            } else {
+                /* Full-attention layer. Only 1 KV head (num_global_key_value_heads),
+                 * so layer_kv is small even at long context; allocate the linear
+                 * max_seq_len cache. Value-less (V=K) layers still need a V cache:
+                 * V is the un-RoPE'd normed K, which differs from the RoPE'd K cache. */
+                kv_cache_size = (size_t)max_seq_len * layer_kv;
+            }
+        } else {
+            kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
+        }
         CHECK_HIP(hipMalloc(&r->d_key_cache[l], kv_cache_size));
         CHECK_HIP(hipMemset(r->d_key_cache[l], 0, kv_cache_size));
         CHECK_HIP(hipMalloc(&r->d_value_cache[l], kv_cache_size));
@@ -8344,6 +9028,17 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     CHECK_HIP(hipMalloc((void **)&r->d_position, sizeof(int)));
     CHECK_HIP(hipMemset(r->d_position, 0, sizeof(int)));
 
+    /* Gemma4 PLE buffers */
+    if (r->is_gemma4 && r->n_embd_per_layer > 0) {
+        int ple_dim = r->n_embd_per_layer;
+        CHECK_HIP(hipMalloc(&r->d_ple_combined, (size_t)r->n_layers * ple_dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_ple_buf, ple_dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_ple_proj, r->n_embd * sizeof(float)));
+        if (r->verbose >= 1)
+            fprintf(stderr, "hip_llm: Gemma4 PLE buffers allocated (ple_dim=%d, %.1f MB)\n",
+                    ple_dim, (double)(r->n_layers * ple_dim + ple_dim + r->n_embd) * sizeof(float) / (1024.0*1024.0));
+    }
+
 #ifdef LLM_HIPBLASLT_ENABLED
     /* === Phase 2: prepare BF16 weight copies + batched activation buffers
      * for hipBLASLt prefill GEMMs. Only enabled for non-hybrid, non-MoE,
@@ -8355,6 +9050,10 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          *     (160-200 MB each), so default 4096 risks OOM on 27B-class models.
          * LLM_BMAX env still overrides. */
         int batch_max = r->is_hybrid ? 1024 : 4096;
+        /* Gemma4 prefill is chunked at gemma_prefill_chunk rows; sizing the batch
+         * scratch buffers larger than that only wastes VRAM (and risks OOM at the
+         * large KV caches needed for long context). */
+        if (r->is_gemma4 && r->gemma_prefill_chunk > 0) batch_max = r->gemma_prefill_chunk;
         const char *env_bm = getenv("LLM_BMAX");
         if (env_bm) batch_max = atoi(env_bm);
         if (batch_max < 1) batch_max = 1;
@@ -8402,7 +9101,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         {
             const char *eg = getenv("LLM_GEMM");
             int user_forced = (eg && (strcmp(eg, "own") == 0 || strcmp(eg, "blaslt") == 0));
-            if (!user_forced && eligible && !r->is_moe && r->n_embd >= 4096) {
+            if (!user_forced && eligible && !r->is_moe && (r->n_embd >= 4096 || r->is_gemma4)) {
                 r->gemm_own = 0;  /* prefer hipBLASLt for large dense GEMMs */
             }
         }
@@ -8817,6 +9516,15 @@ static inline void launch_qknorm_batch(hip_llm_runner *r, void *vec, void *w,
            bdim * sizeof(float), r->stream, args);
 }
 
+/* Weightless per-head RMS norm over n_rows (n_rows=1 for decode). Handles head_dim>256. */
+static inline void launch_raw_rmsnorm_heads_batch(hip_llm_runner *r, void *vec,
+                                                  int n_heads, int head_dim,
+                                                  int n_rows, int row_stride, float eps) {
+    void *args[] = { &vec, &n_heads, &head_dim, &n_rows, &row_stride, &eps };
+    LAUNCH(r->fn_raw_rmsnorm_heads_batch_f32, n_heads, n_rows, 1, 256, 1, 1,
+           256 * sizeof(float), r->stream, args);
+}
+
 static inline void launch_rope(hip_llm_runner *r, void *vec, int n_heads,
                                 int head_dim, int pos, float freq_base) {
     if (r->use_mrope) {
@@ -8852,8 +9560,8 @@ static inline void launch_attention(hip_llm_runner *r, void *out, void *q,
 }
 
 /* === Phase 5: device-pointer launchers (read position from r->d_position) === */
-static inline void launch_rope_devp(hip_llm_runner *r, void *vec, int n_heads,
-                                     int head_dim, float freq_base) {
+static inline void launch_rope_devp_ff(hip_llm_runner *r, void *vec, int n_heads,
+                                        int head_dim, float freq_base, void *freq_factors) {
     int half_dim = head_dim / 2;
     int *pos_p = r->d_position;
     if (r->use_mrope) {
@@ -8864,15 +9572,19 @@ static inline void launch_rope_devp(hip_llm_runner *r, void *vec, int n_heads,
         LAUNCH(r->fn_rope_mrope_f32_devp, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
     } else {
         int n_rope_pairs = r->n_rope_pairs;
-        void *args[] = { &vec, &n_heads, &head_dim, &pos_p, &freq_base, &n_rope_pairs };
+        void *args[] = { &vec, &n_heads, &head_dim, &pos_p, &freq_base, &n_rope_pairs, &freq_factors };
         LAUNCH(r->fn_rope_neox_f32_devp, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
     }
 }
+static inline void launch_rope_devp(hip_llm_runner *r, void *vec, int n_heads,
+                                     int head_dim, float freq_base) {
+    launch_rope_devp_ff(r, vec, n_heads, head_dim, freq_base, NULL);
+}
 
 static inline void launch_kv_store_devp(hip_llm_runner *r, void *key_cache, void *value_cache,
-                                         void *k, void *v, int kv_dim) {
+                                         void *k, void *v, int kv_dim, int cache_len) {
     int *pos_p = r->d_position;
-    void *args[] = { &key_cache, &value_cache, &k, &v, &pos_p, &kv_dim };
+    void *args[] = { &key_cache, &value_cache, &k, &v, &pos_p, &kv_dim, &cache_len };
     LAUNCH(r->fn_kv_cache_store_devp, (kv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
@@ -8902,6 +9614,12 @@ static inline void launch_embed_q8_0(hip_llm_runner *r, void *dst, void *embd_ta
                                       int token_id, int n_embd) {
     void *args[] = { &dst, &embd_table, &token_id, &n_embd };
     LAUNCH(r->fn_embed_q8_0, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_embed_q4_0(hip_llm_runner *r, void *dst, void *embd_table,
+                                      int token_id, int n_embd) {
+    void *args[] = { &dst, &embd_table, &token_id, &n_embd };
+    LAUNCH(r->fn_embed_q4_0, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_matvec_q8_f32(hip_llm_runner *r, void *dst, void *mat,
@@ -9110,6 +9828,21 @@ static inline int launch_dequant_q8_0_to_bf16(hip_llm_runner *r,
     return 0;
 }
 
+static inline int launch_dequant_q4_0_to_bf16(hip_llm_runner *r,
+                                              void *dst, void *mat,
+                                              int n_rows, int n_cols) {
+    if ((n_cols % 32) != 0) return -1;
+    void *args[] = { &dst, &mat, &n_rows, &n_cols };
+    int chunks = (n_cols + 255) / 256;
+    hipError_t e = LAUNCH(r->fn_dequant_q4_0_to_bf16, n_rows, chunks, 1,
+                          256, 1, 1, 0, r->stream, args);
+    if (e != hipSuccess) {
+        fprintf(stderr, "hip_llm: dequant_q4_0 launch failed: %d\n", e);
+        return -1;
+    }
+    return 0;
+}
+
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
  * dequant into r->d_wbuf_bf16 if the weight is not F16-pre-converted.
  * NOTE: returns r->d_wbuf_bf16 for non-F16 paths; the caller must consume the
@@ -9180,6 +9913,9 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
         }
         case GGML_TYPE_Q8_0:
             if (launch_dequant_q8_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q4_0:
+            if (launch_dequant_q4_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q2_K:
             launch_dequant_q2_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
@@ -9259,17 +9995,25 @@ static inline void launch_pack_kv_cache_f16(hip_llm_runner *r,
     }
 }
 
-static inline void launch_rope_neox_batch(hip_llm_runner *r, void *vec_batch,
+static inline void launch_rope_neox_batch_ff(hip_llm_runner *r, void *vec_batch,
                                            int n_heads, int head_dim,
                                            int position_start, float freq_base,
-                                           int n_rope_pairs, int row_stride, int M) {
+                                           int n_rope_pairs, int row_stride, int M,
+                                           void *freq_factors) {
     int half_dim = head_dim / 2;
     int block = half_dim;
     if (block < 1) block = 1;
     void *args[] = { &vec_batch, &n_heads, &head_dim, &position_start,
-                     &freq_base, &n_rope_pairs, &row_stride };
+                     &freq_base, &n_rope_pairs, &row_stride, &freq_factors };
     LAUNCH(r->fn_rope_neox_batch_f32, n_heads, M, 1, block, 1, 1, 0,
            r->stream, args);
+}
+static inline void launch_rope_neox_batch(hip_llm_runner *r, void *vec_batch,
+                                           int n_heads, int head_dim,
+                                           int position_start, float freq_base,
+                                           int n_rope_pairs, int row_stride, int M) {
+    launch_rope_neox_batch_ff(r, vec_batch, n_heads, head_dim, position_start,
+                              freq_base, n_rope_pairs, row_stride, M, NULL);
 }
 
 static inline void launch_rope_mrope_batch(hip_llm_runner *r, void *vec_batch,
@@ -9297,6 +10041,19 @@ static inline void launch_kv_store_batch(hip_llm_runner *r,
            r->stream, args);
 }
 
+/* Strided variant: kv_dim is the destination stride, batch_stride the source.
+ * cache_len > 0 enables circular indexing (slot = pos % cache_len) for SWA. */
+static inline void launch_kv_store_batch_strided(hip_llm_runner *r,
+    void *key_cache, void *value_cache,
+    void *k_batch, void *v_batch,
+    int position_start, int M, int kv_dim, int batch_stride, int cache_len) {
+    int total = M * kv_dim;
+    void *args[] = { &key_cache, &value_cache, &k_batch, &v_batch,
+                     &position_start, &M, &kv_dim, &batch_stride, &cache_len };
+    LAUNCH(r->fn_kv_cache_store_batch_strided, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
 static inline void launch_flash_attn_causal(hip_llm_runner *r,
                                              void *out, void *q_f16,
                                              void *k_f16, void *v_f16,
@@ -9321,6 +10078,58 @@ static inline void launch_flash_attn_causal(hip_llm_runner *r,
         LAUNCH(r->fn_flash_attn_wmma_f16_4w_causal_hd256, n_heads, q_blocks, 1, 128, 1, 1,
                smem_bytes, r->stream, args);
     }
+}
+
+/* Bounded online-softmax (flash) prefill attention. Grid (n_heads, M), block 256.
+ * Smem = (2*head_dim + 2*256) floats, independent of seq_len. window>0 => SWA,
+ * cache_len = circular cache size. Launch error is reported (these used to fail
+ * silently when the old kernel requested > 64KB LDS). */
+static inline void launch_attn_prefill_flash(hip_llm_runner *r,
+    void *out, void *q, void *key_cache, void *value_cache,
+    int n_heads, int n_kv_heads, int head_dim, int kv_dim,
+    int M, int position_start, float scale, int window, int cache_len) {
+    void *args[] = { &out, &q, &key_cache, &value_cache,
+        &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+        &M, &position_start, &scale, &window, &cache_len };
+    size_t smem = ((size_t)(2 * head_dim + 2 * 256)) * sizeof(float);
+    hipError_t err = LAUNCH(r->fn_attn_prefill_flash_f32, n_heads, M, 1, 256, 1, 1,
+                            smem, r->stream, args);
+    if (err != hipSuccess)
+        fprintf(stderr, "hip_llm: attn_prefill_flash launch failed (M=%d hd=%d smem=%zu err=%d)\n",
+                M, head_dim, smem, (int)err);
+}
+
+/* Bounded online-softmax (flash) decode attention. Grid (n_heads,1), block 256.
+ * Reads position from device pointer (graph-capturable). */
+static inline void launch_attn_decode_flash(hip_llm_runner *r,
+    void *out, void *q, void *key_cache, void *value_cache,
+    int n_heads, int n_kv_heads, int head_dim, int kv_dim,
+    float scale, int window, int cache_len) {
+    int *pos_p = r->d_position;
+    void *args[] = { &out, &q, &key_cache, &value_cache,
+        &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+        &pos_p, &scale, &window, &cache_len };
+    size_t smem = ((size_t)(2 * head_dim + 2 * 256)) * sizeof(float);
+    LAUNCH(r->fn_attn_decode_flash_f32_devp, n_heads, 1, 1, 256, 1, 1,
+           smem, r->stream, args);
+}
+
+/* WMMA flash attention for Gemma4 full-attention layers (head_dim 512). Reads the
+ * F32 KV cache directly. Grid (n_heads, ceil(M/16)), 1 wave/block, O in LDS. */
+static inline void launch_flash_attn_wmma_hd512(hip_llm_runner *r,
+    void *out, void *q, void *key_cache, void *value_cache,
+    int M, int kv_len, int position_start,
+    int n_heads, int n_kv_heads, int head_dim, int kv_dim, float scale) {
+    void *args[] = { &out, &q, &key_cache, &value_cache,
+        &M, &kv_len, &position_start, &n_heads, &n_kv_heads, &head_dim, &kv_dim, &scale };
+    /* smK 16K + smV 16K (f16) + smScore 4*256 f32 = ~36.5 KB (smP overlaps smK). */
+    size_t smem = (size_t)(2 * 16 * 512) * 2 + (size_t)(4 * 256) * 4;
+    int qblocks = (M + 15) / 16;
+    hipError_t err = LAUNCH(r->fn_flash_attn_wmma_hd512_causal, n_heads, qblocks, 1, 128, 1, 1,
+                            smem, r->stream, args);
+    if (err != hipSuccess)
+        fprintf(stderr, "hip_llm: flash_attn_wmma_hd512 launch failed (M=%d smem=%zu err=%d)\n",
+                M, smem, (int)err);
 }
 
 /* SSM launch helpers */
@@ -9623,10 +10432,22 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
     /* 1. Token embedding lookup -> F32 (outside captured graph) */
     if (r->token_embd_type == GGML_TYPE_Q8_0) {
         launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    }
+
+    /* Gemma4 scales token embeddings by sqrt(n_embd). This must run for EVERY token
+     * (hip_llm_forward_logits also does it, but this per-token prefill entry must
+     * too, or the residual stream uses an unscaled embedding for all but the last). */
+    if (r->is_gemma4) {
+        int n = n_embd;
+        float scale = r->embd_scale;
+        void *a[] = { &r->d_x, &scale, &n };
+        LAUNCH(r->fn_scale_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
     }
 
     return hip_llm_forward_blocks(r, position);
@@ -10111,7 +10932,131 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
     }
 
-        if (r->is_hybrid && cl->is_ssm) {
+    /* === Gemma4 layer === */
+    if (r->is_gemma4) {
+        int hd = cl->local_head_dim;
+        int local_kv_heads = cl->local_kv_heads;
+        int local_kv_dim = local_kv_heads * hd;
+        int local_q_dim = n_heads * hd;
+        int local_gqa = n_heads / local_kv_heads;
+        int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
+        /* Value-less (global/full-attn) layers: V = K (config attention_k_eq_v). */
+        int v_eq_k = (cl->shared_kv_source < 0) && (cl->attn_v_rows <= 0);
+
+        /* Q projection */
+        launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb,
+                          cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+
+        /* K/V projections (skip if sharing KV; skip V when V==K) */
+        if (cl->shared_kv_source < 0) {
+            launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb,
+                              cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+            if (!v_eq_k)
+                launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb,
+                                  cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+        }
+
+        /* V = K (raw k_proj, BEFORE k_norm) for value-less layers. matches llama.cpp:
+         * Vcur = Kcur (pre-k_norm), then a weightless per-head RMS norm; K instead gets
+         * the learned k_norm + RoPE. So copy here, before k_norm runs. */
+        if (v_eq_k)
+            hipMemcpyAsync(r->d_v, r->d_k, (size_t)local_kv_dim * sizeof(float),
+                           hipMemcpyDeviceToDevice, r->stream);
+
+        /* QK norm (per-layer head_dim) — applies to K only (not the V copy). */
+        if (cl->has_qk_norm) {
+            if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, hd, eps);
+            if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, local_kv_heads, hd, eps);
+        }
+
+        /* V raw RMSNorm (weightless, per head) — applied to V for every KV-bearing
+         * layer (matches llama.cpp Vcur = ggml_rms_norm(Vcur, eps)). V is not RoPE'd.
+         * Use the batched kernel (n_rows=1): it handles head_dim>256 (full-attn hd=512). */
+        if (cl->shared_kv_source < 0)
+            launch_raw_rmsnorm_heads_batch(r, r->d_v, local_kv_heads, hd, 1, local_kv_dim, eps);
+
+        /* RoPE: SWA uses base_swa (no freq_factors); full-attn uses base + proportional
+         * freq_factors. V is never RoPE'd. */
+        if (cl->is_swa) {
+            launch_rope_devp(r, r->d_q, n_heads, hd, r->rope_freq_base_swa);
+            if (cl->shared_kv_source < 0)
+                launch_rope_devp(r, r->d_k, local_kv_heads, hd, r->rope_freq_base_swa);
+        } else {
+            launch_rope_devp_ff(r, r->d_q, n_heads, hd, r->rope_freq_base, r->d_rope_freq_factors);
+            if (cl->shared_kv_source < 0)
+                launch_rope_devp_ff(r, r->d_k, local_kv_heads, hd, r->rope_freq_base, r->d_rope_freq_factors);
+        }
+
+        /* KV cache store. SWA uses a circular cache (slot = pos % swa_cache_len);
+         * full-attn uses a linear cache (cache_len = max_seq_len => no wrap). */
+        int dec_cache_len = cl->is_swa ? r->swa_cache_len : r->max_seq_len;
+        if (cl->shared_kv_source < 0) {
+            launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
+                                 r->d_k, r->d_v, local_kv_dim, dec_cache_len);
+        }
+
+        /* Attention: scale=1.0 (QK norms handle scaling). Bounded online-softmax
+         * kernel works for both SWA (window>0) and full (window=0) and never
+         * exceeds LDS regardless of -s. */
+        {
+            float scale = 1.0f;
+            int win = cl->is_swa ? r->swa_window_size : 0;
+            launch_attn_decode_flash(r, r->d_xb2, r->d_q,
+                                     r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                                     n_heads, local_kv_heads, hd, local_kv_dim,
+                                     scale, win, dec_cache_len);
+        }
+
+        /* Output projection */
+        launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
+                          cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+
+        /* Post-attention norm */
+        if (cl->post_attn_norm_w) {
+            launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_attn_norm_w, n_embd, eps);
+        }
+
+        /* Attention residual: x += xb */
+        launch_add(r, r->d_x, r->d_xb, n_embd);
+
+        /* FFN: RMSNorm */
+        launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
+
+        /* FFN gate + up */
+        launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                          cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
+        launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                          cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+
+        /* GELU * up (not SiLU) */
+        {
+            int n = cl->ffn_gate_rows;
+            void *a[] = { &r->d_gate, &r->d_up, &n };
+            LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
+
+        /* FFN down */
+        launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
+                          cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+
+        /* Post-FFN norm */
+        if (cl->post_ffw_norm_w) {
+            launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_ffw_norm_w, n_embd, eps);
+        }
+
+        /* FFN residual: x += xb */
+        launch_add(r, r->d_x, r->d_xb, n_embd);
+
+        /* Layer output scale */
+        if (cl->layer_scale_val != 1.0f) {
+            int n = n_embd;
+            void *a[] = { &r->d_x, &cl->layer_scale_val, &n };
+            LAUNCH(r->fn_scale_f32, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
+
+        goto gemma4_layer_done;
+
+    } else if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
             int qkv_dim = r->ssm_qkv_dim;
             int d_state = r->ssm_d_state;
@@ -10237,7 +11182,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
 
             launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
-                                 r->d_k, r->d_v, kv_dim);
+                                 r->d_k, r->d_v, kv_dim, r->max_seq_len);
 
             float scale = 1.0f / sqrtf((float)head_dim);
             size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
@@ -10300,7 +11245,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
 
             launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
-                                 r->d_k, r->d_v, kv_dim);
+                                 r->d_k, r->d_v, kv_dim, r->max_seq_len);
 
             float scale = 1.0f / sqrtf((float)head_dim);
             size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
@@ -10369,6 +11314,7 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             }
         }
 
+gemma4_layer_done:
 ffn_done:
         /* DeepStack injection */
         if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
@@ -10537,15 +11483,26 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
     /* Embed (outside captured graph — token_id varies) */
     if (r->token_embd_type == GGML_TYPE_Q8_0) {
         launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+        launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
 
+    /* Gemma4: scale token embeddings by sqrt(n_embd) */
+    if (r->is_gemma4) {
+        int n = n_embd;
+        float scale = r->embd_scale;
+        void *a[] = { &r->d_x, &scale, &n };
+        LAUNCH(r->fn_scale_f32, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+    }
+
     /* Position is consumed by *_devp launchers via r->d_position */
     hipMemcpyAsync(r->d_position, &position, sizeof(int),
                    hipMemcpyHostToDevice, r->stream);
+    r->cur_position = position;
 
     if (r->graph_ready_logits) {
         hipGraphLaunch(r->graph_exec_logits, r->stream);
@@ -10553,6 +11510,13 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
         forward_blocks_body(r);
         launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
                            r->n_vocab, r->n_embd, r->output_w_type);
+        /* Gemma4: final logit softcapping */
+        if (r->is_gemma4 && r->final_logit_softcapping > 0.0f) {
+            float cap = r->final_logit_softcapping;
+            int n = r->n_vocab;
+            void *a[] = { &r->d_logits, &n, &cap };
+            LAUNCH(r->fn_logit_softcap_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
         hipMemcpyAsync(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float),
                        hipMemcpyDeviceToHost, r->stream);
     }
@@ -10794,70 +11758,135 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                                 r->d_qfull_batch, n_heads, head_dim, M);
             }
         }
+
+        /* Gemma4 per-layer dimensions (used by K/V GEMMs, bias, QK-norm, RoPE, KV store, attention) */
+        int l_hd = head_dim, l_qdim = q_dim, l_kvdim = kv_dim, l_nkv = n_kv_heads;
+        if (r->is_gemma4) {
+            l_hd = cl->local_head_dim ? cl->local_head_dim : head_dim;
+            l_nkv = cl->local_kv_heads ? cl->local_kv_heads : n_kv_heads;
+            l_qdim = n_heads * l_hd;
+            l_kvdim = l_nkv * l_hd;
+        }
+
         {
             void *kw = get_bf16_weight(r, cl->attn_k_w, cl->attn_k_w_bf16,
                                        cl->attn_k_type, cl->attn_k_rows, cl->attn_k_cols);
             if (!kw) return -1;
             if (gemm_run_bf16_w(r, r->d_k_batch, kw,
-                                   r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+                                   r->d_xnorm_batch_bf16, M, l_kvdim, n_embd, r->stream) != 0) return -1;
         }
-        {
+        /* Gemma4 "global"/full-attention layers have no v_proj: V = K (config
+         * attention_k_eq_v). matches llama.cpp: Vcur = Kcur (the RAW k_proj, before
+         * k_norm), then a weightless per-head RMS norm; V is not RoPE'd. So copy K->V
+         * HERE (pre-k_norm), then k_norm runs on K only, then V gets its raw RMS norm. */
+        int v_eq_k = r->is_gemma4 && (cl->shared_kv_source < 0) && (cl->attn_v_rows <= 0);
+        if (v_eq_k) {
+            hipMemcpyAsync(r->d_v_batch, r->d_k_batch, (size_t)M * l_kvdim * sizeof(float),
+                           hipMemcpyDeviceToDevice, r->stream);
+        } else {
             void *vw = get_bf16_weight(r, cl->attn_v_w, cl->attn_v_w_bf16,
                                        cl->attn_v_type, cl->attn_v_rows, cl->attn_v_cols);
-            if (!vw) return -1;
-            if (gemm_run_bf16_w(r, r->d_v_batch, vw,
-                                   r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+            if (!vw || cl->attn_v_rows <= 0) {
+                hipMemsetAsync(r->d_v_batch, 0, (size_t)M * l_kvdim * sizeof(float), r->stream);
+            } else if (gemm_run_bf16_w(r, r->d_v_batch, vw,
+                                           r->d_xnorm_batch_bf16, M, l_kvdim, n_embd, r->stream) != 0) return -1;
         }
 
-        /* ---- Biases (per-row loop kept; one launch per row is cheap, only 3 × M
-         *      ~ several thousand launches at L=1024 — defer to a batched bias kernel
-         *      if it shows up in profile. QK-norm is the heavy one and is batched.) ---- */
+        /* ---- Biases ---- */
         if (cl->attn_q_bias || cl->attn_k_bias || cl->attn_v_bias) {
             for (int m = 0; m < M; m++) {
-                float *qrow = (float *)r->d_q_batch + (size_t)m * q_dim;
-                float *krow = (float *)r->d_k_batch + (size_t)m * kv_dim;
-                float *vrow = (float *)r->d_v_batch + (size_t)m * kv_dim;
-                if (cl->attn_q_bias) launch_add(r, qrow, cl->attn_q_bias, q_dim);
-                if (cl->attn_k_bias) launch_add(r, krow, cl->attn_k_bias, kv_dim);
-                if (cl->attn_v_bias) launch_add(r, vrow, cl->attn_v_bias, kv_dim);
+                float *qrow = (float *)r->d_q_batch + (size_t)m * l_qdim;
+                float *krow = (float *)r->d_k_batch + (size_t)m * l_kvdim;
+                float *vrow = (float *)r->d_v_batch + (size_t)m * l_kvdim;
+                if (cl->attn_q_bias) launch_add(r, qrow, cl->attn_q_bias, l_qdim);
+                if (cl->attn_k_bias) launch_add(r, krow, cl->attn_k_bias, l_kvdim);
+                if (cl->attn_v_bias) launch_add(r, vrow, cl->attn_v_bias, l_kvdim);
             }
         }
-        /* ---- QK-norm: batched over M rows ---- */
+        /* ---- QK-norm: batched over M rows ----
+         * NOTE: row strides MUST be the per-layer packed widths (l_qdim/l_kvdim),
+         * not the global q_dim/kv_dim. The Q/K GEMMs write rows contiguously at the
+         * local width; for Gemma4 SWA layers (head_dim 256 vs full 512) the global
+         * stride is 2x too large and would read stale data from the prior layer. */
         if (cl->has_qk_norm) {
             if (cl->attn_q_norm_w)
                 launch_qknorm_batch(r, r->d_q_batch, cl->attn_q_norm_w,
-                                    n_heads,    head_dim, M, q_dim,  eps);
+                                    n_heads, l_hd, M, l_qdim, eps);
             if (cl->attn_k_norm_w)
                 launch_qknorm_batch(r, r->d_k_batch, cl->attn_k_norm_w,
-                                    n_kv_heads, head_dim, M, kv_dim, eps);
+                                    l_nkv, l_hd, M, l_kvdim, eps);
         }
+
+        /* V raw RMSNorm (weightless, per head) for every KV-bearing layer — matches
+         * llama.cpp Vcur = ggml_rms_norm(Vcur, eps). V is not RoPE'd. */
+        if (r->is_gemma4 && cl->shared_kv_source < 0)
+            launch_raw_rmsnorm_heads_batch(r, r->d_v_batch, l_nkv, l_hd, M, l_kvdim, eps);
 
         /* ---- Batched RoPE on Q and K (one launch each, grid=(n_heads, M)) ---- */
         if (r->use_mrope) {
             int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
             int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
-            launch_rope_mrope_batch(r, r->d_q_batch, n_heads,    head_dim,
+            launch_rope_mrope_batch(r, r->d_q_batch, n_heads,    l_hd,
                                     position_start, r->rope_freq_base,
-                                    s0, s1, s2, s3, q_dim,  M);
-            launch_rope_mrope_batch(r, r->d_k_batch, n_kv_heads, head_dim,
+                                    s0, s1, s2, s3, l_qdim,  M);
+            launch_rope_mrope_batch(r, r->d_k_batch, l_nkv, l_hd,
                                     position_start, r->rope_freq_base,
-                                    s0, s1, s2, s3, kv_dim, M);
+                                    s0, s1, s2, s3, l_kvdim, M);
         } else {
-            launch_rope_neox_batch(r, r->d_q_batch, n_heads,    head_dim,
-                                   position_start, r->rope_freq_base,
-                                   r->n_rope_pairs, q_dim,  M);
-            launch_rope_neox_batch(r, r->d_k_batch, n_kv_heads, head_dim,
-                                   position_start, r->rope_freq_base,
-                                   r->n_rope_pairs, kv_dim, M);
+            /* Per-layer RoPE base (Gemma4 SWA uses freq_base_swa, full uses freq_base)
+             * and n_rope_pairs=0 for Gemma4 so the kernel rotates the full per-layer
+             * head_dim (l_hd); the global n_rope_pairs=256 would force rope_dim=512 on
+             * the 256-wide SWA heads, corrupting their positional encoding. */
+            float l_base = (r->is_gemma4 && cl->is_swa) ? r->rope_freq_base_swa : r->rope_freq_base;
+            int   l_npairs = r->is_gemma4 ? 0 : r->n_rope_pairs;
+            /* Full-attention layers use proportional RoPE (freq_factors); SWA does not. */
+            void *l_ff = (r->is_gemma4 && !cl->is_swa) ? r->d_rope_freq_factors : NULL;
+            launch_rope_neox_batch_ff(r, r->d_q_batch, n_heads,    l_hd,
+                                   position_start, l_base,
+                                   l_npairs, l_qdim,  M, l_ff);
+            launch_rope_neox_batch_ff(r, r->d_k_batch, l_nkv, l_hd,
+                                   position_start, l_base,
+                                   l_npairs, l_kvdim, M, l_ff);
         }
 
-        /* ---- Batched KV cache store (M rows in one launch) ---- */
-        launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
-                              r->d_k_batch, r->d_v_batch,
-                              position_start, M, kv_dim);
+        /* ---- Batched KV cache store ---- */
+        /* SWA layers use a circular cache (slot = pos % swa_cache_len); full-attn
+         * layers use a linear cache (cache_len = max_seq_len => no wrap). */
+        int pf_cache_len = (r->is_gemma4 && cl->is_swa) ? r->swa_cache_len : r->max_seq_len;
+        int pf_window    = (r->is_gemma4 && cl->is_swa) ? r->swa_window_size : 0;
+        if (r->is_gemma4) {
+            /* Source (batch) stride must be l_kvdim — the packed width the V/K GEMMs
+             * wrote — not the global kv_dim (2x too large for SWA layers). */
+            launch_kv_store_batch_strided(r, r->d_key_cache[l], r->d_value_cache[l],
+                                          r->d_k_batch, r->d_v_batch,
+                                          position_start, M, l_kvdim, l_kvdim, pf_cache_len);
+        } else {
+            launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
+                                  r->d_k_batch, r->d_v_batch,
+                                  position_start, M, kv_dim);
+        }
 
-        /* ---- Attention: WMMA flash-attention if eligible, else per-row scalar ---- */
-        if (r->fa_path_ok) {
+        /* ---- Attention ---- */
+        if (r->is_gemma4) {
+            /* Gemma4: bounded online-softmax (flash) attention. Handles SWA
+             * (window>0, circular cache) and full (window=0, linear cache) and
+             * never exceeds LDS regardless of sequence length (scales to pp32k).
+             * Gemma4 uses attention scale = 1.0 (self.scaling=1.0); the Q/K RMS
+             * norms set the magnitude, so there is NO 1/sqrt(head_dim) factor. */
+            float l_scale = 1.0f;
+            if (!cl->is_swa && r->gemma_fa_wmma && l_hd == 512 && l_nkv == 1) {
+                /* Full-attention layers (the O(M^2) bottleneck): WMMA flash kernel. */
+                launch_flash_attn_wmma_hd512(r, r->d_attn_out_batch, r->d_q_batch,
+                                             r->d_key_cache[l], r->d_value_cache[l],
+                                             M, position_start + M, position_start,
+                                             n_heads, l_nkv, l_hd, l_kvdim, l_scale);
+            } else {
+                launch_attn_prefill_flash(r, r->d_attn_out_batch, r->d_q_batch,
+                                           r->d_key_cache[l], r->d_value_cache[l],
+                                           n_heads, l_nkv, l_hd, l_kvdim,
+                                           M, position_start, l_scale, pf_window, pf_cache_len);
+            }
+        } else if (r->fa_path_ok) {
             int kv_len = position_start + M;
             /* Pack K/V cache slice [0..kv_len) into transposed F16 scratch. */
             launch_pack_kv_cache_f16(r,
@@ -10892,18 +11921,28 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         }
 
         /* ---- Output projection: [M, q_dim] x W_o^T -> [M, n_embd] ---- */
+        int attn_out_elems = M * (r->is_gemma4 ? l_qdim : q_dim);
         launch_pack_bf16_from_f32(r, r->d_attn_out_batch_bf16,
-                                  r->d_attn_out_batch, M * q_dim);
+                                  r->d_attn_out_batch, attn_out_elems);
         {
             void *ow = get_bf16_weight(r, cl->attn_output_w, cl->attn_output_w_bf16,
                                        cl->attn_output_type, cl->attn_output_rows, cl->attn_output_cols);
             if (!ow) return -1;
+            int o_rows = r->is_gemma4 ? l_qdim : q_dim;
             if (gemm_run_bf16_w(r, r->d_attn_proj_batch, ow,
-                                   r->d_attn_out_batch_bf16, M, n_embd, q_dim, r->stream) != 0) return -1;
+                                   r->d_attn_out_batch_bf16, M, n_embd, o_rows, r->stream) != 0) return -1;
         }
 
-        /* Residual: x_batch += attn_proj */
-        launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
+        /* Residual with Gemma4 post-attention norm. llama.cpp applies the norm to the
+         * attention output (Wo·attn) and THEN adds the residual: x += post_attn_norm(attn_proj).
+         * (Earlier this normed the post-residual x, which is structurally wrong.) */
+        if (r->is_gemma4 && cl->post_attn_norm_w) {
+            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_attn_proj_batch,
+                                 cl->post_attn_norm_w, n_embd, M, n_embd, eps);
+            launch_add(r, r->d_x_batch, r->d_xnorm_batch, M * n_embd);
+        } else {
+            launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
+        }
 
 ffn_section:
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
@@ -10949,7 +11988,13 @@ ffn_section:
         }
 
         /* SiLU(gate) * up — elementwise across [M, n_ff] */
-        launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+        if (r->is_gemma4) {
+            int n = M * n_ff;
+            void *a[] = { &r->d_gate_batch, &r->d_up_batch, &n };
+            LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        } else {
+            launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+        }
 
         /* Pack and down projection */
         launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
@@ -10962,8 +12007,22 @@ ffn_section:
                                    r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
         }
 
-        /* Residual */
-        launch_add(r, r->d_x_batch, r->d_down_batch, M * n_embd);
+        /* Residual + Gemma4 post-FFN norm */
+        if (r->is_gemma4 && cl->post_ffw_norm_w) {
+            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_down_batch,
+                                 cl->post_ffw_norm_w, n_embd, M, n_embd, eps);
+            launch_add(r, r->d_x_batch, r->d_xnorm_batch, M * n_embd);
+        } else {
+            launch_add(r, r->d_x_batch, r->d_down_batch, M * n_embd);
+        }
+
+        /* Gemma4 layer output scale */
+        if (r->is_gemma4 && cl->layer_scale_val != 1.0f) {
+            int n = M * n_embd;
+            float sv = cl->layer_scale_val;
+            void *a[] = { &r->d_x_batch, &sv, &n };
+            LAUNCH(r->fn_scale_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
 
         /* DeepStack injection (per-row) — keep parity with per-token path */
         if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
@@ -10999,9 +12058,29 @@ ffn_section:
 static int batched_path_eligible(const hip_llm_runner *r, int M) {
     if (!r->batch_path_ok) return 0;
     if (M < r->gemm_m_threshold) return 0;
-    if (M > r->batch_max) return 0;
+    /* Paths that internally chunk the prefill (Gemma4 and batched-MoE) can accept
+     * M > batch_max; only the unchunked dense path is hard-capped at batch_max. */
+    if (M > r->batch_max && !r->is_gemma4 && !r->moe_prefill_batched) return 0;
     if (r->_ds_embd != NULL) return 0;  /* DeepStack handled in embed path only */
     return 1;
+}
+
+/* Per-chunk size for the batched prefill. Gemma4 uses a fixed chunk (SWA circular
+ * cache correctness); other models follow the legacy MoE/dense policy. Always
+ * capped at batch_max so the per-chunk activation buffers never overflow. */
+static int prefill_chunk_size(const hip_llm_runner *r, int n_tokens) {
+    int chunk;
+    if (r->is_gemma4)            chunk = r->gemma_prefill_chunk;
+    else if (r->moe_prefill_batched) chunk = r->gemm_own ? r->batch_max : 256;
+    else                         chunk = n_tokens;
+    { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { int c = atoi(e); if (c >= 1) chunk = c; } }
+    { const char *e = getenv("LLM_PREFILL_CHUNK"); if (e) { int c = atoi(e); if (c >= 1) chunk = c; } }
+    if (chunk > r->batch_max) chunk = r->batch_max;
+    /* Gemma4 SWA circular cache holds window+gemma_prefill_chunk positions; a larger
+     * chunk would overwrite still-needed keys mid-batch, so clamp hard. */
+    if (r->is_gemma4 && chunk > r->gemma_prefill_chunk) chunk = r->gemma_prefill_chunk;
+    if (chunk < 1) chunk = 1;
+    return chunk;
 }
 
 /* Embed M tokens into d_x_batch [M, n_embd] F32 using existing embed kernels.
@@ -11015,11 +12094,21 @@ static int embed_tokens_batch(hip_llm_runner *r,
         float *row = (float *)r->d_x_batch + (size_t)m * n_embd;
         if (r->token_embd_type == GGML_TYPE_Q8_0) {
             launch_embed_q8_0(r, row, r->d_token_embd, tid, n_embd);
+        } else if (r->token_embd_type == GGML_TYPE_Q4_0) {
+            launch_embed_q4_0(r, row, r->d_token_embd, tid, n_embd);
         } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
             launch_embed_q2_K(r, row, r->d_token_embd, tid, n_embd);
         } else {
             launch_embed(r, row, r->d_token_embd, tid, n_embd);
         }
+    }
+    /* Gemma4 scales token embeddings by sqrt(n_embd). The per-token path does this
+     * (forward_blocks); the batched path must too or hidden states are ~62x too small. */
+    if (r->is_gemma4) {
+        int n = M * n_embd;
+        float scale = r->embd_scale;
+        void *a[] = { &r->d_x_batch, &scale, &n };
+        LAUNCH(r->fn_scale_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
     }
     return 0;
 }
@@ -11035,8 +12124,12 @@ float *hip_llm_forward_batch(hip_llm_runner *r,
 
 #ifdef LLM_HIPBLASLT_ENABLED
     if (batched_path_eligible(r, n_tokens)) {
-        if (embed_tokens_batch(r, tokens, n_tokens) != 0) return NULL;
-        if (forward_block_batched_dense(r, n_tokens, position_start) != 0) return NULL;
+        int chunk = prefill_chunk_size(r, n_tokens);
+        for (int off = 0; off < n_tokens; off += chunk) {
+            int cc = n_tokens - off; if (cc > chunk) cc = chunk;
+            if (embed_tokens_batch(r, tokens + off, cc) != 0) return NULL;
+            if (forward_block_batched_dense(r, cc, position_start + off) != 0) return NULL;
+        }
         /* Returning NULL hidden buffer for now — callers needing logits use
          * forward_batch_logits. Most call sites only ask for the next token. */
         return (float *)r->d_x;
@@ -11063,9 +12156,9 @@ float *hip_llm_forward_batch_logits(hip_llm_runner *r,
     if (batched_path_eligible(r, n_tokens)) {
         /* Chunk the batch: hipBLASLt/Tensile fails to build plans for this model's
          * large SSM/MoE GEMM shapes at M>256, so process the prefill in <=256-token
-         * sub-batches. SSM conv/recurrent state and KV cache carry across chunks. */
-        int chunk = r->moe_prefill_batched ? (r->gemm_own ? r->batch_max : 256) : n_tokens;
-        { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { chunk = atoi(e); if (chunk < 1) chunk = n_tokens; } }
+         * sub-batches. SSM conv/recurrent state and KV cache carry across chunks.
+         * Gemma4 uses a fixed chunk for SWA circular-cache correctness. */
+        int chunk = prefill_chunk_size(r, n_tokens);
         for (int off = 0; off < n_tokens; off += chunk) {
             int cc = n_tokens - off; if (cc > chunk) cc = chunk;
             if (embed_tokens_batch(r, tokens + off, cc) != 0) return NULL;
@@ -11406,15 +12499,48 @@ void hip_llm_free(hip_llm_runner *r) {
 
     if (r->d_key_cache) {
         for (int l = 0; l < r->n_layers; l++) {
-            if (r->d_key_cache[l]) hipFree(r->d_key_cache[l]);
+            if (r->d_key_cache[l]) {
+                /* Skip shared-KV aliases to avoid double-free */
+                int is_alias = 0;
+                if (r->is_gemma4) {
+                    for (int k = 0; k < l; k++) {
+                        if (r->layers[k].shared_kv_source == l && r->d_key_cache[k] == r->d_key_cache[l]) {
+                            is_alias = 1; break;
+                        }
+                    }
+                }
+                if (!is_alias) hipFree(r->d_key_cache[l]);
+            }
         }
         free(r->d_key_cache);
     }
     if (r->d_value_cache) {
         for (int l = 0; l < r->n_layers; l++) {
-            if (r->d_value_cache[l]) hipFree(r->d_value_cache[l]);
+            if (r->d_value_cache[l]) {
+                int is_alias = 0;
+                if (r->is_gemma4) {
+                    for (int k = 0; k < l; k++) {
+                        if (r->layers[k].shared_kv_source == l && r->d_value_cache[k] == r->d_value_cache[l]) {
+                            is_alias = 1; break;
+                        }
+                    }
+                }
+                if (!is_alias) hipFree(r->d_value_cache[l]);
+            }
         }
         free(r->d_value_cache);
+    }
+
+    /* Gemma4 arrays and PLE buffers */
+    if (r->is_gemma4) {
+        free(r->swa_pattern);
+        free(r->per_layer_kv_heads);
+        free(r->h_rope_freq_factors);
+        free(r->h_rope_inv_freq_full);
+        free(r->h_rope_inv_freq_swa);
+        if (r->d_ple_combined) hipFree(r->d_ple_combined);
+        if (r->d_ple_buf)      hipFree(r->d_ple_buf);
+        if (r->d_ple_proj)     hipFree(r->d_ple_proj);
     }
 
     if (r->layers) {
@@ -11465,6 +12591,12 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->moe_shared_ffn_gate_w)  hipFree(cl->moe_shared_ffn_gate_w);
             if (cl->moe_shared_ffn_up_w)    hipFree(cl->moe_shared_ffn_up_w);
             if (cl->moe_shared_ffn_down_w)  hipFree(cl->moe_shared_ffn_down_w);
+            /* Gemma4 per-layer weights */
+            if (cl->post_attn_norm_w)  hipFree(cl->post_attn_norm_w);
+            if (cl->post_ffw_norm_w)   hipFree(cl->post_ffw_norm_w);
+            if (cl->ple_inp_gate_w)    hipFree(cl->ple_inp_gate_w);
+            if (cl->ple_proj_w)        hipFree(cl->ple_proj_w);
+            if (cl->ple_post_norm_w)   hipFree(cl->ple_post_norm_w);
         }
         free(r->layers);
     }
@@ -11700,17 +12832,35 @@ done:
 }
 
 void hip_llm_reset_state(hip_llm_runner *r) {
-    if (!r || !r->is_hybrid) return;
-    for (int l = 0; l < r->n_layers; l++) {
-        hip_layer *cl = &r->layers[l];
-        if (!cl->is_ssm) continue;
-        if (cl->d_conv_state) {
-            size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
-            hipMemset(cl->d_conv_state, 0, conv_bytes);
+    if (!r) return;
+    if (r->is_hybrid) {
+        for (int l = 0; l < r->n_layers; l++) {
+            hip_layer *cl = &r->layers[l];
+            if (!cl->is_ssm) continue;
+            if (cl->d_conv_state) {
+                size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
+                hipMemset(cl->d_conv_state, 0, conv_bytes);
+            }
+            if (cl->d_recurrent_state) {
+                size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
+                hipMemset(cl->d_recurrent_state, 0, rec_bytes);
+            }
         }
-        if (cl->d_recurrent_state) {
-            size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
-            hipMemset(cl->d_recurrent_state, 0, rec_bytes);
+    }
+    if (r->is_gemma4) {
+        for (int l = 0; l < r->n_layers; l++) {
+            hip_layer *cl = &r->layers[l];
+            if (cl->shared_kv_source >= 0) continue;
+            int local_kv = cl->local_kv_heads;
+            int local_hd = cl->local_head_dim;
+            size_t kv_bytes = (size_t)local_kv * local_hd * sizeof(float);
+            if (cl->is_swa) {
+                kv_bytes *= r->swa_window_size;
+            } else {
+                kv_bytes *= r->max_seq_len;
+            }
+            if (r->d_key_cache[l])   hipMemset(r->d_key_cache[l], 0, kv_bytes);
+            if (r->d_value_cache[l]) hipMemset(r->d_value_cache[l], 0, kv_bytes);
         }
     }
 }

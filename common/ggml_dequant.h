@@ -21,8 +21,6 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
 #include "gguf_loader.h"
 
 #ifdef __cplusplus
@@ -228,20 +226,6 @@ static inline float ggml_fp16_to_fp32(uint16_t h) {
     float result;
     __builtin_memcpy(&result, &f, 4);
     return result;
-}
-
-/* Round-to-nearest f32 -> f16 (IEEE half). Used to encode per-block quant
- * scales, which are always small positive values (absmax/127), so the
- * subnormal/overflow branches below are defensive rather than hot. */
-static inline uint16_t ggml_fp32_to_fp16(float f) {
-    union { float f; uint32_t u; } u; u.f = f;
-    uint32_t bits = u.u;
-    uint32_t sign = (bits >> 16) & 0x8000;
-    int32_t  exp  = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
-    uint32_t mant = (bits >> 13) & 0x3ff;
-    if (exp <= 0)       return (uint16_t)sign;
-    if (exp >= 31)      return (uint16_t)(sign | 0x7c00);
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
 }
 
 void dequantize_row_q2_K(const void *src, float *dst, int n);
@@ -1125,232 +1109,6 @@ static inline void gemm_q8_0_f32_tokmajor(float *Y, const void *W, const float *
     #undef Q8_HSUM_STORE
 }
 
-#elif defined(__ARM_FEATURE_SVE)
-#include <arm_sve.h>
-
-/* SVE F16→F32 conversion helper: load 16 FP16 half-words zero-extended into
- * S lanes (low 16 bits hold the FP16 datum), then FCVT.S.H to FP32.
- * Mirrors the LD1H{Z.S}+FCVT pattern used by a64fx/vlm's FP16 microkernel. */
-#define SVE_F16_TO_F32(pg, ptr) \
-    svcvt_f32_f16_x((pg), svreinterpret_f16( \
-        svreinterpret_u16(svld1uh_u32((pg), (const uint16_t *)(ptr)))))
-
-static inline float vec_dot_f16_f32(const uint16_t *a, const float *b, int n) {
-    int vl = (int)svcntw();
-    int stride4 = 4 * vl;
-    svfloat32_t acc0 = svdup_f32(0.0f), acc1 = svdup_f32(0.0f);
-    svfloat32_t acc2 = svdup_f32(0.0f), acc3 = svdup_f32(0.0f);
-    svbool_t pg = svptrue_b32();
-    int i = 0;
-    for (; i + stride4 - 1 < n; i += stride4) {
-        svfloat32_t va0 = SVE_F16_TO_F32(pg, &a[i]);
-        svfloat32_t va1 = SVE_F16_TO_F32(pg, &a[i + vl]);
-        svfloat32_t va2 = SVE_F16_TO_F32(pg, &a[i + 2 * vl]);
-        svfloat32_t va3 = SVE_F16_TO_F32(pg, &a[i + 3 * vl]);
-        svfloat32_t vb0 = svld1(pg, &b[i]);
-        svfloat32_t vb1 = svld1(pg, &b[i + vl]);
-        svfloat32_t vb2 = svld1(pg, &b[i + 2 * vl]);
-        svfloat32_t vb3 = svld1(pg, &b[i + 3 * vl]);
-        acc0 = svmla_x(pg, acc0, va0, vb0);
-        acc1 = svmla_x(pg, acc1, va1, vb1);
-        acc2 = svmla_x(pg, acc2, va2, vb2);
-        acc3 = svmla_x(pg, acc3, va3, vb3);
-    }
-    for (; i < n; i += vl) {
-        svbool_t ptail = svwhilelt_b32(i, n);
-        acc0 = svmla_m(ptail, acc0, SVE_F16_TO_F32(ptail, &a[i]), svld1(ptail, &b[i]));
-    }
-    return svaddv(pg, svadd_x(pg, svadd_x(pg, acc0, acc1), svadd_x(pg, acc2, acc3)));
-}
-
-/* 6-row F16 matvec: 6 weight streams share one activation vector.
- * 6 FMAs per activation load → strong reuse of L1 activation cache. */
-static inline void matvec_f16_6row(float *dst, const uint16_t *w0, const uint16_t *w1,
-                                    const uint16_t *w2, const uint16_t *w3,
-                                    const uint16_t *w4, const uint16_t *w5,
-                                    const float *x, int n) {
-    int vl = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
-    svbool_t pg = svptrue_b32();
-    int i = 0;
-    for (; i + vl - 1 < n; i += vl) {
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, SVE_F16_TO_F32(pg, &w0[i]), vx);
-        a1 = svmla_x(pg, a1, SVE_F16_TO_F32(pg, &w1[i]), vx);
-        a2 = svmla_x(pg, a2, SVE_F16_TO_F32(pg, &w2[i]), vx);
-        a3 = svmla_x(pg, a3, SVE_F16_TO_F32(pg, &w3[i]), vx);
-        a4 = svmla_x(pg, a4, SVE_F16_TO_F32(pg, &w4[i]), vx);
-        a5 = svmla_x(pg, a5, SVE_F16_TO_F32(pg, &w5[i]), vx);
-    }
-    if (i < n) {
-        svbool_t ptail = svwhilelt_b32(i, n);
-        svfloat32_t vx = svld1(ptail, &x[i]);
-        a0 = svmla_m(ptail, a0, SVE_F16_TO_F32(ptail, &w0[i]), vx);
-        a1 = svmla_m(ptail, a1, SVE_F16_TO_F32(ptail, &w1[i]), vx);
-        a2 = svmla_m(ptail, a2, SVE_F16_TO_F32(ptail, &w2[i]), vx);
-        a3 = svmla_m(ptail, a3, SVE_F16_TO_F32(ptail, &w3[i]), vx);
-        a4 = svmla_m(ptail, a4, SVE_F16_TO_F32(ptail, &w4[i]), vx);
-        a5 = svmla_m(ptail, a5, SVE_F16_TO_F32(ptail, &w5[i]), vx);
-    }
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
-}
-
-static inline void matvec_f16_4row(float *dst, const uint16_t *w0, const uint16_t *w1,
-                                    const uint16_t *w2, const uint16_t *w3,
-                                    const float *x, int n) {
-    int vl = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svbool_t pg = svptrue_b32();
-    int i = 0;
-    for (; i + vl - 1 < n; i += vl) {
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, SVE_F16_TO_F32(pg, &w0[i]), vx);
-        a1 = svmla_x(pg, a1, SVE_F16_TO_F32(pg, &w1[i]), vx);
-        a2 = svmla_x(pg, a2, SVE_F16_TO_F32(pg, &w2[i]), vx);
-        a3 = svmla_x(pg, a3, SVE_F16_TO_F32(pg, &w3[i]), vx);
-    }
-    if (i < n) {
-        svbool_t ptail = svwhilelt_b32(i, n);
-        svfloat32_t vx = svld1(ptail, &x[i]);
-        a0 = svmla_m(ptail, a0, SVE_F16_TO_F32(ptail, &w0[i]), vx);
-        a1 = svmla_m(ptail, a1, SVE_F16_TO_F32(ptail, &w1[i]), vx);
-        a2 = svmla_m(ptail, a2, SVE_F16_TO_F32(ptail, &w2[i]), vx);
-        a3 = svmla_m(ptail, a3, SVE_F16_TO_F32(ptail, &w3[i]), vx);
-    }
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-}
-
-static inline void matvec_f16_2row(float *dst, const uint16_t *w0, const uint16_t *w1,
-                                    const float *x, int n) {
-    int vl = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svbool_t pg = svptrue_b32();
-    int i = 0;
-    for (; i + vl - 1 < n; i += vl) {
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, SVE_F16_TO_F32(pg, &w0[i]), vx);
-        a1 = svmla_x(pg, a1, SVE_F16_TO_F32(pg, &w1[i]), vx);
-    }
-    if (i < n) {
-        svbool_t ptail = svwhilelt_b32(i, n);
-        svfloat32_t vx = svld1(ptail, &x[i]);
-        a0 = svmla_m(ptail, a0, SVE_F16_TO_F32(ptail, &w0[i]), vx);
-        a1 = svmla_m(ptail, a1, SVE_F16_TO_F32(ptail, &w1[i]), vx);
-    }
-    dst[0] = svaddv(pg, a0);
-    dst[1] = svaddv(pg, a1);
-}
-
-/* SVE Q8_0 dot: 32 int8 quants per block × FP16 scale. */
-static inline float vec_dot_q8_0_f32(const void *q8_row, const float *x, int K) {
-    const block_q8_0 *blocks = (const block_q8_0 *)q8_row;
-    int nb = K / 32;
-    svbool_t pg = svptrue_b32();
-    svfloat32_t acc = svdup_f32(0.0f);
-    int vl = (int)svcntw();  /* 16 on A64FX */
-    /* 32 quants per block; on A64FX vl=16 → exactly 2 vector loads per block */
-    for (int b = 0; b < nb; b++) {
-        float scale = ggml_fp16_to_fp32(blocks[b].d);
-        svfloat32_t vscale = svdup_f32(scale);
-        const float *xb = x + b * 32;
-        int j = 0;
-        for (; j + vl - 1 < 32; j += vl) {
-            svint32_t qi = svld1sb_s32(pg, (const int8_t *)(blocks[b].qs + j));
-            svfloat32_t qf = svcvt_f32_s32_x(pg, qi);
-            svfloat32_t vb = svld1(pg, xb + j);
-            acc = svmla_x(pg, acc, svmul_x(pg, qf, vscale), vb);
-        }
-        for (; j < 32; j++) {
-            float v = scale * (float)blocks[b].qs[j] * xb[j];
-            acc = svadd_n_f32_x(pg, acc, v);
-        }
-    }
-    return svaddv(pg, acc);
-}
-
-static inline void matvec_q8_0_f32(float *dst, const void *q8_row, const float *x, int K) {
-    *dst = vec_dot_q8_0_f32(q8_row, x, K);
-}
-
-/* Generic GEMM wrappers: loop over rows/tokens calling the SIMD dot. */
-static inline void gemm_f16_f32(float *Y, const uint16_t *W, const float *X,
-                                 int n_rows, int K, int N, int Y_stride, int X_stride) {
-    int r = 0;
-    for (; r + 5 < n_rows; r += 6) {
-        const uint16_t *w0 = W + (size_t)r * K, *w1 = W + (size_t)(r+1) * K;
-        const uint16_t *w2 = W + (size_t)(r+2) * K, *w3 = W + (size_t)(r+3) * K;
-        const uint16_t *w4 = W + (size_t)(r+4) * K, *w5 = W + (size_t)(r+5) * K;
-        for (int t = 0; t < N; t++) {
-            float tmp[6];
-            matvec_f16_6row(tmp, w0, w1, w2, w3, w4, w5, X + (size_t)t * X_stride, K);
-            Y[(r+0) * Y_stride + t] = tmp[0]; Y[(r+1) * Y_stride + t] = tmp[1];
-            Y[(r+2) * Y_stride + t] = tmp[2]; Y[(r+3) * Y_stride + t] = tmp[3];
-            Y[(r+4) * Y_stride + t] = tmp[4]; Y[(r+5) * Y_stride + t] = tmp[5];
-        }
-    }
-    for (; r < n_rows; r++) {
-        const uint16_t *wr = W + (size_t)r * K;
-        for (int t = 0; t < N; t++)
-            Y[r * Y_stride + t] = vec_dot_f16_f32(wr, X + (size_t)t * X_stride, K);
-    }
-}
-
-static inline void gemm_f16_f32_tokmajor(float *Y, const uint16_t *W, const float *X,
-                                          int n_rows, int K, int N, int Y_stride, int X_stride) {
-    int r = 0;
-    for (; r + 5 < n_rows; r += 6) {
-        const uint16_t *w0 = W + (size_t)r * K, *w1 = W + (size_t)(r+1) * K;
-        const uint16_t *w2 = W + (size_t)(r+2) * K, *w3 = W + (size_t)(r+3) * K;
-        const uint16_t *w4 = W + (size_t)(r+4) * K, *w5 = W + (size_t)(r+5) * K;
-        for (int t = 0; t < N; t++) {
-            float tmp[6];
-            matvec_f16_6row(tmp, w0, w1, w2, w3, w4, w5, X + (size_t)t * X_stride, K);
-            Y[t * Y_stride + r + 0] = tmp[0]; Y[t * Y_stride + r + 1] = tmp[1];
-            Y[t * Y_stride + r + 2] = tmp[2]; Y[t * Y_stride + r + 3] = tmp[3];
-            Y[t * Y_stride + r + 4] = tmp[4]; Y[t * Y_stride + r + 5] = tmp[5];
-        }
-    }
-    for (; r < n_rows; r++) {
-        const uint16_t *wr = W + (size_t)r * K;
-        for (int t = 0; t < N; t++)
-            Y[t * Y_stride + r] = vec_dot_f16_f32(wr, X + (size_t)t * X_stride, K);
-    }
-}
-
-static inline void gemm_f16_f32_tokmajor_fused2(
-        float *Y1, const uint16_t *W1, float *Y2, const uint16_t *W2,
-        const float *X, int n_rows, int K, int N,
-        int Y1_stride, int Y2_stride, int X_stride) {
-    for (int r = 0; r < n_rows; r++) {
-        const uint16_t *w1r = W1 + (size_t)r * K;
-        const uint16_t *w2r = W2 + (size_t)r * K;
-        for (int t = 0; t < N; t++) {
-            const float *xt = X + (size_t)t * X_stride;
-            Y1[t * Y1_stride + r] = vec_dot_f16_f32(w1r, xt, K);
-            Y2[t * Y2_stride + r] = vec_dot_f16_f32(w2r, xt, K);
-        }
-    }
-}
-
-static inline void gemm_q8_0_f32_tokmajor(float *Y, const void *W, const float *X,
-                                            int n_rows, int K, int N, int Y_stride, int X_stride) {
-    int nb = K / 32;
-    size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
-    for (int r = 0; r < n_rows; r++) {
-        const void *wr = (const uint8_t *)W + (size_t)r * row_bytes;
-        for (int t = 0; t < N; t++)
-            Y[t * Y_stride + r] = vec_dot_q8_0_f32(wr, X + (size_t)t * X_stride, K);
-    }
-}
-
-#undef SVE_F16_TO_F32
-
 #else
 /* Scalar fallback */
 static inline float vec_dot_f16_f32(const uint16_t *a, const float *b, int n) {
@@ -1567,543 +1325,6 @@ static inline void matvec_bf16_8row(float *dst,
     dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
 }
 
-/* 8-row BF16 matvec, p_odd predicated-load variant.
- * Inputs are 4 pair buffers, each holding 2 adjacent rows interleaved at
- * bf16 granularity per 16-element chunk. Two ld1h.h with p_odd at offsets
- * -2 / 0 bytes extract both rows as FP32 (bf16 lands in upper half of .s
- * lanes), eliminating the LSL the lsl variant needs.
- *
- * Pair buf layout (per 16-element chunk = 64 bytes = 32 halfwords):
- *   HW 0  = rA[c*16+0]   HW 1  = rB[c*16+0]
- *   HW 2  = rA[c*16+1]   HW 3  = rB[c*16+1]
- *   ... up to HW 30/31
- *
- * Constraints: n_cols % vl (= 16 on A64FX) == 0, n_rows % 8 == 0.
- * Caller must have packed weights via pack_bf16_rows_to_pv first. */
-static inline void matvec_bf16_8row_pv(float *dst,
-                                        const uint16_t *pAB, const uint16_t *pCD,
-                                        const uint16_t *pEF, const uint16_t *pGH,
-                                        const float *x, int n) {
-    svbool_t pg = svptrue_b32();
-    svbool_t p_all_h = svptrue_b16();
-    svuint16_t idx_h = svindex_u16(0, 1);
-    svbool_t p_odd = svcmpne_n_u16(p_all_h,
-                                    svand_n_u16_x(p_all_h, idx_h, 1), 0);
-
-    int vl = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
-    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
-    int i = 0;
-    /* Lighter SW prefetch: distance 8 iters = 2 × 256 B = 2 cachelines per
-     * pair stream, to L2 (locality=2). With ~12 threads/CMG × 4 pair streams
-     * the HW prefetcher's ~16 slots/CMG are oversubscribed; an L2-only hint
-     * provides headroom without blowing the L1. Guarded by TF_BF16PV_PREFETCH=1. */
-    static int pf_env_done = 0, pf_on = 0;
-    if (__builtin_expect(!pf_env_done, 0)) {
-        const char *e = getenv("TF_BF16PV_PREFETCH");
-        pf_on = (e && *e && *e != '0');
-        pf_env_done = 1;
-    }
-    const int PFD_HW = 8 * 32;  /* halfwords = 2 × 256-B cachelines */
-    for (; i + vl - 1 < n; i += vl) {
-        /* pair[hw_base = 2*i] points at chunk c = i/vl */
-        const uint16_t *ab = pAB + 2 * i;
-        const uint16_t *cd = pCD + 2 * i;
-        const uint16_t *ef = pEF + 2 * i;
-        const uint16_t *gh = pGH + 2 * i;
-        if (pf_on) {
-            __builtin_prefetch(ab + PFD_HW, 0, 2);
-            __builtin_prefetch(cd + PFD_HW, 0, 2);
-            __builtin_prefetch(ef + PFD_HW, 0, 2);
-            __builtin_prefetch(gh + PFD_HW, 0, 2);
-        }
-        svuint16_t vA = svld1_u16(p_odd, ab - 1);
-        svuint16_t vB = svld1_u16(p_odd, ab);
-        svuint16_t vC = svld1_u16(p_odd, cd - 1);
-        svuint16_t vD = svld1_u16(p_odd, cd);
-        svuint16_t vE = svld1_u16(p_odd, ef - 1);
-        svuint16_t vF = svld1_u16(p_odd, ef);
-        svuint16_t vG = svld1_u16(p_odd, gh - 1);
-        svuint16_t vH = svld1_u16(p_odd, gh);
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, svreinterpret_f32(vA), vx);
-        a1 = svmla_x(pg, a1, svreinterpret_f32(vB), vx);
-        a2 = svmla_x(pg, a2, svreinterpret_f32(vC), vx);
-        a3 = svmla_x(pg, a3, svreinterpret_f32(vD), vx);
-        a4 = svmla_x(pg, a4, svreinterpret_f32(vE), vx);
-        a5 = svmla_x(pg, a5, svreinterpret_f32(vF), vx);
-        a6 = svmla_x(pg, a6, svreinterpret_f32(vG), vx);
-        a7 = svmla_x(pg, a7, svreinterpret_f32(vH), vx);
-    }
-    /* n is required to be a multiple of vl by the panel build constraint;
-     * no tail handling needed in the kernel. */
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
-    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
-}
-
-/* Accumulating K-tile variant of matvec_bf16_8row_pv, for the batched (M>1)
- * prefill GEMM. ADDS the 8-row partial dot products over a K-segment [0,n) into
- * acc[0..7] (caller zeroes acc, then sweeps K tiles for one token). The pair
- * pointers must already be advanced to the tile's column base (pAB + 2*k0, etc.)
- * and x to x + k0. Same p_odd predicated-load layout/constraints (n % 16 == 0)
- * as matvec_bf16_8row_pv; no SW prefetch (the GEMM keeps the weight tile hot in
- * L1 across all M tokens, so HW streaming suffices). The per-tile svaddv reorders
- * the K reduction vs the single-shot matvec -> result is bit-SIMILAR, not
- * bit-identical (validated to ~1e-4 in ds4f_gemm_test.c). */
-static inline void matvec_bf16_8row_pv_acc(float *acc,
-                                            const uint16_t *pAB, const uint16_t *pCD,
-                                            const uint16_t *pEF, const uint16_t *pGH,
-                                            const float *x, int n) {
-    svbool_t pg = svptrue_b32();
-    svbool_t p_all_h = svptrue_b16();
-    svuint16_t idx_h = svindex_u16(0, 1);
-    svbool_t p_odd = svcmpne_n_u16(p_all_h, svand_n_u16_x(p_all_h, idx_h, 1), 0);
-    int vl = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
-    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
-    int i = 0;
-    for (; i + vl - 1 < n; i += vl) {
-        const uint16_t *ab = pAB + 2 * i, *cd = pCD + 2 * i;
-        const uint16_t *ef = pEF + 2 * i, *gh = pGH + 2 * i;
-        svuint16_t vA = svld1_u16(p_odd, ab - 1), vB = svld1_u16(p_odd, ab);
-        svuint16_t vC = svld1_u16(p_odd, cd - 1), vD = svld1_u16(p_odd, cd);
-        svuint16_t vE = svld1_u16(p_odd, ef - 1), vF = svld1_u16(p_odd, ef);
-        svuint16_t vG = svld1_u16(p_odd, gh - 1), vH = svld1_u16(p_odd, gh);
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, svreinterpret_f32(vA), vx);
-        a1 = svmla_x(pg, a1, svreinterpret_f32(vB), vx);
-        a2 = svmla_x(pg, a2, svreinterpret_f32(vC), vx);
-        a3 = svmla_x(pg, a3, svreinterpret_f32(vD), vx);
-        a4 = svmla_x(pg, a4, svreinterpret_f32(vE), vx);
-        a5 = svmla_x(pg, a5, svreinterpret_f32(vF), vx);
-        a6 = svmla_x(pg, a6, svreinterpret_f32(vG), vx);
-        a7 = svmla_x(pg, a7, svreinterpret_f32(vH), vx);
-    }
-    acc[0] += svaddv(pg, a0); acc[1] += svaddv(pg, a1);
-    acc[2] += svaddv(pg, a2); acc[3] += svaddv(pg, a3);
-    acc[4] += svaddv(pg, a4); acc[5] += svaddv(pg, a5);
-    acc[6] += svaddv(pg, a6); acc[7] += svaddv(pg, a7);
-}
-
-/* Register-blocked 8-row x 3-token accumulating pv GEMM microkernel.
- *
- * matvec_bf16_8row_pv_acc replayed per token loads the 8 weight-row vectors from
- * L1 ONCE PER TOKEN (8 loads + 1 x-load for only 8 FMAs) -> the FLA pipes starve on
- * L1 load ports, capping the GEMM near ~17% of peak. This variant loads each of the
- * 8 weight rows ONCE per K-step (same p_odd dual-load pv layout) and issues it
- * against 3 token columns: 24 FMAs per 11 loads (8 weight + 3 x). 24 live f32 lane-
- * accumulators + 3 x vectors + a transient weight reg fit in the 32 SVE z-registers
- * (the same 8x3 blocking the vlm micro_kernel_bf16B_8x3_pv.S uses). Row->acc mapping
- * (ab-1,ab,cd-1,cd,ef-1,ef,gh-1,gh -> rows 0..7) is byte-identical to the single-
- * token kernel, so results match it (bit-similar via the per-tile svaddv reorder).
- * acc0/acc1/acc2 are each [8]; caller zeroes them and sweeps K tiles. n % 16 == 0. */
-static inline void matvec_bf16_8x3_pv_acc(float *acc0, float *acc1, float *acc2,
-                                          const uint16_t *pAB, const uint16_t *pCD,
-                                          const uint16_t *pEF, const uint16_t *pGH,
-                                          const float *x0, const float *x1, const float *x2,
-                                          int n) {
-    svbool_t pg = svptrue_b32();
-    svbool_t p_all_h = svptrue_b16();
-    svuint16_t idx_h = svindex_u16(0, 1);
-    svbool_t p_odd = svcmpne_n_u16(p_all_h, svand_n_u16_x(p_all_h, idx_h, 1), 0);
-    int vl = (int)svcntw();
-    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0),a30=svdup_f32(0);
-    svfloat32_t a40=svdup_f32(0),a50=svdup_f32(0),a60=svdup_f32(0),a70=svdup_f32(0);
-    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0),a31=svdup_f32(0);
-    svfloat32_t a41=svdup_f32(0),a51=svdup_f32(0),a61=svdup_f32(0),a71=svdup_f32(0);
-    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0),a22=svdup_f32(0),a32=svdup_f32(0);
-    svfloat32_t a42=svdup_f32(0),a52=svdup_f32(0),a62=svdup_f32(0),a72=svdup_f32(0);
-    int i = 0;
-    for (; i + vl - 1 < n; i += vl) {
-        const uint16_t *ab = pAB + 2*i, *cd = pCD + 2*i, *ef = pEF + 2*i, *gh = pGH + 2*i;
-        svfloat32_t vx0 = svld1(pg, &x0[i]);
-        svfloat32_t vx1 = svld1(pg, &x1[i]);
-        svfloat32_t vx2 = svld1(pg, &x2[i]);
-        svfloat32_t w;
-        w = svreinterpret_f32(svld1_u16(p_odd, ab-1)); a00=svmla_x(pg,a00,w,vx0); a01=svmla_x(pg,a01,w,vx1); a02=svmla_x(pg,a02,w,vx2);
-        w = svreinterpret_f32(svld1_u16(p_odd, ab  )); a10=svmla_x(pg,a10,w,vx0); a11=svmla_x(pg,a11,w,vx1); a12=svmla_x(pg,a12,w,vx2);
-        w = svreinterpret_f32(svld1_u16(p_odd, cd-1)); a20=svmla_x(pg,a20,w,vx0); a21=svmla_x(pg,a21,w,vx1); a22=svmla_x(pg,a22,w,vx2);
-        w = svreinterpret_f32(svld1_u16(p_odd, cd  )); a30=svmla_x(pg,a30,w,vx0); a31=svmla_x(pg,a31,w,vx1); a32=svmla_x(pg,a32,w,vx2);
-        w = svreinterpret_f32(svld1_u16(p_odd, ef-1)); a40=svmla_x(pg,a40,w,vx0); a41=svmla_x(pg,a41,w,vx1); a42=svmla_x(pg,a42,w,vx2);
-        w = svreinterpret_f32(svld1_u16(p_odd, ef  )); a50=svmla_x(pg,a50,w,vx0); a51=svmla_x(pg,a51,w,vx1); a52=svmla_x(pg,a52,w,vx2);
-        w = svreinterpret_f32(svld1_u16(p_odd, gh-1)); a60=svmla_x(pg,a60,w,vx0); a61=svmla_x(pg,a61,w,vx1); a62=svmla_x(pg,a62,w,vx2);
-        w = svreinterpret_f32(svld1_u16(p_odd, gh  )); a70=svmla_x(pg,a70,w,vx0); a71=svmla_x(pg,a71,w,vx1); a72=svmla_x(pg,a72,w,vx2);
-    }
-    acc0[0]+=svaddv(pg,a00); acc0[1]+=svaddv(pg,a10); acc0[2]+=svaddv(pg,a20); acc0[3]+=svaddv(pg,a30);
-    acc0[4]+=svaddv(pg,a40); acc0[5]+=svaddv(pg,a50); acc0[6]+=svaddv(pg,a60); acc0[7]+=svaddv(pg,a70);
-    acc1[0]+=svaddv(pg,a01); acc1[1]+=svaddv(pg,a11); acc1[2]+=svaddv(pg,a21); acc1[3]+=svaddv(pg,a31);
-    acc1[4]+=svaddv(pg,a41); acc1[5]+=svaddv(pg,a51); acc1[6]+=svaddv(pg,a61); acc1[7]+=svaddv(pg,a71);
-    acc2[0]+=svaddv(pg,a02); acc2[1]+=svaddv(pg,a12); acc2[2]+=svaddv(pg,a22); acc2[3]+=svaddv(pg,a32);
-    acc2[4]+=svaddv(pg,a42); acc2[5]+=svaddv(pg,a52); acc2[6]+=svaddv(pg,a62); acc2[7]+=svaddv(pg,a72);
-}
-
-/* int8 svdot W8A8 8-row matvec for the q8_pv "group" layout.
- *
- * group layout (per 8 rows × K cols, K % 64 == 0):
- *   nb = K / 64 blocks, each 528 bytes:
- *     bytes [0..16)    -> 8 fp16 row-scales (row 0..7)
- *     bytes [16..528)  -> 8 rows × 64 int8 quants, row-major
- *
- * X is pre-quantized once per matvec into int8 + per-64-block fp16 scale
- * (see tf_quant_x_sdot). Per row per 64-block: one svdot_s32 (64 int8 MACs
- * -> 16 i32 lanes) + svcvt + svmla by the scalar (w_scale × x_scale) into a
- * float lane-accumulator. Block scales fold via the svmla, so there is only
- * ONE horizontal reduction (svaddv) per row, at the very end. Weight DRAM is
- * ~1.03 B/elem (528/512) vs bf16_8row_pv's 2.0 — and unlike the scalar-scale
- * Q8 kernel this stays HBM-BW-bound (svdot keeps the FLA pipe from saturating)
- * giving ~2× at the model's bandwidth regime. */
-static inline void matvec_sdot_8row(float *dst,
-                                     const uint8_t *group, /* points at block 0 */
-                                     const int8_t *xq, const float *xscale,
-                                     int K) {
-    svbool_t pg = svptrue_b32();
-    svbool_t pb = svptrue_b8();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
-    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
-    int nb = K / 64;
-    for (int b = 0; b < nb; b++) {
-        const uint8_t *blk = group + (size_t)b * 528;
-        const uint16_t *scl = (const uint16_t *)blk;
-        const int8_t *qs    = (const int8_t *)(blk + 16);
-        float xs = xscale[b];   /* fp32 activation scale (WS6: fp16 overflowed to Inf for amax>~8.3e6 -> 0*Inf=NaN) */
-        svint8_t xv = svld1_s8(pb, xq + (size_t)b * 64);
-        #define SDOT_ROW(R, ACC)                                              \
-            do {                                                              \
-                svint8_t wv = svld1_s8(pb, qs + (size_t)(R) * 64);            \
-                svint32_t d = svdot_s32(svdup_s32(0), wv, xv);                \
-                svfloat32_t df = svcvt_f32_s32_x(pg, d);                      \
-                float sc = ggml_fp16_to_fp32(scl[R]) * xs;                    \
-                ACC = svmla_x(pg, ACC, df, svdup_f32(sc));                    \
-            } while (0)
-        SDOT_ROW(0, a0); SDOT_ROW(1, a1); SDOT_ROW(2, a2); SDOT_ROW(3, a3);
-        SDOT_ROW(4, a4); SDOT_ROW(5, a5); SDOT_ROW(6, a6); SDOT_ROW(7, a7);
-        #undef SDOT_ROW
-    }
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
-    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
-}
-
-/* 8-row x 3-token int8 svdot (prefill weight reuse): same q8_pv group layout as
- * matvec_sdot_8row, but each 8-row weight block is loaded ONCE and dotted against
- * 3 tokens' int8 (xq0/xq1/xq2 with per-64-block scales xs0/xs1/xs2), amortizing
- * the weight L1->reg loads across the triple. 24 float lane-accumulators (8 rows
- * x 3 tokens) — register-tight (fcc may spill 1-2, as the bf16 8x3 does), still a
- * net win when the loop is svdot-issue-bound. Per-(row,token) the K reduction is
- * the SAME order as the single-token kernel => results match matvec_sdot_8row. */
-static inline void matvec_sdot_8row_3x(float *dst0, float *dst1, float *dst2,
-                                       const uint8_t *group,
-                                       const int8_t *xq0, const float *xs0,
-                                       const int8_t *xq1, const float *xs1,
-                                       const int8_t *xq2, const float *xs2,
-                                       int K) {
-    svbool_t pg = svptrue_b32();
-    svbool_t pb = svptrue_b8();
-    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f),
-                a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
-    svfloat32_t b0=svdup_f32(0.f),b1=svdup_f32(0.f),b2=svdup_f32(0.f),b3=svdup_f32(0.f),
-                b4=svdup_f32(0.f),b5=svdup_f32(0.f),b6=svdup_f32(0.f),b7=svdup_f32(0.f);
-    svfloat32_t c0=svdup_f32(0.f),c1=svdup_f32(0.f),c2=svdup_f32(0.f),c3=svdup_f32(0.f),
-                c4=svdup_f32(0.f),c5=svdup_f32(0.f),c6=svdup_f32(0.f),c7=svdup_f32(0.f);
-    int nb = K / 64;
-    for (int blk = 0; blk < nb; blk++) {
-        const uint8_t *bp = group + (size_t)blk * 528;
-        const uint16_t *scl = (const uint16_t *)bp;
-        const int8_t *qs    = (const int8_t *)(bp + 16);
-        float s0 = xs0[blk];   /* fp32 activation scale (WS6 overflow fix) */
-        float s1 = xs1[blk];
-        float s2 = xs2[blk];
-        svint8_t xv0 = svld1_s8(pb, xq0 + (size_t)blk*64);
-        svint8_t xv1 = svld1_s8(pb, xq1 + (size_t)blk*64);
-        svint8_t xv2 = svld1_s8(pb, xq2 + (size_t)blk*64);
-        #define SDOT3_ROW(R, AA, BB, CC)                                       \
-            do {                                                               \
-                svint8_t wv = svld1_s8(pb, qs + (size_t)(R)*64);               \
-                float ws = ggml_fp16_to_fp32(scl[R]);                          \
-                AA = svmla_x(pg, AA, svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), wv, xv0)), svdup_f32(ws*s0)); \
-                BB = svmla_x(pg, BB, svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), wv, xv1)), svdup_f32(ws*s1)); \
-                CC = svmla_x(pg, CC, svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), wv, xv2)), svdup_f32(ws*s2)); \
-            } while (0)
-        SDOT3_ROW(0,a0,b0,c0); SDOT3_ROW(1,a1,b1,c1); SDOT3_ROW(2,a2,b2,c2); SDOT3_ROW(3,a3,b3,c3);
-        SDOT3_ROW(4,a4,b4,c4); SDOT3_ROW(5,a5,b5,c5); SDOT3_ROW(6,a6,b6,c6); SDOT3_ROW(7,a7,b7,c7);
-        #undef SDOT3_ROW
-    }
-    dst0[0]=svaddv(pg,a0);dst0[1]=svaddv(pg,a1);dst0[2]=svaddv(pg,a2);dst0[3]=svaddv(pg,a3);
-    dst0[4]=svaddv(pg,a4);dst0[5]=svaddv(pg,a5);dst0[6]=svaddv(pg,a6);dst0[7]=svaddv(pg,a7);
-    dst1[0]=svaddv(pg,b0);dst1[1]=svaddv(pg,b1);dst1[2]=svaddv(pg,b2);dst1[3]=svaddv(pg,b3);
-    dst1[4]=svaddv(pg,b4);dst1[5]=svaddv(pg,b5);dst1[6]=svaddv(pg,b6);dst1[7]=svaddv(pg,b7);
-    dst2[0]=svaddv(pg,c0);dst2[1]=svaddv(pg,c1);dst2[2]=svaddv(pg,c2);dst2[3]=svaddv(pg,c3);
-    dst2[4]=svaddv(pg,c4);dst2[5]=svaddv(pg,c5);dst2[6]=svaddv(pg,c6);dst2[7]=svaddv(pg,c7);
-}
-
-/* ========================================================================
- * DeepSeek-V4-Flash on-demand dequant matvecs (split-layout FP8 + MXFP4).
- *
- * These live in the always-available (non-IMPLEMENTATION) region because they
- * are static-inline kernels emitted into every TU that includes this header
- * (ds4f.h / ds4f_runner.c). They keep weights quantized in HBM and dequant a
- * panel into registers per token, in the proven 8-accumulator + final-svaddv
- * shape. M=1 decode is HBM-BW-bound, so DRAM B/elem (FP8 ~1.0, MXFP4 ~0.53)
- * is what matters; the f32 unpack overlaps HBM latency across 48 threads.
- * ======================================================================== */
-
-/* Standard OCP MX E8M0 scale: biased exponent, value = 2^(x - 127).
- * x==0xff is NaN (avoid in synthetic fill); x==0 maps to +0 here (OCP spec
- * value 2^-127, irrelevant for the harness). NOTE: distinct from the GGML
- * ggml_e8m0_to_fp32_half() which folds an extra ×0.5 — do NOT use that one. */
-static inline float ggml_e8m0_to_fp32(uint8_t x) {
-    uint32_t bits = (uint32_t)x << 23;
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-/* MXFP4 e2m1 code -> value, as f32 (svtbl_f32 table form of kvalues_mxfp4). */
-static const float ds4f_kvalues_mxfp4_f32[16] = {
-    0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f,
-    0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f,
-};
-
-/* FP8 E4M3 (bias 7, exp==15 => NaN, no Inf) -> f32 bit pattern. Scalar form
- * lifted from a64fx/fp8-conv/fp8_convert.h, used to build the 256-entry LUT
- * the matvec gathers from (LUT gather ~0.70 cyc/elem, the validated winner). */
-static inline uint32_t ds4f_fp8_e4m3_to_fp32_bits(uint8_t x) {
-    uint8_t sign = (x >> 7) & 1;
-    uint8_t exp  = (x >> 3) & 0xF;
-    uint8_t mant = x & 0x7;
-    if (exp == 0) {
-        if (mant == 0) return (uint32_t)sign << 31;
-        int shift = 0;
-        while ((mant & 0x4) == 0) { mant <<= 1; shift++; }
-        mant &= 0x3;
-        exp = 127 - 7 - shift;
-        return ((uint32_t)sign << 31) | ((uint32_t)exp << 23) | ((uint32_t)mant << 20);
-    }
-    if (exp == 15) /* NaN */
-        return ((uint32_t)sign << 31) | (0xFFu << 23) | ((uint32_t)mant << 20);
-    uint32_t new_exp = exp + (127 - 7);
-    return ((uint32_t)sign << 31) | (new_exp << 23) | ((uint32_t)mant << 20);
-}
-
-/* Fill a caller-provided 256-entry LUT (call once at model init). */
-static inline void ds4f_init_fp8_e4m3_lut(uint32_t *lut) {
-    for (int i = 0; i < 256; i++) lut[i] = ds4f_fp8_e4m3_to_fp32_bits((uint8_t)i);
-}
-
-#if defined(__ARM_FEATURE_SVE)
-/* FP8 E4M3 dense matvec, 8 rows, on-demand dequant via L1-resident LUT gather.
- * Weight = row-major FP8 bytes (1 B/elem); scale = per 128×128 block E8M0.
- * The 8 rows are one row-block (caller keeps groups 8-aligned, and 128 is a
- * multiple of 8 so a group never straddles a 128-row boundary), so for each
- * 128-col tile a single E8M0 scalar applies to all 8 rows -> fold it into x
- * once and reuse across the 8 gather+FMA streams. K must be a multiple of 128.
- *   escale[cb] = E8M0 scale for (this row-block, col-block cb), length K/128. */
-static inline void matvec_fp8e4m3_8row(float *dst,
-        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
-        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
-        const uint8_t *escale, const uint32_t *lut,
-        const float *x, int K) {
-    svbool_t pg = svptrue_b32();
-    svfloat32_t a0 = svdup_f32(0.f), a1 = svdup_f32(0.f);
-    svfloat32_t a2 = svdup_f32(0.f), a3 = svdup_f32(0.f);
-    svfloat32_t a4 = svdup_f32(0.f), a5 = svdup_f32(0.f);
-    svfloat32_t a6 = svdup_f32(0.f), a7 = svdup_f32(0.f);
-    int vl = (int)svcntw();
-    for (int c0 = 0; c0 < K; c0 += 128) {
-        float s = ggml_e8m0_to_fp32(escale[c0 >> 7]);
-        svfloat32_t vs = svdup_f32(s);
-        for (int c = c0; c < c0 + 128; c += vl) {
-            svfloat32_t vxs = svmul_x(pg, svld1(pg, &x[c]), vs);
-            #define FP8_ROW(W, ACC) do {                                       \
-                svuint32_t idx  = svld1ub_u32(pg, (W) + c);                     \
-                svuint32_t bits = svld1_gather_u32index_u32(pg, lut, idx);      \
-                ACC = svmla_x(pg, ACC, svreinterpret_f32_u32(bits), vxs);       \
-            } while (0)
-            FP8_ROW(w0, a0); FP8_ROW(w1, a1); FP8_ROW(w2, a2); FP8_ROW(w3, a3);
-            FP8_ROW(w4, a4); FP8_ROW(w5, a5); FP8_ROW(w6, a6); FP8_ROW(w7, a7);
-            #undef FP8_ROW
-        }
-    }
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
-    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
-}
-
-/* Enable flush-to-zero (FPCR.FZ, bit 24) on the CURRENT thread. The magic FP8
- * decode below builds a transient f32 subnormal (the multiply input) for E4M3
- * subnormals; A64FX penalizes denormal operands by ~3.5x, so FTZ (flush those
- * to 0) is REQUIRED for the magic path to win. Acceptable for the synthetic
- * harness (values meaningless; E4M3 subnormals -> 0). Idempotent + per-thread. */
-static inline void ds4f_set_ftz(void) {
-    uint64_t fpcr; __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
-    fpcr |= (1ull << 24); __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr));
-}
-
-/* FP8 E4M3 -> f32 via the DENORMAL MAGIC-MULTIPLY (no LUT, no gather, no select):
- * build a tiny f32 from the 7 low bits, one fmul by 2^120 renormalizes BOTH
- * normals and subnormals in hardware, then re-apply sign. ~6 ops/lane. REQUIRES
- * FTZ (ds4f_set_ftz) on every calling thread or the subnormal multiply input
- * triggers A64FX denormal microcode. exp==15 maps to a finite <=480 (not NaN),
- * which is harmless / desirable for the harness. */
-static inline svfloat32_t ds4f_fp8_decode_magic_u32(svbool_t pg, svuint32_t b) {
-    svuint32_t sign = svlsl_n_u32_x(pg, svand_n_u32_x(pg, b, 0x80u), 24);
-    svuint32_t mag  = svlsl_n_u32_x(pg, svand_n_u32_x(pg, b, 0x7Fu), 20);
-    svfloat32_t f   = svmul_n_f32_x(pg, svreinterpret_f32_u32(mag), 0x1.0p+120f);
-    return svreinterpret_f32_u32(svorr_u32_x(pg, sign, svreinterpret_u32_f32(f)));
-}
-
-/* FP8 E4M3 dense matvec, 8 rows, magic-decode variant. Same args/contract as
- * matvec_fp8e4m3_8row EXCEPT no LUT (decode is arithmetic). Packed 64-byte
- * svld1_u8 load + svunpk to four u32 sub-vectors, magic-decode each, FMA against
- * the per-128-block-scaled x. Faster than the gather variant in the HBM-stream
- * (M=1 decode) regime: holds 75-140 Gmac/s vs the gather's 73-118 (+2..18%) and
- * ~1.7-3x over bf16-predequant. Callers MUST ds4f_set_ftz() on each thread. */
-static inline void matvec_fp8e4m3_8row_magic(float *dst,
-        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
-        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
-        const uint8_t *escale, const float *x, int K) {
-    svbool_t pg = svptrue_b32();
-    svbool_t pb = svptrue_b8();
-    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f);
-    svfloat32_t a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
-    int vlb = (int)svcntb();   /* 64 bytes / iter on A64FX */
-    for (int c0 = 0; c0 < K; c0 += 128) {
-        float s = ggml_e8m0_to_fp32(escale[c0 >> 7]);
-        svfloat32_t vs = svdup_f32(s);
-        for (int c = c0; c < c0 + 128; c += vlb) {
-            svfloat32_t vx0 = svmul_x(pg, svld1(pg,&x[c]),    vs);
-            svfloat32_t vx1 = svmul_x(pg, svld1(pg,&x[c+16]), vs);
-            svfloat32_t vx2 = svmul_x(pg, svld1(pg,&x[c+32]), vs);
-            svfloat32_t vx3 = svmul_x(pg, svld1(pg,&x[c+48]), vs);
-            #define FP8_MAGIC_ROW(W, ACC) do {                                  \
-                svuint8_t  b   = svld1_u8(pb, (W) + c);                          \
-                svuint16_t l16 = svunpklo_u16(b), h16 = svunpkhi_u16(b);         \
-                svfloat32_t f0 = ds4f_fp8_decode_magic_u32(pg, svunpklo_u32(l16)); \
-                svfloat32_t f1 = ds4f_fp8_decode_magic_u32(pg, svunpkhi_u32(l16)); \
-                svfloat32_t f2 = ds4f_fp8_decode_magic_u32(pg, svunpklo_u32(h16)); \
-                svfloat32_t f3 = ds4f_fp8_decode_magic_u32(pg, svunpkhi_u32(h16)); \
-                ACC = svmla_x(pg, ACC, f0, vx0);                                 \
-                ACC = svmla_x(pg, ACC, f1, vx1);                                 \
-                ACC = svmla_x(pg, ACC, f2, vx2);                                 \
-                ACC = svmla_x(pg, ACC, f3, vx3);                                 \
-            } while (0)
-            FP8_MAGIC_ROW(w0,a0); FP8_MAGIC_ROW(w1,a1); FP8_MAGIC_ROW(w2,a2); FP8_MAGIC_ROW(w3,a3);
-            FP8_MAGIC_ROW(w4,a4); FP8_MAGIC_ROW(w5,a5); FP8_MAGIC_ROW(w6,a6); FP8_MAGIC_ROW(w7,a7);
-            #undef FP8_MAGIC_ROW
-        }
-    }
-    dst[0]=svaddv(pg,a0); dst[1]=svaddv(pg,a1); dst[2]=svaddv(pg,a2); dst[3]=svaddv(pg,a3);
-    dst[4]=svaddv(pg,a4); dst[5]=svaddv(pg,a5); dst[6]=svaddv(pg,a6); dst[7]=svaddv(pg,a7);
-}
-
-/* Split-layout MXFP4 (e2m1) expert matvec, 8 rows, W4A16 f32 (svtbl unpack).
- * Weight = row-major packed nibbles (K/2 B/row); scale = per-32-block E8M0
- * (K/32 B/row, per-row, unlike FP8's shared block). DRAM ~0.53 B/elem.
- * Layout per 32-block of 16 bytes (matches dequantize_row_mxfp4): byte j low
- * nibble -> element j, high nibble -> element j+16. Unpack both halves to f32
- * via svtbl_f32 over the 16-entry kvalues table, accumulate the unscaled block
- * dot, fold the per-row E8M0 scalar via one svmla. K must be a multiple of 32.
- *   wr[r]: K/2 nibble bytes;  sr[r]: K/32 E8M0 bytes. */
-static inline void matvec_mxfp4_8row(float *dst,
-        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
-        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
-        const uint8_t *s0, const uint8_t *s1, const uint8_t *s2, const uint8_t *s3,
-        const uint8_t *s4, const uint8_t *s5, const uint8_t *s6, const uint8_t *s7,
-        const float *x, int K) {
-    svbool_t pg = svptrue_b32();
-    svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
-    svfloat32_t a0 = svdup_f32(0.f), a1 = svdup_f32(0.f);
-    svfloat32_t a2 = svdup_f32(0.f), a3 = svdup_f32(0.f);
-    svfloat32_t a4 = svdup_f32(0.f), a5 = svdup_f32(0.f);
-    svfloat32_t a6 = svdup_f32(0.f), a7 = svdup_f32(0.f);
-    int nb = K / 32;
-    for (int b = 0; b < nb; b++) {
-        svfloat32_t vxlo = svld1(pg, &x[b * 32]);
-        svfloat32_t vxhi = svld1(pg, &x[b * 32 + 16]);
-        #define MXFP4_ROW(W, S, ACC) do {                                      \
-            svuint32_t braw = svld1ub_u32(pg, (W) + (size_t)b * 16);            \
-            svuint32_t lo = svand_n_u32_x(pg, braw, 0xf);                       \
-            svuint32_t hi = svand_n_u32_x(pg, svlsr_n_u32_x(pg, braw, 4), 0xf); \
-            svfloat32_t wlo = svtbl_f32(kv, lo);                               \
-            svfloat32_t whi = svtbl_f32(kv, hi);                               \
-            svfloat32_t p = svmul_x(pg, wlo, vxlo);                            \
-            p = svmla_x(pg, p, whi, vxhi);                                     \
-            float sc = ggml_e8m0_to_fp32((S)[b]);                             \
-            ACC = svmla_x(pg, ACC, p, svdup_f32(sc));                          \
-        } while (0)
-        MXFP4_ROW(w0, s0, a0); MXFP4_ROW(w1, s1, a1);
-        MXFP4_ROW(w2, s2, a2); MXFP4_ROW(w3, s3, a3);
-        MXFP4_ROW(w4, s4, a4); MXFP4_ROW(w5, s5, a5);
-        MXFP4_ROW(w6, s6, a6); MXFP4_ROW(w7, s7, a7);
-        #undef MXFP4_ROW
-    }
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
-    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
-}
-
-/* Two-token register-blocked MXFP4 matvec for batched (M>1) expert GEMM.
- * Same per-row svtbl dequant as matvec_mxfp4_8row, but each block's dequantized
- * weight (wlo/whi) is reused across TWO x-vectors before being discarded, so the
- * weight nibbles read from L1 once feed both tokens -> when the caller keeps an
- * 8-row group L1-resident across its token pairs, the weight is read from HBM
- * once and amortized over all M tokens. Each token's accumulation order (over
- * blocks) is identical to matvec_mxfp4_8row, so dst0/dst1 are BIT-IDENTICAL to
- * two separate single-token calls (no cross-token reassociation here). */
-static inline void matvec_mxfp4_8row_2x(float *dst0, float *dst1,
-        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
-        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
-        const uint8_t *s0, const uint8_t *s1, const uint8_t *s2, const uint8_t *s3,
-        const uint8_t *s4, const uint8_t *s5, const uint8_t *s6, const uint8_t *s7,
-        const float *x0, const float *x1, int K) {
-    svbool_t pg = svptrue_b32();
-    svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
-    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f);
-    svfloat32_t a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
-    svfloat32_t b0=svdup_f32(0.f),b1=svdup_f32(0.f),b2=svdup_f32(0.f),b3=svdup_f32(0.f);
-    svfloat32_t b4=svdup_f32(0.f),b5=svdup_f32(0.f),b6=svdup_f32(0.f),b7=svdup_f32(0.f);
-    int nb = K / 32;
-    for (int b = 0; b < nb; b++) {
-        svfloat32_t vxlo0 = svld1(pg, &x0[b*32]), vxhi0 = svld1(pg, &x0[b*32+16]);
-        svfloat32_t vxlo1 = svld1(pg, &x1[b*32]), vxhi1 = svld1(pg, &x1[b*32+16]);
-        #define MXFP4_ROW2(W, S, ACCA, ACCB) do {                              \
-            svuint32_t braw = svld1ub_u32(pg, (W) + (size_t)b * 16);           \
-            svuint32_t lo = svand_n_u32_x(pg, braw, 0xf);                      \
-            svuint32_t hi = svand_n_u32_x(pg, svlsr_n_u32_x(pg, braw, 4), 0xf);\
-            svfloat32_t wlo = svtbl_f32(kv, lo);                              \
-            svfloat32_t whi = svtbl_f32(kv, hi);                              \
-            svfloat32_t vsc = svdup_f32(ggml_e8m0_to_fp32((S)[b]));           \
-            svfloat32_t pa = svmul_x(pg, wlo, vxlo0);                         \
-            pa = svmla_x(pg, pa, whi, vxhi0);                                 \
-            ACCA = svmla_x(pg, ACCA, pa, vsc);                                \
-            svfloat32_t pbv = svmul_x(pg, wlo, vxlo1);                        \
-            pbv = svmla_x(pg, pbv, whi, vxhi1);                               \
-            ACCB = svmla_x(pg, ACCB, pbv, vsc);                               \
-        } while (0)
-        MXFP4_ROW2(w0,s0,a0,b0); MXFP4_ROW2(w1,s1,a1,b1);
-        MXFP4_ROW2(w2,s2,a2,b2); MXFP4_ROW2(w3,s3,a3,b3);
-        MXFP4_ROW2(w4,s4,a4,b4); MXFP4_ROW2(w5,s5,a5,b5);
-        MXFP4_ROW2(w6,s6,a6,b6); MXFP4_ROW2(w7,s7,a7,b7);
-        #undef MXFP4_ROW2
-    }
-    dst0[0]=svaddv(pg,a0); dst0[1]=svaddv(pg,a1); dst0[2]=svaddv(pg,a2); dst0[3]=svaddv(pg,a3);
-    dst0[4]=svaddv(pg,a4); dst0[5]=svaddv(pg,a5); dst0[6]=svaddv(pg,a6); dst0[7]=svaddv(pg,a7);
-    dst1[0]=svaddv(pg,b0); dst1[1]=svaddv(pg,b1); dst1[2]=svaddv(pg,b2); dst1[3]=svaddv(pg,b3);
-    dst1[4]=svaddv(pg,b4); dst1[5]=svaddv(pg,b5); dst1[6]=svaddv(pg,b6); dst1[7]=svaddv(pg,b7);
-}
-#endif /* __ARM_FEATURE_SVE */
-
 /* Tiled BF16 GEMM: Y[tok, row] = W[row, K] · X[tok, K]^T
  * Token-major output: Y[t * Y_stride + r].
  * Processes 4 rows × N tokens with column-tiled inner loop for L1 reuse. */
@@ -2237,7 +1458,1811 @@ static inline void gemm_bf16_f32_tokmajor(float *Y, const uint16_t *W, const flo
 /* ======================================================================== */
 #ifdef GGML_DEQUANT_IMPLEMENTATION
 
-#include "ggml_dequant_impl.inc"
+#include <string.h>
+#include <math.h>
+
+static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits = x < 2 ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7f) return 0.0f;
+    int exp = (x >> 3) & 0xf;
+    int man = x & 0x7;
+    float raw = exp == 0 ? ldexpf((float)man, -9) : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
+void dequantize_row_q8_0(const void *src, float *dst, int n) {
+    const int nb = n / 32;
+    const block_q8_0 *blocks = (const block_q8_0 *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(blocks[i].d);
+        for (int j = 0; j < 32; j++) {
+            dst[i * 32 + j] = d * blocks[i].qs[j];
+        }
+    }
+}
+
+void dequantize_row_q1_0(const void *src, float *dst, int n) {
+    const int nb = n / 128;
+    const block_q1_0 *blocks = (const block_q1_0 *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(blocks[i].d);
+        const float neg_d = -d;
+        for (int j = 0; j < 128; j++) {
+            const uint8_t bit = (blocks[i].qs[j >> 3] >> (j & 7)) & 1u;
+            dst[i * 128 + j] = bit ? d : neg_d;
+        }
+    }
+}
+
+void dequantize_row_q2_K(const void *src, float *dst, int n) {
+    const int nb = n / 256;
+    const block_q2_K *blocks = (const block_q2_K *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const float d   = ggml_fp16_to_fp32(blocks[i].d);
+        const float min = ggml_fp16_to_fp32(blocks[i].dmin);
+        const uint8_t *q = blocks[i].qs;
+        float *y = dst + i * 256;
+
+        int is = 0;
+        for (int n0 = 0; n0 < 256; n0 += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = blocks[i].scales[is++];
+                const float dl = d * (sc & 0xF);
+                const float ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * ((q[l] >> shift) & 3) - ml;
+
+                sc = blocks[i].scales[is++];
+                const float dl2 = d * (sc & 0xF);
+                const float ml2 = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl2 * ((q[l + 16] >> shift) & 3) - ml2;
+
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+void dequantize_row_q3_K(const void *src, float *dst, int n) {
+    const int nb = n / 256;
+    const block_q3_K *blocks = (const block_q3_K *)src;
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+
+    for (int i = 0; i < nb; i++) {
+        const float d_all = ggml_fp16_to_fp32(blocks[i].d);
+        const uint8_t *q = blocks[i].qs;
+        const uint8_t *hm = blocks[i].hmask;
+        float *y = dst + i * 256;
+        uint8_t m = 1;
+
+        uint32_t aux[4] = {0, 0, 0, 0};
+        memcpy(aux, blocks[i].scales, 12);
+        {
+            uint32_t tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        }
+        const int8_t *scales = (const int8_t *)aux;
+
+        int is = 0;
+        for (int n0 = 0; n0 < 256; n0 += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                const float dl1 = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl1 * ((int8_t)((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4));
+                }
+
+                const float dl2 = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl2 * ((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                }
+
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+
+static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+void dequantize_row_q4_K(const void *src, float *dst, int n) {
+    const int nb = n / 256;
+    const block_q4_K *blocks = (const block_q4_K *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const block_q4_K *b = &blocks[i];
+        const float d = ggml_fp16_to_fp32(b->d);
+        const float dmin = ggml_fp16_to_fp32(b->dmin);
+        float *y = dst + i * 256;
+
+        const uint8_t *q = b->qs;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m_val;
+            get_scale_min_k4(is + 0, b->scales, &sc, &m_val);
+            const float d1 = d * sc;
+            const float m1 = dmin * m_val;
+            get_scale_min_k4(is + 1, b->scales, &sc, &m_val);
+            const float d2 = d * sc;
+            const float m2 = dmin * m_val;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+
+void dequantize_row_q5_K(const void *src, float *dst, int n) {
+    const int nb = n / 256;
+    const block_q5_K *blocks = (const block_q5_K *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *ql = blocks[i].qs;
+        const uint8_t *qh = blocks[i].qh;
+        const float d = ggml_fp16_to_fp32(blocks[i].d);
+        const float min = ggml_fp16_to_fp32(blocks[i].dmin);
+        float *y = dst + i * 256;
+
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, blocks[i].scales, &sc, &m);
+            const float d1 = d * sc;
+            const float m1 = min * m;
+            get_scale_min_k4(is + 1, blocks[i].scales, &sc, &m);
+            const float d2 = d * sc;
+            const float m2 = min * m;
+
+            for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+void dequantize_row_q6_K(const void *src, float *dst, int n) {
+    const int nb = n / 256;
+    const block_q6_K *blocks = (const block_q6_K *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const block_q6_K *b = &blocks[i];
+        const float d = ggml_fp16_to_fp32(b->d);
+        float *y = dst + i * 256;
+
+        /* 256 elements processed in two halves of 128.
+         * Each half uses 64 bytes ql, 32 bytes qh, 8 scale values.
+         * Within each half, 32 iterations produce 4 outputs each. */
+        const uint8_t *ql = b->ql;
+        const uint8_t *qh = b->qh;
+        const int8_t  *sc = b->scales;
+
+        for (int half = 0; half < 2; half++) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l +  0] >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+void dequantize_row_bf16(const void *src, float *dst, int n) {
+    const uint16_t *s = (const uint16_t *)src;
+    for (int i = 0; i < n; i++) {
+        uint32_t bits = (uint32_t)s[i] << 16;  /* BF16 → F32: pad mantissa with zeros */
+        memcpy(&dst[i], &bits, sizeof(float));
+    }
+}
+
+/* IQ2_XXS lookup tables (from ggml-common.h) */
+static const uint64_t iq2xxs_grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
+static const uint8_t ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+
+static const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+static const int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+
+static const uint32_t iq3xxs_grid[256] = {
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+};
+
+static const uint32_t iq3s_grid[512] = {
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+};
+
+static const uint64_t iq2xs_grid[512] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x080808080819192b,
+    0x0808080808192b19, 0x08080808082b0808, 0x08080808082b082b, 0x08080808082b1919,
+    0x08080808082b2b08, 0x0808080819080819, 0x0808080819081908, 0x080808081908192b,
+    0x0808080819082b19, 0x0808080819190808, 0x080808081919082b, 0x0808080819191919,
+    0x0808080819192b08, 0x08080808192b0819, 0x08080808192b1908, 0x080808082b080808,
+    0x080808082b08082b, 0x080808082b081919, 0x080808082b082b08, 0x080808082b190819,
+    0x080808082b191908, 0x080808082b192b19, 0x080808082b2b0808, 0x0808081908080819,
+    0x0808081908081908, 0x080808190808192b, 0x0808081908082b19, 0x0808081908190808,
+    0x080808190819082b, 0x0808081908191919, 0x0808081908192b08, 0x0808081908192b2b,
+    0x08080819082b0819, 0x08080819082b1908, 0x0808081919080808, 0x080808191908082b,
+    0x0808081919081919, 0x0808081919082b08, 0x0808081919190819, 0x0808081919191908,
+    0x08080819192b0808, 0x08080819192b2b08, 0x080808192b080819, 0x080808192b081908,
+    0x080808192b190808, 0x0808082b08080808, 0x0808082b0808082b, 0x0808082b08081919,
+    0x0808082b08082b08, 0x0808082b08190819, 0x0808082b08191908, 0x0808082b082b0808,
+    0x0808082b19080819, 0x0808082b19081908, 0x0808082b19190808, 0x0808082b19191919,
+    0x0808082b2b080808, 0x0808082b2b082b2b, 0x0808190808080819, 0x0808190808081908,
+    0x080819080808192b, 0x0808190808082b19, 0x0808190808190808, 0x080819080819082b,
+    0x0808190808191919, 0x0808190808192b08, 0x08081908082b0819, 0x08081908082b1908,
+    0x0808190819080808, 0x080819081908082b, 0x0808190819081919, 0x0808190819082b08,
+    0x0808190819190819, 0x0808190819191908, 0x080819081919192b, 0x08081908192b0808,
+    0x080819082b080819, 0x080819082b081908, 0x080819082b190808, 0x0808191908080808,
+    0x080819190808082b, 0x0808191908081919, 0x0808191908082b08, 0x0808191908190819,
+    0x0808191908191908, 0x08081919082b0808, 0x0808191919080819, 0x0808191919081908,
+    0x0808191919190808, 0x08081919192b0819, 0x080819192b080808, 0x0808192b08080819,
+    0x0808192b08081908, 0x0808192b08190808, 0x0808192b082b192b, 0x0808192b19080808,
+    0x0808192b1908082b, 0x0808192b2b081908, 0x08082b0808080808, 0x08082b080808082b,
+    0x08082b0808081919, 0x08082b0808082b08, 0x08082b0808082b2b, 0x08082b0808190819,
+    0x08082b0808191908, 0x08082b08082b0808, 0x08082b08082b1919, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b0819192b08, 0x08082b082b080808,
+    0x08082b082b2b0808, 0x08082b082b2b2b2b, 0x08082b1908080819, 0x08082b1908081908,
+    0x08082b1908190808, 0x08082b1919080808, 0x08082b192b080819, 0x08082b192b082b19,
+    0x08082b2b08080808, 0x08082b2b082b0808, 0x08082b2b082b2b08, 0x08082b2b2b19192b,
+    0x08082b2b2b2b0808, 0x0819080808080819, 0x0819080808081908, 0x081908080808192b,
+    0x0819080808082b19, 0x0819080808190808, 0x081908080819082b, 0x0819080808191919,
+    0x0819080808192b08, 0x08190808082b0819, 0x08190808082b1908, 0x0819080819080808,
+    0x081908081908082b, 0x0819080819081919, 0x0819080819082b08, 0x0819080819190819,
+    0x0819080819191908, 0x08190808192b0808, 0x08190808192b2b2b, 0x081908082b080819,
+    0x081908082b081908, 0x081908082b190808, 0x0819081908080808, 0x081908190808082b,
+    0x0819081908081919, 0x0819081908082b08, 0x0819081908190819, 0x0819081908191908,
+    0x08190819082b0808, 0x0819081919080819, 0x0819081919081908, 0x0819081919190808,
+    0x081908192b080808, 0x081908192b191908, 0x081908192b19192b, 0x0819082b08080819,
+    0x0819082b08081908, 0x0819082b0808192b, 0x0819082b08190808, 0x0819082b19080808,
+    0x0819082b192b0808, 0x0819190808080808, 0x081919080808082b, 0x0819190808081919,
+    0x0819190808082b08, 0x0819190808190819, 0x0819190808191908, 0x08191908082b0808,
+    0x0819190819080819, 0x0819190819081908, 0x0819190819082b19, 0x0819190819190808,
+    0x08191908192b1908, 0x081919082b080808, 0x0819191908080819, 0x0819191908081908,
+    0x0819191908190808, 0x0819191919080808, 0x0819192b08080808, 0x0819192b08191908,
+    0x0819192b19082b19, 0x08192b0808080819, 0x08192b0808081908, 0x08192b0808190808,
+    0x08192b080819082b, 0x08192b0819080808, 0x08192b0819191908, 0x08192b082b08192b,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b19192b192b, 0x08192b2b19190819,
+    0x08192b2b2b2b2b19, 0x082b080808080808, 0x082b08080808082b, 0x082b080808081919,
+    0x082b080808082b08, 0x082b080808082b2b, 0x082b080808190819, 0x082b080808191908,
+    0x082b0808082b0808, 0x082b080819080819, 0x082b080819081908, 0x082b080819190808,
+    0x082b08082b080808, 0x082b08082b2b0808, 0x082b081908080819, 0x082b081908081908,
+    0x082b081908190808, 0x082b081919080808, 0x082b081919082b08, 0x082b0819192b1919,
+    0x082b082b08080808, 0x082b082b082b082b, 0x082b082b2b080808, 0x082b082b2b2b2b08,
+    0x082b190808080819, 0x082b190808081908, 0x082b190808190808, 0x082b1908082b2b19,
+    0x082b190819080808, 0x082b191908080808, 0x082b191919080819, 0x082b19191919082b,
+    0x082b19192b192b19, 0x082b192b08080819, 0x082b192b08192b2b, 0x082b192b2b2b192b,
+    0x082b2b0808080808, 0x082b2b0808082b08, 0x082b2b0808082b2b, 0x082b2b08082b0808,
+    0x082b2b0819191919, 0x082b2b082b082b08, 0x082b2b082b2b082b, 0x082b2b19192b2b08,
+    0x082b2b192b190808, 0x082b2b2b08082b08, 0x082b2b2b082b0808, 0x082b2b2b2b08082b,
+    0x082b2b2b2b082b08, 0x082b2b2b2b082b2b, 0x1908080808080819, 0x1908080808081908,
+    0x190808080808192b, 0x1908080808082b19, 0x1908080808190808, 0x190808080819082b,
+    0x1908080808191919, 0x1908080808192b08, 0x19080808082b0819, 0x19080808082b1908,
+    0x1908080819080808, 0x190808081908082b, 0x1908080819081919, 0x1908080819082b08,
+    0x1908080819082b2b, 0x1908080819190819, 0x1908080819191908, 0x19080808192b0808,
+    0x19080808192b1919, 0x190808082b080819, 0x190808082b081908, 0x190808082b190808,
+    0x1908081908080808, 0x190808190808082b, 0x1908081908081919, 0x1908081908082b08,
+    0x1908081908190819, 0x1908081908191908, 0x19080819082b0808, 0x1908081919080819,
+    0x1908081919081908, 0x1908081919190808, 0x190808192b080808, 0x190808192b081919,
+    0x190808192b2b082b, 0x1908082b08080819, 0x1908082b08081908, 0x1908082b08190808,
+    0x1908082b0819082b, 0x1908082b082b2b19, 0x1908082b19080808, 0x1908190808080808,
+    0x190819080808082b, 0x1908190808081919, 0x1908190808082b08, 0x1908190808190819,
+    0x1908190808191908, 0x1908190808192b19, 0x19081908082b0808, 0x1908190819080819,
+    0x1908190819081908, 0x1908190819190808, 0x190819082b080808, 0x190819082b191908,
+    0x1908191908080819, 0x1908191908081908, 0x1908191908190808, 0x19081919082b1908,
+    0x1908191919080808, 0x190819192b192b2b, 0x1908192b08080808, 0x1908192b08082b2b,
+    0x1908192b19081908, 0x1908192b19190808, 0x19082b0808080819, 0x19082b0808081908,
+    0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919, 0x19082b0819191908,
+    0x19082b08192b082b, 0x19082b1908080808, 0x19082b1908190819, 0x19082b1919081908,
+    0x19082b1919190808, 0x19082b19192b2b19, 0x19082b2b08081908, 0x1919080808080808,
+    0x191908080808082b, 0x1919080808081919, 0x1919080808082b08, 0x1919080808190819,
+    0x1919080808191908, 0x19190808082b0808, 0x19190808082b2b08, 0x1919080819080819,
+    0x1919080819081908, 0x1919080819190808, 0x191908082b080808, 0x1919081908080819,
+    0x1919081908081908, 0x1919081908190808, 0x1919081908191919, 0x1919081919080808,
+    0x191908191908082b, 0x1919082b08080808, 0x1919082b19081908, 0x1919082b2b2b2b2b,
+    0x1919190808080819, 0x1919190808081908, 0x1919190808190808, 0x19191908082b0819,
+    0x1919190819080808, 0x19191908192b0808, 0x191919082b080819, 0x191919082b2b0819,
+    0x1919191908080808, 0x1919191908082b08, 0x191919192b080808, 0x191919192b082b08,
+    0x1919192b082b0819, 0x1919192b192b2b08, 0x1919192b2b2b0819, 0x19192b0808080808,
+    0x19192b0808191908, 0x19192b0819080819, 0x19192b0819190808, 0x19192b082b192b19,
+    0x19192b1908192b2b, 0x19192b1919080808, 0x19192b191908082b, 0x19192b2b2b081919,
+    0x192b080808080819, 0x192b080808081908, 0x192b080808190808, 0x192b080819080808,
+    0x192b080819191908, 0x192b0808192b082b, 0x192b08082b08192b, 0x192b08082b2b2b19,
+    0x192b081908080808, 0x192b082b082b1908, 0x192b082b19082b2b, 0x192b082b2b19082b,
+    0x192b190808080808, 0x192b19080819192b, 0x192b191908190808, 0x192b191919080808,
+    0x192b191919081919, 0x192b19192b2b1908, 0x192b2b0808080819, 0x192b2b08192b2b2b,
+    0x192b2b19082b1919, 0x192b2b2b0808192b, 0x192b2b2b19191908, 0x192b2b2b192b082b,
+    0x2b08080808080808, 0x2b0808080808082b, 0x2b08080808081919, 0x2b08080808082b08,
+    0x2b08080808190819, 0x2b08080808191908, 0x2b080808082b0808, 0x2b080808082b2b2b,
+    0x2b08080819080819, 0x2b08080819081908, 0x2b08080819190808, 0x2b0808082b080808,
+    0x2b0808082b08082b, 0x2b0808082b2b2b08, 0x2b0808082b2b2b2b, 0x2b08081908080819,
+    0x2b08081908081908, 0x2b0808190808192b, 0x2b08081908190808, 0x2b08081919080808,
+    0x2b08081919190819, 0x2b08081919192b19, 0x2b08082b08080808, 0x2b08082b082b0808,
+    0x2b08082b2b080808, 0x2b08082b2b08082b, 0x2b08082b2b2b0808, 0x2b08082b2b2b2b08,
+    0x2b08190808080819, 0x2b08190808081908, 0x2b08190808190808, 0x2b0819080819082b,
+    0x2b08190808191919, 0x2b08190819080808, 0x2b081908192b0808, 0x2b0819082b082b19,
+    0x2b08191908080808, 0x2b08191919081908, 0x2b0819192b2b1919, 0x2b08192b08192b08,
+    0x2b08192b192b2b2b, 0x2b082b0808080808, 0x2b082b0808082b08, 0x2b082b08082b1919,
+    0x2b082b0819192b2b, 0x2b082b082b080808, 0x2b082b082b08082b, 0x2b082b082b2b2b08,
+    0x2b082b190808192b, 0x2b082b2b082b082b, 0x2b082b2b2b080808, 0x2b082b2b2b082b08,
+    0x2b082b2b2b19192b, 0x2b082b2b2b2b2b08, 0x2b19080808080819, 0x2b19080808081908,
+    0x2b19080808190808, 0x2b19080819080808, 0x2b1908081919192b, 0x2b1908082b081908,
+    0x2b19081908080808, 0x2b190819082b082b, 0x2b190819192b1908, 0x2b19082b1919192b,
+    0x2b19082b2b082b19, 0x2b19190808080808, 0x2b19190808081919, 0x2b19190819081908,
+    0x2b19190819190808, 0x2b19190819192b08, 0x2b191919082b2b19, 0x2b1919192b190808,
+    0x2b1919192b19082b, 0x2b19192b19080819, 0x2b192b0819190819, 0x2b192b082b2b192b,
+    0x2b192b1919082b19, 0x2b192b2b08191919, 0x2b192b2b192b0808, 0x2b2b080808080808,
+    0x2b2b08080808082b, 0x2b2b080808082b08, 0x2b2b080808082b2b, 0x2b2b0808082b0808,
+    0x2b2b0808082b2b2b, 0x2b2b08082b2b0808, 0x2b2b081919190819, 0x2b2b081919192b19,
+    0x2b2b08192b2b192b, 0x2b2b082b08080808, 0x2b2b082b0808082b, 0x2b2b082b08082b08,
+    0x2b2b082b082b2b2b, 0x2b2b082b2b080808, 0x2b2b082b2b2b0808, 0x2b2b190819080808,
+    0x2b2b19082b191919, 0x2b2b192b192b1919, 0x2b2b192b2b192b08, 0x2b2b2b0808082b2b,
+    0x2b2b2b08082b0808, 0x2b2b2b08082b082b, 0x2b2b2b08082b2b08, 0x2b2b2b082b2b0808,
+    0x2b2b2b082b2b2b08, 0x2b2b2b1908081908, 0x2b2b2b192b081908, 0x2b2b2b192b08192b,
+    0x2b2b2b2b082b2b08, 0x2b2b2b2b082b2b2b, 0x2b2b2b2b2b190819, 0x2b2b2b2b2b2b2b2b,
+};
+
+static const uint64_t iq2s_grid[1024] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x080808080819192b,
+    0x0808080808192b19, 0x08080808082b0808, 0x08080808082b082b, 0x08080808082b1919,
+    0x08080808082b2b08, 0x0808080819080819, 0x0808080819081908, 0x080808081908192b,
+    0x0808080819082b19, 0x0808080819190808, 0x080808081919082b, 0x0808080819191919,
+    0x0808080819192b08, 0x08080808192b0819, 0x08080808192b1908, 0x08080808192b192b,
+    0x08080808192b2b19, 0x080808082b080808, 0x080808082b08082b, 0x080808082b081919,
+    0x080808082b082b08, 0x080808082b190819, 0x080808082b191908, 0x080808082b2b0808,
+    0x080808082b2b1919, 0x080808082b2b2b2b, 0x0808081908080819, 0x0808081908081908,
+    0x080808190808192b, 0x0808081908082b19, 0x0808081908190808, 0x080808190819082b,
+    0x0808081908191919, 0x0808081908192b08, 0x08080819082b0819, 0x08080819082b1908,
+    0x0808081919080808, 0x080808191908082b, 0x0808081919081919, 0x0808081919082b08,
+    0x0808081919190819, 0x0808081919191908, 0x080808191919192b, 0x0808081919192b19,
+    0x08080819192b0808, 0x08080819192b1919, 0x08080819192b2b08, 0x080808192b080819,
+    0x080808192b081908, 0x080808192b190808, 0x080808192b19082b, 0x080808192b191919,
+    0x080808192b2b0819, 0x080808192b2b1908, 0x0808082b08080808, 0x0808082b0808082b,
+    0x0808082b08081919, 0x0808082b08082b08, 0x0808082b08190819, 0x0808082b08191908,
+    0x0808082b082b0808, 0x0808082b082b2b2b, 0x0808082b19080819, 0x0808082b19081908,
+    0x0808082b1908192b, 0x0808082b19082b19, 0x0808082b19190808, 0x0808082b19191919,
+    0x0808082b2b080808, 0x0808082b2b081919, 0x0808082b2b082b2b, 0x0808082b2b191908,
+    0x0808082b2b2b082b, 0x0808190808080819, 0x0808190808081908, 0x080819080808192b,
+    0x0808190808082b19, 0x0808190808190808, 0x080819080819082b, 0x0808190808191919,
+    0x0808190808192b08, 0x08081908082b0819, 0x08081908082b1908, 0x08081908082b192b,
+    0x08081908082b2b19, 0x0808190819080808, 0x080819081908082b, 0x0808190819081919,
+    0x0808190819082b08, 0x0808190819082b2b, 0x0808190819190819, 0x0808190819191908,
+    0x080819081919192b, 0x0808190819192b19, 0x08081908192b0808, 0x08081908192b082b,
+    0x08081908192b1919, 0x080819082b080819, 0x080819082b081908, 0x080819082b08192b,
+    0x080819082b082b19, 0x080819082b190808, 0x080819082b191919, 0x080819082b192b08,
+    0x080819082b2b0819, 0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b,
+    0x0808191908081919, 0x0808191908082b08, 0x0808191908082b2b, 0x0808191908190819,
+    0x0808191908191908, 0x080819190819192b, 0x0808191908192b19, 0x08081919082b0808,
+    0x08081919082b1919, 0x08081919082b2b08, 0x0808191919080819, 0x0808191919081908,
+    0x080819191908192b, 0x0808191919082b19, 0x0808191919190808, 0x080819191919082b,
+    0x0808191919191919, 0x0808191919192b08, 0x08081919192b0819, 0x08081919192b1908,
+    0x080819192b080808, 0x080819192b08082b, 0x080819192b081919, 0x080819192b082b08,
+    0x080819192b190819, 0x080819192b191908, 0x080819192b2b0808, 0x0808192b08080819,
+    0x0808192b08081908, 0x0808192b0808192b, 0x0808192b08082b19, 0x0808192b08190808,
+    0x0808192b08191919, 0x0808192b19080808, 0x0808192b19081919, 0x0808192b19082b08,
+    0x0808192b19190819, 0x0808192b19191908, 0x0808192b192b0808, 0x0808192b2b080819,
+    0x0808192b2b081908, 0x0808192b2b190808, 0x08082b0808080808, 0x08082b080808082b,
+    0x08082b0808081919, 0x08082b0808082b08, 0x08082b0808190819, 0x08082b0808191908,
+    0x08082b080819192b, 0x08082b0808192b19, 0x08082b08082b0808, 0x08082b08082b1919,
+    0x08082b08082b2b2b, 0x08082b0819080819, 0x08082b0819081908, 0x08082b081908192b,
+    0x08082b0819082b19, 0x08082b0819190808, 0x08082b081919082b, 0x08082b0819191919,
+    0x08082b0819192b08, 0x08082b08192b0819, 0x08082b08192b1908, 0x08082b082b080808,
+    0x08082b082b081919, 0x08082b082b191908, 0x08082b082b2b2b2b, 0x08082b1908080819,
+    0x08082b1908081908, 0x08082b1908190808, 0x08082b190819082b, 0x08082b1908191919,
+    0x08082b1908192b08, 0x08082b19082b0819, 0x08082b1919080808, 0x08082b1919081919,
+    0x08082b1919082b08, 0x08082b1919190819, 0x08082b1919191908, 0x08082b19192b0808,
+    0x08082b192b080819, 0x08082b192b190808, 0x08082b2b08080808, 0x08082b2b08190819,
+    0x08082b2b08191908, 0x08082b2b082b082b, 0x08082b2b082b2b08, 0x08082b2b082b2b2b,
+    0x08082b2b19190808, 0x08082b2b2b192b19, 0x0819080808080819, 0x0819080808081908,
+    0x081908080808192b, 0x0819080808082b19, 0x0819080808190808, 0x081908080819082b,
+    0x0819080808191919, 0x0819080808192b08, 0x08190808082b0819, 0x08190808082b1908,
+    0x08190808082b192b, 0x0819080819080808, 0x081908081908082b, 0x0819080819081919,
+    0x0819080819082b08, 0x0819080819190819, 0x0819080819191908, 0x081908081919192b,
+    0x0819080819192b19, 0x08190808192b0808, 0x08190808192b082b, 0x08190808192b1919,
+    0x08190808192b2b08, 0x081908082b080819, 0x081908082b081908, 0x081908082b08192b,
+    0x081908082b190808, 0x081908082b191919, 0x081908082b192b08, 0x081908082b2b0819,
+    0x081908082b2b1908, 0x0819081908080808, 0x081908190808082b, 0x0819081908081919,
+    0x0819081908082b08, 0x0819081908082b2b, 0x0819081908190819, 0x0819081908191908,
+    0x081908190819192b, 0x0819081908192b19, 0x08190819082b0808, 0x08190819082b082b,
+    0x08190819082b1919, 0x08190819082b2b08, 0x0819081919080819, 0x0819081919081908,
+    0x081908191908192b, 0x0819081919082b19, 0x0819081919190808, 0x081908191919082b,
+    0x0819081919191919, 0x0819081919192b08, 0x08190819192b0819, 0x08190819192b1908,
+    0x081908192b080808, 0x081908192b08082b, 0x081908192b081919, 0x081908192b082b08,
+    0x081908192b190819, 0x081908192b191908, 0x0819082b08080819, 0x0819082b08081908,
+    0x0819082b08082b19, 0x0819082b08190808, 0x0819082b08191919, 0x0819082b082b0819,
+    0x0819082b082b1908, 0x0819082b19080808, 0x0819082b19081919, 0x0819082b19190819,
+    0x0819082b19191908, 0x0819082b2b080819, 0x0819082b2b081908, 0x0819082b2b190808,
+    0x0819190808080808, 0x081919080808082b, 0x0819190808081919, 0x0819190808082b08,
+    0x0819190808190819, 0x0819190808191908, 0x081919080819192b, 0x0819190808192b19,
+    0x08191908082b0808, 0x08191908082b1919, 0x08191908082b2b08, 0x0819190819080819,
+    0x0819190819081908, 0x081919081908192b, 0x0819190819082b19, 0x0819190819190808,
+    0x081919081919082b, 0x0819190819191919, 0x0819190819192b08, 0x08191908192b0819,
+    0x08191908192b1908, 0x081919082b080808, 0x081919082b08082b, 0x081919082b081919,
+    0x081919082b082b08, 0x081919082b190819, 0x081919082b191908, 0x081919082b2b0808,
+    0x0819191908080819, 0x0819191908081908, 0x081919190808192b, 0x0819191908082b19,
+    0x0819191908190808, 0x081919190819082b, 0x0819191908191919, 0x0819191908192b08,
+    0x08191919082b0819, 0x08191919082b1908, 0x0819191919080808, 0x081919191908082b,
+    0x0819191919081919, 0x0819191919082b08, 0x0819191919190819, 0x0819191919191908,
+    0x08191919192b0808, 0x081919192b080819, 0x081919192b081908, 0x081919192b190808,
+    0x0819192b08080808, 0x0819192b08081919, 0x0819192b08082b08, 0x0819192b08190819,
+    0x0819192b08191908, 0x0819192b082b0808, 0x0819192b19080819, 0x0819192b19081908,
+    0x0819192b19190808, 0x0819192b2b080808, 0x0819192b2b2b2b2b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b080808192b, 0x08192b0808082b19, 0x08192b0808190808,
+    0x08192b0808191919, 0x08192b0808192b08, 0x08192b08082b0819, 0x08192b0819080808,
+    0x08192b081908082b, 0x08192b0819081919, 0x08192b0819082b08, 0x08192b0819190819,
+    0x08192b0819191908, 0x08192b08192b0808, 0x08192b082b080819, 0x08192b082b081908,
+    0x08192b1908080808, 0x08192b190808082b, 0x08192b1908081919, 0x08192b1908082b08,
+    0x08192b1908190819, 0x08192b1908191908, 0x08192b19082b0808, 0x08192b1919080819,
+    0x08192b1919081908, 0x08192b1919190808, 0x08192b19192b2b19, 0x08192b192b2b082b,
+    0x08192b2b08081908, 0x08192b2b08190808, 0x08192b2b19080808, 0x08192b2b1919192b,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808081919, 0x082b080808082b08,
+    0x082b080808190819, 0x082b080808191908, 0x082b08080819192b, 0x082b080808192b19,
+    0x082b0808082b0808, 0x082b0808082b1919, 0x082b0808082b2b2b, 0x082b080819080819,
+    0x082b080819081908, 0x082b080819190808, 0x082b08081919082b, 0x082b080819191919,
+    0x082b0808192b1908, 0x082b08082b080808, 0x082b08082b082b2b, 0x082b08082b191908,
+    0x082b08082b2b2b2b, 0x082b081908080819, 0x082b081908081908, 0x082b081908190808,
+    0x082b08190819082b, 0x082b081908191919, 0x082b0819082b0819, 0x082b081919080808,
+    0x082b08191908082b, 0x082b081919081919, 0x082b081919190819, 0x082b081919191908,
+    0x082b0819192b0808, 0x082b08192b080819, 0x082b08192b081908, 0x082b08192b190808,
+    0x082b082b08080808, 0x082b082b08082b2b, 0x082b082b082b082b, 0x082b082b082b2b08,
+    0x082b082b082b2b2b, 0x082b082b19081908, 0x082b082b19190808, 0x082b082b2b082b08,
+    0x082b082b2b082b2b, 0x082b082b2b2b2b08, 0x082b190808080819, 0x082b190808081908,
+    0x082b19080808192b, 0x082b190808082b19, 0x082b190808190808, 0x082b190808191919,
+    0x082b190808192b08, 0x082b1908082b0819, 0x082b1908082b1908, 0x082b190819080808,
+    0x082b19081908082b, 0x082b190819081919, 0x082b190819082b08, 0x082b190819190819,
+    0x082b190819191908, 0x082b1908192b0808, 0x082b19082b080819, 0x082b19082b081908,
+    0x082b19082b190808, 0x082b191908080808, 0x082b191908081919, 0x082b191908082b08,
+    0x082b191908190819, 0x082b191908191908, 0x082b1919082b0808, 0x082b191919080819,
+    0x082b191919081908, 0x082b191919190808, 0x082b1919192b192b, 0x082b19192b080808,
+    0x082b192b08080819, 0x082b192b08081908, 0x082b192b08190808, 0x082b192b19080808,
+    0x082b192b19192b19, 0x082b2b0808080808, 0x082b2b0808081919, 0x082b2b0808190819,
+    0x082b2b0808191908, 0x082b2b0819080819, 0x082b2b0819081908, 0x082b2b0819190808,
+    0x082b2b082b082b2b, 0x082b2b082b2b2b2b, 0x082b2b1908080819, 0x082b2b1908081908,
+    0x082b2b1908190808, 0x082b2b192b191919, 0x082b2b2b08082b2b, 0x082b2b2b082b082b,
+    0x082b2b2b192b1908, 0x082b2b2b2b082b08, 0x082b2b2b2b082b2b, 0x1908080808080819,
+    0x1908080808081908, 0x190808080808192b, 0x1908080808082b19, 0x1908080808190808,
+    0x190808080819082b, 0x1908080808191919, 0x1908080808192b08, 0x1908080808192b2b,
+    0x19080808082b0819, 0x19080808082b1908, 0x19080808082b192b, 0x1908080819080808,
+    0x190808081908082b, 0x1908080819081919, 0x1908080819082b08, 0x1908080819082b2b,
+    0x1908080819190819, 0x1908080819191908, 0x190808081919192b, 0x1908080819192b19,
+    0x19080808192b0808, 0x19080808192b082b, 0x19080808192b1919, 0x190808082b080819,
+    0x190808082b081908, 0x190808082b190808, 0x190808082b191919, 0x190808082b192b08,
+    0x190808082b2b0819, 0x190808082b2b1908, 0x1908081908080808, 0x190808190808082b,
+    0x1908081908081919, 0x1908081908082b08, 0x1908081908190819, 0x1908081908191908,
+    0x190808190819192b, 0x1908081908192b19, 0x19080819082b0808, 0x19080819082b082b,
+    0x19080819082b1919, 0x1908081919080819, 0x1908081919081908, 0x190808191908192b,
+    0x1908081919082b19, 0x1908081919190808, 0x190808191919082b, 0x1908081919191919,
+    0x1908081919192b08, 0x19080819192b0819, 0x19080819192b1908, 0x190808192b080808,
+    0x190808192b08082b, 0x190808192b081919, 0x190808192b082b08, 0x190808192b190819,
+    0x190808192b191908, 0x190808192b2b0808, 0x1908082b08080819, 0x1908082b08081908,
+    0x1908082b08190808, 0x1908082b0819082b, 0x1908082b08191919, 0x1908082b08192b08,
+    0x1908082b082b1908, 0x1908082b19080808, 0x1908082b19081919, 0x1908082b19082b08,
+    0x1908082b19190819, 0x1908082b19191908, 0x1908082b192b0808, 0x1908082b2b080819,
+    0x1908082b2b081908, 0x1908190808080808, 0x190819080808082b, 0x1908190808081919,
+    0x1908190808082b08, 0x1908190808082b2b, 0x1908190808190819, 0x1908190808191908,
+    0x190819080819192b, 0x1908190808192b19, 0x19081908082b0808, 0x19081908082b082b,
+    0x19081908082b1919, 0x19081908082b2b08, 0x1908190819080819, 0x1908190819081908,
+    0x190819081908192b, 0x1908190819082b19, 0x1908190819190808, 0x190819081919082b,
+    0x1908190819191919, 0x1908190819192b08, 0x19081908192b0819, 0x19081908192b1908,
+    0x190819082b080808, 0x190819082b08082b, 0x190819082b081919, 0x190819082b082b08,
+    0x190819082b190819, 0x190819082b191908, 0x190819082b2b0808, 0x1908191908080819,
+    0x1908191908081908, 0x190819190808192b, 0x1908191908082b19, 0x1908191908190808,
+    0x190819190819082b, 0x1908191908191919, 0x1908191908192b08, 0x19081919082b0819,
+    0x19081919082b1908, 0x1908191919080808, 0x190819191908082b, 0x1908191919081919,
+    0x1908191919082b08, 0x1908191919190819, 0x1908191919191908, 0x19081919192b0808,
+    0x19081919192b2b2b, 0x190819192b080819, 0x190819192b081908, 0x190819192b190808,
+    0x1908192b08080808, 0x1908192b0808082b, 0x1908192b08081919, 0x1908192b08082b08,
+    0x1908192b08190819, 0x1908192b08191908, 0x1908192b082b0808, 0x1908192b19080819,
+    0x1908192b19081908, 0x1908192b19190808, 0x1908192b2b080808, 0x1908192b2b2b1919,
+    0x19082b0808080819, 0x19082b0808081908, 0x19082b0808082b19, 0x19082b0808190808,
+    0x19082b080819082b, 0x19082b0808191919, 0x19082b0808192b08, 0x19082b08082b0819,
+    0x19082b08082b1908, 0x19082b0819080808, 0x19082b081908082b, 0x19082b0819081919,
+    0x19082b0819082b08, 0x19082b0819190819, 0x19082b0819191908, 0x19082b08192b0808,
+    0x19082b082b081908, 0x19082b082b190808, 0x19082b1908080808, 0x19082b190808082b,
+    0x19082b1908081919, 0x19082b1908082b08, 0x19082b1908190819, 0x19082b1908191908,
+    0x19082b19082b0808, 0x19082b1919080819, 0x19082b1919081908, 0x19082b1919190808,
+    0x19082b192b080808, 0x19082b192b19192b, 0x19082b2b08080819, 0x19082b2b08081908,
+    0x19082b2b08190808, 0x19082b2b19080808, 0x1919080808080808, 0x191908080808082b,
+    0x1919080808081919, 0x1919080808082b08, 0x1919080808190819, 0x1919080808191908,
+    0x191908080819192b, 0x1919080808192b19, 0x19190808082b0808, 0x19190808082b082b,
+    0x19190808082b1919, 0x19190808082b2b08, 0x1919080819080819, 0x1919080819081908,
+    0x191908081908192b, 0x1919080819082b19, 0x1919080819190808, 0x191908081919082b,
+    0x1919080819191919, 0x1919080819192b08, 0x19190808192b0819, 0x19190808192b1908,
+    0x191908082b080808, 0x191908082b08082b, 0x191908082b081919, 0x191908082b082b08,
+    0x191908082b190819, 0x191908082b191908, 0x1919081908080819, 0x1919081908081908,
+    0x191908190808192b, 0x1919081908082b19, 0x1919081908190808, 0x191908190819082b,
+    0x1919081908191919, 0x1919081908192b08, 0x19190819082b0819, 0x19190819082b1908,
+    0x1919081919080808, 0x191908191908082b, 0x1919081919081919, 0x1919081919082b08,
+    0x1919081919190819, 0x1919081919191908, 0x19190819192b0808, 0x191908192b080819,
+    0x191908192b081908, 0x191908192b190808, 0x1919082b08080808, 0x1919082b08081919,
+    0x1919082b08082b08, 0x1919082b08190819, 0x1919082b08191908, 0x1919082b082b0808,
+    0x1919082b19080819, 0x1919082b19081908, 0x1919082b19190808, 0x1919082b192b2b19,
+    0x1919082b2b080808, 0x1919190808080819, 0x1919190808081908, 0x191919080808192b,
+    0x1919190808082b19, 0x1919190808190808, 0x191919080819082b, 0x1919190808191919,
+    0x1919190808192b08, 0x19191908082b0819, 0x19191908082b1908, 0x1919190819080808,
+    0x191919081908082b, 0x1919190819081919, 0x1919190819082b08, 0x1919190819190819,
+    0x1919190819191908, 0x19191908192b0808, 0x191919082b080819, 0x191919082b081908,
+    0x191919082b190808, 0x1919191908080808, 0x191919190808082b, 0x1919191908081919,
+    0x1919191908082b08, 0x1919191908190819, 0x1919191908191908, 0x19191919082b0808,
+    0x1919191919080819, 0x1919191919081908, 0x1919191919190808, 0x191919192b080808,
+    0x1919192b08080819, 0x1919192b08081908, 0x1919192b08190808, 0x1919192b082b192b,
+    0x1919192b19080808, 0x19192b0808080808, 0x19192b080808082b, 0x19192b0808081919,
+    0x19192b0808082b08, 0x19192b0808190819, 0x19192b0808191908, 0x19192b08082b0808,
+    0x19192b0819080819, 0x19192b0819081908, 0x19192b0819190808, 0x19192b0819192b2b,
+    0x19192b082b080808, 0x19192b1908080819, 0x19192b1908081908, 0x19192b1908190808,
+    0x19192b1919080808, 0x19192b2b08080808, 0x19192b2b08192b19, 0x19192b2b2b081919,
+    0x19192b2b2b2b2b08, 0x192b080808080819, 0x192b080808081908, 0x192b08080808192b,
+    0x192b080808190808, 0x192b08080819082b, 0x192b080808191919, 0x192b080808192b08,
+    0x192b0808082b0819, 0x192b0808082b1908, 0x192b080819080808, 0x192b080819081919,
+    0x192b080819082b08, 0x192b080819190819, 0x192b080819191908, 0x192b0808192b0808,
+    0x192b08082b081908, 0x192b08082b190808, 0x192b081908080808, 0x192b08190808082b,
+    0x192b081908081919, 0x192b081908082b08, 0x192b081908190819, 0x192b081908191908,
+    0x192b0819082b0808, 0x192b081919080819, 0x192b081919081908, 0x192b081919190808,
+    0x192b08192b080808, 0x192b08192b192b19, 0x192b082b08081908, 0x192b082b08190808,
+    0x192b082b19080808, 0x192b082b1919192b, 0x192b082b2b2b0819, 0x192b190808080808,
+    0x192b190808081919, 0x192b190808082b08, 0x192b190808190819, 0x192b190808191908,
+    0x192b1908082b0808, 0x192b190819080819, 0x192b190819081908, 0x192b190819190808,
+    0x192b19082b080808, 0x192b191908080819, 0x192b191908081908, 0x192b191908190808,
+    0x192b191919080808, 0x192b191919082b2b, 0x192b1919192b2b08, 0x192b19192b19082b,
+    0x192b192b08080808, 0x192b192b2b191908, 0x192b2b0808080819, 0x192b2b0808081908,
+    0x192b2b0808190808, 0x192b2b08192b1919, 0x192b2b082b192b08, 0x192b2b1908080808,
+    0x192b2b19082b2b2b, 0x192b2b2b1908082b, 0x192b2b2b2b2b0819, 0x2b08080808080808,
+    0x2b0808080808082b, 0x2b08080808081919, 0x2b08080808082b08, 0x2b08080808190819,
+    0x2b08080808191908, 0x2b08080808192b19, 0x2b080808082b0808, 0x2b080808082b1919,
+    0x2b08080819080819, 0x2b08080819081908, 0x2b08080819190808, 0x2b0808081919082b,
+    0x2b08080819191919, 0x2b08080819192b08, 0x2b080808192b0819, 0x2b0808082b080808,
+    0x2b0808082b081919, 0x2b0808082b190819, 0x2b0808082b191908, 0x2b08081908080819,
+    0x2b08081908081908, 0x2b08081908082b19, 0x2b08081908190808, 0x2b0808190819082b,
+    0x2b08081908191919, 0x2b08081908192b08, 0x2b080819082b0819, 0x2b080819082b1908,
+    0x2b08081919080808, 0x2b0808191908082b, 0x2b08081919081919, 0x2b08081919082b08,
+    0x2b08081919190819, 0x2b08081919191908, 0x2b0808192b080819, 0x2b0808192b081908,
+    0x2b0808192b190808, 0x2b0808192b2b2b19, 0x2b08082b08080808, 0x2b08082b08081919,
+    0x2b08082b08082b2b, 0x2b08082b08190819, 0x2b08082b08191908, 0x2b08082b19080819,
+    0x2b08082b19081908, 0x2b08082b19190808, 0x2b08190808080819, 0x2b08190808081908,
+    0x2b0819080808192b, 0x2b08190808082b19, 0x2b08190808190808, 0x2b0819080819082b,
+    0x2b08190808191919, 0x2b08190808192b08, 0x2b081908082b0819, 0x2b08190819080808,
+    0x2b0819081908082b, 0x2b08190819081919, 0x2b08190819082b08, 0x2b08190819190819,
+    0x2b08190819191908, 0x2b081908192b0808, 0x2b0819082b080819, 0x2b0819082b081908,
+    0x2b0819082b190808, 0x2b08191908080808, 0x2b0819190808082b, 0x2b08191908081919,
+    0x2b08191908082b08, 0x2b08191908190819, 0x2b08191908191908, 0x2b081919082b0808,
+    0x2b08191919080819, 0x2b08191919081908, 0x2b08191919190808, 0x2b0819192b080808,
+    0x2b0819192b082b2b, 0x2b08192b08080819, 0x2b08192b08081908, 0x2b08192b08190808,
+    0x2b08192b082b2b19, 0x2b08192b19080808, 0x2b082b0808080808, 0x2b082b0808081919,
+    0x2b082b0808190819, 0x2b082b0808191908, 0x2b082b0819080819, 0x2b082b0819081908,
+    0x2b082b0819190808, 0x2b082b082b2b082b, 0x2b082b1908080819, 0x2b082b1908081908,
+    0x2b082b1919080808, 0x2b082b19192b1919, 0x2b082b2b082b082b, 0x2b082b2b19192b08,
+    0x2b082b2b19192b2b, 0x2b082b2b2b08082b, 0x2b082b2b2b2b082b, 0x2b19080808080819,
+    0x2b19080808081908, 0x2b19080808082b19, 0x2b19080808190808, 0x2b1908080819082b,
+    0x2b19080808191919, 0x2b19080808192b08, 0x2b190808082b1908, 0x2b19080819080808,
+    0x2b1908081908082b, 0x2b19080819081919, 0x2b19080819082b08, 0x2b19080819190819,
+    0x2b19080819191908, 0x2b190808192b0808, 0x2b1908082b080819, 0x2b1908082b081908,
+    0x2b1908082b190808, 0x2b19081908080808, 0x2b19081908081919, 0x2b19081908190819,
+    0x2b19081908191908, 0x2b19081919080819, 0x2b19081919081908, 0x2b19081919190808,
+    0x2b19081919192b2b, 0x2b19082b08080819, 0x2b19082b08081908, 0x2b19082b08190808,
+    0x2b19082b19080808, 0x2b19082b2b2b192b, 0x2b19190808080808, 0x2b1919080808082b,
+    0x2b19190808081919, 0x2b19190808082b08, 0x2b19190808190819, 0x2b19190808191908,
+    0x2b191908082b0808, 0x2b19190819080819, 0x2b19190819081908, 0x2b19190819190808,
+    0x2b1919082b080808, 0x2b1919082b19192b, 0x2b19191908080819, 0x2b19191908081908,
+    0x2b19191908190808, 0x2b19191919080808, 0x2b1919192b192b08, 0x2b1919192b2b0819,
+    0x2b19192b08080808, 0x2b19192b1908192b, 0x2b19192b192b1908, 0x2b192b0808080819,
+    0x2b192b0808081908, 0x2b192b0808190808, 0x2b192b08082b192b, 0x2b192b0819080808,
+    0x2b192b082b2b2b19, 0x2b192b1908080808, 0x2b192b1919082b19, 0x2b192b191919082b,
+    0x2b192b2b2b190808, 0x2b2b080808080808, 0x2b2b080808081919, 0x2b2b080808082b2b,
+    0x2b2b080808191908, 0x2b2b0808082b082b, 0x2b2b0808082b2b2b, 0x2b2b080819080819,
+    0x2b2b080819081908, 0x2b2b080819190808, 0x2b2b08082b2b082b, 0x2b2b08082b2b2b2b,
+    0x2b2b081919080808, 0x2b2b0819192b1919, 0x2b2b082b0808082b, 0x2b2b082b08082b2b,
+    0x2b2b082b082b082b, 0x2b2b082b082b2b08, 0x2b2b082b082b2b2b, 0x2b2b082b2b08082b,
+    0x2b2b082b2b082b08, 0x2b2b082b2b082b2b, 0x2b2b082b2b2b2b08, 0x2b2b190808080819,
+    0x2b2b190808081908, 0x2b2b190808190808, 0x2b2b190819080808, 0x2b2b19082b082b19,
+    0x2b2b19082b2b1908, 0x2b2b191908080808, 0x2b2b191908192b19, 0x2b2b192b19190819,
+    0x2b2b2b0808082b2b, 0x2b2b2b08082b2b08, 0x2b2b2b082b2b082b, 0x2b2b2b1919191908,
+    0x2b2b2b192b08192b, 0x2b2b2b2b08082b08, 0x2b2b2b2b08082b2b, 0x2b2b2b2b082b0808,
+    0x2b2b2b2b082b082b, 0x2b2b2b2b082b2b08, 0x2b2b2b2b2b082b08, 0x2b2b2b2b2b2b2b2b,
+};
+
+static const uint64_t iq1s_grid[2048] = {
+    0xffffffffffffffff, 0xffffffffffffff01, 0xffffffffffff0000, 0xffffffffffff01ff,
+    0xffffffffffff0101, 0xffffffffff00ff00, 0xffffffffff000000, 0xffffffffff01ffff,
+    0xffffffffff01ff01, 0xffffffffff0101ff, 0xffffffffff010101, 0xffffffff00ff0000,
+    0xffffffff0000ff00, 0xffffffff000000ff, 0xffffffff00000001, 0xffffffff00010000,
+    0xffffffff01ffffff, 0xffffffff01ffff01, 0xffffffff01ff01ff, 0xffffffff01ff0101,
+    0xffffffff01000000, 0xffffffff0101ffff, 0xffffffff0101ff01, 0xffffffff010101ff,
+    0xffffffff01010101, 0xffffff00ffff00ff, 0xffffff00ffff0000, 0xffffff00ff00ff00,
+    0xffffff00ff0000ff, 0xffffff00ff000001, 0xffffff00ff000100, 0xffffff00ff000101,
+    0xffffff00ff010000, 0xffffff0000ffff00, 0xffffff0000ff0001, 0xffffff0000ff0100,
+    0xffffff000000ff01, 0xffffff0000000000, 0xffffff0000000101, 0xffffff000001ff00,
+    0xffffff00000100ff, 0xffffff0000010001, 0xffffff00000101ff, 0xffffff0001ff0000,
+    0xffffff000100ff00, 0xffffff00010000ff, 0xffffff0001000001, 0xffffff0001010000,
+    0xffffff01ffffffff, 0xffffff01ffffff01, 0xffffff01ffff01ff, 0xffffff01ffff0101,
+    0xffffff01ff000000, 0xffffff01ff01ffff, 0xffffff01ff01ff01, 0xffffff01ff0101ff,
+    0xffffff01ff010101, 0xffffff0100ff0000, 0xffffff010000ff00, 0xffffff0100000100,
+    0xffffff01000100ff, 0xffffff0100010100, 0xffffff0101ffffff, 0xffffff0101ffff01,
+    0xffffff0101ff01ff, 0xffffff0101ff0101, 0xffffff010100ff00, 0xffffff0101000000,
+    0xffffff0101000100, 0xffffff010101ffff, 0xffffff010101ff01, 0xffffff01010101ff,
+    0xffffff0101010101, 0xffff00ffff00ff00, 0xffff00ffff0000ff, 0xffff00ffff000001,
+    0xffff00ffff010000, 0xffff00ff00ffff00, 0xffff00ff00ff0100, 0xffff00ff00000000,
+    0xffff00ff00000101, 0xffff00ff000100ff, 0xffff00ff00010000, 0xffff00ff0100ff00,
+    0xffff00ff01000100, 0xffff00ff01010000, 0xffff0000ffffff00, 0xffff0000ffff00ff,
+    0xffff0000ffff0000, 0xffff0000ffff0001, 0xffff0000ff000000, 0xffff0000ff0001ff,
+    0xffff0000ff000101, 0xffff0000ff010100, 0xffff000000ffffff, 0xffff000000ff0000,
+    0xffff000000ff0101, 0xffff00000000ffff, 0xffff00000000ff00, 0xffff0000000000ff,
+    0xffff000000000000, 0xffff000000000001, 0xffff000000000100, 0xffff00000001ffff,
+    0xffff00000001ff01, 0xffff000000010000, 0xffff0000000101ff, 0xffff000000010101,
+    0xffff000001ffff00, 0xffff00000100ff00, 0xffff000001000000, 0xffff0000010001ff,
+    0xffff000001000101, 0xffff00000101ff00, 0xffff0000010100ff, 0xffff000001010000,
+    0xffff000001010001, 0xffff000001010100, 0xffff0001ff0000ff, 0xffff0001ff000100,
+    0xffff000100ffff00, 0xffff000100ff00ff, 0xffff00010000ffff, 0xffff00010000ff01,
+    0xffff000100000000, 0xffff0001000001ff, 0xffff00010001ffff, 0xffff00010001ff00,
+    0xffff000100010001, 0xffff000100010100, 0xffff000101ff0000, 0xffff00010100ff00,
+    0xffff0001010000ff, 0xffff000101000100, 0xffff01ffffffffff, 0xffff01ffffffff01,
+    0xffff01ffffff01ff, 0xffff01ffffff0101, 0xffff01ffff000000, 0xffff01ffff01ffff,
+    0xffff01ffff01ff01, 0xffff01ffff0101ff, 0xffff01ffff010101, 0xffff01ff00ff0000,
+    0xffff01ff0000ff00, 0xffff01ff00000001, 0xffff01ff00010000, 0xffff01ff01ffffff,
+    0xffff01ff01ffff01, 0xffff01ff01ff01ff, 0xffff01ff01ff0101, 0xffff01ff01000000,
+    0xffff01ff0101ffff, 0xffff01ff0101ff01, 0xffff01ff010101ff, 0xffff01ff01010101,
+    0xffff0100ffff0000, 0xffff0100ff00ff00, 0xffff0100ff0000ff, 0xffff0100ff000100,
+    0xffff0100ff0100ff, 0xffff0100ff010000, 0xffff010000ffff00, 0xffff01000000ffff,
+    0xffff01000000ff00, 0xffff010000000000, 0xffff01000001ff00, 0xffff0100000100ff,
+    0xffff010000010100, 0xffff01000100ff00, 0xffff0100010000ff, 0xffff010001000001,
+    0xffff010001000100, 0xffff010001010000, 0xffff0101ffffffff, 0xffff0101ffffff01,
+    0xffff0101ffff01ff, 0xffff0101ffff0101, 0xffff0101ff000000, 0xffff0101ff01ffff,
+    0xffff0101ff01ff01, 0xffff0101ff0101ff, 0xffff0101ff010101, 0xffff010100ff0000,
+    0xffff01010000ff00, 0xffff010100000100, 0xffff01010001ff00, 0xffff010100010000,
+    0xffff010101ffffff, 0xffff010101ffff01, 0xffff010101ff0000, 0xffff010101ff01ff,
+    0xffff010101ff0101, 0xffff010101000000, 0xffff01010101ffff, 0xffff01010101ff01,
+    0xffff0101010101ff, 0xffff010101010101, 0xff00ffffff00ffff, 0xff00ffffff00ff00,
+    0xff00ffffff0000ff, 0xff00ffffff000100, 0xff00ffffff0100ff, 0xff00ffffff010000,
+    0xff00ffff00ffff00, 0xff00ffff00ff00ff, 0xff00ffff0000ffff, 0xff00ffff00000000,
+    0xff00ffff000001ff, 0xff00ffff0001ff00, 0xff00ffff000100ff, 0xff00ffff00010000,
+    0xff00ffff00010100, 0xff00ffff0100ff00, 0xff00ffff010000ff, 0xff00ffff01000001,
+    0xff00ffff0101ff00, 0xff00ffff01010000, 0xff00ff00ffffff00, 0xff00ff00ffff00ff,
+    0xff00ff00ffff0001, 0xff00ff00ffff0100, 0xff00ff00ff00ffff, 0xff00ff00ff00ff01,
+    0xff00ff00ff000000, 0xff00ff00ff0001ff, 0xff00ff00ff01ff00, 0xff00ff00ff0100ff,
+    0xff00ff00ff010100, 0xff00ff0000ff0000, 0xff00ff0000ff0101, 0xff00ff000000ffff,
+    0xff00ff000000ff00, 0xff00ff000000ff01, 0xff00ff00000000ff, 0xff00ff0000000000,
+    0xff00ff0000000001, 0xff00ff0000000100, 0xff00ff000001ffff, 0xff00ff0000010000,
+    0xff00ff0001ff00ff, 0xff00ff000100ff01, 0xff00ff0001000000, 0xff00ff000101ff00,
+    0xff00ff00010100ff, 0xff00ff01ff00ff00, 0xff00ff01ff0000ff, 0xff00ff01ff000001,
+    0xff00ff01ff010000, 0xff00ff0100ffffff, 0xff00ff0100ff0001, 0xff00ff0100ff0100,
+    0xff00ff010000ff01, 0xff00ff0100000000, 0xff00ff01000001ff, 0xff00ff0100000101,
+    0xff00ff01000100ff, 0xff00ff0100010001, 0xff00ff0101ff0000, 0xff00ff010100ff00,
+    0xff00ff01010000ff, 0xff00ff0101000001, 0xff00ff0101010000, 0xff0000ffffffff00,
+    0xff0000ffffff0001, 0xff0000ffffff0100, 0xff0000ffff0000ff, 0xff0000ffff000000,
+    0xff0000ffff0001ff, 0xff0000ffff000100, 0xff0000ffff01ff00, 0xff0000ffff010001,
+    0xff0000ff00ffff00, 0xff0000ff00ff0000, 0xff0000ff00ff0001, 0xff0000ff00ff01ff,
+    0xff0000ff00ff0101, 0xff0000ff0000ff00, 0xff0000ff000000ff, 0xff0000ff00000000,
+    0xff0000ff00000001, 0xff0000ff00000100, 0xff0000ff0001ff01, 0xff0000ff00010000,
+    0xff0000ff000101ff, 0xff0000ff01ff00ff, 0xff0000ff01ff0100, 0xff0000ff0100ffff,
+    0xff0000ff010000ff, 0xff0000ff01000000, 0xff0000ff010001ff, 0xff0000ff01000100,
+    0xff0000ff01000101, 0xff0000ff0101ff00, 0xff0000ff010100ff, 0xff0000ff01010000,
+    0xff0000ff01010100, 0xff000000ffffff01, 0xff000000ffff0000, 0xff000000ffff0101,
+    0xff000000ff00ff00, 0xff000000ff0000ff, 0xff000000ff000000, 0xff000000ff000001,
+    0xff000000ff000100, 0xff000000ff01ffff, 0xff000000ff01ff01, 0xff000000ff010000,
+    0xff000000ff0101ff, 0xff000000ff010101, 0xff00000000ffff00, 0xff00000000ff00ff,
+    0xff00000000ff0000, 0xff00000000ff0001, 0xff0000000000ff00, 0xff0000000000ff01,
+    0xff000000000000ff, 0xff00000000000000, 0xff00000000000001, 0xff00000000000100,
+    0xff00000000000101, 0xff0000000001ff00, 0xff000000000100ff, 0xff00000000010000,
+    0xff00000000010001, 0xff00000000010100, 0xff00000001ffffff, 0xff00000001ffff01,
+    0xff00000001ff00ff, 0xff00000001ff0000, 0xff00000001ff01ff, 0xff00000001ff0101,
+    0xff0000000100ffff, 0xff0000000100ff00, 0xff000000010000ff, 0xff00000001000000,
+    0xff00000001000001, 0xff00000001000100, 0xff00000001000101, 0xff0000000101ffff,
+    0xff0000000101ff01, 0xff00000001010000, 0xff000001ffffff00, 0xff000001ffff00ff,
+    0xff000001ffff0000, 0xff000001ffff0001, 0xff000001ff000000, 0xff000001ff000001,
+    0xff000001ff0001ff, 0xff000001ff000101, 0xff000001ff01ff00, 0xff000001ff010001,
+    0xff00000100ffffff, 0xff00000100ffff01, 0xff00000100ff00ff, 0xff00000100ff0000,
+    0xff00000100ff01ff, 0xff00000100ff0101, 0xff0000010000ff00, 0xff00000100000000,
+    0xff00000100000001, 0xff000001000001ff, 0xff00000100000100, 0xff0000010001ff00,
+    0xff000001000100ff, 0xff00000100010000, 0xff000001000101ff, 0xff00000100010100,
+    0xff00000100010101, 0xff00000101ff0001, 0xff00000101ff0101, 0xff0000010100ff01,
+    0xff00000101000000, 0xff000001010100ff, 0xff00000101010100, 0xff0001ffff00ff00,
+    0xff0001ffff000001, 0xff0001ffff010000, 0xff0001ff00ffff00, 0xff0001ff00ff00ff,
+    0xff0001ff00ff0001, 0xff0001ff00ff0100, 0xff0001ff0000ffff, 0xff0001ff00000000,
+    0xff0001ff000001ff, 0xff0001ff00000101, 0xff0001ff0001ffff, 0xff0001ff0001ff00,
+    0xff0001ff000100ff, 0xff0001ff00010001, 0xff0001ff00010100, 0xff0001ff01ff0000,
+    0xff0001ff0100ff00, 0xff0001ff010000ff, 0xff0001ff01010000, 0xff000100ff00ffff,
+    0xff000100ff00ff01, 0xff000100ff000000, 0xff000100ff000101, 0xff000100ff01ff00,
+    0xff000100ff010000, 0xff00010000ffff01, 0xff00010000ff00ff, 0xff00010000ff0000,
+    0xff00010000ff01ff, 0xff0001000000ff00, 0xff000100000000ff, 0xff00010000000000,
+    0xff00010000000001, 0xff00010000000100, 0xff00010000000101, 0xff0001000001ffff,
+    0xff00010000010000, 0xff00010000010101, 0xff00010001ff0100, 0xff0001000100ff00,
+    0xff0001000100ff01, 0xff00010001000000, 0xff000100010001ff, 0xff0001000101ff00,
+    0xff00010001010001, 0xff00010001010100, 0xff000101ffff0100, 0xff000101ff000001,
+    0xff000101ff0100ff, 0xff000101ff010001, 0xff00010100ff00ff, 0xff00010100ff0001,
+    0xff00010100ff0100, 0xff0001010000ffff, 0xff0001010000ff01, 0xff00010100000000,
+    0xff000101000001ff, 0xff0001010001ff00, 0xff00010100010001, 0xff00010100010100,
+    0xff00010101ff0000, 0xff0001010100ff00, 0xff00010101000001, 0xff00010101000101,
+    0xff01ffffffffffff, 0xff01ffffffffff01, 0xff01ffffffff01ff, 0xff01ffffffff0101,
+    0xff01ffffff000000, 0xff01ffffff01ffff, 0xff01ffffff01ff01, 0xff01ffffff010000,
+    0xff01ffffff0101ff, 0xff01ffffff010101, 0xff01ffff00ff0000, 0xff01ffff0000ff00,
+    0xff01ffff00000100, 0xff01ffff0001ff00, 0xff01ffff00010000, 0xff01ffff01ffffff,
+    0xff01ffff01ffff01, 0xff01ffff01ff01ff, 0xff01ffff01ff0101, 0xff01ffff01000000,
+    0xff01ffff0101ffff, 0xff01ffff0101ff01, 0xff01ffff01010000, 0xff01ffff010101ff,
+    0xff01ffff01010101, 0xff01ff00ffff0000, 0xff01ff00ff00ff00, 0xff01ff00ff0000ff,
+    0xff01ff00ff000100, 0xff01ff00ff010000, 0xff01ff0000ffff01, 0xff01ff0000ff00ff,
+    0xff01ff0000ff0100, 0xff01ff0000000000, 0xff01ff00000001ff, 0xff01ff0000000101,
+    0xff01ff000001ff00, 0xff01ff00000100ff, 0xff01ff0000010000, 0xff01ff0000010001,
+    0xff01ff0001ff0000, 0xff01ff000100ffff, 0xff01ff0001000001, 0xff01ff0001000100,
+    0xff01ff0001010000, 0xff01ff01ffffff00, 0xff01ff01ffff01ff, 0xff01ff01ffff0101,
+    0xff01ff01ff00ff00, 0xff01ff01ff000000, 0xff01ff01ff01ffff, 0xff01ff01ff01ff01,
+    0xff01ff01ff0101ff, 0xff01ff01ff010101, 0xff01ff0100ff0000, 0xff01ff010000ff00,
+    0xff01ff0100000001, 0xff01ff0100000100, 0xff01ff0100010000, 0xff01ff0101ffff00,
+    0xff01ff0101ff01ff, 0xff01ff0101ff0101, 0xff01ff010100ff00, 0xff01ff0101000000,
+    0xff01ff010101ffff, 0xff01ff010101ff01, 0xff01ff01010101ff, 0xff01ff0101010101,
+    0xff0100ffffff0000, 0xff0100ffff0000ff, 0xff0100ffff000001, 0xff0100ffff000100,
+    0xff0100ffff010000, 0xff0100ff00ff00ff, 0xff0100ff00ff0000, 0xff0100ff00ff0001,
+    0xff0100ff00ff0100, 0xff0100ff0000ff01, 0xff0100ff00000000, 0xff0100ff000001ff,
+    0xff0100ff00000101, 0xff0100ff00010001, 0xff0100ff01ff0000, 0xff0100ff0100ff00,
+    0xff0100ff010000ff, 0xff0100ff01000100, 0xff0100ff0101ff00, 0xff0100ff01010000,
+    0xff010000ffff0100, 0xff010000ff000000, 0xff010000ff01ff00, 0xff010000ff010100,
+    0xff01000000ffffff, 0xff01000000ff0000, 0xff01000000ff01ff, 0xff0100000000ff00,
+    0xff010000000000ff, 0xff01000000000000, 0xff01000000000100, 0xff0100000001ff01,
+    0xff01000000010000, 0xff010000000101ff, 0xff01000001ff0100, 0xff0100000100ffff,
+    0xff010000010000ff, 0xff01000001000000, 0xff010000010001ff, 0xff01000001000101,
+    0xff0100000101ff00, 0xff010000010100ff, 0xff01000001010001, 0xff01000001010100,
+    0xff010001ffff0000, 0xff010001ff00ffff, 0xff010001ff00ff01, 0xff010001ff000100,
+    0xff010001ff010000, 0xff01000100ffff00, 0xff01000100ff0100, 0xff01000100000000,
+    0xff0100010001ffff, 0xff0100010001ff00, 0xff01000100010100, 0xff01000101ff00ff,
+    0xff01000101ff0001, 0xff0100010100ffff, 0xff01000101000101, 0xff0101ffffffffff,
+    0xff0101ffffffff01, 0xff0101ffffff01ff, 0xff0101ffffff0101, 0xff0101ffff000000,
+    0xff0101ffff01ffff, 0xff0101ffff01ff01, 0xff0101ffff0101ff, 0xff0101ffff010101,
+    0xff0101ff00ff0000, 0xff0101ff0000ff00, 0xff0101ff000000ff, 0xff0101ff00010000,
+    0xff0101ff01ffffff, 0xff0101ff01ffff01, 0xff0101ff01ff01ff, 0xff0101ff01ff0101,
+    0xff0101ff0101ffff, 0xff0101ff0101ff01, 0xff0101ff010101ff, 0xff0101ff01010101,
+    0xff010100ffff0100, 0xff010100ff00ff00, 0xff010100ff0000ff, 0xff010100ff000100,
+    0xff010100ff010000, 0xff01010000ff0001, 0xff01010000ff0100, 0xff0101000000ff01,
+    0xff01010000000000, 0xff0101000001ff00, 0xff010100000100ff, 0xff01010000010001,
+    0xff01010000010100, 0xff01010001ff0000, 0xff0101000100ffff, 0xff01010001000001,
+    0xff01010001000100, 0xff010100010100ff, 0xff01010001010000, 0xff010101ffffffff,
+    0xff010101ffffff01, 0xff010101ffff01ff, 0xff010101ffff0101, 0xff010101ff01ffff,
+    0xff010101ff01ff01, 0xff010101ff0101ff, 0xff010101ff010101, 0xff01010100ff0000,
+    0xff0101010000ff00, 0xff01010100000001, 0xff01010100000100, 0xff01010100010000,
+    0xff01010101ffffff, 0xff01010101ffff01, 0xff01010101ff01ff, 0xff01010101ff0101,
+    0xff01010101000000, 0xff0101010101ffff, 0xff0101010101ff01, 0xff010101010101ff,
+    0xff01010101010101, 0x00ffffffffff0000, 0x00ffffffff00ff00, 0x00ffffffff000001,
+    0x00ffffffff010000, 0x00ffffff00ff0100, 0x00ffffff0000ff01, 0x00ffffff00000000,
+    0x00ffffff000001ff, 0x00ffffff00000101, 0x00ffffff0001ff00, 0x00ffffff000100ff,
+    0x00ffffff00010001, 0x00ffffff010000ff, 0x00ffffff01000100, 0x00ffffff0101ff00,
+    0x00ffffff01010001, 0x00ffff00ffffffff, 0x00ffff00ffffff00, 0x00ffff00ffff00ff,
+    0x00ffff00ffff0001, 0x00ffff00ffff0100, 0x00ffff00ff00ff01, 0x00ffff00ff000000,
+    0x00ffff00ff000001, 0x00ffff00ff0001ff, 0x00ffff00ff000101, 0x00ffff00ff01ff00,
+    0x00ffff00ff010001, 0x00ffff00ff010100, 0x00ffff0000ff0000, 0x00ffff0000ff01ff,
+    0x00ffff0000ff0101, 0x00ffff000000ff00, 0x00ffff00000000ff, 0x00ffff0000000000,
+    0x00ffff0000000001, 0x00ffff0000000100, 0x00ffff0000000101, 0x00ffff0000010000,
+    0x00ffff00000101ff, 0x00ffff0000010101, 0x00ffff0001ffff00, 0x00ffff0001ff00ff,
+    0x00ffff0001ff0001, 0x00ffff000100ffff, 0x00ffff000100ff01, 0x00ffff0001000000,
+    0x00ffff000101ffff, 0x00ffff000101ff00, 0x00ffff000101ff01, 0x00ffff01ffff0000,
+    0x00ffff01ff00ff00, 0x00ffff01ff0000ff, 0x00ffff01ff000001, 0x00ffff01ff010000,
+    0x00ffff0100ffff00, 0x00ffff010000ff01, 0x00ffff0100000000, 0x00ffff0100000101,
+    0x00ffff01000100ff, 0x00ffff0100010100, 0x00ffff0101ff0100, 0x00ffff01010000ff,
+    0x00ffff0101010000, 0x00ff00ffffffff00, 0x00ff00ffff000000, 0x00ff00ffff000100,
+    0x00ff00ffff010100, 0x00ff00ff00ff0000, 0x00ff00ff00ff01ff, 0x00ff00ff00ff0101,
+    0x00ff00ff0000ff00, 0x00ff00ff000000ff, 0x00ff00ff00000000, 0x00ff00ff00000001,
+    0x00ff00ff0001ff00, 0x00ff00ff0001ff01, 0x00ff00ff00010000, 0x00ff00ff000101ff,
+    0x00ff00ff00010101, 0x00ff00ff01ffff00, 0x00ff00ff01ff0001, 0x00ff00ff01ff0100,
+    0x00ff00ff0100ffff, 0x00ff00ff0100ff01, 0x00ff00ff01000000, 0x00ff00ff0101ffff,
+    0x00ff00ff0101ff00, 0x00ff00ff01010100, 0x00ff0000ffffff00, 0x00ff0000ffffff01,
+    0x00ff0000ffff0000, 0x00ff0000ffff0101, 0x00ff0000ff00ff00, 0x00ff0000ff0000ff,
+    0x00ff0000ff000000, 0x00ff0000ff000001, 0x00ff0000ff000100, 0x00ff0000ff01ffff,
+    0x00ff0000ff010000, 0x00ff0000ff010101, 0x00ff000000ffff00, 0x00ff000000ff00ff,
+    0x00ff000000ff0000, 0x00ff000000ff0001, 0x00ff000000ff0100, 0x00ff00000000ffff,
+    0x00ff00000000ff00, 0x00ff0000000000ff, 0x00ff000000000000, 0x00ff000000000001,
+    0x00ff0000000001ff, 0x00ff000000000100, 0x00ff00000001ff00, 0x00ff0000000100ff,
+    0x00ff000000010000, 0x00ff000000010001, 0x00ff000000010100, 0x00ff000001ffff01,
+    0x00ff000001ff00ff, 0x00ff000001ff0000, 0x00ff000001ff01ff, 0x00ff00000100ff00,
+    0x00ff0000010000ff, 0x00ff000001000000, 0x00ff000001000001, 0x00ff000001000100,
+    0x00ff000001000101, 0x00ff000001010000, 0x00ff0000010101ff, 0x00ff000001010101,
+    0x00ff0001ffffff00, 0x00ff0001ffff0000, 0x00ff0001ffff0100, 0x00ff0001ff0000ff,
+    0x00ff0001ff000000, 0x00ff0001ff0001ff, 0x00ff0001ff000101, 0x00ff0001ff01ff00,
+    0x00ff0001ff0100ff, 0x00ff0001ff010100, 0x00ff000100ffffff, 0x00ff000100ffff01,
+    0x00ff000100ff0000, 0x00ff000100ff01ff, 0x00ff00010000ffff, 0x00ff00010000ff00,
+    0x00ff00010000ff01, 0x00ff000100000000, 0x00ff000100000001, 0x00ff000100000100,
+    0x00ff00010001ff01, 0x00ff000100010000, 0x00ff0001000101ff, 0x00ff000101ffff00,
+    0x00ff000101ff0000, 0x00ff000101ff0101, 0x00ff0001010000ff, 0x00ff000101000000,
+    0x00ff00010101ff00, 0x00ff0001010100ff, 0x00ff000101010001, 0x00ff01ffffff0000,
+    0x00ff01ffff00ff00, 0x00ff01ffff000000, 0x00ff01ffff000101, 0x00ff01ffff010000,
+    0x00ff01ff00ffff01, 0x00ff01ff00ff0100, 0x00ff01ff0000ffff, 0x00ff01ff00000000,
+    0x00ff01ff000001ff, 0x00ff01ff0001ff00, 0x00ff01ff000100ff, 0x00ff01ff00010001,
+    0x00ff01ff00010100, 0x00ff01ff01ff0000, 0x00ff01ff0100ff00, 0x00ff01ff010000ff,
+    0x00ff01ff01000001, 0x00ff01ff01000100, 0x00ff01ff01010000, 0x00ff0100ffffff00,
+    0x00ff0100ffff0000, 0x00ff0100ffff0001, 0x00ff0100ffff0101, 0x00ff0100ff00ffff,
+    0x00ff0100ff0000ff, 0x00ff0100ff000000, 0x00ff0100ff0001ff, 0x00ff0100ff01ff00,
+    0x00ff0100ff0100ff, 0x00ff0100ff010001, 0x00ff010000ffffff, 0x00ff010000ff0000,
+    0x00ff010000ff0101, 0x00ff01000000ff00, 0x00ff01000000ff01, 0x00ff0100000000ff,
+    0x00ff010000000000, 0x00ff010000000001, 0x00ff010000000100, 0x00ff01000001ffff,
+    0x00ff01000001ff01, 0x00ff010000010000, 0x00ff010000010001, 0x00ff010000010101,
+    0x00ff010001ff0001, 0x00ff010001ff0100, 0x00ff01000100ff01, 0x00ff010001000000,
+    0x00ff010001000001, 0x00ff0100010001ff, 0x00ff01000101ff00, 0x00ff0100010100ff,
+    0x00ff010001010001, 0x00ff010001010100, 0x00ff0101ff000001, 0x00ff010100ff00ff,
+    0x00ff010100ff0001, 0x00ff010100ff0100, 0x00ff010100000000, 0x00ff0101000001ff,
+    0x00ff010100000101, 0x00ff0101000100ff, 0x00ff010100010100, 0x00ff0101010000ff,
+    0x00ff010101010000, 0x0000ffffffffff00, 0x0000ffffffff00ff, 0x0000ffffffff0000,
+    0x0000ffffffff0001, 0x0000ffffffff0100, 0x0000ffffff00ff01, 0x0000ffffff000000,
+    0x0000ffffff000101, 0x0000ffffff01ff00, 0x0000ffffff0100ff, 0x0000ffffff010100,
+    0x0000ffff00ffffff, 0x0000ffff00ff0000, 0x0000ffff00ff01ff, 0x0000ffff0000ff00,
+    0x0000ffff000000ff, 0x0000ffff00000000, 0x0000ffff00000001, 0x0000ffff00000100,
+    0x0000ffff00010000, 0x0000ffff000101ff, 0x0000ffff01ff0001, 0x0000ffff01ff0100,
+    0x0000ffff01000000, 0x0000ffff010001ff, 0x0000ffff0101ffff, 0x0000ffff0101ff00,
+    0x0000ffff01010001, 0x0000ffff01010100, 0x0000ff00ffff0000, 0x0000ff00ffff01ff,
+    0x0000ff00ffff0100, 0x0000ff00ffff0101, 0x0000ff00ff00ff00, 0x0000ff00ff0000ff,
+    0x0000ff00ff000000, 0x0000ff00ff000001, 0x0000ff00ff0001ff, 0x0000ff00ff000100,
+    0x0000ff00ff01ffff, 0x0000ff00ff010000, 0x0000ff00ff010001, 0x0000ff00ff0101ff,
+    0x0000ff00ff010101, 0x0000ff0000ffff00, 0x0000ff0000ff00ff, 0x0000ff0000ff0000,
+    0x0000ff0000ff0001, 0x0000ff0000ff0100, 0x0000ff000000ffff, 0x0000ff000000ff00,
+    0x0000ff000000ff01, 0x0000ff00000000ff, 0x0000ff0000000000, 0x0000ff0000000001,
+    0x0000ff00000001ff, 0x0000ff0000000100, 0x0000ff0000000101, 0x0000ff000001ff00,
+    0x0000ff00000100ff, 0x0000ff0000010000, 0x0000ff0000010001, 0x0000ff0000010100,
+    0x0000ff0001ffff01, 0x0000ff0001ff0000, 0x0000ff000100ff00, 0x0000ff00010000ff,
+    0x0000ff0001000000, 0x0000ff0001000001, 0x0000ff0001000100, 0x0000ff000101ffff,
+    0x0000ff0001010000, 0x0000ff0001010101, 0x0000ff01ffffff00, 0x0000ff01ffff0001,
+    0x0000ff01ff00ff01, 0x0000ff01ff000000, 0x0000ff01ff000101, 0x0000ff01ff01ff00,
+    0x0000ff01ff0100ff, 0x0000ff0100ffff01, 0x0000ff0100ff0000, 0x0000ff0100ff0101,
+    0x0000ff010000ff00, 0x0000ff01000000ff, 0x0000ff0100000000, 0x0000ff0100000001,
+    0x0000ff0100000100, 0x0000ff010001ff01, 0x0000ff0100010000, 0x0000ff0101ff0000,
+    0x0000ff010100ffff, 0x0000ff010100ff01, 0x0000ff0101000000, 0x0000ff0101000100,
+    0x0000ff0101000101, 0x0000ff01010100ff, 0x000000ffffff00ff, 0x000000ffffff0000,
+    0x000000ffff00ff00, 0x000000ffff0000ff, 0x000000ffff000000, 0x000000ffff000001,
+    0x000000ffff0001ff, 0x000000ffff000100, 0x000000ffff01ff00, 0x000000ffff010000,
+    0x000000ffff0101ff, 0x000000ffff010101, 0x000000ff00ffff00, 0x000000ff00ff00ff,
+    0x000000ff00ff0000, 0x000000ff00ff0001, 0x000000ff00ff0100, 0x000000ff00ff0101,
+    0x000000ff0000ffff, 0x000000ff0000ff00, 0x000000ff000000ff, 0x000000ff00000000,
+    0x000000ff00000001, 0x000000ff000001ff, 0x000000ff00000100, 0x000000ff00000101,
+    0x000000ff0001ff00, 0x000000ff0001ff01, 0x000000ff000100ff, 0x000000ff00010000,
+    0x000000ff00010001, 0x000000ff00010100, 0x000000ff01ffffff, 0x000000ff01ff01ff,
+    0x000000ff01ff0101, 0x000000ff0100ff00, 0x000000ff010000ff, 0x000000ff01000000,
+    0x000000ff01000001, 0x000000ff01000100, 0x000000ff0101ff00, 0x000000ff010100ff,
+    0x000000ff01010000, 0x000000ff01010101, 0x00000000ffffff00, 0x00000000ffffff01,
+    0x00000000ffff00ff, 0x00000000ffff0000, 0x00000000ffff0001, 0x00000000ffff0100,
+    0x00000000ff00ffff, 0x00000000ff00ff00, 0x00000000ff00ff01, 0x00000000ff0000ff,
+    0x00000000ff000000, 0x00000000ff000001, 0x00000000ff000100, 0x00000000ff000101,
+    0x00000000ff01ff00, 0x00000000ff0100ff, 0x00000000ff010000, 0x00000000ff010001,
+    0x00000000ff010100, 0x0000000000ffffff, 0x0000000000ffff00, 0x0000000000ffff01,
+    0x0000000000ff00ff, 0x0000000000ff0000, 0x0000000000ff0001, 0x0000000000ff01ff,
+    0x0000000000ff0100, 0x000000000000ffff, 0x000000000000ff00, 0x000000000000ff01,
+    0x00000000000000ff, 0x0000000000000000, 0x0000000000000001, 0x00000000000001ff,
+    0x0000000000000100, 0x0000000000000101, 0x000000000001ffff, 0x000000000001ff00,
+    0x00000000000100ff, 0x0000000000010000, 0x0000000000010001, 0x00000000000101ff,
+    0x0000000000010100, 0x0000000000010101, 0x0000000001ffff00, 0x0000000001ff00ff,
+    0x0000000001ff0000, 0x0000000001ff0100, 0x0000000001ff0101, 0x000000000100ffff,
+    0x000000000100ff00, 0x00000000010000ff, 0x0000000001000000, 0x0000000001000001,
+    0x00000000010001ff, 0x0000000001000100, 0x000000000101ff00, 0x00000000010100ff,
+    0x0000000001010000, 0x0000000001010001, 0x0000000001010100, 0x00000001ffffffff,
+    0x00000001ffffff00, 0x00000001ffffff01, 0x00000001ffff00ff, 0x00000001ffff0001,
+    0x00000001ffff01ff, 0x00000001ffff0100, 0x00000001ff00ff00, 0x00000001ff0000ff,
+    0x00000001ff000000, 0x00000001ff0001ff, 0x00000001ff000100, 0x00000001ff01ffff,
+    0x00000001ff01ff00, 0x00000001ff01ff01, 0x00000001ff0100ff, 0x00000001ff010000,
+    0x00000001ff010001, 0x00000001ff0101ff, 0x00000001ff010100, 0x0000000100ffff00,
+    0x0000000100ff0000, 0x0000000100ff0001, 0x0000000100ff01ff, 0x0000000100ff0100,
+    0x0000000100ff0101, 0x000000010000ffff, 0x000000010000ff00, 0x000000010000ff01,
+    0x00000001000000ff, 0x0000000100000000, 0x0000000100000001, 0x00000001000001ff,
+    0x0000000100000100, 0x0000000100000101, 0x000000010001ff00, 0x00000001000100ff,
+    0x0000000100010000, 0x0000000100010100, 0x0000000101ffff01, 0x0000000101ff0000,
+    0x0000000101ff0001, 0x0000000101ff01ff, 0x0000000101ff0100, 0x0000000101ff0101,
+    0x000000010100ff00, 0x0000000101000000, 0x0000000101000101, 0x000000010101ff01,
+    0x0000000101010000, 0x0000000101010001, 0x00000001010101ff, 0x0000000101010100,
+    0x000001ffffff00ff, 0x000001ffffff0000, 0x000001ffffff0001, 0x000001ffffff0100,
+    0x000001ffff00ffff, 0x000001ffff000000, 0x000001ffff0001ff, 0x000001ffff01ff00,
+    0x000001ffff010101, 0x000001ff00ff0000, 0x000001ff00ff01ff, 0x000001ff00ff0101,
+    0x000001ff0000ff00, 0x000001ff000000ff, 0x000001ff00000000, 0x000001ff00000001,
+    0x000001ff000001ff, 0x000001ff00000100, 0x000001ff0001ffff, 0x000001ff0001ff01,
+    0x000001ff000100ff, 0x000001ff00010000, 0x000001ff01ffff01, 0x000001ff01ff0100,
+    0x000001ff0100ffff, 0x000001ff0100ff01, 0x000001ff01000000, 0x000001ff010001ff,
+    0x000001ff0101ff00, 0x000001ff01010100, 0x00000100ffffff00, 0x00000100ffffff01,
+    0x00000100ffff0000, 0x00000100ffff0101, 0x00000100ff00ff00, 0x00000100ff0000ff,
+    0x00000100ff000000, 0x00000100ff000001, 0x00000100ff000100, 0x00000100ff010000,
+    0x0000010000ffff00, 0x0000010000ff00ff, 0x0000010000ff0000, 0x0000010000ff0001,
+    0x0000010000ff0100, 0x000001000000ffff, 0x000001000000ff00, 0x000001000000ff01,
+    0x00000100000000ff, 0x0000010000000000, 0x0000010000000001, 0x00000100000001ff,
+    0x0000010000000100, 0x0000010000000101, 0x000001000001ff00, 0x00000100000100ff,
+    0x0000010000010000, 0x0000010000010001, 0x0000010000010100, 0x0000010001ffff00,
+    0x0000010001ff0000, 0x0000010001ff0100, 0x000001000100ff00, 0x00000100010000ff,
+    0x0000010001000000, 0x0000010001000001, 0x00000100010001ff, 0x0000010001000100,
+    0x0000010001010000, 0x00000101ffff00ff, 0x00000101ffff01ff, 0x00000101ff000000,
+    0x00000101ff000101, 0x00000101ff01ffff, 0x00000101ff010000, 0x00000101ff010001,
+    0x00000101ff010100, 0x0000010100ff0000, 0x0000010100ff01ff, 0x0000010100ff0100,
+    0x000001010000ff00, 0x0000010100000000, 0x0000010100000001, 0x00000101000001ff,
+    0x0000010100000100, 0x000001010001ff01, 0x0000010100010000, 0x00000101000101ff,
+    0x0000010100010101, 0x0000010101ffff00, 0x0000010101ff0101, 0x000001010100ff01,
+    0x0000010101000000, 0x0000010101000001, 0x00000101010001ff, 0x0000010101000101,
+    0x000001010101ff00, 0x0001ffffffff0000, 0x0001ffffff0000ff, 0x0001ffffff000001,
+    0x0001ffffff000100, 0x0001ffffff010000, 0x0001ffff00ff00ff, 0x0001ffff0000ffff,
+    0x0001ffff00000000, 0x0001ffff00000001, 0x0001ffff000001ff, 0x0001ffff00000101,
+    0x0001ffff0001ff00, 0x0001ffff000100ff, 0x0001ffff00010001, 0x0001ffff00010100,
+    0x0001ffff01ffff00, 0x0001ffff01000001, 0x0001ffff01010000, 0x0001ff00ffffff00,
+    0x0001ff00ffff00ff, 0x0001ff00ffff0001, 0x0001ff00ffff0100, 0x0001ff00ff00ff01,
+    0x0001ff00ff000000, 0x0001ff00ff01ff00, 0x0001ff00ff01ff01, 0x0001ff00ff010001,
+    0x0001ff00ff010100, 0x0001ff0000ff0000, 0x0001ff0000ff0100, 0x0001ff000000ff00,
+    0x0001ff0000000000, 0x0001ff0000000001, 0x0001ff0000000100, 0x0001ff0000010000,
+    0x0001ff0000010001, 0x0001ff0000010101, 0x0001ff0001ff00ff, 0x0001ff0001ff0101,
+    0x0001ff000100ff01, 0x0001ff0001000000, 0x0001ff000101ff00, 0x0001ff0001010001,
+    0x0001ff0001010100, 0x0001ff01ff00ff00, 0x0001ff01ff000001, 0x0001ff01ff000100,
+    0x0001ff0100ffffff, 0x0001ff0100ffff00, 0x0001ff0100ff0001, 0x0001ff0100000000,
+    0x0001ff0100000001, 0x0001ff01000001ff, 0x0001ff010001ffff, 0x0001ff0101ff0000,
+    0x0001ff010100ff00, 0x0001ff0101000001, 0x0001ff0101010000, 0x000100ffff00ff00,
+    0x000100ffff00ff01, 0x000100ffff000000, 0x000100ffff000001, 0x000100ffff000101,
+    0x000100ffff01ff00, 0x000100ffff010001, 0x000100ffff010100, 0x000100ff00ffffff,
+    0x000100ff00ffff01, 0x000100ff00ff0000, 0x000100ff00ff01ff, 0x000100ff00ff0101,
+    0x000100ff0000ff00, 0x000100ff000000ff, 0x000100ff00000000, 0x000100ff00000001,
+    0x000100ff00000100, 0x000100ff00000101, 0x000100ff0001ffff, 0x000100ff0001ff01,
+    0x000100ff00010000, 0x000100ff01ff00ff, 0x000100ff01ff0000, 0x000100ff01ff0100,
+    0x000100ff0100ffff, 0x000100ff0100ff01, 0x000100ff010000ff, 0x000100ff01000000,
+    0x000100ff01000001, 0x000100ff010001ff, 0x000100ff01000101, 0x000100ff0101ff00,
+    0x000100ff010100ff, 0x000100ff01010100, 0x00010000ffff0000, 0x00010000ffff01ff,
+    0x00010000ffff0101, 0x00010000ff00ff00, 0x00010000ff000000, 0x00010000ff000001,
+    0x00010000ff000100, 0x0001000000ff00ff, 0x0001000000ff0000, 0x0001000000ff0001,
+    0x0001000000ff0100, 0x000100000000ffff, 0x000100000000ff00, 0x00010000000000ff,
+    0x0001000000000000, 0x0001000000000001, 0x0001000000000100, 0x000100000001ff00,
+    0x00010000000100ff, 0x0001000000010000, 0x0001000000010001, 0x0001000000010100,
+    0x0001000001ff0001, 0x0001000001ff0100, 0x0001000001ff0101, 0x000100000100ff00,
+    0x0001000001000000, 0x0001000001000001, 0x0001000001000100, 0x0001000001000101,
+    0x000100000101ff01, 0x0001000001010000, 0x0001000001010001, 0x00010000010101ff,
+    0x00010001ffffff01, 0x00010001ffff0100, 0x00010001ff000000, 0x00010001ff01ffff,
+    0x00010001ff010001, 0x00010001ff0101ff, 0x00010001ff010100, 0x0001000100ffffff,
+    0x0001000100ff0000, 0x0001000100ff01ff, 0x0001000100ff0101, 0x000100010000ff00,
+    0x00010001000000ff, 0x0001000100000000, 0x0001000100000001, 0x00010001000001ff,
+    0x0001000100000101, 0x000100010001ffff, 0x0001000100010000, 0x00010001000101ff,
+    0x0001000101ffffff, 0x0001000101ffff01, 0x0001000101ff0000, 0x0001000101ff0101,
+    0x00010001010000ff, 0x0001000101000001, 0x00010001010001ff, 0x0001000101000100,
+    0x000100010101ffff, 0x00010001010100ff, 0x0001000101010001, 0x0001000101010101,
+    0x000101ffff000001, 0x000101ffff000100, 0x000101ffff010000, 0x000101ff00ffff00,
+    0x000101ff0000ff01, 0x000101ff00000000, 0x000101ff00000101, 0x000101ff0001ff00,
+    0x000101ff00010100, 0x000101ff01ff0000, 0x000101ff0100ff00, 0x000101ff010001ff,
+    0x000101ff01010001, 0x00010100ffffff00, 0x00010100ffff00ff, 0x00010100ff00ffff,
+    0x00010100ff000000, 0x00010100ff01ff00, 0x00010100ff0100ff, 0x00010100ff010001,
+    0x00010100ff010100, 0x0001010000ffffff, 0x0001010000ffff00, 0x0001010000ff0000,
+    0x0001010000ff0001, 0x0001010000ff01ff, 0x000101000000ff00, 0x00010100000000ff,
+    0x0001010000000000, 0x0001010000000001, 0x0001010000000100, 0x000101000001ffff,
+    0x0001010000010000, 0x0001010000010101, 0x0001010001ffff01, 0x0001010001ff00ff,
+    0x0001010001ff0101, 0x0001010001000000, 0x000101000101ff00, 0x00010100010100ff,
+    0x0001010001010000, 0x0001010001010100, 0x00010101ff00ff00, 0x00010101ff000001,
+    0x00010101ff0001ff, 0x0001010100ffff00, 0x0001010100ff00ff, 0x0001010100ff0100,
+    0x000101010000ffff, 0x0001010100000000, 0x00010101000001ff, 0x0001010100000101,
+    0x00010101000100ff, 0x0001010100010000, 0x0001010100010100, 0x0001010101ff0001,
+    0x00010101010000ff, 0x00010101010001ff, 0x0001010101000101, 0x0001010101010001,
+    0x01ffffffffffffff, 0x01ffffffffffff01, 0x01ffffffffff01ff, 0x01ffffffffff0101,
+    0x01ffffffff01ffff, 0x01ffffffff01ff01, 0x01ffffffff0101ff, 0x01ffffffff010101,
+    0x01ffffff00ff0000, 0x01ffffff0000ffff, 0x01ffffff0000ff00, 0x01ffffff000000ff,
+    0x01ffffff00000001, 0x01ffffff00000100, 0x01ffffff00010000, 0x01ffffff01ffffff,
+    0x01ffffff01ffff01, 0x01ffffff01ff01ff, 0x01ffffff01ff0101, 0x01ffffff01000000,
+    0x01ffffff0101ffff, 0x01ffffff0101ff01, 0x01ffffff010101ff, 0x01ffffff01010101,
+    0x01ffff00ffff0000, 0x01ffff00ff00ff00, 0x01ffff00ff0000ff, 0x01ffff00ff000001,
+    0x01ffff00ff000100, 0x01ffff00ff010000, 0x01ffff0000ffff00, 0x01ffff0000ff00ff,
+    0x01ffff0000ff0100, 0x01ffff000000ffff, 0x01ffff000000ff01, 0x01ffff0000000000,
+    0x01ffff0000000001, 0x01ffff00000001ff, 0x01ffff0000000100, 0x01ffff00000100ff,
+    0x01ffff0000010001, 0x01ffff0000010100, 0x01ffff0001ff0000, 0x01ffff0001ff0100,
+    0x01ffff00010000ff, 0x01ffff0001000001, 0x01ffff0001000100, 0x01ffff0001010000,
+    0x01ffff01ffffffff, 0x01ffff01ffffff01, 0x01ffff01ffff01ff, 0x01ffff01ffff0101,
+    0x01ffff01ff000000, 0x01ffff01ff01ffff, 0x01ffff01ff01ff01, 0x01ffff01ff0101ff,
+    0x01ffff01ff010101, 0x01ffff010000ff00, 0x01ffff01000000ff, 0x01ffff0100000100,
+    0x01ffff0100010000, 0x01ffff0101ffffff, 0x01ffff0101ffff01, 0x01ffff0101ff01ff,
+    0x01ffff0101ff0101, 0x01ffff0101000000, 0x01ffff010101ffff, 0x01ffff010101ff01,
+    0x01ffff01010101ff, 0x01ffff0101010101, 0x01ff00ffff0000ff, 0x01ff00ffff000100,
+    0x01ff00ff00ffff00, 0x01ff00ff00ff00ff, 0x01ff00ff0000ff00, 0x01ff00ff00000000,
+    0x01ff00ff00000101, 0x01ff00ff0001ff00, 0x01ff00ff000100ff, 0x01ff00ff00010100,
+    0x01ff00ff010000ff, 0x01ff00ff01000100, 0x01ff0000ffffff00, 0x01ff0000ffff0100,
+    0x01ff0000ff00ff01, 0x01ff0000ff000000, 0x01ff0000ff000101, 0x01ff0000ff010001,
+    0x01ff0000ff010100, 0x01ff000000ffffff, 0x01ff000000ffff00, 0x01ff000000ff0000,
+    0x01ff000000ff01ff, 0x01ff00000000ff00, 0x01ff0000000000ff, 0x01ff000000000000,
+    0x01ff000000000001, 0x01ff000000000100, 0x01ff000000000101, 0x01ff000000010000,
+    0x01ff000000010001, 0x01ff0000000101ff, 0x01ff000000010101, 0x01ff000001ffff00,
+    0x01ff000001ff00ff, 0x01ff000001ff0001, 0x01ff000001ff0100, 0x01ff00000100ffff,
+    0x01ff00000100ff01, 0x01ff000001000000, 0x01ff0000010001ff, 0x01ff000001010001,
+    0x01ff0001ff00ff00, 0x01ff0001ff000001, 0x01ff0001ff000100, 0x01ff0001ff010000,
+    0x01ff000100ffff00, 0x01ff000100ff00ff, 0x01ff000100ff0100, 0x01ff000100ff0101,
+    0x01ff00010000ffff, 0x01ff000100000000, 0x01ff000100000100, 0x01ff000100000101,
+    0x01ff00010001ff00, 0x01ff000100010001, 0x01ff000100010101, 0x01ff000101ff0000,
+    0x01ff00010100ff00, 0x01ff000101000101, 0x01ff0001010100ff, 0x01ff01ffffffffff,
+    0x01ff01ffffffff01, 0x01ff01ffffff01ff, 0x01ff01ffffff0101, 0x01ff01ffff000000,
+    0x01ff01ffff01ffff, 0x01ff01ffff01ff01, 0x01ff01ffff0101ff, 0x01ff01ffff010101,
+    0x01ff01ff00ffff00, 0x01ff01ff00ff0000, 0x01ff01ff0000ff00, 0x01ff01ff000000ff,
+    0x01ff01ff00000100, 0x01ff01ff00010000, 0x01ff01ff00010100, 0x01ff01ff01ffffff,
+    0x01ff01ff01ffff01, 0x01ff01ff01ff01ff, 0x01ff01ff01ff0101, 0x01ff01ff01000000,
+    0x01ff01ff0101ffff, 0x01ff01ff0101ff01, 0x01ff01ff010101ff, 0x01ff01ff01010101,
+    0x01ff0100ffff0000, 0x01ff0100ffff0001, 0x01ff0100ff00ff00, 0x01ff0100ff0000ff,
+    0x01ff0100ff000001, 0x01ff0100ff010000, 0x01ff010000ffff00, 0x01ff010000ff00ff,
+    0x01ff010000ff0001, 0x01ff010000ff0100, 0x01ff01000000ffff, 0x01ff01000000ff01,
+    0x01ff010000000000, 0x01ff010000000101, 0x01ff01000001ff00, 0x01ff0100000100ff,
+    0x01ff010001ff0000, 0x01ff010001000001, 0x01ff010001000100, 0x01ff010001010000,
+    0x01ff0101ffffffff, 0x01ff0101ffffff01, 0x01ff0101ffff01ff, 0x01ff0101ffff0101,
+    0x01ff0101ff000000, 0x01ff0101ff01ffff, 0x01ff0101ff01ff01, 0x01ff0101ff0101ff,
+    0x01ff0101ff010101, 0x01ff010100ff0000, 0x01ff01010000ff00, 0x01ff0101000000ff,
+    0x01ff010100000001, 0x01ff010101ffffff, 0x01ff010101ffff01, 0x01ff010101ff01ff,
+    0x01ff010101ff0101, 0x01ff010101000000, 0x01ff01010101ffff, 0x01ff01010101ff01,
+    0x01ff0101010101ff, 0x01ff010101010101, 0x0100ffffffff0000, 0x0100ffffff00ff00,
+    0x0100ffffff000001, 0x0100ffffff0001ff, 0x0100ffffff000100, 0x0100ffffff010000,
+    0x0100ffff00ffff00, 0x0100ffff00ff0001, 0x0100ffff00ff0100, 0x0100ffff00000000,
+    0x0100ffff000001ff, 0x0100ffff00000101, 0x0100ffff00010100, 0x0100ffff00010101,
+    0x0100ffff01ff0000, 0x0100ffff0100ff00, 0x0100ffff010000ff, 0x0100ffff01000001,
+    0x0100ffff01000100, 0x0100ffff01010000, 0x0100ff00ffffff00, 0x0100ff00ffff00ff,
+    0x0100ff00ffff0001, 0x0100ff00ffff0100, 0x0100ff00ff00ffff, 0x0100ff00ff000000,
+    0x0100ff00ff0001ff, 0x0100ff00ff000101, 0x0100ff00ff01ff00, 0x0100ff00ff0100ff,
+    0x0100ff00ff010001, 0x0100ff00ff010100, 0x0100ff0000ffffff, 0x0100ff0000ff0000,
+    0x0100ff000000ffff, 0x0100ff000000ff00, 0x0100ff00000000ff, 0x0100ff0000000000,
+    0x0100ff0000000001, 0x0100ff0000000100, 0x0100ff000001ff01, 0x0100ff0000010000,
+    0x0100ff0001ff00ff, 0x0100ff0001ff0001, 0x0100ff000100ff01, 0x0100ff0001000000,
+    0x0100ff00010001ff, 0x0100ff000101ff00, 0x0100ff00010100ff, 0x0100ff0001010001,
+    0x0100ff0001010100, 0x0100ff01ffff0000, 0x0100ff01ff00ff00, 0x0100ff01ff0000ff,
+    0x0100ff01ff000100, 0x0100ff01ff010000, 0x0100ff0100ff00ff, 0x0100ff0100ff0001,
+    0x0100ff0100ff0100, 0x0100ff010000ffff, 0x0100ff010000ff01, 0x0100ff0100000000,
+    0x0100ff01000001ff, 0x0100ff0100010001, 0x0100ff0100010100, 0x0100ff0101ff0000,
+    0x0100ff01010000ff, 0x0100ff0101000001, 0x0100ff0101010100, 0x010000ffffffff00,
+    0x010000ffffff00ff, 0x010000ffffff0001, 0x010000ffff00ffff, 0x010000ffff000000,
+    0x010000ffff0001ff, 0x010000ffff010001, 0x010000ff00ffffff, 0x010000ff00ff0101,
+    0x010000ff0000ff00, 0x010000ff000000ff, 0x010000ff00000000, 0x010000ff00000001,
+    0x010000ff000001ff, 0x010000ff00000100, 0x010000ff0001ffff, 0x010000ff0001ff00,
+    0x010000ff0001ff01, 0x010000ff00010000, 0x010000ff01ff00ff, 0x010000ff01ff0001,
+    0x010000ff0100ff01, 0x010000ff010000ff, 0x010000ff01000000, 0x010000ff010001ff,
+    0x010000ff0101ff00, 0x010000ff01010100, 0x01000000ffffffff, 0x01000000ffff0000,
+    0x01000000ffff01ff, 0x01000000ffff0101, 0x01000000ff00ffff, 0x01000000ff00ff00,
+    0x01000000ff0000ff, 0x01000000ff000000, 0x01000000ff000001, 0x01000000ff000100,
+    0x01000000ff01ff00, 0x01000000ff010000, 0x01000000ff010100, 0x01000000ff010101,
+    0x0100000000ffff00, 0x0100000000ff00ff, 0x0100000000ff0000, 0x0100000000ff0001,
+    0x0100000000ff0100, 0x010000000000ffff, 0x010000000000ff00, 0x010000000000ff01,
+    0x01000000000000ff, 0x0100000000000000, 0x0100000000000001, 0x01000000000001ff,
+    0x0100000000000100, 0x0100000000000101, 0x010000000001ff00, 0x01000000000100ff,
+    0x0100000000010000, 0x0100000000010001, 0x0100000000010100, 0x0100000001ffff00,
+    0x0100000001ff0000, 0x0100000001ff01ff, 0x010000000100ff00, 0x010000000100ff01,
+    0x01000000010000ff, 0x0100000001000000, 0x0100000001000001, 0x0100000001000100,
+    0x0100000001000101, 0x010000000101ffff, 0x010000000101ff01, 0x0100000001010000,
+    0x01000000010101ff, 0x0100000001010101, 0x01000001ffffff00, 0x01000001ffff00ff,
+    0x01000001ff00ffff, 0x01000001ff000000, 0x01000001ff000100, 0x01000001ff01ffff,
+    0x01000001ff010001, 0x01000001ff010100, 0x0100000100ff0000, 0x0100000100ff01ff,
+    0x0100000100ff0100, 0x010000010000ff00, 0x010000010000ff01, 0x0100000100000000,
+    0x0100000100000001, 0x0100000100000100, 0x0100000100010000, 0x01000001000101ff,
+    0x0100000101ffff01, 0x0100000101ff00ff, 0x0100000101ff0100, 0x0100000101ff0101,
+    0x010000010100ff01, 0x01000001010000ff, 0x0100000101000000, 0x01000001010100ff,
+    0x0100000101010001, 0x0100000101010100, 0x010001ffffff0000, 0x010001ffff000001,
+    0x010001ffff000100, 0x010001ffff010000, 0x010001ff00ffff00, 0x010001ff00ff0001,
+    0x010001ff0000ffff, 0x010001ff0000ff01, 0x010001ff00000000, 0x010001ff00000001,
+    0x010001ff00000101, 0x010001ff000100ff, 0x010001ff00010000, 0x010001ff01ff0000,
+    0x010001ff0100ff00, 0x010001ff01000001, 0x010001ff01000100, 0x010001ff01010000,
+    0x01000100ffff00ff, 0x01000100ffff0001, 0x01000100ffff0100, 0x01000100ff00ffff,
+    0x01000100ff00ff01, 0x01000100ff000000, 0x01000100ff0001ff, 0x01000100ff000101,
+    0x01000100ff01ffff, 0x01000100ff01ff00, 0x01000100ff0100ff, 0x01000100ff010001,
+    0x0100010000ffffff, 0x0100010000ffff01, 0x0100010000ff0000, 0x0100010000ff01ff,
+    0x0100010000ff0101, 0x010001000000ff00, 0x01000100000000ff, 0x0100010000000000,
+    0x0100010000000001, 0x0100010000000100, 0x010001000001ff01, 0x0100010000010000,
+    0x0100010000010001, 0x0100010000010101, 0x0100010001ffff00, 0x0100010001ff00ff,
+    0x010001000100ffff, 0x010001000100ff01, 0x0100010001000000, 0x0100010001000101,
+    0x010001000101ff00, 0x0100010001010001, 0x01000101ffff0000, 0x01000101ff000000,
+    0x01000101ff010000, 0x0100010100ff00ff, 0x0100010100ff0001, 0x0100010100ff0100,
+    0x010001010000ffff, 0x0100010100000000, 0x01000101000001ff, 0x010001010001ff00,
+    0x0100010101ff0000, 0x010001010100ff00, 0x01000101010000ff, 0x0100010101000000,
+    0x0100010101000001, 0x0101ffffffffffff, 0x0101ffffffffff01, 0x0101ffffffff01ff,
+    0x0101ffffffff0101, 0x0101ffffff000000, 0x0101ffffff01ffff, 0x0101ffffff01ff01,
+    0x0101ffffff0101ff, 0x0101ffffff010101, 0x0101ffff00ff0000, 0x0101ffff0000ff00,
+    0x0101ffff000000ff, 0x0101ffff00000001, 0x0101ffff00000100, 0x0101ffff01ffffff,
+    0x0101ffff01ffff01, 0x0101ffff01ff01ff, 0x0101ffff01ff0101, 0x0101ffff01000000,
+    0x0101ffff0101ffff, 0x0101ffff0101ff01, 0x0101ffff010101ff, 0x0101ffff01010101,
+    0x0101ff00ffff0000, 0x0101ff00ffff0100, 0x0101ff00ff00ff00, 0x0101ff00ff0000ff,
+    0x0101ff00ff000001, 0x0101ff00ff000100, 0x0101ff00ff000101, 0x0101ff0000ff0001,
+    0x0101ff0000ff0100, 0x0101ff000000ff00, 0x0101ff0000000000, 0x0101ff00000001ff,
+    0x0101ff0000000101, 0x0101ff000001ff00, 0x0101ff00000100ff, 0x0101ff0001ff0000,
+    0x0101ff000100ffff, 0x0101ff000100ff01, 0x0101ff0001000001, 0x0101ff0001000100,
+    0x0101ff01ffffff01, 0x0101ff01ffff01ff, 0x0101ff01ffff0101, 0x0101ff01ff00ffff,
+    0x0101ff01ff000100, 0x0101ff01ff01ff01, 0x0101ff01ff0101ff, 0x0101ff01ff010101,
+    0x0101ff0100ff0000, 0x0101ff010000ff00, 0x0101ff0100000001, 0x0101ff0100000100,
+    0x0101ff0100010000, 0x0101ff0101ffffff, 0x0101ff0101ffff01, 0x0101ff0101ff01ff,
+    0x0101ff0101ff0101, 0x0101ff0101000000, 0x0101ff010101ffff, 0x0101ff010101ff01,
+    0x0101ff01010101ff, 0x0101ff0101010101, 0x010100ffff000100, 0x010100ffff010000,
+    0x010100ff00ffff00, 0x010100ff00ff00ff, 0x010100ff0000ffff, 0x010100ff000000ff,
+    0x010100ff00000000, 0x010100ff000001ff, 0x010100ff00000101, 0x010100ff0001ff00,
+    0x010100ff00010000, 0x010100ff00010001, 0x010100ff000101ff, 0x010100ff00010100,
+    0x010100ff01ff0000, 0x01010000ffff0001, 0x01010000ffff0100, 0x01010000ff00ffff,
+    0x01010000ff00ff01, 0x01010000ff000000, 0x01010000ff0001ff, 0x01010000ff010001,
+    0x01010000ff010100, 0x0101000000ffff01, 0x0101000000ff0000, 0x010100000000ff00,
+    0x01010000000000ff, 0x0101000000000000, 0x0101000000000001, 0x0101000000000100,
+    0x0101000000010000, 0x0101000000010101, 0x0101000001ffff00, 0x0101000001ff00ff,
+    0x0101000001ff0000, 0x0101000001ff0001, 0x0101000001ff0100, 0x010100000100ff01,
+    0x0101000001000000, 0x01010000010001ff, 0x01010001ffff0000, 0x01010001ff00ff00,
+    0x01010001ff000001, 0x01010001ff000101, 0x01010001ff01ff00, 0x01010001ff010000,
+    0x0101000100ff00ff, 0x0101000100ff0001, 0x0101000100ff0101, 0x010100010000ff01,
+    0x0101000100000000, 0x0101000100000001, 0x01010001000001ff, 0x010100010001ffff,
+    0x010100010001ff01, 0x0101000101ff0001, 0x010100010100ffff, 0x0101000101000000,
+    0x0101000101000001, 0x0101000101000100, 0x010100010101ff00, 0x01010001010100ff,
+    0x0101000101010001, 0x010101ffffffffff, 0x010101ffffffff01, 0x010101ffffff01ff,
+    0x010101ffffff0101, 0x010101ffff01ffff, 0x010101ffff01ff01, 0x010101ffff0101ff,
+    0x010101ffff010101, 0x010101ff0000ff00, 0x010101ff000000ff, 0x010101ff00000001,
+    0x010101ff00000100, 0x010101ff01ffffff, 0x010101ff01ffff01, 0x010101ff01ff01ff,
+    0x010101ff01ff0101, 0x010101ff01000000, 0x010101ff0101ffff, 0x010101ff0101ff01,
+    0x010101ff010101ff, 0x010101ff01010101, 0x01010100ffff0000, 0x01010100ff0000ff,
+    0x01010100ff000100, 0x01010100ff01ff00, 0x01010100ff010000, 0x0101010000ffff00,
+    0x010101000000ffff, 0x0101010000000000, 0x0101010000000101, 0x010101000001ff00,
+    0x0101010000010001, 0x0101010000010100, 0x010101000100ffff, 0x0101010001000001,
+    0x01010101ffffffff, 0x01010101ffffff01, 0x01010101ffff01ff, 0x01010101ffff0101,
+    0x01010101ff01ffff, 0x01010101ff01ff01, 0x01010101ff0101ff, 0x01010101ff010101,
+    0x010101010000ff00, 0x01010101000000ff, 0x0101010100000001, 0x0101010101ffffff,
+    0x0101010101ffff01, 0x0101010101ff01ff, 0x0101010101ff0101, 0x0101010101000000,
+    0x010101010101ffff, 0x010101010101ff01, 0x01010101010101ff, 0x0101010101010101,
+};
+
+void dequantize_row_iq2_xxs(const void *src, float *dst, int n) {
+    const int nb = n / 256;
+    const block_iq2_xxs *blocks = (const block_iq2_xxs *)src;
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(blocks[i].d);
+        float *y = dst + i * 256;
+
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            memcpy(aux32, blocks[i].qs + 4*ib32, 2*sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> 7*l) & 127];
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+        }
+    }
+}
+
+void dequantize_row_mxfp4(const void *restrict vx, float *restrict y, int k) {
+    const block_mxfp4 *restrict x = (const block_mxfp4 *)vx;
+    const int nb = k / 32;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_e8m0_to_fp32_half(x[i].e);
+        for (int j = 0; j < 16; j++) {
+            const int8_t v0 = kvalues_mxfp4[x[i].qs[j] & 0x0f];
+            const int8_t v1 = kvalues_mxfp4[x[i].qs[j] >> 4];
+            y[i * 32 + j +  0] = (float)v0 * d;
+            y[i * 32 + j + 16] = (float)v1 * d;
+        }
+    }
+}
+
+void dequantize_row_nvfp4(const void *restrict vx, float *restrict y, int k) {
+    const block_nvfp4 *restrict x = (const block_nvfp4 *)vx;
+    const int nb = k / 64;
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < 4; s++) {
+            const float d = ggml_ue4m3_to_fp32(x[i].d[s]);
+            const uint8_t *qs = x[i].qs + s * 8;
+            float *yb = y + i * 64 + s * 16;
+            for (int j = 0; j < 8; j++) {
+                const int8_t v0 = kvalues_mxfp4[qs[j] & 0x0f];
+                const int8_t v1 = kvalues_mxfp4[qs[j] >> 4];
+                yb[j + 0] = (float)v0 * d;
+                yb[j + 8] = (float)v1 * d;
+            }
+        }
+    }
+}
+
+void dequantize_row_q4_0(const void *restrict vx, float *restrict y, int k) {
+    const block_q4_0 *restrict x = (const block_q4_0 *)vx;
+    const int nb = k / 32;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        for (int j = 0; j < 16; j++) {
+            const int v0 = (x[i].qs[j] & 0x0F) - 8;
+            const int v1 = (x[i].qs[j] >>    4) - 8;
+            y[i*32 + j +  0] = v0 * d;
+            y[i*32 + j + 16] = v1 * d;
+        }
+    }
+}
+
+void dequantize_row_q4_1(const void *restrict vx, float *restrict y, int k) {
+    const block_q4_1 *restrict x = (const block_q4_1 *)vx;
+    const int nb = k / 32;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        const float m = ggml_fp16_to_fp32(x[i].m);
+        for (int j = 0; j < 16; j++) {
+            const int v0 = (x[i].qs[j] & 0x0F);
+            const int v1 = (x[i].qs[j] >>    4);
+            y[i*32 + j +  0] = v0 * d + m;
+            y[i*32 + j + 16] = v1 * d + m;
+        }
+    }
+}
+
+void dequantize_row_q5_0(const void *restrict vx, float *restrict y, int k) {
+    const block_q5_0 *restrict x = (const block_q5_0 *)vx;
+    const int nb = k / 32;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+        for (int j = 0; j < 16; j++) {
+            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+            const int32_t x0 = ((x[i].qs[j] & 0x0F) | xh_0) - 16;
+            const int32_t x1 = ((x[i].qs[j] >>    4) | xh_1) - 16;
+            y[i*32 + j +  0] = x0 * d;
+            y[i*32 + j + 16] = x1 * d;
+        }
+    }
+}
+
+void dequantize_row_q5_1(const void *restrict vx, float *restrict y, int k) {
+    const block_q5_1 *restrict x = (const block_q5_1 *)vx;
+    const int nb = k / 32;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        const float m = ggml_fp16_to_fp32(x[i].m);
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+        for (int j = 0; j < 16; j++) {
+            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+            const int32_t x0 = (x[i].qs[j] & 0x0F) | xh_0;
+            const int32_t x1 = (x[i].qs[j] >>    4) | xh_1;
+            y[i*32 + j +  0] = x0 * d + m;
+            y[i*32 + j + 16] = x1 * d + m;
+        }
+    }
+}
+
+void dequantize_row_iq3_xxs(const void *restrict vx, float *restrict y, int k) {
+    const block_iq3_xxs *restrict x = (const block_iq3_xxs *)vx;
+    const int nb = k / 256;
+    uint32_t aux32;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *scales_and_signs = qs + 256/4;
+        for (int ib32 = 0; ib32 < 256/32; ++ib32) {
+            memcpy(&aux32, scales_and_signs + 4*ib32, sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*l) & 127];
+                const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + qs[2*l+0]);
+                const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + qs[2*l+1]);
+                for (int j = 0; j < 4; ++j) {
+                    y[j+0] = db * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+                    y[j+4] = db * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 8;
+        }
+    }
+}
+
+void dequantize_row_iq4_nl(const void *restrict vx, float *restrict y, int k) {
+    const block_iq4_nl *restrict x = (const block_iq4_nl *)vx;
+    const int nb = k / 32;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *qs = x[i].qs;
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        for (int j = 0; j < 16; ++j) {
+            y[j +  0] = d * kvalues_iq4nl[qs[j] & 0xf];
+            y[j + 16] = d * kvalues_iq4nl[qs[j] >>  4];
+        }
+        y  += 32;
+    }
+}
+
+void dequantize_row_iq4_xs(const void *restrict vx, float *restrict y, int k) {
+    const block_iq4_xs *restrict x = (const block_iq4_xs *)vx;
+    const int nb = k / 256;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *qs = x[i].qs;
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        for (int ib = 0; ib < 256/32; ++ib) {
+            const int ls = ((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> 2*ib) & 3) << 4);
+            const float dl = d * (ls - 32);
+            for (int j = 0; j < 16; ++j) {
+                y[j+ 0] = dl * kvalues_iq4nl[qs[j] & 0xf];
+                y[j+16] = dl * kvalues_iq4nl[qs[j] >>  4];
+            }
+            y  += 32;
+            qs += 16;
+        }
+    }
+}
+
+void dequantize_row_iq2_xs(const void *restrict vx, float *restrict y, int k) {
+    const block_iq2_xs *restrict x = (const block_iq2_xs *)vx;
+    const int nb = k / 256;
+    float db[2];
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        for (int ib32 = 0; ib32 < 256/32; ++ib32) {
+            db[0] = d * (0.5f + (x[i].scales[ib32] & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (x[i].scales[ib32] >>  4)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (x[i].qs[4*ib32 + l] & 511));
+                const uint8_t  signs = ksigns_iq2xs[x[i].qs[4*ib32 + l] >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = db[l/2] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+        }
+    }
+}
+
+void dequantize_row_iq2_s(const void *restrict vx, float *restrict y, int k) {
+    const block_iq2_s *restrict x = (const block_iq2_s *)vx;
+    const int nb = k / 256;
+    float db[2];
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = qs + 256/8;
+        for (int ib32 = 0; ib32 < 256/32; ++ib32) {
+            db[0] = d * (0.5f + (x[i].scales[ib32] & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (x[i].scales[ib32] >>  4)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const float dl = db[l/2];
+                const uint8_t *grid = (const uint8_t *)(iq2s_grid + (qs[l] | (qh[ib32] << (8-2*l) & 0x300)));
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 4;
+            signs += 4;
+        }
+    }
+}
+
+void dequantize_row_iq3_s(const void *restrict vx, float *restrict y, int k) {
+    const block_iq3_s *restrict x = (const block_iq3_s *)vx;
+    const int nb = k / 256;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = x[i].signs;
+        for (int ib32 = 0; ib32 < 256/32; ib32 += 2) {
+            const float db1 = d * (1 + 2*(x[i].scales[ib32/2] & 0xf));
+            const float db2 = d * (1 + 2*(x[i].scales[ib32/2] >>  4));
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[0] << (8-2*l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[0] << (7-2*l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j+0] = db1 * grid1[j] * (signs[l] & kmask_iq2xs[j+0] ? -1.f : 1.f);
+                    y[j+4] = db1 * grid2[j] * (signs[l] & kmask_iq2xs[j+4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 8;
+            signs += 4;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[1] << (8-2*l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[1] << (7-2*l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j+0] = db2 * grid1[j] * (signs[l] & kmask_iq2xs[j+0] ? -1.f : 1.f);
+                    y[j+4] = db2 * grid2[j] * (signs[l] & kmask_iq2xs[j+4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qh += 2;
+            qs += 8;
+            signs += 4;
+        }
+    }
+}
+
+#define IQ1S_DELTA 0.125f
+
+void dequantize_row_iq1_s(const void *restrict vx, float *restrict y, int k) {
+    const block_iq1_s *restrict x = (const block_iq1_s *)vx;
+    const int nb = k / 256;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        const uint8_t  *qs = x[i].qs;
+        const uint16_t *qh = x[i].qh;
+        for (int ib = 0; ib < 256/32; ++ib) {
+            const float dl = d * (2*((qh[ib] >> 12) & 7) + 1);
+            const float delta = qh[ib] & 0x8000 ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (int l = 0; l < 4; ++l) {
+                const int8_t *grid = (const int8_t *)(iq1s_grid + (qs[l] | (((qh[ib] >> 3*l) & 7) << 8)));
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl * (grid[j] + delta);
+                }
+                y += 8;
+            }
+            qs += 4;
+        }
+    }
+}
+
+void dequantize_row_iq1_m(const void *restrict vx, float *restrict y, int k) {
+    const block_iq1_m *restrict x = (const block_iq1_m *)vx;
+    const int nb = k / 256;
+    float delta[4];
+    uint16_t idx[4];
+    iq1m_scale_t scale;
+    for (int i = 0; i < nb; i++) {
+        const uint16_t *sc = (const uint16_t *)x[i].scales;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const float d = ggml_fp16_to_fp32(scale.f16);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        for (int ib = 0; ib < 256/32; ++ib) {
+            const float dl1 = d * (2*((sc[ib/2] >> (6*(ib%2)+0)) & 0x7) + 1);
+            const float dl2 = d * (2*((sc[ib/2] >> (6*(ib%2)+3)) & 0x7) + 1);
+            idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
+            idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
+            idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
+            idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
+            delta[0] = qh[0] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[1] = qh[0] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[2] = qh[1] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[3] = qh[1] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (int l = 0; l < 2; ++l) {
+                const int8_t *grid = (const int8_t *)(iq1s_grid + idx[l]);
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl1 * (grid[j] + delta[l]);
+                }
+                y += 8;
+            }
+            for (int l = 2; l < 4; ++l) {
+                const int8_t *grid = (const int8_t *)(iq1s_grid + idx[l]);
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl2 * (grid[j] + delta[l]);
+                }
+                y += 8;
+            }
+            qs += 4;
+            qh += 2;
+        }
+    }
+}
+
+void dequantize_row_tq1_0(const void *restrict vx, float *restrict y, int k) {
+    const block_tq1_0 *restrict x = (const block_tq1_0 *)vx;
+    const int nb = k / 256;
+    const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        for (size_t j = 0; j < sizeof(x->qs) - sizeof(x->qs) % 32; j += 32) {
+            for (size_t n = 0; n < 5; ++n) {
+                for (size_t m = 0; m < 32; ++m) {
+                    uint8_t q = x[i].qs[j + m] * pow3[n];
+                    int16_t xi = ((uint16_t) q * 3) >> 8;
+                    *y++ = (float) (xi - 1) * d;
+                }
+            }
+        }
+        for (size_t j = sizeof(x->qs) - sizeof(x->qs) % 32; j < sizeof(x->qs); j += 16) {
+            for (size_t n = 0; n < 5; ++n) {
+                for (size_t m = 0; m < 16; ++m) {
+                    uint8_t q = x[i].qs[j + m] * pow3[n];
+                    int16_t xi = ((uint16_t) q * 3) >> 8;
+                    *y++ = (float) (xi - 1) * d;
+                }
+            }
+        }
+        for (size_t n = 0; n < 4; ++n) {
+            for (size_t j = 0; j < sizeof(x->qh); ++j) {
+                uint8_t q = x[i].qh[j] * pow3[n];
+                int16_t xi = ((uint16_t) q * 3) >> 8;
+                *y++ = (float) (xi - 1) * d;
+            }
+        }
+    }
+}
+
+void dequantize_row_tq2_0(const void *restrict vx, float *restrict y, int k) {
+    const block_tq2_0 *restrict x = (const block_tq2_0 *)vx;
+    const int nb = k / 256;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = ggml_fp16_to_fp32(x[i].d);
+        for (size_t j = 0; j < sizeof(x->qs); j += 32) {
+            for (size_t l = 0; l < 4; ++l) {
+                for (size_t m = 0; m < 32; ++m) {
+                    int8_t q = (x[i].qs[j + m] >> (l*2)) & 3;
+                    *y++ = (float) (q - 1) * d;
+                }
+            }
+        }
+    }
+}
+
+int dequant_row(uint32_t type, const void *src, float *dst, int n) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+            dequantize_row_q2_K(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q3_K:
+            dequantize_row_q3_K(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q8_0:
+            dequantize_row_q8_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q1_0:
+            dequantize_row_q1_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_MXFP4:
+            dequantize_row_mxfp4(src, dst, n);
+            return 0;
+        case GGML_TYPE_NVFP4:
+            dequantize_row_nvfp4(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q4_K:
+            dequantize_row_q4_K(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q5_K:
+            dequantize_row_q5_K(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q6_K:
+            dequantize_row_q6_K(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ2_XXS:
+            dequantize_row_iq2_xxs(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q4_0:
+            dequantize_row_q4_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q4_1:
+            dequantize_row_q4_1(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q5_0:
+            dequantize_row_q5_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q5_1:
+            dequantize_row_q5_1(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ2_XS:
+            dequantize_row_iq2_xs(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ2_S:
+            dequantize_row_iq2_s(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ3_XXS:
+            dequantize_row_iq3_xxs(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ3_S:
+            dequantize_row_iq3_s(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ4_NL:
+            dequantize_row_iq4_nl(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ4_XS:
+            dequantize_row_iq4_xs(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ1_S:
+            dequantize_row_iq1_s(src, dst, n);
+            return 0;
+        case GGML_TYPE_IQ1_M:
+            dequantize_row_iq1_m(src, dst, n);
+            return 0;
+        case GGML_TYPE_TQ1_0:
+            dequantize_row_tq1_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_TQ2_0:
+            dequantize_row_tq2_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_F32:
+            memcpy(dst, src, n * sizeof(float));
+            return 0;
+        case GGML_TYPE_F16: {
+            const uint16_t *s = (const uint16_t *)src;
+            for (int i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(s[i]);
+            return 0;
+        }
+        case GGML_TYPE_BF16:
+            dequantize_row_bf16(src, dst, n);
+            return 0;
+        default:
+            return -1;
+    }
+}
 
 #endif /* GGML_DEQUANT_IMPLEMENTATION */
 #endif /* GGML_DEQUANT_H */

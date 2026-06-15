@@ -90,13 +90,6 @@ Concurrent `/run` on a session already running a command → HTTP 409
 
 - **Serial sessions**: one command at a time per session; a concurrent `/run`
   gets `409 session busy`.
-- **`exit` ends the session, not just the command**: each session is one
-  persistent shell, so a command containing a bare `exit [N]` (or anything that
-  kills the shell) terminates the *whole session* — that `/run` returns
-  `code: null` and later calls get `404 no such session`. To surface a non-zero
-  status without dropping the session, run it in a subshell — `( exit 7 )` →
-  `code: 7` — or just let a failing tool set it (`ls /nope` → `code: 2`). The
-  session shell stays alive either way.
 - **Client disconnect**: if the client drops mid-`/run`, the server SIGINTs the
   running command and drains it so the session is left clean (briefly `409` busy
   while cleanup finishes).

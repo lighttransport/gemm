@@ -1,0 +1,28 @@
+torch>=2.3
+torchvision
+safetensors
+numpy
+Pillow
+transformers
+pyyaml
+trimesh
+einops
+diffusers
+scikit-image
+timm>=1.0.26
+omegaconf>=2.3.0
+opencv-python>=4.13.0.92
+pymeshlab>=2025.7.post1
+accelerate>=1.13.0
+pygltflib>=1.16.5
+xatlas>=0.0.11
+basicsr>=1.4.2
+realesrgan>=0.3.0
+pybind11>=3.0.3
+pytorch-lightning>=2.6.1
+fast-simplification>=0.1.13
+
+[torch-rocm722]
+triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.6.0+rocm7.2.2.git4ed88892-cp312-cp312-linux_x86_64.whl
+torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl
+torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchvision-0.26.0+rocm7.2.2.git336d36e8-cp312-cp312-linux_x86_64.whl

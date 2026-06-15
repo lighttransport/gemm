@@ -43,7 +43,7 @@ typedef struct {
     qtensor norm_w, norm_b;
 } vision_deepstack;
 
-typedef struct vision_model {
+typedef struct {
     /* Hyperparameters */
     int n_blocks;
     int dim;          /* embedding_length (1024 for 2B) */
@@ -115,57 +115,6 @@ float *vision_normalize_image(const vision_model *vm, const uint8_t *rgb, int wi
 #else
 #define VIT_PROF_BEGIN(name, layer, op, prec) ((void)0)
 #define VIT_PROF_END(name, flops, iops) ((void)0)
-#endif
-
-/* ---- VLMD dump hook (gated; writes the a64fx/vlm validation format) ---- */
-#ifdef VLM_DUMP_REFERENCE
-#include <sys/stat.h>
-#include <sys/types.h>
-static FILE *vit_ref_manifest = NULL;
-static char  vit_ref_dir[512] = {0};
-static int   vit_ref_init_done = 0;
-static void vit_dump_init(void) {
-    if (vit_ref_init_done) return;
-    vit_ref_init_done = 1;
-    const char *d = getenv("VLM_DUMP_DIR");
-    if (!d || !*d) return;
-    strncpy(vit_ref_dir, d, sizeof(vit_ref_dir) - 1);
-    mkdir(vit_ref_dir, 0755);   /* ignore EEXIST */
-    char m[600]; snprintf(m, sizeof(m), "%s/manifest.txt", vit_ref_dir);
-    vit_ref_manifest = fopen(m, "w");
-    if (vit_ref_manifest)
-        fprintf(vit_ref_manifest, "# filename name layer dtype ndim dims...\n");
-}
-static void vit_dump_write_f32_2d(const char *name, int layer, int rows, int cols,
-                                  const float *data) {
-    vit_dump_init();
-    if (!vit_ref_dir[0]) return;
-    char fname[160];
-    if (layer >= 0) snprintf(fname, sizeof(fname), "L%02d_%s.vlmd", layer, name);
-    else            snprintf(fname, sizeof(fname), "%s.vlmd", name);
-    char path[800]; snprintf(path, sizeof(path), "%s/%s", vit_ref_dir, fname);
-    FILE *fp = fopen(path, "wb");
-    if (!fp) return;
-    unsigned char hdr[144]; memset(hdr, 0, sizeof(hdr));
-    memcpy(hdr, "VLMD", 4);
-    uint32_t v = 1, dt = 0, nd = 2;
-    memcpy(hdr + 4, &v, 4); memcpy(hdr + 8, &dt, 4); memcpy(hdr + 12, &nd, 4);
-    uint32_t dims[8] = { (uint32_t)rows, (uint32_t)cols, 0,0,0,0,0,0 };
-    memcpy(hdr + 16, dims, sizeof(dims));
-    strncpy((char *)(hdr + 48), name, 63);
-    fwrite(hdr, 1, 144, fp);
-    fwrite(data, 1, (size_t)rows * cols * sizeof(float), fp);
-    fclose(fp);
-    if (vit_ref_manifest) {
-        fprintf(vit_ref_manifest, "%s %s %d f32 2 %d %d\n",
-                fname, name, layer, rows, cols);
-        fflush(vit_ref_manifest);
-    }
-}
-#define VIT_DUMP_TENSOR(name, layer, ptr, rows, cols) \
-    vit_dump_write_f32_2d((name), (layer), (rows), (cols), (ptr))
-#else
-#define VIT_DUMP_TENSOR(name, layer, ptr, rows, cols) ((void)0)
 #endif
 
 /* ---- Tensor loading ---- */
@@ -701,7 +650,6 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
     }
     /* FLOPs: each patch does dim dot products of kernel_size, times 2 kernels */
     VIT_PROF_END("patch_embed", 2.0 * n_patches * dim * ps * ps * 3 * (vm->patch_embd_w1.data ? 2 : 1), 0);
-    VIT_DUMP_TENSOR("patch_embed", -1, hidden, n_patches, dim);
 
     /* 2. Add position embeddings: position_embd is [dim, orig_n_patches] */
     fprintf(stderr, "  position embeddings...\n");
@@ -725,7 +673,6 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
         }
         free(pos_emb);
     }
-    VIT_DUMP_TENSOR("pos_emb_added", -1, hidden, n_patches, dim);
 
     /* 2b. Compute M-RoPE position IDs for each patch (raster order).
      * Layout: pos_ids[4][n_patches] — (t, h, w, e) per patch.
@@ -802,14 +749,12 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
         vit_layernorm_batch(ln_buf, hidden, &blk->ln1_w, &blk->ln1_b,
                             n_patches, dim, vm->ln_eps);
         VIT_PROF_END("ln1", 5.0 * n_patches * dim, 0);
-        VIT_DUMP_TENSOR("ln1", l, ln_buf, n_patches, dim);
 
         /* QKV projection: [n_patches, dim] -> [n_patches, 3*dim] */
         VIT_PROF_BEGIN("qkv_matmul", l, "matmul", "FP32");
         vit_batch_gemm_bias_mt(qkv, &blk->attn_qkv_w, &blk->attn_qkv_b,
                                ln_buf, n_patches, 3 * dim, dim, n_threads);
         VIT_PROF_END("qkv_matmul", 2.0 * n_patches * 3 * dim * dim, 0);
-        VIT_DUMP_TENSOR("qkv", l, qkv, n_patches, 3 * dim);
 
         /* Apply M-RoPE to Q and K (not V).
          * Vision rotation: pairs [i, i+half] for i in 0..half-1.
@@ -837,7 +782,6 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
         }
 
         VIT_PROF_END("mrope", (double)n_patches * n_heads * half * 8.0 * 2, 0);
-        VIT_DUMP_TENSOR("mrope", l, qkv, n_patches, 3 * dim);
 
         /* Multi-head attention (head-parallel across threads) */
         VIT_PROF_BEGIN("attention", l, "attention", "FP32");
@@ -896,14 +840,12 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
 
         /* QK: heads*seq^2*hd, AV: same */
         VIT_PROF_END("attention", 2.0 * n_heads * (double)n_patches * n_patches * head_dim * 2, 0);
-        VIT_DUMP_TENSOR("attn", l, attn_out, n_patches, dim);
 
         /* Attention output projection */
         VIT_PROF_BEGIN("attn_out", l, "matmul", "FP32");
         vit_batch_gemm_bias_mt(hidden2, &blk->attn_out_w, &blk->attn_out_b,
                                attn_out, n_patches, dim, dim, n_threads);
         VIT_PROF_END("attn_out", 2.0 * n_patches * dim * dim, 0);
-        VIT_DUMP_TENSOR("attn_out", l, hidden2, n_patches, dim);
 
         /* Residual */
         for (int i = 0; i < n_patches * dim; i++) hidden[i] += hidden2[i];
@@ -914,14 +856,12 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
         vit_layernorm_batch(ln_buf, hidden, &blk->ln2_w, &blk->ln2_b,
                             n_patches, dim, vm->ln_eps);
         VIT_PROF_END("ln2", 5.0 * n_patches * dim, 0);
-        VIT_DUMP_TENSOR("ln2", l, ln_buf, n_patches, dim);
 
         /* FFN: up -> GELU -> down */
         VIT_PROF_BEGIN("ffn_up", l, "matmul", "FP32");
         vit_batch_gemm_bias_mt(ffn_buf, &blk->ffn_up_w, &blk->ffn_up_b,
                                ln_buf, n_patches, ffn_dim, dim, n_threads);
         VIT_PROF_END("ffn_up", 2.0 * n_patches * ffn_dim * dim, 0);
-        VIT_DUMP_TENSOR("ffn_up", l, ffn_buf, n_patches, ffn_dim);
 
         VIT_PROF_BEGIN("gelu", l, "gelu", "FP32");
         for (int i = 0; i < n_patches * ffn_dim; i++) {
@@ -929,17 +869,14 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
             ffn_buf[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
         }
         VIT_PROF_END("gelu", 8.0 * n_patches * ffn_dim, 0);
-        VIT_DUMP_TENSOR("gelu", l, ffn_buf, n_patches, ffn_dim);
 
         VIT_PROF_BEGIN("ffn_down", l, "matmul", "FP32");
         vit_batch_gemm_bias_mt(hidden2, &blk->ffn_down_w, &blk->ffn_down_b,
                                ffn_buf, n_patches, dim, ffn_dim, n_threads);
         VIT_PROF_END("ffn_down", 2.0 * n_patches * dim * ffn_dim, 0);
-        VIT_DUMP_TENSOR("ffn_down", l, hidden2, n_patches, dim);
 
         /* Residual */
         for (int i = 0; i < n_patches * dim; i++) hidden[i] += hidden2[i];
-        VIT_DUMP_TENSOR("block_out", l, hidden, n_patches, dim);
 
         /* --- DeepStack --- */
         for (int ds = 0; ds < vm->n_deepstack; ds++) {
@@ -976,7 +913,6 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
             vit_batch_gemm_bias_mt(ds_buf, &dsl->fc1_w, &dsl->fc1_b,
                                    merge_buf, n_merged, merged_dim, merged_dim, n_threads);
             VIT_PROF_END("ds_fc1", 2.0 * n_merged * merged_dim * merged_dim, 0);
-            VIT_DUMP_TENSOR("ds_fc1", l, ds_buf, n_merged, merged_dim);
 
             /* GELU */
             VIT_PROF_BEGIN("ds_gelu", l, "gelu", "FP32");
@@ -989,7 +925,6 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
             vit_batch_gemm_bias_mt(ds_out, &dsl->fc2_w, &dsl->fc2_b,
                                    ds_buf, n_merged, vm->proj_dim, merged_dim, n_threads);
             VIT_PROF_END("ds_fc2", 2.0 * n_merged * vm->proj_dim * merged_dim, 0);
-            VIT_DUMP_TENSOR("ds_fc2", l, ds_out, n_merged, vm->proj_dim);
 
             /* Store as separate feature slice (for concat) */
             memcpy(deepstack_feats + ds_count * n_merged * vm->proj_dim,
@@ -1007,7 +942,6 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
     vit_layernorm_batch(hidden, hidden, &vm->post_ln_w, &vm->post_ln_b,
                         n_patches, dim, vm->ln_eps);
     VIT_PROF_END("post_ln", 5.0 * n_patches * dim, 0);
-    VIT_DUMP_TENSOR("post_ln", -1, hidden, n_patches, dim);
 
     /* 5. Spatial merge: [gh, gw, dim] -> [gh/sm, gw/sm, dim*sm*sm] */
     fprintf(stderr, "  spatial merge...\n");
@@ -1041,19 +975,15 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
     vit_batch_gemm_bias_mt(mm_buf, &vm->mm0_w, &vm->mm0_b,
                            merge_buf, n_merged, merged_dim, merged_dim, n_threads);
     VIT_PROF_END("mm0", 2.0 * n_merged * merged_dim * merged_dim, 0);
-    VIT_DUMP_TENSOR("merge", -1, merge_buf, n_merged, merged_dim);
-    VIT_DUMP_TENSOR("mm0", -1, mm_buf, n_merged, merged_dim);
 
     VIT_PROF_BEGIN("mm_gelu", -1, "gelu", "FP32");
     vit_gelu(mm_buf, n_merged * merged_dim);
     VIT_PROF_END("mm_gelu", 8.0 * n_merged * merged_dim, 0);
-    VIT_DUMP_TENSOR("mm_gelu", -1, mm_buf, n_merged, merged_dim);
 
     VIT_PROF_BEGIN("mm2", -1, "matmul", "FP32");
     vit_batch_gemm_bias_mt(mm_out, &vm->mm2_w, &vm->mm2_b,
                            mm_buf, n_merged, vm->proj_dim, merged_dim, n_threads);
     VIT_PROF_END("mm2", 2.0 * n_merged * vm->proj_dim * merged_dim, 0);
-    VIT_DUMP_TENSOR("mm2", -1, mm_out, n_merged, vm->proj_dim);
 
     /* 7. Concat main embeddings + deepstack features per token
      * Layout: [main_proj_dim, ds0_proj_dim, ds1_proj_dim, ...] for each token
@@ -1068,8 +998,6 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
                    vm->proj_dim * sizeof(float));
         }
     }
-
-    VIT_DUMP_TENSOR("final", -1, result, n_merged, total_embd);
 
     fprintf(stderr, "  vision encoding done: %d tokens of dim %d (main %d + %d deepstack)\n",
             n_merged, total_embd, vm->proj_dim, ds_count);
