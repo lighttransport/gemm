@@ -61,6 +61,13 @@ class Tok:
                 else:
                     for ch in t: ids.append(self.vocab.get(ch, 0))
         return ids
+    def chat(self, user_text, think=False):
+        """M3 instruct format: <bos>user\\n{q}<eos>\\n<bos>ai\\n[</mm:think>]. Atomic
+        special tokens (bos 200019 / eos 200020 / </mm:think> 200060) bracket BPE'd text."""
+        BOS,EOS,THINK_END=200019,200020,200060
+        ids=[BOS]+self.encode("user\n"+user_text)+[EOS]+self.encode("\n")+[BOS]+self.encode("ai\n")
+        if not think: ids.append(THINK_END)
+        return ids
     def decode(self, ids):
         out=[]
         for i in ids:
@@ -78,6 +85,12 @@ def main():
     if cmd=="encode":
         text=sys.argv[2]; add_bos="--bos" in sys.argv
         print(" ".join(str(i) for i in t.encode(text, add_bos)))
+    elif cmd=="chat":
+        text=sys.argv[2]
+        print(" ".join(str(i) for i in t.chat(text)))
+    elif cmd=="chat-file":
+        text=open(sys.argv[2]).read()
+        print(" ".join(str(i) for i in t.chat(text)))
     elif cmd=="decode":
         ids=[int(x) for x in sys.argv[2].split()]
         print(t.decode(ids))
