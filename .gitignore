@@ -242,8 +242,6 @@ cuda/qimg/fp8_reference/
 
 # scan chunked-prototype dev binary
 cuda/llm/scan/deltanet_chunk_test
-<<<<<<< HEAD
-=======
 
 # Python venv (tooling, e.g. git-filter-repo)
 .venv/
@@ -270,4 +268,20 @@ rdna4/qimg/test_hip_qimg
 rdna4/vlm/test_*
 !rdna4/vlm/test_*.c
 vulkan/hy3d/test_vulkan_hy3d
->>>>>>> 4ee142f537401f0036f4293e28b2c5ac7c82507d
+
+# Artifact / binary file types purged from history — never re-commit these.
+# (compiled GPU kernels, images, binary data dumps, profiler output)
+*.cubin
+*.spv
+*.hsaco
+*.co
+*.png
+*.jpg
+*.jpeg
+*.ppm
+*.pgm
+*.npy
+*.dat
+*.bin
+*.bak
+*.sqlite
