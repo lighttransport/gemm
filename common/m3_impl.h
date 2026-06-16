@@ -743,6 +743,7 @@ typedef struct {
     float *logits,*sc;
     int *psel, *pnsel;        /* prefill: per-token MSA selected positions [n*maxsel] + counts [n] (kc/vc NULL) */
     int maxsel;
+    int *gsel; float *gselw;  /* router top-k per token [n*8] (heap; prefill N can exceed 64) */
 } m3_mstream;
 
 /* Y[N,rows] (token-major) = X[N,cols] . W[rows,cols]^T. K-tiled (8 W rows for a tile stay
@@ -824,7 +825,7 @@ static void m3_free_mstream(m3_model*m){
     free(ms->kc);free(ms->vc);free(ms->xn);free(ms->q);free(ms->k);free(ms->v);free(ms->attn);free(ms->o);
     free(ms->h2);free(ms->router);free(ms->route);free(ms->shg);free(ms->shu);free(ms->ffg);free(ms->ffu);
     free(ms->tmp2);free(ms->exg);free(ms->exu);free(ms->emoe);free(ms->bk);free(ms->bw);free(ms->bcnt);free(ms->logits);free(ms->sc);
-    free(ms->psel);free(ms->pnsel);
+    free(ms->psel);free(ms->pnsel);free(ms->gsel);free(ms->gselw);
     free(ms); m->ms=NULL;
 }
 /* per_stream_kv=1: multi-stream decode (own KV per stream). 0: chunked prefill (shared model
@@ -835,7 +836,8 @@ static int m3_alloc_mstream_ex(m3_model*m,int N,int per_stream_kv){
     size_t per=(size_t)c->n_layers*c->max_pos*KVD;
     if(per_stream_kv){ ms->kc=calloc((size_t)N*per,2); ms->vc=calloc((size_t)N*per,2); }
     else { ms->maxsel=(c->msa_topk_blocks+c->msa_local_block+c->msa_init_block+1)*c->msa_block_size;
-           ms->psel=malloc((size_t)N*ms->maxsel*sizeof(int)); ms->pnsel=malloc((size_t)N*sizeof(int)); }
+           ms->psel=malloc((size_t)N*ms->maxsel*sizeof(int)); ms->pnsel=malloc((size_t)N*sizeof(int));
+           ms->gsel=malloc((size_t)N*8*sizeof(int)); ms->gselw=malloc((size_t)N*8*sizeof(float)); }
     ms->xn=malloc((size_t)N*H*4); ms->q=malloc((size_t)N*QD*4); ms->k=malloc((size_t)N*KVD*4); ms->v=malloc((size_t)N*KVD*4);
     ms->attn=malloc((size_t)N*QD*4); ms->o=malloc((size_t)N*H*4); ms->h2=malloc((size_t)N*H*4);
     ms->router=malloc((size_t)N*c->n_experts*4); ms->route=malloc((size_t)N*H*4);
@@ -1024,7 +1026,7 @@ static int m3_forward_prefill_chunk(m3_model*m, float*X, int S, int p0){
         if(is_moe){
             const int tp_sh=(L->sh_rows<c->moe_inter);
             for(size_t i=0;i<(size_t)S*H;i++) ms->route[i]=0;
-            int na=c->n_active>8?8:c->n_active; int sel_all[64*8]; float selw_all[64*8];
+            int na=c->n_active>8?8:c->n_active; int*sel_all=ms->gsel; float*selw_all=ms->gselw;  /* [S*8] heap (S may exceed 64) */
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
 #endif
