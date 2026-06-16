@@ -253,6 +253,8 @@ typedef struct {
     /* pool */
     m3_pool *pool;
     int n_threads, n_cmgs;
+    /* multi-stream batched decode state (m3_mstream*, defined in m3_impl.h); NULL unless allocated */
+    void *ms;
     /* scratch (per-forward, single token) */
     float *s_norm, *s_q, *s_k, *s_v, *s_attn, *s_o;
     float *s_idx_q, *s_idx_k;          /* MSA index projections */
