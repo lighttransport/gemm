@@ -13,6 +13,13 @@ A64FX sustains ~1.0–1.3 TFLOP/s/node on these (bf16→f32-widened) GEMMs:
   efficiency that is **200–400 tok/s**. So **100 tok/s is reachable on the existing
   48–96 nodes** — the lever is batching the sequence, not adding nodes.
 
+## STATUS: Lever 1 IMPLEMENTED + validated (commit, job 49252398, 2026-06-16)
+`m3_forward_prefill_chunk` done + wired (runner `M3_PCHUNK=S`, `m3_real_test`). Single-node,
+4 real layers, prefill 512: **chunked M=128 == token-serial argmax 3051 / ‖x‖ 3.940e4 (exact),
+NaN=0**; throughput **8.95 → 39.18 tok/s = 4.4×** — and that is the COMPUTE-only win (one rank,
+no comm). Multi-node adds the per-token→per-chunk all-reduce collapse on top. Next: full-model
+multi-node run (`M3_PCHUNK=256/512`) to confirm ≥100 tok/s (pending the 1907 episode clearing).
+
 ## Lever 1 (primary, biggest win): chunked batched prefill
 Process the prompt in chunks of **S tokens** (e.g. S=256–512) through the *already-existing*
 batched GEMM path (`m3_gemm`, M=N — the multi-stream decode kernels) instead of token-by-token.
