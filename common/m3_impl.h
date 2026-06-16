@@ -656,10 +656,16 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
     for(int l=0;l<c->n_layers;l++){
         m3_layer*L=&m->layers[l]; int is_moe=m3_is_moe(c,l);
         const int qh0=L->qh0,qh1=L->qh1,nown=qh1-qh0,qrows=nown*HD; const int tp_attn=(qrows<QH*HD);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
         for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->xn+(size_t)t*H, X+(size_t)t*H, L->input_norm, H, c->norm_eps);
         m3_gemm_bf16(ms->q,(uint16_t*)L->wq.w,ms->xn,N,qrows,H);
         m3_gemm_bf16(ms->k,(uint16_t*)L->wk.w,ms->xn,N,KVD,H);
         m3_gemm_bf16(ms->v,(uint16_t*)L->wv.w,ms->xn,N,KVD,H);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
         for(int t=0;t<N;t++){ int p=pos[t]; const float*cosp=&m->rope_cos[(size_t)p*half],*sinp=&m->rope_sin[(size_t)p*half];
             float*qb=ms->q+(size_t)t*qrows,*kb=ms->k+(size_t)t*KVD,*vb=ms->v+(size_t)t*KVD;
             for(int hh=0;hh<nown;hh++){ float*qh=qb+hh*HD; if(c->use_qk_norm) m3_rmsnorm_head(qh,L->q_norm,HD,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
@@ -667,6 +673,9 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
             uint16_t*kc=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
             uint16_t*vc=ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
             for(int i=0;i<KVD;i++){ kc[i]=m3_f2bf(kb[i]); vc[i]=m3_f2bf(vb[i]); } }
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
         for(int t=0;t<N;t++){ int p=pos[t]; float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*qrows,*sc=ms->sc+(size_t)t*c->max_pos;
             uint16_t*kcl=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD,*vcl=ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD;
             for(int hh=0;hh<nown;hh++){ int hgl=qh0+hh; float*qh=qb+hh*HD; int kvh=hgl/grp; float mx=-1e30f;
@@ -677,17 +686,26 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
         m3_gemm_bf16(ms->o,(uint16_t*)L->wo.w,ms->attn,N,H,qrows);
         if(tp_attn && m->ar_cb) m->ar_cb(ms->o,N*H,m->ar_ctx);
         for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->o[i];
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
         for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, L->post_norm, H, c->norm_eps);
         if(is_moe){
             const int tp_sh=(L->sh_rows<c->moe_inter);
             for(size_t i=0;i<(size_t)N*H;i++) ms->route[i]=0;
+            int na=c->n_active>8?8:c->n_active; int sel_all[64*8]; float selw_all[64*8];
+            /* router + select: parallel over streams (F32 gate matvec, no nested matvec) */
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
             for(int t=0;t<N;t++){ float*rl=ms->router+(size_t)t*c->n_experts; m3_mv_f32(rl,(float*)L->gate.w,ms->h2+(size_t)t*H,c->n_experts,H);
                 for(int e=0;e<c->n_experts;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
-                int sel[64]; float sw[64]; int na=c->n_active>64?64:c->n_active;
+                int*sel=sel_all+t*na; float*sw=selw_all+t*na;
                 for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
-                float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1;
-                float*h2t=ms->h2+(size_t)t*H,*rt=ms->route+(size_t)t*H;
-                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size; float w=sw[a]/wsum*c->routed_scale;
+                float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
+            /* owned-expert compute: serial over streams (shared expert scratch + parallel matvec) */
+            for(int t=0;t<N;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na; float*h2t=ms->h2+(size_t)t*H,*rt=ms->route+(size_t)t*H;
+                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size; float w=sw[a];
                     m3_mv_bf16(ms->exg,(uint16_t*)L->ex_w1[slot].w,h2t,c->moe_inter,H);
                     m3_mv_bf16(ms->exu,(uint16_t*)L->ex_w3[slot].w,h2t,c->moe_inter,H);
                     for(int i=0;i<c->moe_inter;i++) ms->exg[i]=m3_swiglu_oai(ms->exg[i],ms->exu[i],c->swiglu_alpha,c->swiglu_limit);
@@ -710,6 +728,9 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
             for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->tmp2[i];
         }
     }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, m->out_norm, H, c->norm_eps);
     int hrows=m->head.rows; m3_gemm_bf16(ms->logits,(uint16_t*)m->head.w,ms->h2,N,hrows,H);
     for(int t=0;t<N;t++){ float*lg=ms->logits+(size_t)t*hrows; int la=0; float bv=lg[0]; for(int i=1;i<hrows;i++) if(lg[i]>bv){bv=lg[i];la=i;}
