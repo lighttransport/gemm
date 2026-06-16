@@ -169,10 +169,10 @@ static m3_pool* m3_pool_create(int nthr){
         for(int c=0;c<512 && nc<M3_POOL_MAXT;c++) if(CPU_ISSET(c,&allowed)) cpus[nc++]=c;
     if(nc<1){ for(int c=0;c<M3_POOL_MAXT;c++) cpus[c]=c; nc=M3_POOL_MAXT; }
     if(nthr>nc) nthr=nc;
-    m3_pool *p=calloc(1,sizeof *p); p->nthr=nthr; atomic_store(&p->seq,0); p->stop=0;
+    m3_pool *p=m3_acalloc(1,sizeof *p); p->nthr=nthr; atomic_store(&p->seq,0); p->stop=0;
     for(int t=0;t<nthr;t++){ p->core[t]=cpus[t]; atomic_store(&p->wdone[t],0); }
     m3_pin(p->core[0]);
-    for(int t=1;t<nthr;t++){ m3_wctx *w=malloc(sizeof *w); w->p=p; w->tid=t;
+    for(int t=1;t<nthr;t++){ m3_wctx *w=m3_amalloc(sizeof *w); w->p=p; w->tid=t;
         int rc=pthread_create(&p->th[t],NULL,m3_worker,w);
         if(m3_pool_dbg) fprintf(stderr,"[pool] create worker %d rc=%d\n",t,rc); }
     if(m3_pool_dbg) fprintf(stderr,"[pool] created nthr=%d\n",nthr);
@@ -193,7 +193,7 @@ static void m3_pool_destroy(m3_pool *p){
                             p->nthr,(long)m3_dbg_disp,(long)m3_dbg_main,(long)m3_dbg_wrk);
     p->stop=1; atomic_fetch_add(&p->seq,1);
     for(int t=1;t<p->nthr;t++) pthread_join(p->th[t],NULL);
-    free(p);
+    m3_afree(p);
 }
 
 /* matvec worker: y[rows] = W[rows,cols](bf16) . x[cols], rows partitioned by 8-blocks */
@@ -293,23 +293,27 @@ static void m3_free(m3_model*m){
     if(m->pool){ if(m3_g_pool==m->pool) m3_g_pool=NULL; m3_pool_destroy(m->pool); m->pool=NULL; }
     for(int l=0;l<m->cfg.n_layers;l++){
         m3_layer*L=&m->layers[l];
-        free(L->input_norm);free(L->post_norm);
-        free(L->wq.w);free(L->wk.w);free(L->wv.w);free(L->wo.w);free(L->q_norm);free(L->k_norm);
-        free(L->k_cache);free(L->v_cache);
-        free(L->k_q4);free(L->v_q4);free(L->k_qs);free(L->v_qs);free(L->idx_q4);free(L->idx_qs);
+        m3_afree(L->input_norm);m3_afree(L->post_norm);
+        /* .scale (MXFP8 e8m0) is NULL for bf16 tensors; m3_afree() of NULL is a no-op */
+        m3_afree(L->wq.w);m3_afree(L->wq.scale);m3_afree(L->wk.w);m3_afree(L->wk.scale);m3_afree(L->wv.w);m3_afree(L->wv.scale);
+        m3_afree(L->wo.w);m3_afree(L->wo.scale);m3_afree(L->q_norm);m3_afree(L->k_norm);
+        m3_afree(L->k_cache);m3_afree(L->v_cache);
+        m3_afree(L->k_q4);m3_afree(L->v_q4);m3_afree(L->k_qs);m3_afree(L->v_qs);m3_afree(L->idx_q4);m3_afree(L->idx_qs);
         if(m3_is_moe(&m->cfg,l)){
-            free(L->idx_wq.w);free(L->idx_wk.w);free(L->idx_q_norm);free(L->idx_k_norm);free(L->idx_k_cache);
-            free(L->gate.w);free(L->gate_bias);free(L->sh_w1.w);free(L->sh_w3.w);free(L->sh_w2.w);
-            if(L->ex_w1){ for(int s=0;s<L->n_owned;s++){ free(L->ex_w1[s].w);free(L->ex_w3[s].w);free(L->ex_w2[s].w);} }
-            free(L->ex_w1);free(L->ex_w3);free(L->ex_w2);free(L->owned_eid);
-        } else { free(L->ff_gate.w);free(L->ff_up.w);free(L->ff_down.w); }
+            m3_afree(L->idx_wq.w);m3_afree(L->idx_wq.scale);m3_afree(L->idx_wk.w);m3_afree(L->idx_wk.scale);
+            m3_afree(L->idx_q_norm);m3_afree(L->idx_k_norm);m3_afree(L->idx_k_cache);
+            m3_afree(L->gate.w);m3_afree(L->gate_bias);
+            m3_afree(L->sh_w1.w);m3_afree(L->sh_w1.scale);m3_afree(L->sh_w3.w);m3_afree(L->sh_w3.scale);m3_afree(L->sh_w2.w);m3_afree(L->sh_w2.scale);
+            if(L->ex_w1){ for(int s=0;s<L->n_owned;s++){ m3_afree(L->ex_w1[s].w);m3_afree(L->ex_w1[s].scale);m3_afree(L->ex_w3[s].w);m3_afree(L->ex_w3[s].scale);m3_afree(L->ex_w2[s].w);m3_afree(L->ex_w2[s].scale);} }
+            m3_afree(L->ex_w1);m3_afree(L->ex_w3);m3_afree(L->ex_w2);m3_afree(L->owned_eid);
+        } else { m3_afree(L->ff_gate.w);m3_afree(L->ff_gate.scale);m3_afree(L->ff_up.w);m3_afree(L->ff_up.scale);m3_afree(L->ff_down.w);m3_afree(L->ff_down.scale); }
     }
-    free(m->layers);free(m->embed);free(m->head.w);free(m->out_norm);free(m->rope_cos);free(m->rope_sin);
-    free(m->s_norm);free(m->s_q);free(m->s_k);free(m->s_v);free(m->s_attn);free(m->s_o);
-    free(m->s_idx_q);free(m->s_idx_k);free(m->s_blk_score);free(m->s_blk_sel);
-    free(m->s_router);free(m->s_shg);free(m->s_shu);free(m->s_sh);free(m->s_moe);
-    free(m->s_exg);free(m->s_exu);free(m->s_route);free(m->s_ff_g);free(m->s_ff_u);free(m->s_ff);free(m->s_logits);
-    free(m);
+    m3_afree(m->layers);m3_afree(m->embed);m3_afree(m->head.w);m3_afree(m->out_norm);m3_afree(m->rope_cos);m3_afree(m->rope_sin);
+    m3_afree(m->s_norm);m3_afree(m->s_q);m3_afree(m->s_k);m3_afree(m->s_v);m3_afree(m->s_attn);m3_afree(m->s_o);
+    m3_afree(m->s_idx_q);m3_afree(m->s_idx_k);m3_afree(m->s_blk_score);m3_afree(m->s_blk_sel);
+    m3_afree(m->s_router);m3_afree(m->s_shg);m3_afree(m->s_shu);m3_afree(m->s_sh);m3_afree(m->s_moe);
+    m3_afree(m->s_exg);m3_afree(m->s_exu);m3_afree(m->s_route);m3_afree(m->s_ff_g);m3_afree(m->s_ff_u);m3_afree(m->s_ff);m3_afree(m->s_logits);
+    m3_afree(m);
 }
 
 /* init int4-KV / CP flags from env (call once after ep_rank/ep_size set, before m3_alloc_kv). */
@@ -326,18 +330,18 @@ static void m3_alloc_kv(m3_model*m,m3_layer*L,int is_moe,size_t*used){
     const m3_config*c=&m->cfg; int KVD=m3_kv_dim(c), KVH=c->n_kv_heads, ID=c->msa_index_dim;
     size_t ns=(size_t)m->cp_nslot;
     if(m->int4_kv){
-        L->k_q4=calloc(ns*(KVD/2),1); L->v_q4=calloc(ns*(KVD/2),1);
-        L->k_qs=calloc(ns*KVH,2);     L->v_qs=calloc(ns*KVH,2);
+        L->k_q4=m3_acalloc(ns*(KVD/2),1); L->v_q4=m3_acalloc(ns*(KVD/2),1);
+        L->k_qs=m3_acalloc(ns*KVH,2);     L->v_qs=m3_acalloc(ns*KVH,2);
         *used += 2*(ns*(KVD/2)+ns*KVH*2);
-        if(is_moe){ L->idx_q4=calloc(ns*(ID/2),1); L->idx_qs=calloc(ns,2); *used += ns*(ID/2)+ns*2; }
+        if(is_moe){ L->idx_q4=m3_acalloc(ns*(ID/2),1); L->idx_qs=m3_acalloc(ns,2); *used += ns*(ID/2)+ns*2; }
     } else {
-        L->k_cache=calloc(ns*KVD,2); L->v_cache=calloc(ns*KVD,2); *used += 2*ns*KVD*2;
-        if(is_moe){ L->idx_k_cache=calloc(ns*ID,2); *used += ns*ID*2; }
+        L->k_cache=m3_acalloc(ns*KVD,2); L->v_cache=m3_acalloc(ns*KVD,2); *used += 2*ns*KVD*2;
+        if(is_moe){ L->idx_k_cache=m3_acalloc(ns*ID,2); *used += ns*ID*2; }
     }
 }
 
 static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_threads,int n_cmgs){
-    m3_model*m=calloc(1,sizeof(m3_model)); if(!m) return NULL;
+    m3_model*m=m3_acalloc(1,sizeof(m3_model)); if(!m) return NULL;
     m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs;
     m->bf16_mv_qt=M3_BF16; m3_kv_init(m);
     const int H=cfg.hidden, QD=m3_q_dim(&cfg), KVD=m3_kv_dim(&cfg), HD=cfg.head_dim;
@@ -353,10 +357,10 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
     int hr0,hrows; if(tp_head) m3_shard(cfg.vocab,ep_rank,ep_size,&hr0,&hrows); else { hr0=0; hrows=cfg.vocab; }
     int er0,erows; if(tp_emb) m3_shard(cfg.vocab,ep_rank,ep_size,&er0,&erows); else { er0=0; erows=cfg.vocab; }
     size_t used=0;
-    #define BF(p,n,amp) do{ (p)=malloc((size_t)(n)*2); m3_fill_bf16((p),(n),(amp)); used+=(size_t)(n)*2; }while(0)
-    #define FZ(p,n,amp) do{ (p)=malloc((size_t)(n)*4); m3_fill_f32 ((p),(n),(amp)); used+=(size_t)(n)*4; }while(0)
+    #define BF(p,n,amp) do{ (p)=m3_amalloc((size_t)(n)*2); m3_fill_bf16((p),(n),(amp)); used+=(size_t)(n)*2; }while(0)
+    #define FZ(p,n,amp) do{ (p)=m3_amalloc((size_t)(n)*4); m3_fill_f32 ((p),(n),(amp)); used+=(size_t)(n)*4; }while(0)
 
-    m->rope_cos=malloc((size_t)cfg.max_pos*half*4); m->rope_sin=malloc((size_t)cfg.max_pos*half*4);
+    m->rope_cos=m3_amalloc((size_t)cfg.max_pos*half*4); m->rope_sin=m3_amalloc((size_t)cfg.max_pos*half*4);
     for(int p=0;p<cfg.max_pos;p++) for(int k=0;k<half;k++){
         double invf=pow((double)cfg.rope_theta,-2.0*k/(double)cfg.rotary_dim); double a=p*invf;
         m->rope_cos[(size_t)p*half+k]=(float)cos(a); m->rope_sin[(size_t)p*half+k]=(float)sin(a); }
@@ -365,7 +369,7 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
     uint16_t*hd; BF(hd,(size_t)hrows*H,0.05f); m->head.w=hd; m->head.type=M3_BF16; m->head.rows=hrows; m->head.cols=H; m->head_r0=hr0;
     BF(m->out_norm,H,0.1f);
 
-    m->layers=calloc(cfg.n_layers,sizeof(m3_layer));
+    m->layers=m3_acalloc(cfg.n_layers,sizeof(m3_layer));
     for(int l=0;l<cfg.n_layers;l++){
         m3_layer*L=&m->layers[l]; int is_moe=m3_is_moe(&cfg,l);
         BF(L->input_norm,H,0.1f); BF(L->post_norm,H,0.1f);
@@ -390,8 +394,8 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
             BF(p,(size_t)H*sh_rows,0.03f); L->sh_w2=(m3_tensor){p,NULL,M3_BF16,H,sh_rows};
             L->sh_r0=sh_r0; L->sh_rows=sh_rows;
             int no=m3_n_owned(cfg.n_experts,ep_rank,ep_size);
-            L->n_owned=no; L->owned_eid=malloc((size_t)(no>0?no:1)*sizeof(int));
-            L->ex_w1=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w3=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w2=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor));
+            L->n_owned=no; L->owned_eid=m3_amalloc((size_t)(no>0?no:1)*sizeof(int));
+            L->ex_w1=m3_amalloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w3=m3_amalloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w2=m3_amalloc((size_t)(no>0?no:1)*sizeof(m3_tensor));
             int s=0; for(int e=0;e<cfg.n_experts;e++) if(e%ep_size==ep_rank){ L->owned_eid[s]=e;
                 BF(p,(size_t)cfg.moe_inter*H,0.03f); L->ex_w1[s]=(m3_tensor){p,NULL,M3_BF16,cfg.moe_inter,H};
                 BF(p,(size_t)cfg.moe_inter*H,0.03f); L->ex_w3[s]=(m3_tensor){p,NULL,M3_BF16,cfg.moe_inter,H};
@@ -403,14 +407,14 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
             L->ff_r0=ff_r0; L->ff_rows=ff_rows;
         }
     }
-    m->s_norm=malloc(H*4); m->s_q=malloc(QD*4); m->s_k=malloc(KVD*4); m->s_v=malloc(KVD*4);
-    m->s_attn=malloc(QD*4); m->s_o=malloc(H*4);
-    m->s_idx_q=malloc((size_t)IQD*4); m->s_idx_k=malloc((size_t)ID*4);
-    m->s_blk_score=malloc((size_t)cfg.max_pos*4); m->s_blk_sel=malloc((size_t)cfg.max_pos*sizeof(int));
-    m->s_router=malloc((size_t)cfg.n_experts*4); m->s_shg=malloc(cfg.moe_inter*4); m->s_shu=malloc(cfg.moe_inter*4);
-    m->s_sh=malloc(H*4); m->s_moe=malloc(H*4); m->s_exg=malloc(cfg.moe_inter*4); m->s_exu=malloc(cfg.moe_inter*4); m->s_route=malloc(H*4);
-    m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
-    m->s_logits=malloc((size_t)hrows*4);
+    m->s_norm=m3_amalloc(H*4); m->s_q=m3_amalloc(QD*4); m->s_k=m3_amalloc(KVD*4); m->s_v=m3_amalloc(KVD*4);
+    m->s_attn=m3_amalloc(QD*4); m->s_o=m3_amalloc(H*4);
+    m->s_idx_q=m3_amalloc((size_t)IQD*4); m->s_idx_k=m3_amalloc((size_t)ID*4);
+    m->s_blk_score=m3_amalloc((size_t)cfg.max_pos*4); m->s_blk_sel=m3_amalloc((size_t)cfg.max_pos*sizeof(int));
+    m->s_router=m3_amalloc((size_t)cfg.n_experts*4); m->s_shg=m3_amalloc(cfg.moe_inter*4); m->s_shu=m3_amalloc(cfg.moe_inter*4);
+    m->s_sh=m3_amalloc(H*4); m->s_moe=m3_amalloc(H*4); m->s_exg=m3_amalloc(cfg.moe_inter*4); m->s_exu=m3_amalloc(cfg.moe_inter*4); m->s_route=m3_amalloc(H*4);
+    m->s_ff_g=m3_amalloc(cfg.dense_inter*4); m->s_ff_u=m3_amalloc(cfg.dense_inter*4); m->s_ff=m3_amalloc(H*4);
+    m->s_logits=m3_amalloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
     m3_init_fp8_lut(m->fp8_lut);
     m3_dummy=m3_envi("M3_DUMMY",0);
@@ -426,11 +430,11 @@ typedef struct { char name[300]; uint64_t off; size_t nbytes; int f32; int nd; l
 static m3_ent* m3_find(m3_ent*es,int n,const char*nm){ for(int i=0;i<n;i++) if(!strcmp(es[i].name,nm)) return &es[i]; return NULL; }
 static m3_ent* m3_req(m3_ent*es,int n,const char*nm){ m3_ent*e=m3_find(es,n,nm); if(!e) fprintf(stderr,"m3_load: MISSING tensor %s\n",nm); return e; }
 /* copy helpers from the blob mmap (base); return malloc'd buffer (caller frees). */
-static void* m3_cp_full(const uint8_t*base,const m3_ent*e){ void*d=malloc(e->nbytes); memcpy(d,base+e->off,e->nbytes); return d; }
+static void* m3_cp_full(const uint8_t*base,const m3_ent*e){ void*d=m3_amalloc(e->nbytes); memcpy(d,base+e->off,e->nbytes); return d; }
 static void* m3_cp_rows(const uint8_t*base,const m3_ent*e,int r0,int nrows,int cols,int esz){
-    size_t rb=(size_t)cols*esz; void*d=malloc((size_t)nrows*rb); memcpy(d,base+e->off+(size_t)r0*rb,(size_t)nrows*rb); return d; }
+    size_t rb=(size_t)cols*esz; void*d=m3_amalloc((size_t)nrows*rb); memcpy(d,base+e->off+(size_t)r0*rb,(size_t)nrows*rb); return d; }
 static void* m3_cp_cols(const uint8_t*base,const m3_ent*e,int Rtot,int c0,int ncols,int Ctot,int esz){
-    void*d=malloc((size_t)Rtot*ncols*esz); uint8_t*dp=d; const uint8_t*sp=base+e->off;
+    void*d=m3_amalloc((size_t)Rtot*ncols*esz); uint8_t*dp=d; const uint8_t*sp=base+e->off;
     for(int r=0;r<Rtot;r++) memcpy(dp+(size_t)r*ncols*esz, sp+((size_t)r*Ctot+c0)*esz, (size_t)ncols*esz); return d; }
 
 /* Load weight `name` (bf16, or MXFP8 if a `name_scale_inv` companion exists) with TP slicing.
@@ -450,7 +454,8 @@ static m3_tensor m3_load_w(m3_ent*es,int n,const uint8_t*base,const char*name,in
     if(se){ int sc=Ctot/M3_MX_BLK;
         if(mode==0) t.scale=(uint8_t*)m3_cp_full(base,se);
         else if(mode==1) t.scale=(uint8_t*)m3_cp_rows(base,se,r0,nr,sc,1);
-        else t.scale=(uint8_t*)m3_cp_cols(base,se,Rtot,c0/M3_MX_BLK,nc/M3_MX_BLK,sc,1); }
+        else { if((c0%M3_MX_BLK)||(nc%M3_MX_BLK)){ fprintf(stderr,"m3_load: MXFP8 col-shard %s not 32-aligned (c0=%d nc=%d); ep_size must divide the dim into multiples of %d\n",name,c0,nc,M3_MX_BLK); *ok=0; return t; }
+               t.scale=(uint8_t*)m3_cp_cols(base,se,Rtot,c0/M3_MX_BLK,nc/M3_MX_BLK,sc,1); } }
     return t;
 }
 
@@ -462,7 +467,7 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     else { const char*e=getenv("M3_STAGE_DIR"); snprintf(bdir,sizeof bdir,"%s",(e&&*e)?e:"/local/m3"); }
     char bp[1100],mp[1100]; snprintf(bp,sizeof bp,"%s/rank%02d.blob",bdir,ep_rank); snprintf(mp,sizeof mp,"%s/rank%02d.manifest",bdir,ep_rank);
     FILE*mf=fopen(mp,"r"); if(!mf){ fprintf(stderr,"m3_load: cannot open %s\n",mp); return NULL; }
-    char line[1024]; int cap=4096,n=0; m3_ent*es=malloc((size_t)cap*sizeof(m3_ent));
+    char line[1024]; int cap=4096,n=0; m3_ent*es=m3_amalloc((size_t)cap*sizeof(m3_ent));
     while(fgets(line,sizeof line,mf)){
         if(line[0]=='#'||line[0]=='\n') continue;
         if(n>=cap){ cap*=2; es=realloc(es,(size_t)cap*sizeof(m3_ent)); }
@@ -472,12 +477,12 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
         while(line[pos]==' ')pos++; char*nl=strchr(line+pos,'\n'); if(nl)*nl=0; snprintf(e->name,sizeof e->name,"%s",line+pos); n++;
     }
     fclose(mf);
-    int bfd=open(bp,O_RDONLY); if(bfd<0){ fprintf(stderr,"m3_load: cannot open %s\n",bp); free(es); return NULL; }
+    int bfd=open(bp,O_RDONLY); if(bfd<0){ fprintf(stderr,"m3_load: cannot open %s\n",bp); m3_afree(es); return NULL; }
     struct stat sb; fstat(bfd,&sb); size_t bsz=sb.st_size;
     const uint8_t*base=mmap(NULL,bsz,PROT_READ,MAP_PRIVATE,bfd,0);
-    if(base==MAP_FAILED){ fprintf(stderr,"m3_load: mmap failed\n"); close(bfd); free(es); return NULL; }
+    if(base==MAP_FAILED){ fprintf(stderr,"m3_load: mmap failed\n"); close(bfd); m3_afree(es); return NULL; }
 
-    m3_model*m=calloc(1,sizeof(m3_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=M3_BF16; m3_kv_init(m);
+    m3_model*m=m3_acalloc(1,sizeof(m3_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=M3_BF16; m3_kv_init(m);
     const int H=cfg.hidden, QD=m3_q_dim(&cfg), KVD=m3_kv_dim(&cfg), HD=cfg.head_dim;
     const int IQD=m3_idx_q_dim(&cfg), ID=cfg.msa_index_dim, half=cfg.rotary_dim/2;
     int tp=m3_envi("M3_TP",0);
@@ -491,7 +496,7 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     #define REQ(nm) ({ m3_ent*_e=m3_req(es,n,(nm)); if(!_e){ ok=0; } _e; })
     char nb[512];
 
-    m->rope_cos=malloc((size_t)cfg.max_pos*half*4); m->rope_sin=malloc((size_t)cfg.max_pos*half*4);
+    m->rope_cos=m3_amalloc((size_t)cfg.max_pos*half*4); m->rope_sin=m3_amalloc((size_t)cfg.max_pos*half*4);
     for(int p=0;p<cfg.max_pos;p++) for(int k=0;k<half;k++){ double invf=pow((double)cfg.rope_theta,-2.0*k/(double)cfg.rotary_dim),a=p*invf;
         m->rope_cos[(size_t)p*half+k]=(float)cos(a); m->rope_sin[(size_t)p*half+k]=(float)sin(a); }
 
@@ -499,7 +504,7 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     { m3_ent*e=REQ("language_model.lm_head.weight"); if(e){ m->head.w=m3_cp_rows(base,e,hr0,hrows,H,2); used+=(size_t)hrows*H*2; } m->head.type=M3_BF16; m->head.rows=hrows; m->head.cols=H; m->head_r0=hr0; }
     { m3_ent*e=REQ("language_model.model.norm.weight"); if(e) m->out_norm=m3_cp_full(base,e); }
 
-    m->layers=calloc(cfg.n_layers,sizeof(m3_layer));
+    m->layers=m3_acalloc(cfg.n_layers,sizeof(m3_layer));
     for(int l=0;l<cfg.n_layers&&ok;l++){
         m3_layer*L=&m->layers[l]; int is_moe=m3_is_moe(&cfg,l);
         #define LN(suf) (snprintf(nb,sizeof nb,"language_model.model.layers.%d." suf,l),nb)
@@ -525,8 +530,8 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
             L->sh_w2=m3_load_w(es,n,base,LN("block_sparse_moe.shared_experts.down_proj.weight"),2,0,0,sh_r0,sh_rows,H,cfg.moe_inter,&ok,&used);
             L->sh_r0=sh_r0; L->sh_rows=sh_rows;
             int no=m3_n_owned(cfg.n_experts,ep_rank,ep_size); L->n_owned=no;
-            L->owned_eid=malloc((size_t)(no>0?no:1)*sizeof(int));
-            L->ex_w1=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w3=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w2=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor));
+            L->owned_eid=m3_amalloc((size_t)(no>0?no:1)*sizeof(int));
+            L->ex_w1=m3_amalloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w3=m3_amalloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w2=m3_amalloc((size_t)(no>0?no:1)*sizeof(m3_tensor));
             int s=0; for(int e2=0;e2<cfg.n_experts&&ok;e2++) if(e2%ep_size==ep_rank){ L->owned_eid[s]=e2;
                 snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w1.weight",l,e2); L->ex_w1[s]=m3_load_w(es,n,base,nb,0,0,0,0,0,cfg.moe_inter,H,&ok,&used);
                 snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w3.weight",l,e2); L->ex_w3[s]=m3_load_w(es,n,base,nb,0,0,0,0,0,cfg.moe_inter,H,&ok,&used);
@@ -541,17 +546,17 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
         #undef LN
     }
     #undef REQ
-    munmap((void*)base,bsz); close(bfd); free(es);
+    munmap((void*)base,bsz); close(bfd); m3_afree(es);
     if(!ok){ fprintf(stderr,"m3_load: rank %d incomplete (missing tensors)\n",ep_rank); m3_free(m); return NULL; }
     /* scratch (same as synth) */
-    m->s_norm=malloc(H*4); m->s_q=malloc(QD*4); m->s_k=malloc(KVD*4); m->s_v=malloc(KVD*4);
-    m->s_attn=malloc(QD*4); m->s_o=malloc(H*4);
-    m->s_idx_q=malloc((size_t)IQD*4); m->s_idx_k=malloc((size_t)ID*4);
-    m->s_blk_score=malloc((size_t)cfg.max_pos*4); m->s_blk_sel=malloc((size_t)cfg.max_pos*sizeof(int));
-    m->s_router=malloc((size_t)cfg.n_experts*4); m->s_shg=malloc(cfg.moe_inter*4); m->s_shu=malloc(cfg.moe_inter*4);
-    m->s_sh=malloc(H*4); m->s_moe=malloc(H*4); m->s_exg=malloc(cfg.moe_inter*4); m->s_exu=malloc(cfg.moe_inter*4); m->s_route=malloc(H*4);
-    m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
-    m->s_logits=malloc((size_t)hrows*4);
+    m->s_norm=m3_amalloc(H*4); m->s_q=m3_amalloc(QD*4); m->s_k=m3_amalloc(KVD*4); m->s_v=m3_amalloc(KVD*4);
+    m->s_attn=m3_amalloc(QD*4); m->s_o=m3_amalloc(H*4);
+    m->s_idx_q=m3_amalloc((size_t)IQD*4); m->s_idx_k=m3_amalloc((size_t)ID*4);
+    m->s_blk_score=m3_amalloc((size_t)cfg.max_pos*4); m->s_blk_sel=m3_amalloc((size_t)cfg.max_pos*sizeof(int));
+    m->s_router=m3_amalloc((size_t)cfg.n_experts*4); m->s_shg=m3_amalloc(cfg.moe_inter*4); m->s_shu=m3_amalloc(cfg.moe_inter*4);
+    m->s_sh=m3_amalloc(H*4); m->s_moe=m3_amalloc(H*4); m->s_exg=m3_amalloc(cfg.moe_inter*4); m->s_exu=m3_amalloc(cfg.moe_inter*4); m->s_route=m3_amalloc(H*4);
+    m->s_ff_g=m3_amalloc(cfg.dense_inter*4); m->s_ff_u=m3_amalloc(cfg.dense_inter*4); m->s_ff=m3_amalloc(H*4);
+    m->s_logits=m3_amalloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
     m3_init_fp8_lut(m->fp8_lut);
     m3_dummy=m3_envi("M3_DUMMY",0);
@@ -822,31 +827,31 @@ static void m3_gemm(m3_model*m, float*restrict Y, const m3_tensor*t, const float
 
 static void m3_free_mstream(m3_model*m){
     m3_mstream*ms=(m3_mstream*)m->ms; if(!ms) return;
-    free(ms->kc);free(ms->vc);free(ms->xn);free(ms->q);free(ms->k);free(ms->v);free(ms->attn);free(ms->o);
-    free(ms->h2);free(ms->router);free(ms->route);free(ms->shg);free(ms->shu);free(ms->ffg);free(ms->ffu);
-    free(ms->tmp2);free(ms->exg);free(ms->exu);free(ms->emoe);free(ms->bk);free(ms->bw);free(ms->bcnt);free(ms->logits);free(ms->sc);
-    free(ms->psel);free(ms->pnsel);free(ms->gsel);free(ms->gselw);
-    free(ms); m->ms=NULL;
+    m3_afree(ms->kc);m3_afree(ms->vc);m3_afree(ms->xn);m3_afree(ms->q);m3_afree(ms->k);m3_afree(ms->v);m3_afree(ms->attn);m3_afree(ms->o);
+    m3_afree(ms->h2);m3_afree(ms->router);m3_afree(ms->route);m3_afree(ms->shg);m3_afree(ms->shu);m3_afree(ms->ffg);m3_afree(ms->ffu);
+    m3_afree(ms->tmp2);m3_afree(ms->exg);m3_afree(ms->exu);m3_afree(ms->emoe);m3_afree(ms->bk);m3_afree(ms->bw);m3_afree(ms->bcnt);m3_afree(ms->logits);m3_afree(ms->sc);
+    m3_afree(ms->psel);m3_afree(ms->pnsel);m3_afree(ms->gsel);m3_afree(ms->gselw);
+    m3_afree(ms); m->ms=NULL;
 }
 /* per_stream_kv=1: multi-stream decode (own KV per stream). 0: chunked prefill (shared model
  * KV cache; allocate per-token MSA selection buffers psel/pnsel instead). */
 static int m3_alloc_mstream_ex(m3_model*m,int N,int per_stream_kv){
     const m3_config*c=&m->cfg; int H=c->hidden,QD=m3_q_dim(c),KVD=m3_kv_dim(c),hrows=m->head.rows;
-    m3_mstream*ms=calloc(1,sizeof *ms); if(!ms) return -1; ms->n=N;
+    m3_mstream*ms=m3_acalloc(1,sizeof *ms); if(!ms) return -1; ms->n=N;
     size_t per=(size_t)c->n_layers*c->max_pos*KVD;
-    if(per_stream_kv){ ms->kc=calloc((size_t)N*per,2); ms->vc=calloc((size_t)N*per,2); }
+    if(per_stream_kv){ ms->kc=m3_acalloc((size_t)N*per,2); ms->vc=m3_acalloc((size_t)N*per,2); }
     else { ms->maxsel=(c->msa_topk_blocks+c->msa_local_block+c->msa_init_block+1)*c->msa_block_size;
-           ms->psel=malloc((size_t)N*ms->maxsel*sizeof(int)); ms->pnsel=malloc((size_t)N*sizeof(int));
-           ms->gsel=malloc((size_t)N*8*sizeof(int)); ms->gselw=malloc((size_t)N*8*sizeof(float)); }
-    ms->xn=malloc((size_t)N*H*4); ms->q=malloc((size_t)N*QD*4); ms->k=malloc((size_t)N*KVD*4); ms->v=malloc((size_t)N*KVD*4);
-    ms->attn=malloc((size_t)N*QD*4); ms->o=malloc((size_t)N*H*4); ms->h2=malloc((size_t)N*H*4);
-    ms->router=malloc((size_t)N*c->n_experts*4); ms->route=malloc((size_t)N*H*4);
-    ms->shg=malloc((size_t)N*c->moe_inter*4); ms->shu=malloc((size_t)N*c->moe_inter*4);
-    ms->ffg=malloc((size_t)N*c->dense_inter*4); ms->ffu=malloc((size_t)N*c->dense_inter*4);
-    ms->tmp2=malloc((size_t)N*H*4);
-    ms->exg=malloc((size_t)c->moe_inter*4); ms->exu=malloc((size_t)c->moe_inter*4); ms->emoe=malloc((size_t)H*4);
-    ms->bk=malloc((size_t)c->n_experts*N*sizeof(int)); ms->bw=malloc((size_t)c->n_experts*N*4); ms->bcnt=malloc((size_t)c->n_experts*sizeof(int));
-    ms->logits=malloc((size_t)N*hrows*4); ms->sc=malloc((size_t)N*c->max_pos*4);
+           ms->psel=m3_amalloc((size_t)N*ms->maxsel*sizeof(int)); ms->pnsel=m3_amalloc((size_t)N*sizeof(int));
+           ms->gsel=m3_amalloc((size_t)N*8*sizeof(int)); ms->gselw=m3_amalloc((size_t)N*8*sizeof(float)); }
+    ms->xn=m3_amalloc((size_t)N*H*4); ms->q=m3_amalloc((size_t)N*QD*4); ms->k=m3_amalloc((size_t)N*KVD*4); ms->v=m3_amalloc((size_t)N*KVD*4);
+    ms->attn=m3_amalloc((size_t)N*QD*4); ms->o=m3_amalloc((size_t)N*H*4); ms->h2=m3_amalloc((size_t)N*H*4);
+    ms->router=m3_amalloc((size_t)N*c->n_experts*4); ms->route=m3_amalloc((size_t)N*H*4);
+    ms->shg=m3_amalloc((size_t)N*c->moe_inter*4); ms->shu=m3_amalloc((size_t)N*c->moe_inter*4);
+    ms->ffg=m3_amalloc((size_t)N*c->dense_inter*4); ms->ffu=m3_amalloc((size_t)N*c->dense_inter*4);
+    ms->tmp2=m3_amalloc((size_t)N*H*4);
+    ms->exg=m3_amalloc((size_t)c->moe_inter*4); ms->exu=m3_amalloc((size_t)c->moe_inter*4); ms->emoe=m3_amalloc((size_t)H*4);
+    ms->bk=m3_amalloc((size_t)c->n_experts*N*sizeof(int)); ms->bw=m3_amalloc((size_t)c->n_experts*N*4); ms->bcnt=m3_amalloc((size_t)c->n_experts*sizeof(int));
+    ms->logits=m3_amalloc((size_t)N*hrows*4); ms->sc=m3_amalloc((size_t)N*c->max_pos*4);
     int kvok = per_stream_kv ? (ms->kc&&ms->vc) : (ms->psel&&ms->pnsel);
     if(!kvok||!ms->logits){ m->ms=ms; m3_free_mstream(m); return -1; }
     m->ms=ms; return 0;

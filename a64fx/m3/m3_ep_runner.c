@@ -253,7 +253,7 @@ int main(void){
         utofu_set_vcq_id_path(&PeerVcq[r],NULL);
         rc=utofu_query_stadd(PeerVcq[r],RUN_STAG,&PeerBase[r]); if(rc!=UTOFU_SUCCESS) die("utofu_query_stadd(peer)",rc);
     }
-    free(tni_ids);
+    m3_afree(tni_ids);
     barrier_robust(1);
 
     static tp_comm comm;
@@ -261,7 +261,7 @@ int main(void){
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
     if(m->cp_on){   /* context-parallel KV: provide the cross-rank block-score MAX + flash-combine */
-        g_kvbuf=(float*)malloc((size_t)(cfg.n_heads + cfg.n_heads*cfg.head_dim)*sizeof(float));
+        g_kvbuf=(float*)m3_amalloc((size_t)(cfg.n_heads + cfg.n_heads*cfg.head_dim)*sizeof(float));
         m->blk_reduce_cb=ep_blk_reduce; m->blk_reduce_ctx=&comm;
         m->kv_combine_cb=ep_kv_combine; m->kv_combine_ctx=&comm;
         if(MyRank==0) logmsg("CP ON: KV sharded block-cyclic (block=%d) over %d ranks, %d slots/rank, int4_kv=%d\n",
@@ -277,7 +277,7 @@ int main(void){
     barrier_robust(1);
     if(MyRank==0) logmsg("all %d ranks past bootstrap barrier; starting prefill\n",N);
 
-    int C=cfg.hidden; float*x=(float*)aligned_alloc(256,(size_t)C*4);
+    int C=cfg.hidden; float*x=(float*)m3_amalloc((size_t)C*4);
 
     /* ---- M3_MSTREAM=N: batched multi-stream decode (synthetic) -> aggregate tok/s ----
      * N concurrent streams per forward: dense GEMMs M=N + ONE EP all-reduce per layer for
@@ -286,8 +286,8 @@ int main(void){
     if(mstream>1){
         int NS=mstream;
         if(m3_alloc_mstream(m,NS)) die("alloc_mstream",-1);
-        float*X=(float*)aligned_alloc(64,(size_t)NS*C*4);
-        int*pos=(int*)malloc((size_t)NS*sizeof(int)),*out=(int*)malloc((size_t)NS*sizeof(int));
+        float*X=(float*)m3_amalloc((size_t)NS*C*4);
+        int*pos=(int*)m3_amalloc((size_t)NS*sizeof(int)),*out=(int*)m3_amalloc((size_t)NS*sizeof(int));
         if(prefill+maxgen+8>cfg.max_pos){ if(MyRank==0) logmsg("mstream: maxpos too small\n"); }
         sm_state=0xD3F00D; for(int t=0;t<NS;t++) pos[t]=0;
         for(int g=0;g<4;g++){ for(int i=0;i<NS*C;i++) X[i]=(float)(sm_next()*0.2-0.1); m3_forward_batch_decode(m,X,NS,pos,out); for(int t=0;t<NS;t++) pos[t]++; }
@@ -303,7 +303,7 @@ int main(void){
                    maxgen, dt/maxgen*1e3, (double)maxgen*NS/dt, (double)maxgen/dt, 100.0*ar/dt, out[0], nan);
             logmsg("SENTINEL m3_mstream_%dn_N%d=done\n",N,NS);
         }
-        free(X);free(pos);free(out); free(x); m3_free(m); return 0;
+        m3_afree(X);m3_afree(pos);m3_afree(out); m3_afree(x); m3_free(m); return 0;
     }
 
     /* ---- gen-mode: M3_PROMPT_IDS set -> real prompt prefill + greedy decode ----
@@ -314,7 +314,7 @@ int main(void){
     if(prompt_file&&*prompt_file){
         int max_new=envi("M3_MAX_NEW",64);
         FILE*pf=fopen(prompt_file,"r"); if(!pf) die("cannot open M3_PROMPT_IDS",-1);
-        int cap=1024,n_prompt=0,*prompt=malloc((size_t)cap*sizeof(int)),v;
+        int cap=1024,n_prompt=0,*prompt=m3_amalloc((size_t)cap*sizeof(int)),v;
         while(fscanf(pf,"%d",&v)==1){ if(n_prompt>=cap){cap*=2;prompt=realloc(prompt,(size_t)cap*sizeof(int));} prompt[n_prompt++]=v; }
         fclose(pf); if(n_prompt<1) die("empty prompt",-1);
         if(n_prompt+max_new>cfg.max_pos) max_new=cfg.max_pos-n_prompt;
@@ -323,15 +323,15 @@ int main(void){
         int pchunk=envi("M3_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=S) */
         if(pchunk>0){
             if(m3_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
-            float*Xc=(float*)malloc((size_t)pchunk*C*4);
+            float*Xc=(float*)m3_amalloc((size_t)pchunk*C*4);
             for(int p0=0;p0<n_prompt;p0+=pchunk){ int S=n_prompt-p0; if(S>pchunk)S=pchunk;
                 for(int t=0;t<S;t++) embed_lookup(m,prompt[p0+t],Xc+(size_t)t*C);
                 pf_last=m3_forward_prefill_chunk(m,Xc,S,p0); }
-            free(Xc); m3_free_mstream(m);
+            m3_afree(Xc); m3_free_mstream(m);
             if(MyRank==0) logmsg("prefill: chunked M=%d\n",pchunk);
         } else
         for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=m3_forward_token(m,x,p); }
-        int *gen=malloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
+        int *gen=m3_amalloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
         double td0=now_sec();
         for(int g=0;g<max_new;g++){ gen[ng++]=cur; if(cur==M3_EOS_ID) break;
             embed_lookup(m,cur,x); cur=m3_forward_token(m,x,n_prompt+g);
@@ -346,7 +346,7 @@ int main(void){
             if(gen_out&&*gen_out){ FILE*gf=fopen(gen_out,"w"); if(gf){ for(int i=0;i<ng;i++) fprintf(gf,"%d%s",gen[i],i+1<ng?" ":"\n"); fclose(gf); logmsg("gen: wrote %d ids to %s\n",ng,gen_out);} }
             logmsg("SENTINEL m3_gen_%dn=done\n",N);
         }
-        free(gen); free(prompt); free(x); m3_free(m); return 0;
+        m3_afree(gen); m3_afree(prompt); m3_afree(x); m3_free(m); return 0;
     }
 
     /* ---- prefill (synthetic, identical activations on every rank) ---- */
@@ -382,6 +382,6 @@ int main(void){
         logmsg("last argmax=%d  NaNs=%d  RSS=%.2f GB\n",last,nan_count,rss_bytes()/1e9);
         logmsg("SENTINEL m3_ep_%dn=%s\n",N,nan_count==0?"done":"NAN");
     }
-    free(x); m3_free(m);
+    m3_afree(x); m3_free(m);
     return 0;
 }

@@ -38,18 +38,18 @@ int main(void){
     if(!m){ printf("FAIL: m3_load_real returned NULL (missing/short tensors)\n"); return 1; }
     printf("load OK: %.1fs  arena_used=%.2f GB\n", now_sec()-t0, m->arena_used/1e9);
 
-    float*x=malloc((size_t)c.hidden*4); int nan=0, argmax=0; double xn=0;
+    float*x=m3_amalloc((size_t)c.hidden*4); int nan=0, argmax=0; double xn=0;
     int pchunk=envi("M3_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=pchunk) */
     /* deterministic pseudo-embeddings as input activations (no tokenizer here) */
     m3_sm=0xABCDEF;
     double tp=now_sec();
     if(pchunk>0){
         if(m3_alloc_mstream_ex(m,pchunk,0)){ printf("FAIL: alloc prefill\n"); return 1; }
-        float*X=malloc((size_t)prefill*c.hidden*4);
+        float*X=m3_amalloc((size_t)prefill*c.hidden*4);
         for(int p=0;p<prefill;p++) for(int i=0;i<c.hidden;i++) X[(size_t)p*c.hidden+i]=(float)(m3_sm_next()*0.2-0.1);
         for(int p0=0;p0<prefill;p0+=pchunk){ int S=prefill-p0; if(S>pchunk)S=pchunk; argmax=m3_forward_prefill_chunk(m,X+(size_t)p0*c.hidden,S,p0); }
         for(size_t i=0;i<(size_t)prefill*c.hidden;i++){ if(!(X[i]==X[i]))nan++; xn+=(double)X[i]*X[i]; }
-        free(X); m3_free_mstream(m);
+        m3_afree(X); m3_free_mstream(m);
         printf("prefill(chunked M=%d) argmax=%d  ||x||=%.3e\n", pchunk, argmax, sqrt(xn));
     } else
     for(int p=0;p<prefill;p++){ for(int i=0;i<c.hidden;i++) x[i]=(float)(m3_sm_next()*0.2-0.1);
@@ -62,6 +62,6 @@ int main(void){
     double dt=now_sec()-td;
     printf("prefill %d tok %.2f tok/s  decode %d tok %.2f tok/s\n", prefill, prefill/pf, decode, decode/dt);
     printf("last argmax=%d  ||x||=%.3e  NaNs=%d  %s\n", last, sqrt(xn), nan, nan==0?"OK":"FAIL");
-    free(x); m3_free(m);
+    m3_afree(x); m3_free(m);
     return nan==0?0:1;
 }
