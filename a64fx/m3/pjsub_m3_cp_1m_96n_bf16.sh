@@ -29,9 +29,9 @@ echo "=== M3 CP+int4 1M 96n bf16-KV (4x4x3): NP=$NP job=${PJM_JOBID:-?} $(date) 
 make -C "$UTOFU" tofu_topo_helper >/dev/null || exit 3
 make -C "$LLM" m3_stage m3_ep_runner CC=fcc OPENMP=1 >/dev/null || exit 3
 topo_ok=0
-for t in 1 2 3 4 5; do rm -f tofu_topo.txt
+for t in $(seq 1 40); do rm -f tofu_topo.txt
   if mpiexec -np "$NP" "$UTOFU/tofu_topo_helper" && [ "$(wc -l < tofu_topo.txt 2>/dev/null || echo 0)" -ge "$NP" ]; then topo_ok=1; break; fi
-  echo "[cp] topo try $t (1907?)"; sleep 3; done
+  echo "[cp] topo try $t (1907 episode?)"; sleep 20; done
 [ "$topo_ok" = 1 ] || { echo "FATAL topo"; exit 3; }
 
 echo "--- staging MXFP8 ($(date)) ---"
