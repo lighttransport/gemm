@@ -10,7 +10,7 @@
 # Submit: ssh fugaku 'cd ~/work/gemm/ds4p && pjsub --no-check-directory a64fx/m3/pjsub_m3_cp_smoke_4n.sh'
 
 #PJM -g hp250467
-#PJM -L "rscgrp=small,node=2x2:torus,elapse=00:30:00"
+#PJM -L "rscgrp=small,node=4,elapse=00:30:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
 #PJM --mpi "proc=4"
 #PJM -j
@@ -25,9 +25,11 @@ export LLM_THREADS=12 OMP_NUM_THREADS=12
 echo "=== CP smoke 4n (synthetic): $(date) ==="
 make -C "$UTOFU" tofu_topo_helper >/dev/null || exit 3
 make -C "$LLM" m3_ep_runner CC=fcc OPENMP=1 >/dev/null || exit 3
-for t in 1 2 3 4 5; do rm -f tofu_topo.txt
-  if mpiexec -np $NP "$UTOFU/tofu_topo_helper" && [ "$(wc -l < tofu_topo.txt 2>/dev/null||echo 0)" -ge $NP ]; then break; fi
-  echo "topo try $t"; sleep 3; done
+topo_ok=0
+for t in $(seq 1 12); do rm -f tofu_topo.txt
+  if mpiexec -np $NP "$UTOFU/tofu_topo_helper" && [ "$(wc -l < tofu_topo.txt 2>/dev/null||echo 0)" -ge $NP ]; then topo_ok=1; break; fi
+  echo "topo try $t (1907?)"; sleep 8; done
+[ "$topo_ok" = 1 ] || { echo "FATAL topo (1907 persistent)"; exit 3; }
 
 for KV in "noCP M3_CP=0 M3_INT4_KV=0" "CP-bf16 M3_CP=1 M3_INT4_KV=0" "CP-int4 M3_CP=1 M3_INT4_KV=1"; do
   set -- $KV; lbl=$1; shift
