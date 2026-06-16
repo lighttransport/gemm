@@ -26,7 +26,14 @@ import termios
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 VERSION = "1.0"
 
