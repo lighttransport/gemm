@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "m3_mxfp8.h"
+#include "ggml_dequant.h"   /* matvec_bf16_8row for the decode-once (multi-stream) path */
 
 static uint64_t sm=0x1234; static double sn(void){ sm+=0x9E3779B97F4A7C15ull; uint64_t z=sm;
     z=(z^(z>>30))*0xBF58476D1CE4E5B9ull; z=(z^(z>>27))*0x94D049BB133111EBull; z^=z>>31; return (double)(z>>11)/(double)(1ull<<53); }
@@ -26,5 +27,16 @@ int main(void){
         printf("row %d  ref=%.6f  sve=%.6f  rel=%.2e\n",j,r[j],v[j],rel); }
     int ok=worst<1e-4;
     printf("N=%d worst_rel=%.2e  %s\n",N,worst,ok?"PASS (SVE == scalar ref)":"FAIL");
-    return ok?0:1;
+
+    /* decode-once (multi-stream) path: decode 8 rows -> bf16 tile, then matvec_bf16_8row.
+     * Must match the per-token reference (FP8*2^k is exact in bf16). */
+    uint16_t*tile=malloc((size_t)8*N*2);
+    for(int j=0;j<8;j++) m3_mxfp8_decode_row_bf16(tile+(size_t)j*N, w[j], s[j], 0, N, lut);
+    float d2[8];
+    matvec_bf16_8row(d2, tile,tile+N,tile+2*N,tile+3*N,tile+4*N,tile+5*N,tile+6*N,tile+7*N, x, N);
+    double worst2=0; for(int j=0;j<8;j++){ double d=fabs(r[j]-d2[j]), den=fabs(r[j])>1e-6?fabs(r[j]):1e-6; double rel=d/den; if(rel>worst2)worst2=rel; }
+    int ok2=worst2<1e-4;
+    printf("decode-once worst_rel=%.2e  %s\n",worst2,ok2?"PASS (bf16-tile == ref)":"FAIL");
+    free(tile);
+    return (ok&&ok2)?0:1;
 }

@@ -227,11 +227,19 @@ typedef struct {
     /* per-layer KV cache: GQA keeps 4 kv heads x head_dim per position, bf16.
      * Full attention (dense layers) + MSA both read this; MSA additionally selects
      * blocks via the indexer. cmp/index caches for long-ctx CP are a later phase. */
-    uint16_t *k_cache;        /* [max_pos, kv_dim] bf16 */
-    uint16_t *v_cache;        /* [max_pos, kv_dim] bf16 */
+    uint16_t *k_cache;        /* [max_pos, kv_dim] bf16 (NULL when int4_kv) */
+    uint16_t *v_cache;        /* [max_pos, kv_dim] bf16 (NULL when int4_kv) */
     /* MSA index-key cache: per-position index key [index_dim] bf16 (1 MQA head),
      * post index_k_norm + RoPE, used to score blocks. NULL on dense layers. */
-    uint16_t *idx_k_cache;    /* [max_pos, index_dim] bf16 */
+    uint16_t *idx_k_cache;    /* [max_pos, index_dim] bf16 (NULL when int4_kv) */
+    /* int4-KV (M3_INT4_KV): replaces the bf16 caches above, ~3.9x smaller, for 1M ctx.
+     * Per (pos, head) group of head_dim: int4 nibbles + bf16 absmax/7 scale.
+     * CP (M3_CP): only positions owned by this rank (block b -> rank b%ep_size) are stored;
+     * the stride is cp_nslot (<= max_pos) and pos maps to a local slot via m3_cp_slot(). */
+    uint8_t  *k_q4, *v_q4;    /* [cp_nslot, kv_dim/2] int4 */
+    uint16_t *k_qs, *v_qs;    /* [cp_nslot, n_kv_heads] bf16 per-head scale */
+    uint8_t  *idx_q4;         /* [cp_nslot, index_dim/2] int4 (sparse layers) */
+    uint16_t *idx_qs;         /* [cp_nslot] bf16 scale */
 } m3_layer;
 
 typedef struct m3_pool m3_pool;
@@ -258,6 +266,19 @@ typedef struct {
     int n_threads, n_cmgs;
     /* multi-stream batched decode state (m3_mstream*, defined in m3_impl.h); NULL unless allocated */
     void *ms;
+    /* int4-KV + context-parallel KV (1M context). int4_kv: caches stored int4 (~3.9x).
+     * cp_on: positions sharded across the EP ranks (block b -> rank b%ep_size); each rank
+     * stores only cp_nslot owned slots. Decode does a flash-style cross-rank combine of the
+     * per-rank partial attention ( kv_combine_cb) + a cross-rank top-k block merge for MSA. */
+    int int4_kv, cp_on, cp_nslot, cp_block;
+    /* flash-combine of [n_heads*head_dim] partial out + per-head (max,sumexp) across EP ranks.
+     * The runner provides a uTofu all-reduce specialized for the online-softmax merge. */
+    void  (*kv_combine_cb)(float *out, float *mx, float *sumexp, int n_heads, int head_dim, void *ctx);
+    void   *kv_combine_ctx;
+    /* all-reduce-MAX of the per-block index scores across EP ranks (each block owned by one
+     * rank; non-owned entries are -inf) so every rank derives the same global top-k selection. */
+    void  (*blk_reduce_cb)(float *scores, int nblk, void *ctx);
+    void   *blk_reduce_ctx;
     /* scratch (per-forward, single token) */
     float *s_norm, *s_q, *s_k, *s_v, *s_attn, *s_o;
     float *s_idx_q, *s_idx_k;          /* MSA index projections */
@@ -291,6 +312,17 @@ enum { M3_P_QKV=0, M3_P_QKNORM=1, M3_P_ROPE=2, M3_P_MSA_INDEX=3, M3_P_ATTN=4,
 static const char *m3_prof_names[M3_NPHASE] = {
     "qkv_proj","qk_norm","rope","msa_index","attn","o_proj","router","experts",
     "shared","dense_ffn","head","other","-","-","-","-" };
+
+/* CP slot mapping: block b=pos/cp_block owned by rank b%ep_size; owner stores it at a local
+ * slot packed over its owned blocks. When cp_on==0 every rank stores all positions (slot==pos). */
+static inline int  m3_cp_owner(const m3_model*m,int pos){ return m->cp_on ? (pos/m->cp_block)%m->ep_size : m->ep_rank; }
+static inline long m3_cp_slot (const m3_model*m,int pos){ if(!m->cp_on) return pos;
+    int b=pos/m->cp_block; return (long)(b/m->ep_size)*m->cp_block + (pos%m->cp_block); }
+static inline int  m3_cp_mine (const m3_model*m,int pos){ return !m->cp_on || (pos/m->cp_block)%m->ep_size==m->ep_rank; }
+/* owned-slot capacity for max_pos positions block-cyclic over ep_size ranks */
+static inline int  m3_cp_nslot(int max_pos,int cp_block,int ep_size,int cp_on){
+    if(!cp_on) return max_pos; int nblk=(max_pos+cp_block-1)/cp_block;
+    return ((nblk+ep_size-1)/ep_size)*cp_block; }
 
 /* ---- implementation (forward graph, arena, synth/load_real) relocated to m3_impl.h ----
  * NOT YET IMPLEMENTED — Phase 2/3 of a64fx/m3/m3.md. The graph mirrors ds4f_impl.h's

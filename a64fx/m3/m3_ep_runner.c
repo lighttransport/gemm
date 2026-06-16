@@ -116,6 +116,28 @@ static void ep_ar_callback(float*buf,int count,void*ctx){
 static void ep_argmax_callback(float*val,int32_t*idx,void*ctx){
     double t0=now_sec(); tp_allreduce_argmax((tp_comm*)ctx,val,idx); g_ar_secs+=now_sec()-t0; g_ar_calls++;
 }
+/* ---- CP (context-parallel KV) callbacks ---- */
+/* all-reduce MAX of per-block index scores so every rank derives the same global top-k. */
+static void ep_blk_reduce(float*scores,int nblk,void*ctx){
+    tp_comm*c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:nblk; double t0=now_sec();
+    for(int off=0;off<nblk;){ int n=nblk-off; if(n>mc)n=mc; tp_allreduce_max(c,scores+off,n); off+=n; }
+    g_ar_secs+=now_sec()-t0; g_ar_calls++;
+}
+/* flash-combine the per-rank partial attention (out unnormalized, max, sumexp) across ranks:
+ *   gmx=max_r mx_r;  s_r=exp(mx_r-gmx);  out = (sum_r s_r*out_r)/(sum_r s_r*se_r). */
+static float *g_kvbuf=NULL;
+static void ep_kv_combine(float*out,float*mx,float*se,int nh,int hd,void*ctx){
+    tp_comm*c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:1; double t0=now_sec();
+    float gmx[64]; for(int h=0;h<nh;h++) gmx[h]=mx[h];
+    tp_allreduce_max(c,gmx,nh);                              /* global per-head max */
+    int cnt=nh+nh*hd; float*buf=g_kvbuf;                     /* [se(nh) | out(nh*hd)] rescaled */
+    for(int h=0;h<nh;h++){ float s=expf(mx[h]-gmx[h]); buf[h]=se[h]*s;
+        float*o=out+h*hd,*b=buf+nh+(size_t)h*hd; for(int i=0;i<hd;i++) b[i]=o[i]*s; }
+    for(int off=0;off<cnt;){ int n=cnt-off; if(n>mc)n=mc; tp_allreduce_sum(c,buf+off,n); off+=n; }
+    for(int h=0;h<nh;h++){ float inv=1.0f/(buf[h]>0?buf[h]:1.0f);
+        float*o=out+h*hd,*b=buf+nh+(size_t)h*hd; for(int i=0;i<hd;i++) o[i]=b[i]*inv; }
+    g_ar_secs+=now_sec()-t0; g_ar_calls++;
+}
 
 /* ---- comm-overlap driver thread: only it touches uTofu during an overlapped reduce ----
  * The batched MoE issues the routed-expert all-reduce here (ar_async_start), computes the
@@ -238,6 +260,13 @@ int main(void){
     if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*mstream,barrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
+    if(m->cp_on){   /* context-parallel KV: provide the cross-rank block-score MAX + flash-combine */
+        g_kvbuf=(float*)malloc((size_t)(cfg.n_heads + cfg.n_heads*cfg.head_dim)*sizeof(float));
+        m->blk_reduce_cb=ep_blk_reduce; m->blk_reduce_ctx=&comm;
+        m->kv_combine_cb=ep_kv_combine; m->kv_combine_ctx=&comm;
+        if(MyRank==0) logmsg("CP ON: KV sharded block-cyclic (block=%d) over %d ranks, %d slots/rank, int4_kv=%d\n",
+                             m->cp_block,N,m->cp_nslot,m->int4_kv);
+    }
     if(envi("M3_COMM_OVERLAP",0)){
         atomic_store(&g_comm_stop,0); atomic_store(&g_comm_done,1); atomic_store(&g_comm_go,0);
         if(pthread_create(&g_comm_th,NULL,comm_driver,NULL)==0){
