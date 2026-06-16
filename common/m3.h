@@ -69,6 +69,7 @@
 #include <arm_sve.h>
 
 #include "ggml_dequant.h"   /* matvec_bf16_8row_pv + e8m0/fp8 helpers (shared with ds4f) */
+#include "m3_mem.h"         /* m3_amalloc/m3_acalloc/m3_afree: 256-aligned NUMA-interleaved */
 
 /* ===================== config ===================== */
 typedef struct {
