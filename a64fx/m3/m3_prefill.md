@@ -40,7 +40,16 @@ genuinely new piece is the **batched causal MSA attention** kernel (`m3_forward_
 Expected: S=256 → comm/256 and GEMMs at the ~100+ Gflop/s the microbench already showed at
 N=8 (rises further at larger M) ⇒ **several hundred tok/s** for single-request prefill.
 
-## Lever 2: prefill-tuned parallelism (compute-bound ⇒ TP-heavy)
+## Sweep findings (job 49252489, 1 node, 4 layers, all configs argmax 3051 == exact)
+- Chunk size @12 threads: serial 8.97 → M=64 41.3, **M=128 43.8 (best)**, M=256 35.6, M=512 30.6.
+  M≥256 spills L2 (M×hidden working set); **use M≈128–256**.
+- **Thread/CMG scaling @M=256 is the big lever (prefill is compute-bound):** 12c 35.6 → 24c 66.4
+  → **48c 112.0 tok/s (3.15×)** — near-linear across all 4 CMGs. **>=100 tok/s met single-node**
+  at 48 cores. ⇒ run prefill with **OMP_NUM_THREADS=48** (the decode/multi-stream paths still
+  prefer 12 = 1 CMG NUMA-local; prefill is the opposite).
+- int4-KV + chunked composes (M=256: 37.9 tok/s, argmax 3051, ‖x‖ 0.25% off bf16, NaN=0).
+
+## Lever 2: prefill-tuned parallelism (compute-bound ⇒ TP-heavy + all CMGs)
 Decode is memory/latency-bound (favours EP + multi-stream). Prefill is compute-bound, so the
 *opposite* layout is optimal: **TP-heavy** (split every GEMM across nodes for more FLOP/s/token)
 with the per-chunk all-reduce amortizing the TP cost. Run the prefill phase with
