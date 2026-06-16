@@ -29,8 +29,8 @@ topo_ok=0; for t in $(seq 1 30); do rm -f tofu_topo.txt
   echo "topo try $t"; sleep 15; done
 [ "$topo_ok" = 1 ] || { echo FATAL topo; exit 3; }
 echo "--- staging $WTAG ($(date)) ---"; mpiexec -np $NP "$LLM/build/m3_stage" || { echo FATAL stage; exit 4; }
-# 16384-token prompt (tile the 6-token prompt; throughput test)
-awk -v n=$NTOK 'BEGIN{c=0;while(c<n){while((getline l < "'"$M3"'/prompt_ids.txt")>0){printf "%s ",l;c++;if(c>=n)break} close("'"$M3"'/prompt_ids.txt")}}' > "$RUN/prompt_16k.txt"
+# exactly NTOK-token prompt (tile by TOKEN count; throughput test)
+python3 -c "import sys; t=open('$M3/prompt_ids.txt').read().split(); n=$NTOK; print(' '.join((t*((n//len(t))+1))[:n]))" > "$RUN/prompt_16k.txt"
 echo "prompt tokens: $(wc -w < "$RUN/prompt_16k.txt")"
 export M3_REAL=1 M3_PROMPT_IDS="$RUN/prompt_16k.txt" M3_PCHUNK=256
 echo "--- chunked prefill M=256, $NTOK tok ($(date)) ---"
