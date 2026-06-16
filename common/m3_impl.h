@@ -749,6 +749,10 @@ typedef struct {
     int *psel, *pnsel;        /* prefill: per-token MSA selected positions [n*maxsel] + counts [n] (kc/vc NULL) */
     int maxsel;
     int *gsel; float *gselw;  /* router top-k per token [n*8] (heap; prefill N can exceed 64) */
+    /* batched-parallel MSA select (prefill, non-CP): batched idx_q/idx_k projections + per-token
+     * block bitmap, so the O(pos) block scoring runs OpenMP-parallel over the chunk. */
+    float *piq, *pik;         /* [n*idx_q_dim], [n*index_dim] batched index projections */
+    char  *pbit; int nblkmax; /* [n*nblkmax] per-token block bitmap (nblkmax=ceil(max_pos/block)) */
 } m3_mstream;
 
 /* Y[N,rows] (token-major) = X[N,cols] . W[rows,cols]^T. K-tiled (8 W rows for a tile stay
@@ -831,6 +835,7 @@ static void m3_free_mstream(m3_model*m){
     m3_afree(ms->h2);m3_afree(ms->router);m3_afree(ms->route);m3_afree(ms->shg);m3_afree(ms->shu);m3_afree(ms->ffg);m3_afree(ms->ffu);
     m3_afree(ms->tmp2);m3_afree(ms->exg);m3_afree(ms->exu);m3_afree(ms->emoe);m3_afree(ms->bk);m3_afree(ms->bw);m3_afree(ms->bcnt);m3_afree(ms->logits);m3_afree(ms->sc);
     m3_afree(ms->psel);m3_afree(ms->pnsel);m3_afree(ms->gsel);m3_afree(ms->gselw);
+    m3_afree(ms->piq);m3_afree(ms->pik);m3_afree(ms->pbit);
     m3_afree(ms); m->ms=NULL;
 }
 /* per_stream_kv=1: multi-stream decode (own KV per stream). 0: chunked prefill (shared model
@@ -842,7 +847,10 @@ static int m3_alloc_mstream_ex(m3_model*m,int N,int per_stream_kv){
     if(per_stream_kv){ ms->kc=m3_acalloc((size_t)N*per,2); ms->vc=m3_acalloc((size_t)N*per,2); }
     else { ms->maxsel=(c->msa_topk_blocks+c->msa_local_block+c->msa_init_block+1)*c->msa_block_size;
            ms->psel=m3_amalloc((size_t)N*ms->maxsel*sizeof(int)); ms->pnsel=m3_amalloc((size_t)N*sizeof(int));
-           ms->gsel=m3_amalloc((size_t)N*8*sizeof(int)); ms->gselw=m3_amalloc((size_t)N*8*sizeof(float)); }
+           ms->gsel=m3_amalloc((size_t)N*8*sizeof(int)); ms->gselw=m3_amalloc((size_t)N*8*sizeof(float));
+           ms->nblkmax=(c->max_pos+c->msa_block_size-1)/c->msa_block_size;
+           ms->piq=m3_amalloc((size_t)N*m3_idx_q_dim(c)*4); ms->pik=m3_amalloc((size_t)N*c->msa_index_dim*4);
+           ms->pbit=m3_amalloc((size_t)N*ms->nblkmax); }
     ms->xn=m3_amalloc((size_t)N*H*4); ms->q=m3_amalloc((size_t)N*QD*4); ms->k=m3_amalloc((size_t)N*KVD*4); ms->v=m3_amalloc((size_t)N*KVD*4);
     ms->attn=m3_amalloc((size_t)N*QD*4); ms->o=m3_amalloc((size_t)N*H*4); ms->h2=m3_amalloc((size_t)N*H*4);
     ms->router=m3_amalloc((size_t)N*c->n_experts*4); ms->route=m3_amalloc((size_t)N*H*4);
@@ -961,6 +969,48 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
         out[t]=gidx; }
 }
 
+/* Batched-parallel MSA block selection for a prefill chunk (non-CP). Replaces the per-token
+ * sequential m3_msa_select: (A) batch idx_q/idx_k projections M=S; (B) parallel norm+RoPE +
+ * store idx_k for all S positions; (C) parallel per-token block scoring (the O(pos) hot loop)
+ * + top-k. Mathematically identical to the sequential path -- the block scores read the same
+ * fully-stored idx_k cache; only the work is parallelized over the chunk + amortized GEMMs. */
+static void m3_msa_prefill_select(m3_model*m, m3_layer*L, int p0, int S, int msa_on){
+    const m3_config*c=&m->cfg; m3_mstream*ms=(m3_mstream*)m->ms;
+    const int ID=c->msa_index_dim, IH=c->msa_n_index_heads, B=c->msa_block_size, half=c->rotary_dim/2, IQD=IH*ID;
+    const int keep=c->msa_topk_blocks+c->msa_local_block+c->msa_init_block;
+    m3_gemm(m,ms->piq,&L->idx_wq,ms->xn,S,IQD,c->hidden);     /* A: batched index projections */
+    m3_gemm(m,ms->pik,&L->idx_wk,ms->xn,S,ID,c->hidden);
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(int t=0;t<S;t++){ int p=p0+t; const float*cosp=&m->rope_cos[(size_t)p*half],*sinp=&m->rope_sin[(size_t)p*half];
+        float*iq=ms->piq+(size_t)t*IQD,*ik=ms->pik+(size_t)t*ID;
+        for(int h=0;h<IH;h++){ float*qh=iq+h*ID; m3_rmsnorm_head(qh,L->idx_q_norm,ID,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
+        m3_rmsnorm_head(ik,L->idx_k_norm,ID,c->norm_eps); m3_rope_head(ik,cosp,sinp,c->rotary_dim);
+        long sl=m3_cp_slot(m,p);   /* B: store idx_k (non-CP -> sl==p, every rank stores) */
+        if(m->int4_kv) L->idx_qs[sl]=m3_q4_pack(L->idx_q4+sl*(size_t)(ID/2),ik,ID);
+        else for(int i=0;i<ID;i++) L->idx_k_cache[sl*(size_t)ID+i]=m3_kv_enc(m,ik[i]); }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(int t=0;t<S;t++){ int p=p0+t, nblk=p/B+1;     /* C: parallel score + select per token */
+        const float*iq=ms->piq+(size_t)t*IQD; int*sel=ms->psel+(size_t)t*ms->maxsel;
+        if(!msa_on || nblk<=keep){ int n=0;
+            for(int b=0;b<nblk;b++){ int t0=b*B,t1=t0+B; if(t1>p+1)t1=p+1; for(int tt=t0;tt<t1;tt++) sel[n++]=tt; }
+            ms->pnsel[t]=n; continue; }
+        float*bs=ms->sc+(size_t)t*c->max_pos; char*selb=ms->pbit+(size_t)t*ms->nblkmax;
+        for(int b=0;b<nblk;b++){ int t0=b*B,t1=t0+B; if(t1>p+1)t1=p+1; float best=-1e30f;
+            for(int tt=t0;tt<t1;tt++){ float scr=0; for(int h=0;h<IH;h++) scr+=m3_idxdot(m,L,tt,iq+h*ID,ID); if(scr>best)best=scr; }
+            bs[b]=best; }
+        for(int b=0;b<nblk;b++) selb[b]=0;
+        for(int b=0;b<c->msa_init_block && b<nblk;b++) selb[b]=1;
+        for(int b=nblk-c->msa_local_block;b<nblk;b++) if(b>=0) selb[b]=1;
+        for(int pick=0;pick<c->msa_topk_blocks;pick++){ int best=-1; float bv=-1e30f;
+            for(int b=0;b<nblk;b++){ if(selb[b])continue; if(bs[b]>bv){bv=bs[b];best=b;} } if(best<0)break; selb[best]=1; }
+        int n=0; for(int b=0;b<nblk;b++){ if(!selb[b])continue; int t0=b*B,t1=t0+B; if(t1>p+1)t1=p+1; for(int tt=t0;tt<t1;tt++) sel[n++]=tt; }
+        ms->pnsel[t]=n; }
+}
+
 /* ===================== chunked batched prefill (Lever 1, >=100 tok/s target) =====================
  * S consecutive tokens of ONE sequence at positions [p0,p0+S), X token-major [S,hidden]. Writes
  * the model's SHARED KV cache (bf16/fp16/int4, CP-aware) and does causal attention (token i sees
@@ -995,10 +1045,14 @@ static int m3_forward_prefill_chunk(m3_model*m, float*X, int S, int p0){
                 if(m->int4_kv) for(int kh=0;kh<KVH;kh++){ L->k_qs[sl*KVH+kh]=m3_q4_pack(L->k_q4+sl*(size_t)(KVD/2)+(size_t)kh*(HD/2),kb+kh*HD,HD);
                                                           L->v_qs[sl*KVH+kh]=m3_q4_pack(L->v_q4+sl*(size_t)(KVD/2)+(size_t)kh*(HD/2),vb+kh*HD,HD); }
                 else for(int i=0;i<KVD;i++){ L->k_cache[sl*(size_t)KVD+i]=m3_kv_enc(m,kb[i]); L->v_cache[sl*(size_t)KVD+i]=m3_kv_enc(m,vb[i]); } } }
-        /* MSA selection per token (sequential: m3_msa_select stores idx[p0+t] then selects, so
-         * earlier intra-chunk tokens' idx are visible; uses shared scratch -> not parallel). */
-        if(sparse) for(int t=0;t<S;t++){ int*sel=ms->psel+(size_t)t*ms->maxsel;
-            ms->pnsel[t]=m3_msa_select(m,L,ms->xn+(size_t)t*H,p0+t,msa_on,sel); }
+        /* MSA selection. Non-CP: batched-parallel (the O(pos) block scoring across all 48 cores).
+         * CP: sequential m3_msa_select (its cross-rank blk_reduce is collective, can't be inside
+         * an omp-parallel-per-token region). */
+        if(sparse){
+            if(m->cp_on) for(int t=0;t<S;t++){ int*sel=ms->psel+(size_t)t*ms->maxsel;
+                ms->pnsel[t]=m3_msa_select(m,L,ms->xn+(size_t)t*H,p0+t,msa_on,sel); }
+            else m3_msa_prefill_select(m,L,p0,S,msa_on);
+        }
         /* causal attention per token (flash form); sparse -> sel list, dense -> contiguous [0,p] */
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
