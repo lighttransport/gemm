@@ -38,8 +38,22 @@ forward, multi-stream batched decode, the tokenizer/gen path. Only 4 spots chang
   ep1) = 851 tensors (768 expert = 128×(3 FP8 + 3 E8M0 scale)), **13.6 GB blob** (vs 21.75 GB
   bf16); `m3_real_test` **load OK 17.1 s** (vs 27.4 bf16), arena 13.33 GB, forward **NaNs=0**,
   ‖x‖=5.86e3, prefill/decode ~12 tok/s. The full MXFP8 path works on real weights.
-- ⬜ remaining: free `.scale` in `m3_free`; 32-align `m3_shard` for MXFP8 col-shards at ep>1;
-  96-node stage+generate (coherence quality gate vs bf16) + mem (~7–8 GB/rank) / fewer-node demo.
+- ✅ **96/48/32-node real-weight stage+generate DONE (jobs 49250943/944/945, 2026-06-16).**
+  Full 60-layer MXFP8, prompt "The capital of France is", TP on (col-shards 32-aligned at
+  these node counts). **All three emit identical coherent text — " Paris. (Paris is the
+  capital of France.)" — matching the bf16 output ⇒ MXFP8 is near-lossless at full scale.**
+  | nodes | arena/rank | owned exp/layer | decode tok/s |
+  |---|---|---|---|
+  | 96 | **7.24 GB** (vs 13.23 bf16) | 2 | 2.49 |
+  | 48 | 10.66 GB | 3 | 2.28 |
+  | 32 | 13.98 GB | 4 | 2.20 |
+  **MXFP8 halves the weight memory → the full model now fits on 32 nodes** (bf16 needed ≥48).
+  Decode ~2.2–2.5 tok/s single-stream (slightly below bf16's ~3.1 — FP8 LUT-gather decode is
+  per-element slower than bf16 widen even at half the bytes; the win is MEMORY, not single-
+  stream speed; multi-stream + the perf levers stack on top). **1M context still needs
+  CP/int4-KV** (KV is bf16 at runtime, ~120 GB/rank at 1M; MXFP8's ~6 GB weight saving only
+  buys ~50k more ctx). Per-job cwd isolation (`mxfp8run_$JOBID`) avoids the tofu_topo collision.
+- ⬜ remaining: free `.scale` in `m3_free`; CP/int4-KV for 1M; MXFP8 multi-stream throughput.
 
 ## Implementation (4 changes)
 0. **Kernel — DONE** (above). Still needed: a batched `m3_gemm_mxfp8` (M=N) mirroring `m3_gemm_bf16`.
