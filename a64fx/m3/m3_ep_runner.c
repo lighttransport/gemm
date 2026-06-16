@@ -320,6 +320,16 @@ int main(void){
         if(n_prompt+max_new>cfg.max_pos) max_new=cfg.max_pos-n_prompt;
         if(MyRank==0) logmsg("gen: prompt=%d tok, max_new=%d, max_pos=%d\n",n_prompt,max_new,cfg.max_pos);
         int pf_last=-1; double t0=now_sec();
+        int pchunk=envi("M3_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=S) */
+        if(pchunk>0){
+            if(m3_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
+            float*Xc=(float*)malloc((size_t)pchunk*C*4);
+            for(int p0=0;p0<n_prompt;p0+=pchunk){ int S=n_prompt-p0; if(S>pchunk)S=pchunk;
+                for(int t=0;t<S;t++) embed_lookup(m,prompt[p0+t],Xc+(size_t)t*C);
+                pf_last=m3_forward_prefill_chunk(m,Xc,S,p0); }
+            free(Xc); m3_free_mstream(m);
+            if(MyRank==0) logmsg("prefill: chunked M=%d\n",pchunk);
+        } else
         for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=m3_forward_token(m,x,p); }
         int *gen=malloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
         double td0=now_sec();
