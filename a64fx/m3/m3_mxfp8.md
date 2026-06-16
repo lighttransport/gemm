@@ -26,7 +26,15 @@ same graph, so it reuses everything except the weight load + matvec.
 The whole stack carries over: EP/TP sharding, uTofu all-reduce, pjsub, the GQA+MSA+sigmoid-MoE
 forward, multi-stream batched decode, the tokenizer/gen path. Only 4 spots change.
 
+## Status
+- ✅ **Kernel DONE + validated** (`common/m3_mxfp8.h`, commit ce8b50a). `matvec_mxfp8_8row`:
+  SVE LUT-gather decode FP8 E4M3 → exact f32, × E8M0 per-[1,32] scale `2^(b-127)`, FMA in f32.
+  E8M0 convention pinned vs the real bf16 model (`max_rel_vs_bf16 = 0.000`; `scale_inv` =
+  multiply, bias 127). SVE == scalar ref ~1e-7 native (`m3_mxfp8_test.c`, N=64/256/6144).
+- ⬜ type + loader + stager + forward dispatch (below).
+
 ## Implementation (4 changes)
+0. **Kernel — DONE** (above). Still needed: a batched `m3_gemm_mxfp8` (M=N) mirroring `m3_gemm_bf16`.
 1. **Type (`common/m3.h`)** — add `M3_MXFP8` (the enum already reserves `M3_FP8`/`M3_MXFP4`
    slots). `m3_wbytes(MXFP8,r,c)=r*c` (1 B/elem); `m3_sbytes(MXFP8,r,c)=r*(c/32)` (E8M0).
    `m3_tensor.scale` (uint8*) holds the E8M0 block scales.
