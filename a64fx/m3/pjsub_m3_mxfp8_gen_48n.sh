@@ -18,10 +18,10 @@
 set -u
 REPO=/vol0006/mdt0/data/hp250467/work/gemm/ds4p
 LLM="$REPO/a64fx/llm"; UTOFU="$REPO/a64fx/utofu-tests"; M3="$REPO/a64fx/m3"
-cd "$M3" || exit 2
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
 NP=${PJM_MPI_PROC:-96}
-export M3_MODEL_DIR=$HOME/models/m3-fp8 M3_NSHARDS=31 M3_STAGE_DIR=/local/m3fp8 M3_STATUS_DIR="$M3"
+RUN="$M3/mxfp8run_${PJM_JOBID:-$$}"; mkdir -p "$RUN"; cd "$RUN" || exit 2   # isolate tofu_topo.txt + logs per job
+export M3_MODEL_DIR=$HOME/models/m3-fp8 M3_NSHARDS=31 M3_STAGE_DIR=/local/m3fp8 M3_STATUS_DIR="$RUN"
 export M3_EP_SIZE=$NP M3_TP=1 M3_MSA=1
 export M3_MAXPOS=${M3_MAXPOS:-256} M3_MAX_NEW=${M3_MAX_NEW:-48}
 export LLM_THREADS=12 OMP_NUM_THREADS=12
