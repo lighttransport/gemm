@@ -142,6 +142,7 @@ int main(void){
     int n_threads=envi("LLM_THREADS",48), n_cmgs=envi("M3_CMGS",4);
     int prefill=envi("M3_PREFILL",8), maxgen=envi("M3_DECODE",16), maxpos=envi("M3_MAXPOS",512);
     int layers=envi("M3_LAYERS",0), nexp=envi("M3_EXPERTS",0);
+    int mstream=envi("M3_MSTREAM",1); if(mstream<1)mstream=1; if(mstream>64)mstream=64;
 
     utofu_tni_id_t*tni_ids=NULL; size_t num_tnis=0;
     rc=utofu_get_onesided_tnis(&tni_ids,&num_tnis); if(rc!=UTOFU_SUCCESS) die("utofu_get_onesided_tnis",rc);
@@ -205,13 +206,40 @@ int main(void){
     barrier_robust(1);
 
     static tp_comm comm;
-    if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden,barrier)!=0) die("tp_comm_init",-1);
+    if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*mstream,barrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
     barrier_robust(1);
     if(MyRank==0) logmsg("all %d ranks past bootstrap barrier; starting prefill\n",N);
 
     int C=cfg.hidden; float*x=(float*)aligned_alloc(256,(size_t)C*4);
+
+    /* ---- M3_MSTREAM=N: batched multi-stream decode (synthetic) -> aggregate tok/s ----
+     * N concurrent streams per forward: dense GEMMs M=N + ONE EP all-reduce per layer for
+     * all N tokens -> dispatch + comm amortized N-fold. Measures the structural throughput
+     * lever the dummy ceiling pointed to. */
+    if(mstream>1){
+        int NS=mstream;
+        if(m3_alloc_mstream(m,NS)) die("alloc_mstream",-1);
+        float*X=(float*)aligned_alloc(64,(size_t)NS*C*4);
+        int*pos=(int*)malloc((size_t)NS*sizeof(int)),*out=(int*)malloc((size_t)NS*sizeof(int));
+        if(prefill+maxgen+8>cfg.max_pos){ if(MyRank==0) logmsg("mstream: maxpos too small\n"); }
+        sm_state=0xD3F00D; for(int t=0;t<NS;t++) pos[t]=0;
+        for(int g=0;g<4;g++){ for(int i=0;i<NS*C;i++) X[i]=(float)(sm_next()*0.2-0.1); m3_forward_batch_decode(m,X,NS,pos,out); for(int t=0;t<NS;t++) pos[t]++; }
+        barrier();
+        double t0=now_sec(); g_ar_secs=0; g_ar_calls=0; int nan=0;
+        for(int g=0;g<maxgen;g++){ for(int i=0;i<NS*C;i++) X[i]=(float)(sm_next()*0.2-0.1); m3_forward_batch_decode(m,X,NS,pos,out); for(int t=0;t<NS;t++) pos[t]++;
+            for(int i=0;i<NS*C;i++) if(!(X[i]==X[i])) nan++; }
+        double dt=now_sec()-t0, ar=g_ar_secs;
+        barrier();
+        if(MyRank==0){
+            logmsg("\n=== MSTREAM N=%d on %d nodes ===\n",NS,N);
+            logmsg("steps=%d  %.1f ms/step  AGG %.2f tok/s  per-stream %.2f  comm %.1f%%  out0=%d NaNs=%d\n",
+                   maxgen, dt/maxgen*1e3, (double)maxgen*NS/dt, (double)maxgen/dt, 100.0*ar/dt, out[0], nan);
+            logmsg("SENTINEL m3_mstream_%dn_N%d=done\n",N,NS);
+        }
+        free(X);free(pos);free(out); free(x); m3_free(m); return 0;
+    }
 
     /* ---- gen-mode: M3_PROMPT_IDS set -> real prompt prefill + greedy decode ----
      * Every rank reads the SAME prompt file and (under TP_HEAD) computes the SAME

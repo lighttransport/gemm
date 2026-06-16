@@ -224,8 +224,10 @@ static size_t m3_arena_size(const m3_config*c,int ep_rank,int ep_size){
 }
 
 /* ===================== synthetic model ===================== */
+static void m3_free_mstream(m3_model*m);
 static void m3_free(m3_model*m){
     if(!m) return;
+    if(m->ms) m3_free_mstream(m);
     if(m->pool){ if(m3_g_pool==m->pool) m3_g_pool=NULL; m3_pool_destroy(m->pool); m->pool=NULL; }
     for(int l=0;l<m->cfg.n_layers;l++){
         m3_layer*L=&m->layers[l];
@@ -576,6 +578,144 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
     int32_t gidx=m->head_r0+la; float gval=lv;
     if(hrows<c->vocab && m->ar_argmax_cb) m->ar_argmax_cb(&gval,&gidx,m->ar_argmax_ctx);  /* TP_HEAD merge */
     return gidx;
+}
+
+/* ===================== multi-stream batched decode (raise M -> amortize dispatch+comm) =====
+ * N concurrent sequences per forward. The dense projections (qkv/o/shared/ffn/head) become
+ * batched GEMMs (weight read ONCE per K-tile, reused across the N tokens), and the EP
+ * all-reduce fires ONCE per layer over the whole [N,hidden] partial -> dispatch + comm
+ * amortized N-fold (the costs the dummy ceiling showed dominate single-stream). Each stream
+ * keeps its own KV cache + position; attention is per-stream (full causal; MSA selection is
+ * deferred in the batched path). Routed experts stay M=1 per (token,expert) for v1 (grouping
+ * is a follow-on) but the dominant comm is amortized. */
+typedef struct {
+    int n;
+    uint16_t *kc, *vc;        /* [n][n_layers][max_pos][kv_dim] bf16 per-stream KV caches */
+    float *xn,*q,*k,*v,*attn,*o,*h2,*router,*route,*shg,*shu,*ffg,*ffu,*tmp2;  /* token-major batched scratch */
+    float *exg,*exu,*emoe;    /* per-token expert scratch (M=1) */
+    float *logits,*sc;
+} m3_mstream;
+
+/* Y[N,rows] (token-major) = X[N,cols] . W[rows,cols]^T. K-tiled (8 W rows for a tile stay
+ * in L1 across the N tokens -> weight read amortized over N). OpenMP over 8-row blocks. */
+static void m3_gemm_bf16(float*restrict Y, const uint16_t*W, const float*X, int N, int rows, int cols){
+    if(m3_dummy){
+        double acc=0;
+#ifdef _OPENMP
+        #pragma omp parallel for reduction(+:acc) schedule(static) if((long)rows>=M3_PAR_MIN)
+#endif
+        for(int r=0;r<rows;r++){ const uint16_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=32) s+=w[i]; acc+=s; }
+        float vv=(float)(((long)acc)&1)*1e-30f; for(size_t i=0;i<(size_t)N*rows;i++) Y[i]=vv; return;
+    }
+    int nb=rows/8, TILE=512; if(TILE>cols)TILE=cols;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)rows>=M3_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){
+        int r=bi*8; const uint16_t*w=W+(size_t)r*cols;
+        for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=0.f; }
+        for(int k0=0;k0<cols;k0+=TILE){ int kl=cols-k0<TILE?cols-k0:TILE; const uint16_t*tw=w+k0;
+            for(int t=0;t<N;t++){ float tmp[8];
+                matvec_bf16_8row(tmp,tw,tw+cols,tw+2*(size_t)cols,tw+3*(size_t)cols,
+                                 tw+4*(size_t)cols,tw+5*(size_t)cols,tw+6*(size_t)cols,tw+7*(size_t)cols,
+                                 X+(size_t)t*cols+k0,kl);
+                float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]+=tmp[j]; } }
+    }
+    for(int r=nb*8;r<rows;r++) for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=vec_dot_bf16_f32(W+(size_t)r*cols,X+(size_t)t*cols,cols);
+}
+
+static void m3_free_mstream(m3_model*m){
+    m3_mstream*ms=(m3_mstream*)m->ms; if(!ms) return;
+    free(ms->kc);free(ms->vc);free(ms->xn);free(ms->q);free(ms->k);free(ms->v);free(ms->attn);free(ms->o);
+    free(ms->h2);free(ms->router);free(ms->route);free(ms->shg);free(ms->shu);free(ms->ffg);free(ms->ffu);
+    free(ms->tmp2);free(ms->exg);free(ms->exu);free(ms->emoe);free(ms->logits);free(ms->sc);
+    free(ms); m->ms=NULL;
+}
+static int m3_alloc_mstream(m3_model*m,int N){
+    const m3_config*c=&m->cfg; int H=c->hidden,QD=m3_q_dim(c),KVD=m3_kv_dim(c),hrows=m->head.rows;
+    m3_mstream*ms=calloc(1,sizeof *ms); if(!ms) return -1; ms->n=N;
+    size_t per=(size_t)c->n_layers*c->max_pos*KVD;
+    ms->kc=calloc((size_t)N*per,2); ms->vc=calloc((size_t)N*per,2);
+    ms->xn=malloc((size_t)N*H*4); ms->q=malloc((size_t)N*QD*4); ms->k=malloc((size_t)N*KVD*4); ms->v=malloc((size_t)N*KVD*4);
+    ms->attn=malloc((size_t)N*QD*4); ms->o=malloc((size_t)N*H*4); ms->h2=malloc((size_t)N*H*4);
+    ms->router=malloc((size_t)N*c->n_experts*4); ms->route=malloc((size_t)N*H*4);
+    ms->shg=malloc((size_t)N*c->moe_inter*4); ms->shu=malloc((size_t)N*c->moe_inter*4);
+    ms->ffg=malloc((size_t)N*c->dense_inter*4); ms->ffu=malloc((size_t)N*c->dense_inter*4);
+    ms->tmp2=malloc((size_t)N*H*4);
+    ms->exg=malloc((size_t)c->moe_inter*4); ms->exu=malloc((size_t)c->moe_inter*4); ms->emoe=malloc((size_t)H*4);
+    ms->logits=malloc((size_t)N*hrows*4); ms->sc=malloc((size_t)N*c->max_pos*4);
+    if(!ms->kc||!ms->vc||!ms->logits){ m->ms=ms; m3_free_mstream(m); return -1; }
+    m->ms=ms; return 0;
+}
+
+/* one batched decode step: N tokens (X token-major [N,hidden]) at positions pos[t] -> out[t]=argmax. */
+static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, int*out){
+    const m3_config*c=&m->cfg; const int H=c->hidden,HD=c->head_dim,QH=c->n_heads,KVH=c->n_kv_heads;
+    const int KVD=m3_kv_dim(c),grp=QH/KVH,half=c->rotary_dim/2; const float ascale=1.0f/sqrtf((float)HD);
+    m3_mstream*ms=(m3_mstream*)m->ms; size_t per=(size_t)c->n_layers*c->max_pos*KVD;
+    for(int l=0;l<c->n_layers;l++){
+        m3_layer*L=&m->layers[l]; int is_moe=m3_is_moe(c,l);
+        const int qh0=L->qh0,qh1=L->qh1,nown=qh1-qh0,qrows=nown*HD; const int tp_attn=(qrows<QH*HD);
+        for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->xn+(size_t)t*H, X+(size_t)t*H, L->input_norm, H, c->norm_eps);
+        m3_gemm_bf16(ms->q,(uint16_t*)L->wq.w,ms->xn,N,qrows,H);
+        m3_gemm_bf16(ms->k,(uint16_t*)L->wk.w,ms->xn,N,KVD,H);
+        m3_gemm_bf16(ms->v,(uint16_t*)L->wv.w,ms->xn,N,KVD,H);
+        for(int t=0;t<N;t++){ int p=pos[t]; const float*cosp=&m->rope_cos[(size_t)p*half],*sinp=&m->rope_sin[(size_t)p*half];
+            float*qb=ms->q+(size_t)t*qrows,*kb=ms->k+(size_t)t*KVD,*vb=ms->v+(size_t)t*KVD;
+            for(int hh=0;hh<nown;hh++){ float*qh=qb+hh*HD; if(c->use_qk_norm) m3_rmsnorm_head(qh,L->q_norm,HD,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
+            for(int kh=0;kh<KVH;kh++){ float*kk=kb+kh*HD; if(c->use_qk_norm) m3_rmsnorm_head(kk,L->k_norm,HD,c->norm_eps); m3_rope_head(kk,cosp,sinp,c->rotary_dim); }
+            uint16_t*kc=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
+            uint16_t*vc=ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
+            for(int i=0;i<KVD;i++){ kc[i]=m3_f2bf(kb[i]); vc[i]=m3_f2bf(vb[i]); } }
+        for(int t=0;t<N;t++){ int p=pos[t]; float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*qrows,*sc=ms->sc+(size_t)t*c->max_pos;
+            uint16_t*kcl=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD,*vcl=ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD;
+            for(int hh=0;hh<nown;hh++){ int hgl=qh0+hh; float*qh=qb+hh*HD; int kvh=hgl/grp; float mx=-1e30f;
+                for(int tt=0;tt<=p;tt++){ const uint16_t*kt=kcl+(size_t)tt*KVD+kvh*HD; double d=0; for(int i=0;i<HD;i++) d+=(double)qh[i]*m3_bf2f(kt[i]); float s=(float)d*ascale; sc[tt]=s; if(s>mx)mx=s; }
+                double sum=0; for(int tt=0;tt<=p;tt++){ float e=expf(sc[tt]-mx); sc[tt]=e; sum+=e; }
+                float inv=(float)(1.0/(sum>0?sum:1)); float*oh=ab+hh*HD; for(int i=0;i<HD;i++) oh[i]=0;
+                for(int tt=0;tt<=p;tt++){ float w=sc[tt]*inv; const uint16_t*vt=vcl+(size_t)tt*KVD+kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]); } } }
+        m3_gemm_bf16(ms->o,(uint16_t*)L->wo.w,ms->attn,N,H,qrows);
+        if(tp_attn && m->ar_cb) m->ar_cb(ms->o,N*H,m->ar_ctx);
+        for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->o[i];
+        for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, L->post_norm, H, c->norm_eps);
+        if(is_moe){
+            const int tp_sh=(L->sh_rows<c->moe_inter);
+            for(size_t i=0;i<(size_t)N*H;i++) ms->route[i]=0;
+            for(int t=0;t<N;t++){ float*rl=ms->router+(size_t)t*c->n_experts; m3_mv_f32(rl,(float*)L->gate.w,ms->h2+(size_t)t*H,c->n_experts,H);
+                for(int e=0;e<c->n_experts;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
+                int sel[64]; float sw[64]; int na=c->n_active>64?64:c->n_active;
+                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1;
+                float*h2t=ms->h2+(size_t)t*H,*rt=ms->route+(size_t)t*H;
+                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size; float w=sw[a]/wsum*c->routed_scale;
+                    m3_mv_bf16(ms->exg,(uint16_t*)L->ex_w1[slot].w,h2t,c->moe_inter,H);
+                    m3_mv_bf16(ms->exu,(uint16_t*)L->ex_w3[slot].w,h2t,c->moe_inter,H);
+                    for(int i=0;i<c->moe_inter;i++) ms->exg[i]=m3_swiglu_oai(ms->exg[i],ms->exu[i],c->swiglu_alpha,c->swiglu_limit);
+                    m3_mv_bf16(ms->emoe,(uint16_t*)L->ex_w2[slot].w,ms->exg,H,c->moe_inter);
+                    for(int i=0;i<H;i++) rt[i]+=w*ms->emoe[i]; } }
+            m3_gemm_bf16(ms->shg,(uint16_t*)L->sh_w1.w,ms->h2,N,L->sh_rows,H);
+            m3_gemm_bf16(ms->shu,(uint16_t*)L->sh_w3.w,ms->h2,N,L->sh_rows,H);
+            for(size_t i=0;i<(size_t)N*L->sh_rows;i++) ms->shg[i]=m3_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+            m3_gemm_bf16(ms->tmp2,(uint16_t*)L->sh_w2.w,ms->shg,N,H,L->sh_rows);   /* shared-out [N,H] */
+            if(tp_sh) for(size_t i=0;i<(size_t)N*H;i++) ms->route[i]+=ms->tmp2[i];
+            if(m->ar_cb) m->ar_cb(ms->route,N*H,m->ar_ctx);                        /* ONE reduce for N tokens */
+            for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
+        } else {
+            const int tp_ffn=(L->ff_rows<c->dense_inter);
+            m3_gemm_bf16(ms->ffg,(uint16_t*)L->ff_gate.w,ms->h2,N,L->ff_rows,H);
+            m3_gemm_bf16(ms->ffu,(uint16_t*)L->ff_up.w,ms->h2,N,L->ff_rows,H);
+            for(size_t i=0;i<(size_t)N*L->ff_rows;i++) ms->ffg[i]=m3_swiglu_oai(ms->ffg[i],ms->ffu[i],c->swiglu_alpha,c->swiglu_limit);
+            m3_gemm_bf16(ms->tmp2,(uint16_t*)L->ff_down.w,ms->ffg,N,H,L->ff_rows);
+            if(tp_ffn && m->ar_cb) m->ar_cb(ms->tmp2,N*H,m->ar_ctx);
+            for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->tmp2[i];
+        }
+    }
+    for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, m->out_norm, H, c->norm_eps);
+    int hrows=m->head.rows; m3_gemm_bf16(ms->logits,(uint16_t*)m->head.w,ms->h2,N,hrows,H);
+    for(int t=0;t<N;t++){ float*lg=ms->logits+(size_t)t*hrows; int la=0; float bv=lg[0]; for(int i=1;i<hrows;i++) if(lg[i]>bv){bv=lg[i];la=i;}
+        int32_t gidx=m->head_r0+la; float gval=bv;
+        if(hrows<c->vocab && m->ar_argmax_cb) m->ar_argmax_cb(&gval,&gidx,m->ar_argmax_ctx);
+        out[t]=gidx; }
 }
 
 #endif /* M3_IMPL_H */
