@@ -142,7 +142,7 @@ static inline int m3_idx_q_dim(const m3_config *c) { return c->msa_n_index_heads
  * flat layout for norms/embed/index-norm read directly. M3_F32 for the router
  * gate + e_score bias (argmax-critical, kept high precision). MXFP4/Q8 reserved
  * for the later perf phase (same enum values as ds4f for kernel sharing). */
-typedef enum { M3_BF16 = 0, M3_FP8 = 1, M3_MXFP4 = 2, M3_F32 = 3, M3_BF16_PV = 4, M3_Q8_PV = 5 } m3_qtype;
+typedef enum { M3_BF16 = 0, M3_FP8 = 1, M3_MXFP4 = 2, M3_F32 = 3, M3_BF16_PV = 4, M3_Q8_PV = 5, M3_MXFP8 = 6 } m3_qtype;
 
 typedef struct {
     void    *w;       /* weight bytes */
@@ -157,6 +157,7 @@ static inline size_t m3_wbytes(m3_qtype t, int rows, int cols) {
         case M3_BF16:    return n * 2;
         case M3_BF16_PV: return n * 2;
         case M3_FP8:     return n;
+        case M3_MXFP8:   return n;          /* 1 byte/elem (FP8 E4M3) */
         case M3_MXFP4:   return n / 2;
         case M3_F32:     return n * 4;
         case M3_Q8_PV:   return (size_t)(rows / 8) * (cols / 64) * 528;
@@ -166,6 +167,7 @@ static inline size_t m3_wbytes(m3_qtype t, int rows, int cols) {
 static inline size_t m3_sbytes(m3_qtype t, int rows, int cols) {
     switch (t) {
         case M3_FP8:   return (size_t)((rows + 127) / 128) * ((cols + 127) / 128);
+        case M3_MXFP8: return (size_t)rows * (cols / 32);   /* E8M0 uint8 per [1,32] block */
         case M3_MXFP4: return (size_t)rows * (cols / 32);
         default:       return 0;
     }
@@ -248,6 +250,7 @@ typedef struct {
     float *rope_cos, *rope_sin;
     /* dense-weight type used for the bf16 matvec path (M3_BF16 or M3_BF16_PV) */
     m3_qtype bf16_mv_qt;
+    uint32_t fp8_lut[256];   /* FP8 E4M3 -> f32 bits (built once; used by the MXFP8 matvec) */
     /* arena */
     uint8_t *arena; size_t arena_sz, arena_used;
     /* pool */
