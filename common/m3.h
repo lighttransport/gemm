@@ -269,6 +269,12 @@ typedef struct {
     void   *ar_ctx;
     void  (*ar_argmax_cb)(float *val, int32_t *idx, void *ctx);  /* TP_HEAD argmax merge */
     void   *ar_argmax_ctx;
+    /* comm-overlap (optional): ar_async_start issues the all-reduce on a comm-driver thread
+     * (returns immediately); ar_wait blocks for it. NULL => no overlap (use ar_cb). The
+     * batched MoE overlaps the routed-expert reduce with the (replicated) shared-expert compute. */
+    void  (*ar_async_start)(float *buf, int count, void *ctx);
+    void  (*ar_wait)(void *ctx);
+    void   *ar_async_ctx;
     /* perf accounting */
     size_t bytes_read;
     double prof[16];

@@ -117,6 +117,35 @@ static void ep_argmax_callback(float*val,int32_t*idx,void*ctx){
     double t0=now_sec(); tp_allreduce_argmax((tp_comm*)ctx,val,idx); g_ar_secs+=now_sec()-t0; g_ar_calls++;
 }
 
+/* ---- comm-overlap driver thread: only it touches uTofu during an overlapped reduce ----
+ * The batched MoE issues the routed-expert all-reduce here (ar_async_start), computes the
+ * replicated shared expert on the OpenMP pool, then ar_wait. The route reduce (comm thread)
+ * runs concurrently with the shared GEMMs (compute threads) -> comm hidden under compute.
+ * Safe because uTofu use is never concurrent: the per-layer o_proj reduce (main thread) and
+ * the route reduce (this thread) are sequential, and the main thread does no uTofu while the
+ * shared expert computes. */
+static tp_comm *g_comm_ctx=NULL;
+static _Atomic int g_comm_go=0, g_comm_done=1, g_comm_stop=0;
+static float *g_comm_buf=NULL; static int g_comm_count=0;
+static pthread_t g_comm_th;
+static void* comm_driver(void *a){ (void)a;
+    for(;;){
+        while(!atomic_load_explicit(&g_comm_go,memory_order_acquire) && !atomic_load_explicit(&g_comm_stop,memory_order_acquire))
+            __asm__ __volatile__("yield":::"memory");
+        if(atomic_load_explicit(&g_comm_stop,memory_order_acquire)) break;
+        atomic_store_explicit(&g_comm_go,0,memory_order_relaxed);
+        ep_ar_callback(g_comm_buf,g_comm_count,g_comm_ctx);
+        atomic_store_explicit(&g_comm_done,1,memory_order_release);
+    }
+    return NULL;
+}
+static void ar_async_start_cb(float *buf,int count,void *ctx){
+    g_comm_buf=buf; g_comm_count=count; g_comm_ctx=(tp_comm*)ctx;
+    atomic_store_explicit(&g_comm_done,0,memory_order_relaxed);
+    atomic_store_explicit(&g_comm_go,1,memory_order_release);
+}
+static void ar_wait_cb(void *ctx){ (void)ctx; while(!atomic_load_explicit(&g_comm_done,memory_order_acquire)) __asm__ __volatile__("yield":::"memory"); }
+
 /* token id -> input embedding (the forward's first op is input_layernorm, so the raw
  * widened embed row is the activation it expects). Under TP_EMBED the owner fills its
  * vocab-shard row and the ar_cb SUMs (zeros elsewhere) -> full embedding, bit-exact. */
@@ -209,6 +238,13 @@ int main(void){
     if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*mstream,barrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
+    if(envi("M3_COMM_OVERLAP",0)){
+        atomic_store(&g_comm_stop,0); atomic_store(&g_comm_done,1); atomic_store(&g_comm_go,0);
+        if(pthread_create(&g_comm_th,NULL,comm_driver,NULL)==0){
+            m->ar_async_start=ar_async_start_cb; m->ar_wait=ar_wait_cb; m->ar_async_ctx=&comm;
+            if(MyRank==0) logmsg("comm-overlap ON (dedicated comm-driver thread)\n");
+        } else if(MyRank==0) logmsg("comm-overlap: pthread_create failed; running synchronous\n");
+    }
     barrier_robust(1);
     if(MyRank==0) logmsg("all %d ranks past bootstrap barrier; starting prefill\n",N);
 

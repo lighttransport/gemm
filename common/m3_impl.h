@@ -711,12 +711,18 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
                     for(int i=0;i<c->moe_inter;i++) ms->exg[i]=m3_swiglu_oai(ms->exg[i],ms->exu[i],c->swiglu_alpha,c->swiglu_limit);
                     m3_mv_bf16(ms->emoe,(uint16_t*)L->ex_w2[slot].w,ms->exg,H,c->moe_inter);
                     for(int i=0;i<H;i++) rt[i]+=w*ms->emoe[i]; } }
+            /* comm-overlap: issue the routed reduce on the comm-driver thread, compute the
+             * (replicated) shared expert during it, then wait. Needs shared replicated (!tp_sh)
+             * so it is independent of the route buffer being reduced. */
+            int overlap = (m->ar_async_start && !tp_sh);
+            if(overlap) m->ar_async_start(ms->route,N*H,m->ar_async_ctx);
             m3_gemm_bf16(ms->shg,(uint16_t*)L->sh_w1.w,ms->h2,N,L->sh_rows,H);
             m3_gemm_bf16(ms->shu,(uint16_t*)L->sh_w3.w,ms->h2,N,L->sh_rows,H);
             for(size_t i=0;i<(size_t)N*L->sh_rows;i++) ms->shg[i]=m3_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
             m3_gemm_bf16(ms->tmp2,(uint16_t*)L->sh_w2.w,ms->shg,N,H,L->sh_rows);   /* shared-out [N,H] */
-            if(tp_sh) for(size_t i=0;i<(size_t)N*H;i++) ms->route[i]+=ms->tmp2[i];
-            if(m->ar_cb) m->ar_cb(ms->route,N*H,m->ar_ctx);                        /* ONE reduce for N tokens */
+            if(overlap){ m->ar_wait(m->ar_async_ctx); }
+            else { if(tp_sh) for(size_t i=0;i<(size_t)N*H;i++) ms->route[i]+=ms->tmp2[i];
+                   if(m->ar_cb) m->ar_cb(ms->route,N*H,m->ar_ctx); }
             for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
         } else {
             const int tp_ffn=(L->ff_rows<c->dense_inter);
