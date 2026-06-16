@@ -593,6 +593,7 @@ typedef struct {
     uint16_t *kc, *vc;        /* [n][n_layers][max_pos][kv_dim] bf16 per-stream KV caches */
     float *xn,*q,*k,*v,*attn,*o,*h2,*router,*route,*shg,*shu,*ffg,*ffu,*tmp2;  /* token-major batched scratch */
     float *exg,*exu,*emoe;    /* per-token expert scratch (M=1) */
+    int *bk; float *bw; int *bcnt;   /* expert grouping: per-owned-slot token buckets [n_experts*N]/[n_experts] */
     float *logits,*sc;
 } m3_mstream;
 
@@ -628,7 +629,7 @@ static void m3_free_mstream(m3_model*m){
     m3_mstream*ms=(m3_mstream*)m->ms; if(!ms) return;
     free(ms->kc);free(ms->vc);free(ms->xn);free(ms->q);free(ms->k);free(ms->v);free(ms->attn);free(ms->o);
     free(ms->h2);free(ms->router);free(ms->route);free(ms->shg);free(ms->shu);free(ms->ffg);free(ms->ffu);
-    free(ms->tmp2);free(ms->exg);free(ms->exu);free(ms->emoe);free(ms->logits);free(ms->sc);
+    free(ms->tmp2);free(ms->exg);free(ms->exu);free(ms->emoe);free(ms->bk);free(ms->bw);free(ms->bcnt);free(ms->logits);free(ms->sc);
     free(ms); m->ms=NULL;
 }
 static int m3_alloc_mstream(m3_model*m,int N){
@@ -643,6 +644,7 @@ static int m3_alloc_mstream(m3_model*m,int N){
     ms->ffg=malloc((size_t)N*c->dense_inter*4); ms->ffu=malloc((size_t)N*c->dense_inter*4);
     ms->tmp2=malloc((size_t)N*H*4);
     ms->exg=malloc((size_t)c->moe_inter*4); ms->exu=malloc((size_t)c->moe_inter*4); ms->emoe=malloc((size_t)H*4);
+    ms->bk=malloc((size_t)c->n_experts*N*sizeof(int)); ms->bw=malloc((size_t)c->n_experts*N*4); ms->bcnt=malloc((size_t)c->n_experts*sizeof(int));
     ms->logits=malloc((size_t)N*hrows*4); ms->sc=malloc((size_t)N*c->max_pos*4);
     if(!ms->kc||!ms->vc||!ms->logits){ m->ms=ms; m3_free_mstream(m); return -1; }
     m->ms=ms; return 0;
@@ -703,14 +705,20 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
                 for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
                 float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
-            /* owned-expert compute: serial over streams (shared expert scratch + parallel matvec) */
-            for(int t=0;t<N;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na; float*h2t=ms->h2+(size_t)t*H,*rt=ms->route+(size_t)t*H;
-                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size; float w=sw[a];
-                    m3_mv_bf16(ms->exg,(uint16_t*)L->ex_w1[slot].w,h2t,c->moe_inter,H);
-                    m3_mv_bf16(ms->exu,(uint16_t*)L->ex_w3[slot].w,h2t,c->moe_inter,H);
-                    for(int i=0;i<c->moe_inter;i++) ms->exg[i]=m3_swiglu_oai(ms->exg[i],ms->exu[i],c->swiglu_alpha,c->swiglu_limit);
-                    m3_mv_bf16(ms->emoe,(uint16_t*)L->ex_w2[slot].w,ms->exg,H,c->moe_inter);
-                    for(int i=0;i<H;i++) rt[i]+=w*ms->emoe[i]; } }
+            /* EXPERT GROUPING: bucket tokens by owned expert, run ONE M=g GEMM per owned
+             * expert (weight read once for the whole group) instead of M=1 per (token,expert). */
+            for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
+            for(int t=0;t<N;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na;
+                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
+                    int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*N+g]=t; ms->bw[(size_t)slot*N+g]=sw[a]; } }
+            for(int s=0;s<L->n_owned;s++){ int g=ms->bcnt[s]; if(g==0) continue;
+                for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*N+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
+                m3_gemm_bf16(ms->shg,(uint16_t*)L->ex_w1[s].w,ms->o,g,c->moe_inter,H);
+                m3_gemm_bf16(ms->shu,(uint16_t*)L->ex_w3[s].w,ms->o,g,c->moe_inter,H);
+                for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=m3_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+                m3_gemm_bf16(ms->tmp2,(uint16_t*)L->ex_w2[s].w,ms->shg,g,H,c->moe_inter);
+                for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*N+i]; float w=ms->bw[(size_t)s*N+i]; float*rt=ms->route+(size_t)t*H,*dn=ms->tmp2+(size_t)i*H;
+                    for(int j=0;j<H;j++) rt[j]+=w*dn[j]; } }
             /* comm-overlap: issue the routed reduce on the comm-driver thread, compute the
              * (replicated) shared expert during it, then wait. Needs shared replicated (!tp_sh)
              * so it is independent of the route buffer being reduced. */
