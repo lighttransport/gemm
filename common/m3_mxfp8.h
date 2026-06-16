@@ -77,8 +77,37 @@ static inline void m3_matvec_mxfp8_8row(float*dst,
     dst[0]=svaddv_f32(pt,a0); dst[1]=svaddv_f32(pt,a1); dst[2]=svaddv_f32(pt,a2); dst[3]=svaddv_f32(pt,a3);
     dst[4]=svaddv_f32(pt,a4); dst[5]=svaddv_f32(pt,a5); dst[6]=svaddv_f32(pt,a6); dst[7]=svaddv_f32(pt,a7);
 }
+/* Decode-once for multi-stream: decode one row's [col0,col0+kl) MXFP8 -> bf16 into dst[0..kl).
+ * FP8 E4M3 has <=3 mantissa bits; x 2^(e8m0-127) only shifts the exponent, so the f32 result's
+ * low 16 mantissa bits are always zero => bf16 = (f32_bits>>16) is EXACT (no rounding). The
+ * caller then runs N cheap bf16 matvecs over the decoded tile, amortizing this gather-decode by
+ * N (the multi-stream win: the FP8->f32 LUT gather is the expensive part, done once not N times).
+ * col0 and kl are 32-aligned in practice (tile boundaries), so each 32-col block has one scale. */
+static inline void m3_mxfp8_decode_row_bf16(uint16_t*restrict dst, const uint8_t*w,
+        const uint8_t*s, int col0, int kl, const uint32_t*lut){
+    int vl=(int)svcntw();
+    for(int b=0;b<kl;b+=M3_MX_BLK){
+        int absc=col0+b; float sc=m3_e8m0(s[absc/M3_MX_BLK]);
+        int bend=b+M3_MX_BLK<kl?b+M3_MX_BLK:kl;
+        for(int c=b;c<bend;c+=vl){
+            svbool_t pg=svwhilelt_b32(c,bend);
+            svuint32_t idx=svld1ub_u32(pg,&w[col0+c]);
+            svfloat32_t wv=svreinterpret_f32_u32(svld1_gather_u32index_u32(pg,lut,idx));
+            svfloat32_t scaled=svmul_n_f32_x(pg,wv,sc);
+            svuint32_t hi=svlsr_n_u32_x(pg,svreinterpret_u32_f32(scaled),16);
+            svst1h_u32(pg,&dst[c],hi);   /* store low 16 bits of (bits>>16) = bf16 */
+        }
+    }
+}
 #else
 #define m3_matvec_mxfp8_8row m3_matvec_mxfp8_8row_ref
+/* scalar decode-to-bf16 fallback (exact: low 16 bits of f32 are zero for fp8*2^k) */
+static inline void m3_mxfp8_decode_row_bf16(uint16_t*restrict dst, const uint8_t*w,
+        const uint8_t*s, int col0, int kl, const uint32_t*lut){
+    for(int i=0;i<kl;i++){ int absc=col0+i; float sc=m3_e8m0(s[absc/M3_MX_BLK]);
+        float wf; uint32_t u=lut[w[absc]]; memcpy(&wf,&u,4); wf*=sc;
+        uint32_t bits; memcpy(&bits,&wf,4); dst[i]=(uint16_t)(bits>>16); }
+}
 #endif
 
 #endif /* M3_MXFP8_H */

@@ -53,6 +53,34 @@ static inline uint16_t m3_f2bf(float f){
 }
 static inline float m3_bf2f(uint16_t h){ return bf16_to_f32_scalar(h); }
 
+/* ===================== int4-KV codec (M3_INT4_KV, for 1M context) =====================
+ * Per group of n (== head_dim) values: signed int4 (+/-7), scale = absmax/7 stored bf16.
+ * ~3.9x smaller than bf16 (n/2 bytes + 1 bf16 scale vs 2n bytes). Used for the k/v/idx
+ * caches; dequant happens on read in the attention/index loops (decode is latency-bound,
+ * scalar matches the existing bf16 inner loops). n must be even. */
+static inline uint16_t m3_q4_pack(uint8_t*restrict q, const float*v, int n){
+    float amax=0; for(int i=0;i<n;i++){ float a=fabsf(v[i]); if(a>amax)amax=a; }
+    float inv = amax>0 ? 7.0f/amax : 0.0f;
+    for(int i=0;i<n;i+=2){
+        int a=(int)lrintf(v[i]*inv);   if(a>7)a=7; else if(a<-7)a=-7;
+        int b=(int)lrintf(v[i+1]*inv); if(b>7)b=7; else if(b<-7)b=-7;
+        q[i>>1]=(uint8_t)((a&0xF)|((b&0xF)<<4));
+    }
+    return m3_f2bf(amax/7.0f);
+}
+static inline float m3_q4_dot(const uint8_t*restrict q, uint16_t scbf, const float*restrict x, int n){
+    double d=0; for(int i=0;i<n;i+=2){ uint8_t by=q[i>>1];
+        int a=(int)(int8_t)(by<<4)>>4, b=(int)(int8_t)by>>4;   /* sign-extend low/high nibble */
+        d += (double)a*x[i] + (double)b*x[i+1]; }
+    return (float)(d*m3_bf2f(scbf));
+}
+static inline void m3_q4_axpy(float*restrict out, const uint8_t*restrict q, uint16_t scbf, float w, int n){
+    float ws=w*m3_bf2f(scbf);
+    for(int i=0;i<n;i+=2){ uint8_t by=q[i>>1];
+        int a=(int)(int8_t)(by<<4)>>4, b=(int)(int8_t)by>>4;
+        out[i]+=ws*a; out[i+1]+=ws*b; }
+}
+
 static uint64_t m3_sm;
 static inline double m3_sm_next(void){
     m3_sm += 0x9E3779B97F4A7C15ull; uint64_t z=m3_sm;
@@ -260,6 +288,7 @@ static void m3_free(m3_model*m){
         free(L->input_norm);free(L->post_norm);
         free(L->wq.w);free(L->wk.w);free(L->wv.w);free(L->wo.w);free(L->q_norm);free(L->k_norm);
         free(L->k_cache);free(L->v_cache);
+        free(L->k_q4);free(L->v_q4);free(L->k_qs);free(L->v_qs);free(L->idx_q4);free(L->idx_qs);
         if(m3_is_moe(&m->cfg,l)){
             free(L->idx_wq.w);free(L->idx_wk.w);free(L->idx_q_norm);free(L->idx_k_norm);free(L->idx_k_cache);
             free(L->gate.w);free(L->gate_bias);free(L->sh_w1.w);free(L->sh_w3.w);free(L->sh_w2.w);
@@ -275,15 +304,38 @@ static void m3_free(m3_model*m){
     free(m);
 }
 
+/* init int4-KV / CP flags from env (call once after ep_rank/ep_size set, before m3_alloc_kv). */
+static void m3_kv_init(m3_model*m){
+    const m3_config*c=&m->cfg;
+    m->int4_kv =m3_envi("M3_INT4_KV",0);       /* int4 KV (independent of CP; both for 1M) */
+    m->cp_on   =m3_envi("M3_CP",0) && m->ep_size>1;
+    m->cp_block=c->msa_block_size;             /* CP shard granularity == MSA block (128) */
+    m->cp_nslot=m3_cp_nslot(c->max_pos,m->cp_block,m->ep_size,m->cp_on);
+}
+/* allocate this layer's KV cache (bf16 or int4, sized to cp_nslot owned slots). */
+static void m3_alloc_kv(m3_model*m,m3_layer*L,int is_moe,size_t*used){
+    const m3_config*c=&m->cfg; int KVD=m3_kv_dim(c), KVH=c->n_kv_heads, ID=c->msa_index_dim;
+    size_t ns=(size_t)m->cp_nslot;
+    if(m->int4_kv){
+        L->k_q4=calloc(ns*(KVD/2),1); L->v_q4=calloc(ns*(KVD/2),1);
+        L->k_qs=calloc(ns*KVH,2);     L->v_qs=calloc(ns*KVH,2);
+        *used += 2*(ns*(KVD/2)+ns*KVH*2);
+        if(is_moe){ L->idx_q4=calloc(ns*(ID/2),1); L->idx_qs=calloc(ns,2); *used += ns*(ID/2)+ns*2; }
+    } else {
+        L->k_cache=calloc(ns*KVD,2); L->v_cache=calloc(ns*KVD,2); *used += 2*ns*KVD*2;
+        if(is_moe){ L->idx_k_cache=calloc(ns*ID,2); *used += ns*ID*2; }
+    }
+}
+
 static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_threads,int n_cmgs){
     m3_model*m=calloc(1,sizeof(m3_model)); if(!m) return NULL;
     m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs;
-    m->bf16_mv_qt=M3_BF16;
+    m->bf16_mv_qt=M3_BF16; m3_kv_init(m);
     const int H=cfg.hidden, QD=m3_q_dim(&cfg), KVD=m3_kv_dim(&cfg), HD=cfg.head_dim;
     const int IQD=m3_idx_q_dim(&cfg), ID=cfg.msa_index_dim, half=cfg.rotary_dim/2;
-    /* TP flags */
+    /* TP flags (TP_ATTN forced off under CP: each rank needs all query heads to merge position-shards) */
     int tp=m3_envi("M3_TP",0);
-    int tp_attn=m3_envi("M3_TP_ATTN",tp), tp_sh=m3_envi("M3_TP_SHARED",tp);
+    int tp_attn=m3_envi("M3_TP_ATTN",tp) && !m->cp_on; int tp_sh=m3_envi("M3_TP_SHARED",tp);
     int tp_ffn=m3_envi("M3_TP_FFN",tp), tp_head=m3_envi("M3_TP_HEAD",tp), tp_emb=m3_envi("M3_TP_EMBED",tp);
     int qh0,qh1; if(tp_attn) m3_shard_heads(cfg.n_heads,ep_rank,ep_size,&qh0,&qh1); else { qh0=0; qh1=cfg.n_heads; }
     int qrows=(qh1-qh0)*HD;
@@ -315,14 +367,12 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
         BF(p,(size_t)H*qrows,0.03f); L->wo=(m3_tensor){p,NULL,M3_BF16,H,qrows};
         BF(L->q_norm,HD,0.1f); BF(L->k_norm,HD,0.1f);
         L->qh0=qh0; L->qh1=qh1;
-        L->k_cache=calloc((size_t)cfg.max_pos*KVD,2); L->v_cache=calloc((size_t)cfg.max_pos*KVD,2);
-        used+=2*(size_t)cfg.max_pos*KVD*2;
+        m3_alloc_kv(m,L,is_moe,&used);
         if(is_moe){
             /* MSA indexer (replicated) */
             BF(p,(size_t)IQD*H,0.03f); L->idx_wq=(m3_tensor){p,NULL,M3_BF16,IQD,H};
             BF(p,(size_t)ID*H,0.03f);  L->idx_wk=(m3_tensor){p,NULL,M3_BF16,ID,H};
             BF(L->idx_q_norm,ID,0.1f); BF(L->idx_k_norm,ID,0.1f);
-            L->idx_k_cache=calloc((size_t)cfg.max_pos*ID,2); used+=(size_t)cfg.max_pos*ID*2;
             /* MoE */
             float*g; FZ(g,(size_t)cfg.n_experts*H,0.03f); L->gate=(m3_tensor){g,NULL,M3_F32,cfg.n_experts,H};
             FZ(L->gate_bias,cfg.n_experts,0.1f);
@@ -418,11 +468,11 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     const uint8_t*base=mmap(NULL,bsz,PROT_READ,MAP_PRIVATE,bfd,0);
     if(base==MAP_FAILED){ fprintf(stderr,"m3_load: mmap failed\n"); close(bfd); free(es); return NULL; }
 
-    m3_model*m=calloc(1,sizeof(m3_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=M3_BF16;
+    m3_model*m=calloc(1,sizeof(m3_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=M3_BF16; m3_kv_init(m);
     const int H=cfg.hidden, QD=m3_q_dim(&cfg), KVD=m3_kv_dim(&cfg), HD=cfg.head_dim;
     const int IQD=m3_idx_q_dim(&cfg), ID=cfg.msa_index_dim, half=cfg.rotary_dim/2;
     int tp=m3_envi("M3_TP",0);
-    int tp_attn=m3_envi("M3_TP_ATTN",tp),tp_sh=m3_envi("M3_TP_SHARED",tp),tp_ffn=m3_envi("M3_TP_FFN",tp),tp_head=m3_envi("M3_TP_HEAD",tp),tp_emb=m3_envi("M3_TP_EMBED",tp);
+    int tp_attn=m3_envi("M3_TP_ATTN",tp) && !m->cp_on; int tp_sh=m3_envi("M3_TP_SHARED",tp),tp_ffn=m3_envi("M3_TP_FFN",tp),tp_head=m3_envi("M3_TP_HEAD",tp),tp_emb=m3_envi("M3_TP_EMBED",tp);
     int qh0,qh1; if(tp_attn) m3_shard_heads(cfg.n_heads,ep_rank,ep_size,&qh0,&qh1); else { qh0=0; qh1=cfg.n_heads; } int qrows=(qh1-qh0)*HD;
     int sh_r0,sh_rows; if(tp_sh) m3_shard(cfg.moe_inter,ep_rank,ep_size,&sh_r0,&sh_rows); else { sh_r0=0; sh_rows=cfg.moe_inter; }
     int ff_r0,ff_rows; if(tp_ffn) m3_shard(cfg.dense_inter,ep_rank,ep_size,&ff_r0,&ff_rows); else { ff_r0=0; ff_rows=cfg.dense_inter; }
@@ -453,13 +503,12 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
         { m3_ent*e=REQ(LN("self_attn.q_norm.weight")); if(e) L->q_norm=m3_cp_full(base,e); }
         { m3_ent*e=REQ(LN("self_attn.k_norm.weight")); if(e) L->k_norm=m3_cp_full(base,e); }
         L->qh0=qh0; L->qh1=qh1;
-        L->k_cache=calloc((size_t)cfg.max_pos*KVD,2); L->v_cache=calloc((size_t)cfg.max_pos*KVD,2);
+        m3_alloc_kv(m,L,is_moe,&used);
         if(is_moe){
             L->idx_wq=m3_load_w(es,n,base,LN("self_attn.index_q_proj.weight"),0,0,0,0,0,IQD,H,&ok,&used);
             L->idx_wk=m3_load_w(es,n,base,LN("self_attn.index_k_proj.weight"),0,0,0,0,0,ID,H,&ok,&used);
             { m3_ent*e=REQ(LN("self_attn.index_q_norm.weight")); if(e) L->idx_q_norm=m3_cp_full(base,e); }
             { m3_ent*e=REQ(LN("self_attn.index_k_norm.weight")); if(e) L->idx_k_norm=m3_cp_full(base,e); }
-            L->idx_k_cache=calloc((size_t)cfg.max_pos*ID,2);
             { m3_ent*e=REQ(LN("block_sparse_moe.gate.weight")); if(e) L->gate=(m3_tensor){m3_cp_full(base,e),NULL,M3_F32,cfg.n_experts,H}; }
             { m3_ent*e=REQ(LN("block_sparse_moe.e_score_correction_bias")); if(e) L->gate_bias=m3_cp_full(base,e); }
             L->sh_w1=m3_load_w(es,n,base,LN("block_sparse_moe.shared_experts.gate_proj.weight"),1,sh_r0,sh_rows,0,0,cfg.moe_inter,H,&ok,&used);
@@ -501,9 +550,32 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     return m;
 }
 
+/* ===================== KV cache accessors (bf16 or int4, CP slot-mapped) ===================== */
+/* dot(q_head, k[pos,kvh]) without the 1/sqrt(d) scale; reads bf16 or int4 at the CP slot. */
+static inline float m3_kdot(m3_model*m,m3_layer*L,int t,int kvh,const float*qh,int HD,int KVH){
+    long sl=m3_cp_slot(m,t);
+    if(m->int4_kv) return m3_q4_dot(L->k_q4+sl*(size_t)(KVH*HD/2)+(size_t)kvh*(HD/2), L->k_qs[sl*KVH+kvh], qh, HD);
+    const uint16_t*kt=L->k_cache+sl*(size_t)(KVH*HD)+(size_t)kvh*HD; double d=0; for(int i=0;i<HD;i++) d+=(double)qh[i]*m3_bf2f(kt[i]); return (float)d;
+}
+/* oh[i] += w * v[pos,kvh][i] */
+static inline void m3_vaxpy(m3_model*m,m3_layer*L,int t,int kvh,float w,float*oh,int HD,int KVH){
+    long sl=m3_cp_slot(m,t);
+    if(m->int4_kv){ m3_q4_axpy(oh, L->v_q4+sl*(size_t)(KVH*HD/2)+(size_t)kvh*(HD/2), L->v_qs[sl*KVH+kvh], w, HD); return; }
+    const uint16_t*vt=L->v_cache+sl*(size_t)(KVH*HD)+(size_t)kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]);
+}
+/* dot(idx_q_head, idx_k[pos]) for MSA block scoring (1 MQA key head) */
+static inline float m3_idxdot(m3_model*m,m3_layer*L,int t,const float*qh,int ID){
+    long sl=m3_cp_slot(m,t);
+    if(m->int4_kv) return m3_q4_dot(L->idx_q4+sl*(size_t)(ID/2), L->idx_qs[sl], qh, ID);
+    const uint16_t*kt=L->idx_k_cache+sl*(size_t)ID; float d=0; for(int i=0;i<ID;i++) d+=qh[i]*m3_bf2f(kt[i]); return d;
+}
+
 /* ===================== MSA: build the selected-position list for a sparse layer ===================== */
-/* Returns nsel positions in sel[]; computes idx_q/idx_k, stores idx_k_cache[pos]. When the
- * block count is <= K+local+init (or MSA off) it returns the full causal range [0..pos]. */
+/* Returns nsel positions in sel[] (this rank's OWNED positions under CP); computes idx_q/idx_k,
+ * stores idx_k at the owner's slot. When the block count is <= K+local+init (or MSA off) it
+ * returns the full causal range (owned subset under CP). Under CP each rank scores only its
+ * owned blocks, then blk_reduce_cb (all-reduce MAX) gives every rank the same global selection;
+ * the cross-rank attention partials are merged later by kv_combine_cb. */
 static int m3_msa_select(m3_model*m,m3_layer*L,const float*xn,int pos,int msa_on,int*sel){
     const m3_config*c=&m->cfg;
     const int ID=c->msa_index_dim, IH=c->msa_n_index_heads, B=c->msa_block_size, half=c->rotary_dim/2;
@@ -514,33 +586,41 @@ static int m3_msa_select(m3_model*m,m3_layer*L,const float*xn,int pos,int msa_on
     m3_mv(m,ik,&L->idx_wk,xn,ID,c->hidden);
     for(int h=0;h<IH;h++){ float*qh=iq+h*ID; m3_rmsnorm_head(qh,L->idx_q_norm,ID,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
     m3_rmsnorm_head(ik,L->idx_k_norm,ID,c->norm_eps); m3_rope_head(ik,cosp,sinp,c->rotary_dim);
-    for(int i=0;i<ID;i++) L->idx_k_cache[(size_t)pos*ID+i]=m3_f2bf(ik[i]);
+    if(m3_cp_mine(m,pos)){ long sl=m3_cp_slot(m,pos);            /* store this pos's index key (owner only) */
+        if(m->int4_kv) L->idx_qs[sl]=m3_q4_pack(L->idx_q4+sl*(size_t)(ID/2), ik, ID);
+        else for(int i=0;i<ID;i++) L->idx_k_cache[sl*(size_t)ID+i]=m3_f2bf(ik[i]); }
 
     int nblk=pos/B+1;
     int keep=c->msa_topk_blocks+c->msa_local_block+c->msa_init_block;
-    if(!msa_on || nblk<=keep){ for(int t=0;t<=pos;t++) sel[t]=t; return pos+1; }
-    /* per-block score = max over positions in block of sum_h dot(idx_q_h, idx_k_cache[t]) */
-    float*bs=m->s_blk_score;
-    for(int b=0;b<nblk;b++){
-        int t0=b*B, t1=t0+B; if(t1>pos+1)t1=pos+1; float best=-1e30f;
-        for(int t=t0;t<t1;t++){ const uint16_t*kt=L->idx_k_cache+(size_t)t*ID; float sc=0;
-            for(int h=0;h<IH;h++){ const float*qh=iq+h*ID; float d=0; for(int i=0;i<ID;i++) d+=qh[i]*m3_bf2f(kt[i]); sc+=d; }
-            if(sc>best)best=sc; }
-        bs[b]=best;
+    int dense_sel = (!msa_on || nblk<=keep);   /* attend all causal positions */
+    char*selb=(char*)m->s_blk_sel;             /* reuse first nblk bytes as a block-selected bitmap */
+    if(dense_sel){ for(int b=0;b<nblk;b++) selb[b]=1; }
+    else {
+        /* per-block score = max over positions of sum_h dot(idx_q_h, idx_k[t]); only OWN blocks */
+        float*bs=m->s_blk_score;
+        for(int b=0;b<nblk;b++){
+            if(m->cp_on && b%m->ep_size!=m->ep_rank){ bs[b]=-1e30f; continue; }   /* not my block */
+            int t0=b*B, t1=t0+B; if(t1>pos+1)t1=pos+1; float best=-1e30f;
+            for(int t=t0;t<t1;t++){ float scr=0; for(int h=0;h<IH;h++) scr+=m3_idxdot(m,L,t,iq+h*ID,ID); if(scr>best)best=scr; }
+            bs[b]=best;
+        }
+        if(m->cp_on && m->blk_reduce_cb) m->blk_reduce_cb(bs,nblk,m->blk_reduce_ctx);  /* global block scores */
+        for(int b=0;b<nblk;b++) selb[b]=0;
+        for(int b=0;b<c->msa_init_block && b<nblk;b++) selb[b]=1;                 /* init blocks */
+        for(int b=nblk-c->msa_local_block;b<nblk;b++) if(b>=0) selb[b]=1;          /* local blocks */
+        for(int pick=0;pick<c->msa_topk_blocks;pick++){                            /* top-K by score */
+            int best=-1; float bv=-1e30f;
+            for(int b=0;b<nblk;b++){ if(selb[b])continue; if(bs[b]>bv){bv=bs[b];best=b;} }
+            if(best<0)break; selb[best]=1;
+        }
     }
-    char*selb=(char*)m->s_blk_sel;    /* reuse first nblk bytes as a block-selected bitmap */
-    for(int b=0;b<nblk;b++) selb[b]=0;
-    for(int b=0;b<c->msa_init_block && b<nblk;b++) selb[b]=1;                 /* init blocks */
-    for(int b=nblk-c->msa_local_block;b<nblk;b++) if(b>=0) selb[b]=1;          /* local blocks */
-    for(int pick=0;pick<c->msa_topk_blocks;pick++){                            /* top-K by score */
-        int best=-1; float bv=-1e30f;
-        for(int b=0;b<nblk;b++){ if(selb[b])continue; if(bs[b]>bv){bv=bs[b];best=b;} }
-        if(best<0)break; selb[best]=1;
-    }
-    /* gather selected positions (causal) into sel[] AFTER reading the bitmap (separate region) */
+    /* gather selected positions (causal); under CP keep only my owned blocks. Write past the
+     * nblk-byte bitmap region, then memmove down. */
     int nsel=0;
-    for(int b=0;b<nblk;b++){ if(!selb[b])continue; int t0=b*B,t1=t0+B; if(t1>pos+1)t1=pos+1;
-        for(int t=t0;t<t1;t++) sel[nblk+nsel++]=t; }       /* write past the nblk-byte bitmap */
+    for(int b=0;b<nblk;b++){ if(!selb[b])continue;
+        if(m->cp_on && b%m->ep_size!=m->ep_rank) continue;     /* another rank owns this block */
+        int t0=b*B,t1=t0+B; if(t1>pos+1)t1=pos+1;
+        for(int t=t0;t<t1;t++) sel[nblk+nsel++]=t; }
     memmove(sel,sel+nblk,(size_t)nsel*sizeof(int));
     return nsel;
 }
@@ -566,20 +646,28 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
         m3_mv(m,vb,&L->wv,xn,KVD,H);
         for(int hh=0;hh<nown;hh++){ float*qh=q+hh*HD; if(c->use_qk_norm) m3_rmsnorm_head(qh,L->q_norm,HD,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
         for(int kh=0;kh<KVH;kh++){ float*kk=kb+kh*HD; if(c->use_qk_norm) m3_rmsnorm_head(kk,L->k_norm,HD,c->norm_eps); m3_rope_head(kk,cosp,sinp,c->rotary_dim); }
-        for(int i=0;i<KVD;i++){ L->k_cache[(size_t)pos*KVD+i]=m3_f2bf(kb[i]); L->v_cache[(size_t)pos*KVD+i]=m3_f2bf(vb[i]); }
-        /* selected positions (MSA on sparse layers; full causal otherwise) */
+        /* store k/v at the owner's slot (bf16 or int4); under CP only the owning rank stores */
+        if(m3_cp_mine(m,pos)){ long sl=m3_cp_slot(m,pos);
+            if(m->int4_kv) for(int kh=0;kh<KVH;kh++){ L->k_qs[sl*KVH+kh]=m3_q4_pack(L->k_q4+sl*(size_t)(KVD/2)+(size_t)kh*(HD/2),kb+kh*HD,HD);
+                                                      L->v_qs[sl*KVH+kh]=m3_q4_pack(L->v_q4+sl*(size_t)(KVD/2)+(size_t)kh*(HD/2),vb+kh*HD,HD); }
+            else for(int i=0;i<KVD;i++){ L->k_cache[sl*(size_t)KVD+i]=m3_f2bf(kb[i]); L->v_cache[sl*(size_t)KVD+i]=m3_f2bf(vb[i]); } }
+        /* selected positions (MSA on sparse layers; full causal otherwise); under CP = owned subset */
         int*selp=m->s_blk_sel;
         int nsel; int sparse=is_moe;       /* M3: sparse layers == moe layers (L>=n_dense) */
         if(sparse) nsel=m3_msa_select(m,L,xn,pos,msa_on,selp);
-        else { for(int t=0;t<=pos;t++) selp[t]=t; nsel=pos+1; }
-        /* GQA attention over selected positions, owned heads -> attn[hh*HD] */
+        else { nsel=0; for(int t=0;t<=pos;t++) if(m3_cp_mine(m,t)) selp[nsel++]=t; }
+        /* GQA attention over selected positions; flash form (unnormalized), owned heads -> attn[hh*HD].
+         * Under CP the per-rank partials (oh,max,sumexp) are merged by kv_combine_cb. */
+        float hmx[64], hse[64];
         for(int hh=0;hh<nown;hh++){ int h=qh0+hh; float*qh=q+hh*HD; int kvh=h/grp; float mx=-1e30f;
-            for(int j=0;j<nsel;j++){ int t=selp[j]; const uint16_t*kt=L->k_cache+(size_t)t*KVD+kvh*HD; double d=0;
-                for(int i=0;i<HD;i++) d+=(double)qh[i]*m3_bf2f(kt[i]); float s=(float)d*ascale; sc[j]=s; if(s>mx)mx=s; }
-            double sum=0; for(int j=0;j<nsel;j++){ float e=expf(sc[j]-mx); sc[j]=e; sum+=e; }
-            float inv=(float)(1.0/(sum>0?sum:1)); float*oh=attn+hh*HD; for(int i=0;i<HD;i++) oh[i]=0;
-            for(int j=0;j<nsel;j++){ int t=selp[j]; float w=sc[j]*inv; const uint16_t*vt=L->v_cache+(size_t)t*KVD+kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]); } }
-        /* o_proj (wo cols = owned head cols); partial under TP_ATTN -> ar_cb sum */
+            for(int j=0;j<nsel;j++){ float s=m3_kdot(m,L,selp[j],kvh,qh,HD,KVH)*ascale; sc[j]=s; if(s>mx)mx=s; }
+            double sum=0; float*oh=attn+hh*HD; for(int i=0;i<HD;i++) oh[i]=0;
+            for(int j=0;j<nsel;j++){ float e=expf(sc[j]-mx); sum+=e; m3_vaxpy(m,L,selp[j],kvh,e,oh,HD,KVH); }
+            hmx[hh]=(nsel>0?mx:-1e30f); hse[hh]=(float)sum;          /* unnormalized; finalize below */
+        }
+        if(m->cp_on && m->kv_combine_cb) m->kv_combine_cb(attn,hmx,hse,nown,HD,m->kv_combine_ctx);
+        else for(int hh=0;hh<nown;hh++){ float inv=1.0f/(hse[hh]>0?hse[hh]:1); float*oh=attn+hh*HD; for(int i=0;i<HD;i++) oh[i]*=inv; }
+        /* o_proj (wo cols = owned head cols); partial under TP_ATTN -> ar_cb sum (CP: full, no reduce) */
         m3_mv(m,ao,&L->wo,attn,H,qrows);
         if(tp_attn && m->ar_cb) m->ar_cb(ao,H,m->ar_ctx);
         for(int i=0;i<H;i++) x[i]+=ao[i];
@@ -674,9 +762,11 @@ static void m3_gemm_bf16(float*restrict Y, const uint16_t*W, const float*X, int 
     for(int r=nb*8;r<rows;r++) for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=vec_dot_bf16_f32(W+(size_t)r*cols,X+(size_t)t*cols,cols);
 }
 
-/* batched MXFP8 GEMM: Y[N,rows] = decode(W fp8 + S e8m0) . X[N,cols]. One omp region over
- * 8-row blocks; inner loop over the N tokens (FP8 weight re-read per token; the memory win is
- * the half-size HBM read). */
+/* batched MXFP8 GEMM: Y[N,rows] = decode(W fp8 + S e8m0) . X[N,cols]. For N>1 the expensive
+ * part is the FP8 LUT-gather decode -- so we decode each 8-row x TILE block ONCE into a bf16
+ * tile (FP8*2^k is exact in bf16), then run N cheap matvec_bf16_8row over it. This amortizes
+ * the decode by N (the multi-stream win). N==1 uses the direct fused kernel (no tile staging). */
+#define M3_MXG_TILE 512
 static void m3_gemm_mxfp8(m3_model*m, float*restrict Y, const uint8_t*W, const uint8_t*S, const float*X, int N, int rows, int cols){
     const uint32_t*lut=m->fp8_lut; int sb=cols/M3_MX_BLK, nb=rows/8;
     if(m3_dummy){ double acc=0;
@@ -685,13 +775,28 @@ static void m3_gemm_mxfp8(m3_model*m, float*restrict Y, const uint8_t*W, const u
 #endif
         for(int r=0;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=64) s+=w[i]; acc+=s; }
         float v=(float)(((long)acc)&1)*1e-30f; for(size_t i=0;i<(size_t)N*rows;i++) Y[i]=v; return; }
+    if(N==1){  /* direct fused: no tile, decode==matvec are one pass */
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if((long)rows>=M3_PAR_MIN)
+        #pragma omp parallel for schedule(static) if((long)rows>=M3_PAR_MIN)
 #endif
-    for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
-        for(int t=0;t<N;t++)
-            m3_matvec_mxfp8_8row(Y+(size_t)t*rows+r, w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
-                                 s,s+sb,s+2*sb,s+3*sb,s+4*sb,s+5*sb,s+6*sb,s+7*sb, X+(size_t)t*cols, cols, lut); }
+        for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
+            m3_matvec_mxfp8_8row(Y+r, w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
+                                 s,s+sb,s+2*sb,s+3*sb,s+4*sb,s+5*sb,s+6*sb,s+7*sb, X, cols, lut); }
+    } else {
+        int TILE=M3_MXG_TILE<cols?M3_MXG_TILE:cols;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if((long)rows>=M3_PAR_MIN)
+#endif
+        for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
+            uint16_t tile[8*M3_MXG_TILE];   /* decoded bf16 weights, 8KB/thread, L1-resident */
+            for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=0.f; }
+            for(int k0=0;k0<cols;k0+=TILE){ int kl=cols-k0<TILE?cols-k0:TILE;
+                for(int j=0;j<8;j++) m3_mxfp8_decode_row_bf16(tile+(size_t)j*kl, w+(size_t)j*cols, s+(size_t)j*sb, k0, kl, lut);
+                for(int t=0;t<N;t++){ float tmp[8];
+                    matvec_bf16_8row(tmp, tile,tile+kl,tile+2*kl,tile+3*kl,tile+4*kl,tile+5*kl,tile+6*kl,tile+7*kl, X+(size_t)t*cols+k0, kl);
+                    float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]+=tmp[j]; } }
+        }
+    }
     for(int r=nb*8;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
         for(int t=0;t<N;t++){ const float*x=X+(size_t)t*cols; double a=0;
             for(int b=0;b<cols;b+=M3_MX_BLK){ float sc=m3_e8m0(s[b/M3_MX_BLK]); int e=b+M3_MX_BLK<cols?b+M3_MX_BLK:cols;
