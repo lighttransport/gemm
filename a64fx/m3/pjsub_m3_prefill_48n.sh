@@ -5,7 +5,7 @@
 # all-reduce/layer/chunk). Target: chunked >= 100 tok/s.
 # Submit: ssh fugaku 'cd ~/work/gemm/ds4p && pjsub --no-check-directory a64fx/m3/pjsub_m3_prefill_48n.sh'
 #PJM -g hp250467
-#PJM -L "rscgrp=small-s2,node=4x4x3:torus,elapse=01:00:00"
+#PJM -L "rscgrp=small-s2,node=4x4x3:torus,elapse=01:30:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
 #PJM --mpi "proc=48"
 #PJM --llio localtmp-size=87Gi
@@ -30,10 +30,12 @@ topo_ok=0; for t in $(seq 1 20); do rm -f tofu_topo.txt
 echo "--- staging ($(date)) ---"; mpiexec -np $NP "$LLM/build/m3_stage" || { echo FATAL stage; exit 4; }
 # build a ~1020-token prompt by tiling the 6-token prompt_ids (throughput test)
 awk 'BEGIN{for(i=0;i<170;i++){while((getline l < "'"$M3"'/prompt_ids.txt")>0) printf "%s ",l; close("'"$M3"'/prompt_ids.txt")}}' > "$RUN/prompt_long.txt"
-echo "prompt tokens: $(wc -w < "$RUN/prompt_long.txt")"
+echo "prompt tokens: $(wc -w < "$RUN/prompt_long.txt")  file=$RUN/prompt_long.txt"
+export M3_REAL=1 M3_PROMPT_IDS="$RUN/prompt_long.txt"   # EXPORT so FjMPI propagates to all ranks
 for PC in 0 256; do
+  export M3_PCHUNK=$PC
   echo "--- M3_PCHUNK=$PC ($(date)) ---"
-  M3_REAL=1 M3_PCHUNK=$PC M3_PROMPT_IDS="$RUN/prompt_long.txt" \
-    mpiexec -np $NP "$LLM/build/m3_ep_runner" 2>&1 | grep -iE "prompt=|prefill|chunked|decode |NaN|FATAL" | head -6
+  mpiexec -np $NP "$LLM/build/m3_ep_runner" 2>&1 | grep -iE "prompt=|prefill|chunked|decode |NaN|FATAL" | head -4
+  echo "  rank0:"; grep -iE "prompt=|prefill|chunked|decode|NaN" m3_ep_rank00.txt 2>/dev/null | head -4
 done
 echo "=== done $(date) ==="
