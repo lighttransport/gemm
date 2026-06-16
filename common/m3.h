@@ -271,6 +271,7 @@ typedef struct {
      * stores only cp_nslot owned slots. Decode does a flash-style cross-rank combine of the
      * per-rank partial attention ( kv_combine_cb) + a cross-rank top-k block merge for MSA. */
     int int4_kv, cp_on, cp_nslot, cp_block;
+    int kv_fp16;   /* uint16 KV path stores IEEE fp16 (M3_KV_FP16) instead of bf16 (quality ref) */
     /* flash-combine of [n_heads*head_dim] partial out + per-head (max,sumexp) across EP ranks.
      * The runner provides a uTofu all-reduce specialized for the online-softmax merge. */
     void  (*kv_combine_cb)(float *out, float *mx, float *sumexp, int n_heads, int head_dim, void *ctx);

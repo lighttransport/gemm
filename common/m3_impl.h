@@ -52,6 +52,14 @@ static inline uint16_t m3_f2bf(float f){
     uint32_t r=u+0x7fffu+((u>>16)&1u); return (uint16_t)(r>>16);
 }
 static inline float m3_bf2f(uint16_t h){ return bf16_to_f32_scalar(h); }
+/* IEEE fp16 (half) KV codec: ~11-bit mantissa vs bf16's 8 -> higher KV fidelity (the model
+ * computes K/V in f32, so bf16 storage already quantizes; fp16 is the higher-precision option
+ * for the quality A/B vs int4). Same 2 bytes/elem as bf16. A64FX has native fp16. */
+static inline uint16_t m3_f2h(float f){ __fp16 h=(__fp16)f; uint16_t u; memcpy(&u,&h,2); return u; }
+static inline float    m3_h2f(uint16_t u){ __fp16 h; memcpy(&h,&u,2); return (float)h; }
+/* uint16 KV path encode/decode, bf16 (default) or fp16 (M3_KV_FP16=1). */
+static inline uint16_t m3_kv_enc(const m3_model*m,float f){ return m->kv_fp16 ? m3_f2h(f) : m3_f2bf(f); }
+static inline float    m3_kv_dec(const m3_model*m,uint16_t u){ return m->kv_fp16 ? m3_h2f(u) : m3_bf2f(u); }
 
 /* ===================== int4-KV codec (M3_INT4_KV, for 1M context) =====================
  * Per group of n (== head_dim) values: signed int4 (+/-7), scale = absmax/7 stored bf16.
@@ -308,6 +316,7 @@ static void m3_free(m3_model*m){
 static void m3_kv_init(m3_model*m){
     const m3_config*c=&m->cfg;
     m->int4_kv =m3_envi("M3_INT4_KV",0);       /* int4 KV (independent of CP; both for 1M) */
+    m->kv_fp16 =m3_envi("M3_KV_FP16",0);        /* uint16 KV path: fp16 (1) vs bf16 (0) */
     m->cp_on   =m3_envi("M3_CP",0) && m->ep_size>1;
     m->cp_block=c->msa_block_size;             /* CP shard granularity == MSA block (128) */
     m->cp_nslot=m3_cp_nslot(c->max_pos,m->cp_block,m->ep_size,m->cp_on);
@@ -555,19 +564,19 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
 static inline float m3_kdot(m3_model*m,m3_layer*L,int t,int kvh,const float*qh,int HD,int KVH){
     long sl=m3_cp_slot(m,t);
     if(m->int4_kv) return m3_q4_dot(L->k_q4+sl*(size_t)(KVH*HD/2)+(size_t)kvh*(HD/2), L->k_qs[sl*KVH+kvh], qh, HD);
-    const uint16_t*kt=L->k_cache+sl*(size_t)(KVH*HD)+(size_t)kvh*HD; double d=0; for(int i=0;i<HD;i++) d+=(double)qh[i]*m3_bf2f(kt[i]); return (float)d;
+    const uint16_t*kt=L->k_cache+sl*(size_t)(KVH*HD)+(size_t)kvh*HD; double d=0; for(int i=0;i<HD;i++) d+=(double)qh[i]*m3_kv_dec(m,kt[i]); return (float)d;
 }
 /* oh[i] += w * v[pos,kvh][i] */
 static inline void m3_vaxpy(m3_model*m,m3_layer*L,int t,int kvh,float w,float*oh,int HD,int KVH){
     long sl=m3_cp_slot(m,t);
     if(m->int4_kv){ m3_q4_axpy(oh, L->v_q4+sl*(size_t)(KVH*HD/2)+(size_t)kvh*(HD/2), L->v_qs[sl*KVH+kvh], w, HD); return; }
-    const uint16_t*vt=L->v_cache+sl*(size_t)(KVH*HD)+(size_t)kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]);
+    const uint16_t*vt=L->v_cache+sl*(size_t)(KVH*HD)+(size_t)kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_kv_dec(m,vt[i]);
 }
 /* dot(idx_q_head, idx_k[pos]) for MSA block scoring (1 MQA key head) */
 static inline float m3_idxdot(m3_model*m,m3_layer*L,int t,const float*qh,int ID){
     long sl=m3_cp_slot(m,t);
     if(m->int4_kv) return m3_q4_dot(L->idx_q4+sl*(size_t)(ID/2), L->idx_qs[sl], qh, ID);
-    const uint16_t*kt=L->idx_k_cache+sl*(size_t)ID; float d=0; for(int i=0;i<ID;i++) d+=qh[i]*m3_bf2f(kt[i]); return d;
+    const uint16_t*kt=L->idx_k_cache+sl*(size_t)ID; float d=0; for(int i=0;i<ID;i++) d+=qh[i]*m3_kv_dec(m,kt[i]); return d;
 }
 
 /* ===================== MSA: build the selected-position list for a sparse layer ===================== */
@@ -588,7 +597,7 @@ static int m3_msa_select(m3_model*m,m3_layer*L,const float*xn,int pos,int msa_on
     m3_rmsnorm_head(ik,L->idx_k_norm,ID,c->norm_eps); m3_rope_head(ik,cosp,sinp,c->rotary_dim);
     if(m3_cp_mine(m,pos)){ long sl=m3_cp_slot(m,pos);            /* store this pos's index key (owner only) */
         if(m->int4_kv) L->idx_qs[sl]=m3_q4_pack(L->idx_q4+sl*(size_t)(ID/2), ik, ID);
-        else for(int i=0;i<ID;i++) L->idx_k_cache[sl*(size_t)ID+i]=m3_f2bf(ik[i]); }
+        else for(int i=0;i<ID;i++) L->idx_k_cache[sl*(size_t)ID+i]=m3_kv_enc(m,ik[i]); }
 
     int nblk=pos/B+1;
     int keep=c->msa_topk_blocks+c->msa_local_block+c->msa_init_block;
@@ -650,7 +659,7 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
         if(m3_cp_mine(m,pos)){ long sl=m3_cp_slot(m,pos);
             if(m->int4_kv) for(int kh=0;kh<KVH;kh++){ L->k_qs[sl*KVH+kh]=m3_q4_pack(L->k_q4+sl*(size_t)(KVD/2)+(size_t)kh*(HD/2),kb+kh*HD,HD);
                                                       L->v_qs[sl*KVH+kh]=m3_q4_pack(L->v_q4+sl*(size_t)(KVD/2)+(size_t)kh*(HD/2),vb+kh*HD,HD); }
-            else for(int i=0;i<KVD;i++){ L->k_cache[sl*(size_t)KVD+i]=m3_f2bf(kb[i]); L->v_cache[sl*(size_t)KVD+i]=m3_f2bf(vb[i]); } }
+            else for(int i=0;i<KVD;i++){ L->k_cache[sl*(size_t)KVD+i]=m3_kv_enc(m,kb[i]); L->v_cache[sl*(size_t)KVD+i]=m3_kv_enc(m,vb[i]); } }
         /* selected positions (MSA on sparse layers; full causal otherwise); under CP = owned subset */
         int*selp=m->s_blk_sel;
         int nsel; int sparse=is_moe;       /* M3: sparse layers == moe layers (L>=n_dense) */
