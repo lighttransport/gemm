@@ -31,7 +31,15 @@ forward, multi-stream batched decode, the tokenizer/gen path. Only 4 spots chang
   SVE LUT-gather decode FP8 E4M3 → exact f32, × E8M0 per-[1,32] scale `2^(b-127)`, FMA in f32.
   E8M0 convention pinned vs the real bf16 model (`max_rel_vs_bf16 = 0.000`; `scale_inv` =
   multiply, bias 127). SVE == scalar ref ~1e-7 native (`m3_mxfp8_test.c`, N=64/256/6144).
-- ⬜ type + loader + stager + forward dispatch (below).
+- ✅ **type + loader + forward dispatch DONE + validated native** (commits 5937767/ce8b50a).
+  M3_MXFP8 type, m3_mv/m3_gemm dispatch, m3_load_w mixed-precision loader, batched
+  m3_gemm_mxfp8. Stager needs NO change (scale tensors pass the same name-based classify).
+  **Single-node real-weight smoke (node b35-0105c):** staged m3-fp8 layers 0–3 (shards 1–2,
+  ep1) = 851 tensors (768 expert = 128×(3 FP8 + 3 E8M0 scale)), **13.6 GB blob** (vs 21.75 GB
+  bf16); `m3_real_test` **load OK 17.1 s** (vs 27.4 bf16), arena 13.33 GB, forward **NaNs=0**,
+  ‖x‖=5.86e3, prefill/decode ~12 tok/s. The full MXFP8 path works on real weights.
+- ⬜ remaining: free `.scale` in `m3_free`; 32-align `m3_shard` for MXFP8 col-shards at ep>1;
+  96-node stage+generate (coherence quality gate vs bf16) + mem (~7–8 GB/rank) / fewer-node demo.
 
 ## Implementation (4 changes)
 0. **Kernel — DONE** (above). Still needed: a batched `m3_gemm_mxfp8` (M=N) mirroring `m3_gemm_bf16`.
