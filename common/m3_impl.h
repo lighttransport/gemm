@@ -35,6 +35,7 @@
 #define M3_IMPL_H
 
 #include "m3.h"
+#include "m3_mxfp8.h"   /* FP8 E4M3 + E8M0 per-32 block scale matvec */
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -195,6 +196,31 @@ static void m3_mv_bf16(float*restrict y,const uint16_t*W,const float*x,int rows,
     for(int r=nb*8;r<rows;r++) y[r]=vec_dot_bf16_f32(W+(size_t)r*cols,x,cols);
 }
 
+/* MXFP8 matvec: y[rows] = decode(W fp8 + S e8m0) . x[cols], 8-row blocks via the kernel. */
+static void m3_mv_mxfp8(m3_model*m, float*restrict y, const uint8_t*W, const uint8_t*S, const float*x, int rows, int cols){
+    const uint32_t*lut=m->fp8_lut; int sb=cols/M3_MX_BLK, nb=rows/8;
+    if(m3_dummy){ double acc=0;
+#ifdef _OPENMP
+        #pragma omp parallel for reduction(+:acc) schedule(static) if(rows>=M3_PAR_MIN)
+#endif
+        for(int r=0;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=64) s+=w[i]; acc+=s; }
+        float v=(float)(((long)acc)&1)*1e-30f; for(int r=0;r<rows;r++) y[r]=v; return; }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows>=M3_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
+        m3_matvec_mxfp8_8row(y+r, w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
+                             s,s+sb,s+2*sb,s+3*sb,s+4*sb,s+5*sb,s+6*sb,s+7*sb, x, cols, lut); }
+    for(int r=nb*8;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb; double a=0;
+        for(int b=0;b<cols;b+=M3_MX_BLK){ float sc=m3_e8m0(s[b/M3_MX_BLK]); int e=b+M3_MX_BLK<cols?b+M3_MX_BLK:cols;
+            for(int c=b;c<e;c++){ float wf; uint32_t u=lut[w[c]]; memcpy(&wf,&u,4); a+=(double)wf*sc*x[c]; } } y[r]=(float)a; }
+}
+/* matvec dispatch by weight type (bf16 or MXFP8) */
+static void m3_mv(m3_model*m, float*restrict y, const m3_tensor*t, const float*x, int rows, int cols){
+    if(t->type==M3_MXFP8) m3_mv_mxfp8(m,y,(const uint8_t*)t->w,t->scale,x,rows,cols);
+    else m3_mv_bf16(y,(const uint16_t*)t->w,x,rows,cols);
+}
+
 /* ===================== arena fit estimate (synth uses malloc) ===================== */
 static size_t m3_arena_size(const m3_config*c,int ep_rank,int ep_size){
     int H=c->hidden, QD=m3_q_dim(c), KVD=m3_kv_dim(c);
@@ -327,6 +353,7 @@ static m3_model* m3_alloc_synth(m3_config cfg,int ep_rank,int ep_size,int n_thre
     m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
     m->s_logits=malloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
+    m3_init_fp8_lut(m->fp8_lut);
     m3_dummy=m3_envi("M3_DUMMY",0);
     if(m3_envi("M3_POOL",0)) m->pool=m3_g_pool=m3_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
     return m;
@@ -346,6 +373,27 @@ static void* m3_cp_rows(const uint8_t*base,const m3_ent*e,int r0,int nrows,int c
 static void* m3_cp_cols(const uint8_t*base,const m3_ent*e,int Rtot,int c0,int ncols,int Ctot,int esz){
     void*d=malloc((size_t)Rtot*ncols*esz); uint8_t*dp=d; const uint8_t*sp=base+e->off;
     for(int r=0;r<Rtot;r++) memcpy(dp+(size_t)r*ncols*esz, sp+((size_t)r*Ctot+c0)*esz, (size_t)ncols*esz); return d; }
+
+/* Load weight `name` (bf16, or MXFP8 if a `name_scale_inv` companion exists) with TP slicing.
+ * mode 0 = full [Rtot,Ctot]; 1 = row-shard rows[r0,r0+nr) of [Rtot,Ctot]; 2 = col-shard
+ * cols[c0,c0+nc) of [Rtot,Ctot]. MXFP8: FP8 weight (1 B) + E8M0 scale (1 B, Ctot/32 per row);
+ * col-shard requires c0,nc multiples of 32 (true for head_dim 128; ep_size=1 uses full). */
+static m3_tensor m3_load_w(m3_ent*es,int n,const uint8_t*base,const char*name,int mode,
+                           int r0,int nr,int c0,int nc,int Rtot,int Ctot,int*ok,size_t*used){
+    char sn[416]; snprintf(sn,sizeof sn,"%s_scale_inv",name);
+    m3_ent*we=m3_find(es,n,name); m3_ent*se=m3_find(es,n,sn);
+    m3_tensor t; t.w=NULL; t.scale=NULL; t.type=M3_BF16; t.rows=0; t.cols=0;
+    if(!we){ fprintf(stderr,"m3_load: MISSING %s\n",name); *ok=0; return t; }
+    int esz = se ? 1 : 2;  t.type = se ? M3_MXFP8 : M3_BF16;
+    if(mode==0){ t.w=m3_cp_full(base,we); t.rows=Rtot; t.cols=Ctot; *used+=we->nbytes; }
+    else if(mode==1){ t.w=m3_cp_rows(base,we,r0,nr,Ctot,esz); t.rows=nr; t.cols=Ctot; *used+=(size_t)nr*Ctot*esz; }
+    else { t.w=m3_cp_cols(base,we,Rtot,c0,nc,Ctot,esz); t.rows=Rtot; t.cols=nc; *used+=(size_t)Rtot*nc*esz; }
+    if(se){ int sc=Ctot/M3_MX_BLK;
+        if(mode==0) t.scale=(uint8_t*)m3_cp_full(base,se);
+        else if(mode==1) t.scale=(uint8_t*)m3_cp_rows(base,se,r0,nr,sc,1);
+        else t.scale=(uint8_t*)m3_cp_cols(base,se,Rtot,c0/M3_MX_BLK,nc/M3_MX_BLK,sc,1); }
+    return t;
+}
 
 /* Build an m3_model from this rank's staged blob (M3_STAGE_DIR/rank<rr>.{blob,manifest}).
  * Dense tensors are TP-sliced into the arena per the same ranges as m3_alloc_synth; routed
@@ -398,38 +446,38 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
         #define LN(suf) (snprintf(nb,sizeof nb,"language_model.model.layers.%d." suf,l),nb)
         { m3_ent*e=REQ(LN("input_layernorm.weight")); if(e) L->input_norm=m3_cp_full(base,e); }
         { m3_ent*e=REQ(LN("post_attention_layernorm.weight")); if(e) L->post_norm=m3_cp_full(base,e); }
-        { m3_ent*e=REQ(LN("self_attn.q_proj.weight")); if(e){ L->wq=(m3_tensor){m3_cp_rows(base,e,qh0*HD,qrows,H,2),NULL,M3_BF16,qrows,H}; used+=(size_t)qrows*H*2; } }
-        { m3_ent*e=REQ(LN("self_attn.k_proj.weight")); if(e) L->wk=(m3_tensor){m3_cp_full(base,e),NULL,M3_BF16,KVD,H}; }
-        { m3_ent*e=REQ(LN("self_attn.v_proj.weight")); if(e) L->wv=(m3_tensor){m3_cp_full(base,e),NULL,M3_BF16,KVD,H}; }
-        { m3_ent*e=REQ(LN("self_attn.o_proj.weight")); if(e){ L->wo=(m3_tensor){m3_cp_cols(base,e,H,qh0*HD,qrows,QD,2),NULL,M3_BF16,H,qrows}; used+=(size_t)H*qrows*2; } }
+        L->wq=m3_load_w(es,n,base,LN("self_attn.q_proj.weight"),1,qh0*HD,qrows,0,0,QD,H,&ok,&used);
+        L->wk=m3_load_w(es,n,base,LN("self_attn.k_proj.weight"),0,0,0,0,0,KVD,H,&ok,&used);
+        L->wv=m3_load_w(es,n,base,LN("self_attn.v_proj.weight"),0,0,0,0,0,KVD,H,&ok,&used);
+        L->wo=m3_load_w(es,n,base,LN("self_attn.o_proj.weight"),2,0,0,qh0*HD,qrows,H,QD,&ok,&used);
         { m3_ent*e=REQ(LN("self_attn.q_norm.weight")); if(e) L->q_norm=m3_cp_full(base,e); }
         { m3_ent*e=REQ(LN("self_attn.k_norm.weight")); if(e) L->k_norm=m3_cp_full(base,e); }
         L->qh0=qh0; L->qh1=qh1;
         L->k_cache=calloc((size_t)cfg.max_pos*KVD,2); L->v_cache=calloc((size_t)cfg.max_pos*KVD,2);
         if(is_moe){
-            { m3_ent*e=REQ(LN("self_attn.index_q_proj.weight")); if(e) L->idx_wq=(m3_tensor){m3_cp_full(base,e),NULL,M3_BF16,IQD,H}; }
-            { m3_ent*e=REQ(LN("self_attn.index_k_proj.weight")); if(e) L->idx_wk=(m3_tensor){m3_cp_full(base,e),NULL,M3_BF16,ID,H}; }
+            L->idx_wq=m3_load_w(es,n,base,LN("self_attn.index_q_proj.weight"),0,0,0,0,0,IQD,H,&ok,&used);
+            L->idx_wk=m3_load_w(es,n,base,LN("self_attn.index_k_proj.weight"),0,0,0,0,0,ID,H,&ok,&used);
             { m3_ent*e=REQ(LN("self_attn.index_q_norm.weight")); if(e) L->idx_q_norm=m3_cp_full(base,e); }
             { m3_ent*e=REQ(LN("self_attn.index_k_norm.weight")); if(e) L->idx_k_norm=m3_cp_full(base,e); }
             L->idx_k_cache=calloc((size_t)cfg.max_pos*ID,2);
             { m3_ent*e=REQ(LN("block_sparse_moe.gate.weight")); if(e) L->gate=(m3_tensor){m3_cp_full(base,e),NULL,M3_F32,cfg.n_experts,H}; }
             { m3_ent*e=REQ(LN("block_sparse_moe.e_score_correction_bias")); if(e) L->gate_bias=m3_cp_full(base,e); }
-            { m3_ent*e=REQ(LN("block_sparse_moe.shared_experts.gate_proj.weight")); if(e){ L->sh_w1=(m3_tensor){m3_cp_rows(base,e,sh_r0,sh_rows,H,2),NULL,M3_BF16,sh_rows,H}; used+=(size_t)sh_rows*H*2; } }
-            { m3_ent*e=REQ(LN("block_sparse_moe.shared_experts.up_proj.weight"));   if(e){ L->sh_w3=(m3_tensor){m3_cp_rows(base,e,sh_r0,sh_rows,H,2),NULL,M3_BF16,sh_rows,H}; used+=(size_t)sh_rows*H*2; } }
-            { m3_ent*e=REQ(LN("block_sparse_moe.shared_experts.down_proj.weight")); if(e){ L->sh_w2=(m3_tensor){m3_cp_cols(base,e,H,sh_r0,sh_rows,cfg.moe_inter,2),NULL,M3_BF16,H,sh_rows}; used+=(size_t)H*sh_rows*2; } }
+            L->sh_w1=m3_load_w(es,n,base,LN("block_sparse_moe.shared_experts.gate_proj.weight"),1,sh_r0,sh_rows,0,0,cfg.moe_inter,H,&ok,&used);
+            L->sh_w3=m3_load_w(es,n,base,LN("block_sparse_moe.shared_experts.up_proj.weight"),1,sh_r0,sh_rows,0,0,cfg.moe_inter,H,&ok,&used);
+            L->sh_w2=m3_load_w(es,n,base,LN("block_sparse_moe.shared_experts.down_proj.weight"),2,0,0,sh_r0,sh_rows,H,cfg.moe_inter,&ok,&used);
             L->sh_r0=sh_r0; L->sh_rows=sh_rows;
             int no=m3_n_owned(cfg.n_experts,ep_rank,ep_size); L->n_owned=no;
             L->owned_eid=malloc((size_t)(no>0?no:1)*sizeof(int));
             L->ex_w1=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w3=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor)); L->ex_w2=malloc((size_t)(no>0?no:1)*sizeof(m3_tensor));
             int s=0; for(int e2=0;e2<cfg.n_experts&&ok;e2++) if(e2%ep_size==ep_rank){ L->owned_eid[s]=e2;
-                snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w1.weight",l,e2); { m3_ent*e=REQ(nb); if(e){ L->ex_w1[s]=(m3_tensor){m3_cp_full(base,e),NULL,M3_BF16,cfg.moe_inter,H}; used+=e->nbytes; } }
-                snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w3.weight",l,e2); { m3_ent*e=REQ(nb); if(e){ L->ex_w3[s]=(m3_tensor){m3_cp_full(base,e),NULL,M3_BF16,cfg.moe_inter,H}; used+=e->nbytes; } }
-                snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w2.weight",l,e2); { m3_ent*e=REQ(nb); if(e){ L->ex_w2[s]=(m3_tensor){m3_cp_full(base,e),NULL,M3_BF16,H,cfg.moe_inter}; used+=e->nbytes; } }
+                snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w1.weight",l,e2); L->ex_w1[s]=m3_load_w(es,n,base,nb,0,0,0,0,0,cfg.moe_inter,H,&ok,&used);
+                snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w3.weight",l,e2); L->ex_w3[s]=m3_load_w(es,n,base,nb,0,0,0,0,0,cfg.moe_inter,H,&ok,&used);
+                snprintf(nb,sizeof nb,"language_model.model.layers.%d.block_sparse_moe.experts.%d.w2.weight",l,e2); L->ex_w2[s]=m3_load_w(es,n,base,nb,0,0,0,0,0,H,cfg.moe_inter,&ok,&used);
                 s++; }
         } else {
-            { m3_ent*e=REQ(LN("mlp.gate_proj.weight")); if(e){ L->ff_gate=(m3_tensor){m3_cp_rows(base,e,ff_r0,ff_rows,H,2),NULL,M3_BF16,ff_rows,H}; used+=(size_t)ff_rows*H*2; } }
-            { m3_ent*e=REQ(LN("mlp.up_proj.weight"));   if(e){ L->ff_up  =(m3_tensor){m3_cp_rows(base,e,ff_r0,ff_rows,H,2),NULL,M3_BF16,ff_rows,H}; used+=(size_t)ff_rows*H*2; } }
-            { m3_ent*e=REQ(LN("mlp.down_proj.weight")); if(e){ L->ff_down=(m3_tensor){m3_cp_cols(base,e,H,ff_r0,ff_rows,cfg.dense_inter,2),NULL,M3_BF16,H,ff_rows}; used+=(size_t)H*ff_rows*2; } }
+            L->ff_gate=m3_load_w(es,n,base,LN("mlp.gate_proj.weight"),1,ff_r0,ff_rows,0,0,cfg.dense_inter,H,&ok,&used);
+            L->ff_up  =m3_load_w(es,n,base,LN("mlp.up_proj.weight"),1,ff_r0,ff_rows,0,0,cfg.dense_inter,H,&ok,&used);
+            L->ff_down=m3_load_w(es,n,base,LN("mlp.down_proj.weight"),2,0,0,ff_r0,ff_rows,H,cfg.dense_inter,&ok,&used);
             L->ff_r0=ff_r0; L->ff_rows=ff_rows;
         }
         #undef LN
@@ -447,6 +495,7 @@ static m3_model* m3_load_real(m3_config cfg,int ep_rank,int ep_size,const char*b
     m->s_ff_g=malloc(cfg.dense_inter*4); m->s_ff_u=malloc(cfg.dense_inter*4); m->s_ff=malloc(H*4);
     m->s_logits=malloc((size_t)hrows*4);
     m->arena_used=used; m->arena_sz=used;
+    m3_init_fp8_lut(m->fp8_lut);
     m3_dummy=m3_envi("M3_DUMMY",0);
     if(m3_envi("M3_POOL",0)) m->pool=m3_g_pool=m3_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
     return m;
@@ -461,8 +510,8 @@ static int m3_msa_select(m3_model*m,m3_layer*L,const float*xn,int pos,int msa_on
     const float*cosp=&m->rope_cos[(size_t)pos*half], *sinp=&m->rope_sin[(size_t)pos*half];
     /* index projections (replicated): idx_q [IH*ID], idx_k [ID] (MQA, 1 head) */
     float*iq=m->s_idx_q, *ik=m->s_idx_k;
-    m3_mv_bf16(iq,(uint16_t*)L->idx_wq.w,xn,IH*ID,c->hidden);
-    m3_mv_bf16(ik,(uint16_t*)L->idx_wk.w,xn,ID,c->hidden);
+    m3_mv(m,iq,&L->idx_wq,xn,IH*ID,c->hidden);
+    m3_mv(m,ik,&L->idx_wk,xn,ID,c->hidden);
     for(int h=0;h<IH;h++){ float*qh=iq+h*ID; m3_rmsnorm_head(qh,L->idx_q_norm,ID,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
     m3_rmsnorm_head(ik,L->idx_k_norm,ID,c->norm_eps); m3_rope_head(ik,cosp,sinp,c->rotary_dim);
     for(int i=0;i<ID;i++) L->idx_k_cache[(size_t)pos*ID+i]=m3_f2bf(ik[i]);
@@ -512,9 +561,9 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
         const float*cosp=&m->rope_cos[(size_t)pos*half], *sinp=&m->rope_sin[(size_t)pos*half];
         m3_rmsnorm_gemma(xn,x,L->input_norm,H,c->norm_eps);
         /* q: owned heads only (TP_ATTN) or all; k/v: replicated (full kv heads) */
-        m3_mv_bf16(q,(uint16_t*)L->wq.w,xn,qrows,H);
-        m3_mv_bf16(kb,(uint16_t*)L->wk.w,xn,KVD,H);
-        m3_mv_bf16(vb,(uint16_t*)L->wv.w,xn,KVD,H);
+        m3_mv(m,q,&L->wq,xn,qrows,H);
+        m3_mv(m,kb,&L->wk,xn,KVD,H);
+        m3_mv(m,vb,&L->wv,xn,KVD,H);
         for(int hh=0;hh<nown;hh++){ float*qh=q+hh*HD; if(c->use_qk_norm) m3_rmsnorm_head(qh,L->q_norm,HD,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
         for(int kh=0;kh<KVH;kh++){ float*kk=kb+kh*HD; if(c->use_qk_norm) m3_rmsnorm_head(kk,L->k_norm,HD,c->norm_eps); m3_rope_head(kk,cosp,sinp,c->rotary_dim); }
         for(int i=0;i<KVD;i++){ L->k_cache[(size_t)pos*KVD+i]=m3_f2bf(kb[i]); L->v_cache[(size_t)pos*KVD+i]=m3_f2bf(vb[i]); }
@@ -531,7 +580,7 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
             float inv=(float)(1.0/(sum>0?sum:1)); float*oh=attn+hh*HD; for(int i=0;i<HD;i++) oh[i]=0;
             for(int j=0;j<nsel;j++){ int t=selp[j]; float w=sc[j]*inv; const uint16_t*vt=L->v_cache+(size_t)t*KVD+kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]); } }
         /* o_proj (wo cols = owned head cols); partial under TP_ATTN -> ar_cb sum */
-        m3_mv_bf16(ao,(uint16_t*)L->wo.w,attn,H,qrows);
+        m3_mv(m,ao,&L->wo,attn,H,qrows);
         if(tp_attn && m->ar_cb) m->ar_cb(ao,H,m->ar_ctx);
         for(int i=0;i<H;i++) x[i]+=ao[i];
         /* FFN / MoE */
@@ -548,32 +597,32 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
             float*route=m->s_route; for(int i=0;i<H;i++) route[i]=0;
             for(int a=0;a<na;a++){ int e=selx[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
                 float w=selw[a]/wsum*c->routed_scale;
-                m3_mv_bf16(m->s_exg,(uint16_t*)L->ex_w1[slot].w,h2,c->moe_inter,H);
-                m3_mv_bf16(m->s_exu,(uint16_t*)L->ex_w3[slot].w,h2,c->moe_inter,H);
+                m3_mv(m,m->s_exg,&L->ex_w1[slot],h2,c->moe_inter,H);
+                m3_mv(m,m->s_exu,&L->ex_w3[slot],h2,c->moe_inter,H);
                 for(int i=0;i<c->moe_inter;i++) m->s_exg[i]=m3_swiglu_oai(m->s_exg[i],m->s_exu[i],c->swiglu_alpha,c->swiglu_limit);
-                m3_mv_bf16(m->s_moe,(uint16_t*)L->ex_w2[slot].w,m->s_exg,H,c->moe_inter);
+                m3_mv(m,m->s_moe,&L->ex_w2[slot],m->s_exg,H,c->moe_inter);
                 for(int i=0;i<H;i++) route[i]+=w*m->s_moe[i]; }
             /* shared expert: TP-sharded -> fold partial into route[] (one reduce); else replicated -> add after */
-            m3_mv_bf16(m->s_shg,(uint16_t*)L->sh_w1.w,h2,L->sh_rows,H);
-            m3_mv_bf16(m->s_shu,(uint16_t*)L->sh_w3.w,h2,L->sh_rows,H);
+            m3_mv(m,m->s_shg,&L->sh_w1,h2,L->sh_rows,H);
+            m3_mv(m,m->s_shu,&L->sh_w3,h2,L->sh_rows,H);
             for(int i=0;i<L->sh_rows;i++) m->s_shg[i]=m3_swiglu_oai(m->s_shg[i],m->s_shu[i],c->swiglu_alpha,c->swiglu_limit);
-            m3_mv_bf16(m->s_sh,(uint16_t*)L->sh_w2.w,m->s_shg,H,L->sh_rows);
+            m3_mv(m,m->s_sh,&L->sh_w2,m->s_shg,H,L->sh_rows);
             if(tp_sh) for(int i=0;i<H;i++) route[i]+=m->s_sh[i];
             if(m->ar_cb) m->ar_cb(route,H,m->ar_ctx);     /* EP-sum routed (+ shared if TP) */
             for(int i=0;i<H;i++) x[i]+=route[i] + (tp_sh?0.0f:m->s_sh[i]);
         } else {
             const int tp_ffn=(L->ff_rows<c->dense_inter);
-            m3_mv_bf16(m->s_ff_g,(uint16_t*)L->ff_gate.w,h2,L->ff_rows,H);
-            m3_mv_bf16(m->s_ff_u,(uint16_t*)L->ff_up.w,h2,L->ff_rows,H);
+            m3_mv(m,m->s_ff_g,&L->ff_gate,h2,L->ff_rows,H);
+            m3_mv(m,m->s_ff_u,&L->ff_up,h2,L->ff_rows,H);
             for(int i=0;i<L->ff_rows;i++) m->s_ff_g[i]=m3_swiglu_oai(m->s_ff_g[i],m->s_ff_u[i],c->swiglu_alpha,c->swiglu_limit);
-            m3_mv_bf16(m->s_ff,(uint16_t*)L->ff_down.w,m->s_ff_g,H,L->ff_rows);
+            m3_mv(m,m->s_ff,&L->ff_down,m->s_ff_g,H,L->ff_rows);
             if(tp_ffn && m->ar_cb) m->ar_cb(m->s_ff,H,m->ar_ctx);
             for(int i=0;i<H;i++) x[i]+=m->s_ff[i];
         }
     }
     /* head: vocab-shard partial logits -> (TP_HEAD) global argmax via ar_argmax, else full */
     float*h2=m->s_norm; m3_rmsnorm_gemma(h2,x,m->out_norm,H,c->norm_eps);
-    int hrows=m->head.rows; m3_mv_bf16(m->s_logits,(uint16_t*)m->head.w,h2,hrows,H);
+    int hrows=m->head.rows; m3_mv(m,m->s_logits,&m->head,h2,hrows,H);
     int la=0; float lv=m->s_logits[0]; for(int i=1;i<hrows;i++) if(m->s_logits[i]>lv){lv=m->s_logits[i];la=i;}
     int32_t gidx=m->head_r0+la; float gval=lv;
     if(hrows<c->vocab && m->ar_argmax_cb) m->ar_argmax_cb(&gval,&gidx,m->ar_argmax_ctx);  /* TP_HEAD merge */
@@ -625,6 +674,35 @@ static void m3_gemm_bf16(float*restrict Y, const uint16_t*W, const float*X, int 
     for(int r=nb*8;r<rows;r++) for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=vec_dot_bf16_f32(W+(size_t)r*cols,X+(size_t)t*cols,cols);
 }
 
+/* batched MXFP8 GEMM: Y[N,rows] = decode(W fp8 + S e8m0) . X[N,cols]. One omp region over
+ * 8-row blocks; inner loop over the N tokens (FP8 weight re-read per token; the memory win is
+ * the half-size HBM read). */
+static void m3_gemm_mxfp8(m3_model*m, float*restrict Y, const uint8_t*W, const uint8_t*S, const float*X, int N, int rows, int cols){
+    const uint32_t*lut=m->fp8_lut; int sb=cols/M3_MX_BLK, nb=rows/8;
+    if(m3_dummy){ double acc=0;
+#ifdef _OPENMP
+        #pragma omp parallel for reduction(+:acc) schedule(static) if((long)rows>=M3_PAR_MIN)
+#endif
+        for(int r=0;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=64) s+=w[i]; acc+=s; }
+        float v=(float)(((long)acc)&1)*1e-30f; for(size_t i=0;i<(size_t)N*rows;i++) Y[i]=v; return; }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)rows>=M3_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
+        for(int t=0;t<N;t++)
+            m3_matvec_mxfp8_8row(Y+(size_t)t*rows+r, w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
+                                 s,s+sb,s+2*sb,s+3*sb,s+4*sb,s+5*sb,s+6*sb,s+7*sb, X+(size_t)t*cols, cols, lut); }
+    for(int r=nb*8;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
+        for(int t=0;t<N;t++){ const float*x=X+(size_t)t*cols; double a=0;
+            for(int b=0;b<cols;b+=M3_MX_BLK){ float sc=m3_e8m0(s[b/M3_MX_BLK]); int e=b+M3_MX_BLK<cols?b+M3_MX_BLK:cols;
+                for(int c=b;c<e;c++){ float wf; uint32_t u=lut[w[c]]; memcpy(&wf,&u,4); a+=(double)wf*sc*x[c]; } } Y[(size_t)t*rows+r]=(float)a; } }
+}
+/* batched GEMM dispatch by weight type */
+static void m3_gemm(m3_model*m, float*restrict Y, const m3_tensor*t, const float*X, int N, int rows, int cols){
+    if(t->type==M3_MXFP8) m3_gemm_mxfp8(m,Y,(const uint8_t*)t->w,t->scale,X,N,rows,cols);
+    else m3_gemm_bf16(Y,(const uint16_t*)t->w,X,N,rows,cols);
+}
+
 static void m3_free_mstream(m3_model*m){
     m3_mstream*ms=(m3_mstream*)m->ms; if(!ms) return;
     free(ms->kc);free(ms->vc);free(ms->xn);free(ms->q);free(ms->k);free(ms->v);free(ms->attn);free(ms->o);
@@ -662,9 +740,9 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
         #pragma omp parallel for schedule(static)
 #endif
         for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->xn+(size_t)t*H, X+(size_t)t*H, L->input_norm, H, c->norm_eps);
-        m3_gemm_bf16(ms->q,(uint16_t*)L->wq.w,ms->xn,N,qrows,H);
-        m3_gemm_bf16(ms->k,(uint16_t*)L->wk.w,ms->xn,N,KVD,H);
-        m3_gemm_bf16(ms->v,(uint16_t*)L->wv.w,ms->xn,N,KVD,H);
+        m3_gemm(m,ms->q,&L->wq,ms->xn,N,qrows,H);
+        m3_gemm(m,ms->k,&L->wk,ms->xn,N,KVD,H);
+        m3_gemm(m,ms->v,&L->wv,ms->xn,N,KVD,H);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
@@ -685,7 +763,7 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
                 double sum=0; for(int tt=0;tt<=p;tt++){ float e=expf(sc[tt]-mx); sc[tt]=e; sum+=e; }
                 float inv=(float)(1.0/(sum>0?sum:1)); float*oh=ab+hh*HD; for(int i=0;i<HD;i++) oh[i]=0;
                 for(int tt=0;tt<=p;tt++){ float w=sc[tt]*inv; const uint16_t*vt=vcl+(size_t)tt*KVD+kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]); } } }
-        m3_gemm_bf16(ms->o,(uint16_t*)L->wo.w,ms->attn,N,H,qrows);
+        m3_gemm(m,ms->o,&L->wo,ms->attn,N,H,qrows);
         if(tp_attn && m->ar_cb) m->ar_cb(ms->o,N*H,m->ar_ctx);
         for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->o[i];
 #ifdef _OPENMP
@@ -713,10 +791,10 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
                     int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*N+g]=t; ms->bw[(size_t)slot*N+g]=sw[a]; } }
             for(int s=0;s<L->n_owned;s++){ int g=ms->bcnt[s]; if(g==0) continue;
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*N+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
-                m3_gemm_bf16(ms->shg,(uint16_t*)L->ex_w1[s].w,ms->o,g,c->moe_inter,H);
-                m3_gemm_bf16(ms->shu,(uint16_t*)L->ex_w3[s].w,ms->o,g,c->moe_inter,H);
+                m3_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,c->moe_inter,H);
+                m3_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H);
                 for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=m3_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
-                m3_gemm_bf16(ms->tmp2,(uint16_t*)L->ex_w2[s].w,ms->shg,g,H,c->moe_inter);
+                m3_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*N+i]; float w=ms->bw[(size_t)s*N+i]; float*rt=ms->route+(size_t)t*H,*dn=ms->tmp2+(size_t)i*H;
                     for(int j=0;j<H;j++) rt[j]+=w*dn[j]; } }
             /* comm-overlap: issue the routed reduce on the comm-driver thread, compute the
@@ -724,20 +802,20 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
              * so it is independent of the route buffer being reduced. */
             int overlap = (m->ar_async_start && !tp_sh);
             if(overlap) m->ar_async_start(ms->route,N*H,m->ar_async_ctx);
-            m3_gemm_bf16(ms->shg,(uint16_t*)L->sh_w1.w,ms->h2,N,L->sh_rows,H);
-            m3_gemm_bf16(ms->shu,(uint16_t*)L->sh_w3.w,ms->h2,N,L->sh_rows,H);
+            m3_gemm(m,ms->shg,&L->sh_w1,ms->h2,N,L->sh_rows,H);
+            m3_gemm(m,ms->shu,&L->sh_w3,ms->h2,N,L->sh_rows,H);
             for(size_t i=0;i<(size_t)N*L->sh_rows;i++) ms->shg[i]=m3_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
-            m3_gemm_bf16(ms->tmp2,(uint16_t*)L->sh_w2.w,ms->shg,N,H,L->sh_rows);   /* shared-out [N,H] */
+            m3_gemm(m,ms->tmp2,&L->sh_w2,ms->shg,N,H,L->sh_rows);   /* shared-out [N,H] */
             if(overlap){ m->ar_wait(m->ar_async_ctx); }
             else { if(tp_sh) for(size_t i=0;i<(size_t)N*H;i++) ms->route[i]+=ms->tmp2[i];
                    if(m->ar_cb) m->ar_cb(ms->route,N*H,m->ar_ctx); }
             for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
         } else {
             const int tp_ffn=(L->ff_rows<c->dense_inter);
-            m3_gemm_bf16(ms->ffg,(uint16_t*)L->ff_gate.w,ms->h2,N,L->ff_rows,H);
-            m3_gemm_bf16(ms->ffu,(uint16_t*)L->ff_up.w,ms->h2,N,L->ff_rows,H);
+            m3_gemm(m,ms->ffg,&L->ff_gate,ms->h2,N,L->ff_rows,H);
+            m3_gemm(m,ms->ffu,&L->ff_up,ms->h2,N,L->ff_rows,H);
             for(size_t i=0;i<(size_t)N*L->ff_rows;i++) ms->ffg[i]=m3_swiglu_oai(ms->ffg[i],ms->ffu[i],c->swiglu_alpha,c->swiglu_limit);
-            m3_gemm_bf16(ms->tmp2,(uint16_t*)L->ff_down.w,ms->ffg,N,H,L->ff_rows);
+            m3_gemm(m,ms->tmp2,&L->ff_down,ms->ffg,N,H,L->ff_rows);
             if(tp_ffn && m->ar_cb) m->ar_cb(ms->tmp2,N*H,m->ar_ctx);
             for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->tmp2[i];
         }
@@ -746,7 +824,7 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
     #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<N;t++) m3_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, m->out_norm, H, c->norm_eps);
-    int hrows=m->head.rows; m3_gemm_bf16(ms->logits,(uint16_t*)m->head.w,ms->h2,N,hrows,H);
+    int hrows=m->head.rows; m3_gemm(m,ms->logits,&m->head,ms->h2,N,hrows,H);
     for(int t=0;t<N;t++){ float*lg=ms->logits+(size_t)t*hrows; int la=0; float bv=lg[0]; for(int i=1;i<hrows;i++) if(lg[i]>bv){bv=lg[i];la=i;}
         int32_t gidx=m->head_r0+la; float gval=bv;
         if(hrows<c->vocab && m->ar_argmax_cb) m->ar_argmax_cb(&gval,&gidx,m->ar_argmax_ctx);
