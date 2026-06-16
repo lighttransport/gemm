@@ -49,6 +49,17 @@ N=8 (rises further at larger M) ⇒ **several hundred tok/s** for single-request
   prefer 12 = 1 CMG NUMA-local; prefill is the opposite).
 - int4-KV + chunked composes (M=256: 37.9 tok/s, argmax 3051, ‖x‖ 0.25% off bf16, NaN=0).
 
+## MSA-select was the long-context bottleneck — FIXED (job 49255124, 2026-06-17)
+At 16k the scalar, **sequential** per-token MSA block-selection (per token: ~nblk·128·IH·ID
+index dots, single-threaded) dominated — the first 16k@48n run sat >34 min in prefill. Fix:
+`m3_msa_prefill_select` batches the idx_q/idx_k projections (M=S GEMM) and runs the O(pos)
+block scoring + top-k **OpenMP-parallel over the chunk** (all 48 cores). Bit-exact vs the
+sequential path (same fully-stored idx_k → same scores/top-k). Validated 4L, prefill 2600
+(MSA active): **token-serial 3.50 → chunked+parallel-MSA 79.91 tok/s = 22.8×, argmax 3051 /
+‖x‖ 8.921e4 identical, NaN=0.** Non-CP only (CP keeps the sequential path; its blk_reduce is
+collective). This is the dominant lever for long-context prefill; combine with the chunk-size /
+all-CMG findings below.
+
 ## Lever 2: prefill-tuned parallelism (compute-bound ⇒ TP-heavy + all CMGs)
 Decode is memory/latency-bound (favours EP + multi-stream). Prefill is compute-bound, so the
 *opposite* layout is optimal: **TP-heavy** (split every GEMM across nodes for more FLOP/s/token)
