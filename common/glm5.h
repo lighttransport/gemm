@@ -125,8 +125,9 @@ static inline int glm5_is_sparse(const glm5_config *c, int L) { return L >= c->n
  * bring-up keeps GLM5_MSA=0, so shared-indexer reuse is intentionally deferred. */
 static inline int glm5_has_full_indexer(const glm5_config *c, int L) {
     if (L < c->n_dense_layers) return 1;
-    return L >= c->n_dense_layers + c->index_topk_freq &&
-           ((L - (c->n_dense_layers + c->index_topk_freq)) % c->index_topk_freq) == 0;
+    int first_sparse_full = c->n_dense_layers + c->index_topk_freq - 1;
+    return L >= first_sparse_full &&
+           ((L - first_sparse_full) % c->index_topk_freq) == 0;
 }
 
 /* derived dims */
