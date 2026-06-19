@@ -12352,7 +12352,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
     const char *stop_attn_env = getenv("CUDA_LLM_STOP_AFTER_ATTN_RESIDUAL");
     int stop_after_attn_residual = stop_attn_env && stop_attn_env[0] && strcmp(stop_attn_env, "0") != 0;
-    int graph_enabled = !r->disable_graph && !r->is_hybrid &&
+    int graph_enabled = !r->disable_graph && !r->is_hybrid && !r->is_gemma4 &&
                         r->debug_layers == 0 && r->max_layers == 0 &&
                         !stop_after_attn_residual;
 
@@ -15588,10 +15588,8 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
      * models use the single-token path so prefill remains correct instead of
      * silently skipping transformer layers.
      */
-    if (!r->is_gemma4 || (r->n_embd_per_layer > 0 && r->d_ple_combined)) {
-        return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
-                                           n_tokens, start_pos);
-    }
+    return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
+                                       n_tokens, start_pos);
 
     /* Chunked prefill for long context on limited VRAM. The batched path below
      * allocates O(n_tokens) F32 activation buffers (q/xb2/k/v/gate/up, ~2 GB at
