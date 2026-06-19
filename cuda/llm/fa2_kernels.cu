@@ -1,6 +1,22 @@
-// Flat-layout FA2 kernel for Gemma4 LLM runner
+// Flat-layout FA2 kernels for Gemma4 LLM runner
 // Compiled as AOT cubin, loaded at runtime
 // Supports [S, H*D] flat KV cache layout with GQA
+//
+// Two specializations:
+//   fa2_attn_f      : head_dim=256, BC=32  (SWA path, used at d=256)
+//   fa2_attn_d512_f : head_dim=512, BC=16  (full-attn path)
+//
+// Both use Q@K^T -> softmax -> P@V with the F16 tensor-core pipeline. The
+// d=512 variant reduces BC (key block size) from 32 to 16 because 4*32*(512+8)*2
+// = 133120 B of shared memory exceeds the 99 KB optin ceiling on sm_120; with
+// BC=16 the per-block smem drops to 4*16*520*2 = 66560 B, well within the
+// limit. The smaller BC means more grid tiles for the same K length but the
+// F16 tensor-core pipeline is still compute-bound (the extra grid is pure
+// work amplification, not a memory stall).
+//
+// Both kernels are F32-input -> F16-output, expect F16 K/V cache, and
+// support an optional sliding-window lower bound (window=0 -> causal only).
+
 #define FA2_D 256
 #define FA2_BR 64
 #define FA2_BC 32
@@ -298,6 +314,290 @@ void fa2_attn_f(dt_t *O,
         if (gqr_b < n_q) {
             Oh[(size_t)gqr_b * hstride_q + d_col + 0] = f2dt(ofrag[nn][2] * inv_b);
             Oh[(size_t)gqr_b * hstride_q + d_col + 1] = f2dt(ofrag[nn][3] * inv_b);
+        }
+    }
+}
+
+// =====================================================================
+// d=512 specialization. BC=16 (vs 32 for d=256) to keep smem under the
+// 99 KB optin on sm_120: 4*16*520*2 = 66560 B vs 4*32*520*2 = 133120 B.
+// Same FA2 algorithm as the d=256 kernel; only the FA2_D/BC/DK/DN/DP
+// constants differ. The two kernels are byte-identical to each other
+// when D=256 and BC=32 (i.e. the d=256 path is the canonical).
+// =====================================================================
+#undef FA2_D
+#undef FA2_BR
+#undef FA2_BC
+#undef FA2_DK
+#undef FA2_BCN
+#undef FA2_BCK
+#undef FA2_DN
+#undef FA2_DP
+#undef FA2_NTHR
+#undef FA2_LB
+
+#define FA2_D 512
+#define FA2_BR 64
+#define FA2_BC 16
+#define FA2_CAUSAL 1
+#define FA2_DK (FA2_D / 16)
+#define FA2_BCN (FA2_BC / 8)
+#define FA2_BCK (FA2_BC / 16)
+#define FA2_DN (FA2_D / 8)
+#define FA2_DP (FA2_D + 8)
+#define FA2_NTHR (FA2_BR / 16 * 32)
+#define FA2_MMA "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+#define FA2_LB __launch_bounds__(FA2_NTHR)
+
+extern "C" __global__ FA2_LB
+void fa2_attn_d512_f(dt_t *O,
+                     const dt_t *Q,
+                     const dt_t *K,
+                     const dt_t *V,
+                     int S, int D_in, int hstride_q, int hstride_kv, int gqa_ratio, float scale,
+                     int window, int n_q, int q_off) {
+    const float d5_LOG2E = 1.4426950408889634f;
+    float d5_lscale = scale * d5_LOG2E;
+    int d5_bh = blockIdx.y;
+    int d5_wid = threadIdx.x >> 5;
+    int d5_lane = threadIdx.x & 31;
+    int d5_warp_q0 = blockIdx.x * FA2_BR + d5_wid * 16;
+
+    int d5_row_a = d5_lane >> 2;
+    int d5_row_b = d5_row_a + 8;
+    int d5_col_g = (d5_lane & 3) * 2;
+
+    const dt_t *d5_Qh = Q + (size_t)d5_bh * FA2_D;
+    int d5_kv_bh = d5_bh / gqa_ratio;
+    const dt_t *d5_Kh = K + (size_t)d5_kv_bh * FA2_D;
+    const dt_t *d5_Vh = V + (size_t)d5_kv_bh * FA2_D;
+    dt_t *d5_Oh = O + (size_t)d5_bh * FA2_D;
+
+    uint32_t d5_qfrag[FA2_DK][4];
+    int d5_gqr_a = d5_warp_q0 + d5_row_a;
+    int d5_gqr_b = d5_warp_q0 + d5_row_b;
+    int d5_gpos_a = d5_gqr_a + q_off;
+    int d5_gpos_b = d5_gqr_b + q_off;
+    int d5_valid_a = (d5_gqr_a < n_q);
+    int d5_valid_b = (d5_gqr_b < n_q);
+    for (int d5_kk = 0; d5_kk < FA2_DK; d5_kk++) {
+        int d5_kbase = d5_kk * 16;
+        const dt_t *d5_qa_lo = d5_Qh + (size_t)d5_gqr_a * hstride_q + d5_kbase + d5_col_g;
+        const dt_t *d5_qb_lo = d5_Qh + (size_t)d5_gqr_b * hstride_q + d5_kbase + d5_col_g;
+        d5_qfrag[d5_kk][0] = d5_valid_a ? *(const uint32_t *)d5_qa_lo : 0u;
+        d5_qfrag[d5_kk][1] = d5_valid_b ? *(const uint32_t *)d5_qb_lo : 0u;
+        d5_qfrag[d5_kk][2] = d5_valid_a ? *(const uint32_t *)(d5_qa_lo + 8) : 0u;
+        d5_qfrag[d5_kk][3] = d5_valid_b ? *(const uint32_t *)(d5_qb_lo + 8) : 0u;
+    }
+
+    float d5_ofrag[FA2_DN][4];
+    for (int n = 0; n < FA2_DN; n++)
+        for (int i = 0; i < 4; i++)
+            d5_ofrag[n][i] = 0.0f;
+    float d5_m_a = -1e30f, d5_m_b = -1e30f, d5_l_a = 0.0f, d5_l_b = 0.0f;
+
+    extern __shared__ dt_t d5_smem[];
+    dt_t *d5_sK0 = d5_smem;
+    dt_t *d5_sK1 = d5_sK0 + FA2_BC * FA2_DP;
+    dt_t *d5_sV0 = d5_sK1 + FA2_BC * FA2_DP;
+    dt_t *d5_sV1 = d5_sV0 + FA2_BC * FA2_DP;
+    dt_t *d5_sK_buf[2] = { d5_sK0, d5_sK1 };
+    dt_t *d5_sV_buf[2] = { d5_sV0, d5_sV1 };
+
+    int d5_total_u4 = (FA2_BC * FA2_D) / 8;
+    int d5_row_u4 = FA2_D / 8;
+
+    int d5_s_eff = S;
+#if FA2_CAUSAL
+    int d5_q_blk_max = q_off + blockIdx.x * FA2_BR + FA2_BR;
+    if (d5_q_blk_max < d5_s_eff) d5_s_eff = d5_q_blk_max;
+#endif
+    int d5_n_tiles = (d5_s_eff + FA2_BC - 1) / FA2_BC;
+    int d5_t_lo = 0;
+    if (window > 0) {
+        int d5_klo = q_off + blockIdx.x * FA2_BR - window + 1;
+        if (d5_klo > 0) d5_t_lo = d5_klo / FA2_BC;
+    }
+
+    {
+        dt_t *d5_dK_ = d5_sK_buf[0];
+        dt_t *d5_dV_ = d5_sV_buf[0];
+        for (int d5_idx = threadIdx.x; d5_idx < d5_total_u4; d5_idx += blockDim.x) {
+            int d5_j_ = d5_idx / d5_row_u4;
+            int d5_dd_ = (d5_idx - d5_j_ * d5_row_u4) * 8;
+            int d5_kv_ = d5_t_lo * FA2_BC + d5_j_;
+            unsigned d5_dst_k = __cvta_generic_to_shared(d5_dK_ + d5_j_ * FA2_DP + d5_dd_);
+            unsigned d5_dst_v = __cvta_generic_to_shared(d5_dV_ + d5_j_ * FA2_DP + d5_dd_);
+            const void *d5_src_k = (const void *)(d5_Kh + (size_t)d5_kv_ * hstride_kv + d5_dd_);
+            const void *d5_src_v = (const void *)(d5_Vh + (size_t)d5_kv_ * hstride_kv + d5_dd_);
+            int d5_src_bytes = (d5_kv_ < S) ? 16 : 0;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d5_dst_k), "l"(d5_src_k), "r"(d5_src_bytes));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d5_dst_v), "l"(d5_src_v), "r"(d5_src_bytes));
+        }
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+
+    int d5_ldm_row_off = d5_lane & 7;
+    int d5_ldm_col_xtra = (d5_lane & 8) ? 8 : 0;
+
+    for (int t = d5_t_lo; t < d5_n_tiles; t++) {
+        int d5_cur = (t - d5_t_lo) & 1;
+        int d5_nxt = 1 - d5_cur;
+        int d5_kv0 = t * FA2_BC;
+
+        if (t + 1 < d5_n_tiles) {
+            int d5_kv0n = (t + 1) * FA2_BC;
+            dt_t *d5_dK_ = d5_sK_buf[d5_nxt];
+            dt_t *d5_dV_ = d5_sV_buf[d5_nxt];
+            for (int d5_idx = threadIdx.x; d5_idx < d5_total_u4; d5_idx += blockDim.x) {
+                int d5_j_ = d5_idx / d5_row_u4;
+                int d5_dd_ = (d5_idx - d5_j_ * d5_row_u4) * 8;
+                int d5_kv_ = d5_kv0n + d5_j_;
+                unsigned d5_dst_k = __cvta_generic_to_shared(d5_dK_ + d5_j_ * FA2_DP + d5_dd_);
+                unsigned d5_dst_v = __cvta_generic_to_shared(d5_dV_ + d5_j_ * FA2_DP + d5_dd_);
+                const void *d5_src_k = (const void *)(d5_Kh + (size_t)d5_kv_ * hstride_kv + d5_dd_);
+                const void *d5_src_v = (const void *)(d5_Vh + (size_t)d5_kv_ * hstride_kv + d5_dd_);
+                int d5_src_bytes = (d5_kv_ < S) ? 16 : 0;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d5_dst_k), "l"(d5_src_k), "r"(d5_src_bytes));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d5_dst_v), "l"(d5_src_v), "r"(d5_src_bytes));
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncthreads();
+
+        dt_t *d5_sK = d5_sK_buf[d5_cur];
+        dt_t *d5_sV = d5_sV_buf[d5_cur];
+
+        // Q @ K^T
+        float d5_sfrag[FA2_BCN][4];
+        for (int n = 0; n < FA2_BCN; n++)
+            for (int i = 0; i < 4; i++)
+                d5_sfrag[n][i] = 0.0f;
+        for (int d5_kk = 0; d5_kk < FA2_DK; d5_kk++) {
+            int d5_kbase = d5_kk * 16;
+            for (int d5_nn = 0; d5_nn < FA2_BCN; d5_nn++) {
+                int d5_nbase = d5_nn * 8;
+                unsigned d5_saddr = __cvta_generic_to_shared(
+                    d5_sK + (d5_nbase + d5_ldm_row_off) * FA2_DP + d5_kbase + d5_ldm_col_xtra);
+                uint32_t d5_b0, d5_b1;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+                    : "=r"(d5_b0), "=r"(d5_b1) : "r"(d5_saddr));
+                uint32_t d5_a0 = d5_qfrag[d5_kk][0], d5_a1 = d5_qfrag[d5_kk][1], d5_a2 = d5_qfrag[d5_kk][2], d5_a3 = d5_qfrag[d5_kk][3];
+                float d5_c0 = d5_sfrag[d5_nn][0], d5_c1 = d5_sfrag[d5_nn][1], d5_c2 = d5_sfrag[d5_nn][2], d5_c3 = d5_sfrag[d5_nn][3];
+                asm(FA2_MMA
+                    " {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+f"(d5_c0), "+f"(d5_c1), "+f"(d5_c2), "+f"(d5_c3)
+                    : "r"(d5_a0), "r"(d5_a1), "r"(d5_a2), "r"(d5_a3),
+                      "r"(d5_b0), "r"(d5_b1));
+                d5_sfrag[d5_nn][0] = d5_c0; d5_sfrag[d5_nn][1] = d5_c1; d5_sfrag[d5_nn][2] = d5_c2; d5_sfrag[d5_nn][3] = d5_c3;
+            }
+        }
+
+        // Scale + causal mask
+        for (int d5_nn = 0; d5_nn < FA2_BCN; d5_nn++) {
+            int d5_kv_c0 = d5_kv0 + d5_nn * 8 + d5_col_g + 0;
+            int d5_kv_c1 = d5_kv0 + d5_nn * 8 + d5_col_g + 1;
+            int d5_va0 = (d5_kv_c0 < S), d5_va1 = (d5_kv_c1 < S);
+            int d5_vb0 = d5_va0, d5_vb1 = d5_va1;
+#if FA2_CAUSAL
+            d5_va0 = d5_va0 && (d5_kv_c0 <= d5_gpos_a); d5_va1 = d5_va1 && (d5_kv_c1 <= d5_gpos_a);
+            d5_vb0 = d5_vb0 && (d5_kv_c0 <= d5_gpos_b); d5_vb1 = d5_vb1 && (d5_kv_c1 <= d5_gpos_b);
+            if (window > 0) {
+                d5_va0 = d5_va0 && (d5_kv_c0 > d5_gpos_a - window); d5_va1 = d5_va1 && (d5_kv_c1 > d5_gpos_a - window);
+                d5_vb0 = d5_vb0 && (d5_kv_c0 > d5_gpos_b - window); d5_vb1 = d5_vb1 && (d5_kv_c1 > d5_gpos_b - window);
+            }
+#endif
+            d5_sfrag[d5_nn][0] = d5_va0 ? d5_sfrag[d5_nn][0] * d5_lscale : -1e30f;
+            d5_sfrag[d5_nn][1] = d5_va1 ? d5_sfrag[d5_nn][1] * d5_lscale : -1e30f;
+            d5_sfrag[d5_nn][2] = d5_vb0 ? d5_sfrag[d5_nn][2] * d5_lscale : -1e30f;
+            d5_sfrag[d5_nn][3] = d5_vb1 ? d5_sfrag[d5_nn][3] * d5_lscale : -1e30f;
+        }
+
+        // Row max
+        float d5_mx_a = -1e30f, d5_mx_b = -1e30f;
+        for (int d5_nn = 0; d5_nn < FA2_BCN; d5_nn++) {
+            d5_mx_a = fmaxf(d5_mx_a, fmaxf(d5_sfrag[d5_nn][0], d5_sfrag[d5_nn][1]));
+            d5_mx_b = fmaxf(d5_mx_b, fmaxf(d5_sfrag[d5_nn][2], d5_sfrag[d5_nn][3]));
+        }
+        d5_mx_a = fmaxf(d5_mx_a, __shfl_xor_sync(0xffffffff, d5_mx_a, 1));
+        d5_mx_a = fmaxf(d5_mx_a, __shfl_xor_sync(0xffffffff, d5_mx_a, 2));
+        d5_mx_b = fmaxf(d5_mx_b, __shfl_xor_sync(0xffffffff, d5_mx_b, 1));
+        d5_mx_b = fmaxf(d5_mx_b, __shfl_xor_sync(0xffffffff, d5_mx_b, 2));
+
+        float d5_m_new_a = fmaxf(d5_m_a, d5_mx_a);
+        float d5_m_new_b = fmaxf(d5_m_b, d5_mx_b);
+        float d5_alpha_a = exp2f(d5_m_a - d5_m_new_a);
+        float d5_alpha_b = exp2f(d5_m_b - d5_m_new_b);
+        d5_l_a *= d5_alpha_a; d5_l_b *= d5_alpha_b;
+        for (int n = 0; n < FA2_DN; n++) {
+            d5_ofrag[n][0] *= d5_alpha_a; d5_ofrag[n][1] *= d5_alpha_a;
+            d5_ofrag[n][2] *= d5_alpha_b; d5_ofrag[n][3] *= d5_alpha_b;
+        }
+        d5_m_a = d5_m_new_a; d5_m_b = d5_m_new_b;
+
+        // P = exp2(S - m)
+        uint32_t d5_pfrag[FA2_BCK][4];
+        float d5_rs_a = 0.0f, d5_rs_b = 0.0f;
+        for (int d5_kk = 0; d5_kk < FA2_BCK; d5_kk++) {
+            float p0 = exp2f(d5_sfrag[2*d5_kk    ][0] - d5_m_a);
+            float p1 = exp2f(d5_sfrag[2*d5_kk    ][1] - d5_m_a);
+            float p2 = exp2f(d5_sfrag[2*d5_kk    ][2] - d5_m_b);
+            float p3 = exp2f(d5_sfrag[2*d5_kk    ][3] - d5_m_b);
+            float p4 = exp2f(d5_sfrag[2*d5_kk + 1][0] - d5_m_a);
+            float p5 = exp2f(d5_sfrag[2*d5_kk + 1][1] - d5_m_a);
+            float p6 = exp2f(d5_sfrag[2*d5_kk + 1][2] - d5_m_b);
+            float p7 = exp2f(d5_sfrag[2*d5_kk + 1][3] - d5_m_b);
+            d5_rs_a += p0 + p1 + p4 + p5;
+            d5_rs_b += p2 + p3 + p6 + p7;
+            d5_pfrag[d5_kk][0] = pack2(p0, p1);
+            d5_pfrag[d5_kk][1] = pack2(p2, p3);
+            d5_pfrag[d5_kk][2] = pack2(p4, p5);
+            d5_pfrag[d5_kk][3] = pack2(p6, p7);
+        }
+        d5_rs_a += __shfl_xor_sync(0xffffffff, d5_rs_a, 1);
+        d5_rs_a += __shfl_xor_sync(0xffffffff, d5_rs_a, 2);
+        d5_rs_b += __shfl_xor_sync(0xffffffff, d5_rs_b, 1);
+        d5_rs_b += __shfl_xor_sync(0xffffffff, d5_rs_b, 2);
+        d5_l_a += d5_rs_a; d5_l_b += d5_rs_b;
+
+        // P @ V
+        for (int d5_kk = 0; d5_kk < FA2_BCK; d5_kk++) {
+            int d5_kbase = d5_kk * 16;
+            int d5_bc_row = d5_kbase + d5_ldm_row_off + ((d5_lane & 8) ? 8 : 0);
+            for (int d5_nn = 0; d5_nn < FA2_DN; d5_nn++) {
+                int d5_nbase = d5_nn * 8;
+                unsigned d5_saddr = __cvta_generic_to_shared(d5_sV + d5_bc_row * FA2_DP + d5_nbase);
+                uint32_t d5_b0, d5_b1;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+                    : "=r"(d5_b0), "=r"(d5_b1) : "r"(d5_saddr));
+                uint32_t d5_a0 = d5_pfrag[d5_kk][0], d5_a1 = d5_pfrag[d5_kk][1], d5_a2 = d5_pfrag[d5_kk][2], d5_a3 = d5_pfrag[d5_kk][3];
+                float d5_c0 = d5_ofrag[d5_nn][0], d5_c1 = d5_ofrag[d5_nn][1], d5_c2 = d5_ofrag[d5_nn][2], d5_c3 = d5_ofrag[d5_nn][3];
+                asm(FA2_MMA
+                    " {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+f"(d5_c0), "+f"(d5_c1), "+f"(d5_c2), "+f"(d5_c3)
+                    : "r"(d5_a0), "r"(d5_a1), "r"(d5_a2), "r"(d5_a3),
+                      "r"(d5_b0), "r"(d5_b1));
+                d5_ofrag[d5_nn][0] = d5_c0; d5_ofrag[d5_nn][1] = d5_c1; d5_ofrag[d5_nn][2] = d5_c2; d5_ofrag[d5_nn][3] = d5_c3;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Epilogue
+    float d5_inv_a = (d5_l_a > 0.0f) ? 1.0f / d5_l_a : 0.0f;
+    float d5_inv_b = (d5_l_b > 0.0f) ? 1.0f / d5_l_b : 0.0f;
+    for (int d5_nn = 0; d5_nn < FA2_DN; d5_nn++) {
+        int d5_d_col = d5_nn * 8 + d5_col_g;
+        if (d5_gqr_a < n_q) {
+            d5_Oh[(size_t)d5_gqr_a * hstride_q + d5_d_col + 0] = f2dt(d5_ofrag[d5_nn][0] * d5_inv_a);
+            d5_Oh[(size_t)d5_gqr_a * hstride_q + d5_d_col + 1] = f2dt(d5_ofrag[d5_nn][1] * d5_inv_a);
+        }
+        if (d5_gqr_b < n_q) {
+            d5_Oh[(size_t)d5_gqr_b * hstride_q + d5_d_col + 0] = f2dt(d5_ofrag[d5_nn][2] * d5_inv_b);
+            d5_Oh[(size_t)d5_gqr_b * hstride_q + d5_d_col + 1] = f2dt(d5_ofrag[d5_nn][3] * d5_inv_b);
         }
     }
 }

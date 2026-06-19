@@ -8458,9 +8458,10 @@ struct cuda_llm_runner {
     int ple_use_f32;                /* 1 = keep PLE weights in F32 for accuracy */
     /* AOT-compiled GPU kernels (moe_gpu_kernels.cubin, no device globals) */
     CUmodule moe_gpu_mod;
-    /* FA2 Flash Attention NVRTC module (separately compiled for D=256) */
+    /* FA2 Flash Attention NVRTC module (separately compiled for D=256 and D=512) */
     CUmodule fa2_mod;
     CUfunction fn_fa2_attn_256;
+    CUfunction fn_fa2_attn_512;
     CUfunction fn_moe_topk_gpu;
     CUfunction fn_moe_shared_gate_gpu;
     CUfunction fn_moe_iq2s_tc;
@@ -9005,7 +9006,7 @@ lookup_funcs:
         }
     }
     /* Load FA2 flash attention cubin */
-    r->fa2_mod = 0; r->fn_fa2_attn_256 = NULL;
+    r->fa2_mod = 0; r->fn_fa2_attn_256 = NULL; r->fn_fa2_attn_512 = NULL;
     {
         const char *cp = "cuda/llm/fa2_kernels.cubin";
         FILE *fp = fopen(cp, "rb");
@@ -9019,6 +9020,7 @@ lookup_funcs:
                 fclose(fp);
                 if (nr == (size_t)sz && cuModuleLoadDataEx(&r->fa2_mod, d, 0, NULL, NULL) == CUDA_SUCCESS) {
                     cuModuleGetFunction(&r->fn_fa2_attn_256, r->fa2_mod, "fa2_attn_f");
+                    cuModuleGetFunction(&r->fn_fa2_attn_512, r->fa2_mod, "fa2_attn_d512_f");
                     /* fa2_attn_f uses 4*32*(head_dim+8)*sizeof(f16) dynamic smem
                      * (= 67584 B for head_dim=256), which exceeds the 48 KB default.
                      * Opt in to the larger dynamic-smem limit or the launch silently
@@ -9027,10 +9029,21 @@ lookup_funcs:
                         CUresult _sa = cuFuncSetAttribute(r->fn_fa2_attn_256,
                             CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96*1024);
                         if (_sa != CUDA_SUCCESS && r->verbose >= 1)
-                            fprintf(stderr, "cuda_llm: FA2 smem opt-in failed (err=%d)\n", (int)_sa);
+                            fprintf(stderr, "cuda_llm: FA2 d=256 smem opt-in failed (err=%d)\n", (int)_sa);
+                    }
+                    /* fa2_attn_d512_f uses 4*16*(512+8)*sizeof(f16) = 66560 B
+                     * dynamic smem (BC=16, head_dim=512). Opt in to 99 KB. */
+                    if (r->fn_fa2_attn_512) {
+                        CUresult _sa = cuFuncSetAttribute(r->fn_fa2_attn_512,
+                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 99*1024);
+                        if (_sa != CUDA_SUCCESS && r->verbose >= 1)
+                            fprintf(stderr, "cuda_llm: FA2 d=512 smem opt-in failed (err=%d)\n", (int)_sa);
                     }
                     if (r->verbose >= 1)
-                        fprintf(stderr, "cuda_llm: loaded %s (FA2 flash attention)\n", cp);
+                        fprintf(stderr, "cuda_llm: loaded %s (FA2 flash attention: %s%s%s)\n", cp,
+                            r->fn_fa2_attn_256 ? "d=256" : "",
+                            (r->fn_fa2_attn_256 && r->fn_fa2_attn_512) ? "," : "",
+                            r->fn_fa2_attn_512 ? "d=512" : "");
                 } else if (r->verbose >= 1) {
                     fprintf(stderr, "cuda_llm: failed to load %s\n", cp);
                 }
@@ -14708,6 +14721,55 @@ static void launch_fa2_attention_swa(cuda_llm_runner *r, CUdeviceptr out, CUdevi
                          head_dim, kv_dim, adj_scale, 0);
 }
 
+/* ---- FA2 d=512 launch helper ---- */
+/* Same shape as launch_fa2_attention but dispatches to fa2_attn_d512_f which
+ * uses BC=16 (vs 32 for d=256). Inputs are F32 Q (converted to F16) and F16
+ * KV cache. Output is F16 (converted back to F32). */
+static void launch_fa2_attention_d512(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
+                                      CUdeviceptr key_cache, CUdeviceptr value_cache,
+                                      int n_tokens, int start_pos, int n_heads, int n_kv_heads,
+                                      int head_dim, int kv_dim, float scale, int window) {
+    if (!r->fn_fa2_attn_512 || head_dim != 512) return;
+    int q_dim = n_heads * head_dim;
+    int hstride_q = q_dim;
+    int hstride_kv = kv_dim;
+    int gqa_ratio = n_heads / n_kv_heads;
+
+    /* Convert Q from F32 to F16 */
+    int total_q = n_tokens * q_dim;
+    CUdeviceptr d_q_f16 = r->d_fa2_q_f16;
+    if (d_q_f16 && r->fn_convert_f32_to_f16) {
+        void *args_conv[] = { &d_q_f16, &q_batch, &total_q };
+        cuLaunchKernel(r->fn_convert_f32_to_f16,
+            (total_q + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args_conv, NULL);
+    }
+    CUdeviceptr d_o_f16 = r->d_fa2_o_f16 ? r->d_fa2_o_f16 : d_q_f16;
+
+    int total_s = start_pos + n_tokens;
+    int fa2_n_q = n_tokens;
+    int fa2_q_off = start_pos;
+#define FA2_BR_D512 64
+#define FA2_BC_D512 16
+#define FA2_NTHR_D512 128
+    int n_q_tiles = (n_tokens + FA2_BR_D512 - 1) / FA2_BR_D512;
+    size_t fa2_smem = 4 * FA2_BC_D512 * (head_dim + 8) * 2; /* F16, +8 to avoid bank conflicts */
+    void *fa2_args[] = { &d_o_f16, &d_q_f16, &key_cache, &value_cache,
+                         &total_s, &head_dim, &hstride_q, &hstride_kv, &gqa_ratio, &scale, &window,
+                         &fa2_n_q, &fa2_q_off };
+    cuLaunchKernel(r->fn_fa2_attn_512,
+        (unsigned)n_q_tiles, (unsigned)n_heads, 1,
+        FA2_NTHR_D512, 1, 1, (unsigned)fa2_smem, r->stream, fa2_args, NULL);
+
+    if (r->fn_convert_f16_to_f32) {
+        void *args_deconv[] = { &out, &d_o_f16, &total_q };
+        cuLaunchKernel(r->fn_convert_f16_to_f32,
+            (total_q + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args_deconv, NULL);
+    }
+}
+#undef FA2_BR_D512
+#undef FA2_BC_D512
+#undef FA2_NTHR_D512
+
 /* cuBLAS-d512 score scratch cap (elements): the [gqa*q_chunk x total_s] score
  * matrix is bounded to this many elements by chunking the query dim. Without
  * chunking, n_heads*N^2 is 4 GB+ at N=8192 and fails to allocate. Used as the
@@ -14733,11 +14795,20 @@ static size_t d512_score_cap_elems(void) {
 /* Q_batch: F32 [n_tokens * q_dim]. K/V cache: F16 [max_seq_len * kv_dim].
    Uses cuBLAS F16 GEMM for Q@K^T and P@V with custom causal softmax.
    The query dim is processed in chunks so the materialized score matrix stays
-   bounded (D512_SCORE_CAP_ELEMS) regardless of n_tokens. */
+   bounded (D512_SCORE_CAP_ELEMS) regardless of n_tokens.
+
+   Falls through to launch_fa2_attention_d512 when the FA2 d=512 cubin
+   function is available, since FA2 avoids materializing scores entirely. */
 static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
                                           CUdeviceptr key_cache, CUdeviceptr value_cache,
                                           int n_tokens, int start_pos, int n_heads, int n_kv_heads,
                                           int head_dim, int kv_dim, float scale) {
+    if (head_dim == 512 && r->fn_fa2_attn_512) {
+        launch_fa2_attention_d512(r, out, q_batch, key_cache, value_cache,
+                                   n_tokens, start_pos, n_heads, n_kv_heads,
+                                   head_dim, kv_dim, scale, 0);
+        return;
+    }
     if (!r->cublas || !r->fn_fa2_attn_256 || !r->d_fa2_q_f16 || !r->d_fa2_scores_f16) return;
     int gqa = n_heads / n_kv_heads;
     int q_dim = n_heads * head_dim;
