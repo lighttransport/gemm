@@ -453,7 +453,12 @@ int main(int argc, char **argv) {
     float *cpu_vision_embd = NULL;
     if (is_gemma4uv) {
         fprintf(stderr, "Gemma4UV detected — using CPU vision encoder (fallback)\n");
+        double t0c = get_time_ms();
+        int cpu_proj_dim = vision->proj_dim;
         cpu_vision_embd = g4v_encode(vision, image, img_w, img_h);
+        double t1c = get_time_ms();
+        if (!cpu_vision_embd) { fprintf(stderr, "CPU vision encoding failed\n"); return 1; }
+        fprintf(stderr, "Vision: %d tokens x %d dim (%.1f ms CPU)\n", n_vision, cpu_proj_dim, t1c - t0c);
     }
     g4v_free(vision);
 

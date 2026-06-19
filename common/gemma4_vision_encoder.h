@@ -252,6 +252,71 @@ static void g4v_layernorm(float *out, const float *x, const qtensor *w, const qt
     for (int i = 0; i < n; i++) out[i] = (x[i] - mean) * scale * wf[i] + bf[i];
 }
 
+/* AVX2 LayerNorm in-place: x = (x - mean) / sqrt(var + eps) * w + b.
+ * Single-pass Welford-style mean+var, then in-place normalize+scale+shift.
+ * n should be a multiple of 8 for best performance. */
+static void g4v_layernorm_avx2_inplace(float *x, const float *w, const float *b, int n, float eps) {
+#ifdef __AVX2__
+    __m256 vsum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) vsum = _mm256_add_ps(vsum, _mm256_loadu_ps(x + i));
+    float tail_sum = 0.0f;
+    for (; i < n; i++) tail_sum += x[i];
+    if (tail_sum != 0.0f) vsum = _mm256_add_ps(vsum, _mm256_set1_ps(tail_sum));
+    /* horizontal sum */
+    __m128 lo = _mm256_castps256_ps128(vsum);
+    __m128 hi = _mm256_extractf128_ps(vsum, 1);
+    lo = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(lo);
+    __m128 sums = _mm_add_ps(lo, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    float mean = _mm_cvtss_f32(sums) / (float)n;
+
+    __m256 vmean = _mm256_set1_ps(mean);
+    __m256 vvar = _mm256_setzero_ps();
+    i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vd = _mm256_sub_ps(vx, vmean);
+        vvar = _mm256_fmadd_ps(vd, vd, vvar);
+    }
+    float tail_var = 0.0f;
+    for (; i < n; i++) { float d = x[i] - mean; tail_var += d * d; }
+    if (tail_var != 0.0f) vvar = _mm256_add_ps(vvar, _mm256_set1_ps(tail_var));
+    lo = _mm256_castps256_ps128(vvar);
+    hi = _mm256_extractf128_ps(vvar, 1);
+    lo = _mm_add_ps(lo, hi);
+    shuf = _mm_movehdup_ps(lo);
+    __m128 vars = _mm_add_ps(lo, shuf);
+    shuf = _mm_movehl_ps(shuf, vars);
+    vars = _mm_add_ss(vars, shuf);
+    float var = _mm_cvtss_f32(vars) / (float)n;
+    float scale = 1.0f / sqrtf(var + eps);
+
+    __m256 vscale = _mm256_set1_ps(scale);
+    i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vw = _mm256_loadu_ps(w + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 vd = _mm256_sub_ps(vx, vmean);
+        __m256 vout = _mm256_fmadd_ps(_mm256_mul_ps(vd, vscale), vw, vb);
+        _mm256_storeu_ps(x + i, vout);
+    }
+    for (; i < n; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
+#else
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= n;
+    float var = 0.0f;
+    for (int i = 0; i < n; i++) { float d = x[i] - mean; var += d * d; }
+    var /= n;
+    float scale = 1.0f / sqrtf(var + eps);
+    for (int i = 0; i < n; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
+#endif
+}
+
 /* Simple matmul: out[n_rows] = mat[n_rows, n_cols] @ vec[n_cols] */
 static void g4v_matvec(float *out, const qtensor *mat, const float *vec, int n_rows, float *tmp) {
     int n_cols = mat->n_cols;
@@ -294,12 +359,30 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
     }
     const uint8_t *base = (const uint8_t *)mat->data;
 
-    /* Dequant all rows into a contiguous F32 buffer */
-    float *mat_f32 = (float *)malloc((size_t)n_rows * n_cols * sizeof(float));
-    for (int r = 0; r < n_rows; r++)
-        dequant_row(mat->type, base + r * row_bytes, mat_f32 + (size_t)r * n_cols, n_cols);
+    /* Dequant all rows into a contiguous F32 buffer.
+     * Fast path: for F32 weights we can use the data pointer directly without copy
+     * (saves a 100+MB memcpy which dominated the matmul time on this CPU). */
+    float *mat_f32 = NULL;
+    int owns_mat = 0;
+    if (mat->type == GGML_TYPE_F32) {
+        mat_f32 = (float *)mat->data;  /* direct, no copy */
+    } else {
+        mat_f32 = (float *)malloc((size_t)n_rows * n_cols * sizeof(float));
+        owns_mat = 1;
+        struct timespec _mts0, _mts1;
+        clock_gettime(CLOCK_MONOTONIC, &_mts0);
+        for (int r = 0; r < n_rows; r++)
+            dequant_row(mat->type, base + r * row_bytes, mat_f32 + (size_t)r * n_cols, n_cols);
+        clock_gettime(CLOCK_MONOTONIC, &_mts1);
+#ifdef GEMMA4_PROFILE_MS
+        fprintf(stderr, "    g4v_matmul_batch dequant: n_rows=%d n_cols=%d -> %.2fms\n",
+                n_rows, n_cols, (_mts1.tv_sec*1000.0+_mts1.tv_nsec/1e6) - (_mts0.tv_sec*1000.0+_mts0.tv_nsec/1e6));
+#endif
+    }
 
     /* Threaded + AVX2 dot products */
+    struct timespec _mts0;
+    clock_gettime(CLOCK_MONOTONIC, &_mts0);
     int nt = g4v_n_threads();
     if (nt > n_rows) nt = n_rows;
     if (nt <= 1) {
@@ -327,7 +410,16 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
         }
         for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
     }
-    free(mat_f32);
+    struct timespec _mts1; clock_gettime(CLOCK_MONOTONIC, &_mts1);
+#ifdef GEMMA4_PROFILE_MS
+    {
+        double _mat_t = (_mts1.tv_sec*1000.0+_mts1.tv_nsec/1e6) - (_mts0.tv_sec*1000.0+_mts0.tv_nsec/1e6);
+        double _mat_gflops = (double)(2LL * n_rows * n_cols * N) / (_mat_t * 1e6);
+        fprintf(stderr, "    g4v_matmul_batch matmul: n_rows=%d n_cols=%d N=%d threads=%d -> %.2fms (%.1f GFLOPS)\n",
+                n_rows, n_cols, N, nt, _mat_t, _mat_gflops);
+    }
+#endif
+    if (owns_mat) free(mat_f32);
 }
 
 /* ---- Loading ---- */
@@ -753,6 +845,22 @@ static void g4v_avg_pool(float *out, const float *in, int ph, int pw, int dim, i
  * the GGUF stores it as [in, out] = mat.n_rows=in, mat.n_cols=out. The matmul we need
  * is out[t, r] = sum_c mat_gguf[c, r] * inp[t, c] = (inp @ mat_gguf.T)[t, r].
  */
+/* Helper: return F32 pointer to qtensor data without copy. Returns NULL if not F32. */
+static const float *g4v_f32_ptr(const qtensor *t) {
+    if (t->type == GGML_TYPE_F32) return (const float *)t->data;
+    return NULL;
+}
+
+/* Helper: like g4v_f32_ptr but returns a writable pointer; dequantizes into a new
+ * malloc'd buffer if the tensor is not F32. Caller must free the returned pointer
+ * if it is non-NULL and the tensor was not F32 (use g4v_f32_owned_free to check). */
+static float *g4v_f32_get_or_dequant(const qtensor *t, int n) {
+    if (t->type == GGML_TYPE_F32) return (float *)t->data;  /* borrowed; do not free */
+    float *out = (float *)malloc((size_t)n * sizeof(float));
+    dequant_row(t->type, t->data, out, n);
+    return out;
+}
+
 static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int width, int height) {
     int dim = vm->dim;
     int ps = vm->patch_size;            /* 48 for 12B */
@@ -763,6 +871,17 @@ static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int widt
     int patch_dim = ps * ps * 3;        /* 6912 for 12B */
 
     fprintf(stderr, "g4v_encode_gemma4uv: %dx%d ps=%d -> %d patches\n", width, height, ps, N);
+#ifdef GEMMA4_PROFILE_MS
+    /* STEP_BEGIN(i) at start of section i, STEP_END(i) at end of section i.
+     * Records the wall time between BEGIN and END into _pt[i]. */
+    double _pt[8] = {0}; const char *_pn[8] = {"im2col","LN1","MM1","LN2","pos","LN3","RMS","MM2"};
+    double _pt_t[8] = {0}; int _pt_active[8] = {0};
+#define STEP_BEGIN(i) do { struct timespec _now; clock_gettime(CLOCK_MONOTONIC, &_now); _pt_t[i] = _now.tv_sec*1000.0 + _now.tv_nsec/1e6; _pt_active[i] = 1; } while (0)
+#define STEP_END(i) do { if (_pt_active[i]) { struct timespec _now; clock_gettime(CLOCK_MONOTONIC, &_now); double _ms = _now.tv_sec*1000.0 + _now.tv_nsec/1e6; _pt[i] += _ms - _pt_t[i]; _pt_active[i] = 0; } } while (0)
+#else
+#define STEP_BEGIN(i) (void)0
+#define STEP_END(i) (void)0
+#endif
 
     float *patches_im2col = (float *)malloc((size_t)N * patch_dim * sizeof(float));
     float *patches        = (float *)malloc((size_t)N * dim      * sizeof(float));
@@ -775,6 +894,7 @@ static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int widt
     }
 
     /* 1. im2col: [patch_dim, N] layout — patches_im2col[patch * N + i] = pixel value */
+    STEP_BEGIN(0);
     for (int py = 0; py < ph; py++) {
         for (int px = 0; px < pw; px++) {
             int patch_idx = py * pw + px;
@@ -791,31 +911,26 @@ static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int widt
             }
         }
     }
+    STEP_END(0);
 
     /* 2. patch_norm_1 (LayerNorm over patch_dim = 6912) */
+    STEP_BEGIN(1);
     {
-        float *w = (float *)malloc(patch_dim * sizeof(float));
-        float *b = (float *)malloc(patch_dim * sizeof(float));
-        dequant_row(vm->patch_norm_1_w.type, vm->patch_norm_1_w.data, w, patch_dim);
-        dequant_row(vm->patch_norm_1_b.type, vm->patch_norm_1_b.data, b, patch_dim);
-        for (int p = 0; p < N; p++) {
-            float *x = patches_im2col + p * patch_dim;
-            float mean = 0.0f;
-            for (int i = 0; i < patch_dim; i++) mean += x[i];
-            mean /= patch_dim;
-            float var = 0.0f;
-            for (int i = 0; i < patch_dim; i++) { float d = x[i] - mean; var += d * d; }
-            var /= patch_dim;
-            float scale = 1.0f / sqrtf(var + eps);
-            for (int i = 0; i < patch_dim; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
-        }
-        free(w); free(b);
+        float *w = g4v_f32_get_or_dequant(&vm->patch_norm_1_w, patch_dim);
+        float *b = g4v_f32_get_or_dequant(&vm->patch_norm_1_b, patch_dim);
+        int w_owned = (w != (float *)vm->patch_norm_1_w.data);
+        int b_owned = (b != (float *)vm->patch_norm_1_b.data);
+        for (int p = 0; p < N; p++)
+            g4v_layernorm_avx2_inplace(patches_im2col + p * patch_dim, w, b, patch_dim, eps);
+        if (w_owned) free(w);
+        if (b_owned) free(b);
     }
 
     /* 3. matmul: g4v_matmul_batch computes out = inp @ mat.T.
      *    qtensor: n_rows=dim, n_cols=patch_dim (loaded reversed from GGUF dims=[patch_dim, dim]).
      *    patches[N, dim] = im2col[N, patch_dim] @ mat[dim, patch_dim].T = im2col @ mat_view.T
      *    g4v_matmul_batch handles this directly with n_rows=dim. */
+    STEP_BEGIN(2);
     {
         int mat_rows = vm->patch_embd_w.n_rows;     /* dim */
         int mat_cols = vm->patch_embd_w.n_cols;     /* patch_dim */
@@ -827,44 +942,47 @@ static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int widt
         }
         g4v_matmul_batch(patches, &vm->patch_embd_w, patches_im2col, N, dim, tmp);
     }
-
+    STEP_END(2);
+    
     /* 4. add patch_embd_b [dim] */
     if (vm->patch_embd_b.data) {
-        float *b = (float *)malloc(dim * sizeof(float));
-        dequant_row(vm->patch_embd_b.type, vm->patch_embd_b.data, b, dim);
+        float *b = g4v_f32_get_or_dequant(&vm->patch_embd_b, dim);
+        int b_owned = (b != (float *)vm->patch_embd_b.data);
         for (int p = 0; p < N; p++)
             for (int d = 0; d < dim; d++) patches[p * dim + d] += b[d];
-        free(b);
+        if (b_owned) free(b);
     }
 
     /* 5. patch_norm_2 (LayerNorm over dim) */
+    STEP_BEGIN(3);
     {
-        float *w = (float *)malloc(dim * sizeof(float));
-        float *b = (float *)malloc(dim * sizeof(float));
-        dequant_row(vm->patch_norm_2_w.type, vm->patch_norm_2_w.data, w, dim);
-        dequant_row(vm->patch_norm_2_b.type, vm->patch_norm_2_b.data, b, dim);
-        for (int p = 0; p < N; p++) {
-            float *x = patches + p * dim;
-            float mean = 0.0f;
-            for (int i = 0; i < dim; i++) mean += x[i];
-            mean /= dim;
-            float var = 0.0f;
-            for (int i = 0; i < dim; i++) { float d = x[i] - mean; var += d * d; }
-            var /= dim;
-            float scale = 1.0f / sqrtf(var + eps);
-            for (int i = 0; i < dim; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
-        }
-        free(w); free(b);
+        float *w = g4v_f32_get_or_dequant(&vm->patch_norm_2_w, dim);
+        float *b = g4v_f32_get_or_dequant(&vm->patch_norm_2_b, dim);
+        int w_owned = (w != (float *)vm->patch_norm_2_w.data);
+        int b_owned = (b != (float *)vm->patch_norm_2_b.data);
+        for (int p = 0; p < N; p++)
+            g4v_layernorm_avx2_inplace(patches + p * dim, w, b, dim, eps);
+        if (w_owned) free(w);
+        if (b_owned) free(b);
     }
+    STEP_END(3);
 
     free(patches_im2col);
     patches_im2col = NULL;
 
     /* 6. add 2D position embedding (X, Y lookups from [dim, n_pos, 2]) */
+    STEP_BEGIN(4);
     {
         int n_pos = vm->n_pos;
-        float *pos_data = (float *)malloc((size_t)dim * n_pos * 2 * sizeof(float));
-        dequant_row(vm->position_embd.type, vm->position_embd.data, pos_data, dim * n_pos * 2);
+        int owns_pos = 0;
+        float *pos_data = NULL;
+        if (vm->position_embd.type == GGML_TYPE_F32) {
+            pos_data = (float *)vm->position_embd.data;  /* direct, no copy */
+        } else {
+            pos_data = (float *)malloc((size_t)dim * n_pos * 2 * sizeof(float));
+            owns_pos = 1;
+            dequant_row(vm->position_embd.type, vm->position_embd.data, pos_data, dim * n_pos * 2);
+        }
         float *tbl_x = pos_data;
         float *tbl_y = pos_data + (size_t)dim * n_pos;
         for (int py = 0; py < ph; py++) {
@@ -876,40 +994,45 @@ static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int widt
                 for (int d = 0; d < dim; d++) p[d] += src_x[d] + src_y[d];
             }
         }
-        free(pos_data);
+        if (owns_pos) free(pos_data);
     }
+    STEP_END(4);
 
     /* 7. patch_norm_3 (LayerNorm over dim) */
+    STEP_BEGIN(5);
     {
-        float *w = (float *)malloc(dim * sizeof(float));
-        float *b = (float *)malloc(dim * sizeof(float));
-        dequant_row(vm->patch_norm_3_w.type, vm->patch_norm_3_w.data, w, dim);
-        dequant_row(vm->patch_norm_3_b.type, vm->patch_norm_3_b.data, b, dim);
-        for (int p = 0; p < N; p++) {
-            float *x = patches + p * dim;
-            float mean = 0.0f;
-            for (int i = 0; i < dim; i++) mean += x[i];
-            mean /= dim;
-            float var = 0.0f;
-            for (int i = 0; i < dim; i++) { float d = x[i] - mean; var += d * d; }
-            var /= dim;
-            float scale = 1.0f / sqrtf(var + eps);
-            for (int i = 0; i < dim; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
-        }
-        free(w); free(b);
+        float *w = g4v_f32_get_or_dequant(&vm->patch_norm_3_w, dim);
+        float *b = g4v_f32_get_or_dequant(&vm->patch_norm_3_b, dim);
+        int w_owned = (w != (float *)vm->patch_norm_3_w.data);
+        int b_owned = (b != (float *)vm->patch_norm_3_b.data);
+        for (int p = 0; p < N; p++)
+            g4v_layernorm_avx2_inplace(patches + p * dim, w, b, dim, eps);
+        if (w_owned) free(w);
+        if (b_owned) free(b);
     }
+    STEP_END(5);
 
     /* 8. RMSNorm over dim (raw, no learned weight) */
+    STEP_BEGIN(6);
     for (int p = 0; p < N; p++) {
         float *x = patches + p * dim;
-        float ss = 0.0f;
-        for (int i = 0; i < dim; i++) ss += x[i] * x[i];
-        ss = 1.0f / sqrtf(ss / dim + eps);
-        for (int i = 0; i < dim; i++) x[i] *= ss;
+        float ss = g4v_sum_sq(x, dim);
+        float scale = 1.0f / sqrtf(ss / dim + eps);
+#ifdef __AVX2__
+        __m256 vsc = _mm256_set1_ps(scale);
+        int i = 0;
+        for (; i + 7 < dim; i += 8)
+            _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vsc));
+        for (; i < dim; i++) x[i] *= scale;
+#else
+        g4v_vec_scale(x, scale, dim);
+#endif
     }
+    STEP_END(6);
 
     /* 9. mm.input_projection: out = patches @ mat_view.T
      *    qtensor: n_rows=proj_dim, n_cols=dim (GGUF dims=[dim, proj_dim]). */
+    STEP_BEGIN(7);
     {
         int mat_rows = vm->mm_proj_w.n_rows;     /* proj_dim */
         int mat_cols = vm->mm_proj_w.n_cols;     /* dim */
@@ -921,9 +1044,18 @@ static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int widt
         }
         g4v_matmul_batch(proj_patches, &vm->mm_proj_w, patches, N, proj_dim, tmp);
     }
+    STEP_END(7);
 
     free(patches);
     free(tmp);
+#ifdef GEMMA4_PROFILE_MS
+    {
+        fprintf(stderr, "  gemma4uv step timings: ");
+        double _total = 0;
+        for (int _i=0;_i<8;_i++) { fprintf(stderr, "%s=%.1fms ", _pn[_i], _pt[_i]); _total += _pt[_i]; }
+        fprintf(stderr, "total=%.1fms\n", _total);
+    }
+#endif
     return proj_patches;
 }
 
