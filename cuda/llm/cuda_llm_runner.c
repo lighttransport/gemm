@@ -14460,10 +14460,10 @@ static void launch_batch_softplus_mul(cuda_llm_runner *r, CUdeviceptr out, CUdev
 }
 
 static void launch_batch_rope(cuda_llm_runner *r, CUdeviceptr vec, int heads_per_token,
-                               int n_tokens, int head_dim, int start_pos, float freq_base) {
+                               int n_tokens, int head_dim, int start_pos, float freq_base,
+                               int n_rope_pairs) {
     int total_heads = heads_per_token * n_tokens;
     int half_dim = head_dim / 2;
-    int n_rope_pairs = r->n_rope_pairs;
     void *args[] = { &vec, &heads_per_token, &total_heads, &head_dim,
                      &start_pos, &freq_base, &n_rope_pairs };
     cuLaunchKernel(r->fn_batch_rope_neox_f32,
@@ -15069,8 +15069,8 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                 if (cl->attn_k_norm_w) launch_qknorm(r, d_batch_k, cl->attn_k_norm_w, n_tokens * n_kv_heads, head_dim, eps);
             }
 
-            launch_batch_rope(r, d_batch_q, n_heads, n_tokens, head_dim, start_pos, r->rope_freq_base);
-            launch_batch_rope(r, d_batch_k, n_kv_heads, n_tokens, head_dim, start_pos, r->rope_freq_base);
+            launch_batch_rope(r, d_batch_q, n_heads, n_tokens, head_dim, start_pos, r->rope_freq_base, r->n_rope_pairs);
+            launch_batch_rope(r, d_batch_k, n_kv_heads, n_tokens, head_dim, start_pos, r->rope_freq_base, r->n_rope_pairs);
 
             {
                 void *args[] = { &r->d_key_cache[l], &r->d_value_cache[l], &d_batch_k, &d_batch_v,
@@ -15816,7 +15816,6 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             /* ----- Batched path for full-attention or non-wrapping SWA ----- */
             int total_q_heads = n_tokens * n_heads;
             int total_kv_heads = n_tokens * layer_kv_heads;
-            float rope_base = cl->is_swa ? r->rope_freq_base_swa : r->rope_freq_base;
 
             if (cl->has_qk_norm) {
                 int bd = 1; while (bd < hd) bd <<= 1;
@@ -15840,9 +15839,14 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
             }
 
             if (cl->is_swa) {
-                launch_batch_rope(r, d_batch_q, n_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa);
+                /* SWA: rotate ALL head_dim pairs (rope_dim = head_dim), matching the
+                 * sequential path's zero_pairs=0. Passing r->n_rope_pairs (=full
+                 * head_dim/2) here made rope_dim = 2*n_rope_pairs = full head_dim,
+                 * i.e. half the correct rotation frequency on every SWA layer ->
+                 * batched prefill diverged from sequential (garbage decode). */
+                launch_batch_rope(r, d_batch_q, n_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa, 0);
                 if (cl->shared_kv_source < 0)
-                    launch_batch_rope(r, d_batch_k, layer_kv_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa);
+                    launch_batch_rope(r, d_batch_k, layer_kv_heads, n_tokens, hd, start_pos, r->rope_freq_base_swa, 0);
             } else {
                 launch_batch_rope_with_factors(r, d_batch_q, n_heads, n_tokens, hd,
                                                start_pos, r->d_rope_inv_freq_full);
