@@ -15584,12 +15584,35 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     }
 
     /*
-     * The generic batched implementation below is Gemma4-specific. Other
-     * models use the single-token path so prefill remains correct instead of
-     * silently skipping transformer layers.
+     * Generic batched prefill. For Gemma4 (LLM-only, text inputs) this is much
+     * faster than running N sequential forwards. Set CUDA_LLM_BATCHED_PREFILL=0
+     * to fall back to the single-token path.
+     *
+     * The VLM path uses vision embeddings interleaved with text tokens; the
+     * batched path's numerical divergence on Gemma4 was the original reason
+     * for always using sequential. We restrict the batched route to token-ids
+     * input (LLM-only); vision-embedding prefill stays on sequential.
      */
-    return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
-                                       n_tokens, start_pos);
+    if (getenv("CUDA_LLM_BATCHED_PREFILL") && atoi(getenv("CUDA_LLM_BATCHED_PREFILL")) == 0) {
+        return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
+                                           n_tokens, start_pos);
+    }
+    if (embeddings != NULL) {
+        /* VLM vision-embedding path: keep sequential for now. */
+        return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
+                                           n_tokens, start_pos);
+    }
+    if (r->is_gemma4 && r->n_embd_per_layer > 0 && r->d_ple_combined) {
+        /* Gemma4 with PLE (older 2B model): the per-layer embedding path is
+         * still per-token in the batched code (if 0 && ...). Keep sequential. */
+        return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
+                                           n_tokens, start_pos);
+    }
+    if (!r->is_gemma4) {
+        /* Non-Gemma4, non-hybrid: use sequential (defensive — keep correctness). */
+        return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
+                                           n_tokens, start_pos);
+    }
 
     /* Chunked prefill for long context on limited VRAM. The batched path below
      * allocates O(n_tokens) F32 activation buffers (q/xb2/k/v/gate/up, ~2 GB at
