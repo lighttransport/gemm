@@ -268,6 +268,7 @@ typedef struct {
     uint32_t fp8_lut[256];   /* FP8 E4GLM5 -> f32 bits (built once; used by the MXFP8 matvec) */
     /* arena */
     uint8_t *arena; size_t arena_sz, arena_used;
+    int owns_weights;           /* 1 for loaded/synth root model; 0 for runtime KV/scratch clones */
     /* pool */
     glm5_pool *pool;
     int n_threads, n_cmgs;

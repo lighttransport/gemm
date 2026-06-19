@@ -215,6 +215,164 @@ static void embed_lookup(glm5_model*m,int tok,float*x){
 #define GLM5_EOS_ID1 154827
 #define GLM5_EOS_ID2 154829
 
+typedef struct {
+    int *ids;
+    int n;
+} id_prompt;
+
+typedef struct {
+    glm5_model *m;
+    float *x;
+    int *gen;
+    int req, n_prompt, ng, cur, done, nan;
+} cb_slot;
+
+static int parse_id_line(char *line,int **out_ids,int *out_n){
+    char *p=line, *end=NULL;
+    while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+    if(!*p || *p=='#') return 0;
+    int cap=64,n=0,*ids=glm5_amalloc((size_t)cap*sizeof(int));
+    while(*p){
+        long v=strtol(p,&end,10);
+        if(end==p) break;
+        if(n>=cap){ cap*=2; ids=realloc(ids,(size_t)cap*sizeof(int)); }
+        ids[n++]=(int)v;
+        p=end;
+        while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+    }
+    if(n<1){ glm5_afree(ids); return 0; }
+    *out_ids=ids; *out_n=n; return 1;
+}
+
+static int load_prompt_batch(const char*path,id_prompt **out){
+    FILE*f=fopen(path,"r"); if(!f) return -1;
+    int cap=16,n=0; id_prompt *ps=glm5_amalloc((size_t)cap*sizeof(id_prompt));
+    char *line=NULL; size_t linecap=0;
+    while(getline(&line,&linecap,f)>0){
+        int *ids=NULL, ni=0;
+        if(!parse_id_line(line,&ids,&ni)) continue;
+        if(n>=cap){ cap*=2; ps=realloc(ps,(size_t)cap*sizeof(id_prompt)); }
+        ps[n++]=(id_prompt){ids,ni};
+    }
+    free(line); fclose(f); *out=ps; return n;
+}
+
+static void prof_sum_models(cb_slot*s,int ns,double dst[GLM5_NPHASE]){
+    for(int i=0;i<GLM5_NPHASE;i++) dst[i]=0.0;
+    for(int j=0;j<ns;j++) if(s[j].m) for(int i=0;i<GLM5_NPHASE;i++) dst[i]+=s[j].m->prof[i];
+}
+
+static void cbatch_write_req(const char*prefix,int req,const int*gen,int ng){
+    if(MyRank!=0 || !prefix || !*prefix) return;
+    char path[512]; snprintf(path,sizeof path,"%s_%03d.txt",prefix,req);
+    FILE*f=fopen(path,"w");
+    if(!f) return;
+    for(int i=0;i<ng;i++) fprintf(f,"%d%s",gen[i],i+1<ng?" ":"\n");
+    fclose(f);
+}
+
+static int cbatch_start(cb_slot*s,const id_prompt*p,int req,int max_new,int C,double *prefill_sec,double *prefill_ar,long *prefill_calls){
+    s->req=req; s->n_prompt=p->n; s->ng=0; s->done=0; s->nan=0; s->cur=0;
+    g_ar_secs=0; g_ar_calls=0;
+    double t0=now_sec();
+    int last=-1;
+    for(int i=0;i<p->n;i++){ embed_lookup(s->m,p->ids[i],s->x); last=glm5_forward_token(s->m,s->x,i); }
+    double dt=now_sec()-t0;
+    *prefill_sec+=dt; *prefill_ar+=g_ar_secs; *prefill_calls+=g_ar_calls;
+    s->cur=last;
+    (void)max_new; (void)C;
+    return 0;
+}
+
+static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefix,int max_new,int C){
+    id_prompt *prompts=NULL;
+    int n_req=load_prompt_batch(batch_file,&prompts);
+    if(n_req<1) die("empty GLM5_CBATCH_PROMPTS",-1);
+    int slots=envi("GLM5_CBATCH_SLOTS",n_req);
+    if(slots<1) slots=1; if(slots>n_req) slots=n_req;
+    if(MyRank==0) logmsg("cbatch: requests=%d slots=%d max_new=%d max_pos=%d prompts=%s\n",
+                         n_req,slots,max_new,root->cfg.max_pos,batch_file);
+    for(int r=0;r<n_req;r++) if(prompts[r].n+max_new>root->cfg.max_pos)
+        die("cbatch prompt+max_new exceeds max_pos",-1);
+
+    cb_slot *S=glm5_acalloc((size_t)slots,sizeof(cb_slot));
+    for(int s=0;s<slots;s++){
+        S[s].m=glm5_clone_runtime(root);
+        if(!S[s].m) die("glm5_clone_runtime",-1);
+        S[s].x=glm5_amalloc((size_t)C*4);
+        S[s].gen=glm5_amalloc((size_t)(max_new>0?max_new:1)*sizeof(int));
+        S[s].req=-1;
+    }
+
+    double prof0[GLM5_NPHASE], prof1[GLM5_NPHASE];
+    prof_sum_models(S,slots,prof0);
+    double pf_sec=0.0,pf_ar=0.0,svc_ar=0.0; long pf_calls=0,svc_calls=0;
+    int next=0,done=0,active=0,total_gen=0,total_nan=0,total_prompt=0;
+    for(int s=0;s<slots && next<n_req;s++,next++){
+        total_prompt+=prompts[next].n;
+        cbatch_start(&S[s],&prompts[next],next,max_new,C,&pf_sec,&pf_ar,&pf_calls);
+        active++;
+    }
+    barrier();
+    g_ar_secs=0; g_ar_calls=0;
+    double svc0=now_sec();
+    while(done<n_req){
+        int progressed=0;
+        for(int s=0;s<slots;s++){
+            cb_slot *q=&S[s];
+            if(q->req<0) continue;
+            progressed=1;
+            if(q->ng<max_new) q->gen[q->ng++]=q->cur;
+            int eos=(q->cur==GLM5_EOS_ID0||q->cur==GLM5_EOS_ID1||q->cur==GLM5_EOS_ID2);
+            if(eos || q->ng>=max_new){
+                total_gen+=q->ng; total_nan+=q->nan;
+                cbatch_write_req(out_prefix,q->req,q->gen,q->ng);
+                if(MyRank==0){
+                    char buf[3000]; int o=0;
+                    for(int i=0;i<q->ng&&o<2900;i++) o+=snprintf(buf+o,sizeof(buf)-o,"%d ",q->gen[i]);
+                    logmsg("CBATCH_IDS req=%d n=%d %s\n",q->req,q->ng,buf);
+                }
+                q->req=-1; done++; active--;
+                if(next<n_req){
+                    total_prompt+=prompts[next].n;
+                    double save_ar=g_ar_secs; long save_calls=g_ar_calls;
+                    cbatch_start(q,&prompts[next],next,max_new,C,&pf_sec,&pf_ar,&pf_calls);
+                    g_ar_secs=save_ar; g_ar_calls=save_calls;
+                    next++; active++;
+                }
+                continue;
+            }
+            embed_lookup(q->m,q->cur,q->x);
+            q->cur=glm5_forward_token(q->m,q->x,q->n_prompt+q->ng-1);
+            for(int i=0;i<C;i++) if(!(q->x[i]==q->x[i])) q->nan++;
+        }
+        if(!progressed && active==0 && next<n_req){
+            total_prompt+=prompts[next].n;
+            double save_ar=g_ar_secs; long save_calls=g_ar_calls;
+            cbatch_start(&S[0],&prompts[next],next,max_new,C,&pf_sec,&pf_ar,&pf_calls);
+            g_ar_secs=save_ar; g_ar_calls=save_calls;
+            next++; active++;
+        }
+    }
+    double svc_dt=now_sec()-svc0; svc_ar=g_ar_secs; svc_calls=g_ar_calls;
+    barrier();
+    prof_sum_models(S,slots,prof1);
+    if(MyRank==0){
+        logmsg("cbatch: prefill %d tok %.2f tok/s comm %.1f%% calls=%ld\n",
+               total_prompt,pf_sec>0?total_prompt/pf_sec:0.0,pf_sec>0?100.0*pf_ar/pf_sec:0.0,pf_calls);
+        logmsg("cbatch: service decode %d tok %.2f agg tok/s %.2f tok/s/slot comm %.1f%% calls=%ld NaNs=%d\n",
+               total_gen,svc_dt>0?total_gen/svc_dt:0.0,svc_dt>0?total_gen/(svc_dt*slots):0.0,
+               svc_dt>0?100.0*svc_ar/svc_dt:0.0,svc_calls,total_nan);
+        prof_log_delta("cbatch_total",prof0,prof1,total_prompt+total_gen,pf_sec+svc_dt,pf_ar+svc_ar);
+        logmsg("SENTINEL glm5_cbatch_%dn=done\n",N);
+    }
+    for(int s=0;s<slots;s++){ glm5_afree(S[s].gen); glm5_afree(S[s].x); glm5_free(S[s].m); }
+    glm5_afree(S);
+    for(int r=0;r<n_req;r++) glm5_afree(prompts[r].ids);
+    glm5_afree(prompts);
+    return 0;
+}
+
 int main(void){
     int rc;
     int n_threads=envi("LLM_THREADS",12), n_cmgs=envi("GLM5_CMGS",4);
@@ -333,6 +491,19 @@ int main(void){
             logmsg("SENTINEL glm5_mstream_%dn_N%d=done\n",N,NS);
         }
         glm5_afree(X);glm5_afree(pos);glm5_afree(out); glm5_afree(x); glm5_free(m); return 0;
+    }
+
+    /* ---- continuous batch gen-mode: each active request owns KV/scratch but shares weights.
+     * GLM5_CBATCH_PROMPTS is a text file: one whitespace-separated token-id prompt per line.
+     * GLM5_CBATCH_SLOTS limits concurrent in-flight requests; completed slots immediately
+     * accept the next queued prompt. This is scheduler/interleaved decode first, not fused MLA. */
+    const char*cbatch_file=getenv("GLM5_CBATCH_PROMPTS");
+    if(cbatch_file&&*cbatch_file){
+        int max_new=envi("GLM5_MAX_NEW",64);
+        const char*out_prefix=getenv("GLM5_CBATCH_OUT_PREFIX");
+        if(!out_prefix||!*out_prefix) out_prefix="glm5_cbatch_gen";
+        int rc2=run_cbatch(m,cbatch_file,out_prefix,max_new,C);
+        glm5_afree(x); glm5_free(m); return rc2;
     }
 
     /* ---- gen-mode: GLM5_PROMPT_IDS set -> real prompt prefill + greedy decode ----

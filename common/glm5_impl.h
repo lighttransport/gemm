@@ -305,25 +305,31 @@ static void glm5_free(glm5_model*m){
     if(m->pool){ if(glm5_g_pool==m->pool) glm5_g_pool=NULL; glm5_pool_destroy(m->pool); m->pool=NULL; }
     for(int l=0;l<m->cfg.n_layers;l++){
         glm5_layer*L=&m->layers[l];
-        glm5_afree(L->input_norm);glm5_afree(L->post_norm);
-        /* .scale (MXFP8 e8m0) is NULL for bf16 tensors; glm5_afree() of NULL is a no-op */
-        glm5_afree(L->wq_a.w);glm5_afree(L->wq_a.scale);glm5_afree(L->wq_b.w);glm5_afree(L->wq_b.scale);
-        glm5_afree(L->wkv_a.w);glm5_afree(L->wkv_a.scale);glm5_afree(L->wkv_b.w);glm5_afree(L->wkv_b.scale);
-        glm5_afree(L->wq.w);glm5_afree(L->wq.scale);glm5_afree(L->wk.w);glm5_afree(L->wk.scale);glm5_afree(L->wv.w);glm5_afree(L->wv.scale);
-        glm5_afree(L->wo.w);glm5_afree(L->wo.scale);glm5_afree(L->q_a_norm);glm5_afree(L->kv_a_norm);glm5_afree(L->q_norm);glm5_afree(L->k_norm);
+        if(m->owns_weights){
+            glm5_afree(L->input_norm);glm5_afree(L->post_norm);
+            /* .scale (MXFP8 e8m0) is NULL for bf16 tensors; glm5_afree() of NULL is a no-op */
+            glm5_afree(L->wq_a.w);glm5_afree(L->wq_a.scale);glm5_afree(L->wq_b.w);glm5_afree(L->wq_b.scale);
+            glm5_afree(L->wkv_a.w);glm5_afree(L->wkv_a.scale);glm5_afree(L->wkv_b.w);glm5_afree(L->wkv_b.scale);
+            glm5_afree(L->wq.w);glm5_afree(L->wq.scale);glm5_afree(L->wk.w);glm5_afree(L->wk.scale);glm5_afree(L->wv.w);glm5_afree(L->wv.scale);
+            glm5_afree(L->wo.w);glm5_afree(L->wo.scale);glm5_afree(L->q_a_norm);glm5_afree(L->kv_a_norm);glm5_afree(L->q_norm);glm5_afree(L->k_norm);
+        }
         glm5_afree(L->kv_cache);glm5_afree(L->k_cache);glm5_afree(L->v_cache);
         glm5_afree(L->k_q4);glm5_afree(L->v_q4);glm5_afree(L->k_qs);glm5_afree(L->v_qs);glm5_afree(L->idx_q4);glm5_afree(L->idx_qs);
         if(glm5_is_moe(&m->cfg,l)){
-            glm5_afree(L->idx_wq_b.w);glm5_afree(L->idx_wq_b.scale);glm5_afree(L->idx_wproj.w);glm5_afree(L->idx_wproj.scale);
-            glm5_afree(L->idx_wq.w);glm5_afree(L->idx_wq.scale);glm5_afree(L->idx_wk.w);glm5_afree(L->idx_wk.scale);
-            glm5_afree(L->idx_q_norm);glm5_afree(L->idx_k_norm);glm5_afree(L->idx_k_bias);glm5_afree(L->idx_k_cache);
-            glm5_afree(L->gate.w);glm5_afree(L->gate_bias);
-            glm5_afree(L->sh_w1.w);glm5_afree(L->sh_w1.scale);glm5_afree(L->sh_w3.w);glm5_afree(L->sh_w3.scale);glm5_afree(L->sh_w2.w);glm5_afree(L->sh_w2.scale);
-            if(L->ex_w1){ for(int s=0;s<L->n_owned;s++){ glm5_afree(L->ex_w1[s].w);glm5_afree(L->ex_w1[s].scale);glm5_afree(L->ex_w3[s].w);glm5_afree(L->ex_w3[s].scale);glm5_afree(L->ex_w2[s].w);glm5_afree(L->ex_w2[s].scale);} }
-            glm5_afree(L->ex_w1);glm5_afree(L->ex_w3);glm5_afree(L->ex_w2);glm5_afree(L->owned_eid);
-        } else { glm5_afree(L->ff_gate.w);glm5_afree(L->ff_gate.scale);glm5_afree(L->ff_up.w);glm5_afree(L->ff_up.scale);glm5_afree(L->ff_down.w);glm5_afree(L->ff_down.scale); }
+            if(m->owns_weights){
+                glm5_afree(L->idx_wq_b.w);glm5_afree(L->idx_wq_b.scale);glm5_afree(L->idx_wproj.w);glm5_afree(L->idx_wproj.scale);
+                glm5_afree(L->idx_wq.w);glm5_afree(L->idx_wq.scale);glm5_afree(L->idx_wk.w);glm5_afree(L->idx_wk.scale);
+                glm5_afree(L->idx_q_norm);glm5_afree(L->idx_k_norm);glm5_afree(L->idx_k_bias);
+                glm5_afree(L->gate.w);glm5_afree(L->gate_bias);
+                glm5_afree(L->sh_w1.w);glm5_afree(L->sh_w1.scale);glm5_afree(L->sh_w3.w);glm5_afree(L->sh_w3.scale);glm5_afree(L->sh_w2.w);glm5_afree(L->sh_w2.scale);
+                if(L->ex_w1){ for(int s=0;s<L->n_owned;s++){ glm5_afree(L->ex_w1[s].w);glm5_afree(L->ex_w1[s].scale);glm5_afree(L->ex_w3[s].w);glm5_afree(L->ex_w3[s].scale);glm5_afree(L->ex_w2[s].w);glm5_afree(L->ex_w2[s].scale);} }
+            }
+            glm5_afree(L->idx_k_cache);
+            if(m->owns_weights){ glm5_afree(L->ex_w1);glm5_afree(L->ex_w3);glm5_afree(L->ex_w2);glm5_afree(L->owned_eid); }
+        } else if(m->owns_weights) { glm5_afree(L->ff_gate.w);glm5_afree(L->ff_gate.scale);glm5_afree(L->ff_up.w);glm5_afree(L->ff_up.scale);glm5_afree(L->ff_down.w);glm5_afree(L->ff_down.scale); }
     }
-    glm5_afree(m->layers);glm5_afree(m->embed);glm5_afree(m->head.w);glm5_afree(m->out_norm);glm5_afree(m->rope_cos);glm5_afree(m->rope_sin);
+    glm5_afree(m->layers);
+    if(m->owns_weights){ glm5_afree(m->embed);glm5_afree(m->head.w);glm5_afree(m->out_norm);glm5_afree(m->rope_cos);glm5_afree(m->rope_sin); }
     glm5_afree(m->s_norm);glm5_afree(m->s_q);glm5_afree(m->s_k);glm5_afree(m->s_v);glm5_afree(m->s_kvb);glm5_afree(m->s_attn);glm5_afree(m->s_o);
     glm5_afree(m->s_idx_q);glm5_afree(m->s_idx_k);glm5_afree(m->s_blk_score);glm5_afree(m->s_blk_sel);glm5_afree(m->s_attn_score);
     glm5_afree(m->s_router);glm5_afree(m->s_shg);glm5_afree(m->s_shu);glm5_afree(m->s_sh);glm5_afree(m->s_moe);
@@ -355,10 +361,53 @@ static void glm5_alloc_kv(glm5_model*m,glm5_layer*L,int is_moe,size_t*used){
     }
 }
 
+static void glm5_alloc_scratch(glm5_model*m,int hrows){
+    const glm5_config*cfg=&m->cfg;
+    const int H=cfg->hidden, QD=glm5_q_dim(cfg), AD=glm5_attn_dim(cfg);
+    const int KVC=glm5_kv_cache_dim(cfg), IQD=glm5_idx_q_dim(cfg), ID=cfg->index_dim;
+    int local_heads=cfg->n_heads;
+    if(m->layers && cfg->n_layers>0){
+        local_heads=m->layers[0].qh1-m->layers[0].qh0;
+        if(local_heads<1) local_heads=1;
+    }
+    m->s_norm=glm5_amalloc(H*4); m->s_q=glm5_amalloc(QD*4); m->s_k=glm5_amalloc(KVC*4); m->s_v=glm5_amalloc(AD*4);
+    m->s_kvb=glm5_amalloc((size_t)local_heads*(cfg->qk_nope_dim+cfg->v_head_dim)*4);
+    m->s_attn=glm5_amalloc(AD*4); m->s_o=glm5_amalloc(H*4);
+    m->s_idx_q=glm5_amalloc((size_t)IQD*4); m->s_idx_k=glm5_amalloc((size_t)ID*4);
+    m->s_blk_score=glm5_amalloc((size_t)cfg->max_pos*4); m->s_blk_sel=glm5_amalloc((size_t)cfg->max_pos*sizeof(int));
+    m->s_attn_score=glm5_amalloc((size_t)cfg->max_pos*local_heads*4);
+    m->s_router=glm5_amalloc((size_t)cfg->n_experts*4); m->s_shg=glm5_amalloc(cfg->moe_inter*4); m->s_shu=glm5_amalloc(cfg->moe_inter*4);
+    m->s_sh=glm5_amalloc(H*4); m->s_moe=glm5_amalloc(H*4); m->s_exg=glm5_amalloc(cfg->moe_inter*4); m->s_exu=glm5_amalloc(cfg->moe_inter*4); m->s_route=glm5_amalloc(H*4);
+    m->s_ff_g=glm5_amalloc(cfg->dense_inter*4); m->s_ff_u=glm5_amalloc(cfg->dense_inter*4); m->s_ff=glm5_amalloc(H*4);
+    m->s_logits=glm5_amalloc((size_t)hrows*4);
+}
+
+static glm5_model* glm5_clone_runtime(glm5_model*src){
+    if(!src) return NULL;
+    glm5_model*m=glm5_acalloc(1,sizeof(glm5_model)); if(!m) return NULL;
+    *m=*src;
+    m->owns_weights=0; m->pool=NULL; m->ms=NULL; m->arena=NULL; m->arena_sz=0; m->arena_used=0;
+    m->bytes_read=0; memset(m->prof,0,sizeof(m->prof));
+    m->layers=glm5_acalloc(src->cfg.n_layers,sizeof(glm5_layer));
+    if(!m->layers){ glm5_afree(m); return NULL; }
+    size_t used=0;
+    for(int l=0;l<src->cfg.n_layers;l++){
+        m->layers[l]=src->layers[l];
+        glm5_layer*L=&m->layers[l];
+        L->kv_cache=NULL; L->k_cache=NULL; L->v_cache=NULL; L->idx_k_cache=NULL;
+        L->k_q4=NULL; L->v_q4=NULL; L->k_qs=NULL; L->v_qs=NULL; L->idx_q4=NULL; L->idx_qs=NULL;
+        int has_idx_cache = src->layers[l].idx_k_cache || src->layers[l].idx_q4 || src->layers[l].idx_qs;
+        glm5_alloc_kv(m,L,has_idx_cache,&used);
+    }
+    glm5_alloc_scratch(m,src->head.rows);
+    m->arena_used=used; m->arena_sz=used;
+    return m;
+}
+
 static glm5_model* glm5_alloc_synth(glm5_config cfg,int ep_rank,int ep_size,int n_threads,int n_cmgs){
     glm5_model*m=glm5_acalloc(1,sizeof(glm5_model)); if(!m) return NULL;
     m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs;
-    m->bf16_mv_qt=GLM5_BF16; glm5_kv_init(m);
+    m->bf16_mv_qt=GLM5_BF16; m->owns_weights=1; glm5_kv_init(m);
     const int H=cfg.hidden, QD=glm5_q_dim(&cfg), AD=glm5_attn_dim(&cfg);
     const int KVC=glm5_kv_cache_dim(&cfg), KVD=KVC, VD=cfg.v_head_dim, QHD=cfg.qk_head_dim, HD=QHD;
     const int IQD=glm5_idx_q_dim(&cfg), ID=cfg.index_dim, half=cfg.qk_rope_dim/2;
@@ -424,17 +473,7 @@ static glm5_model* glm5_alloc_synth(glm5_config cfg,int ep_rank,int ep_size,int 
             L->ff_r0=ff_r0; L->ff_rows=ff_rows;
         }
     }
-    int local_heads=qh1-qh0; if(local_heads<1) local_heads=1;
-    m->s_norm=glm5_amalloc(H*4); m->s_q=glm5_amalloc(QD*4); m->s_k=glm5_amalloc(KVC*4); m->s_v=glm5_amalloc(AD*4);
-    m->s_kvb=glm5_amalloc((size_t)local_heads*(cfg.qk_nope_dim+cfg.v_head_dim)*4);
-    m->s_attn=glm5_amalloc(AD*4); m->s_o=glm5_amalloc(H*4);
-    m->s_idx_q=glm5_amalloc((size_t)IQD*4); m->s_idx_k=glm5_amalloc((size_t)ID*4);
-    m->s_blk_score=glm5_amalloc((size_t)cfg.max_pos*4); m->s_blk_sel=glm5_amalloc((size_t)cfg.max_pos*sizeof(int));
-    m->s_attn_score=glm5_amalloc((size_t)cfg.max_pos*local_heads*4);
-    m->s_router=glm5_amalloc((size_t)cfg.n_experts*4); m->s_shg=glm5_amalloc(cfg.moe_inter*4); m->s_shu=glm5_amalloc(cfg.moe_inter*4);
-    m->s_sh=glm5_amalloc(H*4); m->s_moe=glm5_amalloc(H*4); m->s_exg=glm5_amalloc(cfg.moe_inter*4); m->s_exu=glm5_amalloc(cfg.moe_inter*4); m->s_route=glm5_amalloc(H*4);
-    m->s_ff_g=glm5_amalloc(cfg.dense_inter*4); m->s_ff_u=glm5_amalloc(cfg.dense_inter*4); m->s_ff=glm5_amalloc(H*4);
-    m->s_logits=glm5_amalloc((size_t)hrows*4);
+    glm5_alloc_scratch(m,hrows);
     m->arena_used=used; m->arena_sz=used;
     glm5_init_fp8_lut(m->fp8_lut);
     glm5_dummy=glm5_envi("GLM5_DUMMY",0);
@@ -502,7 +541,7 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     const uint8_t*base=mmap(NULL,bsz,PROT_READ,MAP_PRIVATE,bfd,0);
     if(base==MAP_FAILED){ fprintf(stderr,"glm5_load: mmap failed\n"); close(bfd); glm5_afree(es); return NULL; }
 
-    glm5_model*m=glm5_acalloc(1,sizeof(glm5_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=GLM5_BF16; glm5_kv_init(m);
+    glm5_model*m=glm5_acalloc(1,sizeof(glm5_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=GLM5_BF16; m->owns_weights=1; glm5_kv_init(m);
     const int H=cfg.hidden, QD=glm5_q_dim(&cfg), AD=glm5_attn_dim(&cfg);
     const int KVC=glm5_kv_cache_dim(&cfg), VD=cfg.v_head_dim, QHD=cfg.qk_head_dim;
     const int IQD=glm5_idx_q_dim(&cfg), ID=cfg.index_dim, half=cfg.qk_rope_dim/2;
@@ -574,18 +613,7 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     #undef REQ
     munmap((void*)base,bsz); close(bfd); glm5_afree(es);
     if(!ok){ fprintf(stderr,"glm5_load: rank %d incomplete (missing tensors)\n",ep_rank); glm5_free(m); return NULL; }
-    /* scratch (same as synth) */
-    int local_heads=qh1-qh0; if(local_heads<1) local_heads=1;
-    m->s_norm=glm5_amalloc(H*4); m->s_q=glm5_amalloc(QD*4); m->s_k=glm5_amalloc(KVC*4); m->s_v=glm5_amalloc(AD*4);
-    m->s_kvb=glm5_amalloc((size_t)local_heads*(cfg.qk_nope_dim+cfg.v_head_dim)*4);
-    m->s_attn=glm5_amalloc(AD*4); m->s_o=glm5_amalloc(H*4);
-    m->s_idx_q=glm5_amalloc((size_t)IQD*4); m->s_idx_k=glm5_amalloc((size_t)ID*4);
-    m->s_blk_score=glm5_amalloc((size_t)cfg.max_pos*4); m->s_blk_sel=glm5_amalloc((size_t)cfg.max_pos*sizeof(int));
-    m->s_attn_score=glm5_amalloc((size_t)cfg.max_pos*local_heads*4);
-    m->s_router=glm5_amalloc((size_t)cfg.n_experts*4); m->s_shg=glm5_amalloc(cfg.moe_inter*4); m->s_shu=glm5_amalloc(cfg.moe_inter*4);
-    m->s_sh=glm5_amalloc(H*4); m->s_moe=glm5_amalloc(H*4); m->s_exg=glm5_amalloc(cfg.moe_inter*4); m->s_exu=glm5_amalloc(cfg.moe_inter*4); m->s_route=glm5_amalloc(H*4);
-    m->s_ff_g=glm5_amalloc(cfg.dense_inter*4); m->s_ff_u=glm5_amalloc(cfg.dense_inter*4); m->s_ff=glm5_amalloc(H*4);
-    m->s_logits=glm5_amalloc((size_t)hrows*4);
+    glm5_alloc_scratch(m,hrows);
     m->arena_used=used; m->arena_sz=used;
     glm5_init_fp8_lut(m->fp8_lut);
     glm5_dummy=glm5_envi("GLM5_DUMMY",0);
