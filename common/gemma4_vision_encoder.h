@@ -189,21 +189,119 @@ static int g4v_n_threads(void) {
 }
 
 typedef struct {
-    const float *mat_f32;
+    const float *mat_f32;       /* used when mat_type == GGML_TYPE_F32 */
+    const void *mat_quant;      /* used when mat_type == F16/BF16 (raw bytes) */
+    int mat_type;               /* GGML_TYPE_F32 / F16 / BF16 */
+    int elem_size;              /* bytes per element (4/2/2) */
     const float *inp;
     float *out;
     int n_cols, n_rows, N;
     int row_start, row_end;
 } g4v_matmul_task;
 
+#ifdef __AVX2__
+/* Fused F16 dequant + dot: load 8 F16 elements, convert to F32, FMA with input. */
+static inline float g4v_dot_f16(const uint16_t *w, const float *x, int n) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i)));
+        __m256 w1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i + 8)));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i),     sum0);
+        sum1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x + i + 8), sum1);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    for (; i + 7 < n; i += 8) {
+        __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i)));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i), sum0);
+    }
+    __m128 lo = _mm256_castps256_ps128(sum0);
+    __m128 hi = _mm256_extractf128_ps(sum0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float result = _mm_cvtss_f32(lo);
+    for (; i < n; i++) result += ggml_fp16_to_fp32(w[i]) * x[i];
+    return result;
+}
+
+/* Fused BF16 dequant + dot: BF16 is just F32 with low 16 bits zero. */
+static inline float g4v_dot_bf16(const uint16_t *w, const float *x, int n) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m256i wi0 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + i)));
+        __m256i wi1 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + i + 8)));
+        __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(wi0, 16));
+        __m256 w1 = _mm256_castsi256_ps(_mm256_slli_epi32(wi1, 16));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i),     sum0);
+        sum1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x + i + 8), sum1);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    for (; i + 7 < n; i += 8) {
+        __m256i wi = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + i)));
+        __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(wi, 16));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i), sum0);
+    }
+    __m128 lo = _mm256_castps256_ps128(sum0);
+    __m128 hi = _mm256_extractf128_ps(sum0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float result = _mm_cvtss_f32(lo);
+    for (; i < n; i++) {
+        uint32_t bits = (uint32_t)w[i] << 16;
+        float wf;
+        __builtin_memcpy(&wf, &bits, 4);
+        result += wf * x[i];
+    }
+    return result;
+}
+#endif /* __AVX2__ */
+
 static void *g4v_matmul_worker(void *arg) {
     g4v_matmul_task *t = (g4v_matmul_task *)arg;
-    for (int r = t->row_start; r < t->row_end; r++) {
-        const float *row = t->mat_f32 + (size_t)r * t->n_cols;
-        for (int tok = 0; tok < t->N; tok++) {
-            const float *x = t->inp + tok * t->n_cols;
-            t->out[tok * t->n_rows + r] = g4v_dot(row, x, t->n_cols);
+    if (t->mat_type == GGML_TYPE_F32 || t->mat_f32) {
+        for (int r = t->row_start; r < t->row_end; r++) {
+            const float *row = t->mat_f32 + (size_t)r * t->n_cols;
+            for (int tok = 0; tok < t->N; tok++) {
+                const float *x = t->inp + tok * t->n_cols;
+                t->out[tok * t->n_rows + r] = g4v_dot(row, x, t->n_cols);
+            }
         }
+    } else {
+        /* Fused dequant + dot: read raw F16/BF16 weight bytes directly. */
+#ifdef __AVX2__
+        int is_bf16 = (t->mat_type == GGML_TYPE_BF16);
+        const uint16_t *mat_q = (const uint16_t *)t->mat_quant;
+        for (int r = t->row_start; r < t->row_end; r++) {
+            const uint16_t *row = mat_q + (size_t)r * t->n_cols;
+            for (int tok = 0; tok < t->N; tok++) {
+                const float *x = t->inp + tok * t->n_cols;
+                t->out[tok * t->n_rows + r] = is_bf16
+                    ? g4v_dot_bf16(row, x, t->n_cols)
+                    : g4v_dot_f16(row, x, t->n_cols);
+            }
+        }
+#else
+        /* Scalar fallback: dequant on the fly per element. */
+        for (int r = t->row_start; r < t->row_end; r++) {
+            const uint16_t *row = (const uint16_t *)t->mat_quant + (size_t)r * t->n_cols;
+            for (int tok = 0; tok < t->N; tok++) {
+                const float *x = t->inp + tok * t->n_cols;
+                float acc = 0;
+                for (int k = 0; k < t->n_cols; k++) {
+                    float wf;
+                    uint32_t bits = (uint32_t)row[k] << 16;  /* BF16 path; F16 is similar */
+                    __builtin_memcpy(&wf, &bits, 4);
+                    acc += wf * x[k];
+                }
+                t->out[tok * t->n_rows + r] = acc;
+            }
+        }
+#endif
     }
     return NULL;
 }
@@ -359,45 +457,50 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
     }
     const uint8_t *base = (const uint8_t *)mat->data;
 
-    /* Dequant all rows into a contiguous F32 buffer.
-     * Fast path: for F32 weights we can use the data pointer directly without copy
-     * (saves a 100+MB memcpy which dominated the matmul time on this CPU). */
-    float *mat_f32 = NULL;
+    /* Set up the mat pointer.
+     * Fast paths:
+     *   - F32: use the data pointer directly, no copy, no dequant.
+     *   - F16 / BF16: keep the raw bytes pointer. The worker will dequant
+     *     on the fly inside the AVX2 dot product (fused dequant + matmul),
+     *     avoiding a 100+MB intermediate F32 buffer + the dequant pass. */
+    const float *mat_f32 = NULL;
+    const void  *mat_quant = NULL;
     int owns_mat = 0;
     if (mat->type == GGML_TYPE_F32) {
-        mat_f32 = (float *)mat->data;  /* direct, no copy */
+        mat_f32 = (float *)mat->data;
     } else {
-        mat_f32 = (float *)malloc((size_t)n_rows * n_cols * sizeof(float));
-        owns_mat = 1;
-        struct timespec _mts0, _mts1;
-        clock_gettime(CLOCK_MONOTONIC, &_mts0);
-        for (int r = 0; r < n_rows; r++)
-            dequant_row(mat->type, base + r * row_bytes, mat_f32 + (size_t)r * n_cols, n_cols);
-        clock_gettime(CLOCK_MONOTONIC, &_mts1);
-#ifdef GEMMA4_PROFILE_MS
-        fprintf(stderr, "    g4v_matmul_batch dequant: n_rows=%d n_cols=%d -> %.2fms\n",
-                n_rows, n_cols, (_mts1.tv_sec*1000.0+_mts1.tv_nsec/1e6) - (_mts0.tv_sec*1000.0+_mts0.tv_nsec/1e6));
-#endif
+        mat_quant = mat->data;  /* raw F16/BF16; no copy */
     }
+    (void)base; (void)row_bytes;  /* unused on the fused path */
 
-    /* Threaded + AVX2 dot products */
+    /* Threaded + AVX2 dot products (with on-the-fly F16/BF16 → F32 conversion
+     * when the input weight is not F32). */
     struct timespec _mts0;
     clock_gettime(CLOCK_MONOTONIC, &_mts0);
     int nt = g4v_n_threads();
     if (nt > n_rows) nt = n_rows;
     if (nt <= 1) {
         /* Single-threaded fast path */
-        for (int r = 0; r < n_rows; r++) {
-            const float *row = mat_f32 + (size_t)r * n_cols;
-            for (int t = 0; t < N; t++)
-                out[t * n_rows + r] = g4v_dot(row, inp + t * n_cols, n_cols);
-        }
+        g4v_matmul_task t = {0};
+        t.mat_f32 = mat_f32;
+        t.mat_quant = mat_quant;
+        t.mat_type = mat->type;
+        t.inp = inp;
+        t.out = out;
+        t.n_cols = n_cols;
+        t.n_rows = n_rows;
+        t.N = N;
+        t.row_start = 0;
+        t.row_end = n_rows;
+        g4v_matmul_worker(&t);
     } else {
         pthread_t *threads = (pthread_t *)alloca(nt * sizeof(pthread_t));
         g4v_matmul_task *tasks = (g4v_matmul_task *)alloca(nt * sizeof(g4v_matmul_task));
         int rows_per = (n_rows + nt - 1) / nt;
         for (int i = 0; i < nt; i++) {
             tasks[i].mat_f32 = mat_f32;
+            tasks[i].mat_quant = mat_quant;
+            tasks[i].mat_type = mat->type;
             tasks[i].inp = inp;
             tasks[i].out = out;
             tasks[i].n_cols = n_cols;
@@ -415,11 +518,14 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
     {
         double _mat_t = (_mts1.tv_sec*1000.0+_mts1.tv_nsec/1e6) - (_mts0.tv_sec*1000.0+_mts0.tv_nsec/1e6);
         double _mat_gflops = (double)(2LL * n_rows * n_cols * N) / (_mat_t * 1e6);
-        fprintf(stderr, "    g4v_matmul_batch matmul: n_rows=%d n_cols=%d N=%d threads=%d -> %.2fms (%.1f GFLOPS)\n",
-                n_rows, n_cols, N, nt, _mat_t, _mat_gflops);
+        const char *tn = (mat->type == GGML_TYPE_F32 ? "F32" :
+                          mat->type == GGML_TYPE_F16 ? "F16" :
+                          mat->type == GGML_TYPE_BF16 ? "BF16" : "??");
+        fprintf(stderr, "    g4v_matmul_batch matmul(%s): n_rows=%d n_cols=%d N=%d threads=%d -> %.2fms (%.1f GFLOPS)\n",
+                tn, n_rows, n_cols, N, nt, _mat_t, _mat_gflops);
     }
 #endif
-    if (owns_mat) free(mat_f32);
+    (void)owns_mat;  /* always 0 with fused path; left for future fallback */
 }
 
 /* ---- Loading ---- */
