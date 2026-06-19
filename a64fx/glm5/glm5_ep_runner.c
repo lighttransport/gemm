@@ -377,6 +377,9 @@ int main(void){
     int rc;
     int n_threads=envi("LLM_THREADS",12), n_cmgs=envi("GLM5_CMGS",4);
     int prefill=envi("GLM5_PREFILL",8), maxgen=envi("GLM5_DECODE",16), maxpos=envi("GLM5_MAXPOS",2048);
+    int prefill_only=envi("GLM5_PREFILL_ONLY",0), prefill_synth=envi("GLM5_PREFILL_SYNTH",0);
+    if(prefill_synth>0) prefill=prefill_synth;
+    if(prefill_only) maxgen=0;
     int start_pos=envi("GLM5_START_POS",0); if(start_pos<0) start_pos=0;
     int layers=envi("GLM5_LAYERS",0), nexp=envi("GLM5_EXPERTS",0);
     int mstream=envi("GLM5_MSTREAM",1); if(mstream<1)mstream=1; if(mstream>64)mstream=64;
@@ -525,7 +528,6 @@ int main(void){
         g_ar_secs=0; g_ar_calls=0;
         int pchunk=envi("GLM5_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=S) */
         if(pchunk>0){
-            die("GLM5_PCHUNK chunked prefill still uses legacy QKV tensors; disabled until ported to GLM5.2 MLA", -1);
             if(glm5_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
             for(int p0=0;p0<n_prompt;p0+=pchunk){ int S=n_prompt-p0; if(S>pchunk)S=pchunk;
@@ -536,14 +538,25 @@ int main(void){
         } else
         for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=glm5_forward_token(m,x,p); }
         prof_snapshot(m,prof_gen_pf);
+        double tpf=now_sec()-t0;
         double gen_pf_ar=g_ar_secs; long gen_pf_calls=g_ar_calls;
+        if(prefill_only){
+            barrier();
+            if(MyRank==0){
+                logmsg("gen_prefill_only: %d tok %.2f tok/s comm %.1f%% calls=%ld argmax=%d\n",
+                       n_prompt,tpf>0?n_prompt/tpf:0.0,tpf>0?100.0*gen_pf_ar/tpf:0.0,gen_pf_calls,pf_last);
+                prof_log_delta("gen_prefill",prof_gen0,prof_gen_pf,n_prompt,tpf,gen_pf_ar);
+                logmsg("SENTINEL glm5_prefill_%dn=done\n",N);
+            }
+            glm5_afree(prompt); glm5_afree(x); glm5_free(m); return 0;
+        }
         int *gen=glm5_amalloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
         g_ar_secs=0; g_ar_calls=0;
         double td0=now_sec();
         for(int g=0;g<max_new;g++){ gen[ng++]=cur; if(cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) break;
             embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
             for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
-        double td=now_sec()-td0, tpf=td0-t0;
+        double td=now_sec()-td0;
         double gen_d_ar=g_ar_secs; long gen_d_calls=g_ar_calls;
         prof_snapshot(m,prof_gen_dec);
         barrier();
@@ -558,6 +571,48 @@ int main(void){
             logmsg("SENTINEL glm5_gen_%dn=done\n",N);
         }
         glm5_afree(gen); glm5_afree(prompt); glm5_afree(x); glm5_free(m); return 0;
+    }
+
+    /* ---- synthetic-token prefill benchmark: uses embeddings but avoids a huge prompt file. ---- */
+    if(prefill_synth>0){
+        int pchunk=envi("GLM5_PCHUNK",0);
+        double prof0s[GLM5_NPHASE], prof_pfs[GLM5_NPHASE];
+        prof_snapshot(m,prof0s);
+        double t0=now_sec(); g_ar_secs=0; g_ar_calls=0; int pf_last=-1, nan=0;
+        if(pchunk>0){
+            if(glm5_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
+            float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
+            for(int p0=0;p0<prefill;p0+=pchunk){
+                int S=prefill-p0; if(S>pchunk)S=pchunk;
+                for(int t=0;t<S;t++){
+                    int tok=(p0+t)*1315423911u % (unsigned)m->cfg.vocab;
+                    embed_lookup(m,tok,Xc+(size_t)t*C);
+                }
+                pf_last=glm5_forward_prefill_chunk(m,Xc,S,p0);
+                for(size_t i=0;i<(size_t)S*C;i++) if(!(Xc[i]==Xc[i])) nan++;
+                if(MyRank==0 && envi("GLM5_PREFILL_ROLLING",1)){
+                    double dt=now_sec()-t0;
+                    logmsg("prefill_progress: %d/%d tok elapsed=%.3f rate=%.2f tok/s RSS=%.2f GB\n",
+                           p0+S,prefill,dt,dt>0?(p0+S)/dt:0.0,rss_bytes()/1e9);
+                }
+            }
+            glm5_afree(Xc); glm5_free_mstream(m);
+        } else {
+            for(int p=0;p<prefill;p++){
+                int tok=p*1315423911u % (unsigned)m->cfg.vocab;
+                embed_lookup(m,tok,x); pf_last=glm5_forward_token(m,x,p);
+                for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++;
+            }
+        }
+        double tpf=now_sec()-t0, ar=g_ar_secs; long calls=g_ar_calls;
+        prof_snapshot(m,prof_pfs); barrier();
+        if(MyRank==0){
+            logmsg("prefill_synth: %d tok %.2f tok/s comm %.1f%% calls=%ld pchunk=%d argmax=%d NaNs=%d RSS=%.2f GB\n",
+                   prefill,tpf>0?prefill/tpf:0.0,tpf>0?100.0*ar/tpf:0.0,calls,pchunk,pf_last,nan,rss_bytes()/1e9);
+            prof_log_delta("prefill_synth",prof0s,prof_pfs,prefill,tpf,ar);
+            logmsg("SENTINEL glm5_prefill_%dn=%s\n",N,nan==0?"done":"NAN");
+        }
+        glm5_afree(x); glm5_free(m); return nan==0?0:1;
     }
 
     /* ---- prefill (synthetic, identical activations on every rank) ---- */
