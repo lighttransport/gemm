@@ -30,6 +30,9 @@ export GLM5_NSHARDS=141
 export GLM5_EP_SIZE=$NP
 export GLM5_STATUS_DIR="$RUN_DIR"
 export GLM5_TP=${GLM5_TP:-1}
+# 96-way sharding gives 21/22 shared-expert columns per rank; MXFP8 scale blocks
+# are 32 columns, so keep shared experts replicated unless explicitly overridden.
+export GLM5_TP_SHARED=${GLM5_TP_SHARED:-0}
 export GLM5_MSA=${GLM5_MSA:-0}
 export GLM5_MAXPOS=${GLM5_MAXPOS:-512}
 export GLM5_PREFILL=${GLM5_PREFILL:-4}
