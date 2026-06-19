@@ -16,18 +16,19 @@ REPO=/home/u14346/work/gemm/glm5-1
 LLM="$REPO/a64fx/llm"
 UTOFU="$REPO/a64fx/utofu-tests"
 GLM5="$REPO/a64fx/glm5"
-cd "$GLM5" || exit 2
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
 
 NP=${PJM_MPI_PROC:-96}
 STAGE_LAYERS=${GLM5_STAGE_LAYERS:-0}      # 0 = full 78 main layers
 RUN_LAYERS=${GLM5_LAYERS:-0}
+JOB_TAG=${PJM_JOBID:-manual_$$}
+RUN_DIR="$GLM5/output.$JOB_TAG"
 
 export GLM5_MODEL_DIR=${GLM5_MODEL_DIR:-$HOME/models/glm52-fp8}
-export GLM5_STAGE_DIR=/local/glm5
+export GLM5_STAGE_DIR=${GLM5_STAGE_DIR:-/local/glm5_$JOB_TAG}
 export GLM5_NSHARDS=141
 export GLM5_EP_SIZE=$NP
-export GLM5_STATUS_DIR="$GLM5"
+export GLM5_STATUS_DIR="$RUN_DIR"
 export GLM5_TP=${GLM5_TP:-1}
 export GLM5_MSA=${GLM5_MSA:-0}
 export GLM5_MAXPOS=${GLM5_MAXPOS:-512}
@@ -41,6 +42,8 @@ date
 
 "$GLM5/check_glm5_model.sh" "$GLM5_MODEL_DIR" --tokenizer || exit 2
 
+mkdir -p "$RUN_DIR" || exit 2
+cd "$RUN_DIR" || exit 2
 rm -f tofu_topo.txt glm5_stage_rank*.txt glm5_ep_*.txt glm5_ep_rank00.txt
 make -C "$UTOFU" tofu_topo_helper >/dev/null || exit 3
 make -C "$LLM" glm5_stage glm5_ep_runner CC=fcc OPENMP=1 >/dev/null || exit 3
@@ -58,14 +61,14 @@ done
 [ "$topo_ok" = 1 ] || { echo "FATAL: topo helper failed"; exit 3; }
 echo "topo OK ($(wc -l < tofu_topo.txt) rows)"
 
-echo "--- staging FP8 model -> /local/glm5 ($(date)) ---"
+echo "--- staging FP8 model -> $GLM5_STAGE_DIR ($(date)) ---"
 GLM5_STAGE_LAYERS=$STAGE_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_stage" || { echo "FATAL: stage failed"; exit 4; }
 echo "--- stage status ($(date)) ---"
-cat "$GLM5"/glm5_stage_rank*.txt 2>/dev/null | sort | tail -12
-echo "staged ranks: $(ls "$GLM5"/glm5_stage_rank*.txt 2>/dev/null | wc -l)/$NP"
+cat "$RUN_DIR"/glm5_stage_rank*.txt 2>/dev/null | sort | tail -12
+echo "staged ranks: $(ls "$RUN_DIR"/glm5_stage_rank*.txt 2>/dev/null | wc -l)/$NP"
 
 echo "--- run GLM5_REAL=1 FP8 ($(date)) ---"
 GLM5_REAL=1 GLM5_LAYERS=$RUN_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: run failed"; exit 5; }
 echo "--- rank0 log ---"
-cat glm5_ep_rank00.txt 2>/dev/null
+cat "$RUN_DIR"/glm5_ep_rank00.txt 2>/dev/null
 echo "=== fp8 96n done $(date) ==="
