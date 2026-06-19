@@ -488,13 +488,20 @@ static glm5_model* glm5_alloc_synth(glm5_config cfg,int ep_rank,int ep_size,int 
 typedef struct { char name[300]; uint64_t off; size_t nbytes; int f32; int nd; long shape[5]; } glm5_ent;
 static glm5_ent* glm5_find(glm5_ent*es,int n,const char*nm){ for(int i=0;i<n;i++) if(!strcmp(es[i].name,nm)) return &es[i]; return NULL; }
 static glm5_ent* glm5_req(glm5_ent*es,int n,const char*nm){ glm5_ent*e=glm5_find(es,n,nm); if(!e) fprintf(stderr,"glm5_load: MISSING tensor %s\n",nm); return e; }
+static void glm5_blob_dontneed(const uint8_t*base,uint64_t off,size_t len){
+    long ps=sysconf(_SC_PAGESIZE); if(ps<=0) ps=4096;
+    uintptr_t a=(uintptr_t)(base+off), b=a+len, aa=a&~(uintptr_t)(ps-1), bb=(b+(uintptr_t)ps-1)&~(uintptr_t)(ps-1);
+    if(bb>aa) madvise((void*)aa,bb-aa,MADV_DONTNEED);
+}
 /* copy helpers from the blob mmap (base); return malloc'd buffer (caller frees). */
-static void* glm5_cp_full(const uint8_t*base,const glm5_ent*e){ void*d=glm5_amalloc(e->nbytes); memcpy(d,base+e->off,e->nbytes); return d; }
+static void* glm5_cp_full(const uint8_t*base,const glm5_ent*e){ void*d=glm5_amalloc(e->nbytes); memcpy(d,base+e->off,e->nbytes); glm5_blob_dontneed(base,e->off,e->nbytes); return d; }
 static void* glm5_cp_rows(const uint8_t*base,const glm5_ent*e,int r0,int nrows,int cols,int esz){
-    size_t rb=(size_t)cols*esz; void*d=glm5_amalloc((size_t)nrows*rb); memcpy(d,base+e->off+(size_t)r0*rb,(size_t)nrows*rb); return d; }
+    size_t rb=(size_t)cols*esz, off=e->off+(size_t)r0*rb, nb=(size_t)nrows*rb;
+    void*d=glm5_amalloc(nb); memcpy(d,base+off,nb); glm5_blob_dontneed(base,off,nb); return d; }
 static void* glm5_cp_cols(const uint8_t*base,const glm5_ent*e,int Rtot,int c0,int ncols,int Ctot,int esz){
     void*d=glm5_amalloc((size_t)Rtot*ncols*esz); uint8_t*dp=d; const uint8_t*sp=base+e->off;
-    for(int r=0;r<Rtot;r++) memcpy(dp+(size_t)r*ncols*esz, sp+((size_t)r*Ctot+c0)*esz, (size_t)ncols*esz); return d; }
+    for(int r=0;r<Rtot;r++) memcpy(dp+(size_t)r*ncols*esz, sp+((size_t)r*Ctot+c0)*esz, (size_t)ncols*esz);
+    glm5_blob_dontneed(base,e->off,e->nbytes); return d; }
 
 /* Load weight `name` (bf16, or MXFP8 if a `name_scale_inv` companion exists) with TP slicing.
  * mode 0 = full [Rtot,Ctot]; 1 = row-shard rows[r0,r0+nr) of [Rtot,Ctot]; 2 = col-shard
