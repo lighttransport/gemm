@@ -87,6 +87,7 @@ typedef struct {
     int is_ssm;            /* 1 = Delta-Net SSM layer, 0 = full attention */
     int is_swa;            /* 1 = sliding window attention (Gemma4) */
     int shared_kv_source;  /* layer idx to reuse KV from, -1 = own KV (Gemma4) */
+    int has_v_proj;        /* 0 = V uses K (Gemma4 SWA without attn_v tensor) */
 } transformer_layer;
 
 typedef struct {
@@ -1764,13 +1765,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     /* Gemma4 global tensors */
     if (m->is_gemma4) {
-        m->per_layer_token_embd = tf_load_tensor(gguf, "per_layer_token_embd.weight", 1);
-        m->per_layer_model_proj = tf_load_tensor(gguf, "per_layer_model_proj.weight", 1);
-        m->per_layer_proj_norm = tf_load_tensor(gguf, "per_layer_proj_norm.weight", 1);
+        m->per_layer_token_embd = tf_load_tensor(gguf, "per_layer_token_embd.weight", 0);
+        m->per_layer_model_proj = tf_load_tensor(gguf, "per_layer_model_proj.weight", 0);
+        m->per_layer_proj_norm = tf_load_tensor(gguf, "per_layer_proj_norm.weight", 0);
         if (!m->per_layer_token_embd.data || !m->per_layer_model_proj.data) {
-            fprintf(stderr, "transformer: Gemma4 missing per-layer embedding tensors\n");
-            transformer_free(m);
-            return NULL;
+            /* 12B Gemma4 (Q4_K_XL / Q6_K) ships without PLE tensors — proceed without PLE. */
+            fprintf(stderr, "transformer: Gemma4 has no PLE per-layer embeddings (12B-style model)\n");
         }
         /* Load proportional RoPE frequency factors */
         qtensor rope_freqs_qt = tf_load_tensor(gguf, "rope_freqs.weight", 0);
@@ -1832,13 +1832,16 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             /* K/V only for layers with own KV */
             if (m->layers[l].shared_kv_source < 0) {
                 LOAD(attn_k,       "attn_k",      1)
-                LOAD(attn_v,       "attn_v",      1)
+                /* Gemma4 SWA layers may share V with K (no attn_v tensor) */
+                LOAD(attn_v,       "attn_v",      m->is_gemma4 ? 0 : 1)
                 LOAD(attn_k_norm,  "attn_k_norm", 1)
+                m->layers[l].has_v_proj = (m->layers[l].attn_v.data != NULL);
             } else {
                 /* Try loading K/V anyway — some shared layers may still have them */
                 LOAD(attn_k,       "attn_k",      0)
                 LOAD(attn_v,       "attn_v",      0)
                 LOAD(attn_k_norm,  "attn_k_norm", 0)
+                m->layers[l].has_v_proj = (m->layers[l].attn_v.data != NULL);
             }
             /* V normalization (Gemma4 normalizes V too) */
             LOAD(attn_v_norm,  "attn_v_norm", 0)
@@ -1856,10 +1859,10 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             /* Layer output scale (optional) */
             LOAD(layer_output_scale, "layer_output_scale", 0)
 
-            /* Per-layer embedding tensors */
-            LOAD(ple_inp_gate,  "inp_gate",  1)
-            LOAD(ple_proj,      "proj",      1)
-            LOAD(ple_post_norm, "post_norm", 1)
+            /* Per-layer embedding tensors (PLE) — optional when the model has no PLE */
+            LOAD(ple_inp_gate,  "inp_gate",  m->per_layer_token_embd.data ? 1 : 0)
+            LOAD(ple_proj,      "proj",      m->per_layer_model_proj.data ? 1 : 0)
+            LOAD(ple_post_norm, "post_norm", m->per_layer_proj_norm.data ? 1 : 0)
 
             REQUIRE_SUPPORTED(attn_q,      "attn_q");
             REQUIRE_SUPPORTED(attn_output, "attn_output");
@@ -3257,7 +3260,11 @@ static void *tf_persistent_worker(void *arg) {
             } else {
                 tf_thread_matvec(m->q, &layer->attn_q, m->xb, q_dim, tid, nt);
                 tf_thread_matvec(m->k, &layer->attn_k, m->xb, kv_dim, tid, nt);
-                tf_thread_matvec(m->v, &layer->attn_v, m->xb, kv_dim, tid, nt);
+                if (layer->has_v_proj) {
+                    tf_thread_matvec(m->v, &layer->attn_v, m->xb, kv_dim, tid, nt);
+                } else {
+                    /* Gemma4 SWA without attn_v: V is computed later from K */
+                }
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
 
@@ -3574,6 +3581,10 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* K/V norm (only if we projected them) */
             if (layer->shared_kv_source < 0) {
                 tf_qk_norm(m->k, n_kv_heads, hd, &layer->attn_k_norm, eps, m->matvec_tmp);
+                /* Gemma4 SWA without attn_v: V = K (V is shared with K) */
+                if (!layer->has_v_proj) {
+                    memcpy(m->v, m->k, kv_dim * sizeof(float));
+                }
                 /* V norm — Gemma4 normalizes V too (raw RMSNorm, no weight) */
                 if (layer->attn_v_norm.data) {
                     tf_qk_norm(m->v, n_kv_heads, hd, &layer->attn_v_norm, eps, m->matvec_tmp);

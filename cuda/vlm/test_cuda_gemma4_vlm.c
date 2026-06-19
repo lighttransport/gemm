@@ -448,6 +448,13 @@ int main(int argc, char **argv) {
     /* Done with CPU vision model (not needed for GPU path) */
     int n_vision = vision->n_merged;
     (void)vision->proj_dim; /* GPU path computes proj_dim from mmproj GGUF */
+    int is_gemma4uv = vision->is_gemma4uv;
+    /* For Gemma4UV the GPU vision encoder isn't implemented yet — fall back to CPU */
+    float *cpu_vision_embd = NULL;
+    if (is_gemma4uv) {
+        fprintf(stderr, "Gemma4UV detected — using CPU vision encoder (fallback)\n");
+        cpu_vision_embd = g4v_encode(vision, image, img_w, img_h);
+    }
     g4v_free(vision);
 
     /* 3. Load LLM on CUDA first (need CUDA context for GPU vision) */
@@ -474,17 +481,27 @@ int main(int argc, char **argv) {
     fprintf(stderr, "LLM: n_embd=%d n_vocab=%d n_layers=%d\n",
             n_embd, n_vocab, cuda_llm_n_layers(llm));
 
-    /* 4. Encode image on GPU */
-    fprintf(stderr, "\n=== Vision Encoding (GPU) ===\n");
+    /* 4. Encode image on GPU (or CPU fallback for Gemma4UV) */
     int proj_dim = 0;
-    double t0 = get_time_ms();
-    float *vision_embd = cuda_llm_vision_encode(llm, gguf_mm, image, img_w, img_h, &n_vision, &proj_dim);
-    double t1 = get_time_ms();
-    free(image);
-    gguf_close(gguf_mm);
+    float *vision_embd = NULL;
+    if (cpu_vision_embd) {
+        /* Gemma4UV: use the CPU result computed above */
+        fprintf(stderr, "\n=== Vision Encoding (CPU fallback for Gemma4UV) ===\n");
+        vision_embd = cpu_vision_embd;
+        proj_dim = n_embd; /* n_embd for Gemma4UV projector */
+        free(image);
+        gguf_close(gguf_mm);
+    } else {
+        fprintf(stderr, "\n=== Vision Encoding (GPU) ===\n");
+        double t0 = get_time_ms();
+        vision_embd = cuda_llm_vision_encode(llm, gguf_mm, image, img_w, img_h, &n_vision, &proj_dim);
+        double t1 = get_time_ms();
+        free(image);
+        gguf_close(gguf_mm);
 
-    if (!vision_embd) { fprintf(stderr, "GPU vision encoding failed\n"); return 1; }
-    fprintf(stderr, "Vision: %d tokens x %d dim (%.1f ms)\n", n_vision, proj_dim, t1 - t0);
+        if (!vision_embd) { fprintf(stderr, "GPU vision encoding failed\n"); return 1; }
+        fprintf(stderr, "Vision: %d tokens x %d dim (%.1f ms)\n", n_vision, proj_dim, t1 - t0);
+    }
     {
         float vmin = vision_embd[0], vmax = vision_embd[0], sum = 0;
         int total = n_vision * proj_dim;
@@ -530,6 +547,7 @@ int main(int argc, char **argv) {
     /* 6. Batched Prefill */
     fprintf(stderr, "\n=== LLM Prefill (CUDA, batched) ===\n");
     int pos = 0;
+    double t0, t1;
 
     /* BOS token */
     if (bos_id >= 0) {

@@ -50,19 +50,26 @@ typedef struct {
     int spatial_merge; /* 2 */
     int n_merged;     /* 49 */
     float ln_eps;
+    int is_gemma4uv;  /* Gemma4 "unified vision" projector: no transformer blocks, 48x48 patches, custom 3-norm + linear projection */
 
     /* Patch embedding (conv2d) */
-    qtensor patch_embd_w;  /* [16, 16, 3, dim] */
+    qtensor patch_embd_w;  /* ViT: [16, 16, 3, dim]; Gemma4UV: [patch_size*patch_size*3, dim] (matmul) */
+    qtensor patch_embd_b;  /* Gemma4UV: [dim] bias added after patch matmul (optional for ViT) */
+
+    /* Gemma4UV: three LayerNorms + linear projection */
+    qtensor patch_norm_1_w, patch_norm_1_b;  /* LayerNorm over 6912-dim (Gemma4UV) */
+    qtensor patch_norm_2_w, patch_norm_2_b;  /* LayerNorm over dim (after matmul, Gemma4UV) */
+    qtensor patch_norm_3_w, patch_norm_3_b;  /* LayerNorm over dim (after pos_emb, Gemma4UV) */
 
     /* Position embedding: 2D lookup tables */
     qtensor position_embd; /* [dim, n_pos, 2] — two tables for X/Y */
     int n_pos;             /* number of positions per axis */
 
-    /* Transformer blocks */
+    /* Transformer blocks (empty for Gemma4UV) */
     g4v_block *blocks;
 
     /* MM projection */
-    qtensor mm_proj_w;   /* [dim, proj_dim] */
+    qtensor mm_proj_w;   /* ViT: [dim, proj_dim]; Gemma4UV: [proj_dim, dim] */
 } g4v_model;
 
 g4v_model *g4v_load(gguf_context *mmproj_gguf);
@@ -227,6 +234,24 @@ static void g4v_rmsnorm_inplace(float *x, const qtensor *w, int n, float eps, fl
     g4v_rmsnorm(x, x, w, n, eps, tmp);
 }
 
+/* LayerNorm: out = (x - mean) / sqrt(var + eps) * weight + bias
+ * Mean/var computed over the last dim (n). PyTorch LayerNorm. */
+static void g4v_layernorm(float *out, const float *x, const qtensor *w, const qtensor *b,
+                          int n, float eps, float *tmp) {
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= n;
+    float var = 0.0f;
+    for (int i = 0; i < n; i++) { float d = x[i] - mean; var += d * d; }
+    var /= n;
+    float scale = 1.0f / sqrtf(var + eps);
+    float *wf = tmp;
+    float *bf = tmp + n;
+    dequant_row(w->type, w->data, wf, n);
+    dequant_row(b->type, b->data, bf, n);
+    for (int i = 0; i < n; i++) out[i] = (x[i] - mean) * scale * wf[i] + bf[i];
+}
+
 /* Simple matmul: out[n_rows] = mat[n_rows, n_cols] @ vec[n_cols] */
 static void g4v_matvec(float *out, const qtensor *mat, const float *vec, int n_rows, float *tmp) {
     int n_cols = mat->n_cols;
@@ -362,13 +387,28 @@ g4v_model *g4v_load(gguf_context *g) {
         if (idx >= 0) vm->n_blocks = g->kv[idx].value.u32;
         idx = gguf_find_key(g, "clip.vision.attention.layer_norm_epsilon");
         if (idx >= 0) vm->ln_eps = g->kv[idx].value.f32;
+        /* Detect Gemma4 "unified vision" projector */
+        idx = gguf_find_key(g, "clip.vision.projector_type");
+        if (idx >= 0) {
+            const char *pt = g->kv[idx].value.str.str;
+            if (pt && strcmp(pt, "gemma4uv") == 0) {
+                vm->is_gemma4uv = 1;
+                /* llama.cpp: patch_size *= spatial_merge (3), n_merge = 1 */
+                vm->patch_size = vm->patch_size * vm->spatial_merge;
+            }
+        }
     }
 
     vm->head_dim = vm->dim / vm->n_heads;
     vm->n_patches = (vm->image_size / vm->patch_size) * (vm->image_size / vm->patch_size);
     {
-        int ps_grid = vm->image_size / vm->patch_size;  /* 14 */
-        vm->n_merged = (ps_grid / vm->spatial_merge) * (ps_grid / vm->spatial_merge);
+        int ps_grid = vm->image_size / vm->patch_size;  /* 14 for ViT, 4 for Gemma4UV */
+        if (vm->is_gemma4uv) {
+            /* Gemma4UV: patch_size already includes spatial merge, so n_merged = n_patches */
+            vm->n_merged = vm->n_patches;
+        } else {
+            vm->n_merged = (ps_grid / vm->spatial_merge) * (ps_grid / vm->spatial_merge);
+        }
     }
 
     fprintf(stderr, "g4v: dim=%d heads=%d head_dim=%d ffn=%d blocks=%d\n",
@@ -378,6 +418,7 @@ g4v_model *g4v_load(gguf_context *g) {
 
     /* Load global tensors */
     vm->patch_embd_w = g4v_load_tensor(g, "v.patch_embd.weight", 1);
+    vm->patch_embd_b = g4v_load_tensor(g, "v.patch_embd.bias", 0);
     vm->position_embd = g4v_load_tensor(g, "v.position_embd.weight", 1);
     if (vm->position_embd.data) {
         vm->n_pos = (int)vm->position_embd.dims[1];
@@ -387,8 +428,19 @@ g4v_model *g4v_load(gguf_context *g) {
 
     vm->mm_proj_w = g4v_load_tensor(g, "mm.input_projection.weight", 1);
 
-    /* Load blocks */
-    vm->blocks = (g4v_block *)calloc(vm->n_blocks, sizeof(g4v_block));
+    if (vm->is_gemma4uv) {
+        vm->patch_norm_1_w = g4v_load_tensor(g, "v.patch_norm.1.weight", 1);
+        vm->patch_norm_1_b = g4v_load_tensor(g, "v.patch_norm.1.bias",   1);
+        vm->patch_norm_2_w = g4v_load_tensor(g, "v.patch_norm.2.weight", 1);
+        vm->patch_norm_2_b = g4v_load_tensor(g, "v.patch_norm.2.bias",   1);
+        vm->patch_norm_3_w = g4v_load_tensor(g, "v.patch_norm.3.weight", 1);
+        vm->patch_norm_3_b = g4v_load_tensor(g, "v.patch_norm.3.bias",   1);
+        fprintf(stderr, "g4v: gemma4uv projector detected (effective patch_size=%d, n_merged=%d)\n",
+                vm->patch_size, vm->n_merged);
+    }
+
+    /* Load blocks (zero for Gemma4UV) */
+    vm->blocks = (g4v_block *)calloc(vm->n_blocks > 0 ? vm->n_blocks : 1, sizeof(g4v_block));
     for (int b = 0; b < vm->n_blocks; b++) {
         char name[128];
         #define G4V_LOAD(field, suffix) \
@@ -683,6 +735,198 @@ static void g4v_avg_pool(float *out, const float *in, int ph, int pw, int dim, i
     }
 }
 
+/* Gemma4 "unified vision" (Gemma4UV) encode pipeline.
+ * Mirrors llama.cpp tools/mtmd/models/gemma4uv.cpp.
+ *   im2col: [ps*ps*3, n_patches] (ps = patch_size * spatial_merge = 48 for 12B)
+ *   patch_norm_1 (LayerNorm over 6912-dim, per patch)
+ *   matmul: patch_embd_w [dim, 6912] @ [6912, n_patches] -> [dim, n_patches]
+ *   add patch_embd_b [dim]
+ *   patch_norm_2 (LayerNorm over dim)
+ *   add 2D position embedding (X, Y lookups)
+ *   patch_norm_3 (LayerNorm over dim)
+ *   RMSNorm over dim (raw, no weight)
+ *   matmul: mm.input_projection [proj_dim, dim] @ [dim, n_patches] -> [proj_dim, n_patches]
+ * Output: n_merged tokens of proj_dim each.
+ *
+ * Note: GGUF stores weight matrices in a transposed layout (first dim = contraction,
+ * second dim = output). For math: out = mat_math @ inp, where mat_math is [out, in],
+ * the GGUF stores it as [in, out] = mat.n_rows=in, mat.n_cols=out. The matmul we need
+ * is out[t, r] = sum_c mat_gguf[c, r] * inp[t, c] = (inp @ mat_gguf.T)[t, r].
+ */
+static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int width, int height) {
+    int dim = vm->dim;
+    int ps = vm->patch_size;            /* 48 for 12B */
+    int ph = height / ps, pw = width / ps;
+    int N = ph * pw;                    /* 16 for 12B */
+    int proj_dim = vm->proj_dim;
+    float eps = vm->ln_eps;
+    int patch_dim = ps * ps * 3;        /* 6912 for 12B */
+
+    fprintf(stderr, "g4v_encode_gemma4uv: %dx%d ps=%d -> %d patches\n", width, height, ps, N);
+
+    float *patches_im2col = (float *)malloc((size_t)N * patch_dim * sizeof(float));
+    float *patches        = (float *)malloc((size_t)N * dim      * sizeof(float));
+    float *proj_patches   = (float *)malloc((size_t)N * proj_dim * sizeof(float));
+    float *tmp            = (float *)malloc((size_t)patch_dim * 4 * sizeof(float));
+    if (!patches_im2col || !patches || !proj_patches || !tmp) {
+        fprintf(stderr, "g4v_encode_gemma4uv: alloc failed\n");
+        free(patches_im2col); free(patches); free(proj_patches); free(tmp);
+        return NULL;
+    }
+
+    /* 1. im2col: [patch_dim, N] layout — patches_im2col[patch * N + i] = pixel value */
+    for (int py = 0; py < ph; py++) {
+        for (int px = 0; px < pw; px++) {
+            int patch_idx = py * pw + px;
+            for (int c = 0; c < 3; c++) {
+                for (int fy = 0; fy < ps; fy++) {
+                    for (int fx = 0; fx < ps; fx++) {
+                        int iy = py * ps + fy;
+                        int ix = px * ps + fx;
+                        float v = img_norm[(iy * width + ix) * 3 + c];
+                        int off = c * ps * ps + fy * ps + fx;
+                        patches_im2col[patch_idx * patch_dim + off] = v;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 2. patch_norm_1 (LayerNorm over patch_dim = 6912) */
+    {
+        float *w = (float *)malloc(patch_dim * sizeof(float));
+        float *b = (float *)malloc(patch_dim * sizeof(float));
+        dequant_row(vm->patch_norm_1_w.type, vm->patch_norm_1_w.data, w, patch_dim);
+        dequant_row(vm->patch_norm_1_b.type, vm->patch_norm_1_b.data, b, patch_dim);
+        for (int p = 0; p < N; p++) {
+            float *x = patches_im2col + p * patch_dim;
+            float mean = 0.0f;
+            for (int i = 0; i < patch_dim; i++) mean += x[i];
+            mean /= patch_dim;
+            float var = 0.0f;
+            for (int i = 0; i < patch_dim; i++) { float d = x[i] - mean; var += d * d; }
+            var /= patch_dim;
+            float scale = 1.0f / sqrtf(var + eps);
+            for (int i = 0; i < patch_dim; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
+        }
+        free(w); free(b);
+    }
+
+    /* 3. matmul: g4v_matmul_batch computes out = inp @ mat.T.
+     *    qtensor: n_rows=dim, n_cols=patch_dim (loaded reversed from GGUF dims=[patch_dim, dim]).
+     *    patches[N, dim] = im2col[N, patch_dim] @ mat[dim, patch_dim].T = im2col @ mat_view.T
+     *    g4v_matmul_batch handles this directly with n_rows=dim. */
+    {
+        int mat_rows = vm->patch_embd_w.n_rows;     /* dim */
+        int mat_cols = vm->patch_embd_w.n_cols;     /* patch_dim */
+        if (mat_rows != dim || mat_cols != patch_dim) {
+            fprintf(stderr, "g4v_encode_gemma4uv: patch_embd_w shape mismatch (%dx%d vs %dx%d)\n",
+                    mat_rows, mat_cols, dim, patch_dim);
+            free(patches_im2col); free(patches); free(proj_patches); free(tmp);
+            return NULL;
+        }
+        g4v_matmul_batch(patches, &vm->patch_embd_w, patches_im2col, N, dim, tmp);
+    }
+
+    /* 4. add patch_embd_b [dim] */
+    if (vm->patch_embd_b.data) {
+        float *b = (float *)malloc(dim * sizeof(float));
+        dequant_row(vm->patch_embd_b.type, vm->patch_embd_b.data, b, dim);
+        for (int p = 0; p < N; p++)
+            for (int d = 0; d < dim; d++) patches[p * dim + d] += b[d];
+        free(b);
+    }
+
+    /* 5. patch_norm_2 (LayerNorm over dim) */
+    {
+        float *w = (float *)malloc(dim * sizeof(float));
+        float *b = (float *)malloc(dim * sizeof(float));
+        dequant_row(vm->patch_norm_2_w.type, vm->patch_norm_2_w.data, w, dim);
+        dequant_row(vm->patch_norm_2_b.type, vm->patch_norm_2_b.data, b, dim);
+        for (int p = 0; p < N; p++) {
+            float *x = patches + p * dim;
+            float mean = 0.0f;
+            for (int i = 0; i < dim; i++) mean += x[i];
+            mean /= dim;
+            float var = 0.0f;
+            for (int i = 0; i < dim; i++) { float d = x[i] - mean; var += d * d; }
+            var /= dim;
+            float scale = 1.0f / sqrtf(var + eps);
+            for (int i = 0; i < dim; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
+        }
+        free(w); free(b);
+    }
+
+    free(patches_im2col);
+    patches_im2col = NULL;
+
+    /* 6. add 2D position embedding (X, Y lookups from [dim, n_pos, 2]) */
+    {
+        int n_pos = vm->n_pos;
+        float *pos_data = (float *)malloc((size_t)dim * n_pos * 2 * sizeof(float));
+        dequant_row(vm->position_embd.type, vm->position_embd.data, pos_data, dim * n_pos * 2);
+        float *tbl_x = pos_data;
+        float *tbl_y = pos_data + (size_t)dim * n_pos;
+        for (int py = 0; py < ph; py++) {
+            for (int px = 0; px < pw; px++) {
+                int patch_idx = py * pw + px;
+                float *p = patches + patch_idx * dim;
+                const float *src_x = tbl_x + (size_t)px * dim;
+                const float *src_y = tbl_y + (size_t)py * dim;
+                for (int d = 0; d < dim; d++) p[d] += src_x[d] + src_y[d];
+            }
+        }
+        free(pos_data);
+    }
+
+    /* 7. patch_norm_3 (LayerNorm over dim) */
+    {
+        float *w = (float *)malloc(dim * sizeof(float));
+        float *b = (float *)malloc(dim * sizeof(float));
+        dequant_row(vm->patch_norm_3_w.type, vm->patch_norm_3_w.data, w, dim);
+        dequant_row(vm->patch_norm_3_b.type, vm->patch_norm_3_b.data, b, dim);
+        for (int p = 0; p < N; p++) {
+            float *x = patches + p * dim;
+            float mean = 0.0f;
+            for (int i = 0; i < dim; i++) mean += x[i];
+            mean /= dim;
+            float var = 0.0f;
+            for (int i = 0; i < dim; i++) { float d = x[i] - mean; var += d * d; }
+            var /= dim;
+            float scale = 1.0f / sqrtf(var + eps);
+            for (int i = 0; i < dim; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
+        }
+        free(w); free(b);
+    }
+
+    /* 8. RMSNorm over dim (raw, no learned weight) */
+    for (int p = 0; p < N; p++) {
+        float *x = patches + p * dim;
+        float ss = 0.0f;
+        for (int i = 0; i < dim; i++) ss += x[i] * x[i];
+        ss = 1.0f / sqrtf(ss / dim + eps);
+        for (int i = 0; i < dim; i++) x[i] *= ss;
+    }
+
+    /* 9. mm.input_projection: out = patches @ mat_view.T
+     *    qtensor: n_rows=proj_dim, n_cols=dim (GGUF dims=[dim, proj_dim]). */
+    {
+        int mat_rows = vm->mm_proj_w.n_rows;     /* proj_dim */
+        int mat_cols = vm->mm_proj_w.n_cols;     /* dim */
+        if (mat_rows != proj_dim || mat_cols != dim) {
+            fprintf(stderr, "g4v_encode_gemma4uv: mm_proj_w shape mismatch (%dx%d vs %dx%d)\n",
+                    mat_rows, mat_cols, proj_dim, dim);
+            free(patches); free(proj_patches); free(tmp);
+            return NULL;
+        }
+        g4v_matmul_batch(proj_patches, &vm->mm_proj_w, patches, N, proj_dim, tmp);
+    }
+
+    free(patches);
+    free(tmp);
+    return proj_patches;
+}
+
 float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     if (!vm || !rgb) return NULL;
 
@@ -705,7 +949,7 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     fprintf(stderr, "g4v_encode: %dx%d -> %d patches -> %d tokens\n",
             width, height, N, n_merged);
 
-    /* 1. Normalize image: patches * 2 - 1 (Gemma4 specific) */
+    /* 1. Normalize image: pixels * 2 - 1 (Gemma4 specific) */
     img_norm = (float *)malloc(height * width * 3 * sizeof(float));
     if (!img_norm) {
         fprintf(stderr, "g4v_encode: img_norm alloc failed (%d x %d)\n", width, height);
@@ -713,6 +957,13 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     }
     for (int i = 0; i < height * width * 3; i++)
         img_norm[i] = ((float)rgb[i] / 255.0f) * 2.0f - 1.0f;
+
+    /* Gemma4UV (12B) uses a different pipeline: im2col -> 3 LayerNorms -> matmul */
+    if (vm->is_gemma4uv) {
+        projected = g4v_encode_gemma4uv(vm, img_norm, width, height);
+        free(img_norm);
+        return projected;
+    }
 
     /* 2. Patch embedding (conv2d stride=patch_size) */
     patches = (float *)calloc(N * dim, sizeof(float));
