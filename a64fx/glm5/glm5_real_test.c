@@ -47,7 +47,7 @@ int main(void){
         if(glm5_alloc_mstream_ex(m,pchunk,0)){ printf("FAIL: alloc prefill\n"); return 1; }
         float*X=glm5_amalloc((size_t)prefill*c.hidden*4);
         for(int p=0;p<prefill;p++) for(int i=0;i<c.hidden;i++) X[(size_t)p*c.hidden+i]=(float)(glm5_sm_next()*0.2-0.1);
-        for(int p0=0;p0<prefill;p0+=pchunk){ int S=prefill-p0; if(S>pchunk)S=pchunk; argmax=glm5_forward_prefill_chunk(m,X+(size_t)p0*c.hidden,S,p0); }
+        for(int p0=0;p0<prefill;p0+=pchunk){ int S=prefill-p0; if(S>pchunk)S=pchunk; int a=glm5_forward_prefill_chunk(m,X+(size_t)p0*c.hidden,S,p0,p0+S>=prefill); if(a>=0)argmax=a; }
         for(size_t i=0;i<(size_t)prefill*c.hidden;i++){ if(!(X[i]==X[i]))nan++; xn+=(double)X[i]*X[i]; }
         glm5_afree(X); glm5_free_mstream(m);
         printf("prefill(chunked M=%d) argmax=%d  ||x||=%.3e\n", pchunk, argmax, sqrt(xn));

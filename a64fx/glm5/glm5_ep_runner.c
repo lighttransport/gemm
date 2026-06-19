@@ -532,7 +532,8 @@ int main(void){
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
             for(int p0=0;p0<n_prompt;p0+=pchunk){ int S=n_prompt-p0; if(S>pchunk)S=pchunk;
                 for(int t=0;t<S;t++) embed_lookup(m,prompt[p0+t],Xc+(size_t)t*C);
-                pf_last=glm5_forward_prefill_chunk(m,Xc,S,p0); }
+                int a=glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=n_prompt);
+                if(a>=0) pf_last=a; }
             glm5_afree(Xc); glm5_free_mstream(m);
             if(MyRank==0) logmsg("prefill: chunked M=%d\n",pchunk);
         } else
@@ -588,7 +589,8 @@ int main(void){
                     int tok=(p0+t)*1315423911u % (unsigned)m->cfg.vocab;
                     embed_lookup(m,tok,Xc+(size_t)t*C);
                 }
-                pf_last=glm5_forward_prefill_chunk(m,Xc,S,p0);
+                int a=glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=prefill);
+                if(a>=0) pf_last=a;
                 for(size_t i=0;i<(size_t)S*C;i++) if(!(Xc[i]==Xc[i])) nan++;
                 if(MyRank==0 && envi("GLM5_PREFILL_ROLLING",1)){
                     double dt=now_sec()-t0;

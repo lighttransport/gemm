@@ -1224,7 +1224,7 @@ static void glm5_msa_prefill_select(glm5_model*m, glm5_layer*L, int p0, int S, i
  * Returns the LAST token's argmax (next-token prediction); other tokens' logits aren't needed.
  * Prefill is compute-bound -> ideally run WITHOUT CP (replicated/TP KV); CP works but adds a
  * per-token collective in the MSA select. Requires glm5_alloc_mstream_ex(m,S,0). */
-static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0){
+static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int need_head){
     const glm5_config*c=&m->cfg;
     const int H=c->hidden, AD=glm5_attn_dim(c);
     const int KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;
@@ -1331,6 +1331,9 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0){
         pt=glm5_prof_now();
         glm5_gemm(m,ms->o,&L->wo,ms->attn,S,H,arows);
         if(tp_attn && m->ar_cb) m->ar_cb(ms->o,S*H,m->ar_ctx);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if((long)S*H>=GLM5_PAR_MIN)
+#endif
         for(size_t i=0;i<(size_t)S*H;i++) X[i]+=ms->o[i];
         glm5_prof_add(m,GLM5_P_OPROJ,pt);
         /* post-norm + MoE/FFN (M=S; identical to batch_decode) */
@@ -1342,6 +1345,9 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0){
         glm5_prof_add(m,GLM5_P_OTHER,pt);
         if(is_moe){
             const int tp_sh=(L->sh_rows<c->moe_inter);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)S*H>=GLM5_PAR_MIN)
+#endif
             for(size_t i=0;i<(size_t)S*H;i++) ms->route[i]=0;
             int na=c->n_active>8?8:c->n_active; int*sel_all=ms->gsel; float*selw_all=ms->gselw;  /* [S*8] heap (S may exceed 64) */
             pt=glm5_prof_now();
@@ -1363,6 +1369,9 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0){
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
                 glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,c->moe_inter,H);
                 glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H);
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static) if((long)g*c->moe_inter>=GLM5_PAR_MIN)
+#endif
                 for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
                 glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; float w=ms->bw[(size_t)s*S+i]; float*rt=ms->route+(size_t)t*H,*dn=ms->tmp2+(size_t)i*H;
@@ -1373,11 +1382,17 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0){
             if(overlap) m->ar_async_start(ms->route,S*H,m->ar_async_ctx);
             glm5_gemm(m,ms->shg,&L->sh_w1,ms->h2,S,L->sh_rows,H);
             glm5_gemm(m,ms->shu,&L->sh_w3,ms->h2,S,L->sh_rows,H);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)S*L->sh_rows>=GLM5_PAR_MIN)
+#endif
             for(size_t i=0;i<(size_t)S*L->sh_rows;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
             glm5_gemm(m,ms->tmp2,&L->sh_w2,ms->shg,S,H,L->sh_rows);
             if(overlap){ m->ar_wait(m->ar_async_ctx); }
             else { if(tp_sh) for(size_t i=0;i<(size_t)S*H;i++) ms->route[i]+=ms->tmp2[i];
                    if(m->ar_cb) m->ar_cb(ms->route,S*H,m->ar_ctx); }
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)S*H>=GLM5_PAR_MIN)
+#endif
             for(size_t i=0;i<(size_t)S*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
             glm5_prof_add(m,GLM5_P_SHARED,pt);
         } else {
@@ -1385,14 +1400,21 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0){
             pt=glm5_prof_now();
             glm5_gemm(m,ms->ffg,&L->ff_gate,ms->h2,S,L->ff_rows,H);
             glm5_gemm(m,ms->ffu,&L->ff_up,ms->h2,S,L->ff_rows,H);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)S*L->ff_rows>=GLM5_PAR_MIN)
+#endif
             for(size_t i=0;i<(size_t)S*L->ff_rows;i++) ms->ffg[i]=glm5_swiglu_oai(ms->ffg[i],ms->ffu[i],c->swiglu_alpha,c->swiglu_limit);
             glm5_gemm(m,ms->tmp2,&L->ff_down,ms->ffg,S,H,L->ff_rows);
             if(tp_ffn && m->ar_cb) m->ar_cb(ms->tmp2,S*H,m->ar_ctx);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)S*H>=GLM5_PAR_MIN)
+#endif
             for(size_t i=0;i<(size_t)S*H;i++) X[i]+=ms->tmp2[i];
             glm5_prof_add(m,GLM5_P_DENSE_FFN,pt);
         }
     }
     /* head: LAST token only (next-token prediction) */
+    if(!need_head) return -1;
     double pt=glm5_prof_now();
     int hrows=m->head.rows; glm5_rmsnorm_gemma(ms->h2, X+(size_t)(S-1)*H, m->out_norm, H, c->norm_eps);
     glm5_gemm(m,ms->logits,&m->head,ms->h2,1,hrows,H);
