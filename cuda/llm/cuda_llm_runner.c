@@ -11783,8 +11783,13 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
     switch (weight_type) {
         case GGML_TYPE_Q8_0:
             if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
-                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
-                launch_matvec_q8(r, dst, mat, r->d_xb_q81, r->d_xb_scale, n_rows, n_cols);
+                /* matvec_q8_0_dp4a reads activation scales from a separate buffer,
+                 * so quantize with launch_quantize (int8 -> d_xb_q + scales -> d_xb_scale)
+                 * to match the decode path. Using launch_quantize_q8_1 here packs scales
+                 * inline and leaves d_xb_scale stale -> zeroed output (e.g. the gemma4-12B
+                 * Q8_0 weight-tied LM head). */
+                launch_quantize(r, r->d_xb_q, r->d_xb_scale, x, n_cols);
+                launch_matvec_q8(r, dst, mat, r->d_xb_q, r->d_xb_scale, n_rows, n_cols);
             } else {
                 launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols);
             }
