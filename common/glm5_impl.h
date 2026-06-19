@@ -483,10 +483,6 @@ static glm5_tensor glm5_load_w(glm5_ent*es,int n,const uint8_t*base,const char*n
  * Dense tensors are TP-sliced into the arena per the same ranges as glm5_alloc_synth; routed
  * experts are the owned ones in the blob. Returns NULL on any missing/short tensor. */
 static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const char*blob_dir,int n_threads,int n_cmgs){
-    if(glm5_envi("GLM5_MSA",0)){
-        fprintf(stderr,"glm5_load: GLM5_MSA=1 is not supported for GLM-5.2 yet (shared-indexer top-k reuse is not implemented); use GLM5_MSA=0\n");
-        return NULL;
-    }
     char bdir[1024]; if(blob_dir&&*blob_dir) snprintf(bdir,sizeof bdir,"%s",blob_dir);
     else { const char*e=getenv("GLM5_STAGE_DIR"); snprintf(bdir,sizeof bdir,"%s",(e&&*e)?e:"/local/glm5"); }
     char bp[1100],mp[1100]; snprintf(bp,sizeof bp,"%s/rank%02d.blob",bdir,ep_rank); snprintf(mp,sizeof mp,"%s/rank%02d.manifest",bdir,ep_rank);
@@ -635,7 +631,7 @@ static inline float glm5_idxdot(glm5_model*m,glm5_layer*L,int t,const float*qh,i
  * returns the full causal range (owned subset under CP). Under CP each rank scores only its
  * owned blocks, then blk_reduce_cb (all-reduce MAX) gives every rank the same global selection;
  * the cross-rank attention partials are merged later by kv_combine_cb. */
-static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,int pos,int msa_on,int*sel){
+static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*q_lat,int pos,int msa_on,int*sel){
     const glm5_config*c=&m->cfg;
     const int ID=c->msa_index_dim, IH=c->msa_n_index_heads, B=c->msa_block_size, half=c->rotary_dim/2;
     if(!msa_on){
@@ -644,11 +640,14 @@ static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,int pos,int 
         return nsel;
     }
     const float*cosp=&m->rope_cos[(size_t)pos*half], *sinp=&m->rope_sin[(size_t)pos*half];
-    /* index projections (replicated): idx_q [IH*ID], idx_k [ID] (MQA, 1 head) */
+    /* index projections (replicated): idx_q [IH*ID], idx_k [ID] (MQA, 1 head).
+     * Real GLM-5.2 stores indexer.wq_b as [IH*ID, q_lora], fed by q_a latent.
+     * Synthetic tests keep the older idx_wq [IH*ID, hidden] direct path. */
     float*iq=m->s_idx_q, *ik=m->s_idx_k;
-    glm5_mv(m,iq,&L->idx_wq,xn,IH*ID,c->hidden);
+    if(L->idx_wq_b.w) glm5_mv(m,iq,&L->idx_wq_b,q_lat,IH*ID,c->q_lora);
+    else              glm5_mv(m,iq,&L->idx_wq,xn,IH*ID,c->hidden);
     glm5_mv(m,ik,&L->idx_wk,xn,ID,c->hidden);
-    for(int h=0;h<IH;h++){ float*qh=iq+h*ID; glm5_rmsnorm_head(qh,L->idx_q_norm,ID,c->norm_eps); glm5_rope_head(qh,cosp,sinp,c->rotary_dim); }
+    for(int h=0;h<IH;h++){ float*qh=iq+h*ID; if(L->idx_q_norm) glm5_rmsnorm_head(qh,L->idx_q_norm,ID,c->norm_eps); glm5_rope_head(qh,cosp,sinp,c->rotary_dim); }
     glm5_rmsnorm_head(ik,L->idx_k_norm,ID,c->norm_eps); glm5_rope_head(ik,cosp,sinp,c->rotary_dim);
     if(glm5_cp_mine(m,pos)){ long sl=glm5_cp_slot(m,pos);            /* store this pos's index key (owner only) */
         if(m->int4_kv) L->idx_qs[sl]=glm5_q4_pack(L->idx_q4+sl*(size_t)(ID/2), ik, ID);
@@ -716,6 +715,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
     const int dense_window=glm5_envi("GLM5_DENSE_ATTN_WINDOW",attn_window);
     const int sparse_window=glm5_envi("GLM5_SPARSE_ATTN_WINDOW",attn_window);
     m->bytes_read=0;
+    int last_msa_nsel=0;
     for(int l=0;l<c->n_layers;l++){
         glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(c,l);
         const int qh0=L->qh0, qh1=L->qh1, nown=qh1-qh0, qrows=nown*c->qk_head_dim, arows=nown*c->v_head_dim;
@@ -736,8 +736,15 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
 
         pt=glm5_prof_now();
         int*selp=m->s_blk_sel, nsel=0;
-        if(is_moe && msa_on){
-            nsel=glm5_msa_select(m,L,xn,pos,msa_on,selp);
+        int full_idx = is_moe && glm5_has_full_indexer(c,l);
+        if(is_moe && msa_on && full_idx){
+            nsel=glm5_msa_select(m,L,xn,qlat,pos,msa_on,selp);
+            last_msa_nsel=nsel;
+        } else if(is_moe && msa_on && last_msa_nsel>0){
+            /* GLM-5.2 sparse layers between full-indexer layers reuse the most
+             * recent selected block set. Before the first sparse full-indexer,
+             * fall through to dense/full attention below. */
+            nsel=last_msa_nsel;
         } else {
             int win=is_moe ? sparse_window : dense_window;
             int t0=(win>0 && pos+1>win) ? pos+1-win : 0;
@@ -1172,7 +1179,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0){
          * an omp-parallel-per-token region). */
         if(sparse){
             if(m->cp_on) for(int t=0;t<S;t++){ int*sel=ms->psel+(size_t)t*ms->maxsel;
-                ms->pnsel[t]=glm5_msa_select(m,L,ms->xn+(size_t)t*H,p0+t,msa_on,sel); }
+                ms->pnsel[t]=glm5_msa_select(m,L,ms->xn+(size_t)t*H,ms->xn+(size_t)t*H,p0+t,msa_on,sel); }
             else glm5_msa_prefill_select(m,L,p0,S,msa_on);
         }
         /* causal attention per token (flash form); sparse -> sel list, dense -> contiguous [0,p] */
