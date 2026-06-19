@@ -217,3 +217,36 @@ The current local result is materially better than the earlier harness behavior:
 - CUDA VLM now produces a meaningful Mount Fuji description on the local smoke test
 
 The main remaining work is regression coverage and parameterization, not basic Gemma4 VLM viability.
+
+## Notes on the 12B model (`gemma4uv` projector)
+
+The 12B model uses a fundamentally different vision encoder than the 2B one
+it shares the `gemma4_vision_encoder.h` interface with. Differences:
+
+| | 2B (works since 2026-04-09) | 12B (added 2026-06-19) |
+|---|---|---|
+| `clip.vision.projector_type` | unset | `gemma4uv` |
+| Patch conv kernel | `16*16*3*dim` with 16x16 stride | `48*48*3*dim` (3x3 merged conv) |
+| Effective patch grid | `14*14 = 196` | `4*4 = 16` |
+| Transformer blocks | 16 ViT blocks | **none** (block_count=0) |
+| Normalizations | RMSNorm | three PyTorch LayerNorms (`patch_norm.{1,2,3}.{weight,bias}`) |
+| Position embedding | before transformer | after first matmul + bias |
+| MM projection | after average pool | after RMSNorm (no pooling) |
+
+The 12B pipeline mirrors `llama.cpp/tools/mtmd/models/gemma4uv.cpp`:
+
+  im2col -> patch_norm_1 -> patch_embd_w @ im2col + patch_embd_b
+  -> patch_norm_2 -> add 2D pos_emb -> patch_norm_3 -> RMSNorm
+  -> mm.input_projection -> 16 x 3840 output
+
+CPU and GPU paths share the same `g4v_encode_gemma4uv` implementation
+(only 16 patches x 3840-dim, so a CPU fallback during the GPU test
+is cheap). The 12B Q4_K_XL model now produces a coherent Mount Fuji
+description instead of the previous hallucinated abstract illustration.
+
+The CPU transformer loader was also made tolerant of 12B-style
+Gemma4 GGUF files: PLE tensors (`per_layer_*`) and SWA `attn_v`
+tensors are now optional, since the 12B model has neither. The
+CPU VLM harness still does not work end-to-end on the 12B model
+because the LLM weights use Q4_0 (CPU loader only handles K-quants),
+but the vision encoder is fully shared.
