@@ -62,6 +62,7 @@ typedef struct {
     int32_t channel_start_id;
     int32_t channel_end_id;
     int in_thought;
+    int thought_count;
 } gemma4_decode_state;
 
 typedef struct {
@@ -95,57 +96,31 @@ typedef struct {
     rb_state state;
     int      budget;
     int      count;
-    int32_t  start_tokens[8];
-    int      n_start;
-    int      start_matched;
-    int32_t  end_tokens[8];
-    int      n_end;
-    int      end_matched;
     int      force_idx;
 } reasoning_budget;
 
-static reasoning_budget rb_init(const bpe_vocab *vocab, int budget) {
+static reasoning_budget rb_init(int budget) {
     reasoning_budget rb;
     memset(&rb, 0, sizeof(rb));
     rb.budget = budget;
     rb.state = RB_IDLE;
-    rb.n_start = bpe_tokenize(vocab, "<|channel>thought\n", -1, rb.start_tokens, 8);
-    if (rb.n_start < 0) rb.n_start = 0;
-    rb.n_end = bpe_tokenize(vocab, "<channel|>", -1, rb.end_tokens, 8);
-    if (rb.n_end < 0) rb.n_end = 0;
     return rb;
 }
 
-static void rb_observe(reasoning_budget *rb, int32_t token) {
+static void rb_observe(reasoning_budget *rb, int32_t token,
+                        int32_t channel_start_id, int32_t channel_end_id) {
     switch (rb->state) {
     case RB_IDLE:
-        if (rb->n_start > 0 && token == rb->start_tokens[rb->start_matched]) {
-            rb->start_matched++;
-            if (rb->start_matched >= rb->n_start) {
-                rb->state = RB_COUNTING;
-                rb->count = 0;
-                rb->start_matched = 0;
-            }
-        } else {
-            rb->start_matched = 0;
-            if (rb->n_start > 0 && token == rb->start_tokens[0])
-                rb->start_matched = 1;
+        if (token == channel_start_id) {
+            rb->state = RB_COUNTING;
+            rb->count = 0;
         }
         break;
     case RB_COUNTING:
         rb->count++;
-        if (rb->n_end > 0 && token == rb->end_tokens[rb->end_matched]) {
-            rb->end_matched++;
-            if (rb->end_matched >= rb->n_end) {
-                rb->state = RB_DONE;
-                rb->end_matched = 0;
-            }
-        } else {
-            rb->end_matched = 0;
-            if (rb->n_end > 0 && token == rb->end_tokens[0])
-                rb->end_matched = 1;
-        }
-        if (rb->state == RB_COUNTING && rb->count >= rb->budget) {
+        if (token == channel_end_id) {
+            rb->state = RB_DONE;
+        } else if (rb->count >= rb->budget) {
             rb->state = RB_FORCING;
             rb->force_idx = 0;
         }
@@ -160,12 +135,10 @@ static int rb_needs_forcing(const reasoning_budget *rb) {
     return rb->state == RB_FORCING;
 }
 
-static int32_t rb_force_next(reasoning_budget *rb) {
+static int32_t rb_force_next(reasoning_budget *rb, int32_t channel_end_id) {
     if (rb->state != RB_FORCING) return -1;
-    if (rb->force_idx >= rb->n_end) { rb->state = RB_DONE; return -1; }
-    int32_t tok = rb->end_tokens[rb->force_idx++];
-    if (rb->force_idx >= rb->n_end) rb->state = RB_DONE;
-    return tok;
+    rb->state = RB_DONE;
+    return channel_end_id;
 }
 
 /* ---- Prompt / decode helpers ---- */
@@ -354,6 +327,7 @@ static gemma4_decode_state init_decode_state(const bpe_vocab *vocab) {
     st.channel_start_id = find_exact_token_id(vocab, "<|channel>");
     st.channel_end_id = find_exact_token_id(vocab, "<channel|>");
     st.in_thought = 0;
+    st.thought_count = 0;
     return st;
 }
 
@@ -362,13 +336,29 @@ static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st,
     if (token == st->eos_id || token == st->eot_id || token == st->turn_end_id) return;
     if (token == st->channel_start_id) {
         st->in_thought = 1;
+        fprintf(stderr, "[thought begin]\n");
         return;
     }
     if (token == st->channel_end_id) {
         st->in_thought = 0;
+        fprintf(stderr, "[thought end, %d tokens]\n", st->thought_count);
+        st->thought_count = 0;
         return;
     }
-    if (st->in_thought) return;
+    if (st->in_thought) {
+        if (st->thought_count < 50) {
+            const char *ts = bpe_token_to_str(vocab, token);
+            if (ts) {
+                int dlen = 0;
+                char *d = bpe_byte_decode(ts, (int)strlen(ts), &dlen);
+                if (d) { fprintf(stderr, "[thought] %s\n", d); free(d); }
+            } else {
+                fprintf(stderr, "[thought token %d]\n", token);
+            }
+        }
+        st->thought_count++;
+        return;
+    }
 
     const char *tok_str = bpe_token_to_str(vocab, token);
     if (!tok_str) return;
@@ -585,7 +575,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n=== Generation (budget=%d) ===\n", reasoning_budget_tokens);
     int32_t next_token = argmax;
     gemma4_decode_state ds = init_decode_state(vocab);
-    reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
+    reasoning_budget rb = rb_init(reasoning_budget_tokens);
     visible_text out = {0};
     gemma4_sampling_params sampling = {
         .temperature = 0.8f,
@@ -600,7 +590,7 @@ int main(int argc, char **argv) {
 
     for (int g = 0; g < max_gen; g++) {
         emit_visible_token(vocab, &ds, next_token, &out);
-        rb_observe(&rb, next_token);
+        rb_observe(&rb, next_token, ds.channel_start_id, ds.channel_end_id);
 
         if (next_token == ds.eos_id || next_token == ds.eot_id ||
             next_token == ds.turn_end_id) break;
@@ -610,7 +600,7 @@ int main(int argc, char **argv) {
         gen_count++;
 
         if (rb_needs_forcing(&rb)) {
-            int32_t forced = rb_force_next(&rb);
+            int32_t forced = rb_force_next(&rb, ds.channel_end_id);
             if (forced >= 0) { next_token = forced; continue; }
         }
 

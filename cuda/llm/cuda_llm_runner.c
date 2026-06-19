@@ -4047,6 +4047,104 @@ static const char *cuda_kernel_source =
 "    v[j + n_pairs] = r0 * sin_v + r1 * cos_v;\n"
 "}\n"
 "\n"
+"/* Device-pointer variant of rope_with_factors_f32 for graph capture */\n"
+"__global__ void rope_with_factors_f32_ptr(\n"
+"    float *vec, int n_heads, int head_dim,\n"
+"    const int *pos_ptr,\n"
+"    const float *inv_freq, int n_pairs) {\n"
+"    int position = *pos_ptr;\n"
+"    int h = blockIdx.x;\n"
+"    int j = threadIdx.x;\n"
+"    if (j >= n_pairs) return;\n"
+"    float freq = (float)position * inv_freq[j];\n"
+"    float cos_v = cosf(freq), sin_v = sinf(freq);\n"
+"    float *v = vec + h * head_dim;\n"
+"    float r0 = v[j], r1 = v[j + n_pairs];\n"
+"    v[j]           = r0 * cos_v - r1 * sin_v;\n"
+"    v[j + n_pairs] = r0 * sin_v + r1 * cos_v;\n"
+"}\n"
+"\n"
+"/* Device-pointer variant of attn_decode_swa_f32 for graph capture */\n"
+"__global__ void attn_decode_swa_f32_ptr(\n"
+"    float *out, const float *Q,\n"
+"    const half_raw *K_cache, const half_raw *V_cache,\n"
+"    int n_heads, int n_kv_heads, int head_dim, int kv_dim,\n"
+"    const int *pos_ptr, int window_size, float scale) {\n"
+"    int position = *pos_ptr;\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int gqa_ratio = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa_ratio;\n"
+"    int start = (position >= window_size) ? (position - window_size + 1) : 0;\n"
+"    int seq_len = position - start + 1;\n"
+"    float *scores = smem;\n"
+"    const float *q_h = Q + h * head_dim;\n"
+"    int warp_id = tid / 32;\n"
+"    int lane = tid % 32;\n"
+"\n"
+"    for (int p = tid; p < seq_len; p += nthreads) {\n"
+"        int slot = (start + p) % window_size;\n"
+"        const half_raw *k_p = K_cache + slot * kv_dim + kv_h * head_dim;\n"
+"        float dot = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) dot += q_h[d] * half_to_float(k_p[d]);\n"
+"        scores[p] = dot * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"\n"
+"    float local_max = -1e30f;\n"
+"    for (int p = tid; p < seq_len; p += nthreads)\n"
+"        if (scores[p] > local_max) local_max = scores[p];\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));\n"
+"    __shared__ float warp_max[8];\n"
+"    if (lane == 0) warp_max[warp_id] = local_max;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float m = warp_max[0];\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 1; w < n_warps; w++)\n"
+"            if (warp_max[w] > m) m = warp_max[w];\n"
+"        warp_max[0] = m;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float max_val = warp_max[0];\n"
+"\n"
+"    float local_sum = 0.0f;\n"
+"    for (int p = tid; p < seq_len; p += nthreads) {\n"
+"        float e = expf(scores[p] - max_val);\n"
+"        scores[p] = e;\n"
+"        local_sum += e;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);\n"
+"    __shared__ float warp_sum[8];\n"
+"    if (lane == 0) warp_sum[warp_id] = local_sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float s = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) s += warp_sum[w];\n"
+"        warp_sum[0] = s;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float inv_sum = 1.0f / warp_sum[0];\n"
+"    for (int p = tid; p < seq_len; p += nthreads)\n"
+"        scores[p] *= inv_sum;\n"
+"    __syncthreads();\n"
+"\n"
+"    float *out_h = out + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += nthreads) {\n"
+"        float acc = 0.0f;\n"
+"        for (int p = 0; p < seq_len; p++) {\n"
+"            int slot = (start + p) % window_size;\n"
+"            acc += scores[p] * half_to_float(V_cache[slot * kv_dim + kv_h * head_dim + d]);\n"
+"        }\n"
+"        out_h[d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ==== Batched Prefill Kernels ==== */\n"
 "\n"
 "/* Convert F32 array to F16 in-place (output to separate buffer) */\n"
@@ -8405,6 +8503,8 @@ struct cuda_llm_runner {
     CUfunction fn_attn_decode_swa_f32;
     CUfunction fn_matvec_bf16_f32;
     CUfunction fn_rope_with_factors_f32;
+    CUfunction fn_rope_with_factors_f32_ptr;
+    CUfunction fn_attn_decode_swa_f32_ptr;
     CUfunction fn_batch_rope_with_factors_f32;
 
     /* MoE scratch buffers */
@@ -8768,6 +8868,8 @@ lookup_funcs:
     GET_FUNC(attn_decode_swa_f32);
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(rope_with_factors_f32);
+    GET_FUNC(rope_with_factors_f32_ptr);
+    GET_FUNC(attn_decode_swa_f32_ptr);
     GET_FUNC(batch_rope_with_factors_f32);
     /* Batched prefill kernels */
     GET_FUNC(convert_f32_to_f16);
@@ -11476,20 +11578,26 @@ static inline void launch_attention_swa(cuda_llm_runner *r, CUdeviceptr out, CUd
                                          int kv_dim, int position, int window_size, float scale) {
     int start = (position >= window_size) ? (position - window_size + 1) : 0;
     int seq_len = position - start + 1;
-    size_t smem = seq_len * sizeof(float);
+    int use_ptr = !r->disable_graph && r->d_pos_seq;
+    CUfunction fn = use_ptr ? r->fn_attn_decode_swa_f32_ptr : r->fn_attn_decode_swa_f32;
+    /* For ptr variant (graph capture), allocate max possible shared memory so that
+       the captured smem is large enough for any replay position within the window. */
+    size_t smem = use_ptr ? ((size_t)window_size * sizeof(float)) : ((size_t)seq_len * sizeof(float));
+    void *pos_arg = use_ptr ? (void*)&r->d_pos_seq : (void*)&position;
     void *args[] = { &out, &q, &key_cache, &value_cache,
                      &n_heads, &n_kv_heads, &head_dim, &kv_dim,
-                     &position, &window_size, &scale };
-    cuLaunchKernel(r->fn_attn_decode_swa_f32,
-                   n_heads, 1, 1, 256, 1, 1, smem, r->stream, args, NULL);
+                     pos_arg, &window_size, &scale };
+    cuLaunchKernel(fn, n_heads, 1, 1, 256, 1, 1, smem, r->stream, args, NULL);
 }
 
 static inline void launch_rope_with_factors(cuda_llm_runner *r, CUdeviceptr vec, int n_heads,
                                              int head_dim, int pos, CUdeviceptr inv_freq) {
     int n_pairs = head_dim / 2;
-    void *args[] = { &vec, &n_heads, &head_dim, &pos, &inv_freq, &n_pairs };
-    cuLaunchKernel(r->fn_rope_with_factors_f32,
-                   n_heads, 1, 1, n_pairs, 1, 1, 0, r->stream, args, NULL);
+    int use_ptr = !r->disable_graph && r->d_pos_seq;
+    CUfunction fn = use_ptr ? r->fn_rope_with_factors_f32_ptr : r->fn_rope_with_factors_f32;
+    void *pos_arg = use_ptr ? (void*)&r->d_pos_seq : (void*)&pos;
+    void *args[] = { &vec, &n_heads, &head_dim, pos_arg, &inv_freq, &n_pairs };
+    cuLaunchKernel(fn, n_heads, 1, 1, n_pairs, 1, 1, 0, r->stream, args, NULL);
 }
 
 /* Batched version: processes n_tokens * n_heads heads with position p0 for all */
@@ -12463,11 +12571,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 /* SWA: standard RoPE with freq_base_swa and ALL dims rotated (n_rope_pairs=0) */
                 int half_swa = hd / 2;
                 int zero_pairs = 0; /* 0 = rotate all, rope_dim = head_dim */
-                void *qargs[] = { &r->d_q, &n_heads, &hd, &position, &r->rope_freq_base_swa, &zero_pairs };
-                cuLaunchKernel(r->fn_rope_neox_f32, n_heads, 1, 1, half_swa, 1, 1, 0, r->stream, qargs, NULL);
+                int use_ptr = !r->disable_graph && r->d_pos_seq;
+                CUfunction fn_rope = use_ptr ? r->fn_rope_neox_f32_ptr : r->fn_rope_neox_f32;
+                void *pos_arg = use_ptr ? (void*)&r->d_pos_seq : (void*)&position;
+                void *qargs[] = { &r->d_q, &n_heads, &hd, pos_arg, &r->rope_freq_base_swa, &zero_pairs };
+                cuLaunchKernel(fn_rope, n_heads, 1, 1, half_swa, 1, 1, 0, r->stream, qargs, NULL);
                 if (cl->shared_kv_source < 0) {
-                    void *kargs[] = { &r->d_k, &layer_kv_heads, &hd, &position, &r->rope_freq_base_swa, &zero_pairs };
-                    cuLaunchKernel(r->fn_rope_neox_f32, layer_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, kargs, NULL);
+                    void *kargs[] = { &r->d_k, &layer_kv_heads, &hd, pos_arg, &r->rope_freq_base_swa, &zero_pairs };
+                    cuLaunchKernel(fn_rope, layer_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, kargs, NULL);
                 }
             } else {
                 /* Full-attention: proportional RoPE with precomputed freq factors */
