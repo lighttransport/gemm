@@ -902,16 +902,15 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
                     for(int i=0;i<c->kv_lora;i++) d+=(double)qa[i]*kv[i];
                     for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
                     float s=(float)d*ascale;
-                    score[(size_t)hh*c->max_pos+j]=s;
-                    if(s>hmx[hh]) hmx[hh]=s;
-                }
-            }
-            for(int j=0;j<nsel;j++){
-                glm5_load_latent_kv(m,L,selp[j],kv,KVC);
-                for(int hh=0;hh<nown;hh++){
-                    float e=expf(score[(size_t)hh*c->max_pos+j]-hmx[hh]);
-                    hse[hh]+=e;
                     float*ctx=m->s_ctx+(size_t)hh*c->kv_lora;
+                    if(s>hmx[hh]){
+                        float r=(hmx[hh]>-1e20f)?expf(hmx[hh]-s):0.0f;
+                        hse[hh]*=r;
+                        for(int i=0;i<c->kv_lora;i++) ctx[i]*=r;
+                        hmx[hh]=s;
+                    }
+                    float e=expf(s-hmx[hh]);
+                    hse[hh]+=e;
                     for(int i=0;i<c->kv_lora;i++) ctx[i]+=e*kv[i];
                 }
             }
@@ -1119,10 +1118,25 @@ static void glm5_tensor_tmul_rows(const glm5_model*m,float*y,const glm5_tensor*t
             float xi=x[i]; if(xi==0.0f) continue;
             const uint8_t*row=w+(size_t)i*cols;
             const float*srow=sc+(size_t)i*sb;
+#if defined(__ARM_FEATURE_SVE)
+            int vl=(int)svcntw();
+            for(int b=0;b<sb;b++){
+                float scale=srow[b]*xi; int k0=b*128, k1=k0+128<cols?k0+128:cols;
+                for(int u=k0;u<k1;u+=vl){
+                    svbool_t pg=svwhilelt_b32(u,k1);
+                    svfloat32_t yv=svld1(pg,y+u);
+                    svuint32_t idx=svld1ub_u32(pg,row+u);
+                    svfloat32_t wv=svreinterpret_f32_u32(svld1_gather_u32index_u32(pg,m->fp8_lut,idx));
+                    yv=svmla_n_f32_x(pg,yv,wv,scale);
+                    svst1(pg,y+u,yv);
+                }
+            }
+#else
             for(int b=0;b<sb;b++){
                 float scale=srow[b]; int k0=b*128, k1=k0+128<cols?k0+128:cols;
                 for(int u=k0;u<k1;u++){ float wf; uint32_t bits=m->fp8_lut[row[u]]; memcpy(&wf,&bits,4); y[u]+=xi*wf*scale; }
             }
+#endif
         }
     } else {
         const uint16_t*w=(const uint16_t*)t->w+(size_t)r0*cols;
