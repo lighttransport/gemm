@@ -1,5 +1,5 @@
-MPICC ?= mpiclang
-CFLAGS ?= -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall -Wextra -std=c11
+MPICC ?= mpifccpx
+CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall -Wextra -std=c11
 LDFLAGS ?=
 
 all: mpi_noncontig_probe
