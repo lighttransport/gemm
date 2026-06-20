@@ -389,9 +389,15 @@ int main(int argc, char **argv) {
     int max_gen = 100;
     int reasoning_budget_tokens = 32;
 
+    float cli_temp = -1.0f;   /* <0 = default; 0 = greedy */
+    int cli_seed = -1;        /* <0 = time-seeded */
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) {
             reasoning_budget_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+            cli_temp = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            cli_seed = atoi(argv[++i]);
         } else if (strchr(argv[i], '.') && (strstr(argv[i], ".jpg") || strstr(argv[i], ".jpeg") ||
             strstr(argv[i], ".png") || strstr(argv[i], ".bmp") || strstr(argv[i], ".ppm"))) {
             image_path = argv[i];
@@ -606,7 +612,11 @@ int main(int argc, char **argv) {
         .top_p = 0.95f,
         .min_p = 0.05f,
     };
-    srand((unsigned)time(NULL));
+    if (cli_temp >= 0.0f) {
+        sampling.temperature = cli_temp;   /* 0 => greedy (argmax) */
+        if (cli_temp == 0.0f) { sampling.top_k = 1; sampling.top_p = 1.0f; sampling.min_p = 0.0f; }
+    }
+    srand(cli_seed >= 0 ? (unsigned)cli_seed : (unsigned)time(NULL));
 
     t0 = get_time_ms();
     int gen_count = 0;
