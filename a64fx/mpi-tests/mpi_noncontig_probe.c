@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <string.h>
 
 static int env_i(const char *name, int defval) {
@@ -27,6 +28,24 @@ static void fill_bytes(unsigned char *p, size_t n, int rank) {
     for (size_t i = 0; i < n; i++) p[i] = (unsigned char)((i * 131u + (unsigned)rank) & 255u);
 }
 
+static void log_printf(const char *fmt, ...) {
+    const char *path = getenv("MPI_PROBE_LOG");
+    if (!path || !*path) path = "mpi_probe.log";
+
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+
+    FILE *fp = fopen(path, "a");
+    if (!fp) return;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fclose(fp);
+}
+
 static void bench_allreduce(int rank, int size, int iters) {
     double best = 0.0, sum = 0.0;
     for (int i = 0; i < iters; i++) {
@@ -43,8 +62,8 @@ static void bench_allreduce(int rank, int size, int iters) {
         }
     }
     if (rank == 0) {
-        printf("MPI_BENCH allreduce_i64 iters=%d best_us=%.3f avg_us=%.3f\n",
-               iters, best * 1e6, (sum / iters) * 1e6);
+        log_printf("MPI_BENCH allreduce_i64 iters=%d best_us=%.3f avg_us=%.3f\n",
+                   iters, best * 1e6, (sum / iters) * 1e6);
     }
 }
 
@@ -68,8 +87,8 @@ static void bench_bcast(int rank, int iters, size_t bytes) {
     }
     if (rank == 0) {
         double gbps = bytes / best / 1e9;
-        printf("MPI_BENCH bcast bytes=%zu iters=%d best_ms=%.3f avg_ms=%.3f best_GBps=%.3f\n",
-               bytes, iters, best * 1e3, (sum / iters) * 1e3, gbps);
+        log_printf("MPI_BENCH bcast bytes=%zu iters=%d best_ms=%.3f avg_ms=%.3f best_GBps=%.3f\n",
+                   bytes, iters, best * 1e3, (sum / iters) * 1e3, gbps);
     }
     free(buf);
 }
@@ -91,8 +110,8 @@ static void bench_alltoall(int rank, int size, int iters, size_t each_bytes) {
     }
     if (rank == 0) {
         size_t rank_bytes = each_bytes * (size_t)size;
-        printf("MPI_BENCH alltoall each_bytes=%zu rank_bytes=%zu iters=%d best_ms=%.3f avg_ms=%.3f per_rank_GBps=%.3f\n",
-               each_bytes, rank_bytes, iters, best * 1e3, (sum / iters) * 1e3, (double)rank_bytes / best / 1e9);
+        log_printf("MPI_BENCH alltoall each_bytes=%zu rank_bytes=%zu iters=%d best_ms=%.3f avg_ms=%.3f per_rank_GBps=%.3f\n",
+                   each_bytes, rank_bytes, iters, best * 1e3, (sum / iters) * 1e3, (double)rank_bytes / best / 1e9);
     }
     free(send);
     free(recv);
@@ -116,8 +135,8 @@ static void bench_ring_sendrecv(int rank, int size, int iters, size_t bytes) {
         best = min_nonzero(dt, best);
     }
     if (rank == 0) {
-        printf("MPI_BENCH ring_sendrecv bytes=%zu iters=%d best_ms=%.3f avg_ms=%.3f per_rank_GBps=%.3f\n",
-               bytes, iters, best * 1e3, (sum / iters) * 1e3, bytes / best / 1e9);
+        log_printf("MPI_BENCH ring_sendrecv bytes=%zu iters=%d best_ms=%.3f avg_ms=%.3f per_rank_GBps=%.3f\n",
+                   bytes, iters, best * 1e3, (sum / iters) * 1e3, bytes / best / 1e9);
     }
     free(send);
     free(recv);
@@ -144,23 +163,22 @@ int main(int argc, char **argv) {
     MPI_Allreduce(&is_node_leader, &world_nodes, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("MPI_PROBE size=%d nodes=%d ranks_per_node_minmax pending\n", size, world_nodes);
-        printf("MPI_PROBE env PJM_JOBID=%s PJM_RSCGRP=%s PJM_NODE=%s\n",
-               getenv("PJM_JOBID") ? getenv("PJM_JOBID") : "-",
-               getenv("PJM_RSCGRP") ? getenv("PJM_RSCGRP") : "-",
-               getenv("PJM_NODE") ? getenv("PJM_NODE") : "-");
+        log_printf("MPI_PROBE size=%d nodes=%d ranks_per_node_minmax pending\n", size, world_nodes);
+        log_printf("MPI_PROBE env PJM_JOBID=%s PJM_RSCGRP=%s PJM_NODE=%s\n",
+                   getenv("PJM_JOBID") ? getenv("PJM_JOBID") : "-",
+                   getenv("PJM_RSCGRP") ? getenv("PJM_RSCGRP") : "-",
+                   getenv("PJM_NODE") ? getenv("PJM_NODE") : "-");
     }
 
     int loc_min = local_size, loc_max = local_size;
     MPI_Allreduce(MPI_IN_PLACE, &loc_min, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &loc_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (rank == 0) printf("MPI_PROBE ranks_per_node min=%d max=%d\n", loc_min, loc_max);
+    if (rank == 0) log_printf("MPI_PROBE ranks_per_node min=%d max=%d\n", loc_min, loc_max);
 
     for (int r = 0; r < size; r++) {
         if (r == rank && (rank < 8 || rank == size - 1 || local_rank == 0)) {
-            printf("MPI_RANK rank=%d local_rank=%d local_size=%d host=%s\n",
-                   rank, local_rank, local_size, pname);
-            fflush(stdout);
+            log_printf("MPI_RANK rank=%d local_rank=%d local_size=%d host=%s\n",
+                       rank, local_rank, local_size, pname);
         }
         MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -174,7 +192,7 @@ int main(int argc, char **argv) {
     bench_ring_sendrecv(rank, size, iters, bytes);
     bench_alltoall(rank, size, iters, each);
 
-    if (rank == 0) printf("MPI_PROBE_DONE size=%d nodes=%d\n", size, world_nodes);
+    if (rank == 0) log_printf("MPI_PROBE_DONE size=%d nodes=%d\n", size, world_nodes);
     MPI_Comm_free(&local);
     MPI_Finalize();
     return 0;

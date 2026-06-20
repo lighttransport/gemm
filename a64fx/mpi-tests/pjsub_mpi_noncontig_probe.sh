@@ -20,7 +20,7 @@ echo "=== MPI noncontig probe: NP=$NP job=${PJM_JOBID:-?} ==="
 echo "workdir=$WORK"
 date
 
-if [ ! -x "$MPI_DIR/mpi_noncontig_probe" ]; then
+if [ ! -x "$MPI_DIR/mpi_noncontig_probe" ] || [ "$MPI_DIR/mpi_noncontig_probe.c" -nt "$MPI_DIR/mpi_noncontig_probe" ]; then
     make -C "$MPI_DIR" mpi_noncontig_probe MPICC=/opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifccpx >/dev/null || exit 3
 fi
 
