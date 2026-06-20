@@ -16313,9 +16313,26 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                                            n_tokens, start_pos);
     }
     if (embeddings != NULL) {
-        /* VLM vision-embedding path: keep sequential for now. */
-        return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
-                                           n_tokens, start_pos);
+        /* VLM vision-embedding path. The batched body fully supports pre-computed
+         * embeddings (uploads to d_batch_x, no embd-scale — see below), and the
+         * "batched diverges on Gemma4" worry that originally forced sequential here
+         * was a measurement artifact (it compared F16-batched vs the dp4a INT8
+         * sequential path; vs an F32 oracle the batched path is ~3e-3, correct —
+         * see cuda_llm_set_dp4a / the prefill F32-oracle check). Use batched for
+         * gemma4 (≫ faster than N sequential forwards; ~3x on 16 vision tokens and
+         * scales with image-token count). CUDA_LLM_VLM_SEQ_PREFILL=1 reverts.
+         * PLE (2B) stays sequential. NOTE: batched prefill is F16 (vs the dp4a
+         * sequential it replaces) so the KV cache differs by ~F16 precision; greedy
+         * decode matches for many tokens then can diverge in wording on long
+         * generations (near-tie flips), both valid — landmark/scene answers stable. */
+        int vlm_seq = getenv("CUDA_LLM_VLM_SEQ_PREFILL") &&
+                      atoi(getenv("CUDA_LLM_VLM_SEQ_PREFILL")) != 0;
+        if (!r->is_gemma4 || vlm_seq ||
+            (r->n_embd_per_layer > 0 && r->d_ple_combined)) {
+            return cuda_llm_prefill_sequential(r, token_ids, embeddings, embd_stride,
+                                               n_tokens, start_pos);
+        }
+        /* fall through to the batched body (handles embeddings at line ~16445) */
     }
     if (r->is_gemma4 && r->n_embd_per_layer > 0 && r->d_ple_combined) {
         /* Gemma4 with PLE (older 2B model): the per-layer embedding path is
