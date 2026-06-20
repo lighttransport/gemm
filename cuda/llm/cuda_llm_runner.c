@@ -5276,7 +5276,7 @@ static const char *cuda_kernel_source =
 "__global__ void mmq_iq2xxs_grouped8(float *out, const unsigned char *W, unsigned long long estride,\n"
 "                                    const signed char *cxq8, const float *cxs, const int *ebounds,\n"
 "                                    const int *worklist, int bm, int N, int K) {\n"
-"    const int TG = 16;\n"
+"    const int TG = 24;\n"
 "    __shared__ unsigned long long sGrid[256]; __shared__ unsigned long long sSignMask[128];\n"
 "    for (int i=threadIdx.x;i<256;i+=blockDim.x) sGrid[i]=iq2xxs_grid_dev[i];\n"
 "    for (int i=threadIdx.x;i<128;i+=blockDim.x){ unsigned char s=ksigns_iq2xs_dev[i];\n"
@@ -5292,9 +5292,9 @@ static const char *cuda_kernel_source =
 "    int n0 = blockIdx.x*128 + warp*16;\n"
 "    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
 "    const unsigned char *We = W + (size_t)e*estride;\n"
-"    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
+"    __shared__ signed char sX[192][36]; __shared__ float sXs[192];\n"
 "    __shared__ signed char sW[128][32]; __shared__ float sWs[128];\n"
-"    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
+"    float f[24][4]; for(int g=0;g<24;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
 "    __syncthreads();\n"
 "    for (int sb=0; sb<nsb; sb++) {\n"
 "        { int rl=lane>>1, half=lane&1, r=warp*16+rl, n=n0+rl;\n"
@@ -14765,7 +14765,7 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     /* grouped8 is now WN=8 (128 rows/block) -> needs out_dim%128==0; ~15% faster than WN=4. */
     int use16 = !use_fused && (r->fn_mmq_iq2xxs_grouped8 != 0) && (out_dim % 128 == 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
     int use32 = !use_fused && !use16 && (r->fn_mmq_iq2xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
-    int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
+    int grp = use_fused ? 256 : (use16 ? 192 : (use32 ? 256 : 32));  /* use16=grouped8 TG=24 -> 8*24=192 tok/block */
     if (r->d_mmqd_wl_ntok != n_tokens) {
         int n_work = (n_tokens + grp - 1) / grp; if (n_work < 1) n_work = 1;
         if (!r->d_mmqd_eb && cuMemAlloc(&r->d_mmqd_eb, 2*sizeof(int)) != CUDA_SUCCESS) return -1;
