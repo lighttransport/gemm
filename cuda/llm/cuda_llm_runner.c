@@ -5289,11 +5289,11 @@ static const char *cuda_kernel_source =
 "    int ntg = (eb1 - m_base + 7) / 8; if (ntg > TG) ntg = TG;\n"
 "    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
 "    int gid = lane>>2, tid = lane&3;\n"
-"    int n0 = blockIdx.x*64 + warp*16;\n"
+"    int n0 = blockIdx.x*128 + warp*16;\n"
 "    int nb = K/256, row_bytes = nb*66, nsb = K/32;\n"
 "    const unsigned char *We = W + (size_t)e*estride;\n"
 "    __shared__ signed char sX[128][36]; __shared__ float sXs[128];\n"
-"    __shared__ signed char sW[64][32]; __shared__ float sWs[64];\n"
+"    __shared__ signed char sW[128][32]; __shared__ float sWs[128];\n"
 "    float f[16][4]; for(int g=0;g<16;g++){f[g][0]=f[g][1]=f[g][2]=f[g][3]=0;}\n"
 "    __syncthreads();\n"
 "    for (int sb=0; sb<nsb; sb++) {\n"
@@ -14762,7 +14762,8 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
     /* Prefer fused kernel: loads F32 activations and quantizes on-the-fly. */
     int use_fused = (r->fn_mmq_iq2xxs_fused32 != 0) && getenv("CUDA_LLM_MMQ_FUSED");
-    int use16 = !use_fused && (r->fn_mmq_iq2xxs_grouped8 != 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
+    /* grouped8 is now WN=8 (128 rows/block) -> needs out_dim%128==0; ~15% faster than WN=4. */
+    int use16 = !use_fused && (r->fn_mmq_iq2xxs_grouped8 != 0) && (out_dim % 128 == 0) && !getenv("CUDA_LLM_MMQ_TG32") && !getenv("CUDA_LLM_MMQ_TG4");
     int use32 = !use_fused && !use16 && (r->fn_mmq_iq2xxs_grouped32 != 0) && !getenv("CUDA_LLM_MMQ_TG4");
     int grp = use_fused ? 256 : (use16 ? 128 : (use32 ? 256 : 32));
     if (r->d_mmqd_wl_ntok != n_tokens) {
@@ -14799,8 +14800,10 @@ static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
       cuLaunchKernel(r->fn_mmq_quant_q8_1, in_dim/256, n_tokens, 1, 32, 1, 1, 0, r->stream, a, NULL); }
     { unsigned long long st = 0; int bm = 0, nN = out_dim, nK = in_dim;
       CUfunction mmqfn = use32 ? r->fn_mmq_iq2xxs_grouped32 : (use16 ? r->fn_mmq_iq2xxs_grouped8 : r->fn_mmq_iq2xxs_grouped);
+      /* WN=8 grouped8: 128 rows/block, 256 threads; others: 64 rows/block, 128 threads. */
+      int gx = use16 ? out_dim/128 : out_dim/64, bt = use16 ? 256 : 128;
       void *a[] = { &dst, &mat, &st, &r->d_mmqd_cxq8, &r->d_mmqd_cxs, &r->d_mmqd_eb, &r->d_mmqd_wl, &bm, &nN, &nK };
-      cuLaunchKernel(mmqfn, out_dim/64, n_work, 1, 128, 1, 1, 0, r->stream, a, NULL); }
+      cuLaunchKernel(mmqfn, gx, n_work, 1, bt, 1, 1, 0, r->stream, a, NULL); }
     return 0;
 }
 
