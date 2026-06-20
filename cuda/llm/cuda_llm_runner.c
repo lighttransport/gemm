@@ -15620,13 +15620,20 @@ static size_t d512_score_cap_elems(void) {
    The query dim is processed in chunks so the materialized score matrix stays
    bounded (D512_SCORE_CAP_ELEMS) regardless of n_tokens.
 
-   Falls through to launch_fa2_attention_d512 when the FA2 d=512 cubin
-   function is available, since FA2 avoids materializing scores entirely. */
+   For the gemma4 MQA full-attn layers (n_kv_heads=1, 32 query heads share one
+   KV head) the cuBLAS path is FASTER than FA2-d512 at every prefill length and
+   more accurate (no F16 online-softmax): cuBLAS reuses the single shared K
+   across the 32-head GEMM batch via its own tiling, whereas FA2-d512 launches
+   one q-head per block and is register-bound (ofrag[64][4]=256 regs) with 32x
+   redundant KV streaming. Measured (31B IQ2_XXS, RTX 5060 Ti): pp512 tie,
+   pp8192 491.8->508.5, pp16384 449.2->484.9 t/s; logits rel_L2_vs_seq
+   0.0015->0.0006. So cuBLAS-d512 is the DEFAULT; CUDA_LLM_FA2_D512=1 opts into
+   the FA2-d512 kernel (kept for A/B and as a low-VRAM fallback). */
 static void launch_cublas_d512_attention(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q_batch,
                                           CUdeviceptr key_cache, CUdeviceptr value_cache,
                                           int n_tokens, int start_pos, int n_heads, int n_kv_heads,
                                           int head_dim, int kv_dim, float scale) {
-    if (head_dim == 512 && r->fn_fa2_attn_512) {
+    if (head_dim == 512 && r->fn_fa2_attn_512 && getenv("CUDA_LLM_FA2_D512")) {
         launch_fa2_attention_d512(r, out, q_batch, key_cache, value_cache,
                                    n_tokens, start_pos, n_heads, n_kv_heads,
                                    head_dim, kv_dim, scale, 0);
