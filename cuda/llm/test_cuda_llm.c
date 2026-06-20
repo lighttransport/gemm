@@ -14,6 +14,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
 
 /* GGUF loader */
 #define GGUF_LOADER_IMPLEMENTATION
@@ -250,6 +251,15 @@ int main(int argc, char **argv) {
     float *last_gpu_hidden = (float *)malloc((size_t)n_embd * sizeof(float));
     float *last_seq_logits = n_vocab_size > 0 ? (float *)malloc((size_t)n_vocab_size * sizeof(float)) : NULL;
     float *seq_decode_logits = (verify_decode && n_vocab_size > 0) ? (float *)malloc((size_t)n_vocab_size * sizeof(float)) : NULL;
+    /* CPU F32 oracle (opt-in CUDA_LLM_CPU_ORACLE=1, slow): a true F32 reference to see
+     * which GPU path (batched F16 vs sequential F32) is actually closer to truth. */
+    int cpu_oracle = (!gpu_only) && cpu_model && getenv("CUDA_LLM_CPU_ORACLE");
+    float *cpu_pf_hidden = NULL, *cpu_pf_logits = NULL;
+    int have_cpu_pf_hidden = 0, have_cpu_pf_logits = 0;
+    if (cpu_oracle) {
+        cpu_pf_hidden = (float *)malloc((size_t)n_embd * sizeof(float));
+        if (n_vocab_size > 0) cpu_pf_logits = (float *)malloc((size_t)n_vocab_size * sizeof(float));
+    }
     if (!last_gpu_hidden) {
         fprintf(stderr, "Failed to allocate last_gpu_hidden\n");
         cuda_llm_free(gpu);
@@ -398,6 +408,34 @@ int main(int argc, char **argv) {
     } /* end !large_bench */
 
     if (!large_bench) {
+    /* CPU F32 oracle: replay prefill_tokens on the CPU transformer (true F32, full-
+     * precision dequant + F32 KV) to get a reference both GPU paths can be measured
+     * against. Opt-in (slow: prefill_token_count CPU forwards). The CPU KV cache is
+     * position-keyed, so the in-order replay overwrites all needed slots (no reset). */
+    if (cpu_oracle) {
+        const char *ot = getenv("CUDA_LLM_CPU_ORACLE_THREADS");
+        if (ot) { int nt = atoi(ot); if (nt > 0) transformer_set_threads(cpu_model, nt); }
+        double ct0 = get_time_ms();
+        float *ch = NULL;
+        for (int t = 0; t < prefill_token_count; t++)
+            ch = transformer_forward(cpu_model, prefill_tokens[t], t);
+        if (ch && cpu_pf_hidden) {
+            memcpy(cpu_pf_hidden, ch, (size_t)n_embd * sizeof(float));
+            have_cpu_pf_hidden = 1;
+            fprintf(stderr, "CPU oracle: hidden norm=%.4f [0]=%.6f [1]=%.6f\n",
+                    vec_norm(cpu_pf_hidden, n_embd), cpu_pf_hidden[0], cpu_pf_hidden[1]);
+        }
+        if (cpu_pf_logits) {
+            float *cl = transformer_forward_logits(cpu_model, prefill_tokens[prefill_token_count - 1],
+                                                   prefill_token_count - 1);
+            if (cl) {
+                memcpy(cpu_pf_logits, cl, (size_t)n_vocab_size * sizeof(float));
+                have_cpu_pf_logits = 1;
+            }
+        }
+        fprintf(stderr, "CPU oracle: replayed %d tokens in %.1f ms\n",
+                prefill_token_count, get_time_ms() - ct0);
+    }
     if (cuda_llm_reset_state(gpu) != 0) {
         fprintf(stderr, "cuda_llm_reset_state failed before sequential hidden replay\n");
         pass = 0;
@@ -435,6 +473,12 @@ int main(int argc, char **argv) {
         float ptol = 1e-2f;  /* reference is F32 oracle (dp4a+MMQ off); batched is F16 */
         fprintf(stderr, "Prefill hidden: %.1f ms (%.1f tok/s) rel_L2_vs_seq=%.6f\n",
                 prefill_ms, prefill_ms > 0 ? (1000.0 * prefill_token_count / prefill_ms) : 0.0, err);
+        if (have_cpu_pf_hidden) {
+            float e_bc = rel_l2_error(prefill_hidden, cpu_pf_hidden, n_embd);
+            float e_sc = rel_l2_error(last_gpu_hidden, cpu_pf_hidden, n_embd);
+            fprintf(stderr, "Prefill hidden vs CPU-F32 oracle: batched_vs_cpu=%.6f seq_vs_cpu=%.6f (batched_vs_seq=%.6f)\n",
+                    e_bc, e_sc, err);
+        }
         if (!isfinite(err) || err >= ptol) pass = 0;
     } else {
         fprintf(stderr, "Prefill hidden failed\n");
@@ -454,6 +498,12 @@ int main(int argc, char **argv) {
             float logit_err = rel_l2_error(prefill_logits, last_seq_logits, n_vocab_size);
             float ptol = 1e-2f;  /* reference is F32 oracle (dp4a+MMQ off); batched is F16 */
             fprintf(stderr, "Prefill logits rel_L2_vs_seq=%.6f\n", logit_err);
+            if (have_cpu_pf_logits) {
+                float le_bc = rel_l2_error(prefill_logits, cpu_pf_logits, n_vocab_size);
+                float le_sc = rel_l2_error(last_seq_logits, cpu_pf_logits, n_vocab_size);
+                fprintf(stderr, "Prefill logits vs CPU-F32 oracle: batched_vs_cpu=%.6f seq_vs_cpu=%.6f\n",
+                        le_bc, le_sc);
+            }
             if (!isfinite(logit_err) || logit_err >= ptol) pass = 0;
         }
         fprintf(stderr, "Prefill logits: %.1f ms (%.1f tok/s)\n",
@@ -598,6 +648,8 @@ cleanup:
     /* Cleanup */
     free(last_seq_logits);
     free(last_gpu_hidden);
+    free(cpu_pf_hidden);
+    free(cpu_pf_logits);
     cuda_llm_free(gpu);
     if (cpu_model) transformer_free(cpu_model);
     bpe_vocab_free(vocab);
