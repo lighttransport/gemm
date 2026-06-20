@@ -415,6 +415,10 @@ int main(int argc, char **argv) {
     if (cpu_oracle) {
         const char *ot = getenv("CUDA_LLM_CPU_ORACLE_THREADS");
         if (ot) { int nt = atoi(ot); if (nt > 0) transformer_set_threads(cpu_model, nt); }
+        if (getenv("CUDA_LLM_CPU_ORACLE_F64")) {
+            transformer_set_f64_accum(cpu_model, 1);
+            fprintf(stderr, "CPU oracle: F64 accumulation enabled\n");
+        }
         double ct0 = get_time_ms();
         float *ch = NULL;
         for (int t = 0; t < prefill_token_count; t++)

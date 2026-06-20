@@ -228,6 +228,9 @@ void transformer_free(transformer_model *model);
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable);
+/* Enable double-precision accumulation in matvec/rmsnorm for a higher-fidelity
+ * (closer to F64) CPU reference. Slower; intended for oracle/verification use. */
+void transformer_set_f64_accum(transformer_model *model, int enable);
 
 /* Configure NUMA-aware weight/buffer distribution across CMGs.
  * Must be called after transformer_set_threads, before inference.
@@ -581,9 +584,23 @@ static float tf_sum_squares(const float *v, int n) {
 }
 
 /* RMSNorm: y[i] = x[i] * w[i] / sqrt(mean(x^2) + eps) */
+/* Opt-in double-precision accumulation for a higher-fidelity CPU reference oracle
+ * (transformer_set_f64_accum). Forces the matvec dot and rmsnorm sum-of-squares to
+ * accumulate in double, so the CPU reference is closer to true F64 ground truth and
+ * its own F32 reduction rounding can be distinguished from genuine GPU error. */
+static int tf_g_f64_accum = 0;
+
 static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, float eps, float *w_buf) {
     /* Dequant weight */
     tf_dequant_row(w, 0, w_buf);
+
+    if (tf_g_f64_accum) {
+        double ss = 0.0;
+        for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
+        float inv = (float)(1.0 / sqrt(ss / n + (double)eps));
+        for (int i = 0; i < n; i++) dst[i] = x[i] * inv * w_buf[i];
+        return;
+    }
 
 #if defined(__AVX2__) && defined(__FMA__)
     /* AVX2: sum of squares */
@@ -631,6 +648,17 @@ typedef struct {
 static void *tf_qmatvec_worker(void *arg) {
     tf_matvec_task *t = (tf_matvec_task *)arg;
     int n_cols = t->mat->n_cols;
+    if (tf_g_f64_accum) {
+        /* Reference oracle: dequant each row to F32, dot in double. Uniform across
+         * all weight types so the only F32 rounding left is the per-weight dequant. */
+        for (int i = t->row_start; i < t->row_end; i++) {
+            tf_dequant_row(t->mat, i, t->tmp);
+            double sum = 0.0;
+            for (int j = 0; j < n_cols; j++) sum += (double)t->tmp[j] * (double)t->x[j];
+            t->dst[i] = (float)sum;
+        }
+        return NULL;
+    }
     if (t->mat->type == GGML_TYPE_F16) {
         const uint8_t *base = (const uint8_t *)t->mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
@@ -2347,6 +2375,11 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable) {
     if (!model) return;
     model->trace_hidden_norms = enable ? 1 : 0;
+}
+
+void transformer_set_f64_accum(transformer_model *model, int enable) {
+    (void)model;
+    tf_g_f64_accum = enable ? 1 : 0;
 }
 
 /* ---- NUMA-aware memory allocator ---- */
