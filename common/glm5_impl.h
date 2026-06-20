@@ -244,9 +244,9 @@ static void glm5_mv_bf16(float*restrict y,const uint16_t*W,const float*x,int row
     for(int r=nb*8;r<rows;r++) y[r]=vec_dot_bf16_f32(W+(size_t)r*cols,x,cols);
 }
 
-/* MXFP8 matvec: y[rows] = decode(W fp8 + S e8m0) . x[cols], 8-row blocks via the kernel. */
+/* GLM5.2 FP8 matvec: F8_E4M3 weights with F32 scale_inv per 128x128 block. */
 static void glm5_mv_mxfp8(glm5_model*m, float*restrict y, const uint8_t*W, const uint8_t*S, const float*x, int rows, int cols){
-    const uint32_t*lut=m->fp8_lut; int sb=cols/GLM5_MX_BLK, nb=rows/8;
+    const uint32_t*lut=m->fp8_lut; const float*Sc=(const float*)S; int sb=(cols+127)/128;
     if(glm5_dummy){ double acc=0;
 #ifdef _OPENMP
         #pragma omp parallel for reduction(+:acc) schedule(static) if(rows>=GLM5_PAR_MIN)
@@ -256,12 +256,17 @@ static void glm5_mv_mxfp8(glm5_model*m, float*restrict y, const uint8_t*W, const
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
 #endif
-    for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
-        glm5_matvec_mxfp8_8row(y+r, w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
-                             s,s+sb,s+2*sb,s+3*sb,s+4*sb,s+5*sb,s+6*sb,s+7*sb, x, cols, lut); }
-    for(int r=nb*8;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb; double a=0;
-        for(int b=0;b<cols;b+=GLM5_MX_BLK){ float sc=glm5_e8m0(s[b/GLM5_MX_BLK]); int e=b+GLM5_MX_BLK<cols?b+GLM5_MX_BLK:cols;
-            for(int c=b;c<e;c++){ float wf; uint32_t u=lut[w[c]]; memcpy(&wf,&u,4); a+=(double)wf*sc*x[c]; } } y[r]=(float)a; }
+    for(int r=0;r<rows;r++){
+        const uint8_t*w=W+(size_t)r*cols;
+        const float*s=Sc+(size_t)r*sb;
+        double a=0;
+        for(int b=0;b<cols;b+=128){
+            float sc=s[b/128];
+            int e=b+128<cols?b+128:cols;
+            for(int c=b;c<e;c++){ float wf; uint32_t u=lut[w[c]]; memcpy(&wf,&u,4); a+=(double)wf*sc*x[c]; }
+        }
+        y[r]=(float)a;
+    }
 }
 /* matvec dispatch by weight type (bf16 or MXFP8) */
 static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const float*x, int rows, int cols){
@@ -502,11 +507,24 @@ static void* glm5_cp_cols(const uint8_t*base,const glm5_ent*e,int Rtot,int c0,in
     void*d=glm5_amalloc((size_t)Rtot*ncols*esz); uint8_t*dp=d; const uint8_t*sp=base+e->off;
     for(int r=0;r<Rtot;r++) memcpy(dp+(size_t)r*ncols*esz, sp+((size_t)r*Ctot+c0)*esz, (size_t)ncols*esz);
     glm5_blob_dontneed(base,e->off,e->nbytes); return d; }
+static uint8_t* glm5_cp_scale_f32_blocks(const uint8_t*base,const glm5_ent*e,int r0,int rows,int c0,int cols,int Rtot,int Ctot){
+    int sc=(Ctot+127)/128, cb0=c0/128, ncb=(cols+127)/128;
+    float *d=glm5_amalloc((size_t)rows*ncb*4);
+    const float *sp=(const float*)(base+e->off);
+    (void)Rtot;
+    for(int r=0;r<rows;r++){
+        const float *sr=sp+(size_t)((r0+r)/128)*sc+cb0;
+        memcpy(d+(size_t)r*ncb, sr, (size_t)ncb*4);
+    }
+    glm5_blob_dontneed(base,e->off,e->nbytes);
+    return (uint8_t*)d;
+}
 
-/* Load weight `name` (bf16, or MXFP8 if a `name_scale_inv` companion exists) with TP slicing.
+/* Load weight `name` (bf16, or FP8 if a `name_scale_inv` companion exists) with TP slicing.
  * mode 0 = full [Rtot,Ctot]; 1 = row-shard rows[r0,r0+nr) of [Rtot,Ctot]; 2 = col-shard
- * cols[c0,c0+nc) of [Rtot,Ctot]. MXFP8: FP8 weight (1 B) + E8M0 scale (1 B, Ctot/32 per row);
- * col-shard requires c0,nc multiples of 32 (true for head_dim 128; ep_size=1 uses full). */
+ * cols[c0,c0+nc) of [Rtot,Ctot]. GLM5.2 FP8 stores F8_E4M3 weights plus F32 scale_inv
+ * blocks [ceil(rows/128), ceil(cols/128)]. The loader expands those block scales to one
+ * scale row per local weight row, so row-shards may start at arbitrary head boundaries. */
 static glm5_tensor glm5_load_w(glm5_ent*es,int n,const uint8_t*base,const char*name,int mode,
                            int r0,int nr,int c0,int nc,int Rtot,int Ctot,int*ok,size_t*used){
     char sn[416]; snprintf(sn,sizeof sn,"%s_scale_inv",name);
@@ -517,11 +535,15 @@ static glm5_tensor glm5_load_w(glm5_ent*es,int n,const uint8_t*base,const char*n
     if(mode==0){ t.w=glm5_cp_full(base,we); t.rows=Rtot; t.cols=Ctot; *used+=we->nbytes; }
     else if(mode==1){ t.w=glm5_cp_rows(base,we,r0,nr,Ctot,esz); t.rows=nr; t.cols=Ctot; *used+=(size_t)nr*Ctot*esz; }
     else { t.w=glm5_cp_cols(base,we,Rtot,c0,nc,Ctot,esz); t.rows=Rtot; t.cols=nc; *used+=(size_t)Rtot*nc*esz; }
-    if(se){ int sc=Ctot/GLM5_MX_BLK;
-        if(mode==0) t.scale=(uint8_t*)glm5_cp_full(base,se);
-        else if(mode==1) t.scale=(uint8_t*)glm5_cp_rows(base,se,r0,nr,sc,1);
-        else { if((c0%GLM5_MX_BLK)||(nc%GLM5_MX_BLK)){ fprintf(stderr,"glm5_load: MXFP8 col-shard %s not 32-aligned (c0=%d nc=%d); ep_size must divide the dim into multiples of %d\n",name,c0,nc,GLM5_MX_BLK); *ok=0; return t; }
-               t.scale=(uint8_t*)glm5_cp_cols(base,se,Rtot,c0/GLM5_MX_BLK,nc/GLM5_MX_BLK,sc,1); } }
+    if(se){
+        if(!se->f32){ fprintf(stderr,"glm5_load: FP8 scale_inv %s is not F32\n",sn); *ok=0; return t; }
+        if(mode==0){ t.scale=glm5_cp_scale_f32_blocks(base,se,0,Rtot,0,Ctot,Rtot,Ctot); *used+=(size_t)Rtot*((Ctot+127)/128)*4; }
+        else if(mode==1){ t.scale=glm5_cp_scale_f32_blocks(base,se,r0,nr,0,Ctot,Rtot,Ctot); *used+=(size_t)nr*((Ctot+127)/128)*4; }
+        else {
+            if((c0%128)||(nc%128)){ fprintf(stderr,"glm5_load: FP8 col-shard %s not 128-aligned (c0=%d nc=%d); TP shard must preserve 128-col scale blocks\n",name,c0,nc); *ok=0; return t; }
+            t.scale=glm5_cp_scale_f32_blocks(base,se,0,Rtot,c0,nc,Rtot,Ctot); *used+=(size_t)Rtot*((nc+127)/128)*4;
+        }
+    }
     return t;
 }
 
@@ -944,39 +966,13 @@ static void glm5_gemm_bf16(float*restrict Y, const uint16_t*W, const float*X, in
  * the decode by N (the multi-stream win). N==1 uses the direct fused kernel (no tile staging). */
 #define GLM5_MXG_TILE 512
 static void glm5_gemm_mxfp8(glm5_model*m, float*restrict Y, const uint8_t*W, const uint8_t*S, const float*X, int N, int rows, int cols){
-    const uint32_t*lut=m->fp8_lut; int sb=cols/GLM5_MX_BLK, nb=rows/8;
     if(glm5_dummy){ double acc=0;
 #ifdef _OPENMP
         #pragma omp parallel for reduction(+:acc) schedule(static) if((long)rows>=GLM5_PAR_MIN)
 #endif
         for(int r=0;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=64) s+=w[i]; acc+=s; }
         float v=(float)(((long)acc)&1)*1e-30f; for(size_t i=0;i<(size_t)N*rows;i++) Y[i]=v; return; }
-    if(N==1){  /* direct fused: no tile, decode==matvec are one pass */
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
-#endif
-        for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
-            glm5_matvec_mxfp8_8row(Y+r, w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
-                                 s,s+sb,s+2*sb,s+3*sb,s+4*sb,s+5*sb,s+6*sb,s+7*sb, X, cols, lut); }
-    } else {
-        int TILE=GLM5_MXG_TILE<cols?GLM5_MXG_TILE:cols;
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
-#endif
-        for(int bi=0;bi<nb;bi++){ int r=bi*8; const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
-            uint16_t tile[8*GLM5_MXG_TILE];   /* decoded bf16 weights, 8KB/thread, L1-resident */
-            for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=0.f; }
-            for(int k0=0;k0<cols;k0+=TILE){ int kl=cols-k0<TILE?cols-k0:TILE;
-                for(int j=0;j<8;j++) glm5_mxfp8_decode_row_bf16(tile+(size_t)j*kl, w+(size_t)j*cols, s+(size_t)j*sb, k0, kl, lut);
-                for(int t=0;t<N;t++){ float tmp[8];
-                    matvec_bf16_8row(tmp, tile,tile+kl,tile+2*kl,tile+3*kl,tile+4*kl,tile+5*kl,tile+6*kl,tile+7*kl, X+(size_t)t*cols+k0, kl);
-                    float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]+=tmp[j]; } }
-        }
-    }
-    for(int r=nb*8;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols,*s=S+(size_t)r*sb;
-        for(int t=0;t<N;t++){ const float*x=X+(size_t)t*cols; double a=0;
-            for(int b=0;b<cols;b+=GLM5_MX_BLK){ float sc=glm5_e8m0(s[b/GLM5_MX_BLK]); int e=b+GLM5_MX_BLK<cols?b+GLM5_MX_BLK:cols;
-                for(int c=b;c<e;c++){ float wf; uint32_t u=lut[w[c]]; memcpy(&wf,&u,4); a+=(double)wf*sc*x[c]; } } Y[(size_t)t*rows+r]=(float)a; } }
+    for(int t=0;t<N;t++) glm5_mv_mxfp8(m,Y+(size_t)t*rows,W,S,X+(size_t)t*cols,rows,cols);
 }
 /* batched GEMM dispatch by weight type */
 static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const float*X, int N, int rows, int cols){
@@ -985,9 +981,9 @@ static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const
 }
 static inline float glm5_tensor_get(const glm5_model*m,const glm5_tensor*t,int r,int c){
     if(t->type==GLM5_MXFP8){
-        const uint8_t*w=(const uint8_t*)t->w; int sb=t->cols/GLM5_MX_BLK;
+        const uint8_t*w=(const uint8_t*)t->w; const float*sc=(const float*)t->scale; int sb=(t->cols+127)/128;
         float wf; uint32_t u=m->fp8_lut[w[(size_t)r*t->cols+c]]; memcpy(&wf,&u,4);
-        return wf*glm5_e8m0(t->scale[(size_t)r*sb+c/GLM5_MX_BLK]);
+        return wf*sc[(size_t)r*sb+c/128];
     }
     return glm5_bf2f(((const uint16_t*)t->w)[(size_t)r*t->cols+c]);
 }
@@ -995,7 +991,7 @@ static glm5_tensor glm5_tensor_rows(const glm5_tensor*t,int r0,int rows){
     glm5_tensor u=*t; u.rows=rows;
     if(t->type==GLM5_MXFP8){
         u.w=(uint8_t*)t->w+(size_t)r0*t->cols;
-        u.scale=t->scale+(size_t)r0*(t->cols/GLM5_MX_BLK);
+        u.scale=t->scale+(size_t)r0*((t->cols+127)/128)*4;
     } else u.w=(uint16_t*)t->w+(size_t)r0*t->cols;
     return u;
 }
@@ -1004,15 +1000,15 @@ static void glm5_tensor_tmul_rows(const glm5_model*m,float*y,const glm5_tensor*t
     for(int k=0;k<cols;k++) y[k]=0.0f;
     if(t->type==GLM5_MXFP8){
         const uint8_t*w=(const uint8_t*)t->w+(size_t)r0*cols;
-        const uint8_t*sc=t->scale+(size_t)r0*(cols/GLM5_MX_BLK);
-        int sb=cols/GLM5_MX_BLK;
+        const float*sc=(const float*)t->scale+(size_t)r0*((cols+127)/128);
+        int sb=(cols+127)/128;
         for(int i=0;i<rows;i++){
             float xi=x[i]; if(xi==0.0f) continue;
             const uint8_t*row=w+(size_t)i*cols;
-            const uint8_t*srow=sc+(size_t)i*sb;
+            const float*srow=sc+(size_t)i*sb;
             for(int b=0;b<sb;b++){
-                float scale=glm5_e8m0(srow[b]); int k0=b*GLM5_MX_BLK;
-                for(int u=0;u<GLM5_MX_BLK;u++){ float wf; uint32_t bits=m->fp8_lut[row[k0+u]]; memcpy(&wf,&bits,4); y[k0+u]+=xi*wf*scale; }
+                float scale=srow[b]; int k0=b*128, k1=k0+128<cols?k0+128:cols;
+                for(int u=k0;u<k1;u++){ float wf; uint32_t bits=m->fp8_lut[row[u]]; memcpy(&wf,&bits,4); y[u]+=xi*wf*scale; }
             }
         }
     } else {

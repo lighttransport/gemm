@@ -148,7 +148,7 @@ typedef enum { GLM5_BF16 = 0, GLM5_FP8 = 1, GLM5_MXFP4 = 2, GLM5_F32 = 3, GLM5_B
 
 typedef struct {
     void    *w;       /* weight bytes */
-    uint8_t *scale;   /* E8M0 scale bytes (NULL for BF16/F32) */
+    uint8_t *scale;   /* FP8 scale bytes (GLM5.2: F32 scale_inv blocks; NULL for BF16/F32) */
     glm5_qtype type;
     int rows, cols;   /* logical [rows, cols] */
 } glm5_tensor;
@@ -168,8 +168,8 @@ static inline size_t glm5_wbytes(glm5_qtype t, int rows, int cols) {
 }
 static inline size_t glm5_sbytes(glm5_qtype t, int rows, int cols) {
     switch (t) {
-        case GLM5_FP8:   return (size_t)((rows + 127) / 128) * ((cols + 127) / 128);
-        case GLM5_MXFP8: return (size_t)rows * (cols / 32);   /* E8M0 uint8 per [1,32] block */
+        case GLM5_FP8:   return (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 4;
+        case GLM5_MXFP8: return (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 4;
         case GLM5_MXFP4: return (size_t)rows * (cols / 32);
         default:       return 0;
     }

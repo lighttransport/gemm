@@ -37,6 +37,10 @@ export GLM5_MSA=${GLM5_MSA:-0}
 export GLM5_MAXPOS=${GLM5_MAXPOS:-512}
 export GLM5_PREFILL=${GLM5_PREFILL:-4}
 export GLM5_DECODE=${GLM5_DECODE:-8}
+export GLM5_PROMPT_IDS=${GLM5_PROMPT_IDS:-$GLM5/prompt_ids_fp8_short.txt}
+export GLM5_GEN_OUT=${GLM5_GEN_OUT:-$RUN_DIR/gen_ids.txt}
+export GLM5_MAX_NEW=${GLM5_MAX_NEW:-8}
+export GLM5_TOKENIZER=${GLM5_TOKENIZER:-$GLM5_MODEL_DIR/tokenizer.json}
 export LLM_THREADS=${LLM_THREADS:-12}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$LLM_THREADS}
 
@@ -44,6 +48,7 @@ echo "=== GLM5.2 FP8 real 96n: NP=$NP stage_layers=$STAGE_LAYERS run_layers=$RUN
 date
 
 "$GLM5/check_glm5_model.sh" "$GLM5_MODEL_DIR" --tokenizer || exit 2
+test -s "$GLM5_PROMPT_IDS" || { echo "FATAL: missing GLM5_PROMPT_IDS=$GLM5_PROMPT_IDS"; exit 2; }
 
 mkdir -p "$RUN_DIR" || exit 2
 cd "$RUN_DIR" || exit 2
@@ -74,4 +79,8 @@ echo "--- run GLM5_REAL=1 FP8 ($(date)) ---"
 GLM5_REAL=1 GLM5_LAYERS=$RUN_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: run failed"; exit 5; }
 echo "--- rank0 log ---"
 cat "$RUN_DIR"/glm5_ep_rank00.txt 2>/dev/null
+echo "--- gen ids ---"
+cat "$GLM5_GEN_OUT" 2>/dev/null || true
+echo "--- decoded ---"
+python3 "$GLM5/glm5_tokenizer.py" decode-file "$GLM5_GEN_OUT" 2>/dev/null || true
 echo "=== fp8 96n done $(date) ==="
