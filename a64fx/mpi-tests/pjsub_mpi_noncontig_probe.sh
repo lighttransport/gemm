@@ -4,6 +4,7 @@
 #     --mpi "proc=12" --no-check-directory a64fx/mpi-tests/pjsub_mpi_noncontig_probe.sh
 
 #PJM -j
+#PJM -x PJM_LLIO_GFSCACHE=/vol0004
 set -u
 
 REPO=/home/u14346/work/gemm/glm5-1
