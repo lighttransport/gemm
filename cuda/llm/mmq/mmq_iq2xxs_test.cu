@@ -334,8 +334,16 @@ __global__ void mmq_iq2xxs_mma_v2(float *dst, const uint8_t *W, const int8_t *xq
 #define TG 4   /* token-groups per block (8*TG = 32 tokens) */
 #endif
 
+#ifndef LB
+#define LB 0
+#endif
+#if LB > 0
+__global__ void __launch_bounds__(32*WN, LB) mmq_iq2xxs_mma_v3(float *dst, const uint8_t *W, const int8_t *xq8,
+                                   const float *xs, int M, int N, int K) {
+#else
 __global__ void mmq_iq2xxs_mma_v3(float *dst, const uint8_t *W, const int8_t *xq8,
                                    const float *xs, int M, int N, int K) {
+#endif
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int gid = lane >> 2, tid = lane & 3;
     int n0 = blockIdx.x * (16 * WN) + warp * 16;
