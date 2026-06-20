@@ -9091,6 +9091,45 @@ static int cllm_read_file(const char *path, char **out_data, size_t *out_size) {
     return 0;
 }
 
+/* Open a cubin by leaf name, robust to the current working directory. The cubins
+ * live next to the binary (cuda/llm/). A hardcoded relative path silently fails
+ * when the binary is run from any other directory -> FA2/moe kernels don't load
+ * -> silent fall back to slow per-token attention / per-token matvec (a 5x prefill
+ * cliff). Try, in order: next to the executable (/proc/self/exe dir), the repo-root
+ * relative path "cuda/llm/<leaf>", and the bare leaf (cwd == cuda/llm). Returns an
+ * open FILE* (caller closes) and writes the path used into used_path (optional). */
+static FILE *cllm_fopen_cubin(const char *leaf, const char **used_path) {
+    static char exe_path[4096];
+    /* 1) directory of the running executable */
+    ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (n > 0) {
+        exe_path[n] = '\0';
+        char *slash = strrchr(exe_path, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - exe_path) + 1;
+            if (dlen + strlen(leaf) < sizeof(exe_path)) {
+                memcpy(slash + 1, leaf, strlen(leaf) + 1);
+                FILE *fp = fopen(exe_path, "rb");
+                if (fp) { if (used_path) *used_path = exe_path; return fp; }
+            }
+        }
+    }
+    /* 2) repo-root relative (legacy default) */
+    {
+        static char rp[4096];
+        snprintf(rp, sizeof(rp), "cuda/llm/%s", leaf);
+        FILE *fp = fopen(rp, "rb");
+        if (fp) { if (used_path) *used_path = rp; return fp; }
+    }
+    /* 3) bare leaf (cwd already inside cuda/llm) */
+    {
+        FILE *fp = fopen(leaf, "rb");
+        if (fp) { if (used_path) *used_path = leaf; return fp; }
+    }
+    if (used_path) *used_path = leaf;
+    return NULL;
+}
+
 static void cllm_write_file(const char *path, const char *data, size_t size) {
     FILE *fp = fopen(path, "wb");
     if (!fp) return;
@@ -9380,7 +9419,7 @@ lookup_funcs:
     r->moe_gpu_mod = 0; r->fn_moe_topk_gpu = NULL; r->fn_moe_shared_gate_gpu = NULL;
     {
         const char *cp = "cuda/llm/moe_gpu_kernels.cubin";
-        FILE *fp = fopen(cp, "rb");
+        FILE *fp = cllm_fopen_cubin("moe_gpu_kernels.cubin", &cp);
         if (fp) {
             fseek(fp, 0, SEEK_END);
             long sz = ftell(fp);
@@ -9426,7 +9465,7 @@ lookup_funcs:
     r->fa2_mod = 0; r->fn_fa2_attn_256 = NULL; r->fn_fa2_attn_512 = NULL;
     {
         const char *cp = "cuda/llm/fa2_kernels.cubin";
-        FILE *fp = fopen(cp, "rb");
+        FILE *fp = cllm_fopen_cubin("fa2_kernels.cubin", &cp);
         if (fp) {
             fseek(fp, 0, SEEK_END);
             long sz = ftell(fp);
@@ -14878,6 +14917,17 @@ static int launch_mmq_iq2_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
     return 0;
 }
 
+/* Max n_tokens for which dense int8 MMQ beats the dequant->F16->cuBLAS GEMM.
+ * MMQ wins at small batch (skinny cuBLAS GEMM); cuBLAS wins at large batch (weight
+ * reuse). Default crossover ~256 (measured on gemma-4-12B Q4_0, RTX 5060 Ti).
+ * CUDA_LLM_MMQ_MAX_TOKENS overrides: 0 disables MMQ, a large value forces it. */
+static int cllm_mmq_dense_max_tokens(void) {
+    const char *e = getenv("CUDA_LLM_MMQ_MAX_TOKENS");
+    if (e) { int v = atoi(e); return v < 0 ? 0 : v; }
+    if (getenv("CUDA_LLM_NO_MMQ_DENSE")) return 0;
+    return 256;
+}
+
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type);
@@ -15026,11 +15076,13 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_batch_matvec_iq4_xs, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_Q4_0) {
-        /* Dense int8 tensor-core MMQ: reads Q4_0 once, decodes to int8 in shared,
-         * skips the 8x F16 materialization. The gemma-4-12B "Q4_K_XL" QAT model is
-         * actually 100% Q4_0, so this is the model's main prefill matvec path.
-         * CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
-        if (n_tokens > 1 && !getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+        /* Crossover: dense int8 MMQ wins only at SMALL batch (skinny cuBLAS GEMM);
+         * at large batch the dequant->F16->cuBLAS tensor-core GEMM has far better
+         * weight reuse and wins (measured gemma-4-12B Q4_0, RTX 5060 Ti:
+         * pp64/128 MMQ 519/784 vs cuBLAS 345/627; pp512/1024/2048 MMQ 1044/1031/1016
+         * vs cuBLAS 1240/1460/1526). So use MMQ only for n_tokens <= threshold.
+         * CUDA_LLM_MMQ_MAX_TOKENS overrides (0 disables MMQ; large value forces it). */
+        if (n_tokens > 1 && n_tokens <= cllm_mmq_dense_max_tokens() &&
             launch_mmq_q4_0_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
             return;
         /* Dequant Q4_0 -> F16 (once) + cuBLAS F16 tensor-core GEMM, like Q6_K/Q8_0.
@@ -15058,10 +15110,9 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
             cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, n_groups, 1, 256, 1, 1, 0, r->stream, a, NULL);
             return;
         }
-        /* Dense int8 tensor-core MMQ: reads Q4_K once, decodes to int8 in shared,
-         * skips the 113 MB F16 materialization. Highest-leverage prefill path on
-         * this GPU. CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
-        if (n_tokens > 1 && !getenv("CUDA_LLM_NO_MMQ_DENSE") &&
+        /* Dense int8 MMQ only at small batch (crossover; see the Q4_0 arm above).
+         * Large-batch prefill uses the dequant->F16->cuBLAS GEMM (better weight reuse). */
+        if (n_tokens > 1 && n_tokens <= cllm_mmq_dense_max_tokens() &&
             launch_mmq_q4_K_dense(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
             return;
         /* Dequant + cuBLAS F16 GEMM via the shared helper (reuses the 256 MB
