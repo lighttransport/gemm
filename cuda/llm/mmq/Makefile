@@ -1,7 +1,7 @@
 # Standalone dev harness for the IQ2_XXS MMQ port.
 NVCC = nvcc
 ARCH = sm_120
-TARGETS = mmq_iq2xxs_test mmq_iq2xxs_moe_test mmq_iq3xxs_test mmq_q2_K_test mmq_q4_K_test mmq_iq3_s_test mmq_iq2_s_test
+TARGETS = mmq_iq2xxs_test mmq_iq2xxs_moe_test mmq_iq3xxs_test mmq_q2_K_test mmq_q4_K_test mmq_q4_0_test mmq_iq3_s_test mmq_iq2_s_test
 
 all: $(TARGETS)
 
@@ -18,6 +18,9 @@ mmq_q2_K_test: mmq_q2_K_test.cu
 	$(NVCC) -O3 -arch=$(ARCH) -o $@ $<
 
 mmq_q4_K_test: mmq_q4_K_test.cu
+	$(NVCC) -O3 -arch=$(ARCH) -o $@ $<
+
+mmq_q4_0_test: mmq_q4_0_test.cu
 	$(NVCC) -O3 -arch=$(ARCH) -o $@ $<
 
 mmq_iq3_s_test: mmq_iq3_s_test.cu
