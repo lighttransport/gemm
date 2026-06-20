@@ -88,6 +88,9 @@ typedef struct {
     int is_swa;            /* 1 = sliding window attention (Gemma4) */
     int shared_kv_source;  /* layer idx to reuse KV from, -1 = own KV (Gemma4) */
     int has_v_proj;        /* 0 = V uses K (Gemma4 SWA without attn_v tensor) */
+    int n_kv_heads;        /* per-layer KV heads (Gemma4: SWA & full-attn can differ,
+                            * e.g. 12B has 8 KV heads for SWA but 1 (MQA) for full-attn);
+                            * derived from attn_k rows / head_dim. 0 = use model default */
 } transformer_layer;
 
 typedef struct {
@@ -1846,6 +1849,21 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             /* V normalization (Gemma4 normalizes V too) */
             LOAD(attn_v_norm,  "attn_v_norm", 0)
 
+            /* Per-layer KV head count: Gemma4 12B uses 8 KV heads on SWA layers but
+             * 1 (MQA) on full-attention layers, so deriving it from the actual attn_k
+             * tensor (rows / head_dim) is the only correct source. Shared-KV layers
+             * inherit from their source (already loaded, since src < l). */
+            {
+                int lhd = m->layers[l].is_swa ? m->head_dim_swa : m->head_dim_full;
+                if (m->layers[l].shared_kv_source < 0 && m->layers[l].attn_k.data && lhd > 0)
+                    m->layers[l].n_kv_heads = m->layers[l].attn_k.n_rows / lhd;
+                else if (m->layers[l].shared_kv_source >= 0)
+                    m->layers[l].n_kv_heads = m->layers[m->layers[l].shared_kv_source].n_kv_heads;
+                else
+                    m->layers[l].n_kv_heads = m->n_kv_heads;
+                if (m->layers[l].n_kv_heads <= 0) m->layers[l].n_kv_heads = m->n_kv_heads;
+            }
+
             /* Post-attention norm */
             LOAD(post_attention_norm, "post_attention_norm", 1)
 
@@ -1990,18 +2008,19 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
     m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
     if (m->is_gemma4) {
-        int kv_dim_full = m->n_kv_heads * m->head_dim_full;
-        int kv_dim_swa  = m->n_kv_heads * m->head_dim_swa;
         int n_own = 0, n_shared = 0;
         for (int l = 0; l < m->n_layers; l++) {
             if (m->layers[l].shared_kv_source >= 0) { n_shared++; continue; }
+            /* Per-layer KV dim (SWA & full-attn may have different KV head counts) */
+            int lhd = m->layers[l].is_swa ? m->head_dim_swa : m->head_dim_full;
+            int l_kv_dim = m->layers[l].n_kv_heads * lhd;
             if (m->layers[l].is_swa) {
                 int cache_len = m->swa_window_size;
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, cache_len * kv_dim_swa, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, cache_len * kv_dim_swa, sizeof(float));
+                m->key_cache[l]   = (float *)tf_aligned_calloc(256, cache_len * l_kv_dim, sizeof(float));
+                m->value_cache[l] = (float *)tf_aligned_calloc(256, cache_len * l_kv_dim, sizeof(float));
             } else {
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim_full, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim_full, sizeof(float));
+                m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * l_kv_dim, sizeof(float));
+                m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * l_kv_dim, sizeof(float));
             }
             n_own++;
         }
@@ -2014,7 +2033,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             }
         }
         fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers\n", n_own, n_shared);
-        kv_dim = kv_dim_full > kv_dim_swa ? kv_dim_full : kv_dim_swa; /* for scratch sizing */
+        /* Scratch sizing: max per-layer KV dim across all layers (SWA & full-attn differ). */
+        for (int l = 0; l < m->n_layers; l++) {
+            int lhd = m->layers[l].is_swa ? m->head_dim_swa : m->head_dim_full;
+            int l_kv_dim = m->layers[l].n_kv_heads * lhd;
+            if (l_kv_dim > kv_dim) kv_dim = l_kv_dim;
+        }
     } else {
         for (int l = 0; l < m->n_layers; l++) {
             if (m->is_hybrid && m->layers[l].is_ssm) continue;
@@ -3478,7 +3502,11 @@ float *transformer_forward_logits(transformer_model *model, int32_t token_id, in
 }
 
 static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
-    if (m->n_threads > 1 && m->pool_alive)
+    /* Gemma4 is NOT handled by the persistent worker (it has no SWA / per-layer KV /
+     * proportional-RoPE / V-norm / softcap logic, and assumes a single global head_dim
+     * & KV-head count -- wrong for 12B's MQA full-attn + GQA SWA mix). Use the
+     * gemma4-aware block path; its matvecs still parallelize via tf_qmatvec_pool. */
+    if (m->n_threads > 1 && m->pool_alive && !m->is_gemma4)
         return tf_forward_persistent(m, position, pos_t, pos_h, pos_w);
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
@@ -3560,9 +3588,10 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         if (m->is_gemma4) {
             /* --- Gemma4 layer --- */
             int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
-            int local_kv_dim = n_kv_heads * hd;
+            int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : n_kv_heads;
+            int local_kv_dim = l_kvh * hd;
             int local_q_dim  = n_heads * hd;
-            int local_gqa    = n_heads / n_kv_heads;
+            int local_gqa    = n_heads / l_kvh;
             float eps = m->rms_norm_eps;
 
             /* Q projection (always present) */
@@ -3580,17 +3609,17 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
             /* K/V norm (only if we projected them) */
             if (layer->shared_kv_source < 0) {
-                tf_qk_norm(m->k, n_kv_heads, hd, &layer->attn_k_norm, eps, m->matvec_tmp);
+                tf_qk_norm(m->k, l_kvh, hd, &layer->attn_k_norm, eps, m->matvec_tmp);
                 /* Gemma4 SWA without attn_v: V = K (V is shared with K) */
                 if (!layer->has_v_proj) {
-                    memcpy(m->v, m->k, kv_dim * sizeof(float));
+                    memcpy(m->v, m->k, local_kv_dim * sizeof(float));
                 }
                 /* V norm — Gemma4 normalizes V too (raw RMSNorm, no weight) */
                 if (layer->attn_v_norm.data) {
-                    tf_qk_norm(m->v, n_kv_heads, hd, &layer->attn_v_norm, eps, m->matvec_tmp);
+                    tf_qk_norm(m->v, l_kvh, hd, &layer->attn_v_norm, eps, m->matvec_tmp);
                 } else {
                     /* V gets raw RMSNorm without learned weight */
-                    for (int h = 0; h < n_kv_heads; h++) {
+                    for (int h = 0; h < l_kvh; h++) {
                         float *vh = m->v + h * hd;
                         float ss = 0.0f;
                         for (int i = 0; i < hd; i++) ss += vh[i] * vh[i];
@@ -3617,7 +3646,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 }
                 /* Apply RoPE to K (only if we projected K) */
                 if (layer->shared_kv_source < 0) {
-                    for (int h = 0; h < n_kv_heads; h++) {
+                    for (int h = 0; h < l_kvh; h++) {
                         float *kh = m->k + h * hd;
                         for (int j = 0; j < half; j++) {
                             float freq = (float)position * inv_freq[j];
