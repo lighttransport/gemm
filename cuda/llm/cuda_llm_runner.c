@@ -9027,6 +9027,10 @@ struct cuda_llm_runner {
     CUfunction fn_dequant_q8_0_to_f16;
     CUfunction fn_dequant_q8_0_to_f16_h;
     CUfunction fn_dequant_q6_K_to_f16;
+    /* F32 dequant variants for opt-in exact prefill (CUDA_LLM_PREFILL_F32) */
+    CUfunction fn_dequant_q4_K_to_f32;
+    CUfunction fn_dequant_q4_0_to_f32;
+    CUfunction fn_dequant_q6_K_to_f32;
     CUfunction fn_moe_expert_fused_q4k;
     CUdeviceptr d_topk_idx;   /* [n_used * max_tokens] int */
     CUdeviceptr d_topk_wgt;   /* [n_used * max_tokens] float */
@@ -9164,6 +9168,7 @@ struct cuda_llm_runner {
     int swa_lin_max_tokens;  /* token capacity the d_swa_*_lin buffers were sized for */
     CUdeviceptr d_f16_scratch; /* [max_out * max_in] F16 dequant scratch for Q8_0 GEMM */
     CUdeviceptr d_f16_scratch2; /* second weight-dequant buffer for double-buffered overlap */
+    CUdeviceptr d_f32_scratch; /* F32 weight-dequant scratch for opt-in exact prefill */
     CUstream stream_dq;        /* weight dequant runs here, overlapping GEMM on the main stream */
     CUevent dq_evt[2];         /* dequant-done events (ping-pong) */
     CUevent gemm_evt[2];       /* gemm-done events guarding buffer reuse (ping-pong) */
@@ -9591,6 +9596,9 @@ lookup_funcs:
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16, "dequant_q8_0_to_f16");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q8_0_to_f16_h, "dequant_q8_0_to_f16_h");
                     CLLM_LOAD_OPT_FUNC(r->fn_dequant_q6_K_to_f16, "dequant_q6_K_to_f16");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_K_to_f32, "dequant_q4_K_to_f32");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q4_0_to_f32, "dequant_q4_0_to_f32");
+                    CLLM_LOAD_OPT_FUNC(r->fn_dequant_q6_K_to_f32, "dequant_q6_K_to_f32");
                     CLLM_LOAD_OPT_FUNC(r->fn_moe_expert_fused_q4k, "moe_expert_fused_q4k");
 #undef CLLM_LOAD_OPT_FUNC
                     r->d_grid_ksigns = 0; r->d_grid_iq2s = 0; r->d_grid_iq3 = 0;
@@ -14626,9 +14634,58 @@ static int launch_moe_expert_cublas(cuda_llm_runner *r, cuda_layer *cl,
  * of prefill and fits entirely under the ~66% spent in GEMM). Returns 0 on
  * success, -1 to fall back. The input F32->F16 convert stays on the main stream
  * (ordered with the GEMM that reads it). */
+/* Opt-in EXACT prefill GEMM (CUDA_LLM_PREFILL_F32): dequant weights to full F32,
+ * keep activations in F32 (no F32->F16 convert), and run a true-FP32 pedantic cuBLAS
+ * GEMM (CUBLAS_COMPUTE_32F_PEDANTIC, no TF32). This removes ALL F16 input rounding
+ * present in launch_dequant_gemm_f16, so it serves as a high-precision reference and
+ * an accuracy mode. Slower (2x weight traffic + no tensor cores). Covers the gemma4
+ * dense quant types (Q6_K/Q4_K/Q4_0/Q8_0); returns -1 to fall back to F16 otherwise
+ * (incl. weights > 256 MB F32, e.g. the lm_head). */
+static int launch_dequant_gemm_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                    CUdeviceptr input, int out_dim, int in_dim,
+                                    int n_tokens, int weight_type) {
+    if (!r->cublas) return -1;
+    CUfunction dq_fn; int dq_grid, dq_block; int nb;
+    if (weight_type == GGML_TYPE_Q6_K) {
+        if (!r->fn_dequant_q6_K_to_f32) return -1;
+        nb = in_dim / 256; dq_grid = (out_dim * nb + 3) / 4; dq_block = 256; dq_fn = r->fn_dequant_q6_K_to_f32;
+    } else if (weight_type == GGML_TYPE_Q4_K) {
+        if (!r->fn_dequant_q4_K_to_f32) return -1;
+        nb = in_dim / 256; dq_grid = (int)(((size_t)out_dim * nb + 127) / 128); dq_block = 128; dq_fn = r->fn_dequant_q4_K_to_f32;
+    } else if (weight_type == GGML_TYPE_Q4_0) {
+        if (!r->fn_dequant_q4_0_to_f32) return -1;
+        dq_block = 256; dq_grid = (int)(((size_t)out_dim * in_dim + 255) / 256); dq_fn = r->fn_dequant_q4_0_to_f32;
+    } else if (weight_type == GGML_TYPE_Q8_0) {
+        /* dequant_q8_0_to_f16 already outputs F32; launched 32 threads/block. */
+        if (!r->fn_dequant_q8_0_to_f16) return -1;
+        nb = in_dim / 32; dq_block = 32; dq_grid = (int)(((size_t)out_dim * nb + 31) / 32); dq_fn = r->fn_dequant_q8_0_to_f16;
+    } else return -1;
+
+    size_t w_f32_bytes = (size_t)out_dim * in_dim * sizeof(float);
+    if (w_f32_bytes > 256*1024*1024) return -1;
+    if (!r->d_f32_scratch) {
+        if (cuMemAlloc(&r->d_f32_scratch, 256*1024*1024) != CUDA_SUCCESS) return -1;
+    }
+    CUdeviceptr wbuf = r->d_f32_scratch;
+    void *dq[] = { &wbuf, &mat, &out_dim, &in_dim };
+    if (cuLaunchKernel(dq_fn, dq_grid, 1, 1, dq_block, 1, 1, 0, r->stream, dq, NULL) != CUDA_SUCCESS)
+        return -1;
+    /* Activations stay F32 (input); true-FP32 pedantic GEMM. */
+    int ret = cublasew_gemm_f32_pedantic_rowmajor_nt(r->cublas, dst, wbuf, input,
+                                                     n_tokens, out_dim, in_dim);
+    return ret != 0 ? -1 : 0;
+}
+
 static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                     CUdeviceptr input, int out_dim, int in_dim,
                                     int n_tokens, int weight_type) {
+    /* Opt-in EXACT prefill: redirect every dequant->GEMM caller to the full-F32
+     * pedantic path. Falls through to F16 if F32 is unavailable for this type/size. */
+    static int prefill_f32 = -1;
+    if (prefill_f32 < 0) prefill_f32 = getenv("CUDA_LLM_PREFILL_F32") ? 1 : 0;
+    if (prefill_f32 &&
+        launch_dequant_gemm_f32(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+        return 0;
     if (!r->cublas || !r->d_batch_f16_scratch || !r->fn_convert_f32_to_f16) return -1;
     CUfunction dq_fn; int dq_grid, dq_block;
     int nb;
@@ -17713,6 +17770,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
         if (r->gemm_evt[i]) cuEventDestroy(r->gemm_evt[i]);
     }
     if (r->d_f16_scratch) cuMemFree(r->d_f16_scratch);
+    if (r->d_f32_scratch) cuMemFree(r->d_f32_scratch);
 
     /* Free modules */
     if (r->module) cuModuleUnload(r->module);
