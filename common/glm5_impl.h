@@ -63,6 +63,47 @@ static inline float    glm5_h2f(uint16_t u){ __fp16 h; memcpy(&h,&u,2); return (
 static inline uint16_t glm5_kv_enc(const glm5_model*m,float f){ return m->kv_fp16 ? glm5_f2h(f) : glm5_f2bf(f); }
 static inline float    glm5_kv_dec(const glm5_model*m,uint16_t u){ return m->kv_fp16 ? glm5_h2f(u) : glm5_bf2f(u); }
 
+static inline float glm5_dot_f32_opt(const float*a,const float*b,int n,int use_sve){
+#if defined(__ARM_FEATURE_SVE)
+    if(use_sve){
+        svfloat32_t acc=svdup_f32(0.0f);
+        int vl=(int)svcntw();
+        for(int i=0;i<n;i+=vl){
+            svbool_t pg=svwhilelt_b32(i,n);
+            acc=svmla_f32_x(pg,acc,svld1(pg,a+i),svld1(pg,b+i));
+        }
+        return svaddv_f32(svptrue_b32(),acc);
+    }
+#else
+    (void)use_sve;
+#endif
+    double d=0.0; for(int i=0;i<n;i++) d+=(double)a[i]*b[i]; return (float)d;
+}
+static inline void glm5_scale_f32(float*x,float s,int n){
+#if defined(__ARM_FEATURE_SVE)
+    int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svst1(pg,x+i,svmul_n_f32_x(pg,svld1(pg,x+i),s));
+    }
+#else
+    for(int i=0;i<n;i++) x[i]*=s;
+#endif
+}
+static inline void glm5_axpy_f32(float*y,const float*x,float a,int n){
+#if defined(__ARM_FEATURE_SVE)
+    int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svfloat32_t yv=svld1(pg,y+i);
+        yv=svmla_n_f32_x(pg,yv,svld1(pg,x+i),a);
+        svst1(pg,y+i,yv);
+    }
+#else
+    for(int i=0;i<n;i++) y[i]+=a*x[i];
+#endif
+}
+
 /* ===================== int4-KV codec (GLM5_INT4_KV, for 1M context) =====================
  * Per group of n (== head_dim) values: signed int4 (+/-7), scale = absmax/7 stored bf16.
  * ~3.9x smaller than bf16 (n/2 bytes + 1 bf16 scale vs 2n bytes). Used for the k/v/idx
@@ -882,6 +923,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
         float hmx[64], hse[64];
         const int kvb_stride=c->qk_nope_dim+c->v_head_dim;
         int absorb=glm5_envi("GLM5_ABSORB_ATTN",1) && nsel>=glm5_envi("GLM5_ABSORB_MINSEL",32);
+        int absorb_sve_dot=glm5_envi("GLM5_ABSORB_SVE_DOT",1);
         if(absorb){
             for(int hh=0;hh<nown;hh++){
                 hmx[hh]=-1e30f; hse[hh]=0.0f;
@@ -898,20 +940,19 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
                 for(int hh=0;hh<nown;hh++){
                     const float*qh=q+hh*c->qk_head_dim;
                     const float*qa=m->s_qabs+(size_t)hh*c->kv_lora;
-                    double d=0;
-                    for(int i=0;i<c->kv_lora;i++) d+=(double)qa[i]*kv[i];
+                    double d=(double)glm5_dot_f32_opt(qa,kv,c->kv_lora,absorb_sve_dot);
                     for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
                     float s=(float)d*ascale;
                     float*ctx=m->s_ctx+(size_t)hh*c->kv_lora;
                     if(s>hmx[hh]){
                         float r=(hmx[hh]>-1e20f)?expf(hmx[hh]-s):0.0f;
                         hse[hh]*=r;
-                        for(int i=0;i<c->kv_lora;i++) ctx[i]*=r;
+                        glm5_scale_f32(ctx,r,c->kv_lora);
                         hmx[hh]=s;
                     }
                     float e=expf(s-hmx[hh]);
                     hse[hh]+=e;
-                    for(int i=0;i<c->kv_lora;i++) ctx[i]+=e*kv[i];
+                    glm5_axpy_f32(ctx,kv,e,c->kv_lora);
                 }
             }
             for(int hh=0;hh<nown;hh++){
@@ -1414,6 +1455,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
         /* Absorbed MLA attention. Scores use (W_nope^T q_nope) dot kv_lora plus
          * q_rope dot k_rope. Values accumulate a weighted latent context and apply
          * the per-head value rows of wkv_b once, instead of expanding wkv_b per key. */
+        int absorb_sve_dot=glm5_envi("GLM5_ABSORB_SVE_DOT",1);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
@@ -1432,22 +1474,24 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             }
             for(int hh=0;hh<nown;hh++){ float*ctx=ctxb+(size_t)hh*c->kv_lora; for(int i=0;i<c->kv_lora;i++) ctx[i]=0.0f; }
             for(int j=0;j<ns;j++){
-                glm5_load_latent_kv(m,L,sel[j],ms->v+(size_t)t*KVC,KVC);
+                float*kv=ms->v+(size_t)t*KVC;
+                glm5_load_latent_kv(m,L,sel[j],kv,KVC);
                 for(int hh=0;hh<nown;hh++){
                     const float*qh=qb+hh*c->qk_head_dim;
                     const float*qa=qabs+(size_t)hh*c->kv_lora;
-                    double d=0.0;
-                    for(int i=0;i<c->kv_lora;i++) d+=(double)qa[i]*ms->v[(size_t)t*KVC+i];
-                    for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*ms->v[(size_t)t*KVC+c->kv_lora+i];
-                    float s=(float)d*ascale; sc[(size_t)hh*ms->maxsel+j]=s; if(s>hmx[hh]) hmx[hh]=s;
-                }
-            }
-            for(int j=0;j<ns;j++){
-                glm5_load_latent_kv(m,L,sel[j],ms->v+(size_t)t*KVC,KVC);
-                for(int hh=0;hh<nown;hh++){
-                    float e=expf(sc[(size_t)hh*ms->maxsel+j]-hmx[hh]); hse[hh]+=e;
+                    double d=(double)glm5_dot_f32_opt(qa,kv,c->kv_lora,absorb_sve_dot);
+                    for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
+                    float s=(float)d*ascale;
                     float*ctx=ctxb+(size_t)hh*c->kv_lora;
-                    for(int i=0;i<c->kv_lora;i++) ctx[i]+=e*ms->v[(size_t)t*KVC+i];
+                    if(s>hmx[hh]){
+                        float r=(hmx[hh]>-1e20f)?expf(hmx[hh]-s):0.0f;
+                        hse[hh]*=r;
+                        glm5_scale_f32(ctx,r,c->kv_lora);
+                        hmx[hh]=s;
+                    }
+                    float e=expf(s-hmx[hh]);
+                    hse[hh]+=e;
+                    glm5_axpy_f32(ctx,kv,e,c->kv_lora);
                 }
             }
             for(int hh=0;hh<nown;hh++){
