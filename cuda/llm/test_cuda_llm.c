@@ -333,6 +333,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n=== Skipping decode path for large-batch prefill benchmark ===\n");
     }
 
+    /* Take the sequential reference as a true F32 oracle: turn OFF the INT8 dp4a
+     * matvec path and dense MMQ. The batched prefill is F16, so vs an F32 oracle
+     * it is ~3e-3 (pure F16 precision) and a tight 1e-2 tolerance catches real
+     * batched-dataflow bugs (rope/attention/norm/kv/dequant-GEMM). Comparing
+     * against the dp4a/MMQ int8 path instead inflated rel_L2 to ~0.2-0.7 (int8
+     * activation-quant divergence — argmax-preserving, NOT a batched bug; it was
+     * largest for Q8_0-weight models like the 12B Q6_K, ~0.70). The MMQ int8
+     * kernels are validated separately (cuda/llm/mmq/*_test + the top-5 check). */
+    int saved_dp4a = 0;
+    if (!large_bench) {
+        saved_dp4a = cuda_llm_set_dp4a(gpu, 0);
+        setenv("CUDA_LLM_NO_MMQ_DENSE", "1", 1);
+    }
+
     /* Get logits from sequential forward_logits (skip for large bench) */
     if (!large_bench) {
     if (cuda_llm_reset_state(gpu) != 0) {
@@ -416,7 +430,7 @@ int main(int argc, char **argv) {
     double prefill_ms = get_time_ms() - t0;
     if (prefill_hidden) {
         float err = rel_l2_error(prefill_hidden, last_gpu_hidden, n_embd);
-        float ptol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
+        float ptol = 1e-2f;  /* reference is F32 oracle (dp4a+MMQ off); batched is F16 */
         fprintf(stderr, "Prefill hidden: %.1f ms (%.1f tok/s) rel_L2_vs_seq=%.6f\n",
                 prefill_ms, prefill_ms > 0 ? (1000.0 * prefill_token_count / prefill_ms) : 0.0, err);
         if (!isfinite(err) || err >= ptol) pass = 0;
@@ -436,7 +450,7 @@ int main(int argc, char **argv) {
     if (prefill_logits) {
         if (have_seq_logits && last_seq_logits && n_vocab_size > 0) {
             float logit_err = rel_l2_error(prefill_logits, last_seq_logits, n_vocab_size);
-            float ptol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
+            float ptol = 1e-2f;  /* reference is F32 oracle (dp4a+MMQ off); batched is F16 */
             fprintf(stderr, "Prefill logits rel_L2_vs_seq=%.6f\n", logit_err);
             if (!isfinite(logit_err) || logit_err >= ptol) pass = 0;
         }
@@ -479,6 +493,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Prefill logits failed\n");
         pass = 0;
     }
+    /* Restore the production paths for the decode/perf benchmark below. */
+    unsetenv("CUDA_LLM_NO_MMQ_DENSE");
+    cuda_llm_set_dp4a(gpu, saved_dp4a);
     } /* end !large_bench */
 
     /* Large batch prefill benchmark (synthetic tokens, no correctness) */

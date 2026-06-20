@@ -17771,3 +17771,15 @@ int cuda_llm_n_layers(const cuda_llm_runner *r) { return r ? r->n_layers : 0; }
 int cuda_llm_n_vocab(const cuda_llm_runner *r) { return r ? r->n_vocab : 0; }
 int cuda_llm_max_seq_len(const cuda_llm_runner *r) { return r ? r->max_seq_len : 0; }
 int cuda_llm_uses_dp4a(const cuda_llm_runner *r) { return r ? r->use_dp4a : 0; }
+
+/* Toggle the INT8 dp4a matvec path at runtime. Returns the previous setting.
+ * Used by the test harness to take an F32 sequential reference (dp4a off) for a
+ * meaningful batched-prefill comparison: batched is F16, so vs an F32 oracle it
+ * is ~3e-3 (pure F16 precision); vs the dp4a path it is ~0.2-0.7 (int8 activation
+ * quant divergence, NOT a batched bug). No effect if dp4a was never enabled. */
+int cuda_llm_set_dp4a(cuda_llm_runner *r, int enable) {
+    if (!r) return 0;
+    int prev = r->use_dp4a;
+    r->use_dp4a = enable ? 1 : 0;
+    return prev;
+}

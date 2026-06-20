@@ -105,6 +105,8 @@ int cuda_llm_n_layers(const cuda_llm_runner *r);
 int cuda_llm_n_vocab(const cuda_llm_runner *r);
 int cuda_llm_max_seq_len(const cuda_llm_runner *r);
 int cuda_llm_uses_dp4a(const cuda_llm_runner *r);
+/* Toggle the INT8 dp4a matvec path at runtime; returns the previous setting. */
+int cuda_llm_set_dp4a(cuda_llm_runner *r, int enable);
 
 /* GPU Vision Encoder: run Gemma4 ViT on GPU using runner's CUDA context.
  * mmproj_gguf: opened mmproj GGUF (must stay open during encode).
