@@ -516,11 +516,13 @@ int main(void){
     const char*gen_out=getenv("GLM5_GEN_OUT");
     if(prompt_file&&*prompt_file){
         int max_new=envi("GLM5_MAX_NEW",64);
+        int min_new=envi("GLM5_MIN_NEW",0);
         FILE*pf=fopen(prompt_file,"r"); if(!pf) die("cannot open GLM5_PROMPT_IDS",-1);
         int cap=1024,n_prompt=0,*prompt=glm5_amalloc((size_t)cap*sizeof(int)),v;
         while(fscanf(pf,"%d",&v)==1){ if(n_prompt>=cap){cap*=2;prompt=realloc(prompt,(size_t)cap*sizeof(int));} prompt[n_prompt++]=v; }
         fclose(pf); if(n_prompt<1) die("empty prompt",-1);
         if(n_prompt+max_new>cfg.max_pos) max_new=cfg.max_pos-n_prompt;
+        if(min_new<0) min_new=0; if(min_new>max_new) min_new=max_new;
         if(MyRank==0) logmsg("gen: prompt=%d tok, max_new=%d, max_pos=%d\n",n_prompt,max_new,cfg.max_pos);
         int pf_last=-1; double t0=now_sec();
         double prof_gen0[GLM5_NPHASE], prof_gen_pf[GLM5_NPHASE], prof_gen_dec[GLM5_NPHASE];
@@ -554,7 +556,7 @@ int main(void){
         int *gen=glm5_amalloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
         g_ar_secs=0; g_ar_calls=0;
         double td0=now_sec();
-        for(int g=0;g<max_new;g++){ gen[ng++]=cur; if(cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) break;
+        for(int g=0;g<max_new;g++){ gen[ng++]=cur; if((cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) && ng>=min_new) break;
             embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
             for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
         double td=now_sec()-td0;
