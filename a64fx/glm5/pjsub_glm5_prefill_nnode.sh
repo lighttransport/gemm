@@ -5,6 +5,7 @@
 #     --mpi "proc=240" --no-check-directory a64fx/glm5/pjsub_glm5_prefill_nnode.sh
 
 #PJM -j
+#PJM -x PJM_LLIO_GFSCACHE=/vol0004
 set -u
 
 REPO=/home/u14346/work/gemm/glm5-1
@@ -44,7 +45,7 @@ echo "workdir=$WORK chunks=[$PCHUNKS] threads=[$THREADS] cp=$GLM5_CP msa=$GLM5_M
 date
 
 "$GLM5/check_glm5_model.sh" "$GLM5_MODEL_DIR" --tokenizer || exit 2
-make -C "$UTOFU" tofu_topo_helper >/dev/null || exit 3
+make -C "$UTOFU" tofu_topo_helper MPICC=/opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifccpx >/dev/null || exit 3
 make -C "$LLM" glm5_stage glm5_ep_runner CC=fcc OPENMP=1 >/dev/null || exit 3
 
 topo_ok=0
@@ -58,6 +59,12 @@ for t in 1 2 3 4 5; do
     sleep 3
 done
 [ "$topo_ok" = 1 ] || { echo "FATAL: topo helper failed"; exit 3; }
+echo "topo OK ($(grep -vc '^#' tofu_topo.txt 2>/dev/null || echo 0) ranks)"
+if [ "${GLM5_TOPO_ONLY:-0}" = 1 ]; then
+    sed -n '1,40p' tofu_topo.txt
+    echo "=== prefill${NP} topo-only done $(date) ==="
+    exit 0
+fi
 
 echo "--- staging ($(date)) ---"
 GLM5_STAGE_LAYERS=$STAGE_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_stage" || { echo "FATAL: stage"; exit 4; }

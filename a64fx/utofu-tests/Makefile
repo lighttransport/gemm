@@ -16,7 +16,7 @@ MPICC     = mpiclang
 MPICFLAGS = -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall
 TOFU      = -ltofucom
 
-all: tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth
+all: tofu_topo_helper tofu_put_demo utofu_init_probe ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth
 
 # helper uses MPI + uTofu
 tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
@@ -24,6 +24,10 @@ tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
 
 # pure uTofu app: NO MPI
 tofu_put_demo: tofu_put_demo.c tofu_demo.h
+	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
+
+# pure uTofu init probe: NO MPI, logs each rank to UTOFU_PROBE_DIR
+utofu_init_probe: utofu_init_probe.c tofu_demo.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
 
 # pure uTofu ring-attention decode cost benchmark: NO MPI, OpenMP for mem stream
@@ -80,6 +84,6 @@ ring_attn_async: ring_attn_async.c tofu_demo.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(TOFU) -lhwb
 
 clean:
-	rm -f tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth tofu_topo.txt
+	rm -f tofu_topo_helper tofu_put_demo utofu_init_probe ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth tofu_topo.txt
 
 .PHONY: all clean
