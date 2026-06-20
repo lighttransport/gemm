@@ -14006,6 +14006,9 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
     if (weight_type == GGML_TYPE_Q6_K) {
         if (!r->fn_dequant_q6_K_to_f16) return -1;
         nb = in_dim / 256; dq_grid = (out_dim * nb + 3) / 4; dq_block = 256; dq_fn = r->fn_dequant_q6_K_to_f16;
+    } else if (weight_type == GGML_TYPE_Q4_K) {
+        if (!r->fn_dequant_q4_K_to_f16) return -1;
+        nb = in_dim / 256; dq_grid = (int)(((size_t)out_dim * nb + 127) / 128); dq_block = 128; dq_fn = r->fn_dequant_q4_K_to_f16;
     } else if (weight_type == GGML_TYPE_Q8_0) {
         if (!r->fn_dequant_q8_0_to_f16_h) return -1;
         nb = in_dim / 32; dq_grid = (out_dim * nb + 7) / 8; dq_block = 256; dq_fn = r->fn_dequant_q8_0_to_f16_h;
@@ -14515,29 +14518,16 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
                                input + (size_t)t * in_dim * sizeof(float), out_dim, in_dim);
         }
     } else if (weight_type == GGML_TYPE_Q4_K) {
-        /* Dequant + cuBLAS F16 GEMM for batched mode (read weights once) */
-        if (n_tokens > 1 && r->fn_dequant_q4_K_to_f16 && r->cublas) {
-            size_t f16_bytes = (size_t)out_dim * in_dim * sizeof(uint16_t);
-            CUdeviceptr d_f16 = 0;
-            CUresult err = cuMemAlloc(&d_f16, f16_bytes);
-            if (err == CUDA_SUCCESS) {
-                int nb = in_dim / 256;
-                int total_blocks = out_dim * nb;
-                int dequant_grid = (total_blocks + 127) / 128;
-                void *args[] = { &d_f16, &mat, &out_dim, &in_dim };
-                cuLaunchKernel(r->fn_dequant_q4_K_to_f16, dequant_grid, 1, 1, 128, 1, 1, 0, r->stream, args, NULL);
-                int gemm_ret = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, d_f16, input,
-                                                                      n_tokens, out_dim, in_dim);
-                if (r->verbose >= 1 && gemm_ret != 0)
-                    fprintf(stderr, "cuda_llm: cuBLAS GEMM Q4_K failed (%d, n_tok=%d, out=%d, in=%d)\n",
-                            gemm_ret, n_tokens, out_dim, in_dim);
-                cuMemFree(d_f16);
-                if (gemm_ret == 0) return;
-            } else {
-                void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-                cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, (n_tokens+3)/4, 1, 256, 1, 1, 0, r->stream, a, NULL);
-            }
-        } else if (n_tokens > 1 && r->fn_batch_matvec_q4_K_x4) {
+        /* Dequant + cuBLAS F16 GEMM via the shared helper (reuses the 256 MB
+         * pre-allocated d_f16_scratch + double-buffered overlap) — same fast path
+         * used by Q6_K/Q4_0. Replaces the old per-call cuMemAlloc/cuMemFree which
+         * allocated 113 MB per FFN gate/up call and was the FFN bottleneck. */
+        if (n_tokens > 1) {
+            if (launch_dequant_gemm_f16(r, dst, mat, input, out_dim, in_dim, n_tokens, weight_type) == 0)
+                return;
+        }
+        /* Fallback (n_tokens==1, oversized lm_head, or no cuBLAS): x4 chunked batch kernel. */
+        if (n_tokens > 1 && r->fn_batch_matvec_q4_K_x4) {
             int n_groups = (n_tokens + 3) / 4;
             void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
             cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, n_groups, 1, 256, 1, 1, 0, r->stream, a, NULL);

@@ -532,8 +532,9 @@ extern "C" __global__ void moe_prefill_q4k(
 /*
  * dequant_q4_K_to_f16: Convert Q4_K quantized weights to FP16.
  * grid = (rows * blocks_per_row + 127) / 128, block = 128.
- * Each thread processes 2 consecutive 256-element Q4_K blocks,
- * producing 2 × 256 = 512 FP16 values.
+ * Each thread processes 1 super-block (256 elements) and uses F16x2
+ * vectorized stores to write 2 F16 outputs per 32-bit store, cutting
+ * store count and instructions roughly in half vs per-F16 stores.
  */
 extern "C" __global__ void dequant_q4_K_to_f16(
     half *out,                 // [rows * cols] FP16 output
@@ -549,7 +550,7 @@ extern "C" __global__ void dequant_q4_K_to_f16(
     int bk = bid % nb;
 
     const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 144;
-    half *out_blk = out + (size_t)row * cols + (size_t)bk * 256;
+    half2 *out_blk2 = (half2 *)(out + (size_t)row * cols + (size_t)bk * 256);
 
     float d = __half2float(*(const __half *)bp);
     float dmin = __half2float(*(const __half *)(bp + 2));
@@ -570,10 +571,20 @@ extern "C" __global__ void dequant_q4_K_to_f16(
         }
         float d1 = d * sv0f, m1 = dmin * mv0f;
         float d2 = d * sv1f, m2 = dmin * mv1f;
+        __half2 d1_2 = __float2half2_rn(d1);
+        __half2 d2_2 = __float2half2_rn(d2);
+        __half2 m1_2 = __float2half2_rn(m1);
+        __half2 m2_2 = __float2half2_rn(m2);
         const unsigned char *q = qs + j * 32;
-        for (int l = 0; l < 32; l++) {
-            out_blk[j*64 + l]       = __float2half(d1 * (q[l] & 0xF) - m1);
-            out_blk[j*64 + 32 + l]  = __float2half(d2 * (q[l] >> 4) - m2);
+        #pragma unroll
+        for (int l = 0; l < 32; l += 2) {
+            unsigned char q0 = q[l], q1 = q[l+1];
+            __half2 v0 = __floats2half2_rn((float)(q0 & 0xF), (float)(q1 & 0xF));
+            __half2 v1 = __floats2half2_rn((float)(q0 >> 4),  (float)(q1 >> 4));
+            v0 = __hsub2(__hmul2(d1_2, v0), m1_2);
+            v1 = __hsub2(__hmul2(d2_2, v1), m2_2);
+            out_blk2[j*32 + (l >> 1)]     = v0;
+            out_blk2[j*32 + 16 + (l >> 1)] = v1;
         }
     }
 }
