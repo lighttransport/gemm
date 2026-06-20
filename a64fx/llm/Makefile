@@ -111,7 +111,7 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
                $(LLM_DIR)../utofu-tests/tp_allreduce.h $(LLM_DIR)../utofu-tests/tofu_demo.h
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw m3_ep_runner glm5_ep_runner glm5_stage glm5_real_test
+.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw m3_ep_runner glm5_ep_runner glm5_stage glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
@@ -185,6 +185,9 @@ $(BUILD)/glm5_stage: $(COMMON)/glm5_stage.c $(COMMON)/safetensors.h | $(BUILD)
 glm5_real_test: $(BUILD)/glm5_real_test
 $(BUILD)/glm5_real_test: $(LLM_DIR)../glm5/glm5_real_test.c $(GLM5_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)../glm5/glm5_real_test.c $(LDFLAGS)
+glm5_fp8_kernel_test: $(LLM_DIR)../glm5/glm5_fp8_kernel_test
+$(LLM_DIR)../glm5/glm5_fp8_kernel_test: $(LLM_DIR)../glm5/glm5_fp8_kernel_test.c $(GLM5_HDRS)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)../glm5/glm5_fp8_kernel_test.c $(LDFLAGS)
 
 # DeepSeek-V4-Flash single-node decode-bandwidth bench (no MPI, no vlm objs, no
 # model alloc). Reproduces the M=1 cold-HBM decode regime through the production

@@ -244,7 +244,54 @@ static void glm5_mv_bf16(float*restrict y,const uint16_t*W,const float*x,int row
     for(int r=nb*8;r<rows;r++) y[r]=vec_dot_bf16_f32(W+(size_t)r*cols,x,cols);
 }
 
-/* GLM5.2 FP8 matvec: F8_E4M3 weights with F32 scale_inv per 128x128 block. */
+static inline float glm5_dot_mxfp8_f32scale_row(const uint8_t*w,const float*s,const float*x,int cols,const uint32_t*lut){
+    double a=0;
+    for(int b=0;b<cols;b+=128){
+        float sc=s[b/128];
+        int e=b+128<cols?b+128:cols;
+        for(int c=b;c<e;c++){ float wf; uint32_t u=lut[w[c]]; memcpy(&wf,&u,4); a+=(double)wf*sc*x[c]; }
+    }
+    return (float)a;
+}
+
+#if defined(__ARM_FEATURE_SVE)
+static inline void glm5_matvec_mxfp8_f32scale_8row(float*restrict dst,
+        const uint8_t*w0,const uint8_t*w1,const uint8_t*w2,const uint8_t*w3,
+        const uint8_t*w4,const uint8_t*w5,const uint8_t*w6,const uint8_t*w7,
+        const float*s0,const float*s1,const float*s2,const float*s3,
+        const float*s4,const float*s5,const float*s6,const float*s7,
+        const float*x,int cols,const uint32_t*lut){
+    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f);
+    svfloat32_t a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
+    int vl=(int)svcntw();
+    #define GLM5_FP8_F32S_ROW(WP,SC,ACC) do{ \
+        svuint32_t idx=svld1ub_u32(pg,&(WP)[c]); \
+        svfloat32_t wv=svreinterpret_f32_u32(svld1_gather_u32index_u32(pg,lut,idx)); \
+        ACC=svmla_x(pg,ACC,wv,svmul_n_f32_x(pg,xv,(SC))); \
+    }while(0)
+    for(int b=0;b<cols;b+=128){
+        int bend=b+128<cols?b+128:cols, blk=b/128;
+        float c0=s0[blk],c1=s1[blk],c2=s2[blk],c3=s3[blk];
+        float c4=s4[blk],c5=s5[blk],c6=s6[blk],c7=s7[blk];
+        for(int c=b;c<bend;c+=vl){
+            svbool_t pg=svwhilelt_b32(c,bend);
+            svfloat32_t xv=svld1(pg,&x[c]);
+            GLM5_FP8_F32S_ROW(w0,c0,a0); GLM5_FP8_F32S_ROW(w1,c1,a1);
+            GLM5_FP8_F32S_ROW(w2,c2,a2); GLM5_FP8_F32S_ROW(w3,c3,a3);
+            GLM5_FP8_F32S_ROW(w4,c4,a4); GLM5_FP8_F32S_ROW(w5,c5,a5);
+            GLM5_FP8_F32S_ROW(w6,c6,a6); GLM5_FP8_F32S_ROW(w7,c7,a7);
+        }
+    }
+    #undef GLM5_FP8_F32S_ROW
+    svbool_t pt=svptrue_b32();
+    dst[0]=svaddv_f32(pt,a0); dst[1]=svaddv_f32(pt,a1); dst[2]=svaddv_f32(pt,a2); dst[3]=svaddv_f32(pt,a3);
+    dst[4]=svaddv_f32(pt,a4); dst[5]=svaddv_f32(pt,a5); dst[6]=svaddv_f32(pt,a6); dst[7]=svaddv_f32(pt,a7);
+}
+#endif
+
+/* GLM5.2 FP8 matvec: F8_E4M3 weights with F32 scale_inv per 128x128 block.
+ * The loader expands each block-row scale to one local row, so the kernel can
+ * group eight output rows while preserving arbitrary TP row shards. */
 static void glm5_mv_mxfp8(glm5_model*m, float*restrict y, const uint8_t*W, const uint8_t*S, const float*x, int rows, int cols){
     const uint32_t*lut=m->fp8_lut; const float*Sc=(const float*)S; int sb=(cols+127)/128;
     if(glm5_dummy){ double acc=0;
@@ -253,20 +300,38 @@ static void glm5_mv_mxfp8(glm5_model*m, float*restrict y, const uint8_t*W, const
 #endif
         for(int r=0;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=64) s+=w[i]; acc+=s; }
         float v=(float)(((long)acc)&1)*1e-30f; for(int r=0;r<rows;r++) y[r]=v; return; }
+#if defined(__ARM_FEATURE_SVE)
+    static int use_8row=-1;
+    if(use_8row<0) use_8row=glm5_envi("GLM5_FP8_8ROW",1);
+    if(use_8row){
+        int nb=rows/8;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
+#endif
+        for(int bi=0;bi<nb;bi++){
+            int r=bi*8;
+            const uint8_t*w=W+(size_t)r*cols;
+            const float*s=Sc+(size_t)r*sb;
+            glm5_matvec_mxfp8_f32scale_8row(y+r,
+                w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,
+                w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
+                s,s+sb,s+2*(size_t)sb,s+3*(size_t)sb,
+                s+4*(size_t)sb,s+5*(size_t)sb,s+6*(size_t)sb,s+7*(size_t)sb,
+                x,cols,lut);
+        }
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(rows-nb*8>=GLM5_PAR_MIN)
+#endif
+        for(int r=nb*8;r<rows;r++)
+            y[r]=glm5_dot_mxfp8_f32scale_row(W+(size_t)r*cols,Sc+(size_t)r*sb,x,cols,lut);
+        return;
+    }
+#endif
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
 #endif
-    for(int r=0;r<rows;r++){
-        const uint8_t*w=W+(size_t)r*cols;
-        const float*s=Sc+(size_t)r*sb;
-        double a=0;
-        for(int b=0;b<cols;b+=128){
-            float sc=s[b/128];
-            int e=b+128<cols?b+128:cols;
-            for(int c=b;c<e;c++){ float wf; uint32_t u=lut[w[c]]; memcpy(&wf,&u,4); a+=(double)wf*sc*x[c]; }
-        }
-        y[r]=(float)a;
-    }
+    for(int r=0;r<rows;r++)
+        y[r]=glm5_dot_mxfp8_f32scale_row(W+(size_t)r*cols,Sc+(size_t)r*sb,x,cols,lut);
 }
 /* matvec dispatch by weight type (bf16 or MXFP8) */
 static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const float*x, int rows, int cols){
