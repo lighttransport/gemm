@@ -400,7 +400,7 @@ static void glm5_free(glm5_model*m){
     }
     glm5_afree(m->layers);
     if(m->owns_weights){ glm5_afree(m->embed);glm5_afree(m->head.w);glm5_afree(m->out_norm);glm5_afree(m->rope_cos);glm5_afree(m->rope_sin); }
-    glm5_afree(m->s_norm);glm5_afree(m->s_q);glm5_afree(m->s_k);glm5_afree(m->s_v);glm5_afree(m->s_kvb);glm5_afree(m->s_attn);glm5_afree(m->s_o);
+    glm5_afree(m->s_norm);glm5_afree(m->s_q);glm5_afree(m->s_k);glm5_afree(m->s_v);glm5_afree(m->s_kvb);glm5_afree(m->s_qabs);glm5_afree(m->s_ctx);glm5_afree(m->s_attn);glm5_afree(m->s_o);
     glm5_afree(m->s_idx_q);glm5_afree(m->s_idx_k);glm5_afree(m->s_blk_score);glm5_afree(m->s_blk_sel);glm5_afree(m->s_attn_score);
     glm5_afree(m->s_router);glm5_afree(m->s_shg);glm5_afree(m->s_shu);glm5_afree(m->s_sh);glm5_afree(m->s_moe);
     glm5_afree(m->s_exg);glm5_afree(m->s_exu);glm5_afree(m->s_route);glm5_afree(m->s_ff_g);glm5_afree(m->s_ff_u);glm5_afree(m->s_ff);glm5_afree(m->s_logits);
@@ -442,6 +442,8 @@ static void glm5_alloc_scratch(glm5_model*m,int hrows){
     }
     m->s_norm=glm5_amalloc(H*4); m->s_q=glm5_amalloc(QD*4); m->s_k=glm5_amalloc(KVC*4); m->s_v=glm5_amalloc(AD*4);
     m->s_kvb=glm5_amalloc((size_t)local_heads*(cfg->qk_nope_dim+cfg->v_head_dim)*4);
+    m->s_qabs=glm5_amalloc((size_t)local_heads*cfg->kv_lora*4);
+    m->s_ctx=glm5_amalloc((size_t)local_heads*cfg->kv_lora*4);
     m->s_attn=glm5_amalloc(AD*4); m->s_o=glm5_amalloc(H*4);
     m->s_idx_q=glm5_amalloc((size_t)IQD*4); m->s_idx_k=glm5_amalloc((size_t)ID*4);
     m->s_blk_score=glm5_amalloc((size_t)cfg->max_pos*4); m->s_blk_sel=glm5_amalloc((size_t)cfg->max_pos*sizeof(int));
@@ -824,6 +826,9 @@ static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*
     return nsel;
 }
 
+static glm5_tensor glm5_tensor_rows(const glm5_tensor*t,int r0,int rows);
+static void glm5_tensor_tmul_rows(const glm5_model*m,float*y,const glm5_tensor*t,int r0,int rows,const float*x);
+
 /* ===================== forward (one token at position pos) ===================== */
 static int glm5_forward_token(glm5_model*m,float*x,int pos){
     const glm5_config*c=&m->cfg;
@@ -876,35 +881,75 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
         pt=glm5_prof_now();
         float hmx[64], hse[64];
         const int kvb_stride=c->qk_nope_dim+c->v_head_dim;
-        const int kvb_rows=nown*kvb_stride;
-        for(int hh=0;hh<nown;hh++){
-            hmx[hh]=-1e30f; hse[hh]=0.0f;
-            float*oh=attn+hh*c->v_head_dim;
-            for(int i=0;i<c->v_head_dim;i++) oh[i]=0.0f;
-        }
-        for(int j=0;j<nsel;j++){
-            glm5_load_latent_kv(m,L,selp[j],kv,KVC);
-            glm5_mv(m,kvb,&L->wkv_b,kv,kvb_rows,c->kv_lora);
+        int absorb=glm5_envi("GLM5_ABSORB_ATTN",1) && nsel>=glm5_envi("GLM5_ABSORB_MINSEL",32);
+        if(absorb){
             for(int hh=0;hh<nown;hh++){
+                hmx[hh]=-1e30f; hse[hh]=0.0f;
+                float*qa=m->s_qabs+(size_t)hh*c->kv_lora;
+                float*ctx=m->s_ctx+(size_t)hh*c->kv_lora;
                 const float*qh=q+hh*c->qk_head_dim;
-                const float*kn=kvb+hh*kvb_stride;
-                double d=0;
-                for(int i=0;i<c->qk_nope_dim;i++) d+=(double)qh[i]*kn[i];
-                for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
-                float s=(float)d*ascale;
-                score[(size_t)hh*c->max_pos+j]=s;
-                if(s>hmx[hh]) hmx[hh]=s;
-            }
-        }
-        for(int j=0;j<nsel;j++){
-            glm5_load_latent_kv(m,L,selp[j],kv,KVC);
-            glm5_mv(m,kvb,&L->wkv_b,kv,kvb_rows,c->kv_lora);
-            for(int hh=0;hh<nown;hh++){
-                float e=expf(score[(size_t)hh*c->max_pos+j]-hmx[hh]);
-                hse[hh]+=e;
-                const float*vv=kvb+hh*kvb_stride+c->qk_nope_dim;
+                glm5_tensor_tmul_rows(m,qa,&L->wkv_b,hh*kvb_stride,c->qk_nope_dim,qh);
+                for(int i=0;i<c->kv_lora;i++) ctx[i]=0.0f;
                 float*oh=attn+hh*c->v_head_dim;
-                for(int i=0;i<c->v_head_dim;i++) oh[i]+=e*vv[i];
+                for(int i=0;i<c->v_head_dim;i++) oh[i]=0.0f;
+            }
+            for(int j=0;j<nsel;j++){
+                glm5_load_latent_kv(m,L,selp[j],kv,KVC);
+                for(int hh=0;hh<nown;hh++){
+                    const float*qh=q+hh*c->qk_head_dim;
+                    const float*qa=m->s_qabs+(size_t)hh*c->kv_lora;
+                    double d=0;
+                    for(int i=0;i<c->kv_lora;i++) d+=(double)qa[i]*kv[i];
+                    for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
+                    float s=(float)d*ascale;
+                    score[(size_t)hh*c->max_pos+j]=s;
+                    if(s>hmx[hh]) hmx[hh]=s;
+                }
+            }
+            for(int j=0;j<nsel;j++){
+                glm5_load_latent_kv(m,L,selp[j],kv,KVC);
+                for(int hh=0;hh<nown;hh++){
+                    float e=expf(score[(size_t)hh*c->max_pos+j]-hmx[hh]);
+                    hse[hh]+=e;
+                    float*ctx=m->s_ctx+(size_t)hh*c->kv_lora;
+                    for(int i=0;i<c->kv_lora;i++) ctx[i]+=e*kv[i];
+                }
+            }
+            for(int hh=0;hh<nown;hh++){
+                glm5_tensor tv=glm5_tensor_rows(&L->wkv_b,hh*kvb_stride+c->qk_nope_dim,c->v_head_dim);
+                glm5_mv(m,attn+hh*c->v_head_dim,&tv,m->s_ctx+(size_t)hh*c->kv_lora,c->v_head_dim,c->kv_lora);
+            }
+        } else {
+            const int kvb_rows=nown*kvb_stride;
+            for(int hh=0;hh<nown;hh++){
+                hmx[hh]=-1e30f; hse[hh]=0.0f;
+                float*oh=attn+hh*c->v_head_dim;
+                for(int i=0;i<c->v_head_dim;i++) oh[i]=0.0f;
+            }
+            for(int j=0;j<nsel;j++){
+                glm5_load_latent_kv(m,L,selp[j],kv,KVC);
+                glm5_mv(m,kvb,&L->wkv_b,kv,kvb_rows,c->kv_lora);
+                for(int hh=0;hh<nown;hh++){
+                    const float*qh=q+hh*c->qk_head_dim;
+                    const float*kn=kvb+hh*kvb_stride;
+                    double d=0;
+                    for(int i=0;i<c->qk_nope_dim;i++) d+=(double)qh[i]*kn[i];
+                    for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
+                    float s=(float)d*ascale;
+                    score[(size_t)hh*c->max_pos+j]=s;
+                    if(s>hmx[hh]) hmx[hh]=s;
+                }
+            }
+            for(int j=0;j<nsel;j++){
+                glm5_load_latent_kv(m,L,selp[j],kv,KVC);
+                glm5_mv(m,kvb,&L->wkv_b,kv,kvb_rows,c->kv_lora);
+                for(int hh=0;hh<nown;hh++){
+                    float e=expf(score[(size_t)hh*c->max_pos+j]-hmx[hh]);
+                    hse[hh]+=e;
+                    const float*vv=kvb+hh*kvb_stride+c->qk_nope_dim;
+                    float*oh=attn+hh*c->v_head_dim;
+                    for(int i=0;i<c->v_head_dim;i++) oh[i]+=e*vv[i];
+                }
             }
         }
         if(m->cp_on && m->kv_combine_cb) m->kv_combine_cb(attn,hmx,hse,nown,c->v_head_dim,m->kv_combine_ctx);
@@ -941,6 +986,8 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
                 for(int i=0;i<H;i++) route[i]+=w*m->s_moe[i]; }
             glm5_prof_add(m,GLM5_P_EXPERTS,pt);
             /* shared expert: TP-sharded -> fold partial into route[] (one reduce); else replicated -> add after */
+            int overlap=(m->ar_async_start && !tp_sh);
+            if(overlap) m->ar_async_start(route,H,m->ar_async_ctx);
             pt=glm5_prof_now();
             glm5_mv(m,m->s_shg,&L->sh_w1,h2,L->sh_rows,H);
             glm5_mv(m,m->s_shu,&L->sh_w3,h2,L->sh_rows,H);
@@ -948,7 +995,8 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             glm5_mv(m,m->s_sh,&L->sh_w2,m->s_shg,H,L->sh_rows);
             if(tp_sh) for(int i=0;i<H;i++) route[i]+=m->s_sh[i];
             glm5_prof_add(m,GLM5_P_SHARED,pt);
-            if(m->ar_cb) m->ar_cb(route,H,m->ar_ctx);     /* EP-sum routed (+ shared if TP) */
+            if(overlap) m->ar_wait(m->ar_async_ctx);
+            else if(m->ar_cb) m->ar_cb(route,H,m->ar_ctx);     /* EP-sum routed (+ shared if TP) */
             for(int i=0;i<H;i++) x[i]+=route[i] + (tp_sh?0.0f:m->s_sh[i]);
         } else {
             const int tp_ffn=(L->ff_rows<c->dense_inter);
