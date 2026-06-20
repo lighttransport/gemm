@@ -90,9 +90,9 @@ static void bench_alltoall(int rank, int size, int iters, size_t each_bytes) {
         best = min_nonzero(dt, best);
     }
     if (rank == 0) {
-        double rank_bytes = each_bytes * (size_t)size;
+        size_t rank_bytes = each_bytes * (size_t)size;
         printf("MPI_BENCH alltoall each_bytes=%zu rank_bytes=%zu iters=%d best_ms=%.3f avg_ms=%.3f per_rank_GBps=%.3f\n",
-               each_bytes, rank_bytes, iters, best * 1e3, (sum / iters) * 1e3, rank_bytes / best / 1e9);
+               each_bytes, rank_bytes, iters, best * 1e3, (sum / iters) * 1e3, (double)rank_bytes / best / 1e9);
     }
     free(send);
     free(recv);
