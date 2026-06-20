@@ -8616,6 +8616,7 @@ struct cuda_llm_runner {
     CUevent gemm_evt[2];       /* gemm-done events guarding buffer reuse (ping-pong) */
     int dq_pp;                 /* ping-pong index */
     int prefill_overlap;       /* 1 = double-buffer weight dequant vs GEMM */
+    CUevent gate_done_evt;     /* CUDA_LLM_PAR_FFN: gate matvec done on main stream */
     CUdeviceptr d_batch_f16_scratch; /* [max_tokens * max_dim] F16 for cuBLAS input conversion */
     size_t batch_f16_scratch_bytes; /* current byte capacity of d_batch_f16_scratch */
 
@@ -14373,6 +14374,22 @@ static int launch_mmq_iq2_s_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdevicep
 
 static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
+                                 int n_tokens, int weight_type);
+
+/* Same as launch_batch_matvec but routes all launches (dequant, conversions,
+ * cuBLAS GEMM) onto the caller-supplied stream. Used for FFN gate/up
+ * parallelization via CUDA_LLM_PAR_FFN. */
+static void launch_batch_matvec_stream(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                       CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
+                                       int n_tokens, int weight_type, CUstream stream) {
+    CUstream saved = r->stream;
+    r->stream = stream;
+    launch_batch_matvec(r, dst, mat, mat_f16, input, out_dim, in_dim, n_tokens, weight_type);
+    r->stream = saved;
+}
+
+static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                 CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
     /* cuBLAS path: use F16 shadow + Tensor Core GEMM when available (batched only). */
     if (n_tokens > 1 && r->use_cublas && mat_f16 && r->cublas) {
@@ -16213,10 +16230,26 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
         { void *a[] = { &d_batch_xb, &cl->ffn_norm_w, &n_embd, &eps, &n_tokens };
           cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
 
-        launch_batch_matvec(r, d_batch_gate, cl->ffn_gate_w, 0, d_batch_xb,
-                            cl->ffn_gate_rows, cl->ffn_gate_cols, n_tokens, cl->ffn_gate_type);
-        launch_batch_matvec(r, d_batch_up, cl->ffn_up_w, 0, d_batch_xb,
-                            cl->ffn_up_rows, cl->ffn_up_cols, n_tokens, cl->ffn_up_type);
+        /* Run gate and up matvecs in parallel on two streams when CUDA_LLM_PAR_FFN=1.
+         * Both matvecs read the same input (d_batch_xb) and use the same per-layer
+         * norm/dequant path; running them concurrently lets the GPU overlap the two
+         * dequant writes and two cuBLAS GEMMs. Joined at GELU (both must complete). */
+        if (getenv("CUDA_LLM_PAR_FFN") && r->stream_dq) {
+            if (!r->gate_done_evt) cuEventCreate(&r->gate_done_evt, CU_EVENT_DISABLE_TIMING);
+            launch_batch_matvec(r, d_batch_gate, cl->ffn_gate_w, 0, d_batch_xb,
+                                cl->ffn_gate_rows, cl->ffn_gate_cols, n_tokens, cl->ffn_gate_type);
+            cuEventRecord(r->gate_done_evt, r->stream);
+            /* Run up matvec on the alt stream, wait for gate on main, then sync the main. */
+            launch_batch_matvec_stream(r, d_batch_up, cl->ffn_up_w, 0, d_batch_xb,
+                                       cl->ffn_up_rows, cl->ffn_up_cols, n_tokens, cl->ffn_up_type,
+                                       r->stream_dq);
+            cuStreamWaitEvent(r->stream, r->gate_done_evt, 0);
+        } else {
+            launch_batch_matvec(r, d_batch_gate, cl->ffn_gate_w, 0, d_batch_xb,
+                                cl->ffn_gate_rows, cl->ffn_gate_cols, n_tokens, cl->ffn_gate_type);
+            launch_batch_matvec(r, d_batch_up, cl->ffn_up_w, 0, d_batch_xb,
+                                cl->ffn_up_rows, cl->ffn_up_cols, n_tokens, cl->ffn_up_type);
+        }
 
         { int total = n_tokens * n_ff;
           void *a[] = { &d_batch_gate, &d_batch_up, &total };
