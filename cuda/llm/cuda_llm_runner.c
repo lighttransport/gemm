@@ -1433,6 +1433,80 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- 17a2. matvec_q6_K_q8_1_dp4a_r2: 2 rows per warp (16 lanes/row) ---- */\n"
+"/* The 1-warp/row kernel above strides b=lane..nb; when nb<32 (e.g. ffn gate/up:\n"
+"   n_cols=n_embd=3840 -> nb=15) over half the warp idles and memory-level\n"
+"   parallelism collapses. Pack 2 rows/warp: lanes 0-15 do row A, 16-31 row B,\n"
+"   each via b=hlane..nb step 16, reduced within its 16-lane group (width=16). For\n"
+"   nb<=16 every block is one coalesced pass with all 32 lanes busy. Bit-identical\n"
+"   math to the 1-row kernel (same per-block dp4a, just a 16-wide reduction). */\n"
+"__global__ void matvec_q6_K_q8_1_dp4a_r2(float *dst, const unsigned char *mat,\n"
+"                                          const unsigned char *x_q81,\n"
+"                                          int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int half = lane >> 4;          /* 0 or 1 */\n"
+"    int hlane = lane & 15;         /* 0..15 */\n"
+"    int row = (blockIdx.x * 8 + warp_id) * 2 + half;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = hlane; b < nb; b += 16) {\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp;\n"
+"        const unsigned char *qh = bp + 128;\n"
+"        const signed char *sc = (const signed char *)(bp + 192);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        const unsigned char *bq81_base = x_q81 + (size_t)b * 8 * 36;\n"
+"        float sumf_d = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int hh = 0; hh < 2; hh++) {\n"
+"            int ql_half_off = hh * 64;\n"
+"            int qh_half_off = hh * 32;\n"
+"            int sc_half_off = hh * 8;\n"
+"            #pragma unroll\n"
+"            for (int g = 0; g < 4; g++) {\n"
+"                int q81_idx = hh * 4 + g;\n"
+"                const unsigned char *q81 = bq81_base + q81_idx * 36;\n"
+"                const int *u_w = (const int *)q81;\n"
+"                float d8 = half_to_float(*(const half_raw *)(q81 + 32));\n"
+"                int sc0 = (int)sc[sc_half_off + g * 2 + 0];\n"
+"                int sc1 = (int)sc[sc_half_off + g * 2 + 1];\n"
+"                int ql_off = ql_half_off + ((g & 1) ? 32 : 0);\n"
+"                int shift_q = 2 * g;\n"
+"                int use_high = (g >= 2);\n"
+"                int acc_r_lo = 0, acc_m_lo = 0;\n"
+"                int acc_r_hi = 0, acc_m_hi = 0;\n"
+"                #pragma unroll\n"
+"                for (int k = 0; k < 8; k++) {\n"
+"                    int ql_int = load_u8x4(ql + ql_off + k * 4);\n"
+"                    int qh_int = load_u8x4(qh + qh_half_off + k * 4);\n"
+"                    int vil = use_high ? ((ql_int >> 4) & 0x0F0F0F0F) : (ql_int & 0x0F0F0F0F);\n"
+"                    int vih = ((qh_int >> shift_q) & 0x03030303) << 4;\n"
+"                    int vi  = vil | vih;\n"
+"                    int u_int = u_w[k];\n"
+"                    if (k < 4) {\n"
+"                        acc_r_lo = dp4a_s8(vi, u_int, acc_r_lo);\n"
+"                        acc_m_lo = dp4a_s8(0x20202020, u_int, acc_m_lo);\n"
+"                    } else {\n"
+"                        acc_r_hi = dp4a_s8(vi, u_int, acc_r_hi);\n"
+"                        acc_m_hi = dp4a_s8(0x20202020, u_int, acc_m_hi);\n"
+"                    }\n"
+"                }\n"
+"                sumf_d += d8 * ((float)sc0 * (float)(acc_r_lo - acc_m_lo)\n"
+"                              + (float)sc1 * (float)(acc_r_hi - acc_m_hi));\n"
+"            }\n"
+"        }\n"
+"        sum += d * sumf_d;\n"
+"    }\n"
+"    #pragma unroll\n"
+"    for (int offset = 8; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset, 16);\n"
+"    if (hlane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- 17b. matvec_q5_K_f32: Q5_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q5_K block: 176 bytes = d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128], 256 elements */\n"
 "__global__ void matvec_q5_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -8710,6 +8784,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q5_K_q8_1_dp4a;
     CUfunction fn_matvec_q6_K_f32;
     CUfunction fn_matvec_q6_K_q8_1_dp4a;
+    CUfunction fn_matvec_q6_K_q8_1_dp4a_r2;
     CUfunction fn_embed_q2_K;
     CUfunction fn_embed_q4_K;
     CUfunction fn_embed_q4_0;
@@ -9309,6 +9384,7 @@ lookup_funcs:
     GET_FUNC(matvec_q5_K_q8_1_dp4a);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(matvec_q6_K_q8_1_dp4a);
+    GET_FUNC(matvec_q6_K_q8_1_dp4a_r2);
     GET_FUNC(embed_q2_K);
     GET_FUNC(embed_q4_K);
     GET_FUNC(embed_q4_0);
@@ -12311,6 +12387,16 @@ static inline void launch_matvec_q6_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
 static inline void launch_matvec_q6_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                             CUdeviceptr x_q81, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    /* When the input dim is small (nb=n_cols/256 <= 16, e.g. ffn gate/up with
+     * n_cols=n_embd=3840 -> nb=15) the 1-warp/row kernel idles half the warp.
+     * The 2-rows/warp variant (16 lanes/row) fills it. Wider matvecs (ffn_down
+     * nb=60, attn_out nb=32) keep the 32-lane kernel. CUDA_LLM_NO_Q6K_R2 reverts. */
+    int nb = n_cols / 256;
+    if (r->fn_matvec_q6_K_q8_1_dp4a_r2 && nb <= 16 && !getenv("CUDA_LLM_NO_Q6K_R2")) {
+        cuLaunchKernel(r->fn_matvec_q6_K_q8_1_dp4a_r2,
+                       (n_rows + 15) / 16, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+        return;
+    }
     cuLaunchKernel(r->fn_matvec_q6_K_q8_1_dp4a,
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
