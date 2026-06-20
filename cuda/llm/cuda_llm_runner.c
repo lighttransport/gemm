@@ -664,6 +664,43 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 11a2. matvec_q8_0_q8_1_dp4a: Q8_0 weight x Q8_1 (block-wise) activation ---- */\n"
+"/* Like matvec_q8_0_dp4a but the activation carries a PER-32-BLOCK scale (q8_1)\n"
+"   instead of one per-row absmax scale. Per-row quant crushes small activations\n"
+"   when any of the 3840 values is an outlier (common post-residual), which made\n"
+"   the Q8_0 LM head + attn projections the dominant dp4a error (~1.8 rel_L2 alone\n"
+"   on the 12B Q6_K model). Block-wise matches llama.cpp and drops it to ~0.07.\n"
+"   Q8_0 is symmetric (zero-point 0) so no activation-sum term is needed.\n"
+"   8 warps/block, 1 warp/row, grid = ceil(n_rows/8). Q8_0 block = 36B (f16 d@0,\n"
+"   32 int8 @4); q8_1 block = 36B (32 int8 @0, f16 d8@32, f16 sum@34). */\n"
+"__global__ void matvec_q8_0_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 32;\n"
+"    int row_bytes = nb * 36;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sumf = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 36;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const int *w4 = (const int *)(bp + 4);\n"
+"        const unsigned char *q81 = x_q81 + (size_t)b * 36;\n"
+"        const int *u = (const int *)q81;\n"
+"        float d8 = half_to_float(*(const half_raw *)(q81 + 32));\n"
+"        int acc = 0;\n"
+"        #pragma unroll\n"
+"        for (int k = 0; k < 8; k++) acc = dp4a_s8(w4[k], u[k], acc);\n"
+"        sumf += dw * d8 * (float)acc;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);\n"
+"    if (lane == 0) dst[row] = sumf;\n"
+"}\n"
+"\n"
 "/* ---- 11b. matvec_q8_0_dp4a_fused2: Fused gate+up Q8_0 × INT8 via dp4a ---- */\n"
 "__global__ void matvec_q8_0_dp4a_fused2(float *dst1, float *dst2,\n"
 "                                         const unsigned char *mat1, const unsigned char *mat2,\n"
@@ -8656,6 +8693,7 @@ struct cuda_llm_runner {
     CUfunction fn_add_f32;
     CUfunction fn_quantize_f32_to_int8;
     CUfunction fn_matvec_q8_0_dp4a;
+    CUfunction fn_matvec_q8_0_q8_1_dp4a;
     CUfunction fn_matvec_q8_0_f32;
     CUfunction fn_matvec_q8_0_f32_fused2;
     CUfunction fn_matvec_q8_0_dp4a_fused2;
@@ -9254,6 +9292,7 @@ lookup_funcs:
     GET_FUNC(add_f32);
     GET_FUNC(quantize_f32_to_int8);
     GET_FUNC(matvec_q8_0_dp4a);
+    GET_FUNC(matvec_q8_0_q8_1_dp4a);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(matvec_q8_0_f32_fused2);
     GET_FUNC(matvec_q8_0_dp4a_fused2);
@@ -12131,6 +12170,18 @@ static inline void launch_matvec_q8(cuda_llm_runner *r, CUdeviceptr dst, CUdevic
                    0, r->stream, args, NULL);
 }
 
+/* Q8_0 weight x block-wise (q8_1) activation. The q8_1 buffer must already hold
+ * the quantized activation (caller runs launch_quantize_q8_1). Block-wise scales
+ * are far more accurate than the per-row matvec_q8_0_dp4a. 1 warp/row, 8/block. */
+static inline void launch_matvec_q8_q81(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                         CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q8_0_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1,
+                   256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                        CUdeviceptr x, int n_rows, int n_cols, int weight_type);
 
@@ -12360,13 +12411,19 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
     switch (weight_type) {
         case GGML_TYPE_Q8_0:
             if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
-                /* matvec_q8_0_dp4a reads activation scales from a separate buffer,
-                 * so quantize with launch_quantize (int8 -> d_xb_q + scales -> d_xb_scale)
-                 * to match the decode path. Using launch_quantize_q8_1 here packs scales
-                 * inline and leaves d_xb_scale stale -> zeroed output (e.g. the gemma4-12B
-                 * Q8_0 weight-tied LM head). */
-                launch_quantize(r, r->d_xb_q, r->d_xb_scale, x, n_cols);
-                launch_matvec_q8(r, dst, mat, r->d_xb_q, r->d_xb_scale, n_rows, n_cols);
+                if (!getenv("CUDA_LLM_Q8_0_PERROW")) {
+                    /* Block-wise (q8_1) activation quant: per-32 scales instead of
+                     * one per-row absmax. Far more accurate (per-row crushed small
+                     * activations around outliers -> the Q8_0 LM head/attn were the
+                     * dominant dp4a error). CUDA_LLM_Q8_0_PERROW reverts for A/B. */
+                    launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                    launch_matvec_q8_q81(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+                } else {
+                    /* Legacy per-row path. matvec_q8_0_dp4a reads scales from a
+                     * separate buffer; quantize to d_xb_q + d_xb_scale. */
+                    launch_quantize(r, r->d_xb_q, r->d_xb_scale, x, n_cols);
+                    launch_matvec_q8(r, dst, mat, r->d_xb_q, r->d_xb_scale, n_rows, n_cols);
+                }
             } else {
                 launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols);
             }

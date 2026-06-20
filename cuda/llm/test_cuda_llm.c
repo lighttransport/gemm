@@ -343,7 +343,9 @@ int main(int argc, char **argv) {
      * kernels are validated separately (cuda/llm/mmq/*_test + the top-5 check). */
     int saved_dp4a = 0;
     if (!large_bench) {
-        saved_dp4a = cuda_llm_set_dp4a(gpu, 0);
+        /* DBG: CUDA_LLM_REF_DP4A keeps dp4a ON for the reference so rel_L2 reports
+         * dp4a error (vs F16 batched); combine with NO_*_DP4A to attribute. */
+        saved_dp4a = cuda_llm_set_dp4a(gpu, getenv("CUDA_LLM_REF_DP4A") ? 1 : 0);
         setenv("CUDA_LLM_NO_MMQ_DENSE", "1", 1);
     }
 
