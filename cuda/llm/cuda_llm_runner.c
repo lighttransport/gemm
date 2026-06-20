@@ -14518,6 +14518,16 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
                                input + (size_t)t * in_dim * sizeof(float), out_dim, in_dim);
         }
     } else if (weight_type == GGML_TYPE_Q4_K) {
+        /* Skip dequant+cuBLAS path and use the x4 chunked batch kernel directly.
+         * The dequant materializes 113 MB F16 per call, which is the FFN
+         * bottleneck on this GPU; the x4 kernel reads Q4_K directly and
+         * computes 4 tokens per block. CUDA_LLM_Q4K_X4=1 forces this. */
+        if (n_tokens > 1 && getenv("CUDA_LLM_Q4K_X4") && r->fn_batch_matvec_q4_K_x4) {
+            int n_groups = (n_tokens + 3) / 4;
+            void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+            cuLaunchKernel(r->fn_batch_matvec_q4_K_x4, (out_dim+7)/8, n_groups, 1, 256, 1, 1, 0, r->stream, a, NULL);
+            return;
+        }
         /* Dequant + cuBLAS F16 GEMM via the shared helper (reuses the 256 MB
          * pre-allocated d_f16_scratch + double-buffered overlap) — same fast path
          * used by Q6_K/Q4_0. Replaces the old per-call cuMemAlloc/cuMemFree which
