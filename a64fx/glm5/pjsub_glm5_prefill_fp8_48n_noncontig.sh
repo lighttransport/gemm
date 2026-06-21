@@ -1,12 +1,12 @@
 #!/bin/bash
-# GLM-5.2 FP8 full-layer chunked-prefill benchmark on 96 non-contiguous
+# GLM-5.2 FP8 full-layer chunked-prefill benchmark on 48 non-contiguous
 # A64FX nodes. This usually queues faster than torus placement but may pay
 # higher uTofu communication cost.
 
 #PJM -g hp250467
-#PJM -L "rscgrp=small-s2,node=96,elapse=03:00:00"
+#PJM -L "rscgrp=small-s2,node=48,elapse=03:00:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
-#PJM --mpi "proc=96"
+#PJM --mpi "proc=48"
 #PJM --llio localtmp-size=87Gi
 #PJM -x PJM_LLIO_GFSCACHE=/vol0004
 #PJM -j
@@ -18,14 +18,14 @@ UTOFU="$REPO/a64fx/utofu-tests"
 GLM5="$REPO/a64fx/glm5"
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
 
-NP=${PJM_MPI_PROC:-96}
+NP=${PJM_MPI_PROC:-48}
 STAGE_LAYERS=${GLM5_STAGE_LAYERS:-0}
 RUN_LAYERS=${GLM5_LAYERS:-0}
 PREFILL_SYNTH=${GLM5_PREFILL_SYNTH:-1024}
 PCHUNKS=${GLM5_PCHUNK_SWEEP:-64}
 THREADS=${GLM5_THREAD_SWEEP:-12}
 JOB_TAG=${PJM_JOBID:-manual_$$}
-WORK="$GLM5/prefill_fp8_run_${JOB_TAG}_96n_noncontig"
+WORK="$GLM5/prefill_fp8_run_${JOB_TAG}_48n_noncontig"
 
 export GLM5_MODEL_DIR=${GLM5_MODEL_DIR:-$HOME/models/glm52-fp8}
 export GLM5_STAGE_DIR=${GLM5_STAGE_DIR:-/local/glm5_fp8_prefill_$JOB_TAG}
@@ -49,7 +49,7 @@ export GLM5_ABSORB_SVE_DOT=${GLM5_ABSORB_SVE_DOT:-1}
 export GLM5_PCHUNK=${GLM5_PCHUNK:-64}
 export GLM5_TOKENIZER=${GLM5_TOKENIZER:-$GLM5_MODEL_DIR/tokenizer.json}
 
-echo "=== GLM5.2 FP8 prefill 96n noncontig: NP=$NP layers=$RUN_LAYERS synth=$PREFILL_SYNTH maxpos=$GLM5_MAXPOS model=$GLM5_MODEL_DIR job=${PJM_JOBID:-?} ==="
+echo "=== GLM5.2 FP8 prefill 48n noncontig: NP=$NP layers=$RUN_LAYERS synth=$PREFILL_SYNTH maxpos=$GLM5_MAXPOS model=$GLM5_MODEL_DIR job=${PJM_JOBID:-?} ==="
 echo "workdir=$WORK stage_dir=$GLM5_STAGE_DIR chunks=[$PCHUNKS] threads=[$THREADS] cp=$GLM5_CP msa=$GLM5_MSA int4=$GLM5_INT4_KV tp=$GLM5_TP tp_shared=$GLM5_TP_SHARED ar_tokens=${GLM5_AR_TOKENS:-auto} tp_ar_bf16=${TP_AR_BF16:-0}"
 date
 
@@ -68,14 +68,14 @@ for t in 1 2 3 4 5; do
         topo_ok=1
         break
     fi
-    echo "[prefill-fp8-96-noncontig] topo try $t failed; retry"
+    echo "[prefill-fp8-48-noncontig] topo try $t failed; retry"
     sleep 3
 done
 [ "$topo_ok" = 1 ] || { echo "FATAL: topo helper failed"; exit 3; }
 echo "topo OK ($(grep -vc '^#' tofu_topo.txt 2>/dev/null || echo 0) ranks)"
 sed -n '1,40p' tofu_topo.txt
 if [ "${GLM5_TOPO_ONLY:-0}" = 1 ]; then
-    echo "=== prefill-fp8-96-noncontig topo-only done $(date) ==="
+    echo "=== prefill-fp8-48-noncontig topo-only done $(date) ==="
     exit 0
 fi
 
@@ -84,16 +84,15 @@ GLM5_STAGE_LAYERS=$STAGE_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_stage" || { e
 echo "staged ranks: $(ls "$WORK"/glm5_stage_rank*.txt 2>/dev/null | wc -l)/$NP ($(date))"
 cat "$WORK"/glm5_stage_rank*.txt 2>/dev/null | sort | tail -12
 
-NUMA_WRAP=""; [ "${GLM5_NUMACTL:-0}" = "1" ] && NUMA_WRAP="numactl --interleave=all"
 for th in $THREADS; do
     for pc in $PCHUNKS; do
-        echo "--- prefill FP8 run threads=$th pchunk=$pc numactl=${GLM5_NUMACTL:-0} bind=${OMP_PROC_BIND:-unset} ($(date)) ---"
+        echo "--- prefill FP8 run threads=$th pchunk=$pc ($(date)) ---"
         rm -f glm5_ep_*.txt glm5_ep_rank00.txt
         LLM_THREADS=$th OMP_NUM_THREADS=$th GLM5_PCHUNK=$pc GLM5_REAL=1 GLM5_LAYERS=$RUN_LAYERS \
-          mpiexec -np "$NP" $NUMA_WRAP "$LLM/build/glm5_ep_runner" || { echo "FATAL: prefill threads=$th pchunk=$pc"; exit 5; }
+          mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: prefill threads=$th pchunk=$pc"; exit 5; }
         cp glm5_ep_rank00.txt "prefill_rank00_t${th}_pc${pc}.txt" 2>/dev/null || true
         grep -E "prefill_synth:|prefill_progress:|PROFILE prefill_synth|SENTINEL" "prefill_rank00_t${th}_pc${pc}.txt" 2>/dev/null || true
     done
 done
 
-echo "=== prefill-fp8-96 noncontig done $(date) ==="
+echo "=== prefill-fp8-48 noncontig done $(date) ==="
