@@ -131,22 +131,27 @@ static void barrier_robust(int robust){
 static void barrier(void){ barrier_robust(0); }
 
 /* ---- EP combine all-reduce callback ---- */
-static double g_ar_secs=0.0; static long g_ar_calls=0;
+static double g_ar_secs=0.0; static long g_ar_calls=0, g_ar_frags=0;
 static void ep_ar_callback(float*buf,int count,void*ctx){
     tp_comm*c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:count; double t0=now_sec();
-    for(int off=0;off<count;){ int n=count-off; if(n>mc)n=mc; tp_allreduce_sum(c,buf+off,n); off+=n; }
+    long nf=0;
+    for(int off=0;off<count;){ int n=count-off; if(n>mc)n=mc; tp_allreduce_sum(c,buf+off,n); off+=n; nf++; }
     g_ar_secs+=now_sec()-t0; g_ar_calls++;
+    g_ar_frags+=nf;
 }
 /* (val,global-idx) argmax all-reduce (TP_HEAD vocab-shard logits merge) */
 static void ep_argmax_callback(float*val,int32_t*idx,void*ctx){
     double t0=now_sec(); tp_allreduce_argmax((tp_comm*)ctx,val,idx); g_ar_secs+=now_sec()-t0; g_ar_calls++;
+    g_ar_frags++;
 }
 /* ---- CP (context-parallel KV) callbacks ---- */
 /* all-reduce MAX of per-block index scores so every rank derives the same global top-k. */
 static void ep_blk_reduce(float*scores,int nblk,void*ctx){
     tp_comm*c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:nblk; double t0=now_sec();
-    for(int off=0;off<nblk;){ int n=nblk-off; if(n>mc)n=mc; tp_allreduce_max(c,scores+off,n); off+=n; }
+    long nf=0;
+    for(int off=0;off<nblk;){ int n=nblk-off; if(n>mc)n=mc; tp_allreduce_max(c,scores+off,n); off+=n; nf++; }
     g_ar_secs+=now_sec()-t0; g_ar_calls++;
+    g_ar_frags+=nf;
 }
 /* flash-combine the per-rank partial attention (out unnormalized, max, sumexp) across ranks:
  *   gmx=max_r mx_r;  s_r=exp(mx_r-gmx);  out = (sum_r s_r*out_r)/(sum_r s_r*se_r). */
@@ -155,13 +160,15 @@ static void ep_kv_combine(float*out,float*mx,float*se,int nh,int hd,void*ctx){
     tp_comm*c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:1; double t0=now_sec();
     float gmx[64]; for(int h=0;h<nh;h++) gmx[h]=mx[h];
     tp_allreduce_max(c,gmx,nh);                              /* global per-head max */
+    long nf=1;
     int cnt=nh+nh*hd; float*buf=g_kvbuf;                     /* [se(nh) | out(nh*hd)] rescaled */
     for(int h=0;h<nh;h++){ float s=expf(mx[h]-gmx[h]); buf[h]=se[h]*s;
         float*o=out+h*hd,*b=buf+nh+(size_t)h*hd; for(int i=0;i<hd;i++) b[i]=o[i]*s; }
-    for(int off=0;off<cnt;){ int n=cnt-off; if(n>mc)n=mc; tp_allreduce_sum(c,buf+off,n); off+=n; }
+    for(int off=0;off<cnt;){ int n=cnt-off; if(n>mc)n=mc; tp_allreduce_sum(c,buf+off,n); off+=n; nf++; }
     for(int h=0;h<nh;h++){ float inv=1.0f/(buf[h]>0?buf[h]:1.0f);
         float*o=out+h*hd,*b=buf+nh+(size_t)h*hd; for(int i=0;i<hd;i++) o[i]=b[i]*inv; }
     g_ar_secs+=now_sec()-t0; g_ar_calls++;
+    g_ar_frags+=nf;
 }
 
 /* ---- comm-overlap driver thread: only it touches uTofu during an overlapped reduce ----
@@ -273,7 +280,7 @@ static void cbatch_write_req(const char*prefix,int req,const int*gen,int ng){
 
 static int cbatch_start(cb_slot*s,const id_prompt*p,int req,int max_new,int C,double *prefill_sec,double *prefill_ar,long *prefill_calls){
     s->req=req; s->n_prompt=p->n; s->ng=0; s->done=0; s->nan=0; s->cur=0;
-    g_ar_secs=0; g_ar_calls=0;
+    g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
     double t0=now_sec();
     int last=-1;
     for(int i=0;i<p->n;i++){ embed_lookup(s->m,p->ids[i],s->x); last=glm5_forward_token(s->m,s->x,i); }
@@ -314,7 +321,7 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
         active++;
     }
     barrier();
-    g_ar_secs=0; g_ar_calls=0;
+    g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
     double svc0=now_sec();
     while(done<n_req){
         int progressed=0;
@@ -335,9 +342,9 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
                 q->req=-1; done++; active--;
                 if(next<n_req){
                     total_prompt+=prompts[next].n;
-                    double save_ar=g_ar_secs; long save_calls=g_ar_calls;
+                    double save_ar=g_ar_secs; long save_calls=g_ar_calls, save_frags=g_ar_frags;
                     cbatch_start(q,&prompts[next],next,max_new,C,&pf_sec,&pf_ar,&pf_calls);
-                    g_ar_secs=save_ar; g_ar_calls=save_calls;
+                    g_ar_secs=save_ar; g_ar_calls=save_calls; g_ar_frags=save_frags;
                     next++; active++;
                 }
                 continue;
@@ -348,9 +355,9 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
         }
         if(!progressed && active==0 && next<n_req){
             total_prompt+=prompts[next].n;
-            double save_ar=g_ar_secs; long save_calls=g_ar_calls;
+            double save_ar=g_ar_secs; long save_calls=g_ar_calls, save_frags=g_ar_frags;
             cbatch_start(&S[0],&prompts[next],next,max_new,C,&pf_sec,&pf_ar,&pf_calls);
-            g_ar_secs=save_ar; g_ar_calls=save_calls;
+            g_ar_secs=save_ar; g_ar_calls=save_calls; g_ar_frags=save_frags;
             next++; active++;
         }
     }
@@ -383,6 +390,11 @@ int main(void){
     int start_pos=envi("GLM5_START_POS",0); if(start_pos<0) start_pos=0;
     int layers=envi("GLM5_LAYERS",0), nexp=envi("GLM5_EXPERTS",0);
     int mstream=envi("GLM5_MSTREAM",1); if(mstream<1)mstream=1; if(mstream>64)mstream=64;
+    int ar_tokens=envi("GLM5_AR_TOKENS",0);
+    int pchunk0=envi("GLM5_PCHUNK",0);
+    if(ar_tokens<mstream) ar_tokens=mstream;
+    if(pchunk0>ar_tokens) ar_tokens=pchunk0;
+    if(ar_tokens<1) ar_tokens=1;
 
     utofu_tni_id_t*tni_ids=NULL; size_t num_tnis=0;
     rc=utofu_get_onesided_tnis(&tni_ids,&num_tnis); if(rc!=UTOFU_SUCCESS) die("utofu_get_onesided_tnis",rc);
@@ -446,7 +458,9 @@ int main(void){
     barrier_robust(1);
 
     static tp_comm comm;
-    if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*mstream,barrier)!=0) die("tp_comm_init",-1);
+    if(MyRank==0) logmsg("allreduce: max_count=%d floats ar_tokens=%d pchunk=%d mstream=%d\n",
+                         cfg.hidden*ar_tokens,ar_tokens,pchunk0,mstream);
+    if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*ar_tokens,barrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
     if(m->cp_on){   /* context-parallel KV: provide the cross-rank block-score MAX + flash-combine */
@@ -482,7 +496,7 @@ int main(void){
         sm_state=0xD3F00D; for(int t=0;t<NS;t++) pos[t]=0;
         for(int g=0;g<4;g++){ for(int i=0;i<NS*C;i++) X[i]=(float)(sm_next()*0.2-0.1); glm5_forward_batch_decode(m,X,NS,pos,out); for(int t=0;t<NS;t++) pos[t]++; }
         barrier();
-        double t0=now_sec(); g_ar_secs=0; g_ar_calls=0; int nan=0;
+        double t0=now_sec(); g_ar_secs=0; g_ar_calls=0; g_ar_frags=0; int nan=0;
         for(int g=0;g<maxgen;g++){ for(int i=0;i<NS*C;i++) X[i]=(float)(sm_next()*0.2-0.1); glm5_forward_batch_decode(m,X,NS,pos,out); for(int t=0;t<NS;t++) pos[t]++;
             for(int i=0;i<NS*C;i++) if(!(X[i]==X[i])) nan++; }
         double dt=now_sec()-t0, ar=g_ar_secs;
@@ -527,7 +541,7 @@ int main(void){
         int pf_last=-1; double t0=now_sec();
         double prof_gen0[GLM5_NPHASE], prof_gen_pf[GLM5_NPHASE], prof_gen_dec[GLM5_NPHASE];
         prof_snapshot(m,prof_gen0);
-        g_ar_secs=0; g_ar_calls=0;
+        g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
         int pchunk=envi("GLM5_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=S) */
         if(pchunk>0){
             if(glm5_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
@@ -542,30 +556,30 @@ int main(void){
         for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=glm5_forward_token(m,x,p); }
         prof_snapshot(m,prof_gen_pf);
         double tpf=now_sec()-t0;
-        double gen_pf_ar=g_ar_secs; long gen_pf_calls=g_ar_calls;
+        double gen_pf_ar=g_ar_secs; long gen_pf_calls=g_ar_calls, gen_pf_frags=g_ar_frags;
         if(prefill_only){
             barrier();
             if(MyRank==0){
-                logmsg("gen_prefill_only: %d tok %.2f tok/s comm %.1f%% calls=%ld argmax=%d\n",
-                       n_prompt,tpf>0?n_prompt/tpf:0.0,tpf>0?100.0*gen_pf_ar/tpf:0.0,gen_pf_calls,pf_last);
+                logmsg("gen_prefill_only: %d tok %.2f tok/s comm %.1f%% calls=%ld frags=%ld argmax=%d\n",
+                       n_prompt,tpf>0?n_prompt/tpf:0.0,tpf>0?100.0*gen_pf_ar/tpf:0.0,gen_pf_calls,gen_pf_frags,pf_last);
                 prof_log_delta("gen_prefill",prof_gen0,prof_gen_pf,n_prompt,tpf,gen_pf_ar);
                 logmsg("SENTINEL glm5_prefill_%dn=done\n",N);
             }
             glm5_afree(prompt); glm5_afree(x); glm5_free(m); return 0;
         }
         int *gen=glm5_amalloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
-        g_ar_secs=0; g_ar_calls=0;
+        g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
         double td0=now_sec();
         for(int g=0;g<max_new;g++){ gen[ng++]=cur; if((cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) && ng>=min_new) break;
             embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
             for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
         double td=now_sec()-td0;
-        double gen_d_ar=g_ar_secs; long gen_d_calls=g_ar_calls;
+        double gen_d_ar=g_ar_secs; long gen_d_calls=g_ar_calls, gen_d_frags=g_ar_frags;
         prof_snapshot(m,prof_gen_dec);
         barrier();
         if(MyRank==0){
-            logmsg("gen: prefill %.2f tok/s comm %.1f%% calls=%ld, decode %d tok %.2f tok/s comm %.1f%% calls=%ld, NaNs=%d\n",
-                   n_prompt/tpf,100.0*gen_pf_ar/tpf,gen_pf_calls,ng,td>0?ng/td:0.0,td>0?100.0*gen_d_ar/td:0.0,gen_d_calls,nan);
+            logmsg("gen: prefill %.2f tok/s comm %.1f%% calls=%ld frags=%ld, decode %d tok %.2f tok/s comm %.1f%% calls=%ld frags=%ld, NaNs=%d\n",
+                   n_prompt/tpf,100.0*gen_pf_ar/tpf,gen_pf_calls,gen_pf_frags,ng,td>0?ng/td:0.0,td>0?100.0*gen_d_ar/td:0.0,gen_d_calls,gen_d_frags,nan);
             prof_log_delta("gen_prefill",prof_gen0,prof_gen_pf,n_prompt,tpf,gen_pf_ar);
             prof_log_delta("gen_decode",prof_gen_pf,prof_gen_dec,ng,td,gen_d_ar);
             char buf[6000]; int o=0; for(int i=0;i<ng&&o<5900;i++) o+=snprintf(buf+o,sizeof(buf)-o,"%d ",gen[i]);
@@ -581,7 +595,7 @@ int main(void){
         int pchunk=envi("GLM5_PCHUNK",0);
         double prof0s[GLM5_NPHASE], prof_pfs[GLM5_NPHASE];
         prof_snapshot(m,prof0s);
-        double t0=now_sec(); g_ar_secs=0; g_ar_calls=0; int pf_last=-1, nan=0;
+        double t0=now_sec(); g_ar_secs=0; g_ar_calls=0; g_ar_frags=0; int pf_last=-1, nan=0;
         if(pchunk>0){
             if(glm5_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
@@ -608,11 +622,11 @@ int main(void){
                 for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++;
             }
         }
-        double tpf=now_sec()-t0, ar=g_ar_secs; long calls=g_ar_calls;
+        double tpf=now_sec()-t0, ar=g_ar_secs; long calls=g_ar_calls, frags=g_ar_frags;
         prof_snapshot(m,prof_pfs); barrier();
         if(MyRank==0){
-            logmsg("prefill_synth: %d tok %.2f tok/s comm %.1f%% calls=%ld pchunk=%d argmax=%d NaNs=%d RSS=%.2f GB\n",
-                   prefill,tpf>0?prefill/tpf:0.0,tpf>0?100.0*ar/tpf:0.0,calls,pchunk,pf_last,nan,rss_bytes()/1e9);
+            logmsg("prefill_synth: %d tok %.2f tok/s comm %.1f%% calls=%ld frags=%ld pchunk=%d argmax=%d NaNs=%d RSS=%.2f GB\n",
+                   prefill,tpf>0?prefill/tpf:0.0,tpf>0?100.0*ar/tpf:0.0,calls,frags,pchunk,pf_last,nan,rss_bytes()/1e9);
             prof_log_delta("prefill_synth",prof0s,prof_pfs,prefill,tpf,ar);
             logmsg("SENTINEL glm5_prefill_%dn=%s\n",N,nan==0?"done":"NAN");
         }
@@ -622,19 +636,19 @@ int main(void){
     /* ---- prefill (synthetic, identical activations on every rank) ---- */
     double prof0[GLM5_NPHASE], prof_pf[GLM5_NPHASE], prof_dec[GLM5_NPHASE];
     prof_snapshot(m,prof0);
-    double t_pf0=now_sec(); g_ar_secs=0; g_ar_calls=0; int nan_count=0; double xnorm=0; int pf_last=-1;
+    double t_pf0=now_sec(); g_ar_secs=0; g_ar_calls=0; g_ar_frags=0; int nan_count=0; double xnorm=0; int pf_last=-1;
     sm_state=0xD3F00D;
     for(int p=0;p<prefill;p++){
         for(int i=0;i<C;i++) x[i]=(float)(sm_next()*2.0-1.0);
         pf_last=glm5_forward_token(m,x,start_pos+p);
         for(int i=0;i<C;i++){ if(!(x[i]==x[i])) nan_count++; xnorm+=(double)x[i]*x[i]; }
     }
-    double t_pf=now_sec()-t_pf0; double pf_ar=g_ar_secs; long pf_calls=g_ar_calls;
+    double t_pf=now_sec()-t_pf0; double pf_ar=g_ar_secs; long pf_calls=g_ar_calls, pf_frags=g_ar_frags;
     prof_snapshot(m,prof_pf);
     barrier();
 
     /* ---- decode ---- */
-    double t_d0=now_sec(); g_ar_secs=0; g_ar_calls=0; int last=pf_last;
+    double t_d0=now_sec(); g_ar_secs=0; g_ar_calls=0; g_ar_frags=0; int last=pf_last;
     for(int g=0;g<maxgen;g++){
         int pos=start_pos+prefill+g; for(int i=0;i<C;i++) x[i]=(float)(sm_next()*2.0-1.0);
         last=glm5_forward_token(m,x,pos);
@@ -653,7 +667,7 @@ int main(void){
         fprintf(rf,"last argmax=%d (identical across ranks == lockstep ok)  NaNs=%d ||x||=%.3e\n",last,nan_count,sqrt(xnorm)); fclose(rf);} }
     if(MyRank==0){
         logmsg("\n=== rank0 summary (%d nodes, EP all-reduce combine) ===\n",N);
-        if(prefill>0) logmsg("prefill: %d tok %.1f ms/tok %.2f tok/s comm %.1f%% (ar_calls=%ld argmax=%d)\n",prefill,t_pf/prefill*1e3,prefill/t_pf,100.0*pf_ar/t_pf,pf_calls,pf_last);
+        if(prefill>0) logmsg("prefill: %d tok %.1f ms/tok %.2f tok/s comm %.1f%% (ar_calls=%ld frags=%ld argmax=%d)\n",prefill,t_pf/prefill*1e3,prefill/t_pf,100.0*pf_ar/t_pf,pf_calls,pf_frags,pf_last);
         if(maxgen>0)  logmsg("decode:  %d tok %.1f ms/tok %.2f tok/s comm %.1f%%\n",maxgen,t_d/maxgen*1e3,maxgen/t_d,100.0*d_ar/t_d);
         if(prefill>0) prof_log_delta("prefill",prof0,prof_pf,prefill,t_pf,pf_ar);
         if(maxgen>0)  prof_log_delta("decode",prof_pf,prof_dec,maxgen,t_d,d_ar);

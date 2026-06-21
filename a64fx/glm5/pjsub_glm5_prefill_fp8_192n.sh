@@ -54,7 +54,7 @@ export GLM5_PCHUNK=${GLM5_PCHUNK:-64}
 export GLM5_TOKENIZER=${GLM5_TOKENIZER:-$GLM5_MODEL_DIR/tokenizer.json}
 
 echo "=== GLM5.2 FP8 prefill 192n: NP=$NP layers=$RUN_LAYERS synth=$PREFILL_SYNTH maxpos=$GLM5_MAXPOS model=$GLM5_MODEL_DIR job=${PJM_JOBID:-?} ==="
-echo "workdir=$WORK stage_dir=$GLM5_STAGE_DIR chunks=[$PCHUNKS] threads=[$THREADS] cp=$GLM5_CP msa=$GLM5_MSA int4=$GLM5_INT4_KV"
+echo "workdir=$WORK stage_dir=$GLM5_STAGE_DIR chunks=[$PCHUNKS] threads=[$THREADS] cp=$GLM5_CP msa=$GLM5_MSA int4=$GLM5_INT4_KV tp=$GLM5_TP tp_shared=$GLM5_TP_SHARED ar_tokens=${GLM5_AR_TOKENS:-auto} tp_ar_bf16=${TP_AR_BF16:-0}"
 date
 
 "$GLM5/check_glm5_model.sh" "$GLM5_MODEL_DIR" --tokenizer || exit 2
