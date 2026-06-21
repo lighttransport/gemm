@@ -9812,7 +9812,14 @@ lookup_funcs:
                         { "q3k",    GGML_TYPE_Q3_K,    256 },
                         { "q6k",    GGML_TYPE_Q6_K,    256 },
                         { "q4_0",   GGML_TYPE_Q4_0,     32 },
-                        { "q8_0",   GGML_TYPE_Q8_0,     32 },  // 12B lm_head/token_embd
+                        /* NOTE: Q8_0 deliberately EXCLUDED. This runner stores Q8_0 weights
+                         * as PADDED 36-byte blocks (2B d + 2B pad + 32B qs, see WEIGHT_BYTES
+                         * + matvec_q8_0_q8_1_dp4a) for aligned access, but vendored llama
+                         * vec_dot_q8_0_q8_1 expects the standard 34-byte ggml block_q8_0 ->
+                         * wrong stride -> NaN logits in-model (12B Q6_K lm_head is Q8_0).
+                         * The standalone mmvq_q8_0_test passed only because it used the
+                         * standard 34B layout. Falls back to matvec_q8_0_q8_1_dp4a (correct,
+                         * ~34.2 t/s; the +0.5 t/s "gain" from the MMVQ path was the bug). */
                     };
                     char nm[64];
                     for (int i = 0; i < (int)(sizeof(reg)/sizeof(reg[0])); i++) {
