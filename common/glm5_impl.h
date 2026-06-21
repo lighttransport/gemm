@@ -205,6 +205,41 @@ static inline void glm5_bf16_4row_4x_acc(float*a0,float*a1,float*a2,float*a3,
     a2[0]+=svaddv_f32(pt,a20); a2[1]+=svaddv_f32(pt,a21); a2[2]+=svaddv_f32(pt,a22); a2[3]+=svaddv_f32(pt,a23);
     a3[0]+=svaddv_f32(pt,a30); a3[1]+=svaddv_f32(pt,a31); a3[2]+=svaddv_f32(pt,a32); a3[3]+=svaddv_f32(pt,a33);
 }
+/* 4 bf16 weight rows x 5 activation tokens: each widened weight vector feeds 5 FMAs.
+ * 20 acc + 4 w + 1 reused x = 25 SVE regs. */
+static inline void glm5_bf16_4row_5x_acc(float*a0,float*a1,float*a2,float*a3,float*a4,
+        const uint16_t*w0,const uint16_t*w1,const uint16_t*w2,const uint16_t*w3,
+        const float*x0,const float*x1,const float*x2,const float*x3,const float*x4,int n){
+    svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a02=svdup_f32(0),a03=svdup_f32(0);
+    svfloat32_t a10=svdup_f32(0),a11=svdup_f32(0),a12=svdup_f32(0),a13=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a22=svdup_f32(0),a23=svdup_f32(0);
+    svfloat32_t a30=svdup_f32(0),a31=svdup_f32(0),a32=svdup_f32(0),a33=svdup_f32(0);
+    svfloat32_t a40=svdup_f32(0),a41=svdup_f32(0),a42=svdup_f32(0),a43=svdup_f32(0);
+    int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svfloat32_t v0=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w0+i),16));
+        svfloat32_t v1=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w1+i),16));
+        svfloat32_t v2=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w2+i),16));
+        svfloat32_t v3=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w3+i),16));
+        svfloat32_t xv=svld1(pg,x0+i);
+        a00=svmla_x(pg,a00,v0,xv); a01=svmla_x(pg,a01,v1,xv); a02=svmla_x(pg,a02,v2,xv); a03=svmla_x(pg,a03,v3,xv);
+        xv=svld1(pg,x1+i);
+        a10=svmla_x(pg,a10,v0,xv); a11=svmla_x(pg,a11,v1,xv); a12=svmla_x(pg,a12,v2,xv); a13=svmla_x(pg,a13,v3,xv);
+        xv=svld1(pg,x2+i);
+        a20=svmla_x(pg,a20,v0,xv); a21=svmla_x(pg,a21,v1,xv); a22=svmla_x(pg,a22,v2,xv); a23=svmla_x(pg,a23,v3,xv);
+        xv=svld1(pg,x3+i);
+        a30=svmla_x(pg,a30,v0,xv); a31=svmla_x(pg,a31,v1,xv); a32=svmla_x(pg,a32,v2,xv); a33=svmla_x(pg,a33,v3,xv);
+        xv=svld1(pg,x4+i);
+        a40=svmla_x(pg,a40,v0,xv); a41=svmla_x(pg,a41,v1,xv); a42=svmla_x(pg,a42,v2,xv); a43=svmla_x(pg,a43,v3,xv);
+    }
+    svbool_t pt=svptrue_b32();
+    a0[0]+=svaddv_f32(pt,a00); a0[1]+=svaddv_f32(pt,a01); a0[2]+=svaddv_f32(pt,a02); a0[3]+=svaddv_f32(pt,a03);
+    a1[0]+=svaddv_f32(pt,a10); a1[1]+=svaddv_f32(pt,a11); a1[2]+=svaddv_f32(pt,a12); a1[3]+=svaddv_f32(pt,a13);
+    a2[0]+=svaddv_f32(pt,a20); a2[1]+=svaddv_f32(pt,a21); a2[2]+=svaddv_f32(pt,a22); a2[3]+=svaddv_f32(pt,a23);
+    a3[0]+=svaddv_f32(pt,a30); a3[1]+=svaddv_f32(pt,a31); a3[2]+=svaddv_f32(pt,a32); a3[3]+=svaddv_f32(pt,a33);
+    a4[0]+=svaddv_f32(pt,a40); a4[1]+=svaddv_f32(pt,a41); a4[2]+=svaddv_f32(pt,a42); a4[3]+=svaddv_f32(pt,a43);
+}
 static inline void glm5_f32_4row_3x_acc(float*a0,float*a1,float*a2,
         const float*w0,const float*w1,const float*w2,const float*w3,
         const float*x0,const float*x1,const float*x2,int n){
@@ -1276,10 +1311,11 @@ static void glm5_gemm_mxfp8(glm5_model*m, float*restrict Y, const uint8_t*W, con
     const int sb=(cols+127)/128;
     const int nb=rows/8;
     /* The inner matvec is L1-load-bound on the bf16 weight tile (an f32 tile measured slower).
-     * So block 4 tokens per weight-vector load (vs 3) -> 25% less relative weight traffic. The
-     * 4-token kernel uses 16 acc + 4 x + 4 w = 24 SVE regs. GLM5_FP8_GEMM_TOK selects the token
-     * block (4 default, 3 = previous kernel) for A/B; both are bit-exact. */
-    static int tok=-1; if(tok<0){ tok=glm5_envi("GLM5_FP8_GEMM_TOK",4); if(tok!=3&&tok!=4) tok=4; }
+     * So block several tokens per weight-vector load to cut relative weight traffic and expose
+     * more independent FMA chains. GLM5_FP8_GEMM_TOK selects the token block: 5 (default, 20 acc
+     * +4 w +1 x = 25 SVE regs), 4, or 3 (previous kernel). All bit-exact. Kernel bench N=256:
+     * tok=3 230 -> tok=4 295 -> tok=5 330 Gop/s; full 96n prefill tok=3 14.5 -> tok=5 16.7 tok/s. */
+    static int tok=-1; if(tok<0){ tok=glm5_envi("GLM5_FP8_GEMM_TOK",5); if(tok<3||tok>5) tok=5; }
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
 #endif
@@ -1298,7 +1334,13 @@ static void glm5_gemm_mxfp8(glm5_model*m, float*restrict Y, const uint8_t*W, con
             }
             int t=0;
 #if defined(__ARM_FEATURE_SVE)
-            if(tok==4){
+            if(tok==5){
+                for(;t+4<N;t+=5){
+                    const float*x0=X+(size_t)t*cols+k0,*x1=X+(size_t)(t+1)*cols+k0,*x2=X+(size_t)(t+2)*cols+k0,*x3=X+(size_t)(t+3)*cols+k0,*x4=X+(size_t)(t+4)*cols+k0;
+                    glm5_bf16_4row_5x_acc(acc[t],acc[t+1],acc[t+2],acc[t+3],acc[t+4],tile,tile+kl,tile+2*(size_t)kl,tile+3*(size_t)kl,x0,x1,x2,x3,x4,kl);
+                    glm5_bf16_4row_5x_acc(acc[t]+4,acc[t+1]+4,acc[t+2]+4,acc[t+3]+4,acc[t+4]+4,tile+4*(size_t)kl,tile+5*(size_t)kl,tile+6*(size_t)kl,tile+7*(size_t)kl,x0,x1,x2,x3,x4,kl);
+                }
+            } else if(tok==4){
                 for(;t+3<N;t+=4){
                     const float*x0=X+(size_t)t*cols+k0,*x1=X+(size_t)(t+1)*cols+k0,*x2=X+(size_t)(t+2)*cols+k0,*x3=X+(size_t)(t+3)*cols+k0;
                     glm5_bf16_4row_4x_acc(acc[t],acc[t+1],acc[t+2],acc[t+3],tile,tile+kl,tile+2*(size_t)kl,tile+3*(size_t)kl,x0,x1,x2,x3,kl);
