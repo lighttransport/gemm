@@ -1791,7 +1791,10 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             for(size_t i=0;i<(size_t)S*H;i++) ms->route[i]=0;
             int na=c->n_active>8?8:c->n_active; int*sel_all=ms->gsel; float*selw_all=ms->gselw;  /* [S*8] heap (S may exceed 64) */
             pt=glm5_prof_now();
-            glm5_gemm_f32(ms->router,(float*)L->gate.w,ms->h2,S,c->n_experts,H);
+            /* gate is bf16 (GLM5_BF16); use the type-dispatched GEMM like the single-token path
+             * (glm5_mv at the decode router). The old glm5_gemm_f32((float*)gate.w) read the bf16
+             * buffer as f32 -> 2x over-read past the tensor + wrong logits. */
+            glm5_gemm(m,ms->router,&L->gate,ms->h2,S,c->n_experts,H);
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
 #endif
