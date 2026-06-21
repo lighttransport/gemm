@@ -1616,8 +1616,11 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
          * q_rope dot k_rope. Values accumulate a weighted latent context and apply
          * the per-head value rows of wkv_b once, instead of expanding wkv_b per key. */
         int absorb_sve_dot=glm5_envi("GLM5_ABSORB_SVE_DOT",1);
+/* CP combines call into uTofu and must run in identical token order on every rank.
+ * Keep this token loop serial under CP; otherwise OpenMP threads can enter collectives
+ * concurrently and trigger descriptor/order failures. */
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(!m->cp_on)
 #endif
         for(int t=0;t<S;t++){ float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*arows,*sc=ms->sc+(size_t)t*ms->sc_stride;
             const int*sel=ms->psel+(size_t)t*ms->maxsel; int ns=ms->pnsel[t];
