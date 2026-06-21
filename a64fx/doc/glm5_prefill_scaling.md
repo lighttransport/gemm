@@ -94,12 +94,13 @@ ssh fugaku 'cd ~/work/gemm/glm5-1 && pjsub --no-check-directory \
   -x GLM5_MAXPOS=2048 -x GLM5_PREFILL_SYNTH=1024 \
   -x GLM5_CP=0 -x GLM5_INT4_KV=0 -x GLM5_MSA=0 \
   -x GLM5_TP_SHARED=1 -x GLM5_PCHUNK_SWEEP=256 -x GLM5_THREAD_SWEEP=24 \
-  -x GLM5_COMM_OVERLAP=1 \
+  -x GLM5_COMM_OVERLAP=1 -x TP_AR_BF16=1 \
   a64fx/glm5/pjsub_glm5_prefill_fp8_96n_noncontig.sh'
 ```
 
-→ ~18.7 tok/s, NaNs=0. (`tok=5` GEMM is the binary default.) Note `th=24` over `th=12`:
-the earlier "best" used 12 threads; 24 (2 CMGs) is ~+12%.
+→ ~18.7 tok/s base; **+9% with `TP_AR_BF16=1`** (torus-confirmed 16.09→17.55, comm 43→33%,
+argmax-identical → output-equivalent on synth), NaNs=0. (`tok=5` GEMM is the binary default.)
+Note `th=24` over `th=12`: the earlier "best" used 12 threads; 24 (2 CMGs) is ~+12%.
 
 
 ## UPDATE (2026-06-22): 4-ranks/node measured — NOT a win (Phase 2 closed)
