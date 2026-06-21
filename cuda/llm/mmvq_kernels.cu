@@ -82,3 +82,4 @@ DEFINE_MMVQ(q2k,    GGML_TYPE_Q2_K)     // 31B ffn_down
 DEFINE_MMVQ(q3k,    GGML_TYPE_Q3_K)     // 31B token_embd / lm_head
 DEFINE_MMVQ(q6k,    GGML_TYPE_Q6_K)     // 12B Q6_K
 DEFINE_MMVQ(q4_0,   GGML_TYPE_Q4_0)     // 12B QAT (qk=32)
+DEFINE_MMVQ(q8_0,   GGML_TYPE_Q8_0)     // 12B lm_head / token_embd (qk=32)

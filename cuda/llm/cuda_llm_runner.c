@@ -9812,6 +9812,7 @@ lookup_funcs:
                         { "q3k",    GGML_TYPE_Q3_K,    256 },
                         { "q6k",    GGML_TYPE_Q6_K,    256 },
                         { "q4_0",   GGML_TYPE_Q4_0,     32 },
+                        { "q8_0",   GGML_TYPE_Q8_0,     32 },  // 12B lm_head/token_embd
                     };
                     char nm[64];
                     for (int i = 0; i < (int)(sizeof(reg)/sizeof(reg[0])); i++) {
