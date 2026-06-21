@@ -38,6 +38,22 @@ int main(void){
     for(int i=0;i<cols;i++) x[i]=(float)((int)(lcg(&st)%2001)-1000) * 1.0e-4f;
     for(size_t i=0;i<(size_t)rows*sb;i++) S[i]=0.00390625f * (float)(1 + (lcg(&st)&3));
 
+    int decode_err=0;
+    int decode_rows=rows<8?rows:8;
+    uint16_t *dref=(uint16_t*)glm5_amalloc((size_t)cols*2);
+    uint16_t *dopt=(uint16_t*)glm5_amalloc((size_t)cols*2);
+    if(!dref||!dopt) return 2;
+    for(int r=0;r<decode_rows;r++){
+        const uint8_t*wrow=W+(size_t)r*cols;
+        const float*srow=S+(size_t)r*sb;
+        for(int c=0;c<cols;c++){
+            float wf; uint32_t bits=lut[wrow[c]]; memcpy(&wf,&bits,4);
+            dref[c]=glm5_f2bf(wf*srow[c/128]);
+        }
+        glm5_mxfp8_f32scale_decode_row_bf16(dopt,wrow,srow,0,cols,lut);
+        for(int c=0;c<cols;c++) if(dref[c]!=dopt[c]) decode_err++;
+    }
+
     double t0=wall_sec();
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
@@ -107,8 +123,9 @@ int main(void){
         to=wall_sec()-t0; if(to<best_o) best_o=to;
     }
     double ops=2.0*(double)rows*(double)cols;
-    printf("FP8_KERNEL rows=%d cols=%d reps=%d max_abs=%.6g max_rel=%.6g\n",rows,cols,reps,max_abs,max_rel);
+    printf("FP8_KERNEL rows=%d cols=%d reps=%d decode_err=%d max_abs=%.6g max_rel=%.6g\n",
+           rows,cols,reps,decode_err,max_abs,max_rel);
     printf("FP8_KERNEL scalar=%.6f s %.2f Gop/s opt8=%.6f s %.2f Gop/s speedup=%.2fx\n",
            best_s,ops/best_s/1e9,best_o,ops/best_o/1e9,best_s/best_o);
-    return (max_abs<1.0e-3 && max_rel<1.0e-3) ? 0 : 1;
+    return (decode_err==0 && max_abs<1.0e-3 && max_rel<1.0e-3) ? 0 : 1;
 }

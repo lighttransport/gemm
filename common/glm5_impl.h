@@ -330,6 +330,32 @@ static inline void glm5_matvec_mxfp8_f32scale_8row(float*restrict dst,
 }
 #endif
 
+static inline void glm5_mxfp8_f32scale_decode_row_bf16(uint16_t*restrict dst, const uint8_t*restrict w,
+        const float*restrict s, int col0, int kl, const uint32_t*restrict lut){
+#if defined(__ARM_FEATURE_SVE)
+    const int vl=(int)svcntw();
+    for(int b=0;b<kl;b+=128){
+        int absc=col0+b;
+        int bend=b+128<kl?b+128:kl;
+        float sc=s[absc/128];
+        for(int c=b;c<bend;c+=vl){
+            svbool_t pg=svwhilelt_b32(c,bend);
+            svuint32_t idx=svld1ub_u32(pg,&w[c]);
+            svfloat32_t wf=svreinterpret_f32_u32(svld1_gather_u32index_u32(pg,lut,idx));
+            svuint32_t bits=svreinterpret_u32_f32(svmul_n_f32_x(pg,wf,sc));
+            svuint32_t lsb=svand_n_u32_x(pg,svlsr_n_u32_x(pg,bits,16),1);
+            svuint32_t rnd=svadd_u32_x(pg,bits,svadd_n_u32_x(pg,lsb,0x7fffu));
+            svst1h_u32(pg,&dst[c],svlsr_n_u32_x(pg,rnd,16));
+        }
+    }
+#else
+    for(int u=0;u<kl;u++){
+        float wf; uint32_t bits=lut[w[u]]; memcpy(&wf,&bits,4);
+        dst[u]=glm5_f2bf(wf*s[(col0+u)/128]);
+    }
+#endif
+}
+
 /* GLM5.2 FP8 matvec: F8_E4M3 weights with F32 scale_inv per 128x128 block.
  * The loader expands each block-row scale to one local row, so the kernel can
  * group eight output rows while preserving arbitrary TP row shards. */
@@ -653,7 +679,7 @@ static glm5_tensor glm5_load_w(glm5_ent*es,int n,const uint8_t*base,const char*n
         if(mode==0){ t.scale=glm5_cp_scale_f32_blocks(base,se,0,Rtot,0,Ctot,Rtot,Ctot); *used+=(size_t)Rtot*((Ctot+127)/128)*4; }
         else if(mode==1){ t.scale=glm5_cp_scale_f32_blocks(base,se,r0,nr,0,Ctot,Rtot,Ctot); *used+=(size_t)nr*((Ctot+127)/128)*4; }
         else {
-            if((c0%128)||(nc%128)){ fprintf(stderr,"glm5_load: FP8 col-shard %s not 128-aligned (c0=%d nc=%d); TP shard must preserve 128-col scale blocks\n",name,c0,nc); *ok=0; return t; }
+            if((c0%128) && (c0%128)+nc>128){ fprintf(stderr,"glm5_load: FP8 col-shard %s crosses an unaligned 128-col scale block (c0=%d nc=%d)\n",name,c0,nc); *ok=0; return t; }
             t.scale=glm5_cp_scale_f32_blocks(base,se,0,Rtot,c0,nc,Rtot,Ctot); *used+=(size_t)Rtot*((nc+127)/128)*4;
         }
     }
@@ -1148,10 +1174,7 @@ static void glm5_gemm_mxfp8(glm5_model*m, float*restrict Y, const uint8_t*W, con
                 const uint8_t*wrow=W+(size_t)(r+j)*cols+k0;
                 const float*srow=Sc+(size_t)(r+j)*sb;
                 uint16_t*trow=tile+(size_t)j*kl;
-                for(int u=0;u<kl;u++){
-                    float wf; uint32_t bits=lut[wrow[u]]; memcpy(&wf,&bits,4);
-                    trow[u]=glm5_f2bf(wf*srow[(k0+u)/128]);
-                }
+                glm5_mxfp8_f32scale_decode_row_bf16(trow,wrow,srow,k0,kl,lut);
             }
             for(int t=0;t<N;t++){
                 float tmp[8];
