@@ -1,5 +1,5 @@
-Vendored MMQ device kernels from llama.cpp
-==========================================
+Vendored MMQ/MMVQ device kernels from llama.cpp
+===============================================
 
 Source: https://github.com/ggml-org/llama.cpp
 Pinned upstream commit: 5fd2dc2c41c342a75c26f9756ca6b1814ed05fb4
@@ -15,15 +15,28 @@ Vendored file(s):
               `__launch_bounds__` qualifiers (illegal on a __device__ function)
               were moved to the trampolines.
 
-The remaining MMQ headers (common.cuh, mma.cuh, vecdotq.cuh, ggml-common.h,
-ggml.h, ...) are NOT copied; mmq_kernels.cu includes them directly from the
-upstream tree via -I. The activation quantizer `quantize_mmq_q8_1` is copied
-verbatim into mmq_kernels.cu (also MIT, same commit).
+  mmvq.cuh  - device-only extract of ggml/src/ggml-cuda/mmvq.cu (the decode
+              matvec), marked "VENDOR EDIT (gemm/main)": kept the helpers
+              (mmvq_parameter_table_id, get_vec_dot_q_cuda, get_vdr_mmvq,
+              get_device_table_id, calc_nwarps/calc_rows_per_block) and the
+              `mul_mat_vec_q` template, changed `static __global__` ->
+              `static __device__` with __launch_bounds__ moved to the
+              ../mmvq_kernels.cu trampolines; dropped the MoE kernel + host
+              launch code. ADDED by-value reimplementations of
+              vec_dot_iq3_s/iq2_s (`mmvq_vd_*_byval`) routed via mmvq_vecdot<>:
+              nvcc 13.2/sm_120a miscompiles the upstream const-int&-param
+              versions when inlined into mul_mat_vec_q (the others are unchanged).
+
+The remaining headers (common.cuh, mma.cuh, vecdotq.cuh, ggml-common.h,
+ggml.h, ...) are NOT copied; mmq_kernels.cu / mmvq_kernels.cu include them
+directly from the upstream tree via -I. The activation quantizers
+(`quantize_mmq_q8_1` for MMQ, regular `block_q8_1` for MMVQ) are copied
+verbatim into the respective *_kernels.cu (also MIT, same commit).
 
 ----------------------------------------------------------------------------
 MIT License
 
-Copyright (c) 2023-2024 The ggml authors
+Copyright (c) 2023-2025 The ggml authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
