@@ -393,9 +393,14 @@ static size_t glm5_arena_size(const glm5_config*c,int ep_rank,int ep_size){
     int ffrows = tp_ffn ? (c->dense_inter+ep_size-1)/ep_size : c->dense_inter;
     int hrows = tp_head ? (c->vocab+ep_size-1)/ep_size : c->vocab;
     int erows = tp_emb ? (c->vocab+ep_size-1)/ep_size : c->vocab;
+    int int4_kv=glm5_envi("GLM5_INT4_KV",0);
+    int cp_on=glm5_envi("GLM5_CP",0) && ep_size>1;
+    int cp_nslot=glm5_cp_nslot(c->max_pos,c->msa_block_size,ep_size,cp_on);
+    size_t kv_cache = int4_kv ? (size_t)cp_nslot*(KVD/2 + 2) : (size_t)cp_nslot*KVD*2;
+    size_t idx_cache = int4_kv ? (size_t)cp_nslot*(c->index_dim/2 + 2) : (size_t)cp_nslot*c->index_dim*2;
     size_t attn = (size_t)qrows*H*2 + 2*(size_t)KVD*H*2 + (size_t)H*qrows*2 + 2*(size_t)H*2 + 2*(size_t)c->head_dim*2;
-    attn += 2*(size_t)c->max_pos*KVD*2;
-    size_t msa = (size_t)glm5_idx_q_dim(c)*H*2 + (size_t)c->msa_index_dim*H*2 + 2*(size_t)c->msa_index_dim*2 + (size_t)c->max_pos*c->msa_index_dim*2;
+    attn += kv_cache;
+    size_t msa = (size_t)glm5_idx_q_dim(c)*H*2 + (size_t)c->msa_index_dim*H*2 + 2*(size_t)c->msa_index_dim*2 + idx_cache;
     size_t per_moe = attn + msa + (size_t)c->n_experts*H*4 + (size_t)c->n_experts*4
                    + 2*(size_t)shrows*H*2 + (size_t)H*shrows*2
                    + (size_t)no*3*(size_t)c->moe_inter*H*2;
@@ -1125,7 +1130,45 @@ static void glm5_gemm_mxfp8(glm5_model*m, float*restrict Y, const uint8_t*W, con
 #endif
         for(int r=0;r<rows;r++){ const uint8_t*w=W+(size_t)r*cols; uint32_t s=0; for(int i=0;i<cols;i+=64) s+=w[i]; acc+=s; }
         float v=(float)(((long)acc)&1)*1e-30f; for(size_t i=0;i<(size_t)N*rows;i++) Y[i]=v; return; }
-    for(int t=0;t<N;t++) glm5_mv_mxfp8(m,Y+(size_t)t*rows,W,S,X+(size_t)t*cols,rows,cols);
+    if(N<=1){ glm5_mv_mxfp8(m,Y,W,S,X,rows,cols); return; }
+    const uint32_t*lut=m->fp8_lut;
+    const float*Sc=(const float*)S;
+    const int sb=(cols+127)/128;
+    const int nb=rows/8;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){
+        int r=bi*8;
+        uint16_t tile[8*GLM5_MXG_TILE];
+        for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=0.0f; }
+        for(int k0=0;k0<cols;k0+=GLM5_MXG_TILE){
+            int kl=cols-k0<GLM5_MXG_TILE?cols-k0:GLM5_MXG_TILE;
+            for(int j=0;j<8;j++){
+                const uint8_t*wrow=W+(size_t)(r+j)*cols+k0;
+                const float*srow=Sc+(size_t)(r+j)*sb;
+                uint16_t*trow=tile+(size_t)j*kl;
+                for(int u=0;u<kl;u++){
+                    float wf; uint32_t bits=lut[wrow[u]]; memcpy(&wf,&bits,4);
+                    trow[u]=glm5_f2bf(wf*srow[(k0+u)/128]);
+                }
+            }
+            for(int t=0;t<N;t++){
+                float tmp[8];
+                matvec_bf16_8row(tmp,
+                    tile,tile+kl,tile+2*(size_t)kl,tile+3*(size_t)kl,
+                    tile+4*(size_t)kl,tile+5*(size_t)kl,tile+6*(size_t)kl,tile+7*(size_t)kl,
+                    X+(size_t)t*cols+k0,kl);
+                float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]+=tmp[j];
+            }
+        }
+    }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows-nb*8>=GLM5_PAR_MIN)
+#endif
+    for(int r=nb*8;r<rows;r++){
+        for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=glm5_dot_mxfp8_f32scale_row(W+(size_t)r*cols,Sc+(size_t)r*sb,X+(size_t)t*cols,cols,lut);
+    }
 }
 /* batched GEMM dispatch by weight type */
 static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const float*X, int N, int rows, int cols){
