@@ -13184,6 +13184,13 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
     const char *stop_attn_env = getenv("CUDA_LLM_STOP_AFTER_ATTN_RESIDUAL");
     int stop_after_attn_residual = stop_attn_env && stop_attn_env[0] && strcmp(stop_attn_env, "0") != 0;
+    /* gemma4 decode graphs stay OFF: confirmed no win + breaks correctness. Forcing
+     * capture (CUDA_LLM_GEMMA4_GRAPH experiment, 2026-06-22) gave decode 30.1->30.3 t/s
+     * (within noise) AND corrupted the position-dependent SWA/KV-write/RoPE kernels
+     * (sequential-replay rel_L2 0.023->0.557, since they bake `position` at capture and
+     * lack the d_pos_seq ptr-variants the non-gemma4 path uses). Decode is bandwidth-
+     * bound (~70% of 448 GB/s reading ~10.4GB weights/token), NOT launch-overhead-bound,
+     * so graphs can't close the ~8% gap to llama anyway. */
     int graph_enabled = !r->disable_graph && !r->is_hybrid && !r->is_gemma4 &&
                         r->debug_layers == 0 && r->max_layers == 0 &&
                         !stop_after_attn_residual;
