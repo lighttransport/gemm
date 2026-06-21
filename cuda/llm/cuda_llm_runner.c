@@ -9722,12 +9722,16 @@ lookup_funcs:
                         { "iq3s",   GGML_TYPE_IQ3_S,   256, 0, 57856 },
                         { "q2k",    GGML_TYPE_Q2_K,    256, 2, 70144 },
                         { "q4_0",   GGML_TYPE_Q4_0,     32, 1, 57856 },
-                        /* Q6_K DISABLED: end-to-end rel_L2_vs_seq=0.25 + top-5 rank-4
-                         * mismatch on 12B (a 6-bit quant should be MORE accurate than the
-                         * 2-bit types at 0.02) -> load_tiles_q6_K misreads our gguf Q6_K
-                         * weight layout. Trampolines stay in the cubin; re-add here after
-                         * debugging the block_q6_K layout match. 12B Q6_K falls back to the
-                         * (correct) dequant->F16->cuBLAS path. */
+                        /* Q6_K intentionally NOT enabled. The kernel is CORRECT (standalone
+                         * + in-model dump both match CPU-F32 oracle at rel_L2~0.014/GEMM);
+                         * the high end-to-end rel_L2_vs_seq=0.25 is the int8-ACTIVATION quant
+                         * floor accumulated over 48 layers (vendored uses q8_1 int8 acts;
+                         * the seq oracle + our default Q6_K path use F16/F32 acts). For a
+                         * 6-bit precision quant, int8 MMQ (1597 t/s, llama-equivalent accuracy)
+                         * is WORSE accuracy than our existing dequant->F16->cuBLAS path (1233
+                         * t/s, F16 acts) and still below llama's Q6_K (1913). Not worth the
+                         * accuracy trade; trampolines stay in the cubin. To opt in anyway,
+                         * uncomment: */
                         /* { "q6k", GGML_TYPE_Q6_K, 256, 0, 57856 }, */
                     };
                     char nm[64];
