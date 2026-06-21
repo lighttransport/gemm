@@ -34,6 +34,10 @@ export GLM5_EP_SIZE=$NP
 export GLM5_STATUS_DIR="$WORK"
 export GLM5_TP=${GLM5_TP:-1}
 export GLM5_TP_SHARED=${GLM5_TP_SHARED:-0}
+# 192-way dense FFN column shards are 64 wide for layer-0 down_proj, but FP8
+# scale blocks require 128-column alignment. Keep dense FFN replicated unless
+# the caller selects an alignment-safe TP layout.
+export GLM5_TP_FFN=${GLM5_TP_FFN:-0}
 export GLM5_MSA=${GLM5_MSA:-0}
 export GLM5_MSA_BLOCK_REP=${GLM5_MSA_BLOCK_REP:-1}
 export GLM5_CP=${GLM5_CP:-0}
