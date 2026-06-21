@@ -127,5 +127,36 @@ int main(void){
            rows,cols,reps,decode_err,max_abs,max_rel);
     printf("FP8_KERNEL scalar=%.6f s %.2f Gop/s opt8=%.6f s %.2f Gop/s speedup=%.2fx\n",
            best_s,ops/best_s/1e9,best_o,ops/best_o/1e9,best_s/best_o);
-    return (decode_err==0 && max_abs<1.0e-3 && max_rel<1.0e-3) ? 0 : 1;
+
+    int gemm_n=glm5_envi("GEMM_N",64);
+    int gemm_rows=glm5_envi("GEMM_ROWS",rows<2048?rows:2048);
+    if(gemm_rows>rows) gemm_rows=rows;
+    float *Xg=(float*)glm5_amalloc((size_t)gemm_n*cols*4);
+    float *Yg=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
+    float *Yr=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
+    if(!Xg||!Yg||!Yr) return 2;
+    for(size_t i=0;i<(size_t)gemm_n*cols;i++)
+        Xg[i]=(float)((int)(lcg(&st)%2001)-1000) * 1.0e-4f;
+    glm5_model gm; memset(&gm,0,sizeof gm); memcpy(gm.fp8_lut,lut,sizeof lut);
+    int check_n=gemm_n<4?gemm_n:4, check_rows=gemm_rows<64?gemm_rows:64;
+    for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++)
+        Yr[(size_t)t*gemm_rows+r]=glm5_dot_mxfp8_f32scale_row(W+(size_t)r*cols,S+(size_t)r*sb,Xg+(size_t)t*cols,cols,lut);
+    glm5_gemm_mxfp8(&gm,Yg,W,(const uint8_t*)S,Xg,check_n,check_rows,cols);
+    double gemm_abs=0.0, gemm_rel=0.0;
+    for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
+        double d=fabs((double)Yr[(size_t)t*gemm_rows+r]-(double)Yg[(size_t)t*check_rows+r]);
+        double den=fabs((double)Yr[(size_t)t*gemm_rows+r])+1.0e-12;
+        if(d>gemm_abs) gemm_abs=d; if(d/den>gemm_rel) gemm_rel=d/den;
+    }
+    double tg_best=1e30;
+    for(int it=0;it<reps;it++){
+        t0=wall_sec();
+        glm5_gemm_mxfp8(&gm,Yg,W,(const uint8_t*)S,Xg,gemm_n,gemm_rows,cols);
+        double tg=wall_sec()-t0; if(tg<tg_best) tg_best=tg;
+    }
+    double gops=2.0*(double)gemm_n*(double)gemm_rows*(double)cols;
+    printf("FP8_GEMM N=%d rows=%d cols=%d max_abs=%.6g max_rel=%.6g best=%.6f s %.2f Gop/s\n",
+           gemm_n,gemm_rows,cols,gemm_abs,gemm_rel,tg_best,gops/tg_best/1e9);
+
+    return (decode_err==0 && max_abs<1.0e-3 && max_rel<1.0e-3 && gemm_abs<1.0e-3 && gemm_rel<1.0e-3) ? 0 : 1;
 }

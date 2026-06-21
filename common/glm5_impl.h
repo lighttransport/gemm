@@ -150,6 +150,51 @@ static inline void glm5_fill_f32 (float   *w,size_t n,float amp){ for(size_t i=0
 static inline void glm5_mv_f32(float*restrict y,const float*W,const float*x,int rows,int cols){
     for(int r=0;r<rows;r++){ const float*w=W+(size_t)r*cols; double s=0; for(int i=0;i<cols;i++) s+=(double)w[i]*x[i]; y[r]=(float)s; }
 }
+#if defined(__ARM_FEATURE_SVE)
+static inline void glm5_bf16_4row_3x_acc(float*a0,float*a1,float*a2,
+        const uint16_t*w0,const uint16_t*w1,const uint16_t*w2,const uint16_t*w3,
+        const float*x0,const float*x1,const float*x2,int n){
+    svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a02=svdup_f32(0),a03=svdup_f32(0);
+    svfloat32_t a10=svdup_f32(0),a11=svdup_f32(0),a12=svdup_f32(0),a13=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a22=svdup_f32(0),a23=svdup_f32(0);
+    int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svfloat32_t x0v=svld1(pg,x0+i),x1v=svld1(pg,x1+i),x2v=svld1(pg,x2+i);
+        svfloat32_t v0=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w0+i),16));
+        svfloat32_t v1=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w1+i),16));
+        svfloat32_t v2=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w2+i),16));
+        svfloat32_t v3=svreinterpret_f32(svlsl_x(pg,svld1uh_u32(pg,w3+i),16));
+        a00=svmla_x(pg,a00,v0,x0v); a01=svmla_x(pg,a01,v1,x0v); a02=svmla_x(pg,a02,v2,x0v); a03=svmla_x(pg,a03,v3,x0v);
+        a10=svmla_x(pg,a10,v0,x1v); a11=svmla_x(pg,a11,v1,x1v); a12=svmla_x(pg,a12,v2,x1v); a13=svmla_x(pg,a13,v3,x1v);
+        a20=svmla_x(pg,a20,v0,x2v); a21=svmla_x(pg,a21,v1,x2v); a22=svmla_x(pg,a22,v2,x2v); a23=svmla_x(pg,a23,v3,x2v);
+    }
+    svbool_t pt=svptrue_b32();
+    a0[0]+=svaddv_f32(pt,a00); a0[1]+=svaddv_f32(pt,a01); a0[2]+=svaddv_f32(pt,a02); a0[3]+=svaddv_f32(pt,a03);
+    a1[0]+=svaddv_f32(pt,a10); a1[1]+=svaddv_f32(pt,a11); a1[2]+=svaddv_f32(pt,a12); a1[3]+=svaddv_f32(pt,a13);
+    a2[0]+=svaddv_f32(pt,a20); a2[1]+=svaddv_f32(pt,a21); a2[2]+=svaddv_f32(pt,a22); a2[3]+=svaddv_f32(pt,a23);
+}
+static inline void glm5_f32_4row_3x_acc(float*a0,float*a1,float*a2,
+        const float*w0,const float*w1,const float*w2,const float*w3,
+        const float*x0,const float*x1,const float*x2,int n){
+    svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a02=svdup_f32(0),a03=svdup_f32(0);
+    svfloat32_t a10=svdup_f32(0),a11=svdup_f32(0),a12=svdup_f32(0),a13=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a22=svdup_f32(0),a23=svdup_f32(0);
+    int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svfloat32_t x0v=svld1(pg,x0+i),x1v=svld1(pg,x1+i),x2v=svld1(pg,x2+i);
+        svfloat32_t v0=svld1(pg,w0+i),v1=svld1(pg,w1+i),v2=svld1(pg,w2+i),v3=svld1(pg,w3+i);
+        a00=svmla_x(pg,a00,v0,x0v); a01=svmla_x(pg,a01,v1,x0v); a02=svmla_x(pg,a02,v2,x0v); a03=svmla_x(pg,a03,v3,x0v);
+        a10=svmla_x(pg,a10,v0,x1v); a11=svmla_x(pg,a11,v1,x1v); a12=svmla_x(pg,a12,v2,x1v); a13=svmla_x(pg,a13,v3,x1v);
+        a20=svmla_x(pg,a20,v0,x2v); a21=svmla_x(pg,a21,v1,x2v); a22=svmla_x(pg,a22,v2,x2v); a23=svmla_x(pg,a23,v3,x2v);
+    }
+    svbool_t pt=svptrue_b32();
+    a0[0]+=svaddv_f32(pt,a00); a0[1]+=svaddv_f32(pt,a01); a0[2]+=svaddv_f32(pt,a02); a0[3]+=svaddv_f32(pt,a03);
+    a1[0]+=svaddv_f32(pt,a10); a1[1]+=svaddv_f32(pt,a11); a1[2]+=svaddv_f32(pt,a12); a1[3]+=svaddv_f32(pt,a13);
+    a2[0]+=svaddv_f32(pt,a20); a2[1]+=svaddv_f32(pt,a21); a2[2]+=svaddv_f32(pt,a22); a2[3]+=svaddv_f32(pt,a23);
+}
+#endif
 static inline void glm5_rmsnorm_gemma(float*out,const float*x,const uint16_t*w,int n,float eps){
     double ss=0; for(int i=0;i<n;i++) ss+=(double)x[i]*x[i];
     float inv=(float)(1.0/sqrt(ss/n+eps)); for(int i=0;i<n;i++) out[i]=x[i]*inv*glm5_bf2f(w[i]);
@@ -1133,15 +1178,52 @@ static void glm5_gemm_bf16(float*restrict Y, const uint16_t*W, const float*X, in
 #endif
     for(int bi=0;bi<nb;bi++){
         int r=bi*8; const uint16_t*w=W+(size_t)r*cols;
-        for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=0.f; }
+        float acc[N][8];
+        for(int t=0;t<N;t++) for(int j=0;j<8;j++) acc[t][j]=0.f;
         for(int k0=0;k0<cols;k0+=TILE){ int kl=cols-k0<TILE?cols-k0:TILE; const uint16_t*tw=w+k0;
-            for(int t=0;t<N;t++){ float tmp[8];
+            int t=0;
+#if defined(__ARM_FEATURE_SVE)
+            for(;t+2<N;t+=3){
+                glm5_bf16_4row_3x_acc(acc[t],acc[t+1],acc[t+2],tw,tw+cols,tw+2*(size_t)cols,tw+3*(size_t)cols,
+                                      X+(size_t)t*cols+k0,X+(size_t)(t+1)*cols+k0,X+(size_t)(t+2)*cols+k0,kl);
+                glm5_bf16_4row_3x_acc(acc[t]+4,acc[t+1]+4,acc[t+2]+4,tw+4*(size_t)cols,tw+5*(size_t)cols,tw+6*(size_t)cols,tw+7*(size_t)cols,
+                                      X+(size_t)t*cols+k0,X+(size_t)(t+1)*cols+k0,X+(size_t)(t+2)*cols+k0,kl);
+            }
+#endif
+            for(;t<N;t++){ float tmp[8];
                 matvec_bf16_8row(tmp,tw,tw+cols,tw+2*(size_t)cols,tw+3*(size_t)cols,
                                  tw+4*(size_t)cols,tw+5*(size_t)cols,tw+6*(size_t)cols,tw+7*(size_t)cols,
                                  X+(size_t)t*cols+k0,kl);
-                float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]+=tmp[j]; } }
+                for(int j=0;j<8;j++) acc[t][j]+=tmp[j]; } }
+        for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=acc[t][j]; }
     }
     for(int r=nb*8;r<rows;r++) for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=vec_dot_bf16_f32(W+(size_t)r*cols,X+(size_t)t*cols,cols);
+}
+
+static void glm5_gemm_f32(float*restrict Y, const float*W, const float*X, int N, int rows, int cols){
+    int nb=rows/8;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){
+        int r=bi*8; const float*w=W+(size_t)r*cols;
+        float acc[N][8];
+        for(int t=0;t<N;t++) for(int j=0;j<8;j++) acc[t][j]=0.f;
+        int t=0;
+#if defined(__ARM_FEATURE_SVE)
+        for(;t+2<N;t+=3){
+            glm5_f32_4row_3x_acc(acc[t],acc[t+1],acc[t+2],w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,
+                                 X+(size_t)t*cols,X+(size_t)(t+1)*cols,X+(size_t)(t+2)*cols,cols);
+            glm5_f32_4row_3x_acc(acc[t]+4,acc[t+1]+4,acc[t+2]+4,w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
+                                 X+(size_t)t*cols,X+(size_t)(t+1)*cols,X+(size_t)(t+2)*cols,cols);
+        }
+#endif
+        for(;t<N;t++){ float tmp[8];
+            for(int j=0;j<8;j++){ const float*wr=w+(size_t)j*cols; double s=0; for(int c=0;c<cols;c++) s+=(double)wr[c]*X[(size_t)t*cols+c]; tmp[j]=(float)s; }
+            for(int j=0;j<8;j++) acc[t][j]+=tmp[j]; }
+        for(t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=acc[t][j]; }
+    }
+    for(int r=nb*8;r<rows;r++) for(int t=0;t<N;t++){ const float*w=W+(size_t)r*cols; const float*x=X+(size_t)t*cols; double s=0; for(int c=0;c<cols;c++) s+=(double)w[c]*x[c]; Y[(size_t)t*rows+r]=(float)s; }
 }
 
 /* batched MXFP8 GEMM: Y[N,rows] = decode(W fp8 + S e8m0) . X[N,cols]. For N>1 the expensive
@@ -1167,7 +1249,8 @@ static void glm5_gemm_mxfp8(glm5_model*m, float*restrict Y, const uint8_t*W, con
     for(int bi=0;bi<nb;bi++){
         int r=bi*8;
         uint16_t tile[8*GLM5_MXG_TILE];
-        for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=0.0f; }
+        float acc[N][8];
+        for(int t=0;t<N;t++) for(int j=0;j<8;j++) acc[t][j]=0.0f;
         for(int k0=0;k0<cols;k0+=GLM5_MXG_TILE){
             int kl=cols-k0<GLM5_MXG_TILE?cols-k0:GLM5_MXG_TILE;
             for(int j=0;j<8;j++){
@@ -1176,15 +1259,25 @@ static void glm5_gemm_mxfp8(glm5_model*m, float*restrict Y, const uint8_t*W, con
                 uint16_t*trow=tile+(size_t)j*kl;
                 glm5_mxfp8_f32scale_decode_row_bf16(trow,wrow,srow,k0,kl,lut);
             }
-            for(int t=0;t<N;t++){
+            int t=0;
+#if defined(__ARM_FEATURE_SVE)
+            for(;t+2<N;t+=3){
+                glm5_bf16_4row_3x_acc(acc[t],acc[t+1],acc[t+2],tile,tile+kl,tile+2*(size_t)kl,tile+3*(size_t)kl,
+                                      X+(size_t)t*cols+k0,X+(size_t)(t+1)*cols+k0,X+(size_t)(t+2)*cols+k0,kl);
+                glm5_bf16_4row_3x_acc(acc[t]+4,acc[t+1]+4,acc[t+2]+4,tile+4*(size_t)kl,tile+5*(size_t)kl,tile+6*(size_t)kl,tile+7*(size_t)kl,
+                                      X+(size_t)t*cols+k0,X+(size_t)(t+1)*cols+k0,X+(size_t)(t+2)*cols+k0,kl);
+            }
+#endif
+            for(;t<N;t++){
                 float tmp[8];
                 matvec_bf16_8row(tmp,
                     tile,tile+kl,tile+2*(size_t)kl,tile+3*(size_t)kl,
                     tile+4*(size_t)kl,tile+5*(size_t)kl,tile+6*(size_t)kl,tile+7*(size_t)kl,
                     X+(size_t)t*cols+k0,kl);
-                float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]+=tmp[j];
+                for(int j=0;j<8;j++) acc[t][j]+=tmp[j];
             }
         }
+        for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=acc[t][j]; }
     }
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if(rows-nb*8>=GLM5_PAR_MIN)
@@ -1345,11 +1438,12 @@ static void glm5_forward_batch_decode(glm5_model*m, float*X, int N, const int*po
             const int tp_sh=(L->sh_rows<c->moe_inter);
             for(size_t i=0;i<(size_t)N*H;i++) ms->route[i]=0;
             int na=c->n_active>8?8:c->n_active; int sel_all[64*8]; float selw_all[64*8];
-            /* router + select: parallel over streams (F32 gate matvec, no nested matvec) */
+            /* router + select: batched F32 gate GEMM, then parallel sigmoid/top-k. */
+            glm5_gemm_f32(ms->router,(float*)L->gate.w,ms->h2,N,c->n_experts,H);
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
 #endif
-            for(int t=0;t<N;t++){ float*rl=ms->router+(size_t)t*c->n_experts; glm5_mv_f32(rl,(float*)L->gate.w,ms->h2+(size_t)t*H,c->n_experts,H);
+            for(int t=0;t<N;t++){ float*rl=ms->router+(size_t)t*c->n_experts;
                 for(int e=0;e<c->n_experts;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
                 for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
@@ -1591,10 +1685,11 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             for(size_t i=0;i<(size_t)S*H;i++) ms->route[i]=0;
             int na=c->n_active>8?8:c->n_active; int*sel_all=ms->gsel; float*selw_all=ms->gselw;  /* [S*8] heap (S may exceed 64) */
             pt=glm5_prof_now();
+            glm5_gemm_f32(ms->router,(float*)L->gate.w,ms->h2,S,c->n_experts,H);
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
 #endif
-            for(int t=0;t<S;t++){ float*rl=ms->router+(size_t)t*c->n_experts; glm5_mv_f32(rl,(float*)L->gate.w,ms->h2+(size_t)t*H,c->n_experts,H);
+            for(int t=0;t<S;t++){ float*rl=ms->router+(size_t)t*c->n_experts;
                 for(int e=0;e<c->n_experts;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
                 for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
