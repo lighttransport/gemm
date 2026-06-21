@@ -30,7 +30,7 @@
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
 
-#define MAX_NODES 256
+#define MAX_NODES 512   /* >= largest EP run (384-node prefill); arrays are O(MAX_NODES) tiny */
 #define RUN_STAG  DEMO_STAG
 #define WAIT_TIMEOUT_SEC 300.0
 
