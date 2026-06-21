@@ -9107,6 +9107,21 @@ struct cuda_llm_runner {
     size_t      d_mmqv_fixup_cap;
     int         mmqv_nsm;             /* SM count (stream-K grid sizing); 0 = unqueried */
 
+    /* Vendored llama.cpp mul_mat_vec_q (dp4a DECODE matvec, ncols_dst=1).  Closes
+     * the 31B decode gap (22 vs 32.6 t/s): for ncols_dst=1 on sm_120 it runs
+     * nwarps=4 warps cooperatively on ONE output row (K-split + shared reduction)
+     * -> ~385 GB/s vs our 1-warp/row coalesced matvec's ~248.  See mmvq_kernels.cu.
+     * Per-type table mmvqv_types[]; activation is the regular block_q8_1 (32-elem). */
+    CUmodule    mmvqv_mod;
+    CUfunction  fn_mmvqv_quant;        /* float -> block_q8_1 (regular) */
+    struct cllm_mmvqv_type {
+        int ggml_type, qk, nwarps;
+        CUfunction k;                 /* mul_mat_vec_q<type,1,false> */
+    } mmvqv_types[10];
+    int         mmvqv_ntypes;
+    CUdeviceptr d_mmvqv_y;            /* block_q8_1 activations */
+    size_t      d_mmvqv_y_cap;
+
     float *h_router_logits;       /* host copy for top-k selection */
 
     /* GPU weights */
@@ -9760,6 +9775,72 @@ lookup_funcs:
             }
         } else if (r->verbose >= 1) {
             fprintf(stderr, "cuda_llm: %s not found; vendored MMQ disabled\n", cp);
+        }
+    }
+
+    /* Load vendored llama.cpp mul_mat_vec_q (dp4a DECODE matvec) cubin + per-type
+     * table. Default ON (CUDA_LLM_NO_MMVQ_VENDOR off). nwarps=4 for all types on
+     * sm_120 (GENERIC table, ncols_dst=1) -> block (32,4,1), static shared. */
+    r->mmvqv_mod = 0;
+    r->fn_mmvqv_quant = NULL;
+    r->mmvqv_ntypes = 0;
+    r->d_mmvqv_y = 0; r->d_mmvqv_y_cap = 0;
+    {
+        const char *cp = "cuda/llm/mmvq_kernels.cubin";
+        FILE *fp = cllm_fopen_cubin("mmvq_kernels.cubin", &cp);
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long sz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            char *d = (char *)malloc((size_t)sz);
+            if (d) {
+                size_t nr = fread(d, 1, (size_t)sz, fp);
+                fclose(fp);
+                if (nr == (size_t)sz && cuModuleLoadDataEx(&r->mmvqv_mod, d, 0, NULL, NULL) == CUDA_SUCCESS) {
+                    cuModuleGetFunction(&r->fn_mmvqv_quant, r->mmvqv_mod, "mmvq_quant_q8_1");
+                    /* {sym, GGML_TYPE, qk}; nwarps=4 (GENERIC, ncols_dst=1) for all.
+                     * IQ3_S/IQ2_S are DELIBERATELY EXCLUDED: their vendored mul_mat_vec_q
+                     * produces wrong decode results in-model (31B seq-prefill rel_L2_vs_seq
+                     * 0.805/0.067 vs the 0.023 baseline; IQ2_XXS/IQ3_XXS/Q2_K/Q3_K all
+                     * verify clean at ~0.023, and IQ2_XXS passes the standalone CPU-F32
+                     * oracle at 0.0038). Root cause unresolved — the only types with a
+                     * separate `qh`+`signs` sub-block; struct layout, qi/vdr, grids, and
+                     * launch geometry all match the WORKING types, so it is a subtle
+                     * codebook-decode issue, not the integration. They fall back to the
+                     * validated hand-written matvec_iq{3,2}_s_*_coal kernels (correct,
+                     * slightly slower). Trampolines stay in the cubin; re-add here once
+                     * fixed. CUDA_LLM_MMVQ_SKIP="21,22" replicates this at runtime. */
+                    struct { const char *sym; int t, qk; } reg[] = {
+                        { "iq2xxs", GGML_TYPE_IQ2_XXS, 256 },
+                        { "iq3xxs", GGML_TYPE_IQ3_XXS, 256 },
+                        { "q2k",    GGML_TYPE_Q2_K,    256 },
+                        { "q3k",    GGML_TYPE_Q3_K,    256 },
+                        { "q6k",    GGML_TYPE_Q6_K,    256 },
+                        { "q4_0",   GGML_TYPE_Q4_0,     32 },
+                        /* { "iq2s", GGML_TYPE_IQ2_S, 256 },  // broken, see above */
+                        /* { "iq3s", GGML_TYPE_IQ3_S, 256 },  // broken, see above */
+                    };
+                    char nm[64];
+                    for (int i = 0; i < (int)(sizeof(reg)/sizeof(reg[0])); i++) {
+                        struct cllm_mmvqv_type *mt = &r->mmvqv_types[r->mmvqv_ntypes];
+                        mt->ggml_type = reg[i].t; mt->qk = reg[i].qk; mt->nwarps = 4; mt->k = NULL;
+                        snprintf(nm, sizeof(nm), "mmvq_%s", reg[i].sym);
+                        cuModuleGetFunction(&mt->k, r->mmvqv_mod, nm);
+                        if (!mt->k) continue;
+                        r->mmvqv_ntypes++;
+                    }
+                    if (r->verbose >= 1)
+                        fprintf(stderr, "cuda_llm: loaded %s (vendored MMVQ decode; %d types)\n",
+                            cp, r->mmvqv_ntypes);
+                } else if (r->verbose >= 1) {
+                    fprintf(stderr, "cuda_llm: failed to load %s\n", cp);
+                }
+                free(d);
+            } else {
+                fclose(fp);
+            }
+        } else if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: %s not found; vendored MMVQ disabled\n", cp);
         }
     }
 
@@ -12628,8 +12709,17 @@ static inline void launch_matvec_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdevi
                                       CUdeviceptr x, int n_rows, int n_cols);
 
 /* Auto-dispatch matvec based on weight type */
+static int cllm_mmvqv_enabled(void);
+static int launch_mmvq_vendor(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                              CUdeviceptr x, int out_dim, int in_dim, int weight_type);
+
 static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                        CUdeviceptr x, int n_rows, int n_cols, int weight_type) {
+    /* Vendored llama mul_mat_vec_q decode matvec (4 warps/row, ~385 GB/s).  Default
+     * on; CUDA_LLM_NO_MMVQ_VENDOR reverts to the hand-written launch_matvec_* below. */
+    if (cllm_mmvqv_enabled() &&
+        launch_mmvq_vendor(r, dst, mat, x, n_rows, n_cols, weight_type) == 0)
+        return;
     switch (weight_type) {
         case GGML_TYPE_Q8_0:
             if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
@@ -14878,6 +14968,76 @@ static const struct cllm_mmqv_type *cllm_mmqv_find(cuda_llm_runner *r, int weigh
     for (int i = 0; i < r->mmqv_ntypes; i++)
         if (r->mmqv_types[i].ggml_type == weight_type) return &r->mmqv_types[i];
     return NULL;
+}
+
+/* ---- Vendored llama.cpp mul_mat_vec_q DECODE matvec (ncols_dst=1) ---- */
+static int cllm_mmvqv_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("CUDA_LLM_NO_MMVQ_VENDOR") ? 0 : 1;
+    return v;
+}
+static const struct cllm_mmvqv_type *cllm_mmvqv_find(cuda_llm_runner *r, int weight_type) {
+    /* Debug bisect: CUDA_LLM_MMVQ_SKIP="11,16,..." (comma list of ggml_type ints)
+     * forces those types to fall back to the hand-written matvec. */
+    const char *skip = getenv("CUDA_LLM_MMVQ_SKIP");
+    if (skip) {
+        const char *p = skip;
+        while (*p) {
+            int v = atoi(p);
+            if (v == weight_type) return NULL;
+            while (*p && *p != ',') p++;
+            while (*p == ',') p++;
+        }
+    }
+    for (int i = 0; i < r->mmvqv_ntypes; i++)
+        if (r->mmvqv_types[i].ggml_type == weight_type) return &r->mmvqv_types[i];
+    return NULL;
+}
+
+/* Decode matvec via llama's mul_mat_vec_q: quantize the F32 activation (in_dim) to
+ * regular block_q8_1, then run 1 output-row/block with nwarps warps cooperating
+ * (K-split + shared reduction).  dst = out_dim floats; x = in_dim F32.  ~385 GB/s
+ * vs ~248 for our 1-warp/row coalesced matvec.  Returns 0 on success, -1 to fall
+ * back to the existing launch_matvec_* path. */
+static int launch_mmvq_vendor(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                              CUdeviceptr x, int out_dim, int in_dim, int weight_type) {
+    const struct cllm_mmvqv_type *mt = cllm_mmvqv_find(r, weight_type);
+    if (!mt || !mt->k || !r->fn_mmvqv_quant) return -1;
+    if (mt->qk == 0 || in_dim % mt->qk != 0 || in_dim % 32 != 0) return -1;
+
+    /* activation buffer: in_dim/32 block_q8_1 (36 B each: half2 ds + int8[32]). */
+    size_t ybytes = (size_t)(in_dim / 32) * 36;
+    if (r->d_mmvqv_y_cap < ybytes) {
+        if (r->d_mmvqv_y) cuMemFree(r->d_mmvqv_y);
+        r->d_mmvqv_y = 0; r->d_mmvqv_y_cap = 0;
+        if (cuMemAlloc(&r->d_mmvqv_y, ybytes) != CUDA_SUCCESS) return -1;
+        r->d_mmvqv_y_cap = ybytes;
+    }
+
+    /* quantize F32 -> block_q8_1: one warp / 32-elem block, 8 warps/CTA. */
+    {
+        int n = in_dim;
+        int nblk = in_dim / 32;
+        int ctas = (nblk + 7) / 8;        /* 8 warps (256 flat threads) / CTA */
+        void *a[] = { &x, &r->d_mmvqv_y, &n };
+        /* blockDim must be FLAT 256: the kernel derives warp id from threadIdx.x
+         * (warps_per_block = blockDim.x/WARP_SIZE), so a 2D (32,8) block would
+         * leave 7/8 of the activation unquantized -> garbage ds -> NaN. */
+        if (cuLaunchKernel(r->fn_mmvqv_quant, (unsigned)ctas, 1, 1, 256, 1, 1,
+                           0, r->stream, a, NULL) != CUDA_SUCCESS) return -1;
+    }
+
+    /* matvec: grid (out_dim,1,1), block (32, nwarps, 1).  Channel/sample strides 0
+     * and blockIdx.{y,z}=0, so the fastdiv uint3 args only ever see input 0. */
+    cllm_u3 one = cllm_fastdiv(1);
+    unsigned int ncols_x = (unsigned int)in_dim;
+    unsigned int srx     = (unsigned int)(in_dim / mt->qk);  /* stride_row_x */
+    unsigned int scy     = 0u;                               /* stride_col_y (unused) */
+    unsigned int scd     = (unsigned int)out_dim;            /* stride_col_dst */
+    void *a[] = { &mat, &r->d_mmvqv_y, &dst, &ncols_x, &one, &srx, &scy, &scd, &one, &one };
+    if (cuLaunchKernel(mt->k, (unsigned)out_dim, 1, 1, 32, (unsigned)mt->nwarps, 1,
+                       0, r->stream, a, NULL) != CUDA_SUCCESS) return -1;
+    return 0;
 }
 
 /* Generic dense stream-K MMQ launcher (replaces the per-type ..._dense): quantizes
@@ -18030,11 +18190,13 @@ void cuda_llm_free(cuda_llm_runner *r) {
     /* Vendored MMQ buffers + module */
     if (r->d_mmqv_y) cuMemFree(r->d_mmqv_y);
     if (r->d_mmqv_fixup) cuMemFree(r->d_mmqv_fixup);
+    if (r->d_mmvqv_y) cuMemFree(r->d_mmvqv_y);
 
     /* Free modules */
     if (r->module) cuModuleUnload(r->module);
     if (r->fa2_mod) cuModuleUnload(r->fa2_mod);
     if (r->mmqv_mod) cuModuleUnload(r->mmqv_mod);
+    if (r->mmvqv_mod) cuModuleUnload(r->mmvqv_mod);
     if (r->cublas) cublasewDestroy(r->cublas);
 
     /* Free host buffer */
