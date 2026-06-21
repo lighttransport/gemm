@@ -139,6 +139,13 @@ extern "C" __global__ void mmqv_quant_q8_1_ds4(
     quantize_mmq_q8_1_body<MMQ_Q8_1_DS_LAYOUT_DS4>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
 }
 
+extern "C" __global__ void mmqv_quant_q8_1_d2s6(
+        const float * x, const int32_t * ids, void * vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+    quantize_mmq_q8_1_body<MMQ_Q8_1_DS_LAYOUT_D2S6>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+}
+
 // ---------------------------------------------------------------------------
 // mul_mat_q trampolines.  extern "C" -> stable unmangled cubin symbol names.
 // __launch_bounds__ matches upstream (warp_size * nwarps, 1 block/SM on Volta+).
@@ -176,8 +183,17 @@ extern "C" __global__ void mmqv_fixup_##SUFFIX(                                 
         stride_col_dst, nchannels_y, stride_channel_dst, nsamples_y, stride_sample_dst, ntx);         \
 }
 
-// IQ2_XXS (Phase 1)
-DEFINE_MMQ_TRAMPOLINE(iq2xxs_x128_nc0, GGML_TYPE_IQ2_XXS, false)
-DEFINE_MMQ_TRAMPOLINE(iq2xxs_x128_nc1, GGML_TYPE_IQ2_XXS, true)
-DEFINE_MMQ_FIXUP(iq2xxs_x128_nc0, GGML_TYPE_IQ2_XXS, false)
-DEFINE_MMQ_FIXUP(iq2xxs_x128_nc1, GGML_TYPE_IQ2_XXS, true)
+// Per-type: kernel (nc0/nc1) + stream-K fixup (nc0/nc1).
+#define DEFINE_MMQ_TYPE(SUFFIX, TYPE)             \
+    DEFINE_MMQ_TRAMPOLINE(SUFFIX##_x128_nc0, TYPE, false) \
+    DEFINE_MMQ_TRAMPOLINE(SUFFIX##_x128_nc1, TYPE, true)  \
+    DEFINE_MMQ_FIXUP(SUFFIX##_x128_nc0, TYPE, false)      \
+    DEFINE_MMQ_FIXUP(SUFFIX##_x128_nc1, TYPE, true)
+
+DEFINE_MMQ_TYPE(iq2xxs, GGML_TYPE_IQ2_XXS)  // Phase 1 (31B, dominant)
+DEFINE_MMQ_TYPE(iq3xxs, GGML_TYPE_IQ3_XXS)  // 31B attn_v
+DEFINE_MMQ_TYPE(iq2s,   GGML_TYPE_IQ2_S)    // 31B UD-mix
+DEFINE_MMQ_TYPE(iq3s,   GGML_TYPE_IQ3_S)    // 31B ffn_down
+DEFINE_MMQ_TYPE(q2k,    GGML_TYPE_Q2_K)     // 31B ffn_down (D2S6 quant)
+DEFINE_MMQ_TYPE(q4_0,   GGML_TYPE_Q4_0)     // 12B QAT (DS4 quant, qk=32)
+DEFINE_MMQ_TYPE(q6k,    GGML_TYPE_Q6_K)     // 12B Q6_K
