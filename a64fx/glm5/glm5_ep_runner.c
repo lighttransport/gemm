@@ -392,12 +392,14 @@ int main(void){
     int mstream=envi("GLM5_MSTREAM",1); if(mstream<1)mstream=1; if(mstream>64)mstream=64;
     const char*ar_env=getenv("GLM5_AR_TOKENS");
     int ar_tokens=(ar_env&&*ar_env)?atoi(ar_env):0;
+    int ar_auto_cap=envi("GLM5_AR_AUTO_CAP",256);
     int pchunk0=envi("GLM5_PCHUNK",0);
     if(!ar_env && (envi("GLM5_CP",0) || maxpos>65536)){
         ar_tokens=1;  /* small registered slots for long-context/CP stability */
     } else {
         if(ar_tokens<mstream) ar_tokens=mstream;
         if(pchunk0>ar_tokens) ar_tokens=pchunk0;
+        if(!ar_env && ar_auto_cap>0 && ar_tokens>ar_auto_cap) ar_tokens=ar_auto_cap;
     }
     if(ar_tokens<1) ar_tokens=1;
 
