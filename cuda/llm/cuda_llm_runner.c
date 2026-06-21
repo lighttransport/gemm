@@ -701,6 +701,53 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sumf;\n"
 "}\n"
 "\n"
+"/* ---- 11a3. matvec_q8_0_f16act: Q8_0 weight x F16 activation via half2 (f16x2) PTX ---- */\n"
+"/* Middle ground between int8-dp4a (fast, lossy 8-bit activation) and full f32\n"
+"   (accurate, 2x slow). Activation pre-converted to F16 (x_f16); the inner product\n"
+"   uses packed f16x2 fma (2 MAC/instruction) via inline PTX (the NVRTC source has no\n"
+"   cuda_fp16.h). Cross-block accumulation stays in f32. Same 1-warp/row, 8-rows/block\n"
+"   layout as the dp4a kernel. Q8_0 block = 36B (f16 d@0, 2B pad, 32 int8 @4);\n"
+"   x_f16 = n_cols consecutive halfs (read 2 at a time as a b32 f16x2). */\n"
+"__global__ void matvec_q8_0_f16act(float *dst, const unsigned char *mat,\n"
+"                                     const unsigned short *x_f16, int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 32;\n"
+"    int row_bytes = nb * 36;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sumf = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 36;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const int *w4 = (const int *)(bp + 4);\n"
+"        const unsigned int *xb = (const unsigned int *)(x_f16 + (size_t)b * 32);\n"
+"        unsigned int acc = 0u;  /* f16x2 accumulator */\n"
+"        /* Fold the per-block scale dw (~0.02) into the weight BEFORE the f16 multiply\n"
+"           so the dequantized weight is O(1): raw int8 (+/-127) x outlier f16 activation\n"
+"           summed in f16 would overflow the 65504 f16 range -> NaN. */\n"
+"        #pragma unroll\n"
+"        for (int k = 0; k < 8; k++) {\n"
+"            int wv = w4[k];\n"
+"            /* pack {dw*w_lo, dw*w_hi} and {dw*w_lo2, dw*w_hi2} into f16x2 (low=first elem) */\n"
+"            unsigned int w01, w23;\n"
+"            asm(\"cvt.rn.f16x2.f32 %0, %1, %2;\" : \"=r\"(w01)\n"
+"                : \"f\"(dw * (float)((wv << 16) >> 24)), \"f\"(dw * (float)((wv << 24) >> 24)));\n"
+"            asm(\"cvt.rn.f16x2.f32 %0, %1, %2;\" : \"=r\"(w23)\n"
+"                : \"f\"(dw * (float)(wv >> 24)), \"f\"(dw * (float)((wv << 8) >> 24)));\n"
+"            asm(\"fma.rn.f16x2 %0, %1, %2, %0;\" : \"+r\"(acc) : \"r\"(w01), \"r\"(xb[2*k+0]));\n"
+"            asm(\"fma.rn.f16x2 %0, %1, %2, %0;\" : \"+r\"(acc) : \"r\"(w23), \"r\"(xb[2*k+1]));\n"
+"        }\n"
+"        float lo = half_to_float((half_raw)(acc & 0xffffu));\n"
+"        float hi = half_to_float((half_raw)(acc >> 16));\n"
+"        sumf += lo + hi;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);\n"
+"    if (lane == 0) dst[row] = sumf;\n"
+"}\n"
+"\n"
 "/* ---- 11b. matvec_q8_0_dp4a_fused2: Fused gate+up Q8_0 × INT8 via dp4a ---- */\n"
 "__global__ void matvec_q8_0_dp4a_fused2(float *dst1, float *dst2,\n"
 "                                         const unsigned char *mat1, const unsigned char *mat2,\n"
@@ -8799,6 +8846,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q8_0_dp4a;
     CUfunction fn_matvec_q8_0_q8_1_dp4a;
     CUfunction fn_matvec_q8_0_f32;
+    CUfunction fn_matvec_q8_0_f16act;
     CUfunction fn_matvec_q8_0_f32_fused2;
     CUfunction fn_matvec_q8_0_dp4a_fused2;
     CUfunction fn_matvec_f16_f32_fused2;
@@ -9175,6 +9223,7 @@ struct cuda_llm_runner {
     /* Q8_1 quantization scratch (for K-quant dp4a path) */
     CUdeviceptr d_xb_q81;   /* Q8_1 blocks [ceil(max_dim/32)*36 bytes] */
     CUdeviceptr d_xb_q81_2; /* Q8_1 blocks [ceil(max_dim/32)*36 bytes] second buffer */
+    CUdeviceptr d_xb_f16;   /* F16 activation [max_dim halfs] for Q8_0 f16-act matvec */
     int use_dp4a;            /* 1 = use dp4a INT8 path for Q8_0 matvecs */
     CUdeviceptr d_hidden_snapshots; /* optional packed [3 * n_embd] snapshot buffer */
 
@@ -9438,6 +9487,7 @@ lookup_funcs:
     GET_FUNC(matvec_q8_0_dp4a);
     GET_FUNC(matvec_q8_0_q8_1_dp4a);
     GET_FUNC(matvec_q8_0_f32);
+    GET_FUNC(matvec_q8_0_f16act);
     GET_FUNC(matvec_q8_0_f32_fused2);
     GET_FUNC(matvec_q8_0_dp4a_fused2);
     GET_FUNC(matvec_f16_f32_fused2);
@@ -9818,8 +9868,9 @@ lookup_funcs:
                          * vec_dot_q8_0_q8_1 expects the standard 34-byte ggml block_q8_0 ->
                          * wrong stride -> NaN logits in-model (12B Q6_K lm_head is Q8_0).
                          * The standalone mmvq_q8_0_test passed only because it used the
-                         * standard 34B layout. Falls back to matvec_q8_0_q8_1_dp4a (correct,
-                         * ~34.2 t/s; the +0.5 t/s "gain" from the MMVQ path was the bug). */
+                         * standard 34B layout. Falls back through launch_matvec_auto to the
+                         * Q8_0 f16-act / dp4a path (correct; the +0.5 t/s "gain" from the
+                         * MMVQ path was the bug). */
                     };
                     char nm[64];
                     for (int i = 0; i < (int)(sizeof(reg)/sizeof(reg[0])); i++) {
@@ -11017,6 +11068,7 @@ static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_
         CHECK_CU(cuMemAlloc(&r->d_xb_q81,   q81_bytes));
         CHECK_CU(cuMemAlloc(&r->d_xb_q81_2, q81_bytes));
     }
+    CHECK_CU(cuMemAlloc(&r->d_xb_f16, (size_t)max_dim * sizeof(unsigned short)));
     CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
@@ -11949,6 +12001,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         CHECK_CU(cuMemAlloc(&r->d_xb_q81,   q81_bytes));
         CHECK_CU(cuMemAlloc(&r->d_xb_q81_2, q81_bytes));
     }
+    CHECK_CU(cuMemAlloc(&r->d_xb_f16, (size_t)max_dim * sizeof(unsigned short)));
     CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     /* Logits buffer (GPU + host) */
@@ -12518,6 +12571,20 @@ static inline void launch_matvec_q8_f32(cuda_llm_runner *r, CUdeviceptr dst, CUd
                    0, r->stream, args, NULL);
 }
 
+/* F16-activation Q8_0 matvec: convert x->f16 once, half2 (f16x2) fma. Middle ground
+ * (more accurate than int8, faster than f32). dp4a-style 1-warp/row, 8-rows/block. */
+static inline void launch_matvec_q8_f16act(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x, int n_rows, int n_cols) {
+    void *cargs[] = { &r->d_xb_f16, &x, &n_cols };
+    cuLaunchKernel(r->fn_convert_f32_to_f16, (n_cols + 255) / 256, 1, 1,
+                   256, 1, 1, 0, r->stream, cargs, NULL);
+    void *args[] = { &dst, &mat, &r->d_xb_f16, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q8_0_f16act,
+                   (n_rows + 7) / 8, 1, 1,
+                   256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
 /* ---- K-quant launch helpers ---- */
 
 static inline void launch_matvec_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
@@ -12723,7 +12790,17 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
         return;
     switch (weight_type) {
         case GGML_TYPE_Q8_0:
-            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
+            if (r->use_dp4a && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8_0_F16ACT")
+                && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
+                /* DEFAULT: F16-activation half2 (f16x2 fma) path. The int8 dp4a
+                 * activation quant of the post-residual hidden state is the dominant
+                 * decode error on Q8_0-heavy models (12B Q6_K is ~48% Q8_0 attn):
+                 * rel_L2 0.21 -> 0.11 here. F16 keeps the activation precision while
+                 * the packed f16x2 fma stays weight-BW-bound (33.1 vs dp4a 34.1 t/s,
+                 * vs f32's 17.2). CUDA_LLM_NO_Q8_0_F16ACT reverts to dp4a; gated on
+                 * use_dp4a so CUDA_LLM_NO_DP4A still reaches the full-f32 reference. */
+                launch_matvec_q8_f16act(r, dst, mat, x, n_rows, n_cols);
+            } else if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q8K_DP4A")) {
                 if (!getenv("CUDA_LLM_Q8_0_PERROW")) {
                     /* Block-wise (q8_1) activation quant: per-32 scales instead of
                      * one per-row absmax. Far more accurate (per-row crushed small
@@ -18079,6 +18156,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_xb_scale2) cuMemFree(r->d_xb_scale2);
     if (r->d_xb_q81)    cuMemFree(r->d_xb_q81);
     if (r->d_xb_q81_2)  cuMemFree(r->d_xb_q81_2);
+    if (r->d_xb_f16)    cuMemFree(r->d_xb_f16);
 
     /* Free KV cache (skip shared caches for Gemma4) */
     if (r->d_key_cache) {
