@@ -402,6 +402,8 @@ int main(void){
         if(!ar_env && ar_auto_cap>0 && ar_tokens>ar_auto_cap) ar_tokens=ar_auto_cap;
     }
     if(ar_tokens<1) ar_tokens=1;
+    int ar_hard_cap=envi("GLM5_AR_HARD_CAP",64);
+    if(ar_hard_cap>0 && ar_tokens>ar_hard_cap) ar_tokens=ar_hard_cap;
 
     utofu_tni_id_t*tni_ids=NULL; size_t num_tnis=0;
     rc=utofu_get_onesided_tnis(&tni_ids,&num_tnis); if(rc!=UTOFU_SUCCESS) die("utofu_get_onesided_tnis",rc);
@@ -465,8 +467,8 @@ int main(void){
     barrier_robust(1);
 
     static tp_comm comm;
-    if(MyRank==0) logmsg("allreduce: max_count=%d floats ar_tokens=%d pchunk=%d mstream=%d\n",
-                         cfg.hidden*ar_tokens,ar_tokens,pchunk0,mstream);
+    if(MyRank==0) logmsg("allreduce: max_count=%d floats ar_tokens=%d pchunk=%d mstream=%d ar_auto_cap=%d ar_hard_cap=%d\n",
+                         cfg.hidden*ar_tokens,ar_tokens,pchunk0,mstream,ar_auto_cap,ar_hard_cap);
     if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*ar_tokens,barrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
