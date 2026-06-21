@@ -9799,26 +9799,19 @@ lookup_funcs:
                 if (nr == (size_t)sz && cuModuleLoadDataEx(&r->mmvqv_mod, d, 0, NULL, NULL) == CUDA_SUCCESS) {
                     cuModuleGetFunction(&r->fn_mmvqv_quant, r->mmvqv_mod, "mmvq_quant_q8_1");
                     /* {sym, GGML_TYPE, qk}; nwarps=4 (GENERIC, ncols_dst=1) for all.
-                     * IQ3_S/IQ2_S are DELIBERATELY EXCLUDED: their vendored mul_mat_vec_q
-                     * produces wrong decode results in-model (31B seq-prefill rel_L2_vs_seq
-                     * 0.805/0.067 vs the 0.023 baseline; IQ2_XXS/IQ3_XXS/Q2_K/Q3_K all
-                     * verify clean at ~0.023, and IQ2_XXS passes the standalone CPU-F32
-                     * oracle at 0.0038). Root cause unresolved — the only types with a
-                     * separate `qh`+`signs` sub-block; struct layout, qi/vdr, grids, and
-                     * launch geometry all match the WORKING types, so it is a subtle
-                     * codebook-decode issue, not the integration. They fall back to the
-                     * validated hand-written matvec_iq{3,2}_s_*_coal kernels (correct,
-                     * slightly slower). Trampolines stay in the cubin; re-add here once
-                     * fixed. CUDA_LLM_MMVQ_SKIP="21,22" replicates this at runtime. */
+                     * IQ3_S/IQ2_S need the __noinline__ by-value vec_dot workaround in
+                     * mmq_vendor/mmvq.cuh (nvcc 13.2/sm_120a miscompiles the upstream
+                     * const-int&-param vec_dot_iq{3,2}_s when inlined into mul_mat_vec_q;
+                     * standalone IQ3_S CPU-F32 oracle 0.74 FAIL -> 0.0037 PASS with the fix). */
                     struct { const char *sym; int t, qk; } reg[] = {
                         { "iq2xxs", GGML_TYPE_IQ2_XXS, 256 },
                         { "iq3xxs", GGML_TYPE_IQ3_XXS, 256 },
+                        { "iq2s",   GGML_TYPE_IQ2_S,   256 },
+                        { "iq3s",   GGML_TYPE_IQ3_S,   256 },
                         { "q2k",    GGML_TYPE_Q2_K,    256 },
                         { "q3k",    GGML_TYPE_Q3_K,    256 },
                         { "q6k",    GGML_TYPE_Q6_K,    256 },
                         { "q4_0",   GGML_TYPE_Q4_0,     32 },
-                        /* { "iq2s", GGML_TYPE_IQ2_S, 256 },  // broken, see above */
-                        /* { "iq3s", GGML_TYPE_IQ3_S, 256 },  // broken, see above */
                     };
                     char nm[64];
                     for (int i = 0; i < (int)(sizeof(reg)/sizeof(reg[0])); i++) {

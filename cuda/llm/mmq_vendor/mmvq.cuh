@@ -220,6 +220,87 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// VENDOR EDIT (gemm/main): nvcc 13.2 / sm_120a MISCOMPILES vec_dot_iq3_s_q8_1 and
+// vec_dot_iq2_s_q8_1 when their `const int & kbx, const int & iqs` REFERENCE params are
+// used (decode rel_L2 ~0.74 vs CPU-F32; the _S types index iqs in more sub-expressions
+// than IQ2_XXS/IQ3_XXS, which survive). Proven: a byte-identical copy with BY-VALUE
+// int params is bit-correct (cuda/llm/mmq/dbg_iq3s.cu). These by-value reimplementations
+// replace the upstream functions at the mul_mat_vec_q call site (see mmvq_vecdot<>).
+static __device__ __noinline__ float mmvq_vd_iq3_s_byval(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, int kbx, int iqs) {
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+    const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs = (const uint8_t *) &qs_packed;
+    const int qh = bq3->qh[iqs/2];
+    const int signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8 = (const uint8_t *) &signs_packed_32;
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+static __device__ __noinline__ float mmvq_vd_iq2_s_byval(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, int kbx, int iqs) {
+    const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
+    const int       qs_packed = get_int_b2(bq2->qs, iqs/2);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+    const int qh = bq2->qh[iqs/2];
+    const int       signs_packed_32 = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+    const int ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int ls1 = bq2->scales[iqs/2] >> 4;
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        if (l0 < 4) {
+            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
+            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+        }
+    }
+    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+// Dispatch: the two miscompiled types use the by-value reimpl; everything else uses the
+// upstream function pointer (unchanged, verified correct). type is a compile-time constant
+// so only the matching branch is instantiated.
+template <ggml_type type>
+static __device__ __forceinline__ float mmvq_vecdot(
+    vec_dot_q_cuda_t f, const void * vx, const block_q8_1 * y, int kbx, int iqs) {
+    if constexpr (type == GGML_TYPE_IQ3_S) {
+        return mmvq_vd_iq3_s_byval(vx, y, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        return mmvq_vd_iq2_s_byval(vx, y, kbx, iqs);
+    } else {
+        return f(vx, y, kbx, iqs);
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 // VENDOR EDIT (gemm/main): __global__ -> __device__, __launch_bounds__ moved to trampoline.
 static __device__ void mul_mat_vec_q(
@@ -327,11 +408,11 @@ static __device__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
+                tmp[j][i] += mmvq_vecdot<type>(vec_dot_q_cuda,
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
+                        tmp_gate[j][i] += mmvq_vecdot<type>(vec_dot_q_cuda,
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
