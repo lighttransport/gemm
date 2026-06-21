@@ -128,7 +128,13 @@ static void barrier_robust(int robust){
         }while(*go<t);
     }
 }
-static void barrier(void){ barrier_robust(0); }
+/* Always robust: at large rank counts the N-1 -> 0 fan-in is an incast that congests rank 0's
+ * TNI, so single-shot (non-robust) puts drop and the barrier hangs (seen as a 384-node
+ * "barrier fan-in"/"barrier release" timeout). The robust path retries the fan-in put until
+ * release, which is why the bootstrap barriers (barrier_robust(1)) already survive 384 ranks.
+ * No barrier() is on a per-token hot path (those use tp_allreduce, robust by default), so the
+ * retry's usleep granularity costs nothing here. */
+static void barrier(void){ barrier_robust(1); }
 
 /* ---- EP combine all-reduce callback ---- */
 static double g_ar_secs=0.0; static long g_ar_calls=0, g_ar_frags=0;
