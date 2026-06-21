@@ -3248,6 +3248,56 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sumf;\n"
 "}\n"
 
+"/* ---- matvec_q4_0_f16act: Q4_0 weight x F16 activation via half2 (f16x2) PTX ---- */\n"
+"/* Same idea as matvec_q8_0_f16act: keep the activation in F16 (not int8) to cut the\n"
+"   dominant decode error, packed f16x2 fma, weight-BW-bound. Q4_0 block = 18B\n"
+"   (f16 d@0, 32 nibbles @2): low nibble of qs[j] -> elem j, high nibble -> elem j+16,\n"
+"   value = (nibble-8)*d. The -8 zero-point is applied per-element here (no s8 term);\n"
+"   the block scale dw is folded into the weight BEFORE the f16 multiply so dw*(nibble-8)\n"
+"   is O(1) (raw x outlier-f16-act summed in f16 would overflow 65504 -> NaN). The two\n"
+"   nibble halves index activations 16 apart, so we stream low-half (elems 2j,2j+1) and\n"
+"   high-half (elems 16+2j,16+2j+1) as separate f16x2 pairs. Cross-block accum in f32.\n"
+"   1-warp/row, 8-rows/block. x_f16 = n_cols consecutive halfs. */\n"
+"__global__ void matvec_q4_0_f16act(float *dst, const unsigned char *mat,\n"
+"                                     const unsigned short *x_f16, int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 32;\n"
+"    int row_bytes = nb * 18;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sumf = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 18;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        const unsigned short *xb = x_f16 + (size_t)b * 32;\n"
+"        unsigned int acc = 0u;  /* f16x2 accumulator */\n"
+"        #pragma unroll\n"
+"        for (int j = 0; j < 8; j++) {\n"
+"            unsigned int c0 = qs[2*j], c1 = qs[2*j+1];\n"
+"            unsigned int wlo, whi;\n"
+"            /* low nibbles -> elems 2j,2j+1 ; high nibbles -> elems 16+2j,16+2j+1.\n"
+"               cvt packs low=cvt(2nd arg), high=cvt(1st arg). */\n"
+"            asm(\"cvt.rn.f16x2.f32 %0, %1, %2;\" : \"=r\"(wlo)\n"
+"                : \"f\"(dw * (float)((int)(c1 & 0xF) - 8)), \"f\"(dw * (float)((int)(c0 & 0xF) - 8)));\n"
+"            asm(\"cvt.rn.f16x2.f32 %0, %1, %2;\" : \"=r\"(whi)\n"
+"                : \"f\"(dw * (float)((int)(c1 >> 4) - 8)), \"f\"(dw * (float)((int)(c0 >> 4) - 8)));\n"
+"            unsigned int xlo = *(const unsigned int *)(xb + 2*j);\n"
+"            unsigned int xhi = *(const unsigned int *)(xb + 16 + 2*j);\n"
+"            asm(\"fma.rn.f16x2 %0, %1, %2, %0;\" : \"+r\"(acc) : \"r\"(wlo), \"r\"(xlo));\n"
+"            asm(\"fma.rn.f16x2 %0, %1, %2, %0;\" : \"+r\"(acc) : \"r\"(whi), \"r\"(xhi));\n"
+"        }\n"
+"        float lo = half_to_float((half_raw)(acc & 0xffffu));\n"
+"        float hi = half_to_float((half_raw)(acc >> 16));\n"
+"        sumf += lo + hi;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);\n"
+"    if (lane == 0) dst[row] = sumf;\n"
+"}\n"
+
 "/* ---- matvec_q4_1_f32: Q4_1 matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_q4_1_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
@@ -8887,6 +8937,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_iq2_xxs_q8_1_dp4a_coal;
     CUfunction fn_matvec_q4_0_f32;
     CUfunction fn_matvec_q4_0_q8_1_dp4a;
+    CUfunction fn_matvec_q4_0_f16act;
     CUfunction fn_matvec_q4_1_f32;
     CUfunction fn_matvec_q5_0_f32;
     CUfunction fn_matvec_q5_1_f32;
@@ -9528,6 +9579,7 @@ lookup_funcs:
     GET_FUNC(matvec_iq2_xxs_q8_1_dp4a_coal);
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_0_q8_1_dp4a);
+    GET_FUNC(matvec_q4_0_f16act);
     GET_FUNC(matvec_q4_1_f32);
     GET_FUNC(matvec_q5_0_f32);
     GET_FUNC(matvec_q5_1_f32);
@@ -12648,6 +12700,18 @@ static inline void launch_matvec_q4_0_dp4a(cuda_llm_runner *r, CUdeviceptr dst, 
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+/* F16-activation Q4_0 matvec: convert x->f16 once, half2 (f16x2) fma. More accurate
+ * than int8 dp4a (the int8-act quant is the dominant decode error), ~same speed. */
+static inline void launch_matvec_q4_0_f16act(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                             CUdeviceptr x, int n_rows, int n_cols) {
+    void *cargs[] = { &r->d_xb_f16, &x, &n_cols };
+    cuLaunchKernel(r->fn_convert_f32_to_f16, (n_cols + 255) / 256, 1, 1,
+                   256, 1, 1, 0, r->stream, cargs, NULL);
+    void *args[] = { &dst, &mat, &r->d_xb_f16, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q4_0_f16act,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -12784,8 +12848,11 @@ static int launch_mmvq_vendor(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr m
 static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                        CUdeviceptr x, int n_rows, int n_cols, int weight_type) {
     /* Vendored llama mul_mat_vec_q decode matvec (4 warps/row, ~385 GB/s).  Default
-     * on; CUDA_LLM_NO_MMVQ_VENDOR reverts to the hand-written launch_matvec_* below. */
+     * on; CUDA_LLM_NO_MMVQ_VENDOR reverts to the hand-written launch_matvec_* below.
+     * Q4_0 f16act is opt-in (accuracy>speed) and lives in the switch below, so bypass
+     * the MMVQ hook for Q4_0 when CUDA_LLM_Q4_0_F16ACT is set. */
     if (cllm_mmvqv_enabled() &&
+        !(weight_type == GGML_TYPE_Q4_0 && getenv("CUDA_LLM_Q4_0_F16ACT")) &&
         launch_mmvq_vendor(r, dst, mat, x, n_rows, n_cols, weight_type) == 0)
         return;
     switch (weight_type) {
@@ -12867,7 +12934,15 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
             }
             break;
         case GGML_TYPE_Q4_0:
-            if (r->use_dp4a && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q40_DP4A")) {
+            if (r->use_dp4a && (n_cols % 32) == 0 && getenv("CUDA_LLM_Q4_0_F16ACT")) {
+                /* OPT-IN: F16-activation half2 path. UNLIKE Q8_0 (where f16act is ~free),
+                 * Q4_0 is 4-bit = very BW-light so the per-nibble f16 conversion makes it
+                 * COMPUTE-bound -> ~2x slower (26.7 vs 52 t/s) for a big accuracy win
+                 * (12B QAT decode rel_L2 0.21-0.32 -> 0.012; the error was ENTIRELY the
+                 * int8-act quant — F32 oracle uses the SAME 4-bit weights). Opt-in only,
+                 * and it also bypasses the MMVQ hook above (see launch_matvec_auto top). */
+                launch_matvec_q4_0_f16act(r, dst, mat, x, n_rows, n_cols);
+            } else if (r->use_dp4a && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q40_DP4A")) {
                 launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
                 launch_matvec_q4_0_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
             } else {
