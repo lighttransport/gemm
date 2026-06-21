@@ -285,3 +285,12 @@ vulkan/hy3d/test_vulkan_hy3d
 *.bin
 *.bak
 *.sqlite
+
+# --- repo hygiene (added during cleanup) ---
+# Keep genuine sample/web assets despite the broad image ignores above
+!web/public/**
+!common/fujisan.jpg
+!cpu/sam3d_body/samples/dancing.jpg
+# Never track Claude session state or stray captured stderr logs
+.claude/
+*_stderr.txt
