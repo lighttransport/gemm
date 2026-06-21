@@ -417,8 +417,19 @@ int main(void){
     uint8_t my_coords[TOFU_NCOORDS]={0};
     rc=utofu_query_my_coords(my_coords); if(rc!=UTOFU_SUCCESS) die("utofu_query_my_coords",rc);
     static uint8_t topo[MAX_NODES][TOFU_NCOORDS];
-    N=read_topo(topo); MyRank=-1;
-    for(int r=0;r<N;r++) if(memcmp(topo[r],my_coords,TOFU_NCOORDS)==0) MyRank=r;
+    N=read_topo(topo);
+    int rpn=envi("GLM5_RANKS_PER_NODE",1); if(rpn<1) rpn=1;
+    MyRank=-1;
+    if(rpn>1){
+        /* multiple ranks/node share the same Tofu node coords, so coord-matching is ambiguous;
+         * take MyRank from the MPI rank (topo is rank-ordered, validated by read_topo). */
+        const char*rk[]={"PMIX_RANK","OMPI_COMM_WORLD_RANK","PMI_RANK","GLM5_EP_RANK",NULL};
+        for(int i=0;rk[i];i++){ const char*e=getenv(rk[i]); if(e&&*e){ MyRank=atoi(e); break; } }
+        if(MyRank<0||MyRank>=N) die("GLM5_RANKS_PER_NODE>1: no valid MPI rank env",-1);
+        if(memcmp(topo[MyRank],my_coords,TOFU_NCOORDS)!=0) die("MPI rank vs topo coords mismatch",-1);
+    } else {
+        for(int r=0;r<N;r++) if(memcmp(topo[r],my_coords,TOFU_NCOORDS)==0) MyRank=r;
+    }
     if(MyRank==-1){ fprintf(stderr,"my coords not in %s\n",topo_path()); exit(1); }
 
     { char en[64]; snprintf(en,sizeof en,"glm5_ep_stderr_rank%02d.txt",MyRank); if(!freopen(en,"w",stderr)){} setvbuf(stderr,NULL,_IOLBF,0); }
@@ -459,13 +470,18 @@ int main(void){
     size_t region_sz=BAR_BASE+(size_t)(N+1)*SlotB;
     if(posix_memalign((void**)&Region,DEMO_CACHE_LINE,region_sz)!=0) die("posix_memalign",-1);
     memset(Region,0,region_sz);
-    utofu_tni_id_t tni=tni_ids[0];
+    /* Co-located ranks (same node coords) must be distinguishable on the wire: give each its own
+     * TNI by local rank, and address each peer via ITS local-rank TNI. A64FX exposes 6 TNIs, so
+     * up to 6 ranks/node. (rpn==1 keeps the original single-TNI path.) */
+    int local_rank = MyRank % rpn;
+    if((size_t)rpn > num_tnis){ fprintf(stderr,"GLM5_RANKS_PER_NODE %d > TNIs %zu\n",rpn,num_tnis); die("ranks/node>TNIs",-1); }
+    utofu_tni_id_t tni=tni_ids[local_rank];
     rc=utofu_create_vcq_with_cmp_id(tni,DEMO_CMP_ID,0,&Vcq); if(rc!=UTOFU_SUCCESS) die("utofu_create_vcq_with_cmp_id",rc);
     utofu_vcq_id_t my_real; rc=utofu_query_vcq_id(Vcq,&my_real); if(rc!=UTOFU_SUCCESS) die("utofu_query_vcq_id",rc);
     rc=utofu_reg_mem_with_stag(Vcq,Region,region_sz,RUN_STAG,0,&Base); if(rc!=UTOFU_SUCCESS) die("utofu_reg_mem_with_stag",rc);
     for(int r=0;r<N;r++){
         if(r==MyRank){ PeerVcq[r]=my_real; PeerBase[r]=Base; continue; }
-        rc=utofu_construct_vcq_id(topo[r],tni,DEMO_CQ_ID,DEMO_CMP_ID,&PeerVcq[r]); if(rc!=UTOFU_SUCCESS) die("utofu_construct_vcq_id(peer)",rc);
+        rc=utofu_construct_vcq_id(topo[r],tni_ids[r%rpn],DEMO_CQ_ID,DEMO_CMP_ID,&PeerVcq[r]); if(rc!=UTOFU_SUCCESS) die("utofu_construct_vcq_id(peer)",rc);
         utofu_set_vcq_id_path(&PeerVcq[r],NULL);
         rc=utofu_query_stadd(PeerVcq[r],RUN_STAG,&PeerBase[r]); if(rc!=UTOFU_SUCCESS) die("utofu_query_stadd(peer)",rc);
     }
