@@ -100,3 +100,25 @@ ssh fugaku 'cd ~/work/gemm/glm5-1 && pjsub --no-check-directory \
 
 → ~18.7 tok/s, NaNs=0. (`tok=5` GEMM is the binary default.) Note `th=24` over `th=12`:
 the earlier "best" used 12 threads; 24 (2 CMGs) is ~+12%.
+
+
+## UPDATE (2026-06-22): 4-ranks/node measured — NOT a win (Phase 2 closed)
+
+The multi-rank/node uTofu addressing was fixed (distinct TNI per local rank, commit) so 2- and
+4-ranks/node now run. Decisive 40-layer test, same 96 nodes, fp32 AR:
+
+```text
+1-rank th=24 (2 CMG):       40.33 tok/s  comm 34%
+1-rank th=48 (4 CMG):       27.14 tok/s  comm 45%   (fork-join regression, as expected)
+4-ranks/node th=12 (4x1CMG):16.02 tok/s  comm 61%   <- WORST
+```
+
+4-ranks/node is the **worst**. The 1-rank-per-CMG idea does avoid cross-CMG fork-join, but using
+more *ranks* to get there backfires: (1) the all-reduce becomes 384-way and comm explodes to 61%;
+(2) the un-shardable replicated dense (q_a/kv_a/gate/norms) is recomputed per rank, and attention
+caps at 64 heads, so more ranks add redundant work, not parallelism. Even a perfect hierarchical
+reduce (comm back to node-count) only recovers ~40 tok/s compute-only = **equal to 1-rank th=24**,
+not better. So the shared-dense staging + hierarchical-allreduce rework would not pay off and is
+**not pursued**. The 2-CMG (th=24) point is the genuine optimum; the ~20 tok/s full-model ceiling
+(≈40 tok/s at 40 layers) is fundamental for this model on A64FX. The multi-rank/node capability is
+kept (committed) as it may help other configs, but is off by default (GLM5_RANKS_PER_NODE=1).
