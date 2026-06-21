@@ -460,7 +460,7 @@ static size_t glm5_arena_size(const glm5_config*c,int ep_rank,int ep_size){
     int tp_attn=glm5_envi("GLM5_TP_ATTN",tp), tp_sh=glm5_envi("GLM5_TP_SHARED",tp);
     int tp_ffn=glm5_envi("GLM5_TP_FFN",tp), tp_head=glm5_envi("GLM5_TP_HEAD",tp), tp_emb=glm5_envi("GLM5_TP_EMBED",tp);
     int qrows = tp_attn ? (qh1-qh0)*c->head_dim : QD;
-    int shrows = tp_sh ? (c->moe_inter+ep_size-1)/ep_size : c->moe_inter;
+    int sh_r0_est=0, shrows=c->moe_inter; if(tp_sh) glm5_shard_blocks(c->moe_inter,128,ep_rank,ep_size,&sh_r0_est,&shrows);
     int ffrows = tp_ffn ? (c->dense_inter+ep_size-1)/ep_size : c->dense_inter;
     int hrows = tp_head ? (c->vocab+ep_size-1)/ep_size : c->vocab;
     int erows = tp_emb ? (c->vocab+ep_size-1)/ep_size : c->vocab;
@@ -606,7 +606,7 @@ static glm5_model* glm5_alloc_synth(glm5_config cfg,int ep_rank,int ep_size,int 
     int tp_ffn=glm5_envi("GLM5_TP_FFN",tp), tp_head=glm5_envi("GLM5_TP_HEAD",tp), tp_emb=glm5_envi("GLM5_TP_EMBED",tp);
     int qh0,qh1; if(tp_attn) glm5_shard_heads(cfg.n_heads,ep_rank,ep_size,&qh0,&qh1); else { qh0=0; qh1=cfg.n_heads; }
     int qrows=(qh1-qh0)*QHD, arows=(qh1-qh0)*VD, kvb_rows=(qh1-qh0)*(cfg.qk_nope_dim+VD);
-    int sh_r0,sh_rows; if(tp_sh) glm5_shard(cfg.moe_inter,ep_rank,ep_size,&sh_r0,&sh_rows); else { sh_r0=0; sh_rows=cfg.moe_inter; }
+    int sh_r0,sh_rows; if(tp_sh) glm5_shard_blocks(cfg.moe_inter,128,ep_rank,ep_size,&sh_r0,&sh_rows); else { sh_r0=0; sh_rows=cfg.moe_inter; }
     int ff_r0,ff_rows; if(tp_ffn) glm5_shard(cfg.dense_inter,ep_rank,ep_size,&ff_r0,&ff_rows); else { ff_r0=0; ff_rows=cfg.dense_inter; }
     int hr0,hrows; if(tp_head) glm5_shard(cfg.vocab,ep_rank,ep_size,&hr0,&hrows); else { hr0=0; hrows=cfg.vocab; }
     int er0,erows; if(tp_emb) glm5_shard(cfg.vocab,ep_rank,ep_size,&er0,&erows); else { er0=0; erows=cfg.vocab; }
@@ -761,7 +761,7 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     int tp=glm5_envi("GLM5_TP",0);
     int tp_attn=glm5_envi("GLM5_TP_ATTN",tp) && !m->cp_on; int tp_sh=glm5_envi("GLM5_TP_SHARED",tp),tp_ffn=glm5_envi("GLM5_TP_FFN",tp),tp_head=glm5_envi("GLM5_TP_HEAD",tp),tp_emb=glm5_envi("GLM5_TP_EMBED",tp);
     int qh0,qh1; if(tp_attn) glm5_shard_heads(cfg.n_heads,ep_rank,ep_size,&qh0,&qh1); else { qh0=0; qh1=cfg.n_heads; } int qrows=(qh1-qh0)*QHD, arows=(qh1-qh0)*VD;
-    int sh_r0,sh_rows; if(tp_sh) glm5_shard(cfg.moe_inter,ep_rank,ep_size,&sh_r0,&sh_rows); else { sh_r0=0; sh_rows=cfg.moe_inter; }
+    int sh_r0,sh_rows; if(tp_sh) glm5_shard_blocks(cfg.moe_inter,128,ep_rank,ep_size,&sh_r0,&sh_rows); else { sh_r0=0; sh_rows=cfg.moe_inter; }
     int ff_r0,ff_rows; if(tp_ffn) glm5_shard(cfg.dense_inter,ep_rank,ep_size,&ff_r0,&ff_rows); else { ff_r0=0; ff_rows=cfg.dense_inter; }
     int hr0,hrows; if(tp_head) glm5_shard(cfg.vocab,ep_rank,ep_size,&hr0,&hrows); else { hr0=0; hrows=cfg.vocab; }
     int er0,erows; if(tp_emb) glm5_shard(cfg.vocab,ep_rank,ep_size,&er0,&erows); else { er0=0; erows=cfg.vocab; }

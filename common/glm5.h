@@ -188,6 +188,14 @@ static inline void glm5_shard(int total, int rank, int size, int *r0, int *rows)
     int n  = base + (rank < rem ? 1 : 0);
     *r0 = lo; *rows = n;
 }
+static inline void glm5_shard_blocks(int total, int block, int rank, int size, int *r0, int *rows) {
+    int nb = (total + block - 1) / block;
+    int b0, bn; glm5_shard(nb, rank, size, &b0, &bn);
+    int lo = b0 * block, hi = (b0 + bn) * block;
+    if (lo > total) lo = total;
+    if (hi > total) hi = total;
+    *r0 = lo; *rows = hi - lo;
+}
 /* head/index heads must shard whole (head_dim contiguous): shard the head COUNT. */
 static inline void glm5_shard_heads(int n_heads, int rank, int size, int *h0, int *h1) {
     int r0, rows; glm5_shard(n_heads, rank, size, &r0, &rows); *h0 = r0; *h1 = r0 + rows;
