@@ -1,0 +1,6 @@
+bench_fopen
+bench_mmap
+*.o
+*.txt
+perf_output/
+fapp_output/

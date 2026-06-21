@@ -1,0 +1,19 @@
+# build artifacts (Makefile targets)
+tofu_topo_helper
+tofu_put_demo
+ring_attn_bench
+tni_stripe_bench
+ring_attn_overlap
+ring_attn_async
+moe_dispatch_bench
+moe_async_bench
+allgather_bench
+reducescatter_bench
+pp_handoff_bench
+p2p_latbw_bench
+# runtime-generated
+tofu_topo.txt
+# per-rank logs: demo_/ra_/rao_/raa_/moe_/moea_/ag_/rs_/pp_/p2p_log_<coords>.txt
+*_log_*.txt
+ts_result.txt
+output.*
