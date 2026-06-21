@@ -390,10 +390,15 @@ int main(void){
     int start_pos=envi("GLM5_START_POS",0); if(start_pos<0) start_pos=0;
     int layers=envi("GLM5_LAYERS",0), nexp=envi("GLM5_EXPERTS",0);
     int mstream=envi("GLM5_MSTREAM",1); if(mstream<1)mstream=1; if(mstream>64)mstream=64;
-    int ar_tokens=envi("GLM5_AR_TOKENS",0);
+    const char*ar_env=getenv("GLM5_AR_TOKENS");
+    int ar_tokens=(ar_env&&*ar_env)?atoi(ar_env):0;
     int pchunk0=envi("GLM5_PCHUNK",0);
-    if(ar_tokens<mstream) ar_tokens=mstream;
-    if(pchunk0>ar_tokens) ar_tokens=pchunk0;
+    if(!ar_env && (envi("GLM5_CP",0) || maxpos>65536)){
+        ar_tokens=1;  /* small registered slots for long-context/CP stability */
+    } else {
+        if(ar_tokens<mstream) ar_tokens=mstream;
+        if(pchunk0>ar_tokens) ar_tokens=pchunk0;
+    }
     if(ar_tokens<1) ar_tokens=1;
 
     utofu_tni_id_t*tni_ids=NULL; size_t num_tnis=0;
