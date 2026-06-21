@@ -31,8 +31,8 @@
 #ifndef TP_AR_STAG
 #define TP_AR_STAG 7                  /* steering tag for the all-reduce region  */
 #endif
-#define TP_AR_MAXN   256              /* max ranks in a TP/EP group (covers GLM5 192-node runs) */
-#define TP_AR_NSTEP  9                /* recv slots: sid 0..ceil(log2 pof2(N))+1; 9 covers N<=256 */
+#define TP_AR_MAXN   512              /* max ranks in a TP/EP group (covers GLM5 384-node runs) */
+#define TP_AR_NSTEP  11               /* recv slots: sid 0..nrounds+1 (bcast); 11 covers N<=512 (384-node) */
 #define TP_AR_LINE   256              /* A64FX cache line; each slot own-aligned  */
 #ifndef TP_AR_TIMEOUT
 #define TP_AR_TIMEOUT 60.0
