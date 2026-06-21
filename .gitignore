@@ -270,6 +270,12 @@ rdna4/vlm/test_*
 vulkan/hy3d/test_vulkan_hy3d
 
 # Compiled test/bench executables (regenerate via make) — purged from tracking.
+# cuda/llm/mmq dev/verify harness binaries (regenerate via cuda/llm/mmq/Makefile):
+# any *_test binary + the dbg_iq3s reproducer; keep the *.cu sources.
+cuda/llm/mmq/*_test
+!cuda/llm/mmq/*_test.cu
+cuda/llm/mmq/dbg_iq3s
+cuda/llm/mmq/dbg_iq3s_-O*
 cuda/llm/mmq/mmq_iq2_s_test
 cuda/llm/mmq/mmq_iq3_s_test
 cuda/llm/mmq/mmq_iq3xxs_test
