@@ -1159,6 +1159,7 @@ typedef struct {
      * block bitmap, so the O(pos) block scoring runs OpenMP-parallel over the chunk. */
     float *piq, *pik;         /* [n*idx_q_dim], [n*index_dim] batched index projections */
     char  *pbit; int nblkmax; /* [n*nblkmax] per-token block bitmap (nblkmax=ceil(max_pos/block)) */
+    float *hmx, *hse;         /* [n*64] per-token CP softmax max/sumexp -> deferred ordered combine */
 } glm5_mstream;
 
 /* Y[N,rows] (token-major) = X[N,cols] . W[rows,cols]^T. K-tiled (8 W rows for a tile stay
@@ -1358,6 +1359,7 @@ static void glm5_free_mstream(glm5_model*m){
     glm5_afree(ms->tmp2);glm5_afree(ms->exg);glm5_afree(ms->exu);glm5_afree(ms->emoe);glm5_afree(ms->bk);glm5_afree(ms->bw);glm5_afree(ms->bcnt);glm5_afree(ms->logits);glm5_afree(ms->sc);
     glm5_afree(ms->psel);glm5_afree(ms->pnsel);glm5_afree(ms->gsel);glm5_afree(ms->gselw);
     glm5_afree(ms->piq);glm5_afree(ms->pik);glm5_afree(ms->pbit);
+    glm5_afree(ms->hmx);glm5_afree(ms->hse);
     glm5_afree(ms); m->ms=NULL;
 }
 /* per_stream_kv=1: multi-stream decode (own KV per stream). 0: chunked prefill (shared model
@@ -1377,6 +1379,7 @@ static int glm5_alloc_mstream_ex(glm5_model*m,int N,int per_stream_kv){
     int kvb_scratch = c->qk_nope_dim+c->v_head_dim; if(kvb_scratch<2*c->kv_lora) kvb_scratch=2*c->kv_lora;
     ms->qlat=glm5_amalloc((size_t)N*c->q_lora*4); ms->kvb=glm5_amalloc((size_t)N*c->n_heads*kvb_scratch*4);
     ms->attn=glm5_amalloc((size_t)N*QD*4); ms->o=glm5_amalloc((size_t)N*H*4); ms->h2=glm5_amalloc((size_t)N*H*4);
+    ms->hmx=glm5_amalloc((size_t)N*64*4); ms->hse=glm5_amalloc((size_t)N*64*4);
     ms->router=glm5_amalloc((size_t)N*c->n_experts*4); ms->route=glm5_amalloc((size_t)N*H*4);
     ms->shg=glm5_amalloc((size_t)N*c->moe_inter*4); ms->shu=glm5_amalloc((size_t)N*c->moe_inter*4);
     ms->ffg=glm5_amalloc((size_t)N*c->dense_inter*4); ms->ffu=glm5_amalloc((size_t)N*c->dense_inter*4);
@@ -1387,7 +1390,7 @@ static int glm5_alloc_mstream_ex(glm5_model*m,int N,int per_stream_kv){
     ms->sc_stride = per_stream_kv ? c->max_pos : c->n_heads*(ms->maxsel>0?ms->maxsel:c->max_pos);
     ms->sc=glm5_amalloc((size_t)N*ms->sc_stride*4);
     int kvok = per_stream_kv ? (ms->kc&&ms->vc) : (ms->psel&&ms->pnsel);
-    if(!kvok||!ms->logits||!ms->qlat||!ms->kvb||!ms->sc){ m->ms=ms; glm5_free_mstream(m); return -1; }
+    if(!kvok||!ms->logits||!ms->qlat||!ms->kvb||!ms->sc||!ms->hmx||!ms->hse){ m->ms=ms; glm5_free_mstream(m); return -1; }
     m->ms=ms; return 0;
 }
 static int glm5_alloc_mstream(glm5_model*m,int N){ return glm5_alloc_mstream_ex(m,N,1); }
@@ -1616,15 +1619,16 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
          * q_rope dot k_rope. Values accumulate a weighted latent context and apply
          * the per-head value rows of wkv_b once, instead of expanding wkv_b per key. */
         int absorb_sve_dot=glm5_envi("GLM5_ABSORB_SVE_DOT",1);
-/* CP combines call into uTofu and must run in identical token order on every rank.
- * Keep this token loop serial under CP; otherwise OpenMP threads can enter collectives
- * concurrently and trigger descriptor/order failures. */
+/* The per-token local flash-attention math below touches no uTofu, so it is fully parallel
+ * even under CP. Per-token softmax stats (hmx/hse) and the unnormalized output go to per-token
+ * scratch; the CP combine (which DOES call uTofu) is deferred to an ordered serial loop after
+ * this region so every rank issues collectives in identical token order. */
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if(!m->cp_on)
+        #pragma omp parallel for schedule(static)
 #endif
         for(int t=0;t<S;t++){ float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*arows,*sc=ms->sc+(size_t)t*ms->sc_stride;
             const int*sel=ms->psel+(size_t)t*ms->maxsel; int ns=ms->pnsel[t];
-            float hmx[64],hse[64];
+            float*hmx=ms->hmx+(size_t)t*64,*hse=ms->hse+(size_t)t*64;
             float*qabs=ms->kvb+(size_t)t*c->n_heads*(2*c->kv_lora);
             float*ctxb=qabs+(size_t)c->n_heads*c->kv_lora;
             for(int hh=0;hh<nown;hh++){
@@ -1661,8 +1665,22 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
                 glm5_tensor tv=glm5_tensor_rows(&L->wkv_b,hh*kvb_stride+c->qk_nope_dim,c->v_head_dim);
                 glm5_mv(m,ab+hh*c->v_head_dim,&tv,ctxb+(size_t)hh*c->kv_lora,c->v_head_dim,c->kv_lora);
             }
-            if(m->cp_on && m->kv_combine_cb) m->kv_combine_cb(ab,hmx,hse,nown,c->v_head_dim,m->kv_combine_ctx);
-            else for(int hh=0;hh<nown;hh++){ float inv=1.0f/(hse[hh]>0?hse[hh]:1); float*oh=ab+hh*c->v_head_dim; for(int i=0;i<c->v_head_dim;i++) oh[i]*=inv; }
+        }
+        /* deferred combine/normalize. Under CP this calls uTofu, so it must be serial and in
+         * ascending token order (identical on every rank); non-CP just normalizes, in parallel. */
+        if(m->cp_on && m->kv_combine_cb){
+            for(int t=0;t<S;t++){
+                float*ab=ms->attn+(size_t)t*arows;
+                m->kv_combine_cb(ab,ms->hmx+(size_t)t*64,ms->hse+(size_t)t*64,nown,c->v_head_dim,m->kv_combine_ctx);
+            }
+        } else {
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
+            for(int t=0;t<S;t++){
+                float*ab=ms->attn+(size_t)t*arows; const float*hse=ms->hse+(size_t)t*64;
+                for(int hh=0;hh<nown;hh++){ float inv=1.0f/(hse[hh]>0?hse[hh]:1); float*oh=ab+hh*c->v_head_dim; for(int i=0;i<c->v_head_dim;i++) oh[i]*=inv; }
+            }
         }
         glm5_prof_add(m,GLM5_P_ATTN,pt);
         pt=glm5_prof_now();
