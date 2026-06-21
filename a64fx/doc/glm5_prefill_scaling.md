@@ -72,17 +72,16 @@ hierarchical reduce ⇒ plausibly **~35–50 tok/s**. Not guaranteed — see ris
 - Staging rework: split dense (shared) vs expert (per-rank) blobs; node-local shared-memory
   segment lifecycle (create by local-rank-0, map by the other 3, barrier, cleanup).
 - uTofu at higher rank counts: the EP group grows 4× (96 nodes → 384 ranks). The 384-rank path
-  is **currently stuck at a `barrier fan-in` timeout** (after `MAX_NODES`/`TP_AR_MAXN`/
-  `TP_AR_NSTEP` were raised) — likely noncontig routing or a stalling rank; must be fixed first.
-  Hierarchical reduce (intra-node shared-mem) would *reduce* uTofu group size back to node-count,
-  which may sidestep this.
+  **now runs end to end** — four scaling walls were fixed: `MAX_NODES 256→512` (`d5513d3`),
+  `TP_AR_MAXN 256→512` + `TP_AR_NSTEP 9→11` (`7f4bb51`), and a robust barrier for the 383→1
+  fan-in incast (`4a19895`). 384n short prefill = 15.83 tok/s, NaNs=0. Hierarchical reduce
+  (intra-node shared-mem) would further cut the inter-node uTofu group size back to node-count.
 - Memory headroom is tight (~22 GB dense + 4× scratch on a 31 GB node); KV/scratch must stay lean.
 - Per-CMG HBM locality: the shared dense blob should be NUMA-interleaved or each CMG's hot rows
   first-touched locally.
 
 ### Suggested incremental path
-1. Fix the 384-rank `barrier fan-in` wall (try torus placement vs noncontig; add a per-rank
-   liveness log to find a stalling rank).
+1. [DONE, 4a19895] 384-rank init now works (robust barrier). 384n prefill runs end to end.
 2. Prototype node-local shared-dense mmap with **2 ranks/node** (2 CMGs) first — lower memory and
    comm risk — and confirm the fork-join win materializes before going to 4.
 3. Add the hierarchical (intra-node shared-mem) allreduce.
