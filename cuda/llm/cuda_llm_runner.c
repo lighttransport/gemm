@@ -9088,6 +9088,21 @@ struct cuda_llm_runner {
     CUdeviceptr d_mmqd_wl;        /* int  worklist */
     size_t d_mmqd_cap;            /* allocated cxq8 capacity in bytes (0 = unallocated) */
     int d_mmqd_wl_ntok;           /* n_tokens the cached worklist/eb were built for */
+
+    /* Vendored llama.cpp mul_mat_q (stream-K int8 MMQ), gated CUDA_LLM_MMQ_VENDOR.
+     * Loaded from mmq_kernels.cubin; see mmq_vendor/ + mmq_kernels.cu. */
+    CUmodule    mmqv_mod;
+    CUfunction  fn_mmqv_iq2xxs_nc0;   /* mul_mat_q<IQ2_XXS,128,need_check=false> */
+    CUfunction  fn_mmqv_iq2xxs_nc1;   /* need_check=true (out_dim % 128 != 0) */
+    CUfunction  fn_mmqv_fixup_iq2xxs_nc0;
+    CUfunction  fn_mmqv_fixup_iq2xxs_nc1;
+    CUfunction  fn_mmqv_quant_d4;     /* float -> block_q8_1_mmq (D4 layout) */
+    CUdeviceptr d_mmqv_y;             /* block_q8_1_mmq activations */
+    size_t      d_mmqv_y_cap;
+    CUdeviceptr d_mmqv_fixup;         /* stream-K tmp_fixup reduction buffer */
+    size_t      d_mmqv_fixup_cap;
+    int         mmqv_nsm;             /* SM count (stream-K grid sizing); 0 = unqueried */
+
     float *h_router_logits;       /* host copy for top-k selection */
 
     /* GPU weights */
@@ -9662,6 +9677,62 @@ lookup_funcs:
             }
         } else if (r->verbose >= 1) {
             fprintf(stderr, "cuda_llm: %s not found; FA2 flash attention disabled\n", cp);
+        }
+    }
+
+    /* Load vendored llama.cpp mul_mat_q (stream-K int8 MMQ) cubin. Opt-in via
+     * CUDA_LLM_MMQ_VENDOR at the dense dispatch; load eagerly so it's ready. */
+    r->mmqv_mod = 0;
+    r->fn_mmqv_iq2xxs_nc0 = r->fn_mmqv_iq2xxs_nc1 = NULL;
+    r->fn_mmqv_fixup_iq2xxs_nc0 = r->fn_mmqv_fixup_iq2xxs_nc1 = NULL;
+    r->fn_mmqv_quant_d4 = NULL;
+    r->d_mmqv_y = 0; r->d_mmqv_y_cap = 0;
+    r->d_mmqv_fixup = 0; r->d_mmqv_fixup_cap = 0;
+    r->mmqv_nsm = 0;
+    {
+        const char *cp = "cuda/llm/mmq_kernels.cubin";
+        FILE *fp = cllm_fopen_cubin("mmq_kernels.cubin", &cp);
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long sz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            char *d = (char *)malloc((size_t)sz);
+            if (d) {
+                size_t nr = fread(d, 1, (size_t)sz, fp);
+                fclose(fp);
+                if (nr == (size_t)sz && cuModuleLoadDataEx(&r->mmqv_mod, d, 0, NULL, NULL) == CUDA_SUCCESS) {
+#define CLLM_LOAD_MMQV(dst, name) do { \
+                        CUfunction _fn = NULL; \
+                        if (cuModuleGetFunction(&_fn, r->mmqv_mod, (name)) == CUDA_SUCCESS) (dst) = _fn; \
+                        else (dst) = NULL; \
+                    } while (0)
+                    CLLM_LOAD_MMQV(r->fn_mmqv_iq2xxs_nc0, "mmqv_iq2xxs_x128_nc0");
+                    CLLM_LOAD_MMQV(r->fn_mmqv_iq2xxs_nc1, "mmqv_iq2xxs_x128_nc1");
+                    CLLM_LOAD_MMQV(r->fn_mmqv_fixup_iq2xxs_nc0, "mmqv_fixup_iq2xxs_x128_nc0");
+                    CLLM_LOAD_MMQV(r->fn_mmqv_fixup_iq2xxs_nc1, "mmqv_fixup_iq2xxs_x128_nc1");
+                    CLLM_LOAD_MMQV(r->fn_mmqv_quant_d4, "mmqv_quant_q8_1_d4");
+#undef CLLM_LOAD_MMQV
+                    /* The mul_mat_q kernel uses ~100 KB dynamic shared memory (> 48 KB
+                     * default) -> opt in or the launch silently fails. nbytes_shared is
+                     * recomputed at launch; opt in to the max (112 KB on sm_120). */
+                    CUfunction mmqv_fns[2] = { r->fn_mmqv_iq2xxs_nc0, r->fn_mmqv_iq2xxs_nc1 };
+                    for (int i = 0; i < 2; i++) {
+                        if (mmqv_fns[i]) cuFuncSetAttribute(mmqv_fns[i],
+                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 112*1024);
+                    }
+                    cuDeviceGetAttribute(&r->mmqv_nsm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, r->device);
+                    if (r->verbose >= 1)
+                        fprintf(stderr, "cuda_llm: loaded %s (vendored stream-K MMQ; IQ2_XXS%s, nsm=%d)\n",
+                            cp, r->fn_mmqv_iq2xxs_nc0 ? "" : " MISSING", r->mmqv_nsm);
+                } else if (r->verbose >= 1) {
+                    fprintf(stderr, "cuda_llm: failed to load %s\n", cp);
+                }
+                free(d);
+            } else {
+                fclose(fp);
+            }
+        } else if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: %s not found; vendored MMQ disabled\n", cp);
         }
     }
 
@@ -14756,6 +14827,112 @@ static int launch_dequant_gemm_f16(cuda_llm_runner *r, CUdeviceptr dst, CUdevice
  * Treats the dense weight as a single expert with all n_tokens routed to it.
  * dst is [n_tokens x out_dim] row-major (matches the cuBLAS path).
  * Returns 0 on success, -1 to fall back. */
+
+/* ----- Vendored llama.cpp mul_mat_q (stream-K) dense launcher (Phase 1) ----- */
+/* uint3 fastdiv constants {mp, L, divisor} — replicates common.cuh
+ * init_fastdiv_values so the C runner can build the kernel's div args. */
+typedef struct { unsigned int x, y, z; } cllm_u3;
+static cllm_u3 cllm_fastdiv(unsigned long long d_64) {
+    unsigned int d = (unsigned int)d_64, L = 0;
+    while (L < 32 && ((unsigned int)1 << L) < d) L++;
+    unsigned int mp = (unsigned int)(((unsigned long long)1 << 32) *
+                       (((unsigned long long)1 << L) - d) / d + 1);
+    cllm_u3 r = { mp, L, d };
+    return r;
+}
+/* mmq_get_nbytes_shared<IQ2_XXS>(mmq_x=128, mmq_y=128, cc=1200, ws=32, nwarps=8).
+ * Verified via /tmp/mmq_probe against the vendored header; the 112 KB FuncAttribute
+ * opt-in at load covers it. */
+#define CLLM_MMQV_NBYTES_IQ2XXS 57856
+
+/* Vendored stream-K MMQ for dense IQ2_XXS. Same API as launch_mmq_iq2xxs_dense.
+ * Replicates launch_mul_mat_q (mmq.cu) arithmetic; activations are quantized to
+ * block_q8_1_mmq (D4 layout). Returns 0 on success, -1 to fall back. */
+static int launch_mmq_iq2xxs_dense_v2(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                       CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
+    if (!r->fn_mmqv_iq2xxs_nc0 || !r->fn_mmqv_quant_d4) return -1;
+    if (out_dim % 64 != 0 || in_dim % 256 != 0 || n_tokens < 1) return -1;
+    const int mmq_x = 128, mmq_y = 128, nwarps = 8, warp_size = 32;
+    const int N = out_dim, K = in_dim, M = n_tokens;
+    const int nsm = r->mmqv_nsm > 0 ? r->mmqv_nsm : 36;
+
+    /* (1) quantize activations F32 -> block_q8_1_mmq (D4). */
+    const int ne10p = (K + 511) & ~511;                 /* GGML_PAD(K, 512) */
+    size_t ybytes = (size_t)M * ne10p * 36 / 32 + 256 * 144; /* q8_1=36B + slack */
+    if (r->d_mmqv_y_cap < ybytes) {
+        if (r->d_mmqv_y) cuMemFree(r->d_mmqv_y);
+        r->d_mmqv_y = 0; r->d_mmqv_y_cap = 0;
+        if (cuMemAlloc(&r->d_mmqv_y, ybytes) != CUDA_SUCCESS) return -1;
+        r->d_mmqv_y_cap = ybytes;
+    }
+    {
+        CUdeviceptr ids0 = 0;
+        long long ne00 = K, s01 = K, s02 = 0, s03 = 0, ne0 = ne10p;
+        int ne1 = M, ne2 = 1;
+        int block_num_y = (ne10p + 4*128 - 1) / (4*128);
+        void *a[] = { &input, &ids0, &r->d_mmqv_y, &ne00, &s01, &s02, &s03, &ne0, &ne1, &ne2 };
+        if (cuLaunchKernel(r->fn_mmqv_quant_d4, M, block_num_y, 1, 128, 1, 1, 0, r->stream, a, NULL) != CUDA_SUCCESS)
+            return -1;
+    }
+
+    /* (2) mul_mat_q stream-K. Grid math replicates launch_mul_mat_q. */
+    int need_check = (N % mmq_y != 0);
+    CUfunction kfn = need_check ? r->fn_mmqv_iq2xxs_nc1 : r->fn_mmqv_iq2xxs_nc0;
+    CUfunction ffn = need_check ? r->fn_mmqv_fixup_iq2xxs_nc1 : r->fn_mmqv_fixup_iq2xxs_nc0;
+    if (!kfn) return -1;
+    int nty = (N + mmq_y - 1) / mmq_y;
+    int ntx = (M + mmq_x - 1) / mmq_x;
+    int ntiles_dst = ntx * nty;
+    int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+    int tiles_eff = 100 * ntiles_dst / (nsm * tiles_nwaves);
+    int sk_x = (tiles_eff >= 90) ? ntiles_dst : nsm;
+    int fixup_needed = (ntiles_dst % sk_x) != 0;
+
+    cllm_u3 bp  = cllm_fastdiv((unsigned long long)K / 256);
+    cllm_u3 one = cllm_fastdiv(1);
+    cllm_u3 ntxfd = cllm_fastdiv((unsigned long long)ntx);
+    int s01b = K / 256, zeroi = 0;
+    CUdeviceptr null_p = 0;
+
+    if (fixup_needed) {
+        size_t need = (size_t)sk_x * mmq_x * mmq_y * sizeof(float);
+        if (r->d_mmqv_fixup_cap < need) {
+            if (r->d_mmqv_fixup) cuMemFree(r->d_mmqv_fixup);
+            r->d_mmqv_fixup = 0; r->d_mmqv_fixup_cap = 0;
+            if (cuMemAlloc(&r->d_mmqv_fixup, need) != CUDA_SUCCESS) return -1;
+            r->d_mmqv_fixup_cap = need;
+        }
+    }
+    CUdeviceptr tmpfix = fixup_needed ? r->d_mmqv_fixup : 0;
+
+    {
+        /* arg order matches mul_mat_q(): x,y,ids_dst,expert_bounds,dst,tmp_fixup,
+         * blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
+         * channel_ratio, nchannels_y, stride_{channel}_x/y/dst,
+         * sample_ratio, nsamples_y, stride_{sample}_x/y/dst, ntx */
+        void *a[] = { &mat, &r->d_mmqv_y, &null_p, &null_p, &dst, &tmpfix,
+                      &bp, (void*)&N, (void*)&M, &s01b, (void*)&M, (void*)&N,
+                      &one, &one, &zeroi, &zeroi, &zeroi,
+                      &one, &one, &zeroi, &zeroi, &zeroi,
+                      &ntxfd };
+        if (cuLaunchKernel(kfn, sk_x, 1, 1, warp_size, nwarps, 1,
+                           CLLM_MMQV_NBYTES_IQ2XXS, r->stream, a, NULL) != CUDA_SUCCESS)
+            return -1;
+    }
+    if (fixup_needed) {
+        /* mul_mat_q_stream_k_fixup(): ids_dst,expert_bounds,dst,tmp_last_tile,
+         * blocks_per_ne00, nrows_x, ncols_dst, stride_col_dst,
+         * nchannels_y, stride_channel_dst, nsamples_y, stride_sample_dst, ntx */
+        void *a[] = { &null_p, &null_p, &dst, &r->d_mmqv_fixup,
+                      &bp, (void*)&N, (void*)&M, (void*)&N,
+                      &one, &zeroi, &one, &zeroi, &ntxfd };
+        if (cuLaunchKernel(ffn, sk_x, mmq_y/warp_size, 1, warp_size, nwarps/2, 1,
+                           0, r->stream, a, NULL) != CUDA_SUCCESS)
+            return -1;
+    }
+    return 0;
+}
+
 static int launch_mmq_iq2xxs_dense(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                     CUdeviceptr input, int out_dim, int in_dim, int n_tokens) {
     if (!r->fn_mmq_iq2xxs_grouped || !r->fn_mmq_quant_q8_1) return -1;
@@ -15266,6 +15443,11 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
         void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
         cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
     } else if (weight_type == GGML_TYPE_IQ2_XXS) {
+        /* Vendored llama.cpp stream-K MMQ (CUDA_LLM_MMQ_VENDOR): ~4x our grouped8
+         * kernel on this GPU. Opt-in until all needed types are validated. */
+        if (getenv("CUDA_LLM_MMQ_VENDOR") && n_tokens > 1 &&
+            launch_mmq_iq2xxs_dense_v2(r, dst, mat, input, out_dim, in_dim, n_tokens) == 0)
+            return;
         /* Prefer the int8 tensor-core MMQ for all batch sizes.
            CUDA_LLM_NO_MMQ_DENSE forces the dequant->cuBLAS path. */
         if (!getenv("CUDA_LLM_NO_MMQ_DENSE") &&
@@ -17785,9 +17967,14 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_f16_scratch) cuMemFree(r->d_f16_scratch);
     if (r->d_f32_scratch) cuMemFree(r->d_f32_scratch);
 
+    /* Vendored MMQ buffers + module */
+    if (r->d_mmqv_y) cuMemFree(r->d_mmqv_y);
+    if (r->d_mmqv_fixup) cuMemFree(r->d_mmqv_fixup);
+
     /* Free modules */
     if (r->module) cuModuleUnload(r->module);
     if (r->fa2_mod) cuModuleUnload(r->fa2_mod);
+    if (r->mmqv_mod) cuModuleUnload(r->mmqv_mod);
     if (r->cublas) cublasewDestroy(r->cublas);
 
     /* Free host buffer */
