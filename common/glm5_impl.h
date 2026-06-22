@@ -590,14 +590,34 @@ static void glm5_free(glm5_model*m){
     glm5_afree(m);
 }
 
-/* init int4-KV / CP flags from env (call once after ep_rank/ep_size set, before glm5_alloc_kv). */
+/* Context-tiered KV init (call once after ep_rank/ep_size set, before glm5_alloc_kv).
+ * Default: a single binary auto-picks the prefill algorithm by context length -- start in Tier A
+ * (cp_on=0 bf16, KV replicated per rank, no per-token CP combine) while the un-sharded KV fits a
+ * per-rank budget, then transition (glm5_prefill_to_cp) to Tier B (cp_on=1 int4, CP-sharded) at
+ * T_cp. If the whole context fits un-sharded, it stays Tier A throughout (no CP overhead).
+ * GLM5_CP_THRESHOLD: 0=auto (default), >0=explicit T_cp positions, <0=static (legacy env CP/int4,
+ * for forced-CP A/B reference). GLM5_KV_BUDGET_GB tunes the auto budget. */
 static void glm5_kv_init(glm5_model*m){
     const glm5_config*c=&m->cfg;
-    m->int4_kv =glm5_envi("GLM5_INT4_KV",0);       /* int4 KV (independent of CP; both for 1M) */
-    m->kv_fp16 =glm5_envi("GLM5_KV_FP16",0);        /* uint16 KV path: fp16 (1) vs bf16 (0) */
-    m->cp_on   =glm5_envi("GLM5_CP",0) && m->ep_size>1;
+    m->kv_fp16 =glm5_envi("GLM5_KV_FP16",0);
     m->cp_block=c->msa_block_size;             /* CP shard granularity == MSA block (128) */
-    m->cp_nslot=glm5_cp_nslot(c->max_pos,m->cp_block,m->ep_size,m->cp_on);
+    int ctx=c->max_pos, thr=glm5_envi("GLM5_CP_THRESHOLD",0);
+    if(m->ep_size<=1 || thr<0){                /* static / legacy: env-driven, no tiering */
+        m->int4_kv=glm5_envi("GLM5_INT4_KV",0);
+        m->cp_on  =glm5_envi("GLM5_CP",0) && m->ep_size>1;
+        m->cp_nslot=glm5_cp_nslot(ctx,m->cp_block,m->ep_size,m->cp_on);
+        m->T_cp=0; return;
+    }
+    /* per-position un-sharded bf16 KV bytes across all layers (latent KV + MSA index on MoE). */
+    int KVD=glm5_kv_cache_dim(c), ID=c->index_dim;
+    int n_dense=c->n_dense_layers<c->n_layers?c->n_dense_layers:c->n_layers, n_moe=c->n_layers-n_dense;
+    long per_pos=(long)c->n_layers*KVD*2 + (long)n_moe*ID*2;
+    long T = thr>0 ? thr : ((long)glm5_envi("GLM5_KV_BUDGET_GB",4)<<30)/(per_pos>0?per_pos:1);
+    if(T<m->cp_block) T=m->cp_block;
+    T=(T/m->cp_block)*m->cp_block;             /* block-align so Tier-A slots are CP-block aligned */
+    m->int4_kv=0; m->cp_on=0;                   /* start in Tier A (bf16, replicated) */
+    if(T>=ctx){ m->cp_nslot=ctx; m->T_cp=0; }   /* whole context fits un-sharded: Tier A only */
+    else      { m->cp_nslot=(int)T; m->T_cp=(int)T; }  /* transition to CP+int4 at T */
 }
 /* allocate this layer's KV cache (bf16 or int4, sized to cp_nslot owned slots). */
 static void glm5_alloc_kv(glm5_model*m,glm5_layer*L,int is_moe,size_t*used){
@@ -612,6 +632,45 @@ static void glm5_alloc_kv(glm5_model*m,glm5_layer*L,int is_moe,size_t*used){
         L->kv_cache=glm5_acalloc(ns*KVD,2); *used += ns*KVD*2;
         if(is_moe){ L->idx_k_cache=glm5_acalloc(ns*ID,2); *used += ns*ID*2; }
     }
+}
+
+/* Tier A -> Tier B transition (called once when pos reaches m->T_cp). Each rank currently holds
+ * the full [0,upto) KV un-sharded (Tier A: bf16, slot=pos). This keeps only this rank's CP-owned
+ * blocks (b%ep_size==ep_rank), repacked int4 at the block-cyclic CP slot, for both the latent KV
+ * and the MSA index keys; frees the larger Tier-A buffers; then flips cp_on/int4_kv. Purely local
+ * (no collective) -- but must run on every rank in lockstep before the next chunk's collectives. */
+static void glm5_prefill_to_cp(glm5_model*m,int upto){
+    const glm5_config*c=&m->cfg;
+    int KVD=glm5_kv_cache_dim(c), ID=c->index_dim, B=m->cp_block, eps=m->ep_size, er=m->ep_rank;
+    int nslotB=glm5_cp_nslot(c->max_pos,B,eps,1);
+    float kv[1024], ik[256];   /* KVD<=576, ID<=128 */
+    for(int l=0;l<c->n_layers;l++){
+        glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(c,l);
+        /* idx cache exists only for layers that actually had a Tier-A MSA index buffer (real-weight
+         * load allocates idx for has_full_indexer layers, not all MoE) -- key off the buffer, not
+         * is_moe, so this matches exactly which layers Tier B allocates idx_q4 for. */
+        int has_idx = (L->idx_k_cache!=NULL);
+        uint8_t *nk=glm5_acalloc((size_t)nslotB*(KVD/2),1); uint16_t *nks=glm5_acalloc((size_t)nslotB,2);
+        uint8_t *niq=NULL; uint16_t *niqs=NULL;
+        if(has_idx){ niq=glm5_acalloc((size_t)nslotB*(ID/2),1); niqs=glm5_acalloc((size_t)nslotB,2); }
+        for(int pos=0;pos<upto;pos++){
+            int b=pos/B; if(b%eps!=er) continue;                 /* keep only my CP-owned blocks */
+            int newslot=(b/eps)*B + (pos%B);                     /* == glm5_cp_slot under cp_on=1 */
+            const uint16_t*kc=L->kv_cache+(size_t)pos*KVD;
+            for(int i=0;i<KVD;i++) kv[i]=glm5_kv_dec(m,kc[i]);
+            nks[newslot]=glm5_q4_pack(nk+(size_t)newslot*(KVD/2),kv,KVD);
+            if(has_idx){
+                const uint16_t*ic=L->idx_k_cache+(size_t)pos*ID;
+                for(int i=0;i<ID;i++) ik[i]=glm5_kv_dec(m,ic[i]);
+                niqs[newslot]=glm5_q4_pack(niq+(size_t)newslot*(ID/2),ik,ID);
+            }
+        }
+        (void)is_moe;
+        glm5_afree(L->kv_cache); L->kv_cache=NULL;
+        glm5_afree(L->idx_k_cache); L->idx_k_cache=NULL;
+        L->k_q4=nk; L->k_qs=nks; L->idx_q4=niq; L->idx_qs=niqs;
+    }
+    m->int4_kv=1; m->cp_on=1; m->cp_nslot=nslotB;
 }
 
 static void glm5_alloc_scratch(glm5_model*m,int hrows){

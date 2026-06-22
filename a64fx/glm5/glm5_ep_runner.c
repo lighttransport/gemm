@@ -494,12 +494,17 @@ int main(void){
     if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*ar_tokens,barrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
-    if(m->cp_on){   /* context-parallel KV: provide the cross-rank block-score MAX + flash-combine */
-        g_kvbuf=(float*)glm5_amalloc((size_t)(cfg.n_heads + cfg.n_heads*cfg.head_dim)*sizeof(float));
-        m->blk_reduce_cb=ep_blk_reduce; m->blk_reduce_ctx=&comm;
-        m->kv_combine_cb=ep_kv_combine; m->kv_combine_ctx=&comm;
-        if(MyRank==0) logmsg("CP ON: KV sharded block-cyclic (block=%d) over %d ranks, %d slots/rank, int4_kv=%d\n",
+    /* CP callbacks are wired unconditionally so a mid-run Tier A->B transition can turn CP on.
+     * They stay dormant while m->cp_on==0 (the forward gates the combine/block-reduce on it). */
+    g_kvbuf=(float*)glm5_amalloc((size_t)(cfg.n_heads + cfg.n_heads*cfg.head_dim)*sizeof(float));
+    m->blk_reduce_cb=ep_blk_reduce; m->blk_reduce_ctx=&comm;
+    m->kv_combine_cb=ep_kv_combine; m->kv_combine_ctx=&comm;
+    if(MyRank==0){
+        if(m->T_cp>0) logmsg("CP TIERED: Tier A (cp_on=0 bf16, %d slots) -> transition at pos=%d -> Tier B (CP int4, block=%d over %d ranks)\n",
+                             m->cp_nslot,m->T_cp,m->cp_block,N);
+        else if(m->cp_on) logmsg("CP ON: KV sharded block-cyclic (block=%d) over %d ranks, %d slots/rank, int4_kv=%d\n",
                              m->cp_block,N,m->cp_nslot,m->int4_kv);
+        else logmsg("CP OFF: un-sharded KV, %d slots/rank (context fits, single-tier)\n",m->cp_nslot);
     }
     if(envi("GLM5_COMM_OVERLAP",0)){
         atomic_store(&g_comm_stop,0); atomic_store(&g_comm_done,1); atomic_store(&g_comm_go,0);
@@ -635,6 +640,14 @@ int main(void){
                 for(int t=0;t<S;t++){
                     int tok=(p0+t)*1315423911u % (unsigned)m->cfg.vocab;
                     embed_lookup(m,tok,Xc+(size_t)t*C);
+                }
+                /* Tier A->B: re-shard the [0,p0) history BEFORE any chunk that would store a
+                 * position >= T_cp (so the Tier-A buffer never overflows). Lockstep on all ranks. */
+                if(!m->cp_on && m->T_cp>0 && p0+S>m->T_cp){
+                    double tt=now_sec(); glm5_prefill_to_cp(m,p0);
+                    barrier();
+                    if(MyRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP int4 %d slots/rank\n",
+                                         p0,now_sec()-tt,m->cp_nslot);
                 }
                 int a=glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=prefill);
                 if(a>=0) pf_last=a;

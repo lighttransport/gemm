@@ -288,6 +288,11 @@ typedef struct {
      * per-rank partial attention ( kv_combine_cb) + a cross-rank top-k block merge for MSA. */
     int int4_kv, cp_on, cp_nslot, cp_block;
     int kv_fp16;   /* uint16 KV path stores IEEE fp16 (GLM5_KV_FP16) instead of bf16 (quality ref) */
+    /* context-tiered prefill: a single job runs Tier A (cp_on=0 bf16, KV replicated, no per-token
+     * CP combine -- fast) while pos < T_cp, then re-shards the KV in place and flips to Tier B
+     * (cp_on=1 int4, CP-sharded) for the long tail. T_cp is derived from the per-rank memory
+     * budget (positions whose un-sharded KV fits). T_cp==0 disables tiering (static config). */
+    int T_cp;
     /* flash-combine of [n_heads*head_dim] partial out + per-head (max,sumexp) across EP ranks.
      * The runner provides a uTofu all-reduce specialized for the online-softmax merge. */
     void  (*kv_combine_cb)(float *out, float *mx, float *sumexp, int n_heads, int head_dim, void *ctx);
