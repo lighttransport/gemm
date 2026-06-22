@@ -176,6 +176,46 @@ static void ep_kv_combine(float*out,float*mx,float*se,int nh,int hd,void*ctx){
     g_ar_secs+=now_sec()-t0; g_ar_calls++;
     g_ar_frags+=nf;
 }
+/* batched flash-combine for a whole prefill chunk (S tokens): collapses 2*S per-token collectives
+ * into ONE allreduce_max over [S*nh] + ONE allreduce_sum over [S*(nh+nh*hd)]. The per-(t,h,i)
+ * arithmetic is byte-for-byte ep_kv_combine, so the result is bit-identical to the per-token loop;
+ * allreduce reduces each element independently under a fixed rank schedule, so concatenating the
+ * tokens (and the flat max_count fragmentation that straddles token boundaries) changes nothing.
+ * mx/se share mxse_stride; out uses out_stride. Local rescale/normalize are OpenMP-parallel here
+ * (the per-token path can't parallelize them -- they sit between the two collectives). */
+static float *g_kvmax=NULL;   /* [S*nh] gathered per-(t,h) global max */
+static void ep_kv_combine_batch(float*out,float*mx,float*se,int S,int nh,int hd,
+                                int out_stride,int mxse_stride,void*ctx){
+    tp_comm*c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:1; double tc=0;
+    long nf=0; const size_t blk=(size_t)nh+(size_t)nh*hd;
+    /* (1) gather strided mx -> contiguous [S*nh], one fragmented allreduce_max (keep result). */
+    float*gmx=g_kvmax;
+    for(int t=0;t<S;t++){ const float*mt=mx+(size_t)t*mxse_stride; float*gt=gmx+(size_t)t*nh;
+        for(int h=0;h<nh;h++) gt[h]=mt[h]; }
+    { double t0=now_sec(); int cnt=S*nh; for(int off=0;off<cnt;){ int n=cnt-off; if(n>mc)n=mc; tp_allreduce_max(c,gmx+off,n); off+=n; nf++; } tc+=now_sec()-t0; }
+    /* (2) rescale + pack each token's [se(nh) | out(nh*hd)] block (purely local). */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(int t=0;t<S;t++){
+        const float*mt=mx+(size_t)t*mxse_stride,*st=se+(size_t)t*mxse_stride,*gt=gmx+(size_t)t*nh;
+        const float*ot=out+(size_t)t*out_stride; float*bt=g_kvbuf+(size_t)t*blk;
+        for(int h=0;h<nh;h++){ float s=expf(mt[h]-gt[h]); bt[h]=st[h]*s;
+            const float*o=ot+(size_t)h*hd; float*b=bt+nh+(size_t)h*hd; for(int i=0;i<hd;i++) b[i]=o[i]*s; } }
+    /* (3) one flat fragmented allreduce_sum over the whole [S*blk] payload. */
+    { double t0=now_sec(); size_t cnt=(size_t)S*blk; for(size_t off=0;off<cnt;){ size_t n=cnt-off; if(n>(size_t)mc)n=(size_t)mc;
+        tp_allreduce_sum(c,g_kvbuf+off,(int)n); off+=n; nf++; } tc+=now_sec()-t0; }
+    /* (4) normalize back into out (purely local). */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(int t=0;t<S;t++){
+        const float*bt=g_kvbuf+(size_t)t*blk; float*ot=out+(size_t)t*out_stride;
+        for(int h=0;h<nh;h++){ float inv=1.0f/(bt[h]>0?bt[h]:1.0f);
+            const float*b=bt+nh+(size_t)h*hd; float*o=ot+(size_t)h*hd; for(int i=0;i<hd;i++) o[i]=b[i]*inv; } }
+    g_ar_secs+=tc; g_ar_calls++;  /* time ONLY the collectives (not the local pack/normalize); one combine/chunk vs S */
+    g_ar_frags+=nf;
+}
 
 /* ---- comm-overlap driver thread: only it touches uTofu during an overlapped reduce ----
  * The batched MoE issues the routed-expert all-reduce here (ar_async_start), computes the
@@ -496,9 +536,19 @@ int main(void){
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
     /* CP callbacks are wired unconditionally so a mid-run Tier A->B transition can turn CP on.
      * They stay dormant while m->cp_on==0 (the forward gates the combine/block-reduce on it). */
-    g_kvbuf=(float*)glm5_amalloc((size_t)(cfg.n_heads + cfg.n_heads*cfg.head_dim)*sizeof(float));
+    /* combine scratch sized for a whole chunk (S<=pchunk0): g_kvbuf holds the packed
+     * [S*(nh+nh*hd)] sum payload, g_kvmax the [S*nh] gathered max. NOTE: under CP ar_tokens is
+     * forced to 1 (small registered slot), so size by the CHUNK, not ar_tokens. The batch combine
+     * is only called from the prefill-chunk path, where S<=pchunk0; >=1 covers the no-chunk case. */
+    int kv_chunk=pchunk0>1?pchunk0:1; if(kv_chunk<mstream) kv_chunk=mstream;
+    g_kvbuf=(float*)glm5_amalloc((size_t)kv_chunk*(cfg.n_heads + cfg.n_heads*cfg.head_dim)*sizeof(float));
+    g_kvmax=(float*)glm5_amalloc((size_t)kv_chunk*cfg.n_heads*sizeof(float));
     m->blk_reduce_cb=ep_blk_reduce; m->blk_reduce_ctx=&comm;
     m->kv_combine_cb=ep_kv_combine; m->kv_combine_ctx=&comm;
+    /* batched chunk combine (default on); GLM5_CP_COMBINE_BATCH=0 leaves it NULL -> the forward
+     * falls back to the per-token kv_combine_cb loop (clean A/B without a recompile). */
+    m->kv_combine_batch_cb=NULL; m->kv_combine_batch_ctx=NULL;
+    if(envi("GLM5_CP_COMBINE_BATCH",1)){ m->kv_combine_batch_cb=ep_kv_combine_batch; m->kv_combine_batch_ctx=&comm; }
     if(MyRank==0){
         if(m->T_cp>0) logmsg("CP TIERED: Tier A (cp_on=0 bf16, %d slots) -> transition at pos=%d -> Tier B (CP int4, block=%d over %d ranks)\n",
                              m->cp_nslot,m->T_cp,m->cp_block,N);

@@ -1811,9 +1811,12 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
                 glm5_mv(m,ab+hh*c->v_head_dim,&tv,ctxb+(size_t)hh*c->kv_lora,c->v_head_dim,c->kv_lora);
             }
         }
-        /* deferred combine/normalize. Under CP this calls uTofu, so it must be serial and in
-         * ascending token order (identical on every rank); non-CP just normalizes, in parallel. */
-        if(m->cp_on && m->kv_combine_cb){
+        /* deferred combine/normalize. Under CP this calls uTofu: the batched cb merges the whole
+         * chunk in 2 collectives (bit-identical to the per-token loop, which is kept as fallback);
+         * both are deterministic (same buffer layout/order on every rank). Non-CP just normalizes. */
+        if(m->cp_on && m->kv_combine_batch_cb){
+            m->kv_combine_batch_cb(ms->attn,ms->hmx,ms->hse,S,nown,c->v_head_dim,arows,64,m->kv_combine_batch_ctx);
+        } else if(m->cp_on && m->kv_combine_cb){
             for(int t=0;t<S;t++){
                 float*ab=ms->attn+(size_t)t*arows;
                 m->kv_combine_cb(ab,ms->hmx+(size_t)t*64,ms->hse+(size_t)t*64,nown,c->v_head_dim,m->kv_combine_ctx);

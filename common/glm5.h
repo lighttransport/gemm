@@ -303,6 +303,13 @@ typedef struct {
      * The runner provides a uTofu all-reduce specialized for the online-softmax merge. */
     void  (*kv_combine_cb)(float *out, float *mx, float *sumexp, int n_heads, int head_dim, void *ctx);
     void   *kv_combine_ctx;
+    /* batched flash-combine for a whole prefill chunk: merges all S tokens' partials in TWO
+     * collectives (one MAX over [S*nh], one SUM over the packed [S*(nh+nh*hd)] payload) instead
+     * of 2*S per-token collectives. out/mx/se are the contiguous per-token buffers with the given
+     * strides; bit-identical to calling kv_combine_cb per token. NULL => fall back to per-token. */
+    void  (*kv_combine_batch_cb)(float *out, float *mx, float *se, int S, int nh, int hd,
+                                 int out_stride, int mxse_stride, void *ctx);
+    void   *kv_combine_batch_ctx;
     /* all-reduce-MAX of the per-block index scores across EP ranks (each block owned by one
      * rank; non-owned entries are -inf) so every rank derives the same global top-k selection. */
     void  (*blk_reduce_cb)(float *scores, int nblk, void *ctx);
