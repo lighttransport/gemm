@@ -128,6 +128,13 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
                                const uint8_t *image, int image_w, int image_h,
                                int *out_tokens, int *out_dim);
 
+/* Same, but for a gemma-4 qat-mobile DIRECT safetensors model (vision_tower,
+ * gemma-QAT 8-bit). model_path = model dir (config.json + model.safetensors).
+ * Config from vision_config; proj_dim defaults to the LLM n_embd. */
+float *cuda_llm_vision_encode_safetensors(cuda_llm_runner *r, const char *model_path,
+                                          const uint8_t *image, int image_w, int image_h,
+                                          int *out_tokens, int *out_dim);
+
 #ifdef __cplusplus
 }
 #endif

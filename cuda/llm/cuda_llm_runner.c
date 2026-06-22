@@ -18361,32 +18361,102 @@ typedef struct {
     CUdeviceptr ln1_w, ln2_w;       /* [dim] F16 */
 } vis_gpu_block;
 
-float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
-                               const uint8_t *image, int image_w, int image_h,
-                               int *out_tokens, int *out_dim) {
-    /* Load vision model config from GGUF */
-    int dim = 768, n_heads = 12, ffn_dim = 3072, n_blocks = 16;
-    int patch_size = 16, image_size = 224, proj_dim = 2560, spatial_merge = 3;
-    float ln_eps = 1e-6f;
-    {
-        int idx;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.embedding_length");
-        if (idx >= 0) dim = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.attention.head_count");
-        if (idx >= 0) n_heads = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.feed_forward_length");
-        if (idx >= 0) ffn_dim = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.block_count");
-        if (idx >= 0) n_blocks = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.patch_size");
-        if (idx >= 0) patch_size = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.image_size");
-        if (idx >= 0) image_size = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.projection_dim");
-        if (idx >= 0) proj_dim = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.attention.layer_norm_epsilon");
-        if (idx >= 0) ln_eps = mmproj_gguf->kv[idx].value.f32;
+/* Vision config + tensor source (GGUF mmproj OR gemma4 qat-mobile safetensors). */
+typedef struct {
+    int dim, n_heads, ffn_dim, n_blocks, patch_size, image_size, proj_dim, spatial_merge;
+    float ln_eps;
+} vis_cfg;
+
+typedef struct {
+    gguf_context *gguf;        /* non-NULL -> GGUF mmproj path */
+    st_context **shards;       /* non-NULL -> safetensors vision_tower path */
+    int n_shards;
+} vis_tsrc;
+
+/* Fetch one vision tensor by its GGUF-mmproj name. GGUF: returns the mmap-backed
+ * qtensor (owned=0). Safetensors: QAT-I8 linears are dequanted to a malloc'd F16
+ * buffer (owned=1, caller frees); norms/patch/pos/proj point into the mmap (owned=0).
+ * The gemma4 vision_tower is the SAME SigLIP ViT as the mmproj, just gemma-QAT 8-bit. */
+static qtensor vis_load(vis_tsrc *s, const char *gn, int required, int *owned) {
+    *owned = 0;
+    if (s->gguf) return cllm_load_tensor(s->gguf, gn, required);
+
+    st_context **sh = s->shards; int ns = s->n_shards;
+    const char *VL = "model.vision_tower.encoder.layers";
+    char nm[256];
+
+    if (strcmp(gn, "v.patch_embd.weight") == 0) {
+        /* HF gemma4 patch embedder flattens each patch as HWC (h,w,c); the encoder
+         * (and the GGUF mmproj conv weight) expects CHW (c,h,w). Repermute columns. */
+        qtensor src = cllm_st_load_tensor_multi(sh, ns,
+                          "model.vision_tower.patch_embedder.input_proj.weight", required);
+        if (!src.data) return src;
+        int out = src.n_rows, in = src.n_cols, C = 3;
+        int side = (int)(sqrtf((float)(in / C)) + 0.5f);   /* 16 */
+        const uint16_t *sb = (const uint16_t *)src.data;   /* BF16 */
+        uint16_t *dst = (uint16_t *)malloc((size_t)out * in * sizeof(uint16_t));
+        if (!dst) { qtensor z = {0}; return z; }
+        for (int f = 0; f < out; f++)
+            for (int c = 0; c < C; c++)
+                for (int h = 0; h < side; h++)
+                    for (int w = 0; w < side; w++) {
+                        int s = (h * side * C) + (w * C) + c;        /* HWC source */
+                        int d = (c * side * side) + (h * side) + w;  /* CHW dest   */
+                        dst[(size_t)f * in + d] = cllm_bf16_to_f16(sb[(size_t)f * in + s]);
+                    }
+        qtensor t = src; t.data = dst; t.type = GGML_TYPE_F16; *owned = 1;
+        return t;
     }
+    if (strcmp(gn, "mm.input_projection.weight") == 0)
+        return cllm_st_load_tensor_multi(sh, ns, "model.embed_vision.embedding_projection.weight", required);
+    if (strcmp(gn, "v.position_embd.weight") == 0) {
+        /* safetensors [2, n_pos, dim] -> GGUF convention (ne0=dim fastest, dims[1]=n_pos) */
+        qtensor t = cllm_st_load_tensor_multi(sh, ns,
+                        "model.vision_tower.patch_embedder.position_embedding_table", required);
+        if (t.data) {
+            int npos = (int)t.dims[0];  /* cllm_st set dims[0]=sh[1]=n_pos */
+            int vdim = (int)t.dims[2];  /* dims[2]=sh[2]=dim */
+            t.n_cols = vdim; t.n_rows = 2 * npos; t.n_dims = 3;
+            t.dims[0] = (uint64_t)vdim; t.dims[1] = (uint64_t)npos; t.dims[2] = 2;
+        }
+        return t;
+    }
+
+    int blk = -1;
+    if (sscanf(gn, "v.blk.%d.", &blk) == 1) {
+        const char *dot = strchr(gn + 6, '.');         /* skip "v.blk." then the index */
+        const char *suf = dot ? dot + 1 : "";
+        static const char *lin_g[] = {"attn_q.weight","attn_k.weight","attn_v.weight","attn_out.weight",
+                                      "ffn_gate.weight","ffn_up.weight","ffn_down.weight"};
+        static const char *lin_s[] = {"self_attn.q_proj","self_attn.k_proj","self_attn.v_proj","self_attn.o_proj",
+                                      "mlp.gate_proj","mlp.up_proj","mlp.down_proj"};
+        for (int i = 0; i < 7; i++) if (strcmp(suf, lin_g[i]) == 0) {
+            char base[256];
+            snprintf(base, sizeof(base), "%s.%d.%s.linear", VL, blk, lin_s[i]);
+            qtensor t = cllm_st_load_qat_dequant(sh, ns, base, 8, required);   /* I8 -> F16 */
+            *owned = 1; return t;
+        }
+        static const char *nrm_g[] = {"attn_q_norm.weight","attn_k_norm.weight","attn_post_norm.weight",
+                                      "ffn_post_norm.weight","ln1.weight","ln2.weight"};
+        static const char *nrm_s[] = {"self_attn.q_norm.weight","self_attn.k_norm.weight",
+                                      "post_attention_layernorm.weight","post_feedforward_layernorm.weight",
+                                      "input_layernorm.weight","pre_feedforward_layernorm.weight"};
+        for (int i = 0; i < 6; i++) if (strcmp(suf, nrm_g[i]) == 0) {
+            snprintf(nm, sizeof(nm), "%s.%d.%s", VL, blk, nrm_s[i]);
+            return cllm_st_load_tensor_multi(sh, ns, nm, required);
+        }
+    }
+    fprintf(stderr, "cuda_vision: unmapped safetensors tensor for '%s'\n", gn);
+    qtensor z = {0}; return z;
+}
+
+static float *vis_encode_impl(cuda_llm_runner *r, vis_tsrc *src, vis_cfg cfg,
+                              const uint8_t *image, int image_w, int image_h,
+                              int *out_tokens, int *out_dim) {
+    int dim = cfg.dim, n_heads = cfg.n_heads, ffn_dim = cfg.ffn_dim, n_blocks = cfg.n_blocks;
+    int patch_size = cfg.patch_size, image_size = cfg.image_size, proj_dim = cfg.proj_dim;
+    int spatial_merge = cfg.spatial_merge;
+    float ln_eps = cfg.ln_eps;
     int head_dim = dim / n_heads;
     int ph = image_size / patch_size, pw = ph;
     int n_patches = ph * pw;
@@ -18402,7 +18472,7 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
                 dim, n_heads, n_blocks, n_patches, n_merged, proj_dim);
 
     /* --- 1. Patch embedding on CPU (fast, ~2% of total) --- */
-    qtensor patch_embd_w = cllm_load_tensor(mmproj_gguf, "v.patch_embd.weight", 1);
+    int ow_pe; qtensor patch_embd_w = vis_load(src, "v.patch_embd.weight", 1, &ow_pe);
     float *patches = (float *)calloc((size_t)n_patches * dim, sizeof(float));
     {
         /* Normalize image and extract patches */
@@ -18436,6 +18506,7 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
         }
         free(filters);
     }
+    if (ow_pe) free(patch_embd_w.data);
 
     /* --- 2. Upload patches + position embedding to GPU --- */
     CUdeviceptr d_tokens;
@@ -18444,9 +18515,10 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
     free(patches);
 
     /* Position embedding: add X and Y components */
-    qtensor pos_embd = cllm_load_tensor(mmproj_gguf, "v.position_embd.weight", 1);
+    int ow_pos; qtensor pos_embd = vis_load(src, "v.position_embd.weight", 1, &ow_pos);
     int n_pos = (int)pos_embd.dims[1];
     CUdeviceptr d_pos_embd = vis_upload_f16(&pos_embd);
+    if (ow_pos) free(pos_embd.data);
 
     /* Build position index arrays on host, upload */
     int *pos_x = (int *)malloc(n_patches * sizeof(int));
@@ -18478,15 +18550,17 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
     vis_gpu_block *gblocks = (vis_gpu_block *)calloc(n_blocks, sizeof(vis_gpu_block));
     for (int b = 0; b < n_blocks; b++) {
         char name[128];
-        qtensor t;
+        qtensor t; int ow;
         #define VIS_LOAD(field, suffix) \
             snprintf(name, sizeof(name), "v.blk.%d." suffix ".weight", b); \
-            t = cllm_load_tensor(mmproj_gguf, name, 1); \
-            gblocks[b].field = vis_upload_f16(&t);
+            t = vis_load(src, name, 1, &ow); \
+            gblocks[b].field = vis_upload_f16(&t); \
+            if (ow) free(t.data);
         #define VIS_LOAD_NORM(field, suffix, sz) \
             snprintf(name, sizeof(name), "v.blk.%d." suffix ".weight", b); \
-            t = cllm_load_tensor(mmproj_gguf, name, 1); \
-            gblocks[b].field = vis_upload_norm_f16(&t, sz);
+            t = vis_load(src, name, 1, &ow); \
+            gblocks[b].field = vis_upload_norm_f16(&t, sz); \
+            if (ow) free(t.data);
 
         VIS_LOAD(qw, "attn_q")
         VIS_LOAD(kw, "attn_k")
@@ -18506,8 +18580,9 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
     }
 
     /* Upload projection weight */
-    qtensor mm_proj_w = cllm_load_tensor(mmproj_gguf, "mm.input_projection.weight", 1);
+    int ow_proj; qtensor mm_proj_w = vis_load(src, "mm.input_projection.weight", 1, &ow_proj);
     CUdeviceptr d_proj_w = vis_upload_f16(&mm_proj_w);
+    if (ow_proj) free(mm_proj_w.data);
 
     /* Allocate work buffers */
     CUdeviceptr d_qkv, d_out, d_ffn_gate, d_ffn_up;
@@ -18679,6 +18754,69 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
     free(gblocks);
     free(pos_x); free(pos_y);
 
+    return result;
+}
+
+/* GGUF mmproj vision encode (original public API; config from clip.vision.* keys). */
+float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
+                               const uint8_t *image, int image_w, int image_h,
+                               int *out_tokens, int *out_dim) {
+    vis_cfg cfg = { 768, 12, 3072, 16, 16, 224, 2560, 3, 1e-6f };
+    int idx;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.embedding_length")) >= 0) cfg.dim = mmproj_gguf->kv[idx].value.u32;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.attention.head_count")) >= 0) cfg.n_heads = mmproj_gguf->kv[idx].value.u32;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.feed_forward_length")) >= 0) cfg.ffn_dim = mmproj_gguf->kv[idx].value.u32;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.block_count")) >= 0) cfg.n_blocks = mmproj_gguf->kv[idx].value.u32;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.patch_size")) >= 0) cfg.patch_size = mmproj_gguf->kv[idx].value.u32;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.image_size")) >= 0) cfg.image_size = mmproj_gguf->kv[idx].value.u32;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.projection_dim")) >= 0) cfg.proj_dim = mmproj_gguf->kv[idx].value.u32;
+    if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.attention.layer_norm_epsilon")) >= 0) cfg.ln_eps = mmproj_gguf->kv[idx].value.f32;
+    vis_tsrc src = { mmproj_gguf, NULL, 0 };
+    return vis_encode_impl(r, &src, cfg, image, image_w, image_h, out_tokens, out_dim);
+}
+
+/* Gemma-4 qat-mobile DIRECT safetensors vision encode (vision_tower, gemma-QAT 8-bit).
+ * model_path is the model dir (config.json + model.safetensors). proj_dim = LLM n_embd. */
+float *cuda_llm_vision_encode_safetensors(cuda_llm_runner *r, const char *model_path,
+                                          const uint8_t *image, int image_w, int image_h,
+                                          int *out_tokens, int *out_dim) {
+    /* config: defaults match gemma4 E2B vision_config; override from config.json */
+    vis_cfg cfg = { 768, 12, 3072, 16, 16, 224, r->n_embd > 0 ? r->n_embd : 1536, 3, 1e-6f };
+    {
+        char cfg_path[512];
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", model_path);
+        FILE *f = fopen(cfg_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char *buf = (char *)malloc(sz > 0 ? sz : 1);
+            if (buf && sz > 0 && fread(buf, 1, sz, f) == (size_t)sz) {
+                json_val *root = json_parse(buf, (int)sz);
+                json_val *vc = root ? json_obj_get(root, "vision_config") : NULL;
+                if (vc) {
+                    cfg.dim         = (int)cllm_json_num(vc, "hidden_size", cfg.dim);
+                    cfg.n_heads     = (int)cllm_json_num(vc, "num_attention_heads", cfg.n_heads);
+                    cfg.ffn_dim     = (int)cllm_json_num(vc, "intermediate_size", cfg.ffn_dim);
+                    cfg.n_blocks    = (int)cllm_json_num(vc, "num_hidden_layers", cfg.n_blocks);
+                    cfg.patch_size  = (int)cllm_json_num(vc, "patch_size", cfg.patch_size);
+                    cfg.spatial_merge = (int)cllm_json_num(vc, "pooling_kernel_size", cfg.spatial_merge);
+                    cfg.ln_eps      = (float)cllm_json_num(vc, "rms_norm_eps", cfg.ln_eps);
+                }
+                if (root) json_free(root);
+            }
+            free(buf);
+            fclose(f);
+        }
+    }
+
+    st_context *shards[16] = {0};
+    int n_shards = cllm_open_safetensors_shards(model_path, shards, 16);
+    if (n_shards <= 0) {
+        fprintf(stderr, "cuda_vision: failed to open safetensors %s\n", model_path);
+        return NULL;
+    }
+    vis_tsrc src = { NULL, shards, n_shards };
+    float *result = vis_encode_impl(r, &src, cfg, image, image_w, image_h, out_tokens, out_dim);
+    cllm_close_safetensors_shards(shards, n_shards);
     return result;
 }
 
