@@ -47,12 +47,10 @@ export GLM5_PREFILL_ONLY=1
 export GLM5_PCHUNK=${PCHUNK:-64}
 export GLM5_MAXPOS=${MAXPOS:-2048}
 export GLM5_PREFILL_ROLLING=0
-# Under CP the runner forces ar_tokens=1 (max_count=hidden=6144), which is SMALLER than the
-# per-token combine SUM payload (nh+nh*hd=16448), so per-token already fragments and batching
-# can't merge it. Raise the registered slot so batching actually collapses the fragment count.
-# (hard cap is 64 -> max_count=6144*64=393216 > 16448.) Same value for both A and B, so the only
-# variable is GLM5_CP_COMBINE_BATCH. Set AR_TOKENS=1 to see the small-slot regime.
-export GLM5_AR_TOKENS=${AR_TOKENS:-64}
+# The runner now auto-sizes the CP allreduce slot to cover the chunk's attention-combine payload
+# (max_count >= nh+nh*hd), so batching helps WITHOUT pinning GLM5_AR_TOKENS. Set AR_TOKENS=1 to
+# force the old lean-slot regime (max_count=6144 < 16448 -> per-token already fragments).
+[ -n "${AR_TOKENS:-}" ] && export GLM5_AR_TOKENS=$AR_TOKENS
 
 make -C "$LLM_DIR" glm5_ep_runner CC=fcc OPENMP=1 >/dev/null
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null

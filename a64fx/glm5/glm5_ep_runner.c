@@ -440,8 +440,9 @@ int main(void){
     int ar_tokens=(ar_env&&*ar_env)?atoi(ar_env):0;
     int ar_auto_cap=envi("GLM5_AR_AUTO_CAP",256);
     int pchunk0=envi("GLM5_PCHUNK",0);
-    if(!ar_env && (envi("GLM5_CP",0) || maxpos>65536)){
-        ar_tokens=1;  /* small registered slots for long-context/CP stability */
+    int cp_lean_slot=(envi("GLM5_CP",0) || maxpos>65536);
+    if(!ar_env && cp_lean_slot){
+        ar_tokens=1;  /* provisional lean slot; resized below (post-cfg) to cover the chunk combine */
     } else {
         if(ar_tokens<mstream) ar_tokens=mstream;
         if(pchunk0>ar_tokens) ar_tokens=pchunk0;
@@ -481,6 +482,19 @@ int main(void){
     if(nexp>0)   cfg.n_experts=nexp;
     if(cfg.n_active>cfg.n_experts) cfg.n_active=cfg.n_experts;
     if(start_pos+prefill+maxgen>cfg.max_pos) die("start_pos+prefill+maxgen exceeds max_pos",-1);
+    /* CP/long-context keep the registered allreduce slot lean, but it must still cover the
+     * per-token attention flash-combine (n_heads + n_heads*v_head_dim floats reduced per token).
+     * If max_count < that payload, the per-token reduce already fragments and the batched combine
+     * cannot merge -> no comm win. Size the slot to a chunk's combine payload, bounded by the hard
+     * cap (region ~ (1+TP_AR_NSTEP)*hidden*hard_cap*4 ~ 18 MB at cap 64 -> no extra memory risk
+     * vs the non-CP path). Only when the user didn't pin GLM5_AR_TOKENS. */
+    if(!ar_env && cp_lean_slot){
+        int chunk=pchunk0>0?pchunk0:mstream; if(chunk<1)chunk=1;
+        long need=(long)cfg.n_heads*(1+cfg.v_head_dim)*chunk;   /* (nh + nh*hd) floats per token */
+        int t=(int)((need+cfg.hidden-1)/cfg.hidden); if(t<1)t=1;
+        if(ar_hard_cap>0 && t>ar_hard_cap) t=ar_hard_cap;
+        ar_tokens=t;
+    }
 
     int no=glm5_n_owned(cfg.n_experts,ep_rank,ep_size);
     size_t arena_est=glm5_arena_size(&cfg,ep_rank,ep_size);
