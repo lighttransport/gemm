@@ -47,7 +47,8 @@ $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
 test_gemma4_st: test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(FA2_CUBIN) \
-          cuda_llm_runner.h ../cuew.h ../cublasew.h
+          cuda_llm_runner.h ../cuew.h ../cublasew.h \
+          ../../common/gemma4_audio_encoder.h ../../common/gemma4_audio_mel.h
 	$(CC) $(CFLAGS) -o $@ test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
 run: $(TARGET)

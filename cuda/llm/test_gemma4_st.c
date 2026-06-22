@@ -25,6 +25,10 @@
 #include "../../common/bpe_tokenizer.h"
 #define IMAGE_UTILS_IMPLEMENTATION
 #include "../../common/image_utils.h"
+#define GEMMA4_AUDIO_IMPLEMENTATION
+#include "../../common/gemma4_audio_encoder.h"
+#define GEMMA4_AUDIO_MEL_IMPLEMENTATION
+#include "../../common/gemma4_audio_mel.h"
 
 #include "cuda_llm_runner.h"
 
@@ -44,21 +48,23 @@ static int is_stop(const bpe_vocab *vocab, int id) {
 
 int main(int argc, char **argv) {
     const char *model_path = NULL, *tok_gguf = NULL;
-    const char *prompt = NULL, *image_path = NULL;
-    int n_gen = 32, max_seq_len = 0;
+    const char *prompt = NULL, *image_path = NULL, *audio_path = NULL;
+    int n_gen = 32, max_seq_len = 0, think_mode = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) prompt = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_gen = atoi(argv[++i]);
         else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) max_seq_len = atoi(argv[++i]);
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) image_path = argv[++i];
+        else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) audio_path = argv[++i];
+        else if (strcmp(argv[i], "--think") == 0) think_mode = 1;
         else if (argv[i][0] != '-') { if (!model_path) model_path = argv[i]; else tok_gguf = argv[i]; }
     }
     if (!model_path || !tok_gguf) {
-        fprintf(stderr, "Usage: %s <model_dir_or.safetensors> <tokenizer.gguf> [-i image] [-t prompt] [-n n] [-s seq]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model_dir_or.safetensors> <tokenizer.gguf> [-i image] [-a audio.wav] [-t prompt] [-n n] [-s seq]\n", argv[0]);
         return 1;
     }
-    if (!prompt) prompt = image_path ? "explain the image" : "The capital of France is";
+    if (!prompt) prompt = image_path ? "explain the image" : audio_path ? "Transcribe this audio." : "The capital of France is";
 
     fprintf(stderr, "Tokenizer GGUF: %s\n", tok_gguf);
     gguf_context *gguf = gguf_open(tok_gguf, 1);
@@ -67,7 +73,7 @@ int main(int argc, char **argv) {
     if (!vocab) { fprintf(stderr, "failed to load vocab\n"); return 1; }
     fprintf(stderr, "Vocab: %d tokens\n", vocab->n_tokens);
 
-    if (max_seq_len <= 0) max_seq_len = (image_path ? 320 : 64) + n_gen;
+    if (max_seq_len <= 0) max_seq_len = (image_path ? 320 : audio_path ? 1024 : 64) + n_gen;
     if (max_seq_len < 1024) max_seq_len = 1024;
 
     fprintf(stderr, "\n=== Init + load (DIRECT safetensors) ===\n");
@@ -86,7 +92,48 @@ int main(int argc, char **argv) {
     float *logits = NULL;
     int pos = 0;
 
-    if (image_path) {
+    if (audio_path) {
+        /* ---- audio path: WAV -> mel -> Conformer -> soft tokens -> splice ---- */
+        fprintf(stderr, "\n=== Audio encode (safetensors audio_tower) ===\n");
+        int n_pcm = 0;
+        float *pcm = g4a_wav_load(audio_path, &n_pcm);
+        if (!pcm) { fprintf(stderr, "failed to load audio %s\n", audio_path); return 1; }
+        fprintf(stderr, "Loaded audio %s (%d samples, %.2fs)\n", audio_path, n_pcm, n_pcm / 16000.0);
+        g4a_mel *fe = g4a_mel_init();
+        int n_frames = 0;
+        float *mel = g4a_mel_extract(fe, pcm, n_pcm, &n_frames);
+        free(pcm); g4a_mel_free(fe);
+        fprintf(stderr, "Mel: %d frames x 128\n", n_frames);
+        g4a_model *am = g4a_load_safetensors(model_path);
+        if (!am) { fprintf(stderr, "audio_tower load FAILED\n"); return 1; }
+        int n_aud = 0, adim = 0;
+        float *aembd = g4a_encode(am, mel, n_frames, &n_aud, &adim);
+        free(mel); g4a_free(am);
+        if (!aembd) { fprintf(stderr, "audio encode FAILED\n"); return 1; }
+        fprintf(stderr, "Audio: %d tokens x %d dim\n", n_aud, adim);
+        if (adim != n_embd) { fprintf(stderr, "adim %d != n_embd %d\n", adim, n_embd); return 1; }
+        { const char *dout = getenv("CUDA_LLM_AUD_DUMP_OUT");
+          if (dout) { FILE *fp = fopen(dout, "wb"); if (fp) { fwrite(aembd, sizeof(float), (size_t)n_aud * adim, fp); fclose(fp); } } }
+
+        /* gemma4 audio prompt: BOS [+ system/think] + <|turn>user\n<|audio> + n*soft + <audio|>{prompt}<turn|>\n<|turn>model\n
+         * (the user's <|audio|> placeholder expands to boa <|audio> + n soft + eoa <audio|>) */
+        const char *pre = think_mode ? "<|turn>system\n<|think|>\n<turn|>\n<|turn>user\n<|audio>"
+                                     : "<|turn>user\n<|audio>";
+        char post[512];
+        snprintf(post, sizeof(post), "<audio|>%s<turn|>\n<|turn>model\n", prompt);
+        int32_t pre_tok[256], post_tok[256];
+        int n_pre = bpe_tokenize(vocab, pre, -1, pre_tok, 256);
+        int n_post = bpe_tokenize(vocab, post, -1, post_tok, 256);
+
+        fprintf(stderr, "\n=== Prefill (BOS + %d pre + %d audio + %d post) ===\n", n_pre, n_aud, n_post);
+        cuda_llm_forward(gpu, 2 /*BOS*/, pos++);
+        cuda_llm_prefill(gpu, pre_tok, NULL, 0, n_pre, pos); pos += n_pre;
+        cuda_llm_prefill(gpu, NULL, aembd, adim, n_aud, pos); pos += n_aud;
+        logits = cuda_llm_prefill_logits(gpu, post_tok, NULL, 0, n_post, pos); pos += n_post;
+        free(aembd);
+        if (!logits) { fprintf(stderr, "prefill_logits NULL\n"); return 1; }
+        fprintf(stderr, "\n=== Generate (greedy) ===\nPrompt: \"%s\"\n", prompt);
+    } else if (image_path) {
         /* ---- VLM path: encode image (vision_tower) + splice ---- */
         int iw, ih;
         uint8_t *image = img_load(image_path, &iw, &ih);
