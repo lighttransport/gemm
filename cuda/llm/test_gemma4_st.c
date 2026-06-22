@@ -102,6 +102,8 @@ int main(int argc, char **argv) {
         img_free(image);
         if (!vembd) { fprintf(stderr, "vision encode FAILED\n"); return 1; }
         fprintf(stderr, "Vision: %d tokens x %d dim\n", n_vis, proj_dim);
+        { const char *dout = getenv("CUDA_LLM_VIS_DUMP_OUT");
+          if (dout) { FILE *fp = fopen(dout, "wb"); if (fp) { fwrite(vembd, sizeof(float), (size_t)n_vis*proj_dim, fp); fclose(fp); } } }
         { float mn=vembd[0],mx=vembd[0],sm=0; int tt=n_vis*proj_dim;
           for(int i=0;i<tt;i++){ if(vembd[i]<mn)mn=vembd[i]; if(vembd[i]>mx)mx=vembd[i]; sm+=vembd[i]; }
           fprintf(stderr, "Vision embedding: min=%.4f max=%.4f mean=%.6f\n", mn, mx, sm/tt); }

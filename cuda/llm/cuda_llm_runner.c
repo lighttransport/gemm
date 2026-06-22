@@ -18365,6 +18365,7 @@ typedef struct {
 typedef struct {
     int dim, n_heads, ffn_dim, n_blocks, patch_size, image_size, proj_dim, spatial_merge;
     float ln_eps;
+    int pre_proj_norm;   /* 1 = HF order (RMSNorm over dim BEFORE projection, no post-norm) */
 } vis_cfg;
 
 typedef struct {
@@ -18712,11 +18713,28 @@ static float *vis_encode_impl(cuda_llm_runner *r, vis_tsrc *src, vis_cfg cfg,
     cuMemcpyHtoD(d_pooled, pooled, (size_t)n_merged * dim * sizeof(float));
     free(pooled);
 
-    /* Scale by sqrt(dim) */
+    /* Debug: dump pooled features [n_merged, dim] before scale/norm/project. */
+    { const char *dp = getenv("CUDA_LLM_VIS_DUMP_POOLED");
+      if (dp) { cuStreamSynchronize(r->stream);
+                float *tmp = (float *)malloc((size_t)n_merged * dim * sizeof(float));
+                cuMemcpyDtoH(tmp, d_pooled, (size_t)n_merged * dim * sizeof(float));
+                FILE *fp = fopen(dp, "wb"); if (fp) { fwrite(tmp, sizeof(float), (size_t)n_merged * dim, fp); fclose(fp); }
+                free(tmp); } }
+
+    /* Scale by sqrt(dim) (HF Gemma4VisionPooler.root_hidden_size) */
     float scale = sqrtf((float)dim);
     int pool_total = n_merged * dim;
     { void *a[] = { &d_pooled, &scale, &pool_total };
       cuLaunchKernel(r->fn_vision_scale, (pool_total + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+    CUdeviceptr null_weight = 0;
+    /* HF embed_vision order is RMSNorm(no-scale) over `dim` THEN project (cfg.pre_proj_norm);
+     * the GGUF mmproj path instead projects THEN RMSNorms over `proj_dim` (its projector is
+     * adapted to that order). RMSNorm is nonlinear so the two orders need different projectors. */
+    if (cfg.pre_proj_norm) {
+        void *a[] = { &d_pooled, &null_weight, &dim, &ln_eps, &n_merged };
+        cuLaunchKernel(r->fn_vision_rmsnorm, n_merged, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    }
 
     /* MM projection: [n_merged, dim] → [n_merged, proj_dim] */
     CUdeviceptr d_projected;
@@ -18724,10 +18742,11 @@ static float *vis_encode_impl(cuda_llm_runner *r, vis_tsrc *src, vis_cfg cfg,
     { void *a[] = { &d_projected, &d_proj_w, &d_pooled, &proj_dim, &dim, &n_merged };
       cuLaunchKernel(r->fn_vision_linear_f16, proj_dim, n_merged, 1, 256, 1, 1, 0, r->stream, a, NULL); }
 
-    /* Final RMSNorm (no learned weights) */
-    CUdeviceptr null_weight = 0;
-    { void *a[] = { &d_projected, &null_weight, &proj_dim, &ln_eps, &n_merged };
-      cuLaunchKernel(r->fn_vision_rmsnorm, n_merged, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+    if (!cfg.pre_proj_norm) {
+        /* Final RMSNorm (no learned weights) */
+        void *a[] = { &d_projected, &null_weight, &proj_dim, &ln_eps, &n_merged };
+        cuLaunchKernel(r->fn_vision_rmsnorm, n_merged, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    }
 
     /* --- 7. Download result --- */
     cuStreamSynchronize(r->stream);
@@ -18761,7 +18780,7 @@ static float *vis_encode_impl(cuda_llm_runner *r, vis_tsrc *src, vis_cfg cfg,
 float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
                                const uint8_t *image, int image_w, int image_h,
                                int *out_tokens, int *out_dim) {
-    vis_cfg cfg = { 768, 12, 3072, 16, 16, 224, 2560, 3, 1e-6f };
+    vis_cfg cfg = { 768, 12, 3072, 16, 16, 224, 2560, 3, 1e-6f, 0 };  /* GGUF: project-then-norm */
     int idx;
     if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.embedding_length")) >= 0) cfg.dim = mmproj_gguf->kv[idx].value.u32;
     if ((idx = gguf_find_key(mmproj_gguf, "clip.vision.attention.head_count")) >= 0) cfg.n_heads = mmproj_gguf->kv[idx].value.u32;
@@ -18781,7 +18800,7 @@ float *cuda_llm_vision_encode_safetensors(cuda_llm_runner *r, const char *model_
                                           const uint8_t *image, int image_w, int image_h,
                                           int *out_tokens, int *out_dim) {
     /* config: defaults match gemma4 E2B vision_config; override from config.json */
-    vis_cfg cfg = { 768, 12, 3072, 16, 16, 224, r->n_embd > 0 ? r->n_embd : 1536, 3, 1e-6f };
+    vis_cfg cfg = { 768, 12, 3072, 16, 16, 224, r->n_embd > 0 ? r->n_embd : 1536, 3, 1e-6f, 1 };  /* HF: norm-then-project */
     {
         char cfg_path[512];
         snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", model_path);
