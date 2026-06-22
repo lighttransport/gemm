@@ -504,7 +504,7 @@ int main(void){
                              m->cp_nslot,m->T_cp,m->cp_block,N);
         else if(m->cp_on) logmsg("CP ON: KV sharded block-cyclic (block=%d) over %d ranks, %d slots/rank, int4_kv=%d\n",
                              m->cp_block,N,m->cp_nslot,m->int4_kv);
-        else logmsg("CP OFF: un-sharded KV, %d slots/rank (context fits, single-tier)\n",m->cp_nslot);
+        else logmsg("CP OFF: un-sharded KV, %d slots/rank, msa_on=%d (single-tier)\n",m->cp_nslot,m->msa_on);
     }
     if(envi("GLM5_COMM_OVERLAP",0)){
         atomic_store(&g_comm_stop,0); atomic_store(&g_comm_done,1); atomic_store(&g_comm_go,0);
