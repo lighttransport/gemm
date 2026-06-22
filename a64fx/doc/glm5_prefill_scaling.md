@@ -123,3 +123,45 @@ not better. So the shared-dense staging + hierarchical-allreduce rework would no
 **not pursued**. The 2-CMG (th=24) point is the genuine optimum; the ~20 tok/s full-model ceiling
 (≈40 tok/s at 40 layers) is fundamental for this model on A64FX. The multi-rank/node capability is
 kept (committed) as it may help other configs, but is off by default (GLM5_RANKS_PER_NODE=1).
+
+
+## UPDATE (2026-06-22): batched CP attention combine (Tier-B / context-parallel comm)
+
+The above is short-context (CP off). For **context-parallel (Tier B) prefill** the dominant comm
+was the cross-rank attention flash-combine: `glm5_forward_prefill_chunk` merged the per-rank
+partials with a **serial per-token loop**, firing one tiny `allreduce_max` + one `allreduce_sum`
+*per token* — `2·S` latency-bound recursive-doubling collectives per layer per chunk. uTofu
+allreduce is latency-bound (per-message α over O(log N) rounds), so those per-token launches
+dominate.
+
+Batched it into **two collectives per layer**: one MAX over the contiguous `[S·nh]` maxes + one
+SUM over the packed `[S·(nh+nh·hd)]` payload (commit `7f6d620`). Bit-identical (allreduce reduces
+each element under a fixed rank schedule regardless of fragmentation); the local rescale/normalize
+now run OpenMP-parallel. Gated by `GLM5_CP_COMBINE_BATCH` (default 1; `=0` = per-token fallback).
+
+A second fix was required for it to help by default: CP forced `ar_tokens=1`
+(`max_count=hidden=6144` floats) — *smaller* than one token's combine payload
+(`nh+nh·hd=16448`), so the per-token reduce already fragmented and batching had nothing to merge.
+Now the lean CP slot is auto-sized to a chunk's combine payload, bounded by `GLM5_AR_HARD_CAP`
+(64 → `max_count=393216`, region ~18 MB/rank — negligible) (commit `9db4b95`).
+
+Measured, 12 nodes, static CP (`GLM5_CP=1 GLM5_CP_THRESHOLD=-1 GLM5_MSA=1`, bf16 KV), 8 layers,
+synthetic 1024-tok prefill, th=24, **no `GLM5_AR_TOKENS` override**:
+
+| pchunk | batched tok/s | per-token tok/s | speedup | combine calls (batch→per-tok) | frags |
+| --- | --- | --- | --- | --- | --- |
+| 64  | **68.3** | 66.8 | +2.3% | 208 → 8272 (40×) | 592 → 16464 (28×) |
+| 128 | 54.3 | 52.0 | +4.5% | 104 → 8232 (79×) | 528 → 16464 (31×) |
+| 256 | 50.6 | 49.8 | +1.7% | 52 → 8212 (158×) | 464 → 16464 (35×) |
+
+`pchunk=64` is fastest (tok/s falls at larger pchunk — the CP+MSA batched-attention working-set
+effect, independent of the combine). The combine wins at every pchunk: collective invocations cut
+**40–158×**, fragments **~30×**, NaNs=0. Correctness is bit-exact — verified single-threaded
+(deterministic), batch on/off both `argmax=152743` across repeated runs (the synthetic argmax is
+otherwise run-to-run nondeterministic under threads, including the unmodified per-token baseline —
+a speed signal only, not a correctness signal).
+
+The **wall-clock win is small at 12 nodes** because comm is only ~15% of the prefill wall there;
+it scales with node count (this study's 96n attn-CP is comm-bound). A/B harness:
+`a64fx/glm5/run_glm5_cp_combine_ab.sh`. Follow-ups not yet done: overlap the combine SUM with the
+o-proj GEMM; batch the MSA block-score reduce across the chunk.
