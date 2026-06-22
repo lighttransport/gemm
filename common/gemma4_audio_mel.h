@@ -20,6 +20,9 @@ typedef struct g4a_mel g4a_mel;
 g4a_mel *g4a_mel_init(void);
 void     g4a_mel_free(g4a_mel *fe);
 float   *g4a_wav_load(const char *path, int *n_samples);  /* malloc'd, caller frees */
+/* Load ANY audio file as 16 kHz mono float [-1,1]. .wav -> native loader; everything
+ * else (mp3/flac/m4a/...) -> ffmpeg decode+resample via popen. malloc'd, caller frees. */
+float   *g4a_audio_load(const char *path, int *n_samples);
 float   *g4a_mel_extract(g4a_mel *fe, const float *pcm, int n, int *n_frames); /* malloc'd */
 
 #ifdef __cplusplus
@@ -80,6 +83,37 @@ g4a_mel *g4a_mel_init(void) {
     return fe;
 }
 void g4a_mel_free(g4a_mel *fe) { free(fe); }
+
+/* Decode arbitrary audio to 16 kHz mono f32le through ffmpeg (handles mp3 + resample). */
+static float *g4a_ffmpeg_load(const char *path, int *n_samples) {
+    char cmd[2200];
+    /* -nostdin so popen's child doesn't fight for the terminal; f32le mono 16 kHz to stdout */
+    snprintf(cmd, sizeof(cmd),
+             "ffmpeg -nostdin -v error -i '%s' -f f32le -acodec pcm_f32le -ac 1 -ar 16000 - 2>/dev/null", path);
+    FILE *p = popen(cmd, "r");
+    if (!p) { fprintf(stderr, "g4a_audio: popen(ffmpeg) failed for %s\n", path); return NULL; }
+    size_t cap = 1u << 20, n = 0;
+    float *buf = (float *)malloc(cap * sizeof(float));
+    float tmp[8192]; size_t got;
+    while ((got = fread(tmp, sizeof(float), 8192, p)) > 0) {
+        if (n + got > cap) { while (n + got > cap) cap <<= 1; buf = (float *)realloc(buf, cap * sizeof(float)); }
+        memcpy(buf + n, tmp, got * sizeof(float)); n += got;
+    }
+    int rc = pclose(p);
+    if (rc != 0 || n == 0) { fprintf(stderr, "g4a_audio: ffmpeg decode failed (rc=%d, %zu samples) — is ffmpeg installed?\n", rc, n); free(buf); return NULL; }
+    if (n_samples) *n_samples = (int)n;
+    return buf;
+}
+
+float *g4a_audio_load(const char *path, int *n_samples) {
+    const char *ext = strrchr(path, '.');
+    if (ext && (ext[1] == 'w' || ext[1] == 'W') && (ext[2] == 'a' || ext[2] == 'A')) {
+        /* try native WAV reader; fall back to ffmpeg if it's a non-PCM/odd-rate wav */
+        float *w = g4a_wav_load(path, n_samples);
+        if (w) return w;
+    }
+    return g4a_ffmpeg_load(path, n_samples);
+}
 
 float *g4a_wav_load(const char *path, int *n_samples) {
     FILE *fp = fopen(path, "rb");

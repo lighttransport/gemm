@@ -50,6 +50,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL, *tok_gguf = NULL;
     const char *prompt = NULL, *image_path = NULL, *audio_path = NULL;
     int n_gen = 32, max_seq_len = 0, think_mode = 0;
+    double max_audio_sec = 30.0;  /* HF Gemma4 feature extractor caps at 30 s (480000 samples) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) prompt = argv[++i];
@@ -58,6 +59,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) image_path = argv[++i];
         else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) audio_path = argv[++i];
         else if (strcmp(argv[i], "--think") == 0) think_mode = 1;
+        else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) max_audio_sec = atof(argv[++i]);
         else if (argv[i][0] != '-') { if (!model_path) model_path = argv[i]; else tok_gguf = argv[i]; }
     }
     if (!model_path || !tok_gguf) {
@@ -73,7 +75,37 @@ int main(int argc, char **argv) {
     if (!vocab) { fprintf(stderr, "failed to load vocab\n"); return 1; }
     fprintf(stderr, "Vocab: %d tokens\n", vocab->n_tokens);
 
-    if (max_seq_len <= 0) max_seq_len = (image_path ? 320 : audio_path ? 1024 : 64) + n_gen;
+    /* Audio is encoded BEFORE the model load so max_seq_len can be sized to the
+     * actual soft-token count (a 457 s clip is ~11.4 k tokens). The g4a_* encoder
+     * is independent of the runner. */
+    float *aembd = NULL; int n_aud = 0, adim = 0;
+    if (audio_path) {
+        fprintf(stderr, "\n=== Audio encode (safetensors audio_tower) ===\n");
+        int n_pcm = 0;
+        float *pcm = g4a_audio_load(audio_path, &n_pcm);
+        if (!pcm) { fprintf(stderr, "failed to load audio %s\n", audio_path); return 1; }
+        fprintf(stderr, "Loaded audio %s (%d samples, %.2fs)\n", audio_path, n_pcm, n_pcm / 16000.0);
+        int cap = (int)(max_audio_sec * 16000.0);
+        if (max_audio_sec > 0 && n_pcm > cap) {
+            fprintf(stderr, "Capping audio to %.0fs (%d samples; model design max 30s, use -d 0 to disable)\n", max_audio_sec, cap);
+            n_pcm = cap;
+        }
+        g4a_mel *fe = g4a_mel_init();
+        int n_frames = 0;
+        float *mel = g4a_mel_extract(fe, pcm, n_pcm, &n_frames);
+        free(pcm); g4a_mel_free(fe);
+        fprintf(stderr, "Mel: %d frames x 128\n", n_frames);
+        g4a_model *am = g4a_load_safetensors(model_path);
+        if (!am) { fprintf(stderr, "audio_tower load FAILED\n"); return 1; }
+        aembd = g4a_encode(am, mel, n_frames, &n_aud, &adim);
+        free(mel); g4a_free(am);
+        if (!aembd) { fprintf(stderr, "audio encode FAILED\n"); return 1; }
+        fprintf(stderr, "Audio: %d tokens x %d dim\n", n_aud, adim);
+        { const char *dout = getenv("CUDA_LLM_AUD_DUMP_OUT");
+          if (dout) { FILE *fp = fopen(dout, "wb"); if (fp) { fwrite(aembd, sizeof(float), (size_t)n_aud * adim, fp); fclose(fp); } } }
+    }
+
+    if (max_seq_len <= 0) max_seq_len = (image_path ? 320 : audio_path ? (n_aud + 128) : 64) + n_gen;
     if (max_seq_len < 1024) max_seq_len = 1024;
 
     fprintf(stderr, "\n=== Init + load (DIRECT safetensors) ===\n");
@@ -93,27 +125,8 @@ int main(int argc, char **argv) {
     int pos = 0;
 
     if (audio_path) {
-        /* ---- audio path: WAV -> mel -> Conformer -> soft tokens -> splice ---- */
-        fprintf(stderr, "\n=== Audio encode (safetensors audio_tower) ===\n");
-        int n_pcm = 0;
-        float *pcm = g4a_wav_load(audio_path, &n_pcm);
-        if (!pcm) { fprintf(stderr, "failed to load audio %s\n", audio_path); return 1; }
-        fprintf(stderr, "Loaded audio %s (%d samples, %.2fs)\n", audio_path, n_pcm, n_pcm / 16000.0);
-        g4a_mel *fe = g4a_mel_init();
-        int n_frames = 0;
-        float *mel = g4a_mel_extract(fe, pcm, n_pcm, &n_frames);
-        free(pcm); g4a_mel_free(fe);
-        fprintf(stderr, "Mel: %d frames x 128\n", n_frames);
-        g4a_model *am = g4a_load_safetensors(model_path);
-        if (!am) { fprintf(stderr, "audio_tower load FAILED\n"); return 1; }
-        int n_aud = 0, adim = 0;
-        float *aembd = g4a_encode(am, mel, n_frames, &n_aud, &adim);
-        free(mel); g4a_free(am);
-        if (!aembd) { fprintf(stderr, "audio encode FAILED\n"); return 1; }
-        fprintf(stderr, "Audio: %d tokens x %d dim\n", n_aud, adim);
+        /* ---- audio path: soft tokens (encoded above) -> splice ---- */
         if (adim != n_embd) { fprintf(stderr, "adim %d != n_embd %d\n", adim, n_embd); return 1; }
-        { const char *dout = getenv("CUDA_LLM_AUD_DUMP_OUT");
-          if (dout) { FILE *fp = fopen(dout, "wb"); if (fp) { fwrite(aembd, sizeof(float), (size_t)n_aud * adim, fp); fclose(fp); } } }
 
         /* gemma4 audio prompt: BOS [+ system/think] + <|turn>user\n<|audio> + n*soft + <audio|>{prompt}<turn|>\n<|turn>model\n
          * (the user's <|audio|> placeholder expands to boa <|audio> + n soft + eoa <audio|>) */
