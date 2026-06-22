@@ -293,6 +293,12 @@ typedef struct {
      * (cp_on=1 int4, CP-sharded) for the long tail. T_cp is derived from the per-rank memory
      * budget (positions whose un-sharded KV fits). T_cp==0 disables tiering (static config). */
     int T_cp;
+    /* effective MSA on/off, decided by the tier (auto mode): OFF for a single un-sharded Tier A
+     * (dense attention is faster AND exact while the KV fits -- MSA's per-token index overhead
+     * dominates its sparse-attention savings at short/mid context), ON for tiered jobs (Tier B
+     * needs sparse + the index keys, so Tier A stores them). Static mode (GLM5_CP_THRESHOLD<0)
+     * keeps the GLM5_MSA env value. Read in the forward instead of the env. */
+    int msa_on;
     /* flash-combine of [n_heads*head_dim] partial out + per-head (max,sumexp) across EP ranks.
      * The runner provides a uTofu all-reduce specialized for the online-softmax merge. */
     void  (*kv_combine_cb)(float *out, float *mx, float *sumexp, int n_heads, int head_dim, void *ctx);

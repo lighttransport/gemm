@@ -606,6 +606,7 @@ static void glm5_kv_init(glm5_model*m){
         m->int4_kv=glm5_envi("GLM5_INT4_KV",0);
         m->cp_on  =glm5_envi("GLM5_CP",0) && m->ep_size>1;
         m->cp_nslot=glm5_cp_nslot(ctx,m->cp_block,m->ep_size,m->cp_on);
+        m->msa_on =glm5_envi("GLM5_MSA",0);
         m->T_cp=0; return;
     }
     /* per-position un-sharded bf16 KV bytes across all layers (latent KV + MSA index on MoE). */
@@ -616,8 +617,8 @@ static void glm5_kv_init(glm5_model*m){
     if(T<m->cp_block) T=m->cp_block;
     T=(T/m->cp_block)*m->cp_block;             /* block-align so Tier-A slots are CP-block aligned */
     m->int4_kv=0; m->cp_on=0;                   /* start in Tier A (bf16, replicated) */
-    if(T>=ctx){ m->cp_nslot=ctx; m->T_cp=0; }   /* whole context fits un-sharded: Tier A only */
-    else      { m->cp_nslot=(int)T; m->T_cp=(int)T; }  /* transition to CP+int4 at T */
+    if(T>=ctx){ m->cp_nslot=ctx; m->T_cp=0; m->msa_on=0; }  /* fits un-sharded: Tier A only, no MSA */
+    else      { m->cp_nslot=(int)T; m->T_cp=(int)T; m->msa_on=1; }  /* tiered: MSA on (Tier B needs it) */
 }
 /* allocate this layer's KV cache (bf16 or int4, sized to cp_nslot owned slots). */
 static void glm5_alloc_kv(glm5_model*m,glm5_layer*L,int is_moe,size_t*used){
@@ -1079,7 +1080,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
     const float ascale=1.0f/sqrtf((float)c->qk_head_dim);
     float*xn=m->s_norm,*q=m->s_q,*kv=m->s_k,*kvb=m->s_kvb,*attn=m->s_attn,*ao=m->s_o,*score=m->s_attn_score;
     float*qlat=m->s_idx_q; /* >= q_lora */
-    const int msa_on=glm5_envi("GLM5_MSA",0);
+    const int msa_on=m->msa_on;
     const int attn_window=glm5_envi("GLM5_ATTN_WINDOW",0);
     const int dense_window=glm5_envi("GLM5_DENSE_ATTN_WINDOW",attn_window);
     const int sparse_window=glm5_envi("GLM5_SPARSE_ATTN_WINDOW",attn_window);
@@ -1708,7 +1709,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
     const int KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;
     const float ascale=1.0f/sqrtf((float)c->qk_head_dim);
     glm5_mstream*ms=(glm5_mstream*)m->ms;
-    const int msa_on=glm5_envi("GLM5_MSA",0);
+    const int msa_on=m->msa_on;
     const int attn_window=glm5_envi("GLM5_ATTN_WINDOW",0);
     const int dense_window=glm5_envi("GLM5_DENSE_ATTN_WINDOW",attn_window);
     const int sparse_window=glm5_envi("GLM5_SPARSE_ATTN_WINDOW",attn_window);
