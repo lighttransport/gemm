@@ -10990,6 +10990,128 @@ static qtensor cllm_st_load_tensor_multi(st_context **shards, int n_shards,
     return t;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Gemma "wNa8o8" QAT dequant (gemma-4 *-qat-mobile-transformers checkpoints) */
+/*                                                                            */
+/* Each linear stores a per-output-channel symmetric quant:                   */
+/*   - 2/4-bit -> U8, codes packed INTERLEAVED (col = per*j + k, per=8/bits), */
+/*                value = (code - 2^(bits-1)) * weight_scale[row]              */
+/*   - 8-bit   -> I8 signed, value = code * weight_scale[row]                  */
+/* The activation scales (input/output_activation_scale, *_cache_scale) are   */
+/* IGNORED — we dequant weights to F16 and run full-precision activations     */
+/* (>= QAT accuracy, matching the GGUF QAT path). Returns a host-owned F16    */
+/* qtensor [out, logical_in]; caller must free t.data after upload.           */
+/* ------------------------------------------------------------------------ */
+static qtensor cllm_st_load_qat_dequant(st_context **shards, int n_shards,
+                                        const char *base_name, int bits, int required) {
+    qtensor out = {0};
+    char wn[480], sn[496];
+    snprintf(wn, sizeof(wn), "%s.weight", base_name);
+    snprintf(sn, sizeof(sn), "%s.weight_scale", base_name);
+
+    st_context *stw = NULL; int iw = -1;
+    for (int s = 0; s < n_shards && iw < 0; s++) { iw = safetensors_find(shards[s], wn); if (iw >= 0) stw = shards[s]; }
+    if (iw < 0) { if (required) fprintf(stderr, "cuda_llm: QAT missing weight %s\n", wn); return out; }
+    st_context *sts = NULL; int is = -1;
+    for (int s = 0; s < n_shards && is < 0; s++) { is = safetensors_find(shards[s], sn); if (is >= 0) sts = shards[s]; }
+    if (is < 0) { fprintf(stderr, "cuda_llm: QAT missing scale %s\n", sn); return out; }
+
+    const char *wdt = safetensors_dtype(stw, iw);
+    const uint64_t *wsh = safetensors_shape(stw, iw);
+    int out_rows = (int)wsh[0];
+    int packed   = (int)wsh[1];
+    const float *scale = (const float *)safetensors_data(sts, is);   /* [out_rows] */
+    const uint8_t *w = (const uint8_t *)safetensors_data(stw, iw);
+
+    int is_i8 = (strcmp(wdt, "I8") == 0);
+    int per, zp, mask, logical_in;
+    if (is_i8) { per = 1; zp = 0; mask = 0xFF; logical_in = packed; }
+    else       { per = 8 / bits; zp = 1 << (bits - 1); mask = (1 << bits) - 1; logical_in = packed * per; }
+
+    size_t n = (size_t)out_rows * logical_in;
+    uint16_t *f16 = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!f16) { fprintf(stderr, "cuda_llm: QAT dequant alloc failed (%s, %zu)\n", base_name, n); return out; }
+
+    for (int row = 0; row < out_rows; row++) {
+        float sc = scale[row];
+        const uint8_t *wr = w + (size_t)row * packed;
+        uint16_t *fr = f16 + (size_t)row * logical_in;
+        if (is_i8) {
+            for (int j = 0; j < packed; j++)
+                fr[j] = cllm_f32_to_f16((float)((int8_t)wr[j]) * sc);
+        } else {
+            for (int j = 0; j < packed; j++) {
+                int byte = wr[j];
+                for (int k = 0; k < per; k++) {
+                    int code = (byte >> (k * bits)) & mask;
+                    fr[per * j + k] = cllm_f32_to_f16((float)(code - zp) * sc);
+                }
+            }
+        }
+    }
+
+    out.data = f16; out.type = GGML_TYPE_F16;
+    out.n_rows = out_rows; out.n_cols = logical_in; out.n_dims = 2;
+    out.dims[0] = (uint64_t)logical_in; out.dims[1] = (uint64_t)out_rows;
+    return out;
+}
+
+/* Gemma QAT embedding dequant: <base>.embedding_quantized [vocab, packed] U8 +
+ * <base>.embedding_scale [vocab, nscale] F32. nscale==1 -> one scale per row;
+ * nscale>1 (per-layer-block) -> scale[row,L] applies to cols [L*blk, (L+1)*blk)
+ * where blk = logical_in/nscale. Returns host-owned F16 [vocab, logical_in].
+ * The architectural sqrt-scale is applied at runtime (embed kernel / PLE precompute),
+ * so only the quantization scale is folded here (matches the GGUF raw weights). */
+static qtensor cllm_st_load_qat_embed(st_context **shards, int n_shards,
+                                      const char *base_name, int bits, int required) {
+    qtensor out = {0};
+    char qn[480], sn[496];
+    snprintf(qn, sizeof(qn), "%s.embedding_quantized", base_name);
+    snprintf(sn, sizeof(sn), "%s.embedding_scale", base_name);
+
+    st_context *stq = NULL; int iq = -1;
+    for (int s = 0; s < n_shards && iq < 0; s++) { iq = safetensors_find(shards[s], qn); if (iq >= 0) stq = shards[s]; }
+    if (iq < 0) { if (required) fprintf(stderr, "cuda_llm: QAT missing embed %s\n", qn); return out; }
+    st_context *sts = NULL; int is = -1;
+    for (int s = 0; s < n_shards && is < 0; s++) { is = safetensors_find(shards[s], sn); if (is >= 0) sts = shards[s]; }
+    if (is < 0) { fprintf(stderr, "cuda_llm: QAT missing embed scale %s\n", sn); return out; }
+
+    const uint64_t *qsh = safetensors_shape(stq, iq);
+    int vocab  = (int)qsh[0];
+    int packed = (int)qsh[1];
+    int nscale = (int)safetensors_shape(sts, is)[1];
+    int per = 8 / bits, zp = 1 << (bits - 1), mask = (1 << bits) - 1;
+    int logical_in = packed * per;
+    int blk = (nscale > 1) ? (logical_in / nscale) : logical_in;
+
+    const uint8_t *q = (const uint8_t *)safetensors_data(stq, iq);
+    const float *scale = (const float *)safetensors_data(sts, is);   /* [vocab, nscale] */
+
+    size_t n = (size_t)vocab * logical_in;
+    uint16_t *f16 = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!f16) { fprintf(stderr, "cuda_llm: QAT embed alloc failed (%s, %zu)\n", base_name, n); return out; }
+
+    for (int row = 0; row < vocab; row++) {
+        const uint8_t *qr = q + (size_t)row * packed;
+        const float *sr = scale + (size_t)row * nscale;
+        uint16_t *fr = f16 + (size_t)row * logical_in;
+        for (int j = 0; j < packed; j++) {
+            int byte = qr[j];
+            for (int k = 0; k < per; k++) {
+                int col = per * j + k;
+                int code = (byte >> (k * bits)) & mask;
+                float sc = (nscale > 1) ? sr[col / blk] : sr[0];
+                fr[col] = cllm_f32_to_f16((float)(code - zp) * sc);
+            }
+        }
+    }
+
+    out.data = f16; out.type = GGML_TYPE_F16;
+    out.n_rows = vocab; out.n_cols = logical_in; out.n_dims = 2;
+    out.dims[0] = (uint64_t)logical_in; out.dims[1] = (uint64_t)vocab;
+    return out;
+}
+
 static int cllm_open_safetensors_shards(const char *model_path, st_context **shards,
                                         int max_shards) {
     struct stat sb;
@@ -11012,6 +11134,15 @@ static int cllm_open_safetensors_shards(const char *model_path, st_context **sha
                 }
             }
             if (!found) break;
+        }
+        /* Fallback: a single un-sharded model.safetensors in the directory. */
+        if (n_shards == 0) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/model.safetensors", model_path);
+            if (stat(path, &sb) == 0) {
+                st_context *s = safetensors_open(path);
+                if (s) shards[n_shards++] = s;
+            }
         }
         return n_shards;
     }
@@ -12328,6 +12459,390 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
 
     cllm_close_safetensors_shards(shards, n_shards);
     cllm_f16cache_end(1, r->verbose);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Gemma-4 (E2B / Gemma3n) DIRECT safetensors loader for the "qat-mobile"     */
+/* checkpoints (model_type=gemma4, gemma wNa8o8 QAT).  Dequants every linear  */
+/* to F16 (cuBLAS / F16-matvec path) and mirrors the gemma4 GGUF setup:       */
+/* PLE (per-layer embeddings), per-layer head_dim (SWA 256 / full 512),       */
+/* KV-sharing, sliding-window pattern, final-logit softcap.                   */
+/* ------------------------------------------------------------------------ */
+
+/* tiny config.json helpers (text_config / nested rope_parameters) */
+static double cllm_json_num(const json_val *o, const char *k, double dflt) {
+    if (!o || o->type != JSON_OBJECT) return dflt;
+    const json_val *v = json_obj_get(o, k);
+    return (v && v->type == JSON_NUMBER) ? v->num : dflt;
+}
+
+int cuda_llm_load_weights_gemma4_safetensors(cuda_llm_runner *r,
+                                             const char *model_path,
+                                             int max_seq_len) {
+    if (!r || !model_path) return -1;
+    if (cuda_llm_bind_context(r) != 0) return -1;
+    cllm_f16cache_begin(model_path, r->verbose);
+
+    st_context *shards[16] = {0};
+    int n_shards = cllm_open_safetensors_shards(model_path, shards, 16);
+    if (n_shards <= 0) {
+        fprintf(stderr, "cuda_llm: failed to open gemma4 safetensors %s\n", model_path);
+        cllm_f16cache_end(0, r->verbose);
+        return -1;
+    }
+    #define ST_FAIL() do { cllm_close_safetensors_shards(shards, n_shards); cllm_f16cache_end(0, r->verbose); return -1; } while (0)
+
+    const char *LM = "model.language_model.";
+    char name[256], base[224];
+
+    /* ---- architectural constants: defaults + config.json overrides ---- */
+    float rms_eps = 1e-6f, rope_full = 1000000.0f, rope_swa = 10000.0f;
+    int   sliding_window = 512, shared_kv_layers = 20;
+    float softcap = 30.0f, partial_rotary = 0.25f;
+    int   head_dim_swa = 256, head_dim_full = 512, ple_dim = 256;
+    {
+        char cfg_path[512];
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", model_path);
+        FILE *f = fopen(cfg_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char *buf = (char *)malloc(sz > 0 ? sz : 1);
+            if (buf && sz > 0 && fread(buf, 1, sz, f) == (size_t)sz) {
+                json_val *root = json_parse(buf, (int)sz);
+                json_val *tc = root ? json_obj_get(root, "text_config") : NULL;
+                if (tc) {
+                    rms_eps         = (float)cllm_json_num(tc, "rms_norm_eps", rms_eps);
+                    sliding_window  = (int)  cllm_json_num(tc, "sliding_window", sliding_window);
+                    shared_kv_layers= (int)  cllm_json_num(tc, "num_kv_shared_layers", shared_kv_layers);
+                    softcap         = (float)cllm_json_num(tc, "final_logit_softcapping", softcap);
+                    head_dim_swa    = (int)  cllm_json_num(tc, "head_dim", head_dim_swa);
+                    head_dim_full   = (int)  cllm_json_num(tc, "global_head_dim", head_dim_full);
+                    ple_dim         = (int)  cllm_json_num(tc, "hidden_size_per_layer_input", ple_dim);
+                    json_val *rp = json_obj_get(tc, "rope_parameters");
+                    if (rp && rp->type == JSON_OBJECT) {
+                        json_val *fa = json_obj_get(rp, "full_attention");
+                        json_val *sa = json_obj_get(rp, "sliding_attention");
+                        rope_full = (float)cllm_json_num(fa, "rope_theta", rope_full);
+                        rope_swa  = (float)cllm_json_num(sa, "rope_theta", rope_swa);
+                        partial_rotary = (float)cllm_json_num(fa, "partial_rotary_factor", partial_rotary);
+                    }
+                }
+                if (root) json_free(root);
+            }
+            free(buf);
+            fclose(f);
+        }
+    }
+
+    /* ---- dimensions from tensor shapes ---- */
+    int n_layers = 0;
+    for (int s = 0; s < n_shards; s++) {
+        for (int i = 0; i < shards[s]->n_tensors; i++) {
+            const char *nm = safetensors_name(shards[s], i);
+            const char *p = strstr(nm, "language_model.layers.");
+            if (p) { int l = atoi(p + 22); if (l + 1 > n_layers) n_layers = l + 1; }
+        }
+    }
+    if (n_layers <= 0) { fprintf(stderr, "cuda_llm: gemma4 st: no layers found\n"); ST_FAIL(); }
+
+    snprintf(name, sizeof(name), "%snorm.weight", LM);
+    qtensor onorm = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+    if (!onorm.data) ST_FAIL();
+    int n_embd = onorm.n_cols;
+
+    snprintf(name, sizeof(name), "%sembed_tokens.embedding_quantized", LM);
+    int ev = -1; for (int s = 0; s < n_shards && ev < 0; s++) ev = safetensors_find(shards[s], name);
+    int n_vocab = 0;
+    for (int s = 0; s < n_shards; s++) { int e = safetensors_find(shards[s], name); if (e >= 0) { n_vocab = (int)safetensors_shape(shards[s], e)[0]; break; } }
+    (void)ev;
+    if (n_vocab <= 0) { fprintf(stderr, "cuda_llm: gemma4 st: embed not found\n"); ST_FAIL(); }
+
+    /* q_proj out dim per layer distinguishes SWA (n_heads*256) from full (n_heads*512). */
+    int *swa_pat = (int *)calloc(n_layers, sizeof(int));
+    int n_ff_max = 0, n_heads = 0;
+    if (!swa_pat) ST_FAIL();
+    for (int l = 0; l < n_layers; l++) {
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_proj.weight", LM, l);
+        int qi = -1; st_context *qs = NULL;
+        for (int s = 0; s < n_shards && qi < 0; s++) { qi = safetensors_find(shards[s], name); if (qi >= 0) qs = shards[s]; }
+        if (qi < 0) { fprintf(stderr, "cuda_llm: gemma4 st: missing %s\n", name); free(swa_pat); ST_FAIL(); }
+        int q_out = (int)safetensors_shape(qs, qi)[0];
+        /* full-attn layers have the larger head_dim → larger q_out */
+        if (n_heads == 0) n_heads = q_out / head_dim_swa; /* derive from a SWA layer (layer 0) */
+        swa_pat[l] = (q_out == n_heads * head_dim_full) ? 0 : 1;
+        /* per-layer ffn width (double-wide on the 2-bit layers) */
+        snprintf(name, sizeof(name), "%slayers.%d.mlp.gate_proj.weight", LM, l);
+        for (int s = 0; s < n_shards; s++) { int gi = safetensors_find(shards[s], name);
+            if (gi >= 0) { int go = (int)safetensors_shape(shards[s], gi)[0]; if (go > n_ff_max) n_ff_max = go; break; } }
+    }
+    if (n_heads <= 0) n_heads = 8;
+
+    /* ---- populate runner scalars ---- */
+    r->n_embd = n_embd;
+    r->n_vocab = n_vocab;
+    r->n_layers = n_layers;
+    r->n_heads = n_heads;
+    r->n_kv_heads = 1;
+    r->n_ff = n_ff_max;
+    r->rms_norm_eps = rms_eps;
+    r->rope_freq_base = rope_full;
+    r->rope_freq_base_swa = rope_swa;
+    r->n_rope_pairs = 0;
+    r->is_hybrid = 0; r->is_moe = 0; r->n_deepstack = 0; r->full_attn_interval = 0;
+    r->is_gemma4 = 1;
+    r->head_dim_full = head_dim_full;
+    r->head_dim_swa = head_dim_swa;
+    r->head_dim = head_dim_full;
+    r->swa_window_size = sliding_window;
+    { const char *we = getenv("CUDA_LLM_SWA_WINDOW"); if (we && atoi(we) > 0) r->swa_window_size = atoi(we); }
+    r->n_embd_per_layer = ple_dim;
+    r->n_layer_kv_from_start = n_layers - shared_kv_layers;
+    r->final_logit_softcapping = softcap;
+    r->embd_scale = sqrtf((float)n_embd);
+    r->ple_use_f32 = 1;
+    { const char *ce = getenv("CUDA_LLM_USE_CUBLAS"); if (!ce || atoi(ce) != 0) r->use_cublas = 1; }
+    r->swa_pattern = swa_pat;
+    r->per_layer_kv_heads = NULL;   /* uniform n_kv_heads = 1 */
+    if (max_seq_len <= 0) max_seq_len = 4096;
+    r->max_seq_len = max_seq_len;
+
+    /* ---- RoPE tables (SWA full-rotation; full-attn partial-rotary 0.25) ---- */
+    {
+        int half_swa = head_dim_swa / 2;
+        float *iv = (float *)malloc(half_swa * sizeof(float));
+        if (!iv) ST_FAIL();
+        for (int j = 0; j < half_swa; j++) iv[j] = 1.0f / powf(rope_swa, (float)(2 * j) / head_dim_swa);
+        if (cuMemAlloc(&r->d_rope_inv_freq_swa, half_swa * sizeof(float)) != CUDA_SUCCESS ||
+            cuMemcpyHtoD(r->d_rope_inv_freq_swa, iv, half_swa * sizeof(float)) != CUDA_SUCCESS) { free(iv); ST_FAIL(); }
+        free(iv);
+
+        int half_full = head_dim_full / 2;
+        int n_rot_pairs = (int)(partial_rotary * head_dim_full) / 2;  /* 0.25*512/2 = 64 */
+        float *ivf = (float *)malloc(half_full * sizeof(float));
+        if (!ivf) ST_FAIL();
+        for (int j = 0; j < half_full; j++)
+            ivf[j] = (j < n_rot_pairs) ? 1.0f / powf(rope_full, (float)(2 * j) / head_dim_full) : 0.0f;
+        if (cuMemAlloc(&r->d_rope_inv_freq_full, half_full * sizeof(float)) != CUDA_SUCCESS ||
+            cuMemcpyHtoD(r->d_rope_inv_freq_full, ivf, half_full * sizeof(float)) != CUDA_SUCCESS) { free(ivf); ST_FAIL(); }
+        free(ivf);
+    }
+
+    if (r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: gemma4 safetensors: n_embd=%d n_heads=%d n_kv=%d n_layers=%d n_ff(max)=%d\n",
+                n_embd, n_heads, r->n_kv_heads, n_layers, n_ff_max);
+        fprintf(stderr, "cuda_llm: gemma4: head_full=%d head_swa=%d swa_win=%d ple_dim=%d kv_from_start=%d softcap=%.1f rope=%.0f/%.0f\n",
+                head_dim_full, head_dim_swa, r->swa_window_size, ple_dim, r->n_layer_kv_from_start, softcap, rope_full, rope_swa);
+    }
+
+    /* ---- token embedding (QAT 2-bit -> F16) + lm_head (tied) ---- */
+    snprintf(base, sizeof(base), "%sembed_tokens", LM);
+    qtensor te = cllm_st_load_qat_embed(shards, n_shards, base, 2, 1);
+    if (!te.data) ST_FAIL();
+    if (upload_f16_matrix(&r->d_token_embd, &te) != 0) { free(te.data); ST_FAIL(); }
+    free(te.data);
+    r->token_embd_type = GGML_TYPE_F16;
+    if (upload_norm_f32(r, &r->d_output_norm, &onorm, n_embd) != 0) ST_FAIL();
+    r->d_output_w = r->d_token_embd;
+    r->output_w_type = r->token_embd_type;
+    r->has_lm_head = 1;
+
+    /* ---- per-layer weights ---- */
+    r->layers = (cuda_layer *)calloc(n_layers, sizeof(cuda_layer));
+    if (!r->layers) ST_FAIL();
+
+    #define LD_QAT(field_w, field_type, field_r, field_c, st_base, bits) do { \
+        snprintf(base, sizeof(base), "%slayers.%d." st_base, LM, l); \
+        qtensor _t = cllm_st_load_qat_dequant(shards, n_shards, base, bits, 1); \
+        if (!_t.data) ST_FAIL(); \
+        cl->field_r = _t.n_rows; cl->field_c = _t.n_cols; \
+        int _rc = upload_weight_matrix(r, &cl->field_w, &_t, &cl->field_type, base); \
+        free(_t.data); if (_rc != 0) ST_FAIL(); \
+    } while (0)
+
+    #define LD_NORM(field_w, st_suffix, dim, required) do { \
+        snprintf(name, sizeof(name), "%slayers.%d." st_suffix, LM, l); \
+        qtensor _t = cllm_st_load_tensor_multi(shards, n_shards, name, required); \
+        if (_t.data) { if (upload_norm_f32(r, &cl->field_w, &_t, dim) != 0) ST_FAIL(); } \
+        else if (required) ST_FAIL(); \
+    } while (0)
+
+    for (int l = 0; l < n_layers; l++) {
+        cuda_layer *cl = &r->layers[l];
+        cl->is_ssm = 0;
+        cl->is_swa = swa_pat[l];
+        cl->n_kv_heads = r->n_kv_heads;
+        cl->shared_kv_source = -1;
+        if (l >= r->n_layer_kv_from_start)
+            cl->shared_kv_source = r->n_layer_kv_from_start - (cl->is_swa ? 2 : 1);
+        int hd = cl->is_swa ? head_dim_swa : head_dim_full;
+        int mlp_bits = (l <= 14) ? 4 : 2;
+
+        LD_NORM(attn_norm_w, "input_layernorm.weight", n_embd, 1);
+
+        LD_QAT(attn_q_w, attn_q_type, attn_q_rows, attn_q_cols, "self_attn.q_proj", 4);
+        LD_QAT(attn_output_w, attn_output_type, attn_output_rows, attn_output_cols, "self_attn.o_proj", 4);
+
+        /* Q norm (per-layer head_dim) — Q is computed by every layer */
+        cl->has_qk_norm = 1;
+        LD_NORM(attn_q_norm_w, "self_attn.q_norm.weight", hd, 1);
+
+        /* K/V projections + K norm exist only for own-KV layers; shared-KV layers
+         * (l >= n_layer_kv_from_start) reuse the source layer's KV cache and the
+         * mobile checkpoint omits their k_norm entirely. */
+        if (cl->shared_kv_source < 0) {
+            LD_QAT(attn_k_w, attn_k_type, attn_k_rows, attn_k_cols, "self_attn.k_proj", 4);
+            LD_QAT(attn_v_w, attn_v_type, attn_v_rows, attn_v_cols, "self_attn.v_proj", 4);
+            cl->has_v_proj = 1;
+            LD_NORM(attn_k_norm_w, "self_attn.k_norm.weight", hd, 1);
+        }
+
+        LD_NORM(ffn_norm_w, "pre_feedforward_layernorm.weight", n_embd, 1);
+
+        LD_QAT(ffn_gate_w, ffn_gate_type, ffn_gate_rows, ffn_gate_cols, "mlp.gate_proj", mlp_bits);
+        LD_QAT(ffn_up_w,   ffn_up_type,   ffn_up_rows,   ffn_up_cols,   "mlp.up_proj",   mlp_bits);
+        LD_QAT(ffn_down_w, ffn_down_type, ffn_down_rows, ffn_down_cols, "mlp.down_proj", mlp_bits);
+
+        LD_NORM(post_attn_norm_w, "post_attention_layernorm.weight", n_embd, 1);
+        LD_NORM(post_ffw_norm_w,  "post_feedforward_layernorm.weight", n_embd, 1);
+
+        /* layer output scale (BF16 scalar) */
+        cl->layer_scale_val = 1.0f;
+        snprintf(name, sizeof(name), "%slayers.%d.layer_scalar", LM, l);
+        { qtensor _t = cllm_st_load_tensor_multi(shards, n_shards, name, 0);
+          if (_t.data) { float sv; dequant_row(_t.type, _t.data, &sv, 1); cl->layer_scale_val = sv; } }
+
+        /* per-layer embedding gate/proj (8-bit I8) + post-norm */
+        snprintf(base, sizeof(base), "%slayers.%d.per_layer_input_gate", LM, l);
+        { qtensor _t = cllm_st_load_qat_dequant(shards, n_shards, base, 8, 1);
+          if (!_t.data) ST_FAIL();
+          cl->ple_inp_gate_rows = _t.n_rows; cl->ple_inp_gate_cols = _t.n_cols;
+          cl->ple_inp_gate_type = GGML_TYPE_F32;
+          int _rc = upload_weight_f32(&cl->ple_inp_gate_w, &_t);
+          free(_t.data); if (_rc != 0) ST_FAIL(); }
+
+        snprintf(base, sizeof(base), "%slayers.%d.per_layer_projection", LM, l);
+        { qtensor _t = cllm_st_load_qat_dequant(shards, n_shards, base, 8, 1);
+          if (!_t.data) ST_FAIL();
+          cl->ple_proj_rows = _t.n_rows; cl->ple_proj_cols = _t.n_cols;
+          cl->ple_proj_type = GGML_TYPE_F32;
+          int _rc = upload_weight_f32(&cl->ple_proj_w, &_t);
+          free(_t.data); if (_rc != 0) ST_FAIL(); }
+
+        LD_NORM(ple_post_norm_w, "post_per_layer_input_norm.weight", n_embd, 1);
+
+        if (r->verbose >= 2)
+            fprintf(stderr, "  L%d [%s hd=%d ff=%d]: q[%dx%d] k[%dx%d] v[%dx%d] o[%dx%d]\n",
+                    l, cl->is_swa ? "SWA" : "FULL", hd, cl->ffn_gate_rows,
+                    cl->attn_q_rows, cl->attn_q_cols, cl->attn_k_rows, cl->attn_k_cols,
+                    cl->attn_v_rows, cl->attn_v_cols, cl->attn_output_rows, cl->attn_output_cols);
+    }
+    #undef LD_QAT
+    #undef LD_NORM
+
+    /* ---- global PLE tensors (host-resident for CPU precompute) ---- */
+    {
+        int total_ple = ple_dim * n_layers;
+        /* per_layer token embeddings: QAT 4-bit, per-(row,layer) scale -> F16 host */
+        snprintf(base, sizeof(base), "%sembed_tokens_per_layer", LM);
+        r->h_ple_token_embd = cllm_st_load_qat_embed(shards, n_shards, base, 4, 1);
+        if (!r->h_ple_token_embd.data) ST_FAIL();
+
+        /* per_layer_model_projection [total_ple, n_embd] BF16 -> F32 host (owned) */
+        snprintf(name, sizeof(name), "%sper_layer_model_projection.weight", LM);
+        qtensor mp = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        if (!mp.data) ST_FAIL();
+        {
+            size_t n = (size_t)mp.n_rows * mp.n_cols;
+            float *f32 = (float *)malloc(n * sizeof(float));
+            if (!f32) ST_FAIL();
+            size_t rb = dequant_row_size(mp.type, mp.n_cols);
+            for (int rr = 0; rr < mp.n_rows; rr++)
+                dequant_row(mp.type, (const uint8_t *)mp.data + (size_t)rr * rb, f32 + (size_t)rr * mp.n_cols, mp.n_cols);
+            r->h_ple_model_proj.data = f32; r->h_ple_model_proj.type = GGML_TYPE_F32;
+            r->h_ple_model_proj.n_rows = mp.n_rows; r->h_ple_model_proj.n_cols = mp.n_cols;
+            r->h_ple_model_proj.n_dims = 2;
+        }
+
+        /* per_layer_projection_norm [ple_dim] BF16 -> F32 host (owned) */
+        snprintf(name, sizeof(name), "%sper_layer_projection_norm.weight", LM);
+        qtensor pn = cllm_st_load_tensor_multi(shards, n_shards, name, 0);
+        if (pn.data) {
+            float *f32 = (float *)malloc((size_t)pn.n_cols * sizeof(float));
+            if (!f32) ST_FAIL();
+            dequant_row(pn.type, pn.data, f32, pn.n_cols);
+            r->h_ple_proj_norm.data = f32; r->h_ple_proj_norm.type = GGML_TYPE_F32;
+            r->h_ple_proj_norm.n_rows = 1; r->h_ple_proj_norm.n_cols = pn.n_cols; r->h_ple_proj_norm.n_dims = 1;
+        }
+
+        CHECK_CU(cuMemAlloc(&r->d_ple_combined, (size_t)total_ple * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ple_buf, (size_t)ple_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ple_proj, (size_t)n_embd * sizeof(float)));
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_llm: gemma4 PLE buffers (ple_dim=%d total=%d, embed F16 host=%.1f GB)\n",
+                    ple_dim, total_ple, (double)r->h_ple_token_embd.n_rows * r->h_ple_token_embd.n_cols * 2 / 1e9);
+    }
+
+    /* ---- KV cache (per-layer head_dim, SWA window, shared KV) ---- */
+    r->d_key_cache = (CUdeviceptr *)calloc(n_layers, sizeof(CUdeviceptr));
+    r->d_value_cache = (CUdeviceptr *)calloc(n_layers, sizeof(CUdeviceptr));
+    if (!r->d_key_cache || !r->d_value_cache) ST_FAIL();
+    r->kv_cache_q8 = 0;
+    for (int l = 0; l < n_layers; l++) {
+        if (r->layers[l].shared_kv_source >= 0) continue;
+        int kv_dim = r->layers[l].n_kv_heads * (r->layers[l].is_swa ? head_dim_swa : head_dim_full);
+        size_t cache_sz = (size_t)(r->layers[l].is_swa ? r->swa_window_size : max_seq_len) * kv_dim * sizeof(uint16_t);
+        CHECK_CU(cuMemAlloc(&r->d_key_cache[l], cache_sz));
+        CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, cache_sz));
+        CHECK_CU(cuMemAlloc(&r->d_value_cache[l], cache_sz));
+        CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, cache_sz));
+    }
+    for (int l = 0; l < n_layers; l++) {
+        int src = r->layers[l].shared_kv_source;
+        if (src >= 0 && src < n_layers) {
+            r->d_key_cache[l] = r->d_key_cache[src];
+            r->d_value_cache[l] = r->d_value_cache[src];
+        }
+    }
+
+    /* ---- scratch buffers ---- */
+    {
+        int q_dim = n_heads * head_dim_full;
+        int kv_dim = r->n_kv_heads * head_dim_full;
+        int max_dim = n_embd;
+        if (q_dim > max_dim) max_dim = q_dim;
+        if (n_ff_max > max_dim) max_dim = n_ff_max;
+        int xb2_dim = max_dim;
+
+        CHECK_CU(cuMemAlloc(&r->d_x,   max_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_xb,  max_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_xb2, xb2_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_q,   q_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_k,   kv_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_v,   kv_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_gate, n_ff_max * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_up,   n_ff_max * sizeof(float)));
+
+        CHECK_CU(cuMemAlloc(&r->d_xb_q,      max_dim * sizeof(int8_t)));
+        CHECK_CU(cuMemAlloc(&r->d_xb_scale,  sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_xb_q2,     max_dim * sizeof(int8_t)));
+        CHECK_CU(cuMemAlloc(&r->d_xb_scale2, sizeof(float)));
+        { size_t q81 = ((size_t)max_dim / 32 + 1) * 36;
+          CHECK_CU(cuMemAlloc(&r->d_xb_q81,   q81));
+          CHECK_CU(cuMemAlloc(&r->d_xb_q81_2, q81)); }
+        CHECK_CU(cuMemAlloc(&r->d_xb_f16, (size_t)max_dim * sizeof(unsigned short)));
+        CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * n_embd * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)n_vocab * sizeof(float)));
+        int out_sz = n_vocab > n_embd ? n_vocab : n_embd;
+        r->h_output = (float *)malloc((size_t)out_sz * sizeof(float));
+        if (!r->h_output) ST_FAIL();
+    }
+
+    r->weights_loaded = 1;
+    cllm_close_safetensors_shards(shards, n_shards);
+    cllm_f16cache_end(1, r->verbose);
+    if (r->verbose >= 1) fprintf(stderr, "cuda_llm: gemma4 safetensors load complete\n");
+    #undef ST_FAIL
     return 0;
 }
 

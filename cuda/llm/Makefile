@@ -46,6 +46,10 @@ $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(
           cuda_llm_runner.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
+test_gemma4_st: test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(FA2_CUBIN) \
+          cuda_llm_runner.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -o $@ test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
+
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
 
