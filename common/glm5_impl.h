@@ -597,6 +597,17 @@ static void glm5_free(glm5_model*m){
  * T_cp. If the whole context fits un-sharded, it stays Tier A throughout (no CP overhead).
  * GLM5_CP_THRESHOLD: 0=auto (default), >0=explicit T_cp positions, <0=static (legacy env CP/int4,
  * for forced-CP A/B reference). GLM5_KV_BUDGET_GB tunes the auto budget. */
+/* read a /proc/meminfo field (e.g. "MemAvailable") in bytes; 0 if unavailable. */
+static long glm5_meminfo_bytes(const char*key){
+    FILE*f=fopen("/proc/meminfo","r"); if(!f) return 0;
+    char line[256]; size_t kl=strlen(key); long kb=0;
+    while(fgets(line,sizeof line,f)){
+        if(!strncmp(line,key,kl) && line[kl]==':'){
+            const char*p=line+kl+1; while(*p&&(*p<'0'||*p>'9'))p++; kb=atol(p); break;
+        }
+    }
+    fclose(f); return kb*1024L;
+}
 static void glm5_kv_init(glm5_model*m){
     const glm5_config*c=&m->cfg;
     m->kv_fp16 =glm5_envi("GLM5_KV_FP16",0);
@@ -613,7 +624,26 @@ static void glm5_kv_init(glm5_model*m){
     int KVD=glm5_kv_cache_dim(c), ID=c->index_dim;
     int n_dense=c->n_dense_layers<c->n_layers?c->n_dense_layers:c->n_layers, n_moe=c->n_layers-n_dense;
     long per_pos=(long)c->n_layers*KVD*2 + (long)n_moe*ID*2;
-    long T = thr>0 ? thr : ((long)glm5_envi("GLM5_KV_BUDGET_GB",4)<<30)/(per_pos>0?per_pos:1);
+    long T;
+    if(thr>0) T=thr;                           /* explicit tuning override: T_cp in positions */
+    else {
+        /* Derive the Tier-A budget from real free memory: kv_init runs before weights load, so
+         * MemAvailable is the whole node — subtract the weights-to-come (glm5_arena_size with a
+         * tiny max_pos ~= weights only) and the real rope buffers, keep a safety headroom. */
+        long avail=glm5_meminfo_bytes("MemAvailable");
+        long budget;
+        if(avail<=0) budget=(long)4<<30;       /* /proc/meminfo unreadable: fall back to 4 GB */
+        else {
+            glm5_config tiny=*c; tiny.max_pos=128;             /* KV/rope negligible -> ~weights */
+            long reserve=(long)glm5_arena_size(&tiny,m->ep_rank,m->ep_size);
+            reserve += (long)c->max_pos*(c->rotary_dim/2)*4*2; /* real rope_cos/sin */
+            budget = avail - reserve - avail/10;               /* 10% headroom for scratch/mstream */
+            if(budget < (1L<<30)) budget = 1L<<30;             /* floor: at least 1 GB of Tier-A KV */
+        }
+        int bgb=glm5_envi("GLM5_KV_BUDGET_GB",0);              /* optional hard cap (0 = no cap) */
+        if(bgb>0 && ((long)bgb<<30) < budget) budget=(long)bgb<<30;
+        T = budget/(per_pos>0?per_pos:1);
+    }
     if(T<m->cp_block) T=m->cp_block;
     T=(T/m->cp_block)*m->cp_block;             /* block-align so Tier-A slots are CP-block aligned */
     m->int4_kv=0; m->cp_on=0;                   /* start in Tier A (bf16, replicated) */
