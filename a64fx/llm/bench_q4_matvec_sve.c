@@ -222,8 +222,8 @@ static void dequant_8rows_int8_4blk(const block_q4_0 *w, q4_int8_t *dst, int n_c
             svuint8_t lo1=svand_n_u8_x(pg,q1,0x0f),hi1=svlsr_n_u8_x(pg,q1,4);
             svuint8_t lo2=svand_n_u8_x(pg,q2,0x0f),hi2=svlsr_n_u8_x(pg,q2,4);
             svuint8_t lo3=svand_n_u8_x(pg,q3,0x0f),hi3=svlsr_n_u8_x(pg,q3,4);
-            svuint8_t wu0=svuzp1_u8(lo0,hi0),wu1=svuzp1_u8(lo1,hi1);
-            svuint8_t wu2=svuzp1_u8(lo2,hi2),wu3=svuzp1_u8(lo3,hi3);
+            svuint8_t wu0=svzip1_u8(lo0,hi0),wu1=svzip1_u8(lo1,hi1);
+            svuint8_t wu2=svzip1_u8(lo2,hi2),wu3=svzip1_u8(lo3,hi3);
             svint8_t ws0=svsub_n_s8_x(pg,svreinterpret_s8_u8(wu0),8);
             svint8_t ws1=svsub_n_s8_x(pg,svreinterpret_s8_u8(wu1),8);
             svint8_t ws2=svsub_n_s8_x(pg,svreinterpret_s8_u8(wu2),8);

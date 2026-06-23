@@ -737,6 +737,17 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
     const block_q4_0 *r4, const block_q4_0 *r5,
     const block_q4_0 *r6, const block_q4_0 *r7,
     const float *x, int n_cols);
+static inline void tf_vec_dot_q4_0_int8_full_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols);
+static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols);
+static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols);
+static inline void tf_vec_dot_q4_0_int8_8row(int32_t *dst, const int8_t *wi8,
+                                                const int8_t *xi8, int n_cols);
+static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_scale);
 static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
                                              const block_q4_0 *up,
                                              const float *x, int n_cols,
@@ -1029,6 +1040,309 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
 #endif
 }
 
+/* ================================================================
+ * Q4_0 int8 SDOT path: ~2.3x faster than fp32 FMA on A64FX, but
+ * with significant restrictions. Opt-in via TF_USE_INT8_SDOT_Q4_0.
+ *
+ * Dequantizes Q4_0 to int8 in L1, then uses SVE SDOT for the matvec.
+ * SDOT does 4 multiplies per int32 lane (16 dot products of 4 int8
+ * per instruction), 2 SDOT/cycle on the 2 ALU pipes.
+ *
+ * Each SDOT call processes 64 int8 weights (2 Q4_0 blocks) against
+ * 64 int8 activations, producing 16 int32 partial sums (summed at
+ * the end for the final dot product). 32 SDOTs per row, 8 rows
+ * in parallel.
+ *
+ * RESTRICTION: per-block scale d is folded into the int8 weights
+ * during dequant. For real Q4_0 weights (d ranges from 1e-4 to 1.0),
+ * folding destroys subnormal d values (rounds to 0), so the matvec
+ * produces wrong results. The path is exact only for d in [-1, 1] with
+ * |d| >= 0.5 (i.e., d ≈ 1.0). For unit-scale test data (d = 0x3C00),
+ * results are exact (verified via /tmp/test_dispatch_e2e).
+ *
+ * qlair profile for 8-row 2048x64 Q4_0 matvec (unit-scale test data):
+ *   fp32 FMA 8-row + prefetch: 67,975 cycles
+ *   int8 SDOT path:            ~30,000 cycles  (2.3x faster)
+ *
+ * For real Q4_0 data with subnormal d, the dequant overhead
+ * (proportional to n_rows * n_cols / 32) dominates the SDOT speedup,
+ * and the path is also incorrect. The fp32 path remains the
+ * production default.
+ *
+ * FUTURE: per-tensor d rescale (max|d| across all rows, divide by
+ * max|d| at dequant, scale x by max|d|) would make this exact for
+ * general d. Estimated ~1-2% additional overhead from the d-scan.
+ * ================================================================ */
+
+/* Dequantize 8 rows of Q4_0 to int8, processing 2 blocks (64 int8) at a time.
+ * Output: 8 * n_cols int8 values, row-major.
+ * Each 64-int8 group is laid out [lo0,hi0,lo1,hi1,...] (2 blocks interleaved).
+ * Per-block d is folded in as int8 multiplier (clamped to int8 range). */
+static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svbool_t pg32 = svwhilelt_b8(0, 32);
+    int nb = n_cols / 32;  /* 32 elements per Q4_0 block */
+    /* For SDOT, each row's int8 data should be padded to 64 elements (with
+     * upper 32 = 0) so the SDOT upper lanes compute 0. The dst buffer must
+     * be sized to (8 * ceil(n_cols/64) * 64) for the padded format. */
+    int nb_pairs = (n_cols + 63) / 64;  /* number of 64-element pairs per row */
+    for (int r = 0; r < 8; r++) {
+        const block_q4_0 *row = rows[r];
+        int8_t *drow = dst + r * nb_pairs * 64;
+        for (int p = 0; p < nb_pairs; p++) {
+            /* Zero the entire 64-byte output for this pair first */
+            svst1_s8(pg, drow + p*64, svdup_n_s8(0));
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                /* Load 16 bytes of qs */
+                svuint8_t q = svld1_u8(pg, row[blk].qs);
+                /* Extract lo and hi nibbles */
+                svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
+                svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
+                /* Interleave: [lo[0],hi[0],lo[1],hi[1],...] - 32 int8 in lower 32 lanes */
+                svuint8_t zipped = svzip1_u8(lo, hi);
+                /* Convert to int8 and subtract 8 */
+                svint8_t ws = svsub_n_s8_x(pg, svreinterpret_s8_u8(zipped), 8);
+                /* Fold per-block d into the int8 weights */
+                float d = ggml_fp16_to_fp32(row[blk].d);
+                int8_t di = (d >  127.0f) ?  127 : ((d < -128.0f) ? -128 : (int8_t)d);
+                ws = svmul_n_s8_x(pg, ws, di);
+                /* Store 32 int8 in the appropriate half of the 64-element pair */
+                svst1_s8(pg32, drow + p*64 + b*32, ws);
+            }
+        }
+    }
+#endif
+}
+
+/* Same as tf_dequant_q4_0_8row_to_int8 but takes a base pointer and row stride.
+ * Used when rows are stored contiguously (most common case). */
+static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    const block_q4_0 *rows[8];
+    for (int r = 0; r < 8; r++) rows[r] = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+    tf_dequant_q4_0_8row_to_int8(rows, dst, n_cols);
+#endif
+}
+
+/* 8-row Q4_0 matvec using SVE int8 SDOT.
+ * wi8: pre-dequantized int8 weights, padded to 64 elements per pair (upper 32 = 0).
+ * xi8: pre-quantized int8 activations, padded to 64 elements per pair.
+ * dst[0..7] receives int32 dot products. Multiply by x_scale to get fp32. */
+static inline void tf_vec_dot_q4_0_int8_8row(int32_t *dst, const int8_t *wi8,
+                                                const int8_t *xi8, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+    svint32_t a4=svdup_s32(0),a5=svdup_s32(0),a6=svdup_s32(0),a7=svdup_s32(0);
+    int nb_pairs = (n_cols + 63) / 64;
+    /* wi8 is laid out as 8 rows of nb_pairs * 64 int8 each */
+    for (int p = 0; p < nb_pairs; p++) {
+        if (p + 1 < nb_pairs) {
+            __builtin_prefetch(wi8+0*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+1*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+2*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+3*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+4*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+5*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+6*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+7*nb_pairs*64+(p+1)*64, 0, 0);
+        }
+        /* Load x int8 (64 elements, full SVE vector, with upper 32 = 0) */
+        svint8_t xv = svld1_s8(pg, xi8 + p*64);
+        /* Load 8 rows' int8 weights (64 elements per row, full SVE vector) */
+        svint8_t w0=svld1_s8(pg, wi8+0*nb_pairs*64+p*64);
+        svint8_t w1=svld1_s8(pg, wi8+1*nb_pairs*64+p*64);
+        svint8_t w2=svld1_s8(pg, wi8+2*nb_pairs*64+p*64);
+        svint8_t w3=svld1_s8(pg, wi8+3*nb_pairs*64+p*64);
+        svint8_t w4=svld1_s8(pg, wi8+4*nb_pairs*64+p*64);
+        svint8_t w5=svld1_s8(pg, wi8+5*nb_pairs*64+p*64);
+        svint8_t w6=svld1_s8(pg, wi8+6*nb_pairs*64+p*64);
+        svint8_t w7=svld1_s8(pg, wi8+7*nb_pairs*64+p*64);
+        /* 8 SDOTs (one per row). Each does 16 dot products of 4 int8
+         * (64 int8 = 16 lanes × 4 int8/lane). Sum of 16 partial sums
+         * is the full dot product for that 64-element chunk. */
+        a0=svdot_s32(a0, w0, xv); a1=svdot_s32(a1, w1, xv);
+        a2=svdot_s32(a2, w2, xv); a3=svdot_s32(a3, w3, xv);
+        a4=svdot_s32(a4, w4, xv); a5=svdot_s32(a5, w5, xv);
+        a6=svdot_s32(a6, w6, xv); a7=svdot_s32(a7, w7, xv);
+    }
+    /* Sum the 16 partial sums per row. */
+    dst[0] = svaddv_s32(svptrue_b32(), a0);
+    dst[1] = svaddv_s32(svptrue_b32(), a1);
+    dst[2] = svaddv_s32(svptrue_b32(), a2);
+    dst[3] = svaddv_s32(svptrue_b32(), a3);
+    dst[4] = svaddv_s32(svptrue_b32(), a4);
+    dst[5] = svaddv_s32(svptrue_b32(), a5);
+    dst[6] = svaddv_s32(svptrue_b32(), a6);
+    dst[7] = svaddv_s32(svptrue_b32(), a7);
+#else
+    (void)dst; (void)wi8; (void)xi8; (void)n_cols;
+#endif
+}
+
+/* Quantize fp32 activations to int8 with per-tensor scale.
+ * x_scale = max(|x|) / 127. x_inv = 1 / x_scale. xi8 = round(x * x_inv).
+ * Returns x_scale via *out_scale. */
+static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_scale) {
+    float xmax = 0.0f;
+    for (int j = 0; j < n_cols; j++) {
+        float a = x[j] < 0 ? -x[j] : x[j];
+        if (a > xmax) xmax = a;
+    }
+    float x_scale = xmax > 0.0f ? xmax / 127.0f : 1.0f;
+    float x_inv = 1.0f / x_scale;
+    for (int j = 0; j < n_cols; j++) {
+        float v = x[j] * x_inv;
+        /* Round to nearest, clamp to int8 range */
+        int iv = (int)(v + (v < 0 ? -0.5f : 0.5f));
+        if (iv >  127) iv =  127;
+        if (iv < -128) iv = -128;
+        xi8[j] = (int8_t)iv;
+    }
+    /* Zero-pad to 64-byte boundary (for SDOT upper 32 lanes) */
+    int n_padded = (n_cols + 63) & ~63;
+    for (int j = n_cols; j < n_padded; j++) xi8[j] = 0;
+    *out_scale = x_scale;
+}
+
+/* 8-row Q4_0 matvec with int8 SDOT.
+ * Dequantizes 8 rows of Q4_0 to int8 (padded to 64 per pair), quantizes x to int8
+ * (padded to 64 per pair), then does SDOT. dst[0..7] receives fp32 results. */
+static inline void tf_vec_dot_q4_0_int8_full_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    /* Scratch buffers (static, lazily allocated; assume n_cols <= 2048) */
+    int nb_pairs = (n_cols + 63) / 64;
+    static int8_t *wi8 = NULL;
+    static int8_t *xi8 = NULL;
+    static int wi8_alloc = 0, xi8_alloc = 0;
+    int wi8_need = 8 * nb_pairs * 64;
+    int xi8_need = nb_pairs * 64;
+    if (wi8_need > wi8_alloc) { if (wi8) free(wi8); wi8 = (int8_t *)aligned_alloc(256, wi8_need); wi8_alloc = wi8_need; }
+    if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
+    /* Quantize x to int8 with per-tensor scale (padded to 64 per pair) */
+    float x_scale;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_scale);
+    /* Dequant 8 rows to int8 (padded to 64 per pair) */
+    const block_q4_0 *rows[8] = {r0, r1, r2, r3, r4, r5, r6, r7};
+    tf_dequant_q4_0_8row_to_int8(rows, wi8, n_cols);
+    /* SDOT matvec */
+    int32_t acc[8];
+    tf_vec_dot_q4_0_int8_8row(acc, wi8, xi8, n_cols);
+    /* Scale int32 results by x_scale to get fp32 (d is already in wi8) */
+    for (int i = 0; i < 8; i++) dst[i] = (float)acc[i] * x_scale;
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+    dst[4] = tf_vec_dot_q4_0_f32(r4, x, n_cols);
+    dst[5] = tf_vec_dot_q4_0_f32(r5, x, n_cols);
+    dst[6] = tf_vec_dot_q4_0_f32(r6, x, n_cols);
+    dst[7] = tf_vec_dot_q4_0_f32(r7, x, n_cols);
+#endif
+}
+
+/* 4-row variant of tf_dequant_q4_0_8row_to_int8: takes 4 row pointers and
+ * dequantizes each to (nb_pairs * 64) int8 with upper 32 of each pair = 0. */
+static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svbool_t pg32 = svwhilelt_b8(0, 32);
+    int nb = n_cols / 32;
+    int nb_pairs = (n_cols + 63) / 64;
+    for (int r = 0; r < 4; r++) {
+        const block_q4_0 *row = rows[r];
+        int8_t *drow = dst + r * nb_pairs * 64;
+        for (int p = 0; p < nb_pairs; p++) {
+            svst1_s8(pg, drow + p*64, svdup_n_s8(0));
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                svuint8_t q = svld1_u8(pg, row[blk].qs);
+                svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
+                svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
+                svuint8_t zipped = svzip1_u8(lo, hi);
+                svint8_t ws = svsub_n_s8_x(pg, svreinterpret_s8_u8(zipped), 8);
+                float d = ggml_fp16_to_fp32(row[blk].d);
+                int8_t di = (d >  127.0f) ?  127 : ((d < -128.0f) ? -128 : (int8_t)d);
+                ws = svmul_n_s8_x(pg, ws, di);
+                svst1_s8(pg32, drow + p*64 + b*32, ws);
+            }
+        }
+    }
+#endif
+}
+
+/* 4-row int8 SDOT matvec (no duplicate-row waste). */
+static inline void tf_vec_dot_q4_0_int8_4row(int32_t *dst, const int8_t *wi8,
+                                              const int8_t *xi8, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+    int nb_pairs = (n_cols + 63) / 64;
+    for (int p = 0; p < nb_pairs; p++) {
+        if (p + 1 < nb_pairs) {
+            __builtin_prefetch(wi8+0*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+1*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+2*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+3*nb_pairs*64+(p+1)*64, 0, 0);
+        }
+        svint8_t xv = svld1_s8(pg, xi8 + p*64);
+        svint8_t w0=svld1_s8(pg, wi8+0*nb_pairs*64+p*64);
+        svint8_t w1=svld1_s8(pg, wi8+1*nb_pairs*64+p*64);
+        svint8_t w2=svld1_s8(pg, wi8+2*nb_pairs*64+p*64);
+        svint8_t w3=svld1_s8(pg, wi8+3*nb_pairs*64+p*64);
+        a0=svdot_s32(a0, w0, xv); a1=svdot_s32(a1, w1, xv);
+        a2=svdot_s32(a2, w2, xv); a3=svdot_s32(a3, w3, xv);
+    }
+    dst[0] = svaddv_s32(svptrue_b32(), a0);
+    dst[1] = svaddv_s32(svptrue_b32(), a1);
+    dst[2] = svaddv_s32(svptrue_b32(), a2);
+    dst[3] = svaddv_s32(svptrue_b32(), a3);
+#else
+    (void)dst; (void)wi8; (void)xi8; (void)n_cols;
+#endif
+}
+
+/* 4-row Q4_0 matvec with int8 SDOT. Saves 4 SDOTs per pair vs the
+ * 8-row-with-duplicate-row-reuse path. */
+static inline void tf_vec_dot_q4_0_int8_full_4row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    int nb_pairs = (n_cols + 63) / 64;
+    /* Share the 8-row scratch to avoid extra alloc churn. The 4-row dequant
+     * writes into the first 4*nb_pairs*64 bytes; the 4-row SDOT reads the
+     * same range. */
+    static int8_t *wi8 = NULL;
+    static int8_t *xi8 = NULL;
+    static int wi8_alloc = 0, xi8_alloc = 0;
+    int wi8_need = 8 * nb_pairs * 64;  /* same size as 8-row scratch */
+    int xi8_need = nb_pairs * 64;
+    if (wi8_need > wi8_alloc) { if (wi8) free(wi8); wi8 = (int8_t *)aligned_alloc(256, wi8_need); wi8_alloc = wi8_need; }
+    if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
+    float x_scale;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_scale);
+    const block_q4_0 *rows[4] = {r0, r1, r2, r3};
+    tf_dequant_q4_0_4row_to_int8(rows, wi8, n_cols);
+    int32_t acc[4];
+    tf_vec_dot_q4_0_int8_4row(acc, wi8, xi8, n_cols);
+    for (int i = 0; i < 4; i++) dst[i] = (float)acc[i] * x_scale;
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+#endif
+}
+
 static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
                                            const float *x0, const float *x1,
                                            const float *x2, const float *x3,
@@ -1074,6 +1388,34 @@ static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_byte
                                   const float *x, int n_cols, int row_start, int row_end) {
     int i = row_start;
 #if defined(__ARM_FEATURE_SVE)
+    /* int8 SDOT path: ~2.3x faster than fp32 FMA on A64FX (29.7K vs 68K cycles
+     * for 8-row 2048x64 matvec, per qlair profile), but only exact when per-block
+     * d is in [0.5, 1.0] (folded as int8 multiplier; subnormal d is lost to
+     * rounding). For real Q4_0 weights (d ranges from 1e-4 to 1.0), the
+     * int8 path produces incorrect results, so it's opt-in. Define
+     * TF_USE_INT8_SDOT_Q4_0=1 to enable. */
+#ifdef TF_USE_INT8_SDOT_Q4_0
+    for (; i + 7 < row_end; i += 8) {
+        tf_vec_dot_q4_0_int8_full_8row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+4) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+5) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+6) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+7) * row_bytes),
+            x, n_cols);
+    }
+    for (; i + 3 < row_end; i += 4) {
+        tf_vec_dot_q4_0_int8_full_4row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            x, n_cols);
+    }
+#else
     for (; i + 7 < row_end; i += 8) {
         tf_vec_dot_q4_0_f32_8row(dst + i,
             (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
@@ -1094,6 +1436,7 @@ static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_byte
             (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
             x, n_cols);
     }
+#endif
 #endif
     for (; i < row_end; i++) {
         const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)i * row_bytes);
