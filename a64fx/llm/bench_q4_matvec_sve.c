@@ -202,6 +202,77 @@ static void vec_dot_q4_0_8row_sve(float *dst,
 }
 
 /* ================================================================
+ * IMPLEMENTATION 4: 8-row SVE SDOT (int8 dot product)
+ * Dequant Q4_0 to int8 in 4-block chunks, then use SVE SDOT against
+ * pre-quantized int8 activations. Requires int8 x (e.g. per-tensor
+ * PTQ with scale 64-256 for normalized activations).
+ * ================================================================ */
+typedef int8_t q4_int8_t;
+static void dequant_8rows_int8_4blk(const block_q4_0 *w, q4_int8_t *dst, int n_cols) {
+    svbool_t pg = svptrue_b8();
+    svbool_t pg32 = svwhilelt_b8(0, 32);
+    int nb = n_cols / 32;
+    for (int r = 0; r < 8; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)((const char *)w + r * (nb * sizeof(block_q4_0)));
+        q4_int8_t *drow = dst + r * n_cols;
+        for (int b = 0; b < nb; b += 4) {
+            svuint8_t q0=svld1_u8(pg,row[b].qs),q1=svld1_u8(pg,row[b+1].qs);
+            svuint8_t q2=svld1_u8(pg,row[b+2].qs),q3=svld1_u8(pg,row[b+3].qs);
+            svuint8_t lo0=svand_n_u8_x(pg,q0,0x0f),hi0=svlsr_n_u8_x(pg,q0,4);
+            svuint8_t lo1=svand_n_u8_x(pg,q1,0x0f),hi1=svlsr_n_u8_x(pg,q1,4);
+            svuint8_t lo2=svand_n_u8_x(pg,q2,0x0f),hi2=svlsr_n_u8_x(pg,q2,4);
+            svuint8_t lo3=svand_n_u8_x(pg,q3,0x0f),hi3=svlsr_n_u8_x(pg,q3,4);
+            svuint8_t wu0=svuzp1_u8(lo0,hi0),wu1=svuzp1_u8(lo1,hi1);
+            svuint8_t wu2=svuzp1_u8(lo2,hi2),wu3=svuzp1_u8(lo3,hi3);
+            svint8_t ws0=svsub_n_s8_x(pg,svreinterpret_s8_u8(wu0),8);
+            svint8_t ws1=svsub_n_s8_x(pg,svreinterpret_s8_u8(wu1),8);
+            svint8_t ws2=svsub_n_s8_x(pg,svreinterpret_s8_u8(wu2),8);
+            svint8_t ws3=svsub_n_s8_x(pg,svreinterpret_s8_u8(wu3),8);
+            svst1_s8(pg32,drow+(b+0)*32,ws0);svst1_s8(pg32,drow+(b+1)*32,ws1);
+            svst1_s8(pg32,drow+(b+2)*32,ws2);svst1_s8(pg32,drow+(b+3)*32,ws3);
+        }
+    }
+}
+static void vec_dot_q4_0_8row_sdot(q4_int8_t *wbuf, const q4_int8_t *xi8, int *dst,
+                                     const block_q4_0 *r0, const block_q4_0 *r1,
+                                     const block_q4_0 *r2, const block_q4_0 *r3,
+                                     const block_q4_0 *r4, const block_q4_0 *r5,
+                                     const block_q4_0 *r6, const block_q4_0 *r7,
+                                     int nb) {
+    (void)wbuf; (void)xi8; (void)dst; (void)r0; (void)r1; (void)r2; (void)r3;
+    (void)r4; (void)r5; (void)r6; (void)r7; (void)nb;
+#if defined(__ARM_FEATURE_SVE)
+    dequant_8rows_int8_4blk(r0, wbuf, nb*32);
+    svbool_t pg32 = svwhilelt_b8(0, 32);
+    svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+    svint32_t a4=svdup_s32(0),a5=svdup_s32(0),a6=svdup_s32(0),a7=svdup_s32(0);
+    for (int b = 0; b < nb; b++) {
+        svint8_t xv = svld1_s8(pg32, xi8 + b*32);
+        svint8_t w0=svld1_s8(pg32, wbuf+0*nb*32+b*32);
+        svint8_t w1=svld1_s8(pg32, wbuf+1*nb*32+b*32);
+        svint8_t w2=svld1_s8(pg32, wbuf+2*nb*32+b*32);
+        svint8_t w3=svld1_s8(pg32, wbuf+3*nb*32+b*32);
+        svint8_t w4=svld1_s8(pg32, wbuf+4*nb*32+b*32);
+        svint8_t w5=svld1_s8(pg32, wbuf+5*nb*32+b*32);
+        svint8_t w6=svld1_s8(pg32, wbuf+6*nb*32+b*32);
+        svint8_t w7=svld1_s8(pg32, wbuf+7*nb*32+b*32);
+        a0=svdot_s32(a0, w0, xv); a1=svdot_s32(a1, w1, xv);
+        a2=svdot_s32(a2, w2, xv); a3=svdot_s32(a3, w3, xv);
+        a4=svdot_s32(a4, w4, xv); a5=svdot_s32(a5, w5, xv);
+        a6=svdot_s32(a6, w6, xv); a7=svdot_s32(a7, w7, xv);
+    }
+    dst[0] = svaddv_s32(svptrue_b32(), a0);
+    dst[1] = svaddv_s32(svptrue_b32(), a1);
+    dst[2] = svaddv_s32(svptrue_b32(), a2);
+    dst[3] = svaddv_s32(svptrue_b32(), a3);
+    dst[4] = svaddv_s32(svptrue_b32(), a4);
+    dst[5] = svaddv_s32(svptrue_b32(), a5);
+    dst[6] = svaddv_s32(svptrue_b32(), a6);
+    dst[7] = svaddv_s32(svptrue_b32(), a7);
+#endif
+}
+
+/* ================================================================
  * Matvec drivers
  * ================================================================ */
 static void matvec_1row(float *dst, const unsigned char *base,
