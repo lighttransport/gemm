@@ -803,7 +803,7 @@ int main(void){
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
             int orig_gsize=GSize;                       /* group size before any Phase-2 merges */
             int mat[16],matn=0,mi=0; { const char*ms=getenv("GLM5_MERGE_AT");  /* test: forced merge positions */
-                if(ms&&*ms){ char b[256]; snprintf(b,sizeof b,"%s",ms); for(char*t=strtok(b,",");t&&matn<16;t=strtok(NULL,",")) mat[matn++]=atoi(t); } }
+                if(ms&&*ms){ char b[256]; snprintf(b,sizeof b,"%s",ms); for(char*t=strtok(b,":,");t&&matn<16;t=strtok(NULL,":,")) mat[matn++]=atoi(t); } }  /* ':' too: pjsub -x splits on ',' */
             for(int p0=0;p0<prefill;p0+=pchunk){
                 int S=prefill-p0; if(S>pchunk)S=pchunk;
                 /* Phase 2: pairwise group merge at a (forced) merge point while a bigger group exists.
