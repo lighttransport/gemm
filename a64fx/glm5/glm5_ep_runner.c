@@ -188,34 +188,34 @@ static int pick_groups(const glm5_config*cfg,int n,int target_ctx){
  * replicated KV; copy it to the sibling (odd/upper) subgroup pairwise by local index over uTofu.
  * Call AFTER GBase/GSize/GRank are updated to the merged group so gbarrier spans all 2*old_gsize
  * ranks. upto = filled positions (only the [0,upto) prefix is transferred). */
+/* Transfer one cache buffer's filled prefix from the even (survivor) subgroup to the odd sibling,
+ * pairwise, with dc-civac coherence around the uTofu put. All group ranks must call this the same
+ * number of times (kv_cache exists on every layer; idx_k_cache only on indexer layers - structural,
+ * so consistent across ranks). */
+static void glm5_kv_xfer(char*buf,long reg_bytes,long copy_bytes,int stag,int even,int partner){
+    utofu_stadd_t st; int rc=utofu_reg_mem_with_stag(Vcq,buf,reg_bytes,stag,0,&st);
+    if(rc!=UTOFU_SUCCESS) die("kv_xfer reg",rc);
+    for(long off=0;off<copy_bytes;off+=64) __asm__ __volatile__("dc civac, %0"::"r"(buf+off):"memory");
+    __asm__ __volatile__("dsb sy":::"memory");
+    gbarrier();                                        /* both ends registered + flushed */
+    if(even && copy_bytes>0){
+        utofu_stadd_t dst; rc=utofu_query_stadd(PeerVcq[partner],stag,&dst); if(rc!=UTOFU_SUCCESS) die("kv_xfer query",rc);
+        const long CH=4L<<20;
+        for(long off=0;off<copy_bytes;off+=CH){ long n=copy_bytes-off; if(n>CH)n=CH; put_issue(PeerVcq[partner],st+off,dst+off,(size_t)n,1); }
+    }
+    gbarrier();                                        /* put landed in receiver DRAM */
+    if(!even){ for(long off=0;off<copy_bytes;off+=64) __asm__ __volatile__("dc civac, %0"::"r"(buf+off):"memory"); __asm__ __volatile__("dsb sy":::"memory"); }
+    utofu_dereg_mem(Vcq,st,0);
+}
 static void glm5_group_kv_propagate(glm5_model*m,int old_gsize,int new_base,int upto){
-    const glm5_config*c=&m->cfg; int KVD=glm5_kv_cache_dim(c);
-    long reg_bytes=(long)c->max_pos*KVD*2;             /* register the whole cache buffer */
-    long copy_bytes=(long)upto*KVD*2;                  /* transfer only the filled prefix */
+    const glm5_config*c=&m->cfg; int KVD=glm5_kv_cache_dim(c), ID=c->index_dim;
     int li=(MyRank-new_base)%old_gsize;                /* local index within subgroup */
     int even=(MyRank-new_base)<old_gsize;              /* even subgroup survives, sends */
     int partner=even ? (new_base+old_gsize+li) : (new_base+li);
-    const long CH=4L<<20;
     for(int l=0;l<c->n_layers;l++){
-        glm5_layer*L=&m->layers[l]; if(!L->kv_cache) continue;
-        char*kv=(char*)L->kv_cache;
-        utofu_stadd_t st; int rc=utofu_reg_mem_with_stag(Vcq,kv,reg_bytes,KV_STAG,0,&st);
-        if(rc!=UTOFU_SUCCESS) die("kv_propagate reg",rc);
-        /* RDMA cache coherence: flush BEFORE the put so the sender's source is in DRAM and the
-         * receiver has no dirty (stale seq) line that could write back over the incoming put. */
-        for(long off=0;off<copy_bytes;off+=64) __asm__ __volatile__("dc civac, %0"::"r"(kv+off):"memory");
-        __asm__ __volatile__("dsb sy":::"memory");
-        gbarrier();                                    /* both ends registered + flushed */
-        if(even && copy_bytes>0){
-            utofu_stadd_t dst; rc=utofu_query_stadd(PeerVcq[partner],KV_STAG,&dst); if(rc!=UTOFU_SUCCESS) die("kv_propagate query",rc);
-            for(long off=0;off<copy_bytes;off+=CH){ long n=copy_bytes-off; if(n>CH)n=CH; put_issue(PeerVcq[partner],st+off,dst+off,(size_t)n,1); }
-        }
-        gbarrier();                                    /* puts landed in receiver DRAM */
-        if(!even){                                     /* receiver: invalidate so reads pull the put */
-            for(long off=0;off<copy_bytes;off+=64) __asm__ __volatile__("dc civac, %0"::"r"(kv+off):"memory");
-            __asm__ __volatile__("dsb sy":::"memory");
-        }
-        utofu_dereg_mem(Vcq,st,0);
+        glm5_layer*L=&m->layers[l];
+        if(L->kv_cache)     glm5_kv_xfer((char*)L->kv_cache,    (long)c->max_pos*KVD*2,(long)upto*KVD*2,KV_STAG,  even,partner);
+        if(L->idx_k_cache)  glm5_kv_xfer((char*)L->idx_k_cache, (long)c->max_pos*ID*2, (long)upto*ID*2, KV_STAG+1,even,partner);  /* MSA index keys (tiered runs) */
     }
 }
 /* Merge this group with its sibling (pairwise) -> group of size 2*GSize. Local expert drop + KV
@@ -804,6 +804,12 @@ int main(void){
             int orig_gsize=GSize;                       /* group size before any Phase-2 merges */
             int mat[16],matn=0,mi=0; { const char*ms=getenv("GLM5_MERGE_AT");  /* test: forced merge positions */
                 if(ms&&*ms){ char b[256]; snprintf(b,sizeof b,"%s",ms); for(char*t=strtok(b,":,");t&&matn<16;t=strtok(NULL,":,")) mat[matn++]=atoi(t); } }  /* ':' too: pjsub -x splits on ',' */
+            /* Optional real token stream (GLM5_PROMPT_TOKENS = binary uint32 file, e.g. tokenized
+             * repo source). Cycled if shorter than prefill; falls back to the deterministic hash. */
+            uint32_t*ptok=NULL; long ptn=0; { const char*ptf=getenv("GLM5_PROMPT_TOKENS");
+                if(ptf&&*ptf){ FILE*pf=fopen(ptf,"rb"); if(pf){ fseek(pf,0,SEEK_END); ptn=ftell(pf)/4; fseek(pf,0,SEEK_SET);
+                    if(ptn>0){ ptok=(uint32_t*)glm5_amalloc((size_t)ptn*4); if(fread(ptok,4,ptn,pf)!=(size_t)ptn){ glm5_afree(ptok); ptok=NULL; ptn=0; } } fclose(pf);
+                    if(GRank==0) logmsg("prompt tokens: %s (%ld tok, cycled)\n",ptf,ptn); } } }
             for(int p0=0;p0<prefill;p0+=pchunk){
                 int S=prefill-p0; if(S>pchunk)S=pchunk;
                 /* Phase 2: pairwise group merge at a (forced) merge point while a bigger group exists.
@@ -816,7 +822,9 @@ int main(void){
                     mi++;
                 }
                 for(int t=0;t<S;t++){
-                    int tok=(unsigned)((p0+t)+(unsigned)(GBase/orig_gsize)*0x9E3779B1u)*1315423911u % (unsigned)m->cfg.vocab;
+                    long seq=(p0+t)+(long)(GBase/orig_gsize)*0x9E3779B1u;     /* per-group sequence offset */
+                    int tok = ptok ? (int)(ptok[((seq%ptn)+ptn)%ptn] % (unsigned)m->cfg.vocab)
+                                   : (int)((unsigned)seq*1315423911u % (unsigned)m->cfg.vocab);
                     embed_lookup(m,tok,Xc+(size_t)t*C);
                 }
                 /* Tier A->B: re-shard the [0,p0) history BEFORE any chunk that would store a

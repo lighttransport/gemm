@@ -293,6 +293,8 @@ typedef struct {
      * (cp_on=1 int4, CP-sharded) for the long tail. T_cp is derived from the per-rank memory
      * budget (positions whose un-sharded KV fits). T_cp==0 disables tiering (static config). */
     int T_cp;
+    long kv_avail;   /* MemAvailable seen at kv_init; re-used to recompute T_cp after a Phase-2 merge
+                      * (bigger group -> fewer experts/rank -> more Tier-A KV budget -> higher T_cp). */
     /* effective MSA on/off, decided by the tier (auto mode): OFF for a single un-sharded Tier A
      * (dense attention is faster AND exact while the KV fits -- MSA's per-token index overhead
      * dominates its sparse-attention savings at short/mid context), ON for tiered jobs (Tier B
