@@ -182,6 +182,54 @@ static int pick_groups(const glm5_config*cfg,int n,int target_ctx){
     return 1;
 }
 
+/* ===================== Phase 2: dynamic group merge ===================== */
+#define KV_STAG 11
+/* Tier-A KV propagation at a pairwise merge: the surviving (even/lower) subgroup holds the
+ * replicated KV; copy it to the sibling (odd/upper) subgroup pairwise by local index over uTofu.
+ * Call AFTER GBase/GSize/GRank are updated to the merged group so gbarrier spans all 2*old_gsize
+ * ranks. upto = filled positions (only the [0,upto) prefix is transferred). */
+static void glm5_group_kv_propagate(glm5_model*m,int old_gsize,int new_base,int upto){
+    const glm5_config*c=&m->cfg; int KVD=glm5_kv_cache_dim(c);
+    long reg_bytes=(long)c->max_pos*KVD*2;             /* register the whole cache buffer */
+    long copy_bytes=(long)upto*KVD*2;                  /* transfer only the filled prefix */
+    int li=(MyRank-new_base)%old_gsize;                /* local index within subgroup */
+    int even=(MyRank-new_base)<old_gsize;              /* even subgroup survives, sends */
+    int partner=even ? (new_base+old_gsize+li) : (new_base+li);
+    const long CH=4L<<20;
+    for(int l=0;l<c->n_layers;l++){
+        glm5_layer*L=&m->layers[l]; if(!L->kv_cache) continue;
+        char*kv=(char*)L->kv_cache;
+        utofu_stadd_t st; int rc=utofu_reg_mem_with_stag(Vcq,kv,reg_bytes,KV_STAG,0,&st);
+        if(rc!=UTOFU_SUCCESS) die("kv_propagate reg",rc);
+        /* RDMA cache coherence: flush BEFORE the put so the sender's source is in DRAM and the
+         * receiver has no dirty (stale seq) line that could write back over the incoming put. */
+        for(long off=0;off<copy_bytes;off+=64) __asm__ __volatile__("dc civac, %0"::"r"(kv+off):"memory");
+        __asm__ __volatile__("dsb sy":::"memory");
+        gbarrier();                                    /* both ends registered + flushed */
+        if(even && copy_bytes>0){
+            utofu_stadd_t dst; rc=utofu_query_stadd(PeerVcq[partner],KV_STAG,&dst); if(rc!=UTOFU_SUCCESS) die("kv_propagate query",rc);
+            for(long off=0;off<copy_bytes;off+=CH){ long n=copy_bytes-off; if(n>CH)n=CH; put_issue(PeerVcq[partner],st+off,dst+off,(size_t)n,1); }
+        }
+        gbarrier();                                    /* puts landed in receiver DRAM */
+        if(!even){                                     /* receiver: invalidate so reads pull the put */
+            for(long off=0;off<copy_bytes;off+=64) __asm__ __volatile__("dc civac, %0"::"r"(kv+off):"memory");
+            __asm__ __volatile__("dsb sy":::"memory");
+        }
+        utofu_dereg_mem(Vcq,st,0);
+    }
+}
+/* Merge this group with its sibling (pairwise) -> group of size 2*GSize. Local expert drop + KV
+ * propagation to the sibling + rebuild group-scoped collectives. Survivor = even subgroup's sequence. */
+static void glm5_group_merge(glm5_model*m,tp_comm*comm,int ar_floats,int upto){
+    int old_gsize=GSize, new_gsize=GSize*2;
+    int new_GId=GId/2, new_base=new_GId*new_gsize, new_GRank=MyRank-new_base;
+    GId=new_GId; GBase=new_base; GSize=new_gsize; GRank=new_GRank;   /* group identity FIRST */
+    glm5_group_expert_drop(m,new_gsize,new_GRank);                   /* local: sets m->ep_size/ep_rank */
+    glm5_group_kv_propagate(m,old_gsize,new_base,upto);             /* network: even KV -> odd sibling */
+    tp_comm_free(comm);
+    if(tp_comm_init(comm,Vcq,PeerVcq+GBase,GRank,GSize,ar_floats,gbarrier)!=0) die("merge tp_comm_init",-1);
+}
+
 /* ---- EP combine all-reduce callback ---- */
 static double g_ar_secs=0.0; static long g_ar_calls=0, g_ar_frags=0;
 static void ep_ar_callback(float*buf,int count,void*ctx){
@@ -752,10 +800,22 @@ int main(void){
         if(pchunk>0){
             if(glm5_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
+            int orig_gsize=GSize;                       /* group size before any Phase-2 merges */
+            int mat[16],matn=0,mi=0; { const char*ms=getenv("GLM5_MERGE_AT");  /* test: forced merge positions */
+                if(ms&&*ms){ char b[256]; snprintf(b,sizeof b,"%s",ms); for(char*t=strtok(b,",");t&&matn<16;t=strtok(NULL,",")) mat[matn++]=atoi(t); } }
             for(int p0=0;p0<prefill;p0+=pchunk){
                 int S=prefill-p0; if(S>pchunk)S=pchunk;
+                /* Phase 2: pairwise group merge at a (forced) merge point while a bigger group exists.
+                 * Survivor = even/lower subgroup; its KV is propagated to the sibling, concurrency halves. */
+                while(!m->cp_on && GSize<N && mi<matn && p0+S>mat[mi]){
+                    int og=GSize; double tt=now_sec();
+                    glm5_group_merge(m,&comm,cfg.hidden*ar_tokens,p0);
+                    if(GRank==0) logmsg("group_merge: %dx%d -> %dx%d at pos=%d (%.3f s) seq=%d\n",
+                                        N/og,og,N/GSize,GSize,p0,now_sec()-tt,GBase/orig_gsize);
+                    mi++;
+                }
                 for(int t=0;t<S;t++){
-                    int tok=(unsigned)((p0+t)+(unsigned)GId*0x9E3779B1u)*1315423911u % (unsigned)m->cfg.vocab;
+                    int tok=(unsigned)((p0+t)+(unsigned)(GBase/orig_gsize)*0x9E3779B1u)*1315423911u % (unsigned)m->cfg.vocab;
                     embed_lookup(m,tok,Xc+(size_t)t*C);
                 }
                 /* Tier A->B: re-shard the [0,p0) history BEFORE any chunk that would store a

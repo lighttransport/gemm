@@ -50,12 +50,22 @@ done
 echo "topo OK ($(grep -vc '^#' tofu_topo.txt 2>/dev/null || echo 0) ranks)"
 
 echo "--- group toy run ($(date)) ---"
-LLM_THREADS=${GLM5_THREAD_SWEEP:-12} OMP_NUM_THREADS=${GLM5_THREAD_SWEEP:-12} \
-  GLM5_PCHUNK=${GLM5_PCHUNK:-128} GLM5_REAL=0 GLM5_LAYERS=${GLM5_LAYERS:-4} GLM5_EXPERTS=${GLM5_EXPERTS:-16} \
-  mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: group toy run"; exit 5; }
+COMMON="GLM5_PCHUNK=${GLM5_PCHUNK:-128} GLM5_REAL=0 GLM5_LAYERS=${GLM5_LAYERS:-4} GLM5_EXPERTS=${GLM5_EXPERTS:-16}"
 
-echo "=== per-group outputs ==="
-for f in glm5_ep_rank00.txt glm5_ep_g*_rank00.txt; do
-    [ -f "$f" ] && { echo "--- $f ---"; grep -hE "group [0-9]|prefill_synth:|SENTINEL|NODE_MEMINFO" "$f"; }
-done
+# Run A: configured (groups + optional forced merge via GLM5_MERGE_AT). Survivor = group 0 = seq 0.
+echo "--- run A: groups=$GLM5_PREFILL_GROUPS merge_at=${GLM5_MERGE_AT:-none} ($(date)) ---"
+env $COMMON LLM_THREADS=${GLM5_THREAD_SWEEP:-12} OMP_NUM_THREADS=${GLM5_THREAD_SWEEP:-12} GLM5_MERGE_AT="${GLM5_MERGE_AT:-}" \
+  mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: run A"; exit 5; }
+for f in glm5_ep_rank00.txt glm5_ep_g*_rank00.txt; do [ -f "$f" ] && { echo "--- A:$f ---"; grep -hE "group_merge:|prefill_synth:|SENTINEL" "$f"; }; done
+A_ARG=$(grep -hoE "argmax=[0-9]+" glm5_ep_rank00.txt 2>/dev/null | tail -1)
+mv glm5_ep_rank00.txt A_rank00.txt 2>/dev/null
+
+# Run B: reference, single group (G=1), same seq 0, no merge -> ground truth for the survivor.
+echo "--- run B: reference G=1 (seq 0, no merge) ($(date)) ---"
+env $COMMON LLM_THREADS=${GLM5_THREAD_SWEEP:-12} OMP_NUM_THREADS=${GLM5_THREAD_SWEEP:-12} GLM5_PREFILL_GROUPS=1 GLM5_MERGE_AT="" \
+  mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: run B"; exit 5; }
+echo "--- B:rank00 ---"; grep -hE "prefill_synth:|SENTINEL" glm5_ep_rank00.txt
+B_ARG=$(grep -hoE "argmax=[0-9]+" glm5_ep_rank00.txt 2>/dev/null | tail -1)
+
+echo "=== MERGE CHECK: survivor A $A_ARG vs reference B $B_ARG -> $([ -n "$A_ARG" ] && [ "$A_ARG" = "$B_ARG" ] && echo MATCH || echo MISMATCH) ==="
 echo "=== group toy done $(date) ==="

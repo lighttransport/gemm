@@ -704,6 +704,33 @@ static void glm5_prefill_to_cp(glm5_model*m,int upto){
     m->int4_kv=1; m->cp_on=1; m->cp_nslot=nslotB;
 }
 
+/* Group merge (Phase 2), local expert step: shrink this rank's expert ownership from ep_size to
+ * new_eps (= 2*ep_size for a pairwise merge of adjacent groups), with this rank's new group-local
+ * index new_ep_rank. Each routed expert was independently staged in BOTH sibling subgroups, so the
+ * new owner e%new_eps already holds it -- drop the redundant experts locally (NO network transfer)
+ * and recompact ex_w[] and owned_eid. Slot order stays ascending-by-eid, matching the e/ep_size
+ * arithmetic the forward uses. Caller re-shards KV + rebuilds collectives for the merged group. */
+static void glm5_group_expert_drop(glm5_model*m,int new_eps,int new_ep_rank){
+    glm5_config*c=&m->cfg;
+    for(int l=0;l<c->n_layers;l++){
+        if(!glm5_is_moe(c,l)) continue;
+        glm5_layer*L=&m->layers[l]; int keep=0;
+        for(int s=0;s<L->n_owned;s++){
+            int e=L->owned_eid[s];
+            if(e%new_eps==new_ep_rank){
+                if(keep!=s){ L->ex_w1[keep]=L->ex_w1[s]; L->ex_w3[keep]=L->ex_w3[s]; L->ex_w2[keep]=L->ex_w2[s]; L->owned_eid[keep]=e; }
+                keep++;
+            } else {
+                glm5_afree(L->ex_w1[s].w); glm5_afree(L->ex_w1[s].scale);
+                glm5_afree(L->ex_w3[s].w); glm5_afree(L->ex_w3[s].scale);
+                glm5_afree(L->ex_w2[s].w); glm5_afree(L->ex_w2[s].scale);
+            }
+        }
+        L->n_owned=keep;
+    }
+    m->ep_size=new_eps; m->ep_rank=new_ep_rank;
+}
+
 static void glm5_alloc_scratch(glm5_model*m,int hrows){
     const glm5_config*cfg=&m->cfg;
     const int H=cfg->hidden, QD=glm5_q_dim(cfg), AD=glm5_attn_dim(cfg);
