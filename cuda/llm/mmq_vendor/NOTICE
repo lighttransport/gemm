@@ -1,0 +1,57 @@
+Vendored MMQ/MMVQ device kernels from llama.cpp
+===============================================
+
+Source: https://github.com/ggml-org/llama.cpp
+Pinned upstream commit: 5fd2dc2c41c342a75c26f9756ca6b1814ed05fb4
+License: MIT (see below)
+
+Vendored file(s):
+  mmq.cuh   - copied verbatim from ggml/src/ggml-cuda/mmq.cuh with ONE surgical
+              edit (marked "VENDOR EDIT (gemm/main)"): the two device kernels
+              `mul_mat_q` and `mul_mat_q_stream_k_fixup` were changed from
+              `static __global__` to `static __device__` so that stable-named
+              extern "C" trampolines in ../mmq_kernels.cu can call them (a
+              __global__ cannot be launched from another __global__). The
+              `__launch_bounds__` qualifiers (illegal on a __device__ function)
+              were moved to the trampolines.
+
+  mmvq.cuh  - device-only extract of ggml/src/ggml-cuda/mmvq.cu (the decode
+              matvec), marked "VENDOR EDIT (gemm/main)": kept the helpers
+              (mmvq_parameter_table_id, get_vec_dot_q_cuda, get_vdr_mmvq,
+              get_device_table_id, calc_nwarps/calc_rows_per_block) and the
+              `mul_mat_vec_q` template, changed `static __global__` ->
+              `static __device__` with __launch_bounds__ moved to the
+              ../mmvq_kernels.cu trampolines; dropped the MoE kernel + host
+              launch code. ADDED by-value reimplementations of
+              vec_dot_iq3_s/iq2_s (`mmvq_vd_*_byval`) routed via mmvq_vecdot<>:
+              nvcc 13.2/sm_120a miscompiles the upstream const-int&-param
+              versions when inlined into mul_mat_vec_q (the others are unchanged).
+
+The remaining headers (common.cuh, mma.cuh, vecdotq.cuh, ggml-common.h,
+ggml.h, ...) are NOT copied; mmq_kernels.cu / mmvq_kernels.cu include them
+directly from the upstream tree via -I. The activation quantizers
+(`quantize_mmq_q8_1` for MMQ, regular `block_q8_1` for MMVQ) are copied
+verbatim into the respective *_kernels.cu (also MIT, same commit).
+
+----------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2023-2025 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

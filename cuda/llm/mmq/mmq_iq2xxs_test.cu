@@ -257,7 +257,9 @@ __global__ void mmq_iq2xxs_mma(float *dst, const uint8_t *W, const int8_t *xq8,
  * activation reuse + 128 thr/block lifts occupancy vs the 1-warp/tile v1).
  * grid = (N/(16*WN), ceil(M/8)). Requires N % (16*WN) == 0.
  */
+#ifndef WN
 #define WN 4   /* warps per block -> 64 weight-rows/block */
+#endif
 
 __global__ void mmq_iq2xxs_mma_v2(float *dst, const uint8_t *W, const int8_t *xq8,
                                    const float *xs, int M, int N, int K) {
@@ -328,10 +330,20 @@ __global__ void mmq_iq2xxs_mma_v2(float *dst, const uint8_t *W, const int8_t *xq
  * sub-block ONCE, then reuses across up to TG=4 token-groups (32 tokens) staged
  * together. grid = (N/(16*WN), ceil(M/(8*TG))). 2 syncs per sub-block.
  */
+#ifndef TG
 #define TG 4   /* token-groups per block (8*TG = 32 tokens) */
+#endif
 
+#ifndef LB
+#define LB 0
+#endif
+#if LB > 0
+__global__ void __launch_bounds__(32*WN, LB) mmq_iq2xxs_mma_v3(float *dst, const uint8_t *W, const int8_t *xq8,
+                                   const float *xs, int M, int N, int K) {
+#else
 __global__ void mmq_iq2xxs_mma_v3(float *dst, const uint8_t *W, const int8_t *xq8,
                                    const float *xs, int M, int N, int K) {
+#endif
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int gid = lane >> 2, tid = lane & 3;
     int n0 = blockIdx.x * (16 * WN) + warp * 16;
@@ -370,6 +382,88 @@ __global__ void mmq_iq2xxs_mma_v3(float *dst, const uint8_t *W, const int8_t *xq
         }
         __syncthreads();
         int wr = warp*16;
+        int a0 = pack4(&sW[wr+gid][tid*4]),   a1 = pack4(&sW[wr+gid+8][tid*4]);
+        int a2 = pack4(&sW[wr+gid][tid*4+16]), a3 = pack4(&sW[wr+gid+8][tid*4+16]);
+        float wr0 = sWs[wr+gid], wr8 = sWs[wr+gid+8];
+        for (int g = 0; g < ntg; g++) {
+            int b0 = pack4(&sX[g*8+gid][tid*4]), b1 = pack4(&sX[g*8+gid][tid*4+16]);
+            int c0=0,c1=0,c2=0,c3=0;
+            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                :"=r"(c0),"=r"(c1),"=r"(c2),"=r"(c3)
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(0),"r"(0),"r"(0),"r"(0));
+            float xc0 = sXs[g*8+tid*2], xc1 = sXs[g*8+tid*2+1];
+            f[g][0]+=wr0*xc0*(float)c0; f[g][1]+=wr0*xc1*(float)c1;
+            f[g][2]+=wr8*xc0*(float)c2; f[g][3]+=wr8*xc1*(float)c3;
+        }
+        __syncthreads();
+    }
+    int n_a = n0+gid, n_b = n0+gid+8;
+    for (int g = 0; g < ntg; g++) {
+        int m_a = m_base + g*8 + tid*2, m_b = m_a + 1;
+        if (m_a < M) { dst[(size_t)m_a*N+n_a]=f[g][0]; dst[(size_t)m_a*N+n_b]=f[g][2]; }
+        if (m_b < M) { dst[(size_t)m_b*N+n_a]=f[g][1]; dst[(size_t)m_b*N+n_b]=f[g][3]; }
+    }
+}
+
+/* mma_v4: like v3 (decode-amortized, full 32-lane decode) but SOFTWARE-PIPELINED:
+ * decode sub-block sb+1's weights/acts into a 2nd shared buffer WHILE the mma for
+ * sb runs from the 1st buffer. Overlaps decode-ALU with tensor cores and collapses
+ * to ONE __syncthreads per sub-block (v3 has two). grid/launch identical to v3. */
+#define V4_DECODE(SBV, KB, XB, WSB, XSB)                                              \
+    do {                                                                              \
+        int rl_=lane>>1, half_=lane&1, r_=warp*16+rl_, n_=n0+rl_;                      \
+        const uint8_t *bp_ = W + (size_t)n_*row_bytes + ((SBV)/8)*IQ2XXS_BYTES;        \
+        float d_ = half_to_float_dev(*(const uint16_t*)bp_);                           \
+        const uint16_t *qs_ = (const uint16_t*)(bp_+2); int ib_=(SBV)&7;               \
+        uint32_t a0_=(uint32_t)qs_[4*ib_]|((uint32_t)qs_[4*ib_+1]<<16);                \
+        uint32_t a1_=(uint32_t)qs_[4*ib_+2]|((uint32_t)qs_[4*ib_+3]<<16);              \
+        if(half_==0) (WSB)[r_]=d_*(0.5f+(float)(a1_>>28))*0.25f;                       \
+        for(int l_=half_*2;l_<half_*2+2;l_++){ uint8_t idx_=(a0_>>(8*l_))&255;         \
+            const uint8_t*g_=(const uint8_t*)&c_grid[idx_];                            \
+            uint8_t s_=c_ksigns[(a1_>>(7*l_))&127];                                    \
+            for(int j_=0;j_<8;j_++) (KB)[r_][l_*8+j_]=(int8_t)((int)g_[j_]*((s_&(1<<j_))?-1:1)); } \
+        for(int i_=threadIdx.x;i_<ntg*8*CK;i_+=blockDim.x){ int t_=i_/CK,kk_=i_%CK,m_=m_base+t_; \
+            (XB)[t_][kk_]=(m_<M)?xq8[(size_t)m_*K+(SBV)*CK+kk_]:0; }                    \
+        for(int i_=threadIdx.x;i_<ntg*8;i_+=blockDim.x){ int m_=m_base+i_;             \
+            (XSB)[i_]=(m_<M)?xs[(size_t)m_*nsb+(SBV)]:0.0f; }                           \
+    } while(0)
+
+__global__ void mmq_iq2xxs_mma_v4(float *dst, const uint8_t *W, const int8_t *xq8,
+                                   const float *xs, int M, int N, int K) {
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int gid = lane >> 2, tid = lane & 3;
+    int n0 = blockIdx.x * (16 * WN) + warp * 16;
+    int m_base = blockIdx.y * (8 * TG);
+    int ntg = (M - m_base + 7) / 8; if (ntg > TG) ntg = TG; if (ntg < 0) ntg = 0;
+    int nb = K / QK_K, row_bytes = nb * IQ2XXS_BYTES, nsb = K / CK;
+
+    __shared__ int8_t sXA[8 * TG][CK]; __shared__ float sXsXA[8 * TG];
+    __shared__ int8_t sXB[8 * TG][CK]; __shared__ float sXsXB[8 * TG];
+    __shared__ int8_t sWA[16 * WN][CK]; __shared__ float sWsA[16 * WN];
+    __shared__ int8_t sWB[16 * WN][CK]; __shared__ float sWsB[16 * WN];
+    int8_t (*sWbuf[2])[CK] = { sWA, sWB };
+    int8_t (*sXbuf[2])[CK] = { sXA, sXB };
+    float  *sWsbuf[2] = { sWsA, sWsB };
+    float  *sXsbuf[2] = { sXsXA, sXsXB };
+
+    float f[TG][4];
+    for (int g = 0; g < TG; g++) { f[g][0]=f[g][1]=f[g][2]=f[g][3]=0; }
+
+    if (nsb > 0) { V4_DECODE(0, sWA, sXA, sWsA, sXsXA); }
+    __syncthreads();
+
+    for (int sb = 0; sb < nsb; sb++) {
+        int cur = sb & 1, nxt = cur ^ 1;
+        /* (A) prefetch+decode sb+1 into the OTHER buffer (overlaps with the mma below) */
+        if (sb + 1 < nsb) {
+            int snx = sb + 1;
+            if (nxt == 1) { V4_DECODE(snx, sWB, sXB, sWsB, sXsXB); }
+            else          { V4_DECODE(snx, sWA, sXA, sWsA, sXsXA); }
+        }
+        /* (B) mma for sb from the current buffer */
+        int wr = warp*16;
+        int8_t (*sW)[CK] = sWbuf[cur]; int8_t (*sX)[CK] = sXbuf[cur];
+        float *sWs = sWsbuf[cur], *sXs = sXsbuf[cur];
         int a0 = pack4(&sW[wr+gid][tid*4]),   a1 = pack4(&sW[wr+gid+8][tid*4]);
         int a2 = pack4(&sW[wr+gid][tid*4+16]), a3 = pack4(&sW[wr+gid+8][tid*4+16]);
         float wr0 = sWs[wr+gid], wr8 = sWs[wr+gid+8];
@@ -508,7 +602,22 @@ int main(int argc, char **argv) {
         free(o4);
     } else printf("P2.6 skipped\n");
 
-    int ok = (e < 0.05) && (e2 < 0.05) && (e2v1 < 1e-4) && (e3 < 0.05) && (e3v2 < 1e-4) && (e4 < 0.05) && (e4v < 1e-4);
+    /* ---- Phase 2.7: double-buffered decode (pipeline) ---- */
+    double e5 = 1e9, e5v = 1e9;
+    if (N % (16 * WN) == 0) {
+        CUDA_CHECK(cudaMemset(dDst, 0, (size_t)M * N * sizeof(float)));
+        dim3 v4g(N / (16 * WN), (M + 8*TG - 1) / (8*TG));
+        mmq_iq2xxs_mma_v4<<<v4g, 32 * WN>>>(dDst, dW, dXq, dXs, M, N, K);
+        CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        float *o5 = (float *)malloc((size_t)M * N * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(o5, dDst, (size_t)M * N * sizeof(float), cudaMemcpyDeviceToHost));
+        e5 = rel_l2(o5, ref, M*N); e5v = rel_l2(o5, out2, M*N);
+        printf("P2.7 mma_v4 vs CPU-F32 oracle: rel_L2 = %.6f\n", e5);
+        printf("P2.7 mma_v4 vs P2 mma         : rel_L2 = %.6f  (expect ~0)\n", e5v);
+        free(o5);
+    } else printf("P2.7 skipped\n");
+
+    int ok = (e < 0.05) && (e2 < 0.05) && (e2v1 < 1e-4) && (e3 < 0.05) && (e3v2 < 1e-4) && (e4 < 0.05) && (e4v < 1e-4) && (e5 < 0.05) && (e5v < 1e-4);
     printf("%s\n", ok ? "PASS (P1..P2.6 data path correct)" : "FAIL");
 
     /* ---- rough throughput: dp4a vs mma (one GEMM, single-warp-per-tile) ---- */
@@ -548,6 +657,16 @@ int main(int argc, char **argv) {
             cudaEventElapsedTime(&ms_v3, t0, t1); ms_v3 /= iters;
             printf("  mma_v3 : %.3f ms  %.1f GFLOP/s  (%.2fx vs dp4a, %.2fx vs mma)\n",
                    ms_v3, flop / (ms_v3 * 1e6), ms_dp / ms_v3, ms_mma / ms_v3);
+        }
+        float ms_v4 = 0;
+        if (N % (16 * WN) == 0) {
+            dim3 v4g(N / (16 * WN), (M + 8*TG - 1) / (8*TG));
+            cudaEventRecord(t0);
+            for (int i = 0; i < iters; i++) mmq_iq2xxs_mma_v4<<<v4g, 32 * WN>>>(dDst, dW, dXq, dXs, M, N, K);
+            cudaEventRecord(t1); cudaEventSynchronize(t1);
+            cudaEventElapsedTime(&ms_v4, t0, t1); ms_v4 /= iters;
+            printf("  mma_v4 : %.3f ms  %.1f GFLOP/s  (%.2fx vs dp4a, %.2fx vs v3)\n",
+                   ms_v4, flop / (ms_v4 * 1e6), ms_dp / ms_v4, (ms_v3>0?ms_v3/ms_v4:0));
         }
     }
     return ok ? 0 : 1;

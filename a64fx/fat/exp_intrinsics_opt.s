@@ -18,7 +18,7 @@
 	.type	exp_f32_poly5_intrin_opt,@function
 exp_f32_poly5_intrin_opt:               // @exp_f32_poly5_intrin_opt
 .Lfunc_begin0:
-	.file	1 "/home/u14346/work/gemm/fat" "exp_intrinsics_opt.c"
+	.file	1 "." "exp_intrinsics_opt.c"
 	.loc	1 17 0                  // exp_intrinsics_opt.c:17:0
 	.cfi_startproc
 // %bb.0:
@@ -559,7 +559,7 @@ exp_f64_poly5_intrin_opt:               // @exp_f64_poly5_intrin_opt
 .Linfo_string1:
 	.asciz	"exp_intrinsics_opt.c"  // string offset=82
 .Linfo_string2:
-	.asciz	"/home/u14346/work/gemm/fat" // string offset=103
+	.asciz	"." // string offset=103
 .Linfo_string3:
 	.asciz	"exp_f32_poly5_intrin_opt" // string offset=130
 .Linfo_string4:

@@ -532,8 +532,9 @@ extern "C" __global__ void moe_prefill_q4k(
 /*
  * dequant_q4_K_to_f16: Convert Q4_K quantized weights to FP16.
  * grid = (rows * blocks_per_row + 127) / 128, block = 128.
- * Each thread processes 2 consecutive 256-element Q4_K blocks,
- * producing 2 × 256 = 512 FP16 values.
+ * Each thread processes 1 super-block (256 elements) and uses F16x2
+ * vectorized stores to write 2 F16 outputs per 32-bit store, cutting
+ * store count and instructions roughly in half vs per-F16 stores.
  */
 extern "C" __global__ void dequant_q4_K_to_f16(
     half *out,                 // [rows * cols] FP16 output
@@ -549,7 +550,7 @@ extern "C" __global__ void dequant_q4_K_to_f16(
     int bk = bid % nb;
 
     const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 144;
-    half *out_blk = out + (size_t)row * cols + (size_t)bk * 256;
+    half2 *out_blk2 = (half2 *)(out + (size_t)row * cols + (size_t)bk * 256);
 
     float d = __half2float(*(const __half *)bp);
     float dmin = __half2float(*(const __half *)(bp + 2));
@@ -570,10 +571,20 @@ extern "C" __global__ void dequant_q4_K_to_f16(
         }
         float d1 = d * sv0f, m1 = dmin * mv0f;
         float d2 = d * sv1f, m2 = dmin * mv1f;
+        __half2 d1_2 = __float2half2_rn(d1);
+        __half2 d2_2 = __float2half2_rn(d2);
+        __half2 m1_2 = __float2half2_rn(m1);
+        __half2 m2_2 = __float2half2_rn(m2);
         const unsigned char *q = qs + j * 32;
-        for (int l = 0; l < 32; l++) {
-            out_blk[j*64 + l]       = __float2half(d1 * (q[l] & 0xF) - m1);
-            out_blk[j*64 + 32 + l]  = __float2half(d2 * (q[l] >> 4) - m2);
+        #pragma unroll
+        for (int l = 0; l < 32; l += 2) {
+            unsigned char q0 = q[l], q1 = q[l+1];
+            __half2 v0 = __floats2half2_rn((float)(q0 & 0xF), (float)(q1 & 0xF));
+            __half2 v1 = __floats2half2_rn((float)(q0 >> 4),  (float)(q1 >> 4));
+            v0 = __hsub2(__hmul2(d1_2, v0), m1_2);
+            v1 = __hsub2(__hmul2(d2_2, v1), m2_2);
+            out_blk2[j*32 + (l >> 1)]     = v0;
+            out_blk2[j*32 + 16 + (l >> 1)] = v1;
         }
     }
 }
@@ -866,5 +877,111 @@ extern "C" __global__ void dequant_q6_K_to_f16(
     else if (grp == 2) { qval = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)); scv = sc[is+4]; }
     else               { qval = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)); scv = sc[is+6]; }
     o[e] = __float2half(d * scv * (qval - 32));
+    }
+}
+
+/* ============================================================================
+ * F32 dequant variants for the opt-in exact prefill path (CUDA_LLM_PREFILL_F32).
+ * Element order is byte-for-byte identical to the matching *_to_f16 kernel above
+ * (so cuBLAS F32-pedantic GEMM produces the same math as the F16 path minus the
+ * F16 input rounding). Q8_0 reuses dequant_q8_0_to_f16, which already outputs F32.
+ * ========================================================================== */
+
+/* dequant_q4_K_to_f32: mirrors dequant_q4_K_to_f16 (scalar F32 stores). */
+extern "C" __global__ void dequant_q4_K_to_f32(
+    float *out, const unsigned char *mat, int rows, int cols)
+{
+    int nb = cols / 256, rb = nb * 144;
+    int bid = blockIdx.x * 128 + threadIdx.x;
+    int total_blocks = rows * nb;
+    if (bid >= total_blocks) return;
+    int row = bid / nb, bk = bid % nb;
+    const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 144;
+    float *o = out + (size_t)row * cols + (size_t)bk * 256;
+    float d = __half2float(*(const __half *)bp);
+    float dmin = __half2float(*(const __half *)(bp + 2));
+    const unsigned char *sc = bp + 4;
+    const unsigned char *qs = bp + 16;
+    for (int j = 0; j < 4; j++) {
+        int is = j * 2;
+        float sv0f, mv0f, sv1f, mv1f;
+        if (is < 4) {
+            sv0f = (float)(sc[is] & 63);   mv0f = (float)(sc[is+4] & 63);
+            sv1f = (float)(sc[is+1] & 63); mv1f = (float)(sc[is+1+4] & 63);
+        } else {
+            sv0f = (float)((sc[is+4] & 0xF) | ((sc[is-4] >> 6) << 4));
+            mv0f = (float)((sc[is+4] >> 4) | ((sc[is] >> 6) << 4));
+            sv1f = (float)((sc[is+1+4] & 0xF) | ((sc[is+1-4] >> 6) << 4));
+            mv1f = (float)((sc[is+1+4] >> 4) | ((sc[is+1] >> 6) << 4));
+        }
+        float d1 = d * sv0f, m1 = dmin * mv0f;
+        float d2 = d * sv1f, m2 = dmin * mv1f;
+        const unsigned char *q = qs + j * 32;
+        #pragma unroll
+        for (int l = 0; l < 32; l++) {
+            o[j*64 + l]      = d1 * (float)(q[l] & 0xF) - m1;
+            o[j*64 + 32 + l] = d2 * (float)(q[l] >> 4)  - m2;
+        }
+    }
+}
+
+/* dequant_q4_0_to_f32: mirrors dequant_q4_0_to_f16 (one thread per output elem). */
+extern "C" __global__ void dequant_q4_0_to_f32(
+    float *out, const unsigned char *mat, int rows, int cols)
+{
+    unsigned e = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned total = (unsigned)rows * (unsigned)cols;
+    if (e >= total) return;
+    unsigned ucols = (unsigned)cols;
+    unsigned nb = ucols >> 5;
+    unsigned row = e / ucols;
+    unsigned col = e - row * ucols;
+    unsigned bk = col >> 5;
+    unsigned local = col & 31;
+    const unsigned char *bp = mat + ((size_t)row * nb + bk) * 18;
+    float d = __half2float(*(const __half *)bp);
+    unsigned char q = bp[2 + (local & 15)];
+    int nib = (local < 16) ? (int)(q & 0x0F) : (int)(q >> 4);
+    out[e] = (float)(nib - 8) * d;
+}
+
+/* dequant_q6_K_to_f32: mirrors dequant_q6_K_to_f16 (same shared-mem staging). */
+extern "C" __global__ void dequant_q6_K_to_f32(
+    float *out, const unsigned char *mat, int rows, int cols)
+{
+    int nb = cols / 256, rb = nb * 210;
+    int total_sb = rows * nb;
+    int sb_base = blockIdx.x * DQ6_SB_PER_BLOCK;
+    int tpb = blockDim.x / DQ6_SB_PER_BLOCK;
+    int local = threadIdx.x / tpb;
+    int lane = threadIdx.x % tpb;
+    int sb = sb_base + local;
+    __shared__ unsigned char ss[DQ6_SB_PER_BLOCK][210];
+    if (sb < total_sb) {
+        int row = sb / nb, bk = sb % nb;
+        const unsigned char *bp = mat + (size_t)row * rb + (size_t)bk * 210;
+        for (int i = lane; i < 210; i += tpb) ss[local][i] = bp[i];
+    }
+    __syncthreads();
+    if (sb >= total_sb) return;
+    int row = sb / nb, bk = sb % nb;
+    float *o = out + (size_t)row * cols + (size_t)bk * 256;
+    const unsigned char *s = ss[local];
+    float d = __half2float(*(const __half *)(s + 208));
+    for (int e = lane; e < 256; e += tpb) {
+        int half_i = e >> 7;
+        int r = e & 127;
+        int grp = r >> 5;
+        int l = r & 31;
+        const unsigned char *ql = s + half_i * 64;
+        const unsigned char *qh = s + 128 + half_i * 32;
+        const signed char *sc = (const signed char *)(s + 192) + half_i * 8;
+        int is = l >> 4;
+        int qval, scv;
+        if (grp == 0)      { qval = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)); scv = sc[is+0]; }
+        else if (grp == 1) { qval = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)); scv = sc[is+2]; }
+        else if (grp == 2) { qval = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)); scv = sc[is+4]; }
+        else               { qval = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)); scv = sc[is+6]; }
+        o[e] = d * scv * (qval - 32);
     }
 }

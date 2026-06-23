@@ -63,6 +63,10 @@ $(VLM): test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC
 $(GEMMA4_VLM): test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
 
+# Profile build: enables per-step timing inside g4v_encode_gemma4uv.
+$(GEMMA4_VLM)_profile: test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -DGEMMA4_PROFILE_MS -o $@ test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
+
 # dump_clip_embd requires llama.cpp build (link against libmtmd.so)
 # Usage: make dump_clip_embd LLAMA_DIR=/path/to/llama.cpp
 LLAMA_DIR ?= /home/syoyo/work/llama.cpp

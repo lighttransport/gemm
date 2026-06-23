@@ -37,6 +37,15 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
                                             const char *model_path,
                                             int max_seq_len);
 
+/* Load a Gemma-4 (E2B / Gemma3n) "qat-mobile-transformers" checkpoint DIRECTLY
+ * from safetensors (gemma wNa8o8 QAT: 2/4-bit U8 packed + 8-bit I8, per-output
+ * channel scales).  Dequants every linear to F16 and sets up the gemma4 PLE /
+ * KV-share / sliding-window path.  model_path is the model directory (with
+ * config.json) or a single .safetensors file. */
+int cuda_llm_load_weights_gemma4_safetensors(cuda_llm_runner *r,
+                                             const char *model_path,
+                                             int max_seq_len);
+
 /* Run one token through the transformer. Returns pointer to F32 hidden state [n_embd].
  * The returned pointer is valid until the next call (host-side buffer). */
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position);
@@ -105,6 +114,8 @@ int cuda_llm_n_layers(const cuda_llm_runner *r);
 int cuda_llm_n_vocab(const cuda_llm_runner *r);
 int cuda_llm_max_seq_len(const cuda_llm_runner *r);
 int cuda_llm_uses_dp4a(const cuda_llm_runner *r);
+/* Toggle the INT8 dp4a matvec path at runtime; returns the previous setting. */
+int cuda_llm_set_dp4a(cuda_llm_runner *r, int enable);
 
 /* GPU Vision Encoder: run Gemma4 ViT on GPU using runner's CUDA context.
  * mmproj_gguf: opened mmproj GGUF (must stay open during encode).
@@ -116,6 +127,13 @@ int cuda_llm_uses_dp4a(const cuda_llm_runner *r);
 float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
                                const uint8_t *image, int image_w, int image_h,
                                int *out_tokens, int *out_dim);
+
+/* Same, but for a gemma-4 qat-mobile DIRECT safetensors model (vision_tower,
+ * gemma-QAT 8-bit). model_path = model dir (config.json + model.safetensors).
+ * Config from vision_config; proj_dim defaults to the LLM n_embd. */
+float *cuda_llm_vision_encode_safetensors(cuda_llm_runner *r, const char *model_path,
+                                          const uint8_t *image, int image_w, int image_h,
+                                          int *out_tokens, int *out_dim);
 
 #ifdef __cplusplus
 }

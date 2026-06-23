@@ -269,6 +269,34 @@ rdna4/vlm/test_*
 !rdna4/vlm/test_*.c
 vulkan/hy3d/test_vulkan_hy3d
 
+# Compiled test/bench executables (regenerate via make) — purged from tracking.
+# cuda/llm/mmq dev/verify harness binaries (regenerate via cuda/llm/mmq/Makefile):
+# any *_test binary + the dbg_iq3s reproducer; keep the *.cu sources.
+cuda/llm/mmq/*_test
+!cuda/llm/mmq/*_test.cu
+cuda/llm/mmq/dbg_iq3s
+cuda/llm/mmq/dbg_iq3s_-O*
+cuda/llm/mmq/mmq_iq2_s_test
+cuda/llm/mmq/mmq_iq3_s_test
+cuda/llm/mmq/mmq_iq3xxs_test
+cuda/llm/mmq/mmq_q2_K_test
+rdna4/da3/compare_cpu_gpu
+rdna4/dequant/bench_dequant
+rdna4/fp8/bench_fp8_extracted
+rdna4/llm/cmp_enc
+rdna4/qimg/tools/bench_qimg_fp8_kernel
+rdna4/qimg/verify_qimg_dit
+rdna4/sam3d_body/bench_mhr_stages
+rdna4/turboquant/bench_turboquant
+rdna4/vlm/bench_vlm_gemm
+rdna4/vlm/bench_vlm_gemm_blaslt
+rdna4/vlm/bench_vlm_hipblaslt
+rdna4/vlm/bench_vlm_rocblas
+rdna4/vlm/dump_clip_embd
+ryzen/bench_flash_attn
+ryzen/bench_gemm
+ryzen/bench_nn_ops
+
 # Artifact / binary file types purged from history — never re-commit these.
 # (compiled GPU kernels, images, binary data dumps, profiler output)
 *.cubin
@@ -285,3 +313,12 @@ vulkan/hy3d/test_vulkan_hy3d
 *.bin
 *.bak
 *.sqlite
+
+# --- repo hygiene (added during cleanup) ---
+# Keep genuine sample/web assets despite the broad image ignores above
+!web/public/**
+!common/fujisan.jpg
+!cpu/sam3d_body/samples/dancing.jpg
+# Never track Claude session state or stray captured stderr logs
+.claude/
+*_stderr.txt

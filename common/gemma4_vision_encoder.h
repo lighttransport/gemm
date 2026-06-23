@@ -50,19 +50,26 @@ typedef struct {
     int spatial_merge; /* 2 */
     int n_merged;     /* 49 */
     float ln_eps;
+    int is_gemma4uv;  /* Gemma4 "unified vision" projector: no transformer blocks, 48x48 patches, custom 3-norm + linear projection */
 
     /* Patch embedding (conv2d) */
-    qtensor patch_embd_w;  /* [16, 16, 3, dim] */
+    qtensor patch_embd_w;  /* ViT: [16, 16, 3, dim]; Gemma4UV: [patch_size*patch_size*3, dim] (matmul) */
+    qtensor patch_embd_b;  /* Gemma4UV: [dim] bias added after patch matmul (optional for ViT) */
+
+    /* Gemma4UV: three LayerNorms + linear projection */
+    qtensor patch_norm_1_w, patch_norm_1_b;  /* LayerNorm over 6912-dim (Gemma4UV) */
+    qtensor patch_norm_2_w, patch_norm_2_b;  /* LayerNorm over dim (after matmul, Gemma4UV) */
+    qtensor patch_norm_3_w, patch_norm_3_b;  /* LayerNorm over dim (after pos_emb, Gemma4UV) */
 
     /* Position embedding: 2D lookup tables */
     qtensor position_embd; /* [dim, n_pos, 2] — two tables for X/Y */
     int n_pos;             /* number of positions per axis */
 
-    /* Transformer blocks */
+    /* Transformer blocks (empty for Gemma4UV) */
     g4v_block *blocks;
 
     /* MM projection */
-    qtensor mm_proj_w;   /* [dim, proj_dim] */
+    qtensor mm_proj_w;   /* ViT: [dim, proj_dim]; Gemma4UV: [proj_dim, dim] */
 } g4v_model;
 
 g4v_model *g4v_load(gguf_context *mmproj_gguf);
@@ -182,21 +189,119 @@ static int g4v_n_threads(void) {
 }
 
 typedef struct {
-    const float *mat_f32;
+    const float *mat_f32;       /* used when mat_type == GGML_TYPE_F32 */
+    const void *mat_quant;      /* used when mat_type == F16/BF16 (raw bytes) */
+    int mat_type;               /* GGML_TYPE_F32 / F16 / BF16 */
+    int elem_size;              /* bytes per element (4/2/2) */
     const float *inp;
     float *out;
     int n_cols, n_rows, N;
     int row_start, row_end;
 } g4v_matmul_task;
 
+#ifdef __AVX2__
+/* Fused F16 dequant + dot: load 8 F16 elements, convert to F32, FMA with input. */
+static inline float g4v_dot_f16(const uint16_t *w, const float *x, int n) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i)));
+        __m256 w1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i + 8)));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i),     sum0);
+        sum1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x + i + 8), sum1);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    for (; i + 7 < n; i += 8) {
+        __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i)));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i), sum0);
+    }
+    __m128 lo = _mm256_castps256_ps128(sum0);
+    __m128 hi = _mm256_extractf128_ps(sum0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float result = _mm_cvtss_f32(lo);
+    for (; i < n; i++) result += ggml_fp16_to_fp32(w[i]) * x[i];
+    return result;
+}
+
+/* Fused BF16 dequant + dot: BF16 is just F32 with low 16 bits zero. */
+static inline float g4v_dot_bf16(const uint16_t *w, const float *x, int n) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m256i wi0 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + i)));
+        __m256i wi1 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + i + 8)));
+        __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(wi0, 16));
+        __m256 w1 = _mm256_castsi256_ps(_mm256_slli_epi32(wi1, 16));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i),     sum0);
+        sum1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x + i + 8), sum1);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    for (; i + 7 < n; i += 8) {
+        __m256i wi = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + i)));
+        __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(wi, 16));
+        sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + i), sum0);
+    }
+    __m128 lo = _mm256_castps256_ps128(sum0);
+    __m128 hi = _mm256_extractf128_ps(sum0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float result = _mm_cvtss_f32(lo);
+    for (; i < n; i++) {
+        uint32_t bits = (uint32_t)w[i] << 16;
+        float wf;
+        __builtin_memcpy(&wf, &bits, 4);
+        result += wf * x[i];
+    }
+    return result;
+}
+#endif /* __AVX2__ */
+
 static void *g4v_matmul_worker(void *arg) {
     g4v_matmul_task *t = (g4v_matmul_task *)arg;
-    for (int r = t->row_start; r < t->row_end; r++) {
-        const float *row = t->mat_f32 + (size_t)r * t->n_cols;
-        for (int tok = 0; tok < t->N; tok++) {
-            const float *x = t->inp + tok * t->n_cols;
-            t->out[tok * t->n_rows + r] = g4v_dot(row, x, t->n_cols);
+    if (t->mat_type == GGML_TYPE_F32 || t->mat_f32) {
+        for (int r = t->row_start; r < t->row_end; r++) {
+            const float *row = t->mat_f32 + (size_t)r * t->n_cols;
+            for (int tok = 0; tok < t->N; tok++) {
+                const float *x = t->inp + tok * t->n_cols;
+                t->out[tok * t->n_rows + r] = g4v_dot(row, x, t->n_cols);
+            }
         }
+    } else {
+        /* Fused dequant + dot: read raw F16/BF16 weight bytes directly. */
+#ifdef __AVX2__
+        int is_bf16 = (t->mat_type == GGML_TYPE_BF16);
+        const uint16_t *mat_q = (const uint16_t *)t->mat_quant;
+        for (int r = t->row_start; r < t->row_end; r++) {
+            const uint16_t *row = mat_q + (size_t)r * t->n_cols;
+            for (int tok = 0; tok < t->N; tok++) {
+                const float *x = t->inp + tok * t->n_cols;
+                t->out[tok * t->n_rows + r] = is_bf16
+                    ? g4v_dot_bf16(row, x, t->n_cols)
+                    : g4v_dot_f16(row, x, t->n_cols);
+            }
+        }
+#else
+        /* Scalar fallback: dequant on the fly per element. */
+        for (int r = t->row_start; r < t->row_end; r++) {
+            const uint16_t *row = (const uint16_t *)t->mat_quant + (size_t)r * t->n_cols;
+            for (int tok = 0; tok < t->N; tok++) {
+                const float *x = t->inp + tok * t->n_cols;
+                float acc = 0;
+                for (int k = 0; k < t->n_cols; k++) {
+                    float wf;
+                    uint32_t bits = (uint32_t)row[k] << 16;  /* BF16 path; F16 is similar */
+                    __builtin_memcpy(&wf, &bits, 4);
+                    acc += wf * x[k];
+                }
+                t->out[tok * t->n_rows + r] = acc;
+            }
+        }
+#endif
     }
     return NULL;
 }
@@ -225,6 +330,89 @@ static void g4v_rmsnorm(float *out, const float *x, const qtensor *w, int n, flo
 
 static void g4v_rmsnorm_inplace(float *x, const qtensor *w, int n, float eps, float *tmp) {
     g4v_rmsnorm(x, x, w, n, eps, tmp);
+}
+
+/* LayerNorm: out = (x - mean) / sqrt(var + eps) * weight + bias
+ * Mean/var computed over the last dim (n). PyTorch LayerNorm. */
+static void g4v_layernorm(float *out, const float *x, const qtensor *w, const qtensor *b,
+                          int n, float eps, float *tmp) {
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= n;
+    float var = 0.0f;
+    for (int i = 0; i < n; i++) { float d = x[i] - mean; var += d * d; }
+    var /= n;
+    float scale = 1.0f / sqrtf(var + eps);
+    float *wf = tmp;
+    float *bf = tmp + n;
+    dequant_row(w->type, w->data, wf, n);
+    dequant_row(b->type, b->data, bf, n);
+    for (int i = 0; i < n; i++) out[i] = (x[i] - mean) * scale * wf[i] + bf[i];
+}
+
+/* AVX2 LayerNorm in-place: x = (x - mean) / sqrt(var + eps) * w + b.
+ * Single-pass Welford-style mean+var, then in-place normalize+scale+shift.
+ * n should be a multiple of 8 for best performance. */
+static void g4v_layernorm_avx2_inplace(float *x, const float *w, const float *b, int n, float eps) {
+#ifdef __AVX2__
+    __m256 vsum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) vsum = _mm256_add_ps(vsum, _mm256_loadu_ps(x + i));
+    float tail_sum = 0.0f;
+    for (; i < n; i++) tail_sum += x[i];
+    if (tail_sum != 0.0f) vsum = _mm256_add_ps(vsum, _mm256_set1_ps(tail_sum));
+    /* horizontal sum */
+    __m128 lo = _mm256_castps256_ps128(vsum);
+    __m128 hi = _mm256_extractf128_ps(vsum, 1);
+    lo = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(lo);
+    __m128 sums = _mm_add_ps(lo, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    float mean = _mm_cvtss_f32(sums) / (float)n;
+
+    __m256 vmean = _mm256_set1_ps(mean);
+    __m256 vvar = _mm256_setzero_ps();
+    i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vd = _mm256_sub_ps(vx, vmean);
+        vvar = _mm256_fmadd_ps(vd, vd, vvar);
+    }
+    float tail_var = 0.0f;
+    for (; i < n; i++) { float d = x[i] - mean; tail_var += d * d; }
+    if (tail_var != 0.0f) vvar = _mm256_add_ps(vvar, _mm256_set1_ps(tail_var));
+    lo = _mm256_castps256_ps128(vvar);
+    hi = _mm256_extractf128_ps(vvar, 1);
+    lo = _mm_add_ps(lo, hi);
+    shuf = _mm_movehdup_ps(lo);
+    __m128 vars = _mm_add_ps(lo, shuf);
+    shuf = _mm_movehl_ps(shuf, vars);
+    vars = _mm_add_ss(vars, shuf);
+    float var = _mm_cvtss_f32(vars) / (float)n;
+    float scale = 1.0f / sqrtf(var + eps);
+
+    __m256 vscale = _mm256_set1_ps(scale);
+    i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vw = _mm256_loadu_ps(w + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 vd = _mm256_sub_ps(vx, vmean);
+        __m256 vout = _mm256_fmadd_ps(_mm256_mul_ps(vd, vscale), vw, vb);
+        _mm256_storeu_ps(x + i, vout);
+    }
+    for (; i < n; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
+#else
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= n;
+    float var = 0.0f;
+    for (int i = 0; i < n; i++) { float d = x[i] - mean; var += d * d; }
+    var /= n;
+    float scale = 1.0f / sqrtf(var + eps);
+    for (int i = 0; i < n; i++) x[i] = (x[i] - mean) * scale * w[i] + b[i];
+#endif
 }
 
 /* Simple matmul: out[n_rows] = mat[n_rows, n_cols] @ vec[n_cols] */
@@ -269,27 +457,50 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
     }
     const uint8_t *base = (const uint8_t *)mat->data;
 
-    /* Dequant all rows into a contiguous F32 buffer */
-    float *mat_f32 = (float *)malloc((size_t)n_rows * n_cols * sizeof(float));
-    for (int r = 0; r < n_rows; r++)
-        dequant_row(mat->type, base + r * row_bytes, mat_f32 + (size_t)r * n_cols, n_cols);
+    /* Set up the mat pointer.
+     * Fast paths:
+     *   - F32: use the data pointer directly, no copy, no dequant.
+     *   - F16 / BF16: keep the raw bytes pointer. The worker will dequant
+     *     on the fly inside the AVX2 dot product (fused dequant + matmul),
+     *     avoiding a 100+MB intermediate F32 buffer + the dequant pass. */
+    const float *mat_f32 = NULL;
+    const void  *mat_quant = NULL;
+    int owns_mat = 0;
+    if (mat->type == GGML_TYPE_F32) {
+        mat_f32 = (float *)mat->data;
+    } else {
+        mat_quant = mat->data;  /* raw F16/BF16; no copy */
+    }
+    (void)base; (void)row_bytes;  /* unused on the fused path */
 
-    /* Threaded + AVX2 dot products */
+    /* Threaded + AVX2 dot products (with on-the-fly F16/BF16 → F32 conversion
+     * when the input weight is not F32). */
+    struct timespec _mts0;
+    clock_gettime(CLOCK_MONOTONIC, &_mts0);
     int nt = g4v_n_threads();
     if (nt > n_rows) nt = n_rows;
     if (nt <= 1) {
         /* Single-threaded fast path */
-        for (int r = 0; r < n_rows; r++) {
-            const float *row = mat_f32 + (size_t)r * n_cols;
-            for (int t = 0; t < N; t++)
-                out[t * n_rows + r] = g4v_dot(row, inp + t * n_cols, n_cols);
-        }
+        g4v_matmul_task t = {0};
+        t.mat_f32 = mat_f32;
+        t.mat_quant = mat_quant;
+        t.mat_type = mat->type;
+        t.inp = inp;
+        t.out = out;
+        t.n_cols = n_cols;
+        t.n_rows = n_rows;
+        t.N = N;
+        t.row_start = 0;
+        t.row_end = n_rows;
+        g4v_matmul_worker(&t);
     } else {
         pthread_t *threads = (pthread_t *)alloca(nt * sizeof(pthread_t));
         g4v_matmul_task *tasks = (g4v_matmul_task *)alloca(nt * sizeof(g4v_matmul_task));
         int rows_per = (n_rows + nt - 1) / nt;
         for (int i = 0; i < nt; i++) {
             tasks[i].mat_f32 = mat_f32;
+            tasks[i].mat_quant = mat_quant;
+            tasks[i].mat_type = mat->type;
             tasks[i].inp = inp;
             tasks[i].out = out;
             tasks[i].n_cols = n_cols;
@@ -302,7 +513,19 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
         }
         for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
     }
-    free(mat_f32);
+    struct timespec _mts1; clock_gettime(CLOCK_MONOTONIC, &_mts1);
+#ifdef GEMMA4_PROFILE_MS
+    {
+        double _mat_t = (_mts1.tv_sec*1000.0+_mts1.tv_nsec/1e6) - (_mts0.tv_sec*1000.0+_mts0.tv_nsec/1e6);
+        double _mat_gflops = (double)(2LL * n_rows * n_cols * N) / (_mat_t * 1e6);
+        const char *tn = (mat->type == GGML_TYPE_F32 ? "F32" :
+                          mat->type == GGML_TYPE_F16 ? "F16" :
+                          mat->type == GGML_TYPE_BF16 ? "BF16" : "??");
+        fprintf(stderr, "    g4v_matmul_batch matmul(%s): n_rows=%d n_cols=%d N=%d threads=%d -> %.2fms (%.1f GFLOPS)\n",
+                tn, n_rows, n_cols, N, nt, _mat_t, _mat_gflops);
+    }
+#endif
+    (void)owns_mat;  /* always 0 with fused path; left for future fallback */
 }
 
 /* ---- Loading ---- */
@@ -362,13 +585,28 @@ g4v_model *g4v_load(gguf_context *g) {
         if (idx >= 0) vm->n_blocks = g->kv[idx].value.u32;
         idx = gguf_find_key(g, "clip.vision.attention.layer_norm_epsilon");
         if (idx >= 0) vm->ln_eps = g->kv[idx].value.f32;
+        /* Detect Gemma4 "unified vision" projector */
+        idx = gguf_find_key(g, "clip.vision.projector_type");
+        if (idx >= 0) {
+            const char *pt = g->kv[idx].value.str.str;
+            if (pt && strcmp(pt, "gemma4uv") == 0) {
+                vm->is_gemma4uv = 1;
+                /* llama.cpp: patch_size *= spatial_merge (3), n_merge = 1 */
+                vm->patch_size = vm->patch_size * vm->spatial_merge;
+            }
+        }
     }
 
     vm->head_dim = vm->dim / vm->n_heads;
     vm->n_patches = (vm->image_size / vm->patch_size) * (vm->image_size / vm->patch_size);
     {
-        int ps_grid = vm->image_size / vm->patch_size;  /* 14 */
-        vm->n_merged = (ps_grid / vm->spatial_merge) * (ps_grid / vm->spatial_merge);
+        int ps_grid = vm->image_size / vm->patch_size;  /* 14 for ViT, 4 for Gemma4UV */
+        if (vm->is_gemma4uv) {
+            /* Gemma4UV: patch_size already includes spatial merge, so n_merged = n_patches */
+            vm->n_merged = vm->n_patches;
+        } else {
+            vm->n_merged = (ps_grid / vm->spatial_merge) * (ps_grid / vm->spatial_merge);
+        }
     }
 
     fprintf(stderr, "g4v: dim=%d heads=%d head_dim=%d ffn=%d blocks=%d\n",
@@ -378,6 +616,7 @@ g4v_model *g4v_load(gguf_context *g) {
 
     /* Load global tensors */
     vm->patch_embd_w = g4v_load_tensor(g, "v.patch_embd.weight", 1);
+    vm->patch_embd_b = g4v_load_tensor(g, "v.patch_embd.bias", 0);
     vm->position_embd = g4v_load_tensor(g, "v.position_embd.weight", 1);
     if (vm->position_embd.data) {
         vm->n_pos = (int)vm->position_embd.dims[1];
@@ -387,8 +626,19 @@ g4v_model *g4v_load(gguf_context *g) {
 
     vm->mm_proj_w = g4v_load_tensor(g, "mm.input_projection.weight", 1);
 
-    /* Load blocks */
-    vm->blocks = (g4v_block *)calloc(vm->n_blocks, sizeof(g4v_block));
+    if (vm->is_gemma4uv) {
+        vm->patch_norm_1_w = g4v_load_tensor(g, "v.patch_norm.1.weight", 1);
+        vm->patch_norm_1_b = g4v_load_tensor(g, "v.patch_norm.1.bias",   1);
+        vm->patch_norm_2_w = g4v_load_tensor(g, "v.patch_norm.2.weight", 1);
+        vm->patch_norm_2_b = g4v_load_tensor(g, "v.patch_norm.2.bias",   1);
+        vm->patch_norm_3_w = g4v_load_tensor(g, "v.patch_norm.3.weight", 1);
+        vm->patch_norm_3_b = g4v_load_tensor(g, "v.patch_norm.3.bias",   1);
+        fprintf(stderr, "g4v: gemma4uv projector detected (effective patch_size=%d, n_merged=%d)\n",
+                vm->patch_size, vm->n_merged);
+    }
+
+    /* Load blocks (zero for Gemma4UV) */
+    vm->blocks = (g4v_block *)calloc(vm->n_blocks > 0 ? vm->n_blocks : 1, sizeof(g4v_block));
     for (int b = 0; b < vm->n_blocks; b++) {
         char name[128];
         #define G4V_LOAD(field, suffix) \
@@ -683,6 +933,238 @@ static void g4v_avg_pool(float *out, const float *in, int ph, int pw, int dim, i
     }
 }
 
+/* Gemma4 "unified vision" (Gemma4UV) encode pipeline.
+ * Mirrors llama.cpp tools/mtmd/models/gemma4uv.cpp.
+ *   im2col: [ps*ps*3, n_patches] (ps = patch_size * spatial_merge = 48 for 12B)
+ *   patch_norm_1 (LayerNorm over 6912-dim, per patch)
+ *   matmul: patch_embd_w [dim, 6912] @ [6912, n_patches] -> [dim, n_patches]
+ *   add patch_embd_b [dim]
+ *   patch_norm_2 (LayerNorm over dim)
+ *   add 2D position embedding (X, Y lookups)
+ *   patch_norm_3 (LayerNorm over dim)
+ *   RMSNorm over dim (raw, no weight)
+ *   matmul: mm.input_projection [proj_dim, dim] @ [dim, n_patches] -> [proj_dim, n_patches]
+ * Output: n_merged tokens of proj_dim each.
+ *
+ * Note: GGUF stores weight matrices in a transposed layout (first dim = contraction,
+ * second dim = output). For math: out = mat_math @ inp, where mat_math is [out, in],
+ * the GGUF stores it as [in, out] = mat.n_rows=in, mat.n_cols=out. The matmul we need
+ * is out[t, r] = sum_c mat_gguf[c, r] * inp[t, c] = (inp @ mat_gguf.T)[t, r].
+ */
+/* Helper: return F32 pointer to qtensor data without copy. Returns NULL if not F32. */
+static const float *g4v_f32_ptr(const qtensor *t) {
+    if (t->type == GGML_TYPE_F32) return (const float *)t->data;
+    return NULL;
+}
+
+/* Helper: like g4v_f32_ptr but returns a writable pointer; dequantizes into a new
+ * malloc'd buffer if the tensor is not F32. Caller must free the returned pointer
+ * if it is non-NULL and the tensor was not F32 (use g4v_f32_owned_free to check). */
+static float *g4v_f32_get_or_dequant(const qtensor *t, int n) {
+    if (t->type == GGML_TYPE_F32) return (float *)t->data;  /* borrowed; do not free */
+    float *out = (float *)malloc((size_t)n * sizeof(float));
+    dequant_row(t->type, t->data, out, n);
+    return out;
+}
+
+static float *g4v_encode_gemma4uv(g4v_model *vm, const float *img_norm, int width, int height) {
+    int dim = vm->dim;
+    int ps = vm->patch_size;            /* 48 for 12B */
+    int ph = height / ps, pw = width / ps;
+    int N = ph * pw;                    /* 16 for 12B */
+    int proj_dim = vm->proj_dim;
+    float eps = vm->ln_eps;
+    int patch_dim = ps * ps * 3;        /* 6912 for 12B */
+
+    fprintf(stderr, "g4v_encode_gemma4uv: %dx%d ps=%d -> %d patches\n", width, height, ps, N);
+#ifdef GEMMA4_PROFILE_MS
+    /* STEP_BEGIN(i) at start of section i, STEP_END(i) at end of section i.
+     * Records the wall time between BEGIN and END into _pt[i]. */
+    double _pt[8] = {0}; const char *_pn[8] = {"im2col","LN1","MM1","LN2","pos","LN3","RMS","MM2"};
+    double _pt_t[8] = {0}; int _pt_active[8] = {0};
+#define STEP_BEGIN(i) do { struct timespec _now; clock_gettime(CLOCK_MONOTONIC, &_now); _pt_t[i] = _now.tv_sec*1000.0 + _now.tv_nsec/1e6; _pt_active[i] = 1; } while (0)
+#define STEP_END(i) do { if (_pt_active[i]) { struct timespec _now; clock_gettime(CLOCK_MONOTONIC, &_now); double _ms = _now.tv_sec*1000.0 + _now.tv_nsec/1e6; _pt[i] += _ms - _pt_t[i]; _pt_active[i] = 0; } } while (0)
+#else
+#define STEP_BEGIN(i) (void)0
+#define STEP_END(i) (void)0
+#endif
+
+    float *patches_im2col = (float *)malloc((size_t)N * patch_dim * sizeof(float));
+    float *patches        = (float *)malloc((size_t)N * dim      * sizeof(float));
+    float *proj_patches   = (float *)malloc((size_t)N * proj_dim * sizeof(float));
+    float *tmp            = (float *)malloc((size_t)patch_dim * 4 * sizeof(float));
+    if (!patches_im2col || !patches || !proj_patches || !tmp) {
+        fprintf(stderr, "g4v_encode_gemma4uv: alloc failed\n");
+        free(patches_im2col); free(patches); free(proj_patches); free(tmp);
+        return NULL;
+    }
+
+    /* 1. im2col: [patch_dim, N] layout — patches_im2col[patch * N + i] = pixel value */
+    STEP_BEGIN(0);
+    for (int py = 0; py < ph; py++) {
+        for (int px = 0; px < pw; px++) {
+            int patch_idx = py * pw + px;
+            for (int c = 0; c < 3; c++) {
+                for (int fy = 0; fy < ps; fy++) {
+                    for (int fx = 0; fx < ps; fx++) {
+                        int iy = py * ps + fy;
+                        int ix = px * ps + fx;
+                        float v = img_norm[(iy * width + ix) * 3 + c];
+                        int off = c * ps * ps + fy * ps + fx;
+                        patches_im2col[patch_idx * patch_dim + off] = v;
+                    }
+                }
+            }
+        }
+    }
+    STEP_END(0);
+
+    /* 2. patch_norm_1 (LayerNorm over patch_dim = 6912) */
+    STEP_BEGIN(1);
+    {
+        float *w = g4v_f32_get_or_dequant(&vm->patch_norm_1_w, patch_dim);
+        float *b = g4v_f32_get_or_dequant(&vm->patch_norm_1_b, patch_dim);
+        int w_owned = (w != (float *)vm->patch_norm_1_w.data);
+        int b_owned = (b != (float *)vm->patch_norm_1_b.data);
+        for (int p = 0; p < N; p++)
+            g4v_layernorm_avx2_inplace(patches_im2col + p * patch_dim, w, b, patch_dim, eps);
+        if (w_owned) free(w);
+        if (b_owned) free(b);
+    }
+
+    /* 3. matmul: g4v_matmul_batch computes out = inp @ mat.T.
+     *    qtensor: n_rows=dim, n_cols=patch_dim (loaded reversed from GGUF dims=[patch_dim, dim]).
+     *    patches[N, dim] = im2col[N, patch_dim] @ mat[dim, patch_dim].T = im2col @ mat_view.T
+     *    g4v_matmul_batch handles this directly with n_rows=dim. */
+    STEP_BEGIN(2);
+    {
+        int mat_rows = vm->patch_embd_w.n_rows;     /* dim */
+        int mat_cols = vm->patch_embd_w.n_cols;     /* patch_dim */
+        if (mat_rows != dim || mat_cols != patch_dim) {
+            fprintf(stderr, "g4v_encode_gemma4uv: patch_embd_w shape mismatch (%dx%d vs %dx%d)\n",
+                    mat_rows, mat_cols, dim, patch_dim);
+            free(patches_im2col); free(patches); free(proj_patches); free(tmp);
+            return NULL;
+        }
+        g4v_matmul_batch(patches, &vm->patch_embd_w, patches_im2col, N, dim, tmp);
+    }
+    STEP_END(2);
+    
+    /* 4. add patch_embd_b [dim] */
+    if (vm->patch_embd_b.data) {
+        float *b = g4v_f32_get_or_dequant(&vm->patch_embd_b, dim);
+        int b_owned = (b != (float *)vm->patch_embd_b.data);
+        for (int p = 0; p < N; p++)
+            for (int d = 0; d < dim; d++) patches[p * dim + d] += b[d];
+        if (b_owned) free(b);
+    }
+
+    /* 5. patch_norm_2 (LayerNorm over dim) */
+    STEP_BEGIN(3);
+    {
+        float *w = g4v_f32_get_or_dequant(&vm->patch_norm_2_w, dim);
+        float *b = g4v_f32_get_or_dequant(&vm->patch_norm_2_b, dim);
+        int w_owned = (w != (float *)vm->patch_norm_2_w.data);
+        int b_owned = (b != (float *)vm->patch_norm_2_b.data);
+        for (int p = 0; p < N; p++)
+            g4v_layernorm_avx2_inplace(patches + p * dim, w, b, dim, eps);
+        if (w_owned) free(w);
+        if (b_owned) free(b);
+    }
+    STEP_END(3);
+
+    free(patches_im2col);
+    patches_im2col = NULL;
+
+    /* 6. add 2D position embedding (X, Y lookups from [dim, n_pos, 2]) */
+    STEP_BEGIN(4);
+    {
+        int n_pos = vm->n_pos;
+        int owns_pos = 0;
+        float *pos_data = NULL;
+        if (vm->position_embd.type == GGML_TYPE_F32) {
+            pos_data = (float *)vm->position_embd.data;  /* direct, no copy */
+        } else {
+            pos_data = (float *)malloc((size_t)dim * n_pos * 2 * sizeof(float));
+            owns_pos = 1;
+            dequant_row(vm->position_embd.type, vm->position_embd.data, pos_data, dim * n_pos * 2);
+        }
+        float *tbl_x = pos_data;
+        float *tbl_y = pos_data + (size_t)dim * n_pos;
+        for (int py = 0; py < ph; py++) {
+            for (int px = 0; px < pw; px++) {
+                int patch_idx = py * pw + px;
+                float *p = patches + patch_idx * dim;
+                const float *src_x = tbl_x + (size_t)px * dim;
+                const float *src_y = tbl_y + (size_t)py * dim;
+                for (int d = 0; d < dim; d++) p[d] += src_x[d] + src_y[d];
+            }
+        }
+        if (owns_pos) free(pos_data);
+    }
+    STEP_END(4);
+
+    /* 7. patch_norm_3 (LayerNorm over dim) */
+    STEP_BEGIN(5);
+    {
+        float *w = g4v_f32_get_or_dequant(&vm->patch_norm_3_w, dim);
+        float *b = g4v_f32_get_or_dequant(&vm->patch_norm_3_b, dim);
+        int w_owned = (w != (float *)vm->patch_norm_3_w.data);
+        int b_owned = (b != (float *)vm->patch_norm_3_b.data);
+        for (int p = 0; p < N; p++)
+            g4v_layernorm_avx2_inplace(patches + p * dim, w, b, dim, eps);
+        if (w_owned) free(w);
+        if (b_owned) free(b);
+    }
+    STEP_END(5);
+
+    /* 8. RMSNorm over dim (raw, no learned weight) */
+    STEP_BEGIN(6);
+    for (int p = 0; p < N; p++) {
+        float *x = patches + p * dim;
+        float ss = g4v_sum_sq(x, dim);
+        float scale = 1.0f / sqrtf(ss / dim + eps);
+#ifdef __AVX2__
+        __m256 vsc = _mm256_set1_ps(scale);
+        int i = 0;
+        for (; i + 7 < dim; i += 8)
+            _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vsc));
+        for (; i < dim; i++) x[i] *= scale;
+#else
+        g4v_vec_scale(x, scale, dim);
+#endif
+    }
+    STEP_END(6);
+
+    /* 9. mm.input_projection: out = patches @ mat_view.T
+     *    qtensor: n_rows=proj_dim, n_cols=dim (GGUF dims=[dim, proj_dim]). */
+    STEP_BEGIN(7);
+    {
+        int mat_rows = vm->mm_proj_w.n_rows;     /* proj_dim */
+        int mat_cols = vm->mm_proj_w.n_cols;     /* dim */
+        if (mat_rows != proj_dim || mat_cols != dim) {
+            fprintf(stderr, "g4v_encode_gemma4uv: mm_proj_w shape mismatch (%dx%d vs %dx%d)\n",
+                    mat_rows, mat_cols, proj_dim, dim);
+            free(patches); free(proj_patches); free(tmp);
+            return NULL;
+        }
+        g4v_matmul_batch(proj_patches, &vm->mm_proj_w, patches, N, proj_dim, tmp);
+    }
+    STEP_END(7);
+
+    free(patches);
+    free(tmp);
+#ifdef GEMMA4_PROFILE_MS
+    {
+        fprintf(stderr, "  gemma4uv step timings: ");
+        double _total = 0;
+        for (int _i=0;_i<8;_i++) { fprintf(stderr, "%s=%.1fms ", _pn[_i], _pt[_i]); _total += _pt[_i]; }
+        fprintf(stderr, "total=%.1fms\n", _total);
+    }
+#endif
+    return proj_patches;
+}
+
 float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     if (!vm || !rgb) return NULL;
 
@@ -705,7 +1187,7 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     fprintf(stderr, "g4v_encode: %dx%d -> %d patches -> %d tokens\n",
             width, height, N, n_merged);
 
-    /* 1. Normalize image: patches * 2 - 1 (Gemma4 specific) */
+    /* 1. Normalize image: pixels * 2 - 1 (Gemma4 specific) */
     img_norm = (float *)malloc(height * width * 3 * sizeof(float));
     if (!img_norm) {
         fprintf(stderr, "g4v_encode: img_norm alloc failed (%d x %d)\n", width, height);
@@ -713,6 +1195,13 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     }
     for (int i = 0; i < height * width * 3; i++)
         img_norm[i] = ((float)rgb[i] / 255.0f) * 2.0f - 1.0f;
+
+    /* Gemma4UV (12B) uses a different pipeline: im2col -> 3 LayerNorms -> matmul */
+    if (vm->is_gemma4uv) {
+        projected = g4v_encode_gemma4uv(vm, img_norm, width, height);
+        free(img_norm);
+        return projected;
+    }
 
     /* 2. Patch embedding (conv2d stride=patch_size) */
     patches = (float *)calloc(N * dim, sizeof(float));
