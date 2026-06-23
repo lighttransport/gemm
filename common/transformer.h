@@ -143,6 +143,9 @@ typedef struct {
     float rope_freq_base_swa;       /* RoPE freq base for SWA layers (10000) */
     float embd_scale;               /* sqrt(n_embd) for token embedding scaling */
     int ffn_activation;             /* 0 = SiLU (default), 1 = GELU (Gemma4) */
+    int ffn_gelu_fast;              /* 1 = A64FX fast GELU approximation */
+    int ffn_fused_q4;               /* 1 = fused Q4 gate/up + GELU for Gemma4 prefill */
+    int ffn_check;                  /* 1 = print one fused-vs-exact FFN tile check */
     int *swa_pattern;               /* [n_layers] 1=SWA, 0=full attention */
     /* Per-layer embedding global tensors */
     qtensor per_layer_token_embd;   /* [n_embd_per_layer*n_layer, n_vocab] */
@@ -167,6 +170,9 @@ typedef struct {
     /* KV cache: [n_layers][max_seq_len * n_kv_heads * head_dim] */
     float **key_cache;
     float **value_cache;
+    void **key_cache_raw;
+    void **value_cache_raw;
+    int kv_cache_type;  /* 0 = F32, 1 = F16 */
 
     /* Scratch buffers */
     float *x;        /* [n_embd] current hidden state */
@@ -227,6 +233,9 @@ void transformer_free(transformer_model *model);
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
+void transformer_build_panels(transformer_model *model);
+void transformer_pool_profile_reset(void);
+void transformer_reset_runtime_state(transformer_model *model);
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable);
 /* Enable double-precision accumulation in matvec/rmsnorm for a higher-fidelity
  * (closer to F64) CPU reference. Slower; intended for oracle/verification use. */
@@ -235,7 +244,7 @@ void transformer_set_f64_accum(transformer_model *model, int enable);
 /* Configure NUMA-aware weight/buffer distribution across CMGs.
  * Must be called after transformer_set_threads, before inference.
  * Env vars: NUMA_DISTRIBUTE=1 (enable), NUMA_N_CMGS (default 4),
- *           NUMA_CMG_BUDGET_GB (default 6), NUMA_ALIGNMENT (default 2MB). */
+ *           NUMA_CMG_BUDGET_GB (default 7), NUMA_ALIGNMENT (default 2MB). */
 void transformer_numa_setup(transformer_model *m, const gguf_context *gguf);
 
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
@@ -321,6 +330,7 @@ typedef struct {
 /* Run batched prefill and return logits for the last token. Returns NULL if no LM head.
  * All N tokens are processed through GEMM instead of individual matvecs. */
 float *transformer_forward_batch_logits(transformer_model *m, const transformer_batch *b);
+float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int n_tokens, int start_pos);
 
 /* Sample next token from logits using temperature and top-k. */
 int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperature, int top_k);
@@ -341,6 +351,13 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+extern void gemm_fp16_BT(int M, int K, int N,
+                         const float *A, int lda,
+                         const uint16_t *BT_fp16, int ldb,
+                         float *C, int ldc) __attribute__((weak));
+#endif
 
 /* Profiling macros: active only if profiler.h was included before this file */
 #ifdef PROFILER_H
@@ -415,6 +432,65 @@ static void *tf_aligned_alloc_notouch(size_t alignment, size_t size) {
     void *p = NULL;
     if (posix_memalign(&p, alignment, size) != 0) return NULL;
     return p;
+}
+
+static uint16_t tf_f32_to_f16(float f) {
+    uint32_t x;
+    __builtin_memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t t = mant >> (uint32_t)(1 - exp);
+        if (t & 0x1000u) t += 0x2000u;
+        return (uint16_t)(sign | (t >> 13));
+    }
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7c00u | (mant ? 0x0200u : 0));
+    }
+    if (mant & 0x1000u) {
+        mant += 0x2000u;
+        if (mant & 0x800000u) {
+            mant = 0;
+            exp++;
+            if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+static void tf_kv_store(transformer_model *m, int layer, size_t offset,
+                        const float *src, int n) {
+    if (m->kv_cache_type == 1) {
+        uint16_t *dst = (uint16_t *)m->key_cache_raw[layer] + offset;
+        for (int i = 0; i < n; i++) dst[i] = tf_f32_to_f16(src[i]);
+    } else {
+        memcpy(m->key_cache[layer] + offset, src, (size_t)n * sizeof(float));
+    }
+}
+
+static void tf_kv_store_value(transformer_model *m, int layer, size_t offset,
+                              const float *src, int n) {
+    if (m->kv_cache_type == 1) {
+        uint16_t *dst = (uint16_t *)m->value_cache_raw[layer] + offset;
+        for (int i = 0; i < n; i++) dst[i] = tf_f32_to_f16(src[i]);
+    } else {
+        memcpy(m->value_cache[layer] + offset, src, (size_t)n * sizeof(float));
+    }
+}
+
+static inline float tf_kv_load_key(const transformer_model *m, int layer, size_t idx) {
+    if (m->kv_cache_type == 1)
+        return ggml_fp16_to_fp32(((const uint16_t *)m->key_cache_raw[layer])[idx]);
+    return m->key_cache[layer][idx];
+}
+
+static inline float tf_kv_load_value(const transformer_model *m, int layer, size_t idx) {
+    if (m->kv_cache_type == 1)
+        return ggml_fp16_to_fp32(((const uint16_t *)m->value_cache_raw[layer])[idx]);
+    return m->value_cache[layer][idx];
 }
 
 /* ---- Compute helpers ---- */
@@ -645,6 +721,15 @@ typedef struct {
     float *tmp; /* per-thread scratch */
 } tf_matvec_task;
 
+static inline float tf_vec_dot_q4_0_f32(const block_q4_0 *row, const float *x, int n_cols);
+static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
+                                           const float *x0, const float *x1,
+                                           const float *x2, const float *x3,
+                                           int n_cols, float *s0, float *s1,
+                                           float *s2, float *s3);
+static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                  const float *x, int n_cols, int row_start, int row_end);
+
 static void *tf_qmatvec_worker(void *arg) {
     tf_matvec_task *t = (tf_matvec_task *)arg;
     int n_cols = t->mat->n_cols;
@@ -706,6 +791,13 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         return NULL;
     }
+    if (t->mat->type == GGML_TYPE_Q4_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(t->dst, (const uint8_t *)t->mat->data, row_bytes,
+                              t->x, n_cols, t->row_start, t->row_end);
+        return NULL;
+    }
     for (int i = t->row_start; i < t->row_end; i++) {
         tf_dequant_row(t->mat, i, t->tmp);
 #if defined(__AVX2__) && defined(__FMA__)
@@ -756,6 +848,86 @@ static void tf_matvec_q8_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                 const float *x, int n_cols, int row_start, int row_end) {
     for (int i = row_start; i < row_end; i++) {
         dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, x, n_cols);
+    }
+}
+
+static inline float tf_vec_dot_q4_0_f32(const block_q4_0 *row, const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t acc = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(row[b].d);
+        const int base = b * 32;
+        svuint32_t q = svld1ub_u32(pg, row[b].qs);
+        svint32_t qlo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q, 0x0f)), 8);
+        svint32_t qhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q, 4)), 8);
+        svfloat32_t wlo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qlo), d);
+        svfloat32_t whi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qhi), d);
+        acc = svmla_x(pg, acc, wlo, svld1(pg, x + base));
+        acc = svmla_x(pg, acc, whi, svld1(pg, x + base + 16));
+    }
+    return svaddv_f32(pg, acc);
+#else
+    float s = 0.0f;
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(row[b].d);
+        const int base = b * 32;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t q = row[b].qs[j];
+            s += ((float)((q & 0x0f) - 8) * d) * x[base + j];
+            s += ((float)((q >> 4) - 8) * d) * x[base + j + 16];
+        }
+    }
+    return s;
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
+                                           const float *x0, const float *x1,
+                                           const float *x2, const float *x3,
+                                           int n_cols, float *s0, float *s1,
+                                           float *s2, float *s3) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(row[b].d);
+        const int base = b * 32;
+        svuint32_t q = svld1ub_u32(pg, row[b].qs);
+        svint32_t qlo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q, 0x0f)), 8);
+        svint32_t qhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q, 4)), 8);
+        svfloat32_t wlo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qlo), d);
+        svfloat32_t whi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qhi), d);
+        a0 = svmla_x(pg, a0, wlo, svld1(pg, x0 + base));
+        a0 = svmla_x(pg, a0, whi, svld1(pg, x0 + base + 16));
+        a1 = svmla_x(pg, a1, wlo, svld1(pg, x1 + base));
+        a1 = svmla_x(pg, a1, whi, svld1(pg, x1 + base + 16));
+        a2 = svmla_x(pg, a2, wlo, svld1(pg, x2 + base));
+        a2 = svmla_x(pg, a2, whi, svld1(pg, x2 + base + 16));
+        a3 = svmla_x(pg, a3, wlo, svld1(pg, x3 + base));
+        a3 = svmla_x(pg, a3, whi, svld1(pg, x3 + base + 16));
+    }
+    *s0 = svaddv_f32(pg, a0);
+    *s1 = svaddv_f32(pg, a1);
+    *s2 = svaddv_f32(pg, a2);
+    *s3 = svaddv_f32(pg, a3);
+#else
+    *s0 = tf_vec_dot_q4_0_f32(row, x0, n_cols);
+    *s1 = tf_vec_dot_q4_0_f32(row, x1, n_cols);
+    *s2 = tf_vec_dot_q4_0_f32(row, x2, n_cols);
+    *s3 = tf_vec_dot_q4_0_f32(row, x3, n_cols);
+#endif
+}
+
+static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                  const float *x, int n_cols, int row_start, int row_end) {
+    for (int i = row_start; i < row_end; i++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)i * row_bytes);
+        dst[i] = tf_vec_dot_q4_0_f32(row, x, n_cols);
     }
 }
 
@@ -832,6 +1004,12 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                             t->x, n_cols, t->row_start, t->row_end);
         tf_matvec_q8_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                             t->x, n_cols, t->row_start, t->row_end);
+    } else if (t->mat1->type == GGML_TYPE_Q4_0) {
+        size_t row_bytes = (size_t)(n_cols / 32) * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
+        tf_matvec_q4_0_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
     } else {
         /* Generic path for other quantized weights — AVX2 dot product */
         float *tmp = (float *)malloc(n_cols * sizeof(float));
@@ -992,6 +1170,9 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
     } else if (mat->type == GGML_TYPE_Q8_0) {
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q8_0);
         tf_matvec_q8_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+    } else if (mat->type == GGML_TYPE_Q4_0) {
+        size_t rb = (size_t)(n_cols / 32) * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else {
         float *tmp = (float *)malloc(n_cols * sizeof(float));
         if (!tmp) return;
@@ -1081,6 +1262,12 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         for (int i = 0; i < n_rows; i++) {
             dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, x, n_cols);
         }
+        return;
+    }
+    if (mat->type == GGML_TYPE_Q4_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, row_bytes, x, n_cols, 0, n_rows);
         return;
     }
     for (int i = 0; i < n_rows; i++) {
@@ -1716,6 +1903,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->rope_inv_freq_swa = NULL;
     m->ple_buf = NULL;
     m->ple_proj_buf = NULL;
+    m->ffn_gelu_fast = 0;
+    m->ffn_fused_q4 = 0;
+    m->ffn_check = 0;
     if (strcmp(arch, "gemma4") == 0) {
         m->is_gemma4 = 1;
         m->head_dim_full = tf_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
@@ -1729,6 +1919,23 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         m->rope_freq_base_swa = tf_get_float(gguf, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
         m->embd_scale = sqrtf((float)m->n_embd);
         m->ffn_activation = 1; /* GELU */
+#if defined(__ARM_FEATURE_SVE)
+        m->ffn_gelu_fast = 1;
+        m->ffn_fused_q4 = 1;
+#endif
+        const char *gelu_mode = getenv("TF_GELU_MODE");
+        if (gelu_mode) {
+            if (strcmp(gelu_mode, "exact") == 0 || strcmp(gelu_mode, "0") == 0)
+                m->ffn_gelu_fast = 0;
+            else if (strcmp(gelu_mode, "fast") == 0 || strcmp(gelu_mode, "1") == 0)
+                m->ffn_gelu_fast = 1;
+            else
+                fprintf(stderr, "transformer: ignoring unknown TF_GELU_MODE=%s (use fast|exact)\n", gelu_mode);
+        }
+        const char *fused_q4 = getenv("TF_FFN_FUSED_Q4");
+        if (fused_q4) m->ffn_fused_q4 = atoi(fused_q4) != 0;
+        const char *ffn_check = getenv("TF_FFN_CHECK");
+        if (ffn_check) m->ffn_check = atoi(ffn_check) != 0;
 
         /* Parse SWA layer pattern from GGUF bool array */
         m->swa_pattern = (int *)calloc(m->n_layers, sizeof(int));
@@ -1756,6 +1963,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                 m->n_embd_per_layer, m->n_layer_kv_from_start);
         fprintf(stderr, "transformer: Gemma4: softcap=%.1f rope_base_swa=%.0f\n",
                 m->final_logit_softcapping, m->rope_freq_base_swa);
+        fprintf(stderr, "transformer: Gemma4 FFN: GELU=%s fused_q4=%d check=%d\n",
+                m->ffn_gelu_fast ? "fast_sve" : "exact_erf", m->ffn_fused_q4, m->ffn_check);
     }
 
     #undef ARCH_KEY
@@ -2038,20 +2247,36 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     int kv_dim = m->n_kv_heads * m->head_dim;
     m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
     m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
+    m->key_cache_raw   = (void **)calloc(m->n_layers, sizeof(void *));
+    m->value_cache_raw = (void **)calloc(m->n_layers, sizeof(void *));
+    m->kv_cache_type = 0;
+    {
+        const char *kv = getenv("TF_KV_DTYPE");
+        if (m->is_gemma4 && kv && (!strcmp(kv, "f16") || !strcmp(kv, "fp16"))) {
+            m->kv_cache_type = 1;
+        } else if (m->is_gemma4 && kv && strcmp(kv, "f32") && strcmp(kv, "fp32")) {
+            fprintf(stderr, "transformer: Gemma4 unsupported TF_KV_DTYPE=%s, using f32\n", kv);
+        }
+    }
     if (m->is_gemma4) {
         int n_own = 0, n_shared = 0;
+        size_t kv_elem_size = (m->kv_cache_type == 1) ? sizeof(uint16_t) : sizeof(float);
         for (int l = 0; l < m->n_layers; l++) {
             if (m->layers[l].shared_kv_source >= 0) { n_shared++; continue; }
             /* Per-layer KV dim (SWA & full-attn may have different KV head counts) */
             int lhd = m->layers[l].is_swa ? m->head_dim_swa : m->head_dim_full;
             int l_kv_dim = m->layers[l].n_kv_heads * lhd;
-            if (m->layers[l].is_swa) {
-                int cache_len = m->swa_window_size;
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, cache_len * l_kv_dim, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, cache_len * l_kv_dim, sizeof(float));
-            } else {
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * l_kv_dim, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * l_kv_dim, sizeof(float));
+            int cache_len = m->layers[l].is_swa ? m->swa_window_size : max_seq_len;
+            m->key_cache_raw[l]   = tf_aligned_calloc(256, (size_t)cache_len * l_kv_dim, kv_elem_size);
+            m->value_cache_raw[l] = tf_aligned_calloc(256, (size_t)cache_len * l_kv_dim, kv_elem_size);
+            if (m->kv_cache_type == 0) {
+                m->key_cache[l]   = (float *)m->key_cache_raw[l];
+                m->value_cache[l] = (float *)m->value_cache_raw[l];
+            }
+            if (!m->key_cache_raw[l] || !m->value_cache_raw[l]) {
+                fprintf(stderr, "transformer: Gemma4 KV cache alloc failed at layer %d\n", l);
+                transformer_free(m);
+                return NULL;
             }
             n_own++;
         }
@@ -2061,9 +2286,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             if (src >= 0) {
                 m->key_cache[l]   = m->key_cache[src];
                 m->value_cache[l] = m->value_cache[src];
+                m->key_cache_raw[l]   = m->key_cache_raw[src];
+                m->value_cache_raw[l] = m->value_cache_raw[src];
             }
         }
-        fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers\n", n_own, n_shared);
+        fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers, dtype=%s\n",
+                n_own, n_shared, m->kv_cache_type == 1 ? "f16" : "f32");
         /* Scratch sizing: max per-layer KV dim across all layers (SWA & full-attn differ). */
         for (int l = 0; l < m->n_layers; l++) {
             int lhd = m->layers[l].is_swa ? m->head_dim_swa : m->head_dim_full;
@@ -2075,6 +2303,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             if (m->is_hybrid && m->layers[l].is_ssm) continue;
             m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
             m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
+            m->key_cache_raw[l]   = m->key_cache[l];
+            m->value_cache_raw[l] = m->value_cache[l];
         }
     }
 
@@ -2190,18 +2420,22 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
 void transformer_free(transformer_model *model) {
     if (!model) return;
-    free(model->layers);
-    if (model->key_cache) {
+    if (model->key_cache || model->key_cache_raw) {
         for (int l = 0; l < model->n_layers; l++) {
             /* Skip shared KV caches (freed by their source layer) */
             if (model->is_gemma4 && l < model->n_layers &&
                 model->layers && model->layers[l].shared_kv_source >= 0) continue;
-            free(model->key_cache[l]);
-            free(model->value_cache[l]);
+            void *kptr = model->key_cache_raw ? model->key_cache_raw[l] : (void *)model->key_cache[l];
+            void *vptr = model->value_cache_raw ? model->value_cache_raw[l] : (void *)model->value_cache[l];
+            free(kptr);
+            free(vptr);
         }
+        free(model->key_cache_raw);
+        free(model->value_cache_raw);
         free(model->key_cache);
         free(model->value_cache);
     }
+    free(model->layers);
     /* Gemma4 resources */
     free(model->swa_pattern);
     free(model->rope_freq_factors);
@@ -2256,11 +2490,67 @@ typedef struct {
     int tid;
 } tf_pool_worker_ctx;
 
+static void tf_bind_current_thread_for_numa(int tid) {
+    const char *enabled = getenv("NUMA_DISTRIBUTE");
+    if (!enabled || atoi(enabled) == 0) {
+        (void)tid;
+        return;
+    }
+#if defined(__linux__)
+    int n_cmgs = 4;
+    const char *env = getenv("NUMA_N_CMGS");
+    if (env) n_cmgs = atoi(env);
+    if (n_cmgs < 1) n_cmgs = 1;
+    if (n_cmgs > 4) n_cmgs = 4;
+    int cmg = tid % n_cmgs;
+    int local = tid / n_cmgs;
+    if (local >= 12) local %= 12;
+    int core = 12 + cmg * 12 + local;
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0 && tid == 0) {
+        fprintf(stderr, "numa: warning: sched_setaffinity(core=%d) failed\n", core);
+    }
+#else
+    (void)tid;
+#endif
+}
+
+static int tf_bind_current_thread_for_numa_saved(int tid, cpu_set_t *old_set) {
+    const char *enabled = getenv("NUMA_DISTRIBUTE");
+    if (!enabled || atoi(enabled) == 0) {
+        (void)tid;
+        (void)old_set;
+        return 0;
+    }
+#if defined(__linux__)
+    if (sched_getaffinity(0, sizeof(*old_set), old_set) != 0) return 0;
+    tf_bind_current_thread_for_numa(tid);
+    return 1;
+#else
+    (void)tid;
+    (void)old_set;
+    return 0;
+#endif
+}
+
+static void tf_restore_current_thread_affinity(int restore, const cpu_set_t *old_set) {
+#if defined(__linux__)
+    if (restore) sched_setaffinity(0, sizeof(*old_set), old_set);
+#else
+    (void)restore;
+    (void)old_set;
+#endif
+}
+
 static void *tf_pool_worker_main(void *arg) {
     tf_pool_worker_ctx *ctx = (tf_pool_worker_ctx *)arg;
     transformer_model *m = ctx->model;
     int tid = ctx->tid;
     free(ctx);
+    tf_bind_current_thread_for_numa(tid);
 
     int last_phase = 0;
     while (1) {
@@ -2334,9 +2624,17 @@ static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
     pthread_cond_broadcast(&model->pool_cond);
     pthread_mutex_unlock(&model->pool_mutex);
 
-    /* Main thread executes worker 0's task directly */
+    /* Main thread executes worker 0's task directly. Pin only for this task so
+     * later ad-hoc pthread kernels inherit the broad numactl CPU mask. */
     void *task0 = (char *)args;
+#if defined(__linux__)
+    cpu_set_t old_set;
+    int restore_affinity = tf_bind_current_thread_for_numa_saved(0, &old_set);
+#endif
     fn(task0);
+#if defined(__linux__)
+    tf_restore_current_thread_affinity(restore_affinity, &old_set);
+#endif
 
     /* Wait for remaining workers (brief spin — workers are doing useful work) */
     while (model->pool_done < nt - 1)
@@ -2370,6 +2668,41 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     /* Start new pool */
     if (n_threads > 1) tf_pool_start(model);
     fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
+#if defined(__ARM_FEATURE_SVE)
+    fprintf(stderr, "transformer: A64FX SVE kernels enabled (BF16/F16/Q4_0)\n");
+#endif
+}
+
+void transformer_build_panels(transformer_model *model) {
+    (void)model;
+}
+
+void transformer_pool_profile_reset(void) {
+}
+
+void transformer_reset_runtime_state(transformer_model *model) {
+    if (!model) return;
+    model->ds_embd = NULL;
+    model->ds_embd_stride = 0;
+    if (model->conv_state_pos) {
+        memset(model->conv_state_pos, 0, (size_t)model->n_layers * sizeof(int));
+    }
+    if (model->conv_state) {
+        for (int l = 0; l < model->n_layers; l++) {
+            if (model->conv_state[l]) {
+                int n = (model->ssm_conv_kernel - 1) * model->ssm_qkv_dim;
+                if (n > 0) memset(model->conv_state[l], 0, (size_t)n * sizeof(float));
+            }
+        }
+    }
+    if (model->recurrent_state) {
+        for (int l = 0; l < model->n_layers; l++) {
+            if (model->recurrent_state[l]) {
+                int n = model->ssm_dt_rank * model->ssm_d_state * model->ssm_d_state;
+                if (n > 0) memset(model->recurrent_state[l], 0, (size_t)n * sizeof(float));
+            }
+        }
+    }
 }
 
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable) {
@@ -2427,7 +2760,7 @@ static void *tf_numa_memset_worker(void *arg) {
 static void tf_numa_init(transformer_model *m) {
     memset(&m->numa, 0, sizeof(m->numa));
     m->numa.n_cmgs = 4;
-    m->numa.per_cmg_budget = 6ULL * 1024 * 1024 * 1024;
+    m->numa.per_cmg_budget = 7ULL * 1024 * 1024 * 1024;
     m->numa.alignment = 2 * 1024 * 1024;
     m->numa.enabled = 0;
 
@@ -2463,6 +2796,55 @@ static void tf_numa_print_usage(transformer_model *m) {
     fprintf(stderr, " (budget=%.1fGB)\n", (double)m->numa.per_cmg_budget / (1024.0 * 1024.0 * 1024.0));
 }
 
+static int tf_numa_verify_tensor_sample(int fd, const char *name, const void *data,
+                                        size_t file_off, size_t size, int full) {
+    if (fd < 0 || !data || size == 0) return 0;
+    uint8_t ref[64];
+    const uint8_t *mem = (const uint8_t *)data;
+    if (full) {
+        uint8_t *buf = (uint8_t *)malloc(1024 * 1024);
+        if (!buf) return 1;
+        size_t off = 0;
+        while (off < size) {
+            size_t n = size - off;
+            if (n > 1024 * 1024) n = 1024 * 1024;
+            if (pread(fd, buf, n, (off_t)(file_off + off)) != (ssize_t)n) {
+                fprintf(stderr, "numa: verify read failed tensor=%s off=%zu\n", name, off);
+                free(buf);
+                return 1;
+            }
+            if (memcmp(mem + off, buf, n) != 0) {
+                fprintf(stderr, "numa: verify mismatch tensor=%s off=%zu size=%zu\n",
+                        name, off, size);
+                free(buf);
+                return 1;
+            }
+            off += n;
+        }
+        free(buf);
+        return 0;
+    }
+    size_t points[3];
+    points[0] = 0;
+    points[1] = size > sizeof(ref) ? size / 2 : 0;
+    points[2] = size > sizeof(ref) ? size - sizeof(ref) : 0;
+    for (int i = 0; i < 3; i++) {
+        size_t off = points[i];
+        size_t n = size - off;
+        if (n > sizeof(ref)) n = sizeof(ref);
+        if (pread(fd, ref, n, (off_t)(file_off + off)) != (ssize_t)n) {
+            fprintf(stderr, "numa: verify read failed tensor=%s off=%zu\n", name, off);
+            return 1;
+        }
+        if (memcmp(mem + off, ref, n) != 0) {
+            fprintf(stderr, "numa: verify mismatch tensor=%s off=%zu size=%zu\n",
+                    name, off, size);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
     tf_numa_init(m);
     if (!m->numa.enabled || m->n_threads <= 1 || !m->pool_alive) {
@@ -2482,13 +2864,15 @@ void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
         fprintf(stderr, "numa: phase 1 - loading weights (fd=%d, %zu tensors)...\n",
                 fd, (size_t)gguf->n_tensors);
         size_t weight_bytes = 0;
+        int verify = getenv("TF_NUMA_VERIFY") ? atoi(getenv("TF_NUMA_VERIFY")) : 0;
+        int verify_errors = 0;
 
         for (uint64_t ti = 0; ti < gguf->n_tensors; ti++) {
             void *tdata = gguf_tensor_data(gguf, (int)ti);
             size_t tsz = gguf_tensor_size(gguf, (int)ti);
             if (!tdata || tsz == 0) continue;
 
-            size_t toff = gguf->data_offset + ((uint8_t *)tdata - gguf->data);
+            size_t toff = gguf->data_offset + gguf->tensors[ti].offset;
             int n_dims = (int)gguf->tensors[ti].n_dims;
             int n_rows = 1;
             for (int d = 1; d < n_dims; d++)
@@ -2505,7 +2889,7 @@ void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
                 for (int t = 0; t < nt; t++) {
                     int rc = rp + (t < re ? 1 : 0);
                     size_t s = (size_t)ro * row_bytes;
-                    size_t e = (size_t)(ro + rc) * row_bytes;
+                    size_t e = (t == nt - 1) ? tsz : (size_t)(ro + rc) * row_bytes;
                     if (e > tsz) e = tsz;
                     tasks[t] = (tf_numa_task){tdata, fd, toff, s, e};
                     int cmg = t < m->numa.n_cmgs ? t : t % m->numa.n_cmgs;
@@ -2514,8 +2898,16 @@ void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
                 }
                 tf_pool_dispatch(m, tf_numa_pread_worker, tasks, sizeof(tf_numa_task));
             }
+            if (verify && verify_errors < 8) {
+                const char *name = gguf_tensor_name(gguf, (int)ti);
+                verify_errors += tf_numa_verify_tensor_sample(fd, name ? name : "?",
+                                                              tdata, toff, tsz, verify >= 2);
+            }
             weight_bytes += tsz;
         }
+        if (verify)
+            fprintf(stderr, "numa: verify %s (%d sample mismatches)\n",
+                    verify_errors ? "FAILED" : "ok", verify_errors);
         fprintf(stderr, "numa: phase 1 done (%.1fGB weights loaded)\n",
                 (double)weight_bytes / (1024.0 * 1024.0 * 1024.0));
     }
@@ -3112,14 +3504,100 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
 }
 
-/* Vectorized GELU(gate) × up: out[i] = gelu(gate[i]) * up[i]
- * Uses exact GELU: x * 0.5 * (1 + erf(x / sqrt(2))) */
-static void tf_gelu_mul(float *out, const float *gate, const float *up, int n) {
+static inline float tf_gelu_exact_scalar(float g) {
+    return g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));
+}
+
+static inline float tf_gelu_fast_scalar(float g) {
+    float a = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    float a2 = a * a;
+    float t = a * (27.0f + a2) / (27.0f + 9.0f * a2);
+    if (t > 1.0f) t = 1.0f;
+    if (t < -1.0f) t = -1.0f;
+    return 0.5f * g * (1.0f + t);
+}
+
+static void tf_gelu_mul_exact(float *out, const float *gate, const float *up, int n) {
     for (int i = 0; i < n; i++) {
         float g = gate[i];
-        float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f)); /* 1/sqrt(2) */
-        out[i] = gelu_g * up[i];
+        out[i] = tf_gelu_exact_scalar(g) * up[i];
     }
+}
+
+static inline float tf_gelu_mul_exact_scalar(float gate, float up) {
+    return tf_gelu_exact_scalar(gate) * up;
+}
+
+static inline float tf_gelu_mul_fast_scalar(float gate, float up) {
+    return tf_gelu_fast_scalar(gate) * up;
+}
+
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg, svfloat32_t x) {
+    const float shift_f = 204927.0f; /* 0x48481fc0: FEXPA-compatible rounding shift */
+    svfloat32_t shift = svdup_f32(shift_f);
+    svfloat32_t z = svadd_f32_x(pg, x, shift);
+    svfloat32_t n = svsub_f32_x(pg, z, shift);
+    svfloat32_t r = svsub_f32_x(pg, x, n);
+    svfloat32_t scale = svexpa_f32(svreinterpret_u32_f32(z));
+    svfloat32_t corr = svmla_n_f32_x(pg, svdup_f32(1.0f), r, 0.6931471805599453f);
+    return svmul_f32_x(pg, scale, corr);
+}
+
+static inline svfloat32_t tf_gelu_fast_sve(svbool_t pg, svfloat32_t g) {
+    svfloat32_t g2 = svmul_f32_x(pg, g, g);
+    svfloat32_t g3 = svmul_f32_x(pg, g2, g);
+    svfloat32_t a = svmla_n_f32_x(pg, g, g3, 0.044715f);
+    a = svmul_n_f32_x(pg, a, 0.7978845608028654f);
+    svfloat32_t t = svmul_n_f32_x(pg, a, -2.8853900817779268f); /* -2 * log2(e) */
+    t = svmax_n_f32_x(pg, svmin_n_f32_x(pg, t, 80.0f), -80.0f);
+    svfloat32_t exp_neg = tf_exp2_fexpa_approx_sve(pg, t);
+    svfloat32_t denom = svadd_f32_x(pg, svdup_f32(1.0f), exp_neg);
+    svfloat32_t inv = svrecpe_f32(denom);
+    inv = svmul_f32_x(pg, inv, svrecps_f32(denom, inv));
+    return svmul_f32_x(pg, g, inv);
+}
+
+static void tf_gelu_mul_fast_sve(float *out, const float *gate, const float *up, int n) {
+    int i = 0;
+    while (i < n) {
+        svbool_t pg = svwhilelt_b32(i, n);
+        svfloat32_t g = svld1(pg, gate + i);
+        svfloat32_t u = svld1(pg, up + i);
+        svfloat32_t y = svmul_f32_x(pg, tf_gelu_fast_sve(pg, g), u);
+        svst1(pg, out + i, y);
+        i += (int)svcntw();
+    }
+}
+
+static inline void tf_gelu_mul_fast4_sve(float *out, size_t stride, int row,
+                                         int tok, float g0, float g1,
+                                         float g2, float g3, float u0,
+                                         float u1, float u2, float u3) {
+    float y[4];
+    svbool_t pg = svwhilelt_b32(0, 4);
+    svfloat32_t gv = svdupq_n_f32(g0, g1, g2, g3);
+    svfloat32_t uv = svdupq_n_f32(u0, u1, u2, u3);
+    svst1(pg, y, svmul_f32_x(pg, tf_gelu_fast_sve(pg, gv), uv));
+    out[(size_t)(tok + 0) * stride + row] = y[0];
+    out[(size_t)(tok + 1) * stride + row] = y[1];
+    out[(size_t)(tok + 2) * stride + row] = y[2];
+    out[(size_t)(tok + 3) * stride + row] = y[3];
+}
+#endif
+
+static void tf_gelu_mul_fast(float *out, const float *gate, const float *up, int n) {
+#if defined(__ARM_FEATURE_SVE)
+    tf_gelu_mul_fast_sve(out, gate, up, n);
+#else
+    for (int i = 0; i < n; i++) out[i] = tf_gelu_mul_fast_scalar(gate[i], up[i]);
+#endif
+}
+
+/* GELU(gate) × up dispatcher. Exact mode keeps the previous erf GELU. */
+static void tf_gelu_mul(float *out, const float *gate, const float *up, int n, int fast) {
+    if (fast) tf_gelu_mul_fast(out, gate, up, n);
+    else tf_gelu_mul_exact(out, gate, up, n);
 }
 
 /* Logit soft-capping: logits[i] = cap * tanh(logits[i] / cap) */
@@ -3699,11 +4177,11 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             if (layer->shared_kv_source < 0) {
                 if (layer->is_swa) {
                     int slot = position % m->swa_window_size;
-                    memcpy(m->key_cache[l]   + slot * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + slot * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                    tf_kv_store(m, l, (size_t)slot * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)slot * local_kv_dim, m->v, local_kv_dim);
                 } else {
-                    memcpy(m->key_cache[l]   + position * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + position * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                    tf_kv_store(m, l, (size_t)position * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)position * local_kv_dim, m->v, local_kv_dim);
                 }
             }
 
@@ -3711,8 +4189,6 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             {
                 float attn_scale = 1.0f;
                 int seq_len;
-                float *kc = m->key_cache[kv_src];
-                float *vc = m->value_cache[kv_src];
 
                 if (layer->is_swa) {
                     /* SWA: attend to window [max(0, pos-window+1), pos] via circular buffer */
@@ -3731,9 +4207,9 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                         for (int p = 0; p < seq_len; p++) {
                             int abs_pos = start + p;
                             int slot = abs_pos % win;
-                            float *kp = kc + slot * local_kv_dim + kv_h * hd;
                             float score = 0.0f;
-                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
+                            size_t kbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
                             att_h[p] = score * attn_scale;
                         }
 
@@ -3750,9 +4226,9 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                         for (int p = 0; p < seq_len; p++) {
                             int abs_pos = start + p;
                             int slot = abs_pos % win;
-                            float *vp = vc + slot * local_kv_dim + kv_h * hd;
                             float w = att_h[p];
-                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
+                            size_t vbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
                         }
                     }
                 } else {
@@ -3765,9 +4241,9 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                         int kv_h = h / local_gqa;
 
                         for (int p = 0; p < seq_len; p++) {
-                            float *kp = kc + p * local_kv_dim + kv_h * hd;
                             float score = 0.0f;
-                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
+                            size_t kbase = (size_t)p * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
                             att_h[p] = score * attn_scale;
                         }
 
@@ -3780,9 +4256,9 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
                         float *out_h = m->xb2 + h * hd;
                         for (int p = 0; p < seq_len; p++) {
-                            float *vp = vc + p * local_kv_dim + kv_h * hd;
                             float w = att_h[p];
-                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
+                            size_t vbase = (size_t)p * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
                         }
                     }
                 }
@@ -3802,7 +4278,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
             tf_qmatvec_fused2_pool(m, m->ffn_buf1, &layer->ffn_gate,
                                     m->ffn_buf2, &layer->ffn_up, m->xb, m->n_ff);
-            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff);
+            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff, m->ffn_gelu_fast);
 
             tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
 
@@ -4188,11 +4664,17 @@ void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
 /* ---- Distributed memory management ---- */
 
 void transformer_free_unused_kv(transformer_model *model, int layer_start, int layer_end) {
-    if (!model || !model->key_cache) return;
+    if (!model || (!model->key_cache && !model->key_cache_raw)) return;
     for (int l = 0; l < model->n_layers; l++) {
         if (l < layer_start || l >= layer_end) {
-            free(model->key_cache[l]);   model->key_cache[l] = NULL;
-            free(model->value_cache[l]); model->value_cache[l] = NULL;
+            void *kptr = model->key_cache_raw ? model->key_cache_raw[l] : (void *)model->key_cache[l];
+            void *vptr = model->value_cache_raw ? model->value_cache_raw[l] : (void *)model->value_cache[l];
+            free(kptr);
+            free(vptr);
+            if (model->key_cache) model->key_cache[l] = NULL;
+            if (model->value_cache) model->value_cache[l] = NULL;
+            if (model->key_cache_raw) model->key_cache_raw[l] = NULL;
+            if (model->value_cache_raw) model->value_cache_raw[l] = NULL;
         }
     }
     /* Also free SSM state for unused layers */
@@ -4210,11 +4692,16 @@ void transformer_resize_kv_for_tp(transformer_model *model,
                                     int layer_start, int layer_end, int tp_kv_dim) {
     if (!model || !model->key_cache) return;
     for (int l = layer_start; l < layer_end && l < model->n_layers; l++) {
-        if (!model->key_cache[l]) continue;  /* SSM layer, no KV cache */
-        free(model->key_cache[l]);
-        free(model->value_cache[l]);
+        void *old_k = model->key_cache_raw ? model->key_cache_raw[l] : (void *)model->key_cache[l];
+        void *old_v = model->value_cache_raw ? model->value_cache_raw[l] : (void *)model->value_cache[l];
+        if (!old_k) continue;  /* SSM layer, no KV cache */
+        free(old_k);
+        free(old_v);
         model->key_cache[l]   = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
         model->value_cache[l] = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
+        if (model->key_cache_raw) model->key_cache_raw[l] = model->key_cache[l];
+        if (model->value_cache_raw) model->value_cache_raw[l] = model->value_cache[l];
+        model->kv_cache_type = 0;
     }
 }
 
@@ -4471,6 +4958,14 @@ typedef struct {
     int K, N, Y_stride, X_stride;
 } tf_gemm_q8_tm_task;
 
+typedef struct {
+    float *Y;
+    const qtensor *mat;
+    const float *X;
+    int row_start, row_end;
+    int K, N, Y_stride, X_stride;
+} tf_gemm_qtensor_tm_task;
+
 static void *tf_gemm_q8_tm_worker(void *arg) {
     tf_gemm_q8_tm_task *t = (tf_gemm_q8_tm_task *)arg;
     int nrows = t->row_end - t->row_start;
@@ -4480,6 +4975,563 @@ static void *tf_gemm_q8_tm_worker(void *arg) {
                              (const uint8_t *)t->W + (size_t)t->row_start * row_bytes,
                              t->X, nrows, t->K, t->N, t->Y_stride, t->X_stride);
     return NULL;
+}
+
+static void *tf_gemm_qtensor_tm_worker(void *arg) {
+    tf_gemm_qtensor_tm_task *t = (tf_gemm_qtensor_tm_task *)arg;
+    float *row_buf = (float *)malloc((size_t)t->K * sizeof(float));
+    if (!row_buf) return NULL;
+    size_t rb = tf_row_bytes(t->mat->type, t->K);
+    for (int r = t->row_start; r < t->row_end; r++) {
+        const void *row_data = (const uint8_t *)t->mat->data + (size_t)r * rb;
+        dequant_row(t->mat->type, row_data, row_buf, t->K);
+        for (int tok = 0; tok < t->N; tok++) {
+            const float *xt = t->X + (size_t)tok * t->X_stride;
+            float sum = 0.0f;
+            for (int k = 0; k < t->K; k++) sum += row_buf[k] * xt[k];
+            t->Y[(size_t)tok * t->Y_stride + r] = sum;
+        }
+    }
+    free(row_buf);
+    return NULL;
+}
+
+static void *tf_gemm_q4_0_tm_worker(void *arg) {
+    tf_gemm_qtensor_tm_task *t = (tf_gemm_qtensor_tm_task *)arg;
+    const int nb = t->K / 32;
+    const block_q4_0 *rows = (const block_q4_0 *)t->mat->data;
+    for (int r = t->row_start; r < t->row_end; r++) {
+        const block_q4_0 *row = rows + (size_t)r * nb;
+        int tok = 0;
+        for (; tok + 3 < t->N; tok += 4) {
+            const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+            const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+            const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+            const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+            float s0, s1, s2, s3;
+            tf_vec_dot_q4_0_f32_4x(row, x0, x1, x2, x3, t->K, &s0, &s1, &s2, &s3);
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r] = s0;
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r] = s1;
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r] = s2;
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r] = s3;
+        }
+        for (; tok < t->N; tok++) {
+            const float *x = t->X + (size_t)tok * t->X_stride;
+            float s = tf_vec_dot_q4_0_f32(row, x, t->K);
+            t->Y[(size_t)tok * t->Y_stride + r] = s;
+        }
+    }
+    return NULL;
+}
+
+typedef struct {
+    float *Y;
+    const qtensor *gate;
+    const qtensor *up;
+    const float *X;
+    int row_start, row_end;
+    int K, N, Y_stride, X_stride;
+} tf_gemm_q4_pair_gelu_task;
+
+static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
+                                             const block_q4_0 *up,
+                                             const float *x, int n_cols,
+                                             float *sg, float *su) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag = svdup_f32(0.0f), au = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svfloat32_t xlo = svld1(pg, x + base);
+        svfloat32_t xhi = svld1(pg, x + base + 16);
+
+        svuint32_t qg = svld1ub_u32(pg, gate[b].qs);
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8);
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8);
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        ag = svmla_x(pg, ag, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg), xlo);
+        ag = svmla_x(pg, ag, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg), xhi);
+
+        svuint32_t qu = svld1ub_u32(pg, up[b].qs);
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8);
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        au = svmla_x(pg, au, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du), xlo);
+        au = svmla_x(pg, au, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du), xhi);
+    }
+    *sg = svaddv_f32(pg, ag);
+    *su = svaddv_f32(pg, au);
+#else
+    float gsum = 0.0f, usum = 0.0f;
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        const int base = b * 32;
+        for (int j = 0; j < 16; j++) {
+            uint8_t qg = gate[b].qs[j];
+            uint8_t qu = up[b].qs[j];
+            gsum += ((float)((int)(qg & 0x0f) - 8) * dg) * x[base + j];
+            gsum += ((float)((int)(qg >> 4) - 8) * dg) * x[base + j + 16];
+            usum += ((float)((int)(qu & 0x0f) - 8) * du) * x[base + j];
+            usum += ((float)((int)(qu >> 4) - 8) * du) * x[base + j + 16];
+        }
+    }
+    *sg = gsum;
+    *su = usum;
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_pair_f32_4x(const block_q4_0 *gate,
+                                                const block_q4_0 *up,
+                                                const float *x0, const float *x1,
+                                                const float *x2, const float *x3,
+                                                int n_cols,
+                                                float *g0, float *g1,
+                                                float *g2, float *g3,
+                                                float *u0, float *u1,
+                                                float *u2, float *u3) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag0 = svdup_f32(0.0f), ag1 = svdup_f32(0.0f);
+    svfloat32_t ag2 = svdup_f32(0.0f), ag3 = svdup_f32(0.0f);
+    svfloat32_t au0 = svdup_f32(0.0f), au1 = svdup_f32(0.0f);
+    svfloat32_t au2 = svdup_f32(0.0f), au3 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svfloat32_t x0lo = svld1(pg, x0 + base);
+        svfloat32_t x0hi = svld1(pg, x0 + base + 16);
+        svfloat32_t x1lo = svld1(pg, x1 + base);
+        svfloat32_t x1hi = svld1(pg, x1 + base + 16);
+        svfloat32_t x2lo = svld1(pg, x2 + base);
+        svfloat32_t x2hi = svld1(pg, x2 + base + 16);
+        svfloat32_t x3lo = svld1(pg, x3 + base);
+        svfloat32_t x3hi = svld1(pg, x3 + base + 16);
+
+        svuint32_t qg = svld1ub_u32(pg, gate[b].qs);
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8);
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8);
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        svfloat32_t wglo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg);
+        svfloat32_t wghi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg);
+        ag0 = svmla_x(pg, ag0, wglo, x0lo); ag0 = svmla_x(pg, ag0, wghi, x0hi);
+        ag1 = svmla_x(pg, ag1, wglo, x1lo); ag1 = svmla_x(pg, ag1, wghi, x1hi);
+        ag2 = svmla_x(pg, ag2, wglo, x2lo); ag2 = svmla_x(pg, ag2, wghi, x2hi);
+        ag3 = svmla_x(pg, ag3, wglo, x3lo); ag3 = svmla_x(pg, ag3, wghi, x3hi);
+
+        svuint32_t qu = svld1ub_u32(pg, up[b].qs);
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8);
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        svfloat32_t wulo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du);
+        svfloat32_t wuhi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du);
+        au0 = svmla_x(pg, au0, wulo, x0lo); au0 = svmla_x(pg, au0, wuhi, x0hi);
+        au1 = svmla_x(pg, au1, wulo, x1lo); au1 = svmla_x(pg, au1, wuhi, x1hi);
+        au2 = svmla_x(pg, au2, wulo, x2lo); au2 = svmla_x(pg, au2, wuhi, x2hi);
+        au3 = svmla_x(pg, au3, wulo, x3lo); au3 = svmla_x(pg, au3, wuhi, x3hi);
+    }
+    *g0 = svaddv_f32(pg, ag0); *g1 = svaddv_f32(pg, ag1);
+    *g2 = svaddv_f32(pg, ag2); *g3 = svaddv_f32(pg, ag3);
+    *u0 = svaddv_f32(pg, au0); *u1 = svaddv_f32(pg, au1);
+    *u2 = svaddv_f32(pg, au2); *u3 = svaddv_f32(pg, au3);
+#else
+    tf_vec_dot_q4_0_pair_f32(gate, up, x0, n_cols, g0, u0);
+    tf_vec_dot_q4_0_pair_f32(gate, up, x1, n_cols, g1, u1);
+    tf_vec_dot_q4_0_pair_f32(gate, up, x2, n_cols, g2, u2);
+    tf_vec_dot_q4_0_pair_f32(gate, up, x3, n_cols, g3, u3);
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_pair_f32_2r4x(const block_q4_0 *gate0,
+                                                  const block_q4_0 *up0,
+                                                  const block_q4_0 *gate1,
+                                                  const block_q4_0 *up1,
+                                                  const float *x0, const float *x1,
+                                                  const float *x2, const float *x3,
+                                                  int n_cols,
+                                                  float *g00, float *g01,
+                                                  float *g02, float *g03,
+                                                  float *u00, float *u01,
+                                                  float *u02, float *u03,
+                                                  float *g10, float *g11,
+                                                  float *g12, float *g13,
+                                                  float *u10, float *u11,
+                                                  float *u12, float *u13) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag00 = svdup_f32(0.0f), ag01 = svdup_f32(0.0f);
+    svfloat32_t ag02 = svdup_f32(0.0f), ag03 = svdup_f32(0.0f);
+    svfloat32_t au00 = svdup_f32(0.0f), au01 = svdup_f32(0.0f);
+    svfloat32_t au02 = svdup_f32(0.0f), au03 = svdup_f32(0.0f);
+    svfloat32_t ag10 = svdup_f32(0.0f), ag11 = svdup_f32(0.0f);
+    svfloat32_t ag12 = svdup_f32(0.0f), ag13 = svdup_f32(0.0f);
+    svfloat32_t au10 = svdup_f32(0.0f), au11 = svdup_f32(0.0f);
+    svfloat32_t au12 = svdup_f32(0.0f), au13 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svfloat32_t x0lo = svld1(pg, x0 + base), x0hi = svld1(pg, x0 + base + 16);
+        svfloat32_t x1lo = svld1(pg, x1 + base), x1hi = svld1(pg, x1 + base + 16);
+        svfloat32_t x2lo = svld1(pg, x2 + base), x2hi = svld1(pg, x2 + base + 16);
+        svfloat32_t x3lo = svld1(pg, x3 + base), x3hi = svld1(pg, x3 + base + 16);
+
+#define TF_Q4_ACC_ROW(GROW, UROW, AG0, AG1, AG2, AG3, AU0, AU1, AU2, AU3) do { \
+        svuint32_t qg = svld1ub_u32(pg, (GROW)[b].qs); \
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8); \
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8); \
+        float dg = ggml_fp16_to_fp32((GROW)[b].d); \
+        svfloat32_t wglo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg); \
+        svfloat32_t wghi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg); \
+        AG0 = svmla_x(pg, AG0, wglo, x0lo); AG0 = svmla_x(pg, AG0, wghi, x0hi); \
+        AG1 = svmla_x(pg, AG1, wglo, x1lo); AG1 = svmla_x(pg, AG1, wghi, x1hi); \
+        AG2 = svmla_x(pg, AG2, wglo, x2lo); AG2 = svmla_x(pg, AG2, wghi, x2hi); \
+        AG3 = svmla_x(pg, AG3, wglo, x3lo); AG3 = svmla_x(pg, AG3, wghi, x3hi); \
+        svuint32_t qu = svld1ub_u32(pg, (UROW)[b].qs); \
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8); \
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8); \
+        float du = ggml_fp16_to_fp32((UROW)[b].d); \
+        svfloat32_t wulo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du); \
+        svfloat32_t wuhi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du); \
+        AU0 = svmla_x(pg, AU0, wulo, x0lo); AU0 = svmla_x(pg, AU0, wuhi, x0hi); \
+        AU1 = svmla_x(pg, AU1, wulo, x1lo); AU1 = svmla_x(pg, AU1, wuhi, x1hi); \
+        AU2 = svmla_x(pg, AU2, wulo, x2lo); AU2 = svmla_x(pg, AU2, wuhi, x2hi); \
+        AU3 = svmla_x(pg, AU3, wulo, x3lo); AU3 = svmla_x(pg, AU3, wuhi, x3hi); \
+    } while (0)
+        TF_Q4_ACC_ROW(gate0, up0, ag00, ag01, ag02, ag03, au00, au01, au02, au03);
+        TF_Q4_ACC_ROW(gate1, up1, ag10, ag11, ag12, ag13, au10, au11, au12, au13);
+#undef TF_Q4_ACC_ROW
+    }
+    *g00 = svaddv_f32(pg, ag00); *g01 = svaddv_f32(pg, ag01);
+    *g02 = svaddv_f32(pg, ag02); *g03 = svaddv_f32(pg, ag03);
+    *u00 = svaddv_f32(pg, au00); *u01 = svaddv_f32(pg, au01);
+    *u02 = svaddv_f32(pg, au02); *u03 = svaddv_f32(pg, au03);
+    *g10 = svaddv_f32(pg, ag10); *g11 = svaddv_f32(pg, ag11);
+    *g12 = svaddv_f32(pg, ag12); *g13 = svaddv_f32(pg, ag13);
+    *u10 = svaddv_f32(pg, au10); *u11 = svaddv_f32(pg, au11);
+    *u12 = svaddv_f32(pg, au12); *u13 = svaddv_f32(pg, au13);
+#else
+    tf_vec_dot_q4_0_pair_f32_4x(gate0, up0, x0, x1, x2, x3, n_cols,
+                                g00, g01, g02, g03, u00, u01, u02, u03);
+    tf_vec_dot_q4_0_pair_f32_4x(gate1, up1, x0, x1, x2, x3, n_cols,
+                                g10, g11, g12, g13, u10, u11, u12, u13);
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_pair_f32_8x(const block_q4_0 *gate,
+                                                const block_q4_0 *up,
+                                                const float *x0, const float *x1,
+                                                const float *x2, const float *x3,
+                                                const float *x4, const float *x5,
+                                                const float *x6, const float *x7,
+                                                int n_cols,
+                                                float *g0, float *g1,
+                                                float *g2, float *g3,
+                                                float *g4, float *g5,
+                                                float *g6, float *g7,
+                                                float *u0, float *u1,
+                                                float *u2, float *u3,
+                                                float *u4, float *u5,
+                                                float *u6, float *u7) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag0 = svdup_f32(0.0f), ag1 = svdup_f32(0.0f);
+    svfloat32_t ag2 = svdup_f32(0.0f), ag3 = svdup_f32(0.0f);
+    svfloat32_t ag4 = svdup_f32(0.0f), ag5 = svdup_f32(0.0f);
+    svfloat32_t ag6 = svdup_f32(0.0f), ag7 = svdup_f32(0.0f);
+    svfloat32_t au0 = svdup_f32(0.0f), au1 = svdup_f32(0.0f);
+    svfloat32_t au2 = svdup_f32(0.0f), au3 = svdup_f32(0.0f);
+    svfloat32_t au4 = svdup_f32(0.0f), au5 = svdup_f32(0.0f);
+    svfloat32_t au6 = svdup_f32(0.0f), au7 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svuint32_t qg = svld1ub_u32(pg, gate[b].qs);
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8);
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8);
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        svfloat32_t wglo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg);
+        svfloat32_t wghi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg);
+        svuint32_t qu = svld1ub_u32(pg, up[b].qs);
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8);
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        svfloat32_t wulo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du);
+        svfloat32_t wuhi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du);
+
+#define TF_Q4_ACC_TOKEN(IDX, XPTR, AG, AU) do { \
+        svfloat32_t xlo = svld1(pg, (XPTR) + base); \
+        svfloat32_t xhi = svld1(pg, (XPTR) + base + 16); \
+        AG = svmla_x(pg, AG, wglo, xlo); \
+        AG = svmla_x(pg, AG, wghi, xhi); \
+        AU = svmla_x(pg, AU, wulo, xlo); \
+        AU = svmla_x(pg, AU, wuhi, xhi); \
+    } while (0)
+        TF_Q4_ACC_TOKEN(0, x0, ag0, au0);
+        TF_Q4_ACC_TOKEN(1, x1, ag1, au1);
+        TF_Q4_ACC_TOKEN(2, x2, ag2, au2);
+        TF_Q4_ACC_TOKEN(3, x3, ag3, au3);
+        TF_Q4_ACC_TOKEN(4, x4, ag4, au4);
+        TF_Q4_ACC_TOKEN(5, x5, ag5, au5);
+        TF_Q4_ACC_TOKEN(6, x6, ag6, au6);
+        TF_Q4_ACC_TOKEN(7, x7, ag7, au7);
+#undef TF_Q4_ACC_TOKEN
+    }
+    *g0 = svaddv_f32(pg, ag0); *g1 = svaddv_f32(pg, ag1);
+    *g2 = svaddv_f32(pg, ag2); *g3 = svaddv_f32(pg, ag3);
+    *g4 = svaddv_f32(pg, ag4); *g5 = svaddv_f32(pg, ag5);
+    *g6 = svaddv_f32(pg, ag6); *g7 = svaddv_f32(pg, ag7);
+    *u0 = svaddv_f32(pg, au0); *u1 = svaddv_f32(pg, au1);
+    *u2 = svaddv_f32(pg, au2); *u3 = svaddv_f32(pg, au3);
+    *u4 = svaddv_f32(pg, au4); *u5 = svaddv_f32(pg, au5);
+    *u6 = svaddv_f32(pg, au6); *u7 = svaddv_f32(pg, au7);
+#else
+    tf_vec_dot_q4_0_pair_f32_4x(gate, up, x0, x1, x2, x3, n_cols,
+                                g0, g1, g2, g3, u0, u1, u2, u3);
+    tf_vec_dot_q4_0_pair_f32_4x(gate, up, x4, x5, x6, x7, n_cols,
+                                g4, g5, g6, g7, u4, u5, u6, u7);
+#endif
+}
+
+static void *tf_gemm_q4_0_pair_gelu_worker(void *arg) {
+    tf_gemm_q4_pair_gelu_task *t = (tf_gemm_q4_pair_gelu_task *)arg;
+    const int nb = t->K / 32;
+    const block_q4_0 *gate_rows = (const block_q4_0 *)t->gate->data;
+    const block_q4_0 *up_rows = (const block_q4_0 *)t->up->data;
+    const char *use_2r_env = getenv("TF_FFN_2R4X");
+    int use_2r4x = use_2r_env && atoi(use_2r_env) != 0;
+    const char *use_8x_env = getenv("TF_FFN_8X");
+    int use_8x = !use_8x_env || atoi(use_8x_env) != 0;
+    int r = t->row_start;
+    for (; use_2r4x && r + 1 < t->row_end; r += 2) {
+        const block_q4_0 *g0row = gate_rows + (size_t)r * nb;
+        const block_q4_0 *u0row = up_rows + (size_t)r * nb;
+        const block_q4_0 *g1row = g0row + nb;
+        const block_q4_0 *u1row = u0row + nb;
+        int tok = 0;
+        for (; tok + 3 < t->N; tok += 4) {
+            const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+            const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+            const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+            const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+            float g00, g01, g02, g03, u00, u01, u02, u03;
+            float g10, g11, g12, g13, u10, u11, u12, u13;
+            tf_vec_dot_q4_0_pair_f32_2r4x(g0row, u0row, g1row, u1row,
+                                          x0, x1, x2, x3, t->K,
+                                          &g00, &g01, &g02, &g03, &u00, &u01, &u02, &u03,
+                                          &g10, &g11, &g12, &g13, &u10, &u11, &u12, &u13);
+#if defined(__ARM_FEATURE_SVE)
+            tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok,
+                                  g00, g01, g02, g03, u00, u01, u02, u03);
+            tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r + 1, tok,
+                                  g10, g11, g12, g13, u10, u11, u12, u13);
+#else
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g00, u00);
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g01, u01);
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g02, u02);
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g03, u03);
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g10, u10);
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g11, u11);
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g12, u12);
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g13, u13);
+#endif
+        }
+        for (; tok < t->N; tok++) {
+            const float *x = t->X + (size_t)tok * t->X_stride;
+            float gate, up;
+            tf_vec_dot_q4_0_pair_f32(g0row, u0row, x, t->K, &gate, &up);
+            t->Y[(size_t)tok * t->Y_stride + r] = tf_gelu_mul_fast_scalar(gate, up);
+            tf_vec_dot_q4_0_pair_f32(g1row, u1row, x, t->K, &gate, &up);
+            t->Y[(size_t)tok * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(gate, up);
+        }
+    }
+    for (; r < t->row_end; r++) {
+        const block_q4_0 *grow = gate_rows + (size_t)r * nb;
+        const block_q4_0 *urow = up_rows + (size_t)r * nb;
+        int tok = 0;
+        if (use_8x) {
+            for (; tok + 7 < t->N; tok += 8) {
+                const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+                const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+                const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+                const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+                const float *x4 = t->X + (size_t)(tok + 4) * t->X_stride;
+                const float *x5 = t->X + (size_t)(tok + 5) * t->X_stride;
+                const float *x6 = t->X + (size_t)(tok + 6) * t->X_stride;
+                const float *x7 = t->X + (size_t)(tok + 7) * t->X_stride;
+                float g0, g1, g2, g3, g4, g5, g6, g7;
+                float u0, u1, u2, u3, u4, u5, u6, u7;
+                tf_vec_dot_q4_0_pair_f32_8x(grow, urow, x0, x1, x2, x3,
+                                            x4, x5, x6, x7, t->K,
+                                            &g0, &g1, &g2, &g3, &g4, &g5, &g6, &g7,
+                                            &u0, &u1, &u2, &u3, &u4, &u5, &u6, &u7);
+#if defined(__ARM_FEATURE_SVE)
+                tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok,
+                                      g0, g1, g2, g3, u0, u1, u2, u3);
+                tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok + 4,
+                                      g4, g5, g6, g7, u4, u5, u6, u7);
+#else
+                t->Y[(size_t)(tok + 0) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g0, u0);
+                t->Y[(size_t)(tok + 1) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g1, u1);
+                t->Y[(size_t)(tok + 2) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g2, u2);
+                t->Y[(size_t)(tok + 3) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g3, u3);
+                t->Y[(size_t)(tok + 4) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g4, u4);
+                t->Y[(size_t)(tok + 5) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g5, u5);
+                t->Y[(size_t)(tok + 6) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g6, u6);
+                t->Y[(size_t)(tok + 7) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g7, u7);
+#endif
+            }
+        }
+        for (; tok + 3 < t->N; tok += 4) {
+            const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+            const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+            const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+            const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+            float g0, g1, g2, g3, u0, u1, u2, u3;
+            tf_vec_dot_q4_0_pair_f32_4x(grow, urow, x0, x1, x2, x3, t->K,
+                                        &g0, &g1, &g2, &g3, &u0, &u1, &u2, &u3);
+#if defined(__ARM_FEATURE_SVE)
+            tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok,
+                                  g0, g1, g2, g3, u0, u1, u2, u3);
+#else
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g0, u0);
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g1, u1);
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g2, u2);
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g3, u3);
+#endif
+        }
+        for (; tok < t->N; tok++) {
+            const float *x = t->X + (size_t)tok * t->X_stride;
+            float gate, up;
+            tf_vec_dot_q4_0_pair_f32(grow, urow, x, t->K, &gate, &up);
+            t->Y[(size_t)tok * t->Y_stride + r] = tf_gelu_mul_fast_scalar(gate, up);
+        }
+    }
+    return NULL;
+}
+
+static void tf_dequant_q4_0_rows_to_fp16_bt(uint16_t *bt, const qtensor *mat,
+                                             int row0, int n_rows, int K) {
+    const int nb = K / 32;
+    const block_q4_0 *rows = (const block_q4_0 *)mat->data + (size_t)row0 * nb;
+    for (int rr = 0; rr < n_rows; rr++) {
+        const block_q4_0 *row = rows + (size_t)rr * nb;
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            int base = b * 32;
+            for (int j = 0; j < 16; j++) {
+                uint8_t q = row[b].qs[j];
+                bt[(size_t)(base + j) * n_rows + rr] =
+                    tf_f32_to_f16(((float)((int)(q & 0x0f) - 8)) * d);
+                bt[(size_t)(base + j + 16) * n_rows + rr] =
+                    tf_f32_to_f16(((float)((int)(q >> 4) - 8)) * d);
+            }
+        }
+    }
+}
+
+static int tf_gemm_q4_0_pair_gelu_block_fp16(float *Y_out, const qtensor *gate,
+                                             const qtensor *up, const float *X,
+                                             int n_rows, int N, int out_stride,
+                                             int X_stride) {
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    if (!gemm_fp16_BT) return 0;
+    if (!gate || !up || gate->type != GGML_TYPE_Q4_0 || up->type != GGML_TYPE_Q4_0)
+        return 0;
+    if (gate->n_cols != up->n_cols || gate->n_rows != up->n_rows ||
+        gate->n_cols != X_stride || n_rows != gate->n_rows)
+        return 0;
+    int K = gate->n_cols;
+    if ((K % 32) != 0) return 0;
+
+    const int rb_target = 1024;
+    for (int row0 = 0; row0 < n_rows; row0 += rb_target) {
+        int rb = n_rows - row0;
+        if (rb > rb_target) rb = rb_target;
+        size_t w_elems = (size_t)K * rb;
+        size_t y_elems = (size_t)N * rb;
+        uint16_t *gate_bt = (uint16_t *)malloc(w_elems * sizeof(uint16_t));
+        uint16_t *up_bt = (uint16_t *)malloc(w_elems * sizeof(uint16_t));
+        float *gate_y = (float *)malloc(y_elems * sizeof(float));
+        float *up_y = (float *)malloc(y_elems * sizeof(float));
+        if (!gate_bt || !up_bt || !gate_y || !up_y) {
+            free(gate_bt); free(up_bt); free(gate_y); free(up_y);
+            return 0;
+        }
+
+        tf_dequant_q4_0_rows_to_fp16_bt(gate_bt, gate, row0, rb, K);
+        tf_dequant_q4_0_rows_to_fp16_bt(up_bt, up, row0, rb, K);
+        gemm_fp16_BT(N, K, rb, X, X_stride, gate_bt, rb, gate_y, rb);
+        gemm_fp16_BT(N, K, rb, X, X_stride, up_bt, rb, up_y, rb);
+        tf_gelu_mul_fast(gate_y, gate_y, up_y, (int)y_elems);
+        for (int t = 0; t < N; t++) {
+            memcpy(Y_out + (size_t)t * out_stride + row0,
+                   gate_y + (size_t)t * rb, (size_t)rb * sizeof(float));
+        }
+
+        free(gate_bt); free(up_bt); free(gate_y); free(up_y);
+    }
+    return 1;
+#else
+    (void)Y_out; (void)gate; (void)up; (void)X; (void)n_rows;
+    (void)N; (void)out_stride; (void)X_stride;
+    return 0;
+#endif
+}
+
+static int tf_gemm_q4_0_pair_gelu_tokenmajor(float *Y_out, const qtensor *gate,
+                                             const qtensor *up, const float *X,
+                                             int n_rows, int N, int out_stride,
+                                             int X_stride, int n_threads,
+                                             int check) {
+    if (!gate || !up || gate->type != GGML_TYPE_Q4_0 || up->type != GGML_TYPE_Q4_0)
+        return 0;
+    if (gate->n_cols != up->n_cols || gate->n_rows != up->n_rows ||
+        gate->n_cols != X_stride || n_rows != gate->n_rows)
+        return 0;
+    int K = gate->n_cols;
+    if ((K % 32) != 0) return 0;
+    const char *block_q4 = getenv("TF_FFN_BLOCK_Q4");
+    if (block_q4 && atoi(block_q4) != 0 && N >= 64 &&
+        tf_gemm_q4_0_pair_gelu_block_fp16(Y_out, gate, up, X,
+                                          n_rows, N, out_stride, X_stride))
+        return 1;
+
+    int nt = n_threads;
+    if (nt < 1) nt = 1;
+    if (nt > n_rows) nt = n_rows;
+    if (nt <= 1 || n_rows < 8) {
+        tf_gemm_q4_pair_gelu_task task = {Y_out, gate, up, X, 0, n_rows, K, N, out_stride, X_stride};
+        (void)tf_gemm_q4_0_pair_gelu_worker(&task);
+    } else {
+        pthread_t *threads = (pthread_t *)alloca((size_t)nt * sizeof(pthread_t));
+        tf_gemm_q4_pair_gelu_task *tasks = (tf_gemm_q4_pair_gelu_task *)alloca((size_t)nt * sizeof(tf_gemm_q4_pair_gelu_task));
+        int rows_per = n_rows / nt, extra = n_rows % nt, offset = 0;
+        for (int i = 0; i < nt; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_q4_pair_gelu_task){Y_out, gate, up, X, offset, offset + count,
+                                                   K, N, out_stride, X_stride};
+            offset += count;
+            pthread_create(&threads[i], NULL, tf_gemm_q4_0_pair_gelu_worker, &tasks[i]);
+        }
+        for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+    }
+
+    if (check && N > 0 && n_rows > 0) {
+        const int nb = K / 32;
+        const block_q4_0 *grow = (const block_q4_0 *)gate->data;
+        const block_q4_0 *urow = (const block_q4_0 *)up->data;
+        float g, u;
+        tf_vec_dot_q4_0_pair_f32(grow, urow, X, K, &g, &u);
+        float exact = tf_gelu_mul_exact_scalar(g, u);
+        float fast = Y_out[0];
+        float abs_err = fabsf(fast - exact);
+        float rel_err = abs_err / (fabsf(exact) + 1e-9f);
+        fprintf(stderr, "transformer: TF_FFN_CHECK q4 fused row0 tok0 gate=%.6g up=%.6g fast=%.6g exact=%.6g abs=%.3g rel=%.3g nb=%d\n",
+                g, u, fast, exact, abs_err, rel_err, nb);
+    }
+    return 1;
 }
 
 /* Token-major GEMM: Y[tok * out_stride + row] = dot(W[row,:], X[tok,:])
@@ -4532,43 +5584,50 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
         return;
     }
-    if (mat->type != GGML_TYPE_F16) {
-        /* Fallback for other non-F16/BF16: per-token matvec */
-        int n_cols = mat->n_cols;
-        float *row_buf = (float *)malloc(n_cols * sizeof(float));
-        size_t rb = tf_row_bytes(mat->type, n_cols);
-        for (int t = 0; t < N; t++) {
-            const float *xt = X + (size_t)t * X_stride;
-            for (int r = 0; r < n_rows; r++) {
-                const void *row_data = (const uint8_t *)mat->data + (size_t)r * rb;
-                dequant_row(mat->type, row_data, row_buf, n_cols);
-#if defined(__AVX2__) && defined(__FMA__)
-                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-                int j = 0;
-                for (; j + 31 < n_cols; j += 32) {
-                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j),    _mm256_loadu_ps(xt+j),    a0);
-                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+8),  _mm256_loadu_ps(xt+j+8),  a1);
-                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+16), _mm256_loadu_ps(xt+j+16), a2);
-                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+24), _mm256_loadu_ps(xt+j+24), a3);
-                }
-                for (; j + 7 < n_cols; j += 8)
-                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j), _mm256_loadu_ps(xt+j), a0);
-                a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
-                __m128 hi = _mm256_extractf128_ps(a0, 1), lo = _mm256_castps256_ps128(a0);
-                __m128 s4 = _mm_add_ps(lo, hi);
-                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-                s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
-                float sum = _mm_cvtss_f32(s4);
-                for (; j < n_cols; j++) sum += row_buf[j] * xt[j];
-#else
-                float sum = 0.0f;
-                for (int j = 0; j < n_cols; j++) sum += row_buf[j] * xt[j];
-#endif
-                Y_out[(size_t)t * out_stride + r] = sum;
-            }
+    if (mat->type == GGML_TYPE_Q4_0) {
+        int K = mat->n_cols;
+        int nt = n_threads;
+        if (nt < 1) nt = 1;
+        if (nt > n_rows) nt = n_rows;
+        if (nt <= 1 || n_rows < 8) {
+            tf_gemm_qtensor_tm_task task = {Y_out, mat, X, 0, n_rows, K, N, out_stride, X_stride};
+            (void)tf_gemm_q4_0_tm_worker(&task);
+            return;
         }
-        free(row_buf);
+        pthread_t *threads = (pthread_t *)alloca((size_t)nt * sizeof(pthread_t));
+        tf_gemm_qtensor_tm_task *tasks = (tf_gemm_qtensor_tm_task *)alloca((size_t)nt * sizeof(tf_gemm_qtensor_tm_task));
+        int rows_per = n_rows / nt, extra = n_rows % nt, offset = 0;
+        for (int i = 0; i < nt; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_qtensor_tm_task){Y_out, mat, X, offset, offset + count,
+                                                 K, N, out_stride, X_stride};
+            offset += count;
+            pthread_create(&threads[i], NULL, tf_gemm_q4_0_tm_worker, &tasks[i]);
+        }
+        for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+        return;
+    }
+    if (mat->type != GGML_TYPE_F16) {
+        int K = mat->n_cols;
+        int nt = n_threads;
+        if (nt < 1) nt = 1;
+        if (nt > n_rows) nt = n_rows;
+        if (nt <= 1 || n_rows < 8) {
+            tf_gemm_qtensor_tm_task task = {Y_out, mat, X, 0, n_rows, K, N, out_stride, X_stride};
+            (void)tf_gemm_qtensor_tm_worker(&task);
+            return;
+        }
+        pthread_t *threads = (pthread_t *)alloca((size_t)nt * sizeof(pthread_t));
+        tf_gemm_qtensor_tm_task *tasks = (tf_gemm_qtensor_tm_task *)alloca((size_t)nt * sizeof(tf_gemm_qtensor_tm_task));
+        int rows_per = n_rows / nt, extra = n_rows % nt, offset = 0;
+        for (int i = 0; i < nt; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_qtensor_tm_task){Y_out, mat, X, offset, offset + count,
+                                                 K, N, out_stride, X_stride};
+            offset += count;
+            pthread_create(&threads[i], NULL, tf_gemm_qtensor_tm_worker, &tasks[i]);
+        }
+        for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
         return;
     }
 
@@ -5222,18 +6281,19 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
     double t0p;
 
     /* Allocate batch scratch buffers */
-    float *bx     = (float *)malloc((size_t)N * n_embd * sizeof(float));
-    float *bxb    = (float *)malloc((size_t)N * n_embd * sizeof(float));
-    float *bq     = (float *)malloc((size_t)N * q_dim * sizeof(float));
-    float *bk     = (float *)malloc((size_t)N * kv_dim * sizeof(float));
-    float *bv     = (float *)malloc((size_t)N * kv_dim * sizeof(float));
-    float *bxb2   = (float *)malloc((size_t)N * q_dim * sizeof(float));
-    float *bffn1  = (float *)malloc((size_t)N * n_ff * sizeof(float));
-    float *bffn2  = (float *)malloc((size_t)N * n_ff * sizeof(float));
-    float *bffn3  = (float *)malloc((size_t)N * n_ff * sizeof(float));
+    float *bx     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
+    float *bxb    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
+    float *bq     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * q_dim * sizeof(float));
+    float *bk     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * kv_dim * sizeof(float));
+    float *bv     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * kv_dim * sizeof(float));
+    float *bxb2   = (float *)tf_aligned_alloc_notouch(256, (size_t)N * q_dim * sizeof(float));
+    float *bffn1  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_ff * sizeof(float));
+    float *bffn2  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_ff * sizeof(float));
+    float *bffn3  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_ff * sizeof(float));
 
     /* Per-thread attention score scratch: each thread needs [max_seq_len] */
-    float *batch_att_scratch = (float *)malloc((size_t)m->n_threads * m->max_seq_len * sizeof(float));
+    float *batch_att_scratch = (float *)tf_aligned_alloc_notouch(256,
+        (size_t)m->n_threads * m->max_seq_len * sizeof(float));
 
     /* Copy input embeddings to bx (extract n_embd from embd_stride) */
     for (int t = 0; t < N; t++) {
@@ -5409,6 +6469,306 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
     if (pool_was_alive) tf_pool_start(m);
 
     return m->logits;
+}
+
+static void tf_gemma4_rope_batch(transformer_model *m, transformer_layer *layer,
+                                  float *bq, float *bk, const int *pos,
+                                  int N, int n_heads, int n_kv_heads,
+                                  int hd, int q_dim, int kv_dim) {
+    float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
+    int half = hd / 2;
+    for (int t = 0; t < N; t++) {
+        int p = pos[t];
+        for (int h = 0; h < n_heads; h++) {
+            float *qh = bq + (size_t)t * q_dim + h * hd;
+            for (int j = 0; j < half; j++) {
+                float freq = (float)p * inv_freq[j];
+                float c = cosf(freq), s = sinf(freq);
+                float r0 = qh[j], r1 = qh[j + half];
+                qh[j] = r0 * c - r1 * s;
+                qh[j + half] = r0 * s + r1 * c;
+            }
+        }
+        if (layer->shared_kv_source < 0) {
+            for (int h = 0; h < n_kv_heads; h++) {
+                float *kh = bk + (size_t)t * kv_dim + h * hd;
+                for (int j = 0; j < half; j++) {
+                    float freq = (float)p * inv_freq[j];
+                    float c = cosf(freq), s = sinf(freq);
+                    float r0 = kh[j], r1 = kh[j + half];
+                    kh[j] = r0 * c - r1 * s;
+                    kh[j + half] = r0 * s + r1 * c;
+                }
+            }
+        }
+    }
+}
+
+static void tf_gemma4_raw_v_norm_batch(float *bv, int N, int n_kv_heads,
+                                        int hd, int kv_dim, float eps) {
+    for (int t = 0; t < N; t++) {
+        for (int h = 0; h < n_kv_heads; h++) {
+            float *v = bv + (size_t)t * kv_dim + h * hd;
+            float ss = 0.0f;
+            for (int i = 0; i < hd; i++) ss += v[i] * v[i];
+            ss = 1.0f / sqrtf(ss / hd + eps);
+            for (int i = 0; i < hd; i++) v[i] *= ss;
+        }
+    }
+}
+
+static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *layer,
+                                       float *bq, float *bxb2, const int *pos,
+                                       int N, int kv_src, int n_heads,
+                                       int n_kv_heads, int hd, int q_dim,
+                                       int kv_dim, int gqa) {
+    memset(bxb2, 0, (size_t)N * q_dim * sizeof(float));
+    for (int t = 0; t < N; t++) {
+        int cur_pos = pos[t];
+        int start = 0;
+        int seq_len = cur_pos + 1;
+        if (layer->is_swa && seq_len > m->swa_window_size) {
+            start = cur_pos - m->swa_window_size + 1;
+            seq_len = m->swa_window_size;
+        }
+        for (int h = 0; h < n_heads; h++) {
+            float *qh = bq + (size_t)t * q_dim + h * hd;
+            float *att_h = m->att + (size_t)h * m->max_seq_len;
+            int kv_h = h / gqa;
+            for (int p = 0; p < seq_len; p++) {
+                int abs_pos = start + p;
+                int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                size_t kbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                float score = 0.0f;
+                for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
+                att_h[p] = score;
+            }
+            float max_s = att_h[0];
+            for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
+            float sum_e = 0.0f;
+            for (int p = 0; p < seq_len; p++) {
+                att_h[p] = expf(att_h[p] - max_s);
+                sum_e += att_h[p];
+            }
+            float inv_sum = 1.0f / sum_e;
+            for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
+
+            float *out_h = bxb2 + (size_t)t * q_dim + h * hd;
+            for (int p = 0; p < seq_len; p++) {
+                int abs_pos = start + p;
+                int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                size_t vbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                float w = att_h[p];
+                for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
+            }
+        }
+    }
+}
+
+static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *tokens,
+                                      int n_tokens, int start_pos) {
+    if (!m || !tokens || n_tokens <= 0 || !m->is_gemma4) return NULL;
+    if (m->n_embd_per_layer > 0 || m->per_layer_token_embd.data) {
+        fprintf(stderr, "transformer: Gemma4 batch prefill: PLE models not supported, using token loop\n");
+        return NULL;
+    }
+
+    int N = n_tokens;
+    int n_embd = m->n_embd;
+    int n_heads = m->n_heads;
+    int max_q_dim = n_heads * m->head_dim;
+    int max_kv_dim = 0;
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+        int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
+        int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : m->n_kv_heads;
+        int local_kv_dim = l_kvh * hd;
+        if (local_kv_dim > max_kv_dim) max_kv_dim = local_kv_dim;
+    }
+    if (max_q_dim <= 0 || max_kv_dim <= 0) return NULL;
+
+    int fused_q4_prefill = m->ffn_fused_q4 && m->ffn_gelu_fast;
+    if (fused_q4_prefill) {
+        for (int l = 0; l < m->n_layers; l++) {
+            transformer_layer *layer = &m->layers[l];
+            if (layer->ffn_gate.type != GGML_TYPE_Q4_0 || layer->ffn_up.type != GGML_TYPE_Q4_0 ||
+                layer->ffn_gate.n_rows != m->n_ff || layer->ffn_up.n_rows != m->n_ff ||
+                layer->ffn_gate.n_cols != n_embd || layer->ffn_up.n_cols != n_embd ||
+                (layer->ffn_gate.n_cols % 32) != 0) {
+                fused_q4_prefill = 0;
+                break;
+            }
+        }
+    }
+    if (m->ffn_fused_q4 && !fused_q4_prefill) {
+        fprintf(stderr, "transformer: Gemma4 FFN fused_q4 prefill fallback (requires fast GELU and Q4_0 gate/up)\n");
+    } else if (fused_q4_prefill) {
+        fprintf(stderr, "transformer: Gemma4 FFN fused_q4 prefill active (no bff1/bff2 scratch)\n");
+    }
+
+    int *pos = (int *)tf_aligned_alloc_notouch(256, (size_t)N * sizeof(int));
+    float *bx    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
+    float *bxb   = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
+    float *bq    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_q_dim * sizeof(float));
+    float *bk    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_kv_dim * sizeof(float));
+    float *bv    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_kv_dim * sizeof(float));
+    float *bxb2  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_q_dim * sizeof(float));
+    float *bff1  = fused_q4_prefill ? NULL : (float *)tf_aligned_alloc_notouch(256, (size_t)N * m->n_ff * sizeof(float));
+    float *bff2  = fused_q4_prefill ? NULL : (float *)tf_aligned_alloc_notouch(256, (size_t)N * m->n_ff * sizeof(float));
+    float *bff3  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * m->n_ff * sizeof(float));
+    if (!pos || !bx || !bxb || !bq || !bk || !bv || !bxb2 ||
+        (!fused_q4_prefill && (!bff1 || !bff2)) || !bff3) {
+        fprintf(stderr, "transformer: Gemma4 batch prefill alloc failed (N=%d)\n", N);
+        free(pos); free(bx); free(bxb); free(bq); free(bk); free(bv); free(bxb2);
+        free(bff1); free(bff2); free(bff3);
+        return NULL;
+    }
+
+    for (int t = 0; t < N; t++) {
+        pos[t] = start_pos + t;
+        tf_dequant_row(&m->token_embd, tokens[t], bx + (size_t)t * n_embd);
+        float scale = m->embd_scale;
+        for (int i = 0; i < n_embd; i++) bx[(size_t)t * n_embd + i] *= scale;
+    }
+
+    double t_attn_norm = 0, t_qkv = 0, t_qk_norm = 0, t_rope = 0, t_kv = 0;
+    double t_attn = 0, t_out = 0, t_post = 0, t_ffn_gateup = 0, t_gelu = 0, t_ffn_down = 0;
+    double t0p;
+
+    int pool_was_alive = m->pool_alive;
+    if (pool_was_alive) tf_pool_shutdown(m);
+
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+        int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
+        int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : m->n_kv_heads;
+        int local_kv_dim = l_kvh * hd;
+        int local_q_dim = n_heads * hd;
+        int local_gqa = n_heads / l_kvh;
+        float eps = m->rms_norm_eps;
+
+        t0p = tf_time_ms();
+        tf_rmsnorm_batch(bxb, bx, &layer->attn_norm, n_embd, N, eps, m->matvec_tmp);
+        t_attn_norm += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_gemm_f16_mt_tokenmajor(bq, &layer->attn_q, bxb, local_q_dim, N, local_q_dim, n_embd, m->n_threads);
+        int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
+        if (layer->shared_kv_source < 0) {
+            tf_gemm_f16_mt_tokenmajor(bk, &layer->attn_k, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
+            if (layer->has_v_proj) {
+                tf_gemm_f16_mt_tokenmajor(bv, &layer->attn_v, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
+            } else {
+                memcpy(bv, bk, (size_t)N * local_kv_dim * sizeof(float));
+            }
+        }
+        t_qkv += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_qk_norm_batch(bq, n_heads, hd, N, &layer->attn_q_norm, eps, m->matvec_tmp);
+        if (layer->shared_kv_source < 0) {
+            tf_qk_norm_batch(bk, l_kvh, hd, N, &layer->attn_k_norm, eps, m->matvec_tmp);
+            if (layer->attn_v_norm.data)
+                tf_qk_norm_batch(bv, l_kvh, hd, N, &layer->attn_v_norm, eps, m->matvec_tmp);
+            else
+                tf_gemma4_raw_v_norm_batch(bv, N, l_kvh, hd, local_kv_dim, eps);
+        }
+        t_qk_norm += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_gemma4_rope_batch(m, layer, bq, bk, pos, N, n_heads, l_kvh, hd, local_q_dim, local_kv_dim);
+        t_rope += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        if (layer->shared_kv_source < 0) {
+            for (int t = 0; t < N; t++) {
+                int slot = layer->is_swa ? (pos[t] % m->swa_window_size) : pos[t];
+                tf_kv_store(m, l, (size_t)slot * local_kv_dim,
+                            bk + (size_t)t * local_kv_dim, local_kv_dim);
+                tf_kv_store_value(m, l, (size_t)slot * local_kv_dim,
+                                  bv + (size_t)t * local_kv_dim, local_kv_dim);
+            }
+        }
+        t_kv += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_gemma4_attention_batch(m, layer, bq, bxb2, pos, N, kv_src, n_heads,
+                                  l_kvh, hd, local_q_dim, local_kv_dim, local_gqa);
+        t_attn += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_gemm_f16_mt_tokenmajor(bxb, &layer->attn_output, bxb2, n_embd, N, n_embd, local_q_dim, m->n_threads);
+        t_out += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_rmsnorm_batch(bxb, bxb, &layer->post_attention_norm, n_embd, N, eps, m->matvec_tmp);
+        for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
+        tf_rmsnorm_batch(bxb, bx, &layer->ffn_norm, n_embd, N, eps, m->matvec_tmp);
+        t_post += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        if (fused_q4_prefill &&
+            tf_gemm_q4_0_pair_gelu_tokenmajor(bff3, &layer->ffn_gate, &layer->ffn_up,
+                                               bxb, m->n_ff, N, m->n_ff, n_embd,
+                                               m->n_threads, m->ffn_check && l == 0)) {
+            t_ffn_gateup += tf_time_ms() - t0p;
+        } else {
+            tf_gemm_f16_mt_tokenmajor(bff1, &layer->ffn_gate, bxb, m->n_ff, N, m->n_ff, n_embd, m->n_threads);
+            tf_gemm_f16_mt_tokenmajor(bff2, &layer->ffn_up, bxb, m->n_ff, N, m->n_ff, n_embd, m->n_threads);
+            t_ffn_gateup += tf_time_ms() - t0p;
+
+            t0p = tf_time_ms();
+            tf_gelu_mul(bff3, bff1, bff2, N * m->n_ff, m->ffn_gelu_fast);
+            t_gelu += tf_time_ms() - t0p;
+        }
+
+        t0p = tf_time_ms();
+        tf_gemm_f16_mt_tokenmajor(bxb, &layer->ffn_down, bff3, n_embd, N, n_embd, m->n_ff, m->n_threads);
+        tf_rmsnorm_batch(bxb, bxb, &layer->post_ffw_norm, n_embd, N, eps, m->matvec_tmp);
+        for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
+        if (layer->layer_output_scale.data) {
+            float scale_val;
+            dequant_row(layer->layer_output_scale.type, layer->layer_output_scale.data, &scale_val, 1);
+            for (int t = 0; t < N; t++) {
+                float *xt = bx + (size_t)t * n_embd;
+                for (int i = 0; i < n_embd; i++) xt[i] *= scale_val;
+            }
+        }
+        t_ffn_down += tf_time_ms() - t0p;
+    }
+
+    float *last = bx + (size_t)(N - 1) * n_embd;
+    tf_rmsnorm(m->x, last, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+    tf_qmatvec_pool(m, m->logits, &m->output, m->x, m->n_vocab);
+    if (m->final_logit_softcapping > 0.0f)
+        tf_logit_softcap(m->logits, m->n_vocab, m->final_logit_softcapping);
+
+    double total = t_attn_norm + t_qkv + t_qk_norm + t_rope + t_kv + t_attn + t_out + t_post + t_ffn_gateup + t_gelu + t_ffn_down;
+    fprintf(stderr, "\n  === Gemma4 Batch Prefill Profile (%d tokens x %d layers) ===\n", N, m->n_layers);
+    fprintf(stderr, "  attn_norm: %8.1f ms\n", t_attn_norm);
+    fprintf(stderr, "  QKV GEMM:  %8.1f ms\n", t_qkv);
+    fprintf(stderr, "  QK/V norm: %8.1f ms\n", t_qk_norm);
+    fprintf(stderr, "  RoPE:      %8.1f ms\n", t_rope);
+    fprintf(stderr, "  KV store:  %8.1f ms\n", t_kv);
+    fprintf(stderr, "  attention: %8.1f ms\n", t_attn);
+    fprintf(stderr, "  out proj:  %8.1f ms\n", t_out);
+    fprintf(stderr, "  post/norm: %8.1f ms\n", t_post);
+    fprintf(stderr, "  FFN gate/up:%7.1f ms%s\n", t_ffn_gateup, fused_q4_prefill ? " (fused q4+gelu)" : "");
+    fprintf(stderr, "  GELU/mul:  %8.1f ms (%s)\n", t_gelu, m->ffn_gelu_fast ? "fast" : "exact");
+    fprintf(stderr, "  FFN down:  %8.1f ms\n", t_ffn_down);
+    fprintf(stderr, "  TOTAL:     %8.1f ms (%.2f tok/s)\n\n", total, total > 0 ? (1000.0 * N / total) : 0.0);
+
+    if (pool_was_alive) tf_pool_start(m);
+    free(pos); free(bx); free(bxb); free(bq); free(bk); free(bv); free(bxb2);
+    free(bff1); free(bff2); free(bff3);
+    return m->logits;
+}
+
+float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens,
+                                int n_tokens, int start_pos) {
+    if (!m || !tokens || n_tokens <= 0) return NULL;
+    if (m->is_gemma4) return tf_gemma4_prefill_batch(m, tokens, n_tokens, start_pos);
+    return NULL;
 }
 
 /* Top-k sampling with temperature */

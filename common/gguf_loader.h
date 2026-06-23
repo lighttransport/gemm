@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -144,6 +145,7 @@ typedef struct {
 } gguf_context;
 
 gguf_context *gguf_open(const char *path, int use_mmap);
+gguf_context *gguf_open_multi(const char *path, int use_mmap);
 void gguf_close(gguf_context *ctx);
 const char *gguf_tensor_name(const gguf_context *ctx, int i);
 void *gguf_tensor_data(const gguf_context *ctx, int i);
@@ -462,11 +464,33 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         }
         if (getenv("NUMA_DISTRIBUTE")) {
             /* NUMA mode: keep fd open for parallel pread later.
-             * Don't fread here — let transformer_numa_distribute() do
-             * parallel pread so first-touch places pages on correct CMG. */
+             * Large tensors are loaded later by transformer_numa_setup()
+             * so first-touch places pages on the consuming CMG. Small tensors
+             * may be copied during transformer_load(), so load them eagerly. */
             ctx->fd = fileno(f);
             /* Duplicate fd since fclose will close it */
             ctx->fd = dup(ctx->fd);
+            {
+                size_t eager_limit = 16 * 1024 * 1024;
+                const char *env = getenv("NUMA_EAGER_TENSOR_BYTES");
+                if (env) eager_limit = (size_t)atoll(env);
+                for (uint64_t i = 0; i < ctx->n_tensors; i++) {
+                    size_t sz = gguf_tensor_size(ctx, (int)i);
+                    if (sz == 0) continue;
+                    if (ctx->tensors[i].n_dims <= 1 || sz <= eager_limit) {
+                        uint8_t *dst = ctx->data + ctx->tensors[i].offset;
+                        size_t off = 0;
+                        while (off < sz) {
+                            size_t chunk = sz - off;
+                            if (chunk > 1024 * 1024) chunk = 1024 * 1024;
+                            ssize_t n = pread(ctx->fd, dst + off, chunk,
+                                              (off_t)(ctx->data_offset + ctx->tensors[i].offset + off));
+                            if (n <= 0) goto fail;
+                            off += (size_t)n;
+                        }
+                    }
+                }
+            }
             fclose(f); f = NULL;
         } else {
             fseek(f, (long)ctx->data_offset, SEEK_SET);
@@ -482,6 +506,10 @@ fail:
     if (f) fclose(f);
     gguf_close(ctx);
     return NULL;
+}
+
+gguf_context *gguf_open_multi(const char *path, int use_mmap) {
+    return gguf_open(path, use_mmap);
 }
 
 void gguf_close(gguf_context *ctx) {
@@ -504,6 +532,9 @@ void gguf_close(gguf_context *ctx) {
         if (ctx->fd > 0) close(ctx->fd);
 #endif
     } else {
+#ifndef _WIN32
+        if (ctx->fd > 0) close(ctx->fd);
+#endif
         free(ctx->data);
     }
     free(ctx);

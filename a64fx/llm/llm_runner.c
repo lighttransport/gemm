@@ -118,11 +118,54 @@ static const char *gguf_get_kv_string(const gguf_context *g, const char *key) {
     return g->kv[idx].value.str.str;
 }
 
+static int is_gemma4_model(const gguf_context *g) {
+    return g && gguf_find_key(g, "gemma4.block_count") >= 0;
+}
+
+static int vocab_token_id(const bpe_vocab *vocab, const char *text) {
+    if (!vocab || !text) return -1;
+    return bpe_hm_get(&vocab->token_to_id, text, (int)strlen(text));
+}
+
+static int add_bos_if_needed(const gguf_context *g, const bpe_vocab *vocab,
+                             int32_t *tokens, int n_tokens, int cap) {
+    if (!is_gemma4_model(g) || !vocab || vocab->bos_id < 0) return n_tokens;
+    if (!tokens || n_tokens < 0 || n_tokens >= cap) return n_tokens;
+    memmove(tokens + 1, tokens, (size_t)n_tokens * sizeof(int32_t));
+    tokens[0] = vocab->bos_id;
+    return n_tokens + 1;
+}
+
+static int gemma4_should_stop(const gguf_context *g, const bpe_vocab *vocab, int32_t token) {
+    if (token == vocab->eos_id || token == vocab->eot_id) return 1;
+    if (!is_gemma4_model(g)) return 0;
+    int turn_id = vocab_token_id(vocab, "<turn|>");
+    return token == turn_id || token == 106;
+}
+
+static int gemma4_is_protocol_token(const gguf_context *g, const bpe_vocab *vocab, int32_t token) {
+    if (!is_gemma4_model(g)) return 0;
+    const char *s = bpe_token_to_str(vocab, token);
+    if (!s) return 0;
+    return !strncmp(s, "<|", 2) || strstr(s, "|>") != NULL || !strcmp(s, "<turn|>");
+}
+
 static void build_chat_prompt(const gguf_context *gguf_main,
                               const char *user_prompt,
                               int have_vision,
                               char *text_before, size_t cap_before,
                               char *text_after,  size_t cap_after) {
+    if (is_gemma4_model(gguf_main)) {
+        if (have_vision) {
+            snprintf(text_before, cap_before, "<|turn>user\n<|image>");
+            snprintf(text_after,  cap_after,  "<image|>%s<turn|>\n<|turn>model\n", user_prompt);
+        } else {
+            snprintf(text_before, cap_before, "<|turn>user\n%s<turn|>\n<|turn>model\n", user_prompt);
+            text_after[0] = '\0';
+        }
+        return;
+    }
+
     const char *tmpl = gguf_get_kv_string(gguf_main, "tokenizer.chat_template");
     int has_chatml = tmpl &&
                      strstr(tmpl, "<|im_start|>") &&
@@ -350,6 +393,7 @@ static char *run_text_generation(gguf_context *gguf_main,
     int tok_cap = model->max_seq_len > 256 ? model->max_seq_len : 256;
     int32_t *tokens_before = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
     int n_before = bpe_tokenize(vocab, text_before, -1, tokens_before, tok_cap);
+    n_before = add_bos_if_needed(gguf_main, vocab, tokens_before, n_before, tok_cap);
     free(text_before); free(text_after);
     if (!tokens_before || n_before <= 0) {
         free(tokens_before);
@@ -404,9 +448,13 @@ static char *run_text_generation(gguf_context *gguf_main,
             if (logits[j] > logits[next]) next = j;
         }
         dump_logit_stats(logits, model->n_vocab, g, next);
-        if (next == vocab->eos_id || next == vocab->eot_id) {
+        if (gemma4_should_stop(gguf_main, vocab, next)) {
             finish = "stop";
             break;
+        }
+        if (gemma4_is_protocol_token(gguf_main, vocab, next)) {
+            n_gen++;
+            continue;
         }
         char *piece = decode_token_text(vocab, next);
         if (!piece) {
@@ -641,9 +689,15 @@ int main(int argc, char **argv) {
     transformer_model *model = transformer_load(gguf_main, max_seq_len);
     if (!model) { fprintf(stderr, "transformer_load failed\n"); return 1; }
     if (llm_threads > 1) transformer_set_threads(model, llm_threads);
+    transformer_numa_setup(model, gguf_main);
     /* Build A64FX panel layout after the (pinned) thread pool exists so each
      * panel's row blocks are first-touched onto the consuming core's CMG. */
-    transformer_build_panels(model);
+    const char *no_panel = getenv("TF_NO_PANEL");
+    if (no_panel && atoi(no_panel) != 0) {
+        fprintf(stderr, "      panels: disabled by TF_NO_PANEL\n");
+    } else {
+        transformer_build_panels(model);
+    }
     fprintf(stderr, "      n_embd=%d n_layers=%d n_heads=%d n_vocab=%d (%.3f s)\n",
             model->n_embd, model->n_layers, model->n_heads, model->n_vocab,
             mono_sec() - t);
@@ -769,6 +823,7 @@ int main(int argc, char **argv) {
     int32_t *tokens_before = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
     int32_t *tokens_after  = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
     int n_before = bpe_tokenize(vocab, text_before, -1, tokens_before, tok_cap);
+    n_before = add_bos_if_needed(gguf_main, vocab, tokens_before, n_before, tok_cap);
     int n_after  = text_after[0] ? bpe_tokenize(vocab, text_after, -1, tokens_after, tok_cap) : 0;
 
     int total_prompt = n_before + n_vision_tokens + n_after;
@@ -887,11 +942,15 @@ int main(int argc, char **argv) {
 
         dump_logit_stats(logits, model->n_vocab, g, next);
 
-        if (next == vocab->eos_id || next == vocab->eot_id) {
+        if (gemma4_should_stop(gguf_main, vocab, next)) {
             fprintf(stderr, "\n[eos %d]\n", next);
             if (!getenv("TF_NO_EOS_STOP")) break;
         }
 
+        if (gemma4_is_protocol_token(gguf_main, vocab, next)) {
+            n_gen++;
+            continue;
+        }
         const char *tok_str = bpe_token_to_str(vocab, next);
         if (tok_str) {
             int dec_len = 0;
