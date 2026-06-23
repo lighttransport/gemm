@@ -31,12 +31,13 @@ WORK="$GLM5/prefill_fp8_run_${JOB_TAG}_384n_noncontig"
 export GLM5_MODEL_DIR=${GLM5_MODEL_DIR:-$HOME/models/glm52-fp8}
 export GLM5_STAGE_DIR=${GLM5_STAGE_DIR:-/local/glm5_fp8_prefill_$JOB_TAG}
 export GLM5_NSHARDS=141
-# data-parallel groups: split NP ranks into GROUPS independent models of NP/GROUPS ranks each.
+# data-parallel groups: split NP ranks into NGRP independent models of NP/NGRP ranks each.
 # GLM5_EP_SIZE is the group size so glm5_stage shards experts group-locally; the runner reads
-# GLM5_PREFILL_GROUPS. GROUPS=1 reproduces the original single 384-EP behaviour.
-GROUPS=${GLM5_PREFILL_GROUPS:-1}
-export GLM5_EP_SIZE=$((NP/GROUPS))
-export GLM5_PREFILL_GROUPS=$GROUPS
+# GLM5_PREFILL_GROUPS. NGRP=1 reproduces the original single 384-EP behaviour.
+# NOTE: do not name this 'GROUPS' -- that is a reserved bash array (user's group ids).
+NGRP=${GLM5_PREFILL_GROUPS:-1}
+export GLM5_EP_SIZE=$((NP/NGRP))
+export GLM5_PREFILL_GROUPS=$NGRP
 export GLM5_STATUS_DIR="$WORK"
 export GLM5_TP=${GLM5_TP:-1}
 export GLM5_TP_SHARED=${GLM5_TP_SHARED:-0}
@@ -85,8 +86,8 @@ if [ "${GLM5_TOPO_ONLY:-0}" = 1 ]; then
     exit 0
 fi
 
-echo "--- staging FP8 model -> $GLM5_STAGE_DIR ($(date)) ---"
-GLM5_STAGE_LAYERS=$STAGE_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_stage" || { echo "FATAL: stage"; exit 4; }
+echo "--- staging FP8 model -> $GLM5_STAGE_DIR (ep_size=$GLM5_EP_SIZE groups=$NGRP) ($(date)) ---"
+GLM5_STAGE_LAYERS=$STAGE_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_stage" 2>"$WORK/stage_stderr.txt" || { echo "FATAL: stage (last stderr below)"; tail -25 "$WORK/stage_stderr.txt" 2>/dev/null; exit 4; }
 echo "staged ranks: $(ls "$WORK"/glm5_stage_rank*.txt 2>/dev/null | wc -l)/$NP ($(date))"
 cat "$WORK"/glm5_stage_rank*.txt 2>/dev/null | sort | tail -12
 
