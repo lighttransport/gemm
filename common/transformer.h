@@ -856,6 +856,7 @@ static inline float tf_vec_dot_q4_0_f32(const block_q4_0 *row, const float *x, i
     svfloat32_t acc = svdup_f32(0.0f);
     svbool_t pg = svptrue_b32();
     int nb = n_cols / 32;
+    if (nb > 0) __builtin_prefetch(row->qs, 0, 0);
     for (int b = 0; b < nb; b++) {
         const float d = ggml_fp16_to_fp32(row[b].d);
         const int base = b * 32;
@@ -866,6 +867,7 @@ static inline float tf_vec_dot_q4_0_f32(const block_q4_0 *row, const float *x, i
         svfloat32_t whi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qhi), d);
         acc = svmla_x(pg, acc, wlo, svld1(pg, x + base));
         acc = svmla_x(pg, acc, whi, svld1(pg, x + base + 16));
+        if (b + 1 < nb) __builtin_prefetch(row[b+1].qs, 0, 0);
     }
     return svaddv_f32(pg, acc);
 #else
@@ -884,6 +886,135 @@ static inline float tf_vec_dot_q4_0_f32(const block_q4_0 *row, const float *x, i
 #endif
 }
 
+/* Batched Q4_0 matvec: compute 4 dot products with shared activation load.
+ * Loads activation x once from L1, amortizes across 4 weight rows from L2.
+ * Reduces activation memory traffic by 4x vs per-row calls (144 B/row -> 36 B/row for 2048 cols). */
+static inline void tf_vec_dot_q4_0_f32_4row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(r0->qs, 0, 0);
+        __builtin_prefetch(r1->qs, 0, 0);
+        __builtin_prefetch(r2->qs, 0, 0);
+        __builtin_prefetch(r3->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        int base = b * 32;
+        svfloat32_t x_lo = svld1(pg, x + base);
+        svfloat32_t x_hi = svld1(pg, x + base + 16);
+
+#define TF_Q4_DOT_ROW(acc, row) do { \
+    float d__ = ggml_fp16_to_fp32(row[b].d); \
+    svuint32_t q__ = svld1ub_u32(pg, row[b].qs); \
+    svint32_t ql__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q__, 0x0f)), 8); \
+    svint32_t qh__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q__, 4)), 8); \
+    svfloat32_t wl__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, ql__), d__); \
+    svfloat32_t wh__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qh__), d__); \
+    acc = svmla_x(pg, acc, wl__, x_lo); \
+    acc = svmla_x(pg, acc, wh__, x_hi); \
+} while(0)
+
+        TF_Q4_DOT_ROW(a0, r0); TF_Q4_DOT_ROW(a1, r1);
+        TF_Q4_DOT_ROW(a2, r2); TF_Q4_DOT_ROW(a3, r3);
+#undef TF_Q4_DOT_ROW
+        if (b + 1 < nb) {
+            __builtin_prefetch(r0[b+1].qs, 0, 0);
+            __builtin_prefetch(r1[b+1].qs, 0, 0);
+            __builtin_prefetch(r2[b+1].qs, 0, 0);
+            __builtin_prefetch(r3[b+1].qs, 0, 0);
+        }
+    }
+    dst[0] = svaddv_f32(pg, a0);
+    dst[1] = svaddv_f32(pg, a1);
+    dst[2] = svaddv_f32(pg, a2);
+    dst[3] = svaddv_f32(pg, a3);
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+#endif
+}
+
+/* 8-row Q4_0 matvec: compute 8 dot products with shared activation load.
+ * Doubles compute-to-load ratio vs 4-row: 8 FMAs per activation block load.
+ * A64FX has 32 SVE registers @ 512-bit = 2048 bytes; 8 accumulators x 4 vectors
+ * = 32 regs, with wl/wh/temps spilling to stack. May be register-bound. */
+static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(r0->qs, 0, 0);
+        __builtin_prefetch(r1->qs, 0, 0);
+        __builtin_prefetch(r2->qs, 0, 0);
+        __builtin_prefetch(r3->qs, 0, 0);
+        __builtin_prefetch(r4->qs, 0, 0);
+        __builtin_prefetch(r5->qs, 0, 0);
+        __builtin_prefetch(r6->qs, 0, 0);
+        __builtin_prefetch(r7->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        int base = b * 32;
+        svfloat32_t x_lo = svld1(pg, x + base);
+        svfloat32_t x_hi = svld1(pg, x + base + 16);
+
+#define TF_Q4_DOT_ROW(acc, row) do { \
+    float d__ = ggml_fp16_to_fp32(row[b].d); \
+    svuint32_t q__ = svld1ub_u32(pg, row[b].qs); \
+    svint32_t ql__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q__, 0x0f)), 8); \
+    svint32_t qh__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q__, 4)), 8); \
+    svfloat32_t wl__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, ql__), d__); \
+    svfloat32_t wh__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qh__), d__); \
+    acc = svmla_x(pg, acc, wl__, x_lo); \
+    acc = svmla_x(pg, acc, wh__, x_hi); \
+} while(0)
+
+        TF_Q4_DOT_ROW(a0,r0);TF_Q4_DOT_ROW(a1,r1);
+        TF_Q4_DOT_ROW(a2,r2);TF_Q4_DOT_ROW(a3,r3);
+        TF_Q4_DOT_ROW(a4,r4);TF_Q4_DOT_ROW(a5,r5);
+        TF_Q4_DOT_ROW(a6,r6);TF_Q4_DOT_ROW(a7,r7);
+#undef TF_Q4_DOT_ROW
+        if (b + 1 < nb) {
+            __builtin_prefetch(r0[b+1].qs, 0, 0);
+            __builtin_prefetch(r1[b+1].qs, 0, 0);
+            __builtin_prefetch(r2[b+1].qs, 0, 0);
+            __builtin_prefetch(r3[b+1].qs, 0, 0);
+            __builtin_prefetch(r4[b+1].qs, 0, 0);
+            __builtin_prefetch(r5[b+1].qs, 0, 0);
+            __builtin_prefetch(r6[b+1].qs, 0, 0);
+            __builtin_prefetch(r7[b+1].qs, 0, 0);
+        }
+    }
+    dst[0]=svaddv_f32(pg,a0);dst[1]=svaddv_f32(pg,a1);
+    dst[2]=svaddv_f32(pg,a2);dst[3]=svaddv_f32(pg,a3);
+    dst[4]=svaddv_f32(pg,a4);dst[5]=svaddv_f32(pg,a5);
+    dst[6]=svaddv_f32(pg,a6);dst[7]=svaddv_f32(pg,a7);
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+    dst[4] = tf_vec_dot_q4_0_f32(r4, x, n_cols);
+    dst[5] = tf_vec_dot_q4_0_f32(r5, x, n_cols);
+    dst[6] = tf_vec_dot_q4_0_f32(r6, x, n_cols);
+    dst[7] = tf_vec_dot_q4_0_f32(r7, x, n_cols);
+#endif
+}
+
 static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
                                            const float *x0, const float *x1,
                                            const float *x2, const float *x3,
@@ -894,6 +1025,7 @@ static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
     svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
     svbool_t pg = svptrue_b32();
     int nb = n_cols / 32;
+    if (nb > 0) __builtin_prefetch(row->qs, 0, 0);
     for (int b = 0; b < nb; b++) {
         const float d = ggml_fp16_to_fp32(row[b].d);
         const int base = b * 32;
@@ -910,6 +1042,7 @@ static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
         a2 = svmla_x(pg, a2, whi, svld1(pg, x2 + base + 16));
         a3 = svmla_x(pg, a3, wlo, svld1(pg, x3 + base));
         a3 = svmla_x(pg, a3, whi, svld1(pg, x3 + base + 16));
+        if (b + 1 < nb) __builtin_prefetch(row[b+1].qs, 0, 0);
     }
     *s0 = svaddv_f32(pg, a0);
     *s1 = svaddv_f32(pg, a1);
@@ -925,7 +1058,30 @@ static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
 
 static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                   const float *x, int n_cols, int row_start, int row_end) {
-    for (int i = row_start; i < row_end; i++) {
+    int i = row_start;
+#if defined(__ARM_FEATURE_SVE)
+    for (; i + 7 < row_end; i += 8) {
+        tf_vec_dot_q4_0_f32_8row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+4) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+5) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+6) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+7) * row_bytes),
+            x, n_cols);
+    }
+    for (; i + 3 < row_end; i += 4) {
+        tf_vec_dot_q4_0_f32_4row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            x, n_cols);
+    }
+#endif
+    for (; i < row_end; i++) {
         const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)i * row_bytes);
         dst[i] = tf_vec_dot_q4_0_f32(row, x, n_cols);
     }
@@ -5041,6 +5197,10 @@ static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
     svfloat32_t ag = svdup_f32(0.0f), au = svdup_f32(0.0f);
     svbool_t pg = svptrue_b32();
     int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate->qs, 0, 0);
+        __builtin_prefetch(up->qs, 0, 0);
+    }
     for (int b = 0; b < nb; b++) {
         const int base = b * 32;
         svfloat32_t xlo = svld1(pg, x + base);
@@ -5059,6 +5219,10 @@ static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
         float du = ggml_fp16_to_fp32(up[b].d);
         au = svmla_x(pg, au, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du), xlo);
         au = svmla_x(pg, au, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du), xhi);
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate[b+1].qs, 0, 0);
+            __builtin_prefetch(up[b+1].qs, 0, 0);
+        }
     }
     *sg = svaddv_f32(pg, ag);
     *su = svaddv_f32(pg, au);
@@ -5099,6 +5263,10 @@ static inline void tf_vec_dot_q4_0_pair_f32_4x(const block_q4_0 *gate,
     svfloat32_t au2 = svdup_f32(0.0f), au3 = svdup_f32(0.0f);
     svbool_t pg = svptrue_b32();
     int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate->qs, 0, 0);
+        __builtin_prefetch(up->qs, 0, 0);
+    }
     for (int b = 0; b < nb; b++) {
         const int base = b * 32;
         svfloat32_t x0lo = svld1(pg, x0 + base);
@@ -5131,6 +5299,10 @@ static inline void tf_vec_dot_q4_0_pair_f32_4x(const block_q4_0 *gate,
         au1 = svmla_x(pg, au1, wulo, x1lo); au1 = svmla_x(pg, au1, wuhi, x1hi);
         au2 = svmla_x(pg, au2, wulo, x2lo); au2 = svmla_x(pg, au2, wuhi, x2hi);
         au3 = svmla_x(pg, au3, wulo, x3lo); au3 = svmla_x(pg, au3, wuhi, x3hi);
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate[b+1].qs, 0, 0);
+            __builtin_prefetch(up[b+1].qs, 0, 0);
+        }
     }
     *g0 = svaddv_f32(pg, ag0); *g1 = svaddv_f32(pg, ag1);
     *g2 = svaddv_f32(pg, ag2); *g3 = svaddv_f32(pg, ag3);
@@ -5170,6 +5342,12 @@ static inline void tf_vec_dot_q4_0_pair_f32_2r4x(const block_q4_0 *gate0,
     svfloat32_t au12 = svdup_f32(0.0f), au13 = svdup_f32(0.0f);
     svbool_t pg = svptrue_b32();
     int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate0->qs, 0, 0);
+        __builtin_prefetch(up0->qs, 0, 0);
+        __builtin_prefetch(gate1->qs, 0, 0);
+        __builtin_prefetch(up1->qs, 0, 0);
+    }
     for (int b = 0; b < nb; b++) {
         const int base = b * 32;
         svfloat32_t x0lo = svld1(pg, x0 + base), x0hi = svld1(pg, x0 + base + 16);
@@ -5202,6 +5380,12 @@ static inline void tf_vec_dot_q4_0_pair_f32_2r4x(const block_q4_0 *gate0,
         TF_Q4_ACC_ROW(gate0, up0, ag00, ag01, ag02, ag03, au00, au01, au02, au03);
         TF_Q4_ACC_ROW(gate1, up1, ag10, ag11, ag12, ag13, au10, au11, au12, au13);
 #undef TF_Q4_ACC_ROW
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate0[b+1].qs, 0, 0);
+            __builtin_prefetch(up0[b+1].qs, 0, 0);
+            __builtin_prefetch(gate1[b+1].qs, 0, 0);
+            __builtin_prefetch(up1[b+1].qs, 0, 0);
+        }
     }
     *g00 = svaddv_f32(pg, ag00); *g01 = svaddv_f32(pg, ag01);
     *g02 = svaddv_f32(pg, ag02); *g03 = svaddv_f32(pg, ag03);
@@ -5245,6 +5429,10 @@ static inline void tf_vec_dot_q4_0_pair_f32_8x(const block_q4_0 *gate,
     svfloat32_t au6 = svdup_f32(0.0f), au7 = svdup_f32(0.0f);
     svbool_t pg = svptrue_b32();
     int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate->qs, 0, 0);
+        __builtin_prefetch(up->qs, 0, 0);
+    }
     for (int b = 0; b < nb; b++) {
         const int base = b * 32;
         svuint32_t qg = svld1ub_u32(pg, gate[b].qs);
@@ -5277,6 +5465,10 @@ static inline void tf_vec_dot_q4_0_pair_f32_8x(const block_q4_0 *gate,
         TF_Q4_ACC_TOKEN(6, x6, ag6, au6);
         TF_Q4_ACC_TOKEN(7, x7, ag7, au7);
 #undef TF_Q4_ACC_TOKEN
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate[b+1].qs, 0, 0);
+            __builtin_prefetch(up[b+1].qs, 0, 0);
+        }
     }
     *g0 = svaddv_f32(pg, ag0); *g1 = svaddv_f32(pg, ag1);
     *g2 = svaddv_f32(pg, ag2); *g3 = svaddv_f32(pg, ag3);
