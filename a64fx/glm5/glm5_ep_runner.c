@@ -136,6 +136,52 @@ static void barrier_robust(int robust){
  * retry's usleep granularity costs nothing here. */
 static void barrier(void){ barrier_robust(1); }
 
+/* ===================== data-parallel groups ===================== */
+/* The N global ranks are split into G independent groups of GSize contiguous ranks; each group is a
+ * complete EP model (ep_size=GSize) prefilling its own sequence. Per-sequence collectives are scoped
+ * to the group (group-local tp_comm + gbarrier) so groups run fully async; only the bootstrap/final
+ * barrier is global. gbarrier uses a slot region disjoint from the global barrier's. */
+static int GId, GBase, GSize=1, GRank;
+static size_t GBAR_BASE;
+static uint64_t Gt=1;
+static inline size_t gbar_recv_off(int s){ return GBAR_BASE+(size_t)s*SlotB; }
+static inline size_t gbar_go_off(void)   { return GBAR_BASE+(size_t)N*SlotB; }
+static void gbarrier(void){
+    if(GSize<=1){ return; }
+    uint64_t t=++Gt; char*sb=Region+SEND_OFF; int root=GBase;
+    if(MyRank==root){
+        for(int s=1;s<GSize;s++) wait_ge((volatile uint64_t*)(Region+gbar_recv_off(s)),t,"gbarrier fan-in");
+        for(int s=1;s<GSize;s++){ *(volatile uint64_t*)sb=t; put_issue(PeerVcq[root+s],Base+SEND_OFF,PeerBase[root+s]+gbar_go_off(),8,1); }
+    } else {
+        volatile uint64_t*go=(volatile uint64_t*)(Region+gbar_go_off()); double ts=now_sec();
+        do{ *(volatile uint64_t*)sb=t; put_issue(PeerVcq[root],Base+SEND_OFF,PeerBase[root]+gbar_recv_off(GRank),8,1);
+            for(int a=0;a<50&&*go<t;a++) usleep(2000);
+            if(now_sec()-ts>WAIT_TIMEOUT_SEC) die("gbarrier timeout",-1);
+        }while(*go<t);
+    }
+}
+/* Pick the largest group count G in {4,2,1} (dividing N) whose per-group Tier-A KV budget holds the
+ * target context un-sharded. Mirrors glm5_kv_init's MemAvailable budget, but at ep_size=GSize (the
+ * per-rank weight footprint grows as groups shrink, so smaller groups have a lower context ceiling). */
+static int pick_groups(const glm5_config*cfg,int n,int target_ctx){
+    int KVD=glm5_kv_cache_dim(cfg), ID=cfg->index_dim;
+    int n_dense=cfg->n_dense_layers<cfg->n_layers?cfg->n_dense_layers:cfg->n_layers;
+    int n_moe=cfg->n_layers-n_dense;
+    long per_pos=(long)cfg->n_layers*KVD*2 + (long)n_moe*ID*2; if(per_pos<1)per_pos=1;
+    long avail=glm5_meminfo_bytes("MemAvailable");
+    if(avail<=0 || target_ctx<=0) return 1;            /* can't decide -> safe single group */
+    int cands[3]={4,2,1};
+    for(int i=0;i<3;i++){
+        int G=cands[i]; if(n%G) continue; int gsize=n/G;
+        glm5_config tiny=*cfg; tiny.max_pos=128;        /* KV/rope negligible -> ~weights at ep_size */
+        long reserve=(long)glm5_arena_size(&tiny,0,gsize) + (long)cfg->max_pos*(cfg->rotary_dim/2)*4*2;
+        long budget=avail-reserve-avail/10;
+        if(budget<(1L<<30)) continue;                   /* group too small for weights + 1 GB KV */
+        if((long)target_ctx <= budget/per_pos) return G;
+    }
+    return 1;
+}
+
 /* ---- EP combine all-reduce callback ---- */
 static double g_ar_secs=0.0; static long g_ar_calls=0, g_ar_frags=0;
 static void ep_ar_callback(float*buf,int count,void*ctx){
@@ -474,13 +520,19 @@ int main(void){
     if(MyRank==-1){ fprintf(stderr,"my coords not in %s\n",topo_path()); exit(1); }
 
     { char en[64]; snprintf(en,sizeof en,"glm5_ep_stderr_rank%02d.txt",MyRank); if(!freopen(en,"w",stderr)){} setvbuf(stderr,NULL,_IOLBF,0); }
-    if(MyRank==0) g_log=fopen("glm5_ep_rank00.txt","w");
-
-    int ep_rank=MyRank, ep_size=N;
     glm5_config cfg=glm5_default_config(); cfg.max_pos=maxpos;
     if(layers>0) cfg.n_layers=layers;
     if(nexp>0)   cfg.n_experts=nexp;
     if(cfg.n_active>cfg.n_experts) cfg.n_active=cfg.n_experts;
+    /* data-parallel groups: G independent models over the N ranks (group size from ctx+MemAvailable;
+     * GLM5_PREFILL_GROUPS overrides). ep_rank/ep_size become group-local so each group is complete. */
+    int G=pick_groups(&cfg,N,prefill);
+    { int ge=envi("GLM5_PREFILL_GROUPS",0); if(ge>0) G=ge; }
+    if(G<1) G=1; while(N%G) G--;
+    GSize=N/G; GId=MyRank/GSize; GBase=GId*GSize; GRank=MyRank-GBase;
+    int ep_rank=GRank, ep_size=GSize;
+    if(GRank==0){ char ln[64]; if(GId==0) snprintf(ln,sizeof ln,"glm5_ep_rank00.txt");
+                  else snprintf(ln,sizeof ln,"glm5_ep_g%02d_rank00.txt",GId); g_log=fopen(ln,"w"); }
     if(start_pos+prefill+maxgen>cfg.max_pos) die("start_pos+prefill+maxgen exceeds max_pos",-1);
     /* CP/long-context keep the registered allreduce slot lean, but it must still cover the
      * per-token attention flash-combine (n_heads + n_heads*v_head_dim floats reduced per token).
@@ -499,13 +551,13 @@ int main(void){
     int no=glm5_n_owned(cfg.n_experts,ep_rank,ep_size);
     size_t arena_est=glm5_arena_size(&cfg,ep_rank,ep_size);
     if(MyRank==0)
-        logmsg("=== GLM5 EP synthetic runner: %d ranks ===\n"
-               "layers=%d hidden=%d experts=%d active=%d owned~%d  heads=%d/%d head_dim=%d\n"
-               "threads=%d start_pos=%d prefill=%d decode=%d max_pos=%d  arena~%.2f GB/node (synth malloc)\n",
-               N,cfg.n_layers,cfg.hidden,cfg.n_experts,cfg.n_active,no,
-               cfg.n_heads,cfg.n_kv_heads,cfg.head_dim,n_threads,start_pos,prefill,maxgen,maxpos,
-               arena_est/(1024.0*1024.0*1024.0));
-    if(MyRank==0){ FILE*mf=fopen("/proc/meminfo","r"); if(mf){ char line[128];
+        logmsg("=== GLM5 EP runner: %d ranks, %d groups x %d (group-parallel prefill) ===\n",N,N/GSize,GSize);
+    if(GRank==0)
+        logmsg("group %d/%d (ranks %d..%d): layers=%d hidden=%d experts=%d active=%d owned~%d ep_size=%d\n"
+               "threads=%d start_pos=%d prefill=%d decode=%d max_pos=%d  arena~%.2f GB/node\n",
+               GId,N/GSize,GBase,GBase+GSize-1,cfg.n_layers,cfg.hidden,cfg.n_experts,cfg.n_active,no,ep_size,
+               n_threads,start_pos,prefill,maxgen,maxpos,arena_est/(1024.0*1024.0*1024.0));
+    if(GRank==0){ FILE*mf=fopen("/proc/meminfo","r"); if(mf){ char line[128];
         while(fgets(line,sizeof line,mf)) if(!strncmp(line,"MemTotal",8)||!strncmp(line,"MemFree",7)||!strncmp(line,"MemAvailable",12)){
             for(char*p=line;*p;p++) if(*p=='\n')*p=0; logmsg("NODE_MEMINFO %s\n",line);} fclose(mf);} }
 
@@ -521,7 +573,8 @@ int main(void){
 
     /* ---- barrier region + VCQ ---- */
     SlotSend=DEMO_CACHE_LINE; SlotB=DEMO_CACHE_LINE; SEND_OFF=0; BAR_BASE=SlotSend;
-    size_t region_sz=BAR_BASE+(size_t)(N+1)*SlotB;
+    GBAR_BASE=BAR_BASE+(size_t)(N+1)*SlotB;                /* group-barrier slots, disjoint from global */
+    size_t region_sz=GBAR_BASE+(size_t)(N+1)*SlotB;
     if(posix_memalign((void**)&Region,DEMO_CACHE_LINE,region_sz)!=0) die("posix_memalign",-1);
     memset(Region,0,region_sz);
     /* Co-located ranks (same node coords) must be distinguishable on the wire: give each its own
@@ -543,9 +596,9 @@ int main(void){
     barrier_robust(1);
 
     static tp_comm comm;
-    if(MyRank==0) logmsg("allreduce: max_count=%d floats ar_tokens=%d pchunk=%d mstream=%d ar_auto_cap=%d ar_hard_cap=%d\n",
+    if(GRank==0) logmsg("allreduce: max_count=%d floats ar_tokens=%d pchunk=%d mstream=%d ar_auto_cap=%d ar_hard_cap=%d\n",
                          cfg.hidden*ar_tokens,ar_tokens,pchunk0,mstream,ar_auto_cap,ar_hard_cap);
-    if(tp_comm_init(&comm,Vcq,PeerVcq,MyRank,N,cfg.hidden*ar_tokens,barrier)!=0) die("tp_comm_init",-1);
+    if(tp_comm_init(&comm,Vcq,PeerVcq+GBase,GRank,GSize,cfg.hidden*ar_tokens,gbarrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
     /* CP callbacks are wired unconditionally so a mid-run Tier A->B transition can turn CP on.
@@ -702,21 +755,21 @@ int main(void){
             for(int p0=0;p0<prefill;p0+=pchunk){
                 int S=prefill-p0; if(S>pchunk)S=pchunk;
                 for(int t=0;t<S;t++){
-                    int tok=(p0+t)*1315423911u % (unsigned)m->cfg.vocab;
+                    int tok=(unsigned)((p0+t)+(unsigned)GId*0x9E3779B1u)*1315423911u % (unsigned)m->cfg.vocab;
                     embed_lookup(m,tok,Xc+(size_t)t*C);
                 }
                 /* Tier A->B: re-shard the [0,p0) history BEFORE any chunk that would store a
                  * position >= T_cp (so the Tier-A buffer never overflows). Lockstep on all ranks. */
                 if(!m->cp_on && m->T_cp>0 && p0+S>m->T_cp){
                     double tt=now_sec(); glm5_prefill_to_cp(m,p0);
-                    barrier();
-                    if(MyRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP int4 %d slots/rank\n",
+                    gbarrier();
+                    if(GRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP int4 %d slots/rank\n",
                                          p0,now_sec()-tt,m->cp_nslot);
                 }
                 int a=glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=prefill);
                 if(a>=0) pf_last=a;
                 for(size_t i=0;i<(size_t)S*C;i++) if(!(Xc[i]==Xc[i])) nan++;
-                if(MyRank==0 && envi("GLM5_PREFILL_ROLLING",1)){
+                if(GRank==0 && envi("GLM5_PREFILL_ROLLING",1)){
                     double dt=now_sec()-t0;
                     logmsg("prefill_progress: %d/%d tok elapsed=%.3f rate=%.2f tok/s RSS=%.2f GB\n",
                            p0+S,prefill,dt,dt>0?(p0+S)/dt:0.0,rss_bytes()/1e9);
@@ -725,19 +778,20 @@ int main(void){
             glm5_afree(Xc); glm5_free_mstream(m);
         } else {
             for(int p=0;p<prefill;p++){
-                int tok=p*1315423911u % (unsigned)m->cfg.vocab;
+                int tok=(unsigned)(p+(unsigned)GId*0x9E3779B1u)*1315423911u % (unsigned)m->cfg.vocab;
                 embed_lookup(m,tok,x); pf_last=glm5_forward_token(m,x,p);
                 for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++;
             }
         }
         double tpf=now_sec()-t0, ar=g_ar_secs; long calls=g_ar_calls, frags=g_ar_frags;
-        prof_snapshot(m,prof_pfs); barrier();
-        if(MyRank==0){
-            logmsg("prefill_synth: %d tok %.2f tok/s comm %.1f%% calls=%ld frags=%ld pchunk=%d argmax=%d NaNs=%d RSS=%.2f GB\n",
-                   prefill,tpf>0?prefill/tpf:0.0,tpf>0?100.0*ar/tpf:0.0,calls,frags,pchunk,pf_last,nan,rss_bytes()/1e9);
+        prof_snapshot(m,prof_pfs); gbarrier();
+        if(GRank==0){
+            logmsg("prefill_synth: gid=%d/%d gsize=%d %d tok %.2f tok/s comm %.1f%% calls=%ld frags=%ld pchunk=%d argmax=%d NaNs=%d RSS=%.2f GB\n",
+                   GId,N/GSize,GSize,prefill,tpf>0?prefill/tpf:0.0,tpf>0?100.0*ar/tpf:0.0,calls,frags,pchunk,pf_last,nan,rss_bytes()/1e9);
             prof_log_delta("prefill_synth",prof0s,prof_pfs,prefill,tpf,ar);
-            logmsg("SENTINEL glm5_prefill_%dn=%s\n",N,nan==0?"done":"NAN");
+            logmsg("SENTINEL glm5_prefill_g%dn=%s\n",GSize,nan==0?"done":"NAN");
         }
+        barrier();   /* global: all groups done before teardown (clean VCQ dereg / aggregate) */
         glm5_afree(x); glm5_free(m); return nan==0?0:1;
     }
 

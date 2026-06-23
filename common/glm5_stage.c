@@ -83,6 +83,10 @@ int main(void){
              else snprintf(stage_dir,sizeof stage_dir,"%s/tmp/glm5",home); } }
     int rank=detect_rank();
     int ep_size=envi("GLM5_EP_SIZE",192);
+    /* data-parallel groups: ep_size is the GROUP size; ranks beyond it belong to sibling groups that
+     * stage the SAME group-local expert shard (e%ep_size==rank) to their own node's /local. Map the
+     * global MPI rank to its group-local index so each group is a complete, independently-staged model. */
+    if(ep_size>0) rank %= ep_size;
     int nshards=envi("GLM5_NSHARDS",282);
     int slimit=envi("GLM5_SHARD_LIMIT",0);
     int last=(slimit>0&&slimit<nshards)?slimit:nshards;

@@ -31,7 +31,12 @@ WORK="$GLM5/prefill_fp8_run_${JOB_TAG}_384n_noncontig"
 export GLM5_MODEL_DIR=${GLM5_MODEL_DIR:-$HOME/models/glm52-fp8}
 export GLM5_STAGE_DIR=${GLM5_STAGE_DIR:-/local/glm5_fp8_prefill_$JOB_TAG}
 export GLM5_NSHARDS=141
-export GLM5_EP_SIZE=$NP
+# data-parallel groups: split NP ranks into GROUPS independent models of NP/GROUPS ranks each.
+# GLM5_EP_SIZE is the group size so glm5_stage shards experts group-locally; the runner reads
+# GLM5_PREFILL_GROUPS. GROUPS=1 reproduces the original single 384-EP behaviour.
+GROUPS=${GLM5_PREFILL_GROUPS:-1}
+export GLM5_EP_SIZE=$((NP/GROUPS))
+export GLM5_PREFILL_GROUPS=$GROUPS
 export GLM5_STATUS_DIR="$WORK"
 export GLM5_TP=${GLM5_TP:-1}
 export GLM5_TP_SHARED=${GLM5_TP_SHARED:-0}
