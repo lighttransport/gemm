@@ -727,6 +727,20 @@ static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
                                            const float *x2, const float *x3,
                                            int n_cols, float *s0, float *s1,
                                            float *s2, float *s3);
+static inline void tf_vec_dot_q4_0_f32_4row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const float *x, int n_cols);
+static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols);
+static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
+                                             const block_q4_0 *up,
+                                             const float *x, int n_cols,
+                                             float *sg, float *su);
 static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                   const float *x, int n_cols, int row_start, int row_end);
 
