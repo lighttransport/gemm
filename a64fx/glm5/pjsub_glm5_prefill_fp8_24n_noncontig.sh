@@ -30,7 +30,10 @@ WORK="$GLM5/prefill_fp8_run_${JOB_TAG}_24n_noncontig"
 export GLM5_MODEL_DIR=${GLM5_MODEL_DIR:-$HOME/models/glm52-fp8}
 export GLM5_STAGE_DIR=${GLM5_STAGE_DIR:-/local/glm5_fp8_prefill_$JOB_TAG}
 export GLM5_NSHARDS=141
-export GLM5_EP_SIZE=$NP
+# data-parallel groups (do not name the var GROUPS -- reserved bash array)
+NGRP=${GLM5_PREFILL_GROUPS:-1}
+export GLM5_EP_SIZE=$((NP/NGRP))
+export GLM5_PREFILL_GROUPS=$NGRP
 export GLM5_STATUS_DIR="$WORK"
 export GLM5_TP=${GLM5_TP:-1}
 export GLM5_TP_SHARED=${GLM5_TP_SHARED:-0}

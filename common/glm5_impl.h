@@ -1017,6 +1017,77 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     return m;
 }
 
+/* Phase 2: re-slice this rank's TP-sharded DENSE weights for a new ep (after a group merge), reading
+ * the FULL tensors from this node's local blob (glm5_stage stages dense un-sharded). In-place: frees
+ * each old slice before installing the new one, so no 2x-weight spike. Routed experts are handled by
+ * glm5_group_expert_drop; norms and the replicated attn projections (wq_a/wkv_a) are ep-invariant.
+ * blob_rank = this rank's ORIGINAL staging index (MyRank % initial_ep_size); the blob holds the full
+ * dense + a superset of the experts. Returns 0 on success. */
+static void glm5_reslice_w(glm5_tensor*t,glm5_ent*es,int n,const uint8_t*base,const char*name,int mode,
+                           int r0,int nr,int c0,int nc,int Rtot,int Ctot,int*ok){
+    glm5_afree(t->w); glm5_afree(t->scale); size_t u=0;
+    *t=glm5_load_w(es,n,base,name,mode,r0,nr,c0,nc,Rtot,Ctot,ok,&u);
+}
+static int glm5_group_tp_reslice(glm5_model*m,const char*blob_dir,int blob_rank,int new_eps,int new_ep_rank){
+    glm5_config*cfg=&m->cfg;
+    char bdir[1024]; if(blob_dir&&*blob_dir) snprintf(bdir,sizeof bdir,"%s",blob_dir);
+    else { const char*e=getenv("GLM5_STAGE_DIR"); snprintf(bdir,sizeof bdir,"%s",(e&&*e)?e:"/local/glm5"); }
+    char bp[1100],mp[1100]; snprintf(bp,sizeof bp,"%s/rank%02d.blob",bdir,blob_rank); snprintf(mp,sizeof mp,"%s/rank%02d.manifest",bdir,blob_rank);
+    FILE*mf=fopen(mp,"r"); if(!mf){ fprintf(stderr,"reslice: cannot open %s\n",mp); return -1; }
+    char line[1024]; int cap=4096,n=0; glm5_ent*es=glm5_amalloc((size_t)cap*sizeof(glm5_ent));
+    while(fgets(line,sizeof line,mf)){
+        if(line[0]=='#'||line[0]=='\n') continue;
+        if(n>=cap){ cap*=2; es=realloc(es,(size_t)cap*sizeof(glm5_ent)); }
+        glm5_ent*e=&es[n]; char dt[32]; int pos=0,cnt;
+        if(sscanf(line,"%llu %zu %31s %d%n",(unsigned long long*)&e->off,&e->nbytes,dt,&e->nd,&cnt)!=4) continue;
+        pos=cnt; e->f32=(dt[0]=='F'&&dt[1]=='3'); for(int d=0;d<e->nd&&d<5;d++){ long v; int c2; sscanf(line+pos," %ld%n",&v,&c2); e->shape[d]=v; pos+=c2; }
+        while(line[pos]==' ')pos++; char*nl=strchr(line+pos,'\n'); if(nl)*nl=0; snprintf(e->name,sizeof e->name,"%s",line+pos); n++;
+    }
+    fclose(mf);
+    int bfd=open(bp,O_RDONLY); if(bfd<0){ fprintf(stderr,"reslice: cannot open %s\n",bp); glm5_afree(es); return -1; }
+    struct stat sb; fstat(bfd,&sb); size_t bsz=sb.st_size;
+    const uint8_t*base=mmap(NULL,bsz,PROT_READ,MAP_PRIVATE,bfd,0);
+    if(base==MAP_FAILED){ fprintf(stderr,"reslice: mmap failed\n"); close(bfd); glm5_afree(es); return -1; }
+    const int H=cfg->hidden, QD=glm5_q_dim(cfg), AD=glm5_attn_dim(cfg), VD=cfg->v_head_dim, QHD=cfg->qk_head_dim;
+    int tp=glm5_envi("GLM5_TP",0);
+    int tp_attn=glm5_envi("GLM5_TP_ATTN",tp) && !m->cp_on, tp_sh=glm5_envi("GLM5_TP_SHARED",tp);
+    int tp_ffn=glm5_envi("GLM5_TP_FFN",tp), tp_head=glm5_envi("GLM5_TP_HEAD",tp), tp_emb=glm5_envi("GLM5_TP_EMBED",tp);
+    int qh0,qh1; if(tp_attn) glm5_shard_heads(cfg->n_heads,new_ep_rank,new_eps,&qh0,&qh1); else { qh0=0; qh1=cfg->n_heads; } int qrows=(qh1-qh0)*QHD, arows=(qh1-qh0)*VD; (void)qrows;
+    int sh_r0,sh_rows; if(tp_sh) glm5_shard_blocks(cfg->moe_inter,128,new_ep_rank,new_eps,&sh_r0,&sh_rows); else { sh_r0=0; sh_rows=cfg->moe_inter; }
+    int ff_r0,ff_rows; if(tp_ffn) glm5_shard(cfg->dense_inter,new_ep_rank,new_eps,&ff_r0,&ff_rows); else { ff_r0=0; ff_rows=cfg->dense_inter; }
+    int hr0,hrows; if(tp_head) glm5_shard(cfg->vocab,new_ep_rank,new_eps,&hr0,&hrows); else { hr0=0; hrows=cfg->vocab; }
+    int er0,erows; if(tp_emb) glm5_shard(cfg->vocab,new_ep_rank,new_eps,&er0,&erows); else { er0=0; erows=cfg->vocab; }
+    int ok=1; char nb[512];
+    if(tp_emb){ glm5_ent*e=glm5_req(es,n,"model.embed_tokens.weight"); if(e){ glm5_afree(m->embed); m->embed=glm5_cp_rows(base,e,er0,erows,H,2); } m->emb_r0=er0; m->emb_rows=erows; }
+    if(tp_head){ glm5_reslice_w(&m->head,es,n,base,"lm_head.weight",1,hr0,hrows,0,0,cfg->vocab,H,&ok); m->head_r0=hr0; }
+    for(int l=0;l<cfg->n_layers&&ok;l++){
+        glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(cfg,l);
+        #define RLN(suf) (snprintf(nb,sizeof nb,"model.layers.%d." suf,l),nb)
+        if(tp_attn){
+            glm5_reslice_w(&L->wq_b,es,n,base,RLN("self_attn.q_b_proj.weight"),1,qh0*QHD,(qh1-qh0)*QHD,0,0,QD,cfg->q_lora,&ok);
+            glm5_reslice_w(&L->wkv_b,es,n,base,RLN("self_attn.kv_b_proj.weight"),1,qh0*(cfg->qk_nope_dim+VD),(qh1-qh0)*(cfg->qk_nope_dim+VD),0,0,cfg->n_heads*(cfg->qk_nope_dim+VD),cfg->kv_lora,&ok);
+            glm5_reslice_w(&L->wo,es,n,base,RLN("self_attn.o_proj.weight"),2,0,0,qh0*VD,arows,H,AD,&ok);
+            L->qh0=qh0; L->qh1=qh1;
+        }
+        if(is_moe){
+            if(tp_sh){
+                glm5_reslice_w(&L->sh_w1,es,n,base,RLN("mlp.shared_experts.gate_proj.weight"),1,sh_r0,sh_rows,0,0,cfg->moe_inter,H,&ok);
+                glm5_reslice_w(&L->sh_w3,es,n,base,RLN("mlp.shared_experts.up_proj.weight"),1,sh_r0,sh_rows,0,0,cfg->moe_inter,H,&ok);
+                glm5_reslice_w(&L->sh_w2,es,n,base,RLN("mlp.shared_experts.down_proj.weight"),2,0,0,sh_r0,sh_rows,H,cfg->moe_inter,&ok);
+                L->sh_r0=sh_r0; L->sh_rows=sh_rows;
+            }
+        } else if(tp_ffn){
+            glm5_reslice_w(&L->ff_gate,es,n,base,RLN("mlp.gate_proj.weight"),1,ff_r0,ff_rows,0,0,cfg->dense_inter,H,&ok);
+            glm5_reslice_w(&L->ff_up,es,n,base,RLN("mlp.up_proj.weight"),1,ff_r0,ff_rows,0,0,cfg->dense_inter,H,&ok);
+            glm5_reslice_w(&L->ff_down,es,n,base,RLN("mlp.down_proj.weight"),2,0,0,ff_r0,ff_rows,H,cfg->dense_inter,&ok);
+            L->ff_r0=ff_r0; L->ff_rows=ff_rows;
+        }
+        #undef RLN
+    }
+    munmap((void*)base,bsz); close(bfd); glm5_afree(es);
+    return ok?0:-1;
+}
+
 /* ===================== KV cache accessors (bf16 or int4, CP slot-mapped) ===================== */
 /* dot(q_head, k[pos,kvh]) without the 1/sqrt(d) scale; reads bf16 or int4 at the CP slot. */
 static inline float glm5_kdot(glm5_model*m,glm5_layer*L,int t,int kvh,const float*qh,int HD,int KVH){

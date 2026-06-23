@@ -220,11 +220,12 @@ static void glm5_group_kv_propagate(glm5_model*m,int old_gsize,int new_base,int 
 }
 /* Merge this group with its sibling (pairwise) -> group of size 2*GSize. Local expert drop + KV
  * propagation to the sibling + rebuild group-scoped collectives. Survivor = even subgroup's sequence. */
-static void glm5_group_merge(glm5_model*m,tp_comm*comm,int ar_floats,int upto){
+static void glm5_group_merge(glm5_model*m,tp_comm*comm,int ar_floats,int upto,const char*blob_dir,int orig_gsize){
     int old_gsize=GSize, new_gsize=GSize*2;
     int new_GId=GId/2, new_base=new_GId*new_gsize, new_GRank=MyRank-new_base;
     GId=new_GId; GBase=new_base; GSize=new_gsize; GRank=new_GRank;   /* group identity FIRST */
-    glm5_group_expert_drop(m,new_gsize,new_GRank);                   /* local: sets m->ep_size/ep_rank */
+    glm5_group_expert_drop(m,new_gsize,new_GRank);                   /* local: routed experts, sets ep_* */
+    if(glm5_group_tp_reslice(m,blob_dir,MyRank%orig_gsize,new_gsize,new_GRank)!=0) die("merge tp_reslice",-1); /* local: TP dense from blob */
     glm5_group_kv_propagate(m,old_gsize,new_base,upto);             /* network: even KV -> odd sibling */
     tp_comm_free(comm);
     if(tp_comm_init(comm,Vcq,PeerVcq+GBase,GRank,GSize,ar_floats,gbarrier)!=0) die("merge tp_comm_init",-1);
@@ -809,7 +810,7 @@ int main(void){
                  * Survivor = even/lower subgroup; its KV is propagated to the sibling, concurrency halves. */
                 while(!m->cp_on && GSize<N && mi<matn && p0+S>mat[mi]){
                     int og=GSize; double tt=now_sec();
-                    glm5_group_merge(m,&comm,cfg.hidden*ar_tokens,p0);
+                    glm5_group_merge(m,&comm,cfg.hidden*ar_tokens,p0,blob_dir,orig_gsize);
                     if(GRank==0) logmsg("group_merge: %dx%d -> %dx%d at pos=%d (%.3f s) seq=%d\n",
                                         N/og,og,N/GSize,GSize,p0,now_sec()-tt,GBase/orig_gsize);
                     mi++;
