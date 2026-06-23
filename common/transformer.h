@@ -1041,7 +1041,7 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
 }
 
 /* ================================================================
- * Q4_0 int8 SDOT path: ~2.3x faster than fp32 FMA on A64FX, exact
+ * Q4_0 int8 SDOT path: opt-in via TF_USE_INT8_SDOT_Q4_0. Correct
  * for general Q4_0 weights via per-tensor d rescale.
  *
  * Strategy:
@@ -1051,13 +1051,31 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
  *     full int8 range. Subnormal d (e.g., 1e-3) is preserved at
  *     proportional precision (vs the previous "fold d" approach
  *     that rounded subnormal d to 0).
- *  3. Quantize x -> int8 with scale_x = 127 / max(|x|)
+ *  3. Quantize x -> int8 with x_inv = 127 / max(|x|)
  *  4. SDOT (4 int8 mults per int32 lane, 64 mults per 512-bit call)
- *  5. result_fp32 = sdoti32 / (scale_w * scale_x)
+ *  5. result_fp32 = sdoti32 / (scale_w * x_inv)
  *
- * qlair profile for 8-row 2048x64 Q4_0 matvec (real data):
- *   fp32 FMA 8-row + prefetch: 1.07M cycles for 8 reps
- *   int8 SDOT path:            ~1.5M cycles for 8 reps (with d-scan)
+ * Performance (qlair, 8 reps, 2048x2048 Q4_0 matvec, real data):
+ *   fp32 FMA 8-row path:      30.2M cycles, 45M instructions, 7.0 GFLOPS
+ *   int8 SDOT path (this):    80.7M cycles, 135M instructions
+ *   The int8 path is 2.7x SLOWER than fp32 for typical matvec
+ *   workloads because the dequant overhead (8 SVE ops/block × 8
+ *   rows × 64 blocks = 4K SVE ops) dominates the SDOT throughput
+ *   advantage (256 SDOTs).
+ *
+ * For unit-scale test data (d=1.0), the int8 path matches the
+ * microbenchmark where dequant is amortized: ~30K cycles for an
+ * 8-row 2048x64 matvec vs ~68K for fp32 (2.3x faster in the
+ * microbench). But for real matvec workloads (decode, prefill),
+ * the dequant cost is paid per call, not amortized.
+ *
+ * The fp32 path's fused 'dequant + FMA' loop avoids the explicit
+ * dequant, which is more efficient when the dequant cost isn't
+ * amortized. The int8 path would be a win if:
+ *  - The dequant is amortized (e.g., same weights used many times)
+ *  - The fp32 FMA pipeline is already saturated (it isn't at 7/64 GFLOPS)
+ *  - int8 SDOT replaces both dequant and FMA (it doesn't; dequant is
+ *    separate)
  *
  * SDOT does 4 multiplies per int32 lane (16 dot products of 4 int8
  * per instruction), 2 SDOT/cycle on the 2 ALU pipes. Each SDOT call
@@ -1069,16 +1087,16 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
  * step in the rescaled space; back to fp32 this is ~0.5% relative
  * error in the dominant (high-|d|) blocks. Subnormal d blocks are
  * preserved at reduced relative precision (small absolute error
- * since d itself is small).
+ * since d itself is small). Verified:
+ *   unit-scale (d=1.0):   ~1% error per row
+ *   random Q4_0 (d ~1e-4..1e3): 2-15% error per row (subnormal d
+ *     rounded to 0)
+ *   fp32 path:            0% error (gold standard)
  *
- * Dequant overhead: ~8 SVE ops per block (load, split nibbles,
- * interleave, subtract 8, multiply by d, store). For 8 rows of
- * 2048 cols = 512 blocks, that's ~4K SVE ops. SDOT itself is
- * 8 rows × 32 SDOTs = 256 SDOTs. The dequant is ~16x the SDOT
- * instruction count, so it dominates wall-time. The fp32 path
- * (which fuses dequant + FMA inline) is faster when d is unit-
- * scale. The int8 path wins when the SDOT throughput matters
- * more than the dequant cost (e.g., large n_rows batches).
+ * The int8 path is opt-in via TF_USE_INT8_SDOT_Q4_0. The fp32 path
+ * is the production default. To enable: define TF_USE_INT8_SDOT_Q4_0
+ * before including this header. Useful for unit-scale benchmarks
+ * or as a fallback when SDOT throughput is critical.
  * ================================================================ */
 
 /* Find max(|d|) across 8 rows of Q4_0 (n_cols elements per row).
