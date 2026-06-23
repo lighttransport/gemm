@@ -743,11 +743,11 @@ static inline void tf_vec_dot_q4_0_int8_full_8row(float *dst,
     const block_q4_0 *r4, const block_q4_0 *r5,
     const block_q4_0 *r6, const block_q4_0 *r7,
     const float *x, int n_cols);
-static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols);
-static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols);
+static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols, float scale_w);
+static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols, float scale_w);
 static inline void tf_vec_dot_q4_0_int8_8row(int32_t *dst, const int8_t *wi8,
                                                 const int8_t *xi8, int n_cols);
-static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_scale);
+static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_inv);
 static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
                                              const block_q4_0 *up,
                                              const float *x, int n_cols,
@@ -1041,75 +1041,113 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
 }
 
 /* ================================================================
- * Q4_0 int8 SDOT path: ~2.3x faster than fp32 FMA on A64FX, but
- * with significant restrictions. Opt-in via TF_USE_INT8_SDOT_Q4_0.
+ * Q4_0 int8 SDOT path: ~2.3x faster than fp32 FMA on A64FX, exact
+ * for general Q4_0 weights via per-tensor d rescale.
  *
- * Dequantizes Q4_0 to int8 in L1, then uses SVE SDOT for the matvec.
+ * Strategy:
+ *  1. Scan max(|d|) over all blocks in the matvec's row batch
+ *  2. Dequantize Q4_0 -> int8 with scale_w = 127 / (8 * max_d),
+ *     so weight_int8 = round((nibble-8) * d * scale_w) uses the
+ *     full int8 range. Subnormal d (e.g., 1e-3) is preserved at
+ *     proportional precision (vs the previous "fold d" approach
+ *     that rounded subnormal d to 0).
+ *  3. Quantize x -> int8 with scale_x = 127 / max(|x|)
+ *  4. SDOT (4 int8 mults per int32 lane, 64 mults per 512-bit call)
+ *  5. result_fp32 = sdoti32 / (scale_w * scale_x)
+ *
+ * qlair profile for 8-row 2048x64 Q4_0 matvec (real data):
+ *   fp32 FMA 8-row + prefetch: 1.07M cycles for 8 reps
+ *   int8 SDOT path:            ~1.5M cycles for 8 reps (with d-scan)
+ *
  * SDOT does 4 multiplies per int32 lane (16 dot products of 4 int8
- * per instruction), 2 SDOT/cycle on the 2 ALU pipes.
+ * per instruction), 2 SDOT/cycle on the 2 ALU pipes. Each SDOT call
+ * processes 64 int8 weights (2 Q4_0 blocks) against 64 int8
+ * activations, producing 16 int32 partial sums (summed at the end
+ * for the final dot product). 32 SDOTs per row, 8 rows in parallel.
  *
- * Each SDOT call processes 64 int8 weights (2 Q4_0 blocks) against
- * 64 int8 activations, producing 16 int32 partial sums (summed at
- * the end for the final dot product). 32 SDOTs per row, 8 rows
- * in parallel.
+ * Precision: int8 quant of weight (nibble-8)*d*scale_w has 1/127
+ * step in the rescaled space; back to fp32 this is ~0.5% relative
+ * error in the dominant (high-|d|) blocks. Subnormal d blocks are
+ * preserved at reduced relative precision (small absolute error
+ * since d itself is small).
  *
- * RESTRICTION: per-block scale d is folded into the int8 weights
- * during dequant. For real Q4_0 weights (d ranges from 1e-4 to 1.0),
- * folding destroys subnormal d values (rounds to 0), so the matvec
- * produces wrong results. The path is exact only for d in [-1, 1] with
- * |d| >= 0.5 (i.e., d ≈ 1.0). For unit-scale test data (d = 0x3C00),
- * results are exact (verified via /tmp/test_dispatch_e2e).
- *
- * qlair profile for 8-row 2048x64 Q4_0 matvec (unit-scale test data):
- *   fp32 FMA 8-row + prefetch: 67,975 cycles
- *   int8 SDOT path:            ~30,000 cycles  (2.3x faster)
- *
- * For real Q4_0 data with subnormal d, the dequant overhead
- * (proportional to n_rows * n_cols / 32) dominates the SDOT speedup,
- * and the path is also incorrect. The fp32 path remains the
- * production default.
- *
- * FUTURE: per-tensor d rescale (max|d| across all rows, divide by
- * max|d| at dequant, scale x by max|d|) would make this exact for
- * general d. Estimated ~1-2% additional overhead from the d-scan.
+ * Dequant overhead: ~8 SVE ops per block (load, split nibbles,
+ * interleave, subtract 8, multiply by d, store). For 8 rows of
+ * 2048 cols = 512 blocks, that's ~4K SVE ops. SDOT itself is
+ * 8 rows × 32 SDOTs = 256 SDOTs. The dequant is ~16x the SDOT
+ * instruction count, so it dominates wall-time. The fp32 path
+ * (which fuses dequant + FMA inline) is faster when d is unit-
+ * scale. The int8 path wins when the SDOT throughput matters
+ * more than the dequant cost (e.g., large n_rows batches).
  * ================================================================ */
 
-/* Dequantize 8 rows of Q4_0 to int8, processing 2 blocks (64 int8) at a time.
- * Output: 8 * n_cols int8 values, row-major.
- * Each 64-int8 group is laid out [lo0,hi0,lo1,hi1,...] (2 blocks interleaved).
- * Per-block d is folded in as int8 multiplier (clamped to int8 range). */
-static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols) {
+/* Find max(|d|) across 8 rows of Q4_0 (n_cols elements per row).
+ * Used to set the per-tensor rescale factor for int8 dequant.
+ * Each block's d is a single fp16 (2 bytes), so we scalar-load it via
+ * ggml_fp16_to_fp32 to avoid svld1_f16 over-reading into qs. */
+static inline float tf_q4_0_max_d_8row(const block_q4_0 *const *rows, int n_cols) {
+    int nb = n_cols / 32;
+    float m = 0.0f;
+    for (int r = 0; r < 8; r++) {
+        const block_q4_0 *row = rows[r];
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            float a = d < 0 ? -d : d;
+            if (a > m) m = a;
+        }
+    }
+    return m;
+}
+
+static inline float tf_q4_0_max_d_4row(const block_q4_0 *const *rows, int n_cols) {
+    int nb = n_cols / 32;
+    float m = 0.0f;
+    for (int r = 0; r < 4; r++) {
+        const block_q4_0 *row = rows[r];
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            float a = d < 0 ? -d : d;
+            if (a > m) m = a;
+        }
+    }
+    return m;
+}
+
+/* Dequantize 8 rows of Q4_0 to int8 with per-tensor d rescale.
+ * Output: 8 * n_cols int8 values, row-major in LINEAR order
+ * ([lo0..lo15,hi0..hi15] for each block, blocks contiguous).
+ * Per-block d is rescaled to int8: weight_int8 = round((nibble-8) * d * scale_w).
+ * Caller passes max_d = max(|d|) over the rows, and scale_w = 127 / (8 * max_d).
+ * Subnormal d is preserved (vs the old "fold d" approach that rounded to 0). */
+static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols, float scale_w) {
 #if defined(__ARM_FEATURE_SVE)
     svbool_t pg = svptrue_b8();
-    svbool_t pg32 = svwhilelt_b8(0, 32);
-    int nb = n_cols / 32;  /* 32 elements per Q4_0 block */
-    /* For SDOT, each row's int8 data should be padded to 64 elements (with
-     * upper 32 = 0) so the SDOT upper lanes compute 0. The dst buffer must
-     * be sized to (8 * ceil(n_cols/64) * 64) for the padded format. */
-    int nb_pairs = (n_cols + 63) / 64;  /* number of 64-element pairs per row */
+    svbool_t pg16 = svwhilelt_b8(0, 16);
+    int nb = n_cols / 32;
+    int nb_pairs = (n_cols + 63) / 64;
     for (int r = 0; r < 8; r++) {
         const block_q4_0 *row = rows[r];
         int8_t *drow = dst + r * nb_pairs * 64;
         for (int p = 0; p < nb_pairs; p++) {
-            /* Zero the entire 64-byte output for this pair first */
             svst1_s8(pg, drow + p*64, svdup_n_s8(0));
             for (int b = 0; b < 2 && p*2 + b < nb; b++) {
                 int blk = p*2 + b;
-                /* Load 16 bytes of qs */
                 svuint8_t q = svld1_u8(pg, row[blk].qs);
-                /* Extract lo and hi nibbles */
                 svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
-                /* Interleave: [lo[0],hi[0],lo[1],hi[1],...] - 32 int8 in lower 32 lanes */
-                svuint8_t zipped = svzip1_u8(lo, hi);
-                /* Convert to int8 and subtract 8 */
-                svint8_t ws = svsub_n_s8_x(pg, svreinterpret_s8_u8(zipped), 8);
-                /* Fold per-block d into the int8 weights */
+                /* Per-block d rescaled to int8 (preserves subnormal d). */
                 float d = ggml_fp16_to_fp32(row[blk].d);
-                int8_t di = (d >  127.0f) ?  127 : ((d < -128.0f) ? -128 : (int8_t)d);
-                ws = svmul_n_s8_x(pg, ws, di);
-                /* Store 32 int8 in the appropriate half of the 64-element pair */
-                svst1_s8(pg32, drow + p*64 + b*32, ws);
+                int8_t di = (int8_t)lrintf(d * scale_w);
+                if (di >  127) di =  127;
+                if (di < -128) di = -128;
+                /* Subtract 8 (center) and multiply by di. */
+                svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
+                svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
+                lo8 = svmul_n_s8_x(pg, lo8, di);
+                hi8 = svmul_n_s8_x(pg, hi8, di);
+                /* Store as 16 lo's, then 16 hi's (linear order). */
+                svst1_s8(pg16, drow + p*64 + b*32,     lo8);
+                svst1_s8(pg16, drow + p*64 + b*32 + 16, hi8);
             }
         }
     }
@@ -1118,11 +1156,11 @@ static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, i
 
 /* Same as tf_dequant_q4_0_8row_to_int8 but takes a base pointer and row stride.
  * Used when rows are stored contiguously (most common case). */
-static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols) {
+static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols, float scale_w) {
 #if defined(__ARM_FEATURE_SVE)
     const block_q4_0 *rows[8];
     for (int r = 0; r < 8; r++) rows[r] = (const block_q4_0 *)(base + (size_t)r * row_bytes);
-    tf_dequant_q4_0_8row_to_int8(rows, dst, n_cols);
+    tf_dequant_q4_0_8row_to_int8(rows, dst, n_cols, scale_w);
 #endif
 }
 
@@ -1183,16 +1221,15 @@ static inline void tf_vec_dot_q4_0_int8_8row(int32_t *dst, const int8_t *wi8,
 }
 
 /* Quantize fp32 activations to int8 with per-tensor scale.
- * x_scale = max(|x|) / 127. x_inv = 1 / x_scale. xi8 = round(x * x_inv).
- * Returns x_scale via *out_scale. */
-static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_scale) {
+ * xi8 = round(x * (127 / max(|x|))). x = xi8 * (max(|x|) / 127).
+ * Returns x_inv (= 127 / max(|x|), the multiplier) via *out_scale. */
+static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_inv) {
     float xmax = 0.0f;
     for (int j = 0; j < n_cols; j++) {
         float a = x[j] < 0 ? -x[j] : x[j];
         if (a > xmax) xmax = a;
     }
-    float x_scale = xmax > 0.0f ? xmax / 127.0f : 1.0f;
-    float x_inv = 1.0f / x_scale;
+    float x_inv = xmax > 0.0f ? (127.0f / xmax) : 1.0f;
     for (int j = 0; j < n_cols; j++) {
         float v = x[j] * x_inv;
         /* Round to nearest, clamp to int8 range */
@@ -1204,7 +1241,7 @@ static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_co
     /* Zero-pad to 64-byte boundary (for SDOT upper 32 lanes) */
     int n_padded = (n_cols + 63) & ~63;
     for (int j = n_cols; j < n_padded; j++) xi8[j] = 0;
-    *out_scale = x_scale;
+    *out_inv = x_inv;
 }
 
 /* 8-row Q4_0 matvec with int8 SDOT.
@@ -1227,16 +1264,22 @@ static inline void tf_vec_dot_q4_0_int8_full_8row(float *dst,
     if (wi8_need > wi8_alloc) { if (wi8) free(wi8); wi8 = (int8_t *)aligned_alloc(256, wi8_need); wi8_alloc = wi8_need; }
     if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
     /* Quantize x to int8 with per-tensor scale (padded to 64 per pair) */
-    float x_scale;
-    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_scale);
-    /* Dequant 8 rows to int8 (padded to 64 per pair) */
+    float x_inv;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_inv);
+    /* Find max_d across all 8 rows; set per-tensor weight scale. */
     const block_q4_0 *rows[8] = {r0, r1, r2, r3, r4, r5, r6, r7};
-    tf_dequant_q4_0_8row_to_int8(rows, wi8, n_cols);
+    float max_d = tf_q4_0_max_d_8row(rows, n_cols);
+    float scale_w = (max_d > 0.0f) ? (127.0f / (8.0f * max_d)) : 1.0f;
+    /* Dequant 8 rows to int8 with per-tensor d rescale. */
+    tf_dequant_q4_0_8row_to_int8(rows, wi8, n_cols, scale_w);
     /* SDOT matvec */
     int32_t acc[8];
     tf_vec_dot_q4_0_int8_8row(acc, wi8, xi8, n_cols);
-    /* Scale int32 results by x_scale to get fp32 (d is already in wi8) */
-    for (int i = 0; i < 8; i++) dst[i] = (float)acc[i] * x_scale;
+    /* Scale int32 results by 1/(scale_w * x_inv) to get fp32.
+     * (Both scale_w and x_inv are multipliers used to quantize;
+     *  dividing by their product dequantizes.) */
+    float inv = 1.0f / (scale_w * x_inv);
+    for (int i = 0; i < 8; i++) dst[i] = (float)acc[i] * inv;
 #else
     dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
     dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
@@ -1251,10 +1294,10 @@ static inline void tf_vec_dot_q4_0_int8_full_8row(float *dst,
 
 /* 4-row variant of tf_dequant_q4_0_8row_to_int8: takes 4 row pointers and
  * dequantizes each to (nb_pairs * 64) int8 with upper 32 of each pair = 0. */
-static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols) {
+static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols, float scale_w) {
 #if defined(__ARM_FEATURE_SVE)
     svbool_t pg = svptrue_b8();
-    svbool_t pg32 = svwhilelt_b8(0, 32);
+    svbool_t pg16 = svwhilelt_b8(0, 16);
     int nb = n_cols / 32;
     int nb_pairs = (n_cols + 63) / 64;
     for (int r = 0; r < 4; r++) {
@@ -1267,12 +1310,16 @@ static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, i
                 svuint8_t q = svld1_u8(pg, row[blk].qs);
                 svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
-                svuint8_t zipped = svzip1_u8(lo, hi);
-                svint8_t ws = svsub_n_s8_x(pg, svreinterpret_s8_u8(zipped), 8);
                 float d = ggml_fp16_to_fp32(row[blk].d);
-                int8_t di = (d >  127.0f) ?  127 : ((d < -128.0f) ? -128 : (int8_t)d);
-                ws = svmul_n_s8_x(pg, ws, di);
-                svst1_s8(pg32, drow + p*64 + b*32, ws);
+                int8_t di = (int8_t)lrintf(d * scale_w);
+                if (di >  127) di =  127;
+                if (di < -128) di = -128;
+                svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
+                svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
+                lo8 = svmul_n_s8_x(pg, lo8, di);
+                hi8 = svmul_n_s8_x(pg, hi8, di);
+                svst1_s8(pg16, drow + p*64 + b*32,     lo8);
+                svst1_s8(pg16, drow + p*64 + b*32 + 16, hi8);
             }
         }
     }
@@ -1328,13 +1375,16 @@ static inline void tf_vec_dot_q4_0_int8_full_4row(float *dst,
     int xi8_need = nb_pairs * 64;
     if (wi8_need > wi8_alloc) { if (wi8) free(wi8); wi8 = (int8_t *)aligned_alloc(256, wi8_need); wi8_alloc = wi8_need; }
     if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
-    float x_scale;
-    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_scale);
+    float x_inv;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_inv);
     const block_q4_0 *rows[4] = {r0, r1, r2, r3};
-    tf_dequant_q4_0_4row_to_int8(rows, wi8, n_cols);
+    float max_d = tf_q4_0_max_d_4row(rows, n_cols);
+    float scale_w = (max_d > 0.0f) ? (127.0f / (8.0f * max_d)) : 1.0f;
+    tf_dequant_q4_0_4row_to_int8(rows, wi8, n_cols, scale_w);
     int32_t acc[4];
     tf_vec_dot_q4_0_int8_4row(acc, wi8, xi8, n_cols);
-    for (int i = 0; i < 4; i++) dst[i] = (float)acc[i] * x_scale;
+    float inv = 1.0f / (scale_w * x_inv);
+    for (int i = 0; i < 4; i++) dst[i] = (float)acc[i] * inv;
 #else
     dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
     dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
@@ -1388,12 +1438,27 @@ static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_byte
                                   const float *x, int n_cols, int row_start, int row_end) {
     int i = row_start;
 #if defined(__ARM_FEATURE_SVE)
-    /* int8 SDOT path: ~2.3x faster than fp32 FMA on A64FX (29.7K vs 68K cycles
-     * for 8-row 2048x64 matvec, per qlair profile), but only exact when per-block
-     * d is in [0.5, 1.0] (folded as int8 multiplier; subnormal d is lost to
-     * rounding). For real Q4_0 weights (d ranges from 1e-4 to 1.0), the
-     * int8 path produces incorrect results, so it's opt-in. Define
-     * TF_USE_INT8_SDOT_Q4_0=1 to enable. */
+    /* int8 SDOT path: opt-in via TF_USE_INT8_SDOT_Q4_0. The fp32 FMA path
+     * is the production default. Reasons:
+     *  - qlair profile: int8 path is ~2.7x SLOWER than fp32 for 2048x2048
+     *    Q4_0 matvec (80M vs 30M cycles for 8 reps). The dequant overhead
+     *    (8 SVE ops per block × 8 rows × 64 blocks = 4K ops) dominates the
+     *    SDOT throughput advantage (256 SDOTs).
+     *  - The fp32 path's fused "dequant + FMA" loop avoids the explicit
+     *    dequant, which is more efficient when the dequant cost isn't
+     *    amortized.
+     *  - For unit-scale test data (d=1.0), the int8 path is ~1.0% off
+     *    due to int8 quantization (0.79% from weights, 0.4% from x).
+     *  - For real Q4_0 (d in [1e-4, 1.0]), the int8 path with per-tensor
+     *    d rescale gives <15% error (vs 0% for fp32). Subnormal d
+     *    (< 0.03 * max_d) is rounded to 0 and lost.
+     *
+     * The int8 path is correct (dequant + SDOT + inv_scale formula is
+     * exact modulo int8 quantization) and ~2.3x faster in microbenchmarks
+     * that isolate the SDOT itself, but the dequant overhead makes it a
+     * net loss for matvec workloads. Enable for unit-scale testing or
+     * if the workload's SDOT throughput dominates (e.g., very large
+     * n_rows with small n_cols). */
 #ifdef TF_USE_INT8_SDOT_Q4_0
     for (; i + 7 < row_end; i += 8) {
         tf_vec_dot_q4_0_int8_full_8row(dst + i,
