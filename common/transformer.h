@@ -1095,6 +1095,24 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
  * tf_q4_0_int8_cache_init, use with tf_matvec_q4_0_int8_prequant_rows).
  * The fp32 path is the production default for the existing
  * tf_matvec_q4_0_rows API.
+ *
+ * Alternative paths evaluated (not recommended):
+ *  - int16 SDOT (sve size=0b11, H→D): genuine 2x slower than int8 SDOT
+ *    because int16 SDOT does 32 int16 products per SDOT (vs 64 int8 per
+ *    int8 SDOT). 2x more SDOTs needed for the same K. Not useful.
+ *  - fp16 FMA (svmla_f16): genuine 2x slower than int8 SDOT for the
+ *    same reason (32 fp16 products per FMA vs 64 int8 per SDOT). Plus
+ *    fp16 accumulator overflow risk for large K. qlair models fp16
+ *    FMA via soft-float emulation (slower than hardware). On real
+ *    A64FX hardware, fp16 FMA is 2x faster than fp32 FMA (128 GFLOPS
+ *    vs 64 GFLOPS), but still 2x slower than int8 SDOT.
+ *  - fp16→fp32 widening FMA (FMLAL): SVE 2.0, NOT available on A64FX.
+ *    Would have eliminated overflow risk with no throughput penalty
+ *    vs narrowing FMA, but A64FX is SVE 1.0 only.
+ *
+ * Recommendation: int8 SDOT is the best path for throughput on A64FX.
+ * fp32 FMA is the gold standard for precision. fp16/int16 paths are
+ * 2x slower than int8 SDOT in peak throughput and not recommended.
  * ================================================================ */
 
 /* Find max(|d|) across 8 rows of Q4_0 (n_cols elements per row).
