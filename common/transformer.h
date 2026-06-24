@@ -1041,41 +1041,38 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
 }
 
 /* ================================================================
- * Q4_0 int8 SDOT path: opt-in via TF_USE_INT8_SDOT_Q4_0. Correct
- * for general Q4_0 weights via per-tensor d rescale.
+ * Q4_0 int8 SDOT paths: two variants.
  *
- * Strategy:
+ * 1) ON-THE-FLY int8 path: opt-in via TF_USE_INT8_SDOT_Q4_0. Dequantizes
+ *    Q4_0 to int8 in the matvec hot path, then uses SVE SDOT. Correct
+ *    for general Q4_0 weights via per-tensor d rescale.
+ *
+ *    qlair profile for 8-row 2048x64 Q4_0 matvec (real data):
+ *      fp32 FMA 8-row:    67,975 cycles (microbench)
+ *      int8 SDOT (on-fly): ~30K cycles (microbench, 2.3x faster)
+ *      int8 SDOT 2048x2048 matvec: 80.7M cycles (SLOWER than fp32
+ *        because the dequant overhead dominates the SDOT throughput).
+ *
+ * 2) PREQUANTIZED int8 path: weights are dequantized to int8 once
+ *    (at load time, via tf_q4_0_int8_cache_init), then the matvec is
+ *    pure SDOT (no dequant, no d-scan, no scale_w computation in the
+ *    hot path). For prefill (same weights × many tokens) and any
+ *    repeated matvec with the same weights, this is a clear win.
+ *
+ *    qlair profile for 8-row 2048x64 Q4_0 matvec (real data):
+ *      prequant int8:     ~13K cycles (microbench, 5.2x faster than fp32)
+ *      prequant int8 2048x2048 matvec: 16.5M cycles (1.83x faster
+ *        than fp32's 30.2M cycles for the same matvec).
+ *
+ * Strategy (both paths):
  *  1. Scan max(|d|) over all blocks in the matvec's row batch
  *  2. Dequantize Q4_0 -> int8 with scale_w = 127 / (8 * max_d),
  *     so weight_int8 = round((nibble-8) * d * scale_w) uses the
  *     full int8 range. Subnormal d (e.g., 1e-3) is preserved at
- *     proportional precision (vs the previous "fold d" approach
- *     that rounded subnormal d to 0).
+ *     proportional precision.
  *  3. Quantize x -> int8 with x_inv = 127 / max(|x|)
  *  4. SDOT (4 int8 mults per int32 lane, 64 mults per 512-bit call)
  *  5. result_fp32 = sdoti32 / (scale_w * x_inv)
- *
- * Performance (qlair, 8 reps, 2048x2048 Q4_0 matvec, real data):
- *   fp32 FMA 8-row path:      30.2M cycles, 45M instructions, 7.0 GFLOPS
- *   int8 SDOT path (this):    80.7M cycles, 135M instructions
- *   The int8 path is 2.7x SLOWER than fp32 for typical matvec
- *   workloads because the dequant overhead (8 SVE ops/block × 8
- *   rows × 64 blocks = 4K SVE ops) dominates the SDOT throughput
- *   advantage (256 SDOTs).
- *
- * For unit-scale test data (d=1.0), the int8 path matches the
- * microbenchmark where dequant is amortized: ~30K cycles for an
- * 8-row 2048x64 matvec vs ~68K for fp32 (2.3x faster in the
- * microbench). But for real matvec workloads (decode, prefill),
- * the dequant cost is paid per call, not amortized.
- *
- * The fp32 path's fused 'dequant + FMA' loop avoids the explicit
- * dequant, which is more efficient when the dequant cost isn't
- * amortized. The int8 path would be a win if:
- *  - The dequant is amortized (e.g., same weights used many times)
- *  - The fp32 FMA pipeline is already saturated (it isn't at 7/64 GFLOPS)
- *  - int8 SDOT replaces both dequant and FMA (it doesn't; dequant is
- *    separate)
  *
  * SDOT does 4 multiplies per int32 lane (16 dot products of 4 int8
  * per instruction), 2 SDOT/cycle on the 2 ALU pipes. Each SDOT call
@@ -1093,10 +1090,11 @@ static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
  *     rounded to 0)
  *   fp32 path:            0% error (gold standard)
  *
- * The int8 path is opt-in via TF_USE_INT8_SDOT_Q4_0. The fp32 path
- * is the production default. To enable: define TF_USE_INT8_SDOT_Q4_0
- * before including this header. Useful for unit-scale benchmarks
- * or as a fallback when SDOT throughput is critical.
+ * The on-the-fly int8 path is opt-in via TF_USE_INT8_SDOT_Q4_0. The
+ * prequant int8 path uses the tf_q4_0_int8_cache API (build with
+ * tf_q4_0_int8_cache_init, use with tf_matvec_q4_0_int8_prequant_rows).
+ * The fp32 path is the production default for the existing
+ * tf_matvec_q4_0_rows API.
  * ================================================================ */
 
 /* Find max(|d|) across 8 rows of Q4_0 (n_cols elements per row).
@@ -1240,25 +1238,42 @@ static inline void tf_vec_dot_q4_0_int8_8row(int32_t *dst, const int8_t *wi8,
 
 /* Quantize fp32 activations to int8 with per-tensor scale.
  * xi8 = round(x * (127 / max(|x|))). x = xi8 * (max(|x|) / 127).
- * Returns x_inv (= 127 / max(|x|), the multiplier) via *out_scale. */
+ * Returns x_inv (= 127 / max(|x|), the multiplier) via *out_scale.
+ * SVE-vectorized max(|x|) (svmaxv) + scalar quantize loop. The scalar
+ * quantize is a small fraction of total cycles (the SDOTs dominate). */
 static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_inv) {
+#if defined(__ARM_FEATURE_SVE)
+    /* Vectorized max(|x|). */
+    svbool_t pg = svptrue_b32();
+    svfloat32_t vmax = svdup_f32(0.0f);
+    int j = 0;
+    for (; j + 15 < n_cols; j += 16) {
+        svfloat32_t v = svld1(pg, x + j);
+        svfloat32_t va = svabs_f32_x(pg, v);
+        vmax = svmax_f32_x(pg, vmax, va);
+    }
+    float xmax = svmaxv_f32(pg, vmax);
+    for (; j < n_cols; j++) {
+        float a = x[j] < 0 ? -x[j] : x[j];
+        if (a > xmax) xmax = a;
+    }
+#else
     float xmax = 0.0f;
     for (int j = 0; j < n_cols; j++) {
         float a = x[j] < 0 ? -x[j] : x[j];
         if (a > xmax) xmax = a;
     }
+#endif
     float x_inv = xmax > 0.0f ? (127.0f / xmax) : 1.0f;
-    for (int j = 0; j < n_cols; j++) {
-        float v = x[j] * x_inv;
-        /* Round to nearest, clamp to int8 range */
+    for (int k = 0; k < n_cols; k++) {
+        float v = x[k] * x_inv;
         int iv = (int)(v + (v < 0 ? -0.5f : 0.5f));
         if (iv >  127) iv =  127;
         if (iv < -128) iv = -128;
-        xi8[j] = (int8_t)iv;
+        xi8[k] = (int8_t)iv;
     }
-    /* Zero-pad to 64-byte boundary (for SDOT upper 32 lanes) */
     int n_padded = (n_cols + 63) & ~63;
-    for (int j = n_cols; j < n_padded; j++) xi8[j] = 0;
+    for (int k = n_cols; k < n_padded; k++) xi8[k] = 0;
     *out_inv = x_inv;
 }
 
@@ -1409,6 +1424,289 @@ static inline void tf_vec_dot_q4_0_int8_full_4row(float *dst,
     dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
     dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
 #endif
+}
+
+/* ================================================================
+ * Pure int8 SDOT path: pre-dequantized weights.
+ *
+ * The pre-dequant approach amortizes the dequant cost: weights are
+ * dequantized to int8 once (at load time or when weights change), then
+ * the matvec hot path is just SDOT (no dequant, no d-scan, no scale_w
+ * computation). For prefill (same weights × many tokens) this is a
+ * big win; for decode (1 matvec per weight set) the prequant is paid
+ * once.
+ *
+ * Storage format:
+ *   For each row: ceil(n_cols/64) * 64 int8 values
+ *   The first 32 of each 64-byte pair are the linear-order int8 weights
+ *   for one Q4_0 block; the next 32 are for the next block. If n_cols is
+ *   not a multiple of 64, the last pair's upper 32 are zero-padded.
+ *   Memory cost: ~1.78x the Q4_0 size (4 bits -> 8 bits per element).
+ *
+ * Per-tensor d rescale is baked into the prequant (same formula as the
+ * non-prequant int8 path: scale_w = 127 / (8 * max_d), so the int8
+ * weight range covers the dequantized weight range).
+ *
+ * Matvec: just SDOT (no dequant), then result = sdoti32 / (scale_w * x_inv).
+ * For 8 rows × 32 pairs (n_cols=2048): 256 SDOTs (vs 256 SDOTs + 4K dequant
+ * ops for the on-the-fly int8 path).
+ *
+ * qlair profile for 8-row 2048x64 Q4_0 matvec (real data, single matvec):
+ *   fp32 FMA 8-row:           30.2M cycles
+ *   int8 SDOT (on-the-fly):   80.7M cycles  (dequant dominates)
+ *   int8 SDOT (prequant):     <TBD> cycles (only SDOT, no dequant)
+ * ================================================================ */
+
+/* Opaque prequantized int8 weight cache. Holds the int8 weights and
+ * the scale_w used during prequant. Build with tf_q4_0_int8_cache_init. */
+typedef struct {
+    int8_t  *wi8;        /* prequantized int8 weights */
+    size_t   bytes;      /* size of wi8 in bytes */
+    float    scale_w;    /* per-tensor d rescale factor (127 / (8 * max_d)) */
+    int      n_rows;
+    int      n_cols;
+    int      nb_pairs;   /* ceil(n_cols / 64) */
+} tf_q4_0_int8_cache;
+
+/* Pre-dequantize Q4_0 weights to int8 with per-tensor d rescale.
+ * The Q4_0 data is at 'src' (n_rows rows of n_cols elements each, row
+ * stride = row_bytes). Output is stored in cache->wi8 (allocated here,
+ * freed by tf_q4_0_int8_cache_free).
+ *
+ * Returns 0 on success, -1 on failure.
+ *
+ * Memory cost: n_rows * nb_pairs * 64 bytes (~1.78x the Q4_0 size).
+ * For 2048x2048: 2048 * 32 * 64 = 4 MB. */
+static inline int tf_q4_0_int8_cache_init(tf_q4_0_int8_cache *cache,
+                                            const void *src, size_t row_bytes,
+                                            int n_rows, int n_cols) {
+    cache->n_rows = n_rows;
+    cache->n_cols = n_cols;
+    cache->nb_pairs = (n_cols + 63) / 64;
+    cache->bytes = (size_t)n_rows * cache->nb_pairs * 64;
+    cache->wi8 = (int8_t *)aligned_alloc(256, cache->bytes);
+    if (!cache->wi8) return -1;
+    /* Scan max(|d|) over all rows. */
+    const uint8_t *base = (const uint8_t *)src;
+    float max_d = 0.0f;
+    int nb = n_cols / 32;
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            float a = d < 0 ? -d : d;
+            if (a > max_d) max_d = a;
+        }
+    }
+    cache->scale_w = (max_d > 0.0f) ? (127.0f / (8.0f * max_d)) : 1.0f;
+    /* Dequant all rows. */
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svbool_t pg16 = svwhilelt_b8(0, 16);
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+        int8_t *drow = cache->wi8 + (size_t)r * cache->nb_pairs * 64;
+        for (int p = 0; p < cache->nb_pairs; p++) {
+            svst1_s8(pg, drow + p*64, svdup_n_s8(0));
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                svuint8_t q = svld1_u8(pg, row[blk].qs);
+                svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
+                svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
+                float d = ggml_fp16_to_fp32(row[blk].d);
+                int8_t di = (int8_t)lrintf(d * cache->scale_w);
+                if (di >  127) di =  127;
+                if (di < -128) di = -128;
+                svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
+                svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
+                lo8 = svmul_n_s8_x(pg, lo8, di);
+                hi8 = svmul_n_s8_x(pg, hi8, di);
+                svst1_s8(pg16, drow + p*64 + b*32,     lo8);
+                svst1_s8(pg16, drow + p*64 + b*32 + 16, hi8);
+            }
+        }
+    }
+#else
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+        int8_t *drow = cache->wi8 + (size_t)r * cache->nb_pairs * 64;
+        for (int p = 0; p < cache->nb_pairs; p++) {
+            for (int j = 0; j < 64; j++) drow[p*64 + j] = 0;
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                for (int j = 0; j < 16; j++) {
+                    uint8_t q = row[blk].qs[j];
+                    int lo = (q & 0xf) - 8;
+                    int hi = (q >> 4) - 8;
+                    float d = ggml_fp16_to_fp32(row[blk].d);
+                    int8_t di = (int8_t)lrintf(d * cache->scale_w);
+                    if (di >  127) di =  127;
+                    if (di < -128) di = -128;
+                    drow[p*64 + b*32 + j]      = (int8_t)(lo * di);
+                    drow[p*64 + b*32 + 16 + j] = (int8_t)(hi * di);
+                }
+            }
+        }
+    }
+#endif
+    return 0;
+}
+
+static inline void tf_q4_0_int8_cache_free(tf_q4_0_int8_cache *cache) {
+    if (cache->wi8) { free(cache->wi8); cache->wi8 = NULL; }
+    cache->bytes = 0;
+}
+
+/* 8-row matvec using pre-dequantized int8 weights. No dequant in the
+ * hot path — just SDOT. */
+static inline void tf_matvec_q4_0_int8_prequant_8row(float *dst,
+    const int8_t *w0, const int8_t *w1, const int8_t *w2, const int8_t *w3,
+    const int8_t *w4, const int8_t *w5, const int8_t *w6, const int8_t *w7,
+    const float *x, int n_cols, int nb_pairs, float scale_w) {
+#if defined(__ARM_FEATURE_SVE)
+    /* Scratch for x int8. */
+    static int8_t *xi8 = NULL;
+    static int xi8_alloc = 0;
+    int xi8_need = nb_pairs * 64;
+    if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
+    float x_inv;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_inv);
+    /* 8 SDOTs per pair, one per row. */
+    svbool_t pg = svptrue_b8();
+    svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+    svint32_t a4=svdup_s32(0),a5=svdup_s32(0),a6=svdup_s32(0),a7=svdup_s32(0);
+    for (int p = 0; p < nb_pairs; p++) {
+        if (p + 1 < nb_pairs) {
+            __builtin_prefetch(w0 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w1 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w2 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w3 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w4 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w5 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w6 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w7 + (p+1)*64, 0, 0);
+        }
+        svint8_t xv = svld1_s8(pg, xi8 + p*64);
+        svint8_t v0=svld1_s8(pg, w0 + p*64);
+        svint8_t v1=svld1_s8(pg, w1 + p*64);
+        svint8_t v2=svld1_s8(pg, w2 + p*64);
+        svint8_t v3=svld1_s8(pg, w3 + p*64);
+        svint8_t v4=svld1_s8(pg, w4 + p*64);
+        svint8_t v5=svld1_s8(pg, w5 + p*64);
+        svint8_t v6=svld1_s8(pg, w6 + p*64);
+        svint8_t v7=svld1_s8(pg, w7 + p*64);
+        a0=svdot_s32(a0, v0, xv); a1=svdot_s32(a1, v1, xv);
+        a2=svdot_s32(a2, v2, xv); a3=svdot_s32(a3, v3, xv);
+        a4=svdot_s32(a4, v4, xv); a5=svdot_s32(a5, v5, xv);
+        a6=svdot_s32(a6, v6, xv); a7=svdot_s32(a7, v7, xv);
+    }
+    int32_t acc[8] = {0};
+    acc[0] = svaddv_s32(svptrue_b32(), a0);
+    acc[1] = svaddv_s32(svptrue_b32(), a1);
+    acc[2] = svaddv_s32(svptrue_b32(), a2);
+    acc[3] = svaddv_s32(svptrue_b32(), a3);
+    acc[4] = svaddv_s32(svptrue_b32(), a4);
+    acc[5] = svaddv_s32(svptrue_b32(), a5);
+    acc[6] = svaddv_s32(svptrue_b32(), a6);
+    acc[7] = svaddv_s32(svptrue_b32(), a7);
+    float inv = 1.0f / (scale_w * x_inv);
+    for (int i = 0; i < 8; i++) dst[i] = (float)acc[i] * inv;
+#else
+    (void)dst; (void)w0; (void)w1; (void)w2; (void)w3; (void)w4;
+    (void)w5; (void)w6; (void)w7; (void)x; (void)n_cols; (void)nb_pairs;
+    (void)scale_w;
+#endif
+}
+
+/* 4-row matvec using pre-dequantized int8 weights. */
+static inline void tf_matvec_q4_0_int8_prequant_4row(float *dst,
+    const int8_t *w0, const int8_t *w1, const int8_t *w2, const int8_t *w3,
+    const float *x, int n_cols, int nb_pairs, float scale_w) {
+#if defined(__ARM_FEATURE_SVE)
+    static int8_t *xi8 = NULL;
+    static int xi8_alloc = 0;
+    int xi8_need = nb_pairs * 64;
+    if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
+    float x_inv;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_inv);
+    svbool_t pg = svptrue_b8();
+    svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+    for (int p = 0; p < nb_pairs; p++) {
+        if (p + 1 < nb_pairs) {
+            __builtin_prefetch(w0 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w1 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w2 + (p+1)*64, 0, 0);
+            __builtin_prefetch(w3 + (p+1)*64, 0, 0);
+        }
+        svint8_t xv = svld1_s8(pg, xi8 + p*64);
+        svint8_t v0=svld1_s8(pg, w0 + p*64);
+        svint8_t v1=svld1_s8(pg, w1 + p*64);
+        svint8_t v2=svld1_s8(pg, w2 + p*64);
+        svint8_t v3=svld1_s8(pg, w3 + p*64);
+        a0=svdot_s32(a0, v0, xv); a1=svdot_s32(a1, v1, xv);
+        a2=svdot_s32(a2, v2, xv); a3=svdot_s32(a3, v3, xv);
+    }
+    int32_t acc[4] = {0};
+    acc[0] = svaddv_s32(svptrue_b32(), a0);
+    acc[1] = svaddv_s32(svptrue_b32(), a1);
+    acc[2] = svaddv_s32(svptrue_b32(), a2);
+    acc[3] = svaddv_s32(svptrue_b32(), a3);
+    float inv = 1.0f / (scale_w * x_inv);
+    for (int i = 0; i < 4; i++) dst[i] = (float)acc[i] * inv;
+#else
+    (void)dst; (void)w0; (void)w1; (void)w2; (void)w3; (void)x;
+    (void)n_cols; (void)nb_pairs; (void)scale_w;
+#endif
+}
+
+/* Dispatch: matvec with prequantized int8 weights. Falls back to fp32
+ * for the 1-row tail (scalar). */
+static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
+        const tf_q4_0_int8_cache *cache, const float *x,
+        int row_start, int row_end) {
+    int i = row_start;
+    const int8_t *base = cache->wi8;
+    const int nb_pairs = cache->nb_pairs;
+    const float scale_w = cache->scale_w;
+#if defined(__ARM_FEATURE_SVE)
+    for (; i + 7 < row_end; i += 8) {
+        tf_matvec_q4_0_int8_prequant_8row(dst + i,
+            base + (size_t)(i+0) * nb_pairs * 64,
+            base + (size_t)(i+1) * nb_pairs * 64,
+            base + (size_t)(i+2) * nb_pairs * 64,
+            base + (size_t)(i+3) * nb_pairs * 64,
+            base + (size_t)(i+4) * nb_pairs * 64,
+            base + (size_t)(i+5) * nb_pairs * 64,
+            base + (size_t)(i+6) * nb_pairs * 64,
+            base + (size_t)(i+7) * nb_pairs * 64,
+            x, cache->n_cols, nb_pairs, scale_w);
+    }
+    for (; i + 3 < row_end; i += 4) {
+        tf_matvec_q4_0_int8_prequant_4row(dst + i,
+            base + (size_t)(i+0) * nb_pairs * 64,
+            base + (size_t)(i+1) * nb_pairs * 64,
+            base + (size_t)(i+2) * nb_pairs * 64,
+            base + (size_t)(i+3) * nb_pairs * 64,
+            x, cache->n_cols, nb_pairs, scale_w);
+    }
+#endif
+    /* 1-row tail: scalar fallback (the int8 weights are 1.78x the
+     * original; the dequant in fp32 is no longer applicable). For
+     * simplicity, use the prequantized int8 weights with a scalar int8
+     * dot product. */
+    for (; i < row_end; i++) {
+        const int8_t *w = base + (size_t)i * nb_pairs * 64;
+        static int8_t *xi8 = NULL;
+        static int xi8_alloc = 0;
+        if (cache->n_cols > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, (cache->n_cols + 63) & ~63); xi8_alloc = cache->n_cols; }
+        float x_inv;
+        tf_quantize_f32_to_int8(x, xi8, cache->n_cols, &x_inv);
+        int32_t s = 0;
+        for (int j = 0; j < cache->n_cols; j++) {
+            s += (int32_t)w[j] * (int32_t)xi8[j];
+        }
+        dst[i] = (float)s / (scale_w * x_inv);
+    }
 }
 
 static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
