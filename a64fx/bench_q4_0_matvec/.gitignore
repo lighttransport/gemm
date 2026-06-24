@@ -10,3 +10,4 @@ bw_probe
 dq_mv_omp
 pc_matvec
 results.txt
+numa_matvec
