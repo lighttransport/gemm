@@ -212,10 +212,11 @@ static void glm5_group_kv_propagate(glm5_model*m,int old_gsize,int new_base,int 
     int li=(MyRank-new_base)%old_gsize;                /* local index within subgroup */
     int even=(MyRank-new_base)<old_gsize;              /* even subgroup survives, sends */
     int partner=even ? (new_base+old_gsize+li) : (new_base+li);
+    long ns=(long)m->cp_nslot;                         /* Tier-A buffers are cp_nslot (=T_cp) slots, NOT max_pos */
     for(int l=0;l<c->n_layers;l++){
         glm5_layer*L=&m->layers[l];
-        if(L->kv_cache)     glm5_kv_xfer((char*)L->kv_cache,    (long)c->max_pos*KVD*2,(long)upto*KVD*2,KV_STAG,  even,partner);
-        if(L->idx_k_cache)  glm5_kv_xfer((char*)L->idx_k_cache, (long)c->max_pos*ID*2, (long)upto*ID*2, KV_STAG+1,even,partner);  /* MSA index keys (tiered runs) */
+        if(L->kv_cache)     glm5_kv_xfer((char*)L->kv_cache,    ns*KVD*2,(long)upto*KVD*2,KV_STAG,  even,partner);
+        if(L->idx_k_cache)  glm5_kv_xfer((char*)L->idx_k_cache, ns*ID*2, (long)upto*ID*2, KV_STAG+1,even,partner);  /* MSA index keys (tiered runs) */
     }
 }
 /* Merge this group with its sibling (pairwise) -> group of size 2*GSize. Local expert drop + KV
