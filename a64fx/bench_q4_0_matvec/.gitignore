@@ -6,4 +6,7 @@ dump_shapes
 gemm_shapes
 sdot_roofline
 omp_sweep
+bw_probe
+dq_mv_omp
+pc_matvec
 results.txt
