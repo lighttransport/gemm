@@ -154,7 +154,8 @@ static void matvec_int8_prequant(float *dst, const block_q4_0 *w,
 /* SVE int16 SDOT matvec (H->D, 2x slower than int8)                    */
 /* ------------------------------------------------------------------ */
 static void matvec_int16_sve(float *dst, const int16_t *wi16,
-                               const float *x, int n_rows, int n_cols) {
+                               const float *x, int n_rows, int n_cols,
+                               float w_scale) {
     int nb_pairs = n_cols / 32;
     int16_t *xi16 = aligned_alloc(256, (((size_t)n_cols + 31) & ~31) * sizeof(int16_t));
     /* Quantize x to int16: x' = x (values in [-1, 1] fit in int16) */
@@ -196,9 +197,10 @@ static void matvec_int16_sve(float *dst, const int16_t *wi16,
             a4=svdot_s64(a4, w1e, x1v); a5=svdot_s64(a5, w1f, x1v);
             a6=svdot_s64(a6, w1g, x1v); a7=svdot_s64(a7, w1h, x1v);
         }
-        /* Convert int64 sums to fp32 and rescale. The x was scaled by 32767,
-         * so the result is sum(w*x*32767) / 32767 = sum(w*x). */
-        float scale = 1.0f / 32767.0f;
+        /* Convert int64 sums to fp32 and undo BOTH scales. x was scaled by
+         * 32767 and w by w_scale, so the int64 dot is sum(w*x)*w_scale*32767;
+         * divide it back out to recover sum(w*x). */
+        float scale = 1.0f / (w_scale * 32767.0f);
         dst[b+0] = svaddv_s64(svptrue_b64(), a0) * scale;
         dst[b+1] = svaddv_s64(svptrue_b64(), a1) * scale;
         dst[b+2] = svaddv_s64(svptrue_b64(), a2) * scale;
@@ -211,10 +213,29 @@ static void matvec_int16_sve(float *dst, const int16_t *wi16,
     free(xi16);
 }
 
-/* Pre-dequantize Q4_0 to int16 (lossless from Q4_0's fp16 d). */
+/* Pre-dequantize Q4_0 to int16 with a per-tensor weight scale.
+ *
+ * The Q4_0 weight value is d*v with d in [0.01,2.0] and v in [-8,7], so many
+ * weights have |value| < 1. Storing round(d*v) directly (no scale) rounds them
+ * to 0/+-1 and destroys all sub-unit precision. Instead scale weights into the
+ * full int16 range, exactly like the activations: wi16 = round(d*v*w_scale),
+ * where w_scale = 32767/(8*max|d|) (8 = max|v|). The matvec undoes w_scale.
+ * Returns w_scale via *out_wscale. */
 static void dequant_q4_0_to_int16(int16_t *wi16, const block_q4_0 *w,
-                                    size_t row_bytes, int n_rows, int n_cols) {
+                                    size_t row_bytes, int n_rows, int n_cols,
+                                    float *out_wscale) {
     int nb = n_cols / 32;
+    /* Scan max|d| to set the per-tensor weight scale. */
+    float max_d = 0.0f;
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)((const uint8_t *)w + (size_t)r * row_bytes);
+        for (int b = 0; b < nb; b++) {
+            float a = fabsf(ggml_fp16_to_fp32(row[b].d));
+            if (a > max_d) max_d = a;
+        }
+    }
+    float w_scale = (max_d > 0.0f) ? (32767.0f / (8.0f * max_d)) : 1.0f;
+    *out_wscale = w_scale;
     for (int r = 0; r < n_rows; r++) {
         const block_q4_0 *row = (const block_q4_0 *)((const uint8_t *)w + (size_t)r * row_bytes);
         for (int b = 0; b < nb; b++) {
@@ -222,12 +243,14 @@ static void dequant_q4_0_to_int16(int16_t *wi16, const block_q4_0 *w,
             for (int j = 0; j < 16; j++) {
                 int v0 = (row[b].qs[j] & 0x0F) - 8;
                 int v1 = (row[b].qs[j] >> 4) - 8;
-                int16_t i0 = (int16_t)lrintf(d * v0);
-                int16_t i1 = (int16_t)lrintf(d * v1);
-                /* Store as int16: 2 elements per byte, lo in low 16 bits, hi in high 16 bits */
-                /* Actually, store separately for clarity */
-                wi16[r * n_cols + b * 32 + j]      = i0;
-                wi16[r * n_cols + b * 32 + j + 16] = i1;
+                /* Scaled to the int16 range; clamp for safety (|d*v*w_scale|
+                 * <= 32767 by construction, so the clamp is a no-op here). */
+                long s0 = lrintf(d * v0 * w_scale);
+                long s1 = lrintf(d * v1 * w_scale);
+                if (s0 >  32767) s0 =  32767; if (s0 < -32768) s0 = -32768;
+                if (s1 >  32767) s1 =  32767; if (s1 < -32768) s1 = -32768;
+                wi16[r * n_cols + b * 32 + j]      = (int16_t)s0;
+                wi16[r * n_cols + b * 32 + j + 16] = (int16_t)s1;
             }
         }
     }
@@ -350,7 +373,8 @@ static void run_bench(int n_rows, int n_cols, int n_reps) {
     /* Pre-dequantize for int16 and fp16 paths */
     int16_t *wi16 = aligned_alloc(256, (size_t)n_rows * n_cols * sizeof(int16_t));
     uint16_t *wf16 = aligned_alloc(256, (size_t)n_rows * n_cols * sizeof(uint16_t));
-    dequant_q4_0_to_int16(wi16, w, row_bytes, n_rows, n_cols);
+    float w_scale16 = 1.0f;
+    dequant_q4_0_to_int16(wi16, w, row_bytes, n_rows, n_cols, &w_scale16);
     dequant_q4_0_to_fp16(wf16, w, row_bytes, n_rows, n_cols);
 
     /* Pre-quant cache for int8 prequant path */
@@ -378,7 +402,7 @@ static void run_bench(int n_rows, int n_cols, int n_reps) {
         return;
     }
     matvec_int8_prequant(dst, w, row_bytes, x, n_rows, n_cols, &cache);
-    matvec_int16_sve(dst, wi16, x, n_rows, n_cols);
+    matvec_int16_sve(dst, wi16, x, n_rows, n_cols, w_scale16);
     matvec_fp16_sve(dst, (const float16_t *)wf16, x, n_rows, n_cols);
 
     bench_result_t results[5];
@@ -445,12 +469,12 @@ static void run_bench(int n_rows, int n_cols, int n_reps) {
 
     /* --- int16 SDOT --- */
     {
-        matvec_int16_sve(dst, wi16, x, n_rows, n_cols);
+        matvec_int16_sve(dst, wi16, x, n_rows, n_cols, w_scale16);
         results[n_results].max_err = compute_max_err(dst, dst_ref, n_rows);
         results[n_results].correct = (results[n_results].max_err < (double)(n_cols) * 0.001);
         uint64_t t0 = cycle_read();
         for (int r = 0; r < n_reps; r++) {
-            matvec_int16_sve(dst, wi16, x, n_rows, n_cols);
+            matvec_int16_sve(dst, wi16, x, n_rows, n_cols, w_scale16);
         }
         uint64_t t1 = cycle_read();
         results[n_results].name = "int16 SDOT";
