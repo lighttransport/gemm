@@ -1606,7 +1606,14 @@ static inline void tf_q4_0_int8_cache_free(tf_q4_0_int8_cache *cache) {
  *   1024x1024: 137 / 64  (2.1x)
  *   2048x2048: 234 / 128 (1.8x)
  *   4096x4096: 542 / 256 (2.1x)
- *   8192x2048: 229 / 128 (1.7x) */
+ *   8192x2048: 229 / 128 (1.7x)
+ *
+ * To reach 85% efficiency (~150 cycles/batch), need:
+ *   - Software pipelining across iters (hide 5-cycle load-use latency)
+ *   - 4x unroll + 4x K-unroll (limited by 32 SVE registers)
+ *   - Or: transposed W layout (w[pair][8][64]) + single-base addressing
+ *   Hand-tuned asm experiments (v6 with 2x K-unroll) achieve 297 cycles/batch
+ *   (43% efficiency), worse than the C compiler due to function call overhead. */
 static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
         const tf_q4_0_int8_cache *cache, const float *x,
         int row_start, int row_end) {
