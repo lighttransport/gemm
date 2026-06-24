@@ -98,6 +98,38 @@ static inline void lean_fused_8row(int32_t acc[8], const uint8_t *qsbase, const 
     acc[4]=svaddv_s32(p3,a4);acc[5]=svaddv_s32(p3,a5);acc[6]=svaddv_s32(p3,a6);acc[7]=svaddv_s32(p3,a7);
 }
 
+/* v2: 16 independent accumulators (2 chains/row, even+odd pairs) -> ILP 16
+ * to hide SDOT latency (~9 cyc, 2/cyc throughput needs ~18 in flight). */
+static inline void lean_i8_8row_v2(int32_t acc[8], const int8_t *w0,int nbp,const int8_t *xi8){
+    svbool_t pg=svptrue_b8();
+    svint32_t e0=svdup_s32(0),e1=svdup_s32(0),e2=svdup_s32(0),e3=svdup_s32(0),e4=svdup_s32(0),e5=svdup_s32(0),e6=svdup_s32(0),e7=svdup_s32(0);
+    svint32_t o0=svdup_s32(0),o1=svdup_s32(0),o2=svdup_s32(0),o3=svdup_s32(0),o4=svdup_s32(0),o5=svdup_s32(0),o6=svdup_s32(0),o7=svdup_s32(0);
+    size_t rs=(size_t)nbp*64;
+    const int8_t*w1=w0+rs,*w2=w0+2*rs,*w3=w0+3*rs,*w4=w0+4*rs,*w5=w0+5*rs,*w6=w0+6*rs,*w7=w0+7*rs;
+    int p=0, ue=nbp&~1;
+    for(;p<ue;p+=2){
+        svint8_t x0=svld1_s8(pg,xi8+(size_t)p*64), x1=svld1_s8(pg,xi8+(size_t)(p+1)*64);
+        e0=svdot_s32(e0,svld1_s8(pg,w0+(size_t)p*64),x0); o0=svdot_s32(o0,svld1_s8(pg,w0+(size_t)(p+1)*64),x1);
+        e1=svdot_s32(e1,svld1_s8(pg,w1+(size_t)p*64),x0); o1=svdot_s32(o1,svld1_s8(pg,w1+(size_t)(p+1)*64),x1);
+        e2=svdot_s32(e2,svld1_s8(pg,w2+(size_t)p*64),x0); o2=svdot_s32(o2,svld1_s8(pg,w2+(size_t)(p+1)*64),x1);
+        e3=svdot_s32(e3,svld1_s8(pg,w3+(size_t)p*64),x0); o3=svdot_s32(o3,svld1_s8(pg,w3+(size_t)(p+1)*64),x1);
+        e4=svdot_s32(e4,svld1_s8(pg,w4+(size_t)p*64),x0); o4=svdot_s32(o4,svld1_s8(pg,w4+(size_t)(p+1)*64),x1);
+        e5=svdot_s32(e5,svld1_s8(pg,w5+(size_t)p*64),x0); o5=svdot_s32(o5,svld1_s8(pg,w5+(size_t)(p+1)*64),x1);
+        e6=svdot_s32(e6,svld1_s8(pg,w6+(size_t)p*64),x0); o6=svdot_s32(o6,svld1_s8(pg,w6+(size_t)(p+1)*64),x1);
+        e7=svdot_s32(e7,svld1_s8(pg,w7+(size_t)p*64),x0); o7=svdot_s32(o7,svld1_s8(pg,w7+(size_t)(p+1)*64),x1);
+    }
+    for(;p<nbp;p++){ svint8_t xv=svld1_s8(pg,xi8+(size_t)p*64);
+        e0=svdot_s32(e0,svld1_s8(pg,w0+(size_t)p*64),xv); e1=svdot_s32(e1,svld1_s8(pg,w1+(size_t)p*64),xv);
+        e2=svdot_s32(e2,svld1_s8(pg,w2+(size_t)p*64),xv); e3=svdot_s32(e3,svld1_s8(pg,w3+(size_t)p*64),xv);
+        e4=svdot_s32(e4,svld1_s8(pg,w4+(size_t)p*64),xv); e5=svdot_s32(e5,svld1_s8(pg,w5+(size_t)p*64),xv);
+        e6=svdot_s32(e6,svld1_s8(pg,w6+(size_t)p*64),xv); e7=svdot_s32(e7,svld1_s8(pg,w7+(size_t)p*64),xv); }
+    svbool_t p3=svptrue_b32();
+    acc[0]=svaddv_s32(p3,svadd_s32_x(p3,e0,o0)); acc[1]=svaddv_s32(p3,svadd_s32_x(p3,e1,o1));
+    acc[2]=svaddv_s32(p3,svadd_s32_x(p3,e2,o2)); acc[3]=svaddv_s32(p3,svadd_s32_x(p3,e3,o3));
+    acc[4]=svaddv_s32(p3,svadd_s32_x(p3,e4,o4)); acc[5]=svaddv_s32(p3,svadd_s32_x(p3,e5,o5));
+    acc[6]=svaddv_s32(p3,svadd_s32_x(p3,e6,o6)); acc[7]=svaddv_s32(p3,svadd_s32_x(p3,e7,o7));
+}
+
 int main(int argc,char**argv){
     int rows=argc>2?atoi(argv[1]):21504;
     int cols=argc>2?atoi(argv[2]):5376;
@@ -165,7 +197,12 @@ int main(int argc,char**argv){
                         lean_fused_8row(acc,WQS+(size_t)g*nb*16,DI+(size_t)g*nb,nb,cols,xi8);
                         for(int i=0;i<8;i++) dA[g+i]=(float)acc[i]*inv;
                     } else {
-                        int32_t acc[8]; lean_i8_8row(acc,WI8+(size_t)g*nbp*64,nbp,xi8);
+                        int32_t acc[8];
+#ifdef V2
+                        lean_i8_8row_v2(acc,WI8+(size_t)g*nbp*64,nbp,xi8);
+#else
+                        lean_i8_8row(acc,WI8+(size_t)g*nbp*64,nbp,xi8);
+#endif
                         for(int i=0;i<8;i++) dI[g+i]=(float)acc[i]*inv;
                     }
                 }
