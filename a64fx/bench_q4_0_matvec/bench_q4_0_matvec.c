@@ -550,6 +550,22 @@ int main(int argc, char **argv) {
     printf("Build: -O3 -march=armv8.2-a+sve -ffp-contract=fast\n");
     printf("================================================================\n\n");
 
+    /* Override with shapes from argv: "rows cols [rows cols ...]". */
+    if (argc >= 3) {
+        for (int a = 1; a + 1 < argc; a += 2) {
+            int R = atoi(argv[a]), C = atoi(argv[a+1]);
+            if (R <= 0 || C <= 0 || (R % 8) || (C % 64)) {
+                fprintf(stderr, "skip %dx%d (need rows%%8==0, cols%%64==0)\n", R, C);
+                continue;
+            }
+            /* ~enough reps for a stable read, scaled down for big matrices. */
+            long elems = (long)R * C;
+            int reps = elems > 64L*1024*1024 ? 5 : elems > 4L*1024*1024 ? 10 : 50;
+            run_bench(R, C, reps);
+        }
+        return 0;
+    }
+
     /* Various sizes - adjust n_reps for reasonable run time */
     int sizes[][2] = {
         {  512,  512 },

@@ -1,0 +1,9 @@
+# build artifacts (binaries) and captured output
+bench_q4_0_matvec
+bench_asan
+bench_dbg
+dump_shapes
+gemm_shapes
+sdot_roofline
+omp_sweep
+results.txt
