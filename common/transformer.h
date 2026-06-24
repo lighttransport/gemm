@@ -1166,7 +1166,10 @@ static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, i
             svst1_s8(pg, drow + p*64, svdup_n_s8(0));
             for (int b = 0; b < 2 && p*2 + b < nb; b++) {
                 int blk = p*2 + b;
-                svuint8_t q = svld1_u8(pg, row[blk].qs);
+                /* qs is only 16 bytes; load with a 16-lane predicate so we
+                 * don't over-read 48 bytes past the field (svld1 zeroes the
+                 * inactive lanes, and only the first 16 lanes are stored). */
+                svuint8_t q = svld1_u8(pg16, row[blk].qs);
                 svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
                 /* Per-block d rescaled to int8 (preserves subnormal d). */
@@ -1293,7 +1296,11 @@ static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_co
         svint32_t v_clamp = svmin_n_s32_x(pgb, svmax_n_s32_x(pgb, v_int, -128), 127);
         svint8_t v_lo = svreinterpret_s8_s32(v_clamp);
         svint8_t v_i8 = svtbl_s8(v_lo, idx);
-        svst1_s8(svptrue_b8(), xi8 + j, v_i8);
+        /* Only the first 16 lanes of v_i8 are meaningful (svtbl packed 16
+         * int32 lanes to 16 int8); store 16 bytes, not a full 64-byte vector,
+         * to avoid writing 48 bytes past xi8. The [n_cols,n_padded) tail is
+         * zeroed below. */
+        svst1_s8(svwhilelt_b8((uint32_t)0, (uint32_t)16), xi8 + j, v_i8);
     }
     /* Scalar tail for quantize. */
     for (; j < n_cols; j++) {
@@ -1388,7 +1395,10 @@ static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, i
             svst1_s8(pg, drow + p*64, svdup_n_s8(0));
             for (int b = 0; b < 2 && p*2 + b < nb; b++) {
                 int blk = p*2 + b;
-                svuint8_t q = svld1_u8(pg, row[blk].qs);
+                /* qs is only 16 bytes; load with a 16-lane predicate so we
+                 * don't over-read 48 bytes past the field (svld1 zeroes the
+                 * inactive lanes, and only the first 16 lanes are stored). */
+                svuint8_t q = svld1_u8(pg16, row[blk].qs);
                 svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
                 float d = ggml_fp16_to_fp32(row[blk].d);
@@ -1558,7 +1568,10 @@ static inline int tf_q4_0_int8_cache_init(tf_q4_0_int8_cache *cache,
             svst1_s8(pg, drow + p*64, svdup_n_s8(0));
             for (int b = 0; b < 2 && p*2 + b < nb; b++) {
                 int blk = p*2 + b;
-                svuint8_t q = svld1_u8(pg, row[blk].qs);
+                /* qs is only 16 bytes; load with a 16-lane predicate so we
+                 * don't over-read 48 bytes past the field (svld1 zeroes the
+                 * inactive lanes, and only the first 16 lanes are stored). */
+                svuint8_t q = svld1_u8(pg16, row[blk].qs);
                 svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
                 float d = ggml_fp16_to_fp32(row[blk].d);
