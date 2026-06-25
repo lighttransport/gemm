@@ -232,6 +232,38 @@ static void glm5_group_merge(glm5_model*m,tp_comm*comm,int ar_floats,int upto,co
     if(tp_comm_init(comm,Vcq,PeerVcq+GBase,GRank,GSize,ar_floats,gbarrier)!=0) die("merge tp_comm_init",-1);
 }
 
+/* ===================== KV cache persistence (prompt/prefix caching) ===================== */
+/* Save the processed [0,total) Tier-A KV (bf16, slot=pos; replicated across ranks, so only rank 0
+ * writes) to <dir>/kv.bin with a 4-int header [total,n_layers,KVD,ep_size]. Lets an expensive system
+ * prompt be processed once and re-loaded on later runs instead of recomputed. */
+static void glm5_kv_save(glm5_model*m,const char*dir,int total){
+    const glm5_config*c=&m->cfg; int KVD=glm5_kv_cache_dim(c);
+    char fn[1100]; snprintf(fn,sizeof fn,"%s/kv.bin",dir);
+    FILE*f=fopen(fn,"wb"); if(!f){ logmsg("kv_save: cannot open %s\n",fn); return; }
+    int hdr[4]={total,c->n_layers,KVD,m->ep_size}; fwrite(hdr,sizeof(int),4,f);
+    size_t per=(size_t)total*KVD;
+    for(int l=0;l<c->n_layers;l++) if(m->layers[l].kv_cache) fwrite(m->layers[l].kv_cache,2,per,f);
+    fclose(f);
+    logmsg("kv_save: wrote %d positions x %d layers x %d (%.2f GB) -> %s\n",
+           total,c->n_layers,KVD,(double)c->n_layers*per*2/1e9,fn);
+}
+/* Read <dir>/kv.bin into each layer's Tier-A kv_cache[0:P*KVD]; returns P (positions) or -1. All ranks
+ * read the same file (Tier-A KV is replicated). Caller resumes prefill from start_pos=P. */
+static int glm5_kv_load(glm5_model*m,const char*dir){
+    const glm5_config*c=&m->cfg; int KVD=glm5_kv_cache_dim(c);
+    char fn[1100]; snprintf(fn,sizeof fn,"%s/kv.bin",dir);
+    FILE*f=fopen(fn,"rb"); if(!f){ if(MyRank==0) logmsg("kv_load: cannot open %s\n",fn); return -1; }
+    int hdr[4]; if(fread(hdr,sizeof(int),4,f)!=4){ fclose(f); return -1; }
+    int P=hdr[0];
+    if(hdr[1]!=c->n_layers || hdr[2]!=KVD){ if(MyRank==0) logmsg("kv_load: layout mismatch (layers %d/%d KVD %d/%d)\n",hdr[1],c->n_layers,hdr[2],KVD); fclose(f); return -1; }
+    if(P<=0 || P>c->max_pos){ fclose(f); return -1; }
+    size_t per=(size_t)P*KVD;
+    for(int l=0;l<c->n_layers;l++) if(m->layers[l].kv_cache){ if(fread(m->layers[l].kv_cache,2,per,f)!=per){ fclose(f); return -1; } }
+    fclose(f);
+    if(MyRank==0) logmsg("kv_load: restored %d positions x %d layers from %s\n",P,c->n_layers,fn);
+    return P;
+}
+
 /* ---- EP combine all-reduce callback ---- */
 static double g_ar_secs=0.0; static long g_ar_calls=0, g_ar_frags=0;
 static void ep_ar_callback(float*buf,int count,void*ctx){
@@ -811,40 +843,46 @@ int main(void){
                 if(ptf&&*ptf){ FILE*pf=fopen(ptf,"rb"); if(pf){ fseek(pf,0,SEEK_END); ptn=ftell(pf)/4; fseek(pf,0,SEEK_SET);
                     if(ptn>0){ ptok=(uint32_t*)glm5_amalloc((size_t)ptn*4); if(fread(ptok,4,ptn,pf)!=(size_t)ptn){ glm5_afree(ptok); ptok=NULL; ptn=0; } } fclose(pf);
                     if(GRank==0) logmsg("prompt tokens: %s (%ld tok, cycled)\n",ptf,ptn); } } }
+            /* KV cache load (prompt caching): restore a saved system-prompt KV and resume from P.
+             * Tokens are indexed by ABSOLUTE position (pa) so save/load/full-recompute agree. */
+            { const char*kvl=getenv("GLM5_KV_LOAD"); if(kvl&&*kvl){ int P=glm5_kv_load(m,kvl); if(P>0) start_pos=P; } }
+            int pend=start_pos+prefill;
             for(int p0=0;p0<prefill;p0+=pchunk){
-                int S=prefill-p0; if(S>pchunk)S=pchunk;
+                int S=prefill-p0; if(S>pchunk)S=pchunk; int pa=start_pos+p0;   /* pa = absolute position */
                 /* Phase 2: pairwise group merge at a (forced) merge point while a bigger group exists.
                  * Survivor = even/lower subgroup; its KV is propagated to the sibling, concurrency halves. */
-                while(!m->cp_on && GSize<N && mi<matn && p0+S>mat[mi]){
+                while(!m->cp_on && GSize<N && mi<matn && pa+S>mat[mi]){
                     int og=GSize; double tt=now_sec();
-                    glm5_group_merge(m,&comm,cfg.hidden*ar_tokens,p0,blob_dir,orig_gsize);
+                    glm5_group_merge(m,&comm,cfg.hidden*ar_tokens,pa,blob_dir,orig_gsize);
                     if(GRank==0) logmsg("group_merge: %dx%d -> %dx%d at pos=%d (%.3f s) seq=%d\n",
-                                        N/og,og,N/GSize,GSize,p0,now_sec()-tt,GBase/orig_gsize);
+                                        N/og,og,N/GSize,GSize,pa,now_sec()-tt,GBase/orig_gsize);
                     mi++;
                 }
                 for(int t=0;t<S;t++){
-                    long seq=(p0+t)+(long)(GBase/orig_gsize)*0x9E3779B1u;     /* per-group sequence offset */
+                    long seq=(pa+t)+(long)(GBase/orig_gsize)*0x9E3779B1u;     /* absolute position + group offset */
                     int tok = ptok ? (int)(ptok[((seq%ptn)+ptn)%ptn] % (unsigned)m->cfg.vocab)
                                    : (int)((unsigned)seq*1315423911u % (unsigned)m->cfg.vocab);
                     embed_lookup(m,tok,Xc+(size_t)t*C);
                 }
-                /* Tier A->B: re-shard the [0,p0) history BEFORE any chunk that would store a
+                /* Tier A->B: re-shard the [0,pa) history BEFORE any chunk that would store a
                  * position >= T_cp (so the Tier-A buffer never overflows). Lockstep on all ranks. */
-                if(!m->cp_on && m->T_cp>0 && p0+S>m->T_cp){
-                    double tt=now_sec(); glm5_prefill_to_cp(m,p0);
+                if(!m->cp_on && m->T_cp>0 && pa+S>m->T_cp){
+                    double tt=now_sec(); glm5_prefill_to_cp(m,pa);
                     gbarrier();
                     if(GRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP int4 %d slots/rank\n",
-                                         p0,now_sec()-tt,m->cp_nslot);
+                                         pa,now_sec()-tt,m->cp_nslot);
                 }
-                int a=glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=prefill);
+                int a=glm5_forward_prefill_chunk(m,Xc,S,pa,pa+S>=pend);
                 if(a>=0) pf_last=a;
                 for(size_t i=0;i<(size_t)S*C;i++) if(!(Xc[i]==Xc[i])) nan++;
                 if(GRank==0 && envi("GLM5_PREFILL_ROLLING",1)){
                     double dt=now_sec()-t0;
                     logmsg("prefill_progress: %d/%d tok elapsed=%.3f rate=%.2f tok/s RSS=%.2f GB\n",
-                           p0+S,prefill,dt,dt>0?(p0+S)/dt:0.0,rss_bytes()/1e9);
+                           pa+S,pend,dt,dt>0?(p0+S)/dt:0.0,rss_bytes()/1e9);
                 }
             }
+            /* KV cache save (prompt caching): persist the processed [0,pend) Tier-A KV for reuse. */
+            { const char*kvs=getenv("GLM5_KV_SAVE"); if(kvs&&*kvs && MyRank==0) glm5_kv_save(m,kvs,pend); }
             glm5_afree(Xc); glm5_free_mstream(m);
         } else {
             for(int p=0;p<prefill;p++){
