@@ -73,11 +73,27 @@ fapp single core (hd=256 N=384 win=512), cumulative:
 relL2 still bit-identical (0.00589 / 0.00430 / 0.00585). **Total 103.8M → 44.4M = 2.34×
 fewer cycles per core** vs the original scalar softmax.
 
-Caveats / next lever (#3): A64FX **scatter is slow** and the per-tile `memset(Pp)` adds
-shared-memory write traffic, so at 48 threads the wall-clock gain is BW-masked (per-core
-is the clean signal). The real SWA lever is **skipping zero key-blocks in P·V** (the
-window makes most of `Pp` zero — contract P·V only over active key-tiles per qt-tile),
-which removes BOTH the memset and the wasted P·V compute. The GEMMs stay at 93–96 %.
+## ✅ Skip zero key-blocks (lever #3) — landed: O(N²) → O(N·window)
+Each query-tile only attends keys in [active_lo, active_hi) — causal `k≤qmax`, SWA
+`k≥q0−win+1` — so keys outside are 0 for all 12 rows. QK^T, the `memset`, the pack,
+and P·V now run only over the active key-tile range `[kt_lo,kt_hi)` instead of all `KT`.
+SWA becomes window-bounded (~9 tiles regardless of N); full-causal becomes triangle-bounded.
 
-Reproduce: `make attn_profile_fj && OMP_NUM_THREADS=1 taskset -c 12 bash profile_fapp.sh attn_profile_fj "256 384 512" prof_attn_vec`
-(env `ATTN_SCALAR_EXP=1` for the libm baseline).
+A/B (env `ATTN_NOSKIP=1`), hd=256 SWA win=512, best-of-3 wall-clock (48 cores):
+| N | no-skip | **skip** | speedup |
+|---|--:|--:|--:|
+| 768 | 0.510 ms | 0.505 ms | 1.01× (window≈seq) |
+| 1536 | 0.791 ms | 0.646 ms | 1.22× |
+| 4096 | 2.811 ms | **0.856 ms** | **3.28×** |
+
+Speedup grows with N (the O(N²)→O(N·window) crossover) — the real win for long-context
+prefill, where 5/6 of Gemma-4 layers are SWA(512). relL2 bit-identical (skipped tiles
+were exactly zero-contribution). Also bounds full-causal to the triangle.
+
+## Cumulative attention progress (this session)
+scalar+no-FZ16 baseline → FZ16 → FEXPA softmax → vec transpose/pack → skip-zero-blocks.
+GEMM microkernels unchanged at 93–96 %; the wins are all in the softmax/pack/iteration glue.
+
+Reproduce: `make attn_profile && OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores ./attn_profile 256 4096 512`
+(env `ATTN_NOSKIP=1` no-skip baseline, `ATTN_SCALAR_EXP=1` libm softmax).
+fapp: `make attn_profile_fj && OMP_NUM_THREADS=1 taskset -c 12 bash profile_fapp.sh attn_profile_fj "256 384 512" prof_attn_vec`.

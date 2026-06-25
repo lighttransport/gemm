@@ -104,6 +104,7 @@ int main(int argc,char**argv){
     float*Ofu=(float*)xmap((size_t)Npad*hd*sizeof(float));
     int QT=Npad/MR;
     int scalar_exp=getenv("ATTN_SCALAR_EXP")?1:0;  /* A/B: libm expf vs FEXPA sve_expf */
+    int noskip=getenv("ATTN_NOSKIP")?1:0;          /* A/B: process all key-tiles (no window skip) */
 
     /* scratch per thread allocated inside loop (sized by hd,Kpad) */
     double freq=(double)rdfreq(); volatile uint64_t c0=0,c1=0; int reps=20;
@@ -123,8 +124,16 @@ int main(int argc,char**argv){
         for(int qt=0;qt<QT;qt++){
             /* pack Q: Aq[d*12+r] = Q[qt*12+r][d] */
             for(int d=0;d<hd;d++) for(int r=0;r<MR;r++){ int qi=qt*MR+r; Aq[(size_t)d*MR+r]= qi<N? Q[(size_t)qi*hd+d]:(_Float16)0; }
-            /* QK^T per key-tile -> sc[12][Kpad] (vectorized contiguous row copy) */
-            for(int kt=0;kt<KT;kt++){
+            /* Active key-tile range for this query-tile: keys outside [active_lo,active_hi)
+             * are 0 for ALL 12 rows (causal: k<=qmax; SWA: k>=q0-win+1), so QK^T and P*V
+             * skip them. SWA -> O(window); full-causal -> O(triangle), not O(seq). */
+            int q0=qt*MR, qmax=q0+MR-1; if(qmax>=N)qmax=N-1;
+            int active_lo=0; if(win){ int s=q0-win+1; if(s>0)active_lo=s; }
+            int active_hi=qmax+1;
+            int kt_lo=active_lo/NR, kt_hi=(active_hi+NR-1)/NR; if(kt_hi>KT)kt_hi=KT;
+            if(noskip){ kt_lo=0; kt_hi=KT; }   /* A/B: process all key-tiles (old behavior) */
+            /* QK^T per active key-tile -> sc[12][active] (vectorized contiguous row copy) */
+            for(int kt=kt_lo;kt<kt_hi;kt++){
                 float Ctile[MR*NR];
                 micro_kernel_fp16_12x2_swp(Aq, Bqk+(size_t)kt*hd*NR, Ctile, hd, 0, (int64_t)NR*4);
                 int vl=(int)svcntw();
@@ -134,7 +143,7 @@ int main(int argc,char**argv){
             /* causal mask + softmax per row, then pack P TRANSPOSED into Pp[k*12+r].
              * Pp is zeroed once (invalid keys -> 0 for P*V); each row writes only its
              * valid [start,last) range. Transpose = fp16 scatter (stride MR per key). */
-            memset(Pp, 0, (size_t)Kpad*MR*sizeof(_Float16));
+            memset(Pp+(size_t)kt_lo*NR*MR, 0, (size_t)(kt_hi-kt_lo)*NR*MR*sizeof(_Float16));
             int vl=(int)svcntw();
             for(int r=0;r<MR;r++){
                 int qi=qt*MR+r; if(qi>=N) continue;            /* memset already 0 */
@@ -169,8 +178,8 @@ int main(int argc,char**argv){
             for(int dt=0;dt<hdt;dt++){
                 float Otile[MR*NR];
                 const _Float16*bv=Bv+(size_t)dt*Kpad*NR;
-                micro_kernel_fp16_12x2_swp(Pp, bv, Otile, NR, 0, (int64_t)NR*4);
-                for(int kb=1;kb<KT;kb++)
+                micro_kernel_fp16_12x2_swp(Pp+(size_t)kt_lo*NR*MR, bv+(size_t)kt_lo*NR*NR, Otile, NR, 0, (int64_t)NR*4);
+                for(int kb=kt_lo+1;kb<kt_hi;kb++)
                     micro_kernel_fp16_12x2_swp_accum(Pp+(size_t)kb*NR*MR, bv+(size_t)kb*NR*NR, Otile, NR, 0, (int64_t)NR*4);
                 for(int r=0;r<MR;r++){ int qi=qt*MR+r; if(qi<N) for(int c=0;c<NR;c++) Ofu[(size_t)qi*hd+dt*NR+c]=Otile[r*NR+c]; }
             }
