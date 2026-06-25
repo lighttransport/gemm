@@ -93,6 +93,45 @@ static inline void q8v2_8row(float out[8], const int8_t*wq8,const float*d8,int n
     out[0]=svaddv_f32(p3,f0);out[1]=svaddv_f32(p3,f1);out[2]=svaddv_f32(p3,f2);out[3]=svaddv_f32(p3,f3);
     out[4]=svaddv_f32(p3,f4);out[5]=svaddv_f32(p3,f5);out[6]=svaddv_f32(p3,f6);out[7]=svaddv_f32(p3,f7);
 }
+/* Q8v3: like Q8v2 but 2 fp accumulators/row (16 total, even/odd pairs) to hide
+ * the svmla dependency latency (ILP 8 -> 16). Even nb (pairs), pairs even-ish. */
+static inline void q8v3_8row(float out[8], const int8_t*wq8,const float*d8,int nb,int cols,const int8_t*xi8){
+    svbool_t pg=svptrue_b8(), p3=svptrue_b32(), lo8=svwhilelt_b32((uint32_t)0,(uint32_t)8);
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0),a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+    svfloat32_t b0=svdup_f32(0),b1=svdup_f32(0),b2=svdup_f32(0),b3=svdup_f32(0),b4=svdup_f32(0),b5=svdup_f32(0),b6=svdup_f32(0),b7=svdup_f32(0);
+    size_t rs=(size_t)cols; const int8_t*w[8]; const float*d[8];
+    for(int r=0;r<8;r++){ w[r]=wq8+(size_t)r*rs; d[r]=d8+(size_t)r*nb; }
+    int pairs=nb/2, p=0;
+#define MAC(F,RR,PP) { svint32_t sv=svdot_s32(svdup_s32(0),svld1_s8(pg,w[RR]+(size_t)(PP)*64),xb); \
+    F=svmla_f32_x(p3,F,svcvt_f32_s32_x(p3,sv),svsel_f32(lo8,svdup_f32(d[RR][2*(PP)]),svdup_f32(d[RR][2*(PP)+1]))); }
+    for(;p+2<=pairs;p+=2){
+        { svint8_t xb=svld1_s8(pg,xi8+(size_t)p*64);      MAC(a0,0,p)MAC(a1,1,p)MAC(a2,2,p)MAC(a3,3,p)MAC(a4,4,p)MAC(a5,5,p)MAC(a6,6,p)MAC(a7,7,p) }
+        { svint8_t xb=svld1_s8(pg,xi8+(size_t)(p+1)*64);  MAC(b0,0,p+1)MAC(b1,1,p+1)MAC(b2,2,p+1)MAC(b3,3,p+1)MAC(b4,4,p+1)MAC(b5,5,p+1)MAC(b6,6,p+1)MAC(b7,7,p+1) }
+    }
+    for(;p<pairs;p++){ svint8_t xb=svld1_s8(pg,xi8+(size_t)p*64); MAC(a0,0,p)MAC(a1,1,p)MAC(a2,2,p)MAC(a3,3,p)MAC(a4,4,p)MAC(a5,5,p)MAC(a6,6,p)MAC(a7,7,p) }
+#undef MAC
+    out[0]=svaddv_f32(p3,svadd_f32_x(p3,a0,b0));out[1]=svaddv_f32(p3,svadd_f32_x(p3,a1,b1));
+    out[2]=svaddv_f32(p3,svadd_f32_x(p3,a2,b2));out[3]=svaddv_f32(p3,svadd_f32_x(p3,a3,b3));
+    out[4]=svaddv_f32(p3,svadd_f32_x(p3,a4,b4));out[5]=svaddv_f32(p3,svadd_f32_x(p3,a5,b5));
+    out[6]=svaddv_f32(p3,svadd_f32_x(p3,a6,b6));out[7]=svaddv_f32(p3,svadd_f32_x(p3,a7,b7));
+}
+/* Q8v4: interleaved-by-4 pair layout so svdot even lanes=block0 partials,
+ * odd=block1. Per-lane d-vector is svld1rq([d0,d1,d0,d1]) (1 replicated load,
+ * no svsel/dup). wi/xi pre-interleaved; dp = 4 floats [d0,d1,d0,d1] per pair. */
+static inline void q8v4_8row(float out[8], const int8_t*wq8i,const float*dp8,int pairs,size_t rs,const int8_t*xi8i){
+    svbool_t pg=svptrue_b8(), p3=svptrue_b32();
+    svfloat32_t f0=svdup_f32(0),f1=svdup_f32(0),f2=svdup_f32(0),f3=svdup_f32(0),f4=svdup_f32(0),f5=svdup_f32(0),f6=svdup_f32(0),f7=svdup_f32(0);
+    const int8_t*w[8]; const float*d[8];
+    for(int r=0;r<8;r++){ w[r]=wq8i+(size_t)r*rs; d[r]=dp8+(size_t)r*pairs*4; }
+    for(int p=0;p<pairs;p++){ svint8_t xb=svld1_s8(pg,xi8i+(size_t)p*64);
+#define M4(F,RR) { svfloat32_t dv=svld1rq_f32(p3,d[RR]+(size_t)p*4); \
+    F=svmla_f32_x(p3,F,svcvt_f32_s32_x(p3,svdot_s32(svdup_s32(0),svld1_s8(pg,w[RR]+(size_t)p*64),xb)),dv); }
+        M4(f0,0)M4(f1,1)M4(f2,2)M4(f3,3)M4(f4,4)M4(f5,5)M4(f6,6)M4(f7,7)
+#undef M4
+    }
+    out[0]=svaddv_f32(p3,f0);out[1]=svaddv_f32(p3,f1);out[2]=svaddv_f32(p3,f2);out[3]=svaddv_f32(p3,f3);
+    out[4]=svaddv_f32(p3,f4);out[5]=svaddv_f32(p3,f5);out[6]=svaddv_f32(p3,f6);out[7]=svaddv_f32(p3,f7);
+}
 /* exact fp32 reference matvec from Q4_0 (true dequantized weights). */
 static void ref_mv(float*dst,const block_q4_0*W,size_t rb,const float*x,int rows,int cols){
     int nb=cols/32;
@@ -177,6 +216,31 @@ int main(int argc,char**argv){
         #pragma omp parallel for num_threads(nt) schedule(static)
         for(int r0=0;r0<rows;r0+=8){ float o[8]; q8v2_8row(o,WQ8+(size_t)r0*cols,D8+(size_t)r0*nb,nb,cols,xi8); for(int i=0;i<8;i++) di8[r0+i]=o[i]*inv_x0; }
         double e=now()-s; if(e<bqv2)bqv2=e; }
+    double bqv3=1e30; for(int rep=0;rep<20;rep++){ double s=now();
+        #pragma omp parallel for num_threads(nt) schedule(static)
+        for(int r0=0;r0<rows;r0+=8){ float o[8]; q8v3_8row(o,WQ8+(size_t)r0*cols,D8+(size_t)r0*nb,nb,cols,xi8); for(int i=0;i<8;i++) di8[r0+i]=o[i]*inv_x0; }
+        double e=now()-s; if(e<bqv3)bqv3=e; }
+    /* Q8v4: build interleaved-by-4 weights + [d0,d1,d0,d1]/pair + interleaved x */
+    int pairs=nb/2; size_t dp8sz=(size_t)rows*pairs*4*4;
+    int8_t*WQ8i=(int8_t*)mmap(NULL,q8sz,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    float *DP8=(float *)mmap(NULL,dp8sz,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    int8_t*xi8i=(int8_t*)aligned_alloc(256,(size_t)pairs*64);
+    for(int p=0;p<pairs;p++) for(int gg=0;gg<8;gg++){ const int8_t*sx=xi8+(size_t)p*64; int8_t*dx=xi8i+(size_t)p*64+gg*8;
+        for(int k=0;k<4;k++){ dx[k]=sx[gg*4+k]; dx[4+k]=sx[32+gg*4+k]; } }
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    for(int r=0;r<rows;r++){ const int8_t*sw=WQ8+(size_t)r*cols; int8_t*dw=WQ8i+(size_t)r*cols; const float*dd=D8+(size_t)r*nb; float*dpp=DP8+(size_t)r*pairs*4;
+        for(int p=0;p<pairs;p++){ const int8_t*spw=sw+(size_t)p*64; int8_t*dpw=dw+(size_t)p*64;
+            for(int gg=0;gg<8;gg++) for(int k=0;k<4;k++){ dpw[gg*8+k]=spw[gg*4+k]; dpw[gg*8+4+k]=spw[32+gg*4+k]; }
+            dpp[p*4+0]=dd[2*p]; dpp[p*4+1]=dd[2*p+1]; dpp[p*4+2]=dd[2*p]; dpp[p*4+3]=dd[2*p+1]; } }
+    double bqv4=1e30; for(int rep=0;rep<20;rep++){ double s=now();
+        #pragma omp parallel for num_threads(nt) schedule(static)
+        for(int r0=0;r0<rows;r0+=8){ float o[8]; q8v4_8row(o,WQ8i+(size_t)r0*cols,DP8+(size_t)r0*pairs*4,pairs,(size_t)cols,xi8i); for(int i=0;i<8;i++) di8[r0+i]=o[i]*inv_x0; }
+        double e=now()-s; if(e<bqv4)bqv4=e; }
+    double e2v4=0; { float*tmp=(float*)aligned_alloc(256,(size_t)rows*4);
+      #pragma omp parallel for num_threads(nt) schedule(static)
+      for(int r0=0;r0<rows;r0+=8){ float o[8]; q8v4_8row(o,WQ8i+(size_t)r0*cols,DP8+(size_t)r0*pairs*4,pairs,(size_t)cols,xi8i); for(int i=0;i<8;i++) tmp[r0+i]=o[i]*inv_x0; }
+      for(int i=0;i<rows;i++){ double d=tmp[i]-dref[i]; e2v4+=d*d; } free(tmp); }
+    munmap(WQ8i,q8sz); munmap(DP8,dp8sz); free(xi8i);
     /* accuracy of Q8v2 (should match per-block ~1%) */
     double e2v=0; { float*tmp=(float*)aligned_alloc(256,(size_t)rows*4);
       #pragma omp parallel for num_threads(nt) schedule(static)
@@ -199,6 +263,17 @@ int main(int argc,char**argv){
             for(int j=0;j<16;j++){ bs+=((row[b].qs[j]&0xf)-8)*xi8[b*32+j]; bs+=((row[b].qs[j]>>4)-8)*xi8[b*32+j+16]; }
             s+=(double)d*bs; }
         double v=s*inv_x - dref[r]; e2b+=v*v; }
+    /* per-ROW scale accuracy: same BW-bound kernel as per-tensor (1 SDOT/pair),
+     * but each row uses its own scale_w_r = 127/(8*max_d_in_row). Output scale
+     * is per-row (free). Does row-to-row d variation explain the 8.9%? */
+    double e2r=0;
+    #pragma omp parallel for schedule(static) reduction(+:e2r)
+    for(int r=0;r<rows;r++){ const block_q4_0*row=(const block_q4_0*)((const uint8_t*)W+(size_t)r*rb);
+        float md=0; for(int b=0;b<nb;b++){ float a=fabsf(ggml_fp16_to_fp32(row[b].d)); if(a>md)md=a; }
+        float swr=md>0?127.0f/(8.0f*md):1.0f; double acc=0;
+        for(int b=0;b<nb;b++){ float d=ggml_fp16_to_fp32(row[b].d); int di=(int)lrintf(d*swr); if(di>127)di=127; if(di<-128)di=-128;
+            for(int j=0;j<16;j++){ acc+=(double)((row[b].qs[j]&0xf)-8)*di*xi8[b*32+j]; acc+=(double)((row[b].qs[j]>>4)-8)*di*xi8[b*32+16+j]; } }
+        double v=acc/((double)swr*x_inv)-dref[r]; e2r+=v*v; }
     double opsf=2.0*rows*cols;
     printf("\n=== %s (rows=%d cols=%d) @ %d threads ===\n",tname,rows,cols,nt);
     printf("  PERF @ %d threads (NUMA-local HBM, best-of-N):\n",nt);
@@ -206,11 +281,15 @@ int main(int argc,char**argv){
     printf("    int8 per-TENSOR SDOT : %.3f ms  %.1f GIOPS  %.1fx\n",bi*1000,opsf/bi/1e9,bf/bi);
     printf("    int8 per-BLOCK (Q8_0): %.3f ms  %.1f GIOPS  %.1fx  (svaddv/block)\n",bq*1000,opsf/bq/1e9,bf/bq);
     printf("    int8 per-BLOCK (Q8v) : %.3f ms  %.1f GIOPS  %.1fx  (32-wide, fp-accum/row)\n",bqv*1000,opsf/bqv/1e9,bf/bqv);
-    printf("    int8 per-BLOCK (Q8v2): %.3f ms  %.1f GIOPS  %.1fx  (64-wide pair, fp-accum/row)\n",bqv2*1000,opsf/bqv2/1e9,bf/bqv2);
+    printf("    int8 per-BLOCK (Q8v2): %.3f ms  %.1f GIOPS  %.1fx  %.0f GB/s (64-wide pair)\n",bqv2*1000,opsf/bqv2/1e9,bf/bqv2,(double)(q8sz+(size_t)rows*nb*4)/bqv2/1e9);
+    printf("    int8 per-BLOCK (Q8v3): %.3f ms  %.1f GIOPS  %.1fx  %.0f GB/s (16-acc ILP)\n",bqv3*1000,opsf/bqv3/1e9,bf/bqv3,(double)(q8sz+(size_t)rows*nb*4)/bqv3/1e9);
+    printf("    int8 per-BLOCK (Q8v4): %.3f ms  %.1f GIOPS  %.1fx  %.0f GB/s (interleave+ld1rq)\n",bqv4*1000,opsf/bqv4/1e9,bf/bqv4,(double)(q8sz+(size_t)rows*pairs*16)/bqv4/1e9);
     printf("  ACCURACY vs exact fp32-Q4_0 (rms=%.4g):\n", sqrt(s2/rows));
     printf("    per-TENSOR int8 : relL2=%.4f  maxabs=%.4g  <- fast but lossy\n", sqrt(e2/(s2+1e-12)), mx);
+    printf("    per-ROW    int8 : relL2=%.4f             <- SAME fast kernel, per-row scale\n", sqrt(e2r/(s2+1e-12)));
     printf("    per-BLOCK  Q8_0 : relL2=%.4f             <- accurate\n", sqrt(e2b/(s2+1e-12)));
     printf("    per-BLOCK  Q8v2 : relL2=%.4f (SVE kernel, real output)\n", sqrt(e2v/(s2+1e-12)));
+    printf("    per-BLOCK  Q8v4 : relL2=%.4f (interleaved SVE kernel)\n", sqrt(e2v4/(s2+1e-12)));
     munmap(WI8,i8sz); munmap(WQ8,q8sz); munmap(D8,(size_t)rows*nb*4); free(W); free(x); free(dref); free(di8); free(xi8);
     return 0;
 }
