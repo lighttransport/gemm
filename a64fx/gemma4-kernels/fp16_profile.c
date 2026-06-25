@@ -24,6 +24,10 @@ void micro_kernel_fp16_12x2_swp(const _Float16*A,const _Float16*B,float*C,int64_
 
 static inline uint64_t rdcyc(void){ uint64_t v; __asm__ volatile("mrs %0, cntvct_el0":"=r"(v)); return v; }
 static inline uint64_t rdfreq(void){ uint64_t v; __asm__ volatile("mrs %0, cntfrq_el0":"=r"(v)); return v; }
+/* FPCR.FZ (bit24) + FZ16 (bit19): flush fp32/fp16 subnormals to zero. A64FX handles
+ * subnormals in slow microcode; fp16 GEMM/attention (small accumulands, softmax probs)
+ * is subnormal-prone -> set this or eat a huge stall. Off via env FP16_NOFZ=1. */
+static inline void set_fz(void){ uint64_t f; __asm__ volatile("mrs %0,fpcr":"=r"(f)); f|=(1ULL<<24)|(1ULL<<19); __asm__ volatile("msr fpcr,%0"::"r"(f)); }
 #define MR 12
 #define NR 64
 
@@ -32,6 +36,7 @@ int main(int argc,char**argv){
     long reps= argc>2?atol(argv[2]):2000;
     double cpu_ghz=2.0, peak=256.0;          /* fp16 FMA GFLOPS/core */
     if(K&1)K++;
+    if(!getenv("FP16_NOFZ")) set_fz();
 
     _Float16*A=(_Float16*)aligned_alloc(256,(size_t)K*MR*sizeof(_Float16)); /* [K][12] */
     _Float16*B=(_Float16*)aligned_alloc(256,(size_t)K*NR*sizeof(_Float16)); /* [K][64] */

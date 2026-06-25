@@ -17,6 +17,19 @@ So the int8 `q8v2` kernel is the *universal* weight×activation prefill GEMM, an
 fp16 kernel is only for attention's activation×activation GEMMs (QK^T, P·V).
 Real dims: n_embd=5376, n_ff=21504, n_heads=32, head_dim 256 (SWA) / 512 (full).
 
+## ⚠ FP16 needs FPCR.FZ16 (3× swing — fapp-confirmed)
+A64FX handles fp16/fp32 **subnormals in slow microcode**. fp16 GEMM accumulands and
+attention **softmax probabilities go subnormal**, so any caller of the fp16 kernel /
+fused attention must set `FPCR.FZ (bit24) + FZ16 (bit19)` **per thread**:
+```c
+static inline void set_fz(void){ uint64_t f; asm volatile("mrs %0,fpcr":"=r"(f));
+    f|=(1ULL<<24)|(1ULL<<19); asm volatile("msr fpcr,%0"::"r"(f)); }
+```
+Measured (fapp): fp16 12×2 @K=384 **31 % → 93.6 %** of peak; fused attention
+**284 → 833 GF/s** (hd256 N768), **462 → 2128 GF/s** (hd256 N1536). The drivers here
+set it by default (`fp16_profile`: env `FP16_NOFZ=1` to disable; `attn_profile`: each
+OpenMP thread sets its own). **This is mandatory for the real WS3 attention integration.**
+
 ## Kernels
 
 | Kernel (.S) | Shape | Used for | Precision |

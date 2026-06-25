@@ -32,6 +32,10 @@ void micro_kernel_fp16_12x2_swp_accum(const _Float16*A,const _Float16*B,float*C,
 
 static inline uint64_t rdcyc(void){ uint64_t v; __asm__ volatile("mrs %0, cntvct_el0":"=r"(v)); return v; }
 static inline uint64_t rdfreq(void){ uint64_t v; __asm__ volatile("mrs %0, cntfrq_el0":"=r"(v)); return v; }
+/* FPCR.FZ+FZ16: flush fp32/fp16 subnormals. CRITICAL for fp16 attention — softmax
+ * probabilities and small QK/PV products go subnormal; without this the fp16 kernel
+ * runs ~3x slower (A64FX subnormal microcode). Each OpenMP thread must set its own. */
+static inline void set_fz(void){ uint64_t f; __asm__ volatile("mrs %0,fpcr":"=r"(f)); f|=(1ULL<<24)|(1ULL<<19); __asm__ volatile("msr fpcr,%0"::"r"(f)); }
 static void*xmap(size_t n){ void*p=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); if(p==MAP_FAILED){perror("mmap");exit(1);} return p; }
 #define MR 12
 #define NR 64
@@ -94,6 +98,7 @@ int main(int argc,char**argv){
       }
       #pragma omp parallel num_threads(nt)
       {
+        set_fz();   /* per-thread FPCR.FZ16 — softmax probs go subnormal otherwise */
         _Float16*Aq=(_Float16*)malloc((size_t)hd*MR*sizeof(_Float16));      /* [hd][12] */
         float*sc=(float*)malloc((size_t)MR*Kpad*sizeof(float));            /* scores [12][Kpad] fp32 */
         _Float16*Pp=(_Float16*)malloc((size_t)Kpad*MR*sizeof(_Float16));   /* P packed [seq][12] for PV */
