@@ -105,6 +105,7 @@ int main(int argc,char**argv){
     int QT=Npad/MR;
     int scalar_exp=getenv("ATTN_SCALAR_EXP")?1:0;  /* A/B: libm expf vs FEXPA sve_expf */
     int noskip=getenv("ATTN_NOSKIP")?1:0;          /* A/B: process all key-tiles (no window skip) */
+    int flash=getenv("ATTN_FLASH")?1:0;            /* A/B: single-pass flash (online softmax) vs 2-pass */
 
     /* scratch per thread allocated inside loop (sized by hd,Kpad) */
     double freq=(double)rdfreq(); volatile uint64_t c0=0,c1=0; int reps=20;
@@ -120,8 +121,61 @@ int main(int argc,char**argv){
         _Float16*Aq=(_Float16*)malloc((size_t)hd*MR*sizeof(_Float16));      /* [hd][12] */
         float*sc=(float*)malloc((size_t)MR*Kpad*sizeof(float));            /* scores [12][Kpad] fp32 */
         _Float16*Pp=(_Float16*)malloc((size_t)Kpad*MR*sizeof(_Float16));   /* P packed [seq][12] for PV */
+        /* flash scratch: running output/max/sum + one key-block of P */
+        float*Of=(float*)malloc((size_t)MR*hd*sizeof(float));              /* O accumulator [12][hd] */
+        _Float16*Ppb=(_Float16*)malloc((size_t)NR*MR*sizeof(_Float16));    /* P^T one block [64][12] */
         #pragma omp for schedule(dynamic)
         for(int qt=0;qt<QT;qt++){
+          if(flash){
+            /* ── FLASH: single pass over active key-blocks, online softmax ──
+             * Per block kb: S=QK^T[12][64] -> mask -> online (m,l) update ->
+             * transpose P -> rescale O*=corr -> O += P@V. No full-score materialization. */
+            for(int d=0;d<hd;d++) for(int r=0;r<MR;r++){ int qi=qt*MR+r; Aq[(size_t)d*MR+r]= qi<N? Q[(size_t)qi*hd+d]:(_Float16)0; }
+            int q0=qt*MR, qmax=q0+MR-1; if(qmax>=N)qmax=N-1;
+            int active_lo=0; if(win){ int s=q0-win+1; if(s>0)active_lo=s; }
+            int kt_lo=active_lo/NR, kt_hi=(qmax+1+NR-1)/NR; if(kt_hi>KT)kt_hi=KT; if(noskip){kt_lo=0;kt_hi=KT;}
+            float m[MR],l[MR],corr[MR]; int vl=(int)svcntw();
+            for(int r=0;r<MR;r++){ m[r]=-1e30f; l[r]=0.0f; }
+            for(size_t i=0;i<(size_t)MR*hd;i++) Of[i]=0.0f;
+            svuint32_t lanes=svindex_u32(0,(uint32_t)MR);
+            for(int kb=kt_lo;kb<kt_hi;kb++){
+                float S[MR*NR];
+                micro_kernel_fp16_12x2_swp(Aq, Bqk+(size_t)kb*hd*NR, S, hd, 0, (int64_t)NR*4);
+                memset(Ppb,0,(size_t)NR*MR*sizeof(_Float16));
+                for(int r=0;r<MR;r++){
+                    int qi=qt*MR+r; if(qi>=N){ corr[r]=1.0f; continue; }
+                    int start=0; if(win&&qi+1>win) start=qi-win+1;
+                    int c0=start-kb*NR; if(c0<0)c0=0; int c1=qi+1-kb*NR; if(c1>NR)c1=NR;
+                    if(c1<=c0){ corr[r]=1.0f; continue; }              /* no valid keys this block */
+                    float*Srow=S+r*NR;
+                    /* block rowmax over [c0,c1) */
+                    svfloat32_t vbm=svdup_f32(-1e30f);
+                    for(int c=c0;c<c1;c+=vl){ svbool_t pg=svwhilelt_b32(c,c1); vbm=svmax_m(pg,vbm,svld1(pg,Srow+c)); }
+                    float bm=svmaxv(svptrue_b32(),vbm); float nm=m[r]>bm?m[r]:bm;
+                    float cr=expf(m[r]-nm); corr[r]=cr;                /* old-accumulator rescale */
+                    svfloat32_t vnm=svdup_f32(nm), vsum=svdup_f32(0.0f);
+                    for(int c=c0;c<c1;c+=vl){ svbool_t pg=svwhilelt_b32(c,c1);
+                        svfloat32_t p=sve_expf(pg, svsub_x(pg, svld1(pg,Srow+c), vnm));
+                        vsum=svadd_m(pg,vsum,p);
+                        /* transpose into Ppb[c*MR+r] (fp16 halfword scatter) */
+                        svuint32_t hu=svreinterpret_u32_f16(svcvt_f16_f32_x(pg,p));
+                        svuint32_t idx=svadd_n_u32_x(pg,lanes,(uint32_t)(c*MR+r));
+                        svst1h_scatter_u32index_u32(pg,(uint16_t*)Ppb,idx,hu);
+                    }
+                    l[r]=l[r]*cr + svaddv(svptrue_b32(),vsum); m[r]=nm;
+                }
+                /* rescale O *= corr (per row), then O += P@V over this block's keys */
+                for(int r=0;r<MR;r++){ if(corr[r]==1.0f) continue; svfloat32_t vc=svdup_f32(corr[r]);
+                    for(int d=0;d<hd;d+=vl){ svbool_t pg=svwhilelt_b32(d,hd); float*o=Of+(size_t)r*hd+d; svst1(pg,o,svmul_x(pg,svld1(pg,o),vc)); } }
+                for(int dt=0;dt<hdt;dt++)
+                    micro_kernel_fp16_12x2_swp_accum(Ppb, Bv+(size_t)dt*Kpad*NR + (size_t)kb*NR*NR, Of+dt*NR, NR, 0, (int64_t)hd*4);
+            }
+            /* finalize O /= l, store */
+            for(int r=0;r<MR;r++){ int qi=qt*MR+r; if(qi>=N) continue; float inv=l[r]>0?1.0f/l[r]:0.0f;
+                svfloat32_t vinv=svdup_f32(inv);
+                for(int d=0;d<hd;d+=vl){ svbool_t pg=svwhilelt_b32(d,hd); svst1(pg, Ofu+(size_t)qi*hd+d, svmul_x(pg,svld1(pg,Of+(size_t)r*hd+d),vinv)); } }
+            continue;
+          }
             /* pack Q: Aq[d*12+r] = Q[qt*12+r][d] */
             for(int d=0;d<hd;d++) for(int r=0;r<MR;r++){ int qi=qt*MR+r; Aq[(size_t)d*MR+r]= qi<N? Q[(size_t)qi*hd+d]:(_Float16)0; }
             /* Active key-tile range for this query-tile: keys outside [active_lo,active_hi)
@@ -184,7 +238,7 @@ int main(int argc,char**argv){
                 for(int r=0;r<MR;r++){ int qi=qt*MR+r; if(qi<N) for(int c=0;c<NR;c++) Ofu[(size_t)qi*hd+dt*NR+c]=Otile[r*NR+c]; }
             }
         }
-        free(Aq); free(sc); free(Pp);
+        free(Aq); free(sc); free(Pp); free(Of); free(Ppb);
       }
       if(rep==reps-1){ c1=rdcyc();
 #ifdef USE_FAPP

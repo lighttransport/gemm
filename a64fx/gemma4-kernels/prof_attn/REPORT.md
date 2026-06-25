@@ -90,6 +90,24 @@ Speedup grows with N (the O(N²)→O(N·window) crossover) — the real win for 
 prefill, where 5/6 of Gemma-4 layers are SWA(512). relL2 bit-identical (skipped tiles
 were exactly zero-contribution). Also bounds full-causal to the triangle.
 
+## Flash-attention fusion (ATTN_FLASH=1) — measured, NOT faster on A64FX
+Implemented a single-pass flash kernel (online softmax: running max/sum, O accumulator
+rescaled by `exp(m_old−m_new)` per key-block, no full-score materialization). Bit-correct
+(relL2 0.00586 vs 0.00598 — marginally *more* accurate via fp32 online accumulation).
+
+Best-of-3 wall-clock (48 cores) vs the optimized 2-pass:
+| shape | 2-pass | flash |
+|---|--:|--:|
+| SWA N=768 / 1536 / 2048 / 4096 / 8192 | 0.71 / 0.91 / 0.91 / 1.09 / 1.52 | 0.78 / 0.80 / 0.90 / 1.20 / 1.75 ms |
+| full-causal hd512 N=1024 / 2048 / 4096 | 0.87 / 1.38 / 3.67 | 1.02 / 1.83 / 5.66 ms |
+
+**2-pass wins** (flash neutral-to-worse for SWA, clearly worse for full-causal). The
+online O-rescaling (12×hd per key-block over N/64 blocks) + per-block transpose overhead
+is not offset by the memory saving, because the 2-pass *after skip-zero-blocks* already
+keeps the window/triangle working set cache-resident. Confirms this repo's prior finding
+("two-phase score-tile reuse beat direct fused by 2.75×", ../../doc/FP16_GEMM_CEILING.md
+fused-gemm.md). Flash kept as opt-in reference (`ATTN_FLASH=1`, default off).
+
 ## Cumulative attention progress (this session)
 scalar+no-FZ16 baseline → FZ16 → FEXPA softmax → vec transpose/pack → skip-zero-blocks.
 GEMM microkernels unchanged at 93–96 %; the wins are all in the softmax/pack/iteration glue.
