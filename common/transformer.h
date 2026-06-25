@@ -6551,6 +6551,78 @@ static int tf_gemm_q4_0_pair_gelu_tokenmajor(float *Y_out, const qtensor *gate,
     return 1;
 }
 
+#ifdef TF_HAVE_Q8V2
+/* Q8v2 per-block int8 FFN gate/up GEMM with fused fast-GELU. Drop-in for
+ * tf_gemm_q4_0_pair_gelu_tokenmajor (~12x faster, argmax-identical, ~0.6% relL2).
+ * Q4_0 weights packed ON-THE-FLY per n-tile to centered-nibble int8 (pack_B layout,
+ * per-thread scratch — never globally cached, avoids the 30GB OOM); activations
+ * quantized per-32-block per-row to int8. Kernel: gemma4-kernels/kernel_q8v2_3x4.S.
+ * Enable at runtime with env TF_Q8V2=1. Requires K%256==0 and n_rows%64==0. */
+extern void kernel_q8v2_3x4(const int8_t*,const float*,const int8_t*,const float*,long,float*,long);
+static int tf_gemm_q8v2_pair_gelu_tokenmajor(float *Y, const qtensor *gate,
+        const qtensor *up, const float *X, int n_rows, int N,
+        int out_stride, int X_stride, int n_threads) {
+    if (!gate || !up || gate->type!=GGML_TYPE_Q4_0 || up->type!=GGML_TYPE_Q4_0) return 0;
+    if (gate->n_cols!=up->n_cols || gate->n_rows!=up->n_rows ||
+        gate->n_cols!=X_stride || n_rows!=gate->n_rows) return 0;
+    int K = gate->n_cols;
+    if (K%256 || n_rows%64) return 0;
+    const int MR=3, NR=64, BLK=32;
+    int nb=K/BLK, NTn=n_rows/NR, MTn=(N+MR-1)/MR;
+    int nt=n_threads<1?1:n_threads;
+    size_t aqt=(size_t)nb*MR*BLK, adt=(size_t)nb*MR;
+    int8_t*Aq=(int8_t*)malloc((size_t)MTn*aqt);
+    float *Ad=(float*)malloc((size_t)MTn*adt*sizeof(float));
+    if(!Aq||!Ad){ free(Aq); free(Ad); return 0; }
+    /* 1. quantize activations per-block per-row -> int8 */
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    for(int m0=0;m0<MTn;m0++){ int8_t*aq=Aq+(size_t)m0*aqt; float*ad=Ad+(size_t)m0*adt;
+        for(int b=0;b<nb;b++) for(int r=0;r<MR;r++){ int tok=m0*MR+r;
+            float amax=0; if(tok<N) for(int k=0;k<BLK;k++){ float a=fabsf(X[(size_t)tok*X_stride+b*BLK+k]); if(a>amax)amax=a; }
+            float d=amax>0?amax/127.0f:0.0f, inv=d>0?1.0f/d:0.0f;
+            ad[b*MR+r]=d;
+            for(int k=0;k<BLK;k++){ int q=0; if(tok<N){ q=(int)lrintf(X[(size_t)tok*X_stride+b*BLK+k]*inv); if(q>127)q=127; if(q<-127)q=-127; } aq[(size_t)(b*MR+r)*BLK+k]=(int8_t)q; }
+        }
+    }
+    /* 2. per n-tile: dequant gate/up Q4_0 -> centered-nibble int8 scratch, kernel x2, GELU */
+    const block_q4_0*G=(const block_q4_0*)gate->data;
+    const block_q4_0*U=(const block_q4_0*)up->data;
+    #pragma omp parallel num_threads(nt)
+    {
+        size_t bqt=(size_t)nb*8*4*64;
+        int8_t*bqg=(int8_t*)malloc(bqt), *bqu=(int8_t*)malloc(bqt);
+        float *bdg=(float*)malloc((size_t)nb*NR*sizeof(float)), *bdu=(float*)malloc((size_t)nb*NR*sizeof(float));
+        float Cg[MR*NR], Cu[MR*NR];
+        #pragma omp for schedule(static)
+        for(int n0=0;n0<NTn;n0++){
+            for(int b=0;b<nb;b++) for(int vec=0;vec<4;vec++) for(int col=0;col<16;col++){
+                int n=n0*NR+vec*16+col;
+                const block_q4_0*gr=G+(size_t)n*nb, *ur=U+(size_t)n*nb;
+                bdg[b*NR+vec*16+col]=ggml_fp16_to_fp32(gr[b].d);
+                bdu[b*NR+vec*16+col]=ggml_fp16_to_fp32(ur[b].d);
+                for(int g3=0;g3<8;g3++) for(int kk=0;kk<4;kk++){ int k=g3*4+kk;
+                    int qg=(k<16)?(gr[b].qs[k]&0xf):(gr[b].qs[k-16]>>4);
+                    int qu=(k<16)?(ur[b].qs[k]&0xf):(ur[b].qs[k-16]>>4);
+                    size_t off=((size_t)b*8*4+(size_t)g3*4+vec)*64 + (size_t)col*4 + kk;
+                    bqg[off]=(int8_t)(qg-8); bqu[off]=(int8_t)(qu-8);
+                }
+            }
+            for(int m0=0;m0<MTn;m0++){
+                const int8_t*aq=Aq+(size_t)m0*aqt; const float*ad=Ad+(size_t)m0*adt;
+                kernel_q8v2_3x4(aq,ad,bqg,bdg,nb,Cg,(long)NR*4);
+                kernel_q8v2_3x4(aq,ad,bqu,bdu,nb,Cu,(long)NR*4);
+                for(int r=0;r<MR;r++){ int tok=m0*MR+r; if(tok>=N) continue;
+                    for(int c=0;c<NR;c++) Y[(size_t)tok*out_stride + n0*NR + c]=tf_gelu_fast_scalar(Cg[r*NR+c])*Cu[r*NR+c];
+                }
+            }
+        }
+        free(bqg); free(bqu); free(bdg); free(bdu);
+    }
+    free(Aq); free(Ad);
+    return 1;
+}
+#endif /* TF_HAVE_Q8V2 */
+
 /* Token-major GEMM: Y[tok * out_stride + row] = dot(W[row,:], X[tok,:])
  * Direct output without transpose. */
 static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const float *X,
@@ -7724,6 +7796,15 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
         t_post += tf_time_ms() - t0p;
 
         t0p = tf_time_ms();
+#ifdef TF_HAVE_Q8V2
+        static int q8v2_on = -1;
+        if (q8v2_on < 0) q8v2_on = getenv("TF_Q8V2") && atoi(getenv("TF_Q8V2"));
+        if (q8v2_on &&
+            tf_gemm_q8v2_pair_gelu_tokenmajor(bff3, &layer->ffn_gate, &layer->ffn_up,
+                                               bxb, m->n_ff, N, m->n_ff, n_embd, m->n_threads)) {
+            t_ffn_gateup += tf_time_ms() - t0p;
+        } else
+#endif
         if (fused_q4_prefill &&
             tf_gemm_q4_0_pair_gelu_tokenmajor(bff3, &layer->ffn_gate, &layer->ffn_up,
                                                bxb, m->n_ff, N, m->n_ff, n_embd,
