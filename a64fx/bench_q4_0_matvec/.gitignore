@@ -13,3 +13,6 @@ results.txt
 numa_matvec
 swar_fused
 layer_prof
+int8_local
+layer_opt
+mini_decode
