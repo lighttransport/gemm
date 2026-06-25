@@ -12,3 +12,4 @@ pc_matvec
 results.txt
 numa_matvec
 swar_fused
+layer_prof
