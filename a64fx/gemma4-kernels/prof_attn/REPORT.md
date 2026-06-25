@@ -57,8 +57,27 @@ Multi-thread throughput (48 cores):
 | hd=512 N=768 full | 860 GF/s | **1776** | 2.07× |
 | hd=256 N=1536 SWA | 2026 GF/s | **2736** | 1.35× |
 
-The residual 30 % stall is now the **score transpose + Pp pack** (strided fp16 store)
-and the sum-reduction — lever #2. The GEMMs are unchanged at 93–96 %.
+## ✅ Vectorized transpose + Pp pack — landed (lever #2)
+The QK^T→sc copy is now a vectorized contiguous row copy; the softmax max/exp/sum are
+SVE-vectorized; the transpose-pack (sc[r][k] → Pp[k][r], scale + fp16) uses a
+halfword-narrowing scatter `svst1h_scatter_u32index_u32` (SVE has no f16 scatter →
+reinterpret f16-as-u32, store low 16b), with `Pp` zeroed once per tile (invalid keys → 0).
 
-Reproduce: `make attn_profile_fj && OMP_NUM_THREADS=1 taskset -c 12 bash profile_fapp.sh attn_profile_fj "256 384 512" prof_attn_fexpa`
-(scalar baseline in prof_attn/, env `ATTN_SCALAR_EXP=1`).
+fapp single core (hd=256 N=384 win=512), cumulative:
+| | cycles | FP-busy | stall |
+|---|--:|--:|--:|
+| scalar expf | 103.8 M | 43.3 % | 42.0 % |
+| + FEXPA softmax | 48.7 M | 63.5 % | 30.1 % |
+| **+ vec transpose/pack** | **44.4 M** | **66.2 %** | **26.5 %** |
+
+relL2 still bit-identical (0.00589 / 0.00430 / 0.00585). **Total 103.8M → 44.4M = 2.34×
+fewer cycles per core** vs the original scalar softmax.
+
+Caveats / next lever (#3): A64FX **scatter is slow** and the per-tile `memset(Pp)` adds
+shared-memory write traffic, so at 48 threads the wall-clock gain is BW-masked (per-core
+is the clean signal). The real SWA lever is **skipping zero key-blocks in P·V** (the
+window makes most of `Pp` zero — contract P·V only over active key-tiles per qt-tile),
+which removes BOTH the memset and the wasted P·V compute. The GEMMs stay at 93–96 %.
+
+Reproduce: `make attn_profile_fj && OMP_NUM_THREADS=1 taskset -c 12 bash profile_fapp.sh attn_profile_fj "256 384 512" prof_attn_vec`
+(env `ATTN_SCALAR_EXP=1` for the libm baseline).

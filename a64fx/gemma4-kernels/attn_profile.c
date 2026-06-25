@@ -123,24 +123,30 @@ int main(int argc,char**argv){
         for(int qt=0;qt<QT;qt++){
             /* pack Q: Aq[d*12+r] = Q[qt*12+r][d] */
             for(int d=0;d<hd;d++) for(int r=0;r<MR;r++){ int qi=qt*MR+r; Aq[(size_t)d*MR+r]= qi<N? Q[(size_t)qi*hd+d]:(_Float16)0; }
-            /* QK^T per key-tile -> sc[12][Kpad] */
+            /* QK^T per key-tile -> sc[12][Kpad] (vectorized contiguous row copy) */
             for(int kt=0;kt<KT;kt++){
                 float Ctile[MR*NR];
                 micro_kernel_fp16_12x2_swp(Aq, Bqk+(size_t)kt*hd*NR, Ctile, hd, 0, (int64_t)NR*4);
-                for(int r=0;r<MR;r++) for(int c=0;c<NR;c++) sc[(size_t)r*Kpad + kt*NR + c]=Ctile[r*NR+c];
+                int vl=(int)svcntw();
+                for(int r=0;r<MR;r++){ const float*ct=Ctile+r*NR; float*dst=sc+(size_t)r*Kpad+kt*NR;
+                    for(int c=0;c<NR;c+=vl){ svbool_t pg=svwhilelt_b32(c,NR); svst1_f32(pg,dst+c,svld1_f32(pg,ct+c)); } }
             }
-            /* causal mask + softmax per row, then pack P transposed into Pp[k*12+r] */
+            /* causal mask + softmax per row, then pack P TRANSPOSED into Pp[k*12+r].
+             * Pp is zeroed once (invalid keys -> 0 for P*V); each row writes only its
+             * valid [start,last) range. Transpose = fp16 scatter (stride MR per key). */
+            memset(Pp, 0, (size_t)Kpad*MR*sizeof(_Float16));
+            int vl=(int)svcntw();
             for(int r=0;r<MR;r++){
-                int qi=qt*MR+r; if(qi>=N){ for(int k=0;k<Kpad;k++) Pp[(size_t)k*MR+r]=(_Float16)0; continue; }
+                int qi=qt*MR+r; if(qi>=N) continue;            /* memset already 0 */
                 int start=0; if(win&&qi+1>win) start=qi-win+1;
                 float*row=sc+(size_t)r*Kpad; int last=qi+1; float inv;
                 if(scalar_exp){
                     float mx=-1e30f; for(int k=start;k<last;k++) if(row[k]>mx)mx=row[k];
                     float sum=0; for(int k=start;k<last;k++){ row[k]=expf(row[k]-mx); sum+=row[k]; }
                     inv=1.0f/sum;
+                    for(int k=start;k<last;k++) Pp[(size_t)k*MR+r]=(_Float16)(row[k]*inv);
                 } else {
-                    /* vectorized: max-reduce, FEXPA exp in place, sum-reduce over [start,last) */
-                    int vl=(int)svcntw();
+                    /* vectorized max-reduce, FEXPA exp in place, sum-reduce */
                     svfloat32_t vmax=svdup_f32(-1e30f);
                     for(int k=start;k<last;k+=vl){ svbool_t pg=svwhilelt_b32(k,last); vmax=svmax_m(pg,vmax,svld1(pg,row+k)); }
                     svfloat32_t vmx=svdup_f32(svmaxv(svptrue_b32(),vmax)); svfloat32_t vsum=svdup_f32(0.0f);
@@ -148,8 +154,16 @@ int main(int argc,char**argv){
                         svfloat32_t p=sve_expf(pg, svsub_x(pg, svld1(pg,row+k), vmx));
                         svst1(pg,row+k,p); vsum=svadd_m(pg,vsum,p); }
                     inv=1.0f/svaddv(svptrue_b32(),vsum);
+                    /* vectorized transpose-pack: scale -> fp16 (low 16b of each .s lane)
+                     * -> halfword-narrowing scatter to Pp[(k)*MR+r] (stride MR). SVE has
+                     * no f16 scatter, so reinterpret as u32 and svst1h_scatter (low 16b). */
+                    svfloat32_t vinv=svdup_f32(inv); svuint32_t lanes=svindex_u32(0,(uint32_t)MR);
+                    for(int k=start;k<last;k+=vl){ svbool_t pg=svwhilelt_b32(k,last);
+                        svuint32_t hu=svreinterpret_u32_f16(svcvt_f16_f32_x(pg, svmul_x(pg, svld1(pg,row+k), vinv)));
+                        svuint32_t idx=svadd_n_u32_x(pg, lanes, (uint32_t)(k*MR+r));
+                        svst1h_scatter_u32index_u32(pg, (uint16_t*)Pp, idx, hu);
+                    }
                 }
-                for(int k=0;k<Kpad;k++){ float p=(k>=start&&k<last)? row[k]*inv : 0.0f; Pp[(size_t)k*MR+r]=(_Float16)p; }
             }
             /* P*V: out[12][hd], contract over k(seq) in blocks of KC=NR via init/accum */
             for(int dt=0;dt<hdt;dt++){
