@@ -16,10 +16,14 @@
 #include <omp.h>
 #include <sys/mman.h>
 #include <time.h>
-/* ABI-compliant kernel (kernel_6x4_abi.S adds d8-d15 save/restore); call it
- * directly with no clobber wrapper (no per-call spill of the hot loop state). */
+/* Both kernels are now ABI-compliant (save/restore d8-d15). _opt zeros accs +
+ * stores C; _acc LOADS C + accumulates + stores -> chain across K-blocks so the
+ * C tile is loaded/stored once per block (no manual Ct+=Cb), keeping the proven
+ * 256-K inner loop. */
 void kernel_6x4_opt_256(const int8_t*,const int8_t*,int32_t*,int);
-#define k6x4(A,B,C,ldc) kernel_6x4_opt_256((A),(B),(C),(ldc))
+void kernel_6x4_acc_256(const int8_t*,const int8_t*,int32_t*,int);
+/* internal-K-loop: accumulators live across all nkblocks, C loaded/stored ONCE. */
+void kernel_6x4_kloop_256(const int8_t*,const int8_t*,int32_t*,int,long nkblocks);
 
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 /* cntvct timer: the asm 6x4 kernel clobbers callee-saved v8-v15, corrupting any
@@ -75,12 +79,8 @@ int main(int argc,char**argv){
         #define GEMM_PASS() \
             _Pragma("omp parallel for num_threads(nt) schedule(static) collapse(2)") \
             for(int n=0;n<NTn;n++) for(int m=0;m<MTn;m++){ \
-                int32_t Cb[MR*NR] __attribute__((aligned(256))); \
-                int32_t Ct[MR*NR]; for(int z=0;z<MR*NR;z++) Ct[z]=0; \
-                for(int k=0;k<KBn;k++){ \
-                    k6x4(Ap+((size_t)m*KBn+k)*MR*KB, Bp+((size_t)n*KBn+k)*NR*KB, Cb, NR*4); \
-                    for(int z=0;z<MR*NR;z++) Ct[z]+=Cb[z]; } \
-                for(int r=0;r<MR;r++) for(int c=0;c<NR;c++) C[(size_t)(m*MR+r)*N + n*NR+c]=Ct[r*NR+c]; }
+                int32_t* Ct=C+(size_t)(m*MR)*N + n*NR;  /* tile in big C, row stride N */ \
+                kernel_6x4_kloop_256(Ap+(size_t)m*KBn*MR*KB, Bp+(size_t)n*KBn*NR*KB, Ct, N*4, KBn); }
         GEMM_PASS();  /* warm */
         /* correctness vs naive int8 (row 0, col 0..3) */
         if(mi==0){ int bad=0; for(int c=0;c<4;c++){ long ref=0; for(int k=0;k<K;k++) ref+=(long)A[k]*B[(size_t)c*K+k]; if(ref!=C[c]) bad++; }
