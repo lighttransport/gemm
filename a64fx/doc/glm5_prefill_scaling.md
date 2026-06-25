@@ -240,9 +240,13 @@ prefill_tier: A->B re-shard at pos=39168 (0.12 s) -> CP int4, 2816 slots/rank
 Notes: the tiered path keeps **MSA on throughout** (Tier B needs it), so the Tier-A rate here (~8–12
 tok/s) is below Phase 1's MSA-off ~16 — the throughput numbers above are the right reference for
 peak short-context, this is the 1M-capable path. The merge cost (~185 s) is the 78-layer TP re-slice
-(local blob read) + KV/index propagate, one-time, amortized over the run. The CP tail sustains ~4.8
-tok/s (faster than the ~2.85 of CP-from-start, thanks to the batched combine + sparse MSA), so a 24 h
-window reaches ~360–420k of the 1M tokens (1M needs ~90 h at this rate; not bounded by tok/s but by
-wall time). `glm5_model.kv_avail` is stored for a future **auto-merge** (recompute T_cp after each
+(local blob read) + KV/index propagate, one-time, amortized over the run.
+
+**Measured run (24 h elapse, `49335275`):** processed **400,384 / 1,048,576 tokens (38.2 %)** before
+the 24 h wall terminated it, **cumulative 4.69 tok/s, NaNs-free throughout** (1564 progress samples,
+no FATAL). The CP tail held ~4.7–4.8 tok/s (vs ~2.85 for CP-from-start — the batched combine + sparse
+MSA), declining slowly as the context window grows. At this rate full 1M needs ~62 h, so a 72 h job
+reaches it (the 72 h companion was cancelled). The run is **wall-clock-bound, not tok/s-bound** at
+this rate. `glm5_model.kv_avail` is stored for a future **auto-merge** (recompute T_cp after each
 merge so merges fire by memory, not forced points) — not yet wired; the Tier-A `kv_cache` would also
 need resizing per merge.
