@@ -19,3 +19,4 @@ mini_decode
 lmhead_opt
 gemm_layer
 gemm_existing
+gemm_q4_prefill
