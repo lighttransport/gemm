@@ -37,6 +37,22 @@ static inline uint64_t rdfreq(void){ uint64_t v; __asm__ volatile("mrs %0, cntfr
  * runs ~3x slower (A64FX subnormal microcode). Each OpenMP thread must set its own. */
 static inline void set_fz(void){ uint64_t f; __asm__ volatile("mrs %0,fpcr":"=r"(f)); f|=(1ULL<<24)|(1ULL<<19); __asm__ volatile("msr fpcr,%0"::"r"(f)); }
 static void*xmap(size_t n){ void*p=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); if(p==MAP_FAILED){perror("mmap");exit(1);} return p; }
+
+/* Vectorized FEXPA expf: exp(v) = 2^(v*log2e). The 2-insn core (add SH + fexpa) gives
+ * 2^(round_{1/64}(u)) at ~0.5% (the doc's exp2_fexpa); we recover the sub-1/64 residual
+ * r = u - round(u) and multiply by 2^r ~= 1 + r*ln2 -> ~1e-3, libm-class for softmax.
+ * SH = 0x48481fc0 = 204927.0f is the FEXPA magic shift. Core chain (5 ops on the
+ * critical path): mul(u) -> add(z) -> fexpa(sc) -> [sub(lg) -> sub(r)] -> mla -> mul. */
+#define FEXPA_SH 204927.0f
+static inline svfloat32_t sve_expf(svbool_t pg, svfloat32_t v){
+    const float L2E=1.4426950408889634f, LN2=0.6931471805599453f;
+    svfloat32_t u  = svmul_x(pg, v, svdup_f32(L2E));        /* u = v*log2e */
+    svfloat32_t z  = svadd_x(pg, u, svdup_f32(FEXPA_SH));   /* z = u + SH (rounds low bits to 1/64) */
+    svfloat32_t sc; __asm__("fexpa %0.s, %1.s":"=w"(sc):"w"(z)); /* sc = 2^round_{1/64}(u) */
+    svfloat32_t lg = svsub_x(pg, z, svdup_f32(FEXPA_SH));   /* lg = round_{1/64}(u) */
+    svfloat32_t r  = svsub_x(pg, u, lg);                    /* r = u - lg (|r| <= 1/128) */
+    return svmul_x(pg, sc, svmla_x(pg, svdup_f32(1.0f), r, svdup_f32(LN2))); /* sc*(1+r*ln2) */
+}
 #define MR 12
 #define NR 64
 
@@ -87,6 +103,7 @@ int main(int argc,char**argv){
 
     float*Ofu=(float*)xmap((size_t)Npad*hd*sizeof(float));
     int QT=Npad/MR;
+    int scalar_exp=getenv("ATTN_SCALAR_EXP")?1:0;  /* A/B: libm expf vs FEXPA sve_expf */
 
     /* scratch per thread allocated inside loop (sized by hd,Kpad) */
     double freq=(double)rdfreq(); volatile uint64_t c0=0,c1=0; int reps=20;
@@ -116,11 +133,23 @@ int main(int argc,char**argv){
             for(int r=0;r<MR;r++){
                 int qi=qt*MR+r; if(qi>=N){ for(int k=0;k<Kpad;k++) Pp[(size_t)k*MR+r]=(_Float16)0; continue; }
                 int start=0; if(win&&qi+1>win) start=qi-win+1;
-                float*row=sc+(size_t)r*Kpad; float mx=-1e30f;
-                for(int k=start;k<=qi;k++) if(row[k]>mx)mx=row[k];
-                float sum=0; for(int k=start;k<=qi;k++){ row[k]=expf(row[k]-mx); sum+=row[k]; }
-                float inv=1.0f/sum;
-                for(int k=0;k<Kpad;k++){ float p=(k>=start&&k<=qi)? row[k]*inv : 0.0f; Pp[(size_t)k*MR+r]=(_Float16)p; }
+                float*row=sc+(size_t)r*Kpad; int last=qi+1; float inv;
+                if(scalar_exp){
+                    float mx=-1e30f; for(int k=start;k<last;k++) if(row[k]>mx)mx=row[k];
+                    float sum=0; for(int k=start;k<last;k++){ row[k]=expf(row[k]-mx); sum+=row[k]; }
+                    inv=1.0f/sum;
+                } else {
+                    /* vectorized: max-reduce, FEXPA exp in place, sum-reduce over [start,last) */
+                    int vl=(int)svcntw();
+                    svfloat32_t vmax=svdup_f32(-1e30f);
+                    for(int k=start;k<last;k+=vl){ svbool_t pg=svwhilelt_b32(k,last); vmax=svmax_m(pg,vmax,svld1(pg,row+k)); }
+                    svfloat32_t vmx=svdup_f32(svmaxv(svptrue_b32(),vmax)); svfloat32_t vsum=svdup_f32(0.0f);
+                    for(int k=start;k<last;k+=vl){ svbool_t pg=svwhilelt_b32(k,last);
+                        svfloat32_t p=sve_expf(pg, svsub_x(pg, svld1(pg,row+k), vmx));
+                        svst1(pg,row+k,p); vsum=svadd_m(pg,vsum,p); }
+                    inv=1.0f/svaddv(svptrue_b32(),vsum);
+                }
+                for(int k=0;k<Kpad;k++){ float p=(k>=start&&k<last)? row[k]*inv : 0.0f; Pp[(size_t)k*MR+r]=(_Float16)p; }
             }
             /* P*V: out[12][hd], contract over k(seq) in blocks of KC=NR via init/accum */
             for(int dt=0;dt<hdt;dt++){
