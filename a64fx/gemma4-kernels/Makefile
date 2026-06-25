@@ -21,7 +21,7 @@ FJCFLAGS  = -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -DUSE_F
 KERN_Q8   = kernel_q8v2_3x4.S
 KERN_FP16 = micro_kernel_fp16_12x2_swp.S micro_kernel_fp16_12x2_swp_accum.S
 
-NATIVE_BINS = q8v2_profile fp16_profile attn_profile
+NATIVE_BINS = q8v2_profile fp16_profile attn_profile q8v2_gemm
 FJ_BINS     = q8v2_profile_fj fp16_profile_fj attn_profile_fj
 
 all: $(NATIVE_BINS)
@@ -33,6 +33,8 @@ q8v2_profile: q8v2_profile.c $(KERN_Q8)
 fp16_profile: fp16_profile.c $(KERN_FP16)
 	$(FCC) $(NATIVE) -fopenmp $^ -lm -o $@
 attn_profile: attn_profile.c $(KERN_FP16)
+	$(FCC) $(NATIVE) -fopenmp $^ -lm -o $@
+q8v2_gemm: q8v2_gemm.c $(KERN_Q8)
 	$(FCC) $(NATIVE) -fopenmp $^ -lm -o $@
 
 # ---- fujitsu (fapp/qlair) ----

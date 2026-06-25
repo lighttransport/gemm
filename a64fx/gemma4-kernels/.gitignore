@@ -1,6 +1,7 @@
 # compiled microbench binaries (rebuild with `make` / `make fj`)
 q8v2_profile
 q8v2_profile_fj
+q8v2_gemm
 fp16_profile
 fp16_profile_fj
 attn_profile

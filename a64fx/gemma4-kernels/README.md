@@ -99,8 +99,20 @@ The `*_profile_fj` binaries are plain aarch64+SVE ELF — run them under qlair a
 (`OMP_NUM_THREADS=1`) for clean per-core pipeline analysis; the `fapp_start/stop`
 markers bound the region of interest.
 
+## Node-level Q8v2 GEMM (multi-thread, weight streamed)
+`q8v2_gemm.c` runs the full multi-thread weight×activation GEMM at gemma dims
+(N=21504, K=5376, ~115 MB int8 weight) — what the microkernel can't show (it's
+L1-resident). Finding: the **flat `collapse(2)` loop is already ~32 % of int8 peak**
+(vs 42 % single-tile) and is **NOT weight-bandwidth-bound** (weight read-once ≈ 0.19 ms
+vs ~11 ms compute) — the static schedule reuses each weight panel across m-tiles in
+cache. **GEPP N-panel blocking does NOT help** (0.26–0.91×: per-panel barriers + the
+panel weight exceeds one CMG's L2). The 42 %→32 % gap is multi-thread compute overhead,
+not memory. So q8v2 is at its practical ceiling at both micro and node level (the
+structural Q4_0 convert-scale dependency). `make q8v2_gemm && ./q8v2_gemm 21504 5376 1536`.
+
 ## Files
 - `kernel_q8v2_3x4.S` — int8 Q8v2 weight GEMM microkernel (per-block + per-row).
+- `q8v2_gemm.c` — multi-thread node-level GEMM (flat vs GEPP A/B; synthetic weights).
 - `micro_kernel_fp16_12x2_swp.S`, `..._swp_accum.S` — fp16 12×2 GEMM (init + accumulate).
 - `q8v2_profile.c`, `fp16_profile.c`, `attn_profile.c` — standalone synthetic drivers.
 - `Makefile`, `profile_fapp.sh`.
