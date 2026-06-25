@@ -17,3 +17,4 @@ int8_local
 layer_opt
 mini_decode
 lmhead_opt
+gemm_layer
