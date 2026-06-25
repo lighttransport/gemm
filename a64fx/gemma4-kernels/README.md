@@ -68,12 +68,21 @@ OMP_NUM_THREADS=1 bash profile_fapp.sh attn_profile_fj "256 384 512"
 
 Region names for the report: `q8v2_3x4`, `fp16_12x2_swp`, `attn_fused`.
 `pa1` = statistics (cycles/insns/GFLOPS), `pa6`/`pa7` = cache. See
-`../doc/fapp_pmu_profiling.md`. For the clair-style `preport.js` analysis, point it at
-the CSVs as in `~/work/clair/clair/a64fx/llm-guided-opt/profile_sgemm_6x4.sh`.
+`../doc/fapp_pmu_profiling.md`. Decode raw event codes via `../doc/a64fx_pmu_events.csv`.
+
+Official clair report (optional — corroborates the manual decode):
+```sh
+NODE=~/local/node-v24.11.1-linux-arm64/bin/node
+PREPORT=~/work/clair/clair/sim/a64fx/preport/preport.js
+cd prof_q8v2_profile_fj && $NODE $PREPORT -r q8v2_3x4 > report.txt
+```
+Worked examples of the flow: `~/work/clair/clair/a64fx/llm-guided-opt/profile_sgemm_6x4.sh`.
+Pre-decoded reports for this kernel: `prof_q8v2_pb/REPORT.md` (per-block) and
+`prof_q8v2_arow/COMPARE.md` (per-block vs per-row side-by-side).
 
 ## qlair (cycle-accurate simulation)
 The `*_profile_fj` binaries are plain aarch64+SVE ELF — run them under qlair as in
-`~/work/clair/clair/a64fx/sim/`. Keep `reps` small (sim is slow) and single-thread
+`~/work/clair/clair/sim/a64fx/`. Keep `reps` small (sim is slow) and single-thread
 (`OMP_NUM_THREADS=1`) for clean per-core pipeline analysis; the `fapp_start/stop`
 markers bound the region of interest.
 
