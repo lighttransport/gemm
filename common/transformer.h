@@ -5086,6 +5086,204 @@ static void *tf_persistent_worker(void *arg) {
     return NULL;
 }
 
+/* Gemma4-aware persistent worker: the whole token forward in ONE pool dispatch,
+ * threads sync via the WFE/SEV spin barrier instead of 169 cond_broadcast dispatches
+ * (decode is dispatch-bound: ~0.4 ms/cond_broadcast, ~77 GB/s matvec). Mirrors the
+ * gemma4 block in tf_forward_blocks_range EXACTLY (SWA window / per-layer hd,kvh /
+ * qk+v norm / proportional RoPE / circular KV) but: matvecs row-split (tf_thread_matvec),
+ * attention head-split, GELU element-split. Serial-but-cheap parts (norms, rope, kv
+ * store) run on tid0 while others WFE-wait. 12B BF16 path: no PLE, no MoE, no softcap. */
+static void *tf_gemma4_persistent_worker(void *arg) {
+    tf_persistent_ctx *ctx = (tf_persistent_ctx *)arg;
+    transformer_model *m = ctx->m;
+    int tid = ctx->tid;
+    int nt = m->n_threads;
+    int position = ctx->position;
+    int local_sense = 0;
+
+    int n_embd = m->n_embd;
+    int n_heads = m->n_heads;
+    int n_kv_heads = m->n_kv_heads;
+    float eps = m->rms_norm_eps;
+    /* head partition for attention (head count is constant across layers) */
+    int h_per = n_heads / nt, h_extra = n_heads % nt;
+    int h_start = tid * h_per + (tid < h_extra ? tid : h_extra);
+    int h_count = h_per + (tid < h_extra ? 1 : 0);
+
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+        int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
+        int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : n_kv_heads;
+        int local_kv_dim = l_kvh * hd;
+        int local_q_dim  = n_heads * hd;
+        int local_gqa    = n_heads / l_kvh;
+        int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
+
+        /* attn_norm (tid0) */
+        if (tid == 0) tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, eps, m->matvec_tmp);
+        tf_spin_barrier(m, &local_sense, nt);  /* B1 */
+
+        /* Q/K/V projections (row-split) */
+        if (layer->shared_kv_source < 0 && layer->has_v_proj) {
+            tf_thread_matvec(m->q, &layer->attn_q, m->xb, local_q_dim, tid, nt);
+            tf_thread_matvec(m->k, &layer->attn_k, m->xb, local_kv_dim, tid, nt);
+            tf_thread_matvec(m->v, &layer->attn_v, m->xb, local_kv_dim, tid, nt);
+        } else {
+            tf_thread_matvec(m->q, &layer->attn_q, m->xb, local_q_dim, tid, nt);
+            if (layer->shared_kv_source < 0) {
+                tf_thread_matvec(m->k, &layer->attn_k, m->xb, local_kv_dim, tid, nt);
+                if (layer->has_v_proj)
+                    tf_thread_matvec(m->v, &layer->attn_v, m->xb, local_kv_dim, tid, nt);
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B2 */
+
+        /* QK/V norm + RoPE + KV store (tid0) */
+        if (tid == 0) {
+            tf_qk_norm(m->q, n_heads, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
+            if (layer->shared_kv_source < 0) {
+                tf_qk_norm(m->k, l_kvh, hd, &layer->attn_k_norm, eps, m->matvec_tmp);
+                if (!layer->has_v_proj) memcpy(m->v, m->k, local_kv_dim * sizeof(float));
+                if (layer->attn_v_norm.data) {
+                    tf_qk_norm(m->v, l_kvh, hd, &layer->attn_v_norm, eps, m->matvec_tmp);
+                } else {
+                    for (int h = 0; h < l_kvh; h++) {
+                        float *vh = m->v + h * hd; float ss = 0.0f;
+                        for (int i = 0; i < hd; i++) ss += vh[i] * vh[i];
+                        ss = 1.0f / sqrtf(ss / hd + eps);
+                        for (int i = 0; i < hd; i++) vh[i] *= ss;
+                    }
+                }
+            }
+            /* RoPE: hoist cos/sin, SVE half-split rotate */
+            {
+                float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
+                int half = hd / 2;
+                float cs[256], sn[256];
+                for (int j = 0; j < half; j++) { float f = (float)position * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
+                int nrot = n_heads + (layer->shared_kv_source < 0 ? l_kvh : 0);
+                for (int hh = 0; hh < nrot; hh++) {
+                    float *vh = (hh < n_heads) ? (m->q + hh * hd) : (m->k + (hh - n_heads) * hd);
+#if defined(__ARM_FEATURE_SVE)
+                    for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                        svfloat32_t r0 = svld1(pg, vh + j), r1 = svld1(pg, vh + j + half);
+                        svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                        svst1(pg, vh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));
+                        svst1(pg, vh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); }
+#else
+                    for (int j = 0; j < half; j++) { float r0 = vh[j], r1 = vh[j + half];
+                        vh[j] = r0 * cs[j] - r1 * sn[j]; vh[j + half] = r0 * sn[j] + r1 * cs[j]; }
+#endif
+                }
+            }
+            if (layer->shared_kv_source < 0) {
+                if (layer->is_swa) {
+                    int slot = position % m->swa_window_size;
+                    tf_kv_store(m, l, (size_t)slot * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)slot * local_kv_dim, m->v, local_kv_dim);
+                } else {
+                    tf_kv_store(m, l, (size_t)position * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)position * local_kv_dim, m->v, local_kv_dim);
+                }
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B3 */
+
+        /* Attention (head-split) */
+        if (h_count > 0) {
+            float attn_scale = 1.0f;
+            int win = m->swa_window_size;
+            int start = (layer->is_swa && position >= win) ? (position - win + 1) : 0;
+            int seq_len = position - start + 1;
+            memset(m->xb2 + h_start * hd, 0, (size_t)h_count * hd * sizeof(float));
+            for (int h = h_start; h < h_start + h_count; h++) {
+                float *qh = m->q + h * hd;
+                float *att_h = m->att + (size_t)h * seq_len;
+                int kv_h = h / local_gqa;
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % win) : abs_pos;
+                    float score = 0.0f;
+                    size_t kbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                    for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
+                    att_h[p] = score * attn_scale;
+                }
+                float max_s = att_h[0];
+                for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
+                float sum_e = 0.0f;
+                for (int p = 0; p < seq_len; p++) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }
+                float inv_sum = 1.0f / sum_e;
+                for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
+                float *out_h = m->xb2 + h * hd;
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % win) : abs_pos;
+                    float w = att_h[p];
+                    size_t vbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                    for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
+                }
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B4 */
+
+        /* Output projection (row-split) */
+        tf_thread_matvec(m->xb, &layer->attn_output, m->xb2, n_embd, tid, nt);
+        tf_spin_barrier(m, &local_sense, nt);  /* B5 */
+
+        /* post-attn norm + residual + ffn norm (tid0) */
+        if (tid == 0) {
+            tf_rmsnorm(m->xb, m->xb, &layer->post_attention_norm, n_embd, eps, m->matvec_tmp);
+            tf_vadd(m->x, m->xb, n_embd);
+            tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B6 */
+
+        /* FFN gate+up (row-split) + GELU (element-split) */
+        tf_thread_matvec(m->ffn_buf1, &layer->ffn_gate, m->xb, m->n_ff, tid, nt);
+        tf_thread_matvec(m->ffn_buf2, &layer->ffn_up,   m->xb, m->n_ff, tid, nt);
+        {
+            int rp = m->n_ff / nt, re = m->n_ff % nt;
+            int rs = tid * rp + (tid < re ? tid : re);
+            int rc = rp + (tid < re ? 1 : 0);
+            if (rc > 0) {
+#if defined(__ARM_FEATURE_SVE)
+                if (m->ffn_gelu_fast) tf_gelu_mul_fast_sve(m->ffn_buf3 + rs, m->ffn_buf1 + rs, m->ffn_buf2 + rs, rc);
+                else tf_gelu_mul_exact(m->ffn_buf3 + rs, m->ffn_buf1 + rs, m->ffn_buf2 + rs, rc);
+#else
+                tf_gelu_mul_exact(m->ffn_buf3 + rs, m->ffn_buf1 + rs, m->ffn_buf2 + rs, rc);
+#endif
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B7 */
+
+        /* FFN down (row-split) + post_ffw norm + residual + layer-output scale */
+        tf_thread_matvec(m->xb, &layer->ffn_down, m->ffn_buf3, n_embd, tid, nt);
+        tf_spin_barrier(m, &local_sense, nt);  /* B8 */
+        if (tid == 0) {
+            tf_rmsnorm(m->xb, m->xb, &layer->post_ffw_norm, n_embd, eps, m->matvec_tmp);
+            tf_vadd(m->x, m->xb, n_embd);
+            if (layer->layer_output_scale.data) {
+                float scale_val;
+                dequant_row(layer->layer_output_scale.type, layer->layer_output_scale.data, &scale_val, 1);
+                for (int i = 0; i < n_embd; i++) m->x[i] *= scale_val;
+            }
+        }
+        /* next layer's B1 covers the m->x write (only tid0 writes/reads it) */
+    }
+
+    if (tid == 0) tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, eps, m->matvec_tmp);
+    return NULL;
+}
+
+static float *tf_forward_gemma4_persistent(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
+    int nt = m->n_threads;
+    m->bar_count = 0; m->bar_sense = 0; __sync_synchronize();
+    tf_persistent_ctx *ctxs = (tf_persistent_ctx *)alloca(nt * sizeof(tf_persistent_ctx));
+    for (int t = 0; t < nt; t++) ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w};
+    tf_pool_dispatch(m, tf_gemma4_persistent_worker, ctxs, sizeof(tf_persistent_ctx));
+    return m->x;
+}
+
 /* Persistent forward: dispatch tf_persistent_worker to ALL threads via pool,
  * then main thread runs worker 0 (master-worker pattern). Workers communicate
  * via spin barrier — the old pool dispatch mechanism is NOT used during forward. */
@@ -5164,6 +5362,15 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
      * gemma4-aware block path; its matvecs still parallelize via tf_qmatvec_pool. */
     if (m->n_threads > 1 && m->pool_alive && !m->is_gemma4)
         return tf_forward_persistent(m, position, pos_t, pos_h, pos_w);
+    /* Gemma4 single-token decode: collapse the 169 per-matvec cond_broadcast dispatches
+     * into one persistent dispatch (WFE/SEV spin barriers). Opt-in TF_G4_PERSIST; only
+     * for the 12B-style dense path (no PLE, no MoE). */
+    if (m->is_gemma4 && m->n_threads > 1 && m->pool_alive &&
+        !(m->per_layer_token_embd.data && m->current_token_id >= 0) && !m->use_moe) {
+        static int g4p = -1;
+        if (g4p < 0) { const char *e = getenv("TF_G4_PERSIST"); g4p = (e && atoi(e)) ? 1 : 0; }
+        if (g4p) return tf_forward_gemma4_persistent(m, position, pos_t, pos_h, pos_w);
+    }
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
 
