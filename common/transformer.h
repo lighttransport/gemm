@@ -714,6 +714,15 @@ static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, floa
         _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_mul_ps(vx, vscale), vw));
     }
     for (; i < n; i++) dst[i] = x[i] * ss * w_buf[i];
+#elif defined(__ARM_FEATURE_SVE)
+    svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+    svfloat32_t vss = svdup_f32(0);
+    for (int i = 0; i < n; i += vl) { svbool_t pg = svwhilelt_b32(i, n);
+        svfloat32_t vx = svld1(pg, x + i); vss = svmla_m(pg, vss, vx, vx); }
+    float ss = 1.0f / sqrtf(svaddv(pt, vss) / n + eps);
+    svfloat32_t vsc = svdup_f32(ss);
+    for (int i = 0; i < n; i += vl) { svbool_t pg = svwhilelt_b32(i, n);
+        svst1(pg, dst + i, svmul_x(pg, svmul_x(pg, svld1(pg, x + i), vsc), svld1(pg, w_buf + i))); }
 #else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
@@ -2092,9 +2101,11 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
     return NULL;
 }
 
-/* Decode profiling: total ms spent inside pooled matvecs (gated TF_DPROF). */
+/* Decode profiling: total ms + bytes + count inside pooled matvecs (gated TF_DPROF). */
 static inline double tf_time_ms(void);
 double tf_decode_matvec_ms = 0.0;
+double tf_decode_matvec_bytes = 0.0;
+long tf_decode_matvec_cnt = 0;
 static int tf_dprof = -1;
 static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qtensor *mat1,
                                     float *dst2, const qtensor *mat2,
@@ -2116,7 +2127,9 @@ static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qten
         offset += count;
     }
     tf_pool_dispatch(m, tf_qmatvec_fused2_worker, tasks, sizeof(tf_matvec_fused2_task));
-    if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
+    if (tf_dprof) { tf_decode_matvec_ms += tf_time_ms() - _t0;
+        tf_decode_matvec_bytes += 2.0 * (double)n_rows * mat1->n_cols * (mat1->type == GGML_TYPE_F32 ? 4 : 2);
+        tf_decode_matvec_cnt++; }
 }
 
 /* Forward declaration for fused FFN worker */
@@ -2348,7 +2361,9 @@ static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat
         offset += count;
     }
     tf_pool_dispatch(m, tf_qmatvec_worker, tasks, sizeof(tf_matvec_task));
-    if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
+    if (tf_dprof) { tf_decode_matvec_ms += tf_time_ms() - _t0;
+        tf_decode_matvec_bytes += (double)n_rows * mat->n_cols * (mat->type == GGML_TYPE_F32 ? 4 : 2);
+        tf_decode_matvec_cnt++; }
 }
 
 /* Pool-based multi-threaded expert matvec: splits rows across threads */
@@ -2524,6 +2539,15 @@ static void tf_qk_norm(float *vec, int n_heads, int head_dim, const qtensor *nor
             _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_mul_ps(vi, vscale), vw));
         }
         for (; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#elif defined(__ARM_FEATURE_SVE)
+        svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+        svfloat32_t vss = svdup_f32(0);
+        for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+            svfloat32_t vi = svld1(pg, v + i); vss = svmla_m(pg, vss, vi, vi); }
+        float ss = 1.0f / sqrtf(svaddv(pt, vss) / head_dim + eps);
+        svfloat32_t vsc = svdup_f32(ss);
+        for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+            svst1(pg, v + i, svmul_x(pg, svmul_x(pg, svld1(pg, v + i), vsc), svld1(pg, w_buf + i))); }
 #else
         float ss = 0.0f;
         for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];
@@ -3585,10 +3609,13 @@ static void *tf_pool_worker_main(void *arg) {
     free(ctx);
     tf_bind_current_thread_for_numa(tid);
 
+    /* NOTE: a spin-then-sleep on pool_phase was tried to cut the cond_broadcast
+     * wake-from-sleep latency (~0.4ms/dispatch x 169/tok) but it only ever HURT
+     * (any spin budget throttles the chip / contends); pure cond_wait is best. The
+     * per-matvec barrier overhead is structural -> the real lever is batched decode. */
     int last_phase = 0;
     while (1) {
-        /* Sleep until dispatcher signals new work via cond_broadcast.
-         * Workers consume ZERO bandwidth while sleeping (futex-based). */
+        /* Sleep until dispatcher signals new work via cond_broadcast. */
         pthread_mutex_lock(&m->pool_mutex);
         while (m->pool_phase == last_phase && m->pool_alive)
             pthread_cond_wait(&m->pool_cond, &m->pool_mutex);
@@ -5179,14 +5206,18 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             int local_gqa    = n_heads / l_kvh;
             float eps = m->rms_norm_eps;
 
-            /* Q projection (always present) */
-            tf_qmatvec_pool(m, m->q, &layer->attn_q, m->xb, local_q_dim);
-
-            /* K/V projections (skip if sharing KV) */
+            /* Q/K/V projections: fuse q,k,v into ONE pool dispatch (decode is
+             * dispatch-overhead-bound: ~0.4 ms/dispatch x 289/tok). */
             int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
-            if (layer->shared_kv_source < 0) {
-                tf_qmatvec_pool(m, m->k, &layer->attn_k, m->xb, local_kv_dim);
-                tf_qmatvec_pool(m, m->v, &layer->attn_v, m->xb, local_kv_dim);
+            if (layer->shared_kv_source < 0 && layer->has_v_proj) {
+                tf_qmatvec_fused_qkv_pool(m, m->q, &layer->attn_q, local_q_dim,
+                                          m->k, &layer->attn_k, m->v, &layer->attn_v, local_kv_dim);
+            } else {
+                tf_qmatvec_pool(m, m->q, &layer->attn_q, m->xb, local_q_dim);
+                if (layer->shared_kv_source < 0) {
+                    tf_qmatvec_pool(m, m->k, &layer->attn_k, m->xb, local_kv_dim);
+                    tf_qmatvec_pool(m, m->v, &layer->attn_v, m->xb, local_kv_dim);
+                }
             }
 
             /* Q norm (always) */
@@ -5214,33 +5245,26 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 }
             }
 
-            /* RoPE: use SWA or full-attention inv_freq table */
+            /* RoPE: hoist cos/sin out of the head loop (was recomputed per head -> ~32x
+             * redundant trig) and SVE the half-split rotate (decode is M=1). */
             {
                 float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
                 int half = hd / 2;
-                /* Apply RoPE to Q */
-                for (int h = 0; h < n_heads; h++) {
-                    float *qh = m->q + h * hd;
-                    for (int j = 0; j < half; j++) {
-                        float freq = (float)position * inv_freq[j];
-                        float cos_v = cosf(freq), sin_v = sinf(freq);
-                        float r0 = qh[j], r1 = qh[j + half];
-                        qh[j]        = r0 * cos_v - r1 * sin_v;
-                        qh[j + half] = r0 * sin_v + r1 * cos_v;
-                    }
-                }
-                /* Apply RoPE to K (only if we projected K) */
-                if (layer->shared_kv_source < 0) {
-                    for (int h = 0; h < l_kvh; h++) {
-                        float *kh = m->k + h * hd;
-                        for (int j = 0; j < half; j++) {
-                            float freq = (float)position * inv_freq[j];
-                            float cos_v = cosf(freq), sin_v = sinf(freq);
-                            float r0 = kh[j], r1 = kh[j + half];
-                            kh[j]        = r0 * cos_v - r1 * sin_v;
-                            kh[j + half] = r0 * sin_v + r1 * cos_v;
-                        }
-                    }
+                float cs[256], sn[256];   /* half = hd/2 <= 256 */
+                for (int j = 0; j < half; j++) { float f = (float)position * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
+                int nrot = n_heads + (layer->shared_kv_source < 0 ? l_kvh : 0);
+                for (int hh = 0; hh < nrot; hh++) {
+                    float *vh = (hh < n_heads) ? (m->q + hh * hd) : (m->k + (hh - n_heads) * hd);
+#if defined(__ARM_FEATURE_SVE)
+                    for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                        svfloat32_t r0 = svld1(pg, vh + j), r1 = svld1(pg, vh + j + half);
+                        svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                        svst1(pg, vh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));
+                        svst1(pg, vh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); }
+#else
+                    for (int j = 0; j < half; j++) { float r0 = vh[j], r1 = vh[j + half];
+                        vh[j] = r0 * cs[j] - r1 * sn[j]; vh[j + half] = r0 * sn[j] + r1 * cs[j]; }
+#endif
                 }
             }
 

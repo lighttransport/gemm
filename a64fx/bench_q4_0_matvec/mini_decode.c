@@ -39,12 +39,14 @@ int main(int argc,char**argv){
     fprintf(stderr,"[mini] prefill %d tok in %.3fs; first next-tok=%d\n",np,now()-tp,tok);
 
     /* timed decode */
-    extern double tf_decode_matvec_ms; tf_decode_matvec_ms = 0.0;
+    extern double tf_decode_matvec_ms, tf_decode_matvec_bytes; extern long tf_decode_matvec_cnt;
+    tf_decode_matvec_ms = 0.0; tf_decode_matvec_bytes = 0.0; tf_decode_matvec_cnt = 0;
     double td=now(); int first=tok;
     for(int i=0;i<ndec;i++){ float*lg=transformer_forward_logits(m,tok,pos++); tok=argmax(lg,m->n_vocab); }
     double dt=now()-td;
-    if (getenv("TF_DPROF")) fprintf(stderr,"[dprof] matvec %.1f ms/tok, serial %.1f ms/tok (matvec %.0f%%)\n",
-        tf_decode_matvec_ms/ndec, (dt*1000.0 - tf_decode_matvec_ms)/ndec, 100.0*tf_decode_matvec_ms/(dt*1000.0));
+    if (getenv("TF_DPROF")) fprintf(stderr,"[dprof] matvec %.1f ms/tok, serial %.1f ms/tok (matvec %.0f%%); matvec BW %.0f GB/s, %ld dispatches/tok\n",
+        tf_decode_matvec_ms/ndec, (dt*1000.0 - tf_decode_matvec_ms)/ndec, 100.0*tf_decode_matvec_ms/(dt*1000.0),
+        tf_decode_matvec_bytes/(tf_decode_matvec_ms/1000.0)/1e9, tf_decode_matvec_cnt/ndec);
     fprintf(stderr,"[mini] decode %d tok in %.3fs = %.2f tok/s (first=%d last=%d)\n",ndec,dt,ndec/dt,first,tok);
     printf("DECODE_TOK_S %.3f  first=%d last=%d\n", ndec/dt, first, tok);
     return 0;
