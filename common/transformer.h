@@ -5960,6 +5960,63 @@ static void *tf_gemm_tm_worker(void *arg) {
     return NULL;
 }
 
+#if defined(__ARM_FEATURE_SVE)
+/* Register-blocked token-major BF16xfp32 GEMM (MR=4 tokens x NR=6 weight-rows).
+ * ~60x the matvec-based gemm_bf16_f32_tokmajor: shared k-vector loads feed 24 FMAs/
+ * k-step, BF16 widened in-register (ld1uh->lsl#16, zero conversion FLOPs). No OMP —
+ * the caller's pthread row-split parallelizes. Same signature as gemm_bf16_f32_tokmajor.
+ * For N=1 (decode) the caller keeps the matvec path (this wastes 3/4 token slots). */
+static inline svfloat32_t tf_bf16w(svbool_t pg, const uint16_t *p) {
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
+}
+static void tf_gemm_bf16_blocked(float *Y, const uint16_t *W, const float *X,
+        int n_rows, int K, int N, int Ys, int Xs, int nt) {
+    const int MR = 4, NR = 6; int vl = (int)svcntw();
+    int MTn = (N + MR - 1) / MR, NTn = n_rows / NR;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int n0 = 0; n0 < NTn; n0++) {
+        const uint16_t *w0=W+(size_t)(n0*NR+0)*K,*w1=W+(size_t)(n0*NR+1)*K,*w2=W+(size_t)(n0*NR+2)*K;
+        const uint16_t *w3=W+(size_t)(n0*NR+3)*K,*w4=W+(size_t)(n0*NR+4)*K,*w5=W+(size_t)(n0*NR+5)*K;
+        for (int m0 = 0; m0 < MTn; m0++) {
+            int t0=m0*MR,t1=t0+1,t2=t0+2,t3=t0+3;
+            const float *x0=X+(size_t)(t0<N?t0:0)*Xs,*x1=X+(size_t)(t1<N?t1:0)*Xs;
+            const float *x2=X+(size_t)(t2<N?t2:0)*Xs,*x3=X+(size_t)(t3<N?t3:0)*Xs;
+            svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a02=svdup_f32(0),a03=svdup_f32(0),a04=svdup_f32(0),a05=svdup_f32(0);
+            svfloat32_t a10=svdup_f32(0),a11=svdup_f32(0),a12=svdup_f32(0),a13=svdup_f32(0),a14=svdup_f32(0),a15=svdup_f32(0);
+            svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a22=svdup_f32(0),a23=svdup_f32(0),a24=svdup_f32(0),a25=svdup_f32(0);
+            svfloat32_t a30=svdup_f32(0),a31=svdup_f32(0),a32=svdup_f32(0),a33=svdup_f32(0),a34=svdup_f32(0),a35=svdup_f32(0);
+            for (int k=0;k<K;k+=vl){ svbool_t pg=svwhilelt_b32(k,K);
+                svfloat32_t v0=tf_bf16w(pg,w0+k),v1=tf_bf16w(pg,w1+k),v2=tf_bf16w(pg,w2+k),v3=tf_bf16w(pg,w3+k),v4=tf_bf16w(pg,w4+k),v5=tf_bf16w(pg,w5+k);
+                svfloat32_t x=svld1_f32(pg,x0+k);
+                a00=svmla_f32_m(pg,a00,x,v0);a01=svmla_f32_m(pg,a01,x,v1);a02=svmla_f32_m(pg,a02,x,v2);a03=svmla_f32_m(pg,a03,x,v3);a04=svmla_f32_m(pg,a04,x,v4);a05=svmla_f32_m(pg,a05,x,v5);
+                x=svld1_f32(pg,x1+k);
+                a10=svmla_f32_m(pg,a10,x,v0);a11=svmla_f32_m(pg,a11,x,v1);a12=svmla_f32_m(pg,a12,x,v2);a13=svmla_f32_m(pg,a13,x,v3);a14=svmla_f32_m(pg,a14,x,v4);a15=svmla_f32_m(pg,a15,x,v5);
+                x=svld1_f32(pg,x2+k);
+                a20=svmla_f32_m(pg,a20,x,v0);a21=svmla_f32_m(pg,a21,x,v1);a22=svmla_f32_m(pg,a22,x,v2);a23=svmla_f32_m(pg,a23,x,v3);a24=svmla_f32_m(pg,a24,x,v4);a25=svmla_f32_m(pg,a25,x,v5);
+                x=svld1_f32(pg,x3+k);
+                a30=svmla_f32_m(pg,a30,x,v0);a31=svmla_f32_m(pg,a31,x,v1);a32=svmla_f32_m(pg,a32,x,v2);a33=svmla_f32_m(pg,a33,x,v3);a34=svmla_f32_m(pg,a34,x,v4);a35=svmla_f32_m(pg,a35,x,v5);
+            }
+            svbool_t pt=svptrue_b32(); float *Yb=Y+(size_t)n0*NR;
+            #define TF_BST(tok,A0,A1,A2,A3,A4,A5) if((tok)<N){ float*y=Yb+(size_t)(tok)*Ys; \
+                y[0]=svaddv_f32(pt,A0);y[1]=svaddv_f32(pt,A1);y[2]=svaddv_f32(pt,A2);y[3]=svaddv_f32(pt,A3);y[4]=svaddv_f32(pt,A4);y[5]=svaddv_f32(pt,A5); }
+            TF_BST(t0,a00,a01,a02,a03,a04,a05) TF_BST(t1,a10,a11,a12,a13,a14,a15)
+            TF_BST(t2,a20,a21,a22,a23,a24,a25) TF_BST(t3,a30,a31,a32,a33,a34,a35)
+            #undef TF_BST
+        }
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int row=NTn*NR; row<n_rows; row++){ const uint16_t *w=W+(size_t)row*K;
+        for (int t=0;t<N;t++){ const float *x=X+(size_t)t*Xs; svfloat32_t a=svdup_f32(0);
+            for (int k=0;k<K;k+=vl){ svbool_t pg=svwhilelt_b32(k,K); a=svmla_f32_m(pg,a,svld1_f32(pg,x+k),tf_bf16w(pg,w+k)); }
+            Y[(size_t)t*Ys+row]=svaddv_f32(svptrue_b32(),a); } }
+}
+#define TF_HAVE_BF16_BLOCKED 1
+#endif
+
 static void *tf_gemm_bf16_tm_worker(void *arg) {
     tf_gemm_tm_task *t = (tf_gemm_tm_task *)arg;
     int nrows = t->row_end - t->row_start;
@@ -6694,6 +6751,16 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
     if (mat->type == GGML_TYPE_BF16) {
         /* BF16 GEMM path */
         int K = mat->n_cols;
+#ifdef TF_HAVE_BF16_BLOCKED
+        /* prefill (N>=4): register-blocked, PINNED OpenMP (raw pthreads below float
+         * across CMGs -> cross-CMG weight reads). N=1 decode keeps the matvec path. */
+        if (N >= 4) {
+            tf_gemm_bf16_blocked(Y_out, (const uint16_t *)mat->data, X,
+                                 n_rows, K, N, out_stride, X_stride,
+                                 n_threads > 1 ? n_threads : 1);
+            return;
+        }
+#endif
         if (n_threads <= 1 || n_rows < n_threads * 4) {
             gemm_bf16_f32_tokmajor(Y_out, (const uint16_t *)mat->data, X,
                                     n_rows, K, N, out_stride, X_stride);

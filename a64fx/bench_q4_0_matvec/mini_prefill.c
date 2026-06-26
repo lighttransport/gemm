@@ -19,7 +19,9 @@ static int argmax(const float*v,int n){ int b=0; float m=v[0]; for(int i=1;i<n;i
 int main(int argc,char**argv){
     if(argc<2){ fprintf(stderr,"usage: %s model.gguf [n_tokens]\n",argv[0]); return 1; }
     int N=argc>2?atoi(argv[2]):128;
-    gguf_context*g=gguf_open(argv[1],1); if(!g){ fprintf(stderr,"open failed\n"); return 1; }
+    int use_mmap = (getenv("NO_MMAP")&&atoi(getenv("NO_MMAP")))?0:1;
+    fprintf(stderr,"[prefill] mmap=%d\n",use_mmap);
+    gguf_context*g=gguf_open(argv[1],use_mmap); if(!g){ fprintf(stderr,"open failed\n"); return 1; }
     double t0=now();
     transformer_model*m=transformer_load(g,4096); if(!m){ fprintf(stderr,"load failed\n"); return 1; }
     int nthr=getenv("LLM_THREADS")?atoi(getenv("LLM_THREADS")):48;
