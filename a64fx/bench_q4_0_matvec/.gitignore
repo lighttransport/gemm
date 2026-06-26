@@ -36,3 +36,4 @@ bf16_widen_bench
 bf16_widen_bench
 bf16_tfree_gemm
 bw_probe
+matvec_local_bench
