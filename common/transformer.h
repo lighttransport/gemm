@@ -6057,15 +6057,20 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
     if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
     if (!tf_podd_Xa) return 0;
     uint16_t *Xa = tf_podd_Xa;
-    /* pack X -> k-major BF16 (pad tokens >= N with 0) */
+    /* pack X -> k-major BF16 (transpose + fp32->BF16). SVE: per token, load contiguous
+     * fp32, BF16 = top 16 bits (lsr#16 + halfword scatter to Xb[k*12+n], stride 12). */
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(nt) schedule(static)
     #endif
     for (int tt = 0; tt < TT; tt++) { uint16_t *Xb = Xa + (size_t)tt * K * PNR;
-        for (int k = 0; k < K; k++) for (int n = 0; n < PNR; n++) {
-            int tok = tt*PNR + n; uint32_t u = 0;
-            if (tok < N) { float xv = X[(size_t)tok * Xs + k]; __builtin_memcpy(&u, &xv, 4); }
-            Xb[k*PNR + n] = (uint16_t)(u >> 16); } }
+        for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n;
+            if (tok >= N) { for (int k = 0; k < K; k++) Xb[k*PNR + n] = 0; continue; }
+            const float *xr = X + (size_t)tok * Xs;
+            svuint32_t lanes = svindex_u32(0, (uint32_t)PNR);   /* j*12 */
+            for (int k = 0; k < K; k += (int)svcntw()) { svbool_t pg = svwhilelt_b32(k, K);
+                svuint32_t hu = svlsr_n_u32_x(pg, svreinterpret_u32_f32(svld1_f32(pg, xr + k)), 16);
+                svuint32_t idx = svadd_n_u32_x(pg, lanes, (uint32_t)(k*PNR + n));
+                svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } } }
     /* kernel per (feat-tile, tok-tile); transpose col-major C -> token-major Y */
     #ifdef _OPENMP
     #pragma omp parallel num_threads(nt)
