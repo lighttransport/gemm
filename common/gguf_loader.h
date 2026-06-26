@@ -421,6 +421,23 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->data_size = max_end;
     }
 
+    /* Default to anonymous RAM load when the model fits comfortably in RAM:
+     * file-backed mmap pages are NUMA-mis-placed for the GEMM threads (reads stay
+     * ~storage-slow even when resident), while anonymous memory is first-touched
+     * distributed across CMGs by the NUMA parallel pread -> ~16x faster prefill GEMMs
+     * (measured: Gemma-4 12B BF16 2.8 -> 33 tok/s). Keep mmap for huge models that
+     * don't fit one node's RAM (sharded multi-node). Override with TF_FORCE_MMAP=1. */
+    if (use_mmap && getenv("NUMA_DISTRIBUTE") &&
+        !(getenv("TF_FORCE_MMAP") && atoi(getenv("TF_FORCE_MMAP")))) {
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGE_SIZE);
+        size_t ram = (pages > 0 && psz > 0) ? (size_t)pages * (size_t)psz : 0;
+        if (ram && ctx->data_size < (size_t)((double)ram * 0.80)) {
+            use_mmap = 0;
+            fprintf(stderr, "gguf: model %.1fGB fits RAM %.1fGB -> anonymous load "
+                    "(NUMA-local, eviction-safe; TF_FORCE_MMAP=1 to keep mmap)\n",
+                    (double)ctx->data_size / 1e9, (double)ram / 1e9);
+        }
+    }
     /* load data */
     if (use_mmap) {
 #ifdef _WIN32
