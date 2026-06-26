@@ -7914,6 +7914,22 @@ static void tf_gemma4_raw_v_norm_batch(float *bv, int N, int n_kv_heads,
     }
 }
 
+#if defined(__ARM_FEATURE_SVE)
+/* Vectorized FEXPA expf (from a64fx/gemma4-kernels/attn_profile.c): exp(v)=2^(v*log2e);
+ * the fexpa core gives 2^round_{1/64}(u), then *(1+r*ln2) recovers the residual ->
+ * ~1e-3, libm-class for softmax. SH=204927.0f is the magic shift. */
+#define TF_FEXPA_SH 204927.0f
+static inline svfloat32_t tf_sve_expf(svbool_t pg, svfloat32_t v) {
+    const float L2E = 1.4426950408889634f, LN2 = 0.6931471805599453f;
+    svfloat32_t u  = svmul_x(pg, v, svdup_f32(L2E));
+    svfloat32_t z  = svadd_x(pg, u, svdup_f32(TF_FEXPA_SH));
+    svfloat32_t sc; __asm__("fexpa %0.s, %1.s" : "=w"(sc) : "w"(z));
+    svfloat32_t lg = svsub_x(pg, z, svdup_f32(TF_FEXPA_SH));
+    svfloat32_t r  = svsub_x(pg, u, lg);
+    return svmul_x(pg, sc, svmla_x(pg, svdup_f32(1.0f), r, svdup_f32(LN2)));
+}
+#endif
+
 static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *layer,
                                        float *bq, float *bxb2, const int *pos,
                                        int N, int kv_src, int n_heads,
@@ -7921,9 +7937,17 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
                                        int kv_dim, int gqa) {
     memset(bxb2, 0, (size_t)N * q_dim * sizeof(float));
     /* Parallel over (token,head): each (t,h) writes a disjoint bxb2[t*q_dim+h*hd]
-     * region and uses a thread-local score buffer -> race-free. Was fully serial
-     * (the prefill's dominant cost). KV dtype handled by tf_kv_load_* (scalar). */
+     * region and uses a thread-local score buffer -> race-free. */
     int nt = m->n_threads > 1 ? m->n_threads : 1;
+#if defined(__ARM_FEATURE_SVE)
+    /* SVE fp32 path (TF_ATTN_SVE=1 default): vectorize QK^T dot, FEXPA softmax, PV
+     * accumulate. Only for the F32 KV cache (the default); F16 KV falls back to scalar. */
+    static int attn_sve = -1;
+    if (attn_sve < 0) { const char *e = getenv("TF_ATTN_SVE"); attn_sve = (e && atoi(e) == 0) ? 0 : 1; }
+    int use_sve = attn_sve && m->kv_cache_type == 0;
+#else
+    int use_sve = 0;
+#endif
     #ifdef _OPENMP
     #pragma omp parallel num_threads(nt)
     #endif
@@ -7942,6 +7966,46 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
                 }
                 float *qh = bq + (size_t)t * q_dim + h * hd;
                 int kv_h = h / gqa;
+                float *out_h = bxb2 + (size_t)t * q_dim + h * hd;
+#if defined(__ARM_FEATURE_SVE)
+                if (use_sve) {
+                    const float *Kc = m->key_cache[kv_src];
+                    const float *Vc = m->value_cache[kv_src];
+                    svbool_t pt = svptrue_b32();
+                    /* QK^T: dot(qh, K_slot) over hd (multiple of VL) */
+                    for (int p = 0; p < seq_len; p++) {
+                        int abs_pos = start + p;
+                        int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                        const float *kp = Kc + (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                        svfloat32_t acc = svdup_f32(0);
+                        for (int d = 0; d < hd; d += (int)svcntw())
+                            acc = svmla_x(pt, acc, svld1(pt, qh + d), svld1(pt, kp + d));
+                        att[p] = svaddv(pt, acc);
+                    }
+                    /* softmax: max, then FEXPA exp + sum (vectorized over p) */
+                    float max_s = att[0];
+                    for (int p = 1; p < seq_len; p++) if (att[p] > max_s) max_s = att[p];
+                    svfloat32_t vmax = svdup_f32(max_s), vsum = svdup_f32(0);
+                    int p = 0;
+                    for (; p + (int)svcntw() <= seq_len; p += (int)svcntw()) {
+                        svfloat32_t e = tf_sve_expf(pt, svsub_x(pt, svld1(pt, att + p), vmax));
+                        svst1(pt, att + p, e); vsum = svadd_x(pt, vsum, e);
+                    }
+                    float sum_e = svaddv(pt, vsum);
+                    for (; p < seq_len; p++) { float e = expf(att[p] - max_s); att[p] = e; sum_e += e; }
+                    float inv_sum = 1.0f / sum_e;
+                    /* PV: out_h[d] += (att[p]*inv_sum) * V_slot[d], accumulate over p */
+                    for (int q = 0; q < seq_len; q++) {
+                        int abs_pos = start + q;
+                        int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                        const float *vp = Vc + (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                        svfloat32_t w = svdup_f32(att[q] * inv_sum);
+                        for (int d = 0; d < hd; d += (int)svcntw())
+                            svst1(pt, out_h + d, svmla_x(pt, svld1(pt, out_h + d), w, svld1(pt, vp + d)));
+                    }
+                    continue;
+                }
+#endif
                 for (int p = 0; p < seq_len; p++) {
                     int abs_pos = start + p;
                     int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
@@ -7955,7 +8019,6 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
                 float sum_e = 0.0f;
                 for (int p = 0; p < seq_len; p++) { att[p] = expf(att[p] - max_s); sum_e += att[p]; }
                 float inv_sum = 1.0f / sum_e;
-                float *out_h = bxb2 + (size_t)t * q_dim + h * hd;
                 for (int p = 0; p < seq_len; p++) {
                     int abs_pos = start + p;
                     int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
