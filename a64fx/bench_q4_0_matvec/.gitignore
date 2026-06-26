@@ -36,3 +36,4 @@ q8v2_ffn_test
 results.txt
 sdot_roofline
 swar_fused
+mini_batched

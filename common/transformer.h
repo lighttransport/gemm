@@ -8157,6 +8157,10 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
     }
 }
 
+/* Batched-decode verify hook: if set (size N*n_vocab), prefill_batch fills it with
+ * lm_head logits for ALL N tokens (not just the last) via a single batched GEMM ->
+ * the foundation for speculative/batched decode. NULL = current last-token behavior. */
+float *tf_batch_all_logits = NULL;
 static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *tokens,
                                       int n_tokens, int start_pos) {
     if (!m || !tokens || n_tokens <= 0 || !m->is_gemma4) return NULL;
@@ -8366,6 +8370,16 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
         t_ffn_down += tf_time_ms() - t0p;
     }
 
+    if (tf_batch_all_logits) {
+        /* All-N logits for batched-decode verify: rmsnorm all N hidden states then one
+         * batched lm_head GEMM (output weight read ONCE for N tokens). */
+        tf_rmsnorm_batch(bxb, bx, &m->output_norm, n_embd, N, m->rms_norm_eps, m->matvec_tmp);
+        tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &m->output, bxb, m->n_vocab, N,
+                                  m->n_vocab, n_embd, m->n_threads);
+        if (m->final_logit_softcapping > 0.0f)
+            for (int t = 0; t < N; t++)
+                tf_logit_softcap(tf_batch_all_logits + (size_t)t * m->n_vocab, m->n_vocab, m->final_logit_softcapping);
+    }
     float *last = bx + (size_t)(N - 1) * n_embd;
     tf_rmsnorm(m->x, last, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
     tf_qmatvec_pool(m, m->logits, &m->output, m->x, m->n_vocab);
