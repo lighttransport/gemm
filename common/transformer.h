@@ -7281,6 +7281,15 @@ static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
             _mm256_storeu_ps(yi + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xi + i), vscale),
                                                      _mm256_loadu_ps(w_buf + i)));
         for (; i < n_embd; i++) yi[i] = xi[i] * ss * w_buf[i];
+#elif defined(__ARM_FEATURE_SVE)
+        svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+        svfloat32_t vss = svdup_f32(0);
+        for (int i = 0; i < n_embd; i += vl) { svbool_t pg = svwhilelt_b32(i, n_embd);
+            svfloat32_t vx = svld1(pg, xi + i); vss = svmla_m(pg, vss, vx, vx); }
+        float ss = 1.0f / sqrtf(svaddv(pt, vss) / n_embd + eps);
+        svfloat32_t vsc = svdup_f32(ss);
+        for (int i = 0; i < n_embd; i += vl) { svbool_t pg = svwhilelt_b32(i, n_embd);
+            svst1(pg, yi + i, svmul_x(pg, svmul_x(pg, svld1(pg, xi + i), vsc), svld1(pg, w_buf + i))); }
 #else
         float ss = 0.0f;
         for (int i = 0; i < n_embd; i++) ss += xi[i] * xi[i];
@@ -7295,8 +7304,10 @@ static void tf_qk_norm_batch(float *vec, int n_heads, int head_dim, int N,
                                const qtensor *norm_w, float eps, float *w_buf) {
     tf_dequant_row(norm_w, 0, w_buf);
     int vec_dim = n_heads * head_dim;
+    /* parallel over (token,head): N*n_heads work items (was N-only -> for k/v with
+     * few tokens/heads it starved threads). Each (t,h) writes a disjoint slice. */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) collapse(2)
     #endif
     for (int t = 0; t < N; t++) {
         for (int h = 0; h < n_heads; h++) {
@@ -7322,6 +7333,15 @@ static void tf_qk_norm_batch(float *vec, int n_heads, int head_dim, int N,
                 _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(v + i), vscale),
                                                        _mm256_loadu_ps(w_buf + i)));
             for (; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#elif defined(__ARM_FEATURE_SVE)
+            svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+            svfloat32_t vss = svdup_f32(0);
+            for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+                svfloat32_t vx = svld1(pg, v + i); vss = svmla_m(pg, vss, vx, vx); }
+            float ss = 1.0f / sqrtf(svaddv(pt, vss) / head_dim + eps);
+            svfloat32_t vsc = svdup_f32(ss);
+            for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+                svst1(pg, v + i, svmul_x(pg, svmul_x(pg, svld1(pg, v + i), vsc), svld1(pg, w_buf + i))); }
 #else
             float ss = 0.0f;
             for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];
@@ -7882,20 +7902,36 @@ static void tf_gemma4_rope_batch(transformer_model *m, transformer_layer *layer,
         for (int j = 0; j < half; j++) { float f = (float)p * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
         for (int h = 0; h < n_heads; h++) {
             float *qh = bq + (size_t)t * q_dim + h * hd;
+#if defined(__ARM_FEATURE_SVE)
+            for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                svfloat32_t r0 = svld1(pg, qh + j), r1 = svld1(pg, qh + j + half);
+                svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                svst1(pg, qh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));   /* r0*c - r1*s */
+                svst1(pg, qh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); } /* r0*s + r1*c */
+#else
             for (int j = 0; j < half; j++) {
                 float r0 = qh[j], r1 = qh[j + half];
                 qh[j] = r0 * cs[j] - r1 * sn[j];
                 qh[j + half] = r0 * sn[j] + r1 * cs[j];
             }
+#endif
         }
         if (layer->shared_kv_source < 0) {
             for (int h = 0; h < n_kv_heads; h++) {
                 float *kh = bk + (size_t)t * kv_dim + h * hd;
+#if defined(__ARM_FEATURE_SVE)
+                for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                    svfloat32_t r0 = svld1(pg, kh + j), r1 = svld1(pg, kh + j + half);
+                    svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                    svst1(pg, kh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));
+                    svst1(pg, kh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); }
+#else
                 for (int j = 0; j < half; j++) {
                     float r0 = kh[j], r1 = kh[j + half];
                     kh[j] = r0 * cs[j] - r1 * sn[j];
                     kh[j + half] = r0 * sn[j] + r1 * cs[j];
                 }
+#endif
             }
         }
     }
