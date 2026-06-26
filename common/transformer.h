@@ -41,6 +41,8 @@ typedef struct {
     float    scale;      /* optional external scale for safetensors FP8 weights */
     int      has_scale;
     int      podd_packed; /* 1 = data is k-major-interleaved for the p_odd BF16 GEMM */
+    int8_t  *i8;          /* optional int8 W8A8 weights [n_rows*n_cols], row-major */
+    float   *i8s;         /* per-row int8 scale [n_rows] (w ~= i8 * i8s[row]) */
 } qtensor;
 
 typedef struct {
@@ -361,6 +363,7 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
 extern void gemm_fp16_BT(int M, int K, int N,
@@ -774,6 +777,24 @@ static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
 static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                   const float *x, int n_cols, int row_start, int row_end);
 
+#if defined(__ARM_FEATURE_SVE)
+/* int8 SDOT row dot: sum(w[k]*x[k]) over K via svdot (4 int8 MAC / int32 lane). */
+static inline int32_t tf_int8_dot(const int8_t *w, const int8_t *x, int K) {
+    svint32_t a = svdup_s32(0); svbool_t pb = svptrue_b8(); int vlb = (int)svcntb();
+    int k = 0; for (; k + vlb <= K; k += vlb) a = svdot_s32(a, svld1_s8(pb, w + k), svld1_s8(pb, x + k));
+    int32_t s = svaddv_s32(svptrue_b32(), a);
+    for (; k < K; k++) s += (int32_t)w[k] * (int32_t)x[k];
+    return s;
+}
+/* quantize x[K] -> int8 (per-vector symmetric); returns scale s.t. x ~= xi8*scale. */
+static inline float tf_quant_x_i8(const float *x, int8_t *xi8, int K) {
+    float mx = 0; for (int k = 0; k < K; k++) { float a = x[k] < 0 ? -x[k] : x[k]; if (a > mx) mx = a; }
+    float sc = mx / 127.0f, inv = sc > 0 ? 1.0f / sc : 0;
+    for (int k = 0; k < K; k++) { int q = (int)lrintf(x[k] * inv); xi8[k] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q); }
+    return sc;
+}
+#endif
+
 static void *tf_qmatvec_worker(void *arg) {
     tf_matvec_task *t = (tf_matvec_task *)arg;
     int n_cols = t->mat->n_cols;
@@ -808,6 +829,16 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         return NULL;
     }
+#if defined(__ARM_FEATURE_SVE)
+    if (t->mat->i8) {   /* W8A8 int8 SDOT (per-row w scale, per-call x scale) */
+        int8_t *xi8 = (int8_t *)t->tmp;   /* per-thread scratch (max_dim floats >= n_cols bytes) */
+        float xs = tf_quant_x_i8(t->x, xi8, n_cols);
+        const int8_t *W = t->mat->i8; const float *ws = t->mat->i8s;
+        for (int i = t->row_start; i < t->row_end; i++)
+            t->dst[i] = (float)tf_int8_dot(W + (size_t)i * n_cols, xi8, n_cols) * ws[i] * xs;
+        return NULL;
+    }
+#endif
     if (t->mat->type == GGML_TYPE_BF16) {
         const uint8_t *base = (const uint8_t *)t->mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
@@ -875,6 +906,7 @@ static void *tf_qmatvec_worker(void *arg) {
 
 /* Forward declarations for fused matvec and thread pool */
 static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_rows, float *tmp);
+static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat, const float *x, int n_rows);
 static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
                               void *args, size_t arg_stride);
 static void tf_pool_shutdown(transformer_model *model);
@@ -2110,6 +2142,7 @@ static int tf_dprof = -1;
 static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qtensor *mat1,
                                     float *dst2, const qtensor *mat2,
                                     const float *x, int n_rows) {
+    if (mat1->i8) { tf_qmatvec_pool(m, dst1, mat1, x, n_rows); tf_qmatvec_pool(m, dst2, mat2, x, n_rows); return; }
     if (tf_dprof < 0) tf_dprof = getenv("TF_DPROF") ? 1 : 0;
     double _t0 = tf_dprof ? tf_time_ms() : 0;
     int nt = m->n_threads;
@@ -2244,6 +2277,8 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
                                         float *q, const qtensor *mat_q, int n_q,
                                         float *k, const qtensor *mat_k,
                                         float *v, const qtensor *mat_v, int n_kv) {
+    if (mat_q->i8) { tf_qmatvec_pool(m, q, mat_q, m->xb, n_q);
+        tf_qmatvec_pool(m, k, mat_k, m->xb, n_kv); tf_qmatvec_pool(m, v, mat_v, m->xb, n_kv); return; }
     int nt = m->n_threads;
     if (nt <= 1 || !m->pool_alive) {
         tf_qmatvec(q, mat_q, m->xb, n_q, m->thread_tmp[0]);
@@ -2270,6 +2305,15 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
 
 static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_rows, float *tmp) {
     int n_cols = mat->n_cols;
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->i8) {   /* W8A8 int8 SDOT */
+        int8_t *xi8 = (int8_t *)tmp;
+        float xs = tf_quant_x_i8(x, xi8, n_cols);
+        const int8_t *W = mat->i8; const float *ws = mat->i8s;
+        for (int r = 0; r < n_rows; r++) dst[r] = (float)tf_int8_dot(W + (size_t)r * n_cols, xi8, n_cols) * ws[r] * xs;
+        return;
+    }
+#endif
     if (mat->type == GGML_TYPE_F16) {
         const uint8_t *base = (const uint8_t *)mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
@@ -6091,6 +6135,43 @@ static void tf_gemm_bf16_blocked(float *Y, const uint16_t *W, const float *X,
 }
 #define TF_HAVE_BF16_BLOCKED 1
 
+/* W8A8 int8 prepack: quantize the 7 BF16 dense weights/layer to int8 (per-row symmetric
+ * scale) IN-PLACE -- the 1-byte int8 row [r*K..] overwrites the first half of the 2-byte
+ * BF16 row [r*2K..] AFTER it's read (the int8 write frontier r*K+k stays strictly below
+ * the BF16 read frontier r*2K+2k for r>=1, and within row 0 below the read), so no extra
+ * memory and no madvise (madvise(DONTNEED) HANGS on the interleaved buffer). The weights
+ * are first-touch-distributed by an OMP loop over WEIGHTS (each weight quantized
+ * single-threaded internally -- the in-place hazard is intra-weight; weights are
+ * independent). Sets w->i8 (= w->data) + w->i8s. BREAKS the BF16 path (dispatch checks
+ * mat->i8). The dead second half stays mapped (no saving, but memory-neutral). */
+void transformer_prepack_int8(transformer_model *m) {
+    if (!m || !m->layers) return;
+    int cnt = 0;
+    fprintf(stderr, "int8 prepack: start (%d layers, in-place)\n", m->n_layers);
+    int NW = m->n_layers * 7;
+    for (int wi = 0; wi < NW; wi++) {
+        transformer_layer *L = &m->layers[wi / 7];
+        qtensor *ws[] = {&L->ffn_gate, &L->ffn_up, &L->ffn_down, &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output};
+        qtensor *w = ws[wi % 7];
+        if (!w->data || w->type != GGML_TYPE_BF16 || w->i8) continue;
+        int nr = w->n_rows, K = w->n_cols;
+        float *sc = (float *)malloc((size_t)nr * sizeof(float));
+        if (!sc) { fprintf(stderr, "int8 prepack: scale alloc failed\n"); return; }
+        int8_t *i8 = (int8_t *)w->data;   /* in-place */
+        for (int r = 0; r < nr; r++) {
+            const uint16_t *row = (const uint16_t *)w->data + (size_t)r * K;
+            float mx = 0;
+            for (int k = 0; k < K; k++) { float v = bf16_to_f32_scalar(row[k]); float a = v < 0 ? -v : v; if (a > mx) mx = a; }
+            float s = mx / 127.0f, inv = s > 0 ? 1.0f / s : 0; sc[r] = s;
+            int8_t *dst = i8 + (size_t)r * K;
+            for (int k = 0; k < K; k++) { int q = (int)lrintf(bf16_to_f32_scalar(row[k]) * inv);
+                dst[k] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q); }
+        }
+        w->i8 = i8; w->i8s = sc; cnt++;
+    }
+    fprintf(stderr, "int8 prepack: %d BF16 weights -> int8 W8A8 (in-place)\n", cnt);
+}
+
 #ifdef TF_LINK_PODD   /* consumer opts in (-DTF_LINK_PODD) AND links sgemm_bf16_2x12.S */
 /* On-the-fly p_odd BF16 GEMM (clair sgemm_bf16_2x12, 137 GF/core). A=features(MR=32),
  * B=tokens(NR=12): W packed k-major-interleaved + X packed k-major BF16 per call, C
@@ -6991,6 +7072,32 @@ static int tf_gemm_q8v2_pair_gelu_tokenmajor(float *Y, const qtensor *gate,
 static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const float *X,
                                        int n_rows, int N, int out_stride, int X_stride,
                                        int n_threads) {
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->i8) {   /* W8A8 int8 SDOT GEMM: quantize X per-token, row-outer/token-inner
+                      * (weight row read once from HBM, reused across N tokens from L1). */
+        int K = mat->n_cols, nt = n_threads > 1 ? n_threads : 1;
+        static int8_t *xi8 = NULL; static float *xsc = NULL; static size_t xcap = 0; static int scap = 0;
+        size_t need = (size_t)N * K;
+        if (need > xcap) { free(xi8); xi8 = (int8_t *)malloc(need); xcap = xi8 ? need : 0; }
+        if (N > scap) { free(xsc); xsc = (float *)malloc((size_t)N * 4); scap = xsc ? N : 0; }
+        if (xi8 && xsc) {
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int t = 0; t < N; t++) xsc[t] = tf_quant_x_i8(X + (size_t)t * X_stride, xi8 + (size_t)t * K, K);
+            const int8_t *W = mat->i8; const float *Ws = mat->i8s;
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int r = 0; r < n_rows; r++) {
+                const int8_t *w = W + (size_t)r * K; float wsc = Ws[r];
+                for (int t = 0; t < N; t++)
+                    Y_out[(size_t)t * out_stride + r] = (float)tf_int8_dot(w, xi8 + (size_t)t * K, K) * wsc * xsc[t];
+            }
+            return;
+        }
+    }
+#endif
     if (mat->type == GGML_TYPE_Q8_0) {
         /* Q8_0 SIMD GEMM path */
         int K = mat->n_cols;

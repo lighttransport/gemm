@@ -27,6 +27,7 @@ int main(int argc,char**argv){
     int nthr=getenv("LLM_THREADS")?atoi(getenv("LLM_THREADS")):48;
     transformer_set_threads(m,nthr);
     transformer_numa_setup(m,g);
+    if(getenv("TF_INT8")&&atoi(getenv("TF_INT8"))){ extern void transformer_prepack_int8(transformer_model*); transformer_prepack_int8(m); }
     if(!(getenv("TF_NO_PANEL")&&atoi(getenv("TF_NO_PANEL")))) transformer_build_panels(m);
     fprintf(stderr,"[mini] loaded in %.1fs, n_vocab=%d, threads=%d\n",now()-t0,m->n_vocab,nthr);
 
