@@ -7719,45 +7719,52 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
                                        int n_kv_heads, int hd, int q_dim,
                                        int kv_dim, int gqa) {
     memset(bxb2, 0, (size_t)N * q_dim * sizeof(float));
-    for (int t = 0; t < N; t++) {
-        int cur_pos = pos[t];
-        int start = 0;
-        int seq_len = cur_pos + 1;
-        if (layer->is_swa && seq_len > m->swa_window_size) {
-            start = cur_pos - m->swa_window_size + 1;
-            seq_len = m->swa_window_size;
+    /* Parallel over (token,head): each (t,h) writes a disjoint bxb2[t*q_dim+h*hd]
+     * region and uses a thread-local score buffer -> race-free. Was fully serial
+     * (the prefill's dominant cost). KV dtype handled by tf_kv_load_* (scalar). */
+    int nt = m->n_threads > 1 ? m->n_threads : 1;
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        float *att = (float *)malloc((size_t)m->max_seq_len * sizeof(float));
+        #ifdef _OPENMP
+        #pragma omp for collapse(2) schedule(dynamic)
+        #endif
+        for (int t = 0; t < N; t++) {
+            for (int h = 0; h < n_heads; h++) {
+                int cur_pos = pos[t];
+                int start = 0, seq_len = cur_pos + 1;
+                if (layer->is_swa && seq_len > m->swa_window_size) {
+                    start = cur_pos - m->swa_window_size + 1;
+                    seq_len = m->swa_window_size;
+                }
+                float *qh = bq + (size_t)t * q_dim + h * hd;
+                int kv_h = h / gqa;
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                    size_t kbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                    float score = 0.0f;
+                    for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
+                    att[p] = score;
+                }
+                float max_s = att[0];
+                for (int p = 1; p < seq_len; p++) if (att[p] > max_s) max_s = att[p];
+                float sum_e = 0.0f;
+                for (int p = 0; p < seq_len; p++) { att[p] = expf(att[p] - max_s); sum_e += att[p]; }
+                float inv_sum = 1.0f / sum_e;
+                float *out_h = bxb2 + (size_t)t * q_dim + h * hd;
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                    size_t vbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                    float w = att[p] * inv_sum;
+                    for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
+                }
+            }
         }
-        for (int h = 0; h < n_heads; h++) {
-            float *qh = bq + (size_t)t * q_dim + h * hd;
-            float *att_h = m->att + (size_t)h * m->max_seq_len;
-            int kv_h = h / gqa;
-            for (int p = 0; p < seq_len; p++) {
-                int abs_pos = start + p;
-                int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
-                size_t kbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
-                float score = 0.0f;
-                for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
-                att_h[p] = score;
-            }
-            float max_s = att_h[0];
-            for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
-            float sum_e = 0.0f;
-            for (int p = 0; p < seq_len; p++) {
-                att_h[p] = expf(att_h[p] - max_s);
-                sum_e += att_h[p];
-            }
-            float inv_sum = 1.0f / sum_e;
-            for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
-
-            float *out_h = bxb2 + (size_t)t * q_dim + h * hd;
-            for (int p = 0; p < seq_len; p++) {
-                int abs_pos = start + p;
-                int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
-                size_t vbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
-                float w = att_h[p];
-                for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
-            }
-        }
+        free(att);
     }
 }
 
