@@ -277,8 +277,10 @@ A processes 16,384 and saves; B loads + processes only the 1,000 new; C recomput
 cannot alter the values. End-to-end check (B argmax == C argmax): **MATCH at 24n/8L (9302==9302)**.
 At 384n/78L the argmaxes differed by one (17 vs 16) — this is the **threaded/comm argmax
 nondeterminism** documented above (synthetic byte-derived input → near-flat logits → argmax flips on
-FP noise; C is an *independent* recompute with different rounding), **not** a cache error. A
-single-thread (deterministic) run confirms B==C at full layers (see below).
+FP noise; C is an *independent* recompute with different rounding), **not** a cache error. The
+**deterministic** run settles it: 96n, full 78 layers, **single-thread** (`th=1`, no comm-overlap,
+fp32 allreduce) → **B argmax 167 == C argmax 167 exactly** (`49353292`). So with the threaded FP
+noise removed, the cache-loaded continuation is bit-exact with the full recompute at full depth.
 
 **Win.** The expensive system prompt (here ~860 s at 19 tok/s for 16k tokens on 384n) is processed
 **once** and persisted (1.47 GB); each later request loads it and pays only for its new tokens. KV is
