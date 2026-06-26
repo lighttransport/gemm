@@ -7063,6 +7063,10 @@ static void tf_rope_mrope_batch(float *bq, float *bk, int N, int n_heads, int n_
 static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
                               int n_embd, int N, float eps, float *w_buf) {
     tf_dequant_row(w, 0, w_buf);
+    /* per-token independent (w_buf shared read-only) -> parallelize over tokens */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int t = 0; t < N; t++) {
         const float *xi = src + (size_t)t * n_embd;
         float *yi = dst + (size_t)t * n_embd;
@@ -7101,6 +7105,9 @@ static void tf_qk_norm_batch(float *vec, int n_heads, int head_dim, int N,
                                const qtensor *norm_w, float eps, float *w_buf) {
     tf_dequant_row(norm_w, 0, w_buf);
     int vec_dim = n_heads * head_dim;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int t = 0; t < N; t++) {
         for (int h = 0; h < n_heads; h++) {
             float *v = vec + (size_t)t * vec_dim + h * head_dim;
@@ -7673,27 +7680,31 @@ static void tf_gemma4_rope_batch(transformer_model *m, transformer_layer *layer,
                                   int hd, int q_dim, int kv_dim) {
     float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
     int half = hd / 2;
+    int nt = m->n_threads > 1 ? m->n_threads : 1;
+    /* parallel over tokens; cos/sin depend only on (token,j) so hoist out of the
+     * head loop (was recomputed per head -> ~n_heads x redundant trig). */
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
     for (int t = 0; t < N; t++) {
         int p = pos[t];
+        float cs[256], sn[256];   /* half = hd/2 <= 256 */
+        for (int j = 0; j < half; j++) { float f = (float)p * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
         for (int h = 0; h < n_heads; h++) {
             float *qh = bq + (size_t)t * q_dim + h * hd;
             for (int j = 0; j < half; j++) {
-                float freq = (float)p * inv_freq[j];
-                float c = cosf(freq), s = sinf(freq);
                 float r0 = qh[j], r1 = qh[j + half];
-                qh[j] = r0 * c - r1 * s;
-                qh[j + half] = r0 * s + r1 * c;
+                qh[j] = r0 * cs[j] - r1 * sn[j];
+                qh[j + half] = r0 * sn[j] + r1 * cs[j];
             }
         }
         if (layer->shared_kv_source < 0) {
             for (int h = 0; h < n_kv_heads; h++) {
                 float *kh = bk + (size_t)t * kv_dim + h * hd;
                 for (int j = 0; j < half; j++) {
-                    float freq = (float)p * inv_freq[j];
-                    float c = cosf(freq), s = sinf(freq);
                     float r0 = kh[j], r1 = kh[j + half];
-                    kh[j] = r0 * c - r1 * s;
-                    kh[j + half] = r0 * s + r1 * c;
+                    kh[j] = r0 * cs[j] - r1 * sn[j];
+                    kh[j + half] = r0 * sn[j] + r1 * cs[j];
                 }
             }
         }
