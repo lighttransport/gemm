@@ -9,3 +9,4 @@ attn_profile_fj
 *.o
 # fapp profile output
 prof_*/
+conv2d_patch_bench

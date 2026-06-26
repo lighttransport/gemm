@@ -20,3 +20,15 @@ lmhead_opt
 gemm_layer
 gemm_existing
 gemm_q4_prefill
+
+# build artifacts (standalone benches)
+mini_prefill
+mini_prefill_podd
+mini_prefill_q8
+bf16_gemm_test
+bf16_podd_test
+g4v_encode_test
+g4v_encode_test_prof
+mmproj_probe
+q8v2_ffn_test
+conv2d_patch_bench
