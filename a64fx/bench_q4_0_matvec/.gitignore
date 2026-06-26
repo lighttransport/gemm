@@ -32,3 +32,4 @@ g4v_encode_test_prof
 mmproj_probe
 q8v2_ffn_test
 conv2d_patch_bench
+bf16_widen_bench

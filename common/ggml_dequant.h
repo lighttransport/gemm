@@ -1211,33 +1211,34 @@ static inline float bf16_to_f32_scalar(uint16_t h) {
 /* SVE BF16→FP32 conversion helper: load BF16 half-words, shift to FP32 */
 #define SVE_BF16_TO_F32(pg, ptr) svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, ptr), 16))
 
+/* BF16->FP32 "ld+offset" zero-shift widen: a contiguous .h load of 2*VL bf16, then
+ * zip-with-zero places each bf16 in the HIGH 16 of an fp32 lane (= valid fp32) with
+ * NO lsl. Produces (lo)=first VL, (hi)=second VL, natural order. The widen is
+ * ISSUE-bound on A64FX, so dropping the shift is ~1.9x per-core vs ld1uh+lsl
+ * (measured, bf16_widen_bench); robust at scale unlike the p_odd/ld2w variant. */
+#define SVE_BF16_ZIP(raw, zero, lo, hi) do { \
+    (lo) = svreinterpret_f32_u16(svzip1_u16((zero), (raw))); \
+    (hi) = svreinterpret_f32_u16(svzip2_u16((zero), (raw))); } while (0)
+
 static inline float vec_dot_bf16_f32(const uint16_t *a, const float *b, int n) {
     int i = 0;
-    svfloat32_t acc0 = svdup_f32(0.0f);
-    svfloat32_t acc1 = svdup_f32(0.0f);
-    svfloat32_t acc2 = svdup_f32(0.0f);
-    svfloat32_t acc3 = svdup_f32(0.0f);
-    int vl = (int)svcntw();  /* 16 FP32 elements on A64FX (512-bit SVE) */
-    int stride4 = 4 * vl;
-    svbool_t pg = svptrue_b32();
-
-    /* Software-pipelined loop: prefetch 2 iterations ahead.
-     * A64FX L2 latency ~40 cycles; prefetch distance = 2 * 4*vl * 2 bytes = 256 bytes */
-    for (; i + stride4 - 1 < n; i += stride4) {
-        /* Prefetch BF16 weights and FP32 activations 2 iterations ahead */
-        /* No SW prefetch: A64FX HW stream prefetcher handles sequential patterns */
-        svfloat32_t va0 = SVE_BF16_TO_F32(pg, &a[i]);
-        svfloat32_t va1 = SVE_BF16_TO_F32(pg, &a[i + vl]);
-        svfloat32_t va2 = SVE_BF16_TO_F32(pg, &a[i + 2 * vl]);
-        svfloat32_t va3 = SVE_BF16_TO_F32(pg, &a[i + 3 * vl]);
-        svfloat32_t vb0 = svld1(pg, &b[i]);
-        svfloat32_t vb1 = svld1(pg, &b[i + vl]);
-        svfloat32_t vb2 = svld1(pg, &b[i + 2 * vl]);
-        svfloat32_t vb3 = svld1(pg, &b[i + 3 * vl]);
-        acc0 = svmla_x(pg, acc0, va0, vb0);
-        acc1 = svmla_x(pg, acc1, va1, vb1);
-        acc2 = svmla_x(pg, acc2, va2, vb2);
-        acc3 = svmla_x(pg, acc3, va3, vb3);
+    svfloat32_t acc0 = svdup_f32(0.0f), acc1 = svdup_f32(0.0f);
+    svfloat32_t acc2 = svdup_f32(0.0f), acc3 = svdup_f32(0.0f);
+    int vl = (int)svcntw();      /* 16 FP32 on A64FX */
+    int vlh = (int)svcnth();     /* 32 BF16 = 2*VL */
+    svbool_t pg = svptrue_b32(), pgh = svptrue_b16();
+    svuint16_t zero = svdup_u16(0);
+    int stride = 2 * vlh;        /* 4*VL: two .h loads per iter -> 4 fp32 vectors */
+    for (; i + stride - 1 < n; i += stride) {
+        svuint16_t r0 = svld1_u16(pgh, &a[i]);
+        svuint16_t r1 = svld1_u16(pgh, &a[i + vlh]);
+        svfloat32_t va0, va1, va2, va3;
+        SVE_BF16_ZIP(r0, zero, va0, va1);
+        SVE_BF16_ZIP(r1, zero, va2, va3);
+        acc0 = svmla_x(pg, acc0, va0, svld1(pg, &b[i]));
+        acc1 = svmla_x(pg, acc1, va1, svld1(pg, &b[i + vl]));
+        acc2 = svmla_x(pg, acc2, va2, svld1(pg, &b[i + 2 * vl]));
+        acc3 = svmla_x(pg, acc3, va3, svld1(pg, &b[i + 3 * vl]));
     }
     for (; i < n; i += vl) {
         svbool_t ptail = svwhilelt_b32(i, n);
@@ -1252,30 +1253,33 @@ static inline void matvec_bf16_4row(float *dst, const uint16_t *w0, const uint16
                                      const uint16_t *w2, const uint16_t *w3,
                                      const float *x, int n) {
     int i = 0;
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    int vl = (int)svcntw();
-    svbool_t pg = svptrue_b32();
+    svfloat32_t a0l = svdup_f32(0.0f), a1l = svdup_f32(0.0f), a2l = svdup_f32(0.0f), a3l = svdup_f32(0.0f);
+    svfloat32_t a0h = svdup_f32(0.0f), a1h = svdup_f32(0.0f), a2h = svdup_f32(0.0f), a3h = svdup_f32(0.0f);
+    int vl = (int)svcntw(), vlh = (int)svcnth();   /* vlh = 2*VL bf16 per .h load */
+    svbool_t pg = svptrue_b32(), pgh = svptrue_b16();
+    svuint16_t zero = svdup_u16(0);
 
-    for (; i + vl - 1 < n; i += vl) {
-        /* Prefetch 4 weight rows and activation 2 iterations ahead */
-        /* No SW prefetch: A64FX HW stream prefetcher handles sequential patterns */
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, SVE_BF16_TO_F32(pg, &w0[i]), vx);
-        a1 = svmla_x(pg, a1, SVE_BF16_TO_F32(pg, &w1[i]), vx);
-        a2 = svmla_x(pg, a2, SVE_BF16_TO_F32(pg, &w2[i]), vx);
-        a3 = svmla_x(pg, a3, SVE_BF16_TO_F32(pg, &w3[i]), vx);
+    /* zip widen, 2*VL per iter: x loaded once (lo+hi) and shared across 4 rows */
+    for (; i + vlh - 1 < n; i += vlh) {
+        svfloat32_t vxl = svld1(pg, &x[i]), vxh = svld1(pg, &x[i + vl]);
+        svfloat32_t wl, wh;
+        SVE_BF16_ZIP(svld1_u16(pgh, &w0[i]), zero, wl, wh); a0l = svmla_x(pg, a0l, wl, vxl); a0h = svmla_x(pg, a0h, wh, vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh, &w1[i]), zero, wl, wh); a1l = svmla_x(pg, a1l, wl, vxl); a1h = svmla_x(pg, a1h, wh, vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh, &w2[i]), zero, wl, wh); a2l = svmla_x(pg, a2l, wl, vxl); a2h = svmla_x(pg, a2h, wh, vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh, &w3[i]), zero, wl, wh); a3l = svmla_x(pg, a3l, wl, vxl); a3h = svmla_x(pg, a3h, wh, vxh);
     }
-    if (i < n) {
+    a0l = svadd_x(pg, a0l, a0h); a1l = svadd_x(pg, a1l, a1h);
+    a2l = svadd_x(pg, a2l, a2h); a3l = svadd_x(pg, a3l, a3h);
+    for (; i < n; i += vl) {     /* scalar-VL tail */
         svbool_t ptail = svwhilelt_b32(i, n);
         svfloat32_t vx = svld1(ptail, &x[i]);
-        a0 = svmla_m(ptail, a0, SVE_BF16_TO_F32(ptail, &w0[i]), vx);
-        a1 = svmla_m(ptail, a1, SVE_BF16_TO_F32(ptail, &w1[i]), vx);
-        a2 = svmla_m(ptail, a2, SVE_BF16_TO_F32(ptail, &w2[i]), vx);
-        a3 = svmla_m(ptail, a3, SVE_BF16_TO_F32(ptail, &w3[i]), vx);
+        a0l = svmla_m(ptail, a0l, SVE_BF16_TO_F32(ptail, &w0[i]), vx);
+        a1l = svmla_m(ptail, a1l, SVE_BF16_TO_F32(ptail, &w1[i]), vx);
+        a2l = svmla_m(ptail, a2l, SVE_BF16_TO_F32(ptail, &w2[i]), vx);
+        a3l = svmla_m(ptail, a3l, SVE_BF16_TO_F32(ptail, &w3[i]), vx);
     }
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[0] = svaddv(pg, a0l); dst[1] = svaddv(pg, a1l);
+    dst[2] = svaddv(pg, a2l); dst[3] = svaddv(pg, a3l);
 }
 
 /* 8-row BF16 matvec: compute 8 dot products with shared activation vector.
@@ -1288,41 +1292,39 @@ static inline void matvec_bf16_8row(float *dst,
                                      const uint16_t *w6, const uint16_t *w7,
                                      const float *x, int n) {
     int i = 0;
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
-    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
-    int vl = (int)svcntw();
-    svbool_t pg = svptrue_b32();
+    svfloat32_t a0l=svdup_f32(0),a1l=svdup_f32(0),a2l=svdup_f32(0),a3l=svdup_f32(0);
+    svfloat32_t a4l=svdup_f32(0),a5l=svdup_f32(0),a6l=svdup_f32(0),a7l=svdup_f32(0);
+    svfloat32_t a0h=svdup_f32(0),a1h=svdup_f32(0),a2h=svdup_f32(0),a3h=svdup_f32(0);
+    svfloat32_t a4h=svdup_f32(0),a5h=svdup_f32(0),a6h=svdup_f32(0),a7h=svdup_f32(0);
+    int vl = (int)svcntw(), vlh = (int)svcnth();
+    svbool_t pg = svptrue_b32(), pgh = svptrue_b16();
+    svuint16_t zero = svdup_u16(0);
 
-    for (; i + vl - 1 < n; i += vl) {
-        /* No SW prefetch: A64FX HW stream prefetcher handles sequential patterns */
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, SVE_BF16_TO_F32(pg, &w0[i]), vx);
-        a1 = svmla_x(pg, a1, SVE_BF16_TO_F32(pg, &w1[i]), vx);
-        a2 = svmla_x(pg, a2, SVE_BF16_TO_F32(pg, &w2[i]), vx);
-        a3 = svmla_x(pg, a3, SVE_BF16_TO_F32(pg, &w3[i]), vx);
-        a4 = svmla_x(pg, a4, SVE_BF16_TO_F32(pg, &w4[i]), vx);
-        a5 = svmla_x(pg, a5, SVE_BF16_TO_F32(pg, &w5[i]), vx);
-        a6 = svmla_x(pg, a6, SVE_BF16_TO_F32(pg, &w6[i]), vx);
-        a7 = svmla_x(pg, a7, SVE_BF16_TO_F32(pg, &w7[i]), vx);
+    /* zip widen, 2*VL/iter: x loaded once (lo+hi), amortized across 8 weight streams */
+    for (; i + vlh - 1 < n; i += vlh) {
+        svfloat32_t vxl = svld1(pg, &x[i]), vxh = svld1(pg, &x[i + vl]);
+        svfloat32_t wl, wh;
+        SVE_BF16_ZIP(svld1_u16(pgh,&w0[i]),zero,wl,wh); a0l=svmla_x(pg,a0l,wl,vxl); a0h=svmla_x(pg,a0h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w1[i]),zero,wl,wh); a1l=svmla_x(pg,a1l,wl,vxl); a1h=svmla_x(pg,a1h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w2[i]),zero,wl,wh); a2l=svmla_x(pg,a2l,wl,vxl); a2h=svmla_x(pg,a2h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w3[i]),zero,wl,wh); a3l=svmla_x(pg,a3l,wl,vxl); a3h=svmla_x(pg,a3h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w4[i]),zero,wl,wh); a4l=svmla_x(pg,a4l,wl,vxl); a4h=svmla_x(pg,a4h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w5[i]),zero,wl,wh); a5l=svmla_x(pg,a5l,wl,vxl); a5h=svmla_x(pg,a5h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w6[i]),zero,wl,wh); a6l=svmla_x(pg,a6l,wl,vxl); a6h=svmla_x(pg,a6h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w7[i]),zero,wl,wh); a7l=svmla_x(pg,a7l,wl,vxl); a7h=svmla_x(pg,a7h,wh,vxh);
     }
-    if (i < n) {
+    a0l=svadd_x(pg,a0l,a0h);a1l=svadd_x(pg,a1l,a1h);a2l=svadd_x(pg,a2l,a2h);a3l=svadd_x(pg,a3l,a3h);
+    a4l=svadd_x(pg,a4l,a4h);a5l=svadd_x(pg,a5l,a5h);a6l=svadd_x(pg,a6l,a6h);a7l=svadd_x(pg,a7l,a7h);
+    for (; i < n; i += vl) {
         svbool_t ptail = svwhilelt_b32(i, n);
         svfloat32_t vx = svld1(ptail, &x[i]);
-        a0 = svmla_m(ptail, a0, SVE_BF16_TO_F32(ptail, &w0[i]), vx);
-        a1 = svmla_m(ptail, a1, SVE_BF16_TO_F32(ptail, &w1[i]), vx);
-        a2 = svmla_m(ptail, a2, SVE_BF16_TO_F32(ptail, &w2[i]), vx);
-        a3 = svmla_m(ptail, a3, SVE_BF16_TO_F32(ptail, &w3[i]), vx);
-        a4 = svmla_m(ptail, a4, SVE_BF16_TO_F32(ptail, &w4[i]), vx);
-        a5 = svmla_m(ptail, a5, SVE_BF16_TO_F32(ptail, &w5[i]), vx);
-        a6 = svmla_m(ptail, a6, SVE_BF16_TO_F32(ptail, &w6[i]), vx);
-        a7 = svmla_m(ptail, a7, SVE_BF16_TO_F32(ptail, &w7[i]), vx);
+        a0l=svmla_m(ptail,a0l,SVE_BF16_TO_F32(ptail,&w0[i]),vx); a1l=svmla_m(ptail,a1l,SVE_BF16_TO_F32(ptail,&w1[i]),vx);
+        a2l=svmla_m(ptail,a2l,SVE_BF16_TO_F32(ptail,&w2[i]),vx); a3l=svmla_m(ptail,a3l,SVE_BF16_TO_F32(ptail,&w3[i]),vx);
+        a4l=svmla_m(ptail,a4l,SVE_BF16_TO_F32(ptail,&w4[i]),vx); a5l=svmla_m(ptail,a5l,SVE_BF16_TO_F32(ptail,&w5[i]),vx);
+        a6l=svmla_m(ptail,a6l,SVE_BF16_TO_F32(ptail,&w6[i]),vx); a7l=svmla_m(ptail,a7l,SVE_BF16_TO_F32(ptail,&w7[i]),vx);
     }
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
-    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+    dst[0]=svaddv(pg,a0l); dst[1]=svaddv(pg,a1l); dst[2]=svaddv(pg,a2l); dst[3]=svaddv(pg,a3l);
+    dst[4]=svaddv(pg,a4l); dst[5]=svaddv(pg,a5l); dst[6]=svaddv(pg,a6l); dst[7]=svaddv(pg,a7l);
 }
 
 /* Tiled BF16 GEMM: Y[tok, row] = W[row, K] · X[tok, K]^T
