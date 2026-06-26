@@ -6089,22 +6089,26 @@ void transformer_prepack_podd(transformer_model *m) {
     if (!m || !m->layers) return;
     size_t maxsz = 0;
     for (int l = 0; l < m->n_layers; l++) {
-        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up,
-                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v};
-        for (int i = 0; i < 5; i++) if (ws[i]->data && ws[i]->type == GGML_TYPE_BF16) {
+        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up, &m->layers[l].ffn_down,
+                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v,
+                         &m->layers[l].attn_output};
+        for (int i = 0; i < 7; i++) if (ws[i]->data && ws[i]->type == GGML_TYPE_BF16) {
             size_t s = (size_t)ws[i]->n_rows * ws[i]->n_cols * 2; if (s > maxsz) maxsz = s; }
     }
     if (!maxsz) return;
     uint16_t *tmp = (uint16_t *)malloc(maxsz);
     if (!tmp) { fprintf(stderr, "podd prepack: tmp alloc failed (%zu)\n", maxsz); return; }
     int nt = m->n_threads > 1 ? m->n_threads : 1, cnt = 0;
+    /* pre-packed -> pack-free podd at ANY K (the K<4096 limit was only for the
+     * on-the-fly per-GEMM pack cost; with prepack large-K ffn_down/out benefit too). */
     for (int l = 0; l < m->n_layers; l++) {
-        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up,
-                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v};
-        for (int i = 0; i < 5; i++) { qtensor *w = ws[i];
+        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up, &m->layers[l].ffn_down,
+                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v,
+                         &m->layers[l].attn_output};
+        for (int i = 0; i < 7; i++) { qtensor *w = ws[i];
             if (!w->data || w->type != GGML_TYPE_BF16 || w->podd_packed) continue;
             int n_rows = w->n_rows, K = w->n_cols;
-            if (n_rows % 32 || K >= 4096) continue;     /* podd-beneficial small-K, %32 dims */
+            if (n_rows % 32) continue;          /* kernel needs MR=32 row tiles */
             tf_podd_pack_w((const uint16_t *)w->data, tmp, n_rows, K, nt);
             memcpy(w->data, tmp, (size_t)n_rows * K * 2);
             w->podd_packed = 1; cnt++;
