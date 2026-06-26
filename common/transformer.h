@@ -6015,7 +6015,61 @@ static void tf_gemm_bf16_blocked(float *Y, const uint16_t *W, const float *X,
             Y[(size_t)t*Ys+row]=svaddv_f32(svptrue_b32(),a); } }
 }
 #define TF_HAVE_BF16_BLOCKED 1
-#endif
+
+#ifdef TF_LINK_PODD   /* consumer opts in (-DTF_LINK_PODD) AND links sgemm_bf16_2x12.S */
+/* On-the-fly p_odd BF16 GEMM (clair sgemm_bf16_2x12, 137 GF/core). A=features(MR=32),
+ * B=tokens(NR=12): W packed k-major-interleaved + X packed k-major BF16 per call, C
+ * col-major -> transposed to token-major Y. ~1.8x the blocked kernel for prefill at
+ * N>=128 (the W-pack is a fixed cost that amortizes with N). BF16 activations
+ * (model-native precision; relL2 ~2.7e-3 vs blocked's 2e-7). Enable: TF_PODD=1.
+ * Needs n_rows%32==0 (all gemma-4 12B dims are); token remainder handled by padding. */
+extern void sgemm_bf16_2x12(int64_t K, const void *A, const void *B, float *C, int64_t ldc);
+static uint16_t *tf_podd_Wp = NULL, *tf_podd_Xa = NULL;
+static size_t tf_podd_Wcap = 0, tf_podd_Xcap = 0;
+static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
+        int n_rows, int K, int N, int Ys, int Xs, int nt) {
+    const int PMR = 32, PNR = 12;
+    if (n_rows % PMR) return 0;
+    int FT = n_rows / PMR, TT = (N + PNR - 1) / PNR;
+    size_t wn = (size_t)FT * K * PMR * 2, xn = (size_t)TT * K * PNR * 2;
+    if (wn > tf_podd_Wcap) { free(tf_podd_Wp); tf_podd_Wp = (uint16_t *)malloc(wn); tf_podd_Wcap = tf_podd_Wp ? wn : 0; }
+    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
+    if (!tf_podd_Wp || !tf_podd_Xa) return 0;
+    uint16_t *Wp = tf_podd_Wp, *Xa = tf_podd_Xa;
+    /* pack W -> k-major interleaved (2x16 rows) */
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int ft = 0; ft < FT; ft++) { uint16_t *dst = Wp + (size_t)ft * K * PMR;
+        for (int k = 0; k < K; k++) for (int i = 0; i < 16; i++) {
+            dst[k*PMR + 2*i]   = W[(size_t)(ft*PMR + i)     * K + k];
+            dst[k*PMR + 2*i+1] = W[(size_t)(ft*PMR + 16 + i) * K + k]; } }
+    /* pack X -> k-major BF16 (pad tokens >= N with 0) */
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int tt = 0; tt < TT; tt++) { uint16_t *Xb = Xa + (size_t)tt * K * PNR;
+        for (int k = 0; k < K; k++) for (int n = 0; n < PNR; n++) {
+            int tok = tt*PNR + n; uint32_t u = 0;
+            if (tok < N) { float xv = X[(size_t)tok * Xs + k]; __builtin_memcpy(&u, &xv, 4); }
+            Xb[k*PNR + n] = (uint16_t)(u >> 16); } }
+    /* kernel per (feat-tile, tok-tile); transpose col-major C -> token-major Y */
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    { float Ct[32 * 12];
+      #ifdef _OPENMP
+      #pragma omp for schedule(static) collapse(2)
+      #endif
+      for (int ft = 0; ft < FT; ft++) for (int tt = 0; tt < TT; tt++) {
+          sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, Ct, PMR);
+          for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue;
+              for (int mm = 0; mm < PMR; mm++) Y[(size_t)tok * Ys + ft*PMR + mm] = Ct[mm + n*PMR]; } } }
+    return 1;
+}
+#define TF_HAVE_BF16_PODD 1
+#endif /* TF_LINK_PODD */
+#endif /* __ARM_FEATURE_SVE */
 
 static void *tf_gemm_bf16_tm_worker(void *arg) {
     tf_gemm_tm_task *t = (tf_gemm_tm_task *)arg;
@@ -6751,6 +6805,19 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
     if (mat->type == GGML_TYPE_BF16) {
         /* BF16 GEMM path */
         int K = mat->n_cols;
+#ifdef TF_HAVE_BF16_PODD
+        {   static int podd = -1;
+            if (podd < 0) podd = getenv("TF_PODD") && atoi(getenv("TF_PODD"));
+            /* Only worthwhile at small K: the on-the-fly W/X pack (~ (n_rows+N)*K)
+             * amortizes vs compute (n_rows*N*K) when K is small. Measured: helps
+             * gate/up + QKV (K=3840, ~1.7x), hurts out/down (K>=8192). */
+            if (podd && N >= 12 && K < 4096 &&
+                tf_gemm_bf16_podd(Y_out, (const uint16_t *)mat->data, X,
+                                  n_rows, K, N, out_stride, X_stride,
+                                  n_threads > 1 ? n_threads : 1))
+                return;
+        }
+#endif
 #ifdef TF_HAVE_BF16_BLOCKED
         /* prefill (N>=4): register-blocked, PINNED OpenMP (raw pthreads below float
          * across CMGs -> cross-CMG weight reads). N=1 decode keeps the matvec path. */
