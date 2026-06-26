@@ -8167,6 +8167,9 @@ float *tf_batch_all_logits = NULL;
  * sleep) and silence the per-call profile. */
 int tf_batch_keep_pool = 0;
 int tf_batch_quiet = 0;
+/* If set, prefill_batch points this at the [N x n_embd] post-block hidden states (the
+ * pre-output-norm residual stream) so an MTP/draft head can fuse them. */
+float **tf_batch_hidden_out = NULL;
 static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *tokens,
                                       int n_tokens, int start_pos) {
     if (!m || !tokens || n_tokens <= 0 || !m->is_gemma4) return NULL;
@@ -8376,6 +8379,7 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
         t_ffn_down += tf_time_ms() - t0p;
     }
 
+    if (tf_batch_hidden_out) *tf_batch_hidden_out = bx;   /* [N x n_embd] residual stream */
     if (tf_batch_all_logits) {
         /* All-N logits for batched-decode verify: rmsnorm all N hidden states then one
          * batched lm_head GEMM (output weight read ONCE for N tokens). */
