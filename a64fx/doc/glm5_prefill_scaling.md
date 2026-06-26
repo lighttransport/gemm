@@ -250,3 +250,38 @@ reaches it (the 72 h companion was cancelled). The run is **wall-clock-bound, no
 this rate. `glm5_model.kv_avail` is stored for a future **auto-merge** (recompute T_cp after each
 merge so merges fire by memory, not forced points) — not yet wired; the Tier-A `kv_cache` would also
 need resizing per merge.
+
+
+## UPDATE (2026-06-26): KV-cache save/load (prompt / prefix caching)
+
+A processed system prompt's KV can be **saved to storage and reloaded** so later requests skip
+recomputing it (`994eed1e`). `GLM5_KV_SAVE=<dir>` writes the processed `[0,pend)` Tier-A KV
+(`kv.bin`, 4-int header `[positions,n_layers,KVD,ep_size]` + bf16 `kv_cache` per layer). The Tier-A
+KV is **replicated** across ranks (it comes from the replicated `wkv_a` on the post-allreduce hidden
+state, identical on every rank), so only rank 0 writes one file. `GLM5_KV_LOAD=<dir>` `fread`s it
+into each layer's `kv_cache` and resumes prefill from `start_pos=P`; the synth loop now indexes
+tokens by **absolute** position (`pa=start_pos+p0`) so save / load / full-recompute stay consistent.
+Test harness `pjsub_glm5_kvcache_384n.sh` (set `GLM5_PREFILL_GROUPS=1` so `ep_size=NP` matches the
+staged blobs — auto-grouping would mismatch the blob index and SIGSEGV).
+
+Test: tokenized `~/doc/gpt-5.5.md` (17,384 tokens = 16,384 "system prompt" + 1,000 "query").
+A processes 16,384 and saves; B loads + processes only the 1,000 new; C recomputes all 17,384.
+
+| run | tokens | rate | note |
+| --- | --- | --- | --- |
+| A (save) | 16,384 | 19.1 tok/s (384n) / 137 (24n,8L) | writes 1.47 GB (78L) / 0.15 GB (8L) |
+| B (load + new) | **1,000** | 13.6 / 127 | reuses cache, pays only for new tokens |
+| C (full recompute) | 17,384 | 18.9 / 187 | baseline |
+
+**Correctness.** The save/load is a **byte copy**, so B operates on bit-identical KV to A — the cache
+cannot alter the values. End-to-end check (B argmax == C argmax): **MATCH at 24n/8L (9302==9302)**.
+At 384n/78L the argmaxes differed by one (17 vs 16) — this is the **threaded/comm argmax
+nondeterminism** documented above (synthetic byte-derived input → near-flat logits → argmax flips on
+FP noise; C is an *independent* recompute with different rounding), **not** a cache error. A
+single-thread (deterministic) run confirms B==C at full layers (see below).
+
+**Win.** The expensive system prompt (here ~860 s at 19 tok/s for 16k tokens on 384n) is processed
+**once** and persisted (1.47 GB); each later request loads it and pays only for its new tokens. KV is
+saved as Tier-A bf16 (`slot=pos`); the loader requires the same `KVD`/`n_layers` and `P<=max_pos`.
+Limitation: current save covers the single-tier Tier-A (replicated) case; CP-sharded (Tier-B) save
+would write per-rank shards.

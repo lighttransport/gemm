@@ -29,12 +29,14 @@ export GLM5_MODEL_DIR=${GLM5_MODEL_DIR:-$HOME/models/glm52-fp8}
 export GLM5_STAGE_DIR=${GLM5_STAGE_DIR:-/local/glm5_fp8_prefill_$JOB_TAG}
 export GLM5_NSHARDS=141
 export GLM5_EP_SIZE=$NP
+export GLM5_PREFILL_GROUPS=1   # single group: ep_size=NP must match the staged blobs (no auto-grouping)
 export GLM5_STATUS_DIR="$WORK"
 export GLM5_TP=1 GLM5_TP_SHARED=1 GLM5_MAXPOS=${GLM5_MAXPOS:-32768}
 export GLM5_PREFILL_ONLY=1 GLM5_PREFILL_ROLLING=${GLM5_PREFILL_ROLLING:-1}
 export GLM5_ABSORB_ATTN=1 GLM5_ABSORB_SVE_DOT=1
 th=${GLM5_THREAD_SWEEP:-24}; pc=${GLM5_PCHUNK_SWEEP:-256}
-RUNENV="LLM_THREADS=$th OMP_NUM_THREADS=$th GLM5_PCHUNK=$pc GLM5_REAL=1 GLM5_LAYERS=$RUN_LAYERS GLM5_COMM_OVERLAP=1 TP_AR_BF16=1 GLM5_PROMPT_TOKENS=$TOK"
+ovl=${GLM5_COMM_OVERLAP:-1}; arbf=${TP_AR_BF16:-1}   # set both 0 + th=1 for a deterministic (B==C) check
+RUNENV="LLM_THREADS=$th OMP_NUM_THREADS=$th GLM5_PCHUNK=$pc GLM5_REAL=1 GLM5_LAYERS=$RUN_LAYERS GLM5_COMM_OVERLAP=$ovl TP_AR_BF16=$arbf GLM5_PROMPT_TOKENS=$TOK"
 
 echo "=== GLM5.2 FP8 KV-cache test: NP=$NP sys=$SYS new=$NEW total=$TOTAL tok=$TOK maxpos=$GLM5_MAXPOS job=${PJM_JOBID:-?} ==="
 date; mkdir -p "$WORK" "$KVDIR" || exit 2; cd "$WORK" || exit 2
