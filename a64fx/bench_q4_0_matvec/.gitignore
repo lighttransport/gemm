@@ -37,3 +37,4 @@ results.txt
 sdot_roofline
 swar_fused
 mini_batched
+mini_spec

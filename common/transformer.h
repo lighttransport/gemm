@@ -7020,10 +7020,11 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
 #ifdef TF_HAVE_BF16_PODD
         {   static int podd = -1;
             if (podd < 0) podd = getenv("TF_PODD") && atoi(getenv("TF_PODD"));
-            /* podd_packed weights (pre-packed at load) -> always use podd (pack-free).
-             * Else on-the-fly podd only at small K (the W/X pack ~(n_rows+N)*K amortizes
-             * vs compute n_rows*N*K only when K small: helps gate/up+QKV, hurts out/down). */
-            if (podd && N >= 12 && (mat->podd_packed || K < 4096) &&
+            /* podd_packed weights (pre-packed at load) -> ALWAYS use podd at ANY N (the
+             * kernel pads tokens to NR=12; the blocked path below would MISREAD the
+             * k-major-packed layout as row-major -> corruption). Needed for spec/batched
+             * decode (N=d+1 < 12). On-the-fly podd only at small K + N>=12 (pack amortizes). */
+            if (podd && (mat->podd_packed ? (N >= 1) : (N >= 12 && K < 4096)) &&
                 tf_gemm_bf16_podd(Y_out, (const uint16_t *)mat->data, X,
                                   n_rows, K, N, out_stride, X_stride,
                                   n_threads > 1 ? n_threads : 1, mat->podd_packed))
