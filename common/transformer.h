@@ -226,6 +226,15 @@ typedef struct {
         size_t alignment;             /* minimum alignment (default: 2MB) */
         int enabled;                  /* 0=fallback, 1=active */
     } numa;
+
+    /* Persistent NUMA-distributed 256-aligned bump pool for prefill scratch.
+     * Reused across prefill calls (reset, not freed) to avoid per-call malloc/free
+     * churn that fragments THP and mis-places pages (progressive prefill slowdown). */
+    struct {
+        void  *base;   /* mmap arena (NULL until first use) */
+        size_t cap;    /* capacity bytes */
+        size_t off;    /* bump offset */
+    } mpool;
 } transformer_model;
 
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len);
@@ -3401,6 +3410,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
 void transformer_free(transformer_model *model) {
     if (!model) return;
+    if (model->mpool.base) { munmap(model->mpool.base, model->mpool.cap); model->mpool.base = NULL; }
     if (model->key_cache || model->key_cache_raw) {
         for (int l = 0; l < model->n_layers; l++) {
             /* Skip shared KV caches (freed by their source layer) */
@@ -3766,6 +3776,35 @@ static void tf_numa_distribute_buffer(transformer_model *m, void *buf, size_t to
         off = end;
     }
     tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
+}
+
+/* ── Persistent NUMA-distributed 256-aligned bump pool ──
+ * Replaces per-prefill posix_memalign/free (glibc mmap/munmap churn -> THP
+ * fragmentation + page mis-placement -> progressive prefill slowdown). The arena
+ * is mmap'd once and first-touched spread across CMGs (tf_numa_distribute_buffer,
+ * which needs the thread pool ALIVE -> call ensure before tf_pool_shutdown).
+ * Subsequent prefills reuse the placed pages (reset, no re-mmap, no re-touch). */
+#define TF_MPOOL_ALIGN 256u
+static void tf_mpool_reset(transformer_model *m) { m->mpool.off = 0; }
+static int tf_mpool_ensure(transformer_model *m, size_t need) {
+    if (m->mpool.base && m->mpool.cap >= need) return 1;
+    size_t cap = need + (need >> 2);                 /* +25% headroom */
+    cap = (cap + (2u<<20) - 1) & ~((size_t)(2u<<20) - 1);  /* round to 2MB (THP) */
+    void *p = mmap(NULL, cap, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    if (m->mpool.base) munmap(m->mpool.base, m->mpool.cap);
+    m->mpool.base = p; m->mpool.cap = cap; m->mpool.off = 0;
+    if (m->numa.enabled) tf_numa_distribute_buffer(m, p, cap);  /* NUMA-spread first-touch */
+    else memset(p, 0, cap);                                     /* still pre-fault once */
+    return 1;
+}
+static void *tf_mpool_alloc(transformer_model *m, size_t bytes) {
+    size_t a = (bytes + (TF_MPOOL_ALIGN - 1)) & ~(size_t)(TF_MPOOL_ALIGN - 1);
+    if (m->mpool.off + a > m->mpool.cap) return NULL;
+    void *r = (uint8_t *)m->mpool.base + m->mpool.off;
+    m->mpool.off += a;
+    return r;
 }
 
 /* Print per-CMG usage */
@@ -7696,21 +7735,36 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
         fprintf(stderr, "transformer: Gemma4 FFN fused_q4 prefill active (no bff1/bff2 scratch)\n");
     }
 
-    int *pos = (int *)tf_aligned_alloc_notouch(256, (size_t)N * sizeof(int));
-    float *bx    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
-    float *bxb   = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
-    float *bq    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_q_dim * sizeof(float));
-    float *bk    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_kv_dim * sizeof(float));
-    float *bv    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_kv_dim * sizeof(float));
-    float *bxb2  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * max_q_dim * sizeof(float));
-    float *bff1  = fused_q4_prefill ? NULL : (float *)tf_aligned_alloc_notouch(256, (size_t)N * m->n_ff * sizeof(float));
-    float *bff2  = fused_q4_prefill ? NULL : (float *)tf_aligned_alloc_notouch(256, (size_t)N * m->n_ff * sizeof(float));
-    float *bff3  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * m->n_ff * sizeof(float));
+    /* Allocate scratch from the persistent NUMA bump pool (no per-call malloc/free
+     * churn; pages first-touched NUMA-spread once). Pool ensure runs BEFORE the
+     * thread-pool shutdown below so tf_numa_distribute_buffer can place pages. */
+    #define TF_RND256(x) (((size_t)(x) + 255u) & ~(size_t)255u)
+    size_t ff_bytes = (size_t)N * m->n_ff * sizeof(float);
+    size_t need = TF_RND256((size_t)N * sizeof(int))
+        + 2 * TF_RND256((size_t)N * n_embd * sizeof(float))      /* bx, bxb */
+        + 2 * TF_RND256((size_t)N * max_q_dim * sizeof(float))   /* bq, bxb2 */
+        + 2 * TF_RND256((size_t)N * max_kv_dim * sizeof(float))  /* bk, bv */
+        + (fused_q4_prefill ? 0 : 2 * TF_RND256(ff_bytes))       /* bff1, bff2 */
+        + TF_RND256(ff_bytes);                                   /* bff3 */
+    if (!tf_mpool_ensure(m, need)) {
+        fprintf(stderr, "transformer: Gemma4 batch prefill pool alloc failed (N=%d, need=%zu)\n", N, need);
+        return NULL;
+    }
+    tf_mpool_reset(m);
+    int *pos = (int *)tf_mpool_alloc(m, (size_t)N * sizeof(int));
+    float *bx    = (float *)tf_mpool_alloc(m, (size_t)N * n_embd * sizeof(float));
+    float *bxb   = (float *)tf_mpool_alloc(m, (size_t)N * n_embd * sizeof(float));
+    float *bq    = (float *)tf_mpool_alloc(m, (size_t)N * max_q_dim * sizeof(float));
+    float *bk    = (float *)tf_mpool_alloc(m, (size_t)N * max_kv_dim * sizeof(float));
+    float *bv    = (float *)tf_mpool_alloc(m, (size_t)N * max_kv_dim * sizeof(float));
+    float *bxb2  = (float *)tf_mpool_alloc(m, (size_t)N * max_q_dim * sizeof(float));
+    float *bff1  = fused_q4_prefill ? NULL : (float *)tf_mpool_alloc(m, ff_bytes);
+    float *bff2  = fused_q4_prefill ? NULL : (float *)tf_mpool_alloc(m, ff_bytes);
+    float *bff3  = (float *)tf_mpool_alloc(m, ff_bytes);
+    #undef TF_RND256
     if (!pos || !bx || !bxb || !bq || !bk || !bv || !bxb2 ||
         (!fused_q4_prefill && (!bff1 || !bff2)) || !bff3) {
-        fprintf(stderr, "transformer: Gemma4 batch prefill alloc failed (N=%d)\n", N);
-        free(pos); free(bx); free(bxb); free(bq); free(bk); free(bv); free(bxb2);
-        free(bff1); free(bff2); free(bff3);
+        fprintf(stderr, "transformer: Gemma4 batch prefill pool sub-alloc failed (N=%d)\n", N);
         return NULL;
     }
 
@@ -7857,8 +7911,9 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
     fprintf(stderr, "  TOTAL:     %8.1f ms (%.2f tok/s)\n\n", total, total > 0 ? (1000.0 * N / total) : 0.0);
 
     if (pool_was_alive) tf_pool_start(m);
-    free(pos); free(bx); free(bxb); free(bq); free(bk); free(bv); free(bxb2);
-    free(bff1); free(bff2); free(bff3);
+    /* scratch lives in m->mpool (persistent, reused next call) — do not free */
+    (void)pos; (void)bx; (void)bxb; (void)bq; (void)bk; (void)bv; (void)bxb2;
+    (void)bff1; (void)bff2; (void)bff3;
     return m->logits;
 }
 
