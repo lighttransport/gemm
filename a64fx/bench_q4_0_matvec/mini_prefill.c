@@ -27,6 +27,9 @@ int main(int argc,char**argv){
     int nthr=getenv("LLM_THREADS")?atoi(getenv("LLM_THREADS")):48;
     transformer_set_threads(m,nthr);
     transformer_numa_setup(m,g);
+#ifdef TF_LINK_PODD
+    if(getenv("TF_PODD")&&atoi(getenv("TF_PODD"))){ extern void transformer_prepack_podd(transformer_model*); transformer_prepack_podd(m); }
+#endif
     if(!(getenv("TF_NO_PANEL")&&atoi(getenv("TF_NO_PANEL")))) transformer_build_panels(m);
     fprintf(stderr,"[prefill] loaded in %.1fs, n_vocab=%d threads=%d N=%d\n",now()-t0,m->n_vocab,nthr,N);
 

@@ -40,6 +40,7 @@ typedef struct {
     uint64_t dims[4];
     float    scale;      /* optional external scale for safetensors FP8 weights */
     int      has_scale;
+    int      podd_packed; /* 1 = data is k-major-interleaved for the p_odd BF16 GEMM */
 } qtensor;
 
 typedef struct {
@@ -6026,17 +6027,9 @@ static void tf_gemm_bf16_blocked(float *Y, const uint16_t *W, const float *X,
 extern void sgemm_bf16_2x12(int64_t K, const void *A, const void *B, float *C, int64_t ldc);
 static uint16_t *tf_podd_Wp = NULL, *tf_podd_Xa = NULL;
 static size_t tf_podd_Wcap = 0, tf_podd_Xcap = 0;
-static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
-        int n_rows, int K, int N, int Ys, int Xs, int nt) {
-    const int PMR = 32, PNR = 12;
-    if (n_rows % PMR) return 0;
-    int FT = n_rows / PMR, TT = (N + PNR - 1) / PNR;
-    size_t wn = (size_t)FT * K * PMR * 2, xn = (size_t)TT * K * PNR * 2;
-    if (wn > tf_podd_Wcap) { free(tf_podd_Wp); tf_podd_Wp = (uint16_t *)malloc(wn); tf_podd_Wcap = tf_podd_Wp ? wn : 0; }
-    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
-    if (!tf_podd_Wp || !tf_podd_Xa) return 0;
-    uint16_t *Wp = tf_podd_Wp, *Xa = tf_podd_Xa;
-    /* pack W -> k-major interleaved (2x16 rows) */
+/* pack one [n_rows][K] BF16 weight -> k-major interleaved (the p_odd A layout). */
+static void tf_podd_pack_w(const uint16_t *W, uint16_t *Wp, int n_rows, int K, int nt) {
+    const int PMR = 32; int FT = n_rows / PMR;
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(nt) schedule(static)
     #endif
@@ -6044,6 +6037,26 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
         for (int k = 0; k < K; k++) for (int i = 0; i < 16; i++) {
             dst[k*PMR + 2*i]   = W[(size_t)(ft*PMR + i)     * K + k];
             dst[k*PMR + 2*i+1] = W[(size_t)(ft*PMR + 16 + i) * K + k]; } }
+}
+static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
+        int n_rows, int K, int N, int Ys, int Xs, int nt, int prepacked) {
+    const int PMR = 32, PNR = 12;
+    if (n_rows % PMR) return 0;
+    int FT = n_rows / PMR, TT = (N + PNR - 1) / PNR;
+    size_t xn = (size_t)TT * K * PNR * 2;
+    const uint16_t *Wp;
+    if (prepacked) {
+        Wp = W;   /* data already k-major interleaved (packed at load) */
+    } else {
+        size_t wn = (size_t)FT * K * PMR * 2;
+        if (wn > tf_podd_Wcap) { free(tf_podd_Wp); tf_podd_Wp = (uint16_t *)malloc(wn); tf_podd_Wcap = tf_podd_Wp ? wn : 0; }
+        if (!tf_podd_Wp) return 0;
+        tf_podd_pack_w(W, tf_podd_Wp, n_rows, K, nt);
+        Wp = tf_podd_Wp;
+    }
+    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
+    if (!tf_podd_Xa) return 0;
+    uint16_t *Xa = tf_podd_Xa;
     /* pack X -> k-major BF16 (pad tokens >= N with 0) */
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(nt) schedule(static)
@@ -6066,6 +6079,39 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
           for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue;
               for (int mm = 0; mm < PMR; mm++) Y[(size_t)tok * Ys + ft*PMR + mm] = Ct[mm + n*PMR]; } } }
     return 1;
+}
+/* Pre-pack small-K BF16 weights (gate/up/q/k/v) IN-PLACE to k-major-interleaved so
+ * the p_odd GEMM skips the per-call W-pack (~2.5x the on-the-fly podd: 1767->4499 GF
+ * standalone). In-place via one temp (no extra steady memory). This changes the row-
+ * major layout -> BREAKS the decode matvec for these weights => PREFILL-ONLY; the
+ * harness calls this only when it will prefill with TF_PODD. */
+void transformer_prepack_podd(transformer_model *m) {
+    if (!m || !m->layers) return;
+    size_t maxsz = 0;
+    for (int l = 0; l < m->n_layers; l++) {
+        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up,
+                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v};
+        for (int i = 0; i < 5; i++) if (ws[i]->data && ws[i]->type == GGML_TYPE_BF16) {
+            size_t s = (size_t)ws[i]->n_rows * ws[i]->n_cols * 2; if (s > maxsz) maxsz = s; }
+    }
+    if (!maxsz) return;
+    uint16_t *tmp = (uint16_t *)malloc(maxsz);
+    if (!tmp) { fprintf(stderr, "podd prepack: tmp alloc failed (%zu)\n", maxsz); return; }
+    int nt = m->n_threads > 1 ? m->n_threads : 1, cnt = 0;
+    for (int l = 0; l < m->n_layers; l++) {
+        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up,
+                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v};
+        for (int i = 0; i < 5; i++) { qtensor *w = ws[i];
+            if (!w->data || w->type != GGML_TYPE_BF16 || w->podd_packed) continue;
+            int n_rows = w->n_rows, K = w->n_cols;
+            if (n_rows % 32 || K >= 4096) continue;     /* podd-beneficial small-K, %32 dims */
+            tf_podd_pack_w((const uint16_t *)w->data, tmp, n_rows, K, nt);
+            memcpy(w->data, tmp, (size_t)n_rows * K * 2);
+            w->podd_packed = 1; cnt++;
+        }
+    }
+    free(tmp);
+    fprintf(stderr, "podd prepack: %d small-K BF16 weights packed (prefill-only)\n", cnt);
 }
 #define TF_HAVE_BF16_PODD 1
 #endif /* TF_LINK_PODD */
@@ -6808,13 +6854,13 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
 #ifdef TF_HAVE_BF16_PODD
         {   static int podd = -1;
             if (podd < 0) podd = getenv("TF_PODD") && atoi(getenv("TF_PODD"));
-            /* Only worthwhile at small K: the on-the-fly W/X pack (~ (n_rows+N)*K)
-             * amortizes vs compute (n_rows*N*K) when K is small. Measured: helps
-             * gate/up + QKV (K=3840, ~1.7x), hurts out/down (K>=8192). */
-            if (podd && N >= 12 && K < 4096 &&
+            /* podd_packed weights (pre-packed at load) -> always use podd (pack-free).
+             * Else on-the-fly podd only at small K (the W/X pack ~(n_rows+N)*K amortizes
+             * vs compute n_rows*N*K only when K small: helps gate/up+QKV, hurts out/down). */
+            if (podd && N >= 12 && (mat->podd_packed || K < 4096) &&
                 tf_gemm_bf16_podd(Y_out, (const uint16_t *)mat->data, X,
                                   n_rows, K, N, out_stride, X_stride,
-                                  n_threads > 1 ? n_threads : 1))
+                                  n_threads > 1 ? n_threads : 1, mat->podd_packed))
                 return;
         }
 #endif
