@@ -6153,6 +6153,59 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
               for (int mm = 0; mm < PMR; mm++) Y[(size_t)tok * Ys + ft*PMR + mm] = Ct[mm + n*PMR]; } } }
     return 1;
 }
+/* Combined QKV podd GEMM: q/k/v share the SAME input X and K, so pack X ONCE and run
+ * the 3 prepacked weights' tiles in ONE OMP region (nowait between them). Saves 2
+ * X-packs + 2 fork/joins vs 3 separate calls, and combines the small 2048-row k/v
+ * GEMMs (which parallelize poorly alone) with q into one balanced sweep. Prepacked
+ * weights only, K<=6144 (no K-blocking needed at K=n_embd). */
+static int tf_gemm_bf16_podd_qkv(float *Yq, float *Yk, float *Yv,
+        const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv, const float *X,
+        int rq, int rk, int rv, int K, int N, int Ysq, int Ysk, int Ysv, int Xs, int nt) {
+    const int PMR = 32, PNR = 12;
+    if (rq % PMR || rk % PMR || rv % PMR || K > 6144) return 0;
+    int TT = (N + PNR - 1) / PNR;
+    size_t xn = (size_t)TT * K * PNR * 2;
+    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
+    if (!tf_podd_Xa) return 0;
+    uint16_t *Xa = tf_podd_Xa;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static) collapse(2)
+    #endif
+    for (int tt = 0; tt < TT; tt++) for (int n = 0; n < PNR; n++) {
+            uint16_t *Xb = Xa + (size_t)tt * K * PNR;
+            int tok = tt*PNR + n;
+            if (tok >= N) { for (int k = 0; k < K; k++) Xb[k*PNR + n] = 0; continue; }
+            const float *xs = X + (size_t)tok * Xs;
+            svuint32_t lanes = svindex_u32(0, (uint32_t)PNR);
+            for (int k = 0; k < K; k += (int)svcntw()) { svbool_t pg = svwhilelt_b32(k, K);
+                svuint32_t hu = svlsr_n_u32_x(pg, svreinterpret_u32_f32(svld1_f32(pg, xs + k)), 16);
+                svuint32_t idx = svadd_n_u32_x(pg, lanes, (uint32_t)(k*PNR + n));
+                svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } }
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    { float Ct[32 * 12];
+      #define TF_QKV_TILE(FT, W, Y, Ys) \
+        for (int ft = 0; ft < (FT); ft++) for (int tt = 0; tt < TT; tt++) { \
+            sgemm_bf16_2x12(K, (W) + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, Ct, PMR); \
+            for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue; \
+                for (int mm = 0; mm < PMR; mm++) (Y)[(size_t)tok*(Ys) + ft*PMR + mm] = Ct[mm + n*PMR]; } }
+      #ifdef _OPENMP
+      #pragma omp for schedule(static) collapse(2) nowait
+      #endif
+      TF_QKV_TILE(rq / PMR, Wq, Yq, Ysq)
+      #ifdef _OPENMP
+      #pragma omp for schedule(static) collapse(2) nowait
+      #endif
+      TF_QKV_TILE(rk / PMR, Wk, Yk, Ysk)
+      #ifdef _OPENMP
+      #pragma omp for schedule(static) collapse(2)
+      #endif
+      TF_QKV_TILE(rv / PMR, Wv, Yv, Ysv)
+      #undef TF_QKV_TILE
+    }
+    return 1;
+}
 /* Pre-pack small-K BF16 weights (gate/up/q/k/v) IN-PLACE to k-major-interleaved so
  * the p_odd GEMM skips the per-call W-pack (~2.5x the on-the-fly podd: 1767->4499 GF
  * standalone). In-place via one temp (no extra steady memory). This changes the row-
@@ -8170,14 +8223,28 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
         t_attn_norm += tf_time_ms() - t0p;
 
         t0p = tf_time_ms();
-        tf_gemm_f16_mt_tokenmajor(bq, &layer->attn_q, bxb, local_q_dim, N, local_q_dim, n_embd, m->n_threads);
         int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
-        if (layer->shared_kv_source < 0) {
-            tf_gemm_f16_mt_tokenmajor(bk, &layer->attn_k, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
-            if (layer->has_v_proj) {
-                tf_gemm_f16_mt_tokenmajor(bv, &layer->attn_v, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
-            } else {
-                memcpy(bv, bk, (size_t)N * local_kv_dim * sizeof(float));
+#ifdef TF_HAVE_BF16_PODD
+        /* Combined QKV podd: one X-pack + one fork/join over q,k,v (vs 3 calls). */
+        if (layer->shared_kv_source < 0 && layer->has_v_proj && N >= 12 &&
+            layer->attn_q.podd_packed && layer->attn_k.podd_packed && layer->attn_v.podd_packed &&
+            tf_gemm_bf16_podd_qkv(bq, bk, bv,
+                (const uint16_t *)layer->attn_q.data, (const uint16_t *)layer->attn_k.data,
+                (const uint16_t *)layer->attn_v.data, bxb,
+                local_q_dim, local_kv_dim, local_kv_dim, n_embd, N,
+                local_q_dim, local_kv_dim, local_kv_dim, n_embd, m->n_threads)) {
+            /* done */
+        } else
+#endif
+        {
+            tf_gemm_f16_mt_tokenmajor(bq, &layer->attn_q, bxb, local_q_dim, N, local_q_dim, n_embd, m->n_threads);
+            if (layer->shared_kv_source < 0) {
+                tf_gemm_f16_mt_tokenmajor(bk, &layer->attn_k, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
+                if (layer->has_v_proj) {
+                    tf_gemm_f16_mt_tokenmajor(bv, &layer->attn_v, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
+                } else {
+                    memcpy(bv, bk, (size_t)N * local_kv_dim * sizeof(float));
+                }
             }
         }
         t_qkv += tf_time_ms() - t0p;
