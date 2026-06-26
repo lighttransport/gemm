@@ -6559,6 +6559,7 @@ static int tf_gemm_q4_0_pair_gelu_tokenmajor(float *Y_out, const qtensor *gate,
  * quantized per-32-block per-row to int8. Kernel: gemma4-kernels/kernel_q8v2_3x4.S.
  * Enable at runtime with env TF_Q8V2=1. Requires K%256==0 and n_rows%64==0. */
 extern void kernel_q8v2_3x4(const int8_t*,const float*,const int8_t*,const float*,long,float*,long);
+int tf_q8v2_enable = -1;  /* <0=init from env TF_Q8V2; 0/1 settable by caller for A/B */
 static int tf_gemm_q8v2_pair_gelu_tokenmajor(float *Y, const qtensor *gate,
         const qtensor *up, const float *X, int n_rows, int N,
         int out_stride, int X_stride, int n_threads) {
@@ -7797,9 +7798,8 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
 
         t0p = tf_time_ms();
 #ifdef TF_HAVE_Q8V2
-        static int q8v2_on = -1;
-        if (q8v2_on < 0) q8v2_on = getenv("TF_Q8V2") && atoi(getenv("TF_Q8V2"));
-        if (q8v2_on &&
+        if (tf_q8v2_enable < 0) tf_q8v2_enable = getenv("TF_Q8V2") && atoi(getenv("TF_Q8V2"));
+        if (tf_q8v2_enable &&
             tf_gemm_q8v2_pair_gelu_tokenmajor(bff3, &layer->ffn_gate, &layer->ffn_up,
                                                bxb, m->n_ff, N, m->n_ff, n_embd, m->n_threads)) {
             t_ffn_gateup += tf_time_ms() - t0p;

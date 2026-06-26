@@ -33,13 +33,34 @@ int main(int argc,char**argv){
     for(int i=0;i<N;i++) toks[i]=2 + (i*131+7)%(m->n_vocab>30000?30000:m->n_vocab-1);
     toks[0]=2;
 
-    double tp=now();
-    float*lg=transformer_prefill_gemm(m,toks,N,0);
-    double dt=now()-tp;
-    if(!lg){ fprintf(stderr,"prefill returned NULL\n"); return 1; }
-    int am=argmax(lg,m->n_vocab);
-    fprintf(stderr,"[prefill] %d tok in %.3fs = %.1f tok/s\n",N,dt,N/dt);
-    printf("PREFILL_ARGMAX %d  logit=%.6f  tok_s=%.2f\n", am, lg[am], N/dt);
+    /* A/B in one load: warm-up, then fp32 timed, then Q8v2 timed. tf_q8v2_enable
+     * is a transformer.h global we flip between passes (clean single-process compare). */
+#ifdef TF_HAVE_Q8V2
+    extern int tf_q8v2_enable;
+    int ab = getenv("TF_AB")?atoi(getenv("TF_AB")):0;
+    if(ab){
+        tf_q8v2_enable=0; transformer_prefill_gemm(m,toks,N,0);   /* warm-up (fp32) */
+        double t1=now(); float*l0=transformer_prefill_gemm(m,toks,N,0); double d0=now()-t1; int a0=argmax(l0,m->n_vocab);
+        fprintf(stderr,">>> AB fp32:  %.3fs argmax=%d\n",d0,a0);
+        tf_q8v2_enable=1;
+        double t2=now(); float*l1=transformer_prefill_gemm(m,toks,N,0); double d1=now()-t2; int a1=argmax(l1,m->n_vocab);
+        fprintf(stderr,">>> AB q8v2:  %.3fs argmax=%d\n",d1,a1);
+        printf("AB N=%d fp32=%.3fs q8v2=%.3fs speedup=%.2fx argmax_fp32=%d argmax_q8=%d %s\n",
+               N,d0,d1,d0/d1,a0,a1,a0==a1?"MATCH":"DIFFER");
+        return 0;
+    }
+#endif
+    int npass = getenv("PREFILL_PASSES")?atoi(getenv("PREFILL_PASSES")):1;
+    int am=0; float*lg=NULL;
+    for(int p=0;p<npass;p++){
+        double tp=now();
+        lg=transformer_prefill_gemm(m,toks,N,0);
+        double dt=now()-tp;
+        if(!lg){ fprintf(stderr,"prefill returned NULL\n"); return 1; }
+        am=argmax(lg,m->n_vocab);
+        fprintf(stderr,"[prefill pass %d] %d tok in %.3fs = %.1f tok/s  argmax=%d\n",p,N,dt,N/dt,am);
+    }
+    printf("PREFILL_ARGMAX %d  logit=%.6f\n", am, lg[am]);
     free(toks);
     return 0;
 }
