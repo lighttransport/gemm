@@ -2092,13 +2092,20 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
     return NULL;
 }
 
+/* Decode profiling: total ms spent inside pooled matvecs (gated TF_DPROF). */
+static inline double tf_time_ms(void);
+double tf_decode_matvec_ms = 0.0;
+static int tf_dprof = -1;
 static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qtensor *mat1,
                                     float *dst2, const qtensor *mat2,
                                     const float *x, int n_rows) {
+    if (tf_dprof < 0) tf_dprof = getenv("TF_DPROF") ? 1 : 0;
+    double _t0 = tf_dprof ? tf_time_ms() : 0;
     int nt = m->n_threads;
     if (nt <= 1 || !m->pool_alive) {
         tf_qmatvec(dst1, mat1, x, n_rows, m->thread_tmp[0]);
         tf_qmatvec(dst2, mat2, x, n_rows, m->thread_tmp[0]);
+        if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
         return;
     }
     tf_matvec_fused2_task *tasks = (tf_matvec_fused2_task *)alloca(nt * sizeof(tf_matvec_fused2_task));
@@ -2109,6 +2116,7 @@ static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qten
         offset += count;
     }
     tf_pool_dispatch(m, tf_qmatvec_fused2_worker, tasks, sizeof(tf_matvec_fused2_task));
+    if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
 }
 
 /* Forward declaration for fused FFN worker */
@@ -2322,9 +2330,12 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
 
 /* Pool-based multi-threaded matvec (avoids pthread_create per call) */
 static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat, const float *x, int n_rows) {
+    if (tf_dprof < 0) tf_dprof = getenv("TF_DPROF") ? 1 : 0;
+    double _t0 = tf_dprof ? tf_time_ms() : 0;
     int n_threads = m->n_threads;
     if (n_threads <= 1 || n_rows < n_threads * 4 || !m->pool_alive) {
         tf_qmatvec(dst, mat, x, n_rows, m->thread_tmp[0]);
+        if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
         return;
     }
     tf_matvec_task *tasks = (tf_matvec_task *)alloca(n_threads * sizeof(tf_matvec_task));
@@ -2337,6 +2348,7 @@ static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat
         offset += count;
     }
     tf_pool_dispatch(m, tf_qmatvec_worker, tasks, sizeof(tf_matvec_task));
+    if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
 }
 
 /* Pool-based multi-threaded expert matvec: splits rows across threads */

@@ -181,6 +181,7 @@ static int gguf_find_key_internal(const gguf_context *ctx, const char *key) {
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #endif
 
 /* block_size, type_size pairs for ggml types */
@@ -343,6 +344,21 @@ static void gguf_free_kv(gguf_kv *kv) {
 }
 
 gguf_context *gguf_open(const char *path, int use_mmap) {
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    /* NUMA_INTERLEAVE=1: set the process default mempolicy to MPOL_INTERLEAVE before
+     * any weight allocation/first-touch (replicates `numactl --interleave=all` in-code,
+     * inherited by the pool/numa worker threads created later). M=1 decode matvec is
+     * BW-bound and reads each weight once with a 48-thread row-split; with a per-CMG
+     * (concentrated) placement it caps at one controller's BW (~60 GB/s). Interleaving
+     * across all 4 CMG controllers ~2x's the matvec BW (12B decode 2.2 -> 3.8 tok/s).
+     * Costs the compute-bound prefill GEMM ~6% (it prefers CMG-local) -> opt-in. */
+    if (getenv("NUMA_INTERLEAVE") && atoi(getenv("NUMA_INTERLEAVE"))) {
+        unsigned long nodemask = 0xFFUL;   /* nodes 0..7 (A64FX = 4 CMGs) */
+        long r = syscall(SYS_set_mempolicy, 3 /*MPOL_INTERLEAVE*/, &nodemask, 8UL);
+        fprintf(stderr, "gguf: MPOL_INTERLEAVE process mempolicy (decode BW)%s\n",
+                r == 0 ? "" : " [set_mempolicy failed]");
+    }
+#endif
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "gguf: cannot open %s\n", path); return NULL; }
 

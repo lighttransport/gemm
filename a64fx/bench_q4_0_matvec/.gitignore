@@ -33,3 +33,6 @@ mmproj_probe
 q8v2_ffn_test
 conv2d_patch_bench
 bf16_widen_bench
+bf16_widen_bench
+bf16_tfree_gemm
+bw_probe

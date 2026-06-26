@@ -103,12 +103,87 @@ static inline float dot_offset_ps(const uint16_t *w,const float *xe,const float 
     return s;
 }
 
+/* (E) zip widen with NON-TEMPORAL weight loads (svldnt1) — decode reads each weight
+ * once, so bypass cache to hit streaming BW (bw_probe: svldnt1 = 762 GB/s @48t). */
+static inline float dot_zip_nt(const uint16_t *w,const float *x,int n){
+    svfloat32_t acc0=svdup_f32(0),acc1=svdup_f32(0);
+    int vlh=svcnth(),vl=svcntw(),k=0; svbool_t pth=svptrue_b16(),pt=svptrue_b32();
+    svuint16_t zero=svdup_u16(0);
+    for(;k+vlh<=n;k+=vlh){
+        svuint16_t raw=svldnt1_u16(pth,w+k);
+        svfloat32_t wlo=svreinterpret_f32_u16(svzip1_u16(zero,raw));
+        svfloat32_t whi=svreinterpret_f32_u16(svzip2_u16(zero,raw));
+        acc0=svmla_f32_x(pt,acc0,wlo,svld1_f32(pt,x+k));
+        acc1=svmla_f32_x(pt,acc1,whi,svld1_f32(pt,x+k+vl));
+    }
+    acc0=svadd_f32_x(pt,acc0,acc1);
+    float s=svaddv(pt,acc0);
+    for(int j=(n/vlh)*vlh;j<n;j++) s+=bf2f(w[j])*x[j];
+    return s;
+}
+
+/* (F) zip widen, 4 independent accumulator-pairs (8 acc) to hide FMA latency (~9 cyc). */
+static inline float dot_zip8(const uint16_t *w,const float *x,int n){
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t b0=svdup_f32(0),b1=svdup_f32(0),b2=svdup_f32(0),b3=svdup_f32(0);
+    int vlh=svcnth(),vl=svcntw(),step=4*vlh,k=0; svbool_t pth=svptrue_b16(),pt=svptrue_b32();
+    svuint16_t zero=svdup_u16(0);
+    for(;k+step<=n;k+=step){
+        svuint16_t r0=svld1_u16(pth,w+k),r1=svld1_u16(pth,w+k+vlh),r2=svld1_u16(pth,w+k+2*vlh),r3=svld1_u16(pth,w+k+3*vlh);
+        a0=svmla_f32_x(pt,a0,svreinterpret_f32_u16(svzip1_u16(zero,r0)),svld1_f32(pt,x+k));
+        b0=svmla_f32_x(pt,b0,svreinterpret_f32_u16(svzip2_u16(zero,r0)),svld1_f32(pt,x+k+vl));
+        a1=svmla_f32_x(pt,a1,svreinterpret_f32_u16(svzip1_u16(zero,r1)),svld1_f32(pt,x+k+vlh));
+        b1=svmla_f32_x(pt,b1,svreinterpret_f32_u16(svzip2_u16(zero,r1)),svld1_f32(pt,x+k+vlh+vl));
+        a2=svmla_f32_x(pt,a2,svreinterpret_f32_u16(svzip1_u16(zero,r2)),svld1_f32(pt,x+k+2*vlh));
+        b2=svmla_f32_x(pt,b2,svreinterpret_f32_u16(svzip2_u16(zero,r2)),svld1_f32(pt,x+k+2*vlh+vl));
+        a3=svmla_f32_x(pt,a3,svreinterpret_f32_u16(svzip1_u16(zero,r3)),svld1_f32(pt,x+k+3*vlh));
+        b3=svmla_f32_x(pt,b3,svreinterpret_f32_u16(svzip2_u16(zero,r3)),svld1_f32(pt,x+k+3*vlh+vl));
+    }
+    a0=svadd_f32_x(pt,svadd_f32_x(pt,a0,a1),svadd_f32_x(pt,a2,a3));
+    b0=svadd_f32_x(pt,svadd_f32_x(pt,b0,b1),svadd_f32_x(pt,b2,b3));
+    float s=svaddv(pt,svadd_f32_x(pt,a0,b0));
+    for(int j=(n/step)*step;j<n;j++) s+=bf2f(w[j])*x[j];
+    return s;
+}
+/* (F) zip widen, 4 independent accumulator-pairs (8 acc) to hide FMA latency (~9 cyc). */
+static inline float dot_zip8nt(const uint16_t *w,const float *x,int n){
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t b0=svdup_f32(0),b1=svdup_f32(0),b2=svdup_f32(0),b3=svdup_f32(0);
+    int vlh=svcnth(),vl=svcntw(),step=4*vlh,k=0; svbool_t pth=svptrue_b16(),pt=svptrue_b32();
+    svuint16_t zero=svdup_u16(0);
+    for(;k+step<=n;k+=step){
+        svuint16_t r0=svldnt1_u16(pth,w+k),r1=svldnt1_u16(pth,w+k+vlh),r2=svldnt1_u16(pth,w+k+2*vlh),r3=svldnt1_u16(pth,w+k+3*vlh);
+        a0=svmla_f32_x(pt,a0,svreinterpret_f32_u16(svzip1_u16(zero,r0)),svld1_f32(pt,x+k));
+        b0=svmla_f32_x(pt,b0,svreinterpret_f32_u16(svzip2_u16(zero,r0)),svld1_f32(pt,x+k+vl));
+        a1=svmla_f32_x(pt,a1,svreinterpret_f32_u16(svzip1_u16(zero,r1)),svld1_f32(pt,x+k+vlh));
+        b1=svmla_f32_x(pt,b1,svreinterpret_f32_u16(svzip2_u16(zero,r1)),svld1_f32(pt,x+k+vlh+vl));
+        a2=svmla_f32_x(pt,a2,svreinterpret_f32_u16(svzip1_u16(zero,r2)),svld1_f32(pt,x+k+2*vlh));
+        b2=svmla_f32_x(pt,b2,svreinterpret_f32_u16(svzip2_u16(zero,r2)),svld1_f32(pt,x+k+2*vlh+vl));
+        a3=svmla_f32_x(pt,a3,svreinterpret_f32_u16(svzip1_u16(zero,r3)),svld1_f32(pt,x+k+3*vlh));
+        b3=svmla_f32_x(pt,b3,svreinterpret_f32_u16(svzip2_u16(zero,r3)),svld1_f32(pt,x+k+3*vlh+vl));
+    }
+    a0=svadd_f32_x(pt,svadd_f32_x(pt,a0,a1),svadd_f32_x(pt,a2,a3));
+    b0=svadd_f32_x(pt,svadd_f32_x(pt,b0,b1),svadd_f32_x(pt,b2,b3));
+    float s=svaddv(pt,svadd_f32_x(pt,a0,b0));
+    for(int j=(n/step)*step;j<n;j++) s+=bf2f(w[j])*x[j];
+    return s;
+}
+
+static inline float dot_rawsum(const uint16_t *w,const float *x,int n){ (void)x;
+    svuint32_t acc=svdup_u32(0); int vlh=svcnth(),k=0; svbool_t pth=svptrue_b16();
+    for(;k+vlh<=n;k+=vlh) acc=svadd_u32_x(svptrue_b32(),acc,svreinterpret_u32_u16(svldnt1_u16(pth,w+k)));
+    return (float)svaddv_u32(svptrue_b32(),acc);
+}
 #define MV(NAME,FN) \
 static void NAME(float *Y,const uint16_t *W,const float *x,int n_rows,int K){ \
     _Pragma("omp parallel for schedule(static)") \
     for(int r=0;r<n_rows;r++) Y[r]=FN(W+(size_t)r*K,x,K); }
 MV(mv_lsl,dot_lsl)
 MV(mv_zip,dot_zip)
+MV(mv_zip8,dot_zip8)
+MV(mv_zip8nt,dot_zip8nt)
+MV(mv_rawsum,dot_rawsum)
+MV(mv_zip_nt,dot_zip_nt)
 MV(mv_offset,dot_offset)
 
 static void mv_offset_ps(float *Y,const uint16_t *W,const float *x,int n_rows,int K){
@@ -143,6 +218,10 @@ int main(int argc,char**argv){
         printf("  %-8s %7.3f ms  %7.1f GFLOPS  %6.1f GB/s  relL2=%.2e\n",NAME,t*1e3,flop/t/1e9,bytes/t/1e9,e); }while(0)
     RUN("lsl",mv_lsl);
     RUN("zip",mv_zip);
+    RUN("zip8",mv_zip8);
+    RUN("zip8nt",mv_zip8nt);
+    RUN("rawsum",mv_rawsum);
+    RUN("zip_nt",mv_zip_nt);
     RUN("offset",mv_offset);
     RUN("offset_ps",mv_offset_ps);
     return 0;
