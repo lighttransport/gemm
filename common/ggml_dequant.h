@@ -1327,6 +1327,47 @@ static inline void matvec_bf16_8row(float *dst,
     dst[4]=svaddv(pg,a4l); dst[5]=svaddv(pg,a5l); dst[6]=svaddv(pg,a6l); dst[7]=svaddv(pg,a7l);
 }
 
+#if defined(__ARM_FEATURE_SVE)
+/* p_odd predicate BF16 widen (zenn.dev/syoyo/3b0fedb22c5ef2): the article's technique.
+ * p_odd marks ODD .h lanes active ([0,1,0,1,...]); a contiguous predicated ld1h zeros the
+ * inactive (even) lanes, so the loaded bf16 lands DIRECTLY in the upper 16 of each fp32
+ * lane (= valid fp32) with NO lsl. Two loads at byte-offset 0 / -2 (w[i] and w[i-1]) give
+ * the ODD- and EVEN-indexed bf16 deinterleaved -> 4 insns (2 ld1uh + 2 lsl) become 2 (2 ld1h).
+ * For an fp32-activation matvec the x is pre-split ONCE into xe=x[0,2,..]/xo=x[1,3,..] (in
+ * the caller) so the inner loop is just 2 ld1h + 2 fma. NB: the even ld1h's w[-1] sits on an
+ * INACTIVE lane -> never accessed (no OOB, no padding). */
+static inline svbool_t bf16_podd(void) {
+    svuint16_t iota = svindex_u16(0, 1);
+    return svcmpne_n_u16(svptrue_b16(), svand_n_u16_x(svptrue_b16(), iota, 1), 0);
+}
+static inline void matvec_bf16_8row_podd(float *dst,
+        const uint16_t *w0,const uint16_t *w1,const uint16_t *w2,const uint16_t *w3,
+        const uint16_t *w4,const uint16_t *w5,const uint16_t *w6,const uint16_t *w7,
+        const float *xe,const float *xo,int n,svbool_t podd){
+    svfloat32_t e0=svdup_f32(0),e1=svdup_f32(0),e2=svdup_f32(0),e3=svdup_f32(0),e4=svdup_f32(0),e5=svdup_f32(0),e6=svdup_f32(0),e7=svdup_f32(0);
+    svfloat32_t o0=svdup_f32(0),o1=svdup_f32(0),o2=svdup_f32(0),o3=svdup_f32(0),o4=svdup_f32(0),o5=svdup_f32(0),o6=svdup_f32(0),o7=svdup_f32(0);
+    int vlh=(int)svcnth(),i=0; svbool_t pt=svptrue_b32();
+    for(;i+vlh<=n;i+=vlh){ int j=i>>1;
+        svfloat32_t xev=svld1(pt,xe+j),xov=svld1(pt,xo+j); svfloat32_t we,wo;
+        we=svreinterpret_f32_u16(svld1_u16(podd,w0+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w0+i)); e0=svmla_x(pt,e0,we,xev); o0=svmla_x(pt,o0,wo,xov);
+        we=svreinterpret_f32_u16(svld1_u16(podd,w1+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w1+i)); e1=svmla_x(pt,e1,we,xev); o1=svmla_x(pt,o1,wo,xov);
+        we=svreinterpret_f32_u16(svld1_u16(podd,w2+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w2+i)); e2=svmla_x(pt,e2,we,xev); o2=svmla_x(pt,o2,wo,xov);
+        we=svreinterpret_f32_u16(svld1_u16(podd,w3+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w3+i)); e3=svmla_x(pt,e3,we,xev); o3=svmla_x(pt,o3,wo,xov);
+        we=svreinterpret_f32_u16(svld1_u16(podd,w4+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w4+i)); e4=svmla_x(pt,e4,we,xev); o4=svmla_x(pt,o4,wo,xov);
+        we=svreinterpret_f32_u16(svld1_u16(podd,w5+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w5+i)); e5=svmla_x(pt,e5,we,xev); o5=svmla_x(pt,o5,wo,xov);
+        we=svreinterpret_f32_u16(svld1_u16(podd,w6+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w6+i)); e6=svmla_x(pt,e6,we,xev); o6=svmla_x(pt,o6,wo,xov);
+        we=svreinterpret_f32_u16(svld1_u16(podd,w7+i-1)); wo=svreinterpret_f32_u16(svld1_u16(podd,w7+i)); e7=svmla_x(pt,e7,we,xev); o7=svmla_x(pt,o7,wo,xov);
+    }
+    e0=svadd_x(pt,e0,o0);e1=svadd_x(pt,e1,o1);e2=svadd_x(pt,e2,o2);e3=svadd_x(pt,e3,o3);
+    e4=svadd_x(pt,e4,o4);e5=svadd_x(pt,e5,o5);e6=svadd_x(pt,e6,o6);e7=svadd_x(pt,e7,o7);
+    float d0=svaddv(pt,e0),d1=svaddv(pt,e1),d2=svaddv(pt,e2),d3=svaddv(pt,e3),d4=svaddv(pt,e4),d5=svaddv(pt,e5),d6=svaddv(pt,e6),d7=svaddv(pt,e7);
+    for(;i<n;i++){ float xv=(i&1)?xo[i>>1]:xe[i>>1];
+        d0+=bf16_to_f32_scalar(w0[i])*xv; d1+=bf16_to_f32_scalar(w1[i])*xv; d2+=bf16_to_f32_scalar(w2[i])*xv; d3+=bf16_to_f32_scalar(w3[i])*xv;
+        d4+=bf16_to_f32_scalar(w4[i])*xv; d5+=bf16_to_f32_scalar(w5[i])*xv; d6+=bf16_to_f32_scalar(w6[i])*xv; d7+=bf16_to_f32_scalar(w7[i])*xv; }
+    dst[0]=d0;dst[1]=d1;dst[2]=d2;dst[3]=d3;dst[4]=d4;dst[5]=d5;dst[6]=d6;dst[7]=d7;
+}
+#endif
+
 /* Tiled BF16 GEMM: Y[tok, row] = W[row, K] · X[tok, K]^T
  * Token-major output: Y[t * Y_stride + r].
  * Processes 4 rows × N tokens with column-tiled inner loop for L1 reuse. */

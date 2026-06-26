@@ -1926,6 +1926,35 @@ static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_byte
                                   const float *x, int n_cols, int row_start, int row_end) {
     int i = row_start;
 #if defined(__ARM_FEATURE_SVE)
+    /* p_odd zero-shift widen (zenn.dev/syoyo/3b0fedb22c5ef2): pre-split x ONCE into
+     * xe/xo (per thread, reused across this row-range's 8-row groups) so the kernel's
+     * inner loop is 2 ld1h(p_odd) + 2 fma -> no lsl, no per-row ld2w. The widen is 1.9x
+     * per-core vs ld1uh+lsl, BUT M=1 decode is memory-bound at 48 threads so it ties the
+     * zip path (the x pre-split is slight overhead) -> OPT-IN via TF_PODD_MV=1. The big
+     * win is in the COMPUTE-bound prefill GEMM, where p_odd is already used (clair
+     * sgemm_bf16_2x12, both operands bf16 -> no pre-split). */
+    static __thread float *tl_xe = NULL, *tl_xo = NULL; static __thread int tl_cap = 0;
+    static int podd_mv = -1;
+    if (podd_mv < 0) { const char *e = getenv("TF_PODD_MV"); podd_mv = (e && atoi(e) == 1) ? 1 : 0; }
+    if (podd_mv && i + 7 < row_end) {
+        int half = (n_cols + 1) >> 1;
+        if (half + 8 > tl_cap) { free(tl_xe); free(tl_xo);
+            tl_xe = (float *)malloc((size_t)(half + 8) * 4); tl_xo = (float *)malloc((size_t)(half + 8) * 4);
+            tl_cap = (tl_xe && tl_xo) ? half + 8 : 0; }
+        if (tl_cap) {
+            for (int k = 0; k < n_cols >> 1; k++) { tl_xe[k] = x[2*k]; tl_xo[k] = x[2*k+1]; }
+            if (n_cols & 1) tl_xe[n_cols>>1] = x[n_cols-1];
+            svbool_t podd = bf16_podd();
+            for (; i + 7 < row_end; i += 8) {
+                matvec_bf16_8row_podd(dst + i,
+                    (const uint16_t *)(base + (size_t)(i)  *row_bytes),(const uint16_t *)(base + (size_t)(i+1)*row_bytes),
+                    (const uint16_t *)(base + (size_t)(i+2)*row_bytes),(const uint16_t *)(base + (size_t)(i+3)*row_bytes),
+                    (const uint16_t *)(base + (size_t)(i+4)*row_bytes),(const uint16_t *)(base + (size_t)(i+5)*row_bytes),
+                    (const uint16_t *)(base + (size_t)(i+6)*row_bytes),(const uint16_t *)(base + (size_t)(i+7)*row_bytes),
+                    tl_xe, tl_xo, n_cols, podd);
+            }
+        }
+    }
     /* 8-row blocks: 8 FMAs per activation load, doubles compute/memory ratio */
     for (; i + 7 < row_end; i += 8) {
         matvec_bf16_8row(dst + i,

@@ -84,6 +84,25 @@ static inline float dot_offset(const uint16_t *w,const float *x,int n){
     return s;
 }
 
+/* (D) p_odd offset with PRE-SPLIT x (article technique done right): x is deinterleaved
+ * ONCE (xe=x[0,2,..], xo=x[1,3,..]); each row's inner loop is just 2 ld1h(p_odd) + 2 fma
+ * -> NO shift, NO per-row ld2w. The 2 ld1h replace ld1uh+lsl (4->2 insns, the article's
+ * 50%). Requires w[i-1] readable (caller front-pads W by 1 u16). */
+static inline float dot_offset_ps(const uint16_t *w,const float *xe,const float *xo,int n,svbool_t p_odd){
+    svfloat32_t ae=svdup_f32(0),ao=svdup_f32(0);
+    int vlh=svcnth(),vl=svcntw(),i=0; svbool_t pt=svptrue_b32();
+    for(;i+vlh<=n;i+=vlh){
+        svfloat32_t wo=svreinterpret_f32_u16(svld1_u16(p_odd,w+i));    /* w[i+1,i+3,..] hi-16 */
+        svfloat32_t we=svreinterpret_f32_u16(svld1_u16(p_odd,w+i-1));  /* w[i,i+2,..]  hi-16 */
+        int j=i/2;
+        ae=svmla_x(pt,ae,we,svld1_f32(pt,xe+j));
+        ao=svmla_x(pt,ao,wo,svld1_f32(pt,xo+j));
+    }
+    float s=svaddv(pt,svadd_x(pt,ae,ao));
+    for(int k=(n/vlh)*vlh;k<n;k++) s+=bf2f(w[k])*((k&1)?xo[k/2]:xe[k/2]);
+    return s;
+}
+
 #define MV(NAME,FN) \
 static void NAME(float *Y,const uint16_t *W,const float *x,int n_rows,int K){ \
     _Pragma("omp parallel for schedule(static)") \
@@ -91,6 +110,16 @@ static void NAME(float *Y,const uint16_t *W,const float *x,int n_rows,int K){ \
 MV(mv_lsl,dot_lsl)
 MV(mv_zip,dot_zip)
 MV(mv_offset,dot_offset)
+
+static void mv_offset_ps(float *Y,const uint16_t *W,const float *x,int n_rows,int K){
+    svuint16_t iota=svindex_u16(0,1);
+    svbool_t p_odd=svcmpne_n_u16(svptrue_b16(),svand_n_u16_x(svptrue_b16(),iota,1),0);
+    float *xe=(float*)malloc((size_t)(K/2+16)*4),*xo=(float*)malloc((size_t)(K/2+16)*4);
+    for(int k=0;k<K/2;k++){ xe[k]=x[2*k]; xo[k]=x[2*k+1]; }
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<n_rows;r++) Y[r]=dot_offset_ps(W+(size_t)r*K,xe,xo,K,p_odd);
+    free(xe); free(xo);
+}
 
 static double rel(const float*a,const float*b,int n){ double nu=0,de=0; for(int i=0;i<n;i++){double e=a[i]-b[i];nu+=e*e;de+=(double)b[i]*b[i];} return sqrt(nu/(de+1e-30)); }
 
@@ -115,5 +144,6 @@ int main(int argc,char**argv){
     RUN("lsl",mv_lsl);
     RUN("zip",mv_zip);
     RUN("offset",mv_offset);
+    RUN("offset_ps",mv_offset_ps);
     return 0;
 }
