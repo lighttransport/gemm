@@ -54,11 +54,19 @@ int main(int argc,char**argv){
           for(int k=0;k<K;k++) for(int n=0;n<NR;n++) Xb[k*NR+n]=f2bf(X[(size_t)(tt*NR+n)*K+k]); } \
       _Pragma("omp parallel num_threads(nt)") { \
         float*Ct=(float*)malloc((size_t)MR*NR*4); \
+        if(K>6144){ int Kc=4096,NP=(K+Kc-1)/Kc; \
+          for(int kp=0;kp<NP;kp++){ int k0=kp*Kc,kk=(K-k0<Kc)?(K-k0):Kc; \
+            _Pragma("omp for schedule(static) collapse(2)") \
+            for(int ft=0;ft<FT;ft++) for(int tt=0;tt<TT;tt++){ \
+              sgemm_bf16_2x12(kk, Wp+(size_t)ft*K*MR+(size_t)k0*MR, Xall+(size_t)tt*K*NR+(size_t)k0*NR, Ct, MR); \
+              for(int n=0;n<NR;n++) for(int mm=0;mm<MR;mm++){ size_t yi=(size_t)(tt*NR+n)*n_rows+ft*MR+mm; \
+                if(kp==0) Y[yi]=Ct[mm+n*MR]; else Y[yi]+=Ct[mm+n*MR]; } } } \
+        } else { \
         _Pragma("omp for schedule(static) collapse(2)") \
         for(int ft=0;ft<FT;ft++) for(int tt=0;tt<TT;tt++){ \
             sgemm_bf16_2x12(K, Wp+(size_t)ft*K*MR, Xall+(size_t)tt*K*NR, Ct, MR); \
             for(int n=0;n<NR;n++) for(int mm=0;mm<MR;mm++) Y[(size_t)(tt*NR+n)*n_rows + ft*MR+mm]=Ct[mm+n*MR]; \
-        } free(Ct); } }while(0)
+        } } free(Ct); } }while(0)
     GEMM(); /* warm */
     uint64_t c0=rdcyc(); for(int r=0;r<3;r++) GEMM(); uint64_t c1=rdcyc();
     double t=(double)(c1-c0)/freq/3, gf=2.0*N*n_rows*K/t/1e9;

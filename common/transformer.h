@@ -4609,7 +4609,16 @@ static inline void tf_gelu_mul_fast4_sve(float *out, size_t stride, int row,
 
 static void tf_gelu_mul_fast(float *out, const float *gate, const float *up, int n) {
 #if defined(__ARM_FEATURE_SVE)
+    /* parallelize the (serial) SVE GELU over chunks — was the prefill's GELU cost */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < n; c += 8192) {
+        int len = (n - c < 8192) ? (n - c) : 8192;
+        tf_gelu_mul_fast_sve(out + c, gate + c, up + c, len);
+    }
+    #else
     tf_gelu_mul_fast_sve(out, gate, up, n);
+    #endif
 #else
     for (int i = 0; i < n; i++) out[i] = tf_gelu_mul_fast_scalar(gate[i], up[i]);
 #endif
@@ -6059,19 +6068,49 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
     uint16_t *Xa = tf_podd_Xa;
     /* pack X -> k-major BF16 (transpose + fp32->BF16). SVE: per token, load contiguous
      * fp32, BF16 = top 16 bits (lsr#16 + halfword scatter to Xb[k*12+n], stride 12). */
+    /* collapse(tt,n): TT*PNR work units so ALL nt threads pack (was TT-only -> for
+     * ffn_down TT=10 starved 38 threads while K=15360 made each unit 4x heavier). */
     #ifdef _OPENMP
-    #pragma omp parallel for num_threads(nt) schedule(static)
+    #pragma omp parallel for num_threads(nt) schedule(static) collapse(2)
     #endif
-    for (int tt = 0; tt < TT; tt++) { uint16_t *Xb = Xa + (size_t)tt * K * PNR;
-        for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n;
+    for (int tt = 0; tt < TT; tt++) for (int n = 0; n < PNR; n++) {
+            uint16_t *Xb = Xa + (size_t)tt * K * PNR;
+            int tok = tt*PNR + n;
             if (tok >= N) { for (int k = 0; k < K; k++) Xb[k*PNR + n] = 0; continue; }
             const float *xr = X + (size_t)tok * Xs;
             svuint32_t lanes = svindex_u32(0, (uint32_t)PNR);   /* j*12 */
             for (int k = 0; k < K; k += (int)svcntw()) { svbool_t pg = svwhilelt_b32(k, K);
                 svuint32_t hu = svlsr_n_u32_x(pg, svreinterpret_u32_f32(svld1_f32(pg, xr + k)), 16);
                 svuint32_t idx = svadd_n_u32_x(pg, lanes, (uint32_t)(k*PNR + n));
-                svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } } }
-    /* kernel per (feat-tile, tok-tile); transpose col-major C -> token-major Y */
+                svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } }
+    /* kernel per (feat-tile, tok-tile); transpose col-major C -> token-major Y.
+     * For large K (e.g. ffn_down K=15360) the 32xK W strip (983 KB) x12 cores
+     * overflows the 8 MB CMG L2 -> thrashes, re-streaming W across tok-tiles
+     * (~22% peak vs ~63% at K=3840). Fix: K-PANEL OUTERMOST so a 32xKc W
+     * sub-strip (256 KB; 12 cores = 3 MB, L2-resident) is reused across ALL
+     * tok-tiles, accumulating C across panels. Barrier between panels (the omp
+     * for) + static schedule => each (ft,tt) handled by the same thread each
+     * panel => disjoint Y writes, no races. */
+    if (K > 6144) {
+        const int Kc = 4096; int NP = (K + Kc - 1) / Kc;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(nt)
+        #endif
+        { float Ct[32 * 12];
+          for (int kp = 0; kp < NP; kp++) {
+              int k0 = kp * Kc, kk = (K - k0 < Kc) ? (K - k0) : Kc;
+              #ifdef _OPENMP
+              #pragma omp for schedule(static) collapse(2)
+              #endif
+              for (int ft = 0; ft < FT; ft++) for (int tt = 0; tt < TT; tt++) {
+                  sgemm_bf16_2x12(kk, Wp + (size_t)ft*K*PMR + (size_t)k0*PMR,
+                                  Xa + (size_t)tt*K*PNR + (size_t)k0*PNR, Ct, PMR);
+                  for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue;
+                      float *yp = Y + (size_t)tok * Ys + ft*PMR;
+                      if (kp == 0) for (int mm = 0; mm < PMR; mm++) yp[mm]  = Ct[mm + n*PMR];
+                      else         for (int mm = 0; mm < PMR; mm++) yp[mm] += Ct[mm + n*PMR]; } } } }
+        return 1;
+    }
     #ifdef _OPENMP
     #pragma omp parallel num_threads(nt)
     #endif
