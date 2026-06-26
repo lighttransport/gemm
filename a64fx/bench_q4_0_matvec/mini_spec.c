@@ -48,7 +48,8 @@ int main(int argc,char**argv){
     int nthr=getenv("LLM_THREADS")?atoi(getenv("LLM_THREADS")):48;
     transformer_set_threads(m,nthr); transformer_numa_setup(m,g); transformer_build_panels(m);
     if(getenv("TF_PODD")&&atoi(getenv("TF_PODD"))){ extern void transformer_prepack_podd(transformer_model*); transformer_prepack_podd(m); }
-    extern float *tf_batch_all_logits;
+    extern float *tf_batch_all_logits; extern int tf_batch_keep_pool, tf_batch_quiet;
+    tf_batch_keep_pool=1; tf_batch_quiet=1;
     int do_ref = !(getenv("SPEC_NOREF")&&atoi(getenv("SPEC_NOREF")));
     int V=m->n_vocab;
     float*all=(float*)malloc((size_t)(K+1)*V*sizeof(float));

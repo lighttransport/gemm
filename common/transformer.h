@@ -8162,6 +8162,11 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
  * lm_head logits for ALL N tokens (not just the last) via a single batched GEMM ->
  * the foundation for speculative/batched decode. NULL = current last-token behavior. */
 float *tf_batch_all_logits = NULL;
+/* Spec-decode: keep the thread pool ALIVE across prefill_batch calls (skip the
+ * shutdown/restart churn ~0.4s/call -- the prefill body is all OMP; pool threads just
+ * sleep) and silence the per-call profile. */
+int tf_batch_keep_pool = 0;
+int tf_batch_quiet = 0;
 static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *tokens,
                                       int n_tokens, int start_pos) {
     if (!m || !tokens || n_tokens <= 0 || !m->is_gemma4) return NULL;
@@ -8248,7 +8253,7 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
     double t0p;
 
     int pool_was_alive = m->pool_alive;
-    if (pool_was_alive) tf_pool_shutdown(m);
+    if (pool_was_alive && !tf_batch_keep_pool) tf_pool_shutdown(m);
 
     for (int l = 0; l < m->n_layers; l++) {
         transformer_layer *layer = &m->layers[l];
@@ -8381,13 +8386,20 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
             for (int t = 0; t < N; t++)
                 tf_logit_softcap(tf_batch_all_logits + (size_t)t * m->n_vocab, m->n_vocab, m->final_logit_softcapping);
     }
-    float *last = bx + (size_t)(N - 1) * n_embd;
-    tf_rmsnorm(m->x, last, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
-    tf_qmatvec_pool(m, m->logits, &m->output, m->x, m->n_vocab);
-    if (m->final_logit_softcapping > 0.0f)
-        tf_logit_softcap(m->logits, m->n_vocab, m->final_logit_softcapping);
+    if (tf_batch_all_logits) {
+        /* last-token logits already in all_logits[(N-1)*vocab]; copy into m->logits and
+         * skip the redundant (single-threaded, with the pool shut) lm_head matvec. */
+        memcpy(m->logits, tf_batch_all_logits + (size_t)(N - 1) * m->n_vocab, (size_t)m->n_vocab * sizeof(float));
+    } else {
+        float *last = bx + (size_t)(N - 1) * n_embd;
+        tf_rmsnorm(m->x, last, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        tf_qmatvec_pool(m, m->logits, &m->output, m->x, m->n_vocab);
+        if (m->final_logit_softcapping > 0.0f)
+            tf_logit_softcap(m->logits, m->n_vocab, m->final_logit_softcapping);
+    }
 
     double total = t_attn_norm + t_qkv + t_qk_norm + t_rope + t_kv + t_attn + t_out + t_post + t_ffn_gateup + t_gelu + t_ffn_down;
+    if (!tf_batch_quiet) {
     fprintf(stderr, "\n  === Gemma4 Batch Prefill Profile (%d tokens x %d layers) ===\n", N, m->n_layers);
     fprintf(stderr, "  attn_norm: %8.1f ms\n", t_attn_norm);
     fprintf(stderr, "  QKV GEMM:  %8.1f ms\n", t_qkv);
@@ -8401,8 +8413,9 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
     fprintf(stderr, "  GELU/mul:  %8.1f ms (%s)\n", t_gelu, m->ffn_gelu_fast ? "fast" : "exact");
     fprintf(stderr, "  FFN down:  %8.1f ms\n", t_ffn_down);
     fprintf(stderr, "  TOTAL:     %8.1f ms (%.2f tok/s)\n\n", total, total > 0 ? (1000.0 * N / total) : 0.0);
+    }
 
-    if (pool_was_alive) tf_pool_start(m);
+    if (pool_was_alive && !tf_batch_keep_pool) tf_pool_start(m);
     /* scratch lives in m->mpool (persistent, reused next call) — do not free */
     (void)pos; (void)bx; (void)bxb; (void)bq; (void)bk; (void)bv; (void)bxb2;
     (void)bff1; (void)bff2; (void)bff3;
