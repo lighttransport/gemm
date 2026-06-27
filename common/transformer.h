@@ -7322,6 +7322,43 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
             return;
         }
     }
+    /* Small-N BF16 GEMM (verify/spec): row-split, token-inner zip-widen dot. The podd
+     * GEMM is X-pack/C-transpose/12-col-pad bound at small N (~2.6 GB/s @N=5); this is
+     * weight-read-bound (row read once, reused across N tokens). Needs NORMAL bf16
+     * layout (NOT podd_packed). Gated TF_GEMM_SMALLN (default 8, 0=off). */
+    if (mat->type == GGML_TYPE_BF16 && !mat->podd_packed) {
+        static int smalln = -1;
+        if (smalln < 0) { const char *e = getenv("TF_GEMM_SMALLN"); smalln = e ? atoi(e) : 8; }
+        if (smalln > 0 && N <= smalln) {
+            int K = mat->n_cols, nt = n_threads > 1 ? n_threads : 1;
+            const uint16_t *Wd = (const uint16_t *)mat->data;
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int r = 0; r < n_rows; r++) {
+                const uint16_t *w = Wd + (size_t)r * K;
+                svbool_t pt = svptrue_b32(), pth = svptrue_b16(); svuint16_t zero = svdup_u16(0);
+                int vlh = (int)svcnth(), vl = (int)svcntw();
+                svfloat32_t a0 = svdup_f32(0), a1 = svdup_f32(0), a2 = svdup_f32(0), a3 = svdup_f32(0);
+                svfloat32_t a4 = svdup_f32(0), a5 = svdup_f32(0), a6 = svdup_f32(0), a7 = svdup_f32(0);
+                int k = 0;
+                for (; k + vlh <= K; k += vlh) {
+                    svuint16_t raw = svld1_u16(pth, w + k);
+                    svfloat32_t wlo = svreinterpret_f32_u16(svzip1_u16(zero, raw));
+                    svfloat32_t whi = svreinterpret_f32_u16(svzip2_u16(zero, raw));
+                    #define DOT_T(ai,t) if (N > (t)) { const float *x = X + (size_t)(t)*X_stride + k; \
+                        ai = svmla_f32_x(pt, ai, wlo, svld1_f32(pt, x)); ai = svmla_f32_x(pt, ai, whi, svld1_f32(pt, x + vl)); }
+                    DOT_T(a0,0) DOT_T(a1,1) DOT_T(a2,2) DOT_T(a3,3) DOT_T(a4,4) DOT_T(a5,5) DOT_T(a6,6) DOT_T(a7,7)
+                    #undef DOT_T
+                }
+                float s[8]; s[0]=svaddv_f32(pt,a0); s[1]=svaddv_f32(pt,a1); s[2]=svaddv_f32(pt,a2); s[3]=svaddv_f32(pt,a3);
+                s[4]=svaddv_f32(pt,a4); s[5]=svaddv_f32(pt,a5); s[6]=svaddv_f32(pt,a6); s[7]=svaddv_f32(pt,a7);
+                for (; k < K; k++) { float wv = bf16_to_f32_scalar(w[k]); for (int t = 0; t < N; t++) s[t] += wv * X[(size_t)t*X_stride + k]; }
+                for (int t = 0; t < N; t++) Y_out[(size_t)t * out_stride + r] = s[t];
+            }
+            return;
+        }
+    }
 #endif
     if (mat->type == GGML_TYPE_Q8_0) {
         /* Q8_0 SIMD GEMM path */
