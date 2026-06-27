@@ -2136,6 +2136,8 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
 /* Decode profiling: total ms + bytes + count inside pooled matvecs (gated TF_DPROF). */
 static inline double tf_time_ms(void);
 double tf_decode_matvec_ms = 0.0;
+static int tf_g4p_want_logits = 0;   /* set by forward_logits_pos: fold lm_head into the persistent dispatch */
+static int tf_g4p_did_logits = 0;    /* worker -> caller: logits computed (softcap done), skip the separate lm_head */
 double tf_decode_matvec_bytes = 0.0;
 long tf_decode_matvec_cnt = 0;
 static int tf_dprof = -1;
@@ -5272,6 +5274,19 @@ static void *tf_gemma4_persistent_worker(void *arg) {
     }
 
     if (tid == 0) tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, eps, m->matvec_tmp);
+
+    /* Lever 2: fold lm_head into the same dispatch (no separate cond_broadcast,
+     * threads stay engaged). Row-split the [n_vocab, n_embd] output matvec, then
+     * tid0 applies gemma final-logit softcap. */
+    if (tf_g4p_want_logits && m->has_lm_head) {
+        tf_spin_barrier(m, &local_sense, nt);  /* final norm visible to all */
+        tf_thread_matvec(m->logits, &m->output, m->x, m->n_vocab, tid, nt);
+        if (m->is_gemma4 && m->final_logit_softcapping > 0.0f) {
+            tf_spin_barrier(m, &local_sense, nt);  /* all logit rows written before softcap reads them */
+            if (tid == 0) tf_logit_softcap(m->logits, m->n_vocab, m->final_logit_softcapping);
+        }
+        if (tid == 0) tf_g4p_did_logits = 1;
+    }
     return NULL;
 }
 
@@ -5339,8 +5354,11 @@ float *transformer_forward(transformer_model *model, int32_t token_id, int posit
 }
 
 float *transformer_forward_logits_pos(transformer_model *model, int32_t token_id, int cache_pos, int pos_t, int pos_h, int pos_w) {
+    tf_g4p_did_logits = 0; tf_g4p_want_logits = 1;   /* ask the gemma4 persistent path to fold lm_head */
     float *hidden = transformer_forward_pos(model, token_id, cache_pos, pos_t, pos_h, pos_w);
+    tf_g4p_want_logits = 0;
     if (!model->has_lm_head || !hidden) return NULL;
+    if (tf_g4p_did_logits) return model->logits;   /* lm_head + softcap already done in the persistent dispatch */
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
     tf_qmatvec_pool(model, model->logits, &model->output, hidden, model->n_vocab);
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
