@@ -3083,9 +3083,17 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                 m->n_expert, m->n_expert_used, m->n_ff_expert);
     }
 
+    /* PP (pipeline-parallel) load: TF_PP_L0/L1 = this stage's layer range. The first
+     * stage owns token_embd (input embedding), the last owns token_embd (tied lm_head)
+     * + output_norm; middle stages own neither -> relax the global requirements and the
+     * layer/KV loops below load only [TF_PP_L0, TF_PP_L1). Default = full model. */
+    int tf_pp_l0 = getenv("TF_PP_L0") ? atoi(getenv("TF_PP_L0")) : 0;
+    int tf_pp_l1 = getenv("TF_PP_L1") ? atoi(getenv("TF_PP_L1")) : m->n_layers;
+    int tf_pp = (tf_pp_l0 > 0 || tf_pp_l1 < m->n_layers);
+
     /* Global tensors */
-    m->token_embd = tf_load_tensor(gguf, "token_embd.weight", 1);
-    m->output_norm = tf_load_tensor(gguf, "output_norm.weight", 1);
+    m->token_embd = tf_load_tensor(gguf, "token_embd.weight", tf_pp ? 0 : 1);
+    m->output_norm = tf_load_tensor(gguf, "output_norm.weight", tf_pp ? 0 : 1);
     m->output = tf_load_tensor(gguf, "output.weight", 0);
     if (!m->output.data && m->token_embd.data) {
         /* Weight tying: use token_embd as output projection */
@@ -3097,12 +3105,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     if (m->n_vocab == 0 && m->token_embd.data) {
         m->n_vocab = m->token_embd.n_rows;
     }
-    if (!m->token_embd.data || !m->output_norm.data) {
+    if (!tf_pp && (!m->token_embd.data || !m->output_norm.data)) {
         fprintf(stderr, "transformer: missing required global tensor(s)\n");
         transformer_free(m);
         return NULL;
     }
-    if (m->n_vocab <= 0) {
+    if (!tf_pp && m->n_vocab <= 0) {
         fprintf(stderr, "transformer: invalid vocabulary size %d\n", m->n_vocab);
         transformer_free(m);
         return NULL;
@@ -3154,6 +3162,15 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                     missing_required = 1; \
                 } \
             } while (0)
+
+        if (tf_pp && (l < tf_pp_l0 || l >= tf_pp_l1)) {
+            /* PP: skip non-owned layers. Force shared_kv_source=-1 so the KV-cache
+             * setup does NOT alias them to layer 0 (the calloc default 0 means "share
+             * from layer 0" -> free_unused_kv would double-free layer 0's KV on the
+             * stage that owns layer 0). */
+            m->layers[l].shared_kv_source = -1;
+            continue;
+        }
 
         LOAD(attn_norm,    "attn_norm",   1)
 
