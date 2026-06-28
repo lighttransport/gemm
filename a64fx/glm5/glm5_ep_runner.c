@@ -569,7 +569,7 @@ int main(void){
     int mstream=envi("GLM5_MSTREAM",1); if(mstream<1)mstream=1; if(mstream>64)mstream=64;
     const char*ar_env=getenv("GLM5_AR_TOKENS");
     int ar_tokens=(ar_env&&*ar_env)?atoi(ar_env):0;
-    int ar_auto_cap=envi("GLM5_AR_AUTO_CAP",256);
+    int ar_auto_cap=envi("GLM5_AR_AUTO_CAP",512);
     int pchunk0=envi("GLM5_PCHUNK",0);
     int cp_lean_slot=(envi("GLM5_CP",0) || maxpos>65536);
     if(!ar_env && cp_lean_slot){
@@ -580,7 +580,9 @@ int main(void){
         if(!ar_env && ar_auto_cap>0 && ar_tokens>ar_auto_cap) ar_tokens=ar_auto_cap;
     }
     if(ar_tokens<1) ar_tokens=1;
-    int ar_hard_cap=envi("GLM5_AR_HARD_CAP",64);
+    int ar_hard_cap=envi("GLM5_AR_HARD_CAP",512);  /* bigger AR messages = fewer uTofu puts: cap
+        64->512 cut prefill comm ~2.5x (24%->11%, +13% tok/s) at ~144MB region vs 18MB. Latency-bound
+        at small messages. Raise to the chunk size (one message/allreduce) where memory allows. */
     if(ar_hard_cap>0 && ar_tokens>ar_hard_cap) ar_tokens=ar_hard_cap;
 
     utofu_tni_id_t*tni_ids=NULL; size_t num_tnis=0;
