@@ -161,28 +161,37 @@ int main(int argc,char**argv){
     float *hrecv=(float*)(Region+HRECV_OFF);
     float *hsend=(float*)(Region+HSEND_OFF);
     uint64_t *scr=(uint64_t*)(Region+SCRATCH_OFF);
-    double t0=now_sec();
+    double t0=now_sec(), t_pf=now_sec();
+    double acc_fwd=0, acc_wait=0; int use_persist=(getenv("GEMMA4_PP_PERSIST")&&atoi(getenv("GEMMA4_PP_PERSIST")));
 
     for(int p=0; p<total; p++){
         if(is_first){
-            int t;
+            int t; double tw0=now_sec();
             if(p==0) t=prompt[0];
             else { wait_ge(tseq,(uint64_t)p,"rank0 token wait");           /* token from p-1 */
                    int nt=(int)*(volatile uint64_t*)(Region+TTOK_OFF);
                    t = (p<P)? prompt[p] : nt; }
+            acc_wait+=now_sec()-tw0;
             transformer_embed_token(m,t);
-            (getenv("GEMMA4_PP_PERSIST")&&atoi(getenv("GEMMA4_PP_PERSIST"))?transformer_forward_partial_persistent(m,p,L0,L1):transformer_forward_partial(m,p,L0,L1));
+            double tf0=now_sec();
+            (use_persist?transformer_forward_partial_persistent(m,p,L0,L1):transformer_forward_partial(m,p,L0,L1));
+            acc_fwd+=now_sec()-tf0;
             memcpy(hsend,m->x,(size_t)n_embd_g*sizeof(float));
             put_issue(PeerVcq[1],Base+HSEND_OFF,PeerBase[1]+HRECV_OFF,(size_t)n_embd_g*sizeof(float),0);
             *scr=(uint64_t)(p+1); put_issue(PeerVcq[1],Base+SCRATCH_OFF,PeerBase[1]+HSEQ_OFF,8,1);
         } else {
+            double tw0=now_sec();
             wait_ge(hseq,(uint64_t)(p+1),"hidden wait");
+            acc_wait+=now_sec()-tw0;
             transformer_set_hidden(m,hrecv);
-            (getenv("GEMMA4_PP_PERSIST")&&atoi(getenv("GEMMA4_PP_PERSIST"))?transformer_forward_partial_persistent(m,p,L0,L1):transformer_forward_partial(m,p,L0,L1));
+            double tf0=now_sec();
+            (use_persist?transformer_forward_partial_persistent(m,p,L0,L1):transformer_forward_partial(m,p,L0,L1));
+            acc_fwd+=now_sec()-tf0;
             if(is_last){
                 float *lg=transformer_compute_logits(m);
                 int nt=0; float mx=lg[0]; for(int i=1;i<m->n_vocab;i++) if(lg[i]>mx){mx=lg[i];nt=i;}
                 if(p>=P-1 && ngen<maxgen) gen[ngen++]=nt;
+                if(p==P-1) t_pf=now_sec();   /* prefill (P prompt tokens) done */
                 /* send next token to rank 0: token value then seq (ordered per VCQ pair) */
                 *scr=(uint64_t)nt; put_issue(PeerVcq[0],Base+SCRATCH_OFF,PeerBase[0]+TTOK_OFF,8,1);  /* drain: scratch reused next */
                 *scr=(uint64_t)(p+1); put_issue(PeerVcq[0],Base+SCRATCH_OFF,PeerBase[0]+TSEQ_OFF,8,1);
@@ -193,16 +202,22 @@ int main(int argc,char**argv){
             }
         }
     }
-    double dt=now_sec()-t0;
+    double tend=now_sec(), dt=tend-t0;
+    fprintf(stderr,"[pp] rank%d: fwd %.3fs wait %.3fs (over %d toks, %.3fs/fwd)\n",
+            MyRank,acc_fwd,acc_wait,total,acc_fwd/total);
     if(is_last){
-        fprintf(stderr,"[pp] generated %d tokens in %.3fs = %.2f tok/s\n",ngen,dt,ngen/dt);
-        printf("PPGEN n=%d tok_s=%.3f tokens:",ngen,ngen/dt);
+        double pf_t = t_pf - t0, dec_t = tend - t_pf;          /* prefill=P prompt toks, decode=maxgen */
+        double pf_tps = pf_t>0 ? P/pf_t : 0, dec_tps = dec_t>0 ? maxgen/dec_t : 0;
+        fprintf(stderr,"[pp] N=%d prefill %.2f tok/s (%d tok, %.3fs)  decode %.2f tok/s (%d tok, %.3fs)\n",
+                N,pf_tps,P,pf_t,dec_tps,maxgen,dec_t);
+        printf("PPGEN N=%d prefill_tps=%.3f decode_tps=%.3f n=%d tokens:",N,pf_tps,dec_tps,ngen);
         for(int i=0;i<ngen;i++) printf(" %d",gen[i]);
         printf("\n");
         /* also write to a shared-FS file: mpiexec does NOT reliably forward rank stdout */
         const char *rf = getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_pp_result.txt";
         FILE *f=fopen(rf,"w");
-        if(f){ fprintf(f,"PPGEN N=%d n=%d tok_s=%.4f sec=%.3f tokens:",N,ngen,ngen/dt,dt);
+        if(f){ fprintf(f,"PPGEN N=%d prefill_tps=%.4f decode_tps=%.4f P=%d maxgen=%d n=%d tokens:",
+                       N,pf_tps,dec_tps,P,maxgen,ngen);
                for(int i=0;i<ngen;i++) fprintf(f," %d",gen[i]); fprintf(f,"\n"); fclose(f); }
     }
     barrier_robust(1);
