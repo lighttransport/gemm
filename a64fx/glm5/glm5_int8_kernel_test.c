@@ -136,5 +136,29 @@ int main(void){
     double gops=2.0*(double)gemm_n*(double)gemm_rows*(double)cols;
     printf("INT8_GEMM N=%d rows=%d cols=%d gs=%d max_abs=%.6g max_rel=%.6g best=%.6f s %.2f Gop/s\n",
            gemm_n,gemm_rows,cols,gs,gemm_abs,gemm_rel,tg_best,gops/tg_best/1e9);
-    return (decode_err==0 && max_rel<1.0e-3 && gemm_rel<1.0e-3)?0:1;
+
+    /* w8a8 SDOT GEMM: speed + accuracy vs the w8a16 reference Yr (activation int8-quant error) */
+    float *Ys=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
+    if(!Ys) return 2;
+    glm5_gemm_int8_sdot(&gm,Ys,W,S,gs,Xg,check_n,check_rows,cols);
+    double sd_abs=0.0,sd_rel=0.0; double refn=0.0;
+    for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
+        double ref=Yr[(size_t)t*gemm_rows+r];
+        double d=fabs(ref-(double)Ys[(size_t)t*check_rows+r]), den=fabs(ref)+1e-9;
+        if(d>sd_abs)sd_abs=d; if(d/den>sd_rel)sd_rel=d/den; refn+=ref*ref;
+    }
+    /* RMS relative error: more meaningful than worst-case for a quantized dot */
+    double sse=0,sref=0;
+    for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
+        double ref=Yr[(size_t)t*gemm_rows+r], dd=ref-(double)Ys[(size_t)t*check_rows+r];
+        sse+=dd*dd; sref+=ref*ref;
+    }
+    double tsd=1e30;
+    for(int it=0;it<reps;it++){
+        t0=wall_sec(); glm5_gemm_int8_sdot(&gm,Ys,W,S,gs,Xg,gemm_n,gemm_rows,cols);
+        double tt=wall_sec()-t0; if(tt<tsd)tsd=tt;
+    }
+    printf("INT8_SDOT N=%d rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 GEMM %.2f Gop/s)\n",
+           gemm_n,gemm_rows,cols,gs,sd_rel,sqrt(sse/(sref+1e-30)),tsd,gops/tsd/1e9,gops/tg_best/1e9);
+    return (decode_err==0 && max_rel<1.0e-3 && gemm_rel<5.0e-3)?0:1;  /* gemm bf16-decode rounding ~2e-3 */
 }

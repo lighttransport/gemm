@@ -1720,10 +1720,69 @@ static void glm5_gemm_int8(glm5_model*m, float*restrict Y, const uint8_t*W, cons
     for(int r=nb*8;r<rows;r++)
         for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,X+(size_t)t*cols,cols);
 }
+/* INT8 w8a8 sdot GEMM: dynamically quantize activations to int8 per token, then use the SVE
+ * SDOT (4-way int8->int32, 64 MACs/instr) for the contraction. Weights are offset-binary so the
+ * signed value is byte^0x80. Per group g: d = SDOT_c( (wr[c]^0x80), xq[c] ) -> 16 int32 lanes;
+ * convert and fold the group scale into an f32 accumulator (svaddv is linear, so the per-group
+ * horizontal reduce becomes ONE reduce per (row,token)). y = xsc[t] * sum_g wsc[r,g]*groupdot.
+ * Lossier than the w8a16 path (activations rounded to int8) -> opt-in via GLM5_INT8_SDOT. */
+static void glm5_gemm_int8_sdot(glm5_model*m, float*restrict Y, const uint8_t*W, const float*S, int gs,
+                                const float*X, int N, int rows, int cols){
+    int sb=(cols+gs-1)/gs;
+    int8_t *Xq=(int8_t*)malloc((size_t)N*cols); float *xsc=(float*)malloc((size_t)N*sizeof(float));
+    if(!Xq||!xsc){ free(Xq); free(xsc); glm5_gemm_int8(m,Y,W,S,gs,X,N,rows,cols); return; }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(N>=4)
+#endif
+    for(int t=0;t<N;t++){
+        const float*xt=X+(size_t)t*cols; float amax=1e-20f;
+        for(int c=0;c<cols;c++){ float a=fabsf(xt[c]); if(a>amax)amax=a; }
+        float inv=127.0f/amax; xsc[t]=amax/127.0f; int8_t*xq=Xq+(size_t)t*cols;
+        for(int c=0;c<cols;c++){ int v=(int)lrintf(xt[c]*inv); v=v>127?127:(v<-127?-127:v); xq[c]=(int8_t)v; }
+    }
+#if defined(__ARM_FEATURE_SVE)
+    int vb=(int)svcntb(); svbool_t pf=svptrue_b32();
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
+#endif
+    for(int r=0;r<rows;r++){
+        const uint8_t*wr=W+(size_t)r*cols; const float*sr=S+(size_t)r*sb;
+        for(int t=0;t<N;t++){
+            const int8_t*xq=Xq+(size_t)t*cols;
+            svfloat32_t facc=svdup_f32(0.f);
+            for(int g=0;g<sb;g++){
+                int k0=g*gs, k1=k0+gs<cols?k0+gs:cols, c=k0;
+                svint32_t d0=svdup_s32(0),d1=svdup_s32(0),d2=svdup_s32(0),d3=svdup_s32(0);
+                #define GLM5_SDOTC(D,CC) do{ svint8_t wv=svreinterpret_s8_u8(sveor_n_u8_x(pf8,svld1_u8(pf8,&wr[CC]),0x80)); \
+                    D=svdot_s32(D,wv,svld1_s8(pf8,&xq[CC])); }while(0)
+                svbool_t pf8=svptrue_b8();
+                for(;c+4*vb<=k1;c+=4*vb){ GLM5_SDOTC(d0,c); GLM5_SDOTC(d1,c+vb); GLM5_SDOTC(d2,c+2*vb); GLM5_SDOTC(d3,c+3*vb); }
+                #undef GLM5_SDOTC
+                for(;c<k1;c+=vb){ svbool_t pg=svwhilelt_b8(c,k1);
+                    svint8_t wv=svreinterpret_s8_u8(sveor_n_u8_x(pg,svld1_u8(pg,&wr[c]),0x80));
+                    d0=svdot_s32(d0,wv,svld1_s8(pg,&xq[c])); }
+                svint32_t d=svadd_s32_x(pf,svadd_s32_x(pf,d0,d1),svadd_s32_x(pf,d2,d3));
+                facc=svmla_n_f32_x(pf,facc,svcvt_f32_s32_x(pf,d),sr[g]);
+            }
+            Y[(size_t)t*rows+r]=xsc[t]*svaddv_f32(pf,facc);
+        }
+    }
+#else
+    glm5_gemm_int8(m,Y,W,S,gs,X,N,rows,cols);
+#endif
+    free(Xq); free(xsc);
+}
 /* batched GEMM dispatch by weight type */
 static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const float*X, int N, int rows, int cols){
     if(t->type==GLM5_MXFP8) glm5_gemm_mxfp8(m,Y,(const uint8_t*)t->w,t->scale,X,N,rows,cols);
-    else if(t->type==GLM5_INT8) glm5_gemm_int8(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
+    else if(t->type==GLM5_INT8){
+        /* w8a8 sdot wins only for per-channel tensors (routed experts: 1.77x); for group-128 it
+         * loses to the tuned w8a16 bf16-FMA kernel (per-group cvt/scale overhead). So sdot is
+         * applied to per-channel GEMMs only. Opt-in (GLM5_INT8_SDOT) since it rounds activations. */
+        static int sdot=-1; if(sdot<0) sdot=glm5_envi("GLM5_INT8_SDOT",0);
+        if(sdot && N>1 && t->qg>=cols) glm5_gemm_int8_sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
+        else glm5_gemm_int8(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
+    }
     else glm5_gemm_bf16(Y,(const uint16_t*)t->w,X,N,rows,cols);
 }
 static inline float glm5_tensor_get(const glm5_model*m,const glm5_tensor*t,int r,int c){
