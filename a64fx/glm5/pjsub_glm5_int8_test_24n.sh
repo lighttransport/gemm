@@ -44,8 +44,9 @@ grep -hE "2nd pass" "$WORK"/../pjsub_glm5_int8_test_24n.sh.${PJM_JOBID}.out 2>/d
 echo "staged $(ls "$WORK"/glm5_stage_rank*.txt 2>/dev/null|wc -l)/$NP  rank00: $(head -1 "$WORK"/glm5_stage_rank00.txt)"
 grep -l "model.norm.weight" "$WORK"/rank00.manifest >/dev/null 2>&1 && echo "model.norm staged OK" || grep -c "model.norm" "$WORK"/rank00.manifest
 
-echo "--- prefill_synth 64 tok ($(date)) ---"; rm -f glm5_ep_rank00.txt
-eval $RUNENV GLM5_PREFILL_SYNTH=64 GLM5_GEN_NEW=0 mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: run"; tail -20 glm5_ep_rank00.txt 2>/dev/null; exit 5; }
+SYN=${GLM5_SYNTH:-64}
+echo "--- prefill_synth $SYN tok pchunk=$pc ($(date)) ---"; rm -f glm5_ep_rank00.txt
+eval $RUNENV GLM5_PREFILL_SYNTH=$SYN GLM5_GEN_NEW=0 mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: run"; tail -20 glm5_ep_rank00.txt 2>/dev/null; exit 5; }
 echo "=== INT8 RESULT ==="
 grep -hE "INT8|prefill_synth:|last argmax|NaNs|SENTINEL|owned|arena" glm5_ep_rank00.txt | head -20
 echo "=== int8 test done $(date) ==="

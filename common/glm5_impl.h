@@ -1777,10 +1777,14 @@ static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const
     if(t->type==GLM5_MXFP8) glm5_gemm_mxfp8(m,Y,(const uint8_t*)t->w,t->scale,X,N,rows,cols);
     else if(t->type==GLM5_INT8){
         /* w8a8 sdot wins only for per-channel tensors (routed experts: 1.77x); for group-128 it
-         * loses to the tuned w8a16 bf16-FMA kernel (per-group cvt/scale overhead). So sdot is
-         * applied to per-channel GEMMs only. Opt-in (GLM5_INT8_SDOT) since it rounds activations. */
-        static int sdot=-1; if(sdot<0) sdot=glm5_envi("GLM5_INT8_SDOT",0);
-        if(sdot && N>1 && t->qg>=cols) glm5_gemm_int8_sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
+         * loses to the tuned w8a16 bf16-FMA kernel. AUTO-enable it for the experts only in the
+         * large-chunk prefill regime (chunk >= GLM5_INT8_SDOT_MIN, default 1024 tokens) where the
+         * throughput win is worth the w8a8 activation rounding; small chunks/decode stay w8a16.
+         * GLM5_INT8_SDOT overrides: 0 = never, 1 = always (N>1); unset = auto-by-chunk-size. */
+        static int mode=-2, thr=1024;
+        if(mode==-2){ const char*e=getenv("GLM5_INT8_SDOT"); mode=(e&&*e)?atoi(e):-1; thr=glm5_envi("GLM5_INT8_SDOT_MIN",1024); }
+        int use_sdot = (t->qg>=cols) && N>1 && (mode==1 || (mode<0 && m->prefill_ntok>=thr));
+        if(use_sdot) glm5_gemm_int8_sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
         else glm5_gemm_int8(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
     }
     else glm5_gemm_bf16(Y,(const uint16_t*)t->w,X,N,rows,cols);
@@ -2071,6 +2075,7 @@ static void glm5_msa_prefill_select(glm5_model*m, glm5_layer*L, int p0, int S, i
  * Prefill is compute-bound -> ideally run WITHOUT CP (replicated/TP KV); CP works but adds a
  * per-token collective in the MSA select. Requires glm5_alloc_mstream_ex(m,S,0). */
 static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int need_head){
+    m->prefill_ntok=S;            /* expose chunk size to the GEMM dispatch (expert sdot gate) */
     const glm5_config*c=&m->cfg;
     const int H=c->hidden, AD=glm5_attn_dim(c);
     const int KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;

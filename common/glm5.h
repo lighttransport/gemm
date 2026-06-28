@@ -265,6 +265,7 @@ typedef struct glm5_pool glm5_pool;
 typedef struct {
     glm5_config cfg;
     int ep_rank, ep_size;
+    int prefill_ntok;   /* tokens in the current prefill chunk; gates expert sdot (auto >= 1024) */
     glm5_layer *layers;
     /* embeddings / head (BF16; TP vocab-sharded) */
     uint16_t *embed;          /* [emb_rows, hidden] this rank's vocab shard */
