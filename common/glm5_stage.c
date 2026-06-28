@@ -77,6 +77,16 @@ static void parse_bf16_layers(void){
         for(long L=a;L<=b && g_nbf16<256;L++) g_bf16[g_nbf16++]=(int)L;
     }
 }
+/* GLM5_BF16_EXTRA: exact tensor names (':'/','/space-sep) to source from GLM5_BF16_DIR — for
+ * un-quantized globals (e.g. model.norm.weight) absent from a partially-downloaded primary
+ * checkpoint but identical in the bf16 sibling. Staged in the bf16 pass like bf16 layers. */
+static int g_nextra=0; static char g_extra[16][256];
+static int is_extra(const char*name){ for(int i=0;i<g_nextra;i++) if(!strcmp(g_extra[i],name)) return 1; return 0; }
+static void parse_bf16_extra(void){
+    const char*e=getenv("GLM5_BF16_EXTRA"); if(!e||!*e) return;
+    char buf[4096]; snprintf(buf,sizeof buf,"%s",e);
+    for(char*t=strtok(buf,":, ");t&&g_nextra<16;t=strtok(NULL,":, ")) snprintf(g_extra[g_nextra++],256,"%s",t);
+}
 
 enum { CLS_SKIP, CLS_DENSE, CLS_EXPERT };
 /* bf16_pass=0: FP8 source pass (skip bf16-designated layers); 1: bf16 source pass (keep only them). */
@@ -84,11 +94,11 @@ static int classify(const char*name,int rank,int ep_size,int bf16_pass){
     static int slay=-2; if(slay==-2) slay=envi("GLM5_STAGE_LAYERS",78);
     long L=layer_id(name);
     if(slay>0){ if(L>=0 && L>=slay) return CLS_SKIP; }
-    if(g_nbf16>0){
-        int isb=(L>=0 && is_bf16_layer(L));
-        if(bf16_pass){ if(!isb) return CLS_SKIP; }   /* bf16 pass keeps only designated layers */
-        else { if(isb) return CLS_SKIP; }            /* fp8 pass skips designated layers */
-    } else if(bf16_pass) return CLS_SKIP;            /* no designated layers -> bf16 pass empty */
+    if(g_nbf16>0 || g_nextra>0){
+        int isb=(L>=0 && is_bf16_layer(L)) || is_extra(name);
+        if(bf16_pass){ if(!isb) return CLS_SKIP; }   /* bf16 pass keeps only designated layers/extras */
+        else { if(isb) return CLS_SKIP; }            /* primary pass skips them */
+    } else if(bf16_pass) return CLS_SKIP;            /* none designated -> bf16 pass empty */
     long e=expert_id(name);
     if(e>=0) return (e%ep_size==rank)?CLS_EXPERT:CLS_SKIP;
     return CLS_DENSE;
@@ -114,7 +124,7 @@ int main(void){
     int nshards=envi("GLM5_NSHARDS",282);
     int slimit=envi("GLM5_SHARD_LIMIT",0);
     int fp8_last=(slimit>0&&slimit<nshards)?slimit:nshards;
-    parse_bf16_layers();
+    parse_bf16_layers(); parse_bf16_extra();
     char bf16_dir[1024];
     { const char*e=getenv("GLM5_BF16_DIR"); if(e&&*e) snprintf(bf16_dir,sizeof bf16_dir,"%s",e);
       else snprintf(bf16_dir,sizeof bf16_dir,"%s/models/glm5.2",home); }
@@ -136,8 +146,8 @@ int main(void){
     fprintf(mf,"# GLM5MANIFEST rank=%02d ep_size=%02d n_tensors=%-12d blob_bytes=%-18lld\n",rank,ep_size,0,0LL);
 
     uint64_t off=0,last_sync=0; long long n_dense=0,n_expert=0; uint64_t b_dense=0,b_expert=0; double t0=now_sec();
-    int npass=(g_nbf16>0)?2:1;
-    if(g_nbf16>0){ printf("glm5_stage: mixed-precision %d bf16 layers from %s (rest FP8)\n",g_nbf16,bf16_dir); fflush(stdout); }
+    int npass=(g_nbf16>0||g_nextra>0)?2:1;
+    if(g_nbf16>0||g_nextra>0){ printf("glm5_stage: 2nd pass from %s (%d bf16 layers, %d extra tensors)\n",bf16_dir,g_nbf16,g_nextra); fflush(stdout); }
     for(int pass=0;pass<npass;pass++){
       const char*mdir = pass==0?model_dir:bf16_dir;
       int nsh = pass==0?nshards:bf16_nshards;

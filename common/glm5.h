@@ -144,13 +144,14 @@ static inline int glm5_idx_q_dim(const glm5_config *c) { return c->index_n_heads
  * flat layout for norms/embed/index-norm read directly. GLM5_F32 for the router
  * gate + e_score bias (argmax-critical, kept high precision). MXFP4/Q8 reserved
  * for the later perf phase (same enum values as ds4f for kernel sharing). */
-typedef enum { GLM5_BF16 = 0, GLM5_FP8 = 1, GLM5_MXFP4 = 2, GLM5_F32 = 3, GLM5_BF16_PV = 4, GLM5_Q8_PV = 5, GLM5_MXFP8 = 6 } glm5_qtype;
+typedef enum { GLM5_BF16 = 0, GLM5_FP8 = 1, GLM5_MXFP4 = 2, GLM5_F32 = 3, GLM5_BF16_PV = 4, GLM5_Q8_PV = 5, GLM5_MXFP8 = 6, GLM5_INT8 = 7 } glm5_qtype;
 
 typedef struct {
     void    *w;       /* weight bytes */
-    uint8_t *scale;   /* FP8 scale bytes (GLM5.2: F32 scale_inv blocks; NULL for BF16/F32) */
+    uint8_t *scale;   /* FP8: F32 scale_inv blocks; INT8: F32 per-row scale [rows,cols/qg]; NULL for BF16/F32 */
     glm5_qtype type;
     int rows, cols;   /* logical [rows, cols] */
+    int qg;           /* INT8 scale group size in cols (128 group / =cols per-channel); 0 otherwise */
 } glm5_tensor;
 
 static inline size_t glm5_wbytes(glm5_qtype t, int rows, int cols) {
@@ -160,6 +161,7 @@ static inline size_t glm5_wbytes(glm5_qtype t, int rows, int cols) {
         case GLM5_BF16_PV: return n * 2;
         case GLM5_FP8:     return n;
         case GLM5_MXFP8:   return n;          /* 1 byte/elem (FP8 E4GLM5) */
+        case GLM5_INT8:    return n;          /* 1 byte/elem (int8 packed) */
         case GLM5_MXFP4:   return n / 2;
         case GLM5_F32:     return n * 4;
         case GLM5_Q8_PV:   return (size_t)(rows / 8) * (cols / 64) * 528;
@@ -170,6 +172,7 @@ static inline size_t glm5_sbytes(glm5_qtype t, int rows, int cols) {
     switch (t) {
         case GLM5_FP8:   return (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 4;
         case GLM5_MXFP8: return (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 4;
+        case GLM5_INT8:  return (size_t)rows * ((cols + 127) / 128) * 4;  /* per-row f32 group scale */
         case GLM5_MXFP4: return (size_t)rows * (cols / 32);
         default:       return 0;
     }
