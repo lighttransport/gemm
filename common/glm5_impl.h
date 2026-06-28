@@ -48,6 +48,39 @@ static int glm5_envi(const char*k,int d){ const char*v=getenv(k); return (v&&*v)
 static inline double glm5_prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static inline void glm5_prof_add(glm5_model*m,int phase,double t0){ m->prof[phase]+=glm5_prof_now()-t0; }
 
+#if defined(__ARM_FEATURE_SVE)
+/* 2^x via the SVE FEXPA accelerator (~5 instrs): round-to-table-index, svexpa table lookup,
+ * first-order residual correction 2^r ~= 1 + r*ln2. ~0.01% rel error — plenty for router sigmoids. */
+static inline svfloat32_t glm5_exp2_fexpa(svbool_t pg, svfloat32_t x){
+    const float shift_f=204927.0f;                 /* 0x48481fc0: FEXPA-compatible rounding shift */
+    svfloat32_t shift=svdup_f32(shift_f);
+    svfloat32_t z=svadd_f32_x(pg,x,shift);
+    svfloat32_t n=svsub_f32_x(pg,z,shift);
+    svfloat32_t r=svsub_f32_x(pg,x,n);
+    svfloat32_t scale=svexpa_f32(svreinterpret_u32_f32(z));
+    svfloat32_t corr=svmla_n_f32_x(pg,svdup_f32(1.0f),r,0.6931471805599453f);
+    return svmul_f32_x(pg,scale,corr);
+}
+#endif
+/* in-place sigmoid 1/(1+e^-x) over a row of n floats. SVE: exp(-x)=2^(-x*log2e) via FEXPA +
+ * one Newton step on the reciprocal. Scalar fallback uses expf. */
+static inline void glm5_sigmoid_row(float*rl,int n){
+#if defined(__ARM_FEATURE_SVE)
+    int vl=(int)svcntw();
+    for(int e=0;e<n;e+=vl){
+        svbool_t pg=svwhilelt_b32(e,n);
+        svfloat32_t v=svld1_f32(pg,&rl[e]);
+        svfloat32_t t=svmax_n_f32_x(pg,svmin_n_f32_x(pg,svmul_n_f32_x(pg,v,-1.4426950408889634f),80.f),-80.f);
+        svfloat32_t en=glm5_exp2_fexpa(pg,t);
+        svfloat32_t den=svadd_n_f32_x(pg,en,1.0f);
+        svfloat32_t inv=svrecpe_f32(den); inv=svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+        svst1_f32(pg,&rl[e],inv);
+    }
+#else
+    for(int e=0;e<n;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
+#endif
+}
+
 /* ===================== scalar/codec helpers ===================== */
 static inline uint16_t glm5_f2bf(float f){
     uint32_t u; memcpy(&u,&f,4);
@@ -2230,11 +2263,11 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
              * (glm5_mv at the decode router). The old glm5_gemm_f32((float*)gate.w) read the bf16
              * buffer as f32 -> 2x over-read past the tensor + wrong logits. */
             glm5_gemm(m,ms->router,&L->gate,ms->h2,S,c->n_experts,H);
-#ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-#endif
+            #pragma omp parallel for schedule(static) if((long)S*c->n_experts>=GLM5_PAR_MIN)
             for(int t=0;t<S;t++){ float*rl=ms->router+(size_t)t*c->n_experts;
-                for(int e=0;e<c->n_experts;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
+                /* per-token FEXPA sigmoid + greedy top-k + normalize; independent across tokens,
+                 * so this loop is parallelized (was single-threaded -> ~25% of full-model prefill). */
+                glm5_sigmoid_row(rl,c->n_experts);
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
                 for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
                 float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
