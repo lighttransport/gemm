@@ -61,7 +61,17 @@ static transformer_model *gemma4_tp_load(const char *gguf_path, const char *blob
     g4tp_ent *ents = (g4tp_ent *)calloc(g->n_tensors + 8, sizeof(g4tp_ent));
     int ne = 0; char line[512];
     while (fgets(line, sizeof line, mf)) {
-        if (line[0] == '#') continue;
+        if (line[0] == '#') {
+            /* guard against STALE shards: manifest nranks MUST match the runtime N
+             * (a prior sweep at a different N silently leaves wrong-width slices). */
+            int mr = -1, mn = -1;
+            if (sscanf(line, "# GEMMA4MANIFEST rank=%d nranks=%d", &mr, &mn) == 2 && mn != nranks) {
+                fprintf(stderr, "gemma4_tp_load: STALE SHARD: manifest nranks=%d != runtime N=%d "
+                        "(re-stage %s for N=%d)\n", mn, nranks, blob_path, nranks);
+                fclose(mf); free(ents); return NULL;
+            }
+            continue;
+        }
         char *tok[32]; int nt = 0;
         for (char *p = strtok(line, " \t\n"); p && nt < 32; p = strtok(NULL, " \t\n")) tok[nt++] = p;
         if (nt < 5) continue;                       /* off nbytes dtype ndims dims... name */

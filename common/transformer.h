@@ -8799,6 +8799,8 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
         t0p = tf_time_ms();
         tf_rmsnorm_batch(bxb, bxb, &layer->post_attention_norm, n_embd, N, eps, m->matvec_tmp);
         for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
+        if (getenv("TF_TP_DBG") && l == 0) { double s=0; for(size_t i=0;i<(size_t)N*n_embd;i++) s+=bx[i];
+            fprintf(stderr,"[dbg] L0 post-ATTN bx sum=%.5f tp_rank=%d local_qh=%d local_ff=%d\n", s, m->tp_rank, local_qh, local_ff); }
         tf_rmsnorm_batch(bxb, bx, &layer->ffn_norm, n_embd, N, eps, m->matvec_tmp);
         t_post += tf_time_ms() - t0p;
 
@@ -8834,6 +8836,8 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
         if (m->tp_size > 1 && m->tp_allreduce_fn)
             m->tp_allreduce_fn(bxb, N * n_embd, m->tp_allreduce_ctx);
         tf_rmsnorm_batch(bxb, bxb, &layer->post_ffw_norm, n_embd, N, eps, m->matvec_tmp);
+        if (getenv("TF_TP_DBG") && l == 0) { double s=0; for(int t=0;t<N;t++) for(int i=0;i<n_embd;i++) s+=(bx[(size_t)t*n_embd+i]+bxb[(size_t)t*n_embd+i]);
+            fprintf(stderr,"[dbg] L0 post-FFN bx sum=%.5f tp_rank=%d\n", s, m->tp_rank); }
         for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
         if (layer->layer_output_scale.data) {
             float scale_val;
