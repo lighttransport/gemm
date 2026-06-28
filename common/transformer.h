@@ -4804,6 +4804,7 @@ typedef struct {
     transformer_model *m;
     int tid;
     int position, pos_t, pos_h, pos_w;
+    int l0, l1;   /* layer range for the gemma4 persistent worker (PP); default 0..n_layers */
 } tf_persistent_ctx;
 
 /* ---- Barrier implementations ---- */
@@ -5141,8 +5142,9 @@ static void *tf_gemma4_persistent_worker(void *arg) {
     int h_per = n_heads / nt, h_extra = n_heads % nt;
     int h_start = tid * h_per + (tid < h_extra ? tid : h_extra);
     int h_count = h_per + (tid < h_extra ? 1 : 0);
+    int pp_l0 = ctx->l0, pp_l1 = ctx->l1;   /* PP layer range (full = 0..n_layers) */
 
-    for (int l = 0; l < m->n_layers; l++) {
+    for (int l = pp_l0; l < pp_l1; l++) {
         transformer_layer *layer = &m->layers[l];
         int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
         int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : n_kv_heads;
@@ -5303,7 +5305,10 @@ static void *tf_gemma4_persistent_worker(void *arg) {
         /* next layer's B1 covers the m->x write (only tid0 writes/reads it) */
     }
 
-    if (tid == 0) tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, eps, m->matvec_tmp);
+    /* Final RMSNorm only on the LAST stage (pp_l1 == n_layers); PP middle/first stages
+     * hand off the raw post-block residual to the next stage. */
+    if (tid == 0 && pp_l1 == m->n_layers && m->output_norm.data)
+        tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, eps, m->matvec_tmp);
 
     /* Lever 2: fold lm_head into the same dispatch (no separate cond_broadcast,
      * threads stay engaged). Row-split the [n_vocab, n_embd] output matvec, then
@@ -5320,13 +5325,24 @@ static void *tf_gemma4_persistent_worker(void *arg) {
     return NULL;
 }
 
-static float *tf_forward_gemma4_persistent(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
+static float *tf_forward_gemma4_persistent_range(transformer_model *m, int position,
+                                                 int pos_t, int pos_h, int pos_w, int l0, int l1) {
     int nt = m->n_threads;
     m->bar_count = 0; m->bar_sense = 0; __sync_synchronize();
     tf_persistent_ctx *ctxs = (tf_persistent_ctx *)alloca(nt * sizeof(tf_persistent_ctx));
-    for (int t = 0; t < nt; t++) ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w};
+    for (int t = 0; t < nt; t++) ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w, l0, l1};
     tf_pool_dispatch(m, tf_gemma4_persistent_worker, ctxs, sizeof(tf_persistent_ctx));
     return m->x;
+}
+static float *tf_forward_gemma4_persistent(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
+    return tf_forward_gemma4_persistent_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
+}
+/* PP: run layers [l0,l1) of a single token through the persistent worker (spin-barrier,
+ * ~2.6x the block path). Caller sets m->x (embedding on stage 0, recv hidden elsewhere);
+ * the final RMSNorm fires only when l1==n_layers. Returns m->x. */
+float *transformer_forward_partial_persistent(transformer_model *m, int cache_pos, int l0, int l1) {
+    if (!m || !m->is_gemma4) return NULL;
+    return tf_forward_gemma4_persistent_range(m, cache_pos, cache_pos, cache_pos, cache_pos, l0, l1);
 }
 
 /* Persistent forward: dispatch tf_persistent_worker to ALL threads via pool,

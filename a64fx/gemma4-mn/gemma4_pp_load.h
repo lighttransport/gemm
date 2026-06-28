@@ -12,6 +12,7 @@
 #define GEMMA4_PP_LOAD_H
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -30,14 +31,36 @@ static transformer_model *gemma4_pp_load(const char *gguf_path, const char *blob
     int L0 = (int)((long)rank * n_layers / nranks);
     int L1 = (int)((long)(rank + 1) * n_layers / nranks);
 
-    /* mmap the rank's blob (read-only); becomes the tensor data backing */
+    /* ANON-load the rank's blob into RAM (NOT mmap): mmap re-faults the weights from
+     * /local every decode token (NUMA-misplaced) -> thrash. Read into an interleaved
+     * anon buffer once (resident, NUMA-spread) -> fast decode. Drop the source blob's
+     * page-cache as we read (fadvise) so we don't double the footprint. */
     int bfd = open(blob_path, O_RDONLY);
     if (bfd < 0) { fprintf(stderr, "gemma4_pp_load: open blob %s: %s\n", blob_path, strerror(errno)); return NULL; }
     struct stat st; if (fstat(bfd, &st) != 0) { close(bfd); return NULL; }
-    void *blob = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, bfd, 0);
-    if (blob == MAP_FAILED) { fprintf(stderr, "gemma4_pp_load: mmap blob failed\n"); close(bfd); return NULL; }
-#ifdef MADV_HUGEPAGE
-    madvise(blob, (size_t)st.st_size, MADV_HUGEPAGE);
+    size_t blob_sz = (size_t)st.st_size;
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    {   /* MPOL_INTERLEAVE so the anon blob spreads across the 4 CMGs (decode BW) */
+        unsigned long nodemask = 0xFFUL;
+        syscall(SYS_set_mempolicy, 3 /*MPOL_INTERLEAVE*/, &nodemask, 8UL);
+    }
+#endif
+    void *blob = NULL;
+    if (posix_memalign(&blob, 2*1024*1024, blob_sz) != 0 || !blob) { fprintf(stderr, "gemma4_pp_load: blob alloc %.1f GB failed\n", blob_sz/1e9); close(bfd); return NULL; }
+    {   size_t off = 0;
+        while (off < blob_sz) {
+            size_t chunk = blob_sz - off; if (chunk > 256u*1024*1024) chunk = 256u*1024*1024;
+            ssize_t r = pread(bfd, (uint8_t*)blob + off, chunk, (off_t)off);
+            if (r <= 0) { fprintf(stderr, "gemma4_pp_load: blob pread failed at %zu\n", off); close(bfd); return NULL; }
+#if defined(POSIX_FADV_DONTNEED)
+            posix_fadvise(bfd, (off_t)off, (size_t)r, POSIX_FADV_DONTNEED);
+#endif
+            off += (size_t)r;
+        }
+    }
+    close(bfd);
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    syscall(SYS_set_mempolicy, 0 /*MPOL_DEFAULT*/, NULL, 0UL);   /* restore for later allocs */
 #endif
 
     /* parse manifest: name -> blob offset */
