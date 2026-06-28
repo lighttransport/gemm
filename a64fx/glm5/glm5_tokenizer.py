@@ -98,6 +98,9 @@ def main():
     elif cmd=="chat-file":
         text=open(sys.argv[2]).read()
         print(" ".join(str(i) for i in t.chat(text)))
+    elif cmd=="encode-file":
+        text=open(sys.argv[2]).read()
+        print(" ".join(str(i) for i in t.encode(text)))
     elif cmd=="decode":
         ids=[int(x) for x in sys.argv[2].split()]
         print(t.decode(ids))

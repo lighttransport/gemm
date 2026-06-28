@@ -1046,8 +1046,14 @@ static int glm5_group_tp_reslice(glm5_model*m,const char*blob_dir,int blob_rank,
     fclose(mf);
     int bfd=open(bp,O_RDONLY); if(bfd<0){ fprintf(stderr,"reslice: cannot open %s\n",bp); glm5_afree(es); return -1; }
     struct stat sb; fstat(bfd,&sb); size_t bsz=sb.st_size;
+    /* Merge re-slice re-reads the dense tensors from the (possibly-evicted) /local blob WHILE the
+     * 16 GB model weights are resident on a 31 GB node -> the 26 GB mmap thrashes against them
+     * (~87 MB/s random faults, ~300 s, variable per node -> rank desync trips the 300 s gbarrier).
+     * Hint sequential readahead so faults coalesce; the real safety is the raised gbarrier timeout. */
+    posix_fadvise(bfd,0,bsz,POSIX_FADV_SEQUENTIAL);
     const uint8_t*base=mmap(NULL,bsz,PROT_READ,MAP_PRIVATE,bfd,0);
     if(base==MAP_FAILED){ fprintf(stderr,"reslice: mmap failed\n"); close(bfd); glm5_afree(es); return -1; }
+    madvise((void*)base,bsz,MADV_SEQUENTIAL);
     const int H=cfg->hidden, QD=glm5_q_dim(cfg), AD=glm5_attn_dim(cfg), VD=cfg->v_head_dim, QHD=cfg->qk_head_dim;
     int tp=glm5_envi("GLM5_TP",0);
     int tp_attn=glm5_envi("GLM5_TP_ATTN",tp) && !m->cp_on, tp_sh=glm5_envi("GLM5_TP_SHARED",tp);

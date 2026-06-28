@@ -32,7 +32,10 @@
 
 #define MAX_NODES 512   /* >= largest EP run (384-node prefill); arrays are O(MAX_NODES) tiny */
 #define RUN_STAG  DEMO_STAG
-#define WAIT_TIMEOUT_SEC 300.0
+#define WAIT_TIMEOUT_SEC 900.0  /* generous: the Phase-2 merge re-slice re-reads the dense blob from
+                                 * /local (~300 s, per-node variable); barriers are infrequent and the
+                                 * per-token allreduce has its own timeout, so this only delays detecting
+                                 * a genuine (rare) barrier hang. */
 
 static FILE *g_log = NULL;
 static void logmsg(const char *fmt, ...) {
@@ -884,6 +887,26 @@ int main(void){
             /* KV cache save (prompt caching): persist the processed [0,pend) Tier-A KV for reuse. */
             { const char*kvs=getenv("GLM5_KV_SAVE"); if(kvs&&*kvs && MyRank==0) glm5_kv_save(m,kvs,pend); }
             glm5_afree(Xc); glm5_free_mstream(m);
+            /* Generation tail: greedy-decode GLM5_GEN_NEW tokens after the prefill (reuses the loaded
+             * KV + the just-prefilled query). All ranks decode (forward_token is collective); group
+             * rank 0 logs/writes GEN_IDS for detokenization. */
+            int gen_new=envi("GLM5_GEN_NEW",0);
+            if(gen_new>0 && pf_last>=0){
+                int*gen=glm5_amalloc((size_t)gen_new*4); int ng=0, cur=pf_last, pos=pend;
+                double tg=now_sec();
+                for(int g=0; g<gen_new && pos<m->cfg.max_pos; g++){
+                    gen[ng++]=cur;
+                    if(cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) break;
+                    embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,pos++);
+                }
+                if(GRank==0){
+                    logmsg("gen: %d tokens (%.2f tok/s) from pos=%d\n",ng,ng/(now_sec()-tg+1e-9),pend);
+                    char buf[16000]; int o=0; for(int i=0;i<ng&&o<15900;i++) o+=snprintf(buf+o,sizeof buf-o,"%d ",gen[i]);
+                    logmsg("GEN_IDS %s\n",buf);
+                    const char*go=getenv("GLM5_GEN_OUT"); if(go&&*go){ FILE*gf=fopen(go,"w"); if(gf){ for(int i=0;i<ng;i++) fprintf(gf,"%d ",gen[i]); fclose(gf); logmsg("gen: wrote %d ids -> %s\n",ng,go);} }
+                }
+                glm5_afree(gen);
+            }
         } else {
             for(int p=0;p<prefill;p++){
                 int tok=(unsigned)(p+(unsigned)GId*0x9E3779B1u)*1315423911u % (unsigned)m->cfg.vocab;
