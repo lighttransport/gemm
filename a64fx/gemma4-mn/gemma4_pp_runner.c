@@ -171,14 +171,14 @@ int main(int argc,char**argv){
                    int nt=(int)*(volatile uint64_t*)(Region+TTOK_OFF);
                    t = (p<P)? prompt[p] : nt; }
             transformer_embed_token(m,t);
-            transformer_forward_partial_persistent(m,p,L0,L1);
+            (getenv("GEMMA4_PP_PERSIST")&&atoi(getenv("GEMMA4_PP_PERSIST"))?transformer_forward_partial_persistent(m,p,L0,L1):transformer_forward_partial(m,p,L0,L1));
             memcpy(hsend,m->x,(size_t)n_embd_g*sizeof(float));
             put_issue(PeerVcq[1],Base+HSEND_OFF,PeerBase[1]+HRECV_OFF,(size_t)n_embd_g*sizeof(float),0);
             *scr=(uint64_t)(p+1); put_issue(PeerVcq[1],Base+SCRATCH_OFF,PeerBase[1]+HSEQ_OFF,8,1);
         } else {
             wait_ge(hseq,(uint64_t)(p+1),"hidden wait");
             transformer_set_hidden(m,hrecv);
-            transformer_forward_partial_persistent(m,p,L0,L1);
+            (getenv("GEMMA4_PP_PERSIST")&&atoi(getenv("GEMMA4_PP_PERSIST"))?transformer_forward_partial_persistent(m,p,L0,L1):transformer_forward_partial(m,p,L0,L1));
             if(is_last){
                 float *lg=transformer_compute_logits(m);
                 int nt=0; float mx=lg[0]; for(int i=1;i<m->n_vocab;i++) if(lg[i]>mx){mx=lg[i];nt=i;}
@@ -199,6 +199,11 @@ int main(int argc,char**argv){
         printf("PPGEN n=%d tok_s=%.3f tokens:",ngen,ngen/dt);
         for(int i=0;i<ngen;i++) printf(" %d",gen[i]);
         printf("\n");
+        /* also write to a shared-FS file: mpiexec does NOT reliably forward rank stdout */
+        const char *rf = getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_pp_result.txt";
+        FILE *f=fopen(rf,"w");
+        if(f){ fprintf(f,"PPGEN N=%d n=%d tok_s=%.4f sec=%.3f tokens:",N,ngen,ngen/dt,dt);
+               for(int i=0;i<ngen;i++) fprintf(f," %d",gen[i]); fprintf(f,"\n"); fclose(f); }
     }
     barrier_robust(1);
     return 0;
