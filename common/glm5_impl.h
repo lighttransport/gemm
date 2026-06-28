@@ -1485,7 +1485,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
                 glm5_mv(m,m->s_exu,&L->ex_w3[slot],h2,c->moe_inter,H);
                 for(int i=0;i<c->moe_inter;i++) m->s_exg[i]=glm5_swiglu_oai(m->s_exg[i],m->s_exu[i],c->swiglu_alpha,c->swiglu_limit);
                 glm5_mv(m,m->s_moe,&L->ex_w2[slot],m->s_exg,H,c->moe_inter);
-                for(int i=0;i<H;i++) route[i]+=w*m->s_moe[i]; }
+                glm5_axpy_f32(route, m->s_moe, w, H); }   /* SVE: was scalar route[i]+=w*s_moe[i] */
             glm5_prof_add(m,GLM5_P_EXPERTS,pt);
             /* shared expert: TP-sharded -> fold partial into route[] (one reduce); else replicated -> add after */
             int overlap=(m->ar_async_start && !tp_sh);
@@ -2286,8 +2286,8 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
 #endif
                 for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
                 glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
-                for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; float w=ms->bw[(size_t)s*S+i]; float*rt=ms->route+(size_t)t*H,*dn=ms->tmp2+(size_t)i*H;
-                    for(int j=0;j<H;j++) rt[j]+=w*dn[j]; } }
+                for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; float w=ms->bw[(size_t)s*S+i];
+                    glm5_axpy_f32(ms->route+(size_t)t*H, ms->tmp2+(size_t)i*H, w, H); } }   /* SVE: was scalar rt[j]+=w*dn[j] */
             glm5_prof_add(m,GLM5_P_EXPERTS,pt);
             pt=glm5_prof_now();
             int overlap = (m->ar_async_start && !tp_sh);
