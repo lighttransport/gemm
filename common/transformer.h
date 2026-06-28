@@ -291,6 +291,8 @@ float *transformer_forward_partial(transformer_model *model, int cache_pos,
 /* Compute logits from the current hidden state in model->x.
  * Call after transformer_forward_partial with layer_end == n_layers. */
 float *transformer_compute_logits(transformer_model *model);
+/* TP vocab-parallel: logits for rows [v0,v1) into model->logits[0..v1-v0). */
+float *transformer_compute_logits_slice(transformer_model *model, int v0, int v1);
 
 /* Copy hidden state into/out of model->x for MPI communication */
 float *transformer_get_hidden(transformer_model *model);
@@ -6220,6 +6222,21 @@ float *transformer_compute_logits(transformer_model *model) {
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
     tf_qmatvec_pool(model, model->logits, &model->output, model->x, model->n_vocab);
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
+    return model->logits;
+}
+
+/* TP vocab-parallel lm_head: compute logit rows [v0,v1) into model->logits[0..v1-v0).
+ * lm_head is TIED to token_embd (replicated full on every TP rank) and the final hidden
+ * model->x is identical across ranks (post final-norm), so each rank computes only its
+ * vocab slice; the caller takes the local argmax (offset by v0) then tp_allreduce_argmax
+ * for the global token. Argmax is invariant to final_logit_softcapping (monotonic), so
+ * the slice need not apply it. Returns model->logits (holds v1-v0 valid entries). */
+float *transformer_compute_logits_slice(transformer_model *model, int v0, int v1) {
+    if (!model || !model->has_lm_head) return NULL;
+    if (v0 < 0) v0 = 0;
+    if (v1 > model->n_vocab) v1 = model->n_vocab;
+    if (v1 <= v0) return NULL;
+    tf_qmatvec_row_slice(model, model->logits, &model->output, model->x, v0, v1);
     return model->logits;
 }
 
