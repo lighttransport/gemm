@@ -526,8 +526,25 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
             }
             fclose(f); f = NULL;
         } else {
-            fseek(f, (long)ctx->data_offset, SEEK_SET);
-            if (fread(ctx->data, 1, ctx->data_size, f) != ctx->data_size) goto fail;
+            /* Chunked pread + drop the SOURCE file's page-cache per chunk. A single
+             * fread of the whole 24 GB would cache 24 GB of source pages ON TOP of the
+             * 24 GB anon dest -> page cache balloons -> kswapd thrash / interactive HANG.
+             * Reading in 64 MB chunks and posix_fadvise(DONTNEED) keeps the source-cache
+             * window tiny -> clean explicit anon (HBM2) upload. TF_LOAD_KEEPCACHE=1 disables. */
+            int dfd = fileno(f);
+            int keep = (getenv("TF_LOAD_KEEPCACHE") && atoi(getenv("TF_LOAD_KEEPCACHE")));
+            size_t off = 0, total = ctx->data_size;
+            while (off < total) {
+                size_t chunk = total - off;
+                if (chunk > 64u * 1024 * 1024) chunk = 64u * 1024 * 1024;
+                ssize_t n = pread(dfd, (uint8_t *)ctx->data + off, chunk,
+                                  (off_t)(ctx->data_offset + off));
+                if (n <= 0) goto fail;
+#if defined(POSIX_FADV_DONTNEED)
+                if (!keep) posix_fadvise(dfd, (off_t)(ctx->data_offset + off), (size_t)n, POSIX_FADV_DONTNEED);
+#endif
+                off += (size_t)n;
+            }
             fclose(f); f = NULL;
         }
     }

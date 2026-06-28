@@ -363,6 +363,7 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <fcntl.h>      /* posix_fadvise (drop source page-cache during anon weight load) */
 #include <sys/mman.h>
 
 #if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
@@ -3849,6 +3850,18 @@ static void *tf_numa_pread_worker(void *arg) {
         ssize_t n = pread(t->fd, base + start + off, chunk,
                           (off_t)(t->file_off + start + off));
         if (n <= 0) break;
+#if defined(POSIX_FADV_DONTNEED)
+        /* Explicit HBM2 upload: drop the SOURCE file's page-cache for the range we
+         * just copied into the anon buffer. Without this, preading 24 GB of weights
+         * balloons the page cache to ~24 GB ON TOP of the 24 GB anon dest -> kswapd
+         * must reclaim it -> swap thrash / interactive-session HANG. Default on;
+         * set TF_LOAD_KEEPCACHE=1 to keep pages cached. */
+        {
+            static int keep = -1;
+            if (keep < 0) { const char *e = getenv("TF_LOAD_KEEPCACHE"); keep = (e && atoi(e)) ? 1 : 0; }
+            if (!keep) posix_fadvise(t->fd, (off_t)(t->file_off + start + off), (size_t)n, POSIX_FADV_DONTNEED);
+        }
+#endif
         off += (size_t)n;
     }
     return NULL;
