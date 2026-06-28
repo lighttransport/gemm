@@ -85,8 +85,15 @@ static void barrier_robust(void){
     }
 }
 
-/* transformer_set_tp callback: SUM-reduce a partial across all TP ranks (o-proj/down). */
-static void ar_sum_cb(float *buf, int count, void *ctx){ tp_allreduce_sum((tp_comm*)ctx, buf, count); }
+/* transformer_set_tp callback: SUM-reduce a partial across all TP ranks (o-proj/down).
+ * TP_SKIP_AR=1 makes it a no-op -> WRONG output, but isolates compute-only time so we can
+ * measure the comm fraction (== the ceiling that batched/amortized decode could reach). */
+static int g_skip_ar = -1;
+static void ar_sum_cb(float *buf, int count, void *ctx){
+    if(g_skip_ar<0){ const char*e=getenv("TP_SKIP_AR"); g_skip_ar = (e&&atoi(e))?1:0; }
+    if(g_skip_ar) return;
+    tp_allreduce_sum((tp_comm*)ctx, buf, count);
+}
 
 int main(int argc,char**argv){
     if(argc<3){ fprintf(stderr,"usage: %s <gguf> <blob_dir> [prompt_ids_file] [maxgen]\n",argv[0]); return 1; }
@@ -135,8 +142,11 @@ int main(int argc,char**argv){
     barrier_robust();
 
     /* ---- TP all-reduce comm (its own registered region) ---- */
+    /* batched forward reduces [M,n_embd] at once -> size for the largest batch (cap 32). */
+    int batch_M = getenv("GEMMA4_TP_BATCH") ? atoi(getenv("GEMMA4_TP_BATCH")) : 0;
+    int ar_max = n_embd_g * (batch_M > 1 ? (batch_M < 64 ? batch_M : 64) : 1);
     static tp_comm comm;
-    if(tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, n_embd_g, barrier_robust)!=0) die("tp_comm_init",-1);
+    if(tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, ar_max, barrier_robust)!=0) die("tp_comm_init",-1);
     transformer_set_tp(m, MyRank, N, ar_sum_cb, &comm);
     barrier_robust();
     if(MyRank==0) fprintf(stderr,"[tp] %d ranks up; sharded forward; starting\n",N);
@@ -148,6 +158,33 @@ int main(int argc,char**argv){
     int total=P+maxgen;
     int *gen=(int*)calloc(maxgen,sizeof(int)); int ngen=0;
     long v0=(long)MyRank*V/N, v1=(long)(MyRank+1)*V/N;
+
+    /* ---- batched-throughput mode (comm amortized over M tokens/forward) ---- */
+    if(batch_M > 1){
+        int M = batch_M;
+        int *btok=(int*)malloc((size_t)M*sizeof(int));
+        for(int i=0;i<M;i++) btok[i]=prompt[i%P];
+        /* correctness: batched prefill of the real prompt -> argmax(last) == M=1 first gen */
+        if(!transformer_prefill_gemm(m, prompt, P, 0)){
+            if(MyRank==0) fprintf(stderr,"[tp] BATCH unavailable (prefill_gemm NULL: PLE model?)\n");
+            free(btok); barrier_robust(); return 0;
+        }
+        int chk=0; { float mx=m->logits[0]; for(int i=1;i<V;i++) if(m->logits[i]>mx){mx=m->logits[i];chk=i;} }
+        transformer_prefill_gemm(m, btok, M, 0);      /* warm */
+        barrier_robust();
+        int reps=8; double tb=now_sec();
+        for(int r=0;r<reps;r++) transformer_prefill_gemm(m, btok, M, 0);
+        double el=now_sec()-tb; double tps=el>0?(double)reps*M/el:0;
+        if(MyRank==0){
+            fprintf(stderr,"[tp] N=%d BATCH M=%d: %.2f tok/s (%d forwards x %d tok in %.3fs)  prompt-next-argmax=%d\n",
+                    N,M,tps,reps,M,el,chk);
+            const char*rf=getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_tp_result.txt";
+            FILE*f=fopen(rf,"w");
+            if(f){ fprintf(f,"TPBATCH N=%d M=%d batched_tps=%.4f prompt_next_argmax=%d\n",N,M,tps,chk); fclose(f); }
+            printf("TPBATCH N=%d M=%d batched_tps=%.3f prompt_next_argmax=%d\n",N,M,tps,chk);
+        }
+        free(btok); barrier_robust(); return 0;
+    }
 
     double t0=now_sec(), t_pf=now_sec();
     int next=prompt[0];
