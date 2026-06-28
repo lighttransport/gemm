@@ -1470,7 +1470,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             const int tp_sh=(L->sh_rows<c->moe_inter);
             pt=glm5_prof_now();
             float*rl=m->s_router; glm5_mv(m,rl,&L->gate,h2,c->n_experts,H);
-            for(int e=0;e<c->n_experts;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
+            glm5_sigmoid_row(rl,c->n_experts);   /* FEXPA SVE sigmoid (was scalar expf loop) */
             int selx[64]; float selw[64]; int na=c->n_active>64?64:c->n_active;
             for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f;
                 for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(selx[j]==e){used=1;break;} if(used)continue;
@@ -1561,7 +1561,9 @@ static void glm5_gemm_bf16(float*restrict Y, const uint16_t*W, const float*X, in
     }
     int nb=rows/8, TILE=512; if(TILE>cols)TILE=cols;
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
+    /* parallelize on TOTAL work, not rows: the MoE gate is [256,6144] (rows<GLM5_PAR_MIN) but a
+     * huge GEMM -> the old rows>=512 guard ran it SINGLE-THREADED (~16 Gop/s, ~26% of prefill). */
+    #pragma omp parallel for schedule(static) if((long)nb*(size_t)cols>=GLM5_PAR_MIN)
 #endif
     for(int bi=0;bi<nb;bi++){
         int r=bi*8; const uint16_t*w=W+(size_t)r*cols;
@@ -2262,7 +2264,10 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             /* gate is bf16 (GLM5_BF16); use the type-dispatched GEMM like the single-token path
              * (glm5_mv at the decode router). The old glm5_gemm_f32((float*)gate.w) read the bf16
              * buffer as f32 -> 2x over-read past the tensor + wrong logits. */
+            double t_gate=glm5_prof_now();
             glm5_gemm(m,ms->router,&L->gate,ms->h2,S,c->n_experts,H);
+            { static int gdb=0; if(getenv("GLM5_ROUTER_DBG") && m->ep_rank==0 && gdb<2){ fprintf(stderr,"ROUTER_DBG gate_gemm=%.4f s (S=%d rows=%d cols=%d) then loop...\n",glm5_prof_now()-t_gate,S,c->n_experts,H); gdb++; } }
+            double t_loop=glm5_prof_now();
             #pragma omp parallel for schedule(static) if((long)S*c->n_experts>=GLM5_PAR_MIN)
             for(int t=0;t<S;t++){ float*rl=ms->router+(size_t)t*c->n_experts;
                 /* per-token FEXPA sigmoid + greedy top-k + normalize; independent across tokens,
@@ -2271,6 +2276,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
                 for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
                 float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
+            { static int ldb=0; if(getenv("GLM5_ROUTER_DBG") && m->ep_rank==0 && ldb<2){ fprintf(stderr,"ROUTER_DBG sigmoid+topk loop=%.4f s\n",glm5_prof_now()-t_loop); ldb++; } }
             glm5_prof_add(m,GLM5_P_ROUTER,pt);
             pt=glm5_prof_now();
             for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
