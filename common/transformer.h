@@ -5516,9 +5516,17 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* --- Gemma4 layer --- */
             int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
             int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : n_kv_heads;
-            int local_kv_dim = l_kvh * hd;
-            int local_q_dim  = n_heads * hd;
-            int local_gqa    = n_heads / l_kvh;
+            int local_kv_dim = l_kvh * hd;          /* KV REPLICATED full on every TP rank */
+            int local_gqa    = n_heads / l_kvh;     /* global GQA ratio (heads per KV group) */
+            /* TP: this rank owns Q heads [tp_h0, tp_h0+local_qh); attn_q is ROW-sliced so
+             * m->q/xb2 hold ONLY these heads packed from 0, but kv_h uses the GLOBAL head
+             * index (tp_h0+h) since KV is replicated full. h0=0/local_qh=n_heads when off. */
+            int tp_h0 = 0, local_qh = n_heads;
+            if (m->tp_size > 1) {
+                tp_h0    = m->tp_rank * n_heads / m->tp_size;
+                local_qh = (m->tp_rank + 1) * n_heads / m->tp_size - tp_h0;
+            }
+            int local_q_dim  = local_qh * hd;       /* == layer->attn_q.n_rows when TP-loaded */
             float eps = m->rms_norm_eps;
 
             /* Q/K/V projections: fuse q,k,v into ONE pool dispatch (decode is
@@ -5535,8 +5543,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 }
             }
 
-            /* Q norm (always) */
-            tf_qk_norm(m->q, n_heads, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
+            /* Q norm (always) — over this rank's local Q heads */
+            tf_qk_norm(m->q, local_qh, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
 
             /* K/V norm (only if we projected them) */
             if (layer->shared_kv_source < 0) {
@@ -5567,9 +5575,9 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 int half = hd / 2;
                 float cs[256], sn[256];   /* half = hd/2 <= 256 */
                 for (int j = 0; j < half; j++) { float f = (float)position * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
-                int nrot = n_heads + (layer->shared_kv_source < 0 ? l_kvh : 0);
+                int nrot = local_qh + (layer->shared_kv_source < 0 ? l_kvh : 0);
                 for (int hh = 0; hh < nrot; hh++) {
-                    float *vh = (hh < n_heads) ? (m->q + hh * hd) : (m->k + (hh - n_heads) * hd);
+                    float *vh = (hh < local_qh) ? (m->q + hh * hd) : (m->k + (hh - local_qh) * hd);
 #if defined(__ARM_FEATURE_SVE)
                     for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
                         svfloat32_t r0 = svld1(pg, vh + j), r1 = svld1(pg, vh + j + half);
@@ -5608,10 +5616,10 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
                     /* Compute attention scores over the window */
                     memset(m->xb2, 0, local_q_dim * sizeof(float));
-                    for (int h = 0; h < n_heads; h++) {
+                    for (int h = 0; h < local_qh; h++) {
                         float *qh = m->q + h * hd;
                         float *att_h = m->att + h * seq_len;
-                        int kv_h = h / local_gqa;
+                        int kv_h = (tp_h0 + h) / local_gqa;
 
                         /* Compute QK scores */
                         for (int p = 0; p < seq_len; p++) {
@@ -5645,10 +5653,10 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                     /* Full attention */
                     seq_len = position + 1;
                     memset(m->xb2, 0, local_q_dim * sizeof(float));
-                    for (int h = 0; h < n_heads; h++) {
+                    for (int h = 0; h < local_qh; h++) {
                         float *qh = m->q + h * hd;
                         float *att_h = m->att + h * seq_len;
-                        int kv_h = h / local_gqa;
+                        int kv_h = (tp_h0 + h) / local_gqa;
 
                         for (int p = 0; p < seq_len; p++) {
                             float score = 0.0f;
@@ -5674,8 +5682,12 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 }
             }
 
-            /* Output projection */
+            /* Output projection — TP: attn_output is COL-sliced over this rank's Q heads,
+             * so xb2 holds only local-head outputs and the matvec yields a PARTIAL sum;
+             * allreduce-SUM BEFORE post_attention_norm. */
             tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
+            if (m->tp_size > 1 && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
 
             /* Post-attention norm (before residual) */
             tf_rmsnorm(m->xb, m->xb, &layer->post_attention_norm, n_embd, eps, m->matvec_tmp);
@@ -5686,11 +5698,18 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* --- FFN with GELU --- */
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
 
+            /* TP: gate/up are ROW-sliced (each rank owns ffn rows [r*nff/N,(r+1)*nff/N));
+             * ffn_gate.n_rows is the LOCAL ff width (== n_ff when not TP-loaded). down is
+             * COL-sliced over the SAME ff block -> matvec gives a PARTIAL sum that must be
+             * allreduce-SUM'd BEFORE post_ffw_norm (norm-of-partial != norm-of-sum). */
+            int local_ff = layer->ffn_gate.n_rows;
             tf_qmatvec_fused2_pool(m, m->ffn_buf1, &layer->ffn_gate,
-                                    m->ffn_buf2, &layer->ffn_up, m->xb, m->n_ff);
-            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff, m->ffn_gelu_fast);
+                                    m->ffn_buf2, &layer->ffn_up, m->xb, local_ff);
+            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, local_ff, m->ffn_gelu_fast);
 
             tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
+            if (m->tp_size > 1 && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);   /* partial -> full */
 
             /* Post-FFN norm (before residual) */
             tf_rmsnorm(m->xb, m->xb, &layer->post_ffw_norm, n_embd, eps, m->matvec_tmp);
