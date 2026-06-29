@@ -102,6 +102,8 @@ static void ar_sum_cb(float *buf, int count, void *ctx){
 }
 /* MTP head-shard: all-reduce-argmax the per-rank vocab-slice (val,idx) -> global draft token. */
 static void mtp_arx_cb(float *val, int32_t *idx, void *ctx){ tp_allreduce_argmax((tp_comm*)ctx, val, idx); }
+/* MTP FFN block-shard: all-reduce-SUM the per-rank down-proj partial -> full. */
+static void mtp_sum_cb(float *buf, int count, void *ctx){ tp_allreduce_sum((tp_comm*)ctx, buf, count); }
 
 int main(int argc,char**argv){
     if(argc<3){ fprintf(stderr,"usage: %s <gguf> <blob_dir> [prompt_ids_file] [maxgen]\n",argv[0]); return 1; }
@@ -190,6 +192,7 @@ int main(int argc,char**argv){
          * (the head is ~65% of the replicated draft cost). GEMMA4_MTP_NOSHARD=1 = A/B off. */
         int mtp_shard = (N>1) && !(getenv("GEMMA4_MTP_NOSHARD")&&atoi(getenv("GEMMA4_MTP_NOSHARD")));
         int hsh_v0 = mtp_shard ? (int)v0 : -1, hsh_v1 = (int)v1;
+        int ffn_f0 = mtp_shard ? (int)((long)MyRank*MM.FF/N) : -1, ffn_f1 = (int)((long)(MyRank+1)*MM.FF/N);
         if(MyRank==0) fprintf(stderr,"[tp] spec: MTP head-shard=%d (v0=%ld v1=%ld)\n",mtp_shard,v0,v1);
         float *all=(float*)malloc((size_t)(Kd+1)*V*sizeof(float));
         int *seq=(int*)malloc(sizeof(int)*(P+maxgen+Kd+8));
@@ -210,19 +213,23 @@ int main(int argc,char**argv){
         tf_pool_shutdown(m);
 
         int gen=0, rounds=0, fwd=0, accepted=0, mtp_tries=0, mtp_hit=0;
-        barrier_robust(); double t0=now_sec();
+        barrier_robust(); double t0=now_sec(); double t_draft=0, t_verify=0;
         while(gen<maxgen){
             int draft[8]; float hh[3840]; memcpy(hh,thid,sizeof hh);
             int prev=seq[pos];
+            double td0=now_sec();
             for(int j=0;j<Kd;j++){ float hn[3840];
-                int dt=mtp_step(m,&MM,hh,prev,pos+j,pos,embd_scale,hn, hsh_v0,hsh_v1,mtp_arx_cb,&comm);
+                int dt=mtp_step(m,&MM,hh,prev,pos+j,pos,embd_scale,hn, hsh_v0,hsh_v1,mtp_arx_cb,&comm, ffn_f0,ffn_f1,mtp_sum_cb);
                 draft[j]=dt; prev=dt; memcpy(hh,hn,sizeof hh); }
+            t_draft+=now_sec()-td0;
             int32_t batch[16]; int NB=Kd+1; batch[0]=seq[pos];
             for(int j=0;j<Kd;j++) batch[1+j]=draft[j];
+            double tv0=now_sec();
             tf_batch_all_logits=all; tf_batch_hidden_out=&hid;
             if(mtp_shard){ tf_batch_logit_v0=(int)v0; tf_batch_logit_v1=(int)v1; }
             transformer_prefill_gemm(m, batch, NB, pos);
             tf_batch_all_logits=NULL; tf_batch_logit_v0=-1; fwd++;
+            t_verify+=now_sec()-tv0;
             int gg[16];
             if(mtp_shard){   /* verify lm_head vocab-sliced: per-position local argmax + reduce */
                 int sl=(int)(v1-v0);
@@ -245,6 +252,8 @@ int main(int argc,char**argv){
             double tps=dt>0?gen/dt:0, alpha=mtp_tries?(double)mtp_hit/mtp_tries:0, tpf=fwd?(double)gen/fwd:0;
             fprintf(stderr,"[tp] N=%d SPEC K=%d: %d tok in %.3fs = %.2f tok/s; alpha=%.1f%% (%d/%d) tok/fwd=%.2f (%d fwd, %d rounds)\n",
                     N,Kd,gen,dt,tps,100*alpha,mtp_hit,mtp_tries,tpf,fwd,rounds);
+            fprintf(stderr,"[tp]   draft %.3fs (%.1f%%, %.2f ms/round)  verify %.3fs (%.1f%%, %.2f ms/round)\n",
+                    t_draft,100*t_draft/dt,1000*t_draft/rounds, t_verify,100*t_verify/dt,1000*t_verify/rounds);
             printf("TPSPEC N=%d K=%d tok_s=%.3f alpha=%.4f tok_fwd=%.3f gen=%d first=%d\n",
                    N,Kd,tps,alpha,tpf,gen,seq[P]);
             const char*rf=getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_tp_result.txt";

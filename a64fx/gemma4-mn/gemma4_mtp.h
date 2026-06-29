@@ -98,6 +98,26 @@ static void mtp_mv_range(float*out,const mtp_w*W,const float*x,int r0,int r1){
 static void mtp_mv(float*out,const mtp_w*W,const float*x,int out_dim,int in_dim){
     (void)out_dim; (void)in_dim; mtp_mv_range(out,W,x,0,W->nr);
 }
+/* COL-slice fused bf16 dot: out[o]=dot(W[o, c0:c1], x[0:c1-c0]) for all rows o (partial
+ * sum over the column block; caller all-reduce-SUMs across ranks). x is the local slice. */
+static void mtp_mv_cols(float*out,const mtp_w*W,const float*x,int c0,int c1){
+    int OD=W->nr, NC=W->nc, L=c1-c0;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<OD;o++){ const uint16_t*w=W->w+(size_t)o*NC+c0;
+#if defined(__ARM_FEATURE_SVE)
+        svbool_t pt=svptrue_b32(),pth=svptrue_b16(); svuint16_t zero=svdup_u16(0);
+        int vlh=(int)svcnth(),vl=(int)svcntw(); svfloat32_t a=svdup_f32(0); int i=0;
+        for(;i+vlh<=L;i+=vlh){ svuint16_t raw=svld1_u16(pth,w+i);
+            a=svmla_f32_x(pt,a,svreinterpret_f32_u16(svzip1_u16(zero,raw)),svld1_f32(pt,x+i));
+            a=svmla_f32_x(pt,a,svreinterpret_f32_u16(svzip2_u16(zero,raw)),svld1_f32(pt,x+i+vl)); }
+        float s=svaddv_f32(pt,a);
+        for(;i<L;i++){ uint32_t u=(uint32_t)w[i]<<16; float f; memcpy(&f,&u,4); s+=f*x[i]; }
+        out[o]=s;
+#else
+        float s=0; for(int i=0;i<L;i++){ uint32_t u=(uint32_t)w[i]<<16; float f; memcpy(&f,&u,4); s+=f*x[i]; } out[o]=s;
+#endif
+    }
+}
 static void mtp_rms(float*o,const float*x,const float*w,int n,float eps){
     float ss=0; for(int i=0;i<n;i++) ss+=x[i]*x[i]; ss=1.0f/sqrtf(ss/n+eps);
     for(int i=0;i<n;i++) o[i]=x[i]*ss*w[i];
@@ -115,7 +135,8 @@ static inline float mtp_gelu(float x){ return 0.5f*x*(1.0f+tanhf(0.7978845608f*(
  * so cur/xb/h_next stay identical on all ranks). hv0<0 => full-vocab argmax (single rank). */
 static int mtp_step(transformer_model*m, mtp_model*M, const float*hidden, int prev_tok,
                     int qpos, int kv_len, float embd_scale, float*h_next_out,
-                    int hv0, int hv1, void(*arx)(float*,int32_t*,void*), void*arx_ctx){
+                    int hv0, int hv1, void(*arx)(float*,int32_t*,void*), void*arx_ctx,
+                    int fv0, int fv1, void(*sumx)(float*,int,void*)){
     int D=M->D, NE=m->n_embd, NH=M->NH, FF=M->FF;
     static float *xh=NULL,*cur=NULL,*xb=NULL,*q=NULL,*att=NULL,*ao=NULL,*g1=NULL,*g2=NULL,*g3=NULL,*emb=NULL,*lg=NULL;
     if(!xh){ xh=malloc(2*NE*4); cur=malloc(D*4); xb=malloc(D*4); q=malloc(8192*4); att=malloc((size_t)262144*4);
@@ -153,9 +174,17 @@ static int mtp_step(transformer_model*m, mtp_model*M, const float*hidden, int pr
         mtp_rms(xb,xb,b->post_attn_norm,D,1e-6f);
         for(int i=0;i<D;i++) cur[i]+=xb[i];
         mtp_rms(xb,cur,b->ffn_norm,D,1e-6f);
-        mtp_mv(g1,&b->ffn_gate,xb,FF,D); mtp_mv(g2,&b->ffn_up,xb,FF,D);
-        for(int i=0;i<FF;i++) g3[i]=mtp_gelu(g1[i])*g2[i];
-        mtp_mv(xb,&b->ffn_down,g3,D,FF);
+        if(fv0>=0 && sumx){            /* TP: gate/up ROW-slice [fv0,fv1), down COL-slice -> SUM */
+            int lf=fv1-fv0;
+            mtp_mv_range(g1,&b->ffn_gate,xb,fv0,fv1); mtp_mv_range(g2,&b->ffn_up,xb,fv0,fv1);
+            for(int i=0;i<lf;i++) g3[i]=mtp_gelu(g1[i])*g2[i];
+            mtp_mv_cols(xb,&b->ffn_down,g3,fv0,fv1);   /* partial [D] */
+            sumx(xb,D,arx_ctx);                        /* all-reduce-SUM -> full */
+        } else {
+            mtp_mv(g1,&b->ffn_gate,xb,FF,D); mtp_mv(g2,&b->ffn_up,xb,FF,D);
+            for(int i=0;i<FF;i++) g3[i]=mtp_gelu(g1[i])*g2[i];
+            mtp_mv(xb,&b->ffn_down,g3,D,FF);
+        }
         mtp_rms(xb,xb,b->post_ffw_norm,D,1e-6f);
         float os=b->out_scale[0];
         for(int i=0;i<D;i++) cur[i]=(cur[i]+xb[i])*os;
