@@ -99,6 +99,8 @@ static void ar_sum_cb(float *buf, int count, void *ctx){
     if(g_skip_ar) return;
     tp_allreduce_sum((tp_comm*)ctx, buf, count);
 }
+/* MTP head-shard: all-reduce-argmax the per-rank vocab-slice (val,idx) -> global draft token. */
+static void mtp_arx_cb(float *val, int32_t *idx, void *ctx){ tp_allreduce_argmax((tp_comm*)ctx, val, idx); }
 
 int main(int argc,char**argv){
     if(argc<3){ fprintf(stderr,"usage: %s <gguf> <blob_dir> [prompt_ids_file] [maxgen]\n",argv[0]); return 1; }
@@ -183,6 +185,11 @@ int main(int argc,char**argv){
         float embd_scale = sqrtf((float)n_embd_g);
         tf_batch_keep_pool=1; tf_batch_quiet=1;
         int Kd=spec_K;
+        /* head-shard the MTP draft: each rank computes its vocab slice [v0,v1) + reduce-argmax
+         * (the head is ~65% of the replicated draft cost). GEMMA4_MTP_NOSHARD=1 = A/B off. */
+        int mtp_shard = (N>1) && !(getenv("GEMMA4_MTP_NOSHARD")&&atoi(getenv("GEMMA4_MTP_NOSHARD")));
+        int hsh_v0 = mtp_shard ? (int)v0 : -1, hsh_v1 = (int)v1;
+        if(MyRank==0) fprintf(stderr,"[tp] spec: MTP head-shard=%d (v0=%ld v1=%ld)\n",mtp_shard,v0,v1);
         float *all=(float*)malloc((size_t)(Kd+1)*V*sizeof(float));
         int *seq=(int*)malloc(sizeof(int)*(P+maxgen+Kd+8));
         for(int i=0;i<P;i++) seq[i]=prompt[i];
@@ -207,7 +214,7 @@ int main(int argc,char**argv){
             int draft[8]; float hh[3840]; memcpy(hh,thid,sizeof hh);
             int prev=seq[pos];
             for(int j=0;j<Kd;j++){ float hn[3840];
-                int dt=mtp_step(m,&MM,hh,prev,pos+j,pos,embd_scale,hn);
+                int dt=mtp_step(m,&MM,hh,prev,pos+j,pos,embd_scale,hn, hsh_v0,hsh_v1,mtp_arx_cb,&comm);
                 draft[j]=dt; prev=dt; memcpy(hh,hn,sizeof hh); }
             int32_t batch[16]; int NB=Kd+1; batch[0]=seq[pos];
             for(int j=0;j<Kd;j++) batch[1+j]=draft[j];

@@ -95,10 +95,36 @@ static void mtp_rms_head(float*v,int nh,int hd,const float*w,float eps){
 }
 static inline float mtp_gelu(float x){ return 0.5f*x*(1.0f+tanhf(0.7978845608f*(x+0.044715f*x*x*x))); }
 
+/* generic dequant matvec over a ROW RANGE [r0,r1): out[k]=dot(dequant(W row r0+k), x). */
+static void mtp_mv_rows(float*out,const qtensor*W,const float*x,int r0,int r1){
+    int ID=W->n_cols;
+    #pragma omp parallel
+    {
+        float *row=(float*)malloc((size_t)ID*sizeof(float));
+        #pragma omp for schedule(static)
+        for(int o=r0;o<r1;o++){
+            tf_dequant_row(W,o,row); float s=0;
+#if defined(__ARM_FEATURE_SVE)
+            svbool_t pt=svptrue_b32(); svfloat32_t a=svdup_f32(0); int i=0,vl=(int)svcntw();
+            for(;i+vl<=ID;i+=vl) a=svmla_f32_x(pt,a,svld1_f32(pt,row+i),svld1_f32(pt,x+i));
+            s=svaddv_f32(pt,a); for(;i<ID;i++) s+=row[i]*x[i];
+#else
+            for(int i=0;i<ID;i++) s+=row[i]*x[i];
+#endif
+            out[o-r0]=s;
+        }
+        free(row);
+    }
+}
+
 /* one MTP draft step: fuse (embd(prev_tok), target hidden) -> 4 blocks reading target KV
- * -> draft token; writes h_next_out[n_embd] (post_proj output) for the next step. */
+ * -> draft token; writes h_next_out[n_embd] (post_proj output) for the next step.
+ * TP head-shard: hv0>=0 => compute only vocab rows [hv0,hv1) of the tied head, local
+ * argmax, then arx(val,idx,ctx) all-reduce-argmax for the GLOBAL token (blocks replicated,
+ * so cur/xb/h_next stay identical on all ranks). hv0<0 => full-vocab argmax (single rank). */
 static int mtp_step(transformer_model*m, mtp_model*M, const float*hidden, int prev_tok,
-                    int qpos, int kv_len, float embd_scale, float*h_next_out){
+                    int qpos, int kv_len, float embd_scale, float*h_next_out,
+                    int hv0, int hv1, void(*arx)(float*,int32_t*,void*), void*arx_ctx){
     int D=M->D, NE=m->n_embd, NH=M->NH, FF=M->FF;
     static float *xh=NULL,*cur=NULL,*xb=NULL,*q=NULL,*att=NULL,*ao=NULL,*g1=NULL,*g2=NULL,*g3=NULL,*emb=NULL,*lg=NULL;
     if(!xh){ xh=malloc(2*NE*4); cur=malloc(D*4); xb=malloc(D*4); q=malloc(8192*4); att=malloc((size_t)262144*4);
@@ -144,8 +170,16 @@ static int mtp_step(transformer_model*m, mtp_model*M, const float*hidden, int pr
         for(int i=0;i<D;i++) cur[i]=(cur[i]+xb[i])*os;
     }
     mtp_rms(xb,cur,M->out_norm,D,1e-6f);
-    mtp_mv(lg,&M->tok_embd,xb,M->V,D);
-    int tok=mtp_argmax(lg,M->V);
+    int tok;
+    if(hv0>=0 && arx){                            /* vocab-sharded head + all-reduce argmax */
+        mtp_mv_rows(lg,&M->tok_embd,xb,hv0,hv1);
+        float mv=lg[0]; int32_t gi=hv0;
+        for(int i=1;i<hv1-hv0;i++) if(lg[i]>mv){mv=lg[i];gi=(int32_t)(hv0+i);}
+        arx(&mv,&gi,arx_ctx); tok=(int)gi;
+    } else {
+        mtp_mv(lg,&M->tok_embd,xb,M->V,D);
+        tok=mtp_argmax(lg,M->V);
+    }
     mtp_mv(h_next_out,&M->post_proj,xb,NE,D);     /* PNORM: recurse in post-norm space */
     return tok;
 }
