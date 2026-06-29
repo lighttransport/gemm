@@ -25,8 +25,13 @@
 #define GGUF_LOADER_IMPLEMENTATION
 #include "transformer.h"
 #include "gemma4_tp_load.h"
+#include "gemma4_mtp.h"
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
+
+/* batched-prefill hooks exported by transformer.h (the verify path) */
+extern float *tf_batch_all_logits; extern float **tf_batch_hidden_out;
+extern int tf_batch_keep_pool, tf_batch_quiet;
 
 #define MAX_NODES 128
 #define RUN_STAG  DEMO_STAG
@@ -142,9 +147,14 @@ int main(int argc,char**argv){
     barrier_robust();
 
     /* ---- TP all-reduce comm (its own registered region) ---- */
-    /* batched forward reduces [M,n_embd] at once -> size for the largest batch (cap 32). */
+    /* batched/verify forward reduces [M,n_embd] at once -> size for the largest batch. */
     int batch_M = getenv("GEMMA4_TP_BATCH") ? atoi(getenv("GEMMA4_TP_BATCH")) : 0;
-    int ar_max = n_embd_g * (batch_M > 1 ? (batch_M < 64 ? batch_M : 64) : 1);
+    const char *mtp_path = getenv("GEMMA4_TP_MTP");
+    int spec_K = getenv("GEMMA4_TP_SPEC_K") ? atoi(getenv("GEMMA4_TP_SPEC_K")) : 4;
+    if(spec_K > MTP_NL) spec_K = MTP_NL; if(spec_K < 1) spec_K = 1;
+    int ar_batch = batch_M > 1 ? (batch_M < 64 ? batch_M : 64) : 1;
+    if(mtp_path && ar_batch < 128) ar_batch = 128;   /* spec: prompt-prefill chunk + verify */
+    int ar_max = n_embd_g * ar_batch;
     static tp_comm comm;
     if(tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, ar_max, barrier_robust)!=0) die("tp_comm_init",-1);
     transformer_set_tp(m, MyRank, N, ar_sum_cb, &comm);
@@ -158,6 +168,74 @@ int main(int argc,char**argv){
     int total=P+maxgen;
     int *gen=(int*)calloc(maxgen,sizeof(int)); int ngen=0;
     long v0=(long)MyRank*V/N, v1=(long)(MyRank+1)*V/N;
+
+    /* ---- speculative decode: MTP draft + batched-TP verify ----
+     * Every rank replicates the MTP weights and reads its replicated target KV, so the
+     * draft is identical on all ranks (NO comm). The verify is the batched TP forward
+     * (sharded + internal allreduce); its all_logits are full (token_embd replicated) so
+     * argmax/accept are identical on all ranks -> seq[] stays lockstep without extra comm. */
+    if(mtp_path){
+        static mtp_model MM;
+        if(!mtp_load(&MM, mtp_path, m->n_layers, n_embd_g)){
+            if(MyRank==0) fprintf(stderr,"[tp] MTP load failed: %s\n", mtp_path);
+            barrier_robust(); return 1;
+        }
+        float embd_scale = sqrtf((float)n_embd_g);
+        tf_batch_keep_pool=1; tf_batch_quiet=1;
+        int Kd=spec_K;
+        float *all=(float*)malloc((size_t)(Kd+1)*V*sizeof(float));
+        int *seq=(int*)malloc(sizeof(int)*(P+maxgen+Kd+8));
+        for(int i=0;i<P;i++) seq[i]=prompt[i];
+        /* prefill prompt (chunked <=128 so the verify-sized allreduce covers it) */
+        float *hid=NULL; tf_batch_hidden_out=&hid;
+        for(int s=0;s<P;s+=128){ int c=P-s; if(c>128) c=128;
+            int32_t cb[128]; for(int i=0;i<c;i++) cb[i]=prompt[s+i];
+            if(!transformer_prefill_gemm(m, cb, c, s)){
+                if(MyRank==0) fprintf(stderr,"[tp] spec: prefill_gemm NULL (PLE?)\n");
+                barrier_robust(); return 1; } }
+        int pos=P; { float mx=m->logits[0]; int a=0; for(int i=1;i<V;i++) if(m->logits[i]>mx){mx=m->logits[i];a=i;} seq[pos]=a; }
+        float thid[3840];
+        tf_rmsnorm(thid, hid+(size_t)(P-1)*n_embd_g, &m->output_norm, n_embd_g, m->rms_norm_eps, m->matvec_tmp);
+        /* The MTP draft + the verify GEMMs are OpenMP; the transformer pthread pool
+         * busy-SPINS when idle and would starve those OMP threads -> shut it for the
+         * whole spec phase (keep_pool=1 + all_logits => verify stays OMP, no pool need). */
+        tf_pool_shutdown(m);
+
+        int gen=0, rounds=0, fwd=0, accepted=0, mtp_tries=0, mtp_hit=0;
+        barrier_robust(); double t0=now_sec();
+        while(gen<maxgen){
+            int draft[8]; float hh[3840]; memcpy(hh,thid,sizeof hh);
+            int prev=seq[pos];
+            for(int j=0;j<Kd;j++){ float hn[3840];
+                int dt=mtp_step(m,&MM,hh,prev,pos+j,pos,embd_scale,hn);
+                draft[j]=dt; prev=dt; memcpy(hh,hn,sizeof hh); }
+            int32_t batch[16]; int NB=Kd+1; batch[0]=seq[pos];
+            for(int j=0;j<Kd;j++) batch[1+j]=draft[j];
+            tf_batch_all_logits=all; tf_batch_hidden_out=&hid;
+            transformer_prefill_gemm(m, batch, NB, pos); tf_batch_all_logits=NULL; fwd++;
+            int gg[16]; for(int j=0;j<NB;j++){ float*lp=all+(size_t)j*V; float mx=lp[0]; int a=0;
+                for(int i=1;i<V;i++) if(lp[i]>mx){mx=lp[i];a=i;} gg[j]=a; }
+            int a=0; while(a<Kd && draft[a]==gg[a]) a++;
+            for(int j=0;j<Kd;j++){ mtp_tries++; if(j<a) mtp_hit++; }
+            for(int j=0;j<a;j++) seq[pos+1+j]=draft[j];
+            seq[pos+1+a]=gg[a];
+            tf_rmsnorm(thid, hid+(size_t)a*n_embd_g, &m->output_norm, n_embd_g, m->rms_norm_eps, m->matvec_tmp);
+            gen+=1+a; accepted+=a; rounds++; pos+=1+a;
+        }
+        double dt=now_sec()-t0;
+        if(MyRank==0){
+            double tps=dt>0?gen/dt:0, alpha=mtp_tries?(double)mtp_hit/mtp_tries:0, tpf=fwd?(double)gen/fwd:0;
+            fprintf(stderr,"[tp] N=%d SPEC K=%d: %d tok in %.3fs = %.2f tok/s; alpha=%.1f%% (%d/%d) tok/fwd=%.2f (%d fwd, %d rounds)\n",
+                    N,Kd,gen,dt,tps,100*alpha,mtp_hit,mtp_tries,tpf,fwd,rounds);
+            printf("TPSPEC N=%d K=%d tok_s=%.3f alpha=%.4f tok_fwd=%.3f gen=%d first=%d\n",
+                   N,Kd,tps,alpha,tpf,gen,seq[P]);
+            const char*rf=getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_tp_result.txt";
+            FILE*f=fopen(rf,"w");
+            if(f){ fprintf(f,"TPSPEC N=%d K=%d tok_s=%.4f alpha=%.4f tok_fwd=%.4f gen=%d tokens:",N,Kd,tps,alpha,tpf,gen);
+                   for(int i=0;i<gen && i<64;i++) fprintf(f," %d",seq[P+i]); fprintf(f,"\n"); fclose(f); }
+        }
+        free(all); free(seq); barrier_robust(); return 0;
+    }
 
     /* ---- batched-throughput mode (comm amortized over M tokens/forward) ---- */
     if(batch_M > 1){
