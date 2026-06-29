@@ -8618,6 +8618,11 @@ float *tf_batch_all_logits = NULL;
  * sleep) and silence the per-call profile. */
 int tf_batch_keep_pool = 0;
 int tf_batch_quiet = 0;
+/* TP verify: vocab-slice the all_logits lm_head to rows [v0,v1) of m->output (the lm_head
+ * is token_embd, REPLICATED full -> recomputing the whole 262144 vocab on every rank is the
+ * verify's biggest redundant read). Each rank fills all_logits[N x (v1-v0)]; the caller does
+ * per-position local argmax (offset v0) + all-reduce-argmax. v0<0 = full vocab (default). */
+int tf_batch_logit_v0 = -1, tf_batch_logit_v1 = -1;
 /* If set, prefill_batch points this at the [N x n_embd] post-block hidden states (the
  * pre-output-norm residual stream) so an MTP/draft head can fuse them. */
 float **tf_batch_hidden_out = NULL;
@@ -8853,13 +8858,24 @@ static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *token
     if (tf_batch_hidden_out) *tf_batch_hidden_out = bx;   /* [N x n_embd] residual stream */
     if (tf_batch_all_logits) {
         /* All-N logits for batched-decode verify: rmsnorm all N hidden states then one
-         * batched lm_head GEMM (output weight read ONCE for N tokens). */
+         * batched lm_head GEMM (output weight read ONCE for N tokens). TP: optionally
+         * vocab-slice [v0,v1) of m->output (each rank computes V/N rows -> the caller
+         * reduce-argmaxes; argmax is softcap-invariant so the slice skips softcap). */
         tf_rmsnorm_batch(bxb, bx, &m->output_norm, n_embd, N, m->rms_norm_eps, m->matvec_tmp);
-        tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &m->output, bxb, m->n_vocab, N,
-                                  m->n_vocab, n_embd, m->n_threads);
-        if (m->final_logit_softcapping > 0.0f)
-            for (int t = 0; t < N; t++)
-                tf_logit_softcap(tf_batch_all_logits + (size_t)t * m->n_vocab, m->n_vocab, m->final_logit_softcapping);
+        int lv0 = tf_batch_logit_v0, lv1 = tf_batch_logit_v1;
+        if (lv0 >= 0 && lv1 > lv0 && lv1 <= m->n_vocab) {
+            qtensor osl = m->output;
+            osl.data = (void *)((uint8_t *)m->output.data + (size_t)lv0 * tf_row_bytes(m->output.type, m->output.n_cols));
+            osl.n_rows = lv1 - lv0;
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &osl, bxb, lv1 - lv0, N,
+                                      lv1 - lv0, n_embd, m->n_threads);
+        } else {
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &m->output, bxb, m->n_vocab, N,
+                                      m->n_vocab, n_embd, m->n_threads);
+            if (m->final_logit_softcapping > 0.0f)
+                for (int t = 0; t < N; t++)
+                    tf_logit_softcap(tf_batch_all_logits + (size_t)t * m->n_vocab, m->n_vocab, m->final_logit_softcapping);
+        }
     }
     if (tf_batch_all_logits) {
         /* last-token logits already in all_logits[(N-1)*vocab]; copy into m->logits and

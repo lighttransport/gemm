@@ -32,6 +32,7 @@
 /* batched-prefill hooks exported by transformer.h (the verify path) */
 extern float *tf_batch_all_logits; extern float **tf_batch_hidden_out;
 extern int tf_batch_keep_pool, tf_batch_quiet;
+extern int tf_batch_logit_v0, tf_batch_logit_v1;   /* TP verify lm_head vocab-slice */
 
 #define MAX_NODES 128
 #define RUN_STAG  DEMO_STAG
@@ -219,9 +220,19 @@ int main(int argc,char**argv){
             int32_t batch[16]; int NB=Kd+1; batch[0]=seq[pos];
             for(int j=0;j<Kd;j++) batch[1+j]=draft[j];
             tf_batch_all_logits=all; tf_batch_hidden_out=&hid;
-            transformer_prefill_gemm(m, batch, NB, pos); tf_batch_all_logits=NULL; fwd++;
-            int gg[16]; for(int j=0;j<NB;j++){ float*lp=all+(size_t)j*V; float mx=lp[0]; int a=0;
-                for(int i=1;i<V;i++) if(lp[i]>mx){mx=lp[i];a=i;} gg[j]=a; }
+            if(mtp_shard){ tf_batch_logit_v0=(int)v0; tf_batch_logit_v1=(int)v1; }
+            transformer_prefill_gemm(m, batch, NB, pos);
+            tf_batch_all_logits=NULL; tf_batch_logit_v0=-1; fwd++;
+            int gg[16];
+            if(mtp_shard){   /* verify lm_head vocab-sliced: per-position local argmax + reduce */
+                int sl=(int)(v1-v0);
+                for(int j=0;j<NB;j++){ float*lp=all+(size_t)j*sl; float mx=lp[0]; int32_t a=(int32_t)v0;
+                    for(int i=1;i<sl;i++) if(lp[i]>mx){mx=lp[i];a=(int32_t)(v0+i);}
+                    tp_allreduce_argmax(&comm,&mx,&a); gg[j]=(int)a; }
+            } else {
+                for(int j=0;j<NB;j++){ float*lp=all+(size_t)j*V; float mx=lp[0]; int a=0;
+                    for(int i=1;i<V;i++) if(lp[i]>mx){mx=lp[i];a=i;} gg[j]=a; }
+            }
             int a=0; while(a<Kd && draft[a]==gg[a]) a++;
             for(int j=0;j<Kd;j++){ mtp_tries++; if(j<a) mtp_hit++; }
             for(int j=0;j<a;j++) seq[pos+1+j]=draft[j];
