@@ -58,6 +58,32 @@ sweep leaves most of the headroom on the table, and the gap to the measured **~5
 adds. Three points now bracket the int8 GEMM efficiency curve on qlair's verified 512-peak model:
 **8.8%** (naive tile sweep) -> **39.4%** (kernel-intrinsic, cache-hot) -> **~55%** (measured, tuned).
 
+## FP16 and BF16 GEMM — the other two FP peaks, verified
+Ran the fp16 and bf16 GEMM kernels too, to check qlair auto-selects the right FP peak per
+precision (the profiler picks 256 GFLOPS when fp16 FMAs dominate, 128 when fp32 does). Note
+**A64FX has no native bf16 matmul** (no BFMMLA/BFDOT in ARMv8.2+SVE) -> bf16 GEMM widens
+bf16->fp32 and runs `fmla .s` at the **fp32 (128)** rate; the `sgemm_bf16_2x12` kernel does this
+with a zero-conversion `p_odd` load trick. fp16 uses native `fmla .h` (`micro_kernel_6x4_f16_sve`,
+256 peak).
+
+| precision | kernel | qlair peak | cache-hot loop (intrinsic) | multi-tile sweep |
+|---|---|---|---|---|
+| **int8 SDOT** | `kernel_6x4` (6x64) | 512 GIOPS | **201.9 (39.4%)** IPC 2.22 | 44.8 (8.8%) |
+| **fp16 fmla.h** | `micro_kernel_6x4_f16_sve` | 256 GFLOPS | **121.7 (47.5%)** IPC 2.07 | 20.1 (7.8%) |
+| **bf16->fp32 fmla.s** | `sgemm_bf16_2x12` (32x12) | 128 GFLOPS | **93.0 (72.6%)** IPC 2.86 | 21.0 (16.4%) |
+
+- **Peak model is correct for all precisions**: each kernel's cache-hot GFLOPS lands at a sane
+  fraction of *its own* precision peak (qlair selected 256 for fp16, 128 for bf16/fp32, 512 for
+  int8 — automatically, from the FMA/SDOT mix). The fix that added the int8 512-GIOPS path and
+  kept FP64 64 / FP32 128 / FP16 256 is now exercised across the whole table.
+- **The tuned bf16 kernel is the standout** (72.6% of 128, IPC 2.86): the 32x12 `p_odd` kernel is
+  a production-optimized GEMM, vs the simpler int8/fp16 6x4 microkernels (39-48%). Same pattern as
+  the real chip — efficiency tracks kernel optimization level, not the ISA peak.
+- **Multi-tile sweeps** are all overhead/dependency-bound (7.8-16.4%), cache-resident (L2>=99.9%,
+  HBM idle), same story as the int8 sweep: per-tile prologue/epilogue + L1 streaming dominate the
+  naive microkernel-per-tile loop; the gap to the cache-hot ceiling is the blocking/pipelining a
+  tuned GEMM adds.
+
 ## What qlair CANNOT reproduce (and why) — the comm-bound number
 - The measured decode/prefill **tok/s is multi-node, uTofu-all-reduce-bound** (the sim's dominant
   term: 153 AR/token at ~26 ms). qlair is **single-node with no network/uTofu model**, so it cannot
