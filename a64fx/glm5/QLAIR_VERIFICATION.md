@@ -40,6 +40,24 @@ INT8 GIOPS: 201.9 (39.4% of 512 peak)   IPC 2.22
 optimized 2048^2 GEMM; qlair's 39.4% for this smaller microkernel is the right ballpark -> the
 512-peak fix is correct and qlair reproduces realistic int8 compute efficiency.
 
+### Larger multi-tile GEMM (a real tile sweep, not one cached tile)
+The loop above re-runs **one** 6x64 tile, so A/B stay L1-resident — it measures the kernel's
+*intrinsic* ceiling. To see realistic GEMM behaviour, ran a genuine sweep of **2048 distinct
+tiles** (M=384, N=2048, K=256 -> 64x32 tiles, **3,145,728 SDOT**; A=96 KB, B=512 KB, C=3 MB):
+```
+INT8 GIOPS: 44.8 (8.8% of 512 peak, 3,145,728 SDOT)   IPC 1.74
+Total Cycles: 17,971,568   L1 92.7%  L2 99.9%  HBM2 0.42 GB/s
+0.175 SDOT/cycle/core  (vs 0.79 in the single-cached-tile loop)
+```
+Fully cache-resident (3.6 MB < 8 MB L2, HBM2 idle at 0.2% of peak) -> **not** memory-bound; the
+4.5x drop from the idealized 39.4% is **per-tile prologue/epilogue** (each call re-zeros 24 int32
+accumulators then stores them, amortized over only 1536 SDOT) plus **L1 streaming of B** (512 KB
+sweep spills the 64 KB L1, 92.7% hit). This is the realistic picture: the naive microkernel-per-tile
+sweep leaves most of the headroom on the table, and the gap to the measured **~55%** optimized
+2048^2 GEMM is exactly the blocking / accumulator-reuse / software-pipelining that a tuned GEMM
+adds. Three points now bracket the int8 GEMM efficiency curve on qlair's verified 512-peak model:
+**8.8%** (naive tile sweep) -> **39.4%** (kernel-intrinsic, cache-hot) -> **~55%** (measured, tuned).
+
 ## What qlair CANNOT reproduce (and why) — the comm-bound number
 - The measured decode/prefill **tok/s is multi-node, uTofu-all-reduce-bound** (the sim's dominant
   term: 153 AR/token at ~26 ms). qlair is **single-node with no network/uTofu model**, so it cannot
