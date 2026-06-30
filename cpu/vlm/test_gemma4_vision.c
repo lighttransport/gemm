@@ -433,7 +433,7 @@ int main(int argc, char **argv) {
 
     /* 2. Load vision encoder */
     fprintf(stderr, "Loading mmproj: %s\n", mmproj_path);
-    gguf_context *gguf_mm = gguf_open(mmproj_path, 1);
+    gguf_context *gguf_mm = g4v_open_mmproj(mmproj_path);  /* eager anon RAM: NUMA-local + fully populated */
     if (!gguf_mm) { fprintf(stderr, "failed to open mmproj GGUF\n"); return 1; }
 
     g4v_model *vision = g4v_load(gguf_mm);

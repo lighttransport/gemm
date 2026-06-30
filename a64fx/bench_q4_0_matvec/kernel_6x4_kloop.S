@@ -17,8 +17,8 @@
     .text
     .align 6
 
-    .global kernel_6x4_opt_256
-    .type kernel_6x4_opt_256, @function
+    .global kernel_6x4_kloop_256
+    .type kernel_6x4_kloop_256, @function
 
 // Arguments:
 //   x0 = Apack pointer [6×256] int8 row-major
@@ -26,7 +26,7 @@
 //   x2 = C pointer [6×64] int32 row-major output
 //   x3 = ldc in bytes
 
-kernel_6x4_opt_256:
+kernel_6x4_kloop_256:
     // Save callee-saved registers
     stp     x19, x20, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
@@ -35,10 +35,12 @@ kernel_6x4_opt_256:
     stp     d10, d11, [sp, #-16]!
     stp     d12, d13, [sp, #-16]!
     stp     d14, d15, [sp, #-16]!
+    stp     x27, x28, [sp, #-16]!
 
     // Setup predicates
     ptrue   p0.b
     ptrue   p1.s
+    mov     x28, x4                 // nkblocks (5th arg)
 
     // Zero 24 accumulators
     dup     z0.s, #0
@@ -66,16 +68,16 @@ kernel_6x4_opt_256:
     dup     z22.s, #0
     dup     z23.s, #0
 
-    // Setup A row pointers
-    mov     x4, x0                  // Row 0
-    add     x10, x0, #256           // Row 1
-    add     x11, x10, #256          // Row 2
-    add     x12, x11, #256          // Row 3
-    add     x13, x12, #256          // Row 4
-    add     x14, x13, #256          // Row 5
-
-    mov     x5, x1                  // Bpack base
-    mov     x6, #8                  // K counter (256/32 = 8 iterations, 32 bytes/iter)
+    mov     x9, x0                  // A block base
+    mov     x5, x1                  // B base (carries across K-blocks)
+.Louter_kloop:
+    mov     x4, x9                  // Row 0 (from block base)
+    add     x10, x9, #256
+    add     x11, x9, #512
+    add     x12, x9, #768
+    add     x13, x9, #1024
+    add     x14, x9, #1280
+    mov     x6, #8                  // inner K counter (256/32)
 
     .align 6
 .Lk_loop_6x4_opt:
@@ -512,6 +514,10 @@ kernel_6x4_opt_256:
     subs    x6, x6, #1
     b.gt    .Lk_loop_6x4_opt
 
+    add     x9, x9, #1536           // next A block (6*256)
+    subs    x28, x28, #1
+    b.gt    .Louter_kloop
+
     // ========================================
     // Store results: 6 rows × 4 vectors = 24 SVE vectors
     // ========================================
@@ -560,6 +566,7 @@ kernel_6x4_opt_256:
     st1w    z23.s, p1, [x7, #3, mul vl]
 
     // Restore registers
+    ldp     x27, x28, [sp], #16
     ldp     d14, d15, [sp], #16
     ldp     d12, d13, [sp], #16
     ldp     d10, d11, [sp], #16
@@ -570,4 +577,4 @@ kernel_6x4_opt_256:
 
     ret
 
-    .size kernel_6x4_opt_256, .-kernel_6x4_opt_256
+    .size kernel_6x4_kloop_256, .-kernel_6x4_kloop_256

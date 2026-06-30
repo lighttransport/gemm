@@ -75,6 +75,13 @@ typedef struct {
 g4v_model *g4v_load(gguf_context *mmproj_gguf);
 void g4v_free(g4v_model *vm);
 
+/* Open an mmproj GGUF for the vision encoder, EAGERLY into NUMA-local anonymous
+ * RAM. Use this instead of gguf_open(path,1): file-backed mmap pages are
+ * NUMA-mis-placed -> the SVE F32 GEMMs run ~50x slower; and the gguf auto-anonymous
+ * heuristic (under NUMA_DISTRIBUTE) DEFERS big tensors to transformer_numa_setup,
+ * which the vision encoder never calls -> silently-zero weights. */
+gguf_context *g4v_open_mmproj(const char *path);
+
 /* Encode an image. rgb is raw uint8 [height * width * 3] in RGB order.
  * Returns malloc'd float array of [n_merged * proj_dim] = [49 * 2560].
  * Caller must free the result. */
@@ -95,6 +102,9 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height);
 
 #ifdef __AVX2__
 #include <immintrin.h>
+#endif
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
 #endif
 
 /* ---- AVX2 helpers ---- */
@@ -120,6 +130,13 @@ static inline float g4v_dot(const float *a, const float *b, int n) {
     float result = _mm_cvtss_f32(lo);
     for (; i < n; i++) result += a[i] * b[i];
     return result;
+#elif defined(__ARM_FEATURE_SVE)
+    /* A64FX: SVE F32 dot (was scalar -> ~16x). */
+    svfloat32_t acc = svdup_f32(0); int vl = svcntw(); int i = 0;
+    for (; i + vl <= n; i += vl)
+        acc = svmla_f32_x(svptrue_b32(), acc, svld1_f32(svptrue_b32(), a + i), svld1_f32(svptrue_b32(), b + i));
+    if (i < n) { svbool_t pg = svwhilelt_b32(i, n); acc = svmla_f32_m(pg, acc, svld1_f32(pg, a + i), svld1_f32(pg, b + i)); }
+    return svaddv_f32(svptrue_b32(), acc);
 #else
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += a[i] * b[i];
@@ -181,9 +198,16 @@ static inline void g4v_vec_fmadd(float *dst, float s, const float *src, int n) {
 
 static int g4v_n_threads(void) {
     int n = 4;
+#if defined(__ARM_FEATURE_SVE)
+    int cap = 48;   /* A64FX has 48 cores; the SVE blocked GEMM scales to them */
+#else
+    int cap = 16;
+#endif
+    const char *e = getenv("G4V_THREADS");
+    if (e) { int v = atoi(e); if (v > 0) return v; }
 #ifdef _SC_NPROCESSORS_ONLN
     int hw = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (hw > 0) n = hw > 16 ? 16 : hw;
+    if (hw > 0) n = hw > cap ? cap : hw;
 #endif
     return n;
 }
@@ -261,9 +285,68 @@ static inline float g4v_dot_bf16(const uint16_t *w, const float *x, int n) {
 }
 #endif /* __AVX2__ */
 
+#if defined(__ARM_FEATURE_SVE)
+/* A64FX register-blocked F32 GEMM over a row range: MR=6 rows x NR=4 tokens, 24
+ * SVE accumulators reduced (svaddv) at tile end. X[tok] reused across 6 rows,
+ * W[row] across 4 tokens -> high AI (vs the per-(row,tok) dot which is X-reload
+ * bound). out[tok*n_rows + r] = sum_k W[r][k]*X[tok][k]. Remainder via sve dot. */
+static void g4v_f32_blk_rows(float *out, const float *W, const float *X,
+                             int r0, int r1, int n_cols, int n_rows, int N) {
+    const int MR = 6, NR = 4;
+    int RB = (r1 - r0) / MR, TB = N / NR;
+    for (int rb = 0; rb < RB; rb++) for (int tb = 0; tb < TB; tb++) {
+        int rr = r0 + rb*MR, tt = tb*NR;
+        const float *w0=W+(size_t)(rr+0)*n_cols,*w1=W+(size_t)(rr+1)*n_cols,*w2=W+(size_t)(rr+2)*n_cols;
+        const float *w3=W+(size_t)(rr+3)*n_cols,*w4=W+(size_t)(rr+4)*n_cols,*w5=W+(size_t)(rr+5)*n_cols;
+        const float *x0=X+(size_t)(tt+0)*n_cols,*x1=X+(size_t)(tt+1)*n_cols,*x2=X+(size_t)(tt+2)*n_cols,*x3=X+(size_t)(tt+3)*n_cols;
+        svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a02=svdup_f32(0),a03=svdup_f32(0);
+        svfloat32_t a10=svdup_f32(0),a11=svdup_f32(0),a12=svdup_f32(0),a13=svdup_f32(0);
+        svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a22=svdup_f32(0),a23=svdup_f32(0);
+        svfloat32_t a30=svdup_f32(0),a31=svdup_f32(0),a32=svdup_f32(0),a33=svdup_f32(0);
+        svfloat32_t a40=svdup_f32(0),a41=svdup_f32(0),a42=svdup_f32(0),a43=svdup_f32(0);
+        svfloat32_t a50=svdup_f32(0),a51=svdup_f32(0),a52=svdup_f32(0),a53=svdup_f32(0);
+        int vl=svcntw(),k=0; svbool_t p=svptrue_b32();
+        for(;k+vl<=n_cols;k+=vl){ svfloat32_t wv;
+            svfloat32_t xv0=svld1_f32(p,x0+k),xv1=svld1_f32(p,x1+k),xv2=svld1_f32(p,x2+k),xv3=svld1_f32(p,x3+k);
+            wv=svld1_f32(p,w0+k);a00=svmla_f32_x(p,a00,wv,xv0);a01=svmla_f32_x(p,a01,wv,xv1);a02=svmla_f32_x(p,a02,wv,xv2);a03=svmla_f32_x(p,a03,wv,xv3);
+            wv=svld1_f32(p,w1+k);a10=svmla_f32_x(p,a10,wv,xv0);a11=svmla_f32_x(p,a11,wv,xv1);a12=svmla_f32_x(p,a12,wv,xv2);a13=svmla_f32_x(p,a13,wv,xv3);
+            wv=svld1_f32(p,w2+k);a20=svmla_f32_x(p,a20,wv,xv0);a21=svmla_f32_x(p,a21,wv,xv1);a22=svmla_f32_x(p,a22,wv,xv2);a23=svmla_f32_x(p,a23,wv,xv3);
+            wv=svld1_f32(p,w3+k);a30=svmla_f32_x(p,a30,wv,xv0);a31=svmla_f32_x(p,a31,wv,xv1);a32=svmla_f32_x(p,a32,wv,xv2);a33=svmla_f32_x(p,a33,wv,xv3);
+            wv=svld1_f32(p,w4+k);a40=svmla_f32_x(p,a40,wv,xv0);a41=svmla_f32_x(p,a41,wv,xv1);a42=svmla_f32_x(p,a42,wv,xv2);a43=svmla_f32_x(p,a43,wv,xv3);
+            wv=svld1_f32(p,w5+k);a50=svmla_f32_x(p,a50,wv,xv0);a51=svmla_f32_x(p,a51,wv,xv1);a52=svmla_f32_x(p,a52,wv,xv2);a53=svmla_f32_x(p,a53,wv,xv3);
+        }
+        if(k<n_cols){ svbool_t pg=svwhilelt_b32(k,n_cols); svfloat32_t wv;
+            svfloat32_t xv0=svld1_f32(pg,x0+k),xv1=svld1_f32(pg,x1+k),xv2=svld1_f32(pg,x2+k),xv3=svld1_f32(pg,x3+k);
+            wv=svld1_f32(pg,w0+k);a00=svmla_f32_m(pg,a00,wv,xv0);a01=svmla_f32_m(pg,a01,wv,xv1);a02=svmla_f32_m(pg,a02,wv,xv2);a03=svmla_f32_m(pg,a03,wv,xv3);
+            wv=svld1_f32(pg,w1+k);a10=svmla_f32_m(pg,a10,wv,xv0);a11=svmla_f32_m(pg,a11,wv,xv1);a12=svmla_f32_m(pg,a12,wv,xv2);a13=svmla_f32_m(pg,a13,wv,xv3);
+            wv=svld1_f32(pg,w2+k);a20=svmla_f32_m(pg,a20,wv,xv0);a21=svmla_f32_m(pg,a21,wv,xv1);a22=svmla_f32_m(pg,a22,wv,xv2);a23=svmla_f32_m(pg,a23,wv,xv3);
+            wv=svld1_f32(pg,w3+k);a30=svmla_f32_m(pg,a30,wv,xv0);a31=svmla_f32_m(pg,a31,wv,xv1);a32=svmla_f32_m(pg,a32,wv,xv2);a33=svmla_f32_m(pg,a33,wv,xv3);
+            wv=svld1_f32(pg,w4+k);a40=svmla_f32_m(pg,a40,wv,xv0);a41=svmla_f32_m(pg,a41,wv,xv1);a42=svmla_f32_m(pg,a42,wv,xv2);a43=svmla_f32_m(pg,a43,wv,xv3);
+            wv=svld1_f32(pg,w5+k);a50=svmla_f32_m(pg,a50,wv,xv0);a51=svmla_f32_m(pg,a51,wv,xv1);a52=svmla_f32_m(pg,a52,wv,xv2);a53=svmla_f32_m(pg,a53,wv,xv3);
+        }
+        float *y0=out+(size_t)(tt+0)*n_rows+rr,*y1=out+(size_t)(tt+1)*n_rows+rr,*y2=out+(size_t)(tt+2)*n_rows+rr,*y3=out+(size_t)(tt+3)*n_rows+rr;
+        y0[0]=svaddv_f32(p,a00);y1[0]=svaddv_f32(p,a01);y2[0]=svaddv_f32(p,a02);y3[0]=svaddv_f32(p,a03);
+        y0[1]=svaddv_f32(p,a10);y1[1]=svaddv_f32(p,a11);y2[1]=svaddv_f32(p,a12);y3[1]=svaddv_f32(p,a13);
+        y0[2]=svaddv_f32(p,a20);y1[2]=svaddv_f32(p,a21);y2[2]=svaddv_f32(p,a22);y3[2]=svaddv_f32(p,a23);
+        y0[3]=svaddv_f32(p,a30);y1[3]=svaddv_f32(p,a31);y2[3]=svaddv_f32(p,a32);y3[3]=svaddv_f32(p,a33);
+        y0[4]=svaddv_f32(p,a40);y1[4]=svaddv_f32(p,a41);y2[4]=svaddv_f32(p,a42);y3[4]=svaddv_f32(p,a43);
+        y0[5]=svaddv_f32(p,a50);y1[5]=svaddv_f32(p,a51);y2[5]=svaddv_f32(p,a52);y3[5]=svaddv_f32(p,a53);
+    }
+    int rdone = r0 + RB*MR, tdone = TB*NR;
+    for (int r=rdone;r<r1;r++) for(int tok=0;tok<N;tok++) out[(size_t)tok*n_rows+r]=g4v_dot(W+(size_t)r*n_cols,X+(size_t)tok*n_cols,n_cols);
+    for (int r=r0;r<rdone;r++) for(int tok=tdone;tok<N;tok++) out[(size_t)tok*n_rows+r]=g4v_dot(W+(size_t)r*n_cols,X+(size_t)tok*n_cols,n_cols);
+}
+#endif /* __ARM_FEATURE_SVE */
+
 static void *g4v_matmul_worker(void *arg) {
     g4v_matmul_task *t = (g4v_matmul_task *)arg;
     if (t->mat_type == GGML_TYPE_F32 || t->mat_f32) {
+#if defined(__ARM_FEATURE_SVE)
+        if (t->N >= 4 && !getenv("G4V_FORCE_SCALAR")) {
+            g4v_f32_blk_rows(t->out, t->mat_f32, t->inp, t->row_start, t->row_end, t->n_cols, t->n_rows, t->N);
+            return NULL;
+        }
+#endif
         for (int r = t->row_start; r < t->row_end; r++) {
             const float *row = t->mat_f32 + (size_t)r * t->n_cols;
             for (int tok = 0; tok < t->N; tok++) {
@@ -529,6 +612,18 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
 }
 
 /* ---- Loading ---- */
+
+gguf_context *g4v_open_mmproj(const char *path) {
+    /* Force an EAGER anonymous read (use_mmap=0). Temporarily clear NUMA_DISTRIBUTE
+     * so gguf_open does NOT defer big tensors to transformer_numa_setup (which g4v
+     * never calls) -> all weights are read + populated here, in NUMA-local RAM. */
+    const char *nd = getenv("NUMA_DISTRIBUTE");
+    char saved[128]; int had = 0;
+    if (nd) { had = 1; strncpy(saved, nd, sizeof(saved)-1); saved[sizeof(saved)-1] = 0; unsetenv("NUMA_DISTRIBUTE"); }
+    gguf_context *g = gguf_open(path, 0);
+    if (had) setenv("NUMA_DISTRIBUTE", saved, 1);
+    return g;
+}
 
 static qtensor g4v_load_tensor(gguf_context *g, const char *name, int required) {
     qtensor t = {0};

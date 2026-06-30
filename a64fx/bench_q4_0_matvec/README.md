@@ -47,15 +47,36 @@ per-path:
 - **OK**: whether output matches fp32 reference within tolerance
 - **MaxErr**: max absolute error vs reference
 
-## Expected results (on A64FX @ 2 GHz)
+## Measured results (native A64FX, `fcc -Nclang -O3`, single thread)
 
-| Path | Speedup vs fp32 | Notes |
-|------|-----------------|-------|
-| fp32 FMA | 1.0× | 64 GFLOPS peak (32 ops/cycle × 2 GHz) |
-| int8 SDOT (on-fly) | ~1-3× | Dequant overhead, only faster for large M |
-| **int8 SDOT (preq)** | **~30-50×** | **Production path. ~55% of 256 GOPS int8 peak** |
-| int16 SDOT | ~3-4× | 128 GOPS int16 peak (half of int8 throughput) |
-| fp16 FMA | ~3-4× | 128 GFLOPS fp16 peak (2x fp32, half of int8) |
+Measured on a native A64FX node (`fcc -Nclang -O3 -march=armv8.2-a+sve
+-ffp-contract=fast`, `OMP_NUM_THREADS=1`). All paths verify against the fp32
+reference (`OK`). Effective GFLOPS for the int8 prequant path (prepack done
+once in warmup, not in the timed loop):
+
+| Size (rows×cols) | fp32 GFLOPS | int8 preq | speedup | int16 | fp16 |
+|------------------|-------------|-----------|---------|-------|------|
+| 512×512   | 6.2 | 44.8 | 7.2×  | 2.9× | 2.1× |
+| 1024×1024 | 6.2 | 62.6 | 10.3× | 4.0× | 2.6× |
+| 2048×2048 | 6.2 | **76.6** | **12.5×** ← peak | 1.9× | 1.5× |
+| 4096×4096 | 5.5 | 30.5 | 5.6×  | 2.1× | 1.6× |
+| 8192×4096 | 5.5 | 30.0 | 5.5×  | 2.1× | 1.4× |
+| 4096×8192 | 5.8 | 29.3 | 5.1×  | 1.9× | 1.2× |
+
+**int8 SDOT prequant peaks at ~12.5× (≈77 GFLOPS) at 2048², not the
+qlair-predicted 30-50×.** Two reasons: (1) the fp32 baseline here is itself
+SVE-vectorized (qlair's 40× compared against a slower baseline); (2) at ≥4096²
+the working set exceeds L2 and the matvec goes **bandwidth-bound** — and the
+int8 cache is 1 byte/weight versus Q4_0's 0.56 byte/weight, so it reads *more*
+bytes and loses its compute edge (12.5× @2048² → ~5.5× at 4096²+). The win is
+real but is a mid-size, compute-bound effect.
+
+Quantization error vs the fp32 reference: int8 prequant MaxErr 9.9–49 (within
+the 5% tolerance); int16 MaxErr 0.005–0.029 (256× finer); fp16 MaxErr 0.2–2.5.
+
+> Counter note: `cntfrq_el0` reads **100 MHz** on this node, so the benchmark's
+> "Cycles" column is 100 MHz timer ticks, not CPU cycles. The GFLOPS / Time /
+> Speedup columns are wall-time–derived and correct.
 
 The int8 SDOT path achieves the highest throughput because int8 SDOT does
 **64 int8 products per instruction** (4 int8 × 16 int32 lanes), while int16
@@ -74,6 +95,8 @@ For numerical-sensitive workloads, fp32 or fp16 may be preferred.
 
 ## Cross-compile toolchain
 
-The benchmark uses the `cntvct_el0` virtual counter for cycle-accurate timing.
+The benchmark uses the `cntvct_el0` virtual counter for timing.
 This is available on all AArch64 systems with a fixed-frequency counter.
-On A64FX, the counter frequency is typically 1 GHz (set by firmware).
+On the measured A64FX node the counter runs at **100 MHz** (firmware-set), so
+the "Cycles" column is 100 MHz ticks, not CPU cycles — use the Time/GFLOPS
+columns (wall-time–derived) for performance.

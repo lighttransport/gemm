@@ -57,3 +57,47 @@ This rule applies to all remotes (origin and any others) and all branches, inclu
 branches. It is the same intent as Claude Code's general guidance ("for actions that are hard
 to reverse or outward-facing, confirm first; approval in one context doesn't extend to the
 next").
+
+## Memory-safe operation on the A64FX node (Gemma-4 12B, 32 GB HBM)
+The node has **32 GB HBM** and the 12B BF16 model is **24 GB**. Careless memory ops
+thrash **kswapd** and **HANG the interactive session** (or OOM-kill the agent).
+
+- **NEVER `cp`/`cat` the 24 GB model at once in an interactive session.** A single copy
+  accumulates ~24 GB of *dirty* page-cache → writeback storm → kswapd hang. Stage in
+  1 GiB chunks with fsync: `sh a64fx/bench_q4_0_matvec/stage_model.sh` (idempotent).
+  `/local/u14346/` is **wiped on every session restart** → re-stage each session.
+  Source: `~/models/gemma4/12b/gemma-4-12b-it-BF16.gguf`. Avoid `cat` on multi-GB files.
+- **Use `NO_MMAP=1` (explicit anon upload to HBM2), NOT mmap.** mmap re-faults weights
+  from disk on every decode token (decode reads all 24 GB/token) → constant kswapd
+  re-fault thrash AND NUMA-misplaced/slow. Anon loads once, stays resident, fast.
+- **The anon load is now memory-SAFE (fadvise fix, this session).** Previously a plain
+  load read 24 GB into anon WHILE caching 24 GB of source file pages = ~48 GB transient
+  → kswapd thrash → session HANG. Fixed: the loader now reads in chunks and
+  `posix_fadvise(POSIX_FADV_DONTNEED)` drops the source page-cache as it goes (both the
+  `gguf_loader.h` fread path and `transformer.h` numa-pread path; `TF_LOAD_KEEPCACHE=1`
+  to disable). Peak is now ~26 GB (model + buffers), `MemAvailable` stays stable ~5 GB,
+  **no thrash**. Validated: `NUMA_INTERLEAVE=1 NO_MMAP=1` → 8.4 tok/s, alpha 0.78 @G128,
+  greedy-exact, MemAvailable steady.
+- Gauge headroom with **`MemAvailable`** (reclaimable cache keeps it high; a runaway
+  *anon* alloc drops it). Guard a run: kill if `MemAvailable < 6 GB` (= >25 GB consumed).
+- **Speed** benchmarks (8.45 tok/s spec, 7.7 persistent, etc.) need the fast anon load
+  (`NUMA_INTERLEAVE=1 NO_MMAP=1`, ~25 GB) → run **detached / batch job**, not in the
+  interactive agent session. Use the mmap config only for **correctness** reruns here.
+
+### Rerun the spec-decode validation (memory-safe)
+```
+sh a64fx/bench_q4_0_matvec/stage_model.sh           # stage (chunked) if needed
+cd a64fx/bench_q4_0_matvec
+fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -D_GNU_SOURCE \
+    -DTF_HAVE_Q8V2 -DTF_LINK_PODD -I../../common mini_mtp.c \
+    ../gemma4-kernels/kernel_q8v2_3x4.S ../gemma4-kernels/sgemm_bf16_2x12.S -lm -o mini_mtp
+M=/local/u14346/gemma-4-12b-it-BF16.gguf
+MT=/home/u14346/models/gemma4/12b/MTP/gemma-4-12b-it-BF16-MTP.gguf
+NUMA_INTERLEAVE=1 NO_MMAP=1 MTP_SCALE=1.0 OMP_NUM_THREADS=48 \
+  OMP_PROC_BIND=close OMP_PLACES=cores LLM_THREADS=48 ./mini_mtp $M $MT 128 4
+```
+Expect `match=128/128` (greedy-exact) + `alpha=`. **alpha RISES with context** (the
+short gibberish-prompt prefix is unpredictable): G=32~0.0, G=48~0.47, **G=128~0.78,
+G=256~0.88** — so use G>=128 to see the real rate. Headline: **8.4 tok/s @ alpha 0.78
+G=128 / 0.88 G=256**. The anon load now peaks ~26 GB with no thrash (fadvise). Guard a
+run by killing if `MemAvailable < 2 GB`. Full work log: `project_gemma4_12b_bf16` memory.

@@ -181,6 +181,7 @@ static int gguf_find_key_internal(const gguf_context *ctx, const char *key) {
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #endif
 
 /* block_size, type_size pairs for ggml types */
@@ -343,6 +344,21 @@ static void gguf_free_kv(gguf_kv *kv) {
 }
 
 gguf_context *gguf_open(const char *path, int use_mmap) {
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    /* NUMA_INTERLEAVE=1: set the process default mempolicy to MPOL_INTERLEAVE before
+     * any weight allocation/first-touch (replicates `numactl --interleave=all` in-code,
+     * inherited by the pool/numa worker threads created later). M=1 decode matvec is
+     * BW-bound and reads each weight once with a 48-thread row-split; with a per-CMG
+     * (concentrated) placement it caps at one controller's BW (~60 GB/s). Interleaving
+     * across all 4 CMG controllers ~2x's the matvec BW (12B decode 2.2 -> 3.8 tok/s).
+     * Costs the compute-bound prefill GEMM ~6% (it prefers CMG-local) -> opt-in. */
+    if (getenv("NUMA_INTERLEAVE") && atoi(getenv("NUMA_INTERLEAVE"))) {
+        unsigned long nodemask = 0xFFUL;   /* nodes 0..7 (A64FX = 4 CMGs) */
+        long r = syscall(SYS_set_mempolicy, 3 /*MPOL_INTERLEAVE*/, &nodemask, 8UL);
+        fprintf(stderr, "gguf: MPOL_INTERLEAVE process mempolicy (decode BW)%s\n",
+                r == 0 ? "" : " [set_mempolicy failed]");
+    }
+#endif
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "gguf: cannot open %s\n", path); return NULL; }
 
@@ -421,6 +437,23 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->data_size = max_end;
     }
 
+    /* Default to anonymous RAM load when the model fits comfortably in RAM:
+     * file-backed mmap pages are NUMA-mis-placed for the GEMM threads (reads stay
+     * ~storage-slow even when resident), while anonymous memory is first-touched
+     * distributed across CMGs by the NUMA parallel pread -> ~16x faster prefill GEMMs
+     * (measured: Gemma-4 12B BF16 2.8 -> 33 tok/s). Keep mmap for huge models that
+     * don't fit one node's RAM (sharded multi-node). Override with TF_FORCE_MMAP=1. */
+    if (use_mmap && getenv("NUMA_DISTRIBUTE") &&
+        !(getenv("TF_FORCE_MMAP") && atoi(getenv("TF_FORCE_MMAP")))) {
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGE_SIZE);
+        size_t ram = (pages > 0 && psz > 0) ? (size_t)pages * (size_t)psz : 0;
+        if (ram && ctx->data_size < (size_t)((double)ram * 0.80)) {
+            use_mmap = 0;
+            fprintf(stderr, "gguf: model %.1fGB fits RAM %.1fGB -> anonymous load "
+                    "(NUMA-local, eviction-safe; TF_FORCE_MMAP=1 to keep mmap)\n",
+                    (double)ctx->data_size / 1e9, (double)ram / 1e9);
+        }
+    }
     /* load data */
     if (use_mmap) {
 #ifdef _WIN32
@@ -493,8 +526,25 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
             }
             fclose(f); f = NULL;
         } else {
-            fseek(f, (long)ctx->data_offset, SEEK_SET);
-            if (fread(ctx->data, 1, ctx->data_size, f) != ctx->data_size) goto fail;
+            /* Chunked pread + drop the SOURCE file's page-cache per chunk. A single
+             * fread of the whole 24 GB would cache 24 GB of source pages ON TOP of the
+             * 24 GB anon dest -> page cache balloons -> kswapd thrash / interactive HANG.
+             * Reading in 64 MB chunks and posix_fadvise(DONTNEED) keeps the source-cache
+             * window tiny -> clean explicit anon (HBM2) upload. TF_LOAD_KEEPCACHE=1 disables. */
+            int dfd = fileno(f);
+            int keep = (getenv("TF_LOAD_KEEPCACHE") && atoi(getenv("TF_LOAD_KEEPCACHE")));
+            size_t off = 0, total = ctx->data_size;
+            while (off < total) {
+                size_t chunk = total - off;
+                if (chunk > 64u * 1024 * 1024) chunk = 64u * 1024 * 1024;
+                ssize_t n = pread(dfd, (uint8_t *)ctx->data + off, chunk,
+                                  (off_t)(ctx->data_offset + off));
+                if (n <= 0) goto fail;
+#if defined(POSIX_FADV_DONTNEED)
+                if (!keep) posix_fadvise(dfd, (off_t)(ctx->data_offset + off), (size_t)n, POSIX_FADV_DONTNEED);
+#endif
+                off += (size_t)n;
+            }
             fclose(f); f = NULL;
         }
     }
