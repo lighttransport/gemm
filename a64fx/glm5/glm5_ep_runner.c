@@ -395,6 +395,19 @@ static void embed_lookup(glm5_model*m,int tok,float*x){
     const uint16_t*row=m->embed+(size_t)tok*H;
     for(int i=0;i<H;i++) x[i]=glm5_bf2f(row[i]);
 }
+/* GLM5_BATCH_SELFCHECK=<tok>: validate the multi-stream MLA decode (glm5_forward_batch_decode_mla)
+ * against single-stream glm5_forward_token at M=1, pos=0 (argmax must match). The cheap 1-node gate
+ * before trusting M>1 (which still needs a job for routing/KV-independence). Off unless tok>0. */
+static void glm5_batch_selfcheck(glm5_model*m){
+    int tok=envi("GLM5_BATCH_SELFCHECK",0); if(tok<=0) return;
+    if(glm5_alloc_mstream_ex(m,1,1)){ if(MyRank==0) logmsg("BATCH_SELFCHECK: mstream alloc failed\n"); return; }
+    int H=m->cfg.hidden, pos0=0, out=-1; float*x=glm5_amalloc((size_t)H*4);
+    embed_lookup(m,tok,x); int single=glm5_forward_token(m,x,0);
+    embed_lookup(m,tok,x); glm5_forward_batch_decode_mla(m,x,1,&pos0,&out);
+    glm5_afree(x); glm5_free_mstream(m);
+    if(MyRank==0) logmsg("BATCH_SELFCHECK tok=%d single=%d batched=%d %s\n",
+                         tok,single,out,single==out?"MATCH (M=1 ok; M>1 needs a job)":"*** MISMATCH ***");
+}
 #define GLM5_EOS_ID0 154820
 #define GLM5_EOS_ID1 154827
 #define GLM5_EOS_ID2 154829
@@ -706,6 +719,7 @@ int main(void){
               m->head.rows==m->cfg.vocab?"replicated":"sharded->full-logit gather");
       }
     }
+    glm5_batch_selfcheck(m);   /* GLM5_BATCH_SELFCHECK=<tok>: M=1 batched-decode == single-stream */
     /* CP callbacks are wired unconditionally so a mid-run Tier A->B transition can turn CP on.
      * They stay dormant while m->cp_on==0 (the forward gates the combine/block-reduce on it). */
     /* combine scratch sized for a whole chunk (S<=pchunk0): g_kvbuf holds the packed

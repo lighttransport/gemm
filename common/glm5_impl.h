@@ -2410,4 +2410,186 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
     return gidx;
 }
 
+/* ============ multi-stream MLA decode (GLM5_BATCH_DECODE) ============
+ * M independent decode streams in ONE forward. Per-stream latent KV lives in ms->kc (CP OFF ->
+ * full KV local, so attention needs NO collective); the only per-layer collective is the MoE
+ * all-reduce, now amortized over M tokens (the decode-throughput win). Greedy: out[t]=argmax.
+ * v1 mirrors the validated glm5_forward_prefill_chunk; deltas vs it = per-stream pos[t],
+ * per-stream KV store/load, per-stream full-causal selection, per-stream head. MSA/index-sparse
+ * selection is deferred (full causal); routed-expert grouping is inherited from prefill_chunk.
+ * Validate at M=1 vs glm5_forward_token (argmax) via glm5_batch_decode_selfcheck. */
+static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const int*pos, int*out){
+    const glm5_config*c=&m->cfg;
+    const int H=c->hidden, AD=glm5_attn_dim(c);
+    const int KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;
+    const float ascale=1.0f/sqrtf((float)c->qk_head_dim);
+    glm5_mstream*ms=(glm5_mstream*)m->ms;
+    const size_t per=(size_t)c->n_layers*c->max_pos*KVC;     /* per-stream kc stride */
+    const int absorb_sve_dot=glm5_envi("GLM5_ABSORB_SVE_DOT",1);
+    for(int l=0;l<c->n_layers;l++){
+        glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(c,l);
+        const int qh0=L->qh0,qh1=L->qh1,nown=qh1-qh0,qrows=nown*c->qk_head_dim, arows=nown*c->v_head_dim;
+        const int tp_attn=(arows<AD), kvb_stride=c->qk_nope_dim+c->v_head_dim; (void)qh0;
+        double pt=glm5_prof_now();
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(int t=0;t<M;t++) glm5_rmsnorm_gemma(ms->xn+(size_t)t*H, X+(size_t)t*H, L->input_norm, H, c->norm_eps);
+        glm5_gemm(m,ms->qlat,&L->wq_a,ms->xn,M,c->q_lora,H);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(int t=0;t<M;t++) glm5_rmsnorm_head(ms->qlat+(size_t)t*c->q_lora,L->q_a_norm,c->q_lora,c->norm_eps);
+        glm5_gemm(m,ms->q,&L->wq_b,ms->qlat,M,qrows,c->q_lora);
+        glm5_gemm(m,ms->k,&L->wkv_a,ms->xn,M,KVC,H);
+        /* RoPE + per-stream latent-KV store into ms->kc[stream][layer][pos[t]] */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(int t=0;t<M;t++){
+            int p=pos[t]; const float*cosp=&m->rope_cos[(size_t)p*half],*sinp=&m->rope_sin[(size_t)p*half];
+            float*qb=ms->q+(size_t)t*qrows, *kv=ms->k+(size_t)t*KVC;
+            for(int hh=0;hh<nown;hh++) glm5_rope_interleaved(qb+hh*c->qk_head_dim+c->qk_nope_dim,cosp,sinp,c->qk_rope_dim);
+            glm5_rmsnorm_head(kv,L->kv_a_norm,c->kv_lora,c->norm_eps);
+            glm5_rope_interleaved(kv+c->kv_lora,cosp,sinp,c->qk_rope_dim);
+            uint16_t*kc=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVC+(size_t)p*KVC;
+            for(int i=0;i<KVC;i++) kc[i]=glm5_kv_enc(m,kv[i]);
+        }
+        glm5_prof_add(m,GLM5_P_QKV,pt);
+        /* per-stream absorbed-MLA attention over own KV [0..pos[t]] (CP OFF, no collective) */
+        pt=glm5_prof_now();
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(int t=0;t<M;t++){
+            int p=pos[t];
+            float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*arows;
+            float*qabs=ms->kvb+(size_t)t*c->n_heads*(2*c->kv_lora); float*ctxb=qabs+(size_t)c->n_heads*c->kv_lora;
+            float*hmx=ms->hmx+(size_t)t*64,*hse=ms->hse+(size_t)t*64;
+            float*kv=ms->v+(size_t)t*KVC; const uint16_t*kcl=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVC;
+            for(int hh=0;hh<nown;hh++){
+                hmx[hh]=-1e30f; hse[hh]=0.0f;
+                glm5_tensor_tmul_rows(m,qabs+(size_t)hh*c->kv_lora,&L->wkv_b,hh*kvb_stride,c->qk_nope_dim,qb+hh*c->qk_head_dim);
+                float*oh=ab+hh*c->v_head_dim; for(int i=0;i<c->v_head_dim;i++) oh[i]=0.0f;
+                float*ctx=ctxb+(size_t)hh*c->kv_lora; for(int i=0;i<c->kv_lora;i++) ctx[i]=0.0f;
+            }
+            for(int j=0;j<=p;j++){
+                const uint16_t*kcj=kcl+(size_t)j*KVC; for(int i=0;i<KVC;i++) kv[i]=glm5_kv_dec(m,kcj[i]);
+                for(int hh=0;hh<nown;hh++){
+                    const float*qh=qb+hh*c->qk_head_dim; const float*qa=qabs+(size_t)hh*c->kv_lora;
+                    double d=(double)glm5_dot_f32_opt(qa,kv,c->kv_lora,absorb_sve_dot);
+                    for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
+                    float s=(float)d*ascale; float*ctx=ctxb+(size_t)hh*c->kv_lora;
+                    if(s>hmx[hh]){ float r=(hmx[hh]>-1e20f)?expf(hmx[hh]-s):0.0f; hse[hh]*=r; glm5_scale_f32(ctx,r,c->kv_lora); hmx[hh]=s; }
+                    float e=expf(s-hmx[hh]); hse[hh]+=e; glm5_axpy_f32(ctx,kv,e,c->kv_lora);
+                }
+            }
+            for(int hh=0;hh<nown;hh++){
+                float inv=1.0f/(hse[hh]>0?hse[hh]:1); float*ctx=ctxb+(size_t)hh*c->kv_lora; glm5_scale_f32(ctx,inv,c->kv_lora);
+                glm5_tensor tv=glm5_tensor_rows(&L->wkv_b,hh*kvb_stride+c->qk_nope_dim,c->v_head_dim);
+                glm5_mv(m,ab+hh*c->v_head_dim,&tv,ctx,c->v_head_dim,c->kv_lora);
+            }
+        }
+        glm5_prof_add(m,GLM5_P_ATTN,pt);
+        pt=glm5_prof_now();
+        glm5_gemm(m,ms->o,&L->wo,ms->attn,M,H,arows);
+        if(tp_attn && m->ar_cb) m->ar_cb(ms->o,M*H,m->ar_ctx);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
+#endif
+        for(size_t i=0;i<(size_t)M*H;i++) X[i]+=ms->o[i];
+        glm5_prof_add(m,GLM5_P_OPROJ,pt);
+        pt=glm5_prof_now();
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(int t=0;t<M;t++) glm5_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, L->post_norm, H, c->norm_eps);
+        glm5_prof_add(m,GLM5_P_OTHER,pt);
+        if(is_moe){
+            const int tp_sh=(L->sh_rows<c->moe_inter);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
+#endif
+            for(size_t i=0;i<(size_t)M*H;i++) ms->route[i]=0;
+            int na=c->n_active>8?8:c->n_active; int*sel_all=ms->gsel; float*selw_all=ms->gselw;
+            pt=glm5_prof_now();
+            glm5_gemm(m,ms->router,&L->gate,ms->h2,M,c->n_experts,H);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)M*c->n_experts>=GLM5_PAR_MIN)
+#endif
+            for(int t=0;t<M;t++){ float*rl=ms->router+(size_t)t*c->n_experts; glm5_sigmoid_row(rl,c->n_experts);
+                int*sel=sel_all+t*na; float*sw=selw_all+t*na;
+                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
+            glm5_prof_add(m,GLM5_P_ROUTER,pt);
+            pt=glm5_prof_now();
+            for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
+            for(int t=0;t<M;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na;
+                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
+                    int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*M+g]=t; ms->bw[(size_t)slot*M+g]=sw[a]; } }
+            for(int s=0;s<L->n_owned;s++){ int g=ms->bcnt[s]; if(g==0) continue;
+                for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*M+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
+                glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,c->moe_inter,H);
+                glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H);
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static) if((long)g*c->moe_inter>=GLM5_PAR_MIN)
+#endif
+                for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
+                for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*M+i]; float w=ms->bw[(size_t)s*M+i];
+                    glm5_axpy_f32(ms->route+(size_t)t*H, ms->tmp2+(size_t)i*H, w, H); } }
+            glm5_prof_add(m,GLM5_P_EXPERTS,pt);
+            pt=glm5_prof_now();
+            int overlap = (m->ar_async_start && !tp_sh);
+            if(overlap) m->ar_async_start(ms->route,M*H,m->ar_async_ctx);
+            glm5_gemm(m,ms->shg,&L->sh_w1,ms->h2,M,L->sh_rows,H);
+            glm5_gemm(m,ms->shu,&L->sh_w3,ms->h2,M,L->sh_rows,H);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)M*L->sh_rows>=GLM5_PAR_MIN)
+#endif
+            for(size_t i=0;i<(size_t)M*L->sh_rows;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+            glm5_gemm(m,ms->tmp2,&L->sh_w2,ms->shg,M,H,L->sh_rows);
+            if(overlap){ m->ar_wait(m->ar_async_ctx); }
+            else { if(tp_sh) for(size_t i=0;i<(size_t)M*H;i++) ms->route[i]+=ms->tmp2[i];
+                   if(m->ar_cb) m->ar_cb(ms->route,M*H,m->ar_ctx); }
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
+#endif
+            for(size_t i=0;i<(size_t)M*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
+            glm5_prof_add(m,GLM5_P_SHARED,pt);
+        } else {
+            const int tp_ffn=(L->ff_rows<c->dense_inter);
+            pt=glm5_prof_now();
+            glm5_gemm(m,ms->ffg,&L->ff_gate,ms->h2,M,L->ff_rows,H);
+            glm5_gemm(m,ms->ffu,&L->ff_up,ms->h2,M,L->ff_rows,H);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)M*L->ff_rows>=GLM5_PAR_MIN)
+#endif
+            for(size_t i=0;i<(size_t)M*L->ff_rows;i++) ms->ffg[i]=glm5_swiglu_oai(ms->ffg[i],ms->ffu[i],c->swiglu_alpha,c->swiglu_limit);
+            glm5_gemm(m,ms->tmp2,&L->ff_down,ms->ffg,M,H,L->ff_rows);
+            if(tp_ffn && m->ar_cb) m->ar_cb(ms->tmp2,M*H,m->ar_ctx);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
+#endif
+            for(size_t i=0;i<(size_t)M*H;i++) X[i]+=ms->tmp2[i];
+            glm5_prof_add(m,GLM5_P_DENSE_FFN,pt);
+        }
+    }
+    /* head: ALL M streams, greedy argmax (+ TP_HEAD merge per stream) */
+    double pt=glm5_prof_now(); int hrows=m->head.rows;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(int t=0;t<M;t++) glm5_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, m->out_norm, H, c->norm_eps);
+    glm5_gemm(m,ms->logits,&m->head,ms->h2,M,hrows,H);
+    for(int t=0;t<M;t++){
+        float*lg=ms->logits+(size_t)t*hrows; int la=0; float bv=lg[0];
+        for(int i=1;i<hrows;i++) if(lg[i]>bv){bv=lg[i];la=i;}
+        int32_t gidx=m->head_r0+la; float gval=bv;
+        if(hrows<c->vocab && m->ar_argmax_cb) m->ar_argmax_cb(&gval,&gidx,m->ar_argmax_ctx);
+        out[t]=gidx;
+    }
+    glm5_prof_add(m,GLM5_P_HEAD,pt);
+}
+
 #endif /* GLM5_IMPL_H */
