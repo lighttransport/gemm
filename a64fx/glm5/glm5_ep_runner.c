@@ -405,8 +405,14 @@ static void glm5_batch_selfcheck(glm5_model*m){
     embed_lookup(m,tok,x); int single=glm5_forward_token(m,x,0);
     embed_lookup(m,tok,x); glm5_forward_batch_decode_mla(m,x,1,&pos0,&out);
     glm5_afree(x); glm5_free_mstream(m);
-    if(MyRank==0) logmsg("BATCH_SELFCHECK tok=%d single=%d batched=%d %s\n",
-                         tok,single,out,single==out?"MATCH (M=1 ok; M>1 needs a job)":"*** MISMATCH ***");
+    int li=0; while(li<m->cfg.n_layers-1 && !glm5_is_moe(&m->cfg,li)) li++;   /* first MoE layer */
+    int nown=m->layers[li].qh1-m->layers[li].qh0, shard=(nown<m->cfg.n_heads);
+    if(MyRank==0){
+        logmsg("BATCH_SELFCHECK tok=%d single=%d batched=%d %s\n",
+               tok,single,out,single==out?"MATCH (M=1 ok; M>1 needs a job)":"*** MISMATCH ***");
+        logmsg("BATCH_DECODE AR/MoE-layer=%d (attention %s) -> replicate attention (GLM5_TP_ATTN=0) for 1 AR/layer ~1.95x\n",
+               shard?2:1, shard?"sharded":"replicated");
+    }
 }
 #define GLM5_EOS_ID0 154820
 #define GLM5_EOS_ID1 154827

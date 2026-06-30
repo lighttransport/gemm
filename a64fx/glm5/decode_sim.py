@@ -61,21 +61,28 @@ def active_bytes_per_node(N, M, ctx, prec='int8', shard_attn=True):
 def ub_tok_s(N, M, ctx, prec='int8', shard_attn=True):    # THEORETICAL bandwidth ceiling (comm-free)
     return M / (active_bytes_per_node(N,M,ctx,prec,shard_attn)/BW_NODE)
 
-# ---------- comm model (calibrated) ----------
-# decode pays n_ar all-reduces/forward (MoE combine + attention o-proj if heads sharded), amortized
-# over M. AR latency ~ fixed floor + recursive-doubling rounds (log2 N). Calibrate the floor to the
-# measured M=1 point: comm(96,1) = 1/0.25 - bw_time(96,1).
+# ---------- uTofu all-reduce cost model (explicit) ----------
+# Each EP all-reduce is recursive-doubling over N ranks: ceil(log2 N) rounds, each a uTofu Put +
+# a completion wait. The A64FX/uTofu Put itself is ~1-2 us, but the robust-completion path used here
+# (trailer-seq fence + civac cache-coherence flush + MRQ draining, added for correctness) dominates
+# with a large per-round fixed cost. Model: ar = UTOFU_INIT + rounds*(UTOFU_ROUND) + bytes*UTOFU_BW.
+# UTOFU_ROUND is CALIBRATED to reproduce the measured per-AR latency at 96 ranks; the split into
+# init/round/bandwidth is illustrative (and shows what a leaner completion path would buy).
+UTOFU_INIT  = 2.0e-3            # fixed per-AR setup/teardown (s) -- registration, fence issue
+UTOFU_BW    = 1.0/8e9          # s/byte once in flight (~8 GB/s effective per-link AR bandwidth)
 def n_allreduce(shard_attn): return N_MOE + (N_LAYERS if shard_attn else 0)
-def _ar_shape(N): return 0.30 + 0.70*math.log2(N)/math.log2(96)     # fixed floor + log2 growth, =1 at 96
-SHARD_ATTN = True
+SHARD_ATTN = True              # eval config: attention heads sharded -> 2 AR/MoE layer
 _bw96_1 = active_bytes_per_node(96,1,128)/BW_NODE
-_comm96_1 = 1.0/AR_M1_96 - _bw96_1                                  # total comm seconds at (96, M=1)
-AR_LAT96 = _comm96_1/n_allreduce(SHARD_ATTN)                        # per-all-reduce latency at 96n
-def comm_time(N, M):                                               # per forward (amortizes over M via 1 call)
-    return n_allreduce(SHARD_ATTN)*AR_LAT96*_ar_shape(N)           # (msg-size term negligible at decode sizes)
+_comm96_1 = 1.0/AR_M1_96 - _bw96_1                                 # total comm s at (96, M=1)
+_ar96 = _comm96_1/n_allreduce(SHARD_ATTN)                         # measured per-AR latency at 96n (~26 ms)
+UTOFU_ROUND = (_ar96 - UTOFU_INIT)/math.ceil(math.log2(96))       # calibrated per-round cost (the robustness tax)
+def ar_latency(N, msg_bytes):
+    return UTOFU_INIT + math.ceil(math.log2(N))*UTOFU_ROUND + msg_bytes*UTOFU_BW
+def comm_time(N, M, shard_attn=SHARD_ATTN):                        # per forward (one AR/layer serves M tokens)
+    return n_allreduce(shard_attn)*ar_latency(N, M*H*4)            # AR message = [M,hidden] f32
 
-def pred_tok_s(N, M, ctx=128, prec='int8', mtp=0.0):
-    t = comm_time(N,M) + active_bytes_per_node(N,M,ctx,prec)/BW_NODE
+def pred_tok_s(N, M, ctx=128, prec='int8', mtp=0.0, shard_attn=SHARD_ATTN):
+    t = comm_time(N,M,shard_attn) + active_bytes_per_node(N,M,ctx,prec,shard_attn)/BW_NODE
     agg = M/t
     if mtp>0: agg *= (1+mtp)/1.18
     return agg
@@ -98,11 +105,24 @@ for N in [24,48,96,192,384]:
 print(f"  M=1 96n, attention REPLICATED (no TP head-shard): {ub_tok_s(96,1,128,shard_attn=False):.0f} tok/s")
 print("  (ceiling rises with M until expert reads saturate; falls at long ctx as KV read grows)")
 
+hdr("uTofu all-reduce cost (per call, calibrated)")
+print(f"  per-AR @96n (msg={1*H*4//1024} KB, M=1): {ar_latency(96,1*H*4)*1e3:.1f} ms = "
+      f"{UTOFU_INIT*1e3:.1f} init + {math.ceil(math.log2(96))}rounds*{UTOFU_ROUND*1e3:.1f} + bw")
+print(f"  AR/token: {n_allreduce(True)} (attn sharded: 2/MoE layer) vs {n_allreduce(False)} (attn replicated: 1/MoE layer)")
+print(f"  hardware floor would be ~0.01-0.02 ms/AR -> the {UTOFU_ROUND*1e3:.0f} ms/round is the robust-completion tax.")
+
+hdr("CUT 2 ALL-REDUCES/LAYER -> 1  (replicate attention; the only valid 1-AR path)")
+print("   M    2 AR/layer   1 AR/layer   speedup   +MTP(1AR)")
+for M in [1,8,16,32]:
+    a=pred_tok_s(96,M,shard_attn=True); b=pred_tok_s(96,M,shard_attn=False)
+    print(f"  {M:>3}   {a:>9.2f}    {b:>9.2f}    {b/a:>5.2f}x    {pred_tok_s(96,M,mtp=0.4,shard_attn=False):>7.2f}")
+print("  (decode is comm-bound, so replicating attention's +bandwidth is cheap; prefill keeps sharding.)")
+
 hdr("Calibration + the gap (96 nodes, int8, M=1)")
 print(f"  bandwidth-bound time   : {_bw96_1*1e3:7.2f} ms/token  -> UB {ub_tok_s(96,1,128):.0f} tok/s")
 print(f"  measured / comm-bound  : {1/AR_M1_96*1e3:7.0f} ms/token  -> {AR_M1_96} tok/s")
 print(f"  => all-reduce overhead : {_comm96_1*1e3:7.0f} ms ({100*_comm96_1/(1/AR_M1_96):.0f}% of the token); "
-      f"{n_allreduce(SHARD_ATTN)} AR/token @ {AR_LAT96*1e3:.0f} ms each")
+      f"{n_allreduce(SHARD_ATTN)} AR/token @ {_ar96*1e3:.0f} ms each")
 print(f"  decode runs at {100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of the bandwidth ceiling -> ~{ub_tok_s(96,1,128)/AR_M1_96:.0f}x headroom, all comm.")
 
 hdr("Calibrated PREDICTION — batching + MTP (96 nodes, int8, ctx=128)")
@@ -117,7 +137,7 @@ for L in [128,2048,8192,32768]:
 hdr("Takeaways")
 print(f"""  * THEORETICAL UPPER BOUND (bandwidth) at 96n int8: ~{ub_tok_s(96,1,128):.0f} tok/s (M=1, sharded attn),
     rising to ~{ub_tok_s(96,32,128):.0f} with M=32. Replicated attention would cap it at ~{ub_tok_s(96,1,128,shard_attn=False):.0f}.
-  * We run at ~{100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of that — the loss is ~{n_allreduce(SHARD_ATTN)} all-reduces/token at ~{AR_LAT96*1e3:.0f} ms each
+  * We run at ~{100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of that — the loss is ~{n_allreduce(SHARD_ATTN)} all-reduces/token at ~{_ar96*1e3:.0f} ms each
     (a ~50-100x-too-slow collective from the robust-completion path), NOT bandwidth/compute.
   * Batching M amortizes the comm: predicted M=16 ~{pred_tok_s(96,16):.1f}, M=32 ~{pred_tok_s(96,32):.1f} tok/s; +MTP ~1.2x.
   * Headroom to the bandwidth ceiling is ~{ub_tok_s(96,16,128)/pred_tok_s(96,16):.0f}x even after batching -> cutting AR latency/count

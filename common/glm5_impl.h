@@ -2493,6 +2493,11 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
         glm5_prof_add(m,GLM5_P_ATTN,pt);
         pt=glm5_prof_now();
         glm5_gemm(m,ms->o,&L->wo,ms->attn,M,H,arows);
+        /* CUT 2 ALL-REDUCES/LAYER -> 1: this attention o-proj all-reduce only exists when heads are
+         * SHARDED (tp_attn). It cannot be fused with the MoE all-reduce (the post-attn RMSNorm between
+         * them is nonlinear). Decode is comm-bound, so the right choice is REPLICATED attention
+         * (load with GLM5_TP_ATTN=0 -> qh1==n_heads -> tp_attn=0 here -> NO attention AR -> 1 AR/MoE
+         * layer, ~1.95x decode per the sim). Prefill keeps sharding (bandwidth-bound). */
         if(tp_attn && m->ar_cb) m->ar_cb(ms->o,M*H,m->ar_ctx);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
