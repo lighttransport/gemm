@@ -341,6 +341,16 @@ typedef struct {
     void  (*ar_async_start)(float *buf, int count, void *ctx);
     void  (*ar_wait)(void *ctx);
     void   *ar_async_ctx;
+    /* decode sampling (lockstep: identical s_logits + shared rng on every rank -> same token).
+     * samp_temp<=0 => greedy argmax (default, backward-compatible). Only active when the lm_head
+     * is REPLICATED (head.rows==vocab) so s_logits holds the full distribution on each rank. */
+    float    samp_temp;       /* temperature; <=0 disables sampling */
+    float    samp_topp;       /* nucleus top-p in (0,1]; >=1 disables the cutoff */
+    float    samp_rep_pen;    /* repetition penalty (>1 penalizes); <=1 disables */
+    uint64_t samp_rng;        /* xorshift64 state; SAME initial seed on all ranks */
+    const int *samp_hist;     /* generated-token history for the repetition penalty (runner-owned) */
+    int      samp_hist_n;
+    int     *samp_idx;        /* scratch [vocab] for top-p index sort (alloc'd lazily) */
     /* perf accounting */
     size_t bytes_read;
     double prof[16];

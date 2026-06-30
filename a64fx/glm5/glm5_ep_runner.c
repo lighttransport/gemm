@@ -527,6 +527,7 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
                 continue;
             }
             embed_lookup(q->m,q->cur,q->x);
+            q->m->samp_hist=q->gen; q->m->samp_hist_n=q->ng;   /* per-slot repetition penalty */
             q->cur=glm5_forward_token(q->m,q->x,q->n_prompt+q->ng-1);
             for(int i=0;i<C;i++) if(!(q->x[i]==q->x[i])) q->nan++;
         }
@@ -688,6 +689,23 @@ int main(void){
     if(tp_comm_init(&comm,Vcq,PeerVcq+GBase,GRank,GSize,cfg.hidden*ar_tokens,gbarrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
+    /* decode sampling (off by default; temp<=0 => greedy argmax). Lockstep: identical seed on
+     * every rank => identical token. Only effective when the lm_head is replicated. */
+    { const char*te=getenv("GLM5_TEMP"); const char*tp=getenv("GLM5_TOPP"); const char*rp=getenv("GLM5_REP_PEN");
+      const char*sd=getenv("GLM5_SEED");
+      m->samp_temp   = (te&&*te)? (float)atof(te) : 0.0f;
+      m->samp_topp   = (tp&&*tp)? (float)atof(tp) : 1.0f;
+      m->samp_rep_pen= (rp&&*rp)? (float)atof(rp) : 1.0f;
+      uint64_t seed  = (sd&&*sd)? (uint64_t)strtoull(sd,NULL,10) : 0x9E3779B97F4A7C15ULL;
+      if(!seed) seed = 0x9E3779B97F4A7C15ULL;
+      m->samp_rng=seed; m->samp_hist=NULL; m->samp_hist_n=0; m->samp_idx=NULL;
+      if(m->samp_temp>0.0f){
+          m->samp_idx=(int*)malloc((size_t)m->cfg.vocab*sizeof(int));
+          if(MyRank==0) logmsg("sampling ON: temp=%.3f top_p=%.3f rep_pen=%.3f seed=%llu (head %s)\n",
+              m->samp_temp,m->samp_topp,m->samp_rep_pen,(unsigned long long)seed,
+              m->head.rows==m->cfg.vocab?"replicated":"sharded->full-logit gather");
+      }
+    }
     /* CP callbacks are wired unconditionally so a mid-run Tier A->B transition can turn CP on.
      * They stay dormant while m->cp_on==0 (the forward gates the combine/block-reduce on it). */
     /* combine scratch sized for a whole chunk (S<=pchunk0): g_kvbuf holds the packed
@@ -792,8 +810,16 @@ int main(void){
                 if(a>=0) pf_last=a; }
             glm5_afree(Xc); glm5_free_mstream(m);
             if(MyRank==0) logmsg("prefill: chunked M=%d\n",pchunk);
-        } else
-        for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=glm5_forward_token(m,x,p); }
+        } else {
+        /* GLM5_TF_CHECK: teacher-forcing accuracy -- does argmax at pos p predict prompt[p+1]?
+         * A correct LM scores ~40-80%; a broken forward ~0%. Compares int8 vs bf16 to localize. */
+        int tf_check=envi("GLM5_TF_CHECK",0), tf_ok=0, tf_tot=0;
+        for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=glm5_forward_token(m,x,p);
+            if(tf_check && p+1<n_prompt){ tf_tot++; if(pf_last==prompt[p+1]) tf_ok++;
+                if(MyRank==0 && p<12) logmsg("TF p=%d pred=%d actual=%d %s\n",p,pf_last,prompt[p+1],pf_last==prompt[p+1]?"HIT":"."); } }
+        if(tf_check && MyRank==0) logmsg("TF_ACCURACY %d/%d = %.1f%% (argmax(p)==prompt[p+1]; real LM ~40-80%%, broken ~0%%)\n",
+                                         tf_ok,tf_tot, tf_tot?100.0*tf_ok/tf_tot:0.0);
+        }
         prof_snapshot(m,prof_gen_pf);
         double tpf=now_sec()-t0;
         double gen_pf_ar=g_ar_secs; long gen_pf_calls=g_ar_calls, gen_pf_frags=g_ar_frags;
@@ -811,6 +837,7 @@ int main(void){
         g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
         double td0=now_sec();
         for(int g=0;g<max_new;g++){ gen[ng++]=cur; if((cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) && ng>=min_new) break;
+            m->samp_hist=gen; m->samp_hist_n=ng;   /* repetition penalty over tokens so far */
             embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
             for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
         double td=now_sec()-td0;
@@ -899,6 +926,7 @@ int main(void){
                 for(int g=0; g<gen_new && pos<m->cfg.max_pos; g++){
                     gen[ng++]=cur;
                     if(cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) break;
+                    m->samp_hist=gen; m->samp_hist_n=ng;   /* repetition penalty over tokens so far */
                     embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,pos++);
                 }
                 if(GRank==0){

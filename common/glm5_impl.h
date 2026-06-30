@@ -844,7 +844,8 @@ static void glm5_alloc_scratch(glm5_model*m,int hrows){
     m->s_router=glm5_amalloc((size_t)cfg->n_experts*4); m->s_shg=glm5_amalloc(cfg->moe_inter*4); m->s_shu=glm5_amalloc(cfg->moe_inter*4);
     m->s_sh=glm5_amalloc(H*4); m->s_moe=glm5_amalloc(H*4); m->s_exg=glm5_amalloc(cfg->moe_inter*4); m->s_exu=glm5_amalloc(cfg->moe_inter*4); m->s_route=glm5_amalloc(H*4);
     m->s_ff_g=glm5_amalloc(cfg->dense_inter*4); m->s_ff_u=glm5_amalloc(cfg->dense_inter*4); m->s_ff=glm5_amalloc(H*4);
-    m->s_logits=glm5_amalloc((size_t)hrows*4);
+    /* full-vocab sized (>= hrows) so decode sampling can gather the sharded logits in place */
+    m->s_logits=glm5_amalloc((size_t)(hrows>cfg->vocab?hrows:cfg->vocab)*4);
 }
 
 static glm5_model* glm5_clone_runtime(glm5_model*src){
@@ -1110,7 +1111,17 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
                 { glm5_ent*e=REQ(LN("self_attn.indexer.k_norm.weight")); if(e) L->idx_k_norm=glm5_cp_full(base,e); }
                 { glm5_ent*e=REQ(LN("self_attn.indexer.k_norm.bias")); if(e) L->idx_k_bias=glm5_cp_full(base,e); }
             }
-            { glm5_ent*e=REQ(LN("mlp.gate.weight")); if(e) L->gate=(glm5_tensor){glm5_cp_full(base,e),NULL,GLM5_BF16,cfg.n_experts,H}; }
+            { glm5_ent*e=REQ(LN("mlp.gate.weight")); if(e){
+                /* router gate is stored F32 in the int8 ckpt (bf16 in the bf16 ckpt). The matvec
+                 * expects bf16, so convert F32->bf16; reading the F32 bytes as bf16 silently
+                 * scrambles the router (~10x weak -> flat scores -> broken expert selection). */
+                void*gw;
+                if(e->f32){ size_t ne=(size_t)cfg.n_experts*H; uint16_t*d=glm5_amalloc(ne*2);
+                    const uint32_t*s=(const uint32_t*)(base+e->off);
+                    for(size_t i=0;i<ne;i++){ uint32_t b=s[i]; d[i]=(uint16_t)((b+0x8000u+((b>>16)&1))>>16); } /* round-to-nearest-even */
+                    glm5_blob_dontneed(base,e->off,e->nbytes); gw=d;
+                } else gw=glm5_cp_full(base,e);
+                L->gate=(glm5_tensor){gw,NULL,GLM5_BF16,cfg.n_experts,H}; } }
             { glm5_ent*e=REQ(LN("mlp.gate.e_score_correction_bias")); if(e) L->gate_bias=glm5_cp_full(base,e); }
             L->sh_w1=glm5_load_w(es,n,base,LN("mlp.shared_experts.gate_proj.weight"),1,sh_r0,sh_rows,0,0,cfg.moe_inter,H,&ok,&used);
             L->sh_w3=glm5_load_w(es,n,base,LN("mlp.shared_experts.up_proj.weight"),1,sh_r0,sh_rows,0,0,cfg.moe_inter,H,&ok,&used);
@@ -1332,6 +1343,48 @@ static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*
 static glm5_tensor glm5_tensor_rows(const glm5_tensor*t,int r0,int rows);
 static void glm5_tensor_tmul_rows(const glm5_model*m,float*y,const glm5_tensor*t,int r0,int rows,const float*x);
 
+/* ===================== decode sampling (lockstep) =====================
+ * Operates on the full, replicated logit vector in m->s_logits (identical on every rank).
+ * With an identical rng seed + identical history on all ranks, every rank picks the SAME
+ * token, so the replicated-dense / lockstep invariant is preserved exactly. Only used when
+ * the lm_head is replicated (head.rows==vocab); the sharded-head path falls back to argmax. */
+static inline double glm5_rng_unif(uint64_t*s){          /* xorshift64* -> [0,1) */
+    uint64_t x=*s; x^=x>>12; x^=x<<25; x^=x>>27; *s=x;
+    return (double)((x*0x2545F4914F6CDD1DULL)>>11) * (1.0/9007199254740992.0);
+}
+static const float*g_glm5_samp_lg;                       /* qsort key (decode is single-threaded) */
+static int glm5_samp_cmp(const void*a,const void*b){
+    float x=g_glm5_samp_lg[*(const int*)a], y=g_glm5_samp_lg[*(const int*)b];
+    return (x<y)-(x>y);                                  /* descending */
+}
+static int glm5_sample_logits(glm5_model*m,int vocab){
+    float*lg=m->s_logits;
+    /* 1. repetition penalty over generated history (CTRL/HF-style: each UNIQUE token penalized
+     * ONCE -- not per-occurrence, which would crush frequent tokens by pen^count and degenerate). */
+    if(m->samp_rep_pen>1.0f && m->samp_hist){
+        float p=m->samp_rep_pen;
+        for(int i=0;i<m->samp_hist_n;i++){ int t=m->samp_hist[i];
+            if((unsigned)t>=(unsigned)vocab) continue;
+            int first=1; for(int j=0;j<i;j++) if(m->samp_hist[j]==t){ first=0; break; }
+            if(first){ float v=lg[t]; lg[t]=(v>0.0f)?v/p:v*p; } }
+    }
+    /* 2. temperature + stable softmax (rewrite lg in place as probabilities) */
+    float it=1.0f/m->samp_temp;
+    float mx=lg[0]; for(int v=1;v<vocab;v++) if(lg[v]>mx) mx=lg[v];
+    double sum=0; for(int v=0;v<vocab;v++){ float e=expf((lg[v]-mx)*it); lg[v]=e; sum+=e; }
+    float inv=(float)(1.0/sum); for(int v=0;v<vocab;v++) lg[v]*=inv;
+    /* 3. top-p nucleus: sort indices by prob desc, accumulate to top_p */
+    int*idx=m->samp_idx; if(!idx) return 0;
+    for(int v=0;v<vocab;v++) idx[v]=v;
+    g_glm5_samp_lg=lg; qsort(idx,(size_t)vocab,sizeof(int),glm5_samp_cmp);
+    double cum=1.0; int nuc=vocab;
+    if(m->samp_topp<1.0f){ cum=0.0; for(int k=0;k<vocab;k++){ cum+=lg[idx[k]]; if(cum>=(double)m->samp_topp){ nuc=k+1; break; } } }
+    /* 4. sample within the (renormalized) nucleus */
+    double r=glm5_rng_unif(&m->samp_rng)*cum, acc=0; int pick=idx[0];
+    for(int k=0;k<nuc;k++){ acc+=lg[idx[k]]; if(acc>=r){ pick=idx[k]; break; } }
+    return pick;
+}
+
 /* ===================== forward (one token at position pos) ===================== */
 static int glm5_forward_token(glm5_model*m,float*x,int pos){
     const glm5_config*c=&m->cfg;
@@ -1515,7 +1568,21 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
     /* head: vocab-shard partial logits -> (TP_HEAD) global argmax via ar_argmax, else full */
     double pt=glm5_prof_now();
     float*h2=m->s_norm; glm5_rmsnorm_gemma(h2,x,m->out_norm,H,c->norm_eps);
-    int hrows=m->head.rows; glm5_mv(m,m->s_logits,&m->head,h2,hrows,H);
+    int hrows=m->head.rows;
+    /* sampling: needs the FULL distribution on every rank. Replicated head -> s_logits is already
+     * full; vocab-SHARDED head -> scatter each shard to its global offset + EP all-reduce to gather
+     * the full logit vector identically on every rank (lockstep), then sample. */
+    if(m->samp_temp>0.0f){
+        if(hrows<c->vocab){
+            memset(m->s_logits,0,(size_t)c->vocab*4);
+            glm5_mv(m,m->s_logits+m->head_r0,&m->head,h2,hrows,H);
+            if(m->ar_cb) m->ar_cb(m->s_logits,c->vocab,m->ar_ctx);
+        } else glm5_mv(m,m->s_logits,&m->head,h2,hrows,H);
+        int t=glm5_sample_logits(m,c->vocab);
+        glm5_prof_add(m,GLM5_P_HEAD,pt);
+        return t;
+    }
+    glm5_mv(m,m->s_logits,&m->head,h2,hrows,H);   /* greedy: shard (or full) at offset 0 */
     int la=0; float lv=m->s_logits[0]; for(int i=1;i<hrows;i++) if(m->s_logits[i]>lv){lv=m->s_logits[i];la=i;}
     int32_t gidx=m->head_r0+la; float gval=lv;
     if(hrows<c->vocab && m->ar_argmax_cb) m->ar_argmax_cb(&gval,&gidx,m->ar_argmax_ctx);  /* TP_HEAD merge */
