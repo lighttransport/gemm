@@ -322,3 +322,4 @@ ryzen/bench_nn_ops
 # Never track Claude session state or stray captured stderr logs
 .claude/
 *_stderr.txt
+.rocprofv3/
