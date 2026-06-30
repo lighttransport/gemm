@@ -27,6 +27,19 @@ predictions unchanged** (decode is 99% all-reduce; the bandwidth term is sub-ms 
   i.e. compute/bandwidth is nowhere near the limit. This **independently confirms the sim's central
   thesis**: the measured 0.25 tok/s decode *cannot* be compute/bandwidth — it must be communication.
 
+## INT8 SDOT throughput — verified after fixing qlair's peak model
+qlair originally reported `GFLOPS 0.0` for int8 SDOT kernels (SDOT is integer, uncounted) and
+carried a stale "307.2 GFLOPS/core" comment. Fixed (commit in ~/work/clair): the per-FP peaks are
+FP64 64 / FP32 128 / FP16 256 GFLOPS (already correct in code), and **added int8 SDOT GIOPS vs the
+512 GIOPS/core peak** (2 FLA * 16 lanes * 4 int8-MAC * 2 ops * GHz). A looped int8 6x4 SDOT
+microkernel (460,800 SDOT, cache-resident -> compute-bound):
+```
+INT8 GIOPS: 201.9 (39.4% of 512 peak)   IPC 2.22
+```
+**Cross-checks the measured A64FX**: the session's int8 SDOT bench hit ~55% efficiency on an
+optimized 2048^2 GEMM; qlair's 39.4% for this smaller microkernel is the right ballpark -> the
+512-peak fix is correct and qlair reproduces realistic int8 compute efficiency.
+
 ## What qlair CANNOT reproduce (and why) — the comm-bound number
 - The measured decode/prefill **tok/s is multi-node, uTofu-all-reduce-bound** (the sim's dominant
   term: 153 AR/token at ~26 ms). qlair is **single-node with no network/uTofu model**, so it cannot
