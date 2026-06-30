@@ -26,7 +26,7 @@ MOE_INTER, DENSE_INTER = 2048, 12288
 N_EXP, N_ACT, VOCAB = 256, 8, 154880
 
 # ---------- platform ----------
-BW_NODE = 150e9            # effective per-node HBM matvec bandwidth (A64FX HBM2 ~256 GB/s peak; ~60% eff)
+BW_NODE = 300e9            # per-node EFFECTIVE matvec HBM bandwidth. qlair/A64FX HBM2 peak=1024 GB/s/node (4 stacks); measured decode-BW bench ~300 matvec / ~770 load. (was 150)
 AR_M1_96 = 0.25            # measured M=1 96n tok/s -> calibrates the comm term
 
 # ---------- weight params (then bytes by precision) ----------
