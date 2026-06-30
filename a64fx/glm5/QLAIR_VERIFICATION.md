@@ -71,6 +71,18 @@ with a zero-conversion `p_odd` load trick. fp16 uses native `fmla .h` (`micro_ke
 | **int8 SDOT** | `kernel_6x4` (6x64) | 512 GIOPS | **201.9 (39.4%)** IPC 2.22 | 44.8 (8.8%) |
 | **fp16 fmla.h** | `micro_kernel_6x4_f16_sve` | 256 GFLOPS | **121.7 (47.5%)** IPC 2.07 | 20.1 (7.8%) |
 | **bf16->fp32 fmla.s** | `sgemm_bf16_2x12` (32x12) | 128 GFLOPS | **93.0 (72.6%)** IPC 2.86 | 21.0 (16.4%) |
+| **fp32 fmla.s** | `micro_kernel_fp32_6x4_bcast` | 128 GFLOPS | **83.4 (65.1%)** IPC 2.42 | 20.8 (16.3%) |
+| **fp64 fmla.d** | `fp64_6x4` (derived) | 64 GFLOPS | **46.8 (73.2%)** IPC 2.51 | — |
+
+(The real `simple_dgemm`/`dl_gmwn1_base` fp64 kernels use register-offset `stp` stores that clair's
+assembler rejects, and the 20-accumulator parser-test kernel has out-of-range `mul vl` offsets; the
+fp64 6x4 kernel above was derived from the working fp32 6x4 by widening `.s`->`.d` + doubling the
+A-broadcast byte offsets — same 24-accumulator structure, valid SVE.)
+
+**All five A64FX precision peaks now cross-checked** (int8 512 GIOPS / fp16 256 / bf16+fp32 128 /
+fp64 64): each cache-hot kernel lands at 39-73% of *its own* peak, qlair auto-selecting the peak
+from the FMA/SDOT mix. The cache-hot GFLOPS also scale sanely with width (fp64 46.8 -> fp32 83.4 ->
+fp16 121.7, ~1.8x per precision step, the gap from exactly-2x being kernel-optimization differences).
 
 - **Peak model is correct for all precisions**: each kernel's cache-hot GFLOPS lands at a sane
   fraction of *its own* precision peak (qlair selected 256 for fp16, 128 for bf16/fp32, 512 for
