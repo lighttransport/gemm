@@ -1,8 +1,9 @@
 # Verifying decode_sim.py against the qlair A64FX cycle simulator
 
 Ran kernels through the local **qlair** A64FX cycle-accurate simulator (`~/work/clair/clair/build/qlair`)
-to check what of `decode_sim.py` and the measured A64FX perf is reproducible. qlair is **single-node**
-(per-core pipeline + cache + HBM model); it has no network model, so it bounds what can be checked.
+to check what of `decode_sim.py` and the measured A64FX perf is reproducible. qlair models a per-core
+pipeline + cache + HBM, **and** a uTofu RDMA interconnect with a Fugaku-calibrated put/get latency
+model (see the uTofu section below) — though without a multi-node Tofu *topology*.
 
 ## qlair's A64FX model (src/arch-data-a64fx.hh) — matches the real chip
 | | value |
@@ -96,19 +97,39 @@ fp16 121.7, ~1.8x per precision step, the gap from exactly-2x being kernel-optim
   naive microkernel-per-tile loop; the gap to the cache-hot ceiling is the blocking/pipelining a
   tuned GEMM adds.
 
-## What qlair CANNOT reproduce (and why) — the comm-bound number
+## uTofu interconnect — qlair DOES model it (correction)
+An earlier version of this note said qlair is "single-node with no network/uTofu model." That is
+**wrong**: qlair has a uTofu RDMA simulator (`tools/qlair/tofu/`) intercepting the full uTofu API
+(`utofu_create_vcq`/`reg_mem`/`put`/`poll_tcq`/`poll_mrq`/VBG barrier+reduce/MPI collectives) with
+a **latency model calibrated from real Fugaku 2-node measurements** (`put_ns = 1400 + bytes/6.3`,
+i.e. ~1.4 µs base + 6.3 GB/s per TNI). A 2-endpoint put test (`qlair/utofu_2node_*.c`, run with
+`--cores 2` to enable the sim) measured, from the guest's own `CNTVCT_EL0`:
+```
+   64 B: 1.41 us  0.04 GB/s     16 KB: 4.00 us  4.08 GB/s
+ 1024 B: 1.56 us  0.65 GB/s     64 KB:11.80 us  5.54 GB/s
+ 4096 B: 2.05 us  1.99 GB/s     (-> 6.3 GB/s/TNI asymptote)
+```
+— reproducing the calibrated model exactly. **What it still can't do**: there is no multi-node Tofu
+*topology* (the two ranks are CMGs sharing one address space; no hop-count / link-contention /
+recursive-doubling-tree model). So it gives the **per-transfer hardware floor (~1.4 µs)** but not the
+collective's wire schedule.
+
+## What qlair CANNOT reproduce (and why) — the comm-bound decode number
 - The measured decode/prefill **tok/s is multi-node, uTofu-all-reduce-bound** (the sim's dominant
-  term: 153 AR/token at ~26 ms). qlair is **single-node with no network/uTofu model**, so it cannot
-  produce the 0.25 tok/s or validate the AR-latency calibration. That term stays anchored to the
-  real-cluster measurement.
+  term: 153 AR/token at ~26 ms). qlair models a single uTofu *put* (~1.4 µs floor, above) but **not
+  the multi-node all-reduce schedule** — and crucially the measured 26 ms/AR is dominated by the
+  **robust-completion drain** (trailer-seq/civac/MRQ), ~4 orders of magnitude above the 1.4 µs wire
+  floor qlair confirms. So qlair validates the hardware floor but the AR-drain cost stays anchored to
+  the real-cluster measurement.
 - Practical caveats: the `clair` compiler is fragile (segfaults on float / complex C — only integer
   freestanding C compiled here); prebuilt ELFs are tiny unit tests; the BW path is single-core
   (the node's 1024 GB/s needs all 48 cores + a streaming kernel, not the dependency-bound matvec).
 
 ## Verdict
 qlair **validates the A64FX compute model** `decode_sim.py` relies on (clock, cache hierarchy, and
-especially the HBM peak — which corrected `BW_NODE`), and **independently confirms decode is comm-
-not compute-bound**. It **cannot reproduce the measured comm-bound tok/s** (single-node, no network),
-so the uTofu all-reduce cost in the sim remains calibrated to the real cluster, not qlair. Net: the
-compute/bandwidth half of the sim is now cross-checked against a cycle-accurate model; the comm half
-needs the real cluster or a Tofu network simulator.
+especially the HBM peak — which corrected `BW_NODE`), **independently confirms decode is comm- not
+compute-bound**, and **reproduces the uTofu per-transfer latency floor** (~1.4 µs base, 6.3 GB/s/TNI,
+calibrated to real 2-node Fugaku). What it still **cannot** reproduce is the multi-node all-reduce
+*schedule* and especially the ~26 ms robust-completion drain that dominates the measured decode — that
+term stays anchored to the real cluster. Net: the compute/bandwidth half AND the uTofu wire-cost floor
+are now cross-checked against qlair; only the collective drain/topology cost needs the real cluster.
