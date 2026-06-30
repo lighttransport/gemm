@@ -75,10 +75,14 @@ with a zero-conversion `p_odd` load trick. fp16 uses native `fmla .h` (`micro_ke
 | **fp32 fmla.s** | `micro_kernel_fp32_6x4_bcast` | 128 GFLOPS | **83.4 (65.1%)** IPC 2.42 | 20.8 (16.3%) |
 | **fp64 fmla.d** | `fp64_6x4` (derived) | 64 GFLOPS | **46.8 (73.2%)** IPC 2.51 | — |
 
-(The real `simple_dgemm`/`dl_gmwn1_base` fp64 kernels use register-offset `stp` stores that clair's
-assembler rejects, and the 20-accumulator parser-test kernel has out-of-range `mul vl` offsets; the
-fp64 6x4 kernel above was derived from the working fp32 6x4 by widening `.s`->`.d` + doubling the
-A-broadcast byte offsets — same 24-accumulator structure, valid SVE.)
+(The fp64 6x4 kernel above was derived from the working fp32 6x4 by widening `.s`->`.d` + doubling the
+A-broadcast byte offsets — same 24-accumulator structure, valid SVE. It is the high-efficiency
+reference. The real `simple_dgemm`/`dl_gmwn1_base` Fujitsu kernels originally **wouldn't assemble** in
+clair — fixed upstream now (clair `bf36ff3f`: GNU bare/expr immediates, `sbfiz`/`madd`/`prfm`, xzr
+base/index). `simple_dgemm` (a naive 1-accumulator DGEMM) now runs at **2.9 GFLOPS (4.5% of 64)** —
+latency-bound, as expected for one accumulator, but it confirms qlair selects the fp64 64 peak on a
+real kernel. The 20-accumulator parser-test kernel stays unusable: out-of-range `mul vl` offsets — a
+parser fixture, not valid A64FX.)
 
 **All five A64FX precision peaks now cross-checked** (int8 512 GIOPS / fp16 256 / bf16+fp32 128 /
 fp64 64): each cache-hot kernel lands at 39-73% of *its own* peak, qlair auto-selecting the peak
