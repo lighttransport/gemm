@@ -87,6 +87,13 @@ def pred_tok_s(N, M, ctx=128, prec='int8', mtp=0.0, shard_attn=SHARD_ATTN):
     if mtp>0: agg *= (1+mtp)/1.18
     return agg
 
+def m1_tput(N, shard_attn, round_ms, ctx=128):
+    """Single-stream (M=1) tok/s with an OVERRIDABLE per-AR-round cost (round_ms) so we can model a
+    leaner decode-AR completion path. round_ms = UTOFU_ROUND default reproduces the measured 0.25."""
+    nar = n_allreduce(shard_attn)
+    ar  = UTOFU_INIT + math.ceil(math.log2(N))*round_ms*1e-3 + (1*H*4)*UTOFU_BW
+    return 1.0/(nar*ar + active_bytes_per_node(N,1,ctx,'int8',shard_attn)/BW_NODE)
+
 # ---------- report ----------
 def hdr(s): print("\n"+s+"\n"+"-"*len(s))
 print(__doc__)
@@ -133,6 +140,17 @@ for M in [1,8,16,32,64]:
 hdr("Long-context UB (96n, int8) — KV read grows the floor")
 for L in [128,2048,8192,32768]:
     print(f"  ctx={L:>6}: UB M=1 {ub_tok_s(96,1,L):>6.0f}  M=16 {ub_tok_s(96,16,L):>6.0f} tok/s")
+
+hdr("M=1 lever-stack -> 1 tok/s (single-stream, NO MTP, NO batching)")
+R0 = UTOFU_ROUND*1e3                                              # calibrated per-round cost (~3.4 ms)
+print(f"  target: 1.00 tok/s (4x over 0.25). 1 AR/layer budget = ~13 ms/AR; current = {_ar96*1e3:.0f} ms/AR.")
+print(f"  {'baseline 96n, 2 AR/layer':<46} {m1_tput(96,True ,R0):>5.2f} tok/s")
+print(f"  {'+ 2->1 AR (replicate attention) @96n':<46} {m1_tput(96,False,R0):>5.2f}   (safe; ~2x)")
+print(f"  {'+ smallest int8-fit node count @32n':<46} {m1_tput(32,False,R0):>5.2f}   (safe; smaller AR group)")
+print(f"  {'+ leaner decode-AR completion 1.7 ms/round':<46} {m1_tput(32,False,1.7):>5.2f}   (RISKY: relaxes robust-completion)")
+print(f"  {'+ leaner completion 1.0 ms/round':<46} {m1_tput(32,False,1.0):>5.2f}")
+print(f"  note: round-cost is the trailer-seq/civac/MRQ robustness tax ({R0:.1f} ms vs ~0.02 ms HW floor);")
+print(f"        trimming it is the only lever needing a job to validate (correctness under the races it fixed).")
 
 hdr("Takeaways")
 print(f"""  * THEORETICAL UPPER BOUND (bandwidth) at 96n int8: ~{ub_tok_s(96,1,128):.0f} tok/s (M=1, sharded attn),
