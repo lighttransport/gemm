@@ -16,9 +16,12 @@ wrong result — see the `signed char` bug below).
 | `int8_matvec.c` | core w8a16 GEMV `scale·Σ int8·x` (per-channel) | 16×64, f32 | ok=1, =gcc |
 | `online_softmax.c` | flash-attention streaming softmax (running max+rescale) | N=128 | ok=1, =gcc |
 | `masked_topk.c` | router top-k with expert mask (continue/break/gather) | E=32, K=4 | ok=1, =gcc |
+| `int8_unpack.c` | compressed-tensors unpack (4 int8/int32) + dequant matvec | 8×16 | ok=1, =gcc |
+| `mla_proj.c` | MLA low-rank down→up projection chain (kv_lora compress) | 32→8→24 | ok=1, =gcc |
+| `causal_attn.c` | causal-masked attention scores + streaming softmax + context | T=12, Dh=8 | ok=1, =gcc |
 
-### Two `-O0` clair bugs found by these kernels (both fixed)
-The recommended `-O0` path was assumed solid; two kernels surfaced real defects:
+### `-O0` clair bugs found by these kernels (all fixed)
+The recommended `-O0` path was assumed solid; these kernels surfaced real defects:
 - **nested array subscript `a[b[k]]`** (a gather — MoE expert / KV-index lookup)
   computed the *wrong array's* element: the base address was held in a fixed
   register that the inner subscript clobbered. Found by `masked_topk`; fixed in
@@ -28,6 +31,13 @@ The recommended `-O0` path was assumed solid; two kernels surfaced real defects:
   unsigned, so int8 −100 became 156 — silently corrupting int8 weight math while
   the self-check still read `ok=1`. Caught only by the gcc cross-check on
   `int8_matvec`; fixed in clair `79db4fc6`.
+- **integer-literal init of a float/double array** (`float w[]={1,0,0,1}`) emitted
+  `.word 1` (a denormal ~0) instead of the IEEE754 bits, so such arrays loaded as
+  zeros. Found by `mla_proj` / a matvec chain; fixed in clair `dd7e48a8`.
+- **left shift `a<<b` returned `a>>b` or garbage**: the assembler added op2 on top
+  of a base that already held the LSLV opcode (so `lsl` assembled as `asr`), and
+  `-O0` codegen routed LeftShift through a mis-emitting generic path. Found by
+  `int8_unpack` (word packing `|= byte<<(8*l)`); fixed in clair `7fbff38b`.
 
 ## Compute/comm mixture (per-layer step)
 `moe_layer_mix.c` and `attn_layer_mix.c` run **compute + uTofu comm in one qlair
