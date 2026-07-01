@@ -43,21 +43,37 @@ simulation, so the *structure* (which ops, how many transfers, payload sizes) is
 Two clair `-O` codegen defects were found while writing these (both **only** at
 `-O`; `-O0` is correct, and qlair simulates identically):
 
-1. **`-O` float codegen** — went from "every float is 0" to handling the
-   common cases, across clair `1c956cc0` → `93fb5ca4` → `e3d53986`:
-   - float/double **globals** were emitted as `.long 0` (root cause) — fixed.
-   - float32 register-width bugs (FPTOSI/SITOFP/FCMP/float-literal used `dN`
-     for single) — fixed.
-   - **ternary `?:`** wasn't lowered at all (emitted no code) — now lowers to
-     SELECT, plus the `fcsel` assembler encoding it needs.
+1. **`-O` float codegen** — went from "every float is 0" to running real
+   float array kernels, across clair `1c956cc0` → `93fb5ca4` → `e3d53986` →
+   `7bef4c3f` → `e49b5f26` → `1836cbf8`:
+   - float/double **globals** emitted as `.long 0` (root cause) — fixed;
+     float-array **int-literal** inits (`float p[]={1,2,3,4}`) emitted as raw
+     ints (≈0 denormals) — now stored as IEEE754 bits.
+   - float32 register-width bugs (FPTOSI/SITOFP/FCMP/float-literal/**fmadd**
+     used `dN` for single) — fixed.
+   - **ternary `?:`** wasn't lowered (emitted no code) — now lowers to SELECT,
+     plus the `fcsel` assembler encoding it needs.
    - **mixed int/float** ops (`x*10`, `y<0`) built `fmul s,s,x` — now promote
      the int operand via SITOFP.
-   Verified at `-O`: `a*b=6`, `x*10=10`, `(a>b)?11:22`, `(a<i)?1:0`, relu.
-   **Still a long tail** (compound-assign `+=` mixed promotion, some
-   select-with-value-arms, `sqrtf`/`expf` at `-O`), so the full kernels here
-   aren't all `-O`-clean yet — **keep `-O0` for them** (qlair simulates
-   identically). An `optimizeFMA` use-after-free on loop-carried PHIs also
-   remains for the `-O`+FMA path.
+   - **float array subscript** `a[i]` typed its load with the raw array type
+     (`float[4]`), so elements landed in GP registers → invalid `fadd s,s,x`;
+     and a **global array** base loaded element 0 instead of decaying to its
+     address. Both fixed (read and compound-assign `p[i]*=s` paths).
+   - **FMA fusion use-after-free**: `acc += a*b` fused `FADD(FMUL)`→`FMA` and
+     freed the old FADD without redirecting a loop-carried PHI's `phi_incoming`
+     → SIGSEGV. Now rewires all uses; dot-product / sum-of-squares works.
+   Verified at `-O`: `a+b*c=14`, float-array dot=240, `int8_dequant` **ok=1**,
+   `swiglu` compiles (see below).
+   **Remaining `-O` blockers** (kernels still use `-O0`; qlair identical):
+   - a **cross-block global-address clobber** — a global's address register
+     (e.g. `x22`) is cached across basic blocks but a loop condition's
+     `cset x22` overwrites it, so the post-loop read hits ~0. Re-materialising
+     the `adrp` per use fixes swiglu/`p[i]*=s` but exposes a register-allocator
+     **over-subscription** (the re-emit clobbers a live temp), regressing
+     `int8_dequant` — so it's not yet landed; the allocator fix is the gate.
+   - an **`if`-inside-loop** form (argmax/max: `if(a[i]>mx) mx=a[i]`) infinite-
+     loops at `-O`; `sqrtf`/`expf` at `-O` still open. These stall
+     `rmsnorm`/`router_topk` at `-O`.
 
 2. **`long += (long)(float)` loop-accumulate is wrong** (both backends): summing
    `float→long` conversions into a `long` accumulator over an array injects a
