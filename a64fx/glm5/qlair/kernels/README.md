@@ -19,6 +19,16 @@ wrong result — see the `signed char` bug below).
 | `int8_unpack.c` | compressed-tensors unpack (4 int8/int32) + dequant matvec | 8×16 | ok=1, =gcc |
 | `mla_proj.c` | MLA low-rank down→up projection chain (kv_lora compress) | 32→8→24 | ok=1, =gcc |
 | `causal_attn.c` | causal-masked attention scores + streaming softmax + context | T=12, Dh=8 | ok=1, =gcc |
+| `expert_meta.c` | MoE expert dispatch: indirect gather/scatter `x[route[e]]` | E=8 | ok=1, =gcc |
+| `gate_mask.c` | router gate mask with short-circuit `&&`/`\|\|` (+side effects) | E=16 | ok=1, =gcc |
+| `silu_helper.c` | SwiGLU via user `float silu(float)`/`mul()` calls in a loop | M=64 | ok=1, =gcc |
+
+**Known clair limitation — no struct support:** `-O0` struct member access is
+broken (writes ignore the field offset; reads return the base address), so these
+kernels use **parallel arrays** instead of structs (as `expert_meta` shows). Not
+fixed — the GLM5.2 kernels don't require structs. Working at `-O0`: short-circuit
+`&&`/`||` with correct side-effect ordering, and user function calls with float
+args/returns (`gate_mask`, `silu_helper`).
 
 ### `-O0` clair bugs found by these kernels (all fixed)
 The recommended `-O0` path was assumed solid; these kernels surfaced real defects:
