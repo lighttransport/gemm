@@ -62,22 +62,26 @@ Two clair `-O` codegen defects were found while writing these (both **only** at
    - **FMA fusion use-after-free**: `acc += a*b` fused `FADD(FMUL)`→`FMA` and
      freed the old FADD without redirecting a loop-carried PHI's `phi_incoming`
      → SIGSEGV. Now rewires all uses; dot-product / sum-of-squares works.
-   Verified at `-O`: `a+b*c=14`, float-array dot=240, `int8_dequant` **ok=1**,
-   `swiglu` compiles (see below).
-   **Remaining `-O` blockers** (kernels still use `-O0`; qlair identical):
+   - **half-finished SSA PHI-at-merge** (`insertPhiNodesAtMerge`) rebound every
+     live local from its alloca (`i32*`) to a PHI *value* (`i32`) after each
+     `if`. Since the backend is memory-based, a later `i++` then `createLoad`ed
+     the i32 value as an `i32*` address, writing `i+1` to `&a[i]` instead of
+     `&i` → the loop counter froze and float `if`-in-loop argmax **spun
+     forever**. Now skipped for alloca-backed vars (`4ec29cb5`); this unhung
+     `rmsnorm`/`router_topk`.
+   Verified at `-O`: `a+b*c=14`, float-array dot=240, int argmax, and
+   **`int8_dequant` ok=1 + `router_topk` ok=1** run clean.
+   **Remaining `-O` blockers** — all now converge on one subsystem, the `-O`
+   **register allocator** (kernels still use `-O0`; qlair identical):
    - a **cross-block global-address clobber** — a global's address register
      (e.g. `x22`) is cached across basic blocks but a loop condition's
      `cset x22` overwrites it, so the post-loop read hits ~0. Re-materialising
-     the `adrp` per use fixes swiglu/`p[i]*=s` but exposes a register-allocator
-     **over-subscription** (the re-emit clobbers a live temp), regressing
-     `int8_dequant` — so it's not yet landed; the allocator fix is the gate.
-   - a **`float` `if`-inside-loop** (argmax/max: `if(a[i]>mx) mx=a[i]`)
-     infinite-loops at `-O`. Traced: the for-increment's `i++` load resolves
-     its address to a stale i32 *value* register (the body's `&a[i]` GEP)
-     instead of `&i`, so `i++` writes to `&a[i]` and `i` never advances. The
-     **int** form (`if2`) is well-formed and works — it's specific to float
-     `if`-bodies. `sqrtf`/`expf` at `-O` still open. Together these stall
-     `rmsnorm`/`router_topk` at `-O`.
+     the `adrp` per use *does* fix `swiglu` and float argmax **correctness**
+     (`c3a` 25→30) — but it raises register pressure and exposes allocator
+     **over-subscription** (a `(float)v` conversion reads a GEP address because
+     the value register was clobbered), regressing `int8_dequant` 1→0. So it's
+     not landed: the allocator's liveness/over-subscription fix is the gate.
+   - `sqrtf`/`expf` at `-O` still open (part of why `rmsnorm` is `ok=0`).
 
 2. **`long += (long)(float)` loop-accumulate is wrong** (both backends): summing
    `float→long` conversions into a `long` accumulator over an array injects a
