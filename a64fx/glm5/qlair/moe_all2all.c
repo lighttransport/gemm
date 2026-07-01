@@ -34,8 +34,8 @@ static void rep(const char* label, int N, size_t per){
   int tni = (N-1) < 6 ? (N-1) : 6;
   uint64_t par = ns / (tni>0?tni:1);
   uint64_t bw100 = par ? (uint64_t)per*(N-1)*100/par : 0;
-  printf("  %-22s N=%d  pair=%7luB  ser=%7lu ns  par=%7lu ns  %2lu.%02lu GB/s\n",
-         label, N, (unsigned long)per,
+  printf("  %-22s N=%d  pair=%7luB  steps=%d  ser=%7lu ns  par=%7lu ns  %2lu.%02lu GB/s\n",
+         label, N, (unsigned long)per, N-1,
          (unsigned long)ns, (unsigned long)par,
          (unsigned long)(bw100/100), (unsigned long)(bw100%100));
 }

@@ -24,18 +24,18 @@ cost**, i.e. the hardware floor — not the full collective schedule.
 ## Raw run (aligned `%-22s` labels; `qlair --cores 2 -p`)
 ```
 GLM5 MoE all-to-all comm cost (qlair uTofu, TNIs=6)
-  decode dispatch        N=4  pair=   6144B  ser=   9321 ns  par=   3107 ns   5.93 GB/s
-  decode dispatch        N=8  pair=   6144B  ser=  14449 ns  par=   2408 ns  17.86 GB/s
-  decode combine         N=4  pair=   6144B  ser=   9551 ns  par=   3183 ns   5.79 GB/s
-  decode combine         N=8  pair=   6144B  ser=  18914 ns  par=   3152 ns  13.64 GB/s
-  prefill dispatch c64   N=4  pair= 786432B  ser= 504964 ns  par= 168321 ns  14.01 GB/s
-  prefill dispatch c64   N=8  pair= 393216B  ser= 510408 ns  par=  85068 ns  32.35 GB/s
-  attn all-reduce        N=4  pair=   2048B  ser=   3522 ns  par=   1174 ns   5.23 GB/s
-  attn all-reduce        N=8  pair=   2048B  ser=  13939 ns  par=   2323 ns   6.17 GB/s
+  decode dispatch        N=4  pair=   6144B  steps=3  ser=   9321 ns  par=   3107 ns   5.93 GB/s
+  decode dispatch        N=8  pair=   6144B  steps=7  ser=  14447 ns  par=   2407 ns  17.86 GB/s
+  decode combine         N=4  pair=   6144B  steps=3  ser=   9330 ns  par=   3110 ns   5.92 GB/s
+  decode combine         N=8  pair=   6144B  steps=7  ser=  14411 ns  par=   2401 ns  17.91 GB/s
+  prefill dispatch c64   N=4  pair= 786432B  steps=3  ser= 504938 ns  par= 168312 ns  14.01 GB/s
+  prefill dispatch c64   N=8  pair= 393216B  steps=7  ser= 510457 ns  par=  85076 ns  32.35 GB/s
+  attn all-reduce        N=4  pair=   2048B  steps=3  ser=   3524 ns  par=   1174 ns   5.23 GB/s
+  attn all-reduce        N=8  pair=   2048B  steps=7  ser=  13938 ns  par=   2323 ns   6.17 GB/s
 ```
-(`par` = serialized / min(6, N-1) TNIs. Keep printf args <= 7: AArch64 passes 7
-varargs in x1-x7; an 8th spills to the stack, which qlair's variadic cursor
-mis-reads.)
+(`par` = serialized / min(6, N-1) TNIs. The 8-column form uses 8 printf varargs —
+one spills to the stack per AAPCS64; that path was mis-compiled by clair and is
+now fixed, see clair `8b8bd7f1`.)
 
 ## Results table (`qlair --cores 2 -p moe_all2all.elf`)
 
