@@ -71,8 +71,12 @@ Two clair `-O` codegen defects were found while writing these (both **only** at
      the `adrp` per use fixes swiglu/`p[i]*=s` but exposes a register-allocator
      **over-subscription** (the re-emit clobbers a live temp), regressing
      `int8_dequant` — so it's not yet landed; the allocator fix is the gate.
-   - an **`if`-inside-loop** form (argmax/max: `if(a[i]>mx) mx=a[i]`) infinite-
-     loops at `-O`; `sqrtf`/`expf` at `-O` still open. These stall
+   - a **`float` `if`-inside-loop** (argmax/max: `if(a[i]>mx) mx=a[i]`)
+     infinite-loops at `-O`. Traced: the for-increment's `i++` load resolves
+     its address to a stale i32 *value* register (the body's `&a[i]` GEP)
+     instead of `&i`, so `i++` writes to `&a[i]` and `i` never advances. The
+     **int** form (`if2`) is well-formed and works — it's specific to float
+     `if`-bodies. `sqrtf`/`expf` at `-O` still open. Together these stall
      `rmsnorm`/`router_topk` at `-O`.
 
 2. **`long += (long)(float)` loop-accumulate is wrong** (both backends): summing
