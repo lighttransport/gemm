@@ -28,15 +28,16 @@ static uint64_t a2a(int N, size_t per){
   for(int j=0;j<N-1;j++){ myputn(H0,ID1,S0,S1,per); do{rc=utofu_poll_tcq(H0,0,&d);}while(rc!=0); }
   return rd_cyc()-t0;
 }
-/* prints: <tag> N=<N> pair=<per>B steps=<N-1> serialized=<ns> parallel6TNI=<ns> bw=<GB/s x100> */
-static void rep(int code, int N, size_t per){
+/* aligned table row: left-justified label, then N, per-pair, steps, latencies, BW */
+static void rep(const char* label, int N, size_t per){
   uint64_t ns = a2a(N, per);
   int tni = (N-1) < 6 ? (N-1) : 6;
   uint64_t par = ns / (tni>0?tni:1);
   uint64_t bw100 = par ? (uint64_t)per*(N-1)*100/par : 0;
-  printf("CASE %d N=%d pair=%lu steps=%d ser_ns=%lu par_ns=%lu bw_x100=%lu\n",
-         code, N, (unsigned long)per, N-1,
-         (unsigned long)ns, (unsigned long)par, (unsigned long)bw100);
+  printf("  %-22s N=%d  pair=%7luB  ser=%7lu ns  par=%7lu ns  %2lu.%02lu GB/s\n",
+         label, N, (unsigned long)per,
+         (unsigned long)ns, (unsigned long)par,
+         (unsigned long)(bw100/100), (unsigned long)(bw100%100));
 }
 int main(void){
   utofu_tni_id_t* t; size_t nt; utofu_get_onesided_tnis(&t,&nt);
@@ -45,15 +46,14 @@ int main(void){
   utofu_stadd_t s0,s1; utofu_reg_mem(h0,sbuf,BUFMAX,0,&s0); utofu_reg_mem(h1,rbuf,BUFMAX,0,&s1);
   H0=h0; ID1=id1; S0=s0; S1=s1;
   printf("GLM5 MoE all-to-all comm cost (qlair uTofu, TNIs=%lu)\n",(unsigned long)nt);
-  /* code: 10=decode dispatch, 11=decode combine, 20=prefill c64 dispatch, 30=attn AR */
-  rep(10, 4, HIDDEN);
-  rep(10, 8, HIDDEN);
-  rep(11, 4, HIDDEN);
-  rep(11, 8, HIDDEN);
-  rep(20, 4, (size_t)64*8/4*HIDDEN);
-  rep(20, 8, (size_t)64*8/8*HIDDEN);
-  rep(30, 4, 2048);
-  rep(30, 8, 2048);
+  rep("decode dispatch", 4, HIDDEN);
+  rep("decode dispatch", 8, HIDDEN);
+  rep("decode combine", 4, HIDDEN);
+  rep("decode combine", 8, HIDDEN);
+  rep("prefill dispatch c64", 4, (size_t)64*8/4*HIDDEN);
+  rep("prefill dispatch c64", 8, (size_t)64*8/8*HIDDEN);
+  rep("attn all-reduce", 4, 2048);
+  rep("attn all-reduce", 8, 2048);
   printf("DONE\n");
   return 0;
 }
