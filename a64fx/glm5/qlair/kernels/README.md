@@ -22,13 +22,18 @@ wrong result — see the `signed char` bug below).
 | `expert_meta.c` | MoE expert dispatch: indirect gather/scatter `x[route[e]]` | E=8 | ok=1, =gcc |
 | `gate_mask.c` | router gate mask with short-circuit `&&`/`\|\|` (+side effects) | E=16 | ok=1, =gcc |
 | `silu_helper.c` | SwiGLU via user `float silu(float)`/`mul()` calls in a loop | M=64 | ok=1, =gcc |
+| `long_offset.c` | 64-bit tensor byte-offset math (layer*stride+row*cols+col) | 78 layers | ok=1, =gcc |
+| `ptr_stream.c` | weight streaming via walking pointer `*wp++` matvec | 8×16 | ok=1, =gcc |
 
-**Known clair limitation — no struct support:** `-O0` struct member access is
-broken (writes ignore the field offset; reads return the base address), so these
-kernels use **parallel arrays** instead of structs (as `expert_meta` shows). Not
-fixed — the GLM5.2 kernels don't require structs. Working at `-O0`: short-circuit
-`&&`/`||` with correct side-effect ordering, and user function calls with float
-args/returns (`gate_mask`, `silu_helper`).
+**Known clair `-O0` limitations (not fixed; kernels avoid them):**
+- **no struct support** — member-access writes ignore the field offset and reads
+  return the base address; use **parallel arrays** (as `expert_meta` does).
+- **loop-scoped `float v = <int>`** — a `float`/`double` local assigned an integer
+  *inside a loop body* doesn't convert (stores raw int bits ~0); function-level and
+  if-block assignments are fine. Use float literals/exprs, or hoist the var.
+Confirmed **working** at `-O0`: 64-bit `long` offset math, walking-pointer `*wp++`,
+short-circuit `&&`/`||` with correct side-effect ordering, and user function calls
+with float args/returns.
 
 ### `-O0` clair bugs found by these kernels (all fixed)
 The recommended `-O0` path was assumed solid; these kernels surfaced real defects:
