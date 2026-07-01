@@ -43,16 +43,16 @@ simulation, so the *structure* (which ops, how many transfers, payload sizes) is
 Two clair `-O` codegen defects were found while writing these (both **only** at
 `-O`; `-O0` is correct, and qlair simulates identically):
 
-1. **`-O` float codegen is broken** — every floating-point result is 0. `-O`
-   routes ARM64 through the IR-pipeline backend (`src/ir/ir-codegen-arm64.cc`),
-   whose float value-loading is non-functional (even `a+b`, and a `float`
-   ternary, return 0); integer code is fine. `-O0` uses the working
-   AssemblyEmitter backend (`arm64-codegen-visitor.cc`). A related
-   use-after-free crash exists in the `optimizeFMA` pass: it rewrites
-   `a + b*c` into a new FMA instruction but never redirects other references
-   to the deleted FADD — a loop-carried PHI's `phi_incoming` (which is not in
-   `operands`) then dangles → SIGSEGV. (Both are large fixes in the `-O`
-   backend, kept separate.)
+1. **`-O` float codegen** — the root cause (float **globals** emitted as
+   `.long 0`, so every float loaded 0) plus float32 register-width bugs
+   (FPTOSI/SITOFP/FCMP/float-literal using `dN` for single) are **fixed** in
+   clair `1c956cc0`. Basic float arithmetic and conversions now work at `-O`
+   (`a+b=7`, `(float)n*2.5f=25`). Still open at `-O` (separate, previously
+   masked): a ternary/select used directly as a call arg emits no code, and
+   some larger float kernels don't yet assemble — so **keep using `-O0`** for
+   these kernels (qlair simulates identically). A related `optimizeFMA`
+   use-after-free (rewrites `a+b*c` to a new FMA but leaves a loop-carried
+   PHI's `phi_incoming` dangling → SIGSEGV) also remains for the `-O`+FMA path.
 
 2. **`long += (long)(float)` loop-accumulate is wrong** (both backends): summing
    `float→long` conversions into a `long` accumulator over an array injects a
