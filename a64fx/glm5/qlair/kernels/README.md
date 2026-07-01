@@ -43,16 +43,21 @@ simulation, so the *structure* (which ops, how many transfers, payload sizes) is
 Two clair `-O` codegen defects were found while writing these (both **only** at
 `-O`; `-O0` is correct, and qlair simulates identically):
 
-1. **`-O` float codegen** — the root cause (float **globals** emitted as
-   `.long 0`, so every float loaded 0) plus float32 register-width bugs
-   (FPTOSI/SITOFP/FCMP/float-literal using `dN` for single) are **fixed** in
-   clair `1c956cc0`. Basic float arithmetic and conversions now work at `-O`
-   (`a+b=7`, `(float)n*2.5f=25`). Still open at `-O` (separate, previously
-   masked): a ternary/select used directly as a call arg emits no code, and
-   some larger float kernels don't yet assemble — so **keep using `-O0`** for
-   these kernels (qlair simulates identically). A related `optimizeFMA`
-   use-after-free (rewrites `a+b*c` to a new FMA but leaves a loop-carried
-   PHI's `phi_incoming` dangling → SIGSEGV) also remains for the `-O`+FMA path.
+1. **`-O` float codegen** — went from "every float is 0" to handling the
+   common cases, across clair `1c956cc0` → `93fb5ca4` → `e3d53986`:
+   - float/double **globals** were emitted as `.long 0` (root cause) — fixed.
+   - float32 register-width bugs (FPTOSI/SITOFP/FCMP/float-literal used `dN`
+     for single) — fixed.
+   - **ternary `?:`** wasn't lowered at all (emitted no code) — now lowers to
+     SELECT, plus the `fcsel` assembler encoding it needs.
+   - **mixed int/float** ops (`x*10`, `y<0`) built `fmul s,s,x` — now promote
+     the int operand via SITOFP.
+   Verified at `-O`: `a*b=6`, `x*10=10`, `(a>b)?11:22`, `(a<i)?1:0`, relu.
+   **Still a long tail** (compound-assign `+=` mixed promotion, some
+   select-with-value-arms, `sqrtf`/`expf` at `-O`), so the full kernels here
+   aren't all `-O`-clean yet — **keep `-O0` for them** (qlair simulates
+   identically). An `optimizeFMA` use-after-free on loop-carried PHIs also
+   remains for the `-O`+FMA path.
 
 2. **`long += (long)(float)` loop-accumulate is wrong** (both backends): summing
    `float→long` conversions into a `long` accumulator over an array injects a
