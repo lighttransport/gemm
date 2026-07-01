@@ -2,7 +2,9 @@
 
 Small self-contained C fragments of GLM5.2 building blocks, each with an inline
 self-check (`ok=1` on exact-equality recompute), compiled with the clair C
-compiler and cycle-simulated with qlair.
+compiler and cycle-simulated with qlair. Numeric output is additionally
+cross-checked against `gcc -O0` (self-check alone can pass on a consistent-but-
+wrong result — see the `signed char` bug below).
 
 | kernel | GLM5.2 role | dims | result |
 |---|---|---|---|
@@ -10,6 +12,22 @@ compiler and cycle-simulated with qlair.
 | `swiglu.c` | MoE FFN activation `SiLU(gate)*up` | moe_inter=2048 | ok=1 |
 | `int8_dequant.c` | w8a16 dequant `(q-128)*scale` (offset-binary, group-128) | C=512 | ok=1 |
 | `router_topk.c` | MoE router softmax + top-8 of 256 (argmax-critical) | E=256, K=8 | ok=1 (desc+distinct) |
+| `rope.c` | MLA rotary embedding (pair rotate; `sinf`/`cosf`/`powf`) | D=64, f32 | ok=1, norm-preserving |
+| `int8_matvec.c` | core w8a16 GEMV `scale·Σ int8·x` (per-channel) | 16×64, f32 | ok=1, =gcc |
+| `online_softmax.c` | flash-attention streaming softmax (running max+rescale) | N=128 | ok=1, =gcc |
+| `masked_topk.c` | router top-k with expert mask (continue/break/gather) | E=32, K=4 | ok=1, =gcc |
+
+### Two `-O0` clair bugs found by these kernels (both fixed)
+The recommended `-O0` path was assumed solid; two kernels surfaced real defects:
+- **nested array subscript `a[b[k]]`** (a gather — MoE expert / KV-index lookup)
+  computed the *wrong array's* element: the base address was held in a fixed
+  register that the inner subscript clobbered. Found by `masked_topk`; fixed in
+  clair `86727581` (base is now stack-saved per nesting level).
+- **`signed char` loaded zero-extended** (`ldrb`) instead of sign-extended
+  (`ldrsb`): the parser collapsed `signed char`→`char`, and AArch64 `char` is
+  unsigned, so int8 −100 became 156 — silently corrupting int8 weight math while
+  the self-check still read `ok=1`. Caught only by the gcc cross-check on
+  `int8_matvec`; fixed in clair `79db4fc6`.
 
 ## Compute/comm mixture (per-layer step)
 `moe_layer_mix.c` and `attn_layer_mix.c` run **compute + uTofu comm in one qlair
