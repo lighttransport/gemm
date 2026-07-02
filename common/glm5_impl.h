@@ -1613,6 +1613,12 @@ typedef struct {
     float *piq, *pik;         /* [n*idx_q_dim], [n*index_dim] batched index projections */
     char  *pbit; int nblkmax; /* [n*nblkmax] per-token block bitmap (nblkmax=ceil(max_pos/block)) */
     float *hmx, *hse;         /* [n*64] per-token CP softmax max/sumexp -> deferred ordered combine */
+    float *slog;              /* [n*vocab] full-logit gather for batched SAMPLING (one AR, not n) */
+    const int *const *hist; const int *hist_n;  /* per-stream rep-penalty history (caller-set; may be NULL) */
+    const int *sid;           /* batch entry -> KV stream map (caller-set; NULL = identity). Lets one
+                               * stream contribute MULTIPLE CONTIGUOUS positions per forward (MTP
+                               * draft+verify: entries {p,p+1} share a stream; the KV store loop runs
+                               * before attention, so the later position sees the earlier one). */
 } glm5_mstream;
 
 /* Y[N,rows] (token-major) = X[N,cols] . W[rows,cols]^T. K-tiled (8 W rows for a tile stay
@@ -1977,7 +1983,7 @@ static void glm5_free_mstream(glm5_model*m){
     glm5_afree(ms->tmp2);glm5_afree(ms->exg);glm5_afree(ms->exu);glm5_afree(ms->emoe);glm5_afree(ms->bk);glm5_afree(ms->bw);glm5_afree(ms->bcnt);glm5_afree(ms->logits);glm5_afree(ms->sc);
     glm5_afree(ms->psel);glm5_afree(ms->pnsel);glm5_afree(ms->gsel);glm5_afree(ms->gselw);
     glm5_afree(ms->piq);glm5_afree(ms->pik);glm5_afree(ms->pbit);
-    glm5_afree(ms->hmx);glm5_afree(ms->hse);
+    glm5_afree(ms->hmx);glm5_afree(ms->hse);glm5_afree(ms->slog);
     glm5_afree(ms); m->ms=NULL;
 }
 /* per_stream_kv=1: multi-stream decode (own KV per stream). 0: chunked prefill (shared model
@@ -1986,13 +1992,15 @@ static int glm5_alloc_mstream_ex(glm5_model*m,int N,int per_stream_kv){
     const glm5_config*c=&m->cfg; int H=c->hidden,QD=glm5_q_dim(c),KVD=glm5_kv_dim(c),hrows=m->head.rows;
     glm5_mstream*ms=glm5_acalloc(1,sizeof *ms); if(!ms) return -1; ms->n=N;
     size_t per=(size_t)c->n_layers*c->max_pos*KVD;
-    if(per_stream_kv){ ms->kc=glm5_acalloc((size_t)N*per,2); ms->vc=glm5_acalloc((size_t)N*per,2); }
+    if(per_stream_kv){ ms->kc=glm5_acalloc((size_t)N*per,2);   /* latent-MLA: kc only (no vc; halves KV memory) */
+           ms->slog=glm5_amalloc((size_t)N*c->vocab*4); }      /* batched-sampling full-logit gather */
     else { ms->maxsel=(c->msa_topk_blocks+c->msa_local_block+c->msa_init_block+1)*c->msa_block_size;
            ms->psel=glm5_amalloc((size_t)N*ms->maxsel*sizeof(int)); ms->pnsel=glm5_amalloc((size_t)N*sizeof(int));
-           ms->gsel=glm5_amalloc((size_t)N*8*sizeof(int)); ms->gselw=glm5_amalloc((size_t)N*8*sizeof(float));
            ms->nblkmax=(c->max_pos+c->msa_block_size-1)/c->msa_block_size;
            ms->piq=glm5_amalloc((size_t)N*glm5_idx_q_dim(c)*4); ms->pik=glm5_amalloc((size_t)N*c->msa_index_dim*4);
            ms->pbit=glm5_amalloc((size_t)N*ms->nblkmax); }
+    /* router top-k scratch: used by BOTH prefill_chunk and batch_decode_mla */
+    ms->gsel=glm5_amalloc((size_t)N*8*sizeof(int)); ms->gselw=glm5_amalloc((size_t)N*8*sizeof(float));
     ms->xn=glm5_amalloc((size_t)N*H*4); ms->q=glm5_amalloc((size_t)N*QD*4); ms->k=glm5_amalloc((size_t)N*KVD*4); ms->v=glm5_amalloc((size_t)N*KVD*4);
     int kvb_scratch = c->qk_nope_dim+c->v_head_dim; if(kvb_scratch<2*c->kv_lora) kvb_scratch=2*c->kv_lora;
     ms->qlat=glm5_amalloc((size_t)N*c->q_lora*4); ms->kvb=glm5_amalloc((size_t)N*c->n_heads*kvb_scratch*4);
@@ -2007,7 +2015,7 @@ static int glm5_alloc_mstream_ex(glm5_model*m,int N,int per_stream_kv){
     ms->logits=glm5_amalloc((size_t)N*hrows*4);
     ms->sc_stride = per_stream_kv ? c->max_pos : c->n_heads*(ms->maxsel>0?ms->maxsel:c->max_pos);
     ms->sc=glm5_amalloc((size_t)N*ms->sc_stride*4);
-    int kvok = per_stream_kv ? (ms->kc&&ms->vc) : (ms->psel&&ms->pnsel);
+    int kvok = per_stream_kv ? (ms->kc&&ms->slog) : (ms->psel&&ms->pnsel);
     if(!kvok||!ms->logits||!ms->qlat||!ms->kvb||!ms->sc||!ms->hmx||!ms->hse){ m->ms=ms; glm5_free_mstream(m); return -1; }
     m->ms=ms; return 0;
 }
@@ -2452,7 +2460,8 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
             for(int hh=0;hh<nown;hh++) glm5_rope_interleaved(qb+hh*c->qk_head_dim+c->qk_nope_dim,cosp,sinp,c->qk_rope_dim);
             glm5_rmsnorm_head(kv,L->kv_a_norm,c->kv_lora,c->norm_eps);
             glm5_rope_interleaved(kv+c->kv_lora,cosp,sinp,c->qk_rope_dim);
-            uint16_t*kc=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVC+(size_t)p*KVC;
+            int st=ms->sid?ms->sid[t]:t;                       /* KV stream of this entry */
+            uint16_t*kc=ms->kc+(size_t)st*per+(size_t)l*c->max_pos*KVC+(size_t)p*KVC;
             for(int i=0;i<KVC;i++) kc[i]=glm5_kv_enc(m,kv[i]);
         }
         glm5_prof_add(m,GLM5_P_QKV,pt);
@@ -2466,7 +2475,8 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
             float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*arows;
             float*qabs=ms->kvb+(size_t)t*c->n_heads*(2*c->kv_lora); float*ctxb=qabs+(size_t)c->n_heads*c->kv_lora;
             float*hmx=ms->hmx+(size_t)t*64,*hse=ms->hse+(size_t)t*64;
-            float*kv=ms->v+(size_t)t*KVC; const uint16_t*kcl=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVC;
+            int st=ms->sid?ms->sid[t]:t;                       /* KV stream of this entry */
+            float*kv=ms->v+(size_t)t*KVC; const uint16_t*kcl=ms->kc+(size_t)st*per+(size_t)l*c->max_pos*KVC;
             for(int hh=0;hh<nown;hh++){
                 hmx[hh]=-1e30f; hse[hh]=0.0f;
                 glm5_tensor_tmul_rows(m,qabs+(size_t)hh*c->kv_lora,&L->wkv_b,hh*kvb_stride,c->qk_nope_dim,qb+hh*c->qk_head_dim);
@@ -2580,13 +2590,48 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
             glm5_prof_add(m,GLM5_P_DENSE_FFN,pt);
         }
     }
-    /* head: ALL M streams, greedy argmax (+ TP_HEAD merge per stream) */
+    /* head: ALL M streams, greedy argmax (+ TP_HEAD merge per stream) or sampling */
     double pt=glm5_prof_now(); int hrows=m->head.rows;
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<M;t++) glm5_rmsnorm_gemma(ms->h2+(size_t)t*H, X+(size_t)t*H, m->out_norm, H, c->norm_eps);
     glm5_gemm(m,ms->logits,&m->head,ms->h2,M,hrows,H);
+    if(m->samp_temp>0.0f){
+        /* batched sampling: gather ALL streams' full logits with ONE all-reduce (not M),
+         * then sample per stream in stream order with the shared-seed RNG -- every rank
+         * holds identical full logits and advances the RNG identically => lockstep,
+         * matching glm5_forward_token's sampling contract. Per-stream rep-penalty
+         * history comes from ms->hist/hist_n (caller-set; NULL => no history). */
+        float*SL=ms->slog;
+        if(hrows<c->vocab){
+            memset(SL,0,(size_t)M*c->vocab*4);
+            for(int t=0;t<M;t++) memcpy(SL+(size_t)t*c->vocab+m->head_r0, ms->logits+(size_t)t*hrows, (size_t)hrows*4);
+            if(m->ar_cb) m->ar_cb(SL,M*c->vocab,m->ar_ctx);
+        } else for(int t=0;t<M;t++) memcpy(SL+(size_t)t*c->vocab, ms->logits+(size_t)t*hrows, (size_t)c->vocab*4);
+        for(int t=0;t<M;t++){
+            memcpy(m->s_logits, SL+(size_t)t*c->vocab, (size_t)c->vocab*4);
+            m->samp_hist   = ms->hist   ? ms->hist[t]   : NULL;
+            m->samp_hist_n = ms->hist_n ? ms->hist_n[t] : 0;
+            out[t]=glm5_sample_logits(m,c->vocab);
+        }
+        glm5_prof_add(m,GLM5_P_HEAD,pt);
+        return;
+    }
+    if(hrows<c->vocab && m->ar_argmax_n_cb){
+        /* batched TP_HEAD merge: all M streams' (val,idx) pairs in ONE collective */
+        float vi[2*64];   /* M<=64 streams */
+        int MM=M>64?64:M;
+        for(int t=0;t<MM;t++){
+            float*lg=ms->logits+(size_t)t*hrows; int la=0; float bv=lg[0];
+            for(int i=1;i<hrows;i++) if(lg[i]>bv){bv=lg[i];la=i;}
+            int32_t gidx=m->head_r0+la; vi[2*t]=bv; memcpy(&vi[2*t+1],&gidx,4);
+        }
+        m->ar_argmax_n_cb(vi,MM,m->ar_argmax_n_ctx);
+        for(int t=0;t<MM;t++){ int32_t gi; memcpy(&gi,&vi[2*t+1],4); out[t]=gi; }
+        glm5_prof_add(m,GLM5_P_HEAD,pt);
+        return;
+    }
     for(int t=0;t<M;t++){
         float*lg=ms->logits+(size_t)t*hrows; int la=0; float bv=lg[0];
         for(int i=1;i<hrows;i++) if(lg[i]>bv){bv=lg[i];la=i;}
@@ -2595,6 +2640,64 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
         out[t]=gidx;
     }
     glm5_prof_add(m,GLM5_P_HEAD,pt);
+}
+
+/* ===================== MTP (multi-token prediction, checkpoint layer 78) =====================
+ * Draft head: predicts token t+2 from (residual hidden at position t+1's producer, embedding of
+ * token t+1):  x = eh_proj . [ enorm(emb(tok)) ; hnorm(h) ]  ->  one full transformer block
+ * (own latent-KV cache, EP-sharded MoE)  ->  shared out_norm + lm_head.
+ * The block runs through a 1-LAYER MODEL VIEW so it reuses the entire validated
+ * glm5_forward_token path (absorbed-MLA attention, MoE ar_cb, TP_HEAD argmax merge). */
+static glm5_model glm5_mtp_view(glm5_model*m){
+    glm5_model v=*m;
+    v.layers=m->mtp_layer; v.cfg.n_layers=1; v.cfg.n_dense_layers=0;  /* the block is MoE */
+    v.mtp_layer=NULL; v.ms=NULL;
+    return v;
+}
+/* argmax draft token. h = the residual hidden (post-all-layers, PRE-out_norm) of the forward
+ * that produced `tok` (the caller's activation buffer after glm5_forward_token /
+ * glm5_forward_batch_decode_mla — both leave exactly this in X). pos = tok's position.
+ * xb: caller scratch, 2*hidden floats. Draft is greedy (verification decides acceptance). */
+static int glm5_mtp_draft(glm5_model*m,const float*h,int tok,int pos,float*xb){
+    const glm5_config*c=&m->cfg; const int H=c->hidden;
+    if(!m->mtp_layer) return -1;
+    float*x=m->s_ff;                                   /* [dense_inter] scratch >= H */
+    if(tok<0||tok>=c->vocab) tok=0;
+    if(m->emb_rows<c->vocab){                          /* TP_EMBED: owned rows + AR sum */
+        for(int i=0;i<H;i++) x[i]=0.f;
+        if(tok>=m->emb_r0 && tok<m->emb_r0+m->emb_rows){
+            const uint16_t*row=m->embed+(size_t)(tok-m->emb_r0)*H;
+            for(int i=0;i<H;i++) x[i]=glm5_bf2f(row[i]);
+        }
+        if(m->ar_cb) m->ar_cb(x,H,m->ar_ctx);
+    } else {
+        const uint16_t*row=m->embed+(size_t)tok*H;
+        for(int i=0;i<H;i++) x[i]=glm5_bf2f(row[i]);
+    }
+    glm5_rmsnorm_gemma(xb,   x, m->mtp_enorm, H, c->norm_eps);
+    glm5_rmsnorm_gemma(xb+H, h, m->mtp_hnorm, H, c->norm_eps);
+    glm5_mv(m,x,&m->mtp_eh,xb,H,2*H);
+    glm5_model v=glm5_mtp_view(m);
+    float t0=v.samp_temp; v.samp_temp=0;               /* draft is always greedy */
+    int d=glm5_forward_token(&v,x,pos); (void)t0;
+    return d;
+}
+/* Synthetic MTP block for simulator/lockstep validation (no real layer-78 weights needed).
+ * Same glm5_sm reset discipline as the main model applies (caller's responsibility in
+ * multi-rank single-address-space sims). Real weights: stage with GLM5_STAGE_LAYERS=79 and
+ * load model.layers.78.{enorm,hnorm,eh_proj,block...} (loader TODO, job-validated). */
+static int glm5_alloc_mtp_synth(glm5_model*m){
+    glm5_config c1=m->cfg; c1.n_layers=1; c1.n_dense_layers=0;
+    glm5_model*t=glm5_alloc_synth(c1,m->ep_rank,m->ep_size,m->n_threads,m->n_cmgs);
+    if(!t) return -1;
+    m->mtp_layer=&t->layers[0];                        /* wrapper model intentionally kept (sim-only) */
+    const int H=m->cfg.hidden;
+    m->mtp_enorm=glm5_amalloc((size_t)H*2); glm5_fill_bf16(m->mtp_enorm,H,0.1f);
+    m->mtp_hnorm=glm5_amalloc((size_t)H*2); glm5_fill_bf16(m->mtp_hnorm,H,0.1f);
+    uint16_t*p=glm5_amalloc((size_t)H*2*H*2); if(!p) return -1;
+    glm5_fill_bf16(p,(size_t)H*2*H,0.03f);
+    m->mtp_eh=(glm5_tensor){p,NULL,GLM5_BF16,H,2*H};
+    return 0;
 }
 
 #endif /* GLM5_IMPL_H */

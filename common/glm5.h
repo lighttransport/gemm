@@ -210,7 +210,7 @@ static inline int glm5_n_owned(int n_experts, int ep_rank, int ep_size) {
 }
 
 /* ===================== layer / model ===================== */
-typedef struct {
+typedef struct glm5_layer_s {
     /* norms (BF16 [hidden], Gemma: applied as x*(1+w)) */
     uint16_t *input_norm;     /* input_layernorm */
     uint16_t *post_norm;      /* post_attention_layernorm */
@@ -334,6 +334,10 @@ typedef struct {
     void  (*ar_cb)(float *buf, int count, void *ctx);
     void   *ar_ctx;
     void  (*ar_argmax_cb)(float *val, int32_t *idx, void *ctx);  /* TP_HEAD argmax merge */
+    /* batched TP_HEAD merge: n (val, idx-as-float-bits) pairs in ONE collective. Used by the
+     * batched-decode head (M streams -> 1 AR instead of M). NULL => per-stream ar_argmax_cb. */
+    void  (*ar_argmax_n_cb)(float *vi, int n, void *ctx);
+    void   *ar_argmax_n_ctx;
     void   *ar_argmax_ctx;
     /* comm-overlap (optional): ar_async_start issues the all-reduce on a comm-driver thread
      * (returns immediately); ar_wait blocks for it. NULL => no overlap (use ar_cb). The
@@ -351,6 +355,12 @@ typedef struct {
     const int *samp_hist;     /* generated-token history for the repetition penalty (runner-owned) */
     int      samp_hist_n;
     int     *samp_idx;        /* scratch [vocab] for top-p index sort (alloc'd lazily) */
+    /* MTP (multi-token prediction, checkpoint layer 78 "next-N"): draft head that predicts
+     * token t+2 from (hidden state at t, embedding of token t+1). NULL/unset => no MTP.
+     * mtp_layer is a FULL transformer block (own KV cache) run via a 1-layer model view. */
+    struct glm5_layer_s *mtp_layer;
+    uint16_t *mtp_enorm, *mtp_hnorm;   /* [hidden] RMSNorm weights for the two halves */
+    glm5_tensor mtp_eh;                /* eh_proj [hidden, 2*hidden] */
     /* perf accounting */
     size_t bytes_read;
     double prof[16];

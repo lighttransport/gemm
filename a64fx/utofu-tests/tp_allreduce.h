@@ -49,7 +49,8 @@ typedef struct {
     /* precomputed recursive-doubling schedule */
     int             pof2, rem, nrounds, bcast_sid, newrank;
     int             use_bf16;                /* TP_AR_BF16=1: halve reduce payload */
-    int             robust;                  /* TP_AR_ROBUST=1: drain-per-recv + civac */
+    int             robust;                  /* TP_AR_ROBUST: 0=passive spin, 1=drain+civac per spin,
+                                              * 2=LEAN decode path (amortized drain + civac every 64 spins) */
     uint64_t        seq;                     /* monotonic call counter            */
 } tp_comm;
 
@@ -122,8 +123,29 @@ static inline void tp_ar_drain_mrq(tp_comm *c) {
 static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
                               int sid, const char *what) {
     double t0 = tp_ar_now();
+    unsigned long spins = 0;
+    /* LEAN decode path (robust=2): the per-spin drain+civac+dsb is the dominant
+     * per-round cost of the decode all-reduce (the "robustness tax"). Amortize:
+     * drain the MRQ once at wait ENTRY (+ once on completion, below) — overflow
+     * pressure is ~1 notice per recv, so per-wait draining keeps the queue near
+     * empty without polling it inside the hot spin; civac the trailer line only
+     * every 64th spin — bounded staleness (a few hundred ns) instead of a
+     * clean+invalidate+dsb on every iteration. Correctness envelope is the same
+     * as robust=1 (nothing is skipped, only done less often); validated
+     * bitwise vs robust=1 under the qlair sim, stability at 10^4+ reduces on
+     * real TNIs still needs a job. */
+    if (c->robust >= 2) tp_ar_drain_mrq(c);
     while (*trl < tok) {
-        if (c->robust) { tp_ar_drain_mrq(c); tp_ar_flag_inval(trl); }
+        if (c->robust == 1) { tp_ar_drain_mrq(c); tp_ar_flag_inval(trl); }
+        else if (c->robust >= 2 && (spins & 63ul) == 63ul) tp_ar_flag_inval(trl);
+        /* TP_AR_SPIN_DBG=1: report long spins UNBUFFERED (raw write; simulator-friendly —
+         * under qlair the sim-time TP_AR_TIMEOUT is effectively unreachable). */
+        if (((++spins & 0xFFFFFul) == 0) && getenv("TP_AR_SPIN_DBG")) {
+            char b[128]; int n = snprintf(b, sizeof b,
+                "tp_ar SPIN rank=%d %s sid=%d want=%lu got=%lu spins=%luM\n",
+                c->my_rank, what, sid, (unsigned long)tok, (unsigned long)*trl, spins >> 20);
+            if (n > 0) { ssize_t w = write(2, b, (size_t)n); (void)w; }
+        }
         if (tp_ar_now() - t0 > TP_AR_TIMEOUT) {
             fprintf(stderr, "tp_ar: rank %d %s timeout sid=%d want=%lu got=%lu\n",
                     c->my_rank, what, sid, (unsigned long)tok, (unsigned long)*trl);
@@ -346,6 +368,58 @@ static void tp_allreduce_argmax(tp_comm *c, float *val, int32_t *idx) {
         else             tp_ar_send_argmax(c, mr - 1, c->bcast_sid, buf, tok);
     }
     *val = buf[0]; memcpy(idx, &buf[1], 4);
+}
+
+/* Batched argmax: N independent (val, idx-as-float-bits) pairs reduced in ONE collective
+ * (payload 2*n floats) instead of n tp_allreduce_argmax calls — the batched-decode head
+ * merges all M streams' vocab-shard argmaxes with a single AR. Same recursive-doubling
+ * schedule; combine = per-pair max-with-lower-index (assoc+comm => lockstep-safe).
+ * Requires 2*n <= max_count. Shares the monotonic seq with the other collectives. */
+static void tp_ar_recv_argmax_n(tp_comm *c, int sid, float *vi, int n, uint64_t tok) {
+    char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
+    volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
+    tp_ar_wait(c, trl, tok, sid, "argmaxn");
+    const float *r = (const float *)rb;
+    for (int k = 0; k < n; k++) {
+        int32_t oidx, cidx; memcpy(&oidx, &r[2*k+1], 4); memcpy(&cidx, &vi[2*k+1], 4);
+        if (r[2*k] > vi[2*k] || (r[2*k] == vi[2*k] && oidx < cidx)) { vi[2*k] = r[2*k]; vi[2*k+1] = r[2*k+1]; }
+    }
+}
+static void tp_ar_send_argmax_n(tp_comm *c, int peer, int sid, const float *vi, int n, uint64_t tok) {
+    char *sb = c->region + tp_ar_slot_off(c, 0);
+    memcpy(sb, vi, (size_t)2 * n * sizeof(float));
+    size_t tr_off = tp_ar_trailer_off(c);
+    *(volatile uint64_t *)(sb + tr_off) = tok;
+    utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
+    utofu_stadd_t dst = c->peer_base[peer] + tp_ar_slot_off(c, 1 + sid);
+    tp_ar_put(c, peer, src, dst, (size_t)2 * n * sizeof(float));
+    tp_ar_put(c, peer, src + tr_off, dst + tr_off, 8);
+}
+static void tp_allreduce_argmax_n(tp_comm *c, float *vi, int n) {
+    if (c->nprocs == 1) return;
+    if (2 * n > c->max_count) { fprintf(stderr, "tp_ar: argmax_n %d > max_count\n", n); exit(1); }
+    uint64_t tok = ++c->seq;
+    int mr = c->my_rank, rem = c->rem;
+    if (mr < 2 * rem) {
+        if (mr % 2 == 0) tp_ar_send_argmax_n(c, mr + 1, 0, vi, n, tok);
+        else             tp_ar_recv_argmax_n(c, 0, vi, n, tok);
+    }
+    if (c->newrank != -1) {
+        for (int k = 0; k < c->nrounds; k++) {
+            int pnr = c->newrank ^ (1 << k);
+            int pr  = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+            tp_ar_send_argmax_n(c, pr, k + 1, vi, n, tok);
+            tp_ar_recv_argmax_n(c, k + 1, vi, n, tok);
+        }
+    }
+    if (mr < 2 * rem) {
+        if (mr % 2 == 0) {   /* broadcast leg: overwrite with the final pairs */
+            char *rb = c->region + tp_ar_slot_off(c, 1 + c->bcast_sid);
+            volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
+            tp_ar_wait(c, trl, tok, c->bcast_sid, "argmaxn bcast");
+            memcpy(vi, rb, (size_t)2 * n * sizeof(float));
+        } else tp_ar_send_argmax_n(c, mr - 1, c->bcast_sid, vi, n, tok);
+    }
 }
 
 /* Register the comm region (TP_AR_STAG) and query peers. `barrier_fn` must

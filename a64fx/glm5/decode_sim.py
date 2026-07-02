@@ -46,10 +46,13 @@ HEAD_P   = VOCAB*H                        # bf16, vocab-sharded
 def distinct_experts(M):                  # E[#distinct of N_EXP hit when M tokens pick N_ACT each]
     return N_EXP*(1-(1-N_ACT/N_EXP)**M)
 
-def active_bytes_per_node(N, M, ctx, prec='int8', shard_attn=True):
-    """Bytes read by ONE node in ONE forward serving M streams at context length `ctx`."""
+def active_bytes_per_node(N, M, ctx, prec='int8', shard_attn=True, attn_ways=None):
+    """Bytes read by ONE node in ONE forward serving M streams at context length `ctx`.
+    attn_ways: how many ways attention is sharded (None -> N if shard_attn else 1;
+    k<N models a TP SUBGROUP of k ranks holding 1/k of the heads each)."""
     wb = 1 if prec=='int8' else 2
-    attn = ATTN_P*wb/(N if shard_attn else 1)            # sharded heads -> /N; replicated -> full
+    if attn_ways is None: attn_ways = N if shard_attn else 1
+    attn = ATTN_P*wb/attn_ways                            # sharded heads -> /ways; replicated -> full
     router = ROUTER_P*2                                   # bf16, replicated
     shared = SHARED_P*wb/N                                # TP-sharded
     dense  = DENSE_P*wb/N
@@ -76,23 +79,56 @@ _bw96_1 = active_bytes_per_node(96,1,128)/BW_NODE
 _comm96_1 = 1.0/AR_M1_96 - _bw96_1                                 # total comm s at (96, M=1)
 _ar96 = _comm96_1/n_allreduce(SHARD_ATTN)                         # measured per-AR latency at 96n (~26 ms)
 UTOFU_ROUND = (_ar96 - UTOFU_INIT)/math.ceil(math.log2(96))       # calibrated per-round cost (the robustness tax)
-def ar_latency(N, msg_bytes):
-    return UTOFU_INIT + math.ceil(math.log2(N))*UTOFU_ROUND + msg_bytes*UTOFU_BW
-def comm_time(N, M, shard_attn=SHARD_ATTN):                        # per forward (one AR/layer serves M tokens)
-    return n_allreduce(shard_attn)*ar_latency(N, M*H*4)            # AR message = [M,hidden] f32
 
-def pred_tok_s(N, M, ctx=128, prec='int8', mtp=0.0, shard_attn=SHARD_ATTN):
-    t = comm_time(N,M,shard_attn) + active_bytes_per_node(N,M,ctx,prec,shard_attn)/BW_NODE
+def recalibrate(ar_ms=None, round_ms=None, init_ms=None, n_ref=96):
+    """Re-anchor the comm constants from a MEASUREMENT (qlair-8rank or a job):
+    either the per-round cost directly (round_ms) or a full per-AR latency (ar_ms at n_ref ranks).
+    Call before using pred_tok_s/m1_tput to project with the measured collective."""
+    global UTOFU_ROUND, UTOFU_INIT
+    if init_ms  is not None: UTOFU_INIT  = init_ms*1e-3
+    if round_ms is not None: UTOFU_ROUND = round_ms*1e-3
+    elif ar_ms  is not None: UTOFU_ROUND = (ar_ms*1e-3 - UTOFU_INIT)/math.ceil(math.log2(n_ref))
+
+def ar_latency(N, msg_bytes, round_ms=None, ar_bf16=False):
+    r = UTOFU_ROUND if round_ms is None else round_ms*1e-3
+    if ar_bf16: msg_bytes //= 2                                    # TP_AR_BF16 payload
+    return UTOFU_INIT + math.ceil(math.log2(N))*r + msg_bytes*UTOFU_BW
+
+def comm_time(N, M, shard_attn=SHARD_ATTN, round_ms=None, attn_group=None, ar_bf16=False):
+    """Per forward (one AR/layer serves M tokens). MoE ARs span all N ranks; attention o-proj
+    ARs span attn_group ranks (TP subgroup lever; default N = full-group head-shard)."""
+    t = N_MOE*ar_latency(N, M*H*4, round_ms, ar_bf16)              # MoE routed-sum (dense/head ARs folded into calibration)
+    if shard_attn:
+        t += N_LAYERS*ar_latency(attn_group or N, M*H*4, round_ms, ar_bf16)
+    return t
+
+def pred_tok_s(N, M, ctx=128, prec='int8', mtp=0.0, shard_attn=SHARD_ATTN,
+               round_ms=None, attn_group=None, ar_bf16=False):
+    ways = (attn_group if (shard_attn and attn_group) else None)
+    t = comm_time(N,M,shard_attn,round_ms,attn_group,ar_bf16) \
+      + active_bytes_per_node(N,M,ctx,prec,shard_attn,attn_ways=ways)/BW_NODE
     agg = M/t
     if mtp>0: agg *= (1+mtp)/1.18
     return agg
 
-def m1_tput(N, shard_attn, round_ms, ctx=128):
+def m1_tput(N, shard_attn, round_ms, ctx=128, prec='int8', attn_group=None):
     """Single-stream (M=1) tok/s with an OVERRIDABLE per-AR-round cost (round_ms) so we can model a
     leaner decode-AR completion path. round_ms = UTOFU_ROUND default reproduces the measured 0.25."""
-    nar = n_allreduce(shard_attn)
-    ar  = UTOFU_INIT + math.ceil(math.log2(N))*round_ms*1e-3 + (1*H*4)*UTOFU_BW
-    return 1.0/(nar*ar + active_bytes_per_node(N,1,ctx,'int8',shard_attn)/BW_NODE)
+    return pred_tok_s(N, 1, ctx, prec, 0.0, shard_attn, round_ms, attn_group)
+
+# ---------- memory feasibility (32 GB HBM2/node) ----------
+NODE_GB, RESERVE_GB = 32.0, 2.0
+def mem_per_node_gb(N, prec='int8', attn_ways=None, M=0, max_pos=2048):
+    """Resident GB on one node: EP-sharded experts + TP-sharded shared/dense/head + replicated
+    router/embed + attention (sharded attn_ways-way; 1 = fully replicated) + M-stream KV."""
+    wb = 1 if prec=='int8' else 2
+    if attn_ways is None: attn_ways = N
+    w = (ATTN_P*wb/attn_ways + ROUTER_P*2 + SHARED_P*wb/N + DENSE_P*wb/N
+         + (HEAD_P+VOCAB*H)*2/N                       # lm_head + embed, vocab-sharded bf16
+         + N_EXP*EXPERT_P*wb*N_MOE/N)                 # ALL experts stored, EP-sharded
+    kv = M*N_LAYERS*max_pos*KVC*2                     # per-stream latent KV (bf16)
+    return (w+kv)/1e9
+def fits(gb): return "OK" if gb <= NODE_GB-RESERVE_GB else "DOES NOT FIT"
 
 # ---------- report ----------
 def hdr(s): print("\n"+s+"\n"+"-"*len(s))
@@ -141,7 +177,7 @@ hdr("Long-context UB (96n, int8) — KV read grows the floor")
 for L in [128,2048,8192,32768]:
     print(f"  ctx={L:>6}: UB M=1 {ub_tok_s(96,1,L):>6.0f}  M=16 {ub_tok_s(96,16,L):>6.0f} tok/s")
 
-hdr("M=1 lever-stack -> 1 tok/s (single-stream, NO MTP, NO batching)")
+hdr("M=1 lever-stack, int8 -> 1 tok/s (single-stream, NO MTP, NO batching)")
 R0 = UTOFU_ROUND*1e3                                              # calibrated per-round cost (~3.4 ms)
 print(f"  target: 1.00 tok/s (4x over 0.25). 1 AR/layer budget = ~13 ms/AR; current = {_ar96*1e3:.0f} ms/AR.")
 print(f"  {'baseline 96n, 2 AR/layer':<46} {m1_tput(96,True ,R0):>5.2f} tok/s")
@@ -151,6 +187,40 @@ print(f"  {'+ leaner decode-AR completion 1.7 ms/round':<46} {m1_tput(32,False,1
 print(f"  {'+ leaner completion 1.0 ms/round':<46} {m1_tput(32,False,1.0):>5.2f}")
 print(f"  note: round-cost is the trailer-seq/civac/MRQ robustness tax ({R0:.1f} ms vs ~0.02 ms HW floor);")
 print(f"        trimming it is the only lever needing a job to validate (correctness under the races it fixed).")
+
+hdr("M=1 lever-stack, bf16 -> 2 tok/s target (bf16 needs >=96n; replicated attn DOES NOT FIT in bf16)")
+print(f"  bf16 replicated attention = {ATTN_P*2/1e9:.1f} GB/node -> attention must stay SHARDED (or subgroup).")
+print(f"  {'baseline 96n, 2 AR/layer, robust':<52} {m1_tput(96,True ,R0 ,prec='bf16'):>5.2f} tok/s")
+print(f"  {'+ lean AR 1.0 ms/round':<52} {m1_tput(96,True ,1.0,prec='bf16'):>5.2f}")
+print(f"  {'+ lean AR 0.5 ms/round':<52} {m1_tput(96,True ,0.5,prec='bf16'):>5.2f}")
+print(f"  {'+ lean AR 0.3 ms/round':<52} {m1_tput(96,True ,0.3,prec='bf16'):>5.2f}")
+print(f"  {'+ attn TP SUBGROUP k=8 (o-proj AR over 8), 0.5ms':<52} {m1_tput(96,True ,0.5,prec='bf16',attn_group=8):>5.2f}"
+      f"   (attn mem {ATTN_P*2/8/1e9:.1f} GB/node: {fits(mem_per_node_gb(96,'bf16',attn_ways=8,M=1))})")
+print(f"  {'+ attn TP SUBGROUP k=8, 0.3ms':<52} {m1_tput(96,True ,0.3,prec='bf16',attn_group=8):>5.2f}")
+print(f"  => bf16 2 tok/s needs the lean AR at <=0.5 ms/round PLUS the attention subgroup (or <=0.3 ms alone).")
+
+hdr("Batched aggregate vs lean-AR round cost (sharded attn, ctx=128) — path to 20 tok/s")
+print("  prec  N    round_ms " + "".join(f"{m:>8}" for m in [8,16,32,64]))
+for prec in ['int8','bf16']:
+    for N,rms in [(96,None),(96,1.0),(96,0.5),(32,None),(32,1.0),(32,0.5)]:
+        if prec=='bf16' and N<48: continue                        # bf16 does not fit below ~48n
+        lbl = f"{UTOFU_ROUND*1e3:.1f}(cal)" if rms is None else f"{rms:.1f}"
+        print(f"  {prec:<5}{N:>4}  {lbl:>9} " + "".join(f"{pred_tok_s(N,m,prec=prec,round_ms=rms):>8.1f}" for m in [8,16,32,64]))
+print(f"  +MTP multiplies by ~{(1+0.4)/1.18:.2f} (accept 0.4).  AR msg at M=64 = {64*H*4/1024:.0f} KB -> use TP_AR_BF16.")
+
+hdr("Memory feasibility per node (32 GB HBM2, 2 GB reserve)")
+print("  config                                          GB/node   fit")
+for desc,N,prec,ways,M,mp in [("int8  96n sharded attn, M=32 kv2048", 96,'int8',None,32,2048),
+                               ("int8  96n REPLICATED attn, M=1",      96,'int8',1,   1,2048),
+                               ("int8  32n sharded attn, M=64 kv1024", 32,'int8',None,64,1024),
+                               ("int8  32n REPLICATED attn, M=1",      32,'int8',1,   1,2048),
+                               ("bf16  96n sharded attn, M=32 kv2048", 96,'bf16',None,32,2048),
+                               ("bf16  96n REPLICATED attn, M=1",      96,'bf16',1,   1,2048),
+                               ("bf16  96n attn subgroup k=8, M=1",    96,'bf16',8,   1,2048),
+                               ("bf16  96n attn subgroup k=8, M=32",   96,'bf16',8,  32,2048)]:
+    gb = mem_per_node_gb(N,prec,attn_ways=ways,M=M,max_pos=mp)
+    print(f"  {desc:<46} {gb:>7.1f}   {fits(gb)}")
+print(f"  (ms->kc per-stream KV: M=32 x 78L x 2048pos x {KVC} x 2B = {32*N_LAYERS*2048*KVC*2/1e9:.1f} GB)")
 
 hdr("Takeaways")
 print(f"""  * THEORETICAL UPPER BOUND (bandwidth) at 96n int8: ~{ub_tok_s(96,1,128):.0f} tok/s (M=1, sharded attn),

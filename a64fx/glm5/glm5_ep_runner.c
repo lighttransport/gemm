@@ -281,6 +281,11 @@ static void ep_argmax_callback(float*val,int32_t*idx,void*ctx){
     double t0=now_sec(); tp_allreduce_argmax((tp_comm*)ctx,val,idx); g_ar_secs+=now_sec()-t0; g_ar_calls++;
     g_ar_frags++;
 }
+/* batched merge: M streams' (val,idx) pairs in ONE collective (batched-decode head) */
+static void ep_argmax_n_callback(float*vi,int n,void*ctx){
+    double t0=now_sec(); tp_allreduce_argmax_n((tp_comm*)ctx,vi,n); g_ar_secs+=now_sec()-t0; g_ar_calls++;
+    g_ar_frags++;
+}
 /* ---- CP (context-parallel KV) callbacks ---- */
 /* all-reduce MAX of per-block index scores so every rank derives the same global top-k. */
 static void ep_blk_reduce(float*scores,int nblk,void*ctx){
@@ -474,6 +479,34 @@ static void cbatch_write_req(const char*prefix,int req,const int*gen,int ng){
     fclose(f);
 }
 
+/* token id -> embedding WITHOUT the TP_EMBED all-reduce (owned rows only; zeros elsewhere).
+ * The batched decode path gathers M of these and fires ONE ar over [M,hidden] instead of M. */
+static void embed_partial(glm5_model*m,int tok,float*x){
+    int H=m->cfg.hidden;
+    if(tok<0||tok>=m->cfg.vocab) tok=0;
+    if(m->emb_rows<m->cfg.vocab){
+        memset(x,0,(size_t)H*4);
+        if(tok>=m->emb_r0 && tok<m->emb_r0+m->emb_rows){
+            const uint16_t*row=m->embed+(size_t)(tok-m->emb_r0)*H;
+            for(int i=0;i<H;i++) x[i]=glm5_bf2f(row[i]);
+        }
+        return;
+    }
+    const uint16_t*row=m->embed+(size_t)tok*H;
+    for(int i=0;i<H;i++) x[i]=glm5_bf2f(row[i]);
+}
+
+/* GLM5_BATCH_DECODE: copy a slot model's prompt latent-KV (positions 0..npos-1, all layers)
+ * into the shared mstream's per-stream cache. Bridges the validated per-slot prefill (clone
+ * L->kv_cache, same glm5_kv_enc encoding) to the batched kernel's ms->kc. bf16/fp16 KV, CP off. */
+static void cbatch_kv_to_stream(glm5_model*root,glm5_model*src,int stream,int npos){
+    glm5_mstream*ms=(glm5_mstream*)root->ms; const glm5_config*c=&root->cfg;
+    const int KVC=glm5_kv_cache_dim(c); const size_t per=(size_t)c->n_layers*c->max_pos*KVC;
+    for(int l=0;l<c->n_layers;l++)
+        memcpy(ms->kc+(size_t)stream*per+(size_t)l*c->max_pos*KVC,
+               src->layers[l].kv_cache,(size_t)npos*KVC*2);
+}
+
 static int cbatch_start(cb_slot*s,const id_prompt*p,int req,int max_new,int C,double *prefill_sec,double *prefill_ar,long *prefill_calls){
     s->req=req; s->n_prompt=p->n; s->ng=0; s->done=0; s->nan=0; s->cur=0;
     g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
@@ -507,6 +540,22 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
         S[s].req=-1;
     }
 
+    /* GLM5_BATCH_DECODE=1: ONE glm5_forward_batch_decode_mla over all active slots per step
+     * (one AR/layer serves M tokens) instead of M single-token forwards (M ARs/layer). */
+    int bd=envi("GLM5_BATCH_DECODE",0);
+    float *BX=NULL; int *bdx=NULL,*bpos=NULL,*bout=NULL,*bhn=NULL; const int**bh=NULL;
+    if(bd){
+        if(root->int4_kv) die("GLM5_BATCH_DECODE needs bf16/fp16 KV (GLM5_INT4_KV=0)",-1);
+        if(root->cp_on)   die("GLM5_BATCH_DECODE needs CP off",-1);
+        if(glm5_alloc_mstream_ex(root,slots,1)) die("GLM5_BATCH_DECODE mstream alloc",-1);
+        BX=glm5_amalloc((size_t)slots*C*4);
+        bdx=glm5_amalloc((size_t)slots*sizeof(int));  bpos=glm5_amalloc((size_t)slots*sizeof(int));
+        bout=glm5_amalloc((size_t)slots*sizeof(int)); bhn=glm5_amalloc((size_t)slots*sizeof(int));
+        bh=glm5_amalloc((size_t)slots*sizeof(const int*));
+        if(MyRank==0) logmsg("cbatch: BATCH_DECODE on (M<=%d per forward, per-stream KV %.2f GB)\n",
+                             slots,(double)slots*root->cfg.n_layers*root->cfg.max_pos*glm5_kv_cache_dim(&root->cfg)*2/1e9);
+    }
+
     double prof0[GLM5_NPHASE], prof1[GLM5_NPHASE];
     prof_sum_models(S,slots,prof0);
     double pf_sec=0.0,pf_ar=0.0,svc_ar=0.0; long pf_calls=0,svc_calls=0;
@@ -514,12 +563,59 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
     for(int s=0;s<slots && next<n_req;s++,next++){
         total_prompt+=prompts[next].n;
         cbatch_start(&S[s],&prompts[next],next,max_new,C,&pf_sec,&pf_ar,&pf_calls);
+        if(bd) cbatch_kv_to_stream(root,S[s].m,s,S[s].n_prompt);
         active++;
     }
     barrier();
     g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
     double svc0=now_sec();
-    while(done<n_req){
+    while(bd && done<n_req){
+        /* ---- batched service loop: emit/retire/refill per slot, then ONE forward for all ---- */
+        int M=0;
+        for(int s=0;s<slots;s++){
+            cb_slot *q=&S[s];
+            if(q->req<0) continue;
+            if(q->ng<max_new) q->gen[q->ng++]=q->cur;
+            int eos=(q->cur==GLM5_EOS_ID0||q->cur==GLM5_EOS_ID1||q->cur==GLM5_EOS_ID2);
+            if(eos || q->ng>=max_new){
+                total_gen+=q->ng; total_nan+=q->nan;
+                cbatch_write_req(out_prefix,q->req,q->gen,q->ng);
+                if(MyRank==0){
+                    char buf[3000]; int o=0;
+                    for(int i=0;i<q->ng&&o<2900;i++) o+=snprintf(buf+o,sizeof(buf)-o,"%d ",q->gen[i]);
+                    logmsg("CBATCH_IDS req=%d n=%d %s\n",q->req,q->ng,buf);
+                }
+                q->req=-1; done++; active--;
+                if(next<n_req){
+                    total_prompt+=prompts[next].n;
+                    double save_ar=g_ar_secs; long save_calls=g_ar_calls, save_frags=g_ar_frags;
+                    cbatch_start(q,&prompts[next],next,max_new,C,&pf_sec,&pf_ar,&pf_calls);
+                    g_ar_secs=save_ar; g_ar_calls=save_calls; g_ar_frags=save_frags;
+                    cbatch_kv_to_stream(root,q->m,s,q->n_prompt);
+                    next++; active++;
+                }
+                continue;   /* refilled slot joins the batch next iteration (as per-slot path) */
+            }
+            bdx[M]=s; M++;
+        }
+        if(M==0) continue;  /* retire/refill pass only; loop re-evaluates (no active streams) */
+        glm5_mstream*ms=(glm5_mstream*)root->ms;
+        for(int i=0;i<M;i++){
+            cb_slot *q=&S[bdx[i]];
+            embed_partial(root,q->cur,BX+(size_t)i*C);
+            bpos[i]=q->n_prompt+q->ng-1;
+            bh[i]=q->gen; bhn[i]=q->ng;
+        }
+        /* TP_EMBED: one AR gathers all M embeddings (embed_partial left owned rows only) */
+        if(root->emb_rows<root->cfg.vocab && root->ar_cb) root->ar_cb(BX,M*C,root->ar_ctx);
+        ms->hist=bh; ms->hist_n=bhn;                 /* per-stream repetition-penalty history */
+        glm5_forward_batch_decode_mla(root,BX,M,bpos,bout);
+        for(int i=0;i<M;i++){
+            cb_slot *q=&S[bdx[i]]; q->cur=bout[i];
+            for(int k=0;k<C;k++) if(!(BX[(size_t)i*C+k]==BX[(size_t)i*C+k])){ q->nan++; break; }
+        }
+    }
+    while(!bd && done<n_req){
         int progressed=0;
         for(int s=0;s<slots;s++){
             cb_slot *q=&S[s];
@@ -570,6 +666,8 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
         prof_log_delta("cbatch_total",prof0,prof1,total_prompt+total_gen,pf_sec+svc_dt,pf_ar+svc_ar);
         logmsg("SENTINEL glm5_cbatch_%dn=done\n",N);
     }
+    if(bd){ glm5_afree(BX); glm5_afree(bdx); glm5_afree(bpos); glm5_afree(bout);
+            glm5_afree(bhn); glm5_afree((void*)bh); glm5_free_mstream(root); }
     for(int s=0;s<slots;s++){ glm5_afree(S[s].gen); glm5_afree(S[s].x); glm5_free(S[s].m); }
     glm5_afree(S);
     for(int r=0;r<n_req;r++) glm5_afree(prompts[r].ids);
@@ -708,6 +806,7 @@ int main(void){
     if(tp_comm_init(&comm,Vcq,PeerVcq+GBase,GRank,GSize,cfg.hidden*ar_tokens,gbarrier)!=0) die("tp_comm_init",-1);
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
+    m->ar_argmax_n_cb=ep_argmax_n_callback; m->ar_argmax_n_ctx=&comm;
     /* decode sampling (off by default; temp<=0 => greedy argmax). Lockstep: identical seed on
      * every rank => identical token. Only effective when the lm_head is replicated. */
     { const char*te=getenv("GLM5_TEMP"); const char*tp=getenv("GLM5_TOPP"); const char*rp=getenv("GLM5_REP_PEN");
