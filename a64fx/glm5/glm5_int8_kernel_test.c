@@ -26,7 +26,13 @@ int main(void){
     float *yo=(float*)glm5_amalloc((size_t)rows*4);
     if(!W||!S||!x||!ys||!yo) return 2;
     uint32_t st=1;
-    for(size_t i=0;i<(size_t)rows*cols;i++) W[i]=(uint8_t)(lcg(&st)&0xff);        /* full int8 range */
+    /* Parallel first-touch so weight pages spread across CMGs (mimics the runner's NUMA-interleaved
+     * weights); serial first-touch pins all of W to one CMG -> false single-CMG BW wall at 48 threads. */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(int r=0;r<rows;r++){ uint32_t s=1u+(uint32_t)r*2654435761u; for(int c=0;c<cols;c++) W[(size_t)r*cols+c]=(uint8_t)(lcg(&s)&0xff); }
+    (void)st;
     for(int i=0;i<cols;i++) x[i]=(float)((int)(lcg(&st)%2001)-1000)*1.0e-4f;
     for(size_t i=0;i<(size_t)rows*sb;i++) S[i]=2.0e-4f*(float)(1+(lcg(&st)&3));
 
@@ -160,5 +166,41 @@ int main(void){
     }
     printf("INT8_SDOT N=%d rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 GEMM %.2f Gop/s)\n",
            gemm_n,gemm_rows,cols,gs,sd_rel,sqrt(sse/(sref+1e-30)),tsd,gops/tsd/1e9,gops/tg_best/1e9);
+
+    /* M=1 w8a8 SDOT MATVEC (the decode lever): glm5_mv_int8_sdot vs the w8a16 8row matvec (yo). */
+    float *ymv=(float*)glm5_amalloc((size_t)rows*4);
+    if(!ymv) return 2;
+    glm5_mv_int8_sdot(&gm,ymv,W,S,gs,x,rows,cols);   /* yo already holds the w8a16 reference */
+    double mv_sse=0,mv_sref=0,mv_maxrel=0;
+    for(int r=0;r<rows;r++){
+        double ref=yo[r], dd=ref-(double)ymv[r]; mv_sse+=dd*dd; mv_sref+=ref*ref;
+        double rel=fabs(dd)/(fabs(ref)+1e-9); if(rel>mv_maxrel)mv_maxrel=rel;
+    }
+    double tmv=1e30;
+    for(int it=0;it<reps;it++){
+        t0=wall_sec(); glm5_mv_int8_sdot(&gm,ymv,W,S,gs,x,rows,cols);
+        double tt=wall_sec()-t0; if(tt<tmv)tmv=tt;
+    }
+    printf("INT8_MV_SDOT rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g w8a16=%.6f s %.2f Gop/s  sdot=%.6f s %.2f Gop/s  speedup=%.2fx\n",
+           rows,cols,gs,mv_maxrel,sqrt(mv_sse/(mv_sref+1e-30)),best_o,ops/best_o/1e9,tmv,ops/tmv/1e9,best_o/tmv);
+
+    /* BF16-weight matvec (glm5_mv_bf16): the bf16 decode path (2 B/weight, f32 acts). Reports Gop/s
+     * + GB/s so the memory-vs-compute roofline is explicit (bf16 streams 2x the bytes of int8). */
+    if(glm5_envi("BF16",1)){
+        uint16_t *Wb=(uint16_t*)glm5_amalloc((size_t)rows*cols*2);
+        float *yb=(float*)glm5_amalloc((size_t)rows*4);
+        if(Wb&&yb){
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
+            for(int r=0;r<rows;r++){ uint32_t s=1u+(uint32_t)r*2654435761u; for(int c=0;c<cols;c++) Wb[(size_t)r*cols+c]=(uint16_t)(lcg(&s)>>16); }
+            glm5_model bm; memset(&bm,0,sizeof bm);
+            double tb=1e30;
+            for(int it=0;it<reps;it++){ t0=wall_sec(); glm5_mv_bf16(yb,Wb,x,rows,cols); double tt=wall_sec()-t0; if(tt<tb)tb=tt; }
+            double bbytes=(double)rows*cols*2.0;
+            printf("BF16_MV rows=%d cols=%d best=%.6f s %.2f Gop/s  %.1f GB/s\n",
+                   rows,cols,tb,ops/tb/1e9,bbytes/tb/1e9);
+        }
+    }
     return (decode_err==0 && max_rel<1.0e-3 && gemm_rel<5.0e-3)?0:1;  /* gemm bf16-decode rounding ~2e-3 */
 }

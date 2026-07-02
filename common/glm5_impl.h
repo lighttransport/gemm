@@ -100,8 +100,27 @@ static inline float    glm5_kv_dec(const glm5_model*m,uint16_t u){ return m->kv_
 static inline float glm5_dot_f32_opt(const float*a,const float*b,int n,int use_sve){
 #if defined(__ARM_FEATURE_SVE)
     if(use_sve){
-        svfloat32_t acc=svdup_f32(0.0f);
         int vl=(int)svcntw();
+        /* 4 independent accumulators break the loop-carried svmla dependency chain (A64FX FMA
+         * latency ~9 cyc, 2 FLA pipes) -> ~2x on the isolated dot (qlair: single-acc was ~71%
+         * data-dependency stalls). GLM5_DOT_ACC4=0 restores the single-acc path for A/B. */
+        static int acc4=-1;
+        if(acc4<0){ const char*e=getenv("GLM5_DOT_ACC4"); acc4=e?atoi(e):1; }
+        if(acc4){
+            svfloat32_t a0=svdup_f32(0.0f),a1=a0,a2=a0,a3=a0;
+            svbool_t pg=svptrue_b32();
+            int i=0;
+            for(;i+4*vl<=n;i+=4*vl){
+                a0=svmla_f32_x(pg,a0,svld1(pg,a+i),      svld1(pg,b+i));
+                a1=svmla_f32_x(pg,a1,svld1(pg,a+i+vl),   svld1(pg,b+i+vl));
+                a2=svmla_f32_x(pg,a2,svld1(pg,a+i+2*vl), svld1(pg,b+i+2*vl));
+                a3=svmla_f32_x(pg,a3,svld1(pg,a+i+3*vl), svld1(pg,b+i+3*vl));
+            }
+            for(;i<n;i+=vl){ svbool_t pt=svwhilelt_b32(i,n); a0=svmla_f32_x(pt,a0,svld1(pt,a+i),svld1(pt,b+i)); }
+            a0=svadd_f32_x(pg,svadd_f32_x(pg,a0,a1),svadd_f32_x(pg,a2,a3));
+            return svaddv_f32(pg,a0);
+        }
+        svfloat32_t acc=svdup_f32(0.0f);
         for(int i=0;i<n;i+=vl){
             svbool_t pg=svwhilelt_b32(i,n);
             acc=svmla_f32_x(pg,acc,svld1(pg,a+i),svld1(pg,b+i));
@@ -127,6 +146,24 @@ static inline void glm5_scale_f32(float*x,float s,int n){
 static inline void glm5_axpy_f32(float*y,const float*x,float a,int n){
 #if defined(__ARM_FEATURE_SVE)
     int vl=(int)svcntw();
+    /* 4-way unroll: the online-softmax AXPY has NO reduction dependency, but the single-op loop is
+     * store/load-pipeline bound on A64FX; unrolling hides it -> measured 1.93x NATIVELY (K0, job
+     * 49420133). Bit-identical to the 1-op loop (no reassociation). NOTE qlair modelled this as only
+     * 1.03x -> qlair under-models memory-pipeline effects; trust the NATIVE probe here. Same
+     * GLM5_DOT_ACC4=0 escape hatch restores the 1-op loop for the A/B. */
+    static int acc4=-1;
+    if(acc4<0){ const char*e=getenv("GLM5_DOT_ACC4"); acc4=e?atoi(e):1; }
+    if(acc4){
+        svbool_t pg=svptrue_b32(); int i=0;
+        for(;i+4*vl<=n;i+=4*vl){
+            svst1(pg,y+i,     svmla_n_f32_x(pg,svld1(pg,y+i),      svld1(pg,x+i),a));
+            svst1(pg,y+i+vl,  svmla_n_f32_x(pg,svld1(pg,y+i+vl),   svld1(pg,x+i+vl),a));
+            svst1(pg,y+i+2*vl,svmla_n_f32_x(pg,svld1(pg,y+i+2*vl), svld1(pg,x+i+2*vl),a));
+            svst1(pg,y+i+3*vl,svmla_n_f32_x(pg,svld1(pg,y+i+3*vl), svld1(pg,x+i+3*vl),a));
+        }
+        for(;i<n;i+=vl){ svbool_t q=svwhilelt_b32(i,n); svst1(q,y+i,svmla_n_f32_x(q,svld1(q,y+i),svld1(q,x+i),a)); }
+        return;
+    }
     for(int i=0;i<n;i+=vl){
         svbool_t pg=svwhilelt_b32(i,n);
         svfloat32_t yv=svld1(pg,y+i);
@@ -603,10 +640,54 @@ static void glm5_mv_int8(glm5_model*m, float*restrict y, const uint8_t*W, const 
 #endif
     for(int r=0;r<rows;r++) y[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,x,cols);
 }
+/* GLM5.2 INT8 w8a8 SDOT matvec (M=1 decode): dynamically quantize the activation to int8 ONCE
+ * (per-vector symmetric absmax), then contract with SVE SDOT instead of the w8a16 per-byte
+ * u8->f32 convert. Eliminates the convert-throughput bottleneck of glm5_mv_int8 for M=1. Lossier
+ * (activation rounded to int8) -> opt-in via GLM5_MV_SDOT. */
+static void glm5_mv_int8_sdot(glm5_model*m, float*restrict y, const uint8_t*W, const float*S, int gs, const float*x, int rows, int cols){
+    int sb=(cols+gs-1)/gs;
+    if(glm5_dummy){ for(int r=0;r<rows;r++) y[r]=0.f; (void)m; return; }
+#if defined(__ARM_FEATURE_SVE)
+    int8_t *xq=(int8_t*)malloc((size_t)cols);
+    if(!xq){ glm5_mv_int8(m,y,W,S,gs,x,rows,cols); return; }
+    float amax=1e-20f;
+    for(int c=0;c<cols;c++){ float a=fabsf(x[c]); if(a>amax)amax=a; }
+    float inv=127.0f/amax, xsc=amax/127.0f;
+    for(int c=0;c<cols;c++){ int v=(int)lrintf(x[c]*inv); v=v>127?127:(v<-127?-127:v); xq[c]=(int8_t)v; }
+    int nb=rows/8;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){
+        int r=bi*8; const uint8_t*w=W+(size_t)r*cols; const float*s=S+(size_t)r*sb; float tmp[8];
+        glm5_matvec_int8_sdot_8row(tmp,
+            w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,
+            w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
+            s,s+sb,s+2*(size_t)sb,s+3*(size_t)sb,
+            s+4*(size_t)sb,s+5*(size_t)sb,s+6*(size_t)sb,s+7*(size_t)sb,
+            gs,xq,cols);
+        for(int j=0;j<8;j++) y[r+j]=xsc*tmp[j];
+    }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows-nb*8>=GLM5_PAR_MIN)
+#endif
+    for(int r=nb*8;r<rows;r++) y[r]=xsc*glm5_dot_int8_sdot_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,xq,cols);
+    free(xq);
+    return;
+#else
+    glm5_mv_int8(m,y,W,S,gs,x,rows,cols);
+#endif
+}
 /* matvec dispatch by weight type (bf16 / MXFP8 / INT8) */
 static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const float*x, int rows, int cols){
     if(t->type==GLM5_MXFP8) glm5_mv_mxfp8(m,y,(const uint8_t*)t->w,t->scale,x,rows,cols);
-    else if(t->type==GLM5_INT8) glm5_mv_int8(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,x,rows,cols);
+    else if(t->type==GLM5_INT8){
+        /* w8a8 SDOT M=1 path (GLM5_MV_SDOT=1): faster but lossier (int8 activations). Default off. */
+        static int mvsd=-2;
+        if(mvsd==-2) mvsd=glm5_envi("GLM5_MV_SDOT",0);
+        if(mvsd) glm5_mv_int8_sdot(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,x,rows,cols);
+        else glm5_mv_int8(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,x,rows,cols);
+    }
     else glm5_mv_bf16(y,(const uint16_t*)t->w,x,rows,cols);
 }
 

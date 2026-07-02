@@ -73,6 +73,60 @@ static inline void glm5_matvec_int8_8row(float*restrict dst,
     dst[4]=svaddv_f32(pt,a4)-128.f*cr4; dst[5]=svaddv_f32(pt,a5)-128.f*cr5;
     dst[6]=svaddv_f32(pt,a6)-128.f*cr6; dst[7]=svaddv_f32(pt,a7)-128.f*cr7;
 }
+
+/* w8a8 SDOT 8-row matvec (M=1 decode): activations pre-quantized to int8 (xq); caller multiplies
+ * the result by the activation scale xsc. Offset-binary weights -> signed int8 via eor 0x80. Per
+ * group g: svdot_s32 accumulates int8*int8 into 16 int32 lanes; defer to a per-row f32 accumulator
+ * folding the group scale sc[g] (svmla_n), one svaddv per row at the end (svaddv is linear). This
+ * replaces the w8a16 per-byte u8->f32 convert (the convert-throughput bottleneck) with SDOT
+ * (64 int8 MACs/instr on the int pipe), so the FP pipes only do 1 convert+fma per group per row. */
+static inline void glm5_matvec_int8_sdot_8row(float*restrict dst,
+        const uint8_t*w0,const uint8_t*w1,const uint8_t*w2,const uint8_t*w3,
+        const uint8_t*w4,const uint8_t*w5,const uint8_t*w6,const uint8_t*w7,
+        const float*s0,const float*s1,const float*s2,const float*s3,
+        const float*s4,const float*s5,const float*s6,const float*s7,
+        int gs,const int8_t*xq,int cols){
+    svbool_t pf=svptrue_b32(); int vb=(int)svcntb();
+    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f);
+    svfloat32_t a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
+    for(int b=0;b<cols;b+=gs){
+        int bend=b+gs<cols?b+gs:cols, blk=b/gs, c=b;
+        svint32_t d0=svdup_s32(0),d1=svdup_s32(0),d2=svdup_s32(0),d3=svdup_s32(0);
+        svint32_t d4=svdup_s32(0),d5=svdup_s32(0),d6=svdup_s32(0),d7=svdup_s32(0);
+        #define GLM5_SD(WP,D) do{ svint8_t wv=svreinterpret_s8_u8(sveor_n_u8_x(pg,svld1_u8(pg,&(WP)[c]),0x80)); \
+            D=svdot_s32(D,wv,xv); }while(0)
+        for(;c<bend;c+=vb){
+            svbool_t pg=svwhilelt_b8((uint32_t)c,(uint32_t)bend);
+            svint8_t xv=svld1_s8(pg,&xq[c]);
+            GLM5_SD(w0,d0); GLM5_SD(w1,d1); GLM5_SD(w2,d2); GLM5_SD(w3,d3);
+            GLM5_SD(w4,d4); GLM5_SD(w5,d5); GLM5_SD(w6,d6); GLM5_SD(w7,d7);
+        }
+        #undef GLM5_SD
+        a0=svmla_n_f32_x(pf,a0,svcvt_f32_s32_x(pf,d0),s0[blk]);
+        a1=svmla_n_f32_x(pf,a1,svcvt_f32_s32_x(pf,d1),s1[blk]);
+        a2=svmla_n_f32_x(pf,a2,svcvt_f32_s32_x(pf,d2),s2[blk]);
+        a3=svmla_n_f32_x(pf,a3,svcvt_f32_s32_x(pf,d3),s3[blk]);
+        a4=svmla_n_f32_x(pf,a4,svcvt_f32_s32_x(pf,d4),s4[blk]);
+        a5=svmla_n_f32_x(pf,a5,svcvt_f32_s32_x(pf,d5),s5[blk]);
+        a6=svmla_n_f32_x(pf,a6,svcvt_f32_s32_x(pf,d6),s6[blk]);
+        a7=svmla_n_f32_x(pf,a7,svcvt_f32_s32_x(pf,d7),s7[blk]);
+    }
+    dst[0]=svaddv_f32(pf,a0); dst[1]=svaddv_f32(pf,a1);
+    dst[2]=svaddv_f32(pf,a2); dst[3]=svaddv_f32(pf,a3);
+    dst[4]=svaddv_f32(pf,a4); dst[5]=svaddv_f32(pf,a5);
+    dst[6]=svaddv_f32(pf,a6); dst[7]=svaddv_f32(pf,a7);
+}
+
+/* scalar w8a8 reference (pre-quantized xq), y = xsc * sum_g sc[g] * sum_c (b[c]-128)*xq[c]. */
+static inline float glm5_dot_int8_sdot_row(const uint8_t*w,const float*s,int gs,const int8_t*xq,int cols){
+    double a=0;
+    for(int b=0;b<cols;b+=gs){
+        float sc=s[b/gs]; int e=b+gs<cols?b+gs:cols; long acc=0;
+        for(int c=b;c<e;c++) acc+=(long)((int)w[c]-128)*(int)xq[c];
+        a+=(double)acc*sc;
+    }
+    return (float)a;
+}
 #endif
 
 #endif /* GLM5_INT8_H */

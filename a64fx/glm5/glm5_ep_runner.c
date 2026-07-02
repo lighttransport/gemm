@@ -427,7 +427,20 @@ static tp_comm *g_comm_ctx=NULL;
 static _Atomic int g_comm_go=0, g_comm_done=1, g_comm_stop=0;
 static float *g_comm_buf=NULL; static int g_comm_count=0;
 static pthread_t g_comm_th;
+/* Pick the comm-driver's dedicated core: GLM5_COMM_CORE if set, else the HIGHEST core in this
+ * process's cpuset (A64FX job cpuset = 12-59, so core 59). The OMP pool must be sized to cores-1
+ * and pinned to the LOWER cores (OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores) so the
+ * comm thread never shares a core with a compute thread -> the spin-wait AR stops starving. */
+static int glm5_comm_pick_core(void){
+    const char*e=getenv("GLM5_COMM_CORE"); if(e&&*e) return atoi(e);
+    cpu_set_t s; CPU_ZERO(&s); int hi=-1;
+    if(sched_getaffinity(0,sizeof s,&s)==0) for(int c=0;c<512;c++) if(CPU_ISSET(c,&s)) hi=c;
+    return hi;   /* highest allowed core; -1 -> no pin */
+}
 static void* comm_driver(void *a){ (void)a;
+    int cc=glm5_comm_pick_core();
+    if(cc>=0){ cpu_set_t s; CPU_ZERO(&s); CPU_SET(cc,&s); sched_setaffinity(0,sizeof s,&s);
+        if(MyRank==0) logmsg("comm-driver pinned to core %d\n",cc); }
     for(;;){
         while(!atomic_load_explicit(&g_comm_go,memory_order_acquire) && !atomic_load_explicit(&g_comm_stop,memory_order_acquire))
             __asm__ __volatile__("yield":::"memory");
