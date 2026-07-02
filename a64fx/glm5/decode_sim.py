@@ -132,101 +132,104 @@ def fits(gb): return "OK" if gb <= NODE_GB-RESERVE_GB else "DOES NOT FIT"
 
 # ---------- report ----------
 def hdr(s): print("\n"+s+"\n"+"-"*len(s))
-print(__doc__)
 
-hdr("Active bytes per TOKEN (int8 model, M=1, ctx=128) — what must move")
-GB=1e9
-for nm,val in [("attention(all 78L)",ATTN_P),("routed experts(8/L active)",distinct_experts(1)/1*EXPERT_P*N_MOE),
-               ("shared expert",SHARED_P),("dense FFN",DENSE_P),("router(bf16)",ROUTER_P*2),("lm_head(bf16)",HEAD_P*2)]:
-    print(f"  {nm:<28} {val/GB:6.2f} GB (full model, pre-shard)")
-print(f"  per-node @96n (sharded)      {active_bytes_per_node(96,1,128)/GB:6.3f} GB/forward")
-
-hdr("THEORETICAL UPPER BOUND — bandwidth ceiling (comm-free), int8, ctx=128")
-print("   N\\M " + "".join(f"{m:>9}" for m in [1,8,16,32,64]))
-for N in [24,48,96,192,384]:
-    print(f"  {N:>4} " + "".join(f"{ub_tok_s(N,m,128):>9.0f}" for m in [1,8,16,32,64]))
-print(f"  M=1 96n, attention REPLICATED (no TP head-shard): {ub_tok_s(96,1,128,shard_attn=False):.0f} tok/s")
-print("  (ceiling rises with M until expert reads saturate; falls at long ctx as KV read grows)")
-
-hdr("uTofu all-reduce cost (per call, calibrated)")
-print(f"  per-AR @96n (msg={1*H*4//1024} KB, M=1): {ar_latency(96,1*H*4)*1e3:.1f} ms = "
-      f"{UTOFU_INIT*1e3:.1f} init + {math.ceil(math.log2(96))}rounds*{UTOFU_ROUND*1e3:.1f} + bw")
-print(f"  AR/token: {n_allreduce(True)} (attn sharded: 2/MoE layer) vs {n_allreduce(False)} (attn replicated: 1/MoE layer)")
-print(f"  hardware floor would be ~0.01-0.02 ms/AR -> the {UTOFU_ROUND*1e3:.0f} ms/round is the robust-completion tax.")
-
-hdr("CUT 2 ALL-REDUCES/LAYER -> 1  (replicate attention; the only valid 1-AR path)")
-print("   M    2 AR/layer   1 AR/layer   speedup   +MTP(1AR)")
-for M in [1,8,16,32]:
-    a=pred_tok_s(96,M,shard_attn=True); b=pred_tok_s(96,M,shard_attn=False)
-    print(f"  {M:>3}   {a:>9.2f}    {b:>9.2f}    {b/a:>5.2f}x    {pred_tok_s(96,M,mtp=0.4,shard_attn=False):>7.2f}")
-print("  (decode is comm-bound, so replicating attention's +bandwidth is cheap; prefill keeps sharding.)")
-
-hdr("Calibration + the gap (96 nodes, int8, M=1)")
-print(f"  bandwidth-bound time   : {_bw96_1*1e3:7.2f} ms/token  -> UB {ub_tok_s(96,1,128):.0f} tok/s")
-print(f"  measured / comm-bound  : {1/AR_M1_96*1e3:7.0f} ms/token  -> {AR_M1_96} tok/s")
-print(f"  => all-reduce overhead : {_comm96_1*1e3:7.0f} ms ({100*_comm96_1/(1/AR_M1_96):.0f}% of the token); "
-      f"{n_allreduce(SHARD_ATTN)} AR/token @ {_ar96*1e3:.0f} ms each")
-print(f"  decode runs at {100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of the bandwidth ceiling -> ~{ub_tok_s(96,1,128)/AR_M1_96:.0f}x headroom, all comm.")
-
-hdr("Calibrated PREDICTION — batching + MTP (96 nodes, int8, ctx=128)")
-print("   M    agg tok/s   +MTP(0.4)   % of UB")
-for M in [1,8,16,32,64]:
-    print(f"  {M:>3}   {pred_tok_s(96,M):>8.2f}   {pred_tok_s(96,M,mtp=0.4):>8.2f}   {100*pred_tok_s(96,M)/ub_tok_s(96,M,128):>6.1f}%")
-
-hdr("Long-context UB (96n, int8) — KV read grows the floor")
-for L in [128,2048,8192,32768]:
-    print(f"  ctx={L:>6}: UB M=1 {ub_tok_s(96,1,L):>6.0f}  M=16 {ub_tok_s(96,16,L):>6.0f} tok/s")
-
-hdr("M=1 lever-stack, int8 -> 1 tok/s (single-stream, NO MTP, NO batching)")
-R0 = UTOFU_ROUND*1e3                                              # calibrated per-round cost (~3.4 ms)
-print(f"  target: 1.00 tok/s (4x over 0.25). 1 AR/layer budget = ~13 ms/AR; current = {_ar96*1e3:.0f} ms/AR.")
-print(f"  {'baseline 96n, 2 AR/layer':<46} {m1_tput(96,True ,R0):>5.2f} tok/s")
-print(f"  {'+ 2->1 AR (replicate attention) @96n':<46} {m1_tput(96,False,R0):>5.2f}   (safe; ~2x)")
-print(f"  {'+ smallest int8-fit node count @32n':<46} {m1_tput(32,False,R0):>5.2f}   (safe; smaller AR group)")
-print(f"  {'+ leaner decode-AR completion 1.7 ms/round':<46} {m1_tput(32,False,1.7):>5.2f}   (RISKY: relaxes robust-completion)")
-print(f"  {'+ leaner completion 1.0 ms/round':<46} {m1_tput(32,False,1.0):>5.2f}")
-print(f"  note: round-cost is the trailer-seq/civac/MRQ robustness tax ({R0:.1f} ms vs ~0.02 ms HW floor);")
-print(f"        trimming it is the only lever needing a job to validate (correctness under the races it fixed).")
-
-hdr("M=1 lever-stack, bf16 -> 2 tok/s target (bf16 needs >=96n; replicated attn DOES NOT FIT in bf16)")
-print(f"  bf16 replicated attention = {ATTN_P*2/1e9:.1f} GB/node -> attention must stay SHARDED (or subgroup).")
-print(f"  {'baseline 96n, 2 AR/layer, robust':<52} {m1_tput(96,True ,R0 ,prec='bf16'):>5.2f} tok/s")
-print(f"  {'+ lean AR 1.0 ms/round':<52} {m1_tput(96,True ,1.0,prec='bf16'):>5.2f}")
-print(f"  {'+ lean AR 0.5 ms/round':<52} {m1_tput(96,True ,0.5,prec='bf16'):>5.2f}")
-print(f"  {'+ lean AR 0.3 ms/round':<52} {m1_tput(96,True ,0.3,prec='bf16'):>5.2f}")
-print(f"  {'+ attn TP SUBGROUP k=8 (o-proj AR over 8), 0.5ms':<52} {m1_tput(96,True ,0.5,prec='bf16',attn_group=8):>5.2f}"
-      f"   (attn mem {ATTN_P*2/8/1e9:.1f} GB/node: {fits(mem_per_node_gb(96,'bf16',attn_ways=8,M=1))})")
-print(f"  {'+ attn TP SUBGROUP k=8, 0.3ms':<52} {m1_tput(96,True ,0.3,prec='bf16',attn_group=8):>5.2f}")
-print(f"  => bf16 2 tok/s needs the lean AR at <=0.5 ms/round PLUS the attention subgroup (or <=0.3 ms alone).")
-
-hdr("Batched aggregate vs lean-AR round cost (sharded attn, ctx=128) — path to 20 tok/s")
-print("  prec  N    round_ms " + "".join(f"{m:>8}" for m in [8,16,32,64]))
-for prec in ['int8','bf16']:
-    for N,rms in [(96,None),(96,1.0),(96,0.5),(32,None),(32,1.0),(32,0.5)]:
-        if prec=='bf16' and N<48: continue                        # bf16 does not fit below ~48n
-        lbl = f"{UTOFU_ROUND*1e3:.1f}(cal)" if rms is None else f"{rms:.1f}"
-        print(f"  {prec:<5}{N:>4}  {lbl:>9} " + "".join(f"{pred_tok_s(N,m,prec=prec,round_ms=rms):>8.1f}" for m in [8,16,32,64]))
-print(f"  +MTP multiplies by ~{(1+0.4)/1.18:.2f} (accept 0.4).  AR msg at M=64 = {64*H*4/1024:.0f} KB -> use TP_AR_BF16.")
-
-hdr("Memory feasibility per node (32 GB HBM2, 2 GB reserve)")
-print("  config                                          GB/node   fit")
-for desc,N,prec,ways,M,mp in [("int8  96n sharded attn, M=32 kv2048", 96,'int8',None,32,2048),
-                               ("int8  96n REPLICATED attn, M=1",      96,'int8',1,   1,2048),
-                               ("int8  32n sharded attn, M=64 kv1024", 32,'int8',None,64,1024),
-                               ("int8  32n REPLICATED attn, M=1",      32,'int8',1,   1,2048),
-                               ("bf16  96n sharded attn, M=32 kv2048", 96,'bf16',None,32,2048),
-                               ("bf16  96n REPLICATED attn, M=1",      96,'bf16',1,   1,2048),
-                               ("bf16  96n attn subgroup k=8, M=1",    96,'bf16',8,   1,2048),
-                               ("bf16  96n attn subgroup k=8, M=32",   96,'bf16',8,  32,2048)]:
-    gb = mem_per_node_gb(N,prec,attn_ways=ways,M=M,max_pos=mp)
-    print(f"  {desc:<46} {gb:>7.1f}   {fits(gb)}")
-print(f"  (ms->kc per-stream KV: M=32 x 78L x 2048pos x {KVC} x 2B = {32*N_LAYERS*2048*KVC*2/1e9:.1f} GB)")
-
-hdr("Takeaways")
-print(f"""  * THEORETICAL UPPER BOUND (bandwidth) at 96n int8: ~{ub_tok_s(96,1,128):.0f} tok/s (M=1, sharded attn),
-    rising to ~{ub_tok_s(96,32,128):.0f} with M=32. Replicated attention would cap it at ~{ub_tok_s(96,1,128,shard_attn=False):.0f}.
-  * We run at ~{100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of that — the loss is ~{n_allreduce(SHARD_ATTN)} all-reduces/token at ~{_ar96*1e3:.0f} ms each
-    (a ~50-100x-too-slow collective from the robust-completion path), NOT bandwidth/compute.
-  * Batching M amortizes the comm: predicted M=16 ~{pred_tok_s(96,16):.1f}, M=32 ~{pred_tok_s(96,32):.1f} tok/s; +MTP ~1.2x.
-  * Headroom to the bandwidth ceiling is ~{ub_tok_s(96,16,128)/pred_tok_s(96,16):.0f}x even after batching -> cutting AR latency/count
-    (2->1 AR/layer, lighter completion, smaller groups) is the second big lever after batching.""")
+if __name__ == "__main__":                       # report only when run directly
+    print(__doc__)
+    
+    hdr("Active bytes per TOKEN (int8 model, M=1, ctx=128) — what must move")
+    GB=1e9
+    for nm,val in [("attention(all 78L)",ATTN_P),("routed experts(8/L active)",distinct_experts(1)/1*EXPERT_P*N_MOE),
+                   ("shared expert",SHARED_P),("dense FFN",DENSE_P),("router(bf16)",ROUTER_P*2),("lm_head(bf16)",HEAD_P*2)]:
+        print(f"  {nm:<28} {val/GB:6.2f} GB (full model, pre-shard)")
+    print(f"  per-node @96n (sharded)      {active_bytes_per_node(96,1,128)/GB:6.3f} GB/forward")
+    
+    hdr("THEORETICAL UPPER BOUND — bandwidth ceiling (comm-free), int8, ctx=128")
+    print("   N\\M " + "".join(f"{m:>9}" for m in [1,8,16,32,64]))
+    for N in [24,48,96,192,384]:
+        print(f"  {N:>4} " + "".join(f"{ub_tok_s(N,m,128):>9.0f}" for m in [1,8,16,32,64]))
+    print(f"  M=1 96n, attention REPLICATED (no TP head-shard): {ub_tok_s(96,1,128,shard_attn=False):.0f} tok/s")
+    print("  (ceiling rises with M until expert reads saturate; falls at long ctx as KV read grows)")
+    
+    hdr("uTofu all-reduce cost (per call, calibrated)")
+    print(f"  per-AR @96n (msg={1*H*4//1024} KB, M=1): {ar_latency(96,1*H*4)*1e3:.1f} ms = "
+          f"{UTOFU_INIT*1e3:.1f} init + {math.ceil(math.log2(96))}rounds*{UTOFU_ROUND*1e3:.1f} + bw")
+    print(f"  AR/token: {n_allreduce(True)} (attn sharded: 2/MoE layer) vs {n_allreduce(False)} (attn replicated: 1/MoE layer)")
+    print(f"  hardware floor would be ~0.01-0.02 ms/AR -> the {UTOFU_ROUND*1e3:.0f} ms/round is the robust-completion tax.")
+    
+    hdr("CUT 2 ALL-REDUCES/LAYER -> 1  (replicate attention; the only valid 1-AR path)")
+    print("   M    2 AR/layer   1 AR/layer   speedup   +MTP(1AR)")
+    for M in [1,8,16,32]:
+        a=pred_tok_s(96,M,shard_attn=True); b=pred_tok_s(96,M,shard_attn=False)
+        print(f"  {M:>3}   {a:>9.2f}    {b:>9.2f}    {b/a:>5.2f}x    {pred_tok_s(96,M,mtp=0.4,shard_attn=False):>7.2f}")
+    print("  (decode is comm-bound, so replicating attention's +bandwidth is cheap; prefill keeps sharding.)")
+    
+    hdr("Calibration + the gap (96 nodes, int8, M=1)")
+    print(f"  bandwidth-bound time   : {_bw96_1*1e3:7.2f} ms/token  -> UB {ub_tok_s(96,1,128):.0f} tok/s")
+    print(f"  measured / comm-bound  : {1/AR_M1_96*1e3:7.0f} ms/token  -> {AR_M1_96} tok/s")
+    print(f"  => all-reduce overhead : {_comm96_1*1e3:7.0f} ms ({100*_comm96_1/(1/AR_M1_96):.0f}% of the token); "
+          f"{n_allreduce(SHARD_ATTN)} AR/token @ {_ar96*1e3:.0f} ms each")
+    print(f"  decode runs at {100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of the bandwidth ceiling -> ~{ub_tok_s(96,1,128)/AR_M1_96:.0f}x headroom, all comm.")
+    
+    hdr("Calibrated PREDICTION — batching + MTP (96 nodes, int8, ctx=128)")
+    print("   M    agg tok/s   +MTP(0.4)   % of UB")
+    for M in [1,8,16,32,64]:
+        print(f"  {M:>3}   {pred_tok_s(96,M):>8.2f}   {pred_tok_s(96,M,mtp=0.4):>8.2f}   {100*pred_tok_s(96,M)/ub_tok_s(96,M,128):>6.1f}%")
+    
+    hdr("Long-context UB (96n, int8) — KV read grows the floor")
+    for L in [128,2048,8192,32768]:
+        print(f"  ctx={L:>6}: UB M=1 {ub_tok_s(96,1,L):>6.0f}  M=16 {ub_tok_s(96,16,L):>6.0f} tok/s")
+    
+    hdr("M=1 lever-stack, int8 -> 1 tok/s (single-stream, NO MTP, NO batching)")
+    R0 = UTOFU_ROUND*1e3                                              # calibrated per-round cost (~3.4 ms)
+    print(f"  target: 1.00 tok/s (4x over 0.25). 1 AR/layer budget = ~13 ms/AR; current = {_ar96*1e3:.0f} ms/AR.")
+    print(f"  {'baseline 96n, 2 AR/layer':<46} {m1_tput(96,True ,R0):>5.2f} tok/s")
+    print(f"  {'+ 2->1 AR (replicate attention) @96n':<46} {m1_tput(96,False,R0):>5.2f}   (safe; ~2x)")
+    print(f"  {'+ smallest int8-fit node count @32n':<46} {m1_tput(32,False,R0):>5.2f}   (safe; smaller AR group)")
+    print(f"  {'+ leaner decode-AR completion 1.7 ms/round':<46} {m1_tput(32,False,1.7):>5.2f}   (RISKY: relaxes robust-completion)")
+    print(f"  {'+ leaner completion 1.0 ms/round':<46} {m1_tput(32,False,1.0):>5.2f}")
+    print(f"  note: round-cost is the trailer-seq/civac/MRQ robustness tax ({R0:.1f} ms vs ~0.02 ms HW floor);")
+    print(f"        trimming it is the only lever needing a job to validate (correctness under the races it fixed).")
+    
+    hdr("M=1 lever-stack, bf16 -> 2 tok/s target (bf16 needs >=96n; replicated attn DOES NOT FIT in bf16)")
+    print(f"  bf16 replicated attention = {ATTN_P*2/1e9:.1f} GB/node -> attention must stay SHARDED (or subgroup).")
+    print(f"  {'baseline 96n, 2 AR/layer, robust':<52} {m1_tput(96,True ,R0 ,prec='bf16'):>5.2f} tok/s")
+    print(f"  {'+ lean AR 1.0 ms/round':<52} {m1_tput(96,True ,1.0,prec='bf16'):>5.2f}")
+    print(f"  {'+ lean AR 0.5 ms/round':<52} {m1_tput(96,True ,0.5,prec='bf16'):>5.2f}")
+    print(f"  {'+ lean AR 0.3 ms/round':<52} {m1_tput(96,True ,0.3,prec='bf16'):>5.2f}")
+    print(f"  {'+ attn TP SUBGROUP k=8 (o-proj AR over 8), 0.5ms':<52} {m1_tput(96,True ,0.5,prec='bf16',attn_group=8):>5.2f}"
+          f"   (attn mem {ATTN_P*2/8/1e9:.1f} GB/node: {fits(mem_per_node_gb(96,'bf16',attn_ways=8,M=1))})")
+    print(f"  {'+ attn TP SUBGROUP k=8, 0.3ms':<52} {m1_tput(96,True ,0.3,prec='bf16',attn_group=8):>5.2f}")
+    print(f"  => bf16 2 tok/s needs the lean AR at <=0.5 ms/round PLUS the attention subgroup (or <=0.3 ms alone).")
+    
+    hdr("Batched aggregate vs lean-AR round cost (sharded attn, ctx=128) — path to 20 tok/s")
+    print("  prec  N    round_ms " + "".join(f"{m:>8}" for m in [8,16,32,64]))
+    for prec in ['int8','bf16']:
+        for N,rms in [(96,None),(96,1.0),(96,0.5),(32,None),(32,1.0),(32,0.5)]:
+            if prec=='bf16' and N<48: continue                        # bf16 does not fit below ~48n
+            lbl = f"{UTOFU_ROUND*1e3:.1f}(cal)" if rms is None else f"{rms:.1f}"
+            print(f"  {prec:<5}{N:>4}  {lbl:>9} " + "".join(f"{pred_tok_s(N,m,prec=prec,round_ms=rms):>8.1f}" for m in [8,16,32,64]))
+    print(f"  +MTP multiplies by ~{(1+0.4)/1.18:.2f} (accept 0.4).  AR msg at M=64 = {64*H*4/1024:.0f} KB -> use TP_AR_BF16.")
+    
+    hdr("Memory feasibility per node (32 GB HBM2, 2 GB reserve)")
+    print("  config                                          GB/node   fit")
+    for desc,N,prec,ways,M,mp in [("int8  96n sharded attn, M=32 kv2048", 96,'int8',None,32,2048),
+                                   ("int8  96n REPLICATED attn, M=1",      96,'int8',1,   1,2048),
+                                   ("int8  32n sharded attn, M=64 kv1024", 32,'int8',None,64,1024),
+                                   ("int8  32n REPLICATED attn, M=1",      32,'int8',1,   1,2048),
+                                   ("bf16  96n sharded attn, M=32 kv2048", 96,'bf16',None,32,2048),
+                                   ("bf16  96n REPLICATED attn, M=1",      96,'bf16',1,   1,2048),
+                                   ("bf16  96n attn subgroup k=8, M=1",    96,'bf16',8,   1,2048),
+                                   ("bf16  96n attn subgroup k=8, M=32",   96,'bf16',8,  32,2048)]:
+        gb = mem_per_node_gb(N,prec,attn_ways=ways,M=M,max_pos=mp)
+        print(f"  {desc:<46} {gb:>7.1f}   {fits(gb)}")
+    print(f"  (ms->kc per-stream KV: M=32 x 78L x 2048pos x {KVC} x 2B = {32*N_LAYERS*2048*KVC*2/1e9:.1f} GB)")
+    
+    hdr("Takeaways")
+    print(f"""  * THEORETICAL UPPER BOUND (bandwidth) at 96n int8: ~{ub_tok_s(96,1,128):.0f} tok/s (M=1, sharded attn),
+        rising to ~{ub_tok_s(96,32,128):.0f} with M=32. Replicated attention would cap it at ~{ub_tok_s(96,1,128,shard_attn=False):.0f}.
+      * We run at ~{100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of that — the loss is ~{n_allreduce(SHARD_ATTN)} all-reduces/token at ~{_ar96*1e3:.0f} ms each
+        (a ~50-100x-too-slow collective from the robust-completion path), NOT bandwidth/compute.
+      * Batching M amortizes the comm: predicted M=16 ~{pred_tok_s(96,16):.1f}, M=32 ~{pred_tok_s(96,32):.1f} tok/s; +MTP ~1.2x.
+      * Headroom to the bandwidth ceiling is ~{ub_tok_s(96,16,128)/pred_tok_s(96,16):.0f}x even after batching -> cutting AR latency/count
+        (2->1 AR/layer, lighter completion, smaller groups) is the second big lever after batching.""")
+    

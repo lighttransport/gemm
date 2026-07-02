@@ -989,15 +989,20 @@ int main(void){
         prof_snapshot(m,prof_gen0);
         g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
         int pchunk=envi("GLM5_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=S) */
+        /* GLM5_PREFILL_SP=1: query-sequence-parallel chunk (attention half sharded by home
+         * query slice, N-way; needs GLM5_TP=0 replicated weights). Fallback: classic chunk. */
+        int prefill_sp=envi("GLM5_PREFILL_SP",0);
         if(pchunk>0){
             if(glm5_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
             for(int p0=0;p0<n_prompt;p0+=pchunk){ int S=n_prompt-p0; if(S>pchunk)S=pchunk;
                 for(int t=0;t<S;t++) embed_lookup(m,prompt[p0+t],Xc+(size_t)t*C);
-                int a=glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=n_prompt);
+                int a=prefill_sp?glm5_forward_prefill_chunk_sp(m,Xc,S,p0,p0+S>=n_prompt)
+                                :glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=n_prompt);
+                if(prefill_sp && a<-1) die("GLM5_PREFILL_SP needs GLM5_TP=0, CP/MSA off",a);
                 if(a>=0) pf_last=a; }
             glm5_afree(Xc); glm5_free_mstream(m);
-            if(MyRank==0) logmsg("prefill: chunked M=%d\n",pchunk);
+            if(MyRank==0) logmsg("prefill: chunked M=%d%s\n",pchunk,prefill_sp?" (query-SP)":"");
         } else {
         /* GLM5_TF_CHECK: teacher-forcing accuracy -- does argmax at pos p predict prompt[p+1]?
          * A correct LM scores ~40-80%; a broken forward ~0%. Compares int8 vs bf16 to localize. */
@@ -1092,7 +1097,9 @@ int main(void){
                     if(GRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP int4 %d slots/rank\n",
                                          pa,now_sec()-tt,m->cp_nslot);
                 }
-                int a=glm5_forward_prefill_chunk(m,Xc,S,pa,pa+S>=pend);
+                int a=envi("GLM5_PREFILL_SP",0)?glm5_forward_prefill_chunk_sp(m,Xc,S,pa,pa+S>=pend)
+                                              :glm5_forward_prefill_chunk(m,Xc,S,pa,pa+S>=pend);
+                if(a<-1) die("GLM5_PREFILL_SP needs GLM5_TP=0, CP/MSA off",a);
                 if(a>=0) pf_last=a;
                 for(size_t i=0;i<(size_t)S*C;i++) if(!(Xc[i]==Xc[i])) nan++;
                 if(GRank==0 && envi("GLM5_PREFILL_ROLLING",1)){

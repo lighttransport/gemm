@@ -296,6 +296,118 @@ static void *rank_main(void *arg) {
         glm5_afree(hbuf); glm5_afree(xb2);
     }
 
+    /* ====== TEST 4: chunked prefill (glm5_forward_prefill_chunk) vs token-by-token ====== */
+    /* The gate for ANY prefill comm rework (query-SP, moe a2a). The chunk path uses batched
+     * GEMMs whose fp summation order differs from the matvec path, so the cross-path check is
+     * ARGMAX equality (last prompt argmax + D4 greedy continuations decoded from the chunk-built
+     * KV); rank LOCKSTEP stays bitwise. Also exercises a two-chunk boundary (p0>0). */
+    if (envi_("GLM5_TEST4", 1)) {
+        const int P4 = 6, D4 = 3;
+        int prompt[P4]; for (int i = 0; i < P4; i++) prompt[i] = (5 + 3 * i) % m->cfg.vocab;
+        int ref[P4 + D4], nref = 0;
+        {   /* reference: token-by-token prefill + greedy decode on the model KV */
+            int last = -1;
+            for (int p = 0; p < P4; p++) { sim_embed(m, prompt[p], x); last = glm5_forward_token(m, x, p); }
+            ref[nref++] = last;
+            for (int d = 0; d < D4; d++) { sim_embed(m, last, x); last = glm5_forward_token(m, x, P4 + d); ref[nref++] = last; }
+        }
+        if (m->ms) glm5_free_mstream(m);              /* TEST2/3 allocated the decode-mode mstream */
+        if (glm5_alloc_mstream_ex(m, P4, 0) != 0) {   /* prefill mode: shared model KV, MSA buffers */
+            printf("rank %d: TEST4 mstream alloc failed\n", rank); g_fail = 1; return 0;
+        }
+        float *Xc = glm5_amalloc((size_t)P4 * H * 4);
+        for (int variant = 0; variant < 2; variant++) {   /* 0: one chunk; 1: two chunks (boundary) */
+            int got[P4 + D4], ng = 0, a = -1;
+            if (variant == 0) {
+                for (int t = 0; t < P4; t++) sim_embed(m, prompt[t], Xc + (size_t)t * H);
+                a = glm5_forward_prefill_chunk(m, Xc, P4, 0, 1);
+            } else {
+                int h1 = P4 / 2;
+                for (int t = 0; t < h1; t++) sim_embed(m, prompt[t], Xc + (size_t)t * H);
+                glm5_forward_prefill_chunk(m, Xc, h1, 0, 0);
+                for (int t = h1; t < P4; t++) sim_embed(m, prompt[t], Xc + (size_t)(t - h1) * H);
+                a = glm5_forward_prefill_chunk(m, Xc, P4 - h1, h1, 1);
+            }
+            got[ng++] = a;
+            int last = a;                              /* decode continues on the chunk-built KV */
+            for (int d = 0; d < D4; d++) { sim_embed(m, last, x); last = glm5_forward_token(m, x, P4 + d); got[ng++] = last; }
+            int bad = 0;
+            for (int i = 0; i < ng && i < nref; i++) if (got[i] != ref[i]) bad++;
+            memcpy(g_gen[rank], got, (size_t)ng * sizeof(int));   /* compare FILLED entries only */
+            bar();
+            if (memcmp(g_gen[rank], g_gen[0], (size_t)ng * sizeof(int)) != 0) {
+                printf("rank %d: TEST4 v%d LOCKSTEP MISMATCH\n", rank, variant); g_fail = 1;
+            }
+            bar();
+            if (rank == 0) {
+                if (bad) g_fail = 1;
+                printf("TEST4 prefill-chunk vs token-by-token (%s): %s (%d diffs) [",
+                       variant ? "2 chunks" : "1 chunk", bad ? "FAIL" : "PASS", bad);
+                for (int i = 0; i < ng; i++) printf(" %d", got[i]);
+                printf(" ]\n");
+            }
+        }
+        glm5_afree(Xc);
+    }
+
+    /* ====== TEST 5: query-SP prefill (glm5_forward_prefill_chunk_sp) vs token-by-token ====== */
+    /* Requires REPLICATED attention (run the harness with GLM5_TP=0): the SP path gives every
+     * rank all heads over its home query slice; the zero-extended ar_cb gathers must make the
+     * result token-equal to the classic paths. Same argmax + D continuation gate as TEST4. */
+    if (envi_("GLM5_TEST5", 1) && m->layers[0].qh1 - m->layers[0].qh0 == m->cfg.n_heads) {
+        const int P5 = 6, D5 = 3;
+        int prompt[P5]; for (int i = 0; i < P5; i++) prompt[i] = (5 + 3 * i) % m->cfg.vocab;
+        int ref[P5 + D5], nref = 0;
+        {
+            int last = -1;
+            for (int p = 0; p < P5; p++) { sim_embed(m, prompt[p], x); last = glm5_forward_token(m, x, p); }
+            ref[nref++] = last;
+            for (int d = 0; d < D5; d++) { sim_embed(m, last, x); last = glm5_forward_token(m, x, P5 + d); ref[nref++] = last; }
+        }
+        if (!m->ms || ((glm5_mstream *)m->ms)->kc) {   /* need prefill-mode mstream */
+            if (m->ms) glm5_free_mstream(m);
+            if (glm5_alloc_mstream_ex(m, P5, 0) != 0) {
+                printf("rank %d: TEST5 mstream alloc failed\n", rank); g_fail = 1; return 0;
+            }
+        }
+        float *Xc = glm5_amalloc((size_t)P5 * H * 4);
+        for (int variant = 0; variant < 2; variant++) {
+            int got[P5 + D5], ng = 0, a = -1;
+            if (variant == 0) {
+                for (int t = 0; t < P5; t++) sim_embed(m, prompt[t], Xc + (size_t)t * H);
+                a = glm5_forward_prefill_chunk_sp(m, Xc, P5, 0, 1);
+            } else {
+                int h1 = P5 / 2;
+                for (int t = 0; t < h1; t++) sim_embed(m, prompt[t], Xc + (size_t)t * H);
+                glm5_forward_prefill_chunk_sp(m, Xc, h1, 0, 0);
+                for (int t = h1; t < P5; t++) sim_embed(m, prompt[t], Xc + (size_t)(t - h1) * H);
+                a = glm5_forward_prefill_chunk_sp(m, Xc, P5 - h1, h1, 1);
+            }
+            if (a < 0) { printf("rank %d: TEST5 SP path rejected (rc=%d)\n", rank, a); g_fail = 1; break; }
+            got[ng++] = a;
+            int last = a;
+            for (int d = 0; d < D5; d++) { sim_embed(m, last, x); last = glm5_forward_token(m, x, P5 + d); got[ng++] = last; }
+            int bad = 0;
+            for (int i = 0; i < ng && i < nref; i++) if (got[i] != ref[i]) bad++;
+            memcpy(g_gen[rank], got, (size_t)ng * sizeof(int));   /* compare FILLED entries only */
+            bar();
+            if (memcmp(g_gen[rank], g_gen[0], (size_t)ng * sizeof(int)) != 0) {
+                printf("rank %d: TEST5 v%d LOCKSTEP MISMATCH\n", rank, variant); g_fail = 1;
+            }
+            bar();
+            if (rank == 0) {
+                if (bad) g_fail = 1;
+                printf("TEST5 query-SP prefill vs token-by-token (%s): %s (%d diffs) [",
+                       variant ? "2 chunks" : "1 chunk", bad ? "FAIL" : "PASS", bad);
+                for (int i = 0; i < ng; i++) printf(" %d", got[i]);
+                printf(" ]\n");
+            }
+        }
+        glm5_afree(Xc);
+    } else if (rank == 0 && envi_("GLM5_TEST5", 1)) {
+        printf("TEST5 skipped (needs GLM5_TP=0 / replicated attention)\n");
+    }
+
     if (rank == 0) {
         printf("per-rank all-reduce cost (simulated):\n");
         for (int r = 0; r < R; r++)
