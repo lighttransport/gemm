@@ -286,6 +286,69 @@ static void ep_argmax_n_callback(float*vi,int n,void*ctx){
     double t0=now_sec(); tp_allreduce_argmax_n((tp_comm*)ctx,vi,n); g_ar_secs+=now_sec()-t0; g_ar_calls++;
     g_ar_frags++;
 }
+
+/* ===================== GLM5_AR_PROBE: decode all-reduce calibration ===================== */
+/* Measures the PRODUCTION tp_allreduce on the real machine to calibrate the local models:
+ *   decode_sim.py : recalibrate(ar_ms=us_per_ar/1000)  (or round_ms=round_us/1000)
+ *   qlair         : cross-check tools/qlair/tofu/qlair-tofu.hh latency constants and the
+ *                   MOE_COMM_RESULTS wire floors against the measured per-AR anatomy.
+ * Sweeps robust mode {1 prod, 2 lean, 0 passive} x payload {fp32,bf16} x M in {1,2,8,16,32}
+ * (message = [M,hidden] f32, the batched-decode AR), plus argmax/argmax_n head merges and a
+ * 78-AR back-to-back "decode token" sequence (the comm term decode_sim anchors on: measured
+ * 0.25 tok/s @96n == 153 AR x ~26 ms). All ranks run identical sequences (lockstep); rank 0
+ * reports grep-able "ARPROBE," CSV lines. Values in buf saturate to inf after a few sums --
+ * harmless (inf+inf=inf, no NaNs) and timing-neutral. Runs INSTEAD of prefill/decode
+ * (GLM5_AR_PROBE=1; pair with GLM5_LAYERS=1 GLM5_DUMMY=1 to make the model alloc trivial). */
+static void run_ar_probe(tp_comm*c,int H){
+    int reps=envi("GLM5_PROBE_REPS",50), wu=envi("GLM5_PROBE_WARMUP",5);
+    static const int Ms[]={1,2,8,16,32}; const int nM=5;
+    int rounds=0; for(int x=1;x<c->pof2;x<<=1) rounds++;
+    float*buf=glm5_amalloc((size_t)c->max_count*4);
+    if(!buf) die("ar_probe alloc",-1);
+    if(MyRank==0) logmsg("ARPROBE,begin,N=%d,rounds=%d,max_count=%d,reps=%d\n",c->nprocs,rounds,c->max_count,reps);
+    int save_robust=c->robust, save_bf16=c->use_bf16;
+    static const int RB[3]={1,2,0};
+    for(int ri=0;ri<3;ri++){ c->robust=RB[ri];
+        for(int bf=0;bf<=1;bf++){ c->use_bf16=bf;
+            for(int mi=0;mi<nM;mi++){ int count=Ms[mi]*H; if(count>c->max_count) continue;
+                for(int i=0;i<count;i++) buf[i]=(float)((i%13)+1);
+                for(int w=0;w<wu;w++) tp_allreduce_sum(c,buf,count);
+                barrier();
+                double t0=now_sec();
+                for(int r=0;r<reps;r++) tp_allreduce_sum(c,buf,count);
+                double us=(now_sec()-t0)/reps*1e6;
+                if(MyRank==0) logmsg("ARPROBE,sum,N=%d,robust=%d,bf16=%d,M=%d,bytes=%d,us_per_ar=%.1f,round_us=%.1f\n",
+                                     c->nprocs,c->robust,bf,Ms[mi],count*4,us,rounds>0?us/rounds:us);
+            }
+        }
+        c->use_bf16=0;
+        { float v=(float)MyRank; int32_t idx=MyRank;              /* per-stream head merge */
+          for(int w=0;w<wu;w++) tp_allreduce_argmax(c,&v,&idx);
+          barrier(); double t0=now_sec();
+          for(int r=0;r<reps;r++) tp_allreduce_argmax(c,&v,&idx);
+          double us=(now_sec()-t0)/reps*1e6;
+          if(MyRank==0) logmsg("ARPROBE,argmax,N=%d,robust=%d,us_per_ar=%.1f\n",c->nprocs,c->robust,us); }
+        { float vi[64];                                           /* batched head merge, 32 pairs */
+          for(int k=0;k<32;k++){ vi[2*k]=(float)((MyRank*7+k)%11); int32_t ii=MyRank; memcpy(&vi[2*k+1],&ii,4); }
+          for(int w=0;w<wu;w++) tp_allreduce_argmax_n(c,vi,32);
+          barrier(); double t0=now_sec();
+          for(int r=0;r<reps;r++) tp_allreduce_argmax_n(c,vi,32);
+          double us=(now_sec()-t0)/reps*1e6;
+          if(MyRank==0) logmsg("ARPROBE,argmax_n32,N=%d,robust=%d,us_per_ar=%.1f\n",c->nprocs,c->robust,us); }
+        for(int mi=0;mi<nM;mi++){ int count=Ms[mi]*H; if(count>c->max_count) continue;
+            int tok_reps=reps/10>3?reps/10:3;                     /* one decode token = 78 ARs */
+            for(int i=0;i<count;i++) buf[i]=(float)((i%13)+1);
+            barrier(); double t0=now_sec();
+            for(int r=0;r<tok_reps;r++) for(int l=0;l<78;l++) tp_allreduce_sum(c,buf,count);
+            double ms=(now_sec()-t0)/tok_reps*1e3;
+            if(MyRank==0) logmsg("ARPROBE,token78,N=%d,robust=%d,M=%d,ms_per_token_comm=%.2f,tok_s_comm_bound=%.3f\n",
+                                 c->nprocs,c->robust,Ms[mi],ms,Ms[mi]/(ms/1e3));
+        }
+    }
+    c->robust=save_robust; c->use_bf16=save_bf16;
+    glm5_afree(buf);
+    if(MyRank==0) logmsg("ARPROBE,end\n");
+}
 /* ---- CP (context-parallel KV) callbacks ---- */
 /* all-reduce MAX of per-block index scores so every rank derives the same global top-k. */
 static void ep_blk_reduce(float*scores,int nblk,void*ctx){
@@ -807,6 +870,12 @@ int main(void){
     m->ar_cb=ep_ar_callback; m->ar_ctx=&comm;
     m->ar_argmax_cb=ep_argmax_callback; m->ar_argmax_ctx=&comm;
     m->ar_argmax_n_cb=ep_argmax_n_callback; m->ar_argmax_n_ctx=&comm;
+    if(envi("GLM5_AR_PROBE",0)){       /* comm calibration only; skips prefill/decode */
+        run_ar_probe(&comm,cfg.hidden);
+        if(MyRank==0) logmsg("SENTINEL glm5_ar_probe_%dn=done\n",N);
+        barrier();
+        return 0;
+    }
     /* decode sampling (off by default; temp<=0 => greedy argmax). Lockstep: identical seed on
      * every rank => identical token. Only effective when the lm_head is replicated. */
     { const char*te=getenv("GLM5_TEMP"); const char*tp=getenv("GLM5_TOPP"); const char*rp=getenv("GLM5_REP_PEN");
