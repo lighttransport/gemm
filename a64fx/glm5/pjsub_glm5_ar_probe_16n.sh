@@ -1,5 +1,5 @@
 #!/bin/bash
-# GLM-5.2 decode CALIBRATION probe, 8 nodes / ~25 min — feeds the two local simulators
+# GLM-5.2 decode CALIBRATION probe, 16 nodes / ~30 min — feeds the two local simulators
 # (a64fx/glm5/decode_sim.py and the qlair A64FX sim) with REAL-machine numbers so decode
 # optimization keeps happening locally instead of burning node-hours. See CALIBRATION.md
 # for exactly where each output line plugs in.
@@ -15,9 +15,9 @@
 #                  ratio at 8 nodes (compare against decode_sim.pred_tok_s(8, M=8)).
 
 #PJM -g hp250467
-#PJM -L "rscgrp=small,node=8,elapse=00:25:00"
+#PJM -L "rscgrp=small,node=16,elapse=00:30:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
-#PJM --mpi "proc=8"
+#PJM --mpi "proc=16"
 #PJM -x PJM_LLIO_GFSCACHE=/vol0004
 #PJM -j
 set -u

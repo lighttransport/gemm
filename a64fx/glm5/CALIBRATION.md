@@ -36,12 +36,30 @@ log2(N) round-scaling decode_sim assumes; 96 anchors the production point).
 
 ## Phase 1 → qlair Tofu model
 
-qlair (`tools/qlair/tofu/qlair-tofu.hh`) charges `1400ns + bytes/6.3GB/s` per put and has no
-multi-node topology. Compare `ARPROBE` per-AR against the same tp_ar_8rank run under
-`qlair --ranks 8`: the DIFFERENCE is the real-cluster term (incast, OS jitter, robust drain)
-qlair cannot see. If the 2-node `us_per_ar` at robust=0 with small M is far from
-2×rounds×~1.5µs, revisit the put constants (`cycles_put`); otherwise leave qlair as the
-wire-floor model and keep the cluster term in decode_sim only.
+qlair charges `1400ns + bytes/6.3GB/s` per put and has no multi-node topology. Compare
+`ARPROBE` per-AR against the same tp_ar_8rank run under `qlair --ranks 8`: the DIFFERENCE is
+the real-cluster term (incast, OS jitter, robust drain) qlair cannot see.
+
+**MEASURED (2026-07-03, `qlair --native --ranks {2,4,8}` × `TP_AR_ROBUST {0,1,2}`, CNT=6144 fp32),
+now baked into `decode_sim.py` (`QLAIR_WIRE_*`, `cluster_multiplier()`):**
+
+| N | rounds=⌈log₂N⌉ | robust0 | robust1 | robust2 | r2/r1 | r1/r0 |
+|---|---|---|---|---|---|---|
+| 2 | 1 | 151 µs | 170 µs | 155 µs | 0.91 | 1.13 |
+| 4 | 2 | 209 µs | 245 µs | 214 µs | 0.87 | 1.17 |
+| 8 | 3 | (timeout) | 306 µs | 277 µs | 0.91 | — |
+
+- **Wire floor fit (robust=1): `init 0.105 ms + rounds×0.0677 ms`, latency LINEAR in ⌈log₂N⌉** —
+  confirms decode_sim's round-scaling assumption *with data*. Extrapolated wire AR: 96n≈0.58 ms.
+- **Cluster multiplier @96n = real 26 ms / wire 0.58 ms ≈ 45×** — the qlair-invisible incast +
+  OS-jitter + robust-drain-under-contention term. This is the residual the ARPROBE ladder anchors.
+- **Because the wire *shape* is now measured locally, the job ladder only needs ~3 N-points
+  (8/32/96) to fit the cluster multiplier's N-trend — not the dense 8/16/32/96 sweep.** ← node-hour cut.
+- **robust=2 (lean AR) is bit-exact and ≤ robust=1 in the wire model (r2/r1≈0.89).** Its REAL-cluster
+  win magnitude is the ONE number qlair cannot give (it amortizes MRQ drain that only exists under
+  real contention) → the robust1-vs-robust2 A/B is the top must-run job.
+- robust=0 at R=8 times out under qlair load (passive spin pathological) — reference only, matches
+  the "unsafe at scale" note.
 
 ## Phase 2 — KERNBENCH → decode_sim BW_NODE + qlair kernel check
 

@@ -27,7 +27,22 @@ N_EXP, N_ACT, VOCAB = 256, 8, 154880
 
 # ---------- platform ----------
 BW_NODE = 300e9            # per-node EFFECTIVE matvec HBM bandwidth. qlair/A64FX HBM2 peak=1024 GB/s/node (4 stacks); measured decode-BW bench ~300 matvec / ~770 load. (was 150)
-AR_M1_96 = 0.25            # measured M=1 96n tok/s -> calibrates the comm term
+AR_M1_96 = 0.25            # STALE legacy anchor (kept for the historical decomposition); see REAL_DECODE below.
+
+# ---------- REAL decode anchors (MEASURED, jobs 49419683/684, int8 full model, short ctx, 2026-07-03) ----------
+# Full 78L int8, 8 slots, maxpos 2048, per-slot (bd=0) vs batched (bd=1, M<=4). tok/s/slot + comm fraction:
+REAL_DECODE = {  # N: (bd0_tok_s_per_slot, bd1_tok_s_per_slot, comm_frac_bd0)
+    32: (1.72, 2.94, 0.370),
+    48: (1.66, 2.72, 0.405),   # attn 26.5 ms/tok == 32n: throughput flat 32->48n
+    96: (1.79, 2.90, 0.318),   # attn jumps to 48 ms/tok (distinct worse regime)
+}
+# Headlines: (1) real single-stream int8 decode ~1.75 tok/s/slot -- the old 0.25 anchor was ~7x pessimistic.
+# (2) 32n ~= 96n throughput -> 32n is ~3x more NODE-EFFICIENT for short-ctx int8 serving. (3) comm ~30-37%
+# (~flat in N; NOT lower at fewer ranks). (4) batched ~1.6-1.7x. (5) compute ~65%, attn-dominated & NON-scaling.
+REAL_DECODE_COMPUTE_MS = {  # bd=0 ms/tok by stage: (32n, 96n) -- attn is the top target (grows with N)
+    'attn':(26.4,48.2), 'qkv':(20.2,26.8), 'shared':(20.0,20.9), 'router':(14.2,15.1),
+    'o_proj':(9.7,10.7), 'experts':(9.1,3.8), 'dense':(2.4,1.1), 'head':(0.7,0.2),
+}
 
 # ---------- weight params (then bytes by precision) ----------
 def attn_params():
@@ -64,21 +79,55 @@ def active_bytes_per_node(N, M, ctx, prec='int8', shard_attn=True, attn_ways=Non
 def ub_tok_s(N, M, ctx, prec='int8', shard_attn=True):    # THEORETICAL bandwidth ceiling (comm-free)
     return M / (active_bytes_per_node(N,M,ctx,prec,shard_attn)/BW_NODE)
 
-# ---------- uTofu all-reduce cost model (explicit) ----------
-# Each EP all-reduce is recursive-doubling over N ranks: ceil(log2 N) rounds, each a uTofu Put +
-# a completion wait. The A64FX/uTofu Put itself is ~1-2 us, but the robust-completion path used here
-# (trailer-seq fence + civac cache-coherence flush + MRQ draining, added for correctness) dominates
-# with a large per-round fixed cost. Model: ar = UTOFU_INIT + rounds*(UTOFU_ROUND) + bytes*UTOFU_BW.
-# UTOFU_ROUND is CALIBRATED to reproduce the measured per-AR latency at 96 ranks; the split into
-# init/round/bandwidth is illustrative (and shows what a leaner completion path would buy).
-UTOFU_INIT  = 2.0e-3            # fixed per-AR setup/teardown (s) -- registration, fence issue
-UTOFU_BW    = 1.0/8e9          # s/byte once in flight (~8 GB/s effective per-link AR bandwidth)
+# ---------- uTofu all-reduce cost model (MEASURED on Fugaku, ARPROBE ladder 2026-07-03) ----------
+# Real tp_allreduce anatomy, robust=1, M=1, [1,H] fp32 payload (GLM5_AR_PROBE, GLM5_PREFILL_GROUPS=1
+# so the AR spans all N ranks). Recursive-doubling, ceil(log2 N) rounds, each a uTofu Put + robust
+# completion. Model: ar = UTOFU_INIT + rounds*UTOFU_ROUND + bytes*UTOFU_BW.
+#   N:    8      16     32     96          <- measured us_per_ar (robust=1):
+#   AR:   72.4   86.2   139.6  141.1  us   -> flat ~24-26 us/round, init ~0. robust 0/1/2 within ~30%.
+# >>> This kills the fictional 26 ms/AR robustness tax (tight-loop AR is ~0.14 ms), BUT is NOT the
+#     in-decode cost -- see the EFFECTIVE_AR_FACTOR correction below and MEASURED CALIBRATION report.
+UTOFU_INIT   = 4.0e-6           # fixed per-AR setup (s); measured init ~0 -> small floor
+UTOFU_ROUND  = 26.0e-6         # MEASURED tight-loop per-round cost (s) ~26 us (was fictional 3.4 ms)
+UTOFU_BW     = 1.0/8e9         # s/byte once in flight (~8 GB/s effective per-link AR bandwidth)
+# >>> CORRECTION (real-weight cbatch, job 49419532, bf16 12L 12n, 2026-07-03): the ARPROBE tight loop
+#     UNDER-measures the IN-DECODE all-reduce. Real decode: 6.22 tok/s/slot, comm 41.5%, 3224 AR calls
+#     over 5.1 s => ~0.66 ms EFFECTIVE per-AR at 12n, ~8x the tight-loop probe (~0.08 ms @12n). The gap
+#     is straggler-synchronization (ranks arrive at the AR at different times after uneven expert
+#     compute) + cache-cold/MRQ-under-load interleave -- NOT the robust completion path. So decode is
+#     ~40% comm at 12n (rising with N), NOT the "0.5% / 99% non-comm" the tight-loop probe alone implied.
+EFFECTIVE_AR_FACTOR = 8.0      # MEASURED in-decode per-AR / tight-loop probe per-AR (straggler+interleave)
 def n_allreduce(shard_attn): return N_MOE + (N_LAYERS if shard_attn else 0)
 SHARD_ATTN = True              # eval config: attention heads sharded -> 2 AR/MoE layer
 _bw96_1 = active_bytes_per_node(96,1,128)/BW_NODE
-_comm96_1 = 1.0/AR_M1_96 - _bw96_1                                 # total comm s at (96, M=1)
-_ar96 = _comm96_1/n_allreduce(SHARD_ATTN)                         # measured per-AR latency at 96n (~26 ms)
-UTOFU_ROUND = (_ar96 - UTOFU_INIT)/math.ceil(math.log2(96))       # calibrated per-round cost (the robustness tax)
+_ar96_probe = UTOFU_INIT + math.ceil(math.log2(96))*UTOFU_ROUND    # tight-loop per-AR @96n (~0.19 ms)
+_ar96 = _ar96_probe*EFFECTIVE_AR_FACTOR                            # EFFECTIVE in-decode per-AR @96n (~1.5 ms)
+_comm96_1 = n_allreduce(SHARD_ATTN)*_ar96                          # comm s at (96,M=1) from the effective AR
+_resid96_1 = 1.0/AR_M1_96 - _bw96_1 - _comm96_1                    # residual: compute/HBM/overhead/contention
+#     UNEXPLAINED by comm -> decode is NOT comm-bound. That residual is the real target; a real-weight
+#     decode PROFILE job (comm% breakdown) must attribute it (compute vs HBM vs per-token overhead vs contention).
+
+# ---------- qlair wire-floor calibration (MEASURED, contention-free) ----------
+# tp_ar_8rank.elf under `qlair --native --ranks {2,4,8}` x TP_AR_ROBUST {0,1,2}, CNT=6144 fp32.
+# qlair models the Tofu put (1400ns + bytes/6.3GB/s) + the real SVE reduction, but has NO
+# multi-node topology, incast, OS jitter, or MRQ-drain-under-contention. So it gives the WIRE
+# FLOOR and the *shape*, not the cluster latency. Fit (robust=1, production baseline):
+QLAIR_WIRE_INIT_MS  = 0.105          # per-AR fixed wire cost (setup + first round overheads)
+QLAIR_WIRE_ROUND_MS = 0.0677         # per-round wire cost; latency linear in ceil(log2 N) -> CONFIRMS the model
+QLAIR_ROBUST_TAX    = 1.15           # robust=1 / robust=0 (measured 1.13-1.17): the correctness tax
+QLAIR_LEAN_RECOVER  = 0.89           # robust=2 / robust=1 (measured 0.87-0.91): lean AR recovers most of the tax, bit-exact
+def qlair_wire_ar_ms(N):             # qlair --native per-AR estimate at N ranks
+    return QLAIR_WIRE_INIT_MS + math.ceil(math.log2(N))*QLAIR_WIRE_ROUND_MS
+def qlair_vs_real(n_ref=96):         # qlair wire / MEASURED tight-loop per-AR probe
+    return qlair_wire_ar_ms(n_ref) / (_ar96_probe*1e3)
+# POST-JOB RECONCILIATION (ARPROBE ladder measured the REAL AR):
+#  * qlair --native OVER-estimated the wire ~2.6x (0.58 ms est vs 0.14 ms real @96n) -- pthread-barrier
+#    sim overhead, NOT a cluster term. The earlier "45x cluster multiplier" was an artifact of the
+#    fictional 26 ms/AR; there is NO 45x tax. Use the MEASURED UTOFU_ROUND above, not the qlair floor.
+#  * qlair still got the SHAPE right (linear in ceil(log2 N)) and robust=2 bit-exactness -- those hold.
+#  * robust 0/1/2 real per-AR are within ~30% (no 3.4 ms robustness tax) -> the lean-AR lever is
+#    near-worthless for M=1; comm is ~0.5% of the token. Batching's win (measured 2.6x @8n synthetic)
+#    comes from amortizing per-FORWARD compute/overhead, not AR count.
 
 def recalibrate(ar_ms=None, round_ms=None, init_ms=None, n_ref=96):
     """Re-anchor the comm constants from a MEASUREMENT (qlair-8rank or a job):
@@ -163,13 +212,37 @@ if __name__ == "__main__":                       # report only when run directly
         print(f"  {M:>3}   {a:>9.2f}    {b:>9.2f}    {b/a:>5.2f}x    {pred_tok_s(96,M,mtp=0.4,shard_attn=False):>7.2f}")
     print("  (decode is comm-bound, so replicating attention's +bandwidth is cheap; prefill keeps sharding.)")
     
-    hdr("Calibration + the gap (96 nodes, int8, M=1)")
-    print(f"  bandwidth-bound time   : {_bw96_1*1e3:7.2f} ms/token  -> UB {ub_tok_s(96,1,128):.0f} tok/s")
-    print(f"  measured / comm-bound  : {1/AR_M1_96*1e3:7.0f} ms/token  -> {AR_M1_96} tok/s")
-    print(f"  => all-reduce overhead : {_comm96_1*1e3:7.0f} ms ({100*_comm96_1/(1/AR_M1_96):.0f}% of the token); "
-          f"{n_allreduce(SHARD_ATTN)} AR/token @ {_ar96*1e3:.0f} ms each")
-    print(f"  decode runs at {100*AR_M1_96/ub_tok_s(96,1,128):.1f}% of the bandwidth ceiling -> ~{ub_tok_s(96,1,128)/AR_M1_96:.0f}x headroom, all comm.")
-    
+    hdr("*** MEASURED CALIBRATION (Fugaku 2026-07-03) — two anchors, reconciled ***")
+    print("  (1) ARPROBE tight-loop tp_allreduce (robust=1, M=1, all N ranks):")
+    print("      N=8:72us N=16:86us N=32:140us N=96:141us  (flat ~24us/round; robust 0/1/2 within 30%).")
+    print("      => the fictional 26 ms/AR 'robustness tax' is DEAD; the bare collective is ~0.14 ms.")
+    print("  (2) REAL-WEIGHT cbatch decode (job 49419532, bf16 12L 12n, 4 slots):")
+    print("      6.22 tok/s/slot (24.9 agg), comm 41.5%, 3224 AR calls/5.1s => ~0.66 ms EFFECTIVE per-AR @12n.")
+    print(f"      => in-decode AR is ~{EFFECTIVE_AR_FACTOR:.0f}x the tight loop (straggler-sync + interleave), so")
+    print("         decode IS ~40% comm at 12n (rising with N) -- NOT the 0.5% the tight loop alone implied.")
+    print(f"  RECONCILED comm @96n (M=1): {n_allreduce(SHARD_ATTN)} AR x {_ar96*1e3:.2f} ms eff = {_comm96_1*1e3:.0f} ms/token"
+          f" -> ~{1/_comm96_1:.0f} tok/s comm-ceiling.")
+    print( "  => CORRECTED lever read: comm is a REAL ~40%+ term, but it is straggler/interleave-bound, NOT the")
+    print( "     robust completion path -> lean-AR (robust=2) still ~worthless; the levers are BATCHING (amortize")
+    print( "     AR over M: measured 2.6x @8n synth), FEWER RANKS (smaller AR + less straggler spread), and load")
+    print( "     balance. The other ~60% is compute/HBM. Next: real-weight A/B (bd=0 vs bd=1) + 96n int8 profile.")
+    print(f"  qlair --native over-estimated the tight-loop wire ~{qlair_vs_real():.1f}x (sim overhead); it does NOT see")
+    print( "     straggler-sync either -> real-weight jobs remain the only source for the effective in-decode AR.")
+
+    hdr("*** REAL INT8 DECODE PROFILE (jobs 49419683/684, full 78L, short ctx) — the 0.25 anchor is DEAD ***")
+    print("   N     bd0 tok/s/slot   bd1 (batched)   batched win   comm%")
+    for N in sorted(REAL_DECODE):
+        b0,b1,cf = REAL_DECODE[N]
+        print(f"  {N:>3}      {b0:>6.2f}          {b1:>6.2f}        {b1/b0:>5.2f}x       {cf*100:>4.1f}%")
+    print(f"  => real single-stream int8 decode ~1.75 tok/s/slot (~{1.75/AR_M1_96:.0f}x the stale 0.25 anchor).")
+    print( "  => 32n ~= 96n throughput -> 32n is ~3x more NODE-EFFICIENT for short-ctx int8 serving (run at 32n).")
+    print( "  => comm ~30-37% (flat/slightly-lower at more ranks): 'fewer ranks = less comm' is FALSE; 32n wins on")
+    print( "     EFFICIENCY, not speed. batched 1.6-1.7x (bit-identical only on slot0 -> batched path needs a fix).")
+    print( "  compute ~65% of the token (bd=0 ms/tok, 32n->96n):")
+    for k,(a,b) in REAL_DECODE_COMPUTE_MS.items():
+        tag = "  <- top target, does NOT scale with N" if k=='attn' else ("  (scales well w/ EP)" if k=='experts' else "")
+        print(f"     {k:<8} {a:>5.1f} -> {b:>5.1f} ms{tag}")
+
     hdr("Calibrated PREDICTION — batching + MTP (96 nodes, int8, ctx=128)")
     print("   M    agg tok/s   +MTP(0.4)   % of UB")
     for M in [1,8,16,32,64]:
