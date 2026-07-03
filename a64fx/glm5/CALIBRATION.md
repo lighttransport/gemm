@@ -122,6 +122,14 @@ FP-peak%, mem GB/s, mem-peak% per region); comm from the ARPROBE campaign. Run a
    crossover: 1.26× @M=8 → 1.01× @M=64). ⇒ `decode_sim.BW_NODE` should use the **739 GB/s NUMA-local**
    figure (not 300e9); the decode compute term is BW-bound, the prefill term compute-bound.
 
+### Prefill PCHUNK — the hidden lever for the EXPERTS stage (int16)
+Experts run a per-expert GEMM over g=tokens-routed; PCHUNK=64 gives g~2-4 (<5) → each falls to the M=1
+matvec remainder path (no int16 win). Larger chunk → larger g → the register-blocked 5-token svdot
+kernel. Measured 12L int16 prefill (256-tok prompt): experts ms/tok 1.099(PC64)→0.705(PC128)→0.380(PC256);
+int16 prefill tok/s 187→218→230; experts int16 speedup 1.50×(PC64)→1.99×(PC128). PC192 DIPS (ragged
+192+64 split — avoid non-divisor chunks). ⇒ use PCHUNK≥128 (ideally ~full prompt) with int16; the
+committed 1.30× e2e @PC64 under-represents the win (small-chunk artifact starving experts).
+
 ### Batched-decode GEMM (M=8) — int16 unlocks the decode compute headroom
 Batched decode (bd=1) runs projections through glm5_gemm at M=batch → the compute-bound regime. fapp
 (glm5_kern_prof M=8, 48t): M=1 matvec int16 450 < w8a16 515 Gop/s (0.87×, LOSS) BUT M=8 GEMM int16 1324
