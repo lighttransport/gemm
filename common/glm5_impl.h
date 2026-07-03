@@ -2043,10 +2043,68 @@ static void glm5_gemm_int8_sdot(glm5_model*m, float*restrict Y, const uint8_t*W,
 #endif
     free(Xq); free(xsc);
 }
+/* INT16 w8a16-MIMIC prefill GEMM: quantize the N activations to int16 ONCE (per-token symmetric, near-
+ * lossless), then contract with the register-blocked svdot_s64 4row×5tok kernel (weight widened in-reg
+ * once, reused across 5 tokens). ~2x denser than the w8a16 bf16-tile FMA (svdot_s64 32 macs/instr vs
+ * f32 svmla 16) AND accurate — the prefill counterpart of glm5_mv_int16_sdot. Applies to all int8
+ * tensors. Y is token-major [N,rows] (Y[t*rows+r]). */
+static void glm5_gemm_int16sdot(glm5_model*m, float*restrict Y, const uint8_t*W, const float*S, int gs,
+                                const float*X, int N, int rows, int cols){
+    if(N<=1){ glm5_mv_int16_sdot(m,Y,W,S,gs,X,rows,cols); return; }
+    const int sb=(cols+gs-1)/gs;
+    int16_t *Xq=(int16_t*)malloc((size_t)N*cols*2); float *xsc=(float*)malloc((size_t)N*sizeof(float));
+    if(!Xq||!xsc){ free(Xq); free(xsc); glm5_gemm_int8(m,Y,W,S,gs,X,N,rows,cols); return; }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(N>=4)
+#endif
+    for(int t=0;t<N;t++){
+        const float*xt=X+(size_t)t*cols; float amax=1e-20f;
+        for(int c=0;c<cols;c++){ float a=fabsf(xt[c]); if(a>amax)amax=a; }
+        float inv=32767.0f/amax; xsc[t]=amax/32767.0f; int16_t*xq=Xq+(size_t)t*cols;
+        for(int c=0;c<cols;c++){ int v=(int)lrintf(xt[c]*inv); v=v>32767?32767:(v<-32767?-32767:v); xq[c]=(int16_t)v; }
+    }
+#if defined(__ARM_FEATURE_SVE)
+    const int nb=rows/8;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)rows>=GLM5_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){
+        int r=bi*8; const uint8_t*w=W+(size_t)r*cols; const float*s=S+(size_t)r*sb;
+        const uint8_t*w0=w,*w1=w+cols,*w2=w+2*(size_t)cols,*w3=w+3*(size_t)cols,*w4=w+4*(size_t)cols,*w5=w+5*(size_t)cols,*w6=w+6*(size_t)cols,*w7=w+7*(size_t)cols;
+        const float*s0=s,*s1=s+sb,*s2=s+2*(size_t)sb,*s3=s+3*(size_t)sb,*s4=s+4*(size_t)sb,*s5=s+5*(size_t)sb,*s6=s+6*(size_t)sb,*s7=s+7*(size_t)sb;
+        int t=0;
+        for(;t+4<N;t+=5){
+            float acc[5][8]; for(int u=0;u<5;u++) for(int j=0;j<8;j++) acc[u][j]=0.f;
+            const int16_t*q0=Xq+(size_t)t*cols,*q1=Xq+(size_t)(t+1)*cols,*q2=Xq+(size_t)(t+2)*cols,*q3=Xq+(size_t)(t+3)*cols,*q4=Xq+(size_t)(t+4)*cols;
+            glm5_int16sdot_4row_5x(acc[0],acc[1],acc[2],acc[3],acc[4], w0,w1,w2,w3, s0,s1,s2,s3, gs,0, q0,q1,q2,q3,q4, cols);
+            glm5_int16sdot_4row_5x(acc[0]+4,acc[1]+4,acc[2]+4,acc[3]+4,acc[4]+4, w4,w5,w6,w7, s4,s5,s6,s7, gs,0, q0,q1,q2,q3,q4, cols);
+            for(int u=0;u<5;u++){ float xs=xsc[t+u]; for(int j=0;j<8;j++) Y[(size_t)(t+u)*rows+r+j]=xs*acc[u][j]; }
+        }
+        for(;t<N;t++){
+            float tmp[8];
+            glm5_matvec_int16sdot_8row(tmp, w0,w1,w2,w3,w4,w5,w6,w7, s0,s1,s2,s3,s4,s5,s6,s7, gs, Xq+(size_t)t*cols, cols);
+            float xs=xsc[t]; for(int j=0;j<8;j++) Y[(size_t)t*rows+r+j]=xs*tmp[j];
+        }
+    }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows-nb*8>=GLM5_PAR_MIN)
+#endif
+    for(int r=nb*8;r<rows;r++)
+        for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=xsc[t]*glm5_dot_int16sdot_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,Xq+(size_t)t*cols,cols);
+#else
+    glm5_gemm_int8(m,Y,W,S,gs,X,N,rows,cols);
+#endif
+    free(Xq); free(xsc);
+}
 /* batched GEMM dispatch by weight type */
 static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const float*X, int N, int rows, int cols){
     if(t->type==GLM5_MXFP8) glm5_gemm_mxfp8(m,Y,(const uint8_t*)t->w,t->scale,X,N,rows,cols);
     else if(t->type==GLM5_INT8){
+        /* GLM5_GEMM_SDOT: 0=w8a16 bf16-tile (shipped), 2=int16 w8a16-mimic svdot_s64 (accurate+dense),
+         * 1=int8 w8a8 svdot (fastest, lossy). Default off (=0) keeps the auto w8a8-for-experts logic. */
+        static int gsd=-2;
+        if(gsd==-2) gsd=glm5_envi("GLM5_GEMM_SDOT",0);
+        if(gsd==2 && N>1){ glm5_gemm_int16sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols); return; }
         /* w8a8 sdot wins only for per-channel tensors (routed experts: 1.77x); for group-128 it
          * loses to the tuned w8a16 bf16-FMA kernel. AUTO-enable it for the experts only in the
          * large-chunk prefill regime (chunk >= GLM5_INT8_SDOT_MIN, default 1024 tokens) where the
@@ -2054,8 +2112,8 @@ static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const
          * GLM5_INT8_SDOT overrides: 0 = never, 1 = always (N>1); unset = auto-by-chunk-size. */
         static int mode=-2, thr=1024;
         if(mode==-2){ const char*e=getenv("GLM5_INT8_SDOT"); mode=(e&&*e)?atoi(e):-1; thr=glm5_envi("GLM5_INT8_SDOT_MIN",1024); }
-        int use_sdot = (t->qg>=cols) && N>1 && (mode==1 || (mode<0 && m->prefill_ntok>=thr));
-        if(use_sdot) glm5_gemm_int8_sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
+        int use_sdot = (gsd==1) || ((t->qg>=cols) && N>1 && (mode==1 || (mode<0 && m->prefill_ntok>=thr)));
+        if(use_sdot && N>1) glm5_gemm_int8_sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
         else glm5_gemm_int8(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols);
     }
     else glm5_gemm_bf16(Y,(const uint16_t*)t->w,X,N,rows,cols);

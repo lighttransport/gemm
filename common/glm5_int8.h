@@ -180,6 +180,58 @@ static inline float glm5_dot_int16sdot_row(const uint8_t*w,const float*s,int gs,
     }
     return (float)a;
 }
+
+#if defined(__ARM_FEATURE_SVE)
+/* PREFILL int16-SDOT GEMM micro-kernel: 4 weight rows x 5 token-streams register block. Reads int8
+ * weights directly (offset-binary), widens each K-vector to int16 ONCE (byte-128) and reuses it across
+ * all 5 tokens (amortizes the widen — the prefill analog of the bf16 tile-dequant). Per group: svdot_s64
+ * into 20 int64 accumulators, then fold the per-row group scale into 20 f64 accumulators. Accumulates
+ * into a0..a4[4] (the 4 rows for each of the 5 tokens). Caller multiplies each token's output by xsc[t].
+ * cols0 = absolute start column (for scale group indexing); processes [0,kl) of the given row pointers. */
+static inline void glm5_int16sdot_4row_5x(float*restrict a0,float*restrict a1,float*restrict a2,float*restrict a3,float*restrict a4,
+        const uint8_t*w0,const uint8_t*w1,const uint8_t*w2,const uint8_t*w3,
+        const float*s0,const float*s1,const float*s2,const float*s3,int gs,int col0,
+        const int16_t*xq0,const int16_t*xq1,const int16_t*xq2,const int16_t*xq3,const int16_t*xq4,int kl){
+    svbool_t pf=svptrue_b64(); int vh=(int)svcnth();
+    svfloat64_t f00=svdup_f64(0),f01=svdup_f64(0),f02=svdup_f64(0),f03=svdup_f64(0);
+    svfloat64_t f10=svdup_f64(0),f11=svdup_f64(0),f12=svdup_f64(0),f13=svdup_f64(0);
+    svfloat64_t f20=svdup_f64(0),f21=svdup_f64(0),f22=svdup_f64(0),f23=svdup_f64(0);
+    svfloat64_t f30=svdup_f64(0),f31=svdup_f64(0),f32=svdup_f64(0),f33=svdup_f64(0);
+    svfloat64_t f40=svdup_f64(0),f41=svdup_f64(0),f42=svdup_f64(0),f43=svdup_f64(0);
+    for(int b=0;b<kl;b+=gs){
+        int bend=b+gs<kl?b+gs:kl, blk=(col0+b)/gs, c=b;
+        svint64_t d00=svdup_s64(0),d01=svdup_s64(0),d02=svdup_s64(0),d03=svdup_s64(0);
+        svint64_t d10=svdup_s64(0),d11=svdup_s64(0),d12=svdup_s64(0),d13=svdup_s64(0);
+        svint64_t d20=svdup_s64(0),d21=svdup_s64(0),d22=svdup_s64(0),d23=svdup_s64(0);
+        svint64_t d30=svdup_s64(0),d31=svdup_s64(0),d32=svdup_s64(0),d33=svdup_s64(0);
+        svint64_t d40=svdup_s64(0),d41=svdup_s64(0),d42=svdup_s64(0),d43=svdup_s64(0);
+        for(;c<bend;c+=vh){
+            svbool_t pg=svwhilelt_b16((uint32_t)c,(uint32_t)bend);
+            svint16_t v0=svsub_n_s16_x(pg,svreinterpret_s16_u16(svld1ub_u16(pg,&w0[c])),128);
+            svint16_t v1=svsub_n_s16_x(pg,svreinterpret_s16_u16(svld1ub_u16(pg,&w1[c])),128);
+            svint16_t v2=svsub_n_s16_x(pg,svreinterpret_s16_u16(svld1ub_u16(pg,&w2[c])),128);
+            svint16_t v3=svsub_n_s16_x(pg,svreinterpret_s16_u16(svld1ub_u16(pg,&w3[c])),128);
+            svint16_t xv;
+            xv=svld1_s16(pg,&xq0[c]); d00=svdot_s64(d00,v0,xv); d01=svdot_s64(d01,v1,xv); d02=svdot_s64(d02,v2,xv); d03=svdot_s64(d03,v3,xv);
+            xv=svld1_s16(pg,&xq1[c]); d10=svdot_s64(d10,v0,xv); d11=svdot_s64(d11,v1,xv); d12=svdot_s64(d12,v2,xv); d13=svdot_s64(d13,v3,xv);
+            xv=svld1_s16(pg,&xq2[c]); d20=svdot_s64(d20,v0,xv); d21=svdot_s64(d21,v1,xv); d22=svdot_s64(d22,v2,xv); d23=svdot_s64(d23,v3,xv);
+            xv=svld1_s16(pg,&xq3[c]); d30=svdot_s64(d30,v0,xv); d31=svdot_s64(d31,v1,xv); d32=svdot_s64(d32,v2,xv); d33=svdot_s64(d33,v3,xv);
+            xv=svld1_s16(pg,&xq4[c]); d40=svdot_s64(d40,v0,xv); d41=svdot_s64(d41,v1,xv); d42=svdot_s64(d42,v2,xv); d43=svdot_s64(d43,v3,xv);
+        }
+        double c0=s0[blk],c1=s1[blk],c2=s2[blk],c3=s3[blk];
+        f00=svmla_n_f64_x(pf,f00,svcvt_f64_s64_x(pf,d00),c0); f01=svmla_n_f64_x(pf,f01,svcvt_f64_s64_x(pf,d01),c1); f02=svmla_n_f64_x(pf,f02,svcvt_f64_s64_x(pf,d02),c2); f03=svmla_n_f64_x(pf,f03,svcvt_f64_s64_x(pf,d03),c3);
+        f10=svmla_n_f64_x(pf,f10,svcvt_f64_s64_x(pf,d10),c0); f11=svmla_n_f64_x(pf,f11,svcvt_f64_s64_x(pf,d11),c1); f12=svmla_n_f64_x(pf,f12,svcvt_f64_s64_x(pf,d12),c2); f13=svmla_n_f64_x(pf,f13,svcvt_f64_s64_x(pf,d13),c3);
+        f20=svmla_n_f64_x(pf,f20,svcvt_f64_s64_x(pf,d20),c0); f21=svmla_n_f64_x(pf,f21,svcvt_f64_s64_x(pf,d21),c1); f22=svmla_n_f64_x(pf,f22,svcvt_f64_s64_x(pf,d22),c2); f23=svmla_n_f64_x(pf,f23,svcvt_f64_s64_x(pf,d23),c3);
+        f30=svmla_n_f64_x(pf,f30,svcvt_f64_s64_x(pf,d30),c0); f31=svmla_n_f64_x(pf,f31,svcvt_f64_s64_x(pf,d31),c1); f32=svmla_n_f64_x(pf,f32,svcvt_f64_s64_x(pf,d32),c2); f33=svmla_n_f64_x(pf,f33,svcvt_f64_s64_x(pf,d33),c3);
+        f40=svmla_n_f64_x(pf,f40,svcvt_f64_s64_x(pf,d40),c0); f41=svmla_n_f64_x(pf,f41,svcvt_f64_s64_x(pf,d41),c1); f42=svmla_n_f64_x(pf,f42,svcvt_f64_s64_x(pf,d42),c2); f43=svmla_n_f64_x(pf,f43,svcvt_f64_s64_x(pf,d43),c3);
+    }
+    a0[0]+=svaddv_f64(pf,f00); a0[1]+=svaddv_f64(pf,f01); a0[2]+=svaddv_f64(pf,f02); a0[3]+=svaddv_f64(pf,f03);
+    a1[0]+=svaddv_f64(pf,f10); a1[1]+=svaddv_f64(pf,f11); a1[2]+=svaddv_f64(pf,f12); a1[3]+=svaddv_f64(pf,f13);
+    a2[0]+=svaddv_f64(pf,f20); a2[1]+=svaddv_f64(pf,f21); a2[2]+=svaddv_f64(pf,f22); a2[3]+=svaddv_f64(pf,f23);
+    a3[0]+=svaddv_f64(pf,f30); a3[1]+=svaddv_f64(pf,f31); a3[2]+=svaddv_f64(pf,f32); a3[3]+=svaddv_f64(pf,f33);
+    a4[0]+=svaddv_f64(pf,f40); a4[1]+=svaddv_f64(pf,f41); a4[2]+=svaddv_f64(pf,f42); a4[3]+=svaddv_f64(pf,f43);
+}
+#endif
 #endif
 
 #endif /* GLM5_INT8_H */

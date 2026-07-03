@@ -167,6 +167,23 @@ int main(void){
     printf("INT8_SDOT N=%d rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 GEMM %.2f Gop/s)\n",
            gemm_n,gemm_rows,cols,gs,sd_rel,sqrt(sse/(sref+1e-30)),tsd,gops/tsd/1e9,gops/tg_best/1e9);
 
+    /* int16 w8a16-mimic SDOT GEMM: the prefill lever — accuracy (rms vs w8a16 Yr) + speed vs w8a16. */
+    float *Y16=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
+    if(!Y16) return 2;
+    glm5_gemm_int16sdot(&gm,Y16,W,S,gs,Xg,check_n,check_rows,cols);
+    double s16_sse=0,s16_sref=0,s16_maxrel=0;
+    for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
+        double ref=Yr[(size_t)t*gemm_rows+r], dd=ref-(double)Y16[(size_t)t*check_rows+r];
+        s16_sse+=dd*dd; s16_sref+=ref*ref; double rel=fabs(dd)/(fabs(ref)+1e-9); if(rel>s16_maxrel)s16_maxrel=rel;
+    }
+    double t16=1e30;
+    for(int it=0;it<reps;it++){
+        t0=wall_sec(); glm5_gemm_int16sdot(&gm,Y16,W,S,gs,Xg,gemm_n,gemm_rows,cols);
+        double tt=wall_sec()-t0; if(tt<t16)t16=tt;
+    }
+    printf("INT16_GEMM N=%d rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 %.2f Gop/s, speedup=%.2fx)\n",
+           gemm_n,gemm_rows,cols,gs,s16_maxrel,sqrt(s16_sse/(s16_sref+1e-30)),t16,gops/t16/1e9,gops/tg_best/1e9,tg_best/t16);
+
     /* M=1 w8a8 SDOT MATVEC (the decode lever): glm5_mv_int8_sdot vs the w8a16 8row matvec (yo). */
     float *ymv=(float*)glm5_amalloc((size_t)rows*4);
     if(!ymv) return 2;
