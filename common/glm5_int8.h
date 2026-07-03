@@ -127,6 +127,59 @@ static inline float glm5_dot_int8_sdot_row(const uint8_t*w,const float*s,int gs,
     }
     return (float)a;
 }
+
+/* w8a16-MIMIC via int16 SDOT: the QuantTrio GLM-5.2-Int8 checkpoint is w8a16 (int8 weight x 16-bit
+ * activation) — quantizing activations to int8 (glm5_matvec_int8_sdot_8row) is more aggressive than
+ * the model expects and loses accuracy on outlier-heavy activations. Instead quantize the activation
+ * to INT16 (per-vector symmetric, ~3e-5/elem = near-lossless, finer than bf16's 8-bit mantissa) and
+ * contract with svdot_s64 (int16xint16->int64, 32 MACs/instr). Offset-binary weight byte -> int16 via
+ * (byte-128). Deferred per-group f64 scale fold + one svaddv/row. ~2x denser than the convert-bound
+ * w8a16 f32 kernel (half of the int8-SDOT density) but with w8a16 accuracy. Caller multiplies by xsc. */
+static inline void glm5_matvec_int16sdot_8row(float*restrict dst,
+        const uint8_t*w0,const uint8_t*w1,const uint8_t*w2,const uint8_t*w3,
+        const uint8_t*w4,const uint8_t*w5,const uint8_t*w6,const uint8_t*w7,
+        const float*s0,const float*s1,const float*s2,const float*s3,
+        const float*s4,const float*s5,const float*s6,const float*s7,
+        int gs,const int16_t*xq,int cols){
+    svbool_t pf=svptrue_b64(); int vh=(int)svcnth();
+    svfloat64_t a0=svdup_f64(0),a1=svdup_f64(0),a2=svdup_f64(0),a3=svdup_f64(0);
+    svfloat64_t a4=svdup_f64(0),a5=svdup_f64(0),a6=svdup_f64(0),a7=svdup_f64(0);
+    for(int b=0;b<cols;b+=gs){
+        int bend=b+gs<cols?b+gs:cols, blk=b/gs, c=b;
+        svint64_t d0=svdup_s64(0),d1=svdup_s64(0),d2=svdup_s64(0),d3=svdup_s64(0);
+        svint64_t d4=svdup_s64(0),d5=svdup_s64(0),d6=svdup_s64(0),d7=svdup_s64(0);
+        #define GLM5_SD16(WP,D) do{ svint16_t wv=svsub_n_s16_x(pg,svreinterpret_s16_u16(svld1ub_u16(pg,&(WP)[c])),128); \
+            D=svdot_s64(D,wv,xv); }while(0)
+        for(;c<bend;c+=vh){
+            svbool_t pg=svwhilelt_b16((uint32_t)c,(uint32_t)bend);
+            svint16_t xv=svld1_s16(pg,&xq[c]);
+            GLM5_SD16(w0,d0); GLM5_SD16(w1,d1); GLM5_SD16(w2,d2); GLM5_SD16(w3,d3);
+            GLM5_SD16(w4,d4); GLM5_SD16(w5,d5); GLM5_SD16(w6,d6); GLM5_SD16(w7,d7);
+        }
+        #undef GLM5_SD16
+        a0=svmla_n_f64_x(pf,a0,svcvt_f64_s64_x(pf,d0),(double)s0[blk]);
+        a1=svmla_n_f64_x(pf,a1,svcvt_f64_s64_x(pf,d1),(double)s1[blk]);
+        a2=svmla_n_f64_x(pf,a2,svcvt_f64_s64_x(pf,d2),(double)s2[blk]);
+        a3=svmla_n_f64_x(pf,a3,svcvt_f64_s64_x(pf,d3),(double)s3[blk]);
+        a4=svmla_n_f64_x(pf,a4,svcvt_f64_s64_x(pf,d4),(double)s4[blk]);
+        a5=svmla_n_f64_x(pf,a5,svcvt_f64_s64_x(pf,d5),(double)s5[blk]);
+        a6=svmla_n_f64_x(pf,a6,svcvt_f64_s64_x(pf,d6),(double)s6[blk]);
+        a7=svmla_n_f64_x(pf,a7,svcvt_f64_s64_x(pf,d7),(double)s7[blk]);
+    }
+    dst[0]=(float)svaddv_f64(pf,a0); dst[1]=(float)svaddv_f64(pf,a1);
+    dst[2]=(float)svaddv_f64(pf,a2); dst[3]=(float)svaddv_f64(pf,a3);
+    dst[4]=(float)svaddv_f64(pf,a4); dst[5]=(float)svaddv_f64(pf,a5);
+    dst[6]=(float)svaddv_f64(pf,a6); dst[7]=(float)svaddv_f64(pf,a7);
+}
+static inline float glm5_dot_int16sdot_row(const uint8_t*w,const float*s,int gs,const int16_t*xq,int cols){
+    double a=0;
+    for(int b=0;b<cols;b+=gs){
+        float sc=s[b/gs]; int e=b+gs<cols?b+gs:cols; long acc=0;
+        for(int c=b;c<e;c++) acc+=(long)((int)w[c]-128)*(int)xq[c];
+        a+=(double)acc*sc;
+    }
+    return (float)a;
+}
 #endif
 
 #endif /* GLM5_INT8_H */

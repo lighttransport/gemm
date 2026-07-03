@@ -184,6 +184,23 @@ int main(void){
     printf("INT8_MV_SDOT rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g w8a16=%.6f s %.2f Gop/s  sdot=%.6f s %.2f Gop/s  speedup=%.2fx\n",
            rows,cols,gs,mv_maxrel,sqrt(mv_sse/(mv_sref+1e-30)),best_o,ops/best_o/1e9,tmv,ops/tmv/1e9,best_o/tmv);
 
+    /* M=1 w8a16-MIMIC int16 SDOT matvec: glm5_mv_int16_sdot vs w8a16 (yo). Accuracy should be ~1e-4. */
+    float *ymv16=(float*)glm5_amalloc((size_t)rows*4);
+    if(!ymv16) return 2;
+    glm5_mv_int16_sdot(&gm,ymv16,W,S,gs,x,rows,cols);
+    double m16_sse=0,m16_sref=0,m16_maxrel=0;
+    for(int r=0;r<rows;r++){
+        double ref=yo[r], dd=ref-(double)ymv16[r]; m16_sse+=dd*dd; m16_sref+=ref*ref;
+        double rel=fabs(dd)/(fabs(ref)+1e-9); if(rel>m16_maxrel)m16_maxrel=rel;
+    }
+    double tmv16=1e30;
+    for(int it=0;it<reps;it++){
+        t0=wall_sec(); glm5_mv_int16_sdot(&gm,ymv16,W,S,gs,x,rows,cols);
+        double tt=wall_sec()-t0; if(tt<tmv16)tmv16=tt;
+    }
+    printf("INT16_MV_SDOT rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g w8a16=%.6f s %.2f Gop/s  i16sdot=%.6f s %.2f Gop/s  speedup=%.2fx\n",
+           rows,cols,gs,m16_maxrel,sqrt(m16_sse/(m16_sref+1e-30)),best_o,ops/best_o/1e9,tmv16,ops/tmv16/1e9,best_o/tmv16);
+
     /* BF16-weight matvec (glm5_mv_bf16): the bf16 decode path (2 B/weight, f32 acts). Reports Gop/s
      * + GB/s so the memory-vs-compute roofline is explicit (bf16 streams 2x the bytes of int8). */
     if(glm5_envi("BF16",1)){

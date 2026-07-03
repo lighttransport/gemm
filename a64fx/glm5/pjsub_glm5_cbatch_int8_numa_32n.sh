@@ -7,10 +7,12 @@
 #       limit. Fix = pin threads (OMP_PROC_BIND/PLACES) + interleave weights across the 4 CMGs
 #       (`numactl --interleave=all`) -> ~495-739 GB/s. Microbench matvec: 197 -> 592-671 Gop/s (~3x).
 #       This is the undiagnosed "OMP-48 regression" in common/glm5_impl.h:362-365.
-#   (2) w8a8 SDOT M=1 matvec (GLM5_MV_SDOT=1, glm5_mv_int8_sdot) — replaces the convert-bound w8a16
-#       matvec; +1.27-1.46x on top once NUMA-local (compute-bound regime). rms ~2e-4, argmax-safe.
-# Arms (bd=0 single-stream decode = the M=1 lever target), each an independent runner invocation
-# after ONE staging:  A baseline | B +NUMA(pin+interleave) | C +NUMA+SDOT | plus D bd=1 batched+NUMA+SDOT.
+#   (2) SDOT M=1 matvec (GLM5_MV_SDOT: 1=int8/w8a8, 2=int16/w8a16-mimic) — replaces the convert-bound
+#       w8a16 matvec. int8 is fastest (1.27-1.46x) but LOSSY (12L logit A/B cosine 0.9965, rms 8% —
+#       the checkpoint is w8a16, int8 acts too aggressive). int16 (svdot_s64, near-lossless int16 acts)
+#       is the accuracy-preserving path: 1.15-1.26x, e2e cosine 0.99985 / rms 0.69% / top1 97.9%.
+# Arms (bd=0 single-stream = the M=1 lever target), each an independent runner invocation after ONE
+# staging:  A baseline | B +NUMA | C +NUMA+int8SDOT | E +NUMA+int16SDOT | D bd=1 batched+NUMA+int16SDOT.
 # Derived from pjsub_glm5_cbatch_int8_32n.sh (same staging/model/config).
 
 #PJM -g hp250467
@@ -83,9 +85,10 @@ run_arm(){ local tag=$1 bd=$2 numa=$3 sdot=$4
 }
 run_arm A 0 0 0     # baseline single-stream (shipped)
 run_arm B 0 1 0     # + NUMA pin+interleave
-run_arm C 0 1 1     # + NUMA + w8a8 SDOT
-run_arm D 1 1 1     # batched decode + NUMA + SDOT (full stack)
+run_arm C 0 1 1     # + NUMA + int8 SDOT (w8a8, fast/lossy — expect TOKEN DIFF)
+run_arm E 0 1 2     # + NUMA + int16 SDOT (w8a16-mimic, accuracy-preserving)
+run_arm D 1 1 2     # batched decode + NUMA + int16 SDOT (full stack)
 
-echo "--- token-stream identity (A is reference; B must MATCH, C/D may differ by SDOT rounding) ---"
-for X in B C D; do for f in "$WORK"/A_*.txt; do o="$WORK/${X}_${f##*/A_}"; [ -f "$o" ] && { cmp -s "$f" "$o" || echo "TOKEN DIFF A vs $X: ${f##*/A_}"; }; done; done
+echo "--- token-stream identity (A ref; B must MATCH; C int8 will DIFFER; E int16 should MATCH/near) ---"
+for X in B C E D; do for f in "$WORK"/A_*.txt; do o="$WORK/${X}_${f##*/A_}"; [ -f "$o" ] && { cmp -s "$f" "$o" || echo "TOKEN DIFF A vs $X: ${f##*/A_}"; }; done; done
 echo "SENTINEL glm5_cbatch_int8_numa_${NP}n=done"; date

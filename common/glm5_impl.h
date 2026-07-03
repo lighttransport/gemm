@@ -678,14 +678,54 @@ static void glm5_mv_int8_sdot(glm5_model*m, float*restrict y, const uint8_t*W, c
     glm5_mv_int8(m,y,W,S,gs,x,rows,cols);
 #endif
 }
+/* GLM5.2 INT8 w8a16-MIMIC via int16 SDOT (M=1 decode): quantize the activation to int16 (near-
+ * lossless, ~3e-5/elem) instead of int8, then contract with svdot_s64. Matches the w8a16 reference to
+ * ~1e-4 (unlike w8a8's ~8% on outlier-heavy activations) while still avoiding the per-byte f32 convert.
+ * The QuantTrio GLM-5.2-Int8 checkpoint IS w8a16, so this is the accuracy-preserving fast path. */
+static void glm5_mv_int16_sdot(glm5_model*m, float*restrict y, const uint8_t*W, const float*S, int gs, const float*x, int rows, int cols){
+    int sb=(cols+gs-1)/gs;
+    if(glm5_dummy){ for(int r=0;r<rows;r++) y[r]=0.f; (void)m; return; }
+#if defined(__ARM_FEATURE_SVE)
+    int16_t *xq=(int16_t*)malloc((size_t)cols*2);
+    if(!xq){ glm5_mv_int8(m,y,W,S,gs,x,rows,cols); return; }
+    float amax=1e-20f;
+    for(int c=0;c<cols;c++){ float a=fabsf(x[c]); if(a>amax)amax=a; }
+    float inv=32767.0f/amax, xsc=amax/32767.0f;
+    for(int c=0;c<cols;c++){ int v=(int)lrintf(x[c]*inv); v=v>32767?32767:(v<-32767?-32767:v); xq[c]=(int16_t)v; }
+    int nb=rows/8;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){
+        int r=bi*8; const uint8_t*w=W+(size_t)r*cols; const float*s=S+(size_t)r*sb; float tmp[8];
+        glm5_matvec_int16sdot_8row(tmp,
+            w,w+cols,w+2*(size_t)cols,w+3*(size_t)cols,
+            w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
+            s,s+sb,s+2*(size_t)sb,s+3*(size_t)sb,
+            s+4*(size_t)sb,s+5*(size_t)sb,s+6*(size_t)sb,s+7*(size_t)sb,
+            gs,xq,cols);
+        for(int j=0;j<8;j++) y[r+j]=xsc*tmp[j];
+    }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows-nb*8>=GLM5_PAR_MIN)
+#endif
+    for(int r=nb*8;r<rows;r++) y[r]=xsc*glm5_dot_int16sdot_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,xq,cols);
+    free(xq);
+    return;
+#else
+    glm5_mv_int8(m,y,W,S,gs,x,rows,cols);
+#endif
+}
 /* matvec dispatch by weight type (bf16 / MXFP8 / INT8) */
 static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const float*x, int rows, int cols){
     if(t->type==GLM5_MXFP8) glm5_mv_mxfp8(m,y,(const uint8_t*)t->w,t->scale,x,rows,cols);
     else if(t->type==GLM5_INT8){
-        /* w8a8 SDOT M=1 path (GLM5_MV_SDOT=1): faster but lossier (int8 activations). Default off. */
+        /* GLM5_MV_SDOT: 0=w8a16 f32 (shipped), 1=w8a8 int8-SDOT (fast, lossy ~8%),
+         * 2=w8a16-mimic int16-SDOT (fast + accurate, matches the w8a16 checkpoint). Default off. */
         static int mvsd=-2;
         if(mvsd==-2) mvsd=glm5_envi("GLM5_MV_SDOT",0);
-        if(mvsd) glm5_mv_int8_sdot(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,x,rows,cols);
+        if(mvsd==2) glm5_mv_int16_sdot(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,x,rows,cols);
+        else if(mvsd==1) glm5_mv_int8_sdot(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,x,rows,cols);
         else glm5_mv_int8(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,x,rows,cols);
     }
     else glm5_mv_bf16(y,(const uint16_t*)t->w,x,rows,cols);
@@ -1664,6 +1704,12 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
         return t;
     }
     glm5_mv(m,m->s_logits,&m->head,h2,hrows,H);   /* greedy: shard (or full) at offset 0 */
+    /* GLM5_LOGIT_DUMP=<file>: append the full logit vector per forward_token call (rank 0, replicated
+     * head only). For the SDOT-vs-w8a16 numeric A/B (cosine/rms) fed identical inputs (teacher-forcing
+     * / prefill-only) so there is no autoregressive divergence. */
+    if(m->ep_rank==0 && hrows>=c->vocab){ static FILE*ldf=(FILE*)-1;
+        if(ldf==(FILE*)-1){ const char*e=getenv("GLM5_LOGIT_DUMP"); ldf=(e&&*e)?fopen(e,"wb"):NULL; }
+        if(ldf){ fwrite(m->s_logits,4,(size_t)c->vocab,ldf); fflush(ldf); } }
     int la=0; float lv=m->s_logits[0]; for(int i=1;i<hrows;i++) if(m->s_logits[i]>lv){lv=m->s_logits[i];la=i;}
     int32_t gidx=m->head_r0+la; float gval=lv;
     if(hrows<c->vocab && m->ar_argmax_cb) m->ar_argmax_cb(&gval,&gidx,m->ar_argmax_ctx);  /* TP_HEAD merge */
