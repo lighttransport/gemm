@@ -360,6 +360,7 @@ typedef struct {
      * mtp_layer is a FULL transformer block (own KV cache) run via a 1-layer model view. */
     struct glm5_layer_s *mtp_layer;
     uint16_t *mtp_enorm, *mtp_hnorm;   /* [hidden] RMSNorm weights for the two halves */
+    uint16_t *mtp_out_norm;            /* MTP shared_head.norm [hidden] (used in the view, not model.norm) */
     glm5_tensor mtp_eh;                /* eh_proj [hidden, 2*hidden] */
     /* perf accounting */
     size_t bytes_read;

@@ -1040,13 +1040,28 @@ int main(void){
             glm5_afree(prompt); glm5_afree(x); glm5_free(m); return 0;
         }
         int *gen=glm5_amalloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
+        /* MTP (GLM5_MTP / GLM5_SPEC): each decode step, draft the NEXT token from the just-produced
+         * token + its residual hidden (glm5_mtp_draft), and measure acceptance alpha = P(draft == the
+         * real next token). This is BYTE-IDENTICAL to plain decode (the draft is a side computation
+         * that appends only to the MTP block's own KV, never the main KV). alpha is the gate: if
+         * >=~0.7, gamma=1 spec decode yields E[tokens]=1+alpha per BATCHED-K=2 verify (the speedup
+         * step; this loop is the correctness-first driver + alpha measurement). */
+        int mtp_on=(m->mtp_layer!=NULL) && (envi("GLM5_MTP",0)||envi("GLM5_SPEC",0));
+        float *xb=mtp_on?(float*)glm5_amalloc((size_t)2*C*4):NULL;
+        int prev_draft=-1; long mtp_hit=0,mtp_tot=0;
+        if(mtp_on && MyRank==0) logmsg("MTP draft on: measuring acceptance alpha over %d decode steps\n",max_new);
         g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
         double td0=now_sec();
         for(int g=0;g<max_new;g++){ gen[ng++]=cur; if((cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) && ng>=min_new) break;
             m->samp_hist=gen; m->samp_hist_n=ng;   /* repetition penalty over tokens so far */
             embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
+            if(mtp_on){
+                if(prev_draft>=0){ mtp_tot++; if(prev_draft==cur) mtp_hit++; }
+                prev_draft=glm5_mtp_draft(m,x,cur,n_prompt+g+1,xb);  /* draft the token at n_prompt+g+2 */
+            }
             for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
         double td=now_sec()-td0;
+        double mtp_alpha=mtp_tot?(double)mtp_hit/mtp_tot:0.0;
         double gen_d_ar=g_ar_secs; long gen_d_calls=g_ar_calls, gen_d_frags=g_ar_frags;
         prof_snapshot(m,prof_gen_dec);
         barrier();
@@ -1055,12 +1070,14 @@ int main(void){
                    n_prompt/tpf,100.0*gen_pf_ar/tpf,gen_pf_calls,gen_pf_frags,ng,td>0?ng/td:0.0,td>0?100.0*gen_d_ar/td:0.0,gen_d_calls,gen_d_frags,nan);
             prof_log_delta("gen_prefill",prof_gen0,prof_gen_pf,n_prompt,tpf,gen_pf_ar);
             prof_log_delta("gen_decode",prof_gen_pf,prof_gen_dec,ng,td,gen_d_ar);
+            if(mtp_on) logmsg("MTP_ALPHA %ld/%ld = %.1f%% (draft==next real token) -> spec E[tok/verify]=%.2f (gate >=0.7)\n",
+                              mtp_hit,mtp_tot,100.0*mtp_alpha,1.0+mtp_alpha);
             char buf[6000]; int o=0; for(int i=0;i<ng&&o<5900;i++) o+=snprintf(buf+o,sizeof(buf)-o,"%d ",gen[i]);
             logmsg("GEN_IDS %s\n",buf);
             if(gen_out&&*gen_out){ FILE*gf=fopen(gen_out,"w"); if(gf){ for(int i=0;i<ng;i++) fprintf(gf,"%d%s",gen[i],i+1<ng?" ":"\n"); fclose(gf); logmsg("gen: wrote %d ids to %s\n",ng,gen_out);} }
             logmsg("SENTINEL glm5_gen_%dn=done\n",N);
         }
-        glm5_afree(gen); glm5_afree(prompt); glm5_afree(x); glm5_free(m); return 0;
+        glm5_afree(gen); glm5_afree(xb); glm5_afree(prompt); glm5_afree(x); glm5_free(m); return 0;
     }
 
     /* ---- synthetic-token prefill benchmark: uses embeddings but avoids a huge prompt file. ---- */

@@ -1165,6 +1165,87 @@ static glm5_tensor glm5_load_w(glm5_ent*es,int n,const uint8_t*base,const char*n
 /* Build an glm5_model from this rank's staged blob (GLM5_STAGE_DIR/rank<rr>.{blob,manifest}).
  * Dense tensors are TP-sliced into the arena per the same ranges as glm5_alloc_synth; routed
  * experts are the owned ones in the blob. Returns NULL on any missing/short tensor. */
+/* Load ONE transformer layer's real weights (name prefix model.layers.<l>.) into L. Shared by the
+ * main layer loop and the MTP block (layer 78). is_moe/has_idx are computed by the caller. */
+static void glm5_load_one_layer(glm5_model*m, glm5_layer*L, int l, int is_moe, int has_idx,
+    glm5_ent*es, int n, const uint8_t*base,
+    int qh0,int qh1,int qrows,int arows,int sh_r0,int sh_rows,int ff_r0,int ff_rows,
+    int*ok,size_t*used){
+    const glm5_config*cfg=&m->cfg;
+    const int H=cfg->hidden, QD=glm5_q_dim(cfg), AD=glm5_attn_dim(cfg), KVC=glm5_kv_cache_dim(cfg);
+    const int VD=cfg->v_head_dim, QHD=cfg->qk_head_dim, IQD=glm5_idx_q_dim(cfg), ID=cfg->index_dim;
+    char nb[512];
+    #define REQ2(nm) ({ glm5_ent*_e=glm5_req(es,n,(nm)); if(!_e){ *ok=0; } _e; })
+    #define LN(suf) (snprintf(nb,sizeof nb,"model.layers.%d." suf,l),nb)
+    { glm5_ent*e=REQ2(LN("input_layernorm.weight")); if(e) L->input_norm=glm5_cp_full(base,e); }
+    { glm5_ent*e=REQ2(LN("post_attention_layernorm.weight")); if(e) L->post_norm=glm5_cp_full(base,e); }
+    L->wq_a=glm5_load_w(es,n,base,LN("self_attn.q_a_proj.weight"),0,0,0,0,0,cfg->q_lora,H,ok,used);
+    L->wq_b=glm5_load_w(es,n,base,LN("self_attn.q_b_proj.weight"),1,qh0*QHD,qrows,0,0,QD,cfg->q_lora,ok,used);
+    L->wkv_a=glm5_load_w(es,n,base,LN("self_attn.kv_a_proj_with_mqa.weight"),0,0,0,0,0,KVC,H,ok,used);
+    L->wkv_b=glm5_load_w(es,n,base,LN("self_attn.kv_b_proj.weight"),1,qh0*(cfg->qk_nope_dim+VD),arows ? (qh1-qh0)*(cfg->qk_nope_dim+VD) : 0,0,0,cfg->n_heads*(cfg->qk_nope_dim+VD),cfg->kv_lora,ok,used);
+    L->wo=glm5_load_w(es,n,base,LN("self_attn.o_proj.weight"),2,0,0,qh0*VD,arows,H,AD,ok,used);
+    { glm5_ent*e=REQ2(LN("self_attn.q_a_layernorm.weight")); if(e) L->q_a_norm=glm5_cp_full(base,e); }
+    { glm5_ent*e=REQ2(LN("self_attn.kv_a_layernorm.weight")); if(e) L->kv_a_norm=glm5_cp_full(base,e); }
+    L->qh0=qh0; L->qh1=qh1;
+    glm5_alloc_kv(m,L,is_moe && has_idx,used);
+    if(is_moe){
+        if(has_idx){
+            L->idx_wq_b=glm5_load_w(es,n,base,LN("self_attn.indexer.wq_b.weight"),0,0,0,0,0,IQD,cfg->q_lora,ok,used);
+            L->idx_wk=glm5_load_w(es,n,base,LN("self_attn.indexer.wk.weight"),0,0,0,0,0,ID,H,ok,used);
+            L->idx_wproj=glm5_load_w(es,n,base,LN("self_attn.indexer.weights_proj.weight"),0,0,0,0,0,cfg->index_n_heads,H,ok,used);
+            { glm5_ent*e=REQ2(LN("self_attn.indexer.k_norm.weight")); if(e) L->idx_k_norm=glm5_cp_full(base,e); }
+            { glm5_ent*e=REQ2(LN("self_attn.indexer.k_norm.bias")); if(e) L->idx_k_bias=glm5_cp_full(base,e); }
+        }
+        { glm5_ent*e=REQ2(LN("mlp.gate.weight")); if(e){
+            void*gw;
+            if(e->f32){ size_t ne=(size_t)cfg->n_experts*H; uint16_t*d=glm5_amalloc(ne*2);
+                const uint32_t*s=(const uint32_t*)(base+e->off);
+                for(size_t i=0;i<ne;i++){ uint32_t b=s[i]; d[i]=(uint16_t)((b+0x8000u+((b>>16)&1))>>16); }
+                glm5_blob_dontneed(base,e->off,e->nbytes); gw=d;
+            } else gw=glm5_cp_full(base,e);
+            L->gate=(glm5_tensor){gw,NULL,GLM5_BF16,cfg->n_experts,H}; } }
+        { glm5_ent*e=REQ2(LN("mlp.gate.e_score_correction_bias")); if(e) L->gate_bias=glm5_cp_full(base,e); }
+        L->sh_w1=glm5_load_w(es,n,base,LN("mlp.shared_experts.gate_proj.weight"),1,sh_r0,sh_rows,0,0,cfg->moe_inter,H,ok,used);
+        L->sh_w3=glm5_load_w(es,n,base,LN("mlp.shared_experts.up_proj.weight"),1,sh_r0,sh_rows,0,0,cfg->moe_inter,H,ok,used);
+        L->sh_w2=glm5_load_w(es,n,base,LN("mlp.shared_experts.down_proj.weight"),2,0,0,sh_r0,sh_rows,H,cfg->moe_inter,ok,used);
+        L->sh_r0=sh_r0; L->sh_rows=sh_rows;
+        int no=glm5_n_owned(cfg->n_experts,m->ep_rank,m->ep_size); L->n_owned=no;
+        L->owned_eid=glm5_amalloc((size_t)(no>0?no:1)*sizeof(int));
+        L->ex_w1=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor)); L->ex_w3=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor)); L->ex_w2=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor));
+        int s=0; for(int e2=0;e2<cfg->n_experts && *ok;e2++) if(e2%m->ep_size==m->ep_rank){ L->owned_eid[s]=e2;
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.gate_proj.weight",l,e2); L->ex_w1[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,cfg->moe_inter,H,ok,used);
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.up_proj.weight",l,e2); L->ex_w3[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,cfg->moe_inter,H,ok,used);
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.down_proj.weight",l,e2); L->ex_w2[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,H,cfg->moe_inter,ok,used);
+            s++; }
+    } else {
+        L->ff_gate=glm5_load_w(es,n,base,LN("mlp.gate_proj.weight"),1,ff_r0,ff_rows,0,0,cfg->dense_inter,H,ok,used);
+        L->ff_up  =glm5_load_w(es,n,base,LN("mlp.up_proj.weight"),1,ff_r0,ff_rows,0,0,cfg->dense_inter,H,ok,used);
+        L->ff_down=glm5_load_w(es,n,base,LN("mlp.down_proj.weight"),2,0,0,ff_r0,ff_rows,H,cfg->dense_inter,ok,used);
+        L->ff_r0=ff_r0; L->ff_rows=ff_rows;
+    }
+    #undef LN
+    #undef REQ2
+}
+/* MTP real-weight load: the checkpoint's layer 78 (a full MoE block w/ indexer) + the fusion tensors
+ * (enorm/hnorm/eh_proj) + shared_head.norm. Called from glm5_load_real while the blob is mapped, gated
+ * GLM5_MTP. Stage with GLM5_STAGE_LAYERS=79 so model.layers.78.* is in the rank blobs. */
+static int glm5_load_mtp_real(glm5_model*m, glm5_ent*es, int n, const uint8_t*base,
+    int qh0,int qh1,int qrows,int arows,int sh_r0,int sh_rows,size_t*used){
+    const glm5_config*cfg=&m->cfg; const int H=cfg->hidden; int ok=1, L78=cfg->n_layers; /* = 78 */
+    m->mtp_layer=glm5_acalloc(1,sizeof(glm5_layer));
+    glm5_load_one_layer(m,m->mtp_layer,L78,/*is_moe*/1,/*has_idx*/1,es,n,base,
+                        qh0,qh1,qrows,arows,sh_r0,sh_rows,0,0,&ok,used);
+    char nb[512];
+    #define MREQ(suf) ({ snprintf(nb,sizeof nb,"model.layers.%d." suf,L78); glm5_ent*_e=glm5_req(es,n,nb); if(!_e) ok=0; _e; })
+    { glm5_ent*e=MREQ("enorm.weight");            if(e) m->mtp_enorm=glm5_cp_full(base,e); }
+    { glm5_ent*e=MREQ("hnorm.weight");            if(e) m->mtp_hnorm=glm5_cp_full(base,e); }
+    { glm5_ent*e=MREQ("shared_head.norm.weight"); if(e) m->mtp_out_norm=glm5_cp_full(base,e); }
+    #undef MREQ
+    snprintf(nb,sizeof nb,"model.layers.%d.eh_proj.weight",L78);
+    m->mtp_eh=glm5_load_w(es,n,base,nb,0,0,0,0,0,H,2*H,&ok,used);  /* [H, 2H], replicated */
+    if(!ok){ fprintf(stderr,"glm5_load_mtp: rank %d incomplete (layer %d missing)\n",m->ep_rank,L78); return -1; }
+    return 0;
+}
 static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const char*blob_dir,int n_threads,int n_cmgs){
     char bdir[1024]; if(blob_dir&&*blob_dir) snprintf(bdir,sizeof bdir,"%s",blob_dir);
     else { const char*e=getenv("GLM5_STAGE_DIR"); snprintf(bdir,sizeof bdir,"%s",(e&&*e)?e:"/local/glm5"); }
@@ -1209,60 +1290,15 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     { glm5_ent*e=REQ("model.norm.weight"); if(e) m->out_norm=glm5_cp_full(base,e); }
 
     m->layers=glm5_acalloc(cfg.n_layers,sizeof(glm5_layer));
-    for(int l=0;l<cfg.n_layers&&ok;l++){
-        glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(&cfg,l);
-        #define LN(suf) (snprintf(nb,sizeof nb,"model.layers.%d." suf,l),nb)
-        { glm5_ent*e=REQ(LN("input_layernorm.weight")); if(e) L->input_norm=glm5_cp_full(base,e); }
-        { glm5_ent*e=REQ(LN("post_attention_layernorm.weight")); if(e) L->post_norm=glm5_cp_full(base,e); }
-        L->wq_a=glm5_load_w(es,n,base,LN("self_attn.q_a_proj.weight"),0,0,0,0,0,cfg.q_lora,H,&ok,&used);
-        L->wq_b=glm5_load_w(es,n,base,LN("self_attn.q_b_proj.weight"),1,qh0*QHD,qrows,0,0,QD,cfg.q_lora,&ok,&used);
-        L->wkv_a=glm5_load_w(es,n,base,LN("self_attn.kv_a_proj_with_mqa.weight"),0,0,0,0,0,KVC,H,&ok,&used);
-        L->wkv_b=glm5_load_w(es,n,base,LN("self_attn.kv_b_proj.weight"),1,qh0*(cfg.qk_nope_dim+VD),arows ? (qh1-qh0)*(cfg.qk_nope_dim+VD) : 0,0,0,cfg.n_heads*(cfg.qk_nope_dim+VD),cfg.kv_lora,&ok,&used);
-        L->wo=glm5_load_w(es,n,base,LN("self_attn.o_proj.weight"),2,0,0,qh0*VD,arows,H,AD,&ok,&used);
-        { glm5_ent*e=REQ(LN("self_attn.q_a_layernorm.weight")); if(e) L->q_a_norm=glm5_cp_full(base,e); }
-        { glm5_ent*e=REQ(LN("self_attn.kv_a_layernorm.weight")); if(e) L->kv_a_norm=glm5_cp_full(base,e); }
-        L->qh0=qh0; L->qh1=qh1;
-        int has_idx=glm5_has_full_indexer(&cfg,l);
-        glm5_alloc_kv(m,L,is_moe && has_idx,&used);
-        if(is_moe){
-            if(has_idx){
-                L->idx_wq_b=glm5_load_w(es,n,base,LN("self_attn.indexer.wq_b.weight"),0,0,0,0,0,IQD,cfg.q_lora,&ok,&used);
-                L->idx_wk=glm5_load_w(es,n,base,LN("self_attn.indexer.wk.weight"),0,0,0,0,0,ID,H,&ok,&used);
-                L->idx_wproj=glm5_load_w(es,n,base,LN("self_attn.indexer.weights_proj.weight"),0,0,0,0,0,cfg.index_n_heads,H,&ok,&used);
-                { glm5_ent*e=REQ(LN("self_attn.indexer.k_norm.weight")); if(e) L->idx_k_norm=glm5_cp_full(base,e); }
-                { glm5_ent*e=REQ(LN("self_attn.indexer.k_norm.bias")); if(e) L->idx_k_bias=glm5_cp_full(base,e); }
-            }
-            { glm5_ent*e=REQ(LN("mlp.gate.weight")); if(e){
-                /* router gate is stored F32 in the int8 ckpt (bf16 in the bf16 ckpt). The matvec
-                 * expects bf16, so convert F32->bf16; reading the F32 bytes as bf16 silently
-                 * scrambles the router (~10x weak -> flat scores -> broken expert selection). */
-                void*gw;
-                if(e->f32){ size_t ne=(size_t)cfg.n_experts*H; uint16_t*d=glm5_amalloc(ne*2);
-                    const uint32_t*s=(const uint32_t*)(base+e->off);
-                    for(size_t i=0;i<ne;i++){ uint32_t b=s[i]; d[i]=(uint16_t)((b+0x8000u+((b>>16)&1))>>16); } /* round-to-nearest-even */
-                    glm5_blob_dontneed(base,e->off,e->nbytes); gw=d;
-                } else gw=glm5_cp_full(base,e);
-                L->gate=(glm5_tensor){gw,NULL,GLM5_BF16,cfg.n_experts,H}; } }
-            { glm5_ent*e=REQ(LN("mlp.gate.e_score_correction_bias")); if(e) L->gate_bias=glm5_cp_full(base,e); }
-            L->sh_w1=glm5_load_w(es,n,base,LN("mlp.shared_experts.gate_proj.weight"),1,sh_r0,sh_rows,0,0,cfg.moe_inter,H,&ok,&used);
-            L->sh_w3=glm5_load_w(es,n,base,LN("mlp.shared_experts.up_proj.weight"),1,sh_r0,sh_rows,0,0,cfg.moe_inter,H,&ok,&used);
-            L->sh_w2=glm5_load_w(es,n,base,LN("mlp.shared_experts.down_proj.weight"),2,0,0,sh_r0,sh_rows,H,cfg.moe_inter,&ok,&used);
-            L->sh_r0=sh_r0; L->sh_rows=sh_rows;
-            int no=glm5_n_owned(cfg.n_experts,ep_rank,ep_size); L->n_owned=no;
-            L->owned_eid=glm5_amalloc((size_t)(no>0?no:1)*sizeof(int));
-            L->ex_w1=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor)); L->ex_w3=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor)); L->ex_w2=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor));
-            int s=0; for(int e2=0;e2<cfg.n_experts&&ok;e2++) if(e2%ep_size==ep_rank){ L->owned_eid[s]=e2;
-                snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.gate_proj.weight",l,e2); L->ex_w1[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,cfg.moe_inter,H,&ok,&used);
-                snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.up_proj.weight",l,e2); L->ex_w3[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,cfg.moe_inter,H,&ok,&used);
-                snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.down_proj.weight",l,e2); L->ex_w2[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,H,cfg.moe_inter,&ok,&used);
-                s++; }
-        } else {
-            L->ff_gate=glm5_load_w(es,n,base,LN("mlp.gate_proj.weight"),1,ff_r0,ff_rows,0,0,cfg.dense_inter,H,&ok,&used);
-            L->ff_up  =glm5_load_w(es,n,base,LN("mlp.up_proj.weight"),1,ff_r0,ff_rows,0,0,cfg.dense_inter,H,&ok,&used);
-            L->ff_down=glm5_load_w(es,n,base,LN("mlp.down_proj.weight"),2,0,0,ff_r0,ff_rows,H,cfg.dense_inter,&ok,&used);
-            L->ff_r0=ff_r0; L->ff_rows=ff_rows;
-        }
-        #undef LN
+    for(int l=0;l<cfg.n_layers&&ok;l++)
+        glm5_load_one_layer(m,&m->layers[l],l,glm5_is_moe(&cfg,l),glm5_has_full_indexer(&cfg,l),
+                            es,n,base,qh0,qh1,qrows,arows,sh_r0,sh_rows,ff_r0,ff_rows,&ok,&used);
+    /* MTP block (checkpoint layer 78) — draft head for speculative decode. GLM5_MTP=1 (needs the
+     * layer staged: GLM5_STAGE_LAYERS=79). Failure is non-fatal (MTP just stays disabled). */
+    if(ok && glm5_envi("GLM5_MTP",0)){
+        if(glm5_load_mtp_real(m,es,n,base,qh0,qh1,qrows,arows,sh_r0,sh_rows,&used)==0){
+            if(ep_rank==0) fprintf(stderr,"glm5: MTP block loaded (layer %d)\n",cfg.n_layers);
+        } else { m->mtp_layer=NULL; if(ep_rank==0) fprintf(stderr,"glm5: MTP load failed -> disabled\n"); }
     }
     #undef REQ
     munmap((void*)base,bsz); close(bfd); glm5_afree(es);
@@ -2998,6 +3034,7 @@ static glm5_model glm5_mtp_view(glm5_model*m){
     glm5_model v=*m;
     v.layers=m->mtp_layer; v.cfg.n_layers=1; v.cfg.n_dense_layers=0;  /* the block is MoE */
     v.mtp_layer=NULL; v.ms=NULL;
+    if(m->mtp_out_norm) v.out_norm=m->mtp_out_norm;  /* MTP uses shared_head.norm, not model.norm */
     return v;
 }
 /* argmax draft token. h = the residual hidden (post-all-layers, PRE-out_norm) of the forward
