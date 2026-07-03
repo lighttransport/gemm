@@ -122,6 +122,13 @@ FP-peak%, mem GB/s, mem-peak% per region); comm from the ARPROBE campaign. Run a
    crossover: 1.26× @M=8 → 1.01× @M=64). ⇒ `decode_sim.BW_NODE` should use the **739 GB/s NUMA-local**
    figure (not 300e9); the decode compute term is BW-bound, the prefill term compute-bound.
 
+### Batched-decode GEMM (M=8) — int16 unlocks the decode compute headroom
+Batched decode (bd=1) runs projections through glm5_gemm at M=batch → the compute-bound regime. fapp
+(glm5_kern_prof M=8, 48t): M=1 matvec int16 450 < w8a16 515 Gop/s (0.87×, LOSS) BUT M=8 GEMM int16 1324
+vs w8a16 428 (3.10×) / int8-rb 1888 (4.41×). REAL e2e batched decode (12L, 12n, cbatch bd=1, 8 slots):
+w8a16 63.95 → int16 **98.89 agg tok/s = 1.55×**. ⇒ int16 GEMM is a DECODE-SERVING lever when batched
+(stacks on batching), NOT just prefill — the resolution of the "int16 lost at M=1 decode" result.
+
 ### Comm kernel (tp_allreduce, hidden=6144 f32 = 24 KB, from ARPROBE)
 - **Bare tp_allreduce (tight loop): ~0.08 ms @12n, ~0.14 ms @96n** (NOT the fictional 26 ms the pre-job
   sim back-solved — ~180× cheaper). Raw ARPROBE @N=2 M=1 bytes=24576: `us_per_ar=51.9`.
