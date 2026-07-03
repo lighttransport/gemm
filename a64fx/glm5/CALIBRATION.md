@@ -136,6 +136,9 @@ Batched decode (bd=1) runs projections through glm5_gemm at M=batch → the comp
 vs w8a16 428 (3.10×) / int8-rb 1888 (4.41×). REAL e2e batched decode (12L, 12n, cbatch bd=1, 8 slots):
 w8a16 63.95 → int16 **98.89 agg tok/s = 1.55×**. ⇒ int16 GEMM is a DECODE-SERVING lever when batched
 (stacks on batching), NOT just prefill — the resolution of the "int16 lost at M=1 decode" result.
+SLOTS sweep (int16, PCHUNK=128): agg tok/s 104.6(8)→129.4(16)→151.0(32); w8a16 63.95(8)→111.5(32);
+int16 ratio SHRINKS with batch 1.55×(8)→1.35×(32) (larger M amortizes w8a16's dequant tile, same as the
+kernel M-sweep) → int16 best at MODEST batch. PCHUNK does NOT apply to batched decode (decode M=slots).
 
 ### Comm kernel (tp_allreduce, hidden=6144 f32 = 24 KB, from ARPROBE)
 - **Bare tp_allreduce (tight loop): ~0.08 ms @12n, ~0.14 ms @96n** (NOT the fictional 26 ms the pre-job
