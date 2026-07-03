@@ -2102,9 +2102,11 @@ static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const
     else if(t->type==GLM5_INT8){
         /* GLM5_GEMM_SDOT: 0=w8a16 bf16-tile (shipped), 2=int16 w8a16-mimic svdot_s64 (accurate+dense),
          * 1=int8 w8a8 svdot (fastest, lossy). Default off (=0) keeps the auto w8a8-for-experts logic. */
-        static int gsd=-2;
-        if(gsd==-2) gsd=glm5_envi("GLM5_GEMM_SDOT",0);
-        if(gsd==2 && N>1){ glm5_gemm_int16sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols); return; }
+        static int gsd=-2, mink=0;
+        if(gsd==-2){ gsd=glm5_envi("GLM5_GEMM_SDOT",0); mink=glm5_envi("GLM5_GEMM_SDOT_MINK",0); }
+        /* int16 SDOT helps ALL int8 GEMMs net (12L e2e prefill 1.30x; a cols-based size gate was tested
+         * and REGRESSED, so default MINK=0 = no gate). GLM5_GEMM_SDOT_MINK stays as a tuning override. */
+        if(gsd==2 && N>1 && cols>=mink){ glm5_gemm_int16sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols); return; }
         /* w8a8 sdot wins only for per-channel tensors (routed experts: 1.77x); for group-128 it
          * loses to the tuned w8a16 bf16-FMA kernel. AUTO-enable it for the experts only in the
          * large-chunk prefill regime (chunk >= GLM5_INT8_SDOT_MIN, default 1024 tokens) where the
