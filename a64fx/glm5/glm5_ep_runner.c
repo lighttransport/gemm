@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <math.h>
+#include <sys/syscall.h>
 #include <utofu.h>
 
 #define GLM5_IMPL
@@ -751,7 +752,67 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
     return 0;
 }
 
-int main(void){
+/* ---- CLI front-end: map --flags to the existing GLM5_* env config, so the runner is driven by
+ * command-line args instead of `export` soup. Named flags cover the common knobs; `--set K=V` reaches
+ * any of the ~100 GLM5_* vars. Parsed FIRST in main (before any envi() read) via setenv, so the 100+
+ * existing config sites are untouched and no-args behavior is byte-identical (backward compatible). */
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+/* NUMA-local weight placement (the measured 1.40x e2e, bit-identical lever): interleave THIS process's
+ * future allocations across all CMGs -- in-process equivalent of `numactl --interleave=all`, so no
+ * wrapper is needed. OMP thread affinity is read by the runtime at init, so the launch script still
+ * exports OMP_PROC_BIND=close / OMP_PLACES=cores (best-effort setenv here as a fallback). Default ON. */
+static void glm5_apply_numa(int on){
+    if(!on) return;
+    unsigned long nodemask=~0UL;                 /* all NUMA nodes */
+    syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &nodemask, (unsigned long)(8*sizeof nodemask));
+    setenv("OMP_PROC_BIND","close",0);           /* 0 = don't override if the script already set it */
+    setenv("OMP_PLACES","cores",0);
+}
+static void glm5_cli_usage(void){
+    fprintf(stderr,
+      "glm5_ep_runner [--flags]  (all map to GLM5_* env; env still works as fallback)\n"
+      "  --numa[=0|1]        NUMA-interleave weights (default ON; the 1.40x bit-identical lever)\n"
+      "  --model DIR         GLM5_MODEL_DIR        --layers N     GLM5_LAYERS (0=full)\n"
+      "  --experts N         GLM5_EXPERTS          --maxpos N     GLM5_MAXPOS\n"
+      "  --threads N         LLM_THREADS           --tp N         GLM5_TP\n"
+      "  --tp-shared N       GLM5_TP_SHARED        --sdot N       GLM5_MV_SDOT (0=w8a16,2=int16)\n"
+      "  --batch-decode[=1]  GLM5_BATCH_DECODE     --overlap[=1]  GLM5_COMM_OVERLAP\n"
+      "  --slots N           GLM5_CBATCH_SLOTS     --max-new N    GLM5_MAX_NEW\n"
+      "  --prompts FILE      GLM5_CBATCH_PROMPTS   --prompt-ids F GLM5_PROMPT_IDS\n"
+      "  --gen-out FILE      GLM5_GEN_OUT          --stage-dir D  GLM5_STAGE_DIR\n"
+      "  --nshards N         GLM5_NSHARDS          --ep-size N    GLM5_EP_SIZE\n"
+      "  --real N            GLM5_REAL             --set KEY=VAL  set any GLM5_* var\n");
+}
+static void glm5_cli(int argc,char**argv){
+    int numa=1;
+    for(int i=1;i<argc;i++){
+        char*a=argv[i]; if(strncmp(a,"--",2)) continue; a+=2;
+        char*eq=strchr(a,'='); char*val=NULL;
+        if(eq){ *eq=0; val=eq+1; }
+        else if(i+1<argc && argv[i+1][0]!='-'){ val=argv[++i]; }
+        if(!strcmp(a,"help")){ glm5_cli_usage(); continue; }
+        if(!strcmp(a,"numa")){ numa=val?atoi(val):1; continue; }
+        if(!strcmp(a,"batch-decode")){ setenv("GLM5_BATCH_DECODE",val?val:"1",1); continue; }
+        if(!strcmp(a,"overlap")){ setenv("GLM5_COMM_OVERLAP",val?val:"1",1); continue; }
+        if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }
+        #define MAP(flag,var) if(!strcmp(a,flag)){ if(val) setenv(var,val,1); continue; }
+        MAP("model","GLM5_MODEL_DIR")   MAP("layers","GLM5_LAYERS")   MAP("experts","GLM5_EXPERTS")
+        MAP("maxpos","GLM5_MAXPOS")     MAP("threads","LLM_THREADS")  MAP("tp","GLM5_TP")
+        MAP("tp-shared","GLM5_TP_SHARED") MAP("sdot","GLM5_MV_SDOT")  MAP("slots","GLM5_CBATCH_SLOTS")
+        MAP("max-new","GLM5_MAX_NEW")   MAP("prompts","GLM5_CBATCH_PROMPTS")
+        MAP("prompt-ids","GLM5_PROMPT_IDS") MAP("gen-out","GLM5_GEN_OUT")
+        MAP("stage-dir","GLM5_STAGE_DIR") MAP("nshards","GLM5_NSHARDS") MAP("ep-size","GLM5_EP_SIZE")
+        MAP("real","GLM5_REAL")
+        #undef MAP
+        fprintf(stderr,"glm5_ep_runner: unknown flag --%s (try --help)\n",a);
+    }
+    glm5_apply_numa(numa);
+}
+
+int main(int argc,char**argv){
+    glm5_cli(argc,argv);
     int rc;
     int n_threads=envi("LLM_THREADS",12), n_cmgs=envi("GLM5_CMGS",4);
     int prefill=envi("GLM5_PREFILL",8), maxgen=envi("GLM5_DECODE",16), maxpos=envi("GLM5_MAXPOS",2048);
