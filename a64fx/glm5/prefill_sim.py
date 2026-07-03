@@ -136,11 +136,74 @@ def lever_d(N, S, skew='uniform'):
     t = comp+comm+sync
     return S/t, dict(comp=comp, comm=comm, sync=sync, t=t, rows=rows, gemm_eff=e)
 
+# ================= GEMM-PRECISION COMPUTE MODEL (MEASURED 2026-07-03) =================
+# Complement to the comm-focused levers above. Those anchor the 96n / S=2048 regime where prefill is
+# COMM/SYNC-barrier bound (shared phase 50% = MoE-AR wait). This section models the SMALL-N / large-
+# chunk COMPUTE-bound regime the 2026-07-03 kernel + 12-layer e2e work measured, where the shared-
+# expert + routed-expert GEMMs are the wall and the new int16/int8 SDOT kernels speed them up.
+#
+# MEASURED: decode_sim.GEMM_GOPS (single-node 48t Gop/s by precision x M). 12-layer real-weight e2e
+# (12n, chunked M=64): w8a16 147.83 -> int16 192.65 tok/s = 1.30x; prefill ~94% GEMM (shared 46%,
+# experts 22%, o 12%, qkv 10%, dense 4%; attn 3.5%, router 1.5%). int16 near-lossless (rms 1.5e-5),
+# int8 lossy (rms 4e-3, experts). See CALIBRATION.md "MEASURED A64FX kernel perf".
+# MEASURED per-stage prefill ms/tok (12 layers, 12 nodes, chunked M=64, real weights): the w8a16 base
+# AND the int16 per-stage speedup. The KERNEL ratio is ~2x, but e2e the small-K projections (qkv/o/
+# dense) barely speed up (per-call int16 quant prologue) while the big GEMMs (shared/experts) get
+# ~1.3-1.8x -> the weighted e2e is only 1.30x. This per-stage model reproduces that (unlike a blanket
+# kernel-ratio Amdahl, which over-predicts ~1.9x). int8 per-stage e2e is UNTESTED -> estimated from the
+# kernel ratio, capped at the int16 pattern (marked).
+PREFILL_MS_12L = {  # w8a16 ms/tok @12L,12n,M=64
+    'shared':3.05, 'experts':1.46, 'o_proj':0.82, 'qkv':0.64, 'dense':0.25, 'attn':0.23, 'router':0.10}
+PREFILL_SPEEDUP = {  # per-stage e2e speedup by precision (int16 MEASURED; int8 ESTIMATED*)
+    'w8a16': {k:1.0 for k in PREFILL_MS_12L},
+    'int16': {'shared':1.76,'experts':1.28,'o_proj':1.06,'qkv':0.94,'dense':0.71,'attn':1.0,'router':1.0},
+    'int8':  {'shared':2.4, 'experts':1.6, 'o_proj':1.1, 'qkv':0.95,'dense':0.75,'attn':1.0,'router':1.0}, # *est ~int16 x (int8/int16 kernel)
+}
+E2E_ANCHOR_TOK_S = {'w8a16':147.83, 'int16':192.65}   # measured 12L @12n M=64
+
+def gemm_gops(prec, M):
+    """single-node 48t GEMM Gop/s at token-block M (interpolate the measured decode_sim.GEMM_GOPS)."""
+    tbl = ds.GEMM_GOPS[prec]; ks = sorted(tbl)
+    if M <= ks[0]:  return tbl[ks[0]]*(M/ks[0])
+    if M >= ks[-1]: return tbl[ks[-1]]
+    for a,b in zip(ks, ks[1:]):
+        if a <= M <= b: return tbl[a]+(tbl[b]-tbl[a])*(M-a)/(b-a)
+    return tbl[ks[-1]]
+
+def prefill_prec_toks(prec):
+    """e2e prefill tok/s from the measured per-stage ms/tok / per-stage speedup (reproduces the 1.30x)."""
+    ms = sum(PREFILL_MS_12L[k]/PREFILL_SPEEDUP[prec][k] for k in PREFILL_MS_12L)
+    return 1000.0/ms
+
+def gemm_report():
+    hdr("GEMM-precision compute model (MEASURED kernel Gop/s + per-stage e2e speedup)")
+    print("  single-node 48t GEMM KERNEL Gop/s (group-128) by precision x token-block M:")
+    for p in ('w8a16','int16','int8'):
+        print(f"    {p:6s}: " + "  ".join(f"M{M}={ds.GEMM_GOPS[p][M]}" for M in (8,16,32,64))
+              + f"   (kernel ratio @M64 = {gemm_gops(p,64)/gemm_gops('w8a16',64):.2f}x)")
+    print("  int16 near-lossless (rms 1.5e-5) -> default; int8 lossy (rms 4e-3) -> experts; "
+          "native fp16 NOT worth it (1.23x/0.51x).")
+    hdr("e2e prefill: measured 12L@12n per-stage ms/tok (w8a16) x per-stage speedup")
+    print(f"  {'stage':>8} {'frac%':>6} {'w8a16 ms':>9} {'int16 sp':>9} {'int8 sp*':>9}")
+    tot = sum(PREFILL_MS_12L.values())
+    for k in ('shared','experts','o_proj','qkv','dense','attn','router'):
+        print(f"  {k:>8} {100*PREFILL_MS_12L[k]/tot:>5.1f}% {PREFILL_MS_12L[k]:>9.2f} "
+              f"{PREFILL_SPEEDUP['int16'][k]:>8.2f}x {PREFILL_SPEEDUP['int8'][k]:>8.2f}x")
+    w,i16,i8 = (prefill_prec_toks(p) for p in ('w8a16','int16','int8'))
+    print(f"\n  e2e tok/s @12L,M=64:  w8a16 {w:.1f}   int16 {i16:.1f} ({i16/w:.2f}x)   int8* {i8:.1f} ({i8/w:.2f}x)")
+    print(f"  VALIDATION: model w8a16 {w:.1f} / int16 {i16:.1f} vs MEASURED {E2E_ANCHOR_TOK_S['w8a16']:.1f} / "
+          f"{E2E_ANCHOR_TOK_S['int16']:.1f} tok/s  ({i16/w:.2f}x vs measured {E2E_ANCHOR_TOK_S['int16']/E2E_ANCHOR_TOK_S['w8a16']:.2f}x).")
+    print("  KEY: e2e int16 ~1.3x << the ~2x KERNEL ratio — small-K projections (qkv/o/dense) barely speed")
+    print("       up (per-call int16 quant prologue), only shared/experts do. int8* e2e is ESTIMATED (untested).")
+    print("       Full 78L model: shared+experts are a bigger fraction -> e2e win should exceed the 12L 1.30x.")
+
 # ---------------- report ----------------
 def hdr(s): print("\n"+s+"\n"+"-"*len(s))
 
 if __name__ == "__main__":
     print(__doc__)
+
+    gemm_report()   # MEASURED 2026-07-03 GEMM-precision compute model (the new int16/int8 kernels)
 
     hdr(f"Anchor decomposition (int8, N={AN_N}, S={AN_S}, measured {AN_TOKS} tok/s)")
     toks, br = lever_a(AN_N, AN_S)

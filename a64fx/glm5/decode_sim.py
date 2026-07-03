@@ -26,7 +26,24 @@ MOE_INTER, DENSE_INTER = 2048, 12288
 N_EXP, N_ACT, VOCAB = 256, 8, 154880
 
 # ---------- platform ----------
-BW_NODE = 300e9            # per-node EFFECTIVE matvec HBM bandwidth. qlair/A64FX HBM2 peak=1024 GB/s/node (4 stacks); measured decode-BW bench ~300 matvec / ~770 load. (was 150)
+# MEASURED 2026-07-03 (fapp + streaming kernel bench, node c33-7214c, 48t): NUMA-local (numactl
+# --interleave=all + OMP_PROC_BIND/PLACES, now the landed default) node read-BW ceiling = 739 GB/s;
+# the w8a16 decode matvec ACHIEVES ~336 GB/s effective (M=1, 40960x6144). ⚠ default CMG0 prepage
+# (pre-NUMA-fix) was capped at ~100 GB/s (single-CMG cross-CMG limit) — the old undiagnosed 48t
+# regression. See CALIBRATION.md "MEASURED A64FX kernel perf".
+BW_NODE = 336e9            # per-node EFFECTIVE w8a16 matvec HBM BW, NUMA-local (was 300; CMG0-default ~100e9; load ceiling 739e9)
+
+# ---------- MEASURED compute ceilings (fapp region-profile, 48t, L2-resident microbench = COMPUTE
+# ceiling; real decode is BW-bound above, real prefill is compute-bound so these apply). Gop/s
+# (=2*macs). fapp FP-peak% counts FP ops only -> the SDOT kernels show low FP% (integer svdot pipe)
+# despite 2-4x the throughput; use these wall-clock Gop/s. Imported by prefill_sim.py. ----------
+DECODE_MV_GOPS = {'w8a16': 449.0, 'int16': 431.0}          # M=1 matvec (int16 decode is a net e2e LOSS: BW-bound)
+GEMM_GOPS = {  # prefill GEMM, single-node 48t Gop/s by precision x M (group-128, measured kernel bench)
+    'w8a16': {8:487, 16:692, 32:904, 64:1124},             # int8 w8a16 bf16-tile FMA (26% of f32 FMA peak)
+    'int16': {8:1481, 16:1989, 32:2160, 64:2276},          # int16 svdot_s64, near-lossless (rms 1.5e-5), ~2x
+    'int8':  {8:1869, 16:2600, 32:3060, 64:3175},           # int8 svdot_s32 register-blocked, lossy (rms 4e-3), ~3x
+    'bf16':  {8:487, 16:692, 32:904, 64:1124},              # bf16-widen->f32 (fp16 native NOT worth it: 1.23x/0.51x)
+}
 AR_M1_96 = 0.25            # STALE legacy anchor (kept for the historical decomposition); see REAL_DECODE below.
 
 # ---------- REAL decode anchors (MEASURED, jobs 49419683/684, int8 full model, short ctx, 2026-07-03) ----------
