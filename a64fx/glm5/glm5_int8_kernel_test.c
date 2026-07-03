@@ -184,6 +184,22 @@ int main(void){
     printf("INT16_GEMM N=%d rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 %.2f Gop/s, speedup=%.2fx)\n",
            gemm_n,gemm_rows,cols,gs,s16_maxrel,sqrt(s16_sse/(s16_sref+1e-30)),t16,gops/t16/1e9,gops/tg_best/1e9,tg_best/t16);
 
+    /* register-blocked int8 w8a8 GEMM (glm5_gemm_int8sdot_rb): fastest but lossy vs w8a16 Yr. */
+    float *Y8r=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
+    if(!Y8r) return 2;
+    glm5_gemm_int8sdot_rb(&gm,Y8r,W,S,gs,Xg,check_n,check_rows,cols);
+    double s8_sse=0,s8_sref=0;
+    for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
+        double ref=Yr[(size_t)t*gemm_rows+r], dd=ref-(double)Y8r[(size_t)t*check_rows+r]; s8_sse+=dd*dd; s8_sref+=ref*ref;
+    }
+    double t8r=1e30;
+    for(int it=0;it<reps;it++){
+        t0=wall_sec(); glm5_gemm_int8sdot_rb(&gm,Y8r,W,S,gs,Xg,gemm_n,gemm_rows,cols);
+        double tt=wall_sec()-t0; if(tt<t8r)t8r=tt;
+    }
+    printf("INT8_RB_GEMM N=%d rows=%d cols=%d gs=%d rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 %.2f Gop/s, speedup=%.2fx)\n",
+           gemm_n,gemm_rows,cols,gs,sqrt(s8_sse/(s8_sref+1e-30)),t8r,gops/t8r/1e9,gops/tg_best/1e9,tg_best/t8r);
+
     /* M=1 w8a8 SDOT MATVEC (the decode lever): glm5_mv_int8_sdot vs the w8a16 8row matvec (yo). */
     float *ymv=(float*)glm5_amalloc((size_t)rows*4);
     if(!ymv) return 2;
