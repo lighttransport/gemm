@@ -2160,6 +2160,10 @@ static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const
          * and REGRESSED, so default MINK=0 = no gate). GLM5_GEMM_SDOT_MINK stays as a tuning override. */
         if(gsd==2 && N>1 && cols>=mink){ glm5_gemm_int16sdot(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols); return; }
         if(gsd==1 && N>1){ glm5_gemm_int8sdot_rb(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,X,N,rows,cols); return; }  /* register-blocked int8 w8a8 (fastest, lossy) */
+        /* NB: a mixed mode (int8 w8a8 experts + int16 dense) was tested and gave ZERO e2e gain — the
+         * experts are HBM-BW-bound in the runner (22 owned experts stream ≫L2 from HBM); int8 and int16
+         * read the SAME int8 weight bytes, so int8's higher COMPUTE density (a win only in the L2-resident
+         * kernel bench) buys nothing when memory-bound. Not worth the lossy-experts risk. */
         /* w8a8 sdot wins only for per-channel tensors (routed experts: 1.77x); for group-128 it
          * loses to the tuned w8a16 bf16-FMA kernel. AUTO-enable it for the experts only in the
          * large-chunk prefill regime (chunk >= GLM5_INT8_SDOT_MIN, default 1024 tokens) where the
