@@ -91,4 +91,47 @@ run_arm D 1 1 2     # batched decode + NUMA + int16 SDOT (full stack)
 
 echo "--- token-stream identity (A ref; B must MATCH; C int8 will DIFFER; E int16 should MATCH/near) ---"
 for X in B C E D; do for f in "$WORK"/A_*.txt; do o="$WORK/${X}_${f##*/A_}"; [ -f "$o" ] && { cmp -s "$f" "$o" || echo "TOKEN DIFF A vs $X: ${f##*/A_}"; }; done; done
+
+# ===== Step 2: int16 SDOT ACCURACY — logit cosine A/B on the FULL 78L model (the certifying metric) =====
+# Prefill-only teacher-forcing, replicated head (GLM5_TP_HEAD=0 so a full logit vector exists; the
+# head is bf16 and untouched by SDOT). Real prompt = first agentic prompt (real token distribution ->
+# realistic activation outliers). Compares int16(mode2) AND int8(mode1) vs the w8a16 ref.
+echo "--- Step 2: logit A/B (full model, real prompt) $(date) ---"
+head -1 "$PROMPTS" > "$WORK/prompt.ids"; NPOS=$(wc -w < "$WORK/prompt.ids")
+LOGENV="OMP_PROC_BIND=close OMP_PLACES=cores GLM5_REAL=1 GLM5_LAYERS=$NL GLM5_TP=1 GLM5_TP_HEAD=0 \
+  GLM5_PROMPT_IDS=$WORK/prompt.ids GLM5_PREFILL_ONLY=1"
+: > "$WORK/lg.err"
+for lt in ref:0 int16:2 int8:1; do tag=${lt%:*} sd=${lt#*:}
+  echo "-- logit dump $tag (SDOT=$sd) --"; rm -f "$WORK/logit_$tag.bin"
+  env $LOGENV GLM5_MV_SDOT=$sd GLM5_LOGIT_DUMP="$WORK/logit_$tag.bin" \
+    mpiexec -np "$NP" numactl --interleave=all "$LLM/build/glm5_ep_runner" 2>>"$WORK/lg.err" \
+    | grep -hE 'NaN|prompt=|prefill' | head -2
+done
+echo "======================= LOGIT A/B (int16 & int8 vs w8a16 ref) ======================="
+python3 - "$WORK/logit_ref.bin" "$WORK/logit_int16.bin" "$WORK/logit_int8.bin" "$NPOS" <<'PY'
+import sys,struct,math
+ref,i16,i8,npos=sys.argv[1],sys.argv[2],sys.argv[3],int(sys.argv[4])
+def load(f):
+    try: d=open(f,'rb').read()
+    except: return None
+    n=len(d)//4; return struct.unpack('<%df'%n,d) if n else None
+R=load(ref)
+if not R: print("EMPTY ref dump — check GLM5_TP_HEAD=0 / GLM5_LOGIT_DUMP"); sys.exit()
+vocab=len(R)//npos
+def cmp(name,X):
+    if not X: print(f"{name}: EMPTY"); return
+    nn=min(len(R),len(X))//vocab; cs=rs=0.0; t1=t5=0
+    for p in range(nn):
+        a=R[p*vocab:(p+1)*vocab]; b=X[p*vocab:(p+1)*vocab]
+        dot=sum(x*y for x,y in zip(a,b)); na=math.sqrt(sum(x*x for x in a)); nb=math.sqrt(sum(y*y for y in b))
+        cs+=dot/(na*nb+1e-30); rs+=math.sqrt(sum((x-y)**2 for x,y in zip(a,b)))/(na+1e-30)
+        ia=max(range(vocab),key=lambda i:a[i]); ib=max(range(vocab),key=lambda i:b[i]); t1+=ia==ib
+        t5+= ib in sorted(range(vocab),key=lambda i:a[i],reverse=True)[:5]
+    print(f"{name}: steps={nn} vocab={vocab}  cosine={cs/nn:.6f}  rms_rel={rs/nn:.4f}  "
+          f"top1={t1}/{nn} ({100*t1/nn:.1f}%)  top1_in_ref_top5={100*t5/nn:.1f}%")
+print(f"npos={npos} vocab={vocab}")
+cmp("int16(mode2)",load(i16))
+cmp("int8 (mode1)",load(i8))
+print("PASS int16 if cosine>=0.999 AND top1>=99%")
+PY
 echo "SENTINEL glm5_cbatch_int8_numa_${NP}n=done"; date
