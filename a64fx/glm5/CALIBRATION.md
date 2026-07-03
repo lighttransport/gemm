@@ -88,8 +88,58 @@ a real-weight M>1 A/B at 96n stays on the job-validation list).
   synthetic layer count (8 MoE-ish ARs/token) and N=8 — predicted ratio ≈
   `pred_tok_s(8, M=8) / (8 * pred_tok_s(8, 1))` with the ARPROBE-recalibrated constants.
 
+## MEASURED A64FX kernel perf (fapp + wall-clock, 2026-07-03, node c33-7214c)
+
+Actual on-hardware numbers for the decode matvec, prefill GEMM, and comm kernels — the ground truth
+the `decode_sim.py` (python) and qlair (cycle) sims should reproduce. Tool: `a64fx/glm5/glm5_kern_prof.c`
+(fapp `fapp_start/stop` regions) profiled via `fapp -C -Hevent=statistics` → `fapp -A -ttext` (GFLOPS,
+FP-peak%, mem GB/s, mem-peak% per region); comm from the ARPROBE campaign. Run at 48t, correct NUMA
+(`XOS_MMM_L_PAGING_POLICY=demand:demand:demand OMP_PROC_BIND=close OMP_PLACES=cores`).
+
+### Compute kernels (rows=8192 cols=6144 gs=128; wall-clock Gop/s is authoritative)
+| kernel | wall Gop/s | fapp FP-peak% | fapp mem GB/s | mem-peak% |
+|---|---|---|---|---|
+| decode w8a16 matvec (M=1) | 449 | 19.5% | 5.5 | 0.54% |
+| decode int16 SDOT (M=1)   | 431 | 0.97% | 5.2 | 0.51% |
+| prefill w8a16 GEMM (M=64) | 1095 | **26.2%** | 0.16 | 0.015% |
+| prefill int16 SDOT (M=64) | 2234 | 4.6% | 0.46 | 0.04% |
+| prefill int8-rb SDOT (M=64)| 2005 | 8.4% | 0.41 | 0.04% |
+
+**Two interpretation traps the sims must respect:**
+1. **fapp "GFLOPS / FP-peak%" counts FLOATING-POINT ops only.** The int16/int8 SDOT kernels use
+   `svdot` on the INTEGER pipe → they show ~1–8% FP-peak despite being 2× the throughput of the FP
+   w8a16 path. So the FP-peak% ranks kernels by *FP content*, not speed — use the **wall-clock Gop/s**
+   for the SDOT kernels, and the FP-peak% only for the FP (w8a16 / bf16) path. The w8a16 prefill GEMM
+   hits **26% of the f32 FMA peak** (the FP-GEMM ceiling on A64FX for this shape); the int SDOT kernels
+   move the same work onto the integer `svdot` pipe (int16 svdot_s64 = 2× f32 density, int8 svdot_s32 =
+   4×) → ~2× (int16) / ~2–4× (int8-rb) the w8a16 Gop/s. This is why decode's int16 SDOT is a *loss*
+   (M=1 memory-bound, no compute advantage to exploit) but prefill's is a 2–4× *win* (M≥8 compute-bound).
+2. **This microbench is L2-RESIDENT, not HBM-streaming** (mem-peak% 0.01–0.5%): each thread re-reads its
+   own ~1 MB weight slice across reps → cache-resident. So these Gop/s are the **compute ceiling**, NOT
+   the real serving rate. The REAL decode streams the whole model (≫ cache) from HBM → it is
+   **BW-bound**: measured node read BW = **100 GB/s single-CMG (default prepage) → 739 GB/s NUMA-local**
+   (numactl --interleave=all + pin). Prefill reuses weights M× → less BW-bound (int16 GEMM NUMA
+   crossover: 1.26× @M=8 → 1.01× @M=64). ⇒ `decode_sim.BW_NODE` should use the **739 GB/s NUMA-local**
+   figure (not 300e9); the decode compute term is BW-bound, the prefill term compute-bound.
+
+### Comm kernel (tp_allreduce, hidden=6144 f32 = 24 KB, from ARPROBE)
+- **Bare tp_allreduce (tight loop): ~0.08 ms @12n, ~0.14 ms @96n** (NOT the fictional 26 ms the pre-job
+  sim back-solved — ~180× cheaper). Raw ARPROBE @N=2 M=1 bytes=24576: `us_per_ar=51.9`.
+- **Effective in-decode: ~0.66 ms @12n** (~8× the tight-loop) — the gap is **straggler-sync** (ranks
+  reach the AR at different times after uneven expert compute), NOT the AR primitive. Comm is
+  **~30–37% of the decode token**; compute ~65% (attention-dominated). `decode_sim`: UTOFU_ROUND ≈ the
+  0.08–0.14 ms bare AR; multiply by a ~5–8× straggler factor for the effective in-decode comm term
+  (lean-AR / robust=2 is worthless — the cost is straggler-sync, not the completion path).
+
+### qlair (cycle sim) calibration notes
+- qlair cycle-mode is **FP-latency accurate** (the dot4/axpy story) but the fapp data here shows the
+  hot kernels are now **integer `svdot`** (decode/prefill SDOT) and **HBM-BW-bound** (real decode) —
+  regimes qlair models poorly (memory model misses store-buffer/BW effects; see K0 calibration where
+  qlair mis-ranked the memory-bound axpy 1.03× vs native 1.93×). ⇒ **anchor qlair only for the FP
+  compute-bound kernels; use these native fapp Gop/s + the 739 GB/s BW for the SDOT/decode paths.**
+
 ## After calibration
 
-Update `decode_sim.py` constants (BW_NODE, UTOFU_ROUND/INIT via `recalibrate()` defaults or
-inline), re-run the report, and refresh the lever stack in BATCHED_DECODE_PLAN.md /
-the job-validation list with the re-anchored predictions.
+Update `decode_sim.py` constants (BW_NODE := **739e9** NUMA-local, UTOFU_ROUND := ~0.1e-3 bare AR ×
+straggler factor via `recalibrate()` defaults or inline), re-run the report, and refresh the lever stack
+in BATCHED_DECODE_PLAN.md / the job-validation list with the re-anchored predictions.
