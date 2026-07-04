@@ -21,7 +21,7 @@
 #PJM -j
 set -u
 REPO=/home/u14346/work/gemm/glm5-1
-LLM="$REPO/a64fx/llm"; M3="$REPO/a64fx/m3"
+LLM="$REPO/a64fx/llm"; M3="$REPO/a64fx/m3"; UTOFU="$REPO/a64fx/utofu-tests"
 cd "$M3" || exit 2
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
 # small synthetic that fits 1 node (1 rank owns ALL experts): 12 layers / 16 experts. TP off (1 rank).
@@ -30,12 +30,21 @@ export M3_MAXPOS=${M3_MAXPOS:-1024} M3_DECODE=${M3_DECODE:-32}
 export OMP_NUM_THREADS=12 LLM_THREADS=12
 
 echo "=== M3 bf16 KV x high-M enabler 1n (12L/16E synth): job=${PJM_JOBID:-?} $(date) ==="
+make -C "$UTOFU" tofu_topo_helper >/dev/null || exit 3
 make -C "$LLM" m3_ep_runner CC=fcc OPENMP=1 >/dev/null || exit 3
+# the runner read_topo()s tofu_topo.txt and exit(1)s without it — generate it even for 1 rank
+rm -f tofu_topo.txt
+mpiexec -np 1 "$UTOFU/tofu_topo_helper" || { echo "FATAL topo"; exit 3; }
+echo "topo lines: $(wc -l < tofu_topo.txt 2>/dev/null)"
 
 run_pass(){  # $1=M  $2=label  $3=int4flag(0/1)
   echo "=== M=$1 KV=$2 ($(date)) ==="
-  M3_MSTREAM=$1 M3_INT4_KV=$3 mpiexec -np 1 "$LLM/build/m3_ep_runner" \
-    2>&1 | grep -iE "arena|decode:|MSTREAM|AGG|per-stream|NaN|FATAL" | sed "s/^/[M=$1 KV=$2] /" || echo "[M=$1 KV=$2] pass failed"
+  rm -f m3_ep_rank00.txt m3_ep_load_rank00.txt
+  # the runner writes perf to m3_ep_rank00.txt and arena to m3_ep_load_rank00.txt (NOT stdout)
+  M3_MSTREAM=$1 M3_INT4_KV=$3 mpiexec -np 1 "$LLM/build/m3_ep_runner" > "pass_${1}_${2}.log" 2>&1 \
+    || echo "[M=$1 KV=$2] runner rc=$?"
+  grep -iE "arena|decode:|prefill:|MSTREAM|AGG|per-stream|NaN|cannot open|FATAL|Error" \
+    m3_ep_load_rank00.txt m3_ep_rank00.txt "pass_${1}_${2}.log" 2>/dev/null | sed "s/^/[M=$1 KV=$2] /"
 }
 for M in 8 32 64; do
   run_pass "$M" bf16 0
