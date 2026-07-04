@@ -57,6 +57,16 @@ def weight_floor(usable_gb=USABLE_GB):
     """Fewest nodes for the weights alone (KV=0)."""
     return math.ceil(EXPERTS_GB / (usable_gb - REPLICATED_GB))
 
+def max_ctx(N, M=1, kvb=2, cp=False, usable_gb=USABLE_GB):
+    """Longest context (prompt+gen) that fits on N nodes. cp=False = KV replicated (ds4f attn is
+    replicated), which is the case for the interactive agentic config at 11n."""
+    budget = usable_gb - weights_gb_per_node(N)
+    if budget <= 0:
+        return 0
+    per_tok = N_LAYERS * KVC * kvb * M / 1e9          # GB per context token (all layers, M streams)
+    denom = per_tok / N if cp else per_tok
+    return int(budget / denom)
+
 if __name__ == "__main__":
     K = 1024
     print("DeepSeek-V4-Flash (ds4f) minimal-node sizing")
@@ -90,3 +100,11 @@ if __name__ == "__main__":
     print("  decode-opt  -> run AT the floor (~11n); NUMA (DS4F_NUMA=1) ~1.40x -> target ~14 tok/s")
     print("  prefill-opt -> run ABOVE the floor (extra ranks = attention/expert-GEMM parallelism)")
     print("  serve       -> pinned by persistent KV; DS4F_CP for ctx>=512k, DS4F_INT8_KV cuts ~1/3 nodes")
+    print()
+    print("AGENTIC CODING (12-node interactive alloc = 11 EP; --preset decode, NUMA on):")
+    print(f"  context ceiling @11 EP (prompt+gen, KV replicated) — MLA-KV upper bound;")
+    print(f"  keep ~20% headroom for the Tier-B2 indexer cache (ds4f.md uses the conservative figure):")
+    print(f"    bf16 KV (KVBITS=16): {max_ctx(11, kvb=2)//1024:>4}k max  (~64k recommended)")
+    print(f"    int8 KV (KVBITS=8) : {max_ctx(11, kvb=1)//1024:>4}k max  (~128k recommended)")
+    print(f"    DS4F_CP=1 (sharded): {max_ctx(11, kvb=2, cp=True)//1024:>4}k max  (512k+ recommended)")
+    print(f"  launcher: run_ds4f_agentic_11n.sh (PROMPT_FILE=task.txt [KVBITS=8])")

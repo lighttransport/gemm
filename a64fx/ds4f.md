@@ -111,6 +111,34 @@ min-nodes table above for the target (ctx, M). `DS4F_CP=1` (context-parallel KV)
 ctx ≥ 512k; `DS4F_INT8_KV=1` cuts ~⅓ of the nodes; `--mtp 1` (speculative decode, α≈76%) amortizes the
 per-layer straggler-sync 1/K. Example: 512k / M=8 → 20n (15n with int8-KV).
 
+### Agentic-coding config (12-node interactive alloc = 11 EP)
+
+The flagship interactive target: one `pjsub` **12-node** interactive alloc (shape 2×3×2), 1 node
+reserved for the claude/login control process → **11 EP nodes**. Real weights, the quality-preserving
+decode bundle, NUMA on, sized to fit. Launcher: **`run_ds4f_agentic_11n.sh`** (wraps
+`run_ds4f_gen_11n.sh`).
+
+```sh
+# inside the live 12-node alloc, from a64fx/llm:
+./run_ds4f_stage_11n.sh                                   # 1. stage once (~22.7 GB/node)
+PROMPT_FILE=task.txt ./run_ds4f_agentic_11n.sh            # 2. agentic coding run (<=64k ctx)
+PROMPT_FILE=task.txt KVBITS=8 MAX_NEW=1024 ./run_ds4f_agentic_11n.sh   # up to 128k ctx (int8 KV)
+```
+
+Config = `DS4F_REAL=1` + decode bundle (`FP8_BF16 Q8_DENSE TIERB2 MHC HC_PAR HC_RMSPAR`, ==
+`--preset decode`) + `DS4F_NUMA=1`. **Context ceiling @11 EP** (weights 22.7 GB/node, ≤27 usable;
+context = prompt + generated tokens, KV replicated since ds4f attention is replicated):
+
+| KV mode | knob | max context (prompt+gen) | per-node @ceiling |
+|---|---|---|---|
+| bf16 (default) | `KVBITS=16` | **~64k tokens** | 26.0 GB |
+| int8 | `KVBITS=8` (`DS4F_INT8_KV=1`) | **~128k tokens** | 26.0 GB |
+| context-parallel | `DS4F_CP=1` | **512k+** | 25.1 GB @512k |
+
+Expected decode ≈ **12.8 tok/s** (WS1/WS1b landed) → **~14 tok/s** with the NUMA lever, degrading at
+longer context as attention + tb2prep grow per-position. Last real-weight validation: `rc=0`, NaNs=0,
+lockstep argmax, prefill 10.44 / decode 10.16 tok/s (pre-NUMA/pre-WS1) — see "Validated result".
+
 **Larger sibling.** V4-Pro (`ds4p`: 61 L / hidden 7168 / 384 experts, ~805 GB) is a separate, much
 bigger config (weight floor ~54n+) with its own harness — the numbers here are V4-Flash only.
 
