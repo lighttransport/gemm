@@ -60,6 +60,25 @@ the gen launchers.
 
 ## Results
 
+### P1 — mstream × AR (job 49441386, 48n, full-60L synth bf16, max_pos=1024, 32 steps) — DONE
+| M | AR | AGG tok/s | comm% | out0 |
+|---|---|---|---|---|
+| 8  | f32  | 12.89 | 31.6% | 2847 |
+| 16 | f32  | 13.96 | 25.7% | 3967 |
+| 32 | f32  | **16.15** | 28.7% | 694 |
+| 8  | bf16 | 13.19 | 29.2% | 2847 |
+| 16 | bf16 | 14.29 | 24.5% | 3967 |
+| 32 | bf16 | **16.68** | 26.0% | 694 |
+
+- **Batching scales past N=8** at real node counts: +25% M=8→32 (f32), still climbing at M=32 (the
+  1-node P2 plateaued ~17.6 only because it had no comm; at 48n the per-layer reduce amortizes with M).
+- **bf16-AR (`TP_AR_BF16=1`) is a free +2–3%** at every M, **out0 bit-identical** to f32-AR (lockstep
+  holds, no argmax flip on synth).
+- **NEW BEST: M=32 + bf16-AR = 16.68 tok/s aggregate @48n** vs prior ~14.2 @N=8 → **+17%**. arena 21.53
+  GB (weight only; per-stream KV not in the metric — M=32 fit with no OOM; M>32 headroom uncharacterized).
+- **Next:** a P1b (M=48/64 @48n, bf16-AR) would find the true plateau (compute ceiling ~17.6 from P2),
+  but needs the int4-KV memory question (P2 caveat) settled first if M=64 KV overflows.
+
 ### P2 — int4-KV high-M (job 49441305, 1n, 12L/16E synth, max_pos=1024) — DONE
 (First submit 49441301 failed: the runner `read_topo()` exit(1)s without `tofu_topo.txt`, and the
 1-node template skipped the topo helper; also perf goes to the rank files, not stdout. Fixed in
