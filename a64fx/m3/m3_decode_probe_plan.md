@@ -57,3 +57,25 @@ bf16 model to `/local/m3` @ 48n, gen the coherence prompt. Confirms real-weight 
 Keep concurrency ≤2 jobs. Fold results back into `m3.md` (the decode-roofline bullets) and, if a new
 best config emerges, update the recommended serving config there and in `pjsub_m3_mxfp8_gen_24n.sh` /
 the gen launchers.
+
+## Results
+
+### P2 — int4-KV high-M (job 49441305, 1n, 12L/16E synth, max_pos=1024) — DONE
+(First submit 49441301 failed: the runner `read_topo()` exit(1)s without `tofu_topo.txt`, and the
+1-node template skipped the topo helper; also perf goes to the rank files, not stdout. Fixed in
+`e9354b13`.)
+
+| M | KV | AGG tok/s | per-stream | out0 | arena_used |
+|---|---|---|---|---|---|
+| 8 | bf16 / int4 | 15.76 / 15.82 | 1.97 | 138162 (both) | 26.27 / 26.25 GB |
+| 32 | bf16 / int4 | 17.11 / 17.08 | 0.53 | 177681 (both) | 26.27 / 26.25 GB |
+| 64 | bf16 / int4 | 17.59 / 17.60 | 0.27 | 28337 (both) | 26.27 / 26.25 GB |
+
+- **int4-KV is free** (tok/s identical, NaN=0). **Batching plateaus on compute** (no comm at 1n):
+  +8.6% M=8→32, +2.8% M=32→64 → sweep M≤32 (as P1 is written).
+- **CAVEATS:** (1) `arena_used` is the WEIGHT arena only — per-stream KV is allocated separately and
+  not reported, so the int4-KV **memory saving was NOT measured** (rely on P1 MemFree @48n).
+  (2) int4-KV out0 was **bit-identical** to bf16 → likely **not engaging on the batched/mstream
+  path** (single-stream KV-quality probe does see int4 diffs on real weights). **Verify int4-KV
+  actually changes the batch-decode output before treating it as the high-M memory enabler** — else
+  P1's high-M passes must fit with bf16-KV (more nodes / shorter max_pos) or int4-KV needs wiring.
