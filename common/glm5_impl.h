@@ -954,14 +954,18 @@ static void glm5_alloc_scratch(glm5_model*m,int hrows){
         local_heads=m->layers[0].qh1-m->layers[0].qh0;
         if(local_heads<1) local_heads=1;
     }
+    /* Attention scratch sized for FULL n_heads, not local_heads: the (optional) MTP draft block is
+     * loaded REPLICATED (all heads on every rank) so its forward writes n_heads worth of per-head
+     * scratch. Main layers use nown=local_heads<=n_heads -> fits. Cost ~+0.9MB/rank (negligible). */
+    int sh_heads=cfg->n_heads;
     m->s_norm=glm5_amalloc(H*4); m->s_q=glm5_amalloc(QD*4); m->s_k=glm5_amalloc(KVC*4); m->s_v=glm5_amalloc(AD*4);
-    m->s_kvb=glm5_amalloc((size_t)local_heads*(cfg->qk_nope_dim+cfg->v_head_dim)*4);
-    m->s_qabs=glm5_amalloc((size_t)local_heads*cfg->kv_lora*4);
-    m->s_ctx=glm5_amalloc((size_t)local_heads*cfg->kv_lora*4);
+    m->s_kvb=glm5_amalloc((size_t)sh_heads*(cfg->qk_nope_dim+cfg->v_head_dim)*4);
+    m->s_qabs=glm5_amalloc((size_t)sh_heads*cfg->kv_lora*4);
+    m->s_ctx=glm5_amalloc((size_t)sh_heads*cfg->kv_lora*4);
     m->s_attn=glm5_amalloc(AD*4); m->s_o=glm5_amalloc(H*4);
     m->s_idx_q=glm5_amalloc((size_t)IQD*4); m->s_idx_k=glm5_amalloc((size_t)ID*4);
     m->s_blk_score=glm5_amalloc((size_t)cfg->max_pos*4); m->s_blk_sel=glm5_amalloc((size_t)cfg->max_pos*sizeof(int));
-    m->s_attn_score=glm5_amalloc((size_t)cfg->max_pos*local_heads*4);
+    m->s_attn_score=glm5_amalloc((size_t)cfg->max_pos*sh_heads*4);
     m->s_router=glm5_amalloc((size_t)cfg->n_experts*4); m->s_shg=glm5_amalloc(cfg->moe_inter*4); m->s_shu=glm5_amalloc(cfg->moe_inter*4);
     m->s_sh=glm5_amalloc(H*4); m->s_moe=glm5_amalloc(H*4); m->s_exg=glm5_amalloc(cfg->moe_inter*4); m->s_exu=glm5_amalloc(cfg->moe_inter*4); m->s_route=glm5_amalloc(H*4);
     m->s_ff_g=glm5_amalloc(cfg->dense_inter*4); m->s_ff_u=glm5_amalloc(cfg->dense_inter*4); m->s_ff=glm5_amalloc(H*4);
@@ -1232,9 +1236,15 @@ static void glm5_load_one_layer(glm5_model*m, glm5_layer*L, int l, int is_moe, i
 static int glm5_load_mtp_real(glm5_model*m, glm5_ent*es, int n, const uint8_t*base,
     int qh0,int qh1,int qrows,int arows,int sh_r0,int sh_rows,size_t*used){
     const glm5_config*cfg=&m->cfg; const int H=cfg->hidden; int ok=1, L78=cfg->n_layers; /* = 78 */
+    /* Load the MTP draft block REPLICATED (no TP col-shard). The MTP layer's o_proj and
+     * shared_experts.down_proj are PER-CHANNEL int8 (scale ng=1 -> gs=cols), which the col-shard path
+     * rejects (nc%gs != 0). It's a small draft head, so replicating attn+shared (full arows/sh_rows,
+     * qh0=0) is fine and means the draft forward needs no o_proj all-reduce; routed experts stay
+     * EP-sharded via glm5_load_one_layer's e%ep_size ownership. (Ignore the caller's TP-shard params.) */
+    (void)qh0;(void)qh1;(void)qrows;(void)arows;(void)sh_r0;(void)sh_rows;
     m->mtp_layer=glm5_acalloc(1,sizeof(glm5_layer));
     glm5_load_one_layer(m,m->mtp_layer,L78,/*is_moe*/1,/*has_idx*/1,es,n,base,
-                        qh0,qh1,qrows,arows,sh_r0,sh_rows,0,0,&ok,used);
+                        0,cfg->n_heads,glm5_q_dim(cfg),glm5_attn_dim(cfg),0,cfg->moe_inter,0,0,&ok,used);
     char nb[512];
     #define MREQ(suf) ({ snprintf(nb,sizeof nb,"model.layers.%d." suf,L78); glm5_ent*_e=glm5_req(es,n,nb); if(!_e) ok=0; _e; })
     { glm5_ent*e=MREQ("enorm.weight");            if(e) m->mtp_enorm=glm5_cp_full(base,e); }

@@ -178,6 +178,39 @@ int main(void){
         double el=now_sec()-t0; double gb=(b_dense+b_expert)/1e9;
         printf("  [p%d] shard %2d/%d  kept %4d  cum %5.1f GB  %5.1f s  %5.2f GB/s\n",pass,s,nsh,kept,gb,el,el>0?gb/el:0.0); fflush(stdout);
       }
+      /* MTP block (checkpoint layer 78) lives in mtp-*.safetensors, NOT model-*.safetensors, so the
+       * shard loop above never sees it. Stage it (FP8/int8 source pass only) when GLM5_STAGE_LAYERS>78
+       * (=79). Tensor names are already "model.layers.78.*", so the same classify() applies: EP-shard
+       * the routed experts (e%ep_size==rank), keep the dense/fusion tensors (enorm/hnorm/eh_proj/
+       * input_layernorm/shared_head.norm/attn/shared) on every rank -> glm5_load_mtp_real finds them. */
+      if(pass==0 && envi("GLM5_STAGE_LAYERS",78)>78){
+        int mtp_nsh=envi("GLM5_MTP_NSHARDS",4);
+        for(int s=1;s<=mtp_nsh;s++){
+          char shard[1200]; snprintf(shard,sizeof shard,"%s/mtp-%05d-of-%05d.safetensors",mdir,s,mtp_nsh);
+          st_context*st=safetensors_open(shard);
+          if(!st){ fprintf(stderr,"glm5_stage: skip unreadable MTP shard %s\n",shard); continue; }
+          int kept=0;
+          for(int i=0;i<st->n_tensors;i++){
+              const char*name=st->tensors[i].name; int cls=classify(name,rank,ep_size,pass);
+              if(cls==CLS_SKIP) continue;
+              size_t nb=st->tensors[i].nbytes;
+              uint64_t aligned=(off+(ALIGN-1))&~(uint64_t)(ALIGN-1);
+              if(aligned!=off && lseek(bfd,(off_t)aligned,SEEK_SET)<0){ fprintf(stderr,"glm5_stage: lseek: %s\n",strerror(errno)); goto fail; }
+              if(write_all(bfd,safetensors_data(st,i),nb)!=0){ fprintf(stderr,"glm5_stage: write %s: %s\n",name,strerror(errno)); goto fail; }
+              st_tensor_info*t=&st->tensors[i];
+              fprintf(mf,"%llu %zu %s %d",(unsigned long long)aligned,nb,t->dtype_str,t->n_dims);
+              for(int d=0;d<t->n_dims;d++) fprintf(mf," %llu",(unsigned long long)t->shape[d]);
+              fprintf(mf," %s\n",name);
+              off=aligned+nb;
+              if(cls==CLS_EXPERT){ n_expert++; b_expert+=nb; } else { n_dense++; b_dense+=nb; }
+              kept++;
+              if(off-last_sync>=flush_bytes){ fdatasync(bfd); posix_fadvise(bfd,0,0,POSIX_FADV_DONTNEED); last_sync=off; }
+          }
+          madvise(st->map_base,st->map_size,MADV_DONTNEED);
+          safetensors_close(st);
+          printf("  [p%d] MTP shard %d/%d  kept %4d (layer 78)\n",pass,s,mtp_nsh,kept); fflush(stdout);
+        }
+      }
     }
     double tel=now_sec()-t0; long long n_total=n_dense+n_expert; uint64_t b_total=b_dense+b_expert;
     fseek(mf,hdr_pos,SEEK_SET);
