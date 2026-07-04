@@ -44,8 +44,9 @@ for t in 1 2 3 4 5; do rm -f tofu_topo.txt
 run_pass(){  # $1=M  $2=AR_bf16
   export M3_MSTREAM=$1 TP_AR_BF16=$2
   echo "=== M=$1 AR_bf16=$2 ($(date)) ==="
+  rm -f m3_ep_rank00.txt m3_ep_load_rank00.txt    # so a failed pass shows empty, not stale numbers
   mpiexec -np "$NP" "$LLM/build/m3_ep_runner" || { echo "[M=$1 AR=$2] FATAL (OOM at high M? -> P2 int4-KV)"; return 0; }
-  grep -iE "decode:|MSTREAM|AGG|per-stream|comm|arena|argmax|NaN" m3_ep_rank00.txt | sed "s/^/[M=$1 AR=$2] /"
+  grep -iE "decode:|MSTREAM|AGG|per-stream|comm|arena|argmax|NaN" m3_ep_load_rank00.txt m3_ep_rank00.txt | sed "s/^/[M=$1 AR=$2] /"
 }
 # f32-AR: does mstream scale past 8?
 run_pass 8  0
