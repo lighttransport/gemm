@@ -54,6 +54,12 @@ fi
 # ---- forward harness knobs to the ranks (mpiexec forwards EXPORTED env only) ----
 export LLM_THREADS=${LLM_THREADS:-48}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$LLM_THREADS}
+# NUMA lever (~1.40x bit-identical decode): the runner interleaves its arena across all CMGs in-process
+# (ds4f_apply_numa, default DS4F_NUMA=1); OMP thread affinity is read at runtime init so it MUST be set
+# at launch here. DS4F_NUMA=0 disables the interleave half for an A/B.
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+export OMP_PLACES=${OMP_PLACES:-cores}
+export DS4F_NUMA=${DS4F_NUMA:-1}
 export DS4F_CMGS=${DS4F_CMGS:-4}
 export DS4F_PREFILL=${DS4F_PREFILL:-8}
 # DS4F_PREFILL_BATCH=M_TILE>0 runs prefill as M-token GEMM tiles (needs EXACT+FP8_BF16).

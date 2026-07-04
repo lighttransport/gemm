@@ -35,6 +35,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <utofu.h>
 
 #include "ds4f.h"
@@ -209,7 +210,78 @@ static void ep_armax_callback(float *buf, int count, void *ctx) {
     g_ar_secs += now_sec() - t0; g_ar_calls++;
 }
 
-int main(void) {
+/* ---- CLI front-end: map --flags to the existing DS4F_* env config, so the runner is driven by
+ * command-line args instead of `export` soup. Named flags cover the common knobs; `--set K=V` reaches
+ * any DS4F_* var. Parsed FIRST in main (before any envi()/getenv() read) via setenv, so the existing
+ * config sites are untouched and no-args behavior is byte-identical (backward compatible). Ported from
+ * glm5_ep_runner.c's glm5_cli/glm5_apply_numa (model-agnostic). */
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+/* NUMA-local weight placement (the measured 1.40x e2e, bit-identical lever): interleave THIS process's
+ * future allocations across all CMGs -- in-process equivalent of `numactl --interleave=all`. ds4f decode
+ * is fp8-stream memory-bound (same regime as glm5), so it benefits identically. OMP thread affinity is
+ * read by the runtime at init, so the launch script still exports OMP_PROC_BIND=close / OMP_PLACES=cores
+ * (best-effort setenv here as a fallback). Default ON via DS4F_NUMA. */
+static void ds4f_apply_numa(int on){
+    if(!on) return;
+    unsigned long nodemask=~0UL;                 /* all NUMA nodes */
+    syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &nodemask, (unsigned long)(8*sizeof nodemask));
+    setenv("OMP_PROC_BIND","close",0);           /* 0 = don't override if the script already set it */
+    setenv("OMP_PLACES","cores",0);
+    fprintf(stderr,"NUMA interleave on (MPOL_INTERLEAVE all-CMG; OMP_PROC_BIND=close/OMP_PLACES=cores)\n");
+}
+static void ds4f_cli_usage(void){
+    fprintf(stderr,
+      "ds4f_ep_runner [--flags]  (DeepSeek-V4-Flash; all map to DS4F_* env; env still works as fallback)\n"
+      "  --numa[=0|1]        NUMA-interleave weights (default ON; the 1.40x bit-identical decode lever)\n"
+      "  --preset decode     bundle: FP8_BF16+Q8_DENSE+HC_PAR+HC_RMSPAR+TIERB2+MHC+OPROJ_FUSE+ATTN_SVE\n"
+      "  --model DIR         DS4F_MODEL_DIR       --real N         DS4F_REAL\n"
+      "  --stage-dir D       DS4F_STAGE_DIR       --ep-size N      DS4F_EP_SIZE\n"
+      "  --nshards N         DS4F_NSHARDS         --layers N       DS4F_LAYERS (0=full 43)\n"
+      "  --prefill N         DS4F_PREFILL         --prefill-batch N DS4F_PREFILL_BATCH\n"
+      "  --max-gen N         DS4F_MAXGEN          --maxpos N       DS4F_MAXPOS\n"
+      "  --max-new N         DS4F_MAX_NEW         --cp N           DS4F_CP\n"
+      "  --cp-idx N          DS4F_CP_IDX          --int8-kv N      DS4F_INT8_KV\n"
+      "  --int8-cmp N        DS4F_INT8_CMP        --mtp N          DS4F_MTP\n"
+      "  --tierb2 N          DS4F_TIERB2          --mhc N          DS4F_MHC\n"
+      "  --sparse N          DS4F_SPARSE          --prompt-ids F   DS4F_PROMPT_IDS\n"
+      "  --gen-out FILE      DS4F_GEN_OUT         --set KEY=VAL    set any DS4F_* var\n");
+}
+static void ds4f_cli(int argc,char**argv){
+    int numa=1;
+    for(int i=1;i<argc;i++){
+        char*a=argv[i]; if(strncmp(a,"--",2)) continue; a+=2;
+        char*eq=strchr(a,'='); char*val=NULL;
+        if(eq){ *eq=0; val=eq+1; }
+        else if(i+1<argc && argv[i+1][0]!='-'){ val=argv[++i]; }
+        if(!strcmp(a,"help")){ ds4f_cli_usage(); continue; }
+        if(!strcmp(a,"numa")){ numa=val?atoi(val):1; continue; }
+        if(!strcmp(a,"preset")&&val&&!strcmp(val,"decode")){
+            setenv("DS4F_FP8_BF16","1",1); setenv("DS4F_Q8_DENSE","1",1);
+            setenv("DS4F_HC_PAR","1",1);   setenv("DS4F_HC_RMSPAR","1",1);
+            setenv("DS4F_TIERB2","1",1);   setenv("DS4F_MHC","1",1);
+            setenv("DS4F_OPROJ_FUSE","1",1); setenv("DS4F_ATTN_SVE","1",1);
+            continue;
+        }
+        if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }
+        #define MAP(flag,var) if(!strcmp(a,flag)){ if(val) setenv(var,val,1); continue; }
+        MAP("model","DS4F_MODEL_DIR")   MAP("real","DS4F_REAL")        MAP("stage-dir","DS4F_STAGE_DIR")
+        MAP("ep-size","DS4F_EP_SIZE")   MAP("nshards","DS4F_NSHARDS")  MAP("layers","DS4F_LAYERS")
+        MAP("prefill","DS4F_PREFILL")   MAP("prefill-batch","DS4F_PREFILL_BATCH")
+        MAP("max-gen","DS4F_MAXGEN")    MAP("maxpos","DS4F_MAXPOS")    MAP("max-new","DS4F_MAX_NEW")
+        MAP("cp","DS4F_CP")             MAP("cp-idx","DS4F_CP_IDX")    MAP("int8-kv","DS4F_INT8_KV")
+        MAP("int8-cmp","DS4F_INT8_CMP") MAP("mtp","DS4F_MTP")          MAP("tierb2","DS4F_TIERB2")
+        MAP("mhc","DS4F_MHC")           MAP("sparse","DS4F_SPARSE")
+        MAP("prompt-ids","DS4F_PROMPT_IDS") MAP("gen-out","DS4F_GEN_OUT")
+        #undef MAP
+        fprintf(stderr,"ds4f_ep_runner: unknown flag --%s (try --help)\n",a);
+    }
+    ds4f_apply_numa(numa);
+}
+
+int main(int argc,char**argv){
+    ds4f_cli(argc,argv);
     int rc;
     int n_threads = envi("LLM_THREADS", 48);
     int n_cmgs    = envi("DS4F_CMGS", 4);

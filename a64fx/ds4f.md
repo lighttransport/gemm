@@ -29,6 +29,58 @@ reuse the Step-1 blobs (no re-stage). Last Tier-B1 validation (job 49092345, 202
 `rc=0`, NaNs=0, argmax=122293, prefill 10.44 / decode 10.16 tok/s, arena 22.18 /
 RSS 21.81 GB/node. Per-config numbers are in Steps 2–2d.
 
+## NUMA lever, CLI flags & minimal-node presets (2026-07)
+
+**NUMA interleave (grafted from glm5).** `ds4f_ep_runner` now interleaves its arena across all CMGs
+in-process (`ds4f_apply_numa`: `set_mempolicy(MPOL_INTERLEAVE)`), the in-process equivalent of
+`numactl --interleave=all`. ds4f decode is fp8-stream memory-bound, so this is the same ~1.40×
+bit-identical decode lever measured on glm5. **On by default (`DS4F_NUMA=1`)**; the thread-affinity
+half (`OMP_PROC_BIND=close`, `OMP_PLACES=cores`) is exported at launch by `run_ds4f_11n.sh`. A/B with
+`DS4F_NUMA=0` (or `--numa 0`) — the token stream is bit-identical either way.
+
+**CLI front-end.** `ds4f_ep_runner --flags` map to the `DS4F_*` env (env still works as fallback):
+
+| flag | env | flag | env |
+|---|---|---|---|
+| `--numa[=0\|1]` | (apply; default 1) | `--preset decode` | FP8_BF16+Q8_DENSE+HC_PAR+HC_RMSPAR+TIERB2+MHC+OPROJ_FUSE+ATTN_SVE |
+| `--model DIR` | `DS4F_MODEL_DIR` | `--real N` | `DS4F_REAL` |
+| `--stage-dir D` | `DS4F_STAGE_DIR` | `--ep-size N` | `DS4F_EP_SIZE` |
+| `--nshards N` | `DS4F_NSHARDS` | `--layers N` | `DS4F_LAYERS` |
+| `--prefill N` | `DS4F_PREFILL` | `--max-gen N` | `DS4F_MAXGEN` |
+| `--maxpos N` | `DS4F_MAXPOS` | `--max-new N` | `DS4F_MAX_NEW` |
+| `--cp N` | `DS4F_CP` | `--int8-kv N` | `DS4F_INT8_KV` |
+| `--mtp N` | `DS4F_MTP` | `--tierb2 N` | `DS4F_TIERB2` |
+| `--prompt-ids F` | `DS4F_PROMPT_IDS` | `--set KEY=VAL` | any `DS4F_*` |
+
+**Unified batch launcher `a64fx/llm/pjsub_ds4f.sh`** (MODE = prefill / decode / serve). Unlike the
+interactive `run_ds4f_*11n.sh` (which reserve 1 node for the control session), this is a pjsub batch
+job where all `NODES` are EP ranks. It stages then runs via the CLI flags:
+
+```sh
+NODES=11 MODE=decode  MAXGEN=32 pjsub a64fx/llm/pjsub_ds4f.sh          # decode tok/s @ node floor
+NODES=16 MODE=prefill PREFILL=2048 pjsub a64fx/llm/pjsub_ds4f.sh       # TTFT, run above the floor
+NODES=12 MODE=serve   CP=1 MTP=1 PROMPT_IDS=... pjsub a64fx/llm/pjsub_ds4f.sh  # prefill+decode serving
+```
+
+**Minimal-node configs** — from `a64fx/llm/ds4f_sim.py` (`per_node = 9.02 replicated + 150.59/N fp4
+experts + KV/N`, ≤27 GB; calibrated: `per_node(11,4k,8)=22.9` vs measured 22.18). Weight floor **≥9
+nodes**; `int8-KV` (`DS4F_INT8_KV=1`) cuts ~⅓ at long ctx:
+
+| pattern | ctx | M | min nodes (bf16-KV / int8-KV) |
+|---|---|---|---|
+| decode (short) | 4k | 8 | **9** (use 11 for headroom) |
+| serve | 128k | 1 | **9** |
+| serve | 512k | 1 | **10** |
+| serve | 1M | 1 | **12 / 10** |
+| serve (batched) | 512k | 8 | **20 / 15** |
+| serve (batched) | 1M | 8 | **32 / 20** |
+
+- **decode-optimized** → run **at** the floor (~11n); NUMA ~1.40× → target ~**14 tok/s** decode.
+- **prefill-optimized** → run **above** the floor (extra ranks = attention/expert-GEMM parallelism).
+- **prefill+decode serving** → node count **pinned by persistent KV**; `DS4F_CP` for ctx ≥ 512k.
+
+`python3 a64fx/llm/ds4f_sim.py` prints this table; `min_nodes(ctx, M, kvb)` is importable.
+
 ## Files (branch `ds4f`)
 
 | File | Role |
