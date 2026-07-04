@@ -60,6 +60,24 @@ the gen launchers.
 
 ## Results
 
+### BEST CONFIG (measured, synthetic): `M3_MSTREAM=48 TP_AR_BF16=1` = **17.75 tok/s agg @48n**
+Progression: prior best 14.2 (M=8) → P1 M=32 **16.68** → P1b M=48 **17.75** (**+25%**). Plateau at M≈node
+count; M=64 regresses (17.35). bf16-AR is a free +2–3% (lockstep-preserving). **Confirm on real weights
+(P3) before shipping** — and note the P2 caveats (int4-KV memory/engagement unverified).
+
+### P1b — higher-M plateau (job 49441449, 48n, full-60L synth bf16, bf16-AR, maxpos=512) — DONE
+| M | AGG tok/s | comm% | out0 |
+|---|---|---|---|
+| 32 (control) | 16.70 | 26.3% | 694 |
+| 48 | **17.75** | 26.7% | 2429 |
+| 64 | 17.35 | 25.3% | 3090 |
+
+- M=32@512 (16.70) ≈ P1's M=32@1024 (16.68) → **maxpos-independent**, P1b comparable to P1.
+- **Peak at M=48 (17.75), M=64 regresses (−2.3%)** — batching tops out ~M=node-count; extra per-stream
+  overhead at M=64 beats comm amortization (matches P2's ~17.6 single-node compute ceiling). NaN=0.
+- M=48@maxpos=512 fit (arena 21.46 + KV ~6 GB); at maxpos=1024 M=48 is tight (~27.5 GB) -> needs
+  int4-KV or more nodes for long ctx.
+
 ### P1 — mstream × AR (job 49441386, 48n, full-60L synth bf16, max_pos=1024, 32 steps) — DONE
 | M | AR | AGG tok/s | comm% | out0 |
 |---|---|---|---|---|
