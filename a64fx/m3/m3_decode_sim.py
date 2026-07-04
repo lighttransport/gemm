@@ -14,8 +14,11 @@ Key facts encoded:
   - bf16-AR (TP_AR_BF16=1) is a free +2-3%, lockstep-preserving (baked into the calibration).
   - tok/s is ~flat in node count (m3.md) -> this curve is treated as N-independent; nodes/ctx/KV only
     gate the *max M that fits* (per-stream KV x M), via m3_sim's arena.
-  - CAVEAT: calibrated on SYNTHETIC weights; confirm on real weights (probe P3). int4-KV memory
-    saving + batch-path engagement UNVERIFIED (P2) — treat int4 max-M as optimistic until wired.
+  - REAL-WEIGHT CORRECTION (probe P3, 48n real bf16): the curve is SYNTHETIC and OPTIMISTIC at high M.
+    Measured real-weight M=48 = 15.25 tok/s (vs synth 17.75, -14%) — real-router expert-load imbalance
+    raises comm 27%->37%. Low M (~<16) ~= synth (comm small). Use decode_tok_s_real() / REAL_FACTOR for a
+    deployment estimate; the synthetic decode_tok_s() is the upper bound. (bf16-AR confirmed lossless on
+    real weights: coherent "Paris" gen.) int4-KV memory saving + batch-path engagement still UNVERIFIED (P2).
 
 Run:    python3 m3_decode_sim.py
 Import: from m3_decode_sim import decode_tok_s, best_decode
@@ -49,6 +52,18 @@ def ms_per_step(M):
     """Per-decode-step latency (ms) for a batch of M streams = 1000*M/agg_tok_s."""
     t = decode_tok_s(M);  return 1000.0 * M / t if t > 0 else float('inf')
 
+# Real-weight correction (P3, 48n real bf16): measured M=48 = 15.25 vs synth 17.75 (real-router comm
+# imbalance). ~1.0 up to M=16 (comm small), 0.859 at M=48, linear between.
+REAL_M48 = 15.25
+def real_factor(M):
+    f48 = REAL_M48 / decode_tok_s(48)
+    if M <= 16: return 1.0
+    if M >= 48: return f48
+    return 1.0 + (f48 - 1.0) * (M - 16) / 32.0
+def decode_tok_s_real(M):
+    """Deployment (real-weight) throughput estimate = synth curve x the P3 correction (synth is upper bound)."""
+    return decode_tok_s(M) * real_factor(M)
+
 def raw_arena_gb(N, fmt, maxpos, M, kvb):
     """Weight + M-stream KV arena, WITHOUT m3_sim's page-cache overhead (matches measured arena_used)."""
     return arena_gb(N, fmt, maxpos, M, kvb) - OVERHEAD_GB
@@ -73,14 +88,15 @@ if __name__ == "__main__":
     K = 1024
     print("MiniMax-M3 batched-decode throughput model (calibrated: 48n synth bf16, TP_AR_BF16=1)")
     print("=" * 82)
-    print("measured aggregate tok/s vs M (bf16-AR):  M=8 13.19 | 16 14.29 | 32 16.70 | 48 17.75 | 64 17.35")
-    print(f"PEAK at M={THROUGHPUT_PEAK_M} (=node count); M=64 regresses. Best config: M3_MSTREAM=48 TP_AR_BF16=1.\n")
+    print("measured aggregate tok/s vs M (bf16-AR, synth):  M=8 13.19 | 16 14.29 | 32 16.70 | 48 17.75 | 64 17.35")
+    print(f"PEAK at M={THROUGHPUT_PEAK_M} (=node count); M=64 regresses. Best config: M3_MSTREAM=48 TP_AR_BF16=1.")
+    print(f"REAL-WEIGHT (P3): M=48 = {REAL_M48} tok/s (synth 17.75 is ~14% optimistic; real-router comm imbalance).\n")
     print("curve:  M     8      16      24      32      48      64")
     print("  tok/s " + "  ".join(f"{decode_tok_s(m):5.1f}" for m in (8,16,24,32,48,64)))
     print("  ms/st " + "  ".join(f"{ms_per_step(m):5.0f}" for m in (8,16,24,32,48,64)))
     print()
     print("DEPLOYABLE best (M capped by per-stream KV x M fitting the arena):")
-    print(f"  {'nodes':>5} {'fmt':>5} {'maxpos':>7} {'KV':>5} {'maxM_fit':>9} {'M*':>4} {'agg tok/s':>10} {'note':>16}")
+    print(f"  {'nodes':>5} {'fmt':>5} {'maxpos':>7} {'KV':>5} {'maxM_fit':>9} {'M*':>4} {'synth t/s':>10} {'real~t/s':>9} {'note':>13}")
     rows = [
         (24,'fp8', 512, 2), (24,'fp8', 512, 0.5), (24,'fp8', 4096, 2),
         (32,'fp8', 512, 2), (32,'fp8', 4096, 2),
@@ -90,8 +106,8 @@ if __name__ == "__main__":
     for N, fmt, mp, kvb in rows:
         m_star, tk, mmax, capped = best_decode(N, fmt, mp, kvb)
         kvl = 'int4' if kvb < 1 else 'bf16'
-        note = 'KV-capped' if capped else 'at peak M=48'
-        print(f"  {N:>5} {fmt:>5} {mp:>7} {kvl:>5} {mmax:>9} {m_star:>4} {tk:>9.1f}  {note:>16}")
+        note = 'KV-capped' if capped else 'peak M=48'
+        print(f"  {N:>5} {fmt:>5} {mp:>7} {kvl:>5} {mmax:>9} {m_star:>4} {tk:>9.1f} {decode_tok_s_real(m_star):>8.1f}  {note:>13}")
     print()
     print("reads: 'M*' = the batch to run (min of the M=48 throughput peak and what fits). 'KV-capped'")
     print("means the arena can't hold M=48 streams' KV at this ctx -> raise nodes, drop maxpos, or int4-KV.")

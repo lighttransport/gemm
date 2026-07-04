@@ -60,10 +60,20 @@ the gen launchers.
 
 ## Results
 
-### BEST CONFIG (measured, synthetic): `M3_MSTREAM=48 TP_AR_BF16=1` = **17.75 tok/s agg @48n**
-Progression: prior best 14.2 (M=8) → P1 M=32 **16.68** → P1b M=48 **17.75** (**+25%**). Plateau at M≈node
-count; M=64 regresses (17.35). bf16-AR is a free +2–3% (lockstep-preserving). **Confirm on real weights
-(P3) before shipping** — and note the P2 caveats (int4-KV memory/engagement unverified).
+### BEST CONFIG: `M3_MSTREAM=48 TP_AR_BF16=1` — **17.75 tok/s synth / 15.25 tok/s REAL @48n**
+Progression (synthetic): prior 14.2 (M=8) → P1 M=32 **16.68** → P1b M=48 **17.75** (**+25%**). Plateau at
+M≈node count; M=64 regresses. bf16-AR is a free +2–3% (lockstep-preserving). **P3 real-weight confirm
+(DONE):** coherent "Paris" ✓, M=48 FITS 48n (no OOM), but **real-weight AGG = 15.25 tok/s** (comm
+27%→37% from real-router expert-load imbalance) → **synthetic overpredicts ~14% at high M**. Shippable
+real-weight best is **15.25 tok/s** (+7% over the prior config).
+
+### P3 — real-weight confirm (job 49441549, 48n, real bf16, bf16-AR) — DONE
+- **Pass A (coherence, mstream=1):** "The capital of France is" → **" Paris. (Paris is the capital of
+  France.)"** — bf16-AR preserves REAL-weight output (was argmax-identical on synth). NaN=0, arena 21.25
+  GB (≈ synth 21.46), decode 3.33 tok/s single-stream.
+- **Pass B (throughput, M=48):** **AGG 15.25 tok/s**, comm **37.4%**, arena 21.28 GB — **M=48 fits real
+  weights @48n, no OOM** (memory question resolved for short ctx; int4-KV not needed at M=48/short-ctx).
+  Real 15.25 < synth 17.75 → real-router imbalance raises comm; **m3_decode_sim is optimistic at high M.**
 
 ### P1b — higher-M plateau (job 49441449, 48n, full-60L synth bf16, bf16-AR, maxpos=512) — DONE
 | M | AGG tok/s | comm% | out0 |
