@@ -6,7 +6,7 @@
 # work through pjsub, so copy+edit node=/proc=/NODES together, or submit interactively).
 #
 # Knobs (env at top only; everything the RUNNER needs is passed as --flags):
-#   NODES(=32) LAYERS(=78) SLOTS(=8) MAXNEW(=24) MAXPOS(=2048) BATCH(=0) SDOT(=0) OVERLAP(=0) NUMA(=1)
+#   NODES(=32) LAYERS(=78) SLOTS(=8) MAXNEW(=24) MAXPOS(=2048) BATCH(=0) GEMM_SDOT(=2) SDOT(=0) OVERLAP(=0) NUMA(=1)
 
 #PJM -g hp250467
 #PJM -L "rscgrp=small-s2,node=32,elapse=01:10:00"
@@ -17,7 +17,12 @@
 #PJM -j
 set -u
 : "${NODES:=${PJM_MPI_PROC:-32}}"; : "${LAYERS:=78}"; : "${SLOTS:=8}"; : "${MAXNEW:=24}"
-: "${MAXPOS:=2048}"; : "${BATCH:=0}"; : "${SDOT:=0}"; : "${OVERLAP:=0}"; : "${NUMA:=1}"
+# Shipping defaults = the validated stack (combined job 49436726 = 2.64x over baseline @32n):
+#   NUMA on (1.40x bit-identical) + int16-GEMM on (GEMM_SDOT=2, lossless, prefill 1.42x / batched 1.24x).
+#   BATCH is a SERVING knob (=1 amortizes comm over M streams, +~1.57x) but at 32n M=8 needs MAXPOS<=1024
+#   (else the per-stream KV OOMs) -> default off + 2048; set BATCH=1 MAXPOS=1024 for batched serving.
+#   SDOT (M=1 decode matvec, GLM5_MV_SDOT) stays OFF: it's a net e2e loss (int16-GEMM is the win, not this).
+: "${MAXPOS:=2048}"; : "${BATCH:=0}"; : "${SDOT:=0}"; : "${GEMM_SDOT:=2}"; : "${OVERLAP:=0}"; : "${NUMA:=1}"
 REPO=/home/u14346/work/gemm/glm5-1
 LLM="$REPO/a64fx/llm"; UTOFU="$REPO/a64fx/utofu-tests"; GLM5="$REPO/a64fx/glm5"
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
@@ -32,7 +37,7 @@ export GLM5_EP_SIZE=$NP GLM5_STATUS_DIR="$WORK" GLM5_TOKENIZER=$HOME/models/glm5
 TH=48; [ "$OVERLAP" = 1 ] && TH=47
 [ "$NUMA" = 1 ] && export OMP_PROC_BIND=close OMP_PLACES=cores
 export LLM_THREADS=$TH OMP_NUM_THREADS=$TH
-echo "=== GLM5.2 decode: NP=$NP L=$LAYERS slots=$SLOTS batch=$BATCH sdot=$SDOT overlap=$OVERLAP numa=$NUMA th=$TH job=${PJM_JOBID:-?} ==="
+echo "=== GLM5.2 decode: NP=$NP L=$LAYERS slots=$SLOTS batch=$BATCH gemm_sdot=$GEMM_SDOT sdot=$SDOT overlap=$OVERLAP numa=$NUMA th=$TH job=${PJM_JOBID:-?} ==="
 date; mkdir -p "$WORK" || exit 2; cd "$WORK" || exit 2
 "$GLM5/check_glm5_model.sh" "$MODEL" --tokenizer || exit 2
 test -s "$PROMPTS" || { echo "FATAL: prompts $PROMPTS"; exit 2; }
@@ -50,7 +55,7 @@ echo "staged $(ls "$WORK"/glm5_stage_rank*.txt 2>/dev/null|wc -l)/$NP ($(date))"
 # ---- the run: ALL runtime config as CLI flags (NUMA interleave via --numa; batching/overlap/sdot too)
 ARGS="--real 1 --numa $NUMA --model $MODEL --layers $LAYERS --tp 1 --ep-size $NP \
   --maxpos $MAXPOS --slots $SLOTS --max-new $MAXNEW --prompts $PROMPTS \
-  --batch-decode $BATCH --sdot $SDOT --gen-out $WORK/gen"
+  --batch-decode $BATCH --sdot $SDOT --gemm-sdot $GEMM_SDOT --gen-out $WORK/gen"
 [ "$OVERLAP" = 1 ] && ARGS="$ARGS --overlap 1 --tp-shared 0"
 echo "--- run: glm5_ep_runner $ARGS ($(date)) ---"; rm -f glm5_ep_rank00.txt
 mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" $ARGS || echo "WARN: run rc=$?"

@@ -777,7 +777,8 @@ static void glm5_cli_usage(void){
       "  --model DIR         GLM5_MODEL_DIR        --layers N     GLM5_LAYERS (0=full)\n"
       "  --experts N         GLM5_EXPERTS          --maxpos N     GLM5_MAXPOS\n"
       "  --threads N         LLM_THREADS           --tp N         GLM5_TP\n"
-      "  --tp-shared N       GLM5_TP_SHARED        --sdot N       GLM5_MV_SDOT (0=w8a16,2=int16)\n"
+      "  --tp-shared N       GLM5_TP_SHARED        --sdot N       GLM5_MV_SDOT (M=1 decode; 0=w8a16, net loss)\n"
+      "  --gemm-sdot N       GLM5_GEMM_SDOT (prefill + batched-decode GEMM; 2=int16, lossless, 1.2-1.4x win)\n"
       "  --batch-decode[=1]  GLM5_BATCH_DECODE     --overlap[=1]  GLM5_COMM_OVERLAP\n"
       "  --slots N           GLM5_CBATCH_SLOTS     --max-new N    GLM5_MAX_NEW\n"
       "  --prompts FILE      GLM5_CBATCH_PROMPTS   --prompt-ids F GLM5_PROMPT_IDS\n"
@@ -800,7 +801,8 @@ static void glm5_cli(int argc,char**argv){
         #define MAP(flag,var) if(!strcmp(a,flag)){ if(val) setenv(var,val,1); continue; }
         MAP("model","GLM5_MODEL_DIR")   MAP("layers","GLM5_LAYERS")   MAP("experts","GLM5_EXPERTS")
         MAP("maxpos","GLM5_MAXPOS")     MAP("threads","LLM_THREADS")  MAP("tp","GLM5_TP")
-        MAP("tp-shared","GLM5_TP_SHARED") MAP("sdot","GLM5_MV_SDOT")  MAP("slots","GLM5_CBATCH_SLOTS")
+        MAP("tp-shared","GLM5_TP_SHARED") MAP("sdot","GLM5_MV_SDOT")  MAP("gemm-sdot","GLM5_GEMM_SDOT")
+        MAP("slots","GLM5_CBATCH_SLOTS")
         MAP("max-new","GLM5_MAX_NEW")   MAP("prompts","GLM5_CBATCH_PROMPTS")
         MAP("prompt-ids","GLM5_PROMPT_IDS") MAP("gen-out","GLM5_GEN_OUT")
         MAP("stage-dir","GLM5_STAGE_DIR") MAP("nshards","GLM5_NSHARDS") MAP("ep-size","GLM5_EP_SIZE")
