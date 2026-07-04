@@ -262,6 +262,7 @@ static void ds4f_cli(int argc,char**argv){
             setenv("DS4F_HC_PAR","1",1);   setenv("DS4F_HC_RMSPAR","1",1);
             setenv("DS4F_TIERB2","1",1);   setenv("DS4F_MHC","1",1);
             setenv("DS4F_OPROJ_FUSE","1",1); setenv("DS4F_ATTN_SVE","1",1);
+            setenv("DS4F_FLAGBAR","1",1);   /* per-worker flag barrier: +8% M=1 decode, bit-identical */
             continue;
         }
         if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }

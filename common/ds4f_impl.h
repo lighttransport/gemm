@@ -835,6 +835,16 @@ static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
  * o-projection (wo_a is block-diagonal: 8 groups of o_lora rows) as 8 matvecs. */
 static inline ds4f_tensor ds4f_row_slice(const ds4f_tensor *t, int row0, int nrows) {
     ds4f_tensor v = *t; v.rows = nrows;
+    if (t->type == DS4F_Q8_PV) {
+        /* int8 W8A8 "group" layout: per 8 rows x (cols/64) blocks of 528 B, with the
+         * 8 per-row fp16 scales stored INLINE in each block (no separate scale array).
+         * Sliceable only at an 8-row boundary -- true for every call site (wo_a is
+         * grouped by o_lora=1024, a multiple of 8). Without this case the switch below
+         * falls to the bf16 stride (cols*2) and returns a garbage pointer -> the Q8_DENSE
+         * verify/o-proj produced all-zero logits (argmax 0). */
+        v.w = (uint8_t *)t->w + (size_t)(row0 / 8) * (size_t)(t->cols / 64) * 528;
+        return v;                             /* scales inline; no v.scale to advance */
+    }
     size_t wbpr;                              /* weight bytes per logical row */
     switch (t->type) {
         case DS4F_FP8:   wbpr = (size_t)t->cols;     break;

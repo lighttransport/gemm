@@ -164,6 +164,12 @@ export DS4F_QNR_PAR=${DS4F_QNR_PAR:-1}
 # Default 1 = split the index_heads across the pool (BIT-EXACT, disjoint per-head slices).
 # Was 4.68ms/tok = 5.0% of decode @ctx10240 (scalar, serial on tid0 inside ds4f_index_step).
 export DS4F_TB2ROPE_PAR=${DS4F_TB2ROPE_PAR:-1}
+# DS4F_FLAGBAR=0 forces the OLD shared-counter pool barrier (all 47 workers atomic_fetch_add one
+# _Atomic done -> cache-line ping-pong). Default 1 = per-worker completion flag on its own cache
+# line (main polls each). BIT-IDENTICAL (same worker fn + splits, only the done-signal differs).
+# M=1 decode does ~900 tiny pool dispatches/tok, so the 47-way contention was pure overhead:
+# measured 11n ctx1759 decode 12.26 -> 13.24 tok/s (+8%), prefill 12.32 -> 13.28, byte-identical gen.
+export DS4F_FLAGBAR=${DS4F_FLAGBAR:-1}
 # DS4F_INT8_KV=1 stores the window KV latent as int8 (per-channel STATIC scale calibrated
 # on the first DS4F_INT8KV_CAL positions; S5 scheme), halving the KV footprint (the long-ctx
 # memory dominator). LOSSY (~1% rel) -> argmax NOT bit-exact; coherence is the gate. Forces
