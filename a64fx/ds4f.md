@@ -126,14 +126,18 @@ PROMPT_FILE=task.txt KVBITS=8 MAX_NEW=1024 ./run_ds4f_agentic_11n.sh   # up to 1
 ```
 
 Config = `DS4F_REAL=1` + decode bundle (`FP8_BF16 Q8_DENSE TIERB2 MHC HC_PAR HC_RMSPAR`, ==
-`--preset decode`) + `DS4F_NUMA=1`. **Context ceiling @11 EP** (weights 22.7 GB/node, ≤27 usable;
-context = prompt + generated tokens, KV replicated since ds4f attention is replicated):
+`--preset decode`) + `DS4F_NUMA=1`. **Context ceiling @11 EP** — use the EMPIRICAL column, not the
+pure-memory model. `ds4f_sim.py` (weights 22.7 GB + MLA-latent KV only) says bf16 fits ~64k, but that
+**omits the Tier-B2 indexer + compressed-key caches + warm-fill scratch**, which the ops log shows OOM
+the alloc at ctx≈32k (safe ceiling **~16k**). ⚠️ **An OOM kills the whole allocation** (gotcha #6:
+SIGKILL degrades the node's PMIx daemon → every later launch dies pre-load; recovery = recycle the
+alloc + re-stage, ~21 min). **Do not probe past the safe ceiling on an alloc you want to keep.**
 
-| KV mode | knob | max context (prompt+gen) | per-node @ceiling |
-|---|---|---|---|
-| bf16 (default) | `KVBITS=16` | **~64k tokens** | 26.0 GB |
-| int8 | `KVBITS=8` (`DS4F_INT8_KV=1`) | **~128k tokens** | 26.0 GB |
-| context-parallel | `DS4F_CP=1` | **512k+** | 25.1 GB @512k |
+| KV mode | knob | safe ctx (empirical) | MLA-KV model max | note |
+|---|---|---|---|---|
+| bf16 (default) | `KVBITS=16` | **~16k tokens** | ~64k | validated sweet spot ~10k |
+| int8 KV + cmp | `KVBITS=8` + `DS4F_INT8_CMP=1` | extends (unproven) | ~128k | halves KV *and* indexer cache |
+| context-parallel | `DS4F_CP=1` (`run_ds4f_longctx_11n.sh`) | **512k–1M** | — | the validated long-ctx path, ~0.8–1.2 tok/s @1M |
 
 Expected decode ≈ **12.8 tok/s** (WS1/WS1b landed) → **~14 tok/s** with the NUMA lever, degrading at
 longer context as attention + tb2prep grow per-position. Last real-weight validation: `rc=0`, NaNs=0,

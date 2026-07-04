@@ -5,10 +5,13 @@
 # NUMA lever ON, sized to fit 11 EP nodes. Thin wrapper over run_ds4f_gen_11n.sh (which tokenizes the
 # prompt, runs gen-mode, detokenizes) -> run_ds4f_11n.sh (topo + NUMA pinning + mpiexec).
 #
-# Memory ceiling @11 EP nodes (weights 22.7 GB/node, usable ~27; prompt+gen = context length):
-#   KVBITS=16  bf16 KV (default) -> up to ~64k tokens
-#   KVBITS=8   int8 KV           -> up to ~128k tokens
-#   longer:    DS4F_CP=1 (context-parallel KV) -> 512k+   (see ds4f.md "Node configurations")
+# Context ceiling @11 EP nodes — use the EMPIRICAL figure. The pure weights+MLA-KV model says bf16
+# fits ~64k, but the Tier-B2 indexer/compressed caches + warm-fill scratch push the real ceiling much
+# lower: the ops log OOMs at ctx~32k, SAFE ~16k (sweet spot ~10k). An OOM kills the whole alloc
+# (gotcha #6: SIGKILL degrades PMIx -> later launches die pre-load). DON'T probe past the ceiling.
+#   KVBITS=16  bf16 KV (default) -> safe ~16k tokens (prompt+gen)
+#   KVBITS=8   int8 KV (+ DS4F_INT8_CMP=1 for the indexer cache) -> extends, unproven
+#   longer:    DS4F_CP=1 / run_ds4f_longctx_11n.sh -> 512k-1M (the validated long-ctx path)
 #
 # Prereq: weights staged to /local/ds4f on the SAME node set (run_ds4f_stage_11n.sh).
 # Usage (inside the live 12-node alloc, from a64fx/llm):
@@ -22,10 +25,11 @@ export DS4F_NUMA=${DS4F_NUMA:-1}        # the ~1.40x bit-identical decode lever 
 # quality-preserving decode bundle (== ds4f_ep_runner --preset decode); pinned so the config is explicit
 export DS4F_REAL=1 DS4F_FP8_BF16=1 DS4F_Q8_DENSE=1 DS4F_TIERB2=1 DS4F_MHC=1 DS4F_HC_PAR=1 DS4F_HC_RMSPAR=1
 case "$KVBITS" in
-  16) export DS4F_INT8_KV=0; CEIL="~64k" ;;
-  8)  export DS4F_INT8_KV=1; CEIL="~128k" ;;
+  16) export DS4F_INT8_KV=0; CEIL="~16k safe" ;;
+  8)  export DS4F_INT8_KV=1; CEIL="~16k+ (int8; add DS4F_INT8_CMP=1)" ;;
   *)  echo "KVBITS must be 16 (bf16 KV) or 8 (int8 KV)"; exit 2 ;;
 esac
-echo "[agentic] 11 EP nodes | KV=${KVBITS}-bit (ctx ceiling $CEIL) | MAX_NEW=$MAX_NEW | NUMA=$DS4F_NUMA"
-echo "[agentic] prompt+gen beyond $CEIL -> set KVBITS=8, or DS4F_CP=1 for 512k+ (see a64fx/ds4f.md)"
+echo "[agentic] 11 EP nodes | KV=${KVBITS}-bit | ctx ceiling $CEIL | MAX_NEW=$MAX_NEW | NUMA=$DS4F_NUMA"
+echo "[agentic] WARNING: OOM (past ~16k, or ctx~32k) kills the whole alloc (PMIx, gotcha #6)."
+echo "[agentic] long ctx -> DS4F_CP=1 / run_ds4f_longctx_11n.sh (512k-1M). See a64fx/ds4f.md."
 exec ./run_ds4f_gen_11n.sh
