@@ -18,7 +18,11 @@ Key facts encoded:
     Measured real-weight M=48 = 15.25 tok/s (vs synth 17.75, -14%) — real-router expert-load imbalance
     raises comm 27%->37%. Low M (~<16) ~= synth (comm small). Use decode_tok_s_real() / REAL_FACTOR for a
     deployment estimate; the synthetic decode_tok_s() is the upper bound. (bf16-AR confirmed lossless on
-    real weights: coherent "Paris" gen.) int4-KV memory saving + batch-path engagement still UNVERIFIED (P2).
+    real weights: coherent "Paris" gen.)
+  - int4-KV is NOT wired into batched decode (confirmed in m3_impl.h: m3_forward_batch_decode stores/reads
+    the per-stream KV as bf16, no m->int4_kv branch — the int4 codec is single-stream m3_forward_token only,
+    "for 1M context"). So BATCHED-SERVING KV is ALWAYS bf16 (kvb=2); to hold high-M at long ctx you need
+    MORE NODES (or wire int4 into the batch path). int4-KV helps single-stream 1M-context decode only.
 
 Run:    python3 m3_decode_sim.py
 Import: from m3_decode_sim import decode_tok_s, best_decode
@@ -97,19 +101,18 @@ if __name__ == "__main__":
     print()
     print("DEPLOYABLE best (M capped by per-stream KV x M fitting the arena):")
     print(f"  {'nodes':>5} {'fmt':>5} {'maxpos':>7} {'KV':>5} {'maxM_fit':>9} {'M*':>4} {'synth t/s':>10} {'real~t/s':>9} {'note':>13}")
+    # batched-serving KV is ALWAYS bf16 (int4-KV not wired into m3_forward_batch_decode) -> kvb=2 only.
     rows = [
-        (24,'fp8', 512, 2), (24,'fp8', 512, 0.5), (24,'fp8', 4096, 2),
+        (24,'fp8', 512, 2), (24,'fp8', 4096, 2),
         (32,'fp8', 512, 2), (32,'fp8', 4096, 2),
-        (48,'bf16', 512, 2), (48,'bf16', 4096, 2), (48,'bf16', 4096, 0.5),
-        (96,'bf16', 4096, 2), (96,'bf16', 4096, 0.5),
+        (48,'bf16', 512, 2), (48,'bf16', 4096, 2),
+        (96,'bf16', 512, 2), (96,'bf16', 4096, 2),
     ]
     for N, fmt, mp, kvb in rows:
         m_star, tk, mmax, capped = best_decode(N, fmt, mp, kvb)
-        kvl = 'int4' if kvb < 1 else 'bf16'
         note = 'KV-capped' if capped else 'peak M=48'
-        print(f"  {N:>5} {fmt:>5} {mp:>7} {kvl:>5} {mmax:>9} {m_star:>4} {tk:>9.1f} {decode_tok_s_real(m_star):>8.1f}  {note:>13}")
+        print(f"  {N:>5} {fmt:>5} {mp:>7} {'bf16':>5} {mmax:>9} {m_star:>4} {tk:>9.1f} {decode_tok_s_real(m_star):>8.1f}  {note:>13}")
     print()
-    print("reads: 'M*' = the batch to run (min of the M=48 throughput peak and what fits). 'KV-capped'")
-    print("means the arena can't hold M=48 streams' KV at this ctx -> raise nodes, drop maxpos, or int4-KV.")
-    print("NOTE: synthetic calibration; confirm on real weights (probe P3). int4 max-M optimistic until")
-    print("      int4-KV is verified to engage on the mstream path (P2 caveat).")
+    print("reads: 'M*' = batch to run (min of the M=48 peak and what fits). 'real~t/s' = synth x P3 correction.")
+    print("'KV-capped' = can't fit M=48 streams' bf16 KV at this ctx -> raise nodes or drop maxpos.")
+    print("int4-KV is single-stream/1M only (NOT wired into batched decode) -> serving KV is always bf16.")

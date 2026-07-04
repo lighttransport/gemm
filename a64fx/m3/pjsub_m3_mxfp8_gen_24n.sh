@@ -27,6 +27,10 @@ NP=${PJM_MPI_PROC:-24}
 RUN="$M3/mxfp8run_${PJM_JOBID:-$$}"; mkdir -p "$RUN"; cd "$RUN" || exit 2   # isolate tofu_topo.txt + logs per job
 export M3_MODEL_DIR=$HOME/models/m3-fp8 M3_NSHARDS=31 M3_STAGE_DIR=/local/m3fp8 M3_STATUS_DIR="$RUN"
 export M3_EP_SIZE=$NP M3_TP=1 M3_MSA=1
+# TP_AR_BF16=1: halve the EP all-reduce payload. P3-confirmed LOSSLESS on real weights (coherent
+# "Paris"), a free +2-3%. On by default. M3_MSTREAM=1 = single-prompt coherence gen; for BATCHED
+# SERVING set M3_MSTREAM=48 (the throughput peak = ~15.25 tok/s real @48n; see m3_decode_sim.py).
+export TP_AR_BF16=${TP_AR_BF16:-1}
 export M3_MAXPOS=${M3_MAXPOS:-256} M3_MAX_NEW=${M3_MAX_NEW:-48} M3_MSTREAM=${M3_MSTREAM:-1}
 export LLM_THREADS=12 OMP_NUM_THREADS=12   # M3 runs 1 CMG / 12 threads (pool-vs-OpenMP; do NOT bump)
 

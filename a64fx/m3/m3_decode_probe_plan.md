@@ -122,7 +122,9 @@ real-weight best is **15.25 tok/s** (+7% over the prior config).
   +8.6% M=8→32, +2.8% M=32→64 → sweep M≤32 (as P1 is written).
 - **CAVEATS:** (1) `arena_used` is the WEIGHT arena only — per-stream KV is allocated separately and
   not reported, so the int4-KV **memory saving was NOT measured** (rely on P1 MemFree @48n).
-  (2) int4-KV out0 was **bit-identical** to bf16 → likely **not engaging on the batched/mstream
-  path** (single-stream KV-quality probe does see int4 diffs on real weights). **Verify int4-KV
-  actually changes the batch-decode output before treating it as the high-M memory enabler** — else
-  P1's high-M passes must fit with bf16-KV (more nodes / shorter max_pos) or int4-KV needs wiring.
+  (2) int4-KV out0 was **bit-identical** to bf16 → suspected not engaging on the mstream path.
+  **RESOLVED (code inspection, m3_impl.h):** `m3_forward_batch_decode` stores/reads the per-stream KV as
+  **bf16** (`ms->kc`/`ms->vc`, `m3_f2bf`/`m3_bf2f`) with **no `m->int4_kv` branch** — the int4 codec
+  (`k_q4`/`v_q4`, `m3_q4_*`) is single-stream `m3_forward_token` only ("for 1M context"). So **int4-KV
+  is a no-op for batched serving**; high-M at long ctx needs MORE NODES (or wiring int4 into the batch
+  path). int4-KV helps single-stream 1M-context decode only.
