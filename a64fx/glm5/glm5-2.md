@@ -104,6 +104,59 @@ int8 w8a16 convert-bound compute**; the only lever that breaks it is a **format 
 - Real-weight int8 decode profile: `pjsub_glm5_cbatch_int8_{32,48,96}n.sh` (bd=0 vs bd=1 A/B, short ctx).
 - Model: `decode_sim.py` (`REAL_DECODE`, `REAL_DECODE_COMPUTE_MS`, MEASURED CALIBRATION + REAL PROFILE sections).
 
+## Deployment presets (node-config + launcher knobs)
+
+Minimal node counts come from `decode_sim.py`'s sizing helper (`min_nodes(prec, ctx, M, kv_bytes)`,
+weights sharded + KV context-parallel, ≤28 GB usable/node). Weight floors: **int8 ≥27n, bf16 ≥54n**
+(weights alone). KV per stream is 512k=47 GB / 1M=94 GB → **CP-shard mandatory** at long ctx. The
+shipped compute path is **int8-store / int16-compute (`GEMM_SDOT=2`, lossless)** — that's what "int8"
+means below. `int4-KV` = `GLM5_INT4_KV` (halves KV, drops the node floor). All presets carry the
+validated stack: **NUMA on (1.40× bit-identical) + int16-GEMM on**.
+
+Launcher = `pjsub_glm5_decode.sh` (copy + set `#PJM node=/proc=` and the top-of-file knobs to match a
+row). Knobs: `NODES LAYERS SLOTS MAXNEW MAXPOS BATCH GEMM_SDOT SDOT OVERLAP NUMA`.
+
+### Short-context int8 decode — the efficiency sweet spot
+32n ≈ 96n throughput, so run int8 short-ctx at **32n** (3× more node-efficient). This is the default
+shipping config.
+
+| preset | nodes | ctx | M (BATCH) | knobs | notes |
+|---|---|---|---|---|---|
+| **int8 decode (single)** | 32n | ≤2k | BATCH=0, SLOTS=8 | `MAXPOS=2048 GEMM_SDOT=2 NUMA=1` | ~1.75 tok/s/slot; the launcher default |
+| **int8 decode (batched serving)** | 32n | ≤1k | BATCH=1, SLOTS=8 | `MAXPOS=1024 GEMM_SDOT=2 NUMA=1` | ~2.9/slot, ~11.7 agg; M=8 needs MAXPOS≤1024 (KV OOM otherwise) |
+
+### Long-context int8 (int16-compute) — sized by persistent KV
+`min_nodes` at M=8. Use int4-KV to cut the floor; run **at** the min for decode-opt, **above** it for
+prefill-opt (compute parallelism / query-SP).
+
+| preset | ctx | KV | min nodes | weights+KV GB/node | knobs |
+|---|---|---|---|---|---|
+| **int8 512k** | 512k | bf16-KV | **41n** | 24.3+3.0 | `LAYERS=78 GEMM_SDOT=2 NUMA=1`, CP on |
+| **int8 512k (int4-KV)** | 512k | int4-KV | **31n** | 24.3+1.5 | `+ GLM5_INT4_KV=1` |
+| **int8 1M** | 1024k | bf16-KV | **54n** | 22.1+... | CP on |
+| **int8 1M (int4-KV)** | 1024k | int4-KV | **34n** | 22.1+5.5 | `+ GLM5_INT4_KV=1` — best 1M packing |
+
+Batching sensitivity (int8 512k, bf16-KV): **M=1/4/8 → 29/34/41n**.
+
+### Long-context bf16 — weight-floor bound (≥54n)
+bf16 doesn't fit under 54n regardless of ctx. int4-KV still helps at 512k/1M.
+
+| preset | ctx | KV | min nodes | weights+KV GB/node |
+|---|---|---|---|---|
+| **bf16 512k** | 512k | bf16-KV | **68n** | 26.3+1.7 |
+| **bf16 512k (int4-KV)** | 512k | int4-KV | **57n** | ~26.3+0.9 |
+| **bf16 1M** | 1024k | bf16-KV | **81n** | 24.6+3.1 |
+| **bf16 1M (int4-KV)** | 1024k | int4-KV | **61n** | 24.6+... |
+
+### Pattern guidance
+- **decode-optimized** → run **at** the min-node count (fewer ranks = better efficiency; comm is ~flat in N).
+- **prefill-optimized** → run **above** the min (extra ranks buy compute parallelism + query-SP for the prompt).
+- **prefill+decode serving** → node count is **pinned by the persistent full-ctx KV**, so it lands at the
+  min-node row for the target ctx; batch decode (M up to 8) on top to amortize comm.
+
+Regenerate/verify any row: `python3 decode_sim.py` (prints the table) or call
+`min_nodes('int8'|'bf16', ctx, M, kv_bytes=2|0.5)` → `(nodes, weights_gb, kv_gb)`.
+
 ## Next steps
 
 - **48n profile** (job 49419851, in flight) — completes the node-count curve.

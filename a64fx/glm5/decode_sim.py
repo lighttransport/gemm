@@ -196,6 +196,32 @@ def mem_per_node_gb(N, prec='int8', attn_ways=None, M=0, max_pos=2048):
     return (w+kv)/1e9
 def fits(gb): return "OK" if gb <= NODE_GB-RESERVE_GB else "DOES NOT FIT"
 
+# ---------- long-context node sizing (weights sharded + KV context-parallel) ----------
+# At 512k/1M ctx the latent KV DOMINATES: one stream's full-ctx KV is 78L*ctx*576*2B (47GB@512k,
+# 94GB@1M) -> must context-parallel shard (GLM5_CP=1: each node holds ctx/N positions), else it
+# doesn't fit a single node. Weights are secondary (int8 floor ~27n, bf16 ~54n). "int8" = the shipped
+# int8-store / int16-compute path (GLM5_GEMM_SDOT=2). kv_bytes: bf16 KV=2, int4 KV=0.5 (GLM5_INT4_KV).
+USABLE_GB = NODE_GB - RESERVE_GB - 2.0            # 32 - 2 reserve - ~2 activations/scratch = 28
+def weights_gb_per_node(N, prec='int8'):
+    """Replicated router(bf16) + sharded /N: attn(TP) + shared/dense(TP) + experts(EP) + head/embed
+    (bf16 vocab-sharded). Weight bytes: int8=1, bf16=2."""
+    wb = 1 if prec=='int8' else 2
+    return (ROUTER_P*2 + (ATTN_P*wb + SHARED_P*wb + DENSE_P*wb + N_EXP*EXPERT_P*N_MOE*wb
+            + (HEAD_P+VOCAB*H)*2)/N)/1e9
+def kv_gb_per_node(N, ctx, M, kv_bytes=2, cp=True):
+    """Latent KV/node: M streams x 78L x (ctx/N if CP else ctx) positions x 576 x kv_bytes."""
+    pos = math.ceil(ctx/N) if cp else ctx
+    return M*N_LAYERS*pos*KVC*kv_bytes/1e9
+def min_nodes(prec='int8', ctx=524288, M=8, kv_bytes=2, usable_gb=USABLE_GB, cp=True, nmax=8192):
+    """Fewest nodes where weights + CP-KV fit `usable_gb`. Returns (N, weights_gb, kv_gb) or None.
+    This is the MEMORY-fit minimum: decode-optimized wants exactly this (fewer ranks = more efficient,
+    measured 32n~=96n); prefill-optimized wants MORE (compute parallelism); prefill+decode (serving)
+    is pinned here by the persistent full-ctx KV."""
+    for N in range(1, nmax+1):
+        w = weights_gb_per_node(N, prec); kv = kv_gb_per_node(N, ctx, M, kv_bytes, cp)
+        if w+kv <= usable_gb: return N, w, kv
+    return None
+
 # ---------- report ----------
 def hdr(s): print("\n"+s+"\n"+"-"*len(s))
 
@@ -313,7 +339,23 @@ if __name__ == "__main__":                       # report only when run directly
         gb = mem_per_node_gb(N,prec,attn_ways=ways,M=M,max_pos=mp)
         print(f"  {desc:<46} {gb:>7.1f}   {fits(gb)}")
     print(f"  (ms->kc per-stream KV: M=32 x 78L x 2048pos x {KVC} x 2B = {32*N_LAYERS*2048*KVC*2/1e9:.1f} GB)")
-    
+
+    hdr(f"Long-context MIN NODES (weights sharded + KV context-parallel, <={USABLE_GB:.0f} GB/node, M=8)")
+    print(f"  total weights: int8 {(ROUTER_P*2+ATTN_P+SHARED_P+DENSE_P+N_EXP*EXPERT_P*N_MOE+(HEAD_P+VOCAB*H)*2)/1e9:.0f} GB "
+          f"| bf16 {(ROUTER_P*2+(ATTN_P+SHARED_P+DENSE_P+N_EXP*EXPERT_P*N_MOE)*2+(HEAD_P+VOCAB*H)*2)/1e9:.0f} GB "
+          f"(floors: int8 >={min_nodes('int8',1,0)[0]}n, bf16 >={min_nodes('bf16',1,0)[0]}n for weights alone)")
+    print(f"  KV per stream (78L x ctx x {KVC} x 2B): 512k={N_LAYERS*524288*KVC*2/1e9:.0f} GB  1M={N_LAYERS*1048576*KVC*2/1e9:.0f} GB -> CP-shard mandatory")
+    print("   prec   ctx   bf16-KV   int4-KV   (weights+KV GB/node at the int4 min)")
+    for prec in ['int8','bf16']:
+        for ctx in [524288,1048576]:
+            b=min_nodes(prec,ctx,8,2); q=min_nodes(prec,ctx,8,0.5)
+            print(f"  {prec:<5}{ctx//1024:>5}k   {b[0]:>5}n    {q[0]:>5}n     ({q[1]:.1f}+{q[2]:.1f})")
+    print("  int8=int8-store/int16-compute (GEMM_SDOT=2); int4-KV=GLM5_INT4_KV. batching M=1/4/8 (int8 512k bf16KV): "
+          f"{min_nodes('int8',524288,1,2)[0]}/{min_nodes('int8',524288,4,2)[0]}/{min_nodes('int8',524288,8,2)[0]}n.")
+    print("  => decode-opt: run AT this min (fewer ranks = more efficient). prefill-opt: run ABOVE (compute")
+    print("     parallelism, query-SP). prefill+decode serving: pinned here by the persistent full-ctx KV.")
+    print("  query: min_nodes(prec='int8'|'bf16', ctx, M, kv_bytes=2|0.5) -> (N, weights_gb, kv_gb).")
+
     hdr("Takeaways")
     print(f"""  * THEORETICAL UPPER BOUND (bandwidth) at 96n int8: ~{ub_tok_s(96,1,128):.0f} tok/s (M=1, sharded attn),
         rising to ~{ub_tok_s(96,32,128):.0f} with M=32. Replicated attention would cap it at ~{ub_tok_s(96,1,128,shard_attn=False):.0f}.
