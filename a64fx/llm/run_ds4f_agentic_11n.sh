@@ -24,6 +24,10 @@ export MAX_NEW=${MAX_NEW:-512}          # agentic completions run long; override
 export DS4F_NUMA=${DS4F_NUMA:-1}        # the ~1.40x bit-identical decode lever (in-runner interleave)
 # quality-preserving decode bundle (== ds4f_ep_runner --preset decode); pinned so the config is explicit
 export DS4F_REAL=1 DS4F_FP8_BF16=1 DS4F_Q8_DENSE=1 DS4F_TIERB2=1 DS4F_MHC=1 DS4F_HC_PAR=1 DS4F_HC_RMSPAR=1
+# Batched-verify prefill (comm-amortize + batched qproj/mHC): +74% prefill (13.3->23 tok/s), COHERENT
+# not bit-identical (K-tile GEMM reassoc). Default ON for agentic coding (accepts a valid greedy path);
+# set DS4F_PREFILL_GEMM=0 for bit-reproducible token-by-token prefill.
+export DS4F_PREFILL_GEMM=${DS4F_PREFILL_GEMM:-1}
 case "$KVBITS" in
   16) export DS4F_INT8_KV=0; CEIL="~16k safe" ;;
   8)  export DS4F_INT8_KV=1; CEIL="~16k+ (int8; add DS4F_INT8_CMP=1)" ;;

@@ -101,6 +101,54 @@ static void embed_lookup(const ds4f_model *m, int tok, float *x) {
     }
 }
 
+/* ================= HTTP serve mode (DS4F_SERVE): load once, loop on requests ================= */
+/* reset per-request state: the compressor/indexer RING state carries between requests (position-
+ * indexed KV/cmp/idx caches self-overwrite at pos 0). int8 KV/cmp calibration re-runs per request. */
+static void ds4f_serve_reset(ds4f_model *m) {
+    ds4f_config *c = &m->cfg;
+    for (int L = 0; L < c->n_layers; L++) {
+        ds4f_layer *ly = &m->layers[L];
+        int ratio = c->compress_ratios[L];
+        if (m->tierb2 && ratio) {
+            ds4f_compress_state_reset(ly->cmp_kv_state, ly->cmp_score_state, ratio, c->kv_lora);
+            if (ratio == 4) ds4f_compress_state_reset(ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ratio, c->index_head_dim);
+        }
+        ly->kv_caln = 0; ly->kv_frozen = 0; ly->cmp_caln = 0; ly->cmp_frozen = 0;   /* int8 recalibrate */
+    }
+}
+/* one greedy generation: prefill the prompt (batched-verify if DS4F_PREFILL_GEMM else token-by-token)
+ * then argmax-decode up to max_new (stop on eos). Returns n_gen written to out_ids. All ranks lockstep. */
+static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, float *x, int *out_ids) {
+    int C = m->cfg.hidden, pf_last = 0;
+    int pf_gemm = envi("DS4F_PREFILL_GEMM", 0), K = envi("DS4F_PREFILL_K", 32);
+    if (K < 1) K = 1; if (K > 32) K = 32;
+    if (pf_gemm && !m->has_mtp) {                       /* batched-verify prefill */
+        ds4f_alloc_prefill_batch(m, K);
+        size_t hcC = (size_t)m->cfg.hc_mult * C;
+        float *Xin = (float *)aligned_alloc(64, (size_t)K*C*4), *vhc = (float *)aligned_alloc(64, (size_t)K*hcC*4);
+        for (int base = 0; base < np; base += K) {
+            int M = np - base < K ? np - base : K;
+            for (int mm = 0; mm < M; mm++) embed_lookup(m, pids[base+mm], Xin + (size_t)mm*C);
+            int ot[32]; ds4f_forward_verify(m, Xin, M, base, ot, vhc); pf_last = ot[M-1];
+        }
+        free(Xin); free(vhc);
+    } else {                                            /* token-by-token prefill */
+        for (int p = 0; p < np; p++) { embed_lookup(m, pids[p], x); pf_last = ds4f_forward_token(m, x, p); }
+    }
+    int n_gen = 0, cur = pf_last;                       /* greedy argmax decode */
+    for (int g = 0; g < max_new; g++) {
+        out_ids[n_gen++] = cur;
+        if (cur == DS4F_EOS_ID) break;
+        embed_lookup(m, cur, x);
+        cur = ds4f_forward_token(m, x, np + g);
+    }
+    return n_gen;
+}
+static long ds4f_read_seq(const char *path) {
+    FILE *f = fopen(path, "r"); if (!f) return 0;
+    long v = 0; if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); return v;
+}
+
 /* ---- topology (tofu_topo.txt; written once by tofu_topo_helper) ----
  * TOPO_PATH (default tofu_topo.txt) may be overridden per process via TOFU_TOPO_PATH
  * so co-resident EP groups (e.g. ds4p on 96 nodes + ds4f on 12) can keep SEPARATE
@@ -520,6 +568,45 @@ int main(int argc,char**argv){
 
     int C = cfg.hidden;
     float *x = (float *)aligned_alloc(256, (size_t)C * 4);
+
+    /* ---- HTTP serve loop: load once, then loop on requests from the (python) frontend via shared-FS
+     * files. Rank 0 polls a request-seq counter; a barrier releases all ranks together; all read the
+     * same prompt (shared FS) -> lockstep, no broadcast. Loops until killed. ---- */
+    if (envi("DS4F_SERVE", 0)) {
+        const char *reqf = getenv("DS4F_SERVE_REQ"), *respf = getenv("DS4F_SERVE_RESP");
+        const char *reqseqf = getenv("DS4F_SERVE_REQSEQ"), *respseqf = getenv("DS4F_SERVE_RESPSEQ");
+        if (!reqf || !respf || !reqseqf || !respseqf) die("DS4F_SERVE needs DS4F_SERVE_{REQ,RESP,REQSEQ,RESPSEQ}", -1);
+        int maxpos = envi("DS4F_MAXPOS", 4096);
+        int *pids = (int *)malloc((size_t)maxpos * sizeof(int));
+        int *oids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
+        long last_seq = ds4f_read_seq(reqseqf);   /* ignore any stale request present at startup */
+        if (MyRank == 0) logmsg("SERVE ready: poll %s (seq=%ld), req %s -> resp %s\n", reqseqf, last_seq, reqf, respf);
+        for (;;) {
+            long seq = last_seq;
+            if (MyRank == 0) while ((seq = ds4f_read_seq(reqseqf)) <= last_seq) usleep(2000);
+            barrier();                                          /* release all ranks (req file is written before its seq bumps) */
+            int mnew = 256, np = 0;
+            FILE *rf = fopen(reqf, "r");
+            if (rf) { if (fscanf(rf, "%d", &mnew) != 1) mnew = 256;
+                      int v; while (np < maxpos && fscanf(rf, "%d", &v) == 1) pids[np++] = v; fclose(rf); }
+            if (np > maxpos) np = maxpos;                       /* truncate over-long prompt to the KV ceiling */
+            if (mnew < 1) mnew = 1;
+            if (np + mnew > maxpos) mnew = (maxpos > np) ? maxpos - np : 1;   /* keep prompt+gen <= MAXPOS */
+            double t0 = now_sec();
+            ds4f_serve_reset(m);
+            int ng = np > 0 ? ds4f_serve_gen(m, pids, np, mnew, x, oids) : 0;
+            double dt = now_sec() - t0;
+            if (MyRank == 0) {
+                FILE *of = fopen(respf, "w");
+                if (of) { for (int i = 0; i < ng; i++) fprintf(of, "%d%s", oids[i], i+1 < ng ? " " : "\n"); fclose(of); }
+                long rq = ds4f_read_seq(reqseqf);
+                FILE *sf = fopen(respseqf, "w"); if (sf) { fprintf(sf, "%ld\n", rq); fclose(sf); }
+                logmsg("SERVE req#%ld: prompt=%d gen=%d in %.2fs (%.1f tok/s)\n", rq, np, ng, dt, ng/dt);
+            }
+            barrier();                                          /* lockstep + ensure response visible before next */
+            last_seq = ds4f_read_seq(reqseqf);
+        }
+    }
 
     /* ---- prefill (synthetic, identical activations on every rank) ----
      * Batched path (prefill_batch>0): ds4f_forward_prefill processes M tokens per call
