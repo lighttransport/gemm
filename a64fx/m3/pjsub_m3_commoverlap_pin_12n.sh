@@ -43,8 +43,10 @@ run(){  # $1=label  $2..=env
   rc=$?; [ $rc -eq 124 ] && echo "[$1] TIMEOUT/HANG (rc=124)"; [ $rc -ne 0 ] && [ $rc -ne 124 ] && echo "[$1] rc=$rc"
   grep -hE "AGG|comm-driver pinned|MSTREAM|NaN" m3_ep_rank00.txt 2>/dev/null | sed "s/^/[$1] /"
 }
+# M3 uses only CMG0 (12 threads); CMG1-3 (cores 24-59) are IDLE. Pin comm to an idle-CMG core (24) so
+# compute keeps all 12 CMG0 cores AND comm gets a dedicated core -> the correct overlap test.
 run A_sync           M3_TP=1                 M3_COMM_OVERLAP=0 OMP_NUM_THREADS=12 LLM_THREADS=12
 run C_overlap_unpin  M3_TP=1 M3_TP_SHARED=0  M3_COMM_OVERLAP=1 OMP_NUM_THREADS=12 LLM_THREADS=12
-run B_overlap_pin    M3_TP=1 M3_TP_SHARED=0  M3_COMM_OVERLAP=1 OMP_NUM_THREADS=11 LLM_THREADS=11 \
-                     OMP_PROC_BIND=close OMP_PLACES=cores M3_COMM_CORE=23
+run B_overlap_idlecmg M3_TP=1 M3_TP_SHARED=0 M3_COMM_OVERLAP=1 OMP_NUM_THREADS=12 LLM_THREADS=12 \
+                     OMP_PROC_BIND=close OMP_PLACES=cores M3_COMM_CORE=24
 echo "SENTINEL m3_commoverlap_pin_12n=done"; echo "=== done $(date) ==="
