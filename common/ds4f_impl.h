@@ -4825,6 +4825,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             memcpy(m->s_q,  m->p_q  + (size_t)k*H, (size_t)H*4);     /* indexer + attention read s_q */
             if (m->tierb2 && ratio) ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin);
             m->cp_gather = 0;
+            { DS4F_TIC();
             if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 if (!ds4f_attn_tb2_gemm(m, &at))   /* DS4F_ATTN_GEMM: 8-head KV-reuse per verify position */
@@ -4832,6 +4833,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             } else { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
+            DS4F_TOC(DS4F_P_ATTN); }
             memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
         }
         /* batched grouped low-rank o-projection (no-TP) */

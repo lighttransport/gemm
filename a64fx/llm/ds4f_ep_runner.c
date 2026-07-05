@@ -579,10 +579,10 @@ int main(int argc,char**argv){
             if (MyRank == 0) {
                 logmsg("prefill via batched verify (DS4F_PREFILL_GEMM, K=%d)\n", K);
                 double n = prefill > 0 ? prefill : 1;
-                logmsg("  prefill-verify tb2 (ms/tok over %d pos): lcmp=%.3f qproj=%.3f scan=%.3f topk=%.3f icmp=%.3f wproj=%.3f rope=%.3f\n",
+                logmsg("  prefill-verify tb2 (ms/tok over %d pos): lcmp=%.3f qproj=%.3f scan=%.3f topk=%.3f icmp=%.3f wproj=%.3f rope=%.3f attn=%.3f\n",
                        prefill, m->prof[DS4F_P_TB2LCMP]/n*1e3, m->prof[DS4F_P_TB2QPROJ]/n*1e3,
                        m->prof[DS4F_P_TB2SCAN]/n*1e3, m->prof[DS4F_P_TB2TOPK]/n*1e3, m->prof[DS4F_P_TB2ICMP]/n*1e3,
-                       m->prof[DS4F_P_TB2WPROJ]/n*1e3, m->prof[DS4F_P_TB2ROPE]/n*1e3);
+                       m->prof[DS4F_P_TB2WPROJ]/n*1e3, m->prof[DS4F_P_TB2ROPE]/n*1e3, m->prof[DS4F_P_ATTN]/n*1e3);
             }
             free(Xin); free(vhc);
         } else {
