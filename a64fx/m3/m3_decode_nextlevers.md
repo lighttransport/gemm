@@ -7,7 +7,15 @@ uncertain ~1.2×). Baselines/model: `m3.md` decode roofline, `m3_decode_sim.py`.
 
 ---
 
-## Lever 1 — wire int4-KV into batched decode (`m3_forward_batch_decode`)
+## Lever 1 — wire int4-KV into batched decode (`m3_forward_batch_decode`) — ✅ IMPLEMENTED (223c5b9a)
+
+**STATUS (2026-07-05):** DONE + functionally validated (job 49441928, 1n synth): int4-KV now **engages**
+in batched decode (out0 differs from bf16 at M=8/32/64, vs bit-identical before), **NaN=0**, **tok/s
+unchanged** (unpack is free). Per-stream KV ~3.9× smaller → `m3_decode_sim` shows M=48 peak reachable at
+4k ctx (48n: bf16 M=11 → int4 M=46). **Remaining before production: real-weight QUALITY gate** (does
+int4-KV keep coherent gen? — extend `pjsub_m3_kv_mstream_1n.sh` to batched real-weight bf16-vs-int4, then
+a 48n/4k real A/B where bf16 OOMs at M=48 but int4 fits). Original scope below.
+
 
 **Why.** int4-KV currently exists ONLY in the single-stream `m3_forward_token` path (codec
 `m3_q4_pack`/`m3_q4_dot`/`m3_q4_axpy` + per-layer `L->k_q4/v_q4/k_qs/v_qs`, m3_impl.h ~64, 571, 665).
