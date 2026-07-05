@@ -4719,7 +4719,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             m->cp_gather = 0;
             if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
-                ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+                if (!ds4f_attn_tb2_gemm(m, &at))   /* DS4F_ATTN_GEMM: 8-head KV-reuse per verify position */
+                    ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
             } else { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
