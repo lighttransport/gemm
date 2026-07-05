@@ -7,14 +7,18 @@ uncertain ~1.2×). Baselines/model: `m3.md` decode roofline, `m3_decode_sim.py`.
 
 ---
 
-## Lever 1 — wire int4-KV into batched decode (`m3_forward_batch_decode`) — ✅ IMPLEMENTED (223c5b9a)
+## Lever 1 — wire int4-KV into batched decode (`m3_forward_batch_decode`) — ✅ COMPLETE (223c5b9a)
 
-**STATUS (2026-07-05):** DONE + functionally validated (job 49441928, 1n synth): int4-KV now **engages**
-in batched decode (out0 differs from bf16 at M=8/32/64, vs bit-identical before), **NaN=0**, **tok/s
-unchanged** (unpack is free). Per-stream KV ~3.9× smaller → `m3_decode_sim` shows M=48 peak reachable at
-4k ctx (48n: bf16 M=11 → int4 M=46). **Remaining before production: real-weight QUALITY gate** (does
-int4-KV keep coherent gen? — extend `pjsub_m3_kv_mstream_1n.sh` to batched real-weight bf16-vs-int4, then
-a 48n/4k real A/B where bf16 OOMs at M=48 but int4 fits). Original scope below.
+**STATUS (2026-07-05): DONE + validated + quality-gated.**
+- Functional (job 49441928, 1n synth): int4-KV **engages** (out0 ≠ bf16 at M=8/32/64, vs bit-identical
+  before), **NaN=0**, **tok/s unchanged** (unpack is free). Per-stream KV ~3.9× smaller → the M=48 peak
+  is reachable at long ctx (`m3_decode_sim`: 48n/4k bf16 M=11 → int4 M=46).
+- Quality (job 49442681, 24n fp8 real): "capital of France" → bf16-KV `" Paris. (Paris is the capital of
+  France.)"` vs int4-KV `" Paris."` — **same correct answer, coherent, NaN=0, but int4 EOS's early**
+  (perturbs the greedy trajectory = expected KV-quant loss). **PASS (safe, won't garble) but LOSSY.**
+- **Deploy rule:** bf16-KV for short ctx (M=48 fits, best quality); int4-KV to recover M/throughput at
+  long ctx where bf16 caps M low. Optional follow-up: quantify drift on longer/harder prompts if int4-KV
+  goes to a quality-sensitive production path. Original scope below.
 
 
 **Why.** int4-KV currently exists ONLY in the single-stream `m3_forward_token` path (codec
