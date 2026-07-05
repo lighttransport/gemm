@@ -1274,6 +1274,36 @@ static void ds4f_idxsc_worker(void *arg, int tid, int nthr) {
         Tk->score[t] = acc;
     }
 }
+/* DS4F_IDX_GEMM (default on): 8-index-head-blocked scan. The per-head worker above dots each
+ * kt against one head at a time (kt re-loaded from L1 per head; one high-latency svaddv per head,
+ * serially). Here 8 heads share each loaded kt d-chunk in 8 independent accumulators -> fewer
+ * loads + ILP that hides the svaddv latency. BIT-IDENTICAL: per head the d-reduction runs in the
+ * same order, and relu(dot)*weights are summed in the same ascending-h order. Needs H%8==0. */
+static void ds4f_idxsc8_worker(void *arg, int tid, int nthr) {
+    ds4f_idxsc_task *Tk = (ds4f_idxsc_task *)arg;
+    int Tn = Tk->T, H = Tk->H, hd = Tk->hd, vl = (int)svcntw();
+    int per = Tn / nthr, extra = Tn % nthr;
+    int t0 = per * tid + (tid < extra ? tid : extra), t1 = t0 + per + (tid < extra ? 1 : 0);
+    svbool_t tp = svptrue_b32();
+    for (int t = t0; t < t1; t++) {
+        const float *kt = Tk->kvc + (size_t)t * hd; float acc = 0.f;
+        for (int hb = 0; hb < H; hb += 8) {
+            const float *q = Tk->q + (size_t)hb * hd;
+            svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+            svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+            for (int x = 0; x < hd; x += vl) { svbool_t pg = svwhilelt_b32(x, hd);
+                svfloat32_t vk = svld1(pg, kt + x);
+                a0=svmla_f32_x(pg,a0,svld1(pg,q+0*hd+x),vk); a1=svmla_f32_x(pg,a1,svld1(pg,q+1*hd+x),vk);
+                a2=svmla_f32_x(pg,a2,svld1(pg,q+2*hd+x),vk); a3=svmla_f32_x(pg,a3,svld1(pg,q+3*hd+x),vk);
+                a4=svmla_f32_x(pg,a4,svld1(pg,q+4*hd+x),vk); a5=svmla_f32_x(pg,a5,svld1(pg,q+5*hd+x),vk);
+                a6=svmla_f32_x(pg,a6,svld1(pg,q+6*hd+x),vk); a7=svmla_f32_x(pg,a7,svld1(pg,q+7*hd+x),vk); }
+            float s[8] = { svaddv_f32(tp,a0),svaddv_f32(tp,a1),svaddv_f32(tp,a2),svaddv_f32(tp,a3),
+                           svaddv_f32(tp,a4),svaddv_f32(tp,a5),svaddv_f32(tp,a6),svaddv_f32(tp,a7) };
+            for (int hh = 0; hh < 8; hh++) { float dot = s[hh] < 0.f ? 0.f : s[hh]; acc += dot * Tk->weights[hb + hh]; }
+        }
+        Tk->score[t] = acc;
+    }
+}
 
 /* --- RESIDENT int8/SVE indexer scan (gated DS4F_IDX_INT8, default off) -----------------
  * idx_kv is Hadamard-rotated + fp4-act-quantized at write (rotation kills outlier/sink
@@ -1376,8 +1406,10 @@ static double ds4f_g_tb2topk = 0.0;               /* index_topk top-k selection 
 static void ds4f_index_score(const float *q, const float *kvc, const float *weights,
                              int H, int hd, int T, float *score, ds4f_pool *pool) {
     if (pool && T >= 64) {
+        static int idxg = -1;   /* DS4F_IDX_GEMM: 8-index-head-blocked scan (ILP + fewer kt loads) */
+        if (idxg < 0) { const char *e = getenv("DS4F_IDX_GEMM"); idxg = e ? atoi(e) : 1; }
         ds4f_idxsc_task tk = { q, kvc, weights, H, hd, T, score };
-        ds4f_pool_run(pool, ds4f_idxsc_worker, &tk);
+        ds4f_pool_run(pool, (idxg && (H % 8) == 0) ? ds4f_idxsc8_worker : ds4f_idxsc_worker, &tk);
         return;
     }
     for (int t = 0; t < T; t++) {
