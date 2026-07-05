@@ -1689,6 +1689,7 @@ static int ds4f_index_step(
     int H, int hd, int rd, int ratio, int start_pos, int offset, int k,
     const void *wq_b, const void *weights_proj, int w_bf16,
     const int8_t *wq_b_i8, const float *wq_b_sc,   /* DS4F_IDX_INT8W: non-NULL => int8 W8A8 qproj */
+    const float *q_pre,   /* batched-prefill: non-NULL => use this pre-projected q (skip the qproj matvec) */
     const void *cwkv, const void *cwgate, const float *cape, const uint16_t *cnorm,
     const float *rcos, const float *rsin, float eps,
     float *comp_kv_state, float *comp_score_state, float *idx_kv_cache,
@@ -1701,7 +1702,9 @@ static int ds4f_index_step(
     if (s_cp_merge < 0) { const char *e = getenv("DS4F_CP_MERGE"); s_cp_merge = (e ? atoi(e) : 1); }
     int end_pos = start_pos + 1, half = rd / 2;
     double _tqp0 = ds4f_now();
-    if (pool && wq_b_i8) {                                   /* q = wq_b(qr) via int8 W8A8 (lossy, gated) */
+    if (q_pre) {                                            /* batched prefill: q already projected (M=K GEMM upstream) */
+        memcpy(q_scr, q_pre, (size_t)H * hd * 4);
+    } else if (pool && wq_b_i8) {                           /* q = wq_b(qr) via int8 W8A8 (lossy, gated) */
         int8_t *qi = (int8_t *)alloca((size_t)qlora); float qmx = 0.f;
         for (int i = 0; i < qlora; i++) { float v = qr[i] < 0 ? -qr[i] : qr[i]; if (v > qmx) qmx = v; }
         float xsc = qmx > 0 ? qmx / 127.f : 0.f, qinv = qmx > 0 ? 127.f / qmx : 0.f;
@@ -3872,6 +3875,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
                         c->index_n_heads, ihd, rd, ratio, pos, offset, k,
                         ly->idx_wq_b, ly->idx_wproj, 1,
                         idx_int8w ? ly->idx_wq_b_i8 : NULL, idx_int8w ? ly->idx_wq_b_sc : NULL,
+                        m->s_idx_qpre,   /* batched-prefill pre-projected q (NULL in decode) */
                         ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
                         rcos, rsin, eps,
                         ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,
@@ -4797,9 +4801,21 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         { ds4f_pf_qnr_task t = { m, pos0, K, rcos, rsin };
           ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
         ds4f_gemm(m, m->p_kvlat, &ly->wkv, m->p_hn, K, KV, C);
+        /* batch the indexer qproj (the biggest per-position tb2 matvec): q_idx[K, iH*ihd] =
+         * idx_wq_b @ p_qlat -> the [iH*ihd, q_lora] weight streams ONCE for all K queries (M=K
+         * GEMM) instead of K matvecs; index_step then uses the pre-projected q per position. */
+        int idxg_pf = 0;
+        if (m->tierb2 && ratio == 4 && ly->idx_wq_b) {
+            int iHhd = c->index_n_heads * c->index_head_dim;
+            if (!m->v_idxq) m->v_idxq = (float *)aligned_alloc(64, (size_t)m->m_tile * iHhd * 4);
+            ds4f_tensor wqbt = { ly->idx_wq_b, NULL, DS4F_BF16, iHhd, c->q_lora };
+            ds4f_gemm(m, m->v_idxq, &wqbt, m->p_qlat, K, iHhd, c->q_lora);
+            idxg_pf = 1;
+        }
         /* per-position tier-B2 attention (causal: append KV then attend, in order) */
         for (int k = 0; k < K; k++) {
             int pos = pos0 + k;
+            m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k * c->index_n_heads * c->index_head_dim : NULL;
             float *kvl = m->p_kvlat + (size_t)k*KV;
             ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
             ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
@@ -4878,6 +4894,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_hc_post(m, m->v_x4 + (size_t)k*hcC, m->v_resid + (size_t)k*hcC, o, pf[k], cf[k]);
         }
     }
+    m->s_idx_qpre = NULL;   /* clear the batched-prefill qproj injection so decode's index_step recomputes */
     /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
     for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
     { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, K, C, C };
