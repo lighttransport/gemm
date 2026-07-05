@@ -4220,6 +4220,71 @@ static void ds4f_hcpost_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* ===== batched (K positions) mHC for verify prefill: one pool_run/op (÷K dispatches) with full
+ * (k×work) parallelism. Position-independent -> same per-position math (coherent, not bit-identical:
+ * the ss double-accum reassociates vs the per-position parallel reduction, ~1e-13). post/comb use
+ * the caller's pa/ca [K][16]/[K][64] stride. ===== */
+typedef struct { const float *fn, *x4b; float *mixb; int mix_hc, hd, K; } ds4f_hcmix_b_task;
+static void ds4f_hcmix_b_worker(void *arg, int tid, int nthr) {   /* mixb[k*mix_hc + i] = fn[i] . x4b[k] */
+    ds4f_hcmix_b_task *T = (ds4f_hcmix_b_task *)arg; int mh = T->mix_hc, hd = T->hd;
+    long tot = (long)T->K * mh, per = tot/nthr, ex = tot%nthr;
+    long u0 = per*tid + (tid<ex?tid:ex), u1 = u0 + per + (tid<ex?1:0);
+    for (long u = u0; u < u1; u++) { int k = (int)(u/mh), i = (int)(u%mh);
+        const float *w = T->fn + (size_t)i*hd, *x = T->x4b + (size_t)k*hd;
+        float a = 0.f; for (int j = 0; j < hd; j++) a += w[j]*x[j]; T->mixb[(size_t)k*mh + i] = a; }
+}
+typedef struct { const float *x4b; float *ssb; int hd, K; } ds4f_hcss_b_task;
+static void ds4f_hcss_b_worker(void *arg, int tid, int nthr) {    /* ssb[k] = ||x4b[k]||^2 (double accum) */
+    ds4f_hcss_b_task *T = (ds4f_hcss_b_task *)arg; int hd = T->hd, K = T->K;
+    int per = K/nthr, ex = K%nthr, k0 = per*tid+(tid<ex?tid:ex), k1 = k0+per+(tid<ex?1:0);
+    for (int k = k0; k < k1; k++) { const float *x = T->x4b + (size_t)k*hd; double s = 0.0;
+        for (int j = 0; j < hd; j++) { float v = x[j]; s += (double)v*v; } T->ssb[k] = (float)s; }
+}
+typedef struct { const float *x4b, *preb; float *yb; int hc, C, K; } ds4f_hccol_b_task;
+static void ds4f_hccol_b_worker(void *arg, int tid, int nthr) {   /* yb[k,d] = Σ_j preb[k,j]·x4b[k,j,d] */
+    ds4f_hccol_b_task *T = (ds4f_hccol_b_task *)arg; int hc = T->hc, C = T->C; size_t hcC = (size_t)hc*C;
+    long tot = (long)T->K*C, per = tot/nthr, ex = tot%nthr;
+    long u0 = per*tid+(tid<ex?tid:ex), u1 = u0+per+(tid<ex?1:0);
+    for (long u = u0; u < u1; u++) { int k = (int)(u/C), d = (int)(u%C);
+        const float *x = T->x4b + (size_t)k*hcC, *pre = T->preb + (size_t)k*hc; float a = 0.f;
+        for (int j = 0; j < hc; j++) a += pre[j]*x[(size_t)j*C+d]; T->yb[(size_t)k*C+d] = a; }
+}
+typedef struct { float *x4b; const float *residb, *fb, *postb, *combb; int hc, C, K, pstr, cstr; } ds4f_hcpost_b_task;
+static void ds4f_hcpost_b_worker(void *arg, int tid, int nthr) {  /* x4b[k,kk,d] = post·f + Σ comb·resid */
+    ds4f_hcpost_b_task *T = (ds4f_hcpost_b_task *)arg; int hc = T->hc, C = T->C; size_t hcC = (size_t)hc*C;
+    long tot = (long)T->K*C, per = tot/nthr, ex = tot%nthr;
+    long u0 = per*tid+(tid<ex?tid:ex), u1 = u0+per+(tid<ex?1:0);
+    for (long u = u0; u < u1; u++) { int k = (int)(u/C), d = (int)(u%C);
+        float *x4 = T->x4b + (size_t)k*hcC; const float *resid = T->residb + (size_t)k*hcC;
+        const float *f = T->fb + (size_t)k*C, *post = T->postb + (size_t)k*T->pstr, *comb = T->combb + (size_t)k*T->cstr;
+        for (int kk = 0; kk < hc; kk++) { float v = post[kk]*f[d];
+            for (int j = 0; j < hc; j++) v += comb[j*hc+kk]*resid[(size_t)j*C+d];
+            x4[(size_t)kk*C+d] = v; } }
+}
+/* batched hc_pre for K positions: mixes (GEMM-ish) + per-k rsq/sinkhorn + collapse. postb/combb
+ * are the caller's pa/ca arrays (row stride pstr/cstr); yb[K,C], x4b/residb are [K, hc*C]. */
+static void ds4f_hc_pre_batch(ds4f_model *m, const float *x4b, int K, const float *fn,
+                              const float *scale, const float *base, float *yb,
+                              float *postb, int pstr, float *combb, int cstr) {
+    ds4f_config *c = &m->cfg; int hc = c->hc_mult, C = c->hidden, hd = hc*C, mix_hc = (2+hc)*hc;
+    float *mixb = (float *)alloca((size_t)K*mix_hc*4), *ssb = (float *)alloca((size_t)K*4), *preb = (float *)alloca((size_t)K*hc*4);
+    ds4f_hcmix_b_task mt = { fn, x4b, mixb, mix_hc, hd, K }; ds4f_pool_run(m->pool, ds4f_hcmix_b_worker, &mt);
+    ds4f_hcss_b_task st = { x4b, ssb, hd, K };               ds4f_pool_run(m->pool, ds4f_hcss_b_worker, &st);
+    for (int k = 0; k < K; k++) {
+        float rsq = 1.0f/sqrtf(ssb[k]/hd + c->norm_eps);
+        for (int mm = 0; mm < mix_hc; mm++) mixb[(size_t)k*mix_hc+mm] *= rsq;
+        ds4f_hc_sinkhorn(mixb + (size_t)k*mix_hc, scale, base, hc, c->hc_iters, c->hc_eps,
+                         preb + (size_t)k*hc, postb + (size_t)k*pstr, combb + (size_t)k*cstr);
+    }
+    ds4f_hccol_b_task ct = { x4b, preb, yb, hc, C, K }; ds4f_pool_run(m->pool, ds4f_hccol_b_worker, &ct);
+}
+static void ds4f_hc_post_batch(ds4f_model *m, float *x4b, int K, const float *residb, const float *fb,
+                               const float *postb, int pstr, const float *combb, int cstr) {
+    ds4f_config *c = &m->cfg;
+    ds4f_hcpost_b_task pt = { x4b, residb, fb, postb, combb, c->hc_mult, c->hidden, K, pstr, cstr };
+    ds4f_pool_run(m->pool, ds4f_hcpost_b_worker, &pt);
+}
+
 /* WS1b: fuse the mHC RMS sum-of-squares INTO the mixes-matvec dispatch. The serial
  * `ss = Σ x4^2` over hd=hc*hidden was ~35% of the "other" phase (latency-bound double
  * accumulator chain on tid0, 89us/call). This worker computes the IDENTICAL F32 matvec
@@ -4785,12 +4850,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         int ratio = c->compress_ratios[L];
         const float *rcos = ratio ? m->rope_comp_cos : m->rope_dense_cos;
         const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;
-        /* mHC pre (attn): collapse each position's hc streams -> p_x[k]; save residual + sinkhorn weights */
-        for (int k = 0; k < K; k++) {
-            ds4f_hc_pre(m, m->v_x4 + (size_t)k*hcC, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
-                        m->p_x + (size_t)k*C, pa[k], ca[k]);
-            memcpy(m->v_resid + (size_t)k*hcC, m->v_x4 + (size_t)k*hcC, hcC*4);
-        }
+        /* mHC pre (attn): collapse each position's hc streams -> p_x[k]; save residual + sinkhorn weights (batched) */
+        memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
+        ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
+                          m->p_x, &pa[0][0], 16, &ca[0][0], 64);
         /* batched q/kv projections */
         { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
@@ -4842,14 +4905,11 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
         }
         ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
-        for (int k = 0; k < K; k++)                                  /* mHC post (attn) */
-            ds4f_hc_post(m, m->v_x4 + (size_t)k*hcC, m->v_resid + (size_t)k*hcC, m->p_o + (size_t)k*C, pa[k], ca[k]);
+        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pa[0][0], 16, &ca[0][0], 64);  /* mHC post (attn) */
         /* mHC pre (ffn) */
-        for (int k = 0; k < K; k++) {
-            ds4f_hc_pre(m, m->v_x4 + (size_t)k*hcC, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
-                        m->p_x + (size_t)k*C, pf[k], cf[k]);
-            memcpy(m->v_resid + (size_t)k*hcC, m->v_x4 + (size_t)k*hcC, hcC*4);
-        }
+        memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
+        ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
+                          m->p_x, &pf[0][0], 16, &cf[0][0], 64);
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
         /* shared expert (no-TP) */
@@ -4890,11 +4950,11 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                   for (int i = 0; i < C; i++) route[i] += w * o[i]; }
           } }
         if (m->ar_cb) m->ar_cb(m->p_route, C*K, m->ar_ctx);          /* EP combine: one [K,C] reduce */
-        for (int k = 0; k < K; k++) {                                /* moe out = shared + routed; mHC post (ffn) */
+        for (int k = 0; k < K; k++) {                                /* moe out = shared + routed */
             float *mo = m->p_moe + (size_t)k*C, *ro = m->p_route + (size_t)k*C, *o = m->p_o + (size_t)k*C;
             for (int i = 0; i < C; i++) o[i] = mo[i] + ro[i];
-            ds4f_hc_post(m, m->v_x4 + (size_t)k*hcC, m->v_resid + (size_t)k*hcC, o, pf[k], cf[k]);
         }
+        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pf[0][0], 16, &cf[0][0], 64);  /* mHC post (ffn) */
     }
     m->s_idx_qpre = NULL;   /* clear the batched-prefill qproj injection so decode's index_step recomputes */
     /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
