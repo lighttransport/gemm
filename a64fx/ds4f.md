@@ -510,6 +510,10 @@ decode M>1 to amortize the 43 per-layer all-reduces.
 | `DS4F_BF16_PV` | (auto) | with `DS4F_FP8_BF16=1`: empty = pair-interleaved pv (fastest); `0` = plain bf16; `1` = force pv |
 | `DS4F_MXFP4_GEMM_TILE` | 0 (auto→16 in batched prefill) | M-threshold ≥ which the MXFP4 (expert/dense) **prefill** GEMM tile-dequants nibbles→bf16 once and reuses across M (1.38–1.72× @M≥16, lossless); `0` = off (svtbl per-pair, best at M≤4). **Auto-set to 16 when batched prefill is active (`ds4f_ep_runner.c`); explicit value overrides. Real-weight 11n: +7.9% prefill, token-exact (Step 2o)** |
 | `DS4F_MHC` | 0 | 1 = exact manifold-constrained hyper-connections (`hc_mult=4`). **REQUIRED for coherent real generation** (Step 2e); gen wrapper defaults it on |
+| `DS4F_FLAGBAR` | **1** | per-worker cache-line completion-flag pool barrier (vs the shared-counter barrier's 47-way ping-pong). **Bit-identical, +8% decode & prefill** (M=1 fires ~900 tiny dispatches/tok). See Decode-perf wins |
+| `DS4F_ATTN_GEMM` | **1** | 8-head-blocked Tier-B2 decode attention: each MLA `kv[j]` loaded once, reused across 8 query heads (score + value). **Bit-identical, attn −50%, +6.6% decode (+8.3% @5k, grows w/ctx)**. Falls back to per-head for exotic quant (int8/int4 KV/cmp, CP) |
+| `DS4F_IDX_GEMM` | **1** | 8-index-head-blocked indexer scan (`idxsc8`) — ILP hides the per-head svaddv latency. Bit-identical, +16% on `tb2scan` (O(T), compounds at long-ctx CP) |
+| `DS4F_IDX_INT8W` | 0 | **LOSSY, opt-in**: int8 W8A8 the indexer q-projection weight (`idx_wq_b`, K=1024, byte-bound). ~2× on `tb2qproj`, **+4.1% decode @5k**. q drives only top-k *selection* (error-tolerant); quality-gated (coherent, NaN=0). **Only helps the small qproj matvec — NOT the compressor (K=4096, not byte-bound)** |
 | `DS4F_PROMPT_IDS` / `DS4F_GEN_OUT` / `DS4F_MAX_NEW` | — | gen-mode (Step 2e): prompt id file in, generated id file out, greedy decode budget (stops on eos=1) |
 | `DS4F_TF_CHECK` | 0 | 1 = teacher-forcing next-token accuracy gate (~0 % = broken forward, ~50–80 % = working); the cheap reference-free correctness check |
 | `DS4F_STAGE_FLUSH_GB` | 2 | stager HBM dirty-cache flush granularity |
@@ -739,6 +743,29 @@ Optimized decode @ctx10240 = **13.03 tok/s = 76.7 ms/tok**. Per-phase (Step 2l b
 - **Amortizable** (comm + weight matvecs) = 12.7 + 27.5 = **40.2 ms**; **non-amortizable** (per-position attn + tb2prep) = 13.8 + 17.5 = **31.3 ms** ⇒ even with perfect M-batching the single-stream floor is **~31 ms ≈ 32 tok/s**.
 - **≥20 tok/s IS achievable — via speculative decode (the math):** draft K + verify-in-one-pass (M=K). At K≈3 accepted: comm 12.7→**4.2** ms/tok (÷3), the 27.5 ms weight matvecs become an M=3 GEMM (dequant amortized ~1.4× ⇒ ≈**12.8** ms/tok), attn+tb2 stay 31.3 (per-position) ⇒ **≈48 ms = ~20.7 tok/s**. Batched **multi-sequence** decode (B=8–32) reaches similar/higher **aggregate throughput** (comm+matvec fully amortize; per-sequence attn/tb2 scale with B). Both need packed-B GEMM (note the known A64FX batched-prefill regression, `project_batched_prefill`).
 - **Ceiling ~32 tok/s** (the per-position attn+tb2 floor). To beat it: cut attn (near floor already) or tb2's O(T) scan — which is exactly what **CP shards at high ctx**, so CP also *preserves* ~20–30 tok/s at 1M+ where decode is otherwise ~1 tok/s (scan-bound). **Net: spec/batched decode gets to ~20–30 tok/s; CP keeps it there at long ctx.**
+
+### Decode-perf wins — LANDED on `glm5-2` (2026-07): 12.26 → 14.13 tok/s (+15.3%), all bit-identical
+
+Real-weight 11n A/B (agentic `--preset decode`, ctx 1759 unless noted). Each lever measured, the wins default-on; the dead ends measured-and-reverted (the discipline: no lever ships without a same-config A/B).
+
+| commit | lever | effect | default |
+|---|---|---|---|
+| `691be067` | **`DS4F_FLAGBAR`** per-worker flag barrier + `ds4f_row_slice` Q8_PV fix | **+8% decode & prefill**, bit-identical | on |
+| `c303fcaa` | **`DS4F_ATTN_GEMM`** 8-head KV-reuse attention | **+6.6% decode, attn −50%** (+8.3% @ctx5026, grows w/ctx), bit-identical | on |
+| `54476f06` | verify-path KV-reuse (spec/GEMM-decode) | verify path only (+5% GEMM-decode) | on |
+| `6cf899b8` | **`DS4F_IDX_GEMM`** 8-head indexer scan | +16% `tb2scan` (O(T), long-ctx lever), bit-identical | on |
+| `1c515aa4` | **`DS4F_IDX_INT8W`** int8 qproj weight | **+4.1% @ctx5026**, LOSSY, quality-gate-passed | **off** (opt-in) |
+
+**The key insight — MLA has 1 KV head, so decode attention re-reads each `kv[j]` latent 64× (once per query head)**, running at ~0.5% of compute peak (L2-read-bound, NOT thread-bound — a balanced head-split gave *zero* gain, which is what pointed to the real fix). `DS4F_ATTN_GEMM` blocks 8 heads so each `kv[j]` is loaded once and reused across 8 heads (score dots + value axpy) → 8× fewer L2 reads. Same pattern applies to the batched prefill attention (already HBLK=8, `ds4f_attn_prefill_worker`) and the verify path.
+
+**Measured & REVERTED dead ends (documented so they're not re-tried):**
+- *Speculative MTP decode* — mechanism works (comm 16.5→3.4% via 1 reduce/2 tok) but net LOSS: batched-K=2-verify cost C₂/C₁≈1.52 needs α>0.76, MTP α is only ~68%; and the real accept rate collapses to 27% (batched verify drifts from the matvec draft). Not economical without a cheaper batched verify (needs batched attn/tb2) + higher α.
+- *Attention SW-prefetch* — −2%: the compressed cache is L2-resident at agentic ctx (index_topk·kv_lora·4B ≈ 0.5–1 MB < 8 MB CMG L2), no HBM miss to hide.
+- *Balanced head-split attention* — flat: attn is NOT thread-bound (this refutation led to the KV-reuse win).
+- *Indexer matvec 8-row / widen-zip* — the indexer qproj is a small (K=1024) matvec that peaks at 24 threads and regresses at 48 (widen_bench); zip==lsl (widen isn't the bottleneck); only **fewer bytes** (int8) help → `DS4F_IDX_INT8W`.
+- *int8 compressor* (`tb2lcmp`, K=4096) — quality gate passed but NO speedup (K=4096 already pipelines across 48t; not byte-bound). **General rule: int8 W8A8 helps only SMALL matvecs (K≲1024).**
+
+The remaining decode cost is genuinely hard: **comm** (straggler-sync, only batched/spec decode amortizes it), the **indexer** (matvecs mostly irreducible, top-k O(T·log k) heap-optimized, scan now blocked), and **dense matvecs** (already near BW). Diagnostics: `DS4F_PROF=1` prints the per-phase decode breakdown; the widen microbench is `scratchpad/widen_bench.c` (throwaway).
 
 ### MTP scaffold + spec-decode plan (commit `09aa458`)
 The model ships an MTP module (`config num_nextn_predict_layers=1`, tensors `mtp.0.*`) — a full Block (MLA attn + 256-expert MoE, **no** tier-B2 compressor) + the fusion `x' = e_proj(enorm(embed(next_id))) + h_proj(hnorm(x))` → block → **shared** head. It was unloaded (`n_layers=43` stops before it; stager skipped `mtp.*`). **Scaffolded (compile-validated; env-blocked for run-validation):** `DS4F_STAGE_MTP` ungates staging (experts EP-sharded), `DS4F_MTP` loads it (`m->mtp` + `mtp_*` fusion tensors), `ds4f_mtp_predict()` is a documented STUB. Off-path byte-identical (regression unchanged).
