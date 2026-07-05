@@ -86,12 +86,20 @@ routes, both with real cost:
   error-tolerant) while the reduce completes for the expert compute. Cheaper to code but **changes
   numerics** (not lockstep-bit-exact; needs a quality gate) — risky for a correctness-first port.
 
-**The blocking issue.** The async-comm mechanism itself is unstable on A64FX. m3.md's pinned-pool /
-comm-driver (`M3_COMM_OVERLAP`, `ar_async_start_cb`, `comm_driver` thread, m3_ep_runner.c:152–275)
-**"hangs node-dependently"** — with 12 compute threads on 1 CMG, a dedicated comm thread either
-oversubscribes or steals a compute core. This same cross-CMG/thread problem defeated glm5's overlap and
-m3's full-48 pool. **Lever 2 is gated on first making a stable pinned comm-core mechanism** (OMP=11 +
-comm thread pinned to the 12th core of the CMG), which is itself an open, previously-failed sub-project.
+**The blocking issue — RE-DIAGNOSED (FU2 microbench, job 49443812, 12n synth).** Earlier scoping said
+"the async-comm thread hangs" — WRONG (that was `M3_POOL`, the compute spin pool). The `comm_driver`
+thread (`M3_COMM_OVERLAP`) is **stable** and its **placement is irrelevant**:
+| config | AGG tok/s | comm% |
+|---|---|---|
+| sync (TP_SHARED=1, overlap off) | **14.16** | 33% |
+| overlap on, comm floats | 12.20 | 45% |
+| overlap on, comm pinned to idle CMG (core 24) | 12.13 | 45% |
+Pinning to an idle CMG (M3 uses only CMG0; 36 cores idle, so the comm thread never oversubscribes)
+gave **no gain** (B≈C). The overlap net-loss is **100% the `TP_SHARED=0` replication penalty** (comm
+33%→45%) — NOT threading. ⇒ **per-layer overlap cannot be made net-positive by pinning/threading.**
+The `M3_COMM_CORE` pin (commit c9e64b26) is landed + stable but doesn't help the per-layer path. **Lever
+2's only viable path is cross-layer pipelining that KEEPS `TP_SHARED=1`** (no replication penalty) —
+purely a forward-loop restructure; threading is a non-issue.
 
 **Risks.** HIGH: (1) the async-comm thread stability (unsolved), (2) numerics if route (b), (3) 2×
 working set if route (a) — may not fit the tight arena, (4) large forward-loop restructure with lockstep
