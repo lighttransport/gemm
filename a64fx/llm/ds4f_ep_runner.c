@@ -554,6 +554,31 @@ int main(int argc,char**argv){
     } else {
         int tf_check = gen_mode && envi("DS4F_TF_CHECK", 0);
         int tf_correct = 0, tf_total = 0;
+        /* DS4F_PREFILL_GEMM: batch the gen prefill through the MHC+Tier-B2-capable verify path
+         * (chunks of K<=8) -> the per-layer EP all-reduce fires once per K tokens (comm ÷K) and the
+         * dense projections become an M=K GEMM instead of K matvecs. Attn/tb2/mHC stay per-position
+         * (looped, causal). COHERENT not bit-identical to token-by-token (GEMM reassoc, like GEMM-decode);
+         * seeds the same decode. Not with MTP (per-token MTP KV maintenance). */
+        int pf_gemm = gen_mode && !mtp_on && envi("DS4F_PREFILL_GEMM", 0);
+        if (pf_gemm) {
+            int K = envi("DS4F_PREFILL_K", 32); if (K < 1) K = 1; if (K > 32) K = 32;
+            ds4f_alloc_prefill_batch(m, K);
+            size_t hcC = (size_t)m->cfg.hc_mult * C;
+            float *Xin = (float *)aligned_alloc(64, (size_t)K * C * 4);
+            float *vhc = (float *)aligned_alloc(64, (size_t)K * hcC * 4);
+            int Mlast = 1;
+            for (int base = 0; base < prefill; base += K) {
+                int M = prefill - base < K ? prefill - base : K; Mlast = M;
+                for (int mm = 0; mm < M; mm++) embed_lookup(m, prompt_ids[base + mm], Xin + (size_t)mm * C);
+                m->bytes_read = 0; int ot[8];
+                ds4f_forward_verify(m, Xin, M, base, ot, vhc);
+                pf_bytes += m->bytes_read; pf_last_tok = ot[M - 1];
+            }
+            const float *xl = vhc + (size_t)(Mlast - 1) * hcC;   /* last position's hc state (nan/norm probe) */
+            for (int i = 0; i < C; i++) { if (!(xl[i] == xl[i])) nan_count++; xnorm += (double)xl[i]*xl[i]; }
+            if (MyRank == 0) logmsg("prefill via batched verify (DS4F_PREFILL_GEMM, K=%d)\n", K);
+            free(Xin); free(vhc);
+        } else {
         for (int p = 0; p < prefill; p++) {
             if (gen_mode) embed_lookup(m, prompt_ids[p], x);
             else for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
@@ -578,6 +603,7 @@ int main(int argc,char**argv){
             logmsg("TF_ACCURACY %d/%d = %.1f%% (prompt next-token; real LM ~50-80%%, broken ~0%%)\n",
                    tf_correct, tf_total, tf_total ? 100.0*tf_correct/tf_total : 0.0);
         for (int i = 0; i < C; i++) { if (!(x[i] == x[i])) nan_count++; xnorm += (double)x[i]*x[i]; }
+        }
     }
     double t_pf = now_sec() - t_pf0;
     double pf_ar = g_ar_secs; long pf_calls = g_ar_calls;

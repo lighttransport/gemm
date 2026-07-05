@@ -4771,7 +4771,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
     float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
-    float pa[8][16], ca[8][64], pf[8][16], cf[8][64];    /* per-position sinkhorn weights (K<=8) */
+    float pa[32][16], ca[32][64], pf[32][16], cf[32][64];    /* per-position sinkhorn weights (K<=32 for batched prefill) */
     if (!m->v_x4) { size_t vb = (size_t)m->m_tile*hcC*4;
         m->v_x4 = (float *)aligned_alloc(256, vb); m->v_resid = (float *)aligned_alloc(256, vb); }
     for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
