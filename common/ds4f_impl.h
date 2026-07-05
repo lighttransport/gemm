@@ -3612,6 +3612,132 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* ===================== DS4F_ATTN_GEMM: KV-reuse (8-head-blocked) tb2 decode attention =========
+ * The per-head worker re-reads each KV latent kv[j] 64x (once per head) -> attn runs at ~0.5%
+ * of peak, bound by the redundant L2 reads (1 KV head in MLA; every head dots the same kv[j]).
+ * This BLOCKS 8 heads: each kv[j] is loaded ONCE and dotted against all 8 heads (score) / used to
+ * update all 8 outputs (axpy) -> 8x fewer KV L2 reads. BIT-IDENTICAL to ds4f_attn_tb2_worker:
+ * per head the d-reduction (score) and j-accumulation (axpy) run in the same order; the 8-head
+ * blocking only shares the loaded kv vector across independent accumulators. Common bf16-window +
+ * f32-selected paths only (agentic decode); orchestrator falls back to the per-head worker else. */
+#define DS4F_ATTN_GEMM_MR   8      /* heads per block (n_heads=64 -> 8 blocks) */
+#define DS4F_ATTN_GEMM_DBLK 64     /* axpy dim-block; == qk_rope_dim so the last block == RoPE region */
+/* 8 scores: s[hh] = sum_d q[hh*qs + d] * kv[d], kv loaded ONCE per d-chunk, reused across the 8 rows. */
+static inline void ds4f_score8_f32(float s[8], const float *q, int qs, const float *kv, int K) {
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+    for (int d = 0; d < K; d += (int)svcntw()) { svbool_t pg = svwhilelt_b32(d, K);
+        svfloat32_t vk = svld1_f32(pg, kv + d);
+        a0=svmla_f32_x(pg,a0,svld1_f32(pg,q+0*qs+d),vk); a1=svmla_f32_x(pg,a1,svld1_f32(pg,q+1*qs+d),vk);
+        a2=svmla_f32_x(pg,a2,svld1_f32(pg,q+2*qs+d),vk); a3=svmla_f32_x(pg,a3,svld1_f32(pg,q+3*qs+d),vk);
+        a4=svmla_f32_x(pg,a4,svld1_f32(pg,q+4*qs+d),vk); a5=svmla_f32_x(pg,a5,svld1_f32(pg,q+5*qs+d),vk);
+        a6=svmla_f32_x(pg,a6,svld1_f32(pg,q+6*qs+d),vk); a7=svmla_f32_x(pg,a7,svld1_f32(pg,q+7*qs+d),vk); }
+    svbool_t t=svptrue_b32();
+    s[0]=svaddv_f32(t,a0);s[1]=svaddv_f32(t,a1);s[2]=svaddv_f32(t,a2);s[3]=svaddv_f32(t,a3);
+    s[4]=svaddv_f32(t,a4);s[5]=svaddv_f32(t,a5);s[6]=svaddv_f32(t,a6);s[7]=svaddv_f32(t,a7);
+}
+static inline void ds4f_score8_bf16(float s[8], const float *q, int qs, const uint16_t *kv, int K) {
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+    for (int d = 0; d < K; d += (int)svcntw()) { svbool_t pg = svwhilelt_b32(d, K);
+        svfloat32_t vk = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, kv + d), 16));  /* same widen as ds4f_sve_dot_bf16 */
+        a0=svmla_f32_x(pg,a0,svld1_f32(pg,q+0*qs+d),vk); a1=svmla_f32_x(pg,a1,svld1_f32(pg,q+1*qs+d),vk);
+        a2=svmla_f32_x(pg,a2,svld1_f32(pg,q+2*qs+d),vk); a3=svmla_f32_x(pg,a3,svld1_f32(pg,q+3*qs+d),vk);
+        a4=svmla_f32_x(pg,a4,svld1_f32(pg,q+4*qs+d),vk); a5=svmla_f32_x(pg,a5,svld1_f32(pg,q+5*qs+d),vk);
+        a6=svmla_f32_x(pg,a6,svld1_f32(pg,q+6*qs+d),vk); a7=svmla_f32_x(pg,a7,svld1_f32(pg,q+7*qs+d),vk); }
+    svbool_t t=svptrue_b32();
+    s[0]=svaddv_f32(t,a0);s[1]=svaddv_f32(t,a1);s[2]=svaddv_f32(t,a2);s[3]=svaddv_f32(t,a3);
+    s[4]=svaddv_f32(t,a4);s[5]=svaddv_f32(t,a5);s[6]=svaddv_f32(t,a6);s[7]=svaddv_f32(t,a7);
+}
+/* 8-row axpy: out[hh*os + d] += w[hh]*kv[d], kv loaded ONCE per d-chunk, reused across the 8 rows. */
+static inline void ds4f_axpy8_f32(float *out, int os, const float *kv, const float w[8], int n) {
+    for (int d = 0; d < n; d += (int)svcntw()) { svbool_t pg = svwhilelt_b32(d, n);
+        svfloat32_t vk = svld1_f32(pg, kv + d);
+        for (int hh = 0; hh < 8; hh++) { float *o = out + (size_t)hh*os + d;
+            svst1_f32(pg, o, svmla_f32_x(pg, svld1_f32(pg, o), vk, svdup_f32(w[hh]))); } }
+}
+static inline void ds4f_axpy8_bf16(float *out, int os, const uint16_t *kv, const float w[8], int n) {
+    for (int d = 0; d < n; d += (int)svcntw()) { svbool_t pg = svwhilelt_b32(d, n);
+        svfloat32_t vk = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, kv + d), 16));
+        for (int hh = 0; hh < 8; hh++) { float *o = out + (size_t)hh*os + d;
+            svst1_f32(pg, o, svmla_f32_x(pg, svld1_f32(pg, o), vk, svdup_f32(w[hh]))); } }
+}
+static int ds4f_attn_gemm = -1;
+typedef struct { ds4f_model *m; ds4f_layer *ly; int pos, nP, p_lo, nsel, total, stride;
+                 float scale, half; const float *rcos, *rsin; } ds4f_attn_gemm_task;
+
+static void ds4f_attn_gemm_score_worker(void *arg, int tid, int nthr) {   /* phase 1: scores, 8 heads/kv-load */
+    ds4f_attn_gemm_task *T = (ds4f_attn_gemm_task *)arg; ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
+    int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora, h0base = m->attn_h0;
+    int nhb = (m->attn_h1 - m->attn_h0) / DS4F_ATTN_GEMM_MR;
+    int nP = T->nP, total = T->total, stride = T->stride, p_lo = T->p_lo; float scale = T->scale;
+    const int *sel = m->s_tb2_sel; const float *cmp = ly->cmp_kv; const uint16_t *kvbf = ly->kv_cache;
+    long work = (long)nhb * total, per = work / nthr, extra = work % nthr;
+    long u0 = per*tid + (tid < extra ? tid : extra), u1 = u0 + per + (tid < extra ? 1 : 0);
+    for (long u = u0; u < u1; u++) {
+        int hb = (int)(u / total), j = (int)(u % total), h0 = h0base + hb*DS4F_ATTN_GEMM_MR;
+        const float *q = m->s_q + (size_t)h0*HD; float s[8];
+        if (j < nP) { const uint16_t *kc = kvbf + (size_t)((p_lo + j) % ly->kv_slots)*KV; ds4f_score8_bf16(s, q, HD, kc, KV); }
+        else        { const float *kc = cmp + (size_t)sel[j - nP]*KV;                     ds4f_score8_f32(s, q, HD, kc, KV); }
+        for (int hh = 0; hh < 8; hh++) m->s_attn_sc[(size_t)(hb*DS4F_ATTN_GEMM_MR + hh)*stride + j] = s[hh]*scale;
+    }
+}
+static void ds4f_attn_gemm_soft_worker(void *arg, int tid, int nthr) {   /* phase 2: per-head softmax (head-split) */
+    ds4f_attn_gemm_task *T = (ds4f_attn_gemm_task *)arg; ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
+    int h0 = m->attn_h0, nh = m->attn_h1 - m->attn_h0, total = T->total, stride = T->stride;
+    int per = nh / nthr, extra = nh % nthr, i0 = per*tid + (tid < extra ? tid : extra), i1 = i0 + per + (tid < extra ? 1 : 0);
+    for (int hi = i0; hi < i1; hi++) {
+        float *sc = m->s_attn_sc + (size_t)hi*stride, mx = -1e30f;
+        for (int j = 0; j < total; j++) if (sc[j] > mx) mx = sc[j];
+        float denom = expf(ly->attn_sink[h0 + hi] - mx);
+        for (int j = 0; j < total; j++) { float e = expf(sc[j] - mx); sc[j] = e; denom += e; }
+        float inv = 1.0f/denom; for (int j = 0; j < total; j++) sc[j] *= inv;
+    }
+}
+static void ds4f_attn_gemm_axpy_worker(void *arg, int tid, int nthr) {   /* phase 3: value axpy, 8 heads/kv-load, over (head-block x dim-block) */
+    ds4f_attn_gemm_task *T = (ds4f_attn_gemm_task *)arg; ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
+    int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora, h0base = m->attn_h0;
+    int nhb = (m->attn_h1 - m->attn_h0) / DS4F_ATTN_GEMM_MR;
+    int nP = T->nP, nsel = T->nsel, stride = T->stride, p_lo = T->p_lo;
+    int DBLK = DS4F_ATTN_GEMM_DBLK, nblk = HD / DBLK, nope = HD - m->cfg.qk_rope_dim;
+    const int *sel = m->s_tb2_sel; const float *cmp = ly->cmp_kv; const uint16_t *kvbf = ly->kv_cache;
+    long work = (long)nhb * nblk, per = work / nthr, extra = work % nthr;
+    long u0 = per*tid + (tid < extra ? tid : extra), u1 = u0 + per + (tid < extra ? 1 : 0);
+    float w[8];
+    for (long u = u0; u < u1; u++) {
+        int hb = (int)(u / nblk), blk = (int)(u % nblk), h0 = h0base + hb*DS4F_ATTN_GEMM_MR, d0 = blk*DBLK;
+        float *out = m->s_attn + (size_t)h0*HD + d0;   /* 8 rows at stride HD */
+        for (int hh = 0; hh < 8; hh++) for (int d = 0; d < DBLK; d++) out[(size_t)hh*HD + d] = 0.f;
+        for (int j = 0; j < nP; j++) {
+            for (int hh = 0; hh < 8; hh++) w[hh] = m->s_attn_sc[(size_t)(h0 - h0base + hh)*stride + j];
+            const uint16_t *kc = kvbf + (size_t)((p_lo + j) % ly->kv_slots)*KV + d0; ds4f_axpy8_bf16(out, HD, kc, w, DBLK);
+        }
+        for (int j = 0; j < nsel; j++) {
+            for (int hh = 0; hh < 8; hh++) w[hh] = m->s_attn_sc[(size_t)(h0 - h0base + hh)*stride + nP + j];
+            const float *kc = cmp + (size_t)sel[j]*KV + d0; ds4f_axpy8_f32(out, HD, kc, w, DBLK);
+        }
+        if (d0 == nope) for (int hh = 0; hh < 8; hh++)   /* last block == RoPE region: de-rotate each of the 8 heads */
+            ds4f_rope_apply(out + (size_t)hh*HD, T->rcos, T->rsin, T->pos, T->half, 1);
+    }
+}
+static int ds4f_attn_tb2_gemm(ds4f_model *m, ds4f_attn_ex_task *at) {
+    if (ds4f_attn_gemm < 0) { const char *e = getenv("DS4F_ATTN_GEMM"); ds4f_attn_gemm = e ? atoi(e) : 1; }  /* default ON: -50% attn, bit-identical */
+    ds4f_config *c = &m->cfg; ds4f_layer *ly = at->ly;
+    int HD = c->q_head_dim, nope = HD - c->qk_rope_dim, nh = m->attn_h1 - m->attn_h0;
+    if (!ds4f_attn_gemm || !ds4f_attn_sve) return 0;
+    if (m->int8_kv || m->int8_cmp || m->int4_cmp || m->cp_gather) return 0;   /* window not bf16 / selected not f32 */
+    if (ly->kv_frozen || ly->cmp_frozen) return 0;
+    if ((nh % DS4F_ATTN_GEMM_MR) || c->qk_rope_dim != DS4F_ATTN_GEMM_DBLK || (HD % DS4F_ATTN_GEMM_DBLK) || (nope % DS4F_ATTN_GEMM_DBLK)) return 0;
+    int pos = at->pos, p_lo = pos - at->win + 1; if (p_lo < 0) p_lo = 0;
+    int nP = pos - p_lo + 1, nsel = m->s_tb2_nsel, stride = c->window_size + c->index_topk;
+    if (!m->s_attn_sc) m->s_attn_sc = (float *)aligned_alloc(256, (size_t)c->n_heads*stride*4);
+    ds4f_attn_gemm_task T = { m, ly, pos, nP, p_lo, nsel, nP + nsel, stride, at->scale, (float)(c->qk_rope_dim/2), at->rcos, at->rsin };
+    ds4f_pool_run(m->pool, ds4f_attn_gemm_score_worker, &T);
+    ds4f_pool_run(m->pool, ds4f_attn_gemm_soft_worker, &T);
+    ds4f_pool_run(m->pool, ds4f_attn_gemm_axpy_worker, &T);
+    return 1;
+}
+
 /* Step the per-layer compressor (and, on CSA layers, the indexer) for the current
  * token at absolute position `pos`, then fill m->s_tb2_sel/s_tb2_nsel with the LOCAL
  * compressed indices this query attends. Token-at-a-time: pos==0 seeds the ring state
@@ -4875,7 +5001,8 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             /* window + indexer-selected compressed term (prepare ran above). */
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
-            ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+            if (!ds4f_attn_tb2_gemm(m, &at))   /* DS4F_ATTN_GEMM: 8-head KV-reuse; falls back to per-head */
+                ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
         } else if (m->exact) {
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
