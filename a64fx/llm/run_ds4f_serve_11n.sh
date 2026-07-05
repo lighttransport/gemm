@@ -10,6 +10,9 @@
 #     PORT=8080 ./run_ds4f_serve_11n.sh
 # Then, from anywhere that can reach this node:
 #     curl -s localhost:8080/v1/completions -d '{"prompt":"def quicksort(a):","max_tokens":128}'
+#   with sampling (default is greedy; temperature<=0 == greedy):
+#     curl -s localhost:8080/v1/completions -d '{"prompt":"...","max_tokens":128,
+#       "temperature":0.8,"top_p":0.95,"top_k":40,"repeat_penalty":1.1,"presence_penalty":0,"seed":42}'
 set -e
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
 cd "$(dirname "$0")"

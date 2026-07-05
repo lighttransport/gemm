@@ -6,9 +6,11 @@ requests) over shared-FS files:  <BASE>.req / .reqseq  (prompt in) and  <BASE>.r
 (generated ids out). The runner's 11 ranks all read the same request -> lockstep, no broadcast.
 
 Endpoints:
-  POST /v1/completions   {"prompt": str, "max_tokens": int}   (OpenAI text-completion shape)
-  POST /completion       {"prompt": str, "n_predict": int}     (llama.cpp shape)
+  POST /v1/completions   {"prompt": str, "max_tokens": int, ...sampling}   (OpenAI shape)
+  POST /completion       {"prompt": str, "n_predict": int, ...sampling}     (llama.cpp shape)
   GET  /health
+Sampling params (all optional): temperature (<=0 => greedy, default 0), top_p (1.0), top_k (0=off),
+  presence_penalty (0), repeat_penalty / repetition_penalty (1.0), seed (default: per-request counter).
 
 Env: PORT (8080), TOK (~/models/ds4f/tokenizer.json), DS4F_SERVE_BASE, DS4F_SERVE_TIMEOUT (1200s).
 Start via run_ds4f_serve_11n.sh (which launches the runner first, then this)."""
@@ -61,14 +63,18 @@ def decode(ids):
             except OSError: pass
 
 
-def infer(prompt, max_tokens):
+def infer(prompt, max_tokens, samp):
     global _seq
     with _lock:
         ids = encode(prompt)
         if not ids:
             return [], [], ""
+        seed = samp["seed"] if samp["seed"] is not None else (_seq + 1)
+        # header: "max_new temp top_p top_k presence_penalty repeat_penalty seed"  (runner parses this)
+        hdr = "%d %g %g %d %g %g %d" % (max_tokens, samp["temperature"], samp["top_p"],
+                                        samp["top_k"], samp["presence_penalty"], samp["repeat_penalty"], seed)
         with open(REQ, "w") as f:
-            f.write(str(max_tokens) + "\n" + " ".join(map(str, ids)) + "\n")
+            f.write(hdr + "\n" + " ".join(map(str, ids)) + "\n")
         _seq += 1
         with open(REQSEQ, "w") as f:
             f.write(str(_seq) + "\n")                # write req then bump seq -> runner reads a complete file
@@ -114,9 +120,19 @@ class H(http.server.BaseHTTPRequestHandler):
         if isinstance(prompt, list):
             prompt = "".join(map(str, prompt))
         max_tokens = int(body.get("max_tokens", body.get("n_predict", 128)))
+        seed = body.get("seed", None)
+        samp = {
+            "temperature": float(body.get("temperature", 0.0)),   # <=0 -> greedy
+            "top_p":       float(body.get("top_p", 1.0)),
+            "top_k":       int(body.get("top_k", 0)),             # 0 -> disabled
+            "presence_penalty": float(body.get("presence_penalty", 0.0)),
+            "repeat_penalty":   float(body.get("repeat_penalty",
+                                     body.get("repetition_penalty", 1.0))),
+            "seed":        None if seed is None else int(seed),
+        }
         t0 = time.time()
         try:
-            ids, gen, text = infer(prompt, max_tokens)
+            ids, gen, text = infer(prompt, max_tokens, samp)
         except TimeoutError:
             return self._json(504, {"error": "runner timeout"})
         except Exception as e:

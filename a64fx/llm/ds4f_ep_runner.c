@@ -28,6 +28,7 @@
  *   DS4F_FP8_BF16  predequant dense FP8->BF16 (default 0 = on-demand FP8)
  */
 #define _GNU_SOURCE
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -102,6 +103,65 @@ static void embed_lookup(const ds4f_model *m, int tok, float *x) {
 }
 
 /* ================= HTTP serve mode (DS4F_SERVE): load once, loop on requests ================= */
+/* ---- sampling: temperature / top-k / top-p / presence & repeat penalty ----
+ * The head is replicated in the serve config, so every rank holds the SAME full logits. A
+ * deterministic PRNG (SplitMix64) seeded identically per request and advanced in lockstep makes
+ * all 11 ranks draw the SAME token -> lockstep preserved (== the greedy-argmax guarantee). */
+static uint64_t ds4f_rng_state;
+static inline double ds4f_rng_u01(void) {                  /* uniform [0,1) */
+    uint64_t z = (ds4f_rng_state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z = z ^ (z >> 31);
+    return (double)(z >> 11) * (1.0 / 9007199254740992.0);
+}
+typedef struct { float temp, top_p, pres_pen, rep_pen; int top_k, rep_last_n; } ds4f_sampler;
+
+static const float *ds4f_srt_key;                          /* qsort key (single-threaded serve path) */
+static int ds4f_srt_desc(const void *a, const void *b) {
+    float fa = ds4f_srt_key[*(const int *)a], fb = ds4f_srt_key[*(const int *)b];
+    return (fa < fb) - (fa > fb);
+}
+/* Sample the next token from m->s_logits given recent token history (for penalties). temp<=0 ->
+ * greedy argmax (bit-identical to ds4f_forward_token). Mutates m->s_logits (regenerated next step). */
+static int ds4f_sample(ds4f_model *m, const ds4f_sampler *sp, const int *hist, int nhist) {
+    int V = m->cfg.vocab;
+    float *lg = m->s_logits;
+    if (sp->temp <= 0.f) {                                  /* greedy */
+        int best = 0; float bv = lg[0];
+        for (int v = 1; v < V; v++) if (lg[v] > bv) { bv = lg[v]; best = v; }
+        return best;
+    }
+    static int *idx = NULL; static float *prob = NULL;      /* scratch, sized once to vocab */
+    if (!idx) { idx = (int *)malloc((size_t)V * sizeof(int)); prob = (float *)malloc((size_t)V * sizeof(float)); }
+    /* repeat + presence penalty over the last rep_last_n tokens (once per unique token) */
+    if (sp->rep_pen != 1.f || sp->pres_pen != 0.f) {
+        int ln = sp->rep_last_n > 0 ? sp->rep_last_n : 64;
+        int h0 = nhist > ln ? nhist - ln : 0;
+        for (int i = h0; i < nhist; i++) {
+            int t = hist[i]; if (t < 0 || t >= V) continue;
+            int first = 1; for (int j = h0; j < i; j++) if (hist[j] == t) { first = 0; break; }
+            if (!first) continue;
+            if (sp->rep_pen != 1.f)  lg[t] = lg[t] > 0.f ? lg[t] / sp->rep_pen : lg[t] * sp->rep_pen;
+            if (sp->pres_pen != 0.f) lg[t] -= sp->pres_pen;
+        }
+    }
+    float inv = 1.f / sp->temp;                             /* temperature + sort desc */
+    for (int v = 0; v < V; v++) { lg[v] *= inv; idx[v] = v; }
+    ds4f_srt_key = lg; qsort(idx, (size_t)V, sizeof(int), ds4f_srt_desc);
+    int kcut = (sp->top_k > 0 && sp->top_k < V) ? sp->top_k : V;
+    float mx = lg[idx[0]], sum = 0.f;                       /* stable softmax over top-k */
+    for (int i = 0; i < kcut; i++) { float e = expf(lg[idx[i]] - mx); prob[i] = e; sum += e; }
+    int npc = kcut;                                         /* top-p nucleus */
+    if (sp->top_p < 1.f && sp->top_p > 0.f) {
+        float cum = 0.f, thr = sp->top_p * sum;
+        for (int i = 0; i < kcut; i++) { cum += prob[i]; if (cum >= thr) { npc = i + 1; break; } }
+    }
+    float nsum = 0.f; for (int i = 0; i < npc; i++) nsum += prob[i];   /* renormalize + draw */
+    double r = ds4f_rng_u01() * nsum, acc = 0.0;
+    for (int i = 0; i < npc; i++) { acc += prob[i]; if (acc >= r) return idx[i]; }
+    return idx[npc - 1];
+}
 /* reset per-request state: the compressor/indexer RING state carries between requests (position-
  * indexed KV/cmp/idx caches self-overwrite at pos 0). int8 KV/cmp calibration re-runs per request. */
 static void ds4f_serve_reset(ds4f_model *m) {
@@ -116,32 +176,46 @@ static void ds4f_serve_reset(ds4f_model *m) {
         ly->kv_caln = 0; ly->kv_frozen = 0; ly->cmp_caln = 0; ly->cmp_frozen = 0;   /* int8 recalibrate */
     }
 }
-/* one greedy generation: prefill the prompt (batched-verify if DS4F_PREFILL_GEMM else token-by-token)
- * then argmax-decode up to max_new (stop on eos). Returns n_gen written to out_ids. All ranks lockstep. */
-static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, float *x, int *out_ids) {
-    int C = m->cfg.hidden, pf_last = 0;
+/* one generation: prefill the prompt (batched-verify if DS4F_PREFILL_GEMM else token-by-token) then
+ * decode up to max_new (stop on eos). sp->temp>0 -> sample (temp/top-k/top-p/penalties) from the
+ * per-position logits, else greedy argmax. Returns n_gen written to out_ids. All ranks lockstep. */
+static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, float *x, int *out_ids,
+                          const ds4f_sampler *sp) {
+    int C = m->cfg.hidden, V = m->cfg.vocab, pf_last = 0, have_logits = 0;
     int pf_gemm = envi("DS4F_PREFILL_GEMM", 0), K = envi("DS4F_PREFILL_K", 32);
+    int sampling = sp && sp->temp > 0.f;
     if (K < 1) K = 1; if (K > 32) K = 32;
     if (pf_gemm && !m->has_mtp) {                       /* batched-verify prefill */
         ds4f_alloc_prefill_batch(m, K);
         size_t hcC = (size_t)m->cfg.hc_mult * C;
         float *Xin = (float *)aligned_alloc(64, (size_t)K*C*4), *vhc = (float *)aligned_alloc(64, (size_t)K*hcC*4);
+        int lastM = 0;
         for (int base = 0; base < np; base += K) {
-            int M = np - base < K ? np - base : K;
+            int M = np - base < K ? np - base : K; lastM = M;
             for (int mm = 0; mm < M; mm++) embed_lookup(m, pids[base+mm], Xin + (size_t)mm*C);
             int ot[32]; ds4f_forward_verify(m, Xin, M, base, ot, vhc); pf_last = ot[M-1];
         }
         free(Xin); free(vhc);
-    } else {                                            /* token-by-token prefill */
+        /* first-token sampling needs the last prompt position's logits; verify leaves them in
+         * m->p_logits[lastM-1] (full vocab only when the head is replicated, which the serve config is). */
+        if (m->head.rows == V && m->p_logits) {
+            memcpy(m->s_logits, m->p_logits + (size_t)(lastM-1)*V, (size_t)V*4); have_logits = 1;
+        }
+    } else {                                            /* token-by-token prefill (m->s_logits left set) */
         for (int p = 0; p < np; p++) { embed_lookup(m, pids[p], x); pf_last = ds4f_forward_token(m, x, p); }
+        have_logits = 1;
     }
-    int n_gen = 0, cur = pf_last;                       /* greedy argmax decode */
+    int *hist = (int *)malloc((size_t)(np + max_new) * sizeof(int));   /* penalty history: prompt + gen */
+    memcpy(hist, pids, (size_t)np * sizeof(int)); int nh = np;
+    int n_gen = 0, cur = (sampling && have_logits) ? ds4f_sample(m, sp, hist, nh) : pf_last;
     for (int g = 0; g < max_new; g++) {
-        out_ids[n_gen++] = cur;
+        out_ids[n_gen++] = cur; hist[nh++] = cur;
         if (cur == DS4F_EOS_ID) break;
         embed_lookup(m, cur, x);
-        cur = ds4f_forward_token(m, x, np + g);
+        int am = ds4f_forward_token(m, x, np + g);       /* fills m->s_logits, returns argmax */
+        cur = sampling ? ds4f_sample(m, sp, hist, nh) : am;
     }
+    free(hist);
     return n_gen;
 }
 static long ds4f_read_seq(const char *path) {
@@ -586,15 +660,23 @@ int main(int argc,char**argv){
             if (MyRank == 0) while ((seq = ds4f_read_seq(reqseqf)) <= last_seq) usleep(2000);
             barrier();                                          /* release all ranks (req file is written before its seq bumps) */
             int mnew = 256, np = 0;
+            /* request header line: "max_new temp top_p top_k pres_pen rep_pen seed" (missing fields ->
+             * greedy defaults, so an old "max_new"-only request still works); prompt ids follow. */
+            ds4f_sampler sp = { .temp = 0.f, .top_p = 1.f, .pres_pen = 0.f, .rep_pen = 1.f, .top_k = 0, .rep_last_n = 64 };
+            long seed = 0;
             FILE *rf = fopen(reqf, "r");
-            if (rf) { if (fscanf(rf, "%d", &mnew) != 1) mnew = 256;
+            if (rf) { char line[512];
+                      if (fgets(line, sizeof line, rf))
+                          sscanf(line, "%d %f %f %d %f %f %ld", &mnew, &sp.temp, &sp.top_p, &sp.top_k,
+                                 &sp.pres_pen, &sp.rep_pen, &seed);
                       int v; while (np < maxpos && fscanf(rf, "%d", &v) == 1) pids[np++] = v; fclose(rf); }
             if (np > maxpos) np = maxpos;                       /* truncate over-long prompt to the KV ceiling */
             if (mnew < 1) mnew = 1;
             if (np + mnew > maxpos) mnew = (maxpos > np) ? maxpos - np : 1;   /* keep prompt+gen <= MAXPOS */
+            ds4f_rng_state = (uint64_t)seed;                    /* identical seed on every rank -> lockstep sampling */
             double t0 = now_sec();
             ds4f_serve_reset(m);
-            int ng = np > 0 ? ds4f_serve_gen(m, pids, np, mnew, x, oids) : 0;
+            int ng = np > 0 ? ds4f_serve_gen(m, pids, np, mnew, x, oids, &sp) : 0;
             double dt = now_sec() - t0;
             if (MyRank == 0) {
                 FILE *of = fopen(respf, "w");
