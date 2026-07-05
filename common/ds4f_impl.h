@@ -1224,6 +1224,49 @@ static void ds4f_bf16mv_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* DS4F_IDX_INT8W: int8 W8A8 indexer qproj. The bf16 qproj matvec is byte/BW-bound (~100 GB/s);
+ * int8 halves the weight bytes -> ~2x (widen_bench). LOSSY: the int8-quantized q perturbs the
+ * indexer scores that drive top-k SELECTION -> gated (default off) + validated by a token/coherence
+ * gate. q is used ONLY for selection (not attention values), the most error-tolerant place to quantize. */
+static void ds4f_quant_bf16_rows_i8(const uint16_t *w, int rows, int cols, int8_t *wi, float *ws) {
+    for (int o = 0; o < rows; o++) {
+        const uint16_t *wr = w + (size_t)o * cols; float mx = 0.f;
+        for (int i = 0; i < cols; i++) { float v = bf16_to_f32_scalar(wr[i]); v = v < 0 ? -v : v; if (v > mx) mx = v; }
+        ws[o] = mx > 0 ? mx / 127.f : 0.f; float inv = mx > 0 ? 127.f / mx : 0.f;
+        int8_t *wo = wi + (size_t)o * cols;
+        for (int i = 0; i < cols; i++) { int q = (int)lrintf(bf16_to_f32_scalar(wr[i]) * inv); wo[i] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q)); }
+    }
+}
+typedef struct { float *out; const int8_t *w, *xq; const float *wsc; float xsc; int rows, cols; } ds4f_i8mv_task;
+static void ds4f_i8mv8_worker(void *arg, int tid, int nthr) {
+    ds4f_i8mv_task *T = (ds4f_i8mv_task *)arg;
+    int rows = T->rows, cols = T->cols, bl = (int)svcntb();
+    int nblk = (rows + 7) / 8, per = nblk / nthr, extra = nblk % nthr;
+    int b0 = per * tid + (tid < extra ? tid : extra), b1 = b0 + per + (tid < extra ? 1 : 0);
+    const int8_t *xq = T->xq; float xsc = T->xsc; svbool_t pb = svptrue_b8(), p32 = svptrue_b32();
+    for (int b = b0; b < b1; b++) {
+        int o = b * 8, rem = rows - o; if (rem > 8) rem = 8;
+        if (rem == 8) {
+            const int8_t *w = T->w + (size_t)o * cols;
+            svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+            svint32_t a4=svdup_s32(0),a5=svdup_s32(0),a6=svdup_s32(0),a7=svdup_s32(0);
+            for (int i = 0; i < cols; i += bl) { svint8_t xv = svld1_s8(pb, xq + i);
+                a0=svdot_s32(a0,svld1_s8(pb,w+0*cols+i),xv); a1=svdot_s32(a1,svld1_s8(pb,w+1*cols+i),xv);
+                a2=svdot_s32(a2,svld1_s8(pb,w+2*cols+i),xv); a3=svdot_s32(a3,svld1_s8(pb,w+3*cols+i),xv);
+                a4=svdot_s32(a4,svld1_s8(pb,w+4*cols+i),xv); a5=svdot_s32(a5,svld1_s8(pb,w+5*cols+i),xv);
+                a6=svdot_s32(a6,svld1_s8(pb,w+6*cols+i),xv); a7=svdot_s32(a7,svld1_s8(pb,w+7*cols+i),xv); }
+            T->out[o+0]=(float)svaddv_s32(p32,a0)*T->wsc[o+0]*xsc; T->out[o+1]=(float)svaddv_s32(p32,a1)*T->wsc[o+1]*xsc;
+            T->out[o+2]=(float)svaddv_s32(p32,a2)*T->wsc[o+2]*xsc; T->out[o+3]=(float)svaddv_s32(p32,a3)*T->wsc[o+3]*xsc;
+            T->out[o+4]=(float)svaddv_s32(p32,a4)*T->wsc[o+4]*xsc; T->out[o+5]=(float)svaddv_s32(p32,a5)*T->wsc[o+5]*xsc;
+            T->out[o+6]=(float)svaddv_s32(p32,a6)*T->wsc[o+6]*xsc; T->out[o+7]=(float)svaddv_s32(p32,a7)*T->wsc[o+7]*xsc;
+        } else for (int r = o; r < rows; r++) {
+            const int8_t *w = T->w + (size_t)r * cols; svint32_t a = svdup_s32(0);
+            for (int i = 0; i < cols; i += bl) a = svdot_s32(a, svld1_s8(pb, w + i), svld1_s8(pb, xq + i));
+            T->out[r] = (float)svaddv_s32(p32, a) * T->wsc[r] * xsc;
+        }
+    }
+}
+
 typedef struct { float *kv, *score; const uint16_t *wkv, *wgate; const float *x; int W, dim; } ds4f_cmpmv_bf16_task;
 static void ds4f_cmpmv_bf16_worker(void *arg, int tid, int nthr) {
     ds4f_cmpmv_bf16_task *T = (ds4f_cmpmv_bf16_task *)arg;
@@ -1645,6 +1688,7 @@ static int ds4f_index_step(
     const float *x, int dim, const float *qr, int qlora,
     int H, int hd, int rd, int ratio, int start_pos, int offset, int k,
     const void *wq_b, const void *weights_proj, int w_bf16,
+    const int8_t *wq_b_i8, const float *wq_b_sc,   /* DS4F_IDX_INT8W: non-NULL => int8 W8A8 qproj */
     const void *cwkv, const void *cwgate, const float *cape, const uint16_t *cnorm,
     const float *rcos, const float *rsin, float eps,
     float *comp_kv_state, float *comp_score_state, float *idx_kv_cache,
@@ -1657,7 +1701,14 @@ static int ds4f_index_step(
     if (s_cp_merge < 0) { const char *e = getenv("DS4F_CP_MERGE"); s_cp_merge = (e ? atoi(e) : 1); }
     int end_pos = start_pos + 1, half = rd / 2;
     double _tqp0 = ds4f_now();
-    if (pool && w_bf16) {                                    /* q = wq_b(qr), pooled bf16 */
+    if (pool && wq_b_i8) {                                   /* q = wq_b(qr) via int8 W8A8 (lossy, gated) */
+        int8_t *qi = (int8_t *)alloca((size_t)qlora); float qmx = 0.f;
+        for (int i = 0; i < qlora; i++) { float v = qr[i] < 0 ? -qr[i] : qr[i]; if (v > qmx) qmx = v; }
+        float xsc = qmx > 0 ? qmx / 127.f : 0.f, qinv = qmx > 0 ? 127.f / qmx : 0.f;
+        for (int i = 0; i < qlora; i++) { int q = (int)lrintf(qr[i] * qinv); qi[i] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q)); }
+        ds4f_i8mv_task qt = { q_scr, wq_b_i8, qi, wq_b_sc, xsc, H * hd, qlora };
+        ds4f_pool_run(pool, ds4f_i8mv8_worker, &qt);
+    } else if (pool && w_bf16) {                             /* q = wq_b(qr), pooled bf16 */
         ds4f_bf16mv_task qt = { q_scr, (const uint16_t *)wq_b, qr, H * hd, qlora };
         ds4f_pool_run(pool, ds4f_bf16mv_worker, &qt);
     } else if (pool) {                                       /* q = wq_b(qr), pooled f32 */
@@ -3807,11 +3858,20 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
             return;                                             /* T==0, nothing compressed yet */
         }
         int k = c->index_topk;
+        static int idx_int8w = -1;   /* DS4F_IDX_INT8W (default off, LOSSY): int8 W8A8 qproj (~2x, perturbs top-k) */
+        if (idx_int8w < 0) { const char *e = getenv("DS4F_IDX_INT8W"); idx_int8w = (e && *e && atoi(e)) ? 1 : 0; }
+        if (idx_int8w && !ly->idx_wq_b_i8) {   /* lazy one-time per-row int8 quantization of the qproj weight */
+            size_t rows = (size_t)c->index_n_heads * ihd;
+            ly->idx_wq_b_i8 = (int8_t *)aligned_alloc(256, rows * (size_t)c->q_lora);
+            ly->idx_wq_b_sc = (float *)aligned_alloc(256, rows * 4);
+            ds4f_quant_bf16_rows_i8(ly->idx_wq_b, (int)rows, c->q_lora, ly->idx_wq_b_i8, ly->idx_wq_b_sc);
+        }
         double _sc_snap = ds4f_g_tb2scan, _qp_snap = ds4f_g_tb2qproj, _rp_snap = ds4f_g_tb2rope,
                _ic_snap = ds4f_g_tb2icmp, _wp_snap = ds4f_g_tb2wproj, _tk_snap = ds4f_g_tb2topk;
         ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, c->q_lora,
                         c->index_n_heads, ihd, rd, ratio, pos, offset, k,
                         ly->idx_wq_b, ly->idx_wproj, 1,
+                        idx_int8w ? ly->idx_wq_b_i8 : NULL, idx_int8w ? ly->idx_wq_b_sc : NULL,
                         ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
                         rcos, rsin, eps,
                         ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ly->idx_kv,

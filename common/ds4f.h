@@ -290,6 +290,8 @@ typedef struct {
     int       cmp_frozen;  /* 1 once scale frozen & calbuf quantized into cmp_q */
     /* indexer (CSA layers, compress_ratio==4 only) */
     uint16_t *idx_wq_b;              /* [index_n_heads*index_head_dim, q_lora] bf16 (FP8 src, lossless) */
+    int8_t   *idx_wq_b_i8;           /* DS4F_IDX_INT8W: int8 W8A8 qproj weight (lazy, lossy, gated) */
+    float    *idx_wq_b_sc;           /* per-row absmax scale for idx_wq_b_i8 */
     uint16_t *idx_wproj;             /* [index_n_heads, hidden] bf16 */
     uint16_t *idx_cmp_wkv, *idx_cmp_wgate;  /* indexer compressor (rotate=1): [coff*index_head_dim, hidden] bf16 */
     float    *idx_cmp_ape;           /* [4, coff*index_head_dim] */
