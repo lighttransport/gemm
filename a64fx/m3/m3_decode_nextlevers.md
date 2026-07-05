@@ -16,9 +16,14 @@ uncertain ~1.2×). Baselines/model: `m3.md` decode roofline, `m3_decode_sim.py`.
 - Quality (job 49442681, 24n fp8 real): "capital of France" → bf16-KV `" Paris. (Paris is the capital of
   France.)"` vs int4-KV `" Paris."` — **same correct answer, coherent, NaN=0, but int4 EOS's early**
   (perturbs the greedy trajectory = expected KV-quant loss). **PASS (safe, won't garble) but LOSSY.**
-- **Deploy rule:** bf16-KV for short ctx (M=48 fits, best quality); int4-KV to recover M/throughput at
-  long ctx where bf16 caps M low. Optional follow-up: quantify drift on longer/harder prompts if int4-KV
-  goes to a quality-sensitive production path. Original scope below.
+- Drift (FU1, job 49443796, 24n fp8, 4 prompts MAX_NEW=128): int4-KV matching greedy-token prefix vs
+  bf16 = 2/11, 0/128, 4/128, 12/128 — **diverges early (not token-faithful)**, BUT every factual answer
+  matches (Paris / correct factorial / 100°C / blue) and int4 continuations are **equally coherent**
+  (sometimes cleaner). Where output degenerates (repetition), bf16 does too (base-model greedy artifact).
+  ⇒ **int4-KV is quality-comparable and safe (correct+coherent), just not identical to bf16.**
+- **Deploy rule:** bf16-KV for short ctx (M=48 fits, best quality/reproducibility); int4-KV to recover
+  M/throughput at long ctx where bf16 caps M low — output stays correct+coherent (different greedy path).
+  Original scope below.
 
 
 **Why.** int4-KV currently exists ONLY in the single-stream `m3_forward_token` path (codec
