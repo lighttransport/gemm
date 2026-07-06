@@ -229,10 +229,22 @@ static long ds4f_read_seq(const char *path) {
  * cache-mode layout (int8/int4/maxpos) so a mismatched runner refuses the blob instead of corrupting.
  * Caches are replicated (no-CP) -> any rank's blob restores identically; rank 0 writes, all ranks read. */
 #define DS4F_CTX_MAGIC 0x44533443u   /* 'DS4C' */
+/* context-parallel: the compressed caches are slot-sharded per node, so each rank holds a DIFFERENT
+ * shard and must save/load its own per-rank file. Replicated (no-CP) keeps a single shared file. */
+static int ds4f_ctx_sharded(void) {
+    return envi("DS4F_CP", 0) || envi("DS4F_CP_IDX", 0) || envi("DS4F_CP_SHARD", 0);
+}
+static void ds4f_ctx_rankpath(ds4f_model *m, const char *path, char *out, size_t n) {
+    if (ds4f_ctx_sharded()) snprintf(out, n, "%s.rank%02d", path, m->ep_rank);
+    else                    snprintf(out, n, "%s", path);
+}
 static uint32_t ds4f_ctx_cfg_hash(ds4f_model *m) {
-    uint32_t h = 2166136261u; int v[6] = { m->cfg.max_pos, m->int8_kv, envi("DS4F_INT8_CMP",0),
-        envi("DS4F_INT4_CMP",0), envi("DS4F_IDX_INT4",0), m->cfg.n_layers };
-    for (int i = 0; i < 6; i++) { h ^= (uint32_t)v[i]; h *= 16777619u; }
+    int sh = ds4f_ctx_sharded();   /* under sharding the layout depends on the topology + this rank */
+    uint32_t h = 2166136261u;
+    int v[9] = { m->cfg.max_pos, m->int8_kv, envi("DS4F_INT8_CMP",0), envi("DS4F_INT4_CMP",0),
+                 envi("DS4F_IDX_INT4",0), m->cfg.n_layers, sh,
+                 sh ? m->ep_size : 0, sh ? m->ep_rank : 0 };
+    for (int i = 0; i < 9; i++) { h ^= (uint32_t)v[i]; h *= 16777619u; }
     return h;
 }
 static int ds4f_ctx_write_file(ds4f_model *m, const char *path, const int *ids, int npos) {
@@ -709,9 +721,11 @@ int main(int argc,char**argv){
          * it already prefilled (instant TTFT, survives restarts). Build it once with a ctl=save request. */
         const char *syscache = getenv("DS4F_SERVE_SYSCACHE");
         if (syscache && *syscache) {
-            int sn = 0, rc = ds4f_ctx_read_file(m, syscache, slots[0].ids, &sn, maxpos);
+            char rp[1100]; ds4f_ctx_rankpath(m, syscache, rp, sizeof rp);   /* per-rank shard under CP */
+            int sn = 0, rc = ds4f_ctx_read_file(m, rp, slots[0].ids, &sn, maxpos);
             if (rc == 0) { slots[0].len = sn; slots[0].used = 1;
-                if (MyRank == 0) logmsg("SERVE syscache: preloaded %d-token system prompt from %s\n", sn, syscache); }
+                if (MyRank == 0) logmsg("SERVE syscache: preloaded %d-token system prompt from %s%s\n",
+                                        sn, syscache, ds4f_ctx_sharded() ? " [per-rank shards]" : ""); }
             else if (MyRank == 0) logmsg("SERVE syscache: %s not loaded (rc=%d)\n", syscache, rc);
         }
         long last_seq = ds4f_read_seq(reqseqf);   /* ignore any stale request present at startup */
@@ -755,7 +769,8 @@ int main(int argc,char**argv){
             /* ---- ctl load: restore a persisted context from disk into the live slot (all ranks read) ---- */
             int loaded = 0;
             if ((ctl & 1) && path[0]) {
-                int sn = 0, rc = ds4f_ctx_read_file(m, path, fids, &sn, maxpos);
+                char rp[1100]; ds4f_ctx_rankpath(m, path, rp, sizeof rp);   /* each rank reads its own shard */
+                int sn = 0, rc = ds4f_ctx_read_file(m, rp, fids, &sn, maxpos);
                 if (rc == 0) { memcpy(slots[live].ids, fids, (size_t)sn * sizeof(int)); slots[live].len = sn; loaded = 1; }
                 else if (MyRank == 0) logmsg("SERVE load %s failed rc=%d\n", path, rc);
             }
@@ -777,10 +792,15 @@ int main(int argc,char**argv){
             for (int i = 0; i < np && ctx_len < maxpos; i++)       ctx_ids[ctx_len++] = pids[i];
             for (int i = 0; i < appended && ctx_len < maxpos; i++) ctx_ids[ctx_len++] = oids[i];
             slots[live].len = ctx_len; slots[live].used = 1;
-            /* ---- ctl save: persist the live context to disk (rank 0 writes the shared file) ---- */
-            if ((ctl & 2) && path[0] && MyRank == 0) {
-                int rc = ds4f_ctx_write_file(m, path, ctx_ids, ctx_len);
-                logmsg("SERVE save %s (%d tokens) rc=%d\n", path, ctx_len, rc);
+            /* ---- ctl save: persist the live context to disk. Replicated -> rank 0 writes one shared
+             * file; sharded (CP) -> EVERY rank writes its own shard (path.rankNN). ---- */
+            if ((ctl & 2) && path[0]) {
+                char rp[1100]; ds4f_ctx_rankpath(m, path, rp, sizeof rp);
+                if (ds4f_ctx_sharded() || MyRank == 0) {
+                    int rc = ds4f_ctx_write_file(m, rp, ctx_ids, ctx_len);
+                    if (MyRank == 0) logmsg("SERVE save %s%s (%d tokens) rc=%d\n", path,
+                                            ds4f_ctx_sharded() ? " [per-rank shards]" : "", ctx_len, rc);
+                }
             }
             if (MyRank == 0) {
                 FILE *of = fopen(respf, "w");

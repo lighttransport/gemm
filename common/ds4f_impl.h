@@ -5046,9 +5046,12 @@ static void ds4f_ctx_snap(ds4f_model *m, char *buf, int npos, int restore, size_
         int coff = (ratio==4)?2:1, W = coff*c->kv_lora;
         if (ly->cmp_kv_state)    SNAP(ly->cmp_kv_state,    (size_t)coff*ratio*W*4);
         if (ly->cmp_score_state) SNAP(ly->cmp_score_state, (size_t)coff*ratio*W*4);
-        /* --- compressor store (slot = pos/ratio) --- */
+        /* --- compressor store (slot = pos/ratio). Under CP (cp_on) cmp_q4 is slot-sharded: the local
+         * buffer is cp_nslot = CAL replicated + this node's owned tail, so snapshot the FULL local shard
+         * (per-rank file). Otherwise snapshot the written frontier [0, ceil(npos/ratio)). --- */
         int cap = c->max_pos/ratio, nsl = (npos+ratio-1)/ratio; if (nsl > cap) nsl = cap;
-        if (ly->cmp_q4)      SNAP(ly->cmp_q4, (size_t)nsl*(KV/2));
+        int cmp_ns = (ly->cp_on && ly->cp_nslot > 0) ? ly->cp_nslot : nsl;
+        if (ly->cmp_q4)      SNAP(ly->cmp_q4, (size_t)cmp_ns*(KV/2));
         else if (ly->cmp_q)  SNAP(ly->cmp_q,  (size_t)nsl*KV);
         else if (ly->cmp_kv) SNAP(ly->cmp_kv, (size_t)nsl*KV*4);
         if (ly->cmp_q4 || ly->cmp_q) {                    /* int8/int4 cmp calibration */
@@ -5063,8 +5066,9 @@ static void ds4f_ctx_snap(ds4f_model *m, char *buf, int npos, int restore, size_
             int iW = 2*ihd;
             if (ly->idx_cmp_kv_state)    SNAP(ly->idx_cmp_kv_state,    (size_t)2*ratio*iW*4);
             if (ly->idx_cmp_score_state) SNAP(ly->idx_cmp_score_state, (size_t)2*ratio*iW*4);
-            if (ly->idx_kv8_4)   { SNAP(ly->idx_kv8_4, (size_t)nsl*(ihd/2)); if (ly->idx_pscale) SNAP(ly->idx_pscale, (size_t)nsl*4); }
-            else if (ly->idx_kv8){ SNAP(ly->idx_kv8,   (size_t)nsl*ihd);     if (ly->idx_pscale) SNAP(ly->idx_pscale, (size_t)nsl*4); }
+            int idx_ns = (ly->idx_cp_on && ly->idx_cp_nslot > 0) ? ly->idx_cp_nslot : nsl;  /* CP: local shard */
+            if (ly->idx_kv8_4)   { SNAP(ly->idx_kv8_4, (size_t)idx_ns*(ihd/2)); if (ly->idx_pscale) SNAP(ly->idx_pscale, (size_t)idx_ns*4); }
+            else if (ly->idx_kv8){ SNAP(ly->idx_kv8,   (size_t)nsl*ihd);        if (ly->idx_pscale) SNAP(ly->idx_pscale, (size_t)nsl*4); }
             else if (ly->idx_kv) { SNAP(ly->idx_kv,    (size_t)nsl*ihd*4); }
         }
     }
