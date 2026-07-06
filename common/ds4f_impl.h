@@ -5012,6 +5012,65 @@ static void ds4f_tb2_snap(ds4f_model *m, char *buf, int restore) {
         }
     }
 }
+/* ---- full context-cache snapshot (serve: slot swap / disk persistence / system-prompt cache) ----
+ * Snapshots EVERY written cache byte for a sequence of `npos` positions -- the KV store (int8 kv_q or
+ * bf16 kv_cache), the compressor store (int4 cmp_q4 / int8 cmp_q / f32 cmp_kv), the indexer store
+ * (int4 idx_kv8_4 / int8 idx_kv8 / f32 idx_kv), all the per-position scales, the calibration state
+ * (scales, absmax, calbuf, caln, frozen), and the compressor ring states -- so restoring puts the
+ * model caches back to the exact post-prefill state and decode continues at position npos. buf==NULL
+ * => dry run (only sizes *out_sz). Save (restore=0) copies model->buf; restore=1 copies buf->model.
+ * Caches are REPLICATED across ranks in the no-CP serve config, so a rank-0 blob restores identically
+ * on every rank (lockstep). NOT valid under CP (per-node sharded caches). */
+static void ds4f_ctx_snap(ds4f_model *m, char *buf, int npos, int restore, size_t *out_sz) {
+    ds4f_config *c = &m->cfg; size_t off = 0;
+    int KV = c->kv_lora, ihd = c->index_head_dim;
+    int CALkv = ds4f_int8kv_cal > 0 ? ds4f_int8kv_cal : 256;
+    int CALcmp = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64;
+    if (npos > c->max_pos) npos = c->max_pos;
+    if (npos < 0) npos = 0;
+    #define SNAP(ptr, nbytes) do { size_t _n=(size_t)(nbytes); if (buf && _n) { \
+        if (restore) memcpy((ptr), buf+off, _n); else memcpy(buf+off, (ptr), _n); } off += _n; } while (0)
+    for (int L = 0; L < c->n_layers; L++) {
+        ds4f_layer *ly = &m->layers[L]; int ratio = c->compress_ratios[L];
+        /* --- KV store --- */
+        if (ly->kv_q) {                                   /* int8 kv, direct [0,npos) (kv_slots==max_pos) */
+            SNAP(ly->kv_q, (size_t)npos*KV);
+            if (ly->kv_scale) SNAP(ly->kv_scale, (size_t)KV*4);
+            int nc = npos < CALkv ? npos : CALkv; if (ly->kv_calbuf) SNAP(ly->kv_calbuf, (size_t)nc*KV*2);
+            SNAP(&ly->kv_caln, sizeof(int)); SNAP(&ly->kv_frozen, sizeof(int));
+        } else if (ly->kv_cache) {                        /* bf16 ring (window) or full */
+            int ns = npos < ly->kv_slots ? npos : ly->kv_slots; SNAP(ly->kv_cache, (size_t)ns*KV*2);
+        }
+        if (!ratio) continue;
+        /* --- compressor ring states (fixed size; mirrors ds4f_tb2_snap) --- */
+        int coff = (ratio==4)?2:1, W = coff*c->kv_lora;
+        if (ly->cmp_kv_state)    SNAP(ly->cmp_kv_state,    (size_t)coff*ratio*W*4);
+        if (ly->cmp_score_state) SNAP(ly->cmp_score_state, (size_t)coff*ratio*W*4);
+        /* --- compressor store (slot = pos/ratio) --- */
+        int cap = c->max_pos/ratio, nsl = (npos+ratio-1)/ratio; if (nsl > cap) nsl = cap;
+        if (ly->cmp_q4)      SNAP(ly->cmp_q4, (size_t)nsl*(KV/2));
+        else if (ly->cmp_q)  SNAP(ly->cmp_q,  (size_t)nsl*KV);
+        else if (ly->cmp_kv) SNAP(ly->cmp_kv, (size_t)nsl*KV*4);
+        if (ly->cmp_q4 || ly->cmp_q) {                    /* int8/int4 cmp calibration */
+            if (ly->cmp_scale)  SNAP(ly->cmp_scale,  (size_t)KV*4);
+            if (ly->cmp_iscale) SNAP(ly->cmp_iscale, (size_t)KV*4);
+            if (ly->cmp_absmax) SNAP(ly->cmp_absmax, (size_t)KV*4);
+            int nc = nsl < CALcmp ? nsl : CALcmp; if (ly->cmp_calbuf) SNAP(ly->cmp_calbuf, (size_t)nc*KV*2);
+            SNAP(&ly->cmp_caln, sizeof(int)); SNAP(&ly->cmp_frozen, sizeof(int));
+        }
+        /* --- indexer (ratio==4 only) --- */
+        if (ratio == 4) {
+            int iW = 2*ihd;
+            if (ly->idx_cmp_kv_state)    SNAP(ly->idx_cmp_kv_state,    (size_t)2*ratio*iW*4);
+            if (ly->idx_cmp_score_state) SNAP(ly->idx_cmp_score_state, (size_t)2*ratio*iW*4);
+            if (ly->idx_kv8_4)   { SNAP(ly->idx_kv8_4, (size_t)nsl*(ihd/2)); if (ly->idx_pscale) SNAP(ly->idx_pscale, (size_t)nsl*4); }
+            else if (ly->idx_kv8){ SNAP(ly->idx_kv8,   (size_t)nsl*ihd);     if (ly->idx_pscale) SNAP(ly->idx_pscale, (size_t)nsl*4); }
+            else if (ly->idx_kv) { SNAP(ly->idx_kv,    (size_t)nsl*ihd*4); }
+        }
+    }
+    #undef SNAP
+    if (out_sz) *out_sz = off;
+}
 static int ds4f_mtp_predict(ds4f_model *m, const float *hc_state, const float *xe, int pos, float *logits_out) {
     if (!m->has_mtp) return -1;
     ds4f_config *c = &m->cfg;

@@ -43,6 +43,12 @@ export DS4F_SERVE_REQSEQ="$BASE.reqseq" DS4F_SERVE_RESPSEQ="$BASE.respseq"
 # prefix cache (on by default): a request whose prompt EXTENDS the previous one skips re-prefilling
 # the shared prefix (multi-turn TTFT win, byte-identical). Set 0 to always reprefill from scratch.
 export DS4F_SERVE_PREFIX_CACHE=${DS4F_SERVE_PREFIX_CACHE:-1}
+# SLOTS: number of independent conversation contexts (one live in the caches at a time; a request's
+# "slot" field context-switches by snapshotting/restoring the per-slot KV+compressor state).
+export DS4F_SERVE_SLOTS=${DS4F_SERVE_SLOTS:-1}
+# SYSCACHE: preload a persisted context (built once with a cache_save request) into slot 0 so every
+# conversation starts with the system prompt already prefilled -- instant TTFT, survives restarts.
+[ -n "$DS4F_SERVE_SYSCACHE" ] && export DS4F_SERVE_SYSCACHE
 # real-weight decode bundle (== --preset decode); dense stays int8 (Q8) for fast decode by default
 export DS4F_REAL=1 DS4F_FP8_BF16=1 DS4F_Q8_DENSE=1 DS4F_TIERB2=1 DS4F_MHC=1 DS4F_HC_PAR=1 DS4F_HC_RMSPAR=1
 export DS4F_NUMA=${DS4F_NUMA:-1}

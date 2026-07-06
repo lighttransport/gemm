@@ -63,18 +63,21 @@ def decode(ids):
             except OSError: pass
 
 
-def infer(prompt, max_tokens, samp):
+def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, cache_save=False):
     global _seq
     with _lock:
         ids = encode(prompt)
-        if not ids:
+        if not ids and not cache_save:
             return [], [], ""
         seed = samp["seed"] if samp["seed"] is not None else (_seq + 1)
-        # header: "max_new temp top_p top_k presence_penalty repeat_penalty seed"  (runner parses this)
-        hdr = "%d %g %g %d %g %g %d" % (max_tokens, samp["temperature"], samp["top_p"],
-                                        samp["top_k"], samp["presence_penalty"], samp["repeat_penalty"], seed)
+        ctl = (1 if cache_load else 0) | (2 if cache_save else 0)   # bit0=load-before, bit1=save-after
+        # header: "max_new temp top_p top_k presence_penalty repeat_penalty seed slot ctl"; if ctl!=0 the
+        # NEXT line is the cache path; then the prompt ids.  (runner parses this)
+        hdr = "%d %g %g %d %g %g %d %d %d" % (max_tokens, samp["temperature"], samp["top_p"], samp["top_k"],
+                                              samp["presence_penalty"], samp["repeat_penalty"], seed, slot, ctl)
+        body = hdr + "\n" + ((cache_path or "") + "\n" if ctl else "") + " ".join(map(str, ids)) + "\n"
         with open(REQ, "w") as f:
-            f.write(hdr + "\n" + " ".join(map(str, ids)) + "\n")
+            f.write(body)
         _seq += 1
         with open(REQSEQ, "w") as f:
             f.write(str(_seq) + "\n")                # write req then bump seq -> runner reads a complete file
@@ -130,9 +133,15 @@ class H(http.server.BaseHTTPRequestHandler):
                                      body.get("repetition_penalty", 1.0))),
             "seed":        None if seed is None else int(seed),
         }
+        # context management: slot = which of the DS4F_SERVE_SLOTS conversations; cache_path + cache_load/
+        # cache_save persist/restore the KV+compressor state to disk (system-prompt cache, session save).
+        slot = int(body.get("slot", 0))
+        cache_path = body.get("cache_path", None)
+        cache_load = bool(body.get("cache_load", False))
+        cache_save = bool(body.get("cache_save", False))
         t0 = time.time()
         try:
-            ids, gen, text = infer(prompt, max_tokens, samp)
+            ids, gen, text = infer(prompt, max_tokens, samp, slot, cache_path, cache_load, cache_save)
         except TimeoutError:
             return self._json(504, {"error": "runner timeout"})
         except Exception as e:

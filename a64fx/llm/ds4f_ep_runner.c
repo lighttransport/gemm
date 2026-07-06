@@ -224,6 +224,43 @@ static long ds4f_read_seq(const char *path) {
     FILE *f = fopen(path, "r"); if (!f) return 0;
     long v = 0; if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); return v;
 }
+/* ---- persist a context to disk (system-prompt cache / KV save-load) ----
+ * File = [magic][npos][cfg_hash][ids(npos)][full cache snapshot for npos positions]. cfg_hash pins the
+ * cache-mode layout (int8/int4/maxpos) so a mismatched runner refuses the blob instead of corrupting.
+ * Caches are replicated (no-CP) -> any rank's blob restores identically; rank 0 writes, all ranks read. */
+#define DS4F_CTX_MAGIC 0x44533443u   /* 'DS4C' */
+static uint32_t ds4f_ctx_cfg_hash(ds4f_model *m) {
+    uint32_t h = 2166136261u; int v[6] = { m->cfg.max_pos, m->int8_kv, envi("DS4F_INT8_CMP",0),
+        envi("DS4F_INT4_CMP",0), envi("DS4F_IDX_INT4",0), m->cfg.n_layers };
+    for (int i = 0; i < 6; i++) { h ^= (uint32_t)v[i]; h *= 16777619u; }
+    return h;
+}
+static int ds4f_ctx_write_file(ds4f_model *m, const char *path, const int *ids, int npos) {
+    size_t sz; ds4f_ctx_snap(m, NULL, npos, 0, &sz);
+    char *buf = (char *)malloc(sz); if (!buf) return -1;
+    ds4f_ctx_snap(m, buf, npos, 0, NULL);
+    char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb"); if (!f) { free(buf); return -1; }
+    uint32_t hdr[3] = { DS4F_CTX_MAGIC, (uint32_t)npos, ds4f_ctx_cfg_hash(m) };
+    int ok = fwrite(hdr, 4, 3, f) == 3 && fwrite(ids, sizeof(int), npos, f) == (size_t)npos
+             && fwrite(buf, 1, sz, f) == sz;
+    fclose(f); free(buf);
+    if (ok) { rename(tmp, path); return 0; }   /* atomic publish */
+    remove(tmp); return -1;
+}
+static int ds4f_ctx_read_file(ds4f_model *m, const char *path, int *ids, int *out_npos, int maxpos) {
+    FILE *f = fopen(path, "rb"); if (!f) return -1;
+    uint32_t hdr[3];
+    if (fread(hdr, 4, 3, f) != 3 || hdr[0] != DS4F_CTX_MAGIC) { fclose(f); return -2; }
+    int npos = (int)hdr[1];
+    if (npos > maxpos || hdr[2] != ds4f_ctx_cfg_hash(m)) { fclose(f); return -3; }  /* wrong ctx-cache config */
+    if (fread(ids, sizeof(int), npos, f) != (size_t)npos) { fclose(f); return -1; }
+    size_t sz; ds4f_ctx_snap(m, NULL, npos, 0, &sz);
+    char *buf = (char *)malloc(sz); if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, sz, f) != sz) { free(buf); fclose(f); return -1; }
+    ds4f_ctx_snap(m, buf, npos, 1, NULL);           /* restore into the (replicated) caches */
+    free(buf); fclose(f); *out_npos = npos; return 0;
+}
 
 /* ---- topology (tofu_topo.txt; written once by tofu_topo_helper) ----
  * TOPO_PATH (default tofu_topo.txt) may be overridden per process via TOFU_TOPO_PATH
@@ -655,66 +692,103 @@ int main(int argc,char**argv){
         int maxpos = envi("DS4F_MAXPOS", 4096);
         int *pids = (int *)malloc((size_t)maxpos * sizeof(int));
         int *oids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
-        /* prefix cache (context management): ctx_ids[0,ctx_len) is the token sequence currently held in
-         * the KV/compressor caches (prompt + generated of the previous request). A new request whose
-         * prompt EXTENDS this sequence (shares the whole ctx_len prefix) skips re-prefilling it and
-         * continues from ctx_len -- the huge multi-turn TTFT win. Any divergence -> full reset+reprefill. */
+        int *fids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));   /* scratch for disk load */
+        /* prefix cache (context management): each slot's ids[0,len) is the token sequence held in the
+         * KV/compressor caches. A request whose prompt EXTENDS its slot's sequence skips re-prefilling
+         * the shared prefix and continues from len (the multi-turn TTFT win). Divergence -> full reset. */
         int prefix_cache = envi("DS4F_SERVE_PREFIX_CACHE", 1);
-        int *ctx_ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int)); int ctx_len = 0;
+        /* multi-context slots: DS4F_SERVE_SLOTS independent conversations, one live in the caches at a
+         * time. A request's slot id context-switches by snapshotting the live caches to the old slot and
+         * restoring the new slot's snapshot (ds4f_ctx_snap). Each slot keeps its own token sequence. */
+        int nslots = envi("DS4F_SERVE_SLOTS", 1); if (nslots < 1) nslots = 1; if (nslots > 64) nslots = 64;
+        typedef struct { char *snap; int *ids; int len; int used; } serve_slot;
+        serve_slot *slots = (serve_slot *)calloc((size_t)nslots, sizeof(serve_slot));
+        for (int i = 0; i < nslots; i++) slots[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
+        int live = 0;
+        /* system-prompt cache: preload a persisted context into slot 0 so every conversation starts with
+         * it already prefilled (instant TTFT, survives restarts). Build it once with a ctl=save request. */
+        const char *syscache = getenv("DS4F_SERVE_SYSCACHE");
+        if (syscache && *syscache) {
+            int sn = 0, rc = ds4f_ctx_read_file(m, syscache, slots[0].ids, &sn, maxpos);
+            if (rc == 0) { slots[0].len = sn; slots[0].used = 1;
+                if (MyRank == 0) logmsg("SERVE syscache: preloaded %d-token system prompt from %s\n", sn, syscache); }
+            else if (MyRank == 0) logmsg("SERVE syscache: %s not loaded (rc=%d)\n", syscache, rc);
+        }
         long last_seq = ds4f_read_seq(reqseqf);   /* ignore any stale request present at startup */
-        if (MyRank == 0) logmsg("SERVE ready: poll %s (seq=%ld), req %s -> resp %s  prefix_cache=%d\n",
-                                reqseqf, last_seq, reqf, respf, prefix_cache);
+        if (MyRank == 0) logmsg("SERVE ready: poll %s (seq=%ld), req %s -> resp %s  prefix_cache=%d slots=%d\n",
+                                reqseqf, last_seq, reqf, respf, prefix_cache, nslots);
         for (;;) {
             long seq = last_seq;
             if (MyRank == 0) while ((seq = ds4f_read_seq(reqseqf)) <= last_seq) usleep(2000);
             barrier();                                          /* release all ranks (req file is written before its seq bumps) */
-            int mnew = 256, np = 0;
-            /* request header line: "max_new temp top_p top_k pres_pen rep_pen seed" (missing fields ->
-             * greedy defaults, so an old "max_new"-only request still works); prompt ids follow. */
+            int mnew = 256, np = 0, slot = 0, ctl = 0;
+            char path[1024] = "";
+            /* header: "max_new temp top_p top_k pres_pen rep_pen seed [slot] [ctl]" (missing -> greedy /
+             * slot 0 / no ctl, so old requests still work). ctl bit0=load-before, bit1=save-after; when
+             * ctl!=0 the NEXT line is the disk path. Then the prompt ids. */
             ds4f_sampler sp = { .temp = 0.f, .top_p = 1.f, .pres_pen = 0.f, .rep_pen = 1.f, .top_k = 0, .rep_last_n = 64 };
             long seed = 0;
             FILE *rf = fopen(reqf, "r");
             if (rf) { char line[512];
                       if (fgets(line, sizeof line, rf))
-                          sscanf(line, "%d %f %f %d %f %f %ld", &mnew, &sp.temp, &sp.top_p, &sp.top_k,
-                                 &sp.pres_pen, &sp.rep_pen, &seed);
+                          sscanf(line, "%d %f %f %d %f %f %ld %d %d", &mnew, &sp.temp, &sp.top_p, &sp.top_k,
+                                 &sp.pres_pen, &sp.rep_pen, &seed, &slot, &ctl);
+                      if (ctl) { char pl[1024]; if (fgets(pl, sizeof pl, rf)) {
+                          pl[strcspn(pl, "\r\n")] = 0; snprintf(path, sizeof path, "%s", pl); } }
                       int v; while (np < maxpos && fscanf(rf, "%d", &v) == 1) pids[np++] = v; fclose(rf); }
+            if (slot < 0 || slot >= nslots) slot = 0;
             if (np > maxpos) np = maxpos;                       /* truncate over-long prompt to the KV ceiling */
-            if (mnew < 1) mnew = 1;
-            if (np + mnew > maxpos) mnew = (maxpos > np) ? maxpos - np : 1;   /* keep prompt+gen <= MAXPOS */
+            if (mnew < 0) mnew = 0;                             /* mnew==0 = prefill only (cache priming) */
+            if (np + mnew > maxpos) mnew = (maxpos > np) ? maxpos - np : 0;   /* keep prompt+gen <= MAXPOS */
             ds4f_rng_state = (uint64_t)seed;                    /* identical seed on every rank -> lockstep sampling */
-            /* ---- prefix search: longest common prefix of the new prompt and the cached context ---- */
+            /* ---- context switch: make `slot` the live context (snapshot the outgoing, restore incoming) ---- */
+            if (slot != live) {
+                if (slots[live].len > 0) {
+                    size_t sz; ds4f_ctx_snap(m, NULL, slots[live].len, 0, &sz);
+                    slots[live].snap = (char *)realloc(slots[live].snap, sz);
+                    ds4f_ctx_snap(m, slots[live].snap, slots[live].len, 0, NULL); slots[live].used = 1;
+                }
+                if (slots[slot].used) ds4f_ctx_snap(m, slots[slot].snap, slots[slot].len, 1, NULL);
+                else { ds4f_serve_reset(m); slots[slot].len = 0; }
+                live = slot;
+            }
+            /* ---- ctl load: restore a persisted context from disk into the live slot (all ranks read) ---- */
+            int loaded = 0;
+            if ((ctl & 1) && path[0]) {
+                int sn = 0, rc = ds4f_ctx_read_file(m, path, fids, &sn, maxpos);
+                if (rc == 0) { memcpy(slots[live].ids, fids, (size_t)sn * sizeof(int)); slots[live].len = sn; loaded = 1; }
+                else if (MyRank == 0) logmsg("SERVE load %s failed rc=%d\n", path, rc);
+            }
+            int *ctx_ids = slots[live].ids; int ctx_len = slots[live].len;
+            /* ---- prefix search: longest common prefix of the new prompt and the live slot's sequence ---- */
             int matched = 0, pf_from = 0;
-            if (prefix_cache) {
-                int lim = np < ctx_len ? np : ctx_len;
-                while (matched < lim && pids[matched] == ctx_ids[matched]) matched++;
-            }
-            /* Reuse ONLY a pure append: the cache holds EXACTLY the shared prefix (matched==ctx_len) and
-             * the new prompt extends it (matched<np). Then the caches + compressor + int8 calibration are
-             * already at position ctx_len, so we continue prefilling [matched,np) with no reset. Any other
-             * case (divergence matched<ctx_len, identical/shorter prompt, cold start) -> reset+full reprefill
-             * (rolling the compressor ring back to an interior position would need a snapshot; not done). */
-            if (matched == ctx_len && matched < np && matched > 0) {
-                pf_from = matched;                              /* append: skip the cached prefix */
-            } else {
-                ds4f_serve_reset(m); pf_from = 0; matched = 0;  /* full reprefill */
-            }
+            if (prefix_cache) { int lim = np < ctx_len ? np : ctx_len;
+                while (matched < lim && pids[matched] == ctx_ids[matched]) matched++; }
+            /* reuse ONLY a pure append (caches already at position ctx_len); else full reset+reprefill. */
+            if (matched == ctx_len && matched < np && matched > 0) pf_from = matched;
+            else { ds4f_serve_reset(m); pf_from = 0; matched = 0; }
             double t0 = now_sec();
             int ng = np > 0 ? ds4f_serve_gen(m, pids, np, mnew, x, oids, &sp, pf_from) : 0;
             double dt = now_sec() - t0;
-            /* update the cache to the sequence now resident: prompt[0,np) + the tokens actually fed back
-             * (a trailing EOS is emitted but never embedded, so it is NOT in the caches -> exclude it). */
+            /* update the live slot's sequence: prompt[0,np) + fed-back tokens (trailing EOS is emitted but
+             * never embedded, so it is NOT in the caches -> exclude it). */
             int appended = ng; if (ng > 0 && oids[ng-1] == DS4F_EOS_ID) appended = ng - 1;
             ctx_len = 0;
             for (int i = 0; i < np && ctx_len < maxpos; i++)       ctx_ids[ctx_len++] = pids[i];
             for (int i = 0; i < appended && ctx_len < maxpos; i++) ctx_ids[ctx_len++] = oids[i];
+            slots[live].len = ctx_len; slots[live].used = 1;
+            /* ---- ctl save: persist the live context to disk (rank 0 writes the shared file) ---- */
+            if ((ctl & 2) && path[0] && MyRank == 0) {
+                int rc = ds4f_ctx_write_file(m, path, ctx_ids, ctx_len);
+                logmsg("SERVE save %s (%d tokens) rc=%d\n", path, ctx_len, rc);
+            }
             if (MyRank == 0) {
                 FILE *of = fopen(respf, "w");
                 if (of) { for (int i = 0; i < ng; i++) fprintf(of, "%d%s", oids[i], i+1 < ng ? " " : "\n"); fclose(of); }
                 long rq = ds4f_read_seq(reqseqf);
                 FILE *sf = fopen(respseqf, "w"); if (sf) { fprintf(sf, "%ld\n", rq); fclose(sf); }
-                logmsg("SERVE req#%ld: prompt=%d (cached %d, prefill %d) gen=%d in %.2fs (%.1f tok/s)\n",
-                       rq, np, matched, np - pf_from, ng, dt, ng / dt);
+                logmsg("SERVE req#%ld: slot=%d prompt=%d (cached %d%s, prefill %d) gen=%d in %.2fs (%.1f tok/s)\n",
+                       rq, slot, np, matched, loaded ? "+loaded" : "", np - pf_from, ng, dt, ng > 0 ? ng / dt : 0.0);
             }
             barrier();                                          /* lockstep + ensure response visible before next */
             last_seq = ds4f_read_seq(reqseqf);
