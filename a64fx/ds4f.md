@@ -173,7 +173,7 @@ Endpoints: `POST /v1/completions` (OpenAI shape), `POST /completion` (llama.cpp 
 | **Sampling** | `temperature` (≤0=greedy), `top_p`, `top_k`, `presence_penalty`, `repeat_penalty`, `seed` | temp/top-k/top-p + penalties over the last 64 tokens; shared-seed SplitMix64 → all ranks draw the same token (lockstep) | greedy deterministic; same seed reproducible; ~+48 ms/tok (full-vocab sort) |
 | **Longer single context** | `CTX=<tokens>` | >16k auto-enables compressed ctx-caches (int8 KV/cmp, int4 cmp/idx) → ~2 KB/pos, keeps fast MHC decode; `CP=1` adds TP+CP sharding (→ millions) | MAXPOS=65536 arena **flat** vs 16k; decode 11.6 tok/s @ctx3246 |
 | **Prefix cache** | `DS4F_SERVE_PREFIX_CACHE` (default on) | a request that EXTENDS the cached sequence skips re-prefilling the shared prefix (append only) | 246-tok turn, 237 cached → **1.94s vs 23.2s = 12× TTFT**, byte-identical |
-| **Multi-slot** | `DS4F_SERVE_SLOTS=N`, request `slot` | N independent conversations; a `slot` switch snapshots the outgoing / restores the incoming caches (`ds4f_ctx_snap`) | 2 slots independent + coherent across a switch |
+| **Multi-slot** | `DS4F_SERVE_SLOTS=N`, request `slot` | N independent conversations; a `slot` switch snapshots the outgoing / restores the incoming caches (`ds4f_ctx_snap`) | independent + coherent; switch **~9.5 ms @256 tok** (see below) |
 | **Persistent KV save/load** | `cache_path` + `cache_load` / `cache_save` | persist a context's full cache state to disk (magic + cfg-hash guard, atomic) and restore later | disk round-trip **byte-identical** to live cache |
 | **System-prompt cache** | `DS4F_SERVE_SYSCACHE=path` | preload a persisted context into slot 0 at startup → every conversation starts pre-prefilled, survives restarts | 197-tok sys prompt: prefill only the user turn, **2.2s vs 17s = ~8× TTFT** |
 | **Per-rank shards (CP)** | (automatic under `CP=1`) | under context-parallel the sharded caches are saved/loaded as one `<path>.rankNN` per node | 11 distinct shards, load byte-identical under TP+CP |
@@ -184,6 +184,19 @@ layout (int8/int4/MAXPOS/CP/rank) — a blob is refused (not silently corrupted)
 configured runner. TTFT note: under the long-ctx (int8-KV) path prefill is token-by-token
 (~12.5 tok/s), so a *cold* multi-thousand-token prompt is minutes to first token — which is exactly
 what the prefix / system-prompt / KV-save caches eliminate on every subsequent turn.
+
+**Multi-slot context-switch overhead** (`bench_slot_switch.sh`, rank-0 timer on the two snapshot
+memcpys). Measured real-weight 11n at ctx 256 (reproduced across MAXPOS 8192 & 65536 — identical,
+confirming the snapshot copies only the *written* region, not the arena): **save 5.37 ms + restore
+4.10 ms = ~9.5 ms**, blob **29.9 MB/slot** (single-thread ~6–7 GB/s incl. the `realloc`). The blob is
+a fixed part (~24 MB: int8 `kv_calbuf` CAL=256 + compressor/indexer ring states + scales) plus a
+growing part (~24 KB/token: int8 `kv_q` 512 B/tok/layer×43 + int4 cmp/idx), so switch(L) ≈
+24 MB + L·24 KB → ~15 ms @1k, ~37 ms @4k, ~68 ms @8k. Cheap: at ctx 256 a switch is ~2400× cheaper
+than the ~23 s re-prefill it replaces, and ≈0.1 decode-token of time; only at multi-thousand-token
+contexts does it reach tens of ms (still a fraction of one decode step). NOTE: the run couldn't
+extend past 256 tokens — token-by-token prefills of ≳512 tok intermittently trip a uTofu collective
+timeout (`tp_ar bcast timeout … want=N got=N-1` → `FATAL: barrier release`) on this alloc; the larger
+rows are the linear model, not measured.
 
 ## Files (branch `ds4f`)
 
