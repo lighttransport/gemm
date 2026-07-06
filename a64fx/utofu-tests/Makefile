@@ -66,6 +66,10 @@ p2p_latbw_bench: p2p_latbw_bench.c tofu_demo.h
 tp_allreduce_test: tp_allreduce_test.c tofu_demo.h tp_allreduce.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
 
+# ack/retransmit reliability layer loss-injection test (TP_AR_ACK / TP_AR_DROP); NO MPI
+tp_ar_ack_test: tp_ar_ack_test.c tofu_demo.h tp_allreduce.h
+	$(CC) $(CFLAGS) -o $@ $< $(TOFU) -lm
+
 # communication-only EP prefill roofline: allreduce and synthetic token dispatch, NO MPI
 ep_prefill_synth: ep_prefill_synth.c tofu_demo.h tp_allreduce.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU) -lm
