@@ -198,6 +198,23 @@ extend past 256 tokens — token-by-token prefills of ≳512 tok intermittently 
 timeout (`tp_ar bcast timeout … want=N got=N-1` → `FATAL: barrier release`) on this alloc; the larger
 rows are the linear model, not measured.
 
+**Chunked-prefill checkpointing** (`prefill_checkpoint.sh`) — the fix for that comm timeout. Root
+cause (see "uTofu comm" below): `want` in the timeout is the cumulative reduce count, and deaths
+occur at wildly different counts (69 vs 514 tokens) ⇒ a **probabilistic per-Put loss with no
+retransmit** (`exit(1)` after 60 s), so a token-by-token prefill firing ~43 reduces/token is a coin
+flip over its ~10⁴–10⁵ reduces. The driver splits a long prompt into M-token chunks, `cache_save`-ing
+after each (the prefix cache prefills only the new M tokens ⇒ M·43 reduces/chunk ⇒ low per-chunk
+loss). If the runner dies mid-chunk it relaunches with `DS4F_SERVE_SYSCACHE=<ckpt>` (restores all
+checkpointed chunks), and retries **only** the failed chunk — so a long prefill always makes forward
+progress and a completed chunk is never redone. Reuses the byte-exact KV save/load already validated.
+
+**KV precision — int8 vs bf16 accuracy** (`bench_kv_accuracy.sh`, greedy A/B, `DS4F_INT8_KV` the only
+difference, otherwise the production config: FP8→Q8 dense, int4 cmp/idx). Real-weight 11n, 3 diverse
+prompts × 64 tokens: **100 % top-1 token agreement, zero divergences** — int8 KV (S5 per-channel,
+~0.2–0.5 % intrinsic latent rms) is **argmax-lossless** vs bf16 KV here, so the −0.35 GB/16k (linear
+to ~5.7 GB/256k) it saves is free at the output level. (Matches the earlier gen A/B; the model's KV
+cache is bf16 — there is no separate fp16 KV mode.)
+
 ## Files (branch `ds4f`)
 
 | File | Role |
@@ -212,6 +229,9 @@ rows are the linear model, not measured.
 | `a64fx/llm/run_ds4f_serve_11n.sh` | HTTP serving launcher (persistent runner + `ds4f_serve.py`) |
 | `a64fx/llm/ds4f_serve.py` | control-node HTTP frontend (OpenAI/llama.cpp shapes) |
 | `a64fx/llm/validate_prefix_cache.sh`, `validate_ctx_features.sh`, `validate_cp_shards.sh` | serving A/B validators |
+| `a64fx/llm/prefill_checkpoint.sh` | chunked-prefill checkpoint driver (comm-timeout fix, resumable) |
+| `a64fx/llm/bench_kv_accuracy.sh` + `bench_kv_accuracy_diff.py` | int8-vs-bf16 KV greedy accuracy A/B |
+| `a64fx/llm/bench_slot_switch.sh` | multi-slot context-switch overhead timer |
 | `a64fx/utofu-tests/tofu_topo_helper` | MPI program that writes `tofu_topo.txt` (rank→coords) |
 
 Build is native `fcc`/`FCC` (NOT `fccpx`/`FCCpx`); binaries run directly, **no `pjsub`**
