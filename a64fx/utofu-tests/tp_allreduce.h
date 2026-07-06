@@ -52,6 +52,12 @@ typedef struct {
     int             robust;                  /* TP_AR_ROBUST: 0=passive spin, 1=drain+civac per spin,
                                               * 2=LEAN decode path (amortized drain + civac every 64 spins) */
     uint64_t        seq;                     /* monotonic call counter            */
+    /* --- TP_AR_ACK: ack/retransmit reliability prototype (default off) --- */
+    int             ack;                     /* 1 = reliable send (bounded retransmit + ack) */
+    int             ack_retx;                /* max retransmits before optimistic proceed (TP_AR_ACK_RETX) */
+    double          ack_rtt;                 /* retransmit interval seconds (TP_AR_ACK_RTT) */
+    size_t          ack_base;                /* byte offset of ack region (nprocs 8B slots + 1 scratch) */
+    unsigned long   drop_n, put_ctr;         /* TP_AR_DROP=N: drop 1-in-N payload Puts (loss injection) */
 } tp_comm;
 
 static double tp_ar_now(void) {
@@ -167,10 +173,31 @@ static void tp_ar_put(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t dst
     tp_ar_drain_mrq(c);   /* consume receiver-side RMT_PUT notices → no MRQ overflow */
 }
 
-/* copy buf into send slot, Put payload to peer's recv slot `sid`, then publish
- * the fixed-offset trailer. For full-width fp32 max_count sends, payload and
- * trailer are contiguous and travel in one Put; otherwise use a second 8-byte
- * Put so small decode reductions do not pay the batched-prefill payload size. */
+/* --- TP_AR_ACK reliability helpers --- */
+/* Put the (already-filled) send slot to peer's recv[sid]. Optional TP_AR_DROP loss injection:
+ * every drop_n-th call the payload+trailer "vanish" (skipped) to exercise the retransmit path. */
+static void tp_ar_send_puts(tp_comm *c, int peer, int sid, size_t pbytes, int contiguous) {
+    if (c->drop_n && (++c->put_ctr % c->drop_n) == 0) return;   /* simulate a lost message */
+    size_t tr_off = tp_ar_trailer_off(c);
+    utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
+    utofu_stadd_t dst = c->peer_base[peer] + tp_ar_slot_off(c, 1 + sid);
+    if (contiguous) tp_ar_put(c, peer, src, dst, pbytes + 8);
+    else { tp_ar_put(c, peer, src, dst, pbytes); tp_ar_put(c, peer, src + tr_off, dst + tr_off, 8); }
+}
+/* Receiver R -> sender S: Put R's ack tok into S's ack[R] slot (8 B). Never drop-injected. */
+static void tp_ar_ack_send(tp_comm *c, int to_peer, uint64_t tok) {
+    char *scr = c->region + c->ack_base + (size_t)c->nprocs * TP_AR_LINE;   /* ack-send scratch */
+    *(volatile uint64_t *)scr = tok;
+    utofu_stadd_t src = c->base + c->ack_base + (size_t)c->nprocs * TP_AR_LINE;
+    utofu_stadd_t dst = c->peer_base[to_peer] + c->ack_base + (size_t)c->my_rank * TP_AR_LINE;
+    tp_ar_put(c, to_peer, src, dst, 8);
+}
+/* copy buf into send slot, Put payload to peer's recv slot `sid`, then publish the fixed-offset
+ * trailer. For full-width fp32 max_count sends, payload and trailer are contiguous and travel in one
+ * Put; otherwise a second 8-byte Put so small decode reductions do not pay the prefill payload size.
+ * TP_AR_ACK: after sending, spin for peer's ack (ack[peer] >= tok), retransmitting every ack_rtt up
+ * to ack_retx times, then proceed OPTIMISTICALLY (the payload Put is idempotent and near-certainly
+ * landed on one of the attempts) -- this replaces the old 60s-then-exit(1) on a single lost Put. */
 static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int count, uint64_t tok) {
     char *sb = c->region + tp_ar_slot_off(c, 0);
     size_t pbytes;
@@ -182,22 +209,28 @@ static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int coun
         memcpy(sb, buf, (size_t)count * sizeof(float));
         pbytes = (size_t)count * sizeof(float);
     }
-    size_t tr_off = tp_ar_trailer_off(c);
-    *(volatile uint64_t *)(sb + tr_off) = tok;
-    utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
-    utofu_stadd_t dst = c->peer_base[peer] + tp_ar_slot_off(c, 1 + sid);
-    if (!c->use_bf16 && count == c->max_count) {
-        tp_ar_put(c, peer, src, dst, pbytes + 8);
-    } else {
-        tp_ar_put(c, peer, src, dst, pbytes);
-        tp_ar_put(c, peer, src + tr_off, dst + tr_off, 8);
+    *(volatile uint64_t *)(sb + tp_ar_trailer_off(c)) = tok;
+    int contiguous = (!c->use_bf16 && count == c->max_count);
+    tp_ar_send_puts(c, peer, sid, pbytes, contiguous);
+    if (!c->ack) return;                                    /* default: fire-and-forget (unchanged) */
+    volatile uint64_t *ackp = (volatile uint64_t *)(c->region + c->ack_base + (size_t)peer * TP_AR_LINE);
+    double t0 = tp_ar_now(); int retx = 0;
+    for (;;) {
+        if (c->robust) tp_ar_drain_mrq(c);
+        tp_ar_flag_inval(ackp);
+        if (*ackp >= tok) return;                          /* peer confirmed receipt */
+        if (tp_ar_now() - t0 >= c->ack_rtt) {
+            if (++retx > c->ack_retx) return;              /* optimistic proceed (idempotent payload) */
+            tp_ar_send_puts(c, peer, sid, pbytes, contiguous);   /* retransmit */
+            t0 = tp_ar_now();
+        }
     }
 }
 
 /* wait for recv slot `sid` trailer to reach tok, then add its payload into buf.
  * bf16 mode: buf[i] = Rf(Rf(buf[i]) + recv_bf16[i]) — symmetric so both exchange
  * partners end bitwise-equal and buf stays bf16-valued (broadcast can be exact). */
-static void tp_ar_recv_add(tp_comm *c, int sid, float *buf, int count, uint64_t tok) {
+static void tp_ar_recv_add(tp_comm *c, int sid, int from, float *buf, int count, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
     volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
     tp_ar_wait(c, trl, tok, sid, "wait");
@@ -209,13 +242,14 @@ static void tp_ar_recv_add(tp_comm *c, int sid, float *buf, int count, uint64_t 
         const float *r = (const float *)rb;
         for (int i = 0; i < count; i++) buf[i] += r[i];
     }
+    if (c->ack) tp_ar_ack_send(c, from, tok);   /* ack AFTER reading rb (a retransmit can't corrupt it) */
 }
 /* wait for recv slot `sid` trailer, then element-wise MAX its payload into buf.
  * max is exact (the result is always one of the two inputs), so unlike the sum the
  * bf16 path needs no symmetric-round trick: both partners compute max(Rf(buf),Rf(recv))
  * over bf16-valued operands and end bitwise-equal; fp32 path is plain max. Deterministic
  * (assoc/comm) => identical on every rank regardless of fold order => lockstep-safe. */
-static void tp_ar_recv_max(tp_comm *c, int sid, float *buf, int count, uint64_t tok) {
+static void tp_ar_recv_max(tp_comm *c, int sid, int from, float *buf, int count, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
     volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
     tp_ar_wait(c, trl, tok, sid, "max");
@@ -226,9 +260,10 @@ static void tp_ar_recv_max(tp_comm *c, int sid, float *buf, int count, uint64_t 
         const float *r = (const float *)rb;
         for (int i = 0; i < count; i++) if (r[i] > buf[i]) buf[i] = r[i];
     }
+    if (c->ack) tp_ar_ack_send(c, from, tok);
 }
 /* same wait but overwrite (broadcast leg: receive the final reduced value). */
-static void tp_ar_recv_copy(tp_comm *c, int sid, float *buf, int count, uint64_t tok) {
+static void tp_ar_recv_copy(tp_comm *c, int sid, int from, float *buf, int count, uint64_t tok) {
     char *rb = c->region + tp_ar_slot_off(c, 1 + sid);
     volatile uint64_t *trl = (volatile uint64_t *)(rb + tp_ar_trailer_off(c));
     tp_ar_wait(c, trl, tok, sid, "bcast");
@@ -238,6 +273,7 @@ static void tp_ar_recv_copy(tp_comm *c, int sid, float *buf, int count, uint64_t
     } else {
         memcpy(buf, rb, (size_t)count * sizeof(float));
     }
+    if (c->ack) tp_ar_ack_send(c, from, tok);
 }
 
 /* in-place sum-all-reduce of buf[0..count). All ranks must pass the same count. */
@@ -249,7 +285,7 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
     /* 1. pre-reduce fold: even of the lowest 2*rem ranks -> its odd partner. */
     if (mr < 2 * rem) {
         if (mr % 2 == 0) tp_ar_send(c, mr + 1, 0, buf, count, tok);   /* even sends, then idle */
-        else             tp_ar_recv_add(c, 0, buf, count, tok);       /* odd folds it in */
+        else             tp_ar_recv_add(c, 0, mr - 1, buf, count, tok);   /* odd folds it in */
     }
 
     /* 2. recursive doubling among the pof2 survivors. */
@@ -258,13 +294,13 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
             int pnr = c->newrank ^ (1 << k);
             int pr  = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
             tp_ar_send(c, pr, k + 1, buf, count, tok);
-            tp_ar_recv_add(c, k + 1, buf, count, tok);
+            tp_ar_recv_add(c, k + 1, pr, buf, count, tok);
         }
     }
 
     /* 3. broadcast the result back to the folded-out even ranks. */
     if (mr < 2 * rem) {
-        if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, buf, count, tok);
+        if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);
         else             tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok);
     }
 }
@@ -280,18 +316,18 @@ static void tp_allreduce_max(tp_comm *c, float *buf, int count) {
 
     if (mr < 2 * rem) {                                   /* 1. pre-reduce fold even->odd */
         if (mr % 2 == 0) tp_ar_send(c, mr + 1, 0, buf, count, tok);
-        else             tp_ar_recv_max(c, 0, buf, count, tok);
+        else             tp_ar_recv_max(c, 0, mr - 1, buf, count, tok);
     }
     if (c->newrank != -1) {                               /* 2. recursive doubling */
         for (int k = 0; k < c->nrounds; k++) {
             int pnr = c->newrank ^ (1 << k);
             int pr  = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
             tp_ar_send(c, pr, k + 1, buf, count, tok);
-            tp_ar_recv_max(c, k + 1, buf, count, tok);
+            tp_ar_recv_max(c, k + 1, pr, buf, count, tok);
         }
     }
     if (mr < 2 * rem) {                                   /* 3. broadcast to folded-out evens */
-        if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, buf, count, tok);
+        if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);
         else             tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok);
     }
 }
@@ -433,7 +469,11 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
     for (int r = 0; r < nprocs; r++) c->peer_vcq[r] = peer_vcq[r];
 
     c->slot = ((size_t)max_count * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
-    size_t region_sz = (size_t)(1 + TP_AR_NSTEP) * c->slot;
+    /* reliability prototype: an ack region of nprocs 8B slots (peer p writes its ack tok to ack[p])
+     * plus one scratch slot the acking rank Puts FROM. Only allocated when TP_AR_ACK=1. */
+    c->ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
+    c->ack_base = (size_t)(1 + TP_AR_NSTEP) * c->slot;
+    size_t region_sz = c->ack_base + (c->ack ? (size_t)(nprocs + 1) * TP_AR_LINE : 0);
     if (posix_memalign((void **)&c->region, TP_AR_LINE, region_sz) != 0) {
         fprintf(stderr, "tp_ar: posix_memalign failed\n"); return -1;
     }
@@ -468,9 +508,14 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
     c->seq = 0;
     c->use_bf16 = getenv("TP_AR_BF16") && atoi(getenv("TP_AR_BF16")) != 0;
     c->robust   = getenv("TP_AR_ROBUST") ? atoi(getenv("TP_AR_ROBUST")) : 1;  /* default ON */
+    c->ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 8;
+    c->ack_rtt  = getenv("TP_AR_ACK_RTT")  ? atof(getenv("TP_AR_ACK_RTT"))  : 0.02;  /* 20 ms */
+    c->drop_n   = getenv("TP_AR_DROP") ? strtoul(getenv("TP_AR_DROP"), NULL, 10) : 0;
+    c->put_ctr  = 0;
     if (my_rank == 0)
-        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s robust=%d\n",
-                nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32", c->robust);
+        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s robust=%d ack=%d%s\n",
+                nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32", c->robust,
+                c->ack, c->drop_n ? " DROP-INJECT" : "");
     return 0;
 }
 
