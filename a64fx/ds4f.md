@@ -146,6 +146,45 @@ lockstep argmax, prefill 10.44 / decode 10.16 tok/s (pre-NUMA/pre-WS1) — see "
 **Larger sibling.** V4-Pro (`ds4p`: 61 L / hidden 7168 / 384 experts, ~805 GB) is a separate, much
 bigger config (weight floor ~54n+) with its own harness — the numbers here are V4-Flash only.
 
+## HTTP serving (llama-server-like) — `run_ds4f_serve_11n.sh` (2026-07)
+
+The EP runner has a persistent **`DS4F_SERVE`** loop: load the model **once** on 11 EP nodes, then
+answer many requests (instead of reloading ~3.5 min per generation). A small python HTTP frontend
+(`ds4f_serve.py`) runs on the control node and drives the runner over shared-FS request/response
+files — all 11 ranks read the same request → lockstep, no broadcast.
+
+```sh
+# inside the live 12-node alloc, from a64fx/llm (weights already staged):
+PORT=8080 ./run_ds4f_serve_11n.sh                       # default ~16k ctx, fast decode
+CTX=65536 ./run_ds4f_serve_11n.sh                       # longer single context (compressed caches)
+CTX=1048576 CP=1 DS4F_SERVE_SLOTS=4 ./run_ds4f_serve_11n.sh   # extreme ctx (TP+CP) + 4 slots
+# then, from anywhere that can reach the node:
+curl -s localhost:8080/v1/completions -d '{"prompt":"def quicksort(a):","max_tokens":128}'
+curl -s localhost:8080/v1/completions -d '{"prompt":"...","max_tokens":128,
+  "temperature":0.8,"top_p":0.95,"top_k":40,"repeat_penalty":1.1,"seed":42}'   # sampling
+```
+
+Endpoints: `POST /v1/completions` (OpenAI shape), `POST /completion` (llama.cpp shape), `GET /health`.
+
+**Features** (all validated real-weight 11n; greedy is byte-reproducible):
+
+| Feature | Knob / request field | What it does | Measured |
+|---|---|---|---|
+| **Sampling** | `temperature` (≤0=greedy), `top_p`, `top_k`, `presence_penalty`, `repeat_penalty`, `seed` | temp/top-k/top-p + penalties over the last 64 tokens; shared-seed SplitMix64 → all ranks draw the same token (lockstep) | greedy deterministic; same seed reproducible; ~+48 ms/tok (full-vocab sort) |
+| **Longer single context** | `CTX=<tokens>` | >16k auto-enables compressed ctx-caches (int8 KV/cmp, int4 cmp/idx) → ~2 KB/pos, keeps fast MHC decode; `CP=1` adds TP+CP sharding (→ millions) | MAXPOS=65536 arena **flat** vs 16k; decode 11.6 tok/s @ctx3246 |
+| **Prefix cache** | `DS4F_SERVE_PREFIX_CACHE` (default on) | a request that EXTENDS the cached sequence skips re-prefilling the shared prefix (append only) | 246-tok turn, 237 cached → **1.94s vs 23.2s = 12× TTFT**, byte-identical |
+| **Multi-slot** | `DS4F_SERVE_SLOTS=N`, request `slot` | N independent conversations; a `slot` switch snapshots the outgoing / restores the incoming caches (`ds4f_ctx_snap`) | 2 slots independent + coherent across a switch |
+| **Persistent KV save/load** | `cache_path` + `cache_load` / `cache_save` | persist a context's full cache state to disk (magic + cfg-hash guard, atomic) and restore later | disk round-trip **byte-identical** to live cache |
+| **System-prompt cache** | `DS4F_SERVE_SYSCACHE=path` | preload a persisted context into slot 0 at startup → every conversation starts pre-prefilled, survives restarts | 197-tok sys prompt: prefill only the user turn, **2.2s vs 17s = ~8× TTFT** |
+| **Per-rank shards (CP)** | (automatic under `CP=1`) | under context-parallel the sharded caches are saved/loaded as one `<path>.rankNN` per node | 11 distinct shards, load byte-identical under TP+CP |
+
+Build a system-prompt cache once with a `cache_save` request (`max_tokens:0` = prefill-only), then
+launch with `DS4F_SERVE_SYSCACHE` pointing at it. Caveat: the on-disk cfg-hash pins the cache-mode
+layout (int8/int4/MAXPOS/CP/rank) — a blob is refused (not silently corrupted) by a differently
+configured runner. TTFT note: under the long-ctx (int8-KV) path prefill is token-by-token
+(~12.5 tok/s), so a *cold* multi-thousand-token prompt is minutes to first token — which is exactly
+what the prefix / system-prompt / KV-save caches eliminate on every subsequent turn.
+
 ## Files (branch `ds4f`)
 
 | File | Role |
@@ -157,6 +196,9 @@ bigger config (weight floor ~54n+) with its own harness — the numbers here are
 | `a64fx/llm/run_ds4f_stage_11n.sh` | stage launcher (mpiexec, PMIX_RANK self-ID) |
 | `a64fx/llm/run_ds4f_11n.sh` | run launcher (vcoord + topo + mpiexec) |
 | `a64fx/llm/run_ds4f_longctx_11n.sh` | long-ctx Tier-B2 bench wrapper (ctx-warm + sentinel) |
+| `a64fx/llm/run_ds4f_serve_11n.sh` | HTTP serving launcher (persistent runner + `ds4f_serve.py`) |
+| `a64fx/llm/ds4f_serve.py` | control-node HTTP frontend (OpenAI/llama.cpp shapes) |
+| `a64fx/llm/validate_prefix_cache.sh`, `validate_ctx_features.sh`, `validate_cp_shards.sh` | serving A/B validators |
 | `a64fx/utofu-tests/tofu_topo_helper` | MPI program that writes `tofu_topo.txt` (rank→coords) |
 
 Build is native `fcc`/`FCC` (NOT `fccpx`/`FCCpx`); binaries run directly, **no `pjsub`**
