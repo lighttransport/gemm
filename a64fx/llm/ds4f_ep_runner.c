@@ -176,21 +176,23 @@ static void ds4f_serve_reset(ds4f_model *m) {
         ly->kv_caln = 0; ly->kv_frozen = 0; ly->cmp_caln = 0; ly->cmp_frozen = 0;   /* int8 recalibrate */
     }
 }
-/* one generation: prefill the prompt (batched-verify if DS4F_PREFILL_GEMM else token-by-token) then
- * decode up to max_new (stop on eos). sp->temp>0 -> sample (temp/top-k/top-p/penalties) from the
- * per-position logits, else greedy argmax. Returns n_gen written to out_ids. All ranks lockstep. */
+/* one generation: prefill the prompt positions [pf_from, np) -- pf_from>0 reuses a cached prefix
+ * already in the KV/compressor caches (see the prefix-search in the serve loop) -- then decode up to
+ * max_new (stop on eos). sp->temp>0 -> sample (temp/top-k/top-p/penalties) from the per-position
+ * logits, else greedy argmax. Returns n_gen written to out_ids. All ranks lockstep. */
 static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, float *x, int *out_ids,
-                          const ds4f_sampler *sp) {
+                          const ds4f_sampler *sp, int pf_from) {
     int C = m->cfg.hidden, V = m->cfg.vocab, pf_last = 0, have_logits = 0;
     int pf_gemm = envi("DS4F_PREFILL_GEMM", 0), K = envi("DS4F_PREFILL_K", 32);
     int sampling = sp && sp->temp > 0.f;
+    if (pf_from < 0 || pf_from >= np) pf_from = 0;       /* must prefill >=1 position (for pf_last logits) */
     if (K < 1) K = 1; if (K > 32) K = 32;
     if (pf_gemm && !m->has_mtp) {                       /* batched-verify prefill */
         ds4f_alloc_prefill_batch(m, K);
         size_t hcC = (size_t)m->cfg.hc_mult * C;
         float *Xin = (float *)aligned_alloc(64, (size_t)K*C*4), *vhc = (float *)aligned_alloc(64, (size_t)K*hcC*4);
         int lastM = 0;
-        for (int base = 0; base < np; base += K) {
+        for (int base = pf_from; base < np; base += K) {
             int M = np - base < K ? np - base : K; lastM = M;
             for (int mm = 0; mm < M; mm++) embed_lookup(m, pids[base+mm], Xin + (size_t)mm*C);
             int ot[32]; ds4f_forward_verify(m, Xin, M, base, ot, vhc); pf_last = ot[M-1];
@@ -202,7 +204,7 @@ static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, f
             memcpy(m->s_logits, m->p_logits + (size_t)(lastM-1)*V, (size_t)V*4); have_logits = 1;
         }
     } else {                                            /* token-by-token prefill (m->s_logits left set) */
-        for (int p = 0; p < np; p++) { embed_lookup(m, pids[p], x); pf_last = ds4f_forward_token(m, x, p); }
+        for (int p = pf_from; p < np; p++) { embed_lookup(m, pids[p], x); pf_last = ds4f_forward_token(m, x, p); }
         have_logits = 1;
     }
     int *hist = (int *)malloc((size_t)(np + max_new) * sizeof(int));   /* penalty history: prompt + gen */
@@ -653,8 +655,15 @@ int main(int argc,char**argv){
         int maxpos = envi("DS4F_MAXPOS", 4096);
         int *pids = (int *)malloc((size_t)maxpos * sizeof(int));
         int *oids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
+        /* prefix cache (context management): ctx_ids[0,ctx_len) is the token sequence currently held in
+         * the KV/compressor caches (prompt + generated of the previous request). A new request whose
+         * prompt EXTENDS this sequence (shares the whole ctx_len prefix) skips re-prefilling it and
+         * continues from ctx_len -- the huge multi-turn TTFT win. Any divergence -> full reset+reprefill. */
+        int prefix_cache = envi("DS4F_SERVE_PREFIX_CACHE", 1);
+        int *ctx_ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int)); int ctx_len = 0;
         long last_seq = ds4f_read_seq(reqseqf);   /* ignore any stale request present at startup */
-        if (MyRank == 0) logmsg("SERVE ready: poll %s (seq=%ld), req %s -> resp %s\n", reqseqf, last_seq, reqf, respf);
+        if (MyRank == 0) logmsg("SERVE ready: poll %s (seq=%ld), req %s -> resp %s  prefix_cache=%d\n",
+                                reqseqf, last_seq, reqf, respf, prefix_cache);
         for (;;) {
             long seq = last_seq;
             if (MyRank == 0) while ((seq = ds4f_read_seq(reqseqf)) <= last_seq) usleep(2000);
@@ -674,16 +683,38 @@ int main(int argc,char**argv){
             if (mnew < 1) mnew = 1;
             if (np + mnew > maxpos) mnew = (maxpos > np) ? maxpos - np : 1;   /* keep prompt+gen <= MAXPOS */
             ds4f_rng_state = (uint64_t)seed;                    /* identical seed on every rank -> lockstep sampling */
+            /* ---- prefix search: longest common prefix of the new prompt and the cached context ---- */
+            int matched = 0, pf_from = 0;
+            if (prefix_cache) {
+                int lim = np < ctx_len ? np : ctx_len;
+                while (matched < lim && pids[matched] == ctx_ids[matched]) matched++;
+            }
+            /* Reuse ONLY a pure append: the cache holds EXACTLY the shared prefix (matched==ctx_len) and
+             * the new prompt extends it (matched<np). Then the caches + compressor + int8 calibration are
+             * already at position ctx_len, so we continue prefilling [matched,np) with no reset. Any other
+             * case (divergence matched<ctx_len, identical/shorter prompt, cold start) -> reset+full reprefill
+             * (rolling the compressor ring back to an interior position would need a snapshot; not done). */
+            if (matched == ctx_len && matched < np && matched > 0) {
+                pf_from = matched;                              /* append: skip the cached prefix */
+            } else {
+                ds4f_serve_reset(m); pf_from = 0; matched = 0;  /* full reprefill */
+            }
             double t0 = now_sec();
-            ds4f_serve_reset(m);
-            int ng = np > 0 ? ds4f_serve_gen(m, pids, np, mnew, x, oids, &sp) : 0;
+            int ng = np > 0 ? ds4f_serve_gen(m, pids, np, mnew, x, oids, &sp, pf_from) : 0;
             double dt = now_sec() - t0;
+            /* update the cache to the sequence now resident: prompt[0,np) + the tokens actually fed back
+             * (a trailing EOS is emitted but never embedded, so it is NOT in the caches -> exclude it). */
+            int appended = ng; if (ng > 0 && oids[ng-1] == DS4F_EOS_ID) appended = ng - 1;
+            ctx_len = 0;
+            for (int i = 0; i < np && ctx_len < maxpos; i++)       ctx_ids[ctx_len++] = pids[i];
+            for (int i = 0; i < appended && ctx_len < maxpos; i++) ctx_ids[ctx_len++] = oids[i];
             if (MyRank == 0) {
                 FILE *of = fopen(respf, "w");
                 if (of) { for (int i = 0; i < ng; i++) fprintf(of, "%d%s", oids[i], i+1 < ng ? " " : "\n"); fclose(of); }
                 long rq = ds4f_read_seq(reqseqf);
                 FILE *sf = fopen(respseqf, "w"); if (sf) { fprintf(sf, "%ld\n", rq); fclose(sf); }
-                logmsg("SERVE req#%ld: prompt=%d gen=%d in %.2fs (%.1f tok/s)\n", rq, np, ng, dt, ng/dt);
+                logmsg("SERVE req#%ld: prompt=%d (cached %d, prefill %d) gen=%d in %.2fs (%.1f tok/s)\n",
+                       rq, np, matched, np - pf_from, ng, dt, ng / dt);
             }
             barrier();                                          /* lockstep + ensure response visible before next */
             last_seq = ds4f_read_seq(reqseqf);
