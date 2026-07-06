@@ -757,14 +757,20 @@ int main(int argc,char**argv){
             ds4f_rng_state = (uint64_t)seed;                    /* identical seed on every rank -> lockstep sampling */
             /* ---- context switch: make `slot` the live context (snapshot the outgoing, restore incoming) ---- */
             if (slot != live) {
+                double ts0 = now_sec(); size_t save_sz = 0, rest_sz = 0;
                 if (slots[live].len > 0) {
-                    size_t sz; ds4f_ctx_snap(m, NULL, slots[live].len, 0, &sz);
-                    slots[live].snap = (char *)realloc(slots[live].snap, sz);
+                    ds4f_ctx_snap(m, NULL, slots[live].len, 0, &save_sz);
+                    slots[live].snap = (char *)realloc(slots[live].snap, save_sz);
                     ds4f_ctx_snap(m, slots[live].snap, slots[live].len, 0, NULL); slots[live].used = 1;
                 }
-                if (slots[slot].used) ds4f_ctx_snap(m, slots[slot].snap, slots[slot].len, 1, NULL);
+                double ts1 = now_sec();
+                if (slots[slot].used) { ds4f_ctx_snap(m, slots[slot].snap, slots[slot].len, 1, NULL);
+                                        ds4f_ctx_snap(m, NULL, slots[slot].len, 0, &rest_sz); }
                 else { ds4f_serve_reset(m); slots[slot].len = 0; }
-                live = slot;
+                double ts2 = now_sec(); int from = live; live = slot;
+                if (MyRank == 0) logmsg("SERVE switch %d->%d: save %.2fms (%d tok, %.1f MB) restore %.2fms (%d tok, %.1f MB)\n",
+                    from, slot, (ts1-ts0)*1e3, slots[from].len, save_sz/1048576.0,
+                    (ts2-ts1)*1e3, slots[slot].len, rest_sz/1048576.0);
             }
             /* ---- ctl load: restore a persisted context from disk into the live slot (all ranks read) ---- */
             int loaded = 0;
