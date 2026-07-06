@@ -535,8 +535,12 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
     c->seq = 0;
     c->use_bf16 = getenv("TP_AR_BF16") && atoi(getenv("TP_AR_BF16")) != 0;
     c->robust   = getenv("TP_AR_ROBUST") ? atoi(getenv("TP_AR_ROBUST")) : 1;  /* default ON */
-    c->ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 8;
-    c->ack_rtt  = getenv("TP_AR_ACK_RTT")  ? atof(getenv("TP_AR_ACK_RTT"))  : 0.02;  /* 20 ms */
+    c->ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 64;
+    /* retransmit interval: recovery latency is ~ack_rtt per lost Put. 1 ms is >> the µs-scale real
+     * ack RTT + payload-reduce time (even a ~256 KB batched-prefill tile reduces in <~1 ms), so no
+     * spurious retransmits, while giving ~20x faster loss recovery than the old 20 ms (validated 11n:
+     * drop=50 119 -> 2244 reduce/s). ack_retx*ack_rtt = 64 ms optimistic-proceed budget. */
+    c->ack_rtt  = getenv("TP_AR_ACK_RTT")  ? atof(getenv("TP_AR_ACK_RTT"))  : 0.001;  /* 1 ms */
     c->drop_n   = getenv("TP_AR_DROP") ? strtoul(getenv("TP_AR_DROP"), NULL, 10) : 0;
     c->put_ctr  = 0;
     if (my_rank == 0)
