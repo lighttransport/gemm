@@ -215,6 +215,35 @@ prompts × 64 tokens: **100 % top-1 token agreement, zero divergences** — int8
 to ~5.7 GB/256k) it saves is free at the output level. (Matches the earlier gen A/B; the model's KV
 cache is bf16 — there is no separate fp16 KV mode.)
 
+## uTofu all-reduce reliability — `TP_AR_ACK` (2026-07)
+
+**Root cause of the prefill comm timeout.** The `tp_ar bcast timeout … want=N got=N-1` death is a
+**probabilistic lost Put with no retransmit**: the trailer-poll all-reduce spins 60 s then `exit(1)`,
+and `want` is the cumulative reduce count — observed deaths at wildly different counts (69 vs 514
+tokens) confirm it's random per-Put loss, not a fixed threshold. A token-by-token prefill fires ~43
+reduces/token, so over its ~10⁴–10⁵ reduces a single loss becomes likely. (Two mitigations already
+shipped: `DS4F_PREFILL_GEMM` batches ~K× fewer reduces; `prefill_checkpoint.sh` checkpoints so a death
+costs only the current chunk.)
+
+**Ack/retransmit layer** (`tp_allreduce.h`, `TP_AR_ACK=1`, **default off** → the default path is
+byte-for-byte unchanged). The receiver Puts an ack into the sender's per-peer ack slot after reading
+the payload; the sender retransmits the outstanding send every `TP_AR_ACK_RTT` (1 ms) up to
+`TP_AR_ACK_RETX` (64) times, then proceeds optimistically (the payload is idempotent) — so a lost Put
+is recovered in ~ms instead of a 60 s fatal spin. Two design points, both found by the standalone
+test: **send is non-blocking** (recursive doubling has both partners send before either recvs, so a
+send that blocked on the ack would deadlock/crawl), and the retransmit runs **from inside the
+recv-wait loop** too (if both directions of a doubling pair drop, both ranks block in recv and only a
+recv-loop retransmit — not the after-recv confirm — breaks it). Ack Puts are never drop-injected.
+
+**Validated 11n.** Standalone `tp_ar_ack_test` (exact integer sum+max reduce, direct arithmetic check
++ `TP_AR_DROP=N` loss injection): no-drop 22 500 reduces 0-mismatch @ **21 143 reduce/s**; DROP=50 and
+DROP=20 (1-in-20 heavy loss) 0-mismatch, recovers every loss (rtt sweep 20 ms→1 ms = **19× faster
+recovery**, no no-loss penalty). End-to-end: the full runner with `TP_AR_ACK=1 TP_AR_DROP=50` generates
+coherent, correct output at normal decode speed (8.8–10 tok/s). *Prototype caveat:* not yet hardened
+against cross-call reordering under simultaneous payload+ack loss (~p⁹, astronomically rare). Note: the
+Makefile doesn't track `tp_allreduce.h`, so `rm build/ds4f_ep_runner` before rebuilding to pick up
+ack changes in the runner.
+
 ## Files (branch `ds4f`)
 
 | File | Role |
@@ -232,6 +261,8 @@ cache is bf16 — there is no separate fp16 KV mode.)
 | `a64fx/llm/prefill_checkpoint.sh` | chunked-prefill checkpoint driver (comm-timeout fix, resumable) |
 | `a64fx/llm/bench_kv_accuracy.sh` + `bench_kv_accuracy_diff.py` | int8-vs-bf16 KV greedy accuracy A/B |
 | `a64fx/llm/bench_slot_switch.sh` | multi-slot context-switch overhead timer |
+| `a64fx/utofu-tests/tp_allreduce.h` | EP all-reduce (sum/max/argmax) + `TP_AR_ACK` ack/retransmit layer |
+| `a64fx/utofu-tests/tp_ar_ack_test.c` | standalone loss-injection test for the ack layer (`TP_AR_DROP`) |
 | `a64fx/utofu-tests/tofu_topo_helper` | MPI program that writes `tofu_topo.txt` (rank→coords) |
 
 Build is native `fcc`/`FCC` (NOT `fccpx`/`FCCpx`); binaries run directly, **no `pjsub`**
