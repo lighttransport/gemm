@@ -103,6 +103,9 @@ int main(void) {
     MyRank = -1;
     for (int r = 0; r < N; r++) if (memcmp(topo[r], my_coords, TOFU_NCOORDS) == 0) MyRank = r;
     if (MyRank == -1) die("my coords not in topo", -1);
+    { char en[64]; snprintf(en, sizeof en, "tp_ar_stderr_rank%02d.txt", MyRank);   /* mpiexec drops rank stderr */
+      freopen(en, "w", stderr); setvbuf(stderr, NULL, _IONBF, 0); }
+    fprintf(stderr, "rank %d/%d up (COUNT=%d REPS=%d)\n", MyRank, N, COUNT, REPS);
 
     /* barrier region (own cache line per remote-written slot) */
     SlotSend = DEMO_CACHE_LINE; SlotB = DEMO_CACHE_LINE; SEND_OFF = 0; BAR_BASE = SlotSend;
@@ -148,13 +151,16 @@ int main(void) {
     double dt = now_sec() - t0;
     barrier_robust(1);
     if (MyRank == 0) {
-        fprintf(stderr, "\n==== tp_ar_ack_test: N=%d COUNT=%d REPS=%d ack=%d drop=%lu ====\n",
-                N, COUNT, REPS, comm.ack, comm.drop_n);
-        fprintf(stderr, "reduces=%ld  sum_mismatches=%ld  max_mismatches=%ld  wall=%.2fs (%.0f reduce/s)\n",
-                (long)REPS + REPS / 8, bad_sum, bad_max, dt, (REPS + REPS / 8.0) / dt);
-        fprintf(stderr, "RESULT: %s\n", (bad_sum == 0 && bad_max == 0)
-                ? "PASS (all reduces exact -- ack/retransmit recovered every injected drop)"
-                : "FAIL (reduce mismatch -- reliability layer did not recover)");
+        /* mpiexec does not forward rank stderr, so also write the verdict to a file (== ds4f_ep_runner). */
+        const char *pass = (bad_sum == 0 && bad_max == 0) ? "PASS" : "FAIL";
+        char line[512];
+        snprintf(line, sizeof line,
+                 "tp_ar_ack_test N=%d COUNT=%d REPS=%d ack=%d drop=%lu | reduces=%ld sum_mism=%ld max_mism=%ld "
+                 "wall=%.2fs (%.0f reduce/s) | RESULT: %s\n",
+                 N, COUNT, REPS, comm.ack, comm.drop_n, (long)REPS + REPS / 8, bad_sum, bad_max, dt,
+                 (REPS + REPS / 8.0) / dt, pass);
+        fprintf(stderr, "%s", line);
+        FILE *rf = fopen("tp_ar_ack_result.txt", "a"); if (rf) { fputs(line, rf); fclose(rf); }
     }
     free(buf);
     return (bad_sum == 0 && bad_max == 0) ? 0 : 1;

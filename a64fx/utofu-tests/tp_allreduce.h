@@ -58,6 +58,13 @@ typedef struct {
     double          ack_rtt;                 /* retransmit interval seconds (TP_AR_ACK_RTT) */
     size_t          ack_base;                /* byte offset of ack region (nprocs 8B slots + 1 scratch) */
     unsigned long   drop_n, put_ctr;         /* TP_AR_DROP=N: drop 1-in-N payload Puts (loss injection) */
+    /* one outstanding send awaiting confirmation. send() is NON-blocking (Put + stash here); it is
+     * retransmitted from BOTH the recv-wait spin AND tp_ar_confirm() until the peer acks -- retransmit
+     * during recv is essential: if both directions of a doubling pair drop, both ranks block in recv,
+     * and only a recv-loop retransmit (not the after-recv confirm, never reached) breaks the deadlock.
+     * The send slot is untouched between send and confirm, so a retransmit re-Puts the correct payload. */
+    int             pend_peer, pend_sid, pend_contig, pend_active, pend_retx;
+    size_t          pend_pbytes; uint64_t pend_tok; double pend_t0;
 } tp_comm;
 
 static double tp_ar_now(void) {
@@ -116,6 +123,24 @@ static inline void tp_ar_drain_mrq(tp_comm *c) {
     while (utofu_poll_mrq(c->vcq, 0, &nt) == UTOFU_SUCCESS) { /* discard */ }
 }
 
+static void tp_ar_send_puts(tp_comm *c, int peer, int sid, size_t pbytes, int contiguous);  /* fwd decl */
+/* Retransmit the one outstanding send if still unacked and ack_rtt elapsed. Called from BOTH the
+ * recv-wait spin AND tp_ar_confirm so a send is re-driven even while this rank blocks in a recv --
+ * essential when both directions of a doubling pair drop (both ranks block in recv; only a recv-loop
+ * retransmit, not the never-reached after-recv confirm, breaks it). Returns 1 when the pending send is
+ * confirmed/inactive/optimistically-abandoned, 0 while still outstanding. No-op when ack is off. */
+static inline int tp_ar_service_pending(tp_comm *c) {
+    if (!c->pend_active) return 1;
+    volatile uint64_t *ackp = (volatile uint64_t *)(c->region + c->ack_base + (size_t)c->pend_peer * TP_AR_LINE);
+    tp_ar_flag_inval(ackp);
+    if (*ackp >= c->pend_tok) { c->pend_active = 0; return 1; }              /* peer confirmed receipt */
+    if (tp_ar_now() - c->pend_t0 >= c->ack_rtt) {
+        if (++c->pend_retx > c->ack_retx) { c->pend_active = 0; return 1; }  /* optimistic proceed */
+        tp_ar_send_puts(c, c->pend_peer, c->pend_sid, c->pend_pbytes, c->pend_contig);   /* retransmit */
+        c->pend_t0 = tp_ar_now();
+    }
+    return 0;
+}
 /* Spin until recv-slot trailer `trl` reaches `tok`, then return. In ROBUST mode
  * this is the fix for the large-M dropped-Put deadlock (`want=N+1 got=N`):
  *  (1) drain our MRQ EACH spin AND once on completion — recursive doubling does
@@ -144,6 +169,7 @@ static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
     while (*trl < tok) {
         if (c->robust == 1) { tp_ar_drain_mrq(c); tp_ar_flag_inval(trl); }
         else if (c->robust >= 2 && (spins & 63ul) == 63ul) tp_ar_flag_inval(trl);
+        if (c->ack) tp_ar_service_pending(c);   /* re-drive my outstanding send while I block here */
         /* TP_AR_SPIN_DBG=1: report long spins UNBUFFERED (raw write; simulator-friendly —
          * under qlair the sim-time TP_AR_TIMEOUT is effectively unreachable). */
         if (((++spins & 0xFFFFFul) == 0) && getenv("TP_AR_SPIN_DBG")) {
@@ -195,9 +221,10 @@ static void tp_ar_ack_send(tp_comm *c, int to_peer, uint64_t tok) {
 /* copy buf into send slot, Put payload to peer's recv slot `sid`, then publish the fixed-offset
  * trailer. For full-width fp32 max_count sends, payload and trailer are contiguous and travel in one
  * Put; otherwise a second 8-byte Put so small decode reductions do not pay the prefill payload size.
- * TP_AR_ACK: after sending, spin for peer's ack (ack[peer] >= tok), retransmitting every ack_rtt up
- * to ack_retx times, then proceed OPTIMISTICALLY (the payload Put is idempotent and near-certainly
- * landed on one of the attempts) -- this replaces the old 60s-then-exit(1) on a single lost Put. */
+ * NON-BLOCKING: under TP_AR_ACK the send only Puts + records the pending send; the paired recv acks
+ * the peer, and the driver then calls tp_ar_confirm() (below) to await THIS send's ack + retransmit.
+ * Blocking on the ack here would deadlock -- recursive doubling has both partners send before either
+ * recvs, and recv is what emits the ack. */
 static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int count, uint64_t tok) {
     char *sb = c->region + tp_ar_slot_off(c, 0);
     size_t pbytes;
@@ -212,19 +239,15 @@ static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int coun
     *(volatile uint64_t *)(sb + tp_ar_trailer_off(c)) = tok;
     int contiguous = (!c->use_bf16 && count == c->max_count);
     tp_ar_send_puts(c, peer, sid, pbytes, contiguous);
-    if (!c->ack) return;                                    /* default: fire-and-forget (unchanged) */
-    volatile uint64_t *ackp = (volatile uint64_t *)(c->region + c->ack_base + (size_t)peer * TP_AR_LINE);
-    double t0 = tp_ar_now(); int retx = 0;
-    for (;;) {
-        if (c->robust) tp_ar_drain_mrq(c);
-        tp_ar_flag_inval(ackp);
-        if (*ackp >= tok) return;                          /* peer confirmed receipt */
-        if (tp_ar_now() - t0 >= c->ack_rtt) {
-            if (++retx > c->ack_retx) return;              /* optimistic proceed (idempotent payload) */
-            tp_ar_send_puts(c, peer, sid, pbytes, contiguous);   /* retransmit */
-            t0 = tp_ar_now();
-        }
-    }
+    if (c->ack) { c->pend_peer = peer; c->pend_sid = sid; c->pend_pbytes = pbytes; c->pend_contig = contiguous;
+                  c->pend_tok = tok; c->pend_active = 1; c->pend_retx = 0; c->pend_t0 = tp_ar_now(); }
+}
+/* Finish confirming the LAST send (call once after the paired recv): retransmit until the peer acks,
+ * then proceed OPTIMISTICALLY after ack_retx tries (idempotent payload). The recv-wait loop already
+ * services it too, so by here it is usually already acked. No-op when ack is off. */
+static void tp_ar_confirm(tp_comm *c) {
+    if (!c->ack) return;
+    while (!tp_ar_service_pending(c)) { if (c->robust) tp_ar_drain_mrq(c); }
 }
 
 /* wait for recv slot `sid` trailer to reach tok, then add its payload into buf.
@@ -282,9 +305,11 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
     uint64_t tok = ++c->seq;
     int mr = c->my_rank, rem = c->rem;
 
-    /* 1. pre-reduce fold: even of the lowest 2*rem ranks -> its odd partner. */
+    /* 1. pre-reduce fold: even of the lowest 2*rem ranks -> its odd partner. The odd's recv_add is its
+     * FIRST op (not a send), so the even confirms its prefold send IMMEDIATELY -- deferring it past the
+     * bcast recv would let a dropped prefold wedge the odd (stuck in recv) before the retransmit runs. */
     if (mr < 2 * rem) {
-        if (mr % 2 == 0) tp_ar_send(c, mr + 1, 0, buf, count, tok);   /* even sends, then idle */
+        if (mr % 2 == 0) { tp_ar_send(c, mr + 1, 0, buf, count, tok); tp_ar_confirm(c); }  /* even sends + confirms */
         else             tp_ar_recv_add(c, 0, mr - 1, buf, count, tok);   /* odd folds it in */
     }
 
@@ -295,13 +320,14 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
             int pr  = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
             tp_ar_send(c, pr, k + 1, buf, count, tok);
             tp_ar_recv_add(c, k + 1, pr, buf, count, tok);
+            tp_ar_confirm(c);                        /* await pr's ack of my send (pr just acked in recv) */
         }
     }
 
     /* 3. broadcast the result back to the folded-out even ranks. */
     if (mr < 2 * rem) {
-        if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);
-        else             tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok);
+        if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);   /* even: recv only (prefold already confirmed) */
+        else { tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok); tp_ar_confirm(c); } /* odd: confirm the bcast send */
     }
 }
 
@@ -315,7 +341,7 @@ static void tp_allreduce_max(tp_comm *c, float *buf, int count) {
     int mr = c->my_rank, rem = c->rem;
 
     if (mr < 2 * rem) {                                   /* 1. pre-reduce fold even->odd */
-        if (mr % 2 == 0) tp_ar_send(c, mr + 1, 0, buf, count, tok);
+        if (mr % 2 == 0) { tp_ar_send(c, mr + 1, 0, buf, count, tok); tp_ar_confirm(c); }
         else             tp_ar_recv_max(c, 0, mr - 1, buf, count, tok);
     }
     if (c->newrank != -1) {                               /* 2. recursive doubling */
@@ -324,11 +350,12 @@ static void tp_allreduce_max(tp_comm *c, float *buf, int count) {
             int pr  = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
             tp_ar_send(c, pr, k + 1, buf, count, tok);
             tp_ar_recv_max(c, k + 1, pr, buf, count, tok);
+            tp_ar_confirm(c);
         }
     }
     if (mr < 2 * rem) {                                   /* 3. broadcast to folded-out evens */
         if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);
-        else             tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok);
+        else { tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok); tp_ar_confirm(c); }
     }
 }
 
