@@ -686,11 +686,13 @@ int main(int argc,char**argv){
         if (MyRank == 0) logmsg("DECODE_BATCH throughput sweep (ND=%d steps/M):\n", ND);
         for (int mi = 0; mi < nM; mi++) {
             int M = Ms[mi];
-            ds4f_serve_reset(m); m->dec_batch_seq = NULL; m->dec_batch_pos = NULL; m->dec_nseq = 0;
+            ds4f_serve_reset(m); ds4f_free_decode_batch(m);   /* free prior M's cache sets (no leak/thrash) */
             for (int k = 0; k < M; k++) cur[k] = 100 + k*1000;
             for (int k = 0; k < M; k++) { embed_lookup(m, cur[k], Xb + (size_t)k*C); pos[k] = 0; }
             ds4f_forward_decode_batch(m, Xb, pos, M, ot, hcb);        /* warm (alloc caches/buffers) */
             for (int k = 0; k < M; k++) cur[k] = ot[k];
+            int do_prof = envi("DS4F_PROF", 0);
+            if (do_prof) for (int i = 0; i < DS4F_NPHASE; i++) m->prof[i] = 0;   /* reset per-M breakdown */
             barrier(); double t0 = now_sec();
             for (int t = 1; t <= ND; t++) {
                 for (int k = 0; k < M; k++) { embed_lookup(m, cur[k], Xb + (size_t)k*C); pos[k] = t; }
@@ -700,6 +702,12 @@ int main(int argc,char**argv){
             double dt = now_sec() - t0;
             if (MyRank == 0) logmsg("  M=%2d: %.1f ms/step  aggregate %.1f tok/s  (%.2f tok/s/seq)\n",
                                     M, dt/ND*1e3, (double)M*ND/dt, (double)ND/dt);
+            if (do_prof && MyRank == 0) {   /* per-step ms per phase -> which components scale with M (batching targets) */
+                char pb[1024]; int pn = 0; pn += snprintf(pb+pn, sizeof pb-pn, "    prof M=%2d (ms/step):", M);
+                for (int i = 0; i < DS4F_P_QKV_A; i++) { double ms = m->prof[i]/ND*1e3;
+                    if (ms > 0.05) pn += snprintf(pb+pn, sizeof pb-pn, " %s=%.2f", ds4f_prof_names[i], ms); }
+                logmsg("%s\n", pb);
+            }
         }
         barrier(); exit(0);
     }

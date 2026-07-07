@@ -4847,10 +4847,26 @@ static inline void ds4f_lseq_apply(ds4f_layer *ly, const ds4f_lseq *s) {
     ly->cmp_kv = s->cmp_kv; ly->cmp_kv_state = s->cmp_kv_state; ly->cmp_score_state = s->cmp_score_state;
     ly->idx_kv = s->idx_kv; ly->idx_cmp_kv_state = s->idx_cmp_kv_state; ly->idx_cmp_score_state = s->idx_cmp_score_state;
 }
+/* Free the per-sequence cache sets 1..nseq-1 (set 0 aliases the layer's own live buffers -- never
+ * freed here) and the batch arrays. Safe to call when dec_batch_seq is NULL (no-op). */
+static void ds4f_free_decode_batch(ds4f_model *m) {
+    if (!m->dec_batch_seq) { m->dec_nseq = 0; free(m->dec_batch_pos); m->dec_batch_pos = NULL; return; }
+    int L = m->cfg.n_layers;
+    for (int l = 0; l < L; l++)
+        for (int k = 1; k < m->dec_nseq; k++) {
+            ds4f_lseq *s = &m->dec_batch_seq[(size_t)k*L + l];
+            free(s->kv_cache); free(s->cmp_kv); free(s->cmp_kv_state); free(s->cmp_score_state);
+            free(s->idx_kv); free(s->idx_cmp_kv_state); free(s->idx_cmp_score_state);
+        }
+    free(m->dec_batch_seq); m->dec_batch_seq = NULL;
+    free(m->dec_batch_pos); m->dec_batch_pos = NULL;
+    m->dec_nseq = 0;
+}
 /* Allocate nseq per-sequence cache sets (bf16/f32 caches; NOT int8/int4 -- a later phase). Set 0
  * aliases each layer's own live buffers; sets 1..nseq-1 get fresh zeroed buffers of the layer sizes. */
 static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
     if (m->dec_batch_seq && m->dec_nseq == nseq) return;
+    if (m->dec_batch_seq) ds4f_free_decode_batch(m);   /* nseq changed -> free old sets before realloc (no leak) */
     ds4f_config *c = &m->cfg; int KV = c->kv_lora, ihd = c->index_head_dim, np = c->max_pos, L = c->n_layers;
     m->dec_nseq = nseq;
     m->dec_batch_pos = (int *)malloc((size_t)nseq * sizeof(int));
@@ -4890,11 +4906,15 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         m->v_x4 = (float *)aligned_alloc(256, vb); m->v_resid = (float *)aligned_alloc(256, vb); }
     for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
         memcpy(m->v_x4 + (size_t)k*hcC + (size_t)s*C, X + (size_t)k*C, (size_t)C*4);
+    double _ts = 0; (void)_ts;   /* DS4F_PROF: coarse verify-path section timers (reuse free prof slots) */
+#define VTIC() do { _ts = ds4f_prof_on ? ds4f_now() : 0.0; } while (0)
+#define VTOC(id) do { if (ds4f_prof_on) m->prof[id] += ds4f_now() - _ts; } while (0)
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
         int ratio = c->compress_ratios[L];
         const float *rcos = ratio ? m->rope_comp_cos : m->rope_dense_cos;
         const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;
+        VTIC();
         /* mHC pre (attn): collapse each position's hc streams -> p_x[k]; save residual + sinkhorn weights (batched) */
         memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
@@ -4920,6 +4940,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_gemm(m, m->v_idxq, &wqbt, m->p_qlat, K, iHhd, c->q_lora);
             idxg_pf = 1;
         }
+        VTOC(DS4F_P_QKV);   /* mHC-attn-pre + qkv/kv/idxq GEMMs */
+        VTIC();
         /* per-position tier-B2 attention (causal: append KV then attend, in order). DS4F_DECODE_BATCH:
          * each element k is an INDEPENDENT sequence -> its own position + cache set (swapped into ly). */
         for (int k = 0; k < K; k++) {
@@ -4947,6 +4969,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
         }
         if (m->dec_batch_seq) ds4f_lseq_apply(ly, &m->dec_batch_seq[L]);   /* restore set 0 (seq 0) */
+        VTOC(DS4F_P_TB2PREP);   /* whole per-position loop (glue = tb2prep - attn - tb2* subtimers) */
+        VTIC();
         /* batched grouped low-rank o-projection (no-TP) */
         for (int g = 0; g < og; g++) {
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
@@ -4954,12 +4978,16 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         }
         ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pa[0][0], 16, &ca[0][0], 64);  /* mHC post (attn) */
+        VTOC(DS4F_P_OPROJ);   /* o-proj GEMMs + mHC-attn-post */
+        VTIC();
         /* mHC pre (ffn) */
         memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
                           m->p_x, &pf[0][0], 16, &cf[0][0], 64);
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+        VTOC(DS4F_P_SHARED);   /* mHC-ffn-pre + ffn-norm (shared-expert GEMMs timed in EXPERTS below) */
+        VTIC();
         /* shared expert (no-TP) */
         ds4f_gemm(m, m->p_shg, &ly->sh_w1, m->p_h2, K, c->shared_inter, C);
         ds4f_gemm(m, m->p_shu, &ly->sh_w3, m->p_h2, K, c->shared_inter, C);
@@ -5003,8 +5031,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             for (int i = 0; i < C; i++) o[i] = mo[i] + ro[i];
         }
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pf[0][0], 16, &cf[0][0], 64);  /* mHC post (ffn) */
+        VTOC(DS4F_P_EXPERTS);   /* shared+routed experts + router + EP comm + mHC-ffn-post */
     }
     m->s_idx_qpre = NULL;   /* clear the batched-prefill qproj injection so decode's index_step recomputes */
+    VTIC();
     /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
     for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
     { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, K, C, C };
@@ -5017,7 +5047,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
       ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
       if (tph && m->ar_argmax_cb) for (int k = 0; k < K; k++) { int32_t idx = out_tok[k]; float v = hval[k];
           m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; } }
+    VTOC(DS4F_P_HEAD);   /* hc_head collapse + out_norm + lm_head GEMM + argmax */
     if (out_hc) memcpy(out_hc, m->v_x4, (size_t)K*hcC*4);
+#undef VTIC
+#undef VTOC
 }
 
 /* DS4F_MTP forward (STUB -- scaffold only). Predicts the token after `next_id` given the main model's
