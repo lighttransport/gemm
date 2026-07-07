@@ -494,6 +494,11 @@ typedef struct {
     void  (*ar_argmax_cb)(float *val, int32_t *idx, void *ctx);  /* (val,global-idx) argmax all-reduce
                                                                   * (TP_HEAD batched-prefill head merge) */
     void   *ar_argmax_ctx;
+    int     want_full_logits;  /* set by the runner when a caller needs the full-vocab logits vector
+                                 * (e.g. temperature/top_p/top_k sampling) rather than just the argmax
+                                 * token. Under TP_HEAD, ds4f_forward_token uses this to pick between the
+                                 * cheap local-argmax + tiny argmax-reduce path (greedy, want=0) and the
+                                 * full zero-fill + [vocab] all-reduce-SUM path (sampling, want=1). */
     int     cp;             /* DS4F_CP: context parallelism — compressed caches sharded by slot,
                              * selected latents gathered (ar_cb-SUM) so attention reads a full set. */
     float  *s_cmp_gather;   /* [index_topk * kv_lora] gathered selected cmp latents (f32) under CP */

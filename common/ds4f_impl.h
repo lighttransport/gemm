@@ -5463,19 +5463,32 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     if (m->mhc) { ds4f_hc_head(m, m->s_x4, m->s_xc); hsrc = m->s_xc; ds4f_chk("hc_head", -1, hsrc, C); }
     { DS4F_TIC();
     ds4f_rmsnorm(m->s_hn, hsrc, m->out_norm, C, eps);
-    if (m->head.rows < c->vocab && m->ar_cb) {                 /* TP head: shard matvec -> zero-fill -> all-reduce-SUM */
-        /* each node computes only its vocab shard at s_logits[head_r0..]; zero the rest, then
-         * sum across the TP group. Shards are disjoint so the sum reconstructs the FULL logits
-         * BIT-EXACTLY (adding zeros is exact; each row's dot is identical to the replicated head)
-         * -> every node has identical full logits -> identical argmax (lockstep), no new collective. */
+    int best;
+    if (m->head.rows < c->vocab && m->ar_argmax_cb && !m->want_full_logits) {
+        /* TP head, greedy (M=1) decode: shard matvec -> LOCAL argmax over the owned rows -> ONE tiny
+         * (val,global-idx) argmax all-reduce (mirrors ds4f_forward_verify's ar_argmax_cb path). Avoids
+         * the full [vocab] (517 KB) all-reduce-SUM below -- measured (11n A/B, 2026-07-08) to otherwise
+         * cost ~1.2 ms/tok comm, exactly cancelling the head-compute saved by sharding. Correctness:
+         * the global argmax equals the max over the per-shard local argmaxes (disjoint shards cover the
+         * full vocab), so this is BIT-EXACT to the replicated-head argmax, just cheaper to merge. */
+        ds4f_matvec(m, m->s_logits, &m->head, m->s_hn);        /* [hrows], owned shard only */
+        int lbest = 0; float bv = m->s_logits[0];
+        for (int v = 1; v < m->head.rows; v++) if (m->s_logits[v] > bv) { bv = m->s_logits[v]; lbest = v; }
+        int32_t idx = m->head_r0 + lbest; float val = bv;
+        m->ar_argmax_cb(&val, &idx, m->ar_argmax_ctx);
+        best = idx;
+    } else if (m->head.rows < c->vocab && m->ar_cb) {          /* TP head, sampling: need the FULL logits
+         * vector (temperature/top_p/top_k read every entry) -> shard matvec -> zero-fill -> all-reduce-SUM. */
         memset(m->s_logits, 0, (size_t)c->vocab * sizeof(float));
         ds4f_matvec(m, m->s_logits + m->head_r0, &m->head, m->s_hn);
         m->ar_cb(m->s_logits, c->vocab, m->ar_ctx);
+        best = 0; { float bv = m->s_logits[0];
+        for (int v = 1; v < c->vocab; v++) if (m->s_logits[v] > bv) { bv = m->s_logits[v]; best = v; } }
     } else {
         ds4f_matvec(m, m->s_logits, &m->head, m->s_hn);        /* replicated: full head */
+        best = 0; { float bv = m->s_logits[0];
+        for (int v = 1; v < c->vocab; v++) if (m->s_logits[v] > bv) { bv = m->s_logits[v]; best = v; } }
     }
-    int best = 0; float bv = m->s_logits[0];
-    for (int v = 1; v < c->vocab; v++) if (m->s_logits[v] > bv) { bv = m->s_logits[v]; best = v; }
     DS4F_TOC(DS4F_P_HEAD);
     return best; }
 }

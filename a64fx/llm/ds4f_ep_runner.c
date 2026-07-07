@@ -185,6 +185,8 @@ static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, f
     int C = m->cfg.hidden, V = m->cfg.vocab, pf_last = 0, have_logits = 0;
     int pf_gemm = envi("DS4F_PREFILL_GEMM", 0), K = envi("DS4F_PREFILL_K", 32);
     int sampling = sp && sp->temp > 0.f;
+    m->want_full_logits = sampling;   /* sampling reads every logit (temp/top_p/top_k); greedy only needs
+                                        * argmax -> lets TP_HEAD decode use the cheap argmax-merge path */
     if (pf_from < 0 || pf_from >= np) pf_from = 0;       /* must prefill >=1 position (for pf_last logits) */
     if (K < 1) K = 1; if (K > 32) K = 32;
     if (pf_gemm && !m->has_mtp) {                       /* batched-verify prefill */
@@ -437,13 +439,17 @@ static void ds4f_cli(int argc,char**argv){
             setenv("DS4F_OPROJ_FUSE","1",1); setenv("DS4F_ATTN_SVE","1",1);
             setenv("DS4F_FLAGBAR","1",1);   /* per-worker flag barrier: +8% M=1 decode, bit-identical */
             setenv("DS4F_ATTN_GEMM","1",1); /* 8-head KV-reuse attention: -50% attn phase, bit-identical (default on anyway) */
-            /* TP_HEAD: vocab-shard the lm_head (bf16, Q8_DENSE-independent) across the EP group. A MEMORY
-             * lever, NOT a speed lever: 11n A/B (2026-07-08) measured decode SPEED-NEUTRAL (13.04->13.05
-             * tok/s) -- sharding the full-vocab head compute (~1.2 ms/tok) is exactly cancelled by the
-             * added vocab-parallel argmax all-reduce (+1.2 ms comm) -- but RSS -0.96 GB (more ctx-ceiling
-             * headroom). BIT-EXACT (gen_ids 64/64 identical: disjoint vocab shards + zero-fill+SUM merge
-             * -> identical global argmax; ar_argmax_cb already wired). No-op at ep_size<=1. Kept in the
-             * preset for the free memory win; disable with `--set DS4F_TP_HEAD=0` after --preset. */
+            /* TP_HEAD: vocab-shard the lm_head (bf16, Q8_DENSE-independent) across the EP group. BOTH a
+             * memory lever (RSS -0.96 GB, more ctx-ceiling headroom) AND a decode-speed lever: 11n A/B
+             * (2026-07-08) measured 13.07->13.37 tok/s (+2.3%, 76.5->74.8 ms/tok). First cut of this
+             * feature (683cfaf) measured SPEED-NEUTRAL because ds4f_forward_token's TP_HEAD branch did a
+             * full [vocab] (517 KB) all-reduce-SUM instead of the cheap (val,idx) argmax-merge that
+             * ds4f_forward_verify already used -- exactly cancelling the head-compute saved. Fixed by
+             * routing forward_token's greedy-decode TP_HEAD path through ar_argmax_cb (see
+             * m->want_full_logits in ds4f.h/ds4f_impl.h; sampling still needs the full logits vector and
+             * keeps the old path). BIT-EXACT (gen_ids 64/64 identical both before and after the fix;
+             * global argmax == max over disjoint per-shard local argmaxes). No-op at ep_size<=1. Disable
+             * with `--set DS4F_TP_HEAD=0` after --preset. */
             setenv("DS4F_TP_HEAD","1",1);
             continue;
         }
