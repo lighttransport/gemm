@@ -4425,6 +4425,11 @@ static void ds4f_hc_head(ds4f_model *m, const float *x4, float *y) {
 static void ds4f_alloc_prefill_batch(ds4f_model *m, int m_tile) {
     if (m_tile > DS4F_MAX_MTILE) m_tile = DS4F_MAX_MTILE;
     if (m->p_x && m->m_tile >= m_tile) return;       /* already big enough */
+    /* GROWTH: verify's lazily-allocated, m_tile-sized buffers (v_x4/v_resid/v_idxq/p_logits) were sized
+     * for the OLD (smaller) m_tile -- a larger-M verify would overrun them. Free -> NULL so verify
+     * reallocs them at the new m_tile. (free(NULL) is safe on the first call.) */
+    free(m->v_x4); m->v_x4 = NULL; free(m->v_resid); m->v_resid = NULL;
+    free(m->v_idxq); m->v_idxq = NULL; free(m->p_logits); m->p_logits = NULL;
     ds4f_config *c = &m->cfg;
     int C = c->hidden, H = c->n_heads*c->q_head_dim;
     size_t T = (size_t)m_tile;
@@ -4836,6 +4841,46 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
  * output. NO-TP path (full dense -- the moderate-ctx spec-decode regime; TP-compose is a later refinement),
  * no CP (off at moderate ctx). Requires exact+mhc+tierb2, !int8_kv, ds4f_alloc_prefill_batch(>=K).
  * out_tok[K] = per-position argmax; out_hc[K*hc*C] = per-position final HC state (for the next draft). */
+/* ---- batched concurrent decode: per-sequence cache-set swap (DS4F_DECODE_BATCH) ---- */
+static inline void ds4f_lseq_apply(ds4f_layer *ly, const ds4f_lseq *s) {
+    ly->kv_cache = s->kv_cache;
+    ly->cmp_kv = s->cmp_kv; ly->cmp_kv_state = s->cmp_kv_state; ly->cmp_score_state = s->cmp_score_state;
+    ly->idx_kv = s->idx_kv; ly->idx_cmp_kv_state = s->idx_cmp_kv_state; ly->idx_cmp_score_state = s->idx_cmp_score_state;
+}
+/* Allocate nseq per-sequence cache sets (bf16/f32 caches; NOT int8/int4 -- a later phase). Set 0
+ * aliases each layer's own live buffers; sets 1..nseq-1 get fresh zeroed buffers of the layer sizes. */
+static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
+    if (m->dec_batch_seq && m->dec_nseq == nseq) return;
+    ds4f_config *c = &m->cfg; int KV = c->kv_lora, ihd = c->index_head_dim, np = c->max_pos, L = c->n_layers;
+    m->dec_nseq = nseq;
+    m->dec_batch_pos = (int *)malloc((size_t)nseq * sizeof(int));
+    m->dec_batch_seq = (ds4f_lseq *)calloc((size_t)nseq * L, sizeof(ds4f_lseq));
+    for (int l = 0; l < L; l++) {
+        ds4f_layer *ly = &m->layers[l];
+        ds4f_lseq *s0 = &m->dec_batch_seq[l];                    /* set 0 = existing live buffers */
+        s0->kv_cache = ly->kv_cache;
+        s0->cmp_kv = ly->cmp_kv; s0->cmp_kv_state = ly->cmp_kv_state; s0->cmp_score_state = ly->cmp_score_state;
+        s0->idx_kv = ly->idx_kv; s0->idx_cmp_kv_state = ly->idx_cmp_kv_state; s0->idx_cmp_score_state = ly->idx_cmp_score_state;
+        int ratio = c->compress_ratios[l], coff = (ratio==4)?2:1, W = coff*KV, nslot = ratio ? np/ratio : 0;
+        for (int k = 1; k < nseq; k++) {
+            ds4f_lseq *s = &m->dec_batch_seq[(size_t)k*L + l];
+            s->kv_cache = (uint16_t *)aligned_alloc(256, (size_t)ly->kv_slots*KV*2);
+            memset(s->kv_cache, 0, (size_t)ly->kv_slots*KV*2);
+            if (ratio) {
+                s->cmp_kv          = (float *)aligned_alloc(256, (size_t)nslot*KV*4);
+                s->cmp_kv_state    = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
+                s->cmp_score_state = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
+                ds4f_compress_state_reset(s->cmp_kv_state, s->cmp_score_state, ratio, KV);
+                if (ratio == 4) { int icoff = 2, iW = icoff*ihd;
+                    s->idx_kv              = (float *)aligned_alloc(256, (size_t)nslot*ihd*4);
+                    s->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
+                    s->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
+                    ds4f_compress_state_reset(s->idx_cmp_kv_state, s->idx_cmp_score_state, ratio, ihd);
+                }
+            }
+        }
+    }
+}
 static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, int *out_tok, float *out_hc) {
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
@@ -4875,9 +4920,11 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_gemm(m, m->v_idxq, &wqbt, m->p_qlat, K, iHhd, c->q_lora);
             idxg_pf = 1;
         }
-        /* per-position tier-B2 attention (causal: append KV then attend, in order) */
+        /* per-position tier-B2 attention (causal: append KV then attend, in order). DS4F_DECODE_BATCH:
+         * each element k is an INDEPENDENT sequence -> its own position + cache set (swapped into ly). */
         for (int k = 0; k < K; k++) {
-            int pos = pos0 + k;
+            int pos = m->dec_batch_pos ? m->dec_batch_pos[k] : pos0 + k;
+            if (m->dec_batch_seq) ds4f_lseq_apply(ly, &m->dec_batch_seq[(size_t)k*c->n_layers + L]);
             m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k * c->index_n_heads * c->index_head_dim : NULL;
             float *kvl = m->p_kvlat + (size_t)k*KV;
             ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
@@ -4899,6 +4946,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             DS4F_TOC(DS4F_P_ATTN); }
             memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
         }
+        if (m->dec_batch_seq) ds4f_lseq_apply(ly, &m->dec_batch_seq[L]);   /* restore set 0 (seq 0) */
         /* batched grouped low-rank o-projection (no-TP) */
         for (int g = 0; g < og; g++) {
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
@@ -4994,6 +5042,17 @@ static size_t ds4f_tb2_snap_bytes(ds4f_model *m) {
         if (ratio == 4) { int iW = 2*c->index_head_dim; tot += 2*(size_t)2*ratio*iW*4; }
     }
     return tot;
+}
+/* Decode nseq INDEPENDENT sequences one step. X[nseq*C] = each sequence's current-token embedding,
+ * pos[nseq] = each sequence's position, out_tok[nseq] = next-token argmax, out_hc[nseq*hc*C] = final
+ * HC state. Each sequence reads/appends its own cache set (swapped in per element). Reuses
+ * ds4f_forward_verify (K=nseq batched dense + one all-reduce/layer -> the throughput amortization). */
+static void ds4f_forward_decode_batch(ds4f_model *m, const float *X, const int *pos, int nseq,
+                                      int *out_tok, float *out_hc) {
+    ds4f_alloc_prefill_batch(m, nseq);   /* batched activation scratch (p_x/p_hn/p_q/... >= nseq) */
+    ds4f_alloc_decode_batch(m, nseq);    /* per-sequence cache sets */
+    for (int k = 0; k < nseq; k++) m->dec_batch_pos[k] = pos[k];
+    ds4f_forward_verify(m, X, nseq, 0, out_tok, out_hc);   /* pos0 ignored: dec_batch_pos overrides */
 }
 static void ds4f_tb2_snap(ds4f_model *m, char *buf, int restore) {
     ds4f_config *c = &m->cfg; size_t off = 0;

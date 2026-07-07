@@ -674,6 +674,37 @@ int main(int argc,char**argv){
     if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill%s\n",
                             N, prefill_batch > 0 ? " [batched M-token GEMM]" : "");
 
+    /* ---- DS4F_DECODE_BATCH P1 isolation test: batched concurrent decode must isolate sequences.
+     * Decode seqA solo (nseq=1) vs seqA+seqB batched (nseq=2); seqA's token stream must be IDENTICAL
+     * (each sequence reads its own swapped cache set -> batching a neighbour changes nothing). ---- */
+    if (envi("DS4F_DECODE_BATCH", 0) > 0) {
+        int C = m->cfg.hidden, hc = m->cfg.hc_mult, ND = envi("DS4F_DB_NTOK", 16); if (ND > 64) ND = 64;
+        int seedA = envi("DS4F_DB_SEEDA", 100), seedB = envi("DS4F_DB_SEEDB", 5000);
+        float *Xb  = (float *)aligned_alloc(64, (size_t)2*C*4);
+        float *hcb = (float *)aligned_alloc(64, (size_t)2*(size_t)hc*C*4);
+        int aSolo[64], aBatch[64];
+        ds4f_serve_reset(m); m->dec_batch_seq = NULL; m->dec_batch_pos = NULL; m->dec_nseq = 0;   /* seqA solo */
+        { int cur = seedA;
+          for (int t = 0; t < ND; t++) { embed_lookup(m, cur, Xb); int p[1] = { t }; int ot[1];
+              ds4f_forward_decode_batch(m, Xb, p, 1, ot, hcb); aSolo[t] = cur = ot[0]; } }
+        ds4f_serve_reset(m); m->dec_batch_seq = NULL; m->dec_batch_pos = NULL; m->dec_nseq = 0;   /* seqA + seqB */
+        { int cA = seedA, cB = seedB;
+          for (int t = 0; t < ND; t++) { embed_lookup(m, cA, Xb); embed_lookup(m, cB, Xb + C);
+              int p[2] = { t, t }; int ot[2];
+              ds4f_forward_decode_batch(m, Xb, p, 2, ot, hcb); aBatch[t] = cA = ot[0]; cB = ot[1]; } }
+        if (MyRank == 0) {
+            int match = 0; for (int t = 0; t < ND; t++) if (aSolo[t] == aBatch[t]) match++;
+            logmsg("DECODE_BATCH isolation (seqA solo vs batched-with-seqB): %d/%d match -> %s\n",
+                   match, ND, match == ND ? "PASS" : "FAIL");
+            char b[512]; int n = 0; n += snprintf(b+n, sizeof b-n, "  solo : ");
+            for (int t = 0; t < ND && t < 12; t++) n += snprintf(b+n, sizeof b-n, "%d ", aSolo[t]);
+            n += snprintf(b+n, sizeof b-n, "\n  batch: ");
+            for (int t = 0; t < ND && t < 12; t++) n += snprintf(b+n, sizeof b-n, "%d ", aBatch[t]);
+            logmsg("%s\n", b);
+        }
+        barrier(); exit(0);
+    }
+
     /* Stage-A self-test (post-barrier so every rank's comm is live): verify
      * tp_allreduce_max == serial max + lockstep (every rank computes the same expected
      * global max). Gated DS4F_CP_SELFTEST. Runs in lockstep on all ranks (seq stays aligned). */

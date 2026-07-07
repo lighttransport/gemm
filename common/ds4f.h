@@ -307,6 +307,16 @@ typedef struct {
     int       idx_cp_nslot;          /* idx_kv8_4 slot capacity (DEBUG bounds guard) */
 } ds4f_layer;
 
+/* Batched concurrent decode (DS4F_DECODE_BATCH): the per-sequence DATA/STATE cache buffers for one
+ * (sequence, layer). The batched forward swaps these into ds4f_layer per batch element so the tested
+ * per-position attn/tb2/KV-append run unchanged. Weights (cmp_wkv, idx_wq_b, ...) are shared, never
+ * swapped. bf16/f32 caches only (int8/int4 modes are a later phase). */
+typedef struct {
+    uint16_t *kv_cache;
+    float    *cmp_kv, *cmp_kv_state, *cmp_score_state;
+    float    *idx_kv, *idx_cmp_kv_state, *idx_cmp_score_state;
+} ds4f_lseq;
+
 typedef struct ds4f_pool ds4f_pool;
 
 typedef struct {
@@ -318,6 +328,12 @@ typedef struct {
      *   x' = e_proj(enorm(embed(next_id))) + h_proj(hnorm(x));  block(x'); head -> logits.
      * Scaffolded (load + forward stub); the draft/verify spec-decode loop is the follow-on. */
     int       has_mtp;                         /* DS4F_MTP loaded */
+    /* DS4F_DECODE_BATCH: when dec_batch_seq!=NULL, ds4f_forward_verify decodes dec_nseq INDEPENDENT
+     * sequences (batch elem k at position dec_batch_pos[k], reading cache set dec_batch_seq[k*L+layer])
+     * instead of K consecutive tokens of one sequence. Set 0 aliases the layers' own live buffers. */
+    int        dec_nseq;
+    int       *dec_batch_pos;                  /* [dec_nseq] per-sequence positions (NULL = consecutive) */
+    ds4f_lseq *dec_batch_seq;                  /* [dec_nseq * n_layers] cache sets (NULL = single-stream) */
     ds4f_layer mtp;                            /* the MTP block (attn + MoE), like a main layer */
     uint16_t *mtp_enorm, *mtp_hnorm, *mtp_norm;/* BF16 [hidden] RMSNorm weights (embed/hidden/final) */
     ds4f_tensor mtp_e_proj, mtp_h_proj;        /* [hidden,hidden] dense fusion projections */
