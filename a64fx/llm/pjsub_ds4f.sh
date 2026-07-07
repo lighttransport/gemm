@@ -13,6 +13,8 @@
 #   prefill  — long prompt, 1 decode step; measures time-to-first-token. Run ABOVE the node floor.
 #   decode   — short prompt, many decode steps; the --preset decode bundle. Run AT the node floor.
 #   serve    — prefill+decode; --mtp/--cp for speculative + long-ctx. Node count pinned by KV.
+#   dbbench  — batched-concurrent-decode throughput SWEEP (M=1..DB_MAXM, bf16 dense). Extra knobs:
+#              DB_MAXM(=32) DB_NTOK(=24) DB_PROF(=0, =1 adds per-M section profile). Ceiling ~2.5-3x.
 # Node floor (weights 9.02 GB replicated + 150.59/N experts, <=27 GB): decode ~11n; see ds4f_sim.py.
 
 #PJM -g hp250467
@@ -62,10 +64,18 @@ case "$MODE" in
   prefill) ARGS="$COMMON --prefill $PREFILL --max-gen 1 --tierb2 1 --sparse 1" ;;
   decode)  ARGS="$COMMON --preset decode --prefill $PREFILL --max-gen $MAXGEN" ;;
   serve)   ARGS="$COMMON --preset decode --mtp $MTP --prefill $PREFILL --max-gen $MAXGEN" ;;
-  *) echo "FATAL: unknown MODE=$MODE (prefill|decode|serve)"; exit 2 ;;
+  dbbench) # batched-concurrent-decode throughput SWEEP (DS4F_DB_BENCH): decode M=1..DB_MAXM cold-start
+           # sequences for DB_NTOK steps each, report aggregate tok/s. bf16 dense (NOT --preset's int8:
+           # batching is a bf16 lever -- int8 is dequant-bound). DB_PROF=1 adds the per-M section profile.
+           # The runner hits the DB_BENCH branch post-load-barrier and exit(0)s before the gen loop.
+           export DS4F_DB_BENCH=1 DS4F_DB_MAXM=${DB_MAXM:-32} DS4F_DB_NTOK=${DB_NTOK:-24} DS4F_PROF=${DB_PROF:-0}
+           export DS4F_FP8_BF16=1 DS4F_Q8_DENSE=0 DS4F_TIERB2=1 DS4F_MHC=1 DS4F_HC_PAR=1 DS4F_HC_RMSPAR=1
+           export DS4F_ATTN_SVE=1 DS4F_OPROJ_FUSE=1
+           ARGS="$COMMON --tierb2 1 --prefill $PREFILL --max-gen 2" ;;
+  *) echo "FATAL: unknown MODE=$MODE (prefill|decode|serve|dbbench)"; exit 2 ;;
 esac
 [ -n "$PROMPT_IDS" ] && ARGS="$ARGS --prompt-ids $PROMPT_IDS --gen-out $WORK/gen_ids.txt"
 echo "--- run: ds4f_ep_runner $ARGS ($(date)) ---"; rm -f ds4f_ep_rank00.txt
 mpiexec -np "$NP" "$LLM/build/ds4f_ep_runner" $ARGS || echo "WARN: run rc=$?"
-grep -hE "prefill|decode|tok/s|arena|RSS|NUMA interleave|NaN|argmax" ds4f_ep_rank00.txt ds4f_ep_perf_rank00.txt 2>/dev/null | head -30
+grep -hE "prefill|decode|tok/s|arena|RSS|NUMA interleave|NaN|argmax|DECODE_BATCH|prof M=" ds4f_ep_rank00.txt ds4f_ep_perf_rank00.txt 2>/dev/null | head -40
 echo "SENTINEL ds4f_${MODE}_${NP}n=done"; date
