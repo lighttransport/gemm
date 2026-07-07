@@ -408,7 +408,7 @@ static void ds4f_cli_usage(void){
     fprintf(stderr,
       "ds4f_ep_runner [--flags]  (DeepSeek-V4-Flash; all map to DS4F_* env; env still works as fallback)\n"
       "  --numa[=0|1]        NUMA-interleave weights (default ON; the 1.40x bit-identical decode lever)\n"
-      "  --preset decode     bundle: FP8_BF16+Q8_DENSE+HC_PAR+HC_RMSPAR+TIERB2+MHC+OPROJ_FUSE+ATTN_SVE\n"
+      "  --preset decode     bundle: FP8_BF16+Q8_DENSE+HC_PAR+HC_RMSPAR+TIERB2+MHC+OPROJ_FUSE+ATTN_SVE+TP_HEAD\n"
       "  --model DIR         DS4F_MODEL_DIR       --real N         DS4F_REAL\n"
       "  --stage-dir D       DS4F_STAGE_DIR       --ep-size N      DS4F_EP_SIZE\n"
       "  --nshards N         DS4F_NSHARDS         --layers N       DS4F_LAYERS (0=full 43)\n"
@@ -437,6 +437,13 @@ static void ds4f_cli(int argc,char**argv){
             setenv("DS4F_OPROJ_FUSE","1",1); setenv("DS4F_ATTN_SVE","1",1);
             setenv("DS4F_FLAGBAR","1",1);   /* per-worker flag barrier: +8% M=1 decode, bit-identical */
             setenv("DS4F_ATTN_GEMM","1",1); /* 8-head KV-reuse attention: -50% attn phase, bit-identical (default on anyway) */
+            /* TP_HEAD: vocab-shard the lm_head (bf16, Q8_DENSE-independent) across the EP group. The
+             * full-vocab head (~1 GB) is otherwise read+matvec'd redundantly on EVERY node each token
+             * (~1.5-1.9 ms/tok); sharding cuts it to vocab/N + a tiny (val,idx) argmax all-reduce that
+             * is already wired (ar_argmax_cb). No-op at ep_size<=1 (safe single-node). BIT-EXACT: disjoint
+             * vocab shards, zero-fill+SUM merge -> identical global argmax (validated 683cfaf). Disable
+             * with `--set DS4F_TP_HEAD=0` after --preset. */
+            setenv("DS4F_TP_HEAD","1",1);
             continue;
         }
         if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }
