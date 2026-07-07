@@ -674,6 +674,36 @@ int main(int argc,char**argv){
     if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill%s\n",
                             N, prefill_batch > 0 ? " [batched M-token GEMM]" : "");
 
+    /* ---- DS4F_DB_BENCH: batched concurrent decode throughput sweep. Decode M cold-start sequences
+     * for ND steps at each M, report aggregate tok/s vs the roofline projection (step(M)~=fixed+perM). ---- */
+    if (envi("DS4F_DB_BENCH", 0) > 0) {
+        int C = m->cfg.hidden, hc = m->cfg.hc_mult, ND = envi("DS4F_DB_NTOK", 32), maxM = envi("DS4F_DB_MAXM", 16);
+        int Ms[6] = {1, 2, 4, 8, 16, 32}, nM = 0; while (nM < 6 && Ms[nM] <= maxM) nM++;
+        float *Xb  = (float *)aligned_alloc(64, (size_t)maxM*C*4);
+        float *hcb = (float *)aligned_alloc(64, (size_t)maxM*(size_t)hc*C*4);
+        int *cur = (int *)malloc((size_t)maxM*sizeof(int)), *pos = (int *)malloc((size_t)maxM*sizeof(int));
+        int *ot  = (int *)malloc((size_t)maxM*sizeof(int));
+        if (MyRank == 0) logmsg("DECODE_BATCH throughput sweep (ND=%d steps/M):\n", ND);
+        for (int mi = 0; mi < nM; mi++) {
+            int M = Ms[mi];
+            ds4f_serve_reset(m); m->dec_batch_seq = NULL; m->dec_batch_pos = NULL; m->dec_nseq = 0;
+            for (int k = 0; k < M; k++) cur[k] = 100 + k*1000;
+            for (int k = 0; k < M; k++) { embed_lookup(m, cur[k], Xb + (size_t)k*C); pos[k] = 0; }
+            ds4f_forward_decode_batch(m, Xb, pos, M, ot, hcb);        /* warm (alloc caches/buffers) */
+            for (int k = 0; k < M; k++) cur[k] = ot[k];
+            barrier(); double t0 = now_sec();
+            for (int t = 1; t <= ND; t++) {
+                for (int k = 0; k < M; k++) { embed_lookup(m, cur[k], Xb + (size_t)k*C); pos[k] = t; }
+                ds4f_forward_decode_batch(m, Xb, pos, M, ot, hcb);
+                for (int k = 0; k < M; k++) cur[k] = ot[k];
+            }
+            double dt = now_sec() - t0;
+            if (MyRank == 0) logmsg("  M=%2d: %.1f ms/step  aggregate %.1f tok/s  (%.2f tok/s/seq)\n",
+                                    M, dt/ND*1e3, (double)M*ND/dt, (double)ND/dt);
+        }
+        barrier(); exit(0);
+    }
+
     /* ---- DS4F_DECODE_BATCH P1 isolation test: batched concurrent decode must isolate sequences.
      * Decode seqA solo (nseq=1) vs seqA+seqB batched (nseq=2); seqA's token stream must be IDENTICAL
      * (each sequence reads its own swapped cache set -> batching a neighbour changes nothing). ---- */
