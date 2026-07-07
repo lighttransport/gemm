@@ -437,12 +437,13 @@ static void ds4f_cli(int argc,char**argv){
             setenv("DS4F_OPROJ_FUSE","1",1); setenv("DS4F_ATTN_SVE","1",1);
             setenv("DS4F_FLAGBAR","1",1);   /* per-worker flag barrier: +8% M=1 decode, bit-identical */
             setenv("DS4F_ATTN_GEMM","1",1); /* 8-head KV-reuse attention: -50% attn phase, bit-identical (default on anyway) */
-            /* TP_HEAD: vocab-shard the lm_head (bf16, Q8_DENSE-independent) across the EP group. The
-             * full-vocab head (~1 GB) is otherwise read+matvec'd redundantly on EVERY node each token
-             * (~1.5-1.9 ms/tok); sharding cuts it to vocab/N + a tiny (val,idx) argmax all-reduce that
-             * is already wired (ar_argmax_cb). No-op at ep_size<=1 (safe single-node). BIT-EXACT: disjoint
-             * vocab shards, zero-fill+SUM merge -> identical global argmax (validated 683cfaf). Disable
-             * with `--set DS4F_TP_HEAD=0` after --preset. */
+            /* TP_HEAD: vocab-shard the lm_head (bf16, Q8_DENSE-independent) across the EP group. A MEMORY
+             * lever, NOT a speed lever: 11n A/B (2026-07-08) measured decode SPEED-NEUTRAL (13.04->13.05
+             * tok/s) -- sharding the full-vocab head compute (~1.2 ms/tok) is exactly cancelled by the
+             * added vocab-parallel argmax all-reduce (+1.2 ms comm) -- but RSS -0.96 GB (more ctx-ceiling
+             * headroom). BIT-EXACT (gen_ids 64/64 identical: disjoint vocab shards + zero-fill+SUM merge
+             * -> identical global argmax; ar_argmax_cb already wired). No-op at ep_size<=1. Kept in the
+             * preset for the free memory win; disable with `--set DS4F_TP_HEAD=0` after --preset. */
             setenv("DS4F_TP_HEAD","1",1);
             continue;
         }
