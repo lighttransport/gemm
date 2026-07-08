@@ -1,0 +1,38 @@
+[run_ds4f] excluding relative (0,0,0); placing 11 ranks via vcoord_ds4f.txt:
+    (0,0,1)
+    (0,1,0)
+    (0,1,1)
+    (0,2,0)
+    (0,2,1)
+    (1,0,0)
+    (1,0,1)
+    (1,1,0)
+    (1,1,1)
+    (1,2,0)
+    (1,2,1)
+=== DS4F EP harness on 11 node(s) (REAL weights <- /local/ds4f TierB2 mHC) ===
+threads=48 prefill=865 maxgen=3072 max_pos=4001 layers=0 dense=FP8(real)
+--- tofu topo (12 rows; DS4F_QUIET: see tofu_topo.txt) ---
+--- launching ds4f_ep_runner (NP=11) ---
+=== per-rank compact (load=11/11 perf=11/11; ranks lockstep-identical; full files on disk) ===
+--- rank0 summary (first 20 lines; full in ds4f_ep_rank00.txt) ---
+=== DS4F EP synthetic harness (Stage 2): 11 ranks ===
+layers=43 hidden=4096 experts=256 active=6  owned~24/layer  dense=BF16(predequant,pv)
+threads=48 prefill=865 maxgen=3072 max_pos=4001 ctx_warm=0  arena~25.68 GB/node
+NODE_CGROUP_LIMIT /sys/fs/cgroup/memory/memory.limit_in_bytes = 9223372036854710272 (9223372036.85 GB)
+NODE_MEMINFO MemTotal:       33353984 kB
+NODE_MEMINFO MemFree:        31046912 kB
+NODE_MEMINFO MemAvailable:   31445760 kB
+NODE_MEMINFO HugePages_Total:      12
+NODE_MEMINFO Hugetlb:           24576 kB
+Tier-B2: ON (exact forced)  index_topk=512 index_dim=128 index_heads=64  (21 CSA + 20 HCA layers; compressed-KV folded into window softmax)
+all 11 ranks past bootstrap barrier; starting prefill
+
+=== rank0 summary (11 nodes, EP all-reduce combine) ===
+prefill: 865 tok  74.8 ms/tok  13.37 tok/s   comm 16.2% (ar_calls=37195 argmax=943)
+decode:  1658 tok  70.3 ms/tok  14.22 tok/s   comm 17.3% (12195 us/tok)
+         7.48 GB/tok-weights  argmax=1  NaNs=0  RSS=21.94 GB
+per-phase decode (ms/tok):
+  qkv_proj    7.070 ms   10.5%
+  attn        4.397 ms    6.5%
+  o_proj      9.134 ms   13.5%
