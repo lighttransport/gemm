@@ -1452,3 +1452,66 @@ scratch is correct — do NOT touch its allocation (a realloc-race 'fix' was alr
 reverted). Gate: gemm_test 205/205 + new small-M rows relL2~1e-6 argmax-exact NaN=0. Then remove
 the DS4F_SPEC/GEMM_DECODE+Q8 guard in ds4f_ep_runner.c. Don't commit; report the failing
 shape + the fix."
+
+## WS7 — DS4F_TP_ATTN + DS4F_Q8_DENSE wrong output (11n bug, found 2026-07-08, likely sibling of WS6)
+
+**Symptom**: `DS4F_TP_ATTN=1` (wq_b head-shard, an existing but never-enabled-in-preset memory/speed
+lever) combined with the decode preset's `DS4F_Q8_DENSE=1` produces **coherent-looking but WRONG**
+generated tokens — diverges from the very FIRST decoded token (gen_ids 0/64 match vs the correct
+reference), yet `NaN=0` and `rc=0` throughout, and the aggregate stats (decode tok/s, RSS) look
+entirely plausible (13.62 tok/s, RSS -1.37 GB — this is what makes it dangerous: a superficial A/B
+that only checks NaN=0 + last-token argmax would ship it as a clean win). **Always diff the FULL
+generated token sequence, not just the last token**, when validating a TP/sharding change.
+
+**Bisection (11n real-weight A/B, same 24-tok prompt, 64-tok greedy decode, `run_ds4f_gen_11n.sh`
+called directly — `run_ds4f_agentic_11n.sh`'s hardcoded `export DS4F_Q8_DENSE=1` clobbers an env
+override, use `run_ds4f_gen_11n.sh`'s `${VAR:-default}` form to actually toggle flags):**
+- `TP_ATTN=1, Q8_DENSE=0, OPROJ_FUSE=0` (plain per-group o-proj, no block-diag at all) → **64/64
+  IDENTICAL** to the `TP_ATTN=0` reference. Correct.
+- `TP_ATTN=1, Q8_DENSE=0, OPROJ_FUSE=1` (bf16 block-diagonal o-proj, `ds4f_matvec_blockdiag`'s
+  `DS4F_BF16_PV` branch) → **64/64 IDENTICAL**. Correct — `ds4f_matvec_blockdiag` itself is fine.
+- `TP_ATTN=1, Q8_DENSE=1` (forces `ly->wo_a.type==DS4F_Q8_PV`, which forces block-diag
+  unconditionally via the `ds4f_oproj_fuse || tpo || wo_a.type==DS4F_Q8_PV` check regardless of the
+  `OPROJ_FUSE` flag) → **0/64 match, diverges at token 1**. **Broken.**
+
+**Isolates the bug to `ds4f_matvec_blockdiag`'s `DS4F_Q8_PV` branch** (common/ds4f_impl.h ~line 498,
+inside `ds4f_mv_bd_worker`) specifically when its activation input (`m->s_attn`) is a TP_ATTN-partial,
+zero-padded buffer. `wq_b`'s own (non-block-diag) `DS4F_Q8_PV` matvec branch (~line 377, in plain
+`ds4f_matvec`) can be ruled out analytically: it quantizes `m->s_qlat`, which is REPLICATED (identical
+on every rank, unaffected by TP_ATTN) — deterministic quantization of identical input cannot diverge
+across ranks, so it's architecturally safe regardless of TP_ATTN's row-sharded *output*.
+
+**Root cause NOT fully pinned down** despite deep inspection: `ds4f_quant_x_sdot_into`'s 64-element
+quantization blocks are each entirely within ONE attention head (HD=512 = 8×64), and TP_ATTN shards
+at whole-head granularity (always a multiple of 512, hence of 64) — so blocks never straddle an
+ownership boundary, and per-block dequant (`matvec_sdot_8row`, ggml_dequant.h:1709) is a standard
+weight-scale × activation-scale × int8-dot with no obvious cross-block interaction. This analysis
+suggests the partial-quantize-then-all-reduce-sum SHOULD reconstruct the full-quantize result exactly
+— yet it measurably doesn't. Given WS6 (above) already documents a DIFFERENT nondeterministic Q8_PV
+bug in the same kernel family (`ds4f_gemm_worker`'s small-M remainder path) that also resisted
+surface-level inspection, this is likely a SIBLING low-level bug in the shared int8 W8A8 machinery
+(`ds4f_quant_x_sdot_into` / `matvec_sdot_8row` / the `__thread` xq/xs scratch reuse across groups),
+not a TP_ATTN-specific logic error — worth debugging WS6 and WS7 together.
+
+**Disposition**: NOT shipped (`DS4F_TP_ATTN` stays off in `--preset decode`). Benefit was modest
+(+1.9% decode speed, -1.37 GB RSS in the broken measurement — unverified once/if fixed) vs. the
+already-landed `TP_HEAD`+`TP_EMBED` wins (+2.3% speed, -1.9 GB combined, both bit-exact). Do not
+enable `DS4F_TP_OPROJ` or `DS4F_TP_SHARED` either without first resolving this — same block-diag /
+Q8_PV interaction surface, same risk.
+
+**Resume prompt**: "In /vol0006/mdt0/data/hp250467/work/gemm/glm5-1, DS4F_TP_ATTN=1 combined with
+DS4F_Q8_DENSE=1 produces wrong (but NaN-free, plausible-looking) decode output — isolated to
+ds4f_matvec_blockdiag's DS4F_Q8_PV branch (common/ds4f_impl.h ~line 498) via 11n A/B bisection (see
+WS7 above for the full trail). Both non-Q8 o-proj paths (plain per-group AND bf16 block-diagonal)
+are bit-exact under TP_ATTN; only the int8 W8A8 block-diag kernel breaks. Likely a sibling of WS6
+(same matvec_sdot_8row/ds4f_quant_x_sdot_into machinery). Reproduce with a 1-node unit test if
+possible (mirroring WS6's ds4f_gemm_test approach) rather than the slow 11n A/B loop: construct a
+synthetic multi-rank TP_ATTN scenario (partial/zero-padded input vector, per-rank local quantization,
+sum the dequantized partial dot products) and compare against a single full-vector quantize+dot
+reference. If the isolated kernel test also shows a mismatch, the bug is confirmed structural
+(not an artifact of the real-weight 11n harness) and can be fixed without needing an allocation.
+Candidate structural fix if root-causing stalls: extend the existing `if (tpo && ...) m->ar_cb(m->
+s_attn, H, m->ar_ctx);` pre-reduce (common/ds4f_impl.h ~line 5352, currently gated only on `tpo`==
+TP_OPROJ) to ALSO fire whenever `ly->wo_a.type==DS4F_Q8_PV`, so every rank quantizes an already-
+fully-reduced (not partial) s_attn — trades away TP_ATTN's comm savings for correctness, needs its
+own A/B to confirm. Don't commit without an 11n token-for-token bit-exact re-validation."
