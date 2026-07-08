@@ -410,7 +410,7 @@ static void ds4f_cli_usage(void){
     fprintf(stderr,
       "ds4f_ep_runner [--flags]  (DeepSeek-V4-Flash; all map to DS4F_* env; env still works as fallback)\n"
       "  --numa[=0|1]        NUMA-interleave weights (default ON; the 1.40x bit-identical decode lever)\n"
-      "  --preset decode     bundle: FP8_BF16+Q8_DENSE+HC_PAR+HC_RMSPAR+TIERB2+MHC+OPROJ_FUSE+ATTN_SVE+TP_HEAD\n"
+      "  --preset decode     bundle: FP8_BF16+Q8_DENSE+HC_PAR+HC_RMSPAR+TIERB2+MHC+OPROJ_FUSE+ATTN_SVE+TP_HEAD+TP_EMBED\n"
       "  --model DIR         DS4F_MODEL_DIR       --real N         DS4F_REAL\n"
       "  --stage-dir D       DS4F_STAGE_DIR       --ep-size N      DS4F_EP_SIZE\n"
       "  --nshards N         DS4F_NSHARDS         --layers N       DS4F_LAYERS (0=full 43)\n"
@@ -451,6 +451,14 @@ static void ds4f_cli(int argc,char**argv){
              * global argmax == max over disjoint per-shard local argmaxes). No-op at ep_size<=1. Disable
              * with `--set DS4F_TP_HEAD=0` after --preset. */
             setenv("DS4F_TP_HEAD","1",1);
+            /* TP_EMBED: vocab-shard the input embedding table (bf16, ~1.06 GB full -> ~96 MB/node at N=11).
+             * Unlike the old TP_HEAD bug, embed_lookup's TP path was cheap from the start: decode M=1 only
+             * needs ONE row (the token's embedding) filled by its owning shard, zeroed elsewhere, then a
+             * [hidden]=4096-float (16 KB) all-reduce-SUM -- not a full-vocab reduce. 11n A/B (2026-07-08):
+             * decode 13.37->13.37 tok/s (unchanged, comm noise-level +0.3%), RSS 20.98->20.01 GB (-0.97 GB).
+             * gen_ids 64/64 IDENTICAL (bit-exact: disjoint row + zero-fill + SUM reconstructs the exact row).
+             * A pure memory win at zero speed cost -- disable with `--set DS4F_TP_EMBED=0` after --preset. */
+            setenv("DS4F_TP_EMBED","1",1);
             continue;
         }
         if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }

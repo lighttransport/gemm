@@ -26,8 +26,11 @@ export DS4F_NUMA=${DS4F_NUMA:-1}        # the ~1.40x bit-identical decode lever 
 # DS4F_TP_HEAD: vocab-shard the replicated bf16 lm_head. Memory (-0.96 GB RSS) AND decode-speed lever
 # (11n A/B: 13.07->13.37 tok/s, +2.3%, after routing greedy decode through the cheap argmax-merge instead
 # of a full-vocab all-reduce). BIT-EXACT (gen_ids 64/64 identical), Q8_DENSE-independent, no-op single-node.
+# DS4F_TP_EMBED: vocab-shard the input embedding table. Pure MEMORY lever (-0.97 GB RSS, decode speed
+# unchanged: only a 16 KB [hidden] reduce/token, not a full-vocab one). BIT-EXACT, no-op single-node.
 export DS4F_REAL=1 DS4F_FP8_BF16=1 DS4F_Q8_DENSE=1 DS4F_TIERB2=1 DS4F_MHC=1 DS4F_HC_PAR=1 DS4F_HC_RMSPAR=1
 export DS4F_TP_HEAD=${DS4F_TP_HEAD:-1}
+export DS4F_TP_EMBED=${DS4F_TP_EMBED:-1}
 # Batched-verify prefill (comm-amortize + batched qproj/mHC): +74% prefill (13.3->23 tok/s), COHERENT
 # not bit-identical (K-tile GEMM reassoc). Default ON for agentic coding (accepts a valid greedy path);
 # set DS4F_PREFILL_GEMM=0 for bit-reproducible token-by-token prefill.
