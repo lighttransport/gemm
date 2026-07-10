@@ -1081,6 +1081,37 @@ drain); per-sequence sampling (currently greedy-only); B>4 throughput measuremen
 *Ops note: `pkill -9` on the runner is unreliable — verify the `SERVE-BATCH ready: B=N` banner matches
 the launched B and `ps -eo cmd | grep build/ds4f_ep_runner` is empty before relaunching.*
 
+### LANDED — DS4F_SERVE_DYNAMIC continuous batching / mid-flight admission (2026-07-10b, commit `9ea8f684`)
+
+`ds4f_serve_dynbatch_loop` (`ds4f_ep_runner.c`, gated `DS4F_SERVE_DYNAMIC`, **default off**) admits new
+requests into free slots *as they open* instead of the static "prefill N, drain to completion" model —
+a fast request no longer waits behind slow batch-mates. B persistent bundles; each free slot is filled
+from the queue (single-seq prefill) and the active set decode-steps together via one `ds4f_forward_verify`.
+Queue protocol on the shared FS: `q.<id>` (client-written `max_new\nids`), `r.<id>` (runner response,
+temp+rename atomic). `ds4f_serve.py infer_dynamic` routes when `DS4F_SERVE_DYNAMIC=1`.
+
+**Two cross-node-FS robustness fixes were mandatory (both cost a real debug cycle):**
+1. **Lockstep admission via broadcast, not per-rank read.** Rank 0 reads the `q.<id>` payload and
+   BROADCASTS `(ok,mnew,np,ids)` via `ar_cb`; a per-rank read races the FEFS/LLIO cache (rank 0 sees the
+   fresh file, rank 7 doesn't → divergent `np` → the prefill all-reduce **deadlocks**). Manifested as a
+   hard hang the moment a request arrived *after the loop drained to idle* (peak cache skew) — the burst
+   case worked by luck. `int` ids are float32-exact (vocab ≪ 2²⁴).
+2. **Probe `q.<qnext>` existence; do NOT read a `qhead` counter.** A counter file changes value at the
+   same 2-byte size (`"1\n"→"4\n"`); the compute-node client caches it by size+coarse-mtime and **never
+   refetches** → rank 0 reads a stale `qhead` forever and stops admitting (silent stall, not a hang).
+   New-*file* existence IS coherent, so probe `q.<qnext>` directly (the broadcast `ok` flag stops the
+   loop). This made a *counter* the wrong signal and *file existence* the right one. Consequence: clients
+   must write `q.<id>` **atomically (temp+rename)** or the probe reads a half-written file → `np=0` →
+   empty response. The old `qhead` gate had doubled as the write-complete barrier.
+
+**Validated real-weight 11n (alloc 49508574):** token-exact per-sequence independence — A alone ==
+A admitted mid-flight alongside B,C (**40/40 tokens, 5/5 runs**); no deadlock/stall across repeated
+idle→admit transitions; runner-internal **22.8 tok/s aggregate at active=4** (≈4× single-stream, no
+regression from the probe rewrite). Client-observed end-to-end tok/s is lower and FS-round-trip-bound
+(~fixed tens-of-seconds q/r visibility latency across login↔compute) — a property of the file protocol,
+not compute; a socket transport would remove it. **Follow-ons:** per-sequence sampling (greedy-only);
+socket/shared-mem transport to cut the file-visibility latency; B>4 dynamic throughput on a stable alloc.
+
 ### Resuming prompt — Phase 2 CP (next session)
 > **TASK: DS4F sharded-KV context parallelism (`DS4F_CP`).** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`). Full design + file:line in the plan file `~/.claude/plans/see-a64fx-ds4f-md-and-keep-floofy-dragon.md` and the "Phase 2" section above.
 > **Standing rules:** native fcc/FCC; in-alloc `mpiexec` (no pjsub) NP=11 EXCLUDE node 0; **measure MemFree not RSS**; validate coherence/lockstep (NOT bit-exact — combine reassociates); FP8 dense (`DS4F_FP8_BF16=0`) required; CP composes with full TP (`DS4F_TP_*`) + int4 cmp/idx (`DS4F_INT4_CMP`/`DS4F_IDX_INT4`), all default-off; commit only when asked; one real-weight gen per Bash call (batched jobs blow the 10-min timeout → SIGKILL degrades PMIx → recover via native re-stage `run_ds4f_stage_11n.sh`).
