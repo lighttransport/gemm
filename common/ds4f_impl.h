@@ -1647,6 +1647,9 @@ static inline void ds4f_compress_state_reset(float *kv_state, float *score_state
  * compressed latent (RMSNorm + RoPE @ first-token-of-block + optional rotate/fp4) and
  * returns 1; otherwise returns 0 (out untouched). Mirrors model.py Compressor.forward
  * seqlen==1: start_pos==0 seeds, start_pos>0 decodes. rotate=1 => indexer compressor. */
+/* tb2lcmp/tb2icmp attribution (DS4F_PROF): the compressor matvec DISPATCH time, so the
+ * caller can split the compress_step cost into matvec vs the serial softmax/state tail. */
+static double g_cmp_mv_secs = 0;
 static int ds4f_compress_step(
     const float *x, int dim, int d, int rd, int ratio, int start_pos,
     const void *wkv, const void *wgate, int w_bf16, const float *ape, const uint16_t *norm_w,
@@ -1655,6 +1658,7 @@ static int ds4f_compress_step(
 {
     int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff * d;
     float *kv = (float *)alloca((size_t)W * 4), *score = (float *)alloca((size_t)W * 4);
+    double _cmv = ds4f_now();
     if (pool && w_bf16) {                                   /* pooled SVE, bf16 weights */
         ds4f_cmpmv_bf16_task ct = { kv, score, (const uint16_t *)wkv, (const uint16_t *)wgate, x, W, dim };
         ds4f_pool_run(pool, ds4f_cmpmv_bf16_worker, &ct);
@@ -1668,6 +1672,7 @@ static int ds4f_compress_step(
         for (int i = 0; i < dim; i++) { a += wk[i] * x[i]; b += wg[i] * x[i]; }
         kv[o] = a; score[o] = b;
     }
+    if (pool) g_cmp_mv_secs += ds4f_now() - _cmv;            /* matvec-dispatch attribution (tb2lcmp/icmp split) */
     if (start_pos == 0) {                                    /* seqlen==1 seed (no compress) */
         int offset = overlap ? ratio : 0;                   /* remainder=1 slot */
         for (int o = 0; o < W; o++) {
@@ -2916,6 +2921,36 @@ static void ds4f_load_dense_vshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
     m->bytes_read += ds4f_wbytes(src_fp8 ? DS4F_FP8 : DS4F_BF16, dst->rows, K);
 }
 
+/* DS4F_CMP_LOCAL: re-place a loaded Tier-B2 compressor weight buffer reader-LOCAL. Unlike the
+ * dense matvec (issue-bound -> DS4F_Q8_LOCAL was neutral), the compressor matvec
+ * (ds4f_cmpmv_bf16_worker) is BW-bound AND under-saturating (small W=1024/256 rows) -> under the
+ * process-wide MPOL_INTERLEAVE (DS4F_NUMA=1) its weights stream cross-CMG at ~150 GB/s vs ~278
+ * reader-local (cmp_bench). tb2lcmp = 4.6 ms is 89% this matvec. Copy the interleaved aligned_alloc
+ * buffer into a fresh mmap first-touched by the SAME W-rowsplit the matvec uses (each CMG faults its
+ * own rows), mbind MPOL_LOCAL to pin it. bf16 only. BIT-IDENTICAL (pure page relocation). */
+typedef struct { const uint16_t *src; uint16_t *dst; int rows, cols; } ds4f_cmploc_task;
+static void ds4f_cmploc_worker(void *arg, int tid, int nthr) {
+    ds4f_cmploc_task *T = (ds4f_cmploc_task *)arg;
+    int W = T->rows, per = W / nthr, extra = W % nthr;      /* MUST match ds4f_cmpmv_bf16_worker split */
+    int o0 = per * tid + (tid < extra ? tid : extra), o1 = o0 + per + (tid < extra ? 1 : 0);
+    size_t cols = T->cols;
+    if (o1 > o0) memcpy(T->dst + (size_t)o0*cols, T->src + (size_t)o0*cols, (size_t)(o1-o0)*cols*2);
+}
+static int ds4f_cmp_local = -1;
+static uint16_t *ds4f_cmp_place_local(ds4f_model *m, uint16_t *w, int rows, int cols) {
+    if (ds4f_cmp_local < 0) { const char *e = getenv("DS4F_CMP_LOCAL"); ds4f_cmp_local = e ? atoi(e) : 0; }
+    if (!ds4f_cmp_local || !w || !m->pool) return w;
+    size_t bytes = (size_t)rows * cols * 2;
+    uint16_t *nw = (uint16_t *)mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (nw == MAP_FAILED) return w;
+#if defined(__linux__)
+    syscall(SYS_mbind, nw, bytes, 4 /*MPOL_LOCAL*/, NULL, 0UL, 0UL);
+#endif
+    ds4f_cmploc_task T = { w, nw, rows, cols };
+    ds4f_pool_run(m->pool, ds4f_cmploc_worker, &T);         /* reader-rowsplit copy = local first-touch */
+    free(w);
+    return nw;
+}
 static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
                                   const char *blob_dir, int n_threads, int n_cmgs) {
     double t0 = ds4f_wall();
@@ -3122,6 +3157,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             int coff = (ratio == 4) ? 2 : 1, W = coff * cfg.kv_lora;
             ds4f_load_raw        (m, &B, ly->cmp_wkv,   DS4F_LN("attn.compressor.wkv.weight"),   DS4F_BF16, W, C);
             ds4f_load_raw        (m, &B, ly->cmp_wgate, DS4F_LN("attn.compressor.wgate.weight"), DS4F_BF16, W, C);
+            ly->cmp_wkv   = ds4f_cmp_place_local(m, ly->cmp_wkv,   W, C);   /* DS4F_CMP_LOCAL: BW-bound matvec -> reader-local */
+            ly->cmp_wgate = ds4f_cmp_place_local(m, ly->cmp_wgate, W, C);
             ds4f_load_raw        (m, &B, ly->cmp_ape,   DS4F_LN("attn.compressor.ape"),  DS4F_F32, ratio, W);
             ds4f_load_raw        (m, &B, ly->cmp_norm,  DS4F_LN("attn.compressor.norm.weight"), DS4F_BF16, 1, cfg.kv_lora);
             if (ratio == 4) {                          /* CSA layer => indexer present */
@@ -3132,6 +3169,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
                                       DS4F_BF16, cfg.index_n_heads, C);
                 ds4f_load_raw        (m, &B, ly->idx_cmp_wkv,   DS4F_LN("attn.indexer.compressor.wkv.weight"),   DS4F_BF16, iW, C);
                 ds4f_load_raw        (m, &B, ly->idx_cmp_wgate, DS4F_LN("attn.indexer.compressor.wgate.weight"), DS4F_BF16, iW, C);
+                ly->idx_cmp_wkv   = ds4f_cmp_place_local(m, ly->idx_cmp_wkv,   iW, C);   /* DS4F_CMP_LOCAL (tb2icmp matvec) */
+                ly->idx_cmp_wgate = ds4f_cmp_place_local(m, ly->idx_cmp_wgate, iW, C);
                 ds4f_load_raw        (m, &B, ly->idx_cmp_ape,   DS4F_LN("attn.indexer.compressor.ape"),  DS4F_F32, ratio, iW);
                 ds4f_load_raw        (m, &B, ly->idx_cmp_norm,  DS4F_LN("attn.indexer.compressor.norm.weight"), DS4F_BF16, 1, cfg.index_head_dim);
             }
@@ -3921,7 +3960,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
     int KV = c->kv_lora, ihd = c->index_head_dim, rd = c->qk_rope_dim; float eps = c->norm_eps;
     int offset = c->window_size;                                /* decode combined-buffer offset */
     /* layer compressor (rotate=0): input s_hn -> cmp_kv[pos/ratio] on a boundary */
-    double _tlc0 = ds4f_now();
+    double _tlc0 = ds4f_now(), _mv0 = g_cmp_mv_secs;
     if (ds4f_compress_step(m->s_hn, c->hidden, KV, rd, ratio, pos,
                            ly->cmp_wkv, ly->cmp_wgate, 1, ly->cmp_ape, ly->cmp_norm,
                            rcos, rsin, eps, 0,
@@ -3931,6 +3970,9 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         else memcpy(ly->cmp_kv + (size_t)(pos/ratio)*KV, m->s_cmp_out, (size_t)KV*4);
     }
     m->prof[DS4F_P_TB2LCMP] += ds4f_now() - _tlc0;
+    (void)_mv0;   /* g_cmp_mv_secs accumulates the compressor matvec-dispatch time across all
+                   * compress_step calls; the runner resets it at decode start and prints it
+                   * so tb2lcmp splits into matvec (g_cmp_mv) vs the serial softmax/state tail. */
     int T = (pos + 1) / ratio;
     if (ratio == 4) {                                           /* CSA: indexer-selected */
         if (pos == 0) {                                         /* seed indexer compressor ring */

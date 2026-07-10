@@ -15,6 +15,11 @@
 #   with sampling (default is greedy; temperature<=0 == greedy):
 #     curl -s localhost:8080/v1/completions -d '{"prompt":"...","max_tokens":128,
 #       "temperature":0.8,"top_p":0.95,"top_k":40,"repeat_penalty":1.1,"presence_penalty":0,"seed":42}'
+#   OpenAI chat completions (the pi coding-agent path -- SSE stream + prompt-injected tools):
+#     curl -s localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}]}'
+#     curl -s localhost:8080/v1/models      # lists model id "ds4f"
+#   Drive pi against it (from ~/work/pi, .pi/extensions/ds4f-provider.ts registers the provider):
+#     DS4F_BASE_URL=http://<this-node>:8080/v1 pi --model ds4f/ds4f
 #
 # LONGER SINGLE CONTEXT (CTX=<tokens>, prompt+gen must fit): past the ~16k fast ceiling the f32/bf16
 # KV + compressed caches no longer fit, so CTX>16384 auto-enables the compressed ctx-cache levers --
@@ -76,6 +81,7 @@ export DS4F_HC_SVE=${DS4F_HC_SVE:-1}         # SVE mHC (decode +12%: mhc_pre 10.
 export DS4F_PF_TP=${DS4F_PF_TP:-1}           # compute-shard verify shared+o-proj (prefill; decode untouched)
 export DS4F_PREFILL_K=${DS4F_PREFILL_K:-64}  # verify chunk sweet spot (K=32 -> 64: comm /2; 128 payload-bound)
 export DS4F_MV_FUSE=${DS4F_MV_FUSE:-1}       # wq_a+wkv one dispatch (bit-exact)
+export DS4F_CMP_LOCAL=${DS4F_CMP_LOCAL:-1}   # reader-local Tier-B2 compressor weights: decode +6.6%, bit-exact (tb2lcmp 5.2->2.8 ms)
 export DS4F_TP_HEAD=${DS4F_TP_HEAD:-1}       # vocab-shard head: greedy decode -1.5 ms via argmax-merge
 export DS4F_TP_EMBED=${DS4F_TP_EMBED:-1}     # vocab-shard embed (-0.97 GB, bit-exact)
 
@@ -94,5 +100,5 @@ for i in $(seq 1 180); do
 done
 grep -q 'SERVE ready' "$READY" || { echo "[serve] runner did not become ready in time; see $LOG / $READY"; exit 1; }
 
-echo "[serve] runner ready on 11 nodes. HTTP frontend -> :$PORT"
+echo "[serve] runner ready on 11 nodes. HTTP frontend -> :$PORT (/v1/chat/completions /v1/completions /v1/models)"
 PORT=$PORT DS4F_SERVE_BASE="$BASE" TOK=${TOK:-$HOME/models/ds4f/tokenizer.json} exec python3 ds4f_serve.py

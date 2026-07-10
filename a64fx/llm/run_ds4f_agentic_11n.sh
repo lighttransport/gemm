@@ -41,6 +41,7 @@ export DS4F_HC_SVE=${DS4F_HC_SVE:-1}
 export DS4F_PF_TP=${DS4F_PF_TP:-1}
 export DS4F_PREFILL_K=${DS4F_PREFILL_K:-64}
 export DS4F_MV_FUSE=${DS4F_MV_FUSE:-1}
+export DS4F_CMP_LOCAL=${DS4F_CMP_LOCAL:-1}   # reader-local Tier-B2 compressor weights: decode +6.6%, bit-exact
 case "$KVBITS" in
   16) export DS4F_INT8_KV=0; CEIL="~16k safe" ;;
   8)  export DS4F_INT8_KV=1; CEIL="~16k+ (int8; add DS4F_INT8_CMP=1)" ;;

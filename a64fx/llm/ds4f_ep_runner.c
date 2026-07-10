@@ -1031,6 +1031,7 @@ int main(int argc,char**argv){
                        m->prof[i] / prefill * 1e3, 100.0 * m->prof[i] / (t_pf > 0 ? t_pf : 1));
     }
     memset(m->prof, 0, sizeof(m->prof));
+    g_cmp_mv_secs = 0;   /* tb2lcmp/icmp matvec-dispatch attribution: reset over the decode window */
     double t_dec0 = now_sec(); size_t dec_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int last_tok = 0;
     int *gen_ids = NULL, n_gen = 0;
@@ -1164,6 +1165,8 @@ int main(int argc,char**argv){
                 double ms = m->prof[i]/maxgen*1e3; if (ms <= 0) continue;
                 logmsg("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*m->prof[i]/psum);
             }
+            /* tb2lcmp+tb2icmp split: compressor MATVEC dispatch vs the serial softmax/state tail */
+            logmsg("  (cmp_matvec %.3f ms  -> tail = tb2lcmp+tb2icmp - this)\n", g_cmp_mv_secs/maxgen*1e3);
         }
         /* gen mode: rank 0 writes the generated token-id stream for detokenize */
         if (gen_mode && gen_out_file && *gen_out_file) {
