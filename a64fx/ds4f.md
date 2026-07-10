@@ -930,31 +930,33 @@ HC_PAR+HC_RMSPAR+`DS4F_PREFILL_GEMM=1`; per-lever isolated runs). New decode/pre
 | E | +`DS4F_Q8_GEMM_TILE=16` | 25.5 | 15.63 | **NEUTRAL on speed** (verify GEMMs not GEMM-rate-bound at K=32); *numerics improve* (W8A16-like, relL2 8.9e-3→5.0e-3) |
 | G | +SVE batched mHC, K=64 | **29.32** | 15.60 | prefill mhc_pre 4.97→1.41; comm 5.9→5.5; **tb2prep 11.3 (33%) is now the prefill wall** |
 | H | +`TP_AR_A2A=1`, K=128 | 28.74 | 15.60 | **a2a NEUTRAL** (comm is skew, not exchange latency); K=128 < K=64 (payload-bound) |
-| I | +`TP_HEAD/TP_EMBED/MV_FUSE`, K=64 | **29.50** | **16.11** | head 2.0→argmax-merge; RSS 21.9→**20.0 GB**; the shipped config |
+| I | +`TP_HEAD/TP_EMBED/MV_FUSE`, K=64 | **29.50** | **16.11** | head 2.0→argmax-merge; RSS 21.9→**20.0 GB** |
+| J | +`DS4F_CMP_LOCAL` (2026-07-10b, fresh alloc 49508574) | 29.19 | **17.35** | cmp_matvec 4.6→1.5 ms, tb2lcmp 5.2→2.8; **BYTE-IDENTICAL**; the shipped config |
 
-**Session net: prefill 23.30 → 29.50 tok/s (+27%), decode 13.90 → 16.11 (+16%), RSS −1.9 GB** — all
-real-weight 11n, NaN=0, lockstep, coherent gen (ids shift at the HC_SVE/PF_TP reassoc levers, per the
-established acceptance class). Launcher defaults updated (`run_ds4f_agentic_11n.sh`,
-`run_ds4f_serve_11n.sh` fast path): `DS4F_HC_SVE=1 DS4F_PF_TP=1 DS4F_PREFILL_K=64 DS4F_MV_FUSE=1`
+**Session net: prefill 23.30 → ~29.5 tok/s (+27%), decode 13.90 → 17.35 (+25%), RSS −1.3 GB** — all
+real-weight 11n, NaN=0, lockstep. Launcher defaults (`run_ds4f_agentic_11n.sh`, `run_ds4f_serve_11n.sh`
+fast path): `DS4F_HC_SVE=1 DS4F_PF_TP=1 DS4F_PREFILL_K=64 DS4F_MV_FUSE=1 DS4F_CMP_LOCAL=1`
 (+`TP_HEAD/TP_EMBED=1` in serve).
 
-**Next-session decode levers, in expected-value order** (decode 62.1 ms = comm 12 + tb2prep 11.6 +
-o_proj 8.7 + qkv 7.2 + shared 5.9 + attn 5.2 + experts 4.6 + mHC 3.4 + misc):
-1. **per-row-scale int8 dense rep** (the pinned ~390 Gmac/s sdot ceiling is the scale-application ops;
-   per-row scale + full-int32 K-accum = 17 vs 41 instrs/block, no int32 overflow at K≤4096 → est. dense
-   21.7→~12 ms). LOSSY (coarser than per-64) → real-gen quality gate. `tools/q8_mv_bw.c` is the vehicle.
-2. **tb2lcmp — BOUNDED at the bench (`tools/cmp_bench.c`, 2026-07-10).** The 5.2 ms/tok is NOT the
-   barrier (empty dispatch 4.2 µs → 0.17 ms/tok for 41 layers) and NOT batchable (each layer's
-   compressor input `s_hn` depends on that layer — sequential). It is an **under-saturating matvec**:
-   41 dispatches/tok of a W=1024×dim=4096 bf16 matvec (16.8 MB weight) running at only **278 GB/s @48T**
-   (~40% of the 700 GB/s dense roofline) because W=1024 over 48 threads = ~21 rows/thread — too little
-   streaming runway; 24T is *worse* (178 GB/s), so it's small-W, not barrier-starvation. int8 already
-   refuted (byte-not-bound). Improvement ceiling ~1 ms (≈+1.6% decode) with a hard mechanism → **low
-   value, not pursued.** A `g_cmp_mv_secs` timer (uncommitted diagnostic) splits tb2lcmp into matvec vs
-   the serial softmax/state tail on the real run.
-3. **batched decode serve integration** (below) — comm+dense amortize only there. **This is now the only
-   material single-node lever left:** v3 int8 (refuted, bench), tb2lcmp (bounded ~1 ms, bench), and comm
-   (architectural) all confirm single-stream decode at ~16 tok/s is near its floor — the remaining
+**Next-session decode levers** (post-CMP_LOCAL decode 57.6 ms = comm 12.4 + tb2prep 7.5 + o_proj 8.7 +
+qkv 6.8 + shared 5.7 + attn 5.2 + experts 4.7 + mHC 3.1 + head + misc):
+1. **per-row-scale int8 dense rep — REFUTED at the bench** (see below, "per-row-scale int8 dense").
+   v3 fast-but-lossy (1.38×, spike relL2 0.106 vs 0.030), v4 safe-but-no-gain. The int8 dense decode
+   kernel is at its practical ceiling for the model's massive-activation fidelity.
+2. **tb2lcmp — the reader-local win LANDED (`DS4F_CMP_LOCAL`, commit `bd742c0d`, decode +6.6%,
+   BIT-EXACT).** Attribution (`tools/cmp_bench.c` + `g_cmp_mv_secs`): tb2lcmp's 5.2 ms is 89% the
+   compressor matvec (4.6 ms in-model), which is **BW-bound AND NUMA-interleave-penalized** — the
+   ds4f_cmpmv_bf16 matvec is small-W (1024/256 rows), under-saturating, and under MPOL_INTERLEAVE
+   streams cross-CMG at ~150 GB/s. Reader-local page placement (`ds4f_cmp_place_local`: reader-rowsplit
+   first-touch + `mbind(MPOL_LOCAL)`) recovered it to ~450 GB/s effective → cmp_matvec 4.6→1.5 ms.
+   *(The initial "bounded ~1 ms, not pursued" call was WRONG — I mis-analogized to the refuted DS4F_Q8_LOCAL,
+   forgetting the compressor is BW-bound while the dense matvec is issue-bound; the g_cmp_mv split at the
+   real run showed the NUMA penalty and the reader-local fix delivered 3× the estimate.)* Residual: the
+   ~0.6 ms serial softmax tail (per-`e`-independent → parallelizable, bit-exact) is the only bit left,
+   ~+1% — low value.
+3. **batched decode serve integration** (below) — comm+dense amortize only there. **The only material
+   single-node lever left:** v3 int8 (refuted, bench), tb2lcmp (LANDED via CMP_LOCAL +6.6%), and comm
+   (architectural) confirm single-stream decode at ~17.4 tok/s is near its floor — the remaining
    throughput is batched/serve (comm+dense amortize across M).
 
 **★ per-row-scale int8 dense (lever 1) — REFUTED at the bench (2026-07-10, `tools/q8_mv_bw.c`).** The
