@@ -51,6 +51,8 @@ export DS4F_SERVE_PREFIX_CACHE=${DS4F_SERVE_PREFIX_CACHE:-1}
 # SLOTS: number of independent conversation contexts (one live in the caches at a time; a request's
 # "slot" field context-switches by snapshotting/restoring the per-slot KV+compressor state).
 export DS4F_SERVE_SLOTS=${DS4F_SERVE_SLOTS:-1}
+# concurrent batched decode: >1 = decode up to N requests together (throughput, greedy). Frontend coalesces.
+export DS4F_SERVE_BATCH=${DS4F_SERVE_BATCH:-1}
 # SYSCACHE: preload a persisted context (built once with a cache_save request) into slot 0 so every
 # conversation starts with the system prompt already prefilled -- instant TTFT, survives restarts.
 [ -n "$DS4F_SERVE_SYSCACHE" ] && export DS4F_SERVE_SYSCACHE
@@ -94,11 +96,11 @@ trap 'echo "[serve] stopping"; kill $RUNNER_PID 2>/dev/null; pkill -f "org/mpiex
 # the "SERVE ready" banner goes to the per-rank file (mpiexec does not forward rank stdout), not $LOG
 READY=ds4f_ep_rank00.txt
 for i in $(seq 1 180); do
-    grep -q 'SERVE ready' "$READY" 2>/dev/null && break
+    grep -qE 'SERVE(-BATCH)? ready' "$READY" 2>/dev/null && break
     kill -0 $RUNNER_PID 2>/dev/null || { echo "[serve] runner died during load; see $LOG"; tail -20 "$LOG"; exit 1; }
     sleep 5
 done
-grep -q 'SERVE ready' "$READY" || { echo "[serve] runner did not become ready in time; see $LOG / $READY"; exit 1; }
+grep -qE 'SERVE(-BATCH)? ready' "$READY" || { echo "[serve] runner did not become ready in time; see $LOG / $READY"; exit 1; }
 
 echo "[serve] runner ready on 11 nodes. HTTP frontend -> :$PORT (/v1/chat/completions /v1/completions /v1/models)"
 PORT=$PORT DS4F_SERVE_BASE="$BASE" TOK=${TOK:-$HOME/models/ds4f/tokenizer.json} exec python3 ds4f_serve.py
