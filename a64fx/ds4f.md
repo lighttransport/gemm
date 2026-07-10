@@ -52,34 +52,65 @@ half (`OMP_PROC_BIND=close`, `OMP_PLACES=cores`) is exported at launch by `run_d
 | `--mtp N` | `DS4F_MTP` | `--tierb2 N` | `DS4F_TIERB2` |
 | `--prompt-ids F` | `DS4F_PROMPT_IDS` | `--set KEY=VAL` | any `DS4F_*` |
 
-**Unified batch launcher `a64fx/llm/pjsub_ds4f.sh`** (MODE = prefill / decode / serve). Unlike the
-interactive `run_ds4f_*11n.sh` (which reserve 1 node for the control session), this is a pjsub batch
-job where all `NODES` are EP ranks. It stages then runs via the CLI flags:
+**Unified batch launcher `a64fx/llm/pjsub_ds4f.sh`** (MODE = prefill / decode / serve / serve1m /
+dbbench). Unlike the interactive `run_ds4f_*11n.sh` (which reserve 1 node for the control session),
+this is a pjsub batch job where all `NODES` are EP ranks (rank 0 doubles as driver — **no dedicated
+controller node**). Default `NODES=8` (the minimal-node fast-decode sweet spot). It stages then runs
+via the CLI flags:
 
 ```sh
-NODES=11 MODE=decode  MAXGEN=32 pjsub a64fx/llm/pjsub_ds4f.sh          # decode tok/s @ node floor
+NODES=8  MODE=decode  MAXGEN=64 pjsub a64fx/llm/pjsub_ds4f.sh          # fast Q8 decode @ minimal floor
 NODES=16 MODE=prefill PREFILL=2048 pjsub a64fx/llm/pjsub_ds4f.sh       # TTFT, run above the floor
+NODES=8  MODE=serve1m MAXPOS=1048576 pjsub a64fx/llm/pjsub_ds4f.sh     # 1M-ctx serve (CP-int4 caches)
 NODES=12 MODE=serve   CP=1 MTP=1 PROMPT_IDS=... pjsub a64fx/llm/pjsub_ds4f.sh  # prefill+decode serving
 ```
+(To change node count edit **both** `#PJM node=/proc=` **and** `NODES`.)
 
-**Minimal-node configs** — from `a64fx/llm/ds4f_sim.py` (`per_node = 9.02 replicated + 150.59/N fp4
-experts + KV/N`, ≤27 GB; calibrated: `per_node(11,4k,8)=22.9` vs measured 22.18). Weight floor **≥9
-nodes**; `int8-KV` (`DS4F_INT8_KV=1`) cuts ~⅓ at long ctx:
+**Minimal-node floor — three tiers** (`a64fx/llm/ds4f_sim.py`, ragged `e%N`: fullest node =
+`9.02 replicated + 150.59·⌈256/N⌉/256 experts`, ≤27 GB usable). 256 experts do **not** divide by 6 or
+7, so the fullest node bounds memory — **6 EP nodes do NOT fit** (weights alone ~28 GB > usable):
+
+| tier (dense sharding) | decode speed | weight floor | note |
+|---|---|---|---|
+| **fp8ondemand** (`TP_HEAD`+`TP_EMBED`, FP8 dense) | FP8 (dequant-bound) | **≥8** | **MEASURED @8 EP: fits, RSS 24.57 GB, decode 8.69 tok/s, coherent** |
+| q8fast (`+ Q8_DENSE`, needs bf16 promote) | fast Q8 (~13 tok/s@11n) | **≥9** | **8 OOMs at LOAD** — bf16-promote peak ~28.2 GB busts the node before Q8 reclaims |
+| fp8full (`+ TP_ATTN/SHARED/OPROJ/WOB`) | ~2× slower | **≥7** (weights) | absolute weight floor; `Q8_DENSE`+`TP_ATTN` is a wrong-output bug (WS7) |
+
+> **Measured 2026-07-08 (job 49482631, 12-node interactive alloc, TP_HEAD/EMBED on, MAX_NEW=64):**
+> - **8 EP, fast `Q8_DENSE`:** OOM-kills at load (arena ~28.24 GB, rank SIGKILL) — Q8 first promotes
+>   dense to bf16-pv (+~6 GB) before repacking; that load-peak busts the ~30 GB node.
+> - **8 EP, plain FP8 dense** (`DS4F_FP8_BF16=0 DS4F_Q8_DENSE=0`): fits **RSS 24.57 GB/node**, decode
+>   **8.69 tok/s** / prefill 9.41, NaN=0, coherent — but FP8 is dequant-bound (slower).
+> - **9 EP, fast `Q8_DENSE`:** fits (bf16-promote peak arena 26.6 GB, no OOM), reclaims to **RSS
+>   22.92 GB/node**, decode **13.05 tok/s** / prefill 14.68, NaN=0, coherent — **matches 11-node fast
+>   decode with 2 fewer nodes** (decode is comm/BW-bound, flat in N above the floor).
+>
+> Net: **8 nodes = slower FP8 (~8.7 tok/s); 9 nodes = full fast Q8 (~13 tok/s) and is the minimal-node
+> fast-decode sweet spot.** The fast-Q8 path needs ≥9 nodes (its bf16-promote load-peak, not the
+> steady arena, is the limiter).
+
+Above the weight floor, node count for **serving** is pinned by persistent KV (`int8-KV`/`DS4F_CP`
+cut it). MLA-KV min-nodes (weights EP-sharded + KV context-parallel):
 
 | pattern | ctx | M | min nodes (bf16-KV / int8-KV) |
 |---|---|---|---|
-| decode (short) | 4k | 8 | **9** (use 11 for headroom) |
+| decode (short) | 4k | 8 | **8** fast-Q8 / 9 plain |
 | serve | 128k | 1 | **9** |
 | serve | 512k | 1 | **10** |
-| serve | 1M | 1 | **12 / 10** |
+| serve | 1M | 1 | **12 / 10** (or **8** with the `serve1m` CP-int4 cache stack, load-peak-tight) |
 | serve (batched) | 512k | 8 | **20 / 15** |
 | serve (batched) | 1M | 8 | **32 / 20** |
 
-- **decode-optimized** → run **at** the floor (~11n); NUMA ~1.40× → target ~**14 tok/s** decode.
+- **decode-optimized (minimal nodes)** → **8 EP, `MODE=decode`** (fast Q8, TP_HEAD/EMBED); NUMA ~1.40×.
+  Watch the **load-peak** (`DS4F_WARM_RSS_TRACE=1`, `DS4F_WARM_MEMAVAIL_STOP_GB`) — 8 nodes is the edge;
+  fall back to **9 EP** for headroom.
+- **1M-ctx serving at minimal nodes** → **8 EP, `MODE=serve1m MAXPOS=1048576`**: the CP-sharded int4
+  Tier-B2 cache stack (`CP_SHARD/CP_IDX/INT4_CMP/IDX_INT4` + int8-KV) shards the long-ctx caches across
+  ranks independently of the fast Q8 dense path. Feasible but tight — 9 EP is the robust choice.
 - **prefill-optimized** → run **above** the floor (extra ranks = attention/expert-GEMM parallelism).
-- **prefill+decode serving** → node count **pinned by persistent KV**; `DS4F_CP` for ctx ≥ 512k.
 
-`python3 a64fx/llm/ds4f_sim.py` prints this table; `min_nodes(ctx, M, kvb)` is importable.
+`python3 a64fx/llm/ds4f_sim.py` prints these floors; `weight_floor_tiers()` / `min_nodes(ctx,M,kvb)`
+are importable.
 
 ## Node configurations — prefill / decode / prefill+decode
 
@@ -912,9 +943,37 @@ o_proj 8.7 + qkv 7.2 + shared 5.9 + attn 5.2 + experts 4.6 + mHC 3.4 + misc):
 1. **per-row-scale int8 dense rep** (the pinned ~390 Gmac/s sdot ceiling is the scale-application ops;
    per-row scale + full-int32 K-accum = 17 vs 41 instrs/block, no int32 overflow at K≤4096 → est. dense
    21.7→~12 ms). LOSSY (coarser than per-64) → real-gen quality gate. `tools/q8_mv_bw.c` is the vehicle.
-2. **tb2lcmp sub-instrumentation** (5.2 ms decode / 2.4 prefill; the compress_step serial state ops +
-   2-dispatch structure, not the matvec — mirror the mhc_bench methodology).
-3. **batched decode serve integration** (below) — comm+dense amortize only there.
+2. **tb2lcmp — BOUNDED at the bench (`tools/cmp_bench.c`, 2026-07-10).** The 5.2 ms/tok is NOT the
+   barrier (empty dispatch 4.2 µs → 0.17 ms/tok for 41 layers) and NOT batchable (each layer's
+   compressor input `s_hn` depends on that layer — sequential). It is an **under-saturating matvec**:
+   41 dispatches/tok of a W=1024×dim=4096 bf16 matvec (16.8 MB weight) running at only **278 GB/s @48T**
+   (~40% of the 700 GB/s dense roofline) because W=1024 over 48 threads = ~21 rows/thread — too little
+   streaming runway; 24T is *worse* (178 GB/s), so it's small-W, not barrier-starvation. int8 already
+   refuted (byte-not-bound). Improvement ceiling ~1 ms (≈+1.6% decode) with a hard mechanism → **low
+   value, not pursued.** A `g_cmp_mv_secs` timer (uncommitted diagnostic) splits tb2lcmp into matvec vs
+   the serial softmax/state tail on the real run.
+3. **batched decode serve integration** (below) — comm+dense amortize only there. **This is now the only
+   material single-node lever left:** v3 int8 (refuted, bench), tb2lcmp (bounded ~1 ms, bench), and comm
+   (architectural) all confirm single-stream decode at ~16 tok/s is near its floor — the remaining
+   throughput is batched/serve (comm+dense amortize across M).
+
+**★ per-row-scale int8 dense (lever 1) — REFUTED at the bench (2026-07-10, `tools/q8_mv_bw.c`).** The
+pinned ~390 Gmac/s sdot ceiling is the per-64-block scale APPLICATION (8 fp16→f32 + 8 svcvt + 8 svmla
+*per block*). Two prototypes:
+- **v3** (per-row weight scale + **per-token** activation scale + full-int32 K-accumulation, no per-block
+  scale ops in the inner loop): **538 Gmac/s = 1.38×** — the speed is real and structural. BUT the
+  per-token activation scale is too lossy: a spike test (one channel N× the rest) gives relL2
+  **0.106 vs production 0.030 at N=100** — the per-token scale zeros the O(1) channels while they still
+  contribute ~10% of the output. Real RMSNorm'd dense inputs plausibly hit this 10–1000× "danger band"
+  (residual-stream massive activations, the same ones that force bf16-not-fp16 KV). A quality gamble.
+- **v4** (per-row weight scale + **per-64-block** activation scale, the SAFE version): **389 Gmac/s =
+  ZERO speed win** (identical to production) — because the per-block svcvt+svmla is the actual
+  bottleneck; simplifying only the *weight* scale buys nothing. Accuracy exactly matches production at
+  every spike.
+So the safe path gives no speed and the fast path needs an activation-fidelity gamble the spike test
+flags as real → **not wired** (bench-level refutation, no alloc run, same discipline as the prefetch/OP
+refutations). The int8 dense decode kernel is at its practical ceiling for the per-block activation
+fidelity the model's massive-activation channels require.
 
 **Batched decode re-measured (dbbench, bf16 dense + PF_TP + HC_SVE + TP_HEAD/EMBED, ND=24):**
 aggregate tok/s M=1/2/4/8/16 = **13.0 / 18.5 / 24.4 / 29.0 / 32.4** — vs the prior 9.3/14.1/19.3/23.0/25.7:
