@@ -222,6 +222,140 @@ static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, f
     free(hist);
     return n_gen;
 }
+static long ds4f_read_seq(const char *path);   /* fwd (defined below) */
+static void barrier(void);                      /* fwd (defined below) */
+static int MyRank;                              /* fwd tentative def (defined with N below) */
+/* ================= batched serve: decode up to B sequences concurrently (DS4F_SERVE_BATCH) =================
+ * The throughput path. B persistent per-sequence cache bundles (ds4f_alloc_decode_batch, alloc once); each
+ * request is prefilled into its own bundle, then all still-active sequences are decode-stepped TOGETHER via
+ * one ds4f_forward_verify (dense GEMM + the per-layer EP reduce amortize across the batch -- dbbench M=16
+ * measured ~32 tok/s aggregate vs ~17 single-stream). Greedy (per-seq argmax); each sequence independent
+ * (its own bundle + position), so a seq's output does not depend on its batch-mates. All ranks read the
+ * same batch request (shared FS) -> lockstep. Static batching: a batch is prefilled + drained to completion
+ * before the next is admitted (dynamic mid-flight admission is a follow-on).
+ * Request  file: "BATCH <N>\n" then per seq: "<max_new>\n<id id ...>\n".
+ * Response file: "<N>\n" then per seq: "<gen id id ...>\n". */
+static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
+                                  const char *reqf, const char *respf,
+                                  const char *reqseqf, const char *respseqf) {
+    ds4f_config *c = &m->cfg; int Cc = c->hidden, L = c->n_layers; size_t hcC = (size_t)c->hc_mult * Cc;
+    int K = envi("DS4F_PREFILL_K", 64); if (K < 1) K = 1; if (K > 128) K = 128;
+    int pf_gemm = envi("DS4F_PREFILL_GEMM", 1) && !m->has_mtp;
+    int mtile = B > K ? B : K; if (mtile > 128) mtile = 128;
+    m->want_full_logits = 0;                 /* greedy: cheap argmax-merge head */
+    ds4f_alloc_prefill_batch(m, mtile);
+    ds4f_alloc_decode_batch(m, B);           /* B persistent bundles; bundle i = &bundles[i*L] */
+    ds4f_lseq *bundles = m->dec_batch_seq;
+    ds4f_lseq *view = (ds4f_lseq *)malloc((size_t)B * L * sizeof(ds4f_lseq));
+    int   *vpos = (int *)malloc((size_t)B * sizeof(int));
+    /* Xb/hcb feed forward_verify with up to max(B, prefill-chunk K) rows -> size to mtile, not B. */
+    float *Xb   = (float *)aligned_alloc(64, (size_t)mtile * Cc * 4);
+    float *hcb  = (float *)aligned_alloc(64, (size_t)mtile * hcC * 4);
+    int   *otb  = (int *)malloc((size_t)mtile * sizeof(int));
+    int   *Xin  = (int *)malloc((size_t)maxpos * sizeof(int));
+    typedef struct { int *ids; int nids, np, pos, mnew, active; } bseq;
+    bseq *S = (bseq *)calloc((size_t)B, sizeof(bseq));
+    for (int i = 0; i < B; i++) S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
+    float *xscr = (float *)aligned_alloc(64, (size_t)Cc * 4);   /* per-token embed scratch */
+    long last_seq = ds4f_read_seq(reqseqf);
+    if (MyRank == 0) logmsg("SERVE-BATCH ready: B=%d maxpos=%d prefill_gemm=%d K=%d\n", B, maxpos, pf_gemm, K);
+    for (;;) {
+        long seq = last_seq;
+        if (MyRank == 0) while ((seq = ds4f_read_seq(reqseqf)) <= last_seq) usleep(2000);
+        barrier();
+        int N = 0;
+        FILE *rf = fopen(reqf, "r");
+        if (rf) {
+            char line[256]; int want = 0;
+            if (fgets(line, sizeof line, rf)) sscanf(line, "BATCH %d", &want);
+            if (want > B) want = B;
+            for (int i = 0; i < want; i++) {
+                int mnew = 256;
+                if (!fgets(line, sizeof line, rf)) break; sscanf(line, "%d", &mnew);
+                int np = 0, v; char *tok, *sp;
+                char *ln = NULL; size_t lc = 0;
+                if (getline(&ln, &lc, rf) < 0) { free(ln); break; }
+                for (tok = strtok_r(ln, " \t\n", &sp); tok && np < maxpos; tok = strtok_r(NULL, " \t\n", &sp))
+                    { if (sscanf(tok, "%d", &v) == 1) Xin[np++] = v; }
+                free(ln);
+                if (mnew < 0) mnew = 0; if (np + mnew > maxpos) mnew = maxpos > np ? maxpos - np : 0;
+                bseq *s = &S[N]; s->np = np; s->mnew = mnew; s->nids = 0; s->pos = 0;
+                memcpy(s->ids, Xin, (size_t)np * sizeof(int)); s->nids = np;
+                N++;
+            }
+            fclose(rf);
+        }
+        double t0 = now_sec(); long pf_tokens = 0;
+        /* ---- prefill each request into its own bundle (single-seq path: dec_batch_seq=NULL) ---- */
+        for (int i = 0; i < N; i++) {
+            bseq *s = &S[i];
+            for (int l = 0; l < L; l++) ds4f_lseq_apply(&m->layers[l], &bundles[(size_t)i*L + l]);
+            m->dec_batch_seq = NULL; m->dec_batch_pos = NULL;
+            ds4f_serve_reset(m);
+            int first = DS4F_EOS_ID;
+            if (s->np > 0) {
+                if (pf_gemm) {
+                    for (int base = 0; base < s->np; base += K) {
+                        int M = s->np - base < K ? s->np - base : K;
+                        for (int mm = 0; mm < M; mm++) embed_lookup(m, s->ids[base+mm], Xb + (size_t)mm*Cc);
+                        int ot[128]; ds4f_forward_verify(m, Xb, M, base, ot, hcb); first = ot[M-1];
+                    }
+                } else {
+                    for (int p = 0; p < s->np; p++) { embed_lookup(m, s->ids[p], xscr); first = ds4f_forward_token(m, xscr, p); }
+                }
+                pf_tokens += s->np;
+            }
+            s->pos = s->np;   /* the first gen token (= last-prefill argmax) occupies position np; the
+                               * first decode step forwards it AT pos=np (then pos advances). Do NOT
+                               * pre-increment pos here or position np's KV is never written (a gap). */
+            s->active = (s->np > 0 && s->mnew > 0);
+            if (s->active) { s->ids[s->nids++] = first;             /* record it; decode forwards it at pos=np */
+                             if (first == DS4F_EOS_ID || s->nids - s->np >= s->mnew) s->active = 0; }
+        }
+        double t_pf = now_sec() - t0;
+        /* ---- decode the active set together, one forward_verify per step ---- */
+        long dec_steps = 0, dec_toks = 0;
+        for (;;) {
+            int na = 0, map[128];
+            for (int i = 0; i < N && na < B; i++) if (S[i].active) {
+                map[na] = i;
+                embed_lookup(m, S[i].ids[S[i].nids-1], Xb + (size_t)na*Cc);
+                vpos[na] = S[i].pos;
+                for (int l = 0; l < L; l++) view[(size_t)na*L + l] = bundles[(size_t)i*L + l];
+                na++;
+            }
+            if (na == 0) break;
+            m->dec_batch_seq = view; m->dec_batch_pos = vpos;
+            ds4f_forward_verify(m, Xb, na, 0, otb, hcb);
+            dec_steps++; dec_toks += na;
+            for (int a = 0; a < na; a++) {
+                bseq *s = &S[map[a]]; int tok = otb[a];
+                s->ids[s->nids++] = tok; s->pos++;
+                if (tok == DS4F_EOS_ID || s->nids - s->np >= s->mnew) s->active = 0;
+            }
+        }
+        double dt = now_sec() - t0;
+        if (MyRank == 0) {
+            FILE *of = fopen(respf, "w");
+            if (of) {
+                fprintf(of, "%d\n", N);
+                for (int i = 0; i < N; i++) {
+                    int ng = S[i].nids - S[i].np;   /* generated tokens (after the prompt) */
+                    for (int g = 0; g < ng; g++) fprintf(of, "%d%s", S[i].ids[S[i].np + g], g+1 < ng ? " " : "");
+                    fprintf(of, "\n");
+                }
+                fclose(of);
+            }
+            long rq = ds4f_read_seq(reqseqf);
+            FILE *sf = fopen(respseqf, "w"); if (sf) { fprintf(sf, "%ld\n", rq); fclose(sf); }
+            long tot_gen = 0; for (int i = 0; i < N; i++) tot_gen += S[i].nids - S[i].np;
+            logmsg("SERVE-BATCH req#%ld: N=%d prefill=%ld tok in %.2fs, decode %ld steps %ld tok in %.2fs -> %.1f tok/s agg\n",
+                   rq, N, pf_tokens, t_pf, dec_steps, dec_toks, dt - t_pf, (dt-t_pf) > 0 ? tot_gen/(dt-t_pf) : 0.0);
+        }
+        barrier();
+        last_seq = ds4f_read_seq(reqseqf);
+    }
+}
 static long ds4f_read_seq(const char *path) {
     FILE *f = fopen(path, "r"); if (!f) return 0;
     long v = 0; if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); return v;
@@ -793,6 +927,12 @@ int main(int argc,char**argv){
         const char *reqseqf = getenv("DS4F_SERVE_REQSEQ"), *respseqf = getenv("DS4F_SERVE_RESPSEQ");
         if (!reqf || !respf || !reqseqf || !respseqf) die("DS4F_SERVE needs DS4F_SERVE_{REQ,RESP,REQSEQ,RESPSEQ}", -1);
         int maxpos = envi("DS4F_MAXPOS", 4096);
+        int serve_batch = envi("DS4F_SERVE_BATCH", 1);   /* >1: concurrent batched decode (throughput path) */
+        if (serve_batch > 1) {
+            if (serve_batch > 64) serve_batch = 64;
+            ds4f_serve_batch_loop(m, serve_batch, maxpos, reqf, respf, reqseqf, respseqf);
+            /* never returns */
+        }
         int *pids = (int *)malloc((size_t)maxpos * sizeof(int));
         int *oids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
         int *fids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));   /* scratch for disk load */
