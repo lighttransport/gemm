@@ -622,6 +622,68 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
     int K = t->cols, M = T->M, Ys = T->Ystride, Xs = T->Xstride;
     int r0, r1; ds4f_rowsplit8(t->rows, nthr, tid, &r0, &r1);
     if (t->type == DS4F_Q8_PV) {
+        /* DS4F_Q8_GEMM_TILE (M-threshold, default off): the int8 svdot GEMM below is
+         * ISSUE-bound and FLAT ~104-136 Gmac/s from M=1 to M=64 (ds4f_gemm_test sweep,
+         * 2026-07-10) -- it never amortizes over M, so at batched-verify M it runs ~4x
+         * below the bf16-pv kernel. Mirror of the FP8/MXFP4 fused tile-dequant: dequant
+         * each 8-row group's TILE_K int8 sub-tile ONCE into the 8 KB L1 pv pair-buffer
+         * (int8 x fp16-row-scale -> f32 -> bf16 truncate) and consume it across all M
+         * tokens with the peak matvec_bf16_8x3_pv_acc kernel. X stays f32 (W8A16-like):
+         * REMOVES the sdot path's activation quantization -> different (more accurate)
+         * numerics, coherent-class, gate on real-weight gen A/B. M=1 decode untouched. */
+        static int q8tile = -1;
+        if (q8tile < 0) { const char *e = getenv("DS4F_Q8_GEMM_TILE"); q8tile = e ? atoi(e) : 0; }
+        if (q8tile > 0 && M >= q8tile) {
+            const uint8_t *base = (const uint8_t *)t->w;
+            size_t gb = (size_t)(K / 64) * 528;
+            const int TK = 512;                       /* 8 blocks/tile; 8x512 bf16 = 8 KB L1 */
+            uint16_t *pv = ds4f_fp8bf16_tile((size_t)4 * 2 * TK);
+            svbool_t pg = svptrue_b32(); svbool_t ph = svptrue_b16();
+            for (int i = r0; i + 7 < r1; i += 8) {
+                const uint8_t *g = base + (size_t)(i / 8) * gb;
+                float acc[DS4F_MAX_MTILE][8];
+                for (int mm = 0; mm < M; mm++) for (int r = 0; r < 8; r++) acc[mm][r] = 0.f;
+                for (int k0 = 0; k0 < K; k0 += TK) {
+                    int klen = K - k0 < TK ? K - k0 : TK;   /* K%64==0 (Q8 layout invariant) */
+                    for (int pr = 0; pr < 4; pr++) {
+                        uint16_t *pb = pv + (size_t)pr * 2 * TK;
+                        int ra = 2*pr, rb = 2*pr + 1;
+                        for (int c = 0; c < klen; c += 64) {
+                            const uint8_t *blk = g + (size_t)((k0 + c) >> 6) * 528;
+                            const uint16_t *scl = (const uint16_t *)blk;
+                            const int8_t  *qs  = (const int8_t *)(blk + 16);
+                            svfloat32_t sa = svdup_f32(ggml_fp16_to_fp32(scl[ra]));
+                            svfloat32_t sb = svdup_f32(ggml_fp16_to_fp32(scl[rb]));
+                            for (int cc = 0; cc < 64; cc += 16) {   /* vl==16 (A64FX SVE-512) */
+                                svfloat32_t fa = svmul_x(pg, svcvt_f32_s32_x(pg,
+                                    svld1sb_s32(pg, qs + (size_t)ra*64 + cc)), sa);
+                                svfloat32_t fb = svmul_x(pg, svcvt_f32_s32_x(pg,
+                                    svld1sb_s32(pg, qs + (size_t)rb*64 + cc)), sb);
+                                svuint16_t a16 = svreinterpret_u16_u32(svlsr_n_u32_x(pg, svreinterpret_u32_f32(fa), 16));
+                                svuint16_t b16 = svreinterpret_u16_u32(svlsr_n_u32_x(pg, svreinterpret_u32_f32(fb), 16));
+                                svuint16_t ca = svuzp1_u16(a16, a16);
+                                svuint16_t cb = svuzp1_u16(b16, b16);
+                                svst1_u16(ph, pb + 2*(c + cc), svzip1_u16(ca, cb));
+                            }
+                        }
+                    }
+                    const uint16_t *pA = pv, *pC = pv + 2*TK, *pE = pv + 4*TK, *pG = pv + 6*TK;
+                    int mm = 0;
+                    for (; mm + 2 < M; mm += 3)
+                        matvec_bf16_8x3_pv_acc(acc[mm], acc[mm+1], acc[mm+2], pA, pC, pE, pG,
+                                               X + (size_t)mm    *Xs + k0,
+                                               X + (size_t)(mm+1)*Xs + k0,
+                                               X + (size_t)(mm+2)*Xs + k0, klen);
+                    for (; mm < M; mm++)
+                        matvec_bf16_8row_pv_acc(acc[mm], pA, pC, pE, pG, X + (size_t)mm*Xs + k0, klen);
+                }
+                for (int mm = 0; mm < M; mm++) {
+                    float *y = Y + (size_t)mm*Ys + i;
+                    for (int r = 0; r < 8; r++) y[r] = acc[mm][r];
+                }
+            }
+            return;
+        }
         /* W8A8 int8 svdot prefill. Quantize all M tokens once (thread-local),
          * then row-block OUTER, token INNER: each 8-row weight group (nb*528 B)
          * is read from HBM once and reused L1-resident across the M tokens
