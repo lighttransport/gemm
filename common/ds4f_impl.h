@@ -4746,7 +4746,13 @@ static void ds4f_pf_qnr_worker(void *arg, int tid, int nthr) {
         double ss = 0.0; for (int d = 0; d < HD; d++) ss += (double)qh[d]*qh[d];
         float inv = 1.0f/sqrtf((float)(ss/HD) + c->norm_eps);
         for (int d = 0; d < HD; d++) qh[d] *= inv;
-        ds4f_rope_apply(qh + nope, T->rcos, T->rsin, T->pos0 + mm, half, 0);
+        /* RoPE position: prefill = consecutive (pos0+mm); DECODE-BATCH = each element mm is an
+         * INDEPENDENT sequence at dec_batch_pos[mm] (NOT pos0+mm). The KV RoPE in the per-position
+         * loop already uses dec_batch_pos[mm]; the q RoPE must match or Q/KV rotate at inconsistent
+         * positions -> two identical sequences at different batch indices diverge (the batched-decode
+         * per-sequence independence bug). */
+        int rpos = m->dec_batch_pos ? m->dec_batch_pos[mm] : T->pos0 + mm;
+        ds4f_rope_apply(qh + nope, T->rcos, T->rsin, rpos, half, 0);
     }
 }
 
