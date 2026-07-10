@@ -1052,6 +1052,35 @@ So the earlier "dispatch-bound → batch the tb2 workers" hypothesis is **wrong*
 
 **Build.** `ds4f_forward_verify` already batches *all* dense/MoE/comm as an M=K GEMM with one all-reduce/layer — the amortization exists. The only rework is its per-position attn/tb2 loop → **per-sequence**: M independent live KV/cmp/idx cache **sets** (the multi-slot infra has per-slot *snapshots* but one *live* set), each batch element k with its own `pos[k]` + `cache[k]`. Lowest-risk approach: **pointer-swap** — allocate M cache sets, and before element k's append/tb2/attn, point the layer's cache fields (the ~20 buffers/scalars `ds4f_ctx_snap` enumerates: `kv_*`, `cmp_*`, `idx_*`, the compressor ring states, calibration) at set k, so the existing `ds4f_tb2_prepare`/`ds4f_attn_tb2_worker`/KV-append run unchanged. Phases: **P1** M cache sets + `ds4f_forward_decode_batch` (validate M=1 == single-stream, M=2 == two independent streams); **P2** serve-loop dynamic batch (add/remove sequences, per-sequence sampling/EOS, continuous batching); **P3** measure aggregate tok/s vs the projection. MTP module is staged (throughput draft is a later compose).
 
+### LANDED — DS4F_SERVE_BATCH concurrent batched-decode serve (2026-07-10b, commits `782c8f29`/`eb5d9054`/`994cbd27`)
+
+The batched-serve path is built + validated. `ds4f_serve_batch_loop` (`ds4f_ep_runner.c`, gated
+`DS4F_SERVE_BATCH>1`, **default 1 = the existing single-request loop, zero production impact**): B
+persistent per-sequence cache bundles (`ds4f_alloc_decode_batch`, allocated once), each request
+prefilled into its own bundle (PREFILL_GEMM chunk, `dec_batch_seq=NULL`), then all still-active
+sequences decode-stepped TOGETHER via one `ds4f_forward_verify`/step. Greedy, per-seq EOS/max_new,
+per-sequence independent. Static batching (a batch drains before the next admits; dynamic mid-flight
+admission = the follow-on). Protocol `BATCH N`+(max_new,ids)×N → `N`+ids×N; `ds4f_serve.py` gains a
+dispatcher thread that coalesces concurrent HTTP requests within `DS4F_SERVE_BATCH_WINDOW` (30 ms).
+
+**★ Found + fixed a PRE-EXISTING per-sequence independence bug** (commit `782c8f29`) — it also fixes
+`DS4F_DB_BENCH` correctness, and is NOT one of this session's levers (HC_SVE=0 A/B gave identical
+divergence). `ds4f_pf_qnr_worker` RoPE'd query element mm at `pos0+mm` (right for prefill's consecutive
+positions) but in DECODE-BATCH each mm is an independent sequence at `dec_batch_pos[mm]`; the KV RoPE
+(inline per-k) already used the right position, so Q/KV rotated inconsistently and two identical
+sequences at different batch indices diverged. Localized with a per-(layer,k) hn/q/attn checksum dump
+(layer 0: hn identical, q differed → RoPE). Fix: `rpos = dec_batch_pos ? dec_batch_pos[mm] : pos0+mm`.
+
+**Validated real-weight 11n (direct shared-FS protocol):** per-sequence independence (A alone == A in
+[A,B,C]; 4 identical prompts byte-identical), coherent (a Fibonacci prompt yields correct Python:
+`a,b=0,1 / while a<n: print(a,end=' ') / a,b=b,a`), **aggregate N=4 = 23.4 tok/s vs N=1 = 14.9 (1.57×)**
+— dbbench projects ~2.5-3× at N=8/16. The HTTP frontend dispatcher was confirmed to coalesce 4 concurrent
+curls into one correct BATCH request (the runner + protocol are separately validated, so the halves
+connect). **Follow-ons:** dynamic mid-flight admission (a fast request currently waits for its batch to
+drain); per-sequence sampling (currently greedy-only); B>4 throughput measurement on a stable alloc.
+*Ops note: `pkill -9` on the runner is unreliable — verify the `SERVE-BATCH ready: B=N` banner matches
+the launched B and `ps -eo cmd | grep build/ds4f_ep_runner` is empty before relaunching.*
+
 ### Resuming prompt — Phase 2 CP (next session)
 > **TASK: DS4F sharded-KV context parallelism (`DS4F_CP`).** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`). Full design + file:line in the plan file `~/.claude/plans/see-a64fx-ds4f-md-and-keep-floofy-dragon.md` and the "Phase 2" section above.
 > **Standing rules:** native fcc/FCC; in-alloc `mpiexec` (no pjsub) NP=11 EXCLUDE node 0; **measure MemFree not RSS**; validate coherence/lockstep (NOT bit-exact — combine reassociates); FP8 dense (`DS4F_FP8_BF16=0`) required; CP composes with full TP (`DS4F_TP_*`) + int4 cmp/idx (`DS4F_INT4_CMP`/`DS4F_IDX_INT4`), all default-off; commit only when asked; one real-weight gen per Bash call (batched jobs blow the 10-min timeout → SIGKILL degrades PMIx → recover via native re-stage `run_ds4f_stage_11n.sh`).
