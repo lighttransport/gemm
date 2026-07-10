@@ -884,6 +884,86 @@ The model ships an MTP module (`config num_nextn_predict_layers=1`, tensors `mtp
 
 **★ MEASURED on `glm5-2` (2026-07) — gamma=1 spec decode is a NET LOSS vs the optimized decode.** Real-weight 11n, bf16 dense (`DS4F_FP8_BF16=1`, MHC+Tier-B2, ctx≈15+64), `DS4F_MTP=1 DS4F_SPEC=1 DS4F_SPEC_BATCH=1`: MTP accept **75%** (27/9), **1.391 tok/forward** (46 fwds/64 tok), output coherent — but **decode 10.22 tok/s vs 13.26 baseline (−23%)**. Root cause: the memory's old 1.21× spec win was vs an **8.69 tok/s comm-DOMINATED** decode (13.1 ms/tok comm); the landed decode levers (FLAGBAR/ATTN_GEMM/IDX_GEMM/NUMA) since made plain decode **13.26 tok/s with comm only ~16%**, so (a) there's little comm left to amortize and (b) the verify's **per-position tb2/attn scales with K and never amortizes**, while the baseline gets the optimized matvec path the verify GEMM doesn't. gamma≥2 wouldn't rescue it at short ctx (K× the per-position tb2/attn) and is *worse* at long ctx (K× the growing O(T) scan). **Conclusion: MTP spec decode is dominated by the optimized single-stream decode — not a decode-speed lever here.** The MTP module + `ds4f_mtp_predict` remain useful for a *throughput* (batched multi-request) path, not single-stream speed.
 
+### 2026-07-10 session (alloc 49500509, 12-node interactive): prefill 23.3 → 29.3+, decode 13.9 → 15.6 tok/s
+
+Real-weight 11n A/B ladder (2409-tok prompt, MAX_NEW=64, gen config = REAL+FP8_BF16+Q8_DENSE+TIERB2+MHC+
+HC_PAR+HC_RMSPAR+`DS4F_PREFILL_GEMM=1`; per-lever isolated runs). New decode/prefill sub-timers:
+`mhc_pre/mhc_post/mhc_cpy/comm` (DS4F_NPHASE 20→24) + a per-phase PREFILL profile print in the runner.
+
+| run | change | prefill tok/s | decode tok/s | verdict |
+|---|---|---|---|---|
+| A | baseline (K=32) | 23.30 | 13.90 | decode: other 22.7 = comm 12.0 + **mHC 10.7**; dense 22.2; tb2 11.8 |
+| B | +`DS4F_PF_TP=1` | 24.72 | 13.9 | verify compute-shard (below); +1 [K,C] reduce ate most of it at K=32 |
+| C | +`DS4F_HC_SVE=1` | 25.89 | **15.56** | **mhc_pre 10.1→2.67 ms** (SVE hcmix + SVE sinkhorn + fused resid) |
+| D | +`DS4F_Q8_LOCAL=1` | 25.8 | 15.65 | **NEUTRAL — REFUTED**: reader-local mbind of the q8 buffers changes nothing (placement is not the dense-matvec lever; joins prefetch in the refuted pile) |
+| E | +`DS4F_Q8_GEMM_TILE=16` | 25.5 | 15.63 | **NEUTRAL on speed** (verify GEMMs not GEMM-rate-bound at K=32); *numerics improve* (W8A16-like, relL2 8.9e-3→5.0e-3) |
+| G | +SVE batched mHC, K=64 | **29.32** | 15.60 | prefill mhc_pre 4.97→1.41; comm 5.9→5.5; **tb2prep 11.3 (33%) is now the prefill wall** |
+| H | +`TP_AR_A2A=1`, K=128 | 28.74 | 15.60 | **a2a NEUTRAL** (comm is skew, not exchange latency); K=128 < K=64 (payload-bound) |
+| I | +`TP_HEAD/TP_EMBED/MV_FUSE`, K=64 | **29.50** | **16.11** | head 2.0→argmax-merge; RSS 21.9→**20.0 GB**; the shipped config |
+
+**Session net: prefill 23.30 → 29.50 tok/s (+27%), decode 13.90 → 16.11 (+16%), RSS −1.9 GB** — all
+real-weight 11n, NaN=0, lockstep, coherent gen (ids shift at the HC_SVE/PF_TP reassoc levers, per the
+established acceptance class). Launcher defaults updated (`run_ds4f_agentic_11n.sh`,
+`run_ds4f_serve_11n.sh` fast path): `DS4F_HC_SVE=1 DS4F_PF_TP=1 DS4F_PREFILL_K=64 DS4F_MV_FUSE=1`
+(+`TP_HEAD/TP_EMBED=1` in serve).
+
+**Next-session decode levers, in expected-value order** (decode 62.1 ms = comm 12 + tb2prep 11.6 +
+o_proj 8.7 + qkv 7.2 + shared 5.9 + attn 5.2 + experts 4.6 + mHC 3.4 + misc):
+1. **per-row-scale int8 dense rep** (the pinned ~390 Gmac/s sdot ceiling is the scale-application ops;
+   per-row scale + full-int32 K-accum = 17 vs 41 instrs/block, no int32 overflow at K≤4096 → est. dense
+   21.7→~12 ms). LOSSY (coarser than per-64) → real-gen quality gate. `tools/q8_mv_bw.c` is the vehicle.
+2. **tb2lcmp sub-instrumentation** (5.2 ms decode / 2.4 prefill; the compress_step serial state ops +
+   2-dispatch structure, not the matvec — mirror the mhc_bench methodology).
+3. **batched decode serve integration** (below) — comm+dense amortize only there.
+
+**Batched decode re-measured (dbbench, bf16 dense + PF_TP + HC_SVE + TP_HEAD/EMBED, ND=24):**
+aggregate tok/s M=1/2/4/8/16 = **13.0 / 18.5 / 24.4 / 29.0 / 32.4** — vs the prior 9.3/14.1/19.3/23.0/25.7:
+**+26% at M=16** (and M=1-via-verify 9.3→13.0, +40%). PF_TP shards the batch-path shared GEMM
+(~1 ms/step flat at every M); the per-M dominators are now **experts 94.5 ms/step @M=16** (5.9/seq,
+MoE top-6 barely shares experts) and **tb2prep 124.9** (7.8/seq per-position). Serve continuous-batching
+integration (P2 build plan) is the remaining wiring to expose this as multi-request throughput.
+
+**Landed (this session, uncommitted):**
+- **`DS4F_HC_SVE`** (default off): SVE half-row hcmix (110→~35 µs/call, reassoc/coherent-class), SVE
+  sinkhorn divisions (24→5 µs, **bit-exact**, `tools/mhc_bench.c` 16/16 comb bit-equal), resid-copy fused
+  into the hccol collapse (bit-exact), SVE `hcmix_b` + pooled per-position sinkhorns in `hc_pre_batch`
+  (bit-exact pooling). Decode +12%; gen coherent, NaN=0, lockstep (ids diverge from baseline = reassoc class).
+- **`DS4F_PF_TP`** (default off): memory-neutral COMPUTE-shard of the verify-path shared+o-proj GEMMs by
+  rank-slicing the REPLICATED tensors (row_slice at GEMM time; decode path untouched). Q8-safe per
+  `tools/ws7_tp_q8_test.c`; 64-aligned contraction boundaries via new `DS4F_TP_DENSE_ALIGN` (fixes a real
+  Q8 zero-pad straddle bug in the load-time TP_SHARED/TP_OPROJ alignment: relL2 1.5e-3 → 1.5e-7).
+- **WS7 RECLASSIFIED — no kernel bug** (`tools/ws7_tp_q8_test.c`): TP_ATTN×Q8 partial-sum error is
+  fp-reassociation (relL2 1.5e-7, same class as bf16's 2.8e-7 which is also NOT bitwise); the 11n bf16
+  "64/64 identical" was token-level luck. Row-shard+full-input = BIT-EXACT (8192/8192). Gate TP×Q8 changes
+  on coherence, never token-identity. WS6 confirmed fixed in-tree (fp32 xscale; stress NaN=0, 205/205).
+- **`DS4F_Q8_GEMM_TILE`** (M-threshold, default off): int8→bf16-pv fused tile-dequant GEMM. Found: the Q8
+  svdot GEMM is **FLAT ~104-136 Gmac/s M=1→64** (never amortizes, like MXFP4 svtbl); the tile removes the
+  activation quantization (more accurate) but was speed-NEUTRAL in the verify path (not GEMM-rate-bound there).
+- **`TP_AR_A2A`** (`tp_allreduce.h`, default off): direct all-to-all sum for count ≤ `TP_AR_A2A_MAX` (8192)
+  — one detection wait instead of ~5 sequential exchanges; rank-order fold = bitwise-identical across ranks;
+  dedicated 2-generation slot region. Integer-exact validated 11n (`tp_ar_ack_test` sum_mism=0). Microbench:
+  a2a 50.8 vs doubling 40.8 µs synchronized. **Run H (production A/B): NEUTRAL — decode comm 12.1 ms
+  unchanged.** Verdict: decode "comm" is straggler-skew + floor, not exchange-count latency; a2a does not
+  absorb skew (the slowest sender gates either way). D3 closed: the ~12 ms is architectural at M=1 (only
+  batched decode amortizes it). K=128 prefill also NEUTRAL-to-worse vs K=64 (payload-bound reduces): **K=64
+  is the chunk sweet spot.**
+- **int8-sdot matvec ceiling PINNED (`tools/q8_mv_bw.c`)**: reader-local first-touch pool, production
+  dispatch: **bf16-pv 735 GB/s (0.091 ms) vs q8-sdot 402 GB/s at the SAME 0.086 ms wall** — the sdot
+  kernel is ISSUE-bound ~390 Gmac/s (half the bytes, zero time win); production decode dense is AT this
+  kernel ceiling, so placement levers (Q8_LOCAL, prefetch) are structurally neutral. A `svmla_lane`
+  restructure (v2, bit-exact) measured 2× SLOWER — refuted. The real ≥1.5× dense-decode lever is a
+  **per-row-scale int8 rep** (full-int32 K-accumulation: 17 vs 41 instrs/block; no overflow at K=4096) —
+  LOSSY (coarser than per-64), needs repack + kernel + quality gate. Follow-on work.
+- **Fixes**: `ot[8]` out_tok overrun at K>8 in the gen prefill loop (→ `ot[128]`); `DS4F_PREFILL_K` clamp
+  32→128 (`pa[128]` sinkhorn arrays + K>128 abort in `ds4f_forward_verify`); `DS4F_MAX_MTILE` unchanged.
+- TP_HEAD/TP_EMBED are set by `--preset decode` but NOT by the `run_ds4f_gen_11n.sh` env path — the gen
+  config leaves the +2.3% (and −1.9 GB) on the table; head = 2.0 ms of the 64 ms decode.
+
+**Prefill wall after G (34.1 ms/tok):** tb2prep 11.3 (scan 2.7 + attn 3.6 + lcmp 2.4 + glue) per-position,
+comm 5.5 (payload-bound at K=64), experts 5.4 (svtbl floor at per-expert M≈1.5), qkv 4.2 (replicated wq_b),
+o_proj 3.2 (replicated wo_b contraction), mhc_post 2.1. The doc's earlier "compressor-batching neutral"
+diagnosis holds here too (the lcmp cost is dispatch+serial state glue, not the matvec).
+
 ### Batched concurrent decode — roofline (2026-07) + build plan
 
 **The throughput lever** (decode M independent requests in one forward). Per-phase decode profile (`DS4F_PROF=1`, bf16 dense, ~74 ms/tok) splits into: **amortizable ~65 ms** — dense GEMM weight read *once* for M sequences (mHC 22.6, qkv 7.2, experts 6.0, shared 5.9, head 2.0, router 0.5, tb2 dense projections 9.3) + comm ~12 (one all-reduce/step ÷M) — and **per-sequence ~8.5 ms** (tb2scan 6.9 O(T), attn 1.3, rope/topk 0.3). **89 % amortizable**, so `step(M) ≈ 65 + 8.5·M` and aggregate tok/s = M/step:
