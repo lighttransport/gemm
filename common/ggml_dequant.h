@@ -1498,6 +1498,561 @@ static inline void gemm_bf16_f32_tokmajor(float *Y, const uint16_t *W, const flo
 }
 #endif /* BF16 kernels */
 
+
+/* Round-to-nearest f32 -> f16 (IEEE half). Used to encode per-block quant
+ * scales, which are always small positive values (absmax/127), so the
+ * subnormal/overflow branches below are defensive rather than hot. */
+static inline uint16_t ggml_fp32_to_fp16(float f) {
+    union { float f; uint32_t u; } u; u.f = f;
+    uint32_t bits = u.u;
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t  exp  = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = (bits >> 13) & 0x3ff;
+    if (exp <= 0)       return (uint16_t)sign;
+    if (exp >= 31)      return (uint16_t)(sign | 0x7c00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+
+#if defined(__ARM_FEATURE_SVE)
+/* 8-row BF16 matvec, p_odd predicated-load variant.
+ * Inputs are 4 pair buffers, each holding 2 adjacent rows interleaved at
+ * bf16 granularity per 16-element chunk. Two ld1h.h with p_odd at offsets
+ * -2 / 0 bytes extract both rows as FP32 (bf16 lands in upper half of .s
+ * lanes), eliminating the LSL the lsl variant needs.
+ *
+ * Pair buf layout (per 16-element chunk = 64 bytes = 32 halfwords):
+ *   HW 0  = rA[c*16+0]   HW 1  = rB[c*16+0]
+ *   HW 2  = rA[c*16+1]   HW 3  = rB[c*16+1]
+ *   ... up to HW 30/31
+ *
+ * Constraints: n_cols % vl (= 16 on A64FX) == 0, n_rows % 8 == 0.
+ * Caller must have packed weights via pack_bf16_rows_to_pv first. */
+static inline void matvec_bf16_8row_pv(float *dst,
+                                        const uint16_t *pAB, const uint16_t *pCD,
+                                        const uint16_t *pEF, const uint16_t *pGH,
+                                        const float *x, int n) {
+    svbool_t pg = svptrue_b32();
+    svbool_t p_all_h = svptrue_b16();
+    svuint16_t idx_h = svindex_u16(0, 1);
+    svbool_t p_odd = svcmpne_n_u16(p_all_h,
+                                    svand_n_u16_x(p_all_h, idx_h, 1), 0);
+
+    int vl = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
+    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    int i = 0;
+    /* Lighter SW prefetch: distance 8 iters = 2 × 256 B = 2 cachelines per
+     * pair stream, to L2 (locality=2). With ~12 threads/CMG × 4 pair streams
+     * the HW prefetcher's ~16 slots/CMG are oversubscribed; an L2-only hint
+     * provides headroom without blowing the L1. Guarded by TF_BF16PV_PREFETCH=1. */
+    static int pf_env_done = 0, pf_on = 0;
+    if (__builtin_expect(!pf_env_done, 0)) {
+        const char *e = getenv("TF_BF16PV_PREFETCH");
+        pf_on = (e && *e && *e != '0');
+        pf_env_done = 1;
+    }
+    const int PFD_HW = 8 * 32;  /* halfwords = 2 × 256-B cachelines */
+    for (; i + vl - 1 < n; i += vl) {
+        /* pair[hw_base = 2*i] points at chunk c = i/vl */
+        const uint16_t *ab = pAB + 2 * i;
+        const uint16_t *cd = pCD + 2 * i;
+        const uint16_t *ef = pEF + 2 * i;
+        const uint16_t *gh = pGH + 2 * i;
+        if (pf_on) {
+            __builtin_prefetch(ab + PFD_HW, 0, 2);
+            __builtin_prefetch(cd + PFD_HW, 0, 2);
+            __builtin_prefetch(ef + PFD_HW, 0, 2);
+            __builtin_prefetch(gh + PFD_HW, 0, 2);
+        }
+        svuint16_t vA = svld1_u16(p_odd, ab - 1);
+        svuint16_t vB = svld1_u16(p_odd, ab);
+        svuint16_t vC = svld1_u16(p_odd, cd - 1);
+        svuint16_t vD = svld1_u16(p_odd, cd);
+        svuint16_t vE = svld1_u16(p_odd, ef - 1);
+        svuint16_t vF = svld1_u16(p_odd, ef);
+        svuint16_t vG = svld1_u16(p_odd, gh - 1);
+        svuint16_t vH = svld1_u16(p_odd, gh);
+        svfloat32_t vx = svld1(pg, &x[i]);
+        a0 = svmla_x(pg, a0, svreinterpret_f32(vA), vx);
+        a1 = svmla_x(pg, a1, svreinterpret_f32(vB), vx);
+        a2 = svmla_x(pg, a2, svreinterpret_f32(vC), vx);
+        a3 = svmla_x(pg, a3, svreinterpret_f32(vD), vx);
+        a4 = svmla_x(pg, a4, svreinterpret_f32(vE), vx);
+        a5 = svmla_x(pg, a5, svreinterpret_f32(vF), vx);
+        a6 = svmla_x(pg, a6, svreinterpret_f32(vG), vx);
+        a7 = svmla_x(pg, a7, svreinterpret_f32(vH), vx);
+    }
+    /* n is required to be a multiple of vl by the panel build constraint;
+     * no tail handling needed in the kernel. */
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* Accumulating K-tile variant of matvec_bf16_8row_pv, for the batched (M>1)
+ * prefill GEMM. ADDS the 8-row partial dot products over a K-segment [0,n) into
+ * acc[0..7] (caller zeroes acc, then sweeps K tiles for one token). The pair
+ * pointers must already be advanced to the tile's column base (pAB + 2*k0, etc.)
+ * and x to x + k0. Same p_odd predicated-load layout/constraints (n % 16 == 0)
+ * as matvec_bf16_8row_pv; no SW prefetch (the GEMM keeps the weight tile hot in
+ * L1 across all M tokens, so HW streaming suffices). The per-tile svaddv reorders
+ * the K reduction vs the single-shot matvec -> result is bit-SIMILAR, not
+ * bit-identical (validated to ~1e-4 in ds4f_gemm_test.c). */
+static inline void matvec_bf16_8row_pv_acc(float *acc,
+                                            const uint16_t *pAB, const uint16_t *pCD,
+                                            const uint16_t *pEF, const uint16_t *pGH,
+                                            const float *x, int n) {
+    svbool_t pg = svptrue_b32();
+    svbool_t p_all_h = svptrue_b16();
+    svuint16_t idx_h = svindex_u16(0, 1);
+    svbool_t p_odd = svcmpne_n_u16(p_all_h, svand_n_u16_x(p_all_h, idx_h, 1), 0);
+    int vl = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
+    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    int i = 0;
+    for (; i + vl - 1 < n; i += vl) {
+        const uint16_t *ab = pAB + 2 * i, *cd = pCD + 2 * i;
+        const uint16_t *ef = pEF + 2 * i, *gh = pGH + 2 * i;
+        svuint16_t vA = svld1_u16(p_odd, ab - 1), vB = svld1_u16(p_odd, ab);
+        svuint16_t vC = svld1_u16(p_odd, cd - 1), vD = svld1_u16(p_odd, cd);
+        svuint16_t vE = svld1_u16(p_odd, ef - 1), vF = svld1_u16(p_odd, ef);
+        svuint16_t vG = svld1_u16(p_odd, gh - 1), vH = svld1_u16(p_odd, gh);
+        svfloat32_t vx = svld1(pg, &x[i]);
+        a0 = svmla_x(pg, a0, svreinterpret_f32(vA), vx);
+        a1 = svmla_x(pg, a1, svreinterpret_f32(vB), vx);
+        a2 = svmla_x(pg, a2, svreinterpret_f32(vC), vx);
+        a3 = svmla_x(pg, a3, svreinterpret_f32(vD), vx);
+        a4 = svmla_x(pg, a4, svreinterpret_f32(vE), vx);
+        a5 = svmla_x(pg, a5, svreinterpret_f32(vF), vx);
+        a6 = svmla_x(pg, a6, svreinterpret_f32(vG), vx);
+        a7 = svmla_x(pg, a7, svreinterpret_f32(vH), vx);
+    }
+    acc[0] += svaddv(pg, a0); acc[1] += svaddv(pg, a1);
+    acc[2] += svaddv(pg, a2); acc[3] += svaddv(pg, a3);
+    acc[4] += svaddv(pg, a4); acc[5] += svaddv(pg, a5);
+    acc[6] += svaddv(pg, a6); acc[7] += svaddv(pg, a7);
+}
+
+/* Register-blocked 8-row x 3-token accumulating pv GEMM microkernel.
+ *
+ * matvec_bf16_8row_pv_acc replayed per token loads the 8 weight-row vectors from
+ * L1 ONCE PER TOKEN (8 loads + 1 x-load for only 8 FMAs) -> the FLA pipes starve on
+ * L1 load ports, capping the GEMM near ~17% of peak. This variant loads each of the
+ * 8 weight rows ONCE per K-step (same p_odd dual-load pv layout) and issues it
+ * against 3 token columns: 24 FMAs per 11 loads (8 weight + 3 x). 24 live f32 lane-
+ * accumulators + 3 x vectors + a transient weight reg fit in the 32 SVE z-registers
+ * (the same 8x3 blocking the vlm micro_kernel_bf16B_8x3_pv.S uses). Row->acc mapping
+ * (ab-1,ab,cd-1,cd,ef-1,ef,gh-1,gh -> rows 0..7) is byte-identical to the single-
+ * token kernel, so results match it (bit-similar via the per-tile svaddv reorder).
+ * acc0/acc1/acc2 are each [8]; caller zeroes them and sweeps K tiles. n % 16 == 0. */
+static inline void matvec_bf16_8x3_pv_acc(float *acc0, float *acc1, float *acc2,
+                                          const uint16_t *pAB, const uint16_t *pCD,
+                                          const uint16_t *pEF, const uint16_t *pGH,
+                                          const float *x0, const float *x1, const float *x2,
+                                          int n) {
+    svbool_t pg = svptrue_b32();
+    svbool_t p_all_h = svptrue_b16();
+    svuint16_t idx_h = svindex_u16(0, 1);
+    svbool_t p_odd = svcmpne_n_u16(p_all_h, svand_n_u16_x(p_all_h, idx_h, 1), 0);
+    int vl = (int)svcntw();
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0),a30=svdup_f32(0);
+    svfloat32_t a40=svdup_f32(0),a50=svdup_f32(0),a60=svdup_f32(0),a70=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0),a31=svdup_f32(0);
+    svfloat32_t a41=svdup_f32(0),a51=svdup_f32(0),a61=svdup_f32(0),a71=svdup_f32(0);
+    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0),a22=svdup_f32(0),a32=svdup_f32(0);
+    svfloat32_t a42=svdup_f32(0),a52=svdup_f32(0),a62=svdup_f32(0),a72=svdup_f32(0);
+    int i = 0;
+    for (; i + vl - 1 < n; i += vl) {
+        const uint16_t *ab = pAB + 2*i, *cd = pCD + 2*i, *ef = pEF + 2*i, *gh = pGH + 2*i;
+        svfloat32_t vx0 = svld1(pg, &x0[i]);
+        svfloat32_t vx1 = svld1(pg, &x1[i]);
+        svfloat32_t vx2 = svld1(pg, &x2[i]);
+        svfloat32_t w;
+        w = svreinterpret_f32(svld1_u16(p_odd, ab-1)); a00=svmla_x(pg,a00,w,vx0); a01=svmla_x(pg,a01,w,vx1); a02=svmla_x(pg,a02,w,vx2);
+        w = svreinterpret_f32(svld1_u16(p_odd, ab  )); a10=svmla_x(pg,a10,w,vx0); a11=svmla_x(pg,a11,w,vx1); a12=svmla_x(pg,a12,w,vx2);
+        w = svreinterpret_f32(svld1_u16(p_odd, cd-1)); a20=svmla_x(pg,a20,w,vx0); a21=svmla_x(pg,a21,w,vx1); a22=svmla_x(pg,a22,w,vx2);
+        w = svreinterpret_f32(svld1_u16(p_odd, cd  )); a30=svmla_x(pg,a30,w,vx0); a31=svmla_x(pg,a31,w,vx1); a32=svmla_x(pg,a32,w,vx2);
+        w = svreinterpret_f32(svld1_u16(p_odd, ef-1)); a40=svmla_x(pg,a40,w,vx0); a41=svmla_x(pg,a41,w,vx1); a42=svmla_x(pg,a42,w,vx2);
+        w = svreinterpret_f32(svld1_u16(p_odd, ef  )); a50=svmla_x(pg,a50,w,vx0); a51=svmla_x(pg,a51,w,vx1); a52=svmla_x(pg,a52,w,vx2);
+        w = svreinterpret_f32(svld1_u16(p_odd, gh-1)); a60=svmla_x(pg,a60,w,vx0); a61=svmla_x(pg,a61,w,vx1); a62=svmla_x(pg,a62,w,vx2);
+        w = svreinterpret_f32(svld1_u16(p_odd, gh  )); a70=svmla_x(pg,a70,w,vx0); a71=svmla_x(pg,a71,w,vx1); a72=svmla_x(pg,a72,w,vx2);
+    }
+    acc0[0]+=svaddv(pg,a00); acc0[1]+=svaddv(pg,a10); acc0[2]+=svaddv(pg,a20); acc0[3]+=svaddv(pg,a30);
+    acc0[4]+=svaddv(pg,a40); acc0[5]+=svaddv(pg,a50); acc0[6]+=svaddv(pg,a60); acc0[7]+=svaddv(pg,a70);
+    acc1[0]+=svaddv(pg,a01); acc1[1]+=svaddv(pg,a11); acc1[2]+=svaddv(pg,a21); acc1[3]+=svaddv(pg,a31);
+    acc1[4]+=svaddv(pg,a41); acc1[5]+=svaddv(pg,a51); acc1[6]+=svaddv(pg,a61); acc1[7]+=svaddv(pg,a71);
+    acc2[0]+=svaddv(pg,a02); acc2[1]+=svaddv(pg,a12); acc2[2]+=svaddv(pg,a22); acc2[3]+=svaddv(pg,a32);
+    acc2[4]+=svaddv(pg,a42); acc2[5]+=svaddv(pg,a52); acc2[6]+=svaddv(pg,a62); acc2[7]+=svaddv(pg,a72);
+}
+
+/* int8 svdot W8A8 8-row matvec for the q8_pv "group" layout.
+ *
+ * group layout (per 8 rows × K cols, K % 64 == 0):
+ *   nb = K / 64 blocks, each 528 bytes:
+ *     bytes [0..16)    -> 8 fp16 row-scales (row 0..7)
+ *     bytes [16..528)  -> 8 rows × 64 int8 quants, row-major
+ *
+ * X is pre-quantized once per matvec into int8 + per-64-block fp16 scale
+ * (see tf_quant_x_sdot). Per row per 64-block: one svdot_s32 (64 int8 MACs
+ * -> 16 i32 lanes) + svcvt + svmla by the scalar (w_scale × x_scale) into a
+ * float lane-accumulator. Block scales fold via the svmla, so there is only
+ * ONE horizontal reduction (svaddv) per row, at the very end. Weight DRAM is
+ * ~1.03 B/elem (528/512) vs bf16_8row_pv's 2.0 — and unlike the scalar-scale
+ * Q8 kernel this stays HBM-BW-bound (svdot keeps the FLA pipe from saturating)
+ * giving ~2× at the model's bandwidth regime. */
+static inline void matvec_sdot_8row(float *dst,
+                                     const uint8_t *group, /* points at block 0 */
+                                     const int8_t *xq, const float *xscale,
+                                     int K) {
+    svbool_t pg = svptrue_b32();
+    svbool_t pb = svptrue_b8();
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
+    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    int nb = K / 64;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = group + (size_t)b * 528;
+        const uint16_t *scl = (const uint16_t *)blk;
+        const int8_t *qs    = (const int8_t *)(blk + 16);
+        float xs = xscale[b];   /* fp32 activation scale (WS6: fp16 overflowed to Inf for amax>~8.3e6 -> 0*Inf=NaN) */
+        svint8_t xv = svld1_s8(pb, xq + (size_t)b * 64);
+        #define SDOT_ROW(R, ACC)                                              \
+            do {                                                              \
+                svint8_t wv = svld1_s8(pb, qs + (size_t)(R) * 64);            \
+                svint32_t d = svdot_s32(svdup_s32(0), wv, xv);                \
+                svfloat32_t df = svcvt_f32_s32_x(pg, d);                      \
+                float sc = ggml_fp16_to_fp32(scl[R]) * xs;                    \
+                ACC = svmla_x(pg, ACC, df, svdup_f32(sc));                    \
+            } while (0)
+        SDOT_ROW(0, a0); SDOT_ROW(1, a1); SDOT_ROW(2, a2); SDOT_ROW(3, a3);
+        SDOT_ROW(4, a4); SDOT_ROW(5, a5); SDOT_ROW(6, a6); SDOT_ROW(7, a7);
+        #undef SDOT_ROW
+    }
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* 8-row x 3-token int8 svdot (prefill weight reuse): same q8_pv group layout as
+ * matvec_sdot_8row, but each 8-row weight block is loaded ONCE and dotted against
+ * 3 tokens' int8 (xq0/xq1/xq2 with per-64-block scales xs0/xs1/xs2), amortizing
+ * the weight L1->reg loads across the triple. 24 float lane-accumulators (8 rows
+ * x 3 tokens) — register-tight (fcc may spill 1-2, as the bf16 8x3 does), still a
+ * net win when the loop is svdot-issue-bound. Per-(row,token) the K reduction is
+ * the SAME order as the single-token kernel => results match matvec_sdot_8row. */
+static inline void matvec_sdot_8row_3x(float *dst0, float *dst1, float *dst2,
+                                       const uint8_t *group,
+                                       const int8_t *xq0, const float *xs0,
+                                       const int8_t *xq1, const float *xs1,
+                                       const int8_t *xq2, const float *xs2,
+                                       int K) {
+    svbool_t pg = svptrue_b32();
+    svbool_t pb = svptrue_b8();
+    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f),
+                a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
+    svfloat32_t b0=svdup_f32(0.f),b1=svdup_f32(0.f),b2=svdup_f32(0.f),b3=svdup_f32(0.f),
+                b4=svdup_f32(0.f),b5=svdup_f32(0.f),b6=svdup_f32(0.f),b7=svdup_f32(0.f);
+    svfloat32_t c0=svdup_f32(0.f),c1=svdup_f32(0.f),c2=svdup_f32(0.f),c3=svdup_f32(0.f),
+                c4=svdup_f32(0.f),c5=svdup_f32(0.f),c6=svdup_f32(0.f),c7=svdup_f32(0.f);
+    int nb = K / 64;
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t *bp = group + (size_t)blk * 528;
+        const uint16_t *scl = (const uint16_t *)bp;
+        const int8_t *qs    = (const int8_t *)(bp + 16);
+        float s0 = xs0[blk];   /* fp32 activation scale (WS6 overflow fix) */
+        float s1 = xs1[blk];
+        float s2 = xs2[blk];
+        svint8_t xv0 = svld1_s8(pb, xq0 + (size_t)blk*64);
+        svint8_t xv1 = svld1_s8(pb, xq1 + (size_t)blk*64);
+        svint8_t xv2 = svld1_s8(pb, xq2 + (size_t)blk*64);
+        #define SDOT3_ROW(R, AA, BB, CC)                                       \
+            do {                                                               \
+                svint8_t wv = svld1_s8(pb, qs + (size_t)(R)*64);               \
+                float ws = ggml_fp16_to_fp32(scl[R]);                          \
+                AA = svmla_x(pg, AA, svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), wv, xv0)), svdup_f32(ws*s0)); \
+                BB = svmla_x(pg, BB, svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), wv, xv1)), svdup_f32(ws*s1)); \
+                CC = svmla_x(pg, CC, svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), wv, xv2)), svdup_f32(ws*s2)); \
+            } while (0)
+        SDOT3_ROW(0,a0,b0,c0); SDOT3_ROW(1,a1,b1,c1); SDOT3_ROW(2,a2,b2,c2); SDOT3_ROW(3,a3,b3,c3);
+        SDOT3_ROW(4,a4,b4,c4); SDOT3_ROW(5,a5,b5,c5); SDOT3_ROW(6,a6,b6,c6); SDOT3_ROW(7,a7,b7,c7);
+        #undef SDOT3_ROW
+    }
+    dst0[0]=svaddv(pg,a0);dst0[1]=svaddv(pg,a1);dst0[2]=svaddv(pg,a2);dst0[3]=svaddv(pg,a3);
+    dst0[4]=svaddv(pg,a4);dst0[5]=svaddv(pg,a5);dst0[6]=svaddv(pg,a6);dst0[7]=svaddv(pg,a7);
+    dst1[0]=svaddv(pg,b0);dst1[1]=svaddv(pg,b1);dst1[2]=svaddv(pg,b2);dst1[3]=svaddv(pg,b3);
+    dst1[4]=svaddv(pg,b4);dst1[5]=svaddv(pg,b5);dst1[6]=svaddv(pg,b6);dst1[7]=svaddv(pg,b7);
+    dst2[0]=svaddv(pg,c0);dst2[1]=svaddv(pg,c1);dst2[2]=svaddv(pg,c2);dst2[3]=svaddv(pg,c3);
+    dst2[4]=svaddv(pg,c4);dst2[5]=svaddv(pg,c5);dst2[6]=svaddv(pg,c6);dst2[7]=svaddv(pg,c7);
+}
+#endif /* __ARM_FEATURE_SVE (8-row bf16/sdot kernels) */
+
+/* ========================================================================
+ * DeepSeek-V4-Flash on-demand dequant matvecs (split-layout FP8 + MXFP4).
+ *
+ * These live in the always-available (non-IMPLEMENTATION) region because they
+ * are static-inline kernels emitted into every TU that includes this header
+ * (ds4f.h / ds4f_runner.c). They keep weights quantized in HBM and dequant a
+ * panel into registers per token, in the proven 8-accumulator + final-svaddv
+ * shape. M=1 decode is HBM-BW-bound, so DRAM B/elem (FP8 ~1.0, MXFP4 ~0.53)
+ * is what matters; the f32 unpack overlaps HBM latency across 48 threads.
+ * ======================================================================== */
+
+/* Standard OCP MX E8M0 scale: biased exponent, value = 2^(x - 127).
+ * x==0xff is NaN (avoid in synthetic fill); x==0 maps to +0 here (OCP spec
+ * value 2^-127, irrelevant for the harness). NOTE: distinct from the GGML
+ * ggml_e8m0_to_fp32_half() which folds an extra ×0.5 — do NOT use that one. */
+static inline float ggml_e8m0_to_fp32(uint8_t x) {
+    uint32_t bits = (uint32_t)x << 23;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+/* MXFP4 e2m1 code -> value, as f32 (svtbl_f32 table form of kvalues_mxfp4). */
+static const float ds4f_kvalues_mxfp4_f32[16] = {
+    0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f,
+    0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f,
+};
+
+/* FP8 E4M3 (bias 7, exp==15 => NaN, no Inf) -> f32 bit pattern. Scalar form
+ * lifted from a64fx/fp8-conv/fp8_convert.h, used to build the 256-entry LUT
+ * the matvec gathers from (LUT gather ~0.70 cyc/elem, the validated winner). */
+static inline uint32_t ds4f_fp8_e4m3_to_fp32_bits(uint8_t x) {
+    uint8_t sign = (x >> 7) & 1;
+    uint8_t exp  = (x >> 3) & 0xF;
+    uint8_t mant = x & 0x7;
+    if (exp == 0) {
+        if (mant == 0) return (uint32_t)sign << 31;
+        int shift = 0;
+        while ((mant & 0x4) == 0) { mant <<= 1; shift++; }
+        mant &= 0x3;
+        exp = 127 - 7 - shift;
+        return ((uint32_t)sign << 31) | ((uint32_t)exp << 23) | ((uint32_t)mant << 20);
+    }
+    if (exp == 15) /* NaN */
+        return ((uint32_t)sign << 31) | (0xFFu << 23) | ((uint32_t)mant << 20);
+    uint32_t new_exp = exp + (127 - 7);
+    return ((uint32_t)sign << 31) | (new_exp << 23) | ((uint32_t)mant << 20);
+}
+
+/* Fill a caller-provided 256-entry LUT (call once at model init). */
+static inline void ds4f_init_fp8_e4m3_lut(uint32_t *lut) {
+    for (int i = 0; i < 256; i++) lut[i] = ds4f_fp8_e4m3_to_fp32_bits((uint8_t)i);
+}
+
+#if defined(__ARM_FEATURE_SVE)
+/* FP8 E4M3 dense matvec, 8 rows, on-demand dequant via L1-resident LUT gather.
+ * Weight = row-major FP8 bytes (1 B/elem); scale = per 128×128 block E8M0.
+ * The 8 rows are one row-block (caller keeps groups 8-aligned, and 128 is a
+ * multiple of 8 so a group never straddles a 128-row boundary), so for each
+ * 128-col tile a single E8M0 scalar applies to all 8 rows -> fold it into x
+ * once and reuse across the 8 gather+FMA streams. K must be a multiple of 128.
+ *   escale[cb] = E8M0 scale for (this row-block, col-block cb), length K/128. */
+static inline void matvec_fp8e4m3_8row(float *dst,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *escale, const uint32_t *lut,
+        const float *x, int K) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t a0 = svdup_f32(0.f), a1 = svdup_f32(0.f);
+    svfloat32_t a2 = svdup_f32(0.f), a3 = svdup_f32(0.f);
+    svfloat32_t a4 = svdup_f32(0.f), a5 = svdup_f32(0.f);
+    svfloat32_t a6 = svdup_f32(0.f), a7 = svdup_f32(0.f);
+    int vl = (int)svcntw();
+    for (int c0 = 0; c0 < K; c0 += 128) {
+        float s = ggml_e8m0_to_fp32(escale[c0 >> 7]);
+        svfloat32_t vs = svdup_f32(s);
+        for (int c = c0; c < c0 + 128; c += vl) {
+            svfloat32_t vxs = svmul_x(pg, svld1(pg, &x[c]), vs);
+            #define FP8_ROW(W, ACC) do {                                       \
+                svuint32_t idx  = svld1ub_u32(pg, (W) + c);                     \
+                svuint32_t bits = svld1_gather_u32index_u32(pg, lut, idx);      \
+                ACC = svmla_x(pg, ACC, svreinterpret_f32_u32(bits), vxs);       \
+            } while (0)
+            FP8_ROW(w0, a0); FP8_ROW(w1, a1); FP8_ROW(w2, a2); FP8_ROW(w3, a3);
+            FP8_ROW(w4, a4); FP8_ROW(w5, a5); FP8_ROW(w6, a6); FP8_ROW(w7, a7);
+            #undef FP8_ROW
+        }
+    }
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* Enable flush-to-zero (FPCR.FZ, bit 24) on the CURRENT thread. The magic FP8
+ * decode below builds a transient f32 subnormal (the multiply input) for E4M3
+ * subnormals; A64FX penalizes denormal operands by ~3.5x, so FTZ (flush those
+ * to 0) is REQUIRED for the magic path to win. Acceptable for the synthetic
+ * harness (values meaningless; E4M3 subnormals -> 0). Idempotent + per-thread. */
+static inline void ds4f_set_ftz(void) {
+    uint64_t fpcr; __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ull << 24); __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr));
+}
+
+/* FP8 E4M3 -> f32 via the DENORMAL MAGIC-MULTIPLY (no LUT, no gather, no select):
+ * build a tiny f32 from the 7 low bits, one fmul by 2^120 renormalizes BOTH
+ * normals and subnormals in hardware, then re-apply sign. ~6 ops/lane. REQUIRES
+ * FTZ (ds4f_set_ftz) on every calling thread or the subnormal multiply input
+ * triggers A64FX denormal microcode. exp==15 maps to a finite <=480 (not NaN),
+ * which is harmless / desirable for the harness. */
+static inline svfloat32_t ds4f_fp8_decode_magic_u32(svbool_t pg, svuint32_t b) {
+    svuint32_t sign = svlsl_n_u32_x(pg, svand_n_u32_x(pg, b, 0x80u), 24);
+    svuint32_t mag  = svlsl_n_u32_x(pg, svand_n_u32_x(pg, b, 0x7Fu), 20);
+    svfloat32_t f   = svmul_n_f32_x(pg, svreinterpret_f32_u32(mag), 0x1.0p+120f);
+    return svreinterpret_f32_u32(svorr_u32_x(pg, sign, svreinterpret_u32_f32(f)));
+}
+
+/* FP8 E4M3 dense matvec, 8 rows, magic-decode variant. Same args/contract as
+ * matvec_fp8e4m3_8row EXCEPT no LUT (decode is arithmetic). Packed 64-byte
+ * svld1_u8 load + svunpk to four u32 sub-vectors, magic-decode each, FMA against
+ * the per-128-block-scaled x. Faster than the gather variant in the HBM-stream
+ * (M=1 decode) regime: holds 75-140 Gmac/s vs the gather's 73-118 (+2..18%) and
+ * ~1.7-3x over bf16-predequant. Callers MUST ds4f_set_ftz() on each thread. */
+static inline void matvec_fp8e4m3_8row_magic(float *dst,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *escale, const float *x, int K) {
+    svbool_t pg = svptrue_b32();
+    svbool_t pb = svptrue_b8();
+    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f);
+    svfloat32_t a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
+    int vlb = (int)svcntb();   /* 64 bytes / iter on A64FX */
+    for (int c0 = 0; c0 < K; c0 += 128) {
+        float s = ggml_e8m0_to_fp32(escale[c0 >> 7]);
+        svfloat32_t vs = svdup_f32(s);
+        for (int c = c0; c < c0 + 128; c += vlb) {
+            svfloat32_t vx0 = svmul_x(pg, svld1(pg,&x[c]),    vs);
+            svfloat32_t vx1 = svmul_x(pg, svld1(pg,&x[c+16]), vs);
+            svfloat32_t vx2 = svmul_x(pg, svld1(pg,&x[c+32]), vs);
+            svfloat32_t vx3 = svmul_x(pg, svld1(pg,&x[c+48]), vs);
+            #define FP8_MAGIC_ROW(W, ACC) do {                                  \
+                svuint8_t  b   = svld1_u8(pb, (W) + c);                          \
+                svuint16_t l16 = svunpklo_u16(b), h16 = svunpkhi_u16(b);         \
+                svfloat32_t f0 = ds4f_fp8_decode_magic_u32(pg, svunpklo_u32(l16)); \
+                svfloat32_t f1 = ds4f_fp8_decode_magic_u32(pg, svunpkhi_u32(l16)); \
+                svfloat32_t f2 = ds4f_fp8_decode_magic_u32(pg, svunpklo_u32(h16)); \
+                svfloat32_t f3 = ds4f_fp8_decode_magic_u32(pg, svunpkhi_u32(h16)); \
+                ACC = svmla_x(pg, ACC, f0, vx0);                                 \
+                ACC = svmla_x(pg, ACC, f1, vx1);                                 \
+                ACC = svmla_x(pg, ACC, f2, vx2);                                 \
+                ACC = svmla_x(pg, ACC, f3, vx3);                                 \
+            } while (0)
+            FP8_MAGIC_ROW(w0,a0); FP8_MAGIC_ROW(w1,a1); FP8_MAGIC_ROW(w2,a2); FP8_MAGIC_ROW(w3,a3);
+            FP8_MAGIC_ROW(w4,a4); FP8_MAGIC_ROW(w5,a5); FP8_MAGIC_ROW(w6,a6); FP8_MAGIC_ROW(w7,a7);
+            #undef FP8_MAGIC_ROW
+        }
+    }
+    dst[0]=svaddv(pg,a0); dst[1]=svaddv(pg,a1); dst[2]=svaddv(pg,a2); dst[3]=svaddv(pg,a3);
+    dst[4]=svaddv(pg,a4); dst[5]=svaddv(pg,a5); dst[6]=svaddv(pg,a6); dst[7]=svaddv(pg,a7);
+}
+
+/* Split-layout MXFP4 (e2m1) expert matvec, 8 rows, W4A16 f32 (svtbl unpack).
+ * Weight = row-major packed nibbles (K/2 B/row); scale = per-32-block E8M0
+ * (K/32 B/row, per-row, unlike FP8's shared block). DRAM ~0.53 B/elem.
+ * Layout per 32-block of 16 bytes (matches dequantize_row_mxfp4): byte j low
+ * nibble -> element j, high nibble -> element j+16. Unpack both halves to f32
+ * via svtbl_f32 over the 16-entry kvalues table, accumulate the unscaled block
+ * dot, fold the per-row E8M0 scalar via one svmla. K must be a multiple of 32.
+ *   wr[r]: K/2 nibble bytes;  sr[r]: K/32 E8M0 bytes. */
+static inline void matvec_mxfp4_8row(float *dst,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *s0, const uint8_t *s1, const uint8_t *s2, const uint8_t *s3,
+        const uint8_t *s4, const uint8_t *s5, const uint8_t *s6, const uint8_t *s7,
+        const float *x, int K) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0 = svdup_f32(0.f), a1 = svdup_f32(0.f);
+    svfloat32_t a2 = svdup_f32(0.f), a3 = svdup_f32(0.f);
+    svfloat32_t a4 = svdup_f32(0.f), a5 = svdup_f32(0.f);
+    svfloat32_t a6 = svdup_f32(0.f), a7 = svdup_f32(0.f);
+    int nb = K / 32;
+    for (int b = 0; b < nb; b++) {
+        svfloat32_t vxlo = svld1(pg, &x[b * 32]);
+        svfloat32_t vxhi = svld1(pg, &x[b * 32 + 16]);
+        #define MXFP4_ROW(W, S, ACC) do {                                      \
+            svuint32_t braw = svld1ub_u32(pg, (W) + (size_t)b * 16);            \
+            svuint32_t lo = svand_n_u32_x(pg, braw, 0xf);                       \
+            svuint32_t hi = svand_n_u32_x(pg, svlsr_n_u32_x(pg, braw, 4), 0xf); \
+            svfloat32_t wlo = svtbl_f32(kv, lo);                               \
+            svfloat32_t whi = svtbl_f32(kv, hi);                               \
+            svfloat32_t p = svmul_x(pg, wlo, vxlo);                            \
+            p = svmla_x(pg, p, whi, vxhi);                                     \
+            float sc = ggml_e8m0_to_fp32((S)[b]);                             \
+            ACC = svmla_x(pg, ACC, p, svdup_f32(sc));                          \
+        } while (0)
+        MXFP4_ROW(w0, s0, a0); MXFP4_ROW(w1, s1, a1);
+        MXFP4_ROW(w2, s2, a2); MXFP4_ROW(w3, s3, a3);
+        MXFP4_ROW(w4, s4, a4); MXFP4_ROW(w5, s5, a5);
+        MXFP4_ROW(w6, s6, a6); MXFP4_ROW(w7, s7, a7);
+        #undef MXFP4_ROW
+    }
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* Two-token register-blocked MXFP4 matvec for batched (M>1) expert GEMM.
+ * Same per-row svtbl dequant as matvec_mxfp4_8row, but each block's dequantized
+ * weight (wlo/whi) is reused across TWO x-vectors before being discarded, so the
+ * weight nibbles read from L1 once feed both tokens -> when the caller keeps an
+ * 8-row group L1-resident across its token pairs, the weight is read from HBM
+ * once and amortized over all M tokens. Each token's accumulation order (over
+ * blocks) is identical to matvec_mxfp4_8row, so dst0/dst1 are BIT-IDENTICAL to
+ * two separate single-token calls (no cross-token reassociation here). */
+static inline void matvec_mxfp4_8row_2x(float *dst0, float *dst1,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *s0, const uint8_t *s1, const uint8_t *s2, const uint8_t *s3,
+        const uint8_t *s4, const uint8_t *s5, const uint8_t *s6, const uint8_t *s7,
+        const float *x0, const float *x1, int K) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0=svdup_f32(0.f),a1=svdup_f32(0.f),a2=svdup_f32(0.f),a3=svdup_f32(0.f);
+    svfloat32_t a4=svdup_f32(0.f),a5=svdup_f32(0.f),a6=svdup_f32(0.f),a7=svdup_f32(0.f);
+    svfloat32_t b0=svdup_f32(0.f),b1=svdup_f32(0.f),b2=svdup_f32(0.f),b3=svdup_f32(0.f);
+    svfloat32_t b4=svdup_f32(0.f),b5=svdup_f32(0.f),b6=svdup_f32(0.f),b7=svdup_f32(0.f);
+    int nb = K / 32;
+    for (int b = 0; b < nb; b++) {
+        svfloat32_t vxlo0 = svld1(pg, &x0[b*32]), vxhi0 = svld1(pg, &x0[b*32+16]);
+        svfloat32_t vxlo1 = svld1(pg, &x1[b*32]), vxhi1 = svld1(pg, &x1[b*32+16]);
+        #define MXFP4_ROW2(W, S, ACCA, ACCB) do {                              \
+            svuint32_t braw = svld1ub_u32(pg, (W) + (size_t)b * 16);           \
+            svuint32_t lo = svand_n_u32_x(pg, braw, 0xf);                      \
+            svuint32_t hi = svand_n_u32_x(pg, svlsr_n_u32_x(pg, braw, 4), 0xf);\
+            svfloat32_t wlo = svtbl_f32(kv, lo);                              \
+            svfloat32_t whi = svtbl_f32(kv, hi);                              \
+            svfloat32_t vsc = svdup_f32(ggml_e8m0_to_fp32((S)[b]));           \
+            svfloat32_t pa = svmul_x(pg, wlo, vxlo0);                         \
+            pa = svmla_x(pg, pa, whi, vxhi0);                                 \
+            ACCA = svmla_x(pg, ACCA, pa, vsc);                                \
+            svfloat32_t pbv = svmul_x(pg, wlo, vxlo1);                        \
+            pbv = svmla_x(pg, pbv, whi, vxhi1);                               \
+            ACCB = svmla_x(pg, ACCB, pbv, vsc);                               \
+        } while (0)
+        MXFP4_ROW2(w0,s0,a0,b0); MXFP4_ROW2(w1,s1,a1,b1);
+        MXFP4_ROW2(w2,s2,a2,b2); MXFP4_ROW2(w3,s3,a3,b3);
+        MXFP4_ROW2(w4,s4,a4,b4); MXFP4_ROW2(w5,s5,a5,b5);
+        MXFP4_ROW2(w6,s6,a6,b6); MXFP4_ROW2(w7,s7,a7,b7);
+        #undef MXFP4_ROW2
+    }
+    dst0[0]=svaddv(pg,a0); dst0[1]=svaddv(pg,a1); dst0[2]=svaddv(pg,a2); dst0[3]=svaddv(pg,a3);
+    dst0[4]=svaddv(pg,a4); dst0[5]=svaddv(pg,a5); dst0[6]=svaddv(pg,a6); dst0[7]=svaddv(pg,a7);
+    dst1[0]=svaddv(pg,b0); dst1[1]=svaddv(pg,b1); dst1[2]=svaddv(pg,b2); dst1[3]=svaddv(pg,b3);
+    dst1[4]=svaddv(pg,b4); dst1[5]=svaddv(pg,b5); dst1[6]=svaddv(pg,b6); dst1[7]=svaddv(pg,b7);
+}
+#endif /* __ARM_FEATURE_SVE */
+
 /* ======================================================================== */
 #ifdef GGML_DEQUANT_IMPLEMENTATION
 
