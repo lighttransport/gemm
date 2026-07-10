@@ -188,7 +188,7 @@ static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, f
     m->want_full_logits = sampling;   /* sampling reads every logit (temp/top_p/top_k); greedy only needs
                                         * argmax -> lets TP_HEAD decode use the cheap argmax-merge path */
     if (pf_from < 0 || pf_from >= np) pf_from = 0;       /* must prefill >=1 position (for pf_last logits) */
-    if (K < 1) K = 1; if (K > 32) K = 32;
+    if (K < 1) K = 1; if (K > 128) K = 128;   /* verify path caps at 128 */
     if (pf_gemm && !m->has_mtp) {                       /* batched-verify prefill */
         ds4f_alloc_prefill_batch(m, K);
         size_t hcC = (size_t)m->cfg.hc_mult * C;
@@ -197,7 +197,7 @@ static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, f
         for (int base = pf_from; base < np; base += K) {
             int M = np - base < K ? np - base : K; lastM = M;
             for (int mm = 0; mm < M; mm++) embed_lookup(m, pids[base+mm], Xin + (size_t)mm*C);
-            int ot[32]; ds4f_forward_verify(m, Xin, M, base, ot, vhc); pf_last = ot[M-1];
+            int ot[128]; ds4f_forward_verify(m, Xin, M, base, ot, vhc); pf_last = ot[M-1];
         }
         free(Xin); free(vhc);
         /* first-token sampling needs the last prompt position's logits; verify leaves them in
@@ -952,7 +952,7 @@ int main(int argc,char**argv){
          * seeds the same decode. Not with MTP (per-token MTP KV maintenance). */
         int pf_gemm = gen_mode && !mtp_on && envi("DS4F_PREFILL_GEMM", 0);
         if (pf_gemm) {
-            int K = envi("DS4F_PREFILL_K", 32); if (K < 1) K = 1; if (K > 32) K = 32;
+            int K = envi("DS4F_PREFILL_K", 32); if (K < 1) K = 1; if (K > 128) K = 128;   /* verify path caps at 128 */
             ds4f_alloc_prefill_batch(m, K);
             size_t hcC = (size_t)m->cfg.hc_mult * C;
             float *Xin = (float *)aligned_alloc(64, (size_t)K * C * 4);
@@ -961,7 +961,7 @@ int main(int argc,char**argv){
             for (int base = 0; base < prefill; base += K) {
                 int M = prefill - base < K ? prefill - base : K; Mlast = M;
                 for (int mm = 0; mm < M; mm++) embed_lookup(m, prompt_ids[base + mm], Xin + (size_t)mm * C);
-                m->bytes_read = 0; int ot[8];
+                m->bytes_read = 0; int ot[128];   /* verify writes M<=K argmaxes (was ot[8]: overrun at K>8) */
                 ds4f_forward_verify(m, Xin, M, base, ot, vhc);
                 pf_bytes += m->bytes_read; pf_last_tok = ot[M - 1];
             }

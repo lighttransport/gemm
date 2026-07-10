@@ -4916,11 +4916,26 @@ static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
         }
     }
 }
+/* DS4F_PF_TP (P2 verify compose, default off): COMPUTE-shard the verify-path shared + o-proj
+ * GEMMs across the EP ranks by rank-slicing the REPLICATED dense tensors at GEMM time — the
+ * memory-neutral sibling of the load-time DS4F_TP_SHARED/TP_OPROJ shards. The M=1 decode path
+ * (latency-bound; an extra per-layer reduce costs ~296 us x 43 = ~13 ms/tok) is untouched and
+ * stays bit-exact; only the batched verify (DS4F_PREFILL_GEMM prefill / decode-batch) shards,
+ * where the +1 [K,C] o-proj reduce amortizes /K and the shared partial folds into the existing
+ * routed reduce (zero extra comm). Q8-safe per tools/ws7_tp_q8_test: row-shard = bit-exact
+ * (Case B), contraction zero-pad boundaries 64-aligned = no quant-block straddle (Case C). */
+static int ds4f_pf_tp = -1;
+static inline int ds4f_pf_tp_on(ds4f_model *m) {
+    if (ds4f_pf_tp < 0) { const char *e = getenv("DS4F_PF_TP"); ds4f_pf_tp = e ? atoi(e) : 0; }
+    return ds4f_pf_tp && m->ar_cb && m->ep_size > 1;
+}
 static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, int *out_tok, float *out_hc) {
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
     float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
-    float pa[32][16], ca[32][64], pf[32][16], cf[32][64];    /* per-position sinkhorn weights (K<=32 for batched prefill) */
+    int pftp = ds4f_pf_tp_on(m);
+    float pa[128][16], ca[128][64], pf[128][16], cf[128][64];  /* per-position sinkhorn weights (K<=128, ~80 KB stack) */
+    if (K > 128) { fprintf(stderr, "ds4f_forward_verify: K=%d > 128\n", K); abort(); }
     if (!m->v_x4) { size_t vb = (size_t)m->m_tile*hcC*4;
         m->v_x4 = (float *)aligned_alloc(256, vb); m->v_resid = (float *)aligned_alloc(256, vb); }
     for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
@@ -4938,6 +4953,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
                           m->p_x, &pa[0][0], 16, &ca[0][0], 64);
+        VTOC(DS4F_P_MHCPRE); VTIC();
         /* batched q/kv projections */
         { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
@@ -4990,30 +5006,72 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         if (m->dec_batch_seq) ds4f_lseq_apply(ly, &m->dec_batch_seq[L]);   /* restore set 0 (seq 0) */
         VTOC(DS4F_P_TB2PREP);   /* whole per-position loop (glue = tb2prep - attn - tb2* subtimers) */
         VTIC();
-        /* batched grouped low-rank o-projection (no-TP) */
-        for (int g = 0; g < og; g++) {
+        /* batched grouped low-rank o-projection, optionally o_inter-sharded across the EP ranks:
+         *   - tpo (load-time DS4F_TP_OPROJ): ly->wo_a holds only rows [oi0, oi0+oi_rows).
+         *   - pftp (DS4F_PF_TP): wo_a is REPLICATED; this rank COMPUTES only its 64-aligned
+         *     o_inter slice (rank-sliced view), a memory-neutral compute shard.
+         * Either way: full wo_b over the zero-padded p_o1 -> per-node PARTIAL p_o, ar_cb-SUMMED
+         * to full BEFORE the mHC attn-post (nonlinear in p_o, so this reduce can't be folded
+         * into the routed reduce like the shared partial). Q8-safe: row-shard = disjoint outputs
+         * from an identically-quantized full input (bit-exact, ws7_tp_q8_test Case B); the wo_b
+         * contraction zero-pad boundary is 64-aligned so no quant block straddles (Case C). */
+        int tpo = (m->oi_rows < c->o_inter);
+        int oi0 = m->oi0, oi_rows = m->oi_rows, o_loc0 = 0;   /* o_loc0 = tensor-local row of oi0 */
+        if (!tpo && pftp) {
+            int a0, a1; ds4f_tp_rowshard(c->o_inter, m->ep_size, m->ep_rank, 64, &a0, &a1);
+            oi0 = a0; oi_rows = a1 - a0; o_loc0 = a0; tpo = (oi_rows < c->o_inter);
+        }
+        if (tpo) {
+            memset(m->p_o1, 0, (size_t)K*c->o_inter*4);
+            int olora = c->o_lora, g_lo = oi0 / olora, g_hi = (oi0 + oi_rows - 1) / olora;
+            for (int g = g_lo; g <= g_hi; g++) {
+                int rlo = g*olora > oi0 ? g*olora : oi0;
+                int rhi = (g+1)*olora < oi0 + oi_rows ? (g+1)*olora : oi0 + oi_rows;
+                ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, rlo - oi0 + o_loc0, rhi - rlo);
+                ds4f_gemm(m, m->p_o1 + rlo, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
+            }
+        } else for (int g = 0; g < og; g++) {
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
             ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
         }
-        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
+        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);   /* p_o = PARTIAL if tpo */
+        VTOC(DS4F_P_OPROJ); VTIC();
+        if (tpo && m->ar_cb) m->ar_cb(m->p_o, C*K, m->ar_ctx);        /* sum partials -> full attn out */
+        VTOC(DS4F_P_COMM); VTIC();
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pa[0][0], 16, &ca[0][0], 64);  /* mHC post (attn) */
+        VTOC(DS4F_P_MHCPOST); VTIC();
         VTOC(DS4F_P_OPROJ);   /* o-proj GEMMs + mHC-attn-post */
         VTIC();
         /* mHC pre (ffn) */
         memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
                           m->p_x, &pf[0][0], 16, &cf[0][0], 64);
+        VTOC(DS4F_P_MHCPRE); VTIC();
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
         VTOC(DS4F_P_SHARED);   /* mHC-ffn-pre + ffn-norm (shared-expert GEMMs timed in EXPERTS below) */
         VTIC();
-        /* shared expert (no-TP) */
-        ds4f_gemm(m, m->p_shg, &ly->sh_w1, m->p_h2, K, c->shared_inter, C);
-        ds4f_gemm(m, m->p_shu, &ly->sh_w3, m->p_h2, K, c->shared_inter, C);
+        /* shared expert, optionally shared_inter-sharded (loaded DS4F_TP_SHARED shard, or the
+         * memory-neutral DS4F_PF_TP rank-sliced view of the replicated sh_w1/w3): write the
+         * [shr0, shr0+shrows) columns of a zero-padded [K, shared_inter] buffer; full sh_w2
+         * over the zero-pad -> per-node PARTIAL p_moe, folded into the routed [K,C] reduce
+         * below (ZERO extra comm, mirrors ds4f_forward_prefill's tps). 64-aligned shard
+         * boundary keeps the Q8 quantize of the zero-padded p_shg straddle-free. */
+        int tps = (m->sh_rows < c->shared_inter), shr0 = m->sh_r0;
+        ds4f_tensor w1v = ly->sh_w1, w3v = ly->sh_w3;
+        if (!tps && pftp) {
+            int a0, a1; ds4f_tp_rowshard(c->shared_inter, m->ep_size, m->ep_rank, 64, &a0, &a1);
+            if (a1 - a0 < c->shared_inter) { tps = 1; shr0 = a0;
+                w1v = ds4f_row_slice(&ly->sh_w1, a0, a1 - a0);
+                w3v = ds4f_row_slice(&ly->sh_w3, a0, a1 - a0); }
+        }
+        if (tps) { memset(m->p_shg, 0, (size_t)K*c->shared_inter*4); memset(m->p_shu, 0, (size_t)K*c->shared_inter*4); }
+        ds4f_gemm(m, m->p_shg + shr0, &w1v, m->p_h2, K, c->shared_inter, C);
+        ds4f_gemm(m, m->p_shu + shr0, &w3v, m->p_h2, K, c->shared_inter, C);
         { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, K,
                                     c->shared_inter, c->shared_inter, c->swiglu_limit };
           ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
-        ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);
+        ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);   /* PARTIAL if tps */
         /* router + routed experts (bucketed batched GEMM, reuse the prefill scheme) */
         ds4f_gemm(m, m->p_router, &ly->gate, m->p_h2, K, c->n_experts, C);
         { int no = ly->n_owned;
@@ -5044,13 +5102,20 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                   float *route = m->p_route + (size_t)k*C; const float *o = m->p_exO + (size_t)p*C;
                   for (int i = 0; i < C; i++) route[i] += w * o[i]; }
           } }
+        if (tps) for (int k = 0; k < K; k++) {                       /* TP_SHARED: fold the partial shared
+                                                                      * into the routed reduce (one reduce) */
+            float *mo = m->p_moe + (size_t)k*C, *ro = m->p_route + (size_t)k*C;
+            for (int i = 0; i < C; i++) ro[i] += mo[i];
+        }
+        VTOC(DS4F_P_EXPERTS); VTIC();
         if (m->ar_cb) m->ar_cb(m->p_route, C*K, m->ar_ctx);          /* EP combine: one [K,C] reduce */
+        VTOC(DS4F_P_COMM); VTIC();
         for (int k = 0; k < K; k++) {                                /* moe out = shared + routed */
             float *mo = m->p_moe + (size_t)k*C, *ro = m->p_route + (size_t)k*C, *o = m->p_o + (size_t)k*C;
-            for (int i = 0; i < C; i++) o[i] = mo[i] + ro[i];
+            for (int i = 0; i < C; i++) o[i] = (tps ? 0.f : mo[i]) + ro[i];
         }
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pf[0][0], 16, &cf[0][0], 64);  /* mHC post (ffn) */
-        VTOC(DS4F_P_EXPERTS);   /* shared+routed experts + router + EP comm + mHC-ffn-post */
+        VTOC(DS4F_P_MHCPOST);   /* (EXPERTS closed above; COMM = the [K,C] reduces) */
     }
     m->s_idx_qpre = NULL;   /* clear the batched-prefill qproj injection so decode's index_step recomputes */
     VTIC();
