@@ -149,6 +149,14 @@ static inline int ds4f_tp_attn_shard(int n_heads, int ep_rank, int ep_size, int 
     if (!s || ep_size <= 1) { *h0 = 0; *h1 = n_heads; return 0; }
     ds4f_tp_rowshard(n_heads, ep_size, ep_rank, 1, h0, h1); return 1;
 }
+/* Dense-TP shard alignment for the CONTRACTION-side shards (shared_inter, o_inter).
+ * bf16 needs 8 (kernel row blocking); Q8 W8A8 additionally needs the zero-pad boundary
+ * on a 64-quant-block edge — an 8-aligned boundary makes a 64-block STRADDLE ownership,
+ * so the straddled block's absmax (hence quantization) differs from the full-vector
+ * quantize (measured relL2 1.5e-3 vs 1.5e-7, tools/ws7_tp_q8_test.c Case C). 64 is a
+ * multiple of 8 so it is safe for plain bf16 too; FP8 keeps 128 (scale-block edge,
+ * itself a 64-multiple). Head/embed shards stay 8 (row-shard output, no contraction). */
+#define DS4F_TP_DENSE_ALIGN(is_bf16) ((is_bf16) ? 64 : 128)
 /* DS4F_TP_OPROJ: row-shard wo_a by o_inter (align 128 for FP8). The block-diagonal kernel
  * picks each row's group via (goff+i)/o_lora, so the shard need NOT align to groups. wo_b stays
  * replicated (it contracts the full o_inter, reconstructed by summing the partial s_o). The
@@ -305,6 +313,17 @@ static int ds4f_repack_bf16pv_to_q8pv_ex(ds4f_model *m, ds4f_tensor *t, int recl
     if (q8 == MAP_FAILED) return 0;
 #ifdef MADV_NOHUGEPAGE
     madvise(q8, bytes, MADV_NOHUGEPAGE);
+#endif
+#if defined(__linux__)
+    /* DS4F_Q8_LOCAL: exempt the q8 weight buffer from the process-wide MPOL_INTERLEAVE
+     * (DS4F_NUMA=1) so its pages first-touch LOCAL to the repack worker that fills them —
+     * ds4f_q8repack_worker uses the SAME group split as the matvec rowsplit8, so each CMG's
+     * matvec then reads its own HBM stack (bench: reader-local ~610 GB/s vs interleave ~330).
+     * Default off (A/B gate); bit-identical (page placement only). MPOL_LOCAL == 4. */
+    {   static int q8local = -1;
+        if (q8local < 0) { const char *e = getenv("DS4F_Q8_LOCAL"); q8local = e ? atoi(e) : 0; }
+        if (q8local) syscall(SYS_mbind, q8, bytes, 4 /*MPOL_LOCAL*/, NULL, 0UL, 0UL);
+    }
 #endif
     void *old = t->w; size_t oldb = ds4f_wbytes(DS4F_BF16_PV, N, K);
     ds4f_q8repack_task T = { (const uint16_t *)t->w, (uint8_t *)q8, N, K };
@@ -1875,17 +1894,17 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
         int qbr = (ah1 - ah0) * c->q_head_dim;
         per_layer += ds4f_wbytes(dq, qbr, c->q_lora) + ds4f_sbytes(dq, qbr, c->q_lora) + 2*pad; }
     per_layer += ds4f_wbytes(dq, c->kv_lora, c->hidden) + ds4f_sbytes(dq, c->kv_lora, c->hidden) + 2*pad;
-    {   int oir0, oirows; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &oir0, &oirows);  /* wo_a (TP o_inter shard) */
+    {   int oir0, oirows; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(dense_bf16), &oir0, &oirows);  /* wo_a (TP o_inter shard) */
         int gin = c->n_heads * c->q_head_dim / c->o_groups;  /* wo_a cols (== hidden for ds4f only) */
         per_layer += ds4f_wbytes(dq, oirows, gin) + ds4f_sbytes(dq, oirows, gin) + 2*pad; }
-    {   int oir0, oir; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &oir0, &oir);
+    {   int oir0, oir; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(dense_bf16), &oir0, &oir);
         int wob_c = c->o_inter;                               /* wo_b (DS4F_TP_WOB: FP8 o_inter col-shard) */
         if (oir < c->o_inter && !dense_bf16 && getenv("DS4F_TP_WOB") && atoi(getenv("DS4F_TP_WOB"))) wob_c = oir;
         per_layer += ds4f_wbytes(dq, c->hidden, wob_c) + ds4f_sbytes(dq, c->hidden, wob_c) + 2*pad; }
     per_layer += (size_t)c->n_heads*4 + pad;
     /* MoE */
     per_layer += ds4f_wbytes(DS4F_BF16, c->n_experts, c->hidden) + pad;            /* router */
-    {   int shr0, shrows; ds4f_tp_shared_shard(c->shared_inter, ep_rank, ep_size, dense_bf16 ? 8 : 128, &shr0, &shrows);  /* sh_w1+sh_w3 (TP col-shard) */
+    {   int shr0, shrows; ds4f_tp_shared_shard(c->shared_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(dense_bf16), &shr0, &shrows);  /* sh_w1+sh_w3 (TP col-shard) */
         per_layer += 2*(ds4f_wbytes(dq, shrows, c->hidden) + ds4f_sbytes(dq, shrows, c->hidden)) + 4*pad; }
     per_layer += ds4f_wbytes(dq, c->hidden, c->shared_inter) + ds4f_sbytes(dq, c->hidden, c->shared_inter) + 2*pad;  /* sh_w2 (replicated) */
     size_t per_ex = ds4f_wbytes(DS4F_MXFP4, c->moe_inter, c->hidden) + ds4f_sbytes(DS4F_MXFP4, c->moe_inter, c->hidden)
@@ -2229,9 +2248,9 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, erows, C); m->embed = (uint16_t *)embed.w; /* flat gather */
     {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }     /* matvec'd -> pv when enabled */
-    ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
+    ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(m->dense_qt != DS4F_FP8), &m->sh_r0, &m->sh_rows);
     ds4f_tp_attn_shard(cfg.n_heads, ep_rank, ep_size, &m->attn_h0, &m->attn_h1);  /* DS4F_TP_ATTN: head range */
-    ds4f_tp_oproj_shard(cfg.o_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->oi0, &m->oi_rows);  /* DS4F_TP_OPROJ: wo_a o_inter shard */
+    ds4f_tp_oproj_shard(cfg.o_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(m->dense_qt != DS4F_FP8), &m->oi0, &m->oi_rows);  /* DS4F_TP_OPROJ: wo_a o_inter shard */
     {   int hc = cfg.hc_mult, hd = hc*C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc*hd*4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc*4, 64);
@@ -2915,9 +2934,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
       ds4f_tensor embed = ds4f_new_tensor(m, DS4F_BF16, erows, C); m->embed = (uint16_t *)embed.w; }
     {   int hr0, hrows; ds4f_tp_head_shard(cfg.vocab, ep_rank, ep_size, &hr0, &hrows);  /* TP: vocab-shard */
         m->head = ds4f_new_tensor(m, m->bf16_mv_qt, hrows, C); m->head_r0 = hr0; }   /* matvec'd -> pv when promoted */
-    ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->sh_r0, &m->sh_rows);
+    ds4f_tp_shared_shard(cfg.shared_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(m->dense_qt != DS4F_FP8), &m->sh_r0, &m->sh_rows);
     ds4f_tp_attn_shard(cfg.n_heads, ep_rank, ep_size, &m->attn_h0, &m->attn_h1);  /* DS4F_TP_ATTN: head range */
-    ds4f_tp_oproj_shard(cfg.o_inter, ep_rank, ep_size, m->dense_qt == DS4F_FP8 ? 128 : 8, &m->oi0, &m->oi_rows);  /* DS4F_TP_OPROJ: wo_a o_inter shard */
+    ds4f_tp_oproj_shard(cfg.o_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(m->dense_qt != DS4F_FP8), &m->oi0, &m->oi_rows);  /* DS4F_TP_OPROJ: wo_a o_inter shard */
     {   int hc = cfg.hc_mult, hd = hc * C;
         m->hc_head_fn    = (float *)ds4f_bump(m, (size_t)hc * hd * 4, 256);
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc * 4, 64);
