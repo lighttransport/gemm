@@ -71,6 +71,14 @@ else
   export DS4F_PREFILL_GEMM=${DS4F_PREFILL_GEMM:-1}   # fast ceiling: keep batched-verify prefill (+74%)
 fi
 
+# ---- 2026-07-10 session levers (all real-weight 11n A/B'd; see ds4f.md "2026-07-10 session") ----
+export DS4F_HC_SVE=${DS4F_HC_SVE:-1}         # SVE mHC (decode +12%: mhc_pre 10.1->2.7 ms; SVE batch mHC in prefill)
+export DS4F_PF_TP=${DS4F_PF_TP:-1}           # compute-shard verify shared+o-proj (prefill; decode untouched)
+export DS4F_PREFILL_K=${DS4F_PREFILL_K:-64}  # verify chunk sweet spot (K=32 -> 64: comm /2; 128 payload-bound)
+export DS4F_MV_FUSE=${DS4F_MV_FUSE:-1}       # wq_a+wkv one dispatch (bit-exact)
+export DS4F_TP_HEAD=${DS4F_TP_HEAD:-1}       # vocab-shard head: greedy decode -1.5 ms via argmax-merge
+export DS4F_TP_EMBED=${DS4F_TP_EMBED:-1}     # vocab-shard embed (-0.97 GB, bit-exact)
+
 # ---- launch the persistent 11-node runner in the background (loops until killed) ----
 echo "[serve] launching 11-node runner (loads once, ~2-3 min)... log: $LOG"
 ( ./run_ds4f_11n.sh > "$LOG" 2>&1 ) &

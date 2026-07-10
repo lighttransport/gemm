@@ -35,6 +35,12 @@ export DS4F_TP_EMBED=${DS4F_TP_EMBED:-1}
 # not bit-identical (K-tile GEMM reassoc). Default ON for agentic coding (accepts a valid greedy path);
 # set DS4F_PREFILL_GEMM=0 for bit-reproducible token-by-token prefill.
 export DS4F_PREFILL_GEMM=${DS4F_PREFILL_GEMM:-1}
+# 2026-07-10 session levers (real-weight 11n A/B'd; ds4f.md "2026-07-10 session"): SVE mHC
+# (decode +12%), verify compute-shard + K=64 chunks (prefill 23.3->29.3 tok/s), wq_a+wkv fuse.
+export DS4F_HC_SVE=${DS4F_HC_SVE:-1}
+export DS4F_PF_TP=${DS4F_PF_TP:-1}
+export DS4F_PREFILL_K=${DS4F_PREFILL_K:-64}
+export DS4F_MV_FUSE=${DS4F_MV_FUSE:-1}
 case "$KVBITS" in
   16) export DS4F_INT8_KV=0; CEIL="~16k safe" ;;
   8)  export DS4F_INT8_KV=1; CEIL="~16k+ (int8; add DS4F_INT8_CMP=1)" ;;
