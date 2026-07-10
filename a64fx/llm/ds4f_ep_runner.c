@@ -1023,6 +1023,13 @@ int main(int argc,char**argv){
     }
 
     /* ---- decode (M=1, token-at-a-time) ---- */
+    if (envi("DS4F_PROF", 0) && MyRank == 0 && prefill > 0) {   /* prefill verify-section profile (before the decode reset) */
+        logmsg("per-phase PREFILL (ms/tok over %d tok):\n", prefill);
+        for (int i = 0; i < DS4F_NPHASE; i++)
+            if (m->prof[i] > 0)
+                logmsg("  %-10s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i],
+                       m->prof[i] / prefill * 1e3, 100.0 * m->prof[i] / (t_pf > 0 ? t_pf : 1));
+    }
     memset(m->prof, 0, sizeof(m->prof));
     double t_dec0 = now_sec(); size_t dec_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int last_tok = 0;
