@@ -52,6 +52,10 @@ typedef struct {
     int             robust;                  /* TP_AR_ROBUST: 0=passive spin, 1=drain+civac per spin,
                                               * 2=LEAN decode path (amortized drain + civac every 64 spins) */
     uint64_t        seq;                     /* monotonic call counter            */
+    /* --- TP_AR_A2A: direct all-to-all sum for small (decode-size) payloads --- */
+    int             a2a;                     /* TP_AR_A2A=1: enable */
+    int             a2a_max;                 /* max elems for the a2a path (TP_AR_A2A_MAX, clamped to max_count) */
+    size_t          a2a_base, a2a_slot;      /* dedicated recv region: 2 generations x nprocs slots */
     /* --- TP_AR_ACK: ack/retransmit reliability prototype (default off) --- */
     int             ack;                     /* 1 = reliable send (bounded retransmit + ack) */
     int             ack_retx;                /* max retransmits before optimistic proceed (TP_AR_ACK_RETX) */
@@ -299,9 +303,66 @@ static void tp_ar_recv_copy(tp_comm *c, int sid, int from, float *buf, int count
     if (c->ack) tp_ar_ack_send(c, from, tok);
 }
 
+/* one Put WITHOUT waiting for local TCQ completion (pipelined injection); the caller
+ * polls 'inflight' completions afterwards. BUSY-retry drains one TCQ entry to make room. */
+static int tp_ar_put_nb(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t dst, size_t len) {
+    const unsigned long flags = UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
+    int rc; void *cb;
+    for (;;) { rc = utofu_put(c->vcq, c->peer_vcq[peer], src, dst, len, 0, flags, NULL);
+               if (rc != UTOFU_ERR_BUSY) break; utofu_poll_tcq(c->vcq, 0, &cb); }
+    if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: utofu_put(nb) rc=%d\n", rc); exit(1); }
+    return 1;
+}
+/* TP_AR_A2A sum: Put my payload to EVERY peer's a2a slot[gen][my_rank] (pipelined),
+ * wait all N-1 trailers ONCE, then fold all N payloads in RANK ORDER. One detection
+ * latency instead of ~ceil(log2 N)+2 sequential exchanges; every rank folds the same
+ * buffers in the same order -> bitwise-identical across ranks (lockstep-safe), but the
+ * fold order differs from recursive doubling -> reassoc vs the doubling path (coherent-
+ * class; integer payloads, e.g. tp_ar_ack_test's, sum exactly -> bitwise-equal there).
+ * BW cost x(N-1)/log2(N) -- enabled only for count <= a2a_max (decode-size payloads). */
+static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
+    int N = c->nprocs, me = c->my_rank;
+    char *sb = c->region + tp_ar_slot_off(c, 0);            /* reuse the send slot */
+    size_t pbytes = (size_t)count * sizeof(float);
+    size_t tr = (size_t)c->a2a_max * sizeof(float);         /* a2a slots' fixed trailer offset */
+    memcpy(sb, buf, pbytes);
+    *(volatile uint64_t *)(sb + tr) = tok;                  /* fits: a2a_max <= max_count */
+    int gen = (int)(tok & 1);
+    int inflight = 0; void *cb; int rc;
+    for (int d = 1; d < N; d++) {
+        int peer = (me + d) % N;
+        utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
+        utofu_stadd_t dst = c->peer_base[peer] + c->a2a_base + ((size_t)gen * N + me) * c->a2a_slot;
+        inflight += tp_ar_put_nb(c, peer, src, dst, pbytes);           /* payload */
+        inflight += tp_ar_put_nb(c, peer, src + tr, dst + tr, 8);      /* then trailer (in-order per pair) */
+    }
+    while (inflight > 0) {                                   /* reap local completions */
+        rc = utofu_poll_tcq(c->vcq, 0, &cb);
+        if (rc == UTOFU_SUCCESS) inflight--;
+        else if (rc != UTOFU_ERR_NOT_FOUND) { fprintf(stderr, "tp_ar: a2a poll_tcq rc=%d\n", rc); exit(1); }
+    }
+    tp_ar_drain_mrq(c);
+    for (int r = 0; r < N; r++) {                            /* fold in rank order */
+        const float *pr;
+        if (r == me) pr = (const float *)sb;
+        else {
+            char *rb = c->region + c->a2a_base + ((size_t)gen * N + r) * c->a2a_slot;
+            volatile uint64_t *trl = (volatile uint64_t *)(rb + tr);
+            tp_ar_wait(c, trl, tok, r, "a2a");
+            pr = (const float *)rb;
+        }
+        if (r == 0) memcpy(buf, pr, pbytes);
+        else        for (int i = 0; i < count; i++) buf[i] += pr[i];
+    }
+}
+
 /* in-place sum-all-reduce of buf[0..count). All ranks must pass the same count. */
 static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
     if (c->nprocs == 1) return;
+    if (c->a2a && !c->ack && !c->use_bf16 && count <= c->a2a_max && c->nprocs >= 2) {
+        tp_ar_sum_a2a(c, buf, count, ++c->seq);
+        return;
+    }
     uint64_t tok = ++c->seq;
     int mr = c->my_rank, rem = c->rem;
 
@@ -501,6 +562,15 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
     c->ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
     c->ack_base = (size_t)(1 + TP_AR_NSTEP) * c->slot;
     size_t region_sz = c->ack_base + (c->ack ? (size_t)(nprocs + 1) * TP_AR_LINE : 0);
+    /* TP_AR_A2A recv region: 2 generations x nprocs slots sized for a2a_max elems (small decode
+     * payloads only), appended after the ack region. Generation double-buffering (slot picked by
+     * seq&1) keeps a rank one reduce ahead from overwriting a slot its slow peer hasn't read. */
+    c->a2a = getenv("TP_AR_A2A") ? atoi(getenv("TP_AR_A2A")) : 0;
+    c->a2a_max = getenv("TP_AR_A2A_MAX") ? atoi(getenv("TP_AR_A2A_MAX")) : 8192;
+    if (c->a2a_max > max_count) c->a2a_max = max_count;
+    c->a2a_slot = ((size_t)c->a2a_max * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
+    c->a2a_base = region_sz;
+    if (c->a2a) region_sz += (size_t)2 * nprocs * c->a2a_slot;
     if (posix_memalign((void **)&c->region, TP_AR_LINE, region_sz) != 0) {
         fprintf(stderr, "tp_ar: posix_memalign failed\n"); return -1;
     }
