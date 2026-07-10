@@ -39,7 +39,8 @@ PORT=${PORT:-8080}
 # node-local so rank 0 (an EP node) would never see the controller's request. Default to a home path.
 BASE=${DS4F_SERVE_BASE:-$HOME/.ds4f_serve.${PJM_SUBJOBID:-local}}
 LOG=${DS4F_SERVE_LOG:-/tmp/ds4f_serve_run.log}
-rm -f "$BASE".req "$BASE".resp "$BASE".reqseq "$BASE".respseq   # start from a clean request seq (0)
+rm -f "$BASE".req "$BASE".resp "$BASE".reqseq "$BASE".respseq "$BASE".q.* "$BASE".r.* "$BASE".qhead
+echo 0 > "$BASE".qhead   # continuous-batching queue head (pre-create so the runner sees later writes)
 
 # ---- serve env forwarded to every rank (mpiexec forwards exported env) ----
 export DS4F_SERVE=1
@@ -53,6 +54,7 @@ export DS4F_SERVE_PREFIX_CACHE=${DS4F_SERVE_PREFIX_CACHE:-1}
 export DS4F_SERVE_SLOTS=${DS4F_SERVE_SLOTS:-1}
 # concurrent batched decode: >1 = decode up to N requests together (throughput, greedy). Frontend coalesces.
 export DS4F_SERVE_BATCH=${DS4F_SERVE_BATCH:-1}
+export DS4F_SERVE_DYNAMIC=${DS4F_SERVE_DYNAMIC:-0}  # 1 = continuous batching (mid-flight admission)
 # SYSCACHE: preload a persisted context (built once with a cache_save request) into slot 0 so every
 # conversation starts with the system prompt already prefilled -- instant TTFT, survives restarts.
 [ -n "$DS4F_SERVE_SYSCACHE" ] && export DS4F_SERVE_SYSCACHE
@@ -96,11 +98,11 @@ trap 'echo "[serve] stopping"; kill $RUNNER_PID 2>/dev/null; pkill -f "org/mpiex
 # the "SERVE ready" banner goes to the per-rank file (mpiexec does not forward rank stdout), not $LOG
 READY=ds4f_ep_rank00.txt
 for i in $(seq 1 180); do
-    grep -qE 'SERVE(-BATCH)? ready' "$READY" 2>/dev/null && break
+    grep -qE 'SERVE(-BATCH|-DYNBATCH)? ready' "$READY" 2>/dev/null && break
     kill -0 $RUNNER_PID 2>/dev/null || { echo "[serve] runner died during load; see $LOG"; tail -20 "$LOG"; exit 1; }
     sleep 5
 done
-grep -qE 'SERVE(-BATCH)? ready' "$READY" || { echo "[serve] runner did not become ready in time; see $LOG / $READY"; exit 1; }
+grep -qE 'SERVE(-BATCH|-DYNBATCH)? ready' "$READY" || { echo "[serve] runner did not become ready in time; see $LOG / $READY"; exit 1; }
 
 echo "[serve] runner ready on 11 nodes. HTTP frontend -> :$PORT (/v1/chat/completions /v1/completions /v1/models)"
 PORT=$PORT DS4F_SERVE_BASE="$BASE" TOK=${TOK:-$HOME/models/ds4f/tokenizer.json} exec python3 ds4f_serve.py

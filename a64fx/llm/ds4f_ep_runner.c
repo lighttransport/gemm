@@ -360,6 +360,141 @@ static long ds4f_read_seq(const char *path) {
     FILE *f = fopen(path, "r"); if (!f) return 0;
     long v = 0; if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); return v;
 }
+
+/* ================= DYNAMIC continuous batching (DS4F_SERVE_DYNAMIC) =================
+ * True continuous batching: requests are admitted MID-FLIGHT (as slots free), so a fast request never
+ * waits for slow batch-mates. Queue protocol on the shared FS (base = reqf minus ".req"):
+ *   <base>.qhead      monotonic count of enqueued requests (frontend bumps AFTER writing the q file)
+ *   <base>.q.<id>     request id: "<max_new>\n<id id ...>\n"
+ *   <base>.r.<id>     response for id (rank 0 writes on retirement): "<gen id ...>\n"
+ * LOCKSTEP across the 11 EP ranks is the constraint: every rank must run the SAME sequence of collectives
+ * (each prefill + each decode step is a barrier-synchronized forward_verify). Two decisions must match on
+ * every rank: (a) RETIREMENT -- deterministic, greedy argmax is identical across ranks (replicated head);
+ * (b) ADMISSION count -- rank 0 reads qhead and BROADCASTS it via ar_cb (rank-0-authoritative sum), so all
+ * ranks admit the same requests into the same (lowest-free) slots each round. Idle rounds (no active, none
+ * pending) still call the broadcast + usleep on every rank, staying aligned. */
+/* atomic response write (temp + rename) so the frontend, which polls for <base>.r.<id> existence,
+ * never reads a partially-written file. */
+static void ds4f_dyn_resp(const char *base, long id, const int *g, int ng) {
+    char fin[1152], tmp[1160];
+    snprintf(fin, sizeof fin, "%s.r.%ld", base, id);
+    snprintf(tmp, sizeof tmp, "%s.r.%ld.t", base, id);
+    FILE *of = fopen(tmp, "w");
+    if (of) { for (int i = 0; i < ng; i++) fprintf(of, "%d%s", g[i], i+1<ng?" ":""); fprintf(of, "\n"); fclose(of); rename(tmp, fin); }
+}
+static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const char *reqf) {
+    ds4f_config *c = &m->cfg; int Cc = c->hidden, L = c->n_layers; size_t hcC = (size_t)c->hc_mult * Cc;
+    int K = envi("DS4F_PREFILL_K", 64); if (K < 1) K = 1; if (K > 128) K = 128;
+    int pf_gemm = envi("DS4F_PREFILL_GEMM", 1) && !m->has_mtp;
+    int mtile = B > K ? B : K; if (mtile > 128) mtile = 128;
+    m->want_full_logits = 0;
+    ds4f_alloc_prefill_batch(m, mtile);
+    ds4f_alloc_decode_batch(m, B);
+    ds4f_lseq *bundles = m->dec_batch_seq;
+    ds4f_lseq *view = (ds4f_lseq *)malloc((size_t)B * L * sizeof(ds4f_lseq));
+    int   *vpos = (int *)malloc((size_t)B * sizeof(int));
+    float *Xb   = (float *)aligned_alloc(64, (size_t)mtile * Cc * 4);
+    float *hcb  = (float *)aligned_alloc(64, (size_t)mtile * hcC * 4);
+    int   *otb  = (int *)malloc((size_t)mtile * sizeof(int));
+    /* admission broadcast buffer: [ok, mnew, np, ids...] -- rank 0 reads the fresh q.<id> file and
+     * BROADCASTS it so every rank admits an identical (np, ids, mnew). Cross-node FS-cache skew must
+     * never make ranks disagree on the collective's M (that deadlocks the prefill/decode all-reduce). */
+    float *admit_bc = (float *)aligned_alloc(64, ((size_t)maxpos + 4) * sizeof(float));
+    typedef struct { int *ids; int nids, np, pos, mnew, active; long id; } dseq;
+    dseq *S = (dseq *)calloc((size_t)B, sizeof(dseq));
+    for (int i = 0; i < B; i++) S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
+    char base[1024]; int rl = (int)strlen(reqf); if (rl > 4) rl -= 4;   /* strip ".req" */
+    snprintf(base, sizeof base, "%.*s", rl, reqf);
+    char qheadf[1088]; snprintf(qheadf, sizeof qheadf, "%s.qhead", base);
+    if (MyRank == 0) {   /* ensure qhead exists BEFORE the first read -- else the node-local FS caches a
+                          * "not found" and rank 0 never sees the frontend's later writes (the reason the
+                          * launcher pre-creates reqseq). Create-if-absent, preserving any existing value. */
+        FILE *qf = fopen(qheadf, "a"); if (qf) fclose(qf);
+    }
+    barrier();
+    long qnext = ds4f_read_seq(qheadf);   /* skip requests enqueued before we came up (best-effort) */
+    long done_count = 0; double t_last = now_sec(); long tok_since = 0;
+    if (MyRank == 0) logmsg("SERVE-DYNBATCH ready: B=%d maxpos=%d prefill_gemm=%d K=%d (continuous batching)\n",
+                            B, maxpos, pf_gemm, K);
+    for (;;) {
+        /* ---- admit into free slots by PROBING q.<qnext> directly. We do NOT read a qhead counter: its
+         *      value change ("1\n"->"4\n", same 2-byte size) is not reliably visible on the compute-node
+         *      FEFS/LLIO client (it caches the small file by size+coarse-mtime and never refetches -> rank 0
+         *      sees a stale qhead and never admits). New-FILE existence IS coherent (create takes a lock,
+         *      negative-dentry TTL is short), so rank 0 probes+reads q.<qnext> and broadcasts [ok,mnew,np,
+         *      ids]; ab[0]<0.5 => no request waiting. Broadcasting keeps every rank's admit lockstep -- a
+         *      per-rank read would race the FS cache into divergent np -> prefill all-reduce deadlock. int
+         *      ids fit float32 exactly (vocab << 2^24). ---- */
+        for (int i = 0; i < B; i++) {
+            if (S[i].active) continue;                       /* slot busy (deterministic across ranks) */
+            dseq *s = &S[i];
+            int cap = maxpos + 3;
+            float *ab = admit_bc; memset(ab, 0, (size_t)cap * sizeof(float));
+            if (MyRank == 0) {
+                char qf[1152]; snprintf(qf, sizeof qf, "%s.q.%ld", base, qnext);
+                FILE *f = fopen(qf, "r");
+                if (f) { char line[256]; int mnew = 256, np = 0, v; char *tk, *sp, *ln = NULL; size_t lc = 0;
+                    if (fgets(line, sizeof line, f)) sscanf(line, "%d", &mnew);
+                    if (getline(&ln, &lc, f) >= 0)
+                        for (tk = strtok_r(ln, " \t\n", &sp); tk && np < maxpos; tk = strtok_r(NULL, " \t\n", &sp))
+                            if (sscanf(tk, "%d", &v) == 1) ab[3 + np++] = (float)v;
+                    free(ln); fclose(f);
+                    ab[0] = 1.f; ab[1] = (float)mnew; ab[2] = (float)np;
+                }
+            }
+            if (m->ar_cb && m->ep_size > 1) m->ar_cb(ab, cap, m->ar_ctx);
+            if (ab[0] < 0.5f) break;                         /* file not visible to rank 0 yet -> retry */
+            int mnew = (int)(ab[1] + 0.5f), np = (int)(ab[2] + 0.5f);
+            for (int k = 0; k < np; k++) s->ids[k] = (int)(ab[3 + k] + 0.5f);
+            if (mnew < 0) mnew = 0; if (np + mnew > maxpos) mnew = maxpos > np ? maxpos - np : 0;
+            s->np = np; s->mnew = mnew; s->nids = np; s->id = qnext; qnext++;
+            /* prefill into slot i's bundle (single-seq path) */
+            for (int l = 0; l < L; l++) ds4f_lseq_apply(&m->layers[l], &bundles[(size_t)i*L + l]);
+            m->dec_batch_seq = NULL; m->dec_batch_pos = NULL;
+            ds4f_serve_reset(m);
+            int first = DS4F_EOS_ID;
+            if (np > 0) {
+                if (pf_gemm) { for (int bs = 0; bs < np; bs += K) { int M = np - bs < K ? np - bs : K;
+                        for (int mm = 0; mm < M; mm++) embed_lookup(m, s->ids[bs+mm], Xb + (size_t)mm*Cc);
+                        int ot[128]; ds4f_forward_verify(m, Xb, M, bs, ot, hcb); first = ot[M-1]; } }
+                else { float xs[1]; (void)xs; for (int p = 0; p < np; p++) { embed_lookup(m, s->ids[p], Xb); first = ds4f_forward_token(m, Xb, p); } }
+            }
+            s->pos = np; s->active = (np > 0 && mnew > 0);
+            if (s->active) { s->ids[s->nids++] = first;
+                             if (first == DS4F_EOS_ID || s->nids - s->np >= s->mnew) s->active = 0; }
+            if (!s->active && MyRank == 0) {                 /* prefill-only or immediate stop -> respond now */
+                ds4f_dyn_resp(base, s->id, s->ids + s->np, s->nids - s->np);
+                done_count++;
+            }
+        }
+        /* ---- gather the active set ---- */
+        int na = 0, map[128];
+        for (int i = 0; i < B; i++) if (S[i].active) {
+            map[na] = i;
+            embed_lookup(m, S[i].ids[S[i].nids-1], Xb + (size_t)na*Cc);
+            vpos[na] = S[i].pos;
+            for (int l = 0; l < L; l++) view[(size_t)na*L + l] = bundles[(size_t)i*L + l];
+            na++;
+        }
+        if (na == 0) { usleep(2000); continue; }             /* idle: all ranks sleep, re-poll qhead */
+        /* ---- one decode step over the active set ---- */
+        m->dec_batch_seq = view; m->dec_batch_pos = vpos;
+        ds4f_forward_verify(m, Xb, na, 0, otb, hcb);
+        tok_since += na;
+        for (int a = 0; a < na; a++) {
+            dseq *s = &S[map[a]]; int tok = otb[a];
+            s->ids[s->nids++] = tok; s->pos++;
+            if (tok == DS4F_EOS_ID || s->nids - s->np >= s->mnew) {   /* retire -> respond, free slot */
+                s->active = 0;
+                if (MyRank == 0) { ds4f_dyn_resp(base, s->id, s->ids + s->np, s->nids - s->np); done_count++; }
+            }
+        }
+        if (MyRank == 0) { double now = now_sec();
+            if (now - t_last > 5.0) { logmsg("SERVE-DYNBATCH: %ld done, active=%d, %.1f tok/s agg (window)\n",
+                                             done_count, na, tok_since/(now-t_last));
+                                      t_last = now; tok_since = 0; } }
+    }
+}
 /* ---- persist a context to disk (system-prompt cache / KV save-load) ----
  * File = [magic][npos][cfg_hash][ids(npos)][full cache snapshot for npos positions]. cfg_hash pins the
  * cache-mode layout (int8/int4/maxpos) so a mismatched runner refuses the blob instead of corrupting.
@@ -930,7 +1065,10 @@ int main(int argc,char**argv){
         int serve_batch = envi("DS4F_SERVE_BATCH", 1);   /* >1: concurrent batched decode (throughput path) */
         if (serve_batch > 1) {
             if (serve_batch > 64) serve_batch = 64;
-            ds4f_serve_batch_loop(m, serve_batch, maxpos, reqf, respf, reqseqf, respseqf);
+            if (envi("DS4F_SERVE_DYNAMIC", 0))            /* continuous batching: mid-flight admission */
+                ds4f_serve_dynbatch_loop(m, serve_batch, maxpos, reqf);
+            else
+                ds4f_serve_batch_loop(m, serve_batch, maxpos, reqf, respf, reqseqf, respseqf);
             /* never returns */
         }
         int *pids = (int *)malloc((size_t)maxpos * sizeof(int));

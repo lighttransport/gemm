@@ -100,6 +100,35 @@ def infer_batched(prompt, max_tokens):
     if not r.ev.wait(TIMEOUT): raise TimeoutError("runner timeout")
     return ids, r.gen, decode(r.gen)
 
+# ---- DYNAMIC continuous batching (DS4F_SERVE_DYNAMIC): each request enqueues itself (q.<id> file +
+# atomic qhead bump) and polls for its own r.<id> response. The runner admits mid-flight, so a fast
+# request is NOT blocked behind slow batch-mates. No coalescing thread needed. ----
+DYNAMIC = int(os.environ.get("DS4F_SERVE_DYNAMIC", "0"))
+_qlock = threading.Lock()
+_qnext = 0
+
+def infer_dynamic(prompt, max_tokens):
+    global _qnext
+    ids = encode(prompt)
+    if not ids: return [], [], ""
+    with _qlock:
+        myid = _qnext; _qnext += 1
+        tmp = "%s.q.%d.t" % (BASE, myid)        # write atomically: the runner probes q.<id> existence,
+        with open(tmp, "w") as f:               # so it must never observe a half-written file
+            f.write("%d\n" % max_tokens); f.write(" ".join(map(str, ids)) + "\n")
+        os.rename(tmp, "%s.q.%d" % (BASE, myid))  # atomic publish
+        with open(BASE + ".qhead", "w") as f:   # client-side id bookkeeping (runner probes q.<id>, not qhead)
+            f.write(str(_qnext) + "\n")
+    rf = "%s.r.%d" % (BASE, myid)
+    t0 = time.time()
+    while not os.path.exists(rf):               # runner renames the finished response into place (atomic)
+        if time.time() - t0 > TIMEOUT: raise TimeoutError("runner timeout")
+        time.sleep(0.004)
+    gen = [int(x) for x in open(rf).read().split()]
+    try: os.unlink(rf)
+    except OSError: pass
+    return ids, gen, decode(gen)
+
 # Plain-text chat template (this checkpoint has no chat_template / role tokens).
 BOS = "<｜begin▁of▁sentence｜>"
 ROLE_TAG = {"system": "System", "user": "User", "assistant": "Assistant", "tool": "Tool"}
@@ -153,7 +182,7 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
     # concurrent batched decode: route greedy, non-cache requests through the dispatcher (the runner
     # is in DS4F_SERVE_BATCH mode -> the single-request protocol is not served there).
     if BATCH > 1 and not (cache_load or cache_save):
-        return infer_batched(prompt, max_tokens)
+        return infer_dynamic(prompt, max_tokens) if DYNAMIC else infer_batched(prompt, max_tokens)
     with _lock:
         ids = encode(prompt)
         if not ids and not cache_save:
@@ -442,7 +471,13 @@ if __name__ == "__main__":
             f.write("0\n")                    # clear any stale response marker
     except OSError:
         pass
-    if BATCH > 1:
+    if BATCH > 1 and DYNAMIC:
+        try:                                  # sync _qnext to the runner's current queue head
+            with open(BASE + ".qhead") as f: _qnext = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            pass
+        print(f"[ds4f-serve] DYNAMIC continuous batching: B={BATCH}, mid-flight admission (greedy)", flush=True)
+    elif BATCH > 1:
         try:                                  # sync _seq to the runner's current request counter
             with open(REQSEQ) as f: _seq = int(f.read().strip() or 0)
         except (OSError, ValueError):
