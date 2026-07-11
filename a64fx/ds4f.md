@@ -1052,7 +1052,7 @@ So the earlier "dispatch-bound → batch the tb2 workers" hypothesis is **wrong*
 
 **Build.** `ds4f_forward_verify` already batches *all* dense/MoE/comm as an M=K GEMM with one all-reduce/layer — the amortization exists. The only rework is its per-position attn/tb2 loop → **per-sequence**: M independent live KV/cmp/idx cache **sets** (the multi-slot infra has per-slot *snapshots* but one *live* set), each batch element k with its own `pos[k]` + `cache[k]`. Lowest-risk approach: **pointer-swap** — allocate M cache sets, and before element k's append/tb2/attn, point the layer's cache fields (the ~20 buffers/scalars `ds4f_ctx_snap` enumerates: `kv_*`, `cmp_*`, `idx_*`, the compressor ring states, calibration) at set k, so the existing `ds4f_tb2_prepare`/`ds4f_attn_tb2_worker`/KV-append run unchanged. Phases: **P1** M cache sets + `ds4f_forward_decode_batch` (validate M=1 == single-stream, M=2 == two independent streams); **P2** serve-loop dynamic batch (add/remove sequences, per-sequence sampling/EOS, continuous batching); **P3** measure aggregate tok/s vs the projection. MTP module is staged (throughput draft is a later compose).
 
-### 2026-07-11 session (alloc 49526204, 12-node interactive) — serve maturation + CP Phase-2 complete
+### 2026-07-11 session (allocs 49526204 / 49529254) — serve maturation, CP Phase-2 complete, long-ctx attention
 
 Roll-up of the day's landed work (details in the `### LANDED`/`### MEASURED`/CP sections below + the
 `Resuming prompt — Phase 2 CP`). All gated, defaults off, validated real-weight 11n, tree committed.
@@ -1088,6 +1088,22 @@ that (sharded scan + top-k merge in-tree). This session finished it:
   CP-off vs CP-on **128k 223→30 MB/node (−193); 512k 876→103 (−773)**. Honest verdict: under int4 the caches
   are small, so CP's *memory* win is modest until 512k-1M+; CP's real near-term win is *compute* (the combine
   + sharded scan).
+
+**Long-ctx attention** (details in the `### LANDED — the long-ctx attention cost model` section below).
+Measure-first redirected the work: profiling showed the **only ctx-growing decode terms are the indexer
+scan + top-k** (attn itself is O(1) — window 128 + topk 512 is fixed), ~7% at 8k → **~33% at 128k**. So
+"cheaper long-ctx attention" = "cheaper O(T) indexer scan".
+- **Negative result — `CP_IDX` is a NET LOSS below ~40-50k ctx**: it shards the scan and its candidate-merge
+  *eliminates* the top-k (`tb2topk` → 0.002 ms), but the merge costs ~40 small reduces/token
+  (collective-count-bound, ~11 ms fixed) → measured 16k **7.81 → 4.93 tok/s**. Don't enable it at moderate ctx.
+- **`DS4F_IDX_REUSE=N`** (`098dfdd6`, default off): re-scan every N single-stream steps, reuse the layer's
+  cached selection between — skips **qproj/rope/wproj/scan/topk (the whole O(T) cost) with ZERO comm**. The
+  indexer compressor still runs every step (skipping it corrupts the idx cache). N=4: ctx-warm 8k decode
+  **123.7 → 115.2 ms/tok (+7.3%)**; real gen (2471-tok prompt, T=630 > topk) decode **+5.3%**, prefill
+  **+5.8%**; scales with ctx → **~+35% at 128k**. **Quality gate: TF_ACCURACY 97.7% — IDENTICAL to exact.**
+- *Lesson:* gate lossy ATTENTION changes on `DS4F_TF_CHECK` TF_ACCURACY, never on eyeballing completions —
+  a repetitive test prompt made the EXACT baseline degenerate into copying its input while the reused run
+  correctly summarized, which would have read as a false "the lossy version is better".
 
 ### LANDED — DS4F_SERVE_BATCH concurrent batched-decode serve (2026-07-10b, commits `782c8f29`/`eb5d9054`/`994cbd27`)
 
