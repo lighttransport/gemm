@@ -1233,6 +1233,42 @@ gone.** *Ops note: the throwaway-server trick (`socksrv.py` + `vcoord_1.txt` = o
 is the fast way to test cross-node TCP without the runner; debug/aux files for compute nodes go under `$HOME`
 (the scratchpad dir isn't mounted there).*
 
+### LANDED — the long-ctx attention cost model + `DS4F_IDX_REUSE` (2026-07-11, commit `098dfdd6`)
+
+**The cost model (measured, ctx-warm + `DS4F_PROF`, int4 config).** After the landed Step-2g/2h/2i work
+(O(T·log k) `index_topk`, SVE attn, fused o-proj), the **only ctx-GROWING decode terms** are the indexer
+**scan** (`tb2scan`) + **topk** + the **qproj** that feeds them. Everything else — attn (window 128 +
+topk 512 = fixed), o-proj, qkv, dense, MoE, mHC, `tb2lcmp` — is O(1) in ctx.
+
+| ctx (warm) | decode ms/tok | tb2scan | tb2topk | share |
+|---|---|---|---|---|
+| 8k  | 123.7 | 3.62 ms | 3.63 ms | 7.4% |
+| 16k | 128.1 | 5.36 ms | 5.37 ms | 10.4% |
+
+Fitting the slope → **~30 ms scan + ~30 ms topk at 128k ≈ 33% of decode**: that is the long-ctx cliff.
+
+**★ CP_IDX has a ~40-50k crossover — it LOSES below that.** `DS4F_CP_IDX` shards the scan and its
+candidate-merge *eliminates* the topk (measured `tb2topk` **0.002 ms**), but the merge gathers
+`ep_size*index_topk` candidates via **~40 small reduces/token** (2 per CSA layer) — **collective-count-bound**,
+~11 ms fixed. At 16k that cost exceeds the scan-sharding saving: **decode 7.81 → 4.93 tok/s (CP_IDX is a
+NET LOSS)**. It only pays above ~40-50k ctx. *Don't enable CP_IDX at moderate ctx.*
+
+**★ `DS4F_IDX_REUSE=N` (default 0=off) — the lever that works at ALL ctx with ZERO comm.** Re-scan every N
+single-stream steps; reuse the layer's cached selection in between (per-layer `sel_cache` + `sel_cache_pos`).
+A reused step still runs the indexer compressor (idx-cache continuity) but skips **qproj/rope/wproj/scan/topk
+— the entire O(T) cost**. `since>=1` + a `ds4f_serve_reset` invalidation handle request boundaries; batched
+decode (per-seq selections) is excluded. **LOSSY** (the newest ~N/ratio compressed slots aren't selectable
+until the next scan — they're recent, so the sliding window covers them) → coherence-gated.
+
+**Measured (N=4):** ctx-warm 8k — `tb2scan` 3.62→0.86, `tb2topk` 3.63→0.93, `tb2qproj` 3.21→0.80 ms (all
+÷~4); decode **123.7 → 115.2 ms/tok (+7.3%)**. Real gen, 2471-tok prompt (T=630 slots > topk=512, so the
+selection genuinely prunes): decode **119.4 → 113.4 (+5.3%)**, prefill **117.2 → 110.8 (+5.8%)**.
+**QUALITY GATE: `DS4F_TF_CHECK` TF_ACCURACY 2413/2470 = 97.7% — IDENTICAL to the exact baseline.** The gen
+text diverges (expected, lossy) but predictive quality is unchanged. *(Lesson: gate lossy attention changes
+on TF_ACCURACY, not on comparing completions — a repetitive test prompt made the EXACT baseline degenerate
+into copying its input while the reused run correctly summarized, which would have read as a false "win".)*
+**The win scales with ctx** (the skipped terms are the O(T) ones) → extrapolates to **~+35% decode at 128k**.
+
 ### Resuming prompt — Phase 2 CP (next session)
 > **STATUS UPDATE 2026-07-11:** the CP code is well past the Stage-A checkpoint the prompt below describes.
 > In-tree now (`ds4f_impl.h`): `ds4f_cp_slot_shard` (`:185`); storage sharding `DS4F_CP_SHARD` for `cmp_q4`
