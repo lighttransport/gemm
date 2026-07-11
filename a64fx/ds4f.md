@@ -1144,8 +1144,34 @@ coherent; per-sequence independence under sampling (A[seed X] admitted mid-fligh
 X] run alone; same-seed seqs in one batch identical; different seed differ). Sampling requests *completing*
 is itself the lockstep proof (mismatched draws would deadlock the per-layer all-reduce). Cost: the full
 `[K,vocab]` SUM (~2.4 MB at K=4) per decode step only when a sampling seq is active — same per-seq cost as
-single-stream sampling. **Follow-on:** the static `DS4F_SERVE_BATCH` loop is still greedy-only (dynamic is
-the sampling path); mirror if needed.
+single-stream sampling. Static-batch parity landed too (commit `01f43ce8`): `ds4f_serve_batch_loop` gains
+the same per-seq sampler (BATCH per-seq line `max_new [temp top_p top_k seed rep_pen pres_pen]`), validated
+B=4 (greedy regression clean, mixed greedy+sampled batch, seed 1234 yields the SAME tokens as the dynamic
+loop — identical seed derivation).
+
+### MEASURED — batched-decode throughput saturates ~25-30 tok/s (B sweep, 2026-07-11)
+
+Dynamic-loop runner-internal peak `tok/s agg` (early-context, N=B concurrent 80-tok requests, alloc 49526204):
+
+| B  | peak agg tok/s | vs single-stream (~17) |
+|----|----------------|------------------------|
+| 4  | 22.8           | 1.34×                  |
+| 8  | 25.8           | 1.52×                  |
+| 16 | 25.3           | 1.49×                  |
+| 32 | 29.4           | 1.73×                  |
+
+**Aggregate throughput saturates at ~25-30 tok/s across B=8..32 — heavily sublinear (only 1.29× from
+B=4→B=32).** The amortizable base (dense GEMM + per-layer EP reduce + mHC) is fully amortized by B≈8; beyond
+that the **per-sequence tier-B2 work does NOT amortize** — each sequence has an independent KV/compressor/
+index cache, so its attention + `tb2_prepare` cost grows ~linearly with B and dominates. This corrects the
+`DS4F_DB_BENCH` ~2.5-3× projection (dbbench measured the dense-amortized regime without the full per-seq
+mHC+tierB2 attention loop). Throughput also DECAYS within a run as context grows (B=32: 29.4→25.1 over the
+window sweep) since per-position attention scales with KV length. Independence held at every B. Per-window
+numbers are noisy (peak depends on exact ctx at measurement) but the saturation is robust. **Practical
+sweet spot ≈ B=8-16** (throughput plateau + lower per-request latency + 8-16 cache bundles vs 32); B=32
+buys little for 2× the bundle memory. The real lever beyond this is per-sequence attention cost (CP shards
+the caches; a cheaper long-ctx attention), not larger B. Client-observed tok/s (10-14) is FS-round-trip-
+bound (the file protocol), not the compute number.
 
 ### Resuming prompt — Phase 2 CP (next session)
 > **TASK: DS4F sharded-KV context parallelism (`DS4F_CP`).** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`). Full design + file:line in the plan file `~/.claude/plans/see-a64fx-ds4f-md-and-keep-floofy-dragon.md` and the "Phase 2" section above.
