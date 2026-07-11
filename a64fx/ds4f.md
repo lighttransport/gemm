@@ -1225,8 +1225,18 @@ is the fast way to test cross-node TCP without the runner; debug/aux files for c
 > positions take the normal path). Validated `PREFILL_GEMM=1` ctx=805: **verify-COMBINE == verify-noCP 48/48
 > byte-identical** (the 15/48 gap vs the token baseline is the known verify-vs-token GEMM reassociation —
 > verify-noCP diverges identically). CP now composes with the fast batched-verify prefill (56.8 vs 128.8
-> ms/tok token-by-token). Caveat: verify+CP int4 batched-DECODE (multi-seq) still needs `cmp_q4` added to
-> `ds4f_lseq` (per-sequence cache swap) — prefill is single-seq so unaffected. **REMAINING:** long-ctx A/B:
+> ms/tok token-by-token).
+>
+> **BATCHED-DECODE CP DONE (commit `ef1e07f8`).** `ds4f_lseq` now carries the per-sequence int8/int4 stores +
+> calibration (`kv_q`/`cmp_q4`/`cmp_q`/`cmp_scale`/`cmp_iscale`/`cmp_absmax`/`*_calbuf`/`idx_kv8_4`/`idx_kv8`/
+> `idx_pscale` + the `caln`/`frozen` scalars); previously it held only bf16/f32 so int4 batched decode shared
+> one `cmp_q4` across sequences. `ds4f_lseq_apply` swaps them (NULL/0 when off → bf16 path unchanged); new
+> `ds4f_lseq_capture` writes the calibration SCALARS back after each step (a sequence can cross the freeze
+> point mid-decode) — wired into the forward_verify per-position loop + the serve loops' per-request prefill.
+> `ds4f_alloc_decode_batch`/`_free` allocate/free per-bundle quant buffers (shard capacity = base layer's).
+> Validated via the `DS4F_DECODE_BATCH` isolation test (seqA solo == seqA batched-with-seqB, token-exact):
+> **CP+int4+CP_SHARD/IDX/COMBINE with `DS4F_INT8CMP_CAL=4` (early freeze → positions 16-47 use the SHARDED
+> per-seq cmp_q4): 48/48 PASS**; standard non-CP bf16: 48/48 (no regression). **REMAINING:** long-ctx A/B:
 > per-node MemFree + coherence at max_pos = 32k/64k/128k, CP-on vs the CP-off ceiling (dedicated alloc — long
 > ctx OOM-risks the shared job). NOTE the plan file
 > `~/.claude/plans/see-a64fx-ds4f-md-...md` is GONE — reconstruct design from the in-tree code above + the
