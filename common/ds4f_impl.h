@@ -5254,6 +5254,21 @@ static inline void ds4f_lseq_apply(ds4f_layer *ly, const ds4f_lseq *s) {
     ly->kv_cache = s->kv_cache;
     ly->cmp_kv = s->cmp_kv; ly->cmp_kv_state = s->cmp_kv_state; ly->cmp_score_state = s->cmp_score_state;
     ly->idx_kv = s->idx_kv; ly->idx_cmp_kv_state = s->idx_cmp_kv_state; ly->idx_cmp_score_state = s->idx_cmp_score_state;
+    /* quantized stores + their per-sequence calibration state (all NULL/0 when those modes are off -> the
+     * bf16/f32 batched path is unchanged). cp_on/cp_t0/cp_t1 stay on the base layer (topology-constant). */
+    ly->kv_q = s->kv_q; ly->kv_scale = s->kv_scale; ly->kv_calbuf = s->kv_calbuf;
+    ly->kv_caln = s->kv_caln; ly->kv_frozen = s->kv_frozen;
+    ly->cmp_q4 = s->cmp_q4; ly->cmp_q = s->cmp_q; ly->cmp_scale = s->cmp_scale;
+    ly->cmp_iscale = s->cmp_iscale; ly->cmp_absmax = s->cmp_absmax; ly->cmp_calbuf = s->cmp_calbuf;
+    ly->cmp_caln = s->cmp_caln; ly->cmp_frozen = s->cmp_frozen;
+    ly->idx_kv8_4 = s->idx_kv8_4; ly->idx_kv8 = s->idx_kv8; ly->idx_pscale = s->idx_pscale;
+}
+/* write the mutable calibration SCALARS back into the sequence's bundle after a step (a sequence can
+ * cross the freeze point mid-decode; buffers update in place via the swapped pointers, only these
+ * ints must persist for the next step). No-op-safe when quant modes are off (copies 0s). */
+static inline void ds4f_lseq_capture(ds4f_lseq *s, const ds4f_layer *ly) {
+    s->kv_caln = ly->kv_caln;   s->kv_frozen = ly->kv_frozen;
+    s->cmp_caln = ly->cmp_caln; s->cmp_frozen = ly->cmp_frozen;
 }
 /* Free the per-sequence cache sets 1..nseq-1 (set 0 aliases the layer's own live buffers -- never
  * freed here) and the batch arrays. Safe to call when dec_batch_seq is NULL (no-op). */
@@ -5265,6 +5280,10 @@ static void ds4f_free_decode_batch(ds4f_model *m) {
             ds4f_lseq *s = &m->dec_batch_seq[(size_t)k*L + l];
             free(s->kv_cache); free(s->cmp_kv); free(s->cmp_kv_state); free(s->cmp_score_state);
             free(s->idx_kv); free(s->idx_cmp_kv_state); free(s->idx_cmp_score_state);
+            free(s->kv_q); free(s->kv_scale); free(s->kv_calbuf);
+            free(s->cmp_q4); free(s->cmp_q); free(s->cmp_scale); free(s->cmp_iscale);
+            free(s->cmp_absmax); free(s->cmp_calbuf);
+            free(s->idx_kv8_4); free(s->idx_kv8); free(s->idx_pscale);
         }
     free(m->dec_batch_seq); m->dec_batch_seq = NULL;
     free(m->dec_batch_pos); m->dec_batch_pos = NULL;
@@ -5285,7 +5304,14 @@ static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
         s0->kv_cache = ly->kv_cache;
         s0->cmp_kv = ly->cmp_kv; s0->cmp_kv_state = ly->cmp_kv_state; s0->cmp_score_state = ly->cmp_score_state;
         s0->idx_kv = ly->idx_kv; s0->idx_cmp_kv_state = ly->idx_cmp_kv_state; s0->idx_cmp_score_state = ly->idx_cmp_score_state;
+        s0->kv_q = ly->kv_q; s0->kv_scale = ly->kv_scale; s0->kv_calbuf = ly->kv_calbuf;
+        s0->kv_caln = ly->kv_caln; s0->kv_frozen = ly->kv_frozen;
+        s0->cmp_q4 = ly->cmp_q4; s0->cmp_q = ly->cmp_q; s0->cmp_scale = ly->cmp_scale;
+        s0->cmp_iscale = ly->cmp_iscale; s0->cmp_absmax = ly->cmp_absmax; s0->cmp_calbuf = ly->cmp_calbuf;
+        s0->cmp_caln = ly->cmp_caln; s0->cmp_frozen = ly->cmp_frozen;
+        s0->idx_kv8_4 = ly->idx_kv8_4; s0->idx_kv8 = ly->idx_kv8; s0->idx_pscale = ly->idx_pscale;
         int ratio = c->compress_ratios[l], coff = (ratio==4)?2:1, W = coff*KV, nslot = ratio ? np/ratio : 0;
+        int CAL = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64; if (CAL > nslot) CAL = nslot > 0 ? nslot : 1;
         for (int k = 1; k < nseq; k++) {
             ds4f_lseq *s = &m->dec_batch_seq[(size_t)k*L + l];
             s->kv_cache = (uint16_t *)aligned_alloc(256, (size_t)ly->kv_slots*KV*2);
@@ -5300,6 +5326,30 @@ static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
                     s->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
                     s->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
                     ds4f_compress_state_reset(s->idx_cmp_kv_state, s->idx_cmp_score_state, ratio, ihd);
+                }
+            }
+            /* per-sequence quantized stores (mirror whatever the base layer allocated). Fresh calibration:
+             * cmp_caln/cmp_frozen are 0 (calloc); absmax zeroed. cp_nslot/idx_cp_nslot (shard capacity) are
+             * the base layer's -- every sequence on this node owns the SAME slot range. */
+            if (ly->kv_q)      { s->kv_q = (int8_t *)aligned_alloc(256, (size_t)ly->kv_slots*KV);
+                                 memset(s->kv_q, 0, (size_t)ly->kv_slots*KV); }
+            if (ly->kv_scale)  s->kv_scale  = (float *)aligned_alloc(64, (size_t)KV*4);
+            if (ly->kv_calbuf) s->kv_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
+            if (ratio) {
+                if (ly->cmp_q4)     { size_t z = ((size_t)ly->cp_nslot*(KV/2) + 255) & ~255ull;
+                                      s->cmp_q4 = (uint8_t *)aligned_alloc(256, z); memset(s->cmp_q4, 0, z); }
+                if (ly->cmp_q)        s->cmp_q  = (int8_t *)aligned_alloc(256, ((size_t)nslot*KV + 255) & ~255ull);
+                if (ly->cmp_scale)    s->cmp_scale  = (float *)aligned_alloc(64, (size_t)KV*4);
+                if (ly->cmp_iscale)   s->cmp_iscale = (float *)aligned_alloc(64, (size_t)KV*4);
+                if (ly->cmp_absmax) { s->cmp_absmax = (float *)aligned_alloc(64, (size_t)KV*4);
+                                      memset(s->cmp_absmax, 0, (size_t)KV*4); }
+                if (ly->cmp_calbuf)   s->cmp_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
+                if (ratio == 4) {
+                    if (ly->idx_kv8_4) { size_t z = ((size_t)ly->idx_cp_nslot*(ihd/2) + 255) & ~255ull;
+                                         s->idx_kv8_4 = (uint8_t *)aligned_alloc(256, z); memset(s->idx_kv8_4, 0, z); }
+                    if (ly->idx_kv8)     s->idx_kv8   = (int8_t *)aligned_alloc(256, ((size_t)nslot*ihd + 255) & ~255ull);
+                    if (ly->idx_pscale)  s->idx_pscale = (float *)aligned_alloc(256,
+                                             ((size_t)(ly->idx_kv8_4 ? ly->idx_cp_nslot : nslot)*4 + 255) & ~255ull);
                 }
             }
         }
@@ -5412,6 +5462,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at);
                 memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4); }
             DS4F_TOC(DS4F_P_ATTN); }
+            /* persist this sequence's calibration scalars (it may have crossed the freeze point). */
+            if (m->dec_batch_seq) ds4f_lseq_capture(&m->dec_batch_seq[(size_t)k*c->n_layers + L], ly);
         }
         if (nc > 0) {   /* CP Stage-C: one batched cross-node combine for the chunk, then scatter to p_attn */
             ds4f_cp_attn_combine_batched(m, nc, poss_comb, rcos, rsin);

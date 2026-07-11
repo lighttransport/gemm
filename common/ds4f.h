@@ -316,6 +316,13 @@ typedef struct {
     uint16_t *kv_cache;
     float    *cmp_kv, *cmp_kv_state, *cmp_score_state;
     float    *idx_kv, *idx_cmp_kv_state, *idx_cmp_score_state;
+    /* int8/int4 quantized stores + their per-sequence calibration (DS4F_INT8_KV / INT8_CMP / INT4_CMP /
+     * IDX_INT8 / IDX_INT4, needed for batched-decode under those modes incl. CP). NULL when the mode is
+     * off. cp_on/cp_t0/cp_t1 stay topology-constant on the base layer (same shard for every sequence). */
+    int8_t   *kv_q;    float *kv_scale;  uint16_t *kv_calbuf;  int kv_caln, kv_frozen;    /* window int8 */
+    uint8_t  *cmp_q4;  int8_t *cmp_q;    float *cmp_scale, *cmp_iscale, *cmp_absmax;
+    uint16_t *cmp_calbuf; int cmp_caln, cmp_frozen;                                       /* compressed int8/int4 */
+    uint8_t  *idx_kv8_4; int8_t *idx_kv8; float *idx_pscale;                              /* indexer int8/int4 */
 } ds4f_lseq;
 
 typedef struct ds4f_pool ds4f_pool;

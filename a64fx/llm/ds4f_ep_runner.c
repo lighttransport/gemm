@@ -339,6 +339,9 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
                 pf_tokens += s->np;
             }
             m->want_full_logits = 0;
+            /* persist this request's per-sequence calibration scalars into its bundle (prefill wrote the
+             * bundle's buffers via the applied pointers; the frozen/caln ints must be captured for decode). */
+            for (int l = 0; l < L; l++) ds4f_lseq_capture(&bundles[(size_t)i*L + l], &m->layers[l]);
             s->pos = s->np;   /* the first gen token (= last-prefill argmax) occupies position np; the
                                * first decode step forwards it AT pos=np (then pos advances). Do NOT
                                * pre-increment pos here or position np's KV is never written (a gap). */
@@ -648,6 +651,8 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
                     if (s->samples) first = ds4f_sample(m, &s->samp, s->ids, s->np); }
             }
             m->want_full_logits = 0;
+            /* persist this request's per-sequence calibration scalars into its bundle (see the static loop). */
+            for (int l = 0; l < L; l++) ds4f_lseq_capture(&bundles[(size_t)i*L + l], &m->layers[l]);
             s->pos = np; s->active = (np > 0 && mnew > 0);
             if (s->active) { s->ids[s->nids++] = first;
                              if (first == DS4F_EOS_ID || s->nids - s->np >= s->mnew) s->active = 0; }
