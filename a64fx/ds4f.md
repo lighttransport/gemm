@@ -2158,3 +2158,34 @@ So the earlier "TP conservation curve" (dropping TP_ATTN is always a wash) was a
 SLOW dense rep. Under FP8, un-sharding `wq_b` costs more compute than the reduce saves (a LOSS,
 11.34 → 8.16). Under a correct Q8 it is a large win (9.02 → 14.06). **Comm-vs-compute trades are
 not invariant — they flip when you change the kernel's speed.**
+
+### Post-bake: where ds4fbase decode actually goes now (2026-07-12)
+
+**Measure COMPUTE, not tok/s.** On this fabric the IDENTICAL config reads 10.2-13.9 tok/s
+(comm swings 23-60 ms from external contention). Compute = `ms/tok x (1-comm%)` is stable to
+±0.1 ms and is the only part we control. (An earlier "14.06 tok/s" headline of mine was a lucky
+low-comm run — the median for that config is ~10.4.)
+
+Profile after the bake (Q8 dense + TP_ATTN=0), compute 48.3 ms: **tb2prep 12.4, mhc_pre 10.2**,
+experts 7.2, qkv 7.4 (wq_b full), shared 4.8, o_proj 4.6, tb2scan 2.7. o_proj is no longer the
+problem — the Tier-B2 compressor and the mHC collapse are.
+
+Two ALREADY-BUILT levers were simply not enabled:
+
+| | compute | tb2prep | mhc_pre |
+|---|---|---|---|
+| Q8 + TP_ATTN=0 | 48.3 ms | 12.4 | 10.2 |
+| + `DS4F_CMP_LOCAL=1` (BIT-EXACT) | 44.3 | **8.3** | 10.2 |
+| + `DS4F_HC_SVE=1` (reassoc class) | **36.6** | 8.3 | **2.4** |
+
+**−24% compute**, reproduced across 3 runs each (48.3/48.3/48.4 vs 36.5/36.6/36.7). HC_SVE is
+coherence-validated on base (valid quicksort, NaN=0, 12/12 lockstep) but ids diverge → opt-in.
+
+**❌ REFUTED — `TP_ATTN=1 + TP_OPROJ=0`** (shard wq_b without triggering the s_attn reduce; the
+reduce guard needs BOTH). qkv drops 7.4→3.8 as hoped, but wo_a AND wo_b go full → compute 40.1 ms
+(worse than 36.6) and arena 28.05 GB. The bytes you add exceed the bytes you save.
+
+**What is left.** Comm (23-60 ms) is now the dominant term and is architectural at M=1 — a2a was
+already refuted, and the doc's conclusion holds: only BATCHED decode amortizes it (measured ~3.1x
+aggregate at M=16 on base). On the compute side the remaining stack is flat-ish (experts 7.2,
+qkv 7.4, tb2prep 8.3, shared 4.8, o_proj 4.6) with no single dominator left.

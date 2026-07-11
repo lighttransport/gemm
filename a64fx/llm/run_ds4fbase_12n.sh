@@ -102,6 +102,22 @@ export DS4F_TP_EMBED=${DS4F_TP_EMBED:-1}    # vocab-shard embedding (bit-exact: 
 export DS4F_FP8_BF16=${DS4F_FP8_BF16:-0}
 export DS4F_PREFILL_BATCH=${DS4F_PREFILL_BATCH:-0}   # needs FP8_BF16=1 -> must stay 0 here
 
+# ---- DECODE COMPUTE levers. Measure COMPUTE = ms/tok x (1-comm%), NOT tok/s ----------------
+# tok/s on this fabric swings 10.2 - 13.9 for the IDENTICAL config (comm 23-60 ms, external
+# contention). Compute is rock-stable (+/-0.1 ms) and is the only part we control:
+#     Q8 + TP_ATTN=0                       compute 48.3 ms   (tb2prep 12.4, mhc_pre 10.2)
+#   + DS4F_CMP_LOCAL=1                     compute 44.3 ms   (tb2prep 12.4 -> 8.3, BIT-EXACT)
+#   + DS4F_HC_SVE=1                        compute 36.6 ms   (mhc_pre 10.2 -> 2.4)   = -24%
+#
+# CMP_LOCAL is BIT-EXACT (reader-local page placement only) -> ON by default below.
+# HC_SVE is a REASSOCIATION-class lever (SVE half-row hcmix): NOT bit-exact, ids diverge from
+# the baseline trajectory. Validated coherent on base (12n gen: valid quicksort, NaN=0, 12/12
+# lockstep) -- but that is one eyeballed completion, not an accuracy gate, so it stays OPT-IN.
+# Turn it on with DS4F_HC_SVE=1 if you accept the reassoc class; it is the single biggest
+# remaining compute win (mhc_pre -77%).
+export DS4F_CMP_LOCAL=${DS4F_CMP_LOCAL:-1}
+export DS4F_HC_SVE=${DS4F_HC_SVE:-0}
+
 # ---- bit-exact perf levers (all validated token-identical on ds4f) ----
 export DS4F_OPROJ_FUSE=${DS4F_OPROJ_FUSE:-1}
 export DS4F_QNR_PAR=${DS4F_QNR_PAR:-1}
