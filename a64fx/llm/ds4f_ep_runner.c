@@ -1083,6 +1083,22 @@ int main(int argc,char**argv){
                "(%d CSA + %d HCA layers; compressed-KV folded into window softmax)\n",
                cfg.index_topk, cfg.index_head_dim, cfg.index_n_heads, ncsa, nhca);
     }
+    if (MyRank == 0 && m->tierb2) {   /* per-node ctx-cache accounting (CP MemFree A/B): the O(ctx) KV/cmp/idx
+                                       * buffers this node allocated, and the CP-shardable subset (cmp_q4/idx int4). */
+        size_t tot = 0, shard = 0; int KV = cfg.kv_lora, ihd = cfg.index_head_dim;
+        for (int L = 0; L < cfg.n_layers; L++) { ds4f_layer *ly = &m->layers[L];
+            int ratio = cfg.compress_ratios[L], nslot = ratio ? cfg.max_pos/ratio : 0;
+            if (ly->kv_cache)   tot += (size_t)ly->kv_slots*KV*2;
+            if (ly->cmp_kv)     tot += (size_t)nslot*KV*4;
+            if (ly->cmp_q4)   { size_t b=(size_t)ly->cp_nslot*(KV/2);           tot+=b; shard+=b; }
+            if (ly->cmp_q)      tot += (size_t)nslot*KV;
+            if (ly->idx_kv8_4){ size_t b=(size_t)ly->idx_cp_nslot*(ihd/2);      tot+=b; shard+=b; }
+            if (ly->idx_kv8)    tot += (size_t)nslot*ihd;
+            if (ly->idx_pscale){size_t b=(size_t)(ly->idx_kv8_4?ly->idx_cp_nslot:nslot)*4; tot+=b; shard+=b; }
+        }
+        logmsg("CTX_CACHE: total=%.1f MB/node shardable=%.1f MB/node (max_pos=%d cp=%d cp_shard=%d)\n",
+               tot/1048576.0, shard/1048576.0, cfg.max_pos, m->cp, envi("DS4F_CP_SHARD",0));
+    }
     double ta1 = now_sec();
     {   char tn[64]; snprintf(tn, sizeof tn, "ds4f_ep_load_rank%02d.txt", MyRank);
         FILE *tf = fopen(tn, "w");
