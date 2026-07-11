@@ -37,6 +37,13 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <utofu.h>
 
 #include "ds4f.h"
@@ -406,6 +413,110 @@ static long ds4f_read_seq(const char *path) {
  * (b) ADMISSION count -- rank 0 reads qhead and BROADCASTS it via ar_cb (rank-0-authoritative sum), so all
  * ranks admit the same requests into the same (lowest-free) slots each round. Idle rounds (no active, none
  * pending) still call the broadcast + usleep on every rank, staying aligned. */
+/* ================= socket transport (DS4F_SERVE_SOCK) =================
+ * The file protocol's admission/response latency is dominated by cross-node FEFS/LLIO cache visibility
+ * (~tens of seconds: client writes q.<id> on the login node, the compute-node runner sees it only after
+ * the attr/dentry cache refreshes). TCP over the Tofu IP interface between the login node and the runner's
+ * rank-0 compute node is ~0.7 ms round-trip (measured), so rank 0 hosts a TCP listener and the frontend
+ * connects per request. ONLY rank 0 touches sockets; the received request is broadcast to the EP group via
+ * ar_cb exactly like the file path, so lockstep is unchanged. Frame = [u32 BE length][payload]; request
+ * payload is the same 2-line text as a q.<id> file ("max_new temp top_p top_k seed rep_pen pres_pen\n
+ * ids...\n"); response payload is "gen_id gen_id ...\n". One request per connection (frontend closes after
+ * reading the response); connect is cheap. */
+#define DS4F_SOCK_MAXCONN 256
+typedef struct { int fd; unsigned char *buf; int len, cap; int have; } ds4f_sconn;  /* have=full frame buffered */
+typedef struct { int listen_fd; ds4f_sconn conns[DS4F_SOCK_MAXCONN]; } ds4f_sock;
+
+static void ds4f_sock_myip(char *out, size_t n) {   /* prefer a Tofu 10.x IPv4 addr for this node */
+    struct ifaddrs *ifa, *p; out[0] = 0;
+    if (getifaddrs(&ifa) != 0) return;
+    for (p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, ip, sizeof ip);
+        if (!strncmp(ip, "10.", 3)) { snprintf(out, n, "%s", ip); break; }
+    }
+    freeifaddrs(ifa);
+}
+/* rank 0: create the non-blocking listener, publish "<ip> <port>" to <base>.sock (atomic temp+rename). */
+static int ds4f_sock_init(ds4f_sock *S, const char *base) {
+    memset(S, 0, sizeof *S);
+    S->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (S->listen_fd < 0) return -1;
+    int one = 1; setsockopt(S->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = 0;   /* ephemeral port */
+    if (bind(S->listen_fd, (struct sockaddr *)&a, sizeof a) != 0) return -1;
+    socklen_t al = sizeof a; getsockname(S->listen_fd, (struct sockaddr *)&a, &al);
+    if (listen(S->listen_fd, 128) != 0) return -1;
+    fcntl(S->listen_fd, F_SETFL, O_NONBLOCK);
+    char ip[64]; ds4f_sock_myip(ip, sizeof ip);
+    char path[1152], tmp[1160]; snprintf(path, sizeof path, "%s.sock", base); snprintf(tmp, sizeof tmp, "%s.sock.t", base);
+    FILE *f = fopen(tmp, "w"); if (f) { fprintf(f, "%s %d\n", ip, (int)ntohs(a.sin_port)); fclose(f); rename(tmp, path); }
+    return 0;
+}
+static void ds4f_sock_close(ds4f_sock *S, int i) {
+    if (S->conns[i].fd < 0) return;
+    close(S->conns[i].fd); free(S->conns[i].buf);
+    S->conns[i].fd = -1; S->conns[i].buf = NULL; S->conns[i].len = S->conns[i].cap = S->conns[i].have = 0;
+}
+/* accept pending connections + drain readable bytes into each conn's buffer, marking those with a complete
+ * [u32 len][payload] frame as have=1. Non-blocking; call once per admit round on rank 0. */
+static void ds4f_sock_poll(ds4f_sock *S) {
+    for (;;) {                                        /* accept all pending */
+        int c = accept(S->listen_fd, NULL, NULL);
+        if (c < 0) break;
+        fcntl(c, F_SETFL, O_NONBLOCK);
+        int one = 1; setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        int slot = -1; for (int i = 0; i < DS4F_SOCK_MAXCONN; i++) if (S->conns[i].fd == 0 || S->conns[i].fd == -1) { slot = i; break; }
+        if (slot < 0) { close(c); continue; }         /* table full -> drop */
+        S->conns[slot].fd = c; S->conns[slot].buf = NULL; S->conns[slot].len = S->conns[slot].cap = S->conns[slot].have = 0;
+    }
+    for (int i = 0; i < DS4F_SOCK_MAXCONN; i++) {
+        ds4f_sconn *cn = &S->conns[i];
+        if (cn->fd <= 0 || cn->have) continue;
+        for (;;) {
+            if (cn->len + 4096 > cn->cap) { cn->cap = cn->cap ? cn->cap * 2 : 8192; cn->buf = (unsigned char *)realloc(cn->buf, cn->cap); }
+            ssize_t r = recv(cn->fd, cn->buf + cn->len, cn->cap - cn->len, 0);
+            if (r > 0) { cn->len += (int)r; continue; }
+            if (r == 0) { ds4f_sock_close(S, i); break; }               /* peer closed before a full frame */
+            break;                                                      /* EAGAIN */
+        }
+        if (cn->fd > 0 && cn->len >= 4) {                                /* have the length prefix? */
+            uint32_t need; memcpy(&need, cn->buf, 4); need = ntohl(need);
+            if (cn->len >= 4 + (int)need) cn->have = 1;                  /* full frame buffered */
+        }
+    }
+}
+/* pop the first conn with a complete request: copy its payload (NUL-terminated) into out, reset that
+ * conn's read buffer (so the frame isn't re-detected while it awaits its response), return the conn index
+ * (-1 if none ready). The conn stays open until ds4f_sock_respond. */
+static int ds4f_sock_take(ds4f_sock *S, char *out, int outcap) {
+    for (int i = 0; i < DS4F_SOCK_MAXCONN; i++) if (S->conns[i].fd > 0 && S->conns[i].have) {
+        uint32_t need; memcpy(&need, S->conns[i].buf, 4); need = ntohl(need);
+        int n = (int)need < outcap - 1 ? (int)need : outcap - 1;
+        memcpy(out, S->conns[i].buf + 4, n); out[n] = 0;
+        S->conns[i].len = 0; S->conns[i].have = 0;      /* consumed; conn awaits its response */
+        return i;
+    }
+    return -1;
+}
+/* send a framed response on conn i, then close it (one request per connection). */
+static void ds4f_sock_respond(ds4f_sock *S, int i, const int *g, int ng) {
+    if (i < 0 || S->conns[i].fd <= 0) return;
+    char *body = (char *)malloc((size_t)ng * 12 + 2); int bl = 0;
+    for (int k = 0; k < ng; k++) bl += sprintf(body + bl, "%d%s", g[k], k+1<ng?" ":"");
+    body[bl++] = '\n';
+    uint32_t nl = htonl((uint32_t)bl);
+    unsigned char *frame = (unsigned char *)malloc(4 + bl);
+    memcpy(frame, &nl, 4); memcpy(frame + 4, body, bl);
+    int off = 0, tot = 4 + bl, fd = S->conns[i].fd;
+    while (off < tot) { ssize_t w = send(fd, frame + off, tot - off, 0);
+        if (w > 0) off += (int)w; else if (w < 0 && errno == EAGAIN) continue; else break; }
+    free(body); free(frame);
+    ds4f_sock_close(S, i);
+}
+
 /* atomic response write (temp + rename) so the frontend, which polls for <base>.r.<id> existence,
  * never reads a partially-written file. */
 static void ds4f_dyn_resp(const char *base, long id, const int *g, int ng) {
@@ -437,11 +548,16 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
     const int HDR = 9;
     float *admit_bc = (float *)aligned_alloc(64, ((size_t)maxpos + HDR + 1) * sizeof(float));
     typedef struct { int *ids; int nids, np, pos, mnew, active; long id;
-                     ds4f_sampler samp; uint64_t rng; int samples; } dseq;
+                     ds4f_sampler samp; uint64_t rng; int samples; int cfd; } dseq;
     dseq *S = (dseq *)calloc((size_t)B, sizeof(dseq));
-    for (int i = 0; i < B; i++) S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
+    for (int i = 0; i < B; i++) { S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int)); S[i].cfd = -1; }
     char base[1024]; int rl = (int)strlen(reqf); if (rl > 4) rl -= 4;   /* strip ".req" */
     snprintf(base, sizeof base, "%.*s", rl, reqf);
+    /* socket transport (rank 0 only): TCP listener over the Tofu IP, published to <base>.sock. Requests
+     * arrive on sockets instead of q.<id> files (no cross-node FS-cache admission latency). */
+    int sock_mode = envi("DS4F_SERVE_SOCK", 0);
+    ds4f_sock sock; char *sockpb = (char *)malloc((size_t)maxpos * 8 + 64);
+    if (sock_mode && MyRank == 0) { if (ds4f_sock_init(&sock, base) != 0) { logmsg("DS4F_SERVE_SOCK: listener init failed -> file mode\n"); sock_mode = 0; } }
     char qheadf[1088]; snprintf(qheadf, sizeof qheadf, "%s.qhead", base);
     if (MyRank == 0) {   /* ensure qhead exists BEFORE the first read -- else the node-local FS caches a
                           * "not found" and rank 0 never sees the frontend's later writes (the reason the
@@ -451,8 +567,8 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
     barrier();
     long qnext = ds4f_read_seq(qheadf);   /* skip requests enqueued before we came up (best-effort) */
     long done_count = 0; double t_last = now_sec(); long tok_since = 0;
-    if (MyRank == 0) logmsg("SERVE-DYNBATCH ready: B=%d maxpos=%d prefill_gemm=%d K=%d (continuous batching)\n",
-                            B, maxpos, pf_gemm, K);
+    if (MyRank == 0) logmsg("SERVE-DYNBATCH ready: B=%d maxpos=%d prefill_gemm=%d K=%d transport=%s (continuous batching)\n",
+                            B, maxpos, pf_gemm, K, sock_mode ? "socket" : "file");
     for (;;) {
         /* ---- admit into free slots by PROBING q.<qnext> directly. We do NOT read a qhead counter: its
          *      value change ("1\n"->"4\n", same 2-byte size) is not reliably visible on the compute-node
@@ -465,32 +581,45 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
         for (int i = 0; i < B; i++) {
             if (S[i].active) continue;                       /* slot busy (deterministic across ranks) */
             dseq *s = &S[i];
-            int cap = maxpos + HDR;
+            int cap = maxpos + HDR, taken_cfd = -1;
             float *ab = admit_bc; memset(ab, 0, (size_t)cap * sizeof(float));
             if (MyRank == 0) {
-                char qf[1152]; snprintf(qf, sizeof qf, "%s.q.%ld", base, qnext);
-                FILE *f = fopen(qf, "r");
-                if (f) { char line[256]; int mnew = 256, np = 0, v; char *tk, *sp, *ln = NULL; size_t lc = 0;
-                    /* first line: "mnew [temp top_p top_k seed rep_pen pres_pen]" (sampling params optional,
-                     * default greedy temp=0). */
+                /* rank 0 fills ab[] from ONE waiting request (socket conn or q.<qnext> file); the parsed
+                 * payload is identical text in both modes. ab[0]=1 => a request was taken. */
+                char line1[256] = {0}, *ids_line = NULL, *pbuf = NULL; int got = 0;
+                if (sock_mode) {
+                    ds4f_sock_poll(&sock);
+                    int ci = ds4f_sock_take(&sock, sockpb, (int)((size_t)maxpos*8+64));
+                    if (ci >= 0) { taken_cfd = ci; pbuf = sockpb; got = 1;
+                        char *nl = strchr(pbuf, '\n');
+                        if (nl) { *nl = 0; snprintf(line1, sizeof line1, "%s", pbuf); ids_line = nl + 1; }
+                        else { snprintf(line1, sizeof line1, "%s", pbuf); ids_line = pbuf + strlen(pbuf); } }
+                } else {
+                    char qf[1152]; snprintf(qf, sizeof qf, "%s.q.%ld", base, qnext);
+                    FILE *f = fopen(qf, "r");
+                    if (f) { char idl[65536] = {0};
+                        if (fgets(line1, sizeof line1, f)) got = 1;
+                        if (fgets(idl, sizeof idl, f)) { pbuf = strdup(idl); ids_line = pbuf; }
+                        fclose(f); }
+                }
+                if (got) { int mnew = 256, np = 0, v; char *tk, *sp;
                     float temp = 0.f, top_p = 1.f, rep_pen = 1.f, pres_pen = 0.f; int top_k = 0; long seed = 0;
-                    if (fgets(line, sizeof line, f))
-                        sscanf(line, "%d %f %f %d %ld %f %f", &mnew, &temp, &top_p, &top_k, &seed, &rep_pen, &pres_pen);
-                    if (getline(&ln, &lc, f) >= 0)
-                        for (tk = strtok_r(ln, " \t\n", &sp); tk && np < maxpos; tk = strtok_r(NULL, " \t\n", &sp))
-                            if (sscanf(tk, "%d", &v) == 1) ab[HDR + np++] = (float)v;
-                    free(ln); fclose(f);
+                    /* line 1: "mnew [temp top_p top_k seed rep_pen pres_pen]" (sampling optional, greedy default) */
+                    sscanf(line1, "%d %f %f %d %ld %f %f", &mnew, &temp, &top_p, &top_k, &seed, &rep_pen, &pres_pen);
+                    if (ids_line) for (tk = strtok_r(ids_line, " \t\n", &sp); tk && np < maxpos; tk = strtok_r(NULL, " \t\n", &sp))
+                        if (sscanf(tk, "%d", &v) == 1) ab[HDR + np++] = (float)v;
                     ab[0] = 1.f; ab[1] = (float)mnew; ab[2] = (float)np;
                     ab[3] = temp; ab[4] = top_p; ab[5] = (float)top_k; ab[6] = (float)seed;
                     ab[7] = rep_pen; ab[8] = pres_pen;
                 }
+                if (!sock_mode && pbuf) free(pbuf);           /* strdup from the file path */
             }
             if (m->ar_cb && m->ep_size > 1) m->ar_cb(ab, cap, m->ar_ctx);
-            if (ab[0] < 0.5f) break;                         /* file not visible to rank 0 yet -> retry */
+            if (ab[0] < 0.5f) break;                         /* nothing waiting -> retry next round */
             int mnew = (int)(ab[1] + 0.5f), np = (int)(ab[2] + 0.5f);
             for (int k = 0; k < np; k++) s->ids[k] = (int)(ab[HDR + k] + 0.5f);
             if (mnew < 0) mnew = 0; if (np + mnew > maxpos) mnew = maxpos > np ? maxpos - np : 0;
-            s->np = np; s->mnew = mnew; s->nids = np; s->id = qnext; qnext++;
+            s->np = np; s->mnew = mnew; s->nids = np; s->id = qnext; qnext++; s->cfd = taken_cfd;
             /* per-sequence sampler + PRNG (all ranks derive identical values -> identical draws -> lockstep).
              * temp<=0 => greedy (uses the batched argmax). seed 0 => derive from the request id (reproducible
              * per id; distinct across concurrent requests). */
@@ -523,8 +652,9 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
             if (s->active) { s->ids[s->nids++] = first;
                              if (first == DS4F_EOS_ID || s->nids - s->np >= s->mnew) s->active = 0; }
             if (!s->active && MyRank == 0) {                 /* prefill-only or immediate stop -> respond now */
-                ds4f_dyn_resp(base, s->id, s->ids + s->np, s->nids - s->np);
-                done_count++;
+                if (s->cfd >= 0) ds4f_sock_respond(&sock, s->cfd, s->ids + s->np, s->nids - s->np);
+                else ds4f_dyn_resp(base, s->id, s->ids + s->np, s->nids - s->np);
+                s->cfd = -1; done_count++;
             }
         }
         /* ---- gather the active set ---- */
@@ -553,7 +683,11 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
             s->ids[s->nids++] = tok; s->pos++;
             if (tok == DS4F_EOS_ID || s->nids - s->np >= s->mnew) {   /* retire -> respond, free slot */
                 s->active = 0;
-                if (MyRank == 0) { ds4f_dyn_resp(base, s->id, s->ids + s->np, s->nids - s->np); done_count++; }
+                if (MyRank == 0) {
+                    if (s->cfd >= 0) ds4f_sock_respond(&sock, s->cfd, s->ids + s->np, s->nids - s->np);
+                    else ds4f_dyn_resp(base, s->id, s->ids + s->np, s->nids - s->np);
+                    s->cfd = -1; done_count++;
+                }
             }
         }
         if (MyRank == 0) { double now = now_sec();

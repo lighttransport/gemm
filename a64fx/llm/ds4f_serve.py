@@ -142,6 +142,44 @@ def infer_dynamic(prompt, max_tokens, samp=None):
     except OSError: pass
     return ids, gen, decode(gen)
 
+# ---- SOCKET transport (DS4F_SERVE_SOCK): the runner's rank 0 hosts a TCP listener over the Tofu IP and
+# publishes "<ip> <port>" to <base>.sock. Each request opens a connection, sends [u32 BE len][payload],
+# reads [u32 BE len][gen ids]. Eliminates the file protocol's ~tens-of-seconds cross-node FS-cache
+# admission/response latency (control->compute TCP is ~1 ms; a request is then compute-bound). ----
+SOCK = int(os.environ.get("DS4F_SERVE_SOCK", "0"))
+_sock_addr = None
+def _sock_get_addr():
+    global _sock_addr
+    if _sock_addr: return _sock_addr
+    for _ in range(int(TIMEOUT * 10)):
+        try:
+            ip, port = open(BASE + ".sock").read().split(); _sock_addr = (ip, int(port)); return _sock_addr
+        except Exception: time.sleep(0.1)
+    raise RuntimeError("no %s.sock (runner not in DS4F_SERVE_SOCK mode?)" % BASE)
+
+def infer_socket(prompt, max_tokens, samp=None):
+    import socket, struct
+    ids = encode(prompt)
+    if not ids: return [], [], ""
+    if samp is None:
+        samp = {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "presence_penalty": 0.0,
+                "repeat_penalty": 1.0, "seed": None}
+    seed = samp.get("seed") if samp.get("seed") is not None else 0
+    payload = ("%d %g %g %d %d %g %g\n%s\n" % (max_tokens, samp["temperature"], samp["top_p"], samp["top_k"],
+               seed, samp["repeat_penalty"], samp["presence_penalty"], " ".join(map(str, ids)))).encode()
+    ip, port = _sock_get_addr()
+    s = socket.socket(); s.settimeout(TIMEOUT); s.connect((ip, port))
+    try:
+        s.sendall(struct.pack("!I", len(payload)) + payload)
+        hdr = b""
+        while len(hdr) < 4: hdr += s.recv(4 - len(hdr))
+        n = struct.unpack("!I", hdr)[0]; body = b""
+        while len(body) < n: body += s.recv(n - len(body))
+    finally:
+        s.close()
+    gen = [int(x) for x in body.split()]
+    return ids, gen, decode(gen)
+
 # Plain-text chat template (this checkpoint has no chat_template / role tokens).
 BOS = "<｜begin▁of▁sentence｜>"
 ROLE_TAG = {"system": "System", "user": "User", "assistant": "Assistant", "tool": "Tool"}
@@ -195,7 +233,8 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
     # concurrent batched decode: route greedy, non-cache requests through the dispatcher (the runner
     # is in DS4F_SERVE_BATCH mode -> the single-request protocol is not served there).
     if BATCH > 1 and not (cache_load or cache_save):
-        # both batched paths now support per-sequence sampling
+        # all batched paths support per-sequence sampling; SOCK is the low-latency dynamic transport
+        if DYNAMIC and SOCK: return infer_socket(prompt, max_tokens, samp)
         return infer_dynamic(prompt, max_tokens, samp) if DYNAMIC else infer_batched(prompt, max_tokens, samp)
     with _lock:
         ids = encode(prompt)

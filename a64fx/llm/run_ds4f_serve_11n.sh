@@ -55,6 +55,9 @@ export DS4F_SERVE_SLOTS=${DS4F_SERVE_SLOTS:-1}
 # concurrent batched decode: >1 = decode up to N requests together (throughput, greedy). Frontend coalesces.
 export DS4F_SERVE_BATCH=${DS4F_SERVE_BATCH:-1}
 export DS4F_SERVE_DYNAMIC=${DS4F_SERVE_DYNAMIC:-0}  # 1 = continuous batching (mid-flight admission)
+export DS4F_SERVE_SOCK=${DS4F_SERVE_SOCK:-0}        # 1 = TCP transport (needs DYNAMIC=1): rank 0 listens
+                                                    # on the Tofu IP, frontend connects per request. Cuts
+                                                    # the file protocol's cross-node FS-cache latency.
 # SYSCACHE: preload a persisted context (built once with a cache_save request) into slot 0 so every
 # conversation starts with the system prompt already prefilled -- instant TTFT, survives restarts.
 [ -n "$DS4F_SERVE_SYSCACHE" ] && export DS4F_SERVE_SYSCACHE
