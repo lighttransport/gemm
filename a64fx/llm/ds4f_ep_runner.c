@@ -1105,6 +1105,15 @@ int main(int argc,char**argv){
         }
         logmsg("CTX_CACHE: total=%.1f MB/node shardable=%.1f MB/node (max_pos=%d cp=%d cp_shard=%d)\n",
                tot/1048576.0, shard/1048576.0, cfg.max_pos, m->cp, envi("DS4F_CP_SHARD",0));
+        /* DS4F_CP_IDX break-even guard. The idx-merge gathers ep_size*index_topk candidates per CSA layer --
+         * a FIXED comm cost (measured ~56 ms/tok at N=11,k=512, and NOT reducible by packing the reduces:
+         * that was tried, zero benefit) -- while the scan-sharding saving only GROWS with ctx (~27 ms even
+         * at 128k). Break-even is ~276k ctx; below it CP_IDX is a NET LOSS (measured 16k: 7.81 -> 4.93
+         * tok/s). Prefer DS4F_IDX_REUSE, which cuts the same O(T) scan with ZERO comm at any ctx. */
+        if (m->cp && envi("DS4F_CP_IDX", 0) && cfg.max_pos < 262144)
+            logmsg("WARN: DS4F_CP_IDX at max_pos=%d is a NET LOSS (idx-merge comm ~56 ms/tok is fixed; "
+                   "break-even ~276k ctx). Measured 16k: 7.81 -> 4.93 tok/s. Use DS4F_IDX_REUSE instead.\n",
+                   cfg.max_pos);
     }
     double ta1 = now_sec();
     {   char tn[64]; snprintf(tn, sizeof tn, "ds4f_ep_load_rank%02d.txt", MyRank);

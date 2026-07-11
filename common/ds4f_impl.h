@@ -1893,6 +1893,9 @@ static int ds4f_index_step(
                 for (int j = 0; j < k; j++) { int g = lsel[j];
                     cp_cand_slot[base + j]  = (g >= 0) ? (float)g : -1.f;
                     cp_cand_score[base + j] = (g >= 0) ? score_scr[g - idx_s0] : 0.f; }
+                /* NOTE: packing these into ONE contiguous [2*ncand] reduce was tried and gave ZERO benefit
+                 * (16k CP_IDX: decode 202.9->203.8 ms/tok, comm 33.1%->33.3%) -- the merge is NOT
+                 * collective-count-bound; the cost is byte/chunk-driven. Kept as two for clarity. */
                 ar_cb(cp_cand_slot, ncand, ar_ctx); ar_cb(cp_cand_score, ncand, ar_ctx);
                 ds4f_cp_merge_topk(cp_cand_slot, cp_cand_score, ncand, k, offset, sel);
                 sel_done = 1;
