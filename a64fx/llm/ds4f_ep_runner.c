@@ -188,6 +188,7 @@ static void ds4f_serve_reset(ds4f_model *m) {
             if (ratio == 4) ds4f_compress_state_reset(ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ratio, c->index_head_dim);
         }
         ly->kv_caln = 0; ly->kv_frozen = 0; ly->cmp_caln = 0; ly->cmp_frozen = 0;   /* int8 recalibrate */
+        ly->sel_cache_pos = -1;   /* DS4F_IDX_REUSE: invalidate the cached selection at each request boundary */
     }
 }
 /* one generation: prefill the prompt positions [pf_from, np) -- pf_from>0 reuses a cached prefix

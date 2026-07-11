@@ -4108,6 +4108,31 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
             ly->idx_wq_b_sc = (float *)aligned_alloc(256, rows * 4);
             ds4f_quant_bf16_rows_i8(ly->idx_wq_b, (int)rows, c->q_lora, ly->idx_wq_b_i8, ly->idx_wq_b_sc);
         }
+        /* DS4F_IDX_REUSE=N: reuse this layer's cached selection for N-1 of every N single-stream decode
+         * steps (the O(T) scan+topk is the only ctx-growing decode term; the selection drifts slowly). On a
+         * reused step we still run the indexer compressor (idx-cache continuity) but skip qproj/scan/topk.
+         * `since>=1` naturally invalidates across request boundaries (a new sequence restarts at a lower pos).
+         * LOSSY (the newest ~N/ratio compressed slots aren't selectable until the next scan; they're recent so
+         * the sliding window covers them) -> coherence-gated. Batched decode (per-seq selections) is excluded. */
+        static int idx_reuse = -1;
+        if (idx_reuse < 0) { const char *e = getenv("DS4F_IDX_REUSE"); idx_reuse = (e && *e) ? atoi(e) : 0; }
+        int since = pos - ly->sel_cache_pos;
+        int reuse = idx_reuse > 1 && ly->sel_cache && ly->sel_cache_pos >= 0 && !m->dec_batch_seq
+                    && since >= 1 && since < idx_reuse;
+        if (reuse) {
+            float *comp_out = (float *)alloca((size_t)ihd * 4);   /* indexer compressor only (mirrors index_step) */
+            if (ds4f_compress_step(m->s_hn, c->hidden, ihd, rd, ratio, pos,
+                                   ly->idx_cmp_wkv, ly->idx_cmp_wgate, 1, ly->idx_cmp_ape, ly->idx_cmp_norm,
+                                   rcos, rsin, eps, 1, ly->idx_cmp_kv_state, ly->idx_cmp_score_state, comp_out, m->pool)) {
+                int slot = pos / ratio, int_mode = (ly->idx_kv8 || ly->idx_kv8_4);
+                if (!int_mode || slot < DS4F_IDX_F32_SLOTS) memcpy(ly->idx_kv + (size_t)slot*ihd, comp_out, (size_t)ihd*4);
+                int iloc = ly->idx_cp_on ? ((slot >= ly->idx_cp_s0 && slot < ly->idx_cp_s1) ? slot - ly->idx_cp_s0 : -1) : slot;
+                if (ly->idx_kv8_4) { if (iloc >= 0) ds4f_idx_quant_pos_i4(comp_out, ihd, ly->idx_kv8_4 + (size_t)iloc*(ihd/2), &ly->idx_pscale[iloc]); }
+                else if (ly->idx_kv8) ds4f_idx_quant_pos(comp_out, ihd, ly->idx_kv8 + (size_t)slot*ihd, &ly->idx_pscale[slot]);
+            }
+            memcpy(m->s_tb2_sel, ly->sel_cache, (size_t)ly->sel_cache_n * sizeof(int));
+            m->s_tb2_nsel = ly->sel_cache_n;
+        } else {
         double _sc_snap = ds4f_g_tb2scan, _qp_snap = ds4f_g_tb2qproj, _rp_snap = ds4f_g_tb2rope,
                _ic_snap = ds4f_g_tb2icmp, _wp_snap = ds4f_g_tb2wproj, _tk_snap = ds4f_g_tb2topk;
         ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, c->q_lora,
@@ -4131,6 +4156,12 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         int nsel = 0;                                           /* compact + strip offset -> local idx */
         for (int i = 0; i < k; i++) { int v = m->s_tb2_sel[i]; if (v < 0) break; m->s_tb2_sel[nsel++] = v - offset; }
         m->s_tb2_nsel = nsel;
+        if (idx_reuse > 1 && !m->dec_batch_seq) {              /* cache the fresh selection for reuse */
+            if (!ly->sel_cache) ly->sel_cache = (int *)malloc((size_t)k * sizeof(int));
+            memcpy(ly->sel_cache, m->s_tb2_sel, (size_t)nsel * sizeof(int));
+            ly->sel_cache_n = nsel; ly->sel_cache_pos = pos;
+        }
+        }
     } else {                                                    /* HCA: all compressed tokens */
         for (int t = 0; t < T; t++) m->s_tb2_sel[t] = t;
         m->s_tb2_nsel = T;

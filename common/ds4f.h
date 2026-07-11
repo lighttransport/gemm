@@ -306,6 +306,10 @@ typedef struct {
     int       idx_cp_on;             /* DS4F_CP_IDX: idx_kv8_4/idx_pscale slot-sharded [idx_cp_s0,idx_cp_s1) */
     int       idx_cp_s0, idx_cp_s1;  /* this node's owned indexer-slot range (per-slot scale -> no CAL replication) */
     int       idx_cp_nslot;          /* idx_kv8_4 slot capacity (DEBUG bounds guard) */
+    /* DS4F_IDX_REUSE: per-layer cached indexer selection (offset-stripped local cmp indices) + the position
+     * it was scanned at. Re-scan every N decode steps, reuse in between (the O(T) scan+topk is the only
+     * ctx-growing decode term; the selection drifts slowly). Lazily allocated. */
+    int      *sel_cache; int sel_cache_n, sel_cache_pos;
 } ds4f_layer;
 
 /* Batched concurrent decode (DS4F_DECODE_BATCH): the per-sequence DATA/STATE cache buffers for one
