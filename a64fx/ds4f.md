@@ -1285,6 +1285,53 @@ on TF_ACCURACY, not on comparing completions — a repetitive test prompt made t
 into copying its input while the reused run correctly summarized, which would have read as a false "win".)*
 **The win scales with ctx** (the skipped terms are the O(T) ones) → extrapolates to **~+35% decode at 128k**.
 
+### LANDED/REFUTED — long-ctx follow-ups (2026-07-11b, commits `94484265`/`a2821722`, alloc 49529254)
+
+**1. `IDX_REUSE` under batched decode + a REAL BUG (commit `94484265`).** `sel_cache` moved into `ds4f_lseq`
+(pre-allocated per bundle; pointer swapped by `ds4f_lseq_apply`, scalars written back by `_capture`), so
+`DS4F_IDX_REUSE` now works batched. **★ In doing so, found a latent bug from `ef1e07f8`: the serve loops hand
+`ds4f_forward_verify` a COMPACTED COPY of the active bundles (`view[a] = bundles[map[a]]`, by value), so every
+`ds4f_lseq_capture` landed in that copy and was DISCARDED when the view was rebuilt next step.** The
+per-sequence mutable state never advanced — the `cmp_frozen`/`caln` mid-decode-freeze write-back was silently
+lost, and IDX_REUSE re-used a stale selection forever. New `ds4f_lseq_sync()` copies the mutable scalars from
+the view back into the owning bundle after each decode step, in both serve loops. *The `DECODE_BATCH`
+isolation test never caught it because it sets `dec_batch_seq` to the REAL bundles array, not a view.*
+Validated with REAL selection pruning (prompts 2471/2134 tok → T=617 > topk=512), dynamic serve B=4 over the
+socket: `IDX_REUSE=0` control **A-batched == A-solo (True — batched decode is bit-exact here)**; `=4` BEFORE
+fix **False, diverged @ token 15**; `=4` AFTER fix **True**. *The control is what proved the divergence was
+mine and not pre-existing M-reassociation — always run it.*
+
+**2. REFUTED — packing the CP_IDX merge reduces (commit `a2821722`).** Hypothesis: the idx-merge is
+collective-COUNT-bound (2 reduces × 20 CSA layers = 40/token at the ~280 µs floor), so packing slot+score
+into ONE contiguous reduce halves the comm. **Measured: ZERO benefit** (16k CP_IDX decode 202.9 → 203.8
+ms/tok, comm 33.1% → 33.3%). The cost is byte/chunk-driven, not call-driven. Reverted. **★ Worse, the
+measurement exposes that CP_IDX's merge comm is FIXED** — it gathers `ep_size*index_topk` candidates per CSA
+layer regardless of ctx (**~56 ms/tok** at N=11, k=512) — while the scan-sharding saving only GROWS with ctx
+(~27 ms even at 128k). **Break-even ≈ 276k ctx: `DS4F_CP_IDX` is a NET LOSS at every practical context**
+(measured 16k: 7.81 → 4.93 tok/s). `ncand` can't shrink without breaking exactness (the global top-k may take
+all k from one node). Added a rank-0 startup WARN below 256k pointing at `DS4F_IDX_REUSE`, which cuts the same
+O(T) scan with **zero comm** at any ctx and is strictly the better lever.
+
+**3. `DS4F_IDX_INT8W` — PASSES the gate, but modest.** int8 W8A8 indexer qproj. **TF_ACCURACY 2413/2470 =
+97.7%, IDENTICAL to the exact baseline** → quality-safe. Speed: decode 119.4 → **117.7 ms/tok (+1.4%)**,
+prefill +0.9%. The old "+4.1% @5k" claim doesn't hold here — qproj is a FIXED ~3.2 ms cost, so its *share*
+shrinks as decode grows. Safe to enable; small win.
+
+**4. ctx=32768 CLEARS with `DS4F_Q8_DENSE=1` + int8 KV + int4 cmp/idx (the 256k blocker).** Fresh alloc,
+ctx-warm 32k: **RSS 22.56 GB** (vs the 27.95 GB that used to OOM), arena 21.74, `CTX_CACHE` 54.6 MB/node,
+decode **7.32 tok/s**, NaNs=0, **MemFree 30.9 GB — ~8.5 GB of headroom.** Extrapolating the cache slope
+(~1.7 MB/1k-ctx) the MEMORY ceiling is millions of tokens. **So memory is no longer the long-ctx binding
+constraint — the O(T) indexer scan COMPUTE is.**
+
+**★ `IDX_REUSE` confirmed to scale with ctx (the point of the lever).** Measured at real ctx (not extrapolated):
+
+| ctx | reuse=0 | reuse=4 | gain |
+|---|---|---|---|
+| 8k  | 123.7 ms/tok | 115.2 | **+7.3%** |
+| 32k | 136.7 ms/tok | 122.0 (7.32 → **8.20 tok/s**) | **+12.0%** |
+
+(at 32k, `tb2scan` 1.96 / `tb2topk` 1.88 / `tb2qproj` 0.80 ms — all ÷~4). Extrapolates to ~+30-35% at 128k.
+
 ### Resuming prompt — Phase 2 CP (next session)
 > **STATUS UPDATE 2026-07-11:** the CP code is well past the Stage-A checkpoint the prompt below describes.
 > In-tree now (`ds4f_impl.h`): `ds4f_cp_slot_shard` (`:185`); storage sharding `DS4F_CP_SHARD` for `cmp_q4`
