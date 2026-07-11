@@ -1170,8 +1170,31 @@ window sweep) since per-position attention scales with KV length. Independence h
 numbers are noisy (peak depends on exact ctx at measurement) but the saturation is robust. **Practical
 sweet spot ≈ B=8-16** (throughput plateau + lower per-request latency + 8-16 cache bundles vs 32); B=32
 buys little for 2× the bundle memory. The real lever beyond this is per-sequence attention cost (CP shards
-the caches; a cheaper long-ctx attention), not larger B. Client-observed tok/s (10-14) is FS-round-trip-
-bound (the file protocol), not the compute number.
+the caches; a cheaper long-ctx attention), not larger B. Client-observed tok/s (10-14) WAS FS-round-trip-
+bound (the file protocol); the socket transport below removes that.
+
+### LANDED — DS4F_SERVE_SOCK TCP transport (2026-07-11, commit `c856ce83`)
+
+The file protocol's admission/response latency is dominated by **cross-node FEFS/LLIO cache visibility**
+(~tens of seconds: login-node client writes `q.<id>`, the compute-node runner sees it only after the
+attr/dentry cache refreshes; `r.<id>` propagates back the same way). **TCP over the Tofu IP interface**
+(the nodes have `tofu0`/`tofu1` 10.x IPv4 addrs) between the login node and the runner's rank-0 compute
+node is **0.7 ms round-trip** (measured with a throwaway `mpiexec -np 1` python server on one compute node
++ a control-node connect). So rank 0 hosts a non-blocking TCP listener and publishes `<ip> <port>` to
+`<base>.sock`; the frontend connects per request. Frame = `[u32 BE len][payload]`; request payload is the
+SAME 2-line text as a `q.<id>` file (so per-seq sampling flows through unchanged); response is `gen ids\n`.
+Only rank 0 touches sockets — the parsed request is broadcast to the EP group via `ar_cb` exactly like the
+file path, so **lockstep is unchanged**. Falls back to file mode if the listener fails. Frontend
+`ds4f_serve.py infer_socket` (routed when `DYNAMIC && SOCK`).
+
+**Result — single-request serving is now COMPUTE-bound, not FS-bound.** Real-weight 11n (alloc 49526204):
+40-tok greedy request **3.33 s** end-to-end (83 ms/tok) vs **~30 s** under the file protocol; 1-token
+request **596 ms** (prefill-bound); 4 concurrent **9.36 s = 17.1 tok/s** end-to-end (vs file's 6.4);
+per-sequence independence (A concurrent == A alone) + sampling reproducibility preserved; runner-internal
+22.7 tok/s at active=4 unchanged (socket admission is free). **The ~tens-of-seconds FS-visibility floor is
+gone.** *Ops note: the throwaway-server trick (`socksrv.py` + `vcoord_1.txt` = one line of `vcoord_ds4f.txt`)
+is the fast way to test cross-node TCP without the runner; debug/aux files for compute nodes go under `$HOME`
+(the scratchpad dir isn't mounted there).*
 
 ### Resuming prompt — Phase 2 CP (next session)
 > **TASK: DS4F sharded-KV context parallelism (`DS4F_CP`).** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`). Full design + file:line in the plan file `~/.claude/plans/see-a64fx-ds4f-md-and-keep-floofy-dragon.md` and the "Phase 2" section above.
