@@ -1236,9 +1236,20 @@ is the fast way to test cross-node TCP without the runner; debug/aux files for c
 > `ds4f_alloc_decode_batch`/`_free` allocate/free per-bundle quant buffers (shard capacity = base layer's).
 > Validated via the `DS4F_DECODE_BATCH` isolation test (seqA solo == seqA batched-with-seqB, token-exact):
 > **CP+int4+CP_SHARD/IDX/COMBINE with `DS4F_INT8CMP_CAL=4` (early freeze → positions 16-47 use the SHARDED
-> per-seq cmp_q4): 48/48 PASS**; standard non-CP bf16: 48/48 (no regression). **REMAINING:** long-ctx A/B:
-> per-node MemFree + coherence at max_pos = 32k/64k/128k, CP-on vs the CP-off ceiling (dedicated alloc — long
-> ctx OOM-risks the shared job). NOTE the plan file
+> per-seq cmp_q4): 48/48 PASS**; standard non-CP bf16: 48/48 (no regression).
+>
+> **LONG-CTX MEMORY A/B DONE (commit `b3f2c350`).** Couldn't `pjsub` a dedicated alloc (compute node has no
+> `pjsub`; login node unreachable) — but didn't need to: the caches are LAZILY allocated (RSS at max_pos=16k
+> == 128k with a 2-token gen, both 21.8 GB, since untouched slots aren't resident), and the RESERVED
+> allocation == the resident memory once ctx fills. So a new `CTX_CACHE` load-time log (rank 0 sums the
+> O(ctx) KV/cmp/idx buffers + the CP-shardable int4 subset) measures the A/B safely with a tiny gen. Measured
+> 11n, int4, CP-off vs CP-on(`CP_SHARD`+`CP_IDX`): **128k 223.0 → 30.0 MB/node (−193, 8.8×); 512k 875.9 →
+> 103.0 MB/node (−773, 8.5×)**. Linear (~1.5 MB/1k-ctx/node saved) → ~1.5 GB/node at 1M ctx. **Honest
+> framing: under int4 the caches are already small, so CP's MEMORY saving is modest at 128k (~193 MB/node)
+> and only a GB-scale ceiling lever at 512k-1M+; CP's bigger near-term win is COMPUTE — the combine's −36%
+> decode comm + the sharded index scan.** For a resident-memory check at true long ctx on a dedicated alloc,
+> generate to ~128k actual positions and read node MemFree (expect the CP-off − CP-on gap = the CTX_CACHE
+> delta above). **CP Phase-2 is complete: Stage A/B/C + verify/prefill + batched-decode + the memory A/B.** NOTE the plan file
 > `~/.claude/plans/see-a64fx-ds4f-md-...md` is GONE — reconstruct design from the in-tree code above + the
 > git history (`git log --oneline | grep -iE 'CP |attn-CP|slot-shard'`; some CP commits are glm5/m3, not ds4f).
 >
