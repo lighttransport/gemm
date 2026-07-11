@@ -2227,3 +2227,55 @@ nothing to hide: the fast ranks are already idle waiting on a slow rank's COMPUT
 refuted independently: WS4 for the reduce, and the roofline for decode∥GEMM double-buffering.)
 
 **ds4fbase 12n decode, cumulative:** 11.34 (FP8 baseline) → 17.05 tok/s.
+
+## ds4f (Flash) on 12 nodes with the baked Q8 dense — 18.98 single-stream / 32.8 batched (2026-07-12)
+
+Same stack as ds4fbase (offline bake + `LLM_THREADS=47`), applied to Flash. Flash FITS WITHOUT any
+per-layer TP (arena 18.91 GB), which is the whole difference: **1 all-reduce per layer instead of 2**.
+
+Config: `DS4F_MODEL=ds4f DS4F_DENSE=q8pv`, `TP_ATTN=0 TP_OPROJ=0 TP_WOB=0`, `TP_SHARED=1`
+`TP_HEAD=1 TP_EMBED=1`, `CMP_LOCAL=1 HC_SVE=1 MV_FUSE=1`, `LLM_THREADS=47`.
+
+| step | decode | note |
+|---|---|---|
+| full TP (base-style) | 17.11 | comm 27.5 ms — TP is a NET LOSS here |
+| no per-layer TP | 18.22 | comm 27.5 → 12.4 (half the barriers) |
+| + `TP_SHARED=1` | 18.74 | FREE: its partial folds into the EP reduce, no extra all-reduce |
+| + `DS4F_MV_FUSE=1` | **18.98** | (was implemented + single-node validated but never A/B'd on real weights) |
+| *48 threads* | *14.48* | the leave-a-core-free rule holds on Flash too |
+
+### Single-stream ceiling is ~21.8 tok/s — and it is NOT the dense weights
+
+52.7 ms/tok = compute 39.7 + comm 12.1. Weight bytes 7.06 GB/tok → HBM roofline 8.5 ms.
+
+```
+dense matvec (qkv+o_proj+shared)  19.9 ms  = 295 GB/s = 73% of the PINNED q8-sdot ceiling (402)
+tb2prep (compressor/indexer)       8.3 ms  \
+experts                            4.7 ms   |  19.2 ms of NON-matvec work that
+mhc (HC_SVE already on)            4.6 ms   |  no weight format can shrink
+attn/router/head                   1.6 ms  /
+comm                              12.1 ms  = 43 reduces x ~0.28 ms (already 1/layer)
+```
+Even at the dense kernel's 402 GB/s ceiling: 14.6 + 19.2 + 12.1 = **45.9 ms → ~21.8 tok/s**. The
+blocker is the Tier-B2 attention + MoE + mHC work, i.e. model architecture, not kernel choice.
+(`bf16-pv` does not help: the pinned bench has it at the SAME wall as q8-sdot — 735 GB/s but 2x
+the bytes.)
+
+### Batched decode is where 30-40 tok/s lives
+
+`DS4F_DB_BENCH=1`, same config, aggregate tok/s:
+
+| M | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| baked Q8 | 13.7 | 18.4 | 23.5 | 26.8 | 29.7 | 31.4 |
+| **+ `DS4F_PF_TP=1`** | 15.3 | 19.9 | 24.6 | 28.1 | **31.0** | **32.8** |
+| per-seq | 15.3 | 9.95 | 6.16 | 3.52 | 1.94 | 1.02 |
+
+**Peak 32.8 aggregate at M=32; M=16 (31.0) is the sweet spot** — M=16→32 buys only +6% while
+halving per-seq latency. `PF_TP` is worth ~+6% across the curve.
+
+Two gotchas: the curve saturates because the MoE experts barely amortize (top-6-of-256 rarely
+share an expert) and Tier-B2's compressor/indexer runs PER-POSITION, so tb2prep scales ~linearly
+with M and becomes the new bottleneck. And **M=1 through the batch path (15.3) is SLOWER than
+single-stream matvec decode (18.98)** — batching is a throughput mode you switch into, not a
+strictly-better path.
