@@ -463,6 +463,9 @@ typedef struct {
     float *s_h2, *s_router, *s_shg, *s_shu, *s_exg, *s_exu, *s_moe, *s_logits;
     float *s_route;         /* routed-expert partial (owned-only); EP-summed via ar_cb */
     float *s_attn_sc;       /* DS4F_ATTN_GEMM: [n_heads*(window+index_topk)] scores->softmax weights (lazy) */
+    float *s_attn_m;             /* DS4F_CP_COMBINE: per-head local max (lazy, [n_heads]) */
+    float *s_attn_comb;          /* DS4F_CP_COMBINE: packed [acc: n_heads*q_head_dim | l: n_heads] reduced in
+                                  * ONE ar_cb (min collective count on this latency-bound fabric) (lazy) */
     float *s_idx_qpre;      /* batched-prefill: pre-projected indexer q for the current pos (NULL=compute in index_step) */
     float *v_idxq;          /* [m_tile*index_n_heads*index_head_dim] batched qproj output (lazy, verify prefill) */
     /* batched (M>1) prefill scratch (only allocated by ds4f_alloc_prefill_batch;

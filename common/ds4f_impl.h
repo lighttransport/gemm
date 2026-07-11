@@ -3818,6 +3818,93 @@ static void ds4f_attn_tb2_worker(void *arg, int tid, int nthr) {
     }
 }
 
+/* ===================== DS4F_CP_COMBINE: Stage-C online-softmax attention combine ==================
+ * Instead of GATHERING every selected latent to every node (ns*KV floats/layer of comm), each node
+ * attends over only the terms it OWNS and emits a per-head partial {max, sum-exp, weighted-V}; the
+ * partials combine cross-node with a max-reduce + a sum-reduce (comm = n_heads*HD, ~20x less). Ownership:
+ * rank 0 owns the window + sink + the replicated [0,CAL) selected slots; every node owns its cmp-shard
+ * tail [cp_t0,cp_t1). COHERENT (reassociates the softmax), not bit-exact -- gate on real-weight coherence.
+ * int4 cmp (cmp_q4) + bf16/int8 window (the CP decode config); requires cmp_frozen + cp_on + TP_ATTN off. */
+static void ds4f_attn_tb2_combine_worker(void *arg, int tid, int nthr) {
+    ds4f_attn_ex_task *T = (ds4f_attn_ex_task *)arg;
+    ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
+    int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora;
+    int pos = T->pos, p_lo = pos - T->win + 1; if (p_lo < 0) p_lo = 0;
+    int nP = pos - p_lo + 1, nsel = m->s_tb2_nsel;
+    const int *sel = m->s_tb2_sel;
+    int r0 = (m->ep_rank == 0), CAL = ds4f_int8cmp_cal;
+    int cp_t0 = ly->cp_t0, cp_t1 = ly->cp_t1;
+    int sve = ds4f_attn_sve;
+    int i8 = (m->int8_kv && ly->kv_frozen); const float *kvsc = ly->kv_scale;
+    const uint16_t *kvbf = (m->int8_kv && !ly->kv_frozen) ? ly->kv_calbuf : ly->kv_cache;
+    const float *cmpsc = ly->cmp_scale;
+    int nh = m->cfg.n_heads;
+    int h0, h1; ds4f_head_split(m, nthr, tid, &h0, &h1);
+    int cap = (r0 ? nP : 0) + nsel;
+    float *sc  = (float *)alloca((size_t)(cap > 0 ? cap : 1) * 4);
+    int   *src = (int   *)alloca((size_t)(cap > 0 ? cap : 1) * sizeof(int));  /* >=0 window slot; <0 => -(loc+1) cmp slot */
+    for (int h = h0; h < h1; h++) {
+        const float *q = m->s_q + (size_t)h*HD;
+        float mx = -1e30f; int cnt = 0;
+        if (r0) for (int j = 0; j < nP; j++) {                    /* window term (rank 0 owns it) */
+            int slot = (p_lo + j) % ly->kv_slots; float s;
+            if (i8) { const int8_t *kc = ly->kv_q + (size_t)slot*KV;
+                s = sve ? ds4f_sve_dot_i8s(q, kc, kvsc, KV) : ds4f_scalar_dot_i8s(q, kc, kvsc, KV); }
+            else { const uint16_t *kc = kvbf + (size_t)slot*KV;
+                if (sve) s = ds4f_sve_dot_bf16(q, kc, KV);
+                else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d]*ds4f_bf16f(kc[d]); } }
+            s *= T->scale; sc[cnt] = s; src[cnt] = slot; cnt++; if (s > mx) mx = s;
+        }
+        for (int j = 0; j < nsel; j++) {                         /* owned selected (int4 cmp) */
+            int g = sel[j], loc;
+            if (g < CAL) { if (!r0) continue; loc = g; }         /* replicated calib region -> rank 0 */
+            else { if (!(g >= cp_t0 && g < cp_t1)) continue; loc = CAL + (g - cp_t0); }  /* sharded tail owner */
+            const uint8_t *kc = ly->cmp_q4 + (size_t)loc*(KV/2);
+            float s = sve ? ds4f_sve_dot_i4s(q, kc, cmpsc, KV) : ds4f_scalar_dot_i4s(q, kc, cmpsc, KV);
+            s *= T->scale; sc[cnt] = s; src[cnt] = -(loc+1); cnt++; if (s > mx) mx = s;
+        }
+        float l = r0 ? expf(ly->attn_sink[h] - mx) : 0.f;        /* sink term once (rank 0) */
+        for (int j = 0; j < cnt; j++) { float e = expf(sc[j] - mx); sc[j] = e; l += e; }
+        float *out = m->s_attn_comb + (size_t)h*HD;              /* packed acc region */
+        for (int d = 0; d < HD; d++) out[d] = 0.f;
+        for (int j = 0; j < cnt; j++) {                          /* weighted V (UNNORMALIZED) */
+            float w = sc[j];
+            if (src[j] >= 0) {
+                if (i8) { const int8_t *kc = ly->kv_q + (size_t)src[j]*KV;
+                    if (sve) ds4f_sve_axpy_i8s(out, kc, kvsc, w, HD); else ds4f_scalar_axpy_i8s(out, kc, kvsc, w, HD); }
+                else { const uint16_t *kc = kvbf + (size_t)src[j]*KV;
+                    if (sve) ds4f_sve_axpy_bf16(out, kc, w, HD);
+                    else for (int d = 0; d < HD; d++) out[d] += w*ds4f_bf16f(kc[d]); }
+            } else { const uint8_t *kc = ly->cmp_q4 + (size_t)(-(src[j])-1)*(KV/2);
+                if (sve) ds4f_sve_axpy_i4s(out, kc, cmpsc, w, HD); else ds4f_scalar_axpy_i4s(out, kc, cmpsc, w, HD); }
+        }
+        m->s_attn_m[h] = mx; m->s_attn_comb[(size_t)nh*HD + h] = l;  /* max + packed l; de-rotate deferred */
+    }
+}
+/* reduce the partials into the exact global attention on every node, then de-rotate @ the query pos.
+ * TWO collectives: max per head, then ONE sum over the packed [acc | l] (rescaled). Every rank calls both
+ * -> lockstep. COHERENT (reassociated softmax), not bit-exact to the gather/replicated path. */
+static void ds4f_cp_attn_combine(ds4f_model *m, int pos, const float *rcos, const float *rsin) {
+    int nh = m->cfg.n_heads, HD = m->cfg.q_head_dim, rd = m->cfg.qk_rope_dim, nope = HD - rd, half = rd/2;
+    float *cb = m->s_attn_comb;                                  /* [acc: nh*HD | l: nh] */
+    float *mloc = (float *)alloca((size_t)nh * 4);
+    memcpy(mloc, m->s_attn_m, (size_t)nh * 4);                   /* save this node's local max */
+    m->ar_max_cb(m->s_attn_m, nh, m->ar_max_ctx);                /* -> global max per head */
+    for (int h = 0; h < nh; h++) {                               /* rescale acc + l by exp(local-global) */
+        float sc = expf(mloc[h] - m->s_attn_m[h]);               /* (0,1]; 0 if this node scored nothing */
+        float *acc = cb + (size_t)h*HD;
+        for (int d = 0; d < HD; d++) acc[d] *= sc;
+        cb[(size_t)nh*HD + h] *= sc;
+    }
+    m->ar_cb(cb, nh*HD + nh, m->ar_ctx);                         /* global [numerator | denom] in one reduce */
+    for (int h = 0; h < nh; h++) {                               /* normalize + de-rotate @ query pos -> s_attn */
+        float inv = 1.0f / cb[(size_t)nh*HD + h];
+        float *acc = cb + (size_t)h*HD, *out = m->s_attn + (size_t)h*HD;
+        for (int d = 0; d < HD; d++) out[d] = acc[d] * inv;
+        ds4f_rope_apply(out + nope, rcos, rsin, pos, half, 1);
+    }
+}
+
 /* ===================== DS4F_ATTN_GEMM: KV-reuse (8-head-blocked) tb2 decode attention =========
  * The per-head worker re-reads each KV latent kv[j] 64x (once per head) -> attn runs at ~0.5%
  * of peak, bound by the redundant L2 reads (1 KV head in MLA; every head dots the same kv[j]).
@@ -5677,11 +5764,16 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         if (m->tierb2 && ratio) { DS4F_TIC();
             ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin);  /* fills s_tb2_sel/nsel */
             DS4F_TOC(DS4F_P_TB2PREP); }
-        /* ---- CP gather-selected (CSA only): dequant the selected cmp_q4 latents to f32 and ar_cb-SUM
-         * so every node holds the full selected set even though cmp_q4 is slot-sharded; attention reads
-         * s_cmp_gather instead of cmp_q4[sel]. Step A (cmp still replicated): only rank 0 contributes. */
+        /* ---- CP selected-latent attention: Stage-C online-softmax COMBINE (DS4F_CP_COMBINE, comm =
+         * n_heads*HD) or the GATHER fallback (comm = ns*KV, reconstructs the full selected set). Combine
+         * needs the cmp sharded (cp_on) + frozen + TP_ATTN off; the decision is deterministic per layer so
+         * every rank agrees (lockstep). Combine skips the gather entirely. ---- */
+        static int s_cp_comb = -1;
+        if (s_cp_comb < 0) { const char *e = getenv("DS4F_CP_COMBINE"); s_cp_comb = (e && *e && atoi(e)) ? 1 : 0; }
+        int cp_combine = s_cp_comb && m->cp && m->tierb2 && ratio == 4 && m->int4_cmp && ly->cmp_frozen
+                         && ly->cp_on && m->ar_max_cb && m->ar_cb && (m->attn_h1 - m->attn_h0 == c->n_heads);
         m->cp_gather = 0;
-        if (m->cp && m->tierb2 && ratio == 4 && m->int4_cmp && ly->cmp_frozen && m->ar_cb) {
+        if (!cp_combine && m->cp && m->tierb2 && ratio == 4 && m->int4_cmp && ly->cmp_frozen && m->ar_cb) {
             int ns = m->s_tb2_nsel, CAL = ds4f_int8cmp_cal;
             memset(m->s_cmp_gather, 0, (size_t)ns*KV*4);
             for (int j = 0; j < ns; j++) {        /* each node dequants the selected slots IT owns; ar_cb-SUM -> all */
@@ -5704,7 +5796,13 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             /* window + indexer-selected compressed term (prepare ran above). */
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
-            if (!ds4f_attn_tb2_gemm(m, &at))   /* DS4F_ATTN_GEMM: 8-head KV-reuse; falls back to per-head */
+            if (cp_combine) {                  /* Stage-C: per-node partials -> cross-node online-softmax combine */
+                int nh = c->n_heads;
+                if (!m->s_attn_m) { m->s_attn_m    = (float *)aligned_alloc(64, ((size_t)nh*4 + 63) & ~63ull);
+                                    m->s_attn_comb = (float *)aligned_alloc(64, ((size_t)(nh*HD + nh)*4 + 63) & ~63ull); }
+                ds4f_pool_run(m->pool, ds4f_attn_tb2_combine_worker, &at);
+                ds4f_cp_attn_combine(m, pos, rcos, rsin);
+            } else if (!ds4f_attn_tb2_gemm(m, &at))   /* DS4F_ATTN_GEMM: 8-head KV-reuse; falls back to per-head */
                 ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
         } else if (m->exact) {
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
