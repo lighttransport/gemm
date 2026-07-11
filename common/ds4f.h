@@ -471,6 +471,9 @@ typedef struct {
     int m_tile;
     float *p_x, *p_hn, *p_qlat, *p_q, *p_kvlat, *p_attn, *p_o1, *p_o;
     float *p_h2, *p_shg, *p_shu, *p_moe, *p_route, *p_router, *p_logits;
+    /* [m_tile, vocab] full per-row logits reconstructed for batched SAMPLING under TP_HEAD (zero-fill the
+     * owned shard + ar_cb SUM). When the head is replicated it aliases p_logits. Lazily allocated. */
+    float *p_logits_full;
     /* expert-grouping prefill scratch: per owned slot a bucket of routed tokens
      * (ex_tok[slot*m_tile+p]=token idx, ex_wt=its routed weight); p_exX gathers
      * those tokens' h2, p_exG/p_exU hold the w1/w3 GEMM out, p_exO the w2 out. */

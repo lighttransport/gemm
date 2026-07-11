@@ -4688,7 +4688,10 @@ static void ds4f_alloc_prefill_batch(ds4f_model *m, int m_tile) {
      * for the OLD (smaller) m_tile -- a larger-M verify would overrun them. Free -> NULL so verify
      * reallocs them at the new m_tile. (free(NULL) is safe on the first call.) */
     free(m->v_x4); m->v_x4 = NULL; free(m->v_resid); m->v_resid = NULL;
-    free(m->v_idxq); m->v_idxq = NULL; free(m->p_logits); m->p_logits = NULL;
+    free(m->v_idxq); m->v_idxq = NULL;
+    if (m->p_logits_full == m->p_logits) m->p_logits_full = NULL;   /* aliased (replicated head) -> don't double-free */
+    else { free(m->p_logits_full); m->p_logits_full = NULL; }
+    free(m->p_logits); m->p_logits = NULL;
     ds4f_config *c = &m->cfg;
     int C = c->hidden, H = c->n_heads*c->q_head_dim;
     size_t T = (size_t)m_tile;
@@ -5090,12 +5093,35 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
      * ar_argmax_cb (M small 2-float argmax all-reduces, ONCE -- cheap, unlike a full [M,vocab] logit reduce). */
     int hrows = m->head.rows, tph = (hrows < c->vocab);
     ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, M, hrows, C);
-    { float *hval = tph ? (float *)alloca((size_t)M*4) : NULL;
+    if (m->want_full_logits) {
+        /* SAMPLING: the caller needs full [M, vocab] logits (temp/top_p/top_k read every entry). Under
+         * TP_HEAD, p_logits holds only the owned [M, hrows] shard -> scatter each row into a full-vocab
+         * row (zero-fill) and all-reduce-SUM so every rank ends up with the SAME full logits (== the
+         * greedy argmax-merge lockstep guarantee, just the full vector). Replicated head -> already full,
+         * alias it. out_tok is still filled with the per-row argmax (greedy sequences in the batch use it). */
+        int V = c->vocab;
+        if (tph && m->ar_cb) {
+            if (!m->p_logits_full) m->p_logits_full = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)V*4);
+            memset(m->p_logits_full, 0, (size_t)M*(size_t)V*4);
+            for (int mm = 0; mm < M; mm++)
+                memcpy(m->p_logits_full + (size_t)mm*V + m->head_r0, m->p_logits + (size_t)mm*hrows, (size_t)hrows*4);
+            m->ar_cb(m->p_logits_full, M*V, m->ar_ctx);
+        } else {
+            m->p_logits_full = m->p_logits;                    /* replicated head: [M, vocab] already full */
+        }
+        for (int mm = 0; mm < M; mm++) {
+            float *lg = m->p_logits_full + (size_t)mm*V; int best = 0; float bv = lg[0];
+            for (int v = 1; v < V; v++) if (lg[v] > bv) { bv = lg[v]; best = v; }
+            out_tok[mm] = best;
+        }
+    } else {
+      float *hval = tph ? (float *)alloca((size_t)M*4) : NULL;
       ds4f_pf_argmax_task t = { m->p_logits, out_tok, hrows, M, m->head_r0, hval };
       ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
       if (tph && m->ar_argmax_cb)
           for (int mm = 0; mm < M; mm++) { int32_t idx = out_tok[mm]; float v = hval[mm];
-              m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[mm] = idx; } }
+              m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[mm] = idx; }
+    }
     DS4F_TOC(DS4F_P_HEAD); }
 }
 
@@ -5372,12 +5398,35 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
     if (!m->p_logits) m->p_logits = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)c->vocab*4);
     int hrows = m->head.rows, tph = (hrows < c->vocab);
     ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, K, hrows, C);
-    { float *hval = tph ? (float *)alloca((size_t)K*4) : NULL;
+    if (m->want_full_logits) {
+        /* SAMPLING (per-sequence temp/top_p/top_k): reconstruct full [K, vocab] logits on every rank.
+         * Under TP_HEAD, p_logits holds only the owned [K, hrows] shard -> scatter each row into a
+         * full-vocab row (zero-fill) and all-reduce-SUM so every rank has the SAME full logits (the
+         * lockstep guarantee -- else ranks draw different tokens). Replicated head -> already full, alias.
+         * out_tok still gets the per-row argmax (greedy sequences in a mixed batch use it). */
+        int V = c->vocab;
+        if (tph && m->ar_cb) {
+            if (!m->p_logits_full) m->p_logits_full = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)V*4);
+            memset(m->p_logits_full, 0, (size_t)K*(size_t)V*4);
+            for (int k = 0; k < K; k++)
+                memcpy(m->p_logits_full + (size_t)k*V + m->head_r0, m->p_logits + (size_t)k*hrows, (size_t)hrows*4);
+            m->ar_cb(m->p_logits_full, K*V, m->ar_ctx);
+        } else {
+            m->p_logits_full = m->p_logits;
+        }
+        for (int k = 0; k < K; k++) {
+            float *lg = m->p_logits_full + (size_t)k*V; int best = 0; float bv = lg[0];
+            for (int v = 1; v < V; v++) if (lg[v] > bv) { bv = lg[v]; best = v; }
+            out_tok[k] = best;
+        }
+    } else {
+      float *hval = tph ? (float *)alloca((size_t)K*4) : NULL;
       ds4f_pf_argmax_task t = { m->p_logits, out_tok, hrows, K, m->head_r0, hval };
       ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
       if (tph && m->ar_argmax_cb) for (int k = 0; k < K; k++) { int32_t idx = out_tok[k]; float v = hval[k];
-          m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; } }
-    VTOC(DS4F_P_HEAD);   /* hc_head collapse + out_norm + lm_head GEMM + argmax */
+          m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; }
+    }
+    VTOC(DS4F_P_HEAD);   /* hc_head collapse + out_norm + lm_head GEMM + argmax/sample-logits */
     if (out_hc) memcpy(out_hc, m->v_x4, (size_t)K*hcC*4);
 #undef VTIC
 #undef VTOC

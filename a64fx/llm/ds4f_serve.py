@@ -107,15 +107,22 @@ DYNAMIC = int(os.environ.get("DS4F_SERVE_DYNAMIC", "0"))
 _qlock = threading.Lock()
 _qnext = 0
 
-def infer_dynamic(prompt, max_tokens):
+def infer_dynamic(prompt, max_tokens, samp=None):
     global _qnext
     ids = encode(prompt)
     if not ids: return [], [], ""
+    if samp is None:
+        samp = {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "presence_penalty": 0.0,
+                "repeat_penalty": 1.0, "seed": None}
+    seed = samp.get("seed") if samp.get("seed") is not None else 0   # 0 -> runner derives from request id
     with _qlock:
         myid = _qnext; _qnext += 1
         tmp = "%s.q.%d.t" % (BASE, myid)        # write atomically: the runner probes q.<id> existence,
         with open(tmp, "w") as f:               # so it must never observe a half-written file
-            f.write("%d\n" % max_tokens); f.write(" ".join(map(str, ids)) + "\n")
+            # first line: "max_new temp top_p top_k seed rep_pen pres_pen" (per-sequence sampling)
+            f.write("%d %g %g %d %d %g %g\n" % (max_tokens, samp["temperature"], samp["top_p"],
+                    samp["top_k"], seed, samp["repeat_penalty"], samp["presence_penalty"]))
+            f.write(" ".join(map(str, ids)) + "\n")
         os.rename(tmp, "%s.q.%d" % (BASE, myid))  # atomic publish
         with open(BASE + ".qhead", "w") as f:   # client-side id bookkeeping (runner probes q.<id>, not qhead)
             f.write(str(_qnext) + "\n")
@@ -182,7 +189,8 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
     # concurrent batched decode: route greedy, non-cache requests through the dispatcher (the runner
     # is in DS4F_SERVE_BATCH mode -> the single-request protocol is not served there).
     if BATCH > 1 and not (cache_load or cache_save):
-        return infer_dynamic(prompt, max_tokens) if DYNAMIC else infer_batched(prompt, max_tokens)
+        # DYNAMIC path supports per-sequence sampling; the static BATCH path is greedy-only.
+        return infer_dynamic(prompt, max_tokens, samp) if DYNAMIC else infer_batched(prompt, max_tokens)
     with _lock:
         ids = encode(prompt)
         if not ids and not cache_save:

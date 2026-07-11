@@ -108,13 +108,14 @@ static void embed_lookup(const ds4f_model *m, int tok, float *x) {
  * deterministic PRNG (SplitMix64) seeded identically per request and advanced in lockstep makes
  * all 11 ranks draw the SAME token -> lockstep preserved (== the greedy-argmax guarantee). */
 static uint64_t ds4f_rng_state;
-static inline double ds4f_rng_u01(void) {                  /* uniform [0,1) */
-    uint64_t z = (ds4f_rng_state += 0x9E3779B97F4A7C15ULL);
+static inline double ds4f_rng_u01_st(uint64_t *st) {       /* uniform [0,1) from an explicit SplitMix64 state */
+    uint64_t z = (*st += 0x9E3779B97F4A7C15ULL);
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     z = z ^ (z >> 31);
     return (double)(z >> 11) * (1.0 / 9007199254740992.0);
 }
+static inline double ds4f_rng_u01(void) { return ds4f_rng_u01_st(&ds4f_rng_state); }
 typedef struct { float temp, top_p, pres_pen, rep_pen; int top_k, rep_last_n; } ds4f_sampler;
 
 static const float *ds4f_srt_key;                          /* qsort key (single-threaded serve path) */
@@ -122,11 +123,13 @@ static int ds4f_srt_desc(const void *a, const void *b) {
     float fa = ds4f_srt_key[*(const int *)a], fb = ds4f_srt_key[*(const int *)b];
     return (fa < fb) - (fa > fb);
 }
-/* Sample the next token from m->s_logits given recent token history (for penalties). temp<=0 ->
- * greedy argmax (bit-identical to ds4f_forward_token). Mutates m->s_logits (regenerated next step). */
-static int ds4f_sample(ds4f_model *m, const ds4f_sampler *sp, const int *hist, int nhist) {
-    int V = m->cfg.vocab;
-    float *lg = m->s_logits;
+/* Sample the next token from an explicit logits buffer `lg[V]` and per-caller PRNG `*rng`, given recent
+ * token history (for penalties). temp<=0 -> greedy argmax. Mutates lg (temperature/penalties applied in
+ * place; the caller's buffer is regenerated next step). Deterministic in (lg, *rng): identical logits +
+ * identical rng state on every rank -> identical token -> lockstep preserved. The batched path calls this
+ * once per active sequence with that sequence's own full-logit row + own rng state. */
+static int ds4f_sample_logits(float *lg, int V, const ds4f_sampler *sp, uint64_t *rng,
+                              const int *hist, int nhist) {
     if (sp->temp <= 0.f) {                                  /* greedy */
         int best = 0; float bv = lg[0];
         for (int v = 1; v < V; v++) if (lg[v] > bv) { bv = lg[v]; best = v; }
@@ -158,9 +161,13 @@ static int ds4f_sample(ds4f_model *m, const ds4f_sampler *sp, const int *hist, i
         for (int i = 0; i < kcut; i++) { cum += prob[i]; if (cum >= thr) { npc = i + 1; break; } }
     }
     float nsum = 0.f; for (int i = 0; i < npc; i++) nsum += prob[i];   /* renormalize + draw */
-    double r = ds4f_rng_u01() * nsum, acc = 0.0;
+    double r = ds4f_rng_u01_st(rng) * nsum, acc = 0.0;
     for (int i = 0; i < npc; i++) { acc += prob[i]; if (acc >= r) return idx[i]; }
     return idx[npc - 1];
+}
+/* single-stream serve wrapper: sample from m->s_logits with the global PRNG (bit-identical to before). */
+static int ds4f_sample(ds4f_model *m, const ds4f_sampler *sp, const int *hist, int nhist) {
+    return ds4f_sample_logits(m->s_logits, m->cfg.vocab, sp, &ds4f_rng_state, hist, nhist);
 }
 /* reset per-request state: the compressor/indexer RING state carries between requests (position-
  * indexed KV/cmp/idx caches self-overwrite at pos 0). int8 KV/cmp calibration re-runs per request. */
@@ -396,11 +403,15 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
     float *Xb   = (float *)aligned_alloc(64, (size_t)mtile * Cc * 4);
     float *hcb  = (float *)aligned_alloc(64, (size_t)mtile * hcC * 4);
     int   *otb  = (int *)malloc((size_t)mtile * sizeof(int));
-    /* admission broadcast buffer: [ok, mnew, np, ids...] -- rank 0 reads the fresh q.<id> file and
-     * BROADCASTS it so every rank admits an identical (np, ids, mnew). Cross-node FS-cache skew must
-     * never make ranks disagree on the collective's M (that deadlocks the prefill/decode all-reduce). */
-    float *admit_bc = (float *)aligned_alloc(64, ((size_t)maxpos + 4) * sizeof(float));
-    typedef struct { int *ids; int nids, np, pos, mnew, active; long id; } dseq;
+    /* admission broadcast buffer: [ok,mnew,np, temp,top_p,top_k,seed,rep_pen,pres_pen, ids...] -- rank 0
+     * reads the fresh q.<id> file and BROADCASTS it so every rank admits an identical request (payload AND
+     * sampling params). Cross-node FS-cache skew must never make ranks disagree on the collective's M
+     * (that deadlocks the prefill/decode all-reduce) NOR on the per-seq sampler/seed (that would make ranks
+     * draw different tokens -> lockstep divergence). */
+    const int HDR = 9;
+    float *admit_bc = (float *)aligned_alloc(64, ((size_t)maxpos + HDR + 1) * sizeof(float));
+    typedef struct { int *ids; int nids, np, pos, mnew, active; long id;
+                     ds4f_sampler samp; uint64_t rng; int samples; } dseq;
     dseq *S = (dseq *)calloc((size_t)B, sizeof(dseq));
     for (int i = 0; i < B; i++) S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
     char base[1024]; int rl = (int)strlen(reqf); if (rl > 4) rl -= 4;   /* strip ".req" */
@@ -428,26 +439,40 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
         for (int i = 0; i < B; i++) {
             if (S[i].active) continue;                       /* slot busy (deterministic across ranks) */
             dseq *s = &S[i];
-            int cap = maxpos + 3;
+            int cap = maxpos + HDR;
             float *ab = admit_bc; memset(ab, 0, (size_t)cap * sizeof(float));
             if (MyRank == 0) {
                 char qf[1152]; snprintf(qf, sizeof qf, "%s.q.%ld", base, qnext);
                 FILE *f = fopen(qf, "r");
                 if (f) { char line[256]; int mnew = 256, np = 0, v; char *tk, *sp, *ln = NULL; size_t lc = 0;
-                    if (fgets(line, sizeof line, f)) sscanf(line, "%d", &mnew);
+                    /* first line: "mnew [temp top_p top_k seed rep_pen pres_pen]" (sampling params optional,
+                     * default greedy temp=0). */
+                    float temp = 0.f, top_p = 1.f, rep_pen = 1.f, pres_pen = 0.f; int top_k = 0; long seed = 0;
+                    if (fgets(line, sizeof line, f))
+                        sscanf(line, "%d %f %f %d %ld %f %f", &mnew, &temp, &top_p, &top_k, &seed, &rep_pen, &pres_pen);
                     if (getline(&ln, &lc, f) >= 0)
                         for (tk = strtok_r(ln, " \t\n", &sp); tk && np < maxpos; tk = strtok_r(NULL, " \t\n", &sp))
-                            if (sscanf(tk, "%d", &v) == 1) ab[3 + np++] = (float)v;
+                            if (sscanf(tk, "%d", &v) == 1) ab[HDR + np++] = (float)v;
                     free(ln); fclose(f);
                     ab[0] = 1.f; ab[1] = (float)mnew; ab[2] = (float)np;
+                    ab[3] = temp; ab[4] = top_p; ab[5] = (float)top_k; ab[6] = (float)seed;
+                    ab[7] = rep_pen; ab[8] = pres_pen;
                 }
             }
             if (m->ar_cb && m->ep_size > 1) m->ar_cb(ab, cap, m->ar_ctx);
             if (ab[0] < 0.5f) break;                         /* file not visible to rank 0 yet -> retry */
             int mnew = (int)(ab[1] + 0.5f), np = (int)(ab[2] + 0.5f);
-            for (int k = 0; k < np; k++) s->ids[k] = (int)(ab[3 + k] + 0.5f);
+            for (int k = 0; k < np; k++) s->ids[k] = (int)(ab[HDR + k] + 0.5f);
             if (mnew < 0) mnew = 0; if (np + mnew > maxpos) mnew = maxpos > np ? maxpos - np : 0;
             s->np = np; s->mnew = mnew; s->nids = np; s->id = qnext; qnext++;
+            /* per-sequence sampler + PRNG (all ranks derive identical values -> identical draws -> lockstep).
+             * temp<=0 => greedy (uses the batched argmax). seed 0 => derive from the request id (reproducible
+             * per id; distinct across concurrent requests). */
+            s->samp.temp = ab[3]; s->samp.top_p = ab[4]; s->samp.top_k = (int)(ab[5] + 0.5f);
+            s->samp.rep_pen = ab[7]; s->samp.pres_pen = ab[8]; s->samp.rep_last_n = 64;
+            s->samples = (s->samp.temp > 0.f);
+            { long seed = (long)(ab[6] + 0.5f); uint64_t bs = seed ? (uint64_t)seed : (uint64_t)(s->id + 1);
+              s->rng = bs * 0x9E3779B97F4A7C15ULL; }
             /* prefill into slot i's bundle (single-seq path) */
             for (int l = 0; l < L; l++) ds4f_lseq_apply(&m->layers[l], &bundles[(size_t)i*L + l]);
             m->dec_batch_seq = NULL; m->dec_batch_pos = NULL;
@@ -456,9 +481,18 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
             if (np > 0) {
                 if (pf_gemm) { for (int bs = 0; bs < np; bs += K) { int M = np - bs < K ? np - bs : K;
                         for (int mm = 0; mm < M; mm++) embed_lookup(m, s->ids[bs+mm], Xb + (size_t)mm*Cc);
-                        int ot[128]; ds4f_forward_verify(m, Xb, M, bs, ot, hcb); first = ot[M-1]; } }
-                else { float xs[1]; (void)xs; for (int p = 0; p < np; p++) { embed_lookup(m, s->ids[p], Xb); first = ds4f_forward_token(m, Xb, p); } }
+                        /* sampling needs the LAST prompt position's full logits (to draw the first gen token);
+                         * only the last chunk pays the full-[M,vocab] reduce -- earlier chunks stay greedy. */
+                        m->want_full_logits = (s->samples && bs + K >= np);
+                        int ot[128]; ds4f_forward_verify(m, Xb, M, bs, ot, hcb); first = ot[M-1];
+                        if (m->want_full_logits)
+                            first = ds4f_sample_logits(m->p_logits_full + (size_t)(M-1)*c->vocab, c->vocab,
+                                                       &s->samp, &s->rng, s->ids, s->np); } }
+                else { m->want_full_logits = s->samples;
+                    for (int p = 0; p < np; p++) { embed_lookup(m, s->ids[p], Xb); first = ds4f_forward_token(m, Xb, p); }
+                    if (s->samples) first = ds4f_sample(m, &s->samp, s->ids, s->np); }
             }
+            m->want_full_logits = 0;
             s->pos = np; s->active = (np > 0 && mnew > 0);
             if (s->active) { s->ids[s->nids++] = first;
                              if (first == DS4F_EOS_ID || s->nids - s->np >= s->mnew) s->active = 0; }
@@ -478,11 +512,18 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
         }
         if (na == 0) { usleep(2000); continue; }             /* idle: all ranks sleep, re-poll qhead */
         /* ---- one decode step over the active set ---- */
+        int any_sample = 0;                                  /* if ANY active seq samples, reconstruct full
+                                                              * [na,vocab] logits (greedy seqs just argmax it). */
+        for (int a = 0; a < na; a++) if (S[map[a]].samples) { any_sample = 1; break; }
+        m->want_full_logits = any_sample;
         m->dec_batch_seq = view; m->dec_batch_pos = vpos;
         ds4f_forward_verify(m, Xb, na, 0, otb, hcb);
         tok_since += na;
         for (int a = 0; a < na; a++) {
-            dseq *s = &S[map[a]]; int tok = otb[a];
+            dseq *s = &S[map[a]];
+            int tok = s->samples ? ds4f_sample_logits(m->p_logits_full + (size_t)a*c->vocab, c->vocab,
+                                                      &s->samp, &s->rng, s->ids, s->nids)
+                                 : otb[a];
             s->ids[s->nids++] = tok; s->pos++;
             if (tok == DS4F_EOS_ID || s->nids - s->np >= s->mnew) {   /* retire -> respond, free slot */
                 s->active = 0;
