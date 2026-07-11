@@ -1105,6 +1105,22 @@ scan + top-k** (attn itself is O(1) — window 128 + topk 512 is fixed), ~7% at 
   a repetitive test prompt made the EXACT baseline degenerate into copying its input while the reused run
   correctly summarized, which would have read as a false "the lossy version is better".
 
+**Long-ctx follow-ups** (alloc 49529254; details in `### LANDED/REFUTED — long-ctx follow-ups` below).
+- **`IDX_REUSE` under batched decode** (`94484265`): `sel_cache` into `ds4f_lseq`. **★ Caught a REAL latent bug
+  from `ef1e07f8`** — the serve loops hand `ds4f_forward_verify` a compacted **COPY** of the active bundles, so
+  every `ds4f_lseq_capture` landed in the copy and was DISCARDED; the `cmp_frozen`/`caln` freeze write-back and
+  the reuse cache never advanced. New `ds4f_lseq_sync()`. Validated under real pruning (T=617 > topk=512):
+  A-batched == A-solo. *The `IDX_REUSE=0` control is what proved the divergence was mine, not pre-existing
+  M-reassociation — and the `DECODE_BATCH` isolation test can't catch it (it uses the real bundles, not a view).*
+- **REFUTED — packing the CP_IDX merge reduces** (`a2821722`): zero benefit (202.9 → 203.8 ms/tok); it's
+  byte/chunk-bound, not call-bound. Worse, the merge's comm is **FIXED** (~56 ms/tok) while the sharding saving
+  only grows with ctx → **`DS4F_CP_IDX` is a NET LOSS below ~276k ctx**. Startup WARN added; use `IDX_REUSE`.
+- **`DS4F_IDX_INT8W`**: passes the TF gate (**97.7%, identical**) but only **+1.4%** — the old "+4.1%" doesn't hold.
+- **ctx=32768 CLEARS** with `Q8_DENSE=1`+int8-KV+int4 (the old 256k blocker): **RSS 22.56 GB** (vs 27.95 that
+  OOM'd), ~8.5 GB headroom, NaNs=0. **Memory is no longer the long-ctx constraint — the O(T) scan compute is.**
+- **`IDX_REUSE` confirmed to scale with ctx** (measured, not extrapolated): **+7.3% @8k → +12.0% @32k**
+  (136.7 → 122.0 ms/tok, 7.32 → **8.20 tok/s**) → ~+30-35% @128k.
+
 ### LANDED — DS4F_SERVE_BATCH concurrent batched-decode serve (2026-07-10b, commits `782c8f29`/`eb5d9054`/`994cbd27`)
 
 The batched-serve path is built + validated. `ds4f_serve_batch_loop` (`ds4f_ep_runner.c`, gated
