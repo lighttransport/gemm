@@ -1205,11 +1205,19 @@ is the fast way to test cross-node TCP without the runner; debug/aux files for c
 > gen — `DS4F_CP=1 DS4F_CP_SHARD=1 DS4F_CP_IDX=1 DS4F_INT4_CMP=1 DS4F_IDX_INT4=1 DS4F_FP8_BF16=0` — ran
 > **rc=0, NaNs=0, coherent** (correct quicksort completion) at short ctx (max_pos=120; the memory/ctx-ceiling
 > win only shows at large `max_pos`, NOT tested here — long-ctx validation risks OOM-killing the shared
-> interactive alloc, so do it deliberately on a dedicated alloc). **REMAINING:** (1) confirm/finish the
-> Stage-C attention *combine* (whether the selected-latent attention distributes compute with a cross-node
-> `{m,l,acc}` online-softmax combine, or currently shards storage + gathers for replicated compute — read
-> `ds4f_attn_tb2_worker` + the `ds4f_forward_token` combine); (2) long-ctx A/B: per-node MemFree + coherence
-> at max_pos = 32k/64k/128k, CP-on vs the CP-off ceiling. NOTE the plan file
+> interactive alloc, so do it deliberately on a dedicated alloc).
+>
+> **STAGE C DONE (2026-07-11, commit `15fdac73`, `DS4F_CP_COMBINE`).** The prior CP path gathered every
+> selected latent to every node (`ns*KV` ≈ 1 MB/layer, bandwidth-bound) then attended replicated. Now each
+> node attends over only its OWNED terms and emits a per-head online-softmax partial `{max, sum-exp,
+> weighted-V}`; the partials combine with a max-reduce + one packed `[acc|l]` sum-reduce (comm ≈
+> `n_heads*HD` ≈ 12 K floats/layer, ~20× fewer bytes). `ds4f_attn_tb2_combine_worker` + `ds4f_cp_attn_combine`
+> (`ds4f_impl.h`), gated (needs `DS4F_CP_SHARD` + int4_cmp + cmp_frozen + TP_ATTN off), decode path only
+> (verify/prefill stays on gather). Validated ctx=805 (cmp tail genuinely sharded): **combine == gather
+> 48/48 tokens byte-identical**, rc=0/NaNs=0/lockstep; **decode comm 34.8→22.3 ms/tok (−36%), 7.25→8.16
+> tok/s (+12.5%)**. **REMAINING:** (1) mirror the combine into the verify/prefill batched path (`ds4f_forward_verify`,
+> still gather); (2) long-ctx A/B: per-node MemFree + coherence at max_pos = 32k/64k/128k, CP-on vs the
+> CP-off ceiling (dedicated alloc — long ctx OOM-risks the shared job). NOTE the plan file
 > `~/.claude/plans/see-a64fx-ds4f-md-...md` is GONE — reconstruct design from the in-tree code above + the
 > git history (`git log --oneline | grep -iE 'CP |attn-CP|slot-shard'`; some CP commits are glm5/m3, not ds4f).
 >
