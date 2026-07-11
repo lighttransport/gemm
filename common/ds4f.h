@@ -327,6 +327,7 @@ typedef struct {
     uint8_t  *cmp_q4;  int8_t *cmp_q;    float *cmp_scale, *cmp_iscale, *cmp_absmax;
     uint16_t *cmp_calbuf; int cmp_caln, cmp_frozen;                                       /* compressed int8/int4 */
     uint8_t  *idx_kv8_4; int8_t *idx_kv8; float *idx_pscale;                              /* indexer int8/int4 */
+    int      *sel_cache; int sel_cache_n, sel_cache_pos;   /* DS4F_IDX_REUSE: per-sequence cached selection */
 } ds4f_lseq;
 
 typedef struct ds4f_pool ds4f_pool;

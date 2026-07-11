@@ -368,6 +368,9 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
             m->want_full_logits = any_sample;
             m->dec_batch_seq = view; m->dec_batch_pos = vpos;
             ds4f_forward_verify(m, Xb, na, 0, otb, hcb);
+            /* view is a COPY of the active bundles -> sync the per-seq state captured into it back home. */
+            for (int a = 0; a < na; a++) for (int l = 0; l < L; l++)
+                ds4f_lseq_sync(&bundles[(size_t)map[a]*L + l], &view[(size_t)a*L + l]);
             dec_steps++; dec_toks += na;
             for (int a = 0; a < na; a++) {
                 bseq *s = &S[map[a]];
@@ -680,6 +683,9 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
         m->want_full_logits = any_sample;
         m->dec_batch_seq = view; m->dec_batch_pos = vpos;
         ds4f_forward_verify(m, Xb, na, 0, otb, hcb);
+        /* view is a COPY of the active bundles -> sync the per-seq state captured into it back home. */
+        for (int a = 0; a < na; a++) for (int l = 0; l < L; l++)
+            ds4f_lseq_sync(&bundles[(size_t)map[a]*L + l], &view[(size_t)a*L + l]);
         tok_since += na;
         for (int a = 0; a < na; a++) {
             dseq *s = &S[map[a]];

@@ -2234,6 +2234,10 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
                 ds4f_tensor u5 = { ly->idx_cmp_ape,   NULL, DS4F_F32, ratio, iW };     ds4f_fill(m, u5);
                 ds4f_tensor u6 = { ly->idx_cmp_norm,  NULL, DS4F_BF16, 1, ihd };       ds4f_fill(m, u6);
             }
+            /* DS4F_IDX_REUSE: cached selection (pre-allocated, NOT lazy -- the pointer must be stable so
+             * ds4f_lseq can swap a per-sequence one in under batched decode). -1 = no valid cache. */
+            ly->sel_cache = (int *)aligned_alloc(64, ((size_t)c->index_topk*4 + 63) & ~63ull);
+            ly->sel_cache_n = 0; ly->sel_cache_pos = -1;
         }
     }
 }
@@ -4116,8 +4120,8 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
          * the sliding window covers them) -> coherence-gated. Batched decode (per-seq selections) is excluded. */
         static int idx_reuse = -1;
         if (idx_reuse < 0) { const char *e = getenv("DS4F_IDX_REUSE"); idx_reuse = (e && *e) ? atoi(e) : 0; }
-        int since = pos - ly->sel_cache_pos;
-        int reuse = idx_reuse > 1 && ly->sel_cache && ly->sel_cache_pos >= 0 && !m->dec_batch_seq
+        int since = pos - ly->sel_cache_pos;   /* per-SEQUENCE under batched decode (sel_cache lives in ds4f_lseq) */
+        int reuse = idx_reuse > 1 && ly->sel_cache && ly->sel_cache_pos >= 0
                     && since >= 1 && since < idx_reuse;
         if (reuse) {
             float *comp_out = (float *)alloca((size_t)ihd * 4);   /* indexer compressor only (mirrors index_step) */
@@ -4156,8 +4160,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         int nsel = 0;                                           /* compact + strip offset -> local idx */
         for (int i = 0; i < k; i++) { int v = m->s_tb2_sel[i]; if (v < 0) break; m->s_tb2_sel[nsel++] = v - offset; }
         m->s_tb2_nsel = nsel;
-        if (idx_reuse > 1 && !m->dec_batch_seq) {              /* cache the fresh selection for reuse */
-            if (!ly->sel_cache) ly->sel_cache = (int *)malloc((size_t)k * sizeof(int));
+        if (idx_reuse > 1 && ly->sel_cache) {                  /* cache the fresh selection for reuse */
             memcpy(ly->sel_cache, m->s_tb2_sel, (size_t)nsel * sizeof(int));
             ly->sel_cache_n = nsel; ly->sel_cache_pos = pos;
         }
@@ -5293,6 +5296,7 @@ static inline void ds4f_lseq_apply(ds4f_layer *ly, const ds4f_lseq *s) {
     ly->cmp_iscale = s->cmp_iscale; ly->cmp_absmax = s->cmp_absmax; ly->cmp_calbuf = s->cmp_calbuf;
     ly->cmp_caln = s->cmp_caln; ly->cmp_frozen = s->cmp_frozen;
     ly->idx_kv8_4 = s->idx_kv8_4; ly->idx_kv8 = s->idx_kv8; ly->idx_pscale = s->idx_pscale;
+    ly->sel_cache = s->sel_cache; ly->sel_cache_n = s->sel_cache_n; ly->sel_cache_pos = s->sel_cache_pos;
 }
 /* write the mutable calibration SCALARS back into the sequence's bundle after a step (a sequence can
  * cross the freeze point mid-decode; buffers update in place via the swapped pointers, only these
@@ -5300,6 +5304,17 @@ static inline void ds4f_lseq_apply(ds4f_layer *ly, const ds4f_lseq *s) {
 static inline void ds4f_lseq_capture(ds4f_lseq *s, const ds4f_layer *ly) {
     s->kv_caln = ly->kv_caln;   s->kv_frozen = ly->kv_frozen;
     s->cmp_caln = ly->cmp_caln; s->cmp_frozen = ly->cmp_frozen;
+    s->sel_cache_n = ly->sel_cache_n; s->sel_cache_pos = ly->sel_cache_pos;  /* DS4F_IDX_REUSE (buffer is in-place) */
+}
+/* Sync the MUTABLE per-sequence state (exactly what ds4f_lseq_capture writes) from a decode-`view` entry
+ * back into the OWNING bundle. The serve loops hand ds4f_forward_verify a COMPACTED COPY of the active
+ * bundles (view[a] = bundles[map[a]], by value), so the per-position captures land in that copy and are
+ * DISCARDED when the view is rebuilt next step. Without this the frozen/caln state and the IDX_REUSE
+ * selection cache never advance -> a sequence re-uses a stale selection / re-calibrates forever. */
+static inline void ds4f_lseq_sync(ds4f_lseq *dst, const ds4f_lseq *src) {
+    dst->kv_caln = src->kv_caln;   dst->kv_frozen = src->kv_frozen;
+    dst->cmp_caln = src->cmp_caln; dst->cmp_frozen = src->cmp_frozen;
+    dst->sel_cache_n = src->sel_cache_n; dst->sel_cache_pos = src->sel_cache_pos;
 }
 /* Free the per-sequence cache sets 1..nseq-1 (set 0 aliases the layer's own live buffers -- never
  * freed here) and the batch arrays. Safe to call when dec_batch_seq is NULL (no-op). */
@@ -5314,7 +5329,7 @@ static void ds4f_free_decode_batch(ds4f_model *m) {
             free(s->kv_q); free(s->kv_scale); free(s->kv_calbuf);
             free(s->cmp_q4); free(s->cmp_q); free(s->cmp_scale); free(s->cmp_iscale);
             free(s->cmp_absmax); free(s->cmp_calbuf);
-            free(s->idx_kv8_4); free(s->idx_kv8); free(s->idx_pscale);
+            free(s->idx_kv8_4); free(s->idx_kv8); free(s->idx_pscale); free(s->sel_cache);
         }
     free(m->dec_batch_seq); m->dec_batch_seq = NULL;
     free(m->dec_batch_pos); m->dec_batch_pos = NULL;
@@ -5341,6 +5356,7 @@ static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
         s0->cmp_iscale = ly->cmp_iscale; s0->cmp_absmax = ly->cmp_absmax; s0->cmp_calbuf = ly->cmp_calbuf;
         s0->cmp_caln = ly->cmp_caln; s0->cmp_frozen = ly->cmp_frozen;
         s0->idx_kv8_4 = ly->idx_kv8_4; s0->idx_kv8 = ly->idx_kv8; s0->idx_pscale = ly->idx_pscale;
+        s0->sel_cache = ly->sel_cache; s0->sel_cache_n = ly->sel_cache_n; s0->sel_cache_pos = ly->sel_cache_pos;
         int ratio = c->compress_ratios[l], coff = (ratio==4)?2:1, W = coff*KV, nslot = ratio ? np/ratio : 0;
         int CAL = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64; if (CAL > nslot) CAL = nslot > 0 ? nslot : 1;
         for (int k = 1; k < nseq; k++) {
@@ -5381,6 +5397,9 @@ static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
                     if (ly->idx_kv8)     s->idx_kv8   = (int8_t *)aligned_alloc(256, ((size_t)nslot*ihd + 255) & ~255ull);
                     if (ly->idx_pscale)  s->idx_pscale = (float *)aligned_alloc(256,
                                              ((size_t)(ly->idx_kv8_4 ? ly->idx_cp_nslot : nslot)*4 + 255) & ~255ull);
+                    if (ly->sel_cache) { /* DS4F_IDX_REUSE: this sequence's own cached selection */
+                        s->sel_cache = (int *)aligned_alloc(64, ((size_t)c->index_topk*4 + 63) & ~63ull);
+                        s->sel_cache_n = 0; s->sel_cache_pos = -1; }
                 }
             }
         }
