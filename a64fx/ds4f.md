@@ -2189,3 +2189,41 @@ reduce guard needs BOTH). qkv drops 7.4→3.8 as hoped, but wo_a AND wo_b go ful
 already refuted, and the doc's conclusion holds: only BATCHED decode amortizes it (measured ~3.1x
 aggregate at M=16 on base). On the compute side the remaining stack is flat-ish (experts 7.2,
 qkv 7.4, tb2prep 8.3, shared 4.8, o_proj 4.6) with no single dominator left.
+
+### ⚠️ LEAVE ONE CORE FREE: `LLM_THREADS=47`, not 48 (+40%, and it kills the "variance")
+
+The single largest decode lever found on ds4fbase, and it is one env var.
+
+The node cgroup gives the job cores **12-59** (48 compute cores). The assistant cores 0-1 are NOT
+in our cpuset — `taskset` to them fails with EINVAL, so a co-located agent CANNOT be moved off the
+compute cores. With **48 OMP threads pinned 1:1 onto 48 cores**, ANY other process on that node
+(the claude session, an MPI progress thread, an OS daemon) forces one OMP thread to timeshare.
+Because the pool barrier waits for **all** 48, that one descheduled thread stalls its rank — and
+since decode comm is *wait-for-the-slowest* (WS4: skew slope b=0.999), it stalls **all 12 ranks**.
+
+Measured 12n (`DS4F_DENSE=q8pv` + `TP_ATTN=0` + `CMP_LOCAL` + `HC_SVE`), 2 runs each:
+
+| threads | decode | compute spread | comm | rank11 (claude node) |
+|---|---|---|---|---|
+| 48 | 12.00 / 12.51 | **20.3 / 15.0 ms** | 44.6 | 53 ms vs 32 min |
+| **47** | **17.06 / 17.05** | **5.3 / 5.3** | 21.6 | 38 ms |
+| 46 | 16.91 / 16.89 | 5.0 / 5.0 | 22.2 | 38 ms |
+
+**+40%, and the run-to-run variance VANISHES** (17.06 vs 17.05). Every "fabric noise" number
+earlier in this doc (10.2-13.9 tok/s for one config) was actually our own session preempting an
+OMP thread — not the network.
+
+**`renice` does NOT fix it.** The pool workers SPIN-wait, so a niced competitor still gets
+scheduled and still preempts them: 48t + `nice 19` still measured spread 20.4 ms. Only leaving a
+core free works.
+
+Residual spread at 47t is **5.3 ms** = the MoE routing imbalance (top-6-of-256 over 12 ranks →
+E[max] ≈ 2 experts vs mean 0.5, so the critical path is ~4x the average expert work). Structural —
+6 chosen experts can only land on ≤6 ranks — and only **batched decode** amortizes it.
+
+**Comm budget at 47t:** 21.6 ms = fabric floor (23 µs × 86 reduces = 2.0 ms, ~9%) + straggler
+skew (~5 ms) + jitter. It is NOT data movement, so compute/comm OVERLAP (double-buffering) has
+nothing to hide: the fast ranks are already idle waiting on a slow rank's COMPUTE. (Also already
+refuted independently: WS4 for the reduce, and the roofline for decode∥GEMM double-buffering.)
+
+**ds4fbase 12n decode, cumulative:** 11.34 (FP8 baseline) → 17.05 tok/s.

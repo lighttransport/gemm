@@ -73,7 +73,26 @@ echo "[run_ds4fbase] placing $NP ranks via $VCOORD (($LAST) last => EP rank $((N
 cat -n "$VCOORD" | sed 's/^/    /'
 
 # ---- threads / NUMA ----
-export LLM_THREADS=${LLM_THREADS:-48}
+# *** LEAVE ONE CORE FREE. 47, NOT 48. This is worth +40% and is not optional. ***
+# The node's cgroup gives us cores 12-59 (48 compute cores; the assistant cores 0-1 are NOT in
+# our cpuset, so nothing of ours can be moved off). With 48 OMP threads pinned 1:1 to 48 cores,
+# ANY other process on the node (the co-located claude session, an MPI progress thread, an OS
+# daemon) forces one OMP thread to timeshare -- and because the pool barrier waits for ALL 48,
+# that single descheduled thread stalls the rank, which stalls all 12 ranks (comm == wait for
+# the slowest). Measured 12n, DS4F_DENSE=q8pv + TP_ATTN=0 + CMP_LOCAL + HC_SVE:
+#
+#   threads  decode              compute spread   comm
+#   48       12.00 / 12.51       20.3 / 15.0 ms   44.6   <- rank11 (claude node) 53 ms vs 33 min
+#   47       17.06 / 17.05        5.3 /  5.3      21.6   <- +40%, and REPRODUCIBLE to 0.01
+#   46       16.91 / 16.89        5.0 /  5.0      22.2
+#
+# renice does NOT fix it (the OMP threads spin-wait, so a niced competitor still preempts them):
+# 48t + nice 19 still gave spread 20.4 ms. Only leaving a core free works.
+# This also explains the "run-to-run variance" I chased earlier -- it was our own session
+# preempting an OMP thread, not the fabric.
+# The residual 5.3 ms spread is the MoE routing imbalance (top-6-of-256 over 12 ranks => E[max]
+# ~2 experts vs mean 0.5). That one is structural; only batched decode amortizes it.
+export LLM_THREADS=${LLM_THREADS:-47}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$LLM_THREADS}
 export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
 export OMP_PLACES=${OMP_PLACES:-cores}
