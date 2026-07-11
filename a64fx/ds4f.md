@@ -1109,8 +1109,43 @@ A admitted mid-flight alongside B,C (**40/40 tokens, 5/5 runs**); no deadlock/st
 idle→admit transitions; runner-internal **22.8 tok/s aggregate at active=4** (≈4× single-stream, no
 regression from the probe rewrite). Client-observed end-to-end tok/s is lower and FS-round-trip-bound
 (~fixed tens-of-seconds q/r visibility latency across login↔compute) — a property of the file protocol,
-not compute; a socket transport would remove it. **Follow-ons:** per-sequence sampling (greedy-only);
-socket/shared-mem transport to cut the file-visibility latency; B>4 dynamic throughput on a stable alloc.
+not compute; a socket transport would remove it. **Follow-ons:** socket/shared-mem transport to cut
+the file-visibility latency; B>4 dynamic throughput on a stable alloc.
+
+### LANDED — per-sequence sampling in the dynamic loop (2026-07-11, commit `7b18d816`)
+
+DS4F_SERVE_DYNAMIC decode was greedy-only; now each admitted sequence carries its own sampler
+(temperature / top_p / top_k / repeat+presence penalty / seed) + its own SplitMix64 PRNG, so one batch
+can mix greedy and sampled sequences and each draws independently. `temp<=0` stays greedy (the cheap
+argmax-merge head, bit-identical). Pieces: (1) `ds4f_sample` split into `ds4f_sample_logits(lg,V,sp,
+*rng,hist,nhist)` — a pure fn on an explicit logits row + explicit PRNG state; (2) **`ds4f_forward_verify`
+head gains a `want_full_logits` branch** — under TP_HEAD the head is vocab-sharded, so it scatters each
+row's owned `[K,hrows]` shard into a full-vocab row (zero-fill) + `ar_cb` SUM → every rank holds the
+SAME full `[K,vocab]` logits (new `p_logits_full` buffer, aliases `p_logits` when the head is
+replicated); (3) the admit broadcast payload carries the sampler params + seed so every rank derives an
+IDENTICAL sampler (else ranks draw different tokens → divergence); `want_full_logits` is set per-step
+(any active seq samples) and only on the LAST prefill chunk (first-token draw). `q.<id>` line 1 extended
+to `max_new temp top_p top_k seed rep_pen pres_pen` (params optional → greedy). seed 0 ⇒ derived from
+the request id (reproducible per id, distinct across concurrent requests).
+
+**★ Bug found + fixed en route (the instructive one):** the `want_full_logits` branch was first added to
+`ds4f_forward_prefill`'s head — but the dynamic loop calls `ds4f_forward_verify`, a DIFFERENT function
+(~`ds4f_impl.h:5410`) whose head still argmaxed only → `p_logits_full` stayed NULL → `ds4f_sample_logits(
+NULL+offset)` SIGSEGV on the first sampling request. Localized with per-rank file traces
+(`/home/u14346/sampdbg.r<rank>`, gated `DS4F_SAMP_DBG`): all ranks logged `wfl=1` + `pf_full=(nil)` and
+the head trace never fired → wrong function. **Lesson: there are TWO batched heads (`_prefill` M-rows and
+`_verify` K-rows); the serve/decode path is `_verify`. Per-rank stderr is NOT forwarded to the launcher
+log (only plexec's `sig=11` line is) and the scratchpad dir isn't mounted on compute nodes — write debug
+to `$HOME`.**
+
+**Validated real-weight 11n (alloc 49526204, `DS4F_TP_HEAD=1` sharded head):** greedy determinism +
+token-exact independence unchanged (40/40); sampling reproducible by seed, diverse across seeds, ≠ greedy,
+coherent; per-sequence independence under sampling (A[seed X] admitted mid-flight with B[seed Y] == A[seed
+X] run alone; same-seed seqs in one batch identical; different seed differ). Sampling requests *completing*
+is itself the lockstep proof (mismatched draws would deadlock the per-layer all-reduce). Cost: the full
+`[K,vocab]` SUM (~2.4 MB at K=4) per decode step only when a sampling seq is active — same per-seq cost as
+single-stream sampling. **Follow-on:** the static `DS4F_SERVE_BATCH` loop is still greedy-only (dynamic is
+the sampling path); mirror if needed.
 
 ### Resuming prompt — Phase 2 CP (next session)
 > **TASK: DS4F sharded-KV context parallelism (`DS4F_CP`).** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`). Full design + file:line in the plan file `~/.claude/plans/see-a64fx-ds4f-md-and-keep-floofy-dragon.md` and the "Phase 2" section above.
