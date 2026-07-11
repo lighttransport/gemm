@@ -1197,7 +1197,23 @@ is the fast way to test cross-node TCP without the runner; debug/aux files for c
 (the scratchpad dir isn't mounted there).*
 
 ### Resuming prompt — Phase 2 CP (next session)
-> **TASK: DS4F sharded-KV context parallelism (`DS4F_CP`).** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`). Full design + file:line in the plan file `~/.claude/plans/see-a64fx-ds4f-md-and-keep-floofy-dragon.md` and the "Phase 2" section above.
+> **STATUS UPDATE 2026-07-11:** the CP code is well past the Stage-A checkpoint the prompt below describes.
+> In-tree now (`ds4f_impl.h`): `ds4f_cp_slot_shard` (`:185`); storage sharding `DS4F_CP_SHARD` for `cmp_q4`
+> (`:2173`, `cp_t0/cp_t1`) and `DS4F_CP_IDX` for `idx_kv8_4` (`:2219`, `idx_cp_s0/s1`); the sharded-read
+> paths (`:3510`, `:4224`); the sharded index scan wired with `idx_cp_on` + `ar_cb` (`:4007`); and the
+> **CP idx-shard top-k merge** (`:1920`). **Validated functional this session** (alloc 49526204): a full CP
+> gen — `DS4F_CP=1 DS4F_CP_SHARD=1 DS4F_CP_IDX=1 DS4F_INT4_CMP=1 DS4F_IDX_INT4=1 DS4F_FP8_BF16=0` — ran
+> **rc=0, NaNs=0, coherent** (correct quicksort completion) at short ctx (max_pos=120; the memory/ctx-ceiling
+> win only shows at large `max_pos`, NOT tested here — long-ctx validation risks OOM-killing the shared
+> interactive alloc, so do it deliberately on a dedicated alloc). **REMAINING:** (1) confirm/finish the
+> Stage-C attention *combine* (whether the selected-latent attention distributes compute with a cross-node
+> `{m,l,acc}` online-softmax combine, or currently shards storage + gathers for replicated compute — read
+> `ds4f_attn_tb2_worker` + the `ds4f_forward_token` combine); (2) long-ctx A/B: per-node MemFree + coherence
+> at max_pos = 32k/64k/128k, CP-on vs the CP-off ceiling. NOTE the plan file
+> `~/.claude/plans/see-a64fx-ds4f-md-...md` is GONE — reconstruct design from the in-tree code above + the
+> git history (`git log --oneline | grep -iE 'CP |attn-CP|slot-shard'`; some CP commits are glm5/m3, not ds4f).
+>
+> **(original Stage-A prompt, kept for the design detail):** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`).
 > **Standing rules:** native fcc/FCC; in-alloc `mpiexec` (no pjsub) NP=11 EXCLUDE node 0; **measure MemFree not RSS**; validate coherence/lockstep (NOT bit-exact — combine reassociates); FP8 dense (`DS4F_FP8_BF16=0`) required; CP composes with full TP (`DS4F_TP_*`) + int4 cmp/idx (`DS4F_INT4_CMP`/`DS4F_IDX_INT4`), all default-off; commit only when asked; one real-weight gen per Bash call (batched jobs blow the 10-min timeout → SIGKILL degrades PMIx → recover via native re-stage `run_ds4f_stage_11n.sh`).
 > **Cumulative ceiling: ~255k → ~4.8M (~19×)** committed (2p `981350a`, 2q `cc86b0f`, 2r `683cfaf`/`7961f1a`/`5614dea`/`2c00f58`, 2s `f9fb3ff`, 2t `23b793b`); CP targets tens-of-millions + ~20–30 tok/s at long ctx (see roofline above — spec/batched decode is the speed lever, CP shards the O(T) scan that otherwise caps long-ctx decode at ~1 tok/s).
 
