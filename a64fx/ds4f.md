@@ -2008,3 +2008,92 @@ s_attn, H, m->ar_ctx);` pre-reduce (common/ds4f_impl.h ~line 5352, currently gat
 TP_OPROJ) to ALSO fire whenever `ly->wo_a.type==DS4F_Q8_PV`, so every rank quantizes an already-
 fully-reduced (not partial) s_attn — trades away TP_ATTN's comm savings for correctness, needs its
 own A/B to confirm. Don't commit without an 11n token-for-token bit-exact re-validation."
+
+## DS4F-BASE — DeepSeek-V4 base (fp8 experts) on 12 nodes  ✅ LANDED (2026-07-11)
+
+`~/models/ds4fbase` (275 GB) runs on 12 A64FX EP nodes at FULL fp8 expert fidelity (no
+requantization). Scripts: `run_ds4fbase_{stage_12n,12n,gen_12n}.sh`. Commit: "ds4fbase: run
+DeepSeek-V4 base (fp8 experts) on 12 A64FX nodes".
+
+### The whole port was two changes
+
+Diffed all 46 shards of ds4f vs ds4fbase: ZERO missing tensors (the only 2 extras are `mtp.*`,
+already skipped by the stager), and every remaining difference falls into two classes:
+
+1. **Every `*.scale` is `F32`, not `F8_E8M0`** (same shapes). The values are EXACT powers of two
+   (`scale_fmt="ue8m0"`), so `ds4f_stage.c` now folds them to E8M0 bytes at stage time via an
+   exponent bit-extract. Lossless => **zero loader/kernel changes**: by the time the loader sees
+   the blob, base and Flash scales are identical. Keyed on source dtype, so ds4f still passes
+   through untouched. A non-pow2 value is a hard abort — a clean full stage IS the proof the
+   premise holds model-wide (it did, all 46 shards x 12 ranks).
+2. **Routed experts are FP8-e4m3 + 128x128 block scale, not MXFP4.** Only hardcoded at the
+   ALLOCATION sites; `ds4f_matvec`/`ds4f_gemm`/`ds4f_load_q` already dispatch `DS4F_FP8`, and
+   `ds4f_sbytes(DS4F_FP8,2048,4096)` = 16x32 = 512 B is EXACTLY base's scale shape. Became one
+   `cfg.expert_qt` field (`DS4F_MODEL=ds4fbase`).
+
+### Dense TP is MANDATORY (this is what makes 12 nodes work)
+
+FP8 experts are 24 MiB each (vs MXFP4's 12.75) = 22.17 GiB/node at EP=12. Per node (GiB):
+
+| | experts | dense | tb2w | emb/head | TOTAL |
+|---|---|---|---|---|---|
+| no TP  | 22.17 | 5.50 | 0.87 | 1.97 | **30.52  DOES NOT FIT** (29.0 avail) |
+| +TP    | 22.17 | 1.26 | 0.87 | 0.16 | **24.47  fits** |
+
+Measured arena: **25.34 GB** (ranks 0-3, 22 experts) / **24.15 GB** (ranks 4-11, 21 experts).
+`DS4F_TP_ATTN/OPROJ/WOB/SHARED/HEAD/EMBED` all default ON in `run_ds4fbase_12n.sh`. Corollary:
+`DS4F_FP8_BF16` and `DS4F_Q8_DENSE` must stay OFF (they promote dense to bf16, +6 GB we do not
+have), which forces `DS4F_PREFILL_BATCH=0`. More nodes = fewer experts each, so 12 fits where 11
+would not.
+
+Rank placement: 256 = 12*21 + 4, so ranks 0-3 own 22 experts and ranks 4-11 own 21, and
+`ep_rank == MyRank ==` vcoordfile line order. The scripts put the login/claude node LAST (rank 11)
+so it gets the small shard (~1.1 GB less). Interactive is capped at 12 nodes, so that node hosts a
+rank whether we like it or not.
+
+Validated: full stage 2126 s (12/12, no pow2 abort), 43-layer load, NaNs=0, all 12 ranks lockstep
+in prefill AND decode, and a correct greedy quicksort completion.
+
+### CONTEXT: 1M fits. `DS4F_INT8_KV` must be OFF — it COSTS context, it does not save it
+
+**`DS4F_INT8_KV=1` is a long-ctx TRAP on this model.** It allocates `ly->kv_q = max_pos * kv_lora`
+for EVERY layer (`common/ds4f_impl.h` ~2040), which DEFEATS Tier-B2's KV windowing. The default
+(`INT8_KV=0`) `kv_cache` path instead uses `ly->kv_slots`, which windows the 41 sparse layers to
+`window_size`=128 slots. So INT8_KV turns a flat O(1) KV into 43 x max_pos x 512 B = **22 KB/token**
+of ARENA growth. Measured arena slope with INT8_KV=1: exactly 22,016 B/tok = 43*512*1.
+
+With **INT8_KV=0** the arena is FLAT at 25.34 GB at ANY context; only the compressed Tier-B2 caches
+grow, at ~1.7 KB/token. Measured (12n, `INT4_CMP=1 IDX_INT4=1`):
+
+| ctx | INT8_KV=1 | INT8_KV=0 (correct) | ctx-cache | decode |
+|---|---|---|---|---|
+| 32k   | —          | arena 25.34 GB | 60 MB   | 8.47 tok/s |
+| 128k  | RSS 28.24 GB (ok) | arena 25.34 GB | 223 MB  | 1.53 tok/s |
+| 192k  | **OOM (sig 9)**   | —              | —       | — |
+| 256k  | **OOM (sig 9)**   | arena 25.34 GB | 441 MB  | 1.02 tok/s |
+| 1M    | —          | arena 25.34 GB | 1747 MB | 0.25 tok/s |
+
+So **the ceiling is PERFORMANCE, not memory**: 1M fits with ~5 GB of headroom to spare, but decode
+falls off a cliff between 32k and 128k (comm 56% -> 91%) because the indexer scan is O(T).
+Practical guidance: **<=32k is the usable range (~8.5 tok/s); 128k is marginal (1.5); >=256k is a
+capability demo, not a working config.**
+
+`CTX_CACHE:` in the runner log UNDERSTATES the default path — it counts `idx_kv8`/`idx_kv8_4` but
+never the f32 `idx_kv` (2,688 B/tok). Only trust it when IDX_INT8/INT4 is on.
+
+### ❌ REFUTED: `DS4F_IDX_REUSE` does not rescue long-ctx decode here
+
+`DS4F_IDX_REUSE=4` at 256k measured **0.92 tok/s vs 1.02 without it** — slightly WORSE, no win.
+The O(T) scan is not where the 256k/1M time is going (comm is 85-91%). Do not reach for IDX_REUSE
+as the long-ctx decode fix on base/12n without re-measuring.
+
+### Two things that make a BROKEN run look healthy (cost me time; do not be fooled)
+
+- **`prefill ||x||` proves nothing.** It is the norm of the *synthetic random INPUT*
+  (`sm_next()*2-1` over 4096 dims => always ~sqrt(4096/3) = 36.7), not a model output. It is
+  byte-identical across models and configs by construction. NaNs=0 + lockstep + ||x|| would all
+  pass with a completely wrong expert dequant. **Only a coherent completion gates the numerics.**
+- **The gen wrapper's lockstep line cries wolf.** `run_ds4f_gen_11n.sh` pools the prefill and
+  decode argmaxes into one `sort -u`, so a perfectly healthy run reports "2 distinct" — and it
+  counts with `wc -w`, where "last argmax=N" is two words. `run_ds4fbase_gen_12n.sh` compares the
+  phases SEPARATELY and counts lines. The ds4f wrapper still has both bugs.

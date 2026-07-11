@@ -90,6 +90,21 @@ export DS4F_TB2ROPE_PAR=${DS4F_TB2ROPE_PAR:-1}
 export DS4F_ATTN_SVE=${DS4F_ATTN_SVE:-1}
 export DS4F_FLAGBAR=${DS4F_FLAGBAR:-1}
 
+# ---- LONG CONTEXT: leave DS4F_INT8_KV OFF. It COSTS context, it does not save it. ----
+# INT8_KV allocates ly->kv_q = max_pos * kv_lora for EVERY layer (ds4f_impl.h ~2040), which DEFEATS
+# Tier-B2's KV windowing (the default kv_cache path uses ly->kv_slots -> 128 slots on the 41 sparse
+# layers). So it converts a flat O(1) KV into 43*512 = 22 KB/token of ARENA growth. Measured 12n:
+#   INT8_KV=1 -> 192k and 256k OOM (SIGKILL).
+#   INT8_KV=0 -> arena FLAT at 25.34 GB at ANY ctx; only the compressed caches grow (~1.7 KB/tok);
+#                1M ctx fits (caches 1.75 GB).
+# For long ctx use the compressed-cache levers instead: DS4F_INT4_CMP=1 DS4F_IDX_INT4=1.
+# The ceiling is then PERFORMANCE, not memory: decode 8.47 tok/s @32k -> 1.53 @128k -> 0.25 @1M
+# (comm 56% -> 91%, the O(T) indexer scan). Usable range is <=32k; 128k is marginal.
+# (DS4F_IDX_REUSE=4 does NOT rescue it: 0.92 vs 1.02 tok/s @256k -- refuted, see a64fx/ds4f.md.)
+export DS4F_INT8_KV=${DS4F_INT8_KV:-0}
+export DS4F_INT4_CMP=${DS4F_INT4_CMP:-0}
+export DS4F_IDX_INT4=${DS4F_IDX_INT4:-0}
+
 # ---- workload ----
 export DS4F_PREFILL=${DS4F_PREFILL:-8}
 export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
