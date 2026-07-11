@@ -2097,3 +2097,64 @@ as the long-ctx decode fix on base/12n without re-measuring.
   decode argmaxes into one `sort -u`, so a perfectly healthy run reports "2 distinct" — and it
   counts with `wc -w`, where "last argmax=N" is two words. `run_ds4fbase_gen_12n.sh` compares the
   phases SEPARATELY and counts lines. The ds4f wrapper still has both bugs.
+
+## Offline dense BAKE → ds4fbase decode 11.34 → 14.06 tok/s (+24%)  ✅ LANDED (2026-07-12)
+
+`ds4f_bake.c` pre-packs the 8 dominant dense tensors/layer into the kernel-ready **BF16_PV** and
+**Q8_PV** layouts, written permanently to `~/models/<model>-fast/` (11.36 GB + 5.86 GB, 344 = 43×8
+tensors, ~107 s). `ds4f_stage.c` gains a bake overlay (`DS4F_DENSE=bf16pv|q8pv`), and the loader
+copies the bytes straight in. **No bf16 promotion peak at load.**
+
+Bit-identity is BY CONSTRUCTION: the bake calls the same `ds4f_promote_worker` / `ds4f_q8repack_worker`
+the runtime calls. **LUT trap:** the real path needs `ds4f_init_fp8_e4m3fn_lut` (exp==15 FINITE),
+NOT the synth `ds4f_init_fp8_e4m3_lut` (exp==15 → NaN). `--verify` therefore checks what can really
+break: FP8→BF16_PV max|err| = **0** (lossless), Q8 round-trip relL2 = 0.026 (int8 band).
+
+### ds4f (the testbed): token-identical, arena −5.50 GB, decode unchanged
+
+11n, 43 layers, real weights. Baked-Q8 vs the runtime `FP8_BF16=1 + Q8_DENSE=1` path:
+
+| | arena | decode | prefill argmax | decode argmax |
+|---|---|---|---|---|
+| runtime Q8 | 25.58 GB | 15.22 | 1805 | 16 |
+| **baked Q8** | **20.08 GB** | 15.24 | **1805** | **16** |
+
+TOKEN-IDENTICAL, and the arena drops exactly `11.36 (bf16) − 5.86 (q8) = 5.50 GB` — the peak.
+Decode is unchanged, as expected (same kernel; bf16-pv is already AT the BW roofline).
+
+### ds4fbase: the payoff — but ONLY after two real bugs
+
+Naive baked-Q8 was a **net LOSS** (8.91 vs 11.34). Two things had to be fixed, and both were mine:
+
+1. **`ds4f_load_dense_cshard` was FP8-only**, so `wob_s` silently fell back to a REPLICATED `wo_b`
+   (33 MiB/layer vs ~2.8). Weight traffic 2.04 → 3.36 GB/tok, o_proj 19.3 → 40.8 ms. Fixed: cshard
+   now col-shards Q8_PV (64-aligned = a contiguous run of whole 528 B blocks per group) and BF16_PV.
+2. **The Q8 block-diagonal worker re-quantized the activation PER THREAD.** Fine without TP (wo_a is
+   8192 rows → ~170 rows/thread, so one O(K) quantize amortizes); catastrophic under `TP_OPROJ`,
+   where the shard is ~683 rows → ~14 rows/thread, so all 48 threads paid a full 4096-element
+   quantize to do 14 rows of matvec. FP8 pays NO activation quant at all. Fixed: hoist it to a
+   shared once-per-group pre-pass (`ds4f_bd_prequant_worker`) — BIT-EXACT (same quantize fn, same
+   input), re-validated token-identical on ds4f.
+
+Measured 12n, SAME allocation (cross-allocation numbers are worthless here — the same FP8 config
+read 8.28 on one alloc and 11.34 on another):
+
+| config | decode | comm | qkv_proj | o_proj | shared | arena |
+|---|---|---|---|---|---|---|
+| FP8 dense, full TP *(reference)* | 11.34 | 40.2% | 6.71 | 19.34 | 7.84 | 25.34 GB |
+| FP8 dense, `TP_ATTN=0` | 8.16 | 43.4% | — | — | — | — |
+| Q8 dense, full TP | 9.02 | 59.2% | 3.89 | 40.08 | 4.70 | 25.33 GB |
+| **Q8 dense, `TP_ATTN=0`** | **14.06** | **32.1%** | 7.37 | **4.60** | 4.76 | 26.68 GB |
+
+Coherent completion, NaNs=0, 12/12 lockstep on both phases.
+
+**The mechanism (this is the transferable bit).** `o_proj`'s timer includes `TP_ATTN`'s 128 KB/layer
+`s_attn` all-reduce (`wo_a` needs the FULL `s_attn`). Q8 makes the plain matvecs ~1.8× faster
+(qkv 6.71→3.89, shared 7.84→4.70, exactly as the roofline says) but that CANNOT show up while the
+reduce dominates o_proj — hence Q8+full-TP is *slower*. Drop `TP_ATTN` and the reduce vanishes:
+o_proj becomes pure compute, 19.3 → **4.60 ms**.
+
+So the earlier "TP conservation curve" (dropping TP_ATTN is always a wash) was an artifact of the
+SLOW dense rep. Under FP8, un-sharding `wq_b` costs more compute than the reduce saves (a LOSS,
+11.34 → 8.16). Under a correct Q8 it is a large win (9.02 → 14.06). **Comm-vs-compute trades are
+not invariant — they flip when you change the kernel's speed.**

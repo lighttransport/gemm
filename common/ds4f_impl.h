@@ -500,7 +500,22 @@ static void ds4f_matvec_multi(ds4f_model *m, const ds4f_mv1 *list, int n) {
 typedef struct {
     ds4f_model *m; float *dst; const ds4f_tensor *t; const float *xbase;
     int gin, glora, goff;   /* goff = global o_inter row offset of this (TP-sharded) wo_a -> group=(goff+i)/glora */
+    const int8_t *xq; const float *xs; int g0;   /* Q8_PV only: activation pre-quantized per group, g0 = first group */
 } ds4f_mv_bd_task;
+
+/* Q8_PV block-diagonal activation pre-quantize (shared, once per group -- see the Q8 branch of
+ * ds4f_mv_bd_worker for why the old per-thread quantize was the bottleneck under TP_OPROJ).
+ * Grow-on-demand file-scope scratch: pool dispatches are serialized from the main thread, so a
+ * single shared buffer is safe. */
+static int8_t *ds4f_bdxq = NULL; static float *ds4f_bdxs = NULL; static size_t ds4f_bdxq_cap = 0;
+typedef struct { const float *xbase; int gin, K, g0, ng; int8_t *xq; float *xs; } ds4f_bd_prequant_task;
+static void ds4f_bd_prequant_worker(void *arg, int tid, int nthr) {
+    ds4f_bd_prequant_task *T = (ds4f_bd_prequant_task *)arg;
+    int K = T->K, nbq = K / 64;
+    for (int j = tid; j < T->ng; j += nthr)                  /* whole groups per thread; no split rows */
+        ds4f_quant_x_sdot_into(T->xbase + (size_t)(T->g0 + j) * T->gin, K,
+                               T->xq + (size_t)j * K, T->xs + (size_t)j * nbq);
+}
 static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
     ds4f_mv_bd_task *T = (ds4f_mv_bd_task *)arg;
     const ds4f_tensor *t = T->t; float *dst = T->dst;
@@ -521,19 +536,21 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
             matvec_bf16_8row(dst + i, w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K, x, K);
         }
     } else if (t->type == DS4F_Q8_PV) {
-        /* int8 W8A8 (DS4F_Q8_DENSE). Like the regular Q8_PV matvec, but the block-
-         * diagonal x differs per group => re-quantize x only when the group changes
-         * (groups are glora-aligned and glora%8==0, so a quantize lands on a block
-         * boundary). Bit-exact to the per-group ds4f_matvec Q8 path (same xq/xs, same
-         * (i/8)*gb weight offset). */
+        /* int8 W8A8. The activation is quantized ONCE PER GROUP by a shared pre-pass
+         * (ds4f_bd_prequant below); the worker just reads it. It used to re-quantize x
+         * per THREAD, which is fine without TP (wo_a is 8192 rows => ~170 rows/thread, so
+         * one O(K) quantize amortizes) but collapses under TP_OPROJ: the shard is ~683 rows
+         * => ~14 rows/thread, so all 48 threads paid a full 4096-element quantize to do 14
+         * rows of matvec. That single effect made o_proj 35.6 ms vs FP8's 19.3 (FP8 needs no
+         * activation quant at all) and sank baked-Q8 dense on ds4fbase.
+         * BIT-EXACT: same ds4f_quant_x_sdot_into on the same input, just hoisted+shared. */
         const uint8_t *base = (const uint8_t *)t->w;
         size_t gb = (size_t)(K / 64) * 528;
-        int8_t *xq; float *xs; ds4f_q8_xscratch(1, K, &xq, &xs);
-        int cur_g = -1;
+        int nbq = K / 64;
         for (int i = r0; i + 7 < r1; i += 8) {
-            int g = (goff + i) / glora;
-            if (g != cur_g) { ds4f_quant_x_sdot_into(T->xbase + (size_t)g * gin, K, xq, xs); cur_g = g; }
-            matvec_sdot_8row(dst + i, base + (size_t)(i / 8) * gb, xq, xs, K);
+            int j = (goff + i) / glora - T->g0;               /* index into the pre-quantized groups */
+            matvec_sdot_8row(dst + i, base + (size_t)(i / 8) * gb,
+                             T->xq + (size_t)j * K, T->xs + (size_t)j * nbq, K);
         }
     } else if (t->type == DS4F_FP8) {
         const uint8_t *base = (const uint8_t *)t->w;
@@ -572,7 +589,21 @@ static void ds4f_mv_bd_worker(void *arg, int tid, int nthr) {
 static int ds4f_oproj_fuse = -1;     /* DS4F_OPROJ_FUSE: 1=fused wo_a (default), 0=per-group ref */
 static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *t,
                                   const float *xbase, int gin, int glora, int goff) {
-    ds4f_mv_bd_task T = { m, dst, t, xbase, gin, glora, goff };
+    ds4f_mv_bd_task T = { m, dst, t, xbase, gin, glora, goff, NULL, NULL, 0 };
+    if (t->type == DS4F_Q8_PV) {          /* pre-quantize x ONCE per group, shared across the pool */
+        int K = t->cols, nbq = K / 64;
+        int g0 = goff / glora, g1 = (goff + t->rows - 1) / glora, ng = g1 - g0 + 1;
+        size_t need = (size_t)ng * K;
+        if (need > ds4f_bdxq_cap) {
+            free(ds4f_bdxq); free(ds4f_bdxs);
+            ds4f_bdxq = (int8_t *)malloc(need);
+            ds4f_bdxs = (float *)malloc((size_t)ng * nbq * sizeof(float));
+            ds4f_bdxq_cap = need;
+        }
+        ds4f_bd_prequant_task P = { xbase, gin, K, g0, ng, ds4f_bdxq, ds4f_bdxs };
+        ds4f_pool_run(m->pool, ds4f_bd_prequant_worker, &P);
+        T.xq = ds4f_bdxq; T.xs = ds4f_bdxs; T.g0 = g0;
+    }
     m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols) + ds4f_sbytes(t->type, t->rows, t->cols);
     ds4f_pool_run(m->pool, ds4f_mv_bd_worker, &T);
 }
@@ -1978,8 +2009,10 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, ds
         int gin = c->n_heads * c->q_head_dim / c->o_groups;  /* wo_a cols (== hidden for ds4f only) */
         per_layer += ds4f_wbytes(dq, oirows, gin) + ds4f_sbytes(dq, oirows, gin) + 2*pad; }
     {   int oir0, oir; ds4f_tp_oproj_shard(c->o_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(dense_bf16), &oir0, &oir);
-        int wob_c = c->o_inter;                               /* wo_b (DS4F_TP_WOB: FP8 o_inter col-shard) */
-        if (oir < c->o_inter && !dense_bf16 && getenv("DS4F_TP_WOB") && atoi(getenv("DS4F_TP_WOB"))) wob_c = oir;
+        int wob_c = c->o_inter;                               /* wo_b (DS4F_TP_WOB: o_inter col-shard) */
+        /* MUST mirror the runtime's wob_s (FP8 | Q8_PV | BF16_PV), else the arena is mis-sized. */
+        if (oir < c->o_inter && getenv("DS4F_TP_WOB") && atoi(getenv("DS4F_TP_WOB")) &&
+            (dq == DS4F_FP8 || dq == DS4F_Q8_PV || dq == DS4F_BF16_PV)) wob_c = oir;
         per_layer += ds4f_wbytes(dq, c->hidden, wob_c) + ds4f_sbytes(dq, c->hidden, wob_c) + 2*pad; }
     per_layer += (size_t)c->n_heads*4 + pad;
     /* MoE */
@@ -2355,7 +2388,11 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows,           /* TP: o_inter row-shard */
                                    cfg.n_heads*cfg.q_head_dim/cfg.o_groups);  /* cols = gin (== hidden for ds4f only) */
         {   const char *e = getenv("DS4F_TP_WOB");              /* wo_b: FP8 o_inter col-shard (pairs w/ TP_OPROJ) */
-            int wob_s = (m->oi_rows < cfg.o_inter) && dq == DS4F_FP8 && e && atoi(e);
+            /* wo_b col-shard: FP8 (128-aligned) or the BAKED layouts (64-aligned) -- ds4f_cshard_worker
+             * handles all three. Leaving Q8/bf16-pv out here REPLICATES wo_b (33 MiB/layer vs ~2.8) and
+             * o_proj balloons 19.3 -> 40.8 ms; that alone made baked-Q8 a net loss on ds4fbase. */
+            int wob_s = (m->oi_rows < cfg.o_inter) && e && atoi(e) &&
+                        (dq == DS4F_FP8 || dq == DS4F_Q8_PV || dq == DS4F_BF16_PV);
             ly->wo_b = ds4f_new_tensor(m, dq, C, wob_s ? m->oi_rows : cfg.o_inter); }
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads*4, 64);
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv when enabled */
@@ -2863,15 +2900,56 @@ static void ds4f_promote_worker(void *arg, int tid, int nthr) {
         }
     }
 }
-/* TP column-shard (FP8 only): copy columns [c0, c0+dst->cols) of the full [rows, Kfull] FP8 dense
- * into dst -- strided per row (cols not contiguous) + the 128-blocked E8M0 scale columns. c0 and
- * dst->cols 128-aligned. Used for wo_b under TP_OPROJ: bit-exact (s_o1 is already zero outside the
- * owned o_inter slice, so the dropped columns multiplied zeros). */
-typedef struct { uint8_t *dw, *dscale; const uint8_t *sw, *ss; int rows, cols, Kfull, c0; } ds4f_cshard_task;
+/* Is this manifest entry an OFFLINE-BAKED dense tensor (ds4f_bake.c)? Those bytes are already in
+ * the final kernel layout, so they are copied straight in -- no promote, no scale, and crucially
+ * NO transient bf16 peak. Detected from the manifest dtype, so no call site changes.
+ * (Defined here, ahead of the first user: cshard needs it too.) */
+static inline int ds4f_baked_dtype(const char *dt, ds4f_qtype *out) {
+    if (strcmp(dt, "BF16_PV") == 0) { *out = DS4F_BF16_PV; return 1; }
+    if (strcmp(dt, "Q8_PV")   == 0) { *out = DS4F_Q8_PV;   return 1; }
+    return 0;
+}
+
+/* TP column-shard: copy columns [c0, c0+dst->cols) of the full [rows, Kfull] dense into dst.
+ * Used for wo_b under TP_OPROJ -- bit-exact, because s_o1 is already zero outside the owned
+ * o_inter slice, so the dropped columns only ever multiplied zeros.
+ *
+ * Supports FP8 (128-aligned c0) and the two OFFLINE-BAKED layouts (64-aligned c0, which is what
+ * DS4F_TP_DENSE_ALIGN already hands us for non-FP8). Getting the baked ones working MATTERS:
+ * without a Q8 cshard, wob_s falls back to a REPLICATED wo_b (33 MiB/layer instead of ~2.8), the
+ * per-token weight traffic jumps 2.04 -> 3.36 GB, and o_proj balloons 19.3 -> 40.8 ms -- which
+ * turned baked-Q8 dense into a net LOSS on ds4fbase (8.91 vs 11.34 tok/s) even though its pure
+ * matvecs got ~1.8x faster (qkv 6.71->3.73, shared 7.84->4.54). The kernel was never the problem;
+ * the missing shard was. */
+typedef struct { uint8_t *dw, *dscale; const uint8_t *sw, *ss; int rows, cols, Kfull, c0;
+                 ds4f_qtype type; } ds4f_cshard_task;
 static void ds4f_cshard_worker(void *arg, int tid, int nthr) {
     ds4f_cshard_task *T = (ds4f_cshard_task *)arg;
     int rows = T->rows, cols = T->cols, Kfull = T->Kfull, c0 = T->c0;
     int r0, r1; ds4f_rowsplit8(rows, nthr, tid, &r0, &r1);
+
+    if (T->type == DS4F_Q8_PV) {
+        /* group layout: (rows/8) x (K/64) blocks of 528 B, scales INLINE. A column range that is
+         * 64-aligned is a CONTIGUOUS run of whole blocks inside each group -- so the shard is one
+         * memcpy per group, and the inline scales come along for free. */
+        size_t nbf = (size_t)(Kfull / 64), nbd = (size_t)(cols / 64);
+        for (int g = r0 / 8; g < r1 / 8; g++)
+            memcpy(T->dw + (size_t)g * nbd * 528,
+                   T->sw + (size_t)g * nbf * 528 + (size_t)(c0 / 64) * 528, nbd * 528);
+        return;
+    }
+    if (T->type == DS4F_BF16_PV) {
+        /* pair-interleaved: group g holds 4 pair-bufs of 2*K uint16, element (row,j) at
+         * pair*2*K + 2*j + slot. So columns [c0,c0+cols) are the contiguous uint16 run
+         * [2*c0, 2*(c0+cols)) inside each pair-buf. */
+        const uint16_t *sw = (const uint16_t *)T->sw; uint16_t *dw = (uint16_t *)T->dw;
+        for (int g = r0 / 8; g < r1 / 8; g++)
+            for (int p = 0; p < 4; p++)
+                memcpy(dw + (size_t)g * 8 * cols + (size_t)p * 2 * cols,
+                       sw + (size_t)g * 8 * Kfull + (size_t)p * 2 * Kfull + (size_t)2 * c0,
+                       (size_t)2 * cols * sizeof(uint16_t));
+        return;
+    }
     for (int i = r0; i < r1; i++)                                  /* FP8 weight: cols [c0,c0+cols) of row i */
         memcpy(T->dw + (size_t)i*cols, T->sw + (size_t)i*Kfull + c0, (size_t)cols);
     if (tid == 0) {                                                /* E8M0 scale (tiny): block-cols [c0/128,..) */
@@ -2884,23 +2962,31 @@ static void ds4f_load_dense_cshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
     char wn[256]; snprintf(wn, sizeof wn, "%s.weight", base);
     const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
     if (!we) { fprintf(stderr, "cshard: MISSING '%s'\n", wn); abort(); }
+    int rows = dst->rows, cols = dst->cols;
+    {   ds4f_qtype bq;                                      /* BAKED src: col-shard in the final layout */
+        if (ds4f_baked_dtype(we->dtype, &bq)) {
+            if (dst->type != bq) { fprintf(stderr, "cshard: '%s' baked %s vs dst %d\n", wn, we->dtype, dst->type); abort(); }
+            if (we->nbytes != ds4f_wbytes(bq, rows, Kfull)) {
+                fprintf(stderr, "cshard: baked '%s' nbytes %llu != full %zu\n",
+                        wn, (unsigned long long)we->nbytes, ds4f_wbytes(bq, rows, Kfull)); abort(); }
+            if ((c0 & 63) || (cols & 63)) {   /* Q8's block and the pv pair-run both need 64-aligned cols */
+                fprintf(stderr, "cshard: baked '%s' c0=%d cols=%d not 64-aligned\n", wn, c0, cols); abort(); }
+            ds4f_cshard_task T = { (uint8_t *)dst->w, NULL, B->blob + we->off, NULL,
+                                   rows, cols, Kfull, c0, bq };
+            ds4f_pool_run(m->pool, ds4f_cshard_worker, &T);
+            m->bytes_read += ds4f_wbytes(bq, rows, cols);
+            return;
+        }
+    }
     if (strcmp(we->dtype, "F8_E4M3") != 0 || dst->type != DS4F_FP8) { fprintf(stderr, "cshard: FP8 src+dst only\n"); abort(); }
-    int rows = dst->rows, cols = dst->cols, sbcf = (Kfull+127)/128;
+    int sbcf = (Kfull+127)/128;
     char sn[256]; snprintf(sn, sizeof sn, "%s.scale", base);
     const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", (size_t)((rows+127)/128)*sbcf);
-    ds4f_cshard_task T = { (uint8_t *)dst->w, (uint8_t *)dst->scale, B->blob + we->off, B->blob + se->off, rows, cols, Kfull, c0 };
+    ds4f_cshard_task T = { (uint8_t *)dst->w, (uint8_t *)dst->scale, B->blob + we->off, B->blob + se->off,
+                           rows, cols, Kfull, c0, DS4F_FP8 };
     ds4f_pool_run(m->pool, ds4f_cshard_worker, &T);
     m->bytes_read += (size_t)rows*cols;
 }
-/* Is this manifest entry an OFFLINE-BAKED dense tensor (ds4f_bake.c)? Those bytes are already in
- * the final kernel layout, so they are copied straight in -- no promote, no scale, and crucially
- * NO transient bf16 peak. Detected from the manifest dtype, so no call site changes. */
-static inline int ds4f_baked_dtype(const char *dt, ds4f_qtype *out) {
-    if (strcmp(dt, "BF16_PV") == 0) { *out = DS4F_BF16_PV; return 1; }
-    if (strcmp(dt, "Q8_PV")   == 0) { *out = DS4F_Q8_PV;   return 1; }
-    return 0;
-}
-
 static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst, const char *base) {
     char wn[256];
     snprintf(wn, sizeof wn, "%s.weight", base);
@@ -3152,7 +3238,11 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->wo_a = ds4f_new_tensor(m, dq, m->oi_rows,           /* TP: o_inter row-shard */
                                    cfg.n_heads*cfg.q_head_dim/cfg.o_groups);  /* cols = gin (== hidden for ds4f only) */
         {   const char *e = getenv("DS4F_TP_WOB");              /* wo_b: FP8 o_inter col-shard (pairs w/ TP_OPROJ) */
-            int wob_s = (m->oi_rows < cfg.o_inter) && dq == DS4F_FP8 && e && atoi(e);
+            /* wo_b col-shard: FP8 (128-aligned) or the BAKED layouts (64-aligned) -- ds4f_cshard_worker
+             * handles all three. Leaving Q8/bf16-pv out here REPLICATES wo_b (33 MiB/layer vs ~2.8) and
+             * o_proj balloons 19.3 -> 40.8 ms; that alone made baked-Q8 a net loss on ds4fbase. */
+            int wob_s = (m->oi_rows < cfg.o_inter) && e && atoi(e) &&
+                        (dq == DS4F_FP8 || dq == DS4F_Q8_PV || dq == DS4F_BF16_PV);
             ly->wo_b = ds4f_new_tensor(m, dq, C, wob_s ? m->oi_rows : cfg.o_inter); }
         ly->attn_sink = (float *)ds4f_bump(m, (size_t)cfg.n_heads * 4, 64);
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv */

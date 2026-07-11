@@ -24,6 +24,25 @@
 # 256 = 12*21 + 4 ranks 0-3 own 22 experts while ranks 4-11 own 21 — so the shared node gets the
 # SMALL shard (~23.5 GiB instead of 24.5). Keep the MemAvailable guard armed regardless.
 #
+# ---- FAST DECODE: baked Q8 dense + TP_ATTN=0  (14.06 tok/s vs 11.34, +24%) ------------------
+# The default below (FP8-on-demand dense + full TP) is the SAFE/reference path. The FAST path is:
+#
+#   ./build/ds4f_bake  with DS4F_MODEL=ds4fbase            # once, ~2 min -> ~/models/ds4fbase-fast
+#   DS4F_DENSE=q8pv DS4F_STAGE_DIR=/local/ds4fbase_q8 ./run_ds4fbase_stage_12n.sh
+#   DS4F_DENSE=q8pv DS4F_STAGE_DIR=/local/ds4fbase_q8 DS4F_TP_ATTN=0 ./run_ds4fbase_12n.sh
+#
+# Measured 12n, same allocation (decode tok/s / comm / o_proj ms):
+#   FP8 dense, full TP  (reference)  11.34   40.2%   19.34
+#   Q8  dense, full TP                9.02   59.2%   40.08   <- TP_ATTN's s_attn reduce dominates
+#   Q8  dense, TP_ATTN=0             14.06   32.1%    4.60   <- FAST
+#
+# WHY TP_ATTN=0 only wins with Q8: o_proj's timer includes TP_ATTN's 128 KB/layer s_attn
+# all-reduce (wo_a needs the FULL s_attn). Under FP8 the extra wq_b compute from un-sharding
+# costs MORE than the reduce saves (11.34 -> 8.16, a LOSS). Under Q8 the dense matvec is ~1.8x
+# faster, so the trade flips hard. Both need the Q8 cshard (TP_WOB) + the block-diag activation
+# pre-quantize; without those Q8 is a net loss. See a64fx/ds4f.md.
+# NOTE: DS4F_DENSE must MATCH how the blob was staged, or the loader aborts (by design).
+#
 # Run INSIDE the existing 12-node allocation (NO pjsub), AFTER run_ds4fbase_stage_12n.sh:
 #   ./run_ds4fbase_12n.sh
 #   DS4F_LAYERS=4 DS4F_MAXGEN=4 ./run_ds4fbase_12n.sh    # fast smoke / memory probe
