@@ -3904,6 +3904,35 @@ static void ds4f_cp_attn_combine(ds4f_model *m, int pos, const float *rcos, cons
         ds4f_rope_apply(out + nope, rcos, rsin, pos, half, 1);
     }
 }
+/* BATCHED verify/prefill combine: the `nc` combine-mode positions' per-node partials were collected
+ * (compacted) into p_attn_comb[i*(H+nh)] (packed [acc|l]) + p_attn_m[i*nh]. Reduce ALL nc in TWO
+ * collectives (not nc*2), then normalize + de-rotate each @ its own pos, writing the final [H] output
+ * back IN PLACE into p_attn_comb[i*stride..+H) (the caller scatters to p_attn[orig_k]). poss[i] = the
+ * i-th combine position's abs pos. nc==0 => no collective (all ranks agree -> lockstep). */
+static void ds4f_cp_attn_combine_batched(ds4f_model *m, int nc, const int *poss,
+                                         const float *rcos, const float *rsin) {
+    if (nc <= 0) return;
+    int nh = m->cfg.n_heads, HD = m->cfg.q_head_dim, H = nh*HD;
+    int rd = m->cfg.qk_rope_dim, nope = HD - rd, half = rd/2;
+    size_t stride = (size_t)H + nh;                              /* per-position packed [acc(H) | l(nh)] */
+    float *mloc = (float *)malloc((size_t)nc*nh*4);
+    memcpy(mloc, m->p_attn_m, (size_t)nc*nh*4);                  /* save local maxes */
+    m->ar_max_cb(m->p_attn_m, nc*nh, m->ar_max_ctx);            /* global max per (position,head) */
+    for (int i = 0; i < nc; i++) for (int h = 0; h < nh; h++) { /* rescale acc + l by exp(local-global) */
+        float sc = expf(mloc[(size_t)i*nh + h] - m->p_attn_m[(size_t)i*nh + h]);
+        float *acc = m->p_attn_comb + (size_t)i*stride + (size_t)h*HD;
+        for (int d = 0; d < HD; d++) acc[d] *= sc;
+        m->p_attn_comb[(size_t)i*stride + H + h] *= sc;
+    }
+    m->ar_cb(m->p_attn_comb, (int)((size_t)nc*stride), m->ar_ctx);  /* one reduce for the whole chunk */
+    for (int i = 0; i < nc; i++) for (int h = 0; h < nh; h++) { /* normalize + de-rotate IN PLACE */
+        float inv = 1.0f / m->p_attn_comb[(size_t)i*stride + H + h];
+        float *acc = m->p_attn_comb + (size_t)i*stride + (size_t)h*HD;
+        for (int d = 0; d < HD; d++) acc[d] *= inv;
+        ds4f_rope_apply(acc + nope, rcos, rsin, poss[i], half, 1);
+    }
+    free(mloc);
+}
 
 /* ===================== DS4F_ATTN_GEMM: KV-reuse (8-head-blocked) tb2 decode attention =========
  * The per-head worker re-reads each KV latent kv[j] 64x (once per head) -> attn runs at ~0.5%
@@ -4779,6 +4808,7 @@ static void ds4f_alloc_prefill_batch(ds4f_model *m, int m_tile) {
     if (m->p_logits_full == m->p_logits) m->p_logits_full = NULL;   /* aliased (replicated head) -> don't double-free */
     else { free(m->p_logits_full); m->p_logits_full = NULL; }
     free(m->p_logits); m->p_logits = NULL;
+    free(m->p_attn_comb); m->p_attn_comb = NULL; free(m->p_attn_m); m->p_attn_m = NULL;   /* CP-combine chunk partials */
     ds4f_config *c = &m->cfg;
     int C = c->hidden, H = c->n_heads*c->q_head_dim;
     size_t T = (size_t)m_tile;
@@ -5338,6 +5368,19 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         VTIC();
         /* per-position tier-B2 attention (causal: append KV then attend, in order). DS4F_DECODE_BATCH:
          * each element k is an INDEPENDENT sequence -> its own position + cache set (swapped into ly). */
+        /* CP Stage-C combine (DS4F_CP_COMBINE): combine-mode positions (cmp sharded + frozen) emit per-node
+         * partials that are compacted here and reduced in ONE batched combine after the loop (not K*2
+         * collectives); pre-freeze / non-CSA positions take the normal path straight to p_attn. The per-
+         * position frozen/cp_on check is deterministic -> every rank compacts the same set (lockstep). */
+        static int s_vcp = -1;
+        if (s_vcp < 0) { const char *e = getenv("DS4F_CP_COMBINE"); s_vcp = (e && *e && atoi(e)) ? 1 : 0; }
+        int vcp = s_vcp && m->cp && m->int4_cmp && m->ar_max_cb && m->ar_cb && (m->attn_h1 - m->attn_h0 == c->n_heads);
+        size_t vstride = (size_t)H + c->n_heads; int nc = 0, comb_k[128], poss_comb[128];
+        if (vcp) { int nh = c->n_heads;
+            if (!m->s_attn_m)    { m->s_attn_m    = (float *)aligned_alloc(64, ((size_t)nh*4 + 63) & ~63ull);
+                                   m->s_attn_comb = (float *)aligned_alloc(64, ((size_t)(H+nh)*4 + 63) & ~63ull); }
+            if (!m->p_attn_comb) { m->p_attn_comb = (float *)aligned_alloc(256, (size_t)m->m_tile*vstride*4);
+                                   m->p_attn_m    = (float *)aligned_alloc(256, (size_t)m->m_tile*nh*4); } }
         for (int k = 0; k < K; k++) {
             int pos = m->dec_batch_pos ? m->dec_batch_pos[k] : pos0 + k;
             if (m->dec_batch_seq) ds4f_lseq_apply(ly, &m->dec_batch_seq[(size_t)k*c->n_layers + L]);
@@ -5351,16 +5394,29 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             memcpy(m->s_q,  m->p_q  + (size_t)k*H, (size_t)H*4);     /* indexer + attention read s_q */
             if (m->tierb2 && ratio) ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin);
             m->cp_gather = 0;
+            int this_comb = vcp && m->tierb2 && ratio == 4 && ly->cmp_frozen && ly->cp_on;
             { DS4F_TIC();
-            if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
+            if (this_comb) {                       /* Stage-C partial -> compact for the batched combine */
+                ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD), c->window_size, c->qk_rope_dim/2, rcos, rsin };
+                ds4f_pool_run(m->pool, ds4f_attn_tb2_combine_worker, &at);
+                memcpy(m->p_attn_comb + (size_t)nc*vstride, m->s_attn_comb, vstride*4);
+                memcpy(m->p_attn_m    + (size_t)nc*c->n_heads, m->s_attn_m, (size_t)c->n_heads*4);
+                comb_k[nc] = k; poss_comb[nc] = pos; nc++;
+            } else if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 if (!ds4f_attn_tb2_gemm(m, &at))   /* DS4F_ATTN_GEMM: 8-head KV-reuse per verify position */
                     ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+                memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
             } else { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
-                ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
+                ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at);
+                memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4); }
             DS4F_TOC(DS4F_P_ATTN); }
-            memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
+        }
+        if (nc > 0) {   /* CP Stage-C: one batched cross-node combine for the chunk, then scatter to p_attn */
+            ds4f_cp_attn_combine_batched(m, nc, poss_comb, rcos, rsin);
+            for (int i = 0; i < nc; i++)
+                memcpy(m->p_attn + (size_t)comb_k[i]*H, m->p_attn_comb + (size_t)i*vstride, (size_t)H*4);
         }
         if (m->dec_batch_seq) ds4f_lseq_apply(ly, &m->dec_batch_seq[L]);   /* restore set 0 (seq 0) */
         VTOC(DS4F_P_TB2PREP);   /* whole per-position loop (glue = tb2prep - attn - tb2* subtimers) */
