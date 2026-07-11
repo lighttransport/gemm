@@ -7,7 +7,9 @@
  *
  * Weights stay quantized in HBM and are dequantized on demand per token:
  *   - dense (MLA attn + shared expert) = FP8 E4M3, 128x128 block E8M0 scale
- *   - routed experts                   = split MXFP4 (e2m1), per-32 E8M0 scale
+ *   - routed experts                   = cfg.expert_qt: split MXFP4 (e2m1), per-32 E8M0
+ *                                        scale for Flash/Pro; FP8 E4M3 + 128x128 block
+ *                                        E8M0 scale for base (DS4F_MODEL=ds4fbase)
  *   - embed / head / router / norms    = BF16 ;  attn_sink / mHC = F32
  * Kernels (matvec_fp8e4m3_8row / matvec_mxfp4_8row / matvec_bf16_8row) and the
  * e8m0/fp8 helpers live in ggml_dequant.h (validated by ds4f_kernels_bench.c).
@@ -29,6 +31,8 @@
  *   ffn.gate.weight BF16 [256,4096]   (router)
  *   ffn.shared_experts.w1/w3 F8 [2048,4096] scale[16,32]; w2 F8 [4096,2048] scale[32,16]
  *   ffn.experts.N.w1/w3 I8 [2048,2048] scale[2048,128];  w2 I8 [4096,1024] scale[4096,64]
+ *     (ds4fbase instead: w1/w3 F8 [2048,4096] scale[16,32]; w2 F8 [4096,2048] scale[32,16]
+ *      -- i.e. the experts take the SAME shape as the shared expert above)
  *   hc_attn_* / hc_ffn_* F32 (small, FLOP stand-in)
  */
 #ifndef DS4F_H
@@ -52,6 +56,10 @@
 #include <arm_sve.h>
 
 #include "ggml_dequant.h"
+
+/* Weight quant types. Declared up here because ds4f_config carries one (expert_qt);
+ * the per-type layout notes live above the ds4f_tensor definition below. */
+typedef enum { DS4F_BF16 = 0, DS4F_FP8 = 1, DS4F_MXFP4 = 2, DS4F_F32 = 3, DS4F_BF16_PV = 4, DS4F_Q8_PV = 5 } ds4f_qtype;
 
 /* ===================== config ===================== */
 typedef struct {
@@ -101,6 +109,11 @@ typedef struct {
     int   rope_factor;           /* 16 */
     int   beta_fast, beta_slow;  /* 32, 1 */
     int   original_seq_len;      /* 65536 (YaRN orig ctx; 0 => YaRN off) */
+    /* Routed-expert weight format. This is the ONLY thing that differs between the
+     * Flash release (~/models/ds4f, expert_dtype=fp4 -> DS4F_MXFP4) and the base
+     * release (~/models/ds4fbase, expert_dtype=fp8 -> DS4F_FP8). Everything else --
+     * dims, tensor names, tokenizer, dense FP8 -- is identical. */
+    ds4f_qtype expert_qt;
     /* runtime */
     int max_pos;        /* KV cache capacity */
 } ds4f_config;
@@ -112,6 +125,7 @@ static inline ds4f_config ds4f_default_config(void) {
     c.q_lora = 1024; c.kv_lora = 512; c.o_inter = 8192; c.o_groups = 8;
     c.n_experts = 256; c.n_active = 6; c.moe_inter = 2048; c.shared_inter = 2048;
     c.routed_scale = 1.5f; c.max_pos = 4096;
+    c.expert_qt = DS4F_MXFP4;            /* Flash: expert_dtype=fp4 (see ds4f_base_config) */
     c.hc_mult = 4; c.hc_iters = 20; c.hc_eps = 1e-6f; c.norm_eps = 1e-6f;
     /* lightning indexer (matches DeepSeek-V4-Flash config.json) */
     c.index_topk = 512; c.index_head_dim = 128; c.index_n_heads = 64;
@@ -152,10 +166,31 @@ static inline ds4f_config ds4f_pro_config(void) {
     return c;
 }
 
-/* DS4F_MODEL=ds4p selects the Pro config (default: Flash). */
+/* DeepSeek-V4 BASE (~/models/ds4fbase, 275 GB / 46 shards): the SAME graph and the SAME
+ * dimensions as Flash -- config.json differs in exactly one field, expert_dtype fp8 (vs fp4).
+ * So the routed experts are FP8-e4m3 with a 128x128 block scale (byte-for-byte the layout the
+ * dense tensors already use) instead of MXFP4, and they cost 24 MiB/expert instead of 12.75.
+ *
+ * The base safetensors also store every *.scale as F32 rather than F8_E8M0. The values are exact
+ * powers of two (config.json: scale_fmt="ue8m0"), so ds4f_stage.c folds them losslessly to E8M0
+ * bytes at stage time -- by the time the loader sees the blob, base and Flash scales are identical
+ * and no kernel here knows the difference.
+ *
+ * Memory: FP8 experts are 22.17 GiB/node at EP=12 (vs 12.85 for Flash at EP=11), so base needs the
+ * dense-TP stack (DS4F_TP_ATTN/OPROJ/WOB/SHARED/HEAD/EMBED) to fit a 32 GB node -- 24.5 GiB with TP
+ * vs 30.5 without. See run_ds4fbase_12n.sh. */
+static inline ds4f_config ds4f_base_config(void) {
+    ds4f_config c = ds4f_default_config();
+    c.expert_qt = DS4F_FP8;              /* the only delta vs Flash */
+    return c;
+}
+
+/* DS4F_MODEL selects the variant: ds4p = Pro, ds4fbase = base, default = Flash. */
 static inline ds4f_config ds4f_config_from_env(void) {
     const char *m = getenv("DS4F_MODEL");
-    return (m && strcmp(m, "ds4p") == 0) ? ds4f_pro_config() : ds4f_default_config();
+    if (m && strcmp(m, "ds4p") == 0)     return ds4f_pro_config();
+    if (m && strcmp(m, "ds4fbase") == 0) return ds4f_base_config();
+    return ds4f_default_config();
 }
 
 /* ===================== tensor ===================== */
@@ -171,7 +206,6 @@ static inline ds4f_config ds4f_config_from_env(void) {
  * and svdot is 4x FMLA throughput -> the only sub-f32 dense lever. Argmax-exact
  * but NOT rel<1e-3 (int8 rounding ~1e-2); used ONLY for the big hidden-layer
  * dense GEMMs (qkv/o_proj/shared), never the argmax-critical router/lm-head. */
-typedef enum { DS4F_BF16 = 0, DS4F_FP8 = 1, DS4F_MXFP4 = 2, DS4F_F32 = 3, DS4F_BF16_PV = 4, DS4F_Q8_PV = 5 } ds4f_qtype;
 
 typedef struct {
     void    *w;       /* weight bytes */
@@ -212,7 +246,7 @@ typedef struct {
     ds4f_tensor gate;                 /* BF16 [n_experts, hidden] router */
     float *gate_bias;                 /* [n_experts] F32 selection bias (exact, layers>=n_hash); NULL=hash/synth */
     ds4f_tensor sh_w1, sh_w2, sh_w3;  /* shared expert (FP8) */
-    ds4f_tensor *ex_w1, *ex_w2, *ex_w3; /* owned experts (MXFP4), indexed 0..n_owned-1 */
+    ds4f_tensor *ex_w1, *ex_w2, *ex_w3; /* owned experts (cfg.expert_qt: MXFP4 | FP8), 0..n_owned-1 */
     int *owned_eid;                   /* global expert id of each owned slot */
     int  n_owned;
     /* mHC (F32): fn = [mix_hc=24, hc_mult*hidden=16384] Linear; base = [24] bias;

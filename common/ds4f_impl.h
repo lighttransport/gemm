@@ -1977,9 +1977,10 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     {   int shr0, shrows; ds4f_tp_shared_shard(c->shared_inter, ep_rank, ep_size, DS4F_TP_DENSE_ALIGN(dense_bf16), &shr0, &shrows);  /* sh_w1+sh_w3 (TP col-shard) */
         per_layer += 2*(ds4f_wbytes(dq, shrows, c->hidden) + ds4f_sbytes(dq, shrows, c->hidden)) + 4*pad; }
     per_layer += ds4f_wbytes(dq, c->hidden, c->shared_inter) + ds4f_sbytes(dq, c->hidden, c->shared_inter) + 2*pad;  /* sh_w2 (replicated) */
-    size_t per_ex = ds4f_wbytes(DS4F_MXFP4, c->moe_inter, c->hidden) + ds4f_sbytes(DS4F_MXFP4, c->moe_inter, c->hidden)
-                  + ds4f_wbytes(DS4F_MXFP4, c->hidden, c->moe_inter) + ds4f_sbytes(DS4F_MXFP4, c->hidden, c->moe_inter)
-                  + ds4f_wbytes(DS4F_MXFP4, c->moe_inter, c->hidden) + ds4f_sbytes(DS4F_MXFP4, c->moe_inter, c->hidden) + 6*pad;
+    ds4f_qtype xq = c->expert_qt;   /* MXFP4 (Flash/Pro) | FP8 (base) */
+    size_t per_ex = ds4f_wbytes(xq, c->moe_inter, c->hidden) + ds4f_sbytes(xq, c->moe_inter, c->hidden)
+                  + ds4f_wbytes(xq, c->hidden, c->moe_inter) + ds4f_sbytes(xq, c->hidden, c->moe_inter)
+                  + ds4f_wbytes(xq, c->moe_inter, c->hidden) + ds4f_sbytes(xq, c->moe_inter, c->hidden) + 6*pad;
     per_layer += (size_t)no * per_ex;
     {   int hc = c->hc_mult, mix = (2+hc)*hc, hd = hc*c->hidden;
         per_layer += 2*((size_t)mix*hd*4 + (size_t)mix*4 + 3*4) + 6*pad;            /* hc_attn/ffn fn+base+scale */
@@ -2009,8 +2010,8 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
         mtp += ds4f_wbytes(dq,c->o_inter,c->hidden) + ds4f_sbytes(dq,c->o_inter,c->hidden);
         mtp += ds4f_wbytes(dq,c->hidden,c->o_inter) + ds4f_sbytes(dq,c->hidden,c->o_inter);
         mtp += ds4f_wbytes(DS4F_BF16,c->n_experts,c->hidden);                                  /* gate */
-        mtp += (size_t)no * (2*(ds4f_wbytes(DS4F_MXFP4,c->moe_inter,c->hidden)+ds4f_sbytes(DS4F_MXFP4,c->moe_inter,c->hidden))
-                            + ds4f_wbytes(DS4F_MXFP4,c->hidden,c->moe_inter)+ds4f_sbytes(DS4F_MXFP4,c->hidden,c->moe_inter));
+        mtp += (size_t)no * (2*(ds4f_wbytes(xq,c->moe_inter,c->hidden)+ds4f_sbytes(xq,c->moe_inter,c->hidden))
+                            + ds4f_wbytes(xq,c->hidden,c->moe_inter)+ds4f_sbytes(xq,c->hidden,c->moe_inter));
         mtp += 2*(ds4f_wbytes(dq,c->hidden,c->hidden)+ds4f_sbytes(dq,c->hidden,c->hidden));    /* e_proj + h_proj */
         mtp += (size_t)2*mix*hc*c->hidden*4 + (size_t)hc*hc*c->hidden*4;                       /* hc_attn/ffn/head fn */
         total += mtp + (size_t)64*1024*1024 + 64*pad;                                          /* norms/base/scale + slack */
@@ -2358,10 +2359,11 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->owned_eid = (int *)calloc(no, sizeof(int));
         ly->n_owned = no;
         int slot = 0;
+        ds4f_qtype xq = cfg.expert_qt;   /* MXFP4 (Flash/Pro) | FP8 (base) */
         for (int e = 0; e < cfg.n_experts; e++) if (e % ep_size == ep_rank) {
-            ly->ex_w1[slot] = ds4f_new_tensor(m, DS4F_MXFP4, cfg.moe_inter, C);
-            ly->ex_w3[slot] = ds4f_new_tensor(m, DS4F_MXFP4, cfg.moe_inter, C);
-            ly->ex_w2[slot] = ds4f_new_tensor(m, DS4F_MXFP4, C, cfg.moe_inter);
+            ly->ex_w1[slot] = ds4f_new_tensor(m, xq, cfg.moe_inter, C);
+            ly->ex_w3[slot] = ds4f_new_tensor(m, xq, cfg.moe_inter, C);
+            ly->ex_w2[slot] = ds4f_new_tensor(m, xq, C, cfg.moe_inter);
             ly->owned_eid[slot] = e; slot++;
         }
         {   int hc = cfg.hc_mult, mix = (2+hc)*hc, hd = hc*C;
@@ -3077,10 +3079,11 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->owned_eid = (int *)calloc(no, sizeof(int));
         ly->n_owned = no;
         int slot = 0;
+        ds4f_qtype xq = cfg.expert_qt;   /* MXFP4 (Flash/Pro) | FP8 (base) */
         for (int e = 0; e < cfg.n_experts; e++) if (e % ep_size == ep_rank) {
-            ly->ex_w1[slot] = ds4f_new_tensor(m, DS4F_MXFP4, cfg.moe_inter, C);
-            ly->ex_w3[slot] = ds4f_new_tensor(m, DS4F_MXFP4, cfg.moe_inter, C);
-            ly->ex_w2[slot] = ds4f_new_tensor(m, DS4F_MXFP4, C, cfg.moe_inter);
+            ly->ex_w1[slot] = ds4f_new_tensor(m, xq, cfg.moe_inter, C);
+            ly->ex_w3[slot] = ds4f_new_tensor(m, xq, cfg.moe_inter, C);
+            ly->ex_w2[slot] = ds4f_new_tensor(m, xq, C, cfg.moe_inter);
             ly->owned_eid[slot] = e; slot++;
         }
         {   int hc = cfg.hc_mult, mix = (2 + hc) * hc, hd = hc * C;
@@ -3209,10 +3212,11 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
          * NULL; the block-forward must skip the shared contribution for the MTP layer when wired. */
         mt->ex_w1=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w2=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w3=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor));
         mt->owned_eid=(int*)calloc(no,sizeof(int)); mt->n_owned=no;
+        ds4f_qtype xqm = cfg.expert_qt;   /* MXFP4 (Flash/Pro) | FP8 (base) */
         { int slot=0; for (int e=0;e<cfg.n_experts;e++) if (e%ep_size==ep_rank) {
-            mt->ex_w1[slot]=ds4f_new_tensor(m,DS4F_MXFP4,cfg.moe_inter,C2);
-            mt->ex_w3[slot]=ds4f_new_tensor(m,DS4F_MXFP4,cfg.moe_inter,C2);
-            mt->ex_w2[slot]=ds4f_new_tensor(m,DS4F_MXFP4,C2,cfg.moe_inter);
+            mt->ex_w1[slot]=ds4f_new_tensor(m,xqm,cfg.moe_inter,C2);
+            mt->ex_w3[slot]=ds4f_new_tensor(m,xqm,cfg.moe_inter,C2);
+            mt->ex_w2[slot]=ds4f_new_tensor(m,xqm,C2,cfg.moe_inter);
             snprintf(mn,sizeof mn,"mtp.0.ffn.experts.%d.w1",e); ds4f_load_q(m,&B,&mt->ex_w1[slot],mn);
             snprintf(mn,sizeof mn,"mtp.0.ffn.experts.%d.w3",e); ds4f_load_q(m,&B,&mt->ex_w3[slot],mn);
             snprintf(mn,sizeof mn,"mtp.0.ffn.experts.%d.w2",e); ds4f_load_q(m,&B,&mt->ex_w2[slot],mn);
@@ -3270,8 +3274,10 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     double el = ds4f_wall() - t0;
     fprintf(stderr,
         "ds4f_load_real rank %d/%d: %d staged tensors, loaded %.2f GB "
-        "(FP8 e4m3fn dense + MXFP4 experts repacked, %d owned), arena %.2f GB, %.1f s, %.2f GB/s\n",
-        ep_rank, ep_size, n_tensors, loaded_gb, no, (double)m->arena_used / 1e9,
+        "(FP8 e4m3fn dense + %s experts, %d owned), arena %.2f GB, %.1f s, %.2f GB/s\n",
+        ep_rank, ep_size, n_tensors, loaded_gb,
+        cfg.expert_qt == DS4F_FP8 ? "FP8 e4m3fn" : "MXFP4 repacked",   /* base vs Flash/Pro */
+        no, (double)m->arena_used / 1e9,
         el, el > 0 ? loaded_gb / el : 0.0);
     (void)staged;
     ds4f_build_freqs(m);   /* RoPE/YaRN tables (only when exact) */

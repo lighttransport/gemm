@@ -18,6 +18,11 @@
  * Copies stream file->file from the mmap, so process RSS stays at a few MB
  * even while moving ~25 GB.
  *
+ * The ONE transform applied on the way through: an F32 "*.scale" is folded to the
+ * E8M0 byte the loader/kernels expect (see f32_scale_to_e8m0). This is what lets the
+ * SAME stager+loader serve both ds4f (Flash: F8_E8M0 scales, MXFP4 experts) and
+ * ds4fbase (base: F32 scales, FP8-e4m3 experts) -- see DS4F_MODEL=ds4fbase.
+ *
  *   out_dir/rank<rr>.blob       packed weights (256B aligned per tensor)
  *   out_dir/rank<rr>.manifest   header line + one line per tensor:
  *       <local_off> <nbytes> <dtype> <ndims> <d0..dn> <name>
@@ -111,6 +116,45 @@ static int classify(const char *name, int rank, int ep_size) {
     return CLS_DENSE;                                       /* replicated */
 }
 
+/* ---- F32 "ue8m0" scale -> E8M0 byte ------------------------------------------------
+ * DeepSeek-V4-Flash ships every *.scale as F8_E8M0 (one byte = the biased exponent of a
+ * power-of-2 scale). The BASE model (ds4fbase) ships the SAME scales as F32 -- same shape,
+ * same values, 4x the bytes. config.json says scale_fmt="ue8m0" for both, and every value
+ * checks out as an exact power of two (verified over dense/shared/indexer/expert scales:
+ * sign=0, mantissa=0, log2 in [-12,-8]).
+ *
+ * So we normalize F32 scales to E8M0 HERE, at stage time. That is a lossless exponent
+ * bit-extract (byte = the f32's biased-exponent field), and it means the loader and every
+ * FP8 kernel keep consuming exactly the E8M0 layout they already do -- no downstream change.
+ *
+ * Exactness is load-bearing, so a non-pow2 value is a hard error, never a silent round. */
+static int f32_scale_to_e8m0(const void *src, size_t nbytes, uint8_t *dst, const char *name) {
+    if (nbytes % 4) {
+        fprintf(stderr, "ds4f_stage: '%s' F32 scale nbytes %zu not a multiple of 4\n", name, nbytes);
+        return -1;
+    }
+    size_t n = nbytes / 4;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t b;
+        memcpy(&b, (const uint8_t *)src + i * 4, 4);
+        /* pow2 <=> sign clear AND mantissa clear. (Also rejects 0, inf/NaN-with-mantissa.) */
+        if (b & 0x807FFFFFu) {
+            float f; memcpy(&f, &b, 4);
+            fprintf(stderr, "ds4f_stage: '%s'[%zu] = %.9g (bits %08x) is NOT a power of two -- "
+                            "the ue8m0 premise fails, refusing to lossily round to E8M0\n",
+                    name, i, (double)f, b);
+            return -1;
+        }
+        dst[i] = (uint8_t)((b >> 23) & 0xFFu);   /* biased exponent == the E8M0 byte */
+    }
+    return 0;
+}
+
+static int is_scale_name(const char *name) {
+    size_t n = strlen(name);
+    return n >= 6 && strcmp(name + n - 6, ".scale") == 0;
+}
+
 /* write exactly n bytes (loop over partial writes) */
 static int write_all(int fd, const void *buf, size_t n) {
     const uint8_t *p = (const uint8_t *)buf;
@@ -183,6 +227,8 @@ int main(void) {
     uint64_t last_sync = 0;            /* blob bytes already flushed + dropped */
     long long n_dense = 0, n_expert = 0;
     uint64_t b_dense = 0, b_expert = 0;
+    long long n_e8m0 = 0;              /* F32 scales folded to E8M0 (ds4fbase); 0 for ds4f */
+    static uint8_t e8m0_buf[1 << 16];  /* biggest scale is wq_b [256,8] = 2 K elems */
     double t0 = now_sec();
 
     for (int s = 1; s <= last; s++) {
@@ -197,7 +243,22 @@ int main(void) {
             int cls = classify(name, rank, ep_size);
             if (cls == CLS_SKIP) continue;
 
-            size_t nb = st->tensors[i].nbytes;
+            st_tensor_info *t = &st->tensors[i];
+            size_t nb = t->nbytes;
+            const void *src = safetensors_data(st, i);
+            const char *dtype = t->dtype_str;
+
+            /* ds4fbase ships *.scale as F32; fold it to the E8M0 byte the loader expects.
+             * (ds4f's scales are already F8_E8M0 -> this never fires, plain byte copy.) */
+            if (strcmp(dtype, "F32") == 0 && is_scale_name(name)) {
+                if (nb / 4 > sizeof e8m0_buf) {   /* scales are tiny (<=8 KB); guard anyway */
+                    fprintf(stderr, "ds4f_stage: '%s' scale too large (%zu B) for the E8M0 buffer\n", name, nb);
+                    goto fail;
+                }
+                if (f32_scale_to_e8m0(src, nb, e8m0_buf, name) != 0) goto fail;
+                src = e8m0_buf; nb /= 4; dtype = "F8_E8M0"; n_e8m0++;
+            }
+
             /* align the destination offset to ALIGN (sparse seek over the gap) */
             uint64_t aligned = (off + (ALIGN - 1)) & ~(uint64_t)(ALIGN - 1);
             if (aligned != off) {
@@ -206,14 +267,14 @@ int main(void) {
                     goto fail;
                 }
             }
-            if (write_all(bfd, safetensors_data(st, i), nb) != 0) {
+            if (write_all(bfd, src, nb) != 0) {
                 fprintf(stderr, "ds4f_stage: write failed on %s: %s\n", name, strerror(errno));
                 goto fail;
             }
 
-            /* manifest line: off nbytes dtype ndims shape... name */
-            st_tensor_info *t = &st->tensors[i];
-            fprintf(mf, "%llu %zu %s %d", (unsigned long long)aligned, nb, t->dtype_str, t->n_dims);
+            /* manifest line: off nbytes dtype ndims shape... name
+             * (shape is unchanged by the F32->E8M0 fold -- only the element size shrinks) */
+            fprintf(mf, "%llu %zu %s %d", (unsigned long long)aligned, nb, dtype, t->n_dims);
             for (int d = 0; d < t->n_dims; d++) fprintf(mf, " %llu", (unsigned long long)t->shape[d]);
             fprintf(mf, " %s\n", name);
 
@@ -253,6 +314,7 @@ int main(void) {
     if (close(bfd) < 0) { fprintf(stderr, "ds4f_stage: close blob failed: %s\n", strerror(errno)); return 2; }
 
     printf("\nrank %d done: %lld tensors (%lld dense / %lld expert)\n", rank, n_total, n_dense, n_expert);
+    printf("  F32->E8M0 scales folded: %lld  (0 = ds4f, already E8M0)\n", n_e8m0);
     printf("  staged %.2f GB (dense %.2f + expert %.2f)  blob_size=%.2f GB\n",
            b_total / 1e9, b_dense / 1e9, b_expert / 1e9, off / 1e9);
     printf("  %.1f s  %.2f GB/s effective\n", tel, tel > 0 ? b_total / 1e9 / tel : 0.0);
