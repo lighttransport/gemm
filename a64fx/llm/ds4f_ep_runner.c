@@ -260,8 +260,10 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
     float *hcb  = (float *)aligned_alloc(64, (size_t)mtile * hcC * 4);
     int   *otb  = (int *)malloc((size_t)mtile * sizeof(int));
     int   *Xin  = (int *)malloc((size_t)maxpos * sizeof(int));
-    typedef struct { int *ids; int nids, np, pos, mnew, active; } bseq;
+    typedef struct { int *ids; int nids, np, pos, mnew, active;
+                     ds4f_sampler samp; uint64_t rng; int samples; } bseq;
     bseq *S = (bseq *)calloc((size_t)B, sizeof(bseq));
+    long req_ctr = 0;   /* monotonic per-request counter (identical across ranks) -> default seed source */
     for (int i = 0; i < B; i++) S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
     float *xscr = (float *)aligned_alloc(64, (size_t)Cc * 4);   /* per-token embed scratch */
     long last_seq = ds4f_read_seq(reqseqf);
@@ -278,7 +280,10 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
             if (want > B) want = B;
             for (int i = 0; i < want; i++) {
                 int mnew = 256;
-                if (!fgets(line, sizeof line, rf)) break; sscanf(line, "%d", &mnew);
+                /* per-seq line: "max_new [temp top_p top_k seed rep_pen pres_pen]" (sampling optional). */
+                float temp = 0.f, top_p = 1.f, rep_pen = 1.f, pres_pen = 0.f; int top_k = 0; long seed = 0;
+                if (!fgets(line, sizeof line, rf)) break;
+                sscanf(line, "%d %f %f %d %ld %f %f", &mnew, &temp, &top_p, &top_k, &seed, &rep_pen, &pres_pen);
                 int np = 0, v; char *tok, *sp;
                 char *ln = NULL; size_t lc = 0;
                 if (getline(&ln, &lc, rf) < 0) { free(ln); break; }
@@ -288,6 +293,14 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
                 if (mnew < 0) mnew = 0; if (np + mnew > maxpos) mnew = maxpos > np ? maxpos - np : 0;
                 bseq *s = &S[N]; s->np = np; s->mnew = mnew; s->nids = 0; s->pos = 0;
                 memcpy(s->ids, Xin, (size_t)np * sizeof(int)); s->nids = np;
+                /* per-seq sampler + PRNG (identical on every rank -> identical draws -> lockstep). seed 0
+                 * => derive from a monotonic per-request counter (unique across batches, rank-deterministic). */
+                s->samp.temp = temp; s->samp.top_p = top_p; s->samp.top_k = top_k;
+                s->samp.rep_pen = rep_pen; s->samp.pres_pen = pres_pen; s->samp.rep_last_n = 64;
+                s->samples = (temp > 0.f);
+                { uint64_t bs = seed ? (uint64_t)seed : (uint64_t)(req_ctr + 1);
+                  s->rng = bs * 0x9E3779B97F4A7C15ULL; }
+                req_ctr++;
                 N++;
             }
             fclose(rf);
@@ -305,13 +318,20 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
                     for (int base = 0; base < s->np; base += K) {
                         int M = s->np - base < K ? s->np - base : K;
                         for (int mm = 0; mm < M; mm++) embed_lookup(m, s->ids[base+mm], Xb + (size_t)mm*Cc);
+                        m->want_full_logits = (s->samples && base + K >= s->np);   /* last chunk: first-token draw */
                         int ot[128]; ds4f_forward_verify(m, Xb, M, base, ot, hcb); first = ot[M-1];
+                        if (m->want_full_logits)
+                            first = ds4f_sample_logits(m->p_logits_full + (size_t)(M-1)*c->vocab, c->vocab,
+                                                       &s->samp, &s->rng, s->ids, s->np);
                     }
                 } else {
+                    m->want_full_logits = s->samples;
                     for (int p = 0; p < s->np; p++) { embed_lookup(m, s->ids[p], xscr); first = ds4f_forward_token(m, xscr, p); }
+                    if (s->samples) first = ds4f_sample(m, &s->samp, s->ids, s->np);
                 }
                 pf_tokens += s->np;
             }
+            m->want_full_logits = 0;
             s->pos = s->np;   /* the first gen token (= last-prefill argmax) occupies position np; the
                                * first decode step forwards it AT pos=np (then pos advances). Do NOT
                                * pre-increment pos here or position np's KV is never written (a gap). */
@@ -332,11 +352,17 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
                 na++;
             }
             if (na == 0) break;
+            int any_sample = 0;                              /* full [na,vocab] logits iff a seq samples */
+            for (int a = 0; a < na; a++) if (S[map[a]].samples) { any_sample = 1; break; }
+            m->want_full_logits = any_sample;
             m->dec_batch_seq = view; m->dec_batch_pos = vpos;
             ds4f_forward_verify(m, Xb, na, 0, otb, hcb);
             dec_steps++; dec_toks += na;
             for (int a = 0; a < na; a++) {
-                bseq *s = &S[map[a]]; int tok = otb[a];
+                bseq *s = &S[map[a]];
+                int tok = s->samples ? ds4f_sample_logits(m->p_logits_full + (size_t)a*c->vocab, c->vocab,
+                                                          &s->samp, &s->rng, s->ids, s->nids)
+                                     : otb[a];
                 s->ids[s->nids++] = tok; s->pos++;
                 if (tok == DS4F_EOS_ID || s->nids - s->np >= s->mnew) s->active = 0;
             }

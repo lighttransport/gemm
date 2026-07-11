@@ -49,9 +49,10 @@ BATCH_WINDOW = float(os.environ.get("DS4F_SERVE_BATCH_WINDOW", "0.03"))   # 30 m
 _batch_q = _queue.Queue()
 
 class _BReq:
-    __slots__ = ("ids", "max_new", "ev", "gen")
-    def __init__(self, ids, max_new):
+    __slots__ = ("ids", "max_new", "ev", "gen", "samp")
+    def __init__(self, ids, max_new, samp=None):
         self.ids, self.max_new, self.ev, self.gen = ids, max_new, threading.Event(), []
+        self.samp = samp
 
 def _batch_dispatcher():
     global _seq
@@ -68,7 +69,12 @@ def _batch_dispatcher():
         with open(REQ, "w") as f:
             f.write("BATCH %d\n" % len(batch))
             for r in batch:
-                f.write("%d\n" % r.max_new)
+                sp = r.samp or {"temperature": 0.0, "top_p": 1.0, "top_k": 0,
+                                "repeat_penalty": 1.0, "presence_penalty": 0.0, "seed": None}
+                seed = sp.get("seed") if sp.get("seed") is not None else 0
+                # per-seq line: "max_new temp top_p top_k seed rep_pen pres_pen" (runner parses; greedy if temp<=0)
+                f.write("%d %g %g %d %d %g %g\n" % (r.max_new, sp["temperature"], sp["top_p"],
+                        sp["top_k"], seed, sp["repeat_penalty"], sp["presence_penalty"]))
                 f.write(" ".join(map(str, r.ids)) + "\n")
         with open(REQSEQ, "w") as f:
             f.write(str(_seq) + "\n")
@@ -92,10 +98,10 @@ def _batch_dispatcher():
                 r.gen = [int(x) for x in lines[1 + i].split()]
             r.ev.set()
 
-def infer_batched(prompt, max_tokens):
+def infer_batched(prompt, max_tokens, samp=None):
     ids = encode(prompt)
     if not ids: return [], [], ""
-    r = _BReq(ids, max_tokens)
+    r = _BReq(ids, max_tokens, samp)
     _batch_q.put(r)
     if not r.ev.wait(TIMEOUT): raise TimeoutError("runner timeout")
     return ids, r.gen, decode(r.gen)
@@ -189,8 +195,8 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
     # concurrent batched decode: route greedy, non-cache requests through the dispatcher (the runner
     # is in DS4F_SERVE_BATCH mode -> the single-request protocol is not served there).
     if BATCH > 1 and not (cache_load or cache_save):
-        # DYNAMIC path supports per-sequence sampling; the static BATCH path is greedy-only.
-        return infer_dynamic(prompt, max_tokens, samp) if DYNAMIC else infer_batched(prompt, max_tokens)
+        # both batched paths now support per-sequence sampling
+        return infer_dynamic(prompt, max_tokens, samp) if DYNAMIC else infer_batched(prompt, max_tokens, samp)
     with _lock:
         ids = encode(prompt)
         if not ids and not cache_save:
