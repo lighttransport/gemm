@@ -6,6 +6,7 @@
 # Usage:
 #   make CC=fcc                     # Fujitsu fcc, sequential
 #   make CC=fcc OPENMP=1            # Fujitsu fcc + OpenMP (recommended)
+#   make CC=mpifcc OPENMP=1         # Fujitsu MPI wrapper + OpenMP
 #   make CC=gcc OPENMP=1            # gcc + OpenMP
 #
 # Outputs:
@@ -28,6 +29,12 @@ BUILD       := $(LLM_DIR)build
 
 # ── Compiler-specific flags ────────────────────────────────────────────
 ifeq ($(CC),fcc)
+    BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
+    BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
+    OMP_FLAG     := -fopenmp
+    ASMC         := fcc
+    HWBLIB       := -lhwb
+else ifeq ($(CC),mpifcc)
     BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
     BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
@@ -65,6 +72,10 @@ LDFLAGS := -lm -lpthread $(HWBLIB)
 ifdef OPENMP
     CFLAGS  += $(OMP_FLAG) -DUSE_OPENMP=1
     LDFLAGS += $(OMP_FLAG)
+endif
+
+ifdef FAPP
+    CFLAGS  += -DGLM5_USE_FAPP=1
 endif
 
 ifdef DEBUG
@@ -107,11 +118,13 @@ DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ds4f_impl.h $(
 M3_EP_SRC := $(LLM_DIR)../m3/m3_ep_runner.c
 M3_HDRS   := $(COMMON)/m3.h $(COMMON)/m3_impl.h $(COMMON)/ggml_dequant.h
 GLM5_EP_SRC := $(LLM_DIR)../glm5/glm5_ep_runner.c
-GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COMMON)/glm5_mxfp8.h $(COMMON)/ggml_dequant.h \
+GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COMMON)/glm5_mxfp8.h $(COMMON)/glm5_int8.h $(COMMON)/ggml_dequant.h \
                $(LLM_DIR)../utofu-tests/tp_allreduce.h $(LLM_DIR)../utofu-tests/tofu_demo.h
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw m3_ep_runner glm5_ep_runner glm5_stage glm5_real_test glm5_fp8_kernel_test
+# ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
+# built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
+.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
@@ -179,6 +192,9 @@ $(BUILD)/m3_real_test: $(LLM_DIR)../m3/m3_real_test.c $(M3_HDRS) | $(BUILD)
 glm5_ep_runner: $(BUILD)/glm5_ep_runner
 $(BUILD)/glm5_ep_runner: $(GLM5_EP_SRC) $(GLM5_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(GLM5_EP_SRC) $(LDFLAGS) -ltofucom
+glm5_ep_runner_fapp: $(BUILD)/glm5_ep_runner_fapp
+$(BUILD)/glm5_ep_runner_fapp: $(GLM5_EP_SRC) $(GLM5_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -DGLM5_USE_FAPP=1 -o $@ $(GLM5_EP_SRC) $(LDFLAGS) -ltofucom
 glm5_stage: $(BUILD)/glm5_stage
 $(BUILD)/glm5_stage: $(COMMON)/glm5_stage.c $(COMMON)/safetensors.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(COMMON)/glm5_stage.c $(LDFLAGS)
@@ -195,6 +211,15 @@ $(LLM_DIR)../glm5/glm5_fp8_kernel_test: $(LLM_DIR)../glm5/glm5_fp8_kernel_test.c
 ds4f_decode_bw: $(BUILD)/ds4f_decode_bw
 $(BUILD)/ds4f_decode_bw: $(DS4F_DECBW_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_DECBW_SRC) $(LDFLAGS)
+
+# OFFLINE dense bake: safetensors FP8 -> the kernel-ready BF16_PV / Q8_PV layouts, written
+# permanently under ~/models/<model>-fast/. Removes the runtime bf16 promotion peak (which is
+# what makes the ds4f 8-node decode floor "load-peak-tight" and blocks Q8 dense on ds4fbase
+# entirely). Single node, no allocation, no MPI. Calls the SAME promote/repack workers the
+# runtime uses, so the bytes are identical by construction. See the header of ds4f_bake.c.
+ds4f_bake: $(BUILD)/ds4f_bake
+$(BUILD)/ds4f_bake: $(LLM_DIR)ds4f_bake.c $(DS4F_HDRS) $(COMMON)/safetensors.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)ds4f_bake.c $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD)

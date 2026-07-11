@@ -1034,7 +1034,15 @@ int main(int argc,char**argv){
     const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
     int bf16_pv = (pv_e && *pv_e) ? (atoi(pv_e) != 0) : dense_bf16;
     int no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
-    size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16,
+    /* mirror ds4f_load_real's dense_qt so the printed estimate matches the real arena
+     * (DS4F_DENSE selects the offline-baked rep and overrides FP8_BF16). */
+    ds4f_qtype est_qt = dense_bf16 ? (bf16_pv ? DS4F_BF16_PV : DS4F_BF16) : DS4F_FP8;
+    {   const char *de = getenv("DS4F_DENSE");
+        if (de && *de) {
+            if      (!strcmp(de, "q8pv"))   est_qt = DS4F_Q8_PV;
+            else if (!strcmp(de, "bf16pv")) est_qt = DS4F_BF16_PV;
+        } }
+    size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, est_qt,
                                        envi("DS4F_TIERB2", 0) && !envi("DS4F_INT8_KV", 0));
     if (MyRank == 0)
         logmsg("=== DS4F EP synthetic harness (Stage 2): %d ranks ===\n"

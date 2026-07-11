@@ -352,6 +352,12 @@ static int ds4f_repack_bf16pv_to_q8pv(ds4f_model *m, ds4f_tensor *t) {
  * produces bit-identical q8 from bit-identical bf16. */
 static void ds4f_q8_promote_dense(ds4f_model *m) {
     if (!m->q8_dense) return;
+    if (m->dense_qt == DS4F_Q8_PV) {   /* DS4F_DENSE=q8pv: already int8 from the baked blob --
+                                        * nothing to promote, and no bf16 peak was ever paid. */
+        if (m->ep_rank == 0)
+            fprintf(stderr, "[ds4f] DS4F_Q8_DENSE: dense is ALREADY Q8_PV (baked) — no repack needed\n");
+        return;
+    }
     if (m->dense_qt != DS4F_BF16_PV) {
         fprintf(stderr, "[ds4f] DS4F_Q8_DENSE=1 ignored: dense is not bf16-pv "
                 "(need DS4F_FP8_BF16=1; current dense_qt=%d)\n", m->dense_qt);
@@ -1952,9 +1958,13 @@ static inline int ds4f_n_owned(int n_experts, int ep_rank, int ep_size) {
 /* ring = (tierb2 && !int8_kv): sparse layers ring-buffer kv_cache at window_size, so
  * size the per-layer kv term accordingly (else max_pos for all layers). MUST match the
  * kv_slots condition in ds4f_alloc_synth/ds4f_load_real or the arena over/under-shoots. */
-static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, int dense_bf16, int ring) {
+/* Takes the ACTUAL dense qtype, not a bf16 bool: Q8_PV is 1.03 B/elem, so sizing it as FP8
+ * (1.0) under-counts the dense by ~170 MB -- more than the 64 MB arena slack, i.e. a bump
+ * overflow. The two derived predicates below mirror the runtime exactly (see ds4f_load_real). */
+static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, ds4f_qtype dense_qt, int ring) {
     size_t pad = 256; /* per-tensor alignment slack */
-    ds4f_qtype dq = dense_bf16 ? DS4F_BF16 : DS4F_FP8;
+    ds4f_qtype dq = dense_qt;
+    int dense_bf16 = (dense_qt != DS4F_FP8);   /* TP contraction align: 64 unless FP8 (128) */
     int no = ds4f_n_owned(c->n_experts, ep_rank, ep_size);
     size_t per_layer = 0;
     per_layer += (size_t)(c->hidden*2 + c->hidden*2 + c->q_lora*2 + c->kv_lora*2) + 4*pad;
@@ -2301,8 +2311,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     if (m->int8_cmp) m->exact = 1;  /* int8 cmp uses the exact streaming tierb2 path */
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
-    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
-                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV,
+    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size, m->dense_qt,
                                   m->tierb2 && !m->int8_kv);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ|PROT_WRITE,
                                MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
@@ -2628,6 +2637,17 @@ static void ds4f_copy_worker(void *arg, int tid, int nthr) {
     if (t->type == DS4F_BF16) {                  /* real BF16 = row-major -> direct */
         if (r1 > r0) memcpy((uint16_t *)t->w + (size_t)r0 * K,
                             (const uint16_t *)T->src_w + (size_t)r0 * K, (size_t)(r1 - r0) * K * 2);
+    } else if (t->type == DS4F_BF16_PV) {        /* OFFLINE-BAKED bf16-pv: already kernel-ready */
+        /* pair-interleaved, but a group of 8 rows is CONTIGUOUS (8*K uint16), and rowsplit8 only
+         * ever cuts on 8-row boundaries -> the byte range for [r0,r1) is exactly r0*K*2 .. r1*K*2. */
+        if (r1 > r0) memcpy((uint16_t *)t->w + (size_t)r0 * K,
+                            (const uint16_t *)T->src_w + (size_t)r0 * K, (size_t)(r1 - r0) * K * 2);
+    } else if (t->type == DS4F_Q8_PV) {          /* OFFLINE-BAKED int8 W8A8: already kernel-ready */
+        /* group layout: (rows/8) groups x (K/64) blocks x 528 B, scales INLINE (no t->scale).
+         * rowsplit8 gives 8-aligned r0/r1, so the group range is [r0/8, r1/8). */
+        size_t bpg = (size_t)(K / 64) * 528;     /* bytes per 8-row group */
+        if (r1 > r0) memcpy((uint8_t *)t->w + (size_t)(r0 / 8) * bpg,
+                            T->src_w + (size_t)(r0 / 8) * bpg, (size_t)((r1 - r0) / 8) * bpg);
     } else if (t->type == DS4F_FP8) {            /* e4m3fn bytes row-major -> direct */
         if (r1 > r0) memcpy((uint8_t *)t->w + (size_t)r0 * K, T->src_w + (size_t)r0 * K, (size_t)(r1 - r0) * K);
         if (tid == 0)                            /* tiny 128x128 block scale; whole on tid0 (no 128-split race) */
@@ -2655,9 +2675,16 @@ static void ds4f_copy_run(ds4f_model *m, ds4f_tensor dst, const uint8_t *sw, con
     ds4f_pool_run(m->pool, ds4f_copy_worker, &T);
 }
 
+/* Manifest dtype string for a qtype. BF16_PV/Q8_PV name the OFFLINE-BAKED dense layouts
+ * (ds4f_bake.c): they are kernel-ready bytes, copied straight in with no promote. Safe to add
+ * as explicit cases -- audited: ds4f_load_q is only ever called with expert types (FP8/MXFP4)
+ * or from ds4f_load_dense's same-dtype fast path (FP8/BF16), and ds4f_load_raw only with
+ * explicit BF16/F32. Nothing relied on BF16_PV falling through to "BF16". */
 static const char *ds4f_qtype_dtstr(ds4f_qtype q) {
     switch (q) { case DS4F_FP8: return "F8_E4M3"; case DS4F_MXFP4: return "I8";
-                 case DS4F_F32: return "F32"; default: return "BF16"; }
+                 case DS4F_F32: return "F32";
+                 case DS4F_BF16_PV: return "BF16_PV"; case DS4F_Q8_PV: return "Q8_PV";
+                 default: return "BF16"; }
 }
 
 /* find a manifest entry and assert its dtype + byte size; abort otherwise */
@@ -2865,12 +2892,37 @@ static void ds4f_load_dense_cshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
     ds4f_pool_run(m->pool, ds4f_cshard_worker, &T);
     m->bytes_read += (size_t)rows*cols;
 }
+/* Is this manifest entry an OFFLINE-BAKED dense tensor (ds4f_bake.c)? Those bytes are already in
+ * the final kernel layout, so they are copied straight in -- no promote, no scale, and crucially
+ * NO transient bf16 peak. Detected from the manifest dtype, so no call site changes. */
+static inline int ds4f_baked_dtype(const char *dt, ds4f_qtype *out) {
+    if (strcmp(dt, "BF16_PV") == 0) { *out = DS4F_BF16_PV; return 1; }
+    if (strcmp(dt, "Q8_PV")   == 0) { *out = DS4F_Q8_PV;   return 1; }
+    return 0;
+}
+
 static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst, const char *base) {
     char wn[256];
     snprintf(wn, sizeof wn, "%s.weight", base);
     const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
     if (!we) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", wn); abort(); }
     int rows = dst->rows, K = dst->cols;
+    {   ds4f_qtype bq;                                       /* BAKED source -> direct copy */
+        if (ds4f_baked_dtype(we->dtype, &bq)) {
+            if (dst->type != bq) {
+                fprintf(stderr, "ds4f_load_dense: '%s' is baked %s but dst dtype is %d "
+                                "(set DS4F_DENSE to match the staged blob)\n", wn, we->dtype, dst->type);
+                abort(); }
+            size_t wb = ds4f_wbytes(bq, rows, K);
+            if (we->nbytes != wb) {
+                fprintf(stderr, "ds4f_load_dense: baked '%s' nbytes %llu != %zu\n",
+                        wn, (unsigned long long)we->nbytes, wb); abort(); }
+            ds4f_copy_run(m, *dst, B->blob + we->off, NULL);   /* scales are inline (Q8) or absent */
+            ds4f_blob_drop(B, we->off, wb);
+            m->bytes_read += wb;
+            return;
+        }
+    }
     int src_fp8 = (strcmp(we->dtype, "F8_E4M3") == 0), src_bf16 = (strcmp(we->dtype, "BF16") == 0);
     if (!src_fp8 && !src_bf16) { fprintf(stderr, "ds4f_load_dense: '%s' src dtype %s unsupported\n", wn, we->dtype); abort(); }
     if ((src_fp8 && dst->type == DS4F_FP8) || (src_bf16 && dst->type == DS4F_BF16)) {
@@ -2905,6 +2957,28 @@ static void ds4f_load_dense_vshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
     const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
     if (!we) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", wn); abort(); }
     int K = dst->cols;
+    {   ds4f_qtype bq;                                       /* BAKED source -> direct sharded copy */
+        if (ds4f_baked_dtype(we->dtype, &bq)) {
+            if (dst->type != bq) {
+                fprintf(stderr, "ds4f_load_dense_vshard: '%s' is baked %s but dst dtype is %d\n",
+                        wn, we->dtype, dst->type); abort(); }
+            if (we->nbytes != ds4f_wbytes(bq, full_rows, K)) {
+                fprintf(stderr, "ds4f_load_dense_vshard: baked '%s' nbytes %llu != full %zu\n",
+                        wn, (unsigned long long)we->nbytes, ds4f_wbytes(bq, full_rows, K)); abort(); }
+            if (r0 & 7) {   /* both baked layouts are 8-row-group formats -- a non-8-aligned shard
+                             * start would silently read from the middle of a pv pair / q8 block. */
+                fprintf(stderr, "ds4f_load_dense_vshard: baked '%s' r0=%d not 8-aligned\n", wn, r0);
+                abort(); }
+            /* byte offset of row r0: bf16-pv groups are contiguous (r0*K*2); q8 groups are
+             * (r0/8) x (K/64) x 528. Same addressing ds4f_row_slice uses. */
+            const uint8_t *bw = B->blob + we->off +
+                (bq == DS4F_Q8_PV ? (size_t)(r0 / 8) * (size_t)(K / 64) * 528
+                                  : (size_t)r0 * K * 2);
+            ds4f_copy_run(m, *dst, bw, NULL);
+            m->bytes_read += ds4f_wbytes(bq, dst->rows, K);
+            return;
+        }
+    }
     int src_fp8 = (strcmp(we->dtype, "F8_E4M3") == 0), src_bf16 = (strcmp(we->dtype, "BF16") == 0);
     if (!src_fp8 && !src_bf16) { fprintf(stderr, "ds4f_load_dense_vshard: '%s' src %s unsupported\n", wn, we->dtype); abort(); }
     int same = (src_fp8 && dst->type == DS4F_FP8) || (src_bf16 && dst->type == DS4F_BF16);  /* direct copy, no promote */
@@ -2996,6 +3070,22 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         m->bf16_pv = (p && *p) ? (atoi(p) ? 1 : 0) : pre;
         m->dense_qt = pre ? (m->bf16_pv ? DS4F_BF16_PV : DS4F_BF16) : DS4F_FP8;
         m->bf16_mv_qt = m->bf16_pv ? DS4F_BF16_PV : DS4F_BF16; }
+    /* DS4F_DENSE=q8pv|bf16pv selects the OFFLINE-BAKED dense rep (ds4f_bake.c, staged into the
+     * blob by ds4f_stage's bake overlay). The bytes arrive kernel-ready, so there is NO bf16
+     * promotion peak -- which is the whole point: it is what makes the ds4f 8-node decode floor
+     * "load-peak-tight", and it is why Q8 dense was impossible on ds4fbase at all (no room for
+     * +5.5 GiB of transient bf16 on top of 22.17 GiB of FP8 experts).
+     * Overrides FP8_BF16/BF16_PV. The router gate + lm_head are NOT baked and stay bf16_mv_qt. */
+    {   const char *e = getenv("DS4F_DENSE");
+        if (e && *e && strcmp(e, "fp8") != 0) {
+            if      (strcmp(e, "q8pv")   == 0) m->dense_qt = DS4F_Q8_PV;
+            else if (strcmp(e, "bf16pv") == 0) m->dense_qt = DS4F_BF16_PV;
+            else { fprintf(stderr, "DS4F_DENSE=%s unknown (want fp8|bf16pv|q8pv)\n", e); abort(); }
+            m->bf16_pv = 1; m->bf16_mv_qt = DS4F_BF16_PV;   /* gate/head keep the fast pv matvec */
+            if (m->ep_rank == 0)
+                fprintf(stderr, "[ds4f] DS4F_DENSE=%s: dense loaded from the BAKED blob "
+                                "(no bf16 promote, no load peak)\n", e);
+        } }
     { const char *e = getenv("DS4F_FP8_MAGIC"); m->fp8_magic = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_MXFP4_GEMM_TILE"); m->mxfp4_gemm_tile = (e && *e) ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE");    m->sparse    = (e && *e && atoi(e)) ? 1 : 0; }
@@ -3022,8 +3112,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
     if (m->int8_cmp) m->exact = 1; /* int8 cmp uses the exact streaming tierb2 path */
     m->pool = ds4f_pool_start(n_threads, n_cmgs);
 
-    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size,
-                                  m->dense_qt == DS4F_BF16 || m->dense_qt == DS4F_BF16_PV,
+    m->arena_sz = ds4f_arena_size(&cfg, ep_rank, ep_size, m->dense_qt,
                                   m->tierb2 && !m->int8_kv);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);

@@ -155,6 +155,66 @@ static int is_scale_name(const char *name) {
     return n >= 6 && strcmp(name + n - 6, ".scale") == 0;
 }
 
+/* ---- BAKE OVERLAY (DS4F_BAKE_DIR + DS4F_DENSE=bf16pv|q8pv) --------------------------
+ * ds4f_bake.c pre-packs the 8 dominant dense tensors per layer into the kernel-ready
+ * BF16_PV / Q8_PV layouts under ~/models/<model>-fast/. When the overlay is on we source
+ * those tensors from the baked blob instead of the safetensors, so the runtime mmaps the
+ * final layout straight in -- NO bf16 promotion peak at load. Everything else (experts,
+ * embed/head, norms, tb2) still comes from the safetensors, unchanged.
+ *
+ * The baked tensors' ".scale" siblings are DROPPED: Q8_PV carries its scales inline and
+ * BF16_PV has none, so the loader never asks for them. Staging them would just waste blob. */
+typedef struct { char name[192]; uint64_t off; size_t nbytes; int rows, cols; } bake_ent;
+static bake_ent *g_bake = NULL;
+static int       g_bake_n = 0;
+static uint8_t  *g_bake_blob = MAP_FAILED;
+static size_t    g_bake_blob_sz = 0;
+static const char *g_bake_dtype = NULL;      /* "BF16_PV" | "Q8_PV" */
+
+static int bake_load(const char *dir, const char *variant) {
+    char mp[1200], bp[1200];
+    snprintf(mp, sizeof mp, "%s/dense_%s.manifest", dir, variant);
+    snprintf(bp, sizeof bp, "%s/dense_%s.blob",     dir, variant);
+    FILE *f = fopen(mp, "r");
+    if (!f) { fprintf(stderr, "ds4f_stage: cannot open bake manifest %s: %s\n", mp, strerror(errno)); return -1; }
+    int cap = 512; g_bake = (bake_ent *)malloc((size_t)cap * sizeof(bake_ent));
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        bake_ent e; char dt[32]; int nd;
+        if (sscanf(line, "%llu %zu %31s %d %d %d %191s",
+                   (unsigned long long *)&e.off, &e.nbytes, dt, &nd, &e.rows, &e.cols, e.name) != 7) continue;
+        if (nd != 2) continue;
+        if (!g_bake_dtype) g_bake_dtype = strcmp(dt, "Q8_PV") == 0 ? "Q8_PV" : "BF16_PV";
+        if (g_bake_n == cap) { cap *= 2; g_bake = (bake_ent *)realloc(g_bake, (size_t)cap * sizeof(bake_ent)); }
+        g_bake[g_bake_n++] = e;
+    }
+    fclose(f);
+    int bfd = open(bp, O_RDONLY);
+    if (bfd < 0) { fprintf(stderr, "ds4f_stage: cannot open bake blob %s: %s\n", bp, strerror(errno)); return -1; }
+    struct stat sb; if (fstat(bfd, &sb) != 0) { close(bfd); return -1; }
+    g_bake_blob_sz = (size_t)sb.st_size;
+    g_bake_blob = (uint8_t *)mmap(NULL, g_bake_blob_sz, PROT_READ, MAP_PRIVATE, bfd, 0);
+    close(bfd);
+    if (g_bake_blob == MAP_FAILED) { fprintf(stderr, "ds4f_stage: mmap bake blob failed: %s\n", strerror(errno)); return -1; }
+    fprintf(stderr, "ds4f_stage: bake overlay ON — %d %s tensors from %s (%.2f GB)\n",
+            g_bake_n, g_bake_dtype, dir, g_bake_blob_sz / 1e9);
+    return 0;
+}
+static const bake_ent *bake_find(const char *name) {
+    for (int i = 0; i < g_bake_n; i++) if (strcmp(g_bake[i].name, name) == 0) return &g_bake[i];
+    return NULL;
+}
+/* is this a ".scale" whose ".weight" sibling is baked? -> drop it */
+static int bake_drops_scale(const char *name) {
+    if (!g_bake_n) return 0;
+    size_t n = strlen(name);
+    if (n < 6 || strcmp(name + n - 6, ".scale") != 0) return 0;
+    char wn[256];
+    snprintf(wn, sizeof wn, "%.*s.weight", (int)(n - 6), name);
+    return bake_find(wn) != NULL;
+}
+
 /* write exactly n bytes (loop over partial writes) */
 static int write_all(int fd, const void *buf, size_t n) {
     const uint8_t *p = (const uint8_t *)buf;
@@ -197,6 +257,19 @@ int main(void) {
      * after use -> peak staging HBM ~= flush_gb (dirty) + one shard (clean). */
     int flush_gb = envi("DS4F_STAGE_FLUSH_GB", 2);
     uint64_t flush_bytes = (uint64_t)(flush_gb > 0 ? flush_gb : 2) << 30;
+
+    /* bake overlay: DS4F_DENSE=bf16pv|q8pv sources the 8 dense tensors/layer from the baked
+     * blob (ds4f_bake.c). Default fp8 = today's behavior, byte-for-byte unchanged. */
+    {   const char *dv = getenv("DS4F_DENSE");
+        if (dv && *dv && strcmp(dv, "fp8") != 0) {
+            if (strcmp(dv, "q8pv") != 0 && strcmp(dv, "bf16pv") != 0) {
+                fprintf(stderr, "ds4f_stage: DS4F_DENSE=%s unknown (want fp8|bf16pv|q8pv)\n", dv); return 2; }
+            char bd[1024];
+            const char *e = getenv("DS4F_BAKE_DIR");
+            if (e && *e) snprintf(bd, sizeof bd, "%s", e);
+            else snprintf(bd, sizeof bd, "%s/models/%s-fast", home, mtag ? mtag : "ds4f");
+            if (bake_load(bd, dv) != 0) return 2;
+        } }
     if (rank < 0 || rank >= ep_size) {
         fprintf(stderr, "ds4f_stage: bad rank %d for ep_size %d\n", rank, ep_size);
         return 2;
@@ -228,6 +301,7 @@ int main(void) {
     long long n_dense = 0, n_expert = 0;
     uint64_t b_dense = 0, b_expert = 0;
     long long n_e8m0 = 0;              /* F32 scales folded to E8M0 (ds4fbase); 0 for ds4f */
+    long long n_baked = 0;             /* dense tensors sourced from the bake overlay; 0 when off */
     static uint8_t e8m0_buf[1 << 16];  /* biggest scale is wq_b [256,8] = 2 K elems */
     double t0 = now_sec();
 
@@ -247,10 +321,20 @@ int main(void) {
             size_t nb = t->nbytes;
             const void *src = safetensors_data(st, i);
             const char *dtype = t->dtype_str;
+            int nd = t->n_dims; uint64_t shp[2];
+
+            /* --- bake overlay: swap in the kernel-ready dense bytes, drop their scales --- */
+            if (bake_drops_scale(name)) continue;                  /* inline (Q8) or absent (bf16-pv) */
+            const bake_ent *be = g_bake_n ? bake_find(name) : NULL;
+            if (be) {
+                src = g_bake_blob + be->off; nb = be->nbytes; dtype = g_bake_dtype;
+                nd = 2; shp[0] = (uint64_t)be->rows; shp[1] = (uint64_t)be->cols;  /* LOGICAL shape */
+                n_baked++;
+            }
 
             /* ds4fbase ships *.scale as F32; fold it to the E8M0 byte the loader expects.
              * (ds4f's scales are already F8_E8M0 -> this never fires, plain byte copy.) */
-            if (strcmp(dtype, "F32") == 0 && is_scale_name(name)) {
+            if (!be && strcmp(dtype, "F32") == 0 && is_scale_name(name)) {
                 if (nb / 4 > sizeof e8m0_buf) {   /* scales are tiny (<=8 KB); guard anyway */
                     fprintf(stderr, "ds4f_stage: '%s' scale too large (%zu B) for the E8M0 buffer\n", name, nb);
                     goto fail;
@@ -273,9 +357,12 @@ int main(void) {
             }
 
             /* manifest line: off nbytes dtype ndims shape... name
-             * (shape is unchanged by the F32->E8M0 fold -- only the element size shrinks) */
-            fprintf(mf, "%llu %zu %s %d", (unsigned long long)aligned, nb, dtype, t->n_dims);
-            for (int d = 0; d < t->n_dims; d++) fprintf(mf, " %llu", (unsigned long long)t->shape[d]);
+             * (shape is unchanged by the F32->E8M0 fold -- only the element size shrinks; a baked
+             *  tensor records its LOGICAL [rows,cols] and lets the dtype imply the packing, so
+             *  ds4f_wbytes() reproduces nbytes exactly on the load side) */
+            const uint64_t *shape = be ? shp : t->shape;
+            fprintf(mf, "%llu %zu %s %d", (unsigned long long)aligned, nb, dtype, nd);
+            for (int d = 0; d < nd; d++) fprintf(mf, " %llu", (unsigned long long)shape[d]);
             fprintf(mf, " %s\n", name);
 
             off = aligned + nb;
@@ -315,6 +402,8 @@ int main(void) {
 
     printf("\nrank %d done: %lld tensors (%lld dense / %lld expert)\n", rank, n_total, n_dense, n_expert);
     printf("  F32->E8M0 scales folded: %lld  (0 = ds4f, already E8M0)\n", n_e8m0);
+    printf("  dense from BAKE overlay:  %lld %s  (0 = DS4F_DENSE=fp8, no overlay)\n",
+           n_baked, g_bake_dtype ? g_bake_dtype : "-");
     printf("  staged %.2f GB (dense %.2f + expert %.2f)  blob_size=%.2f GB\n",
            b_total / 1e9, b_dense / 1e9, b_expert / 1e9, off / 1e9);
     printf("  %.1f s  %.2f GB/s effective\n", tel, tel > 0 ? b_total / 1e9 / tel : 0.0);
