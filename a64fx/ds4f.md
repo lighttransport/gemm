@@ -1052,6 +1052,43 @@ So the earlier "dispatch-bound → batch the tb2 workers" hypothesis is **wrong*
 
 **Build.** `ds4f_forward_verify` already batches *all* dense/MoE/comm as an M=K GEMM with one all-reduce/layer — the amortization exists. The only rework is its per-position attn/tb2 loop → **per-sequence**: M independent live KV/cmp/idx cache **sets** (the multi-slot infra has per-slot *snapshots* but one *live* set), each batch element k with its own `pos[k]` + `cache[k]`. Lowest-risk approach: **pointer-swap** — allocate M cache sets, and before element k's append/tb2/attn, point the layer's cache fields (the ~20 buffers/scalars `ds4f_ctx_snap` enumerates: `kv_*`, `cmp_*`, `idx_*`, the compressor ring states, calibration) at set k, so the existing `ds4f_tb2_prepare`/`ds4f_attn_tb2_worker`/KV-append run unchanged. Phases: **P1** M cache sets + `ds4f_forward_decode_batch` (validate M=1 == single-stream, M=2 == two independent streams); **P2** serve-loop dynamic batch (add/remove sequences, per-sequence sampling/EOS, continuous batching); **P3** measure aggregate tok/s vs the projection. MTP module is staged (throughput draft is a later compose).
 
+### 2026-07-11 session (alloc 49526204, 12-node interactive) — serve maturation + CP Phase-2 complete
+
+Roll-up of the day's landed work (details in the `### LANDED`/`### MEASURED`/CP sections below + the
+`Resuming prompt — Phase 2 CP`). All gated, defaults off, validated real-weight 11n, tree committed.
+
+**Serve path.**
+- **Continuous batching / mid-flight admission** (`DS4F_SERVE_DYNAMIC`, commit `9ea8f684`): admit into free
+  slots as they open. Two cross-node-FS fixes were mandatory — broadcast the request payload (per-rank read
+  deadlocks the collective under FEFS cache skew) + probe `q.<id>` existence, not a same-size `qhead`
+  counter (cached stale), with atomic temp+rename writes. Token-exact independence 40/40, 22.8 tok/s @B=4.
+- **Per-sequence sampling** (dynamic `7b18d816` + static `01f43ce8`): each admitted seq carries its own
+  temp/top_p/top_k/penalties/seed + PRNG; lockstep via full-`[K,vocab]` reconstruction under `TP_HEAD` +
+  broadcast sampler. Bug found: the combine SIGSEGV'd because there are TWO batched heads (`_prefill` vs the
+  serve path `_verify`). Validated reproducible-by-seed, per-seq independent, greedy unchanged.
+- **B-sweep** (`65753d12`): batched-decode aggregate **saturates ~25-30 tok/s across B=8..32** (1.3× from
+  B=4→32) — per-seq tier-B2 attention doesn't amortize past B≈8; corrects the dbbench 2.5-3× projection.
+- **Socket transport** (`DS4F_SERVE_SOCK`, `c856ce83`): rank 0 hosts a TCP listener over the Tofu IP
+  (control→compute 0.7 ms). Single 40-tok request **3.33 s vs ~30 s** under the file protocol — the
+  tens-of-seconds FS-cache latency is gone; single-request serving is now compute-bound.
+
+**CP Phase-2 (context parallelism) — COMPLETE.** Was at "Stage A done, B/C next"; the code was already past
+that (sharded scan + top-k merge in-tree). This session finished it:
+- **Stage-C attention combine** (`DS4F_CP_COMBINE`, decode `15fdac73` + verify/prefill `f89d3f5f`):
+  online-softmax per-node partials + max-reduce + one packed `[acc|l]` sum-reduce replaces the gather
+  (comm `n_heads*HD` ≈ 12K floats vs `ns*KV` ≈ 262K). **−36% decode comm, +12.5% decode tok/s, byte-identical.**
+  Lesson: splitting a bandwidth-bound reduce into more-but-smaller reduces wins even on this latency-bound
+  fabric. Verify/prefill uses a batched combine (one reduce/chunk, not K·2).
+- **Batched-decode CP** (`ef1e07f8`): added the per-sequence int8/int4 stores + calibration to `ds4f_lseq`
+  (was bf16/f32 only) so each sequence has its own `cmp_q4` — with `ds4f_lseq_capture` writing the
+  `frozen`/`caln` scalars back after each step (a seq can cross the freeze point mid-decode). Isolation test
+  48/48 under CP (`DS4F_INT8CMP_CAL=4` forces an early freeze to exercise the sharded path); non-CP 48/48.
+- **Long-ctx memory A/B** (`b3f2c350`): couldn't `pjsub` a dedicated alloc, but the caches are lazily
+  allocated, so a `CTX_CACHE` load-time log measures the reserved (== resident-once-filled) A/B safely: int4
+  CP-off vs CP-on **128k 223→30 MB/node (−193); 512k 876→103 (−773)**. Honest verdict: under int4 the caches
+  are small, so CP's *memory* win is modest until 512k-1M+; CP's real near-term win is *compute* (the combine
+  + sharded scan).
+
 ### LANDED — DS4F_SERVE_BATCH concurrent batched-decode serve (2026-07-10b, commits `782c8f29`/`eb5d9054`/`994cbd27`)
 
 The batched-serve path is built + validated. `ds4f_serve_batch_loop` (`ds4f_ep_runner.c`, gated
