@@ -1215,9 +1215,20 @@ is the fast way to test cross-node TCP without the runner; debug/aux files for c
 > (`ds4f_impl.h`), gated (needs `DS4F_CP_SHARD` + int4_cmp + cmp_frozen + TP_ATTN off), decode path only
 > (verify/prefill stays on gather). Validated ctx=805 (cmp tail genuinely sharded): **combine == gather
 > 48/48 tokens byte-identical**, rc=0/NaNs=0/lockstep; **decode comm 34.8→22.3 ms/tok (−36%), 7.25→8.16
-> tok/s (+12.5%)**. **REMAINING:** (1) mirror the combine into the verify/prefill batched path (`ds4f_forward_verify`,
-> still gather); (2) long-ctx A/B: per-node MemFree + coherence at max_pos = 32k/64k/128k, CP-on vs the
-> CP-off ceiling (dedicated alloc — long ctx OOM-risks the shared job). NOTE the plan file
+> tok/s (+12.5%)**.
+>
+> **STAGE C ALSO MIRRORED INTO VERIFY/PREFILL (commit `f89d3f5f`).** `ds4f_forward_verify` runs K positions
+> per call, so a per-position combine would be K*2 collectives/layer (prefill K=64 → 2560/chunk); instead the
+> combine-mode positions' partials are COMPACTED and reduced in ONE batched combine per chunk
+> (`ds4f_cp_attn_combine_batched`: ar_max + one packed `[acc|l]` ar_cb), scattered back to `p_attn[k]`.
+> Per-position mode select (`cmp_frozen && cp_on`) handles a chunk straddling the freeze point (pre-freeze
+> positions take the normal path). Validated `PREFILL_GEMM=1` ctx=805: **verify-COMBINE == verify-noCP 48/48
+> byte-identical** (the 15/48 gap vs the token baseline is the known verify-vs-token GEMM reassociation —
+> verify-noCP diverges identically). CP now composes with the fast batched-verify prefill (56.8 vs 128.8
+> ms/tok token-by-token). Caveat: verify+CP int4 batched-DECODE (multi-seq) still needs `cmp_q4` added to
+> `ds4f_lseq` (per-sequence cache swap) — prefill is single-seq so unaffected. **REMAINING:** long-ctx A/B:
+> per-node MemFree + coherence at max_pos = 32k/64k/128k, CP-on vs the CP-off ceiling (dedicated alloc — long
+> ctx OOM-risks the shared job). NOTE the plan file
 > `~/.claude/plans/see-a64fx-ds4f-md-...md` is GONE — reconstruct design from the in-tree code above + the
 > git history (`git log --oneline | grep -iE 'CP |attn-CP|slot-shard'`; some CP commits are glm5/m3, not ds4f).
 >
