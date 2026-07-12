@@ -2509,3 +2509,37 @@ than the prefill misuse, but **this has not been verified.** Before trusting bat
 serving, gate it on output (the `DS4F_DECODE_BATCH` P1 isolation test compares solo vs batched ids).
 
 **Status: `DS4F_PREFILL_GEMM=0`.** The +51-82% prefill it offers is real speed on a wrong answer.
+
+### Gating batched decode (P1 isolation) — isolation PASSES; whole-path correctness still OPEN
+
+Prompted by the `PREFILL_GEMM` bisect: the same `ds4f_forward_verify` powers batched decode, so the
+35.4 / 32.8 tok/s throughput numbers needed a correctness gate.
+
+**1. Sequence isolation — PASSES in substance.** `DS4F_DECODE_BATCH=1` reports `15/16 match -> FAIL`,
+but that is a *bit-exactness* assertion against the SOLO run, and it is misleading. Varying the
+neighbour (`DS4F_DB_SEEDB` = 5000 / 777 / 31337) leaves seqA's batched stream **byte-identical**:
+
+```
+seqB=5000   42498 82 14 20 55 49970 51 26 85 223 42498 223
+seqB=777    42498 82 14 20 55 49970 51 26 85 223 42498 223
+seqB=31337  42498 82 14 20 55 49970 51 26 85 223 42498 223
+```
+
+seqA's output does not depend on its neighbour's content **at all** ⇒ **NO cross-sequence
+contamination**, which is the property serving actually needs. The 1/16 divergence from solo is the
+M=1 vs M=2 GEMM reassociation (first 12 tokens identical, then a near-tie argmax flips) — the same
+coherent-not-bit-exact class as HC_SVE. A real leak corrupts early and badly, as the prefill bug does.
+
+**⇒ Treat the P1 "FAIL" as a too-strict assertion, not a defect.** (The test would be more useful if
+it compared against solo *modulo reassoc*, or asserted neighbour-independence as done above.)
+
+**2. Verify-vs-matvec numerical correctness — STILL OPEN.** Driving the same seed (token 100) through
+the matvec decode gives a completely different id stream than the verify path's solo run. That is NOT
+conclusive: the P1 harness leaves its `hcb` hyper-connection buffer **uninitialized** and uses a
+different reset/cache path, so the two are not apples-to-apples. Given that this very function IS
+broken when misused as a prefill, this deserves a proper gate: run a REAL prompt through the
+serve/batch loop and check the completion, rather than trusting DB_BENCH (which only times steps).
+
+**Bottom line for the batched numbers (base 35.4 @M=16, Flash 32.8 @M=32): sequence isolation is
+sound; end-to-end output quality of the batch path is measured-but-not-gated.** Use for capacity
+planning, not as a correctness claim.
