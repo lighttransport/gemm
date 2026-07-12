@@ -2322,3 +2322,21 @@ bottleneck, and they are stuck there by memory.
 
 Cost: the Q8 expert blob is **291 GB** in `~/models/ds4fbase-fast/` (all 256 experts x 43 layers,
 rank-agnostic; the stager picks each rank's slice). Bake ~50 min, one time.
+
+### Batched decode, ds4fbase 12n (Q8 experts + `DS4F_PF_TP=1`)
+
+| M | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| **Q8 experts** | 17.3 | 22.7 | 28.0 | 32.3 | **35.4** | **OOM** |
+| FP8 experts (old) | 11.7 | 15.4 | 19.7 | 23.9 | 28.0 | — |
+| per-seq (Q8) | 17.3 | 11.4 | 7.01 | 4.04 | 2.21 | — |
+
+**Peak 35.4 tok/s aggregate at M=16** (+26% over FP8 experts at the same M). **M=32 OOMs** (SIGKILL):
+base's arena is 27.42 GB vs Flash's 18.91, so the per-sequence cache bundles do not fit. M=16 is
+base's hard ceiling — unlike Flash, which reaches M=32.
+
+Base beats Flash at every point: **22.45 vs 18.98 single-stream, 35.4 vs 31.0 batched (M=16)**.
+
+At M=16 the step profile is **experts 164.3 ms** (of 451.8) and **tb2prep 122.1** — the MoE still
+barely amortizes even batched (top-6-of-256 rarely shares an expert), and Tier-B2's compressor runs
+per-position. Both remain the bottleneck, batched or not.
