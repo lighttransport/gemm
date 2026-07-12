@@ -2472,3 +2472,40 @@ even batched); `DS4F_Q8_GEMM_TILE` (neutral); `DS4F_PF_TP` (neutral — it only 
 Working prefill profile (19.84 tok/s, 50.4 ms/tok) is **tb2prep-dominated**: tb2prep 14.0 ms (42%,
 of which tb2scan 6.4 — the O(T) indexer scan), experts 5.1, comm 5.1, qkv 4.3, attn 3.4. The scan
 grows with prompt length, so prefill degrades on long prompts — that is Tier-B2 architecture.
+
+### BISECT of the `DS4F_PREFILL_GEMM` corruption (2026-07-12) — a latent in-tree bug, NOT the bake
+
+Three stages of ds4fbase on 12n, same prompt, `PREFILL_GEMM=1` vs control:
+
+| dense | routed experts | control (no GEMM) | `PREFILL_GEMM=1` |
+|---|---|---|---|
+| Q8_PV (baked) | Q8_PV (baked) | correct ✓ | garbage ✗ |
+| Q8_PV (baked) | **FP8** (safetensors) | correct ✓ | garbage ✗ |
+| **FP8** | **FP8** — *the ORIGINAL config, no bake at all* | correct ✓ | **garbage ✗** |
+
+**⇒ The bake is exonerated.** Not Q8 dense, not Q8 experts. `DS4F_PREFILL_GEMM` is broken on
+ds4fbase in its original FP8 form.
+
+**It is not a K (chunk-size) bug either** — it is prompt-LENGTH dependent, and the error COMPOUNDS:
+
+| prompt | K | result |
+|---|---|---|
+| 24 tok | 8 | **correct** code ✓ |
+| 24 tok | 32 | `"cpython"` ✗ |
+| 314 tok | 8 or 32 | `"yment the algorithm."` — plausible English, WRONG continuation |
+| 929 tok | 4 / 8 / 16 / 32 | `"2025-01-25 13:04:01 / ## 相关"` — total garbage, prompt ignored |
+
+All K values fail identically at 929 tokens. So `ds4f_forward_verify`, when driven as a prefill
+(1 sequence × K consecutive positions rather than its native speculative-verify shape), produces a
+subtly WRONG context whose error grows with position count. The docs' "+65%, COHERENT" validation
+does not survive a realistic prompt length. Prime suspects (not yet isolated): intra-chunk causal
+masking, RoPE position indexing, or the Tier-B2 compressor/window cache writes across the chunk.
+
+**⚠️ CONSEQUENCE FOR BATCHED DECODE.** The same `ds4f_forward_verify` powers `DS4F_DB_BENCH`. Our
+batched-decode throughput numbers (base 35.4 tok/s @M=16, Flash 32.8 @M=32) measure the speed of
+that path but were **never output-quality-gated** — DB_BENCH only times steps. Batched decode drives
+verify in its native shape (M independent sequences, 1 token each), which is far more likely correct
+than the prefill misuse, but **this has not been verified.** Before trusting batched decode for real
+serving, gate it on output (the `DS4F_DECODE_BATCH` P1 isolation test compares solo vs batched ids).
+
+**Status: `DS4F_PREFILL_GEMM=0`.** The +51-82% prefill it offers is real speed on a wrong answer.
