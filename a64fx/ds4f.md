@@ -2340,3 +2340,50 @@ Base beats Flash at every point: **22.45 vs 18.98 single-stream, 35.4 vs 31.0 ba
 At M=16 the step profile is **experts 164.3 ms** (of 451.8) and **tb2prep 122.1** — the MoE still
 barely amortizes even batched (top-6-of-256 rarely shares an expert), and Tier-B2's compressor runs
 per-position. Both remain the bottleneck, batched or not.
+
+### ❌ REFUTED: static MoE load balancing (2026-07-12)
+
+Given `comm ≈ 3 × expert_time` comes from the top-6-of-256 routing landing ~2 experts on the max
+rank vs a 0.5 average, the obvious fix is a smarter expert→rank map than `e % ep_size`. It does
+not work, and the reason is structural.
+
+Captured **7783 real routing decisions** (~181 decode tokens × 43 layers, `DS4F_DEBUG=1`):
+
+| assignment | E[max experts on a rank] |
+|---|---|
+| current `e % 12` | **1.85** (mean load 0.50) |
+| 200 random relabelings | 1.82 – 1.93 |
+| per-layer co-occurrence greedy, **in-sample** | **1.00** ← looks perfect |
+| per-layer co-occurrence greedy, **HELD-OUT** | **1.69** |
+| theoretical optimum | 1.00 |
+
+**Two independent kills:**
+
+1. **Global permutations are provably useless.** `e % 12` (1.85) sits *inside* the random-relabeling
+   spread (1.82–1.93). Symmetry: the top-6 SET is what is random, not the labels, so every bijection
+   e→rank is statistically identical.
+2. **Per-layer maps only memorize.** In-sample E[max] = 1.00 (the optimum!) but held-out = 1.69 —
+   a pure generalization gap. The learning curve (21→98 train tokens/layer) plateaus at ~1.69, it
+   does not trend toward 1.0. More calibration data will not save it.
+
+Best honest case: 1.92 → 1.69 held-out = **1.14×** on the max load, worth ~+4% decode — for a
+per-layer expert map threaded through the stager AND loader, plus a calibration run whose validity
+across prompts/domains is unproven. Not worth it.
+
+**The clincher:** a random-selection simulation predicts E[max] = **1.90** at M=1; the real routing
+measures **1.85–1.92**. DeepSeek's router is statistically indistinguishable from random expert
+selection at this granularity. Nothing static can beat randomness.
+
+It also *derives* the empirical rule: ratio = E[max]/mean = **3.79×**, so the barrier waits
+≈ (max − own) ≈ 3× the average expert work — i.e. `comm ≈ 3 × expert_time`, confirmed independently.
+
+**And it shows what DOES work — batching:**
+
+| M | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| E[max] | 1.90 | 2.85 | 4.53 | 7.50 | 12.84 |
+| mean | 0.50 | 1.00 | 2.00 | 4.00 | 8.00 |
+| **straggler ratio** | **3.79×** | 2.85× | 2.27× | 1.88× | **1.61×** |
+
+The straggler multiplier shrinks with M by the law of large numbers. That is the real, and only,
+fix for MoE imbalance on this fabric — and it is already measured (base: 22.45 → 35.4 tok/s).
