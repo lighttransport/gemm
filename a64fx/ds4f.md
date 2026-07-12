@@ -2543,3 +2543,48 @@ serve/batch loop and check the completion, rather than trusting DB_BENCH (which 
 **Bottom line for the batched numbers (base 35.4 @M=16, Flash 32.8 @M=32): sequence isolation is
 sound; end-to-end output quality of the batch path is measured-but-not-gated.** Use for capacity
 planning, not as a correctness claim.
+
+## 🚨 BATCHED DECODE IS NOT USABLE: the serve path returns GARBAGE for a real prompt (2026-07-12)
+
+Gating the batched numbers (base 35.4 @M=16, Flash 32.8 @M=32) end-to-end, as the `PREFILL_GEMM`
+bisect demanded. Drove a real 24-token prompt through the **batched serve loop**
+(`DS4F_SERVE=1 DS4F_SERVE_BATCH=2 DS4F_SERVE_DYNAMIC=1`) and detokenized the response:
+
+| serve config | completion |
+|---|---|
+| `prefill_gemm=1` (**the serve DEFAULT**) | `"  Ф.m  15.(D.T..:  https://g en:03."` ✗ |
+| `prefill_gemm=0` (correct token-at-a-time prefill) | `",, append. .(s,;  ._  (  .ppt. 4:"` ✗ |
+
+**Garbage with PREFILL_GEMM both ON and OFF.** So this is NOT (only) the prefill bug — the batched
+serve path is broken end-to-end. Control: the same prompt through the normal gen path
+(`ds4f_forward_token`, no batching) yields correct quicksort code.
+
+**⚠️ The serve path's default is the broken one.** `ds4f_serve_batch_loop` / `ds4f_serve_dynbatch_loop`
+both do `int pf_gemm = envi("DS4F_PREFILL_GEMM", 1)` — i.e. **default 1**, the corrupted prefill. But
+setting it to 0 does not rescue the output, so the defect is deeper.
+
+### What this means for the throughput numbers
+
+**base 35.4 tok/s @M=16 and Flash 32.8 @M=32 are speed measurements of a path that does not produce
+correct output.** They are upper bounds on a broken path, NOT deliverable serving capacity. I
+reported them earlier without an output gate; that was wrong and this supersedes it. `DS4F_DB_BENCH`
+only times steps — it never looks at what it generated, which is exactly how this went unnoticed.
+
+**Single-stream decode is unaffected** (22.45 base / 18.98 Flash) — it uses `ds4f_forward_token`
+(matvec), a different path, and is gated on coherent completions.
+
+### Not yet separated (next step)
+
+Three candidate layers, in order of suspicion:
+1. `ds4f_forward_verify` / `ds4f_forward_decode_batch` itself (shared by DB_BENCH, P1 and serve);
+2. the serve loop's per-slot cache/bundle orchestration;
+3. the serve loop's prefill into a bundle.
+
+Evidence bearing on (1): the P1 isolation test shows the batch path is **neighbour-independent**
+(seqA byte-identical across 3 different batch-mates), so there is no cross-sequence leak — the
+sequences are cleanly separated, they are just each producing wrong tokens. That points AWAY from
+bundle mix-up and TOWARD the verify forward itself, or the prefill into the bundle.
+
+A decisive next test: run `ds4f_forward_decode_batch` at M=1 from a real prompt prefilled by the
+KNOWN-GOOD token-at-a-time path, and compare its ids to `ds4f_forward_token`. If they diverge, the
+bug is in the verify forward.
