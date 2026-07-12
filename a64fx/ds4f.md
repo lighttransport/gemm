@@ -2279,3 +2279,46 @@ share an expert) and Tier-B2's compressor/indexer runs PER-POSITION, so tb2prep 
 with M and becomes the new bottleneck. And **M=1 through the batch path (15.3) is SLOWER than
 single-stream matvec decode (18.98)** — batching is a throughput mode you switch into, not a
 strictly-better path.
+
+## Q8 EXPERTS: ds4fbase 17.07 -> 22.45 tok/s (+32%) — and comm ~= 3 x expert_time (2026-07-12)
+
+`DS4F_BAKE_EXPERTS=1` extends the offline bake to the ROUTED experts, and `DS4F_EXPERTS=q8pv`
+loads them. Base ships FP8 experts, whose on-demand gather runs at **~76 GB/s in-model** — 5x below
+the q8-sdot ceiling. Q8_PV is 1.03 B/elem vs FP8's 1.0, so the swap is essentially free on memory.
+
+Measured 12n, SAME allocation, everything else identical (q8 dense, TP_ATTN=0, CMP_LOCAL, HC_SVE,
+MV_FUSE, 47 threads), 2 runs each:
+
+| | decode | experts | comm | compute | arena |
+|---|---|---|---|---|---|
+| FP8 experts | 17.10 / 17.04 | 6.74 / 6.83 ms | 21.7 / 21.8 | 35.2-37.5 | 26.68 GB |
+| **Q8 experts** | **22.45 / 22.45** | **3.13 / 3.17** | **11.3 / 11.4** | 31.6-33.4 | 27.42 GB |
+
+Coherent completion, NaNs=0, 12/12 lockstep — and the same token ids (361/1527) as the FP8 run.
+
+### The payoff is 2x bigger than the expert phase, because **comm ≈ 3 × expert_time**
+
+  FP8: 3 x 6.79 = 20.4   vs measured comm 21.75
+  Q8 : 3 x 3.13 =  9.4   vs measured comm 11.30
+
+Per layer, top-6-of-256 routing puts ~2 experts on the MAX rank against a 0.5 average, so the EP
+all-reduce barrier waits ~3x the average expert work — 43 times per token. Decode comm is not data
+movement (fabric floor is 23 µs x 86 = 2 ms); it is **the MoE straggler, and it is a 3x multiplier
+on expert time**.
+
+**=> Cutting expert time by X cuts decode by ~4X (1X compute + 3X comm).** That is why a 3.7 ms
+expert saving bought 14 ms/token. This is the single most useful predictive rule found here.
+
+### Consequence: the BASE model now decodes FASTER than Flash
+
+| | experts | decode |
+|---|---|---|
+| ds4f (Flash) 12n | MXFP4 (svtbl, dequant-bound ~84 Gmac/s, cannot be Q8'd — would double to 22.9 GiB and blow the arena) | 18.98 |
+| **ds4fbase 12n** | **Q8_PV (sdot)** | **22.45** |
+
+The higher-fidelity 275 GB model is ~18% FASTER than the 149 GB one, purely because its FP8 expert
+format converts to a fast kernel while Flash's fp4 does not. Flash's MXFP4 experts are now its
+bottleneck, and they are stuck there by memory.
+
+Cost: the Q8 expert blob is **291 GB** in `~/models/ds4fbase-fast/` (all 256 experts x 43 layers,
+rank-agnostic; the stager picks each rank's slice). Bake ~50 min, one time.

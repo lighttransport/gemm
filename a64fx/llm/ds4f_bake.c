@@ -102,6 +102,28 @@ static int is_bake_weight(const char *name) {
     return 0;
 }
 
+/* DS4F_BAKE_EXPERTS=1: also bake the ROUTED experts (layers.L.ffn.experts.E.w{1,2,3}.weight).
+ *
+ * WHY: on ds4fbase the experts ship FP8, and the FP8 on-demand gather kernel runs at ~76 GB/s
+ * (measured in-model) -- 5x below the q8-sdot ceiling. Worse, expert time drives COMM too: the
+ * top-6-of-256 routing lands on <=6 of the 12 ranks, so the per-layer MoE imbalance IS the
+ * straggler skew the all-reduce barrier absorbs. Making experts fast cuts the expert phase AND
+ * the comm it induces. Q8_PV is 1.03 B/elem vs FP8's 1.0 -- essentially free.
+ *
+ * Experts are written to the **Q8_PV blob ONLY**: they are 277 G elements (vs the dense set's
+ * 5.68 G), so a bf16-pv expert blob would be ~554 GB. Q8 alone is ~23 GB.
+ *
+ * NOT for ds4f (Flash): its experts are MXFP4 (0.53 B/elem). Q8 would DOUBLE them (11.8 -> 22.9
+ * GiB) and blow the 12-node arena. Flash keeps MXFP4. */
+static int is_bake_expert(const char *name) {
+    if (strncmp(name, "layers.", 7) != 0) return 0;      /* mtp.* skipped */
+    if (!strstr(name, ".ffn.experts.")) return 0;         /* leading dot: never shared_experts */
+    size_t n = strlen(name);
+    if (n < 8 || strcmp(name + n - 7, ".weight") != 0) return 0;
+    const char *w = name + n - 10;                        /* ".wN.weight" */
+    return (w[0] == '.' && w[1] == 'w' && (w[2] == '1' || w[2] == '2' || w[2] == '3'));
+}
+
 static int envi(const char *k, int d) { const char *e = getenv(k); return (e && *e) ? atoi(e) : d; }
 
 /* F32 "ue8m0" scale -> E8M0 byte (ds4fbase ships F32 scales; ds4f already ships E8M0).
@@ -152,6 +174,8 @@ int main(void) {
     /* smoke-test knob: stop after N shards. nshards stays in the FILENAME (…-of-00046). */
     int slimit  = envi("DS4F_BAKE_SHARD_LIMIT", 0);
     int last    = (slimit > 0 && slimit < nshards) ? slimit : nshards;
+    /* DS4F_BAKE_EXPERTS=1: also bake the routed experts -> Q8_PV (base/FP8 only; see is_bake_expert) */
+    int bake_experts = envi("DS4F_BAKE_EXPERTS", 0);
 
     mkdir(out_dir, 0755);
 
@@ -194,10 +218,14 @@ int main(void) {
 
         for (int i = 0; i < st->n_tensors; i++) {
             st_tensor_info *t = &st->tensors[i];
-            if (!is_bake_weight(t->name)) continue;
+            int is_exp = bake_experts && is_bake_expert(t->name);
+            if (!is_bake_weight(t->name) && !is_exp) continue;
             if (t->n_dims != 2) { fprintf(stderr, "bake: '%s' ndims %d != 2\n", t->name, t->n_dims); goto fail; }
             if (strcmp(t->dtype_str, "F8_E4M3") != 0) {
-                fprintf(stderr, "bake: '%s' dtype %s != F8_E4M3\n", t->name, t->dtype_str); goto fail; }
+                /* ds4f (Flash) experts are MXFP4 ("I8"), not FP8 -- and Q8 would double them. */
+                fprintf(stderr, "bake: '%s' dtype %s != F8_E4M3%s\n", t->name, t->dtype_str,
+                        is_exp ? " (Flash MXFP4 experts cannot be baked to Q8 -- they would not fit)" : "");
+                goto fail; }
 
             int N = (int)t->shape[0], K = (int)t->shape[1];
             if ((N & 7) || (K & 63)) {            /* Q8_PV needs 8-row groups x 64-col blocks */
@@ -280,11 +308,12 @@ int main(void) {
                 }
             }
 
-            /* --- append both variants + manifest lines (logical shape; dtype implies packing) --- */
+            /* --- append the variant(s) + manifest lines (logical shape; dtype implies packing) ---
+             * experts go to the Q8 blob ONLY (v=1): a bf16-pv expert blob would be ~554 GB. */
             const void *src_v[2] = { bf, q8 };
             size_t      nb_v[2]  = { wb_bf, wb_q8 };
             const char *dt_v[2]  = { "BF16_PV", "Q8_PV" };
-            for (int v = 0; v < 2; v++) {
+            for (int v = (is_exp ? 1 : 0); v < 2; v++) {
                 uint64_t a = (off[v] + 255) & ~(uint64_t)255;
                 if (a != off[v] && lseek(bfd[v], (off_t)a, SEEK_SET) < 0) {
                     fprintf(stderr, "bake: lseek: %s\n", strerror(errno)); goto fail; }

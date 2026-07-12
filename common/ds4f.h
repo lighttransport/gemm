@@ -185,12 +185,23 @@ static inline ds4f_config ds4f_base_config(void) {
     return c;
 }
 
-/* DS4F_MODEL selects the variant: ds4p = Pro, ds4fbase = base, default = Flash. */
+/* DS4F_MODEL selects the variant: ds4p = Pro, ds4fbase = base, default = Flash.
+ *
+ * DS4F_EXPERTS=q8pv then overrides the routed-expert rep to the OFFLINE-BAKED int8 W8A8
+ * (ds4f_bake.c with DS4F_BAKE_EXPERTS=1). Only meaningful for base: its FP8 experts run the
+ * on-demand gather at ~76 GB/s in-model, 5x below the q8-sdot ceiling, and Q8_PV is 1.03 B/elem
+ * vs FP8's 1.0 -- essentially free. It also cuts COMM, because the per-layer MoE imbalance
+ * (top-6-of-256 landing on <=6 of 12 ranks) IS the straggler skew the all-reduce absorbs.
+ * NOT for Flash: MXFP4 -> Q8 would double its experts (11.8 -> 22.9 GiB) and blow the arena. */
 static inline ds4f_config ds4f_config_from_env(void) {
     const char *m = getenv("DS4F_MODEL");
-    if (m && strcmp(m, "ds4p") == 0)     return ds4f_pro_config();
-    if (m && strcmp(m, "ds4fbase") == 0) return ds4f_base_config();
-    return ds4f_default_config();
+    ds4f_config c = (m && strcmp(m, "ds4p") == 0)     ? ds4f_pro_config()
+                  : (m && strcmp(m, "ds4fbase") == 0) ? ds4f_base_config()
+                                                      : ds4f_default_config();
+    {   const char *e = getenv("DS4F_EXPERTS");
+        if (e && *e && strcmp(e, "q8pv") == 0) c.expert_qt = DS4F_Q8_PV;
+    }
+    return c;
 }
 
 /* ===================== tensor ===================== */
