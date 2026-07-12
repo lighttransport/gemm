@@ -2435,3 +2435,40 @@ It also *derives* the empirical rule: ratio = E[max]/mean = **3.79×**, so the b
 
 The straggler multiplier shrinks with M by the law of large numbers. That is the real, and only,
 fix for MoE imbalance on this fabric — and it is already measured (base: 22.45 → 35.4 tok/s).
+
+## ⚠️ PREFILL: `DS4F_PREFILL_GEMM=1` is +51% but SILENTLY CORRUPTS the output — do not use (2026-07-12)
+
+Prefill on ds4fbase 12n (929-token prompt, Q8 dense + Q8 experts, 47 threads):
+
+| config | prefill | ar_calls | completion |
+|---|---|---|---|
+| **baseline (working)** | **19.84 tok/s** | 80,823 | correctly continues the passage ✓ |
+| `PREFILL_GEMM=1 K=32` | 30.06 (+51%) | 3,509 | `"- Page 2 of 2"` ✗ |
+| `PREFILL_GEMM=1 K=64` | 29.99 | 2,219 | ✗ |
+| + `HC_SVE` | 30.01 | 2,219 | `"https://www.youtube.com/watch?v=..."` ✗ |
+| + `Q8_GEMM_TILE=16` | 29.71 | 3,509 | `"Apotheosis Apotheosis"` ✗ |
+
+**Every** GEMM variant produces text that IGNORES the prompt entirely (web boilerplate, a URL,
+Chinese kinase gibberish) — the signature of a context that was never correctly prefilled. Yet
+**NaNs=0 and 12/12 lockstep pass in all of them.** This is the exact failure mode this doc warns
+about: only a coherence gate catches it.
+
+The same prompt with `PREFILL_GEMM` OFF correctly continues the text, and the standard 24-token
+quicksort prompt still yields correct code (ids 361/1527) — so the weights, stage and build are
+fine. It is the batched verify-path prefill that is broken.
+
+**Not the Q8 kernel:** `DS4F_Q8_GEMM_TILE` (which removes the sdot activation quantization
+entirely) is *also* garbage, and `ds4f_gemm_test` passes 205/205 on Q8_PV. The defect is in
+`ds4f_forward_verify`'s prefill state handling, not the GEMM.
+
+**UNRESOLVED — needs a bisect:** whether this is (a) pre-existing on base, (b) specific to Q8 dense,
+or (c) specific to Q8 experts. Separating them requires staging an FP8-expert blob and re-testing.
+The docs' original validation was on **ds4f with bf16-pv dense + MXFP4 experts**, a config we no
+longer run. **Until bisected, leave `DS4F_PREFILL_GEMM=0`.**
+
+**Also refuted for prefill:** `DS4F_IDX_INT8` (tb2scan 6.41 → 7.72 ms, WORSE — the int8 scan loses
+even batched); `DS4F_Q8_GEMM_TILE` (neutral); `DS4F_PF_TP` (neutral — it only helps batched decode).
+
+Working prefill profile (19.84 tok/s, 50.4 ms/tok) is **tb2prep-dominated**: tb2prep 14.0 ms (42%,
+of which tb2scan 6.4 — the O(T) indexer scan), experts 5.1, comm 5.1, qkv 4.3, attn 3.4. The scan
+grows with prompt length, so prefill degrades on long prompts — that is Tier-B2 architecture.
