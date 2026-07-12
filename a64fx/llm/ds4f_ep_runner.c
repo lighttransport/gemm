@@ -1280,6 +1280,57 @@ int main(int argc,char**argv){
         barrier(); exit(0);
     }
 
+    /* ---- DS4F_VERIFY_GATE: is ds4f_forward_verify (the batched / serve forward) numerically
+     * EQUIVALENT to ds4f_forward_token (the gated single-stream matvec forward)?
+     *
+     * WHY THIS EXISTS: DS4F_PREFILL_GEMM corrupts the output (error compounds with prompt length)
+     * AND the batched serve loop returns garbage for a real prompt even with PREFILL_GEMM=0. Both
+     * misuse ds4f_forward_verify. DS4F_DB_BENCH only TIMES steps -- it never inspects what it
+     * generated -- which is how this stayed hidden while we quoted 35.4 tok/s of "throughput".
+     *
+     * The test isolates the forward function and nothing else: BOTH arms prefill the same prompt
+     * through the KNOWN-GOOD ds4f_forward_token path (so caches/Tier-B2 state are built identically),
+     * then decode ND tokens -- arm A with ds4f_forward_token, arm B with ds4f_forward_verify(K=1).
+     * Same caches, same positions, same prompt => ANY divergence is the verify forward itself.
+     * (Expect a small reassoc-class tail: the GEMM reassociates. A prompt-ignoring/garbage stream
+     *  is a BUG.) ---- */
+    if (envi("DS4F_VERIFY_GATE", 0) > 0 && gen_mode && n_prompt > 0) {
+        int Cc = m->cfg.hidden, hcm = m->cfg.hc_mult; size_t hcC = (size_t)hcm * Cc;
+        int ND = envi("DS4F_VG_NTOK", 16); if (ND > 64) ND = 64;
+        ds4f_alloc_prefill_batch(m, 8);      /* sizes m->v_* / m_tile: forward_verify SEGVs without it */
+        float *xb  = (float *)aligned_alloc(64, (size_t)Cc * 4);
+        float *hcb = (float *)aligned_alloc(64, hcC * 4);
+        int A[64], B[64];
+        for (int arm = 0; arm < 2; arm++) {
+            ds4f_serve_reset(m); m->dec_batch_seq = NULL; m->dec_batch_pos = NULL; m->dec_nseq = 0;
+            int last = DS4F_EOS_ID;
+            for (int p = 0; p < n_prompt; p++) {                  /* identical known-good prefill */
+                embed_lookup(m, prompt_ids[p], xb);
+                last = ds4f_forward_token(m, xb, p);
+            }
+            int cur = last;
+            for (int t = 0; t < ND; t++) {
+                (arm ? B : A)[t] = cur;
+                embed_lookup(m, cur, xb);
+                if (!arm) cur = ds4f_forward_token(m, xb, n_prompt + t);
+                else { int ot[1]; ds4f_forward_verify(m, xb, 1, n_prompt + t, ot, hcb); cur = ot[0]; }
+            }
+        }
+        if (MyRank == 0) {
+            int match = 0, pfx = 0; for (int t = 0; t < ND; t++) if (A[t] == B[t]) match++;
+            while (pfx < ND && A[pfx] == B[pfx]) pfx++;
+            logmsg("VERIFY_GATE (forward_token vs forward_verify K=1, IDENTICAL prefill): "
+                   "%d/%d match, common prefix %d -> %s\n", match, ND, pfx,
+                   match == ND ? "PASS" : (pfx >= ND/2 ? "reassoc-tail?" : "FAIL (verify forward is WRONG)"));
+            char b[512]; int n = 0; n += snprintf(b+n, sizeof b-n, "  token : ");
+            for (int t = 0; t < ND && t < 12; t++) n += snprintf(b+n, sizeof b-n, "%d ", A[t]);
+            n += snprintf(b+n, sizeof b-n, "\n  verify: ");
+            for (int t = 0; t < ND && t < 12; t++) n += snprintf(b+n, sizeof b-n, "%d ", B[t]);
+            logmsg("%s\n", b);
+        }
+        barrier(); exit(0);
+    }
+
     /* Stage-A self-test (post-barrier so every rank's comm is live): verify
      * tp_allreduce_max == serial max + lockstep (every rank computes the same expected
      * global max). Gated DS4F_CP_SELFTEST. Runs in lockstep on all ranks (seq stays aligned). */

@@ -2588,3 +2588,46 @@ bundle mix-up and TOWARD the verify forward itself, or the prefill into the bund
 A decisive next test: run `ds4f_forward_decode_batch` at M=1 from a real prompt prefilled by the
 KNOWN-GOOD token-at-a-time path, and compare its ids to `ds4f_forward_token`. If they diverge, the
 bug is in the verify forward.
+
+## 🔴 ROOT CAUSE: `ds4f_forward_verify` IS WRONG (2026-07-12) — `DS4F_VERIFY_GATE`
+
+One defect explains the `PREFILL_GEMM` corruption AND the batched-decode garbage. New gate
+(`DS4F_VERIFY_GATE=1`, `ds4f_ep_runner.c`) isolates the forward function and nothing else: BOTH arms
+prefill the same prompt through the **known-good `ds4f_forward_token`** path (identical caches /
+Tier-B2 state / positions), then decode 16 tokens — arm A with `ds4f_forward_token`, arm B with
+`ds4f_forward_verify(K=1)`.
+
+```
+VERIFY_GATE (forward_token vs forward_verify K=1, IDENTICAL prefill):
+  2/16 match, common prefix 1 -> FAIL (verify forward is WRONG)
+
+  token : 361 855 9080 18561 11 8593 223 19 1137 528 1354 3522     <- coherent
+  verify: 361 313 343 67  11  223 80  223 223 343 20   11          <- degenerate
+```
+
+They agree on 361 (the shared prefill's output) and then **diverge on the very FIRST verify-decoded
+token**, with `forward_verify` collapsing into degenerate low-id tokens. **Not reassociation** — a
+reassoc tail diverges late after a long common prefix; this diverges immediately.
+
+### This one bug explains everything
+
+| symptom | mechanism |
+|---|---|
+| `DS4F_PREFILL_GEMM` corrupts, error grows with prompt length | prefill runs through `forward_verify` |
+| batched serve returns garbage (PREFILL_GEMM on **and** off) | decode runs through `forward_verify` |
+| `DB_BENCH` 35.4 / 32.8 tok/s looked fine | it only TIMES steps; never inspects the output |
+| P1 isolation showed neighbour-independence | both arms used `forward_verify` — equally wrong, so no *relative* leak |
+
+**Everything that touches `ds4f_forward_verify` is unusable:** batched decode, batched serve
+(`DS4F_SERVE_BATCH`>1, incl. the dynbatch loop), `DS4F_PREFILL_GEMM`, and by extension spec-decode's
+verify step. **Single-stream decode and token-at-a-time prefill are unaffected and gated** — they use
+`ds4f_forward_token` (base 22.45 tok/s, Flash 18.98, all backed by coherent completions).
+
+**Both serve loops default to the broken path** (`pf_gemm = envi("DS4F_PREFILL_GEMM", 1)`).
+
+### Next: fix inside `ds4f_forward_verify` (common/ds4f_impl.h:5609)
+
+It diverges at the first decode step against a pre-built cache, so suspect its handling of an
+EXISTING cache at `pos0 > 0` — the K-position loop over window/sparse attention, the KV/compressor
+write offsets, or the Tier-B2 index/top-k selection. `DS4F_VERIFY_GATE=1` is now the regression test:
+it must reach `16/16 match` (or a long common prefix with only a reassoc tail).
