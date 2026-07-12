@@ -1,14 +1,62 @@
-# DeepSeek-V4-Flash (DS4F) on 11× A64FX (Fugaku) — build & run repro
+# DeepSeek-V4 (Flash + base) on A64FX / Fugaku — build & run repro
 
-EP-only inference harness for DeepSeek-V4-Flash (284B total / 13B activated MoE,
-43 MoE layers, hidden 4096, vocab 129280). 256 routed experts are EP-sharded
-~23–24/node; dense (attn / shared expert / router / embed / head) is replicated and
-computed redundantly per node. Weights stay quantized in HBM with on-demand dequant
-(dense FP8 e4m3fn, experts MXFP4) to fit ~25 GB usable HBM2/node.
+EP inference harness for DeepSeek-V4 **Flash** (`~/models/ds4f`, 149 GB, fp4 experts) and
+**base** (`~/models/ds4fbase`, 275 GB, fp8 experts) — 284B total / 13B activated MoE, 43 layers,
+hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 
-This file is the **operational repro** for the real-weight Tier-B1 run. The science /
-status lives in the auto-memory `project_ds4f_flash_ep_harness`; the design rationale
-in `~/.claude/plans/plan-deepseek-v4-flash-iterative-prism.md`.
+---
+
+## ★ CURRENT STATE — decode, 12 nodes (2026-07-12)
+
+| model | experts | single-stream | batched (aggregate) | arena |
+|---|---|---|---|---|
+| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **22.45 tok/s** | **35.4 @ M=16** (M=32 OOMs) | 27.4 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | 18.98 tok/s | 32.8 @ M=32 / 31.0 @ M=16 | 18.9 GB |
+
+**The base model is FASTER than Flash** — its fp8 experts convert to the fast int8-sdot kernel
+while Flash's fp4 does not. Cumulative on base: 11.34 → **22.45 tok/s (2.0×)**.
+
+```sh
+# ONE TIME (survives allocations; ~50 min): kernel-ready weights -> ~/models/<model>-fast/
+DS4F_MODEL=ds4fbase DS4F_BAKE_EXPERTS=1 ./build/ds4f_bake     # 11.4 GB bf16pv + 291 GB q8pv
+
+# PER ALLOCATION (/local is node-local and dies with the job): ~30 min
+DS4F_MODEL=ds4fbase DS4F_DENSE=q8pv DS4F_STAGE_DIR=/local/base_q8 ./run_ds4fbase_stage_12n.sh
+
+# RUN — the flags below are the measured optimum; see the notes for why each one matters
+DS4F_MODEL=ds4fbase DS4F_STAGE_DIR=/local/base_q8 \
+  DS4F_DENSE=q8pv DS4F_EXPERTS=q8pv \
+  DS4F_TP_ATTN=0 DS4F_CMP_LOCAL=1 DS4F_HC_SVE=1 DS4F_MV_FUSE=1 \
+  LLM_THREADS=47 ./run_ds4fbase_12n.sh
+```
+
+**The four rules that produced those numbers** (each cost real time to find; details in the
+sections below):
+
+1. **`LLM_THREADS=47`, never 48.** 48 pinned OMP threads on 48 compute cores means ANY other
+   process on the node preempts one — and the pool barrier waits for all 48, which stalls every
+   rank. **+40%**, and it makes the numbers reproducible. It masquerades as fabric noise.
+2. **`comm ≈ 3 × expert_time`.** Decode "comm" is not data movement (fabric floor is 2 ms of the
+   ~11–22 ms observed) — it is the MoE straggler. Top-6-of-256 lands ~2 experts on the max rank vs
+   a 0.5 average. **⇒ cutting expert time by X cuts decode by ~4X.** This is the single most useful
+   predictive rule here.
+3. **Bake the weights offline.** The fast reps (bf16-pv, Q8_PV) were only reachable at runtime via a
+   transient bf16 peak that base could not afford. Baking removes the peak — and it is what made
+   rule 2 actionable (Q8 experts: 6.8 → 3.1 ms ⇒ **+32%** decode).
+4. **`TP_ATTN=0`.** TP's `s_attn` all-reduce (128 KB × 43/token) dominates `o_proj`. With a fast
+   dense kernel the trade flips: TP_ATTN is a LOSS under FP8 but a WIN under Q8.
+
+**Refuted, do not retry:** compute/comm overlap & double-buffering (comm is idle-wait, not
+transfer); static MoE load balancing (the router is statistically random — see the refutation);
+per-row-scale int8 (lossy or zero-gain); `DS4F_INT8_KV` for long ctx (it *costs* context).
+**Context:** 1M fits (arena is flat in ctx); the ceiling is speed, not memory.
+
+---
+
+## Historical: Tier-B1 operational repro (11 nodes, pre-bake)
+
+This section predates the bake + the 47-thread fix; its numbers (decode ~10 tok/s) are superseded
+by the table above and are kept for the staging/validation recipe only.
 
 ## TL;DR
 
