@@ -49,7 +49,14 @@ echo "[gate] submitted 2 requests, polling for responses..."
 for i in $(seq 1 240); do
     [ -f "$BASE.r.0" ] && [ -f "$BASE.r.1" ] && break; sleep 5
 done
+# The serve loop NEVER returns, so it must be torn down explicitly -- and killing the wrapper is
+# NOT enough: mpiexec/plexec/ds4f_ep_runner survive it and keep holding the nodes, so the NEXT job
+# dies with "PLE 0054 plexec: number of processes exceed the limit on virtual coordinate (0,0,0)".
+# Match on the exact process NAME: `pkill -f ds4f_ep_runner` also matches this script's own command
+# line and kills the shell running it.
 kill $SRV 2>/dev/null || true
+pkill -x ds4f_ep_runner 2>/dev/null || true; sleep 2
+pkill -x mpiexec 2>/dev/null || true; pkill -x plexec 2>/dev/null || true; sleep 2
 
 fail=0
 for n in 0 1; do

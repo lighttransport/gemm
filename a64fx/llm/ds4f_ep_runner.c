@@ -1523,11 +1523,17 @@ int main(int argc,char**argv){
     } else {
         int tf_check = gen_mode && envi("DS4F_TF_CHECK", 0);
         int tf_correct = 0, tf_total = 0;
-        /* DS4F_PREFILL_GEMM: batch the gen prefill through the MHC+Tier-B2-capable verify path
-         * (chunks of K<=8) -> the per-layer EP all-reduce fires once per K tokens (comm ÷K) and the
-         * dense projections become an M=K GEMM instead of K matvecs. Attn/tb2/mHC stay per-position
-         * (looped, causal). COHERENT not bit-identical to token-by-token (GEMM reassoc, like GEMM-decode);
-         * seeds the same decode. Not with MTP (per-token MTP KV maintenance). */
+        /* DS4F_PREFILL_GEMM: batch the gen prefill through the MHC+Tier-B2-capable verify path in
+         * chunks of K -> the dense projections become an M=K GEMM instead of K matvecs, and the
+         * per-layer EP all-reduce fires once per K tokens instead of once per token. Attn/tb2/mHC
+         * stay per-position (looped, causal). COHERENT not bit-identical to token-by-token (GEMM
+         * reassoc); seeds the same decode. Not with MTP (per-token MTP KV maintenance).
+         *
+         * MEASURED (base 12n, K sweep, 2026-07-13): 17.88 -> 28.31 tok/s (+58%) from K=1 to K=128,
+         * saturating past K~16. The win is mostly the GEMM, NOT the comm elision: ar_calls falls 39x
+         * (6090 -> 156) but comm only 20.3% -> 14.9%, i.e. compute -14.5 ms/tok vs comm -6.0 ms/tok.
+         * The floor is attn/tb2/mHC, which stay per-position. Default is now ON (K=32) in
+         * run_ds4fbase_12n.sh -- it was off only because forward_verify was broken (see f9daca59). */
         int pf_gemm = gen_mode && !mtp_on && envi("DS4F_PREFILL_GEMM", 0);
         if (pf_gemm) {
             int K = envi("DS4F_PREFILL_K", 32); if (K < 1) K = 1; if (K > 128) K = 128;   /* verify path caps at 128 */

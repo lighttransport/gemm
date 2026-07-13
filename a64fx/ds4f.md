@@ -8,10 +8,10 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 
 ## ★ CURRENT STATE — decode, 12 nodes (2026-07-13)
 
-| model | experts | single-stream | batched (aggregate) | arena |
-|---|---|---|---|---|
-| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **22.45 tok/s** | **35.4 @ M=16** (M=32 OOMs) | 27.4 GB |
-| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | 18.98 tok/s | 32.8 @ M=32 / 31.0 @ M=16 | 18.9 GB |
+| model | experts | single-stream | batched (aggregate) | prefill | arena |
+|---|---|---|---|---|---|
+| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **22.45 tok/s** | **35.4 @ M=16** (M=32 OOMs) | **28.3 tok/s** (`PREFILL_GEMM`, K=32/128) | 27.4 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | 18.98 tok/s | 32.8 @ M=32 / 31.0 @ M=16 | — | 18.9 GB |
 
 **The base model is FASTER than Flash** — its fp8 experts convert to the fast int8-sdot kernel
 while Flash's fp4 does not. Cumulative on base: 11.34 → **22.45 tok/s (2.0×)**.
@@ -2516,6 +2516,10 @@ serving, gate it on output (the `DS4F_DECODE_BATCH` P1 isolation test compares s
 
 **Status: `DS4F_PREFILL_GEMM=0`.** The +51-82% prefill it offers is real speed on a wrong answer.
 
+> **SUPERSEDED 2026-07-12/13.** The cause was the `forward_verify` × `TP_WOB` column-shard bug (one
+> line, fixed in `f9daca59`) — not the prefill chunking. `DS4F_PREFILL_GEMM=1` is now the DEFAULT and
+> is output-gated at **28.31 tok/s (+58%)**. See the fix and the K sweep at the end of this file.
+
 ### Gating batched decode (P1 isolation) — isolation PASSES; whole-path correctness still OPEN
 
 Prompted by the `PREFILL_GEMM` bisect: the same `ds4f_forward_verify` powers batched decode, so the
@@ -2715,6 +2719,40 @@ Two harness notes baked into the script:
   same size) is never revalidated by the compute node's FS cache, so rank 0 never sees the request.
   The dynbatch loop probes `<base>.q.<id>` **existence**, which does invalidate.
 - The queue lives on the **shared FS** (`$HOME`), not `/tmp` or `/local` — rank 0 is on another node.
+
+### ✅ PREFILL: `DS4F_PREFILL_GEMM` is now ON by default — 17.88 → 28.31 tok/s (+58%)
+
+With `forward_verify` fixed, the batched prefill is finally usable, so K got its first sweep on a
+path that produces **correct output** (`sweep_prefill_k.sh`, base 12n, q8pv + TP_ATTN=0, 70-tok
+prompt). Every point is gated on a coherent completion **and** on the prefill argmax matching the
+token-at-a-time control exactly (`361` at every K):
+
+| K | prefill tok/s | ms/tok | comm % | ar_calls |
+|---|---|---|---|---|
+| 1 (`PREFILL_GEMM=0`, control) | 17.88 | 55.9 | 20.3% | 6090 |
+| 8 | 24.75 | 40.4 | 16.4% | 844 |
+| 16 | 26.47 | 37.8 | 16.0% | 500 |
+| **32 (new default)** | **27.56** | 36.3 | 15.2% | 328 |
+| 64 | 27.96 | 35.8 | 15.0% | 242 |
+| 128 (cap) | **28.31 (+58%)** | 35.3 | 14.9% | 156 |
+
+**★ The stated mechanism was WRONG, and the sweep is what caught it.** Both the code comment and the
+earlier write-up explained this as *"the per-layer EP all-reduce fires once per K tokens ⇒ comm ÷ K"*.
+But `ar_calls` falls **39×** (6090 → 156) while comm barely moves (20.3% → 14.9%). Splitting ms/tok:
+
+| | K=1 | K=128 | Δ |
+|---|---|---|---|
+| compute | 44.5 ms | 30.0 ms | **−14.5 ms** |
+| comm | 11.3 ms | 5.3 ms | −6.0 ms |
+
+**~70% of the win is the dense M=K GEMM replacing K matvecs** — the all-reduce elision is the minor
+term. This matters because it predicts the shape: the curve **saturates past K≈16**, since attention,
+Tier-B2 and mHC stay per-position (looped, causal) and form an irreducible floor that no K can touch.
+Chasing K past 32 buys 4 points for 4× the chunk. **Default: `DS4F_PREFILL_GEMM=1 DS4F_PREFILL_K=32`.**
+
+(Note this is *not* the same lesson as decode's `comm ≈ 3 × expert_time`. In decode, comm is the MoE
+straggler and dominates. In prefill, K tokens of work per reduce already amortize it — so prefill is
+compute-bound where decode is straggler-bound, and the two respond to completely different levers.)
 
 ### ⚠️ Build trap: `make` alone silently builds the WRONG binary
 

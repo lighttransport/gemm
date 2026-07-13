@@ -121,6 +121,24 @@ export DS4F_TP_EMBED=${DS4F_TP_EMBED:-1}    # vocab-shard embedding (bit-exact: 
 export DS4F_FP8_BF16=${DS4F_FP8_BF16:-0}
 export DS4F_PREFILL_BATCH=${DS4F_PREFILL_BATCH:-0}   # needs FP8_BF16=1 -> must stay 0 here
 
+# ---- PREFILL: batch it through the verify path. ON by default as of 2026-07-13 --------------
+# Was off because ds4f_forward_verify was BROKEN (the TP_WOB column-shard bug, f9daca59) and this
+# produced fast garbage. Post-fix it is gated: coherent completion AND the prefill argmax is
+# IDENTICAL to the token-at-a-time control (361) at every K below.
+#
+#   K:        1(off)   8      16     32     64     128
+#   tok/s:    17.88   24.75  26.47  27.56  27.96  28.31     (+58% at K=128)
+#   comm:     20.3%   16.4%  16.0%  15.2%  15.0%  14.9%
+#   ar_calls: 6090    844    500    328    242    156
+#
+# NOTE the mechanism is NOT what the code comment used to claim ("comm / K"): ar_calls falls 39x
+# but comm only 20.3% -> 14.9%. Splitting ms/tok, compute drops 44.5 -> 30.0 (-14.5 ms) while comm
+# drops 11.3 -> 5.3 (-6.0 ms) -- so ~70% of the win is the dense M=K GEMM replacing K matvecs, not
+# the all-reduce elision. It saturates past K~16 because attn/Tier-B2/mHC stay per-position
+# (looped, causal) and are the irreducible floor. K=32 takes 54 of the 58 points; the last 4 cost 4x K.
+export DS4F_PREFILL_GEMM=${DS4F_PREFILL_GEMM:-1}
+export DS4F_PREFILL_K=${DS4F_PREFILL_K:-32}
+
 # ---- DECODE COMPUTE levers. Measure COMPUTE = ms/tok x (1-comm%), NOT tok/s ----------------
 # tok/s on this fabric swings 10.2 - 13.9 for the IDENTICAL config (comm 23-60 ms, external
 # contention). Compute is rock-stable (+/-0.1 ms) and is the only part we control:
@@ -171,9 +189,17 @@ export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 export DS4F_WARM_RSS_TRACE=${DS4F_WARM_RSS_TRACE:-0}
 export DS4F_WARM_MEMAVAIL_STOP_GB=${DS4F_WARM_MEMAVAIL_STOP_GB:-1.5}
 
-echo "=== DS4F-BASE EP harness on $NP node(s) (REAL fp8-expert weights <- $DS4F_STAGE_DIR) ==="
+echo "=== DS4F-BASE EP harness on $NP node(s) (REAL weights <- $DS4F_STAGE_DIR) ==="
 echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43}"
-echo "experts=FP8(e4m3)  dense=FP8  TP=attn/oproj/wob/shared/head/embed"
+# Print what is ACTUALLY configured. This line used to be a hardcoded
+#   echo "experts=FP8(e4m3)  dense=FP8  TP=attn/oproj/wob/shared/head/embed"
+# which reported FP8 + full TP no matter what you passed -- so a q8pv/TP_ATTN=0 run looked like a
+# stock FP8 run in every log we archived. A banner that cannot be wrong is worth more than a pretty one.
+tp=""
+for k in ATTN OPROJ WOB SHARED HEAD EMBED; do
+    v="DS4F_TP_$k"; [ "${!v}" = "1" ] && tp="$tp$(echo $k | tr 'A-Z' 'a-z')/"
+done
+echo "experts=${DS4F_EXPERTS:-fp8(e4m3)}  dense=${DS4F_DENSE:-fp8}  TP=${tp:-none}  (bake=${DS4F_BAKE_DIR:-\$HOME/models/<model>-fast})"
 
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
 make -C "$LLM_DIR" ds4f_ep_runner CC=fcc OPENMP=1 >/dev/null
