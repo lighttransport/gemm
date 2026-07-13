@@ -11,7 +11,7 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 | model | experts | single-stream | batched (aggregate) | prefill | arena |
 |---|---|---|---|---|---|
 | **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **21.5–23.0 tok/s** | **34.6 @ M=16** | **37.2 tok/s** (`PREFILL_GEMM`, K=32) | 26.9 GB |
-| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | 32.8 @ M=32 / 31.0 @ M=16 | 15.5 tok/s (no `PREFILL_GEMM` yet) | 18.9 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | 32.8 @ M=32 / 31.0 @ M=16 | **24.9 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
 
 > Flash's old **18.98** was a synthetic-ctx=8 number, like base's 22.45. On a **real 70-token prompt**
 > it is **15.54** (was 12.57 before the indexer-scan fix). Its batched/arena figures are older and
@@ -2851,9 +2851,21 @@ vs Flash +24% — purely because Flash's MXFP4/svtbl experts make its step longe
 saving. The prediction was made before the run and held. **Use this to predict the next model:
 the scan fix is worth ~15 ms/token, full stop; divide by that model's step time.**
 
-**Still on the table for Flash: `DS4F_PREFILL_GEMM` is NOT on** (`ar_calls=3010` vs base's 328 —
-only `run_ds4fbase_12n.sh` defaults it). Base got +58% prefill from it. Flash's prefill is 15.51 tok/s
-and should improve substantially; it needs its own gate run first.
+### Flash `PREFILL_GEMM`: ON by default too — +61% prefill, gated (`gate_prefill_flash.sh`)
+
+| Flash | prefill | decode | ar_calls |
+|---|---|---|---|
+| `PREFILL_GEMM=0` | 15.45 tok/s | 15.47 | 3010 |
+| **`PREFILL_GEMM=1` (new default)** | **24.86 (+61%)** | 15.51 (unchanged) | **129** |
+
+Gate: **`VERIFY_GATE` 16/16 PASS** on Flash, and the completion is **character-identical** to the
+control with the same prefill argmax (361). Decode is untouched by design — `PREFILL_GEMM` only
+changes how the prompt is consumed, not what it seeds.
+
+Flash's TP stack is **entirely off** (`run_ds4f_11n.sh`: `TP_ATTN/SHARED/HEAD/EMBED = 0`, no
+`TP_OPROJ`/`TP_WOB`), so the `forward_verify` × `TP_WOB` bug that broke every batched path on base
+never applied here. That is a reason to *expect* a pass — it is not a substitute for measuring one,
+which is the entire lesson of this file.
 
 **Lesson: a default that "works" can still be measuring the wrong regime.** The `T >= 64` guard was
 presumably there to dodge pool overhead at tiny T. It was never re-measured, and the fallback it

@@ -68,6 +68,20 @@ export DS4F_PREFILL=${DS4F_PREFILL:-8}
 # (Attention is now GEMM-ified per-head-block so its 32MB q/attn buffers no longer
 #  bound L2 — that is why the old M>=128 cliff softened and 64 now wins.)
 export DS4F_PREFILL_BATCH=${DS4F_PREFILL_BATCH:-0}
+
+# ---- PREFILL: batch it through the verify path. ON by default as of 2026-07-14 ---------------
+# Gated on Flash before flipping (gate_prefill_flash.sh): VERIFY_GATE 16/16 PASS, and the completion
+# is CHARACTER-IDENTICAL to the control with the same prefill argmax (361).
+#
+#   PREFILL_GEMM=0   prefill 15.45 tok/s   ar_calls 3010
+#   PREFILL_GEMM=1   prefill 24.86 (+61%)  ar_calls  129     decode unchanged (15.47 -> 15.51)
+#
+# Decode is untouched by design -- this only changes how the prompt is consumed. Flash's TP stack is
+# OFF (below), so the forward_verify x TP_WOB bug that broke every batched path on base (f9daca59)
+# never applied here; that is a reason to EXPECT a pass, not a substitute for gating one.
+export DS4F_PREFILL_GEMM=${DS4F_PREFILL_GEMM:-1}
+export DS4F_PREFILL_K=${DS4F_PREFILL_K:-32}
+
 export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
 export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
 # DS4F_CTX_WARM>0 fills synthetic KV+compressed caches to this ctx, then decodes
