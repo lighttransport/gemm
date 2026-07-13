@@ -11,7 +11,11 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 | model | experts | single-stream | batched (aggregate) | prefill | arena |
 |---|---|---|---|---|---|
 | **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **21.5–23.0 tok/s** | **34.6 @ M=16** | **37.2 tok/s** (`PREFILL_GEMM`, K=32) | 26.9 GB |
-| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | 18.98 tok/s | 32.8 @ M=32 / 31.0 @ M=16 | — | 18.9 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | 32.8 @ M=32 / 31.0 @ M=16 | 15.5 tok/s (no `PREFILL_GEMM` yet) | 18.9 GB |
+
+> Flash's old **18.98** was a synthetic-ctx=8 number, like base's 22.45. On a **real 70-token prompt**
+> it is **15.54** (was 12.57 before the indexer-scan fix). Its batched/arena figures are older and
+> have NOT been re-measured in a single allocation — treat them as provisional.
 
 **Every base number above is from ONE allocation (job 49556601) with the gate green** —
 `./bench_headline_12n.sh`, which runs `VERIFY_GATE` **first** and aborts the whole benchmark if it
@@ -2825,6 +2829,31 @@ ties — it did not. Prefill gains too, because the indexer scan runs there as w
 
 The dip is gone: decode is now flat ~23 tok/s from ctx=64 to 1024, and the real-prompt number
 (**23.03**) finally *exceeds* the old synthetic-ctx=8 headline (22.45) instead of collapsing below it.
+
+### It applies to FLASH too — +23.6%, and the mechanism proves itself
+
+`ds4f_index_score` is **shared**, and Flash uses the same indexer geometry (64 index heads × 128 dim,
+`ds4f_default_config`), so Flash was sitting in the same serial-scalar band. Measured (11n, real
+70-token prompt, `ab_scanmin_flash.sh`):
+
+| Flash | decode | prefill | tb2scan | step |
+|---|---|---|---|---|
+| `SCAN_MIN=64` (old) | 12.57 tok/s | 14.42 | 15.317 ms | 79.5 ms/tok |
+| **`SCAN_MIN=8` (new)** | **15.54 (+23.6%)** | **15.51 (+7.6%)** | **0.161 ms (−99%)** | **64.4 ms/tok** |
+
+Completions **character-identical**. Flash's published **18.98 tok/s has the same defect as base's
+22.45 — it was a synthetic-ctx=8 number**; on a real prompt it was 12.57.
+
+**★ The absolute scan saving is IDENTICAL across the two models — 15.16 ms/token.** Base's step went
+58.5 → 43.4 and Flash's 79.5 → 64.4: both exactly 15.1 ms. That is what a shared, model-independent
+kernel must do (same indexer, same 43 layers), and it is why the *relative* wins differ — base +35%
+vs Flash +24% — purely because Flash's MXFP4/svtbl experts make its step longer, diluting a fixed
+saving. The prediction was made before the run and held. **Use this to predict the next model:
+the scan fix is worth ~15 ms/token, full stop; divide by that model's step time.**
+
+**Still on the table for Flash: `DS4F_PREFILL_GEMM` is NOT on** (`ar_calls=3010` vs base's 328 —
+only `run_ds4fbase_12n.sh` defaults it). Base got +58% prefill from it. Flash's prefill is 15.51 tok/s
+and should improve substantially; it needs its own gate run first.
 
 **Lesson: a default that "works" can still be measuring the wrong regime.** The `T >= 64` guard was
 presumably there to dodge pool overhead at tiny T. It was never re-measured, and the fallback it
