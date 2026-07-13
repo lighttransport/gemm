@@ -10,14 +10,30 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 
 | model | experts | single-stream | batched (aggregate) | prefill | arena |
 |---|---|---|---|---|---|
-| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **23.03 tok/s** | **35.4 @ M=16** (M=32 OOMs) | **36.1 tok/s** (`PREFILL_GEMM`, K=32) | 27.4 GB |
+| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **21.5–23.0 tok/s** | **34.6 @ M=16** | **37.2 tok/s** (`PREFILL_GEMM`, K=32) | 26.9 GB |
 | ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | 18.98 tok/s | 32.8 @ M=32 / 31.0 @ M=16 | — | 18.9 GB |
 
-**★ ALWAYS state the context a decode number was measured at.** The base row is a **real 70-token
-prompt** (job 49556601, one allocation, all four numbers comparable). The old "22.45 tok/s" headline
-was measured at the run script's **default synthetic prefill of 8 tokens** and did NOT survive a real
-prompt (it read 17.08 there) — until the indexer-scan bug below was fixed. A bare tok/s figure with
-no stated context is not a fact about this model.
+**Every base number above is from ONE allocation (job 49556601) with the gate green** —
+`./bench_headline_12n.sh`, which runs `VERIFY_GATE` **first** and aborts the whole benchmark if it
+does not pass. Reproduced verbatim:
+
+```
+[1/4] VERIFY_GATE  16/16 match, common prefix 16 -> PASS      (43 layers, full stack)
+[2/4] decode    64 tok  46.5 ms/tok  21.49 tok/s  comm 29.3%   \ real 70-token prompt,
+[3/4] prefill   70 tok  26.9 ms/tok  37.16 tok/s  comm 21.8%   / coherent quicksort, 12/12 lockstep
+[4/4] batched   M=1 17.1 | M=2 22.3 | M=4 27.5 | M=8 31.4 | M=16 34.6 tok/s aggregate
+```
+
+**★ ALWAYS state the context a decode number was measured at.** Single-stream reads **23.03** over 32
+decoded tokens and **21.49** over 64 (the run walks further out in context) — both on the same real
+70-token prompt. The old "22.45 tok/s" headline was measured at the run script's **default synthetic
+prefill of 8 tokens**, and it did NOT survive a real prompt (17.08 there) until the indexer-scan bug
+below was fixed. A bare tok/s figure with no stated context is not a fact about this model.
+
+**Batching still pays, but sub-linearly**: M=16 gives 34.6 tok/s aggregate (2.0× M=1) at 2.16
+tok/s/seq — per-sequence latency degrades ~8× to buy 2× throughput. That trade is the whole decision
+for a serving deployment, and it is only meaningful because the batched forward is now *gated*
+(`VERIFY_GATE`); for months these same numbers were garbage produced at full speed.
 
 **The base model is FASTER than Flash** — its fp8 experts convert to the fast int8-sdot kernel
 while Flash's fp4 does not. Cumulative on base: 11.34 → **22.45 tok/s (2.0×)**.

@@ -74,8 +74,21 @@ cleanup
 # ---- 4. batched decode. DB_BENCH only TIMES steps, so the VERIFY_GATE above is what makes it mean
 #         anything -- it is the only evidence the batched forward is correct. ----
 say ""; say "--- [4/4] batched decode (DB_BENCH sweep to M=16; correctness rests on gate [1]) ---"
+# TWO traps, both of which ate this step before:
+#  1. logmsg() writes to ds4f_ep_rank00.txt, NOT stdout -- the M= lines are never on the pipe. The
+#     old version grepped stdout and silently reported nothing.
+#  2. Piping the run straight into grep discards the log, so when it comes back empty there is
+#     nothing left to diagnose from. Keep the full log.
+rm -f ds4f_ep_rank00.txt
 DS4F_DB_BENCH=1 DS4F_DB_MAXM=16 DS4F_DB_NTOK=32 DS4F_PREFILL=32 DS4F_MAXGEN=4 \
-  ./run_ds4fbase_12n.sh 2>&1 | grep -hiE "^ *M=|DB_BENCH|agg tok/s" | tail -8 | sed 's/^/  /' | tee -a "$OUT"
+  ./run_ds4fbase_12n.sh > "$LLM_DIR/bench_headline_db.log" 2>&1 || true
+if grep -qE "^ *M=" ds4f_ep_rank00.txt 2>/dev/null; then
+    grep -hE "^ *M=" ds4f_ep_rank00.txt | sed 's/^/  /' | tee -a "$OUT"
+    cp -f ds4f_ep_rank00.txt "$LLM_DIR/bench_headline_db_rank00.txt"
+else
+    say "  !! no M= lines -- DB_BENCH did not run. Tail of bench_headline_db.log:"
+    tail -4 "$LLM_DIR/bench_headline_db.log" | sed 's/^/  /' | tee -a "$OUT"
+fi
 cleanup
 
 say ""; say "=== all four measured in job ${PJM_JOBID:-?} -- comparable to each other ==="
