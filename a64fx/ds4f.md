@@ -2701,6 +2701,18 @@ TP shards, or the serve loops must keep it at 16/16 (or a long common prefix + r
 Lesson: `DB_BENCH` only TIMES steps — a throughput benchmark that never inspects its output will
 happily report 35 tok/s of garbage.
 
+**Run it with `./gate_verify_12n.sh`** — full 43 layers, one command, exit 0 = PASS / 3 = FAIL, and
+the verdict lands in `ds4f_verify_gate.txt`. `bench_headline_12n.sh` aborts if it does not pass.
+
+> **There is NO OOM at 43 layers** — I claimed there was, and it was false. The gate had been
+> **PASSING at full depth all along** (16/16, arena 26.9 GB); its result was being *eaten by the
+> harness*. `logmsg()` writes only to `ds4f_ep_rank00.txt`, **which the next run truncates**, so the
+> benchmark's step [2/4] destroyed step [1/4]'s verdict; and the gate exits before generating tokens,
+> so the gen wrapper returns `rc=1` + "no gen_ids produced", which is indistinguishable from a crash.
+> Both are fixed (durable verdict file + meaningful exit code). **Never read a result out of a file
+> the next run rewrites** — and don't diagnose an OOM without looking at what was actually allocated
+> (`ds4f_alloc_prefill_batch` at `m_tile=8` is a few MB, which refuted the theory on inspection).
+
 ### ✅ Batched SERVE gated end-to-end (2026-07-13) — `gate_serve_12n.sh`
 
 The serve loop was the last consumer of `ds4f_forward_verify` still taken on faith ("same forward, so
