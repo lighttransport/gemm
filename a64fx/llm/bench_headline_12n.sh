@@ -48,15 +48,16 @@ say "cfg: dense=$DS4F_DENSE experts=$DS4F_EXPERTS TP_ATTN=$DS4F_TP_ATTN CMP_LOCA
 
 # ---- 1. CORRECTNESS GATE first. A fast wrong number is worth nothing (see the DB_BENCH lesson). ----
 say ""; say "--- [1/4] VERIFY_GATE: forward_verify == forward_token? (must be 16/16) ---"
-# The gate's result is printed by logmsg(), which writes to ds4f_ep_rank00.txt -- NOT to stdout.
-# Grab it BEFORE the next run, which overwrites that file. (Cost me a whole benchmark pass.)
-# rc=1 from the gen wrapper is EXPECTED here: the gate exits before producing gen ids.
-rm -f ds4f_ep_rank00.txt
-DS4F_GEN_SENTINEL=/tmp/hl_vg_s.txt DS4F_GEN_LOG=/tmp/hl_vg.txt \
-  PROMPT_FILE="$PF" MAX_NEW=4 DS4F_VERIFY_GATE=1 DS4F_VG_NTOK=16 \
-  ./run_ds4fbase_gen_12n.sh > /dev/null 2>&1 || true
-grep -hE "match, common prefix|token :|verify:" ds4f_ep_rank00.txt 2>/dev/null | tail -3 | sed 's/^/  /' | tee -a "$OUT"
-cp -f ds4f_ep_rank00.txt "$LLM_DIR/bench_headline_gate_rank00.txt" 2>/dev/null || true
+# gate_verify_12n.sh writes a DURABLE verdict (ds4f_verify_gate.txt) and exits 0/3. The earlier
+# version of this step grepped ds4f_ep_rank00.txt, which step [2/4] then truncated -- so the gate's
+# PASS vanished and looked like a crash. Never read a result out of a file the next run rewrites.
+if ./gate_verify_12n.sh > /tmp/hl_vg.txt 2>&1; then
+    grep -hE "match, common prefix" /tmp/hl_vg.txt | sed 's/^/  /' | tee -a "$OUT"
+else
+    say "  !! VERIFY_GATE DID NOT PASS -- every number below is suspect. Stopping."
+    grep -hE "match, common prefix|NO VERDICT" /tmp/hl_vg.txt | sed 's/^/  /' | tee -a "$OUT"
+    exit 3
+fi
 cleanup
 
 # ---- 2+3. decode + prefill, one gen run (both reported per-phase), gated on the completion ----

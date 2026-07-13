@@ -1319,19 +1319,40 @@ int main(int argc,char**argv){
                 else { int ot[1]; ds4f_forward_verify(m, xb, 1, n_prompt + t, ot, hcb); cur = ot[0]; }
             }
         }
+        int match = 0, pfx = 0;
+        for (int t = 0; t < ND; t++) if (A[t] == B[t]) match++;
+        while (pfx < ND && A[pfx] == B[pfx]) pfx++;
+        const char *verdict = match == ND ? "PASS"
+                            : (pfx >= ND/2 ? "reassoc-tail?" : "FAIL (verify forward is WRONG)");
         if (MyRank == 0) {
-            int match = 0, pfx = 0; for (int t = 0; t < ND; t++) if (A[t] == B[t]) match++;
-            while (pfx < ND && A[pfx] == B[pfx]) pfx++;
             logmsg("VERIFY_GATE (forward_token vs forward_verify K=1, IDENTICAL prefill): "
-                   "%d/%d match, common prefix %d -> %s\n", match, ND, pfx,
-                   match == ND ? "PASS" : (pfx >= ND/2 ? "reassoc-tail?" : "FAIL (verify forward is WRONG)"));
+                   "%d/%d match, common prefix %d -> %s\n", match, ND, pfx, verdict);
             char b[512]; int n = 0; n += snprintf(b+n, sizeof b-n, "  token : ");
             for (int t = 0; t < ND && t < 12; t++) n += snprintf(b+n, sizeof b-n, "%d ", A[t]);
             n += snprintf(b+n, sizeof b-n, "\n  verify: ");
             for (int t = 0; t < ND && t < 12; t++) n += snprintf(b+n, sizeof b-n, "%d ", B[t]);
             logmsg("%s\n", b);
+            /* DURABLE VERDICT. logmsg() writes only to ds4f_ep_rank00.txt, which the NEXT run
+             * truncates -- so a benchmark that runs the gate and then anything else destroys the
+             * gate's own result (that happened, and the gate's PASS looked like a silent crash).
+             * Write the verdict somewhere nothing else clobbers, and print it to stdout too. */
+            const char *vf = getenv("DS4F_VERIFY_GATE_OUT");
+            char vpath[1024];
+            snprintf(vpath, sizeof vpath, "%s", (vf && *vf) ? vf : "ds4f_verify_gate.txt");
+            FILE *f = fopen(vpath, "w");
+            if (f) {
+                fprintf(f, "%d/%d match, common prefix %d -> %s\n", match, ND, pfx, verdict);
+                fprintf(f, "token : "); for (int t = 0; t < ND; t++) fprintf(f, "%d ", A[t]);
+                fprintf(f, "\nverify: "); for (int t = 0; t < ND; t++) fprintf(f, "%d ", B[t]);
+                fprintf(f, "\n"); fclose(f);
+            }
+            printf("VERIFY_GATE: %d/%d match, common prefix %d -> %s\n", match, ND, pfx, verdict);
+            fflush(stdout);
         }
-        barrier(); exit(0);
+        /* Exit code carries the verdict. The gate deliberately produces no gen ids, so the gen
+         * wrapper reports rc=1 + "no gen_ids produced" -- which is indistinguishable from a crash.
+         * Every rank computed A/B in lockstep, so each can decide for itself. 0 = PASS. */
+        barrier(); exit(match == ND ? 0 : 3);
     }
 
     /* Stage-A self-test (post-barrier so every rank's comm is live): verify
