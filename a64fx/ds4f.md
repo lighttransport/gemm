@@ -10,8 +10,14 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 
 | model | experts | single-stream | batched (aggregate) | prefill | arena |
 |---|---|---|---|---|---|
-| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **22.45 tok/s** | **35.4 @ M=16** (M=32 OOMs) | **28.3 tok/s** (`PREFILL_GEMM`, K=32/128) | 27.4 GB |
+| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **23.03 tok/s** | **35.4 @ M=16** (M=32 OOMs) | **36.1 tok/s** (`PREFILL_GEMM`, K=32) | 27.4 GB |
 | ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | 18.98 tok/s | 32.8 @ M=32 / 31.0 @ M=16 | — | 18.9 GB |
+
+**★ ALWAYS state the context a decode number was measured at.** The base row is a **real 70-token
+prompt** (job 49556601, one allocation, all four numbers comparable). The old "22.45 tok/s" headline
+was measured at the run script's **default synthetic prefill of 8 tokens** and did NOT survive a real
+prompt (it read 17.08 there) — until the indexer-scan bug below was fixed. A bare tok/s figure with
+no stated context is not a fact about this model.
 
 **The base model is FASTER than Flash** — its fp8 experts convert to the fast int8-sdot kernel
 while Flash's fp4 does not. Cumulative on base: 11.34 → **22.45 tok/s (2.0×)**.
@@ -2753,6 +2759,49 @@ Chasing K past 32 buys 4 points for 4× the chunk. **Default: `DS4F_PREFILL_GEMM
 (Note this is *not* the same lesson as decode's `comm ≈ 3 × expert_time`. In decode, comm is the MoE
 straggler and dominates. In prefill, K tokens of work per reduce already amortize it — so prefill is
 compute-bound where decode is straggler-bound, and the two respond to completely different levers.)
+
+## 🔴 THE INDEXER SCAN WAS SERIAL AND SCALAR BELOW T=64 (fixed 2026-07-13) — decode +35%
+
+Trying to reproduce the 22.45 headline on ONE allocation (the "never compare across allocations"
+rule) turned up something better than a doc fix. 22.45 reproduced **exactly** — 22.48 tok/s, tb2prep
+8.358 ms — but only at `DS4F_PREFILL=8`, the run script's **default synthetic prefill**. On a real
+70-token prompt the same config read **17.08**. So I swept context, and the curve is **not monotonic**:
+
+| ctx | decode | tb2scan | |
+|---|---|---|---|
+| 8 | 22.50 tok/s | 2.73 ms | |
+| **64** | **18.07** | **12.80 ms** | ← worst |
+| 256 | 22.94 | **0.24 ms** | ← 4× the work of ctx=64, in 1/53rd the time |
+| 1024 | 22.41 | ~0.3 ms | |
+
+**ctx=256 doing 4× more scan work 53× faster is not a cost curve — it is a bug.** `ds4f_index_score`
+dispatched the pooled SVE scan only at `T >= 64` compressed tokens and otherwise fell through to a
+**scalar, SINGLE-THREADED** triple loop — ~5.6M scalar MACs on one core, summed over 43 layers. With
+the Tier-B2 compressor's ratio-4 stride, `T ≈ ctx/4`, so the slow path covered **ctx < ~256: every
+short prompt a chat or serving workload actually sends.** Decomposition proved it — `tb2scan` was the
+only term moving; `tb2lcmp`/`tb2icmp`/`tb2topk` were flat to the millisecond across all four contexts.
+
+**Fix:** `DS4F_IDX_SCAN_MIN` (default **8**, was a hardcoded 64). The pooled workers already handle
+any `T` — they split `T` across threads — so the threshold was the whole bug.
+
+| | decode | prefill | tb2scan |
+|---|---|---|---|
+| `SCAN_MIN=64` (old), real 70-tok prompt | 17.08 tok/s | 30.68 | 15.31 ms |
+| **`SCAN_MIN=8` (new), real 70-tok prompt** | **23.03 (+35%)** | **36.14 (+18%)** | **0.175 ms (−99%)** |
+| `SCAN_MIN=64`, synthetic ctx=64 | 18.18 | — | 12.79 |
+| **`SCAN_MIN=8`, synthetic ctx=64** | **23.54 (+29%)** | — | **0.162** |
+
+**Gated:** completions are **character-identical** across the A/B (same quicksort). The SVE path
+reassociates the dot products vs the scalar loop, so this could have shifted top-k selection near
+ties — it did not. Prefill gains too, because the indexer scan runs there as well.
+
+The dip is gone: decode is now flat ~23 tok/s from ctx=64 to 1024, and the real-prompt number
+(**23.03**) finally *exceeds* the old synthetic-ctx=8 headline (22.45) instead of collapsing below it.
+
+**Lesson: a default that "works" can still be measuring the wrong regime.** The `T >= 64` guard was
+presumably there to dodge pool overhead at tiny T. It was never re-measured, and the fallback it
+guarded was so much worse that it lost by 79× in the band that matters. The synthetic default
+(`DS4F_PREFILL=8`) then hid the whole thing, because it sits *below* the bad band.
 
 ### ⚠️ Build trap: `make` alone silently builds the WRONG binary
 

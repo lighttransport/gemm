@@ -146,6 +146,17 @@ export DS4F_PREFILL_K=${DS4F_PREFILL_K:-32}
 #   + DS4F_CMP_LOCAL=1                     compute 44.3 ms   (tb2prep 12.4 -> 8.3, BIT-EXACT)
 #   + DS4F_HC_SVE=1                        compute 36.6 ms   (mhc_pre 10.2 -> 2.4)   = -24%
 #
+# !! THOSE NUMBERS ARE AT ctx=8 -- this script's DEFAULT synthetic prefill -- and that is NOT a
+# representative context. Decode tok/s is a function of context, and NOT monotonically:
+#     ctx     8: 22.50 tok/s   (tb2scan  2.73 ms)
+#     ctx    64: 18.07 tok/s   (tb2scan 12.80 ms)   <- WORST: serial scalar indexer scan
+#     ctx   256: 22.94 tok/s   (tb2scan  0.24 ms)   <- pooled SVE scan: 4x work, 1/53 the time
+#     ctx  1024: 22.41 tok/s
+# The dip was a real BUG (fixed 2026-07-13): ds4f_index_score fell back to a scalar SINGLE-THREADED
+# loop for T < 64 compressed tokens (~ctx < 256) -- i.e. for every short prompt a chat/serving
+# workload actually has. See DS4F_IDX_SCAN_MIN in common/ds4f_impl.h. ALWAYS state the context a
+# decode number was measured at; a bare "22.45 tok/s" is not a fact about the model.
+#
 # CMP_LOCAL is BIT-EXACT (reader-local page placement only) -> ON by default below.
 # HC_SVE is a REASSOCIATION-class lever (SVE half-row hcmix): NOT bit-exact, ids diverge from
 # the baseline trajectory. Validated coherent on base (12n gen: valid quicksort, NaN=0, 12/12

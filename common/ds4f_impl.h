@@ -1564,9 +1564,24 @@ static double ds4f_g_tb2topk = 0.0;               /* index_topk top-k selection 
  * only this many slots, not full nslot -- cutting it ~2,688 B/pos -> 0 (the idx memory lever:
  * slope 5.93 -> ~3.9 KB/pos, ctx ceiling ~1.12M -> ~1.7M). Keep in sync with that branch. */
 #define DS4F_IDX_F32_SLOTS 64
+/* DS4F_IDX_SCAN_MIN: T below which we fall back to the scalar serial loop below.
+ * It used to be a hardcoded 64, and that was a PERFORMANCE BUG for every short context.
+ * The fallback is scalar AND single-threaded, so it loses catastrophically long before T=64:
+ * summed over 43 layers it is ~5.6M scalar MACs on ONE core. Measured (base 12n, 2026-07-13):
+ *
+ *   ctx    T~ctx/4   tb2scan    decode
+ *     8       2       2.73 ms   22.50 tok/s
+ *    64      16      12.80 ms   18.07 tok/s   <- serial scalar fallback, the worst case
+ *   256      64       0.24 ms   22.94 tok/s   <- pooled SVE path: 4x the work, 1/53rd the time
+ *  1024     256       ~0.3 ms   22.41 tok/s
+ *
+ * i.e. the SLOW path was being used for exactly the contexts a chat/serving workload actually
+ * has. Default 8 now; the pooled workers handle any T (they split T across threads). */
 static void ds4f_index_score(const float *q, const float *kvc, const float *weights,
                              int H, int hd, int T, float *score, ds4f_pool *pool) {
-    if (pool && T >= 64) {
+    static int scanmin = -1;
+    if (scanmin < 0) { const char *e = getenv("DS4F_IDX_SCAN_MIN"); scanmin = e ? atoi(e) : 8; }
+    if (pool && T >= scanmin) {
         static int idxg = -1;   /* DS4F_IDX_GEMM: 8-index-head-blocked scan (ILP + fewer kt loads) */
         if (idxg < 0) { const char *e = getenv("DS4F_IDX_GEMM"); idxg = e ? atoi(e) : 1; }
         ds4f_idxsc_task tk = { q, kvc, weights, H, hd, T, score };
