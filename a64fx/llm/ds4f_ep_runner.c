@@ -1283,10 +1283,13 @@ int main(int argc,char**argv){
     /* ---- DS4F_VERIFY_GATE: is ds4f_forward_verify (the batched / serve forward) numerically
      * EQUIVALENT to ds4f_forward_token (the gated single-stream matvec forward)?
      *
-     * WHY THIS EXISTS: DS4F_PREFILL_GEMM corrupts the output (error compounds with prompt length)
-     * AND the batched serve loop returns garbage for a real prompt even with PREFILL_GEMM=0. Both
-     * misuse ds4f_forward_verify. DS4F_DB_BENCH only TIMES steps -- it never inspects what it
-     * generated -- which is how this stayed hidden while we quoted 35.4 tok/s of "throughput".
+     * WHY THIS EXISTS: it caught a real one. Every batched path (PREFILL_GEMM, decode-batch,
+     * batched serve) silently produced GARBAGE because ds4f_forward_verify fed p_o1 column 0 to a
+     * wo_b that DS4F_TP_WOB had COLUMN-sharded (fixed 2026-07-12, ds4f_impl.h; must be p_o1+oi0).
+     * Single-stream decode was fine throughout, because it is a different function.
+     * DS4F_DB_BENCH only TIMES steps -- it never inspects what it generated -- which is how this
+     * stayed hidden while we quoted 35.4 tok/s of "throughput". KEEP THIS GATE GREEN (16/16):
+     * anything touching forward_verify, the TP shards, or the serve loops must re-run it.
      *
      * The test isolates the forward function and nothing else: BOTH arms prefill the same prompt
      * through the KNOWN-GOOD ds4f_forward_token path (so caches/Tier-B2 state are built identically),

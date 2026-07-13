@@ -6,7 +6,7 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 
 ---
 
-## ★ CURRENT STATE — decode, 12 nodes (2026-07-12)
+## ★ CURRENT STATE — decode, 12 nodes (2026-07-13)
 
 | model | experts | single-stream | batched (aggregate) | arena |
 |---|---|---|---|---|
@@ -15,6 +15,12 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 
 **The base model is FASTER than Flash** — its fp8 experts convert to the fast int8-sdot kernel
 while Flash's fp4 does not. Cumulative on base: 11.34 → **22.45 tok/s (2.0×)**.
+
+**All of these are output-gated.** Single-stream and token-at-a-time prefill on coherent completions;
+everything batched (decode, `PREFILL_GEMM`, and the serve loops) on `DS4F_VERIFY_GATE=1` at 16/16 plus
+`gate_serve_12n.sh` returning coherent completions for two concurrent real prompts. That qualifier is
+load-bearing: until 2026-07-12 every batched number here was **garbage produced at full speed** (see
+the `forward_verify` × `TP_WOB` fix at the end of this file).
 
 ```sh
 # ONE TIME (survives allocations; ~50 min): kernel-ready weights -> ~/models/<model>-fast/
@@ -2674,7 +2680,7 @@ Both arms prefill the same prompt through the known-good `ds4f_forward_token`, t
 |---|---|---|
 | `DS4F_PREFILL_GEMM=1` prefill | garbage | **coherent**, 19.84 → **30.11 tok/s (+52%)** |
 | batched decode (M=16) | garbage | **coherent path**, 35.5 tok/s |
-| batched serve / dynbatch | garbage | fixed (same forward) |
+| batched serve / dynbatch | garbage | **coherent** — measured, see gate below |
 | single-stream decode | fine | unchanged (22.45) |
 
 **Batched throughput was never wrong in MAGNITUDE — it was computing the wrong answer at that speed.**
@@ -2684,3 +2690,35 @@ The numbers now stand: base **22.45 tok/s single-stream / 35.5 batched @M=16**, 
 TP shards, or the serve loops must keep it at 16/16 (or a long common prefix + reassoc tail).
 Lesson: `DB_BENCH` only TIMES steps — a throughput benchmark that never inspects its output will
 happily report 35 tok/s of garbage.
+
+### ✅ Batched SERVE gated end-to-end (2026-07-13) — `gate_serve_12n.sh`
+
+The serve loop was the last consumer of `ds4f_forward_verify` still taken on faith ("same forward, so
+it must be fixed"). That is an inference, not a measurement, and this file has already been burned
+once by exactly that kind of reasoning. So: gate it.
+
+`a64fx/llm/gate_serve_12n.sh` brings the **dynbatch** loop up on 12n (`DS4F_SERVE=1
+DS4F_SERVE_BATCH=2 DS4F_SERVE_DYNAMIC=1`), submits **two concurrent real prompts**, and decodes the
+responses back to text. Post-fix, both come back coherent:
+
+| req | prompt (tail) | completion |
+|---|---|---|
+| 0 | `…the capital city of Japan is` | **` Tokyo.`** then base-model repetition |
+| 1 | `def fibonacci(n): … return` | **` fibonacci(n-1) + fibonacci(n-2)`** |
+
+Before the fix this same path emitted `"Ф.m 15.(D.T..: https://g en:03."`. **The batched serve path is
+now correct**, and the 35.5 tok/s @M=16 is deliverable serving capacity rather than an upper bound on
+a broken path.
+
+Two harness notes baked into the script:
+- It uses the **dynamic** loop deliberately. The static loop's `reqseq` counter (`"0\n"` → `"1\n"`,
+  same size) is never revalidated by the compute node's FS cache, so rank 0 never sees the request.
+  The dynbatch loop probes `<base>.q.<id>` **existence**, which does invalidate.
+- The queue lives on the **shared FS** (`$HOME`), not `/tmp` or `/local` — rank 0 is on another node.
+
+### ⚠️ Build trap: `make` alone silently builds the WRONG binary
+
+GNU make has a built-in `CC = cc`, and the Makefile's `CC ?= fcc` does **not** override a built-in
+default. So a bare `make ds4f_ep_runner` compiles with gcc, misses the `fcc` branch's
+`-march=armv8.2-a+sve`, and dies on `arm_sve.h: No such file or directory` — or worse, for targets
+that don't need SVE, quietly produces a `-O2` non-SVE binary. **Always `make CC=fcc`.**
