@@ -5739,7 +5739,19 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
             ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
         }
-        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);   /* p_o = PARTIAL if tpo */
+        /* wo_b input offset — THE BUG (fixed 2026-07-12): under DS4F_TP_WOB, wo_b is COLUMN-sharded
+         * (cols == oi_rows), so it must contract this rank's OWNED o_inter slice, which lives at
+         * p_o1[.. oi0 ..]. Passing p_o1 (column 0) made the GEMM read the zero-padded columns of some
+         * OTHER rank's slice -> p_o garbage. ds4f_forward_token has always done this (see its
+         * `s_o1 + (wo_b.cols < o_inter ? oi0 : 0)`); forward_verify did not.
+         *
+         * This single line is why EVERYTHING through forward_verify was broken -- batched decode,
+         * batched serve, and DS4F_PREFILL_GEMM -- while single-stream decode was fine. TP_WOB is ON by
+         * default in run_ds4fbase_12n.sh, so every batched path silently produced garbage.
+         * Xstride stays o_inter (p_o1's row pitch); only the column origin moves. Replicated wo_b
+         * (no TP_WOB, or pftp's compute-shard of a replicated wo_a) keeps offset 0. */
+        int wob_shard = (ly->wo_b.cols < c->o_inter);
+        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1 + (wob_shard ? oi0 : 0), K, C, c->o_inter);  /* PARTIAL if tpo */
         VTOC(DS4F_P_OPROJ); VTIC();
         if (tpo && m->ar_cb) m->ar_cb(m->p_o, C*K, m->ar_ctx);        /* sum partials -> full attn out */
         VTOC(DS4F_P_COMM); VTIC();

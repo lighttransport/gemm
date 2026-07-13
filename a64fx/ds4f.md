@@ -2631,3 +2631,56 @@ It diverges at the first decode step against a pre-built cache, so suspect its h
 EXISTING cache at `pos0 > 0` — the K-position loop over window/sparse attention, the KV/compressor
 write offsets, or the Tier-B2 index/top-k selection. `DS4F_VERIFY_GATE=1` is now the regression test:
 it must reach `16/16 match` (or a long common prefix with only a reassoc tail).
+
+## ✅ FIXED (2026-07-12): `forward_verify` ignored the `TP_WOB` column shard — ONE LINE
+
+**The bug.** `ds4f_forward_verify`'s o-projection:
+
+```c
+ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);   /* WRONG */
+```
+
+Under `DS4F_TP_WOB`, `wo_b` is COLUMN-sharded (`cols == oi_rows`), so the GEMM contracts `oi_rows`
+values starting at **column 0** of `p_o1` — but the values this rank actually computed live at
+`[oi0, oi0+oi_rows)`. It read the zero-padded columns belonging to some *other* rank's slice, so
+`p_o` was garbage. `ds4f_forward_token` always did this right
+(`s_o1 + (wo_b.cols < o_inter ? oi0 : 0)`); verify never learned about the shard.
+
+```c
+int wob_shard = (ly->wo_b.cols < c->o_inter);
+ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1 + (wob_shard ? oi0 : 0), K, C, c->o_inter);   /* FIXED */
+```
+
+`TP_WOB` is **ON by default** in `run_ds4fbase_12n.sh`, so every batched path silently produced
+garbage while single-stream decode (a different function) was perfectly fine.
+
+### Bisect (`DS4F_VERIFY_GATE=1`, base 12n)
+
+Both arms prefill the same prompt through the known-good `ds4f_forward_token`, then decode 16 tokens
+— arm A `forward_token`, arm B `forward_verify(K=1)`. Isolates the forward and nothing else.
+
+| TP config | before fix | after fix |
+|---|---|---|
+| all TP off | 16/16 PASS | 16/16 PASS |
+| +`TP_HEAD` +`TP_EMBED` | 16/16 PASS | — |
+| +`TP_SHARED` | 16/16 PASS | — |
+| +`TP_OPROJ` (no WOB) | 14/16 (reassoc tail) | 14/16 |
+| **+`TP_OPROJ` +`TP_WOB`** | **2/16 FAIL** | **14/16** |
+| **full production stack, 43 layers** | **2/16 FAIL** | **16/16 PASS (byte-identical)** |
+
+### Everything it un-breaks
+
+| | before | after |
+|---|---|---|
+| `DS4F_PREFILL_GEMM=1` prefill | garbage | **coherent**, 19.84 → **30.11 tok/s (+52%)** |
+| batched decode (M=16) | garbage | **coherent path**, 35.5 tok/s |
+| batched serve / dynbatch | garbage | fixed (same forward) |
+| single-stream decode | fine | unchanged (22.45) |
+
+**Batched throughput was never wrong in MAGNITUDE — it was computing the wrong answer at that speed.**
+The numbers now stand: base **22.45 tok/s single-stream / 35.5 batched @M=16**, prefill **30.11**.
+
+**`DS4F_VERIFY_GATE=1` is the permanent regression test.** Any change touching `forward_verify`, the
+TP shards, or the serve loops must keep it at 16/16 (or a long common prefix + reassoc tail).
+Lesson: `DB_BENCH` only TIMES steps — a throughput benchmark that never inspects its output will
+happily report 35 tok/s of garbage.
