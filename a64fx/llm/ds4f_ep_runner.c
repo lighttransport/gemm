@@ -146,7 +146,7 @@ static int ds4f_sample_logits(float *lg, int V, const ds4f_sampler *sp, uint64_t
         return best;
     }
     static int *idx = NULL; static float *prob = NULL;      /* scratch, sized once to vocab */
-    if (!idx) { idx = (int *)malloc((size_t)V * sizeof(int)); prob = (float *)malloc((size_t)V * sizeof(float)); }
+    if (!idx) { idx = (int *)ds4f_xmalloc((size_t)V * sizeof(int), "idx"); prob = (float *)ds4f_xmalloc((size_t)V * sizeof(float), "prob"); }
     /* repeat + presence penalty over the last rep_last_n tokens (once per unique token) */
     if (sp->rep_pen != 1.f || sp->pres_pen != 0.f) {
         int ln = sp->rep_last_n > 0 ? sp->rep_last_n : 64;
@@ -210,7 +210,7 @@ static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, f
     if (pf_gemm && !m->has_mtp) {                       /* batched-verify prefill */
         ds4f_alloc_prefill_batch(m, K);
         size_t hcC = (size_t)m->cfg.hc_mult * C;
-        float *Xin = (float *)aligned_alloc(64, (size_t)K*C*4), *vhc = (float *)aligned_alloc(64, (size_t)K*hcC*4);
+        float *Xin = (float *)ds4f_xalloc(64, (size_t)K*C*4, "Xin"), *vhc = (float *)ds4f_xalloc(64, (size_t)K*hcC*4, "vhc");
         int lastM = 0;
         for (int base = pf_from; base < np; base += K) {
             int M = np - base < K ? np - base : K; lastM = M;
@@ -227,7 +227,7 @@ static int ds4f_serve_gen(ds4f_model *m, const int *pids, int np, int max_new, f
         for (int p = pf_from; p < np; p++) { embed_lookup(m, pids[p], x); pf_last = ds4f_forward_token(m, x, p); }
         have_logits = 1;
     }
-    int *hist = (int *)malloc((size_t)(np + max_new) * sizeof(int));   /* penalty history: prompt + gen */
+    int *hist = (int *)ds4f_xmalloc((size_t)(np + max_new) * sizeof(int), "hist");   /* penalty history: prompt + gen */
     memcpy(hist, pids, (size_t)np * sizeof(int)); int nh = np;
     int n_gen = 0, cur = (sampling && have_logits) ? ds4f_sample(m, sp, hist, nh) : pf_last;
     for (int g = 0; g < max_new; g++) {
@@ -264,19 +264,19 @@ static void ds4f_serve_batch_loop(ds4f_model *m, int B, int maxpos,
     ds4f_alloc_prefill_batch(m, mtile);
     ds4f_alloc_decode_batch(m, B);           /* B persistent bundles; bundle i = &bundles[i*L] */
     ds4f_lseq *bundles = m->dec_batch_seq;
-    ds4f_lseq *view = (ds4f_lseq *)malloc((size_t)B * L * sizeof(ds4f_lseq));
-    int   *vpos = (int *)malloc((size_t)B * sizeof(int));
+    ds4f_lseq *view = (ds4f_lseq *)ds4f_xmalloc((size_t)B * L * sizeof(ds4f_lseq), "view");
+    int   *vpos = (int *)ds4f_xmalloc((size_t)B * sizeof(int), "vpos");
     /* Xb/hcb feed forward_verify with up to max(B, prefill-chunk K) rows -> size to mtile, not B. */
-    float *Xb   = (float *)aligned_alloc(64, (size_t)mtile * Cc * 4);
-    float *hcb  = (float *)aligned_alloc(64, (size_t)mtile * hcC * 4);
-    int   *otb  = (int *)malloc((size_t)mtile * sizeof(int));
-    int   *Xin  = (int *)malloc((size_t)maxpos * sizeof(int));
+    float *Xb   = (float *)ds4f_xalloc(64, (size_t)mtile * Cc * 4, "Xb");
+    float *hcb  = (float *)ds4f_xalloc(64, (size_t)mtile * hcC * 4, "hcb");
+    int   *otb  = (int *)ds4f_xmalloc((size_t)mtile * sizeof(int), "otb");
+    int   *Xin  = (int *)ds4f_xmalloc((size_t)maxpos * sizeof(int), "Xin");
     typedef struct { int *ids; int nids, np, pos, mnew, active;
                      ds4f_sampler samp; uint64_t rng; int samples; } bseq;
-    bseq *S = (bseq *)calloc((size_t)B, sizeof(bseq));
+    bseq *S = (bseq *)ds4f_xcalloc((size_t)B, sizeof(bseq), "S");
     long req_ctr = 0;   /* monotonic per-request counter (identical across ranks) -> default seed source */
-    for (int i = 0; i < B; i++) S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
-    float *xscr = (float *)aligned_alloc(64, (size_t)Cc * 4);   /* per-token embed scratch */
+    for (int i = 0; i < B; i++) S[i].ids = (int *)ds4f_xmalloc((size_t)(maxpos + 1) * sizeof(int), "ids");
+    float *xscr = (float *)ds4f_xalloc(64, (size_t)Cc * 4, "xscr");   /* per-token embed scratch */
     long last_seq = ds4f_read_seq(reqseqf);
     if (MyRank == 0) logmsg("SERVE-BATCH ready: B=%d maxpos=%d prefill_gemm=%d K=%d\n", B, maxpos, pf_gemm, K);
     for (;;) {
@@ -514,11 +514,11 @@ static int ds4f_sock_take(ds4f_sock *S, char *out, int outcap) {
 /* send a framed response on conn i, then close it (one request per connection). */
 static void ds4f_sock_respond(ds4f_sock *S, int i, const int *g, int ng) {
     if (i < 0 || S->conns[i].fd <= 0) return;
-    char *body = (char *)malloc((size_t)ng * 12 + 2); int bl = 0;
+    char *body = (char *)ds4f_xmalloc((size_t)ng * 12 + 2, "body"); int bl = 0;
     for (int k = 0; k < ng; k++) bl += sprintf(body + bl, "%d%s", g[k], k+1<ng?" ":"");
     body[bl++] = '\n';
     uint32_t nl = htonl((uint32_t)bl);
-    unsigned char *frame = (unsigned char *)malloc(4 + bl);
+    unsigned char *frame = (unsigned char *)ds4f_xmalloc(4 + bl, "frame");
     memcpy(frame, &nl, 4); memcpy(frame + 4, body, bl);
     int off = 0, tot = 4 + bl, fd = S->conns[i].fd;
     while (off < tot) { ssize_t w = send(fd, frame + off, tot - off, 0);
@@ -545,28 +545,28 @@ static void ds4f_serve_dynbatch_loop(ds4f_model *m, int B, int maxpos, const cha
     ds4f_alloc_prefill_batch(m, mtile);
     ds4f_alloc_decode_batch(m, B);
     ds4f_lseq *bundles = m->dec_batch_seq;
-    ds4f_lseq *view = (ds4f_lseq *)malloc((size_t)B * L * sizeof(ds4f_lseq));
-    int   *vpos = (int *)malloc((size_t)B * sizeof(int));
-    float *Xb   = (float *)aligned_alloc(64, (size_t)mtile * Cc * 4);
-    float *hcb  = (float *)aligned_alloc(64, (size_t)mtile * hcC * 4);
-    int   *otb  = (int *)malloc((size_t)mtile * sizeof(int));
+    ds4f_lseq *view = (ds4f_lseq *)ds4f_xmalloc((size_t)B * L * sizeof(ds4f_lseq), "view");
+    int   *vpos = (int *)ds4f_xmalloc((size_t)B * sizeof(int), "vpos");
+    float *Xb   = (float *)ds4f_xalloc(64, (size_t)mtile * Cc * 4, "Xb");
+    float *hcb  = (float *)ds4f_xalloc(64, (size_t)mtile * hcC * 4, "hcb");
+    int   *otb  = (int *)ds4f_xmalloc((size_t)mtile * sizeof(int), "otb");
     /* admission broadcast buffer: [ok,mnew,np, temp,top_p,top_k,seed,rep_pen,pres_pen, ids...] -- rank 0
      * reads the fresh q.<id> file and BROADCASTS it so every rank admits an identical request (payload AND
      * sampling params). Cross-node FS-cache skew must never make ranks disagree on the collective's M
      * (that deadlocks the prefill/decode all-reduce) NOR on the per-seq sampler/seed (that would make ranks
      * draw different tokens -> lockstep divergence). */
     const int HDR = 9;
-    float *admit_bc = (float *)aligned_alloc(64, ((size_t)maxpos + HDR + 1) * sizeof(float));
+    float *admit_bc = (float *)ds4f_xalloc(64, ((size_t)maxpos + HDR + 1) * sizeof(float), "admit_bc");
     typedef struct { int *ids; int nids, np, pos, mnew, active; long id;
                      ds4f_sampler samp; uint64_t rng; int samples; int cfd; } dseq;
-    dseq *S = (dseq *)calloc((size_t)B, sizeof(dseq));
-    for (int i = 0; i < B; i++) { S[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int)); S[i].cfd = -1; }
+    dseq *S = (dseq *)ds4f_xcalloc((size_t)B, sizeof(dseq), "S");
+    for (int i = 0; i < B; i++) { S[i].ids = (int *)ds4f_xmalloc((size_t)(maxpos + 1) * sizeof(int), "ids"); S[i].cfd = -1; }
     char base[1024]; int rl = (int)strlen(reqf); if (rl > 4) rl -= 4;   /* strip ".req" */
     snprintf(base, sizeof base, "%.*s", rl, reqf);
     /* socket transport (rank 0 only): TCP listener over the Tofu IP, published to <base>.sock. Requests
      * arrive on sockets instead of q.<id> files (no cross-node FS-cache admission latency). */
     int sock_mode = envi("DS4F_SERVE_SOCK", 0);
-    ds4f_sock sock; char *sockpb = (char *)malloc((size_t)maxpos * 8 + 64);
+    ds4f_sock sock; char *sockpb = (char *)ds4f_xmalloc((size_t)maxpos * 8 + 64, "sockpb");
     if (sock_mode && MyRank == 0) { if (ds4f_sock_init(&sock, base) != 0) { logmsg("DS4F_SERVE_SOCK: listener init failed -> file mode\n"); sock_mode = 0; } }
     char qheadf[1088]; snprintf(qheadf, sizeof qheadf, "%s.qhead", base);
     if (MyRank == 0) {   /* ensure qhead exists BEFORE the first read -- else the node-local FS caches a
@@ -736,7 +736,7 @@ static uint32_t ds4f_ctx_cfg_hash(ds4f_model *m) {
 }
 static int ds4f_ctx_write_file(ds4f_model *m, const char *path, const int *ids, int npos) {
     size_t sz; ds4f_ctx_snap(m, NULL, npos, 0, &sz);
-    char *buf = (char *)malloc(sz); if (!buf) return -1;
+    char *buf = (char *)ds4f_xmalloc(sz, "buf"); if (!buf) return -1;
     ds4f_ctx_snap(m, buf, npos, 0, NULL);
     char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb"); if (!f) { free(buf); return -1; }
@@ -755,7 +755,7 @@ static int ds4f_ctx_read_file(ds4f_model *m, const char *path, int *ids, int *ou
     if (npos > maxpos || hdr[2] != ds4f_ctx_cfg_hash(m)) { fclose(f); return -3; }  /* wrong ctx-cache config */
     if (fread(ids, sizeof(int), npos, f) != (size_t)npos) { fclose(f); return -1; }
     size_t sz; ds4f_ctx_snap(m, NULL, npos, 0, &sz);
-    char *buf = (char *)malloc(sz); if (!buf) { fclose(f); return -1; }
+    char *buf = (char *)ds4f_xmalloc(sz, "buf");   /* ds4f_xmalloc aborts on OOM; no NULL check needed */
     if (fread(buf, 1, sz, f) != sz) { free(buf); fclose(f); return -1; }
     ds4f_ctx_snap(m, buf, npos, 1, NULL);           /* restore into the (replicated) caches */
     free(buf); fclose(f); *out_npos = npos; return 0;
@@ -994,7 +994,10 @@ static void ds4f_crash_handler(int sig) {
 
 int main(int argc,char**argv){
     ds4f_cli(argc,argv);
-    if (envi("DS4F_BACKTRACE", 0)) {
+    /* ON BY DEFAULT (DS4F_BACKTRACE=0 to disable). Costs nothing until something crashes, and turns
+     * the launcher's useless "PLE 0610 ... (rank=6)(sig=11)" into a named frame. Finding that
+     * ds4f_pf_qnr_worker -> ds4f_rope_apply was the fault took a whole session WITHOUT this. */
+    if (envi("DS4F_BACKTRACE", 1)) {
         /* SIGALTSTACK is REQUIRED here, not optional. The first attempt at this handler produced
          * eleven 0-byte crash files: the handler was entered but died before its first write(). That
          * is the signature of a STACK OVERFLOW -- the handler runs on the very stack that just
@@ -1036,7 +1039,7 @@ int main(int argc,char**argv){
     if (gen_mode) {
         FILE *pfh = fopen(prompt_ids_file, "r");
         if (!pfh) die("cannot open DS4F_PROMPT_IDS file", -1);
-        int cap = 1024; prompt_ids = (int *)malloc((size_t)cap*sizeof(int));
+        int cap = 1024; prompt_ids = (int *)ds4f_xmalloc((size_t)cap*sizeof(int), "cap");
         int v;
         while (fscanf(pfh, "%d", &v) == 1) {
             if (n_prompt >= cap) { cap *= 2; prompt_ids = (int *)realloc(prompt_ids, (size_t)cap*sizeof(int)); }
@@ -1066,12 +1069,37 @@ int main(int argc,char**argv){
     for (int r = 0; r < N; r++) if (memcmp(topo[r], my_coords, TOFU_NCOORDS) == 0) MyRank = r;
     if (MyRank == -1) { fprintf(stderr, "my coords not in %s\n", topo_path()); exit(1); }
 
-    /* FJ mpiexec drops per-rank stderr -> capture to a file so diagnostics survive */
-    {   char en[64]; snprintf(en, sizeof en, "ds4f_ep_stderr_rank%02d.txt", MyRank);
-        if (!freopen(en, "w", stderr)) { /* keep going */ }
+    ds4f_set_rank(MyRank);   /* so library ds4f_fatal()/OOM messages can name the rank */
+
+    /* ---------------- DURABLE PER-RUN LOGS ----------------
+     * mpiexec does not forward rank stdout/stderr, so these files ARE the diagnostics. They used to
+     * be written to the CWD with fopen(...,"w") -- which means THE NEXT RUN TRUNCATES THEM. That is
+     * not a theoretical hazard: it destroyed a VERIFY_GATE verdict mid-benchmark (step [2] wiped
+     * step [1]'s result) and made a PASSING gate look like a silent crash. And only rank 0 got a
+     * log at all, so every other rank's logmsg() went nowhere.
+     *
+     * Now: $DS4F_LOG_DIR/run-<jobid>-<pid>/rank<NN>.{log,err}, one per rank, plus a `latest`
+     * symlink for the wrappers. Nothing is ever overwritten. */
+    {
+        const char *ldir = getenv("DS4F_LOG_DIR"); if (!ldir || !*ldir) ldir = "logs";
+        const char *jid  = getenv("PJM_JOBID");    if (!jid  || !*jid)  jid  = "nojob";
+        static char rundir[512];
+        snprintf(rundir, sizeof rundir, "%s/run-%s-%d", ldir, jid, (int)getppid());
+        mkdir(ldir, 0755);                       /* ignore EEXIST */
+        mkdir(rundir, 0755);
+        char en[640], lg[640];
+        snprintf(en, sizeof en, "%s/rank%02d.err", rundir, MyRank);
+        snprintf(lg, sizeof lg, "%s/rank%02d.log", rundir, MyRank);
+        if (!freopen(en, "w", stderr)) { /* keep going: better to run than to die over a log */ }
         setvbuf(stderr, NULL, _IOLBF, 0);
+        g_log = fopen(lg, "w");                  /* EVERY rank gets a log, not just rank 0 */
+        if (MyRank == 0) {                       /* logs/latest -> this run, for the wrappers */
+            char link[600]; snprintf(link, sizeof link, "%s/latest", ldir);
+            unlink(link);
+            char target[520]; snprintf(target, sizeof target, "run-%s-%d", jid, (int)getppid());
+            if (symlink(target, link) != 0) { /* non-fatal */ }
+        }
     }
-    if (MyRank == 0) g_log = fopen("ds4f_ep_rank00.txt", "w");
 
     int ep_rank = MyRank, ep_size = N;
     ds4f_config cfg = ds4f_config_from_env();
@@ -1133,11 +1161,57 @@ int main(int argc,char**argv){
      * Else synthetic fill. Loader forces dense=FP8 (ignores the synth dense knobs). */
     int real_weights = envi("DS4F_REAL", 0);
     const char *blob_dir = getenv("DS4F_STAGE_DIR");
+
+    /* ---------------- PRE-FLIGHT: fail in SECONDS, not after a 4-minute load ----------------
+     * Every check here fired for real during development and cost far more than it should have:
+     *
+     *  - Missing stage. /local is node-local and is WIPED on every job restart, so the single most
+     *    common failure is "the blob is gone". The loader already reports it, but only after the
+     *    run has burned minutes -- and the message lands in a per-rank file the wrappers were not
+     *    reading, which is how a wiped stage looked like a mysterious 3-second death.
+     *  - Arena will not fit. Reported AFTER the weight load, i.e. after the expensive part.
+     *  - EXACT=0 with a batched path. The batched forward always applies RoPE, but the RoPE tables
+     *    are only built when exact is on -> NULL deref in a pool worker, reported as a bare sig=11.
+     *    (ds4f_forward_verify now guards this too; catching it here names it before anything runs.) */
+    {
+        if (real_weights) {
+            const char *bd = blob_dir && *blob_dir ? blob_dir : "/local/ds4f";
+            char mp[1100];
+            snprintf(mp, sizeof mp, "%s/rank%02d.manifest", bd, ep_rank);
+            FILE *pf = fopen(mp, "r");
+            if (!pf) ds4f_fatal("no staged weights: cannot open %s\n"
+                                "       /local is node-local and is WIPED on every job restart.\n"
+                                "       Re-run the stager (run_ds4f*_stage_*.sh) before this job.", mp);
+            fclose(pf);
+        }
+        /* Any path that drives ds4f_forward_verify needs the RoPE tables, which need EXACT. */
+        int batched = envi("DS4F_PREFILL_GEMM", 0) || envi("DS4F_DB_BENCH", 0)
+                   || envi("DS4F_DECODE_BATCH", 0) || envi("DS4F_VERIFY_GATE", 0)
+                   || (envi("DS4F_SERVE", 0) && envi("DS4F_SERVE_BATCH", 1) > 1);
+        /* mirror ds4f_load's logic: TIERB2 and INT8_KV both force exact on (ds4f_impl.h:2415,2419) */
+        int will_be_exact = envi("DS4F_EXACT", 0) || envi("DS4F_TIERB2", 0) || envi("DS4F_INT8_KV", 0);
+        if (batched && !will_be_exact)
+            ds4f_fatal("a batched path is enabled (PREFILL_GEMM/DB_BENCH/DECODE_BATCH/VERIFY_GATE/"
+                       "SERVE_BATCH) but DS4F_EXACT=0.\n"
+                       "       The batched forward always applies RoPE, and the RoPE tables are only\n"
+                       "       built when exact is on -> it would segfault in a pool worker.\n"
+                       "       Set DS4F_EXACT=1 (and DS4F_TIERB2=1 DS4F_MHC=1 for the real model).");
+        double need_gb = ds4f_arena_size(&cfg, ep_rank, ep_size, DS4F_FP8, 0) / 1073741824.0;
+        double avail   = ds4f_mem_avail_gb();
+        if (avail > 0 && need_gb > avail)
+            ds4f_fatal("the arena will not fit: needs ~%.2f GB, node has %.2f GB available.\n"
+                       "       Lower DS4F_MAXPOS, enable the dense TP stack, or use more nodes.",
+                       need_gb, avail);
+        if (MyRank == 0)
+            logmsg("preflight OK: stage present, arena ~%.2f GB vs %.2f GB available, exact=%d\n",
+                   need_gb, avail, will_be_exact);
+    }
+
     double ta0 = now_sec();
     ds4f_model *m = real_weights
         ? ds4f_load_real(cfg, ep_rank, ep_size, blob_dir, n_threads, n_cmgs)
         : ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
-    if (!m) { fprintf(stderr, "rank %d: model alloc/load failed\n", MyRank); exit(1); }
+    if (!m) ds4f_fatal("model alloc/load failed (see the lines above for the reason)");
     if (MyRank == 0 && m->tierb2) {
         int ncsa = 0, nhca = 0;
         for (int L = 0; L < cfg.n_layers; L++) {
@@ -1266,10 +1340,10 @@ int main(int argc,char**argv){
     if (envi("DS4F_DB_BENCH", 0) > 0) {
         int C = m->cfg.hidden, hc = m->cfg.hc_mult, ND = envi("DS4F_DB_NTOK", 32), maxM = envi("DS4F_DB_MAXM", 16);
         int Ms[6] = {1, 2, 4, 8, 16, 32}, nM = 0; while (nM < 6 && Ms[nM] <= maxM) nM++;
-        float *Xb  = (float *)aligned_alloc(64, (size_t)maxM*C*4);
-        float *hcb = (float *)aligned_alloc(64, (size_t)maxM*(size_t)hc*C*4);
-        int *cur = (int *)malloc((size_t)maxM*sizeof(int)), *pos = (int *)malloc((size_t)maxM*sizeof(int));
-        int *ot  = (int *)malloc((size_t)maxM*sizeof(int));
+        float *Xb  = (float *)ds4f_xalloc(64, (size_t)maxM*C*4, "Xb");
+        float *hcb = (float *)ds4f_xalloc(64, (size_t)maxM*(size_t)hc*C*4, "hcb");
+        int *cur = (int *)ds4f_xmalloc((size_t)maxM*sizeof(int), "cur"), *pos = (int *)ds4f_xmalloc((size_t)maxM*sizeof(int), "pos");
+        int *ot  = (int *)ds4f_xmalloc((size_t)maxM*sizeof(int), "ot");
         if (MyRank == 0) logmsg("DECODE_BATCH throughput sweep (ND=%d steps/M):\n", ND);
         /* DS4F_TRACE=1: append a checkpoint per step to $HOME. When a multi-node run dies with a bare
          * "sig=11" and the crash handler itself cannot run (stack overflow -> 0-byte crash files),
@@ -1316,8 +1390,8 @@ int main(int argc,char**argv){
     if (envi("DS4F_DECODE_BATCH", 0) > 0) {
         int C = m->cfg.hidden, hc = m->cfg.hc_mult, ND = envi("DS4F_DB_NTOK", 16); if (ND > 64) ND = 64;
         int seedA = envi("DS4F_DB_SEEDA", 100), seedB = envi("DS4F_DB_SEEDB", 5000);
-        float *Xb  = (float *)aligned_alloc(64, (size_t)2*C*4);
-        float *hcb = (float *)aligned_alloc(64, (size_t)2*(size_t)hc*C*4);
+        float *Xb  = (float *)ds4f_xalloc(64, (size_t)2*C*4, "Xb");
+        float *hcb = (float *)ds4f_xalloc(64, (size_t)2*(size_t)hc*C*4, "hcb");
         int aSolo[64], aBatch[64];
         ds4f_serve_reset(m); m->dec_batch_seq = NULL; m->dec_batch_pos = NULL; m->dec_nseq = 0;   /* seqA solo */
         { int cur = seedA;
@@ -1362,8 +1436,8 @@ int main(int argc,char**argv){
         int Cc = m->cfg.hidden, hcm = m->cfg.hc_mult; size_t hcC = (size_t)hcm * Cc;
         int ND = envi("DS4F_VG_NTOK", 16); if (ND > 64) ND = 64;
         ds4f_alloc_prefill_batch(m, 8);      /* sizes m->v_* / m_tile: forward_verify SEGVs without it */
-        float *xb  = (float *)aligned_alloc(64, (size_t)Cc * 4);
-        float *hcb = (float *)aligned_alloc(64, hcC * 4);
+        float *xb  = (float *)ds4f_xalloc(64, (size_t)Cc * 4, "xb");
+        float *hcb = (float *)ds4f_xalloc(64, hcC * 4, "hcb");
         int A[64], B[64];
         for (int arm = 0; arm < 2; arm++) {
             ds4f_serve_reset(m); m->dec_batch_seq = NULL; m->dec_batch_pos = NULL; m->dec_nseq = 0;
@@ -1434,7 +1508,7 @@ int main(int argc,char**argv){
     }
 
     int C = cfg.hidden;
-    float *x = (float *)aligned_alloc(256, (size_t)C * 4);
+    float *x = (float *)ds4f_xalloc(256, (size_t)C * 4, "x");
 
     /* ---- HTTP serve loop: load once, then loop on requests from the (python) frontend via shared-FS
      * files. Rank 0 polls a request-seq counter; a barrier releases all ranks together; all read the
@@ -1453,9 +1527,9 @@ int main(int argc,char**argv){
                 ds4f_serve_batch_loop(m, serve_batch, maxpos, reqf, respf, reqseqf, respseqf);
             /* never returns */
         }
-        int *pids = (int *)malloc((size_t)maxpos * sizeof(int));
-        int *oids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
-        int *fids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));   /* scratch for disk load */
+        int *pids = (int *)ds4f_xmalloc((size_t)maxpos * sizeof(int), "pids");
+        int *oids = (int *)ds4f_xmalloc((size_t)(maxpos + 1) * sizeof(int), "oids");
+        int *fids = (int *)ds4f_xmalloc((size_t)(maxpos + 1) * sizeof(int), "fids");   /* scratch for disk load */
         /* prefix cache (context management): each slot's ids[0,len) is the token sequence held in the
          * KV/compressor caches. A request whose prompt EXTENDS its slot's sequence skips re-prefilling
          * the shared prefix and continues from len (the multi-turn TTFT win). Divergence -> full reset. */
@@ -1465,8 +1539,8 @@ int main(int argc,char**argv){
          * restoring the new slot's snapshot (ds4f_ctx_snap). Each slot keeps its own token sequence. */
         int nslots = envi("DS4F_SERVE_SLOTS", 1); if (nslots < 1) nslots = 1; if (nslots > 64) nslots = 64;
         typedef struct { char *snap; int *ids; int len; int used; } serve_slot;
-        serve_slot *slots = (serve_slot *)calloc((size_t)nslots, sizeof(serve_slot));
-        for (int i = 0; i < nslots; i++) slots[i].ids = (int *)malloc((size_t)(maxpos + 1) * sizeof(int));
+        serve_slot *slots = (serve_slot *)ds4f_xcalloc((size_t)nslots, sizeof(serve_slot), "slots");
+        for (int i = 0; i < nslots; i++) slots[i].ids = (int *)ds4f_xmalloc((size_t)(maxpos + 1) * sizeof(int), "ids");
         int live = 0;
         /* system-prompt cache: preload a persisted context into slot 0 so every conversation starts with
          * it already prefilled (instant TTFT, survives restarts). Build it once with a ctl=save request. */
@@ -1582,13 +1656,13 @@ int main(int argc,char**argv){
     int nan_count = 0; double xnorm = 0.0; int pf_last_tok = -1;
     int mtp_on = gen_mode && m->has_mtp;   /* DS4F_MTP self-spec: maintain MTP KV (prefill+decode) + measure accept rate */
     int spec_on = mtp_on && envi("DS4F_SPEC", 0);   /* DS4F_SPEC: gamma=1 speculative decode loop */
-    float *xe = mtp_on ? (float *)aligned_alloc(64, (size_t)C * 4) : NULL;
+    float *xe = mtp_on ? (float *)ds4f_xalloc(64, (size_t)C * 4, "xe") : NULL;
     int mtp_prev_draft = -1, mtp_hits = 0, mtp_total = 0;
     sm_state = 0xD5F00D;   /* SAME seed on every rank -> replicated dense + valid all-reduce */
     if (prefill_batch > 0 && prefill > 0) {
         ds4f_alloc_prefill_batch(m, ar_mtile);
-        float *X  = (float *)aligned_alloc(256, (size_t)ar_mtile * C * 4);
-        int   *bt = (int *)malloc((size_t)ar_mtile * sizeof(int));
+        float *X  = (float *)ds4f_xalloc(256, (size_t)ar_mtile * C * 4, "X");
+        int   *bt = (int *)ds4f_xmalloc((size_t)ar_mtile * sizeof(int), "bt");
         for (int base = 0; base < prefill; base += ar_mtile) {
             int M = prefill - base < ar_mtile ? prefill - base : ar_mtile;
             for (int mm = 0; mm < M; mm++)
@@ -1621,8 +1695,8 @@ int main(int argc,char**argv){
             int K = envi("DS4F_PREFILL_K", 32); if (K < 1) K = 1; if (K > 128) K = 128;   /* verify path caps at 128 */
             ds4f_alloc_prefill_batch(m, K);
             size_t hcC = (size_t)m->cfg.hc_mult * C;
-            float *Xin = (float *)aligned_alloc(64, (size_t)K * C * 4);
-            float *vhc = (float *)aligned_alloc(64, (size_t)K * hcC * 4);
+            float *Xin = (float *)ds4f_xalloc(64, (size_t)K * C * 4, "Xin");
+            float *vhc = (float *)ds4f_xalloc(64, (size_t)K * hcC * 4, "vhc");
             int Mlast = 1;
             for (int base = 0; base < prefill; base += K) {
                 int M = prefill - base < K ? prefill - base : K; Mlast = M;
@@ -1708,10 +1782,10 @@ int main(int argc,char**argv){
          * tokens; on reject restore the compressor state + the saved hidden, redo pos+2 next step. */
         size_t hcf = (size_t)m->cfg.hc_mult * C, hcb = hcf * 4;
         int spec_batch = envi("DS4F_SPEC_BATCH", 0);   /* 1: BATCHED verify (M2b, COHERENT, the speedup) */
-        gen_ids = (int *)malloc((size_t)(max_new + 2) * sizeof(int));
-        char *snap = (char *)malloc(ds4f_tb2_snap_bytes(m));
-        float *hc_save = (float *)aligned_alloc(64, hcb), *Xin = NULL, *vhc = NULL;
-        if (spec_batch) { ds4f_alloc_prefill_batch(m, 2); Xin = (float *)aligned_alloc(64,(size_t)2*C*4); vhc = (float *)aligned_alloc(64, 2*hcb); }
+        gen_ids = (int *)ds4f_xmalloc((size_t)(max_new + 2) * sizeof(int), "s");
+        char *snap = (char *)ds4f_xmalloc(ds4f_tb2_snap_bytes(m), "snap");
+        float *hc_save = (float *)ds4f_xalloc(64, hcb, "hc_save"), *Xin = NULL, *vhc = NULL;
+        if (spec_batch) { ds4f_alloc_prefill_batch(m, 2); Xin = (float *)ds4f_xalloc(64,(size_t)2*C*4, "Xin"); vhc = (float *)ds4f_xalloc(64, 2*hcb, "vhc"); }
         int pos = dec_base - 1, t_next = pf_last_tok, dec_steps = 0, accepts = 0, rejects = 0;
         while (n_gen < max_new) {
             gen_ids[n_gen++] = t_next;
@@ -1752,7 +1826,7 @@ int main(int argc,char**argv){
         /* greedy: pf_last_tok is the prompt's first prediction (token at pos
          * dec_base). Feed it back, argmax->embed->next, until eos or max_new.
          * forward(x,pos) places `cur` at `pos` and predicts pos+1. */
-        gen_ids = (int *)malloc((size_t)(max_new + 1) * sizeof(int));
+        gen_ids = (int *)ds4f_xmalloc((size_t)(max_new + 1) * sizeof(int), "s");
         int gemm_decode = envi("DS4F_GEMM_DECODE", 0);   /* run each position through verify(K=1) -- the GEMM-path
                                                           * decode that the batched spec verify is token-identical to */
         if (gemm_decode) ds4f_alloc_prefill_batch(m, 2);

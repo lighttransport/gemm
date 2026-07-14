@@ -3,6 +3,72 @@
  * #included at the end of ds4f.h after all public types are defined.
  * Do not #include this directly — include "ds4f.h". */
 
+/* ===================== FATAL PATH + CHECKED ALLOCATION =====================
+ *
+ * WHY THIS EXISTS. Two failure modes cost this project days:
+ *
+ *  1. OOM presented as SIGSEGV. Nearly every allocation here was
+ *     `aligned_alloc(...)` followed immediately by a write. aligned_alloc returns NULL on
+ *     exhaustion, so an out-of-memory condition became a NULL dereference -- reported by the MPI
+ *     launcher as a bare `PLE 0610 ... (rank=6)(sig=11)`, indistinguishable from a memory-safety
+ *     bug, on whichever rank happened to have the least headroom. Days were spent chasing a
+ *     "segfault" that was simply "this does not fit".
+ *
+ *  2. Errors with no rank and no context. 37 bare abort()s and 60 raw fprintf(stderr)s, none of
+ *     which said WHICH rank died or what the node's memory looked like at the time.
+ *
+ * The rule: an inference engine cannot continue without its weights, so recovery is meaningless.
+ * The deliverable of a failure is a DIAGNOSIS. Fail fast, say exactly what could not be had, and
+ * say it somewhere that survives. */
+
+#include <stdarg.h>
+
+static double ds4f_mem_avail_gb(void);      /* defined below; used by the fatal path */
+
+/* Set once by the runner (ds4f_ep_runner.c) so library errors can name the rank. -1 = unknown
+ * (single-node tools and kernel tests link this header too). */
+static int ds4f_rank = -1;
+static inline void ds4f_set_rank(int r) { ds4f_rank = r; }
+
+/* Rank-tagged fatal. stderr is freopen'd to a per-rank file by the runner, so this DOES survive --
+ * that is the channel to look in when a run "dies silently". */
+static void ds4f_fatal(const char *fmt, ...) {
+    char msg[1024];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    double avail = ds4f_mem_avail_gb();
+    fprintf(stderr, "\n[ds4f rank %d] FATAL: %s\n", ds4f_rank, msg);
+    if (avail >= 0) fprintf(stderr, "[ds4f rank %d]        node MemAvailable = %.2f GB\n", ds4f_rank, avail);
+    fflush(stderr);
+    abort();
+}
+
+/* Running total of everything we have handed out, so an OOM message can say how far we got. */
+static size_t ds4f_alloc_total = 0;
+
+static void *ds4f_xalloc(size_t align, size_t sz, const char *what) {
+    void *p = ds4f_xalloc(align, sz, "p");
+    if (!p) ds4f_fatal("out of memory allocating %s (%.1f MB); %.2f GB allocated so far",
+                       what, sz / 1048576.0, ds4f_alloc_total / 1073741824.0);
+    ds4f_alloc_total += sz;
+    return p;
+}
+static void *ds4f_xmalloc(size_t sz, const char *what) {
+    void *p = ds4f_xmalloc(sz, "p");
+    if (!p) ds4f_fatal("out of memory allocating %s (%.1f MB); %.2f GB allocated so far",
+                       what, sz / 1048576.0, ds4f_alloc_total / 1073741824.0);
+    ds4f_alloc_total += sz;
+    return p;
+}
+static void *ds4f_xcalloc(size_t n, size_t sz, const char *what) {
+    void *p = ds4f_xcalloc(n, sz, "p");
+    if (!p) ds4f_fatal("out of memory allocating %s (%zu x %.1f MB); %.2f GB allocated so far",
+                       what, n, sz / 1048576.0, ds4f_alloc_total / 1073741824.0);
+    ds4f_alloc_total += n * sz;
+    return p;
+}
+
 /* DS4F_FLAGBAR: per-worker completion flag on its own cache line (kills the 47-way
  * fetch_add contention of the centralized `done` counter; main spins on distinct lines). */
 typedef struct { _Atomic int v; char pad[64 - sizeof(_Atomic int)]; } ds4f_cacheline;
@@ -58,15 +124,15 @@ static void *ds4f_worker(void *v) {
 }
 
 static ds4f_pool *ds4f_pool_start(int nthr, int n_cmgs) {
-    ds4f_pool *p = (ds4f_pool *)calloc(1, sizeof(*p));
+    ds4f_pool *p = (ds4f_pool *)ds4f_xcalloc(1, sizeof(*p), "p");
     p->nthr = nthr; p->n_cmgs = n_cmgs;
     atomic_store(&p->seq, 0); atomic_store(&p->done, 0); atomic_store(&p->stop, 0);
     { const char *e = getenv("DS4F_FLAGBAR"); p->flagbar = e ? atoi(e) : 0; }
-    p->donef = (ds4f_cacheline *)aligned_alloc(64, (size_t)nthr * sizeof(ds4f_cacheline));
+    p->donef = (ds4f_cacheline *)ds4f_xalloc(64, (size_t)nthr * sizeof(ds4f_cacheline), "donef");
     for (int t = 0; t < nthr; t++) atomic_store_explicit(&p->donef[t].v, 0, memory_order_relaxed);
-    p->threads = (pthread_t *)calloc(nthr, sizeof(pthread_t));
+    p->threads = (pthread_t *)ds4f_xcalloc(nthr, sizeof(pthread_t), "threads");
     for (int t = 1; t < nthr; t++) {   /* main thread acts as tid 0 */
-        ds4f_wctx *w = (ds4f_wctx *)malloc(sizeof(*w));
+        ds4f_wctx *w = (ds4f_wctx *)ds4f_xmalloc(sizeof(*w), "w");
         w->p = p; w->tid = t;
         pthread_create(&p->threads[t], NULL, ds4f_worker, w);
     }
@@ -247,8 +313,8 @@ static inline void ds4f_q8_xscratch(int M, int K, int8_t **xq, float **xs) {
     size_t need = (size_t)M * K;
     if (need > ds4f_xq_cap) {
         free(ds4f_xq_buf); free(ds4f_xs_buf);
-        ds4f_xq_buf = (int8_t *)malloc(need);
-        ds4f_xs_buf = (float *)malloc((size_t)M * (K / 64) * sizeof(float));
+        ds4f_xq_buf = (int8_t *)ds4f_xmalloc(need, "f");
+        ds4f_xs_buf = (float *)ds4f_xmalloc((size_t)M * (K / 64) * sizeof(float), "f");
         ds4f_xq_cap = need;
     }
     *xq = ds4f_xq_buf; *xs = ds4f_xs_buf;
@@ -596,8 +662,8 @@ static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *
         size_t need = (size_t)ng * K;
         if (need > ds4f_bdxq_cap) {
             free(ds4f_bdxq); free(ds4f_bdxs);
-            ds4f_bdxq = (int8_t *)malloc(need);
-            ds4f_bdxs = (float *)malloc((size_t)ng * nbq * sizeof(float));
+            ds4f_bdxq = (int8_t *)ds4f_xmalloc(need, "q");
+            ds4f_bdxs = (float *)ds4f_xmalloc((size_t)ng * nbq * sizeof(float), "s");
             ds4f_bdxq_cap = need;
         }
         ds4f_bd_prequant_task P = { xbase, gin, K, g0, ng, ds4f_bdxq, ds4f_bdxs };
@@ -639,7 +705,7 @@ static __thread size_t    ds4f_fp8t_cap = 0;          /* in uint16_t elems */
 static inline uint16_t *ds4f_fp8bf16_tile(size_t need) {
     if (need > ds4f_fp8t_cap) {
         free(ds4f_fp8t_buf);
-        ds4f_fp8t_buf = (uint16_t *)malloc(need * sizeof(uint16_t));
+        ds4f_fp8t_buf = (uint16_t *)ds4f_xmalloc(need * sizeof(uint16_t), "f");
         ds4f_fp8t_cap = need;
     }
     return ds4f_fp8t_buf;
@@ -929,7 +995,7 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
 static int ds4f_gemm_warned = 0;
 static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
                       const float *X, int M, int Ystride, int Xstride) {
-    if (M > DS4F_MAX_MTILE) { fprintf(stderr, "ds4f_gemm: M=%d > DS4F_MAX_MTILE=%d\n", M, DS4F_MAX_MTILE); abort(); }
+    if (M > DS4F_MAX_MTILE) { ds4f_fatal("ds4f_gemm: M=%d > DS4F_MAX_MTILE=%d", M, DS4F_MAX_MTILE); }
     if (t->type == DS4F_BF16_PV || t->type == DS4F_BF16 || t->type == DS4F_MXFP4 ||
         t->type == DS4F_Q8_PV   || t->type == DS4F_FP8) {
         m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols)    /* read once across all M */
@@ -1042,10 +1108,10 @@ static void ds4f_build_freqs(ds4f_model *m) {
     ds4f_config *c = &m->cfg;
     int dim = c->qk_rope_dim, half = dim / 2, P = c->max_pos;
     size_t n = (size_t)P * half;
-    m->rope_dense_cos = (float *)aligned_alloc(64, n * 4);
-    m->rope_dense_sin = (float *)aligned_alloc(64, n * 4);
-    m->rope_comp_cos  = (float *)aligned_alloc(64, n * 4);
-    m->rope_comp_sin  = (float *)aligned_alloc(64, n * 4);
+    m->rope_dense_cos = (float *)ds4f_xalloc(64, n * 4, "rope_dense_cos");
+    m->rope_dense_sin = (float *)ds4f_xalloc(64, n * 4, "rope_dense_sin");
+    m->rope_comp_cos  = (float *)ds4f_xalloc(64, n * 4, "rope_comp_cos");
+    m->rope_comp_sin  = (float *)ds4f_xalloc(64, n * 4, "rope_comp_sin");
     ds4f_rope_table(m->rope_dense_cos, m->rope_dense_sin, dim, P,
                     c->rope_theta, c->rope_factor, c->beta_fast, c->beta_slow, 0);
     ds4f_rope_table(m->rope_comp_cos, m->rope_comp_sin, dim, P,
@@ -1215,8 +1281,8 @@ static void ds4f_compress_prefill(
     int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff * d;
     int cutoff = seqlen - seqlen % ratio, nwin = cutoff / ratio;
     if (nwin <= 0) return;
-    float *kvl = (float *)malloc((size_t)cutoff * W * sizeof(float));
-    float *scl = (float *)malloc((size_t)cutoff * W * sizeof(float));
+    float *kvl = (float *)ds4f_xmalloc((size_t)cutoff * W * sizeof(float), "kvl");
+    float *scl = (float *)ds4f_xmalloc((size_t)cutoff * W * sizeof(float), "scl");
     for (int pos = 0; pos < cutoff; pos++) {                  /* wkv/wgate linear */
         const float *xp = x + (size_t)pos * dim;
         for (int o = 0; o < W; o++) {
@@ -2202,27 +2268,27 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
      * state -> all-NaN cmp_kv from the 3rd compressed block on. Size to hold both. */
     int nsel_cap = np > c->index_topk ? np : c->index_topk;
     /* model-level per-token scratch (allocated once) */
-    m->s_cmp_out   = (float *)aligned_alloc(256, (size_t)KV*4);
-    m->s_idx_q     = (float *)aligned_alloc(256, (size_t)iH*ihd*4);
-    m->s_idx_score = (float *)aligned_alloc(256, (size_t)nsel_cap*4);
-    m->s_tb2_sel   = (int   *)aligned_alloc(256, (size_t)nsel_cap*4);
-    m->s_cmp_gather = (float *)aligned_alloc(256, (size_t)c->index_topk*KV*4);  /* CP: gathered selected cmp latents
+    m->s_cmp_out   = (float *)ds4f_xalloc(256, (size_t)KV*4, "s_cmp_out");
+    m->s_idx_q     = (float *)ds4f_xalloc(256, (size_t)iH*ihd*4, "s_idx_q");
+    m->s_idx_score = (float *)ds4f_xalloc(256, (size_t)nsel_cap*4, "s_idx_score");
+    m->s_tb2_sel   = (int   *)ds4f_xalloc(256, (size_t)nsel_cap*4, "s_tb2_sel");
+    m->s_cmp_gather = (float *)ds4f_xalloc(256, (size_t)c->index_topk*KV*4, "s_cmp_gather");  /* CP: gathered selected cmp latents
         (only ns<=index_topk slots ever written -- must NOT scale with nsel_cap=max(max_pos,topk): 16 GB @ 8M ctx) */
     { int eps = m->ep_size > 0 ? m->ep_size : 1;               /* CP idx-merge candidate gather buffers */
-      m->s_cp_cand_slot  = (float *)aligned_alloc(256, ((size_t)eps*c->index_topk*4 + 255) & ~255ull);
-      m->s_cp_cand_score = (float *)aligned_alloc(256, ((size_t)eps*c->index_topk*4 + 255) & ~255ull); }
+      m->s_cp_cand_slot  = (float *)ds4f_xalloc(256, ((size_t)eps*c->index_topk*4 + 255) & ~255ull, "s_cp_cand_slot");
+      m->s_cp_cand_score = (float *)ds4f_xalloc(256, ((size_t)eps*c->index_topk*4 + 255) & ~255ull, "s_cp_cand_score"); }
     for (int L = 0; L < c->n_layers; L++) {
         int ratio = c->compress_ratios[L];
         if (ratio == 0) continue;
         ds4f_layer *ly = &m->layers[L];
         int overlap = (ratio == 4), coff = overlap ? 2 : 1, W = coff*KV;
         int nslot = np / ratio;
-        ly->cmp_wkv   = (uint16_t *)aligned_alloc(256, (size_t)W*C*2);
-        ly->cmp_wgate = (uint16_t *)aligned_alloc(256, (size_t)W*C*2);
-        ly->cmp_ape   = (float *)aligned_alloc(256, (size_t)ratio*W*4);
-        ly->cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)KV*2 + 63) & ~63u);
-        ly->cmp_kv_state    = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
-        ly->cmp_score_state = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
+        ly->cmp_wkv   = (uint16_t *)ds4f_xalloc(256, (size_t)W*C*2, "cmp_wkv");
+        ly->cmp_wgate = (uint16_t *)ds4f_xalloc(256, (size_t)W*C*2, "cmp_wgate");
+        ly->cmp_ape   = (float *)ds4f_xalloc(256, (size_t)ratio*W*4, "cmp_ape");
+        ly->cmp_norm  = (uint16_t *)ds4f_xalloc(64, ((size_t)KV*2 + 63) & ~63u, "cmp_norm");
+        ly->cmp_kv_state    = (float *)ds4f_xalloc(256, (size_t)coff*ratio*W*4, "cmp_kv_state");
+        ly->cmp_score_state = (float *)ds4f_xalloc(256, (size_t)coff*ratio*W*4, "cmp_score_state");
         if (m->int8_cmp) {       /* int8 compressed-latent store (1/4 the f32 physical) + S5 calbuf/scales */
             int CAL = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64;
             if (CAL > nslot) CAL = nslot > 0 ? nslot : 1;
@@ -2237,18 +2303,18 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
                     ds4f_cp_slot_shard(tail, m->ep_rank, m->ep_size, &t0, &t1);
                     ly->cp_on = 1; ly->cp_t0 = CAL + t0; ly->cp_t1 = CAL + t1; nslot_q = CAL + (t1 - t0);
                 }
-                ly->cmp_q4 = (uint8_t *)aligned_alloc(256, ((size_t)nslot_q*(KV/2) + 255) & ~255ull);
+                ly->cmp_q4 = (uint8_t *)ds4f_xalloc(256, ((size_t)nslot_q*(KV/2) + 255) & ~255ull, "cmp_q4");
                 ly->cp_nslot = nslot_q;   /* cmp_q4 slot capacity (DEBUG bounds guards) */
             } else
-                ly->cmp_q  = (int8_t *)aligned_alloc(256, ((size_t)nslot*KV + 255) & ~255ull);
-            ly->cmp_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
-            ly->cmp_scale  = (float *)aligned_alloc(64, (size_t)KV*4);
-            ly->cmp_iscale = (float *)aligned_alloc(64, (size_t)KV*4);
-            ly->cmp_absmax = (float *)aligned_alloc(64, (size_t)KV*4);
+                ly->cmp_q  = (int8_t *)ds4f_xalloc(256, ((size_t)nslot*KV + 255) & ~255ull, "cmp_q");
+            ly->cmp_calbuf = (uint16_t *)ds4f_xalloc(256, (size_t)CAL*KV*2, "cmp_calbuf");
+            ly->cmp_scale  = (float *)ds4f_xalloc(64, (size_t)KV*4, "cmp_scale");
+            ly->cmp_iscale = (float *)ds4f_xalloc(64, (size_t)KV*4, "cmp_iscale");
+            ly->cmp_absmax = (float *)ds4f_xalloc(64, (size_t)KV*4, "cmp_absmax");
             ly->cmp_caln = 0; ly->cmp_frozen = 0;
             for (int d = 0; d < KV; d++) ly->cmp_absmax[d] = 0.f;
         } else {
-            ly->cmp_kv = (float *)aligned_alloc(256, (size_t)nslot*KV*4);
+            ly->cmp_kv = (float *)ds4f_xalloc(256, (size_t)nslot*KV*4, "cmp_kv");
         }
         ds4f_compress_state_reset(ly->cmp_kv_state, ly->cmp_score_state, ratio, KV);
         if (fill) {
@@ -2259,14 +2325,14 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
         }
         if (ratio == 4) {                                       /* indexer (CSA only) */
             int icoff = 2, iW = icoff*ihd;                      /* index ratio==4 => overlap */
-            ly->idx_wq_b  = (uint16_t *)aligned_alloc(256, (size_t)iH*ihd*qlora*2);
-            ly->idx_wproj = (uint16_t *)aligned_alloc(256, (size_t)iH*C*2);
-            ly->idx_cmp_wkv   = (uint16_t *)aligned_alloc(256, (size_t)iW*C*2);
-            ly->idx_cmp_wgate = (uint16_t *)aligned_alloc(256, (size_t)iW*C*2);
-            ly->idx_cmp_ape   = (float *)aligned_alloc(256, (size_t)ratio*iW*4);
-            ly->idx_cmp_norm  = (uint16_t *)aligned_alloc(64, ((size_t)ihd*2 + 63) & ~63u);
-            ly->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
-            ly->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
+            ly->idx_wq_b  = (uint16_t *)ds4f_xalloc(256, (size_t)iH*ihd*qlora*2, "idx_wq_b");
+            ly->idx_wproj = (uint16_t *)ds4f_xalloc(256, (size_t)iH*C*2, "idx_wproj");
+            ly->idx_cmp_wkv   = (uint16_t *)ds4f_xalloc(256, (size_t)iW*C*2, "idx_cmp_wkv");
+            ly->idx_cmp_wgate = (uint16_t *)ds4f_xalloc(256, (size_t)iW*C*2, "idx_cmp_wgate");
+            ly->idx_cmp_ape   = (float *)ds4f_xalloc(256, (size_t)ratio*iW*4, "idx_cmp_ape");
+            ly->idx_cmp_norm  = (uint16_t *)ds4f_xalloc(64, ((size_t)ihd*2 + 63) & ~63u, "idx_cmp_norm");
+            ly->idx_cmp_kv_state    = (float *)ds4f_xalloc(256, (size_t)icoff*ratio*iW*4, "idx_cmp_kv_state");
+            ly->idx_cmp_score_state = (float *)ds4f_xalloc(256, (size_t)icoff*ratio*iW*4, "idx_cmp_score_state");
             { static int s_i8a = -1, s_i4a = -1;   /* DS4F_IDX_INT8/INT4: int store REPLACES f32 idx_kv */
               if (s_i8a < 0) { const char *e = getenv("DS4F_IDX_INT8"); s_i8a = (e && *e && atoi(e)) ? 1 : 0; }
               if (s_i4a < 0) { const char *e = getenv("DS4F_IDX_INT4"); s_i4a = (e && *e && atoi(e)) ? 1 : 0; }
@@ -2275,7 +2341,7 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
               /* f32 idx_kv: full nslot in f32 mode; only DS4F_IDX_F32_SLOTS slots under int replacement
                * (the f32 scan reads it only for T<that; T>=that uses idx_kv8/idx_kv8_4) -> 2,688 B/pos -> 0. */
               int idxf32 = use_i8 ? (nslot < DS4F_IDX_F32_SLOTS ? nslot : DS4F_IDX_F32_SLOTS) : nslot;
-              ly->idx_kv = (float *)aligned_alloc(256, (size_t)idxf32*ihd*4);
+              ly->idx_kv = (float *)ds4f_xalloc(256, (size_t)idxf32*ihd*4, "idx_kv");
               if (use_i8) {
                 int insl = nslot;   /* DS4F_CP_IDX: slot-shard idx_kv8_4 (per-slot scale, clean [0,nslot) shard, no CAL split) */
                 if (use_i4 && m->cp && ratio == 4 && getenv("DS4F_CP_IDX") && atoi(getenv("DS4F_CP_IDX"))) {
@@ -2283,9 +2349,9 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
                     ly->idx_cp_on = 1; ly->idx_cp_s0 = a0; ly->idx_cp_s1 = a1; insl = a1 - a0;
                 }
                 ly->idx_cp_nslot = insl;
-                if (use_i4) ly->idx_kv8_4 = (uint8_t *)aligned_alloc(256, ((size_t)insl*(ihd/2) + 255) & ~255ull);
-                else        ly->idx_kv8   = (int8_t  *)aligned_alloc(256, ((size_t)nslot*ihd     + 255) & ~255ull);
-                ly->idx_pscale = (float  *)aligned_alloc(256, ((size_t)(use_i4?insl:nslot)*4 + 255) & ~255ull);
+                if (use_i4) ly->idx_kv8_4 = (uint8_t *)ds4f_xalloc(256, ((size_t)insl*(ihd/2) + 255) & ~255ull, "idx_kv8_4");
+                else        ly->idx_kv8   = (int8_t  *)ds4f_xalloc(256, ((size_t)nslot*ihd     + 255) & ~255ull, "idx_kv8");
+                ly->idx_pscale = (float  *)ds4f_xalloc(256, ((size_t)(use_i4?insl:nslot)*4 + 255) & ~255ull, "idx_pscale");
               } else { ly->idx_kv8 = NULL; ly->idx_kv8_4 = NULL; ly->idx_pscale = NULL; } }
             ds4f_compress_state_reset(ly->idx_cmp_kv_state, ly->idx_cmp_score_state, ratio, ihd);
             if (fill) {
@@ -2298,7 +2364,7 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
             }
             /* DS4F_IDX_REUSE: cached selection (pre-allocated, NOT lazy -- the pointer must be stable so
              * ds4f_lseq can swap a per-sequence one in under batched decode). -1 = no valid cache. */
-            ly->sel_cache = (int *)aligned_alloc(64, ((size_t)c->index_topk*4 + 63) & ~63ull);
+            ly->sel_cache = (int *)ds4f_xalloc(64, ((size_t)c->index_topk*4 + 63) & ~63ull, "sel_cache");
             ly->sel_cache_n = 0; ly->sel_cache_pos = -1;
         }
     }
@@ -2306,7 +2372,7 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
 
 static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
                                     int n_threads, int n_cmgs) {
-    ds4f_model *m = (ds4f_model *)calloc(1, sizeof(*m));
+    ds4f_model *m = (ds4f_model *)ds4f_xcalloc(1, sizeof(*m), "m");
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
     ds4f_init_fp8_e4m3_lut(m->fp8_lut);
@@ -2363,7 +2429,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
                                   m->tierb2 && !m->int8_kv);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ|PROT_WRITE,
                                MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
-    if (m->arena == MAP_FAILED) { fprintf(stderr, "mmap %zu failed\n", m->arena_sz); abort(); }
+    if (m->arena == MAP_FAILED) { ds4f_fatal("mmap %zu failed", m->arena_sz); }
     /* CRITICAL for A64FX/Fugaku NUMA: disable transparent huge pages so that
      * the per-thread first-touch below (ds4f_fill, compute-thread == touch-thread)
      * actually places each thread's row block on its own CMG node. With THP on,
@@ -2388,7 +2454,7 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc*4, 64);
         m->hc_head_scale = (float *)ds4f_bump(m, (size_t)4, 64); }
 
-    m->layers = (ds4f_layer *)calloc(cfg.n_layers, sizeof(ds4f_layer));
+    m->layers = (ds4f_layer *)ds4f_xcalloc(cfg.n_layers, sizeof(ds4f_layer), "layers");
     int no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
     for (int L = 0; L < cfg.n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
@@ -2414,10 +2480,10 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
         ly->sh_w3 = ds4f_new_tensor(m, dq, m->sh_rows, C);
         ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter); /* replicated (contracts full shared_inter) */
-        ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
-        ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
-        ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
-        ly->owned_eid = (int *)calloc(no, sizeof(int));
+        ly->ex_w1 = (ds4f_tensor *)ds4f_xcalloc(no, sizeof(ds4f_tensor), "ex_w1");
+        ly->ex_w2 = (ds4f_tensor *)ds4f_xcalloc(no, sizeof(ds4f_tensor), "ex_w2");
+        ly->ex_w3 = (ds4f_tensor *)ds4f_xcalloc(no, sizeof(ds4f_tensor), "ex_w3");
+        ly->owned_eid = (int *)ds4f_xcalloc(no, sizeof(int), "owned_eid");
         ly->n_owned = no;
         int slot = 0;
         ds4f_qtype xq = cfg.expert_qt;   /* MXFP4 (Flash/Pro) | FP8 (base) */
@@ -2477,33 +2543,33 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
 
     /* scratch */
     int H = cfg.n_heads*cfg.q_head_dim;
-    m->s_hn    = (float *)aligned_alloc(256, (size_t)C*4);
-    m->s_qlat  = (float *)aligned_alloc(256, (size_t)cfg.q_lora*4);
-    m->s_q     = (float *)aligned_alloc(256, (size_t)H*4);
-    m->s_kvlat = (float *)aligned_alloc(256, (size_t)cfg.kv_lora*4);
-    m->s_attn  = (float *)aligned_alloc(256, (size_t)H*4);
-    m->s_oin   = (float *)aligned_alloc(256, (size_t)(C > H/cfg.o_groups ? C : H/cfg.o_groups)*4);  /* stand-in needs gin=H/og floats */
-    m->s_o1    = (float *)aligned_alloc(256, (size_t)cfg.o_inter*4);
-    m->s_o     = (float *)aligned_alloc(256, (size_t)C*4);
-    m->s_h2    = (float *)aligned_alloc(256, (size_t)C*4);
-    m->s_router= (float *)aligned_alloc(256, (size_t)cfg.n_experts*4);
-    m->s_shg   = (float *)aligned_alloc(256, (size_t)cfg.shared_inter*4);
-    m->s_shu   = (float *)aligned_alloc(256, (size_t)cfg.shared_inter*4);
-    m->s_exg   = (float *)aligned_alloc(256, (size_t)cfg.moe_inter*4);
-    m->s_exu   = (float *)aligned_alloc(256, (size_t)cfg.moe_inter*4);
-    m->s_moe   = (float *)aligned_alloc(256, (size_t)C*4);
-    m->s_route = (float *)aligned_alloc(256, (size_t)C*4);
-    m->s_logits= (float *)aligned_alloc(256, (size_t)cfg.vocab*4);
+    m->s_hn    = (float *)ds4f_xalloc(256, (size_t)C*4, "s_hn");
+    m->s_qlat  = (float *)ds4f_xalloc(256, (size_t)cfg.q_lora*4, "s_qlat");
+    m->s_q     = (float *)ds4f_xalloc(256, (size_t)H*4, "s_q");
+    m->s_kvlat = (float *)ds4f_xalloc(256, (size_t)cfg.kv_lora*4, "s_kvlat");
+    m->s_attn  = (float *)ds4f_xalloc(256, (size_t)H*4, "s_attn");
+    m->s_oin   = (float *)ds4f_xalloc(256, (size_t)(C > H/cfg.o_groups ? C : H/cfg.o_groups)*4, "s_oin");  /* stand-in needs gin=H/og floats */
+    m->s_o1    = (float *)ds4f_xalloc(256, (size_t)cfg.o_inter*4, "s_o1");
+    m->s_o     = (float *)ds4f_xalloc(256, (size_t)C*4, "s_o");
+    m->s_h2    = (float *)ds4f_xalloc(256, (size_t)C*4, "s_h2");
+    m->s_router= (float *)ds4f_xalloc(256, (size_t)cfg.n_experts*4, "s_router");
+    m->s_shg   = (float *)ds4f_xalloc(256, (size_t)cfg.shared_inter*4, "s_shg");
+    m->s_shu   = (float *)ds4f_xalloc(256, (size_t)cfg.shared_inter*4, "s_shu");
+    m->s_exg   = (float *)ds4f_xalloc(256, (size_t)cfg.moe_inter*4, "s_exg");
+    m->s_exu   = (float *)ds4f_xalloc(256, (size_t)cfg.moe_inter*4, "s_exu");
+    m->s_moe   = (float *)ds4f_xalloc(256, (size_t)C*4, "s_moe");
+    m->s_route = (float *)ds4f_xalloc(256, (size_t)C*4, "s_route");
+    m->s_logits= (float *)ds4f_xalloc(256, (size_t)cfg.vocab*4, "s_logits");
     /* sparse-indexer scratch: block scores reuse as the selected-score buffer,
      * so the per-thread stride must cover both the worst-case block count
      * (ceil(nP/R), R>=1 => up to max_pos) and index_topk selected positions. */
     m->idx_blk_stride = cfg.max_pos > cfg.index_topk ? cfg.max_pos : cfg.index_topk;
-    m->s_idx_scores = (float *)aligned_alloc(256, (size_t)n_threads * m->idx_blk_stride * 4);
-    m->s_idx_sel    = (int   *)aligned_alloc(256, (size_t)n_threads * cfg.index_topk * 4);
+    m->s_idx_scores = (float *)ds4f_xalloc(256, (size_t)n_threads * m->idx_blk_stride * 4, "s_idx_scores");
+    m->s_idx_sel    = (int   *)ds4f_xalloc(256, (size_t)n_threads * cfg.index_topk * 4, "s_idx_sel");
     /* mHC 4-stream scratch (only used when m->mhc) */
-    m->s_x4    = (float *)aligned_alloc(256, (size_t)cfg.hc_mult*C*4);
-    m->s_resid = (float *)aligned_alloc(256, (size_t)cfg.hc_mult*C*4);
-    m->s_xc    = (float *)aligned_alloc(256, (size_t)C*4);
+    m->s_x4    = (float *)ds4f_xalloc(256, (size_t)cfg.hc_mult*C*4, "s_x4");
+    m->s_resid = (float *)ds4f_xalloc(256, (size_t)cfg.hc_mult*C*4, "s_resid");
+    m->s_xc    = (float *)ds4f_xalloc(256, (size_t)C*4, "s_xc");
     ds4f_build_freqs(m);   /* RoPE/YaRN tables (only when exact) */
     if (m->tierb2) ds4f_alloc_tb2(m, 1);   /* off-arena compressor/indexer (synth fill) */
     ds4f_q8_promote_dense(m);   /* DS4F_Q8_DENSE: dense bf16-pv -> int8 W8A8 (no-op if off) */
@@ -2617,7 +2683,7 @@ static int ds4f_blob_open(ds4f_blob *B, const char *dir, int rank) {
     snprintf(bp, sizeof bp, "%s/rank%02d.blob", dir, rank);
     FILE *mf = fopen(mp, "r");
     if (!mf) { fprintf(stderr, "ds4f_load: cannot open %s: %s\n", mp, strerror(errno)); return -1; }
-    B->cap = 8192; B->e = (ds4f_mani_ent *)malloc((size_t)B->cap * sizeof(*B->e)); B->n = 0;
+    B->cap = 8192; B->e = (ds4f_mani_ent *)ds4f_xmalloc((size_t)B->cap * sizeof(*B->e), "cap"); B->n = 0;
     char line[1024];
     while (fgets(line, sizeof line, mf)) {
         if (line[0] == '#') {                    /* header carries rank / ep_size */
@@ -2743,9 +2809,9 @@ static const char *ds4f_qtype_dtstr(ds4f_qtype q) {
 static const ds4f_mani_ent *ds4f_need(const ds4f_blob *B, const char *name,
                                       const char *dtype, size_t nbytes) {
     const ds4f_mani_ent *e = ds4f_mani_find(B, name);
-    if (!e) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", name); abort(); }
+    if (!e) { ds4f_fatal("ds4f_load: MISSING tensor '%s'", name); }
     if (strcmp(e->dtype, dtype) != 0) {
-        fprintf(stderr, "ds4f_load: '%s' dtype %s != expected %s\n", name, e->dtype, dtype); abort(); }
+        ds4f_fatal("ds4f_load: '%s' dtype %s != expected %s", name, e->dtype, dtype); }
     if (e->nbytes != nbytes) {
         fprintf(stderr, "ds4f_load: '%s' nbytes %llu != expected %zu\n",
                 name, (unsigned long long)e->nbytes, nbytes); abort(); }
@@ -2976,16 +3042,16 @@ static void ds4f_load_dense_cshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
                                    const char *base, int c0, int Kfull) {
     char wn[256]; snprintf(wn, sizeof wn, "%s.weight", base);
     const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
-    if (!we) { fprintf(stderr, "cshard: MISSING '%s'\n", wn); abort(); }
+    if (!we) { ds4f_fatal("cshard: MISSING '%s'", wn); }
     int rows = dst->rows, cols = dst->cols;
     {   ds4f_qtype bq;                                      /* BAKED src: col-shard in the final layout */
         if (ds4f_baked_dtype(we->dtype, &bq)) {
-            if (dst->type != bq) { fprintf(stderr, "cshard: '%s' baked %s vs dst %d\n", wn, we->dtype, dst->type); abort(); }
+            if (dst->type != bq) { ds4f_fatal("cshard: '%s' baked %s vs dst %d", wn, we->dtype, dst->type); }
             if (we->nbytes != ds4f_wbytes(bq, rows, Kfull)) {
                 fprintf(stderr, "cshard: baked '%s' nbytes %llu != full %zu\n",
                         wn, (unsigned long long)we->nbytes, ds4f_wbytes(bq, rows, Kfull)); abort(); }
             if ((c0 & 63) || (cols & 63)) {   /* Q8's block and the pv pair-run both need 64-aligned cols */
-                fprintf(stderr, "cshard: baked '%s' c0=%d cols=%d not 64-aligned\n", wn, c0, cols); abort(); }
+                ds4f_fatal("cshard: baked '%s' c0=%d cols=%d not 64-aligned", wn, c0, cols); }
             ds4f_cshard_task T = { (uint8_t *)dst->w, NULL, B->blob + we->off, NULL,
                                    rows, cols, Kfull, c0, bq };
             ds4f_pool_run(m->pool, ds4f_cshard_worker, &T);
@@ -2993,7 +3059,7 @@ static void ds4f_load_dense_cshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
             return;
         }
     }
-    if (strcmp(we->dtype, "F8_E4M3") != 0 || dst->type != DS4F_FP8) { fprintf(stderr, "cshard: FP8 src+dst only\n"); abort(); }
+    if (strcmp(we->dtype, "F8_E4M3") != 0 || dst->type != DS4F_FP8) { ds4f_fatal("cshard: FP8 src+dst only"); }
     int sbcf = (Kfull+127)/128;
     char sn[256]; snprintf(sn, sizeof sn, "%s.scale", base);
     const ds4f_mani_ent *se = ds4f_need(B, sn, "F8_E8M0", (size_t)((rows+127)/128)*sbcf);
@@ -3006,7 +3072,7 @@ static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst,
     char wn[256];
     snprintf(wn, sizeof wn, "%s.weight", base);
     const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
-    if (!we) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", wn); abort(); }
+    if (!we) { ds4f_fatal("ds4f_load: MISSING tensor '%s'", wn); }
     int rows = dst->rows, K = dst->cols;
     {   ds4f_qtype bq;                                       /* BAKED source -> direct copy */
         if (ds4f_baked_dtype(we->dtype, &bq)) {
@@ -3025,7 +3091,7 @@ static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst,
         }
     }
     int src_fp8 = (strcmp(we->dtype, "F8_E4M3") == 0), src_bf16 = (strcmp(we->dtype, "BF16") == 0);
-    if (!src_fp8 && !src_bf16) { fprintf(stderr, "ds4f_load_dense: '%s' src dtype %s unsupported\n", wn, we->dtype); abort(); }
+    if (!src_fp8 && !src_bf16) { ds4f_fatal("ds4f_load_dense: '%s' src dtype %s unsupported", wn, we->dtype); }
     if ((src_fp8 && dst->type == DS4F_FP8) || (src_bf16 && dst->type == DS4F_BF16)) {
         ds4f_load_q(m, B, dst, base); return;                /* no promote: direct copy */
     }
@@ -3033,7 +3099,7 @@ static void ds4f_load_dense(ds4f_model *m, const ds4f_blob *B, ds4f_tensor *dst,
         fprintf(stderr, "ds4f_load_dense: '%s' dest dtype %d unsupported "
                         "(real MXFP4 dense promote is lossy/NYI; use DS4F_FP8_BF16=1)\n", wn, dst->type); abort(); }
     size_t wb = src_fp8 ? ds4f_wbytes(DS4F_FP8, rows, K) : ds4f_wbytes(DS4F_BF16, rows, K);
-    if (we->nbytes != wb) { fprintf(stderr, "ds4f_load_dense: '%s' nbytes %llu != %zu\n", wn, (unsigned long long)we->nbytes, wb); abort(); }
+    if (we->nbytes != wb) { ds4f_fatal("ds4f_load_dense: '%s' nbytes %llu != %zu", wn, (unsigned long long)we->nbytes, wb); }
     const uint8_t *sw = B->blob + we->off, *ss = NULL; size_t sb = 0;
     if (src_fp8) {
         char sn[256]; snprintf(sn, sizeof sn, "%s.scale", base);
@@ -3056,7 +3122,7 @@ static void ds4f_load_dense_vshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
                                    const char *base, int r0, int full_rows) {
     char wn[256]; snprintf(wn, sizeof wn, "%s.weight", base);
     const ds4f_mani_ent *we = ds4f_mani_find(B, wn);
-    if (!we) { fprintf(stderr, "ds4f_load: MISSING tensor '%s'\n", wn); abort(); }
+    if (!we) { ds4f_fatal("ds4f_load: MISSING tensor '%s'", wn); }
     int K = dst->cols;
     {   ds4f_qtype bq;                                       /* BAKED source -> direct sharded copy */
         if (ds4f_baked_dtype(we->dtype, &bq)) {
@@ -3081,11 +3147,11 @@ static void ds4f_load_dense_vshard(ds4f_model *m, const ds4f_blob *B, ds4f_tenso
         }
     }
     int src_fp8 = (strcmp(we->dtype, "F8_E4M3") == 0), src_bf16 = (strcmp(we->dtype, "BF16") == 0);
-    if (!src_fp8 && !src_bf16) { fprintf(stderr, "ds4f_load_dense_vshard: '%s' src %s unsupported\n", wn, we->dtype); abort(); }
+    if (!src_fp8 && !src_bf16) { ds4f_fatal("ds4f_load_dense_vshard: '%s' src %s unsupported", wn, we->dtype); }
     int same = (src_fp8 && dst->type == DS4F_FP8) || (src_bf16 && dst->type == DS4F_BF16);  /* direct copy, no promote */
-    if (!same && dst->type != DS4F_BF16 && dst->type != DS4F_BF16_PV) { fprintf(stderr, "ds4f_load_dense_vshard: dst dtype %d NYI\n", dst->type); abort(); }
+    if (!same && dst->type != DS4F_BF16 && dst->type != DS4F_BF16_PV) { ds4f_fatal("ds4f_load_dense_vshard: dst dtype %d NYI", dst->type); }
     size_t fwb = src_fp8 ? ds4f_wbytes(DS4F_FP8, full_rows, K) : ds4f_wbytes(DS4F_BF16, full_rows, K);
-    if (we->nbytes != fwb) { fprintf(stderr, "ds4f_load_dense_vshard: '%s' nbytes %llu != full %zu\n", wn, (unsigned long long)we->nbytes, fwb); abort(); }
+    if (we->nbytes != fwb) { ds4f_fatal("ds4f_load_dense_vshard: '%s' nbytes %llu != full %zu", wn, (unsigned long long)we->nbytes, fwb); }
     const uint8_t *sw, *ss = NULL;
     if (src_fp8) {
         sw = B->blob + we->off + (size_t)r0 * K;                 /* fp8: 1 byte/elem (r0 128-aligned) */
@@ -3155,7 +3221,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ds4f_blob_close(&B); return NULL;
     }
 
-    ds4f_model *m = (ds4f_model *)calloc(1, sizeof(*m));
+    ds4f_model *m = (ds4f_model *)ds4f_xcalloc(1, sizeof(*m), "m");
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
     /* real dtypes: staged dense = FP8(e4m3fn), experts = MXFP4, router/head/embed/
@@ -3181,7 +3247,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         if (e && *e && strcmp(e, "fp8") != 0) {
             if      (strcmp(e, "q8pv")   == 0) m->dense_qt = DS4F_Q8_PV;
             else if (strcmp(e, "bf16pv") == 0) m->dense_qt = DS4F_BF16_PV;
-            else { fprintf(stderr, "DS4F_DENSE=%s unknown (want fp8|bf16pv|q8pv)\n", e); abort(); }
+            else { ds4f_fatal("DS4F_DENSE=%s unknown (want fp8|bf16pv|q8pv)", e); }
             m->bf16_pv = 1; m->bf16_mv_qt = DS4F_BF16_PV;   /* gate/head keep the fast pv matvec */
             if (m->ep_rank == 0)
                 fprintf(stderr, "[ds4f] DS4F_DENSE=%s: dense loaded from the BAKED blob "
@@ -3217,7 +3283,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
                                   m->tierb2 && !m->int8_kv);
     m->arena = (uint8_t *)mmap(NULL, m->arena_sz, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (m->arena == MAP_FAILED) { fprintf(stderr, "ds4f_load_real: arena mmap %zu failed\n", m->arena_sz); abort(); }
+    if (m->arena == MAP_FAILED) { ds4f_fatal("ds4f_load_real: arena mmap %zu failed", m->arena_sz); }
 #ifdef MADV_NOHUGEPAGE
     madvise(m->arena, m->arena_sz, MADV_NOHUGEPAGE);   /* per-thread first-touch NUMA placement */
 #endif
@@ -3238,7 +3304,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         m->hc_head_base  = (float *)ds4f_bump(m, (size_t)hc * 4, 64);
         m->hc_head_scale = (float *)ds4f_bump(m, (size_t)4, 64); }
 
-    m->layers = (ds4f_layer *)calloc(cfg.n_layers, sizeof(ds4f_layer));
+    m->layers = (ds4f_layer *)ds4f_xcalloc(cfg.n_layers, sizeof(ds4f_layer), "layers");
     int no = ds4f_n_owned(cfg.n_experts, ep_rank, ep_size);
     for (int L = 0; L < cfg.n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
@@ -3263,14 +3329,14 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv */
         /* router selection bias (F32[n_experts]); only non-hash layers have it.
          * Off-arena (tiny, read single-threaded in the exact gate, not a matvec). */
-        if (L >= cfg.n_hash_layers) ly->gate_bias = (float *)aligned_alloc(64, (size_t)cfg.n_experts * 4);
+        if (L >= cfg.n_hash_layers) ly->gate_bias = (float *)ds4f_xalloc(64, (size_t)cfg.n_experts * 4, "gate_bias");
         ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
         ly->sh_w3 = ds4f_new_tensor(m, dq, m->sh_rows, C);
         ly->sh_w2 = ds4f_new_tensor(m, dq, C, cfg.shared_inter); /* replicated (contracts full shared_inter) */
-        ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
-        ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
-        ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
-        ly->owned_eid = (int *)calloc(no, sizeof(int));
+        ly->ex_w1 = (ds4f_tensor *)ds4f_xcalloc(no, sizeof(ds4f_tensor), "ex_w1");
+        ly->ex_w2 = (ds4f_tensor *)ds4f_xcalloc(no, sizeof(ds4f_tensor), "ex_w2");
+        ly->ex_w3 = (ds4f_tensor *)ds4f_xcalloc(no, sizeof(ds4f_tensor), "ex_w3");
+        ly->owned_eid = (int *)ds4f_xcalloc(no, sizeof(int), "owned_eid");
         ly->n_owned = no;
         int slot = 0;
         ds4f_qtype xq = cfg.expert_qt;   /* MXFP4 (Flash/Pro) | FP8 (base) */
@@ -3401,11 +3467,11 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         mt->wo_a=ds4f_new_tensor(m,dq,cfg.o_inter,cfg.n_heads*cfg.q_head_dim/cfg.o_groups); ds4f_load_dense(m,&B,&mt->wo_a,MTPN("attn.wo_a"));
         mt->wo_b=ds4f_new_tensor(m,dq,C2,cfg.o_inter);                       ds4f_load_dense(m,&B,&mt->wo_b,MTPN("attn.wo_b"));
         mt->gate=ds4f_new_tensor(m,m->bf16_mv_qt,cfg.n_experts,C2);          ds4f_load_dense(m,&B,&mt->gate,MTPN("ffn.gate"));
-        mt->gate_bias=(float*)aligned_alloc(64,(size_t)cfg.n_experts*4);     ds4f_load_raw(m,&B,mt->gate_bias,MTPN("ffn.gate.bias"),DS4F_F32,1,cfg.n_experts);
+        mt->gate_bias=(float*)ds4f_xalloc(64,(size_t)cfg.n_experts*4,"mtp.gate_bias");     ds4f_load_raw(m,&B,mt->gate_bias,MTPN("ffn.gate.bias"),DS4F_F32,1,cfg.n_experts);
         /* the MTP ffn has NO shared expert (no mtp.0.ffn.shared_experts.* in the checkpoint) -> sh_w* stay
          * NULL; the block-forward must skip the shared contribution for the MTP layer when wired. */
-        mt->ex_w1=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w2=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor)); mt->ex_w3=(ds4f_tensor*)calloc(no,sizeof(ds4f_tensor));
-        mt->owned_eid=(int*)calloc(no,sizeof(int)); mt->n_owned=no;
+        mt->ex_w1=(ds4f_tensor*)ds4f_xcalloc(no,sizeof(ds4f_tensor),"mtp.ex_w1"); mt->ex_w2=(ds4f_tensor*)ds4f_xcalloc(no,sizeof(ds4f_tensor),"mtp.ex_w2"); mt->ex_w3=(ds4f_tensor*)ds4f_xcalloc(no,sizeof(ds4f_tensor),"mtp.ex_w3");
+        mt->owned_eid=(int*)ds4f_xcalloc(no,sizeof(int), "owned_eid"); mt->n_owned=no;
         ds4f_qtype xqm = cfg.expert_qt;   /* MXFP4 (Flash/Pro) | FP8 (base) */
         { int slot=0; for (int e=0;e<cfg.n_experts;e++) if (e%ep_size==ep_rank) {
             mt->ex_w1[slot]=ds4f_new_tensor(m,xqm,cfg.moe_inter,C2);
@@ -3427,7 +3493,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         { int hd=hc*C2; m->mtp_hc_fn=(float*)ds4f_bump(m,(size_t)hc*hd*4,256); m->mtp_hc_base=(float*)ds4f_bump(m,(size_t)hc*4,64); m->mtp_hc_scale=(float*)ds4f_bump(m,(size_t)4,64);
           ds4f_load_raw(m,&B,m->mtp_hc_fn,MTPN("hc_head_fn"),DS4F_F32,hc,hd); ds4f_load_raw(m,&B,m->mtp_hc_base,MTPN("hc_head_base"),DS4F_F32,1,hc); ds4f_load_raw(m,&B,m->mtp_hc_scale,MTPN("hc_head_scale"),DS4F_F32,1,1); }
         mt->kv_slots = cfg.window_size;   /* MTP: dense window attention -> window-size KV ring */
-        mt->kv_cache = (uint16_t *)aligned_alloc(256, ((size_t)mt->kv_slots*cfg.kv_lora*2 + 255) & ~255ull);
+        mt->kv_cache = (uint16_t *)ds4f_xalloc(256, ((size_t)mt->kv_slots*cfg.kv_lora*2 + 255) & ~255ull, "kv_cache");
         mt->sh_w1.w = mt->sh_w3.w = mt->sh_w2.w = NULL;   /* MTP has no shared expert (gate the shared step on sh_w1.w) */
         m->has_mtp=1;
         #undef MTPN
@@ -3441,29 +3507,29 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
 
     /* ---- scratch (identical to ds4f_alloc_synth) ---- */
     int H = cfg.n_heads * cfg.q_head_dim;
-    m->s_hn    = (float *)aligned_alloc(256, (size_t)C * 4);
-    m->s_qlat  = (float *)aligned_alloc(256, (size_t)cfg.q_lora * 4);
-    m->s_q     = (float *)aligned_alloc(256, (size_t)H * 4);
-    m->s_kvlat = (float *)aligned_alloc(256, (size_t)cfg.kv_lora * 4);
-    m->s_attn  = (float *)aligned_alloc(256, (size_t)H * 4);
-    m->s_oin   = (float *)aligned_alloc(256, (size_t)(C > H/cfg.o_groups ? C : H/cfg.o_groups) * 4);  /* stand-in needs gin=H/og floats */
-    m->s_o1    = (float *)aligned_alloc(256, (size_t)cfg.o_inter * 4);
-    m->s_o     = (float *)aligned_alloc(256, (size_t)C * 4);
-    m->s_h2    = (float *)aligned_alloc(256, (size_t)C * 4);
-    m->s_router= (float *)aligned_alloc(256, (size_t)cfg.n_experts * 4);
-    m->s_shg   = (float *)aligned_alloc(256, (size_t)cfg.shared_inter * 4);
-    m->s_shu   = (float *)aligned_alloc(256, (size_t)cfg.shared_inter * 4);
-    m->s_exg   = (float *)aligned_alloc(256, (size_t)cfg.moe_inter * 4);
-    m->s_exu   = (float *)aligned_alloc(256, (size_t)cfg.moe_inter * 4);
-    m->s_moe   = (float *)aligned_alloc(256, (size_t)C * 4);
-    m->s_route = (float *)aligned_alloc(256, (size_t)C * 4);
-    m->s_logits= (float *)aligned_alloc(256, (size_t)cfg.vocab * 4);
+    m->s_hn    = (float *)ds4f_xalloc(256, (size_t)C * 4, "s_hn");
+    m->s_qlat  = (float *)ds4f_xalloc(256, (size_t)cfg.q_lora * 4, "s_qlat");
+    m->s_q     = (float *)ds4f_xalloc(256, (size_t)H * 4, "s_q");
+    m->s_kvlat = (float *)ds4f_xalloc(256, (size_t)cfg.kv_lora * 4, "s_kvlat");
+    m->s_attn  = (float *)ds4f_xalloc(256, (size_t)H * 4, "s_attn");
+    m->s_oin   = (float *)ds4f_xalloc(256, (size_t)(C > H/cfg.o_groups ? C : H/cfg.o_groups) * 4, "s_oin");  /* stand-in needs gin=H/og floats */
+    m->s_o1    = (float *)ds4f_xalloc(256, (size_t)cfg.o_inter * 4, "s_o1");
+    m->s_o     = (float *)ds4f_xalloc(256, (size_t)C * 4, "s_o");
+    m->s_h2    = (float *)ds4f_xalloc(256, (size_t)C * 4, "s_h2");
+    m->s_router= (float *)ds4f_xalloc(256, (size_t)cfg.n_experts * 4, "s_router");
+    m->s_shg   = (float *)ds4f_xalloc(256, (size_t)cfg.shared_inter * 4, "s_shg");
+    m->s_shu   = (float *)ds4f_xalloc(256, (size_t)cfg.shared_inter * 4, "s_shu");
+    m->s_exg   = (float *)ds4f_xalloc(256, (size_t)cfg.moe_inter * 4, "s_exg");
+    m->s_exu   = (float *)ds4f_xalloc(256, (size_t)cfg.moe_inter * 4, "s_exu");
+    m->s_moe   = (float *)ds4f_xalloc(256, (size_t)C * 4, "s_moe");
+    m->s_route = (float *)ds4f_xalloc(256, (size_t)C * 4, "s_route");
+    m->s_logits= (float *)ds4f_xalloc(256, (size_t)cfg.vocab * 4, "s_logits");
     m->idx_blk_stride = cfg.max_pos > cfg.index_topk ? cfg.max_pos : cfg.index_topk;
-    m->s_idx_scores = (float *)aligned_alloc(256, (size_t)n_threads * m->idx_blk_stride * 4);
-    m->s_idx_sel    = (int   *)aligned_alloc(256, (size_t)n_threads * cfg.index_topk * 4);
-    m->s_x4    = (float *)aligned_alloc(256, (size_t)cfg.hc_mult * C * 4);
-    m->s_resid = (float *)aligned_alloc(256, (size_t)cfg.hc_mult * C * 4);
-    m->s_xc    = (float *)aligned_alloc(256, (size_t)C * 4);
+    m->s_idx_scores = (float *)ds4f_xalloc(256, (size_t)n_threads * m->idx_blk_stride * 4, "s_idx_scores");
+    m->s_idx_sel    = (int   *)ds4f_xalloc(256, (size_t)n_threads * cfg.index_topk * 4, "s_idx_sel");
+    m->s_x4    = (float *)ds4f_xalloc(256, (size_t)cfg.hc_mult * C * 4, "s_x4");
+    m->s_resid = (float *)ds4f_xalloc(256, (size_t)cfg.hc_mult * C * 4, "s_resid");
+    m->s_xc    = (float *)ds4f_xalloc(256, (size_t)C * 4, "s_xc");
 
     double el = ds4f_wall() - t0;
     fprintf(stderr,
@@ -3697,7 +3763,7 @@ static void ds4f_cmp_freeze_i4(ds4f_layer *ly, int KV) {
         float s = ly->cmp_absmax[d] / 7.f; if (s < 1e-12f) s = 1e-12f;
         ly->cmp_scale[d] = s; ly->cmp_iscale[d] = 1.f / s;
     }
-    if (ly->cmp_caln > ly->cp_nslot) { fprintf(stderr, "[CP-DBG freeze OOB] caln=%d cap=%d\n", ly->cmp_caln, ly->cp_nslot); fflush(stderr); abort(); }
+    if (ly->cmp_caln > ly->cp_nslot) { ds4f_fatal("[CP-DBG freeze OOB] caln=%d cap=%d", ly->cmp_caln, ly->cp_nslot); fflush(stderr); }
     for (int p = 0; p < ly->cmp_caln; p++) {
         const uint16_t *src = ly->cmp_calbuf + (size_t)p * KV;
         uint8_t *dst = ly->cmp_q4 + (size_t)p * (KV/2);
@@ -4122,7 +4188,7 @@ static void ds4f_cp_attn_combine_batched(ds4f_model *m, int nc, const int *poss,
     int nh = m->cfg.n_heads, HD = m->cfg.q_head_dim, H = nh*HD;
     int rd = m->cfg.qk_rope_dim, nope = HD - rd, half = rd/2;
     size_t stride = (size_t)H + nh;                              /* per-position packed [acc(H) | l(nh)] */
-    float *mloc = (float *)malloc((size_t)nc*nh*4);
+    float *mloc = (float *)ds4f_xmalloc((size_t)nc*nh*4, "mloc");
     memcpy(mloc, m->p_attn_m, (size_t)nc*nh*4);                  /* save local maxes */
     m->ar_max_cb(m->p_attn_m, nc*nh, m->ar_max_ctx);            /* global max per (position,head) */
     for (int i = 0; i < nc; i++) for (int h = 0; h < nh; h++) { /* rescale acc + l by exp(local-global) */
@@ -4259,7 +4325,7 @@ static int ds4f_attn_tb2_gemm(ds4f_model *m, ds4f_attn_ex_task *at) {
     if ((nh % DS4F_ATTN_GEMM_MR) || c->qk_rope_dim != DS4F_ATTN_GEMM_DBLK || (HD % DS4F_ATTN_GEMM_DBLK) || (nope % DS4F_ATTN_GEMM_DBLK)) return 0;
     int pos = at->pos, p_lo = pos - at->win + 1; if (p_lo < 0) p_lo = 0;
     int nP = pos - p_lo + 1, nsel = m->s_tb2_nsel, stride = c->window_size + c->index_topk;
-    if (!m->s_attn_sc) m->s_attn_sc = (float *)aligned_alloc(256, (size_t)c->n_heads*stride*4);
+    if (!m->s_attn_sc) m->s_attn_sc = (float *)ds4f_xalloc(256, (size_t)c->n_heads*stride*4, "s_attn_sc");
     ds4f_attn_gemm_task T = { m, ly, pos, nP, p_lo, nsel, nP + nsel, stride, at->scale, (float)(c->qk_rope_dim/2), at->rcos, at->rsin };
     ds4f_pool_run(m->pool, ds4f_attn_gemm_score_worker, &T);
     ds4f_pool_run(m->pool, ds4f_attn_gemm_soft_worker, &T);
@@ -4311,8 +4377,8 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         if (idx_int8w < 0) { const char *e = getenv("DS4F_IDX_INT8W"); idx_int8w = (e && *e && atoi(e)) ? 1 : 0; }
         if (idx_int8w && !ly->idx_wq_b_i8) {   /* lazy one-time per-row int8 quantization of the qproj weight */
             size_t rows = (size_t)c->index_n_heads * ihd;
-            ly->idx_wq_b_i8 = (int8_t *)aligned_alloc(256, rows * (size_t)c->q_lora);
-            ly->idx_wq_b_sc = (float *)aligned_alloc(256, rows * 4);
+            ly->idx_wq_b_i8 = (int8_t *)ds4f_xalloc(256, rows * (size_t)c->q_lora, "idx_wq_b_i8");
+            ly->idx_wq_b_sc = (float *)ds4f_xalloc(256, rows * 4, "idx_wq_b_sc");
             ds4f_quant_bf16_rows_i8(ly->idx_wq_b, (int)rows, c->q_lora, ly->idx_wq_b_i8, ly->idx_wq_b_sc);
         }
         /* DS4F_IDX_REUSE=N: reuse this layer's cached selection for N-1 of every N single-stream decode
@@ -4529,7 +4595,7 @@ static void ds4f_warm_tb2(ds4f_model *m, int npos) {
     ds4f_config *c = &m->cfg;
     int KV = c->kv_lora, ihd = c->index_head_dim;
     if (npos > c->max_pos) npos = c->max_pos;
-    float *crow = m->int8_cmp ? (float *)aligned_alloc(64, (size_t)KV*4) : NULL;  /* int8 cmp staging */
+    float *crow = m->int8_cmp ? (float *)ds4f_xalloc(64, (size_t)KV*4, "crow") : NULL;  /* int8 cmp staging */
     int rss_trace = 0; { const char *e = getenv("DS4F_WARM_RSS_TRACE"); rss_trace = (e && *e && atoi(e)); }
     double rss_stop = 0.0; { const char *e = getenv("DS4F_WARM_RSS_STOP_GB"); if (e && *e) rss_stop = atof(e); }
     double avail_stop = 1.5; { const char *e = getenv("DS4F_WARM_MEMAVAIL_STOP_GB"); if (e && *e) avail_stop = atof(e); }
@@ -4575,7 +4641,7 @@ static void ds4f_warm_tb2(ds4f_model *m, int npos) {
                     ir[d] = (float)((double)(z >> 11) / (double)(1ull << 53)) * 2.0f - 1.0f;
                 }
                 if (ly->idx_kv8_4) { int il = ly->idx_cp_on ? ((t >= ly->idx_cp_s0 && t < ly->idx_cp_s1) ? t - ly->idx_cp_s0 : -1) : t;
-                    if (il >= 0) { if (il >= ly->idx_cp_nslot) { fprintf(stderr,"[CP-DBG idxwarm OOB] t=%d il=%d cap=%d\n",t,il,ly->idx_cp_nslot); fflush(stderr); abort(); }
+                    if (il >= 0) { if (il >= ly->idx_cp_nslot) { ds4f_fatal("[CP-DBG idxwarm OOB] t=%d il=%d cap=%d",t,il,ly->idx_cp_nslot); fflush(stderr); }
                         ds4f_idx_quant_pos_i4(ir, ihd, ly->idx_kv8_4 + (size_t)il*(ihd/2), &ly->idx_pscale[il]); } }
                 else if (ly->idx_kv8)  ds4f_idx_quant_pos(ir, ihd, ly->idx_kv8 + (size_t)t*ihd, &ly->idx_pscale[t]);
             }
@@ -5050,30 +5116,30 @@ static void ds4f_alloc_prefill_batch(ds4f_model *m, int m_tile) {
     int C = c->hidden, H = c->n_heads*c->q_head_dim;
     size_t T = (size_t)m_tile;
     m->m_tile  = m_tile;
-    m->p_x     = (float *)aligned_alloc(256, T*(size_t)C*4);
-    m->p_hn    = (float *)aligned_alloc(256, T*(size_t)C*4);
-    m->p_qlat  = (float *)aligned_alloc(256, T*(size_t)c->q_lora*4);
-    m->p_q     = (float *)aligned_alloc(256, T*(size_t)H*4);
-    m->p_kvlat = (float *)aligned_alloc(256, T*(size_t)c->kv_lora*4);
-    m->p_attn  = (float *)aligned_alloc(256, T*(size_t)H*4);
-    m->p_o1    = (float *)aligned_alloc(256, T*(size_t)c->o_inter*4);
-    m->p_o     = (float *)aligned_alloc(256, T*(size_t)C*4);
-    m->p_h2    = (float *)aligned_alloc(256, T*(size_t)C*4);
-    m->p_shg   = (float *)aligned_alloc(256, T*(size_t)c->shared_inter*4);
-    m->p_shu   = (float *)aligned_alloc(256, T*(size_t)c->shared_inter*4);
-    m->p_moe   = (float *)aligned_alloc(256, T*(size_t)C*4);
-    m->p_route = (float *)aligned_alloc(256, T*(size_t)C*4);
-    m->p_router= (float *)aligned_alloc(256, T*(size_t)c->n_experts*4);
+    m->p_x     = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_x");
+    m->p_hn    = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_hn");
+    m->p_qlat  = (float *)ds4f_xalloc(256, T*(size_t)c->q_lora*4, "p_qlat");
+    m->p_q     = (float *)ds4f_xalloc(256, T*(size_t)H*4, "p_q");
+    m->p_kvlat = (float *)ds4f_xalloc(256, T*(size_t)c->kv_lora*4, "p_kvlat");
+    m->p_attn  = (float *)ds4f_xalloc(256, T*(size_t)H*4, "p_attn");
+    m->p_o1    = (float *)ds4f_xalloc(256, T*(size_t)c->o_inter*4, "p_o1");
+    m->p_o     = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_o");
+    m->p_h2    = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_h2");
+    m->p_shg   = (float *)ds4f_xalloc(256, T*(size_t)c->shared_inter*4, "p_shg");
+    m->p_shu   = (float *)ds4f_xalloc(256, T*(size_t)c->shared_inter*4, "p_shu");
+    m->p_moe   = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_moe");
+    m->p_route = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_route");
+    m->p_router= (float *)ds4f_xalloc(256, T*(size_t)c->n_experts*4, "p_router");
     /* expert-grouping buckets + gather/GEMM scratch */
     int no = ds4f_n_owned(c->n_experts, m->ep_rank, m->ep_size);
     m->ex_no   = no;
-    m->ex_cnt  = (int   *)aligned_alloc(256, (size_t)no*sizeof(int));
-    m->ex_tok  = (int   *)aligned_alloc(256, (size_t)no*T*sizeof(int));
-    m->ex_wt   = (float *)aligned_alloc(256, (size_t)no*T*4);
-    m->p_exX   = (float *)aligned_alloc(256, T*(size_t)C*4);
-    m->p_exG   = (float *)aligned_alloc(256, T*(size_t)c->moe_inter*4);
-    m->p_exU   = (float *)aligned_alloc(256, T*(size_t)c->moe_inter*4);
-    m->p_exO   = (float *)aligned_alloc(256, T*(size_t)C*4);
+    m->ex_cnt  = (int   *)ds4f_xalloc(256, (size_t)no*sizeof(int), "ex_cnt");
+    m->ex_tok  = (int   *)ds4f_xalloc(256, (size_t)no*T*sizeof(int), "ex_tok");
+    m->ex_wt   = (float *)ds4f_xalloc(256, (size_t)no*T*4, "ex_wt");
+    m->p_exX   = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_exX");
+    m->p_exG   = (float *)ds4f_xalloc(256, T*(size_t)c->moe_inter*4, "p_exG");
+    m->p_exU   = (float *)ds4f_xalloc(256, T*(size_t)c->moe_inter*4, "p_exU");
+    m->p_exO   = (float *)ds4f_xalloc(256, T*(size_t)C*4, "p_exO");
 }
 
 /* batched RMSNorm: dst[mm] = rmsnorm(src[mm], w) for mm in [0,M). token-parallel. */
@@ -5315,10 +5381,10 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     int og = c->o_groups, gin = H / og;
     if (ds4f_prof_on < 0) { const char *e = getenv("DS4F_PROF"); ds4f_prof_on = e ? atoi(e) : 0; }
     if (!m->exact || m->mhc || m->tierb2) {
-        fprintf(stderr, "ds4f_forward_prefill requires exact && !mhc && !tierb2\n"); abort(); }
+        ds4f_fatal("ds4f_forward_prefill requires exact && !mhc && !tierb2"); }
     if (m->int8_kv) {   /* batched kvpost/attn workers read the bf16 kv_cache (NULL under int8 KV) */
-        fprintf(stderr, "ds4f_forward_prefill incompatible with DS4F_INT8_KV (use token-at-a-time)\n"); abort(); }
-    if (!m->p_x || m->m_tile < M) { fprintf(stderr, "prefill batch buffers too small (m_tile=%d M=%d)\n", m->m_tile, M); abort(); }
+        ds4f_fatal("ds4f_forward_prefill incompatible with DS4F_INT8_KV (use token-at-a-time)"); }
+    if (!m->p_x || m->m_tile < M) { ds4f_fatal("prefill batch buffers too small (m_tile=%d M=%d)", m->m_tile, M); }
     for (int mm = 0; mm < M; mm++) memcpy(m->p_x + (size_t)mm*C, X + (size_t)mm*C, (size_t)C*4);
 
     int tps = (m->sh_rows < c->shared_inter);   /* TP shared-expert (sh_w1/w3 col-shard, sh_w2 full over zero-pad) */
@@ -5455,7 +5521,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, M, C, C };
       ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
     /* logits scratch reuses a per-token vocab buffer; allocate lazily once (sized full vocab). */
-    if (!m->p_logits) m->p_logits = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)c->vocab*4);
+    if (!m->p_logits) m->p_logits = (float *)ds4f_xalloc(256, (size_t)m->m_tile*(size_t)c->vocab*4, "p_logits");
     /* TP_HEAD: head is vocab-sharded (head.rows = hrows). GEMM the owned vocab rows -> p_logits[M, hrows];
      * each token's local argmax (global index head_r0+best, local max value) is merged across the shards by
      * ar_argmax_cb (M small 2-float argmax all-reduces, ONCE -- cheap, unlike a full [M,vocab] logit reduce). */
@@ -5469,7 +5535,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
          * alias it. out_tok is still filled with the per-row argmax (greedy sequences in the batch use it). */
         int V = c->vocab;
         if (tph && m->ar_cb) {
-            if (!m->p_logits_full) m->p_logits_full = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)V*4);
+            if (!m->p_logits_full) m->p_logits_full = (float *)ds4f_xalloc(256, (size_t)m->m_tile*(size_t)V*4, "p_logits_full");
             memset(m->p_logits_full, 0, (size_t)M*(size_t)V*4);
             for (int mm = 0; mm < M; mm++)
                 memcpy(m->p_logits_full + (size_t)mm*V + m->head_r0, m->p_logits + (size_t)mm*hrows, (size_t)hrows*4);
@@ -5554,43 +5620,19 @@ static void ds4f_free_decode_batch(ds4f_model *m) {
 }
 /* Allocate nseq per-sequence cache sets (bf16/f32 caches; NOT int8/int4 -- a later phase). Set 0
  * aliases each layer's own live buffers; sets 1..nseq-1 get fresh zeroed buffers of the layer sizes. */
-/* CHECKED alloc for the per-sequence decode-batch cache sets.
- *
- * THE BUG THIS FIXES (2026-07-14): every aligned_alloc below was UNCHECKED and immediately
- * memset/written. On exhaustion aligned_alloc returns NULL, so the batch path did not "OOM" -- it
- * dereferenced NULL and died with SIGSEGV (sig=11) on whichever rank had the least headroom. That is
- * why Flash's DB_BENCH M=32 crashed with a rank-specific segfault, and it is almost certainly what
- * base's docs recorded as "M=32 OOMs". A NULL deref is indistinguishable from a real memory-safety
- * bug in the logs; an honest message costs one branch.
- *
- * These sets are sized by max_pos, so they are LARGE: at nseq=32 x 43 layers with the default
- * DS4F_MAXPOS=4096 they run to ~10 GB that a 32-step benchmark never touches. If you hit this, the
- * first question is whether DS4F_MAXPOS is bigger than the context you actually decode. */
-static size_t ds4f_db_bytes = 0;      /* running total, for the diagnostic */
-static void *ds4f_db_alloc(size_t align, size_t sz, const char *what, int k, int l) {
-    void *p = aligned_alloc(align, sz);
-    if (!p) {
-        fprintf(stderr,
-            "ds4f_alloc_decode_batch: OUT OF MEMORY allocating %s for seq %d layer %d (%.1f MB; "
-            "%.2f GB of per-sequence cache sets allocated so far).\n"
-            "  These sets are sized by max_pos. Lower DS4F_MAXPOS to the context you actually decode "
-            "(a 32-step bench does not need 4096), or lower the batch size.\n",
-            what, k, l, sz/1048576.0, ds4f_db_bytes/1073741824.0);
-        fflush(stderr);
-        abort();      /* an explicit abort beats a NULL deref: the log says WHAT and HOW MUCH */
-    }
-    ds4f_db_bytes += sz;
-    return p;
-}
-
+/* The per-sequence cache sets are sized by max_pos, so they are LARGE: at nseq=32 x 43 layers with
+ * the default DS4F_MAXPOS=4096 they run to ~10 GB that a 32-step benchmark never touches. When an OOM
+ * message names a "decode-batch <buffer>", the first question is whether DS4F_MAXPOS is bigger than
+ * the context you actually decode. (These allocs were unchecked until 2026-07-14 -- aligned_alloc
+ * then straight into memset -- so an OOM here presented as a rank-specific SIGSEGV. All allocation
+ * now goes through ds4f_xalloc.) */
 static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
     if (m->dec_batch_seq && m->dec_nseq == nseq) return;
     if (m->dec_batch_seq) ds4f_free_decode_batch(m);   /* nseq changed -> free old sets before realloc (no leak) */
-    ds4f_db_bytes = 0;
     ds4f_config *c = &m->cfg; int KV = c->kv_lora, ihd = c->index_head_dim, np = c->max_pos, L = c->n_layers;
     m->dec_nseq = nseq;
-    m->dec_batch_pos = (int *)malloc((size_t)nseq * sizeof(int));
-    m->dec_batch_seq = (ds4f_lseq *)calloc((size_t)nseq * L, sizeof(ds4f_lseq));
+    m->dec_batch_pos = (int *)ds4f_xmalloc((size_t)nseq * sizeof(int), "dec_batch_pos");
+    m->dec_batch_seq = (ds4f_lseq *)ds4f_xcalloc((size_t)nseq * L, sizeof(ds4f_lseq), "dec_batch_seq");
     for (int l = 0; l < L; l++) {
         ds4f_layer *ly = &m->layers[l];
         ds4f_lseq *s0 = &m->dec_batch_seq[l];                    /* set 0 = existing live buffers */
@@ -5608,44 +5650,45 @@ static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
         int CAL = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64; if (CAL > nslot) CAL = nslot > 0 ? nslot : 1;
         for (int k = 1; k < nseq; k++) {
             ds4f_lseq *s = &m->dec_batch_seq[(size_t)k*L + l];
-            s->kv_cache = (uint16_t *)ds4f_db_alloc(256, (size_t)ly->kv_slots*KV*2, "kv_cache", k, l);
+            s->kv_cache = (uint16_t *)ds4f_xalloc(256, (size_t)ly->kv_slots*KV*2, "decode-batch kv_cache");
             memset(s->kv_cache, 0, (size_t)ly->kv_slots*KV*2);
             if (ratio) {
-                s->cmp_kv          = (float *)ds4f_db_alloc(256, (size_t)nslot*KV*4, "cmp_kv", k, l);
-                s->cmp_kv_state    = (float *)ds4f_db_alloc(256, (size_t)coff*ratio*W*4, "cmp_kv_state", k, l);
-                s->cmp_score_state = (float *)ds4f_db_alloc(256, (size_t)coff*ratio*W*4, "cmp_score_state", k, l);
+                s->cmp_kv          = (float *)ds4f_xalloc(256, (size_t)nslot*KV*4, "decode-batch cmp_kv");
+                s->cmp_kv_state    = (float *)ds4f_xalloc(256, (size_t)coff*ratio*W*4, "decode-batch cmp_kv_state");
+                s->cmp_score_state = (float *)ds4f_xalloc(256, (size_t)coff*ratio*W*4, "decode-batch cmp_score_state");
                 ds4f_compress_state_reset(s->cmp_kv_state, s->cmp_score_state, ratio, KV);
                 if (ratio == 4) { int icoff = 2, iW = icoff*ihd;
-                    s->idx_kv              = (float *)ds4f_db_alloc(256, (size_t)nslot*ihd*4, "idx_kv", k, l);
-                    s->idx_cmp_kv_state    = (float *)ds4f_db_alloc(256, (size_t)icoff*ratio*iW*4, "idx_cmp_kv_state", k, l);
-                    s->idx_cmp_score_state = (float *)ds4f_db_alloc(256, (size_t)icoff*ratio*iW*4, "idx_cmp_score_state", k, l);
+                    s->idx_kv              = (float *)ds4f_xalloc(256, (size_t)nslot*ihd*4, "decode-batch idx_kv");
+                    s->idx_cmp_kv_state    = (float *)ds4f_xalloc(256, (size_t)icoff*ratio*iW*4, "decode-batch idx_cmp_kv_state");
+                    s->idx_cmp_score_state = (float *)ds4f_xalloc(256, (size_t)icoff*ratio*iW*4, "decode-batch idx_cmp_score_state");
                     ds4f_compress_state_reset(s->idx_cmp_kv_state, s->idx_cmp_score_state, ratio, ihd);
                 }
             }
             /* per-sequence quantized stores (mirror whatever the base layer allocated). Fresh calibration:
              * cmp_caln/cmp_frozen are 0 (calloc); absmax zeroed. cp_nslot/idx_cp_nslot (shard capacity) are
              * the base layer's -- every sequence on this node owns the SAME slot range. */
-            if (ly->kv_q)      { s->kv_q = (int8_t *)aligned_alloc(256, (size_t)ly->kv_slots*KV);
+            if (ly->kv_q)      { s->kv_q = (int8_t *)ds4f_xalloc(256, (size_t)ly->kv_slots*KV, "kv_q");
                                  memset(s->kv_q, 0, (size_t)ly->kv_slots*KV); }
-            if (ly->kv_scale)  s->kv_scale  = (float *)aligned_alloc(64, (size_t)KV*4);
-            if (ly->kv_calbuf) s->kv_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
+            if (ly->kv_scale)  s->kv_scale  = (float *)ds4f_xalloc(64, (size_t)KV*4, "kv_scale");
+            if (ly->kv_calbuf) s->kv_calbuf = (uint16_t *)ds4f_xalloc(256, (size_t)CAL*KV*2, "kv_calbuf");
             if (ratio) {
                 if (ly->cmp_q4)     { size_t z = ((size_t)ly->cp_nslot*(KV/2) + 255) & ~255ull;
-                                      s->cmp_q4 = (uint8_t *)aligned_alloc(256, z); memset(s->cmp_q4, 0, z); }
-                if (ly->cmp_q)        s->cmp_q  = (int8_t *)aligned_alloc(256, ((size_t)nslot*KV + 255) & ~255ull);
-                if (ly->cmp_scale)    s->cmp_scale  = (float *)aligned_alloc(64, (size_t)KV*4);
-                if (ly->cmp_iscale)   s->cmp_iscale = (float *)aligned_alloc(64, (size_t)KV*4);
-                if (ly->cmp_absmax) { s->cmp_absmax = (float *)aligned_alloc(64, (size_t)KV*4);
+                                      s->cmp_q4 = (uint8_t *)ds4f_xalloc(256, z, "cmp_q4"); memset(s->cmp_q4, 0, z); }
+                if (ly->cmp_q)        s->cmp_q  = (int8_t *)ds4f_xalloc(256, ((size_t)nslot*KV + 255) & ~255ull, "cmp_q");
+                if (ly->cmp_scale)    s->cmp_scale  = (float *)ds4f_xalloc(64, (size_t)KV*4, "cmp_scale");
+                if (ly->cmp_iscale)   s->cmp_iscale = (float *)ds4f_xalloc(64, (size_t)KV*4, "cmp_iscale");
+                if (ly->cmp_absmax) { s->cmp_absmax = (float *)ds4f_xalloc(64, (size_t)KV*4, "cmp_absmax");
                                       memset(s->cmp_absmax, 0, (size_t)KV*4); }
-                if (ly->cmp_calbuf)   s->cmp_calbuf = (uint16_t *)aligned_alloc(256, (size_t)CAL*KV*2);
+                if (ly->cmp_calbuf)   s->cmp_calbuf = (uint16_t *)ds4f_xalloc(256, (size_t)CAL*KV*2, "cmp_calbuf");
                 if (ratio == 4) {
                     if (ly->idx_kv8_4) { size_t z = ((size_t)ly->idx_cp_nslot*(ihd/2) + 255) & ~255ull;
-                                         s->idx_kv8_4 = (uint8_t *)aligned_alloc(256, z); memset(s->idx_kv8_4, 0, z); }
-                    if (ly->idx_kv8)     s->idx_kv8   = (int8_t *)aligned_alloc(256, ((size_t)nslot*ihd + 255) & ~255ull);
-                    if (ly->idx_pscale)  s->idx_pscale = (float *)aligned_alloc(256,
-                                             ((size_t)(ly->idx_kv8_4 ? ly->idx_cp_nslot : nslot)*4 + 255) & ~255ull);
+                                         s->idx_kv8_4 = (uint8_t *)ds4f_xalloc(256, z, "idx_kv8_4"); memset(s->idx_kv8_4, 0, z); }
+                    if (ly->idx_kv8)     s->idx_kv8   = (int8_t *)ds4f_xalloc(256, ((size_t)nslot*ihd + 255) & ~255ull, "idx_kv8");
+                    if (ly->idx_pscale)  s->idx_pscale = (float *)ds4f_xalloc(256,
+                                             ((size_t)(ly->idx_kv8_4 ? ly->idx_cp_nslot : nslot)*4 + 255) & ~255ull,
+                                             "idx_pscale");
                     if (ly->sel_cache) { /* DS4F_IDX_REUSE: this sequence's own cached selection */
-                        s->sel_cache = (int *)aligned_alloc(64, ((size_t)c->index_topk*4 + 63) & ~63ull);
+                        s->sel_cache = (int *)ds4f_xalloc(64, ((size_t)c->index_topk*4 + 63) & ~63ull, "sel_cache");
                         s->sel_cache_n = 0; s->sel_cache_pos = -1; }
                 }
             }
@@ -5688,9 +5731,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
     float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
     int pftp = ds4f_pf_tp_on(m);
     float pa[128][16], ca[128][64], pf[128][16], cf[128][64];  /* per-position sinkhorn weights (K<=128, ~80 KB stack) */
-    if (K > 128) { fprintf(stderr, "ds4f_forward_verify: K=%d > 128\n", K); abort(); }
+    if (K > 128) { ds4f_fatal("ds4f_forward_verify: K=%d > 128", K); }
     if (!m->v_x4) { size_t vb = (size_t)m->m_tile*hcC*4;
-        m->v_x4 = (float *)aligned_alloc(256, vb); m->v_resid = (float *)aligned_alloc(256, vb); }
+        m->v_x4 = (float *)ds4f_xalloc(256, vb, "v_x4"); m->v_resid = (float *)ds4f_xalloc(256, vb, "v_resid"); }
     for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
         memcpy(m->v_x4 + (size_t)k*hcC + (size_t)s*C, X + (size_t)k*C, (size_t)C*4);
     double _ts = 0; (void)_ts;   /* DS4F_PROF: coarse verify-path section timers (reuse free prof slots) */
@@ -5723,7 +5766,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         int idxg_pf = 0;
         if (m->tierb2 && ratio == 4 && ly->idx_wq_b) {
             int iHhd = c->index_n_heads * c->index_head_dim;
-            if (!m->v_idxq) m->v_idxq = (float *)aligned_alloc(64, (size_t)m->m_tile * iHhd * 4);
+            if (!m->v_idxq) m->v_idxq = (float *)ds4f_xalloc(64, (size_t)m->m_tile * iHhd * 4, "v_idxq");
             ds4f_tensor wqbt = { ly->idx_wq_b, NULL, DS4F_BF16, iHhd, c->q_lora };
             ds4f_gemm(m, m->v_idxq, &wqbt, m->p_qlat, K, iHhd, c->q_lora);
             idxg_pf = 1;
@@ -5741,10 +5784,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         int vcp = s_vcp && m->cp && m->int4_cmp && m->ar_max_cb && m->ar_cb && (m->attn_h1 - m->attn_h0 == c->n_heads);
         size_t vstride = (size_t)H + c->n_heads; int nc = 0, comb_k[128], poss_comb[128];
         if (vcp) { int nh = c->n_heads;
-            if (!m->s_attn_m)    { m->s_attn_m    = (float *)aligned_alloc(64, ((size_t)nh*4 + 63) & ~63ull);
-                                   m->s_attn_comb = (float *)aligned_alloc(64, ((size_t)(H+nh)*4 + 63) & ~63ull); }
-            if (!m->p_attn_comb) { m->p_attn_comb = (float *)aligned_alloc(256, (size_t)m->m_tile*vstride*4);
-                                   m->p_attn_m    = (float *)aligned_alloc(256, (size_t)m->m_tile*nh*4); } }
+            if (!m->s_attn_m)    { m->s_attn_m    = (float *)ds4f_xalloc(64, ((size_t)nh*4 + 63) & ~63ull, "s_attn_m");
+                                   m->s_attn_comb = (float *)ds4f_xalloc(64, ((size_t)(H+nh)*4 + 63) & ~63ull, "s_attn_comb"); }
+            if (!m->p_attn_comb) { m->p_attn_comb = (float *)ds4f_xalloc(256, (size_t)m->m_tile*vstride*4, "p_attn_comb");
+                                   m->p_attn_m    = (float *)ds4f_xalloc(256, (size_t)m->m_tile*nh*4, "p_attn_m"); } }
         for (int k = 0; k < K; k++) {
             int pos = m->dec_batch_pos ? m->dec_batch_pos[k] : pos0 + k;
             if (m->dec_batch_seq) ds4f_lseq_apply(ly, &m->dec_batch_seq[(size_t)k*c->n_layers + L]);
@@ -5916,7 +5959,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
     for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
     { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, K, C, C };
       ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-    if (!m->p_logits) m->p_logits = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)c->vocab*4);
+    if (!m->p_logits) m->p_logits = (float *)ds4f_xalloc(256, (size_t)m->m_tile*(size_t)c->vocab*4, "p_logits");
     int hrows = m->head.rows, tph = (hrows < c->vocab);
     ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, K, hrows, C);
     if (m->want_full_logits) {
@@ -5927,7 +5970,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
          * out_tok still gets the per-row argmax (greedy sequences in a mixed batch use it). */
         int V = c->vocab;
         if (tph && m->ar_cb) {
-            if (!m->p_logits_full) m->p_logits_full = (float *)aligned_alloc(256, (size_t)m->m_tile*(size_t)V*4);
+            if (!m->p_logits_full) m->p_logits_full = (float *)ds4f_xalloc(256, (size_t)m->m_tile*(size_t)V*4, "p_logits_full");
             memset(m->p_logits_full, 0, (size_t)K*(size_t)V*4);
             for (int k = 0; k < K; k++)
                 memcpy(m->p_logits_full + (size_t)k*V + m->head_r0, m->p_logits + (size_t)k*hrows, (size_t)hrows*4);
@@ -6232,8 +6275,8 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
             if (cp_combine) {                  /* Stage-C: per-node partials -> cross-node online-softmax combine */
                 int nh = c->n_heads;
-                if (!m->s_attn_m) { m->s_attn_m    = (float *)aligned_alloc(64, ((size_t)nh*4 + 63) & ~63ull);
-                                    m->s_attn_comb = (float *)aligned_alloc(64, ((size_t)(nh*HD + nh)*4 + 63) & ~63ull); }
+                if (!m->s_attn_m) { m->s_attn_m    = (float *)ds4f_xalloc(64, ((size_t)nh*4 + 63) & ~63ull, "s_attn_m");
+                                    m->s_attn_comb = (float *)ds4f_xalloc(64, ((size_t)(nh*HD + nh)*4 + 63) & ~63ull, "s_attn_comb"); }
                 ds4f_pool_run(m->pool, ds4f_attn_tb2_combine_worker, &at);
                 ds4f_cp_attn_combine(m, pos, rcos, rsin);
             } else if (!ds4f_attn_tb2_gemm(m, &at))   /* DS4F_ATTN_GEMM: 8-head KV-reuse; falls back to per-head */

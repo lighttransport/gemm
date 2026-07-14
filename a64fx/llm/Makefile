@@ -31,6 +31,11 @@ BUILD       := $(LLM_DIR)build
 ifeq ($(CC),fcc)
     BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
     BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
+    # -g -rdynamic: symbol names for the SIGSEGV backtrace handler (on by default). These do NOT
+    # change codegen at -O3 -- they only keep the symbol table, so a crash reports
+    # "ds4f_pf_qnr_worker -> ds4f_rope_apply" instead of a bare hex address. On a multi-node run with
+    # no core dump and no debugger, that is the difference between a 10-minute fix and a lost day.
+    BASE_CFLAGS  += -g -rdynamic
     OMP_FLAG     := -fopenmp
     ASMC         := fcc
     HWBLIB       := -lhwb

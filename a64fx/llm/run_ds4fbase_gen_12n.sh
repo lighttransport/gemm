@@ -87,8 +87,10 @@ t1=$(date +%s)
     python3 tools/ds4f_tokenizer.py decode --tokenizer "$TOK" --ids-file "$GEN_OUT"
     echo "<<<END>>>"
   else
-    echo "!! no $GEN_OUT produced (rc=$rc). Last crash context:"
-    grep -m6 -iE 'segmentation|sigsegv|abort|MISSING tensor|dtype|nbytes|Killed|out of memory|No such file|cannot open' "$LOG"
+    echo "!! no $GEN_OUT produced (rc=$rc)."
+    # The runner's diagnostics live in per-rank files, NOT in $LOG (mpiexec stdout, always empty).
+    # Greping $LOG is what made a wiped /local stage look like an unexplained 3-second death.
+    . ./ds4f_show_error.sh; ds4f_show_error
   fi
   echo "GEN_END $(date +%H:%M:%S)"
 } | tee "$SENT"
