@@ -231,7 +231,7 @@ echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS
 
 # ---- build (native fcc + OpenMP) ----
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
-make -C "$LLM_DIR" ds4f_ep_runner CC=fcc OPENMP=1 >/dev/null
+[ "${DS4F_NOBUILD:-0}" = 1 ] || make -C "$LLM_DIR" ds4f_ep_runner CC=fcc OPENMP=1 >/dev/null
 BIN="$LLM_DIR/build/ds4f_ep_runner"
 
 # ---- clean per-rank artifacts from any prior run ----
