@@ -23,12 +23,11 @@ ds4f_show_error() {
         echo "      mpiexec -np 1 /bin/sh -c 'hostname > \$HOME/livecheck.txt'"
         return 1
     fi
-    local found=0
+    local found=0 hits=""
     for f in "$ldir"/rank*.err; do
         [ -s "$f" ] || continue
         # the interesting lines: our fatal path, the loader's messages, and any crash
-        local hits
-        hits=$(grep -iE 'FATAL|out of memory|cannot open|no staged blob|MISSING tensor|segmentation|sig(segv|bus|fpe)|backtrace|abort|Killed|will not fit|DS4F_EXACT' "$f")
+        hits=$(grep -iE 'FATAL|out of memory|cannot open|no staged blob|MISSING tensor|segmentation|sig(segv|bus|fpe)|backtrace|abort|Killed|will not fit|DS4F_EXACT' "$f" || true)
         if [ -n "$hits" ]; then
             found=1
             echo "  == $(basename "$f") =="

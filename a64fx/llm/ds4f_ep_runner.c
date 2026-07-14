@@ -1098,7 +1098,28 @@ int main(int argc,char**argv){
             unlink(link);
             char target[520]; snprintf(target, sizeof target, "run-%s-%d", jid, (int)getppid());
             if (symlink(target, link) != 0) { /* non-fatal */ }
+            /* BACKWARD COMPAT, and it is load-bearing: every wrapper, gate and benchmark in this tree
+             * greps `ds4f_ep_rank00.txt` for the prefill/decode lines. Moving the log without leaving
+             * this behind silently broke ALL of them -- the run completed and reported no numbers. */
+            unlink("ds4f_ep_rank00.txt");
+            char rel[700]; snprintf(rel, sizeof rel, "%s/rank00.log", rundir);
+            if (symlink(rel, "ds4f_ep_rank00.txt") != 0) { /* non-fatal */ }
         }
+    }
+
+    /* DS4F_TEST_SEGV / DS4F_TEST_OOM: deliberately trip the diagnostics, to prove they fire. Placed
+     * AFTER the log setup so the output lands in logs/latest/rank<NN>.err -- which is the thing being
+     * tested. A crash handler that has never been triggered, and an OOM message that has never been
+     * printed, are exactly what turn out to be broken on the day you need them. */
+    if (envi("DS4F_TEST_SEGV", 0)) { volatile int *p = NULL; *p = 1; }   /* NULL deref -> backtrace */
+    if (envi("DS4F_TEST_OOM", 0)) {
+        /* NOTE, and it matters: a merely HUGE request (64 TB) SUCCEEDS on Linux -- overcommit hands
+         * out virtual address space, aligned_alloc returns non-NULL, the check never fires, and the
+         * process is SIGKILLed later when it TOUCHES the pages. So a checked allocator catches
+         * allocator FAILURE, not overcommit death; the defence against the latter is the preflight
+         * (arena size vs MemAvailable). To exercise the NULL path we must ask for something the
+         * allocator cannot even map. */
+        (void)ds4f_xalloc(256, (size_t)-4096, "DS4F_TEST_OOM probe (unsatisfiable)");
     }
 
     int ep_rank = MyRank, ep_size = N;

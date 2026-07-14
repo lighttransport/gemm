@@ -50,7 +50,17 @@ static size_t ds4f_alloc_total = 0;
 /* NOTE: these three MUST call the raw libc allocators. An automated rewrite once turned the bodies
  * into self-calls (ds4f_xalloc -> ds4f_xalloc), i.e. infinite recursion -- which blew the stack on
  * all 47 pool threads and presented as an instant SIGKILL on every rank, with no message. */
+/* A single buffer larger than the node's whole RAM is always a bug (a bad size expression), and
+ * Linux WILL hand it to you: overcommit grants the address space, aligned_alloc returns non-NULL,
+ * and the process is SIGKILLed later when it touches the pages -- with no message, on a random rank.
+ * That is unfalsifiable from a log. Catch it at the source instead. */
+#define DS4F_ALLOC_SANITY_GB 64.0
 static void *ds4f_xalloc(size_t align, size_t sz, const char *what) {
+    if (sz / 1073741824.0 > DS4F_ALLOC_SANITY_GB)
+        ds4f_fatal("implausible allocation: %s wants %.1f GB (> %.0f GB sanity ceiling).\n"
+                   "       This is a bad size expression, not a memory shortage -- Linux overcommit\n"
+                   "       would have granted it and then SIGKILLed us on first touch.",
+                   what, sz / 1073741824.0, DS4F_ALLOC_SANITY_GB);
     void *p = aligned_alloc(align, sz);
     if (!p) ds4f_fatal("out of memory allocating %s (%.1f MB); %.2f GB allocated so far",
                        what, sz / 1048576.0, ds4f_alloc_total / 1073741824.0);

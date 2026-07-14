@@ -48,15 +48,31 @@ say "     IDX_SCAN_MIN=default(8)  PREFILL_GEMM=default(1,K=32)"
 
 # ---- [1] CORRECTNESS GATE FIRST. A fast wrong number is worth nothing. ----
 say ""; say "--- [1/4] VERIFY_GATE (must be 16/16) ---"
-VOUT="$LLM_DIR/ds4f_verify_gate_flash.txt"; rm -f "$VOUT"
-free_nodes
-DS4F_VERIFY_GATE=1 DS4F_VG_NTOK=16 DS4F_VERIFY_GATE_OUT="$VOUT" \
-  PROMPT_FILE="$PF" MAX_NEW=4 \
-  DS4F_GEN_LOG="$LLM_DIR/fh_vg.log" DS4F_GEN_SENTINEL="$LLM_DIR/fh_vg_s.txt" \
-  ./run_ds4f_gen_11n.sh > /dev/null 2>&1 || true      # rc=1 EXPECTED: gate exits before gen ids
-if [ ! -s "$VOUT" ] || ! grep -q -- "-> PASS" "$VOUT"; then
-    say "  !! VERIFY_GATE DID NOT PASS -- every number below would be suspect. Stopping."
-    [ -s "$VOUT" ] && sed 's/^/  /' "$VOUT" | tee -a "$OUT" || tail -5 "$LLM_DIR/fh_vg.log" | sed 's/^/  /' | tee -a "$OUT"
+VOUT="$LLM_DIR/ds4f_verify_gate_flash.txt"
+# RETRY on a LAUNCH failure, not on a gate failure -- they look identical from here and must not.
+# If the previous run's ranks have not fully released the Tofu coordinates, mpiexec returns in ~3s
+# having printed NOTHING (not even "PLE 0054"), the run never loads, and no verdict is written. That
+# is a launcher hiccup, and reporting it as "GATE FAILED" is a false alarm that aborts the benchmark.
+# A missing verdict => retry; a verdict that says FAIL => stop, that is real.
+gate_ok=0
+for attempt in 1 2 3; do
+    rm -f "$VOUT"
+    free_nodes; sleep 10                                  # let the fabric actually settle
+    DS4F_VERIFY_GATE=1 DS4F_VG_NTOK=16 DS4F_VERIFY_GATE_OUT="$VOUT" \
+      PROMPT_FILE="$PF" MAX_NEW=4 \
+      DS4F_GEN_LOG="$LLM_DIR/fh_vg.log" DS4F_GEN_SENTINEL="$LLM_DIR/fh_vg_s.txt" \
+      ./run_ds4f_gen_11n.sh > /dev/null 2>&1 || true      # rc=1 EXPECTED: gate exits before gen ids
+    if [ -s "$VOUT" ]; then gate_ok=1; break; fi
+    say "  (attempt $attempt: no verdict -- run never started; retrying)"
+done
+if [ "$gate_ok" != 1 ]; then
+    say "  !! VERIFY_GATE never produced a verdict after 3 attempts -- the run is not starting."
+    tail -5 "$LLM_DIR/fh_vg.log" | sed 's/^/  /' | tee -a "$OUT"
+    exit 1
+fi
+if ! grep -q -- "-> PASS" "$VOUT"; then
+    say "  !! VERIFY_GATE FAILED -- every number below would be suspect. Stopping."
+    sed 's/^/  /' "$VOUT" | tee -a "$OUT"
     exit 3
 fi
 grep -hE "match, common prefix" "$VOUT" | sed 's/^/  /' | tee -a "$OUT"
