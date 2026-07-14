@@ -11,11 +11,17 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 | model | experts | single-stream | batched (aggregate) | prefill | arena |
 |---|---|---|---|---|---|
 | **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **21.5–23.0 tok/s** | **34.6 @ M=16** | **37.2 tok/s** (`PREFILL_GEMM`, K=32) | 26.9 GB |
-| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | 32.8 @ M=32 / 31.0 @ M=16 | **24.9 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | ~~32.8 @ M=32~~ **RETRACTED** | **24.9 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
 
 > Flash's old **18.98** was a synthetic-ctx=8 number, like base's 22.45. On a **real 70-token prompt**
-> it is **15.54** (was 12.57 before the indexer-scan fix). Its batched/arena figures are older and
-> have NOT been re-measured in a single allocation — treat them as provisional.
+> it is **15.54** (was 12.57 before the indexer-scan fix).
+>
+> **🔴 Flash's old batched numbers (32.8 @ M=32 / 31.0 @ M=16) are RETRACTED.** That path
+> **segfaults** on the real model — at every batch size, including M=1, on every rank — and the reason
+> says what those numbers actually were: `run_ds4f_11n.sh` defaults **`DS4F_EXACT=0`** (stand-in math;
+> base's script defaults it to **1**), and with `EXACT=0` the RoPE tables are never built, so the
+> batched forward NULL-derefs. A `DB_BENCH` run that did *not* crash was therefore benchmarking the
+> **synthetic stand-in model, not DeepSeek-V4**. See the section at the end of this file.
 
 **Every base number above is from ONE allocation (job 49556601) with the gate green** —
 `./bench_headline_12n.sh`, which runs `VERIFY_GATE` **first** and aborts the whole benchmark if it
@@ -2871,6 +2877,41 @@ which is the entire lesson of this file.
 presumably there to dodge pool overhead at tiny T. It was never re-measured, and the fallback it
 guarded was so much worse that it lost by 79× in the band that matters. The synthetic default
 (`DS4F_PREFILL=8`) then hid the whole thing, because it sits *below* the bad band.
+
+## 🔴 `DS4F_EXACT=0` + the batched path = SIGSEGV (fixed 2026-07-14) — and Flash's batched numbers were STAND-IN MATH
+
+Flash's `DB_BENCH` segfaulted (`sig=11`) on **every rank**, at **every batch size including M=1**.
+The hunt is worth recording because three plausible theories died first:
+
+| theory | killed by |
+|---|---|
+| unchecked `aligned_alloc` → NULL deref on OOM | made the allocs checked; **it never fired** |
+| memory pressure (the caches are sized by `max_pos`) | `DS4F_MAXPOS=128` cut them ~32× — **no change** |
+| something M-dependent (M=32 only) | it crashes at **M=1** too |
+
+A crash handler writing to **`$HOME`** (the launcher DROPS rank stderr) plus `sigaltstack` (the first
+handler produced eleven **0-byte** files — it was dying on the overflowed stack before its first
+`write`) finally gave the frame: **`ds4f_pf_qnr_worker` → `ds4f_rope_apply`**.
+
+**Root cause, one line:** `ds4f_build_freqs()` begins `if (!m->exact) return;` — so with `EXACT=0`
+the **RoPE tables are never allocated** (`rope_dense_cos`/`rope_comp_cos` stay NULL).
+`ds4f_forward_token` branches around RoPE in stand-in mode and runs fine; `ds4f_forward_verify`'s
+q-norm/RoPE worker ropes **unconditionally** → NULL `cosb` → SIGSEGV in a pool worker.
+
+**And `run_ds4f_11n.sh` defaults `DS4F_EXACT=0` / `TIERB2=0` / `MHC=0`** — while
+`run_ds4fbase_12n.sh` defaults all three to **1**. The gen wrapper sets them, which is exactly why
+gen, `PREFILL_GEMM` and `VERIFY_GATE` all passed while a bare `DB_BENCH` died.
+
+**The consequence is bigger than the crash.** Flash's published batched figures were produced by the
+bare run script, i.e. **with stand-in math — they were never measurements of DeepSeek-V4 at all.**
+They are retracted, not merely refreshed. This is the `DB_BENCH`-garbage lesson wearing a new coat:
+*a number is only as real as the model that produced it, and nothing in the harness was checking.*
+
+**Fixes:** `ds4f_forward_verify` now **aborts with an explanatory message** when `!m->exact` instead
+of dereferencing NULL; `bench_headline_flash_11n.sh` sets `EXACT/TIERB2/MHC=1` explicitly.
+Also added `DS4F_BACKTRACE=1` (per-rank backtrace → `$HOME/ds4f_crash_rank<NN>.txt`, on an altstack)
+and `DS4F_TRACE=1` (checkpoints), which are what made this findable at all — **the MPI launcher's
+`sig=11` on its own tells you nothing, and rank stderr never reaches your log.**
 
 ### ⚠️ Build trap: `make` alone silently builds the WRONG binary
 

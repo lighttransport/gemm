@@ -5109,6 +5109,20 @@ static void ds4f_pf_qnr_worker(void *arg, int tid, int nthr) {
          * positions -> two identical sequences at different batch indices diverge (the batched-decode
          * per-sequence independence bug). */
         int rpos = m->dec_batch_pos ? m->dec_batch_pos[mm] : T->pos0 + mm;
+        /* DS4F_ROPE_GUARD: catch a bad rpos/table BEFORE it becomes a wild cosb+rpos*half read.
+         * (A SIGSEGV inside rope_apply from a pool worker is what a garbage rpos looks like.) */
+        static int rope_guard = -1;
+        if (rope_guard < 0) { const char *e = getenv("DS4F_ROPE_GUARD"); rope_guard = e ? atoi(e) : 0; }
+        if (rope_guard) {
+            if (!T->rcos || !T->rsin || rpos < 0 || rpos >= m->cfg.max_pos) {
+                fprintf(stderr, "ROPE_GUARD: rpos=%d (max_pos=%d) mm=%d M=%d dec_batch_pos=%p "
+                                "rcos=%p rsin=%p -- would have segfaulted\n",
+                        rpos, m->cfg.max_pos, mm, T->M, (void*)m->dec_batch_pos,
+                        (const void*)T->rcos, (const void*)T->rsin);
+                fflush(stderr);
+                abort();
+            }
+        }
         ds4f_rope_apply(qh + nope, T->rcos, T->rsin, rpos, half, 0);
     }
 }
@@ -5540,9 +5554,39 @@ static void ds4f_free_decode_batch(ds4f_model *m) {
 }
 /* Allocate nseq per-sequence cache sets (bf16/f32 caches; NOT int8/int4 -- a later phase). Set 0
  * aliases each layer's own live buffers; sets 1..nseq-1 get fresh zeroed buffers of the layer sizes. */
+/* CHECKED alloc for the per-sequence decode-batch cache sets.
+ *
+ * THE BUG THIS FIXES (2026-07-14): every aligned_alloc below was UNCHECKED and immediately
+ * memset/written. On exhaustion aligned_alloc returns NULL, so the batch path did not "OOM" -- it
+ * dereferenced NULL and died with SIGSEGV (sig=11) on whichever rank had the least headroom. That is
+ * why Flash's DB_BENCH M=32 crashed with a rank-specific segfault, and it is almost certainly what
+ * base's docs recorded as "M=32 OOMs". A NULL deref is indistinguishable from a real memory-safety
+ * bug in the logs; an honest message costs one branch.
+ *
+ * These sets are sized by max_pos, so they are LARGE: at nseq=32 x 43 layers with the default
+ * DS4F_MAXPOS=4096 they run to ~10 GB that a 32-step benchmark never touches. If you hit this, the
+ * first question is whether DS4F_MAXPOS is bigger than the context you actually decode. */
+static size_t ds4f_db_bytes = 0;      /* running total, for the diagnostic */
+static void *ds4f_db_alloc(size_t align, size_t sz, const char *what, int k, int l) {
+    void *p = aligned_alloc(align, sz);
+    if (!p) {
+        fprintf(stderr,
+            "ds4f_alloc_decode_batch: OUT OF MEMORY allocating %s for seq %d layer %d (%.1f MB; "
+            "%.2f GB of per-sequence cache sets allocated so far).\n"
+            "  These sets are sized by max_pos. Lower DS4F_MAXPOS to the context you actually decode "
+            "(a 32-step bench does not need 4096), or lower the batch size.\n",
+            what, k, l, sz/1048576.0, ds4f_db_bytes/1073741824.0);
+        fflush(stderr);
+        abort();      /* an explicit abort beats a NULL deref: the log says WHAT and HOW MUCH */
+    }
+    ds4f_db_bytes += sz;
+    return p;
+}
+
 static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
     if (m->dec_batch_seq && m->dec_nseq == nseq) return;
     if (m->dec_batch_seq) ds4f_free_decode_batch(m);   /* nseq changed -> free old sets before realloc (no leak) */
+    ds4f_db_bytes = 0;
     ds4f_config *c = &m->cfg; int KV = c->kv_lora, ihd = c->index_head_dim, np = c->max_pos, L = c->n_layers;
     m->dec_nseq = nseq;
     m->dec_batch_pos = (int *)malloc((size_t)nseq * sizeof(int));
@@ -5564,17 +5608,17 @@ static void ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
         int CAL = ds4f_int8cmp_cal > 0 ? ds4f_int8cmp_cal : 64; if (CAL > nslot) CAL = nslot > 0 ? nslot : 1;
         for (int k = 1; k < nseq; k++) {
             ds4f_lseq *s = &m->dec_batch_seq[(size_t)k*L + l];
-            s->kv_cache = (uint16_t *)aligned_alloc(256, (size_t)ly->kv_slots*KV*2);
+            s->kv_cache = (uint16_t *)ds4f_db_alloc(256, (size_t)ly->kv_slots*KV*2, "kv_cache", k, l);
             memset(s->kv_cache, 0, (size_t)ly->kv_slots*KV*2);
             if (ratio) {
-                s->cmp_kv          = (float *)aligned_alloc(256, (size_t)nslot*KV*4);
-                s->cmp_kv_state    = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
-                s->cmp_score_state = (float *)aligned_alloc(256, (size_t)coff*ratio*W*4);
+                s->cmp_kv          = (float *)ds4f_db_alloc(256, (size_t)nslot*KV*4, "cmp_kv", k, l);
+                s->cmp_kv_state    = (float *)ds4f_db_alloc(256, (size_t)coff*ratio*W*4, "cmp_kv_state", k, l);
+                s->cmp_score_state = (float *)ds4f_db_alloc(256, (size_t)coff*ratio*W*4, "cmp_score_state", k, l);
                 ds4f_compress_state_reset(s->cmp_kv_state, s->cmp_score_state, ratio, KV);
                 if (ratio == 4) { int icoff = 2, iW = icoff*ihd;
-                    s->idx_kv              = (float *)aligned_alloc(256, (size_t)nslot*ihd*4);
-                    s->idx_cmp_kv_state    = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
-                    s->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff*ratio*iW*4);
+                    s->idx_kv              = (float *)ds4f_db_alloc(256, (size_t)nslot*ihd*4, "idx_kv", k, l);
+                    s->idx_cmp_kv_state    = (float *)ds4f_db_alloc(256, (size_t)icoff*ratio*iW*4, "idx_cmp_kv_state", k, l);
+                    s->idx_cmp_score_state = (float *)ds4f_db_alloc(256, (size_t)icoff*ratio*iW*4, "idx_cmp_score_state", k, l);
                     ds4f_compress_state_reset(s->idx_cmp_kv_state, s->idx_cmp_score_state, ratio, ihd);
                 }
             }
@@ -5622,6 +5666,23 @@ static inline int ds4f_pf_tp_on(ds4f_model *m) {
     return ds4f_pf_tp && m->ar_cb && m->ep_size > 1;
 }
 static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, int *out_tok, float *out_hc) {
+    /* THE BATCHED FORWARD REQUIRES DS4F_EXACT=1 -- say so instead of segfaulting.
+     *
+     * ds4f_build_freqs() starts with `if (!m->exact) return;`, so with EXACT=0 the RoPE tables are
+     * NEVER ALLOCATED (rope_dense_cos / rope_comp_cos stay NULL). ds4f_forward_token branches around
+     * RoPE in stand-in mode and runs fine, but this function's ds4f_pf_qnr_worker ropes
+     * UNCONDITIONALLY -> NULL cosb -> SIGSEGV inside ds4f_rope_apply, from a pool worker, on every
+     * rank, at every batch size including M=1. That is what Flash's DB_BENCH crash was: run_ds4f_11n.sh
+     * defaults DS4F_EXACT=0 (base's script defaults it to 1), so the bare synthetic run took the
+     * batched path with no RoPE tables. Cost a long hunt; a one-line check ends it forever. */
+    if (!m->exact) {
+        fprintf(stderr, "ds4f_forward_verify: DS4F_EXACT=1 is REQUIRED (the batched/verify path always "
+                        "applies RoPE, and the RoPE tables are only built when exact is on -- without "
+                        "them this segfaults in a pool worker). Set DS4F_EXACT=1 (and DS4F_TIERB2=1 "
+                        "DS4F_MHC=1 for the real model).\n");
+        fflush(stderr);
+        abort();
+    }
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
     float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;

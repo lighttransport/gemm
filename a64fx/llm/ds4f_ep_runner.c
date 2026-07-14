@@ -34,6 +34,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <execinfo.h>
+#include <unistd.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -959,8 +962,55 @@ static void ds4f_cli(int argc,char**argv){
     ds4f_apply_numa(numa);
 }
 
+/* DS4F_BACKTRACE=1: dump a symbolized backtrace on SIGSEGV/SIGBUS/SIGFPE. The MPI launcher only ever
+ * reports "PLE 0610 ... (rank=6)(sig=11)", which tells you nothing about WHERE -- and a multi-node
+ * crash is otherwise very expensive to localize (no core, no debugger). Opt-in; costs nothing off. */
+static void ds4f_crash_handler(int sig) {
+    void *bt[64];
+    int n = backtrace(bt, 64);
+    /* Write to a per-rank file on the SHARED FS, not stderr: the MPI launcher DROPS rank stderr, so
+     * a handler that only writes to fd 2 produces nothing and you are back to "sig=11, good luck".
+     * (/local is node-private and the crashing rank is usually on another node -- $HOME is the one
+     * place the message is guaranteed to survive.) */
+    char path[256];
+    const char *home = getenv("HOME");
+    snprintf(path, sizeof path, "%s/ds4f_crash_rank%02d.txt", home ? home : ".", MyRank);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char hdr[128];
+        int hn = snprintf(hdr, sizeof hdr, "rank %d: FATAL signal %d -- backtrace (%d frames):\n",
+                          MyRank, sig, n);
+        ssize_t wr = write(fd, hdr, (size_t)hn); (void)wr;
+        backtrace_symbols_fd(bt, n, fd);
+        fsync(fd); close(fd);
+    }
+    char hdr2[128];
+    int h2 = snprintf(hdr2, sizeof hdr2, "\n*** rank %d: FATAL signal %d (backtrace -> %s)\n",
+                      MyRank, sig, path);
+    ssize_t w2 = write(2, hdr2, (size_t)h2); (void)w2;
+    backtrace_symbols_fd(bt, n, 2);
+    _exit(128 + sig);
+}
+
 int main(int argc,char**argv){
     ds4f_cli(argc,argv);
+    if (envi("DS4F_BACKTRACE", 0)) {
+        /* SIGALTSTACK is REQUIRED here, not optional. The first attempt at this handler produced
+         * eleven 0-byte crash files: the handler was entered but died before its first write(). That
+         * is the signature of a STACK OVERFLOW -- the handler runs on the very stack that just
+         * overflowed, so it cannot do anything. Give it its own stack and it can finally speak. */
+        static char altstk[SIGSTKSZ * 4];
+        stack_t ss = { .ss_sp = altstk, .ss_size = sizeof altstk, .ss_flags = 0 };
+        sigaltstack(&ss, NULL);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = ds4f_crash_handler;
+        sa.sa_flags = SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS,  &sa, NULL);
+        sigaction(SIGFPE,  &sa, NULL);
+    }
     int rc;
     int n_threads = envi("LLM_THREADS", 48);
     int n_cmgs    = envi("DS4F_CMGS", 4);
@@ -1221,12 +1271,23 @@ int main(int argc,char**argv){
         int *cur = (int *)malloc((size_t)maxM*sizeof(int)), *pos = (int *)malloc((size_t)maxM*sizeof(int));
         int *ot  = (int *)malloc((size_t)maxM*sizeof(int));
         if (MyRank == 0) logmsg("DECODE_BATCH throughput sweep (ND=%d steps/M):\n", ND);
+        /* DS4F_TRACE=1: append a checkpoint per step to $HOME. When a multi-node run dies with a bare
+         * "sig=11" and the crash handler itself cannot run (stack overflow -> 0-byte crash files),
+         * the LAST line of this file is the last thing that completed. Crude, and decisive. */
+        int trc = envi("DS4F_TRACE", 0);
+        char trp[256]; FILE *trf = NULL;
+        if (trc) { snprintf(trp, sizeof trp, "%s/ds4f_trace_rank%02d.txt", getenv("HOME") ? getenv("HOME") : ".", MyRank);
+                   trf = fopen(trp, "w"); }
+        #define TRACE(...) do { if (trf) { fprintf(trf, __VA_ARGS__); fflush(trf); } } while (0)
         for (int mi = 0; mi < nM; mi++) {
             int M = Ms[mi];
+            TRACE("M=%d: serve_reset+free\n", M);
             ds4f_serve_reset(m); ds4f_free_decode_batch(m);   /* free prior M's cache sets (no leak/thrash) */
             for (int k = 0; k < M; k++) cur[k] = 100 + k*1000;
             for (int k = 0; k < M; k++) { embed_lookup(m, cur[k], Xb + (size_t)k*C); pos[k] = 0; }
+            TRACE("M=%d: -> forward_decode_batch (warm)\n", M);
             ds4f_forward_decode_batch(m, Xb, pos, M, ot, hcb);        /* warm (alloc caches/buffers) */
+            TRACE("M=%d: warm OK\n", M);
             for (int k = 0; k < M; k++) cur[k] = ot[k];
             int do_prof = envi("DS4F_PROF", 0);
             if (do_prof) for (int i = 0; i < DS4F_NPHASE; i++) m->prof[i] = 0;   /* reset per-M breakdown */
