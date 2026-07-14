@@ -11,17 +11,17 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 | model | experts | single-stream | batched (aggregate) | prefill | arena |
 |---|---|---|---|---|---|
 | **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **21.5–23.0 tok/s** | **34.6 @ M=16** | **37.2 tok/s** (`PREFILL_GEMM`, K=32) | 26.9 GB |
-| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | ~~32.8 @ M=32~~ **RETRACTED** | **24.9 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | **24.0 @ M=32** / 21.6 @ M=16 | **24.9 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
 
 > Flash's old **18.98** was a synthetic-ctx=8 number, like base's 22.45. On a **real 70-token prompt**
 > it is **15.54** (was 12.57 before the indexer-scan fix).
 >
-> **🔴 Flash's old batched numbers (32.8 @ M=32 / 31.0 @ M=16) are RETRACTED.** That path
-> **segfaults** on the real model — at every batch size, including M=1, on every rank — and the reason
-> says what those numbers actually were: `run_ds4f_11n.sh` defaults **`DS4F_EXACT=0`** (stand-in math;
-> base's script defaults it to **1**), and with `EXACT=0` the RoPE tables are never built, so the
-> batched forward NULL-derefs. A `DB_BENCH` run that did *not* crash was therefore benchmarking the
-> **synthetic stand-in model, not DeepSeek-V4**. See the section at the end of this file.
+> **🔴 Flash's old batched numbers (32.8 @ M=32 / 31.0 @ M=16) were RETRACTED and re-measured.**
+> They were produced by the bare `run_ds4f_11n.sh`, which defaults **`DS4F_EXACT=0`** (stand-in math;
+> base's script defaults it to **1**) — so they were never measurements of DeepSeek-V4 at all. On the
+> real model that path first **segfaulted** (no RoPE tables under `EXACT=0`; fixed below), and once it
+> runs it is **24.0 @ M=32 / 21.6 @ M=16** — the retracted figures were **~35–45% too high**.
+> See the section at the end of this file.
 
 **Every base number above is from ONE allocation (job 49556601) with the gate green** —
 `./bench_headline_12n.sh`, which runs `VERIFY_GATE` **first** and aborts the whole benchmark if it
@@ -2906,6 +2906,29 @@ gen, `PREFILL_GEMM` and `VERIFY_GATE` all passed while a bare `DB_BENCH` died.
 bare run script, i.e. **with stand-in math — they were never measurements of DeepSeek-V4 at all.**
 They are retracted, not merely refreshed. This is the `DB_BENCH`-garbage lesson wearing a new coat:
 *a number is only as real as the model that produced it, and nothing in the harness was checking.*
+
+### The real Flash batched numbers (`DS4F_EXACT=1`, 11n, `flash_db_fixed.sh`)
+
+| M | ms/step | aggregate | per-seq |
+|---|---|---|---|
+| 1 | 165.3 | 6.0 tok/s | 6.05 |
+| 2 | 202.4 | 9.9 | 4.94 |
+| 4 | 280.6 | 14.3 | 3.56 |
+| 8 | 441.4 | 18.1 | 2.27 |
+| 16 | 739.9 | **21.6** | 1.35 |
+| 32 | 1330.9 | **24.0** | 0.75 |
+
+**The retracted numbers were ~35–45% too high** (32.8 → 24.0 @ M=32; 31.0 → 21.6 @ M=16) — exactly the
+kind of flattering error stand-in math produces. Correctness of this path rests on `VERIFY_GATE`
+(16/16 PASS on Flash); `DB_BENCH` only *times* steps and never inspects its output.
+
+Two things worth reading off the curve. **Batching pays 4× on aggregate** (6.0 → 24.0) but costs **8×
+in per-sequence latency** (6.05 → 0.75 tok/s/seq) — that is the serving trade, stated honestly.
+And **M=1 batched (6.0) is far below single-stream (15.54)**, because `DB_BENCH` drives the *GEMM*
+forward while single-stream uses the matvec forward — and Flash's MXFP4 experts run the `svtbl`
+dequant path, which is flat ~84 Gmac/s and does not amortize over M. Base does not show this gap as
+sharply (17.1 batched vs 21.5 single) because its Q8 experts hit the fast sdot kernel. **Never quote
+`DB_BENCH` M=1 as a single-stream number; they are different kernels.**
 
 **Fixes:** `ds4f_forward_verify` now **aborts with an explanatory message** when `!m->exact` instead
 of dereferencing NULL; `bench_headline_flash_11n.sh` sets `EXACT/TIERB2/MHC=1` explicitly.
