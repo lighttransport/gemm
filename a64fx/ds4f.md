@@ -11,7 +11,14 @@ hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 | model | experts | single-stream | batched (aggregate) | prefill | arena |
 |---|---|---|---|---|---|
 | **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **21.5–23.0 tok/s** | **34.6 @ M=16** | **37.2 tok/s** (`PREFILL_GEMM`, K=32) | 26.9 GB |
-| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.54 tok/s** | **24.0 @ M=32** / 21.6 @ M=16 | **24.9 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.56 tok/s** | **24.1 @ M=32** / 21.6 @ M=16 | **25.1 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
+
+**Flash's row is now a single-allocation, gate-first measurement** (`bench_headline_flash_11n.sh`,
+the same standard base meets) — `VERIFY_GATE` 16/16, then decode/prefill on a real 70-token prompt,
+then the batched sweep. Full curve: **M=1 6.3 | M=2 10.1 | M=4 14.4 | M=8 18.2 | M=16 21.6 | M=32 24.1**
+tok/s aggregate (per-seq 6.28 → 0.75: **4× throughput for 8× worse latency** — that is the serving
+trade). Measured on the *hardened* runner; every number is within noise of the pre-hardening values,
+so the reliability work costs nothing.
 
 > Flash's old **18.98** was a synthetic-ctx=8 number, like base's 22.45. On a **real 70-token prompt**
 > it is **15.54** (was 12.57 before the indexer-scan fix).
@@ -2935,6 +2942,65 @@ of dereferencing NULL; `bench_headline_flash_11n.sh` sets `EXACT/TIERB2/MHC=1` e
 Also added `DS4F_BACKTRACE=1` (per-rank backtrace → `$HOME/ds4f_crash_rank<NN>.txt`, on an altstack)
 and `DS4F_TRACE=1` (checkpoints), which are what made this findable at all — **the MPI launcher's
 `sig=11` on its own tells you nothing, and rank stderr never reaches your log.**
+
+## 🛡️ PRODUCTION HARDENING (2026-07-15) — read this FIRST when a run "dies silently"
+
+**A run never dies silently any more. If it looks like it did, you are reading the wrong file.**
+
+```sh
+. ./ds4f_show_error.sh; ds4f_show_error        # prints the failing rank's actual error
+cat logs/latest/rank<NN>.err                   # or read it directly
+```
+
+### The three failure modes this fixes, and what each really was
+
+| what you saw | what it actually was |
+|---|---|
+| `PLE 0610 ... (rank=6)(sig=11)` — "a segfault" | **an OOM.** ~215 of 220 allocations were `aligned_alloc` followed straight by a write, so exhaustion was a NULL deref. Flash's "M=32 OOMs" was this. |
+| "died in 3s, no output, cause unknown" | **the `/local` stage was wiped** (it dies with every job restart). The runner said so *precisely* — in `ds4f_ep_stderr_rank00.txt` — but the wrappers grepped `$LOG`, the mpiexec stdout log, which is **always empty**. |
+| a PASSING gate that looked like a crash | **the next run truncated the evidence.** Logs were `fopen(...,"w")` in the CWD, rank 0 only. |
+
+### What is in place now
+
+- **Every allocation checked** (`ds4f_xalloc`/`xmalloc`/`xcalloc`, all 220 sites, zero raw allocs).
+  On failure: *"out of memory allocating `kv_cache` (N MB); X GB allocated so far; node has Y GB available"*.
+- **`ds4f_fatal()`** — one rank-tagged fatal path, prints `MemAvailable`, flushes, aborts.
+- **Pre-flight, before the 4-minute load**: missing stage / arena-won't-fit / `EXACT=0`-with-a-batched-path
+  all fail in **seconds** with an actionable message.
+- **Durable per-run logs**: `logs/run-<jobid>/rank<NN>.{log,err}` + `latest`, **every rank**, never
+  overwritten. `ds4f_ep_rank00.txt` remains as a symlink — see the warning below.
+- **Backtrace handler ON by default** (`sigaltstack` + `-g -rdynamic`): `sig=11` becomes
+  `ds4f_pf_qnr_worker -> ds4f_rope_apply`.
+- **`DS4F_TEST_OOM=1` / `DS4F_TEST_SEGV=1`** — gated hooks that deliberately trip the diagnostics.
+  *A crash handler that has never been triggered is exactly what turns out to be broken on the day
+  you need it.* Verified: `verify_hardening.sh` (all 4 steps pass; costs nothing measurable).
+
+### ★ `DS4F_ALLOC_SANITY_GB` — because on Linux, "checked malloc" is a LIE
+
+A **64 TB `aligned_alloc` SUCCEEDS.** Overcommit hands out the address space, the NULL check never
+fires, and the process is **SIGKILLed later when it TOUCHES the pages** — on a random rank, with no
+message. That is precisely the `sig=9`-with-no-output pattern that costs days, and it is what an
+unchecked **bad size expression** looks like in production.
+
+So a checked allocator catches allocator *failure* but **not overcommit death**; alone it is theatre
+for the failure mode that actually hurts. Hence the **64 GB sanity ceiling**: any single buffer larger
+than twice the node's RAM is a bad size expression *by construction*, and is refused up front with a
+message. Genuine shortage is caught earlier, by the pre-flight.
+
+### ⚠️ Two self-inflicted bugs — do not repeat them
+
+1. **An automated rewrite will rewrite the wrapper's OWN BODY.** Converting 220 call sites to
+   `ds4f_xalloc`, the script also rewrote the definition: `ds4f_xalloc() { void *p = ds4f_xalloc(...); }`
+   — **infinite recursion**, stack blown on all 47 pool threads, presenting as an instant SIGKILL on
+   every rank with no message. It looks exactly like a bad node. **Exclude the definition, then grep
+   the wrapper body to confirm it calls the RAW allocator.**
+2. **Moving a log breaks every consumer.** `ds4f_ep_rank00.txt` is what the wrappers, gates and
+   benchmarks grep for the prefill/decode lines. Relocating it into `logs/` made runs **complete
+   successfully while reporting NO NUMBERS**. It is now a symlink into the per-run dir. *A durability
+   fix that quietly severs the data path is worse than the truncation it replaced.*
+
+(And: `cp`ing a binary over `build/` gives it a fresh mtime, so `make` skips the rebuild — I then
+A/B-tested the reference binary against **itself** and got a meaningless "both pass".)
 
 ### ⚠️ Build trap: `make` alone silently builds the WRONG binary
 
