@@ -27,6 +27,9 @@ export GLM5_PREFILL_GROUPS=1
 export GLM5_CP_THRESHOLD=-1 GLM5_CP=0 GLM5_INT4_KV=0 GLM5_MSA=0
 export GLM5_MAXPOS="${GLM5_MAXPOS:-2304}" GLM5_PCHUNK="${GLM5_PCHUNK:-512}"
 export GLM5_IQ_REF="${GLM5_IQ_REF:-1}"
+export TP_AR_BF16="${TP_AR_BF16:-1}" TP_AR_ROBUST="${TP_AR_ROBUST:-1}"
+export GLM5_BF16_GEMM_TOK="${GLM5_BF16_GEMM_TOK:-5}"
+export GLM5_ATTN_QK="${GLM5_ATTN_QK:-1}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 export TF_HW_BARRIER="${TF_HW_BARRIER:-1}"
 
@@ -79,7 +82,7 @@ case "$MODE" in
         export GLM5_PROMPT_IDS="$RUN_DIR/prompt.ids"
         ;;
     prefill)
-        export GLM5_LAYERS=78 GLM5_PREFILL_ONLY=1 GLM5_MAX_NEW=0 LLM_THREADS="${LLM_THREADS:-24}"
+        export GLM5_LAYERS=78 GLM5_PREFILL_ONLY=1 GLM5_MAX_NEW=0 LLM_THREADS="${LLM_THREADS:-48}"
         make_prompt 2048 "$RUN_DIR/prompt.ids"
         export GLM5_PROMPT_IDS="$RUN_DIR/prompt.ids"
         ;;

@@ -540,8 +540,22 @@ int main(int argc, char **argv) {
                 fatal("need at least 27 GiB free under %s (have %.2f GiB)",
                       outdir,(double)freeb/(1024.0*1024.0*1024.0));
         }
-        if (!force && access(blob,F_OK)==0 && access(mani,F_OK)==0)
-            fatal("rank %d output exists (use --force)",rank);
+        if (!force && access(blob,F_OK)==0 && access(mani,F_OK)==0) {
+            struct stat done;
+            FILE *dm=fopen(mani,"r");
+            char line[256]; uint64_t declared=0; int version=0;
+            while(dm&&fgets(line,sizeof line,dm)) {
+                if(strstr(line,"glm52-a64fx-ep12-v1")) version=1;
+                if(sscanf(line,"# blob_bytes %" SCNu64,&declared)==1) {}
+            }
+            if(dm) fclose(dm);
+            if(version && declared && !stat(blob,&done) && (uint64_t)done.st_size==declared) {
+                fprintf(stderr,"glm52-convert: rank %d complete; reusing %s\n",rank,blob);
+                close_sources(&sources);
+                return 0;
+            }
+            fatal("rank %d output is incomplete/incompatible (use --force)",rank);
+        }
         o.blob=fopen(btmp,"wb");
         o.manifest=fopen(mtmp,"w");
         if(!o.blob||!o.manifest)
