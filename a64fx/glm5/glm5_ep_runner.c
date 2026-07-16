@@ -584,6 +584,143 @@ static void cbatch_kv_to_stream(glm5_model*root,glm5_model*src,int stream,int np
                src->layers[l].kv_cache,(size_t)npos*KVC*2);
 }
 
+static void cbatch_stream_to_kv(glm5_model*root,int stream,int npos){
+    glm5_mstream*ms=(glm5_mstream*)root->ms; const glm5_config*c=&root->cfg;
+    const int KVC=glm5_kv_cache_dim(c); const size_t per=(size_t)c->n_layers*c->max_pos*KVC;
+    for(int l=0;l<c->n_layers;l++)
+        memcpy(root->layers[l].kv_cache,
+               ms->kc+(size_t)stream*per+(size_t)l*c->max_pos*KVC,
+               (size_t)npos*KVC*2);
+}
+
+static void copy_runtime_kv(glm5_model*dst,glm5_model*src,int npos){
+    const glm5_config*c=&src->cfg;
+    const int KVC=glm5_kv_cache_dim(c), ID=c->index_dim;
+    for(int l=0;l<c->n_layers;l++){
+        if(dst->layers[l].kv_cache && src->layers[l].kv_cache)
+            memcpy(dst->layers[l].kv_cache,src->layers[l].kv_cache,(size_t)npos*KVC*2);
+        if(dst->layers[l].idx_k_cache && src->layers[l].idx_k_cache)
+            memcpy(dst->layers[l].idx_k_cache,src->layers[l].idx_k_cache,(size_t)npos*ID*2);
+    }
+}
+
+static void glm5_spec_selftest(glm5_model*m,int cur,int n_prompt,int C){
+    if(!envi("GLM5_SPEC_SELFTEST",0)) return;
+    if(m->cp_on || m->int4_kv){ if(MyRank==0) logmsg("SPEC_SELFTEST: skip (needs CP off + bf16 KV)\n"); return; }
+    glm5_model*seq=glm5_clone_runtime(m);
+    if(!seq){ if(MyRank==0) logmsg("SPEC_SELFTEST: clone failed\n"); return; }
+    copy_runtime_kv(seq,m,n_prompt);
+    glm5_model*chk=glm5_clone_runtime(m);
+    if(chk) copy_runtime_kv(chk,m,n_prompt);
+    float *xs=glm5_amalloc((size_t)C*4), *h0=glm5_amalloc((size_t)C*4);
+    float *h1=glm5_amalloc((size_t)C*4), *xb=glm5_amalloc((size_t)2*C*4), *xc=glm5_amalloc((size_t)2*C*4);
+    int out_seq0=-1,out_seq1=-1,out_b[2]={-1,-1}, pos[2]={n_prompt,n_prompt+1}, sid[2]={0,0};
+    embed_lookup(seq,cur,xs);
+    out_seq0=glm5_forward_token(seq,xs,n_prompt);
+    memcpy(h0,xs,(size_t)C*4);
+    embed_lookup(seq,out_seq0,xs);
+    out_seq1=glm5_forward_token(seq,xs,n_prompt+1);
+    memcpy(h1,xs,(size_t)C*4);
+    if(glm5_alloc_mstream_ex(m,2,1)){
+        if(MyRank==0) logmsg("SPEC_SELFTEST: mstream alloc failed\n");
+    } else {
+        cbatch_kv_to_stream(m,m,0,n_prompt);
+        embed_partial(m,cur,xb);
+        embed_partial(m,out_seq0,xb+C);
+        if(m->emb_rows<m->cfg.vocab && m->ar_cb) m->ar_cb(xb,2*C,m->ar_ctx);
+        glm5_mstream*ms=(glm5_mstream*)m->ms;
+        ms->sid=sid;
+        glm5_forward_batch_decode_mla(m,xb,2,pos,out_b);
+        ms->sid=NULL;
+        double s0=0.0,d0=0.0,s1=0.0,d1=0.0,m0=0.0,m1=0.0;
+        for(int i=0;i<C;i++){
+            double a0=h0[i], b0=xb[i], e0=a0-b0;
+            double a1=h1[i], b1=xb[C+i], e1=a1-b1;
+            s0+=a0*a0; d0+=e0*e0; if(fabs(e0)>m0) m0=fabs(e0);
+            s1+=a1*a1; d1+=e1*e1; if(fabs(e1)>m1) m1=fabs(e1);
+        }
+        glm5_free_mstream(m);
+        if(MyRank==0) logmsg("SPEC_SELFTEST seq=(%d,%d) batch=(%d,%d) %s\n",
+                             out_seq0,out_seq1,out_b[0],out_b[1],
+                             (out_seq0==out_b[0] && out_seq1==out_b[1])?"MATCH":"*** MISMATCH ***");
+        if(MyRank==0) logmsg("SPEC_SELFTEST hidden_relerr row0=%.3e max=%.3e row1=%.3e max=%.3e\n",
+                             s0>0.0?sqrt(d0/s0):0.0,m0,s1>0.0?sqrt(d1/s1):0.0,m1);
+    }
+    if(chk){
+        embed_lookup(chk,cur,xc);
+        embed_lookup(chk,out_seq0,xc+C);
+        if(glm5_alloc_mstream_ex(chk,2,0)){
+            if(MyRank==0) logmsg("SPEC_SELFTEST: prefill mstream alloc failed\n");
+        } else {
+            int out_c=glm5_forward_prefill_chunk(chk,xc,2,n_prompt,1);
+            double s=0.0,d=0.0,mx=0.0;
+            for(int i=0;i<C;i++){
+                double a=h1[i], b=xc[C+i], e=a-b;
+                s+=a*a; d+=e*e; if(fabs(e)>mx) mx=fabs(e);
+            }
+            glm5_free_mstream(chk);
+            if(MyRank==0) logmsg("SPEC_SELFTEST prefill2 last=%d expected=%d %s hidden_relerr=%.3e max=%.3e\n",
+                                 out_c,out_seq1,out_c==out_seq1?"MATCH":"*** MISMATCH ***",
+                                 s>0.0?sqrt(d/s):0.0,mx);
+        }
+        glm5_free(chk);
+    }
+    glm5_afree(xs); glm5_afree(h0); glm5_afree(h1); glm5_afree(xb); glm5_afree(xc); glm5_free(seq);
+}
+
+static int glm5_run_spec_verify(glm5_model*m,int *gen,int *ng,int max_new,int min_new,
+                                int n_prompt,int *curp,float*x,int C,int *nanp,
+                                long *hitp,long *totp){
+    if(m->cp_on || m->int4_kv || !m->mtp_layer) return 0;
+    if(glm5_alloc_mstream_ex(m,2,1)) return 0;
+    cbatch_kv_to_stream(m,m,0,n_prompt);
+    float *BX=glm5_amalloc((size_t)2*C*4), *xb=glm5_amalloc((size_t)2*C*4);
+    int pos[2], out[2], sid[2]={0,0};
+    glm5_mstream*ms=(glm5_mstream*)m->ms;
+    ms->sid=sid;
+    int cur=*curp, p=n_prompt, draft=glm5_mtp_draft(m,x,cur,p,xb);
+    int warm=envi("GLM5_SPEC_WARMUP",8), min_alpha=envi("GLM5_SPEC_MIN_ALPHA_PCT",25);
+    long hit=0, tot=0, steps=0; int aborted=0;
+    while(*ng<max_new){
+        if(draft<0) break;
+        embed_partial(m,cur,BX);
+        embed_partial(m,draft,BX+C);
+        if(m->emb_rows<m->cfg.vocab && m->ar_cb) m->ar_cb(BX,2*C,m->ar_ctx);
+        pos[0]=p; pos[1]=p+1;
+        glm5_forward_batch_decode_mla(m,BX,2,pos,out);
+        for(int i=0;i<2*C;i++) if(!(BX[i]==BX[i])){ (*nanp)++; break; }
+        gen[(*ng)++]=cur;
+        int eos0=(cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2);
+        if(eos0 && *ng>=min_new){ cur=out[0]; p++; memcpy(x,BX,(size_t)C*4); break; }
+        tot++;
+        if(out[0]==draft && *ng<max_new){
+            hit++;
+            gen[(*ng)++]=draft;
+            int eos1=(draft==GLM5_EOS_ID0||draft==GLM5_EOS_ID1||draft==GLM5_EOS_ID2);
+            cur=out[1]; p+=2; memcpy(x,BX+C,(size_t)C*4);
+            if(eos1 && *ng>=min_new) break;
+        } else {
+            cur=out[0]; p++; memcpy(x,BX,(size_t)C*4);
+        }
+        draft=glm5_mtp_draft(m,x,cur,p,xb);
+        steps++;
+        if(warm>0 && tot>=warm && hit*100 < (long)min_alpha*tot){
+            cbatch_stream_to_kv(m,0,p);
+            aborted=1;
+            if(MyRank==0) logmsg("SPEC_VERIFY abort: alpha %ld/%ld below %d%% after warmup; restored %d KV positions\n",
+                                 hit,tot,min_alpha,p);
+            break;
+        }
+    }
+    ms->sid=NULL;
+    glm5_free_mstream(m);
+    glm5_afree(BX); glm5_afree(xb);
+    *curp=cur; *hitp=hit; *totp=tot;
+    if(MyRank==0) logmsg("SPEC_VERIFY steps=%ld emitted=%d accept=%ld/%ld %.1f%%\n",
+                         steps,*ng,hit,tot,tot?100.0*(double)hit/(double)tot:0.0);
+    return aborted?2:1;
+}
+
 static int cbatch_start(cb_slot*s,const id_prompt*p,int req,int max_new,int C,double *prefill_sec,double *prefill_ar,long *prefill_calls){
     s->req=req; s->n_prompt=p->n; s->ng=0; s->done=0; s->nan=0; s->cur=0;
     g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
@@ -765,7 +902,34 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
  * exports OMP_PROC_BIND=close / OMP_PLACES=cores (best-effort setenv here as a fallback). Default ON. */
 static void glm5_apply_numa(int on){
     if(!on) return;
-    unsigned long nodemask=~0UL;                 /* all NUMA nodes */
+    /* Interleave over the NUMA nodes that hold OUR cpus only.  On A64FX nodes 0-3 are the
+     * tiny assistant-core nodes (~700 MB each); a ~0UL mask makes the kernel round-robin
+     * weight pages onto them until they fill.  NOTE: page placement only follows this
+     * policy under XOS demand paging (XOS_MMM_L_PAGING_POLICY=demand:demand:demand, set
+     * by the launcher); the default prepage policy puts every heap page on the allocating
+     * thread's CMG and caps multi-CMG streaming at ~94 GB/s (measured; demand = 843). */
+    unsigned long nodemask=0;
+    cpu_set_t aff;
+    if(sched_getaffinity(0,sizeof aff,&aff)==0){
+        for(int nd=0;nd<64;nd++){
+            char p[128]; snprintf(p,sizeof p,"/sys/devices/system/node/node%d/cpulist",nd);
+            FILE*f=fopen(p,"r"); if(!f) continue;
+            char buf[256]={0};
+            if(fgets(buf,sizeof buf,f)){
+                char*s=buf;
+                while(*s && *s!='\n'){
+                    char*e; long a=strtol(s,&e,10); if(e==s) break;
+                    long b=a; s=e;
+                    if(*s=='-'){ b=strtol(s+1,&e,10); s=e; }
+                    for(long cc=a;cc<=b;cc++)
+                        if(cc>=0 && cc<CPU_SETSIZE && CPU_ISSET((int)cc,&aff)){ nodemask|=1UL<<nd; break; }
+                    if(*s==',') s++; else break;
+                }
+            }
+            fclose(f);
+        }
+    }
+    if(!nodemask) nodemask=~0UL;
     syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &nodemask, (unsigned long)(8*sizeof nodemask));
     setenv("OMP_PROC_BIND","close",0);           /* 0 = don't override if the script already set it */
     setenv("OMP_PLACES","cores",0);
@@ -1068,6 +1232,12 @@ int main(int argc,char**argv){
         /* GLM5_PREFILL_SP=1: query-sequence-parallel chunk (attention half sharded by home
          * query slice, N-way; needs GLM5_TP=0 replicated weights). Fallback: classic chunk. */
         int prefill_sp=envi("GLM5_PREFILL_SP",0);
+        /* MTP prefill support: the draft block keeps its OWN latent-KV cache, so drafting
+         * during decode attends garbage for every prompt position unless we back-fill it.
+         * Capture the last-layer residual of every prompt position here (the chunk buffer
+         * already holds exactly that on return), then after prefill run the drafter over
+         * the prompt once to populate its KV (side computation; main KV untouched). */
+        float*mtp_h=(envi("GLM5_MTP",0)||envi("GLM5_SPEC",0))?(float*)glm5_amalloc((size_t)n_prompt*C*4):NULL;
         if(pchunk>0){
             if(glm5_alloc_mstream_ex(m,pchunk,0)) die("alloc prefill chunk",-1);
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
@@ -1076,6 +1246,7 @@ int main(int argc,char**argv){
                 int a=prefill_sp?glm5_forward_prefill_chunk_sp(m,Xc,S,p0,p0+S>=n_prompt)
                                 :glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=n_prompt);
                 if(prefill_sp && a<-1) die("GLM5_PREFILL_SP needs GLM5_TP=0, CP/MSA off",a);
+                if(mtp_h) memcpy(mtp_h+(size_t)p0*C,Xc,(size_t)S*C*4);
                 if(a>=0) pf_last=a; }
             glm5_afree(Xc); glm5_free_mstream(m);
             if(MyRank==0) logmsg("prefill: chunked M=%d%s\n",pchunk,prefill_sp?" (query-SP)":"");
@@ -1084,6 +1255,7 @@ int main(int argc,char**argv){
          * A correct LM scores ~40-80%; a broken forward ~0%. Compares int8 vs bf16 to localize. */
         int tf_check=envi("GLM5_TF_CHECK",0), tf_ok=0, tf_tot=0;
         for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=glm5_forward_token(m,x,p);
+            if(mtp_h) memcpy(mtp_h+(size_t)p*C,x,(size_t)C*4);
             if(tf_check && p+1<n_prompt){ tf_tot++; if(pf_last==prompt[p+1]) tf_ok++;
                 if(MyRank==0 && p<12) logmsg("TF p=%d pred=%d actual=%d %s\n",p,pf_last,prompt[p+1],pf_last==prompt[p+1]?"HIT":"."); } }
         if(tf_check && MyRank==0) logmsg("TF_ACCURACY %d/%d = %.1f%% (argmax(p)==prompt[p+1]; real LM ~40-80%%, broken ~0%%)\n",
@@ -1102,6 +1274,7 @@ int main(int argc,char**argv){
             }
             glm5_afree(prompt); glm5_afree(x); glm5_free(m); return 0;
         }
+        glm5_spec_selftest(m,pf_last,n_prompt,C);
         int *gen=glm5_amalloc((size_t)(max_new>0?max_new:1)*sizeof(int)),ng=0,cur=pf_last,nan=0;
         /* MTP (GLM5_MTP / GLM5_SPEC): each decode step, draft the NEXT token from the just-produced
          * token + its residual hidden (glm5_mtp_draft), and measure acceptance alpha = P(draft == the
@@ -1112,17 +1285,54 @@ int main(int argc,char**argv){
         int mtp_on=(m->mtp_layer!=NULL) && (envi("GLM5_MTP",0)||envi("GLM5_SPEC",0));
         float *xb=mtp_on?(float*)glm5_amalloc((size_t)2*C*4):NULL;
         int prev_draft=-1; long mtp_hit=0,mtp_tot=0;
+        if(mtp_on && mtp_h){
+            /* Back-fill the draft block's KV over the prompt: draft(h_t, token at t+1, pos t+1)
+             * for every prompt position (slot 0 seeded from a zero hidden).  Lockstep on all
+             * ranks (the draft forward carries the usual EP/TP collectives). */
+            double tf0=now_sec();
+            float*hz=(float*)glm5_amalloc((size_t)C*4); memset(hz,0,(size_t)C*4);
+            glm5_mtp_draft(m,hz,prompt[0],0,xb);
+            long dtf_ok=0,dtf_tot=0;
+            for(int t=0;t<n_prompt;t++){
+                int d=glm5_mtp_draft(m,mtp_h+(size_t)t*C,(t+1<n_prompt)?prompt[t+1]:cur,t+1,xb);
+                if(t+2<n_prompt){ dtf_tot++; if(d==prompt[t+2]) dtf_ok++;
+                    if(MyRank==0 && t<6 && envi("GLM5_MTP_DBG",0))
+                        logmsg("MTP-TF t=%d draft=%d actual=%d %s\n",t,d,prompt[t+2],d==prompt[t+2]?"HIT":"."); }
+            }
+            glm5_afree(hz);
+            if(MyRank==0) logmsg("MTP prefill: draft KV filled for %d positions in %.2fs; drafter TF %ld/%ld = %.1f%%\n",
+                                 n_prompt+1,now_sec()-tf0,dtf_ok,dtf_tot,dtf_tot?100.0*dtf_ok/dtf_tot:0.0);
+        }
+        if(mtp_h){ glm5_afree(mtp_h); mtp_h=NULL; }
         if(mtp_on && MyRank==0) logmsg("MTP draft on: measuring acceptance alpha over %d decode steps\n",max_new);
         g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
         double td0=now_sec();
-        for(int g=0;g<max_new;g++){ gen[ng++]=cur; if((cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) && ng>=min_new) break;
-            m->samp_hist=gen; m->samp_hist_n=ng;   /* repetition penalty over tokens so far */
-            embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
-            if(mtp_on){
-                if(prev_draft>=0){ mtp_tot++; if(prev_draft==cur) mtp_hit++; }
-                prev_draft=glm5_mtp_draft(m,x,cur,n_prompt+g+1,xb);  /* draft the token at n_prompt+g+2 */
+        int spec_verify=envi("GLM5_SPEC_VERIFY",0) && mtp_on && m->samp_temp<=0.0f;
+        if(spec_verify){
+            if(MyRank==0) logmsg("SPEC_VERIFY on: experimental K=2 batched verifier (greedy only)\n");
+            int sv=glm5_run_spec_verify(m,gen,&ng,max_new,min_new,n_prompt,&cur,x,C,&nan,&mtp_hit,&mtp_tot);
+            if(!sv){
+                if(MyRank==0) logmsg("SPEC_VERIFY unavailable -> falling back to side-draft decode\n");
+                spec_verify=0;
+            } else if(sv==2){
+                if(MyRank==0) logmsg("SPEC_VERIFY fell back at generated=%d\n",ng);
+                spec_verify=0;
             }
-            for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
+        }
+        if(!spec_verify){
+            for(int g=ng;g<max_new;g++){ gen[ng++]=cur; if((cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) && ng>=min_new) break;
+                m->samp_hist=gen; m->samp_hist_n=ng;   /* repetition penalty over tokens so far */
+                embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
+                if(mtp_on){
+                    if(prev_draft>=0){ mtp_tot++; if(prev_draft==cur) mtp_hit++;
+                        if(MyRank==0 && mtp_tot<=10 && envi("GLM5_MTP_DBG",0))
+                            logmsg("MTP dbg %ld: draft=%d actual=%d %s\n",
+                                   mtp_tot,prev_draft,cur,prev_draft==cur?"HIT":".");
+                    }
+                    prev_draft=glm5_mtp_draft(m,x,cur,n_prompt+g+1,xb);  /* draft the token at n_prompt+g+2 */
+                }
+                for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
+        }
         double td=now_sec()-td0;
         double mtp_alpha=mtp_tot?(double)mtp_hit/mtp_tot:0.0;
         double gen_d_ar=g_ar_secs; long gen_d_calls=g_ar_calls, gen_d_frags=g_ar_frags;

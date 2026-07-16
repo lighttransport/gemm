@@ -26,8 +26,19 @@ export GLM5_TP_FFN=1 GLM5_TP_HEAD=1 GLM5_TP_EMBED=1
 export GLM5_PREFILL_GROUPS=1
 export GLM5_CP_THRESHOLD=-1 GLM5_CP=0 GLM5_INT4_KV=0 GLM5_MSA=0
 export GLM5_MAXPOS="${GLM5_MAXPOS:-2304}" GLM5_PCHUNK="${GLM5_PCHUNK:-512}"
+# XOS default (prepage) puts every heap page on the allocating thread's CMG: multi-CMG
+# streaming collapses to ~94 GB/s. demand restores first-touch/mempolicy -> 843 GB/s.
+export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
+# IQ_MODE=1 (q8 SDOT expert kernels, llama.cpp Q8_K-equivalent accuracy) is the tuned
+# decode path; GLM5_IQ_MODE=0 / GLM5_IQ_REF=1 restores source-faithful F32 dequant.
+export GLM5_IQ_MODE="${GLM5_IQ_MODE:-1}"
+# A64FX HARDWARE barrier for the OMP runtime: the software barrier's release/arrival
+# stagger costs ~25-40us PER SYNC at 47 threads in-decode (~150us/layer across the fused
+# stages); HARD collapses it (measured 13.3 -> 15.0 tok/s). FLIB overrides OMP_PROC_BIND
+# itself (benign jwe1051i warning). FLIB_BARRIER=SOFT restores the software barrier.
+export FLIB_BARRIER="${FLIB_BARRIER:-HARD}"
 export GLM5_IQ_REF="${GLM5_IQ_REF:-1}"
-export TP_AR_BF16="${TP_AR_BF16:-1}" TP_AR_ROBUST="${TP_AR_ROBUST:-1}"
+export TP_AR_BF16="${TP_AR_BF16:-1}" TP_AR_ROBUST="${TP_AR_ROBUST:-2}"
 export GLM5_BF16_GEMM_TOK="${GLM5_BF16_GEMM_TOK:-5}"
 export GLM5_ATTN_QK="${GLM5_ATTN_QK:-1}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"

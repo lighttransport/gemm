@@ -29,6 +29,8 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$dry" = 1 ] && args+=(--dry-run)
 [ "$force" = 1 ] && args+=(--force)
+[ "${GLM52_SHARD2:-0}" = 1 ] && args+=(--shard2)
+[ "${GLM52_MTP:-0}" = 1 ] && args+=(--mtp)
 
 if [ -n "$rank" ]; then
     exec "$BIN" "${args[@]}" --rank "$rank"

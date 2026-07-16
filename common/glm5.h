@@ -171,6 +171,12 @@ static inline int glm5_is_ggml_q(glm5_qtype t) {
            t == GLM5_Q4_K || t == GLM5_Q5_K || t == GLM5_Q6_K ||
            t == GLM5_IQ2_XS || t == GLM5_IQ3_XXS || t == GLM5_IQ4_XS;
 }
+/* types the fast q8/a16 mixed-IQ row kernels implement; every other ggml type
+ * (e.g. the nextn block's Q2_K/Q3_K experts) must take the source-faithful
+ * dequant fallback — feeding them to the IQ kernels produces garbage. */
+static inline int glm5_iq_q8_ok(glm5_qtype t) {
+    return t == GLM5_IQ2_XS || t == GLM5_IQ3_XXS || t == GLM5_IQ4_XS;
+}
 
 typedef struct {
     void    *w;       /* weight bytes */
@@ -271,6 +277,7 @@ typedef struct glm5_layer_s {
     glm5_tensor *ex_w1, *ex_w3, *ex_w2; /* owned routed experts, 0..n_owned-1 */
     int      *owned_eid;      /* global expert id of each owned slot */
     int       n_owned;
+    int       ex_iqok;   /* all owned expert tensors use the fast-IQ-kernel types */
     /* TP_SHARED: shared-expert intermediate shard [sh_r0, sh_r0+sh_rows) for w1/w3
      * (w2 input-sharded correspondingly, output EP-summed). */
     int sh_r0, sh_rows;
@@ -301,6 +308,7 @@ typedef struct glm5_pool glm5_pool;
 typedef struct {
     glm5_config cfg;
     int ep_rank, ep_size;
+    int ex_shard2, ex_no0;   /* 2-way expert shard (manifest "# expert_shard 2"); no0 = h0 slot count */
     int prefill_ntok;   /* tokens in the current prefill chunk; gates expert sdot (auto >= 1024) */
     glm5_layer *layers;
     /* embeddings / head (BF16; TP vocab-sharded) */
@@ -361,6 +369,10 @@ typedef struct {
     float *s_idx_q, *s_idx_k;          /* MSA index projections */
     float *s_blk_score; int *s_blk_sel; int s_blk_nsel;  /* per-block scores + selected block ids */
     float *s_attn_score;               /* [local_heads, max_pos] decode attention scores */
+    float *s_pctx,*s_pmx,*s_pse,*s_qfull; /* parallel absorbed-attention tile partials */
+    void  *s_iqx,*s_iqx2;              /* fused-decode pre-quantized q8 activations (h2 / expert gate) */
+    int16_t *s_axq,*s_axq2; int64_t *s_axg,*s_axg2; /* fused-decode hoisted a16 activations (int8 dense) */
+    int16_t *s_bxq,*s_bxq2; float *s_bxsc,*s_bxsc2; int64_t *s_bxg,*s_bxg2; /* fused-batch (M<=4) preq activations */
     float *s_router, *s_shg, *s_shu, *s_sh, *s_exg, *s_exu, *s_moe;
     float *s_route;                    /* routed-expert partial (owned-only); EP-summed via ar_cb */
     float *s_ff_g, *s_ff_u, *s_ff;     /* dense FFN scratch */

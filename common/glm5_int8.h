@@ -159,6 +159,15 @@ static inline void glm5_matvec_int16sdot_8row(float*restrict dst,
     double bc0=0,bc1=0,bc2=0,bc3=0,bc4=0,bc5=0,bc6=0,bc7=0;
     for(int b=0;b<cols;){
         int blk=(qg0+b)/gs, bend=(blk+1)*gs-qg0; if(bend>cols)bend=cols; int c=b;
+        /* cold-stream prefetch: decode visits each weight row once per token; the 8 short
+         * per-row streams under-run the HW prefetcher (~157 GB/s effective vs 433 hot).
+         * One PRFM per row per group block (64 B/row advance), ~1 KB ahead. */
+        if(b+1024<cols){
+            __builtin_prefetch(&w0[b+1024]); __builtin_prefetch(&w1[b+1024]);
+            __builtin_prefetch(&w2[b+1024]); __builtin_prefetch(&w3[b+1024]);
+            __builtin_prefetch(&w4[b+1024]); __builtin_prefetch(&w5[b+1024]);
+            __builtin_prefetch(&w6[b+1024]); __builtin_prefetch(&w7[b+1024]);
+        }
         svint64_t d0=svdup_s64(0),d1=svdup_s64(0),d2=svdup_s64(0),d3=svdup_s64(0);
         svint64_t d4=svdup_s64(0),d5=svdup_s64(0),d6=svdup_s64(0),d7=svdup_s64(0);
         #define GLM5_SD16(WP,D) do{ svint16_t wv=svreinterpret_s16_u16(svld1ub_u16(pg,&(WP)[c])); \

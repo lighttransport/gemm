@@ -41,10 +41,24 @@
 #include <omp.h>
 #endif
 /* parallelize a matvec/down-proj only when the output dim is large enough that the
- * fork/join barrier is amortized (small projections stay serial). */
-#define GLM5_PAR_MIN 512
+ * fork/join barrier is amortized.  Was a compile-time 512; under XOS demand paging the
+ * 47-thread region costs ~10 us while a serial 171-row bf16 GEMV costs ~67 us, so the
+ * crossover sits far lower.  GLM5_PAR_MIN env overrides (default 64). */
+#define GLM5_PAR_MIN glm5_par_min()
+static int glm5_par_min(void);
+/* parallel absorbed-attention: max (head x position-chunk) tiles held in scratch */
+#define GLM5_ABS_MAXTILE 192
 
 static int glm5_envi(const char*k,int d){ const char*v=getenv(k); return (v&&*v)?atoi(v):d; }
+static int glm5_par_min(void){ static int v=-1; if(v<0) v=glm5_envi("GLM5_PAR_MIN",64); return v; }
+/* expert -> local slot (-1 if not owned).  Full experts: slot e/ep for e%ep==rank.
+ * 2-way shard (m->ex_shard2): half-0 slots [0,ex_no0) for e%ep==rank, half-1 slots
+ * [ex_no0,..) for (e+ep/2)%ep==rank.  Matches the loader's slot emission order. */
+static inline int glm5_ex_slot(const glm5_model*m,int e){
+    if(e%m->ep_size==m->ep_rank) return e/m->ep_size;
+    if(m->ex_shard2 && (e+m->ep_size/2)%m->ep_size==m->ep_rank) return m->ex_no0 + e/m->ep_size;
+    return -1;
+}
 static inline void glm5_shard_shared_inter(int total,int rank,int size,int*r0,int*rows){
     const char*v=getenv("GLM5_TP_SHARED_BLOCK");
     int block=(v&&*v)?atoi(v):128;  /* 0 = exact even rows; default keeps faster scale-aligned shards */
@@ -519,6 +533,27 @@ static void glm5_mv_worker(void *a,int tid,int nthr){
     if(glm5_pool_dbg) atomic_fetch_add_explicit(tid==0?&glm5_dbg_main:&glm5_dbg_wrk,(long)(b1-b0),memory_order_relaxed);
 }
 
+/* two-tensor bf16 matvec worker (q_a+kv_a, sh_w1+sh_w3): one thread team covers the
+ * combined 8-row block space; tails on tid 0.  Bit-identical to sequential calls. */
+typedef struct { float*y0; const uint16_t*W0; int rows0; float*y1; const uint16_t*W1; int rows1;
+                 const float*x; int cols; } glm5_mv2job;
+static void glm5_mv2_worker(void*a,int tid,int nthr){
+    glm5_mv2job*j=a; int nb0=j->rows0/8, nb1=j->rows1/8, nb=nb0+nb1;
+    int per=(nb+nthr-1)/nthr, b0=tid*per, b1=b0+per; if(b1>nb)b1=nb;
+    for(int bi=b0;bi<b1;bi++){
+        const uint16_t*W = bi<nb0 ? j->W0 : j->W1;
+        float*y          = bi<nb0 ? j->y0 : j->y1;
+        int r            = (bi<nb0 ? bi : bi-nb0)*8;
+        const uint16_t*b=W+(size_t)r*j->cols;
+        matvec_bf16_8row(y+r,b,b+j->cols,b+2*(size_t)j->cols,b+3*(size_t)j->cols,
+                         b+4*(size_t)j->cols,b+5*(size_t)j->cols,b+6*(size_t)j->cols,b+7*(size_t)j->cols,j->x,j->cols);
+    }
+    if(tid==0){
+        for(int r=nb0*8;r<j->rows0;r++) j->y0[r]=vec_dot_bf16_f32(j->W0+(size_t)r*j->cols,j->x,j->cols);
+        for(int r=nb1*8;r<j->rows1;r++) j->y1[r]=vec_dot_bf16_f32(j->W1+(size_t)r*j->cols,j->x,j->cols);
+    }
+}
+
 /* y[rows] = W[rows,cols](bf16) . x[cols] over 8-row blocks (disjoint outputs -> bit-
  * identical to serial). Default parallelism is OpenMP (validated ~7x @12 threads = 1 CMG;
  * the cross-CMG fork-join wall caps it there). The experimental pinned pool (GLM5_POOL=1)
@@ -542,6 +577,29 @@ static void glm5_mv_bf16(float*restrict y,const uint16_t*W,const float*x,int row
         matvec_bf16_8row(y+r,b,b+cols,b+2*(size_t)cols,b+3*(size_t)cols,
                          b+4*(size_t)cols,b+5*(size_t)cols,b+6*(size_t)cols,b+7*(size_t)cols,x,cols); }
     for(int r=nb*8;r<rows;r++) y[r]=vec_dot_bf16_f32(W+(size_t)r*cols,x,cols);
+}
+
+/* two BF16 matvecs sharing one activation in ONE parallel region: decode fires ~15 small
+ * GEMV regions per layer and the ~10-15 us entry cost each was ~10% of the token. rows may
+ * differ (q_a 2048 + kv_a 576).  Bit-identical to two glm5_mv_bf16 calls (same 8-row kernel,
+ * disjoint outputs). */
+static void glm5_mv_bf16_2(float*restrict y0,const uint16_t*W0,int rows0,
+                           float*restrict y1,const uint16_t*W1,int rows1,
+                           const float*x,int cols){
+    const int nb0=rows0/8, nb1=rows1/8, nb=nb0+nb1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows0+rows1>=GLM5_PAR_MIN)
+#endif
+    for(int bi=0;bi<nb;bi++){
+        const uint16_t*W = bi<nb0 ? W0 : W1;
+        float*y          = bi<nb0 ? y0 : y1;
+        int r            = (bi<nb0 ? bi : bi-nb0)*8;
+        const uint16_t*b=W+(size_t)r*cols;
+        matvec_bf16_8row(y+r,b,b+cols,b+2*(size_t)cols,b+3*(size_t)cols,
+                         b+4*(size_t)cols,b+5*(size_t)cols,b+6*(size_t)cols,b+7*(size_t)cols,x,cols);
+    }
+    for(int r=nb0*8;r<rows0;r++) y0[r]=vec_dot_bf16_f32(W0+(size_t)r*cols,x,cols);
+    for(int r=nb1*8;r<rows1;r++) y1[r]=vec_dot_bf16_f32(W1+(size_t)r*cols,x,cols);
 }
 
 static inline float glm5_dot_mxfp8_f32scale_row(const uint8_t*w,const float*s,const float*x,int cols,const uint32_t*lut){
@@ -817,6 +875,279 @@ static inline float glm5_dot_f32_f32(const float *a,const float *b,int n){
 #endif
 }
 
+/* Fast mixed-IQ decode path.  Expand the tiny IQ grids into one 64-byte tile,
+ * then let one 512-bit SVE SDOT contract the whole tile.  Sub-block scales are
+ * applied to the 16 int32 dot lanes before the horizontal reduction.  The
+ * lookup tables remove the scalar sign expansion from the hot row loop. */
+typedef struct { float d; int8_t q[256]; } glm5_iq_q8_block;
+static int8_t glm5_iq2_signed[65536][8];
+static int8_t glm5_iq3_signed[2][128][256][4];
+/* v2 kernels: 8-byte sign masks (0xFF where negative) indexed by the 7-bit ksigns id; the
+ * sign is applied in-register as (g^m)-m. 1 KB -> L1-resident under all threads. */
+static uint64_t glm5_iq_signmask64[128];
+static pthread_once_t glm5_iq_lut_once=PTHREAD_ONCE_INIT;
+
+static void glm5_iq_init_luts(void){
+    for(int code=0;code<65536;code++){
+        const uint8_t*g=(const uint8_t*)(iq2xs_grid+(code&511));
+        uint8_t s=ksigns_iq2xs[(code>>9)&127];
+        for(int j=0;j<8;j++) glm5_iq2_signed[code][j]=(int8_t)((s&kmask_iq2xs[j])?-(int)g[j]:(int)g[j]);
+    }
+    for(int s=0;s<128;s++) for(int g=0;g<256;g++){
+        const uint8_t*v=(const uint8_t*)(iq3xxs_grid+g);
+        uint8_t sm=ksigns_iq2xs[s];
+        for(int j=0;j<4;j++){
+            glm5_iq3_signed[0][s][g][j]=(int8_t)((sm&kmask_iq2xs[j])?-(int)v[j]:(int)v[j]);
+            glm5_iq3_signed[1][s][g][j]=(int8_t)((sm&kmask_iq2xs[j+4])?-(int)v[j]:(int)v[j]);
+        }
+    }
+    for(int s=0;s<128;s++){
+        uint8_t sm=ksigns_iq2xs[s]; uint64_t mask=0;
+        for(int j=0;j<8;j++) if(sm&kmask_iq2xs[j]) mask|=0xffull<<(8*j);
+        glm5_iq_signmask64[s]=mask;
+    }
+}
+
+static void glm5_iq_quant_q8(glm5_iq_q8_block*q,const float*x,int cols){
+    for(int b=0;b<cols/256;b++){
+#if defined(__ARM_FEATURE_SVE)
+        const svbool_t pg=svptrue_b32(); const int vl=(int)svcntw();
+        svfloat32_t am=svdup_f32(0.f);
+        for(int j=0;j<256;j+=vl) am=svmax_f32_x(pg,am,svabs_f32_x(pg,svld1(pg,x+256*b+j)));
+        float amax=svmaxv_f32(pg,am);
+        q[b].d=amax>0.f?amax/127.f:0.f;
+        float inv=amax>0.f?127.f/amax:0.f;
+        for(int j=0;j<256;j+=vl){
+            svfloat32_t v=svrintn_f32_x(pg,svmul_n_f32_x(pg,svld1(pg,x+256*b+j),inv));
+            svint32_t iv=svcvt_s32_f32_x(pg,v);
+            iv=svmin_n_s32_x(pg,svmax_n_s32_x(pg,iv,-127),127);
+            svst1b_s32(pg,q[b].q+j,iv);
+        }
+#else
+        float amax=0.f;
+        for(int j=0;j<256;j++){ float a=fabsf(x[256*b+j]); if(a>amax)amax=a; }
+        q[b].d=amax>0.f?amax/127.f:0.f;
+        float inv=amax>0.f?127.f/amax:0.f;
+        for(int j=0;j<256;j++){
+            int v=(int)lrintf(x[256*b+j]*inv);
+            v=v>127?127:(v<-127?-127:v); q[b].q[j]=(int8_t)v;
+        }
+#endif
+    }
+}
+
+static inline int64_t glm5_iq_dot64_scaled(const int8_t*w,const int8_t*x,const int32_t*sc){
+#if defined(__ARM_FEATURE_SVE)
+    if(svcntb()==64){
+        svbool_t p8=svptrue_b8(),p32=svptrue_b32();
+        svint32_t d=svdot_s32(svdup_s32(0),svld1_s8(p8,w),svld1_s8(p8,x));
+        return (int64_t)svaddv_s32(p32,svmul_s32_x(p32,d,svld1_s32(p32,sc)));
+    }
+#endif
+    int64_t z=0; for(int i=0;i<64;i++) z+=(int32_t)w[i]*x[i]*sc[i/4]; return z;
+}
+
+static float glm5_iq2_xs_q8_row(const block_iq2_xs*w,const glm5_iq_q8_block*x,int nb){
+    double sum=0.0; _Alignas(64) int8_t qw[64]; _Alignas(64) int32_t sc[16];
+    for(int b=0;b<nb;b++){
+        int64_t ibsum=0;
+        for(int k=0;k<4;k++){
+            for(int h=0;h<2;h++){
+                int ib=2*k+h;
+                for(int l=0;l<4;l++) memcpy(qw+32*h+8*l,glm5_iq2_signed[w[b].qs[4*ib+l]],8);
+                int s0=2*(w[b].scales[ib]&15)+1,s1=2*(w[b].scales[ib]>>4)+1;
+                for(int j=0;j<4;j++) sc[8*h+j]=s0;
+                for(int j=4;j<8;j++) sc[8*h+j]=s1;
+            }
+            ibsum+=glm5_iq_dot64_scaled(qw,x[b].q+64*k,sc);
+        }
+        sum+=(double)ggml_fp16_to_fp32(w[b].d)*x[b].d*(double)ibsum*0.125;
+    }
+    return (float)sum;
+}
+
+static float glm5_iq3_xxs_q8_row(const block_iq3_xxs*w,const glm5_iq_q8_block*x,int nb){
+    double sum=0.0; _Alignas(64) int8_t qw[64]; _Alignas(64) int32_t sc[16];
+    for(int b=0;b<nb;b++){
+        const uint8_t*q3=w[b].qs,*gas=w[b].qs+64; int64_t ibsum=0;
+        for(int k=0;k<4;k++){
+            for(int h=0;h<2;h++){
+                int ib=2*k+h; uint32_t aux; memcpy(&aux,gas+4*ib,4);
+                for(int l=0;l<4;l++){
+                    int si=(aux>>(7*l))&127;
+                    memcpy(qw+32*h+8*l,glm5_iq3_signed[0][si][q3[8*ib+2*l]],4);
+                    memcpy(qw+32*h+8*l+4,glm5_iq3_signed[1][si][q3[8*ib+2*l+1]],4);
+                }
+                int ls=2*(int)(aux>>28)+1; for(int j=0;j<8;j++) sc[8*h+j]=ls;
+            }
+            ibsum+=glm5_iq_dot64_scaled(qw,x[b].q+64*k,sc);
+        }
+        sum+=(double)ggml_fp16_to_fp32(w[b].d)*x[b].d*(double)ibsum*0.25;
+    }
+    return (float)sum;
+}
+
+static float glm5_iq4_xs_q8_row(const block_iq4_xs*w,const glm5_iq_q8_block*x,int nb){
+    double sum=0.0; _Alignas(64) int8_t qw[64]; _Alignas(64) int32_t sc[16];
+    for(int b=0;b<nb;b++){
+        int64_t ibsum=0;
+        for(int k=0;k<4;k++){
+            for(int h=0;h<2;h++){
+                int ib=2*k+h; const uint8_t*qs=w[b].qs+16*ib;
+                for(int j=0;j<16;j++){ qw[32*h+j]=kvalues_iq4nl[qs[j]&15]; qw[32*h+j+16]=kvalues_iq4nl[qs[j]>>4]; }
+                int ls=((w[b].scales_l[ib/2]>>(4*(ib&1)))&15)|(((w[b].scales_h>>(2*ib))&3)<<4);
+                for(int j=0;j<8;j++) sc[8*h+j]=ls-32;
+            }
+            ibsum+=glm5_iq_dot64_scaled(qw,x[b].q+64*k,sc);
+        }
+        sum+=(double)ggml_fp16_to_fp32(w[b].d)*x[b].d*(double)ibsum;
+    }
+    return (float)sum;
+}
+
+/* ---- v2 q8 row kernels (SVE-512): expand each 64-byte tile IN REGISTERS (grid/sign-mask
+ * gathers from L1-resident LUTs, or nibble TBL for IQ4), contract with one SDOT, apply the
+ * sub-block scales as a 16-lane int32 MLA, and keep a per-row f32 vector accumulator ->
+ * ONE horizontal reduction per row instead of one per 64 weights.  The old kernels'
+ * per-tile stack round-trip (8 memcpys + reload) and svaddv (long-latency horizontal add)
+ * were the decode bottleneck.  GLM5_IQ_V2=0 restores the v1 kernels. */
+#if defined(__ARM_FEATURE_SVE)
+static float glm5_iq2_xs_q8_row_v2(const block_iq2_xs*w,const glm5_iq_q8_block*x,int nb){
+    const svbool_t p8=svptrue_b8(),p32=svptrue_b32(),p64=svptrue_b64();
+    const svbool_t lo8_32=svwhilelt_b32(0,8);
+    /* tile-k scale-select index base: lane l -> nibble l/4 (add 4k per tile) */
+    const svuint32_t nidx=svlsr_n_u32_x(p32,svindex_u32(0,1),2);
+    svfloat32_t accf=svdup_f32(0.f);
+    for(int b=0;b<nb;b++){
+        const uint16_t*qs=w[b].qs;
+        /* expand the 8 scale bytes to 16 nibble lanes ONCE per block, in the SIMD domain:
+         * [b0.lo,b0.hi,b1.lo,b1.hi,...] via zip of the lo/hi nibbles */
+        svuint32_t sb8=svld1ub_u32(lo8_32,w[b].scales);
+        svuint32_t nibs=svzip1_u32(svand_n_u32_x(p32,sb8,15),svand_n_u32_x(p32,svlsr_n_u32_x(p32,sb8,4),15));
+        svint32_t acc=svdup_s32(0);
+        for(int k=0;k<4;k++){
+            svuint64_t code=svld1uh_u64(p64,qs+8*k);
+            svuint64_t g=svld1_gather_u64index_u64(p64,(const uint64_t*)iq2xs_grid,svand_n_u64_x(p64,code,511));
+            svuint64_t sm=svld1_gather_u64index_u64(p64,glm5_iq_signmask64,svlsr_n_u64_x(p64,code,9));
+            svint8_t wv=svsub_s8_x(p8,svreinterpret_s8_u64(sveor_u64_x(p64,g,sm)),svreinterpret_s8_u64(sm));
+            svint32_t d=svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x[b].q+64*k));
+            svuint32_t nib=svtbl_u32(nibs,svadd_n_u32_x(p32,nidx,4*k));
+            svint32_t sc=svreinterpret_s32_u32(svorr_n_u32_x(p32,svlsl_n_u32_x(p32,nib,1),1));
+            acc=svmla_s32_x(p32,acc,d,sc);
+        }
+        accf=svmla_n_f32_x(p32,accf,svcvt_f32_s32_x(p32,acc),ggml_fp16_to_fp32(w[b].d)*x[b].d*0.125f);
+    }
+    return svaddv_f32(p32,accf);
+}
+static float glm5_iq3_xxs_q8_row_v2(const block_iq3_xxs*w,const glm5_iq_q8_block*x,int nb){
+    const svbool_t p8=svptrue_b8(),p32=svptrue_b32(),p64=svptrue_b64();
+    static const uint64_t sh_arr[8]={0,7,14,21,0,7,14,21};
+    const svuint64_t sh8=svld1_u64(p64,sh_arr);
+    const svbool_t lo4_64=svwhilelt_b64(0,4), lo8_32=svwhilelt_b32(0,8);
+    svfloat32_t accf=svdup_f32(0.f);
+    for(int b=0;b<nb;b++){
+        const uint8_t*q3=w[b].qs,*gas=w[b].qs+64;
+        svint32_t acc=svdup_s32(0);
+        for(int k=0;k<4;k++){
+            uint32_t aux0,aux1; memcpy(&aux0,gas+8*k,4); memcpy(&aux1,gas+8*k+4,4);
+            svuint32_t g=svld1_gather_u32index_u32(p32,(const uint32_t*)iq3xxs_grid,svld1ub_u32(p32,q3+16*k));
+            svuint64_t av=svsel_u64(lo4_64,svdup_u64(aux0),svdup_u64(aux1));
+            svuint64_t sm=svld1_gather_u64index_u64(p64,glm5_iq_signmask64,
+                              svand_n_u64_x(p64,svlsr_u64_x(p64,av,sh8),127));
+            svint8_t wv=svsub_s8_x(p8,svreinterpret_s8_u32(sveor_u32_x(p32,g,svreinterpret_u32_u64(sm))),
+                                   svreinterpret_s8_u64(sm));
+            svint32_t d=svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x[b].q+64*k));
+            svint32_t sc=svsel_s32(lo8_32,svdup_s32(2*(int)(aux0>>28)+1),svdup_s32(2*(int)(aux1>>28)+1));
+            acc=svmla_s32_x(p32,acc,d,sc);
+        }
+        accf=svmla_n_f32_x(p32,accf,svcvt_f32_s32_x(p32,acc),ggml_fp16_to_fp32(w[b].d)*x[b].d*0.25f);
+    }
+    return svaddv_f32(p32,accf);
+}
+static float glm5_iq4_xs_q8_row_v2(const block_iq4_xs*w,const glm5_iq_q8_block*x,int nb){
+    const svbool_t p8=svptrue_b8(),p32=svptrue_b32();
+    const svbool_t lo16_8=svwhilelt_b8(0,16), lo32_8=svwhilelt_b8(0,32), lo8_32=svwhilelt_b32(0,8);
+    static const uint8_t idxA[64]={ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
+                                   255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+                                    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+                                   255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255};
+    static const uint8_t idxB[64]={255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+                                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
+                                   255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+                                    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
+    const svuint8_t vA=svld1_u8(p8,idxA), vB=svld1_u8(p8,idxB);
+    const svint8_t kv16=svld1_s8(lo16_8,kvalues_iq4nl);
+    svfloat32_t accf=svdup_f32(0.f);
+    for(int b=0;b<nb;b++){
+        svint32_t acc=svdup_s32(0); uint16_t h=w[b].scales_h;
+        for(int k=0;k<4;k++){
+            svuint8_t v=svld1_u8(lo32_8,w[b].qs+32*k);
+            svint8_t wl=svtbl_s8(kv16,svand_n_u8_x(p8,v,15));
+            svint8_t wh=svtbl_s8(kv16,svlsr_n_u8_x(p8,v,4));
+            svint8_t wv=svorr_s8_x(p8,svtbl_s8(wl,vA),svtbl_s8(wh,vB));
+            svint32_t d=svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x[b].q+64*k));
+            int ls0=(int)((w[b].scales_l[k]&15)|(((h>>(4*k))&3)<<4))-32;
+            int ls1=(int)((w[b].scales_l[k]>>4)|(((h>>(4*k+2))&3)<<4))-32;
+            acc=svmla_s32_x(p32,acc,d,svsel_s32(lo8_32,svdup_s32(ls0),svdup_s32(ls1)));
+        }
+        accf=svmla_n_f32_x(p32,accf,svcvt_f32_s32_x(p32,acc),ggml_fp16_to_fp32(w[b].d)*x[b].d);
+    }
+    return svaddv_f32(p32,accf);
+}
+#endif
+static int glm5_iq_v2(void){
+    static int v=-1;
+    if(v<0){
+        v=glm5_envi("GLM5_IQ_V2",1);
+#if defined(__ARM_FEATURE_SVE)
+        if(svcntb()!=64) v=0;
+#else
+        v=0;
+#endif
+    }
+    return v;
+}
+static inline float glm5_iq_q8_row(const glm5_tensor*t,const uint8_t*w,const glm5_iq_q8_block*x,int nb){
+#if defined(__ARM_FEATURE_SVE)
+    if(glm5_iq_v2()){
+        if(t->type==GLM5_IQ2_XS) return glm5_iq2_xs_q8_row_v2((const block_iq2_xs*)w,x,nb);
+        if(t->type==GLM5_IQ3_XXS) return glm5_iq3_xxs_q8_row_v2((const block_iq3_xxs*)w,x,nb);
+        return glm5_iq4_xs_q8_row_v2((const block_iq4_xs*)w,x,nb);
+    }
+#endif
+    if(t->type==GLM5_IQ2_XS) return glm5_iq2_xs_q8_row((const block_iq2_xs*)w,x,nb);
+    if(t->type==GLM5_IQ3_XXS) return glm5_iq3_xxs_q8_row((const block_iq3_xxs*)w,x,nb);
+    return glm5_iq4_xs_q8_row((const block_iq4_xs*)w,x,nb);
+}
+
+typedef struct {
+    float *y0,*y1; const glm5_tensor *t0,*t1; const glm5_iq_q8_block*xq;
+    size_t rb0,rb1; int rows,nb;
+} glm5_iq_q8_job;
+static void glm5_iq_q8_worker(void*a,int tid,int nthr){
+    glm5_iq_q8_job*j=a; int per=(j->rows+nthr-1)/nthr,r0=tid*per,r1=r0+per; if(r1>j->rows)r1=j->rows;
+    for(int r=r0;r<r1;r++){
+        j->y0[r]=glm5_iq_q8_row(j->t0,(const uint8_t*)j->t0->w+(size_t)r*j->rb0,j->xq,j->nb);
+        if(j->t1) j->y1[r]=glm5_iq_q8_row(j->t1,(const uint8_t*)j->t1->w+(size_t)r*j->rb1,j->xq,j->nb);
+    }
+}
+
+static int glm5_mv_iq_q8(float*restrict y,const glm5_tensor*t,const float*x,int rows,int cols){
+    if(cols%256||(t->type!=GLM5_IQ2_XS&&t->type!=GLM5_IQ3_XXS&&t->type!=GLM5_IQ4_XS)) return -1;
+    int nb=cols/256; glm5_iq_q8_block*xq=malloc((size_t)nb*sizeof(*xq)); if(!xq) return -1;
+    pthread_once(&glm5_iq_lut_once,glm5_iq_init_luts); glm5_iq_quant_q8(xq,x,cols);
+    size_t rb=dequant_row_size((uint32_t)t->type,cols);
+    if(glm5_g_pool&&rows>=GLM5_PAR_MIN){
+        glm5_iq_q8_job j={y,NULL,t,NULL,xq,rb,0,rows,nb};
+        glm5_pool_run(glm5_g_pool,glm5_iq_q8_worker,&j); free(xq); return 0;
+    }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
+#endif
+    for(int r=0;r<rows;r++) y[r]=glm5_iq_q8_row(t,(const uint8_t*)t->w+(size_t)r*rb,xq,nb);
+    free(xq); return 0;
+}
+
 /* Mixed-IQ decode kernel.  llama.cpp normally pairs the IQ blocks with a
  * Q8_K activation.  On A64FX we use a per-256-element int16 activation
  * instead: it is effectively lossless for inference activations while still
@@ -965,6 +1296,14 @@ static void glm5_mv_ggml(float*restrict y,const glm5_tensor*t,const float*x,int 
     free(tmp);
 #endif
 }
+static int glm5_iq_mode(void){
+    static int mode=-1;
+    if(mode<0){
+        const char*e=getenv("GLM5_IQ_MODE");
+        mode=(e&&*e)?atoi(e):(glm5_envi("GLM5_IQ_REF",1)?0:2);
+    }
+    return mode;
+}
 /* matvec dispatch by weight type (bf16 / MXFP8 / INT8 / GGML IQ) */
 static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const float*x, int rows, int cols){
     if(t->type==GLM5_MXFP8) glm5_mv_mxfp8(m,y,(const uint8_t*)t->w,t->scale,x,rows,cols);
@@ -978,12 +1317,10 @@ static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const f
         else glm5_mv_int8(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,x,rows,cols);
     }
     else if(glm5_is_ggml_q(t->type)){
-        static int iqref=-1,iqcheck=-1;
-        /* The row-dequant path is currently faster at production thread count;
-         * set GLM5_IQ_REF=0 to exercise the accuracy-preserving A16 SDOT path. */
-        if(iqref<0) iqref=glm5_envi("GLM5_IQ_REF",1);
+        static int iqcheck=-1;
         if(iqcheck<0) iqcheck=glm5_envi("GLM5_IQ_CHECK",0);
-        int fallback=iqref||glm5_mv_iq_a16(y,t,x,rows,cols);
+        int mode=glm5_iq_mode();
+        int fallback=mode==0||(mode==1?glm5_mv_iq_q8(y,t,x,rows,cols):glm5_mv_iq_a16(y,t,x,rows,cols));
         if(fallback) glm5_mv_ggml(y,t,x,rows,cols);
         else if(iqcheck){
             /* First-call accuracy gate against source-faithful F32 dequant. */
@@ -998,15 +1335,111 @@ static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const f
                         e2+=e*e; r2+=(double)ref[r]*ref[r]; if(a>mx)mx=a;
                     }
                     double rel=sqrt(e2/(r2+1e-30));
-                    fprintf(stderr,"[glm52-iq] a16/ref rows=%d cols=%d rel_l2=%.3e max_abs=%.3e %s\n",
-                            rows,cols,rel,mx,(isfinite(rel)&&rel<5e-4)?"OK":"FAIL");
-                    if(!isfinite(rel)||rel>=5e-4) abort();
+                    double limit=mode==1?3e-2:5e-4;
+                    fprintf(stderr,"[glm52-iq] %s/ref rows=%d cols=%d rel_l2=%.3e max_abs=%.3e %s\n",
+                            mode==1?"q8":"a16",rows,cols,rel,mx,(isfinite(rel)&&rel<limit)?"OK":"FAIL");
+                    if(!isfinite(rel)||rel>=limit) abort();
                     free(ref);
                 }
             }
         }
     }
     else glm5_mv_bf16(y,(const uint16_t*)t->w,x,rows,cols);
+}
+
+/* ---- hoisted-a16 int8 matvec pieces for the fused decode path ----
+ * glm5_mv_int16_sdot quantizes the activation PER CALL (~50 us serial incl. malloc):
+ * fine for one 12907-row head GEMV, fatal for decode's 171-2048 row GEMVs (run E:
+ * 8.55 tok/s).  The fused decode layer quantizes each activation ONCE on tid 0 and
+ * drives this worker with the shared (xq, xg, xsc). */
+static void glm5_a16_quantize(int16_t*restrict xq,int64_t*restrict xg,float*restrict xsc,
+                              const float*restrict x,int cols,int gs,int qg0){
+    float amax=1e-20f;
+#if defined(__ARM_FEATURE_SVE)
+    { const svbool_t pg=svptrue_b32(); const int vl=(int)svcntw();
+      svfloat32_t am=svdup_f32(0.f); int c=0;
+      for(;c+vl<=cols;c+=vl) am=svmax_f32_x(pg,am,svabs_f32_x(pg,svld1(pg,x+c)));
+      float m0=svmaxv_f32(pg,am); if(m0>amax) amax=m0;
+      for(;c<cols;c++){ float a=fabsf(x[c]); if(a>amax) amax=a; }
+      float inv=32767.0f/amax;
+      /* quantize per scale group with the group sum FOLDED into the same pass (bit-exact:
+       * per-group |sum| <= 64*32767 fits s32; one svaddv per group, not per vector) */
+      for(int b=0;b<cols;){
+          int blk=(qg0+b)/gs, bend=(blk+1)*gs-qg0; if(bend>cols) bend=cols;
+          svint32_t accv=svdup_s32(0);
+          for(int c2=b;c2<bend;c2+=vl){
+              svbool_t pt=svwhilelt_b32(c2,bend);
+              svfloat32_t v=svrintn_f32_x(pt,svmul_n_f32_x(pt,svld1(pt,x+c2),inv));
+              svint32_t iv=svcvt_s32_f32_x(pt,v);
+              iv=svmin_n_s32_x(pt,svmax_n_s32_x(pt,iv,-32767),32767);
+              svst1h_s32(pt,xq+c2,iv);
+              accv=svadd_s32_m(pt,accv,iv);
+          }
+          xg[blk]=svaddv_s32(pg,accv);
+          b=bend;
+      }
+    }
+#else
+    for(int c=0;c<cols;c++){ float a=fabsf(x[c]); if(a>amax)amax=a; }
+    float inv=32767.0f/amax;
+    for(int c=0;c<cols;c++){ int v=(int)lrintf(x[c]*inv); v=v>32767?32767:(v<-32767?-32767:v); xq[c]=(int16_t)v; }
+    glm5_i16_group_sums(xg,xq,gs,qg0,cols);
+#endif
+    *xsc=amax/32767.0f;
+}
+typedef struct {
+    float*y; const uint8_t*W; const float*S; int gs,qg0,rows,cols;
+    const int16_t*xq; const int64_t*xg; float xsc;
+} glm5_i16job;
+static void glm5_i16_worker(void*a,int tid,int nthr){
+#if defined(__ARM_FEATURE_SVE)
+    glm5_i16job*j=a; int sb=(j->qg0+j->cols+j->gs-1)/j->gs;
+    int nb=j->rows/8, per=(nb+nthr-1)/nthr, b0=tid*per, b1=b0+per; if(b1>nb)b1=nb;
+    for(int bi=b0;bi<b1;bi++){
+        int r=bi*8; const uint8_t*w=j->W+(size_t)r*j->cols; const float*s=j->S+(size_t)r*sb; float tmp[8];
+        glm5_matvec_int16sdot_8row(tmp,
+            w,w+j->cols,w+2*(size_t)j->cols,w+3*(size_t)j->cols,
+            w+4*(size_t)j->cols,w+5*(size_t)j->cols,w+6*(size_t)j->cols,w+7*(size_t)j->cols,
+            s,s+sb,s+2*(size_t)sb,s+3*(size_t)sb,
+            s+4*(size_t)sb,s+5*(size_t)sb,s+6*(size_t)sb,s+7*(size_t)sb,
+            j->gs,j->qg0,j->xq,j->xg,j->cols);
+        for(int k=0;k<8;k++) j->y[r+k]=j->xsc*tmp[k];
+    }
+    if(tid==0) for(int r=nb*8;r<j->rows;r++)
+        j->y[r]=j->xsc*glm5_dot_int16sdot_row(j->W+(size_t)r*j->cols,j->S+(size_t)r*sb,j->gs,j->qg0,j->xq,j->cols);
+#else
+    (void)a;(void)tid;(void)nthr;
+#endif
+}
+
+/* Gate/up projections consume the same activation.  For mixed-IQ weights,
+ * quantize it once and process both matrices inside one OpenMP team. */
+static void glm5_mv_pair(glm5_model*m,float*restrict y0,const glm5_tensor*t0,
+                         float*restrict y1,const glm5_tensor*t1,const float*x,int rows,int cols){
+    if(glm5_iq_mode()==1&&glm5_iq_q8_ok(t0->type)&&glm5_iq_q8_ok(t1->type)&&cols%256==0){
+        int nb=cols/256; glm5_iq_q8_block*xq=malloc((size_t)nb*sizeof(*xq));
+        if(xq){
+            pthread_once(&glm5_iq_lut_once,glm5_iq_init_luts); glm5_iq_quant_q8(xq,x,cols);
+            size_t rb0=dequant_row_size((uint32_t)t0->type,cols),rb1=dequant_row_size((uint32_t)t1->type,cols);
+            if(glm5_g_pool&&rows>=GLM5_PAR_MIN){
+                glm5_iq_q8_job j={y0,y1,t0,t1,xq,rb0,rb1,rows,nb};
+                glm5_pool_run(glm5_g_pool,glm5_iq_q8_worker,&j); free(xq); return;
+            }
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
+#endif
+            for(int r=0;r<rows;r++){
+                y0[r]=glm5_iq_q8_row(t0,(const uint8_t*)t0->w+(size_t)r*rb0,xq,nb);
+                y1[r]=glm5_iq_q8_row(t1,(const uint8_t*)t1->w+(size_t)r*rb1,xq,nb);
+            }
+            free(xq); return;
+        }
+    }
+    if(t0->type==GLM5_BF16&&t1->type==GLM5_BF16&&!glm5_dummy){
+        glm5_mv_bf16_2(y0,(const uint16_t*)t0->w,rows,y1,(const uint16_t*)t1->w,rows,x,cols);
+        return;
+    }
+    glm5_mv(m,y0,t0,x,rows,cols); glm5_mv(m,y1,t1,x,rows,cols);
 }
 
 /* ===================== arena fit estimate (synth uses malloc) ===================== */
@@ -1076,6 +1509,11 @@ static void glm5_free(glm5_model*m){
     glm5_afree(m->layers);
     if(m->owns_weights){ glm5_afree(m->embed);glm5_afree(m->head.w);glm5_afree(m->out_norm);glm5_afree(m->rope_cos);glm5_afree(m->rope_sin); }
     glm5_afree(m->s_norm);glm5_afree(m->s_q);glm5_afree(m->s_k);glm5_afree(m->s_v);glm5_afree(m->s_kvb);glm5_afree(m->s_qabs);glm5_afree(m->s_ctx);glm5_afree(m->s_attn);glm5_afree(m->s_o);
+    glm5_afree(m->s_pctx);glm5_afree(m->s_pmx);glm5_afree(m->s_pse);glm5_afree(m->s_qfull);
+    glm5_afree(m->s_iqx);glm5_afree(m->s_iqx2);
+    glm5_afree(m->s_axq);glm5_afree(m->s_axq2);glm5_afree(m->s_axg);glm5_afree(m->s_axg2);
+    glm5_afree(m->s_bxq);glm5_afree(m->s_bxq2);glm5_afree(m->s_bxsc);glm5_afree(m->s_bxsc2);
+    glm5_afree(m->s_bxg);glm5_afree(m->s_bxg2);
     glm5_afree(m->s_idx_q);glm5_afree(m->s_idx_k);glm5_afree(m->s_blk_score);glm5_afree(m->s_blk_sel);glm5_afree(m->s_attn_score);
     glm5_afree(m->s_router);glm5_afree(m->s_shg);glm5_afree(m->s_shu);glm5_afree(m->s_sh);glm5_afree(m->s_moe);
     glm5_afree(m->s_exg);glm5_afree(m->s_exu);glm5_afree(m->s_route);glm5_afree(m->s_ff_g);glm5_afree(m->s_ff_u);glm5_afree(m->s_ff);glm5_afree(m->s_logits);
@@ -1208,6 +1646,7 @@ static void glm5_prefill_to_cp(glm5_model*m,int upto){
  * arithmetic the forward uses. Caller re-shards KV + rebuilds collectives for the merged group. */
 static void glm5_group_expert_drop(glm5_model*m,int new_eps,int new_ep_rank){
     glm5_config*c=&m->cfg;
+    if(m->ex_shard2){ fprintf(stderr,"glm5: group merge is unsupported with 2-way expert shard blobs\n"); abort(); }
     for(int l=0;l<c->n_layers;l++){
         if(!glm5_is_moe(c,l)) continue;
         glm5_layer*L=&m->layers[l]; int keep=0;
@@ -1244,12 +1683,25 @@ static void glm5_alloc_scratch(glm5_model*m,int hrows){
     m->s_kvb=glm5_amalloc((size_t)sh_heads*(cfg->qk_nope_dim+cfg->v_head_dim)*4);
     m->s_qabs=glm5_amalloc((size_t)sh_heads*cfg->kv_lora*4);
     m->s_ctx=glm5_amalloc((size_t)sh_heads*cfg->kv_lora*4);
+    m->s_pctx=glm5_amalloc((size_t)GLM5_ABS_MAXTILE*cfg->kv_lora*4);
+    m->s_pmx=glm5_amalloc(GLM5_ABS_MAXTILE*4); m->s_pse=glm5_amalloc(GLM5_ABS_MAXTILE*4);
+    m->s_qfull=glm5_amalloc((size_t)sh_heads*KVC*4);
+    m->s_iqx =glm5_amalloc((size_t)4*((H+255)/256)*sizeof(glm5_iq_q8_block));
+    m->s_iqx2=glm5_amalloc((size_t)(cfg->n_active>0?cfg->n_active:8)*((cfg->moe_inter+255)/256)*sizeof(glm5_iq_q8_block));
+    m->s_axq =glm5_amalloc((size_t)H*2); m->s_axq2=glm5_amalloc((size_t)H*2);
+    m->s_axg =glm5_amalloc(256*sizeof(int64_t)); m->s_axg2=glm5_amalloc(256*sizeof(int64_t));
+    m->s_bxq =glm5_amalloc((size_t)4*H*2); m->s_bxq2=glm5_amalloc((size_t)4*H*2);
+    m->s_bxsc=glm5_amalloc(4*4); m->s_bxsc2=glm5_amalloc(4*4);
+    m->s_bxg =glm5_amalloc((size_t)4*256*sizeof(int64_t)); m->s_bxg2=glm5_amalloc((size_t)4*256*sizeof(int64_t));
     m->s_attn=glm5_amalloc(AD*4); m->s_o=glm5_amalloc(H*4);
     m->s_idx_q=glm5_amalloc((size_t)IQD*4); m->s_idx_k=glm5_amalloc((size_t)ID*4);
     m->s_blk_score=glm5_amalloc((size_t)cfg->max_pos*4); m->s_blk_sel=glm5_amalloc((size_t)cfg->max_pos*sizeof(int));
     m->s_attn_score=glm5_amalloc((size_t)cfg->max_pos*sh_heads*4);
     m->s_router=glm5_amalloc((size_t)cfg->n_experts*4); m->s_shg=glm5_amalloc(cfg->moe_inter*4); m->s_shu=glm5_amalloc(cfg->moe_inter*4);
-    m->s_sh=glm5_amalloc(H*4); m->s_moe=glm5_amalloc(H*4); m->s_exg=glm5_amalloc(cfg->moe_inter*4); m->s_exu=glm5_amalloc(cfg->moe_inter*4); m->s_route=glm5_amalloc(H*4);
+    /* s_exg/s_exu sized for the fused batched-expert pass: ALL owned units of one token
+     * (up to n_active units even when 2-way sharded) in one contiguous row space */
+    { size_t exn=(size_t)(cfg->n_active>0?cfg->n_active:8)*cfg->moe_inter;
+      m->s_sh=glm5_amalloc(H*4); m->s_moe=glm5_amalloc(H*4); m->s_exg=glm5_amalloc(exn*4); m->s_exu=glm5_amalloc(exn*4); m->s_route=glm5_amalloc(H*4); }
     m->s_ff_g=glm5_amalloc(cfg->dense_inter*4); m->s_ff_u=glm5_amalloc(cfg->dense_inter*4); m->s_ff=glm5_amalloc(H*4);
     /* full-vocab sized (>= hrows) so decode sampling can gather the sharded logits in place */
     m->s_logits=glm5_amalloc((size_t)(hrows>cfg->vocab?hrows:cfg->vocab)*4);
@@ -1350,7 +1802,8 @@ static glm5_model* glm5_alloc_synth(glm5_config cfg,int ep_rank,int ep_size,int 
     m->arena_used=used; m->arena_sz=used;
     glm5_init_fp8_lut(m->fp8_lut);
     glm5_dummy=glm5_envi("GLM5_DUMMY",0);
-    if(glm5_envi("GLM5_POOL",0)) m->pool=glm5_g_pool=glm5_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
+    if(glm5_envi("GLM5_POOL",0)&&glm5_envi("GLM5_POOL_EAGER",0))
+        m->pool=glm5_g_pool=glm5_pool_create(m->n_threads);
     return m;
     #undef BF
     #undef FZ
@@ -1522,14 +1975,30 @@ static void glm5_load_one_layer(glm5_model*m, glm5_layer*L, int l, int is_moe, i
         L->sh_w3=glm5_load_w(es,n,base,LN("mlp.shared_experts.up_proj.weight"),1,sh_r0,sh_rows,0,0,cfg->moe_inter,H,ok,used);
         L->sh_w2=glm5_load_w(es,n,base,LN("mlp.shared_experts.down_proj.weight"),2,0,0,sh_r0,sh_rows,H,cfg->moe_inter,ok,used);
         L->sh_r0=sh_r0; L->sh_rows=sh_rows;
-        int no=glm5_n_owned(cfg->n_experts,m->ep_rank,m->ep_size); L->n_owned=no;
-        L->owned_eid=glm5_amalloc((size_t)(no>0?no:1)*sizeof(int));
-        L->ex_w1=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor)); L->ex_w3=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor)); L->ex_w2=glm5_amalloc((size_t)(no>0?no:1)*sizeof(glm5_tensor));
+        /* 2-way expert shard (manifest "# expert_shard 2"): slot layout is
+         * [0,no) = half-0 of experts with e%ep==rank, [no,no+no1) = half-1 of
+         * experts with (e+ep/2)%ep==rank.  Tensors carry inter=moe_inter/2 rows
+         * (gate/up) / cols (down); consumers read the dims off the tensor. */
+        int no=glm5_n_owned(cfg->n_experts,m->ep_rank,m->ep_size);
+        int no1=m->ex_shard2?glm5_n_owned(cfg->n_experts,(m->ep_rank+m->ep_size/2)%m->ep_size,m->ep_size):0;
+        int IH=m->ex_shard2?cfg->moe_inter/2:cfg->moe_inter;
+        L->n_owned=no+no1;
+        int ncap=L->n_owned>0?L->n_owned:1;
+        L->owned_eid=glm5_amalloc((size_t)ncap*sizeof(int));
+        L->ex_w1=glm5_amalloc((size_t)ncap*sizeof(glm5_tensor)); L->ex_w3=glm5_amalloc((size_t)ncap*sizeof(glm5_tensor)); L->ex_w2=glm5_amalloc((size_t)ncap*sizeof(glm5_tensor));
         int s=0; for(int e2=0;e2<cfg->n_experts && *ok;e2++) if(e2%m->ep_size==m->ep_rank){ L->owned_eid[s]=e2;
-            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.gate_proj.weight",l,e2); L->ex_w1[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,cfg->moe_inter,H,ok,used);
-            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.up_proj.weight",l,e2); L->ex_w3[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,cfg->moe_inter,H,ok,used);
-            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.down_proj.weight",l,e2); L->ex_w2[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,H,cfg->moe_inter,ok,used);
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.gate_proj.weight",l,e2); L->ex_w1[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,IH,H,ok,used);
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.up_proj.weight",l,e2); L->ex_w3[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,IH,H,ok,used);
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.down_proj.weight",l,e2); L->ex_w2[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,H,IH,ok,used);
             s++; }
+        if(m->ex_shard2) for(int e2=0;e2<cfg->n_experts && *ok;e2++) if((e2+m->ep_size/2)%m->ep_size==m->ep_rank){ L->owned_eid[s]=e2;
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.gate_proj.weight",l,e2); L->ex_w1[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,IH,H,ok,used);
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.up_proj.weight",l,e2); L->ex_w3[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,IH,H,ok,used);
+            snprintf(nb,sizeof nb,"model.layers.%d.mlp.experts.%d.down_proj.weight",l,e2); L->ex_w2[s]=glm5_load_w(es,n,base,nb,0,0,0,0,0,H,IH,ok,used);
+            s++; }
+        L->ex_iqok=1;
+        for(int si=0;si<L->n_owned;si++)
+            if(!glm5_iq_q8_ok(L->ex_w1[si].type)||!glm5_iq_q8_ok(L->ex_w3[si].type)||!glm5_iq_q8_ok(L->ex_w2[si].type)){ L->ex_iqok=0; break; }
     } else {
         L->ff_gate=glm5_load_w(es,n,base,LN("mlp.gate_proj.weight"),1,ff_r0,ff_rows,0,0,cfg->dense_inter,H,ok,used);
         L->ff_up  =glm5_load_w(es,n,base,LN("mlp.up_proj.weight"),1,ff_r0,ff_rows,0,0,cfg->dense_inter,H,ok,used);
@@ -1566,14 +2035,16 @@ static int glm5_load_mtp_real(glm5_model*m, glm5_ent*es, int n, const uint8_t*ba
     if(!ok){ fprintf(stderr,"glm5_load_mtp: rank %d incomplete (layer %d missing)\n",m->ep_rank,L78); return -1; }
     return 0;
 }
+static void glm5_dense_i8_convert(glm5_model*m);
 static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const char*blob_dir,int n_threads,int n_cmgs){
     char bdir[1024]; if(blob_dir&&*blob_dir) snprintf(bdir,sizeof bdir,"%s",blob_dir);
     else { const char*e=getenv("GLM5_STAGE_DIR"); snprintf(bdir,sizeof bdir,"%s",(e&&*e)?e:"/local/glm5"); }
     char bp[1100],mp[1100]; snprintf(bp,sizeof bp,"%s/rank%02d.blob",bdir,ep_rank); snprintf(mp,sizeof mp,"%s/rank%02d.manifest",bdir,ep_rank);
     FILE*mf=fopen(mp,"r"); if(!mf){ fprintf(stderr,"glm5_load: cannot open %s\n",mp); return NULL; }
-    char line[1024]; int cap=4096,n=0,glm52_manifest=0; glm5_ent*es=glm5_amalloc((size_t)cap*sizeof(glm5_ent));
+    char line[1024]; int cap=4096,n=0,glm52_manifest=0,exshard=0; glm5_ent*es=glm5_amalloc((size_t)cap*sizeof(glm5_ent));
     while(fgets(line,sizeof line,mf)){
-        if(line[0]=='#'){ if(strstr(line,"glm52-a64fx-ep12-v1"))glm52_manifest=1; continue; }
+        if(line[0]=='#'){ if(strstr(line,"glm52-a64fx-ep12-v1"))glm52_manifest=1;
+                          if(strstr(line,"# expert_shard 2"))exshard=1; continue; }
         if(line[0]=='\n') continue;
         if(n>=cap){ cap*=2; es=realloc(es,(size_t)cap*sizeof(glm5_ent)); }
         glm5_ent*e=&es[n]; char dt[32]; int pos=0,cnt;
@@ -1594,6 +2065,8 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     if(base==MAP_FAILED){ fprintf(stderr,"glm5_load: mmap failed\n"); close(bfd); glm5_afree(es); return NULL; }
 
     glm5_model*m=glm5_acalloc(1,sizeof(glm5_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=GLM5_BF16; m->owns_weights=1;
+    m->ex_shard2=exshard; m->ex_no0=glm5_n_owned(cfg.n_experts,ep_rank,ep_size);
+    if(exshard && ep_rank==0) fprintf(stderr,"glm5: 2-way expert shard blobs (inter %d per half)\n",cfg.moe_inter/2);
     if(glm52_manifest) m->arena_sz=bsz; /* exact compressed/rank-sliced weight reserve for KV tiering */
     glm5_kv_init(m);
     const int H=cfg.hidden, QD=glm5_q_dim(&cfg), AD=glm5_attn_dim(&cfg);
@@ -1632,6 +2105,8 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
      * layer staged: GLM5_STAGE_LAYERS=79, or GLM5_STAGE_MTP=1 with a truncated main model).
      * Failure is non-fatal (MTP just stays disabled). */
     if(ok && glm5_envi("GLM5_MTP",0)){
+        /* 2-way-sharded blobs work here too: glm5_load_one_layer applies the same
+         * half-slot mapping to the layer-78 experts the converter emitted. */
         if(glm5_load_mtp_real(m,es,n,base,qh0,qh1,qrows,arows,sh_r0,sh_rows,&used)==0){
             if(ep_rank==0) fprintf(stderr,"glm5: MTP block loaded (checkpoint layer 78)\n");
         } else { m->mtp_layer=NULL; if(ep_rank==0) fprintf(stderr,"glm5: MTP load failed -> disabled\n"); }
@@ -1639,12 +2114,68 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     #undef REQ
     munmap((void*)base,bsz); close(bfd); glm5_afree(es);
     if(!ok){ fprintf(stderr,"glm5_load: rank %d incomplete (missing tensors)\n",ep_rank); glm5_free(m); return NULL; }
+    glm5_dense_i8_convert(m);   /* GLM5_DENSE_I8=1: bf16 dense -> int8 w8a16 (halved GEMV bytes) */
     glm5_alloc_scratch(m,hrows);
     m->arena_used=used; m->arena_sz=used;
     glm5_init_fp8_lut(m->fp8_lut);
     glm5_dummy=glm5_envi("GLM5_DUMMY",0);
-    if(glm5_envi("GLM5_POOL",0)) m->pool=glm5_g_pool=glm5_pool_create(m->n_threads);  /* experimental pinned pool; default OpenMP */
+    if(glm5_envi("GLM5_POOL",0)&&glm5_envi("GLM5_POOL_EAGER",0))
+        m->pool=glm5_g_pool=glm5_pool_create(m->n_threads);
     return m;
+}
+
+/* Load-time BF16 -> INT8 w8a16 dense conversion (GLM5_DENSE_I8=1).  Halves the dense
+ * weight bytes decode streams per token and reuses the validated int8 matvec kernels
+ * (offset-binary byte, f32 scale per qg-column group, same layout the int8 checkpoints
+ * ship).  Weight-only quantization: symmetric absmax/127 per group (g=64 default,
+ * GLM5_DENSE_I8_GS).  Excluded: wkv_b (absorbed-attention tmul + parallel V-expand are
+ * BF16 paths and kv_b feeds attention directly), the router gate (expert selection),
+ * embed and norms. */
+static int glm5_tensor_bf16_to_i8(glm5_tensor*t,int gs){
+    if(!t || t->type!=GLM5_BF16 || !t->w || t->rows<=0 || t->cols<=0) return 0;
+    int rows=t->rows, cols=t->cols, sb=(cols+gs-1)/gs;
+    uint8_t*W=glm5_amalloc((size_t)rows*cols);
+    float*S=glm5_amalloc((size_t)rows*sb*4);
+    if(!W||!S){ glm5_afree(W); glm5_afree(S); return -1; }
+    const uint16_t*src=(const uint16_t*)t->w;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(int r=0;r<rows;r++){
+        const uint16_t*wr=src+(size_t)r*cols;
+        uint8_t*dr=W+(size_t)r*cols; float*srow=S+(size_t)r*sb;
+        for(int b=0;b<sb;b++){
+            int c0=b*gs, c1=c0+gs<cols?c0+gs:cols; float amax=0.f;
+            for(int c=c0;c<c1;c++){ float v=fabsf(glm5_bf2f(wr[c])); if(v>amax) amax=v; }
+            float inv=amax>0.f?127.f/amax:0.f;
+            srow[b]=amax>0.f?amax/127.f:0.f;
+            for(int c=c0;c<c1;c++){
+                int q=(int)lrintf(glm5_bf2f(wr[c])*inv);
+                if(q>127)q=127; if(q<-127)q=-127;
+                dr[c]=(uint8_t)(q+128);
+            }
+        }
+    }
+    glm5_afree(t->w); t->w=W; t->scale=(uint8_t*)S;
+    t->type=GLM5_INT8; t->qg=gs; t->qg0=0;
+    return 1;
+}
+static void glm5_dense_i8_convert(glm5_model*m){
+    if(!glm5_envi("GLM5_DENSE_I8",0)) return;
+    int gs=glm5_envi("GLM5_DENSE_I8_GS",64), n=0;
+    for(int l=0;l<m->cfg.n_layers;l++){
+        glm5_layer*L=&m->layers[l];
+        glm5_tensor*ts[]={&L->wq_a,&L->wq_b,&L->wkv_a,&L->wo,
+                          &L->sh_w1,&L->sh_w3,&L->sh_w2,
+                          &L->ff_gate,&L->ff_up,&L->ff_down};
+        for(size_t i=0;i<sizeof ts/sizeof ts[0];i++){
+            int rc=glm5_tensor_bf16_to_i8(ts[i],gs);
+            if(rc<0){ fprintf(stderr,"glm5: dense-i8 alloc failed (layer %d)\n",l); return; }
+            n+=rc;
+        }
+    }
+    n+=glm5_tensor_bf16_to_i8(&m->head,gs)>0;
+    if(m->ep_rank==0) fprintf(stderr,"glm5: dense bf16->int8 g=%d converted %d tensors\n",gs,n);
 }
 
 /* Phase 2: re-slice this rank's TP-sharded DENSE weights for a new ep (after a group merge), reading
@@ -1835,6 +2366,8 @@ static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*
 
 static glm5_tensor glm5_tensor_rows(const glm5_tensor*t,int r0,int rows);
 static void glm5_tensor_tmul_rows(const glm5_model*m,float*y,const glm5_tensor*t,int r0,int rows,const float*x);
+static void glm5_absorb_token_par(glm5_model*m,glm5_layer*L,const float*qb,float*ab,
+        const int*sel,int ns,float*hmx,float*hse,int nown);
 
 /* ===================== decode sampling (lockstep) =====================
  * Operates on the full, replicated logit vector in m->s_logits (identical on every rank).
@@ -1878,8 +2411,62 @@ static int glm5_sample_logits(glm5_model*m,int vocab){
     return pick;
 }
 
+static void glm5_prefill_absorb_token(glm5_model*m, glm5_layer*L, const float*qb, float*ab,
+        const int*sel, int ns, float*hmx, float*hse, float*qabs, float*ctxb,
+        float*kvtmp, int nown, int qrows, int arows, int qk_mode);
+/* parallel-absorb job types + workers (defined after the absorb kernels below); the fused
+ * decode layer drives them directly inside its own parallel region */
+typedef struct {
+    glm5_model*m; glm5_layer*L; const int*sel; int ns,nown,nchunk,chunklen,KVC,kvl;
+    float ascale; const float*qfull; float*pctx,*pmx,*pse;
+} glm5_abs_job;
+typedef struct { glm5_layer*L; const float*ctxb; float*ab; int nown,kvl,VD,kvb_stride,nope; } glm5_absv_job;
+static void glm5_abs_tile_worker(void*a,int tid,int nthr);
+static void glm5_absv_worker(void*a,int tid,int nthr);
+static void glm5_abs_qfull_head(glm5_model*m,glm5_layer*L,const float*qb,int hh,int KVC,int kvl,int kvb_stride);
+static void glm5_abs_merge_head(glm5_model*m,int hh,int nchunk,int kvl,float*hmx,float*hse);
+/* fused-decode batched expert units: ALL owned (expert,half) units in one worker pass
+ * per stage (pair / down) so the per-unit barrier chain collapses to 4 per layer.
+ * ooff[] are prefix sums of unit inter sizes; xq2 holds per-unit gate quants. */
+typedef struct {
+    glm5_layer*L; const int*oslot; const int*ooff; const float*ow; int nunits,total_rows,H;
+    const glm5_iq_q8_block*xq; int nb;
+    const glm5_iq_q8_block*xq2; int xq2blk;
+    float*yg,*yu,*route;
+} glm5_exb_job;
+static void glm5_exb_pair_worker(void*a,int tid,int nthr){
+    glm5_exb_job*j=a;
+    int per=(j->total_rows+nthr-1)/nthr, r0=tid*per, r1=r0+per; if(r1>j->total_rows) r1=j->total_rows;
+    if(r0>=r1) return;
+    int u=0; while(r0>=j->ooff[u+1]) u++;
+    for(int r=r0;r<r1;r++){
+        while(r>=j->ooff[u+1]) u++;
+        int rr=r-j->ooff[u];
+        const glm5_tensor*t1=&j->L->ex_w1[j->oslot[u]], *t3=&j->L->ex_w3[j->oslot[u]];
+        j->yg[r]=glm5_iq_q8_row(t1,(const uint8_t*)t1->w+(size_t)rr*dequant_row_size((uint32_t)t1->type,t1->cols),j->xq,j->nb);
+        j->yu[r]=glm5_iq_q8_row(t3,(const uint8_t*)t3->w+(size_t)rr*dequant_row_size((uint32_t)t3->type,t3->cols),j->xq,j->nb);
+    }
+}
+static void glm5_exb_down_worker(void*a,int tid,int nthr){
+    glm5_exb_job*j=a;
+    int per=(j->H+nthr-1)/nthr, r0=tid*per, r1=r0+per; if(r1>j->H) r1=j->H;
+    for(int r=r0;r<r1;r++){
+        float acc=j->route[r];
+        for(int u=0;u<j->nunits;u++){
+            const glm5_tensor*t2=&j->L->ex_w2[j->oslot[u]];
+            int ir=j->ooff[u+1]-j->ooff[u];
+            acc+=j->ow[u]*glm5_iq_q8_row(t2,(const uint8_t*)t2->w+(size_t)r*dequant_row_size((uint32_t)t2->type,t2->cols),
+                                         j->xq2+(size_t)u*j->xq2blk,ir/256);
+        }
+        j->route[r]=acc;
+    }
+}
+
 /* ===================== forward (one token at position pos) ===================== */
 static int glm5_forward_token(glm5_model*m,float*x,int pos){
+    /* Defer the persistent pool until decode.  Creating it during model load
+     * leaves spinning workers contending with the OpenMP prefill GEMMs. */
+    if(!m->pool&&glm5_envi("GLM5_POOL",0)) m->pool=glm5_g_pool=glm5_pool_create(m->n_threads);
     const glm5_config*c=&m->cfg;
     const int H=c->hidden, AD=glm5_attn_dim(c);
     const int KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;
@@ -1892,20 +2479,150 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
     const int sparse_window=glm5_envi("GLM5_SPARSE_ATTN_WINDOW",attn_window);
     m->bytes_read=0;
     int last_msa_nsel=0;
+    /* Fused decode (GLM5_DEC_FUSED=1 default): TWO OpenMP regions per layer instead of
+     * ~10 parallel-for launches -- in-decode each region entry after a serial gap costs
+     * ~25-50 us, ~15-20 ms/token across 78 layers.  Serial glue runs on tid 0 between
+     * barriers; matvecs reuse the (arg,tid,nthr) workers, bit-identical partitioning. */
+    static int dec_fused_env=-1;
+    if(dec_fused_env<0) dec_fused_env=glm5_envi("GLM5_DEC_FUSED",1);
+    int dec_fused=dec_fused_env&&!glm5_dummy&&!m->int4_kv&&!m->cp_on&&!msa_on&&!glm5_g_pool;
+#if !defined(_OPENMP)||!defined(__ARM_FEATURE_SVE)
+    dec_fused=0;
+#endif
     for(int l=0;l<c->n_layers;l++){
         glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(c,l);
         const int qh0=L->qh0, qh1=L->qh1, nown=qh1-qh0, qrows=nown*c->qk_head_dim, arows=nown*c->v_head_dim;
         const int tp_attn=(arows<AD);
         const float*cosp=&m->rope_cos[(size_t)pos*half], *sinp=&m->rope_sin[(size_t)pos*half];
         double pt=glm5_prof_now();
+        /* fused phase-1/2 accept all-BF16 or all-INT8 dense (GLM5_DENSE_I8=1); int8 uses
+         * ONE hoisted a16 activation quant per stage instead of per-GEMV (the run-E trap) */
+        const int p1bf=L->wq_a.type==GLM5_BF16 && L->wkv_a.type==GLM5_BF16
+                        && L->wq_b.type==GLM5_BF16 && L->wo.type==GLM5_BF16;
+        const int p1i8=L->wq_a.type==GLM5_INT8 && L->wkv_a.type==GLM5_INT8
+                        && L->wq_b.type==GLM5_INT8 && L->wo.type==GLM5_INT8
+                        && L->wq_a.qg==L->wkv_a.qg && L->wq_a.qg0==0 && L->wkv_a.qg0==0
+                        && L->wq_b.qg0==0 && L->wo.qg0==0;
+        const int fuse1=dec_fused && (p1bf||p1i8) && L->wkv_b.type==GLM5_BF16;
+        const int p2bf=L->sh_w1.type==GLM5_BF16 && L->sh_w3.type==GLM5_BF16 && L->sh_w2.type==GLM5_BF16;
+        const int p2i8=L->sh_w1.type==GLM5_INT8 && L->sh_w3.type==GLM5_INT8 && L->sh_w2.type==GLM5_INT8
+                        && L->sh_w1.qg==L->sh_w3.qg && L->sh_w1.qg0==0 && L->sh_w3.qg0==0 && L->sh_w2.qg0==0;
+        const int fuse2=fuse1 && is_moe && glm5_iq_mode()==1 && H%256==0 && c->moe_inter%256==0
+                        && L->gate.type==GLM5_BF16 && (p2bf||p2i8)
+                        && L->ex_w1 && L->ex_iqok;
+#if defined(_OPENMP)&&defined(__ARM_FEATURE_SVE)
+        if(fuse1){
+            GLM5_FAPP_START("glm5_dec_p1_fused");
+            /* position selection (MSA off in fused mode -> window/full-range branch) */
+            int*selp=m->s_blk_sel, nsel=0;
+            { int win=is_moe ? sparse_window : dense_window;
+              int t0=(win>0 && pos+1>win) ? pos+1-win : 0;
+              for(int t=t0;t<=pos;t++) selp[nsel++]=t; }
+            float hmx[64],hse[64];
+            const int kvb_stride=c->qk_nope_dim+c->v_head_dim, kvl=c->kv_lora;
+            int nthr=omp_get_max_threads();
+            int nchunk=(nthr+nown-1)/nown; if(nchunk<1) nchunk=1;
+            if(nown*nchunk>GLM5_ABS_MAXTILE){ nchunk=GLM5_ABS_MAXTILE/nown; if(nchunk<1) nchunk=1; }
+            int chunklen=(nsel+nchunk-1)/nchunk; if(chunklen<1) chunklen=1;
+            while(nchunk>1 && chunklen<32){ nchunk--; chunklen=(nsel+nchunk-1)/nchunk; }
+            glm5_mv2job qkj={qlat,(const uint16_t*)L->wq_a.w,c->q_lora,
+                             kv,(const uint16_t*)L->wkv_a.w,KVC,xn,H};
+            glm5_mvjob qbj={q,(const uint16_t*)L->wq_b.w,qlat,qrows,c->q_lora};
+            glm5_mvjob oj={ao,(const uint16_t*)L->wo.w,attn,H,arows};
+            glm5_i16job qaji={qlat,(const uint8_t*)L->wq_a.w,(const float*)L->wq_a.scale,
+                              L->wq_a.qg,0,c->q_lora,H,m->s_axq,m->s_axg,0.f};
+            glm5_i16job kvji={kv,(const uint8_t*)L->wkv_a.w,(const float*)L->wkv_a.scale,
+                              L->wkv_a.qg,0,KVC,H,m->s_axq,m->s_axg,0.f};
+            glm5_i16job qbji={q,(const uint8_t*)L->wq_b.w,(const float*)L->wq_b.scale,
+                              L->wq_b.qg,0,qrows,c->q_lora,m->s_axq2,m->s_axg2,0.f};
+            glm5_i16job oji={ao,(const uint8_t*)L->wo.w,(const float*)L->wo.scale,
+                             L->wo.qg,0,H,arows,m->s_axq,m->s_axg,0.f};
+            glm5_abs_job aj={m,L,selp,nsel,nown,nchunk,chunklen,KVC,kvl,ascale,
+                             m->s_qfull,m->s_pctx,m->s_pmx,m->s_pse};
+            glm5_absv_job vj={L,m->s_ctx,attn,nown,kvl,c->v_head_dim,kvb_stride,c->qk_nope_dim};
+            double tq=pt,ta=pt;
+            /* GLM5_P1_TRACE=1: per-stage micro-timing of fused phase 1 (rank 0, printed once) */
+            static int p1tr=-1; if(p1tr<0) p1tr=glm5_envi("GLM5_P1_TRACE",0);
+            static double p1t[8]; static long p1n=0;
+            double s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0;
+            #pragma omp parallel
+            {
+                int tid=omp_get_thread_num(), nt=omp_get_num_threads();
+                if(tid==0){
+                    if(p1tr) s0=glm5_prof_now();
+                    glm5_rmsnorm_gemma(xn,x,L->input_norm,H,c->norm_eps);
+                    if(p1i8){ float xs; glm5_a16_quantize(m->s_axq,m->s_axg,&xs,xn,H,qaji.gs,0);
+                              qaji.xsc=xs; kvji.xsc=xs; }
+                    if(p1tr) s1=glm5_prof_now();
+                }
+                #pragma omp barrier
+                if(p1i8){ glm5_i16_worker(&qaji,tid,nt); glm5_i16_worker(&kvji,tid,nt); }
+                else glm5_mv2_worker(&qkj,tid,nt);
+                #pragma omp barrier
+                if(tid==0){
+                    if(p1tr) s2=glm5_prof_now();
+                    glm5_rmsnorm_head(qlat,L->q_a_norm,c->q_lora,c->norm_eps);
+                    if(p1i8) glm5_a16_quantize(m->s_axq2,m->s_axg2,&qbji.xsc,qlat,c->q_lora,qbji.gs,0);
+                    if(p1tr) s3=glm5_prof_now();
+                }
+                #pragma omp barrier
+                if(p1i8) glm5_i16_worker(&qbji,tid,nt);
+                else glm5_mv_worker(&qbj,tid,nt);
+                #pragma omp barrier
+                if(p1tr && tid==0) s4=glm5_prof_now();
+                if(tid==0){
+                    for(int hh=0;hh<nown;hh++) glm5_rope_interleaved(q+hh*c->qk_head_dim+c->qk_nope_dim,cosp,sinp,c->qk_rope_dim);
+                    glm5_rmsnorm_head(kv,L->kv_a_norm,c->kv_lora,c->norm_eps);
+                    glm5_rope_interleaved(kv+c->kv_lora,cosp,sinp,c->qk_rope_dim);
+                    glm5_store_latent_kv(m,L,pos,kv,KVC);
+                    tq=glm5_prof_now(); if(p1tr) s5=tq;
+                }
+                #pragma omp barrier
+                for(int hh=tid;hh<nown;hh+=nt) glm5_abs_qfull_head(m,L,q,hh,KVC,kvl,kvb_stride);
+                #pragma omp barrier
+                glm5_abs_tile_worker(&aj,tid,nt);
+                #pragma omp barrier
+                for(int hh=tid;hh<nown;hh+=nt) glm5_abs_merge_head(m,hh,nchunk,kvl,hmx,hse);
+                #pragma omp barrier
+                glm5_absv_worker(&vj,tid,nt);
+                #pragma omp barrier
+                if(tid==0){
+                    for(int hh=0;hh<nown;hh++){ float inv=1.0f/(hse[hh]>0?hse[hh]:1);
+                        float*oh=attn+hh*c->v_head_dim; for(int i=0;i<c->v_head_dim;i++) oh[i]*=inv; }
+                    if(p1i8) glm5_a16_quantize(m->s_axq,m->s_axg,&oji.xsc,attn,arows,oji.gs,0);
+                    ta=glm5_prof_now();
+                }
+                #pragma omp barrier
+                if(p1i8) glm5_i16_worker(&oji,tid,nt);
+                else glm5_mv_worker(&oj,tid,nt);
+                if(p1tr && tid==0) s6=glm5_prof_now();
+            }
+            if(p1tr && m->ep_rank==0){
+                p1t[0]+=s1-s0; p1t[1]+=s2-s1; p1t[2]+=s3-s2; p1t[3]+=s4-s3;
+                p1t[4]+=s5-s4; p1t[5]+=ta-s5; p1t[6]+=s6-ta; p1n++;
+                if(p1n%(75*32)==0)
+                    fprintf(stderr,"[p1-trace] avg us/layer: norm+q %.1f | qa+kva %.1f | norm+q2 %.1f | qb %.1f | rope+store %.1f | attn %.1f | oq+o %.1f\n",
+                            p1t[0]/p1n*1e6,p1t[1]/p1n*1e6,p1t[2]/p1n*1e6,p1t[3]/p1n*1e6,p1t[4]/p1n*1e6,p1t[5]/p1n*1e6,p1t[6]/p1n*1e6);
+            }
+            m->prof[GLM5_P_QKV]+=tq-pt; m->prof[GLM5_P_ATTN]+=ta-tq;
+            if(tp_attn && m->ar_cb) m->ar_cb(ao,H,m->ar_ctx);
+            for(int i=0;i<H;i++) x[i]+=ao[i];
+            glm5_prof_add(m,GLM5_P_OPROJ,ta);
+            GLM5_FAPP_STOP("glm5_dec_p1_fused");
+        } else
+#endif
+        {
         GLM5_FAPP_START("glm5_dec_qkv");
         glm5_rmsnorm_gemma(xn,x,L->input_norm,H,c->norm_eps);
-        glm5_mv(m,qlat,&L->wq_a,xn,c->q_lora,H);
+        /* q_a and kv_a both consume xn: one fused region instead of two */
+        if(L->wq_a.type==GLM5_BF16&&L->wkv_a.type==GLM5_BF16&&!glm5_dummy)
+            glm5_mv_bf16_2(qlat,(const uint16_t*)L->wq_a.w,c->q_lora,
+                           kv,(const uint16_t*)L->wkv_a.w,KVC,xn,H);
+        else { glm5_mv(m,qlat,&L->wq_a,xn,c->q_lora,H); glm5_mv(m,kv,&L->wkv_a,xn,KVC,H); }
         glm5_rmsnorm_head(qlat,L->q_a_norm,c->q_lora,c->norm_eps);
         glm5_mv(m,q,&L->wq_b,qlat,qrows,c->q_lora);
         for(int hh=0;hh<nown;hh++) glm5_rope_interleaved(q+hh*c->qk_head_dim+c->qk_nope_dim,cosp,sinp,c->qk_rope_dim);
 
-        glm5_mv(m,kv,&L->wkv_a,xn,KVC,H);
         glm5_rmsnorm_head(kv,L->kv_a_norm,c->kv_lora,c->norm_eps);
         glm5_rope_interleaved(kv+c->kv_lora,cosp,sinp,c->qk_rope_dim);
         if(glm5_cp_mine(m,pos)) glm5_store_latent_kv(m,L,pos,kv,KVC);
@@ -1934,42 +2651,22 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
         float hmx[64], hse[64];
         const int kvb_stride=c->qk_nope_dim+c->v_head_dim;
         int absorb=glm5_envi("GLM5_ABSORB_ATTN",1) && nsel>=glm5_envi("GLM5_ABSORB_MINSEL",32);
-        int absorb_sve_dot=glm5_envi("GLM5_ABSORB_SVE_DOT",1);
         if(absorb){
-            for(int hh=0;hh<nown;hh++){
-                hmx[hh]=-1e30f; hse[hh]=0.0f;
-                float*qa=m->s_qabs+(size_t)hh*c->kv_lora;
-                float*ctx=m->s_ctx+(size_t)hh*c->kv_lora;
-                const float*qh=q+hh*c->qk_head_dim;
-                glm5_tensor_tmul_rows(m,qa,&L->wkv_b,hh*kvb_stride,c->qk_nope_dim,qh);
-                for(int i=0;i<c->kv_lora;i++) ctx[i]=0.0f;
-                float*oh=attn+hh*c->v_head_dim;
-                for(int i=0;i<c->v_head_dim;i++) oh[i]=0.0f;
-            }
-            for(int j=0;j<nsel;j++){
-                glm5_load_latent_kv(m,L,selp[j],kv,KVC);
-                for(int hh=0;hh<nown;hh++){
-                    const float*qh=q+hh*c->qk_head_dim;
-                    const float*qa=m->s_qabs+(size_t)hh*c->kv_lora;
-                    double d=(double)glm5_dot_f32_opt(qa,kv,c->kv_lora,absorb_sve_dot);
-                    for(int i=0;i<c->qk_rope_dim;i++) d+=(double)qh[c->qk_nope_dim+i]*kv[c->kv_lora+i];
-                    float s=(float)d*ascale;
-                    float*ctx=m->s_ctx+(size_t)hh*c->kv_lora;
-                    if(s>hmx[hh]){
-                        float r=(hmx[hh]>-1e20f)?expf(hmx[hh]-s):0.0f;
-                        hse[hh]*=r;
-                        glm5_scale_f32(ctx,r,c->kv_lora);
-                        hmx[hh]=s;
-                    }
-                    float e=expf(s-hmx[hh]);
-                    hse[hh]+=e;
-                    glm5_axpy_f32(ctx,kv,e,c->kv_lora);
-                }
-            }
-            for(int hh=0;hh<nown;hh++){
-                glm5_tensor tv=glm5_tensor_rows(&L->wkv_b,hh*kvb_stride+c->qk_nope_dim,c->v_head_dim);
-                glm5_mv(m,attn+hh*c->v_head_dim,&tv,m->s_ctx+(size_t)hh*c->kv_lora,c->v_head_dim,c->kv_lora);
-            }
+            /* Decode used to keep a separate scalar head/key loop here.  Reuse
+             * the prefill token kernel so GLM5_ATTN_QK=1 contracts 4 heads x 4
+             * cached keys per SVE tile and amortizes reductions/cache decoding. */
+            int qk_mode=glm5_envi("GLM5_ATTN_QK",1);
+            static int abs_par=-1;
+            if(abs_par<0) abs_par=glm5_envi("GLM5_ABSORB_PAR",1);
+            int par_ok=abs_par && !m->int4_kv && L->wkv_b.type==GLM5_BF16;
+#if !defined(__ARM_FEATURE_SVE)
+            par_ok=0;
+#endif
+            if(par_ok)
+                glm5_absorb_token_par(m,L,q,attn,selp,nsel,hmx,hse,nown);
+            else
+                glm5_prefill_absorb_token(m,L,q,attn,selp,nsel,hmx,hse,m->s_qabs,m->s_ctx,
+                                          kv,nown,qrows,arows,qk_mode);
         } else {
             const int kvb_rows=nown*kvb_stride;
             for(int hh=0;hh<nown;hh++){
@@ -2014,10 +2711,143 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
         for(int i=0;i<H;i++) x[i]+=ao[i];
         GLM5_FAPP_STOP("glm5_dec_o_proj");
         glm5_prof_add(m,GLM5_P_OPROJ,pt);
+        }
+        static int nt_env=-1; if(nt_env<0) nt_env=glm5_envi("GLM5_NAN_TRACE",0);
+        if(nt_env){
+            static int nt_once=0;
+            if(m->ep_rank==0 && nt_once<6){ nt_once++;
+                int na=0,nq=0,nat=0; for(int i=0;i<H;i++) if(x[i]!=x[i]) na++;
+                for(int i=0;i<qrows;i++) if(q[i]!=q[i]) nq++;
+                for(int i=0;i<arows;i++) if(attn[i]!=attn[i]) nat++;
+                fprintf(stderr,"[nan-trace] L=%d nlayers=%d post-attn: x_nan=%d/%d q_nan=%d/%d attn_nan=%d/%d\n",
+                        l,c->n_layers,na,H,nq,qrows,nat,arows);
+            }
+        }
         /* FFN / MoE */
         pt=glm5_prof_now();
         float*h2=m->s_norm; glm5_rmsnorm_gemma(h2,x,L->post_norm,H,c->norm_eps);
         glm5_prof_add(m,GLM5_P_OTHER,pt);
+#if defined(_OPENMP)&&defined(__ARM_FEATURE_SVE)
+        if(is_moe&&fuse2){
+            const int tp_sh=(L->sh_rows<c->moe_inter);
+            pt=glm5_prof_now();
+            GLM5_FAPP_START("glm5_dec_p2_fused");
+            float*rl=m->s_router,*route=m->s_route;
+            int selx[64]; float selw[64]; int na=c->n_active>64?64:c->n_active;
+            int nownx=0,oslot[64]; float ow[64];
+            glm5_mvjob gj={rl,(const uint16_t*)L->gate.w,h2,c->n_experts,H};
+            glm5_mv2job shj={m->s_shg,(const uint16_t*)L->sh_w1.w,L->sh_rows,
+                             m->s_shu,(const uint16_t*)L->sh_w3.w,L->sh_rows,h2,H};
+            glm5_mvjob sh2j={m->s_sh,(const uint16_t*)L->sh_w2.w,m->s_shg,H,L->sh_rows};
+            glm5_i16job shji1={m->s_shg,(const uint8_t*)L->sh_w1.w,(const float*)L->sh_w1.scale,
+                               L->sh_w1.qg,0,L->sh_rows,H,m->s_axq,m->s_axg,0.f};
+            glm5_i16job shji3={m->s_shu,(const uint8_t*)L->sh_w3.w,(const float*)L->sh_w3.scale,
+                               L->sh_w3.qg,0,L->sh_rows,H,m->s_axq,m->s_axg,0.f};
+            glm5_i16job sh2ji={m->s_sh,(const uint8_t*)L->sh_w2.w,(const float*)L->sh_w2.scale,
+                               L->sh_w2.qg,0,H,L->sh_rows,m->s_axq2,m->s_axg2,0.f};
+            double tr=pt,te=pt;
+            #pragma omp parallel
+            {
+                int tid=omp_get_thread_num(), nt=omp_get_num_threads();
+                glm5_mv_worker(&gj,tid,nt);
+                #pragma omp barrier
+                if(tid==0){
+                    glm5_sigmoid_row(rl,c->n_experts);
+                    for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f;
+                        for(int e=0;e<c->n_experts;e++){ int used=0; for(int j2=0;j2<a;j2++) if(selx[j2]==e){used=1;break;} if(used)continue;
+                            float v=rl[e]+L->gate_bias[e]; if(v>bv){bv=v;best=e;} } selx[a]=best; selw[a]=rl[best]; }
+                    float wsum=0; for(int a=0;a<na;a++) wsum+=selw[a]; if(wsum<=0)wsum=1;
+                    for(int a=0;a<na;a++){ int sl=glm5_ex_slot(m,selx[a]);
+                        if(sl>=0){ oslot[nownx]=sl; ow[nownx]=selw[a]/wsum*c->routed_scale; nownx++; } }
+                    memset(route,0,(size_t)H*4);
+                    pthread_once(&glm5_iq_lut_once,glm5_iq_init_luts);
+                    glm5_iq_quant_q8((glm5_iq_q8_block*)m->s_iqx,h2,H);
+                    if(p2i8){ float xs; glm5_a16_quantize(m->s_axq,m->s_axg,&xs,h2,H,shji1.gs,0);
+                              shji1.xsc=xs; shji3.xsc=xs; }
+                    tr=glm5_prof_now();
+                }
+                #pragma omp barrier
+                /* ALL owned expert units in one pass per stage: 4 barriers/layer total.
+                 * ooff prefix sums are rebuilt identically on every thread (deterministic).
+                 * GLM5_EXB=0 restores the per-unit loop for A/B. */
+                static int use_exb=-1;
+                if(use_exb<0) use_exb=glm5_envi("GLM5_EXB",1);
+                if(use_exb){
+                    int ooff[65]; ooff[0]=0;
+                    for(int a=0;a<nownx;a++) ooff[a+1]=ooff[a]+L->ex_w1[oslot[a]].rows;
+                    int exR=ooff[nownx];
+                    int xq2blk=(c->moe_inter+255)/256;
+                    glm5_exb_job xj={L,oslot,ooff,ow,nownx,exR,H,
+                                     (const glm5_iq_q8_block*)m->s_iqx,H/256,
+                                     (const glm5_iq_q8_block*)m->s_iqx2,xq2blk,
+                                     m->s_exg,m->s_exu,route};
+                    if(exR>0){
+                        glm5_exb_pair_worker(&xj,tid,nt);
+                        #pragma omp barrier
+                        { int per=(exR+nt-1)/nt, i0=tid*per, i1=i0+per>exR?exR:i0+per;
+                          for(int i=i0;i<i1;i++) m->s_exg[i]=glm5_swiglu_oai(m->s_exg[i],m->s_exu[i],c->swiglu_alpha,c->swiglu_limit); }
+                        #pragma omp barrier
+                        for(int u=tid;u<nownx;u+=nt)
+                            glm5_iq_quant_q8((glm5_iq_q8_block*)m->s_iqx2+(size_t)u*xq2blk,m->s_exg+ooff[u],ooff[u+1]-ooff[u]);
+                        #pragma omp barrier
+                        glm5_exb_down_worker(&xj,tid,nt);
+                    }
+                    #pragma omp barrier
+                }
+                else for(int a=0;a<nownx;a++){
+                    const int ir=L->ex_w1[oslot[a]].rows;
+                    glm5_iq_q8_job pj={m->s_exg,m->s_exu,&L->ex_w1[oslot[a]],&L->ex_w3[oslot[a]],
+                                       (const glm5_iq_q8_block*)m->s_iqx,
+                                       dequant_row_size((uint32_t)L->ex_w1[oslot[a]].type,H),
+                                       dequant_row_size((uint32_t)L->ex_w3[oslot[a]].type,H),
+                                       ir,H/256};
+                    glm5_iq_q8_worker(&pj,tid,nt);
+                    #pragma omp barrier
+                    { int per=(ir+nt-1)/nt, i0=tid*per, i1=i0+per>ir?ir:i0+per;
+                      for(int i=i0;i<i1;i++) m->s_exg[i]=glm5_swiglu_oai(m->s_exg[i],m->s_exu[i],c->swiglu_alpha,c->swiglu_limit); }
+                    #pragma omp barrier
+                    if(tid==0) glm5_iq_quant_q8((glm5_iq_q8_block*)m->s_iqx2,m->s_exg,ir);
+                    #pragma omp barrier
+                    glm5_iq_q8_job dj={m->s_moe,NULL,&L->ex_w2[oslot[a]],NULL,
+                                       (const glm5_iq_q8_block*)m->s_iqx2,
+                                       dequant_row_size((uint32_t)L->ex_w2[oslot[a]].type,ir),0,H,ir/256};
+                    glm5_iq_q8_worker(&dj,tid,nt);
+                    #pragma omp barrier
+                    { int per=(H+nt-1)/nt, i0=tid*per, i1=i0+per>H?H:i0+per;
+                      if(i1>i0) glm5_axpy_f32(route+i0,m->s_moe+i0,ow[a],i1-i0); }
+                    #pragma omp barrier
+                }
+                if(tid==0) te=glm5_prof_now();
+                if(p2i8){ glm5_i16_worker(&shji1,tid,nt); glm5_i16_worker(&shji3,tid,nt); }
+                else glm5_mv2_worker(&shj,tid,nt);
+                #pragma omp barrier
+                { int per=(L->sh_rows+nt-1)/nt, i0=tid*per, i1=i0+per>L->sh_rows?L->sh_rows:i0+per;
+                  for(int i=i0;i<i1;i++) m->s_shg[i]=glm5_swiglu_oai(m->s_shg[i],m->s_shu[i],c->swiglu_alpha,c->swiglu_limit); }
+                #pragma omp barrier
+                if(p2i8){
+                    if(tid==0) glm5_a16_quantize(m->s_axq2,m->s_axg2,&sh2ji.xsc,m->s_shg,L->sh_rows,sh2ji.gs,0);
+                    #pragma omp barrier
+                    glm5_i16_worker(&sh2ji,tid,nt);
+                } else glm5_mv_worker(&sh2j,tid,nt);
+                #pragma omp barrier
+                if(tid==0&&tp_sh) for(int i=0;i<H;i++) route[i]+=m->s_sh[i];
+            }
+            m->prof[GLM5_P_ROUTER]+=tr-pt; m->prof[GLM5_P_EXPERTS]+=te-tr;
+            glm5_prof_add(m,GLM5_P_SHARED,te);
+            GLM5_FAPP_STOP("glm5_dec_p2_fused");
+            if(m->ar_cb) m->ar_cb(route,H,m->ar_ctx);          /* EP-sum routed (+ shared if TP) */
+            for(int i=0;i<H;i++) x[i]+=route[i] + (tp_sh?0.0f:m->s_sh[i]);
+            static int nt_env2=-1; if(nt_env2<0) nt_env2=glm5_envi("GLM5_NAN_TRACE",0);
+            if(nt_env2){
+                static int nt2_once=0;
+                if(m->ep_rank==0 && nt2_once<6){ nt2_once++;
+                    int nr=0,ns2=0,nx=0; for(int i=0;i<H;i++){ if(route[i]!=route[i]) nr++; if(m->s_sh[i]!=m->s_sh[i]) ns2++; if(x[i]!=x[i]) nx++; }
+                    fprintf(stderr,"[nan-trace] L=%d nlayers=%d post-moe: route_nan=%d sh_nan=%d x_nan=%d/%d tp_sh=%d\n",
+                            l,c->n_layers,nr,ns2,nx,H,tp_sh);
+                }
+            }
+        } else
+#endif
         if(is_moe){
             const int tp_sh=(L->sh_rows<c->moe_inter);
             pt=glm5_prof_now();
@@ -2034,12 +2864,11 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             glm5_prof_add(m,GLM5_P_ROUTER,pt);
             pt=glm5_prof_now();
             GLM5_FAPP_START("glm5_dec_experts");
-            for(int a=0;a<na;a++){ int e=selx[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
-                float w=selw[a]/wsum*c->routed_scale;
-                glm5_mv(m,m->s_exg,&L->ex_w1[slot],h2,c->moe_inter,H);
-                glm5_mv(m,m->s_exu,&L->ex_w3[slot],h2,c->moe_inter,H);
-                for(int i=0;i<c->moe_inter;i++) m->s_exg[i]=glm5_swiglu_oai(m->s_exg[i],m->s_exu[i],c->swiglu_alpha,c->swiglu_limit);
-                glm5_mv(m,m->s_moe,&L->ex_w2[slot],m->s_exg,H,c->moe_inter);
+            for(int a=0;a<na;a++){ int e=selx[a]; int slot=glm5_ex_slot(m,e); if(slot<0) continue;
+                float w=selw[a]/wsum*c->routed_scale; int ir=L->ex_w1[slot].rows;
+                glm5_mv_pair(m,m->s_exg,&L->ex_w1[slot],m->s_exu,&L->ex_w3[slot],h2,ir,H);
+                for(int i=0;i<ir;i++) m->s_exg[i]=glm5_swiglu_oai(m->s_exg[i],m->s_exu[i],c->swiglu_alpha,c->swiglu_limit);
+                glm5_mv(m,m->s_moe,&L->ex_w2[slot],m->s_exg,H,ir);
                 glm5_axpy_f32(route, m->s_moe, w, H); }   /* SVE: was scalar route[i]+=w*s_moe[i] */
             GLM5_FAPP_STOP("glm5_dec_experts");
             glm5_prof_add(m,GLM5_P_EXPERTS,pt);
@@ -2048,8 +2877,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             if(overlap) m->ar_async_start(route,H,m->ar_async_ctx);
             pt=glm5_prof_now();
             GLM5_FAPP_START("glm5_dec_shared");
-            glm5_mv(m,m->s_shg,&L->sh_w1,h2,L->sh_rows,H);
-            glm5_mv(m,m->s_shu,&L->sh_w3,h2,L->sh_rows,H);
+            glm5_mv_pair(m,m->s_shg,&L->sh_w1,m->s_shu,&L->sh_w3,h2,L->sh_rows,H);
             for(int i=0;i<L->sh_rows;i++) m->s_shg[i]=glm5_swiglu_oai(m->s_shg[i],m->s_shu[i],c->swiglu_alpha,c->swiglu_limit);
             glm5_mv(m,m->s_sh,&L->sh_w2,m->s_shg,H,L->sh_rows);
             if(tp_sh) for(int i=0;i<H;i++) route[i]+=m->s_sh[i];
@@ -2058,12 +2886,20 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             if(overlap) m->ar_wait(m->ar_async_ctx);
             else if(m->ar_cb) m->ar_cb(route,H,m->ar_ctx);     /* EP-sum routed (+ shared if TP) */
             for(int i=0;i<H;i++) x[i]+=route[i] + (tp_sh?0.0f:m->s_sh[i]);
+            static int nt_env3=-1; if(nt_env3<0) nt_env3=glm5_envi("GLM5_NAN_TRACE",0);
+            if(nt_env3){
+                static int nt2_once=0;
+                if(m->ep_rank==0 && nt2_once<6){ nt2_once++;
+                    int nr=0,ns2=0,nx=0; for(int i=0;i<H;i++){ if(route[i]!=route[i]) nr++; if(m->s_sh[i]!=m->s_sh[i]) ns2++; if(x[i]!=x[i]) nx++; }
+                    fprintf(stderr,"[nan-trace] L=%d nlayers=%d post-moe: route_nan=%d sh_nan=%d x_nan=%d/%d tp_sh=%d\n",
+                            l,c->n_layers,nr,ns2,nx,H,tp_sh);
+                }
+            }
         } else {
             const int tp_ffn=(L->ff_rows<c->dense_inter);
             pt=glm5_prof_now();
             GLM5_FAPP_START("glm5_dec_dense_ffn");
-            glm5_mv(m,m->s_ff_g,&L->ff_gate,h2,L->ff_rows,H);
-            glm5_mv(m,m->s_ff_u,&L->ff_up,h2,L->ff_rows,H);
+            glm5_mv_pair(m,m->s_ff_g,&L->ff_gate,m->s_ff_u,&L->ff_up,h2,L->ff_rows,H);
             for(int i=0;i<L->ff_rows;i++) m->s_ff_g[i]=glm5_swiglu_oai(m->s_ff_g[i],m->s_ff_u[i],c->swiglu_alpha,c->swiglu_limit);
             glm5_mv(m,m->s_ff,&L->ff_down,m->s_ff_g,H,L->ff_rows);
             if(tp_ffn && m->ar_cb) m->ar_cb(m->s_ff,H,m->ar_ctx);
@@ -2537,6 +3373,36 @@ static int glm5_gemm2_int16sdot_preq(float*restrict Y0, const uint8_t*W0, const 
  * once, reused across 5 tokens). ~2x denser than the w8a16 bf16-tile FMA (svdot_s64 32 macs/instr vs
  * f32 svmla 16) AND accurate — the prefill counterpart of glm5_mv_int16_sdot. Applies to all int8
  * tensors. Y is token-major [N,rows] (Y[t*rows+r]). */
+/* (tid,nthr) worker forms of the preq int16-SDOT GEMM and the small-N IQ GEMM, so the
+ * fused-batch decode layer can drive them inside ONE parallel region per phase. */
+typedef struct { float*Y; const uint8_t*W; const float*S; int gs,qg0,rows,cols,N,sb;
+                 const int16_t*Xq; const int64_t*Xg; const float*xsc; } glm5_i16g_job;
+static void glm5_i16g_worker(void*a,int tid,int nthr){
+#if defined(__ARM_FEATURE_SVE)
+    glm5_i16g_job*j=a; int nb=j->rows/8, per=(nb+nthr-1)/nthr, b0=tid*per, b1=b0+per; if(b1>nb)b1=nb;
+    for(int bi=b0;bi<b1;bi++){
+        int r=bi*8; const uint8_t*w=j->W+(size_t)r*j->cols; const float*s=j->S+(size_t)r*j->sb;
+        glm5_gemm_int16sdot_block8(j->Y,j->rows,r,w,s,j->sb,j->gs,j->qg0,j->Xq,j->Xg,j->xsc,j->N,j->cols);
+    }
+    if(tid==0) for(int r=nb*8;r<j->rows;r++)
+        for(int t=0;t<j->N;t++) j->Y[(size_t)t*j->rows+r]=
+            j->xsc[t]*glm5_dot_int16sdot_row(j->W+(size_t)r*j->cols,j->S+(size_t)r*j->sb,j->gs,j->qg0,j->Xq+(size_t)t*j->cols,j->cols);
+#else
+    (void)a;(void)tid;(void)nthr;
+#endif
+}
+typedef struct { float*Y; const glm5_tensor*t; const glm5_iq_q8_block*xq; const int*tok;
+                 int N,rows,nb; size_t rb; } glm5_iqgN_job;
+static void glm5_iqgN_worker(void*a,int tid,int nthr){
+    glm5_iqgN_job*j=a; int per=(j->rows+nthr-1)/nthr, r0=tid*per, r1=r0+per; if(r1>j->rows) r1=j->rows;
+    for(int r=r0;r<r1;r++){
+        const uint8_t*w=(const uint8_t*)j->t->w+(size_t)r*j->rb;
+        for(int n=0;n<j->N;n++){
+            int xi=j->tok?j->tok[n]:n;    /* bucket entries index non-contiguous activations */
+            j->Y[(size_t)n*j->rows+r]=glm5_iq_q8_row(j->t,w,j->xq+(size_t)xi*j->nb,j->nb);
+        }
+    }
+}
 static void glm5_gemm_int16sdot(glm5_model*m, float*restrict Y, const uint8_t*W, const float*S, int gs, int qg0,
                                 const float*X, int N, int rows, int cols){
     if(N<=1){ glm5_mv_int16_sdot(m,Y,W,S,gs,qg0,X,rows,cols); return; }
@@ -2611,8 +3477,31 @@ static void glm5_gemm_int8sdot_rb(glm5_model*m, float*restrict Y, const uint8_t*
 #endif
     free(Xq); free(xsc);
 }
+/* small-N mixed-IQ GEMM via the v2 q8 row kernels: quantize the N activations once,
+ * read each weight row once and contract it against all N.  The K=2 spec verifier's
+ * expert GEMMs (g=1..2) ran through the F32-dequant fallback at ~270 ms/tok. */
+static int glm5_gemm_iq_q8_smalln(float*restrict Y,const glm5_tensor*t,const float*X,
+                                  int N,int rows,int cols){
+    if(glm5_iq_mode()!=1||!glm5_iq_q8_ok(t->type)||cols%256) return -1;
+    int nb=cols/256;
+    glm5_iq_q8_block*xq=malloc((size_t)N*nb*sizeof(*xq)); if(!xq) return -1;
+    pthread_once(&glm5_iq_lut_once,glm5_iq_init_luts);
+    for(int n=0;n<N;n++) glm5_iq_quant_q8(xq+(size_t)n*nb,X+(size_t)n*cols,cols);
+    size_t rb=dequant_row_size((uint32_t)t->type,cols);
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
+#endif
+    for(int r=0;r<rows;r++){
+        const uint8_t*w=(const uint8_t*)t->w+(size_t)r*rb;
+        for(int n=0;n<N;n++) Y[(size_t)n*rows+r]=glm5_iq_q8_row(t,w,xq+(size_t)n*nb,nb);
+    }
+    free(xq); return 0;
+}
 static void glm5_gemm_ggml(float*restrict Y,const glm5_tensor*t,const float*X,
                            int N,int rows,int cols){
+    /* q8 kernels FIRST, including N==1: the spec verifier's M=2 buckets are mostly g=1
+     * and the F32-dequant fallback below runs at scalar-dequant speed (~330 ms/step). */
+    if(N<=16 && !glm5_gemm_iq_q8_smalln(Y,t,X,N,rows,cols)) return;
     if(N<=1){ glm5_mv_ggml(Y,t,X,rows,cols); return; }
     const size_t rb=dequant_row_size((uint32_t)t->type,cols);
     if(!rb){ for(size_t i=0;i<(size_t)N*rows;i++)Y[i]=NAN; return; }
@@ -2876,6 +3765,161 @@ static void glm5_prefill_absorb_token(glm5_model*m, glm5_layer*L, const float*qb
     }
 }
 
+/* ===================== parallel absorbed-MLA decode attention =====================
+ * The serial absorb walks ns x nown (576-dot + online-softmax axpy + SCALAR u16 KV
+ * decode) on ONE core -> ~150 ms/tok at 640 ctx on the 12n Q2 run.  Here the
+ * (head, position-chunk) tiles run on ALL threads; each tile keeps its own
+ * online-softmax partial (mx, se, ctx[kv_lora]) in m->s_pctx and the partials
+ * merge with the standard flash combine (same math as the CP kv_combine).  KV
+ * stays u16 (bf16/fp16) and is widened INSIDE the dot/axpy kernels -- no scalar
+ * decode pass, no f32 KV staging.  V-expand parallelizes over nown*v_head_dim
+ * BF16 rows.  Decode falls back to glm5_prefill_absorb_token for int4-KV or a
+ * non-BF16 wkv_b (int8 checkpoints), or GLM5_ABSORB_PAR=0. */
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t glm5_w16(svbool_t pg,const uint16_t*p,int fp16){
+    svuint32_t u=svld1uh_u32(pg,p);
+    if(fp16) return svcvt_f32_f16_x(pg,svreinterpret_f16_u32(u));
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg,u,16));
+}
+static void glm5_dot4_f32_u16(float*out,const float*q,const uint16_t*k0,const uint16_t*k1,
+                              const uint16_t*k2,const uint16_t*k3,int n,int fp16){
+    svfloat32_t a0=svdup_f32(0.f),a1=a0,a2=a0,a3=a0; int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svfloat32_t qv=svld1(pg,q+i);
+        a0=svmla_f32_x(pg,a0,qv,glm5_w16(pg,k0+i,fp16));
+        a1=svmla_f32_x(pg,a1,qv,glm5_w16(pg,k1+i,fp16));
+        a2=svmla_f32_x(pg,a2,qv,glm5_w16(pg,k2+i,fp16));
+        a3=svmla_f32_x(pg,a3,qv,glm5_w16(pg,k3+i,fp16));
+    }
+    svbool_t pt=svptrue_b32();
+    out[0]=svaddv_f32(pt,a0); out[1]=svaddv_f32(pt,a1);
+    out[2]=svaddv_f32(pt,a2); out[3]=svaddv_f32(pt,a3);
+}
+static void glm5_axpy4_f32_u16(float*ctx,const uint16_t*k0,const uint16_t*k1,const uint16_t*k2,
+                               const uint16_t*k3,const float*e,int n,int fp16){
+    int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svfloat32_t cv=svld1(pg,ctx+i);
+        cv=svmla_n_f32_x(pg,cv,glm5_w16(pg,k0+i,fp16),e[0]);
+        cv=svmla_n_f32_x(pg,cv,glm5_w16(pg,k1+i,fp16),e[1]);
+        cv=svmla_n_f32_x(pg,cv,glm5_w16(pg,k2+i,fp16),e[2]);
+        cv=svmla_n_f32_x(pg,cv,glm5_w16(pg,k3+i,fp16),e[3]);
+        svst1(pg,ctx+i,cv);
+    }
+}
+#endif
+static void glm5_abs_tile_worker(void*a,int tid,int nthr){
+#if defined(__ARM_FEATURE_SVE)
+    glm5_abs_job*j=a; glm5_model*m=j->m; glm5_layer*L=j->L;
+    const int fp16=m->kv_fp16, KVC=j->KVC, kvl=j->kvl, ntile=j->nown*j->nchunk;
+    for(int t=tid;t<ntile;t+=nthr){
+        int hh=t/j->nchunk, ch=t%j->nchunk;
+        int j0=ch*j->chunklen, j1=j0+j->chunklen; if(j1>j->ns) j1=j->ns;
+        float*ctx=j->pctx+(size_t)t*kvl; memset(ctx,0,(size_t)kvl*4);
+        float mx=-1e30f, se=0.f;
+        const float*qf=j->qfull+(size_t)hh*KVC;
+        float sc[64]; const uint16_t*kp[64];
+        for(int b0=j0;b0<j1;b0+=64){
+            int bn=j1-b0; if(bn>64) bn=64;
+            for(int u=0;u<bn;u++) kp[u]=L->kv_cache+glm5_cp_slot(m,j->sel[b0+u])*(size_t)KVC;
+            int u=0;
+            for(;u+3<bn;u+=4) glm5_dot4_f32_u16(sc+u,qf,kp[u],kp[u+1],kp[u+2],kp[u+3],KVC,fp16);
+            for(;u<bn;u++){ float o[4]; glm5_dot4_f32_u16(o,qf,kp[u],kp[u],kp[u],kp[u],KVC,fp16); sc[u]=o[0]; }
+            float bmx=mx;
+            for(u=0;u<bn;u++){ sc[u]*=j->ascale; if(sc[u]>bmx) bmx=sc[u]; }
+            if(bmx>mx){
+                if(se>0.f){ float r=expf(mx-bmx); se*=r; glm5_scale_f32(ctx,r,kvl); }
+                mx=bmx;
+            }
+            for(u=0;u<bn;u++){ sc[u]=expf(sc[u]-mx); se+=sc[u]; }
+            u=0;
+            for(;u+3<bn;u+=4) glm5_axpy4_f32_u16(ctx,kp[u],kp[u+1],kp[u+2],kp[u+3],sc+u,kvl,fp16);
+            for(;u<bn;u++){ float e4[4]={sc[u],0.f,0.f,0.f}; glm5_axpy4_f32_u16(ctx,kp[u],kp[u],kp[u],kp[u],e4,kvl,fp16); }
+        }
+        j->pmx[t]=mx; j->pse[t]=se;
+    }
+#else
+    (void)a;(void)tid;(void)nthr;
+#endif
+}
+static void glm5_absv_worker(void*a,int tid,int nthr){
+    glm5_absv_job*j=a; int rows=j->nown*j->VD;
+    int per=(rows+nthr-1)/nthr, r0=tid*per, r1=r0+per; if(r1>rows) r1=rows;
+    const glm5_tensor*t=&j->L->wkv_b;
+    for(int r=r0;r<r1;r++){
+        int hh=r/j->VD, rr=r%j->VD;
+        const uint16_t*w=(const uint16_t*)t->w+(size_t)(hh*j->kvb_stride+j->nope+rr)*t->cols;
+        j->ab[hh*j->VD+rr]=vec_dot_bf16_f32(w,j->ctxb+(size_t)hh*j->kvl,j->kvl);
+    }
+}
+static void glm5_abs_qfull_head(glm5_model*m,glm5_layer*L,const float*qb,int hh,
+                                int KVC,int kvl,int kvb_stride){
+    const glm5_config*c=&m->cfg;
+    float*qf=m->s_qfull+(size_t)hh*KVC;
+    glm5_tensor_tmul_rows(m,qf,&L->wkv_b,hh*kvb_stride,c->qk_nope_dim,qb+hh*c->qk_head_dim);
+    memcpy(qf+kvl,qb+hh*c->qk_head_dim+c->qk_nope_dim,(size_t)c->qk_rope_dim*4);
+}
+static void glm5_abs_merge_head(glm5_model*m,int hh,int nchunk,int kvl,float*hmx,float*hse){
+    float gm=-1e30f;
+    for(int ch=0;ch<nchunk;ch++){ float v=m->s_pmx[hh*nchunk+ch]; if(v>gm) gm=v; }
+    float gse=0.f; float*ctx=m->s_ctx+(size_t)hh*kvl;
+    memset(ctx,0,(size_t)kvl*4);
+    for(int ch=0;ch<nchunk;ch++){
+        int t=hh*nchunk+ch;
+        if(m->s_pse[t]<=0.f) continue;
+        float r=expf(m->s_pmx[t]-gm);
+        gse+=m->s_pse[t]*r;
+        glm5_axpy_f32(ctx,m->s_pctx+(size_t)t*kvl,r,kvl);
+    }
+    hmx[hh]=gm; hse[hh]=gse;
+}
+static void glm5_absorb_token_par(glm5_model*m,glm5_layer*L,const float*qb,float*ab,
+        const int*sel,int ns,float*hmx,float*hse,int nown){
+    const glm5_config*c=&m->cfg;
+    const int KVC=glm5_kv_cache_dim(c), kvb_stride=c->qk_nope_dim+c->v_head_dim, kvl=c->kv_lora;
+    const float ascale=1.0f/sqrtf((float)c->qk_head_dim);
+    int nthr=1;
+#ifdef _OPENMP
+    nthr=omp_get_max_threads();
+#endif
+    if(glm5_g_pool) nthr=glm5_g_pool->nthr;
+    int nchunk=(nthr+nown-1)/nown; if(nchunk<1) nchunk=1;
+    if(nown*nchunk>GLM5_ABS_MAXTILE){ nchunk=GLM5_ABS_MAXTILE/nown; if(nchunk<1) nchunk=1; }
+    int chunklen=(ns+nchunk-1)/nchunk; if(chunklen<1) chunklen=1;
+    while(nchunk>1 && chunklen<32){ nchunk--; chunklen=(ns+nchunk-1)/nchunk; }
+    glm5_abs_job j={m,L,sel,ns,nown,nchunk,chunklen,KVC,kvl,ascale,m->s_qfull,m->s_pctx,m->s_pmx,m->s_pse};
+    glm5_absv_job vj={L,m->s_ctx,ab,nown,kvl,c->v_head_dim,kvb_stride,c->qk_nope_dim};
+    if(glm5_g_pool){
+        for(int hh=0;hh<nown;hh++) glm5_abs_qfull_head(m,L,qb,hh,KVC,kvl,kvb_stride);
+        glm5_pool_run(glm5_g_pool,glm5_abs_tile_worker,&j);
+        for(int hh=0;hh<nown;hh++) glm5_abs_merge_head(m,hh,nchunk,kvl,hmx,hse);
+        glm5_pool_run(glm5_g_pool,glm5_absv_worker,&vj);
+        return;
+    }
+#ifdef _OPENMP
+    /* ONE parallel region for qabs / tiles / merge / V-expand: region entry and the
+     * serial qabs tmul were ~100 us of fixed cost per layer as separate phases. */
+    #pragma omp parallel
+    {
+        int tid=omp_get_thread_num(), nt=omp_get_num_threads();
+        for(int hh=tid;hh<nown;hh+=nt) glm5_abs_qfull_head(m,L,qb,hh,KVC,kvl,kvb_stride);
+        #pragma omp barrier
+        glm5_abs_tile_worker(&j,tid,nt);
+        #pragma omp barrier
+        for(int hh=tid;hh<nown;hh+=nt) glm5_abs_merge_head(m,hh,nchunk,kvl,hmx,hse);
+        #pragma omp barrier
+        glm5_absv_worker(&vj,tid,nt);
+    }
+#else
+    for(int hh=0;hh<nown;hh++) glm5_abs_qfull_head(m,L,qb,hh,KVC,kvl,kvb_stride);
+    glm5_abs_tile_worker(&j,0,1);
+    for(int hh=0;hh<nown;hh++) glm5_abs_merge_head(m,hh,nchunk,kvl,hmx,hse);
+    glm5_absv_worker(&vj,0,1);
+#endif
+}
+
 static void glm5_free_mstream(glm5_model*m){
     glm5_mstream*ms=(glm5_mstream*)m->ms; if(!ms) return;
     glm5_afree(ms->kc);glm5_afree(ms->vc);glm5_afree(ms->xn);glm5_afree(ms->q);glm5_afree(ms->k);glm5_afree(ms->v);glm5_afree(ms->qlat);glm5_afree(ms->kvb);glm5_afree(ms->attn);glm5_afree(ms->o);
@@ -2921,7 +3965,8 @@ static int glm5_alloc_mstream_ex(glm5_model*m,int N,int per_stream_kv){
     ms->shg=glm5_amalloc((size_t)N*c->moe_inter*4); ms->shu=glm5_amalloc((size_t)N*c->moe_inter*4);
     ms->ffg=glm5_amalloc((size_t)N*c->dense_inter*4); ms->ffu=glm5_amalloc((size_t)N*c->dense_inter*4);
     ms->tmp2=glm5_amalloc((size_t)N*H*4);
-    ms->exg=glm5_amalloc((size_t)c->moe_inter*4); ms->exu=glm5_amalloc((size_t)c->moe_inter*4); ms->emoe=glm5_amalloc((size_t)H*4);
+    /* sized N-wide: the fused-batch expert workers hold a whole bucket (g<=N) at once */
+    ms->exg=glm5_amalloc((size_t)N*c->moe_inter*4); ms->exu=glm5_amalloc((size_t)N*c->moe_inter*4); ms->emoe=glm5_amalloc((size_t)N*H*4);
     ms->bk=glm5_amalloc((size_t)c->n_experts*N*sizeof(int)); ms->bw=glm5_amalloc((size_t)c->n_experts*N*4); ms->bcnt=glm5_amalloc((size_t)c->n_experts*sizeof(int));
     ms->logits=glm5_amalloc((size_t)N*hrows*4);
     ms->sc_stride = per_stream_kv ? c->max_pos : c->n_heads*(ms->maxsel>0?ms->maxsel:c->max_pos);
@@ -2992,16 +4037,17 @@ static void glm5_forward_batch_decode(glm5_model*m, float*X, int N, const int*po
              * expert (weight read once for the whole group) instead of M=1 per (token,expert). */
             for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
             for(int t=0;t<N;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
+                for(int a=0;a<na;a++){ int e=sel[a]; int slot=glm5_ex_slot(m,e); if(slot<0) continue;
                     int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*N+g]=t; ms->bw[(size_t)slot*N+g]=sw[a]; } }
             for(int s=0;s<L->n_owned;s++){ int g=ms->bcnt[s]; if(g==0) continue;
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*N+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
-                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H)){
-                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,c->moe_inter,H);
-                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H);
+                const int ir=L->ex_w1[s].rows;   /* moe_inter, or /2 when 2-way sharded */
+                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,ir,H)){
+                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,ir,H);
+                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,ir,H);
                 }
-                for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
-                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
+                for(size_t i=0;i<(size_t)g*ir;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,ir);
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*N+i]; float w=ms->bw[(size_t)s*N+i]; float*rt=ms->route+(size_t)t*H,*dn=ms->tmp2+(size_t)i*H;
                     for(int j=0;j<H;j++) rt[j]+=w*dn[j]; } }
             /* comm-overlap: issue the routed reduce on the comm-driver thread, compute the
@@ -3260,19 +4306,20 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             GLM5_FAPP_START("glm5_experts");
             for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
             for(int t=0;t<S;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
+                for(int a=0;a<na;a++){ int e=sel[a]; int slot=glm5_ex_slot(m,e); if(slot<0) continue;
                     int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*S+g]=t; ms->bw[(size_t)slot*S+g]=sw[a]; } }
             for(int s=0;s<L->n_owned;s++){ int g=ms->bcnt[s]; if(g==0) continue;
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
-                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H)){
-                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,c->moe_inter,H);
-                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H);
+                const int ir=L->ex_w1[s].rows;   /* moe_inter, or /2 when 2-way sharded */
+                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,ir,H)){
+                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,ir,H);
+                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,ir,H);
                 }
 #ifdef _OPENMP
-                #pragma omp parallel for schedule(static) if((long)g*c->moe_inter>=GLM5_PAR_MIN)
+                #pragma omp parallel for schedule(static) if((long)g*ir>=GLM5_PAR_MIN)
 #endif
-                for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
-                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
+                for(size_t i=0;i<(size_t)g*ir;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,ir);
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; float w=ms->bw[(size_t)s*S+i];
                     glm5_axpy_f32(ms->route+(size_t)t*H, ms->tmp2+(size_t)i*H, w, H); } }   /* SVE: was scalar rt[j]+=w*dn[j] */
             GLM5_FAPP_STOP("glm5_experts");
@@ -3432,6 +4479,26 @@ static int glm5_forward_prefill_chunk_sp(glm5_model*m, float*X, int S, int p0, i
         glm5_prof_add(m,GLM5_P_MSA_INDEX,pt);
         pt=glm5_prof_now();
         static int qk_mode=-1; if(qk_mode<0){ qk_mode=glm5_envi("GLM5_ATTN_QK",0); if(qk_mode<0||qk_mode>2) qk_mode=0; }
+        /* Small batches (the K=2 spec verifier, tiny M) leave most threads idle in the
+         * per-token parallel-for while each token walks the SERIAL absorb (~2 ms/layer at
+         * ctx 640).  Run tokens sequentially through the all-thread parallel absorb
+         * instead; per-token model scratch is safe because the calls are serial. */
+        int abs_par_small=0;
+#if defined(_OPENMP)&&defined(__ARM_FEATURE_SVE)
+        { static int e=-1; if(e<0) e=glm5_envi("GLM5_ABSORB_PAR",1);
+          abs_par_small=e && Sl<=4 && !m->int4_kv && !m->cp_on && L->wkv_b.type==GLM5_BF16; }
+#endif
+        if(abs_par_small){
+            for(int t=0;t<Sl;t++){ float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*arows;
+                const int*sel=ms->psel+(size_t)t*ms->maxsel; int ns=ms->pnsel[t];
+                float*hmx=ms->hmx+(size_t)t*64,*hse=ms->hse+(size_t)t*64;
+                glm5_absorb_token_par(m,L,qb,ab,sel,ns,hmx,hse,nown);
+                for(int hh=0;hh<nown;hh++){
+                    float inv=1.0f/(hse[hh]>0?hse[hh]:1); float*oh=ab+hh*c->v_head_dim;
+                    for(int i=0;i<c->v_head_dim;i++) oh[i]*=inv;
+                }
+            }
+        } else {
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
@@ -3445,6 +4512,7 @@ static int glm5_forward_prefill_chunk_sp(glm5_model*m, float*X, int S, int p0, i
                 float inv=1.0f/(hse[hh]>0?hse[hh]:1); float*oh=ab+hh*c->v_head_dim;
                 for(int i=0;i<c->v_head_dim;i++) oh[i]*=inv;
             }
+        }
         }
         glm5_prof_add(m,GLM5_P_ATTN,pt);
         pt=glm5_prof_now();
@@ -3488,19 +4556,20 @@ static int glm5_forward_prefill_chunk_sp(glm5_model*m, float*X, int S, int p0, i
             pt=glm5_prof_now();
             for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
             for(int t=0;t<S;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
+                for(int a=0;a<na;a++){ int e=sel[a]; int slot=glm5_ex_slot(m,e); if(slot<0) continue;
                     int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*S+g]=t; ms->bw[(size_t)slot*S+g]=sw[a]; } }
             for(int s=0;s<L->n_owned;s++){ int g=ms->bcnt[s]; if(g==0) continue;
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
-                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H)){
-                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,c->moe_inter,H);
-                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H);
+                const int ir=L->ex_w1[s].rows;   /* moe_inter, or /2 when 2-way sharded */
+                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,ir,H)){
+                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,ir,H);
+                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,ir,H);
                 }
 #ifdef _OPENMP
-                #pragma omp parallel for schedule(static) if((long)g*c->moe_inter>=GLM5_PAR_MIN)
+                #pragma omp parallel for schedule(static) if((long)g*ir>=GLM5_PAR_MIN)
 #endif
-                for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
-                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
+                for(size_t i=0;i<(size_t)g*ir;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,ir);
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*S+i]; float w=ms->bw[(size_t)s*S+i];
                     glm5_axpy_f32(ms->route+(size_t)t*H, ms->tmp2+(size_t)i*H, w, H); } }
             glm5_prof_add(m,GLM5_P_EXPERTS,pt);
@@ -3560,6 +4629,225 @@ static int glm5_forward_prefill_chunk_sp(glm5_model*m, float*X, int S, int p0, i
  * per-stream KV store/load, per-stream full-causal selection, per-stream head. MSA/index-sparse
  * selection is deferred (full causal); routed-expert grouping is inherited from prefill_chunk.
  * Validate at M=1 vs glm5_forward_token (argmax) via glm5_batch_decode_selfcheck. */
+/* fused-batch decode layer (M<=4, the K=2 spec verifier): TWO parallel regions per layer
+ * instead of ~15 GEMM/loop launches, with weight-shared preq int16-SDOT GEMM workers for
+ * the int8 dense, per-token parallel absorb, and q8 IQ expert workers.  Requires the
+ * GLM5_DENSE_I8 + 2w-shard + IQ-expert configuration; returns 0 to fall back.
+ * GLM5_BD_FUSED=0 disables. */
+static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X,int M,const int*pos,int l,size_t per){
+#if defined(_OPENMP)&&defined(__ARM_FEATURE_SVE)
+    const glm5_config*c=&m->cfg;
+    const int H=c->hidden, AD=glm5_attn_dim(c), KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;
+    const int nown=L->qh1-L->qh0, qrows=nown*c->qk_head_dim, arows=nown*c->v_head_dim;
+    const int tp_attn=(arows<AD), kvl=c->kv_lora, kvb_stride=c->qk_nope_dim+c->v_head_dim;
+    const int is_moe=glm5_is_moe(c,l);
+    /* default OFF: measured SLOWER than the legacy batched path at M=2 (the ~30 syncs/layer
+     * this dataflow needs cost ~25-50us each in-decode) and its accept-rate is lower
+     * (numerics still diverge from the single-token path).  Kept for future work. */
+    static int env=-1; if(env<0) env=glm5_envi("GLM5_BD_FUSED",0);
+    if(!env||M>4||m->int4_kv||m->cp_on||m->kv_fp16) return 0;
+    if(!is_moe) return 0;                                    /* 3 dense layers: legacy is cheap */
+    if(L->wq_a.type!=GLM5_INT8||L->wkv_a.type!=GLM5_INT8||L->wq_b.type!=GLM5_INT8||L->wo.type!=GLM5_INT8) return 0;
+    if(L->wkv_b.type!=GLM5_BF16||L->gate.type!=GLM5_BF16) return 0;
+    if(L->sh_w1.type!=GLM5_INT8||L->sh_w3.type!=GLM5_INT8||L->sh_w2.type!=GLM5_INT8) return 0;
+    if(glm5_iq_mode()!=1||H%256||c->moe_inter%256||!L->ex_iqok) return 0;
+    if(L->wq_a.qg0||L->wkv_a.qg0||L->wq_b.qg0||L->wo.qg0||L->sh_w1.qg0||L->sh_w3.qg0||L->sh_w2.qg0) return 0;
+    const int nbH=H/256;
+    double pt=glm5_prof_now(); double tq=pt,ta=pt,tr=pt,te=pt;
+    /* ---- phase 1: norms -> qkv -> attention -> o_proj ---- */
+    glm5_i16g_job qaj={ms->qlat,(const uint8_t*)L->wq_a.w,(const float*)L->wq_a.scale,L->wq_a.qg,0,
+                       c->q_lora,H,M,(H+L->wq_a.qg-1)/L->wq_a.qg,m->s_bxq,m->s_bxg,m->s_bxsc};
+    glm5_i16g_job kvj={ms->k,(const uint8_t*)L->wkv_a.w,(const float*)L->wkv_a.scale,L->wkv_a.qg,0,
+                       KVC,H,M,(H+L->wkv_a.qg-1)/L->wkv_a.qg,m->s_bxq,m->s_bxg,m->s_bxsc};
+    glm5_i16g_job qbj={ms->q,(const uint8_t*)L->wq_b.w,(const float*)L->wq_b.scale,L->wq_b.qg,0,
+                       qrows,c->q_lora,M,(c->q_lora+L->wq_b.qg-1)/L->wq_b.qg,m->s_bxq2,m->s_bxg2,m->s_bxsc2};
+    glm5_i16g_job oj={ms->o,(const uint8_t*)L->wo.w,(const float*)L->wo.scale,L->wo.qg,0,
+                      H,arows,M,(arows+L->wo.qg-1)/L->wo.qg,m->s_bxq2,m->s_bxg2,m->s_bxsc2};
+    glm5_abs_job aj; glm5_absv_job vj; memset(&aj,0,sizeof aj); memset(&vj,0,sizeof vj);
+    uint16_t*kvsave=L->kv_cache;                 /* swapped per token in phase 1; restored after */
+    #pragma omp parallel
+    {
+        int tid=omp_get_thread_num(), nt=omp_get_num_threads();
+        if(tid==0){
+            for(int t=0;t<M;t++) glm5_rmsnorm_gemma(ms->xn+(size_t)t*H,X+(size_t)t*H,L->input_norm,H,c->norm_eps);
+            glm5_quantize_i16_acts(m->s_bxq,m->s_bxsc,ms->xn,M,H);
+            for(int t=0;t<M;t++) glm5_i16_group_sums(m->s_bxg+(size_t)t*qaj.sb,m->s_bxq+(size_t)t*H,qaj.gs,0,H);
+        }
+        #pragma omp barrier
+        glm5_i16g_worker(&qaj,tid,nt);
+        glm5_i16g_worker(&kvj,tid,nt);
+        #pragma omp barrier
+        if(tid==0){
+            for(int t=0;t<M;t++) glm5_rmsnorm_head(ms->qlat+(size_t)t*c->q_lora,L->q_a_norm,c->q_lora,c->norm_eps);
+            glm5_quantize_i16_acts(m->s_bxq2,m->s_bxsc2,ms->qlat,M,c->q_lora);
+            for(int t=0;t<M;t++) glm5_i16_group_sums(m->s_bxg2+(size_t)t*qbj.sb,m->s_bxq2+(size_t)t*c->q_lora,qbj.gs,0,c->q_lora);
+        }
+        #pragma omp barrier
+        glm5_i16g_worker(&qbj,tid,nt);
+        #pragma omp barrier
+        if(tid==0){
+            for(int t=0;t<M;t++){
+                int p=pos[t]; const float*cosp=&m->rope_cos[(size_t)p*half],*sinp=&m->rope_sin[(size_t)p*half];
+                float*qb=ms->q+(size_t)t*qrows,*kv=ms->k+(size_t)t*KVC;
+                for(int hh=0;hh<nown;hh++) glm5_rope_interleaved(qb+hh*c->qk_head_dim+c->qk_nope_dim,cosp,sinp,c->qk_rope_dim);
+                glm5_rmsnorm_head(kv,L->kv_a_norm,c->kv_lora,c->norm_eps);
+                glm5_rope_interleaved(kv+c->kv_lora,cosp,sinp,c->qk_rope_dim);
+                int st=ms->sid?ms->sid[t]:t;
+                uint16_t*kc=ms->kc+(size_t)st*per+(size_t)l*c->max_pos*KVC+(size_t)pos[t]*KVC;
+                for(int i=0;i<KVC;i++) kc[i]=glm5_kv_enc(m,kv[i]);
+            }
+            tq=glm5_prof_now();
+        }
+        #pragma omp barrier
+        for(int t=0;t<M;t++){
+            if(tid==0){
+                int p=pos[t], st=ms->sid?ms->sid[t]:t;
+                L->kv_cache=ms->kc+(size_t)st*per+(size_t)l*c->max_pos*KVC;   /* swapped; restored below */
+                int*selid=m->s_blk_sel; for(int j2=0;j2<=p;j2++) selid[j2]=j2;
+                int nthr2=nt, nchunk=(nthr2+nown-1)/nown; if(nchunk<1) nchunk=1;
+                if(nown*nchunk>GLM5_ABS_MAXTILE){ nchunk=GLM5_ABS_MAXTILE/nown; if(nchunk<1) nchunk=1; }
+                int chunklen=(p+1+nchunk-1)/nchunk; if(chunklen<1) chunklen=1;
+                while(nchunk>1 && chunklen<32){ nchunk--; chunklen=(p+1+nchunk-1)/nchunk; }
+                glm5_abs_job tmp={m,L,selid,p+1,nown,nchunk,chunklen,KVC,kvl,1.0f/sqrtf((float)c->qk_head_dim),
+                                  m->s_qfull,m->s_pctx,m->s_pmx,m->s_pse};
+                aj=tmp;
+                glm5_absv_job vtmp={L,m->s_ctx,ms->attn+(size_t)t*arows,nown,kvl,c->v_head_dim,kvb_stride,c->qk_nope_dim};
+                vj=vtmp;
+                for(int hh=0;hh<nown;hh++) glm5_abs_qfull_head(m,L,ms->q+(size_t)t*qrows,hh,KVC,kvl,kvb_stride);
+            }
+            #pragma omp barrier
+            glm5_abs_tile_worker(&aj,tid,nt);
+            #pragma omp barrier
+            if(tid==0){
+                float*hmx=ms->hmx+(size_t)t*64,*hse=ms->hse+(size_t)t*64;
+                for(int hh=0;hh<nown;hh++) glm5_abs_merge_head(m,hh,aj.nchunk,kvl,hmx,hse);
+            }
+            #pragma omp barrier
+            glm5_absv_worker(&vj,tid,nt);
+            #pragma omp barrier
+            if(tid==0){
+                float*hse=ms->hse+(size_t)t*64,*ab=ms->attn+(size_t)t*arows;
+                for(int hh=0;hh<nown;hh++){ float inv=1.0f/(hse[hh]>0?hse[hh]:1);
+                    float*oh=ab+hh*c->v_head_dim; for(int i=0;i<c->v_head_dim;i++) oh[i]*=inv; }
+            }
+            #pragma omp barrier
+        }
+        if(tid==0){
+            ta=glm5_prof_now();
+            glm5_quantize_i16_acts(m->s_bxq2,m->s_bxsc2,ms->attn,M,arows);
+            for(int t=0;t<M;t++) glm5_i16_group_sums(m->s_bxg2+(size_t)t*oj.sb,m->s_bxq2+(size_t)t*arows,oj.gs,0,arows);
+        }
+        #pragma omp barrier
+        glm5_i16g_worker(&oj,tid,nt);
+    }
+    L->kv_cache=kvsave;
+    m->prof[GLM5_P_QKV]+=tq-pt; m->prof[GLM5_P_ATTN]+=ta-tq;
+    if(tp_attn && m->ar_cb) m->ar_cb(ms->o,M*H,m->ar_ctx);
+    for(size_t i=0;i<(size_t)M*H;i++) X[i]+=ms->o[i];
+    glm5_prof_add(m,GLM5_P_OPROJ,ta);
+    /* ---- phase 2: router -> experts -> shared -> route AR ---- */
+    pt=glm5_prof_now();
+    const int tp_sh=(L->sh_rows<c->moe_inter);
+    int na=c->n_active>8?8:c->n_active;
+    int*sel_all=ms->gsel; float*selw_all=ms->gselw;
+    glm5_i16g_job shj1={ms->shg,(const uint8_t*)L->sh_w1.w,(const float*)L->sh_w1.scale,L->sh_w1.qg,0,
+                        L->sh_rows,H,M,(H+L->sh_w1.qg-1)/L->sh_w1.qg,m->s_bxq,m->s_bxg,m->s_bxsc};
+    glm5_i16g_job shj3={ms->shu,(const uint8_t*)L->sh_w3.w,(const float*)L->sh_w3.scale,L->sh_w3.qg,0,
+                        L->sh_rows,H,M,(H+L->sh_w3.qg-1)/L->sh_w3.qg,m->s_bxq,m->s_bxg,m->s_bxsc};
+    glm5_i16g_job sh2j={ms->tmp2,(const uint8_t*)L->sh_w2.w,(const float*)L->sh_w2.scale,L->sh_w2.qg,0,
+                        H,L->sh_rows,M,(L->sh_rows+L->sh_w2.qg-1)/L->sh_w2.qg,m->s_bxq2,m->s_bxg2,m->s_bxsc2};
+    glm5_iqgN_job pj1,pj3,dj; memset(&pj1,0,sizeof pj1); memset(&pj3,0,sizeof pj3); memset(&dj,0,sizeof dj);
+    glm5_mvjob gj={ms->router,(const uint16_t*)L->gate.w,ms->h2,c->n_experts,H};
+    #pragma omp parallel
+    {
+        int tid=omp_get_thread_num(), nt=omp_get_num_threads();
+        if(tid==0)
+            for(int t=0;t<M;t++) glm5_rmsnorm_gemma(ms->h2+(size_t)t*H,X+(size_t)t*H,L->post_norm,H,c->norm_eps);
+        #pragma omp barrier
+        for(int t=0;t<M;t++){                    /* gate: BF16 [256,H], one worker pass per token */
+            glm5_mvjob g2=gj; g2.y=ms->router+(size_t)t*c->n_experts; g2.x=ms->h2+(size_t)t*H;
+            glm5_mv_worker(&g2,tid,nt);
+        }
+        #pragma omp barrier
+        if(tid==0){
+            for(int t=0;t<M;t++){ float*rl=ms->router+(size_t)t*c->n_experts; glm5_sigmoid_row(rl,c->n_experts);
+                int*sel=sel_all+t*na; float*sw=selw_all+t*na;
+                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f;
+                    for(int e=0;e<c->n_experts;e++){ int used=0; for(int j2=0;j2<a;j2++) if(sel[j2]==e){used=1;break;} if(used)continue;
+                        float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1;
+                for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
+            memset(ms->route,0,(size_t)M*H*4);
+            for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
+            for(int t=0;t<M;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na;
+                for(int a=0;a<na;a++){ int e=sel[a]; int slot=glm5_ex_slot(m,e); if(slot<0) continue;
+                    int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*M+g]=t; ms->bw[(size_t)slot*M+g]=sw[a]; } }
+            pthread_once(&glm5_iq_lut_once,glm5_iq_init_luts);
+            for(int t=0;t<M;t++) glm5_iq_quant_q8((glm5_iq_q8_block*)m->s_iqx+(size_t)t*nbH,ms->h2+(size_t)t*H,H);
+            glm5_quantize_i16_acts(m->s_bxq,m->s_bxsc,ms->h2,M,H);
+            for(int t=0;t<M;t++) glm5_i16_group_sums(m->s_bxg+(size_t)t*shj1.sb,m->s_bxq+(size_t)t*H,shj1.gs,0,H);
+            tr=glm5_prof_now();
+        }
+        #pragma omp barrier
+        for(int s=0;s<L->n_owned;s++){
+            int g=ms->bcnt[s]; if(g==0) continue;
+            const int ir=L->ex_w1[s].rows;
+            if(tid==0){
+                glm5_iqgN_job t1={ms->exg,&L->ex_w1[s],(const glm5_iq_q8_block*)m->s_iqx,ms->bk+(size_t)s*M,g,ir,nbH,
+                                  dequant_row_size((uint32_t)L->ex_w1[s].type,H)};
+                glm5_iqgN_job t3={ms->exu,&L->ex_w3[s],(const glm5_iq_q8_block*)m->s_iqx,ms->bk+(size_t)s*M,g,ir,nbH,
+                                  dequant_row_size((uint32_t)L->ex_w3[s].type,H)};
+                pj1=t1; pj3=t3;
+            }
+            #pragma omp barrier
+            glm5_iqgN_worker(&pj1,tid,nt);
+            glm5_iqgN_worker(&pj3,tid,nt);
+            #pragma omp barrier
+            { int tot=g*ir, per2=(tot+nt-1)/nt, i0=tid*per2, i1=i0+per2>tot?tot:i0+per2;
+              for(int i=i0;i<i1;i++) ms->exg[i]=glm5_swiglu_oai(ms->exg[i],ms->exu[i],c->swiglu_alpha,c->swiglu_limit); }
+            #pragma omp barrier
+            if(tid==0){
+                /* entry stride MUST equal the worker's nb (ir/256), not moe_inter/256 */
+                for(int i=0;i<g;i++) glm5_iq_quant_q8((glm5_iq_q8_block*)m->s_iqx2+(size_t)i*(ir/256),
+                                                      ms->exg+(size_t)i*ir,ir);
+                glm5_iqgN_job td={ms->emoe,&L->ex_w2[s],(const glm5_iq_q8_block*)m->s_iqx2,NULL,g,H,ir/256,
+                                  dequant_row_size((uint32_t)L->ex_w2[s].type,ir)};
+                dj=td;
+            }
+            #pragma omp barrier
+            glm5_iqgN_worker(&dj,tid,nt);
+            #pragma omp barrier
+            { int per2=(H+nt-1)/nt, i0=tid*per2, i1=i0+per2>H?H:i0+per2;
+              if(i1>i0) for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*M+i]; float w=ms->bw[(size_t)s*M+i];
+                  glm5_axpy_f32(ms->route+(size_t)t*H+i0,ms->emoe+(size_t)i*H+i0,w,i1-i0); } }
+            #pragma omp barrier
+        }
+        if(tid==0) te=glm5_prof_now();
+        glm5_i16g_worker(&shj1,tid,nt);
+        glm5_i16g_worker(&shj3,tid,nt);
+        #pragma omp barrier
+        { int tot=M*L->sh_rows, per2=(tot+nt-1)/nt, i0=tid*per2, i1=i0+per2>tot?tot:i0+per2;
+          for(int i=i0;i<i1;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit); }
+        #pragma omp barrier
+        if(tid==0){
+            glm5_quantize_i16_acts(m->s_bxq2,m->s_bxsc2,ms->shg,M,L->sh_rows);
+            for(int t=0;t<M;t++) glm5_i16_group_sums(m->s_bxg2+(size_t)t*sh2j.sb,m->s_bxq2+(size_t)t*L->sh_rows,sh2j.gs,0,L->sh_rows);
+        }
+        #pragma omp barrier
+        glm5_i16g_worker(&sh2j,tid,nt);
+    }
+    m->prof[GLM5_P_ROUTER]+=tr-pt; m->prof[GLM5_P_EXPERTS]+=te-tr;
+    if(tp_sh) for(size_t i=0;i<(size_t)M*H;i++) ms->route[i]+=ms->tmp2[i];
+    if(m->ar_cb) m->ar_cb(ms->route,M*H,m->ar_ctx);
+    for(size_t i=0;i<(size_t)M*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
+    glm5_prof_add(m,GLM5_P_SHARED,te);
+    return 1;
+#else
+    (void)m;(void)ms;(void)L;(void)X;(void)M;(void)pos;(void)l;(void)per;
+    return 0;
+#endif
+}
+
 static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const int*pos, int*out){
     const glm5_config*c=&m->cfg;
     const int H=c->hidden, AD=glm5_attn_dim(c);
@@ -3572,6 +4860,7 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
         glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(c,l);
         const int qh0=L->qh0,qh1=L->qh1,nown=qh1-qh0,qrows=nown*c->qk_head_dim, arows=nown*c->v_head_dim;
         const int tp_attn=(arows<AD), kvb_stride=c->qk_nope_dim+c->v_head_dim; (void)qh0;
+        if(glm5_bd_layer_fused(m,ms,L,X,M,pos,l,per)) continue;
         double pt=glm5_prof_now();
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
@@ -3601,6 +4890,29 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
         glm5_prof_add(m,GLM5_P_QKV,pt);
         /* per-stream absorbed-MLA attention over own KV [0..pos[t]] (CP OFF, no collective) */
         pt=glm5_prof_now();
+        /* small M (the K=2 spec verifier) leaves M threads walking the SERIAL online loop
+         * with scalar KV decode (~160 ms/step at ctx 640).  Run the streams sequentially
+         * through the all-thread parallel absorb instead; L->kv_cache is swapped to the
+         * stream's cache for the (serial, top-level) call and restored. */
+        int abs_small=0;
+#if defined(_OPENMP)&&defined(__ARM_FEATURE_SVE)
+        { static int e=-1; if(e<0) e=glm5_envi("GLM5_ABSORB_PAR",1);
+          abs_small=e && M<=4 && !m->int4_kv && !m->cp_on && L->wkv_b.type==GLM5_BF16; }
+#endif
+        if(abs_small){
+            for(int t=0;t<M;t++){
+                int p=pos[t]; int st=ms->sid?ms->sid[t]:t;
+                float*ab=ms->attn+(size_t)t*arows;
+                float*hmx=ms->hmx+(size_t)t*64,*hse=ms->hse+(size_t)t*64;
+                uint16_t*save=L->kv_cache;
+                L->kv_cache=ms->kc+(size_t)st*per+(size_t)l*c->max_pos*KVC;
+                int*selid=m->s_blk_sel; for(int j=0;j<=p;j++) selid[j]=j;
+                glm5_absorb_token_par(m,L,ms->q+(size_t)t*qrows,ab,selid,p+1,hmx,hse,nown);
+                L->kv_cache=save;
+                for(int hh=0;hh<nown;hh++){ float inv=1.0f/(hse[hh]>0?hse[hh]:1);
+                    float*oh=ab+hh*c->v_head_dim; for(int i=0;i<c->v_head_dim;i++) oh[i]*=inv; }
+            }
+        } else {
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
@@ -3633,6 +4945,7 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
                 glm5_tensor tv=glm5_tensor_rows(&L->wkv_b,hh*kvb_stride+c->qk_nope_dim,c->v_head_dim);
                 glm5_mv(m,ab+hh*c->v_head_dim,&tv,ctx,c->v_head_dim,c->kv_lora);
             }
+        }
         }
         glm5_prof_add(m,GLM5_P_ATTN,pt);
         pt=glm5_prof_now();
@@ -3674,19 +4987,20 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
             pt=glm5_prof_now();
             for(int s=0;s<L->n_owned;s++) ms->bcnt[s]=0;
             for(int t=0;t<M;t++){ int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int e=sel[a]; if(e%m->ep_size!=m->ep_rank) continue; int slot=e/m->ep_size;
+                for(int a=0;a<na;a++){ int e=sel[a]; int slot=glm5_ex_slot(m,e); if(slot<0) continue;
                     int g=ms->bcnt[slot]++; ms->bk[(size_t)slot*M+g]=t; ms->bw[(size_t)slot*M+g]=sw[a]; } }
             for(int s=0;s<L->n_owned;s++){ int g=ms->bcnt[s]; if(g==0) continue;
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*M+i]; memcpy(ms->o+(size_t)i*H, ms->h2+(size_t)t*H, (size_t)H*4); }
-                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H)){
-                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,c->moe_inter,H);
-                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,c->moe_inter,H);
+                const int ir=L->ex_w1[s].rows;   /* moe_inter, or /2 when 2-way sharded */
+                if(!glm5_gemm_pair(m,ms->shg,&L->ex_w1[s],ms->shu,&L->ex_w3[s],ms->o,g,ir,H)){
+                    glm5_gemm(m,ms->shg,&L->ex_w1[s],ms->o,g,ir,H);
+                    glm5_gemm(m,ms->shu,&L->ex_w3[s],ms->o,g,ir,H);
                 }
 #ifdef _OPENMP
-                #pragma omp parallel for schedule(static) if((long)g*c->moe_inter>=GLM5_PAR_MIN)
+                #pragma omp parallel for schedule(static) if((long)g*ir>=GLM5_PAR_MIN)
 #endif
-                for(size_t i=0;i<(size_t)g*c->moe_inter;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
-                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,c->moe_inter);
+                for(size_t i=0;i<(size_t)g*ir;i++) ms->shg[i]=glm5_swiglu_oai(ms->shg[i],ms->shu[i],c->swiglu_alpha,c->swiglu_limit);
+                glm5_gemm(m,ms->tmp2,&L->ex_w2[s],ms->shg,g,H,ir);
                 for(int i=0;i<g;i++){ int t=ms->bk[(size_t)s*M+i]; float w=ms->bw[(size_t)s*M+i];
                     glm5_axpy_f32(ms->route+(size_t)t*H, ms->tmp2+(size_t)i*H, w, H); } }
             glm5_prof_add(m,GLM5_P_EXPERTS,pt);
@@ -3815,12 +5129,38 @@ static int glm5_mtp_draft(glm5_model*m,const float*h,int tok,int pos,float*xb){
         const uint16_t*row=m->embed+(size_t)tok*H;
         for(int i=0;i<H;i++) x[i]=glm5_bf2f(row[i]);
     }
-    glm5_rmsnorm_gemma(xb,   x, m->mtp_enorm, H, c->norm_eps);
-    glm5_rmsnorm_gemma(xb+H, h, m->mtp_hnorm, H, c->norm_eps);
+    /* fusion concat order: [enorm(emb); hnorm(h)] matches DeepSeek-V3/GLM MTP reference
+     * implementations; GLM5_MTP_SWAP=1 A/Bs the reverse in case the checkpoint differs. */
+    static int mtp_swap=-1; if(mtp_swap<0) mtp_swap=glm5_envi("GLM5_MTP_SWAP",0);
+    if(mtp_swap){
+        glm5_rmsnorm_gemma(xb,   h, m->mtp_hnorm, H, c->norm_eps);
+        glm5_rmsnorm_gemma(xb+H, x, m->mtp_enorm, H, c->norm_eps);
+    } else {
+        glm5_rmsnorm_gemma(xb,   x, m->mtp_enorm, H, c->norm_eps);
+        glm5_rmsnorm_gemma(xb+H, h, m->mtp_hnorm, H, c->norm_eps);
+    }
     glm5_mv(m,x,&m->mtp_eh,xb,H,2*H);
+    if(glm5_envi("GLM5_MTP_DBG",0)){
+        static int once=0;
+        if(m->ep_rank==0 && once<3){ once++;
+            double ae=0,ah=0,ax=0; for(int i=0;i<H;i++){ ae+=fabsf(xb[i]); ah+=fabsf(xb[H+i]); ax+=fabsf(x[i]); }
+            fprintf(stderr,"[mtp-dbg] pos=%d tok=%d |enorm|=%.4f |hnorm|=%.4f |eh_out|=%.4f\n",
+                    pos,tok,ae/H,ah/H,ax/H);
+        }
+    }
     glm5_model v=glm5_mtp_view(m);
     float t0=v.samp_temp; v.samp_temp=0;               /* draft is always greedy */
     int d=glm5_forward_token(&v,x,pos); (void)t0;
+    if(glm5_envi("GLM5_MTP_DBG",0)){
+        static int once2=0;
+        if(m->ep_rank==0 && once2<3){ once2++;
+            double ax=0,mx=0; int nn=0;
+            for(int i=0;i<H;i++){ float vv=x[i]; if(vv!=vv){nn++;continue;} ax+=fabsf(vv); if(fabsf(vv)>mx)mx=fabsf(vv); }
+            double an=0; for(int i=0;i<H;i++){ float vv=m->s_norm[i]; if(vv==vv) an+=fabsf(vv); }
+            fprintf(stderr,"[mtp-dbg2] pos=%d d=%d |resid|=%.4f max=%.3f nan=%d |h2|=%.4f logit0=%.4f\n",
+                    pos,d,ax/H,mx,nn,an/H,m->s_logits[0]);
+        }
+    }
     return d;
 }
 /* Synthetic MTP block for simulator/lockstep validation (no real layer-78 weights needed).

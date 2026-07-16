@@ -263,6 +263,9 @@ static void emit_f32(output *o, source_set *s, const char *src_name,
     record_tensor(o, at, "F32", rows == 1 ? 1 : 2, shape, dst_name);
 }
 
+static int g_shard2 = 0;   /* --shard2: 2-way expert sharding across rank pairs */
+static int g_mtp    = 0;   /* --mtp: also emit the layer-78 nextn (MTP) block */
+
 static void emit_raw_expert(output *o, source_set *s, const char *src_name,
                             const char *dst_name, int expert,
                             int rows, int cols) {
@@ -280,6 +283,38 @@ static void emit_raw_expert(output *o, source_set *s, const char *src_name,
                        + (size_t)expert * bytes;
     write_bytes(o, src, bytes);
     drop_pages(src, bytes);
+    record_tensor(o, at, ggml_type_name(r.ti->type), 2, shape, dst_name);
+}
+
+/* 2-way expert shard: emit a row range [r0,r0+nr) x column range [c0,c0+nc) of one
+ * expert.  Columns are sliced at quant-block boundaries (all mixed-IQ formats use
+ * 256-wide self-contained blocks; MOE_INTER/2 = 1024 = 4 blocks), so a half-row is
+ * a contiguous byte range inside the source row. */
+static void emit_raw_expert_slice(output *o, source_set *s, const char *src_name,
+                                  const char *dst_name, int expert,
+                                  int rows, int cols, int r0, int nr, int c0, int nc) {
+    tensor_ref r = find_tensor(s, src_name);
+    require_matrix(&r, cols, rows, GLM52_EXPERTS, src_name);
+    size_t rb  = row_bytes(r.ti->type, cols);
+    size_t cb0 = row_bytes(r.ti->type, c0);
+    size_t cbn = row_bytes(r.ti->type, nc);
+    if (c0 % 256 || nc % 256)
+        fatal("%s: column slice %d+%d not block-aligned", src_name, c0, nc);
+    long shape[2] = {nr, nc};
+    uint64_t at = begin_tensor(o);
+    if (o->dry_run) {
+        o->off += (size_t)nr * cbn;
+        return;
+    }
+    const uint8_t *base = (const uint8_t *)gguf_tensor_data(r.ctx, r.index)
+                        + (size_t)expert * rows * rb;
+    if (nc == cols) {
+        write_bytes(o, base + (size_t)r0 * rb, (size_t)nr * rb);
+    } else {
+        for (int rr = r0; rr < r0 + nr; ++rr)
+            write_bytes(o, base + (size_t)rr * rb + cb0, cbn);
+    }
+    drop_pages(base, (size_t)rows * rb);
     record_tensor(o, at, ggml_type_name(r.ti->type), 2, shape, dst_name);
 }
 
@@ -385,7 +420,14 @@ static void emit_model(output *o, source_set *s, int ep_size, int layers) {
                      VOCAB, HIDDEN, 1, vr0, vrows);
     emit_bf16_vector(o, s, "output_norm.weight", "model.norm.weight", HIDDEN);
 
-    for (int l = 0; l < layers; ++l) {
+    /* --mtp appends the nextn draft block as checkpoint layer 78.  The runtime loads it
+     * REPLICATED (no attn/shared TP shard) so the draft forward needs no o_proj AR;
+     * routed experts follow the same (2-way sharded) ownership as the main layers. */
+    int last_l = layers + (g_mtp ? 1 : 0);
+    for (int l = 0; l < last_l; ++l) {
+        int mtp = (l >= GLM52_LAYERS);
+        int L_h0 = mtp ? 0 : h0,  L_hn = mtp ? GLM52_HEADS : hcount;
+        int L_sh0 = mtp ? 0 : sh0, L_shn = mtp ? MOE_INTER : shrows;
         char src[192], dst[256];
 #define EMIT_VEC(SRC, DST, N) do { \
         snprintf(src,sizeof src,"blk.%d.%s",l,(SRC)); \
@@ -403,17 +445,17 @@ static void emit_model(output *o, source_set *s, int ep_size, int layers) {
                  Q_LORA, HIDDEN, 0, 0, 0);
         EMIT_MAT("attn_q_b.weight", "self_attn.q_b_proj.weight",
                  GLM52_HEADS * (QK_NOPE + QK_ROPE), Q_LORA,
-                 1, h0 * (QK_NOPE + QK_ROPE),
-                 hcount * (QK_NOPE + QK_ROPE));
+                 1, L_h0 * (QK_NOPE + QK_ROPE),
+                 L_hn * (QK_NOPE + QK_ROPE));
         EMIT_MAT("attn_kv_a_mqa.weight",
                  "self_attn.kv_a_proj_with_mqa.weight",
                  KV_LORA + QK_ROPE, HIDDEN, 0, 0, 0);
         snprintf(dst,sizeof dst,
                  "model.layers.%d.self_attn.kv_b_proj.weight",l);
-        emit_combined_kv_b(o,s,l,h0,hcount,dst);
+        emit_combined_kv_b(o,s,l,L_h0,L_hn,dst);
         EMIT_MAT("attn_output.weight", "self_attn.o_proj.weight",
                  HIDDEN, GLM52_HEADS * V_HEAD,
-                 2, h0 * V_HEAD, hcount * V_HEAD);
+                 2, L_h0 * V_HEAD, L_hn * V_HEAD);
         EMIT_VEC("attn_q_a_norm.weight",
                  "self_attn.q_a_layernorm.weight", Q_LORA);
         EMIT_VEC("attn_kv_a_norm.weight",
@@ -427,7 +469,7 @@ static void emit_model(output *o, source_set *s, int ep_size, int layers) {
             EMIT_MAT("ffn_down.weight", "mlp.down_proj.weight",
                      HIDDEN, DENSE_INTER, 2, ff0, ffrows);
         } else {
-            if (has_full_indexer(l)) {
+            if (has_full_indexer(l) || mtp) {
                 EMIT_MAT("indexer.attn_q_b.weight",
                          "self_attn.indexer.wq_b.weight",
                          4096, Q_LORA, 0, 0, 0);
@@ -451,13 +493,38 @@ static void emit_model(output *o, source_set *s, int ep_size, int layers) {
             emit_f32(o,s,src,dst,1,GLM52_EXPERTS);
             EMIT_MAT("ffn_gate_shexp.weight",
                      "mlp.shared_experts.gate_proj.weight",
-                     MOE_INTER, HIDDEN, 1, sh0, shrows);
+                     MOE_INTER, HIDDEN, 1, L_sh0, L_shn);
             EMIT_MAT("ffn_up_shexp.weight",
                      "mlp.shared_experts.up_proj.weight",
-                     MOE_INTER, HIDDEN, 1, sh0, shrows);
+                     MOE_INTER, HIDDEN, 1, L_sh0, L_shn);
             EMIT_MAT("ffn_down_shexp.weight",
                      "mlp.shared_experts.down_proj.weight",
-                     HIDDEN, MOE_INTER, 2, sh0, shrows);
+                     HIDDEN, MOE_INTER, 2, L_sh0, L_shn);
+            if (g_shard2) {
+                /* 2-way shard: half h of expert e lives on rank (e + h*ep/2) % ep.
+                 * gate/up keep inter ROWS [h*I/2, h*I/2+I/2); down keeps inter
+                 * COLUMNS of the same range, so a shard's swiglu/down partial is
+                 * complete and the EP route all-reduce sums the two halves. */
+                const int IH = MOE_INTER/2;
+                for (int e = 0; e < GLM52_EXPERTS; ++e) {
+                    int h;
+                    if (e % ep_size == o->rank) h = 0;
+                    else if ((e + ep_size/2) % ep_size == o->rank) h = 1;
+                    else continue;
+                    snprintf(src,sizeof src,"blk.%d.ffn_gate_exps.weight",l);
+                    snprintf(dst,sizeof dst,
+                             "model.layers.%d.mlp.experts.%d.gate_proj.weight",l,e);
+                    emit_raw_expert_slice(o,s,src,dst,e,MOE_INTER,HIDDEN,h*IH,IH,0,HIDDEN);
+                    snprintf(src,sizeof src,"blk.%d.ffn_up_exps.weight",l);
+                    snprintf(dst,sizeof dst,
+                             "model.layers.%d.mlp.experts.%d.up_proj.weight",l,e);
+                    emit_raw_expert_slice(o,s,src,dst,e,MOE_INTER,HIDDEN,h*IH,IH,0,HIDDEN);
+                    snprintf(src,sizeof src,"blk.%d.ffn_down_exps.weight",l);
+                    snprintf(dst,sizeof dst,
+                             "model.layers.%d.mlp.experts.%d.down_proj.weight",l,e);
+                    emit_raw_expert_slice(o,s,src,dst,e,HIDDEN,MOE_INTER,0,HIDDEN,h*IH,IH);
+                }
+            } else
             for (int e = o->rank; e < GLM52_EXPERTS; e += ep_size) {
                 snprintf(src,sizeof src,"blk.%d.ffn_gate_exps.weight",l);
                 snprintf(dst,sizeof dst,
@@ -473,10 +540,18 @@ static void emit_model(output *o, source_set *s, int ep_size, int layers) {
                 emit_raw_expert(o,s,src,dst,e,HIDDEN,MOE_INTER);
             }
         }
+        if (mtp) {
+            /* nextn fusion tensors, replicated: eh_proj [H,2H] + enorm/hnorm +
+             * shared_head.norm (the MTP head's out-norm; embed/lm_head are shared) */
+            EMIT_MAT("nextn.eh_proj.weight", "eh_proj.weight", HIDDEN, 2*HIDDEN, 0, 0, 0);
+            EMIT_VEC("nextn.enorm.weight", "enorm.weight", HIDDEN);
+            EMIT_VEC("nextn.hnorm.weight", "hnorm.weight", HIDDEN);
+            EMIT_VEC("nextn.shared_head_norm.weight", "shared_head.norm.weight", HIDDEN);
+        }
 #undef EMIT_MAT
 #undef EMIT_VEC
         fprintf(stderr, "glm52-convert: rank %d layer %d/%d %.3f GiB\n",
-                o->rank, l + 1, layers,
+                o->rank, l + 1, last_l,
                 (double)o->off / (1024.0*1024.0*1024.0));
     }
 }
@@ -484,7 +559,7 @@ static void emit_model(output *o, source_set *s, int ep_size, int layers) {
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s [--source DIR] [--output DIR] --rank R [--ep-size 12]\n"
-        "          [--layers 78] [--maxpos 2304] [--dry-run] [--force]\n",
+        "          [--layers 78] [--maxpos 2304] [--dry-run] [--force] [--shard2]\n",
         argv0);
     exit(2);
 }
@@ -507,6 +582,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--maxpos") && ++i < argc) maxpos=atoi(argv[i]);
         else if (!strcmp(argv[i],"--dry-run")) dry=1;
         else if (!strcmp(argv[i],"--force")) force=1;
+        else if (!strcmp(argv[i],"--shard2")) g_shard2=1;
+        else if (!strcmp(argv[i],"--mtp")) g_mtp=1;
         else usage(argv[0]);
     }
     if(rank<0){
@@ -564,6 +641,7 @@ int main(int argc, char **argv) {
                 "# glm52-a64fx-ep12-v1\n# rank %d\n# ep_size %d\n"
                 "# layers %d\n# maxpos %d\n",
                 rank,ep_size,layers,maxpos);
+        if (g_shard2) fprintf(o.manifest,"# expert_shard 2\n");
     }
     emit_model(&o,&sources,ep_size,layers);
     uint64_t reserve = UINT64_C(3)*1024*1024*1024;
