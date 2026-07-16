@@ -423,13 +423,53 @@ static inline void glm5_f32_4row_3x_acc(float*a0,float*a1,float*a2,
     a2[0]+=svaddv_f32(pt,a20); a2[1]+=svaddv_f32(pt,a21); a2[2]+=svaddv_f32(pt,a22); a2[3]+=svaddv_f32(pt,a23);
 }
 #endif
-static inline void glm5_rmsnorm_gemma(float*out,const float*x,const uint16_t*w,int n,float eps){
+/* SVE rmsnorm: 4-accumulator f32 sum-of-squares (pairwise-ish, ~1e-6 rel of the old
+ * serial-double sum) + widening bf16 weight multiply.  The scalar version cost
+ * ~20-25 us per 6144-vector on tid 0 — one of the largest serial-glue items the
+ * phase-1 stage trace exposed. */
+static inline float glm5_rms_inv_sve(const float*x,int n,float eps){
+#if defined(__ARM_FEATURE_SVE)
+    const svbool_t pg=svptrue_b32(); const int vl=(int)svcntw();
+    svfloat32_t a0=svdup_f32(0.f),a1=a0,a2=a0,a3=a0;
+    int i=0;
+    for(;i+4*vl<=n;i+=4*vl){
+        svfloat32_t v0=svld1(pg,x+i),v1=svld1(pg,x+i+vl),v2=svld1(pg,x+i+2*vl),v3=svld1(pg,x+i+3*vl);
+        a0=svmla_f32_x(pg,a0,v0,v0); a1=svmla_f32_x(pg,a1,v1,v1);
+        a2=svmla_f32_x(pg,a2,v2,v2); a3=svmla_f32_x(pg,a3,v3,v3);
+    }
+    for(;i<n;i+=vl){ svbool_t pt=svwhilelt_b32(i,n); svfloat32_t v=svld1(pt,x+i); a0=svmla_f32_m(pt,a0,v,v); }
+    double ss=(double)svaddv_f32(pg,svadd_f32_x(pg,svadd_f32_x(pg,a0,a1),svadd_f32_x(pg,a2,a3)));
+    return (float)(1.0/sqrt(ss/n+eps));
+#else
     double ss=0; for(int i=0;i<n;i++) ss+=(double)x[i]*x[i];
-    float inv=(float)(1.0/sqrt(ss/n+eps)); for(int i=0;i<n;i++) out[i]=x[i]*inv*glm5_bf2f(w[i]);
+    return (float)(1.0/sqrt(ss/n+eps));
+#endif
+}
+static inline void glm5_rmsnorm_gemma(float*out,const float*x,const uint16_t*w,int n,float eps){
+    float inv=glm5_rms_inv_sve(x,n,eps);
+#if defined(__ARM_FEATURE_SVE)
+    const int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pt=svwhilelt_b32(i,n);
+        svfloat32_t wf=svreinterpret_f32_u32(svlsl_n_u32_x(pt,svld1uh_u32(pt,w+i),16));
+        svst1(pt,out+i,svmul_f32_x(pt,svmul_n_f32_x(pt,svld1(pt,x+i),inv),wf));
+    }
+#else
+    for(int i=0;i<n;i++) out[i]=x[i]*inv*glm5_bf2f(w[i]);
+#endif
 }
 static inline void glm5_rmsnorm_head(float*v,const uint16_t*w,int n,float eps){
-    double ss=0; for(int i=0;i<n;i++) ss+=(double)v[i]*v[i];
-    float inv=(float)(1.0/sqrt(ss/n+eps)); for(int i=0;i<n;i++) v[i]=v[i]*inv*glm5_bf2f(w[i]);
+    float inv=glm5_rms_inv_sve(v,n,eps);
+#if defined(__ARM_FEATURE_SVE)
+    const int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pt=svwhilelt_b32(i,n);
+        svfloat32_t wf=svreinterpret_f32_u32(svlsl_n_u32_x(pt,svld1uh_u32(pt,w+i),16));
+        svst1(pt,v+i,svmul_f32_x(pt,svmul_n_f32_x(pt,svld1(pt,v+i),inv),wf));
+    }
+#else
+    for(int i=0;i<n;i++) v[i]=v[i]*inv*glm5_bf2f(w[i]);
+#endif
 }
 /* SwiGLU-OAI (GPT-OSS "swigluoai"): glu(gate)·(up+1), gate clamped <=lim, up clamped
  * to [-lim,lim]. glu(g)=g·sigmoid(alpha·g). The (up+1) term is part of the OAI variant. */
