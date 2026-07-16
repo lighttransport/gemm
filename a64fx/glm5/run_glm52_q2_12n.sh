@@ -23,6 +23,7 @@ export GLM5_STAGE_DIR="${GLM5_STAGE_DIR:-/local/u14346/glm52-2bit-ep12}"
 export GLM5_STATUS_DIR="$RUN_DIR"
 export GLM5_REAL=1 GLM5_TP=1 GLM5_TP_ATTN=1 GLM5_TP_SHARED=1
 export GLM5_TP_FFN=1 GLM5_TP_HEAD=1 GLM5_TP_EMBED=1
+export GLM5_PREFILL_GROUPS=1
 export GLM5_CP_THRESHOLD=-1 GLM5_CP=0 GLM5_INT4_KV=0 GLM5_MSA=0
 export GLM5_MAXPOS="${GLM5_MAXPOS:-2304}" GLM5_PCHUNK="${GLM5_PCHUNK:-512}"
 export GLM5_IQ_REF="${GLM5_IQ_REF:-1}"
@@ -99,6 +100,10 @@ repeat="${GLM52_REPEAT:-1}"
 for ((i=1;i<=repeat;i++)); do
     mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
         > >(tee "$RUN_DIR/run-$i.stdout") 2> >(tee "$RUN_DIR/run-$i.stderr" >&2)
+    grep -Eq '^SENTINEL .*=(done)$' glm5_ep_rank00.txt || {
+        echo "rank-0 completion sentinel missing; inspect $RUN_DIR/glm5_ep_stderr_rank*.txt" >&2
+        exit 5
+    }
     cp glm5_ep_rank00.txt "$RUN_DIR/rank00-$i.txt" 2>/dev/null || true
 done
 
