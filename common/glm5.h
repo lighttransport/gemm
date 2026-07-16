@@ -309,6 +309,7 @@ typedef struct {
     glm5_config cfg;
     int ep_rank, ep_size;
     int ex_shard2, ex_no0;   /* 2-way expert shard (manifest "# expert_shard 2"); no0 = h0 slot count */
+    int bd_fused;            /* fused-batch decode layers (GLM5_BD_FUSED; runtime-togglable for A/B) */
     int prefill_ntok;   /* tokens in the current prefill chunk; gates expert sdot (auto >= 1024) */
     glm5_layer *layers;
     /* embeddings / head (BF16; TP vocab-sharded) */

@@ -496,6 +496,46 @@ static void glm5_batch_selfcheck(glm5_model*m){
                shard?2:1, shard?"sharded":"replicated");
     }
 }
+/* GLM5_BATCH_SELFCHECK2=<tok>: numerics diff of the FUSED batch layer (GLM5_BD_FUSED path)
+ * vs the legacy batched path at M=2 (same-stream verifier shape: sid={0,0}, pos={0,1}).
+ * Runs the identical inputs through both (KV rewritten deterministically), reports the
+ * max relative X diff and whether the two argmax pairs match. */
+static void glm5_batch_selfcheck2(glm5_model*m){
+    int tok=envi("GLM5_BATCH_SELFCHECK2",0); if(tok<=0) return;
+    if(glm5_alloc_mstream_ex(m,2,1)){ if(MyRank==0) logmsg("BATCH_SELFCHECK2: alloc failed\n"); return; }
+    glm5_mstream*ms=(glm5_mstream*)m->ms;
+    static const int sid2[2]={0,0}; ms->sid=sid2;
+    int H=m->cfg.hidden, pos2[2]={0,1}, outA[2]={-1,-1}, outB[2]={-1,-1};
+    float*X=glm5_amalloc((size_t)2*H*4), *XA=glm5_amalloc((size_t)2*H*4);
+    embed_lookup(m,tok,X); embed_lookup(m,tok+1,X+H);
+    int save=m->bd_fused;
+    m->bd_fused=1; glm5_forward_batch_decode_mla(m,X,2,pos2,outA);
+    memcpy(XA,X,(size_t)2*H*4);
+    embed_lookup(m,tok,X); embed_lookup(m,tok+1,X+H);
+    m->bd_fused=0; glm5_forward_batch_decode_mla(m,X,2,pos2,outB);
+    m->bd_fused=save;
+    double mx=0,rn=0,dn=0;
+    for(int i=0;i<2*H;i++){ double d=fabs((double)XA[i]-X[i]); dn+=d*d; rn+=(double)X[i]*X[i]; if(d>mx)mx=d; }
+    if(MyRank==0) logmsg("BATCH_SELFCHECK2 tok=%d fused=(%d,%d) legacy=(%d,%d) rel_l2=%.3e max_abs=%.3e %s\n",
+                         tok,outA[0],outA[1],outB[0],outB[1],sqrt(dn/(rn+1e-30)),mx,
+                         (outA[0]==outB[0]&&outA[1]==outB[1])?"ARGMAX-MATCH":"*** ARGMAX-MISMATCH ***");
+    /* M=1 control: same diff with a single token — separates M=2-lane bugs from
+     * layer-code (kernel-order) deltas that exist at every M */
+    {
+        int p0=0, oA=-1, oB=-1;
+        embed_lookup(m,tok,X);
+        m->bd_fused=1; glm5_forward_batch_decode_mla(m,X,1,&p0,&oA);
+        memcpy(XA,X,(size_t)H*4);
+        embed_lookup(m,tok,X);
+        m->bd_fused=0; glm5_forward_batch_decode_mla(m,X,1,&p0,&oB);
+        m->bd_fused=save;
+        double mx1=0,rn1=0,dn1=0;
+        for(int i=0;i<H;i++){ double d=fabs((double)XA[i]-X[i]); dn1+=d*d; rn1+=(double)X[i]*X[i]; if(d>mx1)mx1=d; }
+        if(MyRank==0) logmsg("BATCH_SELFCHECK2-M1 tok=%d fused=%d legacy=%d rel_l2=%.3e max_abs=%.3e %s\n",
+                             tok,oA,oB,sqrt(dn1/(rn1+1e-30)),mx1,oA==oB?"ARGMAX-MATCH":"*** ARGMAX-MISMATCH ***");
+    }
+    glm5_afree(X); glm5_afree(XA); glm5_free_mstream(m);
+}
 #define GLM5_EOS_ID0 154820
 #define GLM5_EOS_ID1 154827
 #define GLM5_EOS_ID2 154829
@@ -672,10 +712,11 @@ static int glm5_run_spec_verify(glm5_model*m,int *gen,int *ng,int max_new,int mi
                                 int n_prompt,int *curp,float*x,int C,int *nanp,
                                 long *hitp,long *totp){
     if(m->cp_on || m->int4_kv || !m->mtp_layer) return 0;
-    if(glm5_alloc_mstream_ex(m,2,1)) return 0;
+    int K=envi("GLM5_SPEC_K",1); if(K<1)K=1; if(K>2)K=2;   /* K=2: chained 2nd draft, M=3 verify */
+    if(glm5_alloc_mstream_ex(m,K+1,1)) return 0;
     cbatch_kv_to_stream(m,m,0,n_prompt);
-    float *BX=glm5_amalloc((size_t)2*C*4), *xb=glm5_amalloc((size_t)2*C*4);
-    int pos[2], out[2], sid[2]={0,0};
+    float *BX=glm5_amalloc((size_t)(K+1)*C*4), *xb=glm5_amalloc((size_t)2*C*4), *xb2=glm5_amalloc((size_t)2*C*4);
+    int pos[3], out[3], sid[3]={0,0,0};
     glm5_mstream*ms=(glm5_mstream*)m->ms;
     ms->sid=sid;
     int cur=*curp, p=n_prompt, draft=glm5_mtp_draft(m,x,cur,p,xb);
@@ -683,12 +724,16 @@ static int glm5_run_spec_verify(glm5_model*m,int *gen,int *ng,int max_new,int mi
     long hit=0, tot=0, steps=0; int aborted=0;
     while(*ng<max_new){
         if(draft<0) break;
+        int d2=-1;
+        if(K==2) d2=glm5_mtp_draft(m,xb,draft,p+1,xb2);   /* chained: drafter hidden feeds draft 2 */
+        int M=(d2>=0)?3:2;
         embed_partial(m,cur,BX);
         embed_partial(m,draft,BX+C);
-        if(m->emb_rows<m->cfg.vocab && m->ar_cb) m->ar_cb(BX,2*C,m->ar_ctx);
-        pos[0]=p; pos[1]=p+1;
-        glm5_forward_batch_decode_mla(m,BX,2,pos,out);
-        for(int i=0;i<2*C;i++) if(!(BX[i]==BX[i])){ (*nanp)++; break; }
+        if(M==3) embed_partial(m,d2,BX+2*C);
+        if(m->emb_rows<m->cfg.vocab && m->ar_cb) m->ar_cb(BX,M*C,m->ar_ctx);
+        pos[0]=p; pos[1]=p+1; pos[2]=p+2;
+        glm5_forward_batch_decode_mla(m,BX,M,pos,out);
+        for(int i=0;i<M*C;i++) if(!(BX[i]==BX[i])){ (*nanp)++; break; }
         gen[(*ng)++]=cur;
         int eos0=(cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2);
         if(eos0 && *ng>=min_new){ cur=out[0]; p++; memcpy(x,BX,(size_t)C*4); break; }
@@ -697,8 +742,17 @@ static int glm5_run_spec_verify(glm5_model*m,int *gen,int *ng,int max_new,int mi
             hit++;
             gen[(*ng)++]=draft;
             int eos1=(draft==GLM5_EOS_ID0||draft==GLM5_EOS_ID1||draft==GLM5_EOS_ID2);
-            cur=out[1]; p+=2; memcpy(x,BX+C,(size_t)C*4);
-            if(eos1 && *ng>=min_new) break;
+            if(eos1 && *ng>=min_new){ cur=out[1]; p+=2; memcpy(x,BX+C,(size_t)C*4); break; }
+            if(M==3 && *ng<max_new){
+                tot++;                                     /* 2nd draft judged only after 1st accept */
+                if(out[1]==d2){
+                    hit++;
+                    gen[(*ng)++]=d2;
+                    int eos2=(d2==GLM5_EOS_ID0||d2==GLM5_EOS_ID1||d2==GLM5_EOS_ID2);
+                    cur=out[2]; p+=3; memcpy(x,BX+2*C,(size_t)C*4);
+                    if(eos2 && *ng>=min_new) break;
+                } else { cur=out[1]; p+=2; memcpy(x,BX+C,(size_t)C*4); }
+            } else { cur=out[1]; p+=2; memcpy(x,BX+C,(size_t)C*4); }
         } else {
             cur=out[0]; p++; memcpy(x,BX,(size_t)C*4);
         }
@@ -714,7 +768,7 @@ static int glm5_run_spec_verify(glm5_model*m,int *gen,int *ng,int max_new,int mi
     }
     ms->sid=NULL;
     glm5_free_mstream(m);
-    glm5_afree(BX); glm5_afree(xb);
+    glm5_afree(BX); glm5_afree(xb); glm5_afree(xb2);
     *curp=cur; *hitp=hit; *totp=tot;
     if(MyRank==0) logmsg("SPEC_VERIFY steps=%ld emitted=%d accept=%ld/%ld %.1f%%\n",
                          steps,*ng,hit,tot,tot?100.0*(double)hit/(double)tot:0.0);
@@ -1134,6 +1188,7 @@ int main(int argc,char**argv){
       }
     }
     glm5_batch_selfcheck(m);   /* GLM5_BATCH_SELFCHECK=<tok>: M=1 batched-decode == single-stream */
+    glm5_batch_selfcheck2(m);  /* GLM5_BATCH_SELFCHECK2=<tok>: fused-batch vs legacy at M=2 */
     /* CP callbacks are wired unconditionally so a mid-run Tier A->B transition can turn CP on.
      * They stay dormant while m->cp_on==0 (the forward gates the combine/block-reduce on it). */
     /* combine scratch sized for a whole chunk (S<=pchunk0): g_kvbuf holds the packed

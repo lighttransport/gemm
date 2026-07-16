@@ -324,6 +324,43 @@ static inline void glm5_int16sdot_4row_4x(float*restrict a0,float*restrict a1,fl
     a3[0]+=svaddv_f64(pf,f30)-128.0*b30; a3[1]+=svaddv_f64(pf,f31)-128.0*b31; a3[2]+=svaddv_f64(pf,f32)-128.0*b32; a3[3]+=svaddv_f64(pf,f33)-128.0*b33;
 }
 
+/* 4 weight rows x 2 tokens: the M=2 spec-verify block. One weight widen feeds both tokens'
+ * sdot lanes (two per-token matvecs widen twice; the dup-lane 4x wastes half its sdots). */
+static inline void glm5_int16sdot_4row_2x(float*restrict a0,float*restrict a1,
+        const uint8_t*w0,const uint8_t*w1,const uint8_t*w2,const uint8_t*w3,
+        const float*s0,const float*s1,const float*s2,const float*s3,int gs,int col0,
+        const int16_t*xq0,const int16_t*xq1,
+        const int64_t*restrict xg0,const int64_t*restrict xg1,int kl){
+    svbool_t pf=svptrue_b64(); int vh=(int)svcnth();
+    svfloat64_t f00=svdup_f64(0),f01=svdup_f64(0),f02=svdup_f64(0),f03=svdup_f64(0);
+    svfloat64_t f10=svdup_f64(0),f11=svdup_f64(0),f12=svdup_f64(0),f13=svdup_f64(0);
+    double b00=0,b01=0,b02=0,b03=0, b10=0,b11=0,b12=0,b13=0;
+    for(int b=0;b<kl;){
+        int blk=(col0+b)/gs, bend=(blk+1)*gs-col0; if(bend>kl)bend=kl; int c=b;
+        svint64_t d00=svdup_s64(0),d01=svdup_s64(0),d02=svdup_s64(0),d03=svdup_s64(0);
+        svint64_t d10=svdup_s64(0),d11=svdup_s64(0),d12=svdup_s64(0),d13=svdup_s64(0);
+        for(;c<bend;c+=vh){
+            svbool_t pg=svwhilelt_b16((uint32_t)c,(uint32_t)bend);
+            svint16_t v0=svreinterpret_s16_u16(svld1ub_u16(pg,&w0[c]));
+            svint16_t v1=svreinterpret_s16_u16(svld1ub_u16(pg,&w1[c]));
+            svint16_t v2=svreinterpret_s16_u16(svld1ub_u16(pg,&w2[c]));
+            svint16_t v3=svreinterpret_s16_u16(svld1ub_u16(pg,&w3[c]));
+            svint16_t xv;
+            xv=svld1_s16(pg,&xq0[c]); d00=svdot_s64(d00,v0,xv); d01=svdot_s64(d01,v1,xv); d02=svdot_s64(d02,v2,xv); d03=svdot_s64(d03,v3,xv);
+            xv=svld1_s16(pg,&xq1[c]); d10=svdot_s64(d10,v0,xv); d11=svdot_s64(d11,v1,xv); d12=svdot_s64(d12,v2,xv); d13=svdot_s64(d13,v3,xv);
+        }
+        double c0=s0[blk],c1=s1[blk],c2=s2[blk],c3=s3[blk];
+        double g0=(double)xg0[blk],g1=(double)xg1[blk];
+        b00+=c0*g0; b01+=c1*g0; b02+=c2*g0; b03+=c3*g0;
+        b10+=c0*g1; b11+=c1*g1; b12+=c2*g1; b13+=c3*g1;
+        f00=svmla_n_f64_x(pf,f00,svcvt_f64_s64_x(pf,d00),c0); f01=svmla_n_f64_x(pf,f01,svcvt_f64_s64_x(pf,d01),c1); f02=svmla_n_f64_x(pf,f02,svcvt_f64_s64_x(pf,d02),c2); f03=svmla_n_f64_x(pf,f03,svcvt_f64_s64_x(pf,d03),c3);
+        f10=svmla_n_f64_x(pf,f10,svcvt_f64_s64_x(pf,d10),c0); f11=svmla_n_f64_x(pf,f11,svcvt_f64_s64_x(pf,d11),c1); f12=svmla_n_f64_x(pf,f12,svcvt_f64_s64_x(pf,d12),c2); f13=svmla_n_f64_x(pf,f13,svcvt_f64_s64_x(pf,d13),c3);
+        b=bend;
+    }
+    a0[0]+=svaddv_f64(pf,f00)-128.0*b00; a0[1]+=svaddv_f64(pf,f01)-128.0*b01; a0[2]+=svaddv_f64(pf,f02)-128.0*b02; a0[3]+=svaddv_f64(pf,f03)-128.0*b03;
+    a1[0]+=svaddv_f64(pf,f10)-128.0*b10; a1[1]+=svaddv_f64(pf,f11)-128.0*b11; a1[2]+=svaddv_f64(pf,f12)-128.0*b12; a1[3]+=svaddv_f64(pf,f13)-128.0*b13;
+}
+
 /* PREFILL int8 w8a8-SDOT GEMM micro-kernel: 4 weight rows x 5 token register block. Like the int16
  * kernel but int8xint8 svdot_s32 (64 MACs/instr = 2x the int16, 4x the w8a16 bf16-FMA) — the FASTEST
  * but LOSSY (activations rounded to int8). Weight offset-binary -> signed via eor 0x80 (no widen).

@@ -90,6 +90,23 @@ static inline float tp_bf162f(uint16_t b) {
     uint32_t x = (uint32_t)b << 16; float f; memcpy(&f, &x, sizeof f); return f;
 }
 static inline float tp_bf16_round(float f) { return tp_bf162f(tp_f2bf16(f)); }
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+/* SVE forms of the bf16 payload loops — BIT-EXACT elementwise transcriptions of the
+ * scalar formulas above (same integer round-to-nearest-even, no reassociation), so the
+ * lockstep bitwise-identical invariant is preserved.  The scalar loops cost ~12 us per
+ * 6144-float round on one core, which dominated the measured 29 us/round AR anatomy. */
+static inline svuint32_t tp_bf16_rne_sve(svbool_t pg, svuint32_t x){   /* bits -> rounded bf16 (in low 16) */
+    return svlsr_n_u32_x(pg, svadd_u32_x(pg, x,
+               svadd_n_u32_x(pg, svand_n_u32_x(pg, svlsr_n_u32_x(pg, x, 16), 1u), 0x7fffu)), 16);
+}
+static inline svfloat32_t tp_bf16_round_sve(svbool_t pg, svfloat32_t f){
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg, tp_bf16_rne_sve(pg, svreinterpret_u32_f32(f)), 16));
+}
+static inline svfloat32_t tp_bf16_ld_sve(svbool_t pg, const uint16_t*p){
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
+}
+#endif
 
 /* Invalidate one cache line before reading an RDMA-written trailer (A64FX).
  * A purely passive volatile-read spin can keep hitting a stale cached copy of the
@@ -234,7 +251,15 @@ static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int coun
     size_t pbytes;
     if (c->use_bf16) {
         uint16_t *d = (uint16_t *)sb;
+#if defined(__ARM_FEATURE_SVE)
+        { const int vl=(int)svcntw();
+          for (int i = 0; i < count; i += vl) {
+              svbool_t pg = svwhilelt_b32(i, count);
+              svst1h_u32(pg, d + i, tp_bf16_rne_sve(pg, svld1_u32(pg, (const uint32_t*)(buf + i))));
+          } }
+#else
         for (int i = 0; i < count; i++) d[i] = tp_f2bf16(buf[i]);
+#endif
         pbytes = (size_t)count * sizeof(uint16_t);
     } else {
         memcpy(sb, buf, (size_t)count * sizeof(float));
@@ -263,8 +288,18 @@ static void tp_ar_recv_add(tp_comm *c, int sid, int from, float *buf, int count,
     tp_ar_wait(c, trl, tok, sid, "wait");
     if (c->use_bf16) {
         const uint16_t *r = (const uint16_t *)rb;
+#if defined(__ARM_FEATURE_SVE)
+        { const int vl=(int)svcntw();
+          for (int i = 0; i < count; i += vl) {
+              svbool_t pg = svwhilelt_b32(i, count);
+              svfloat32_t b = tp_bf16_round_sve(pg, svld1(pg, buf + i));
+              svfloat32_t v = tp_bf16_ld_sve(pg, r + i);
+              svst1(pg, buf + i, tp_bf16_round_sve(pg, svadd_f32_x(pg, b, v)));
+          } }
+#else
         for (int i = 0; i < count; i++)
             buf[i] = tp_bf16_round(tp_bf16_round(buf[i]) + tp_bf162f(r[i]));
+#endif
     } else {
         const float *r = (const float *)rb;
         for (int i = 0; i < count; i++) buf[i] += r[i];
@@ -282,7 +317,18 @@ static void tp_ar_recv_max(tp_comm *c, int sid, int from, float *buf, int count,
     tp_ar_wait(c, trl, tok, sid, "max");
     if (c->use_bf16) {
         const uint16_t *r = (const uint16_t *)rb;
+#if defined(__ARM_FEATURE_SVE)
+        { const int vl=(int)svcntw();
+          for (int i = 0; i < count; i += vl) {
+              svbool_t pg = svwhilelt_b32(i, count);
+              svfloat32_t v = tp_bf16_ld_sve(pg, r + i);
+              svfloat32_t b = tp_bf16_round_sve(pg, svld1(pg, buf + i));
+              /* exact `v > b ? v : b` ternary semantics (not fmax) */
+              svst1(pg, buf + i, svsel_f32(svcmpgt_f32(pg, v, b), v, b));
+          } }
+#else
         for (int i = 0; i < count; i++) { float v = tp_bf162f(r[i]), b = tp_bf16_round(buf[i]); buf[i] = v > b ? v : b; }
+#endif
     } else {
         const float *r = (const float *)rb;
         for (int i = 0; i < count; i++) if (r[i] > buf[i]) buf[i] = r[i];
@@ -296,7 +342,15 @@ static void tp_ar_recv_copy(tp_comm *c, int sid, int from, float *buf, int count
     tp_ar_wait(c, trl, tok, sid, "bcast");
     if (c->use_bf16) {
         const uint16_t *r = (const uint16_t *)rb;
+#if defined(__ARM_FEATURE_SVE)
+        { const int vl=(int)svcntw();
+          for (int i = 0; i < count; i += vl) {
+              svbool_t pg = svwhilelt_b32(i, count);
+              svst1(pg, buf + i, tp_bf16_ld_sve(pg, r + i));
+          } }
+#else
         for (int i = 0; i < count; i++) buf[i] = tp_bf162f(r[i]);
+#endif
     } else {
         memcpy(buf, rb, (size_t)count * sizeof(float));
     }
