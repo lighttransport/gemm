@@ -1,5 +1,6 @@
 #!/bin/bash
 # GLM-5.2 mixed-IQ full-model runner for an existing interactive 1x12 allocation.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 

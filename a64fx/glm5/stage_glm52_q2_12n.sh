@@ -1,5 +1,6 @@
 #!/bin/bash
 # Run under mpiexec: each rank copies only its converted blob to node-local LLIO.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 
 SOURCE="${GLM52_CONVERT_DIR:-$HOME/models/glm52-2bit/a64fx-ep12-v1}"

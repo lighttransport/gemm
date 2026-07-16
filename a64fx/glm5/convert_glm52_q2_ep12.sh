@@ -1,5 +1,6 @@
 #!/bin/bash
 # Convert the seven-shard GLM-5.2 mixed-IQ GGUF into twelve A64FX rank blobs.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
