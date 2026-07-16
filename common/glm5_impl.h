@@ -3540,8 +3540,11 @@ static int glm5_gemm_iq_q8_smalln(float*restrict Y,const glm5_tensor*t,const flo
 static void glm5_gemm_ggml(float*restrict Y,const glm5_tensor*t,const float*X,
                            int N,int rows,int cols){
     /* q8 kernels FIRST, including N==1: the spec verifier's M=2 buckets are mostly g=1
-     * and the F32-dequant fallback below runs at scalar-dequant speed (~330 ms/step). */
-    if(N<=16 && !glm5_gemm_iq_q8_smalln(Y,t,X,N,rows,cols)) return;
+     * and the F32-dequant fallback below runs at scalar-dequant speed (~330 ms/step).
+     * GLM5_IQ_GEMM_MAXN sets the N cutoff (prefill buckets are g~16-32; the q8 row
+     * kernels re-dot L1-hot weights per activation and beat dequant-once well past 16). */
+    static int maxn=-1; if(maxn<0) maxn=glm5_envi("GLM5_IQ_GEMM_MAXN",512);
+    if(N<=maxn && !glm5_gemm_iq_q8_smalln(Y,t,X,N,rows,cols)) return;
     if(N<=1){ glm5_mv_ggml(Y,t,X,rows,cols); return; }
     const size_t rb=dequant_row_size((uint32_t)t->type,cols);
     if(!rb){ for(size_t i=0;i<(size_t)N*rows;i++)Y[i]=NAN; return; }
