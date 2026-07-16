@@ -4845,8 +4845,14 @@ static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X
                       H,arows,M,(arows+L->wo.qg-1)/L->wo.qg,m->s_bxq2,m->s_bxg2,m->s_bxsc2};
     glm5_abs_job aj; glm5_absv_job vj; memset(&aj,0,sizeof aj); memset(&vj,0,sizeof vj);
     glm5_abs2_job a2j; memset(&a2j,0,sizeof a2j);
+    /* GLM5_BD_ABS2=1 opts into the shared-KV 2-query absorb (~2.3 ms/step faster but its
+     * chunk-grid reassoc departs from the legacy/single-path realization).  Default 0 =
+     * per-token absorb: with GLM5_BD_GATEX this makes the fused layer BIT-IDENTICAL to the
+     * legacy batched path (selfcheck2 rel_l2 = 0.0), so verify trajectories/accept match
+     * the reference exactly. */
+    static int abs2_env=-1; if(abs2_env<0) abs2_env=glm5_envi("GLM5_BD_ABS2",0);
     /* two same-stream tokens (the spec-verify pair): one shared-KV 2-query absorb pass */
-    const int abs2_ok=(M==2 && (ms->sid?ms->sid[1]==ms->sid[0]:0) && pos[1]>=pos[0] && 2*nown<=c->n_heads);
+    const int abs2_ok=(abs2_env && M==2 && (ms->sid?ms->sid[1]==ms->sid[0]:0) && pos[1]>=pos[0] && 2*nown<=c->n_heads);
     uint16_t*kvsave=L->kv_cache;                 /* swapped per token in phase 1; restored after */
     /* GLM5_BD_TRACE=1: per-stage micro-timing (rank 0), the p1-trace analog for this path */
     static int bdtr=-1; if(bdtr<0) bdtr=glm5_envi("GLM5_BD_TRACE",0);
@@ -4988,16 +4994,31 @@ static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X
                         L->sh_rows,H,M,(H+L->sh_w3.qg-1)/L->sh_w3.qg,m->s_bxq,m->s_bxg,m->s_bxsc};
     glm5_i16g_job sh2j={ms->tmp2,(const uint8_t*)L->sh_w2.w,(const float*)L->sh_w2.scale,L->sh_w2.qg,0,
                         H,L->sh_rows,M,(L->sh_rows+L->sh_w2.qg-1)/L->sh_w2.qg,m->s_bxq2,m->s_bxg2,m->s_bxsc2};
-    glm5_mvjob gj={ms->router,(const uint16_t*)L->gate.w,ms->h2,c->n_experts,H};
     int ex_oslot[64],ex_ooff[65],ex_otok[64],ex_nu=0; float ex_ow[64];
     const int xq2blk=c->moe_inter/256;
     glm5_exbN_job xj; memset(&xj,0,sizeof xj);
+    /* GLM5_BD_GATEX=1 (default): post-norm + gate run OUTSIDE the region through the exact
+     * legacy glm5_gemm call — BIT-IDENTICAL router logits to the legacy path.  The in-region
+     * mv_worker gate produced ~1e-6 logit deltas that flip near-tie top-8 selections; each
+     * flip perturbs X by percent-scale and measurably depresses the drafter accept rate. */
+    static int gatex=-1; if(gatex<0) gatex=glm5_envi("GLM5_BD_GATEX",1);
+    glm5_mvjob gj={ms->router,(const uint16_t*)L->gate.w,ms->h2,c->n_experts,H};
+    if(gatex){
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(int t=0;t<M;t++)
+            glm5_rmsnorm_gemma(ms->h2+(size_t)t*H,X+(size_t)t*H,L->post_norm,H,c->norm_eps);
+        glm5_gemm(m,ms->router,&L->gate,ms->h2,M,c->n_experts,H);
+    }
     #pragma omp parallel
     {
         int tid=omp_get_thread_num(), nt=omp_get_num_threads();
-        for(int t=tid;t<M;t+=nt)
-            glm5_rmsnorm_gemma(ms->h2+(size_t)t*H,X+(size_t)t*H,L->post_norm,H,c->norm_eps);
-        #pragma omp barrier
+        if(!gatex){
+            for(int t=tid;t<M;t+=nt)
+                glm5_rmsnorm_gemma(ms->h2+(size_t)t*H,X+(size_t)t*H,L->post_norm,H,c->norm_eps);
+            #pragma omp barrier
+        }
         pthread_once(&glm5_iq_lut_once,glm5_iq_init_luts);   /* every thread: blocks until LUTs ready */
         /* h2 is final: overlap the per-token quant chains (threads 0..2M-1) with the
          * gate matvec (remaining threads) — they only share h2 reads */
@@ -5006,7 +5027,7 @@ static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X
         } else if(tid<2*M){ int t=tid-M;
             glm5_a16_quantize(m->s_bxq+(size_t)t*H,m->s_bxg+(size_t)t*shj1.sb,m->s_bxsc+t,
                               ms->h2+(size_t)t*H,H,shj1.gs,0);
-        } else if(nt>2*M){
+        } else if(!gatex && nt>2*M){
             for(int t=0;t<M;t++){                /* gate: BF16 [256,H], one worker pass per token */
                 glm5_mvjob g2=gj; g2.y=ms->router+(size_t)t*c->n_experts; g2.x=ms->h2+(size_t)t*H;
                 glm5_mv_worker(&g2,tid-2*M,nt-2*M);
