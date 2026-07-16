@@ -53,7 +53,19 @@
 #include <time.h>
 #include <arm_sve.h>
 
-#include "ggml_dequant.h"   /* matvec_bf16_8row_pv + e8m0/fp8 helpers (shared with ds4f) */
+/* GLM5_IMPL translation units also need the scalar GGML dequantizers for the
+ * mixed-IQ GLM-5.2 GGUF path.  Each GLM executable is a single translation
+ * unit, so emitting the header implementation here does not create duplicate
+ * linker definitions. */
+#if defined(GLM5_IMPL) && !defined(GGML_DEQUANT_IMPLEMENTATION)
+#define GGML_DEQUANT_IMPLEMENTATION
+#define GLM5_OWNS_GGML_DEQUANT_IMPLEMENTATION
+#endif
+#include "ggml_dequant.h"   /* matvec_bf16_8row_pv + GGML IQ dequantizers */
+#ifdef GLM5_OWNS_GGML_DEQUANT_IMPLEMENTATION
+#undef GGML_DEQUANT_IMPLEMENTATION
+#undef GLM5_OWNS_GGML_DEQUANT_IMPLEMENTATION
+#endif
 #include "glm5_mem.h"         /* glm5_amalloc/glm5_acalloc/glm5_afree: 256-aligned NUMA-interleaved */
 
 /* ===================== config ===================== */
@@ -144,14 +156,29 @@ static inline int glm5_idx_q_dim(const glm5_config *c) { return c->index_n_heads
  * flat layout for norms/embed/index-norm read directly. GLM5_F32 for the router
  * gate + e_score bias (argmax-critical, kept high precision). MXFP4/Q8 reserved
  * for the later perf phase (same enum values as ds4f for kernel sharing). */
-typedef enum { GLM5_BF16 = 0, GLM5_FP8 = 1, GLM5_MXFP4 = 2, GLM5_F32 = 3, GLM5_BF16_PV = 4, GLM5_Q8_PV = 5, GLM5_MXFP8 = 6, GLM5_INT8 = 7 } glm5_qtype;
+typedef enum {
+    GLM5_BF16 = 0, GLM5_FP8 = 1, GLM5_MXFP4 = 2, GLM5_F32 = 3,
+    GLM5_BF16_PV = 4, GLM5_Q8_PV = 5, GLM5_MXFP8 = 6, GLM5_INT8 = 7,
+    /* Values intentionally match enum ggml_dtype: the mixed-IQ dispatch can
+     * pass them directly to dequant_row/dequant_row_size. */
+    GLM5_Q8_0 = 8, GLM5_Q2_K = 10, GLM5_Q3_K = 11, GLM5_Q4_K = 12,
+    GLM5_Q5_K = 13, GLM5_Q6_K = 14, GLM5_IQ2_XS = 17,
+    GLM5_IQ3_XXS = 18, GLM5_IQ4_XS = 23
+} glm5_qtype;
+
+static inline int glm5_is_ggml_q(glm5_qtype t) {
+    return t == GLM5_Q8_0 || t == GLM5_Q2_K || t == GLM5_Q3_K ||
+           t == GLM5_Q4_K || t == GLM5_Q5_K || t == GLM5_Q6_K ||
+           t == GLM5_IQ2_XS || t == GLM5_IQ3_XXS || t == GLM5_IQ4_XS;
+}
 
 typedef struct {
     void    *w;       /* weight bytes */
-    uint8_t *scale;   /* FP8: F32 scale_inv blocks; INT8: F32 per-row scale [rows,cols/qg]; NULL for BF16/F32 */
+    uint8_t *scale;   /* FP8: F32 scale_inv blocks; INT8: F32 per-row scale groups; NULL for BF16/F32 */
     glm5_qtype type;
     int rows, cols;   /* logical [rows, cols] */
     int qg;           /* INT8 scale group size in cols (128 group / =cols per-channel); 0 otherwise */
+    int qg0;          /* INT8 original-column offset into the first copied scale group */
 } glm5_tensor;
 
 static inline size_t glm5_wbytes(glm5_qtype t, int rows, int cols) {
@@ -165,6 +192,15 @@ static inline size_t glm5_wbytes(glm5_qtype t, int rows, int cols) {
         case GLM5_MXFP4:   return n / 2;
         case GLM5_F32:     return n * 4;
         case GLM5_Q8_PV:   return (size_t)(rows / 8) * (cols / 64) * 528;
+        case GLM5_Q8_0:
+        case GLM5_Q2_K:
+        case GLM5_Q3_K:
+        case GLM5_Q4_K:
+        case GLM5_Q5_K:
+        case GLM5_Q6_K:
+        case GLM5_IQ2_XS:
+        case GLM5_IQ3_XXS:
+        case GLM5_IQ4_XS:  return (size_t)rows * dequant_row_size((uint32_t)t, cols);
     }
     return 0;
 }

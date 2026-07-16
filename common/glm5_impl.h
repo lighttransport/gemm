@@ -804,7 +804,168 @@ static void glm5_mv_int16_sdot(glm5_model*m, float*restrict y, const uint8_t*W, 
     glm5_mv_int8(m,y,W,S,gs,qg0,x,rows,cols);
 #endif
 }
-/* matvec dispatch by weight type (bf16 / MXFP8 / INT8) */
+static inline float glm5_dot_f32_f32(const float *a,const float *b,int n){
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t acc=svdup_f32(0.f);
+    for(int i=0;i<n;i+=(int)svcntw()){
+        svbool_t pg=svwhilelt_b32(i,n);
+        acc=svmla_f32_m(pg,acc,svld1(pg,a+i),svld1(pg,b+i));
+    }
+    return svaddv_f32(svptrue_b32(),acc);
+#else
+    double acc=0.0; for(int i=0;i<n;i++) acc+=(double)a[i]*b[i]; return (float)acc;
+#endif
+}
+
+/* Mixed-IQ decode kernel.  llama.cpp normally pairs the IQ blocks with a
+ * Q8_K activation.  On A64FX we use a per-256-element int16 activation
+ * instead: it is effectively lossless for inference activations while still
+ * allowing SVE svdot_s64 to contract the small integer grids directly.  The
+ * IQ block scale and sub-block scale are folded after the integer dot. */
+typedef struct { float d; int16_t q[256]; } glm5_iq_a16_block;
+
+static inline int64_t glm5_iq_dot_i16(const int16_t*a,const int16_t*b,int n){
+#if defined(__ARM_FEATURE_SVE)
+    svint64_t acc=svdup_s64(0);
+    for(int i=0;i<n;i+=(int)svcnth()){
+        svbool_t pg=svwhilelt_b16(i,n);
+        acc=svdot_s64(acc,svld1_s16(pg,a+i),svld1_s16(pg,b+i));
+    }
+    return svaddv_s64(svptrue_b64(),acc);
+#else
+    int64_t acc=0; for(int i=0;i<n;i++) acc+=(int32_t)a[i]*b[i]; return acc;
+#endif
+}
+
+static void glm5_iq_quant_a16(glm5_iq_a16_block*q,const float*x,int cols){
+    for(int b=0;b<cols/256;b++){
+        float amax=0.f;
+        for(int j=0;j<256;j++){ float a=fabsf(x[256*b+j]); if(a>amax)amax=a; }
+        q[b].d=amax>0.f?amax/32767.f:0.f;
+        float inv=amax>0.f?32767.f/amax:0.f;
+        for(int j=0;j<256;j++){
+            int v=(int)lrintf(x[256*b+j]*inv);
+            v=v>32767?32767:(v<-32767?-32767:v);
+            q[b].q[j]=(int16_t)v;
+        }
+    }
+}
+
+static float glm5_iq2_xs_a16_row(const block_iq2_xs*w,const glm5_iq_a16_block*x,int nb){
+    double sum=0.0; int16_t qw[32];
+    for(int b=0;b<nb;b++){
+        int64_t ibsum=0;
+        for(int ib=0;ib<8;ib++){
+            for(int l=0;l<4;l++){
+                uint16_t code=w[b].qs[4*ib+l];
+                const uint8_t*grid=(const uint8_t*)(iq2xs_grid+(code&511));
+                uint8_t signs=ksigns_iq2xs[code>>9];
+                for(int j=0;j<8;j++) qw[8*l+j]=(int16_t)(
+                    (signs&kmask_iq2xs[j])?-(int)grid[j]:(int)grid[j]);
+            }
+            int ls1=2*(w[b].scales[ib]&15)+1;
+            int ls2=2*(w[b].scales[ib]>>4)+1;
+            const int16_t*xq=x[b].q+32*ib;
+            ibsum+=glm5_iq_dot_i16(qw,xq,16)*ls1;
+            ibsum+=glm5_iq_dot_i16(qw+16,xq+16,16)*ls2;
+        }
+        sum+=(double)ggml_fp16_to_fp32(w[b].d)*x[b].d*(double)ibsum*0.125;
+    }
+    return (float)sum;
+}
+
+static float glm5_iq3_xxs_a16_row(const block_iq3_xxs*w,const glm5_iq_a16_block*x,int nb){
+    double sum=0.0; int16_t qw[32];
+    for(int b=0;b<nb;b++){
+        const uint8_t*q3=w[b].qs;
+        const uint8_t*gas=w[b].qs+64;
+        int64_t ibsum=0;
+        for(int ib=0;ib<8;ib++){
+            uint32_t aux; memcpy(&aux,gas+4*ib,4);
+            for(int l=0;l<4;l++){
+                const uint8_t*g1=(const uint8_t*)(iq3xxs_grid+q3[8*ib+2*l]);
+                const uint8_t*g2=(const uint8_t*)(iq3xxs_grid+q3[8*ib+2*l+1]);
+                uint8_t signs=ksigns_iq2xs[(aux>>(7*l))&127];
+                for(int j=0;j<4;j++){
+                    qw[8*l+j]=(int16_t)((signs&kmask_iq2xs[j])?-(int)g1[j]:(int)g1[j]);
+                    qw[8*l+j+4]=(int16_t)((signs&kmask_iq2xs[j+4])?-(int)g2[j]:(int)g2[j]);
+                }
+            }
+            ibsum+=glm5_iq_dot_i16(qw,x[b].q+32*ib,32)*(2*(int)(aux>>28)+1);
+        }
+        sum+=(double)ggml_fp16_to_fp32(w[b].d)*x[b].d*(double)ibsum*0.25;
+    }
+    return (float)sum;
+}
+
+static float glm5_iq4_xs_a16_row(const block_iq4_xs*w,const glm5_iq_a16_block*x,int nb){
+    double sum=0.0; int16_t qw[32];
+    for(int b=0;b<nb;b++){
+        const uint8_t*qs=w[b].qs; uint16_t h=w[b].scales_h;
+        int64_t ibsum=0;
+        for(int ib=0;ib<8;ib++){
+            for(int j=0;j<16;j++){
+                qw[j]=kvalues_iq4nl[qs[j]&15];
+                qw[j+16]=kvalues_iq4nl[qs[j]>>4];
+            }
+            int ls=((w[b].scales_l[ib/2]>>(4*(ib&1)))&15)|((h&3)<<4);
+            h>>=2;
+            ibsum+=glm5_iq_dot_i16(qw,x[b].q+32*ib,32)*(ls-32);
+            qs+=16;
+        }
+        sum+=(double)ggml_fp16_to_fp32(w[b].d)*x[b].d*(double)ibsum;
+    }
+    return (float)sum;
+}
+
+static int glm5_mv_iq_a16(float*restrict y,const glm5_tensor*t,const float*x,int rows,int cols){
+    if(cols%256) return -1;
+    if(t->type!=GLM5_IQ2_XS&&t->type!=GLM5_IQ3_XXS&&t->type!=GLM5_IQ4_XS) return -1;
+    int nb=cols/256;
+    glm5_iq_a16_block*xq=malloc((size_t)nb*sizeof(*xq));
+    if(!xq) return -1;
+    glm5_iq_quant_a16(xq,x,cols);
+    size_t rb=dequant_row_size((uint32_t)t->type,cols);
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
+#endif
+    for(int r=0;r<rows;r++){
+        const uint8_t*w=(const uint8_t*)t->w+(size_t)r*rb;
+        if(t->type==GLM5_IQ2_XS) y[r]=glm5_iq2_xs_a16_row((const block_iq2_xs*)w,xq,nb);
+        else if(t->type==GLM5_IQ3_XXS) y[r]=glm5_iq3_xxs_a16_row((const block_iq3_xxs*)w,xq,nb);
+        else y[r]=glm5_iq4_xs_a16_row((const block_iq4_xs*)w,xq,nb);
+    }
+    free(xq); return 0;
+}
+/* Source-faithful mixed-IQ baseline.  A row is dequantized into
+ * thread-local scratch and immediately contracted, so compressed expert
+ * weights never expand persistently in HBM. */
+static void glm5_mv_ggml(float*restrict y,const glm5_tensor*t,const float*x,int rows,int cols){
+    const size_t rb=dequant_row_size((uint32_t)t->type,cols);
+    if(!rb){ for(int r=0;r<rows;r++) y[r]=NAN; return; }
+#ifdef _OPENMP
+    #pragma omp parallel if(rows>=GLM5_PAR_MIN)
+    {
+        float*tmp=malloc((size_t)cols*4);
+        #pragma omp for schedule(static)
+        for(int r=0;r<rows;r++){
+            const uint8_t*src=(const uint8_t*)t->w+(size_t)r*rb;
+            y[r]=(!tmp||dequant_row((uint32_t)t->type,src,tmp,cols))?NAN:
+                 glm5_dot_f32_f32(tmp,x,cols);
+        }
+        free(tmp);
+    }
+#else
+    float*tmp=malloc((size_t)cols*4);
+    for(int r=0;r<rows;r++){
+        const uint8_t*src=(const uint8_t*)t->w+(size_t)r*rb;
+        y[r]=(!tmp||dequant_row((uint32_t)t->type,src,tmp,cols))?NAN:
+             glm5_dot_f32_f32(tmp,x,cols);
+    }
+    free(tmp);
+#endif
+}
+/* matvec dispatch by weight type (bf16 / MXFP8 / INT8 / GGML IQ) */
 static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const float*x, int rows, int cols){
     if(t->type==GLM5_MXFP8) glm5_mv_mxfp8(m,y,(const uint8_t*)t->w,t->scale,x,rows,cols);
     else if(t->type==GLM5_INT8){
@@ -815,6 +976,35 @@ static void glm5_mv(glm5_model*m, float*restrict y, const glm5_tensor*t, const f
         if(mvsd==2) glm5_mv_int16_sdot(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,x,rows,cols);
         else if(mvsd==1) glm5_mv_int8_sdot(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,x,rows,cols);
         else glm5_mv_int8(m,y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,x,rows,cols);
+    }
+    else if(glm5_is_ggml_q(t->type)){
+        static int iqref=-1,iqcheck=-1;
+        /* The row-dequant path is currently faster at production thread count;
+         * set GLM5_IQ_REF=0 to exercise the accuracy-preserving A16 SDOT path. */
+        if(iqref<0) iqref=glm5_envi("GLM5_IQ_REF",1);
+        if(iqcheck<0) iqcheck=glm5_envi("GLM5_IQ_CHECK",0);
+        int fallback=iqref||glm5_mv_iq_a16(y,t,x,rows,cols);
+        if(fallback) glm5_mv_ggml(y,t,x,rows,cols);
+        else if(iqcheck){
+            /* First-call accuracy gate against source-faithful F32 dequant. */
+            static atomic_int checked=0;
+            if(atomic_exchange(&checked,1)==0){
+                float*ref=malloc((size_t)rows*sizeof(float));
+                if(ref){
+                    glm5_mv_ggml(ref,t,x,rows,cols);
+                    double e2=0,r2=0,mx=0;
+                    for(int r=0;r<rows;r++){
+                        double e=(double)y[r]-ref[r],a=fabs(e);
+                        e2+=e*e; r2+=(double)ref[r]*ref[r]; if(a>mx)mx=a;
+                    }
+                    double rel=sqrt(e2/(r2+1e-30));
+                    fprintf(stderr,"[glm52-iq] a16/ref rows=%d cols=%d rel_l2=%.3e max_abs=%.3e %s\n",
+                            rows,cols,rel,mx,(isfinite(rel)&&rel<5e-4)?"OK":"FAIL");
+                    if(!isfinite(rel)||rel>=5e-4) abort();
+                    free(ref);
+                }
+            }
+        }
     }
     else glm5_mv_bf16(y,(const uint16_t*)t->w,x,rows,cols);
 }
@@ -937,7 +1127,11 @@ static void glm5_kv_init(glm5_model*m){
         if(avail<=0) budget=(long)4<<30;       /* /proc/meminfo unreadable: fall back to 4 GB */
         else {
             glm5_config tiny=*c; tiny.max_pos=128;             /* KV/rope negligible -> ~weights */
-            long reserve=(long)glm5_arena_size(&tiny,m->ep_rank,m->ep_size);
+            /* Converted mixed-IQ blobs are already rank-sliced, and arena_sz is
+             * seeded from the exact blob size before kv_init.  The legacy
+             * estimator assumes BF16 experts and would overstate EP12 by ~5x. */
+            long reserve=m->arena_sz>0?(long)m->arena_sz:
+                         (long)glm5_arena_size(&tiny,m->ep_rank,m->ep_size);
             reserve += (long)c->max_pos*(c->rotary_dim/2)*4*2; /* real rope_cos/sin */
             budget = avail - reserve - avail/10;               /* 10% headroom for scratch/mstream */
             if(budget < (1L<<30)) budget = 1L<<30;             /* floor: at least 1 GB of Tier-A KV */
@@ -1164,7 +1358,19 @@ static glm5_model* glm5_alloc_synth(glm5_config cfg,int ep_rank,int ep_size,int 
 
 /* ===================== real-weight loader (staged blob + manifest) ===================== */
 #include <sys/mman.h>
-typedef struct { char name[300]; uint64_t off; size_t nbytes; int f32; int nd; long shape[5]; } glm5_ent;
+typedef struct { char name[300]; uint64_t off; size_t nbytes; int f32; glm5_qtype qtype; int nd; long shape[5]; } glm5_ent;
+static glm5_qtype glm5_manifest_qtype(const char*s){
+    if(!strcmp(s,"Q8_0"))return GLM5_Q8_0;
+    if(!strcmp(s,"Q2_K"))return GLM5_Q2_K;
+    if(!strcmp(s,"Q3_K"))return GLM5_Q3_K;
+    if(!strcmp(s,"Q4_K"))return GLM5_Q4_K;
+    if(!strcmp(s,"Q5_K"))return GLM5_Q5_K;
+    if(!strcmp(s,"Q6_K"))return GLM5_Q6_K;
+    if(!strcmp(s,"IQ2_XS"))return GLM5_IQ2_XS;
+    if(!strcmp(s,"IQ3_XXS"))return GLM5_IQ3_XXS;
+    if(!strcmp(s,"IQ4_XS"))return GLM5_IQ4_XS;
+    return GLM5_BF16;
+}
 static glm5_ent* glm5_find(glm5_ent*es,int n,const char*nm){ for(int i=0;i<n;i++) if(!strcmp(es[i].name,nm)) return &es[i]; return NULL; }
 static glm5_ent* glm5_req(glm5_ent*es,int n,const char*nm){ glm5_ent*e=glm5_find(es,n,nm); if(!e) fprintf(stderr,"glm5_load: MISSING tensor %s\n",nm); return e; }
 static void glm5_blob_dontneed(const uint8_t*base,uint64_t off,size_t len){
@@ -1220,6 +1426,16 @@ static glm5_tensor glm5_load_w(glm5_ent*es,int n,const uint8_t*base,const char*n
     glm5_ent*we=glm5_find(es,n,name); glm5_ent*se=glm5_find(es,n,sn);
     glm5_ent*pe=glm5_find(es,n,pn); glm5_ent*qe=glm5_find(es,n,qn);
     glm5_tensor t; t.w=NULL; t.scale=NULL; t.type=GLM5_BF16; t.rows=0; t.cols=0; t.qg=0; t.qg0=0;
+    if(we && glm5_is_ggml_q(we->qtype)){
+        int er=we->nd>0?(int)we->shape[0]:Rtot, ec=we->nd>1?(int)we->shape[1]:Ctot;
+        if(mode!=0 || er!=Rtot || ec!=Ctot ||
+           we->nbytes!=(size_t)er*dequant_row_size((uint32_t)we->qtype,ec)){
+            fprintf(stderr,"glm5_load: invalid compressed tensor %s shape=%dx%d bytes=%zu mode=%d\n",
+                    name,er,ec,we->nbytes,mode); *ok=0; return t;
+        }
+        t.w=glm5_cp_full(base,we); t.type=we->qtype; t.rows=er; t.cols=ec;
+        *used+=we->nbytes; return t;
+    }
     /* INT8 (compressed-tensors w8a16): name_packed (int8 bytes [Rtot,Ctot]) + name_scale (bf16
      * [Rtot,ng]); offset-binary q=byte-128, group size gs=Ctot/ng (128 group / =Ctot channel). */
     if(pe && qe){
@@ -1240,8 +1456,12 @@ static glm5_tensor glm5_load_w(glm5_ent*es,int n,const uint8_t*base,const char*n
     }
     if(!we){ fprintf(stderr,"glm5_load: MISSING %s\n",name); *ok=0; return t; }
     int esz = se ? 1 : 2;  t.type = se ? GLM5_MXFP8 : GLM5_BF16;
-    if(mode==0){ t.w=glm5_cp_full(base,we); t.rows=Rtot; t.cols=Ctot; *used+=we->nbytes; }
-    else if(mode==1){ t.w=glm5_cp_rows(base,we,r0,nr,Ctot,esz); t.rows=nr; t.cols=Ctot; *used+=(size_t)nr*Ctot*esz; }
+    int er=we->nd>0?(int)we->shape[0]:Rtot, ec=we->nd>1?(int)we->shape[1]:Ctot;
+    int local_row=(mode==1 && er==nr && ec==Ctot);
+    int local_col=(mode==2 && er==Rtot && ec==nc);
+    if(mode==0 || local_row || local_col){
+        t.w=glm5_cp_full(base,we); t.rows=er; t.cols=ec; *used+=we->nbytes;
+    } else if(mode==1){ t.w=glm5_cp_rows(base,we,r0,nr,Ctot,esz); t.rows=nr; t.cols=Ctot; *used+=(size_t)nr*Ctot*esz; }
     else { t.w=glm5_cp_cols(base,we,Rtot,c0,nc,Ctot,esz); t.rows=Rtot; t.cols=nc; *used+=(size_t)Rtot*nc*esz; }
     if(se){
         if(!se->f32){ fprintf(stderr,"glm5_load: FP8 scale_inv %s is not F32\n",sn); *ok=0; return t; }
@@ -1351,22 +1571,31 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     else { const char*e=getenv("GLM5_STAGE_DIR"); snprintf(bdir,sizeof bdir,"%s",(e&&*e)?e:"/local/glm5"); }
     char bp[1100],mp[1100]; snprintf(bp,sizeof bp,"%s/rank%02d.blob",bdir,ep_rank); snprintf(mp,sizeof mp,"%s/rank%02d.manifest",bdir,ep_rank);
     FILE*mf=fopen(mp,"r"); if(!mf){ fprintf(stderr,"glm5_load: cannot open %s\n",mp); return NULL; }
-    char line[1024]; int cap=4096,n=0; glm5_ent*es=glm5_amalloc((size_t)cap*sizeof(glm5_ent));
+    char line[1024]; int cap=4096,n=0,glm52_manifest=0; glm5_ent*es=glm5_amalloc((size_t)cap*sizeof(glm5_ent));
     while(fgets(line,sizeof line,mf)){
-        if(line[0]=='#'||line[0]=='\n') continue;
+        if(line[0]=='#'){ if(strstr(line,"glm52-a64fx-ep12-v1"))glm52_manifest=1; continue; }
+        if(line[0]=='\n') continue;
         if(n>=cap){ cap*=2; es=realloc(es,(size_t)cap*sizeof(glm5_ent)); }
         glm5_ent*e=&es[n]; char dt[32]; int pos=0,cnt;
         if(sscanf(line,"%llu %zu %31s %d%n",(unsigned long long*)&e->off,&e->nbytes,dt,&e->nd,&cnt)!=4) continue;
-        pos=cnt; e->f32=(dt[0]=='F'&&dt[1]=='3'); for(int d=0;d<e->nd&&d<5;d++){ long v; int c2; sscanf(line+pos," %ld%n",&v,&c2); e->shape[d]=v; pos+=c2; }
+        pos=cnt; e->f32=(dt[0]=='F'&&dt[1]=='3'); e->qtype=glm5_manifest_qtype(dt);
+        for(int d=0;d<e->nd&&d<5;d++){ long v; int c2; sscanf(line+pos," %ld%n",&v,&c2); e->shape[d]=v; pos+=c2; }
         while(line[pos]==' ')pos++; char*nl=strchr(line+pos,'\n'); if(nl)*nl=0; snprintf(e->name,sizeof e->name,"%s",line+pos); n++;
     }
     fclose(mf);
     int bfd=open(bp,O_RDONLY); if(bfd<0){ fprintf(stderr,"glm5_load: cannot open %s\n",bp); glm5_afree(es); return NULL; }
     struct stat sb; fstat(bfd,&sb); size_t bsz=sb.st_size;
+    for(int i=0;i<n;i++) if(es[i].off>bsz || es[i].nbytes>bsz-es[i].off){
+        fprintf(stderr,"glm5_load: manifest tensor %s exceeds blob (%llu+%zu > %zu)\n",
+                es[i].name,(unsigned long long)es[i].off,es[i].nbytes,bsz);
+        close(bfd); glm5_afree(es); return NULL;
+    }
     const uint8_t*base=mmap(NULL,bsz,PROT_READ,MAP_PRIVATE,bfd,0);
     if(base==MAP_FAILED){ fprintf(stderr,"glm5_load: mmap failed\n"); close(bfd); glm5_afree(es); return NULL; }
 
-    glm5_model*m=glm5_acalloc(1,sizeof(glm5_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=GLM5_BF16; m->owns_weights=1; glm5_kv_init(m);
+    glm5_model*m=glm5_acalloc(1,sizeof(glm5_model)); m->cfg=cfg; m->ep_rank=ep_rank; m->ep_size=ep_size; m->n_threads=n_threads; m->n_cmgs=n_cmgs; m->bf16_mv_qt=GLM5_BF16; m->owns_weights=1;
+    if(glm52_manifest) m->arena_sz=bsz; /* exact compressed/rank-sliced weight reserve for KV tiering */
+    glm5_kv_init(m);
     const int H=cfg.hidden, QD=glm5_q_dim(&cfg), AD=glm5_attn_dim(&cfg);
     const int KVC=glm5_kv_cache_dim(&cfg), VD=cfg.v_head_dim, QHD=cfg.qk_head_dim;
     const int IQD=glm5_idx_q_dim(&cfg), ID=cfg.index_dim, half=cfg.qk_rope_dim/2;
@@ -1385,8 +1614,14 @@ static glm5_model* glm5_load_real(glm5_config cfg,int ep_rank,int ep_size,const 
     for(int p=0;p<cfg.max_pos;p++) for(int k=0;k<half;k++){ double invf=pow((double)cfg.rope_theta,-2.0*k/(double)cfg.rotary_dim),a=p*invf;
         m->rope_cos[(size_t)p*half+k]=(float)cos(a); m->rope_sin[(size_t)p*half+k]=(float)sin(a); }
 
-    { glm5_ent*e=REQ("model.embed_tokens.weight"); if(e){ m->embed=glm5_cp_rows(base,e,er0,erows,H,2); used+=(size_t)erows*H*2; } m->emb_r0=er0; m->emb_rows=erows; }
-    { glm5_ent*e=REQ("lm_head.weight"); if(e){ m->head.w=glm5_cp_rows(base,e,hr0,hrows,H,2); used+=(size_t)hrows*H*2; } m->head.type=GLM5_BF16; m->head.rows=hrows; m->head.cols=H; m->head_r0=hr0; }
+    { glm5_ent*e=REQ("model.embed_tokens.weight"); if(e){
+        if(e->nd>=2&&e->shape[0]==erows&&e->shape[1]==H) m->embed=glm5_cp_full(base,e);
+        else m->embed=glm5_cp_rows(base,e,er0,erows,H,2);
+        used+=(size_t)erows*H*2; } m->emb_r0=er0; m->emb_rows=erows; }
+    { glm5_ent*e=REQ("lm_head.weight"); if(e){
+        if(e->nd>=2&&e->shape[0]==hrows&&e->shape[1]==H) m->head.w=glm5_cp_full(base,e);
+        else m->head.w=glm5_cp_rows(base,e,hr0,hrows,H,2);
+        used+=(size_t)hrows*H*2; } m->head.type=GLM5_BF16; m->head.rows=hrows; m->head.cols=H; m->head_r0=hr0; }
     { glm5_ent*e=REQ("model.norm.weight"); if(e) m->out_norm=glm5_cp_full(base,e); }
 
     m->layers=glm5_acalloc(cfg.n_layers,sizeof(glm5_layer));
@@ -2376,6 +2611,35 @@ static void glm5_gemm_int8sdot_rb(glm5_model*m, float*restrict Y, const uint8_t*
 #endif
     free(Xq); free(xsc);
 }
+static void glm5_gemm_ggml(float*restrict Y,const glm5_tensor*t,const float*X,
+                           int N,int rows,int cols){
+    if(N<=1){ glm5_mv_ggml(Y,t,X,rows,cols); return; }
+    const size_t rb=dequant_row_size((uint32_t)t->type,cols);
+    if(!rb){ for(size_t i=0;i<(size_t)N*rows;i++)Y[i]=NAN; return; }
+#ifdef _OPENMP
+    #pragma omp parallel if((long)rows*cols>=GLM5_PAR_MIN)
+    {
+        float*tmp=malloc((size_t)cols*4);
+        #pragma omp for schedule(static)
+        for(int r=0;r<rows;r++){
+            const uint8_t*src=(const uint8_t*)t->w+(size_t)r*rb;
+            int bad=!tmp||dequant_row((uint32_t)t->type,src,tmp,cols);
+            for(int n=0;n<N;n++) Y[(size_t)n*rows+r]=bad?NAN:
+                glm5_dot_f32_f32(tmp,X+(size_t)n*cols,cols);
+        }
+        free(tmp);
+    }
+#else
+    float*tmp=malloc((size_t)cols*4);
+    for(int r=0;r<rows;r++){
+        const uint8_t*src=(const uint8_t*)t->w+(size_t)r*rb;
+        int bad=!tmp||dequant_row((uint32_t)t->type,src,tmp,cols);
+        for(int n=0;n<N;n++) Y[(size_t)n*rows+r]=bad?NAN:
+            glm5_dot_f32_f32(tmp,X+(size_t)n*cols,cols);
+    }
+    free(tmp);
+#endif
+}
 /* batched GEMM dispatch by weight type */
 static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const float*X, int N, int rows, int cols){
     if(t->type==GLM5_MXFP8) glm5_gemm_mxfp8(m,Y,(const uint8_t*)t->w,t->scale,X,N,rows,cols);
@@ -2403,6 +2667,7 @@ static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const
         if(use_sdot && N>1) glm5_gemm_int8sdot_rb(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,X,N,rows,cols);  /* register-blocked (~3x the old glm5_gemm_int8_sdot) */
         else glm5_gemm_int8(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,X,N,rows,cols);
     }
+    else if(glm5_is_ggml_q(t->type)) glm5_gemm_ggml(Y,t,X,N,rows,cols);
     else glm5_gemm_bf16(Y,(const uint16_t*)t->w,X,N,rows,cols);
 }
 static int glm5_gemm_sdot_override(glm5_model*m, float*restrict Y, const glm5_tensor*t, const float*X, int N, int rows, int cols, int mode){
@@ -2434,6 +2699,12 @@ static inline float glm5_tensor_get(const glm5_model*m,const glm5_tensor*t,int r
         const uint8_t*w=(const uint8_t*)t->w; const float*sc=(const float*)t->scale; int sb=(t->qg0+t->cols+t->qg-1)/t->qg;
         return (float)((int)w[(size_t)r*t->cols+c]-128) * sc[(size_t)r*sb + (t->qg0+c)/t->qg];
     }
+    if(glm5_is_ggml_q(t->type)){
+        size_t rb=dequant_row_size((uint32_t)t->type,t->cols);
+        float*tmp=malloc((size_t)t->cols*4); if(!tmp)return NAN;
+        int bad=dequant_row((uint32_t)t->type,(const uint8_t*)t->w+(size_t)r*rb,tmp,t->cols);
+        float v=bad?NAN:tmp[c]; free(tmp); return v;
+    }
     return glm5_bf2f(((const uint16_t*)t->w)[(size_t)r*t->cols+c]);
 }
 static glm5_tensor glm5_tensor_rows(const glm5_tensor*t,int r0,int rows){
@@ -2444,6 +2715,8 @@ static glm5_tensor glm5_tensor_rows(const glm5_tensor*t,int r0,int rows){
     } else if(t->type==GLM5_INT8){
         u.w=(uint8_t*)t->w+(size_t)r0*t->cols;
         u.scale=t->scale+(size_t)r0*((t->qg0+t->cols+t->qg-1)/t->qg)*4;   /* f32 scale, bytes */
+    } else if(glm5_is_ggml_q(t->type)){
+        u.w=(uint8_t*)t->w+(size_t)r0*dequant_row_size((uint32_t)t->type,t->cols);
     } else u.w=(uint16_t*)t->w+(size_t)r0*t->cols;
     return u;
 }
