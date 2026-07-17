@@ -35,6 +35,8 @@
 #define GLM5_IMPL_H
 
 #include "glm5.h"
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "glm5_mxfp8.h"   /* FP8 E4GLM5 + E8M0 per-32 block scale matvec */
 #include "glm5_int8.h"    /* INT8 w8a16 (offset-binary, per-row group/channel f32 scale) matvec */
 #ifdef _OPENMP
@@ -1877,10 +1879,35 @@ static void glm5_blob_dontneed(const uint8_t*base,uint64_t off,size_t len){
     if(bb>aa) madvise((void*)aa,bb-aa,MADV_DONTNEED);
 }
 /* copy helpers from the blob mmap (base); return malloc'd buffer (caller frees). */
-static void* glm5_cp_full(const uint8_t*base,const glm5_ent*e){ void*d=glm5_amalloc(e->nbytes); memcpy(d,base+e->off,e->nbytes); glm5_blob_dontneed(base,e->off,e->nbytes); return d; }
+/* PARALLEL copy = NUMA placement.  glm5_amalloc hands back fresh (unfaulted) pages, so whichever
+ * thread first WRITES a page decides which CMG's HBM it lives on.  A single-threaded memcpy put
+ * every weight on ONE CMG (measured: an entire IQ expert 27/27 pages on node6), which is why the
+ * runner needed a process-wide MPOL_INTERLEAVE to spread them -- at the cost of making ~75% of
+ * every read remote.  Copying in parallel over byte chunks (rows are contiguous, so this is a row
+ * split) places each thread's slice on its own CMG, matching how the decode workers later read it.
+ * Byte-identical to memcpy. */
+static void glm5_pmemcpy(void*restrict dst,const void*restrict src,size_t n){
+#ifdef _OPENMP
+    if(n>=(size_t)(1u<<20)){
+        #pragma omp parallel
+        {
+            int tid=omp_get_thread_num(), nt=omp_get_num_threads();
+            size_t per=(n+(size_t)nt-1)/(size_t)nt;
+            /* align chunk starts to 256 B so threads never share a store buffer / partial vector */
+            size_t a=(size_t)tid*per, b=a+per>n?n:a+per;
+            a=(a+255)&~(size_t)255; if(tid==0) a=0;
+            b=(b+255)&~(size_t)255; if(b>n) b=n;
+            if(b>a) memcpy((char*)dst+a,(const char*)src+a,b-a);
+        }
+        return;
+    }
+#endif
+    memcpy(dst,src,n);
+}
+static void* glm5_cp_full(const uint8_t*base,const glm5_ent*e){ void*d=glm5_amalloc(e->nbytes); glm5_pmemcpy(d,base+e->off,e->nbytes); glm5_blob_dontneed(base,e->off,e->nbytes); return d; }
 static void* glm5_cp_rows(const uint8_t*base,const glm5_ent*e,int r0,int nrows,int cols,int esz){
     size_t rb=(size_t)cols*esz, off=e->off+(size_t)r0*rb, nb=(size_t)nrows*rb;
-    void*d=glm5_amalloc(nb); memcpy(d,base+off,nb); glm5_blob_dontneed(base,off,nb); return d; }
+    void*d=glm5_amalloc(nb); glm5_pmemcpy(d,base+off,nb); glm5_blob_dontneed(base,off,nb); return d; }
 static void* glm5_cp_cols(const uint8_t*base,const glm5_ent*e,int Rtot,int c0,int ncols,int Ctot,int esz){
     void*d=glm5_amalloc((size_t)Rtot*ncols*esz); uint8_t*dp=d; const uint8_t*sp=base+e->off;
     for(int r=0;r<Rtot;r++) memcpy(dp+(size_t)r*ncols*esz, sp+((size_t)r*Ctot+c0)*esz, (size_t)ncols*esz);
@@ -2206,6 +2233,28 @@ static int glm5_tensor_bf16_to_i8(glm5_tensor*t,int gs){
     t->type=GLM5_INT8; t->qg=gs; t->qg0=0;
     return 1;
 }
+/* GLM5_NUMA_DBG=1: report the ACTUAL NUMA page placement of a converted weight tensor.
+ * The in-run dense GEMV runs at ~166 GB/s = almost exactly one CMG's bandwidth, while the
+ * same kernel/shape does 407 cold in a native bench -> is the tensor spread over the 4 CMG
+ * nodes (4..7 on A64FX; 0..3 are assistant-core nodes) or concentrated on one? */
+static void glm5_numa_report(const char*tag,const void*p,size_t n){
+#if defined(__linux__) && defined(SYS_move_pages)
+    long ps=sysconf(_SC_PAGESIZE); int np=(int)(n/ps); if(np>2048) np=2048; if(np<1) return;
+    void**pg=malloc((size_t)np*sizeof(void*)); int*st=malloc((size_t)np*sizeof(int));
+    if(!pg||!st){ free(pg); free(st); return; }
+    for(int i=0;i<np;i++) pg[i]=(char*)p+(size_t)i*ps;
+    long rc=syscall(SYS_move_pages,0,np,pg,NULL,st,0);
+    if(rc==0){ int h[9]={0}; for(int i=0;i<np;i++){ int v=st[i]; if(v>=0&&v<8) h[v]++; else h[8]++; }
+        fprintf(stderr,"[numa] %s %zu MB: ",tag,n>>20);
+        for(int i=0;i<8;i++) if(h[i]) fprintf(stderr,"node%d=%d ",i,h[i]);
+        if(h[8]) fprintf(stderr,"unmapped/err=%d ",h[8]);
+        fprintf(stderr,"(of %d pages, %ld KB/page)\n",np,ps>>10);
+    } else fprintf(stderr,"[numa] %s move_pages failed errno=%d\n",tag,errno);
+    free(pg); free(st);
+#else
+    (void)tag;(void)p;(void)n;
+#endif
+}
 static void glm5_dense_i8_convert(glm5_model*m){
     if(!glm5_envi("GLM5_DENSE_I8",0)) return;
     int gs=glm5_envi("GLM5_DENSE_I8_GS",64), n=0;
@@ -2222,6 +2271,17 @@ static void glm5_dense_i8_convert(glm5_model*m){
     }
     n+=glm5_tensor_bf16_to_i8(&m->head,gs)>0;
     if(m->ep_rank==0) fprintf(stderr,"glm5: dense bf16->int8 g=%d converted %d tensors\n",gs,n);
+    if(m->ep_rank==0 && glm5_envi("GLM5_NUMA_DBG",0)){
+        int nthr_at_convert=1;
+#ifdef _OPENMP
+        nthr_at_convert=omp_get_max_threads();
+#endif
+        fprintf(stderr,"[numa] omp_get_max_threads at convert = %d\n",nthr_at_convert);
+        glm5_numa_report("L3.wq_a",m->layers[3].wq_a.w,(size_t)m->layers[3].wq_a.rows*m->layers[3].wq_a.cols);
+        glm5_numa_report("L3.wkv_a",m->layers[3].wkv_a.w,(size_t)m->layers[3].wkv_a.rows*m->layers[3].wkv_a.cols);
+        if(m->layers[3].ex_w1) glm5_numa_report("L3.ex_w1[0](IQ,not converted)",m->layers[3].ex_w1[0].w,
+            dequant_row_size((uint32_t)m->layers[3].ex_w1[0].type,m->layers[3].ex_w1[0].cols)*(size_t)m->layers[3].ex_w1[0].rows);
+    }
 }
 
 /* Phase 2: re-slice this rank's TP-sharded DENSE weights for a new ep (after a group merge), reading

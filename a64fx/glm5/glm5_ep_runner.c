@@ -955,6 +955,12 @@ static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefi
  * wrapper is needed. OMP thread affinity is read by the runtime at init, so the launch script still
  * exports OMP_PROC_BIND=close / OMP_PLACES=cores (best-effort setenv here as a fallback). Default ON. */
 static void glm5_apply_numa(int on){
+    /* Thread pinning is NOT optional and must not ride on the interleave flag: first-touch
+     * placement is only meaningful if a thread stays on one CMG.  (Previously the `if(!on)
+     * return` below skipped these too, so GLM5_NUMA=0 silently unpinned the threads and
+     * scattered placement.) */
+    setenv("OMP_PROC_BIND","close",0);           /* 0 = don't override if the script already set it */
+    setenv("OMP_PLACES","cores",0);
     if(!on) return;
     /* Interleave over the NUMA nodes that hold OUR cpus only.  On A64FX nodes 0-3 are the
      * tiny assistant-core nodes (~700 MB each); a ~0UL mask makes the kernel round-robin
@@ -985,8 +991,6 @@ static void glm5_apply_numa(int on){
     }
     if(!nodemask) nodemask=~0UL;
     syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &nodemask, (unsigned long)(8*sizeof nodemask));
-    setenv("OMP_PROC_BIND","close",0);           /* 0 = don't override if the script already set it */
-    setenv("OMP_PLACES","cores",0);
 }
 static void glm5_cli_usage(void){
     fprintf(stderr,
@@ -1005,7 +1009,12 @@ static void glm5_cli_usage(void){
       "  --real N            GLM5_REAL             --set KEY=VAL  set any GLM5_* var\n");
 }
 static void glm5_cli(int argc,char**argv){
-    int numa=1;
+    /* GLM5_NUMA=0 disables the process-wide MPOL_INTERLEAVE.  That interleave dates from the
+     * XOS *prepage* era, when first-touch put every weight page on the allocating thread's CMG
+     * (1 CMG = ~94 GB/s) so round-robin was a 1.40x win.  Under demand paging (the launcher's
+     * default since 2026-07-16) first-touch places each thread's rows on ITS OWN CMG, and the
+     * interleave instead forces ~75% of every read across the CMG ring. */
+    int numa=envi("GLM5_NUMA",1);
     for(int i=1;i<argc;i++){
         char*a=argv[i]; if(strncmp(a,"--",2)) continue; a+=2;
         char*eq=strchr(a,'='); char*val=NULL;

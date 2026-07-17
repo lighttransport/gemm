@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <sys/mman.h>
 #if defined(__linux__)
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -26,7 +28,12 @@
 #define GLM5_NUMA_THRESH (1u<<20)      /* interleave allocations >= 1 MiB */
 
 #if defined(__linux__) && defined(SYS_mbind)
-/* best-effort MPOL_INTERLEAVE(=3) across all NUMA nodes; page-granular, non-fatal. */
+/* best-effort MPOL_INTERLEAVE(=3) across all NUMA nodes; page-granular, non-fatal.
+ * NOTE (measured 2026-07-17): this ALWAYS fails with EINVAL - a ~0UL mask sets bits for
+ * nodes 8..63 that do not exist, and the kernel rejects any nodemask outside N_MEMORY.
+ * It has therefore never done anything; placement has always been pure first-touch.
+ * Kept (harmless) only so the call site's intent is documented; the real placement lever
+ * is glm5_fresh_pages() below + the runner's process-wide policy (--numa / GLM5_NUMA). */
 static inline void glm5_numa_interleave(void *p, size_t n){
     static int off=-1; if(off<0) off = getenv("GLM5_NO_NUMA") ? 1 : 0; if(off) return;
     unsigned long mask=~0UL;   /* all nodes; kernel intersects with this task's allowed set */
@@ -35,6 +42,26 @@ static inline void glm5_numa_interleave(void *p, size_t n){
 #else
 static inline void glm5_numa_interleave(void *p, size_t n){ (void)p; (void)n; }
 #endif
+
+/* Drop any pages glibc handed us that are ALREADY resident, so the caller's (parallel) first
+ * touch actually decides NUMA placement.
+ *
+ * Why this exists: after the loader has faulted in tens of GB, malloc serves large blocks by
+ * REUSING heap pages that the single-threaded loader already touched -> they sit on ONE CMG,
+ * and re-touching resident pages cannot move them.  Measured: L3.wq_a was 192/192 pages on
+ * node6 even though glm5_tensor_bf16_to_i8 writes it with `omp parallel for` over 47 threads.
+ * MADV_DONTNEED on private anonymous memory unmaps the pages (next touch re-faults, zeroed),
+ * which is exactly what we want for a buffer we are about to overwrite completely.
+ * Only the page-aligned interior is dropped, so partial edge pages keep their contents --
+ * callers must treat the block as uninitialized (all of them do: they fill it right after).
+ * Non-fatal and page-size agnostic (A64FX/XOS uses 64 KB pages). */
+/* NOT DONE, and here is why (measured 2026-07-17): MADV_DONTNEED'ing the interior here to force
+ * a fresh parallel first touch changed nothing, because the runner's process-wide
+ * set_mempolicy(MPOL_INTERLEAVE) (glm5_apply_numa, --numa default ON) decides placement at fault
+ * time regardless.  A 2x2 of {XOS prepage,demand} x {interleave,first-touch} showed interleave
+ * wins both paging modes (qa+kva 97 us either way) and first-touch loses (107-178 us), because
+ * sub-threshold tensors (wkv_a 3.5 MB, every IQ expert ~1.6 MB) still land wholly on one CMG.
+ * See GLM52_Q2_12N.md section 12. */
 
 /* 256-aligned allocation; size rounded up to the alignment (aligned_alloc requirement). */
 static inline void *glm5_amalloc(size_t n){
