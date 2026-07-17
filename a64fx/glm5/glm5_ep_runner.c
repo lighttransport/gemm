@@ -1374,10 +1374,15 @@ int main(int argc,char**argv){
                 spec_verify=0;
             }
         }
+        double tl_emb=0,tl_fw=0,tl_nan=0,tl_mtp=0;   /* GLM5_TOK_TRACE: where the token loop's wall goes */
         if(!spec_verify){
             for(int g=ng;g<max_new;g++){ gen[ng++]=cur; if((cur==GLM5_EOS_ID0||cur==GLM5_EOS_ID1||cur==GLM5_EOS_ID2) && ng>=min_new) break;
                 m->samp_hist=gen; m->samp_hist_n=ng;   /* repetition penalty over tokens so far */
-                embed_lookup(m,cur,x); cur=glm5_forward_token(m,x,n_prompt+g);
+                double tt0=now_sec();
+                embed_lookup(m,cur,x);
+                double tt1=now_sec(); tl_emb+=tt1-tt0;
+                cur=glm5_forward_token(m,x,n_prompt+g);
+                double tt2=now_sec(); tl_fw+=tt2-tt1;
                 if(mtp_on){
                     if(prev_draft>=0){ mtp_tot++; if(prev_draft==cur) mtp_hit++;
                         if(MyRank==0 && mtp_tot<=10 && envi("GLM5_MTP_DBG",0))
@@ -1386,9 +1391,17 @@ int main(int argc,char**argv){
                     }
                     prev_draft=glm5_mtp_draft(m,x,cur,n_prompt+g+1,xb);  /* draft the token at n_prompt+g+2 */
                 }
-                for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++; }
+                double tt3=now_sec(); tl_mtp+=tt3-tt2;
+                for(int i=0;i<C;i++) if(!(x[i]==x[i])) nan++;
+                tl_nan+=now_sec()-tt3; }
         }
         double td=now_sec()-td0;
+        if(MyRank==0 && envi("GLM5_TOK_TRACE",0) && ng>0)
+            logmsg("[tok-trace] ms/tok: embed %.2f | forward_token %.2f | mtp %.2f | nan %.2f | loop-total %.2f\n"
+                   "[tok-trace] layers: wall %.2f ms/tok | buckets-in-layer %.2f ms/tok | UNBUCKETED-IN-LAYER %.2f ms/tok (%.1f us/layer over %ld)\n",
+                   tl_emb*1e3/ng, tl_fw*1e3/ng, tl_mtp*1e3/ng, tl_nan*1e3/ng, td*1e3/ng,
+                   glm5_lay_wall*1e3/ng, glm5_lay_buck*1e3/ng, (glm5_lay_wall-glm5_lay_buck)*1e3/ng,
+                   glm5_lay_n?(glm5_lay_wall-glm5_lay_buck)*1e6/glm5_lay_n:0.0, glm5_lay_n);
         double mtp_alpha=mtp_tot?(double)mtp_hit/mtp_tot:0.0;
         double gen_d_ar=g_ar_secs; long gen_d_calls=g_ar_calls, gen_d_frags=g_ar_frags;
         prof_snapshot(m,prof_gen_dec);

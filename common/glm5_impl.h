@@ -67,6 +67,10 @@ static inline void glm5_shard_shared_inter(int total,int rank,int size,int*r0,in
 }
 static inline double glm5_prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static inline void glm5_prof_add(glm5_model*m,int phase,double t0){ m->prof[phase]+=glm5_prof_now()-t0; }
+/* GLM5_TOK_TRACE=1: per-layer wall vs the buckets accumulated inside it.  This is what
+ * exposed the route-AR profiling hole (14.5 ms/tok, 24% of the step, in no bucket). */
+static double glm5_lay_wall=0, glm5_lay_buck=0; static long glm5_lay_n=0;
+static int glm5_tok_trace(void){ static int v=-1; if(v<0) v=glm5_envi("GLM5_TOK_TRACE",0); return v; }
 
 #if defined(GLM5_USE_FAPP) && GLM5_USE_FAPP
 extern void fapp_start(const char*, int, int) __attribute__((weak));
@@ -2575,6 +2579,8 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
         const int tp_attn=(arows<AD);
         const float*cosp=&m->rope_cos[(size_t)pos*half], *sinp=&m->rope_sin[(size_t)pos*half];
         double pt=glm5_prof_now();
+        double lay_t0=pt;   /* GLM5_TOK_TRACE: whole-layer wall, to diff against the buckets */
+        double lay_b0=0; if(glm5_tok_trace()) for(int pi=0;pi<GLM5_NPHASE;pi++) lay_b0+=m->prof[pi];
         /* fused phase-1/2 accept all-BF16 or all-INT8 dense (GLM5_DENSE_I8=1); int8 uses
          * ONE hoisted a16 activation quant per stage instead of per-GEMV (the run-E trap) */
         const int p1bf=L->wq_a.type==GLM5_BF16 && L->wkv_a.type==GLM5_BF16
@@ -2915,8 +2921,16 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             m->prof[GLM5_P_ROUTER]+=tr-pt; m->prof[GLM5_P_EXPERTS]+=te-tr;
             glm5_prof_add(m,GLM5_P_SHARED,te);
             GLM5_FAPP_STOP("glm5_dec_p2_fused");
+            /* The route all-reduce is the single largest item in the decode token (~186 us/layer,
+             * ~24% of the step) and used to land OUTSIDE every bucket: wall-vs-buckets showed a
+             * 14.5 ms/tok hole.  Attribute it to P_ROUTE_AR. */
+            double t_rar=glm5_prof_now();
             if(m->ar_cb) m->ar_cb(route,H,m->ar_ctx);          /* EP-sum routed (+ shared if TP) */
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if(H>=GLM5_PAR_MIN)
+#endif
             for(int i=0;i<H;i++) x[i]+=route[i] + (tp_sh?0.0f:m->s_sh[i]);
+            glm5_prof_add(m,GLM5_P_ROUTE_AR,t_rar);
             static int nt_env2=-1; if(nt_env2<0) nt_env2=glm5_envi("GLM5_NAN_TRACE",0);
             if(nt_env2){
                 static int nt2_once=0;
@@ -2987,6 +3001,9 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             GLM5_FAPP_STOP("glm5_dec_dense_ffn");
             glm5_prof_add(m,GLM5_P_DENSE_FFN,pt);
         }
+        /* GLM5_TOK_TRACE: layer wall vs the buckets accumulated inside this layer */
+        if(glm5_tok_trace()){ double b1=0; for(int pi=0;pi<GLM5_NPHASE;pi++) b1+=m->prof[pi];
+                  glm5_lay_wall+=glm5_prof_now()-lay_t0; glm5_lay_buck+=b1-lay_b0; glm5_lay_n++; }
     }
     /* head: vocab-shard partial logits -> (TP_HEAD) global argmax via ar_argmax, else full */
     double pt=glm5_prof_now();
@@ -4981,6 +4998,9 @@ static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X
     m->prof[GLM5_P_QKV]+=tq-pt; m->prof[GLM5_P_ATTN]+=ta-tq;
     if(tp_attn && m->ar_cb) m->ar_cb(ms->o,M*H,m->ar_ctx);
     if(bdtr) bt[8]=glm5_prof_now();
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
+#endif
     for(size_t i=0;i<(size_t)M*H;i++) X[i]+=ms->o[i];
     glm5_prof_add(m,GLM5_P_OPROJ,ta);
     /* ---- phase 2: router -> experts -> shared -> route AR ---- */
@@ -5092,11 +5112,21 @@ static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X
         glm5_i16g_worker(&sh2j,tid,nt);
     }
     m->prof[GLM5_P_ROUTER]+=tr-pt; m->prof[GLM5_P_EXPERTS]+=te-tr;
+    glm5_prof_add(m,GLM5_P_SHARED,te);        /* shared expert only; the AR is its own phase */
     if(bdtr) bt[12]=glm5_prof_now();
-    if(tp_sh) for(size_t i=0;i<(size_t)M*H;i++) ms->route[i]+=ms->tmp2[i];
+    double t_rar=glm5_prof_now();
+    if(tp_sh){
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
+#endif
+        for(size_t i=0;i<(size_t)M*H;i++) ms->route[i]+=ms->tmp2[i];
+    }
     if(m->ar_cb) m->ar_cb(ms->route,M*H,m->ar_ctx);
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((long)M*H>=GLM5_PAR_MIN)
+#endif
     for(size_t i=0;i<(size_t)M*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
-    glm5_prof_add(m,GLM5_P_SHARED,te);
+    glm5_prof_add(m,GLM5_P_ROUTE_AR,t_rar);
     if(bdtr){
         double e=glm5_prof_now();
         bdt[0]+=bt[1]-bt[0];  bdt[1]+=bt[2]-bt[1];  bdt[2]+=bt[3]-bt[2];  bdt[3]+=bt[4]-bt[3];

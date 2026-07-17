@@ -419,11 +419,11 @@ typedef struct {
 /* phase ids for glm5_model.prof[] */
 enum { GLM5_P_QKV=0, GLM5_P_QKNORM=1, GLM5_P_ROPE=2, GLM5_P_MSA_INDEX=3, GLM5_P_ATTN=4,
        GLM5_P_OPROJ=5, GLM5_P_ROUTER=6, GLM5_P_EXPERTS=7, GLM5_P_SHARED=8, GLM5_P_DENSE_FFN=9,
-       GLM5_P_HEAD=10, GLM5_P_OTHER=11 };
+       GLM5_P_HEAD=10, GLM5_P_OTHER=11, GLM5_P_ROUTE_AR=12 };
 #define GLM5_NPHASE 16
 static const char *glm5_prof_names[GLM5_NPHASE] = {
     "qkv_proj","qk_norm","rope","msa_index","attn","o_proj","router","experts",
-    "shared","dense_ffn","head","other","-","-","-","-" };
+    "shared","dense_ffn","head","other","route_ar","-","-","-" };
 
 /* CP slot mapping: block b=pos/cp_block owned by rank b%ep_size; owner stores it at a local
  * slot packed over its owned blocks. When cp_on==0 every rank stores all positions (slot==pos). */
