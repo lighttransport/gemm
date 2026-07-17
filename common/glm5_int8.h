@@ -157,16 +157,19 @@ static inline void glm5_matvec_int16sdot_8row(float*restrict dst,
     svfloat64_t a0=svdup_f64(0),a1=svdup_f64(0),a2=svdup_f64(0),a3=svdup_f64(0);
     svfloat64_t a4=svdup_f64(0),a5=svdup_f64(0),a6=svdup_f64(0),a7=svdup_f64(0);
     double bc0=0,bc1=0,bc2=0,bc3=0,bc4=0,bc5=0,bc6=0,bc7=0;
+    const int fast_g64=gs==64 && (qg0&63)==0 && (cols&63)==0;
     for(int b=0;b<cols;){
-        int blk=(qg0+b)/gs, bend=(blk+1)*gs-qg0; if(bend>cols)bend=cols; int c=b;
-        /* cold-stream prefetch: decode visits each weight row once per token; the 8 short
-         * per-row streams under-run the HW prefetcher (~157 GB/s effective vs 433 hot).
-         * One PRFM per row per group block (64 B/row advance), ~1 KB ahead. */
-        if(b+1024<cols){
-            __builtin_prefetch(&w0[b+1024]); __builtin_prefetch(&w1[b+1024]);
-            __builtin_prefetch(&w2[b+1024]); __builtin_prefetch(&w3[b+1024]);
-            __builtin_prefetch(&w4[b+1024]); __builtin_prefetch(&w5[b+1024]);
-            __builtin_prefetch(&w6[b+1024]); __builtin_prefetch(&w7[b+1024]);
+        int blk=fast_g64?(qg0+b)>>6:(qg0+b)/gs;
+        int bend=fast_g64?b+64:(blk+1)*gs-qg0; if(bend>cols)bend=cols; int c=b;
+        /* A64FX cache lines are 256 B.  On the production group-64 path, issue one
+         * hint per cache line, 512 B ahead, instead of four redundant per-group hints.
+         * The generic path retains the established schedule for unusual group layouts. */
+        int pdist=fast_g64?512:1024;
+        if(b+pdist<cols && (!fast_g64 || (b&255)==0)){
+            __builtin_prefetch(&w0[b+pdist]); __builtin_prefetch(&w1[b+pdist]);
+            __builtin_prefetch(&w2[b+pdist]); __builtin_prefetch(&w3[b+pdist]);
+            __builtin_prefetch(&w4[b+pdist]); __builtin_prefetch(&w5[b+pdist]);
+            __builtin_prefetch(&w6[b+pdist]); __builtin_prefetch(&w7[b+pdist]);
         }
         svint64_t d0=svdup_s64(0),d1=svdup_s64(0),d2=svdup_s64(0),d3=svdup_s64(0);
         svint64_t d4=svdup_s64(0),d5=svdup_s64(0),d6=svdup_s64(0),d7=svdup_s64(0);
