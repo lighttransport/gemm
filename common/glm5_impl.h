@@ -3144,46 +3144,87 @@ static void glm5_gemm_bf16(float*restrict Y, const uint16_t*W, const float*X, in
     }
     int nb=rows/8, TILE=512; if(TILE>cols)TILE=cols;
     static int tok=-1; if(tok<0){ tok=glm5_envi("GLM5_BF16_GEMM_TOK",3); if(tok!=3&&tok!=4&&tok!=5) tok=3; }
+    /* Small TP output shards expose fewer 8-row blocks than hardware threads
+     * (shared gate/up: 128/256 scale-aligned rows, or 170/171 even rows, on
+     * 48 cores).  Split the token range as a second work dimension.  This
+     * repeats the small BF16 weight
+     * shard across splits, but for large-N prefill it restores core occupancy
+     * while the shard remains cache-resident.  0 disables; a positive value
+     * forces that many token splits; unset selects just enough for one task
+     * per thread, capped at four. */
+    int split=1;
+#ifdef _OPENMP
+    static int split_mode=-2;
+    if(split_mode==-2){ const char*e=getenv("GLM5_BF16_GEMM_SPLIT"); split_mode=(e&&*e)?atoi(e):-1; }
+    int nth=omp_get_max_threads();
+    if(split_mode!=0 && N>=16 && nb>0 && nb<nth){
+        if(split_mode>0) split=split_mode;
+        else {
+            /* Static scheduling makes partially filled second waves costly.
+             * Choose k by ceil(nb*k/nth)/k, rather than simply ceil(nth/nb):
+             * nb=21 -> k=2 (42 equal tasks), nb=32 -> k=3 (96 tasks,
+             * exactly two waves), on the 48-core A64FX. */
+            double best=1e30;
+            for(int k=1;k<=4&&k<=N/5;k++){
+                double score=(double)((nb*k+nth-1)/nth)/k;
+                if(score<best){ best=score; split=k; }
+            }
+        }
+        if(split>4)split=4;
+        if(split>N/5)split=N/5;
+        if(split<1)split=1;
+    }
+#endif
 #ifdef _OPENMP
     /* parallelize on TOTAL work, not rows: the MoE gate is [256,6144] (rows<GLM5_PAR_MIN) but a
      * huge GEMM -> the old rows>=512 guard ran it SINGLE-THREADED (~16 Gop/s, ~26% of prefill). */
-    #pragma omp parallel for schedule(static) if((long)nb*(size_t)cols>=GLM5_PAR_MIN)
+    #pragma omp parallel for schedule(static) if((size_t)nb*(size_t)cols>=(size_t)GLM5_PAR_MIN)
 #endif
-    for(int bi=0;bi<nb;bi++){
+    for(int work=0;work<nb*split;work++){
+        int bi=work/split, part=work-bi*split;
+        int tn0=N*part/split, tn1=N*(part+1)/split;
         int r=bi*8; const uint16_t*w=W+(size_t)r*cols;
         float acc[N][8];
-        for(int t=0;t<N;t++) for(int j=0;j<8;j++) acc[t][j]=0.f;
+        for(int t=tn0;t<tn1;t++) for(int j=0;j<8;j++) acc[t][j]=0.f;
         for(int k0=0;k0<cols;k0+=TILE){ int kl=cols-k0<TILE?cols-k0:TILE; const uint16_t*tw=w+k0;
-            int t=0;
+            int t=tn0;
 #if defined(__ARM_FEATURE_SVE)
             if(tok==5){
-                for(;t+4<N;t+=5){
+                for(;t+4<tn1;t+=5){
                     const float*x0=X+(size_t)t*cols+k0,*x1=X+(size_t)(t+1)*cols+k0,*x2=X+(size_t)(t+2)*cols+k0,*x3=X+(size_t)(t+3)*cols+k0,*x4=X+(size_t)(t+4)*cols+k0;
                     glm5_bf16_4row_5x_acc(acc[t],acc[t+1],acc[t+2],acc[t+3],acc[t+4],tw,tw+cols,tw+2*(size_t)cols,tw+3*(size_t)cols,x0,x1,x2,x3,x4,kl);
                     glm5_bf16_4row_5x_acc(acc[t]+4,acc[t+1]+4,acc[t+2]+4,acc[t+3]+4,acc[t+4]+4,tw+4*(size_t)cols,tw+5*(size_t)cols,tw+6*(size_t)cols,tw+7*(size_t)cols,x0,x1,x2,x3,x4,kl);
                 }
             } else if(tok==4){
-                for(;t+3<N;t+=4){
+                for(;t+3<tn1;t+=4){
                     const float*x0=X+(size_t)t*cols+k0,*x1=X+(size_t)(t+1)*cols+k0,*x2=X+(size_t)(t+2)*cols+k0,*x3=X+(size_t)(t+3)*cols+k0;
                     glm5_bf16_4row_4x_acc(acc[t],acc[t+1],acc[t+2],acc[t+3],tw,tw+cols,tw+2*(size_t)cols,tw+3*(size_t)cols,x0,x1,x2,x3,kl);
                     glm5_bf16_4row_4x_acc(acc[t]+4,acc[t+1]+4,acc[t+2]+4,acc[t+3]+4,tw+4*(size_t)cols,tw+5*(size_t)cols,tw+6*(size_t)cols,tw+7*(size_t)cols,x0,x1,x2,x3,kl);
                 }
             }
-            for(;t+2<N;t+=3){
+            for(;t+2<tn1;t+=3){
                 glm5_bf16_4row_3x_acc(acc[t],acc[t+1],acc[t+2],tw,tw+cols,tw+2*(size_t)cols,tw+3*(size_t)cols,
                                       X+(size_t)t*cols+k0,X+(size_t)(t+1)*cols+k0,X+(size_t)(t+2)*cols+k0,kl);
                 glm5_bf16_4row_3x_acc(acc[t]+4,acc[t+1]+4,acc[t+2]+4,tw+4*(size_t)cols,tw+5*(size_t)cols,tw+6*(size_t)cols,tw+7*(size_t)cols,
                                       X+(size_t)t*cols+k0,X+(size_t)(t+1)*cols+k0,X+(size_t)(t+2)*cols+k0,kl);
             }
 #endif
-            for(;t<N;t++){ float tmp[8];
+            for(;t<tn1;t++){ float tmp[8];
                 matvec_bf16_8row(tmp,tw,tw+cols,tw+2*(size_t)cols,tw+3*(size_t)cols,
                                  tw+4*(size_t)cols,tw+5*(size_t)cols,tw+6*(size_t)cols,tw+7*(size_t)cols,
                                  X+(size_t)t*cols+k0,kl);
                 for(int j=0;j<8;j++) acc[t][j]+=tmp[j]; } }
-        for(int t=0;t<N;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=acc[t][j]; }
+        for(int t=tn0;t<tn1;t++){ float*y=Y+(size_t)t*rows+r; for(int j=0;j<8;j++) y[j]=acc[t][j]; }
     }
-    for(int r=nb*8;r<rows;r++) for(int t=0;t<N;t++) Y[(size_t)t*rows+r]=vec_dot_bf16_f32(W+(size_t)r*cols,X+(size_t)t*cols,cols);
+    /* TP row shards are commonly 170--171 rows.  Leaving their 2--3 row
+     * remainder serial makes one core contract every prefill token and can
+     * dominate the otherwise parallel 8-row blocks.  The tail elements are
+     * independent, so spread (row,token) pairs across the team. */
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static) if((size_t)(rows-nb*8)*(size_t)N*(size_t)cols>=(size_t)GLM5_PAR_MIN)
+#endif
+    for(int r=nb*8;r<rows;r++) for(int t=0;t<N;t++)
+        Y[(size_t)t*rows+r]=vec_dot_bf16_f32(W+(size_t)r*cols,X+(size_t)t*cols,cols);
 }
 
 static void glm5_gemm_f32(float*restrict Y, const float*W, const float*X, int N, int rows, int cols){

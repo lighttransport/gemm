@@ -60,7 +60,19 @@ static double bench_mv_bf16_rb(const uint16_t*W,const float*x,float*y,int rows,i
     return (wall()-t0)/reps;
 }
 
+static double bench_gemm_bf16(const uint16_t*W,const float*X,float*Y,
+                              int n,int rows,int cols,int reps){
+    glm5_gemm_bf16(Y,W,X,n,rows,cols);
+    double best=1e30;
+    for(int rep=0;rep<reps;rep++){
+        double t0=wall(); glm5_gemm_bf16(Y,W,X,n,rows,cols); double dt=wall()-t0;
+        if(dt<best) best=dt;
+    }
+    return best;
+}
+
 int main(void){
+    int failures=0;
     if(glm5_envi("BN_NUMA",1)){
         /* interleave over the CMG nodes only (Fugaku: nodes 4-7 hold the compute cores;
          * nodes 0-3 are the tiny assistant-core nodes). BN_MASK overrides. */
@@ -112,7 +124,41 @@ int main(void){
         glm5_afree(W);glm5_afree(x);glm5_afree(y);
     }
 
-    /* ---------- 1b. decode-pattern qkv sequence: region overhead probe ----------
+    /* ---------- 1b. production-shape BF16 prefill GEMMs ----------
+     * The default scale-aligned TP shared shards are 256 rows on four ranks
+     * and 128 on eight; exact-even slicing uses 170--171.  All expose fewer
+     * row blocks than 48 cores, and the even slice also has a 2--3 row tail. */
+    if(glm5_envi("BN_PREFILL_BF16",1)){
+        int pn=glm5_envi("BN_PREFILL_N",512), reps=glm5_envi("BN_PREFILL_REPS",3);
+        struct { const char*name; int rows,cols; } PS[]={
+            {"shared_up256",256,6144},{"shared_up128",128,6144},
+            {"shared_up171",171,6144},{"shared_down",6144,256}
+        };
+        for(int s=0;s<4;s++){
+            int pr=PS[s].rows,pc=PS[s].cols;
+            uint16_t*W=glm5_amalloc((size_t)pr*pc*2);
+            float*X=glm5_amalloc((size_t)pn*pc*4),*Y=glm5_amalloc((size_t)pn*pr*4);
+            fill_bf16(W,(size_t)pr*pc,71u+(uint32_t)s);
+            #pragma omp parallel for schedule(static)
+            for(size_t i=0;i<(size_t)pn*pc;i++){ uint32_t sd=91u+(uint32_t)i*2654435761u; X[i]=frnd(&sd); }
+            double dt=bench_gemm_bf16(W,X,Y,pn,pr,pc,reps);
+            double se=0,sr=0,mx=0;
+            int ct[3]={0,pn/2,pn-1}, cr[6]={0,7,8,pr/2,pr-2,pr-1};
+            for(int ti=0;ti<3;ti++) for(int ri=0;ri<6;ri++){
+                int t=ct[ti],r=cr[ri]; if(r<0||r>=pr)continue;
+                float ref=vec_dot_bf16_f32(W+(size_t)r*pc,X+(size_t)t*pc,pc);
+                double d=(double)Y[(size_t)t*pr+r]-ref,a=fabs(d); se+=d*d; sr+=(double)ref*ref; if(a>mx)mx=a;
+            }
+            double ops=2.0*(double)pn*pr*pc;
+            double rel=sqrt(se/(sr+1e-30));
+            printf("bf16 prefill %-11s N=%d [%d x %d] %8.2f ms %7.1f Gop/s tail=%d rel=%.2e maxabs=%.2e\n",
+                   PS[s].name,pn,pr,pc,dt*1e3,ops/dt/1e9,pr%8,rel,mx);
+            if(rel>1e-5) failures++;
+            glm5_afree(W);glm5_afree(X);glm5_afree(Y);
+        }
+    }
+
+    /* ---------- 1c. decode-pattern qkv sequence: region overhead probe ----------
      * Mimics one layer's qkv: norm(6144) serial -> mv q_a [2048x6144] -> norm(2048)
      * serial -> mv q_b [1536x2048] -> mv kv_a [576x6144].  Compares the in-pattern
      * per-layer time against the sum of tight-loop GEMV times (=> per-region cost). */
@@ -247,6 +293,7 @@ int main(void){
             glm5_afree(sel);
         }
     }
-    printf("BENCH_DONE\n");
-    return 0;
+    if(failures) printf("BENCH_FAIL failures=%d\n",failures);
+    else printf("BENCH_DONE\n");
+    return failures?1:0;
 }
