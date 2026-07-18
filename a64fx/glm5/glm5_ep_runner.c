@@ -1094,6 +1094,7 @@ int main(int argc,char**argv){
     glm5_config cfg=glm5_default_config(); cfg.max_pos=maxpos;
     if(layers>0) cfg.n_layers=layers;
     if(nexp>0)   cfg.n_experts=nexp;
+    { int na=envi("GLM5_ACTIVE_EXPERTS",cfg.n_active); if(na>0) cfg.n_active=na; }
     if(cfg.n_active>cfg.n_experts) cfg.n_active=cfg.n_experts;
     /* data-parallel groups: G independent models over the N ranks (group size from ctx+MemAvailable;
      * GLM5_PREFILL_GROUPS overrides). ep_rank/ep_size become group-local so each group is complete. */
