@@ -992,21 +992,58 @@ static void glm5_apply_numa(int on){
     if(!nodemask) nodemask=~0UL;
     syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &nodemask, (unsigned long)(8*sizeof nodemask));
 }
+/* Production defaults for the 12-node GLM-5.2 Q2 path, baked so the runner reproduces the tuned
+ * numbers in GLM52_Q2_12N.md with ZERO env and ZERO flags.  Each is setenv(...,0) = no-overwrite,
+ * so a real env var (debug) still wins, and a CLI flag (which setenv(...,1) overwrites) wins over
+ * both.  This is the pragmatic bridge: the deep forward/kernel code keeps reading glm5_envi, but
+ * the value now comes from here or from a flag -- the operator never has to export anything.
+ * FLIB_BARRIER / OMP_* / XOS_MMM_L_PAGING_POLICY are library-runtime env set by the launcher
+ * before the process starts (they cannot be program args) -- see run_glm52_q2_12n.sh. */
+static void glm5_bake_defaults(void){
+    static const char *kv[][2] = {
+        {"GLM5_REAL","1"},                                  /* staged real BF16/IQ weights */
+        {"GLM5_TP","1"},{"GLM5_TP_ATTN","1"},{"GLM5_TP_SHARED","1"},
+        {"GLM5_TP_FFN","1"},{"GLM5_TP_HEAD","1"},{"GLM5_TP_EMBED","1"},
+        {"GLM5_PREFILL_GROUPS","1"},                        /* one group over the 12 ranks */
+        {"GLM5_IQ_MODE","1"},{"GLM5_IQ_REF","1"},           /* q8 SDOT expert kernels */
+        {"GLM5_DENSE_I8","1"},                              /* hoisted-a16 int8 dense (was manual) */
+        {"TP_AR_BF16","1"},{"TP_AR_ROBUST","2"},            /* lean bf16 allreduce */
+        {"GLM5_BF16_GEMM_TOK","5"},                         /* 5-token BF16 GEMM register block */
+        {"GLM5_ATTN_QK","1"},
+        {"GLM5_CP_THRESHOLD","0"},                          /* 0 = auto KV tiering (long-ctx safe;
+                                                             * Tier-A-only when it fits, identical
+                                                             * to the legacy -1 static path) */
+        {"GLM5_MAXPOS","2304"},{"GLM5_PCHUNK","512"},
+        {NULL,NULL}
+    };
+    for(int i=0;kv[i][0];i++) setenv(kv[i][0],kv[i][1],0);
+}
 static void glm5_cli_usage(void){
     fprintf(stderr,
-      "glm5_ep_runner [--flags]  (all map to GLM5_* env; env still works as fallback)\n"
-      "  --numa[=0|1]        NUMA-interleave weights (default ON; the 1.40x bit-identical lever)\n"
-      "  --model DIR         GLM5_MODEL_DIR        --layers N     GLM5_LAYERS (0=full)\n"
-      "  --experts N         GLM5_EXPERTS          --maxpos N     GLM5_MAXPOS\n"
-      "  --threads N         LLM_THREADS           --tp N         GLM5_TP\n"
-      "  --tp-shared N       GLM5_TP_SHARED        --sdot N       GLM5_MV_SDOT (M=1 decode; 0=w8a16, net loss)\n"
-      "  --gemm-sdot N       GLM5_GEMM_SDOT (prefill + batched-decode GEMM; 2=int16, lossless, 1.2-1.4x win)\n"
-      "  --batch-decode[=1]  GLM5_BATCH_DECODE     --overlap[=1]  GLM5_COMM_OVERLAP\n"
-      "  --slots N           GLM5_CBATCH_SLOTS     --max-new N    GLM5_MAX_NEW\n"
-      "  --prompts FILE      GLM5_CBATCH_PROMPTS   --prompt-ids F GLM5_PROMPT_IDS\n"
-      "  --gen-out FILE      GLM5_GEN_OUT          --stage-dir D  GLM5_STAGE_DIR\n"
-      "  --nshards N         GLM5_NSHARDS          --ep-size N    GLM5_EP_SIZE\n"
-      "  --real N            GLM5_REAL             --set KEY=VAL  set any GLM5_* var\n");
+      "glm5_ep_runner [--flags]  (arg-driven; tuned 12n-Q2 defaults are baked in -- no env needed)\n"
+      "\n model / run:\n"
+      "  --model DIR         weights dir          --stage-dir DIR   node-local staged blobs\n"
+      "  --layers N          0=full (78)          --experts N       0=full (256)\n"
+      "  --threads N         OMP/worker threads   --maxpos N (--ctx N) KV positions (default 2304)\n"
+      "  --pchunk N          prefill chunk (512)  --prefill-only[=1] prefill benchmark, no decode\n"
+      "  --numa[=0|1]        NUMA-interleave weights (default ON; bit-identical 1.40x lever)\n"
+      "  --real N            0=synthetic structural benchmark path\n"
+      "\n generation:\n"
+      "  --max-new N         decode tokens        --min-new N       floor decode tokens\n"
+      "  --prompt-ids FILE   space-separated ids  --prompt-tokens FILE  packed uint32 prompt\n"
+      "  --gen-out FILE      write generated ids  --gen-new N       generate-after-prefill count\n"
+      "  --kv-save FILE      save KV after prefill --kv-load FILE    resume from saved KV\n"
+      "  --temp F --topp F --rep-pen F --seed N    sampler (temp<=0 => greedy)\n"
+      "\n perf / quality:\n"
+      "  --active-experts N  top-k MoE (default 8 exact; 3 => ~20 tok/s, changes output)\n"
+      "  --dense-i8[=0|1]    hoisted int8 dense (default ON)   --dense-i8-gs N  group size (64; 256=prefill+)\n"
+      "  --gemm-sdot N       prefill/batched GEMM (2=int16, lossless 1.2-1.4x)  --sdot N  M=1 decode (0=w8a16)\n"
+      "\n long context:\n"
+      "  --cp-threshold N    KV tier switch position (0=auto budget; -1=legacy static off)\n"
+      "  --kv-budget-gb N    Tier-A bf16 KV cap/node (0=auto from MemAvailable)\n"
+      "\n batched serving / misc:\n"
+      "  --batch-decode[=1]  --overlap[=1]  --slots N  --prompts FILE  --nshards N  --ep-size N\n"
+      "  --set KEY=VAL       escape hatch: set any GLM5_* var directly\n");
 }
 static void glm5_cli(int argc,char**argv){
     /* GLM5_NUMA=0 disables the process-wide MPOL_INTERLEAVE.  That interleave dates from the
@@ -1020,27 +1057,45 @@ static void glm5_cli(int argc,char**argv){
         char*eq=strchr(a,'='); char*val=NULL;
         if(eq){ *eq=0; val=eq+1; }
         else if(i+1<argc && argv[i+1][0]!='-'){ val=argv[++i]; }
-        if(!strcmp(a,"help")){ glm5_cli_usage(); continue; }
+        if(!strcmp(a,"help")){ glm5_cli_usage(); exit(0); }
         if(!strcmp(a,"numa")){ numa=val?atoi(val):1; continue; }
-        if(!strcmp(a,"batch-decode")){ setenv("GLM5_BATCH_DECODE",val?val:"1",1); continue; }
-        if(!strcmp(a,"overlap")){ setenv("GLM5_COMM_OVERLAP",val?val:"1",1); continue; }
+        /* boolean flags default to "1" when given bare (--dense-i8 == --dense-i8=1) */
+        #define BFLAG(flag,var) if(!strcmp(a,flag)){ setenv(var,val?val:"1",1); continue; }
+        BFLAG("batch-decode","GLM5_BATCH_DECODE") BFLAG("overlap","GLM5_COMM_OVERLAP")
+        BFLAG("dense-i8","GLM5_DENSE_I8")         BFLAG("prefill-only","GLM5_PREFILL_ONLY")
+        BFLAG("kv-tier-bf16","GLM5_KV_TIER_BF16")
+        #undef BFLAG
         if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }
         #define MAP(flag,var) if(!strcmp(a,flag)){ if(val) setenv(var,val,1); continue; }
+        /* model / run */
         MAP("model","GLM5_MODEL_DIR")   MAP("layers","GLM5_LAYERS")   MAP("experts","GLM5_EXPERTS")
-        MAP("maxpos","GLM5_MAXPOS")     MAP("threads","LLM_THREADS")  MAP("tp","GLM5_TP")
-        MAP("tp-shared","GLM5_TP_SHARED") MAP("sdot","GLM5_MV_SDOT")  MAP("gemm-sdot","GLM5_GEMM_SDOT")
-        MAP("slots","GLM5_CBATCH_SLOTS")
-        MAP("max-new","GLM5_MAX_NEW")   MAP("prompts","GLM5_CBATCH_PROMPTS")
-        MAP("prompt-ids","GLM5_PROMPT_IDS") MAP("gen-out","GLM5_GEN_OUT")
-        MAP("stage-dir","GLM5_STAGE_DIR") MAP("nshards","GLM5_NSHARDS") MAP("ep-size","GLM5_EP_SIZE")
-        MAP("real","GLM5_REAL")
+        MAP("maxpos","GLM5_MAXPOS")     MAP("ctx","GLM5_MAXPOS")      MAP("threads","LLM_THREADS")
+        MAP("pchunk","GLM5_PCHUNK")     MAP("stage-dir","GLM5_STAGE_DIR") MAP("real","GLM5_REAL")
+        MAP("status-dir","GLM5_STATUS_DIR") MAP("prefill-synth","GLM5_PREFILL_SYNTH")
+        MAP("tp","GLM5_TP")             MAP("tp-shared","GLM5_TP_SHARED")
+        /* generation */
+        MAP("max-new","GLM5_MAX_NEW")   MAP("min-new","GLM5_MIN_NEW") MAP("gen-new","GLM5_GEN_NEW")
+        MAP("prompt-ids","GLM5_PROMPT_IDS") MAP("prompt-tokens","GLM5_PROMPT_TOKENS")
+        MAP("gen-out","GLM5_GEN_OUT")   MAP("kv-save","GLM5_KV_SAVE") MAP("kv-load","GLM5_KV_LOAD")
+        MAP("temp","GLM5_TEMP")         MAP("topp","GLM5_TOPP")       MAP("rep-pen","GLM5_REP_PEN")
+        MAP("seed","GLM5_SEED")
+        /* perf / quality */
+        MAP("active-experts","GLM5_ACTIVE_EXPERTS") MAP("dense-i8-gs","GLM5_DENSE_I8_GS")
+        MAP("gemm-sdot","GLM5_GEMM_SDOT") MAP("sdot","GLM5_MV_SDOT")
+        /* long context */
+        MAP("cp-threshold","GLM5_CP_THRESHOLD") MAP("kv-budget-gb","GLM5_KV_BUDGET_GB")
+        /* batched serving / misc */
+        MAP("slots","GLM5_CBATCH_SLOTS") MAP("prompts","GLM5_CBATCH_PROMPTS")
+        MAP("nshards","GLM5_NSHARDS")    MAP("ep-size","GLM5_EP_SIZE")
         #undef MAP
         fprintf(stderr,"glm5_ep_runner: unknown flag --%s (try --help)\n",a);
+        exit(2);
     }
     glm5_apply_numa(numa);
 }
 
 int main(int argc,char**argv){
+    glm5_bake_defaults();
     glm5_cli(argc,argv);
     int rc;
     int n_threads=envi("LLM_THREADS",12), n_cmgs=envi("GLM5_CMGS",4);

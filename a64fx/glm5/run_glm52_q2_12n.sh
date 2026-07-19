@@ -1,5 +1,27 @@
 #!/bin/bash
-# GLM-5.2 mixed-IQ full-model runner for an existing interactive 1x12 allocation.
+# GLM-5.2 mixed-IQ full-model runner for an existing interactive 1x12 A64FX allocation.
+#
+# The runner (glm5_ep_runner) is arg-driven: every model/perf/generation knob is a --flag and the
+# tuned 12n-Q2 production defaults are baked into the binary (glm5_bake_defaults), so no GLM5_*/TP_*
+# config env is needed.  This launcher only ORCHESTRATES: topology discovery, node-local staging,
+# build, prompt construction, and the perf gate.  It exports a small, documented set of
+# library-runtime env vars that MUST exist before the process starts (they cannot be program args):
+#   FLIB_BARRIER=HARD            Fujitsu OMP A64FX hardware barrier (13.3->15.0 tok/s; see GLM52 doc)
+#   OMP_NUM_THREADS/PROC_BIND/PLACES   OpenMP runtime thread count + pinning
+#   XOS_MMM_L_PAGING_POLICY     XOS heap paging policy (Fugaku presets demand:demand:prepage)
+#
+# Usage: run_glm52_q2_12n.sh MODE [extra runner flags...]
+#   MODE = check | prefill | decode | generate | codegen
+# Orchestration knobs are flags too (parsed here, before MODE-independent runner flags):
+#   --convert-dir DIR   shared source blobs   (default: a64fx-ep12-2w-v1)
+#   --stage-dir DIR     node-local dest       (default: /local/$USER/glm52-2bit-ep12)
+#   --np N              ranks                  (default: 12)
+#   --last x,y,z        node to place rank 0 last (spare-node avoidance)
+#   --repeat N          run the model N times
+#   --no-stage          skip node-local staging (blobs already present)
+#   --no-enforce        do not fail on a missed perf gate
+#   --active-experts N  forwarded to the runner (3 => ~20 tok/s decode; default 8 exact)
+# Any flag not consumed here is passed through verbatim to glm5_ep_runner.
 if [ -z "${BASH_VERSION:-}" ] || shopt -oq posix; then exec /bin/bash "$0" "$@"; fi
 set -euo pipefail
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
@@ -8,48 +30,55 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 LLM="$REPO/a64fx/llm"
 UTOFU="$REPO/a64fx/utofu-tests"
-MODE="${1:-check}"
-case "$MODE" in check|prefill|decode|generate) ;; *) echo "usage: $0 {check|prefill|decode|generate}" >&2; exit 2;; esac
 
-NP="${NP:-12}"
-LAST="${LAST:-0,0,0}"
+MODE="${1:-check}"; shift || true
+case "$MODE" in check|prefill|decode|generate|codegen) ;; *)
+    echo "usage: $0 {check|prefill|decode|generate|codegen} [flags]" >&2; exit 2;; esac
+
+# --- orchestration defaults + flag parsing (unknown flags pass through to the runner) ---
+NP=12
+LAST="0,0,0"
+REPEAT=1
+DO_STAGE=1
+ENFORCE=1
+CONVERT_DIR="$HOME/models/glm52-2bit/a64fx-ep12-2w-v1"
+STAGE_DIR="/local/$USER/glm52-2bit-ep12"
+PREFILL_TARGET=34
+DECODE_TARGET=15
+RUNNER_FLAGS=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --np) NP="$2"; shift 2;;
+        --last) LAST="$2"; shift 2;;
+        --repeat) REPEAT="$2"; shift 2;;
+        --no-stage) DO_STAGE=0; shift;;
+        --no-enforce) ENFORCE=0; shift;;
+        --convert-dir) CONVERT_DIR="$2"; shift 2;;
+        --stage-dir) STAGE_DIR="$2"; shift 2;;
+        --prefill-target) PREFILL_TARGET="$2"; shift 2;;
+        --decode-target) DECODE_TARGET="$2"; shift 2;;
+        *) RUNNER_FLAGS+=("$1"); shift;;
+    esac
+done
+
 STAMP="${PJM_JOBID:-interactive}-$(date +%Y%m%d-%H%M%S)"
-RUN_DIR="${GLM52_RUN_DIR:-$HERE/logs/run-$STAMP-$MODE}"
+RUN_DIR="$HERE/logs/run-$STAMP-$MODE"
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
 
-export GLM52_CONVERT_DIR="${GLM52_CONVERT_DIR:-$HOME/models/glm52-2bit/a64fx-ep12-v1}"
-export GLM5_STAGE_DIR="${GLM5_STAGE_DIR:-/local/u14346/glm52-2bit-ep12}"
-export GLM5_STATUS_DIR="$RUN_DIR"
-export GLM5_REAL=1 GLM5_TP=1 GLM5_TP_ATTN=1 GLM5_TP_SHARED=1
-export GLM5_TP_FFN=1 GLM5_TP_HEAD=1 GLM5_TP_EMBED=1
-export GLM5_PREFILL_GROUPS=1
-export GLM5_CP_THRESHOLD=-1 GLM5_CP=0 GLM5_INT4_KV=0 GLM5_MSA=0
-export GLM5_MAXPOS="${GLM5_MAXPOS:-2304}" GLM5_PCHUNK="${GLM5_PCHUNK:-512}"
-# XOS default (prepage) puts every heap page on the allocating thread's CMG: multi-CMG
-# streaming collapses to ~94 GB/s. demand restores first-touch/mempolicy -> 843 GB/s.
-export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
-# IQ_MODE=1 (q8 SDOT expert kernels, llama.cpp Q8_K-equivalent accuracy) is the tuned
-# decode path; GLM5_IQ_MODE=0 / GLM5_IQ_REF=1 restores source-faithful F32 dequant.
-export GLM5_IQ_MODE="${GLM5_IQ_MODE:-1}"
-# A64FX HARDWARE barrier for the OMP runtime: the software barrier's release/arrival
-# stagger costs ~25-40us PER SYNC at 47 threads in-decode (~150us/layer across the fused
-# stages); HARD collapses it (measured 13.3 -> 15.0 tok/s). FLIB overrides OMP_PROC_BIND
-# itself (benign jwe1051i warning). FLIB_BARRIER=SOFT restores the software barrier.
+# Library-runtime env boundary (cannot be program args; must precede process start).
 export FLIB_BARRIER="${FLIB_BARRIER:-HARD}"
-export GLM5_IQ_REF="${GLM5_IQ_REF:-1}"
-export TP_AR_BF16="${TP_AR_BF16:-1}" TP_AR_ROBUST="${TP_AR_ROBUST:-2}"
-export GLM5_BF16_GEMM_TOK="${GLM5_BF16_GEMM_TOK:-5}"
-export GLM5_ATTN_QK="${GLM5_ATTN_QK:-1}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
-export TF_HW_BARRIER="${TF_HW_BARRIER:-1}"
+export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
 
+# Validate the requested source blobs.
 for ((r=0;r<NP;r++)); do
     printf -v rr '%02d' "$r"
-    test -s "$GLM52_CONVERT_DIR/rank$rr.blob"
-    grep -q '^# glm52-a64fx-ep12-v1' "$GLM52_CONVERT_DIR/rank$rr.manifest"
+    test -s "$CONVERT_DIR/rank$rr.blob"
+    grep -q '^# glm52-a64fx-ep12' "$CONVERT_DIR/rank$rr.manifest"
 done
 
+# Virtual-coordinate file: place rank 0 (LAST) at the tail so a spare node can host it.
 VCOORD="$RUN_DIR/vcoord_glm52.txt"
 SX="${PJM_MPI_SHAPE_X:-${PJM_NODE_X:-2}}"
 SY="${PJM_MPI_SHAPE_Y:-${PJM_NODE_Y:-3}}"
@@ -69,11 +98,13 @@ for try in 1 2 3 4 5; do
     [ "$try" = 5 ] && { echo "topology discovery failed" >&2; exit 3; }
 done
 
-if [ "${GLM52_STAGE:-1}" = 1 ]; then
-    mpiexec -np "$NP" -vcoordfile "$VCOORD" "$HERE/stage_glm52_q2_12n.sh" \
+if [ "$DO_STAGE" = 1 ]; then
+    mpiexec -np "$NP" -vcoordfile "$VCOORD" \
+        "$HERE/stage_glm52_q2_12n.sh" --source "$CONVERT_DIR" --dest "$STAGE_DIR" --status "$RUN_DIR" \
         >stage.stdout 2>stage.stderr
 fi
 
+# Build a natural-length prompt of `count` ids by repeating the sample block and tokenizing.
 make_prompt() {
     local count="$1" out="$2" text="$RUN_DIR/prompt-repeat.txt" ids="$RUN_DIR/prompt-all.ids"
     : > "$text"
@@ -86,33 +117,65 @@ make_prompt() {
     awk -v n="$count" '{for(i=1;i<=NF&&k<n;i++){printf "%s%s",$i,(++k<n?" ":"\n")}}' "$ids" > "$out"
 }
 
+# Common runner flags for every mode: node-local blobs, run-dir status, this run's log dir.
+COMMON=(--stage-dir "$STAGE_DIR" --status-dir "$RUN_DIR")
+
+THREADS=47   # leave one core free (a64fx-omp-leave-one-core); prefill overrides to 48
 case "$MODE" in
     check)
-        export GLM5_LAYERS="${GLM5_LAYERS:-4}" GLM5_MAX_NEW=1 LLM_THREADS="${LLM_THREADS:-47}"
         make_prompt 16 "$RUN_DIR/prompt.ids"
-        export GLM5_PROMPT_IDS="$RUN_DIR/prompt.ids"
+        MODE_FLAGS=(--layers 4 --max-new 1 --prompt-ids "$RUN_DIR/prompt.ids")
         ;;
     prefill)
-        export GLM5_LAYERS=78 GLM5_PREFILL_ONLY=1 GLM5_MAX_NEW=0 LLM_THREADS="${LLM_THREADS:-48}"
+        THREADS=48
         make_prompt 2048 "$RUN_DIR/prompt.ids"
-        export GLM5_PROMPT_IDS="$RUN_DIR/prompt.ids"
+        MODE_FLAGS=(--layers 78 --prefill-only --max-new 0 --prompt-ids "$RUN_DIR/prompt.ids")
         ;;
     decode)
-        export GLM5_LAYERS=78 GLM5_MAX_NEW="${GLM5_MAX_NEW:-128}" LLM_THREADS="${LLM_THREADS:-47}"
         make_prompt 512 "$RUN_DIR/prompt.ids"
-        export GLM5_PROMPT_IDS="$RUN_DIR/prompt.ids" GLM5_GEN_OUT="$RUN_DIR/gen.ids"
+        MODE_FLAGS=(--layers 78 --max-new 128 \
+                    --prompt-ids "$RUN_DIR/prompt.ids" --gen-out "$RUN_DIR/gen.ids")
         ;;
     generate)
-        export GLM5_LAYERS="${GLM5_LAYERS:-78}" GLM5_MAX_NEW="${GLM5_MAX_NEW:-128}" LLM_THREADS="${LLM_THREADS:-47}"
-        test -s "${GLM5_PROMPT_IDS:?set GLM5_PROMPT_IDS for generate mode}"
-        export GLM5_GEN_OUT="${GLM5_GEN_OUT:-$RUN_DIR/gen.ids}"
+        MODE_FLAGS=(--layers 78 --max-new 128 --gen-out "$RUN_DIR/gen.ids")
+        # caller must pass --prompt-ids or --prompt-tokens via extra flags
+        ;;
+    codegen)
+        # Coding-agent usecase = the real long-context stability + coherence test.
+        # Single phase: prefill the precomputed code prompt (real tokens), then greedy-generate
+        # code and detokenize.  On 12 nodes a >~23k-token context exceeds the Tier-A bf16 KV
+        # budget, so the auto KV tiering (Tier A -> int4 CP-sharded Tier B + MSA) engages mid
+        # prefill -- this run therefore exercises the long-context path end to end.  (KV save/load
+        # reuse across the tier boundary is a separate item; a one-shot run needs neither.)
+        CODEGEN_TOK="${CODEGEN_TOK:-$HOME/glm5_codegen.bin}"
+        SYS_TOK="${SYS_TOK:-108474}"; GEN="${GEN:-256}"
+        test -s "$CODEGEN_TOK" || { echo "codegen: missing prompt tokens $CODEGEN_TOK" >&2; exit 4; }
+        MAXPOS=$(( SYS_TOK + GEN + 128 ))
+        export OMP_NUM_THREADS=47
+        echo "--- codegen: prefill $SYS_TOK-token code prompt, generate $GEN, detokenize ---"
+        mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
+            "${COMMON[@]}" --layers 78 --threads 47 --ctx "$MAXPOS" --pchunk 512 \
+            --prompt-tokens "$CODEGEN_TOK" --prefill-synth "$SYS_TOK" --prefill-only \
+            --gen-new "$GEN" --gen-out "$RUN_DIR/gen.ids" \
+            "${RUNNER_FLAGS[@]}" > >(tee "$RUN_DIR/codegen.stdout") 2> >(tee "$RUN_DIR/codegen.stderr" >&2)
+        cp glm5_ep_rank00.txt "$RUN_DIR/rank00-codegen.txt" 2>/dev/null || true
+        grep -Eq '^SENTINEL .*=(done)$' glm5_ep_rank00.txt || {
+            echo "codegen: rank-0 sentinel missing" >&2; exit 5; }
+        if [ -s "$RUN_DIR/gen.ids" ]; then
+            echo "=== GENERATED (detokenized) ==="
+            python3 "$HERE/glm5_tokenizer.py" decode-file "$RUN_DIR/gen.ids" | tee "$RUN_DIR/generated.txt"
+        fi
+        ln -sfn "$RUN_DIR" "$HERE/logs/latest-glm52-q2"
+        echo "GLM52_RUN_DIR=$RUN_DIR"
+        exit 0
         ;;
 esac
-export OMP_NUM_THREADS="$LLM_THREADS"
 
-repeat="${GLM52_REPEAT:-1}"
-for ((i=1;i<=repeat;i++)); do
+export OMP_NUM_THREADS="$THREADS"
+
+for ((i=1;i<=REPEAT;i++)); do
     mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
+        "${COMMON[@]}" "${MODE_FLAGS[@]}" --threads "$THREADS" "${RUNNER_FLAGS[@]}" \
         > >(tee "$RUN_DIR/run-$i.stdout") 2> >(tee "$RUN_DIR/run-$i.stderr" >&2)
     grep -Eq '^SENTINEL .*=(done)$' glm5_ep_rank00.txt || {
         echo "rank-0 completion sentinel missing; inspect $RUN_DIR/glm5_ep_stderr_rank*.txt" >&2
@@ -121,11 +184,9 @@ for ((i=1;i<=repeat;i++)); do
     cp glm5_ep_rank00.txt "$RUN_DIR/rank00-$i.txt" 2>/dev/null || true
 done
 
-if [ "${GLM52_ENFORCE_TARGETS:-1}" = 1 ] && { [ "$MODE" = prefill ] || [ "$MODE" = decode ]; }; then
-    metric="$MODE"
-    target="${GLM52_PREFILL_TARGET:-34}"
-    [ "$MODE" = decode ] && target="${GLM52_DECODE_TARGET:-15}"
-    awk -v mode="$metric" -v target="$target" '
+if [ "$ENFORCE" = 1 ] && { [ "$MODE" = prefill ] || [ "$MODE" = decode ]; }; then
+    target="$PREFILL_TARGET"; [ "$MODE" = decode ] && target="$DECODE_TARGET"
+    awk -v mode="$MODE" -v target="$target" '
         mode=="prefill" && $1=="gen_prefill_only:" { seen=1; rate=$4 }
         mode=="decode" && $1=="gen:" {
             for(i=1;i<=NF;i++) if($i=="decode"){ seen=1; rate=$(i+3) }
@@ -134,7 +195,7 @@ if [ "${GLM52_ENFORCE_TARGETS:-1}" = 1 ] && { [ "$MODE" = prefill ] || [ "$MODE"
             if(!seen){ print "missing " mode " metric" > "/dev/stderr"; exit 2 }
             printf "%s measured %.2f tok/s, target %.2f tok/s: %s\n",mode,rate,target,(rate>=target?"PASS":"FAIL")
             exit rate>=target?0:1
-        }' "$RUN_DIR/rank00-$repeat.txt"
+        }' "$RUN_DIR/rank00-$REPEAT.txt"
 fi
 ln -sfn "$RUN_DIR" "$HERE/logs/latest-glm52-q2"
 echo "GLM52_RUN_DIR=$RUN_DIR"

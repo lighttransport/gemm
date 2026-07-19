@@ -342,6 +342,12 @@ typedef struct {
      * (cp_on=1 int4, CP-sharded) for the long tail. T_cp is derived from the per-rank memory
      * budget (positions whose un-sharded KV fits). T_cp==0 disables tiering (static config). */
     int T_cp;
+    /* T_dense: max positions attended DENSELY / the Tier-A window (= T_cp when tiered, else max_pos).
+     * The 256K+ buffer-layout invariant (a64fx/glm5/CTX_BUFFER_LAYOUT.md): every class-D
+     * (O(ctx), replicated) scratch/score buffer is bounded by T_dense, never by max_pos=T_ctx; the
+     * logical context grows only through the CP-sharded Tier-B KV (class E) and the maxsel/nblkmax-
+     * bounded MSA scratch (class B/C). */
+    int T_dense;
     long kv_avail;   /* MemAvailable seen at kv_init; re-used to recompute T_cp after a Phase-2 merge
                       * (bigger group -> fewer experts/rank -> more Tier-A KV budget -> higher T_cp). */
     /* effective MSA on/off, decided by the tier (auto mode): OFF for a single un-sharded Tier A

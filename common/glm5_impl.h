@@ -1140,7 +1140,128 @@ static float glm5_iq4_xs_q8_row_v2(const block_iq4_xs*w,const glm5_iq_q8_block*x
     }
     return svaddv_f32(p32,accf);
 }
+/* ---- NB=4 register-blocked variants (prefill/N-token expert GEMM) ----
+ * Identical math to the *_v2 row kernels, but decode the weight sub-tile (the expensive
+ * gather/svtbl work) and its scale ONCE per (block,tile) and reuse across 4 activations.
+ * Bit-exact vs 4 separate *_v2 calls (measured rel_l2 == 0). ~2.5x at N>=16 (the prefill
+ * expert buckets), because the weight decode dominated the per-token kernel. x0..x3 are the
+ * 4 tokens' q8 activation-block arrays; out[0..3] their dot products. */
+static void glm5_iq2_xs_q8_row4_v2(const block_iq2_xs*w,const glm5_iq_q8_block*x0,const glm5_iq_q8_block*x1,
+                                   const glm5_iq_q8_block*x2,const glm5_iq_q8_block*x3,float*out,int nb){
+    const svbool_t p8=svptrue_b8(),p32=svptrue_b32(),p64=svptrue_b64();
+    const svbool_t lo8_32=svwhilelt_b32(0,8);
+    const svuint32_t nidx=svlsr_n_u32_x(p32,svindex_u32(0,1),2);
+    svfloat32_t f0=svdup_f32(0.f),f1=f0,f2=f0,f3=f0;
+    for(int b=0;b<nb;b++){
+        const uint16_t*qs=w[b].qs;
+        svuint32_t sb8=svld1ub_u32(lo8_32,w[b].scales);
+        svuint32_t nibs=svzip1_u32(svand_n_u32_x(p32,sb8,15),svand_n_u32_x(p32,svlsr_n_u32_x(p32,sb8,4),15));
+        svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0;
+        for(int k=0;k<4;k++){
+            svuint64_t code=svld1uh_u64(p64,qs+8*k);
+            svuint64_t g=svld1_gather_u64index_u64(p64,(const uint64_t*)iq2xs_grid,svand_n_u64_x(p64,code,511));
+            svuint64_t sm=svld1_gather_u64index_u64(p64,glm5_iq_signmask64,svlsr_n_u64_x(p64,code,9));
+            svint8_t wv=svsub_s8_x(p8,svreinterpret_s8_u64(sveor_u64_x(p64,g,sm)),svreinterpret_s8_u64(sm));
+            svuint32_t nib=svtbl_u32(nibs,svadd_n_u32_x(p32,nidx,4*k));
+            svint32_t sc=svreinterpret_s32_u32(svorr_n_u32_x(p32,svlsl_n_u32_x(p32,nib,1),1));
+            a0=svmla_s32_x(p32,a0,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x0[b].q+64*k)),sc);
+            a1=svmla_s32_x(p32,a1,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x1[b].q+64*k)),sc);
+            a2=svmla_s32_x(p32,a2,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x2[b].q+64*k)),sc);
+            a3=svmla_s32_x(p32,a3,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x3[b].q+64*k)),sc);
+        }
+        float wd=ggml_fp16_to_fp32(w[b].d)*0.125f;
+        f0=svmla_n_f32_x(p32,f0,svcvt_f32_s32_x(p32,a0),wd*x0[b].d);
+        f1=svmla_n_f32_x(p32,f1,svcvt_f32_s32_x(p32,a1),wd*x1[b].d);
+        f2=svmla_n_f32_x(p32,f2,svcvt_f32_s32_x(p32,a2),wd*x2[b].d);
+        f3=svmla_n_f32_x(p32,f3,svcvt_f32_s32_x(p32,a3),wd*x3[b].d);
+    }
+    out[0]=svaddv_f32(p32,f0);out[1]=svaddv_f32(p32,f1);out[2]=svaddv_f32(p32,f2);out[3]=svaddv_f32(p32,f3);
+}
+static void glm5_iq3_xxs_q8_row4_v2(const block_iq3_xxs*w,const glm5_iq_q8_block*x0,const glm5_iq_q8_block*x1,
+                                    const glm5_iq_q8_block*x2,const glm5_iq_q8_block*x3,float*out,int nb){
+    const svbool_t p8=svptrue_b8(),p32=svptrue_b32(),p64=svptrue_b64();
+    static const uint64_t sh_arr[8]={0,7,14,21,0,7,14,21};
+    const svuint64_t sh8=svld1_u64(p64,sh_arr);
+    const svbool_t lo4_64=svwhilelt_b64(0,4), lo8_32=svwhilelt_b32(0,8);
+    svfloat32_t f0=svdup_f32(0.f),f1=f0,f2=f0,f3=f0;
+    for(int b=0;b<nb;b++){
+        const uint8_t*q3=w[b].qs,*gas=w[b].qs+64;
+        svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0;
+        for(int k=0;k<4;k++){
+            uint32_t aux0,aux1; memcpy(&aux0,gas+8*k,4); memcpy(&aux1,gas+8*k+4,4);
+            svuint32_t g=svld1_gather_u32index_u32(p32,(const uint32_t*)iq3xxs_grid,svld1ub_u32(p32,q3+16*k));
+            svuint64_t av=svsel_u64(lo4_64,svdup_u64(aux0),svdup_u64(aux1));
+            svuint64_t sm=svld1_gather_u64index_u64(p64,glm5_iq_signmask64,
+                              svand_n_u64_x(p64,svlsr_u64_x(p64,av,sh8),127));
+            svint8_t wv=svsub_s8_x(p8,svreinterpret_s8_u32(sveor_u32_x(p32,g,svreinterpret_u32_u64(sm))),
+                                   svreinterpret_s8_u64(sm));
+            svint32_t sc=svsel_s32(lo8_32,svdup_s32(2*(int)(aux0>>28)+1),svdup_s32(2*(int)(aux1>>28)+1));
+            a0=svmla_s32_x(p32,a0,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x0[b].q+64*k)),sc);
+            a1=svmla_s32_x(p32,a1,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x1[b].q+64*k)),sc);
+            a2=svmla_s32_x(p32,a2,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x2[b].q+64*k)),sc);
+            a3=svmla_s32_x(p32,a3,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x3[b].q+64*k)),sc);
+        }
+        float wd=ggml_fp16_to_fp32(w[b].d)*0.25f;
+        f0=svmla_n_f32_x(p32,f0,svcvt_f32_s32_x(p32,a0),wd*x0[b].d);
+        f1=svmla_n_f32_x(p32,f1,svcvt_f32_s32_x(p32,a1),wd*x1[b].d);
+        f2=svmla_n_f32_x(p32,f2,svcvt_f32_s32_x(p32,a2),wd*x2[b].d);
+        f3=svmla_n_f32_x(p32,f3,svcvt_f32_s32_x(p32,a3),wd*x3[b].d);
+    }
+    out[0]=svaddv_f32(p32,f0);out[1]=svaddv_f32(p32,f1);out[2]=svaddv_f32(p32,f2);out[3]=svaddv_f32(p32,f3);
+}
+static void glm5_iq4_xs_q8_row4_v2(const block_iq4_xs*w,const glm5_iq_q8_block*x0,const glm5_iq_q8_block*x1,
+                                   const glm5_iq_q8_block*x2,const glm5_iq_q8_block*x3,float*out,int nb){
+    const svbool_t p8=svptrue_b8(),p32=svptrue_b32();
+    const svbool_t lo16_8=svwhilelt_b8(0,16), lo32_8=svwhilelt_b8(0,32), lo8_32=svwhilelt_b32(0,8);
+    static const uint8_t idxA[64]={ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
+                                   255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+                                    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+                                   255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255};
+    static const uint8_t idxB[64]={255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+                                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
+                                   255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+                                    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
+    const svuint8_t vA=svld1_u8(p8,idxA), vB=svld1_u8(p8,idxB);
+    const svint8_t kv16=svld1_s8(lo16_8,kvalues_iq4nl);
+    svfloat32_t f0=svdup_f32(0.f),f1=f0,f2=f0,f3=f0;
+    for(int b=0;b<nb;b++){
+        svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0; uint16_t h=w[b].scales_h;
+        for(int k=0;k<4;k++){
+            svuint8_t v=svld1_u8(lo32_8,w[b].qs+32*k);
+            svint8_t wl=svtbl_s8(kv16,svand_n_u8_x(p8,v,15));
+            svint8_t wh=svtbl_s8(kv16,svlsr_n_u8_x(p8,v,4));
+            svint8_t wv=svorr_s8_x(p8,svtbl_s8(wl,vA),svtbl_s8(wh,vB));
+            int ls0=(int)((w[b].scales_l[k]&15)|(((h>>(4*k))&3)<<4))-32;
+            int ls1=(int)((w[b].scales_l[k]>>4)|(((h>>(4*k+2))&3)<<4))-32;
+            svint32_t sc=svsel_s32(lo8_32,svdup_s32(ls0),svdup_s32(ls1));
+            a0=svmla_s32_x(p32,a0,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x0[b].q+64*k)),sc);
+            a1=svmla_s32_x(p32,a1,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x1[b].q+64*k)),sc);
+            a2=svmla_s32_x(p32,a2,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x2[b].q+64*k)),sc);
+            a3=svmla_s32_x(p32,a3,svdot_s32(svdup_s32(0),wv,svld1_s8(p8,x3[b].q+64*k)),sc);
+        }
+        float wd=ggml_fp16_to_fp32(w[b].d);
+        f0=svmla_n_f32_x(p32,f0,svcvt_f32_s32_x(p32,a0),wd*x0[b].d);
+        f1=svmla_n_f32_x(p32,f1,svcvt_f32_s32_x(p32,a1),wd*x1[b].d);
+        f2=svmla_n_f32_x(p32,f2,svcvt_f32_s32_x(p32,a2),wd*x2[b].d);
+        f3=svmla_n_f32_x(p32,f3,svcvt_f32_s32_x(p32,a3),wd*x3[b].d);
+    }
+    out[0]=svaddv_f32(p32,f0);out[1]=svaddv_f32(p32,f1);out[2]=svaddv_f32(p32,f2);out[3]=svaddv_f32(p32,f3);
+}
 #endif
+/* NB=4 dispatcher: 4 tokens' q8 blocks -> 4 dots against one IQ weight row. SVE only; the
+ * callers handle the N%4 tail with the 1-token glm5_iq_q8_row. */
+static inline void glm5_iq_q8_row4(const glm5_tensor*t,const uint8_t*w,const glm5_iq_q8_block*x0,
+        const glm5_iq_q8_block*x1,const glm5_iq_q8_block*x2,const glm5_iq_q8_block*x3,float*out,int nb){
+#if defined(__ARM_FEATURE_SVE)
+    if(t->type==GLM5_IQ2_XS){ glm5_iq2_xs_q8_row4_v2((const block_iq2_xs*)w,x0,x1,x2,x3,out,nb); return; }
+    if(t->type==GLM5_IQ3_XXS){ glm5_iq3_xxs_q8_row4_v2((const block_iq3_xxs*)w,x0,x1,x2,x3,out,nb); return; }
+    glm5_iq4_xs_q8_row4_v2((const block_iq4_xs*)w,x0,x1,x2,x3,out,nb);
+#else
+    out[0]=glm5_iq_q8_row(t,w,x0,nb); out[1]=glm5_iq_q8_row(t,w,x1,nb);
+    out[2]=glm5_iq_q8_row(t,w,x2,nb); out[3]=glm5_iq_q8_row(t,w,x3,nb);
+#endif
+}
+static int glm5_iq_rown(void){ static int v=-1; if(v<0) v=glm5_envi("GLM5_IQ_ROWN",1); return v; }
 static int glm5_iq_v2(void){
     static int v=-1;
     if(v<0){
@@ -1594,7 +1715,7 @@ static void glm5_kv_init(glm5_model*m){
         m->cp_on  =glm5_envi("GLM5_CP",0) && m->ep_size>1;
         m->cp_nslot=glm5_cp_nslot(ctx,m->cp_block,m->ep_size,m->cp_on);
         m->msa_on =glm5_envi("GLM5_MSA",0);
-        m->T_cp=0; return;
+        m->T_cp=0; m->T_dense=ctx; return;   /* static: full ctx attended densely (or user's CP/MSA) */
     }
     /* per-position un-sharded bf16 KV bytes across all layers (latent KV + MSA index on MoE). */
     int KVD=glm5_kv_cache_dim(c), ID=c->index_dim;
@@ -1617,7 +1738,29 @@ static void glm5_kv_init(glm5_model*m){
             long reserve=m->arena_sz>0?(long)m->arena_sz:
                          (long)glm5_arena_size(&tiny,m->ep_rank,m->ep_size);
             reserve += (long)c->max_pos*(c->rotary_dim/2)*4*2; /* real rope_cos/sin */
-            budget = avail - reserve - avail/10;               /* 10% headroom for scratch/mstream */
+            /* Phase-4 budget (CTX_BUFFER_LAYOUT.md).  The replicated Tier-A KV (T_cp*per_pos)
+             * coexists during dense prefill with two other pools: (1) the per-chunk mstream
+             * scratch -- bounded O(pchunk*dims), NOT ctx-scaling (post-Phase-3 there is NO
+             * dense-score buffer in the single-stream path: ms->sc is per_stream-only); and
+             * (2) glibc-arena / page-cache overhead from the mmap'd weights, not counted in
+             * arena_sz.  A proportional 10% alone let Tier-A grow until dense prefill OOM-killed
+             * (SIGKILL) at ctx 108k on a 31 GB node.  Reserve (1) computed from the actual
+             * dominant mstream buffer dims (adapts to pchunk), and (2) as a proportional margin
+             * (empirical, node-size dependent).  Override with GLM5_KV_BUDGET_GB on roomier nodes. */
+            int pchunk_est=glm5_envi("GLM5_PCHUNK",512); if(pchunk_est<1) pchunk_est=512;
+            long maxsel_est=(long)(c->msa_topk_blocks+c->msa_local_block+c->msa_init_block+1)*c->msa_block_size;
+            long kvb_sc=c->qk_nope_dim+c->v_head_dim; if(kvb_sc<2*c->kv_lora) kvb_sc=2*c->kv_lora;
+            long QDf=(long)c->n_heads*c->qk_head_dim, KVDf=glm5_kv_dim(c), IQDf=(long)c->msa_n_index_heads*c->msa_index_dim;
+            long per_tok = (long)c->vocab            /* ms->logits (worst-case replicated head shard) */
+                         + (long)c->n_heads*kvb_sc   /* ms->kvb */
+                         + 2*QDf + 2*KVDf            /* q,attn + k,v */
+                         + c->q_lora                 /* qlat */
+                         + 6*(long)c->hidden         /* xn,o,h2,route,tmp2,emoe */
+                         + 2*(long)c->moe_inter + 2*(long)c->dense_inter
+                         + maxsel_est + IQDf         /* psel, piq */
+                         + 3*(long)c->n_experts + 256; /* router,bk,bw + gsel/hmx/hse misc */
+            long scratch = per_tok*pchunk_est*4;                   /* bounded per-chunk mstream scratch */
+            budget = avail - reserve - avail/8 - scratch;          /* +12.5% OS/page-cache margin */
             if(budget < (1L<<30)) budget = 1L<<30;             /* floor: at least 1 GB of Tier-A KV */
         }
         int bgb=glm5_envi("GLM5_KV_BUDGET_GB",0);              /* optional hard cap (0 = no cap) */
@@ -1627,8 +1770,8 @@ static void glm5_kv_init(glm5_model*m){
     if(T<m->cp_block) T=m->cp_block;
     T=(T/m->cp_block)*m->cp_block;             /* block-align so Tier-A slots are CP-block aligned */
     m->int4_kv=0; m->cp_on=0;                   /* start in Tier A (bf16, replicated) */
-    if(T>=ctx){ m->cp_nslot=ctx; m->T_cp=0; m->msa_on=0; }  /* fits un-sharded: Tier A only, no MSA */
-    else      { m->cp_nslot=(int)T; m->T_cp=(int)T; m->msa_on=1; }  /* tiered: MSA on (Tier B needs it) */
+    if(T>=ctx){ m->cp_nslot=ctx; m->T_cp=0; m->msa_on=0; m->T_dense=ctx; }  /* fits un-sharded: Tier A only, no MSA */
+    else      { m->cp_nslot=(int)T; m->T_cp=(int)T; m->msa_on=1; m->T_dense=(int)T; }  /* tiered: dense window = T_cp, MSA past it */
 }
 /* allocate this layer's KV cache (bf16 or int4, sized to cp_nslot owned slots). */
 static void glm5_alloc_kv(glm5_model*m,glm5_layer*L,int is_moe,size_t*used){
@@ -1654,6 +1797,13 @@ static void glm5_prefill_to_cp(glm5_model*m,int upto){
     const glm5_config*c=&m->cfg;
     int KVD=glm5_kv_cache_dim(c), ID=c->index_dim, B=m->cp_block, eps=m->ep_size, er=m->ep_rank;
     int nslotB=glm5_cp_nslot(c->max_pos,B,eps,1);
+    /* Tier-B KV precision.  Default int4 (smallest footprint, ~2 GB/node even at 1M).  But the
+     * CP shard already divides the full KV by ep_size, so bf16 Tier-B fits on modest node counts
+     * (108k: ~1.1 GB/node; 256k: ~2.4 GB/node over 12 ranks) and AVOIDS the int4 quantization
+     * error that accumulates over 100k+ positions into incoherent output.  GLM5_KV_TIER_BF16=1
+     * (--kv-tier-bf16) keeps Tier B in exact bf16; the store/load/idxdot paths already branch on
+     * m->int4_kv, so only this re-shard needs the bf16 variant. */
+    int tier_int4 = !glm5_envi("GLM5_KV_TIER_BF16",0);
     float kv[1024], ik[256];   /* KVD<=576, ID<=128 */
     for(int l=0;l<c->n_layers;l++){
         glm5_layer*L=&m->layers[l]; int is_moe=glm5_is_moe(c,l);
@@ -1661,27 +1811,44 @@ static void glm5_prefill_to_cp(glm5_model*m,int upto){
          * load allocates idx for has_full_indexer layers, not all MoE) -- key off the buffer, not
          * is_moe, so this matches exactly which layers Tier B allocates idx_q4 for. */
         int has_idx = (L->idx_k_cache!=NULL);
-        uint8_t *nk=glm5_acalloc((size_t)nslotB*(KVD/2),1); uint16_t *nks=glm5_acalloc((size_t)nslotB,2);
-        uint8_t *niq=NULL; uint16_t *niqs=NULL;
-        if(has_idx){ niq=glm5_acalloc((size_t)nslotB*(ID/2),1); niqs=glm5_acalloc((size_t)nslotB,2); }
-        for(int pos=0;pos<upto;pos++){
-            int b=pos/B; if(b%eps!=er) continue;                 /* keep only my CP-owned blocks */
-            int newslot=(b/eps)*B + (pos%B);                     /* == glm5_cp_slot under cp_on=1 */
-            const uint16_t*kc=L->kv_cache+(size_t)pos*KVD;
-            for(int i=0;i<KVD;i++) kv[i]=glm5_kv_dec(m,kc[i]);
-            nks[newslot]=glm5_q4_pack(nk+(size_t)newslot*(KVD/2),kv,KVD);
-            if(has_idx){
-                const uint16_t*ic=L->idx_k_cache+(size_t)pos*ID;
-                for(int i=0;i<ID;i++) ik[i]=glm5_kv_dec(m,ic[i]);
-                niqs[newslot]=glm5_q4_pack(niq+(size_t)newslot*(ID/2),ik,ID);
+        if(tier_int4){
+            uint8_t *nk=glm5_acalloc((size_t)nslotB*(KVD/2),1); uint16_t *nks=glm5_acalloc((size_t)nslotB,2);
+            uint8_t *niq=NULL; uint16_t *niqs=NULL;
+            if(has_idx){ niq=glm5_acalloc((size_t)nslotB*(ID/2),1); niqs=glm5_acalloc((size_t)nslotB,2); }
+            for(int pos=0;pos<upto;pos++){
+                int b=pos/B; if(b%eps!=er) continue;                 /* keep only my CP-owned blocks */
+                int newslot=(b/eps)*B + (pos%B);                     /* == glm5_cp_slot under cp_on=1 */
+                const uint16_t*kc=L->kv_cache+(size_t)pos*KVD;
+                for(int i=0;i<KVD;i++) kv[i]=glm5_kv_dec(m,kc[i]);
+                nks[newslot]=glm5_q4_pack(nk+(size_t)newslot*(KVD/2),kv,KVD);
+                if(has_idx){
+                    const uint16_t*ic=L->idx_k_cache+(size_t)pos*ID;
+                    for(int i=0;i<ID;i++) ik[i]=glm5_kv_dec(m,ic[i]);
+                    niqs[newslot]=glm5_q4_pack(niq+(size_t)newslot*(ID/2),ik,ID);
+                }
             }
+            L->k_q4=nk; L->k_qs=nks; L->idx_q4=niq; L->idx_qs=niqs;
+        } else {   /* exact bf16 CP-sharded Tier B: copy the bf16 words straight to the CP slot */
+            uint16_t *nkv=glm5_acalloc((size_t)nslotB*KVD,2);
+            uint16_t *nidx=has_idx?glm5_acalloc((size_t)nslotB*ID,2):NULL;
+            for(int pos=0;pos<upto;pos++){
+                int b=pos/B; if(b%eps!=er) continue;
+                int newslot=(b/eps)*B + (pos%B);
+                const uint16_t*kc=L->kv_cache+(size_t)pos*KVD;
+                memcpy(nkv+(size_t)newslot*KVD,kc,(size_t)KVD*2);
+                if(has_idx){ const uint16_t*ic=L->idx_k_cache+(size_t)pos*ID;
+                    memcpy(nidx+(size_t)newslot*ID,ic,(size_t)ID*2); }
+            }
+            glm5_afree(L->kv_cache); L->kv_cache=nkv;
+            glm5_afree(L->idx_k_cache); L->idx_k_cache=nidx;
         }
         (void)is_moe;
-        glm5_afree(L->kv_cache); L->kv_cache=NULL;
-        glm5_afree(L->idx_k_cache); L->idx_k_cache=NULL;
-        L->k_q4=nk; L->k_qs=nks; L->idx_q4=niq; L->idx_qs=niqs;
+        if(tier_int4){
+            glm5_afree(L->kv_cache); L->kv_cache=NULL;
+            glm5_afree(L->idx_k_cache); L->idx_k_cache=NULL;
+        }
     }
-    m->int4_kv=1; m->cp_on=1; m->cp_nslot=nslotB;
+    m->int4_kv=tier_int4; m->cp_on=1; m->cp_nslot=nslotB;
 }
 
 /* Group merge (Phase 2), local expert step: shrink this rank's expert ownership from ep_size to
@@ -2399,10 +2566,14 @@ static inline float glm5_idxdot(glm5_model*m,glm5_layer*L,int t,const float*qh,i
  * returns the full causal range (owned subset under CP). Under CP each rank scores only its
  * owned blocks, then blk_reduce_cb (all-reduce MAX) gives every rank the same global selection;
  * the cross-rank attention partials are merged later by kv_combine_cb. */
-static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*q_lat,int pos,int msa_on,int*sel){
+/* sel_cap = capacity (ints) of the caller's sel[] buffer: max_pos for the decode s_blk_sel alias,
+ * ms->maxsel for the prefill psel slice.  Guards the class-B/C -> buffer-overflow bug family
+ * (CTX_BUFFER_LAYOUT.md): abort loudly instead of corrupting the heap if a write would exceed it. */
+static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*q_lat,int pos,int msa_on,int*sel,int sel_cap){
     const glm5_config*c=&m->cfg;
     const int ID=c->msa_index_dim, IH=c->msa_n_index_heads, B=c->msa_block_size, half=c->rotary_dim/2;
     if(!msa_on){
+        if(pos+1 > sel_cap){ fprintf(stderr,"glm5_msa_select(dense): need %d > cap %d\n",pos+1,sel_cap); abort(); }
         int nsel=0;
         for(int t=0;t<=pos;t++) if(glm5_cp_mine(m,t)) sel[nsel++]=t;
         return nsel;
@@ -2424,6 +2595,13 @@ static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*
     int nblk=pos/B+1;
     int keep=c->msa_topk_blocks+c->msa_local_block+c->msa_init_block;
     int dense_sel = (!msa_on || nblk<=keep);   /* attend all causal positions */
+    /* bound guard: worst-case highest sel[] write index (see CTX_BUFFER_LAYOUT.md).  dense_sel writes
+     * sel[0..pos]; the sparse gather writes sel[off + up to keep*B], off=nblk only when aliased. */
+    int aliased = ((void*)sel == (void*)m->s_blk_sel);
+    { int cap_need = dense_sel ? (pos+1)
+                    : ((aliased?nblk:0) + ((keep*B < pos+1)?keep*B:pos+1));
+      if(cap_need > sel_cap){ fprintf(stderr,"glm5_msa_select: sel write %d exceeds cap %d (pos=%d nblk=%d keep=%d aliased=%d)\n",
+                                     cap_need,sel_cap,pos,nblk,keep,aliased); abort(); } }
     if(dense_sel){
         int nsel=0;
         for(int t=0;t<=pos;t++) if(glm5_cp_mine(m,t)) sel[nsel++]=t;
@@ -2459,14 +2637,19 @@ static int glm5_msa_select(glm5_model*m,glm5_layer*L,const float*xn,const float*
         for(int b=0;b<nblk;b++){ if(selb[b])continue; if(bs[b]>bv){bv=bs[b];best=b;} }
         if(best<0)break; selb[best]=1;
     }
-    /* gather selected positions (causal); under CP keep only my owned blocks. Write past the
-     * nblk-byte bitmap region, then memmove down. */
+    /* gather selected positions (causal); under CP keep only my owned blocks. The nblk offset +
+     * memmove is needed ONLY when the output aliases the bitmap buffer (decode: sel==selb==
+     * m->s_blk_sel, max_pos ints); writing past the nblk-byte bitmap avoids clobbering selb mid-read.
+     * The prefill chunk passes a maxsel-wide ms->psel slice (NOT selb), where sel[nblk+nsel] would
+     * overflow once nblk grows (nblk=2050 @256K > maxsel=2304 slack) -> heap corruption. So offset
+     * only in the aliased case; otherwise write directly. */
+    int off = aliased ? nblk : 0;   /* aliased computed above (== sel==m->s_blk_sel) */
     int nsel=0;
     for(int b=0;b<nblk;b++){ if(!selb[b])continue;
         if(m->cp_on && b%m->ep_size!=m->ep_rank) continue;     /* another rank owns this block */
         int t0=b*B,t1=t0+B; if(t1>pos+1)t1=pos+1;
-        for(int t=t0;t<t1;t++) sel[nblk+nsel++]=t; }
-    memmove(sel,sel+nblk,(size_t)nsel*sizeof(int));
+        for(int t=t0;t<t1;t++) sel[off+nsel++]=t; }
+    if(aliased) memmove(sel,sel+nblk,(size_t)nsel*sizeof(int));
     return nsel;
 }
 
@@ -2779,7 +2962,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
         int*selp=m->s_blk_sel, nsel=0;
         int full_idx = is_moe && glm5_has_full_indexer(c,l);
         if(is_moe && msa_on && full_idx){
-            nsel=glm5_msa_select(m,L,xn,qlat,pos,msa_on,selp);
+            nsel=glm5_msa_select(m,L,xn,qlat,pos,msa_on,selp,c->max_pos);   /* selp=s_blk_sel (max_pos ints) */
             last_msa_nsel=nsel;
         } else if(is_moe && msa_on && last_msa_nsel>0){
             /* GLM-5.2 sparse layers between full-indexer layers reuse the most
@@ -3612,9 +3795,19 @@ typedef struct { float*Y; const glm5_tensor*t; const glm5_iq_q8_block*xq; const 
                  int N,rows,nb; size_t rb; } glm5_iqgN_job;
 static void glm5_iqgN_worker(void*a,int tid,int nthr){
     glm5_iqgN_job*j=a; int per=(j->rows+nthr-1)/nthr, r0=tid*per, r1=r0+per; if(r1>j->rows) r1=j->rows;
+    const int rn=glm5_iq_rown()&&glm5_iq_v2(), nbk=j->nb;
     for(int r=r0;r<r1;r++){
         const uint8_t*w=(const uint8_t*)j->t->w+(size_t)r*j->rb;
-        for(int n=0;n<j->N;n++){
+        int n=0;
+        if(rn) for(;n+4<=j->N;n+=4){                       /* NB=4: decode weight once, dot 4 tokens */
+            int x0=j->tok?j->tok[n]:n,   x1=j->tok?j->tok[n+1]:n+1;
+            int x2=j->tok?j->tok[n+2]:n+2, x3=j->tok?j->tok[n+3]:n+3;
+            float o[4];
+            glm5_iq_q8_row4(j->t,w,j->xq+(size_t)x0*nbk,j->xq+(size_t)x1*nbk,j->xq+(size_t)x2*nbk,j->xq+(size_t)x3*nbk,o,nbk);
+            j->Y[(size_t)n*j->rows+r]=o[0]; j->Y[(size_t)(n+1)*j->rows+r]=o[1];
+            j->Y[(size_t)(n+2)*j->rows+r]=o[2]; j->Y[(size_t)(n+3)*j->rows+r]=o[3];
+        }
+        for(;n<j->N;n++){
             int xi=j->tok?j->tok[n]:n;    /* bucket entries index non-contiguous activations */
             j->Y[(size_t)n*j->rows+r]=glm5_iq_q8_row(j->t,w,j->xq+(size_t)xi*j->nb,j->nb);
         }
@@ -3705,12 +3898,20 @@ static int glm5_gemm_iq_q8_smalln(float*restrict Y,const glm5_tensor*t,const flo
     pthread_once(&glm5_iq_lut_once,glm5_iq_init_luts);
     for(int n=0;n<N;n++) glm5_iq_quant_q8(xq+(size_t)n*nb,X+(size_t)n*cols,cols);
     size_t rb=dequant_row_size((uint32_t)t->type,cols);
+    const int rn=glm5_iq_rown()&&glm5_iq_v2();
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if(rows>=GLM5_PAR_MIN)
 #endif
     for(int r=0;r<rows;r++){
         const uint8_t*w=(const uint8_t*)t->w+(size_t)r*rb;
-        for(int n=0;n<N;n++) Y[(size_t)n*rows+r]=glm5_iq_q8_row(t,w,xq+(size_t)n*nb,nb);
+        int n=0;
+        if(rn) for(;n+4<=N;n+=4){                          /* NB=4: decode weight once, dot 4 tokens */
+            float o[4];
+            glm5_iq_q8_row4(t,w,xq+(size_t)n*nb,xq+(size_t)(n+1)*nb,xq+(size_t)(n+2)*nb,xq+(size_t)(n+3)*nb,o,nb);
+            Y[(size_t)n*rows+r]=o[0]; Y[(size_t)(n+1)*rows+r]=o[1];
+            Y[(size_t)(n+2)*rows+r]=o[2]; Y[(size_t)(n+3)*rows+r]=o[3];
+        }
+        for(;n<N;n++) Y[(size_t)n*rows+r]=glm5_iq_q8_row(t,w,xq+(size_t)n*nb,nb);
     }
     free(xq); return 0;
 }
@@ -4269,10 +4470,18 @@ static int glm5_alloc_mstream_ex(glm5_model*m,int N,int per_stream_kv){
       ms->exg=glm5_amalloc(exn*4); ms->exu=glm5_amalloc(exn*4); } ms->emoe=glm5_amalloc((size_t)N*H*4);
     ms->bk=glm5_amalloc((size_t)c->n_experts*N*sizeof(int)); ms->bw=glm5_amalloc((size_t)c->n_experts*N*4); ms->bcnt=glm5_amalloc((size_t)c->n_experts*sizeof(int));
     ms->logits=glm5_amalloc((size_t)N*hrows*4);
-    ms->sc_stride = per_stream_kv ? c->max_pos : c->n_heads*(ms->maxsel>0?ms->maxsel:c->max_pos);
-    ms->sc=glm5_amalloc((size_t)N*ms->sc_stride*4);
-    int kvok = per_stream_kv ? (ms->kc&&ms->slog) : (ms->psel&&ms->pnsel);
-    if(!kvok||!ms->logits||!ms->qlat||!ms->kvb||!ms->sc||!ms->hmx||!ms->hse){ m->ms=ms; glm5_free_mstream(m); return -1; }
+    /* sc_dense: dense attention scores [N * max_pos], the class-D score buffer.  Its ONLY live
+     * consumer is glm5_forward_batch_decode (per_stream_kv, multi-stream serving with full
+     * non-tiered KV).  The single-stream long-context path (glm5_forward_prefill_chunk +
+     * single-token decode) does NOT use it -- its scores are stack/absorb-local and its MSA block
+     * scores use m->s_blk_score.  So allocate it ONLY for per_stream_kv; this frees ~N*n_heads*
+     * maxsel*4 (~300 MB at pchunk 512) in exactly the memory-tight long-context path, adding OOM
+     * headroom.  (The old non-per-stream sizing fed only the now-dead glm5_msa_prefill_select.)
+     * See a64fx/glm5/CTX_BUFFER_LAYOUT.md. */
+    ms->sc_stride = c->max_pos;
+    ms->sc = per_stream_kv ? glm5_amalloc((size_t)N*ms->sc_stride*4) : NULL;
+    int kvok = per_stream_kv ? (ms->kc&&ms->slog&&ms->sc) : (ms->psel&&ms->pnsel);
+    if(!kvok||!ms->logits||!ms->qlat||!ms->kvb||!ms->hmx||!ms->hse){ m->ms=ms; glm5_free_mstream(m); return -1; }
     m->ms=ms; return 0;
 }
 static int glm5_alloc_mstream(glm5_model*m,int N){ return glm5_alloc_mstream_ex(m,N,1); }
@@ -4426,7 +4635,9 @@ static void glm5_msa_prefill_select(glm5_model*m, glm5_layer*L, int p0, int S, i
         if(!msa_on || nblk<=keep){ int n=0;
             for(int b=0;b<nblk;b++){ int t0=b*B,t1=t0+B; if(t1>p+1)t1=p+1; for(int tt=t0;tt<t1;tt++) sel[n++]=tt; }
             ms->pnsel[t]=n; continue; }
-        float*bs=ms->sc+(size_t)t*c->max_pos; char*selb=ms->pbit+(size_t)t*ms->nblkmax;
+        /* bs holds per-BLOCK scores [0,nblk); stride by nblkmax (not max_pos, which overflows
+         * ms->sc = N*sc_stride once max_pos > sc_stride, i.e. any long-context Tier-B chunk). */
+        float*bs=ms->sc+(size_t)t*ms->nblkmax; char*selb=ms->pbit+(size_t)t*ms->nblkmax;
         for(int b=0;b<nblk;b++){ int t0=b*B,t1=t0+B; if(t1>p+1)t1=p+1; float best=-1e30f;
             for(int tt=t0;tt<t1;tt++){ float scr=0; for(int h=0;h<IH;h++) scr+=glm5_idxdot(m,L,tt,iq+h*ID,ID); if(scr>best)best=scr; }
             bs[b]=best; }
@@ -4502,7 +4713,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
         for(int t=0;t<S;t++){
             int p=p0+t, n=0, *sel=ms->psel+(size_t)t*ms->maxsel;
             if(is_moe && msa_on && glm5_has_full_indexer(c,l)){
-                ms->pnsel[t]=glm5_msa_select(m,L,ms->xn+(size_t)t*H,ms->qlat+(size_t)t*c->q_lora,p,msa_on,sel);
+                ms->pnsel[t]=glm5_msa_select(m,L,ms->xn+(size_t)t*H,ms->qlat+(size_t)t*c->q_lora,p,msa_on,sel,ms->maxsel);
                 continue;
             }
             int win=is_moe ? sparse_window : dense_window;

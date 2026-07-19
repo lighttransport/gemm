@@ -3,9 +3,18 @@
 if [ -z "${BASH_VERSION:-}" ] || shopt -oq posix; then exec /bin/bash "$0" "$@"; fi
 set -euo pipefail
 
-SOURCE="${GLM52_CONVERT_DIR:-$HOME/models/glm52-2bit/a64fx-ep12-v1}"
-DEST="${GLM5_STAGE_DIR:-/local/u14346/glm52-2bit-ep12}"
+# Arg-driven (env kept only as fallback for legacy callers).
+SOURCE="${GLM52_CONVERT_DIR:-$HOME/models/glm52-2bit/a64fx-ep12-2w-v1}"
+DEST="${GLM5_STAGE_DIR:-/local/$USER/glm52-2bit-ep12}"
 STATUS="${GLM5_STATUS_DIR:-.}"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --source) SOURCE="$2"; shift 2;;
+        --dest)   DEST="$2";   shift 2;;
+        --status) STATUS="$2"; shift 2;;
+        *) echo "stage_glm52: unknown arg $1" >&2; exit 2;;
+    esac
+done
 rank="${GLM52_RANK:-${PMIX_RANK:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${MV2_COMM_WORLD_RANK:-}}}}}"
 [ -n "$rank" ] || { echo "stage_glm52: cannot determine MPI rank" >&2; exit 2; }
 printf -v rr '%02d' "$rank"
