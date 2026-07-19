@@ -30,6 +30,7 @@
 
 #ifndef TP_AR_STAG
 #define TP_AR_STAG 7                  /* steering tag for the all-reduce region  */
+#define TP_AR_STAG2 8                 /* second region for the 2D/hierarchical AR col sub-comm  */
 #endif
 #define TP_AR_MAXN   512              /* max ranks in a TP/EP group (covers GLM5 384-node runs) */
 #define TP_AR_NSTEP  11               /* recv slots: sid 0..nrounds+1 (bcast); 11 covers N<=512 (384-node) */
@@ -45,6 +46,7 @@ typedef struct {
     utofu_stadd_t   base;                    /* my region base stadd              */
     char           *region;                  /* send slot + TP_AR_NSTEP recv slots*/
     size_t          slot;                    /* bytes per slot (payload+seq, aligned)*/
+    int             stag;                    /* steering tag of THIS comm's region (sub-comms differ)*/
     int             my_rank, nprocs, max_count;
     /* precomputed recursive-doubling schedule */
     int             pof2, rem, nrounds, bcast_sid, newrank;
@@ -603,11 +605,11 @@ static void tp_allreduce_argmax_n(tp_comm *c, float *vi, int n) {
 /* Register the comm region (TP_AR_STAG) and query peers. `barrier_fn` must
  * globally synchronize all ranks (so every region is registered before the
  * stadd queries). Returns 0 on success. */
-static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *peer_vcq,
-                        int my_rank, int nprocs, int max_count, void (*barrier_fn)(void)) {
+static int tp_comm_init_ex(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *peer_vcq,
+                        int my_rank, int nprocs, int max_count, void (*barrier_fn)(void), int stag) {
     if (nprocs > TP_AR_MAXN) { fprintf(stderr, "tp_ar: nprocs %d > %d\n", nprocs, TP_AR_MAXN); return -1; }
     memset(c, 0, sizeof *c);
-    c->vcq = vcq; c->my_rank = my_rank; c->nprocs = nprocs; c->max_count = max_count;
+    c->vcq = vcq; c->my_rank = my_rank; c->nprocs = nprocs; c->max_count = max_count; c->stag = stag;
     for (int r = 0; r < nprocs; r++) c->peer_vcq[r] = peer_vcq[r];
 
     c->slot = ((size_t)max_count * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
@@ -637,14 +639,14 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
         __asm__ __volatile__("dc civac, %0" :: "r"(c->region + off) : "memory");
     __asm__ __volatile__("dsb sy" ::: "memory");
 
-    int rc = utofu_reg_mem_with_stag(vcq, c->region, region_sz, TP_AR_STAG, 0, &c->base);
+    int rc = utofu_reg_mem_with_stag(vcq, c->region, region_sz, stag, 0, &c->base);
     if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: reg_mem rc=%d\n", rc); return -1; }
 
     if (barrier_fn) barrier_fn();        /* all regions registered before query */
 
     for (int r = 0; r < nprocs; r++) {
         if (r == my_rank) { c->peer_base[r] = c->base; continue; }
-        rc = utofu_query_stadd(c->peer_vcq[r], TP_AR_STAG, &c->peer_base[r]);
+        rc = utofu_query_stadd(c->peer_vcq[r], stag, &c->peer_base[r]);
         if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: query_stadd peer %d rc=%d\n", r, rc); return -1; }
     }
 
@@ -674,8 +676,59 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
     return 0;
 }
 
+/* back-compat: the single-region all-reduce over the whole group (TP_AR_STAG). */
+static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *peer_vcq,
+                        int my_rank, int nprocs, int max_count, void (*barrier_fn)(void)) {
+    return tp_comm_init_ex(c, vcq, peer_vcq, my_rank, nprocs, max_count, barrier_fn, TP_AR_STAG);
+}
+
 static void tp_comm_free(tp_comm *c) {
     if (c->region) { utofu_dereg_mem(c->vcq, c->base, 0); free(c->region); c->region = NULL; }
 }
+
+/* ======================= hierarchical (2-level) all-reduce =======================
+ * Factor the N ranks into A groups of B (A*B == N, rank r -> group g=r/B, pos b=r%B).
+ * A flat recursive-double over N pairs partners 2^k apart in rank space -> up to
+ * log2(N) *physically distant* torus hops.  The 2-level form runs two SMALL reduces:
+ *   (1) row: all-reduce within my group {g*B .. g*B+B-1}  (B CONTIGUOUS ranks)
+ *   (2) col: all-reduce across the A group-siblings {b, B+b, 2B+b, ...} (stride B)
+ * so each level's partners are a contiguous ring / a single torus axis -> cheaper
+ * per-hop latency, smaller per-level non-pof2 remainders, and the fast local row
+ * reduce absorbs arrival skew before the global col step.  Round count is unchanged
+ * (log2 A + log2 B == log2 N); the win is per-round cost + skew, not round count.
+ * The two sub-comms register DISTINCT regions (TP_AR_STAG / TP_AR_STAG2) so they do
+ * not collide, and reuse the full recursive-doubling / bf16 / robust machinery.
+ * Pick A to match a real torus dimension (e.g. N=36 -> A=6,B=6; N=32 -> A=4,B=8). */
+static int tp_comm_init_2d(tp_comm *row, tp_comm *col, utofu_vcq_hdl_t vcq,
+                           const utofu_vcq_id_t *peer_vcq, int my_rank, int nprocs,
+                           int A, int max_count, void (*barrier_fn)(void)) {
+    if (A < 1 || nprocs % A != 0) { fprintf(stderr, "tp_ar_2d: A=%d does not divide N=%d\n", A, nprocs); return -1; }
+    int B = nprocs / A;
+    int g = my_rank / B, b = my_rank % B;
+    utofu_vcq_id_t pv[TP_AR_MAXN];
+    /* row sub-comm: the B contiguous ranks of my group; my row-rank is b (STAG). */
+    for (int j = 0; j < B; j++) pv[j] = peer_vcq[g * B + j];
+    if (tp_comm_init_ex(row, vcq, pv, b, B, max_count, barrier_fn, TP_AR_STAG) != 0) return -1;
+    /* col sub-comm: my A group-siblings at stride B; my col-rank is g (STAG2).
+     * A second global barrier (barrier_fn) ensures every rank has registered STAG2
+     * before any col query_stadd -- both inits are called in lockstep by all ranks. */
+    for (int i = 0; i < A; i++) pv[i] = peer_vcq[i * B + b];
+    if (tp_comm_init_ex(col, vcq, pv, g, A, max_count, barrier_fn, TP_AR_STAG2) != 0) return -1;
+    if (my_rank == 0) fprintf(stderr, "tp_ar_2d: N=%d = A(%d) x B(%d), rounds %d+%d = %d (flat would be %d)\n",
+                              nprocs, A, B, col->nrounds, row->nrounds, col->nrounds + row->nrounds,
+                              (int)(8 * sizeof(int) - __builtin_clz(nprocs - 1)));
+    return 0;
+}
+
+/* in-place SUM-all-reduce of buf[0..count) via the 2-level schedule: reduce within the
+ * group (row), then across groups (col).  After row, every rank in group g holds the
+ * group-sum S_g; col then reduces {S_0..S_{A-1}} so every rank ends with the global sum.
+ * Bit-reproducible across ranks (both sub-reduces are; the two-level order is fixed). */
+static void tp_allreduce_sum_2d(tp_comm *row, tp_comm *col, float *buf, int count) {
+    tp_allreduce_sum(row, buf, count);   /* within-group partial */
+    tp_allreduce_sum(col, buf, count);   /* across-group -> global */
+}
+
+static void tp_comm_free_2d(tp_comm *row, tp_comm *col) { tp_comm_free(row); tp_comm_free(col); }
 
 #endif /* TP_ALLREDUCE_H */

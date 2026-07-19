@@ -129,6 +129,7 @@ int main(void) {
     free(tni_ids);
     barrier_robust(1);   /* everyone registered before tp_comm_init's internal barrier */
 
+    int ar2d = envi("TP_AR_2D", 0);   /* >0: also time the 2-level AR with A=ar2d groups (must divide N) */
     tp_comm comm;
     if (tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, COUNT, barrier) != 0) die("tp_comm_init", -1);
 
@@ -150,18 +151,44 @@ int main(void) {
     }
     double dt = now_sec() - t0;
     barrier_robust(1);
+
+    /* ---- optional: same-allocation comparison against the 2-level (hierarchical) AR ---- */
+    double dt2 = -1.0; long bad2 = 0; int A2 = 0, B2 = 0;
+    if (ar2d > 0 && N % ar2d == 0) {
+        tp_comm_free(&comm);                 /* free STAG7 before the 2D row re-registers it */
+        barrier_robust(1);
+        tp_comm row, col;
+        if (tp_comm_init_2d(&row, &col, Vcq, PeerVcq, MyRank, N, ar2d, COUNT, barrier) != 0) die("tp_comm_init_2d", -1);
+        A2 = ar2d; B2 = N / ar2d;
+        double t2 = now_sec();
+        for (int it = 0; it < REPS; it++) {
+            for (int i = 0; i < COUNT; i++) buf[i] = (float)(MyRank + 1);
+            tp_allreduce_sum_2d(&row, &col, buf, COUNT);
+            for (int i = 0; i < COUNT; i++) if (buf[i] != exp_sum) { bad2++; break; }
+        }
+        dt2 = now_sec() - t2;
+        barrier_robust(1);
+        tp_comm_free_2d(&row, &col);
+    } else if (ar2d > 0 && MyRank == 0) {
+        fprintf(stderr, "tp_ar_ack_test: TP_AR_2D=%d does not divide N=%d; skipping 2D\n", ar2d, N);
+    }
+
     if (MyRank == 0) {
         /* mpiexec does not forward rank stderr, so also write the verdict to a file (== ds4f_ep_runner). */
-        const char *pass = (bad_sum == 0 && bad_max == 0) ? "PASS" : "FAIL";
-        char line[512];
-        snprintf(line, sizeof line,
-                 "tp_ar_ack_test N=%d COUNT=%d REPS=%d ack=%d drop=%lu | reduces=%ld sum_mism=%ld max_mism=%ld "
-                 "wall=%.2fs (%.0f reduce/s) | RESULT: %s\n",
-                 N, COUNT, REPS, comm.ack, comm.drop_n, (long)REPS + REPS / 8, bad_sum, bad_max, dt,
-                 (REPS + REPS / 8.0) / dt, pass);
+        const char *pass = (bad_sum == 0 && bad_max == 0 && bad2 == 0) ? "PASS" : "FAIL";
+        char line[640];
+        int n = snprintf(line, sizeof line,
+                 "tp_ar_ack_test N=%d COUNT=%d REPS=%d ack=%d drop=%lu | flat: %.0f reduce/s (%.1f us/reduce) "
+                 "sum_mism=%ld max_mism=%ld",
+                 N, COUNT, REPS, comm.ack, comm.drop_n, REPS / dt, dt / REPS * 1e6, bad_sum, bad_max);
+        if (dt2 >= 0.0)
+            n += snprintf(line + n, sizeof line - n,
+                 " | 2D A=%dxB=%d: %.0f reduce/s (%.1f us/reduce) sum_mism=%ld speedup=%.2fx",
+                 A2, B2, REPS / dt2, dt2 / REPS * 1e6, bad2, dt / dt2);
+        snprintf(line + n, sizeof line - n, " | RESULT: %s\n", pass);
         fprintf(stderr, "%s", line);
         FILE *rf = fopen("tp_ar_ack_result.txt", "a"); if (rf) { fputs(line, rf); fclose(rf); }
     }
     free(buf);
-    return (bad_sum == 0 && bad_max == 0) ? 0 : 1;
+    return (bad_sum == 0 && bad_max == 0 && bad2 == 0) ? 0 : 1;
 }

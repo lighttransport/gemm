@@ -18,6 +18,7 @@
 #   --np N              ranks                  (default: 12)
 #   --last x,y,z        node to place rank 0 last (spare-node avoidance)
 #   --repeat N          run the model N times
+#   --retries N         retry the model run on a transient uTofu barrier fan-in (default 3)
 #   --no-stage          skip node-local staging (blobs already present)
 #   --no-enforce        do not fail on a missed perf gate
 #   --active-experts N  forwarded to the runner (3 => ~20 tok/s decode; default 8 exact)
@@ -41,6 +42,7 @@ LAST="0,0,0"
 REPEAT=1
 DO_STAGE=1
 ENFORCE=1
+RETRIES=3                 # retry the model run this many times on a transient uTofu barrier fan-in
 CONVERT_DIR="$HOME/models/glm52-2bit/a64fx-ep12-2w-v1"
 STAGE_DIR="/local/$USER/glm52-2bit-ep12"
 PREFILL_TARGET=34
@@ -51,6 +53,7 @@ while [ "$#" -gt 0 ]; do
         --np) NP="$2"; shift 2;;
         --last) LAST="$2"; shift 2;;
         --repeat) REPEAT="$2"; shift 2;;
+        --retries) RETRIES="$2"; shift 2;;
         --no-stage) DO_STAGE=0; shift;;
         --no-enforce) ENFORCE=0; shift;;
         --convert-dir) CONVERT_DIR="$2"; shift 2;;
@@ -174,11 +177,25 @@ esac
 export OMP_NUM_THREADS="$THREADS"
 
 for ((i=1;i<=REPEAT;i++)); do
-    mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
-        "${COMMON[@]}" "${MODE_FLAGS[@]}" --threads "$THREADS" "${RUNNER_FLAGS[@]}" \
-        > >(tee "$RUN_DIR/run-$i.stdout") 2> >(tee "$RUN_DIR/run-$i.stderr" >&2)
-    grep -Eq '^SENTINEL .*=(done)$' glm5_ep_rank00.txt || {
-        echo "rank-0 completion sentinel missing; inspect $RUN_DIR/glm5_ep_stderr_rank*.txt" >&2
+    # A cold uTofu VCQ bring-up occasionally fails the bootstrap barrier ("barrier fan-in
+    # (rc=-1)"), especially right after another job/run tore down the fabric.  It is transient and
+    # clears on a fresh mpiexec, so retry the run (NOT a code bug).  Any other non-completion
+    # (real error, NaN, OOM) is not retried -- its stderr won't match the transient signature.
+    ok=0
+    for ((a=1;a<=RETRIES;a++)); do
+        : > glm5_ep_rank00.txt
+        mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
+            "${COMMON[@]}" "${MODE_FLAGS[@]}" --threads "$THREADS" "${RUNNER_FLAGS[@]}" \
+            > >(tee "$RUN_DIR/run-$i.stdout") 2> >(tee "$RUN_DIR/run-$i.stderr" >&2) || true
+        if grep -Eq '^SENTINEL .*=(done)$' glm5_ep_rank00.txt; then ok=1; break; fi
+        if grep -qa 'barrier fan-in' glm5_ep_rank00.txt "$RUN_DIR"/glm5_ep_stderr_rank*.txt 2>/dev/null; then
+            echo "run $i attempt $a: transient uTofu barrier fan-in; retrying ($a/$RETRIES)" >&2
+            continue
+        fi
+        break   # non-transient failure: stop retrying, fall through to the error below
+    done
+    [ "$ok" = 1 ] || {
+        echo "rank-0 completion sentinel missing after $RETRIES attempt(s); inspect $RUN_DIR/glm5_ep_stderr_rank*.txt" >&2
         exit 5
     }
     cp glm5_ep_rank00.txt "$RUN_DIR/rank00-$i.txt" 2>/dev/null || true

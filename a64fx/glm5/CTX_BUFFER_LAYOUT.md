@@ -139,3 +139,23 @@ separate axis — see output-code.md), more nodes for a larger exact dense windo
 - Decode / 2048-prefill benchmark **unchanged**: with `T_dense ≥ 2304` the
   Tier-A-only path is bit-identical to today (verified this session: decode
   16.28–16.38 tok/s, NaNs=0, after all buffer edits).
+
+## 512K result (2026-07-19, 12n)
+
+Synth prefill to **524288 positions** (8 layers, `--cp-threshold 2048 --pchunk 512
+--set GLM5_MSA_BLOCK_REP=1`, int4 Tier-B): **completes all 524288 tokens at
+242 tok/s with NO crash, NO OOM, NO overflow, NO guard-abort** — the ctx-aware
+buffer layout, bound guards, and int4 CP-sharded Tier-B (43776 slots/rank) all
+handle 512K. Tier A->B re-shard at pos 2048 in 0.034 s.
+
+BUT the run ends `SENTINEL glm5_prefill_g12n=NAN` with **NaNs = 1,388,544 =
+exactly 226 x 6144** -> precisely **226 hidden-vectors went NaN**, onset past
+~362K (an earlier attempt was NaN-free through 362496). The localized 226-position
+pattern rules out a clean int32-threshold overflow (that would corrupt every
+position past ~350K, not 226). So 512K is **structurally capable (runs to
+completion) but not yet numerically clean**: a small set of positions develop NaN
+at extreme context. Suspects (not yet localized): an AR/transient interaction (the
+run had a fabric transient), an MSA block-selection degeneracy under block_rep at
+>256K, or a rope/softmax edge near 2^19. Localize with GLM5_NAN_TRACE on a fresh
+run; this is a follow-up numerical bug, separate from the (completed) stability +
+buffer-layout work. 256K remains fully clean (NaNs=0, verified repeatedly).

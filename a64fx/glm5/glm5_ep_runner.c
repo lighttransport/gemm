@@ -350,6 +350,40 @@ static void run_ar_probe(tp_comm*c,int H){
     glm5_afree(buf);
     if(MyRank==0) logmsg("ARPROBE,end\n");
 }
+/* 2-level (hierarchical) AR probe: same metrics as run_ar_probe but via tp_allreduce_sum_2d over
+ * row(B)+col(A) sub-comms.  Logged as ARPROBE2D,* so a run with GLM5_AR_PROBE=1 GLM5_AR_2D=A emits
+ * both ARPROBE,sum and ARPROBE2D,sum lines for a same-allocation flat-vs-hierarchical comparison.
+ * Covers the decode-relevant sizes (M=1,2,8) + the 78-AR/token comm-bound projection; robust/bf16
+ * follow the production decode path (robust=2, bf16=1).  See a64fx/glm5/DECODE_SCALING.md. */
+static void run_ar_probe_2d(tp_comm*row,tp_comm*col,int H,int A,int B){
+    int reps=envi("GLM5_PROBE_REPS",50), wu=envi("GLM5_PROBE_WARMUP",5);
+    static const int Ms[]={1,2,8,16,32}; const int nM=5;
+    int max_count=row->max_count; float*buf=glm5_amalloc((size_t)max_count*4);
+    if(!buf) die("ar_probe_2d alloc",-1);
+    row->robust=col->robust=2; row->use_bf16=col->use_bf16=1;             /* production decode AR config */
+    if(MyRank==0) logmsg("ARPROBE2D,begin,N=%d,A=%d,B=%d,rounds=%d+%d,max_count=%d,reps=%d\n",
+                         row->nprocs*0+A*B,A,B,col->nrounds,row->nrounds,max_count,reps);
+    for(int mi=0;mi<nM;mi++){ int count=Ms[mi]*H; if(count>max_count) continue;
+        for(int i=0;i<count;i++) buf[i]=(float)((i%13)+1);
+        for(int w=0;w<wu;w++) tp_allreduce_sum_2d(row,col,buf,count);
+        barrier();
+        double t0=now_sec();
+        for(int r=0;r<reps;r++) tp_allreduce_sum_2d(row,col,buf,count);
+        double us=(now_sec()-t0)/reps*1e6;
+        if(MyRank==0) logmsg("ARPROBE2D,sum,A=%d,B=%d,M=%d,bytes=%d,us_per_ar=%.1f\n",A,B,Ms[mi],count*4,us);
+    }
+    for(int mi=0;mi<nM;mi++){ int count=Ms[mi]*H; if(count>max_count) continue;
+        int tok_reps=reps/10>3?reps/10:3;                                /* one decode token = 78 ARs */
+        for(int i=0;i<count;i++) buf[i]=(float)((i%13)+1);
+        barrier(); double t0=now_sec();
+        for(int r=0;r<tok_reps;r++) for(int l=0;l<78;l++) tp_allreduce_sum_2d(row,col,buf,count);
+        double ms=(now_sec()-t0)/tok_reps*1e3;
+        if(MyRank==0) logmsg("ARPROBE2D,token78,A=%d,B=%d,M=%d,ms_per_token_comm=%.2f,tok_s_comm_bound=%.3f\n",
+                             A,B,Ms[mi],ms,Ms[mi]/(ms/1e3));
+    }
+    glm5_afree(buf);
+    if(MyRank==0) logmsg("ARPROBE2D,end\n");
+}
 /* ---- CP (context-parallel KV) callbacks ---- */
 /* all-reduce MAX of per-block index scores so every rank derives the same global top-k. */
 static void ep_blk_reduce(float*scores,int nblk,void*ctx){
@@ -1038,9 +1072,13 @@ static void glm5_cli_usage(void){
       "  --active-experts N  top-k MoE (default 8 exact; 3 => ~20 tok/s, changes output)\n"
       "  --dense-i8[=0|1]    hoisted int8 dense (default ON)   --dense-i8-gs N  group size (64; 256=prefill+)\n"
       "  --gemm-sdot N       prefill/batched GEMM (2=int16, lossless 1.2-1.4x)  --sdot N  M=1 decode (0=w8a16)\n"
-      "\n long context:\n"
+      "\n long context (256K+):\n"
       "  --cp-threshold N    KV tier switch position (0=auto budget; -1=legacy static off)\n"
       "  --kv-budget-gb N    Tier-A bf16 KV cap/node (0=auto from MemAvailable)\n"
+      "  --kv-tier-bf16[=1]  exact bf16 CP-sharded Tier-B (default int4; fits <=256K on 12n)\n"
+      "\n comm calibration:\n"
+      "  --ar-probe[=1]      all-reduce latency probe (skips prefill/decode)\n"
+      "  --ar-2d A           also probe the 2-level AR: A groups of N/A (A must divide the group)\n"
       "\n batched serving / misc:\n"
       "  --batch-decode[=1]  --overlap[=1]  --slots N  --prompts FILE  --nshards N  --ep-size N\n"
       "  --set KEY=VAL       escape hatch: set any GLM5_* var directly\n");
@@ -1063,7 +1101,7 @@ static void glm5_cli(int argc,char**argv){
         #define BFLAG(flag,var) if(!strcmp(a,flag)){ setenv(var,val?val:"1",1); continue; }
         BFLAG("batch-decode","GLM5_BATCH_DECODE") BFLAG("overlap","GLM5_COMM_OVERLAP")
         BFLAG("dense-i8","GLM5_DENSE_I8")         BFLAG("prefill-only","GLM5_PREFILL_ONLY")
-        BFLAG("kv-tier-bf16","GLM5_KV_TIER_BF16")
+        BFLAG("kv-tier-bf16","GLM5_KV_TIER_BF16") BFLAG("ar-probe","GLM5_AR_PROBE")
         #undef BFLAG
         if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }
         #define MAP(flag,var) if(!strcmp(a,flag)){ if(val) setenv(var,val,1); continue; }
@@ -1084,6 +1122,8 @@ static void glm5_cli(int argc,char**argv){
         MAP("gemm-sdot","GLM5_GEMM_SDOT") MAP("sdot","GLM5_MV_SDOT")
         /* long context */
         MAP("cp-threshold","GLM5_CP_THRESHOLD") MAP("kv-budget-gb","GLM5_KV_BUDGET_GB")
+        /* comm calibration */
+        MAP("ar-2d","GLM5_AR_2D")
         /* batched serving / misc */
         MAP("slots","GLM5_CBATCH_SLOTS") MAP("prompts","GLM5_CBATCH_PROMPTS")
         MAP("nshards","GLM5_NSHARDS")    MAP("ep-size","GLM5_EP_SIZE")
@@ -1231,6 +1271,20 @@ int main(int argc,char**argv){
     m->ar_argmax_n_cb=ep_argmax_n_callback; m->ar_argmax_n_ctx=&comm;
     if(envi("GLM5_AR_PROBE",0)){       /* comm calibration only; skips prefill/decode */
         run_ar_probe(&comm,cfg.hidden);
+        /* GLM5_AR_2D=A: also probe the 2-level AR (row=B contiguous, col=A stride-B). Frees the flat
+         * comm's TP_AR_STAG region first so the 2D row can re-register it; needs A | GSize. */
+        int a2d=envi("GLM5_AR_2D",0);
+        if(a2d>0){
+            if(GSize%a2d!=0){ if(MyRank==0) logmsg("ARPROBE2D,skip: A=%d does not divide group %d\n",a2d,GSize); }
+            else {
+                tp_comm_free(&comm); barrier();
+                static tp_comm row,col;
+                if(tp_comm_init_2d(&row,&col,Vcq,PeerVcq+GBase,GRank,GSize,a2d,cfg.hidden*ar_tokens,gbarrier)!=0)
+                    die("tp_comm_init_2d",-1);
+                run_ar_probe_2d(&row,&col,cfg.hidden,a2d,GSize/a2d);
+                tp_comm_free_2d(&row,&col);
+            }
+        }
         if(MyRank==0) logmsg("SENTINEL glm5_ar_probe_%dn=done\n",N);
         barrier();
         return 0;
