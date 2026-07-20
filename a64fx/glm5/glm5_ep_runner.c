@@ -1109,7 +1109,11 @@ static void glm5_cli(int argc,char**argv){
         char*a=argv[i]; if(strncmp(a,"--",2)) continue; a+=2;
         char*eq=strchr(a,'='); char*val=NULL;
         if(eq){ *eq=0; val=eq+1; }
-        else if(i+1<argc && argv[i+1][0]!='-'){ val=argv[++i]; }
+        /* Accept NEGATIVE values: "-1" starts with '-', so a plain argv[i+1][0]!='-' test silently
+         * dropped it and left the flag unset (e.g. `--cp-threshold -1` became a no-op that kept the
+         * baked default).  Treat a leading '-' followed by a digit/dot as a value, not a flag. */
+        else if(i+1<argc && (argv[i+1][0]!='-' ||
+                             ((argv[i+1][1]>='0'&&argv[i+1][1]<='9')||argv[i+1][1]=='.'))){ val=argv[++i]; }
         if(!strcmp(a,"help")){ glm5_cli_usage(); exit(0); }
         if(!strcmp(a,"numa")){ numa=val?atoi(val):1; continue; }
         /* boolean flags default to "1" when given bare (--dense-i8 == --dense-i8=1) */

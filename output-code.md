@@ -136,3 +136,38 @@ Recommended next steps (in order):
 **Bottom line:** the runner refactor, perf targets, and 256K *stability* are done;
 256K *coherence* is bounded by the sparse-attention regime + node count, not by a
 runner bug — it needs the budget fix above and, most directly, more nodes.
+
+---
+
+## RETRACTION (2026-07-20): the incoherence was the PROMPT, not the long-context path
+
+Everything above that attributes the garbage output to the sparse-attention regime,
+int4 KV, or node count is **WRONG** and is retracted. Evidence:
+
+1. A 3-way test at 8K (dense-exact / sparse-full-scoring / sparse-block-rep) showed
+   **even the exact-dense reference produced garbage** — so sparsity/int4/block-rep
+   could not be the cause.
+2. A minimal sanity check — 19-token **chat-framed** prompt, full 78 layers, no
+   tiering, exact dense — produced clean, correct output:
+   `Here is a simple C++ function ... int sum(int a, int b) { return a + b; } ...`
+   at 17.23 tok/s, NaNs=0.
+
+So the model, the 2-bit weights, the runner and the forward pass are all fine.
+
+**Root cause of the "incoherence": malformed prompts in my own tests.**
+- The 512K/108K stress runs fed **hash-random synthetic tokens** (`--prefill-synth`
+  without a real token file) — garbage in, garbage out, correctly.
+- The 108K codegen run additionally used `GLM5_MSA_BLOCK_REP=1` (documented as
+  "not for quality validation") AND a forced `--cp-threshold 2048`.
+- The 8K/16K "tail" tests cut a **mid-document fragment** out of `glm5_codegen.bin`
+  and fed it raw via `--prompt-tokens`, i.e. starting mid-sentence with **no chat
+  template**. The working prompt is chat-framed (154822 154824 154827 … 154828
+  154842); the raw `--prompt-tokens` path applies no framing.
+
+**Lesson:** for any quality/coherence claim, the prompt must be chat-framed
+(`glm5_tokenizer.py chat-file`) and self-contained. Use `--prompt-ids` (framed),
+not `--prompt-tokens` (raw), and never `block_rep`. `--prefill-synth` is a
+throughput/stability tool only — its output is meaningless for quality.
+
+A correct long-context coherence test (17K chat-framed prompt with a self-contained
+question, dense vs sparse-full vs sparse-block-rep) is the next measurement.
