@@ -159,3 +159,50 @@ run had a fabric transient), an MSA block-selection degeneracy under block_rep a
 >256K, or a rope/softmax edge near 2^19. Localize with GLM5_NAN_TRACE on a fresh
 run; this is a follow-up numerical bug, separate from the (completed) stability +
 buffer-layout work. 256K remains fully clean (NaNs=0, verified repeatedly).
+
+### 512K NaN hunt (2026-07-19): OOD divergence of the synthetic prompt, not a bug
+
+Localized with per-chunk NaN instrumentation ([nan-chunk] logs). Findings:
+- Onset ~pos 354153 (chunk [353792,354304)); 60 NaN chunks scattered over
+  354K..524K, DENSER toward the end; dominant 3 tokens/chunk.
+- Count VARIES run-to-run: 226 then 249 NaN positions -> NOT a deterministic
+  index/threshold bug; the exact overflow positions depend on the all-reduce
+  reduction order (sum perturbations tip near-overflow values differently).
+- Ruled out: int32 pos*hidden overflow (no such int index exists; the 349525 =
+  2^31/6144 coincidence is spurious), int4 KV scale overflow (scale is bf16 =
+  fp32 exponent range), empty-CP-selection (attention output is zeroed + hse
+  guarded), bf16-AR range (bf16 has fp32's 8-bit exponent, same overflow point).
+
+Conclusion: the model **numerically diverges on out-of-distribution synthetic
+(random-hash) tokens** past ~354K positions -- activations grow with the garbage
+context until they overflow the float range, AR-order-sensitively. Consistent
+with: 256K clean (never reaches 354K), 108K real codegen prompt clean, and the
+run-to-run count variation. This is a property of the synthetic stress prompt,
+NOT the ctx-aware buffer layout (which handles 512K structurally: no crash/OOM/
+overflow/guard-abort). 512K is structurally capable; numerical cleanliness on
+random tokens past ~354K is expected to fail.
+
+RESOLVED (2026-07-20) -- it WAS a bug, not OOD divergence.  The real-token
+discriminator ALSO NaN'd (onset 329572), refuting OOD.  Op-level tracing
+(GLM5_NAN_TRACE + per-stage glm5_nan_scan) pinned the seed: at layer 6 the LOCAL
+absorb was clean (absorb-local/hmx/hse) but `attn-out` -- i.e. AFTER the cross-rank
+combine -- was NaN.
+
+**Root cause (ep_kv_combine / ep_kv_combine_batch):**
+```c
+float s = expf(mt[h] - gt[h]);   /* gt = global max from tp_allreduce_max */
+bt[h] = st[h] * s;
+```
+`gt` is the global max so `mt-gt <= 0` mathematically, BUT the all-reduce runs with
+TP_AR_BF16=1, so `gt` comes back **bf16-rounded**.  When a rank owns NO selected
+block for a (token,head) it uses the sentinel `mt=-1e30, st(hse)=0`; if the bf16
+rounding of -1e30 lands slightly MORE negative, `mt-gt` becomes a large POSITIVE ->
+`expf` overflows to +inf -> `bt = 0 * inf = NaN`.  At extreme context the ~18
+MSA-selected blocks spread thinly over the ranks, so empty-selection (token,head)
+pairs become common -- hence the ~330K onset, the growth with context, and the
+AR-order-sensitive run-to-run count (226 vs 249).
+
+**Fix:** clamp the (mathematically <=0) exponent and skip empty heads, in BOTH
+combines: `d=mt-gt; if(d>0) d=0; s = (st>0) ? expf(d) : 0;`
+**Verified:** 335872-token prefill past the old onset -> NaNs=0, SENTINEL=done
+(was NaN at 329572).

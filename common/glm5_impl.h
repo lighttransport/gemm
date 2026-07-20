@@ -2425,6 +2425,7 @@ static void glm5_numa_report(const char*tag,const void*p,size_t n){
 static void glm5_dense_i8_convert(glm5_model*m){
     if(!glm5_envi("GLM5_DENSE_I8",0)) return;
     int gs=glm5_envi("GLM5_DENSE_I8_GS",64), n=0;
+    if(gs<1) gs=64;   /* gs is a DIVISOR in every quant/dequant path: --dense-i8-gs 0 would SIGFPE */
     for(int l=0;l<m->cfg.n_layers;l++){
         glm5_layer*L=&m->layers[l];
         glm5_tensor*ts[]={&L->wq_a,&L->wq_b,&L->wkv_a,&L->wo,
@@ -2850,7 +2851,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             float hmx[64],hse[64];
             const int kvb_stride=c->qk_nope_dim+c->v_head_dim, kvl=c->kv_lora;
             int nthr=omp_get_max_threads();
-            int nchunk=(nthr+nown-1)/nown; if(nchunk<1) nchunk=1;
+            int nchunk=(nown>0)?((nthr+nown-1)/nown):1; if(nchunk<1) nchunk=1;  /* nown==0 possible at ep_size>n_heads */
             if(nown*nchunk>GLM5_ABS_MAXTILE){ nchunk=GLM5_ABS_MAXTILE/nown; if(nchunk<1) nchunk=1; }
             int chunklen=(nsel+nchunk-1)/nchunk; if(chunklen<1) chunklen=1;
             while(nchunk>1 && chunklen<32){ nchunk--; chunklen=(nsel+nchunk-1)/nchunk; }
@@ -3084,7 +3085,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
                     glm5_sigmoid_row(rl,c->n_experts);
                     for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f;
                         for(int e=0;e<c->n_experts;e++){ int used=0; for(int j2=0;j2<a;j2++) if(selx[j2]==e){used=1;break;} if(used)continue;
-                            float v=rl[e]+L->gate_bias[e]; if(v>bv){bv=v;best=e;} } selx[a]=best; selw[a]=rl[best]; }
+                            float v=rl[e]+L->gate_bias[e]; if(v>bv){bv=v;best=e;} } selx[a]=(best<0)?0:best; selw[a]=(best<0)?0.0f:rl[best]; }  /* guard: NaN logits leave best=-1 -> avoid rl[-1] OOB */
                     float wsum=0; for(int a=0;a<na;a++) wsum+=selw[a]; if(wsum<=0)wsum=1;
                     for(int a=0;a<na;a++){ int sl=glm5_ex_slot(m,selx[a]);
                         if(sl>=0){ oslot[nownx]=sl; ow[nownx]=selw[a]/wsum*c->routed_scale; nownx++; } }
@@ -3194,7 +3195,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             int selx[64]; float selw[64]; int na=c->n_active>64?64:c->n_active;
             for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f;
                 for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(selx[j]==e){used=1;break;} if(used)continue;
-                    float v=rl[e]+L->gate_bias[e]; if(v>bv){bv=v;best=e;} } selx[a]=best; selw[a]=rl[best]; }
+                    float v=rl[e]+L->gate_bias[e]; if(v>bv){bv=v;best=e;} } selx[a]=(best<0)?0:best; selw[a]=(best<0)?0.0f:rl[best]; }  /* guard: NaN logits leave best=-1 -> avoid rl[-1] OOB */
             float wsum=0; for(int a=0;a<na;a++) wsum+=selw[a]; if(wsum<=0)wsum=1;
             float*route=m->s_route; for(int i=0;i<H;i++) route[i]=0;
             GLM5_FAPP_STOP("glm5_dec_router");
@@ -4379,6 +4380,13 @@ static void glm5_absorb_token_par(glm5_model*m,glm5_layer*L,const float*qb,float
     const glm5_config*c=&m->cfg;
     const int KVC=glm5_kv_cache_dim(c), kvb_stride=c->qk_nope_dim+c->v_head_dim, kvl=c->kv_lora;
     const float ascale=1.0f/sqrtf((float)c->qk_head_dim);
+    /* A rank can own ZERO attention heads once ep_size > n_heads (glm5_shard gives base=0: at
+     * ep_size=96, n_heads=64 -> 32 ranks get 0).  nown is a DIVISOR below, so that is a SIGFPE.
+     * Such a rank simply has no attention work (arows=0; it contributes 0 to the o-proj all-reduce,
+     * which stays uniform across ranks), so return early.  Not reachable under CP -- tp_attn is
+     * force-disabled when cp_on, making nown==n_heads on every rank -- but reachable for
+     * short-context TP runs at >64 ranks. */
+    if(nown<=0) return;
     int nthr=1;
 #ifdef _OPENMP
     nthr=omp_get_max_threads();
@@ -4540,7 +4548,7 @@ static void glm5_forward_batch_decode(glm5_model*m, float*X, int N, const int*po
             for(int t=0;t<N;t++){ float*rl=ms->router+(size_t)t*c->n_experts;
                 for(int e=0;e<c->n_experts;e++) rl[e]=1.0f/(1.0f+expf(-rl[e]));
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=(best<0)?0:best; sw[a]=(best<0)?0.0f:rl[best]; }  /* best stays -1 if every rl[] is NaN (NaN cmp is false): pick 0 w/ zero weight, never rl[-1] */
                 float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
             /* EXPERT GROUPING: bucket tokens by owned expert, run ONE M=g GEMM per owned
              * expert (weight read once for the whole group) instead of M=1 per (token,expert). */
@@ -4658,12 +4666,22 @@ static void glm5_msa_prefill_select(glm5_model*m, glm5_layer*L, int p0, int S, i
  * Returns the LAST token's argmax (next-token prediction); other tokens' logits aren't needed.
  * Prefill is compute-bound -> ideally run WITHOUT CP (replicated/TP KV); CP works but adds a
  * per-token collective in the MSA select. Requires glm5_alloc_mstream_ex(m,S,0). */
+/* GLM5_NAN_TRACE prefill localizer: report the FIRST (layer,stage,pos) where a chunk buffer goes
+ * NaN, capped, rank-0 only.  Localizes the 512K structural NaN (onset ~330-354K). */
+static int g_nan_op_shown=0;
+static void glm5_nan_scan(int on,int rank0,const char*stage,int l,const float*buf,int S,int stride,int width,int p0){
+    if(!on||!rank0||g_nan_op_shown>=24) return;
+    for(int t=0;t<S;t++){ const float*b=buf+(size_t)t*stride;
+        for(int i=0;i<width;i++) if(!(b[i]==b[i])){ g_nan_op_shown++;
+            fprintf(stderr,"[nan-op] layer=%d stage=%s pos=%d elem=%d/%d\n",l,stage,p0+t,i,width); return; } }
+}
 static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int need_head){
     m->prefill_ntok=S;            /* expose chunk size to the GEMM dispatch (expert sdot gate) */
     const glm5_config*c=&m->cfg;
     const int H=c->hidden, AD=glm5_attn_dim(c);
     const int KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;
     const float ascale=1.0f/sqrtf((float)c->qk_head_dim);
+    const int nan_tr=glm5_envi("GLM5_NAN_TRACE",0), r0=(m->ep_rank==0);
     glm5_mstream*ms=(glm5_mstream*)m->ms;
     const int msa_on=m->msa_on;
     const int attn_window=glm5_envi("GLM5_ATTN_WINDOW",0);
@@ -4745,6 +4763,11 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             float*ctxb=qabs+(size_t)c->n_heads*c->kv_lora;
             glm5_prefill_absorb_token(m,L,qb,ab,sel,ns,hmx,hse,qabs,ctxb,ms->v+(size_t)t*KVC,nown,qrows,arows,qk_mode);
         }
+        /* NaN localizer: these three scan the LOCAL absorb result BEFORE the cross-rank combine.
+         * If they are clean but "attn-out" (after the combine) is NaN, the combine is the culprit. */
+        glm5_nan_scan(nan_tr,r0,"absorb-local",l,ms->attn,S,arows,arows,p0);
+        glm5_nan_scan(nan_tr,r0,"absorb-hmx",l,ms->hmx,S,64,nown,p0);
+        glm5_nan_scan(nan_tr,r0,"absorb-hse",l,ms->hse,S,64,nown,p0);
         /* deferred combine/normalize. Under CP this calls uTofu: the batched cb merges the whole
          * chunk in 2 collectives (bit-identical to the per-token loop, which is kept as fallback);
          * both are deterministic (same buffer layout/order on every rank). Non-CP just normalizes. */
@@ -4767,12 +4790,15 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
         GLM5_FAPP_STOP("glm5_attn");
         glm5_prof_add(m,GLM5_P_ATTN,pt);
         pt=glm5_prof_now();
+        glm5_nan_scan(nan_tr,r0,"attn-out",l,ms->attn,S,arows,arows,p0);   /* MSA/absorb attention output */
         GLM5_FAPP_START("glm5_o_proj");
         GLM5_FAPP_START("glm5_o_proj_gemm");
         if(!glm5_gemm_sdot_override(m,ms->o,&L->wo,ms->attn,S,H,arows,oproj_gsd))
             glm5_gemm(m,ms->o,&L->wo,ms->attn,S,H,arows);
         GLM5_FAPP_STOP("glm5_o_proj_gemm");
+        glm5_nan_scan(nan_tr,r0,"o-gemm",l,ms->o,S,H,H,p0);                /* after o_proj GEMM, before AR */
         if(tp_attn && m->ar_cb){ GLM5_FAPP_START("glm5_o_proj_ar"); m->ar_cb(ms->o,S*H,m->ar_ctx); GLM5_FAPP_STOP("glm5_o_proj_ar"); }
+        glm5_nan_scan(nan_tr,r0,"o-ar",l,ms->o,S,H,H,p0);                  /* after o_proj all-reduce */
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static) if((long)S*H>=GLM5_PAR_MIN)
 #endif
@@ -4808,7 +4834,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
                  * so this loop is parallelized (was single-threaded -> ~25% of full-model prefill). */
                 glm5_sigmoid_row(rl,c->n_experts);
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=(best<0)?0:best; sw[a]=(best<0)?0.0f:rl[best]; }  /* best stays -1 if every rl[] is NaN (NaN cmp is false): pick 0 w/ zero weight, never rl[-1] */
                 float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
             { static int ldb=0; if(getenv("GLM5_ROUTER_DBG") && m->ep_rank==0 && ldb<2){ fprintf(stderr,"ROUTER_DBG sigmoid+topk loop=%.4f s\n",glm5_prof_now()-t_loop); ldb++; } }
             GLM5_FAPP_STOP("glm5_router");
@@ -4867,6 +4893,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             #pragma omp parallel for schedule(static) if((long)S*H>=GLM5_PAR_MIN)
 #endif
             for(size_t i=0;i<(size_t)S*H;i++) X[i]+=ms->route[i] + (tp_sh?0.0f:ms->tmp2[i]);
+            glm5_nan_scan(nan_tr,r0,"post-moe-X",l,X,S,H,H,p0);           /* after router+experts+shared */
             GLM5_FAPP_STOP("glm5_shared");
             glm5_prof_add(m,GLM5_P_SHARED,pt);
         } else {
@@ -4889,6 +4916,7 @@ static int glm5_forward_prefill_chunk(glm5_model*m, float*X, int S, int p0, int 
             #pragma omp parallel for schedule(static) if((long)S*H>=GLM5_PAR_MIN)
 #endif
             for(size_t i=0;i<(size_t)S*H;i++) X[i]+=ms->tmp2[i];
+            glm5_nan_scan(nan_tr,r0,"post-ffn-X",l,X,S,H,H,p0);          /* after dense FFN */
             GLM5_FAPP_STOP("glm5_dense_ffn");
             glm5_prof_add(m,GLM5_P_DENSE_FFN,pt);
         }
@@ -5061,7 +5089,7 @@ static int glm5_forward_prefill_chunk_sp(glm5_model*m, float*X, int S, int p0, i
             for(int t=0;t<S;t++){ float*rl=ms->router+(size_t)t*c->n_experts;
                 glm5_sigmoid_row(rl,c->n_experts);
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=(best<0)?0:best; sw[a]=(best<0)?0.0f:rl[best]; }  /* best stays -1 if every rl[] is NaN (NaN cmp is false): pick 0 w/ zero weight, never rl[-1] */
                 float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
             glm5_prof_add(m,GLM5_P_ROUTER,pt);
             pt=glm5_prof_now();
@@ -5233,7 +5261,7 @@ static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X
                 L->kv_cache=ms->kc+(size_t)st*per+(size_t)l*c->max_pos*KVC;   /* swapped; restored below */
                 int ns0=pos[0]+1, ns1=pos[1]+1;
                 int*selid=m->s_blk_sel; for(int j2=0;j2<ns1;j2++) selid[j2]=j2;
-                int nchunk=(nt+nown-1)/nown; if(nchunk<1) nchunk=1;
+                int nchunk=(nown>0)?((nt+nown-1)/nown):1; if(nchunk<1) nchunk=1;  /* nown==0 possible at ep_size>n_heads */
                 if(2*nown*nchunk>GLM5_ABS_MAXTILE){ nchunk=GLM5_ABS_MAXTILE/(2*nown); if(nchunk<1) nchunk=1; }
                 int chunklen=(ns1+nchunk-1)/nchunk; if(chunklen<1) chunklen=1;
                 while(nchunk>1 && chunklen<32){ nchunk--; chunklen=(ns1+nchunk-1)/nchunk; }
@@ -5372,7 +5400,7 @@ static int glm5_bd_layer_fused(glm5_model*m,glm5_mstream*ms,glm5_layer*L,float*X
             int*sel=sel_all+t*na; float*sw=selw_all+t*na;
             for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f;
                 for(int e=0;e<c->n_experts;e++){ int used=0; for(int j2=0;j2<a;j2++) if(sel[j2]==e){used=1;break;} if(used)continue;
-                    float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                    float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=(best<0)?0:best; sw[a]=(best<0)?0.0f:rl[best]; }  /* best stays -1 if every rl[] is NaN (NaN cmp is false): pick 0 w/ zero weight, never rl[-1] */
             float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1;
             for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale;
         }
@@ -5591,7 +5619,7 @@ static void glm5_forward_batch_decode_mla(glm5_model*m, float*X, int M, const in
 #endif
             for(int t=0;t<M;t++){ float*rl=ms->router+(size_t)t*c->n_experts; glm5_sigmoid_row(rl,c->n_experts);
                 int*sel=sel_all+t*na; float*sw=selw_all+t*na;
-                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=best; sw[a]=rl[best]; }
+                for(int a=0;a<na;a++){ int best=-1; float bv=-1e30f; for(int e=0;e<c->n_experts;e++){ int used=0; for(int j=0;j<a;j++) if(sel[j]==e){used=1;break;} if(used)continue; float vv=rl[e]+L->gate_bias[e]; if(vv>bv){bv=vv;best=e;} } sel[a]=(best<0)?0:best; sw[a]=(best<0)?0.0f:rl[best]; }  /* best stays -1 if every rl[] is NaN (NaN cmp is false): pick 0 w/ zero weight, never rl[-1] */
                 float wsum=0; for(int a=0;a<na;a++) wsum+=sw[a]; if(wsum<=0)wsum=1; for(int a=0;a<na;a++) sw[a]=sw[a]/wsum*c->routed_scale; }
             glm5_prof_add(m,GLM5_P_ROUTER,pt);
             pt=glm5_prof_now();

@@ -402,7 +402,13 @@ static void ep_kv_combine(float*out,float*mx,float*se,int nh,int hd,void*ctx){
     tp_allreduce_max(c,gmx,nh);                              /* global per-head max */
     long nf=1;
     int cnt=nh+nh*hd; float*buf=g_kvbuf;                     /* [se(nh) | out(nh*hd)] rescaled */
-    for(int h=0;h<nh;h++){ float s=expf(mx[h]-gmx[h]); buf[h]=se[h]*s;
+    for(int h=0;h<nh;h++){
+        /* same guard as ep_kv_combine_batch: clamp the (mathematically <=0) exponent so a bf16-
+         * rounded global max cannot overflow expf, and skip empty-selection heads (se==0) whose
+         * 0*inf would be NaN.  See the 512K long-context NaN note in CTX_BUFFER_LAYOUT.md. */
+        float d=mx[h]-gmx[h]; if(d>0.0f) d=0.0f;
+        float s=(se[h]>0.0f)?expf(d):0.0f;
+        buf[h]=se[h]*s;
         float*o=out+h*hd,*b=buf+nh+(size_t)h*hd; for(int i=0;i<hd;i++) b[i]=o[i]*s; }
     for(int off=0;off<cnt;){ int n=cnt-off; if(n>mc)n=mc; tp_allreduce_sum(c,buf+off,n); off+=n; nf++; }
     for(int h=0;h<nh;h++){ float inv=1.0f/(buf[h]>0?buf[h]:1.0f);
@@ -434,7 +440,16 @@ static void ep_kv_combine_batch(float*out,float*mx,float*se,int S,int nh,int hd,
     for(int t=0;t<S;t++){
         const float*mt=mx+(size_t)t*mxse_stride,*st=se+(size_t)t*mxse_stride,*gt=gmx+(size_t)t*nh;
         const float*ot=out+(size_t)t*out_stride; float*bt=g_kvbuf+(size_t)t*blk;
-        for(int h=0;h<nh;h++){ float s=expf(mt[h]-gt[h]); bt[h]=st[h]*s;
+        for(int h=0;h<nh;h++){
+            /* gt is the GLOBAL max, so mt-gt <= 0 mathematically; a positive can only come from the
+             * all-reduce's bf16 rounding of the max (TP_AR_BF16=1).  Unclamped that overflows expf
+             * to +inf and, for a rank with an EMPTY local selection (mt=-1e30, st=0), yields
+             * 0*inf = NaN.  That is the 512K long-context NaN: at extreme ctx the ~18 MSA-selected
+             * blocks spread thinly over the ranks, so some (token,head) has no owned block on this
+             * rank and hits the sentinel.  Clamp the exponent and skip empty heads. */
+            float d=mt[h]-gt[h]; if(d>0.0f) d=0.0f;
+            float s=(st[h]>0.0f)?expf(d):0.0f;
+            bt[h]=st[h]*s;
             const float*o=ot+(size_t)h*hd; float*b=bt+nh+(size_t)h*hd; for(int i=0;i<hd;i++) b[i]=o[i]*s; } }
     /* (3) one flat fragmented allreduce_sum over the whole [S*blk] payload. */
     { double t0=now_sec(); size_t cnt=(size_t)S*blk; for(size_t off=0;off<cnt;){ size_t n=cnt-off; if(n>(size_t)mc)n=(size_t)mc;
@@ -1289,6 +1304,30 @@ int main(int argc,char**argv){
         barrier();
         return 0;
     }
+    /* ---- LOCKSTEP: make the Tier A->B transition point identical on every rank ----
+     * glm5_kv_init derives T_cp from THIS NODE's /proc/meminfo MemAvailable, which genuinely
+     * differs across nodes (each staged a different 24.5 GB blob, so page cache differs).  The
+     * transition flips m->cp_on, which GATES a collective (the CP kv-combine), so a divergent
+     * T_cp makes some ranks issue the combine while others do not -> mismatched collectives ->
+     * the all-reduce/barrier waits out -> "barrier fan-in (rc=-1)".  Block alignment (128 pos ~
+     * 14 MB of budget) hides small skew, but not the 100s of MB staging can leave.
+     * Reduce to the MIN across ranks (min via max-of-negation).  Safe wrt the ALREADY-allocated
+     * Tier-A KV: every rank's buffer was sized for its own T_cp >= the min (a rank that needed no
+     * tiering allocated the full ctx), so shrinking the transition point never overflows.
+     * A rank that thought it fit (T_cp==0) must also switch on MSA once any rank must tier. */
+    /* UNCONDITIONAL: the reduce itself must be lockstep, so it may not be gated on any per-rank
+     * value (T_cp/msa_on are exactly the values that diverge).  All-ranks-fit collapses to the
+     * sentinel and changes nothing. */
+    {   float v = (m->T_cp>0) ? (float)m->T_cp : 1e30f;   /* +big sentinel = "no tiering needed" */
+        float nv = -v; tp_allreduce_max(&comm,&nv,1); v = -nv;      /* -> global MIN */
+        if(v < 1e29f){
+            int T=(int)v;
+            if(m->T_cp==0){ m->msa_on=1; }   /* this rank fit, but another must tier: join it */
+            if(T!=m->T_cp && GRank==0)
+                logmsg("T_cp sync: local %d -> global min %d (per-node MemAvailable skew)\n",m->T_cp,T);
+            m->T_cp=T;
+        }
+    }
     /* decode sampling (off by default; temp<=0 => greedy argmax). Lockstep: identical seed on
      * every rank => identical token. Only effective when the lm_head is replicated. */
     { const char*te=getenv("GLM5_TEMP"); const char*tp=getenv("GLM5_TOPP"); const char*rp=getenv("GLM5_REP_PEN");
@@ -1591,7 +1630,13 @@ int main(int argc,char**argv){
                                               :glm5_forward_prefill_chunk(m,Xc,S,pa,pa+S>=pend);
                 if(a<-1) die("GLM5_PREFILL_SP needs GLM5_TP=0, CP/MSA off",a);
                 if(a>=0) pf_last=a;
-                for(size_t i=0;i<(size_t)S*C;i++) if(!(Xc[i]==Xc[i])) nan++;
+                { long chunk_nan=0; int first_nan_t=-1, nan_toks=0;   /* per-chunk NaN localization */
+                  for(int t=0;t<S;t++){ int tn=0; for(int i=0;i<C;i++) if(!(Xc[(size_t)t*C+i]==Xc[(size_t)t*C+i])) tn++;
+                      if(tn){ if(first_nan_t<0) first_nan_t=t; chunk_nan+=tn; nan_toks++; } }
+                  nan+=chunk_nan;
+                  if(chunk_nan && GRank==0)
+                      logmsg("[nan-chunk] pos=[%d,%d) first_nan_pos=%d nan_toks=%d/%d elems=%ld\n",
+                             pa,pa+S,pa+first_nan_t,nan_toks,S,chunk_nan); }
                 if(GRank==0 && envi("GLM5_PREFILL_ROLLING",1)){
                     double dt=now_sec()-t0;
                     logmsg("prefill_progress: %d/%d tok elapsed=%.3f rate=%.2f tok/s RSS=%.2f GB\n",
