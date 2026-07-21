@@ -373,6 +373,7 @@ typedef struct {
     void   *blk_reduce_ctx;
     /* scratch (per-forward, single token) */
     float *s_norm, *s_q, *s_k, *s_v, *s_kvb, *s_qabs, *s_ctx, *s_attn, *s_o;
+    float *s_q_lat;                    /* MLA q_a latent; separate from index-query output */
     float *s_idx_q, *s_idx_k;          /* MSA index projections */
     float *s_blk_score; int *s_blk_sel; int s_blk_nsel;  /* per-block scores + selected block ids */
     float *s_attn_score;               /* [local_heads, max_pos] decode attention scores */

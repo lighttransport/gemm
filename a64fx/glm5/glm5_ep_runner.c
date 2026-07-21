@@ -1091,7 +1091,7 @@ static void glm5_cli_usage(void){
       "  --cp-threshold N    KV tier switch position (0=auto budget; -1=legacy static off)\n"
       "  --kv-budget-gb N    Tier-A bf16 KV cap/node (0=auto from MemAvailable)\n"
       "  --kv-tier-bf16[=1]  exact bf16 CP-sharded Tier-B (default int4; fits <=256K on 12n)\n"
-      "  --stable-outputs[=1]  fixed-tree + BF16 Tier-B + serial single-token decode\n"
+      "  --stable-outputs[=1]  fixed-tree + BF16 Tier-B + serial absorbed attention\n"
       "\n comm calibration:\n"
       "  --ar-probe[=1]      all-reduce latency probe (skips prefill/decode)\n"
       "  --ar-2d A           also probe the 2-level AR: A groups of N/A (A must divide the group)\n"

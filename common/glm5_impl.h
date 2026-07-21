@@ -1686,7 +1686,7 @@ static void glm5_free(glm5_model*m){
     glm5_afree(m->s_axq);glm5_afree(m->s_axq2);glm5_afree(m->s_axg);glm5_afree(m->s_axg2);
     glm5_afree(m->s_bxq);glm5_afree(m->s_bxq2);glm5_afree(m->s_bxsc);glm5_afree(m->s_bxsc2);
     glm5_afree(m->s_bxg);glm5_afree(m->s_bxg2);
-    glm5_afree(m->s_idx_q);glm5_afree(m->s_idx_k);glm5_afree(m->s_blk_score);glm5_afree(m->s_blk_sel);glm5_afree(m->s_attn_score);
+    glm5_afree(m->s_q_lat);glm5_afree(m->s_idx_q);glm5_afree(m->s_idx_k);glm5_afree(m->s_blk_score);glm5_afree(m->s_blk_sel);glm5_afree(m->s_attn_score);
     glm5_afree(m->s_router);glm5_afree(m->s_shg);glm5_afree(m->s_shu);glm5_afree(m->s_sh);glm5_afree(m->s_moe);
     glm5_afree(m->s_exg);glm5_afree(m->s_exu);glm5_afree(m->s_route);glm5_afree(m->s_ff_g);glm5_afree(m->s_ff_u);glm5_afree(m->s_ff);glm5_afree(m->s_logits);
     glm5_afree(m);
@@ -1913,6 +1913,7 @@ static void glm5_alloc_scratch(glm5_model*m,int hrows){
     m->s_bxsc=glm5_amalloc(4*4); m->s_bxsc2=glm5_amalloc(4*4);
     m->s_bxg =glm5_amalloc((size_t)4*256*sizeof(int64_t)); m->s_bxg2=glm5_amalloc((size_t)4*256*sizeof(int64_t));
     m->s_attn=glm5_amalloc(AD*4); m->s_o=glm5_amalloc(H*4);
+    m->s_q_lat=glm5_amalloc((size_t)cfg->q_lora*4);
     m->s_idx_q=glm5_amalloc((size_t)IQD*4); m->s_idx_k=glm5_amalloc((size_t)ID*4);
     m->s_blk_score=glm5_amalloc((size_t)cfg->max_pos*4); m->s_blk_sel=glm5_amalloc((size_t)cfg->max_pos*sizeof(int));
     m->s_attn_score=glm5_amalloc((size_t)cfg->max_pos*sh_heads*4);
@@ -2796,14 +2797,23 @@ static void glm5_exbN_down_worker(void*a,int tid,int nthr){
 }
 
 /* ===================== forward (one token at position pos) ===================== */
+static void glm5_stable_trace_residual(const glm5_model*m,const float*x,int n,
+                                       int pos,int layer,const char*stage){
+    static int enabled=-1, trace_pos=-2;
+    if(enabled<0) enabled=glm5_envi("GLM5_STABLE_TRACE",0);
+    if(!enabled||m->ep_rank!=0) return;
+    if(trace_pos==-2) trace_pos=glm5_envi("GLM5_STABLE_TRACE_POS",-1);
+    if(trace_pos>=0&&pos!=trace_pos) return;
+    uint64_t h=UINT64_C(1469598103934665603); double sum=0.0,asum=0.0;
+    for(int i=0;i<n;i++){
+        uint32_t u; memcpy(&u,x+i,sizeof u);
+        h^=u; h*=UINT64_C(1099511628211);
+        sum+=(double)x[i]; asum+=fabs((double)x[i]);
+    }
+    fprintf(stderr,"[stable-trace] pos=%d L=%d %s hash=%016llx sum=%.17g asum=%.17g\n",
+            pos,layer,stage,(unsigned long long)h,sum,asum);
+}
 static int glm5_forward_token(glm5_model*m,float*x,int pos){
-    /* Chunked prefill remains parallel, but the opt-in reproducibility profile runs
-     * single-token decode with one OpenMP worker. Several decode kernels partition shared
-     * scratch across a persistent team; serial execution removes scheduling/team-size drift
-     * from the autoregressive state while the exact source is being narrowed further. */
-#ifdef _OPENMP
-    if(glm5_stable_outputs() && omp_get_max_threads()!=1) omp_set_num_threads(1);
-#endif
     /* Defer the persistent pool until decode.  Creating it during model load
      * leaves spinning workers contending with the OpenMP prefill GEMMs. */
     if(!m->pool&&glm5_envi("GLM5_POOL",0)) m->pool=glm5_g_pool=glm5_pool_create(m->n_threads);
@@ -2812,7 +2822,9 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
     const int KVC=glm5_kv_cache_dim(c), half=c->qk_rope_dim/2;
     const float ascale=1.0f/sqrtf((float)c->qk_head_dim);
     float*xn=m->s_norm,*q=m->s_q,*kv=m->s_k,*kvb=m->s_kvb,*attn=m->s_attn,*ao=m->s_o,*score=m->s_attn_score;
-    float*qlat=m->s_idx_q; /* >= q_lora */
+    /* q_lat must not alias s_idx_q: the first full MSA indexer projects
+     * [q_lora] -> [index_heads*index_dim] while still reading q_lat. */
+    float*qlat=m->s_q_lat;
     const int msa_on=m->msa_on;
     const int attn_window=glm5_envi("GLM5_ATTN_WINDOW",0);
     const int dense_window=glm5_envi("GLM5_DENSE_ATTN_WINDOW",attn_window);
@@ -3065,6 +3077,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
                         l,c->n_layers,na,H,nq,qrows,nat,arows);
             }
         }
+        glm5_stable_trace_residual(m,x,H,pos,l,"attn");
         /* FFN / MoE */
         pt=glm5_prof_now();
         float*h2=m->s_norm; glm5_rmsnorm_gemma(h2,x,L->post_norm,H,c->norm_eps);
@@ -3257,6 +3270,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             GLM5_FAPP_STOP("glm5_dec_dense_ffn");
             glm5_prof_add(m,GLM5_P_DENSE_FFN,pt);
         }
+        glm5_stable_trace_residual(m,x,H,pos,l,"ffn");
         /* GLM5_TOK_TRACE: layer wall vs the buckets accumulated inside this layer */
         if(glm5_tok_trace()){ double b1=0; for(int pi=0;pi<GLM5_NPHASE;pi++) b1+=m->prof[pi];
                   glm5_lay_wall+=glm5_prof_now()-lay_t0; glm5_lay_buck+=b1-lay_b0; glm5_lay_n++; }
