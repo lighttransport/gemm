@@ -609,7 +609,7 @@ static int parse_id_line(char *line,int **out_ids,int *out_n){
     while(*p){
         long v=strtol(p,&end,10);
         if(end==p) break;
-        if(n>=cap){ cap*=2; ids=realloc(ids,(size_t)cap*sizeof(int)); }
+        if(n>=cap){ int oc=cap; cap*=2; ids=glm5_arealloc(ids,(size_t)oc*sizeof(int),(size_t)cap*sizeof(int)); }
         ids[n++]=(int)v;
         p=end;
         while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
@@ -625,7 +625,7 @@ static int load_prompt_batch(const char*path,id_prompt **out){
     while(getline(&line,&linecap,f)>0){
         int *ids=NULL, ni=0;
         if(!parse_id_line(line,&ids,&ni)) continue;
-        if(n>=cap){ cap*=2; ps=realloc(ps,(size_t)cap*sizeof(id_prompt)); }
+        if(n>=cap){ int oc=cap; cap*=2; ps=glm5_arealloc(ps,(size_t)oc*sizeof(id_prompt),(size_t)cap*sizeof(id_prompt)); }
         ps[n++]=(id_prompt){ids,ni};
     }
     free(line); fclose(f); *out=ps; return n;
@@ -1091,6 +1091,7 @@ static void glm5_cli_usage(void){
       "  --cp-threshold N    KV tier switch position (0=auto budget; -1=legacy static off)\n"
       "  --kv-budget-gb N    Tier-A bf16 KV cap/node (0=auto from MemAvailable)\n"
       "  --kv-tier-bf16[=1]  exact bf16 CP-sharded Tier-B (default int4; fits <=256K on 12n)\n"
+      "  --stable-outputs[=1]  fixed-tree + BF16 Tier-B + serial single-token decode\n"
       "\n comm calibration:\n"
       "  --ar-probe[=1]      all-reduce latency probe (skips prefill/decode)\n"
       "  --ar-2d A           also probe the 2-level AR: A groups of N/A (A must divide the group)\n"
@@ -1120,7 +1121,7 @@ static void glm5_cli(int argc,char**argv){
         #define BFLAG(flag,var) if(!strcmp(a,flag)){ setenv(var,val?val:"1",1); continue; }
         BFLAG("batch-decode","GLM5_BATCH_DECODE") BFLAG("overlap","GLM5_COMM_OVERLAP")
         BFLAG("dense-i8","GLM5_DENSE_I8")         BFLAG("prefill-only","GLM5_PREFILL_ONLY")
-        BFLAG("kv-tier-bf16","GLM5_KV_TIER_BF16") BFLAG("ar-probe","GLM5_AR_PROBE")
+        BFLAG("kv-tier-bf16","GLM5_KV_TIER_BF16") BFLAG("stable-outputs","GLM5_STABLE_OUTPUTS") BFLAG("ar-probe","GLM5_AR_PROBE")
         #undef BFLAG
         if(!strcmp(a,"set")&&val){ char*e=strchr(val,'='); if(e){*e=0; setenv(val,e+1,1);} continue; }
         #define MAP(flag,var) if(!strcmp(a,flag)){ if(val) setenv(var,val,1); continue; }
@@ -1149,6 +1150,14 @@ static void glm5_cli(int argc,char**argv){
         #undef MAP
         fprintf(stderr,"glm5_ep_runner: unknown flag --%s (try --help)\n",a);
         exit(2);
+    }
+    if(envi("GLM5_STABLE_OUTPUTS",0)){
+        setenv("TP_AR_DETERMINISTIC","1",1);
+        setenv("GLM5_KV_TIER_BF16","1",1);
+        setenv("GLM5_INT8_SDOT","0",1);
+        setenv("GLM5_GEMM_SDOT","0",1);
+        setenv("GLM5_MV_SDOT","0",1);
+        setenv("GLM5_DENSE_I8","0",1);
     }
     glm5_apply_numa(numa);
 }
@@ -1367,8 +1376,8 @@ int main(int argc,char**argv){
     m->kv_combine_batch_cb=NULL; m->kv_combine_batch_ctx=NULL;
     if(envi("GLM5_CP_COMBINE_BATCH",1)){ m->kv_combine_batch_cb=ep_kv_combine_batch; m->kv_combine_batch_ctx=&comm; }
     if(MyRank==0){
-        if(m->T_cp>0) logmsg("CP TIERED: Tier A (cp_on=0 bf16, %d slots) -> transition at pos=%d -> Tier B (CP int4, block=%d over %d ranks)\n",
-                             m->cp_nslot,m->T_cp,m->cp_block,N);
+        if(m->T_cp>0) logmsg("CP TIERED: Tier A (cp_on=0 bf16, %d slots) -> transition at pos=%d -> Tier B (CP %s, block=%d over %d ranks)\n",
+                             m->cp_nslot,m->T_cp,m->int4_kv?"int4":"bf16",m->cp_block,N);
         else if(m->cp_on) logmsg("CP ON: KV sharded block-cyclic (block=%d) over %d ranks, %d slots/rank, int4_kv=%d\n",
                              m->cp_block,N,m->cp_nslot,m->int4_kv);
         else logmsg("CP OFF: un-sharded KV, %d slots/rank, msa_on=%d (single-tier)\n",m->cp_nslot,m->msa_on);
@@ -1436,8 +1445,16 @@ int main(int argc,char**argv){
         int min_new=envi("GLM5_MIN_NEW",0);
         FILE*pf=fopen(prompt_file,"r"); if(!pf) die("cannot open GLM5_PROMPT_IDS",-1);
         int cap=1024,n_prompt=0,*prompt=glm5_amalloc((size_t)cap*sizeof(int)),v;
-        while(fscanf(pf,"%d",&v)==1){ if(n_prompt>=cap){cap*=2;prompt=realloc(prompt,(size_t)cap*sizeof(int));} prompt[n_prompt++]=v; }
+        while(fscanf(pf,"%d",&v)==1){ if(n_prompt>=cap){int oc=cap;cap*=2;prompt=glm5_arealloc(prompt,(size_t)oc*sizeof(int),(size_t)cap*sizeof(int));} prompt[n_prompt++]=v; }
         fclose(pf); if(n_prompt<1) die("empty prompt",-1);
+        /* A prompt longer than the context makes max_new negative, which downstream
+           becomes an undersized allocation and a corrupted heap far from the cause.
+           Fail here with the two numbers the user needs (raise --ctx). */
+        if(n_prompt>=cfg.max_pos){
+            if(MyRank==0) logmsg("fatal: prompt=%d tok >= --ctx/max_pos=%d; raise --ctx to at least %d\n",
+                                 n_prompt,cfg.max_pos,n_prompt+64);
+            die("prompt exceeds context",-1);
+        }
         if(n_prompt+max_new>cfg.max_pos) max_new=cfg.max_pos-n_prompt;
         if(min_new<0) min_new=0; if(min_new>max_new) min_new=max_new;
         if(MyRank==0) logmsg("gen: prompt=%d tok, max_new=%d, max_pos=%d\n",n_prompt,max_new,cfg.max_pos);
@@ -1445,7 +1462,7 @@ int main(int argc,char**argv){
         double prof_gen0[GLM5_NPHASE], prof_gen_pf[GLM5_NPHASE], prof_gen_dec[GLM5_NPHASE];
         prof_snapshot(m,prof_gen0);
         g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
-        int pchunk=envi("GLM5_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=S) */
+            int pchunk=envi("GLM5_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=S) */
         /* GLM5_PREFILL_SP=1: query-sequence-parallel chunk (attention half sharded by home
          * query slice, N-way; needs GLM5_TP=0 replicated weights). Fallback: classic chunk. */
         int prefill_sp=envi("GLM5_PREFILL_SP",0);
@@ -1460,6 +1477,16 @@ int main(int argc,char**argv){
             float*Xc=(float*)glm5_amalloc((size_t)pchunk*C*4);
             for(int p0=0;p0<n_prompt;p0+=pchunk){ int S=n_prompt-p0; if(S>pchunk)S=pchunk;
                 for(int t=0;t<S;t++) embed_lookup(m,prompt[p0+t],Xc+(size_t)t*C);
+                /* Tier A->B: re-shard the [0,p0) history before this chunk stores a
+                 * position at or beyond T_cp.  Keep this in lockstep with the
+                 * synthetic prefill path: CP callbacks are installed before the
+                 * prompt loop, but remain dormant until this transition. */
+                if(!m->cp_on && m->T_cp>0 && p0+S>m->T_cp){
+                    double tt=now_sec(); glm5_prefill_to_cp(m,p0);
+                    barrier();
+                    if(MyRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP %s %d slots/rank\n",
+                                         p0,now_sec()-tt,m->int4_kv?"int4":"bf16",m->cp_nslot);
+                }
                 int a=prefill_sp?glm5_forward_prefill_chunk_sp(m,Xc,S,p0,p0+S>=n_prompt)
                                 :glm5_forward_prefill_chunk(m,Xc,S,p0,p0+S>=n_prompt);
                 if(prefill_sp && a<-1) die("GLM5_PREFILL_SP needs GLM5_TP=0, CP/MSA off",a);
@@ -1471,7 +1498,16 @@ int main(int argc,char**argv){
         /* GLM5_TF_CHECK: teacher-forcing accuracy -- does argmax at pos p predict prompt[p+1]?
          * A correct LM scores ~40-80%; a broken forward ~0%. Compares int8 vs bf16 to localize. */
         int tf_check=envi("GLM5_TF_CHECK",0), tf_ok=0, tf_tot=0;
-        for(int p=0;p<n_prompt;p++){ embed_lookup(m,prompt[p],x); pf_last=glm5_forward_token(m,x,p);
+        for(int p=0;p<n_prompt;p++){
+            /* The token-by-token fallback must perform the same tier transition as
+             * chunked prefill before storing the first Tier-B position. */
+            if(!m->cp_on && m->T_cp>0 && p>=m->T_cp){
+                double tt=now_sec(); glm5_prefill_to_cp(m,p);
+                barrier();
+                if(MyRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP %s %d slots/rank\n",
+                                     p,now_sec()-tt,m->int4_kv?"int4":"bf16",m->cp_nslot);
+            }
+            embed_lookup(m,prompt[p],x); pf_last=glm5_forward_token(m,x,p);
             if(mtp_h) memcpy(mtp_h+(size_t)p*C,x,(size_t)C*4);
             if(tf_check && p+1<n_prompt){ tf_tot++; if(pf_last==prompt[p+1]) tf_ok++;
                 if(MyRank==0 && p<12) logmsg("TF p=%d pred=%d actual=%d %s\n",p,pf_last,prompt[p+1],pf_last==prompt[p+1]?"HIT":"."); } }
@@ -1585,6 +1621,12 @@ int main(int argc,char**argv){
 
     /* ---- synthetic-token prefill benchmark: uses embeddings but avoids a huge prompt file. ---- */
     if(prefill_synth>0){
+        /* Same trap as the --prompt-ids path: writing past max_pos is an OOB KV write. */
+        if(start_pos+prefill>cfg.max_pos){
+            if(MyRank==0) logmsg("fatal: start_pos=%d + prefill=%d > --ctx/max_pos=%d; raise --ctx\n",
+                                 start_pos,prefill,cfg.max_pos);
+            die("synth prefill exceeds context",-1);
+        }
         int pchunk=envi("GLM5_PCHUNK",0);
         double prof0s[GLM5_NPHASE], prof_pfs[GLM5_NPHASE];
         prof_snapshot(m,prof0s);
@@ -1627,8 +1669,8 @@ int main(int argc,char**argv){
                 if(!m->cp_on && m->T_cp>0 && pa+S>m->T_cp){
                     double tt=now_sec(); glm5_prefill_to_cp(m,pa);
                     gbarrier();
-                    if(GRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP int4 %d slots/rank\n",
-                                         pa,now_sec()-tt,m->cp_nslot);
+                    if(GRank==0) logmsg("prefill_tier: A->B re-shard at pos=%d (%.3f s) -> CP %s %d slots/rank\n",
+                                         pa,now_sec()-tt,m->int4_kv?"int4":"bf16",m->cp_nslot);
                 }
                 int a=envi("GLM5_PREFILL_SP",0)?glm5_forward_prefill_chunk_sp(m,Xc,S,pa,pa+S>=pend)
                                               :glm5_forward_prefill_chunk(m,Xc,S,pa,pa+S>=pend);

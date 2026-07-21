@@ -52,6 +52,11 @@ static int glm5_par_min(void);
 #define GLM5_ABS_MAXTILE 192
 
 static int glm5_envi(const char*k,int d){ const char*v=getenv(k); return (v&&*v)?atoi(v):d; }
+static int glm5_stable_outputs(void){
+    static int v=-1;
+    if(v<0) v=glm5_envi("GLM5_STABLE_OUTPUTS",0)!=0;
+    return v;
+}
 static int glm5_par_min(void){ static int v=-1; if(v<0) v=glm5_envi("GLM5_PAR_MIN",64); return v; }
 /* expert -> local slot (-1 if not owned).  Full experts: slot e/ep for e%ep==rank.
  * 2-way shard (m->ex_shard2): half-0 slots [0,ex_no0) for e%ep==rank, half-1 slots
@@ -2792,6 +2797,13 @@ static void glm5_exbN_down_worker(void*a,int tid,int nthr){
 
 /* ===================== forward (one token at position pos) ===================== */
 static int glm5_forward_token(glm5_model*m,float*x,int pos){
+    /* Chunked prefill remains parallel, but the opt-in reproducibility profile runs
+     * single-token decode with one OpenMP worker. Several decode kernels partition shared
+     * scratch across a persistent team; serial execution removes scheduling/team-size drift
+     * from the autoregressive state while the exact source is being narrowed further. */
+#ifdef _OPENMP
+    if(glm5_stable_outputs() && omp_get_max_threads()!=1) omp_set_num_threads(1);
+#endif
     /* Defer the persistent pool until decode.  Creating it during model load
      * leaves spinning workers contending with the OpenMP prefill GEMMs. */
     if(!m->pool&&glm5_envi("GLM5_POOL",0)) m->pool=glm5_g_pool=glm5_pool_create(m->n_threads);
@@ -2988,7 +3000,7 @@ static int glm5_forward_token(glm5_model*m,float*x,int pos){
             int qk_mode=glm5_envi("GLM5_ATTN_QK",1);
             static int abs_par=-1;
             if(abs_par<0) abs_par=glm5_envi("GLM5_ABSORB_PAR",1);
-            int par_ok=abs_par && !m->int4_kv && L->wkv_b.type==GLM5_BF16;
+            int par_ok=abs_par && !glm5_stable_outputs() && !m->int4_kv && L->wkv_b.type==GLM5_BF16;
 #if !defined(__ARM_FEATURE_SVE)
             par_ok=0;
 #endif
@@ -3974,7 +3986,7 @@ static void glm5_gemm(glm5_model*m, float*restrict Y, const glm5_tensor*t, const
          * GLM5_INT8_SDOT overrides: 0 = never, 1 = always (N>1); unset = auto-by-chunk-size. */
         static int mode=-2, thr=1024;
         if(mode==-2){ const char*e=getenv("GLM5_INT8_SDOT"); mode=(e&&*e)?atoi(e):-1; thr=glm5_envi("GLM5_INT8_SDOT_MIN",1024); }
-        int use_sdot = ((t->qg>=cols) && N>1 && (mode==1 || (mode<0 && m->prefill_ntok>=thr)));
+        int use_sdot = !glm5_stable_outputs() && ((t->qg>=cols) && N>1 && (mode==1 || (mode<0 && m->prefill_ntok>=thr)));
         if(use_sdot && N>1) glm5_gemm_int8sdot_rb(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,X,N,rows,cols);  /* register-blocked (~3x the old glm5_gemm_int8_sdot) */
         else glm5_gemm_int8(m,Y,(const uint8_t*)t->w,(const float*)t->scale,t->qg,t->qg0,X,N,rows,cols);
     }

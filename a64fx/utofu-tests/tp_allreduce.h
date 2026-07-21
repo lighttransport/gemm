@@ -51,6 +51,7 @@ typedef struct {
     /* precomputed recursive-doubling schedule */
     int             pof2, rem, nrounds, bcast_sid, newrank;
     int             use_bf16;                /* TP_AR_BF16=1: halve reduce payload */
+    int             deterministic;           /* TP_AR_DETERMINISTIC=1: fixed-root reduce/broadcast */
     int             robust;                  /* TP_AR_ROBUST: 0=passive spin, 1=drain+civac per spin,
                                               * 2=LEAN decode path (amortized drain + civac every 64 spins) */
     uint64_t        seq;                     /* monotonic call counter            */
@@ -412,14 +413,53 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
     }
 }
 
+/* Deterministic fixed-root sum. Recursive doubling is faster, but each survivor folds
+ * ranks in a different order, and floating/BF16 addition is not associative.  That lets
+ * long-context logits diverge after many reductions even though every rank starts from
+ * the same token.  Reduce to rank 0 with a fixed binomial tree, then broadcast the same
+ * result over the reverse tree.  The normal fast path remains unchanged; this opt-in mode
+ * is for quality/stability validation and costs extra synchronization. */
+static void tp_allreduce_sum_deterministic(tp_comm *c, float *buf, int count, uint64_t tok) {
+    int nr=0; for(int step=1;step<c->nprocs;step<<=1) nr++;
+    if(2*nr > TP_AR_NSTEP-1){
+        fprintf(stderr,"tp_ar: deterministic N=%d needs %d slots (max %d)\n",
+                c->nprocs,2*nr,TP_AR_NSTEP-1); exit(1);
+    }
+    int active=1;
+    for(int k=0,step=1; k<nr && active; k++,step<<=1){
+        int span=step<<1, lane=c->my_rank%span;
+        if(lane>=step){
+            tp_ar_send(c,c->my_rank-step,k,buf,count,tok);
+            tp_ar_confirm(c); active=0;
+        } else if(c->my_rank+step<c->nprocs){
+            tp_ar_recv_add(c,k,c->my_rank+step,buf,count,tok);
+        }
+    }
+    for(int k=nr-1,step=1<<(nr-1); k>=0; k--,step>>=1){
+        int span=step<<1, lane=c->my_rank%span, sid=nr+(nr-1-k);
+        if(lane<step){
+            if(c->my_rank+step<c->nprocs){
+                tp_ar_send(c,c->my_rank+step,sid,buf,count,tok);
+                tp_ar_confirm(c);
+            }
+        } else {
+            tp_ar_recv_copy(c,sid,c->my_rank-step,buf,count,tok);
+        }
+    }
+}
+
 /* in-place sum-all-reduce of buf[0..count). All ranks must pass the same count. */
 static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
     if (c->nprocs == 1) return;
-    if (c->a2a && !c->ack && !c->use_bf16 && count <= c->a2a_max && c->nprocs >= 2) {
-        tp_ar_sum_a2a(c, buf, count, ++c->seq);
+    uint64_t tok = ++c->seq;
+    if (c->deterministic){
+        tp_allreduce_sum_deterministic(c,buf,count,tok);
         return;
     }
-    uint64_t tok = ++c->seq;
+    if (c->a2a && !c->ack && !c->use_bf16 && count <= c->a2a_max && c->nprocs >= 2) {
+        tp_ar_sum_a2a(c, buf, count, tok);
+        return;
+    }
     int mr = c->my_rank, rem = c->rem;
 
     /* 1. pre-reduce fold: even of the lowest 2*rem ranks -> its odd partner. The odd's recv_add is its
@@ -448,6 +488,38 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
     }
 }
 
+/* Fixed-root MAX companion.  The mathematical max is associative, but the BF16
+ * transport rounds the local accumulator while folding; canonicalizing the tree
+ * removes that order-dependent rounding from CP/MSA block selection. */
+static void tp_allreduce_max_deterministic(tp_comm *c, float *buf, int count, uint64_t tok) {
+    int nr=0; for(int step=1;step<c->nprocs;step<<=1) nr++;
+    if(2*nr > TP_AR_NSTEP-1){
+        fprintf(stderr,"tp_ar: deterministic MAX N=%d needs %d slots (max %d)\n",
+                c->nprocs,2*nr,TP_AR_NSTEP-1); exit(1);
+    }
+    int active=1;
+    for(int k=0,step=1; k<nr && active; k++,step<<=1){
+        int span=step<<1, lane=c->my_rank%span;
+        if(lane>=step){
+            tp_ar_send(c,c->my_rank-step,k,buf,count,tok);
+            tp_ar_confirm(c); active=0;
+        } else if(c->my_rank+step<c->nprocs){
+            tp_ar_recv_max(c,k,c->my_rank+step,buf,count,tok);
+        }
+    }
+    for(int k=nr-1,step=1<<(nr-1); k>=0; k--,step>>=1){
+        int span=step<<1, lane=c->my_rank%span, sid=nr+(nr-1-k);
+        if(lane<step){
+            if(c->my_rank+step<c->nprocs){
+                tp_ar_send(c,c->my_rank+step,sid,buf,count,tok);
+                tp_ar_confirm(c);
+            }
+        } else {
+            tp_ar_recv_copy(c,sid,c->my_rank-step,buf,count,tok);
+        }
+    }
+}
+
 /* in-place MAX-all-reduce of buf[0..count). Same recursive-doubling schedule as
  * tp_allreduce_sum, reduction op = element-wise max (tp_ar_recv_max). Used by the
  * Phase-2 context-parallel online-softmax combine (global per-head max before the
@@ -455,6 +527,10 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
 static void tp_allreduce_max(tp_comm *c, float *buf, int count) {
     if (c->nprocs == 1) return;
     uint64_t tok = ++c->seq;
+    if (c->deterministic){
+        tp_allreduce_max_deterministic(c,buf,count,tok);
+        return;
+    }
     int mr = c->my_rank, rem = c->rem;
 
     if (mr < 2 * rem) {                                   /* 1. pre-reduce fold even->odd */
@@ -660,6 +736,7 @@ static int tp_comm_init_ex(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t
     else                      c->newrank = my_rank - c->rem;
     c->seq = 0;
     c->use_bf16 = getenv("TP_AR_BF16") && atoi(getenv("TP_AR_BF16")) != 0;
+    c->deterministic = getenv("TP_AR_DETERMINISTIC") && atoi(getenv("TP_AR_DETERMINISTIC")) != 0;
     c->robust   = getenv("TP_AR_ROBUST") ? atoi(getenv("TP_AR_ROBUST")) : 1;  /* default ON */
     c->ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 64;
     /* retransmit interval: recovery latency is ~ack_rtt per lost Put. 1 ms is >> the µs-scale real
@@ -670,8 +747,8 @@ static int tp_comm_init_ex(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t
     c->drop_n   = getenv("TP_AR_DROP") ? strtoul(getenv("TP_AR_DROP"), NULL, 10) : 0;
     c->put_ctr  = 0;
     if (my_rank == 0)
-        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s robust=%d ack=%d%s\n",
-                nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32", c->robust,
+        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s deterministic=%d robust=%d ack=%d%s\n",
+                nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32", c->deterministic, c->robust,
                 c->ack, c->drop_n ? " DROP-INJECT" : "");
     return 0;
 }

@@ -19,6 +19,7 @@
 #   --last x,y,z        node to place rank 0 last (spare-node avoidance)
 #   --repeat N          run the model N times
 #   --retries N         retry the model run on a transient uTofu barrier fan-in (default 3)
+#   --load-timeout SEC  restart mpiexec if not all ranks load in time (default 300)
 #   --no-stage          skip node-local staging (blobs already present)
 #   --no-enforce        do not fail on a missed perf gate
 #   --active-experts N  forwarded to the runner (3 => ~20 tok/s decode; default 8 exact)
@@ -43,6 +44,7 @@ REPEAT=1
 DO_STAGE=1
 ENFORCE=1
 RETRIES=3                 # retry the model run this many times on a transient uTofu barrier fan-in
+LOAD_TIMEOUT=300          # full loads normally take about two minutes; a missing child otherwise hangs forever
 CONVERT_DIR="$HOME/models/glm52-2bit/a64fx-ep12-2w-v1"
 STAGE_DIR="/local/$USER/glm52-2bit-ep12"
 PREFILL_TARGET=34
@@ -54,6 +56,7 @@ while [ "$#" -gt 0 ]; do
         --last) LAST="$2"; shift 2;;
         --repeat) REPEAT="$2"; shift 2;;
         --retries) RETRIES="$2"; shift 2;;
+        --load-timeout) LOAD_TIMEOUT="$2"; shift 2;;
         --no-stage) DO_STAGE=0; shift;;
         --no-enforce) ENFORCE=0; shift;;
         --convert-dir) CONVERT_DIR="$2"; shift 2;;
@@ -156,11 +159,48 @@ case "$MODE" in
         MAXPOS=$(( SYS_TOK + GEN + 128 ))
         export OMP_NUM_THREADS=47
         echo "--- codegen: prefill $SYS_TOK-token code prompt, generate $GEN, detokenize ---"
-        mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
-            "${COMMON[@]}" --layers 78 --threads 47 --ctx "$MAXPOS" --pchunk 512 \
-            --prompt-tokens "$CODEGEN_TOK" --prefill-synth "$SYS_TOK" --prefill-only \
-            --gen-new "$GEN" --gen-out "$RUN_DIR/gen.ids" \
-            "${RUNNER_FLAGS[@]}" > >(tee "$RUN_DIR/codegen.stdout") 2> >(tee "$RUN_DIR/codegen.stderr" >&2)
+        codegen_ok=0
+        for ((a=1;a<=RETRIES;a++)); do
+            rm -f "$RUN_DIR"/glm5_ep_load_rank*.txt "$RUN_DIR"/glm5_ep_stderr_rank*.txt \
+                  "$RUN_DIR/gen.ids" glm5_ep_rank00.txt
+            # A separate process group lets the watchdog tear down mpiwrapp, org/mpiexec,
+            # and plexec together. Killing only the wrapper leaves PLE coordinates reserved
+            # briefly, causing every immediate retry to fail with PLE 0054.
+            setsid mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
+                "${COMMON[@]}" --layers 78 --threads 47 --ctx "$MAXPOS" --pchunk 512 \
+                --prompt-tokens "$CODEGEN_TOK" --prefill-synth "$SYS_TOK" --prefill-only \
+                --gen-new "$GEN" --gen-out "$RUN_DIR/gen.ids" \
+                "${RUNNER_FLAGS[@]}" \
+                > >(tee "$RUN_DIR/codegen-attempt-$a.stdout") \
+                2> >(tee "$RUN_DIR/codegen-attempt-$a.stderr" >&2) &
+            mpi_pid=$!
+            load_start=$SECONDS
+            while kill -0 "$mpi_pid" 2>/dev/null; do
+                loaded=$(find "$RUN_DIR" -maxdepth 1 -name 'glm5_ep_load_rank*.txt' | wc -l)
+                [ "$loaded" -ge "$NP" ] && break
+                if (( SECONDS - load_start >= LOAD_TIMEOUT )); then
+                    echo "codegen attempt $a: load timeout after ${LOAD_TIMEOUT}s ($loaded/$NP ranks); restarting mpiexec" >&2
+                    kill -TERM -- "-$mpi_pid" 2>/dev/null || true
+                    wait "$mpi_pid" 2>/dev/null || true
+                    # PLE releases the remote child coordinates asynchronously; on a wedged
+                    # rank this has taken over 30 seconds even after the local process group exits.
+                    sleep 60
+                    mpi_pid=
+                    break
+                fi
+                sleep 2
+            done
+            if [ -n "${mpi_pid:-}" ]; then
+                if wait "$mpi_pid" && grep -Eq '^SENTINEL .*=(done)$' glm5_ep_rank00.txt; then
+                    codegen_ok=1
+                    cp "$RUN_DIR/codegen-attempt-$a.stdout" "$RUN_DIR/codegen.stdout"
+                    cp "$RUN_DIR/codegen-attempt-$a.stderr" "$RUN_DIR/codegen.stderr"
+                    break
+                fi
+            fi
+            echo "codegen attempt $a did not complete; retrying ($a/$RETRIES)" >&2
+        done
+        [ "$codegen_ok" = 1 ] || { echo "codegen failed after $RETRIES attempt(s)" >&2; exit 5; }
         cp glm5_ep_rank00.txt "$RUN_DIR/rank00-codegen.txt" 2>/dev/null || true
         grep -Eq '^SENTINEL .*=(done)$' glm5_ep_rank00.txt || {
             echo "codegen: rank-0 sentinel missing" >&2; exit 5; }
