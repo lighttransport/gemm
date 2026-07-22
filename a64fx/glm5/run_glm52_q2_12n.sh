@@ -11,7 +11,7 @@
 #   XOS_MMM_L_PAGING_POLICY     XOS heap paging policy (Fugaku presets demand:demand:prepage)
 #
 # Usage: run_glm52_q2_12n.sh MODE [extra runner flags...]
-#   MODE = check | prefill | decode | generate | codegen
+#   MODE = check | prefill | decode | generate | codegen | serve
 # Orchestration knobs are flags too (parsed here, before MODE-independent runner flags):
 #   --convert-dir DIR   shared source blobs   (default: a64fx-ep12-2w-v1)
 #   --stage-dir DIR     node-local dest       (default: /local/$USER/glm52-2bit-ep12)
@@ -36,8 +36,8 @@ LLM="$REPO/a64fx/llm"
 UTOFU="$REPO/a64fx/utofu-tests"
 
 MODE="${1:-check}"; shift || true
-case "$MODE" in check|prefill|decode|generate|codegen) ;; *)
-    echo "usage: $0 {check|prefill|decode|generate|codegen} [flags]" >&2; exit 2;; esac
+case "$MODE" in check|prefill|decode|generate|codegen|serve) ;; *)
+    echo "usage: $0 {check|prefill|decode|generate|codegen|serve} [flags]" >&2; exit 2;; esac
 
 # --- orchestration defaults + flag parsing (unknown flags pass through to the runner) ---
 NP=12
@@ -165,6 +165,9 @@ case "$MODE" in
         MODE_FLAGS=(--layers 78 --max-new 128 --gen-out "$RUN_DIR/gen.ids")
         # caller must pass --prompt-ids or --prompt-tokens via extra flags
         ;;
+    serve)
+        MODE_FLAGS=(--layers 78)
+        ;;
     codegen)
         # Coding-agent usecase = the real long-context stability + coherence test.
         # Single phase: prefill the precomputed code prompt (real tokens), then greedy-generate
@@ -247,6 +250,11 @@ case "$MODE" in
 esac
 
 export OMP_NUM_THREADS="$THREADS"
+
+if [ "$MODE" = serve ]; then
+    exec mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
+        "${COMMON[@]}" "${MODE_FLAGS[@]}" --threads "$THREADS" "${RUNNER_FLAGS[@]}"
+fi
 
 for ((i=1;i<=REPEAT;i++)); do
     # A cold uTofu VCQ bring-up occasionally fails the bootstrap barrier ("barrier fan-in

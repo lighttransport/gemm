@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <utofu.h>
 
 #define GLM5_IMPL
@@ -828,12 +829,103 @@ static int cbatch_start(cb_slot*s,const id_prompt*p,int req,int max_new,int C,do
     s->req=req; s->n_prompt=p->n; s->ng=0; s->done=0; s->nan=0; s->cur=0;
     g_ar_secs=0; g_ar_calls=0; g_ar_frags=0;
     double t0=now_sec();
-    int last=-1;
-    for(int i=0;i<p->n;i++){ embed_lookup(s->m,p->ids[i],s->x); last=glm5_forward_token(s->m,s->x,i); }
+    int last=-1, chunk=envi("GLM5_PCHUNK",512); if(chunk<1)chunk=1;
+    if(glm5_alloc_mstream_ex(s->m,chunk,0)) die("cbatch alloc prefill chunk",-1);
+    float*Xc=glm5_amalloc((size_t)chunk*C*4);
+    for(int p0=0;p0<p->n;p0+=chunk){ int S=p->n-p0; if(S>chunk)S=chunk;
+        for(int t=0;t<S;t++) embed_lookup(s->m,p->ids[p0+t],Xc+(size_t)t*C);
+        if(!s->m->cp_on && s->m->T_cp>0 && p0+S>s->m->T_cp){
+            double tt=now_sec(); glm5_prefill_to_cp(s->m,p0); gbarrier();
+            if(GRank==0) logmsg("cbatch_tier: req=%d A->B at pos=%d (%.3f s) CP %s %d slots/rank\n",
+                                req,p0,now_sec()-tt,s->m->int4_kv?"int4":"bf16",s->m->cp_nslot);
+        }
+        int a=glm5_forward_prefill_chunk(s->m,Xc,S,p0,p0+S>=p->n); if(a>=0)last=a;
+        memcpy(s->x,Xc+(size_t)(S-1)*C,(size_t)C*4);
+    }
+    glm5_afree(Xc); glm5_free_mstream(s->m);
     double dt=now_sec()-t0;
     *prefill_sec+=dt; *prefill_ar+=g_ar_secs; *prefill_calls+=g_ar_calls;
     s->cur=last;
     (void)max_new; (void)C;
+    return 0;
+}
+
+static int run_cbatch(glm5_model*root,const char*batch_file,const char*out_prefix,int max_new,int C);
+
+static void touch_range(void*p,size_t n){
+    volatile unsigned char*q=(volatile unsigned char*)p;
+    if(!q)return; for(size_t i=0;i<n;i+=4096) q[i]=(unsigned char)(q[i]^1u);
+    if(n)q[n-1]=(unsigned char)(q[n-1]^1u);
+}
+static void touch_context_kv(glm5_model*m){
+    const glm5_config*c=&m->cfg; size_t ns=(size_t)m->cp_nslot;
+    int KVD=glm5_kv_cache_dim(c),ID=c->index_dim;
+    for(int l=0;l<c->n_layers;l++){ glm5_layer*L=&m->layers[l]; int moe=glm5_is_moe(c,l);
+        if(m->int4_kv){ touch_range(L->k_q4,ns*(KVD/2)); touch_range(L->k_qs,ns*2);
+            if(moe){ touch_range(L->idx_q4,ns*(ID/2)); touch_range(L->idx_qs,ns*2); } }
+        else { touch_range(L->kv_cache,ns*KVD*2); if(moe)touch_range(L->idx_k_cache,ns*ID*2); }
+    }
+}
+static void run_serve_capacity_probe(glm5_model*root,int slots){
+    glm5_model**p=glm5_acalloc((size_t)slots,sizeof(*p));
+    for(int s=0;s<slots;s++){
+        p[s]=glm5_clone_runtime(root); if(!p[s])die("serve capacity clone",-1);
+        if(!p[s]->cp_on && p[s]->T_cp>0)glm5_prefill_to_cp(p[s],0);
+        touch_context_kv(p[s]); gbarrier();
+    }
+    float mb=(float)(glm5_meminfo_bytes("MemAvailable")/(1024L*1024L)), neg=-mb;
+    tp_allreduce_max((tp_comm*)root->ar_ctx,&neg,1); float min_mb=-neg;
+    if(MyRank==0)logmsg("SERVE_CAPACITY slots=%d ctx=%d tier=%s min_MemAvailable=%.0f MB\n",
+                        slots,root->cfg.max_pos,p[0]->int4_kv?"int4":"bf16",min_mb);
+    int floor_mb=envi("GLM5_SERVE_MIN_AVAILABLE_MB",1024);
+    for(int s=0;s<slots;s++)glm5_free(p[s]); glm5_afree(p); gbarrier();
+    if(min_mb<(float)floor_mb)die("serve capacity below MemAvailable floor",-1);
+}
+
+/* Persistent filesystem control plane. Only rank 0 polls; a one-float allreduce broadcasts the
+ * sequence to the other ranks. Request files are atomically renamed into place by the HTTP
+ * process and contain: SEQ MAX_NEW SLOTS PROMPTS_PATH OUT_PREFIX. */
+static int run_serve(glm5_model*root,const char*dir,int max_slots,int C){
+    const float stop_cmd=16777215.0f; /* largest exactly represented positive integer below 2^24 */
+    if(envi("GLM5_SERVE_CAPACITY_PROBE",0))run_serve_capacity_probe(root,max_slots);
+    if(max_slots<1)max_slots=1;
+    if(MyRank==0){ mkdir(dir,0700); char p[512]; snprintf(p,sizeof p,"%s/ready",dir);
+        FILE*f=fopen(p,"w"); if(f){ fprintf(f,"pid=%ld slots=%d max_pos=%d\n",(long)getpid(),max_slots,root->cfg.max_pos); fclose(f); } }
+    barrier(); long last=0;
+    if(MyRank==0) logmsg("serve: ready dir=%s slots=%d max_pos=%d\n",dir,max_slots,root->cfg.max_pos);
+    for(;;){
+        float cmd=0.0f;
+        if(MyRank==0){
+            char stop[512],req[512]; snprintf(stop,sizeof stop,"%s/stop",dir);
+            if(access(stop,F_OK)==0) cmd=stop_cmd;
+            else { snprintf(req,sizeof req,"%s/request",dir); FILE*f=fopen(req,"r");
+                long seq=0; if(f){ if(fscanf(f,"%ld",&seq)==1 && seq>last) cmd=(float)seq; fclose(f); } }
+        }
+        tp_allreduce_max((tp_comm*)root->ar_ctx,&cmd,1);
+        if(cmd==stop_cmd) break;
+        long seq=(long)cmd; if(seq<=last){ usleep(50000); continue; }
+        char req[512],prompts[512],prefix[512]; int max_new=0,slots=0; long file_seq=0;
+        /* LLIO metadata visibility can lag an atomic rename on sibling compute nodes. Rank 0
+         * already observed the new sequence, but peers may briefly open the previous descriptor
+         * (or no descriptor). Retry until this exact sequence and its prompt file are visible. */
+        snprintf(req,sizeof req,"%s/request",dir); int parsed=0;
+        for(int a=0;a<300&&!parsed;a++){
+            FILE*f=fopen(req,"r"); int nf=0;
+            if(f){ nf=fscanf(f,"%ld %d %d %511s %511s",&file_seq,&max_new,&slots,prompts,prefix); fclose(f); }
+            struct stat st;
+            if(nf==5 && file_seq==seq && stat(prompts,&st)==0 && st.st_size>0) parsed=1;
+            else usleep(10000);
+        }
+        if(!parsed) die("serve request visibility timeout",-1);
+        if(file_seq!=seq || max_new<1 || slots<1 || slots>max_slots) die("serve invalid request",-1);
+        barrier();
+        char sb[32]; snprintf(sb,sizeof sb,"%d",slots); setenv("GLM5_CBATCH_SLOTS",sb,1);
+        int rc=run_cbatch(root,prompts,prefix,max_new,C); barrier();
+        if(MyRank==0){ char tmp[512],done[512]; snprintf(tmp,sizeof tmp,"%s/done.tmp",dir); snprintf(done,sizeof done,"%s/done",dir);
+            FILE*df=fopen(tmp,"w"); if(df){ fprintf(df,"%ld %d\n",seq,rc); fclose(df); rename(tmp,done); } }
+        last=seq;
+    }
+    if(MyRank==0) logmsg("serve: stopped after seq=%ld\n",last);
     return 0;
 }
 
@@ -1097,7 +1189,7 @@ static void glm5_cli_usage(void){
       "  --ar-2d A           also probe the 2-level AR: A groups of N/A (A must divide the group)\n"
       "\n batched serving / misc:\n"
       "  --batch-decode[=1]  --overlap[=1]  --slots N  --prompts FILE  --out-prefix PATH\n"
-      "  --nshards N --ep-size N\n"
+      "  --serve-dir DIR     persistent request directory  --nshards N --ep-size N\n"
       "  --set KEY=VAL       escape hatch: set any GLM5_* var directly\n");
 }
 static void glm5_cli(int argc,char**argv){
@@ -1148,6 +1240,7 @@ static void glm5_cli(int argc,char**argv){
         /* batched serving / misc */
         MAP("slots","GLM5_CBATCH_SLOTS") MAP("prompts","GLM5_CBATCH_PROMPTS")
         MAP("out-prefix","GLM5_CBATCH_OUT_PREFIX")
+        MAP("serve-dir","GLM5_SERVE_DIR")
         MAP("nshards","GLM5_NSHARDS")    MAP("ep-size","GLM5_EP_SIZE")
         #undef MAP
         fprintf(stderr,"glm5_ep_runner: unknown flag --%s (try --help)\n",a);
@@ -1397,6 +1490,13 @@ int main(int argc,char**argv){
     if(MyRank==0) logmsg("all %d ranks past bootstrap barrier; starting prefill\n",N);
 
     int C=cfg.hidden; float*x=(float*)glm5_amalloc((size_t)C*4);
+
+    const char*serve_dir=getenv("GLM5_SERVE_DIR");
+    if(serve_dir&&*serve_dir){
+        int serve_slots=envi("GLM5_CBATCH_SLOTS",1);
+        int rc2=run_serve(m,serve_dir,serve_slots,C);
+        glm5_afree(x); glm5_free(m); return rc2;
+    }
 
     /* ---- GLM5_MSTREAM=N: batched multi-stream decode (synthetic) -> aggregate tok/s ----
      * N concurrent streams per forward: dense GEMMs M=N + ONE EP all-reduce per layer for

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,36 @@ import glm52_http_server as http
 
 
 class ServiceTest(unittest.TestCase):
+    def test_persistent_worker_protocol_and_shutdown(self):
+        with tempfile.TemporaryDirectory() as td:
+            runner = Path(td) / "fake_runner.py"
+            runner.write_text("""#!/usr/bin/env python3
+import os, sys, time
+from pathlib import Path
+d=Path(sys.argv[sys.argv.index('--serve-dir')+1]); d.mkdir(exist_ok=True)
+(d/'ready').write_text('ready\\n'); last=0
+while not (d/'stop').exists():
+    r=d/'request'
+    if r.exists():
+        f=r.read_text().split(); seq=int(f[0])
+        if seq>last:
+            n=int(f[2]); prefix=f[4]
+            for i in range(n): Path(prefix+'_%03d.txt'%i).write_text('%d\\n'%(100+i))
+            (d/'done.tmp').write_text('%d 0\\n'%seq); os.replace(str(d/'done.tmp'),str(d/'done')); last=seq
+    time.sleep(.01)
+""")
+            runner.chmod(0o755)
+            args = argparse.Namespace(
+                runner=str(runner), work_dir=td, max_context=128, max_tokens=8,
+                max_slots=2, startup_timeout=5, worker_pchunk=64,
+            )
+            worker = http.PersistentWorker(args)
+            try:
+                self.assertEqual(worker.submit([[1], [2]], 2, 5), [[100], [101]])
+            finally:
+                worker.stop()
+            self.assertIsNotNone(worker.proc.poll())
+
     def test_completion_contract_and_long_context_override(self):
         with tempfile.TemporaryDirectory() as td:
             args = argparse.Namespace(

@@ -1770,6 +1770,14 @@ static void glm5_kv_init(glm5_model*m){
         }
         int bgb=glm5_envi("GLM5_KV_BUDGET_GB",0);              /* optional hard cap (0 = no cap) */
         if(bgb>0 && ((long)bgb<<30) < budget) budget=(long)bgb<<30;
+        /* A serving/batch root retains its own KV while each active slot owns a cloned runtime.
+         * Divide the available Tier-A pool before choosing T_cp so root + all configured slots
+         * fit simultaneously. This is deliberately based on configured capacity, not the first
+         * request's occupancy: a persistent worker must remain safe for later full batches. */
+        if(getenv("GLM5_SERVE_DIR") || getenv("GLM5_CBATCH_PROMPTS")){
+            int slots=glm5_envi("GLM5_CBATCH_SLOTS",1); if(slots<1)slots=1;
+            budget /= (long)slots+1;
+        }
         T = budget/(per_pos>0?per_pos:1);
     }
     if(T<m->cp_block) T=m->cp_block;

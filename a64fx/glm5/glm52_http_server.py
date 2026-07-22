@@ -2,6 +2,7 @@
 """Small serialized HTTP gateway for the 12-node GLM-5.2 Q2 runner."""
 
 import argparse
+import atexit
 import json
 import os
 import subprocess
@@ -18,6 +19,79 @@ sys.path.insert(0, str(HERE))
 from glm5_tokenizer import Tok, TOKJSON  # noqa: E402
 
 
+class PersistentWorker:
+    def __init__(self, args):
+        stamp = "worker-%d-%d" % (int(time.time()), os.getpid())
+        self.control = Path(args.work_dir) / stamp
+        self.control.mkdir(mode=0o700)
+        self.seq = 0
+        self.stdout = open(str(self.control / "worker.stdout"), "w")
+        self.stderr = open(str(self.control / "worker.stderr"), "w")
+        cmd = [args.runner, "serve", "--no-stage", "--no-enforce", "--stable-outputs",
+               "--kv-tier-bf16=0", "--ctx", str(args.max_context + args.max_tokens + 128),
+               "--slots", str(args.max_slots), "--pchunk", str(args.worker_pchunk),
+               "--serve-dir", str(self.control),
+               "--set", "GLM5_SERVE_CAPACITY_PROBE=1"]
+        self.proc = subprocess.Popen(cmd, cwd=HERE, stdout=self.stdout, stderr=self.stderr,
+                                     preexec_fn=os.setsid)
+        deadline = time.time() + args.startup_timeout
+        while not (self.control / "ready").is_file():
+            if self.proc.poll() is not None:
+                raise RuntimeError("persistent MPI worker exited during startup; see %s" % self.control)
+            if time.time() >= deadline:
+                self.stop()
+                raise RuntimeError("persistent MPI worker startup timed out")
+            time.sleep(0.25)
+
+    def submit(self, batches, max_tokens, timeout):
+        self.seq += 1
+        seq = self.seq
+        prompts = self.control / ("prompts-%d.ids" % seq)
+        prefix = self.control / ("generated-%d" % seq)
+        prompts.write_text("".join(" ".join(map(str, ids)) + "\n" for ids in batches))
+        done = self.control / "done"
+        try:
+            done.unlink()
+        except FileNotFoundError:
+            pass
+        tmp = self.control / "request.tmp"
+        tmp.write_text("%d %d %d %s %s\n" %
+                       (seq, max_tokens, len(batches), prompts, prefix))
+        os.replace(str(tmp), str(self.control / "request"))
+        deadline = time.time() + timeout
+        while True:
+            if self.proc.poll() is not None:
+                raise RuntimeError("persistent MPI worker exited; see %s" % self.control)
+            if done.is_file():
+                fields = done.read_text().split()
+                if len(fields) == 2 and int(fields[0]) == seq:
+                    if int(fields[1]) != 0:
+                        raise RuntimeError("persistent MPI request failed")
+                    break
+            if time.time() >= deadline:
+                self.stop()
+                raise subprocess.TimeoutExpired("persistent MPI request", timeout)
+            time.sleep(0.05)
+        outputs = []
+        for i in range(len(batches)):
+            path = Path("%s_%03d.txt" % (prefix, i))
+            if not path.is_file():
+                raise RuntimeError("persistent MPI output missing: %s" % path)
+            outputs.append([int(x) for x in path.read_text().split()])
+        return outputs
+
+    def stop(self):
+        if getattr(self, "proc", None) and self.proc.poll() is None:
+            (self.control / "stop").write_text("stop\n")
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.proc.pid, 15)
+        for stream in (getattr(self, "stdout", None), getattr(self, "stderr", None)):
+            if stream:
+                stream.close()
+
+
 class Service:
     def __init__(self, args):
         self.args = args
@@ -25,6 +99,9 @@ class Service:
         self.lock = threading.Lock()
         self.started = time.time()
         self.requests = 0
+        self.worker = PersistentWorker(args) if getattr(args, "persistent", False) else None
+        if self.worker:
+            atexit.register(self.worker.stop)
 
     def complete(self, body):
         prompt = body.get("prompt")
@@ -40,6 +117,19 @@ class Service:
         with self.lock:
             self.requests += 1
             request_id = "glm52-%d-%06d" % (int(time.time()), self.requests)
+            if self.worker:
+                started = time.time()
+                generated = self.worker.submit([ids], max_tokens, self.args.timeout)[0]
+                text = self.tokenizer.decode(generated)
+                return {
+                    "id": request_id, "object": "text_completion", "created": int(started),
+                    "model": "glm-5.2-q2-a64fx-ep12",
+                    "choices": [{"text": text, "index": 0,
+                                 "finish_reason": "stop" if len(generated) < max_tokens else "length"}],
+                    "usage": {"prompt_tokens": len(ids), "completion_tokens": len(generated),
+                              "total_tokens": len(ids) + len(generated)},
+                    "elapsed_seconds": round(time.time() - started, 3),
+                }
             with tempfile.TemporaryDirectory(prefix=request_id + "-", dir=self.args.work_dir) as td:
                 prompt_file = Path(td) / "prompt.ids"
                 output_file = Path(td) / "generated.ids"
@@ -92,6 +182,21 @@ class Service:
         with self.lock:
             self.requests += len(prompts)
             request_id = "glm52-batch-%d-%06d" % (int(time.time()), self.requests)
+            if self.worker:
+                started = time.time()
+                generated_many = self.worker.submit(batches, max_tokens, self.args.timeout)
+                choices = [{"text": self.tokenizer.decode(ids), "index": i,
+                            "finish_reason": "stop" if len(ids) < max_tokens else "length"}
+                           for i, ids in enumerate(generated_many)]
+                prompt_tokens = sum(len(ids) for ids in batches)
+                completion_tokens = sum(len(ids) for ids in generated_many)
+                return {
+                    "id": request_id, "object": "text_completion.batch", "created": int(started),
+                    "model": "glm-5.2-q2-a64fx-ep12", "choices": choices,
+                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                              "total_tokens": prompt_tokens + completion_tokens},
+                    "contexts": len(batches), "elapsed_seconds": round(time.time() - started, 3),
+                }
             with tempfile.TemporaryDirectory(prefix=request_id + "-", dir=self.args.work_dir) as td:
                 batch_file = Path(td) / "prompts.ids"
                 out_prefix = str(Path(td) / "generated")
@@ -145,7 +250,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             s = self.server.service
             self.send_json(200, {"status": "ok", "busy": s.lock.locked(),
-                                 "requests": s.requests, "uptime_seconds": int(time.time()-s.started)})
+                                 "requests": s.requests, "persistent": bool(s.worker),
+                                 "worker_alive": bool(s.worker and s.worker.proc.poll() is None),
+                                 "uptime_seconds": int(time.time()-s.started)})
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -188,18 +295,28 @@ def main():
     p.add_argument("--runner", default=str(HERE / "run_glm52_q2_12n.sh"))
     p.add_argument("--work-dir", default=str(HERE / "logs"))
     p.add_argument("--max-context", type=int, default=262144)
-    p.add_argument("--max-total-context", type=int, default=262144)
-    p.add_argument("--max-slots", type=int, default=4)
+    p.add_argument("--max-total-context", type=int, default=0)
+    p.add_argument("--max-slots", type=int, default=3)
+    p.add_argument("--worker-pchunk", type=int, default=64)
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--int4-threshold", type=int, default=23000)
     p.add_argument("--max-body", type=int, default=8 << 20)
     p.add_argument("--timeout", type=int, default=21600)
+    p.add_argument("--startup-timeout", type=int, default=600)
+    p.add_argument("--no-persistent", dest="persistent", action="store_false")
+    p.set_defaults(persistent=True)
     args = p.parse_args()
+    if args.max_total_context <= 0:
+        args.max_total_context = args.max_context * args.max_slots
     Path(args.work_dir).mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.service = Service(args)
     print("GLM52 HTTP listening on http://%s:%d" % (args.host, args.port), flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if server.service.worker:
+            server.service.worker.stop()
 
 
 if __name__ == "__main__":
