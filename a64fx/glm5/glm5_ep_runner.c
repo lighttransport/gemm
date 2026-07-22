@@ -1153,7 +1153,9 @@ static void glm5_cli(int argc,char**argv){
     }
     if(envi("GLM5_STABLE_OUTPUTS",0)){
         setenv("TP_AR_DETERMINISTIC","1",1);
-        setenv("GLM5_KV_TIER_BF16","1",1);
+        /* BF16 Tier-B is the quality default, but full-weight 256K exceeds the
+         * 32 GB HBM margin. Preserve an explicit --kv-tier-bf16=0 override. */
+        if(!getenv("GLM5_KV_TIER_BF16")) setenv("GLM5_KV_TIER_BF16","1",1);
         setenv("GLM5_INT8_SDOT","0",1);
         setenv("GLM5_GEMM_SDOT","0",1);
         setenv("GLM5_MV_SDOT","0",1);
@@ -1377,7 +1379,7 @@ int main(int argc,char**argv){
     if(envi("GLM5_CP_COMBINE_BATCH",1)){ m->kv_combine_batch_cb=ep_kv_combine_batch; m->kv_combine_batch_ctx=&comm; }
     if(MyRank==0){
         if(m->T_cp>0) logmsg("CP TIERED: Tier A (cp_on=0 bf16, %d slots) -> transition at pos=%d -> Tier B (CP %s, block=%d over %d ranks)\n",
-                             m->cp_nslot,m->T_cp,m->int4_kv?"int4":"bf16",m->cp_block,N);
+                             m->cp_nslot,m->T_cp,envi("GLM5_KV_TIER_BF16",0)?"bf16":"int4",m->cp_block,N);
         else if(m->cp_on) logmsg("CP ON: KV sharded block-cyclic (block=%d) over %d ranks, %d slots/rank, int4_kv=%d\n",
                              m->cp_block,N,m->cp_nslot,m->int4_kv);
         else logmsg("CP OFF: un-sharded KV, %d slots/rank, msa_on=%d (single-tier)\n",m->cp_nslot,m->msa_on);

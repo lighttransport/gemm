@@ -16,7 +16,9 @@
 #   --convert-dir DIR   shared source blobs   (default: a64fx-ep12-2w-v1)
 #   --stage-dir DIR     node-local dest       (default: /local/$USER/glm52-2bit-ep12)
 #   --np N              ranks                  (default: 12)
-#   --last x,y,z        node to place rank 0 last (spare-node avoidance)
+#   --tail-coord x,y,z  coordinate assigned to rank NP-1 (default: 1,1,1)
+#   --last x,y,z        backward-compatible alias for --tail-coord
+#   --tail-text FILE    append tokenized text at the exact end of a codegen prompt
 #   --repeat N          run the model N times
 #   --retries N         retry the model run on a transient uTofu barrier fan-in (default 3)
 #   --load-timeout SEC  restart mpiexec if not all ranks load in time (default 300)
@@ -39,7 +41,8 @@ case "$MODE" in check|prefill|decode|generate|codegen) ;; *)
 
 # --- orchestration defaults + flag parsing (unknown flags pass through to the runner) ---
 NP=12
-LAST="0,0,0"
+TAIL_COORD="${GLM52_TAIL_COORD:-1,1,1}"
+TAIL_TEXT=""
 REPEAT=1
 DO_STAGE=1
 ENFORCE=1
@@ -53,7 +56,8 @@ RUNNER_FLAGS=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --np) NP="$2"; shift 2;;
-        --last) LAST="$2"; shift 2;;
+        --last|--tail-coord) TAIL_COORD="$2"; shift 2;;
+        --tail-text) TAIL_TEXT="$2"; shift 2;;
         --repeat) REPEAT="$2"; shift 2;;
         --retries) RETRIES="$2"; shift 2;;
         --load-timeout) LOAD_TIMEOUT="$2"; shift 2;;
@@ -66,6 +70,10 @@ while [ "$#" -gt 0 ]; do
         *) RUNNER_FLAGS+=("$1"); shift;;
     esac
 done
+
+if [ -n "$TAIL_TEXT" ]; then
+    case "$TAIL_TEXT" in /*) ;; *) TAIL_TEXT="$PWD/$TAIL_TEXT";; esac
+fi
 
 STAMP="${PJM_JOBID:-interactive}-$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="$HERE/logs/run-$STAMP-$MODE"
@@ -84,17 +92,26 @@ for ((r=0;r<NP;r++)); do
     grep -q '^# glm52-a64fx-ep12' "$CONVERT_DIR/rank$rr.manifest"
 done
 
-# Virtual-coordinate file: place rank 0 (LAST) at the tail so a spare node can host it.
+# Virtual-coordinate file: assign TAIL_COORD to rank NP-1.  Keeping the interactive
+# coordinate (0,0,0) near rank 0 avoids the recurrent rank-11 child/load stall seen when
+# (0,0,0) was the final entry.
 VCOORD="$RUN_DIR/vcoord_glm52.txt"
 SX="${PJM_MPI_SHAPE_X:-${PJM_NODE_X:-2}}"
 SY="${PJM_MPI_SHAPE_Y:-${PJM_NODE_Y:-3}}"
 SZ="${PJM_MPI_SHAPE_Z:-${PJM_NODE_Z:-2}}"
+IFS=, read -r TX TY TZ EXTRA <<< "$TAIL_COORD"
+if [ -n "${EXTRA:-}" ] || ! [[ "$TX" =~ ^[0-9]+$ && "$TY" =~ ^[0-9]+$ && "$TZ" =~ ^[0-9]+$ ]] ||
+   (( TX >= SX || TY >= SY || TZ >= SZ || NP > SX*SY*SZ )); then
+    echo "invalid --tail-coord $TAIL_COORD for shape ${SX}x${SY}x${SZ} and NP=$NP" >&2
+    exit 2
+fi
 : > "$VCOORD"
 for ((x=0;x<SX;x++)); do for ((y=0;y<SY;y++)); do for ((z=0;z<SZ;z++)); do
-    [ "$x,$y,$z" = "$LAST" ] || echo "($x,$y,$z)" >> "$VCOORD"
+    [ "$x,$y,$z" = "$TAIL_COORD" ] || echo "($x,$y,$z)" >> "$VCOORD"
 done; done; done
-echo "($LAST)" >> "$VCOORD"
+echo "($TAIL_COORD)" >> "$VCOORD"
 head -n "$NP" "$VCOORD" > "$VCOORD.tmp" && mv "$VCOORD.tmp" "$VCOORD"
+[ "$(wc -l < "$VCOORD")" -eq "$NP" ] || { echo "invalid NP/shape/--tail-coord combination" >&2; exit 2; }
 
 make -C "$UTOFU" tofu_topo_helper >/dev/null
 make -C "$LLM" glm5_ep_runner CC=fcc OPENMP=1 >/dev/null
@@ -108,6 +125,8 @@ if [ "$DO_STAGE" = 1 ]; then
     mpiexec -np "$NP" -vcoordfile "$VCOORD" \
         "$HERE/stage_glm52_q2_12n.sh" --source "$CONVERT_DIR" --dest "$STAGE_DIR" --status "$RUN_DIR" \
         >stage.stdout 2>stage.stderr
+    staged=$(find "$RUN_DIR" -maxdepth 1 -name 'glm52_stage_rank*.txt' | wc -l)
+    [ "$staged" -eq "$NP" ] || { echo "staging incomplete: $staged/$NP rank markers" >&2; exit 4; }
 fi
 
 # Build a natural-length prompt of `count` ids by repeating the sample block and tokenizing.
@@ -150,24 +169,35 @@ case "$MODE" in
         # Coding-agent usecase = the real long-context stability + coherence test.
         # Single phase: prefill the precomputed code prompt (real tokens), then greedy-generate
         # code and detokenize.  On 12 nodes a >~23k-token context exceeds the Tier-A bf16 KV
-        # budget, so the auto KV tiering (Tier A -> int4 CP-sharded Tier B + MSA) engages mid
+        # budget, so auto KV tiering engages CP-sharded Tier B + MSA mid-prefill.  Tier B is
+        # int4 by default and BF16 under --stable-outputs.
         # prefill -- this run therefore exercises the long-context path end to end.  (KV save/load
         # reuse across the tier boundary is a separate item; a one-shot run needs neither.)
         CODEGEN_TOK="${CODEGEN_TOK:-$HOME/glm5_codegen.bin}"
         SYS_TOK="${SYS_TOK:-108474}"; GEN="${GEN:-256}"
         test -s "$CODEGEN_TOK" || { echo "codegen: missing prompt tokens $CODEGEN_TOK" >&2; exit 4; }
+        if [ -n "$TAIL_TEXT" ]; then
+            test -s "$TAIL_TEXT" || { echo "codegen: missing tail text $TAIL_TEXT" >&2; exit 4; }
+            python3 "$HERE/make_long_prompt.py" --base-bin "$CODEGEN_TOK" \
+                --tail-text "$TAIL_TEXT" --tokens "$SYS_TOK" \
+                --output "$RUN_DIR/codegen-prompt.bin"
+            CODEGEN_TOK="$RUN_DIR/codegen-prompt.bin"
+        fi
         MAXPOS=$(( SYS_TOK + GEN + 128 ))
         export OMP_NUM_THREADS=47
         echo "--- codegen: prefill $SYS_TOK-token code prompt, generate $GEN, detokenize ---"
         codegen_ok=0
         for ((a=1;a<=RETRIES;a++)); do
+            ATTEMPT_DIR="$RUN_DIR/attempt-$a"
+            mkdir -p "$ATTEMPT_DIR"
             rm -f "$RUN_DIR"/glm5_ep_load_rank*.txt "$RUN_DIR"/glm5_ep_stderr_rank*.txt \
                   "$RUN_DIR/gen.ids" glm5_ep_rank00.txt
             # A separate process group lets the watchdog tear down mpiwrapp, org/mpiexec,
             # and plexec together. Killing only the wrapper leaves PLE coordinates reserved
             # briefly, causing every immediate retry to fail with PLE 0054.
             setsid mpiexec -np "$NP" -vcoordfile "$VCOORD" "$LLM/build/glm5_ep_runner" \
-                "${COMMON[@]}" --layers 78 --threads 47 --ctx "$MAXPOS" --pchunk 512 \
+                --stage-dir "$STAGE_DIR" --status-dir "$RUN_DIR" \
+                --layers 78 --threads 47 --ctx "$MAXPOS" --pchunk 512 \
                 --prompt-tokens "$CODEGEN_TOK" --prefill-synth "$SYS_TOK" --prefill-only \
                 --gen-new "$GEN" --gen-out "$RUN_DIR/gen.ids" \
                 "${RUNNER_FLAGS[@]}" \
@@ -195,9 +225,11 @@ case "$MODE" in
                     codegen_ok=1
                     cp "$RUN_DIR/codegen-attempt-$a.stdout" "$RUN_DIR/codegen.stdout"
                     cp "$RUN_DIR/codegen-attempt-$a.stderr" "$RUN_DIR/codegen.stderr"
+                    cp "$RUN_DIR"/glm5_ep_*.txt "$ATTEMPT_DIR"/ 2>/dev/null || true
                     break
                 fi
             fi
+            cp "$RUN_DIR"/glm5_ep_*.txt "$ATTEMPT_DIR"/ 2>/dev/null || true
             echo "codegen attempt $a did not complete; retrying ($a/$RETRIES)" >&2
         done
         [ "$codegen_ok" = 1 ] || { echo "codegen failed after $RETRIES attempt(s)" >&2; exit 5; }
