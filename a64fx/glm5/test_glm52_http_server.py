@@ -2,6 +2,7 @@
 import argparse
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -36,6 +37,9 @@ while not (d/'stop').exists():
             worker = http.PersistentWorker(args)
             try:
                 self.assertEqual(worker.submit([[1], [2]], 2, 5), [[100], [101]])
+                self.assertFalse((worker.control / "request").exists())
+                self.assertFalse((worker.control / "prompts-1.ids").exists())
+                self.assertFalse((worker.control / "generated-1_000.txt").exists())
             finally:
                 worker.stop()
             self.assertIsNotNone(worker.proc.poll())
@@ -94,6 +98,51 @@ while not (d/'stop').exists():
                 result = service.complete_many({"prompts": ["one", "two"], "max_tokens": 2})
             self.assertEqual(result["contexts"], 2)
             self.assertEqual([x["index"] for x in result["choices"]], [0, 1])
+
+    def test_bounded_admission_and_metrics(self):
+        args = argparse.Namespace(
+            tokenizer=http.TOKJSON, max_tokens=8, max_context=128,
+            max_total_context=128, max_slots=1, work_dir="/tmp",
+            runner="unused", int4_threshold=23000, timeout=30, max_body=1024,
+            max_queue=0,
+        )
+        service = http.Service(args)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_slot():
+            with service.admitted():
+                entered.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold_slot)
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        with self.assertRaises(http.QueueFull):
+            with service.admitted():
+                pass
+        release.set()
+        thread.join(2)
+        snapshot = service.snapshot()
+        self.assertEqual(snapshot["completed"], 1)
+        self.assertEqual(snapshot["failed"], 0)
+        self.assertEqual(snapshot["rejected"], 1)
+        self.assertEqual(snapshot["inflight"], 0)
+
+    def test_dead_persistent_worker_is_unavailable(self):
+        args = argparse.Namespace(
+            tokenizer=http.TOKJSON, max_tokens=8, max_context=128,
+            max_total_context=128, max_slots=1, work_dir="/tmp",
+            runner="unused", int4_threshold=23000, timeout=30, max_body=1024,
+        )
+        service = http.Service(args)
+        service.worker = type("Worker", (), {
+            "proc": type("Proc", (), {"poll": lambda self: 9})()
+        })()
+        self.assertFalse(service.snapshot()["ready"])
+        with self.assertRaises(http.WorkerUnavailable):
+            with service.admitted():
+                pass
 
 
 if __name__ == "__main__":
