@@ -73,6 +73,62 @@ class Service:
                     "elapsed_seconds": round(time.time() - started, 3),
                 }
 
+    def complete_many(self, body):
+        prompts = body.get("prompts")
+        if not isinstance(prompts, list) or not prompts or not all(isinstance(x, str) and x for x in prompts):
+            raise ValueError("prompts must be a non-empty array of strings")
+        if len(prompts) > self.args.max_slots:
+            raise ValueError("prompts exceeds max_slots (%d)" % self.args.max_slots)
+        max_tokens = body.get("max_tokens", self.args.max_tokens)
+        if not isinstance(max_tokens, int) or not 1 <= max_tokens <= self.args.max_tokens:
+            raise ValueError("max_tokens must be an integer in [1, %d]" % self.args.max_tokens)
+        batches = [self.tokenizer.chat(p, think=bool(body.get("think", False))) for p in prompts]
+        lengths = [len(ids) + max_tokens for ids in batches]
+        if max(lengths) > self.args.max_context:
+            raise ValueError("a prompt plus max_tokens exceeds max_context")
+        if sum(lengths) > self.args.max_total_context:
+            raise ValueError("aggregate contexts exceed max_total_context")
+
+        with self.lock:
+            self.requests += len(prompts)
+            request_id = "glm52-batch-%d-%06d" % (int(time.time()), self.requests)
+            with tempfile.TemporaryDirectory(prefix=request_id + "-", dir=self.args.work_dir) as td:
+                batch_file = Path(td) / "prompts.ids"
+                out_prefix = str(Path(td) / "generated")
+                batch_file.write_text("".join(" ".join(map(str, ids)) + "\n" for ids in batches))
+                ctx = max(lengths) + 128
+                cmd = [
+                    self.args.runner, "generate", "--no-stage", "--no-enforce",
+                    "--stable-outputs", "--ctx", str(ctx), "--prompts", str(batch_file),
+                    "--slots", str(len(prompts)), "--out-prefix", out_prefix,
+                    "--max-new", str(max_tokens),
+                ]
+                if max(len(ids) for ids in batches) >= self.args.int4_threshold:
+                    cmd += ["--kv-tier-bf16=0"]
+                started = time.time()
+                proc = subprocess.run(cmd, cwd=HERE, universal_newlines=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      timeout=self.args.timeout)
+                outputs = [Path("%s_%03d.txt" % (out_prefix, i)) for i in range(len(prompts))]
+                if proc.returncode or not all(path.is_file() for path in outputs):
+                    tail = (proc.stderr or proc.stdout)[-2000:]
+                    raise RuntimeError("runner failed (exit %d): %s" % (proc.returncode, tail))
+                choices = []
+                completion_tokens = 0
+                for i, path in enumerate(outputs):
+                    generated = [int(x) for x in path.read_text().split()]
+                    completion_tokens += len(generated)
+                    choices.append({"text": self.tokenizer.decode(generated), "index": i,
+                                    "finish_reason": "stop" if len(generated) < max_tokens else "length"})
+                prompt_tokens = sum(len(ids) for ids in batches)
+                return {
+                    "id": request_id, "object": "text_completion.batch", "created": int(started),
+                    "model": "glm-5.2-q2-a64fx-ep12", "choices": choices,
+                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                              "total_tokens": prompt_tokens + completion_tokens},
+                    "contexts": len(prompts), "elapsed_seconds": round(time.time() - started, 3),
+                }
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "glm52-http/1"
@@ -94,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/v1/completions", "/generate"):
+        if self.path not in ("/v1/completions", "/v1/batch/completions", "/generate"):
             self.send_json(404, {"error": "not found"})
             return
         try:
@@ -104,7 +160,11 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise ValueError("request body must be a JSON object")
-            self.send_json(200, self.server.service.complete(body))
+            if self.path == "/v1/batch/completions" or "prompts" in body:
+                result = self.server.service.complete_many(body)
+            else:
+                result = self.server.service.complete(body)
+            self.send_json(200, result)
         except (ValueError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
         except subprocess.TimeoutExpired:
@@ -128,6 +188,8 @@ def main():
     p.add_argument("--runner", default=str(HERE / "run_glm52_q2_12n.sh"))
     p.add_argument("--work-dir", default=str(HERE / "logs"))
     p.add_argument("--max-context", type=int, default=262144)
+    p.add_argument("--max-total-context", type=int, default=262144)
+    p.add_argument("--max-slots", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--int4-threshold", type=int, default=23000)
     p.add_argument("--max-body", type=int, default=8 << 20)

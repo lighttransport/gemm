@@ -1096,7 +1096,8 @@ static void glm5_cli_usage(void){
       "  --ar-probe[=1]      all-reduce latency probe (skips prefill/decode)\n"
       "  --ar-2d A           also probe the 2-level AR: A groups of N/A (A must divide the group)\n"
       "\n batched serving / misc:\n"
-      "  --batch-decode[=1]  --overlap[=1]  --slots N  --prompts FILE  --nshards N  --ep-size N\n"
+      "  --batch-decode[=1]  --overlap[=1]  --slots N  --prompts FILE  --out-prefix PATH\n"
+      "  --nshards N --ep-size N\n"
       "  --set KEY=VAL       escape hatch: set any GLM5_* var directly\n");
 }
 static void glm5_cli(int argc,char**argv){
@@ -1146,6 +1147,7 @@ static void glm5_cli(int argc,char**argv){
         MAP("ar-2d","GLM5_AR_2D")
         /* batched serving / misc */
         MAP("slots","GLM5_CBATCH_SLOTS") MAP("prompts","GLM5_CBATCH_PROMPTS")
+        MAP("out-prefix","GLM5_CBATCH_OUT_PREFIX")
         MAP("nshards","GLM5_NSHARDS")    MAP("ep-size","GLM5_EP_SIZE")
         #undef MAP
         fprintf(stderr,"glm5_ep_runner: unknown flag --%s (try --help)\n",a);
