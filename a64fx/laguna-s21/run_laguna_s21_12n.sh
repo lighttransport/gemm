@@ -81,7 +81,8 @@ echo "prompt ids: $(cat "$IDS")"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-47}"   # leave one core free (a64fx-omp-leave-one-core)
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
-export FLIB_BARRIER="${FLIB_BARRIER:-HARD}"
+# NB: do NOT set FLIB_BARRIER=HARD here -- it forces the OpenMP runtime to 48
+# threads (oversubscribing all 48 cores), which ~4x-slows the matvec kernels.
 export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
 
 mpiexec -np "$NP" "$HERE/build/laguna_s21_ep_runner" --generate \

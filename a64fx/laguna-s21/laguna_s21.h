@@ -95,6 +95,70 @@ static inline int laguna_expert_owner(int expert, int ep_size) { return expert %
  *  Forward-pass primitives (correctness-first; f32 accumulation).       *
  * ===================================================================== */
 
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+/* Widen a contiguous bf16 vector to f32: (uint16 << 16) reinterpreted as float. */
+static inline svfloat32_t laguna_ld_bf16(svbool_t pg, const uint16_t *p) {
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
+}
+/* Compute rows [r, r+nr) (nr<=4) of y = W*x, SVE-widened bf16, sharing each x load. */
+static inline void laguna_bf16_rowblock(float *restrict y, const uint16_t *restrict W,
+                                        const float *restrict x, int r, int nr, int cols) {
+    if (nr == 4) {
+        const uint16_t *w0=W+(size_t)r*cols, *w1=w0+cols, *w2=w1+cols, *w3=w2+cols;
+        svfloat32_t a0=svdup_f32(0), a1=svdup_f32(0), a2=svdup_f32(0), a3=svdup_f32(0);
+        for (int c = 0; c < cols; c += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32(c, cols);
+            svfloat32_t xf = svld1_f32(pg, x + c);
+            a0 = svmla_f32_x(pg, a0, laguna_ld_bf16(pg, w0+c), xf);
+            a1 = svmla_f32_x(pg, a1, laguna_ld_bf16(pg, w1+c), xf);
+            a2 = svmla_f32_x(pg, a2, laguna_ld_bf16(pg, w2+c), xf);
+            a3 = svmla_f32_x(pg, a3, laguna_ld_bf16(pg, w3+c), xf);
+        }
+        svbool_t pt = svptrue_b32();
+        y[r]=svaddv_f32(pt,a0); y[r+1]=svaddv_f32(pt,a1);
+        y[r+2]=svaddv_f32(pt,a2); y[r+3]=svaddv_f32(pt,a3);
+    } else {
+        for (int rr = r; rr < r+nr; ++rr) {
+            const uint16_t *w = W + (size_t)rr * cols;
+            svfloat32_t a = svdup_f32(0);
+            for (int c = 0; c < cols; c += (int)svcntw()) {
+                svbool_t pg = svwhilelt_b32(c, cols);
+                a = svmla_f32_x(pg, a, laguna_ld_bf16(pg, w+c), svld1_f32(pg, x+c));
+            }
+            y[rr] = svaddv_f32(svptrue_b32(), a);
+        }
+    }
+}
+/* Decode matvec: y[rows] = W[rows,cols](bf16) * x[cols](f32). */
+static inline void laguna_matvec_bf16(float *restrict y, const uint16_t *restrict W,
+                                      const float *restrict x, int rows, int cols) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r += 4)
+        laguna_bf16_rowblock(y, W, x, r, rows-r<4?rows-r:4, cols);
+}
+/* Fused multi-matvec: several y[i]=W[i]*x sharing input x and column count, in ONE
+ * parallel region (nowait between matrices) to amortize OpenMP fork/join. */
+static inline void laguna_matvec_bf16_multi(float *const *ys, const uint16_t *const *Ws,
+                                            const int *rows, int nmat, const float *x, int cols) {
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        for (int m = 0; m < nmat; ++m) {
+            #pragma omp for schedule(static) nowait
+            for (int r = 0; r < rows[m]; r += 4)
+                laguna_bf16_rowblock(ys[m], Ws[m], x, r, rows[m]-r<4?rows[m]-r:4, cols);
+        }
+    }
+#else
+    for (int m = 0; m < nmat; ++m)
+        for (int r = 0; r < rows[m]; r += 4)
+            laguna_bf16_rowblock(ys[m], Ws[m], x, r, rows[m]-r<4?rows[m]-r:4, cols);
+#endif
+}
+#else
 /* y[rows] = W[rows,cols] (bf16, row-major) * x[cols] (f32). */
 static inline void laguna_matvec_bf16(float *restrict y, const uint16_t *restrict W,
                                       const float *restrict x, int rows, int cols) {
@@ -108,6 +172,7 @@ static inline void laguna_matvec_bf16(float *restrict y, const uint16_t *restric
         y[r] = acc;
     }
 }
+#endif
 
 /* RMSNorm in-place style: out[n] = (x/rms(x)) * w (bf16 weight). */
 static inline void laguna_rmsnorm(float *restrict out, const float *restrict x,
@@ -165,6 +230,28 @@ static inline void laguna_default_inv_freq(float *inv_freq, int dim, double thet
         inv_freq[i] = (float)(1.0 / pow(theta, (double)(2 * i) / (double)dim));
 }
 
+#if defined(__ARM_FEATURE_SVE)
+/* SVE group-32 INT4 dot. Requires a 512-bit VL (16 f32 lanes): 16 packed bytes =
+ * 32 nibbles = exactly one group.  Byte b holds col 2b (low nibble) and 2b+1
+ * (high nibble), so deinterleave x with svld2 into even/odd lanes. */
+static inline float laguna_i4g32_dot_sve(const uint32_t *packed, const uint16_t *scales,
+                                         const float *x, int cols) {
+    const uint8_t *p = (const uint8_t *)packed;
+    int ngrp = cols / LAGUNA_GROUP;
+    svbool_t pg = svptrue_b32();
+    float sum = 0.0f;
+    for (int g = 0; g < ngrp; ++g) {
+        svuint32_t bytes = svld1ub_u32(pg, p + (size_t)g * 16);
+        svfloat32_t lo = svsub_n_f32_x(pg, svcvt_f32_u32_x(pg, svand_n_u32_x(pg, bytes, 0xfu)), 8.0f);
+        svfloat32_t hi = svsub_n_f32_x(pg, svcvt_f32_u32_x(pg, svlsr_n_u32_x(pg, bytes, 4)), 8.0f);
+        svfloat32x2_t xv = svld2_f32(pg, x + (size_t)g * LAGUNA_GROUP);
+        svfloat32_t part = svmla_f32_x(pg, svmul_f32_x(pg, lo, svget2_f32(xv, 0)), hi, svget2_f32(xv, 1));
+        sum += svaddv_f32(pg, part) * laguna_bf16_to_f32(scales[g]);
+    }
+    return sum;
+}
+#endif
+
 /* INT4 group-32 symmetric matvec: y[rows] = sum_c (nibble(packed)-8)*scale * x[c].
  * packed is row-major uint32 (cols/8 per row); scales bf16 (cols/32 per row). */
 static inline void laguna_matvec_i4g32(float *restrict y, const uint32_t *restrict packed,
@@ -175,7 +262,13 @@ static inline void laguna_matvec_i4g32(float *restrict y, const uint32_t *restri
     #pragma omp parallel for schedule(static)
 #endif
     for (int r = 0; r < rows; ++r)
+#if defined(__ARM_FEATURE_SVE)
+        y[r] = (svcntw() == 16)
+             ? laguna_i4g32_dot_sve(packed + (size_t)r * ppr, scales + (size_t)r * spr, x, cols)
+             : laguna_i4g32_dot    (packed + (size_t)r * ppr, scales + (size_t)r * spr, x, cols);
+#else
         y[r] = laguna_i4g32_dot(packed + (size_t)r * ppr, scales + (size_t)r * spr, x, cols);
+#endif
 }
 
 /* ===================== per-rank model ===================== */

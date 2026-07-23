@@ -2,6 +2,9 @@
  * Included at the bottom of laguna_s21_ep_runner.c (one translation unit).
  * Distilled from a64fx/glm5/glm5_ep_runner.c (rpn=1, one group, no DP merge). */
 #include <utofu.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
 
@@ -61,9 +64,12 @@ static void barrier(void){
 }
 
 static tp_comm g_comm;
+static double g_ar_secs=0; static long g_ar_calls=0;
 static void ep_ar(void *ctx, float *buf, int count){
     tp_comm *c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:count;
+    double t=now_sec();
     for(int off=0;off<count;){ int nn=count-off; if(nn>mc)nn=mc; tp_allreduce_sum(c,buf+off,nn); off+=nn; }
+    g_ar_secs+=now_sec()-t; g_ar_calls++;
 }
 
 static void tofu_bootstrap(void){
@@ -174,8 +180,13 @@ static int run_generate(int argc, char **argv){
     }
     double dc1=now_sec();
     if(MyRank==0){
-        logmsg("decode %d tok in %.2fs (%.1f tok/s) total_nan=%d\n",
-               ngen,dc1-dc0,ngen/(dc1-dc0>0?dc1-dc0:1),total_nan);
+        int nth=1;
+#ifdef _OPENMP
+        nth=omp_get_max_threads();
+#endif
+        logmsg("decode %d tok in %.2fs (%.1f tok/s) total_nan=%d comm=%.2fs (%.1f%%) threads=%d\n",
+               ngen,dc1-dc0,ngen/(dc1-dc0>0?dc1-dc0:1),total_nan,g_ar_secs,
+               (dc1-dc0)>0?100.0*g_ar_secs/(dc1-dc0):0.0,nth);
         printf("GEN_IDS");
         for(int i=0;i<ngen;i++) printf(" %d",gen[i]);
         printf("\n"); fflush(stdout);

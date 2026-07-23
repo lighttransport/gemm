@@ -140,23 +140,15 @@ static int stage_load(laguna_stage *s, const char *dir, int rank) {
     if(fd<0||fstat(fd,&sb)){perror(bp); if(fd>=0)close(fd); fclose(f); return -1;}
     const unsigned char *fmap=mmap(NULL,(size_t)sb.st_size,PROT_READ,MAP_PRIVATE,fd,0);
     if(fmap==MAP_FAILED){perror("mmap"); close(fd); fclose(f); return -1;}
-    /* Copy the file-backed blob into a NUMA-friendly arena: reading weights
-     * directly from the file mmap first-touches every page on one CMG, which
-     * collapses multi-CMG memory bandwidth (~84 MB/s observed). A parallel copy
-     * distributes the arena's pages across CMGs via first-touch (OMP_PROC_BIND). */
     size_t nb=(size_t)sb.st_size;
     unsigned char *arena=NULL;
     if(posix_memalign((void**)&arena,256,nb)!=0){fprintf(stderr,"arena alloc %.1f GB failed\n",nb/1e9);munmap((void*)fmap,nb);close(fd);fclose(f);return -1;}
-    const size_t CHUNK=(size_t)8<<20;
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for (long c=0; c<(long)((nb+CHUNK-1)/CHUNK); ++c) {
-        size_t o=(size_t)c*CHUNK, len=nb-o<CHUNK?nb-o:CHUNK;
-        memcpy(arena+o, fmap+o, len);
-    }
-    munmap((void*)fmap,nb); close(fd);
     s->blob=arena; s->blob_bytes=nb;
+    /* Parse the manifest first so the arena copy can first-touch each tensor with
+     * the SAME per-row static schedule the matvecs use.  Copying the whole blob in
+     * arbitrary chunks lands each tensor's pages on a CMG unrelated to the thread
+     * that later reads that row -> cross-CMG reads collapse bandwidth (~3x slower
+     * decode).  Per-tensor parallel copy keeps weights CMG-local to their reader. */
     long cap=8192; s->n_ents=0; s->ents=malloc((size_t)cap*sizeof(manifest_ent));
     while (fgets(line,sizeof line,f)) {
         if (line[0]=='#') continue;
@@ -174,6 +166,39 @@ static int stage_load(laguna_stage *s, const char *dir, int rank) {
         s->n_ents++;
     }
     fclose(f);
+    /* Per-tensor parallel copy for NUMA-local first-touch.  Large tensors are split
+     * into page-chunks static across threads (thread t owns the same byte/row range
+     * it later reads in the matvec).  Tiny tensors (norms/biases) don't matter for
+     * bandwidth, so they're copied one-per-thread via a single dynamic loop -- this
+     * avoids thousands of tiny omp-for dispatches that ballooned load time. */
+    const size_t PG=(size_t)64<<10, BIG=(size_t)256<<10;
+    long ne=s->n_ents;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        for (long i=0;i<ne;i++) {
+            const manifest_ent *e=&s->ents[i];
+            if (e->bytes < BIG) continue;
+            long nchunk=(long)((e->bytes+PG-1)/PG);
+#ifdef _OPENMP
+            #pragma omp for schedule(static) nowait
+#endif
+            for (long c=0;c<nchunk;c++) {
+                size_t o=(size_t)c*PG, len=e->bytes-o<PG?e->bytes-o:PG;
+                memcpy(arena+e->off+o, fmap+e->off+o, len);
+            }
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic,16) nowait
+#endif
+        for (long i=0;i<ne;i++) {
+            const manifest_ent *e=&s->ents[i];
+            if (e->bytes >= BIG) continue;
+            memcpy(arena+e->off, fmap+e->off, e->bytes);
+        }
+    }
+    munmap((void*)fmap,nb); close(fd);
     return 0;
 }
 
@@ -283,12 +308,16 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
     int half = rot/2;
     const float *rc = cosp + (size_t)pos*half, *rs = sinp + (size_t)pos*half;
 
-    laguna_matvec_bf16(sc->qf, ly->q_proj, sc->n1, nh*hd, LAGUNA_HIDDEN);
-    laguna_matvec_bf16(sc->kf, ly->k_proj, sc->n1, LAGUNA_KV_HEADS*hd, LAGUNA_HIDDEN);
-    laguna_matvec_bf16(sc->vf, ly->v_proj, sc->n1, LAGUNA_KV_HEADS*hd, LAGUNA_HIDDEN);
-    laguna_matvec_bf16(sc->gf, ly->g_proj, sc->n1, nh, LAGUNA_HIDDEN);
+    /* q/k/v/g all read n1 -> one fused parallel region */
+    { float *ys[4]={sc->qf,sc->kf,sc->vf,sc->gf};
+      const uint16_t *Ws[4]={ly->q_proj,ly->k_proj,ly->v_proj,ly->g_proj};
+      int rws[4]={nh*hd, LAGUNA_KV_HEADS*hd, LAGUNA_KV_HEADS*hd, nh};
+      laguna_matvec_bf16_multi(ys, Ws, rws, 4, sc->n1, LAGUNA_HIDDEN); }
 
     /* q_norm + rope per query head */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int h=0; h<nh; ++h) {
         float *q=sc->qf+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
         laguna_rmsnorm(tmp, q, ly->q_norm, hd, LAGUNA_RMS_EPS);
@@ -312,26 +341,31 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
     int lo = ly->is_sliding ? (pos-LAGUNA_SLIDING_WINDOW+1) : 0; if(lo<0)lo=0;
     const uint16_t *kbase=m->kcache+(size_t)layer*m->kv_layer_stride;
     const uint16_t *vbase=m->vcache+(size_t)layer*m->kv_layer_stride;
+    /* Per-head attention, parallel over heads with a one-pass online softmax
+     * (running max/sum + rescaled accumulator) so there is no shared score buffer. */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int h=0; h<nh; ++h) {
         const float *q=sc->qf+(size_t)h*hd;
         int kvh=h/kv_groups;
-        float mx=-INFINITY;
+        float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
+        float m_i=-INFINITY, l_i=0.0f;
         for (int j=lo; j<=pos; ++j) {
             const uint16_t *kj=kbase+(size_t)j*LAGUNA_KV_HEADS*hd+(size_t)kvh*hd;
             float dot=0; for(int d=0;d<hd;++d) dot+=q[d]*laguna_bf16_to_f32(kj[d]);
-            dot*=scale; sc->scores[j]=dot; if(dot>mx)mx=dot;
-        }
-        float z=0; for(int j=lo;j<=pos;++j){ float e=expf(sc->scores[j]-mx); sc->scores[j]=e; z+=e; }
-        float invz=1.0f/z; float *o=sc->ao+(size_t)h*hd;
-        for(int d=0;d<hd;++d)o[d]=0;
-        for (int j=lo; j<=pos; ++j) {
-            float w=sc->scores[j]*invz;
+            dot*=scale;
+            float m_new = dot>m_i ? dot : m_i;
+            float corr = expf(m_i - m_new);
+            float p = expf(dot - m_new);
+            l_i = l_i*corr + p;
             const uint16_t *vj=vbase+(size_t)j*LAGUNA_KV_HEADS*hd+(size_t)kvh*hd;
-            for(int d=0;d<hd;++d)o[d]+=w*laguna_bf16_to_f32(vj[d]);
+            for(int d=0;d<hd;++d) acc[d]=acc[d]*corr + p*laguna_bf16_to_f32(vj[d]);
+            m_i=m_new;
         }
-        /* per-head softplus gate */
         float gate=laguna_softplus(sc->gf[h]);
-        for(int d=0;d<hd;++d)o[d]*=gate;
+        float s=gate/l_i; float *o=sc->ao+(size_t)h*hd;
+        for(int d=0;d<hd;++d) o[d]=acc[d]*s;
     }
     /* o_proj: [hidden, nh*hd] * ao -> attn_out */
     laguna_matvec_bf16(sc->attn_out, ly->o_proj, sc->ao, LAGUNA_HIDDEN, nh*hd);
@@ -340,8 +374,9 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
 /* dense/shared SwiGLU: out[hidden] = down( silu(gate(x)) * up(x) ), bf16 weights. */
 static void swiglu_bf16(laguna_scratch *sc, const uint16_t *gate_w, const uint16_t *up_w,
                         const uint16_t *down_w, const float *x, float *out, int inter) {
-    laguna_matvec_bf16(sc->inter_a, gate_w, x, inter, LAGUNA_HIDDEN);
-    laguna_matvec_bf16(sc->inter_b, up_w,   x, inter, LAGUNA_HIDDEN);
+    float *ys[2]={sc->inter_a, sc->inter_b};
+    const uint16_t *Ws[2]={gate_w, up_w}; int rws[2]={inter, inter};
+    laguna_matvec_bf16_multi(ys, Ws, rws, 2, x, LAGUNA_HIDDEN);   /* gate & up share x */
     for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
     laguna_matvec_bf16(out, down_w, sc->inter_a, LAGUNA_HIDDEN, inter);
 }
@@ -361,15 +396,22 @@ typedef void (*ar_fn)(void *ctx, float *buf, int count);
  * If compute_logits, writes sc->logits. ar/ar_ctx do the routed allreduce. */
 static int g_dbg=0;
 static double vnorm(const float*v,int n){ double s=0; for(int i=0;i<n;i++)s+=(double)v[i]*v[i]; return sqrt(s); }
+/* lightweight phase profiling (enabled by the bench) */
+double g_t_attn=0, g_t_mlp=0, g_t_norm=0; int g_prof=0;
+static double prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, int pos,
                           ar_fn ar, void *ar_ctx, int compute_logits) {
     for (int L=0; L<m->n_layers; ++L) {
         const laguna_layer *ly=&m->layers[L];
+        double pt0=g_prof?prof_now():0;
         /* --- attention block --- */
         laguna_rmsnorm(sc->n1, x, ly->in_ln, LAGUNA_HIDDEN, LAGUNA_RMS_EPS);
+        if(g_prof){double n=prof_now();g_t_norm+=n-pt0;pt0=n;}
         attention(m, ly, sc, L, pos);
+        if(g_prof){double n=prof_now();g_t_attn+=n-pt0;pt0=n;}
         if(g_dbg&&compute_logits) logmsg("L%02d pos%d ||x_in||=%.3f ||attn||=%.3f\n",L,pos,vnorm(x,LAGUNA_HIDDEN),vnorm(sc->attn_out,LAGUNA_HIDDEN));
         for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]+=sc->attn_out[i];
+        double pm0=g_prof?prof_now():0;
         /* --- mlp block --- */
         laguna_rmsnorm(sc->n2, x, ly->post_ln, LAGUNA_HIDDEN, LAGUNA_RMS_EPS);
         if (!ly->is_moe) {
@@ -396,6 +438,7 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
             if(g_dbg&&compute_logits) logmsg("L%02d pos%d ||shared||=%.3f ||routed||=%.3f e0=%d\n",L,pos,vnorm(sc->shared,LAGUNA_HIDDEN),vnorm(sc->partial,LAGUNA_HIDDEN),ids[0]);
             for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]+=sc->shared[i]+LAGUNA_ROUTED_SCALE*sc->partial[i];
         }
+        if(g_prof) g_t_mlp+=prof_now()-pm0;
     }
     if (compute_logits) {
         laguna_rmsnorm(sc->n1, x, m->final_norm, LAGUNA_HIDDEN, LAGUNA_RMS_EPS);
@@ -429,6 +472,7 @@ static void usage(const char *n){
       "                     [--stage-dir DIR] [--gen-out FILE]\n", n, n);
 }
 
+#ifndef LAGUNA_BENCH
 #include "laguna_tofu.inc"   /* uTofu bootstrap + allreduce glue (single EP group) */
 
 int main(int argc, char **argv) {
@@ -444,3 +488,4 @@ int main(int argc, char **argv) {
     if (argc>=2 && !strcmp(argv[1],"--generate")) return run_generate(argc,argv);
     usage(argv[0]); return 2;
 }
+#endif /* LAGUNA_BENCH */

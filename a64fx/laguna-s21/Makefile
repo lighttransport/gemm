@@ -21,7 +21,7 @@ CFLAGS += -I$(COMMON) -I$(UTOFU)
 LDFLAGS += -lm -lpthread
 TOFU_LIBS ?= -ltofucom
 
-.PHONY: all clean test
+.PHONY: all clean test bench
 all: $(BUILD)/laguna_s21_stage $(BUILD)/laguna_s21_ep_runner
 
 $(BUILD):
@@ -35,6 +35,12 @@ $(BUILD)/laguna_s21_ep_runner: laguna_s21_ep_runner.c laguna_s21.h laguna_tofu.i
 
 test: $(BUILD)/laguna_s21_ep_runner
 	$(BUILD)/laguna_s21_ep_runner --self-test
+
+# Single-node synthetic decode benchmark (no uTofu). Run: OMP_NUM_THREADS=47 \
+#   XOS_MMM_L_PAGING_POLICY=demand:demand:demand build/bench_decode 48 1 30
+bench: $(BUILD)/bench_decode
+$(BUILD)/bench_decode: bench_decode.c laguna_s21_ep_runner.c laguna_s21.h | $(BUILD)
+	$(CC) $(CFLAGS) -DLAGUNA_BENCH -o $@ bench_decode.c $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD)
