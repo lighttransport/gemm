@@ -405,7 +405,15 @@ static void expert_i4(laguna_scratch *sc, const laguna_expert *ex, const float *
     laguna_matvec_i4g32(out, ex->dp, ex->ds, sc->inter_a, LAGUNA_HIDDEN, inter);
 }
 
-typedef void (*ar_fn)(void *ctx, float *buf, int count);
+/* Async all-reduce interface: launch() posts the reduction (on a comm thread),
+ * join() waits for it. Between them the caller runs independent compute (the
+ * shared expert) so the per-MoE-layer allreduce overlaps it. NULL => single node
+ * (no reduction needed). */
+typedef struct {
+    void (*launch)(void *ctx, float *buf, int count);
+    void (*join)(void *ctx);
+    void *ctx;
+} laguna_async_ar;
 
 /* Full forward for one token. `x` = residual stream (f32 [hidden]), updated in place.
  * If compute_logits, writes sc->logits. ar/ar_ctx do the routed allreduce. */
@@ -415,7 +423,7 @@ static double vnorm(const float*v,int n){ double s=0; for(int i=0;i<n;i++)s+=(do
 double g_t_attn=0, g_t_mlp=0, g_t_norm=0; int g_prof=0;
 static double prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, int pos,
-                          ar_fn ar, void *ar_ctx, int compute_logits) {
+                          laguna_async_ar *aar, int compute_logits) {
     for (int L=0; L<m->n_layers; ++L) {
         const laguna_layer *ly=&m->layers[L];
         double pt0=g_prof?prof_now():0;
@@ -434,9 +442,6 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
                       sc->attn_out, LAGUNA_DENSE_INTER);
             for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]+=sc->attn_out[i];
         } else {
-            /* shared expert (replicated) */
-            swiglu_w8(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->n2,
-                      sc->shared, LAGUNA_SHARED_INTER);
             /* router: sigmoid + bias, top-10, normalized */
             laguna_matvec_i8(sc->logits, &ly->router_w, sc->n2, LAGUNA_EXPERTS, LAGUNA_HIDDEN);
             int ids[LAGUNA_ACTIVE]; float rw[LAGUNA_ACTIVE];
@@ -449,7 +454,12 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
                 float w=rw[k];
                 for (int i=0;i<LAGUNA_HIDDEN;++i) sc->partial[i]+=w*sc->attn_out[i];
             }
-            if (ar) ar(ar_ctx, sc->partial, LAGUNA_HIDDEN);
+            /* Launch the routed-partial allreduce on the comm thread, then compute
+             * the (independent) shared expert on the OMP team so they overlap. */
+            if (aar && aar->launch) aar->launch(aar->ctx, sc->partial, LAGUNA_HIDDEN);
+            swiglu_w8(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->n2,
+                      sc->shared, LAGUNA_SHARED_INTER);
+            if (aar && aar->join) aar->join(aar->ctx);
             if(g_dbg&&compute_logits) logmsg("L%02d pos%d ||shared||=%.3f ||routed||=%.3f e0=%d\n",L,pos,vnorm(sc->shared,LAGUNA_HIDDEN),vnorm(sc->partial,LAGUNA_HIDDEN),ids[0]);
             for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]+=sc->shared[i]+LAGUNA_ROUTED_SCALE*sc->partial[i];
         }

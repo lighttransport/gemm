@@ -72,6 +72,16 @@ static void ep_ar(void *ctx, float *buf, int count){
     g_ar_secs+=now_sec()-t; g_ar_calls++;
 }
 
+/* Synchronous allreduce via the async interface: launch() does the blocking
+ * reduce, join() is a no-op.  (A dedicated comm-thread overlap was tried and
+ * reverted: on this OMP runtime the comm thread is starved of CPU and can't
+ * drive uTofu promptly -- the allreduce ballooned ~100x, net loss.) */
+static void ar_launch(void *ctx, float *buf, int count){ (void)ctx; ep_ar(&g_comm, buf, count); }
+static void ar_join(void *ctx){ (void)ctx; }
+static laguna_async_ar g_aar = { ar_launch, ar_join, NULL };
+static void ar_thread_start(void){ if(N<=1){ g_aar.launch=NULL; g_aar.join=NULL; } }
+static void ar_thread_stop(void){ }
+
 static void tofu_bootstrap(void){
     int rc;
     utofu_tni_id_t*tni_ids=NULL; size_t num_tnis=0;
@@ -137,6 +147,7 @@ static int run_generate(int argc, char **argv){
     if(stage_load(&st,stage_dir,MyRank)!=0){ fprintf(stderr,"rank %d: stage load failed\n",MyRank); return 1; }
     laguna_model m; model_build(&m,&st,n_layers,maxpos,MyRank,N);
     laguna_scratch sc; scratch_alloc(&sc,maxpos);
+    ar_thread_start();   /* dedicated comm core for overlapped allreduce */
     double t1=now_sec();
     logmsg("rank %d: loaded %ld tensors, %.2f GB blob, %d layers, maxpos %d in %.1fs\n",
            MyRank,st.n_ents,st.blob_bytes/1e9,n_layers,maxpos,t1-t0);
@@ -152,7 +163,7 @@ static int run_generate(int argc, char **argv){
     for(int p=0;p<n_prompt;p++){
         embed_token(&m,prompt[p],x);
         int need_logits=(p==n_prompt-1)||g_dbg;
-        forward_token(&m,&sc,x,p,ep_ar,&g_comm,need_logits);
+        forward_token(&m,&sc,x,p,&g_aar,need_logits);
         total_nan+=count_nan(x,LAGUNA_HIDDEN);
         if(g_dbg&&MyRank==0){ int a=argmax(sc.logits,LAGUNA_VOCAB); logmsg("PREFILL pos%d in_tok=%d -> argmax=%d (logit %.2f)\n",p,prompt[p],a,sc.logits[a]); }
     }
@@ -174,7 +185,7 @@ static int run_generate(int argc, char **argv){
         gen[ngen++]=next;
         if(next==eos0||next==eos1) break;
         embed_token(&m,next,x);
-        forward_token(&m,&sc,x,pos,ep_ar,&g_comm,1);
+        forward_token(&m,&sc,x,pos,&g_aar,1);
         total_nan+=count_nan(x,LAGUNA_HIDDEN);
         next=argmax(sc.logits,LAGUNA_VOCAB);
         pos++;
@@ -193,6 +204,7 @@ static int run_generate(int argc, char **argv){
         printf("\n"); fflush(stdout);
         if(gen_out){ FILE*f=fopen(gen_out,"w"); if(f){ for(int i=0;i<ngen;i++) fprintf(f,"%d%s",gen[i],i+1<ngen?" ":"\n"); fclose(f);} }
     }
+    ar_thread_stop();
     barrier();
     return total_nan>0 ? 3 : 0;
 }

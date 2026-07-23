@@ -90,18 +90,18 @@ int main(int argc, char**argv){
 
     struct timespec t0,t1;
     /* warmup (touches weights) */
-    for(int i=0;i<3;i++){ for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f; forward_token(&m,&sc,x,i,NULL,NULL,1); }
+    for(int i=0;i<3;i++){ for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f; forward_token(&m,&sc,x,i,NULL,1); }
     extern double g_t_attn,g_t_mlp,g_t_norm; extern int g_prof; g_prof=1;
     g_t_attn=g_t_mlp=g_t_norm=0;
     clock_gettime(CLOCK_MONOTONIC,&t0);
-    for(int i=0;i<iters;i++){ for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f; forward_token(&m,&sc,x,10+i,NULL,NULL,1); }
+    for(int i=0;i<iters;i++){ for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f; forward_token(&m,&sc,x,10+i,NULL,1); }
     clock_gettime(CLOCK_MONOTONIC,&t1);
     double dt=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
     printf("  phases/token: norm=%.2f attn=%.2f mlp=%.2f ms\n",g_t_norm*1e3/iters,g_t_attn*1e3/iters,g_t_mlp*1e3/iters);
     g_prof=0;
     /* layers only (no lm_head) */
     struct timespec t2,t3; clock_gettime(CLOCK_MONOTONIC,&t2);
-    for(int i=0;i<iters;i++){ for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f; forward_token(&m,&sc,x,10+i,NULL,NULL,0); }
+    for(int i=0;i<iters;i++){ for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f; forward_token(&m,&sc,x,10+i,NULL,0); }
     clock_gettime(CLOCK_MONOTONIC,&t3);
     double dl=((t3.tv_sec-t2.tv_sec)+(t3.tv_nsec-t2.tv_nsec)*1e-9)/iters;
     /* lm_head only */
