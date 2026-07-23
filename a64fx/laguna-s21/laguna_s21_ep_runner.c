@@ -202,16 +202,28 @@ static int stage_load(laguna_stage *s, const char *dir, int rank) {
     return 0;
 }
 
-/* Fill the model from a rank-local stage. n_layers lets a bring-up run truncate. */
+/* Quantize a staged bf16 [rows,cols] weight to per-row int8 + f32 scale (W8). */
+static laguna_w8 stage_quant(const laguna_stage *s, const char *name, int rows, int cols) {
+    const uint16_t *w = stage_req(s, name);
+    laguna_w8 r;
+    if (posix_memalign((void**)&r.q, 256, (size_t)rows*cols) != 0 ||
+        posix_memalign((void**)&r.s, 256, (size_t)rows*sizeof(float)) != 0) {
+        fprintf(stderr, "FATAL: W8 alloc failed for %s\n", name); exit(1);
+    }
+    laguna_quant_w8(r.q, r.s, w, rows, cols);
+    return r;
+}
+
+/* Fill the model from a rank-local stage. n_layers lets a bring-up run truncate.
+ * Attention/dense/shared/router/lm_head are quantized to int8 (W8) at load to
+ * halve the per-token weight bandwidth; norms/embed stay bf16, experts stay int4. */
 static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
                         int max_pos, int rank, int ep_size) {
-    static const int layer_types_full[LAGUNA_LAYERS] = {0}; /* computed below */
     memset(m,0,sizeof *m);
     m->n_layers=n_layers; m->max_pos=max_pos; m->ep_rank=rank; m->ep_size=ep_size;
     m->embed      = stage_req(s,"model.embed_tokens.weight");
-    m->lm_head    = stage_req(s,"lm_head.weight");
+    m->lm_head    = stage_quant(s,"lm_head.weight", LAGUNA_VOCAB, LAGUNA_HIDDEN);
     m->final_norm = stage_req(s,"model.norm.weight");
-    (void)layer_types_full;
     char nm[320];
     for (int L=0; L<n_layers; ++L) {
         laguna_layer *ly=&m->layers[L];
@@ -219,25 +231,27 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
         ly->is_sliding = !full;
         ly->num_heads  = full ? LAGUNA_FULL_HEADS : LAGUNA_SLIDING_HEADS;
         ly->is_moe     = (L != 0);          /* mlp_only_layers=[0] => layer 0 dense */
+        int nh=ly->num_heads, H=LAGUNA_HIDDEN, hd=LAGUNA_HEAD_DIM;
         #define REQ(field,suffix) do{ snprintf(nm,sizeof nm,"model.layers.%d." suffix,L); ly->field=stage_req(s,nm);}while(0)
-        REQ(q_proj,  "self_attn.q_proj.weight");
-        REQ(k_proj,  "self_attn.k_proj.weight");
-        REQ(v_proj,  "self_attn.v_proj.weight");
-        REQ(o_proj,  "self_attn.o_proj.weight");
-        REQ(g_proj,  "self_attn.g_proj.weight");
+        #define QREQ(field,suffix,rows,cols) do{ snprintf(nm,sizeof nm,"model.layers.%d." suffix,L); ly->field=stage_quant(s,nm,(rows),(cols));}while(0)
+        QREQ(q_proj,  "self_attn.q_proj.weight", nh*hd, H);
+        QREQ(k_proj,  "self_attn.k_proj.weight", LAGUNA_KV_HEADS*hd, H);
+        QREQ(v_proj,  "self_attn.v_proj.weight", LAGUNA_KV_HEADS*hd, H);
+        QREQ(o_proj,  "self_attn.o_proj.weight", H, nh*hd);
+        QREQ(g_proj,  "self_attn.g_proj.weight", nh, H);
         REQ(q_norm,  "self_attn.q_norm.weight");
         REQ(k_norm,  "self_attn.k_norm.weight");
         REQ(in_ln,   "input_layernorm.weight");
         REQ(post_ln, "post_attention_layernorm.weight");
         if (!ly->is_moe) {
-            REQ(dense_gate,"mlp.gate_proj.weight");
-            REQ(dense_up,  "mlp.up_proj.weight");
-            REQ(dense_down,"mlp.down_proj.weight");
+            QREQ(dense_gate,"mlp.gate_proj.weight", LAGUNA_DENSE_INTER, H);
+            QREQ(dense_up,  "mlp.up_proj.weight",   LAGUNA_DENSE_INTER, H);
+            QREQ(dense_down,"mlp.down_proj.weight", H, LAGUNA_DENSE_INTER);
         } else {
-            REQ(shared_gate,"mlp.shared_expert.gate_proj.weight");
-            REQ(shared_up,  "mlp.shared_expert.up_proj.weight");
-            REQ(shared_down,"mlp.shared_expert.down_proj.weight");
-            REQ(router_w,   "mlp.gate.weight");
+            QREQ(shared_gate,"mlp.shared_expert.gate_proj.weight", LAGUNA_SHARED_INTER, H);
+            QREQ(shared_up,  "mlp.shared_expert.up_proj.weight",   LAGUNA_SHARED_INTER, H);
+            QREQ(shared_down,"mlp.shared_expert.down_proj.weight", H, LAGUNA_SHARED_INTER);
+            QREQ(router_w,   "mlp.gate.weight", LAGUNA_EXPERTS, H);
             snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.e_score_correction_bias",L);
             ly->router_bias=stage_req(s,nm);
             for (int e=0;e<LAGUNA_EXPERTS;++e) {
@@ -253,6 +267,7 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
             }
         }
         #undef REQ
+        #undef QREQ
     }
     /* rope tables + KV cache */
     int hf=LAGUNA_ROPE_FULL_DIM/2, hs=LAGUNA_ROPE_SLIDING_DIM/2;
@@ -308,11 +323,11 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
     int half = rot/2;
     const float *rc = cosp + (size_t)pos*half, *rs = sinp + (size_t)pos*half;
 
-    /* q/k/v/g all read n1 -> one fused parallel region */
+    /* q/k/v/g all read n1 -> one fused parallel region (int8 weight, f32 act) */
     { float *ys[4]={sc->qf,sc->kf,sc->vf,sc->gf};
-      const uint16_t *Ws[4]={ly->q_proj,ly->k_proj,ly->v_proj,ly->g_proj};
+      const laguna_w8 *Ws[4]={&ly->q_proj,&ly->k_proj,&ly->v_proj,&ly->g_proj};
       int rws[4]={nh*hd, LAGUNA_KV_HEADS*hd, LAGUNA_KV_HEADS*hd, nh};
-      laguna_matvec_bf16_multi(ys, Ws, rws, 4, sc->n1, LAGUNA_HIDDEN); }
+      laguna_matvec_i8_multi(ys, Ws, rws, 4, sc->n1, LAGUNA_HIDDEN); }
 
     /* q_norm + rope per query head */
 #ifdef _OPENMP
@@ -367,18 +382,18 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
         float s=gate/l_i; float *o=sc->ao+(size_t)h*hd;
         for(int d=0;d<hd;++d) o[d]=acc[d]*s;
     }
-    /* o_proj: [hidden, nh*hd] * ao -> attn_out */
-    laguna_matvec_bf16(sc->attn_out, ly->o_proj, sc->ao, LAGUNA_HIDDEN, nh*hd);
+    /* o_proj: [hidden, nh*hd] * ao -> attn_out (int8 weight, f32 act) */
+    laguna_matvec_i8(sc->attn_out, &ly->o_proj, sc->ao, LAGUNA_HIDDEN, nh*hd);
 }
 
-/* dense/shared SwiGLU: out[hidden] = down( silu(gate(x)) * up(x) ), bf16 weights. */
-static void swiglu_bf16(laguna_scratch *sc, const uint16_t *gate_w, const uint16_t *up_w,
-                        const uint16_t *down_w, const float *x, float *out, int inter) {
+/* dense/shared SwiGLU: out[hidden] = down( silu(gate(x)) * up(x) ), int8 W8 weights. */
+static void swiglu_w8(laguna_scratch *sc, const laguna_w8 *gate_w, const laguna_w8 *up_w,
+                      const laguna_w8 *down_w, const float *x, float *out, int inter) {
     float *ys[2]={sc->inter_a, sc->inter_b};
-    const uint16_t *Ws[2]={gate_w, up_w}; int rws[2]={inter, inter};
-    laguna_matvec_bf16_multi(ys, Ws, rws, 2, x, LAGUNA_HIDDEN);   /* gate & up share x */
+    const laguna_w8 *Ws[2]={gate_w, up_w}; int rws[2]={inter, inter};
+    laguna_matvec_i8_multi(ys, Ws, rws, 2, x, LAGUNA_HIDDEN);   /* gate & up share x */
     for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
-    laguna_matvec_bf16(out, down_w, sc->inter_a, LAGUNA_HIDDEN, inter);
+    laguna_matvec_i8(out, down_w, sc->inter_a, LAGUNA_HIDDEN, inter);
 }
 
 /* One expert's INT4 SwiGLU into `out` (hidden). inter=1024. */
@@ -415,15 +430,15 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
         /* --- mlp block --- */
         laguna_rmsnorm(sc->n2, x, ly->post_ln, LAGUNA_HIDDEN, LAGUNA_RMS_EPS);
         if (!ly->is_moe) {
-            swiglu_bf16(sc, ly->dense_gate, ly->dense_up, ly->dense_down, sc->n2,
-                        sc->attn_out, LAGUNA_DENSE_INTER);
+            swiglu_w8(sc, &ly->dense_gate, &ly->dense_up, &ly->dense_down, sc->n2,
+                      sc->attn_out, LAGUNA_DENSE_INTER);
             for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]+=sc->attn_out[i];
         } else {
             /* shared expert (replicated) */
-            swiglu_bf16(sc, ly->shared_gate, ly->shared_up, ly->shared_down, sc->n2,
-                        sc->shared, LAGUNA_SHARED_INTER);
+            swiglu_w8(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->n2,
+                      sc->shared, LAGUNA_SHARED_INTER);
             /* router: sigmoid + bias, top-10, normalized */
-            laguna_matvec_bf16(sc->logits, ly->router_w, sc->n2, LAGUNA_EXPERTS, LAGUNA_HIDDEN);
+            laguna_matvec_i8(sc->logits, &ly->router_w, sc->n2, LAGUNA_EXPERTS, LAGUNA_HIDDEN);
             int ids[LAGUNA_ACTIVE]; float rw[LAGUNA_ACTIVE];
             laguna_top10(sc->logits, ly->router_bias, ids, rw);
             for (int i=0;i<LAGUNA_HIDDEN;++i) sc->partial[i]=0.0f;
@@ -442,7 +457,7 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
     }
     if (compute_logits) {
         laguna_rmsnorm(sc->n1, x, m->final_norm, LAGUNA_HIDDEN, LAGUNA_RMS_EPS);
-        laguna_matvec_bf16(sc->logits, m->lm_head, sc->n1, LAGUNA_VOCAB, LAGUNA_HIDDEN);
+        laguna_matvec_i8(sc->logits, &m->lm_head, sc->n1, LAGUNA_VOCAB, LAGUNA_HIDDEN);
     }
 }
 

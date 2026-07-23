@@ -27,6 +27,14 @@ static uint16_t *scale_buf(size_t n){ uint16_t*p=NULL; posix_memalign((void**)&p
 static float *f32_buf(size_t n){ float*p=NULL; posix_memalign((void**)&p,256,n*4);
     #pragma omp parallel for schedule(static)
     for(long i=0;i<(long)n;i++) p[i]=0.0f; return p; }
+/* synthetic int8 W8 weight (parallel first-touch) */
+static laguna_w8 w8_buf(int rows,int cols){ laguna_w8 w;
+    posix_memalign((void**)&w.q,256,(size_t)rows*cols);
+    posix_memalign((void**)&w.s,256,(size_t)rows*sizeof(float));
+    #pragma omp parallel for schedule(static)
+    for(long r=0;r<rows;r++){ w.s[r]=0.001f; int8_t*q=w.q+(size_t)r*cols;
+        for(int c=0;c<cols;c++)q[c]=(int8_t)(((r*131+c)%255)-127); }
+    return w; }
 
 int main(int argc, char**argv){
     int n_layers = argc>1?atoi(argv[1]):48;
@@ -36,28 +44,29 @@ int main(int argc, char**argv){
     laguna_model m; memset(&m,0,sizeof m);
     m.n_layers=n_layers; m.max_pos=maxpos; m.ep_rank=0; m.ep_size=1;
     m.embed=bf16_buf((size_t)LAGUNA_VOCAB*LAGUNA_HIDDEN);
-    m.lm_head=bf16_buf((size_t)LAGUNA_VOCAB*LAGUNA_HIDDEN);
+    m.lm_head=w8_buf(LAGUNA_VOCAB, LAGUNA_HIDDEN);
     m.final_norm=bf16_buf(LAGUNA_HIDDEN);
+    int H=LAGUNA_HIDDEN, hd=LAGUNA_HEAD_DIM;
     for(int L=0;L<n_layers;L++){
         laguna_layer*ly=&m.layers[L]; int full=(L%4==0);
         ly->is_sliding=!full; ly->num_heads=full?LAGUNA_FULL_HEADS:LAGUNA_SLIDING_HEADS; ly->is_moe=(L!=0);
         int nh=ly->num_heads;
-        ly->q_proj=bf16_buf((size_t)nh*LAGUNA_HEAD_DIM*LAGUNA_HIDDEN);
-        ly->k_proj=bf16_buf((size_t)LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*LAGUNA_HIDDEN);
-        ly->v_proj=bf16_buf((size_t)LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*LAGUNA_HIDDEN);
-        ly->o_proj=bf16_buf((size_t)LAGUNA_HIDDEN*nh*LAGUNA_HEAD_DIM);
-        ly->g_proj=bf16_buf((size_t)nh*LAGUNA_HIDDEN);
+        ly->q_proj=w8_buf(nh*hd, H);
+        ly->k_proj=w8_buf(LAGUNA_KV_HEADS*hd, H);
+        ly->v_proj=w8_buf(LAGUNA_KV_HEADS*hd, H);
+        ly->o_proj=w8_buf(H, nh*hd);
+        ly->g_proj=w8_buf(nh, H);
         ly->q_norm=bf16_buf(LAGUNA_HEAD_DIM); ly->k_norm=bf16_buf(LAGUNA_HEAD_DIM);
         ly->in_ln=bf16_buf(LAGUNA_HIDDEN); ly->post_ln=bf16_buf(LAGUNA_HIDDEN);
         if(!ly->is_moe){
-            ly->dense_gate=bf16_buf((size_t)LAGUNA_DENSE_INTER*LAGUNA_HIDDEN);
-            ly->dense_up  =bf16_buf((size_t)LAGUNA_DENSE_INTER*LAGUNA_HIDDEN);
-            ly->dense_down=bf16_buf((size_t)LAGUNA_HIDDEN*LAGUNA_DENSE_INTER);
+            ly->dense_gate=w8_buf(LAGUNA_DENSE_INTER, H);
+            ly->dense_up  =w8_buf(LAGUNA_DENSE_INTER, H);
+            ly->dense_down=w8_buf(H, LAGUNA_DENSE_INTER);
         } else {
-            ly->shared_gate=bf16_buf((size_t)LAGUNA_SHARED_INTER*LAGUNA_HIDDEN);
-            ly->shared_up  =bf16_buf((size_t)LAGUNA_SHARED_INTER*LAGUNA_HIDDEN);
-            ly->shared_down=bf16_buf((size_t)LAGUNA_HIDDEN*LAGUNA_SHARED_INTER);
-            ly->router_w=bf16_buf((size_t)LAGUNA_EXPERTS*LAGUNA_HIDDEN);
+            ly->shared_gate=w8_buf(LAGUNA_SHARED_INTER, H);
+            ly->shared_up  =w8_buf(LAGUNA_SHARED_INTER, H);
+            ly->shared_down=w8_buf(H, LAGUNA_SHARED_INTER);
+            ly->router_w=w8_buf(LAGUNA_EXPERTS, H);
             ly->router_bias=f32_buf(LAGUNA_EXPERTS);
             size_t gp=(size_t)LAGUNA_EXPERT_INTER*(LAGUNA_HIDDEN/8), gs=(size_t)LAGUNA_EXPERT_INTER*(LAGUNA_HIDDEN/32);
             size_t dp=(size_t)LAGUNA_HIDDEN*(LAGUNA_EXPERT_INTER/8), ds=(size_t)LAGUNA_HIDDEN*(LAGUNA_EXPERT_INTER/32);
@@ -97,7 +106,7 @@ int main(int argc, char**argv){
     double dl=((t3.tv_sec-t2.tv_sec)+(t3.tv_nsec-t2.tv_nsec)*1e-9)/iters;
     /* lm_head only */
     clock_gettime(CLOCK_MONOTONIC,&t2);
-    for(int i=0;i<iters;i++) laguna_matvec_bf16(sc.logits,m.lm_head,sc.n1,LAGUNA_VOCAB,LAGUNA_HIDDEN);
+    for(int i=0;i<iters;i++) laguna_matvec_i8(sc.logits,&m.lm_head,sc.n1,LAGUNA_VOCAB,LAGUNA_HIDDEN);
     clock_gettime(CLOCK_MONOTONIC,&t3);
     double dh=((t3.tv_sec-t2.tv_sec)+(t3.tv_nsec-t2.tv_nsec)*1e-9)/iters;
     printf("  breakdown: layers=%.2f ms  lm_head=%.2f ms\n",dl*1e3,dh*1e3);

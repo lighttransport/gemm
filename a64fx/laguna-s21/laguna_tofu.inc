@@ -167,6 +167,7 @@ static int run_generate(int argc, char **argv){
                n_prompt,pf1-pf0,n_prompt/(pf1-pf0),a,total_nan);
     }
     /* decode loop */
+    g_ar_secs=0; g_ar_calls=0;   /* measure decode-only comm */
     double dc0=now_sec();
     int pos=n_prompt;
     for(int g=0; g<max_new; ++g){

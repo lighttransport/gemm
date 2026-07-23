@@ -230,6 +230,111 @@ static inline void laguna_default_inv_freq(float *inv_freq, int dim, double thet
         inv_freq[i] = (float)(1.0 / pow(theta, (double)(2 * i) / (double)dim));
 }
 
+/* ---- W8: per-row symmetric int8 weights (halves bf16 weight bandwidth) ---- */
+typedef struct { int8_t *q; float *s; } laguna_w8;   /* q[rows*cols], s[rows] */
+
+/* Quantize a bf16 [rows,cols] weight to per-row symmetric int8 + f32 scale.
+ * Parallel over rows so the int8/scale pages first-touch on the reader's CMG. */
+static inline void laguna_quant_w8(int8_t *q, float *scale, const uint16_t *w,
+                                   int rows, int cols) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; ++r) {
+        const uint16_t *wr = w + (size_t)r * cols;
+        float mx = 0.0f;
+        for (int c = 0; c < cols; ++c) { float a = fabsf(laguna_bf16_to_f32(wr[c])); if (a>mx) mx=a; }
+        float s = mx > 0.0f ? mx / 127.0f : 1.0f;
+        scale[r] = s;
+        float inv = 1.0f / s;
+        int8_t *qr = q + (size_t)r * cols;
+        for (int c = 0; c < cols; ++c) {
+            int v = (int)lrintf(laguna_bf16_to_f32(wr[c]) * inv);
+            qr[c] = (int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);
+        }
+    }
+}
+
+#if defined(__ARM_FEATURE_SVE)
+/* Rows [r,r+nr) (nr<=8) of y = (Q*x) scaled per row, int8 weights widened to f32.
+ * 8 independent accumulators give enough ILP to hide FMA/load latency (the matvec
+ * is latency-bound, not bandwidth-bound, on A64FX). */
+#define LAGUNA_I8_BLK 8
+static inline void laguna_i8_rowblock(float *restrict y, const int8_t *restrict Q,
+                                      const float *restrict sc, const float *restrict x,
+                                      int r, int nr, int cols) {
+    if (nr == LAGUNA_I8_BLK) {
+        const int8_t *w0=Q+(size_t)r*cols,*w1=w0+cols,*w2=w1+cols,*w3=w2+cols;
+        const int8_t *w4=w3+cols,*w5=w4+cols,*w6=w5+cols,*w7=w6+cols;
+        svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+        svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+        for (int c = 0; c < cols; c += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32(c, cols);
+            svfloat32_t xf = svld1_f32(pg, x + c);
+            a0=svmla_f32_x(pg,a0,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w0+c)),xf);
+            a1=svmla_f32_x(pg,a1,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w1+c)),xf);
+            a2=svmla_f32_x(pg,a2,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w2+c)),xf);
+            a3=svmla_f32_x(pg,a3,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w3+c)),xf);
+            a4=svmla_f32_x(pg,a4,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w4+c)),xf);
+            a5=svmla_f32_x(pg,a5,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w5+c)),xf);
+            a6=svmla_f32_x(pg,a6,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w6+c)),xf);
+            a7=svmla_f32_x(pg,a7,svcvt_f32_s32_x(pg,svld1sb_s32(pg,w7+c)),xf);
+        }
+        svbool_t pt = svptrue_b32();
+        y[r]=svaddv_f32(pt,a0)*sc[r];     y[r+1]=svaddv_f32(pt,a1)*sc[r+1];
+        y[r+2]=svaddv_f32(pt,a2)*sc[r+2]; y[r+3]=svaddv_f32(pt,a3)*sc[r+3];
+        y[r+4]=svaddv_f32(pt,a4)*sc[r+4]; y[r+5]=svaddv_f32(pt,a5)*sc[r+5];
+        y[r+6]=svaddv_f32(pt,a6)*sc[r+6]; y[r+7]=svaddv_f32(pt,a7)*sc[r+7];
+    } else {
+        for (int rr = r; rr < r+nr; ++rr) {
+            const int8_t *ww = Q + (size_t)rr * cols;
+            svfloat32_t a = svdup_f32(0);
+            for (int c = 0; c < cols; c += (int)svcntw()) {
+                svbool_t pg = svwhilelt_b32(c, cols);
+                a = svmla_f32_x(pg, a, svcvt_f32_s32_x(pg, svld1sb_s32(pg, ww+c)), svld1_f32(pg, x+c));
+            }
+            y[rr] = svaddv_f32(svptrue_b32(), a) * sc[rr];
+        }
+    }
+}
+static inline void laguna_matvec_i8(float *restrict y, const laguna_w8 *w,
+                                    const float *restrict x, int rows, int cols) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r += LAGUNA_I8_BLK)
+        laguna_i8_rowblock(y, w->q, w->s, x, r, rows-r<LAGUNA_I8_BLK?rows-r:LAGUNA_I8_BLK, cols);
+}
+
+static inline void laguna_matvec_i8_multi(float *const *ys, const laguna_w8 *const *ws,
+                                          const int *rows, int nmat, const float *x, int cols) {
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        for (int m = 0; m < nmat; ++m) {
+            #pragma omp for schedule(static) nowait
+            for (int r = 0; r < rows[m]; r += LAGUNA_I8_BLK)
+                laguna_i8_rowblock(ys[m], ws[m]->q, ws[m]->s, x, r, rows[m]-r<LAGUNA_I8_BLK?rows[m]-r:LAGUNA_I8_BLK, cols);
+        }
+    }
+#else
+    for (int m = 0; m < nmat; ++m)
+        for (int r = 0; r < rows[m]; r += LAGUNA_I8_BLK)
+            laguna_i8_rowblock(ys[m], ws[m]->q, ws[m]->s, x, r, rows[m]-r<LAGUNA_I8_BLK?rows[m]-r:LAGUNA_I8_BLK, cols);
+#endif
+}
+#else /* scalar fallback */
+static inline void laguna_matvec_i8(float *restrict y, const laguna_w8 *w,
+                                    const float *restrict x, int rows, int cols) {
+    for (int r=0;r<rows;++r){ const int8_t*q=w->q+(size_t)r*cols; float a=0;
+        for(int c=0;c<cols;++c)a+=(float)q[c]*x[c]; y[r]=a*w->s[r]; }
+}
+static inline void laguna_matvec_i8_multi(float *const *ys, const laguna_w8 *const *ws,
+                                          const int *rows, int nmat, const float *x, int cols) {
+    for (int m=0;m<nmat;++m) laguna_matvec_i8(ys[m], ws[m], x, rows[m], cols);
+}
+#endif
+
 #if defined(__ARM_FEATURE_SVE)
 /* SVE group-32 INT4 dot. Requires a 512-bit VL (16 f32 lanes): 16 packed bytes =
  * 32 nibbles = exactly one group.  Byte b holds col 2b (low nibble) and 2b+1
@@ -282,22 +387,23 @@ typedef struct {
     int num_heads;         /* per-layer query heads (48 full / 72 sliding) */
     int is_sliding;        /* 1 => sliding_attention, 0 => full_attention  */
     int is_moe;            /* 1 => MoE mlp, 0 => dense mlp (layer 0)        */
-    /* attention (bf16) */
-    const uint16_t *q_proj, *k_proj, *v_proj, *o_proj, *g_proj;
+    /* attention projections (int8 W8) */
+    laguna_w8 q_proj, k_proj, v_proj, o_proj, g_proj;
+    /* norms stay bf16 */
     const uint16_t *q_norm, *k_norm, *in_ln, *post_ln;
-    /* dense mlp (layer 0) */
-    const uint16_t *dense_gate, *dense_up, *dense_down;
-    /* moe: shared expert (bf16), router weight (bf16 [256,hidden]), bias (f32 [256]) */
-    const uint16_t *shared_gate, *shared_up, *shared_down;
-    const uint16_t *router_w;
+    /* dense mlp (layer 0), int8 W8 */
+    laguna_w8 dense_gate, dense_up, dense_down;
+    /* moe: shared expert (int8 W8), router weight (int8 [256,hidden]), bias (f32 [256]) */
+    laguna_w8 shared_gate, shared_up, shared_down;
+    laguna_w8 router_w;
     const float    *router_bias;
     laguna_expert   experts[LAGUNA_EXPERTS];
 } laguna_layer;
 
 typedef struct {
     int n_layers, max_pos, ep_rank, ep_size;
-    const uint16_t *embed;      /* bf16 [vocab,hidden] */
-    const uint16_t *lm_head;    /* bf16 [vocab,hidden] */
+    const uint16_t *embed;      /* bf16 [vocab,hidden] (embedding lookup) */
+    laguna_w8 lm_head;          /* int8 W8 [vocab,hidden] */
     const uint16_t *final_norm; /* bf16 [hidden]       */
     laguna_layer layers[LAGUNA_LAYERS];
     /* rope tables: cos/sin[pos * half] for full (half=32) and sliding (half=64) */
