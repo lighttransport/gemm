@@ -2,4 +2,5 @@ build/
 logs/
 smoke/
 gen_*/
+probe/
 *.ids

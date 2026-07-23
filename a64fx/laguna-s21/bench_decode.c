@@ -110,6 +110,15 @@ int main(int argc, char**argv){
     clock_gettime(CLOCK_MONOTONIC,&t3);
     double dh=((t3.tv_sec-t2.tv_sec)+(t3.tv_nsec-t2.tv_nsec)*1e-9)/iters;
     printf("  breakdown: layers=%.2f ms  lm_head=%.2f ms\n",dl*1e3,dh*1e3);
+    /* correctness gate: deterministic forward from a fixed state -> logits checksum.
+     * Must be bit-stable across kernel/parallelization refactors. */
+    { memset(m.kcache,0,(size_t)n_layers*m.kv_layer_stride*2);
+      memset(m.vcache,0,(size_t)n_layers*m.kv_layer_stride*2);
+      for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f;
+      forward_token(&m,&sc,x,0,NULL,1);
+      double s=0,a=0; int nn=0;
+      for(int i=0;i<LAGUNA_VOCAB;i++){ s+=sc.logits[i]; a+=fabs((double)sc.logits[i]); if(!isfinite(sc.logits[i]))nn++; }
+      printf("  CHECKSUM sum=%.6f abs=%.6f argmax=%d nan=%d\n",s,a,argmax(sc.logits,LAGUNA_VOCAB),nn); }
     printf("layers=%d active=%d iters=%d: %.2f ms/token  %.2f tok/s  (SVE=%d threads=%d)\n",
            n_layers,n_active,iters,dt*1e3/iters,iters/dt,
 #if defined(__ARM_FEATURE_SVE)

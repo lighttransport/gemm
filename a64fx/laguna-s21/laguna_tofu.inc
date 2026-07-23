@@ -118,6 +118,39 @@ static void tofu_bootstrap(void){
     if(tp_comm_init(&g_comm,Vcq,PeerVcq,MyRank,N,LAGUNA_HIDDEN,barrier)!=0) die("tp_comm_init",-1);
 }
 
+/* Isolate pure collective cost from load-imbalance wait: barrier before each
+ * timed allreduce so every rank enters together (=> wire+sync only), vs a
+ * back-to-back loop (=> what the decode loop actually pays). No weights needed. */
+static int run_ar_probe(int argc, char **argv){
+    int reps = 2000, count = LAGUNA_HIDDEN;
+    for(int i=2;i<argc;i++){
+        if(!strcmp(argv[i],"--reps")&&i+1<argc) reps=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--count")&&i+1<argc) count=atoi(argv[++i]);
+    }
+    if(count>LAGUNA_HIDDEN) count=LAGUNA_HIDDEN;
+    tofu_bootstrap();
+    float *buf=malloc((size_t)count*sizeof(float));
+    for(int i=0;i<count;i++) buf[i]=0.001f*i;
+    /* warmup */
+    for(int i=0;i<50;i++) ep_ar(&g_comm,buf,count);
+    barrier();
+    /* (a) back-to-back: includes any drift/imbalance the decode loop sees */
+    double t0=now_sec();
+    for(int i=0;i<reps;i++) ep_ar(&g_comm,buf,count);
+    double bb=(now_sec()-t0)/reps;
+    barrier();
+    /* (b) barrier-synced: all ranks enter together => pure collective cost */
+    double acc=0;
+    for(int i=0;i<reps;i++){ barrier(); double s=now_sec(); ep_ar(&g_comm,buf,count); acc+=now_sec()-s; }
+    double sy=acc/reps;
+    if(MyRank==0)
+        logmsg("AR_PROBE count=%d reps=%d: back_to_back=%.1f us  barrier_synced=%.1f us  "
+               "=> per-layer decode comm would be %.1f us; 47 layers = %.2f ms/token\n",
+               count,reps,bb*1e6,sy*1e6,bb*1e6,47*bb*1e3);
+    barrier();
+    return 0;
+}
+
 static int run_generate(int argc, char **argv){
     const char *ids_path=NULL, *stage_dir=getenv("LAGUNA_STAGE_DIR"), *gen_out=NULL;
     int max_new=32, maxpos=0, n_layers=LAGUNA_LAYERS;
