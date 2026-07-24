@@ -1190,6 +1190,88 @@ static int argmax(const float *v, int n) {
     for (int i=1;i<n;++i) if(v[i]>bv){bv=v[i];best=i;}
     return best;
 }
+
+/* ---- sampling ----
+ * The checkpoint's generation_config.json asks for do_sample=true, temperature=1.0,
+ * top_k=20, top_p=1.0, min_p=0.0.  Greedy stays the default here because it is
+ * deterministic (and is what every benchmark in fp8-optimization.md used); pass
+ * --sample to follow the checkpoint's own configuration.  Warper order matches
+ * HuggingFace: temperature -> top_k -> top_p -> min_p. */
+typedef struct {
+    int   do_sample;
+    float temp, top_p, min_p;
+    int   top_k;
+    uint64_t rng;
+} laguna_sampler;
+
+static inline double laguna_rng_next(uint64_t *s) {   /* splitmix64 -> [0,1) */
+    uint64_t z = (*s += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return (double)(z >> 11) * 0x1.0p-53;
+}
+
+/* Candidate cap when top_k is disabled but a distribution warper still needs a
+ * ranked list.  A full 100352-wide sort per token is far too slow, and no
+ * plausible configuration reaches this far down the tail. */
+#define LAGUNA_TOPK_CAP 1024
+
+static int laguna_sample(const float *logits, int n, laguna_sampler *sp) {
+    if (!sp->do_sample || sp->temp <= 0.0f) return argmax(logits, n);
+
+    int need_rank = (sp->top_k > 0) || (sp->top_p < 1.0f) || (sp->min_p > 0.0f);
+    float inv_t = 1.0f / sp->temp;
+
+    if (!need_rank) {                     /* plain multinomial over the full vocab */
+        float mx = logits[argmax(logits,n)];
+        double sum = 0.0;
+        for (int i=0;i<n;++i) sum += exp((double)(logits[i]-mx)*inv_t);
+        double r = laguna_rng_next(&sp->rng) * sum, c = 0.0;
+        for (int i=0;i<n;++i) { c += exp((double)(logits[i]-mx)*inv_t); if (c >= r) return i; }
+        return n-1;
+    }
+
+    int k = sp->top_k > 0 ? sp->top_k : LAGUNA_TOPK_CAP;
+    if (k > n) k = n;
+    if (k > LAGUNA_TOPK_CAP) k = LAGUNA_TOPK_CAP;
+
+    /* top-k by insertion into a descending list (k is small; one pass over vocab) */
+    static int   idx[LAGUNA_TOPK_CAP];
+    static float val[LAGUNA_TOPK_CAP];
+    int cnt = 0;
+    for (int i=0;i<n;++i) {
+        float v = logits[i];
+        if (cnt == k && v <= val[cnt-1]) continue;
+        int j = cnt < k ? cnt : k-1;
+        while (j > 0 && val[j-1] < v) { val[j]=val[j-1]; idx[j]=idx[j-1]; --j; }
+        val[j]=v; idx[j]=i;
+        if (cnt < k) ++cnt;
+    }
+
+    /* softmax over the candidates (temperature applied to logits) */
+    double p[LAGUNA_TOPK_CAP], sum = 0.0;
+    for (int i=0;i<cnt;++i) { p[i] = exp((double)(val[i]-val[0])*inv_t); sum += p[i]; }
+    for (int i=0;i<cnt;++i) p[i] /= sum;
+
+    int m = cnt;
+    if (sp->top_p < 1.0f) {               /* smallest prefix with cumulative >= top_p */
+        double c = 0.0; m = cnt;
+        for (int i=0;i<cnt;++i) { c += p[i]; if (c >= (double)sp->top_p) { m = i+1; break; } }
+        if (m < 1) m = 1;
+    }
+    if (sp->min_p > 0.0f) {               /* drop p < min_p * p_max */
+        double thr = (double)sp->min_p * p[0];
+        int mm = m; for (int i=0;i<m;++i) if (p[i] < thr) { mm = i; break; }
+        if (mm < 1) mm = 1;
+        m = mm;
+    }
+
+    double tot = 0.0; for (int i=0;i<m;++i) tot += p[i];
+    double r = laguna_rng_next(&sp->rng) * tot, c = 0.0;
+    for (int i=0;i<m;++i) { c += p[i]; if (c >= r) return idx[i]; }
+    return idx[m-1];
+}
 static void embed_token(const laguna_model *m, int tok, float *x) {
     const uint16_t *row=m->embed+(size_t)tok*LAGUNA_HIDDEN;
     for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]=laguna_bf16_to_f32(row[i]);

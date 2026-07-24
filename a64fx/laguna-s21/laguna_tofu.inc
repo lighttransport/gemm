@@ -153,9 +153,41 @@ static int run_ar_probe(int argc, char **argv){
     return 0;
 }
 
+/* Choose the next token ON RANK 0 and broadcast it, rather than letting each rank
+ * argmax its own logits.
+ *
+ * Every rank computes the full logits, but they are not bit-identical: the routed
+ * partial is combined by a tree allreduce, so ranks can differ in the last ulp.
+ * With independent argmax, one near-tie makes two ranks emit different tokens,
+ * after which their KV caches diverge and the run is silently corrupt -- and the
+ * chance of hitting one grows with the output length, so long generations are
+ * exactly where it bites.  Sampling would make it far worse (independent RNG
+ * draws), so the broadcast is what makes --sample safe at all.
+ *
+ * One 2-element allreduce does both jobs: slot 0 is rank 0's choice (zero
+ * elsewhere, so the sum IS rank 0's choice) and slot 1 is the sum of every rank's
+ * own choice, which equals N * rank0 iff all ranks agreed.  Token ids reach
+ * ~100352 and N is small, so both stay exactly representable in f32.
+ * Cost is one tiny allreduce per token against the 47 the MoE layers already do. */
+static int pick_token(laguna_scratch *sc, laguna_sampler *smp, long *disagree){
+    int mine = laguna_sample(sc->logits, LAGUNA_VOCAB, smp);
+    if (N <= 1) return mine;
+    float b[2];
+    b[0] = (MyRank==0) ? (float)mine : 0.0f;
+    b[1] = (float)mine;
+    ep_ar(&g_comm, b, 2);
+    int chosen = (int)(b[0] + 0.5f);
+    if (fabsf(b[1] - (float)N*b[0]) > 0.5f) (*disagree)++;
+    return chosen;
+}
+
 static int run_generate(int argc, char **argv){
     const char *ids_path=NULL, *stage_dir=getenv("LAGUNA_STAGE_DIR"), *gen_out=NULL;
     int max_new=32, maxpos=0, n_layers=LAGUNA_LAYERS;
+    /* defaults from the checkpoint's generation_config.json, except do_sample,
+     * which stays off so the default run is deterministic (--sample turns it on) */
+    laguna_sampler smp = { .do_sample=0, .temp=1.0f, .top_p=1.0f, .min_p=0.0f,
+                           .top_k=20, .rng=0x1234ABCDull };
     for(int i=2;i<argc;i++){
         if(!strcmp(argv[i],"--ids")&&i+1<argc) ids_path=argv[++i];
         else if(!strcmp(argv[i],"--max-new")&&i+1<argc) max_new=atoi(argv[++i]);
@@ -163,6 +195,12 @@ static int run_generate(int argc, char **argv){
         else if(!strcmp(argv[i],"--layers")&&i+1<argc) n_layers=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--stage-dir")&&i+1<argc) stage_dir=argv[++i];
         else if(!strcmp(argv[i],"--gen-out")&&i+1<argc) gen_out=argv[++i];
+        else if(!strcmp(argv[i],"--sample")) smp.do_sample=1;
+        else if(!strcmp(argv[i],"--temp")&&i+1<argc) smp.temp=(float)atof(argv[++i]);
+        else if(!strcmp(argv[i],"--top-k")&&i+1<argc) smp.top_k=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--top-p")&&i+1<argc) smp.top_p=(float)atof(argv[++i]);
+        else if(!strcmp(argv[i],"--min-p")&&i+1<argc) smp.min_p=(float)atof(argv[++i]);
+        else if(!strcmp(argv[i],"--seed")&&i+1<argc) smp.rng=(uint64_t)strtoull(argv[++i],NULL,10);
         else { fprintf(stderr,"unknown flag %s\n",argv[i]); return 2; }
     }
     if(!ids_path){ fprintf(stderr,"--generate requires --ids FILE\n"); return 2; }
@@ -177,6 +215,7 @@ static int run_generate(int argc, char **argv){
     if(maxpos<=0) maxpos=n_prompt+max_new+8;
     if(n_prompt+max_new>maxpos){ fprintf(stderr,"prompt+max_new exceeds maxpos\n"); return 2; }
 
+    uint64_t seed0 = smp.rng;   /* smp.rng advances as we sample; keep the seed for the log */
     double t0=now_sec();
     laguna_stage st;
     /* The fp8 build re-quantizes every hot tensor at load (experts -> int8-per-block,
@@ -234,7 +273,8 @@ static int run_generate(int argc, char **argv){
     }
     free(Xc);
     double pf1=now_sec();
-    int next=argmax(sc.logits,LAGUNA_VOCAB);
+    long lockstep_bad0=0;
+    int next=pick_token(&sc,&smp,&lockstep_bad0);
     if(MyRank==0){
         /* top-3 for sanity */
         /* top-5 logits for sanity */
@@ -248,15 +288,18 @@ static int run_generate(int argc, char **argv){
     }
     /* decode loop */
     g_ar_secs=0; g_ar_calls=0;   /* measure decode-only comm */
+    long lockstep_bad=0;
     double dc0=now_sec();
     int pos=n_prompt;
+    int hit_eos=0;
     for(int g=0; g<max_new; ++g){
+        /* stop BEFORE emitting: an eos token is a stop signal, not output text */
+        if(next==eos0||next==eos1){ hit_eos=1; break; }
         gen[ngen++]=next;
-        if(next==eos0||next==eos1) break;
         embed_token(&m,next,x);
         forward_token(&m,&sc,x,pos,&g_aar,1);
         total_nan+=count_nan(x,LAGUNA_HIDDEN);
-        next=argmax(sc.logits,LAGUNA_VOCAB);
+        next=pick_token(&sc,&smp,&lockstep_bad);
         pos++;
     }
     double dc1=now_sec();
@@ -265,6 +308,18 @@ static int run_generate(int argc, char **argv){
 #ifdef _OPENMP
         nth=omp_get_max_threads();
 #endif
+        if(lockstep_bad+lockstep_bad0)
+            logmsg("WARNING: %ld of %d token picks disagreed across ranks before the "
+                   "broadcast (logits differ in the last ulp); output is still "
+                   "consistent because rank 0's choice is authoritative\n",
+                   lockstep_bad+lockstep_bad0, ngen+1);
+        else
+            logmsg("lockstep: all %d token picks agreed across ranks\n", ngen+1);
+        if(smp.do_sample)
+            logmsg("sampling: temp=%.2f top_k=%d top_p=%.2f min_p=%.2f seed=%llu\n",
+                   smp.temp, smp.top_k, smp.top_p, smp.min_p,
+                   (unsigned long long)seed0);
+        if(hit_eos) logmsg("stopped on eos after %d tokens\n", ngen);
         logmsg("decode %d tok in %.2fs (%.1f tok/s) total_nan=%d comm=%.2fs (%.1f%%) threads=%d\n",
                ngen,dc1-dc0,ngen/(dc1-dc0>0?dc1-dc0:1),total_nan,g_ar_secs,
                (dc1-dc0)>0?100.0*g_ar_secs/(dc1-dc0):0.0,nth);

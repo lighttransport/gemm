@@ -276,6 +276,64 @@ Full-attention layer throughput, C=256 (`attn_bench.c`):
 - `_Static_assert` ties `LAGUNA_SLIDING_CAP` to `LAGUNA_PCHUNK`, so raising the
   chunk size past the ring is a build error rather than silent corruption.
 
+## Generation correctness
+
+Three fixes, in order of how badly they could bite:
+
+**1. Token choice is made on rank 0 and broadcast.** Every rank computes the full
+logits, but they are not bit-identical -- the routed partial is combined by a tree
+allreduce, so ranks can differ in the last ulp. With each rank running its own
+`argmax`, a single near-tie makes two ranks emit *different* tokens, after which
+their KV caches diverge and the run is silently corrupt. The chance of hitting one
+grows with output length, so long generations are exactly where it bites.
+
+One 2-element allreduce does the broadcast and detects disagreement at the same
+time (slot 0 = rank 0's pick, zero elsewhere; slot 1 = sum of all picks, which
+equals `N * rank0` iff everyone agreed). Every run now reports which it was.
+
+Measured: **ranks agreed on all 1025 / 751 / 401 picks** in the runs tested, so
+this was latent rather than active for greedy. It is what makes `--sample` safe at
+all, though: independent per-rank RNG draws have no reason to agree. Cost is one
+tiny allreduce per token against the 47 the MoE layers already do -- 26.0 -> 25.5
+tok/s, ~2%.
+
+**2. Sampling.** The checkpoint's `generation_config.json` asks for
+`do_sample=true, temperature=1.0, top_k=20, top_p=1.0, min_p=0.0`, but the runner
+only ever did greedy argmax. `--sample` follows the checkpoint's configuration;
+`--temp/--top-k/--top-p/--min-p/--seed` override it. Warper order matches
+HuggingFace (temperature -> top_k -> top_p -> min_p).
+
+Greedy remains the default because it is deterministic and is what every
+measurement in this document used. Verified by `sampler_test.c`: top-k support,
+draw frequencies matching the reference softmax to <2%, monotonic P(top) in
+temperature, top-p nucleus and min-p truncation, and seed determinism.
+
+**3. eos is a stop signal, not output.** The loop appended the token and *then*
+broke, so an eos landed in `gen.ids` and was decoded into the text. It now stops
+before emitting, and reports `stopped on eos after N tokens`.
+
+### Does long output actually degenerate?
+
+No -- measured, not eyeballed (`tools/repetition.py`):
+
+| 1024-token generation | distinct-2 | distinct-3 | max repeat run |
+|---|---|---|---|
+| `--sample` (top_k=20) | 0.830 | 0.955 | 0 |
+| greedy | 0.753 | 0.885 | 0 |
+
+No hard loops in either, and both tails are coherent (greedy reached a natural
+conclusion and stopped on eos at 750 tokens). Sampling is measurably less
+repetitive, which is the effect the checkpoint's `do_sample=true` is asking for,
+but greedy does not collapse -- so the earlier hypothesis that long output was
+degenerating was wrong.
+
+**Known gap:** the runner feeds raw token ids, so it does continuation, not chat.
+The checkpoint ships a `chat_template.jinja` (a thinking-model template with
+system/user/assistant blocks). Prompts that read like instructions
+("The capital of France is") therefore get an out-of-distribution continuation
+rather than an answer. Applying the template is the next correctness step and is
+independent of everything above.
+
 ### Remaining levers
 
 - Attention is still the largest single prefill phase and now runs at ~250-280
