@@ -22,10 +22,8 @@ UTOFU="$REPO/a64fx/utofu-tests"
 
 MODE="${1:-self-test}"; shift || true
 NP="${LAGUNA_NP:-${PJM_MPI_PROC:-12}}"
-MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21-int4}"
-STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-ep$NP}"
 PROMPT="The capital of France is"
-IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1
+IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; BF16=0
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,15 +32,29 @@ while [ $# -gt 0 ]; do
     --max-new) MAX_NEW="$2"; shift 2;;
     --layers)  LAYERS="$2"; shift 2;;
     --no-stage) DO_STAGE=0; shift;;
+    --bf16)    BF16=1; shift;;
     *) PASS+=("$1"); shift;;
   esac
 done
 
-make -C "$HERE" all CC="${CC:-fcc}" OPENMP=1 >/dev/null
+# int4 (production, default) vs pure-bf16 reference build. bf16 uses the 46-shard
+# unquantized checkpoint, the -DLAGUNA_BF16 runner, and a separate stage dir.
+if [ "$BF16" = 1 ]; then
+  MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21}"
+  STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-bf16-ep$NP}"
+  RUNNER="$HERE/build/laguna_s21_bf16_ep_runner"
+  export LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-46}"
+else
+  MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21-int4}"
+  STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-ep$NP}"
+  RUNNER="$HERE/build/laguna_s21_ep_runner"
+fi
+
+make -C "$HERE" all $([ "$BF16" = 1 ] && echo bf16) CC="${CC:-fcc}" OPENMP=1 >/dev/null
 make -C "$UTOFU" tofu_topo_helper >/dev/null 2>&1 || true
 
 case "$MODE" in
-  self-test) exec "$HERE/build/laguna_s21_ep_runner" --self-test ;;
+  self-test) exec "$RUNNER" --self-test ;;
   stage)
     export LAGUNA_MODEL_DIR="$MODEL" LAGUNA_STAGE_DIR="$STAGE" LAGUNA_EP_SIZE="$NP"
     exec mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" "${PASS[@]}" ;;
@@ -66,6 +78,7 @@ done
 if [ "$DO_STAGE" = 1 ]; then
   echo "staging weights to $STAGE (this takes a few minutes) ..."
   LAGUNA_MODEL_DIR="$MODEL" LAGUNA_STAGE_DIR="$STAGE" LAGUNA_STATUS_DIR="$RUN_DIR" LAGUNA_EP_SIZE="$NP" \
+    LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-15}" \
     mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" >stage.stdout 2>stage.stderr
   staged=$(find "$RUN_DIR" -maxdepth 1 -name 'laguna_stage_rank*.txt' | wc -l)
   [ "$staged" -eq "$NP" ] || { echo "staging incomplete: $staged/$NP" >&2; exit 4; }
@@ -85,7 +98,7 @@ export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 # threads (oversubscribing all 48 cores), which ~4x-slows the matvec kernels.
 export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
 
-mpiexec -np "$NP" "$HERE/build/laguna_s21_ep_runner" --generate \
+mpiexec -np "$NP" "$RUNNER" --generate \
     --ids "$IDS" --max-new "$MAX_NEW" --layers "$LAYERS" \
     --stage-dir "$STAGE" --gen-out "$RUN_DIR/gen.ids" "${PASS[@]}"
 

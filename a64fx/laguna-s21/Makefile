@@ -21,8 +21,14 @@ CFLAGS += -I$(COMMON) -I$(UTOFU)
 LDFLAGS += -lm -lpthread
 TOFU_LIBS ?= -ltofucom
 
-.PHONY: all clean test bench
+.PHONY: all clean test bench bf16
 all: $(BUILD)/laguna_s21_stage $(BUILD)/laguna_s21_ep_runner
+
+# Pure-bf16 reference build (~/models/laguna-s21, unquantized): same runner with
+# -DLAGUNA_BF16. Shares the stager (stage the bf16 checkpoint with LAGUNA_NSHARDS=46).
+bf16: $(BUILD)/laguna_s21_bf16_ep_runner
+$(BUILD)/laguna_s21_bf16_ep_runner: laguna_s21_ep_runner.c laguna_s21.h laguna_tofu.inc | $(BUILD)
+	$(CC) $(CFLAGS) -DLAGUNA_BF16 -o $@ laguna_s21_ep_runner.c $(LDFLAGS) $(TOFU_LIBS)
 
 $(BUILD):
 	mkdir -p $@

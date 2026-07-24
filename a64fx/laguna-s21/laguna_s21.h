@@ -376,34 +376,56 @@ static inline void laguna_matvec_i4g32(float *restrict y, const uint32_t *restri
 #endif
 }
 
-/* ===================== per-rank model ===================== */
+/* ---- linear-weight abstraction: int8 W8 (production) or bf16 (reference).
+ * Build the bf16 variant with -DLAGUNA_BF16.  Call sites use laguna_lin_mv /
+ * laguna_lin_mv_multi and stay identical between the two builds. ---- */
+#ifdef LAGUNA_BF16
+typedef const uint16_t *laguna_lin;          /* a plain bf16 weight pointer */
+static inline void laguna_lin_mv(float *restrict y, const laguna_lin *w,
+                                 const float *restrict x, int rows, int cols) {
+    laguna_matvec_bf16(y, *w, x, rows, cols);
+}
+static inline void laguna_lin_mv_multi(float *const *ys, const laguna_lin *const *ws,
+                                       const int *rows, int nmat, const float *x, int cols) {
+    const uint16_t *Ws[8]; for (int m=0;m<nmat;++m) Ws[m]=*ws[m];
+    laguna_matvec_bf16_multi(ys, Ws, rows, nmat, x, cols);
+}
+typedef struct { const uint16_t *gate, *up, *down; int present; } laguna_expert;
+#else
+typedef laguna_w8 laguna_lin;                /* int8 per-row weight (q + scale) */
+static inline void laguna_lin_mv(float *restrict y, const laguna_lin *w,
+                                 const float *restrict x, int rows, int cols) {
+    laguna_matvec_i8(y, w, x, rows, cols);
+}
+static inline void laguna_lin_mv_multi(float *const *ys, const laguna_lin *const *ws,
+                                       const int *rows, int nmat, const float *x, int cols) {
+    laguna_matvec_i8_multi(ys, ws, rows, nmat, x, cols);
+}
 typedef struct {
     const uint32_t *gp, *up, *dp;   /* weight_packed (uint32) */
     const uint16_t *gs, *us, *ds;   /* weight_scale  (bf16)   */
     int present;                    /* owned by this rank      */
 } laguna_expert;
+#endif
 
+/* ===================== per-rank model ===================== */
 typedef struct {
     int num_heads;         /* per-layer query heads (48 full / 72 sliding) */
     int is_sliding;        /* 1 => sliding_attention, 0 => full_attention  */
     int is_moe;            /* 1 => MoE mlp, 0 => dense mlp (layer 0)        */
-    /* attention projections (int8 W8) */
-    laguna_w8 q_proj, k_proj, v_proj, o_proj, g_proj;
-    /* norms stay bf16 */
-    const uint16_t *q_norm, *k_norm, *in_ln, *post_ln;
-    /* dense mlp (layer 0), int8 W8 */
-    laguna_w8 dense_gate, dense_up, dense_down;
-    /* moe: shared expert (int8 W8), router weight (int8 [256,hidden]), bias (f32 [256]) */
-    laguna_w8 shared_gate, shared_up, shared_down;
-    laguna_w8 router_w;
-    const float    *router_bias;
+    laguna_lin q_proj, k_proj, v_proj, o_proj, g_proj;
+    const uint16_t *q_norm, *k_norm, *in_ln, *post_ln;   /* norms stay bf16 */
+    laguna_lin dense_gate, dense_up, dense_down;         /* dense mlp (layer 0) */
+    laguna_lin shared_gate, shared_up, shared_down;      /* moe shared expert */
+    laguna_lin router_w;                                 /* router [256,hidden] */
+    const float    *router_bias;                         /* [256] (converted to f32) */
     laguna_expert   experts[LAGUNA_EXPERTS];
 } laguna_layer;
 
 typedef struct {
     int n_layers, max_pos, ep_rank, ep_size;
     const uint16_t *embed;      /* bf16 [vocab,hidden] (embedding lookup) */
-    laguna_w8 lm_head;          /* int8 W8 [vocab,hidden] */
+    laguna_lin lm_head;         /* [vocab,hidden] */
     const uint16_t *final_norm; /* bf16 [hidden]       */
     laguna_layer layers[LAGUNA_LAYERS];
     /* rope tables: cos/sin[pos * half] for full (half=32) and sliding (half=64) */
