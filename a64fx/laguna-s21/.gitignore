@@ -4,3 +4,4 @@ smoke/
 gen_*/
 probe/
 *.ids
+bf16smoke/
