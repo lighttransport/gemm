@@ -313,8 +313,13 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
     m->full_cos=malloc((size_t)max_pos*hf*sizeof(float)); m->full_sin=malloc((size_t)max_pos*hf*sizeof(float));
     m->swa_cos =malloc((size_t)max_pos*hs*sizeof(float)); m->swa_sin =malloc((size_t)max_pos*hs*sizeof(float));
     laguna_build_rope_tables(m);
-    m->kv_layer_stride=(size_t)max_pos*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM;
-    size_t kv_elems=(size_t)n_layers*m->kv_layer_stride;
+    /* Per-layer KV: full-attention layers keep the whole context; sliding layers
+     * use a SLIDING_WINDOW ring buffer.  Keeps 128k KV at ~6.5 GB not ~26. */
+    size_t kv_elems=0; int slot=LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM;
+    for (int L=0; L<n_layers; ++L) {
+        int cap = m->layers[L].is_sliding ? LAGUNA_SLIDING_WINDOW : max_pos;
+        m->kv_cap[L]=cap; m->kv_off[L]=kv_elems; kv_elems += (size_t)cap*slot;
+    }
     m->kcache=malloc(kv_elems*sizeof(uint16_t));
     m->vcache=malloc(kv_elems*sizeof(uint16_t));
     if(!m->kcache||!m->vcache){ fprintf(stderr,"FATAL: KV cache alloc failed (%zu MB)\n",kv_elems*2*2/(1u<<20)); exit(1); }
@@ -353,6 +358,31 @@ static void scratch_alloc(laguna_scratch *sc, int max_pos) {
 }
 
 /* Attention for one token at `pos`. `x` is input_layernorm output (n1). Writes attn_out. */
+/* SVE-vectorized per-position attention inner ops (bf16 KV widened to f32).
+ * These are the O(context) hot loops that dominate long-context prefill. */
+#if defined(__ARM_FEATURE_SVE)
+static inline float laguna_qkdot(const float *restrict q, const uint16_t *restrict k, int hd) {
+    svfloat32_t a = svdup_f32(0);
+    for (int d=0; d<hd; d+=(int)svcntw()) { svbool_t pg=svwhilelt_b32(d,hd);
+        a = svmla_f32_x(pg, a, svld1_f32(pg,q+d), laguna_ld_bf16(pg,k+d)); }
+    return svaddv_f32(svptrue_b32(), a);
+}
+static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
+                                float p, float corr, int hd) {
+    svfloat32_t sp=svdup_f32(p), scv=svdup_f32(corr);
+    for (int d=0; d<hd; d+=(int)svcntw()) { svbool_t pg=svwhilelt_b32(d,hd);
+        svfloat32_t a = svmul_f32_x(pg, svld1_f32(pg,acc+d), scv);
+        svst1_f32(pg, acc+d, svmla_f32_x(pg, a, sp, laguna_ld_bf16(pg,v+d))); }
+}
+#else
+static inline float laguna_qkdot(const float *q, const uint16_t *k, int hd) {
+    float s=0; for(int d=0;d<hd;++d) s+=q[d]*laguna_bf16_to_f32(k[d]); return s;
+}
+static inline void laguna_vaxpy(float *acc, const uint16_t *v, float p, float corr, int hd) {
+    for(int d=0;d<hd;++d) acc[d]=acc[d]*corr + p*laguna_bf16_to_f32(v[d]);
+}
+#endif
+
 static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scratch *sc,
                       int layer, int pos) {
     int nh=ly->num_heads, hd=LAGUNA_HEAD_DIM;
@@ -378,9 +408,11 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
         memcpy(q,tmp,sizeof tmp);
         laguna_rope_half(q, rc, rs, rot);
     }
-    /* k_norm + rope per kv head, then store to cache at pos */
-    uint16_t *kdst=m->kcache+(size_t)layer*m->kv_layer_stride+(size_t)pos*LAGUNA_KV_HEADS*hd;
-    uint16_t *vdst=m->vcache+(size_t)layer*m->kv_layer_stride+(size_t)pos*LAGUNA_KV_HEADS*hd;
+    /* k_norm + rope per kv head, then store to cache at pos (ring slot pos%cap) */
+    int cap=m->kv_cap[layer], kvstride=LAGUNA_KV_HEADS*hd;
+    uint16_t *kbase=m->kcache+m->kv_off[layer], *vbase=m->vcache+m->kv_off[layer];
+    uint16_t *kdst=kbase+(size_t)(pos%cap)*kvstride;
+    uint16_t *vdst=vbase+(size_t)(pos%cap)*kvstride;
     for (int h=0; h<LAGUNA_KV_HEADS; ++h) {
         float *k=sc->kf+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
         laguna_rmsnorm(tmp, k, ly->k_norm, hd, LAGUNA_RMS_EPS);
@@ -389,12 +421,11 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
         for (int d=0; d<hd; ++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
         for (int d=0; d<hd; ++d) vdst[h*hd+d]=laguna_f32_to_bf16(sc->vf[h*hd+d]);
     }
-    /* attention per query head */
+    /* attention per query head.  Sliding layers attend to the last `cap` positions
+     * (the ring holds exactly those); full layers attend to all [0..pos]. */
     float scale=1.0f/sqrtf((float)hd);
     int kv_groups=nh/LAGUNA_KV_HEADS;
-    int lo = ly->is_sliding ? (pos-LAGUNA_SLIDING_WINDOW+1) : 0; if(lo<0)lo=0;
-    const uint16_t *kbase=m->kcache+(size_t)layer*m->kv_layer_stride;
-    const uint16_t *vbase=m->vcache+(size_t)layer*m->kv_layer_stride;
+    int lo = ly->is_sliding ? (pos-cap+1) : 0; if(lo<0)lo=0;
     /* Per-head attention, parallel over heads with a one-pass online softmax
      * (running max/sum + rescaled accumulator) so there is no shared score buffer. */
 #ifdef _OPENMP
@@ -406,15 +437,13 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
         float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
         float m_i=-INFINITY, l_i=0.0f;
         for (int j=lo; j<=pos; ++j) {
-            const uint16_t *kj=kbase+(size_t)j*LAGUNA_KV_HEADS*hd+(size_t)kvh*hd;
-            float dot=0; for(int d=0;d<hd;++d) dot+=q[d]*laguna_bf16_to_f32(kj[d]);
-            dot*=scale;
+            size_t slot=(size_t)(j%cap)*kvstride+(size_t)kvh*hd;
+            float dot=laguna_qkdot(q, kbase+slot, hd)*scale;
             float m_new = dot>m_i ? dot : m_i;
             float corr = expf(m_i - m_new);
             float p = expf(dot - m_new);
             l_i = l_i*corr + p;
-            const uint16_t *vj=vbase+(size_t)j*LAGUNA_KV_HEADS*hd+(size_t)kvh*hd;
-            for(int d=0;d<hd;++d) acc[d]=acc[d]*corr + p*laguna_bf16_to_f32(vj[d]);
+            laguna_vaxpy(acc, vbase+slot, p, corr, hd);
             m_i=m_new;
         }
         float gate=laguna_softplus(sc->gf[h]);

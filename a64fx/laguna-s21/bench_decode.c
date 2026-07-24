@@ -82,8 +82,10 @@ int main(int argc, char**argv){
     m.full_cos=f32_buf((size_t)maxpos*hf); m.full_sin=f32_buf((size_t)maxpos*hf);
     m.swa_cos=f32_buf((size_t)maxpos*hs); m.swa_sin=f32_buf((size_t)maxpos*hs);
     laguna_build_rope_tables(&m);
-    m.kv_layer_stride=(size_t)maxpos*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM;
-    m.kcache=calloc((size_t)n_layers*m.kv_layer_stride,2); m.vcache=calloc((size_t)n_layers*m.kv_layer_stride,2);
+    size_t kv_total=0; { int slot=LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM;
+      for(int L=0;L<n_layers;L++){ int cap=m.layers[L].is_sliding?LAGUNA_SLIDING_WINDOW:maxpos;
+          m.kv_cap[L]=cap; m.kv_off[L]=kv_total; kv_total+=(size_t)cap*slot; }
+      m.kcache=calloc(kv_total,2); m.vcache=calloc(kv_total,2); }
 
     laguna_scratch sc; scratch_alloc(&sc,maxpos);
     float*x=f32_buf(LAGUNA_HIDDEN);
@@ -112,8 +114,8 @@ int main(int argc, char**argv){
     printf("  breakdown: layers=%.2f ms  lm_head=%.2f ms\n",dl*1e3,dh*1e3);
     /* correctness gate: deterministic forward from a fixed state -> logits checksum.
      * Must be bit-stable across kernel/parallelization refactors. */
-    { memset(m.kcache,0,(size_t)n_layers*m.kv_layer_stride*2);
-      memset(m.vcache,0,(size_t)n_layers*m.kv_layer_stride*2);
+    { memset(m.kcache,0,kv_total*2);
+      memset(m.vcache,0,kv_total*2);
       for(int j=0;j<LAGUNA_HIDDEN;j++)x[j]=0.01f;
       forward_token(&m,&sc,x,0,NULL,1);
       double s=0,a=0; int nn=0;

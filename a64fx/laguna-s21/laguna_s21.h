@@ -532,9 +532,12 @@ typedef struct {
     /* rope tables: cos/sin[pos * half] for full (half=32) and sliding (half=64) */
     float *full_cos, *full_sin;       /* [max_pos * 32] */
     float *swa_cos, *swa_sin;         /* [max_pos * 64] */
-    /* KV cache (bf16), replicated per rank: [layer][pos][KV_HEADS*HEAD_DIM] */
+    /* KV cache (bf16), replicated per rank.  Full-attention layers keep the whole
+     * context; sliding layers use a SLIDING_WINDOW ring buffer (position p -> slot
+     * p%cap), so long-context KV stays small (128k: ~6.5 GB not 25.8). */
     uint16_t *kcache, *vcache;
-    size_t kv_layer_stride;           /* per-layer element stride = max_pos*KV_HEADS*HEAD_DIM */
+    size_t kv_off[LAGUNA_LAYERS];     /* element offset of each layer's KV block */
+    int    kv_cap[LAGUNA_LAYERS];     /* capacity: max_pos (full) or window (sliding) */
 } laguna_model;
 
 static inline void laguna_build_rope_tables(laguna_model *m) {
