@@ -23,7 +23,7 @@ UTOFU="$REPO/a64fx/utofu-tests"
 MODE="${1:-self-test}"; shift || true
 NP="${LAGUNA_NP:-${PJM_MPI_PROC:-12}}"
 PROMPT="The capital of France is"
-IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; BF16=0
+IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,25 +32,21 @@ while [ $# -gt 0 ]; do
     --max-new) MAX_NEW="$2"; shift 2;;
     --layers)  LAYERS="$2"; shift 2;;
     --no-stage) DO_STAGE=0; shift;;
-    --bf16)    BF16=1; shift;;
+    --bf16)    VARIANT=bf16; shift;;
+    --fp8)     VARIANT=fp8; shift;;
     *) PASS+=("$1"); shift;;
   esac
 done
 
-# int4 (production, default) vs pure-bf16 reference build. bf16 uses the 46-shard
-# unquantized checkpoint, the -DLAGUNA_BF16 runner, and a separate stage dir.
-if [ "$BF16" = 1 ]; then
-  MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21}"
-  STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-bf16-ep$NP}"
-  RUNNER="$HERE/build/laguna_s21_bf16_ep_runner"
-  export LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-46}"
-else
-  MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21-int4}"
-  STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-ep$NP}"
-  RUNNER="$HERE/build/laguna_s21_ep_runner"
-fi
+# int4 (production, default), pure-bf16 reference, or fp8 (bf16 linears + fp8
+# experts). Each uses its own checkpoint, runner binary, and stage dir.
+case "$VARIANT" in
+  bf16) MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21}";     STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-bf16-ep$NP}"; RUNNER="$HERE/build/laguna_s21_bf16_ep_runner"; export LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-46}";;
+  fp8)  MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21-fp8}"; STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-fp8-ep$NP}";  RUNNER="$HERE/build/laguna_s21_fp8_ep_runner";  export LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-24}";;
+  *)    MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21-int4}"; STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-ep$NP}";      RUNNER="$HERE/build/laguna_s21_ep_runner";;
+esac
 
-make -C "$HERE" all $([ "$BF16" = 1 ] && echo bf16) CC="${CC:-fcc}" OPENMP=1 >/dev/null
+make -C "$HERE" all $([ "$VARIANT" != int4 ] && echo "$VARIANT") CC="${CC:-fcc}" OPENMP=1 >/dev/null
 make -C "$UTOFU" tofu_topo_helper >/dev/null 2>&1 || true
 
 case "$MODE" in

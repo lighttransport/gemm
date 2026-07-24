@@ -35,6 +35,10 @@
 #include <sys/stat.h>
 #include "laguna_s21.h"
 
+#if defined(LAGUNA_FP8)
+float laguna_fp8_lut[256];   /* definition for the extern in laguna_s21.h */
+#endif
+
 /* ============================ small helpers ============================ */
 static FILE *g_log = NULL;
 static int   g_rank = 0;
@@ -209,7 +213,7 @@ static int stage_load(laguna_stage *s, const char *dir, int rank) {
 
 /* Load one linear weight from the stage.  int8 build: quantize bf16 -> per-row
  * W8 at load.  bf16 build (-DLAGUNA_BF16): point straight at the staged bf16. */
-#ifdef LAGUNA_BF16
+#if defined(LAGUNA_BF16) || defined(LAGUNA_FP8)
 static laguna_lin stage_lin(const laguna_stage *s, const char *name, int rows, int cols) {
     (void)rows; (void)cols; return (laguna_lin)stage_req(s, name);
 }
@@ -232,6 +236,9 @@ static laguna_lin stage_lin(const laguna_stage *s, const char *name, int rows, i
 static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
                         int max_pos, int rank, int ep_size) {
     memset(m,0,sizeof *m);
+#if defined(LAGUNA_FP8)
+    laguna_fp8_init_lut();
+#endif
     m->n_layers=n_layers; m->max_pos=max_pos; m->ep_rank=rank; m->ep_size=ep_size;
     m->embed      = stage_req(s,"model.embed_tokens.weight");
     m->lm_head    = stage_lin(s,"lm_head.weight", LAGUNA_VOCAB, LAGUNA_HIDDEN);
@@ -276,7 +283,14 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
             for (int e=0;e<LAGUNA_EXPERTS;++e) {
                 if (e % ep_size != rank) continue;   /* not owned by this rank */
                 laguna_expert *ex=&ly->experts[e];
-#ifdef LAGUNA_BF16
+#if defined(LAGUNA_FP8)
+                snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.gate_proj.weight",      L,e); ex->gate=stage_req(s,nm);
+                snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.gate_proj.weight_scale",L,e); ex->gs  =stage_req(s,nm);
+                snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.up_proj.weight",        L,e); ex->up  =stage_req(s,nm);
+                snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.up_proj.weight_scale",  L,e); ex->us  =stage_req(s,nm);
+                snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.down_proj.weight",      L,e); ex->down=stage_req(s,nm);
+                snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.down_proj.weight_scale",L,e); ex->ds  =stage_req(s,nm);
+#elif defined(LAGUNA_BF16)
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.gate_proj.weight",L,e); ex->gate=stage_req(s,nm);
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.up_proj.weight",  L,e); ex->up  =stage_req(s,nm);
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.down_proj.weight", L,e); ex->down=stage_req(s,nm);
@@ -425,7 +439,12 @@ static void swiglu_lin(laguna_scratch *sc, const laguna_lin *gate_w, const lagun
  * or bf16 (-DLAGUNA_BF16). */
 static void expert_mv(laguna_scratch *sc, const laguna_expert *ex, const float *x, float *out) {
     int inter=LAGUNA_EXPERT_INTER;
-#ifdef LAGUNA_BF16
+#if defined(LAGUNA_FP8)
+    laguna_matvec_fp8blk(sc->inter_a, ex->gate, ex->gs, x, inter, LAGUNA_HIDDEN);
+    laguna_matvec_fp8blk(sc->inter_b, ex->up,   ex->us, x, inter, LAGUNA_HIDDEN);
+    for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
+    laguna_matvec_fp8blk(out, ex->down, ex->ds, sc->inter_a, LAGUNA_HIDDEN, inter);
+#elif defined(LAGUNA_BF16)
     laguna_matvec_bf16(sc->inter_a, ex->gate, x, inter, LAGUNA_HIDDEN);
     laguna_matvec_bf16(sc->inter_b, ex->up,   x, inter, LAGUNA_HIDDEN);
     for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];

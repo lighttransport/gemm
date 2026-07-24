@@ -21,7 +21,7 @@ CFLAGS += -I$(COMMON) -I$(UTOFU)
 LDFLAGS += -lm -lpthread
 TOFU_LIBS ?= -ltofucom
 
-.PHONY: all clean test bench bf16
+.PHONY: all clean test bench bf16 fp8
 all: $(BUILD)/laguna_s21_stage $(BUILD)/laguna_s21_ep_runner
 
 # Pure-bf16 reference build (~/models/laguna-s21, unquantized): same runner with
@@ -29,6 +29,12 @@ all: $(BUILD)/laguna_s21_stage $(BUILD)/laguna_s21_ep_runner
 bf16: $(BUILD)/laguna_s21_bf16_ep_runner
 $(BUILD)/laguna_s21_bf16_ep_runner: laguna_s21_ep_runner.c laguna_s21.h laguna_tofu.inc | $(BUILD)
 	$(CC) $(CFLAGS) -DLAGUNA_BF16 -o $@ laguna_s21_ep_runner.c $(LDFLAGS) $(TOFU_LIBS)
+
+# fp8 build (~/models/laguna-s21-fp8): bf16 linears + fp8-e4m3 block-128 experts.
+# Stage the 24-shard checkpoint with LAGUNA_NSHARDS=24.
+fp8: $(BUILD)/laguna_s21_fp8_ep_runner
+$(BUILD)/laguna_s21_fp8_ep_runner: laguna_s21_ep_runner.c laguna_s21.h laguna_tofu.inc | $(BUILD)
+	$(CC) $(CFLAGS) -DLAGUNA_FP8 -o $@ laguna_s21_ep_runner.c $(LDFLAGS) $(TOFU_LIBS)
 
 $(BUILD):
 	mkdir -p $@

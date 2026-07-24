@@ -376,10 +376,48 @@ static inline void laguna_matvec_i4g32(float *restrict y, const uint32_t *restri
 #endif
 }
 
-/* ---- linear-weight abstraction: int8 W8 (production) or bf16 (reference).
- * Build the bf16 variant with -DLAGUNA_BF16.  Call sites use laguna_lin_mv /
- * laguna_lin_mv_multi and stay identical between the two builds. ---- */
-#ifdef LAGUNA_BF16
+/* ---- fp8 e4m3 (OCP e4m3fn) dequant, for the fp8-expert build ---- */
+#if defined(LAGUNA_FP8)
+enum { LAGUNA_FP8_BLK = 128 };               /* weight block-scale is 128x128 */
+extern float laguna_fp8_lut[256];            /* byte -> f32, filled by laguna_fp8_init_lut() */
+static inline void laguna_fp8_init_lut(void) {
+    for (int b = 0; b < 256; ++b) {
+        int s=(b>>7)&1, e=(b>>3)&0xf, m=b&0x7; float v;
+        if (e==0)            v = (float)m * 0.001953125f;      /* subnormal: m*2^-9 */
+        else if (e==15&&m==7)v = 0.0f;                          /* e4m3fn NaN -> 0  */
+        else                 v = ldexpf(1.0f + (float)m*0.125f, e-7);
+        laguna_fp8_lut[b] = s ? -v : v;
+    }
+}
+/* Block-scaled fp8 matvec: y[r] = sum over 128-col blocks cb of
+ * scale[r/128, cb] * sum_{c in cb} lut[W[r,c]] * x[c].  cols multiple of 128. */
+static inline void laguna_matvec_fp8blk(float *restrict y, const uint8_t *restrict W,
+                                        const uint16_t *restrict scales,
+                                        const float *restrict x, int rows, int cols) {
+    int cblk = cols / LAGUNA_FP8_BLK;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *wr = W + (size_t)r * cols;
+        const uint16_t *sr = scales + (size_t)(r / LAGUNA_FP8_BLK) * cblk;
+        float acc = 0.0f;
+        for (int cb = 0; cb < cblk; ++cb) {
+            const uint8_t *wb = wr + cb*LAGUNA_FP8_BLK; const float *xb = x + cb*LAGUNA_FP8_BLK;
+            float part = 0.0f;
+            for (int j = 0; j < LAGUNA_FP8_BLK; ++j) part += laguna_fp8_lut[wb[j]] * xb[j];
+            acc += laguna_bf16_to_f32(sr[cb]) * part;
+        }
+        y[r] = acc;
+    }
+}
+#endif
+
+/* ---- linear-weight abstraction: int8 W8 (production), bf16, or fp8-expert.
+ * Build variants with -DLAGUNA_BF16 or -DLAGUNA_FP8.  Non-expert linears are
+ * bf16 in both the bf16 and fp8 builds; call sites use laguna_lin_mv* and stay
+ * identical. ---- */
+#if defined(LAGUNA_BF16) || defined(LAGUNA_FP8)
 typedef const uint16_t *laguna_lin;          /* a plain bf16 weight pointer */
 static inline void laguna_lin_mv(float *restrict y, const laguna_lin *w,
                                  const float *restrict x, int rows, int cols) {
@@ -390,7 +428,6 @@ static inline void laguna_lin_mv_multi(float *const *ys, const laguna_lin *const
     const uint16_t *Ws[8]; for (int m=0;m<nmat;++m) Ws[m]=*ws[m];
     laguna_matvec_bf16_multi(ys, Ws, rows, nmat, x, cols);
 }
-typedef struct { const uint16_t *gate, *up, *down; int present; } laguna_expert;
 #else
 typedef laguna_w8 laguna_lin;                /* int8 per-row weight (q + scale) */
 static inline void laguna_lin_mv(float *restrict y, const laguna_lin *w,
@@ -401,6 +438,15 @@ static inline void laguna_lin_mv_multi(float *const *ys, const laguna_lin *const
                                        const int *rows, int nmat, const float *x, int cols) {
     laguna_matvec_i8_multi(ys, ws, rows, nmat, x, cols);
 }
+#endif
+
+#if defined(LAGUNA_FP8)
+typedef struct { const uint8_t *gate, *up, *down;   /* fp8 e4m3 [rows,cols]     */
+                 const uint16_t *gs, *us, *ds;      /* bf16 block scales        */
+                 int present; } laguna_expert;
+#elif defined(LAGUNA_BF16)
+typedef struct { const uint16_t *gate, *up, *down; int present; } laguna_expert;
+#else
 typedef struct {
     const uint32_t *gp, *up, *dp;   /* weight_packed (uint32) */
     const uint16_t *gs, *us, *ds;   /* weight_scale  (bf16)   */
