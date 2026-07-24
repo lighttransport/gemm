@@ -340,6 +340,8 @@ typedef struct {
     float *scores;         /* [MAX_HEADS * max_pos] per-head attention scores */
     /* batched chunked-prefill scratch: PCHUNK tokens (token-major layout) */
     float *cn1,*cn2,*cq,*ck,*cv,*cg,*cao,*cattn,*cia,*cib,*cpart,*cshared;
+    /* query-block flash-attention state (full layers): per (head, query) */
+    float *fm,*fl,*facc;   /* fm/fl [MAX_HEADS*PCHUNK], facc [MAX_HEADS*PCHUNK*HEAD_DIM] */
 } laguna_scratch;
 
 #define LAGUNA_PCHUNK 256
@@ -354,7 +356,10 @@ static void scratch_alloc(laguna_scratch *sc, int max_pos) {
       sc->cattn=malloc((size_t)C*H*sizeof(float));
       sc->cia=malloc((size_t)C*LAGUNA_DENSE_INTER*sizeof(float));
       sc->cib=malloc((size_t)C*LAGUNA_DENSE_INTER*sizeof(float));
-      sc->cpart=malloc((size_t)C*H*sizeof(float)); sc->cshared=malloc((size_t)C*H*sizeof(float)); }
+      sc->cpart=malloc((size_t)C*H*sizeof(float)); sc->cshared=malloc((size_t)C*H*sizeof(float));
+      sc->fm=malloc((size_t)LAGUNA_MAX_HEADS*C*sizeof(float));
+      sc->fl=malloc((size_t)LAGUNA_MAX_HEADS*C*sizeof(float));
+      sc->facc=malloc((size_t)LAGUNA_MAX_HEADS*C*LAGUNA_HEAD_DIM*sizeof(float)); }
     sc->n1=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->n2=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->qf=malloc((size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
@@ -479,6 +484,71 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
     laguna_lin_mv_multi(ys, Ws, rws, 4, sc->n1, LAGUNA_HIDDEN);
     attention_core(m, ly, sc, layer, pos, nh, sc->qf, sc->kf, sc->vf, sc->gf, sc->ao);
     laguna_lin_mv(sc->attn_out, &ly->o_proj, sc->ao, LAGUNA_HIDDEN, nh*hd);
+}
+
+/* Query-block flash attention for a chunk of C tokens on a FULL-attention layer.
+ * Batched q/k/v/g are token-major (Q[c*nh*hd], K/V[c*8*hd], G[c*nh]); writes AO.
+ * Amortizes KV bandwidth ~C x: for each key block, the C queries reuse it from
+ * cache, so KV is read from HBM once instead of once per query.  Online (flash)
+ * softmax with FEXPA exp; causal via a prefix pass [0,pos0) + a diagonal pass. */
+#define LAGUNA_KB 128
+static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, laguna_scratch *sc,
+                                 int layer, int pos0, int C, int nh,
+                                 float *Q, float *K, float *V, float *G, float *AO) {
+    int hd=LAGUNA_HEAD_DIM, kv_groups=nh/LAGUNA_KV_HEADS, kvstride=LAGUNA_KV_HEADS*hd;
+    int rot=LAGUNA_ROPE_FULL_DIM, half=rot/2;
+    uint16_t *kbase=m->kcache+m->kv_off[layer], *vbase=m->vcache+m->kv_off[layer];
+    float scale=1.0f/sqrtf((float)hd);
+    /* 1. qk-norm + rope + write KV (parallel over chunk tokens; full cache slot=pos) */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int c=0;c<C;++c) {
+        int pos=pos0+c;
+        const float *rc=m->full_cos+(size_t)pos*half, *rs=m->full_sin+(size_t)pos*half;
+        for (int h=0;h<nh;++h){ float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
+            laguna_rmsnorm(tmp,q,ly->q_norm,hd,LAGUNA_RMS_EPS); memcpy(q,tmp,sizeof tmp); laguna_rope_half(q,rc,rs,rot); }
+        uint16_t *kdst=kbase+(size_t)pos*kvstride, *vdst=vbase+(size_t)pos*kvstride;
+        for (int h=0;h<LAGUNA_KV_HEADS;++h){ float *k=K+(size_t)c*kvstride+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
+            laguna_rmsnorm(tmp,k,ly->k_norm,hd,LAGUNA_RMS_EPS); memcpy(k,tmp,sizeof tmp); laguna_rope_half(k,rc,rs,rot);
+            for(int d=0;d<hd;++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
+            for(int d=0;d<hd;++d) vdst[h*hd+d]=laguna_f32_to_bf16(V[(size_t)c*kvstride+h*hd+d]); }
+    }
+    /* 2. flash query-block, parallel over query heads */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int h=0;h<nh;++h) {
+        int kvh=h/kv_groups;
+        float *fm=sc->fm+(size_t)h*C, *fl=sc->fl+(size_t)h*C, *acc=sc->facc+(size_t)h*C*hd;
+        for (int c=0;c<C;++c){ fm[c]=-INFINITY; fl[c]=0.0f; float *a=acc+(size_t)c*hd; for(int d=0;d<hd;++d)a[d]=0.0f; }
+        /* prefix keys [0, pos0): every query attends all -> block, reuse KV across C queries */
+        for (int kb=0; kb<pos0; kb+=LAGUNA_KB) {
+            int bn=pos0-kb; if(bn>LAGUNA_KB)bn=LAGUNA_KB;
+            for (int c=0;c<C;++c) {
+                const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float sb[LAGUNA_KB]; float bmax=-INFINITY;
+                for (int b=0;b<bn;++b){ float d=laguna_qkdot(q, kbase+(size_t)(kb+b)*kvstride+(size_t)kvh*hd, hd)*scale; sb[b]=d; if(d>bmax)bmax=d; }
+                float m_old=fm[c], m_new=m_old>bmax?m_old:bmax, corr=expf(m_old-m_new);
+                float psum=laguna_exp_shift_sum(sb, bn, m_new);
+                fl[c]=fl[c]*corr+psum; float *a=acc+(size_t)c*hd;
+                for (int b=0;b<bn;++b) laguna_vaxpy(a, vbase+(size_t)(kb+b)*kvstride+(size_t)kvh*hd, sb[b], b==0?corr:1.0f, hd);
+                fm[c]=m_new;
+            }
+        }
+        /* diagonal keys [pos0, pos0+c]: causal within the chunk */
+        for (int c=0;c<C;++c) {
+            const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float *a=acc+(size_t)c*hd;
+            for (int j=0;j<=c;++j) {
+                float d=laguna_qkdot(q, kbase+(size_t)(pos0+j)*kvstride+(size_t)kvh*hd, hd)*scale;
+                float m_old=fm[c], m_new=m_old>d?m_old:d, corr=expf(m_old-m_new), p=expf(d-m_new);
+                fl[c]=fl[c]*corr+p;
+                laguna_vaxpy(a, vbase+(size_t)(pos0+j)*kvstride+(size_t)kvh*hd, p, corr, hd);
+                fm[c]=m_new;
+            }
+        }
+        for (int c=0;c<C;++c){ float gate=laguna_softplus(G[(size_t)c*nh+h]); float s=gate/fl[c];
+            float *a=acc+(size_t)c*hd, *o=AO+(size_t)c*nh*hd+(size_t)h*hd; for(int d=0;d<hd;++d)o[d]=a[d]*s; }
+    }
 }
 
 /* dense/shared SwiGLU: out[hidden] = down( silu(gate(x)) * up(x) ). */
@@ -610,11 +680,17 @@ static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, flo
         laguna_lin_mm(sc->ck, &ly->k_proj, sc->cn1, LAGUNA_KV_HEADS*hd, H, C);
         laguna_lin_mm(sc->cv, &ly->v_proj, sc->cn1, LAGUNA_KV_HEADS*hd, H, C);
         laguna_lin_mm(sc->cg, &ly->g_proj, sc->cn1, nh, H, C);
-        for (int c=0;c<C;++c)
-            attention_core(m, ly, sc, L, pos0+c, nh,
-                           sc->cq+(size_t)c*nh*hd, sc->ck+(size_t)c*LAGUNA_KV_HEADS*hd,
-                           sc->cv+(size_t)c*LAGUNA_KV_HEADS*hd, sc->cg+(size_t)c*nh,
-                           sc->cao+(size_t)c*nh*hd);
+        if (!ly->is_sliding) {
+            /* full attention: query-block flash (amortizes KV bandwidth across the chunk) */
+            attention_full_flash(m, ly, sc, L, pos0, C, nh, sc->cq, sc->ck, sc->cv, sc->cg, sc->cao);
+        } else {
+            /* sliding: O(512)/query, per-token write-then-attend (ring, no clobber) */
+            for (int c=0;c<C;++c)
+                attention_core(m, ly, sc, L, pos0+c, nh,
+                               sc->cq+(size_t)c*nh*hd, sc->ck+(size_t)c*LAGUNA_KV_HEADS*hd,
+                               sc->cv+(size_t)c*LAGUNA_KV_HEADS*hd, sc->cg+(size_t)c*nh,
+                               sc->cao+(size_t)c*nh*hd);
+        }
         laguna_lin_mm(sc->cattn, &ly->o_proj, sc->cao, H, nh*hd, C);
         for (long i=0;i<(long)C*H;++i) X[i]+=sc->cattn[i];
         /* mlp */
