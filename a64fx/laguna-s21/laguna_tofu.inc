@@ -184,6 +184,11 @@ static int run_generate(int argc, char **argv){
     double t1=now_sec();
     logmsg("rank %d: loaded %ld tensors, %.2f GB blob, %d layers, maxpos %d in %.1fs\n",
            MyRank,st.n_ents,st.blob_bytes/1e9,n_layers,maxpos,t1-t0);
+    /* All ranks must enter the forward together: load time varies per rank (a lot
+     * for the ~27GB bf16 build under memory pressure), and without this barrier a
+     * fast rank hits the first MoE-layer allreduce and times out (60s) waiting on
+     * a still-loading peer. */
+    barrier();
 
     /* eos tokens (config: [2,24]) */
     const int eos0=2, eos1=24;
