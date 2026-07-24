@@ -115,7 +115,9 @@ static void tofu_bootstrap(void){
     }
     free(tni_ids);
     barrier();
-    if(tp_comm_init(&g_comm,Vcq,PeerVcq,MyRank,N,LAGUNA_HIDDEN,barrier)!=0) die("tp_comm_init",-1);
+    /* max_count sized for the batched chunked-prefill allreduce (C*hidden) so the
+     * whole chunk reduces in one sync; decode's per-token [hidden] reduce still fits. */
+    if(tp_comm_init(&g_comm,Vcq,PeerVcq,MyRank,N,LAGUNA_PCHUNK*LAGUNA_HIDDEN,barrier)!=0) die("tp_comm_init",-1);
 }
 
 /* Isolate pure collective cost from load-imbalance wait: barrier before each
@@ -196,15 +198,31 @@ static int run_generate(int argc, char **argv){
     float *x=malloc(LAGUNA_HIDDEN*sizeof(float));
     int total_nan=0;
 
-    /* prefill: process prompt tokens; only compute logits at the last one */
+    /* prefill: chunked over the prompt except the last token, which is a per-token
+     * forward to produce the first-generation logits.  --pchunk 1 forces the old
+     * per-token path for A/B. */
     double pf0=now_sec();
-    for(int p=0;p<n_prompt;p++){
+    int pchunk=envi("LAGUNA_PCHUNK", LAGUNA_PCHUNK);
+    if(pchunk<1) pchunk=1; if(pchunk>LAGUNA_PCHUNK) pchunk=LAGUNA_PCHUNK;
+    int nprefill = n_prompt-1;   /* last token done per-token for logits */
+    float *Xc = malloc((size_t)LAGUNA_PCHUNK*LAGUNA_HIDDEN*sizeof(float));
+    int p=0;
+    if(pchunk>1){
+        for(; p+1<=nprefill; ){
+            int C = nprefill-p; if(C>pchunk)C=pchunk; if(C<=0) break;
+            for(int c=0;c<C;++c) embed_token(&m,prompt[p+c],Xc+(size_t)c*LAGUNA_HIDDEN);
+            forward_prefill_chunk(&m,&sc,Xc,p,C,&g_aar);
+            p+=C;
+            if(MyRank==0 && (p%2048<C)) logmsg("prefill progress: %d/%d\n",p,n_prompt);
+        }
+    }
+    for(; p<n_prompt; ++p){   /* remaining tokens (incl. the last) per-token */
         embed_token(&m,prompt[p],x);
         int need_logits=(p==n_prompt-1)||g_dbg;
         forward_token(&m,&sc,x,p,&g_aar,need_logits);
         total_nan+=count_nan(x,LAGUNA_HIDDEN);
-        if(g_dbg&&MyRank==0){ int a=argmax(sc.logits,LAGUNA_VOCAB); logmsg("PREFILL pos%d in_tok=%d -> argmax=%d (logit %.2f)\n",p,prompt[p],a,sc.logits[a]); }
     }
+    free(Xc);
     double pf1=now_sec();
     int next=argmax(sc.logits,LAGUNA_VOCAB);
     if(MyRank==0){

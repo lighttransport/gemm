@@ -337,10 +337,24 @@ typedef struct {
     float *partial;        /* [hidden] routed accumulator */
     float *shared;         /* [hidden] */
     float *logits;         /* [vocab] */
-    float *scores;         /* [max_pos] attention scores */
+    float *scores;         /* [MAX_HEADS * max_pos] per-head attention scores */
+    /* batched chunked-prefill scratch: PCHUNK tokens (token-major layout) */
+    float *cn1,*cn2,*cq,*ck,*cv,*cg,*cao,*cattn,*cia,*cib,*cpart,*cshared;
 } laguna_scratch;
 
+#define LAGUNA_PCHUNK 256
 static void scratch_alloc(laguna_scratch *sc, int max_pos) {
+    { int C=LAGUNA_PCHUNK, H=LAGUNA_HIDDEN;
+      sc->cn1=malloc((size_t)C*H*sizeof(float));   sc->cn2=malloc((size_t)C*H*sizeof(float));
+      sc->cq =malloc((size_t)C*LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
+      sc->ck =malloc((size_t)C*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
+      sc->cv =malloc((size_t)C*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
+      sc->cg =malloc((size_t)C*LAGUNA_MAX_HEADS*sizeof(float));
+      sc->cao=malloc((size_t)C*LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
+      sc->cattn=malloc((size_t)C*H*sizeof(float));
+      sc->cia=malloc((size_t)C*LAGUNA_DENSE_INTER*sizeof(float));
+      sc->cib=malloc((size_t)C*LAGUNA_DENSE_INTER*sizeof(float));
+      sc->cpart=malloc((size_t)C*H*sizeof(float)); sc->cshared=malloc((size_t)C*H*sizeof(float)); }
     sc->n1=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->n2=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->qf=malloc((size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
@@ -354,7 +368,7 @@ static void scratch_alloc(laguna_scratch *sc, int max_pos) {
     sc->partial=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->shared=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->logits=malloc(LAGUNA_VOCAB*sizeof(float));
-    sc->scores=malloc((size_t)max_pos*sizeof(float));
+    sc->scores=malloc((size_t)LAGUNA_MAX_HEADS*max_pos*sizeof(float));
 }
 
 /* Attention for one token at `pos`. `x` is input_layernorm output (n1). Writes attn_out. */
@@ -383,27 +397,25 @@ static inline void laguna_vaxpy(float *acc, const uint16_t *v, float p, float co
 }
 #endif
 
-static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scratch *sc,
-                      int layer, int pos) {
-    int nh=ly->num_heads, hd=LAGUNA_HEAD_DIM;
+/* Attention core for ONE token: qk-norm + rope + KV-write + head loop, on the
+ * pre-projected qf/kf/vf/gf, writing ao.  Shared by decode (forward_token) and
+ * chunked prefill (which batches the q/k/v/g/o matvecs and calls this per token). */
+static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna_scratch *sc,
+                           int layer, int pos, int nh,
+                           float *qf, float *kf, float *vf, float *gf, float *ao) {
+    int hd=LAGUNA_HEAD_DIM;
     int rot = ly->is_sliding ? LAGUNA_ROPE_SLIDING_DIM : LAGUNA_ROPE_FULL_DIM;
     const float *cosp = ly->is_sliding ? m->swa_cos : m->full_cos;
     const float *sinp = ly->is_sliding ? m->swa_sin : m->full_sin;
     int half = rot/2;
     const float *rc = cosp + (size_t)pos*half, *rs = sinp + (size_t)pos*half;
 
-    /* q/k/v/g all read n1 -> one fused parallel region */
-    { float *ys[4]={sc->qf,sc->kf,sc->vf,sc->gf};
-      const laguna_lin *Ws[4]={&ly->q_proj,&ly->k_proj,&ly->v_proj,&ly->g_proj};
-      int rws[4]={nh*hd, LAGUNA_KV_HEADS*hd, LAGUNA_KV_HEADS*hd, nh};
-      laguna_lin_mv_multi(ys, Ws, rws, 4, sc->n1, LAGUNA_HIDDEN); }
-
     /* q_norm + rope per query head */
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (int h=0; h<nh; ++h) {
-        float *q=sc->qf+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
+        float *q=qf+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
         laguna_rmsnorm(tmp, q, ly->q_norm, hd, LAGUNA_RMS_EPS);
         memcpy(q,tmp,sizeof tmp);
         laguna_rope_half(q, rc, rs, rot);
@@ -414,43 +426,58 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
     uint16_t *kdst=kbase+(size_t)(pos%cap)*kvstride;
     uint16_t *vdst=vbase+(size_t)(pos%cap)*kvstride;
     for (int h=0; h<LAGUNA_KV_HEADS; ++h) {
-        float *k=sc->kf+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
+        float *k=kf+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
         laguna_rmsnorm(tmp, k, ly->k_norm, hd, LAGUNA_RMS_EPS);
         memcpy(k,tmp,sizeof tmp);
         laguna_rope_half(k, rc, rs, rot);
         for (int d=0; d<hd; ++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
-        for (int d=0; d<hd; ++d) vdst[h*hd+d]=laguna_f32_to_bf16(sc->vf[h*hd+d]);
+        for (int d=0; d<hd; ++d) vdst[h*hd+d]=laguna_f32_to_bf16(vf[h*hd+d]);
     }
     /* attention per query head.  Sliding layers attend to the last `cap` positions
      * (the ring holds exactly those); full layers attend to all [0..pos]. */
     float scale=1.0f/sqrtf((float)hd);
     int kv_groups=nh/LAGUNA_KV_HEADS;
     int lo = ly->is_sliding ? (pos-cap+1) : 0; if(lo<0)lo=0;
-    /* Per-head attention, parallel over heads with a one-pass online softmax
-     * (running max/sum + rescaled accumulator) so there is no shared score buffer. */
+    /* Per-head attention, parallel over heads.  Two passes over the key range with
+     * a per-head score buffer: (1) scores = q.k*scale, track max; (2) VECTORIZED
+     * softmax exp (FEXPA) -- the O(context) prefill bottleneck; (3) weighted sum of
+     * V.  Contiguous key positions when cap doesn't wrap (full layers, or sliding
+     * once wrapped) let qk/av stream. */
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (int h=0; h<nh; ++h) {
-        const float *q=sc->qf+(size_t)h*hd;
+        const float *q=qf+(size_t)h*hd;
         int kvh=h/kv_groups;
-        float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
-        float m_i=-INFINITY, l_i=0.0f;
-        for (int j=lo; j<=pos; ++j) {
-            size_t slot=(size_t)(j%cap)*kvstride+(size_t)kvh*hd;
-            float dot=laguna_qkdot(q, kbase+slot, hd)*scale;
-            float m_new = dot>m_i ? dot : m_i;
-            float corr = expf(m_i - m_new);
-            float p = expf(dot - m_new);
-            l_i = l_i*corr + p;
-            laguna_vaxpy(acc, vbase+slot, p, corr, hd);
-            m_i=m_new;
+        float *sco=sc->scores+(size_t)h*m->max_pos;   /* this head's scores */
+        int nkeys=pos-lo+1;
+        float mx=-INFINITY;
+        for (int i=0;i<nkeys;++i) {
+            size_t slot=(size_t)((lo+i)%cap)*kvstride+(size_t)kvh*hd;
+            float d=laguna_qkdot(q, kbase+slot, hd)*scale;
+            sco[i]=d; if(d>mx)mx=d;
         }
-        float gate=laguna_softplus(sc->gf[h]);
-        float s=gate/l_i; float *o=sc->ao+(size_t)h*hd;
+        float l_i=laguna_exp_shift_sum(sco, nkeys, mx);   /* sco[i]=exp(sco[i]-mx) */
+        float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
+        for (int i=0;i<nkeys;++i) {
+            size_t slot=(size_t)((lo+i)%cap)*kvstride+(size_t)kvh*hd;
+            laguna_vaxpy(acc, vbase+slot, sco[i], 1.0f, hd);
+        }
+        float gate=laguna_softplus(gf[h]);
+        float s=gate/l_i; float *o=ao+(size_t)h*hd;
         for(int d=0;d<hd;++d) o[d]=acc[d]*s;
     }
-    /* o_proj: [hidden, nh*hd] * ao -> attn_out */
+}
+
+/* Decode attention for one token: project q/k/v/g from n1, run the core, o_proj. */
+static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scratch *sc,
+                      int layer, int pos) {
+    int nh=ly->num_heads, hd=LAGUNA_HEAD_DIM;
+    float *ys[4]={sc->qf,sc->kf,sc->vf,sc->gf};
+    const laguna_lin *Ws[4]={&ly->q_proj,&ly->k_proj,&ly->v_proj,&ly->g_proj};
+    int rws[4]={nh*hd, LAGUNA_KV_HEADS*hd, LAGUNA_KV_HEADS*hd, nh};
+    laguna_lin_mv_multi(ys, Ws, rws, 4, sc->n1, LAGUNA_HIDDEN);
+    attention_core(m, ly, sc, layer, pos, nh, sc->qf, sc->kf, sc->vf, sc->gf, sc->ao);
     laguna_lin_mv(sc->attn_out, &ly->o_proj, sc->ao, LAGUNA_HIDDEN, nh*hd);
 }
 
@@ -496,8 +523,18 @@ typedef struct {
     void *ctx;
 } laguna_async_ar;
 
-/* Full forward for one token. `x` = residual stream (f32 [hidden]), updated in place.
- * If compute_logits, writes sc->logits. ar/ar_ctx do the routed allreduce. */
+/* Batched SwiGLU over C tokens (token-major).  out[C][hidden]. */
+static void swiglu_lin_batch(laguna_scratch *sc, const laguna_lin *gate_w, const laguna_lin *up_w,
+                             const laguna_lin *down_w, const float *X, float *out, int inter, int C) {
+    laguna_lin_mm(sc->cia, gate_w, X, inter, LAGUNA_HIDDEN, C);
+    laguna_lin_mm(sc->cib, up_w,   X, inter, LAGUNA_HIDDEN, C);
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (long i=0;i<(long)C*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
+    laguna_lin_mm(out, down_w, sc->cia, LAGUNA_HIDDEN, inter, C);
+}
+
 static int g_dbg=0;
 static double vnorm(const float*v,int n){ double s=0; for(int i=0;i<n;i++)s+=(double)v[i]*v[i]; return sqrt(s); }
 /* lightweight phase profiling (enabled by the bench) */
@@ -549,6 +586,66 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
     if (compute_logits) {
         laguna_rmsnorm(sc->n1, x, m->final_norm, LAGUNA_HIDDEN, LAGUNA_RMS_EPS);
         laguna_lin_mv(sc->logits, &m->lm_head, sc->n1, LAGUNA_VOCAB, LAGUNA_HIDDEN);
+    }
+}
+
+/* Chunked prefill: process C tokens (positions pos0..pos0+C-1) in one pass.  The
+ * weight-heavy matvecs are BATCHED (weight bandwidth amortized ~8x) and the routed
+ * allreduce is one per chunk (C-token payload) instead of per token.  KV-write +
+ * attention stay per token (the sliding ring needs write-then-attend order).
+ * Does not compute logits (prefill builds KV; the last token's logits are produced
+ * by a final per-token forward). */
+static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, float *X,
+                                  int pos0, int C, laguna_async_ar *aar) {
+    int H=LAGUNA_HIDDEN, hd=LAGUNA_HEAD_DIM;
+    for (int L=0; L<m->n_layers; ++L) {
+        const laguna_layer *ly=&m->layers[L];
+        int nh=ly->num_heads;
+        /* attention */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int c=0;c<C;++c) laguna_rmsnorm(sc->cn1+(size_t)c*H, X+(size_t)c*H, ly->in_ln, H, LAGUNA_RMS_EPS);
+        laguna_lin_mm(sc->cq, &ly->q_proj, sc->cn1, nh*hd, H, C);
+        laguna_lin_mm(sc->ck, &ly->k_proj, sc->cn1, LAGUNA_KV_HEADS*hd, H, C);
+        laguna_lin_mm(sc->cv, &ly->v_proj, sc->cn1, LAGUNA_KV_HEADS*hd, H, C);
+        laguna_lin_mm(sc->cg, &ly->g_proj, sc->cn1, nh, H, C);
+        for (int c=0;c<C;++c)
+            attention_core(m, ly, sc, L, pos0+c, nh,
+                           sc->cq+(size_t)c*nh*hd, sc->ck+(size_t)c*LAGUNA_KV_HEADS*hd,
+                           sc->cv+(size_t)c*LAGUNA_KV_HEADS*hd, sc->cg+(size_t)c*nh,
+                           sc->cao+(size_t)c*nh*hd);
+        laguna_lin_mm(sc->cattn, &ly->o_proj, sc->cao, H, nh*hd, C);
+        for (long i=0;i<(long)C*H;++i) X[i]+=sc->cattn[i];
+        /* mlp */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int c=0;c<C;++c) laguna_rmsnorm(sc->cn2+(size_t)c*H, X+(size_t)c*H, ly->post_ln, H, LAGUNA_RMS_EPS);
+        if (!ly->is_moe) {
+            swiglu_lin_batch(sc, &ly->dense_gate, &ly->dense_up, &ly->dense_down, sc->cn2, sc->cattn, LAGUNA_DENSE_INTER, C);
+            for (long i=0;i<(long)C*H;++i) X[i]+=sc->cattn[i];
+        } else {
+            /* per-token router + experts -> cpart[C][H] */
+            for (long i=0;i<(long)C*H;++i) sc->cpart[i]=0.0f;
+            for (int c=0;c<C;++c) {
+                const float *n2=sc->cn2+(size_t)c*H; float *pc=sc->cpart+(size_t)c*H;
+                laguna_lin_mv(sc->logits, &ly->router_w, n2, LAGUNA_EXPERTS, H);
+                int ids[LAGUNA_ACTIVE]; float rw[LAGUNA_ACTIVE];
+                laguna_top10(sc->logits, ly->router_bias, ids, rw);
+                for (int k=0;k<LAGUNA_ACTIVE;++k) {
+                    const laguna_expert *ex=&ly->experts[ids[k]];
+                    if (!ex->present) continue;
+                    expert_mv(sc, ex, n2, sc->attn_out);
+                    float w=rw[k];
+                    for (int i=0;i<H;++i) pc[i]+=w*sc->attn_out[i];
+                }
+            }
+            if (aar && aar->launch) aar->launch(aar->ctx, sc->cpart, C*H);   /* one AR for C tokens */
+            swiglu_lin_batch(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->cn2, sc->cshared, LAGUNA_SHARED_INTER, C);
+            if (aar && aar->join) aar->join(aar->ctx);
+            for (long i=0;i<(long)C*H;++i) X[i]+=sc->cshared[i]+LAGUNA_ROUTED_SCALE*sc->cpart[i];
+        }
     }
 }
 

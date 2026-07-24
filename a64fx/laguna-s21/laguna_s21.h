@@ -101,6 +101,31 @@ static inline int laguna_expert_owner(int expert, int ep_size) { return expert %
 static inline svfloat32_t laguna_ld_bf16(svbool_t pg, const uint16_t *p) {
     return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
 }
+/* 2^x via the A64FX FEXPA accelerator (adapted from glm5_impl.h). */
+static inline svfloat32_t laguna_exp2_fexpa(svbool_t pg, svfloat32_t x) {
+    const float shift_f = 204927.0f;               /* 0x48481fc0: FEXPA rounding shift */
+    svfloat32_t shift = svdup_f32(shift_f);
+    svfloat32_t z = svadd_f32_x(pg, x, shift);
+    svfloat32_t n = svsub_f32_x(pg, z, shift);
+    svfloat32_t r = svsub_f32_x(pg, x, n);
+    svfloat32_t scale = svexpa_f32(svreinterpret_u32_f32(z));
+    svfloat32_t corr = svmla_n_f32_x(pg, svdup_f32(1.0f), r, 0.6931471805599453f);
+    return svmul_f32_x(pg, scale, corr);
+}
+/* s[i] = exp(s[i] - shift) for i in [0,n); returns sum.  Vectorized softmax expf
+ * (the O(context) prefill bottleneck).  e^x = 2^(x*log2e). */
+static inline float laguna_exp_shift_sum(float *restrict s, int n, float shift) {
+    svfloat32_t acc = svdup_f32(0);
+    svfloat32_t sh = svdup_f32(shift), l2e = svdup_f32(1.4426950408889634f);
+    for (int i=0;i<n;i+=(int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(i, n);
+        svfloat32_t v = svld1_f32(pg, s+i);
+        v = laguna_exp2_fexpa(pg, svmul_f32_x(pg, svsub_f32_x(pg, v, sh), l2e));
+        svst1_f32(pg, s+i, v);
+        acc = svadd_f32_m(pg, acc, v);
+    }
+    return svaddv_f32(svptrue_b32(), acc);
+}
 /* Compute rows [r, r+nr) (nr<=4) of y = W*x, SVE-widened bf16, sharing each x load. */
 static inline void laguna_bf16_rowblock(float *restrict y, const uint16_t *restrict W,
                                         const float *restrict x, int r, int nr, int cols) {
@@ -130,6 +155,43 @@ static inline void laguna_bf16_rowblock(float *restrict y, const uint16_t *restr
         }
     }
 }
+/* Batched matvec (chunked prefill): Y[C][rows] = X[C][cols] @ W[rows][cols]^T,
+ * token-major (Y[c*rows+r], X[c*cols]).  8 tokens share each weight-row load, so
+ * the weight bandwidth is amortized ~8x vs C separate matvecs. */
+static inline void laguna_matmat_bf16(float *restrict Y, const uint16_t *restrict W,
+                                      const float *restrict X, int rows, int cols, int C) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r=0;r<rows;++r) {
+        const uint16_t *w=W+(size_t)r*cols; int ct=0;
+        for (; ct+8<=C; ct+=8) {
+            const float *x0=X+(size_t)(ct+0)*cols,*x1=X+(size_t)(ct+1)*cols,*x2=X+(size_t)(ct+2)*cols,*x3=X+(size_t)(ct+3)*cols;
+            const float *x4=X+(size_t)(ct+4)*cols,*x5=X+(size_t)(ct+5)*cols,*x6=X+(size_t)(ct+6)*cols,*x7=X+(size_t)(ct+7)*cols;
+            svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+            svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+            for (int c=0;c<cols;c+=(int)svcntw()) {
+                svbool_t pg=svwhilelt_b32(c,cols); svfloat32_t wv=laguna_ld_bf16(pg,w+c);
+                a0=svmla_f32_x(pg,a0,wv,svld1_f32(pg,x0+c)); a1=svmla_f32_x(pg,a1,wv,svld1_f32(pg,x1+c));
+                a2=svmla_f32_x(pg,a2,wv,svld1_f32(pg,x2+c)); a3=svmla_f32_x(pg,a3,wv,svld1_f32(pg,x3+c));
+                a4=svmla_f32_x(pg,a4,wv,svld1_f32(pg,x4+c)); a5=svmla_f32_x(pg,a5,wv,svld1_f32(pg,x5+c));
+                a6=svmla_f32_x(pg,a6,wv,svld1_f32(pg,x6+c)); a7=svmla_f32_x(pg,a7,wv,svld1_f32(pg,x7+c));
+            }
+            svbool_t pt=svptrue_b32();
+            Y[(size_t)(ct+0)*rows+r]=svaddv_f32(pt,a0); Y[(size_t)(ct+1)*rows+r]=svaddv_f32(pt,a1);
+            Y[(size_t)(ct+2)*rows+r]=svaddv_f32(pt,a2); Y[(size_t)(ct+3)*rows+r]=svaddv_f32(pt,a3);
+            Y[(size_t)(ct+4)*rows+r]=svaddv_f32(pt,a4); Y[(size_t)(ct+5)*rows+r]=svaddv_f32(pt,a5);
+            Y[(size_t)(ct+6)*rows+r]=svaddv_f32(pt,a6); Y[(size_t)(ct+7)*rows+r]=svaddv_f32(pt,a7);
+        }
+        for (; ct<C; ++ct) {
+            const float *x=X+(size_t)ct*cols; svfloat32_t a=svdup_f32(0);
+            for (int c=0;c<cols;c+=(int)svcntw()){ svbool_t pg=svwhilelt_b32(c,cols);
+                a=svmla_f32_x(pg,a,laguna_ld_bf16(pg,w+c),svld1_f32(pg,x+c)); }
+            Y[(size_t)ct*rows+r]=svaddv_f32(svptrue_b32(),a);
+        }
+    }
+}
+
 /* Decode matvec: y[rows] = W[rows,cols](bf16) * x[cols](f32). */
 static inline void laguna_matvec_bf16(float *restrict y, const uint16_t *restrict W,
                                       const float *restrict x, int rows, int cols) {
@@ -483,6 +545,11 @@ static inline void laguna_lin_mv_multi(float *const *ys, const laguna_lin *const
     const uint16_t *Ws[8]; for (int m=0;m<nmat;++m) Ws[m]=*ws[m];
     laguna_matvec_bf16_multi(ys, Ws, rows, nmat, x, cols);
 }
+/* batched (chunked prefill): Y[C][rows] = X[C][cols] @ w^T */
+static inline void laguna_lin_mm(float *Y, const laguna_lin *w, const float *X,
+                                 int rows, int cols, int C) {
+    laguna_matmat_bf16(Y, *w, X, rows, cols, C);
+}
 #else
 typedef laguna_w8 laguna_lin;                /* int8 per-row weight (q + scale) */
 static inline void laguna_lin_mv(float *restrict y, const laguna_lin *w,
@@ -492,6 +559,11 @@ static inline void laguna_lin_mv(float *restrict y, const laguna_lin *w,
 static inline void laguna_lin_mv_multi(float *const *ys, const laguna_lin *const *ws,
                                        const int *rows, int nmat, const float *x, int cols) {
     laguna_matvec_i8_multi(ys, ws, rows, nmat, x, cols);
+}
+/* batched: int8 build falls back to per-token (no chunked-prefill target for it) */
+static inline void laguna_lin_mm(float *Y, const laguna_lin *w, const float *X,
+                                 int rows, int cols, int C) {
+    for (int c=0;c<C;++c) laguna_matvec_i8(Y+(size_t)c*rows, w, X+(size_t)c*cols, rows, cols);
 }
 #endif
 
