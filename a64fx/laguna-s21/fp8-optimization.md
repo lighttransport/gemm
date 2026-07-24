@@ -327,12 +327,48 @@ repetitive, which is the effect the checkpoint's `do_sample=true` is asking for,
 but greedy does not collapse -- so the earlier hypothesis that long output was
 degenerating was wrong.
 
-**Known gap:** the runner feeds raw token ids, so it does continuation, not chat.
-The checkpoint ships a `chat_template.jinja` (a thinking-model template with
-system/user/assistant blocks). Prompts that read like instructions
-("The capital of France is") therefore get an out-of-distribution continuation
-rather than an answer. Applying the template is the next correctness step and is
-independent of everything above.
+### Chat template
+
+The runner used to feed raw token ids, so it did continuation, not chat, and an
+instruction-shaped prompt got an out-of-distribution ramble:
+
+```
+    "What is the capital of France?"
+    before: "You are a bot that can perform various tasks. Your task is to
+             respond to the user's question and acknowledge the karma points."
+    after:  "</think>The capital of France is Paris."   (stops on eos, 8 tokens)
+```
+
+`laguna_tok.py chat` renders the checkpoint's own `chat_template.jinja` with
+jinja2 rather than reimplementing it, so it cannot drift. The template's
+`{% generation %}` / `{% endgeneration %}` tags are a HuggingFace-only extension
+for loss masking that emit no text, so they are stripped to let plain jinja2 parse
+it. Launcher flags: `--chat MSG`, `--system TEXT`, `--no-think`.
+
+Two tokenizer bugs had to be fixed first, both invisible until the template
+introduced markup:
+
+- **`encode` ignored added tokens entirely**, BPE-ing them as ordinary text: the
+  19-token control sequence above came out as 26 word pieces, and the model saw
+  none of the control tokens it was trained on. Added tokens are now matched
+  longest-first (so `〈|EOS|〉` beats its own substrings `〈|` and `|〉`).
+- **`decode` byte-decoded added tokens.** BPE pieces are byte-level-encoded (each
+  character stands for a byte) but added-token contents are literal text, so
+  putting them through the same decode mangled anything non-ASCII -- `〈|EOS|〉`
+  did not survive a round-trip. The byte buffer is now flushed around each added
+  token.
+
+`decode` also now hides only `special=True` tokens, matching HuggingFace's
+`skip_special_tokens`. The chat markup (`<think>`, `</think>`, `<assistant>`) is
+`special=False` and stays visible; `--raw` shows everything.
+
+Worth noting: `eos_token_id` is `[2, 24]` and 24 is `</assistant>`, so the
+runner's existing stop condition was already the correct chat turn terminator --
+chat answers terminate on their own rather than running to `--max-new`.
+
+`tools/tok_test.py` covers added-token mapping, longest-first matching, exact
+round-trip (including unicode), decode visibility, and template rendering for
+thinking / no-think / custom-system / multi-turn.
 
 ### Remaining levers
 

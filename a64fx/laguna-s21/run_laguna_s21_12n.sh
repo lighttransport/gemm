@@ -23,11 +23,14 @@ UTOFU="$REPO/a64fx/utofu-tests"
 MODE="${1:-self-test}"; shift || true
 NP="${LAGUNA_NP:-${PJM_MPI_PROC:-12}}"
 PROMPT="The capital of France is"
-IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4
+IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --prompt)  PROMPT="$2"; shift 2;;
+    --chat)    PROMPT="$2"; CHAT=1; shift 2;;
+    --system)  SYSMSG="$2"; shift 2;;
+    --no-think) NOTHINK=1; shift;;
     --ids)     IDS="$2"; shift 2;;
     --max-new) MAX_NEW="$2"; shift 2;;
     --layers)  LAYERS="$2"; shift 2;;
@@ -83,8 +86,22 @@ fi
 # Tokenize prompt (unless --ids given).
 if [ -z "$IDS" ]; then
   IDS="$RUN_DIR/prompt.ids"
-  # BOS (id 2) is required — without it the model degenerates to copying the last token.
-  python3 "$HERE/tools/laguna_tok.py" encode "$PROMPT" --bos > "$IDS"
+  if [ "$CHAT" = 1 ]; then
+    # Instruct/chat: render the checkpoint's own chat_template.jinja.  Raw
+    # continuation of an instruction-shaped prompt is out of distribution for this
+    # model -- it answers properly only inside <system>/<user>/<assistant> markup.
+    # The template emits BOS itself, so no --bos here.
+    ARGS=(chat "$PROMPT" --show-prompt)
+    [ -n "$SYSMSG" ] && ARGS+=(--system "$SYSMSG")
+    [ "$NOTHINK" = 1 ] && ARGS+=(--no-think)
+    LAGUNA_TOKENIZER="$MODEL/tokenizer.json" \
+      python3 "$HERE/tools/laguna_tok.py" "${ARGS[@]}" > "$IDS" 2>"$RUN_DIR/prompt.txt"
+    echo "--- chat prompt ---"; cat "$RUN_DIR/prompt.txt"
+  else
+    # BOS (id 2) is required — without it the model degenerates to copying the last token.
+    LAGUNA_TOKENIZER="$MODEL/tokenizer.json" \
+      python3 "$HERE/tools/laguna_tok.py" encode "$PROMPT" --bos > "$IDS"
+  fi
 fi
 echo "prompt ids: $(cat "$IDS")"
 
@@ -99,4 +116,5 @@ mpiexec -np "$NP" "$RUNNER" --generate \
     --stage-dir "$STAGE" --gen-out "$RUN_DIR/gen.ids" "${PASS[@]}"
 
 echo "--- generated text ---"
-python3 "$HERE/tools/laguna_tok.py" decode-file "$RUN_DIR/gen.ids" || true
+LAGUNA_TOKENIZER="$MODEL/tokenizer.json" \
+  python3 "$HERE/tools/laguna_tok.py" decode-file "$RUN_DIR/gen.ids" || true
