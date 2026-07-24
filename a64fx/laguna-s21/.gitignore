@@ -5,3 +5,4 @@ gen_*/
 probe/
 *.ids
 bf16smoke/
+fp8run/

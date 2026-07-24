@@ -391,6 +391,60 @@ static inline void laguna_fp8_init_lut(void) {
 }
 /* Block-scaled fp8 matvec: y[r] = sum over 128-col blocks cb of
  * scale[r/128, cb] * sum_{c in cb} lut[W[r,c]] * x[c].  cols multiple of 128. */
+#if defined(__ARM_FEATURE_SVE)
+/* 8 rows share each x load; fp8 bytes -> f32 via an SVE gather from the LUT (exact,
+ * incl. subnormals / e4m3fn NaN). 8 consecutive rows share one scale row because
+ * 8 | 128, so an 8-row group never crosses a block-row boundary. */
+static inline void laguna_matvec_fp8blk(float *restrict y, const uint8_t *restrict W,
+                                        const uint16_t *restrict scales,
+                                        const float *restrict x, int rows, int cols) {
+    int cblk = cols / LAGUNA_FP8_BLK, VL = (int)svcntw();
+    svbool_t pt = svptrue_b32();
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r += 8) {
+        int nr = rows - r < 8 ? rows - r : 8;
+        const uint16_t *sr = scales + (size_t)(r / LAGUNA_FP8_BLK) * cblk;
+        if (nr == 8) {
+            const uint8_t *w0=W+(size_t)r*cols,*w1=w0+cols,*w2=w1+cols,*w3=w2+cols;
+            const uint8_t *w4=w3+cols,*w5=w4+cols,*w6=w5+cols,*w7=w6+cols;
+            float t0=0,t1=0,t2=0,t3=0,t4=0,t5=0,t6=0,t7=0;
+            for (int cb = 0; cb < cblk; ++cb) {
+                int c0 = cb*LAGUNA_FP8_BLK;
+                svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+                svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+                for (int c = c0; c < c0+LAGUNA_FP8_BLK; c += VL) {
+                    svfloat32_t xf = svld1_f32(pt, x + c);
+                    a0=svmla_f32_x(pt,a0,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w0+c)),xf);
+                    a1=svmla_f32_x(pt,a1,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w1+c)),xf);
+                    a2=svmla_f32_x(pt,a2,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w2+c)),xf);
+                    a3=svmla_f32_x(pt,a3,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w3+c)),xf);
+                    a4=svmla_f32_x(pt,a4,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w4+c)),xf);
+                    a5=svmla_f32_x(pt,a5,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w5+c)),xf);
+                    a6=svmla_f32_x(pt,a6,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w6+c)),xf);
+                    a7=svmla_f32_x(pt,a7,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,w7+c)),xf);
+                }
+                float s = laguna_bf16_to_f32(sr[cb]);
+                t0+=s*svaddv_f32(pt,a0); t1+=s*svaddv_f32(pt,a1); t2+=s*svaddv_f32(pt,a2); t3+=s*svaddv_f32(pt,a3);
+                t4+=s*svaddv_f32(pt,a4); t5+=s*svaddv_f32(pt,a5); t6+=s*svaddv_f32(pt,a6); t7+=s*svaddv_f32(pt,a7);
+            }
+            y[r]=t0;y[r+1]=t1;y[r+2]=t2;y[r+3]=t3;y[r+4]=t4;y[r+5]=t5;y[r+6]=t6;y[r+7]=t7;
+        } else {
+            for (int rr = r; rr < r+nr; ++rr) {
+                const uint8_t *wr = W + (size_t)rr * cols; float acc = 0.0f;
+                for (int cb = 0; cb < cblk; ++cb) {
+                    int c0=cb*LAGUNA_FP8_BLK; svfloat32_t a=svdup_f32(0);
+                    for (int c=c0;c<c0+LAGUNA_FP8_BLK;c+=VL)
+                        a=svmla_f32_x(pt,a,svld1_gather_u32index_f32(pt,laguna_fp8_lut,svld1ub_u32(pt,wr+c)),svld1_f32(pt,x+c));
+                    acc += laguna_bf16_to_f32(sr[cb]) * svaddv_f32(pt,a);
+                }
+                y[rr]=acc;
+            }
+        }
+    }
+}
+#else
 static inline void laguna_matvec_fp8blk(float *restrict y, const uint8_t *restrict W,
                                         const uint16_t *restrict scales,
                                         const float *restrict x, int rows, int cols) {
@@ -411,6 +465,7 @@ static inline void laguna_matvec_fp8blk(float *restrict y, const uint8_t *restri
         y[r] = acc;
     }
 }
+#endif
 #endif
 
 /* ---- linear-weight abstraction: int8 W8 (production), bf16, or fp8-expert.
