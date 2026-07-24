@@ -342,6 +342,10 @@ typedef struct {
     float *cn1,*cn2,*cq,*ck,*cv,*cg,*cao,*cattn,*cia,*cib,*cpart,*cshared;
     /* query-block flash-attention state (full layers): per (head, query) */
     float *fm,*fl,*facc;   /* fm/fl [MAX_HEADS*PCHUNK], facc [MAX_HEADS*PCHUNK*HEAD_DIM] */
+    /* batched-MoE (chunked prefill): routing table + per-expert gather buffer */
+    int   *rids;           /* [PCHUNK*ACTIVE] selected expert ids per token */
+    float *rrw;            /* [PCHUNK*ACTIVE] routing weights */
+    float *xe, *ye;        /* [PCHUNK*hidden] gathered expert in/out */
 } laguna_scratch;
 
 #define LAGUNA_PCHUNK 256
@@ -359,7 +363,9 @@ static void scratch_alloc(laguna_scratch *sc, int max_pos) {
       sc->cpart=malloc((size_t)C*H*sizeof(float)); sc->cshared=malloc((size_t)C*H*sizeof(float));
       sc->fm=malloc((size_t)LAGUNA_MAX_HEADS*C*sizeof(float));
       sc->fl=malloc((size_t)LAGUNA_MAX_HEADS*C*sizeof(float));
-      sc->facc=malloc((size_t)LAGUNA_MAX_HEADS*C*LAGUNA_HEAD_DIM*sizeof(float)); }
+      sc->facc=malloc((size_t)LAGUNA_MAX_HEADS*C*LAGUNA_HEAD_DIM*sizeof(float));
+      sc->rids=malloc((size_t)C*LAGUNA_ACTIVE*sizeof(int)); sc->rrw=malloc((size_t)C*LAGUNA_ACTIVE*sizeof(float));
+      sc->xe=malloc((size_t)C*H*sizeof(float)); sc->ye=malloc((size_t)C*H*sizeof(float)); }
     sc->n1=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->n2=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->qf=malloc((size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
@@ -609,6 +615,8 @@ static int g_dbg=0;
 static double vnorm(const float*v,int n){ double s=0; for(int i=0;i<n;i++)s+=(double)v[i]*v[i]; return sqrt(s); }
 /* lightweight phase profiling (enabled by the bench) */
 double g_t_attn=0, g_t_mlp=0, g_t_norm=0; int g_prof=0;
+/* chunked-prefill phase timers (rank-0, seconds) */
+double g_c_qkv=0, g_c_attn=0, g_c_op=0, g_c_router=0, g_c_expert=0, g_c_shared=0, g_c_ar=0;
 static double prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, int pos,
                           laguna_async_ar *aar, int compute_logits) {
@@ -671,6 +679,7 @@ static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, flo
     for (int L=0; L<m->n_layers; ++L) {
         const laguna_layer *ly=&m->layers[L];
         int nh=ly->num_heads;
+        double _t=prof_now();
         /* attention */
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
@@ -680,6 +689,7 @@ static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, flo
         laguna_lin_mm(sc->ck, &ly->k_proj, sc->cn1, LAGUNA_KV_HEADS*hd, H, C);
         laguna_lin_mm(sc->cv, &ly->v_proj, sc->cn1, LAGUNA_KV_HEADS*hd, H, C);
         laguna_lin_mm(sc->cg, &ly->g_proj, sc->cn1, nh, H, C);
+        g_c_qkv+=prof_now()-_t; _t=prof_now();
         if (!ly->is_sliding) {
             /* full attention: query-block flash (amortizes KV bandwidth across the chunk) */
             attention_full_flash(m, ly, sc, L, pos0, C, nh, sc->cq, sc->ck, sc->cv, sc->cg, sc->cao);
@@ -691,36 +701,65 @@ static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, flo
                                sc->cv+(size_t)c*LAGUNA_KV_HEADS*hd, sc->cg+(size_t)c*nh,
                                sc->cao+(size_t)c*nh*hd);
         }
+        g_c_attn+=prof_now()-_t; _t=prof_now();
         laguna_lin_mm(sc->cattn, &ly->o_proj, sc->cao, H, nh*hd, C);
         for (long i=0;i<(long)C*H;++i) X[i]+=sc->cattn[i];
-        /* mlp */
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
         for (int c=0;c<C;++c) laguna_rmsnorm(sc->cn2+(size_t)c*H, X+(size_t)c*H, ly->post_ln, H, LAGUNA_RMS_EPS);
+        g_c_op+=prof_now()-_t;
+        /* mlp */
         if (!ly->is_moe) {
+            _t=prof_now();
             swiglu_lin_batch(sc, &ly->dense_gate, &ly->dense_up, &ly->dense_down, sc->cn2, sc->cattn, LAGUNA_DENSE_INTER, C);
             for (long i=0;i<(long)C*H;++i) X[i]+=sc->cattn[i];
+            g_c_shared+=prof_now()-_t;
         } else {
-            /* per-token router + experts -> cpart[C][H] */
+            _t=prof_now();
             for (long i=0;i<(long)C*H;++i) sc->cpart[i]=0.0f;
+            /* route all C tokens */
+            for (int c=0;c<C;++c) {
+                laguna_lin_mv(sc->logits, &ly->router_w, sc->cn2+(size_t)c*H, LAGUNA_EXPERTS, H);
+                laguna_top10(sc->logits, ly->router_bias, sc->rids+(size_t)c*LAGUNA_ACTIVE, sc->rrw+(size_t)c*LAGUNA_ACTIVE);
+            }
+            double _te=prof_now();
+#if defined(LAGUNA_FP8)
+            /* BATCHED experts: for each owned expert, gather its tokens and run one
+             * (dequant-once) fp8 GEMM -> the fp8 gather is amortized across tokens. */
+            int inter=LAGUNA_EXPERT_INTER; int tok[LAGUNA_PCHUNK]; float wgt[LAGUNA_PCHUNK];
+            for (int e=m->ep_rank; e<LAGUNA_EXPERTS; e+=m->ep_size) {
+                const laguna_expert *ex=&ly->experts[e]; if(!ex->present) continue;
+                int ne=0;
+                for (int c=0;c<C;++c){ const int *id=sc->rids+(size_t)c*LAGUNA_ACTIVE;
+                    for (int k=0;k<LAGUNA_ACTIVE;++k) if(id[k]==e){ tok[ne]=c; wgt[ne]=sc->rrw[(size_t)c*LAGUNA_ACTIVE+k]; ne++; break; } }
+                if(ne==0) continue;
+                for (int i=0;i<ne;++i) memcpy(sc->xe+(size_t)i*H, sc->cn2+(size_t)tok[i]*H, (size_t)H*sizeof(float));
+                laguna_matmat_fp8blk(sc->cia, ex->gate, ex->gs, sc->xe, inter, H, ne);
+                laguna_matmat_fp8blk(sc->cib, ex->up,   ex->us, sc->xe, inter, H, ne);
+                for (long i=0;i<(long)ne*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
+                laguna_matmat_fp8blk(sc->ye, ex->down, ex->ds, sc->cia, H, inter, ne);
+                for (int i=0;i<ne;++i){ float w=wgt[i]; float *pc=sc->cpart+(size_t)tok[i]*H; const float *ye=sc->ye+(size_t)i*H;
+                    for (int d=0;d<H;++d) pc[d]+=w*ye[d]; }
+            }
+#else
             for (int c=0;c<C;++c) {
                 const float *n2=sc->cn2+(size_t)c*H; float *pc=sc->cpart+(size_t)c*H;
-                laguna_lin_mv(sc->logits, &ly->router_w, n2, LAGUNA_EXPERTS, H);
-                int ids[LAGUNA_ACTIVE]; float rw[LAGUNA_ACTIVE];
-                laguna_top10(sc->logits, ly->router_bias, ids, rw);
+                const int *id=sc->rids+(size_t)c*LAGUNA_ACTIVE; const float *rw=sc->rrw+(size_t)c*LAGUNA_ACTIVE;
                 for (int k=0;k<LAGUNA_ACTIVE;++k) {
-                    const laguna_expert *ex=&ly->experts[ids[k]];
-                    if (!ex->present) continue;
+                    const laguna_expert *ex=&ly->experts[id[k]]; if(!ex->present) continue;
                     expert_mv(sc, ex, n2, sc->attn_out);
-                    float w=rw[k];
-                    for (int i=0;i<H;++i) pc[i]+=w*sc->attn_out[i];
+                    for (int i=0;i<H;++i) pc[i]+=rw[k]*sc->attn_out[i];
                 }
             }
+#endif
+            g_c_expert+=prof_now()-_te;
+            g_c_router+=prof_now()-_t; _t=prof_now();
             if (aar && aar->launch) aar->launch(aar->ctx, sc->cpart, C*H);   /* one AR for C tokens */
             swiglu_lin_batch(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->cn2, sc->cshared, LAGUNA_SHARED_INTER, C);
             if (aar && aar->join) aar->join(aar->ctx);
             for (long i=0;i<(long)C*H;++i) X[i]+=sc->cshared[i]+LAGUNA_ROUTED_SCALE*sc->cpart[i];
+            g_c_shared+=prof_now()-_t;
         }
     }
 }

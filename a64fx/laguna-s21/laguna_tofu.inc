@@ -232,6 +232,9 @@ static int run_generate(int argc, char **argv){
         int a=next;
         logmsg("prefill %d tok in %.2fs (%.1f tok/s); argmax first token = %d nan=%d\n",
                n_prompt,pf1-pf0,n_prompt/(pf1-pf0),a,total_nan);
+        extern double g_c_qkv,g_c_attn,g_c_op,g_c_router,g_c_expert,g_c_shared;
+        logmsg("  chunk phases (s): qkv=%.1f attn=%.1f o_proj+rms=%.1f router=%.1f (expert=%.1f) shared/mlp=%.1f\n",
+               g_c_qkv,g_c_attn,g_c_op,g_c_router-g_c_expert,g_c_expert,g_c_shared);
     }
     /* decode loop */
     g_ar_secs=0; g_ar_calls=0;   /* measure decode-only comm */

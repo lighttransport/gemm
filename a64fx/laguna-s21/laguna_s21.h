@@ -530,6 +530,41 @@ static inline void laguna_matvec_fp8blk(float *restrict y, const uint8_t *restri
 #endif
 #endif
 
+#if defined(LAGUNA_FP8) && defined(__ARM_FEATURE_SVE)
+/* Batched fp8 block matvec: Y[N][rows] = X[N][cols] @ fp8_W^T (token-major).  Each
+ * weight row is dequanted ONCE (gather LUT + block scale) into an f32 scratch and
+ * reused across the N tokens -> the gather (the fp8 bottleneck) is amortized ~N x,
+ * and the N dots are plain f32 SVE.  cols multiple of 128, <= LAGUNA_HIDDEN. */
+static inline void laguna_matmat_fp8blk(float *restrict Y, const uint8_t *restrict W,
+                                        const uint16_t *restrict scales, const float *restrict X,
+                                        int rows, int cols, int N) {
+    int cblk = cols / LAGUNA_FP8_BLK;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r=0;r<rows;++r) {
+        const uint8_t *wr=W+(size_t)r*cols; const uint16_t *sr=scales+(size_t)(r/LAGUNA_FP8_BLK)*cblk;
+        float wrow[LAGUNA_HIDDEN];
+        for (int cb=0;cb<cblk;++cb){ float s=laguna_bf16_to_f32(sr[cb]); const uint8_t *wb=wr+cb*LAGUNA_FP8_BLK; float *o=wrow+cb*LAGUNA_FP8_BLK;
+            for (int j=0;j<LAGUNA_FP8_BLK;++j) o[j]=laguna_fp8_lut[wb[j]]*s; }
+        int ct=0;
+        for (; ct+4<=N; ct+=4) {
+            const float *x0=X+(size_t)(ct+0)*cols,*x1=X+(size_t)(ct+1)*cols,*x2=X+(size_t)(ct+2)*cols,*x3=X+(size_t)(ct+3)*cols;
+            svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+            for (int c=0;c<cols;c+=(int)svcntw()){ svbool_t pg=svwhilelt_b32(c,cols); svfloat32_t wv=svld1_f32(pg,wrow+c);
+                a0=svmla_f32_x(pg,a0,wv,svld1_f32(pg,x0+c)); a1=svmla_f32_x(pg,a1,wv,svld1_f32(pg,x1+c));
+                a2=svmla_f32_x(pg,a2,wv,svld1_f32(pg,x2+c)); a3=svmla_f32_x(pg,a3,wv,svld1_f32(pg,x3+c)); }
+            svbool_t pt=svptrue_b32();
+            Y[(size_t)(ct+0)*rows+r]=svaddv_f32(pt,a0); Y[(size_t)(ct+1)*rows+r]=svaddv_f32(pt,a1);
+            Y[(size_t)(ct+2)*rows+r]=svaddv_f32(pt,a2); Y[(size_t)(ct+3)*rows+r]=svaddv_f32(pt,a3);
+        }
+        for (; ct<N; ++ct){ const float *x=X+(size_t)ct*cols; svfloat32_t a=svdup_f32(0);
+            for (int c=0;c<cols;c+=(int)svcntw()){ svbool_t pg=svwhilelt_b32(c,cols); a=svmla_f32_x(pg,a,svld1_f32(pg,wrow+c),svld1_f32(pg,x+c)); }
+            Y[(size_t)ct*rows+r]=svaddv_f32(svptrue_b32(),a); }
+    }
+}
+#endif
+
 /* ---- linear-weight abstraction: int8 W8 (production), bf16, or fp8-expert.
  * Build variants with -DLAGUNA_BF16 or -DLAGUNA_FP8.  Non-expert linears are
  * bf16 in both the bf16 and fp8 builds; call sites use laguna_lin_mv* and stay
