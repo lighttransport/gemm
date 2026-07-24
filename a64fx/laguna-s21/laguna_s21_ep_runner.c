@@ -76,6 +76,77 @@ static int test_i4_matvec(void) {
     return 0;
 }
 
+/* Batched int8 GEMM must agree with C separate int8 matvecs (chunked prefill
+ * uses the former, the last-token forward the latter). */
+static int test_i8_matmat(void) {
+    enum { R=136, C=256, N=11 };
+    static int8_t q[R*C]; static float s[R], X[N*C], Y[N*R], y1[R];
+    uint64_t st=0x9e3779b9ull;
+    for (int i=0;i<R*C;i++){ st=st*6364136223846793005ull+1; q[i]=(int8_t)((st>>33)%255-127); }
+    for (int i=0;i<R;i++) s[i]=0.001f*(1+i%7);
+    for (int i=0;i<N*C;i++){ st=st*6364136223846793005ull+1; X[i]=(float)((int)((st>>34)%2000)-1000)/1000.0f; }
+    laguna_w8 w={q,s};
+    laguna_matmat_i8(Y,&w,X,R,C,N);
+    for (int n=0;n<N;n++){
+        laguna_matvec_i8(y1,&w,X+(size_t)n*C,R,C);
+        for (int r=0;r<R;r++){
+            float a=Y[(size_t)n*R+r], b=y1[r];
+            if (fabsf(a-b) > 1e-4f*(1+fabsf(b))) {
+                fprintf(stderr,"i8 matmat tok %d row %d: %.6g vs %.6g\n",n,r,a,b); return 1; }
+        }
+    }
+    return 0;
+}
+#if defined(LAGUNA_FP8)
+/* The fp8 -> int8-per-block re-quantization must track the exact e4m3 kernel, and
+ * the batched form must agree with the matvec form. */
+static int test_fp8_i8blk(void) {
+    enum { R=256, C=256, N=9 };
+    static uint8_t W[R*C]; static uint16_t bs[(R/LAGUNA_FP8_BLK)*(C/LAGUNA_FP8_BLK)];
+    static float x[C], yex[R], yq[R], X[N*C], Y[N*R];
+    laguna_fp8_init_lut();
+    uint64_t st=0xdeadbeefull;
+    /* near-Gaussian block content (what a real block-scaled checkpoint holds) */
+    for (int i=0;i<R*C;i++){
+        double u=0; for(int k=0;k<4;k++){ st=st*6364136223846793005ull+1; u+=(double)((st>>34)%1000)/1000.0; }
+        float v=(float)(u-2.0)*0.35f;                       /* ~N(0,1) scaled */
+        int best=0; float bd=1e30f;
+        for (int b=0;b<256;b++){ if((b&0x7f)==0x7f) continue;
+            float d=fabsf(laguna_fp8_lut[b]-v); if(d<bd){bd=d;best=b;} }
+        W[i]=(uint8_t)best;
+    }
+    for (size_t i=0;i<sizeof bs/sizeof *bs;i++) bs[i]=laguna_f32_to_bf16(0.0037f);
+    for (int i=0;i<C;i++){ st=st*6364136223846793005ull+1; x[i]=(float)((int)((st>>34)%2000)-1000)/1000.0f; }
+    for (int i=0;i<N*C;i++){ st=st*6364136223846793005ull+1; X[i]=(float)((int)((st>>34)%2000)-1000)/1000.0f; }
+
+    laguna_matvec_fp8blk(yex,W,bs,x,R,C);
+    laguna_w8b q;
+    if (posix_memalign((void**)&q.q,256,(size_t)R*C)!=0 ||
+        posix_memalign((void**)&q.s,256,(size_t)R*(C/LAGUNA_FP8_BLK)*sizeof(float))!=0) return 1;
+    laguna_fp8_to_i8blk(&q,W,bs,R,C);
+    laguna_matvec_i8blk(yq,&q,x,R,C);
+
+    double num=0,den=0;
+    for (int r=0;r<R;r++){ double d=(double)yq[r]-yex[r]; num+=d*d; den+=(double)yex[r]*yex[r]; }
+    double rel=sqrt(num/(den>0?den:1));
+    if (!(rel < 0.05)) { fprintf(stderr,"fp8->i8blk relerr %.3e too large\n",rel); free(q.q);free(q.s); return 1; }
+
+    laguna_matmat_i8blk(Y,&q,X,R,C,N);
+    for (int n=0;n<N;n++){
+        laguna_matvec_i8blk(yq,&q,X+(size_t)n*C,R,C);
+        for (int r=0;r<R;r++){
+            float a=Y[(size_t)n*R+r], b=yq[r];
+            if (fabsf(a-b) > 1e-4f*(1+fabsf(b))) {
+                fprintf(stderr,"i8blk matmat tok %d row %d: %.6g vs %.6g\n",n,r,a,b);
+                free(q.q);free(q.s); return 1; }
+        }
+    }
+    fprintf(stderr,"  fp8->i8blk relerr vs exact e4m3 kernel = %.3e\n",rel);
+    free(q.q); free(q.s);
+    return 0;
+}
+#endif
+
 /* ============================ stage validation (unchanged) ============================ */
 typedef struct { uint64_t off; size_t bytes; char dtype[8]; int nd; long shape[5]; char name[320]; } ent;
 static int stage_check(const char *dir, int layers) {
@@ -140,7 +211,14 @@ static int stage_dtype_is_bf16(const laguna_stage *s, const char *name) {
     return 0;
 }
 
-static int stage_load(laguna_stage *s, const char *dir, int rank) {
+/* use_arena=1: copy the blob into anonymous memory with NUMA-local first-touch
+ * (required when weights are used IN PLACE, i.e. the bf16/int4 builds).
+ * use_arena=0: point straight at the mmap and skip the copy.  Valid only when
+ * every bandwidth-hot tensor is re-quantized at load into its own allocation
+ * (the fp8 build: experts -> int8-per-block, linears -> int8), which does its own
+ * NUMA-local first-touch.  Saves a full blob-sized allocation (17.8 GB for fp8),
+ * which is what makes room for the int8 copies on a 32 GB node. */
+static int stage_load(laguna_stage *s, const char *dir, int rank, int use_arena) {
     char mp[1200], bp[1200], line[1024];
     snprintf(mp,sizeof mp,"%s/rank%02d.manifest",dir,rank);
     snprintf(bp,sizeof bp,"%s/rank%02d.blob",dir,rank);
@@ -151,8 +229,13 @@ static int stage_load(laguna_stage *s, const char *dir, int rank) {
     if(fmap==MAP_FAILED){perror("mmap"); close(fd); fclose(f); return -1;}
     size_t nb=(size_t)sb.st_size;
     unsigned char *arena=NULL;
-    if(posix_memalign((void**)&arena,256,nb)!=0){fprintf(stderr,"arena alloc %.1f GB failed\n",nb/1e9);munmap((void*)fmap,nb);close(fd);fclose(f);return -1;}
-    s->blob=arena; s->blob_bytes=nb;
+    if (use_arena) {
+        if(posix_memalign((void**)&arena,256,nb)!=0){fprintf(stderr,"arena alloc %.1f GB failed\n",nb/1e9);munmap((void*)fmap,nb);close(fd);fclose(f);return -1;}
+        s->blob=arena;
+    } else {
+        s->blob=fmap;   /* mapping is retained for the process lifetime */
+    }
+    s->blob_bytes=nb;
     /* Parse the manifest first so the arena copy can first-touch each tensor with
      * the SAME per-row static schedule the matvecs use.  Copying the whole blob in
      * arbitrary chunks lands each tensor's pages on a CMG unrelated to the thread
@@ -182,6 +265,7 @@ static int stage_load(laguna_stage *s, const char *dir, int rank) {
      * avoids thousands of tiny omp-for dispatches that ballooned load time. */
     const size_t PG=(size_t)64<<10, BIG=(size_t)256<<10;
     long ne=s->n_ents;
+    if (!use_arena) { close(fd); return 0; }   /* no copy: read from the mapping */
 #ifdef _OPENMP
     #pragma omp parallel
 #endif
@@ -211,9 +295,36 @@ static int stage_load(laguna_stage *s, const char *dir, int rank) {
     return 0;
 }
 
-/* Load one linear weight from the stage.  int8 build: quantize bf16 -> per-row
- * W8 at load.  bf16 build (-DLAGUNA_BF16): point straight at the staged bf16. */
-#if defined(LAGUNA_BF16) || defined(LAGUNA_FP8)
+/* Bump allocator for re-quantized weights, handing out of big (1 GB) chunks.
+ *
+ * These MUST NOT be thousands of separate posix_memalign blocks.  Decode streams
+ * every byte of the quantized weights each token, and ~3000 mid-size mappings
+ * cost ~30% of decode versus the same bytes in a handful of large ones (measured:
+ * 13.7 -> 19.9 tok/s) -- the big contiguous mappings are what the OS backs with
+ * large pages, and at 13 GB streamed per token the TLB behaviour dominates.
+ * Kernel speed in isolation says nothing about this; the microbenchmarks reuse one
+ * small resident array and cannot see it.
+ *
+ * Chunks are never freed (process lifetime).  NUMA first-touch still comes from
+ * the quantization loops, which write each row from the thread that later reads it. */
+#define LAGUNA_QCHUNK ((size_t)1<<30)
+static unsigned char *g_qcur = NULL; static size_t g_qleft = 0;
+static void *qalloc(size_t n) {
+    n = (n + 255u) & ~(size_t)255u;
+    if (n > g_qleft) {
+        size_t want = n > LAGUNA_QCHUNK ? n : LAGUNA_QCHUNK;
+        void *p = mmap(NULL, want, PROT_READ|PROT_WRITE,
+                       MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) { fprintf(stderr,"FATAL: qalloc %.2f GB failed\n",want/1e9); exit(1); }
+        g_qcur = p; g_qleft = want;
+    }
+    void *r = g_qcur; g_qcur += n; g_qleft -= n; return r;
+}
+
+/* Load one linear weight from the stage.  int8 and fp8 builds: quantize bf16 ->
+ * per-row W8 at load.  bf16 build (-DLAGUNA_BF16): point straight at the staged
+ * bf16. */
+#if defined(LAGUNA_BF16)
 static laguna_lin stage_lin(const laguna_stage *s, const char *name, int rows, int cols) {
     (void)rows; (void)cols; return (laguna_lin)stage_req(s, name);
 }
@@ -221,12 +332,59 @@ static laguna_lin stage_lin(const laguna_stage *s, const char *name, int rows, i
 static laguna_lin stage_lin(const laguna_stage *s, const char *name, int rows, int cols) {
     const uint16_t *w = stage_req(s, name);
     laguna_w8 r;
-    if (posix_memalign((void**)&r.q, 256, (size_t)rows*cols) != 0 ||
-        posix_memalign((void**)&r.s, 256, (size_t)rows*sizeof(float)) != 0) {
-        fprintf(stderr, "FATAL: W8 alloc failed for %s\n", name); exit(1);
-    }
+    r.q = qalloc((size_t)rows*cols);
+    r.s = qalloc((size_t)rows*sizeof(float));
     laguna_quant_w8(r.q, r.s, w, rows, cols);
     return r;
+}
+#endif
+
+#if defined(LAGUNA_FP8)
+/* LAGUNA_FP8_EXACT=1 keeps the exact e4m3 LUT-gather kernels (A/B reference)
+ * instead of the int8-per-block re-quantization. */
+static int g_fp8_exact = 0;
+static void alloc_w8b(laguna_w8b *w, int rows, int cols) {
+    int cblk = cols/LAGUNA_FP8_BLK;
+    w->q = qalloc((size_t)rows*cols);
+    w->s = qalloc((size_t)rows*cblk*sizeof(float));
+}
+#endif
+
+#if defined(LAGUNA_FP8)
+/* Once every hot tensor has been re-quantized, the blob is dead weight -- but as a
+ * mapping its pages stay in the page cache, and 17.8 GB of those alongside ~13 GB
+ * of int8 weights does not fit a 32 GB node.  The kernel then evicts exactly the
+ * pages the still-bf16 norms live on, and decode faults them back from local SSD
+ * on EVERY token.  Chunked prefill barely notices (one fault amortized over 256
+ * tokens); decode lost ~45% (17.2 -> 9.8 tok/s) before this.
+ * So: copy the few tensors that stay bf16 (embed + norms, ~620 MB) into anonymous
+ * memory and unmap the blob. */
+static const void *dup_blob(const void *p, size_t bytes) {
+    void *q = malloc(bytes);
+    if (!q) { fprintf(stderr,"FATAL: dup_blob %zu bytes failed\n",bytes); exit(1); }
+    memcpy(q, p, bytes);
+    return q;
+}
+static void fp8_release_blob(laguna_model *m, laguna_stage *s) {
+    if (g_fp8_exact || !s->blob) return;      /* EXACT mode reads e4m3 bytes hot */
+    size_t H = LAGUNA_HIDDEN, hd = LAGUNA_HEAD_DIM;
+    m->embed      = dup_blob(m->embed, (size_t)LAGUNA_VOCAB*H*sizeof(uint16_t));
+    m->final_norm = dup_blob(m->final_norm, H*sizeof(uint16_t));
+    for (int L = 0; L < m->n_layers; ++L) {
+        laguna_layer *ly = &m->layers[L];
+        ly->in_ln   = dup_blob(ly->in_ln,   H*sizeof(uint16_t));
+        ly->post_ln = dup_blob(ly->post_ln, H*sizeof(uint16_t));
+        ly->q_norm  = dup_blob(ly->q_norm,  hd*sizeof(uint16_t));
+        ly->k_norm  = dup_blob(ly->k_norm,  hd*sizeof(uint16_t));
+        for (int e = 0; e < LAGUNA_EXPERTS; ++e) {   /* e4m3 sources now dead */
+            laguna_expert *ex = &ly->experts[e];
+            ex->gate = ex->up = ex->down = NULL;
+            ex->gs = ex->us = ex->ds = NULL;
+        }
+    }
+    munmap((void*)s->blob, s->blob_bytes);
+    s->blob = NULL; s->blob_bytes = 0;
+    free(s->ents); s->ents = NULL; s->n_ents = 0;
 }
 #endif
 
@@ -238,6 +396,7 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
     memset(m,0,sizeof *m);
 #if defined(LAGUNA_FP8)
     laguna_fp8_init_lut();
+    { const char *e=getenv("LAGUNA_FP8_EXACT"); g_fp8_exact = e && atoi(e); }
 #endif
     m->n_layers=n_layers; m->max_pos=max_pos; m->ep_rank=rank; m->ep_size=ep_size;
     m->embed      = stage_req(s,"model.embed_tokens.weight");
@@ -290,6 +449,14 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.up_proj.weight_scale",  L,e); ex->us  =stage_req(s,nm);
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.down_proj.weight",      L,e); ex->down=stage_req(s,nm);
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.down_proj.weight_scale",L,e); ex->ds  =stage_req(s,nm);
+                if (!g_fp8_exact) {
+                    /* Re-quantize e4m3 -> int8 per 128-col block (halves the bytes and
+                     * drops the LUT gather; see laguna_fp8_to_i8blk). */
+                    int inter=LAGUNA_EXPERT_INTER;
+                    alloc_w8b(&ex->qg, inter, H); laguna_fp8_to_i8blk(&ex->qg, ex->gate, ex->gs, inter, H);
+                    alloc_w8b(&ex->qu, inter, H); laguna_fp8_to_i8blk(&ex->qu, ex->up,   ex->us, inter, H);
+                    alloc_w8b(&ex->qd, H, inter); laguna_fp8_to_i8blk(&ex->qd, ex->down, ex->ds, H, inter);
+                }
 #elif defined(LAGUNA_BF16)
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.gate_proj.weight",L,e); ex->gate=stage_req(s,nm);
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.up_proj.weight",  L,e); ex->up  =stage_req(s,nm);
@@ -312,17 +479,28 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
     int hf=LAGUNA_ROPE_FULL_DIM/2, hs=LAGUNA_ROPE_SLIDING_DIM/2;
     m->full_cos=malloc((size_t)max_pos*hf*sizeof(float)); m->full_sin=malloc((size_t)max_pos*hf*sizeof(float));
     m->swa_cos =malloc((size_t)max_pos*hs*sizeof(float)); m->swa_sin =malloc((size_t)max_pos*hs*sizeof(float));
+    if(!m->full_cos||!m->full_sin||!m->swa_cos||!m->swa_sin){
+        fprintf(stderr,"FATAL: rope table alloc failed for maxpos %d (%.2f GB)\n",
+                max_pos,(double)max_pos*(hf+hs)*2*sizeof(float)/1e9); exit(1); }
     laguna_build_rope_tables(m);
     /* Per-layer KV: full-attention layers keep the whole context; sliding layers
      * use a SLIDING_WINDOW ring buffer.  Keeps 128k KV at ~6.5 GB not ~26. */
     size_t kv_elems=0; int slot=LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM;
     for (int L=0; L<n_layers; ++L) {
-        int cap = m->layers[L].is_sliding ? LAGUNA_SLIDING_WINDOW : max_pos;
+        int cap = m->layers[L].is_sliding ? LAGUNA_SLIDING_CAP : max_pos;
         m->kv_cap[L]=cap; m->kv_off[L]=kv_elems; kv_elems += (size_t)cap*slot;
     }
     m->kcache=malloc(kv_elems*sizeof(uint16_t));
     m->vcache=malloc(kv_elems*sizeof(uint16_t));
-    if(!m->kcache||!m->vcache){ fprintf(stderr,"FATAL: KV cache alloc failed (%zu MB)\n",kv_elems*2*2/(1u<<20)); exit(1); }
+    if(!m->kcache||!m->vcache){
+        fprintf(stderr,"FATAL: KV cache alloc failed: maxpos %d needs %.2f GB "
+                "(%d full-attention layers x %d B/pos, %d sliding layers ringed at %d)\n",
+                max_pos, (double)kv_elems*2*sizeof(uint16_t)/1e9,
+                n_layers - n_layers*3/4, (int)((size_t)slot*2*sizeof(uint16_t)),
+                n_layers*3/4, LAGUNA_SLIDING_CAP);
+        exit(1); }
+    if (rank==0) fprintf(stderr,"  KV cache: %.2f GB for maxpos %d\n",
+                         (double)kv_elems*2*sizeof(uint16_t)/1e9, max_pos);
 }
 
 /* ============================ forward pass ============================ */
@@ -346,9 +524,15 @@ typedef struct {
     int   *rids;           /* [PCHUNK*ACTIVE] selected expert ids per token */
     float *rrw;            /* [PCHUNK*ACTIVE] routing weights */
     float *xe, *ye;        /* [PCHUNK*hidden] gathered expert in/out */
+    float *crouter;        /* [PCHUNK*EXPERTS] batched router logits */
 } laguna_scratch;
 
 #define LAGUNA_PCHUNK 256
+/* attention_slide_flash writes a whole chunk's K/V before any of the chunk's
+ * queries attend, so the sliding ring must hold the window plus the chunk. */
+_Static_assert(LAGUNA_SLIDING_CAP >= LAGUNA_SLIDING_WINDOW + LAGUNA_PCHUNK - 1,
+               "sliding ring too small for LAGUNA_PCHUNK: chunk writes would clobber "
+               "slots the chunk's own earlier queries still need");
 static void scratch_alloc(laguna_scratch *sc, int max_pos) {
     { int C=LAGUNA_PCHUNK, H=LAGUNA_HIDDEN;
       sc->cn1=malloc((size_t)C*H*sizeof(float));   sc->cn2=malloc((size_t)C*H*sizeof(float));
@@ -365,7 +549,8 @@ static void scratch_alloc(laguna_scratch *sc, int max_pos) {
       sc->fl=malloc((size_t)LAGUNA_MAX_HEADS*C*sizeof(float));
       sc->facc=malloc((size_t)LAGUNA_MAX_HEADS*C*LAGUNA_HEAD_DIM*sizeof(float));
       sc->rids=malloc((size_t)C*LAGUNA_ACTIVE*sizeof(int)); sc->rrw=malloc((size_t)C*LAGUNA_ACTIVE*sizeof(float));
-      sc->xe=malloc((size_t)C*H*sizeof(float)); sc->ye=malloc((size_t)C*H*sizeof(float)); }
+      sc->xe=malloc((size_t)C*H*sizeof(float)); sc->ye=malloc((size_t)C*H*sizeof(float));
+      sc->crouter=malloc((size_t)C*LAGUNA_EXPERTS*sizeof(float)); }
     sc->n1=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->n2=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->qf=malloc((size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
@@ -380,6 +565,18 @@ static void scratch_alloc(laguna_scratch *sc, int max_pos) {
     sc->shared=malloc(LAGUNA_HIDDEN*sizeof(float));
     sc->logits=malloc(LAGUNA_VOCAB*sizeof(float));
     sc->scores=malloc((size_t)LAGUNA_MAX_HEADS*max_pos*sizeof(float));
+    /* scores is the only maxpos-sized scratch; at 128k it is ~38 MB.  Check it and
+     * the chunk buffers explicitly -- a long-context run that silently gets NULL
+     * here segfaults deep inside attention instead of reporting the real problem. */
+    if(!sc->scores||!sc->cn1||!sc->cn2||!sc->cq||!sc->ck||!sc->cv||!sc->cg||!sc->cao||
+       !sc->cattn||!sc->cia||!sc->cib||!sc->cpart||!sc->cshared||!sc->fm||!sc->fl||
+       !sc->facc||!sc->rids||!sc->rrw||!sc->xe||!sc->ye||!sc->crouter||
+       !sc->n1||!sc->n2||!sc->qf||!sc->kf||!sc->vf||!sc->gf||!sc->ao||!sc->attn_out||
+       !sc->inter_a||!sc->inter_b||!sc->partial||!sc->shared||!sc->logits){
+        fprintf(stderr,"FATAL: scratch alloc failed (maxpos %d, scores %.2f GB)\n",
+                max_pos,(double)LAGUNA_MAX_HEADS*max_pos*sizeof(float)/1e9);
+        exit(1);
+    }
 }
 
 /* Attention for one token at `pos`. `x` is input_layernorm output (n1). Writes attn_out. */
@@ -399,12 +596,118 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
         svfloat32_t a = svmul_f32_x(pg, svld1_f32(pg,acc+d), scv);
         svst1_f32(pg, acc+d, svmla_f32_x(pg, a, sp, laguna_ld_bf16(pg,v+d))); }
 }
+
+/* ---- run-based attention inner loops (head_dim == 8 vectors at VL=16) ----
+ * These replace per-key laguna_qkdot / laguna_vaxpy calls over a CONTIGUOUS run of
+ * key slots.  Two things dominate attention at long context and both are fixed by
+ * keeping state in registers across the run:
+ *   qk : one accumulator per dot is an 8-long serial FMLA chain (~9-cycle latency
+ *        each).  Four keys at a time with two accumulators each gives 8 independent
+ *        chains of depth 4, and q stays in registers instead of being re-read.
+ *   av : the old laguna_vaxpy read AND wrote all 128 floats of acc for every key --
+ *        1 KB of traffic per 256-byte V row.  Holding acc in 8 registers for the
+ *        whole run removes that entirely.
+ * hd is always LAGUNA_HEAD_DIM (128); the generic path is kept as a fallback. */
+#define LAGUNA_AV_NV 8      /* 128 / 16 */
+static inline int laguna_run_ok(int hd) { return hd == LAGUNA_AV_NV*(int)svcntw(); }
+
+/* sco[i] = dot(q, k[i]) * scale, for i in [0,n), keys at k + i*kvstride */
+static inline void laguna_qk_run(float *restrict sco, const float *restrict q,
+                                 const uint16_t *restrict k, int kvstride,
+                                 int n, float scale, int hd) {
+    if (!laguna_run_ok(hd)) {
+        for (int i=0;i<n;++i) sco[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
+        return;
+    }
+    svbool_t pt=svptrue_b32(); int VL=(int)svcntw();
+    svfloat32_t q0=svld1_f32(pt,q+0*VL),q1=svld1_f32(pt,q+1*VL),
+                q2=svld1_f32(pt,q+2*VL),q3=svld1_f32(pt,q+3*VL),
+                q4=svld1_f32(pt,q+4*VL),q5=svld1_f32(pt,q+5*VL),
+                q6=svld1_f32(pt,q+6*VL),q7=svld1_f32(pt,q+7*VL);
+    int i=0;
+    for (; i+4<=n; i+=4) {
+        const uint16_t *k0=k+(size_t)(i+0)*kvstride,*k1=k+(size_t)(i+1)*kvstride,
+                       *k2=k+(size_t)(i+2)*kvstride,*k3=k+(size_t)(i+3)*kvstride;
+        svfloat32_t a0=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k0+0*VL));
+        svfloat32_t b0=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k0+4*VL));
+        svfloat32_t a1=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k1+0*VL));
+        svfloat32_t b1=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k1+4*VL));
+        svfloat32_t a2=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k2+0*VL));
+        svfloat32_t b2=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k2+4*VL));
+        svfloat32_t a3=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k3+0*VL));
+        svfloat32_t b3=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k3+4*VL));
+        a0=svmla_f32_x(pt,a0,q1,laguna_ld_bf16(pt,k0+1*VL)); b0=svmla_f32_x(pt,b0,q5,laguna_ld_bf16(pt,k0+5*VL));
+        a1=svmla_f32_x(pt,a1,q1,laguna_ld_bf16(pt,k1+1*VL)); b1=svmla_f32_x(pt,b1,q5,laguna_ld_bf16(pt,k1+5*VL));
+        a2=svmla_f32_x(pt,a2,q1,laguna_ld_bf16(pt,k2+1*VL)); b2=svmla_f32_x(pt,b2,q5,laguna_ld_bf16(pt,k2+5*VL));
+        a3=svmla_f32_x(pt,a3,q1,laguna_ld_bf16(pt,k3+1*VL)); b3=svmla_f32_x(pt,b3,q5,laguna_ld_bf16(pt,k3+5*VL));
+        a0=svmla_f32_x(pt,a0,q2,laguna_ld_bf16(pt,k0+2*VL)); b0=svmla_f32_x(pt,b0,q6,laguna_ld_bf16(pt,k0+6*VL));
+        a1=svmla_f32_x(pt,a1,q2,laguna_ld_bf16(pt,k1+2*VL)); b1=svmla_f32_x(pt,b1,q6,laguna_ld_bf16(pt,k1+6*VL));
+        a2=svmla_f32_x(pt,a2,q2,laguna_ld_bf16(pt,k2+2*VL)); b2=svmla_f32_x(pt,b2,q6,laguna_ld_bf16(pt,k2+6*VL));
+        a3=svmla_f32_x(pt,a3,q2,laguna_ld_bf16(pt,k3+2*VL)); b3=svmla_f32_x(pt,b3,q6,laguna_ld_bf16(pt,k3+6*VL));
+        a0=svmla_f32_x(pt,a0,q3,laguna_ld_bf16(pt,k0+3*VL)); b0=svmla_f32_x(pt,b0,q7,laguna_ld_bf16(pt,k0+7*VL));
+        a1=svmla_f32_x(pt,a1,q3,laguna_ld_bf16(pt,k1+3*VL)); b1=svmla_f32_x(pt,b1,q7,laguna_ld_bf16(pt,k1+7*VL));
+        a2=svmla_f32_x(pt,a2,q3,laguna_ld_bf16(pt,k2+3*VL)); b2=svmla_f32_x(pt,b2,q7,laguna_ld_bf16(pt,k2+7*VL));
+        a3=svmla_f32_x(pt,a3,q3,laguna_ld_bf16(pt,k3+3*VL)); b3=svmla_f32_x(pt,b3,q7,laguna_ld_bf16(pt,k3+7*VL));
+        sco[i+0]=svaddv_f32(pt,svadd_f32_x(pt,a0,b0))*scale;
+        sco[i+1]=svaddv_f32(pt,svadd_f32_x(pt,a1,b1))*scale;
+        sco[i+2]=svaddv_f32(pt,svadd_f32_x(pt,a2,b2))*scale;
+        sco[i+3]=svaddv_f32(pt,svadd_f32_x(pt,a3,b3))*scale;
+    }
+    for (; i<n; ++i) {
+        const uint16_t *ki=k+(size_t)i*kvstride;
+        svfloat32_t a=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,ki+0*VL));
+        svfloat32_t b=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,ki+4*VL));
+        a=svmla_f32_x(pt,a,q1,laguna_ld_bf16(pt,ki+1*VL)); b=svmla_f32_x(pt,b,q5,laguna_ld_bf16(pt,ki+5*VL));
+        a=svmla_f32_x(pt,a,q2,laguna_ld_bf16(pt,ki+2*VL)); b=svmla_f32_x(pt,b,q6,laguna_ld_bf16(pt,ki+6*VL));
+        a=svmla_f32_x(pt,a,q3,laguna_ld_bf16(pt,ki+3*VL)); b=svmla_f32_x(pt,b,q7,laguna_ld_bf16(pt,ki+7*VL));
+        sco[i]=svaddv_f32(pt,svadd_f32_x(pt,a,b))*scale;
+    }
+}
+
+/* acc[d] = acc[d]*corr + sum_i w[i]*v[i][d], keys at v + i*kvstride */
+static inline void laguna_av_run(float *restrict acc, const float *restrict w,
+                                 const uint16_t *restrict v, int kvstride,
+                                 int n, float corr, int hd) {
+    if (!laguna_run_ok(hd)) {
+        for (int i=0;i<n;++i) laguna_vaxpy(acc, v+(size_t)i*kvstride, w[i], i==0?corr:1.0f, hd);
+        return;
+    }
+    svbool_t pt=svptrue_b32(); int VL=(int)svcntw();
+    svfloat32_t c=svdup_f32(corr);
+    svfloat32_t a0=svmul_f32_x(pt,svld1_f32(pt,acc+0*VL),c),a1=svmul_f32_x(pt,svld1_f32(pt,acc+1*VL),c),
+                a2=svmul_f32_x(pt,svld1_f32(pt,acc+2*VL),c),a3=svmul_f32_x(pt,svld1_f32(pt,acc+3*VL),c),
+                a4=svmul_f32_x(pt,svld1_f32(pt,acc+4*VL),c),a5=svmul_f32_x(pt,svld1_f32(pt,acc+5*VL),c),
+                a6=svmul_f32_x(pt,svld1_f32(pt,acc+6*VL),c),a7=svmul_f32_x(pt,svld1_f32(pt,acc+7*VL),c);
+    for (int i=0;i<n;++i) {
+        const uint16_t *vi=v+(size_t)i*kvstride; svfloat32_t p=svdup_f32(w[i]);
+        a0=svmla_f32_x(pt,a0,p,laguna_ld_bf16(pt,vi+0*VL));
+        a1=svmla_f32_x(pt,a1,p,laguna_ld_bf16(pt,vi+1*VL));
+        a2=svmla_f32_x(pt,a2,p,laguna_ld_bf16(pt,vi+2*VL));
+        a3=svmla_f32_x(pt,a3,p,laguna_ld_bf16(pt,vi+3*VL));
+        a4=svmla_f32_x(pt,a4,p,laguna_ld_bf16(pt,vi+4*VL));
+        a5=svmla_f32_x(pt,a5,p,laguna_ld_bf16(pt,vi+5*VL));
+        a6=svmla_f32_x(pt,a6,p,laguna_ld_bf16(pt,vi+6*VL));
+        a7=svmla_f32_x(pt,a7,p,laguna_ld_bf16(pt,vi+7*VL));
+    }
+    svst1_f32(pt,acc+0*VL,a0); svst1_f32(pt,acc+1*VL,a1);
+    svst1_f32(pt,acc+2*VL,a2); svst1_f32(pt,acc+3*VL,a3);
+    svst1_f32(pt,acc+4*VL,a4); svst1_f32(pt,acc+5*VL,a5);
+    svst1_f32(pt,acc+6*VL,a6); svst1_f32(pt,acc+7*VL,a7);
+}
 #else
 static inline float laguna_qkdot(const float *q, const uint16_t *k, int hd) {
     float s=0; for(int d=0;d<hd;++d) s+=q[d]*laguna_bf16_to_f32(k[d]); return s;
 }
 static inline void laguna_vaxpy(float *acc, const uint16_t *v, float p, float corr, int hd) {
     for(int d=0;d<hd;++d) acc[d]=acc[d]*corr + p*laguna_bf16_to_f32(v[d]);
+}
+static inline void laguna_qk_run(float *sco, const float *q, const uint16_t *k,
+                                 int kvstride, int n, float scale, int hd) {
+    for (int i=0;i<n;++i) sco[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
+}
+static inline void laguna_av_run(float *acc, const float *w, const uint16_t *v,
+                                 int kvstride, int n, float corr, int hd) {
+    for (int i=0;i<n;++i) laguna_vaxpy(acc, v+(size_t)i*kvstride, w[i], i==0?corr:1.0f, hd);
 }
 #endif
 
@@ -448,7 +751,9 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
      * (the ring holds exactly those); full layers attend to all [0..pos]. */
     float scale=1.0f/sqrtf((float)hd);
     int kv_groups=nh/LAGUNA_KV_HEADS;
-    int lo = ly->is_sliding ? (pos-cap+1) : 0; if(lo<0)lo=0;
+    /* Attended range is the WINDOW, never the ring capacity (cap >= window, and
+     * they are no longer equal -- see LAGUNA_SLIDING_CAP). */
+    int lo = ly->is_sliding ? (pos-LAGUNA_SLIDING_WINDOW+1) : 0; if(lo<0)lo=0;
     /* Per-head attention, parallel over heads.  Two passes over the key range with
      * a per-head score buffer: (1) scores = q.k*scale, track max; (2) VECTORIZED
      * softmax exp (FEXPA) -- the O(context) prefill bottleneck; (3) weighted sum of
@@ -462,18 +767,17 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
         int kvh=h/kv_groups;
         float *sco=sc->scores+(size_t)h*m->max_pos;   /* this head's scores */
         int nkeys=pos-lo+1;
+        /* [lo,pos] is at most two contiguous slot runs (one if the ring doesn't
+         * wrap, which is always the case for full-attention layers). */
+        int s0=lo%cap, n1=cap-s0; if(n1>nkeys) n1=nkeys; int n2=nkeys-n1;
+        laguna_qk_run(sco,    q, kbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, scale, hd);
+        if(n2) laguna_qk_run(sco+n1, q, kbase+(size_t)kvh*hd, kvstride, n2, scale, hd);
         float mx=-INFINITY;
-        for (int i=0;i<nkeys;++i) {
-            size_t slot=(size_t)((lo+i)%cap)*kvstride+(size_t)kvh*hd;
-            float d=laguna_qkdot(q, kbase+slot, hd)*scale;
-            sco[i]=d; if(d>mx)mx=d;
-        }
+        for (int i=0;i<nkeys;++i) if(sco[i]>mx) mx=sco[i];
         float l_i=laguna_exp_shift_sum(sco, nkeys, mx);   /* sco[i]=exp(sco[i]-mx) */
         float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
-        for (int i=0;i<nkeys;++i) {
-            size_t slot=(size_t)((lo+i)%cap)*kvstride+(size_t)kvh*hd;
-            laguna_vaxpy(acc, vbase+slot, sco[i], 1.0f, hd);
-        }
+        laguna_av_run(acc, sco,    vbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, 0.0f, hd);
+        if(n2) laguna_av_run(acc, sco+n1, vbase+(size_t)kvh*hd, kvstride, n2, 1.0f, hd);
         float gate=laguna_softplus(gf[h]);
         float s=gate/l_i; float *o=ao+(size_t)h*hd;
         for(int d=0;d<hd;++d) o[d]=acc[d]*s;
@@ -497,7 +801,16 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
  * Amortizes KV bandwidth ~C x: for each key block, the C queries reuse it from
  * cache, so KV is read from HBM once instead of once per query.  Online (flash)
  * softmax with FEXPA exp; causal via a prefix pass [0,pos0) + a diagonal pass. */
+#ifndef LAGUNA_QT
+/* Query-tile size for the flash paths.  nh*ceil(C/QT) tasks must comfortably
+ * exceed the thread count or the tail round wastes most of the machine. */
+#define LAGUNA_QT 32
+#endif
+#ifndef LAGUNA_KB
+/* Key-block size for the flash paths.  K+V for one block is 2*KB*head_dim*2 bytes
+ * (64 KB at KB=128, i.e. the whole of A64FX's 64 KB L1D). */
 #define LAGUNA_KB 128
+#endif
 static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, laguna_scratch *sc,
                                  int layer, int pos0, int C, int nh,
                                  float *Q, float *K, float *V, float *G, float *AO) {
@@ -520,29 +833,36 @@ static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, 
             for(int d=0;d<hd;++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
             for(int d=0;d<hd;++d) vdst[h*hd+d]=laguna_f32_to_bf16(V[(size_t)c*kvstride+h*hd+d]); }
     }
-    /* 2. flash query-block, parallel over query heads */
+    /* 2. flash query-block, parallel over (head, query tile).
+     * Parallelising over heads alone leaves 47 threads running ceil(48/47)=2 rounds
+     * with the second round 1/47 utilised -- measured, 24 threads were as fast as 47.
+     * Tiling the queries gives nh*ntile tasks so every thread stays busy. */
+    int ntile=(C+LAGUNA_QT-1)/LAGUNA_QT;
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for collapse(2) schedule(dynamic,1)
 #endif
     for (int h=0;h<nh;++h) {
+      for (int t=0;t<ntile;++t) {
+        int cbeg=t*LAGUNA_QT, cend=cbeg+LAGUNA_QT; if(cend>C)cend=C;
         int kvh=h/kv_groups;
         float *fm=sc->fm+(size_t)h*C, *fl=sc->fl+(size_t)h*C, *acc=sc->facc+(size_t)h*C*hd;
-        for (int c=0;c<C;++c){ fm[c]=-INFINITY; fl[c]=0.0f; float *a=acc+(size_t)c*hd; for(int d=0;d<hd;++d)a[d]=0.0f; }
+        for (int c=cbeg;c<cend;++c){ fm[c]=-INFINITY; fl[c]=0.0f; float *a=acc+(size_t)c*hd; for(int d=0;d<hd;++d)a[d]=0.0f; }
         /* prefix keys [0, pos0): every query attends all -> block, reuse KV across C queries */
         for (int kb=0; kb<pos0; kb+=LAGUNA_KB) {
             int bn=pos0-kb; if(bn>LAGUNA_KB)bn=LAGUNA_KB;
-            for (int c=0;c<C;++c) {
+            for (int c=cbeg;c<cend;++c) {
                 const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float sb[LAGUNA_KB]; float bmax=-INFINITY;
-                for (int b=0;b<bn;++b){ float d=laguna_qkdot(q, kbase+(size_t)(kb+b)*kvstride+(size_t)kvh*hd, hd)*scale; sb[b]=d; if(d>bmax)bmax=d; }
+                laguna_qk_run(sb, q, kbase+(size_t)kb*kvstride+(size_t)kvh*hd, kvstride, bn, scale, hd);
+                for (int b=0;b<bn;++b) if(sb[b]>bmax) bmax=sb[b];
                 float m_old=fm[c], m_new=m_old>bmax?m_old:bmax, corr=expf(m_old-m_new);
                 float psum=laguna_exp_shift_sum(sb, bn, m_new);
                 fl[c]=fl[c]*corr+psum; float *a=acc+(size_t)c*hd;
-                for (int b=0;b<bn;++b) laguna_vaxpy(a, vbase+(size_t)(kb+b)*kvstride+(size_t)kvh*hd, sb[b], b==0?corr:1.0f, hd);
+                laguna_av_run(a, sb, vbase+(size_t)kb*kvstride+(size_t)kvh*hd, kvstride, bn, corr, hd);
                 fm[c]=m_new;
             }
         }
         /* diagonal keys [pos0, pos0+c]: causal within the chunk */
-        for (int c=0;c<C;++c) {
+        for (int c=cbeg;c<cend;++c) {
             const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float *a=acc+(size_t)c*hd;
             for (int j=0;j<=c;++j) {
                 float d=laguna_qkdot(q, kbase+(size_t)(pos0+j)*kvstride+(size_t)kvh*hd, hd)*scale;
@@ -552,8 +872,90 @@ static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, 
                 fm[c]=m_new;
             }
         }
-        for (int c=0;c<C;++c){ float gate=laguna_softplus(G[(size_t)c*nh+h]); float s=gate/fl[c];
+        for (int c=cbeg;c<cend;++c){ float gate=laguna_softplus(G[(size_t)c*nh+h]); float s=gate/fl[c];
             float *a=acc+(size_t)c*hd, *o=AO+(size_t)c*nh*hd+(size_t)h*hd; for(int d=0;d<hd;++d)o[d]=a[d]*s; }
+      }
+    }
+}
+
+/* Query-block flash attention for a chunk of C tokens on a SLIDING layer.
+ *
+ * The per-token path re-reads a 512-key window for every query, and consecutive
+ * queries' windows overlap by 511/512 -- so the same KV is pulled from memory ~C
+ * times per chunk.  Blocking over key positions and sweeping the C queries inside
+ * each block reads it once, exactly as attention_full_flash does for full layers.
+ *
+ * This requires writing the whole chunk's K/V before any query attends, which is
+ * why the sliding ring is LAGUNA_SLIDING_CAP (768) rather than the 512-wide window:
+ * at cap==window the chunk's own writes would clobber slots its earlier queries
+ * still need.  Key ranges are per query c: [pos0+c-511, pos0+c] (clamped at 0),
+ * so the union over the chunk is a band of C+511 positions. */
+static void attention_slide_flash(const laguna_model *m, const laguna_layer *ly,
+                                  laguna_scratch *sc, int layer, int pos0, int C, int nh,
+                                  float *Q, float *K, float *V, float *G, float *AO) {
+    int hd=LAGUNA_HEAD_DIM, kv_groups=nh/LAGUNA_KV_HEADS, kvstride=LAGUNA_KV_HEADS*hd;
+    int rot=LAGUNA_ROPE_SLIDING_DIM, half=rot/2;
+    int cap=m->kv_cap[layer], W=LAGUNA_SLIDING_WINDOW;
+    uint16_t *kbase=m->kcache+m->kv_off[layer], *vbase=m->vcache+m->kv_off[layer];
+    float scale=1.0f/sqrtf((float)hd);
+
+    /* 1. qk-norm + rope + write KV for the whole chunk (ring slot pos%cap) */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int c=0;c<C;++c) {
+        int pos=pos0+c;
+        const float *rc=m->swa_cos+(size_t)pos*half, *rs=m->swa_sin+(size_t)pos*half;
+        for (int h=0;h<nh;++h){ float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
+            laguna_rmsnorm(tmp,q,ly->q_norm,hd,LAGUNA_RMS_EPS); memcpy(q,tmp,sizeof tmp); laguna_rope_half(q,rc,rs,rot); }
+        uint16_t *kdst=kbase+(size_t)(pos%cap)*kvstride, *vdst=vbase+(size_t)(pos%cap)*kvstride;
+        for (int h=0;h<LAGUNA_KV_HEADS;++h){ float *k=K+(size_t)c*kvstride+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
+            laguna_rmsnorm(tmp,k,ly->k_norm,hd,LAGUNA_RMS_EPS); memcpy(k,tmp,sizeof tmp); laguna_rope_half(k,rc,rs,rot);
+            for(int d=0;d<hd;++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
+            for(int d=0;d<hd;++d) vdst[h*hd+d]=laguna_f32_to_bf16(V[(size_t)c*kvstride+h*hd+d]); }
+    }
+
+    /* 2. flash over key blocks, parallel over query heads */
+    int glo = pos0-(W-1); if(glo<0) glo=0;
+    int ghi = pos0+C-1;
+    int ntile=(C+LAGUNA_QT-1)/LAGUNA_QT;
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(dynamic,1)
+#endif
+    for (int h=0;h<nh;++h) {
+      for (int t=0;t<ntile;++t) {
+        int cbeg=t*LAGUNA_QT, cend=cbeg+LAGUNA_QT; if(cend>C)cend=C;
+        int kvh=h/kv_groups;
+        float *fm=sc->fm+(size_t)h*C, *fl=sc->fl+(size_t)h*C, *acc=sc->facc+(size_t)h*C*hd;
+        for (int c=cbeg;c<cend;++c){ fm[c]=-INFINITY; fl[c]=0.0f; float *a=acc+(size_t)c*hd; for(int d=0;d<hd;++d)a[d]=0.0f; }
+        for (int kb=glo; kb<=ghi; kb+=LAGUNA_KB) {
+            int kend = kb+LAGUNA_KB-1; if(kend>ghi) kend=ghi;
+            /* queries whose window intersects [kb,kend]: pos0+c-(W-1) <= kend and pos0+c >= kb */
+            int c0 = kb-pos0;            if(c0<cbeg) c0=cbeg;
+            int c1 = kend-pos0+(W-1);    if(c1>cend-1) c1=cend-1;
+            for (int c=c0;c<=c1;++c) {
+                int lo_c = pos0+c-(W-1); if(lo_c<0) lo_c=0;
+                int hi_c = pos0+c;
+                int js = kb>lo_c?kb:lo_c, je = kend<hi_c?kend:hi_c;
+                if (js>je) continue;
+                const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd;
+                float sb[LAGUNA_KB]; float bmax=-INFINITY; int n=je-js+1;
+                /* the ring makes [js,je] at most two contiguous slot runs */
+                int s0=js%cap, n1=cap-s0; if(n1>n) n1=n; int n2=n-n1;
+                laguna_qk_run(sb,    q, kbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, scale, hd);
+                if(n2) laguna_qk_run(sb+n1, q, kbase+(size_t)kvh*hd, kvstride, n2, scale, hd);
+                for (int b=0;b<n;++b) if(sb[b]>bmax) bmax=sb[b];
+                float m_old=fm[c], m_new=m_old>bmax?m_old:bmax, corr=expf(m_old-m_new);
+                float psum=laguna_exp_shift_sum(sb, n, m_new);
+                fl[c]=fl[c]*corr+psum; float *a=acc+(size_t)c*hd;
+                laguna_av_run(a, sb,    vbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, corr, hd);
+                if(n2) laguna_av_run(a, sb+n1, vbase+(size_t)kvh*hd, kvstride, n2, 1.0f, hd);
+                fm[c]=m_new;
+            }
+        }
+        for (int c=cbeg;c<cend;++c){ float gate=laguna_softplus(G[(size_t)c*nh+h]); float s=gate/fl[c];
+            float *a=acc+(size_t)c*hd, *o=AO+(size_t)c*nh*hd+(size_t)h*hd; for(int d=0;d<hd;++d)o[d]=a[d]*s; }
+      }
     }
 }
 
@@ -572,10 +974,18 @@ static void swiglu_lin(laguna_scratch *sc, const laguna_lin *gate_w, const lagun
 static void expert_mv(laguna_scratch *sc, const laguna_expert *ex, const float *x, float *out) {
     int inter=LAGUNA_EXPERT_INTER;
 #if defined(LAGUNA_FP8)
-    laguna_matvec_fp8blk(sc->inter_a, ex->gate, ex->gs, x, inter, LAGUNA_HIDDEN);
-    laguna_matvec_fp8blk(sc->inter_b, ex->up,   ex->us, x, inter, LAGUNA_HIDDEN);
-    for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
-    laguna_matvec_fp8blk(out, ex->down, ex->ds, sc->inter_a, LAGUNA_HIDDEN, inter);
+    if (g_fp8_exact) {
+        laguna_matvec_fp8blk(sc->inter_a, ex->gate, ex->gs, x, inter, LAGUNA_HIDDEN);
+        laguna_matvec_fp8blk(sc->inter_b, ex->up,   ex->us, x, inter, LAGUNA_HIDDEN);
+        for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
+        laguna_matvec_fp8blk(out, ex->down, ex->ds, sc->inter_a, LAGUNA_HIDDEN, inter);
+    } else {
+        float *ys[2]={sc->inter_a, sc->inter_b};
+        const laguna_w8b *ws[2]={&ex->qg, &ex->qu};
+        laguna_matvec_i8blk_multi(ys, ws, 2, x, inter, LAGUNA_HIDDEN);  /* gate & up share x */
+        for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
+        laguna_matvec_i8blk(out, &ex->qd, sc->inter_a, LAGUNA_HIDDEN, inter);
+    }
 #elif defined(LAGUNA_BF16)
     laguna_matvec_bf16(sc->inter_a, ex->gate, x, inter, LAGUNA_HIDDEN);
     laguna_matvec_bf16(sc->inter_b, ex->up,   x, inter, LAGUNA_HIDDEN);
@@ -693,8 +1103,11 @@ static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, flo
         if (!ly->is_sliding) {
             /* full attention: query-block flash (amortizes KV bandwidth across the chunk) */
             attention_full_flash(m, ly, sc, L, pos0, C, nh, sc->cq, sc->ck, sc->cv, sc->cg, sc->cao);
+        } else if (C > 1) {
+            /* sliding: query-block flash (KV read once per block, not once per query) */
+            attention_slide_flash(m, ly, sc, L, pos0, C, nh, sc->cq, sc->ck, sc->cv, sc->cg, sc->cao);
         } else {
-            /* sliding: O(512)/query, per-token write-then-attend (ring, no clobber) */
+            /* single token: per-token write-then-attend (ring, no clobber) */
             for (int c=0;c<C;++c)
                 attention_core(m, ly, sc, L, pos0+c, nh,
                                sc->cq+(size_t)c*nh*hd, sc->ck+(size_t)c*LAGUNA_KV_HEADS*hd,
@@ -718,11 +1131,12 @@ static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, flo
         } else {
             _t=prof_now();
             for (long i=0;i<(long)C*H;++i) sc->cpart[i]=0.0f;
-            /* route all C tokens */
-            for (int c=0;c<C;++c) {
-                laguna_lin_mv(sc->logits, &ly->router_w, sc->cn2+(size_t)c*H, LAGUNA_EXPERTS, H);
-                laguna_top10(sc->logits, ly->router_bias, sc->rids+(size_t)c*LAGUNA_ACTIVE, sc->rrw+(size_t)c*LAGUNA_ACTIVE);
-            }
+            /* route all C tokens: one batched router GEMM (was C matvecs, i.e. C
+             * OpenMP fork/joins per MoE layer), then top-10 per token. */
+            laguna_lin_mm(sc->crouter, &ly->router_w, sc->cn2, LAGUNA_EXPERTS, H, C);
+            for (int c=0;c<C;++c)
+                laguna_top10(sc->crouter+(size_t)c*LAGUNA_EXPERTS, ly->router_bias,
+                             sc->rids+(size_t)c*LAGUNA_ACTIVE, sc->rrw+(size_t)c*LAGUNA_ACTIVE);
             double _te=prof_now();
 #if defined(LAGUNA_FP8)
             /* BATCHED experts: for each owned expert, gather its tokens and run one
@@ -735,10 +1149,17 @@ static void forward_prefill_chunk(const laguna_model *m, laguna_scratch *sc, flo
                     for (int k=0;k<LAGUNA_ACTIVE;++k) if(id[k]==e){ tok[ne]=c; wgt[ne]=sc->rrw[(size_t)c*LAGUNA_ACTIVE+k]; ne++; break; } }
                 if(ne==0) continue;
                 for (int i=0;i<ne;++i) memcpy(sc->xe+(size_t)i*H, sc->cn2+(size_t)tok[i]*H, (size_t)H*sizeof(float));
-                laguna_matmat_fp8blk(sc->cia, ex->gate, ex->gs, sc->xe, inter, H, ne);
-                laguna_matmat_fp8blk(sc->cib, ex->up,   ex->us, sc->xe, inter, H, ne);
-                for (long i=0;i<(long)ne*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
-                laguna_matmat_fp8blk(sc->ye, ex->down, ex->ds, sc->cia, H, inter, ne);
+                if (g_fp8_exact) {
+                    laguna_matmat_fp8blk(sc->cia, ex->gate, ex->gs, sc->xe, inter, H, ne);
+                    laguna_matmat_fp8blk(sc->cib, ex->up,   ex->us, sc->xe, inter, H, ne);
+                    for (long i=0;i<(long)ne*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
+                    laguna_matmat_fp8blk(sc->ye, ex->down, ex->ds, sc->cia, H, inter, ne);
+                } else {
+                    laguna_matmat_i8blk(sc->cia, &ex->qg, sc->xe, inter, H, ne);
+                    laguna_matmat_i8blk(sc->cib, &ex->qu, sc->xe, inter, H, ne);
+                    for (long i=0;i<(long)ne*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
+                    laguna_matmat_i8blk(sc->ye, &ex->qd, sc->cia, H, inter, ne);
+                }
                 for (int i=0;i<ne;++i){ float w=wgt[i]; float *pc=sc->cpart+(size_t)tok[i]*H; const float *ye=sc->ye+(size_t)i*H;
                     for (int d=0;d<H;++d) pc[d]+=w*ye[d]; }
             }
@@ -795,7 +1216,10 @@ static void usage(const char *n){
 
 int main(int argc, char **argv) {
     if (argc==2 && !strcmp(argv[1],"--self-test")) {
-        int rc=test_i4()|test_fht()|test_route()|test_i4_matvec();
+        int rc=test_i4()|test_fht()|test_route()|test_i4_matvec()|test_i8_matmat();
+#if defined(LAGUNA_FP8)
+        rc|=test_fp8_i8blk();
+#endif
         if(!rc)puts("Laguna S21 ABI self-test: PASS"); return rc;
     }
     if (argc==2 && !strcmp(argv[1],"--describe")) {

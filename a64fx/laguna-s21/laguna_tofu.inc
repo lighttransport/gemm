@@ -179,8 +179,18 @@ static int run_generate(int argc, char **argv){
 
     double t0=now_sec();
     laguna_stage st;
-    if(stage_load(&st,stage_dir,MyRank)!=0){ fprintf(stderr,"rank %d: stage load failed\n",MyRank); return 1; }
+    /* The fp8 build re-quantizes every hot tensor at load (experts -> int8-per-block,
+     * linears -> int8), so it needs no blob-sized arena -- except in FP8_EXACT mode,
+     * where the e4m3 expert bytes are read hot and want NUMA-local pages. */
+    int use_arena = 1;
+#if defined(LAGUNA_FP8)
+    { const char *e=getenv("LAGUNA_FP8_EXACT"); use_arena = (e && atoi(e)) ? 1 : 0; }
+#endif
+    if(stage_load(&st,stage_dir,MyRank,use_arena)!=0){ fprintf(stderr,"rank %d: stage load failed\n",MyRank); return 1; }
     laguna_model m; model_build(&m,&st,n_layers,maxpos,MyRank,N);
+#if defined(LAGUNA_FP8)
+    fp8_release_blob(&m,&st);   /* weights are re-quantized; drop the mapping */
+#endif
     laguna_scratch sc; scratch_alloc(&sc,maxpos);
     ar_thread_start();   /* dedicated comm core for overlapped allreduce */
     double t1=now_sec();
