@@ -22,7 +22,8 @@ enum {
     LAGUNA_DENSE_INTER = 12288, LAGUNA_SHARED_INTER = 1024,
     LAGUNA_FULL_HEADS = 48, LAGUNA_SLIDING_HEADS = 72,
     LAGUNA_ROPE_FULL_DIM = 64, LAGUNA_ROPE_SLIDING_DIM = 128,
-    LAGUNA_MAX_HEADS = 72
+    LAGUNA_MAX_HEADS = 72,
+    LAGUNA_MAX_BATCH = 16      /* concurrent sequences the serve path can step together */
 };
 #define LAGUNA_RMS_EPS      1e-6f
 #define LAGUNA_ROUTED_SCALE 2.5f
@@ -925,6 +926,11 @@ typedef struct {
     uint16_t *kcache, *vcache;
     size_t kv_off[LAGUNA_LAYERS];     /* element offset of each layer's KV block */
     int    kv_cap[LAGUNA_LAYERS];     /* capacity: max_pos (full) or window (sliding) */
+    /* Batched serving keeps n_seq independent caches back to back, so sequence s
+     * starts at s*kv_seq_stride.  n_seq==1 for --generate, and every existing
+     * single-sequence call site passes seq=0 and is unaffected. */
+    size_t kv_seq_stride;
+    int    n_seq;
 } laguna_model;
 
 static inline void laguna_build_rope_tables(laguna_model *m) {

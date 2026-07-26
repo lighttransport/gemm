@@ -25,6 +25,7 @@
  * does the chat templating and tokenisation on the client side.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -33,6 +34,7 @@
 #define LSRV_MAX_PROMPT   262144        /* ids per request */
 #define LSRV_HDR          12            /* control words ahead of the ids */
 #define LSRV_REQ_BODY_MAX (64u<<20)
+#define LSRV_MAX_SLOTS    16            /* concurrent sequences (--max-batch) */
 
 /* ---- tiny JSON scanners (only the shapes this API accepts) ---- */
 static const char *ljs_find(const char *s, const char *key) {
@@ -122,7 +124,7 @@ static int lsrv_listen(int port) {
     struct sockaddr_in a; memset(&a,0,sizeof a);
     a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons((uint16_t)port);
     if (bind(fd,(struct sockaddr*)&a,sizeof a) != 0) { perror("bind"); close(fd); return -1; }
-    if (listen(fd, 16) != 0) { perror("listen"); close(fd); return -1; }
+    if (listen(fd, 64) != 0) { perror("listen"); close(fd); return -1; }
     return fd;
 }
 static void lsrv_write_all(int fd, const char *p, size_t n) {
@@ -163,146 +165,205 @@ static char *lsrv_read_request(int fd, char **body_out) {
     return buf;
 }
 
+#include "laguna_batch.inc"
+
 /* ---- the serve loop ---- */
+/* Parse one HTTP request on rank 0 into a free slot.  Returns 1 if the slot was
+ * filled and should be admitted, 0 if the connection was already answered
+ * (health / error) and needs no compute. */
+static int lsrv_accept_into(lbat_slot *s, int cfd, char *raw, char *body,
+                            int maxpos, int nranks, int nlayers,
+                            laguna_sampler defaults) {
+    if (!strncmp(raw,"GET /health",11)) {
+        char b[192];
+        snprintf(b,sizeof b,"{\"status\":\"ok\",\"ranks\":%d,\"maxpos\":%d,\"layers\":%d}",
+                 nranks, maxpos, nlayers);
+        lsrv_respond(cfd,200,"OK",b); return 0;
+    }
+    if (strncmp(raw,"POST /generate",14)) {
+        lsrv_respond(cfd,400,"Bad Request",
+                     "{\"error\":\"unknown endpoint; use GET /health or POST /generate\"}");
+        return 0;
+    }
+    int n = ljs_ids(body, s->ids, maxpos);
+    if (n <= 0) {
+        lsrv_respond(cfd,400,"Bad Request","{\"error\":\"missing or malformed ids array\"}");
+        return 0;
+    }
+    s->smp = defaults;
+    s->max_new       = (int)ljs_num(body,"max_new",32);
+    s->smp.do_sample = (int)ljs_num(body,"sample",defaults.do_sample);
+    s->smp.temp      = (float)ljs_num(body,"temp", defaults.temp);
+    s->smp.top_k     = (int)ljs_num(body,"top_k",defaults.top_k);
+    s->smp.top_p     = (float)ljs_num(body,"top_p",defaults.top_p);
+    s->smp.min_p     = (float)ljs_num(body,"min_p",defaults.min_p);
+    s->smp.rng       = (uint64_t)ljs_num(body,"seed",(double)defaults.rng);
+    if (s->max_new < 1) s->max_new = 1;
+    if (n + s->max_new > maxpos) {
+        lsrv_respond(cfd,400,"Bad Request",
+                     "{\"error\":\"prompt + max_new exceeds the server's --maxpos\"}");
+        return 0;
+    }
+    s->n_prompt = n; s->fd = cfd; s->pos = 0; s->ngen = 0; s->hit_eos = 0;
+    return 1;
+}
+
+static void lsrv_finish(lbat_slot *s, double t_now, long disagree) {
+    if (s->fd < 0) { s->active = 0; return; }
+    size_t cap = (size_t)s->ngen*8 + 512;
+    char *b = malloc(cap);
+    if (b) {
+        double pf = s->t_prefill_done > s->t_admit ? s->n_prompt/(s->t_prefill_done-s->t_admit) : 0.0;
+        double dt = t_now > s->t_prefill_done ? s->ngen/(t_now-s->t_prefill_done) : 0.0;
+        int k = snprintf(b, cap, "{\"n\":%d,\"stop\":\"%s\",\"lockstep_disagree\":%ld,"
+                "\"prefill_tok_s\":%.2f,\"decode_tok_s\":%.2f,\"ids\":[",
+                s->ngen, s->hit_eos?"eos":"length", disagree, pf, dt);
+        for (int i=0;i<s->ngen && k < (int)cap-16; ++i)
+            k += snprintf(b+k, cap-(size_t)k, i?",%d":"%d", s->gen[i]);
+        k += snprintf(b+k, cap-(size_t)k, "]}");
+        lsrv_respond(s->fd, 200, "OK", b);
+        free(b);
+    } else lsrv_respond(s->fd, 500, "Internal Server Error", "{\"error\":\"oom\"}");
+    close(s->fd); s->fd = -1; s->active = 0;
+}
+
 static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
-                    laguna_sampler defaults) {
+                    laguna_sampler defaults, int max_batch) {
     int listen_fd = -1;
     if (MyRank == 0) {
         listen_fd = lsrv_listen(port);
-        if (listen_fd < 0) { fprintf(stderr,"FATAL: cannot listen on port %d\n", port); }
-        else logmsg("serving HTTP on port %d (maxpos %d, %d ranks)\n", port, maxpos, N);
+        if (listen_fd < 0) fprintf(stderr,"FATAL: cannot listen on port %d\n", port);
+        else logmsg("serving HTTP on port %d (maxpos %d, %d ranks, max batch %d)\n",
+                    port, maxpos, N, max_batch);
     }
-    /* a listen failure on rank 0 must stop every rank, not just rank 0 */
     { lsrv_req probe = { .quit = (MyRank==0 && listen_fd<0) ? 1 : 0,
                          .n_prompt = 0, .max_new = 0, .smp = defaults };
       static int dummy_ids[1];
       lsrv_bcast(&probe, dummy_ids);
       if (probe.quit) return 2; }
 
-    int *ids = laguna_xalloc((size_t)LSRV_MAX_PROMPT*sizeof(int), &g_mem_other, "serve prompt ids");
-    int *gen = laguna_xalloc((size_t)LSRV_MAX_PROMPT*sizeof(int), &g_mem_other, "serve output ids");
-    float *x = laguna_xalloc(LAGUNA_HIDDEN*sizeof(float), &g_mem_other, "serve activation");
+    lbat_state B; lbat_init(&B, max_batch, maxpos);
+    float *x  = laguna_xalloc(LAGUNA_HIDDEN*sizeof(float), &g_mem_other, "serve activation");
     float *Xc = laguna_xalloc((size_t)LAGUNA_PCHUNK*LAGUNA_HIDDEN*sizeof(float),
                               &g_mem_other, "serve chunk activations");
     const int eos0 = 2, eos1 = 24;
+    long disagree = 0;
+    int shutting_down = 0;
 
     for (;;) {
-        int cfd = -1; char *raw = NULL, *body = NULL;
-        lsrv_req req = { .quit=0, .n_prompt=0, .max_new=0, .smp=defaults };
-        int bad = 0, answered = 0; const char *bad_msg = NULL;
+        lbat_step st; memset(&st, 0, sizeof st);
 
         if (MyRank == 0) {
-            struct sockaddr_in ca; socklen_t cl = sizeof ca;
-            cfd = accept(listen_fd, (struct sockaddr*)&ca, &cl);
-            if (cfd < 0) { if (errno==EINTR) continue; perror("accept"); req.quit = 1; }
-            else {
+            /* Admit whatever is waiting into free slots.  Block on accept() only
+             * when the batch is empty, so an idle server does not spin and a busy
+             * one never stalls a step waiting for a new client. */
+            int nactive = 0;
+            for (int i=0;i<B.nslot;i++) if (B.slot[i].active) nactive++;
+            for (;;) {
+                int free_slot = -1;
+                for (int i=0;i<B.nslot;i++) if (!B.slot[i].active) { free_slot = i; break; }
+                if (free_slot < 0) break;
+                int fl = fcntl(listen_fd, F_GETFL, 0);
+                fcntl(listen_fd, F_SETFL, nactive ? (fl|O_NONBLOCK) : (fl&~O_NONBLOCK));
+                int cfd = accept(listen_fd, NULL, NULL);
+                if (cfd < 0) break;                       /* nothing pending */
                 int one=1; setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-                raw = lsrv_read_request(cfd, &body);
-                if (!raw) { bad=1; bad_msg="could not read request"; }
-                else if (!strncmp(raw,"GET /health",11)) {
-                    char b[256];
-                    snprintf(b,sizeof b,"{\"status\":\"ok\",\"ranks\":%d,\"maxpos\":%d,\"layers\":%d}",
-                             N, maxpos, m->n_layers);
-                    lsrv_respond(cfd,200,"OK",b);
-                    answered = 1;   /* still falls through to the broadcast below */
-                }
-                else if (!strncmp(raw,"POST /shutdown",14)) {
+                char *body=NULL; char *raw = lsrv_read_request(cfd, &body);
+                if (!raw) { close(cfd); continue; }
+                if (!strncmp(raw,"POST /shutdown",14)) {
                     lsrv_respond(cfd,200,"OK","{\"status\":\"stopping\"}");
-                    close(cfd); free(raw); raw=NULL; req.quit = 1;
+                    close(cfd); free(raw); shutting_down = 1; break;
                 }
-                else if (strncmp(raw,"POST /generate",14)) {
-                    bad=1; bad_msg="unknown endpoint; use GET /health or POST /generate";
-                }
-                else {
-                    int n = ljs_ids(body, ids, LSRV_MAX_PROMPT);
-                    if (n <= 0) { bad=1; bad_msg="missing or malformed ids array"; }
-                    else {
-                        req.n_prompt = n;
-                        req.max_new  = (int)ljs_num(body,"max_new",32);
-                        req.smp.do_sample = (int)ljs_num(body,"sample",defaults.do_sample);
-                        req.smp.temp  = (float)ljs_num(body,"temp", defaults.temp);
-                        req.smp.top_k = (int)ljs_num(body,"top_k",defaults.top_k);
-                        req.smp.top_p = (float)ljs_num(body,"top_p",defaults.top_p);
-                        req.smp.min_p = (float)ljs_num(body,"min_p",defaults.min_p);
-                        req.smp.rng   = (uint64_t)ljs_num(body,"seed",(double)defaults.rng);
-                        if (req.max_new < 1) req.max_new = 1;
-                        if (n + req.max_new > maxpos) {
-                            bad=1; bad_msg="prompt + max_new exceeds the server's --maxpos";
-                        }
-                    }
-                }
-                if (bad) { req.n_prompt = 0; req.max_new = 0; }
+                lbat_slot *s = &B.slot[free_slot];
+                int admit = lsrv_accept_into(s, cfd, raw, body, maxpos, N, m->n_layers, defaults);
+                free(raw);
+                if (!admit) { close(cfd); continue; }
+                s->active = 1; s->t_admit = now_sec();
+                st.adm_slot[st.n_admit] = free_slot;
+                st.adm_len[st.n_admit]  = s->n_prompt;
+                st.n_admit++;
+                nactive++;
             }
-        }
-        /* every rank learns the request (or the quit/no-op) together */
-        if (lsrv_bcast(&req, ids) != 0) { req.quit = 1; }
-        if (req.quit) {
-            if (cfd >= 0) close(cfd);
-            free(raw);
-            break;
-        }
-        if (req.n_prompt == 0) {          /* health check, or rejected: no compute */
-            if (MyRank == 0 && cfd >= 0) {
-                if (!answered) {
-                    char b[256];
-                    snprintf(b,sizeof b,"{\"error\":\"%s\"}", bad_msg ? bad_msg : "bad request");
-                    lsrv_respond(cfd,400,"Bad Request",b);
-                }
-                close(cfd);
+            /* everything already running steps this round */
+            for (int i=0;i<B.nslot;i++) {
+                if (!B.slot[i].active) continue;
+                int newly = 0;
+                for (int j=0;j<st.n_admit;j++) if (st.adm_slot[j]==i) newly=1;
+                if (newly) continue;
+                st.act_slot[st.n_active] = i;
+                st.act_pos[st.n_active]  = B.slot[i].pos;
+                st.n_active++;
             }
-            free(raw);
-            continue;
+            st.quit = shutting_down && st.n_active==0 && st.n_admit==0;
         }
 
-        /* ---- identical compute on every rank ---- */
-        double t0 = now_sec();
-        int nprefill = req.n_prompt - 1, p = 0, nan_total = 0;
-        for (; p + 1 <= nprefill; ) {
-            int C = nprefill - p; if (C > LAGUNA_PCHUNK) C = LAGUNA_PCHUNK; if (C <= 0) break;
-            for (int c=0;c<C;++c) embed_token(m, ids[p+c], Xc+(size_t)c*LAGUNA_HIDDEN);
-            forward_prefill_chunk(m, sc, Xc, p, C, &g_aar);
-            p += C;
-        }
-        for (; p < req.n_prompt; ++p) {
-            embed_token(m, ids[p], x);
-            forward_token(m, sc, x, p, &g_aar, p == req.n_prompt-1);
-            nan_total += count_nan(x, LAGUNA_HIDDEN);
-        }
-        double t1 = now_sec();
-        long disagree = 0;
-        int next = pick_token(sc, &req.smp, &disagree), ngen = 0, hit_eos = 0;
-        int pos = req.n_prompt;
-        for (int g=0; g<req.max_new; ++g) {
-            if (next==eos0 || next==eos1) { hit_eos = 1; break; }
-            gen[ngen++] = next;
-            embed_token(m, next, x);
-            forward_token(m, sc, x, pos, &g_aar, 1);
-            nan_total += count_nan(x, LAGUNA_HIDDEN);
-            next = pick_token(sc, &req.smp, &disagree);
-            ++pos;
-        }
-        double t2 = now_sec();
+        if (lbat_bcast(&B, &st) != 0) break;
+        if (st.quit) break;
+        if (st.n_active == 0 && st.n_admit == 0) continue;   /* nothing to do */
 
-        if (MyRank == 0 && cfd >= 0) {
-            size_t cap = (size_t)ngen*8 + 512;
-            char *b = malloc(cap);
-            if (b) {
-                int k = snprintf(b, cap, "{\"n\":%d,\"stop\":\"%s\",\"nan\":%d,"
-                    "\"lockstep_disagree\":%ld,\"prefill_tok_s\":%.2f,\"decode_tok_s\":%.2f,\"ids\":[",
-                    ngen, hit_eos?"eos":"length", nan_total, disagree,
-                    t1>t0 ? req.n_prompt/(t1-t0) : 0.0, t2>t1 ? ngen/(t2-t1) : 0.0);
-                for (int i=0;i<ngen && k < (int)cap-16; ++i)
-                    k += snprintf(b+k, cap-(size_t)k, i?",%d":"%d", gen[i]);
-                k += snprintf(b+k, cap-(size_t)k, "]}");
-                lsrv_respond(cfd, 200, "OK", b);
-                free(b);
-            } else lsrv_respond(cfd, 500, "Internal Server Error", "{\"error\":\"oom\"}");
-            close(cfd);
-            logmsg("served %d prompt + %d gen tok, prefill %.1f tok/s, decode %.1f tok/s%s\n",
-                   req.n_prompt, ngen, t1>t0?req.n_prompt/(t1-t0):0.0,
-                   t2>t1?ngen/(t2-t1):0.0, hit_eos?" (eos)":"");
+        /* --- admitted sequences: prefill each into its own slot's KV --- */
+        for (int i=0;i<st.n_admit;i++) {
+            int slot = st.adm_slot[i];
+            lbat_slot *s = &B.slot[slot];
+            if (MyRank != 0) { s->active = 1; s->fd = -1; s->ngen = 0; s->hit_eos = 0;
+                               s->max_new = maxpos; s->smp = defaults; }
+            int nxt = lbat_prefill(m, sc, s, slot, Xc, x, &disagree);
+            s->t_prefill_done = now_sec();
+            if (nxt==eos0 || nxt==eos1) { s->hit_eos = 1; }
+            else { s->gen[s->ngen++] = nxt; embed_token(m, nxt, B.X + (size_t)slot*LAGUNA_HIDDEN); }
+            /* a freshly prefilled slot joins the decode batch below */
+            if (!s->hit_eos && s->ngen < s->max_new) {
+                st.act_slot[st.n_active] = slot;
+                st.act_pos[st.n_active]  = s->pos;
+                st.n_active++;
+            }
         }
-        free(raw);
+
+        /* --- one batched decode step over every active slot --- */
+        if (st.n_active > 0) {
+            for (int i=0;i<st.n_active;i++) {
+                B.seqs[i] = st.act_slot[i];
+                B.poss[i] = st.act_pos[i];
+                if (i != st.act_slot[i])   /* pack activations contiguously for the batch */
+                    memcpy(B.X + (size_t)i*LAGUNA_HIDDEN,
+                           B.X + (size_t)st.act_slot[i]*LAGUNA_HIDDEN,
+                           LAGUNA_HIDDEN*sizeof(float));
+            }
+            forward_decode_batch(m, sc, B.X, B.seqs, B.poss, st.n_active, &g_aar);
+            /* all K choices in ONE allreduce, and each slot keeps its own sampler
+             * state so a seeded request is unaffected by who it batches with */
+            { laguna_sampler smps[LAGUNA_MAX_BATCH]; int nxt[LAGUNA_MAX_BATCH];
+              for (int i=0;i<st.n_active;i++) smps[i] = B.slot[st.act_slot[i]].smp;
+              pick_tokens_batch(sc, smps, nxt, st.n_active, &disagree);
+              for (int i=0;i<st.n_active;i++) {
+                lbat_slot *s = &B.slot[st.act_slot[i]];
+                s->smp = smps[i];                       /* advanced RNG state */
+                s->pos++;
+                if (nxt[i]==eos0 || nxt[i]==eos1) s->hit_eos = 1;
+                else if (s->ngen < s->max_new) {
+                    s->gen[s->ngen++] = nxt[i];
+                    embed_token(m, nxt[i], B.X + (size_t)i*LAGUNA_HIDDEN);
+                }
+              } }
+            /* unpack activations back to slot order for the next step */
+            for (int i=st.n_active-1;i>=0;i--)
+                if (i != st.act_slot[i])
+                    memcpy(B.X + (size_t)st.act_slot[i]*LAGUNA_HIDDEN,
+                           B.X + (size_t)i*LAGUNA_HIDDEN, LAGUNA_HIDDEN*sizeof(float));
+        }
+
+        /* --- retire finished slots (rank 0 answers; all ranks free the slot) --- */
+        for (int i=0;i<B.nslot;i++) {
+            lbat_slot *s = &B.slot[i];
+            if (!s->active) continue;
+            if (s->hit_eos || s->ngen >= s->max_new) {
+                if (MyRank == 0) {
+                    logmsg("slot %d done: %d prompt + %d gen tok%s\n",
+                           i, s->n_prompt, s->ngen, s->hit_eos?" (eos)":"");
+                    lsrv_finish(s, now_sec(), disagree);
+                } else { s->active = 0; s->fd = -1; }
+            }
+        }
     }
     if (MyRank == 0 && listen_fd >= 0) { close(listen_fd); logmsg("server stopped\n"); }
     return 0;

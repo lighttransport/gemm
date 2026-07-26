@@ -35,7 +35,7 @@ static int run_case(int pos0, int C, int nh, double *max_abs, double *rel) {
     laguna_build_rope_tables(&m);
 
     int cap=LAGUNA_SLIDING_CAP;
-    m.kv_cap[0]=cap; m.kv_off[0]=0;
+    m.kv_cap[0]=cap; m.kv_off[0]=0; m.n_seq=1; m.kv_seq_stride=0;
     size_t kvel=(size_t)cap*kvs;
     m.kcache=malloc(kvel*2); m.vcache=malloc(kvel*2);
     for(size_t i=0;i<kvel;i++){ m.kcache[i]=laguna_f32_to_bf16(frand()*0.5f);
@@ -58,13 +58,13 @@ static int run_case(int pos0, int C, int nh, double *max_abs, double *rel) {
     /* A: per-token reference */
     memcpy(Qa,Q0,qn_el*4); memcpy(Ka,K0,kv_el*4); memcpy(Va,V0,kv_el*4); memcpy(Ga,G0,g_el*4);
     for (int c=0;c<C;++c)
-        attention_core(&m,ly,&sc,0,pos0+c,nh, Qa+(size_t)c*nh*hd, Ka+(size_t)c*kvs,
+        attention_core(&m,ly,&sc,0,0,pos0+c,nh, Qa+(size_t)c*nh*hd, Ka+(size_t)c*kvs,
                        Va+(size_t)c*kvs, Ga+(size_t)c*nh, AOa+(size_t)c*nh*hd);
 
     /* B: query-blocked, from the same initial ring */
     memcpy(m.kcache,ksnap,kvel*2); memcpy(m.vcache,vsnap,kvel*2);
     memcpy(Qa,Q0,qn_el*4); memcpy(Ka,K0,kv_el*4); memcpy(Va,V0,kv_el*4); memcpy(Ga,G0,g_el*4);
-    attention_slide_flash(&m,ly,&sc,0,pos0,C,nh, Qa,Ka,Va,Ga, AOb);
+    attention_slide_flash(&m,ly,&sc,0,0,pos0,C,nh, Qa,Ka,Va,Ga, AOb);
 
     double mx=0, num=0, den=0;
     for (size_t i=0;i<qn_el;i++){ double d=fabs((double)AOa[i]-AOb[i]);
@@ -89,7 +89,7 @@ static void run_bugged(int pos0, int C, int nh, double *max_abs, double *rel) {
     m.full_cos=malloc((size_t)maxpos*hf*4);m.full_sin=malloc((size_t)maxpos*hf*4);
     m.swa_cos=malloc((size_t)maxpos*hs*4);m.swa_sin=malloc((size_t)maxpos*hs*4);
     laguna_build_rope_tables(&m);
-    m.kv_cap[0]=cap; m.kv_off[0]=0; size_t kvel=(size_t)cap*kvs;
+    m.kv_cap[0]=cap; m.kv_off[0]=0; m.n_seq=1; m.kv_seq_stride=0; size_t kvel=(size_t)cap*kvs;
     m.kcache=malloc(kvel*2);m.vcache=malloc(kvel*2);
     for(size_t i=0;i<kvel;i++){m.kcache[i]=laguna_f32_to_bf16(frand()*0.5f);
                                m.vcache[i]=laguna_f32_to_bf16(frand()*0.5f);}

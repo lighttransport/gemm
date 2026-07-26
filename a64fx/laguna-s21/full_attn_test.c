@@ -37,7 +37,7 @@ static void run_case(int pos0, int C, int nh, double *max_abs, double *rel, int 
     m.swa_cos =malloc((size_t)maxpos*hs*4); m.swa_sin =malloc((size_t)maxpos*hs*4);
     laguna_build_rope_tables(&m);
 
-    m.kv_cap[0]=maxpos; m.kv_off[0]=0;              /* full layer: no ring */
+    m.kv_cap[0]=maxpos; m.kv_off[0]=0; m.n_seq=1; m.kv_seq_stride=0;              /* full layer: no ring */
     size_t kvel=(size_t)maxpos*kvs;
     m.kcache=malloc(kvel*2); m.vcache=malloc(kvel*2);
     for(size_t i=0;i<kvel;i++){ m.kcache[i]=laguna_f32_to_bf16(frand()*0.5f);
@@ -59,13 +59,13 @@ static void run_case(int pos0, int C, int nh, double *max_abs, double *rel, int 
     /* A: per-token reference */
     memcpy(Qa,Q0,qn_el*4); memcpy(Ka,K0,kv_el*4); memcpy(Va,V0,kv_el*4); memcpy(Ga,G0,g_el*4);
     for (int c=0;c<C;++c)
-        attention_core(&m,ly,&sc,0,pos0+c,nh, Qa+(size_t)c*nh*hd, Ka+(size_t)c*kvs,
+        attention_core(&m,ly,&sc,0,0,pos0+c,nh, Qa+(size_t)c*nh*hd, Ka+(size_t)c*kvs,
                        Va+(size_t)c*kvs, Ga+(size_t)c*nh, AOa+(size_t)c*nh*hd);
 
     /* B: query-blocked flash, from the same initial cache */
     memcpy(m.kcache,ksnap,kvel*2); memcpy(m.vcache,vsnap,kvel*2);
     memcpy(Qa,Q0,qn_el*4); memcpy(Ka,K0,kv_el*4); memcpy(Va,V0,kv_el*4); memcpy(Ga,G0,g_el*4);
-    attention_full_flash(&m,ly,&sc,0,pos0,C,nh, Qa,Ka,Va,Ga, AOb);
+    attention_full_flash(&m,ly,&sc,0,0,pos0,C,nh, Qa,Ka,Va,Ga, AOb);
 
     /* optional deliberate corruption, to prove the tolerance can detect a bug:
      * drop the last diagonal key of every query (an off-by-one in the causal cut) */
@@ -91,7 +91,7 @@ static void run_offbyone(int pos0, int C, int nh, double *rel) {
     m.full_cos=malloc((size_t)maxpos*hf*4);m.full_sin=malloc((size_t)maxpos*hf*4);
     m.swa_cos=malloc((size_t)maxpos*hs*4);m.swa_sin=malloc((size_t)maxpos*hs*4);
     laguna_build_rope_tables(&m);
-    m.kv_cap[0]=maxpos; m.kv_off[0]=0; size_t kvel=(size_t)maxpos*kvs;
+    m.kv_cap[0]=maxpos; m.kv_off[0]=0; m.n_seq=1; m.kv_seq_stride=0; size_t kvel=(size_t)maxpos*kvs;
     m.kcache=malloc(kvel*2);m.vcache=malloc(kvel*2);
     for(size_t i=0;i<kvel;i++){m.kcache[i]=laguna_f32_to_bf16(frand()*0.5f);
                                m.vcache[i]=laguna_f32_to_bf16(frand()*0.5f);}

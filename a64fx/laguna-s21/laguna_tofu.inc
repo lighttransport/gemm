@@ -183,10 +183,33 @@ static int pick_token(laguna_scratch *sc, laguna_sampler *smp, long *disagree){
 }
 
 
+/* Batched form of pick_token: rank 0 chooses all K tokens and broadcasts them in
+ * ONE allreduce (2K+1 floats) rather than K separate ones.  Same invariant --
+ * ranks never use their own logits, so a last-ulp difference cannot split them. */
+static void pick_tokens_batch(laguna_scratch *sc, laguna_sampler *smps, int *out,
+                              int K, long *disagree) {
+    for (int i=0;i<K;i++)
+        out[i] = laguna_sample(sc->clogits + (size_t)i*LAGUNA_VOCAB, LAGUNA_VOCAB, &smps[i]);
+    if (N <= 1) return;
+    static float *b = NULL; static int cap = 0;
+    if (cap < 2*K+1) { free(b); cap = 2*K+1; b = malloc((size_t)cap*sizeof(float)); }
+    for (int i=0;i<K;i++) {
+        b[i]   = (MyRank==0) ? (float)out[i] : 0.0f;   /* rank 0's choice */
+        b[K+i] = (float)out[i];                        /* sum over ranks, for the check */
+    }
+    ep_ar(&g_comm, b, 2*K);
+    for (int i=0;i<K;i++) {
+        int chosen = (int)(b[i]+0.5f);
+        if (fabsf(b[K+i] - (float)N*b[i]) > 0.5f) (*disagree)++;
+        out[i] = chosen;
+    }
+}
+
+
 /* Options shared by --generate and --serve, and the load sequence they share. */
 typedef struct {
     const char *stage_dir, *topo;
-    int maxpos, n_layers, pchunk, debug, fp8_exact;
+    int maxpos, n_layers, pchunk, debug, fp8_exact, max_batch;
     laguna_sampler smp;
 } laguna_opts;
 
@@ -198,6 +221,7 @@ static laguna_opts laguna_opts_default(void) {
      * do_sample, which stays off so an unadorned run is deterministic */
     o.smp.do_sample = 0; o.smp.temp = 1.0f; o.smp.top_p = 1.0f;
     o.smp.min_p = 0.0f;  o.smp.top_k = 20;  o.smp.rng = 0x1234ABCDull;
+    o.max_batch = 4;
     return o;
 }
 /* returns 1 if argv[i] was consumed (advancing i), 0 if unrecognised */
@@ -209,6 +233,7 @@ static int laguna_opt_parse(laguna_opts *o, int argc, char **argv, int *i) {
     if(!strcmp(a,"--maxpos"))    NEXT(o->maxpos, atoi);
     if(!strcmp(a,"--layers"))    NEXT(o->n_layers, atoi);
     if(!strcmp(a,"--pchunk"))    NEXT(o->pchunk, atoi);
+    if(!strcmp(a,"--max-batch")) NEXT(o->max_batch, atoi);
     if(!strcmp(a,"--temp"))      NEXT(o->smp.temp, (float)atof);
     if(!strcmp(a,"--top-k"))     NEXT(o->smp.top_k, atoi);
     if(!strcmp(a,"--top-p"))     NEXT(o->smp.top_p, (float)atof);
@@ -224,6 +249,8 @@ static int laguna_opts_apply(laguna_opts *o) {
     if (!o->stage_dir) { fprintf(stderr,"--stage-dir DIR is required\n"); return 2; }
     if (o->n_layers < 1 || o->n_layers > LAGUNA_LAYERS) o->n_layers = LAGUNA_LAYERS;
     if (o->pchunk < 1 || o->pchunk > LAGUNA_PCHUNK) o->pchunk = LAGUNA_PCHUNK;
+    if (o->max_batch < 1) o->max_batch = 1;
+    if (o->max_batch > LAGUNA_MAX_BATCH) o->max_batch = LAGUNA_MAX_BATCH;
     g_topo_path = o->topo;
     g_dbg = o->debug;
 #if defined(LAGUNA_FP8)
@@ -243,7 +270,7 @@ static int laguna_load(laguna_model *m, laguna_scratch *sc, laguna_stage *st,
         fprintf(stderr,"rank %d: stage load failed from %s\n", MyRank, o->stage_dir);
         return 1;
     }
-    model_build(m, st, o->n_layers, maxpos, MyRank, N);
+    model_build(m, st, o->n_layers, maxpos, MyRank, N, o->max_batch);
 #if defined(LAGUNA_FP8)
     fp8_release_blob(m, st);   /* weights are re-quantized; drop the mapping */
 #endif
@@ -277,7 +304,7 @@ static int run_serve(int argc, char **argv) {
     tofu_bootstrap();
     laguna_stage st; laguna_model m; laguna_scratch sc;
     if (laguna_load(&m, &sc, &st, &o, o.maxpos) != 0) return 1;
-    return lsrv_run(&m, &sc, port, o.maxpos, o.smp);
+    return lsrv_run(&m, &sc, port, o.maxpos, o.smp, o.max_batch);
 }
 
 static int run_generate(int argc, char **argv){
@@ -328,7 +355,7 @@ static int run_generate(int argc, char **argv){
         for(; p+1<=nprefill; ){
             int C = nprefill-p; if(C>pchunk)C=pchunk; if(C<=0) break;
             for(int c=0;c<C;++c) embed_token(&m,prompt[p+c],Xc+(size_t)c*LAGUNA_HIDDEN);
-            forward_prefill_chunk(&m,&sc,Xc,p,C,&g_aar);
+            forward_prefill_chunk(&m,&sc,Xc,0,p,C,&g_aar);
             p+=C;
             if(MyRank==0 && (p%2048<C)) logmsg("prefill progress: %d/%d\n",p,n_prompt);
         }
@@ -336,7 +363,7 @@ static int run_generate(int argc, char **argv){
     for(; p<n_prompt; ++p){   /* remaining tokens (incl. the last) per-token */
         embed_token(&m,prompt[p],x);
         int need_logits=(p==n_prompt-1)||g_dbg;
-        forward_token(&m,&sc,x,p,&g_aar,need_logits);
+        forward_token(&m,&sc,x,0,p,&g_aar,need_logits);
         total_nan+=count_nan(x,LAGUNA_HIDDEN);
     }
     free(Xc);
@@ -365,7 +392,7 @@ static int run_generate(int argc, char **argv){
         if(next==eos0||next==eos1){ hit_eos=1; break; }
         gen[ngen++]=next;
         embed_token(&m,next,x);
-        forward_token(&m,&sc,x,pos,&g_aar,1);
+        forward_token(&m,&sc,x,0,pos,&g_aar,1);
         total_nan+=count_nan(x,LAGUNA_HIDDEN);
         next=pick_token(&sc,&smp,&lockstep_bad);
         pos++;
