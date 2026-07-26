@@ -471,6 +471,46 @@ GFLOP/s across every depth**, where before it ramped from 45 at pos0=0 to 375 at
 Only full-attention layers have a diagonal pass; `attention_slide_flash` already
 processed its band through the run kernels.
 
+**End-to-end** (12 nodes, both binaries back-to-back on one allocation,
+`013e259b` vs the blocked version):
+
+| | before | after | |
+|---|---|---|---|
+| prefill, 715 tok | 65.4 tok/s | **67.5** | +3.2% |
+| attn phase, 715 tok | 1.2 s | **0.9 s** | 1.33x |
+| prefill, 2377 tok | 62.6 tok/s | **64.4** | +2.9% |
+| attn phase, 2377 tok | 5.9 s | **4.9 s** | 1.20x |
+| decode | 24.6 / 22.8 tok/s | 25.0 / 22.8 | unchanged |
+
+A large kernel win that is a small end-to-end one, and worth being explicit about
+why: attention is only 11% of prefill at 715 tokens and 16% at 2377, and just 12
+of 48 layers are full-attention. Decode is untouched because it processes one
+query at a time -- there is no diagonal block to speak of.
+
+Unlike the full-width-load change this is **not** bit-exact: block-wise online
+softmax reassociates (~1e-6, see `full_attn_test.c`). Generated tokens were
+identical at 2377 but diverged at 715, and the top-1 logit moved 27.705 -> 28.134
+(1.5%), which is far more than 1e-6 and deserved checking rather than waving away.
+
+**This runner is deterministic run-to-run** -- the same binary twice gives the
+identical logit and token stream, so the shift is genuinely attributable to the
+change and not to reduction-order jitter. (Worth knowing on its own: the comm
+layer reports `deterministic=0`, so this could have gone the other way, and it is
+the control to run before attributing any output difference to a code change.)
+
+The amplification has a concrete mechanism in an MoE model: the router takes
+top-10 of 256 experts, so a ~1e-6 perturbation can flip which expert lands tenth.
+That is a *discrete* change in the computation, compounded over 48 layers. A 1.5%
+logit move from a 1e-6 kernel perturbation is therefore expected here in a way it
+would not be in a dense model.
+
+"Both continuations look coherent" is weak evidence, so quality was checked with
+sharp pass/fail prompts in exactly the regime this change affects (short prompts,
+where the chunk is all diagonal). All three give **character-identical answers on
+both binaries**: "The capital of France is Paris.", the 17-sheep riddle answered
+correctly as 9, and the same three Japanese supercomputers. The divergence at 715
+tokens was on a deliberately repetitive prompt, where near-ties are dense.
+
 `full_attn_test.c` covers this path (the sliding path had `slide_attn_test.c` but
 the full path had none): 20 cases over prefix/block alignments and chunk sizes,
 with pure-diagonal cases exact to 0.0, plus a control that moves the causal cut by
