@@ -633,7 +633,14 @@ region boundaries fall:
 | router + shared (they trade attribution) | 16.11 ms | **14.89** | -1.22 ms |
 | routed experts | 3.74 ms | **3.40** | -0.34 ms |
 
-Generated tokens are **identical**. The saving predicted from the region count was
+Generated tokens are **identical**. Confirmed again at a 2648-token prompt
+(**21.9 -> 22.6 tok/s**, +3.2%, tokens identical, same argmax) where **prefill is
+bit-for-bit unchanged at 62.6 tok/s** -- the useful negative control, since the
+fusion touches only the decode path. A 22k-token needle retrieval under the fused
+build returns the passcode verbatim with `nan=0`, which is what would break first
+if the `sh_a`/`sh_b` aliasing had been gotten wrong.
+
+The saving predicted from the region count was
 1.7 ms/token and 1.5 was measured, which validates the cost model: the remaining
 ~300 regions per token are worth roughly another 4 ms, and the way to get them is
 one `omp parallel` per layer with `omp for` inside rather than per-call regions.
