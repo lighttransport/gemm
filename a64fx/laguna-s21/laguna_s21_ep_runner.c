@@ -609,6 +609,12 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
  *        whole run removes that entirely.
  * hd is always LAGUNA_HEAD_DIM (128); the generic path is kept as a fallback. */
 #define LAGUNA_AV_NV 8      /* 128 / 16 */
+/* bf16 halves of a full-width u16 load, widened to f32 */
+#define LAGUNA_UNLO(pg,h) svreinterpret_f32_u32(svlsl_n_u32_x((pg),svunpklo_u32(h),16))
+#define LAGUNA_UNHI(pg,h) svreinterpret_f32_u32(svlsl_n_u32_x((pg),svunpkhi_u32(h),16))
+/* uzp1(a,b)+uzp2(a,b) = [a0+a1, a2+a3, ..., b0+b1, ...] -- four stages reduce 16
+ * accumulators to one vector of 16 lane-sums without any svaddv. */
+#define LAGUNA_BFLY(pg,a,b) svadd_f32_x((pg), svuzp1_f32((a),(b)), svuzp2_f32((a),(b)))
 static inline int laguna_run_ok(int hd) { return hd == LAGUNA_AV_NV*(int)svcntw(); }
 
 /* sco[i] = dot(q, k[i]) * scale, for i in [0,n), keys at k + i*kvstride */
@@ -619,35 +625,46 @@ static inline void laguna_qk_run(float *restrict sco, const float *restrict q,
         for (int i=0;i<n;++i) sco[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
         return;
     }
-    svbool_t pt=svptrue_b32(); int VL=(int)svcntw();
+    svbool_t pt=svptrue_b32(), ph=svptrue_b16(); int VL=(int)svcntw();
     svfloat32_t q0=svld1_f32(pt,q+0*VL),q1=svld1_f32(pt,q+1*VL),
                 q2=svld1_f32(pt,q+2*VL),q3=svld1_f32(pt,q+3*VL),
                 q4=svld1_f32(pt,q+4*VL),q5=svld1_f32(pt,q+5*VL),
                 q6=svld1_f32(pt,q+6*VL),q7=svld1_f32(pt,q+7*VL);
     int i=0;
+    /* Same full-width-load trick as laguna_av_run: 4 svld1_u16 + unpack instead of
+     * 8 widening svld1uh_u32.  Each q register still meets the same dims in the
+     * same order, so this is bit-identical. */
     for (; i+4<=n; i+=4) {
         const uint16_t *k0=k+(size_t)(i+0)*kvstride,*k1=k+(size_t)(i+1)*kvstride,
                        *k2=k+(size_t)(i+2)*kvstride,*k3=k+(size_t)(i+3)*kvstride;
-        svfloat32_t a0=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k0+0*VL));
-        svfloat32_t b0=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k0+4*VL));
-        svfloat32_t a1=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k1+0*VL));
-        svfloat32_t b1=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k1+4*VL));
-        svfloat32_t a2=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k2+0*VL));
-        svfloat32_t b2=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k2+4*VL));
-        svfloat32_t a3=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,k3+0*VL));
-        svfloat32_t b3=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,k3+4*VL));
-        a0=svmla_f32_x(pt,a0,q1,laguna_ld_bf16(pt,k0+1*VL)); b0=svmla_f32_x(pt,b0,q5,laguna_ld_bf16(pt,k0+5*VL));
-        a1=svmla_f32_x(pt,a1,q1,laguna_ld_bf16(pt,k1+1*VL)); b1=svmla_f32_x(pt,b1,q5,laguna_ld_bf16(pt,k1+5*VL));
-        a2=svmla_f32_x(pt,a2,q1,laguna_ld_bf16(pt,k2+1*VL)); b2=svmla_f32_x(pt,b2,q5,laguna_ld_bf16(pt,k2+5*VL));
-        a3=svmla_f32_x(pt,a3,q1,laguna_ld_bf16(pt,k3+1*VL)); b3=svmla_f32_x(pt,b3,q5,laguna_ld_bf16(pt,k3+5*VL));
-        a0=svmla_f32_x(pt,a0,q2,laguna_ld_bf16(pt,k0+2*VL)); b0=svmla_f32_x(pt,b0,q6,laguna_ld_bf16(pt,k0+6*VL));
-        a1=svmla_f32_x(pt,a1,q2,laguna_ld_bf16(pt,k1+2*VL)); b1=svmla_f32_x(pt,b1,q6,laguna_ld_bf16(pt,k1+6*VL));
-        a2=svmla_f32_x(pt,a2,q2,laguna_ld_bf16(pt,k2+2*VL)); b2=svmla_f32_x(pt,b2,q6,laguna_ld_bf16(pt,k2+6*VL));
-        a3=svmla_f32_x(pt,a3,q2,laguna_ld_bf16(pt,k3+2*VL)); b3=svmla_f32_x(pt,b3,q6,laguna_ld_bf16(pt,k3+6*VL));
-        a0=svmla_f32_x(pt,a0,q3,laguna_ld_bf16(pt,k0+3*VL)); b0=svmla_f32_x(pt,b0,q7,laguna_ld_bf16(pt,k0+7*VL));
-        a1=svmla_f32_x(pt,a1,q3,laguna_ld_bf16(pt,k1+3*VL)); b1=svmla_f32_x(pt,b1,q7,laguna_ld_bf16(pt,k1+7*VL));
-        a2=svmla_f32_x(pt,a2,q3,laguna_ld_bf16(pt,k2+3*VL)); b2=svmla_f32_x(pt,b2,q7,laguna_ld_bf16(pt,k2+7*VL));
-        a3=svmla_f32_x(pt,a3,q3,laguna_ld_bf16(pt,k3+3*VL)); b3=svmla_f32_x(pt,b3,q7,laguna_ld_bf16(pt,k3+7*VL));
+        svuint16_t g0=svld1_u16(ph,k0+0*2*VL),g1=svld1_u16(ph,k0+1*2*VL),
+                   g2=svld1_u16(ph,k0+2*2*VL),g3=svld1_u16(ph,k0+3*2*VL);
+        svuint16_t m0=svld1_u16(ph,k1+0*2*VL),m1=svld1_u16(ph,k1+1*2*VL),
+                   m2=svld1_u16(ph,k1+2*2*VL),m3=svld1_u16(ph,k1+3*2*VL);
+        svuint16_t n0=svld1_u16(ph,k2+0*2*VL),n1=svld1_u16(ph,k2+1*2*VL),
+                   n2=svld1_u16(ph,k2+2*2*VL),n3=svld1_u16(ph,k2+3*2*VL);
+        svuint16_t r0=svld1_u16(ph,k3+0*2*VL),r1=svld1_u16(ph,k3+1*2*VL),
+                   r2=svld1_u16(ph,k3+2*2*VL),r3=svld1_u16(ph,k3+3*2*VL);
+        svfloat32_t a0=svmul_f32_x(pt,q0,LAGUNA_UNLO(pt,g0));
+        svfloat32_t b0=svmul_f32_x(pt,q4,LAGUNA_UNLO(pt,g2));
+        svfloat32_t a1=svmul_f32_x(pt,q0,LAGUNA_UNLO(pt,m0));
+        svfloat32_t b1=svmul_f32_x(pt,q4,LAGUNA_UNLO(pt,m2));
+        svfloat32_t a2=svmul_f32_x(pt,q0,LAGUNA_UNLO(pt,n0));
+        svfloat32_t b2=svmul_f32_x(pt,q4,LAGUNA_UNLO(pt,n2));
+        svfloat32_t a3=svmul_f32_x(pt,q0,LAGUNA_UNLO(pt,r0));
+        svfloat32_t b3=svmul_f32_x(pt,q4,LAGUNA_UNLO(pt,r2));
+        a0=svmla_f32_x(pt,a0,q1,LAGUNA_UNHI(pt,g0)); b0=svmla_f32_x(pt,b0,q5,LAGUNA_UNHI(pt,g2));
+        a1=svmla_f32_x(pt,a1,q1,LAGUNA_UNHI(pt,m0)); b1=svmla_f32_x(pt,b1,q5,LAGUNA_UNHI(pt,m2));
+        a2=svmla_f32_x(pt,a2,q1,LAGUNA_UNHI(pt,n0)); b2=svmla_f32_x(pt,b2,q5,LAGUNA_UNHI(pt,n2));
+        a3=svmla_f32_x(pt,a3,q1,LAGUNA_UNHI(pt,r0)); b3=svmla_f32_x(pt,b3,q5,LAGUNA_UNHI(pt,r2));
+        a0=svmla_f32_x(pt,a0,q2,LAGUNA_UNLO(pt,g1)); b0=svmla_f32_x(pt,b0,q6,LAGUNA_UNLO(pt,g3));
+        a1=svmla_f32_x(pt,a1,q2,LAGUNA_UNLO(pt,m1)); b1=svmla_f32_x(pt,b1,q6,LAGUNA_UNLO(pt,m3));
+        a2=svmla_f32_x(pt,a2,q2,LAGUNA_UNLO(pt,n1)); b2=svmla_f32_x(pt,b2,q6,LAGUNA_UNLO(pt,n3));
+        a3=svmla_f32_x(pt,a3,q2,LAGUNA_UNLO(pt,r1)); b3=svmla_f32_x(pt,b3,q6,LAGUNA_UNLO(pt,r3));
+        a0=svmla_f32_x(pt,a0,q3,LAGUNA_UNHI(pt,g1)); b0=svmla_f32_x(pt,b0,q7,LAGUNA_UNHI(pt,g3));
+        a1=svmla_f32_x(pt,a1,q3,LAGUNA_UNHI(pt,m1)); b1=svmla_f32_x(pt,b1,q7,LAGUNA_UNHI(pt,m3));
+        a2=svmla_f32_x(pt,a2,q3,LAGUNA_UNHI(pt,n1)); b2=svmla_f32_x(pt,b2,q7,LAGUNA_UNHI(pt,n3));
+        a3=svmla_f32_x(pt,a3,q3,LAGUNA_UNHI(pt,r1)); b3=svmla_f32_x(pt,b3,q7,LAGUNA_UNHI(pt,r3));
         sco[i+0]=svaddv_f32(pt,svadd_f32_x(pt,a0,b0))*scale;
         sco[i+1]=svaddv_f32(pt,svadd_f32_x(pt,a1,b1))*scale;
         sco[i+2]=svaddv_f32(pt,svadd_f32_x(pt,a2,b2))*scale;
@@ -672,22 +689,30 @@ static inline void laguna_av_run(float *restrict acc, const float *restrict w,
         for (int i=0;i<n;++i) laguna_vaxpy(acc, v+(size_t)i*kvstride, w[i], i==0?corr:1.0f, hd);
         return;
     }
-    svbool_t pt=svptrue_b32(); int VL=(int)svcntw();
+    svbool_t pt=svptrue_b32(), ph=svptrue_b16(); int VL=(int)svcntw();
     svfloat32_t c=svdup_f32(corr);
     svfloat32_t a0=svmul_f32_x(pt,svld1_f32(pt,acc+0*VL),c),a1=svmul_f32_x(pt,svld1_f32(pt,acc+1*VL),c),
                 a2=svmul_f32_x(pt,svld1_f32(pt,acc+2*VL),c),a3=svmul_f32_x(pt,svld1_f32(pt,acc+3*VL),c),
                 a4=svmul_f32_x(pt,svld1_f32(pt,acc+4*VL),c),a5=svmul_f32_x(pt,svld1_f32(pt,acc+5*VL),c),
                 a6=svmul_f32_x(pt,svld1_f32(pt,acc+6*VL),c),a7=svmul_f32_x(pt,svld1_f32(pt,acc+7*VL),c);
+    /* Read V with FULL-WIDTH u16 loads and unpack, rather than 8 widening
+     * svld1uh_u32.  A widening load fills 16 f32 lanes from only 32 bytes, so it
+     * spends a whole load slot on half a vector; 4 full loads + unpack move the
+     * same bytes in half the slots and measure 1.44x (35.2 -> 24.5 cyc/key).
+     * Each accumulator still sees the same dims in the same order, so the result
+     * is bit-identical to the widening-load form. */
     for (int i=0;i<n;++i) {
         const uint16_t *vi=v+(size_t)i*kvstride; svfloat32_t p=svdup_f32(w[i]);
-        a0=svmla_f32_x(pt,a0,p,laguna_ld_bf16(pt,vi+0*VL));
-        a1=svmla_f32_x(pt,a1,p,laguna_ld_bf16(pt,vi+1*VL));
-        a2=svmla_f32_x(pt,a2,p,laguna_ld_bf16(pt,vi+2*VL));
-        a3=svmla_f32_x(pt,a3,p,laguna_ld_bf16(pt,vi+3*VL));
-        a4=svmla_f32_x(pt,a4,p,laguna_ld_bf16(pt,vi+4*VL));
-        a5=svmla_f32_x(pt,a5,p,laguna_ld_bf16(pt,vi+5*VL));
-        a6=svmla_f32_x(pt,a6,p,laguna_ld_bf16(pt,vi+6*VL));
-        a7=svmla_f32_x(pt,a7,p,laguna_ld_bf16(pt,vi+7*VL));
+        svuint16_t h0=svld1_u16(ph,vi+0*2*VL), h1=svld1_u16(ph,vi+1*2*VL);
+        svuint16_t h2=svld1_u16(ph,vi+2*2*VL), h3=svld1_u16(ph,vi+3*2*VL);
+        a0=svmla_f32_x(pt,a0,p,LAGUNA_UNLO(pt,h0));
+        a1=svmla_f32_x(pt,a1,p,LAGUNA_UNHI(pt,h0));
+        a2=svmla_f32_x(pt,a2,p,LAGUNA_UNLO(pt,h1));
+        a3=svmla_f32_x(pt,a3,p,LAGUNA_UNHI(pt,h1));
+        a4=svmla_f32_x(pt,a4,p,LAGUNA_UNLO(pt,h2));
+        a5=svmla_f32_x(pt,a5,p,LAGUNA_UNHI(pt,h2));
+        a6=svmla_f32_x(pt,a6,p,LAGUNA_UNLO(pt,h3));
+        a7=svmla_f32_x(pt,a7,p,LAGUNA_UNHI(pt,h3));
     }
     svst1_f32(pt,acc+0*VL,a0); svst1_f32(pt,acc+1*VL,a1);
     svst1_f32(pt,acc+2*VL,a2); svst1_f32(pt,acc+3*VL,a3);

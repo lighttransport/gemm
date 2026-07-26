@@ -370,6 +370,55 @@ chat answers terminate on their own rather than running to `--max-new`.
 round-trip (including unicode), decode visibility, and template rendering for
 thinking / no-think / custom-system / multi-turn.
 
+### bf16 loads: use the full vector width
+
+`laguna_ld_bf16` used `svld1uh_u32`, a *widening* load that fills 16 f32 lanes
+from only 32 bytes -- a whole load slot for half a vector, so head_dim=128 needed
+8 of them per key. Reading 64 bytes at a time with `svld1_u16` and splitting with
+`svunpklo/hi` moves the same bytes in half the slots. Each accumulator still meets
+the same dims in the same order, so it is **bit-identical**.
+
+Full-attention layer, C=256, 47 threads, median of 5 runs (ms/call):
+
+| context | before | after | |
+|---|---|---|---|
+| 2048 | 54.6 | **43.2** | 1.26x |
+| 8192 | 171 | **127** | 1.35x |
+| 32768 | 710 | **479** | 1.48x |
+| 65536 | 1476 | **1214** | 1.22x |
+
+This helps every attention path at once (`qk_run`, `av_run`, hence full flash,
+sliding flash and decode).
+
+### Two things that measured well in isolation and lost in context
+
+Worth recording because both cost real time and neither shipped:
+
+**A64FX `svaddv` costs ~35-40 cycles and does not pipeline.** Measured directly
+(`svfloor_bench.c`): the same 8 loads + 8 FMLA run at ~10 cyc/key with the
+accumulators left alone and ~50 with one `svaddv` per key. head_dim=128 is only 8
+vectors, so a per-key reduction is amortised over 8 FMLAs rather than the 192 of a
+3072-wide matvec -- which is why the identical trick paid off for the int8 expert
+kernel earlier and why it looks so bad here.
+
+Reducing 16 keys together with a zip tree (`uzp1+uzp2`, four stages, no `svaddv`)
+is **1.48x on the isolated primitive** and numerically fine (<3e-7). In the real
+kernel it was a **10-17% regression** -- the 16 live accumulators plus 8 hoisted q
+registers spill. Reverted; only the load-width change shipped.
+
+**Do not trust an isolated primitive benchmark for a register-pressure-sensitive
+change.** Two further traps hit along the way, both self-inflicted:
+- An early "floor" measurement consumed only 2 of 8 accumulators, so the compiler
+  deleted 6 of the 8 FMLA chains and reported ~9 cyc/key that nothing could reach.
+- A first A/B compared HEAD against HEAD, because a `cd` in a compound shell
+  command persisted and both binaries were built from the same directory. It
+  showed "no change", which was true but meaningless. Always assert the two
+  binaries actually differ.
+
+An earlier conclusion in this file that full-width loads "gave nothing" came from
+that same confounding: the `svaddv` dominated the measurement so heavily that the
+load width was invisible. It is worth 1.2-1.5x once the measurement is clean.
+
 ### Remaining levers
 
 - Attention is still the largest single prefill phase and now runs at ~250-280
