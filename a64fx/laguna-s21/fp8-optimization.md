@@ -641,9 +641,30 @@ build returns the passcode verbatim with `nan=0`, which is what would break firs
 if the `sh_a`/`sh_b` aliasing had been gotten wrong.
 
 The saving predicted from the region count was
-1.7 ms/token and 1.5 was measured, which validates the cost model: the remaining
-~300 regions per token are worth roughly another 4 ms, and the way to get them is
-one `omp parallel` per layer with `omp for` inside rather than per-call regions.
+1.7 ms/token and 1.5 was measured.
+
+**That agreement was a coincidence, and the cost model it appeared to validate is
+wrong.**  Acting on it -- one `omp parallel` per LAYER, taking decode from ~320
+fork/joins per token to 47 -- was implemented, verified token-identical, and
+measured a **regression**: 28.1 -> 27.7 tok/s (3 baseline runs at 28.1, two
+refactor runs at 27.7; comm flat at 23.4% -> 21.6%, so it was not a comm effect).
+It has been reverted.  Two things were wrong:
+
+1. **13.2 us is the cost of an ISOLATED region, not the marginal cost of the next
+   one.**  In the steady-state decode loop the Fujitsu runtime keeps workers
+   spin-waiting, so entering the next region costs about a barrier rather than a
+   thread wake-up.  The microbenchmark measured a wake-up that decode never pays.
+2. **Collapsing regions ADDS synchronisation.**  Serial sections (rmsnorm,
+   residual adds, top-10, the allreduce) previously ran between regions with the
+   team parked and *zero* barriers.  Inside one region each needs `omp single` --
+   a barrier in and a barrier out.  Per layer that traded ~6.8 fork/joins for
+   ~19 barriers.
+
+So the real reason the two fusions above won is NOT the region count.  It is that
+the fused operands share their input (`n2`, and gate/up share `x`), so fusing them
+reuses that input from cache and halves the number of times the weight stream is
+restarted -- an arithmetic/locality effect that happens to scale with the same
+count.  Fuse work that shares an input; do not fuse merely to remove a region.
 
 ### Where to look next, in order
 
@@ -652,12 +673,12 @@ one `omp parallel` per layer with `omp for` inside rather than per-call regions.
    Worth revisiting with a different mechanism -- e.g. reducing every other layer's
    partial together, which halves the count at the cost of holding one extra
    partial.
-2. ~~Router fork/join~~ **done above (+4.1%)**, and the cost model it validated
-   says the remaining ~300 regions/token are worth ~4 ms more. The structural fix
-   is one `omp parallel` per layer with `omp for` inside, instead of a region per
-   call. Note a work threshold (`GLM5_PAR_MIN`-style) would NOT have helped here:
-   the router is 786K MACs, far too much to run serially -- the problem was the
-   number of regions, not their width.
+2. ~~Router fork/join~~ **done above (+4.1%)**. Do NOT pursue the remaining
+   regions: one `omp parallel` per layer was tried and **regressed to 27.7**
+   (see above) because collapsing regions adds barriers around every serial
+   section. A `GLM5_PAR_MIN`-style work threshold is also not the answer -- the
+   router is 786K MACs, far too much to run serially. Region count is simply not
+   the lever it looked like.
 3. **Small-matvec efficiency generally** -- shared expert at 11% of bandwidth and
    routed experts at 12% are the same problem one level up.
 

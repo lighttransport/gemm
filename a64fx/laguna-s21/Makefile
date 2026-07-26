@@ -1,4 +1,11 @@
-CC ?= fcc
+# NOT `CC ?= fcc`: make predefines CC=cc, whose origin is "default" rather than
+# "undefined", so ?= never fires and the build silently used gcc -- which drops
+# -march=armv8.2-a+sve, compiles the (incomplete) non-SVE fallbacks, and fails at
+# link with undefined references to laguna_exp_shift_sum.  An explicit CC=... on
+# the command line or in the environment still wins.
+ifeq ($(origin CC),default)
+  CC := fcc
+endif
 OPENMP ?= 1
 
 ROOT := $(abspath ../..)
