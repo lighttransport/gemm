@@ -570,6 +570,58 @@ An honest note on how this went: the whole feature was justified by an arithmeti
 estimate ("13 GB/token, therefore bandwidth-bound") that was never measured. The
 scaling test that refuted it takes two minutes and should have come first.
 
+## What actually dominates decode
+
+Measured with `--prof` at 35.6 ms/token (28.1 tok/s), short context, plus a
+thread-count sweep to separate real work from per-call overhead.
+
+| phase | ms/token | share | GB/s | % of ~830 GB/s | 12->47 thread scaling |
+|---|---|---|---|---|---|
+| **allreduce** | ~10.4 | **29%** | -- | -- | -- |
+| qkv+gate linears | 6.7-7.5 | 21% | 207 | 25% | **3.35x** |
+| shared expert (compute) | ~5.9 | 17% | 94 | 11% | ~1.9x |
+| o_proj | 4.1 | 12% | 302 | 36% | -- |
+| routed experts | 3.3-3.8 | 10% | 98 | 12% | **2.0x** |
+| router | 2.5 | 7% | 14 | 2% | **1.04x (flat)** |
+| attention core | 2.3 | 6% | -- | -- | -- |
+| lm_head | 1.2 | 3% | 263 | 32% | -- |
+| rmsnorm | 0.8 | 2% | -- | -- | -- |
+
+Three conclusions, in order of how much they are worth:
+
+**1. Communication is the single largest item, ~29%.** 48 allreduces per token,
+one per MoE layer plus the token broadcast, each 0.22 ms for a 12 KB payload.
+That is latency, not wire: it is the same 0.22 ms whatever the thread count.
+
+**2. Nothing is bandwidth-bound.** The best phase reaches 36% of HBM, most sit at
+11-25%. This is the direct refutation of the batching premise: batching amortises
+*bytes*, and bytes were never the constraint. It also means the earlier "13 GB per
+token" figure was wrong -- that is the resident footprint; only **4.07 GB** is
+actually read per token per rank, which at 27.8 tok/s is 113 GB/s, 14% of peak.
+
+**3. ~10% of decode is OpenMP fork/join, and the router is the proof.** The router
+costs 2.53 ms at 47 threads, 2.47 at 24 and 2.64 at 12 -- completely flat, while
+qkv+gate scales 3.35x over the same range. It is a 256x3072 matvec (0.037 GB) that
+does not need 47 threads or its own parallel region, and it runs 47 times per
+token. The routed experts scale only 2.0x for the same reason at smaller scale.
+
+Worth noting for prioritisation: the routed experts, which absorbed most of the
+fp8 kernel effort in this document, are **10% of decode**. The dense linears
+(qkv + o_proj + shared + router) are ~57%.
+
+### Where to look next, in order
+
+1. **The 48 per-token allreduces (29%).** Latency-bound at 12 KB. Async overlap was
+   tried and reverted (`c4ec762b`: the comm thread is starved by the OMP runtime).
+   Worth revisiting with a different mechanism -- e.g. reducing every other layer's
+   partial together, which halves the count at the cost of holding one extra
+   partial.
+2. **Router fork/join (7%, entirely overhead).** Fuse it into the same parallel
+   region as the shared expert, or gate small matvecs on a work threshold the way
+   `common/glm5_impl.h` does with `GLM5_PAR_MIN`.
+3. **Small-matvec efficiency generally** -- shared expert at 11% of bandwidth and
+   routed experts at 12% are the same problem one level up.
+
 ### Remaining levers
 
 - `dense_down` (3072x12288) sits at 42 GMAC/s vs q_proj's 110; it is layer 0 only
