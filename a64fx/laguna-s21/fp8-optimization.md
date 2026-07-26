@@ -441,11 +441,43 @@ An earlier conclusion in this file that full-width loads "gave nothing" came fro
 that same confounding: the `svaddv` dominated the measurement so heavily that the
 load width was invisible. It is worth 1.2-1.5x once the measurement is clean.
 
+### The diagonal pass (done)
+
+`attention_full_flash`'s within-chunk causal pass ran one key at a time, and it
+was the worst-shaped loop in the file: a per-key `svaddv` inside `laguna_qkdot`, a
+full-accumulator read-modify-write inside `laguna_vaxpy`, and two **scalar** `expf`
+rather than the vectorised FEXPA path. It measured **67 GFLOP/s against the prefix
+pass's 382**.
+
+Its cost is `C^2/2` per head *regardless of context*, so a key-count estimate
+badly understates it: at 6% of the keys but ~6x the cost per key it was 27% of the
+kernel at pos0=2048 and 33% at pos0=1024. Blocking it the same way as the prefix
+pass (`laguna_qk_run` + `laguna_exp_shift_sum` + `laguna_av_run` over `LAGUNA_KB`
+key blocks) gives, median of 3 runs at C=256, 47 threads:
+
+| pos0 | before | after | |
+|---|---|---|---|
+| 0 (pure diagonal) | 12.0 ms | **2.4** | **5.0x** |
+| 256 | 16.6 | **6.6** | 2.5x |
+| 1024 | 27.1 | **18.6** | 1.46x |
+| 2048 | 42.6 | **35.2** | 1.21x |
+| 8192 | 140.6 | 135.7 | 1.04x |
+| 65536 | 1161 | 1080 | ~1.0x |
+
+The shape matters more than any single number: throughput is now **flat at ~385
+GFLOP/s across every depth**, where before it ramped from 45 at pos0=0 to 375 at
+65k. The kernel no longer has a short-context penalty.
+
+Only full-attention layers have a diagonal pass; `attention_slide_flash` already
+processed its band through the run kernels.
+
+`full_attn_test.c` covers this path (the sliding path had `slide_attn_test.c` but
+the full path had none): 20 cases over prefix/block alignments and chunk sizes,
+with pure-diagonal cases exact to 0.0, plus a control that moves the causal cut by
+one key and shows 1.5e-2 against a ~5e-6 reassociation floor.
+
 ### Remaining levers
 
-- Attention is still the largest single prefill phase and now runs at ~250-280
-  GFLOP/s. The next structural step would be blocking the *diagonal* (within-chunk
-  causal) pass of `attention_full_flash`, which is still one key at a time.
 - `dense_down` (3072x12288) sits at 42 GMAC/s vs q_proj's 110; it is layer 0 only
   (~1/48 of the model) so the payoff is small, but 2D (row x token) blocking would
   fix it.

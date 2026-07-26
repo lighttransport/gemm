@@ -17,7 +17,7 @@ static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
 int main(int argc, char **argv) {
     int C = argc>1?atoi(argv[1]):256;
     int hd=LAGUNA_HEAD_DIM, nh=LAGUNA_FULL_HEADS, kvs=LAGUNA_KV_HEADS*hd;
-    int depths[] = {2048, 8192, 32768, 65536};
+    int depths[] = {0, 256, 1024, 2048, 8192, 32768, 65536};
     printf("LAGUNA_KB=%d  C=%d  (full-attention layer, nh=%d)\n", LAGUNA_KB, C, nh);
     for (size_t di=0; di<sizeof depths/sizeof *depths; ++di) {
         int pos0=depths[di], maxpos=pos0+C+8;

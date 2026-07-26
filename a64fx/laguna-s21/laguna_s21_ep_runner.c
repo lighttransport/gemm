@@ -969,14 +969,32 @@ static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, 
                 fm[c]=m_new;
             }
         }
-        /* diagonal keys [pos0, pos0+c]: causal within the chunk */
-        for (int c=cbeg;c<cend;++c) {
-            const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float *a=acc+(size_t)c*hd;
-            for (int j=0;j<=c;++j) {
-                float d=laguna_qkdot(q, kbase+(size_t)(pos0+j)*kvstride+(size_t)kvh*hd, hd)*scale;
-                float m_old=fm[c], m_new=m_old>d?m_old:d, corr=expf(m_old-m_new), p=expf(d-m_new);
-                fl[c]=fl[c]*corr+p;
-                laguna_vaxpy(a, vbase+(size_t)(pos0+j)*kvstride+(size_t)kvh*hd, p, corr, hd);
+        /* Diagonal keys [pos0, pos0+c]: causal within the chunk.  Blocked exactly
+         * like the prefix pass above -- one key at a time was the worst-shaped
+         * loop in the file (a per-key svaddv inside laguna_qkdot, a full-accumulator
+         * read-modify-write inside laguna_vaxpy, and two scalar expf), running at
+         * 67 GFLOP/s against the prefix pass's 382.  Its cost is C^2/2 per head
+         * regardless of context, so it was 27% of this kernel at pos0=2048 and 33%
+         * at pos0=1024, though only ~1% at 64k.
+         * Key order per query is still strictly increasing (kb ascends, and within
+         * a block j ascends), which is what the online softmax requires. */
+        for (int kb=0; kb<cend; kb+=LAGUNA_KB) {
+            int kend = kb+LAGUNA_KB-1; if (kend > cend-1) kend = cend-1;
+            int c0 = kb > cbeg ? kb : cbeg;      /* queries below kb have no key here */
+            for (int c=c0;c<cend;++c) {
+                int je = kend < c ? kend : c;    /* causal cutoff inside the block */
+                int n = je - kb + 1;
+                if (n <= 0) continue;
+                const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float *a=acc+(size_t)c*hd;
+                const uint16_t *kblk = kbase+(size_t)(pos0+kb)*kvstride+(size_t)kvh*hd;
+                const uint16_t *vblk = vbase+(size_t)(pos0+kb)*kvstride+(size_t)kvh*hd;
+                float sb[LAGUNA_KB], bmax=-INFINITY;
+                laguna_qk_run(sb, q, kblk, kvstride, n, scale, hd);
+                for (int b=0;b<n;++b) if (sb[b]>bmax) bmax=sb[b];
+                float m_old=fm[c], m_new=m_old>bmax?m_old:bmax, corr=expf(m_old-m_new);
+                float psum=laguna_exp_shift_sum(sb, n, m_new);
+                fl[c]=fl[c]*corr+psum;
+                laguna_av_run(a, sb, vblk, kvstride, n, corr, hd);
                 fm[c]=m_new;
             }
         }
