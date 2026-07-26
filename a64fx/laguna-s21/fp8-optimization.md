@@ -390,6 +390,24 @@ Full-attention layer, C=256, 47 threads, median of 5 runs (ms/call):
 This helps every attention path at once (`qk_run`, `av_run`, hence full flash,
 sliding flash and decode).
 
+**Confirmed end-to-end** on 12 nodes, both binaries back-to-back on one
+allocation (a fresh allocation and re-stage; `eb1ab88c` vs `5bda6d7f`):
+
+| | before | after | |
+|---|---|---|---|
+| prefill, 2377 tok | 57.0 tok/s | **60.4** | +6% |
+| **attn phase, 2377 tok** | 8.5 s | **6.5 s** | **1.31x** |
+| decode, 2377-tok ctx | 19.4 tok/s | **21.2** | +9% |
+| decode, 6-tok ctx | 27.9 tok/s | 28.0 | unchanged |
+
+Generated tokens are **identical** in both cases, as the bit-exactness implies.
+The 1.31x on the attention phase matches what the kernel benchmark predicted for
+this depth (1.26-1.35x), so the microbenchmark and the real model agree here --
+unlike the `svaddv` experiment below, where they did not.
+
+Short-context decode is unchanged because it is bound by streaming the weights,
+not by attention; the gain scales with context, which is the point.
+
 ### Two things that measured well in isolation and lost in context
 
 Worth recording because both cost real time and neither shipped:
