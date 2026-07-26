@@ -516,6 +516,60 @@ the full path had none): 20 cases over prefix/block alignments and chunk sizes,
 with pure-diagonal cases exact to 0.0, plus a control that moves the causal cut by
 one key and shows 1.5e-2 against a ~5e-6 reassociation floor.
 
+## Batched serving: the premise was wrong
+
+Continuous batching was built on the assumption that decode is weight-bandwidth
+bound -- ~13 GB read per token -- so K sequences stepped together would share one
+pass over the weights and scale close to K x. **Measured, that is false on this
+machine.** 150 tokens per stream, identical prompts:
+
+| K | wall | aggregate | per stream |
+|---|---|---|---|
+| 1 | 9.93 s | 15.1 tok/s | 15.1 |
+| 2 | 17.02 s | 17.6 | 8.8 |
+| 4 | 30.27 s | 19.8 | 5.0 |
+
+A K=4 step cost **3.05x** a K=1 step, not ~1x. Decode is far more compute-bound
+than the bandwidth arithmetic suggested; batching amortises the weight traffic and
+the 47 per-token allreduces, and that is worth only ~1.3x, not 4x.
+
+Two separate problems were behind the poor showing, and only one is fixed:
+
+1. **`laguna_matmat_i8` had no small-C path.** With C<8 it fell entirely into its
+   1-token tail, which re-widens the whole weight row for *every* token and does an
+   `svaddv` per (row, token) -- strictly worse than C separate matvecs. It now
+   widens once into a scratch and reuses it, the same `wrow` trick already used by
+   `laguna_matmat_i8blk`. (The kernel had only ever been exercised at C=256.)
+2. **K=1 through the batched path is much slower than `forward_token`** (15.1 vs
+   27.8 tok/s), because `forward_token` fuses q/k/v/g into one OpenMP region and
+   uses matvecs rather than 1-column GEMMs. The serve loop now routes a lone
+   request through `forward_token`, so a single client never pays for the batching
+   machinery.
+
+After both fixes, re-measured:
+
+| K | aggregate before fixes | after |
+|---|---|---|
+| 1 | 15.1 tok/s | **23.6** |
+| 2 | 17.6 | 16.0 |
+| 4 | 19.8 | 18.4 |
+
+The single-stream regression is repaired (15.1 -> 23.6, against 27.8 for the
+`--generate` path, the rest being HTTP and per-request accounting). **Batching is
+still a net loss**: 18.4 tok/s aggregate at K=4 against 23.6 for one stream.
+
+**`--max-batch` therefore defaults to 1** (no batching). The mechanism is correct
+-- four prompts served alone and concurrently give byte-identical output with zero
+lockstep disagreements -- but correctness is not a reason to enable something that
+measured slower. It is kept, off, because the machinery is verified and the
+blocker is now a specific, findable one: a K-token step costs ~3x a 1-token step,
+so whatever dominates decode here scales with tokens rather than with weight
+traffic. Identify that first; batching only pays once it does not.
+
+An honest note on how this went: the whole feature was justified by an arithmetic
+estimate ("13 GB/token, therefore bandwidth-bound") that was never measured. The
+scaling test that refuted it takes two minutes and should have come first.
+
 ### Remaining levers
 
 - `dense_down` (3072x12288) sits at 42 GMAC/s vs q_proj's 110; it is layer 0 only

@@ -221,7 +221,7 @@ static laguna_opts laguna_opts_default(void) {
      * do_sample, which stays off so an unadorned run is deterministic */
     o.smp.do_sample = 0; o.smp.temp = 1.0f; o.smp.top_p = 1.0f;
     o.smp.min_p = 0.0f;  o.smp.top_k = 20;  o.smp.rng = 0x1234ABCDull;
-    o.max_batch = 4;
+    o.max_batch = 1;   /* batching is opt-in until it is a measured win */
     return o;
 }
 /* returns 1 if argv[i] was consumed (advancing i), 0 if unrecognised */

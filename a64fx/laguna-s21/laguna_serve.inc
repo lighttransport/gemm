@@ -319,8 +319,23 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
             }
         }
 
-        /* --- one batched decode step over every active slot --- */
-        if (st.n_active > 0) {
+        /* --- one decode step over every active slot ---
+         * K==1 goes through forward_token, which fuses q/k/v/g into a single OMP
+         * region and uses matvec rather than a 1-column GEMM; measured 27.8 vs
+         * 15.1 tok/s, so a lone request must not pay for the batching machinery. */
+        if (st.n_active == 1) {
+            int slot = st.act_slot[0];
+            lbat_slot *s = &B.slot[slot];
+            memcpy(x, B.X + (size_t)slot*LAGUNA_HIDDEN, LAGUNA_HIDDEN*sizeof(float));
+            forward_token(m, sc, x, slot, st.act_pos[0], &g_aar, 1);
+            int nxt = pick_token(sc, &s->smp, &disagree);
+            s->pos++;
+            if (nxt==eos0 || nxt==eos1) s->hit_eos = 1;
+            else if (s->ngen < s->max_new) {
+                s->gen[s->ngen++] = nxt;
+                embed_token(m, nxt, B.X + (size_t)slot*LAGUNA_HIDDEN);
+            }
+        } else if (st.n_active > 1) {
             for (int i=0;i<st.n_active;i++) {
                 B.seqs[i] = st.act_slot[i];
                 B.poss[i] = st.act_pos[i];

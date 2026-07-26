@@ -406,6 +406,34 @@ static inline void laguna_matvec_i8_multi(float *const *ys, const laguna_w8 *con
  * summation order is unchanged, only the order outputs are produced in. */
 static inline void laguna_matmat_i8(float *restrict Y, const laguna_w8 *w,
                                     const float *restrict X, int rows, int cols, int C) {
+    /* Small C (batched decode, C = batch size) would otherwise fall entirely into
+     * the 1-token tail below, which re-widens the whole weight row for EVERY token
+     * and does an svaddv per (row, token) -- strictly worse than C separate
+     * matvecs.  Widen the row once into a scratch and reuse it across the C dots,
+     * as laguna_matmat_i8blk does.  Measured: a K=4 decode step was costing 3.05x
+     * a K=1 step before this, when batching should make it nearly free. */
+    if (C < 8 && cols <= LAGUNA_DENSE_INTER) {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int r=0;r<rows;++r) {
+            const int8_t *q=w->q+(size_t)r*cols; float sc=w->s[r];
+            float wrow[LAGUNA_DENSE_INTER];
+            int VL=(int)svcntw(); svbool_t pt=svptrue_b32();
+            svfloat32_t sv=svdup_f32(sc);
+            for (int c=0;c<cols;c+=VL) {
+                svbool_t pg=svwhilelt_b32(c,cols);
+                svst1_f32(pg, wrow+c, svmul_f32_x(pg, svcvt_f32_s32_x(pg, svld1sb_s32(pg,q+c)), sv));
+            }
+            for (int ct=0;ct<C;++ct) {
+                const float *x=X+(size_t)ct*cols; svfloat32_t a=svdup_f32(0);
+                for (int c=0;c<cols;c+=VL){ svbool_t pg=svwhilelt_b32(c,cols);
+                    a=svmla_f32_x(pg,a,svld1_f32(pg,wrow+c),svld1_f32(pg,x+c)); }
+                Y[(size_t)ct*rows+r]=svaddv_f32(pt,a);
+            }
+        }
+        return;
+    }
     int TB = (int)(4194304u/((unsigned)cols*4u));   /* ~4 MB of X per block */
     if (TB > C) TB = C;
     TB &= ~7; if (TB < 8) TB = 8;
