@@ -242,6 +242,7 @@ static int laguna_opt_parse(laguna_opts *o, int argc, char **argv, int *i) {
     #undef NEXT
     if(!strcmp(a,"--sample"))    { o->smp.do_sample = 1; return 1; }
     if(!strcmp(a,"--debug"))     { o->debug = 1; return 1; }
+    if(!strcmp(a,"--prof"))      { g_prof = 1; return 1; }
     if(!strcmp(a,"--fp8-exact")) { o->fp8_exact = 1; return 1; }
     return 0;
 }
@@ -415,6 +416,23 @@ static int run_generate(int argc, char **argv){
                    smp.temp, smp.top_k, smp.top_p, smp.min_p,
                    (unsigned long long)seed0);
         if(hit_eos) logmsg("stopped on eos after %d tokens\n", ngen);
+        if(g_prof){
+            double tot=dc1-dc0, comm=g_ar_secs;
+            double sum=g_d_qkv+g_d_core+g_d_oproj+g_d_router+g_d_experts+g_d_shared+g_d_lmhead+g_t_norm;
+            logmsg("decode profile over %d tokens (%.1f ms/token):\n", ngen, tot*1e3/(ngen?ngen:1));
+            #define P(nm,v) logmsg("    %-22s %7.2f s  %5.1f%%  %6.2f ms/token\n", nm, (double)(v), 100.0*(v)/tot, (v)*1e3/(ngen?ngen:1))
+            P("qkv+gate linears", g_d_qkv);
+            P("attention core",   g_d_core);
+            P("o_proj",           g_d_oproj);
+            P("router",           g_d_router);
+            P("routed experts",   g_d_experts);
+            P("shared expert+AR", g_d_shared);
+            P("lm_head",          g_d_lmhead);
+            P("rmsnorm",          g_t_norm);
+            #undef P
+            logmsg("    %-22s %7.2f s  %5.1f%%   (inside the phases above)\n","of which allreduce",comm,100.0*comm/tot);
+            logmsg("    %-22s %7.2f s  %5.1f%%\n","unattributed",tot-sum,100.0*(tot-sum)/tot);
+        }
         logmsg("decode %d tok in %.2fs (%.1f tok/s) total_nan=%d comm=%.2fs (%.1f%%) threads=%d\n",
                ngen,dc1-dc0,ngen/(dc1-dc0>0?dc1-dc0:1),total_nan,g_ar_secs,
                (dc1-dc0)>0?100.0*g_ar_secs/(dc1-dc0):0.0,nth);

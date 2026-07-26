@@ -669,6 +669,12 @@ static void laguna_report_memory(void) {
             laguna_hsize(tot,b5,sizeof b5), laguna_hsize(laguna_mem_available(),b6,sizeof b6));
 }
 
+double g_t_attn=0, g_t_mlp=0, g_t_norm=0; int g_prof=0;
+/* finer decode breakdown (--prof): where a single-token step actually goes */
+double g_d_qkv=0, g_d_core=0, g_d_oproj=0, g_d_router=0, g_d_experts=0,
+       g_d_shared=0, g_d_lmhead=0, g_d_norm=0, g_d_resid=0;
+static double prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+
 /* Attention for one token at `pos`. `x` is input_layernorm output (n1). Writes attn_out. */
 /* SVE-vectorized per-position attention inner ops (bf16 KV widened to f32).
  * These are the O(context) hot loops that dominate long-context prefill. */
@@ -907,9 +913,13 @@ static void attention(const laguna_model *m, const laguna_layer *ly, laguna_scra
     float *ys[4]={sc->qf,sc->kf,sc->vf,sc->gf};
     const laguna_lin *Ws[4]={&ly->q_proj,&ly->k_proj,&ly->v_proj,&ly->g_proj};
     int rws[4]={nh*hd, LAGUNA_KV_HEADS*hd, LAGUNA_KV_HEADS*hd, nh};
+    double _p = g_prof?prof_now():0;
     laguna_lin_mv_multi(ys, Ws, rws, 4, sc->n1, LAGUNA_HIDDEN);
+    if(g_prof){double n=prof_now(); g_d_qkv+=n-_p; _p=n;}
     attention_core(m, ly, sc, layer, seq, pos, nh, sc->qf, sc->kf, sc->vf, sc->gf, sc->ao);
+    if(g_prof){double n=prof_now(); g_d_core+=n-_p; _p=n;}
     laguna_lin_mv(sc->attn_out, &ly->o_proj, sc->ao, LAGUNA_HIDDEN, nh*hd);
+    if(g_prof) g_d_oproj+=prof_now()-_p;
 }
 
 /* Query-block flash attention for a chunk of C tokens on a FULL-attention layer.
@@ -1160,10 +1170,10 @@ static void swiglu_lin_batch(laguna_scratch *sc, const laguna_lin *gate_w, const
 static int g_dbg=0;
 static double vnorm(const float*v,int n){ double s=0; for(int i=0;i<n;i++)s+=(double)v[i]*v[i]; return sqrt(s); }
 /* lightweight phase profiling (enabled by the bench) */
-double g_t_attn=0, g_t_mlp=0, g_t_norm=0; int g_prof=0;
+
 /* chunked-prefill phase timers (rank-0, seconds) */
 double g_c_qkv=0, g_c_attn=0, g_c_op=0, g_c_router=0, g_c_expert=0, g_c_shared=0, g_c_ar=0;
-static double prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+
 static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, int seq, int pos,
                           laguna_async_ar *aar, int compute_logits) {
     for (int L=0; L<m->n_layers; ++L) {
@@ -1185,10 +1195,12 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
             for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]+=sc->attn_out[i];
         } else {
             /* router: sigmoid + bias, top-10, normalized */
+            double _q = g_prof?prof_now():0;
             laguna_lin_mv(sc->logits, &ly->router_w, sc->n2, LAGUNA_EXPERTS, LAGUNA_HIDDEN);
             int ids[LAGUNA_ACTIVE]; float rw[LAGUNA_ACTIVE];
             laguna_top10(sc->logits, ly->router_bias, ids, rw);
             for (int i=0;i<LAGUNA_HIDDEN;++i) sc->partial[i]=0.0f;
+            if(g_prof){double n=prof_now(); g_d_router+=n-_q; _q=n;}
             for (int k=0;k<LAGUNA_ACTIVE;++k) {
                 int e=ids[k]; const laguna_expert *ex=&ly->experts[e];
                 if (!ex->present) continue;
@@ -1198,18 +1210,22 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
             }
             /* Launch the routed-partial allreduce on the comm thread, then compute
              * the (independent) shared expert on the OMP team so they overlap. */
+            if(g_prof){double n=prof_now(); g_d_experts+=n-_q; _q=n;}
             if (aar && aar->launch) aar->launch(aar->ctx, sc->partial, LAGUNA_HIDDEN);
             swiglu_lin(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->n2,
                        sc->shared, LAGUNA_SHARED_INTER);
             if (aar && aar->join) aar->join(aar->ctx);
+            if(g_prof) g_d_shared+=prof_now()-_q;
             if(g_dbg&&compute_logits) logmsg("L%02d pos%d ||shared||=%.3f ||routed||=%.3f e0=%d\n",L,pos,vnorm(sc->shared,LAGUNA_HIDDEN),vnorm(sc->partial,LAGUNA_HIDDEN),ids[0]);
             for (int i=0;i<LAGUNA_HIDDEN;++i) x[i]+=sc->shared[i]+LAGUNA_ROUTED_SCALE*sc->partial[i];
         }
         if(g_prof) g_t_mlp+=prof_now()-pm0;
     }
     if (compute_logits) {
+        double _l = g_prof?prof_now():0;
         laguna_rmsnorm(sc->n1, x, m->final_norm, LAGUNA_HIDDEN, LAGUNA_RMS_EPS);
         laguna_lin_mv(sc->logits, &m->lm_head, sc->n1, LAGUNA_VOCAB, LAGUNA_HIDDEN);
+        if(g_prof) g_d_lmhead+=prof_now()-_l;
     }
 }
 
