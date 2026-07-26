@@ -16,8 +16,27 @@
 #include "safetensors.h"
 
 #define ALIGN 256u
-static int envi(const char *k, int d) { const char *v=getenv(k); return v&&*v ? atoi(v) : d; }
-static int rank_env(void) { const char *ks[]={"LAGUNA_EP_RANK","PMIX_RANK","OMPI_COMM_WORLD_RANK","PMI_RANK",NULL}; for(int i=0;ks[i];++i){const char*v=getenv(ks[i]);if(v&&*v)return atoi(v);} return 0; }
+/* MPI rank is supplied by the launcher, not by the user -- it is the one thing
+ * that legitimately comes from the environment (there is no CLI channel for it
+ * under mpiexec).  --rank overrides for single-process testing. */
+static int rank_from_launcher(void) {
+    const char *ks[]={"PMIX_RANK","OMPI_COMM_WORLD_RANK","PMI_RANK",NULL};
+    for(int i=0;ks[i];++i){ const char*v=getenv(ks[i]); if(v&&*v) return atoi(v); }
+    return 0;
+}
+static void stage_usage(const char *p) {
+    fprintf(stderr,
+      "usage: %s --model-dir DIR --stage-dir DIR [options]\n"
+      "  --model-dir DIR   source safetensors checkpoint (required)\n"
+      "  --stage-dir DIR   node-local destination (required)\n"
+      "  --status-dir DIR  where to drop the per-rank completion marker\n"
+      "  --ep-size N       expert-parallel group size (default 12)\n"
+      "  --nshards N       safetensors shard count (default 15)\n"
+      "  --shard-limit N   stop after N shards (bring-up)\n"
+      "  --layers N        stage only the first N layers (bring-up)\n"
+      "  --no-dense        skip the dense/attention tensors\n"
+      "  --rank N          override the launcher-provided MPI rank\n", p);
+}
 static long expert_id(const char *s) { const char *p=strstr(s,".mlp.experts."); if(!p) return -1; p+=13; return (*p>='0'&&*p<='9') ? strtol(p,NULL,10) : -1; }
 static long layer_id(const char *s) { const char *p=strstr(s,"model.layers."); if(!p) return -1; p+=13; return (*p>='0'&&*p<='9') ? strtol(p,NULL,10) : -1; }
 static int write_all(int fd,const void *p,size_t n) { const unsigned char *b=p; while(n){ ssize_t w=write(fd,b,n>(size_t)(1u<<30)?(size_t)(1u<<30):n); if(w<0){if(errno==EINTR)continue;return -1;} b+=w;n-=(size_t)w;} return 0; }
@@ -42,13 +61,23 @@ static void drop_source(int fd, const void *p, size_t n) {
 }
 
 int main(int argc, char **argv) {
-    const char *model=getenv("LAGUNA_MODEL_DIR"), *stage=getenv("LAGUNA_STAGE_DIR"), *status=getenv("LAGUNA_STATUS_DIR");
-    if(argc==3 && !strcmp(argv[1],"--model")) model=argv[2];
-    if(!model) model="/home/u14346/models/laguna-s21-int4";
-    if(!stage) stage="/local/laguna-s21";
-    int rank=rank_env(), ep=envi("LAGUNA_EP_SIZE",12), nshards=envi("LAGUNA_NSHARDS",15), dense=envi("LAGUNA_STAGE_DENSE",1);
-    int shard_limit=envi("LAGUNA_SHARD_LIMIT",0);
-    int layer_limit=envi("LAGUNA_STAGE_LAYERS",0);
+    const char *model=NULL, *stage=NULL, *status=NULL;
+    int rank=rank_from_launcher(), ep=12, nshards=15, dense=1;
+    int shard_limit=0, layer_limit=0;
+    for (int i=1;i<argc;i++) {
+        if(!strcmp(argv[i],"--model-dir")&&i+1<argc) model=argv[++i];
+        else if(!strcmp(argv[i],"--stage-dir")&&i+1<argc) stage=argv[++i];
+        else if(!strcmp(argv[i],"--status-dir")&&i+1<argc) status=argv[++i];
+        else if(!strcmp(argv[i],"--ep-size")&&i+1<argc) ep=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--nshards")&&i+1<argc) nshards=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--shard-limit")&&i+1<argc) shard_limit=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--layers")&&i+1<argc) layer_limit=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--no-dense")) dense=0;
+        else if(!strcmp(argv[i],"--rank")&&i+1<argc) rank=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){ stage_usage(argv[0]); return 0; }
+        else { fprintf(stderr,"unknown flag %s\n",argv[i]); stage_usage(argv[0]); return 2; }
+    }
+    if(!model||!stage){ fprintf(stderr,"--model-dir and --stage-dir are required\n"); stage_usage(argv[0]); return 2; }
     if (shard_limit <= 0 || shard_limit > nshards) shard_limit = nshards;
     if(rank<0||rank>=ep||ep<1||ep>12){fprintf(stderr,"bad rank/ep-size %d/%d\n",rank,ep);return 2;}
     if(mkdir_p(stage)){perror(stage);return 2;}

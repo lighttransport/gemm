@@ -48,7 +48,6 @@ static void logmsg(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap); va_end(ap);
 }
 static double now_sec(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
-static int envi(const char*k,int d){ const char*v=getenv(k); return (v&&*v)?atoi(v):d; }
 
 /* ============================ ABI self-tests ============================ */
 static int test_i4(void) {
@@ -295,6 +294,41 @@ static int stage_load(laguna_stage *s, const char *dir, int rank, int use_arena)
     return 0;
 }
 
+/* ---------------- allocation: checked, accounted, and reported ----------------
+ * Every large allocation goes through these so that (a) a failure names what was
+ * being allocated and how big it was instead of dying on a NULL deref deep in a
+ * kernel, and (b) the totals can be reported up front, which is what makes an
+ * over-large context fail with a budget rather than an OOM kill. */
+static size_t g_mem_weights = 0, g_mem_kv = 0, g_mem_scratch = 0, g_mem_other = 0;
+
+static const char *laguna_hsize(size_t b, char *buf, size_t n) {
+    const char *u[] = {"B","KB","MB","GB","TB"}; int i=0; double v=(double)b;
+    while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
+    snprintf(buf, n, "%.2f %s", v, u[i]); return buf;
+}
+/* Total memory the OS is willing to give us right now (MemAvailable accounts for
+ * reclaimable page cache, unlike MemFree).  0 if unknown. */
+static size_t laguna_mem_available(void) {
+    FILE *f = fopen("/proc/meminfo", "r"); if (!f) return 0;
+    char line[256]; size_t kb = 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) break;
+    fclose(f); return kb * 1024;
+}
+static void *laguna_xalloc(size_t bytes, size_t *bucket, const char *what) {
+    void *p = NULL;
+    if (bytes == 0) return NULL;
+    if (posix_memalign(&p, 256, bytes) != 0 || !p) {
+        char b1[32], b2[32];
+        fprintf(stderr, "FATAL: could not allocate %s for %s (available %s)\n",
+                laguna_hsize(bytes, b1, sizeof b1), what,
+                laguna_hsize(laguna_mem_available(), b2, sizeof b2));
+        exit(1);
+    }
+    if (bucket) *bucket += bytes;
+    return p;
+}
+
 /* Bump allocator for re-quantized weights, handing out of big (1 GB) chunks.
  *
  * These MUST NOT be thousands of separate posix_memalign blocks.  Decode streams
@@ -315,8 +349,15 @@ static void *qalloc(size_t n) {
         size_t want = n > LAGUNA_QCHUNK ? n : LAGUNA_QCHUNK;
         void *p = mmap(NULL, want, PROT_READ|PROT_WRITE,
                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) { fprintf(stderr,"FATAL: qalloc %.2f GB failed\n",want/1e9); exit(1); }
-        g_qcur = p; g_qleft = want;
+        if (p == MAP_FAILED) {
+            char b1[32], b2[32], b3[32];
+            fprintf(stderr, "FATAL: weight arena could not grow by %s "
+                    "(%s already committed, %s available)\n",
+                    laguna_hsize(want,b1,sizeof b1), laguna_hsize(g_mem_weights,b2,sizeof b2),
+                    laguna_hsize(laguna_mem_available(),b3,sizeof b3));
+            exit(1);
+        }
+        g_qcur = p; g_qleft = want; g_mem_weights += want;
     }
     void *r = g_qcur; g_qcur += n; g_qleft -= n; return r;
 }
@@ -340,8 +381,8 @@ static laguna_lin stage_lin(const laguna_stage *s, const char *name, int rows, i
 #endif
 
 #if defined(LAGUNA_FP8)
-/* LAGUNA_FP8_EXACT=1 keeps the exact e4m3 LUT-gather kernels (A/B reference)
- * instead of the int8-per-block re-quantization. */
+/* --fp8-exact keeps the exact e4m3 LUT-gather kernels (A/B reference) instead of
+ * the int8-per-block re-quantization.  Set from argv before model_build. */
 static int g_fp8_exact = 0;
 static void alloc_w8b(laguna_w8b *w, int rows, int cols) {
     int cblk = cols/LAGUNA_FP8_BLK;
@@ -388,6 +429,54 @@ static void fp8_release_blob(laguna_model *m, laguna_stage *s) {
 }
 #endif
 
+
+/* ---------------- long-context budget ----------------
+ * Everything that scales with context is known in closed form before a byte is
+ * allocated, so an over-large --maxpos can be refused with a budget and the
+ * largest workable value, rather than being discovered by the OOM killer part way
+ * through a 20-minute prefill.
+ *
+ * Per position the only growing term is the FULL-attention layers' KV: sliding
+ * layers are ringed at LAGUNA_SLIDING_CAP and cost a constant.  Scratch is
+ * dominated by sc->scores, which is MAX_HEADS*maxpos floats. */
+static size_t laguna_ctx_bytes_per_pos(int n_layers) {
+    int n_full = 0;
+    for (int L = 0; L < n_layers; ++L) if (L % 4 == 0) ++n_full;
+    size_t kv  = (size_t)n_full * LAGUNA_KV_HEADS * LAGUNA_HEAD_DIM * 2 /*K+V*/ * sizeof(uint16_t);
+    size_t rope = (size_t)(LAGUNA_ROPE_FULL_DIM/2 + LAGUNA_ROPE_SLIDING_DIM/2) * 2 /*cos+sin*/ * sizeof(float);
+    size_t scores = (size_t)LAGUNA_MAX_HEADS * sizeof(float);
+    return kv + rope + scores;
+}
+static size_t laguna_ctx_fixed_bytes(int n_layers) {
+    int n_slide = n_layers - (n_layers + 3) / 4;
+    return (size_t)n_slide * LAGUNA_SLIDING_CAP * LAGUNA_KV_HEADS * LAGUNA_HEAD_DIM * 2 * sizeof(uint16_t);
+}
+static void laguna_report_context_budget(const laguna_model *m, int n_layers, int max_pos, int rank) {
+    (void)m;
+    size_t per   = laguna_ctx_bytes_per_pos(n_layers);
+    size_t fixed = laguna_ctx_fixed_bytes(n_layers);
+    size_t need  = fixed + per * (size_t)max_pos;
+    size_t avail = laguna_mem_available();
+    char b1[32], b2[32], b3[32], b4[32], b5[32];
+    if (rank == 0)
+        fprintf(stderr, "  context budget: maxpos %d needs %s (%s/token growing + %s fixed); "
+                        "weights hold %s, %s available\n",
+                max_pos, laguna_hsize(need,b1,sizeof b1), laguna_hsize(per,b2,sizeof b2),
+                laguna_hsize(fixed,b3,sizeof b3), laguna_hsize(g_mem_weights,b4,sizeof b4),
+                laguna_hsize(avail,b5,sizeof b5));
+    /* Leave headroom for the chunk scratch and transient copies; refuse early if
+     * the growing part alone cannot fit. */
+    if (avail && need + (size_t)(256u<<20) > avail) {
+        long fits = avail > fixed + (size_t)(256u<<20)
+                  ? (long)((avail - fixed - (size_t)(256u<<20)) / per) : 0;
+        fprintf(stderr, "FATAL: context of %d does not fit: needs %s, only %s available.\n"
+                        "       Largest --maxpos that fits here is about %ld.\n",
+                max_pos, laguna_hsize(need,b1,sizeof b1), laguna_hsize(avail,b2,sizeof b2), fits);
+        (void)b3; (void)b4; (void)b5;
+        exit(1);
+    }
+}
+
 /* Fill the model from a rank-local stage. n_layers lets a bring-up run truncate.
  * Attention/dense/shared/router/lm_head are quantized to int8 (W8) at load to
  * halve the per-token weight bandwidth; norms/embed stay bf16, experts stay int4. */
@@ -396,7 +485,6 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
     memset(m,0,sizeof *m);
 #if defined(LAGUNA_FP8)
     laguna_fp8_init_lut();
-    { const char *e=getenv("LAGUNA_FP8_EXACT"); g_fp8_exact = e && atoi(e); }
 #endif
     m->n_layers=n_layers; m->max_pos=max_pos; m->ep_rank=rank; m->ep_size=ep_size;
     m->embed      = stage_req(s,"model.embed_tokens.weight");
@@ -477,11 +565,11 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
     }
     /* rope tables + KV cache */
     int hf=LAGUNA_ROPE_FULL_DIM/2, hs=LAGUNA_ROPE_SLIDING_DIM/2;
-    m->full_cos=malloc((size_t)max_pos*hf*sizeof(float)); m->full_sin=malloc((size_t)max_pos*hf*sizeof(float));
-    m->swa_cos =malloc((size_t)max_pos*hs*sizeof(float)); m->swa_sin =malloc((size_t)max_pos*hs*sizeof(float));
-    if(!m->full_cos||!m->full_sin||!m->swa_cos||!m->swa_sin){
-        fprintf(stderr,"FATAL: rope table alloc failed for maxpos %d (%.2f GB)\n",
-                max_pos,(double)max_pos*(hf+hs)*2*sizeof(float)/1e9); exit(1); }
+    laguna_report_context_budget(m, n_layers, max_pos, rank);
+    m->full_cos=laguna_xalloc((size_t)max_pos*hf*sizeof(float),&g_mem_other,"rope full_cos");
+    m->full_sin=laguna_xalloc((size_t)max_pos*hf*sizeof(float),&g_mem_other,"rope full_sin");
+    m->swa_cos =laguna_xalloc((size_t)max_pos*hs*sizeof(float),&g_mem_other,"rope swa_cos");
+    m->swa_sin =laguna_xalloc((size_t)max_pos*hs*sizeof(float),&g_mem_other,"rope swa_sin");
     laguna_build_rope_tables(m);
     /* Per-layer KV: full-attention layers keep the whole context; sliding layers
      * use a SLIDING_WINDOW ring buffer.  Keeps 128k KV at ~6.5 GB not ~26. */
@@ -490,17 +578,8 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
         int cap = m->layers[L].is_sliding ? LAGUNA_SLIDING_CAP : max_pos;
         m->kv_cap[L]=cap; m->kv_off[L]=kv_elems; kv_elems += (size_t)cap*slot;
     }
-    m->kcache=malloc(kv_elems*sizeof(uint16_t));
-    m->vcache=malloc(kv_elems*sizeof(uint16_t));
-    if(!m->kcache||!m->vcache){
-        fprintf(stderr,"FATAL: KV cache alloc failed: maxpos %d needs %.2f GB "
-                "(%d full-attention layers x %d B/pos, %d sliding layers ringed at %d)\n",
-                max_pos, (double)kv_elems*2*sizeof(uint16_t)/1e9,
-                n_layers - n_layers*3/4, (int)((size_t)slot*2*sizeof(uint16_t)),
-                n_layers*3/4, LAGUNA_SLIDING_CAP);
-        exit(1); }
-    if (rank==0) fprintf(stderr,"  KV cache: %.2f GB for maxpos %d\n",
-                         (double)kv_elems*2*sizeof(uint16_t)/1e9, max_pos);
+    m->kcache=laguna_xalloc(kv_elems*sizeof(uint16_t),&g_mem_kv,"K cache");
+    m->vcache=laguna_xalloc(kv_elems*sizeof(uint16_t),&g_mem_kv,"V cache");
 }
 
 /* ============================ forward pass ============================ */
@@ -534,49 +613,53 @@ _Static_assert(LAGUNA_SLIDING_CAP >= LAGUNA_SLIDING_WINDOW + LAGUNA_PCHUNK - 1,
                "sliding ring too small for LAGUNA_PCHUNK: chunk writes would clobber "
                "slots the chunk's own earlier queries still need");
 static void scratch_alloc(laguna_scratch *sc, int max_pos) {
+#define SALLOC(field, nbytes, what) sc->field = laguna_xalloc((nbytes), &g_mem_scratch, what)
     { int C=LAGUNA_PCHUNK, H=LAGUNA_HIDDEN;
-      sc->cn1=malloc((size_t)C*H*sizeof(float));   sc->cn2=malloc((size_t)C*H*sizeof(float));
-      sc->cq =malloc((size_t)C*LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-      sc->ck =malloc((size_t)C*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-      sc->cv =malloc((size_t)C*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-      sc->cg =malloc((size_t)C*LAGUNA_MAX_HEADS*sizeof(float));
-      sc->cao=malloc((size_t)C*LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-      sc->cattn=malloc((size_t)C*H*sizeof(float));
-      sc->cia=malloc((size_t)C*LAGUNA_DENSE_INTER*sizeof(float));
-      sc->cib=malloc((size_t)C*LAGUNA_DENSE_INTER*sizeof(float));
-      sc->cpart=malloc((size_t)C*H*sizeof(float)); sc->cshared=malloc((size_t)C*H*sizeof(float));
-      sc->fm=malloc((size_t)LAGUNA_MAX_HEADS*C*sizeof(float));
-      sc->fl=malloc((size_t)LAGUNA_MAX_HEADS*C*sizeof(float));
-      sc->facc=malloc((size_t)LAGUNA_MAX_HEADS*C*LAGUNA_HEAD_DIM*sizeof(float));
-      sc->rids=malloc((size_t)C*LAGUNA_ACTIVE*sizeof(int)); sc->rrw=malloc((size_t)C*LAGUNA_ACTIVE*sizeof(float));
-      sc->xe=malloc((size_t)C*H*sizeof(float)); sc->ye=malloc((size_t)C*H*sizeof(float));
-      sc->crouter=malloc((size_t)C*LAGUNA_EXPERTS*sizeof(float)); }
-    sc->n1=malloc(LAGUNA_HIDDEN*sizeof(float));
-    sc->n2=malloc(LAGUNA_HIDDEN*sizeof(float));
-    sc->qf=malloc((size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-    sc->kf=malloc(LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-    sc->vf=malloc(LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-    sc->gf=malloc(LAGUNA_MAX_HEADS*sizeof(float));
-    sc->ao=malloc((size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float));
-    sc->attn_out=malloc(LAGUNA_HIDDEN*sizeof(float));
-    sc->inter_a=malloc(LAGUNA_DENSE_INTER*sizeof(float));
-    sc->inter_b=malloc(LAGUNA_DENSE_INTER*sizeof(float));
-    sc->partial=malloc(LAGUNA_HIDDEN*sizeof(float));
-    sc->shared=malloc(LAGUNA_HIDDEN*sizeof(float));
-    sc->logits=malloc(LAGUNA_VOCAB*sizeof(float));
-    sc->scores=malloc((size_t)LAGUNA_MAX_HEADS*max_pos*sizeof(float));
-    /* scores is the only maxpos-sized scratch; at 128k it is ~38 MB.  Check it and
-     * the chunk buffers explicitly -- a long-context run that silently gets NULL
-     * here segfaults deep inside attention instead of reporting the real problem. */
-    if(!sc->scores||!sc->cn1||!sc->cn2||!sc->cq||!sc->ck||!sc->cv||!sc->cg||!sc->cao||
-       !sc->cattn||!sc->cia||!sc->cib||!sc->cpart||!sc->cshared||!sc->fm||!sc->fl||
-       !sc->facc||!sc->rids||!sc->rrw||!sc->xe||!sc->ye||!sc->crouter||
-       !sc->n1||!sc->n2||!sc->qf||!sc->kf||!sc->vf||!sc->gf||!sc->ao||!sc->attn_out||
-       !sc->inter_a||!sc->inter_b||!sc->partial||!sc->shared||!sc->logits){
-        fprintf(stderr,"FATAL: scratch alloc failed (maxpos %d, scores %.2f GB)\n",
-                max_pos,(double)LAGUNA_MAX_HEADS*max_pos*sizeof(float)/1e9);
-        exit(1);
-    }
+      size_t cH = (size_t)C*H*sizeof(float);
+      SALLOC(cn1, cH, "chunk n1");                    SALLOC(cn2, cH, "chunk n2");
+      SALLOC(cq,  (size_t)C*LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float), "chunk q");
+      SALLOC(ck,  (size_t)C*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float),  "chunk k");
+      SALLOC(cv,  (size_t)C*LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float),  "chunk v");
+      SALLOC(cg,  (size_t)C*LAGUNA_MAX_HEADS*sizeof(float), "chunk gate");
+      SALLOC(cao, (size_t)C*LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float), "chunk attn out");
+      SALLOC(cattn, cH, "chunk attn proj");
+      SALLOC(cia, (size_t)C*LAGUNA_DENSE_INTER*sizeof(float), "chunk inter a");
+      SALLOC(cib, (size_t)C*LAGUNA_DENSE_INTER*sizeof(float), "chunk inter b");
+      SALLOC(cpart, cH, "chunk routed partial");      SALLOC(cshared, cH, "chunk shared");
+      SALLOC(fm, (size_t)LAGUNA_MAX_HEADS*C*sizeof(float), "flash max");
+      SALLOC(fl, (size_t)LAGUNA_MAX_HEADS*C*sizeof(float), "flash denom");
+      SALLOC(facc, (size_t)LAGUNA_MAX_HEADS*C*LAGUNA_HEAD_DIM*sizeof(float), "flash acc");
+      SALLOC(rids, (size_t)C*LAGUNA_ACTIVE*sizeof(int), "routing ids");
+      SALLOC(rrw,  (size_t)C*LAGUNA_ACTIVE*sizeof(float), "routing weights");
+      SALLOC(xe, cH, "expert gather in");              SALLOC(ye, cH, "expert gather out");
+      SALLOC(crouter, (size_t)C*LAGUNA_EXPERTS*sizeof(float), "chunk router logits"); }
+    SALLOC(n1, LAGUNA_HIDDEN*sizeof(float), "n1");
+    SALLOC(n2, LAGUNA_HIDDEN*sizeof(float), "n2");
+    SALLOC(qf, (size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float), "q");
+    SALLOC(kf, LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float), "k");
+    SALLOC(vf, LAGUNA_KV_HEADS*LAGUNA_HEAD_DIM*sizeof(float), "v");
+    SALLOC(gf, LAGUNA_MAX_HEADS*sizeof(float), "attention gate");
+    SALLOC(ao, (size_t)LAGUNA_MAX_HEADS*LAGUNA_HEAD_DIM*sizeof(float), "attn out");
+    SALLOC(attn_out, LAGUNA_HIDDEN*sizeof(float), "attn proj out");
+    SALLOC(inter_a, LAGUNA_DENSE_INTER*sizeof(float), "inter a");
+    SALLOC(inter_b, LAGUNA_DENSE_INTER*sizeof(float), "inter b");
+    SALLOC(partial, LAGUNA_HIDDEN*sizeof(float), "routed partial");
+    SALLOC(shared,  LAGUNA_HIDDEN*sizeof(float), "shared expert out");
+    SALLOC(logits,  LAGUNA_VOCAB*sizeof(float), "logits");
+    /* the only maxpos-sized scratch: MAX_HEADS * maxpos floats (~38 MB at 128k) */
+    SALLOC(scores, (size_t)LAGUNA_MAX_HEADS*max_pos*sizeof(float), "attention scores");
+#undef SALLOC
+}
+
+/* One line summarising where the process memory went; printed by rank 0 after the
+ * model is built so a long-context run shows its budget before it commits to it. */
+static void laguna_report_memory(void) {
+    char b1[32],b2[32],b3[32],b4[32],b5[32],b6[32];
+    size_t tot = g_mem_weights+g_mem_kv+g_mem_scratch+g_mem_other;
+    fprintf(stderr, "  memory: weights %s + KV %s + scratch %s + other %s = %s (%s still available)\n",
+            laguna_hsize(g_mem_weights,b1,sizeof b1), laguna_hsize(g_mem_kv,b2,sizeof b2),
+            laguna_hsize(g_mem_scratch,b3,sizeof b3), laguna_hsize(g_mem_other,b4,sizeof b4),
+            laguna_hsize(tot,b5,sizeof b5), laguna_hsize(laguna_mem_available(),b6,sizeof b6));
 }
 
 /* Attention for one token at `pos`. `x` is input_layernorm output (n1). Writes attn_out. */
@@ -1335,6 +1418,7 @@ int main(int argc, char **argv) {
     if (argc>=3 && argc<=4 && !strcmp(argv[1],"--check-stage")) return stage_check(argv[2],argc==4?atoi(argv[3]):0);
     if (argc==3 && !strcmp(argv[1],"--probe-stage")) return probe_stage(argv[2]);
     if (argc>=2 && !strcmp(argv[1],"--generate")) return run_generate(argc,argv);
+    if (argc>=2 && !strcmp(argv[1],"--serve"))    return run_serve(argc,argv);
     usage(argv[0]); return 2;
 }
 #endif /* LAGUNA_BENCH */

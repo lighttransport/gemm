@@ -26,8 +26,9 @@ static void die(const char *what, int rc) { logmsg("FATAL: %s (rc=%d)\n", what, 
 static inline size_t bar_recv_off(int s){ return BAR_BASE+(size_t)s*SlotB; }
 static inline size_t bar_go_off(void)   { return BAR_BASE+(size_t)N*SlotB; }
 
+static const char *g_topo_path = NULL;    /* --topo, default ./tofu_topo.txt */
 static int read_topo(uint8_t coords[][TOFU_NCOORDS]){
-    const char*t=getenv("TOFU_TOPO_PATH"); const char*tp=(t&&*t)?t:TOPO_PATH;
+    const char *tp = g_topo_path ? g_topo_path : TOPO_PATH;
     FILE*f=fopen(tp,"r");
     if(!f){ fprintf(stderr,"cannot open %s (run tofu_topo_helper first)\n",tp); exit(1); }
     int n=0; char line[256];
@@ -181,33 +182,120 @@ static int pick_token(laguna_scratch *sc, laguna_sampler *smp, long *disagree){
     return chosen;
 }
 
+
+/* Options shared by --generate and --serve, and the load sequence they share. */
+typedef struct {
+    const char *stage_dir, *topo;
+    int maxpos, n_layers, pchunk, debug, fp8_exact;
+    laguna_sampler smp;
+} laguna_opts;
+
+static laguna_opts laguna_opts_default(void) {
+    laguna_opts o;
+    memset(&o, 0, sizeof o);
+    o.n_layers = LAGUNA_LAYERS;
+    /* sampler defaults come from the checkpoint's generation_config.json, except
+     * do_sample, which stays off so an unadorned run is deterministic */
+    o.smp.do_sample = 0; o.smp.temp = 1.0f; o.smp.top_p = 1.0f;
+    o.smp.min_p = 0.0f;  o.smp.top_k = 20;  o.smp.rng = 0x1234ABCDull;
+    return o;
+}
+/* returns 1 if argv[i] was consumed (advancing i), 0 if unrecognised */
+static int laguna_opt_parse(laguna_opts *o, int argc, char **argv, int *i) {
+    const char *a = argv[*i];
+    #define NEXT(dst, conv) do { if (*i+1>=argc) return 0; dst = conv(argv[++(*i)]); return 1; } while(0)
+    if(!strcmp(a,"--stage-dir")) NEXT(o->stage_dir, );
+    if(!strcmp(a,"--topo"))      NEXT(o->topo, );
+    if(!strcmp(a,"--maxpos"))    NEXT(o->maxpos, atoi);
+    if(!strcmp(a,"--layers"))    NEXT(o->n_layers, atoi);
+    if(!strcmp(a,"--pchunk"))    NEXT(o->pchunk, atoi);
+    if(!strcmp(a,"--temp"))      NEXT(o->smp.temp, (float)atof);
+    if(!strcmp(a,"--top-k"))     NEXT(o->smp.top_k, atoi);
+    if(!strcmp(a,"--top-p"))     NEXT(o->smp.top_p, (float)atof);
+    if(!strcmp(a,"--min-p"))     NEXT(o->smp.min_p, (float)atof);
+    if(!strcmp(a,"--seed"))      NEXT(o->smp.rng, (uint64_t)atoll);
+    #undef NEXT
+    if(!strcmp(a,"--sample"))    { o->smp.do_sample = 1; return 1; }
+    if(!strcmp(a,"--debug"))     { o->debug = 1; return 1; }
+    if(!strcmp(a,"--fp8-exact")) { o->fp8_exact = 1; return 1; }
+    return 0;
+}
+static int laguna_opts_apply(laguna_opts *o) {
+    if (!o->stage_dir) { fprintf(stderr,"--stage-dir DIR is required\n"); return 2; }
+    if (o->n_layers < 1 || o->n_layers > LAGUNA_LAYERS) o->n_layers = LAGUNA_LAYERS;
+    if (o->pchunk < 1 || o->pchunk > LAGUNA_PCHUNK) o->pchunk = LAGUNA_PCHUNK;
+    g_topo_path = o->topo;
+    g_dbg = o->debug;
+#if defined(LAGUNA_FP8)
+    g_fp8_exact = o->fp8_exact;
+#endif
+    return 0;
+}
+/* Load the stage and build the model; identical for both modes. */
+static int laguna_load(laguna_model *m, laguna_scratch *sc, laguna_stage *st,
+                       const laguna_opts *o, int maxpos) {
+    double t0 = now_sec();
+    int use_arena = 1;
+#if defined(LAGUNA_FP8)
+    use_arena = g_fp8_exact;   /* only the exact e4m3 path reads the blob hot */
+#endif
+    if (stage_load(st, o->stage_dir, MyRank, use_arena) != 0) {
+        fprintf(stderr,"rank %d: stage load failed from %s\n", MyRank, o->stage_dir);
+        return 1;
+    }
+    model_build(m, st, o->n_layers, maxpos, MyRank, N);
+#if defined(LAGUNA_FP8)
+    fp8_release_blob(m, st);   /* weights are re-quantized; drop the mapping */
+#endif
+    scratch_alloc(sc, maxpos);
+    if (MyRank == 0) laguna_report_memory();
+    logmsg("rank %d: %d layers, maxpos %d, loaded in %.1fs\n",
+           MyRank, o->n_layers, maxpos, now_sec()-t0);
+    /* Ranks finish loading at noticeably different times; without this a fast rank
+     * reaches the first allreduce and times out waiting on a still-loading peer. */
+    barrier();
+    return 0;
+}
+
+#include "laguna_serve.inc"
+
+/* --serve: load once, then answer HTTP requests until POST /shutdown.
+ * maxpos must be given explicitly here -- unlike --generate there is no prompt to
+ * size it from, and it sets the largest context the server will accept. */
+static int run_serve(int argc, char **argv) {
+    laguna_opts o = laguna_opts_default();
+    int port = 0;
+    for (int i=2;i<argc;i++) {
+        if(!strcmp(argv[i],"--port") && i+1<argc) { port = atoi(argv[++i]); continue; }
+        if(laguna_opt_parse(&o, argc, argv, &i)) continue;
+        fprintf(stderr,"unknown flag %s\n", argv[i]); return 2;
+    }
+    if (port <= 0)  { fprintf(stderr,"--serve requires --port N\n"); return 2; }
+    if (o.maxpos <= 0) { fprintf(stderr,"--serve requires --maxpos N (largest context to accept)\n"); return 2; }
+    int rc = laguna_opts_apply(&o); if (rc) return rc;
+
+    tofu_bootstrap();
+    laguna_stage st; laguna_model m; laguna_scratch sc;
+    if (laguna_load(&m, &sc, &st, &o, o.maxpos) != 0) return 1;
+    return lsrv_run(&m, &sc, port, o.maxpos, o.smp);
+}
+
 static int run_generate(int argc, char **argv){
-    const char *ids_path=NULL, *stage_dir=getenv("LAGUNA_STAGE_DIR"), *gen_out=NULL;
-    int max_new=32, maxpos=0, n_layers=LAGUNA_LAYERS;
-    /* defaults from the checkpoint's generation_config.json, except do_sample,
-     * which stays off so the default run is deterministic (--sample turns it on) */
-    laguna_sampler smp = { .do_sample=0, .temp=1.0f, .top_p=1.0f, .min_p=0.0f,
-                           .top_k=20, .rng=0x1234ABCDull };
+    laguna_opts o = laguna_opts_default();
+    const char *ids_path=NULL, *gen_out=NULL;
+    int max_new=32;
     for(int i=2;i<argc;i++){
-        if(!strcmp(argv[i],"--ids")&&i+1<argc) ids_path=argv[++i];
-        else if(!strcmp(argv[i],"--max-new")&&i+1<argc) max_new=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--maxpos")&&i+1<argc) maxpos=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--layers")&&i+1<argc) n_layers=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--stage-dir")&&i+1<argc) stage_dir=argv[++i];
-        else if(!strcmp(argv[i],"--gen-out")&&i+1<argc) gen_out=argv[++i];
-        else if(!strcmp(argv[i],"--sample")) smp.do_sample=1;
-        else if(!strcmp(argv[i],"--temp")&&i+1<argc) smp.temp=(float)atof(argv[++i]);
-        else if(!strcmp(argv[i],"--top-k")&&i+1<argc) smp.top_k=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--top-p")&&i+1<argc) smp.top_p=(float)atof(argv[++i]);
-        else if(!strcmp(argv[i],"--min-p")&&i+1<argc) smp.min_p=(float)atof(argv[++i]);
-        else if(!strcmp(argv[i],"--seed")&&i+1<argc) smp.rng=(uint64_t)strtoull(argv[++i],NULL,10);
-        else { fprintf(stderr,"unknown flag %s\n",argv[i]); return 2; }
+        if(!strcmp(argv[i],"--ids")&&i+1<argc) { ids_path=argv[++i]; continue; }
+        if(!strcmp(argv[i],"--gen-out")&&i+1<argc) { gen_out=argv[++i]; continue; }
+        if(!strcmp(argv[i],"--max-new")&&i+1<argc) { max_new=atoi(argv[++i]); continue; }
+        if(laguna_opt_parse(&o, argc, argv, &i)) continue;
+        fprintf(stderr,"unknown flag %s\n",argv[i]); return 2;
     }
     if(!ids_path){ fprintf(stderr,"--generate requires --ids FILE\n"); return 2; }
-    if(!stage_dir) stage_dir="/local/laguna-s21";
-    if(n_layers<1||n_layers>LAGUNA_LAYERS) n_layers=LAGUNA_LAYERS;
+    { int rc = laguna_opts_apply(&o); if (rc) return rc; }
+    laguna_sampler smp = o.smp;
+    int maxpos = o.maxpos;
 
-    g_dbg=envi("LAGUNA_DEBUG",0);
     tofu_bootstrap();
 
     int *prompt=NULL; int n_prompt=load_ids(ids_path,&prompt);
@@ -217,30 +305,10 @@ static int run_generate(int argc, char **argv){
 
     uint64_t seed0 = smp.rng;   /* smp.rng advances as we sample; keep the seed for the log */
     double t0=now_sec();
-    laguna_stage st;
-    /* The fp8 build re-quantizes every hot tensor at load (experts -> int8-per-block,
-     * linears -> int8), so it needs no blob-sized arena -- except in FP8_EXACT mode,
-     * where the e4m3 expert bytes are read hot and want NUMA-local pages. */
-    int use_arena = 1;
-#if defined(LAGUNA_FP8)
-    { const char *e=getenv("LAGUNA_FP8_EXACT"); use_arena = (e && atoi(e)) ? 1 : 0; }
-#endif
-    if(stage_load(&st,stage_dir,MyRank,use_arena)!=0){ fprintf(stderr,"rank %d: stage load failed\n",MyRank); return 1; }
-    laguna_model m; model_build(&m,&st,n_layers,maxpos,MyRank,N);
-#if defined(LAGUNA_FP8)
-    fp8_release_blob(&m,&st);   /* weights are re-quantized; drop the mapping */
-#endif
-    laguna_scratch sc; scratch_alloc(&sc,maxpos);
-    ar_thread_start();   /* dedicated comm core for overlapped allreduce */
+    laguna_stage st; laguna_model m; laguna_scratch sc;
+    if (laguna_load(&m,&sc,&st,&o,maxpos) != 0) return 1;
+    ar_thread_start();
     double t1=now_sec();
-    logmsg("rank %d: loaded %ld tensors, %.2f GB blob, %d layers, maxpos %d in %.1fs\n",
-           MyRank,st.n_ents,st.blob_bytes/1e9,n_layers,maxpos,t1-t0);
-    /* All ranks must enter the forward together: load time varies per rank (a lot
-     * for the ~27GB bf16 build under memory pressure), and without this barrier a
-     * fast rank hits the first MoE-layer allreduce and times out (60s) waiting on
-     * a still-loading peer. */
-    barrier();
-
     /* eos tokens (config: [2,24]) */
     const int eos0=2, eos1=24;
     int *gen=malloc((size_t)max_new*sizeof(int)); int ngen=0;
@@ -251,7 +319,7 @@ static int run_generate(int argc, char **argv){
      * forward to produce the first-generation logits.  --pchunk 1 forces the old
      * per-token path for A/B. */
     double pf0=now_sec();
-    int pchunk=envi("LAGUNA_PCHUNK", LAGUNA_PCHUNK);
+    int pchunk = o.pchunk;
     if(pchunk<1) pchunk=1; if(pchunk>LAGUNA_PCHUNK) pchunk=LAGUNA_PCHUNK;
     int nprefill = n_prompt-1;   /* last token done per-token for logits */
     float *Xc = malloc((size_t)LAGUNA_PCHUNK*LAGUNA_HIDDEN*sizeof(float));

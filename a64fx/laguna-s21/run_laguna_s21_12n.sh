@@ -1,14 +1,19 @@
 #!/bin/bash
 # Laguna S-2.1 INT4 launcher for an existing interactive 1xNP A64FX allocation.
-#   MODE = self-test | stage | generate
+#   MODE = self-test | stage | generate | serve
 #
 # generate: discovers Tofu topology, (optionally) stages weights node-local, then
-# runs the EP forward pass + greedy decode across NP nodes over uTofu.
+# runs the EP forward pass + decode across NP nodes over uTofu.
+# serve:    the same, but leaves an HTTP endpoint up (see tools/laguna_cli.py).
 #
-# Env / flags:
-#   LAGUNA_NP           ranks (default 12; = PJM_MPI_PROC)
-#   LAGUNA_MODEL_DIR    source safetensors (default ~/models/laguna-s21-int4)
-#   LAGUNA_STAGE_DIR    node-local dest    (default /local/$USER/laguna-s21-ep$NP)
+# Configuration is by flag, not environment (PJM_MPI_PROC is the one exception:
+# it is supplied by the batch system, not by the user):
+#   --np N              ranks (default 12, or PJM_MPI_PROC)
+#   --model-dir DIR     source safetensors (default depends on --bf16/--fp8)
+#   --stage-dir DIR     node-local dest
+#   --nshards N         safetensors shard count of the source checkpoint
+#   --port N            serve mode: HTTP port
+#   --maxpos N          serve mode: largest context to accept
 #   --prompt "text"     natural-language prompt (tokenized here)
 #   --ids FILE          pre-tokenized ids (overrides --prompt)
 #   --max-new N         tokens to generate (default 48)
@@ -21,9 +26,10 @@ REPO="$(cd "$HERE/../.." && pwd)"
 UTOFU="$REPO/a64fx/utofu-tests"
 
 MODE="${1:-self-test}"; shift || true
-NP="${LAGUNA_NP:-${PJM_MPI_PROC:-12}}"
+NP="${PJM_MPI_PROC:-12}"
 PROMPT="The capital of France is"
 IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0
+MODEL=""; STAGE=""; NSHARDS=""; PORT=""; MAXPOS=""
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,6 +41,12 @@ while [ $# -gt 0 ]; do
     --max-new) MAX_NEW="$2"; shift 2;;
     --layers)  LAYERS="$2"; shift 2;;
     --no-stage) DO_STAGE=0; shift;;
+    --np)        NP="$2"; shift 2;;
+    --model-dir) MODEL="$2"; shift 2;;
+    --stage-dir) STAGE="$2"; shift 2;;
+    --nshards)   NSHARDS="$2"; shift 2;;
+    --port)      PORT="$2"; shift 2;;
+    --maxpos)    MAXPOS="$2"; shift 2;;
     --bf16)    VARIANT=bf16; shift;;
     --fp8)     VARIANT=fp8; shift;;
     *) PASS+=("$1"); shift;;
@@ -44,9 +56,9 @@ done
 # int4 (production, default), pure-bf16 reference, or fp8 (bf16 linears + fp8
 # experts). Each uses its own checkpoint, runner binary, and stage dir.
 case "$VARIANT" in
-  bf16) MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21}";     STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-bf16-ep$NP}"; RUNNER="$HERE/build/laguna_s21_bf16_ep_runner"; export LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-46}";;
-  fp8)  MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21-fp8}"; STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-fp8-ep$NP}";  RUNNER="$HERE/build/laguna_s21_fp8_ep_runner";  export LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-24}";;
-  *)    MODEL="${LAGUNA_MODEL_DIR:-$HOME/models/laguna-s21-int4}"; STAGE="${LAGUNA_STAGE_DIR:-/local/$USER/laguna-s21-ep$NP}";      RUNNER="$HERE/build/laguna_s21_ep_runner";;
+  bf16) : "${MODEL:=$HOME/models/laguna-s21}";      : "${STAGE:=/local/$USER/laguna-s21-bf16-ep$NP}"; RUNNER="$HERE/build/laguna_s21_bf16_ep_runner"; : "${NSHARDS:=46}";;
+  fp8)  : "${MODEL:=$HOME/models/laguna-s21-fp8}";  : "${STAGE:=/local/$USER/laguna-s21-fp8-ep$NP}";  RUNNER="$HERE/build/laguna_s21_fp8_ep_runner";  : "${NSHARDS:=24}";;
+  *)    : "${MODEL:=$HOME/models/laguna-s21-int4}"; : "${STAGE:=/local/$USER/laguna-s21-ep$NP}";      RUNNER="$HERE/build/laguna_s21_ep_runner";      : "${NSHARDS:=15}";;
 esac
 
 make -C "$HERE" all $([ "$VARIANT" != int4 ] && echo "$VARIANT") CC="${CC:-fcc}" OPENMP=1 >/dev/null
@@ -55,13 +67,14 @@ make -C "$UTOFU" tofu_topo_helper >/dev/null 2>&1 || true
 case "$MODE" in
   self-test) exec "$RUNNER" --self-test ;;
   stage)
-    export LAGUNA_MODEL_DIR="$MODEL" LAGUNA_STAGE_DIR="$STAGE" LAGUNA_EP_SIZE="$NP"
-    exec mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" "${PASS[@]}" ;;
-  generate) ;;  # handled below
-  *) echo "usage: $0 {self-test|stage|generate} [flags]" >&2; exit 2;;
+    exec mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" \
+        --model-dir "$MODEL" --stage-dir "$STAGE" --ep-size "$NP" \
+        --nshards "$NSHARDS" "${PASS[@]}" ;;
+  generate|serve) ;;  # handled below
+  *) echo "usage: $0 {self-test|stage|generate|serve} [flags]" >&2; exit 2;;
 esac
 
-# ---- generate ----
+# ---- generate / serve ----
 RUN_DIR="$HERE/gen_$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN_DIR"; cd "$RUN_DIR"
 
@@ -76,15 +89,15 @@ done
 # Stage node-local (per-rank blobs) unless skipped.
 if [ "$DO_STAGE" = 1 ]; then
   echo "staging weights to $STAGE (this takes a few minutes) ..."
-  LAGUNA_MODEL_DIR="$MODEL" LAGUNA_STAGE_DIR="$STAGE" LAGUNA_STATUS_DIR="$RUN_DIR" LAGUNA_EP_SIZE="$NP" \
-    LAGUNA_NSHARDS="${LAGUNA_NSHARDS:-15}" \
-    mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" >stage.stdout 2>stage.stderr
+  mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" \
+      --model-dir "$MODEL" --stage-dir "$STAGE" --status-dir "$RUN_DIR" \
+      --ep-size "$NP" --nshards "$NSHARDS" >stage.stdout 2>stage.stderr
   staged=$(find "$RUN_DIR" -maxdepth 1 -name 'laguna_stage_rank*.txt' | wc -l)
   [ "$staged" -eq "$NP" ] || { echo "staging incomplete: $staged/$NP" >&2; exit 4; }
 fi
 
-# Tokenize prompt (unless --ids given).
-if [ -z "$IDS" ]; then
+# Tokenize prompt (unless --ids given).  Serve mode takes its prompts over HTTP.
+if [ "$MODE" = generate ] && [ -z "$IDS" ]; then
   IDS="$RUN_DIR/prompt.ids"
   if [ "$CHAT" = 1 ]; then
     # Instruct/chat: render the checkpoint's own chat_template.jinja.  Raw
@@ -103,13 +116,23 @@ if [ -z "$IDS" ]; then
       python3 "$HERE/tools/laguna_tok.py" encode "$PROMPT" --bos > "$IDS"
   fi
 fi
-echo "prompt ids: $(cat "$IDS")"
+[ "$MODE" = generate ] && echo "prompt ids: $(cat "$IDS")"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-47}"   # leave one core free (a64fx-omp-leave-one-core)
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 # NB: do NOT set FLIB_BARRIER=HARD here -- it forces the OpenMP runtime to 48
 # threads (oversubscribing all 48 cores), which ~4x-slows the matvec kernels.
 export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
+
+if [ "$MODE" = serve ]; then
+  [ -n "$PORT" ] || { echo "serve needs --port N" >&2; exit 2; }
+  [ -n "$MAXPOS" ] || { echo "serve needs --maxpos N (largest context to accept)" >&2; exit 2; }
+  echo "serving on port $PORT (maxpos $MAXPOS); client:"
+  echo "  LAGUNA_TOKENIZER=$MODEL/tokenizer.json python3 $HERE/tools/laguna_cli.py --port $PORT chat 'hello'"
+  exec mpiexec -np "$NP" "$RUNNER" --serve \
+      --port "$PORT" --maxpos "$MAXPOS" --layers "$LAYERS" \
+      --stage-dir "$STAGE" "${PASS[@]}"
+fi
 
 mpiexec -np "$NP" "$RUNNER" --generate \
     --ids "$IDS" --max-new "$MAX_NEW" --layers "$LAYERS" \
