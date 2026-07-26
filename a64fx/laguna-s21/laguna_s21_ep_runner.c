@@ -610,6 +610,7 @@ typedef struct {
     float *xe, *ye;        /* [PCHUNK*hidden] gathered expert in/out */
     float *crouter;        /* [PCHUNK*EXPERTS] batched router logits */
     float *clogits;        /* [MAX_BATCH*VOCAB] per-sequence logits for batched decode */
+    float *sh_a, *sh_b;    /* [SHARED_INTER] shared-expert gate/up, computed early */
 } laguna_scratch;
 
 #define LAGUNA_PCHUNK 256
@@ -652,6 +653,8 @@ static void scratch_alloc(laguna_scratch *sc, int max_pos) {
     SALLOC(inter_b, LAGUNA_DENSE_INTER*sizeof(float), "inter b");
     SALLOC(partial, LAGUNA_HIDDEN*sizeof(float), "routed partial");
     SALLOC(shared,  LAGUNA_HIDDEN*sizeof(float), "shared expert out");
+    SALLOC(sh_a, LAGUNA_SHARED_INTER*sizeof(float), "shared expert gate");
+    SALLOC(sh_b, LAGUNA_SHARED_INTER*sizeof(float), "shared expert up");
     SALLOC(logits,  LAGUNA_VOCAB*sizeof(float), "logits");
     /* the only maxpos-sized scratch: MAX_HEADS * maxpos floats (~38 MB at 128k) */
     SALLOC(scores, (size_t)LAGUNA_MAX_HEADS*max_pos*sizeof(float), "attention scores");
@@ -1126,11 +1129,8 @@ static void expert_mv(laguna_scratch *sc, const laguna_expert *ex, const float *
         for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
         laguna_matvec_fp8blk(out, ex->down, ex->ds, sc->inter_a, LAGUNA_HIDDEN, inter);
     } else {
-        float *ys[2]={sc->inter_a, sc->inter_b};
-        const laguna_w8b *ws[2]={&ex->qg, &ex->qu};
-        laguna_matvec_i8blk_multi(ys, ws, 2, x, inter, LAGUNA_HIDDEN);  /* gate & up share x */
-        for (int i=0;i<inter;++i) sc->inter_a[i]=laguna_silu(sc->inter_a[i])*sc->inter_b[i];
-        laguna_matvec_i8blk(out, &ex->qd, sc->inter_a, LAGUNA_HIDDEN, inter);
+        laguna_expert_swiglu_i8blk(out, sc->inter_a, sc->inter_b,
+                                   &ex->qg, &ex->qu, &ex->qd, x, inter, LAGUNA_HIDDEN);
     }
 #elif defined(LAGUNA_BF16)
     laguna_matvec_bf16(sc->inter_a, ex->gate, x, inter, LAGUNA_HIDDEN);
@@ -1196,7 +1196,17 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
         } else {
             /* router: sigmoid + bias, top-10, normalized */
             double _q = g_prof?prof_now():0;
-            laguna_lin_mv(sc->logits, &ly->router_w, sc->n2, LAGUNA_EXPERTS, LAGUNA_HIDDEN);
+            /* Router and the shared expert's gate/up all read n2, are mutually
+             * independent, and share cols=HIDDEN, so they go in ONE parallel
+             * region instead of three.  A fork/join costs 13.2 us at 47 threads
+             * and decode runs ~400 of them per token (~15% of the step), so the
+             * region count is worth as much here as the arithmetic inside them.
+             * The shared results need their own scratch because the routed
+             * experts below reuse inter_a/inter_b. */
+            { float *ys3[3]={sc->logits, sc->sh_a, sc->sh_b};
+              const laguna_lin *Ws3[3]={&ly->router_w, &ly->shared_gate, &ly->shared_up};
+              int rws3[3]={LAGUNA_EXPERTS, LAGUNA_SHARED_INTER, LAGUNA_SHARED_INTER};
+              laguna_lin_mv_multi(ys3, Ws3, rws3, 3, sc->n2, LAGUNA_HIDDEN); }
             int ids[LAGUNA_ACTIVE]; float rw[LAGUNA_ACTIVE];
             laguna_top10(sc->logits, ly->router_bias, ids, rw);
             for (int i=0;i<LAGUNA_HIDDEN;++i) sc->partial[i]=0.0f;
@@ -1212,8 +1222,10 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
              * the (independent) shared expert on the OMP team so they overlap. */
             if(g_prof){double n=prof_now(); g_d_experts+=n-_q; _q=n;}
             if (aar && aar->launch) aar->launch(aar->ctx, sc->partial, LAGUNA_HIDDEN);
-            swiglu_lin(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->n2,
-                       sc->shared, LAGUNA_SHARED_INTER);
+            for (int i=0;i<LAGUNA_SHARED_INTER;++i)
+                sc->sh_a[i]=laguna_silu(sc->sh_a[i])*sc->sh_b[i];
+            laguna_lin_mv(sc->shared, &ly->shared_down, sc->sh_a,
+                          LAGUNA_HIDDEN, LAGUNA_SHARED_INTER);
             if (aar && aar->join) aar->join(aar->ctx);
             if(g_prof) g_d_shared+=prof_now()-_q;
             if(g_dbg&&compute_logits) logmsg("L%02d pos%d ||shared||=%.3f ||routed||=%.3f e0=%d\n",L,pos,vnorm(sc->shared,LAGUNA_HIDDEN),vnorm(sc->partial,LAGUNA_HIDDEN),ids[0]);

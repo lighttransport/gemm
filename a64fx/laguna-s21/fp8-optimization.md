@@ -609,6 +609,35 @@ Worth noting for prioritisation: the routed experts, which absorbed most of the
 fp8 kernel effort in this document, are **10% of decode**. The dense linears
 (qkv + o_proj + shared + router) are ~57%.
 
+### Fewer OpenMP regions: +4% decode
+
+A fork/join costs **13.2 us at 47 threads** on this machine (7.4 at 24, 4.8 at 12,
+0.8 at 1 -- measured with an empty parallel region). Decode runs roughly 9 regions
+per layer x 47 layers ~= 400 per token, i.e. **~5.4 ms of a 35.6 ms step**. That is
+the "~10% fork/join" the profile inferred, now measured directly.
+
+Two fusions, neither of which changes any arithmetic or its order -- only where the
+region boundaries fall:
+
+- **Router + shared-expert gate/up in one region.** All three read `n2`, are
+  mutually independent and share `cols=HIDDEN`. This needs dedicated `sh_a`/`sh_b`
+  scratch: the routed experts reuse `inter_a`/`inter_b` in between, so computing the
+  shared gate/up early into the old buffers would have been silently clobbered.
+- **One expert's whole SwiGLU in one region** (`laguna_expert_swiglu_i8blk`): gate
+  and up with `nowait`, a barrier, the `silu*up` split across the team, then `down`.
+  Was three regions.
+
+| | before | after | |
+|---|---|---|---|
+| decode | 26.9 tok/s | **28.0** | **+4.1%** |
+| router + shared (they trade attribution) | 16.11 ms | **14.89** | -1.22 ms |
+| routed experts | 3.74 ms | **3.40** | -0.34 ms |
+
+Generated tokens are **identical**. The saving predicted from the region count was
+1.7 ms/token and 1.5 was measured, which validates the cost model: the remaining
+~300 regions per token are worth roughly another 4 ms, and the way to get them is
+one `omp parallel` per layer with `omp for` inside rather than per-call regions.
+
 ### Where to look next, in order
 
 1. **The 48 per-token allreduces (29%).** Latency-bound at 12 KB. Async overlap was
@@ -616,9 +645,12 @@ fp8 kernel effort in this document, are **10% of decode**. The dense linears
    Worth revisiting with a different mechanism -- e.g. reducing every other layer's
    partial together, which halves the count at the cost of holding one extra
    partial.
-2. **Router fork/join (7%, entirely overhead).** Fuse it into the same parallel
-   region as the shared expert, or gate small matvecs on a work threshold the way
-   `common/glm5_impl.h` does with `GLM5_PAR_MIN`.
+2. ~~Router fork/join~~ **done above (+4.1%)**, and the cost model it validated
+   says the remaining ~300 regions/token are worth ~4 ms more. The structural fix
+   is one `omp parallel` per layer with `omp for` inside, instead of a region per
+   call. Note a work threshold (`GLM5_PAR_MIN`-style) would NOT have helped here:
+   the router is 786K MACs, far too much to run serially -- the problem was the
+   number of regions, not their width.
 3. **Small-matvec efficiency generally** -- shared expert at 11% of bandwidth and
    routed experts at 12% are the same problem one level up.
 

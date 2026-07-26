@@ -791,6 +791,40 @@ static inline void laguna_matvec_i8blk_multi(float *const *ys, const laguna_w8b 
             laguna_i8blk_rowblock(ys[m], ws[m], x, r, rows-r<8?rows-r:8, cols);
 #endif
 }
+
+/* One expert's whole SwiGLU in ONE parallel region: gate and up (independent, so
+ * nowait between them), a barrier, the elementwise silu*up split across the team,
+ * another barrier, then down.  Previously three regions; a fork/join is 13.2 us at
+ * 47 threads and decode runs ~400 of them per token, so collapsing them is worth
+ * as much as the arithmetic inside. */
+static inline void laguna_expert_swiglu_i8blk(float *restrict out, float *restrict a,
+                                              float *restrict b,
+                                              const laguna_w8b *gate, const laguna_w8b *up,
+                                              const laguna_w8b *down,
+                                              const float *restrict x, int inter, int hidden) {
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        #pragma omp for schedule(static) nowait
+        for (int r = 0; r < inter; r += 8)
+            laguna_i8blk_rowblock(a, gate, x, r, inter-r<8?inter-r:8, hidden);
+        #pragma omp for schedule(static)
+        for (int r = 0; r < inter; r += 8)
+            laguna_i8blk_rowblock(b, up, x, r, inter-r<8?inter-r:8, hidden);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < inter; ++i) a[i] = laguna_silu(a[i]) * b[i];
+        #pragma omp for schedule(static)
+        for (int r = 0; r < hidden; r += 8)
+            laguna_i8blk_rowblock(out, down, a, r, hidden-r<8?hidden-r:8, inter);
+    }
+#else
+    for (int r=0;r<inter;r+=8) laguna_i8blk_rowblock(a,gate,x,r,inter-r<8?inter-r:8,hidden);
+    for (int r=0;r<inter;r+=8) laguna_i8blk_rowblock(b,up,  x,r,inter-r<8?inter-r:8,hidden);
+    for (int i=0;i<inter;++i) a[i]=laguna_silu(a[i])*b[i];
+    for (int r=0;r<hidden;r+=8) laguna_i8blk_rowblock(out,down,a,r,hidden-r<8?hidden-r:8,inter);
+#endif
+}
+
 /* Batched (chunked prefill): Y[N][rows] = X[N][cols] @ W8B^T, token-major.
  * Each weight row is widened and scaled ONCE into an f32 scratch, then reused for
  * all N token dots (which are then plain f32 SVE).  Widening per 8-token tile
