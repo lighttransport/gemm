@@ -399,8 +399,12 @@ allocation (a fresh allocation and re-stage; `eb1ab88c` vs `5bda6d7f`):
 | **attn phase, 2377 tok** | 8.5 s | **6.5 s** | **1.31x** |
 | decode, 2377-tok ctx | 19.4 tok/s | **21.2** | +9% |
 | decode, 6-tok ctx | 27.9 tok/s | 28.0 | unchanged |
+| prefill, 26632 tok | 31.7 tok/s | **36.4** | +15% |
+| **attn phase, 26632 tok** | 435.6 s | **333.4 s** | **1.31x** |
+| decode, 26632-tok ctx | 4.4 tok/s | **5.6** | +27% |
 
-Generated tokens are **identical** in both cases, as the bit-exactness implies.
+Generated tokens are **identical** at every length, as the bit-exactness implies,
+and the 26.6k needle is retrieved by both binaries.
 The 1.31x on the attention phase matches what the kernel benchmark predicted for
 this depth (1.26-1.35x), so the microbenchmark and the real model agree here --
 unlike the `svaddv` experiment below, where they did not.
