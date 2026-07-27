@@ -16,7 +16,7 @@ frontend loginN            compute head node            11 other nodes
 
 ## What it is (and is not)
 
-llmgr is a **supervisor**, not an MPI rank. It runs outside MPI and spawns
+llmgr is a **generic supervisor**, not an MPI rank. It runs outside MPI and spawns
 runners as `setsid` process groups, so one `killpg` reaps a whole `mpiexec`
 tree. No C code was changed to build it.
 
@@ -110,7 +110,7 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | model | variants | serve? | launcher |
 |---|---|---|---|
 | `laguna` | `int4` (default), `bf16`, `fp8` | yes | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
-| `gemma4` | `pp` | no — one-shot only | `a64fx/gemma4-mn/run_gemma4_pp.sh` |
+| `gemma4` | `tp` (default), `pp` | no — one-shot only | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
 
 Adding a model is one dict in `models.py`. Adapters deliberately do **not** set
 performance-critical environment: the launchers already encode it
@@ -118,6 +118,11 @@ performance-critical environment: the launchers already encode it
 `XOS_MMM_L_PAGING_POLICY=demand:demand:demand`; and for laguna the *absence* of
 `FLIB_BARRIER=HARD`, which would force 48 threads and ~4x-slow the matvecs).
 Only env you pass explicitly in `env:{…}` is layered on top.
+
+The adapter/supervisor interface is documented in [RUNBOOK.md](RUNBOOK.md).
+It is intentionally command-oriented: a runner can be a C binary, shell
+launcher, or another MPI program as long as it supplies the standard operation
+builders and a passive readiness check for serve mode.
 
 ## Never probe a runner to see if it is ready
 

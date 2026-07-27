@@ -159,6 +159,15 @@ def main(argv=None):
     r.add_argument("--max-new", type=int)
     r.add_argument("--prompt")
     r.add_argument("--ids", help="path to an ids file (generate mode)")
+    r.add_argument("--prompt-ids", help="path to a prompt ids file (Gemma4)")
+    r.add_argument("--gguf", help="model GGUF path (Gemma4)")
+    r.add_argument("--mtp", help="Gemma4 TP MTP draft GGUF path")
+    r.add_argument("--exclude", help="Gemma4 node coordinate to exclude, or none")
+    r.add_argument("--threads", type=int, help="Gemma4 worker threads")
+    r.add_argument("--spec-k", type=int, help="Gemma4 TP speculative draft length")
+    r.add_argument("--batch", type=int, help="Gemma4 TP batch size")
+    r.add_argument("--tp-skip-ar", action="store_true",
+                   help="Gemma4 TP compute-only mode (output is invalid)")
     r.add_argument("--stage", action="store_true", help="stage before running")
     r.add_argument("--extra", nargs="*", default=[],
                    help="extra flags passed through to the runner")
@@ -240,7 +249,9 @@ def main(argv=None):
         emit(call(args, "POST", "/runner/start",
                   dict(model=args.model,
                        **opt("variant", "mode", "port", "maxpos", "layers",
-                             "np", "max_new", "prompt", "ids", "stage",
+                             "np", "max_new", "prompt", "ids", "prompt_ids",
+                             "gguf", "mtp", "exclude", "threads", "spec_k",
+                             "batch", "tp_skip_ar", "stage",
                              "extra"))))
     elif c == "stop":
         emit(call(args, "POST", "/runner/stop", {"id": args.id}, timeout=180))

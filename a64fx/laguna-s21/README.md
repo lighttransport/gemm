@@ -15,6 +15,12 @@ make fp8        # bf16 checkpoint quantized at load: int8 linears + int8-per-blo
 make bf16       # pure-bf16 reference
 ```
 
+For the production FP8 shape, use
+`run_laguna_s21_fp8_best.sh`: it selects the FP8 checkpoint and runner while
+leaving the allocation rank count (`PJM_MPI_PROC`, normally 12) explicit. The
+recommended six-hour llmgr job, including submission and tunnel commands, is
+in [`../llmgr/RUNBOOK.md`](../llmgr/RUNBOOK.md).
+
 ## Configuration is by flag, never by environment
 
 Every knob is a command-line argument. The single exception is the MPI rank, which

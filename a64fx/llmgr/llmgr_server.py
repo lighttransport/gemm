@@ -817,7 +817,7 @@ class Handler(bhs.Handler):
     def _post_simple(self, body, mode):
         """/build and /stage: one-shot, identical shape."""
         adapter = models.get(body.get("model", "laguna"))
-        argv, env, cwd = getattr(adapter, mode)(body)
+        argv, env, cwd = adapter.launch(mode, body)
         c = _new_child("oneshot", "%s:%s" % (mode, adapter.name),
                        argv, env, cwd,
                        meta={"model": adapter.name, "mode": mode})
@@ -838,14 +838,14 @@ class Handler(bhs.Handler):
             if busy:
                 return self._err("port %d already held by child %s"
                                  % (port, busy.id), status=409)
-            argv, env, cwd = adapter.serve(body)
+            argv, env, cwd = adapter.launch("serve", body)
             c = _new_child("serve", "serve:%s" % adapter.name, argv, env, cwd,
                            port=port, meta={"model": adapter.name,
                                             "adapter": adapter,
                                             "runner_bin": _runner_bin(adapter, body),
                                             "config": body})
         else:
-            argv, env, cwd = adapter.generate(body)
+            argv, env, cwd = adapter.launch("generate", body)
             c = _new_child("oneshot", "generate:%s" % adapter.name,
                            argv, env, cwd,
                            meta={"model": adapter.name, "config": body,

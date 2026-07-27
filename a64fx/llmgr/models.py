@@ -62,7 +62,12 @@ def _env_overrides(cfg):
 
 
 class Adapter:
-    """Base: subclasses fill in the command builders they support."""
+    """Generic runner contract used by llmgr.
+
+    Adapters only translate a model configuration into a command, environment,
+    and working directory.  The supervisor owns process groups, logs, rank
+    output collection, readiness, stopping, and HTTP proxying.
+    """
 
     name = "?"
     variants = ()
@@ -120,12 +125,41 @@ class Adapter:
         """argv for the runner binary itself (no mpiexec, no launcher)."""
         raise NotImplementedError("%s cannot be profiled" % self.name)
 
+    def launch(self, mode, cfg):
+        """Return ``(argv, env, cwd)`` for a standard llmgr operation.
+
+        Keeping this dispatch here lets the supervisor remain generic when a
+        new runner adds a mode; the server does not need another model branch.
+        """
+        builders = {
+            "build": self.build,
+            "stage": self.stage,
+            "serve": self.serve,
+            "generate": self.generate,
+        }
+        try:
+            return builders[mode](cfg)
+        except KeyError:
+            raise ConfigError("unsupported runner operation %r" % mode)
+
     def variant(self, cfg):
         v = cfg.get("variant") or self.default_variant
         if v not in self.variants:
             raise ConfigError("variant must be one of %s (got %r)"
                               % ("|".join(self.variants), v))
         return v
+
+    def contract(self):
+        """Machine-readable capabilities for clients and documentation."""
+        modes = []
+        for mode in ("build", "stage", "serve", "generate", "profile"):
+            if mode == "profile":
+                fn = self.profile_argv
+            else:
+                fn = getattr(self, mode)
+            if fn.__func__ is not getattr(Adapter, mode, None):
+                modes.append(mode)
+        return {"modes": modes, "runner_contract": "llmgr.v1"}
 
 
 class LagunaAdapter(Adapter):
@@ -320,7 +354,7 @@ class LagunaAdapter(Adapter):
 
 
 class Gemma4Adapter(Adapter):
-    """Gemma-4 12B pipeline-parallel, via a64fx/gemma4-mn/run_gemma4_pp.sh.
+    """Gemma-4 12B PP/TP via the a64fx/gemma4-mn launchers.
 
     No server mode: the runner takes positional args, generates, writes a
     result file, and exits.  So every gemma4 run is a llmgr `oneshot` child and
@@ -328,26 +362,33 @@ class Gemma4Adapter(Adapter):
     """
 
     name = "gemma4"
-    variants = ("pp",)
-    default_variant = "pp"
+    variants = ("pp", "tp")
+    default_variant = "tp"
     supports_serve = False
 
-    LAUNCHER = os.path.join(GEMMA4_DIR, "run_gemma4_pp.sh")
+    LAUNCHERS = {
+        "pp": os.path.join(GEMMA4_DIR, "run_gemma4_pp.sh"),
+        "tp": os.path.join(GEMMA4_DIR, "run_gemma4_tp.sh"),
+    }
 
     def default_np(self):
-        # run_gemma4_pp.sh drops one node from the allocation by default
-        # (EXCLUDE=0,0,0) so the login/agent node is not OOM-killed.
+        # The batch allocation supplies the usable rank count explicitly. Keep
+        # the historical controller-node reserve for callers without --np.
         return max(1, int(os.environ.get("PJM_MPI_PROC", "12")) - 1)
 
+    def _variant(self, cfg):
+        return self.variant(cfg)
+
     def stage_dir(self, cfg):
-        return str(cfg.get("stage_dir") or "/local/gemma4_pp")
+        default = "/local/gemma4_tp" if self._variant(cfg) == "tp" else "/local/gemma4_pp"
+        return str(cfg.get("stage_dir") or default)
 
     def model_dir(self, cfg):
         return str(cfg.get("gguf") or os.path.expanduser(
             "~/models/gemma4/12b/gemma-4-12b-it-BF16.gguf"))
 
     def _env(self, cfg, *, skip_stage):
-        """run_gemma4_pp.sh is env-driven, not flag-driven."""
+        """Gemma4 launchers are env-driven, not flag-driven."""
         env = {
             "NP": str(_int(cfg, "np", self.default_np())),
             "GGUF": self.model_dir(cfg),
@@ -368,27 +409,38 @@ class Gemma4Adapter(Adapter):
                              ("dprof", "TF_DPROF")):
             if cfg.get(key) is not None:
                 env[envname] = "1" if cfg[key] else "0"
+        if self._variant(cfg) == "tp":
+            for key, envname in (("mtp", "GEMMA4_TP_MTP"),
+                                 ("spec_k", "GEMMA4_TP_SPEC_K"),
+                                 ("batch", "GEMMA4_TP_BATCH")):
+                if cfg.get(key) is not None:
+                    env[envname] = str(cfg[key])
+            if cfg.get("tp_skip_ar") is not None:
+                env["TP_SKIP_AR"] = "1" if cfg["tp_skip_ar"] else "0"
         env.update(_env_overrides(cfg))
         return env
 
     def result_path(self, cfg):
-        # gemma4_pp_runner.c writes GEMMA4_RESULT_FILE (relative to its cwd,
-        # which the launcher leaves as GEMMA4_DIR).
-        name = str(cfg.get("result_file") or "gemma4_pp_result.txt")
+        # Both runners write GEMMA4_RESULT_FILE relative to GEMMA4_DIR.
+        default = "gemma4_tp_result.txt" if self._variant(cfg) == "tp" else "gemma4_pp_result.txt"
+        name = str(cfg.get("result_file") or default)
         return name if os.path.isabs(name) else os.path.join(GEMMA4_DIR, name)
 
     def build(self, cfg):
-        # No Makefile here; run_gemma4_pp.sh compiles inline. Mirror its lines.
+        # No Makefile here; the selected launcher compiles inline.
         cc = cfg.get("cc", "fcc")
+        runner = "gemma4_tp_runner.c" if self._variant(cfg) == "tp" else "gemma4_pp_runner.c"
+        output = "gemma4_tp_runner" if self._variant(cfg) == "tp" else "gemma4_pp_runner"
         script = (
             "set -e; cd %(d)s; "
             "make -C %(u)s tofu_topo_helper >/dev/null; "
             "%(cc)s -Nclang -O2 -D_GNU_SOURCE -I../../common "
             "gemma4_stage.c -o gemma4_stage; "
             "%(cc)s -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp "
-            "-D_GNU_SOURCE -I../../common gemma4_pp_runner.c "
-            "-lm -lpthread -lhwb -ltofucom -o gemma4_pp_runner"
-        ) % {"d": GEMMA4_DIR, "u": UTOFU_DIR, "cc": cc}
+            "-D_GNU_SOURCE -I../../common %(runner)s "
+            "-lm -lpthread -lhwb -ltofucom -o %(output)s"
+        ) % {"d": GEMMA4_DIR, "u": UTOFU_DIR, "cc": cc,
+              "runner": runner, "output": output}
         return ["sh", "-c", script], _env_overrides(cfg), GEMMA4_DIR
 
     def stage(self, cfg):
@@ -396,13 +448,15 @@ class Gemma4Adapter(Adapter):
         # with the smallest possible generation to keep it short.
         env = self._env(cfg, skip_stage=False)
         env["MAXGEN"] = "1"
-        return [self.LAUNCHER], env, GEMMA4_DIR
+        return [self.LAUNCHERS[self._variant(cfg)]], env, GEMMA4_DIR
 
     def generate(self, cfg):
-        return [self.LAUNCHER], self._env(cfg, skip_stage=not cfg.get("stage", False)), GEMMA4_DIR
+        return [self.LAUNCHERS[self._variant(cfg)]], self._env(
+            cfg, skip_stage=not cfg.get("stage", False)), GEMMA4_DIR
 
     def runner_bin(self, cfg):
-        return os.path.join(GEMMA4_DIR, "gemma4_pp_runner")
+        name = "gemma4_tp_runner" if self._variant(cfg) == "tp" else "gemma4_pp_runner"
+        return os.path.join(GEMMA4_DIR, name)
 
     def profile_argv(self, cfg):
         return [self.model_dir(cfg), self.stage_dir(cfg),
@@ -427,6 +481,7 @@ def describe():
             "default_variant": a.default_variant,
             "supports_serve": a.supports_serve,
             "default_np": a.default_np(),
+            **a.contract(),
         }
         for name, a in ADAPTERS.items()
     }
