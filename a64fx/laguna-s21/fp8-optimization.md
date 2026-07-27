@@ -666,6 +666,57 @@ reuses that input from cache and halves the number of times the weight stream is
 restarted -- an arithmetic/locality effect that happens to scale with the same
 count.  Fuse work that shares an input; do not fuse merely to remove a region.
 
+### "Comm is 23%" is probably NOT comm -- it is expert load imbalance
+
+Unverified on hardware yet (needs an allocation) but the arithmetic is strong, and
+two diagnostics are now wired in to settle it.
+
+Expert `e` lives on rank `e % N`, so per layer a rank owns `Binomial(top-10, 1/N)`
+experts.  At N=12 that is mean **0.833** but **E[max over ranks] = 2.52** -- and
+every rank blocks at the routed allreduce until the busiest one finishes, so the
+3.02x spread is charged to "comm".  Calibrating against the measured profile
+(rank 0: experts 3.47 ms/token, AR 8.33 ms/token, 47 layers):
+
+| | |
+|---|---|
+| implied cost of one expert | 0.0886 ms |
+| implied idle at the barrier (max-mean = 1.68 experts) | 0.149 ms/layer |
+| measured allreduce | 0.177 ms/layer |
+| **imbalance as a share of "comm"** | **~84%** |
+
+Two supporting facts: the collective is already recursive-doubling with a
+non-pof2 prefold (12 ranks = prefold + 3 rounds + bcast = 5 steps, near the
+log2(12)=3.6 floor), and 12 KB at ~6.8 GB/s is ~2 us of wire against 177 us
+measured.  There is no plausible way for the fabric to be the cost.
+
+**How to test it (both need only an allocation, one needs no weights):**
+
+- `--ar-probe` -- was dead code, defined but reachable from no CLI flag; now
+  wired up.  Reports back-to-back vs barrier-synced allreduce latency with **no
+  weights loaded**, so it needs no 17.8 GB stage.  Barrier-synced x 47 is the
+  floor for honest comm; if that is far under 8.33 ms/token, the rest is skew.
+- `--prof` now gathers per-rank expert counts and AR seconds and prints
+  max/mean against the 3.02x prediction.  If AR time is anti-correlated with
+  expert count across ranks, imbalance is confirmed.
+
+**If confirmed, the fix is to shard experts, not to touch the collective.**  Give
+each expert to a GROUP of G ranks and split its `inter=1024` G ways.  Memory per
+rank, weight bytes read per token, and the allreduce (one [hidden] reduction) are
+all unchanged -- only the balance changes:
+
+| G | groups | imbalance | down-proj inner dim | |
+|---|---|---|---|---|
+| 1 (today) | 12 | 3.02x | 1024 | |
+| 4 | 3 | **1.47x** | 256 | removes 77% of the skew |
+| 12 (full TP) | 1 | 1.00x | 85 | removes 100%, but skinny |
+
+Full TP balances perfectly but leaves the down projection with an inner dimension
+of 85, which is a poor SVE kernel shape; G=4 keeps 256 and still removes most of
+the skew.  Predicted (assuming imbalance is 84% of AR): **G=4 -> ~33 tok/s, G=12
+-> ~35 tok/s, from 28.1**.  Treat those as upper bounds -- they ignore the
+efficiency the smaller per-rank kernels will lose, which is exactly why G=4 may
+beat G=12 in practice.  Measure before building the staging changes.
+
 ### Where to look next, in order
 
 1. **The 48 per-token allreduces (29%).** Latency-bound at 12 KB. Async overlap was

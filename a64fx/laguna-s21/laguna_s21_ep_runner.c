@@ -673,6 +673,11 @@ static void laguna_report_memory(void) {
 }
 
 double g_t_attn=0, g_t_mlp=0, g_t_norm=0; int g_prof=0;
+/* Experts this rank actually ran.  Expert e lives on rank e%N, so per layer a rank
+ * owns Binomial(top-10, 1/N) of them: mean 0.83 at N=12 but E[max over ranks]=2.5.
+ * Every rank waits for the slowest at the routed allreduce, so that 3x spread --
+ * not the wire -- is the suspected bulk of "comm". This counts it. */
+long g_d_expert_n=0;
 /* finer decode breakdown (--prof): where a single-token step actually goes */
 double g_d_qkv=0, g_d_core=0, g_d_oproj=0, g_d_router=0, g_d_experts=0,
        g_d_shared=0, g_d_lmhead=0, g_d_norm=0, g_d_resid=0;
@@ -1215,6 +1220,7 @@ static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, i
                 int e=ids[k]; const laguna_expert *ex=&ly->experts[e];
                 if (!ex->present) continue;
                 expert_mv(sc, ex, sc->n2, sc->attn_out);   /* reuse attn_out as expert out */
+                g_d_expert_n++;
                 float w=rw[k];
                 for (int i=0;i<LAGUNA_HIDDEN;++i) sc->partial[i]+=w*sc->attn_out[i];
             }
@@ -1514,7 +1520,8 @@ static void usage(const char *n){
     fprintf(stderr,
       "usage: %s --self-test | --describe | --check-stage DIR [LAYERS] | --probe-stage DIR\n"
       "       %s --generate --ids FILE --max-new N [--maxpos P] [--layers L]\n"
-      "                     [--stage-dir DIR] [--gen-out FILE]\n", n, n);
+      "                     [--stage-dir DIR] [--gen-out FILE]\n"
+      "       %s --ar-probe [--reps N] [--count C]   (needs no weights)\n", n, n, n);
 }
 
 #ifndef LAGUNA_BENCH
@@ -1533,6 +1540,7 @@ int main(int argc, char **argv) {
     }
     if (argc>=3 && argc<=4 && !strcmp(argv[1],"--check-stage")) return stage_check(argv[2],argc==4?atoi(argv[3]):0);
     if (argc==3 && !strcmp(argv[1],"--probe-stage")) return probe_stage(argv[2]);
+    if (argc>=2 && !strcmp(argv[1],"--ar-probe"))  return run_ar_probe(argc,argv);
     if (argc>=2 && !strcmp(argv[1],"--generate")) return run_generate(argc,argv);
     if (argc>=2 && !strcmp(argv[1],"--serve"))    return run_serve(argc,argv);
     usage(argv[0]); return 2;

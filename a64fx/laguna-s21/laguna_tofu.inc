@@ -431,6 +431,27 @@ static int run_generate(int argc, char **argv){
             P("rmsnorm",          g_t_norm);
             #undef P
             logmsg("    %-22s %7.2f s  %5.1f%%   (inside the phases above)\n","of which allreduce",comm,100.0*comm/tot);
+            /* Is "comm" really the wire, or is it waiting for the slowest rank?
+             * Expert e lives on rank e%N, so per layer a rank owns
+             * Binomial(top-10,1/N) experts: mean 0.83 at N=12, but E[max]=2.5.
+             * Every rank blocks at the routed allreduce until the busiest finishes,
+             * so imbalance is charged to comm.  Gather both per rank and look at
+             * whether AR time is ANTI-correlated with expert count -- if it is, the
+             * fix is balancing experts (TP-sharding them), not the collective. */
+            if(N>1 && N<=64){
+                float v[64*2]; for(int i=0;i<64*2;i++) v[i]=0.0f;
+                v[MyRank]=(float)g_d_expert_n; v[64+MyRank]=(float)g_ar_secs;
+                tp_allreduce_sum(&g_comm, v, 64*2);
+                double mn=1e30, mx=-1e30, sum=0;
+                for(int r=0;r<N;r++){ double e=v[r]; sum+=e; if(e<mn)mn=e; if(e>mx)mx=e; }
+                logmsg("  expert-load imbalance across %d ranks (experts run over %d tokens):\n", N, ngen);
+                for(int r=0;r<N;r++)
+                    logmsg("      rank%02d  experts=%-8.0f (%.2f/layer/token)  ar=%.2fs\n",
+                           r, v[r], v[r]/((double)ngen*47.0), v[64+r]);
+                logmsg("      min=%.0f max=%.0f mean=%.1f  => max/mean=%.2fx"
+                       "  (uniform-routing prediction: 3.02x)\n",
+                       mn, mx, sum/N, (sum/N)>0?mx/(sum/N):0.0);
+            }
             logmsg("    %-22s %7.2f s  %5.1f%%\n","unattributed",tot-sum,100.0*(tot-sum)/tot);
         }
         logmsg("decode %d tok in %.2fs (%.1f tok/s) total_nan=%d comm=%.2fs (%.1f%%) threads=%d\n",
