@@ -37,6 +37,14 @@ if [ "$EXCLUDE" != "none" ]; then
     echo "[g4pp] placing $NP ranks via $VCOORD (excl $EXCLUDE)"
 fi
 
+# Optional per-rank stdout capture. Fugaku's mpiexec does not deliver rank stdout
+# to the launching process (a pipe or a redirect both come back empty); -of-proc
+# PREFIX writes PREFIX.<step>.<rank> instead, and the prefix must be on the shared
+# FS. Unset by default => behaviour unchanged; a64fx/llmgr sets it so a supervised
+# run's output lands in its log directory. Unquoted like $MPI_PLACE above.
+OFP=""
+[ -n "${MPIEXEC_OF_PROC:-}" ] && OFP="-of-proc $MPIEXEC_OF_PROC"
+
 # ---- build ----
 echo "[g4pp] building tofu_topo_helper + stager + runner..."
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
@@ -46,15 +54,15 @@ fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -D_GNU_SOURCE -
 
 # ---- topology ----
 echo "[g4pp] generating tofu topo ($TOFU_TOPO_PATH)..."
-mpiexec -np "$NP" $MPI_PLACE "$UTOFU_DIR/tofu_topo_helper"
+mpiexec -np "$NP" $MPI_PLACE $OFP "$UTOFU_DIR/tofu_topo_helper"
 
 # ---- stage (each rank stages its shard; memory-safe 1GB chunks) ----
 if [ "${SKIP_STAGE:-0}" != "1" ]; then
     echo "[g4pp] staging shards to $STAGE_DIR (NP=$NP)..."
-    mpiexec -np "$NP" $MPI_PLACE sh -c "mkdir -p $STAGE_DIR; exec $HERE/gemma4_stage $GGUF $STAGE_DIR \$PMIX_RANK $NP pp"
+    mpiexec -np "$NP" $MPI_PLACE $OFP sh -c "mkdir -p $STAGE_DIR; exec $HERE/gemma4_stage $GGUF $STAGE_DIR \$PMIX_RANK $NP pp"
 fi
 
 # ---- run ----
 PROMPT_ARG=""; [ -n "${PROMPT_IDS:-}" ] && PROMPT_ARG="$PROMPT_IDS"
 echo "[g4pp] running PP pipeline (maxgen=$MAXGEN)..."
-mpiexec -np "$NP" $MPI_PLACE "$HERE/gemma4_pp_runner" "$GGUF" "$STAGE_DIR" "$PROMPT_ARG" "$MAXGEN"
+mpiexec -np "$NP" $MPI_PLACE $OFP "$HERE/gemma4_pp_runner" "$GGUF" "$STAGE_DIR" "$PROMPT_ARG" "$MAXGEN"

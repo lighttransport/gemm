@@ -61,13 +61,21 @@ case "$VARIANT" in
   *)    : "${MODEL:=$HOME/models/laguna-s21-int4}"; : "${STAGE:=/local/$USER/laguna-s21-ep$NP}";      RUNNER="$HERE/build/laguna_s21_ep_runner";      : "${NSHARDS:=15}";;
 esac
 
+# Optional per-rank stdout capture. Fugaku's mpiexec does not deliver rank
+# stdout to the launching process (a pipe or a redirect both come back empty);
+# -of-proc PREFIX writes PREFIX.<step>.<rank> instead, and the prefix must be on
+# the shared FS. Unset by default => behaviour unchanged; a64fx/llmgr sets it so
+# a supervised runner's output lands in its log directory.
+OFP=()
+[ -n "${MPIEXEC_OF_PROC:-}" ] && OFP=(-of-proc "$MPIEXEC_OF_PROC")
+
 make -C "$HERE" all $([ "$VARIANT" != int4 ] && echo "$VARIANT") CC="${CC:-fcc}" OPENMP=1 >/dev/null
 make -C "$UTOFU" tofu_topo_helper >/dev/null 2>&1 || true
 
 case "$MODE" in
   self-test) exec "$RUNNER" --self-test ;;
   stage)
-    exec mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" \
+    exec mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$HERE/build/laguna_s21_stage" \
         --model-dir "$MODEL" --stage-dir "$STAGE" --ep-size "$NP" \
         --nshards "$NSHARDS" "${PASS[@]}" ;;
   generate|serve) ;;  # handled below
@@ -81,7 +89,7 @@ mkdir -p "$RUN_DIR"; cd "$RUN_DIR"
 # Topology discovery (writes ./tofu_topo.txt used by the runner).
 for try in 1 2 3 4 5; do
   rm -f tofu_topo.txt
-  mpiexec -np "$NP" "$UTOFU/tofu_topo_helper" && break
+  mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$UTOFU/tofu_topo_helper" && break
   [ "$try" = 5 ] && { echo "topology discovery failed" >&2; exit 3; }
 done
 [ "$(grep -vc '^#' tofu_topo.txt)" -eq "$NP" ] || { echo "topo has wrong node count" >&2; exit 3; }
@@ -89,7 +97,7 @@ done
 # Stage node-local (per-rank blobs) unless skipped.
 if [ "$DO_STAGE" = 1 ]; then
   echo "staging weights to $STAGE (this takes a few minutes) ..."
-  mpiexec -np "$NP" "$HERE/build/laguna_s21_stage" \
+  mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$HERE/build/laguna_s21_stage" \
       --model-dir "$MODEL" --stage-dir "$STAGE" --status-dir "$RUN_DIR" \
       --ep-size "$NP" --nshards "$NSHARDS" >stage.stdout 2>stage.stderr
   staged=$(find "$RUN_DIR" -maxdepth 1 -name 'laguna_stage_rank*.txt' | wc -l)
@@ -129,12 +137,12 @@ if [ "$MODE" = serve ]; then
   [ -n "$MAXPOS" ] || { echo "serve needs --maxpos N (largest context to accept)" >&2; exit 2; }
   echo "serving on port $PORT (maxpos $MAXPOS); client:"
   echo "  LAGUNA_TOKENIZER=$MODEL/tokenizer.json python3 $HERE/tools/laguna_cli.py --port $PORT chat 'hello'"
-  exec mpiexec -np "$NP" "$RUNNER" --serve \
+  exec mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --serve \
       --port "$PORT" --maxpos "$MAXPOS" --layers "$LAYERS" \
       --stage-dir "$STAGE" "${PASS[@]}"
 fi
 
-mpiexec -np "$NP" "$RUNNER" --generate \
+mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --generate \
     --ids "$IDS" --max-new "$MAX_NEW" --layers "$LAYERS" \
     --stage-dir "$STAGE" --gen-out "$RUN_DIR/gen.ids" "${PASS[@]}"
 
