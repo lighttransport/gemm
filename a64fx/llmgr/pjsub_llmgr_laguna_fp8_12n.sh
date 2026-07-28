@@ -24,7 +24,7 @@
 #PJM -j
 
 set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO=${REPO:-/home/u14346/work/gemm/glm5-1}
 export FRONTEND_PORT="${FRONTEND_PORT:-21374}"
 export SERVER_PORT="${SERVER_PORT:-21274}"
-exec "$HERE/pjsub_llmgr_12n.sh"
+exec "$REPO/a64fx/llmgr/pjsub_llmgr_12n.sh"
