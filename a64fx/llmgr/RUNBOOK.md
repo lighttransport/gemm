@@ -50,6 +50,10 @@ Useful overrides:
 JOB_SCRIPT=a64fx/llmgr/pjsub_llmgr_4n.sh FRONTEND_PORT=21375 \
   ./a64fx/llmgr/submit_llmgr_over_ssh.sh
 
+# preemptible spot allocation; use a distinct port if another job is queued
+RSCGRP=spot-small NODES=12 ELAPSE=06:00:00 FRONTEND_PORT=21375 \
+  ./a64fx/llmgr/submit_llmgr_over_ssh.sh
+
 REMOTE=my-fugaku-alias \
 REMOTE_REPO=/vol0006/mdt0/data/hp250467/work/gemm/glm5-1 \
   ./a64fx/llmgr/submit_llmgr_over_ssh.sh
