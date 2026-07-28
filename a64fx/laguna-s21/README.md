@@ -18,8 +18,10 @@ make bf16       # pure-bf16 reference
 For the production FP8 shape, use
 `run_laguna_s21_fp8_best.sh`: it selects the FP8 checkpoint and runner while
 leaving the allocation rank count (`PJM_MPI_PROC`, normally 12) explicit. The
-recommended six-hour llmgr job, including submission and tunnel commands, is
-in [`../llmgr/RUNBOOK.md`](../llmgr/RUNBOOK.md).
+recommended six-hour llmgr job, including submission from the Mutagen-synced
+workstation, frontend pinning, tunnels, and the control API, is in
+[`../llmgr/RUNBOOK.md`](../llmgr/RUNBOOK.md). Keep that as the operational
+source of truth; this file documents the runner itself.
 
 ## Configuration is by flag, never by environment
 

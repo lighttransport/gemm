@@ -64,6 +64,17 @@ token.
 
 ## Batch job with the reverse tunnel
 
+From the Mutagen-synced workstation, use the helper that discovers and pins the
+actual load-balanced Fugaku frontend:
+
+```sh
+./a64fx/llmgr/submit_llmgr_over_ssh.sh
+```
+
+See [RUNBOOK.md](RUNBOOK.md) for the workstation local-forward command and the
+complete Laguna procedure. From an already pinned Fugaku frontend, submit the
+job script directly:
+
 ```sh
 pjsub --no-check-directory a64fx/llmgr/pjsub_llmgr_12n.sh
 # then on the frontend it tunnelled to (login1 by default):
