@@ -537,3 +537,65 @@ result directories. Cleanup only removes directories created by that invocation.
 Environment variables are limited to scheduler/rank discovery, OpenMP/XOS profiling
 and binding controls, and the debugging retention switches `K3_KEEP_PROBE=1` and
 `K3_KEEP_RESULTS=1`; they no longer select model, layer, kernel, or topology behavior.
+
+## Distributed K3 runner
+
+`k3_ep_runner` is the executable uTofu bring-up path for the intermediate-TP MoE
+architecture. It defaults to 96 nodes but accepts `--nodes N`; the configured count
+must divide 96 so every rank owns an integer number of native 32-channel MXFP4 scale
+groups. At 96 nodes each rank owns 32 channels from each of the 16 selected experts.
+The selected-expert SVE kernel shares one OpenMP team, route-weights the local `w2`
+partials, packs the 3,584-float routed latent and 7,168-float hidden partial, and issues
+one 10,752-float sum-allreduce per layer step. All ranks then advance the same residual
+state. A final checksum reduction detects lost lockstep.
+
+Both execution modes use the same kernels, scratch buffers, and collective:
+
+- `--mode dummy` creates deterministic MXFP4 tensors through the 256-byte-aligned,
+  NUMA-aware pool. It checks topology, registration, allreduce, computation, status
+  reporting, and teardown without filesystem traffic.
+- `--mode real` loads 16 rank-local intermediate-TP slices produced by `k3_stage.py`.
+  `--experts 0-15` stages all selected experts with one scan of the 96 safetensor
+  headers. At TP=96 this reads about 2.79 MiB/rank, or about 45 MiB per 16-node SIO
+  group. Loading is collective-safe: one rank's failure is reduced to every rank,
+  producing `load-failed` status rather than stranding peers in the next collective.
+
+Inside an allocation, use the orchestration wrapper:
+
+```sh
+./run_k3_ep.sh --mode dummy --nodes 96 --layers 2 --tokens 2
+./run_k3_ep.sh --mode real --nodes 96 --layer 1 --experts 0-15 \
+  --model-dir "$HOME/models/kimi-k3" --layers 1 --tokens 2
+```
+
+The wrapper builds the runner and topology helper, retries topology discovery, stages
+only for real mode, captures per-rank output on the shared filesystem, and requires one
+durable `state=pass` marker per rank. It refuses pre-existing result and rank-local
+stage directories. Rank-local data is intentionally not recursively deleted by the
+launcher; Fugaku wipes `/local` when the allocation ends, while retention during an
+interactive job makes failures recoverable.
+
+Short 96-node batch smoke scripts are `pjsub_k3_dummy_96n.sh` (five minutes, no model
+I/O), `pjsub_k3_real_96n.sh` (ten minutes, bounded partial weights), and
+`pjsub_k3_smoke_96n.sh` (ten minutes; dummy must pass before real staging begins). They use the
+`small` resource group because `small-s2` has a scheduler-enforced minimum elapsed time
+of 3,601 seconds. The PJM allocation remains 96-node-specific; within an allocation the
+runner and wrapper node count are configurable.
+
+The 12-node preflight on job `49849632` passed all bring-up gates:
+
+- A representative dummy range `[2,5)` exercised two KDA layers, one MLA layer,
+  three MoE collectives per token, and produced 12/12 pass markers with checksum
+  disagreement `4.65e-11`.
+- One dummy token traversed the full 93-layer schedule (69 KDA, 24 MLA, dense layer
+  0 and 92 MoE layers) with 12/12 pass markers. Managed peak memory was 70.09 MiB/rank.
+- The real layer-1 preflight staged all 16 experts in one header scan, read 22.31
+  MiB/rank (about 268 MiB for the allocation's SIO group), and passed 12/12 ranks.
+  Two layer steps took 71.26 ms total; managed peak memory was 23.20 MiB/rank and
+  checksum disagreement was `4.25e-10`.
+
+This is a distributed graph/loader/collective runner, not yet a quality-generation
+claim: dummy mode uses synthetic attention projections, route weights, dense/shared
+projection, embeddings, and head; bounded real mode replaces the 16 expert slices
+only. Full checkpoint staging and tokenizer-driven generation remain the next runner
+increment after the 96-node graph gate.

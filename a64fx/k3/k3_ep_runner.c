@@ -1,0 +1,342 @@
+/* Kimi K3 A64FX intermediate-TP runner bring-up.
+ *
+ * This is the first executable distributed slice of the K3 network: every rank
+ * owns a contiguous MXFP4 intermediate slice from each of the 16 selected
+ * experts.  Routed latent and hidden partials are packed into one all-reduce,
+ * matching the intended full-runner MoE collective.  Dummy and staged-real
+ * modes deliberately share the same kernel and communication path.
+ */
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#include <errno.h>
+#include <math.h>
+#include <omp.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <utofu.h>
+
+#include "k3_moe.h"
+#include "k3_runtime.h"
+#include "../utofu-tests/tofu_demo.h"
+#include "../utofu-tests/tp_allreduce.h"
+
+#define K3_RUNNER_MAX_NODES 512
+#define K3_SELECTED 16
+#define K3_WAIT_TIMEOUT 120.0
+#define K3_RUN_STAG DEMO_STAG
+
+typedef enum { K3_MODE_DUMMY, K3_MODE_REAL } k3_mode;
+typedef struct {
+    int nodes;
+    int layers;
+    int tokens;
+    int threads;
+    int layer;
+    k3_mode mode;
+    const char *stage_dir;
+    const char *status_dir;
+    const char *topo_path;
+} k3_options;
+typedef struct { uint64_t offset,nbytes,rows,cols; char dtype[16],name[512]; } k3_entry;
+typedef struct { uint8_t *blob; size_t size; k3_mxfp4_matrix w1,w2,w3; } k3_loaded_expert;
+
+static int g_nodes, g_rank;
+static char *g_region;
+static size_t g_send_off, g_bar_base, g_slot_send, g_slot_bar;
+static utofu_vcq_hdl_t g_vcq;
+static utofu_stadd_t g_base;
+static utofu_vcq_id_t g_peer_vcq[K3_RUNNER_MAX_NODES];
+static utofu_stadd_t g_peer_base[K3_RUNNER_MAX_NODES];
+static uint64_t g_bar_token=1;
+static const unsigned long g_put_flags=UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
+
+static double now_sec(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
+static void usage(const char *p){
+    fprintf(stderr,
+        "usage: %s [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]\n"
+        "          [--threads N] [--layer N] [--stage-dir DIR]\n"
+        "          [--status-dir DIR] [--topo FILE]\n",p);
+}
+static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
+    char *end=NULL;errno=0;long v=strtol(s,&end,10);
+    if(errno||!s[0]||!end||*end||v<lo||v>hi){
+        fprintf(stderr,"k3_ep_runner: %s expects an integer in [%d,%d], got '%s'\n",flag,lo,hi,s);return-1;}
+    *out=(int)v;return 0;
+}
+static int parse_options(int argc,char **argv,k3_options *o){
+    *o=(k3_options){.nodes=96,.layers=1,.tokens=2,.threads=48,.layer=1,
+        .mode=K3_MODE_DUMMY,.stage_dir="/local/k3-runner",
+        .status_dir=".",.topo_path="tofu_topo.txt"};
+    for(int i=1;i<argc;++i){const char *a=argv[i];
+#define VALUE() do{if(++i>=argc){fprintf(stderr,"k3_ep_runner: missing value for %s\n",a);usage(argv[0]);return-1;}}while(0)
+        if(!strcmp(a,"--mode")){VALUE();if(!strcmp(argv[i],"dummy"))o->mode=K3_MODE_DUMMY;
+            else if(!strcmp(argv[i],"real"))o->mode=K3_MODE_REAL;
+            else{fprintf(stderr,"k3_ep_runner: --mode expects dummy or real, got '%s'\n",argv[i]);return-1;}}
+        else if(!strcmp(a,"--nodes")){VALUE();if(parse_int(a,argv[i],1,K3_RUNNER_MAX_NODES,&o->nodes))return-1;}
+        else if(!strcmp(a,"--layers")){VALUE();if(parse_int(a,argv[i],1,93,&o->layers))return-1;}
+        else if(!strcmp(a,"--tokens")){VALUE();if(parse_int(a,argv[i],1,4096,&o->tokens))return-1;}
+        else if(!strcmp(a,"--threads")){VALUE();if(parse_int(a,argv[i],1,48,&o->threads))return-1;}
+        else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
+        else if(!strcmp(a,"--stage-dir")){VALUE();o->stage_dir=argv[i];}
+        else if(!strcmp(a,"--status-dir")){VALUE();o->status_dir=argv[i];}
+        else if(!strcmp(a,"--topo")){VALUE();o->topo_path=argv[i];}
+        else if(!strcmp(a,"-h")||!strcmp(a,"--help")){usage(argv[0]);return 1;}
+        else{fprintf(stderr,"k3_ep_runner: unknown argument '%s'\n",a);usage(argv[0]);return-1;}
+#undef VALUE
+    }
+    int local=K3_EXPERT_INTER/o->nodes;
+    if(K3_EXPERT_INTER%o->nodes||local%K3_EXPERT_TP_BLOCK){
+        fprintf(stderr,"k3_ep_runner: --nodes %d cannot preserve native MXFP4 groups; "
+            "node count must divide 96 (local intermediate channels must be a multiple of 32)\n",o->nodes);return-1;}
+    if(o->mode==K3_MODE_REAL&&(!o->stage_dir||!o->stage_dir[0])){
+        fprintf(stderr,"k3_ep_runner: real mode requires --stage-dir\n");return-1;}
+    if(o->mode==K3_MODE_REAL&&(o->layer==0||o->layers!=1)){
+        fprintf(stderr,"k3_ep_runner: bounded real mode requires --layer in [1,92] and --layers 1\n");return-1;}
+    if(o->layer+o->layers>93){
+        fprintf(stderr,"k3_ep_runner: layer range [%d,%d) exceeds the 93-layer network\n",o->layer,o->layer+o->layers);return-1;}
+    return 0;
+}
+
+static int read_topology(const char *path,uint8_t coords[][TOFU_NCOORDS]){
+    FILE *f=fopen(path,"r");if(!f){fprintf(stderr,"k3_ep_runner: cannot open topology '%s': %s\n",path,strerror(errno));return-1;}
+    char line[256];int n=0;
+    while(fgets(line,sizeof line,f)){if(line[0]=='#'||line[0]=='\n')continue;
+        if(n>=K3_RUNNER_MAX_NODES){fprintf(stderr,"k3_ep_runner: topology exceeds %d ranks\n",K3_RUNNER_MAX_NODES);fclose(f);return-1;}
+        unsigned r,c[TOFU_NCOORDS];
+        if(sscanf(line,"%u %u %u %u %u %u %u",&r,&c[0],&c[1],&c[2],&c[3],&c[4],&c[5])!=7||(int)r!=n){
+            fprintf(stderr,"k3_ep_runner: malformed/out-of-order topology line: %s",line);fclose(f);return-1;}
+        for(int k=0;k<TOFU_NCOORDS;++k)coords[n][k]=(uint8_t)c[k];++n;
+    }
+    fclose(f);return n;
+}
+static size_t bar_recv_off(int rank){return g_bar_base+(size_t)rank*g_slot_bar;}
+static size_t bar_go_off(void){return g_bar_base+(size_t)g_nodes*g_slot_bar;}
+static int put_issue(utofu_vcq_id_t peer,utofu_stadd_t src,utofu_stadd_t dst,size_t bytes){
+    int rc;void *cb;
+    do{rc=utofu_put(g_vcq,peer,src,dst,bytes,0,g_put_flags,NULL);if(rc==UTOFU_ERR_BUSY)(void)utofu_poll_tcq(g_vcq,0,&cb);}while(rc==UTOFU_ERR_BUSY);
+    if(rc!=UTOFU_SUCCESS)return rc;
+    do{rc=utofu_poll_tcq(g_vcq,0,&cb);}while(rc==UTOFU_ERR_NOT_FOUND);
+    return rc;
+}
+static int wait_ge(volatile uint64_t *p,uint64_t want){double start=now_sec();while(*p<want)if(now_sec()-start>K3_WAIT_TIMEOUT)return-1;return 0;}
+static void runner_barrier(void){
+    uint64_t token=++g_bar_token;char *send=g_region+g_send_off;
+    if(g_rank==0){
+        for(int r=1;r<g_nodes;++r)if(wait_ge((volatile uint64_t*)(g_region+bar_recv_off(r)),token)){
+            fprintf(stderr,"k3_ep_runner rank 0: barrier fan-in timeout from rank %d\n",r);exit(3);}
+        for(int r=1;r<g_nodes;++r){*(volatile uint64_t*)send=token;
+            int rc=put_issue(g_peer_vcq[r],g_base+g_send_off,g_peer_base[r]+bar_go_off(),8);
+            if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank 0: barrier release rank %d rc=%d\n",r,rc);exit(3);}}
+    }else{
+        volatile uint64_t *go=(volatile uint64_t*)(g_region+bar_go_off());double start=now_sec();
+        do{*(volatile uint64_t*)send=token;int rc=put_issue(g_peer_vcq[0],g_base+g_send_off,g_peer_base[0]+bar_recv_off(g_rank),8);
+            if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: barrier put rc=%d\n",g_rank,rc);exit(3);}
+            for(int i=0;i<50&&*go<token;++i)usleep(2000);
+            if(now_sec()-start>K3_WAIT_TIMEOUT){fprintf(stderr,"k3_ep_runner rank %d: barrier release timeout\n",g_rank);exit(3);}
+        }while(*go<token);
+    }
+}
+
+static int load_manifest(const char *path,k3_entry *entries,int cap){
+    FILE *f=fopen(path,"r");if(!f){fprintf(stderr,"k3_ep_runner: open manifest '%s': %s\n",path,strerror(errno));return-1;}
+    char line[1024];int n=0;
+    while(fgets(line,sizeof line,f)){if(line[0]=='#')continue;k3_entry e;int nd;unsigned long long off,bytes,rows,cols;
+        if(sscanf(line,"%llu %llu %15s %d %llu %llu %511s",&off,&bytes,e.dtype,&nd,&rows,&cols,e.name)!=7||nd!=2||n>=cap){
+            fprintf(stderr,"k3_ep_runner: malformed manifest '%s' near entry %d\n",path,n);fclose(f);return-1;}
+        e.offset=off;e.nbytes=bytes;e.rows=rows;e.cols=cols;entries[n++]=e;
+    }
+    fclose(f);return n;
+}
+static k3_entry *find_entry(k3_entry *entries,int n,const char *suffix){
+    size_t sl=strlen(suffix);for(int i=0;i<n;++i){size_t nl=strlen(entries[i].name);
+        if(nl>=sl&&!strcmp(entries[i].name+nl-sl,suffix))return&entries[i];}return NULL;
+}
+static int load_real_expert(k3_pool *pool,const char *stage_dir,int layer,int expert,
+        int local,k3_loaded_expert *out){
+    char blob[1024],manifest[1024];
+    int nb=snprintf(blob,sizeof blob,"%s/expert%03d/layer%02d_expert%03d.blob",stage_dir,expert,layer,expert);
+    int nm=snprintf(manifest,sizeof manifest,"%s/expert%03d/layer%02d_expert%03d.manifest",stage_dir,expert,layer,expert);
+    if(nb<0||nm<0||(size_t)nb>=sizeof blob||(size_t)nm>=sizeof manifest){fprintf(stderr,"k3_ep_runner: staged path is too long\n");return-1;}
+    k3_entry es[8];int ne=load_manifest(manifest,es,8);if(ne!=6){fprintf(stderr,"k3_ep_runner: '%s' has %d entries, expected 6\n",manifest,ne);return-1;}
+    size_t size=0;uint8_t *base=k3_pool_load_blob(pool,blob,&size);if(!base){fprintf(stderr,"%s\n",k3_pool_error(pool));return-1;}
+    for(int i=0;i<ne;++i)if(es[i].offset>size||es[i].nbytes>size-es[i].offset){
+        fprintf(stderr,"k3_ep_runner: tensor '%s' exceeds blob '%s'\n",es[i].name,blob);k3_pool_free(pool,base);return-1;}
+#define MATRIX(prefix,rows_,cols_) do{ \
+    k3_entry *p=find_entry(es,ne,#prefix ".weight_packed"),*s=find_entry(es,ne,#prefix ".weight_scale"); \
+    if(!p||!s||p->rows!=(uint64_t)(rows_)||p->cols!=(uint64_t)((cols_)/2)|| \
+       s->rows!=(uint64_t)(rows_)||s->cols!=(uint64_t)((cols_)/32)){ \
+        fprintf(stderr,"k3_ep_runner: invalid %s TP shape in '%s'\n",#prefix,manifest);k3_pool_free(pool,base);return-1;} \
+    out->prefix=(k3_mxfp4_matrix){base+p->offset,base+s->offset,(rows_),(cols_)}; \
+}while(0)
+    MATRIX(w1,local,K3_LATENT);MATRIX(w2,K3_LATENT,local);MATRIX(w3,local,K3_LATENT);
+#undef MATRIX
+    out->blob=base;out->size=size;return 0;
+}
+
+static uint64_t mix64(uint64_t x){x=(x^(x>>30))*UINT64_C(0xbf58476d1ce4e5b9);x=(x^(x>>27))*UINT64_C(0x94d049bb133111eb);return x^(x>>31);}
+static int make_dummy_expert(k3_pool *pool,int rank,int expert,int local,k3_loaded_expert *out){
+    size_t p13=(size_t)local*K3_LATENT/2,s13=(size_t)local*K3_LATENT/32;
+    size_t p2=(size_t)K3_LATENT*local/2,s2=(size_t)K3_LATENT*local/32;
+    size_t total=p13+s13+p2+s2+p13+s13;uint8_t *b=k3_pool_alloc(pool,total);if(!b)return-1;
+    uint8_t *p=b;out->w1=(k3_mxfp4_matrix){p,p+p13,local,K3_LATENT};p+=p13+s13;
+    out->w2=(k3_mxfp4_matrix){p,p+p2,K3_LATENT,local};p+=p2+s2;
+    out->w3=(k3_mxfp4_matrix){p,p+p13,local,K3_LATENT};
+    k3_mxfp4_matrix *m[3]={&out->w1,&out->w2,&out->w3};
+    for(int q=0;q<3;++q){size_t pn=(size_t)m[q]->rows*m[q]->cols/2,sn=(size_t)m[q]->rows*m[q]->cols/32;
+        uint64_t state=mix64(UINT64_C(0x4b33000000000000)^((uint64_t)rank<<24)^((uint64_t)expert<<8)^q);
+        uint8_t *wp=(uint8_t*)m[q]->packed,*ws=(uint8_t*)m[q]->scale;
+        for(size_t i=0;i<pn;++i){state=mix64(state+i+1);wp[i]=(uint8_t)((state&7)|(((state>>8)&7)<<4));}
+        /* Small but non-zero synthetic weights avoid immediately saturating the
+         * SiTU/tanh residual, keeping checksum drift useful as a smoke signal. */
+        memset(ws,110,sn);}
+    out->blob=b;out->size=total;return 0;
+}
+static void write_status(const k3_options *o,const char *state,double seconds,double checksum,size_t peak){
+    char path[1024];int n=snprintf(path,sizeof path,"%s/k3_rank%03d.status",o->status_dir,g_rank);
+    if(n<0||(size_t)n>=sizeof path)return;FILE *f=fopen(path,"w");if(!f)return;
+    fprintf(f,"rank=%d nodes=%d mode=%s state=%s layers=%d tokens=%d seconds=%.9f checksum=%+.9e peak_bytes=%zu\n",
+        g_rank,g_nodes,o->mode==K3_MODE_REAL?"real":"dummy",state,o->layers,o->tokens,seconds,checksum,peak);fclose(f);
+}
+
+/* Config lists layers one-based. KDA occupies three of each four through layer
+ * 91; layer 92 (one-based) and the final layer 93 are MLA, for 69 KDA + 24 MLA. */
+static int layer_is_kda(int layer){int one=layer+1;return one<=91&&(one&3)!=0;}
+
+static void synthetic_attention_partial(float *shared,const float *latent,
+        int layer_index,int global_layer,int token,int cache_tokens,int local_heads,
+        float *kda_state,float *mla_keys,float *mla_values,
+        float *q,float *k,float *v,float *decay,float *attn_out){
+    int is_kda=layer_is_kda(global_layer);size_t qstride=is_kda?K3_HEAD_DIM:192;
+    memset(shared,0,K3_HIDDEN*sizeof(float));
+    for(int h=0;h<local_heads;++h){int gh=g_rank*local_heads+h;
+        for(size_t d=0;d<qstride;++d){
+            float base=latent[(gh*131+(int)d*17+global_layer*29+token*7)%K3_LATENT];
+            q[(size_t)h*192+d]=base+0.0001f*(float)(d+1);
+            k[(size_t)h*192+d]=base*0.75f-0.00007f*(float)(d+1);
+            if(d<K3_HEAD_DIM){v[(size_t)h*K3_HEAD_DIM+d]=latent[(gh*97+(int)d*11+token)%K3_LATENT]*0.5f;
+                decay[(size_t)h*K3_HEAD_DIM+d]=0.995f;}}
+        if(is_kda){k3_l2_normalize_sve(q+(size_t)h*192,K3_HEAD_DIM,1e-6f);
+            k3_l2_normalize_sve(k+(size_t)h*192,K3_HEAD_DIM,1e-6f);}
+    }
+    if(is_kda){
+#pragma omp parallel for schedule(static)
+        for(int h=0;h<local_heads;++h){float beta=.5f;
+            float *state=kda_state+((size_t)layer_index*local_heads+h)*K3_HEAD_DIM*K3_HEAD_DIM;
+            k3_kda_step_decay_sve(attn_out+(size_t)h*K3_HEAD_DIM,
+                q+(size_t)h*192,k+(size_t)h*192,v+(size_t)h*K3_HEAD_DIM,
+                decay+(size_t)h*K3_HEAD_DIM,&beta,state,1,K3_HEAD_DIM,K3_HEAD_DIM);}
+    }else{
+#pragma omp parallel for schedule(static)
+        for(int h=0;h<local_heads;++h){
+            size_t base=((size_t)layer_index*local_heads+h);
+            float *kh=mla_keys+(base*(size_t)cache_tokens+(size_t)token)*192;
+            float *vh=mla_values+(base*(size_t)cache_tokens+(size_t)token)*K3_HEAD_DIM;
+            memcpy(kh,k+(size_t)h*192,192*sizeof(float));memcpy(vh,v+(size_t)h*K3_HEAD_DIM,K3_HEAD_DIM*sizeof(float));
+            k3_attention_sve(attn_out+(size_t)h*K3_HEAD_DIM,q+(size_t)h*192,
+                mla_keys+base*(size_t)cache_tokens*192,mla_values+base*(size_t)cache_tokens*K3_HEAD_DIM,
+                token+1,192,K3_HEAD_DIM);}
+    }
+    /* Synthetic row projection: ownership is disjoint, so the following fused
+     * allreduce reconstructs one replicated hidden contribution. */
+    for(int h=0;h<local_heads;++h){int gh=g_rank*local_heads+h;
+        for(int d=0;d<K3_HEAD_DIM;++d){int out=(gh*K3_HEAD_DIM+d)%K3_HIDDEN;
+            shared[out]+=attn_out[(size_t)h*K3_HEAD_DIM+d]*0.03125f;}}
+    for(int i=g_rank;i<K3_HIDDEN;i+=g_nodes)
+        shared[i]+=0.015625f*latent[(i+global_layer+token)%K3_LATENT];
+}
+
+int main(int argc,char **argv){
+    k3_options opt;int parsed=parse_options(argc,argv,&opt);if(parsed)return parsed>0?0:2;
+    omp_set_num_threads(opt.threads);
+    static uint8_t topo[K3_RUNNER_MAX_NODES][TOFU_NCOORDS];int topo_n=read_topology(opt.topo_path,topo);
+    if(topo_n<0)return 2;if(topo_n!=opt.nodes){fprintf(stderr,"k3_ep_runner: topology has %d ranks but --nodes is %d\n",topo_n,opt.nodes);return 2;}
+    uint8_t mine[TOFU_NCOORDS]={0};int rc=utofu_query_my_coords(mine);if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner: utofu_query_my_coords rc=%d\n",rc);return 3;}
+    g_nodes=topo_n;g_rank=-1;for(int r=0;r<g_nodes;++r)if(!memcmp(topo[r],mine,TOFU_NCOORDS)){g_rank=r;break;}
+    if(g_rank<0){fprintf(stderr,"k3_ep_runner: local coordinates are absent from '%s'\n",opt.topo_path);return 3;}
+
+    k3_pool pool;k3_pool_init(&pool,"k3-ep-runner");
+    g_slot_send=DEMO_CACHE_LINE;g_slot_bar=DEMO_CACHE_LINE;g_send_off=0;g_bar_base=g_slot_send;
+    size_t region_bytes=g_bar_base+(size_t)(g_nodes+1)*g_slot_bar;
+    g_region=k3_pool_calloc(&pool,1,region_bytes);if(!g_region){fprintf(stderr,"%s\n",k3_pool_error(&pool));k3_pool_destroy(&pool);return 2;}
+
+    utofu_tni_id_t *tnis=NULL;size_t ntni=0;rc=utofu_get_onesided_tnis(&tnis,&ntni);
+    if(rc!=UTOFU_SUCCESS||ntni<1){fprintf(stderr,"k3_ep_runner rank %d: no one-sided TNI (rc=%d count=%zu)\n",g_rank,rc,ntni);k3_pool_destroy(&pool);return 3;}
+    rc=utofu_create_vcq_with_cmp_id(tnis[0],DEMO_CMP_ID,0,&g_vcq);if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: create VCQ rc=%d\n",g_rank,rc);free(tnis);k3_pool_destroy(&pool);return 3;}
+    utofu_vcq_id_t self;rc=utofu_query_vcq_id(g_vcq,&self);if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: query VCQ rc=%d\n",g_rank,rc);return 3;}
+    rc=utofu_reg_mem_with_stag(g_vcq,g_region,region_bytes,K3_RUN_STAG,0,&g_base);if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: register barrier rc=%d\n",g_rank,rc);return 3;}
+    for(int r=0;r<g_nodes;++r){if(r==g_rank){g_peer_vcq[r]=self;g_peer_base[r]=g_base;continue;}
+        rc=utofu_construct_vcq_id(topo[r],tnis[0],DEMO_CQ_ID,DEMO_CMP_ID,&g_peer_vcq[r]);
+        if(rc==UTOFU_SUCCESS)utofu_set_vcq_id_path(&g_peer_vcq[r],NULL);
+        if(rc==UTOFU_SUCCESS)rc=utofu_query_stadd(g_peer_vcq[r],K3_RUN_STAG,&g_peer_base[r]);
+        if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: peer %d bootstrap rc=%d\n",g_rank,r,rc);return 3;}}
+    free(tnis);runner_barrier();
+    tp_comm comm;if(tp_comm_init(&comm,g_vcq,g_peer_vcq,g_rank,g_nodes,K3_MOE_REDUCE_FLOATS,runner_barrier)){
+        fprintf(stderr,"k3_ep_runner rank %d: all-reduce initialization failed\n",g_rank);return 3;}
+    runner_barrier();
+
+    int local=K3_EXPERT_INTER/g_nodes,ready=1;k3_loaded_expert experts[K3_SELECTED];memset(experts,0,sizeof experts);
+    for(int e=0;e<K3_SELECTED;++e){int bad=opt.mode==K3_MODE_REAL?
+        load_real_expert(&pool,opt.stage_dir,opt.layer,e,local,&experts[e]):
+        make_dummy_expert(&pool,g_rank,e,local,&experts[e]);if(bad){ready=0;break;}}
+    float ready_sum=(float)ready;tp_allreduce_sum(&comm,&ready_sum,1);
+    if((int)lrintf(ready_sum)!=g_nodes){
+        if(g_rank==0)fprintf(stderr,"k3_ep_runner: distributed weight readiness failed (%d/%d ranks ready)\n",(int)lrintf(ready_sum),g_nodes);
+        write_status(&opt,"load-failed",0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
+        utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 4;}
+
+    k3_mxfp4_matrix w1[K3_SELECTED],w2[K3_SELECTED],w3[K3_SELECTED];float route[K3_SELECTED];
+    for(int e=0;e<K3_SELECTED;++e){w1[e]=experts[e].w1;w2[e]=experts[e].w2;w3[e]=experts[e].w3;route[e]=1.0f/K3_SELECTED;}
+    float *latent=k3_pool_alloc(&pool,K3_LATENT*sizeof(float));
+    float *partial=k3_pool_alloc(&pool,K3_LATENT*sizeof(float));
+    float *shared=k3_pool_calloc(&pool,K3_HIDDEN,sizeof(float));
+    float *reduce=k3_pool_alloc(&pool,K3_MOE_REDUCE_FLOATS*sizeof(float));
+    float *gate=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
+    float *up=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
+    float *expert_out=k3_pool_alloc(&pool,(size_t)K3_SELECTED*K3_LATENT*sizeof(float));
+    int local_heads=96/g_nodes;
+    float *kda_state=k3_pool_calloc(&pool,(size_t)opt.layers*local_heads*K3_HEAD_DIM*K3_HEAD_DIM,sizeof(float));
+    float *mla_keys=k3_pool_calloc(&pool,(size_t)opt.layers*local_heads*opt.tokens*192,sizeof(float));
+    float *mla_values=k3_pool_calloc(&pool,(size_t)opt.layers*local_heads*opt.tokens*K3_HEAD_DIM,sizeof(float));
+    float *q=k3_pool_alloc(&pool,(size_t)local_heads*192*sizeof(float));
+    float *k=k3_pool_alloc(&pool,(size_t)local_heads*192*sizeof(float));
+    float *v=k3_pool_alloc(&pool,(size_t)local_heads*K3_HEAD_DIM*sizeof(float));
+    float *decay=k3_pool_alloc(&pool,(size_t)local_heads*K3_HEAD_DIM*sizeof(float));
+    float *attn_out=k3_pool_alloc(&pool,(size_t)local_heads*K3_HEAD_DIM*sizeof(float));
+    ready=latent&&partial&&shared&&reduce&&gate&&up&&expert_out&&kda_state&&mla_keys&&mla_values&&q&&k&&v&&decay&&attn_out;
+    ready_sum=(float)ready;tp_allreduce_sum(&comm,&ready_sum,1);
+    if((int)lrintf(ready_sum)!=g_nodes){if(!ready)fprintf(stderr,"%s\n",k3_pool_error(&pool));
+        if(g_rank==0)fprintf(stderr,"k3_ep_runner: distributed scratch allocation failed (%d/%d ranks ready)\n",(int)lrintf(ready_sum),g_nodes);
+        write_status(&opt,"alloc-failed",0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
+        utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 4;}
+    for(int i=0;i<K3_LATENT;++i)latent[i]=sinf((float)(i+1)*0.001f)*0.125f;
+
+    runner_barrier();double start=now_sec();int finite=1;
+    for(int token=0;token<opt.tokens;++token)for(int layer=0;layer<opt.layers;++layer){int global_layer=opt.layer+layer;
+        synthetic_attention_partial(shared,latent,layer,global_layer,token,opt.tokens,local_heads,
+            kda_state,mla_keys,mla_values,q,k,v,decay,attn_out);
+        if(global_layer==0)memset(partial,0,K3_LATENT*sizeof(float));
+        else if(k3_expert_tp_forward_selected_mxfp4(partial,w1,w2,w3,route,K3_SELECTED,latent,gate,up,expert_out,opt.threads))finite=0;
+        k3_moe_pack_reduce(reduce,partial,shared);tp_allreduce_sum(&comm,reduce,K3_MOE_REDUCE_FLOATS);
+        for(int i=0;i<K3_LATENT;++i){float v=tanhf(reduce[i]+reduce[K3_LATENT+(i*2)%K3_HIDDEN]);latent[i]=v;finite&=isfinite(v);}
+    }
+    runner_barrier();double seconds=now_sec()-start,checksum=0,norm2=0;
+    for(int i=0;i<K3_LATENT;++i){checksum+=latent[i];norm2+=(double)latent[i]*latent[i];}
+    float checksum_sum=(float)checksum;tp_allreduce_sum(&comm,&checksum_sum,1);
+    double disagreement=fabs((double)checksum_sum/g_nodes-checksum);
+    finite&=isfinite(checksum)&&isfinite(norm2)&&disagreement<1e-4;
+    write_status(&opt,finite?"pass":"fail",seconds,checksum,pool.peak_active_bytes);
+    if(g_rank==0){double steps=(double)opt.layers*opt.tokens;
+        int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
+        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d\n",
+            opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads);
+        printf("K3_RESULT status=%s wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f\n",
+            finite?"PASS":"FAIL",seconds,steps/seconds,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0);
+        fflush(stdout);}
+    runner_barrier();tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
+    return finite?0:1;
+}
