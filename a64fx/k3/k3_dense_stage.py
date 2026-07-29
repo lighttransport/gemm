@@ -11,13 +11,16 @@ ALIGN = 256
 EXPECTED = {
     "block_sparse_moe.gate.weight": ("BF16", [896, 7168]),
     "block_sparse_moe.routed_expert_down_proj.weight": ("BF16", [3584, 7168]),
+    "block_sparse_moe.routed_expert_up_proj.weight": ("BF16", [7168, 3584]),
 }
 
 
-def locate(model_dir, layer):
+def locate(model_dir, layer, include_up=False):
+    expected = EXPECTED if include_up else {k: v for k, v in EXPECTED.items()
+                                            if "up_proj" not in k}
     prefix = "language_model.model.layers.%d." % layer
     wanted = {prefix + suffix: (suffix, dtype, shape)
-              for suffix, (dtype, shape) in EXPECTED.items()}
+              for suffix, (dtype, shape) in expected.items()}
     found = {}
     paths = sorted(model_dir.glob("*.safetensors"))
     if len(paths) != 96:
@@ -33,10 +36,10 @@ def locate(model_dir, layer):
             found[suffix] = {"name": name, "source": str(path),
                 "source_offset": data_start + begin, "nbytes": end - begin,
                 "dtype": dtype, "shape": shape}
-    missing = sorted(set(EXPECTED) - set(found))
+    missing = sorted(set(expected) - set(found))
     if missing:
         raise ValueError("missing tensors: %s" % ", ".join(missing))
-    return [found[suffix] for suffix in EXPECTED]
+    return [found[suffix] for suffix in expected]
 
 
 def write_all(fd, data):
@@ -108,12 +111,14 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--chunk-mib", type=int, default=8)
+    parser.add_argument("--include-up", action="store_true",
+                        help="also stage the replicated routed-up candidate")
     args = parser.parse_args()
     if args.layer < 1 or args.layer > 92:
         parser.error("layer must be in [1,92]")
     if k3_stage.mem_available_kb() < k3_stage.MIN_AVAILABLE_KB:
         raise MemoryError("MemAvailable below 6 GiB")
-    records = locate(args.model_dir, args.layer)
+    records = locate(args.model_dir, args.layer, args.include_up)
     blob, manifest, size = stage(records, args.output_dir, args.layer,
                                  args.chunk_mib * 1048576)
     print("staged K3 dense slice %.3f MiB: %s" % (size / 1048576.0, blob))

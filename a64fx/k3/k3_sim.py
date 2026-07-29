@@ -270,7 +270,8 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            latent_overlap: bool, hierarchical_ar: bool,
            expert_tp: bool = False, expert_tp_layer_ms: float = .096,
            fused_moe_ar: bool = False, dense_q8: bool = False,
-           q8_gbps: float = 138.0, attention_rsag: bool = False) -> dict:
+           q8_down_gbps: float = 140.0, q8_up_gbps: float = 97.0,
+           attention_rsag: bool = False) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB -
@@ -281,7 +282,8 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
     if dense_q8:
         weight_s = ROUTER_GB / router_down_gbps
         weight_s += (split.replicated - ROUTER_DOWN_GB + other_tp) / bw_gbps
-        weight_s += .5006 * (ROUTED_DOWN_GB + ROUTED_UP_GB) / q8_gbps
+        weight_s += .5006 * ROUTED_DOWN_GB / q8_down_gbps
+        weight_s += .5006 * ROUTED_UP_GB / q8_up_gbps
     else:
         weight_s = router_down / router_down_gbps
         weight_s += (split.replicated - router_down + other_tp) / bw_gbps
@@ -424,7 +426,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
                        args.expert_ms,args.expert_samples,args.moe_collectives,
                        args.latent_overlap,args.hierarchical_ar,args.expert_tp,
                        args.expert_tp_layer_ms,args.fused_moe_ar,args.dense_q8,
-                       args.q8_gbps,args.attention_rsag)
+                       args.q8_down_gbps,args.q8_up_gbps,args.attention_rsag)
             result["decode"].append(d)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:7.1f} {d['expert_ms']:7.1f} "
                   f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f}")
@@ -489,7 +491,8 @@ def main() -> None:
                    help="one concatenated latent+shared hidden reduction per MoE layer")
     p.add_argument("--dense-q8", action="store_true",
                    help="row-Q8 routed down and replicated routed up")
-    p.add_argument("--q8-gbps", type=float, default=138.0)
+    p.add_argument("--q8-down-gbps", type=float, default=140.0)
+    p.add_argument("--q8-up-gbps", type=float, default=97.0)
     p.add_argument("--attention-rsag", action="store_true",
                    help="use decomposed reduce-scatter/allgather attention reduction")
     p.add_argument("--json", type=Path, help="also write full results as JSON")

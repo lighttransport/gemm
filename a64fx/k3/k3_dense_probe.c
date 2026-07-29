@@ -17,12 +17,13 @@ typedef struct {
     char name[512];
 } entry;
 typedef k3_bf16_matrix matrix;
+static void evict(float *b, size_t n, int th);
 static double now_sec(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
-static int manifest(const char *path, entry *out) {
+static int manifest(const char *path, entry *out, int cap) {
     FILE *f = fopen(path, "r");
     if (!f)
         return -1;
@@ -36,7 +37,7 @@ static int manifest(const char *path, entry *out) {
         int nd, r, c;
         if (sscanf(line, "%llu %llu %15s %d %d %d %511s", &o, &b, dt, &nd, &r,
                    &c, out[n].name) != 7 ||
-            strcmp(dt, "BF16") || nd != 2 || n >= 2) {
+            strcmp(dt, "BF16") || nd != 2 || n >= cap) {
             fclose(f);
             return -1;
         }
@@ -49,11 +50,21 @@ static int manifest(const char *path, entry *out) {
     fclose(f);
     return n;
 }
-static entry *find(entry *e, const char *s) {
-    for (int i = 0; i < 2; ++i)
+static entry *find(entry *e, int n, const char *s) {
+    for (int i = 0; i < n; ++i)
         if (strstr(e[i].name, s))
             return &e[i];
     return NULL;
+}
+static int q8_projection(const matrix *m,const float*x,const float*ref,int threads,const char*label){
+    size_t wn=(size_t)m->rows*m->cols;int8_t*qw=malloc(wn),*qx=malloc((size_t)m->cols);float*sc=malloc((size_t)m->rows*4),*out=malloc((size_t)m->rows*4);
+    size_t en=(size_t)192*1024*1024/4;float*eb=calloc(en,4);if(!qw||!qx||!sc||!out||!eb)return 1;
+    k3_q8_quantize_bf16_rows(qw,sc,m->weight,m->rows,m->cols);k3_q8_matrix q={qw,sc,m->rows,m->cols};k3_matvec_q8(out,&q,x,qx,threads);
+    double se=0,sr=0,dot=0,so=0;for(int i=0;i<m->rows;++i){double d=out[i]-ref[i];se+=d*d;sr+=(double)ref[i]*ref[i];dot+=(double)out[i]*ref[i];so+=(double)out[i]*out[i];}
+    double rel=sqrt(se/(sr+1e-30)),cos=dot/sqrt((sr+1e-30)*(so+1e-30));double sec=0;int iters=10;for(int it=0;it<iters;++it){evict(eb,en,threads);double t=now_sec();k3_matvec_q8(out,&q,x,qx,threads);sec+=now_sec()-t;}
+    printf("[dense-q8-%s] rel_l2=%.3e cosine=%.8f %s\n",label,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");
+    printf("PROBE dense mode=%s-q8 threads=%d us=%.3f GB/s=%.2f memory_MiB=%.2f\n",label,threads,sec/iters*1e6,k3_q8_matrix_bytes(m->rows,m->cols)/(sec/iters)/1e9,k3_q8_matrix_bytes(m->rows,m->cols)/1048576.0);
+    free(qw);free(qx);free(sc);free(out);free(eb);return !isfinite(rel)||!isfinite(cos);
 }
 static uint64_t rs = 0x4b3344454e534501ULL;
 static float rnd(void) {
@@ -160,16 +171,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s BLOB MANIFEST\n", argv[0]);
         return 2;
     }
-    entry e[2];
-    if (manifest(argv[2], e) != 2)
+    entry e[3];
+    int ne=manifest(argv[2], e, 3);
+    if (ne < 2)
         return 2;
     k3_apply_numa_interleave();
     size_t sz;
     uint8_t *b = k3_load_blob_anon(argv[1], &sz);
     if (!b)
         return 2;
-    entry *re = find(e, "gate.weight"),
-          *de = find(e, "routed_expert_down_proj");
+    entry *re = find(e, ne, "gate.weight"),
+          *de = find(e, ne, "routed_expert_down_proj"),
+          *ue = find(e, ne, "routed_expert_up_proj");
     if (!re || !de)
         return 2;
     matrix r = {(uint16_t *)(b + re->offset), re->rows, re->cols},
@@ -193,6 +206,7 @@ int main(int argc, char **argv) {
         perf(&r, &d, x, yr, yd, ts[i], 1);
     }
     int q8_fail = q8_correctness_perf(&r, &d, x, down_ref, 47);
+    if(ue){matrix up={(uint16_t*)(b+ue->offset),ue->rows,ue->cols};float*ux=malloc((size_t)up.cols*4),*uref=malloc((size_t)up.rows*4);for(int i=0;i<up.cols;++i)ux[i]=rnd()*.125f;mv(uref,&up,ux,47);q8_fail|=q8_projection(&up,ux,uref,47,"up");free(ux);free(uref);}
     free(down_ref);
     free(x);
     free(yr);
