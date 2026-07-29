@@ -453,3 +453,9 @@ workshare. It estimates 14.67 tok/s and 25.05 GB/rank at M=1. At
 M=32 it reaches 185.6 aggregate tok/s but models 27.15 GB/rank, narrowly beyond the
 strict 27 GB guard. Use `--q8-up-only`; this remains experimental because routed-up
 alone still fails the projection-level relative-L2 gate.
+
+A 12-node multi-TNI probe used the fused MoE payload size (21,504 bytes in BF16).
+One TNI was fastest at 4.598 us/hop and 4.68 GB/s. Two through six TNIs regressed
+monotonically to 4.702--4.980 us/hop, so same-peer payload striping is rejected. Any
+further collective improvement must reduce synchronization depth or select better
+topological peers; adding VCQs for byte striping will not close the remaining gap.
