@@ -521,4 +521,28 @@ static inline void k3_dense_router_bf16_down_q8(
     }
 }
 
+/* Quality-gated mixed stage: BF16 router plus group-16 Q8 weights / FP32
+ * activation for routed-down, scheduled in one persistent team. */
+static inline void k3_dense_router_bf16_down_q8w16(
+        float *router_out, float *latent_out,
+        const k3_bf16_matrix *router, const k3_q8pv_matrix *latent_down,
+        const float *hidden, int threads) {
+    int router_groups=router->rows/8,down_groups=latent_down->rows/8;
+    size_t down_group_bytes=(size_t)(latent_down->cols/16)*160;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for(int task=0;task<router_groups+down_groups;++task){
+        if(task<router_groups){int r=task*8;const uint16_t*w=router->weight+(size_t)r*router->cols;
+            matvec_bf16_8row(router_out+r,w,w+router->cols,w+2*router->cols,
+                w+3*router->cols,w+4*router->cols,w+5*router->cols,
+                w+6*router->cols,w+7*router->cols,hidden,router->cols);
+        }else{int g=task-router_groups;k3_matvec_q8pv16_f32_group(latent_out+g*8,
+                latent_down->data+(size_t)g*down_group_bytes,hidden,latent_down->cols);}
+    }
+}
+
 #endif

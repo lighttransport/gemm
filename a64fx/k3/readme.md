@@ -499,3 +499,13 @@ strict 27 GB guard. The M=1 breakdown is 40.3 ms weights, 8.6 ms experts, 0.7 ms
 KV/KDA, and 23.0 ms communication. Reaching 20 token/s requires about 22.6 ms more
 than the validated model and cannot be obtained from routed-up optimization alone;
 it requires a genuinely lower-depth collective or cross-layer pipeline overlap.
+
+Q8W16 is also quality-safe for routed-down: across eight independent activations the
+real matrix has worst relative L2 0.478% and minimum cosine 0.9999886. The fused
+BF16-router/Q8W16-down workshare reaches 207.5 us at 40 workers, or 216.7 GB/s of
+mixed stored traffic. `--q8w16-dense` enables group-16 weight-only Q8 for both routed
+projections while retaining the router in BF16. It estimates 14.11 token/s at 4K M=1
+and 182.1 aggregate token/s at M=32. The smaller weights fit both cases: 23.87 GB/rank
+at M=1 and 25.97 GB/rank at M=32. Its M=1 compute-only lower bound is 47.9 ms, or
+20.9 token/s with free communication; the current 23.0 ms collective term must fall
+to roughly 2 ms to reach 20 token/s without further kernel gains.

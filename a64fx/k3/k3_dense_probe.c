@@ -231,6 +231,12 @@ static int q8_correctness_perf(const matrix *r, const matrix *d, const float *x,
     free(eb); free(qw); free(qx); free(scale); free(out); free(router_out);
     return !isfinite(rel) || !isfinite(cosine);
 }
+static int q8w16_pair_perf(const matrix*r,const matrix*d,const float*x,
+        const float*down_ref,int threads){size_t bytes=k3_q8pv16_matrix_bytes(d->rows,d->cols);uint8_t*q=malloc(bytes);float*out=malloc((size_t)d->rows*4),*router=malloc((size_t)r->rows*4);size_t en=(size_t)192*1024*1024/4;float*eb=calloc(en,4);if(!q||!out||!router||!eb)return 1;
+    k3_q8pv16_quantize_bf16(q,d->weight,d->rows,d->cols);k3_q8pv_matrix qm={q,d->rows,d->cols};k3_dense_router_bf16_down_q8w16(router,out,r,&qm,x,threads);double se=0,sr=0;for(int i=0;i<d->rows;++i){double z=out[i]-down_ref[i];se+=z*z;sr+=(double)down_ref[i]*down_ref[i];}double rel=sqrt(se/(sr+1e-30));int ts[]={36,40,44,47,48};
+    for(int ti=0;ti<5;++ti){int th=ts[ti];double sec=0;for(int it=0;it<10;++it){evict(eb,en,th);double t=now_sec();k3_dense_router_bf16_down_q8w16(router,out,r,&qm,x,th);sec+=now_sec()-t;}double traffic=bytes+2.0*r->rows*r->cols;printf("PROBE dense mode=router-bf16+down-q8w16 threads=%d us=%.3f GB/s=%.2f rel_l2=%.3e\n",th,sec/10*1e6,traffic/(sec/10)/1e9,rel);}
+    free(q);free(out);free(router);free(eb);return !isfinite(rel);
+}
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s BLOB MANIFEST\n", argv[0]);
@@ -251,6 +257,23 @@ int main(int argc, char **argv) {
     if (!re || !de)
         return 2;
     const char *only = getenv("K3_DENSE_ONLY");
+    if (only && !strcmp(only, "q8w16down")) {
+        matrix down = {(uint16_t *)(b + de->offset), de->rows, de->cols};
+        float *dx = malloc((size_t)down.cols * 4);
+        float *dref = malloc((size_t)down.rows * 4);
+        if (!dx || !dref)
+            return 2;
+        for (int i = 0; i < down.cols; ++i)
+            dx[i] = rnd() * .125f;
+        mv(dref, &down, dx, 47);
+        int bad = q8pv16_f32_projection(&down, dx, dref, 47, "down");
+        matrix router = {(uint16_t *)(b + re->offset), re->rows, re->cols};
+        bad |= q8w16_pair_perf(&router, &down, dx, dref, 47);
+        free(dx);
+        free(dref);
+        free(b);
+        return bad;
+    }
     if (only && !strcmp(only, "q8w16")) {
         if (!ue)
             return 2;
@@ -290,6 +313,8 @@ int main(int argc, char **argv) {
     }
     int q8_fail = q8_correctness_perf(&r, &d, x, down_ref, 47);
     q8_fail |= q8p16_projection(&d,x,down_ref,47,"down");
+    q8_fail |= q8pv16_f32_projection(&d,x,down_ref,47,"down");
+    q8_fail |= q8w16_pair_perf(&r,&d,x,down_ref,47);
     if(ue){matrix up={(uint16_t*)(b+ue->offset),ue->rows,ue->cols};float*ux=malloc((size_t)up.cols*4),*uref=malloc((size_t)up.rows*4);for(int i=0;i<up.cols;++i)ux[i]=rnd()*.125f;mv(uref,&up,ux,47);q8_fail|=q8_projection(&up,ux,uref,47,"up");q8_fail|=q8p16_projection(&up,ux,uref,47,"up");q8_fail|=mxfp4_projection(&up,ux,uref,47,"up");q8_fail|=q8pv_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_f32_projection(&up,ux,uref,47,"up");q8_fail|=q8pv16_f32_projection(&up,ux,uref,47,"up");q8_fail|=bf16pv_projection(&up,ux,uref,47,"up");free(ux);free(uref);}
     free(down_ref);
     free(x);
