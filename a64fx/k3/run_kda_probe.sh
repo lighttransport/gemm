@@ -14,5 +14,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$script_dir/k3_kda_stage.py" \
     --head "${K3_KDA_HEAD:-0}"
 
 stem="layer$(printf '%02d' "${K3_KDA_LAYER:-0}")_head$(printf '%02d' "${K3_KDA_HEAD:-0}")"
+export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
 OMP_PROC_BIND=close OMP_PLACES=cores "$script_dir/k3_kda_probe" \
     "$stage_dir/$stem.blob" "$stage_dir/$stem.manifest"

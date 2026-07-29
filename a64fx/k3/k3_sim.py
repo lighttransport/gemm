@@ -356,7 +356,7 @@ def main() -> None:
     p.add_argument("--usable-gb", type=float, default=USABLE_GB)
     p.add_argument("--kv-bytes", type=int, choices=(1,2), default=2)
     p.add_argument("--bw-gbps", type=float, default=336.0, help="effective per-rank decode bandwidth")
-    p.add_argument("--head-bw-gbps", type=float, default=83.6,
+    p.add_argument("--head-bw-gbps", type=float, default=131.8,
                    help="measured cache-evicted one-head BF16 projection bandwidth")
     p.add_argument("--mxfp4-gbps", type=float, default=180.0,
                    help="48-core MXFP4 bandwidth; extrapolated from the measured 3.75 GB/s/core")
@@ -366,7 +366,7 @@ def main() -> None:
                    help="deterministic routing Monte Carlo samples per batch")
     p.add_argument("--moe-collectives", type=int, choices=(0,1,2,3), default=2,
                    help="MoE collectives/layer: current exact path is 2")
-    p.add_argument("--kda-gops", type=float, default=11.35,
+    p.add_argument("--kda-gops", type=float, default=14.73,
                    help="12-node mean one-head KDA rate at the optimal 8 threads")
     p.add_argument("--gemm-tflops", type=float, default=1.25, help="assumed per-rank BF16-equivalent GEMM")
     p.add_argument("--latency-us", type=float, default=20.0, help="assumed allreduce latency per log2 step")

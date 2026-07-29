@@ -168,11 +168,11 @@ batch 1. One-million-token context does not fit even at batch 1 (39.81 GB total)
 confirms that context-parallel MLA is required rather than optional.
 
 With the current default assumptions (336 GB/s large-matrix bandwidth, measured
-83.6 GB/s cache-evicted head-slice bandwidth, 180 GB/s 48-core MXFP4 bandwidth,
+131.8 GB/s cache-evicted head-slice bandwidth, 180 GB/s 48-core MXFP4 bandwidth,
 measured eight-thread KDA, and 20 microseconds per recursive-doubling collective step),
 the original bandwidth-average estimate was 14.17 token/s at 4K. The measured
 expert-service model below supersedes it: random top-16 ownership collisions make the
-current 4K batch-one estimate 9.73 token/s.
+current 4K batch-one estimate 10.06 token/s.
 The 1M result remains compute-only and is not runnable under the v1 cache layout.
 
 Known implementation limits of this milestone:
@@ -221,13 +221,13 @@ which creates a visible performance step.
 | 64 | 30.86 GB | no | compute-only; not deployable |
 | 72 | 29.05 GB | no | compute-only; not deployable |
 | 80 | 27.29 GB | no, narrowly | compute-only; not deployable |
-| 84 | 25.61 GB | yes | 9.45 token/s |
-| 92 | 23.89 GB | yes | 9.60 token/s |
-| 96 | 23.77 GB | yes | 9.73 token/s |
+| 84 | 25.61 GB | yes | 9.82 token/s |
+| 92 | 23.89 GB | yes | 9.96 token/s |
+| 96 | 23.77 GB | yes | 10.06 token/s |
 
 The KDA calibration now comes from real layer-0/head-0 activations on all twelve nodes:
-8 threads are optimal at 8.66 microseconds/head-step and 11.35 GOP/s. Cache-evicted
-one-head BF16 projections peak at 83.6 GB/s with 24 threads. For batch-one 128K decode,
+8 threads are optimal at 6.67 microseconds/head-step and 14.73 GOP/s. Cache-evicted
+one-head BF16 projections deliver a robust 131.8 GB/s mean with 24 threads. For batch-one 128K decode,
 only 96 nodes fit the expanded BF16 MLA cache; the revised estimate is 13.10 token/s.
 
 Projected prefill with chunk size 256 is:
@@ -238,7 +238,7 @@ Projected prefill with chunk size 256 is:
 | 92 | 113 token/s | 110 token/s | does not fit |
 | 96 | 122 token/s | 121 token/s | 96 token/s |
 
-The projection uses 336 GB/s for large dense matrices, the measured 83.6 GB/s for
+The projection uses 336 GB/s for large dense matrices, the measured 131.8 GB/s for
 small head-TP attention slices, 180 GB/s full-node MXFP4 bandwidth, 1.25 TFLOP/s
 BF16-equivalent GEMM per node, 20 microseconds per
 recursive-doubling collective step, and a 1.20 routed-expert imbalance factor. The
@@ -261,12 +261,12 @@ Twelve-node mean scaling, with one MPI process per node, is:
 | Four BF16 projections, resident | 1 | 343.85 us | 21.35 GB/s | 100% |
 | Four BF16 projections, resident | 24 | 20.52 us | 363.16 GB/s | 69.8% |
 | Four BF16 projections, resident | 48 | 17.56 us | 418.73 GB/s | 40.8% |
-| Four BF16 projections, cache-evicted | 16 | 88.98 us | 82.51 GB/s | -- |
-| Four BF16 projections, cache-evicted | 24 | 87.83 us | 83.59 GB/s | -- |
-| Four BF16 projections, cache-evicted | 48 | 98.62 us | 74.46 GB/s | -- |
+| Four BF16 projections, cache-evicted | 16 | 60.29 us | 121.82 GB/s | -- |
+| Four BF16 projections, cache-evicted | 24 | 55.68 us | 131.84 GB/s | -- |
+| Four BF16 projections, cache-evicted | 48 | 59.59 us | 140.06 GB/s mean (outliers) | -- |
 | KDA recurrence | 1 | 25.20 us | 3.90 GOP/s | 100% |
 | KDA recurrence | 4 | 9.21 us | 10.68 GOP/s | 68.4% |
-| KDA recurrence | 8 | 8.66 us | 11.35 GOP/s | 36.4% |
+| KDA recurrence | 8 | 6.67 us | 14.73 GOP/s | 47.7% |
 | KDA recurrence | 12 | 9.13 us | 10.76 GOP/s | 23.0% |
 | KDA recurrence | 48 | 11.76 us | 8.38 GOP/s | 4.5% |
 
@@ -325,17 +325,17 @@ and hidden MoE collectives, 278 total), the revised estimates are:
 
 | Decode batch | Dense/attention | Routed experts | KDA + KV | Collectives | Aggregate token/s |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 28.2 ms | 34.0 ms | 0.8 ms | 39.7 ms | 9.73 |
-| 8 | 28.2 ms | 85.6 ms | 5.0 ms | 45.5 ms | 48.70 |
-| 16 | 28.2 ms | 131.1 ms | 9.8 ms | 52.1 ms | 72.34 |
-| 32 | 28.2 ms | 191.9 ms | 19.3 ms | 65.3 ms | 105.01 |
+| 1 | 24.9 ms | 34.0 ms | 0.7 ms | 39.7 ms | 10.06 |
+| 8 | 24.9 ms | 85.6 ms | 3.9 ms | 45.5 ms | 50.03 |
+| 16 | 24.9 ms | 131.1 ms | 7.6 ms | 52.1 ms | 74.18 |
+| 32 | 24.9 ms | 191.9 ms | 14.9 ms | 65.3 ms | 107.73 |
 
 Therefore the requested 30 token/s single-stream target is not yet feasible: the bare
 modeled compute path is already about 63 ms/token, and the current 278-collective model
 alone is 39.7 ms versus a 33.3 ms total target. Reducing MoE communication all the way
 to one hidden collective for the entire layer (94 stack-wide calls, an architectural
-upper-bound experiment rather than the current exact graph) gives 13.06 token/s at
-batch one and 59.43 aggregate token/s at batch eight. Thus the 60 token/s batched target
+upper-bound experiment rather than the current exact graph) gives 13.7 token/s at
+batch one and 61.4 aggregate token/s at batch eight. Thus the 60 token/s batched target
 is close under a one-collective MoE redesign, while single-stream 30 requires roughly a
 threefold combined improvement in expert and dense/attention kernels plus fewer
 collectives. These are projections from partial real weights, not a claim of full-layer
