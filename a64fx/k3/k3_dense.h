@@ -100,15 +100,18 @@ static inline void k3_matvec_q8pv(float*out,const k3_q8pv_matrix*m,
 static inline size_t k3_q8pv32_matrix_bytes(int rows,int cols){
     return(size_t)(rows/8)*(cols/32)*288;
 }
-static inline void k3_q8pv32_quantize_bf16(uint8_t*dst,const uint16_t*src,int rows,int cols){
+static inline void k3_q8pv32_quantize_bf16_clip(uint8_t*dst,const uint16_t*src,int rows,int cols,float clip){
     int groups=rows/8,blocks=cols/32;
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
     for(int g=0;g<groups;++g)for(int b=0;b<blocks;++b){uint8_t*blk=dst+((size_t)g*blocks+b)*288;float*sc=(float*)blk;int8_t*q=(int8_t*)(blk+32);
         for(int r=0;r<8;++r){const uint16_t*w=src+(size_t)(g*8+r)*cols+b*32;float amax=0;
-            for(int j=0;j<32;++j)amax=fmaxf(amax,fabsf(bf16_to_f32_scalar(w[j])));float s=amax>0?amax/127.0f:1.0f,inv=1.0f/s;sc[r]=s;
+            for(int j=0;j<32;++j)amax=fmaxf(amax,fabsf(bf16_to_f32_scalar(w[j])));float s=amax>0?amax*clip/127.0f:1.0f,inv=1.0f/s;sc[r]=s;
             for(int j=0;j<32;++j){long v=lrintf(bf16_to_f32_scalar(w[j])*inv);q[r*32+j]=(int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);}}}
+}
+static inline void k3_q8pv32_quantize_bf16(uint8_t*dst,const uint16_t*src,int rows,int cols){
+    k3_q8pv32_quantize_bf16_clip(dst,src,rows,cols,1.0f);
 }
 static inline void k3_q8pv32_quantize_vector(int8_t*q,float*sc,const float*x,int n){
     for(int b=0;b<n/32;++b){float amax=0;for(int j=0;j<32;++j)amax=fmaxf(amax,fabsf(x[b*32+j]));float s=amax>0?amax/127.0f:1.0f,inv=1.0f/s;sc[b]=s;
@@ -135,6 +138,67 @@ static inline void k3_matvec_q8pv32(float*out,const k3_q8pv_matrix*m,const float
     (void)threads;
 #endif
     for(int g=0;g<m->rows/8;++g)k3_matvec_q8pv32_group(out+g*8,m->data+(size_t)g*gb,xq,xs,m->cols);
+}
+
+/* Weight-only group-32 Q8.  Preserve the FP32 activation to remove the second
+ * quantization error; signed-byte widening and scaling happen in registers. */
+static inline void k3_matvec_q8pv32_f32_group(float*out,const uint8_t*group,const float*x,int k){
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg=svptrue_b32();svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+    for(int b=0;b<k/32;++b){const uint8_t*blk=group+(size_t)b*288;const float*sc=(const float*)blk;const int8_t*q=(const int8_t*)(blk+32);
+        svfloat32_t x0=svld1(pg,x+(size_t)b*32),x1=svld1(pg,x+(size_t)b*32+16);
+#define K3_Q8PV32_F32_ROW(R,A) do{svfloat32_t w0=svcvt_f32_s32_x(pg,svld1sb_s32(pg,q+(size_t)(R)*32));svfloat32_t w1=svcvt_f32_s32_x(pg,svld1sb_s32(pg,q+(size_t)(R)*32+16));A=svmla_n_f32_x(pg,A,svmul_f32_x(pg,w0,x0),sc[R]);A=svmla_n_f32_x(pg,A,svmul_f32_x(pg,w1,x1),sc[R]);}while(0)
+        K3_Q8PV32_F32_ROW(0,a0);K3_Q8PV32_F32_ROW(1,a1);K3_Q8PV32_F32_ROW(2,a2);K3_Q8PV32_F32_ROW(3,a3);K3_Q8PV32_F32_ROW(4,a4);K3_Q8PV32_F32_ROW(5,a5);K3_Q8PV32_F32_ROW(6,a6);K3_Q8PV32_F32_ROW(7,a7);
+#undef K3_Q8PV32_F32_ROW
+    }out[0]=svaddv(pg,a0);out[1]=svaddv(pg,a1);out[2]=svaddv(pg,a2);out[3]=svaddv(pg,a3);out[4]=svaddv(pg,a4);out[5]=svaddv(pg,a5);out[6]=svaddv(pg,a6);out[7]=svaddv(pg,a7);
+#else
+    (void)out;(void)group;(void)x;(void)k;
+#endif
+}
+static inline void k3_matvec_q8pv32_f32(float*out,const k3_q8pv_matrix*m,const float*x,int threads){
+    int blocks=m->cols/32;size_t gb=(size_t)blocks*288;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for(int g=0;g<m->rows/8;++g)k3_matvec_q8pv32_f32_group(out+g*8,m->data+(size_t)g*gb,x,m->cols);
+}
+
+/* Group-16 weight-only variant: [8 f32 scales][8 x 16 int8] per block. */
+static inline size_t k3_q8pv16_matrix_bytes(int rows,int cols){return(size_t)(rows/8)*(cols/16)*160;}
+static inline void k3_q8pv16_quantize_bf16(uint8_t*dst,const uint16_t*src,int rows,int cols){int groups=rows/8,blocks=cols/16;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int g=0;g<groups;++g)for(int b=0;b<blocks;++b){uint8_t*blk=dst+((size_t)g*blocks+b)*160;float*sc=(float*)blk;int8_t*q=(int8_t*)(blk+32);
+        for(int r=0;r<8;++r){const uint16_t*w=src+(size_t)(g*8+r)*cols+b*16;float amax=0;for(int j=0;j<16;++j)amax=fmaxf(amax,fabsf(bf16_to_f32_scalar(w[j])));float s=amax>0?amax/127.0f:1.0f,inv=1.0f/s;sc[r]=s;
+            for(int j=0;j<16;++j){long v=lrintf(bf16_to_f32_scalar(w[j])*inv);q[r*16+j]=(int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);}}}
+}
+static inline void k3_matvec_q8pv16_f32_group(float*out,const uint8_t*group,const float*x,int k){
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg=svptrue_b32();svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+    for(int b=0;b<k/16;++b){const uint8_t*blk=group+(size_t)b*160;const float*sc=(const float*)blk;const int8_t*q=(const int8_t*)(blk+32);svfloat32_t xv=svld1(pg,x+(size_t)b*16);
+#define K3_Q8PV16_F32_ROW(R,A) do{svfloat32_t wv=svcvt_f32_s32_x(pg,svld1sb_s32(pg,q+(size_t)(R)*16));A=svmla_n_f32_x(pg,A,svmul_f32_x(pg,wv,xv),sc[R]);}while(0)
+        K3_Q8PV16_F32_ROW(0,a0);K3_Q8PV16_F32_ROW(1,a1);K3_Q8PV16_F32_ROW(2,a2);K3_Q8PV16_F32_ROW(3,a3);K3_Q8PV16_F32_ROW(4,a4);K3_Q8PV16_F32_ROW(5,a5);K3_Q8PV16_F32_ROW(6,a6);K3_Q8PV16_F32_ROW(7,a7);
+#undef K3_Q8PV16_F32_ROW
+    }out[0]=svaddv(pg,a0);out[1]=svaddv(pg,a1);out[2]=svaddv(pg,a2);out[3]=svaddv(pg,a3);out[4]=svaddv(pg,a4);out[5]=svaddv(pg,a5);out[6]=svaddv(pg,a6);out[7]=svaddv(pg,a7);
+#else
+    (void)out;(void)group;(void)x;(void)k;
+#endif
+}
+static inline void k3_matvec_q8pv16_f32_bias(float*out,const k3_q8pv_matrix*m,const float*x,const float*bias,int threads){int blocks=m->cols/16;size_t gb=(size_t)blocks*160;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for(int g=0;g<m->rows/8;++g){k3_matvec_q8pv16_f32_group(out+g*8,m->data+(size_t)g*gb,x,m->cols);if(bias)for(int r=0;r<8;++r)out[g*8+r]+=bias[g*8+r];}
+}
+static inline void k3_matvec_q8pv16_f32(float*out,const k3_q8pv_matrix*m,const float*x,int threads){
+    k3_matvec_q8pv16_f32_bias(out,m,x,NULL,threads);
 }
 
 static inline float k3_q8_quantize_vector(int8_t *q, const float *x, int n) {
@@ -350,6 +414,30 @@ static inline void k3_matvec_q8p16_bias(float*out,const int8_t*p,const float*sca
 static inline void k3_matvec_q8p16(float*out,const int8_t*p,const float*scale,
         int rows,int cols,const float*x,int8_t*qx,int threads){
     k3_matvec_q8p16_bias(out,p,scale,rows,cols,x,qx,NULL,threads);
+}
+
+/* Decode KDA has five matrices with the same activation.  Quantize that
+ * activation once, then schedule every 16-row packed block in one team. */
+static inline void k3_dense_many_q8p16(float **out, const int8_t **packed,
+        const float **scale, int count, int rows, int cols, const float *x,
+        int8_t *qx, int threads) {
+    float xs = k3_q8_quantize_vector(qx, x, cols);
+    int groups = rows / 16, blocks = cols / 64;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for (int task = 0; task < count * groups; ++task) {
+        int m = task / groups, g = task % groups, dot[16];
+        k3_q8p16_dot16(dot, packed[m] + (size_t)g * blocks * 1024,
+                       qx, blocks);
+        for (int r = 0; r < 16; ++r) {
+            int row = g * 16 + r;
+            out[m][row] = (float)dot[r] * (scale[m][row] * xs);
+        }
+    }
 }
 
 /* A64FX loses bandwidth at 48 workers for these two matrices.  Reserving the

@@ -127,6 +127,30 @@ static double projection5_probe_cold(float*out[5],const uint16_t*w[5],const floa
     double bytes=(double)iters*5*128*K3_HIDDEN*2;printf("PROBE projection5row4_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f\n",threads,sec/iters*1e6,bytes/sec/1e9);free(evict);return sec/iters;
 }
 
+static double projection5_q8p16_probe_cold(float *out[5], const uint16_t *w[5],
+        const float *ref[5], const float *x, int threads, int iters) {
+    size_t matrix_bytes=(size_t)128*K3_HIDDEN;
+    int8_t *packed[5],*qx=malloc(K3_HIDDEN);float *scale[5];
+    const int8_t *pm[5];const float *sm[5];
+    size_t count=(size_t)64*1024*1024/sizeof(float);float *evict=calloc(count,sizeof(float));
+    if(!qx||!evict)return 0.0;
+    for(int m=0;m<5;++m){packed[m]=malloc(matrix_bytes);scale[m]=malloc(128*sizeof(float));
+        if(!packed[m]||!scale[m])return 0.0;
+        k3_q8p16_quantize_bf16(packed[m],scale[m],w[m],128,K3_HIDDEN);
+        pm[m]=packed[m];sm[m]=scale[m];}
+    k3_dense_many_q8p16(out,pm,sm,5,128,K3_HIDDEN,x,qx,threads);
+    double se=0,sr=0,dot=0,so=0;
+    for(int m=0;m<5;++m)for(int r=0;r<128;++r){double a=out[m][r],b=ref[m][r],d=a-b;
+        se+=d*d;sr+=b*b;dot+=a*b;so+=a*a;}
+    double rel=sqrt(se/(sr+1e-30)),cos=dot/sqrt((sr+1e-30)*(so+1e-30)),sec=0;
+    for(int i=0;i<iters;++i){evict_caches(evict,count,threads);double t=now_sec();
+        k3_dense_many_q8p16(out,pm,sm,5,128,K3_HIDDEN,x,qx,threads);sec+=now_sec()-t;}
+    printf("PROBE projection5q8p16_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f rel_l2=%.3e cosine=%.8f %s\n",
+        threads,sec/iters*1e6,(double)iters*5*128*K3_HIDDEN/sec/1e9,rel,cos,
+        rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");
+    for(int m=0;m<5;++m){free(packed[m]);free(scale[m]);}free(qx);free(evict);return sec/iters;
+}
+
 static double kda_probe(float*out,const float*q,const float*k,const float*v,const float*decay,
                         float beta,float*state,int threads,int iters){
     memset(state,0,(size_t)K3_HEAD_DIM*K3_HEAD_DIM*4); omp_set_num_threads(threads);
@@ -183,6 +207,10 @@ int main(int argc,char**argv){
     for(int i=0;i<8;++i){double t=projection_probe(outs,ws,x,ts[i],40);if(i==0)p1=t;printf("PROBE projection_eff threads=%2d efficiency=%.3f\n",ts[i],p1/(t*ts[i]));}
     int cold_ts[]={16,24,32,40,44,47,48};
     for(int i=0;i<7;++i){projection_probe_cold(outs,ws,x,cold_ts[i],10);projection4row_probe_cold(outs,ws,x,cold_ts[i],10);projection5_probe_cold(outs5,ws5,x,cold_ts[i],10);}
+    float qref[128],kref[128],vref[128],gref[128],faref[128];
+    float *refs[5]={qref,kref,vref,gref,faref};const float *crefs[5]={qref,kref,vref,gref,faref};
+    k3_dense_many_bf16_row4(refs,(k3_bf16_matrix[]){{qw,128,K3_HIDDEN},{kw,128,K3_HIDDEN},{vw,128,K3_HIDDEN},{gw,128,K3_HIDDEN},{faw,128,K3_HIDDEN}},5,x,40);
+    for(int i=0;i<7;++i)projection5_q8p16_probe_cold(outs5,ws5,crefs,x,cold_ts[i],10);
     printf("\nReal-activation KDA recurrence scaling (128x128 FP32 state):\n");
     double r1=0;
     for(int i=0;i<8;++i){double t=kda_probe(o,cq,ck,cv,decay,beta,state,ts[i],300);if(i==0)r1=t;printf("PROBE recurrence_eff threads=%2d efficiency=%.3f\n",ts[i],r1/(t*ts[i]));}

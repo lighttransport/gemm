@@ -19,6 +19,39 @@ typedef struct {
     int cols;
 } k3_mxfp4_matrix;
 
+static inline void k3_mxfp4_gemm_mode(float *y,
+        const k3_mxfp4_matrix *matrix, const float *x, int batch,
+        int threads, int tile_threshold);
+
+static inline size_t k3_mxfp4_matrix_bytes(int rows, int cols) {
+    return (size_t)rows * (cols / 2 + cols / 32);
+}
+
+/* Offline-style BF16 -> OCP MXFP4 conversion used by bounded real-weight
+ * probes and the future stage path.  Each 32-value block uses the smallest
+ * E8M0 power-of-two scale whose E2M1 maximum (12) covers the block. */
+static inline void k3_mxfp4_quantize_bf16(uint8_t *packed, uint8_t *scale,
+        const uint16_t *src, int rows, int cols) {
+    int blocks=cols/32;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int r=0;r<rows;++r){const uint16_t *row=src+(size_t)r*cols;
+        uint8_t *qr=packed+(size_t)r*cols/2,*sr=scale+(size_t)r*blocks;
+        for(int b=0;b<blocks;++b){float amax=0;
+            for(int j=0;j<32;++j)amax=fmaxf(amax,fabsf(bf16_to_f32_scalar(row[b*32+j])));
+            int e=0;if(amax>0) e=(int)ceilf(log2f(amax/12.0f));
+            if(e < -126)e=-126;if(e>127)e=127;sr[b]=(uint8_t)(e+127);
+            float inv=1.0f/ldexpf(1.0f,e);
+            for(int j=0;j<16;++j){uint8_t code[2];
+                for(int h=0;h<2;++h){float v=bf16_to_f32_scalar(row[b*32+j+h*16])*inv;
+                    int sign=v<0, best=0;float av=fabsf(v),err=av;
+                    for(int q=1;q<8;++q){float d=fabsf(av-ds4f_kvalues_mxfp4_f32[q]);if(d<err){err=d;best=q;}}
+                    code[h]=(uint8_t)(best|(sign&&best?8:0));}
+                qr[b*16+j]=(uint8_t)(code[0]|(code[1]<<4));}}
+    }
+}
+
 #define K3_EXPERT_TP_BLOCK 32
 #define K3_MOE_REDUCE_FLOATS (K3_LATENT + K3_HIDDEN)
 
@@ -88,6 +121,28 @@ static inline void k3_moe_finish_reduce_q8p16(float*hidden_out,
     k3_rmsnorm_sve(norm_scratch,reduced,routed_norm_weight,K3_LATENT,eps);
     k3_matvec_q8p16_bias(hidden_out,routed_up_packed,routed_up_scale,
         K3_HIDDEN,K3_LATENT,norm_scratch,q_scratch,reduced+K3_LATENT,threads);
+}
+
+static inline void k3_moe_finish_reduce_mxfp4(float *hidden_out,
+        float *norm_scratch, const float *reduced,
+        const float *routed_norm_weight,
+        const k3_mxfp4_matrix *replicated_routed_up, float eps, int threads) {
+    k3_rmsnorm_sve(norm_scratch,reduced,routed_norm_weight,K3_LATENT,eps);
+    k3_mxfp4_gemm_mode(hidden_out,replicated_routed_up,norm_scratch,1,threads,0);
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+    for(int i=0;i<K3_HIDDEN;++i)hidden_out[i]+=reduced[K3_LATENT+i];
+}
+
+static inline void k3_moe_finish_reduce_q8w16(float *hidden_out,
+        float *norm_scratch, const float *reduced,
+        const float *routed_norm_weight,
+        const k3_q8pv_matrix *replicated_routed_up, float eps, int threads) {
+    k3_rmsnorm_sve(norm_scratch,reduced,routed_norm_weight,K3_LATENT,eps);
+    k3_matvec_q8pv16_f32_bias(hidden_out,replicated_routed_up,norm_scratch,
+                              reduced+K3_LATENT,threads);
 }
 
 #ifndef K3_MOE_MAX_BATCH

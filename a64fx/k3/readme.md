@@ -459,3 +459,40 @@ One TNI was fastest at 4.598 us/hop and 4.68 GB/s. Two through six TNIs regresse
 monotonically to 4.702--4.980 us/hop, so same-peer payload striping is rejected. Any
 further collective improvement must reduce synchronization depth or select better
 topological peers; adding VCQs for byte striping will not close the remaining gap.
+
+### 20 token/s stretch work
+
+The K3-sized attention collective was measured separately on the current 12-node
+allocation. For 7,168 BF16 elements, the existing recursive-doubling tree takes
+20.73 us. Six-TNI direct reduce-scatter takes 4.77 us and the matching all-gather
+takes 4.82 us, or 9.59 us combined (0.46x the tree). This supports the simulator's
+conservative `--attention-rsag` factor of 0.52. The legacy communication benchmark
+does not perform the receiver-side addition, so a production RSAG primitive still
+needs real-sum correctness and timing before runner integration.
+
+Several additional real routed-up and KDA probes delimit the useful kernel space:
+
+- K-blocked Q8 does not help routed-down: 144.7 GB/s versus about 140 GB/s for the
+  row-Q8 kernel, with the same 0.997% relative projection error.
+- Fusing five Q8 KDA projections quantizes the activation only once, but SDOT is
+  compute-limited at 46.9 GB/s. It takes 97.8 us versus 53--56 us for BF16 and has
+  1.42% relative error, so it is rejected.
+- Routed-up MXFP4 reaches 112 us/layer (457 GB/s BF16-equivalent), but 11.7%
+  relative error and cosine 0.9932 make it unusable.
+- Group-32 weight-only Q8 preserves the FP32 activation and improves error to
+  0.539%, narrowly missing the 0.5% gate. Clipping the group scale makes accuracy
+  worse. Group-16 weight-only Q8 has worst relative error 0.478% and minimum cosine
+  0.9999886 across eight independent activations, passing the projection gate. Its
+  best isolated real-weight result is 143.6 us at 47 workers and 223.6 GB/s of stored
+  weights; the simulator conservatively uses 218 GB/s. `k3_moe_finish_reduce_q8w16`
+  fuses the shared residual into the same workshare. Rerun only this calibration with
+  `K3_DENSE_ONLY=q8w16 ./k3_dense_probe BLOB MANIFEST`; shared-node HBM contention
+  caused slower outliers, so the modeled rate is an optimistic clean-run calibration.
+
+The quality-gated simulator mode is `--q8w16-up`. With expert TP, fused MoE reduction,
+hierarchical collectives, and attention RSAG, it estimates 14.70 token/s at 4K M=1
+and 186.3 aggregate token/s at M=32. M=1 fits at 25.64 GB/rank; M=32 is 27.74 GB and
+misses the strict 27 GB guard. The M=1 breakdown is 40.3 ms weights, 8.6 ms experts,
+0.7 ms KV/KDA, and 18.4 ms communication. Reaching 20 token/s requires 18 ms more
+than the current model and cannot be obtained from routed-up optimization alone;
+it requires a production low-depth collective and/or cross-layer pipeline overlap.
