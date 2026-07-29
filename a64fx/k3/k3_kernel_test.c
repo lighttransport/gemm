@@ -54,6 +54,9 @@ int main(void) {
     fail |= check("gated-rms", r, o, N, 3e-5f);
     k3_situ_ref(r, a, b, N); k3_situ_sve(o, a, b, N);
     fail |= check("situ", r, o, N, 0.0f);
+    fill(a, N, 12.0f); fill(b, N, 40.0f);
+    k3_situ_ref(r, a, b, N); k3_situ_fast_sve(o, a, b, N);
+    fail |= check("situ-fexpa", r, o, N, 2e-3f);
 
     float conv_x[64], conv_w[64 * 4], conv_b[64], conv_s0[64 * 3] = {0}, conv_s1[64 * 3] = {0};
     float conv_r[64], conv_o[64]; fill(conv_w, 64 * 4, .3f); fill(conv_b, 64, .1f);

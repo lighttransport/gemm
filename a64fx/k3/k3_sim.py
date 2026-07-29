@@ -180,8 +180,8 @@ def active_expert_gb(split: WeightSplit, nodes: int, batch: int,
 
 def expert_service_ms(count: int, single_ms: float) -> float:
     """Measured real-expert latency curve, linearly interpolated by bucket M."""
-    curve = ((0, 0.0), (1, 0.177), (2, 0.315), (4, 0.553),
-             (8, 1.032), (16, 1.864), (32, 3.238))
+    curve = ((0, 0.0), (1, 0.1665), (2, 0.2975), (4, 0.512),
+             (8, 0.946), (16, 1.690), (32, 2.6915))
     scale = single_ms / curve[1][1]
     for (m0, t0), (m1, t1) in zip(curve, curve[1:]):
         if count <= m1:
@@ -194,10 +194,17 @@ def expert_service_ms(count: int, single_ms: float) -> float:
 def rank_expert_service_ms(rank_buckets: dict, single_ms: float) -> float:
     service = sum(expert_service_ms(m, single_ms)
                   for m in rank_buckets.values())
-    # Four-CMG sparse scheduler, measured with distinct real experts on 12 nodes.
-    # Two/three use a shared workshare; exactly four pin one bucket per CMG.
-    factors = {2: 0.944, 3: 0.94, 4: 0.886}
-    return service * factors.get(len(rank_buckets), 1.0)
+    # Four-CMG sparse scheduler, measured with 1/2/4/8/16 distinct real experts
+    # on every node of the 12-node allocation. Interpolate by active buckets.
+    points = ((1, 1.0), (2, 0.874), (4, 0.861),
+              (8, 0.775), (16, 0.760))
+    count = len(rank_buckets)
+    factor = points[-1][1]
+    for (n0, f0), (n1, f1) in zip(points, points[1:]):
+        if count <= n1:
+            factor = f0 + (f1 - f0) * (count - n0) / (n1 - n0)
+            break
+    return service * factor
 
 
 @lru_cache(maxsize=None)
@@ -400,7 +407,7 @@ def main() -> None:
                    help="measured cache-evicted one-head BF16 projection bandwidth")
     p.add_argument("--mxfp4-gbps", type=float, default=180.0,
                    help="48-core MXFP4 bandwidth; extrapolated from the measured 3.75 GB/s/core")
-    p.add_argument("--expert-ms", type=float, default=0.177,
+    p.add_argument("--expert-ms", type=float, default=0.1665,
                    help="measured real MXFP4 M=1 expert latency")
     p.add_argument("--expert-samples", type=int, default=1000,
                    help="deterministic routing Monte Carlo samples per batch")

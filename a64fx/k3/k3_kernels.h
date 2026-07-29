@@ -124,6 +124,55 @@ static inline void k3_situ_sve(float *out, const float *gate, const float *up, i
     k3_situ_ref(out, gate, up, n);
 }
 
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t k3_exp2_fexpa_sve(svbool_t pg, svfloat32_t x) {
+    const float shift_f = 204927.0f;
+    svfloat32_t shift = svdup_f32(shift_f);
+    svfloat32_t z = svadd_f32_x(pg, x, shift);
+    svfloat32_t rounded = svsub_f32_x(pg, z, shift);
+    svfloat32_t residual = svsub_f32_x(pg, x, rounded);
+    svfloat32_t scale = svexpa_f32(svreinterpret_u32_f32(z));
+    svfloat32_t correction = svmla_n_f32_x(
+        pg, svdup_f32(1.0f), residual, 0.6931471805599453f);
+    return svmul_f32_x(pg, scale, correction);
+}
+
+static inline svfloat32_t k3_sigmoid_fast_sve(svbool_t pg, svfloat32_t x) {
+    svfloat32_t t = svmul_n_f32_x(pg, x, -1.4426950408889634f);
+    t = svmax_n_f32_x(pg, svmin_n_f32_x(pg, t, 80.0f), -80.0f);
+    svfloat32_t den = svadd_n_f32_x(pg, k3_exp2_fexpa_sve(pg, t), 1.0f);
+    svfloat32_t inv = svrecpe_f32(den);
+    return svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+}
+
+/* SiTU via tanh(x)=2*sigmoid(2*x)-1.  FEXPA plus residual correction has an
+ * explicit real-input error gate in k3_kernel_test before this is enabled in
+ * the expert path. */
+static inline void k3_situ_fast_sve(float *out, const float *gate,
+                                    const float *up, int n) {
+    int vl = (int)svcntw();
+    for (int i = 0; i < n; i += vl) {
+        svbool_t pg = svwhilelt_b32(i, n);
+        svfloat32_t g = svld1(pg, gate + i);
+        svfloat32_t u = svld1(pg, up + i);
+        svfloat32_t tg = svsub_n_f32_x(pg,
+            svmul_n_f32_x(pg, k3_sigmoid_fast_sve(
+                pg, svmul_n_f32_x(pg, g, 0.5f)), 2.0f), 1.0f);
+        svfloat32_t su = svsub_n_f32_x(pg,
+            svmul_n_f32_x(pg, k3_sigmoid_fast_sve(
+                pg, svmul_n_f32_x(pg, u, 0.08f)), 2.0f), 1.0f);
+        svfloat32_t y = svmul_f32_x(pg, tg, k3_sigmoid_fast_sve(pg, g));
+        y = svmul_f32_x(pg, y, su);
+        svst1(pg, out + i, svmul_n_f32_x(pg, y, 100.0f));
+    }
+}
+#else
+static inline void k3_situ_fast_sve(float *out, const float *gate,
+                                    const float *up, int n) {
+    k3_situ_ref(out, gate, up, n);
+}
+#endif
+
 /* State is [channels][kernel-1], oldest to newest; weight is [channels][kernel]. */
 static inline void k3_conv_step_ref(float *out, const float *x, float *state,
                                     const float *weight, const float *bias,

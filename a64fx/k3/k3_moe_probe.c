@@ -59,15 +59,35 @@ static int batched_correctness(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2
 }
 
 static int tiled_correctness(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2,const k3_mxfp4_matrix*w3){
-    enum{M=16};float*x=malloc((size_t)M*K3_LATENT*4),*yt=malloc((size_t)M*K3_LATENT*4),*yr=malloc((size_t)M*K3_LATENT*4);
+    enum{M=32};float*x=malloc((size_t)M*K3_LATENT*4),*yt=malloc((size_t)M*K3_LATENT*4),*yr=malloc((size_t)M*K3_LATENT*4);
     float*gt=malloc((size_t)M*K3_EXPERT_INTER*4),*ut=malloc((size_t)M*K3_EXPERT_INTER*4);
     float*gr=malloc((size_t)M*K3_EXPERT_INTER*4),*ur=malloc((size_t)M*K3_EXPERT_INTER*4);
     if(!x||!yt||!yr||!gt||!ut||!gr||!ur)return 1;
     for(int i=0;i<M*K3_LATENT;++i)x[i]=rf()*.125f;
     k3_expert_forward_mxfp4_mode(yr,w1,w2,w3,x,M,gr,ur,48,0);
     k3_expert_forward_mxfp4_mode(yt,w1,w2,w3,x,M,gt,ut,48,8);
-    float e=max_abs(yt,yr,(size_t)M*K3_LATENT);printf("[tile-vs-svtbl] M=16 max_abs=%.3e %s\n",e,e<2e-4?"OK":"FAIL");
+    float e=max_abs(yt,yr,(size_t)M*K3_LATENT);printf("[tile-vs-svtbl] M=32 max_abs=%.3e %s\n",e,e<2e-4?"OK":"FAIL");
     free(x);free(yt);free(yr);free(gt);free(ut);free(gr);free(ur);return e>=2e-4;
+}
+
+static int situ_fast_correctness(const k3_mxfp4_matrix*w1,
+                                 const k3_mxfp4_matrix*w2,
+                                 const k3_mxfp4_matrix*w3){
+    enum{M=2};int n=M*K3_EXPERT_INTER;
+    float*x=malloc((size_t)M*K3_LATENT*4),*u=malloc((size_t)n*4);
+    float*gf=malloc((size_t)n*4),*ge=malloc((size_t)n*4);
+    float*yf=malloc((size_t)M*K3_LATENT*4),*ye=malloc((size_t)M*K3_LATENT*4);
+    if(!x||!u||!gf||!ge||!yf||!ye)return 1;
+    for(int i=0;i<M*K3_LATENT;++i)x[i]=rf()*.125f;
+    k3_mxfp4_gemm2_mode(gf,w1,u,w3,x,M,24,8);memcpy(ge,gf,(size_t)n*4);
+    k3_moe_situ(gf,u,n,24);
+    for(int i=0;i<n;++i)ge[i]=4.0f*tanhf(ge[i]*.25f)*k3_sigmoidf(ge[i])
+        *25.0f*tanhf(u[i]*.04f);
+    k3_mxfp4_gemm_mode(yf,w2,gf,M,24,8);k3_mxfp4_gemm_mode(ye,w2,ge,M,24,8);
+    float e=max_abs(yf,ye,(size_t)M*K3_LATENT);double se=0,sr=0;
+    for(int i=0;i<M*K3_LATENT;++i){double d=yf[i]-ye[i];se+=d*d;sr+=(double)ye[i]*ye[i];}
+    double rel=sqrt(se/(sr+1e-30));printf("[situ-fexpa-real] max_abs=%.3e rel_l2=%.3e %s\n",e,rel,e<2e-4&&rel<5e-4?"OK":"FAIL");
+    free(x);free(u);free(gf);free(ge);free(yf);free(ye);return e>=2e-4||rel>=5e-4;
 }
 
 static int local_scheduler_correctness(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2,const k3_mxfp4_matrix*w3){
@@ -97,6 +117,43 @@ static void perf(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2,const k3_mxfp
     double sum=0;for(int i=0;i<batch*K3_LATENT;++i)sum+=y[i];
     printf("PROBE expert kernel=%s batch=%2d threads=%2d ms=%.3f tok/s=%.1f distinct_GB/s=%.2f checksum=%+.6e\n",
            tile_threshold?"tile":"svtbl",batch,threads,sec/iters*1e3,batch/(sec/iters),bytes/(sec/iters)/1e9,sum);
+    free(x);free(y);free(g);free(u);free(eb);
+}
+
+static void profile_stages(const k3_mxfp4_matrix *w1,
+                           const k3_mxfp4_matrix *w2,
+                           const k3_mxfp4_matrix *w3, int batch,
+                           int threads, int tile_threshold) {
+    float *x=malloc((size_t)batch*K3_LATENT*4);
+    float *y=malloc((size_t)batch*K3_LATENT*4);
+    float *g=malloc((size_t)batch*K3_EXPERT_INTER*4);
+    float *u=malloc((size_t)batch*K3_EXPERT_INTER*4);
+    size_t en=(size_t)128*1024*1024/4;
+    float *eb=calloc(en,4);
+    if(!x||!y||!g||!u||!eb)return;
+    for(int i=0;i<batch*K3_LATENT;++i)x[i]=rf()*.125f;
+    double t13=0,tsitu=0,t2=0;
+    int iters=5;
+    for(int it=0;it<iters;++it){
+        evict(eb,en,threads);
+        double t=now_sec();
+        k3_mxfp4_gemm2_mode(g,w1,u,w3,x,batch,threads,tile_threshold);
+        t13+=now_sec()-t;
+        t=now_sec();
+        omp_set_num_threads(threads);
+        int vl=(int)svcntw();
+#pragma omp parallel for schedule(static)
+        for(int i=0;i<batch*K3_EXPERT_INTER;i+=vl)
+            k3_situ_fast_sve(g+i,g+i,u+i,
+                batch*K3_EXPERT_INTER-i<vl?batch*K3_EXPERT_INTER-i:vl);
+        tsitu+=now_sec()-t;
+        t=now_sec();
+        k3_mxfp4_gemm_mode(y,w2,g,batch,threads,tile_threshold);
+        t2+=now_sec()-t;
+    }
+    printf("PROFILE expert situ=fexpa batch=%d threads=%d w13_ms=%.3f situ_ms=%.3f w2_ms=%.3f total_ms=%.3f\n",
+           batch,threads,t13/iters*1e3,tsitu/iters*1e3,t2/iters*1e3,
+           (t13+tsitu+t2)/iters*1e3);
     free(x);free(y);free(g);free(u);free(eb);
 }
 
@@ -133,10 +190,11 @@ int main(int argc,char**argv){
     int nlocal=(argc-1)/2;if(nlocal>16)return 2;loaded_expert le[16];memset(le,0,sizeof(le));k3_apply_numa_interleave();
     for(int e=0;e<nlocal;++e)if(load_expert(argv[1+2*e],argv[2+2*e],&le[e])){fprintf(stderr,"load expert %d failed\n",e);return 2;}
     k3_mxfp4_matrix w1=le[0].w1,w2=le[0].w2,w3=le[0].w3;
-    int fail=dispatch_unit()|batched_correctness(&w1,&w2,&w3)|tiled_correctness(&w1,&w2,&w3)|local_scheduler_correctness(&w1,&w2,&w3);
+    int fail=dispatch_unit()|batched_correctness(&w1,&w2,&w3)|tiled_correctness(&w1,&w2,&w3)|situ_fast_correctness(&w1,&w2,&w3)|local_scheduler_correctness(&w1,&w2,&w3);
     int batches[]={1,2,4,8,16,32},threads[]={24,48};
     int tile_threshold=getenv("K3_MXFP4_TILE")?atoi(getenv("K3_MXFP4_TILE")):8;
     for(int ti=0;ti<2;++ti)for(int bi=0;bi<6;++bi)perf(&w1,&w2,&w3,batches[bi],threads[ti],tile_threshold);
+    profile_stages(&w1,&w2,&w3,32,48,tile_threshold);
     for(int e=1;e<=nlocal;e*=2)multi_expert_perf(le,e,48);
     if(nlocal>2&&(nlocal&(nlocal-1)))multi_expert_perf(le,nlocal,48);
     for(int e=0;e<nlocal;++e)free(le[e].blob);printf("K3 MoE probe: %s\n",fail?"FAIL":"PASS");return fail?1:0;

@@ -293,21 +293,31 @@ reported rates. `run_moe_probe_mpi.sh` stages four distinct layer-1 experts per 
 (66.94 MiB/node), runs all ranks, and requires an explicit PASS record from every rank.
 
 The decode kernel now prefetches packed rows eight MXFP4 blocks ahead. The tiled batch
-kernel uses a 512-column dequant tile below M=24 and 1,024 columns at M>=24; this keeps
+kernel uses a 512-column dequant tile below M=24 and 3,072 columns at M>=24; this keeps
 M=16 from regressing while improving M=32. A 12-row decode experiment was unstable and
 slower and was not retained. A persistent OpenMP team across the three expert stages
 also regressed M=1/M=2 and was removed.
+
+SiTU was the remaining local M=32 hotspot: scalar `tanhf`/`expf` cost about 0.37 ms
+of a 3.25 ms expert. The default path now uses SVE FEXPA with residual correction and
+one reciprocal refinement. It takes 0.02--0.03 ms. The scalar contract remains
+available at compile time with `K3_SITU_FEXPA=0`. Across twelve nodes, comparison with
+libm followed by the real MXFP4 down projection had maximum absolute error `9.62e-5`
+and relative L2 `3.05e-4`. The 3,072-column tile differs from the `svtbl` reference by
+at most `7.14e-7` at M=32.
 
 Measured on all twelve nodes at 48 threads after these changes:
 
 | Real expert workload | Time/rate |
 |---|---:|
-| One expert, M=1 | median 0.176 ms (0.172--0.298 ms) |
-| One expert, M=8 tiled | median 1.030 ms (1.025--1.034 ms) |
-| One expert, M=16 tiled | median 1.863 ms (1.849--1.875 ms) |
-| One expert, M=32 tiled | median 3.237 ms (3.217--3.258 ms), 9.89k assignments/s |
-| Two distinct M=1 experts, shared workshare | median 0.334 ms (one 0.473 ms outlier) |
-| Four distinct M=1 experts, CMG-partitioned | median 0.629 ms (0.625--0.632 ms) |
+| One expert, M=1 | median 0.167 ms (0.163--0.169 ms) |
+| One expert, M=8 tiled | median 0.946 ms (0.942--0.951 ms) |
+| One expert, M=16 tiled | median 1.690 ms (1.678--1.701 ms) |
+| One expert, M=32 tiled | median 2.692 ms (2.675--3.079 ms), 11.9k assignments/s normally |
+| Two distinct M=1 experts, shared workshare | median 0.292 ms (0.279--0.295 ms) |
+| Four distinct M=1 experts, CMG-partitioned | median 0.575 ms (0.557--0.582 ms) |
+| Eight distinct M=1 experts, shared workshare | median 1.032 ms (1.008--1.036 ms) |
+| Sixteen distinct M=1 experts, shared workshare | median 2.024 ms (1.997--2.027 ms) |
 
 The exactly-four-expert sparse path pins one bucket per 12-core CMG subgroup. Two and
 three active experts retain the global workshare because a two-way CMG split measured
@@ -339,10 +349,10 @@ revised estimates are:
 
 | Decode batch | Dense/attention | Routed experts | KDA + KV | Collectives | Aggregate token/s |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 28.3 ms | 27.2 ms | 0.7 ms | 39.7 ms | 10.43 |
-| 8 | 28.3 ms | 72.4 ms | 3.9 ms | 45.5 ms | 53.32 |
-| 16 | 28.3 ms | 113.5 ms | 7.6 ms | 52.1 ms | 79.44 |
-| 32 | 28.3 ms | 174.8 ms | 14.9 ms | 65.3 ms | 112.96 |
+| 1 | 28.3 ms | 24.0 ms | 0.7 ms | 39.7 ms | 10.79 |
+| 8 | 28.3 ms | 62.3 ms | 3.9 ms | 45.5 ms | 57.17 |
+| 16 | 28.3 ms | 88.6 ms | 7.6 ms | 52.1 ms | 90.66 |
+| 32 | 28.3 ms | 130.3 ms | 14.9 ms | 65.3 ms | 134.03 |
 
 The production uTofu probe was also rerun on the twelve-node allocation. Exact FP32 SUM
 and MAX checks passed. For 7,168 floats, flat recursive doubling takes 76.3 us and the
@@ -351,20 +361,26 @@ is 1.30x: 114,688 floats take 1.164/0.896 ms flat/hierarchical and 229,376 float
 2.328/1.782 ms. `--hierarchical-ar` applies the measured payload-dependent speedup;
 carrying that ratio to 96 nodes is an explicit extrapolation, not a 96-node result.
 
-With hierarchical reduction extrapolated and the exact graph retained, the optimistic
-projection is 11.06 token/s at M=1 and 119.42 aggregate token/s at M=32. Overlapping the
-latent reduce with the TP-local shared expert only raises these to 11.16 and 119.76:
+With hierarchical reduction extrapolated and the exact graph retained, plus the bounded
+latent overlap, the optimistic projection is 11.57 token/s at M=1 and 143.71 aggregate
+token/s at M=32. The latter now exceeds the 128 token/s target in the calibrated model.
+The scheduler model is no longer a serialization assumption: bounded probes staged
+16 distinct real experts per node (267.7 MiB/node), and all twelve nodes passed. Eight
+and sixteen distinct experts cost 0.775x and 0.760x their serialized service; these
+measured factors are interpolated by active critical-rank bucket count.
+
+Overlapping the latent reduce with the TP-local shared expert remains a minor lever:
 the whole shared-expert stack is 24.310 GB, only 0.253 GB per 96-node rank, so the model
 caps hidden work at about 0.75 ms for the entire stack. There is no legitimate large
 overlap window. The 12-node large-payload measurements also warn that the simulator's
-8 GB/s wire lower bound is optimistic for M=32; 119.76 is therefore a ceiling-oriented
+8 GB/s wire lower bound is optimistic for M=32; 143.71 is therefore a ceiling-oriented
 estimate, not a demonstrated 128 token/s result.
 
-The current exact design does not meet either new target: single decode remains well
-below 15 token/s and M=32 remains below 128 token/s even before applying the conservative
-large-payload correction. Eliminating the latent collective exactly would require
+The current exact design still misses the single-decode target: 10.79 token/s with flat
+collectives and 11.57 under the hierarchical/overlap projection, versus 15. Eliminating
+the latent collective exactly would require
 replicating the 4.727 GB BF16 routed-up stack per rank (or a new 2-D placement); that
 exceeds the 27 GB memory budget on the fullest ranks. Mode `--moe-collectives 0` means
 *no MoE collective* (94 attention/dense calls), not one collective per MoE layer, and is
-only an impossible upper bound: 14.35 token/s at M=1 and 132.3 at M=32. These are
+only an impossible upper bound: 15.05 token/s at M=1 and 162.2 at M=32. These are
 projections from bounded real weights, not full-layer end-to-end validation.

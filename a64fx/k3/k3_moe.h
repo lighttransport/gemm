@@ -25,11 +25,36 @@ typedef struct {
 #define K3_MXFP4_TILE_K_SMALL 512
 #endif
 #ifndef K3_MXFP4_TILE_K_LARGE
-#define K3_MXFP4_TILE_K_LARGE 1024
+#define K3_MXFP4_TILE_K_LARGE 3072
 #endif
 #ifndef K3_MXFP4_PREFETCH_BLOCKS
 #define K3_MXFP4_PREFETCH_BLOCKS 8
 #endif
+#ifndef K3_SITU_FEXPA
+#define K3_SITU_FEXPA 1
+#endif
+
+static inline void k3_moe_situ(float *gate, const float *up, int n,
+                               int threads) {
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#endif
+#if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
+    int vl=(int)svcntw();
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int i=0;i<n;i+=vl)
+        k3_situ_fast_sve(gate+i,gate+i,up+i,n-i<vl?n-i:vl);
+#else
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int i=0;i<n;++i)
+        gate[i]=4.0f*tanhf(gate[i]*.25f)*k3_sigmoidf(gate[i])
+                *25.0f*tanhf(up[i]*.04f);
+#endif
+}
 
 /* Slot-major dispatch buffers have capacity=batch for each local expert. */
 static inline int k3_moe_build_dispatch(const int *route_experts,
@@ -283,13 +308,7 @@ static inline void k3_expert_forward_mxfp4_mode(float *out,
                                            int threads, int tile_threshold) {
     k3_mxfp4_gemm2_mode(gate,w1,up,w3,x,batch,threads,tile_threshold);
     int n = batch * w1->rows;
-#if defined(_OPENMP)
-    omp_set_num_threads(threads);
-#pragma omp parallel for schedule(static)
-#endif
-    for (int i = 0; i < n; ++i)
-        gate[i] = 4.0f*tanhf(gate[i]*0.25f)*k3_sigmoidf(gate[i])
-                *25.0f*tanhf(up[i]*0.04f);
+    k3_moe_situ(gate,up,n,threads);
     k3_mxfp4_gemm_mode(out,w2,gate,batch,threads,tile_threshold);
 }
 
@@ -338,9 +357,15 @@ static inline void k3_moe_forward_sparse_partitioned(
             int e=active[ai],n=counts[e]*K3_EXPERT_INTER;
             float*g=gate+(size_t)e*batch*K3_EXPERT_INTER;
             const float*u=up+(size_t)e*batch*K3_EXPERT_INTER;
+#if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
+            int vl=(int)svcntw();
+            for(int i=lane*vl;i<n;i+=group_threads*vl)
+                k3_situ_fast_sve(g+i,g+i,u+i,n-i<vl?n-i:vl);
+#else
             for(int i=lane;i<n;i+=group_threads)
                 g[i]=4.0f*tanhf(g[i]*.25f)*k3_sigmoidf(g[i])
                     *25.0f*tanhf(u[i]*.04f);
+#endif
         }
 #pragma omp barrier
         for(int ai=group;ai<nactive;ai+=groups){
@@ -410,16 +435,25 @@ static inline void k3_moe_forward_local_mxfp4(
                              matrix->scale + (size_t)r * sr,
                              xbase, K3_LATENT, m, matrix->cols, tile_threshold);
     }
+#if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
+    {int total=nlocal*batch*K3_EXPERT_INTER,vl=(int)svcntw();
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < nlocal * batch * K3_EXPERT_INTER; ++i) {
-        int expert = i / (batch * K3_EXPERT_INTER);
-        int rem = i % (batch * K3_EXPERT_INTER);
-        if (rem >= counts[expert] * K3_EXPERT_INTER) continue;
-        gate[i] = 4.0f * tanhf(gate[i] * 0.25f) * k3_sigmoidf(gate[i])
-                * 25.0f * tanhf(up[i] * 0.04f);
-    }
+    for(int i=0;i<total;i+=vl){int expert=i/(batch*K3_EXPERT_INTER);
+        int rem=i%(batch*K3_EXPERT_INTER);
+        if(rem<counts[expert]*K3_EXPERT_INTER)
+            k3_situ_fast_sve(gate+i,gate+i,up+i,total-i<vl?total-i:vl);}}
+#else
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int i=0;i<nlocal*batch*K3_EXPERT_INTER;++i){
+        int expert=i/(batch*K3_EXPERT_INTER),rem=i%(batch*K3_EXPERT_INTER);
+        if(rem<counts[expert]*K3_EXPERT_INTER)
+            gate[i]=4.0f*tanhf(gate[i]*.25f)*k3_sigmoidf(gate[i])
+                    *25.0f*tanhf(up[i]*.04f);}
+#endif
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
