@@ -2,7 +2,7 @@ CC = fcc
 CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -I../../common
 WARN = -Wall -Wextra -Wpedantic -Wno-unused-function
 
-.PHONY: all test real-test probe-kda probe-kda-mpi probe-moe-mpi sim validate clean
+.PHONY: all test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
 all: k3_kernel_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe
 
 k3_kernel_test: k3_kernel_test.c k3_kernels.h
@@ -34,6 +34,9 @@ probe-kda-mpi: k3_kda_probe
 
 probe-moe-mpi: k3_moe_probe
 	./run_moe_probe_mpi.sh
+
+probe-expert-tp-mpi: k3_moe_probe
+	./run_expert_tp_probe_mpi.sh
 
 sim:
 	python3 k3_sim.py

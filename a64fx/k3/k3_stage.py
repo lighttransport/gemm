@@ -83,6 +83,50 @@ def locate(model_dir, layer, expert):
     return [found[suffix] for suffix in sorted(found)]
 
 
+def tensor_parallel_records(records, tp_size, tp_rank):
+    """Slice one native 32-channel expert-intermediate block at TP=96.
+
+    w1/w3 are row sliced.  w2 is column sliced and therefore represented as a
+    bounded list of source ranges, one per output row; no full tensor is read.
+    """
+    if 3072 % tp_size or tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError("expert TP size must divide 3072")
+    local = 3072 // tp_size
+    if local % 32:
+        raise ValueError("expert TP slice must preserve MXFP4 group-32 alignment")
+    first = tp_rank * local
+    out = []
+    for source in records:
+        rec = dict(source)
+        suffix = rec["name"].rsplit(".", 2)[-2] + "." + rec["name"].rsplit(".", 1)[-1]
+        rows, cols = rec["shape"]
+        if suffix.startswith("w1.") or suffix.startswith("w3."):
+            row_bytes = rec["nbytes"] // rows
+            rec["source_offset"] += first * row_bytes
+            rec["nbytes"] = local * row_bytes
+            rec["shape"] = [local, cols]
+        elif suffix == "w2.weight_packed":
+            row_bytes = rec["nbytes"] // rows
+            take = local // 2
+            start = first // 2
+            rec["segments"] = [(rec["source_offset"] + r * row_bytes + start, take)
+                               for r in range(rows)]
+            rec["nbytes"] = rows * take
+            rec["shape"] = [rows, take]
+        elif suffix == "w2.weight_scale":
+            row_bytes = rec["nbytes"] // rows
+            take = local // 32
+            start = first // 32
+            rec["segments"] = [(rec["source_offset"] + r * row_bytes + start, take)
+                               for r in range(rows)]
+            rec["nbytes"] = rows * take
+            rec["shape"] = [rows, take]
+        else:
+            raise ValueError("unexpected expert tensor %s" % rec["name"])
+        out.append(rec)
+    return out
+
+
 def validate_checkpoint(model_dir):
     config_path = model_dir / "config.json"
     with config_path.open("r") as f:
@@ -167,6 +211,16 @@ def copy_range(src_fd, dst_fd, source_offset, nbytes, chunk_bytes):
                              os.POSIX_FADV_DONTNEED)
 
 
+def copy_record(src_fd, dst_fd, record, chunk_bytes):
+    segments = record.get("segments")
+    if segments is None:
+        copy_range(src_fd, dst_fd, record["source_offset"],
+                   record["nbytes"], chunk_bytes)
+    else:
+        for source_offset, nbytes in segments:
+            copy_range(src_fd, dst_fd, source_offset, nbytes, chunk_bytes)
+
+
 def stage(records, output_dir, layer, expert, chunk_bytes, force):
     output_dir.mkdir(parents=True, exist_ok=True)
     blob = output_dir / ("layer%02d_expert%03d.blob" % (layer, expert))
@@ -187,7 +241,7 @@ def stage(records, output_dir, layer, expert, chunk_bytes, force):
                 write_all(dst, b"\0" * (aligned - offset))
             src = os.open(record["source"], os.O_RDONLY)
             try:
-                copy_range(src, dst, record["source_offset"], record["nbytes"], chunk_bytes)
+                copy_record(src, dst, record, chunk_bytes)
             finally:
                 os.close(src)
             entry = dict(record)
@@ -234,6 +288,10 @@ def main():
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--validate-all", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--expert-tp", action="store_true",
+                        help="stage an intermediate-TP slice instead of a whole expert")
+    parser.add_argument("--tp-size", type=int, default=96)
+    parser.add_argument("--tp-rank", type=int, default=0)
     args = parser.parse_args()
     if args.layer < 1 or args.layer > 92:
         parser.error("expert layers are 1..92")
@@ -241,7 +299,7 @@ def main():
         parser.error("invalid rank/nodes")
     if args.expert < 0 or args.expert >= 896:
         parser.error("expert must be in [0,895]")
-    if args.expert % args.nodes != args.rank:
+    if not args.expert_tp and args.expert % args.nodes != args.rank:
         parser.error("expert %d belongs to rank %d for %d nodes" %
                      (args.expert, args.expert % args.nodes, args.nodes))
     if args.chunk_mib < 1 or args.chunk_mib > 64:
@@ -257,9 +315,14 @@ def main():
         if not args.output_dir:
             return
     records = locate(args.model_dir, args.layer, args.expert)
+    if args.expert_tp:
+        records = tensor_parallel_records(records, args.tp_size, args.tp_rank)
     total = sum(r["nbytes"] for r in records)
     print("K3 partial plan: layer=%d expert=%d rank=%d/%d tensors=%d bytes=%d (%.3f MiB)" %
           (args.layer, args.expert, args.rank, args.nodes, len(records), total, total / 1048576.0))
+    if args.expert_tp:
+        print("  expert intermediate TP: rank=%d/%d channels=%d" %
+              (args.tp_rank, args.tp_size, 3072 // args.tp_size))
     for r in records:
         print("  %-16s %8.3f MiB  %s" %
               (r["name"].rsplit(".", 2)[-2] + "." + r["name"].rsplit(".", 1)[-1],

@@ -9,6 +9,7 @@
 #endif
 
 #include "k3_kernels.h"
+#include "k3_dense.h"
 #include "ggml_dequant.h"
 
 typedef struct {
@@ -17,6 +18,73 @@ typedef struct {
     int rows;
     int cols;
 } k3_mxfp4_matrix;
+
+#define K3_EXPERT_TP_BLOCK 32
+#define K3_MOE_REDUCE_FLOATS (K3_LATENT + K3_HIDDEN)
+
+/* At TP=96 every rank owns exactly one native MXFP4 scale group from every
+ * expert.  Smaller jobs emulate the same architecture with a contiguous
+ * multiple of 32 intermediate channels per rank. */
+static inline int k3_expert_tp_layout_valid(const k3_mxfp4_matrix *w1,
+                                             const k3_mxfp4_matrix *w2,
+                                             const k3_mxfp4_matrix *w3) {
+    return w1 && w2 && w3 && w1->rows == w3->rows &&
+        w1->rows > 0 && !(w1->rows % K3_EXPERT_TP_BLOCK) &&
+        w1->cols == K3_LATENT && w3->cols == K3_LATENT &&
+        w2->rows == K3_LATENT && w2->cols == w1->rows;
+}
+
+static inline int k3_expert_tp_forward_mxfp4(
+        float *partial_latent, const k3_mxfp4_matrix *w1,
+        const k3_mxfp4_matrix *w2, const k3_mxfp4_matrix *w3,
+        const float *latent, int batch, float *gate, float *up,
+        int threads, int tile_threshold);
+
+/* Local contributions are concatenated so routed latent and shared hidden use
+ * one network synchronization.  The caller invokes exactly one sum-allreduce
+ * over K3_MOE_REDUCE_FLOATS floats, then finishes routed_up locally. */
+static inline void k3_moe_pack_reduce(float *reduce,
+                                      const float *routed_latent_partial,
+                                      const float *shared_hidden_partial) {
+    memcpy(reduce, routed_latent_partial, K3_LATENT * sizeof(float));
+    memcpy(reduce + K3_LATENT, shared_hidden_partial,
+           K3_HIDDEN * sizeof(float));
+}
+
+static inline void k3_moe_finish_reduce_q8(
+        float *hidden_out, float *norm_scratch, int8_t *q_scratch,
+        const float *reduced, const float *routed_norm_weight,
+        const k3_q8_matrix *replicated_routed_up, float eps, int threads) {
+    k3_rmsnorm_sve(norm_scratch, reduced, routed_norm_weight, K3_LATENT, eps);
+    k3_matvec_q8(hidden_out, replicated_routed_up, norm_scratch,
+                 q_scratch, threads);
+    const float *shared = reduced + K3_LATENT;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < K3_HIDDEN; ++i) hidden_out[i] += shared[i];
+}
+
+static inline void k3_moe_finish_reduce_bf16(
+        float *hidden_out, float *norm_scratch, const float *reduced,
+        const float *routed_norm_weight,
+        const k3_bf16_matrix *replicated_routed_up, float eps, int threads) {
+    k3_rmsnorm_sve(norm_scratch, reduced, routed_norm_weight, K3_LATENT, eps);
+    int groups=K3_HIDDEN/8;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for(int g=0;g<groups;++g){int r=g*8;const uint16_t*w=
+        replicated_routed_up->weight+(size_t)r*K3_LATENT;
+        matvec_bf16_8row(hidden_out+r,w,w+K3_LATENT,w+2*K3_LATENT,
+            w+3*K3_LATENT,w+4*K3_LATENT,w+5*K3_LATENT,
+            w+6*K3_LATENT,w+7*K3_LATENT,norm_scratch,K3_LATENT);
+        for(int j=0;j<8;++j)hidden_out[r+j]+=reduced[K3_LATENT+r+j];}
+}
 
 #ifndef K3_MOE_MAX_BATCH
 #define K3_MOE_MAX_BATCH 256
@@ -320,6 +388,70 @@ static inline void k3_expert_forward_mxfp4(float *out,
                                            float *gate, float *up,
                                            int threads) {
     k3_expert_forward_mxfp4_mode(out,w1,w2,w3,x,batch,gate,up,threads,8);
+}
+
+static inline int k3_expert_tp_forward_mxfp4(
+        float *partial_latent, const k3_mxfp4_matrix *w1,
+        const k3_mxfp4_matrix *w2, const k3_mxfp4_matrix *w3,
+        const float *latent, int batch, float *gate, float *up,
+        int threads, int tile_threshold) {
+    if (!k3_expert_tp_layout_valid(w1, w2, w3)) return -1;
+    k3_expert_forward_mxfp4_mode(partial_latent, w1, w2, w3, latent,
+        batch, gate, up, threads, tile_threshold);
+    return 0;
+}
+
+/* Decode path for the 16 selected experts on one intermediate-TP rank.  The
+ * team is shared across experts, avoiding 48-thread startup/workshare overhead
+ * for each tiny 32-channel slice at TP=96. */
+static inline int k3_expert_tp_forward_selected_mxfp4(
+        float *latent_partial, const k3_mxfp4_matrix *w1,
+        const k3_mxfp4_matrix *w2, const k3_mxfp4_matrix *w3,
+        const float *route_weight, int selected, const float *latent,
+        float *gate, float *up, float *expert_out, int threads) {
+    if(selected<1)return-1;int local=w1[0].rows;
+    for(int e=0;e<selected;++e)if(w1[e].rows!=local||
+        !k3_expert_tp_layout_valid(&w1[e],&w2[e],&w3[e]))return-1;
+    int g13=local/8,g2=K3_LATENT/8;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+    for(int task=0;task<selected*2*g13;++task){int e=task/(2*g13),rem=task%(2*g13),which=rem/g13,r=(rem%g13)*8;
+        const k3_mxfp4_matrix*m=which?&w3[e]:&w1[e];float*y=(which?up:gate)+(size_t)e*local;
+        size_t wr=(size_t)m->cols/2,sr=(size_t)m->cols/32;
+        k3_mxfp4_group_batch(y+r,local,m->packed+(size_t)r*wr,
+            m->scale+(size_t)r*sr,latent,K3_LATENT,1,m->cols,0);}
+#if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
+    int vl=(int)svcntw(),blocks=(selected*local+vl-1)/vl;
+#pragma omp for schedule(static)
+    for(int b=0;b<blocks;++b){int i=b*vl,n=selected*local-i;
+        k3_situ_fast_sve(gate+i,gate+i,up+i,n<vl?n:vl);}
+#else
+#pragma omp for schedule(static)
+    for(int i=0;i<selected*local;++i)gate[i]=4.0f*tanhf(gate[i]*.25f)*
+        k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
+#endif
+#pragma omp for schedule(static)
+    for(int task=0;task<selected*g2;++task){int e=task/g2,r=(task%g2)*8;const k3_mxfp4_matrix*m=&w2[e];
+        size_t wr=(size_t)local/2,sr=(size_t)local/32;
+        k3_mxfp4_group_batch(expert_out+(size_t)e*K3_LATENT+r,K3_LATENT,
+            m->packed+(size_t)r*wr,m->scale+(size_t)r*sr,
+            gate+(size_t)e*local,local,1,local,0);}
+#pragma omp for schedule(static)
+    for(int i=0;i<K3_LATENT;++i){float sum=0;for(int e=0;e<selected;++e)
+        sum+=route_weight[e]*expert_out[(size_t)e*K3_LATENT+i];latent_partial[i]=sum;}
+    }
+#else
+    (void)threads;
+    for(int e=0;e<selected;++e){if(k3_expert_tp_forward_mxfp4(
+        expert_out+(size_t)e*K3_LATENT,&w1[e],&w2[e],&w3[e],latent,1,
+        gate+(size_t)e*local,up+(size_t)e*local,1,0))return-1;}
+    for(int i=0;i<K3_LATENT;++i){float sum=0;for(int e=0;e<selected;++e)
+        sum+=route_weight[e]*expert_out[(size_t)e*K3_LATENT+i];latent_partial[i]=sum;}
+#endif
+    return 0;
 }
 
 static inline void k3_moe_forward_sparse_partitioned(

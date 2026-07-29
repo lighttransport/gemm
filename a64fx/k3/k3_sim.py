@@ -31,6 +31,9 @@ EXPERT_INTER = 3072
 USABLE_GB = 27.0
 ATTENTION_GB = 72.404  # header-scan total; small head-TP slices use a separate decode rate
 ROUTER_DOWN_GB = 5.909055488  # 92 BF16 router + routed-latent down matrices
+ROUTER_GB = 1.181745664
+ROUTED_DOWN_GB = 4.726980608
+ROUTED_UP_GB = 4.726980608
 SHARED_EXPERT_GB = 24.310185984  # TP-sharded shared experts, full stack
 
 # Header-scan fallback, decimal GB, from the release checkpoint.
@@ -133,11 +136,23 @@ def fullest_expert_gb(split: WeightSplit, nodes: int) -> float:
 
 
 def memory(split: WeightSplit, nodes: int, context: int, batch: int,
-           kv_bytes: int = 2, usable_gb: float = USABLE_GB) -> Memory:
+           kv_bytes: int = 2, usable_gb: float = USABLE_GB,
+           expert_tp: bool = False, dense_q8: bool = False,
+           fused_moe_ar: bool = False) -> Memory:
     local_heads = math.ceil(HEADS / nodes)
-    expert = fullest_expert_gb(split, nodes)
-    tp = split.shardable / nodes
-    weights = expert + split.replicated + tp
+    expert = split.experts / nodes if expert_tp else fullest_expert_gb(split, nodes)
+    if dense_q8:
+        q8_ratio = .5006
+        replicated = split.replicated - ROUTED_DOWN_GB + \
+            q8_ratio * (ROUTED_DOWN_GB + ROUTED_UP_GB)
+        tp = max(0.0, split.shardable - ROUTED_UP_GB) / nodes
+    elif fused_moe_ar:
+        replicated = split.replicated + ROUTED_UP_GB
+        tp = max(0.0, split.shardable - ROUTED_UP_GB) / nodes
+    else:
+        replicated = split.replicated
+        tp = split.shardable / nodes
+    weights = expert + replicated + tp
     # KDA recurrent state is FP32 [layer,stream,local_head,value,key].
     kda = KDA_LAYERS * batch * local_heads * HEAD_DIM * HEAD_DIM * 4 / 1e9
     # Exact expanded MLA K/V, local heads only: 192 key + 128 value BF16 elements.
@@ -145,7 +160,7 @@ def memory(split: WeightSplit, nodes: int, context: int, batch: int,
     # 12 saved residuals plus current, FP32; ping-pong and projection workspaces.
     scratch = batch * 15 * HIDDEN * 4 / 1e9 + 0.35
     total = weights + kda + mla + scratch
-    return Memory(weights, expert, split.replicated, tp, kda, mla, scratch,
+    return Memory(weights, expert, replicated, tp, kda, mla, scratch,
                   total, usable_gb, total <= usable_gb)
 
 
@@ -252,25 +267,62 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            kda_gops: float, latency_us: float,
            link_gbps: float, imbalance: float, expert_ms: float,
            expert_samples: int, moe_collectives: int,
-           latent_overlap: bool, hierarchical_ar: bool) -> dict:
+           latent_overlap: bool, hierarchical_ar: bool,
+           expert_tp: bool = False, expert_tp_layer_ms: float = .096,
+           fused_moe_ar: bool = False, dense_q8: bool = False,
+           q8_gbps: float = 138.0, attention_rsag: bool = False) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
-    other_tp = max(0.0, split.shardable - ATTENTION_GB) / nodes
+    other_tp = max(0.0, split.shardable - ATTENTION_GB -
+                   (ROUTED_UP_GB if fused_moe_ar else 0.0)) / nodes
     dense = split.replicated + attention + other_tp
     cache = MLA_LAYERS * context * math.ceil(HEADS / nodes) * (192 + 128) * 2 / 1e9
     router_down = min(ROUTER_DOWN_GB, split.replicated)
-    weight_s = router_down / router_down_gbps
-    weight_s += (split.replicated - router_down + other_tp) / bw_gbps
+    if dense_q8:
+        weight_s = ROUTER_GB / router_down_gbps
+        weight_s += (split.replicated - ROUTER_DOWN_GB + other_tp) / bw_gbps
+        weight_s += .5006 * (ROUTED_DOWN_GB + ROUTED_UP_GB) / q8_gbps
+    else:
+        weight_s = router_down / router_down_gbps
+        weight_s += (split.replicated - router_down + other_tp) / bw_gbps
+        if fused_moe_ar:
+            weight_s += ROUTED_UP_GB / bw_gbps
     weight_s += attention / head_bw_gbps
-    expert_layer_ms, expert_p95_ms = critical_expert_ms(
-        nodes, batch, expert_ms, expert_samples)
+    if expert_tp:
+        # All ranks execute the same 16 expert slices.  M growth is sublinear
+        # once the native group-32 weights are reused across token rows.
+        expert_layer_ms = expert_tp_layer_ms * batch ** .65
+        expert_p95_ms = expert_layer_ms
+    else:
+        expert_layer_ms, expert_p95_ms = critical_expert_ms(
+            nodes, batch, expert_ms, expert_samples)
     expert_s = MOE_LAYERS * expert_layer_ms * 1e-3
     cache_s = cache / bw_gbps
     # decay, prediction dot, delta update and output dot; measured single-head kernel.
     kda_ops = batch * KDA_LAYERS * math.ceil(HEADS / nodes) * HEAD_DIM * HEAD_DIM * 6
     kda_s = kda_ops / (kda_gops * 1e9)
-    hidden_comm_s, latent_comm_s, collective_calls = collective_seconds(
-        nodes, batch, moe_collectives, latency_us, link_gbps, hierarchical_ar)
+    if fused_moe_ar:
+        # 93 attention + one dense output, then one concatenated
+        # [routed-latent, shared-hidden] reduction per MoE layer.
+        attention_comm = allreduce_seconds(nodes, HIDDEN * 2 * batch,
+                                           LAYERS, latency_us, link_gbps)
+        if attention_rsag:
+            attention_comm *= .52
+        elif hierarchical_ar:
+            attention_comm /= hierarchical_ar_speedup(HIDDEN * batch)
+        dense_comm = allreduce_seconds(nodes, HIDDEN * 2 * batch, 1,
+                                       latency_us, link_gbps)
+        moe_comm = allreduce_seconds(nodes, (LATENT + HIDDEN) * 2 * batch,
+                                     MOE_LAYERS, latency_us, link_gbps)
+        if hierarchical_ar:
+            dense_comm /= hierarchical_ar_speedup(HIDDEN * batch)
+            moe_comm /= hierarchical_ar_speedup((LATENT + HIDDEN) * batch)
+        hidden_comm_s = attention_comm + dense_comm + moe_comm
+        latent_comm_s = 0.0
+        collective_calls = LAYERS + 1 + MOE_LAYERS
+    else:
+        hidden_comm_s, latent_comm_s, collective_calls = collective_seconds(
+            nodes, batch, moe_collectives, latency_us, link_gbps, hierarchical_ar)
     # Only the TP shard of the shared expert is independent of the routed
     # latent reduction.  It is 0.253 GB/rank over the whole 96-node stack, so
     # this overlap is intentionally capped and cannot hide arbitrary comm.
@@ -349,15 +401,19 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"{'ctx':>5} {'M':>3} {'weights':>8} {'KDA':>7} {'MLA-KV':>8} {'total':>8} {'fit27':>6}")
     for ctx in args.contexts:
         for batch in args.batches:
-            m = memory(split, args.nodes, ctx, batch, args.kv_bytes, args.usable_gb)
+            m = memory(split, args.nodes, ctx, batch, args.kv_bytes, args.usable_gb,
+                       args.expert_tp, args.dense_q8, args.fused_moe_ar)
             md = m._asdict()
             md.update({"context": ctx, "batch": batch})
             result["memory"].append(md)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {m.weights_gb:8.2f} {m.kda_state_gb:7.2f} "
                   f"{m.mla_cache_gb:8.2f} {m.total_gb:8.2f} {'yes' if m.fits else 'NO':>6}")
-    _, _, calls = collective_seconds(args.nodes, 1, args.moe_collectives,
-                                     args.latency_us, args.link_gbps,
-                                     args.hierarchical_ar)
+    if args.fused_moe_ar:
+        calls = LAYERS + 1 + MOE_LAYERS
+    else:
+        _, _, calls = collective_seconds(args.nodes, 1, args.moe_collectives,
+                                         args.latency_us, args.link_gbps,
+                                         args.hierarchical_ar)
     print(f"\nDecode (batch tokens/s; {calls} collectives/layer-stack)")
     print(f"{'ctx':>5} {'M':>3} {'W ms':>7} {'Exp ms':>7} {'KV ms':>7} {'KDA':>7} {'comm':>7} {'tok/s':>9}")
     for ctx in args.contexts:
@@ -366,7 +422,9 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
                        args.mxfp4_gbps,args.kda_gops,
                        args.latency_us,args.link_gbps,args.imbalance,
                        args.expert_ms,args.expert_samples,args.moe_collectives,
-                       args.latent_overlap,args.hierarchical_ar)
+                       args.latent_overlap,args.hierarchical_ar,args.expert_tp,
+                       args.expert_tp_layer_ms,args.fused_moe_ar,args.dense_q8,
+                       args.q8_gbps,args.attention_rsag)
             result["decode"].append(d)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:7.1f} {d['expert_ms']:7.1f} "
                   f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f}")
@@ -423,8 +481,21 @@ def main() -> None:
     p.add_argument("--latency-us", type=float, default=20.0, help="assumed allreduce latency per log2 step")
     p.add_argument("--link-gbps", type=float, default=8.0)
     p.add_argument("--imbalance", type=float, default=1.20, help="critical-rank routed-expert traffic factor")
+    p.add_argument("--expert-tp", action="store_true",
+                   help="shard every expert over its group-32 intermediate blocks")
+    p.add_argument("--expert-tp-layer-ms", type=float, default=.096,
+                   help="target M=1 critical time for 16 local expert slices")
+    p.add_argument("--fused-moe-ar", action="store_true",
+                   help="one concatenated latent+shared hidden reduction per MoE layer")
+    p.add_argument("--dense-q8", action="store_true",
+                   help="row-Q8 routed down and replicated routed up")
+    p.add_argument("--q8-gbps", type=float, default=138.0)
+    p.add_argument("--attention-rsag", action="store_true",
+                   help="use decomposed reduce-scatter/allgather attention reduction")
     p.add_argument("--json", type=Path, help="also write full results as JSON")
     args = p.parse_args()
+    if args.dense_q8 and not args.fused_moe_ar:
+        p.error("--dense-q8 requires --fused-moe-ar (replicated routed-up)")
     if args.nodes < 1 or args.nodes > HEADS:
         p.error("--nodes must be in [1,96] for head TP")
     split = fallback_weights() if args.no_manifest else scan_weights(args.model_dir)

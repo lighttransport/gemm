@@ -384,3 +384,41 @@ exceeds the 27 GB memory budget on the fullest ranks. Mode `--moe-collectives 0`
 *no MoE collective* (94 attention/dense calls), not one collective per MoE layer, and is
 only an impossible upper bound: 15.05 token/s at M=1 and 162.2 at M=32. These are
 projections from bounded real weights, not full-layer end-to-end validation.
+
+## Intermediate-TP MoE architecture
+
+The decode MoE path now supports intermediate tensor parallelism instead of whole-expert
+ownership. At 96 ranks, rank `r` owns channels `[32*r, 32*r+32)` from every expert:
+the matching `w1/w3` rows and `w2` columns. Thirty-two channels are exactly one native
+MXFP4 scale group. `k3_stage.py --expert-tp --tp-size 96 --tp-rank R` creates these
+slices with bounded reads and without requantization.
+
+`k3_expert_tp_forward_selected_mxfp4` schedules all 16 selected slices in one OpenMP
+team. `k3_moe_pack_reduce` concatenates routed latent and shared hidden partials into
+10,752 floats for one sum-allreduce. The BF16 or quality-gated Q8 completion then applies
+routed RMSNorm, replicated routed-up, and the shared residual locally. This changes the
+MoE graph from two collectives to one.
+
+Twelve real 256-channel slices reconstructed layer-1/expert-0 with max absolute error
+`6.054e-8` and relative L2 `2.196e-7`. The distributed slice probe passed on 12/12
+nodes. With 16 real selected experts, the 12-way path measured 0.204--0.233 ms/layer.
+A true 96-way 32-channel slice measured locally at 0.096 ms/layer, or 8.81 ms over 92
+MoE layers. Run the 12-node check with `make -C a64fx/k3 probe-expert-tp-mpi`.
+
+## Routed projection Q8 gate
+
+`k3_dense.h` now has dynamic per-vector activation quantization, symmetric per-row
+weights, and a 24-row SVE `sdot` matvec. The real routed-down matrix occupies 24.51 MiB.
+Q8 alone measured 137.9 GB/s; the mixed BF16-router/Q8-down stage measured about
+0.231 ms, versus 0.227 ms for BF16 router+down. Q8 therefore saves memory but not time.
+
+The real result had relative L2 `9.969e-3` and cosine `0.99995032`. It fails the chosen
+relative-L2 limit of `5e-3`, so the probe reports `GATE-REJECT(BF16 fallback)` and router
+Q8 remains disabled. Both BF16 and experimental Q8 routed-up completion APIs exist.
+
+The simulator now models the placement directly via `--expert-tp`, `--fused-moe-ar`,
+`--dense-q8`, and `--attention-rsag`. With measured expert (`0.096 ms/layer`) and Q8
+(`138 GB/s`) calibration, the full Q8 candidate estimates 13.6 tok/s at 4K, M=1, and
+96 nodes. It does not meet the 15 tok/s gate. The former 20 tok/s projection depended
+on unmeasured 240--336 GB/s Q8 and 0.045 ms expert rates and is retracted. M=32 remains
+above 128 tok/s in the model, pending end-to-end large-payload collective measurement.

@@ -185,11 +185,69 @@ static void multi_expert_perf(const loaded_expert *le,int nlocal,int threads){
     free(counts);free(tok);free(tw);free(w1);free(w2);free(w3);free(x);free(gate);free(up);free(eo);free(dst);free(eb);
 }
 
+static int tp_slices_correctness(const loaded_expert *le, int nslice, int threads) {
+    int local=le[0].w1.rows,total=local*nslice;
+    if(getenv("K3_TP_SELECTED")){
+        k3_mxfp4_matrix*w1=malloc((size_t)nslice*sizeof(*w1)),*w2=malloc((size_t)nslice*sizeof(*w2)),*w3=malloc((size_t)nslice*sizeof(*w3));
+        float*rw=malloc((size_t)nslice*4),*x=malloc((size_t)K3_LATENT*4),*got=malloc((size_t)K3_LATENT*4),*ref=calloc(K3_LATENT,4),*part=malloc((size_t)K3_LATENT*4);
+        float*g=malloc((size_t)nslice*local*4),*u=malloc((size_t)nslice*local*4),*eo=malloc((size_t)nslice*K3_LATENT*4),*gl=malloc((size_t)local*4),*ul=malloc((size_t)local*4);
+        if(!w1||!w2||!w3||!rw||!x||!got||!ref||!part||!g||!u||!eo||!gl||!ul)return 1;
+        for(int e=0;e<nslice;++e){w1[e]=le[e].w1;w2[e]=le[e].w2;w3[e]=le[e].w3;rw[e]=1.0f/nslice;}for(int i=0;i<K3_LATENT;++i)x[i]=rf()*.125f;
+        for(int e=0;e<nslice;++e){k3_expert_tp_forward_mxfp4(part,&w1[e],&w2[e],&w3[e],x,1,gl,ul,threads,8);for(int i=0;i<K3_LATENT;++i)ref[i]+=rw[e]*part[i];}
+        k3_expert_tp_forward_selected_mxfp4(got,w1,w2,w3,rw,nslice,x,g,u,eo,threads);
+        float err=max_abs(got,ref,K3_LATENT);double mean=0,best=1e9;for(int it=0;it<8;++it){double t=now_sec();k3_expert_tp_forward_selected_mxfp4(got,w1,w2,w3,rw,nslice,x,g,u,eo,threads);double ms=(now_sec()-t)*1e3;mean+=ms;if(ms<best)best=ms;}mean/=8;
+        printf("[expert-tp-selected] experts=%d channels/rank=%d max_abs=%.3e %s\n",nslice,local,err,err<2e-6?"OK":"FAIL");
+        printf("PROBE expert-tp-selected experts=%d channels=%d mean_ms=%.3f best_ms=%.3f projected_stack_ms=%.3f\n",nslice,local,mean,best,mean*K3_MOE_LAYERS);
+        free(w1);free(w2);free(w3);free(rw);free(x);free(got);free(ref);free(part);free(g);free(u);free(eo);free(gl);free(ul);return err>=2e-6;
+    }
+    if(total!=K3_EXPERT_INTER){
+        float*x=malloc((size_t)K3_LATENT*4),*y=malloc((size_t)K3_LATENT*4);
+        float*g=malloc((size_t)local*4),*u=malloc((size_t)local*4);if(!x||!y||!g||!u)return 1;
+        for(int i=0;i<K3_LATENT;++i)x[i]=rf()*.125f;double mean=0,best=1e9,checksum=0;
+        for(int q=0;q<nslice;++q){if(k3_expert_tp_forward_mxfp4(y,&le[q].w1,&le[q].w2,&le[q].w3,x,1,g,u,threads,8))return 1;
+            for(int it=0;it<8;++it){double t=now_sec();if(k3_expert_tp_forward_mxfp4(y,&le[q].w1,&le[q].w2,&le[q].w3,x,1,g,u,threads,8))return 1;
+                double ms=(now_sec()-t)*1e3;mean+=ms;if(ms<best)best=ms;}
+            for(int i=0;i<K3_LATENT;++i){if(!isfinite(y[i]))return 1;checksum+=y[i];}}
+        mean/=8*nslice;
+        printf("[expert-tp-slice] slices=%d channels=%d finite=yes PASS\n",nslice,total);
+        printf("PROBE expert-tp local_slices=%d channels=%d mean_ms=%.3f best_ms=%.3f checksum=%+.6e\n",nslice,total,mean,best,checksum);
+        free(x);free(y);free(g);free(u);return 0;
+    }
+    size_t w13=(size_t)K3_EXPERT_INTER*K3_LATENT/2,s13=(size_t)K3_EXPERT_INTER*K3_LATENT/32;
+    size_t w2n=(size_t)K3_LATENT*K3_EXPERT_INTER/2,s2n=(size_t)K3_LATENT*K3_EXPERT_INTER/32;
+    uint8_t *p1=malloc(w13),*s1=malloc(s13),*p2=malloc(w2n),*s2=malloc(s2n),*p3=malloc(w13),*s3=malloc(s13);
+    float*x=malloc((size_t)K3_LATENT*4),*ref=malloc((size_t)K3_LATENT*4),*sum=calloc(K3_LATENT,4),*part=malloc((size_t)K3_LATENT*4);
+    float*g=malloc((size_t)K3_EXPERT_INTER*4),*u=malloc((size_t)K3_EXPERT_INTER*4),*gl=malloc((size_t)local*4),*ul=malloc((size_t)local*4);
+    if(!p1||!s1||!p2||!s2||!p3||!s3||!x||!ref||!sum||!part||!g||!u||!gl||!ul)return 1;
+    for(int q=0;q<nslice;++q){
+        size_t pw=(size_t)local*K3_LATENT/2,ps=(size_t)local*K3_LATENT/32;
+        memcpy(p1+(size_t)q*pw,le[q].w1.packed,pw);memcpy(s1+(size_t)q*ps,le[q].w1.scale,ps);
+        memcpy(p3+(size_t)q*pw,le[q].w3.packed,pw);memcpy(s3+(size_t)q*ps,le[q].w3.scale,ps);
+        for(int r=0;r<K3_LATENT;++r){
+            memcpy(p2+(size_t)r*K3_EXPERT_INTER/2+(size_t)q*local/2,
+                   le[q].w2.packed+(size_t)r*local/2,(size_t)local/2);
+            memcpy(s2+(size_t)r*K3_EXPERT_INTER/32+(size_t)q*local/32,
+                   le[q].w2.scale+(size_t)r*local/32,(size_t)local/32);
+        }
+    }
+    for(int i=0;i<K3_LATENT;++i)x[i]=rf()*.125f;
+    k3_mxfp4_matrix f1={p1,s1,K3_EXPERT_INTER,K3_LATENT},f2={p2,s2,K3_LATENT,K3_EXPERT_INTER},f3={p3,s3,K3_EXPERT_INTER,K3_LATENT};
+    k3_expert_forward_mxfp4(ref,&f1,&f2,&f3,x,1,g,u,threads);
+    double max_ms=0,total_ms=0;
+    for(int q=0;q<nslice;++q){double t=now_sec();int bad=k3_expert_tp_forward_mxfp4(part,&le[q].w1,&le[q].w2,&le[q].w3,x,1,gl,ul,threads,8);double ms=(now_sec()-t)*1e3;
+        if(bad)return 1;if(ms>max_ms)max_ms=ms;total_ms+=ms;for(int i=0;i<K3_LATENT;++i)sum[i]+=part[i];}
+    float e=max_abs(sum,ref,K3_LATENT);double se=0,sr=0;for(int i=0;i<K3_LATENT;++i){double d=sum[i]-ref[i];se+=d*d;sr+=(double)ref[i]*ref[i];}
+    double rel=sqrt(se/(sr+1e-30));printf("[expert-tp] slices=%d channels/rank=%d max_abs=%.3e rel_l2=%.3e %s\n",nslice,local,e,rel,e<2e-4&&rel<5e-4?"OK":"FAIL");
+    printf("PROBE expert-tp emulated_ranks=%d serial_ms=%.3f critical_rank_ms=%.3f projected_layers_ms=%.3f\n",nslice,total_ms,max_ms,max_ms*K3_MOE_LAYERS);
+    free(p1);free(s1);free(p2);free(s2);free(p3);free(s3);free(x);free(ref);free(sum);free(part);free(g);free(u);free(gl);free(ul);return e>=2e-4||rel>=5e-4;
+}
+
 int main(int argc,char**argv){
     if(argc<3||!(argc&1)){fprintf(stderr,"usage: %s BLOB MANIFEST [BLOB MANIFEST ...]\n",argv[0]);return 2;}
     int nlocal=(argc-1)/2;if(nlocal>16)return 2;loaded_expert le[16];memset(le,0,sizeof(le));k3_apply_numa_interleave();
     for(int e=0;e<nlocal;++e)if(load_expert(argv[1+2*e],argv[2+2*e],&le[e])){fprintf(stderr,"load expert %d failed\n",e);return 2;}
     k3_mxfp4_matrix w1=le[0].w1,w2=le[0].w2,w3=le[0].w3;
+    if(w1.rows!=K3_EXPERT_INTER){int fail=tp_slices_correctness(le,nlocal,48);for(int e=0;e<nlocal;++e)free(le[e].blob);printf("K3 expert-TP probe: %s\n",fail?"FAIL":"PASS");return fail?1:0;}
     int fail=dispatch_unit()|batched_correctness(&w1,&w2,&w3)|tiled_correctness(&w1,&w2,&w3)|situ_fast_correctness(&w1,&w2,&w3)|local_scheduler_correctness(&w1,&w2,&w3);
     int batches[]={1,2,4,8,16,32},threads[]={24,48};
     int tile_threshold=getenv("K3_MXFP4_TILE")?atoi(getenv("K3_MXFP4_TILE")):8;

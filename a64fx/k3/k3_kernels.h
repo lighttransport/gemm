@@ -15,6 +15,8 @@ enum {
     K3_HEAD_DIM = 128,
     K3_KDA_LAYERS = 69,
     K3_MLA_LAYERS = 24,
+    K3_LAYERS = 93,
+    K3_MOE_LAYERS = 92,
     K3_EXPERTS = 896,
     K3_TOP_K = 16,
     K3_LATENT = 3584,

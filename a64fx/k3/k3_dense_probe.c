@@ -108,6 +108,53 @@ static void perf(const matrix *r, const matrix *d, const float *x, float *yr,
            bytes / (sec / iters) / 1e9, sum);
     free(eb);
 }
+static int q8_correctness_perf(const matrix *r, const matrix *d, const float *x,
+                               const float *down_ref, int threads) {
+    size_t wn = (size_t)d->rows * d->cols;
+    int8_t *qw = malloc(wn), *qx = malloc((size_t)d->cols);
+    float *scale = malloc((size_t)d->rows * sizeof(float));
+    float *out = malloc((size_t)d->rows * sizeof(float));
+    float *router_out = malloc((size_t)r->rows * sizeof(float));
+    if (!qw || !qx || !scale || !out || !router_out) return 1;
+    k3_q8_quantize_bf16_rows(qw, scale, d->weight, d->rows, d->cols);
+    k3_q8_matrix q = {qw, scale, d->rows, d->cols};
+    k3_matvec_q8(out, &q, x, qx, threads);
+    double se = 0.0, sr = 0.0, dot = 0.0, so = 0.0;
+    float ma = 0.0f;
+    for (int i = 0; i < d->rows; ++i) {
+        double diff = out[i] - down_ref[i];
+        se += diff * diff; sr += (double)down_ref[i] * down_ref[i];
+        dot += (double)out[i] * down_ref[i]; so += (double)out[i] * out[i];
+        ma = fmaxf(ma, fabsf((float)diff));
+    }
+    double rel = sqrt(se / (sr + 1e-30));
+    double cosine = dot / sqrt((sr + 1e-30) * (so + 1e-30));
+    int accepted = rel < 5e-3 && cosine >= .99995;
+    printf("[dense-q8] max_abs=%.3e rel_l2=%.3e cosine=%.8f %s\n",
+           ma, rel, cosine, accepted ? "GATE-PASS" : "GATE-REJECT(BF16 fallback)");
+    size_t en = (size_t)192 * 1024 * 1024 / 4;
+    float *eb = calloc(en, sizeof(float));
+    double sec = 0.0; int iters = 10;
+    double qsec = 0.0;
+    for (int i = 0; i < iters; ++i) {
+        evict(eb, en, threads); double t = now_sec();
+        k3_matvec_q8(out, &q, x, qx, threads); qsec += now_sec() - t;
+    }
+    printf("PROBE dense mode=down-q8-dot24 threads=%d us=%.3f GB/s=%.2f\n",
+           threads, qsec / iters * 1e6,
+           k3_q8_matrix_bytes(d->rows,d->cols)/(qsec/iters)/1e9);
+    for (int i = 0; i < iters; ++i) {
+        evict(eb, en, threads); double t = now_sec();
+        k3_dense_router_bf16_down_q8(router_out, out, r, &q, x, qx, threads);
+        sec += now_sec() - t;
+    }
+    double bytes = 2.0 * r->rows * r->cols + (double)wn + d->rows * 4.0;
+    printf("PROBE dense mode=router-bf16+down-q8 threads=%d us=%.3f GB/s=%.2f memory_MiB=%.2f\n",
+           threads, sec / iters * 1e6, bytes / (sec / iters) / 1e9,
+           k3_q8_matrix_bytes(d->rows, d->cols) / 1048576.0);
+    free(eb); free(qw); free(qx); free(scale); free(out); free(router_out);
+    return !isfinite(rel) || !isfinite(cosine);
+}
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s BLOB MANIFEST\n", argv[0]);
@@ -132,19 +179,24 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 7168; ++i)
         x[i] = rnd() * .125f;
     mv(yr, &r, x, 48);
+    mv(yd, &d, x, 48);
     double ref = 0;
     for (int i = 0; i < 7168; ++i)
         ref += (double)bf16_to_f32_scalar(r.weight[i]) * x[i];
     double err = fabs(ref - yr[0]);
     printf("[dense-row0] abs_err=%.3e %s\n", err, err < 2e-5 ? "OK" : "FAIL");
     int ts[] = {24, 28, 32, 36, 40, 44, 47, 48};
+    float *down_ref = malloc((size_t)d.rows * sizeof(float));
+    memcpy(down_ref, yd, (size_t)d.rows * sizeof(float));
     for (int i = 0; i < 8; ++i) {
         perf(&r, &d, x, yr, yd, ts[i], 0);
         perf(&r, &d, x, yr, yd, ts[i], 1);
     }
+    int q8_fail = q8_correctness_perf(&r, &d, x, down_ref, 47);
+    free(down_ref);
     free(x);
     free(yr);
     free(yd);
     free(b);
-    return err < 2e-5 ? 0 : 1;
+    return err < 2e-5 && !q8_fail ? 0 : 1;
 }
