@@ -480,25 +480,21 @@ static inline void k3_expert_tp_forward_selected_team_mxfp4(
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
-    for(int task=0;task<selected*2*g13;++task){int e=task/(2*g13),rem=task%(2*g13),which=rem/g13,r=(rem%g13)*8;
-        const k3_mxfp4_matrix*m=which?&w3[e]:&w1[e];float*y=(which?up:gate)+(size_t)e*local;
-        size_t wr=(size_t)m->cols/2,sr=(size_t)m->cols/32;
-        k3_mxfp4_group_batch(y+r,local,m->packed+(size_t)r*wr,
-            m->scale+(size_t)r*sr,latent,K3_LATENT,1,m->cols,0);}
+    for(int task=0;task<selected*g13;++task){int e=task/g13,r=(task%g13)*8;
+        float*g=gate+(size_t)e*local+r,*u=up+(size_t)e*local+r;
+        const k3_mxfp4_matrix*m1=&w1[e],*m3=&w3[e];
+        size_t wr=(size_t)K3_LATENT/2,sr=(size_t)K3_LATENT/32;
+        k3_mxfp4_group_batch(g,local,m1->packed+(size_t)r*wr,
+            m1->scale+(size_t)r*sr,latent,K3_LATENT,1,K3_LATENT,0);
+        k3_mxfp4_group_batch(u,local,m3->packed+(size_t)r*wr,
+            m3->scale+(size_t)r*sr,latent,K3_LATENT,1,K3_LATENT,0);
 #if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
-    int vl=(int)svcntw(),blocks=(selected*local+vl-1)/vl;
-#if defined(_OPENMP)
-#pragma omp for schedule(static)
-#endif
-    for(int b=0;b<blocks;++b){int i=b*vl,n=selected*local-i;
-        k3_situ_fast_sve(gate+i,gate+i,up+i,n<vl?n:vl);}
+        k3_situ_fast_sve(g,g,u,8);
 #else
-#if defined(_OPENMP)
-#pragma omp for schedule(static)
+        for(int j=0;j<8;++j)g[j]=4.0f*tanhf(g[j]*.25f)*
+            k3_sigmoidf(g[j])*25.0f*tanhf(u[j]*.04f);
 #endif
-    for(int i=0;i<selected*local;++i)gate[i]=4.0f*tanhf(gate[i]*.25f)*
-        k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
-#endif
+    }
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif

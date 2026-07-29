@@ -676,6 +676,16 @@ passed 12/12 ranks at 2,365 layer-steps/s after the fusion. This optimization ad
 local scheduling only; the allreduce remains outside the OpenMP region and continues
 to cost approximately 0.11--0.12 ms per partial layer step on 12 nodes.
 
+The selected-expert workshare now fuses each eight-channel W1 group, matching W3
+group, and SiTU activation into one task. This removes a full-team barrier and avoids
+rereading the gate/up tile before W2 while retaining 512 independent tasks at TP=12.
+The real 16-expert slice reference remained exact (`max_abs=0`). A 4K dummy sweep
+reduced expert time from 0.2217 to 0.2142 ms/layer and increased total throughput from
+2,416 to 2,426 layer-steps/s. Four 4K real-weight distributed runs passed 12/12 ranks;
+the three non-outlier expert times were 0.2131--0.2199 ms/layer with identical final
+checksums. One run experienced a simultaneous collective/system outlier and is not
+used as a kernel-speed claim.
+
 ### Long-context stability and compact state
 
 Runtime state is now indexed by compact layer-type slots rather than the decoder-layer
