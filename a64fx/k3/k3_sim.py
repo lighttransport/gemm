@@ -11,7 +11,9 @@ import json
 import math
 import os
 import re
+import random
 import struct
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, NamedTuple
 
@@ -161,32 +163,96 @@ def active_expert_gb(split: WeightSplit, nodes: int, batch: int,
     return split.experts * distinct / EXPERTS / nodes * imbalance
 
 
+def expert_service_ms(count: int, single_ms: float) -> float:
+    """Measured real-expert latency curve, linearly interpolated by bucket M."""
+    curve = ((0, 0.0), (1, 0.220), (2, 0.317), (4, 0.555),
+             (8, 1.041), (16, 1.884), (32, 3.467))
+    scale = single_ms / curve[1][1]
+    for (m0, t0), (m1, t1) in zip(curve, curve[1:]):
+        if count <= m1:
+            return scale * (t0 + (t1 - t0) * (count - m0) / (m1 - m0))
+    m0, t0 = curve[-2]
+    m1, t1 = curve[-1]
+    return scale * (t1 + (count - m1) * (t1 - t0) / (m1 - m0))
+
+
+def rank_expert_service_ms(rank_buckets: dict, single_ms: float) -> float:
+    service = sum(expert_service_ms(m, single_ms)
+                  for m in rank_buckets.values())
+    # Four-CMG sparse scheduler, measured with distinct real experts on 12 nodes.
+    # Two/three use a shared workshare; exactly four pin one bucket per CMG.
+    factors = {2: 0.952, 3: 0.95, 4: 0.875}
+    return service * factors.get(len(rank_buckets), 1.0)
+
+
+@lru_cache(maxsize=None)
+def critical_expert_ms(nodes: int, batch: int, single_ms: float,
+                       samples: int) -> Tuple[float, float]:
+    """Mean/p95 slowest-rank expert service for one MoE layer.
+
+    Each token chooses 16 distinct experts. Experts are assigned by id modulo
+    rank, and same-expert tokens use the measured batched kernel curve.
+    """
+    rng = random.Random(0x4B334D4F45 + nodes * 257 + batch)
+    maxima = []
+    for _ in range(samples):
+        buckets = [dict() for _ in range(nodes)]
+        for _token in range(batch):
+            for expert in rng.sample(range(EXPERTS), TOP_K):
+                rank = expert % nodes
+                buckets[rank][expert] = buckets[rank].get(expert, 0) + 1
+        maxima.append(max(rank_expert_service_ms(rank_buckets, single_ms)
+                          for rank_buckets in buckets))
+    maxima.sort()
+    return sum(maxima) / samples, maxima[min(samples - 1, int(.95 * samples))]
+
+
+def collective_seconds(nodes: int, batch: int, moe_collectives: int,
+                       latency_us: float, link_gbps: float) -> Tuple[float, int]:
+    # Attention produces one hidden collective per layer. The dense FFN adds
+    # one. Current exact LatentMoE has latent-reduce + hidden-output (2).
+    hidden_calls = LAYERS + 1 + MOE_LAYERS * min(moe_collectives, 1)
+    latent_calls = MOE_LAYERS if moe_collectives >= 2 else 0
+    hidden_calls += MOE_LAYERS * max(0, moe_collectives - 2)
+    seconds = allreduce_seconds(nodes, HIDDEN * 2 * batch, hidden_calls,
+                                latency_us, link_gbps)
+    seconds += allreduce_seconds(nodes, LATENT * 2 * batch, latent_calls,
+                                 latency_us, link_gbps)
+    return seconds, hidden_calls + latent_calls
+
+
 def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            bw_gbps: float, head_bw_gbps: float, mxfp4_gbps: float,
            kda_gops: float, latency_us: float,
-           link_gbps: float, imbalance: float) -> dict:
+           link_gbps: float, imbalance: float, expert_ms: float,
+           expert_samples: int, moe_collectives: int) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB) / nodes
     dense = split.replicated + attention + other_tp
     cache = MLA_LAYERS * context * math.ceil(HEADS / nodes) * (192 + 128) * 2 / 1e9
     weight_s = (split.replicated + other_tp) / bw_gbps
-    weight_s += attention / head_bw_gbps + expert / mxfp4_gbps
+    weight_s += attention / head_bw_gbps
+    expert_layer_ms, expert_p95_ms = critical_expert_ms(
+        nodes, batch, expert_ms, expert_samples)
+    expert_s = MOE_LAYERS * expert_layer_ms * 1e-3
     cache_s = cache / bw_gbps
     # decay, prediction dot, delta update and output dot; measured single-head kernel.
     kda_ops = batch * KDA_LAYERS * math.ceil(HEADS / nodes) * HEAD_DIM * HEAD_DIM * 6
     kda_s = kda_ops / (kda_gops * 1e9)
-    # 93 attention output + 93 FFN output + 92 latent expert reductions.
-    comm_s = allreduce_seconds(nodes, HIDDEN * 2 * batch, 186, latency_us, link_gbps)
-    comm_s += allreduce_seconds(nodes, LATENT * 2 * batch, 92, latency_us, link_gbps)
-    lower = weight_s + cache_s + kda_s
+    comm_s, collective_calls = collective_seconds(
+        nodes, batch, moe_collectives, latency_us, link_gbps)
+    lower = weight_s + expert_s + cache_s + kda_s
     predicted = lower + comm_s
     return {
         "context": context, "batch": batch,
         "dense_gb": dense, "attention_tp_gb": attention,
         "active_expert_gb": expert, "mla_scan_gb": cache,
-        "weight_ms": weight_s * 1e3, "cache_ms": cache_s * 1e3,
+        "weight_ms": weight_s * 1e3, "expert_ms": expert_s * 1e3,
+        "expert_layer_ms": expert_layer_ms, "expert_layer_p95_ms": expert_p95_ms,
+        "cache_ms": cache_s * 1e3,
         "kda_ms": kda_s * 1e3, "comm_ms": comm_s * 1e3,
+        "collective_calls": collective_calls,
         "lower_bound_ms": lower * 1e3, "predicted_ms": predicted * 1e3,
         "tokens_per_second": batch / predicted,
     }
@@ -194,7 +260,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
 
 def prefill(split: WeightSplit, nodes: int, tokens: int, chunk: int,
             gemm_tflops: float, kda_gops: float, latency_us: float,
-            link_gbps: float) -> dict:
+            link_gbps: float, moe_collectives: int) -> dict:
     # Every dense/shardable byte corresponds approximately to one matrix weight used once/token.
     # MXFP4 expert bytes are 0.53125 B/weight including scales.
     dense_weights = (split.replicated + split.shardable / nodes) * 1e9 / 2.0
@@ -208,12 +274,14 @@ def prefill(split: WeightSplit, nodes: int, tokens: int, chunk: int,
     mla_ops = MLA_LAYERS * math.ceil(HEADS / nodes) * pairs * 2.0 * (192 + 128)
     attention_s = mla_ops / (gemm_tflops * 0.35 * 1e12)
     chunks = math.ceil(tokens / chunk)
-    comm_s = allreduce_seconds(nodes, HIDDEN * 2 * chunk, 186 * chunks, latency_us, link_gbps)
-    comm_s += allreduce_seconds(nodes, LATENT * 2 * chunk, 92 * chunks, latency_us, link_gbps)
+    comm_chunk_s, calls_per_chunk = collective_seconds(
+        nodes, chunk, moe_collectives, latency_us, link_gbps)
+    comm_s = comm_chunk_s * chunks
     total = gemm_s + kda_s + attention_s + comm_s
     return {
         "tokens": tokens, "chunk": chunk, "gemm_s": gemm_s, "kda_s": kda_s,
-        "mla_attention_s": attention_s, "comm_s": comm_s, "total_s": total,
+        "mla_attention_s": attention_s, "comm_s": comm_s,
+        "collective_calls": calls_per_chunk * chunks, "total_s": total,
         "tokens_per_second": tokens / total,
     }
 
@@ -232,6 +300,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
           f"replicated {split.replicated:.3f} + TP {split.shardable:.3f}")
     print(f"calibration: dense-BW={args.bw_gbps:g} GB/s, head-slice-BW={args.head_bw_gbps:g} GB/s, "
           f"MXFP4-BW={args.mxfp4_gbps:g} GB/s, "
+          f"expert-M1={args.expert_ms:g} ms, "
           f"KDA={args.kda_gops:g} GOP/s, "
           f"GEMM={args.gemm_tflops:g} TF/s, collective={args.latency_us:g} us/step")
     print("\nMemory (fullest rank, expanded BF16 MLA cache)")
@@ -244,22 +313,25 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
             result["memory"].append(md)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {m.weights_gb:8.2f} {m.kda_state_gb:7.2f} "
                   f"{m.mla_cache_gb:8.2f} {m.total_gb:8.2f} {'yes' if m.fits else 'NO':>6}")
-    print("\nDecode (batch tokens/s; predicted includes 278 collectives/layer-stack)")
-    print(f"{'ctx':>5} {'M':>3} {'W ms':>8} {'KV ms':>8} {'KDA ms':>8} {'comm ms':>8} {'tok/s':>9}")
+    _, calls = collective_seconds(args.nodes, 1, args.moe_collectives,
+                                  args.latency_us, args.link_gbps)
+    print(f"\nDecode (batch tokens/s; {calls} collectives/layer-stack)")
+    print(f"{'ctx':>5} {'M':>3} {'W ms':>7} {'Exp ms':>7} {'KV ms':>7} {'KDA':>7} {'comm':>7} {'tok/s':>9}")
     for ctx in args.contexts:
         for batch in args.batches:
             d = decode(split,args.nodes,ctx,batch,args.bw_gbps,args.head_bw_gbps,
                        args.mxfp4_gbps,args.kda_gops,
-                       args.latency_us,args.link_gbps,args.imbalance)
+                       args.latency_us,args.link_gbps,args.imbalance,
+                       args.expert_ms,args.expert_samples,args.moe_collectives)
             result["decode"].append(d)
-            print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:8.1f} {d['cache_ms']:8.1f} "
-                  f"{d['kda_ms']:8.1f} {d['comm_ms']:8.1f} {d['tokens_per_second']:9.2f}")
+            print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:7.1f} {d['expert_ms']:7.1f} "
+                  f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f}")
     print("\nPrefill (tokens/s)")
     print(f"{'prompt':>7} {'chunk':>6} {'GEMM s':>9} {'KDA s':>9} {'MLA s':>9} {'comm s':>9} {'tok/s':>9}")
     for tokens in args.prompts:
         for chunk in args.chunks:
             p = prefill(split,args.nodes,tokens,chunk,args.gemm_tflops,args.kda_gops,
-                        args.latency_us,args.link_gbps)
+                        args.latency_us,args.link_gbps,args.moe_collectives)
             result["prefill"].append(p)
             print(f"{fmt_ctx(tokens):>7} {chunk:6d} {p['gemm_s']:9.1f} {p['kda_s']:9.1f} "
                   f"{p['mla_attention_s']:9.1f} {p['comm_s']:9.1f} {p['tokens_per_second']:9.1f}")
@@ -288,6 +360,12 @@ def main() -> None:
                    help="measured cache-evicted one-head BF16 projection bandwidth")
     p.add_argument("--mxfp4-gbps", type=float, default=180.0,
                    help="48-core MXFP4 bandwidth; extrapolated from the measured 3.75 GB/s/core")
+    p.add_argument("--expert-ms", type=float, default=0.220,
+                   help="measured real MXFP4 M=1 expert latency")
+    p.add_argument("--expert-samples", type=int, default=1000,
+                   help="deterministic routing Monte Carlo samples per batch")
+    p.add_argument("--moe-collectives", type=int, choices=(0,1,2,3), default=2,
+                   help="MoE collectives/layer: current exact path is 2")
     p.add_argument("--kda-gops", type=float, default=11.35,
                    help="12-node mean one-head KDA rate at the optimal 8 threads")
     p.add_argument("--gemm-tflops", type=float, default=1.25, help="assumed per-rank BF16-equivalent GEMM")

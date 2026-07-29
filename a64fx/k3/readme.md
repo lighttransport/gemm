@@ -4,7 +4,7 @@
 
 Build an exact text-only Kimi K3 inference path for 96 A64FX nodes. The implementation will live in this directory and reuse the proven GLM-5.2 runner structure for uTofu bootstrap, robust collectives, rank-local staging, profiling, and generation.
 
-The current interactive allocation has six 32 GB nodes, so development must use synthetic tests and carefully selected real-weight layers. A complete 96-node run is out of scope for the interactive validation stage.
+The current interactive allocation has twelve 32 GB nodes, so development uses synthetic tests and carefully selected real-weight slices. A complete 96-node run is out of scope for the interactive validation stage.
 
 ## Checkpoint and architecture
 
@@ -170,7 +170,9 @@ confirms that context-parallel MLA is required rather than optional.
 With the current default assumptions (336 GB/s large-matrix bandwidth, measured
 83.6 GB/s cache-evicted head-slice bandwidth, 180 GB/s 48-core MXFP4 bandwidth,
 measured eight-thread KDA, and 20 microseconds per recursive-doubling collective step),
-the 96-node estimates are 14.17 token/s at 4K and 13.10 token/s at 128K for batch 1.
+the original bandwidth-average estimate was 14.17 token/s at 4K. The measured
+expert-service model below supersedes it: random top-16 ownership collisions make the
+current 4K batch-one estimate 9.73 token/s.
 The 1M result remains compute-only and is not runnable under the v1 cache layout.
 
 Known implementation limits of this milestone:
@@ -219,9 +221,9 @@ which creates a visible performance step.
 | 64 | 30.86 GB | no | compute-only; not deployable |
 | 72 | 29.05 GB | no | compute-only; not deployable |
 | 80 | 27.29 GB | no, narrowly | compute-only; not deployable |
-| 84 | 25.61 GB | yes | 13.69 token/s |
-| 92 | 23.89 GB | yes | 13.92 token/s |
-| 96 | 23.77 GB | yes | 14.17 token/s |
+| 84 | 25.61 GB | yes | 9.45 token/s |
+| 92 | 23.89 GB | yes | 9.60 token/s |
+| 96 | 23.77 GB | yes | 9.73 token/s |
 
 The KDA calibration now comes from real layer-0/head-0 activations on all twelve nodes:
 8 threads are optimal at 8.66 microseconds/head-step and 11.35 GOP/s. Cache-evicted
@@ -274,3 +276,67 @@ OpenMP synchronization. The eight-thread calibration is the more conservative an
 robust choice. Hoisting `exp(log_decay)` out of the value-row loop remains the dominant
 optimization: it changed the synthetic single-core recurrence from about 348 to
 23--26 microseconds.
+
+## Real partial MoE dispatch and MXFP4 probe
+
+`k3_moe.h` now contains exact top-k local bucketing, gather, weighted scatter-add,
+single-expert MXFP4 execution, and a fused multi-expert scheduler. The batched SVE path
+dequantizes each 8-row MXFP4 tile once to an 8 KiB BF16 pair-vector panel and reuses it
+through a three-token microkernel. On real K3 weights the tiled path differs from the
+decode `svtbl` reference by at most `1.42e-7`; scalar-batch and fused-dispatch checks are
+bit exact.
+
+All performance probes first read their bounded blobs into anonymous memory under
+`MPOL_INTERLEAVE` over NUMA nodes 4--7 (`mask=0xf0`). The launchers set
+`XOS_MMM_L_PAGING_POLICY=demand:demand:demand`; file-backed first-touch is not used for
+reported rates. `run_moe_probe_mpi.sh` stages four distinct layer-1 experts per node
+(66.94 MiB/node), runs all ranks, and requires an explicit PASS record from every rank.
+
+Measured on all twelve nodes at 48 threads:
+
+| Real expert workload | Time/rate |
+|---|---:|
+| One expert, M=1 | 0.215--0.229 ms, 4.37--4.64k assignments/s |
+| One expert, M=32 tiled | about 3.44 ms, 9.2--9.3k assignments/s |
+| Two distinct M=1 experts, shared workshare | 0.417--0.422 ms, about 4.77k assignments/s |
+| Four distinct M=1 experts, CMG-partitioned | 0.764--0.773 ms on 11 nodes; one 0.927 ms outlier |
+
+The exactly-four-expert sparse path pins one bucket per 12-core CMG subgroup. Two and
+three active experts retain the global workshare because a two-way CMG split measured
+slower. The four-way path improves the normal four-expert result from about 0.89 ms to
+0.77 ms.
+
+Reproduce the distributed bounded test inside an allocation with:
+
+```sh
+K3_KEEP_RESULTS=1 make -C a64fx/k3 probe-moe-mpi
+```
+
+## 4K decode target audit
+
+The simulator now uses a deterministic routing Monte Carlo and the measured real-expert
+service curve instead of dividing active expert bytes evenly over all ranks. This matters
+at batch one: 16 experts mapped onto 96 owners collide often enough that the mean
+slowest-rank MoE service is about 0.37 ms/layer, or 34.0 ms over 92 layers, rather than
+the impossible bandwidth-average value of 1.8 ms for the whole stack.
+
+For 96 nodes, 4K context, current exact placement (one attention collective plus latent
+and hidden MoE collectives, 278 total), the revised estimates are:
+
+| Decode batch | Dense/attention | Routed experts | KDA + KV | Collectives | Aggregate token/s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 28.2 ms | 34.0 ms | 0.8 ms | 39.7 ms | 9.73 |
+| 8 | 28.2 ms | 85.6 ms | 5.0 ms | 45.5 ms | 48.70 |
+| 16 | 28.2 ms | 131.1 ms | 9.8 ms | 52.1 ms | 72.34 |
+| 32 | 28.2 ms | 191.9 ms | 19.3 ms | 65.3 ms | 105.01 |
+
+Therefore the requested 30 token/s single-stream target is not yet feasible: the bare
+modeled compute path is already about 63 ms/token, and the current 278-collective model
+alone is 39.7 ms versus a 33.3 ms total target. Reducing MoE communication all the way
+to one hidden collective for the entire layer (94 stack-wide calls, an architectural
+upper-bound experiment rather than the current exact graph) gives 13.06 token/s at
+batch one and 59.43 aggregate token/s at batch eight. Thus the 60 token/s batched target
+is close under a one-collective MoE redesign, while single-stream 30 requires roughly a
+threefold combined improvement in expert and dense/attention kernels plus fewer
+collectives. These are projections from partial real weights, not a claim of full-layer
+end-to-end validation.

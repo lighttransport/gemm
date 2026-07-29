@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <fcntl.h>
@@ -7,12 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "k3_kernels.h"
+#include "k3_runtime.h"
 #include "ggml_dequant.h"
 
 typedef struct {
@@ -132,8 +133,7 @@ static double kda_probe(float*out,const float*q,const float*k,const float*v,cons
 int main(int argc,char**argv){
     if(argc!=3){fprintf(stderr,"usage: %s BLOB MANIFEST\n",argv[0]);return 2;}
     entry es[20];int ne=load_manifest(argv[2],es,20);if(ne!=13){fprintf(stderr,"expected 13 tensors, got %d\n",ne);return 2;}
-    int fd=open(argv[1],O_RDONLY);struct stat st;if(fd<0||fstat(fd,&st)){perror("blob");return 2;}
-    uint8_t*blob=mmap(NULL,(size_t)st.st_size,PROT_READ,MAP_PRIVATE,fd,0);if(blob==MAP_FAILED){perror("mmap");return 2;}
+    k3_apply_numa_interleave();size_t blob_size=0;uint8_t*blob=k3_load_blob_anon(argv[1],&blob_size);if(!blob){perror("blob");return 2;}
 #define PTR(suf,type) ((type*)(blob+find_suffix(es,ne,suf)->offset))
     const uint16_t *qw=PTR("q_proj.weight",uint16_t),*kw=PTR("k_proj.weight",uint16_t);
     const uint16_t *vw=PTR("v_proj.weight",uint16_t),*gw=PTR("g_proj.weight",uint16_t);
@@ -168,6 +168,6 @@ int main(int argc,char**argv){
     printf("\nReal-activation KDA recurrence scaling (128x128 FP32 state):\n");
     double r1=0;
     for(int i=0;i<8;++i){double t=kda_probe(o,cq,ck,cv,decay,beta,state,ts[i],300);if(i==0)r1=t;printf("PROBE recurrence_eff threads=%2d efficiency=%.3f\n",ts[i],r1/(t*ts[i]));}
-    munmap(blob,(size_t)st.st_size);close(fd);free(x);free(state);
+    free(blob);free(x);free(state);
     return finite?0:1;
 }
