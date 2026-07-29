@@ -267,7 +267,7 @@ def collective_seconds(nodes: int, batch: int, moe_collectives: int,
 
 
 def decode(split: WeightSplit, nodes: int, context: int, batch: int,
-           bw_gbps: float, router_down_gbps: float, head_bw_gbps: float, mxfp4_gbps: float,
+           bw_gbps: float, mla_bw_gbps: float, router_down_gbps: float, head_bw_gbps: float, mxfp4_gbps: float,
            kda_gops: float, latency_us: float,
            link_gbps: float, imbalance: float, expert_ms: float,
            expert_samples: int, moe_collectives: int,
@@ -314,7 +314,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
         expert_layer_ms, expert_p95_ms = critical_expert_ms(
             nodes, batch, expert_ms, expert_samples)
     expert_s = MOE_LAYERS * expert_layer_ms * 1e-3
-    cache_s = cache / bw_gbps
+    cache_s = cache / mla_bw_gbps
     # decay, prediction dot, delta update and output dot; measured single-head kernel.
     kda_ops = batch * KDA_LAYERS * math.ceil(HEADS / nodes) * HEAD_DIM * HEAD_DIM * 6
     kda_s = kda_ops / (kda_gops * 1e9)
@@ -408,7 +408,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"manifest: {split.source} ({split.shards} shards, {split.tensors:,} tensors)")
     print(f"text weights: {split.total_text:.3f} GB = experts {split.experts:.3f} + "
           f"replicated {split.replicated:.3f} + TP {split.shardable:.3f}")
-    print(f"calibration: dense-BW={args.bw_gbps:g} GB/s, router/down={args.router_down_gbps:g} GB/s, "
+    print(f"calibration: dense-BW={args.bw_gbps:g} GB/s, MLA-BW={args.mla_bw_gbps:g} GB/s, router/down={args.router_down_gbps:g} GB/s, "
           f"head-slice-BW={args.head_bw_gbps:g} GB/s, "
           f"MXFP4-BW={args.mxfp4_gbps:g} GB/s, "
           f"expert-M1={args.expert_ms:g} ms, "
@@ -445,7 +445,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"{'ctx':>5} {'M':>3} {'W ms':>7} {'Exp ms':>7} {'KV ms':>7} {'KDA':>7} {'comm':>7} {'tok/s':>9}")
     for ctx in args.contexts:
         for batch in args.batches:
-            d = decode(split,args.nodes,ctx,batch,args.bw_gbps,args.router_down_gbps,args.head_bw_gbps,
+            d = decode(split,args.nodes,ctx,batch,args.bw_gbps,args.mla_bw_gbps,args.router_down_gbps,args.head_bw_gbps,
                        args.mxfp4_gbps,args.kda_gops,
                        args.latency_us,args.link_gbps,args.imbalance,
                        args.expert_ms,args.expert_samples,args.moe_collectives,
@@ -467,7 +467,8 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
             result["prefill"].append(p)
             print(f"{fmt_ctx(tokens):>7} {chunk:6d} {p['gemm_s']:9.1f} {p['kda_s']:9.1f} "
                   f"{p['mla_attention_s']:9.1f} {p['comm_s']:9.1f} {p['tokens_per_second']:9.1f}")
-    print("\nCaveat: 128k/1m exact runtime needs context-parallel MLA; v1 only models it. "
+    print("\nCaveat: 128k M=1 fits the modeled 96-node memory budget but lacks a full-model run. "
+          "Exact 1m BF16 KV exceeds HBM even with perfect context sharding; it needs cache compression or weight-memory reduction. "
           "Predictions are engineering estimates, not measured end-to-end results.")
     return result
 
@@ -488,6 +489,8 @@ def main() -> None:
     p.add_argument("--usable-gb", type=float, default=USABLE_GB)
     p.add_argument("--kv-bytes", type=int, choices=(1,2), default=2)
     p.add_argument("--bw-gbps", type=float, default=336.0, help="effective per-rank decode bandwidth")
+    p.add_argument("--mla-bw-gbps", type=float, default=148.3,
+                   help="effective exact-BF16 MLA scan rate from the 12-node 128K sweep")
     p.add_argument("--router-down-gbps", type=float, default=283.7,
                    help="measured fused BF16 router+routed-down bandwidth")
     p.add_argument("--head-bw-gbps", type=float, default=172.5,

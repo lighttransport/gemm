@@ -20,7 +20,10 @@
 #ifndef TP_ALLREDUCE_H
 #define TP_ALLREDUCE_H
 
+#include <errno.h>
 #include <stdint.h>
+#include <setjmp.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -40,11 +43,21 @@
 #endif
 
 typedef struct {
+    int use_bf16, deterministic, robust;
+    int a2a, a2a_max;
+    int ack, ack_retx;
+    double ack_rtt, timeout;
+    unsigned long drop_n;
+} tp_comm_config;
+
+typedef struct {
     utofu_vcq_hdl_t vcq;
     utofu_vcq_id_t  peer_vcq[TP_AR_MAXN];
     utofu_stadd_t   peer_base[TP_AR_MAXN];   /* peers' TP_AR_STAG region base     */
     utofu_stadd_t   base;                    /* my region base stadd              */
     char           *region;                  /* send slot + TP_AR_NSTEP recv slots*/
+    size_t          region_size;
+    int             owns_region;
     size_t          slot;                    /* bytes per slot (payload+seq, aligned)*/
     int             stag;                    /* steering tag of THIS comm's region (sub-comms differ)*/
     int             my_rank, nprocs, max_count;
@@ -63,6 +76,7 @@ typedef struct {
     int             ack;                     /* 1 = reliable send (bounded retransmit + ack) */
     int             ack_retx;                /* max retransmits before optimistic proceed (TP_AR_ACK_RETX) */
     double          ack_rtt;                 /* retransmit interval seconds (TP_AR_ACK_RTT) */
+    double          timeout;
     size_t          ack_base;                /* byte offset of ack region (nprocs 8B slots + 1 scratch) */
     unsigned long   drop_n, put_ctr;         /* TP_AR_DROP=N: drop 1-in-N payload Puts (loss injection) */
     /* one outstanding send awaiting confirmation. send() is NON-blocking (Put + stash here); it is
@@ -72,7 +86,21 @@ typedef struct {
      * The send slot is untouched between send and confirm, so a retransmit re-Puts the correct payload. */
     int             pend_peer, pend_sid, pend_contig, pend_active, pend_retx;
     size_t          pend_pbytes; uint64_t pend_tok; double pend_t0;
+    jmp_buf         *failure_jmp;
+    int             error_code;
+    char            error_message[192];
 } tp_comm;
+
+static void tp_ar_fail(tp_comm *c,int code,const char *fmt,...) __attribute__((noreturn));
+static void tp_ar_fail(tp_comm *c,int code,const char *fmt,...){
+    va_list ap;va_start(ap,fmt);vsnprintf(c->error_message,sizeof c->error_message,fmt,ap);va_end(ap);
+    c->error_code=code;if(c->failure_jmp)longjmp(*c->failure_jmp,1);
+    fprintf(stderr,"tp_ar: %s\n",c->error_message);exit(1);
+}
+
+static const char *tp_comm_error(const tp_comm *c){
+    return c&&c->error_message[0]?c->error_message:"no collective error recorded";
+}
 
 static double tp_ar_now(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -202,11 +230,9 @@ static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
                 c->my_rank, what, sid, (unsigned long)tok, (unsigned long)*trl, spins >> 20);
             if (n > 0) { ssize_t w = write(2, b, (size_t)n); (void)w; }
         }
-        if (tp_ar_now() - t0 > TP_AR_TIMEOUT) {
-            fprintf(stderr, "tp_ar: rank %d %s timeout sid=%d want=%lu got=%lu\n",
-                    c->my_rank, what, sid, (unsigned long)tok, (unsigned long)*trl);
-            exit(1);
-        }
+        if(tp_ar_now()-t0>c->timeout)tp_ar_fail(c,ETIMEDOUT,
+            "rank %d %s timeout sid=%d want=%lu got=%lu",c->my_rank,what,sid,
+            (unsigned long)tok,(unsigned long)*trl);
     }
     if (c->robust) tp_ar_drain_mrq(c);   /* consume THIS recv's RMT_PUT notice (no leak) */
 }
@@ -217,9 +243,9 @@ static void tp_ar_put(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t dst
     int rc; void *cb;
     for (;;) { rc = utofu_put(c->vcq, c->peer_vcq[peer], src, dst, len, 0, flags, NULL);
                if (rc != UTOFU_ERR_BUSY) break; utofu_poll_tcq(c->vcq, 0, &cb); }
-    if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: utofu_put rc=%d\n", rc); exit(1); }
+    if(rc!=UTOFU_SUCCESS)tp_ar_fail(c,EIO,"utofu_put rc=%d",rc);
     do { rc = utofu_poll_tcq(c->vcq, 0, &cb); } while (rc == UTOFU_ERR_NOT_FOUND);
-    if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: poll_tcq rc=%d\n", rc); exit(1); }
+    if(rc!=UTOFU_SUCCESS)tp_ar_fail(c,EIO,"poll_tcq rc=%d",rc);
     tp_ar_drain_mrq(c);   /* consume receiver-side RMT_PUT notices → no MRQ overflow */
 }
 
@@ -367,7 +393,7 @@ static int tp_ar_put_nb(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t d
     int rc; void *cb;
     for (;;) { rc = utofu_put(c->vcq, c->peer_vcq[peer], src, dst, len, 0, flags, NULL);
                if (rc != UTOFU_ERR_BUSY) break; utofu_poll_tcq(c->vcq, 0, &cb); }
-    if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: utofu_put(nb) rc=%d\n", rc); exit(1); }
+    if(rc!=UTOFU_SUCCESS)tp_ar_fail(c,EIO,"utofu_put(nb) rc=%d",rc);
     return 1;
 }
 /* TP_AR_A2A sum: Put my payload to EVERY peer's a2a slot[gen][my_rank] (pipelined),
@@ -396,7 +422,7 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
     while (inflight > 0) {                                   /* reap local completions */
         rc = utofu_poll_tcq(c->vcq, 0, &cb);
         if (rc == UTOFU_SUCCESS) inflight--;
-        else if (rc != UTOFU_ERR_NOT_FOUND) { fprintf(stderr, "tp_ar: a2a poll_tcq rc=%d\n", rc); exit(1); }
+        else if(rc!=UTOFU_ERR_NOT_FOUND)tp_ar_fail(c,EIO,"a2a poll_tcq rc=%d",rc);
     }
     tp_ar_drain_mrq(c);
     for (int r = 0; r < N; r++) {                            /* fold in rank order */
@@ -422,8 +448,8 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
 static void tp_allreduce_sum_deterministic(tp_comm *c, float *buf, int count, uint64_t tok) {
     int nr=0; for(int step=1;step<c->nprocs;step<<=1) nr++;
     if(2*nr > TP_AR_NSTEP-1){
-        fprintf(stderr,"tp_ar: deterministic N=%d needs %d slots (max %d)\n",
-                c->nprocs,2*nr,TP_AR_NSTEP-1); exit(1);
+        tp_ar_fail(c,EINVAL,"deterministic N=%d needs %d slots (max %d)",
+                c->nprocs,2*nr,TP_AR_NSTEP-1);
     }
     int active=1;
     for(int k=0,step=1; k<nr && active; k++,step<<=1){
@@ -494,8 +520,8 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
 static void tp_allreduce_max_deterministic(tp_comm *c, float *buf, int count, uint64_t tok) {
     int nr=0; for(int step=1;step<c->nprocs;step<<=1) nr++;
     if(2*nr > TP_AR_NSTEP-1){
-        fprintf(stderr,"tp_ar: deterministic MAX N=%d needs %d slots (max %d)\n",
-                c->nprocs,2*nr,TP_AR_NSTEP-1); exit(1);
+        tp_ar_fail(c,EINVAL,"deterministic MAX N=%d needs %d slots (max %d)",
+                c->nprocs,2*nr,TP_AR_NSTEP-1);
     }
     int active=1;
     for(int k=0,step=1; k<nr && active; k++,step<<=1){
@@ -550,6 +576,23 @@ static void tp_allreduce_max(tp_comm *c, float *buf, int count) {
         if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);
         else { tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok); tp_ar_confirm(c); }
     }
+}
+
+static int tp_allreduce_checked(tp_comm *c,float *buf,int count,
+        void (*operation)(tp_comm*,float*,int)){
+    if(count<0||count>c->max_count){c->error_code=EINVAL;
+        snprintf(c->error_message,sizeof c->error_message,"count %d exceeds max_count %d",count,c->max_count);return EINVAL;}
+    jmp_buf failure;c->error_code=0;c->error_message[0]='\0';c->failure_jmp=&failure;
+    if(setjmp(failure)){c->failure_jmp=NULL;return c->error_code?c->error_code:EIO;}
+    operation(c,buf,count);c->failure_jmp=NULL;return 0;
+}
+
+static int tp_allreduce_sum_checked(tp_comm *c,float *buf,int count){
+    return tp_allreduce_checked(c,buf,count,tp_allreduce_sum);
+}
+
+static int tp_allreduce_max_checked(tp_comm *c,float *buf,int count){
+    return tp_allreduce_checked(c,buf,count,tp_allreduce_max);
 }
 
 /* Argmax send: copy 2-float payload (val + index-as-bits) into the send slot
@@ -653,7 +696,7 @@ static void tp_ar_send_argmax_n(tp_comm *c, int peer, int sid, const float *vi, 
 }
 static void tp_allreduce_argmax_n(tp_comm *c, float *vi, int n) {
     if (c->nprocs == 1) return;
-    if (2 * n > c->max_count) { fprintf(stderr, "tp_ar: argmax_n %d > max_count\n", n); exit(1); }
+    if(2*n>c->max_count)tp_ar_fail(c,EINVAL,"argmax_n %d > max_count",n);
     uint64_t tok = ++c->seq;
     int mr = c->my_rank, rem = c->rem;
     if (mr < 2 * rem) {
@@ -678,34 +721,66 @@ static void tp_allreduce_argmax_n(tp_comm *c, float *vi, int n) {
     }
 }
 
-/* Register the comm region (TP_AR_STAG) and query peers. `barrier_fn` must
- * globally synchronize all ranks (so every region is registered before the
- * stadd queries). Returns 0 on success. */
-static int tp_comm_init_ex(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *peer_vcq,
-                        int my_rank, int nprocs, int max_count, void (*barrier_fn)(void), int stag) {
+static tp_comm_config tp_comm_env_config(void) {
+    tp_comm_config o = {0};
+    o.use_bf16 = getenv("TP_AR_BF16") ? atoi(getenv("TP_AR_BF16")) : 0;
+    o.deterministic = getenv("TP_AR_DETERMINISTIC") ? atoi(getenv("TP_AR_DETERMINISTIC")) : 0;
+    o.robust = getenv("TP_AR_ROBUST") ? atoi(getenv("TP_AR_ROBUST")) : 1;
+    o.a2a = getenv("TP_AR_A2A") ? atoi(getenv("TP_AR_A2A")) : 0;
+    o.a2a_max = getenv("TP_AR_A2A_MAX") ? atoi(getenv("TP_AR_A2A_MAX")) : 8192;
+    o.ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
+    o.ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 64;
+    o.ack_rtt = getenv("TP_AR_ACK_RTT") ? atof(getenv("TP_AR_ACK_RTT")) : 0.001;
+    o.timeout = TP_AR_TIMEOUT;
+    o.drop_n = getenv("TP_AR_DROP") ? strtoul(getenv("TP_AR_DROP"), NULL, 10) : 0;
+    return o;
+}
+
+static size_t tp_comm_region_size(int nprocs, int max_count, const tp_comm_config *options) {
+    tp_comm_config fallback = { .robust=1, .a2a_max=8192, .ack_retx=64, .ack_rtt=0.001, .timeout=TP_AR_TIMEOUT };
+    const tp_comm_config *o = options ? options : &fallback;
+    int a2a_max=o->a2a_max>0?o->a2a_max:8192;if(a2a_max>max_count)a2a_max=max_count;
+    size_t slot=((size_t)max_count*sizeof(float)+8+(TP_AR_LINE-1))&~(size_t)(TP_AR_LINE-1);
+    size_t bytes=(size_t)(1+TP_AR_NSTEP)*slot+(o->ack?(size_t)(nprocs+1)*TP_AR_LINE:0);
+    size_t a2a_slot=((size_t)a2a_max*sizeof(float)+8+(TP_AR_LINE-1))&~(size_t)(TP_AR_LINE-1);
+    if(o->a2a)bytes+=(size_t)2*nprocs*a2a_slot;return bytes;
+}
+
+/* Register an optionally caller-owned comm region and query peers. */
+static int tp_comm_init_region_ex(tp_comm *c, utofu_vcq_hdl_t vcq,
+                        const utofu_vcq_id_t *peer_vcq,int my_rank,int nprocs,
+                        int max_count,void (*barrier_fn)(void),int stag,
+                        const tp_comm_config *options,void *external_region,size_t external_size) {
     if (nprocs > TP_AR_MAXN) { fprintf(stderr, "tp_ar: nprocs %d > %d\n", nprocs, TP_AR_MAXN); return -1; }
     memset(c, 0, sizeof *c);
     c->vcq = vcq; c->my_rank = my_rank; c->nprocs = nprocs; c->max_count = max_count; c->stag = stag;
     for (int r = 0; r < nprocs; r++) c->peer_vcq[r] = peer_vcq[r];
 
+    tp_comm_config env;if(!options){env=tp_comm_env_config();options=&env;}
+    c->use_bf16=options->use_bf16;c->deterministic=options->deterministic;
+    c->robust=options->robust;c->ack=options->ack;c->ack_retx=options->ack_retx;
+    c->ack_rtt=options->ack_rtt;c->timeout=options->timeout>0?options->timeout:TP_AR_TIMEOUT;
+    c->drop_n=options->drop_n;c->a2a=options->a2a;
+
     c->slot = ((size_t)max_count * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
     /* reliability prototype: an ack region of nprocs 8B slots (peer p writes its ack tok to ack[p])
      * plus one scratch slot the acking rank Puts FROM. Only allocated when TP_AR_ACK=1. */
-    c->ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
     c->ack_base = (size_t)(1 + TP_AR_NSTEP) * c->slot;
     size_t region_sz = c->ack_base + (c->ack ? (size_t)(nprocs + 1) * TP_AR_LINE : 0);
     /* TP_AR_A2A recv region: 2 generations x nprocs slots sized for a2a_max elems (small decode
      * payloads only), appended after the ack region. Generation double-buffering (slot picked by
      * seq&1) keeps a rank one reduce ahead from overwriting a slot its slow peer hasn't read. */
-    c->a2a = getenv("TP_AR_A2A") ? atoi(getenv("TP_AR_A2A")) : 0;
-    c->a2a_max = getenv("TP_AR_A2A_MAX") ? atoi(getenv("TP_AR_A2A_MAX")) : 8192;
+    c->a2a_max = options->a2a_max>0?options->a2a_max:8192;
     if (c->a2a_max > max_count) c->a2a_max = max_count;
     c->a2a_slot = ((size_t)c->a2a_max * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
     c->a2a_base = region_sz;
     if (c->a2a) region_sz += (size_t)2 * nprocs * c->a2a_slot;
-    if (posix_memalign((void **)&c->region, TP_AR_LINE, region_sz) != 0) {
-        fprintf(stderr, "tp_ar: posix_memalign failed\n"); return -1;
-    }
+    c->region_size=region_sz;
+    if(external_region){if(((uintptr_t)external_region&(TP_AR_LINE-1))||external_size<region_sz){
+            fprintf(stderr,"tp_ar: external region invalid: ptr=%p supplied=%zu required=%zu\n",external_region,external_size,region_sz);return-1;}
+        c->region=external_region;c->owns_region=0;
+    }else{if(posix_memalign((void **)&c->region,TP_AR_LINE,region_sz)!=0){
+            fprintf(stderr,"tp_ar: posix_memalign failed\n");return-1;}c->owns_region=1;}
     memset(c->region, 0, region_sz);
     /* Flush the dirty memset-zeros to DRAM BEFORE registration so the robust-path
      * poll-time `dc civac` (tp_ar_flag_inval) can only ever pull a landed Put down
@@ -716,14 +791,16 @@ static int tp_comm_init_ex(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t
     __asm__ __volatile__("dsb sy" ::: "memory");
 
     int rc = utofu_reg_mem_with_stag(vcq, c->region, region_sz, stag, 0, &c->base);
-    if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: reg_mem rc=%d\n", rc); return -1; }
+    if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: reg_mem rc=%d\n", rc);
+        if(c->owns_region)free(c->region);c->region=NULL;return -1; }
 
     if (barrier_fn) barrier_fn();        /* all regions registered before query */
 
     for (int r = 0; r < nprocs; r++) {
         if (r == my_rank) { c->peer_base[r] = c->base; continue; }
         rc = utofu_query_stadd(c->peer_vcq[r], stag, &c->peer_base[r]);
-        if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: query_stadd peer %d rc=%d\n", r, rc); return -1; }
+        if (rc != UTOFU_SUCCESS) { fprintf(stderr, "tp_ar: query_stadd peer %d rc=%d\n", r, rc);
+            utofu_dereg_mem(c->vcq,c->base,0);if(c->owns_region)free(c->region);c->region=NULL;return -1; }
     }
 
     /* recursive-doubling schedule */
@@ -731,26 +808,33 @@ static int tp_comm_init_ex(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t
     c->rem = nprocs - c->pof2;
     c->nrounds = 0; for (int x = 1; x < c->pof2; x <<= 1) c->nrounds++;
     c->bcast_sid = c->nrounds + 1;
-    if (c->bcast_sid >= TP_AR_NSTEP) { fprintf(stderr, "tp_ar: too many steps for N=%d\n", nprocs); return -1; }
+    if(c->bcast_sid>=TP_AR_NSTEP){fprintf(stderr,"tp_ar: too many steps for N=%d\n",nprocs);
+        utofu_dereg_mem(c->vcq,c->base,0);if(c->owns_region)free(c->region);c->region=NULL;return -1;}
     if (my_rank < 2 * c->rem) c->newrank = (my_rank % 2 == 0) ? -1 : my_rank / 2;
     else                      c->newrank = my_rank - c->rem;
     c->seq = 0;
-    c->use_bf16 = getenv("TP_AR_BF16") && atoi(getenv("TP_AR_BF16")) != 0;
-    c->deterministic = getenv("TP_AR_DETERMINISTIC") && atoi(getenv("TP_AR_DETERMINISTIC")) != 0;
-    c->robust   = getenv("TP_AR_ROBUST") ? atoi(getenv("TP_AR_ROBUST")) : 1;  /* default ON */
-    c->ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 64;
     /* retransmit interval: recovery latency is ~ack_rtt per lost Put. 1 ms is >> the µs-scale real
      * ack RTT + payload-reduce time (even a ~256 KB batched-prefill tile reduces in <~1 ms), so no
      * spurious retransmits, while giving ~20x faster loss recovery than the old 20 ms (validated 11n:
      * drop=50 119 -> 2244 reduce/s). ack_retx*ack_rtt = 64 ms optimistic-proceed budget. */
-    c->ack_rtt  = getenv("TP_AR_ACK_RTT")  ? atof(getenv("TP_AR_ACK_RTT"))  : 0.001;  /* 1 ms */
-    c->drop_n   = getenv("TP_AR_DROP") ? strtoul(getenv("TP_AR_DROP"), NULL, 10) : 0;
     c->put_ctr  = 0;
     if (my_rank == 0)
         fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s deterministic=%d robust=%d ack=%d%s\n",
                 nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32", c->deterministic, c->robust,
                 c->ack, c->drop_n ? " DROP-INJECT" : "");
     return 0;
+}
+
+static int tp_comm_init_ex(tp_comm *c, utofu_vcq_hdl_t vcq,const utofu_vcq_id_t *peer_vcq,
+                        int my_rank,int nprocs,int max_count,void (*barrier_fn)(void),int stag){
+    return tp_comm_init_region_ex(c,vcq,peer_vcq,my_rank,nprocs,max_count,barrier_fn,stag,NULL,NULL,0);
+}
+
+static int tp_comm_init_external(tp_comm *c,utofu_vcq_hdl_t vcq,const utofu_vcq_id_t *peer_vcq,
+                        int my_rank,int nprocs,int max_count,void (*barrier_fn)(void),
+                        const tp_comm_config *options,void *region,size_t region_size){
+    return tp_comm_init_region_ex(c,vcq,peer_vcq,my_rank,nprocs,max_count,barrier_fn,
+        TP_AR_STAG,options,region,region_size);
 }
 
 /* back-compat: the single-region all-reduce over the whole group (TP_AR_STAG). */
@@ -760,7 +844,8 @@ static int tp_comm_init(tp_comm *c, utofu_vcq_hdl_t vcq, const utofu_vcq_id_t *p
 }
 
 static void tp_comm_free(tp_comm *c) {
-    if (c->region) { utofu_dereg_mem(c->vcq, c->base, 0); free(c->region); c->region = NULL; }
+    if (c->region) { utofu_dereg_mem(c->vcq, c->base, 0);
+        if(c->owns_region)free(c->region);c->region = NULL; }
 }
 
 /* ======================= hierarchical (2-level) all-reduce =======================

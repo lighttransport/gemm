@@ -24,6 +24,7 @@ PROFILE=0
 REUSE_STAGE=0
 NO_FUSED_TEAM=0
 MLA_CACHE_BF16=1
+HEARTBEAT_TOKENS=1024
 
 usage() {
     cat >&2 <<EOF
@@ -32,6 +33,7 @@ usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
           [--profile] [--reuse-stage] [--no-fused-team]
           [--mla-cache-bf16|--mla-cache-fp32]
+          [--heartbeat-tokens N]
 EOF
 }
 need_value() { if (( $# < 2 )); then echo "$0: missing value for $1" >&2; usage; exit 2; fi; }
@@ -55,12 +57,13 @@ while (( $# )); do
         --no-fused-team) NO_FUSED_TEAM=1; shift;;
         --mla-cache-bf16) MLA_CACHE_BF16=1; shift;;
         --mla-cache-fp32) MLA_CACHE_BF16=0; shift;;
+        --heartbeat-tokens) need_value "$@"; HEARTBEAT_TOKENS=$2; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2;;
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
@@ -124,14 +127,14 @@ else
 fi
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" \
+    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?
 set -e
 
 passes=$(grep -l ' state=pass ' "$RESULT_DIR"/k3_rank*.status 2>/dev/null | wc -l || true)
-grep -hE 'K3_RUN|K3_RESULT|K3_HEALTH|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
+grep -hE 'K3_RUN|K3_PROGRESS|K3_RESULT|K3_HEALTH|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
 echo "K3 distributed result: rc=$runner_rc pass_markers=$passes/$NODES results=$RESULT_DIR"
 
 # Rank-local storage is job-scoped and is wiped by the scheduler. Deliberately

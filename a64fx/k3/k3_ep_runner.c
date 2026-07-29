@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <math.h>
 #include <omp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,9 @@
 #define K3_SELECTED 16
 #define K3_WAIT_TIMEOUT 120.0
 #define K3_RUN_STAG DEMO_STAG
+#define K3_RUN_REDUCE_FLOATS (K3_MOE_REDUCE_FLOATS+2)
+#define K3_CONTROL_SIGNAL K3_MOE_REDUCE_FLOATS
+#define K3_CONTROL_NUMERIC (K3_MOE_REDUCE_FLOATS+1)
 
 typedef enum { K3_MODE_DUMMY, K3_MODE_REAL } k3_mode;
 typedef struct {
@@ -42,6 +46,7 @@ typedef struct {
     int fused_threads;
     int fuse_kda_expert;
     int mla_cache_bf16;
+    int heartbeat_tokens;
     k3_mode mode;
     const char *stage_dir;
     const char *status_dir;
@@ -59,6 +64,9 @@ static utofu_vcq_id_t g_peer_vcq[K3_RUNNER_MAX_NODES];
 static utofu_stadd_t g_peer_base[K3_RUNNER_MAX_NODES];
 static uint64_t g_bar_token=1;
 static const unsigned long g_put_flags=UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
+static volatile sig_atomic_t g_stop_signal;
+
+static void handle_stop_signal(int sig){g_stop_signal=sig;}
 
 static double now_sec(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static void usage(const char *p){
@@ -67,7 +75,7 @@ static void usage(const char *p){
         "          [--threads N] [--layer N] [--stage-dir DIR]\n"
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
-        "          [--mla-cache-bf16|--mla-cache-fp32]\n",p);
+        "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n",p);
 }
 static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
     char *end=NULL;errno=0;long v=strtol(s,&end,10);
@@ -77,7 +85,7 @@ static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
 }
 static int parse_options(int argc,char **argv,k3_options *o){
     *o=(k3_options){.nodes=96,.layers=1,.tokens=2,.threads=48,.layer=1,
-        .mla_cache_bf16=1,
+        .mla_cache_bf16=1,.heartbeat_tokens=1024,
         .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.stage_dir="/local/k3-runner",
         .status_dir=".",.topo_path="tofu_topo.txt"};
     for(int i=1;i<argc;++i){const char *a=argv[i];
@@ -94,6 +102,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--no-fused-team")){o->fuse_kda_expert=0;}
         else if(!strcmp(a,"--mla-cache-bf16")){o->mla_cache_bf16=1;}
         else if(!strcmp(a,"--mla-cache-fp32")){o->mla_cache_bf16=0;}
+        else if(!strcmp(a,"--heartbeat-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->heartbeat_tokens))return-1;}
         else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
         else if(!strcmp(a,"--stage-dir")){VALUE();o->stage_dir=argv[i];}
         else if(!strcmp(a,"--status-dir")){VALUE();o->status_dir=argv[i];}
@@ -239,16 +248,33 @@ static int make_dummy_expert(k3_pool *pool,int rank,int expert,int local,k3_load
         memset(ws,110,sn);}
     out->blob=b;out->size=total;return 0;
 }
-static void write_status(const k3_options *o,const char *state,double seconds,double checksum,size_t peak){
+static void write_status(const k3_options *o,const char *state,const char *reason,
+        int tokens_completed,int last_layer,uint64_t collective_seq,
+        double seconds,double checksum,size_t peak){
     char path[1024],tmp[1088];int n=snprintf(path,sizeof path,"%s/k3_rank%03d.status",o->status_dir,g_rank);
     if(n<0||(size_t)n>=sizeof path)return;
     n=snprintf(tmp,sizeof tmp,"%s.tmp.%ld",path,(long)getpid());if(n<0||(size_t)n>=sizeof tmp)return;
     FILE *f=fopen(tmp,"wx");if(!f){fprintf(stderr,"k3_ep_runner rank %d: create status '%s': %s\n",g_rank,tmp,strerror(errno));return;}
-    int ok=fprintf(f,"rank=%d nodes=%d mode=%s state=%s layers=%d tokens=%d seconds=%.9f checksum=%+.9e peak_bytes=%zu\n",
-        g_rank,g_nodes,o->mode==K3_MODE_REAL?"real":"dummy",state,o->layers,o->tokens,seconds,checksum,peak)>=0;
+    int ok=fprintf(f,"rank=%d nodes=%d mode=%s state=%s reason=%s layers=%d tokens=%d tokens_completed=%d last_layer=%d collective_seq=%lu seconds=%.9f checksum=%+.9e peak_bytes=%zu\n",
+        g_rank,g_nodes,o->mode==K3_MODE_REAL?"real":"dummy",state,reason?reason:"none",
+        o->layers,o->tokens,tokens_completed,last_layer,(unsigned long)collective_seq,seconds,checksum,peak)>=0;
     if(ok)ok=fflush(f)==0;if(ok)ok=fsync(fileno(f))==0;if(fclose(f))ok=0;
     if(ok)ok=rename(tmp,path)==0;
     if(!ok){int saved=errno?errno:EIO;unlink(tmp);fprintf(stderr,"k3_ep_runner rank %d: publish status '%s': %s\n",g_rank,path,strerror(saved));}
+}
+
+static void write_progress(const k3_options *o,int tokens_completed,double seconds,
+        float latent_max,float state_max,float cache_max,float min_available_mib,uint64_t seq){
+    if(g_rank)return;char path[1024],tmp[1088];
+    int n=snprintf(path,sizeof path,"%s/k3_progress.status",o->status_dir);
+    if(n<0||(size_t)n>=sizeof path)return;
+    n=snprintf(tmp,sizeof tmp,"%s.tmp.%ld",path,(long)getpid());if(n<0||(size_t)n>=sizeof tmp)return;
+    FILE*f=fopen(tmp,"w");if(!f)return;
+    int ok=fprintf(f,"state=running tokens_completed=%d seconds=%.6f tokens_per_s=%.3f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e min_available_mib=%.1f collective_seq=%lu\n",
+        tokens_completed,seconds,seconds>0?tokens_completed/seconds:0.0,latent_max,state_max,cache_max,
+        min_available_mib,(unsigned long)seq)>=0;
+    if(ok)ok=fflush(f)==0;if(ok)ok=fsync(fileno(f))==0;if(fclose(f))ok=0;
+    if(ok)ok=rename(tmp,path)==0;if(!ok)unlink(tmp);
 }
 
 /* Config lists layers one-based. KDA occupies three of each four through layer
@@ -296,7 +322,7 @@ static void synthetic_attention_partial(float *shared,const float *latent,
         int state_slot,int global_layer,int token,int cache_tokens,int local_heads,int first_head,
         float *kda_state,void *mla_keys,void *mla_values,int mla_cache_bf16,
         float *q,float *k,float *v,float *decay,float *attn_out,
-        float *mla_scratch,float *mla_stats,int threads){
+        float *mla_scratch,float *mla_stats,float *cache_running_max,int threads){
     int is_kda=layer_is_kda(global_layer);
     omp_set_num_threads(threads);
     synthetic_attention_prepare(shared,latent,global_layer,token,local_heads,first_head,
@@ -311,8 +337,10 @@ static void synthetic_attention_partial(float *shared,const float *latent,
             for(int h=0;h<local_heads;++h){size_t base=(size_t)state_slot*local_heads+h;
                 uint16_t *kh=keys+(base*(size_t)cache_tokens+token)*192;
                 uint16_t *vh=values+(base*(size_t)cache_tokens+token)*K3_HEAD_DIM;
-                for(int d=0;d<192;++d)kh[d]=k3_f32_to_bf16_rne(k[(size_t)h*192+d]);
-                for(int d=0;d<K3_HEAD_DIM;++d)vh[d]=k3_f32_to_bf16_rne(v[(size_t)h*K3_HEAD_DIM+d]);}
+                for(int d=0;d<192;++d){kh[d]=k3_f32_to_bf16_rne(k[(size_t)h*192+d]);
+                    float a=fabsf(k3_bf16_to_f32(kh[d]));if(a>*cache_running_max)*cache_running_max=a;}
+                for(int d=0;d<K3_HEAD_DIM;++d){vh[d]=k3_f32_to_bf16_rne(v[(size_t)h*K3_HEAD_DIM+d]);
+                    float a=fabsf(k3_bf16_to_f32(vh[d]));if(a>*cache_running_max)*cache_running_max=a;}}
             const uint16_t *layer_keys=keys+(size_t)state_slot*local_heads*cache_tokens*192;
             const uint16_t *layer_values=values+(size_t)state_slot*local_heads*cache_tokens*K3_HEAD_DIM;
             if(token+1<128){
@@ -326,7 +354,9 @@ static void synthetic_attention_partial(float *shared,const float *latent,
             for(int h=0;h<local_heads;++h){size_t base=(size_t)state_slot*local_heads+h;
                 float *kh=keys+(base*(size_t)cache_tokens+token)*192;
                 float *vh=values+(base*(size_t)cache_tokens+token)*K3_HEAD_DIM;
-                memcpy(kh,k+(size_t)h*192,192*sizeof(float));memcpy(vh,v+(size_t)h*K3_HEAD_DIM,K3_HEAD_DIM*sizeof(float));}
+                memcpy(kh,k+(size_t)h*192,192*sizeof(float));memcpy(vh,v+(size_t)h*K3_HEAD_DIM,K3_HEAD_DIM*sizeof(float));
+                for(int d=0;d<192;++d){float a=fabsf(kh[d]);if(a>*cache_running_max)*cache_running_max=a;}
+                for(int d=0;d<K3_HEAD_DIM;++d){float a=fabsf(vh[d]);if(a>*cache_running_max)*cache_running_max=a;}}
             const float *layer_keys=keys+(size_t)state_slot*local_heads*cache_tokens*192;
             const float *layer_values=values+(size_t)state_slot*local_heads*cache_tokens*K3_HEAD_DIM;
             if(token+1<128){
@@ -370,6 +400,8 @@ static int synthetic_kda_expert_partial(float *shared,float *partial,const float
 
 int main(int argc,char **argv){
     k3_options opt;int parsed=parse_options(argc,argv,&opt);if(parsed)return parsed>0?0:2;
+    struct sigaction sa;memset(&sa,0,sizeof sa);sa.sa_handler=handle_stop_signal;
+    sigemptyset(&sa.sa_mask);sigaction(SIGINT,&sa,NULL);sigaction(SIGTERM,&sa,NULL);
     omp_set_num_threads(opt.threads);
     static uint8_t topo[K3_RUNNER_MAX_NODES][TOFU_NCOORDS];int topo_n=read_topology(opt.topo_path,topo);
     if(topo_n<0)return 2;if(topo_n!=opt.nodes){fprintf(stderr,"k3_ep_runner: topology has %d ranks but --nodes is %d\n",topo_n,opt.nodes);return 2;}
@@ -393,8 +425,17 @@ int main(int argc,char **argv){
         if(rc==UTOFU_SUCCESS)rc=utofu_query_stadd(g_peer_vcq[r],K3_RUN_STAG,&g_peer_base[r]);
         if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: peer %d bootstrap rc=%d\n",g_rank,r,rc);return 3;}}
     free(tnis);runner_barrier();
-    tp_comm comm;if(tp_comm_init(&comm,g_vcq,g_peer_vcq,g_rank,g_nodes,K3_MOE_REDUCE_FLOATS,runner_barrier)){
-        fprintf(stderr,"k3_ep_runner rank %d: all-reduce initialization failed\n",g_rank);return 3;}
+    tp_comm_config comm_config={.robust=1,.a2a_max=8192,.ack_retx=64,.ack_rtt=0.001,.timeout=120.0};
+    if(opt.profile&&getenv("K3_DEBUG_COMM_DROP_N")){
+        comm_config.drop_n=strtoul(getenv("K3_DEBUG_COMM_DROP_N"),NULL,10);
+        if(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))comm_config.timeout=atof(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))*1e-3;}
+    size_t comm_region_size=tp_comm_region_size(g_nodes,K3_RUN_REDUCE_FLOATS,&comm_config);
+    void *comm_region=k3_pool_alloc(&pool,comm_region_size);
+    if(!comm_region){fprintf(stderr,"k3_ep_runner rank %d: %s\n",g_rank,k3_pool_error(&pool));return 3;}
+    tp_comm comm;if(tp_comm_init_external(&comm,g_vcq,g_peer_vcq,g_rank,g_nodes,
+            K3_RUN_REDUCE_FLOATS,runner_barrier,&comm_config,comm_region,comm_region_size)){
+        fprintf(stderr,"k3_ep_runner rank %d: all-reduce initialization failed\n",g_rank);
+        utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
     runner_barrier();
 
     int local=partition_count(96,g_rank,g_nodes)*K3_EXPERT_TP_BLOCK,ready=1;
@@ -402,10 +443,13 @@ int main(int argc,char **argv){
     for(int e=0;e<K3_SELECTED;++e){int bad=opt.mode==K3_MODE_REAL?
         load_real_expert(&pool,opt.stage_dir,opt.layer,e,local,&experts[e]):
         make_dummy_expert(&pool,g_rank,e,local,&experts[e]);if(bad){ready=0;break;}}
-    float ready_sum=(float)ready;tp_allreduce_sum(&comm,&ready_sum,1);
+    float ready_sum=(float)ready;int collective_rc=tp_allreduce_sum_checked(&comm,&ready_sum,1);
+    if(collective_rc){fprintf(stderr,"k3_ep_runner rank %d: readiness collective failed: %s\n",g_rank,tp_comm_error(&comm));
+        write_status(&opt,"comm-failed","weight-readiness",0,-1,comm.seq,0,0,pool.peak_active_bytes);
+        tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
     if((int)lrintf(ready_sum)!=g_nodes){
         if(g_rank==0)fprintf(stderr,"k3_ep_runner: distributed weight readiness failed (%d/%d ranks ready)\n",(int)lrintf(ready_sum),g_nodes);
-        write_status(&opt,"load-failed",0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
+        write_status(&opt,"load-failed","weight-load",0,-1,comm.seq,0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
         utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 4;}
 
     k3_mxfp4_matrix w1[K3_SELECTED],w2[K3_SELECTED],w3[K3_SELECTED];float route[K3_SELECTED];
@@ -413,7 +457,7 @@ int main(int argc,char **argv){
     float *latent=k3_pool_alloc(&pool,K3_LATENT*sizeof(float));
     float *partial=k3_pool_alloc(&pool,K3_LATENT*sizeof(float));
     float *shared=k3_pool_calloc(&pool,K3_HIDDEN,sizeof(float));
-    float *reduce=k3_pool_alloc(&pool,K3_MOE_REDUCE_FLOATS*sizeof(float));
+    float *reduce=k3_pool_alloc(&pool,K3_RUN_REDUCE_FLOATS*sizeof(float));
     float *gate=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
     float *up=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
     int local_heads=partition_count(96,g_rank,g_nodes),first_head=partition_first(96,g_rank,g_nodes);
@@ -440,38 +484,77 @@ int main(int argc,char **argv){
     float *mla_stats=k3_pool_alloc(&pool,((size_t)local_heads*opt.threads*2+(size_t)local_heads*2)*sizeof(float));
     ready=capacity_ok&&latent&&partial&&shared&&reduce&&gate&&up&&(!kda_elems||kda_state)&&
         (!mla_key_elems||mla_keys)&&(!mla_value_elems||mla_values)&&q&&k&&v&&decay&&attn_out&&mla_scratch&&mla_stats;
-    ready_sum=(float)ready;tp_allreduce_sum(&comm,&ready_sum,1);
+    ready_sum=(float)ready;collective_rc=tp_allreduce_sum_checked(&comm,&ready_sum,1);
+    if(collective_rc){fprintf(stderr,"k3_ep_runner rank %d: allocation collective failed: %s\n",g_rank,tp_comm_error(&comm));
+        write_status(&opt,"comm-failed","allocation-readiness",0,-1,comm.seq,0,0,pool.peak_active_bytes);
+        tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
     if((int)lrintf(ready_sum)!=g_nodes){if(!ready&&pool.error[0])fprintf(stderr,"%s\n",k3_pool_error(&pool));
         if(g_rank==0)fprintf(stderr,"k3_ep_runner: distributed scratch allocation failed (%d/%d ranks ready)\n",(int)lrintf(ready_sum),g_nodes);
-        write_status(&opt,"alloc-failed",0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
+        write_status(&opt,"alloc-failed","state-allocation",0,-1,comm.seq,0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
         utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 4;}
     for(int i=0;i<K3_LATENT;++i)latent[i]=sinf((float)(i+1)*0.001f)*0.125f;
 
-    runner_barrier();double start=now_sec(),phase[6]={0};int finite=1;
-    for(int token=0;token<opt.tokens;++token)for(int layer=0;layer<opt.layers;++layer){int global_layer=opt.layer+layer;
-        int fused=opt.fuse_kda_expert&&global_layer>0&&layer_is_kda(global_layer);double pt=0;
-        if(fused){double ft[2]={0};if(synthetic_kda_expert_partial(shared,partial,latent,
-                state_slot[layer],global_layer,token,local_heads,first_head,kda_state,q,k,v,decay,attn_out,
-                w1,w2,w3,route,gate,up,opt.fused_threads,opt.profile,ft))finite=0;
-            if(opt.profile){phase[0]+=ft[0];phase[2]+=ft[1];}}
-        else{pt=opt.profile?now_sec():0;
-            synthetic_attention_partial(shared,latent,state_slot[layer],global_layer,token,opt.tokens,local_heads,first_head,
-                kda_state,mla_keys,mla_values,opt.mla_cache_bf16,q,k,v,decay,attn_out,mla_scratch,mla_stats,
-                layer_is_kda(global_layer)?opt.kda_threads:opt.threads);
-            if(opt.profile)phase[layer_is_kda(global_layer)?0:1]+=now_sec()-pt;
-            pt=opt.profile?now_sec():0;
-            if(global_layer==0)memset(partial,0,K3_LATENT*sizeof(float));
-            else if(k3_expert_tp_forward_selected_mxfp4(partial,w1,w2,w3,route,K3_SELECTED,latent,gate,up,NULL,opt.threads))finite=0;
-            if(opt.profile)phase[2]+=now_sec()-pt;}
-        pt=opt.profile?now_sec():0;
-        k3_moe_pack_reduce(reduce,partial,shared);
-        if(opt.profile)phase[3]+=now_sec()-pt;pt=opt.profile?now_sec():0;
-        tp_allreduce_sum(&comm,reduce,K3_MOE_REDUCE_FLOATS);
-        if(opt.profile)phase[4]+=now_sec()-pt;pt=opt.profile?now_sec():0;
-        residual_update(latent,reduce);for(int i=0;i<K3_LATENT;++i)finite&=isfinite(latent[i]);
-        if(opt.profile)phase[5]+=now_sec()-pt;
+    int debug_rank=-1,debug_token=-1,debug_layer=-1;
+    if(opt.profile&&getenv("K3_DEBUG_NAN_RANK")){debug_rank=atoi(getenv("K3_DEBUG_NAN_RANK"));
+        debug_token=getenv("K3_DEBUG_NAN_TOKEN")?atoi(getenv("K3_DEBUG_NAN_TOKEN")):-1;
+        debug_layer=getenv("K3_DEBUG_NAN_LAYER")?atoi(getenv("K3_DEBUG_NAN_LAYER")):-1;}
+    runner_barrier();double start=now_sec(),phase[6]={0};int finite=1,stopped=0,comm_failed=0;
+    int stop_numeric=0,stop_signal=0,tokens_completed=0,last_layer=-1;float cache_running_max=0.0f;
+    for(int token=0;token<opt.tokens&&!stopped;++token){
+        for(int layer=0;layer<opt.layers;++layer){int global_layer=opt.layer+layer;
+            if(!finite||g_stop_signal){memset(reduce,0,K3_RUN_REDUCE_FLOATS*sizeof(float));
+                reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
+                reduce[K3_CONTROL_NUMERIC]=finite?0.0f:1.0f;
+                if(tp_allreduce_sum_checked(&comm,reduce,K3_RUN_REDUCE_FLOATS)){
+                    fprintf(stderr,"k3_ep_runner rank %d: stop collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=stopped=1;break;}
+                stop_signal=reduce[K3_CONTROL_SIGNAL]>0;stop_numeric=reduce[K3_CONTROL_NUMERIC]>0;stopped=1;break;}
+            int fused=opt.fuse_kda_expert&&global_layer>0&&layer_is_kda(global_layer);double pt=0;
+            if(fused){double ft[2]={0};if(synthetic_kda_expert_partial(shared,partial,latent,
+                    state_slot[layer],global_layer,token,local_heads,first_head,kda_state,q,k,v,decay,attn_out,
+                    w1,w2,w3,route,gate,up,opt.fused_threads,opt.profile,ft))finite=0;
+                if(opt.profile){phase[0]+=ft[0];phase[2]+=ft[1];}}
+            else{pt=opt.profile?now_sec():0;
+                synthetic_attention_partial(shared,latent,state_slot[layer],global_layer,token,opt.tokens,local_heads,first_head,
+                    kda_state,mla_keys,mla_values,opt.mla_cache_bf16,q,k,v,decay,attn_out,mla_scratch,mla_stats,
+                    &cache_running_max,layer_is_kda(global_layer)?opt.kda_threads:opt.threads);
+                if(opt.profile)phase[layer_is_kda(global_layer)?0:1]+=now_sec()-pt;
+                pt=opt.profile?now_sec():0;
+                if(global_layer==0)memset(partial,0,K3_LATENT*sizeof(float));
+                else if(k3_expert_tp_forward_selected_mxfp4(partial,w1,w2,w3,route,K3_SELECTED,latent,gate,up,NULL,opt.threads))finite=0;
+                if(opt.profile)phase[2]+=now_sec()-pt;}
+            pt=opt.profile?now_sec():0;k3_moe_pack_reduce(reduce,partial,shared);
+            reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
+            reduce[K3_CONTROL_NUMERIC]=finite?0.0f:1.0f;
+            if(opt.profile)phase[3]+=now_sec()-pt;pt=opt.profile?now_sec():0;
+            if(tp_allreduce_sum_checked(&comm,reduce,K3_RUN_REDUCE_FLOATS)){
+                fprintf(stderr,"k3_ep_runner rank %d: layer collective failed at token=%d layer=%d: %s\n",
+                    g_rank,token,global_layer,tp_comm_error(&comm));comm_failed=stopped=1;break;}
+            if(opt.profile)phase[4]+=now_sec()-pt;
+            if(reduce[K3_CONTROL_SIGNAL]>0||reduce[K3_CONTROL_NUMERIC]>0){
+                stop_signal=reduce[K3_CONTROL_SIGNAL]>0;stop_numeric=reduce[K3_CONTROL_NUMERIC]>0;stopped=1;break;}
+            pt=opt.profile?now_sec():0;residual_update(latent,reduce);last_layer=global_layer;
+            if(g_rank==debug_rank&&token==debug_token&&global_layer==debug_layer)latent[0]=NAN;
+            for(int i=0;i<K3_LATENT;++i)finite&=isfinite(latent[i]);
+            if(opt.profile)phase[5]+=now_sec()-pt;
+        }
+        if(!stopped&&finite)tokens_completed=token+1;
+        int heartbeat=opt.heartbeat_tokens>0&&((token+1)%opt.heartbeat_tokens==0||token+1==opt.tokens);
+        if(!stopped&&heartbeat){float latent_now=0,state_now=0;
+            for(int i=0;i<K3_LATENT;++i){float a=fabsf(latent[i]);if(a>latent_now)latent_now=a;}
+#pragma omp parallel for reduction(max:state_now)
+            for(size_t i=0;i<kda_elems;++i){float a=fabsf(kda_state[i]);if(a>state_now)state_now=a;}
+            float hb[6]={g_stop_signal?1.0f:0.0f,finite?0.0f:1.0f,latent_now,state_now,
+                cache_running_max,-(float)(k3_mem_available_bytes()/1048576.0)};
+            if(tp_allreduce_max_checked(&comm,hb,6)){
+                fprintf(stderr,"k3_ep_runner rank %d: heartbeat collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=stopped=1;break;}
+            stop_signal=hb[0]>0;stop_numeric=hb[1]>0;
+            if(stop_signal||stop_numeric)stopped=1;
+            double elapsed=now_sec()-start;write_progress(&opt,tokens_completed,elapsed,hb[2],hb[3],hb[4],-hb[5],comm.seq);
+            if(g_rank==0){printf("K3_PROGRESS tokens=%d/%d elapsed_s=%.3f tokens_per_s=%.3f min_available_MiB=%.1f latent_max=%.6e state_max=%.6e cache_max=%.6e collective_seq=%lu\n",
+                tokens_completed,opt.tokens,elapsed,elapsed>0?tokens_completed/elapsed:0.0,-hb[5],hb[2],hb[3],hb[4],(unsigned long)comm.seq);fflush(stdout);}
+        }
     }
-    runner_barrier();double seconds=now_sec()-start,checksum=0,norm2=0;
+    if(!comm_failed)runner_barrier();double seconds=now_sec()-start,checksum=0,norm2=0;
     float latent_max=0,state_max=0,cache_max=0;
     for(int i=0;i<K3_LATENT;++i){float a=fabsf(latent[i]);checksum+=latent[i];norm2+=(double)latent[i]*latent[i];if(a>latent_max)latent_max=a;}
 #pragma omp parallel for reduction(max:state_max)
@@ -486,28 +569,36 @@ int main(int argc,char **argv){
         for(size_t i=0;i<mla_key_elems;++i){float a=fabsf(keys[i]);if(a>cache_max)cache_max=a;}
 #pragma omp parallel for reduction(max:cache_max)
         for(size_t i=0;i<mla_value_elems;++i){float a=fabsf(values[i]);if(a>cache_max)cache_max=a;}}
-    float health[3]={latent_max,state_max,cache_max};tp_allreduce_max(&comm,health,3);
-    float checksum_sum=(float)checksum;tp_allreduce_sum(&comm,&checksum_sum,1);
-    double disagreement=fabs((double)checksum_sum/g_nodes-checksum);
-    finite&=isfinite(checksum)&&isfinite(norm2)&&disagreement<1e-4;
-    write_status(&opt,finite?"pass":"fail",seconds,checksum,pool.peak_active_bytes);
-    if(g_rank==0){double steps=(double)opt.layers*opt.tokens;
+    float health[3]={latent_max,state_max,cache_max};float checksum_sum=(float)checksum;
+    if(!comm_failed&&(tp_allreduce_max_checked(&comm,health,3)||
+            tp_allreduce_sum_checked(&comm,&checksum_sum,1))){
+        fprintf(stderr,"k3_ep_runner rank %d: final health collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=1;}
+    if(opt.profile&&!comm_failed)for(int i=0;i<6;++i){float x=(float)phase[i];
+        if(tp_allreduce_max_checked(&comm,&x,1)){fprintf(stderr,"k3_ep_runner rank %d: profile collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=1;break;}phase[i]=x;}
+    double disagreement=comm_failed?INFINITY:fabs((double)checksum_sum/g_nodes-checksum);
+    finite&=!comm_failed&&isfinite(checksum)&&isfinite(norm2)&&disagreement<1e-4;
+    if(!finite)stop_numeric=1;
+    const char *final_state=comm_failed?"comm-failed":stop_signal?"stopped":stop_numeric?"numeric-failed":"pass";
+    const char *final_reason=comm_failed?"collective-error":stop_signal?(g_stop_signal==SIGINT?"signal-int":g_stop_signal==SIGTERM?"signal-term":"signal-peer"):
+        stop_numeric?"non-finite":"complete";
+    write_status(&opt,final_state,final_reason,tokens_completed,last_layer,comm.seq,seconds,checksum,pool.peak_active_bytes);
+    if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
         printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s\n",
             opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32");
-        printf("K3_RESULT status=%s wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f\n",
-            finite?"PASS":"FAIL",seconds,steps/seconds,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0);
+        printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
+            !comm_failed&&!stop_signal&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal?"STOPPED":"FAIL",final_reason,tokens_completed,
+            seconds,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)comm.seq);
         printf("K3_HEALTH kda_slots=%d mla_slots=%d state_MiB=%.2f mla_cache_MiB=%.2f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e\n",
             kda_layers,mla_layers,kda_elems*sizeof(float)/1048576.0,
             (mla_key_elems+mla_value_elems)*cache_element_bytes/1048576.0,health[0],health[1],health[2]);
         fflush(stdout);}
-    if(opt.profile){const char *names[6]={"kda","mla","expert","pack","allreduce","residual"};double steps=(double)opt.layers*opt.tokens;
-        for(int i=0;i<6;++i){float x=(float)phase[i];tp_allreduce_max(&comm,&x,1);phase[i]=x;}
+    if(opt.profile&&!comm_failed){const char *names[6]={"kda","mla","expert","pack","allreduce","residual"};double steps=(double)opt.layers*tokens_completed;if(steps<1)steps=1;
         if(g_rank==0){double sum=0;for(int i=0;i<6;++i)sum+=phase[i];
             printf("K3_PROFILE rank_max_ms_per_layer");for(int i=0;i<6;++i)printf(" %s=%.4f",names[i],phase[i]*1e3/steps);
             printf(" measured_upper=%.4f upper_pct=%.1f\n",sum*1e3/steps,seconds>0?100.0*sum/seconds:0.0);
         fflush(stdout);}
     }
-    runner_barrier();tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
-    return finite?0:1;
+    if(!comm_failed)runner_barrier();tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
+    return comm_failed?3:stop_signal?5:stop_numeric?1:0;
 }

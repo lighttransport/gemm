@@ -100,7 +100,11 @@ Truncated generation is not expected to produce meaningful text; its purpose is 
 
 The default report will cover decode batches 1, 8, and 32 at 4K, 128K, and 1M context, plus prefill prompts of 1K, 8K, 128K, and 1M tokens with chunk sizes 64, 256, and 1024. Six-node kernel and collective measurements will replace inherited GLM/DS4F calibration constants where available.
 
-Exact 1M-context runtime is not part of v1. The simulator will describe the required follow-up context-parallel MLA design: context-sharded cache, query/gate gathers, distributed attention statistics, flash-combine, and output reduction.
+Exact 1M-context runtime is not part of v1. Context-parallel MLA can distribute the
+scan work, but cannot reduce the cluster-average KV bytes once all 96 ranks participate.
+The 1M design therefore also needs validated cache compression or lower weight memory;
+query gathers, distributed attention statistics, flash-combine, and output reduction
+remain relevant performance work after capacity is solved.
 
 ## Deliverables
 
@@ -165,7 +169,8 @@ text checkpoint as follows (decimal GB):
 At 96 ranks the fullest rank is modeled at 23.35 GB of weights. With expanded BF16 MLA
 K/V and a 27 GB usable budget, 4K context fits through batch 32, and 128K fits only at
 batch 1. One-million-token context does not fit even at batch 1 (39.81 GB total), which
-confirms that context-parallel MLA is required rather than optional.
+confirms that a cache/weight capacity reduction is required; context sharding alone
+cannot change the average bytes per rank.
 
 With the current default assumptions (336 GB/s large-matrix bandwidth, measured
 131.8 GB/s cache-evicted head-slice bandwidth, 180 GB/s 48-core MXFP4 bandwidth,
@@ -243,7 +248,7 @@ small head-TP attention slices, 180 GB/s full-node MXFP4 bandwidth, 1.25 TFLOP/s
 BF16-equivalent GEMM per node, 20 microseconds per
 recursive-doubling collective step, and a 1.20 routed-expert imbalance factor. The
 modeled 96-node 1M prefill rate is about 37 token/s, but it cannot run with the v1 cache
-layout; context-parallel MLA is required.
+layout; exact 1M additionally requires cache compression or lower weight residency.
 
 ## Real partial KDA probe
 
@@ -738,6 +743,56 @@ a64fx/k3/run_k3_ep.sh --mode dummy --nodes 12 --layer 3 --layers 1 \
 a64fx/k3/run_k3_ep.sh --mode dummy --nodes 12 --layer 3 --layers 1 \
   --tokens 16384 --threads 48 --kda-threads 8 --mla-cache-fp32 --profile
 ```
+
+### Exact 128K runner hardening
+
+Online MLA now branches on the running maximum so exactly one exponential is evaluated
+per cached token; the other online-softmax weight is mathematically one. Token-block
+parallelism uses `ceil(threads/local_heads)` parts per head instead of assigning every
+thread to every head. TP=12 therefore uses six parts for each of eight local heads,
+while TP=96 retains 48 parts for its one local head. All serial/parallel, FP32/BF16,
+and extreme-logit tests retain their previous tolerances. At 16K the BF16 MLA phase
+fell from 0.3829 to 0.3535 ms/step and total throughput rose from 1,330 to 1,377
+layer-steps/s. A strided interleaved K/V kernel is covered by correctness tests, but
+was rejected for the runner: it measured 0.3711 versus 0.3535 ms at 16K and 0.6349
+versus 0.6287 ms at 32K, with identical checksums.
+
+`--heartbeat-tokens N` defaults to 1024. Rank 0 atomically publishes
+`k3_progress.status` with completed tokens, elapsed rate, global latent/KDA/cache
+maxima, minimum `MemAvailable`, and collective sequence. Cache maxima are accumulated
+while appending K/V, avoiding a growing-cache scan at every heartbeat. SIGINT,
+SIGTERM, and non-finite state use two control floats appended to the existing fused
+layer allreduce, so no per-token collective was added. Completion records now include
+the reason, completed token count, last layer, and sequence. A rank-0 NaN injection
+produced 12/12 `numeric-failed` records at sequence 380; SIGTERM delivered to one rank
+produced 12/12 stopped records at sequence 1311 without stranding peers.
+
+The allreduce region is sized explicitly and allocated by the runner's 256-byte-aligned,
+NUMA-aware pool. K3 passes an explicit robust communication configuration rather than
+operational environment variables. Checked SUM/MAX entry points unwind uTofu errors
+and timeouts to the runner, allowing `comm-failed` status publication; legacy callers
+retain the original terminating wrappers.
+With every debug Put dropped and a 200 ms profiling timeout, all 12 ranks unwound the
+first readiness collective and atomically reported `comm-failed` at sequence 1; no
+process called the legacy hard-exit path or waited for the production timeout.
+
+Two long real-TNI tests completed on job `49852817`:
+
+- Real layer-1 KDA+MoE ran 131,072 steps in 54.06 seconds (2,425 layer-steps/s),
+  reached collective sequence 131,080, kept `kda_state_max=0.110`, and had rank
+  disagreement `1.6e-7`.
+- One exact BF16 MLA+MoE layer ran the complete 128K sequential sweep in 346.84
+  seconds, reached sequence 131,084, used 640 MiB KV/rank, kept
+  `mla_cache_max=0.1387`, and had rank disagreement `6.9e-6`. Its average MLA phase
+  was 2.262 ms/step over the quadratic sweep.
+
+The 128K sweep implies 148.3 GB/s effective per-rank exact-MLA scan throughput, now
+modeled separately from dense-weight bandwidth by `k3_sim.py --mla-bw-gbps`. At 96
+nodes the revised model reports 9.56 token/s for 128K M=1 versus 10.93 token/s at 4K.
+A full TP=12 1M request is rejected collectively before allocation (122,914 MiB/rank
+required). At 96 nodes, exact 1M BF16 KV plus the fullest weight shard is still modeled
+at 39.81 GB/rank; context sharding alone does not reduce this average, so 1M remains
+out of scope pending a validated capacity reduction.
 
 The real layer-1 KDA+MoE path also completed 65,536 recurrent steps on all 12 ranks in
 27.12 seconds (2,416 partial layer-steps/s). Latent RMS remained 7.4833,
