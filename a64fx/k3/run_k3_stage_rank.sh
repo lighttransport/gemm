@@ -17,17 +17,23 @@ if [ -e "$stage_dir" ]; then
     echo "$0: refusing to overwrite pre-existing rank-local stage: $stage_dir" >&2
     exit 2
 fi
+stage_tmp="${stage_dir}.tmp.rank${rank}.$$"
+if [ -e "$stage_tmp" ]; then
+    echo "$0: temporary stage path already exists: $stage_tmp" >&2
+    exit 2
+fi
 
 PYTHONDONTWRITEBYTECODE=1 python3 "$script_dir/k3_stage.py" \
-    --model-dir "$model_dir" --output-dir "$stage_dir" \
+    --model-dir "$model_dir" --output-dir "$stage_tmp" \
     --layer "$layer" --experts "$experts" --nodes "$nodes" --rank "$rank" \
     --expert-tp --tp-size "$nodes" --tp-rank "$rank" \
     --chunk-mib "$chunk_mib"
 
-marker="$stage_dir/stage-rank$(printf '%03d' "$rank").status"
+marker="$stage_tmp/stage-rank$(printf '%03d' "$rank").status"
 marker_tmp="$marker.tmp.$$"
 trap 'rm -f "$marker_tmp"' EXIT HUP INT TERM
 printf 'rank=%s nodes=%s layer=%s experts=%s\n' "$rank" "$nodes" "$layer" "$experts" > "$marker_tmp"
-sync -f "$marker_tmp"
 mv "$marker_tmp" "$marker"
 trap - EXIT HUP INT TERM
+sync -f "$marker"
+mv -T "$stage_tmp" "$stage_dir"

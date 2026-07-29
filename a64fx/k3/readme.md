@@ -736,6 +736,27 @@ size before constructing matrix views. The retained 16-expert layer-1 stage pass
 new checks on all 12 ranks. Topology parsing now rejects coordinates outside the
 stored byte range and duplicate physical coordinates before uTofu peer construction.
 
+Newly staged expert blobs use the `K3EXPERTV2` manifest header with a CRC32 over the
+complete aligned blob. The stager computes it through bounded reads of its already
+local temporary file, then drops those pages; it does not reread checkpoint payloads
+from shared storage. The runner verifies CRC32 before exposing matrix views. Legacy V1
+stages remain readable with one warning per rank so an interactive allocation is not
+invalidated unexpectedly, but must be restaged before production use.
+
+A fresh 12-node layer-1 stage read 22.31 MiB/rank and verified all 16 checksums before
+passing decode on 12/12 ranks. Changing only rank 0's test-manifest CRC produced the
+expected mismatch, reduced readiness to 11/12, wrote no pass markers, and terminated
+collectively without stranding the other ranks. The test manifest was restored after
+the negative test.
+
+Each rank now builds a new stage beneath a uniquely named same-filesystem temporary
+root. Only after every expert, V2 manifest, and ready marker is durable does the rank
+atomically rename the complete directory to the requested stage path. An interrupted
+attempt may leave a clearly named `.tmp.rank...` diagnostic directory, but it cannot
+poison the final path or satisfy `--reuse-stage`; an interactive retry can select the
+same final path safely. A one-expert TP=12 publication test left one complete final
+directory and no temporary root.
+
 Queued 96-node smoke job `49852287` never started and produced no runner logs. It was
 held by the scheduler with `RSCGRP STOP`, then explicitly canceled on 2026-07-30. This
 was resource-group state rather than evidence of a runner failure; no replacement

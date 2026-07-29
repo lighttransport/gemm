@@ -157,15 +157,25 @@ static void runner_barrier(void){
     }
 }
 
-static int load_manifest(const char *path,k3_entry *entries,int cap){
+static int load_manifest(const char *path,k3_entry *entries,int cap,uint32_t *crc,int *has_crc){
     FILE *f=fopen(path,"r");if(!f){fprintf(stderr,"k3_ep_runner: open manifest '%s': %s\n",path,strerror(errno));return-1;}
-    char line[1024];int n=0;
-    while(fgets(line,sizeof line,f)){if(line[0]=='#')continue;k3_entry e;int nd;unsigned long long off,bytes,rows,cols;
+    char line[1024];int n=0;*crc=0;*has_crc=0;
+    while(fgets(line,sizeof line,f)){if(line[0]=='#'){unsigned value;
+            if(!strncmp(line,"# K3EXPERTV2 ",13)){
+                if(sscanf(line,"# K3EXPERTV2 layer=%*u expert=%*u tensors=%*u blob_bytes=%*u crc32=%x",&value)!=1){
+                    fprintf(stderr,"k3_ep_runner: malformed V2 header in '%s'\n",path);fclose(f);return-1;}
+                *crc=value;*has_crc=1;}
+            continue;}k3_entry e;int nd;unsigned long long off,bytes,rows,cols;
         if(sscanf(line,"%llu %llu %15s %d %llu %llu %511s",&off,&bytes,e.dtype,&nd,&rows,&cols,e.name)!=7||nd!=2||n>=cap){
             fprintf(stderr,"k3_ep_runner: malformed manifest '%s' near entry %d\n",path,n);fclose(f);return-1;}
         e.offset=off;e.nbytes=bytes;e.rows=rows;e.cols=cols;entries[n++]=e;
     }
     fclose(f);return n;
+}
+static uint32_t crc32_bytes(const uint8_t *data,size_t size){
+    static uint32_t table[256];static int initialized;
+    if(!initialized){for(unsigned i=0;i<256;++i){uint32_t c=i;for(int b=0;b<8;++b)c=(c>>1)^((c&1)?UINT32_C(0xedb88320):0);table[i]=c;}initialized=1;}
+    uint32_t crc=UINT32_MAX;for(size_t i=0;i<size;++i)crc=(crc>>8)^table[(crc^data[i])&255];return crc^UINT32_MAX;
 }
 static k3_entry *find_entry(k3_entry *entries,int n,const char *suffix){
     size_t sl=strlen(suffix);for(int i=0;i<n;++i){size_t nl=strlen(entries[i].name);
@@ -177,8 +187,13 @@ static int load_real_expert(k3_pool *pool,const char *stage_dir,int layer,int ex
     int nb=snprintf(blob,sizeof blob,"%s/expert%03d/layer%02d_expert%03d.blob",stage_dir,expert,layer,expert);
     int nm=snprintf(manifest,sizeof manifest,"%s/expert%03d/layer%02d_expert%03d.manifest",stage_dir,expert,layer,expert);
     if(nb<0||nm<0||(size_t)nb>=sizeof blob||(size_t)nm>=sizeof manifest){fprintf(stderr,"k3_ep_runner: staged path is too long\n");return-1;}
-    k3_entry es[8];int ne=load_manifest(manifest,es,8);if(ne!=6){fprintf(stderr,"k3_ep_runner: '%s' has %d entries, expected 6\n",manifest,ne);return-1;}
+    k3_entry es[8];uint32_t expected_crc;int has_crc;
+    int ne=load_manifest(manifest,es,8,&expected_crc,&has_crc);if(ne!=6){fprintf(stderr,"k3_ep_runner: '%s' has %d entries, expected 6\n",manifest,ne);return-1;}
     size_t size=0;uint8_t *base=k3_pool_load_blob(pool,blob,&size);if(!base){fprintf(stderr,"%s\n",k3_pool_error(pool));return-1;}
+    if(has_crc){uint32_t actual=crc32_bytes(base,size);if(actual!=expected_crc){
+        fprintf(stderr,"k3_ep_runner: CRC32 mismatch for '%s': expected=%08x actual=%08x\n",blob,expected_crc,actual);
+        k3_pool_free(pool,base);return-1;}}
+    else{static int warned;if(!warned){fprintf(stderr,"k3_ep_runner rank %d: legacy stage has no CRC32; restage before production use\n",g_rank);warned=1;}}
     char prefix[256];int np=snprintf(prefix,sizeof prefix,"language_model.model.layers.%d.block_sparse_moe.experts.%d.",layer,expert);
     size_t max_end=0;int valid=np>0&&(size_t)np<sizeof prefix;
     for(int i=0;i<ne&&valid;++i){size_t end=es[i].offset+es[i].nbytes;

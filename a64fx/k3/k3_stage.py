@@ -11,6 +11,7 @@ import os
 import re
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 ALIGN = 256
@@ -292,7 +293,7 @@ def stage(records, output_dir, layer, expert, chunk_bytes, force):
     entries = []
     dst = None
     try:
-        dst = os.open(str(blob_tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        dst = os.open(str(blob_tmp), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
         offset = 0
         for record in records:
             aligned = (offset + ALIGN - 1) & ~(ALIGN - 1)
@@ -308,13 +309,20 @@ def stage(records, output_dir, layer, expert, chunk_bytes, force):
             entries.append(entry)
             offset = aligned + record["nbytes"]
         os.fsync(dst)
+        os.lseek(dst, 0, os.SEEK_SET)
+        checksum = 0
+        while True:
+            data = os.read(dst, chunk_bytes)
+            if not data:
+                break
+            checksum = zlib.crc32(data, checksum)
         if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
             os.posix_fadvise(dst, 0, 0, os.POSIX_FADV_DONTNEED)
         os.close(dst)
         dst = None
         with open(str(manifest_tmp), "w") as f:
-            f.write("# K3EXPERTV1 layer=%d expert=%d tensors=%d blob_bytes=%d\n" %
-                    (layer, expert, len(entries), offset))
+            f.write("# K3EXPERTV2 layer=%d expert=%d tensors=%d blob_bytes=%d crc32=%08x\n" %
+                    (layer, expert, len(entries), offset, checksum & 0xffffffff))
             for e in entries:
                 f.write("%d %d %s %d %s %s\n" %
                         (e["offset"], e["nbytes"], e["dtype"], len(e["shape"]),
