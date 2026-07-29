@@ -351,7 +351,8 @@ static inline void k3_attention_ref(float *out, const float *q, const float *key
     float m = -INFINITY, l = 0.0f, scale = 1.0f / sqrtf((float)qk_dim);
     for (int t = 0; t < tokens; ++t) {
         float score = k3_dot_ref(q, keys + (size_t)t * qk_dim, qk_dim) * scale;
-        float nm = fmaxf(m, score), old = expf(m - nm), add = expf(score - nm);
+        float nm,old,add;if(score<=m){nm=m;old=1.0f;add=expf(score-m);}
+        else{nm=score;old=expf(m-score);add=1.0f;}
         for (int j = 0; j < v_dim; ++j)
             out[j] = out[j] * old + values[(size_t)t * v_dim + j] * add;
         l = l * old + add; m = nm;
@@ -365,7 +366,8 @@ static inline void k3_attention_sve(float *out, const float *q, const float *key
     float m = -INFINITY, l = 0.0f, scale = 1.0f / sqrtf((float)qk_dim);
     for (int t = 0; t < tokens; ++t) {
         float score = k3_dot_sve(q, keys + (size_t)t * qk_dim, qk_dim) * scale;
-        float nm = fmaxf(m, score), old = expf(m - nm), add = expf(score - nm);
+        float nm,old,add;if(score<=m){nm=m;old=1.0f;add=expf(score-m);}
+        else{nm=score;old=expf(m-score);add=1.0f;}
 #if defined(__ARM_FEATURE_SVE)
         int vl = (int)svcntw();
         for (int j = 0; j < v_dim; j += vl) {
@@ -409,19 +411,21 @@ static inline float k3_dot_f32_bf16_sve(const float *a,const uint16_t *b,int n){
 #endif
 }
 
-static inline void k3_attention_bf16_sve(float *out,const float *q,const uint16_t *keys,
-        const uint16_t *values,int tokens,int qk_dim,int v_dim){
+static inline void k3_attention_bf16_strided_sve(float *out,const float *q,
+        const uint16_t *keys,const uint16_t *values,int tokens,int qk_dim,int v_dim,
+        int key_stride,int value_stride){
     for(int j=0;j<v_dim;++j)out[j]=0.0f;
     float m=-INFINITY,l=0.0f,scale=1.0f/sqrtf((float)qk_dim);
-    for(int t=0;t<tokens;++t){float score=k3_dot_f32_bf16_sve(q,keys+(size_t)t*qk_dim,qk_dim)*scale;
-        float nm=fmaxf(m,score),old=expf(m-nm),add=expf(score-nm);
+    for(int t=0;t<tokens;++t){float score=k3_dot_f32_bf16_sve(q,keys+(size_t)t*key_stride,qk_dim)*scale;
+        float nm,old,add;if(score<=m){nm=m;old=1.0f;add=expf(score-m);}
+        else{nm=score;old=expf(m-score);add=1.0f;}
 #if defined(__ARM_FEATURE_SVE)
         int vl=(int)svcntw();for(int j=0;j<v_dim;j+=vl){svbool_t pg=svwhilelt_b32(j,v_dim);
-            svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,values+(size_t)t*v_dim+j),16);
+            svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,values+(size_t)t*value_stride+j),16);
             svfloat32_t z=svmul_n_f32_x(pg,svld1(pg,out+j),old);
             z=svmla_n_f32_x(pg,z,svreinterpret_f32_u32(bits),add);svst1(pg,out+j,z);}
 #else
-        for(int j=0;j<v_dim;++j)out[j]=out[j]*old+k3_bf16_to_f32(values[(size_t)t*v_dim+j])*add;
+        for(int j=0;j<v_dim;++j)out[j]=out[j]*old+k3_bf16_to_f32(values[(size_t)t*value_stride+j])*add;
 #endif
         l=l*old+add;m=nm;
     }
@@ -435,10 +439,23 @@ static inline void k3_attention_bf16_sve(float *out,const float *q,const uint16_
     }
 }
 
-static inline void k3_attention_heads_parallel_bf16_sve(float *out,const float *q,
-        const uint16_t *keys,const uint16_t *values,int heads,int tokens,int cache_tokens,
-        int qk_dim,int v_dim,int threads,float *scratch,float *stats){
-    int parts=threads<tokens?threads:tokens;float scale=1.0f/sqrtf((float)qk_dim);
+static inline void k3_attention_bf16_sve(float *out,const float *q,const uint16_t *keys,
+        const uint16_t *values,int tokens,int qk_dim,int v_dim){
+    k3_attention_bf16_strided_sve(out,q,keys,values,tokens,qk_dim,v_dim,qk_dim,v_dim);
+}
+
+static inline void k3_attention_bf16_interleaved_sve(float *out,const float *q,
+        const uint16_t *kv,int tokens,int qk_dim,int v_dim){
+    int stride=qk_dim+v_dim;
+    k3_attention_bf16_strided_sve(out,q,kv,kv+qk_dim,tokens,qk_dim,v_dim,stride,stride);
+}
+
+static inline void k3_attention_heads_parallel_bf16_strided_sve(float *out,const float *q,
+        const uint16_t *keys,const uint16_t *values,int heads,int tokens,int qk_dim,int v_dim,
+        size_t key_head_stride,size_t value_head_stride,int key_token_stride,int value_token_stride,
+        int threads,float *scratch,float *stats){
+    int parts=(threads+heads-1)/heads;if(parts>tokens)parts=tokens;
+    float scale=1.0f/sqrtf((float)qk_dim);
 #if defined(_OPENMP)
     omp_set_num_threads(threads);
 #pragma omp parallel
@@ -447,18 +464,19 @@ static inline void k3_attention_heads_parallel_bf16_sve(float *out,const float *
 #endif
         for(int task=0;task<heads*parts;++task){int h=task/parts,p=task%parts;
             int begin=(tokens*p)/parts,end=(tokens*(p+1))/parts;float *num=scratch+(size_t)task*v_dim;
-            const float *qh=q+(size_t)h*qk_dim;const uint16_t *kh=keys+(size_t)h*cache_tokens*qk_dim;
-            const uint16_t *vh=values+(size_t)h*cache_tokens*v_dim;for(int j=0;j<v_dim;++j)num[j]=0.0f;
+            const float *qh=q+(size_t)h*qk_dim;const uint16_t *kh=keys+(size_t)h*key_head_stride;
+            const uint16_t *vh=values+(size_t)h*value_head_stride;for(int j=0;j<v_dim;++j)num[j]=0.0f;
             float m=-INFINITY,l=0.0f;for(int t=begin;t<end;++t){
-                float score=k3_dot_f32_bf16_sve(qh,kh+(size_t)t*qk_dim,qk_dim)*scale;
-                float nm=fmaxf(m,score),old=expf(m-nm),add=expf(score-nm);
+                float score=k3_dot_f32_bf16_sve(qh,kh+(size_t)t*key_token_stride,qk_dim)*scale;
+                float nm,old,add;if(score<=m){nm=m;old=1.0f;add=expf(score-m);}
+                else{nm=score;old=expf(m-score);add=1.0f;}
 #if defined(__ARM_FEATURE_SVE)
                 int vl=(int)svcntw();for(int j=0;j<v_dim;j+=vl){svbool_t pg=svwhilelt_b32(j,v_dim);
-                    svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,vh+(size_t)t*v_dim+j),16);
+                    svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,vh+(size_t)t*value_token_stride+j),16);
                     svfloat32_t z=svmul_n_f32_x(pg,svld1(pg,num+j),old);
                     z=svmla_n_f32_x(pg,z,svreinterpret_f32_u32(bits),add);svst1(pg,num+j,z);}
 #else
-                for(int j=0;j<v_dim;++j)num[j]=num[j]*old+k3_bf16_to_f32(vh[(size_t)t*v_dim+j])*add;
+                for(int j=0;j<v_dim;++j)num[j]=num[j]*old+k3_bf16_to_f32(vh[(size_t)t*value_token_stride+j])*add;
 #endif
                 l=l*old+add;m=nm;}
             stats[(size_t)task*2]=m;stats[(size_t)task*2+1]=l;}
@@ -481,6 +499,21 @@ static inline void k3_attention_heads_parallel_bf16_sve(float *out,const float *
 #endif
 }
 
+static inline void k3_attention_heads_parallel_bf16_sve(float *out,const float *q,
+        const uint16_t *keys,const uint16_t *values,int heads,int tokens,int cache_tokens,
+        int qk_dim,int v_dim,int threads,float *scratch,float *stats){
+    k3_attention_heads_parallel_bf16_strided_sve(out,q,keys,values,heads,tokens,qk_dim,v_dim,
+        (size_t)cache_tokens*qk_dim,(size_t)cache_tokens*v_dim,qk_dim,v_dim,threads,scratch,stats);
+}
+
+static inline void k3_attention_heads_parallel_bf16_interleaved_sve(float *out,const float *q,
+        const uint16_t *kv,int heads,int tokens,int cache_tokens,int qk_dim,int v_dim,
+        int threads,float *scratch,float *stats){
+    int stride=qk_dim+v_dim;size_t head_stride=(size_t)cache_tokens*stride;
+    k3_attention_heads_parallel_bf16_strided_sve(out,q,kv,kv+qk_dim,heads,tokens,qk_dim,v_dim,
+        head_stride,head_stride,stride,stride,threads,scratch,stats);
+}
+
 /* Parallel exact online attention for head-TP decode. Token blocks retain
  * independent (max, denominator, numerator) triples and are combined with the
  * log-sum-exp identity. scratch holds heads*threads*v_dim floats and stats
@@ -489,7 +522,7 @@ static inline void k3_attention_heads_parallel_sve(float *out, const float *q,
         const float *keys, const float *values, int heads, int tokens,
         int cache_tokens, int qk_dim, int v_dim, int threads,
         float *scratch, float *stats) {
-    int parts=threads<tokens?threads:tokens;
+    int parts=(threads+heads-1)/heads;if(parts>tokens)parts=tokens;
     float scale=1.0f/sqrtf((float)qk_dim);
 #if defined(_OPENMP)
     omp_set_num_threads(threads);
@@ -508,7 +541,8 @@ static inline void k3_attention_heads_parallel_sve(float *out, const float *q,
             float m=-INFINITY,l=0.0f;
             for(int t=begin;t<end;++t){
                 float score=k3_dot_sve(qh,kh+(size_t)t*qk_dim,qk_dim)*scale;
-                float nm=fmaxf(m,score),old=expf(m-nm),add=expf(score-nm);
+                float nm,old,add;if(score<=m){nm=m;old=1.0f;add=expf(score-m);}
+                else{nm=score;old=expf(m-score);add=1.0f;}
 #if defined(__ARM_FEATURE_SVE)
                 int vl=(int)svcntw();
                 for(int j=0;j<v_dim;j+=vl){svbool_t pg=svwhilelt_b32(j,v_dim);
