@@ -276,41 +276,61 @@ static inline void k3_kda_step_decay_sve(float *out, const float *q, const float
     }
 }
 
+static inline void k3_kda_step_decay_row_sve(float *out, const float *q,
+        const float *k, const float *v, const float *decay,
+        const float *beta, float *state, int heads, int key_dim,
+        int value_dim, int task) {
+    (void)heads;
+    float scale=1.0f/sqrtf((float)key_dim);
+    int h=task/value_dim,j=task%value_dim;
+    const float *qh=q+(size_t)h*key_dim,*kh=k+(size_t)h*key_dim;
+    const float *dh=decay+(size_t)h*key_dim;
+    float *row=state+((size_t)h*value_dim+j)*key_dim;
+#if defined(__ARM_FEATURE_SVE)
+    int vl=(int)svcntw();
+    for(int d=0;d<key_dim;d+=vl){svbool_t pg=svwhilelt_b32(d,key_dim);
+        svst1(pg,row+d,svmul_f32_x(pg,svld1(pg,row+d),svld1(pg,dh+d)));}
+#else
+    for(int d=0;d<key_dim;++d)row[d]*=dh[d];
+#endif
+    float delta=beta[h]*(v[(size_t)h*value_dim+j]-k3_dot_sve(kh,row,key_dim));
+#if defined(__ARM_FEATURE_SVE)
+    int vl2=(int)svcntw();
+    for(int d=0;d<key_dim;d+=vl2){svbool_t pg=svwhilelt_b32(d,key_dim);
+        svst1(pg,row+d,svmla_n_f32_x(pg,svld1(pg,row+d),svld1(pg,kh+d),delta));}
+#else
+    for(int d=0;d<key_dim;++d)row[d]+=kh[d]*delta;
+#endif
+    out[(size_t)h*value_dim+j]=k3_dot_sve(qh,row,key_dim)*scale;
+}
+
+/* Orphaned workshare: every thread in an existing OpenMP team must call it. */
+static inline void k3_kda_step_decay_team_sve(float *out, const float *q,
+        const float *k, const float *v, const float *decay,
+        const float *beta, float *state, int heads, int key_dim,
+        int value_dim) {
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int task=0;task<heads*value_dim;++task)
+        k3_kda_step_decay_row_sve(out,q,k,v,decay,beta,state,heads,key_dim,value_dim,task);
+}
+
 /* Flatten [head][value] into enough independent row tasks to occupy all A64FX
  * cores even when tensor parallelism leaves only one to eight heads per rank. */
 static inline void k3_kda_step_decay_parallel_sve(float *out, const float *q,
         const float *k, const float *v, const float *decay,
         const float *beta, float *state, int heads, int key_dim,
         int value_dim, int threads) {
-    float scale=1.0f/sqrtf((float)key_dim);
 #if defined(_OPENMP)
     omp_set_num_threads(threads);
-#pragma omp parallel for schedule(static)
+#pragma omp parallel
+    k3_kda_step_decay_team_sve(out,q,k,v,decay,beta,state,heads,key_dim,value_dim);
 #else
     (void)threads;
+    for(int task=0;task<heads*value_dim;++task)
+        k3_kda_step_decay_row_sve(out,q,k,v,decay,beta,state,heads,key_dim,value_dim,task);
 #endif
-    for(int task=0;task<heads*value_dim;++task){
-        int h=task/value_dim,j=task%value_dim;
-        const float *qh=q+(size_t)h*key_dim,*kh=k+(size_t)h*key_dim;
-        const float *dh=decay+(size_t)h*key_dim;
-        float *row=state+((size_t)h*value_dim+j)*key_dim;
-#if defined(__ARM_FEATURE_SVE)
-        int vl=(int)svcntw();
-        for(int d=0;d<key_dim;d+=vl){svbool_t pg=svwhilelt_b32(d,key_dim);
-            svst1(pg,row+d,svmul_f32_x(pg,svld1(pg,row+d),svld1(pg,dh+d)));}
-#else
-        for(int d=0;d<key_dim;++d)row[d]*=dh[d];
-#endif
-        float delta=beta[h]*(v[(size_t)h*value_dim+j]-k3_dot_sve(kh,row,key_dim));
-#if defined(__ARM_FEATURE_SVE)
-        int vl2=(int)svcntw();
-        for(int d=0;d<key_dim;d+=vl2){svbool_t pg=svwhilelt_b32(d,key_dim);
-            svst1(pg,row+d,svmla_n_f32_x(pg,svld1(pg,row+d),svld1(pg,kh+d),delta));}
-#else
-        for(int d=0;d<key_dim;++d)row[d]+=kh[d]*delta;
-#endif
-        out[(size_t)h*value_dim+j]=k3_dot_sve(qh,row,key_dim)*scale;
-    }
 }
 
 static inline void k3_kda_step_sve(float *out, const float *q, const float *k,

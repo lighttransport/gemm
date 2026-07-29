@@ -460,6 +460,56 @@ static inline int k3_expert_tp_forward_mxfp4(
     return 0;
 }
 
+static inline int k3_expert_tp_selected_layout_valid(
+        const k3_mxfp4_matrix *w1, const k3_mxfp4_matrix *w2,
+        const k3_mxfp4_matrix *w3, int selected) {
+    if(selected<1||!w1||!w2||!w3)return 0;int local=w1[0].rows;
+    for(int e=0;e<selected;++e)if(w1[e].rows!=local||
+        !k3_expert_tp_layout_valid(&w1[e],&w2[e],&w3[e]))return 0;
+    return 1;
+}
+
+/* Orphaned workshares: every thread in an existing OpenMP team must call it. */
+static inline void k3_expert_tp_forward_selected_team_mxfp4(
+        float *latent_partial, const k3_mxfp4_matrix *w1,
+        const k3_mxfp4_matrix *w2, const k3_mxfp4_matrix *w3,
+        const float *route_weight, int selected, const float *latent,
+        float *gate, float *up) {
+    int local=w1[0].rows;
+    int g13=local/8,g2=K3_LATENT/8;
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int task=0;task<selected*2*g13;++task){int e=task/(2*g13),rem=task%(2*g13),which=rem/g13,r=(rem%g13)*8;
+        const k3_mxfp4_matrix*m=which?&w3[e]:&w1[e];float*y=(which?up:gate)+(size_t)e*local;
+        size_t wr=(size_t)m->cols/2,sr=(size_t)m->cols/32;
+        k3_mxfp4_group_batch(y+r,local,m->packed+(size_t)r*wr,
+            m->scale+(size_t)r*sr,latent,K3_LATENT,1,m->cols,0);}
+#if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
+    int vl=(int)svcntw(),blocks=(selected*local+vl-1)/vl;
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int b=0;b<blocks;++b){int i=b*vl,n=selected*local-i;
+        k3_situ_fast_sve(gate+i,gate+i,up+i,n<vl?n:vl);}
+#else
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int i=0;i<selected*local;++i)gate[i]=4.0f*tanhf(gate[i]*.25f)*
+        k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
+#endif
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int gr=0;gr<g2;++gr){int r=gr*8;float sum[8]={0},tmp[8];
+        for(int e=0;e<selected;++e){const k3_mxfp4_matrix*m=&w2[e];size_t wr=(size_t)local/2,sr=(size_t)local/32;
+            k3_mxfp4_group_batch(tmp,8,m->packed+(size_t)r*wr,
+                m->scale+(size_t)r*sr,gate+(size_t)e*local,local,1,local,0);
+            for(int j=0;j<8;++j)sum[j]+=route_weight[e]*tmp[j];}
+        for(int j=0;j<8;++j)latent_partial[r+j]=sum[j];}
+}
+
 /* Decode path for the 16 selected experts on one intermediate-TP rank.  The
  * team is shared across experts, avoiding 48-thread startup/workshare overhead
  * for each tiny 32-channel slice at TP=96. */
@@ -468,39 +518,12 @@ static inline int k3_expert_tp_forward_selected_mxfp4(
         const k3_mxfp4_matrix *w2, const k3_mxfp4_matrix *w3,
         const float *route_weight, int selected, const float *latent,
         float *gate, float *up, float *expert_out, int threads) {
-    if(selected<1)return-1;int local=w1[0].rows;
-    (void)expert_out;
-    for(int e=0;e<selected;++e)if(w1[e].rows!=local||
-        !k3_expert_tp_layout_valid(&w1[e],&w2[e],&w3[e]))return-1;
-    int g13=local/8,g2=K3_LATENT/8;
+    if(!k3_expert_tp_selected_layout_valid(w1,w2,w3,selected))return-1;
 #if defined(_OPENMP)
-    omp_set_num_threads(threads);
+    (void)expert_out;omp_set_num_threads(threads);
 #pragma omp parallel
-    {
-#pragma omp for schedule(static)
-    for(int task=0;task<selected*2*g13;++task){int e=task/(2*g13),rem=task%(2*g13),which=rem/g13,r=(rem%g13)*8;
-        const k3_mxfp4_matrix*m=which?&w3[e]:&w1[e];float*y=(which?up:gate)+(size_t)e*local;
-        size_t wr=(size_t)m->cols/2,sr=(size_t)m->cols/32;
-        k3_mxfp4_group_batch(y+r,local,m->packed+(size_t)r*wr,
-            m->scale+(size_t)r*sr,latent,K3_LATENT,1,m->cols,0);}
-#if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
-    int vl=(int)svcntw(),blocks=(selected*local+vl-1)/vl;
-#pragma omp for schedule(static)
-    for(int b=0;b<blocks;++b){int i=b*vl,n=selected*local-i;
-        k3_situ_fast_sve(gate+i,gate+i,up+i,n<vl?n:vl);}
-#else
-#pragma omp for schedule(static)
-    for(int i=0;i<selected*local;++i)gate[i]=4.0f*tanhf(gate[i]*.25f)*
-        k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
-#endif
-#pragma omp for schedule(static)
-    for(int gr=0;gr<g2;++gr){int r=gr*8;float sum[8]={0},tmp[8];
-        for(int e=0;e<selected;++e){const k3_mxfp4_matrix*m=&w2[e];size_t wr=(size_t)local/2,sr=(size_t)local/32;
-            k3_mxfp4_group_batch(tmp,8,m->packed+(size_t)r*wr,
-                m->scale+(size_t)r*sr,gate+(size_t)e*local,local,1,local,0);
-            for(int j=0;j<8;++j)sum[j]+=route_weight[e]*tmp[j];}
-        for(int j=0;j<8;++j)latent_partial[r+j]=sum[j];}
-    }
+    k3_expert_tp_forward_selected_team_mxfp4(latent_partial,w1,w2,w3,
+        route_weight,selected,latent,gate,up);
 #else
     (void)threads;
     for(int e=0;e<selected;++e){if(k3_expert_tp_forward_mxfp4(

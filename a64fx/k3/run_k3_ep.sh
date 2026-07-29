@@ -12,6 +12,7 @@ LAYERS=1
 TOKENS=2
 THREADS=48
 KDA_THREADS=8
+FUSED_THREADS=0
 LAYER=1
 EXPERTS=0-15
 CHUNK_MIB=8
@@ -21,13 +22,14 @@ STAGE_DIR="/local/$USER/k3-runner-$JOB_TAG"
 RESULT_DIR="$SCRIPT_DIR/logs/run-$JOB_TAG"
 PROFILE=0
 REUSE_STAGE=0
+NO_FUSED_TEAM=0
 
 usage() {
     cat >&2 <<EOF
 usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
-          [--threads N] [--kda-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
+          [--threads N] [--kda-threads N] [--fused-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
-          [--profile] [--reuse-stage]
+          [--profile] [--reuse-stage] [--no-fused-team]
 EOF
 }
 need_value() { if (( $# < 2 )); then echo "$0: missing value for $1" >&2; usage; exit 2; fi; }
@@ -39,6 +41,7 @@ while (( $# )); do
         --tokens) need_value "$@"; TOKENS=$2; shift 2;;
         --threads) need_value "$@"; THREADS=$2; shift 2;;
         --kda-threads) need_value "$@"; KDA_THREADS=$2; shift 2;;
+        --fused-threads) need_value "$@"; FUSED_THREADS=$2; shift 2;;
         --layer) need_value "$@"; LAYER=$2; shift 2;;
         --experts) need_value "$@"; EXPERTS=$2; shift 2;;
         --chunk-mib) need_value "$@"; CHUNK_MIB=$2; shift 2;;
@@ -47,15 +50,17 @@ while (( $# )); do
         --result-dir) need_value "$@"; RESULT_DIR=$2; shift 2;;
         --profile) PROFILE=1; shift;;
         --reuse-stage) REUSE_STAGE=1; shift;;
+        --no-fused-team) NO_FUSED_TEAM=1; shift;;
         -h|--help) usage; exit 0;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2;;
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$LAYER" "$CHUNK_MIB"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
-(( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && KDA_THREADS > 0 && KDA_THREADS <= 48 && CHUNK_MIB > 0 )) || {
+(( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
+(( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && KDA_THREADS > 0 && KDA_THREADS <= THREADS && FUSED_THREADS > 0 && FUSED_THREADS <= THREADS && CHUNK_MIB > 0 )) || {
     echo "$0: invalid numeric option range" >&2; exit 2; }
 (( NODES <= 96 )) || { echo "$0: node count must be in [1,96]" >&2; exit 2; }
 if [[ -n "${PJM_MPI_PROC:-}" && "$NODES" -ne "$PJM_MPI_PROC" ]]; then
@@ -106,9 +111,10 @@ fi
 set +e
 RUNNER_EXTRA=()
 (( PROFILE )) && RUNNER_EXTRA+=(--profile)
+(( NO_FUSED_TEAM )) && RUNNER_EXTRA+=(--no-fused-team)
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --layer "$LAYER" \
+    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?

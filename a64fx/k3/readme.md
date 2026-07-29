@@ -651,6 +651,31 @@ state bounded while representing the graph's residual behavior more faithfully. 
 runner owns all new MLA scratch through the 256-byte-aligned, NUMA-aware memory pool;
 no raw runner allocation was introduced.
 
+The next scheduling pass removes the OpenMP team-size transition between KDA and MoE
+on KDA+MoE layers. Both kernels now expose orphaned workshares that can execute inside
+one existing team: flattened KDA rows complete first, the synthetic attention partial
+is projected, and the same workers immediately execute the three selected-expert
+stages. Standalone wrappers retain the original APIs for tests and non-runner users.
+`--fused-threads N` controls this team and defaults to `--threads` (48 on A64FX).
+`--no-fused-team` retains the independently sized `--kda-threads` path as a diagnostic
+and recovery fallback.
+
+An A/B test over 512 real layer-1 steps on job `49852817` produced identical checksums
+and passed all 12 ranks:
+
+| Schedule | Layer-steps/s | KDA ms/layer | Expert ms/layer | Wall ms/layer |
+|---|---:|---:|---:|---:|
+| Separate 8-thread KDA + 48-thread expert teams | 1,496.0 | 0.139 | 0.418 | 0.668 |
+| Fused 48-thread KDA + expert team | 1,853.1 | 0.188 | 0.245 | 0.540 |
+
+The fused path is 1.24x faster end to end. Three additional 512-step runs measured
+1,816--1,859 layer-steps/s at 48 fused threads; 40 threads measured
+1,767--1,776, so the full 48-core team is the robust default despite its slightly
+higher KDA phase time. A 16-token traversal of the complete 93-layer dummy schedule
+passed 12/12 ranks at 2,365 layer-steps/s after the fusion. This optimization addresses
+local scheduling only; the allreduce remains outside the OpenMP region and continues
+to cost approximately 0.11--0.12 ms per partial layer step on 12 nodes.
+
 All figures in this section are partial-runner measurements: real mode supplies real
 MXFP4 expert slices but still uses synthetic attention projections and omits the full
 dense/shared completion, embedding, tokenizer, and LM head. They are useful for kernel
