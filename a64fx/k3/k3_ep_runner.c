@@ -89,10 +89,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else{fprintf(stderr,"k3_ep_runner: unknown argument '%s'\n",a);usage(argv[0]);return-1;}
 #undef VALUE
     }
-    int local=K3_EXPERT_INTER/o->nodes;
-    if(K3_EXPERT_INTER%o->nodes||local%K3_EXPERT_TP_BLOCK){
-        fprintf(stderr,"k3_ep_runner: --nodes %d cannot preserve native MXFP4 groups; "
-            "node count must divide 96 (local intermediate channels must be a multiple of 32)\n",o->nodes);return-1;}
+    if(o->nodes>96){
+        fprintf(stderr,"k3_ep_runner: --nodes must be in [1,96] so every rank owns at least one native MXFP4 group\n");return-1;}
     if(o->mode==K3_MODE_REAL&&(!o->stage_dir||!o->stage_dir[0])){
         fprintf(stderr,"k3_ep_runner: real mode requires --stage-dir\n");return-1;}
     if(o->mode==K3_MODE_REAL&&(o->layer==0||o->layers!=1)){
@@ -206,14 +204,16 @@ static void write_status(const k3_options *o,const char *state,double seconds,do
 /* Config lists layers one-based. KDA occupies three of each four through layer
  * 91; layer 92 (one-based) and the final layer 93 are MLA, for 69 KDA + 24 MLA. */
 static int layer_is_kda(int layer){int one=layer+1;return one<=91&&(one&3)!=0;}
+static int partition_count(int total,int rank,int ranks){int base=total/ranks,extra=total%ranks;return base+(rank<extra);}
+static int partition_first(int total,int rank,int ranks){int base=total/ranks,extra=total%ranks;return rank*base+(rank<extra?rank:extra);}
 
 static void synthetic_attention_partial(float *shared,const float *latent,
-        int layer_index,int global_layer,int token,int cache_tokens,int local_heads,
+        int layer_index,int global_layer,int token,int cache_tokens,int local_heads,int first_head,
         float *kda_state,float *mla_keys,float *mla_values,
         float *q,float *k,float *v,float *decay,float *attn_out){
     int is_kda=layer_is_kda(global_layer);size_t qstride=is_kda?K3_HEAD_DIM:192;
     memset(shared,0,K3_HIDDEN*sizeof(float));
-    for(int h=0;h<local_heads;++h){int gh=g_rank*local_heads+h;
+    for(int h=0;h<local_heads;++h){int gh=first_head+h;
         for(size_t d=0;d<qstride;++d){
             float base=latent[(gh*131+(int)d*17+global_layer*29+token*7)%K3_LATENT];
             q[(size_t)h*192+d]=base+0.0001f*(float)(d+1);
@@ -243,7 +243,7 @@ static void synthetic_attention_partial(float *shared,const float *latent,
     }
     /* Synthetic row projection: ownership is disjoint, so the following fused
      * allreduce reconstructs one replicated hidden contribution. */
-    for(int h=0;h<local_heads;++h){int gh=g_rank*local_heads+h;
+    for(int h=0;h<local_heads;++h){int gh=first_head+h;
         for(int d=0;d<K3_HEAD_DIM;++d){int out=(gh*K3_HEAD_DIM+d)%K3_HIDDEN;
             shared[out]+=attn_out[(size_t)h*K3_HEAD_DIM+d]*0.03125f;}}
     for(int i=g_rank;i<K3_HIDDEN;i+=g_nodes)
@@ -279,7 +279,8 @@ int main(int argc,char **argv){
         fprintf(stderr,"k3_ep_runner rank %d: all-reduce initialization failed\n",g_rank);return 3;}
     runner_barrier();
 
-    int local=K3_EXPERT_INTER/g_nodes,ready=1;k3_loaded_expert experts[K3_SELECTED];memset(experts,0,sizeof experts);
+    int local=partition_count(96,g_rank,g_nodes)*K3_EXPERT_TP_BLOCK,ready=1;
+    k3_loaded_expert experts[K3_SELECTED];memset(experts,0,sizeof experts);
     for(int e=0;e<K3_SELECTED;++e){int bad=opt.mode==K3_MODE_REAL?
         load_real_expert(&pool,opt.stage_dir,opt.layer,e,local,&experts[e]):
         make_dummy_expert(&pool,g_rank,e,local,&experts[e]);if(bad){ready=0;break;}}
@@ -298,7 +299,7 @@ int main(int argc,char **argv){
     float *gate=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
     float *up=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
     float *expert_out=k3_pool_alloc(&pool,(size_t)K3_SELECTED*K3_LATENT*sizeof(float));
-    int local_heads=96/g_nodes;
+    int local_heads=partition_count(96,g_rank,g_nodes),first_head=partition_first(96,g_rank,g_nodes);
     float *kda_state=k3_pool_calloc(&pool,(size_t)opt.layers*local_heads*K3_HEAD_DIM*K3_HEAD_DIM,sizeof(float));
     float *mla_keys=k3_pool_calloc(&pool,(size_t)opt.layers*local_heads*opt.tokens*192,sizeof(float));
     float *mla_values=k3_pool_calloc(&pool,(size_t)opt.layers*local_heads*opt.tokens*K3_HEAD_DIM,sizeof(float));
@@ -317,7 +318,7 @@ int main(int argc,char **argv){
 
     runner_barrier();double start=now_sec();int finite=1;
     for(int token=0;token<opt.tokens;++token)for(int layer=0;layer<opt.layers;++layer){int global_layer=opt.layer+layer;
-        synthetic_attention_partial(shared,latent,layer,global_layer,token,opt.tokens,local_heads,
+        synthetic_attention_partial(shared,latent,layer,global_layer,token,opt.tokens,local_heads,first_head,
             kda_state,mla_keys,mla_values,q,k,v,decay,attn_out);
         if(global_layer==0)memset(partial,0,K3_LATENT*sizeof(float));
         else if(k3_expert_tp_forward_selected_mxfp4(partial,w1,w2,w3,route,K3_SELECTED,latent,gate,up,expert_out,opt.threads))finite=0;

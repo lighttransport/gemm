@@ -541,9 +541,11 @@ and binding controls, and the debugging retention switches `K3_KEEP_PROBE=1` and
 ## Distributed K3 runner
 
 `k3_ep_runner` is the executable uTofu bring-up path for the intermediate-TP MoE
-architecture. It defaults to 96 nodes but accepts `--nodes N`; the configured count
-must divide 96 so every rank owns an integer number of native 32-channel MXFP4 scale
-groups. At 96 nodes each rank owns 32 channels from each of the 16 selected experts.
+architecture. It defaults to 96 nodes but accepts `--nodes N` for any count from 1
+through 96. The 96 native 32-channel MXFP4 scale groups are distributed raggedly when
+necessary: at 64 nodes, 32 ranks own 64 channels and 32 ranks own 32; at 96 nodes each
+rank owns 32 channels from each of the 16 selected experts. Attention heads use the
+same balanced ragged ownership rule.
 The selected-expert SVE kernel shares one OpenMP team, route-weights the local `w2`
 partials, packs the 3,584-float routed latent and 7,168-float hidden partial, and issues
 one 10,752-float sum-allreduce per layer step. All ranks then advance the same residual

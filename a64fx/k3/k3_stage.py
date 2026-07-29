@@ -142,17 +142,18 @@ def locate_many(model_dir, layer, experts):
 
 
 def tensor_parallel_records(records, tp_size, tp_rank):
-    """Slice one native 32-channel expert-intermediate block at TP=96.
+    """Slice native 32-channel expert-intermediate blocks across TP ranks.
 
     w1/w3 are row sliced.  w2 is column sliced and therefore represented as a
     bounded list of source ranges, one per output row; no full tensor is read.
     """
-    if 3072 % tp_size or tp_rank < 0 or tp_rank >= tp_size:
-        raise ValueError("expert TP size must divide 3072")
-    local = 3072 // tp_size
-    if local % 32:
-        raise ValueError("expert TP slice must preserve MXFP4 group-32 alignment")
-    first = tp_rank * local
+    if tp_size < 1 or tp_size > 96 or tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError("expert TP requires 1..96 ranks and a valid rank index")
+    base, extra = divmod(96, tp_size)
+    local_blocks = base + (1 if tp_rank < extra else 0)
+    first_block = tp_rank * base + min(tp_rank, extra)
+    local = local_blocks * 32
+    first = first_block * 32
     out = []
     for source in records:
         rec = dict(source)
@@ -390,8 +391,11 @@ def main():
           (args.layer, args.experts or str(args.expert), args.rank, args.nodes,
            len(experts) * len(EXPECTED), total, total / 1048576.0))
     if args.expert_tp:
-        print("  expert intermediate TP: rank=%d/%d channels=%d" %
-              (args.tp_rank, args.tp_size, 3072 // args.tp_size))
+        base, extra = divmod(96, args.tp_size)
+        local = (base + (1 if args.tp_rank < extra else 0)) * 32
+        first = (args.tp_rank * base + min(args.tp_rank, extra)) * 32
+        print("  expert intermediate TP: rank=%d/%d channels=[%d,%d)" %
+              (args.tp_rank, args.tp_size, first, first + local))
     if args.plan_only:
         return
     for expert in experts:

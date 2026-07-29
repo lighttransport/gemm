@@ -50,8 +50,7 @@ for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$LAYER" "$CHUNK_MIB"; do
 done
 (( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && CHUNK_MIB > 0 )) || {
     echo "$0: invalid numeric option range" >&2; exit 2; }
-(( 3072 % NODES == 0 && (3072 / NODES) % 32 == 0 )) || {
-    echo "$0: node count $NODES does not preserve native 32-channel MXFP4 groups (it must divide 96)" >&2; exit 2; }
+(( NODES <= 96 )) || { echo "$0: node count must be in [1,96]" >&2; exit 2; }
 if [[ -n "${PJM_MPI_PROC:-}" && "$NODES" -ne "$PJM_MPI_PROC" ]]; then
     echo "$0: --nodes $NODES differs from allocation process count $PJM_MPI_PROC" >&2
     exit 2
