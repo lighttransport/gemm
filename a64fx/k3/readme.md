@@ -661,6 +661,71 @@ margin is intentionally small: 18 token/s is not an end-to-end 96-node claim
 until the real routed-up buffers replace the proxy window and the 96-node
 collective calibration confirms the modeled 24.1 ms communication stack.
 
+### 20 token/s attack
+
+The decode transport now defaults to `--comm-robust 2`. It still drains the
+uTofu MRQ at receive entry and completion, but invalidates the RDMA trailer cache
+line once every eight spins instead of executing `dc civac; dsb sy` plus an MRQ
+poll on every spin. `--comm-robust 1` retains the eager recovery path for A/B and
+diagnosis. On the restarted 12-node 2x3x2 allocation, 8,192 hierarchical layer
+steps reduced rank-maximum allreduce time from **124.8 us to 99.2 us** (1.258x),
+with identical checksums. A 16,384-step flat run also passed on all ranks without
+MRQ growth or transport failure. A later same-weight real A/B was stricter:
+95.8 us versus 86.7 us, or **1.105x**. The simulator uses this smaller factor.
+
+The polling choice is phase-specific. During concurrent HBM prefetch, the pinned
+WFE/SEV worker benefits from eager trailer invalidation, so the runner temporarily
+uses robust mode 1 only between async submit and completion and restores the
+requested mode immediately afterward. With 47 compute workers, three hierarchy
+groups, and a 16 MiB window, this hybrid path measured **112.1 us** versus
+**101.6 us** without prefetch in the dummy run. The repeated real-weight path
+measured 115.2--119.2 us versus an 86.7 us baseline, so the simulator uses a
+conservative **33 us** charge. Two alternatives were measured and rejected:
+
+- keeping communication and prefetch inside the existing OpenMP team cost
+  139.7 us for 16 MiB because uTofu and HBM fills interfered;
+- issuing L2 hints before the expert cost 84--123 us because the A64FX prefetch
+  queue throttled before expert execution.
+
+The bounded real-weight test restaged layer 1, experts 0--15 on all twelve nodes
+and completed 4,096 hybrid steps. All 12 ranks passed, checksum disagreement was
+at most `6.463e-08`, peak runner-pool use was 40.14 MiB/rank, and the real collective
+stage measured 115.2--119.2 us. This is a real MXFP4 kernel/collective validation, not a
+whole-network throughput measurement; the prefetch window remains a proxy until
+the full runner exposes the next layer's Q8W16 routed-up allocation.
+
+With the real 96-shard manifest, 0.063 ms selected-expert kernel, 300 GB/s
+routed-up, 280 GB/s router/down, 248 GB/s cache-line fill, 1.105x lean decode
+collectives, and the conservative 33 us hybrid charge, the model predicts
+**about 54 ms/token = 18.5 token/s** for 4K M=1 on 96 nodes. Memory is 23.53
+GB/rank. The earlier 20.11 token/s number used the faster dummy-only 1.258x/13 us
+pair and is retracted by the real A/B. The 20 token/s stretch remains open; it
+requires another roughly 4 ms/token from router/down bandwidth or a 96-node
+collective improvement, followed by an end-to-end full-layer run.
+
+The follow-on real router/down sweep did not justify a higher bandwidth
+assumption. Across five 64-sample trials, the existing 11-router/36-down worker
+split had a 270.9 GB/s minimum p95 floor; 10/37, 14/33, and 16/31 bottomed at
+259.3, 269.6, and 267.8 GB/s. A 16-row kernel that reused each activation SVE
+load across two adjacent output groups was also rejected: its 16 vector
+accumulators spilled and reduced the floor to 205.5--210.0 GB/s. Production
+therefore retains the eight-row kernel and conservative 280 GB/s model value.
+`k3_dense_probe --only q8pair` now isolates this quality/performance gate for
+future work without running unrelated quantizers.
+
+Reproduce the real partial validation in a 12-node allocation with:
+
+```sh
+./run_k3_ep.sh --mode real --nodes 12 --layers 1 --tokens 4096 \
+  --layer 1 --experts 0-15 --threads 47 --fused-threads 47 \
+  --profile --heartbeat-tokens 1024 --ar-groups 3 --comm-robust 2 \
+  --prefetch-mib 16 --stage-dir /local/$USER/k3-runner-profile-$PJM_JOBID \
+  --result-dir logs/attack20-real-hybrid-$PJM_JOBID
+
+python3 k3_sim.py --nodes 96 --contexts 4096 --batches 1 \
+  --expert-tp --fused-moe-ar --hierarchical-ar --q8w16-dense
+```
+
 ## Runner runtime and command-line contract
 
 The K3 dense, KDA, and MoE probes now allocate through `k3_pool` in

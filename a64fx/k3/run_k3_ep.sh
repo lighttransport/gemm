@@ -26,6 +26,7 @@ NO_FUSED_TEAM=0
 MLA_CACHE_BF16=1
 HEARTBEAT_TOKENS=1024
 AR_GROUPS=0
+COMM_ROBUST=2
 PREFETCH_MIB=0
 
 usage() {
@@ -37,6 +38,7 @@ usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--mla-cache-bf16|--mla-cache-fp32]
           [--heartbeat-tokens N]
           [--ar-groups N] (0=flat, otherwise N contiguous groups)
+          [--comm-robust 1|2] (2=amortized polling, default)
           [--prefetch-mib N] (overlap a routed-up weight window with MoE reduce)
 EOF
 }
@@ -63,13 +65,14 @@ while (( $# )); do
         --mla-cache-fp32) MLA_CACHE_BF16=0; shift;;
         --heartbeat-tokens) need_value "$@"; HEARTBEAT_TOKENS=$2; shift 2;;
         --ar-groups) need_value "$@"; AR_GROUPS=$2; shift 2;;
+        --comm-robust) need_value "$@"; COMM_ROBUST=$2; shift 2;;
         --prefetch-mib) need_value "$@"; PREFETCH_MIB=$2; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2;;
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$AR_GROUPS" "$PREFETCH_MIB"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$AR_GROUPS" "$COMM_ROBUST" "$PREFETCH_MIB"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
@@ -79,6 +82,7 @@ done
 (( PREFETCH_MIB <= 32 )) || { echo "$0: --prefetch-mib must be in [0,32]" >&2; exit 2; }
 (( AR_GROUPS == 0 || (AR_GROUPS > 1 && NODES % AR_GROUPS == 0) )) || {
     echo "$0: --ar-groups must be 0 or a divisor in [2,--nodes]" >&2; exit 2; }
+(( COMM_ROBUST == 1 || COMM_ROBUST == 2 )) || { echo "$0: --comm-robust must be 1 or 2" >&2; exit 2; }
 if (( PREFETCH_MIB > 0 && THREADS > 47 )); then
     echo "$0: --prefetch-mib requires --threads <=47" >&2
     exit 2
@@ -93,7 +97,7 @@ RESULT_DIR=$(cd "$RESULT_DIR" && pwd)
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 if (( PREFETCH_MIB > 0 )) && [[ -z "${OMP_PLACES:-}" ]]; then
-    OMP_PLACES='{12}:47:1' # reserve A64FX application core 59 for the communication worker
+    OMP_PLACES='{12}:47:1'
 fi
 export OMP_NUM_THREADS="$THREADS" OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
@@ -144,7 +148,7 @@ else
 fi
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --ar-groups "$AR_GROUPS" --prefetch-mib "$PREFETCH_MIB" \
+    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --prefetch-mib "$PREFETCH_MIB" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?

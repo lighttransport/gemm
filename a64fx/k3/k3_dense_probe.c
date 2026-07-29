@@ -333,13 +333,13 @@ int main(int argc, char **argv) {
             if(!end||*end||value<1||value>48){fprintf(stderr,"k3_dense_probe: --threads must be 1..48\n");return 2;}
             perf_threads=(int)value;
         }
-        else if(!strcmp(argv[i],"--help")){printf("usage: %s [--only q8w16|q8w16down] [--threads N] [--stable-reps N] BLOB MANIFEST\n",argv[0]);return 0;}
+        else if(!strcmp(argv[i],"--help")){printf("usage: %s [--only q8w16|q8w16down|q8pair] [--threads N] [--stable-reps N] BLOB MANIFEST\n",argv[0]);return 0;}
         else if(argv[i][0]=='-'){fprintf(stderr,"k3_dense_probe: unknown option '%s'\n",argv[i]);return 2;}
         else if(!blob_path)blob_path=argv[i];else if(!manifest_path)manifest_path=argv[i];
         else{fprintf(stderr,"k3_dense_probe: unexpected argument '%s'\n",argv[i]);return 2;}
     }
-    if(!blob_path||!manifest_path||(only&&strcmp(only,"q8w16")&&strcmp(only,"q8w16down"))){
-        fprintf(stderr,"usage: %s [--only q8w16|q8w16down] [--threads N] [--stable-reps N] BLOB MANIFEST\n",argv[0]);
+    if(!blob_path||!manifest_path||(only&&strcmp(only,"q8w16")&&strcmp(only,"q8w16down")&&strcmp(only,"q8pair"))){
+        fprintf(stderr,"usage: %s [--only q8w16|q8w16down|q8pair] [--threads N] [--stable-reps N] BLOB MANIFEST\n",argv[0]);
         return 2;
     }
     k3_pool_init(&probe_pool,"dense-probe");
@@ -360,7 +360,7 @@ int main(int argc, char **argv) {
     if(!re||!de){fprintf(stderr,"k3_dense_probe: manifest lacks gate or routed-down tensor\n");k3_pool_destroy(&probe_pool);
         return 2;
     }
-    if (only && !strcmp(only, "q8w16down")) {
+    if (only && (!strcmp(only, "q8w16down")||!strcmp(only,"q8pair"))) {
         matrix down = {(uint16_t *)(b + de->offset), de->rows, de->cols};
         matrix router = {(uint16_t *)(b + re->offset), re->rows, re->cols};
         float *dx = probe_alloc((size_t)down.cols * 4);
@@ -373,10 +373,13 @@ int main(int argc, char **argv) {
             dx[i] = rnd() * .125f;
         mv(dref, &down, dx, 47);
         mv(rref, &router, dx, 47);
-        int bad = q8pv16_f32_projection(&down, dx, dref, 47, "down",NULL);
-        float router_clip=1.0f;
-        (void)q8pv16_f32_projection(&router, dx, rref, 47, "router",&router_clip);
-        bad |= q8pv8_f32_projection(&router, dx, rref, 47, "router");
+        int bad=0;
+        if(strcmp(only,"q8pair")){
+            bad=q8pv16_f32_projection(&down,dx,dref,47,"down",NULL);
+            float router_clip=1.0f;
+            (void)q8pv16_f32_projection(&router,dx,rref,47,"router",&router_clip);
+            bad|=q8pv8_f32_projection(&router,dx,rref,47,"router");
+        }
         bad |= q8w16_pair_perf(&router, &down, dx, rref, dref,47);
         probe_free(dx);
         probe_free(dref);

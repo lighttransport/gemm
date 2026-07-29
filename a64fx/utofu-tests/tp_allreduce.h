@@ -214,15 +214,15 @@ static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
      * drain the MRQ once at wait ENTRY (+ once on completion, below) — overflow
      * pressure is ~1 notice per recv, so per-wait draining keeps the queue near
      * empty without polling it inside the hot spin; civac the trailer line only
-     * every 64th spin — bounded staleness (a few hundred ns) instead of a
+     * every eighth spin — bounded staleness without a
      * clean+invalidate+dsb on every iteration. Correctness envelope is the same
      * as robust=1 (nothing is skipped, only done less often); validated
-     * bitwise vs robust=1 under the qlair sim, stability at 10^4+ reduces on
-     * real TNIs still needs a job. */
+     * bitwise vs robust=1 under the qlair sim and for 16K sequential reduces
+     * on a real 12-node A64FX allocation. */
     if (c->robust >= 2) tp_ar_drain_mrq(c);
     while (*trl < tok) {
         if (c->robust == 1) { tp_ar_drain_mrq(c); tp_ar_flag_inval(trl); }
-        else if (c->robust >= 2 && (spins & 63ul) == 63ul) tp_ar_flag_inval(trl);
+        else if (c->robust >= 2 && (spins & 7ul) == 7ul) tp_ar_flag_inval(trl);
         if (c->ack) tp_ar_service_pending(c);   /* re-drive my outstanding send while I block here */
         /* TP_AR_SPIN_DBG=1: report long spins UNBUFFERED (raw write; simulator-friendly —
          * under qlair the sim-time TP_AR_TIMEOUT is effectively unreachable). */

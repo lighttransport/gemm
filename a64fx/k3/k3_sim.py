@@ -274,6 +274,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            link_gbps: float, imbalance: float, expert_ms: float,
            expert_samples: int, moe_collectives: int,
            latent_overlap: bool, hierarchical_ar: bool,
+           lean_collective_speedup: float = 1.105,
            expert_tp: bool = False, expert_tp_layer_ms: float = .063,
            fused_moe_ar: bool = False, dense_q8: bool = False,
            q8_down_gbps: float = 140.0, q8_up_gbps: float = 173.0,
@@ -281,7 +282,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            q8w16_up: bool = False, q8w16_up_gbps: float = 300.0,
            q8w16_dense: bool = False, q8w16_pair_gbps: float = 280.0,
            moe_prefetch_mib: float = 16.0, prefetch_gbps: float = 248.0,
-           prefetch_launch_us: float = 22.0) -> dict:
+           prefetch_launch_us: float = 33.0) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB -
@@ -322,6 +323,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
     # decay, prediction dot, delta update and output dot; measured single-head kernel.
     kda_ops = batch * KDA_LAYERS * math.ceil(HEADS / nodes) * HEAD_DIM * HEAD_DIM * 6
     kda_s = kda_ops / (kda_gops * 1e9)
+    moe_comm = 0.0
     if fused_moe_ar:
         # 93 attention + one dense output, then one concatenated
         # [routed-latent, shared-hidden] reduction per MoE layer.
@@ -346,6 +348,10 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
     else:
         hidden_comm_s, latent_comm_s, collective_calls = collective_seconds(
             nodes, batch, moe_collectives, latency_us, link_gbps, hierarchical_ar)
+    effective_lean = lean_collective_speedup if hierarchical_ar else 1.0
+    hidden_comm_s /= effective_lean
+    latent_comm_s /= effective_lean
+    moe_comm /= effective_lean
     # Only the TP shard of the shared expert is independent of the routed
     # latent reduction.  It is 0.253 GB/rank over the whole 96-node stack, so
     # this overlap is intentionally capped and cannot hide arbitrary comm.
@@ -429,6 +435,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
           f"KDA={args.kda_gops:g} GOP/s, "
           f"GEMM={args.gemm_tflops:g} TF/s, collective={args.latency_us:g} us/step, "
           f"hierarchical={'on' if args.hierarchical_ar else 'off'}, "
+          f"lean-decode={(args.lean_collective_speedup if args.hierarchical_ar else 1.0):g}x, "
           f"latent-overlap={'on' if args.latent_overlap else 'off'}")
     if args.expert_tp or args.fused_moe_ar or args.dense_q8 or args.q8_up_only or args.q8w16_up or args.q8w16_dense or args.attention_rsag:
         print(f"architecture: expert-TP={args.expert_tp} ({args.expert_tp_layer_ms:g} ms/layer), "
@@ -466,7 +473,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
                        args.mxfp4_gbps,args.kda_gops,
                        args.latency_us,args.link_gbps,args.imbalance,
                        args.expert_ms,args.expert_samples,args.moe_collectives,
-                       args.latent_overlap,args.hierarchical_ar,args.expert_tp,
+                       args.latent_overlap,args.hierarchical_ar,args.lean_collective_speedup,args.expert_tp,
                        args.expert_tp_layer_ms,args.fused_moe_ar,args.dense_q8,
                        args.q8_down_gbps,args.q8_up_gbps,args.attention_rsag,
                        args.q8_up_only,args.q8w16_up,args.q8w16_up_gbps,
@@ -571,8 +578,10 @@ def main() -> None:
                    help="routed-up bytes prefetched per layer during the fused MoE reduction")
     p.add_argument("--prefetch-gbps", type=float, default=248.0,
                    help="p95 cache-line prefetch bandwidth measured on A64FX")
-    p.add_argument("--prefetch-launch-us", type=float, default=22.0,
+    p.add_argument("--prefetch-launch-us", type=float, default=33.0,
                    help="measured async-helper overhead per MoE layer")
+    p.add_argument("--lean-collective-speedup", type=float, default=1.105,
+                   help="robust=2 decode collective speedup measured against eager polling")
     p.add_argument("--attention-rsag", action="store_true",
                    help="model measured real RSAG (1.03x flat tree; rejected)")
     p.add_argument("--json", type=Path, help="also write full results as JSON")
@@ -591,8 +600,8 @@ def main() -> None:
         p.error("--nodes must be in [1,96] for head TP")
     if args.decode_target_tps <= 0:
         p.error("--decode-target-tps must be positive")
-    if args.moe_prefetch_mib < 0 or args.prefetch_gbps <= 0 or args.prefetch_launch_us < 0:
-        p.error("prefetch size/overhead must be nonnegative and bandwidth positive")
+    if args.moe_prefetch_mib < 0 or args.prefetch_gbps <= 0 or args.prefetch_launch_us < 0 or args.lean_collective_speedup <= 0:
+        p.error("prefetch size/overhead and lean speedup must be nonnegative/positive")
     split = fallback_weights() if args.no_manifest else scan_weights(args.model_dir)
     result = report(args, split)
     if args.json:

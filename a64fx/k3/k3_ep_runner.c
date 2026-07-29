@@ -51,6 +51,7 @@ typedef struct {
     int mla_cache_bf16;
     int heartbeat_tokens;
     int ar_groups;
+    int comm_robust;
     int prefetch_mib;
     k3_mode mode;
     const char *stage_dir;
@@ -82,7 +83,7 @@ static void usage(const char *p){
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
         "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
-        "          [--ar-groups N] [--prefetch-mib N]\n"
+        "          [--ar-groups N] [--comm-robust 1|2] [--prefetch-mib N]\n"
         "          (ar-groups: 0=flat, otherwise N contiguous groups)\n",p);
 }
 static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
@@ -93,7 +94,7 @@ static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
 }
 static int parse_options(int argc,char **argv,k3_options *o){
     *o=(k3_options){.nodes=96,.layers=1,.tokens=2,.threads=48,.layer=1,
-        .mla_cache_bf16=1,.heartbeat_tokens=1024,
+        .mla_cache_bf16=1,.heartbeat_tokens=1024,.comm_robust=2,
         .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.stage_dir="/local/k3-runner",
         .status_dir=".",.topo_path="tofu_topo.txt"};
     for(int i=1;i<argc;++i){const char *a=argv[i];
@@ -112,6 +113,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--mla-cache-fp32")){o->mla_cache_bf16=0;}
         else if(!strcmp(a,"--heartbeat-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->heartbeat_tokens))return-1;}
         else if(!strcmp(a,"--ar-groups")){VALUE();if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
+        else if(!strcmp(a,"--comm-robust")){VALUE();if(parse_int(a,argv[i],1,2,&o->comm_robust))return-1;}
         else if(!strcmp(a,"--prefetch-mib")){VALUE();if(parse_int(a,argv[i],0,32,&o->prefetch_mib))return-1;}
         else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
         else if(!strcmp(a,"--stage-dir")){VALUE();o->stage_dir=argv[i];}
@@ -155,6 +157,9 @@ static int runner_allreduce_sum(k3_runner_comm *c,float *buf,int count){
 static int runner_allreduce_max(k3_runner_comm *c,float *buf,int count){
     return c->groups?tp_allreduce_max_2d_checked(&c->row,&c->col,buf,count):
         tp_allreduce_max_checked(&c->row,buf,count);
+}
+static void runner_comm_set_robust(k3_runner_comm *c,int robust){
+    c->row.robust=robust;if(c->groups)c->col.robust=robust;
 }
 
 typedef struct {
@@ -490,7 +495,7 @@ int main(int argc,char **argv){
         if(rc==UTOFU_SUCCESS)rc=utofu_query_stadd(g_peer_vcq[r],K3_RUN_STAG,&g_peer_base[r]);
         if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: peer %d bootstrap rc=%d\n",g_rank,r,rc);return 3;}}
     free(tnis);runner_barrier();
-    tp_comm_config comm_config={.robust=1,.a2a_max=8192,.ack_retx=64,.ack_rtt=0.001,.timeout=120.0};
+    tp_comm_config comm_config={.robust=opt.comm_robust,.a2a_max=8192,.ack_retx=64,.ack_rtt=0.001,.timeout=120.0};
     if(opt.profile&&getenv("K3_DEBUG_COMM_DROP_N")){
         comm_config.drop_n=strtoul(getenv("K3_DEBUG_COMM_DROP_N"),NULL,10);
         if(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))comm_config.timeout=atof(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))*1e-3;}
@@ -618,10 +623,12 @@ int main(int argc,char **argv){
             reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
             reduce[K3_CONTROL_NUMERIC]=finite?0.0f:1.0f;
             if(opt.profile)phase[3]+=now_sec()-pt;pt=opt.profile?now_sec():0;
-            if(prefetch_bytes){runner_async_submit(&async_reduce,reduce,K3_RUN_REDUCE_FLOATS);
+            if(prefetch_bytes){runner_comm_set_robust(&comm,1);
+                runner_async_submit(&async_reduce,reduce,K3_RUN_REDUCE_FLOATS);
                 int pth=opt.threads<K3_Q8W16_UP_THREADS?opt.threads:K3_Q8W16_UP_THREADS;
                 prefetch_sink+=k3_prefetch_weight_window(prefetch_weights,prefetch_bytes,pth);
                 collective_rc=runner_async_wait(&async_reduce);
+                runner_comm_set_robust(&comm,opt.comm_robust);
             }else collective_rc=runner_allreduce_sum(&comm,reduce,K3_RUN_REDUCE_FLOATS);
             if(collective_rc){
                 fprintf(stderr,"k3_ep_runner rank %d: layer collective failed at token=%d layer=%d: %s\n",
@@ -682,9 +689,9 @@ int main(int argc,char **argv){
     write_status(&opt,final_state,final_reason,tokens_completed,last_layer,runner_comm_seq(&comm),seconds,checksum,pool.peak_active_bytes);
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
-        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d prefetch_mib=%d prefetch_checksum=%llu\n",
+        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d prefetch_mib=%d prefetch_checksum=%llu\n",
             opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",
-            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.prefetch_mib,(unsigned long long)prefetch_sink);
+            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.prefetch_mib,(unsigned long long)prefetch_sink);
         printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
             !comm_failed&&!stop_signal&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal?"STOPPED":"FAIL",final_reason,tokens_completed,
             seconds,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));
