@@ -437,22 +437,22 @@ static inline void k3_attention_heads_parallel_sve(float *out, const float *q,
 #pragma omp for schedule(static)
 #endif
         for(int h=0;h<heads;++h){
-            float m=-INFINITY,l=0.0f;
+            float m=-INFINITY;double l=0.0;
             for(int p=0;p<parts;++p)m=fmaxf(m,stats[((size_t)h*parts+p)*2]);
             for(int p=0;p<parts;++p){size_t s=((size_t)h*parts+p)*2;
-                l+=stats[s+1]*expf(stats[s]-m);}
+                float weight=expf(stats[s]-m);l+=(double)stats[s+1]*weight;stats[s]=weight;}
             size_t g=(size_t)heads*parts*2+(size_t)h*2;
-            stats[g]=m;stats[g+1]=l;
+            stats[g]=m;stats[g+1]=(float)l;
         }
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
         for(int task=0;task<heads*v_dim;++task){
-            int h=task/v_dim,j=task%v_dim;float z=0.0f;
+            int h=task/v_dim,j=task%v_dim;double z=0.0;
             size_t g=(size_t)heads*parts*2+(size_t)h*2;
             for(int p=0;p<parts;++p){size_t s=((size_t)h*parts+p)*2;
-                z+=scratch[((size_t)h*parts+p)*v_dim+j]*expf(stats[s]-stats[g]);}
-            out[task]=z/stats[g+1];
+                z+=(double)scratch[((size_t)h*parts+p)*v_dim+j]*stats[s];}
+            out[task]=(float)(z/stats[g+1]);
         }
 #if defined(_OPENMP)
     }

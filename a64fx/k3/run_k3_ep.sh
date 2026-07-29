@@ -121,7 +121,7 @@ runner_rc=$?
 set -e
 
 passes=$(grep -l 'state=pass' "$RESULT_DIR"/k3_rank*.status 2>/dev/null | wc -l || true)
-grep -hE 'K3_RUN|K3_RESULT|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
+grep -hE 'K3_RUN|K3_RESULT|K3_HEALTH|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
 echo "K3 distributed result: rc=$runner_rc pass_markers=$passes/$NODES results=$RESULT_DIR"
 
 # Rank-local storage is job-scoped and is wiped by the scheduler. Deliberately

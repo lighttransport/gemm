@@ -676,6 +676,42 @@ passed 12/12 ranks at 2,365 layer-steps/s after the fusion. This optimization ad
 local scheduling only; the allreduce remains outside the OpenMP region and continues
 to cost approximately 0.11--0.12 ms per partial layer step on 12 nodes.
 
+### Long-context stability and compact state
+
+Runtime state is now indexed by compact layer-type slots rather than the decoder-layer
+index. A full network allocates 69 recurrent KDA slots and 24 MLA cache slots; the old
+layout incorrectly reserved MLA cache for all 93 layers. In the 16-token full-network
+control this reduced managed peak memory from 83.69 to 60.91 MiB/rank while preserving
+the checksum and passing all ranks. At 4K context the change avoids approximately
+2.9 GiB of unnecessary FP32 cache allocation per TP=12 rank. A KDA-only range now
+allocates no MLA cache, so `--tokens` accepts values through 1,048,576 for bounded
+recurrent stress testing without an unrelated context allocation.
+
+Before allocating recurrent state or K/V cache, every rank compares the exact byte
+requirement with `MemAvailable` and retains a 6 GiB reserve. Failure is reduced across
+all ranks before entering the token loop. A deliberately impossible 1M-token,
+93-layer request required 245,794 MiB/rank and was rejected by all 12 ranks with
+`alloc-failed`; no large allocation was attempted and no peer entered a collective
+alone. `K3_HEALTH` reports compact slot counts, state/cache sizes, global latent maximum,
+KDA-state maximum, and MLA-cache maximum after every successful run.
+
+The parallel MLA combine now computes each block's log-sum-exp weight once and reuses
+it for all 128 value dimensions. Previously it evaluated the same exponential 128
+times per block. A double accumulator is used for the small final block sum before
+rounding the output to FP32. The independent three-head correctness test remains within
+`2.8e-9` of serial online attention. On 12 nodes, the 8K synthetic MLA phase improved
+from 0.262 to 0.239 ms/step and end-to-end throughput rose from 1,589 to 1,665 partial
+layer-steps/s. The optimized 16K run used 160 MiB cache/rank and passed 12/12 ranks at
+1,327 layer-steps/s with `mla_cache_max=0.139` and stable latent RMS.
+
+The real layer-1 KDA+MoE path also completed 65,536 recurrent steps on all 12 ranks in
+27.12 seconds (2,416 partial layer-steps/s). Latent RMS remained 7.4833,
+`kda_state_max` was 0.107 versus 0.110 at 8K, and checksum disagreement was below
+`1e-8`, showing no slow recurrent-state growth in this bounded test. These stress runs
+still use synthetic attention inputs and only real MXFP4 expert slices; they validate
+state evolution, cache indexing, collectives, and failure handling rather than
+full-model generation quality.
+
 All figures in this section are partial-runner measurements: real mode supplies real
 MXFP4 expert slices but still uses synthetic attention projections and omits the full
 dense/shared completion, embedding, tokenizer, and LM head. They are useful for kernel
