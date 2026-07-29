@@ -319,7 +319,9 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
         attention_comm = allreduce_seconds(nodes, HIDDEN * 2 * batch,
                                            LAYERS, latency_us, link_gbps)
         if attention_rsag:
-            attention_comm *= .52
+            # 12-node real BF16 scatter+SVE-sum+gather is 1.03x the tree.
+            # Keep the switch as a measured rejected alternative, not a win.
+            attention_comm *= 1.03
         elif hierarchical_ar:
             attention_comm /= hierarchical_ar_speedup(HIDDEN * batch)
         dense_comm = allreduce_seconds(nodes, HIDDEN * 2 * batch, 1,
@@ -518,7 +520,7 @@ def main() -> None:
     p.add_argument("--q8w16-up-gbps", type=float, default=218.0,
                    help="measured stored-byte bandwidth for Q8W16 routed-up")
     p.add_argument("--attention-rsag", action="store_true",
-                   help="use decomposed reduce-scatter/allgather attention reduction")
+                   help="model measured real RSAG (1.03x flat tree; rejected)")
     p.add_argument("--json", type=Path, help="also write full results as JSON")
     args = p.parse_args()
     if args.dense_q8 and not args.fused_moe_ar:

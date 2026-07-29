@@ -452,7 +452,8 @@ GB/s at 44 workers, and the shared hidden residual is now added inside the same
 workshare. It estimates 14.67 tok/s and 25.05 GB/rank at M=1. At
 M=32 it reaches 185.6 aggregate tok/s but models 27.15 GB/rank, narrowly beyond the
 strict 27 GB guard. Use `--q8-up-only`; this remains experimental because routed-up
-alone still fails the projection-level relative-L2 gate.
+alone still fails the projection-level relative-L2 gate. These rates used the former
+wire-only attention-RSAG projection and are retracted by the real-sum measurement below.
 
 A 12-node multi-TNI probe used the fused MoE payload size (21,504 bytes in BF16).
 One TNI was fastest at 4.598 us/hop and 4.68 GB/s. Two through six TNIs regressed
@@ -463,12 +464,14 @@ topological peers; adding VCQs for byte striping will not close the remaining ga
 ### 20 token/s stretch work
 
 The K3-sized attention collective was measured separately on the current 12-node
-allocation. For 7,168 BF16 elements, the existing recursive-doubling tree takes
-20.73 us. Six-TNI direct reduce-scatter takes 4.77 us and the matching all-gather
-takes 4.82 us, or 9.59 us combined (0.46x the tree). This supports the simulator's
-conservative `--attention-rsag` factor of 0.52. The legacy communication benchmark
-does not perform the receiver-side addition, so a production RSAG primitive still
-needs real-sum correctness and timing before runner integration.
+allocation. The original wire-only probe reported 9.59 us for six-TNI scatter plus
+gather versus 20.73 us for the tree, but it omitted the sum and used an unsafe trailing
+sequence word. Real payload reads exposed incomplete/overwritten tail cache lines.
+The corrected protocol uses ordered completion puts and disjoint scatter/gather landing
+areas. Its SVE BF16 receiver sum takes 2.33 us and passes full numerical validation.
+End-to-end scatter + sum + gather is 21.46 us versus 20.80 us for the tree (1.03x):
+RSAG is rejected. `--attention-rsag` now models this measured regression rather than
+the retracted 0.52 factor.
 
 Several additional real routed-up and KDA probes delimit the useful kernel space:
 
@@ -490,9 +493,9 @@ Several additional real routed-up and KDA probes delimit the useful kernel space
   caused slower outliers, so the modeled rate is an optimistic clean-run calibration.
 
 The quality-gated simulator mode is `--q8w16-up`. With expert TP, fused MoE reduction,
-hierarchical collectives, and attention RSAG, it estimates 14.70 token/s at 4K M=1
-and 186.3 aggregate token/s at M=32. M=1 fits at 25.64 GB/rank; M=32 is 27.74 GB and
-misses the strict 27 GB guard. The M=1 breakdown is 40.3 ms weights, 8.6 ms experts,
-0.7 ms KV/KDA, and 18.4 ms communication. Reaching 20 token/s requires 18 ms more
-than the current model and cannot be obtained from routed-up optimization alone;
-it requires a production low-depth collective and/or cross-layer pipeline overlap.
+and hierarchical tree collectives, it estimates 13.77 token/s at 4K M=1 and 180.3
+aggregate token/s at M=32. M=1 fits at 25.64 GB/rank; M=32 is 27.74 GB and misses the
+strict 27 GB guard. The M=1 breakdown is 40.3 ms weights, 8.6 ms experts, 0.7 ms
+KV/KDA, and 23.0 ms communication. Reaching 20 token/s requires about 22.6 ms more
+than the validated model and cannot be obtained from routed-up optimization alone;
+it requires a genuinely lower-depth collective or cross-layer pipeline overlap.
