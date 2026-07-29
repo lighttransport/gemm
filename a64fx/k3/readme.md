@@ -680,7 +680,12 @@ requested mode immediately afterward. With 47 compute workers, three hierarchy
 groups, and a 16 MiB window, this hybrid path measured **112.1 us** versus
 **101.6 us** without prefetch in the dummy run. The repeated real-weight path
 measured 115.2--119.2 us versus an 86.7 us baseline, so the simulator uses a
-conservative **33 us** charge. Two alternatives were measured and rejected:
+33 us typical-run charge. A subsequent concurrency sweep selected 32 prefetch
+workers: four repeated stages were 123.9, 128.4, 123.9, and 137.4 us, while 28
+workers reached 216.0 us and 36 reached 169.8 us. Auto mode now uses 32 workers,
+and the stable simulator uses the conservative **51 us** rank-max charge.
+`--prefetch-threads N` permits explicit profiling overrides. Two alternatives
+were measured and rejected:
 
 - keeping communication and prefetch inside the existing OpenMP team cost
   139.7 us for 16 MiB because uTofu and HBM fills interfered;
@@ -696,8 +701,9 @@ the full runner exposes the next layer's Q8W16 routed-up allocation.
 
 With the real 96-shard manifest, 0.063 ms selected-expert kernel, 300 GB/s
 routed-up, 280 GB/s router/down, 248 GB/s cache-line fill, 1.105x lean decode
-collectives, and the conservative 33 us hybrid charge, the model predicts
-**about 54 ms/token = 18.5 token/s** for 4K M=1 on 96 nodes. Memory is 23.53
+collectives, and the conservative 51 us hybrid charge, the model predicts
+**55.66 ms/token = 17.97 token/s** for 4K M=1 on 96 nodes. The typical 33 us
+charge gives about **18.5 token/s**. Memory is 23.53
 GB/rank. The earlier 20.11 token/s number used the faster dummy-only 1.258x/13 us
 pair and is retracted by the real A/B. The 20 token/s stretch remains open; it
 requires another roughly 4 ms/token from router/down bandwidth or a 96-node
@@ -712,6 +718,17 @@ accumulators spilled and reduced the floor to 205.5--210.0 GB/s. Production
 therefore retains the eight-row kernel and conservative 280 GB/s model value.
 `k3_dense_probe --only q8pair` now isolates this quality/performance gate for
 future work without running unrelated quantizers.
+
+Compressing Q8 scales also failed to improve M=1. BF16 scales reduced the
+routed-down layout from 0.625x to 0.5625x BF16 bytes but narrowly failed quality
+(0.5046% relative L2). FP16 scales passed at 0.4778%, yet converting scales in
+the inner loop raised p95 from roughly 151 to 161 us. Compressing only router
+scales and retuning to 16 router workers recovered about 154 us but did not beat
+the original kernel. Both compressed layouts were removed from production.
+
+Windows larger than 16 MiB are likewise rejected: real 24 and 32 MiB runs raised
+the collective stage to 212.4 and 245.0 us, more than the additional cached
+weight bytes can repay. The stable runner therefore keeps a 16 MiB window.
 
 Reproduce the real partial validation in a 12-node allocation with:
 

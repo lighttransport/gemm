@@ -36,6 +36,7 @@
 #define K3_RUN_REDUCE_FLOATS (K3_MOE_REDUCE_FLOATS+2)
 #define K3_CONTROL_SIGNAL K3_MOE_REDUCE_FLOATS
 #define K3_CONTROL_NUMERIC (K3_MOE_REDUCE_FLOATS+1)
+#define K3_RUN_PREFETCH_THREADS 32
 
 typedef enum { K3_MODE_DUMMY, K3_MODE_REAL } k3_mode;
 typedef struct {
@@ -53,6 +54,7 @@ typedef struct {
     int ar_groups;
     int comm_robust;
     int prefetch_mib;
+    int prefetch_threads;
     k3_mode mode;
     const char *stage_dir;
     const char *status_dir;
@@ -83,7 +85,7 @@ static void usage(const char *p){
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
         "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
-        "          [--ar-groups N] [--comm-robust 1|2] [--prefetch-mib N]\n"
+        "          [--ar-groups N] [--comm-robust 1|2] [--prefetch-mib N] [--prefetch-threads N]\n"
         "          (ar-groups: 0=flat, otherwise N contiguous groups)\n",p);
 }
 static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
@@ -115,6 +117,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--ar-groups")){VALUE();if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
         else if(!strcmp(a,"--comm-robust")){VALUE();if(parse_int(a,argv[i],1,2,&o->comm_robust))return-1;}
         else if(!strcmp(a,"--prefetch-mib")){VALUE();if(parse_int(a,argv[i],0,32,&o->prefetch_mib))return-1;}
+        else if(!strcmp(a,"--prefetch-threads")){VALUE();if(parse_int(a,argv[i],0,48,&o->prefetch_threads))return-1;}
         else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
         else if(!strcmp(a,"--stage-dir")){VALUE();o->stage_dir=argv[i];}
         else if(!strcmp(a,"--status-dir")){VALUE();o->status_dir=argv[i];}
@@ -141,6 +144,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
         fprintf(stderr,"k3_ep_runner: phase team sizes cannot exceed --threads %d\n",o->threads);return-1;}
     if(o->prefetch_mib&&o->threads>47){
         fprintf(stderr,"k3_ep_runner: --prefetch-mib requires --threads <=47 to reserve one communication core\n");return-1;}
+    if(o->prefetch_threads>o->threads){
+        fprintf(stderr,"k3_ep_runner: --prefetch-threads cannot exceed --threads %d\n",o->threads);return-1;}
     return 0;
 }
 
@@ -625,7 +630,8 @@ int main(int argc,char **argv){
             if(opt.profile)phase[3]+=now_sec()-pt;pt=opt.profile?now_sec():0;
             if(prefetch_bytes){runner_comm_set_robust(&comm,1);
                 runner_async_submit(&async_reduce,reduce,K3_RUN_REDUCE_FLOATS);
-                int pth=opt.threads<K3_Q8W16_UP_THREADS?opt.threads:K3_Q8W16_UP_THREADS;
+                int pth=opt.prefetch_threads?opt.prefetch_threads:
+                    (opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS);
                 prefetch_sink+=k3_prefetch_weight_window(prefetch_weights,prefetch_bytes,pth);
                 collective_rc=runner_async_wait(&async_reduce);
                 runner_comm_set_robust(&comm,opt.comm_robust);
@@ -689,9 +695,10 @@ int main(int argc,char **argv){
     write_status(&opt,final_state,final_reason,tokens_completed,last_layer,runner_comm_seq(&comm),seconds,checksum,pool.peak_active_bytes);
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
-        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d prefetch_mib=%d prefetch_checksum=%llu\n",
+        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
             opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",
-            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.prefetch_mib,(unsigned long long)prefetch_sink);
+            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.prefetch_mib,
+            opt.prefetch_threads?opt.prefetch_threads:(opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS),(unsigned long long)prefetch_sink);
         printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
             !comm_failed&&!stop_signal&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal?"STOPPED":"FAIL",final_reason,tokens_completed,
             seconds,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));

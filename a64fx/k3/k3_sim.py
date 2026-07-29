@@ -282,7 +282,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            q8w16_up: bool = False, q8w16_up_gbps: float = 300.0,
            q8w16_dense: bool = False, q8w16_pair_gbps: float = 280.0,
            moe_prefetch_mib: float = 16.0, prefetch_gbps: float = 248.0,
-           prefetch_launch_us: float = 33.0) -> dict:
+           prefetch_launch_us: float = 51.0) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB -
@@ -578,7 +578,7 @@ def main() -> None:
                    help="routed-up bytes prefetched per layer during the fused MoE reduction")
     p.add_argument("--prefetch-gbps", type=float, default=248.0,
                    help="p95 cache-line prefetch bandwidth measured on A64FX")
-    p.add_argument("--prefetch-launch-us", type=float, default=33.0,
+    p.add_argument("--prefetch-launch-us", type=float, default=51.0,
                    help="measured async-helper overhead per MoE layer")
     p.add_argument("--lean-collective-speedup", type=float, default=1.105,
                    help="robust=2 decode collective speedup measured against eager polling")
