@@ -27,6 +27,7 @@ TOP_K = 16
 LATENT = 3584
 EXPERT_INTER = 3072
 USABLE_GB = 27.0
+ATTENTION_GB = 72.404  # header-scan total; small head-TP slices use a separate decode rate
 
 # Header-scan fallback, decimal GB, from the release checkpoint.
 FALLBACK = {
@@ -161,12 +162,16 @@ def active_expert_gb(split: WeightSplit, nodes: int, batch: int,
 
 
 def decode(split: WeightSplit, nodes: int, context: int, batch: int,
-           bw_gbps: float, mxfp4_gbps: float, kda_gops: float, latency_us: float,
+           bw_gbps: float, head_bw_gbps: float, mxfp4_gbps: float,
+           kda_gops: float, latency_us: float,
            link_gbps: float, imbalance: float) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
-    dense = split.replicated + split.shardable / nodes
+    attention = min(ATTENTION_GB, split.shardable) / nodes
+    other_tp = max(0.0, split.shardable - ATTENTION_GB) / nodes
+    dense = split.replicated + attention + other_tp
     cache = MLA_LAYERS * context * math.ceil(HEADS / nodes) * (192 + 128) * 2 / 1e9
-    weight_s = dense / bw_gbps + expert / mxfp4_gbps
+    weight_s = (split.replicated + other_tp) / bw_gbps
+    weight_s += attention / head_bw_gbps + expert / mxfp4_gbps
     cache_s = cache / bw_gbps
     # decay, prediction dot, delta update and output dot; measured single-head kernel.
     kda_ops = batch * KDA_LAYERS * math.ceil(HEADS / nodes) * HEAD_DIM * HEAD_DIM * 6
@@ -178,7 +183,8 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
     predicted = lower + comm_s
     return {
         "context": context, "batch": batch,
-        "dense_gb": dense, "active_expert_gb": expert, "mla_scan_gb": cache,
+        "dense_gb": dense, "attention_tp_gb": attention,
+        "active_expert_gb": expert, "mla_scan_gb": cache,
         "weight_ms": weight_s * 1e3, "cache_ms": cache_s * 1e3,
         "kda_ms": kda_s * 1e3, "comm_ms": comm_s * 1e3,
         "lower_bound_ms": lower * 1e3, "predicted_ms": predicted * 1e3,
@@ -224,7 +230,8 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"manifest: {split.source} ({split.shards} shards, {split.tensors:,} tensors)")
     print(f"text weights: {split.total_text:.3f} GB = experts {split.experts:.3f} + "
           f"replicated {split.replicated:.3f} + TP {split.shardable:.3f}")
-    print(f"calibration: dense-BW={args.bw_gbps:g} GB/s, MXFP4-BW={args.mxfp4_gbps:g} GB/s, "
+    print(f"calibration: dense-BW={args.bw_gbps:g} GB/s, head-slice-BW={args.head_bw_gbps:g} GB/s, "
+          f"MXFP4-BW={args.mxfp4_gbps:g} GB/s, "
           f"KDA={args.kda_gops:g} GOP/s, "
           f"GEMM={args.gemm_tflops:g} TF/s, collective={args.latency_us:g} us/step")
     print("\nMemory (fullest rank, expanded BF16 MLA cache)")
@@ -241,7 +248,8 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"{'ctx':>5} {'M':>3} {'W ms':>8} {'KV ms':>8} {'KDA ms':>8} {'comm ms':>8} {'tok/s':>9}")
     for ctx in args.contexts:
         for batch in args.batches:
-            d = decode(split,args.nodes,ctx,batch,args.bw_gbps,args.mxfp4_gbps,args.kda_gops,
+            d = decode(split,args.nodes,ctx,batch,args.bw_gbps,args.head_bw_gbps,
+                       args.mxfp4_gbps,args.kda_gops,
                        args.latency_us,args.link_gbps,args.imbalance)
             result["decode"].append(d)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:8.1f} {d['cache_ms']:8.1f} "
@@ -276,9 +284,12 @@ def main() -> None:
     p.add_argument("--usable-gb", type=float, default=USABLE_GB)
     p.add_argument("--kv-bytes", type=int, choices=(1,2), default=2)
     p.add_argument("--bw-gbps", type=float, default=336.0, help="effective per-rank decode bandwidth")
+    p.add_argument("--head-bw-gbps", type=float, default=83.6,
+                   help="measured cache-evicted one-head BF16 projection bandwidth")
     p.add_argument("--mxfp4-gbps", type=float, default=180.0,
                    help="48-core MXFP4 bandwidth; extrapolated from the measured 3.75 GB/s/core")
-    p.add_argument("--kda-gops", type=float, default=0.287, help="measured per-core KDA rate")
+    p.add_argument("--kda-gops", type=float, default=11.35,
+                   help="12-node mean one-head KDA rate at the optimal 8 threads")
     p.add_argument("--gemm-tflops", type=float, default=1.25, help="assumed per-rank BF16-equivalent GEMM")
     p.add_argument("--latency-us", type=float, default=20.0, help="assumed allreduce latency per log2 step")
     p.add_argument("--link-gbps", type=float, default=8.0)

@@ -184,15 +184,15 @@ static inline void k3_kda_step_ref(float *out, const float *q, const float *k,
     }
 }
 
-static inline void k3_kda_step_sve(float *out, const float *q, const float *k,
-                                   const float *v, const float *log_decay,
+static inline void k3_kda_step_decay_sve(float *out, const float *q, const float *k,
+                                   const float *v, const float *decay,
                                    const float *beta, float *state,
                                    int heads, int key_dim, int value_dim) {
     float scale = 1.0f / sqrtf((float)key_dim);
     for (int h = 0; h < heads; ++h) {
         const float *qh = q + (size_t)h * key_dim;
         const float *kh = k + (size_t)h * key_dim;
-        const float *gh = log_decay + (size_t)h * key_dim;
+        const float *dh = decay + (size_t)h * key_dim;
         float *sh = state + (size_t)h * value_dim * key_dim;
         for (int j = 0; j < value_dim; ++j) {
             float *row = sh + (size_t)j * key_dim;
@@ -200,14 +200,11 @@ static inline void k3_kda_step_sve(float *out, const float *q, const float *k,
             int vl = (int)svcntw();
             for (int d = 0; d < key_dim; d += vl) {
                 svbool_t pg = svwhilelt_b32(d, key_dim);
-                float tmp[svcntw()];
-                svst1(pg, tmp, svld1(pg, gh + d));
-                for (int z = 0; z < vl && d + z < key_dim; ++z) tmp[z] = expf(tmp[z]);
-                svfloat32_t r = svmul_f32_x(pg, svld1(pg, row + d), svld1(pg, tmp));
+                svfloat32_t r = svmul_f32_x(pg, svld1(pg, row + d), svld1(pg, dh + d));
                 svst1(pg, row + d, r);
             }
 #else
-            for (int d = 0; d < key_dim; ++d) row[d] *= expf(gh[d]);
+            for (int d = 0; d < key_dim; ++d) row[d] *= dh[d];
 #endif
             float delta = beta[h] * (v[h * value_dim + j] - k3_dot_sve(kh, row, key_dim));
 #if defined(__ARM_FEATURE_SVE)
@@ -223,6 +220,16 @@ static inline void k3_kda_step_sve(float *out, const float *q, const float *k,
             out[h * value_dim + j] = k3_dot_sve(qh, row, key_dim) * scale;
         }
     }
+}
+
+static inline void k3_kda_step_sve(float *out, const float *q, const float *k,
+                                   const float *v, const float *log_decay,
+                                   const float *beta, float *state,
+                                   int heads, int key_dim, int value_dim) {
+    size_t n = (size_t)heads * key_dim;
+    float decay[n];
+    for (size_t i = 0; i < n; ++i) decay[i] = expf(log_decay[i]);
+    k3_kda_step_decay_sve(out,q,k,v,decay,beta,state,heads,key_dim,value_dim);
 }
 
 /* Stable online softmax for one query. keys=[tokens][qk_dim], values=[tokens][v_dim]. */

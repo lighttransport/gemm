@@ -139,15 +139,18 @@ Run the native checks and the 96-node report with:
 make -C a64fx/k3 clean test
 make -C a64fx/k3 validate
 make -C a64fx/k3 real-test
+make -C a64fx/k3 probe-kda
+make -C a64fx/k3 probe-kda-mpi
 python3 a64fx/k3/k3_sim.py
 ```
 
 The current native test passes all primitives on 512-bit SVE. A representative run on
 the interactive A64FX node measured 3.86 GB/s per core for the 8-row, K=3584 MXFP4
-matvec and 0.279 GOP/s per core (352 microseconds) for one 128x128 KDA head step. These
-are microkernel measurements, not full-node or end-to-end runner results. MXFP4 scaling
-to 48 cores is an explicit simulator assumption; collective and dense-kernel constants
-remain inherited calibration assumptions until the six-node runner measures them.
+matvec. Hoisting KDA decay exponentiation out of the 128 value-row loop reduced one
+synthetic 128x128 head step from roughly 348 to 23.5 microseconds on one core, about a
+15x graph-level improvement. These are microkernel measurements, not full-node or
+end-to-end runner results. MXFP4 scaling to 48 cores remains a simulator assumption;
+collective constants remain inherited until the distributed runner measures them.
 
 The manifest scan validates 497,220 tensor entries across 96 shards and assigns the
 text checkpoint as follows (decimal GB):
@@ -164,18 +167,18 @@ K/V and a 27 GB usable budget, 4K context fits through batch 32, and 128K fits o
 batch 1. One-million-token context does not fit even at batch 1 (39.81 GB total), which
 confirms that context-parallel MLA is required rather than optional.
 
-With the current default assumptions (336 GB/s dense bandwidth, 180 GB/s 48-core
-MXFP4 bandwidth, measured single-core KDA, and 20 microseconds per recursive-doubling
-collective step), the conservative 96-node decode estimates are 11.5 token/s at 4K,
-10.8 token/s at 128K, and 7.4 token/s at 1M for batch 1. The 1M result is a modeled
-compute/communication value only and is not runnable under the v1 cache layout.
+With the current default assumptions (336 GB/s large-matrix bandwidth, measured
+83.6 GB/s cache-evicted head-slice bandwidth, 180 GB/s 48-core MXFP4 bandwidth,
+measured eight-thread KDA, and 20 microseconds per recursive-doubling collective step),
+the 96-node estimates are 14.17 token/s at 4K and 13.10 token/s at 128K for batch 1.
+The 1M result remains compute-only and is not runnable under the v1 cache layout.
 
 Known implementation limits of this milestone:
 
 - The release checkpoint stores all 69 KDA `A_log` tensors as `[128]`, shared by
   key channel across heads, although the bundled Python constructor declares
   `[num_heads]` (`[96]`). The C kernel follows the actual checkpoint. The stager must
-validate `[128]` and keep this discrepancy visible until upstream clarifies it.
+  validate `[128]` and keep this discrepancy visible until upstream clarifies it.
 - The complete header validator passes: 96 shards, 497,220 tensors, 69 KDA layers,
   24 MLA layers, and all 82,432 layer/expert groups containing six exact-shape tensors.
 - A bounded real-weight test staged layer 1/expert 0 (six tensors, 16.734 MiB) and tested
@@ -195,9 +198,79 @@ validate `[128]` and keep this discrepancy visible until upstream clarifies it.
 - Transcendental functions use the scalar libm accuracy contract. SVE currently speeds
   reductions and vector algebra; SiTU, convolution bookkeeping, and sigmoid evaluation
   still need tuned vector approximations or restructuring.
-- KDA is correctness-first and single-threaded in this harness. A persistent 48-thread
-  value-row schedule is the next performance task.
+- The real KDA probe has a row-parallel recurrence, but it creates an OpenMP workshare
+  per step. The runner should retain a persistent team and use 8 threads per local
+  head; using all 48 threads on one 128-row recurrence is counterproductive.
 - The simulator's collective latency, full-node bandwidth scaling, GEMM rate, routing
   distribution, and imbalance factor are surfaced assumptions, not measured K3 data.
 - The GLM-5.2-derived stager, full layer graph, uTofu runner, and launch scripts remain
   to be implemented. No full checkpoint load or multi-node job was attempted here.
+
+## Estimated performance on 64--96 A64FX nodes
+
+The simulator's strict usable-memory limit is 27 GB/node. With the current placement,
+64 nodes require 30.86 GB/node, 72 require 29.05 GB, and 80 require 27.29 GB. The first
+configuration that fits a 4K, batch-one decode is 82 nodes. At 96 nodes, exactly one of
+the 96 attention heads resides on each rank; below 96 the critical rank owns two heads,
+which creates a visible performance step.
+
+| Nodes | 4K memory/node | Fits | Measured-KDA decode estimate |
+|---:|---:|:---:|---:|
+| 64 | 30.86 GB | no | compute-only; not deployable |
+| 72 | 29.05 GB | no | compute-only; not deployable |
+| 80 | 27.29 GB | no, narrowly | compute-only; not deployable |
+| 84 | 25.61 GB | yes | 13.69 token/s |
+| 92 | 23.89 GB | yes | 13.92 token/s |
+| 96 | 23.77 GB | yes | 14.17 token/s |
+
+The KDA calibration now comes from real layer-0/head-0 activations on all twelve nodes:
+8 threads are optimal at 8.66 microseconds/head-step and 11.35 GOP/s. Cache-evicted
+one-head BF16 projections peak at 83.6 GB/s with 24 threads. For batch-one 128K decode,
+only 96 nodes fit the expanded BF16 MLA cache; the revised estimate is 13.10 token/s.
+
+Projected prefill with chunk size 256 is:
+
+| Nodes | 1K prompt | 8K prompt | 128K prompt |
+|---:|---:|---:|---:|
+| 84 | 111 token/s | 108 token/s | does not fit |
+| 92 | 113 token/s | 110 token/s | does not fit |
+| 96 | 122 token/s | 121 token/s | 96 token/s |
+
+The projection uses 336 GB/s for large dense matrices, the measured 83.6 GB/s for
+small head-TP attention slices, 180 GB/s full-node MXFP4 bandwidth, 1.25 TFLOP/s
+BF16-equivalent GEMM per node, 20 microseconds per
+recursive-doubling collective step, and a 1.20 routed-expert imbalance factor. The
+modeled 96-node 1M prefill rate is about 37 token/s, but it cannot run with the v1 cache
+layout; context-parallel MLA is required.
+
+## Real partial KDA probe
+
+`k3_kda_stage.py` stages thirteen tensors for one real KDA head: local `q/k/v`, output
+gate, latent decay projections, beta row, convolution weights, `dt_bias`, `A_log`, and
+output norm. Layer 0/head 0 occupies only 8.802 MiB. The test executes the projection,
+causal convolution with SiLU, q/k normalization, safe decay gate, sigmoid beta,
+recurrent delta update, and gated RMSNorm. All twelve nodes produced the identical
+checksum `+4.685916041e-05`, beta `0.526281`, and finite output.
+
+Twelve-node mean scaling, with one MPI process per node, is:
+
+| Kernel | Threads | Time | Rate | Efficiency vs 1 thread |
+|---|---:|---:|---:|---:|
+| Four BF16 projections, resident | 1 | 343.85 us | 21.35 GB/s | 100% |
+| Four BF16 projections, resident | 24 | 20.52 us | 363.16 GB/s | 69.8% |
+| Four BF16 projections, resident | 48 | 17.56 us | 418.73 GB/s | 40.8% |
+| Four BF16 projections, cache-evicted | 16 | 88.98 us | 82.51 GB/s | -- |
+| Four BF16 projections, cache-evicted | 24 | 87.83 us | 83.59 GB/s | -- |
+| Four BF16 projections, cache-evicted | 48 | 98.62 us | 74.46 GB/s | -- |
+| KDA recurrence | 1 | 25.20 us | 3.90 GOP/s | 100% |
+| KDA recurrence | 4 | 9.21 us | 10.68 GOP/s | 68.4% |
+| KDA recurrence | 8 | 8.66 us | 11.35 GOP/s | 36.4% |
+| KDA recurrence | 12 | 9.13 us | 10.76 GOP/s | 23.0% |
+| KDA recurrence | 48 | 11.76 us | 8.38 GOP/s | 4.5% |
+
+The earlier six-node allocation reached 6.53 microseconds at 12 threads while retaining
+the same 25.3-microsecond single-thread result, demonstrating allocation-sensitive
+OpenMP synchronization. The eight-thread calibration is the more conservative and
+robust choice. Hoisting `exp(log_decay)` out of the value-row loop remains the dominant
+optimization: it changed the synthetic single-core recurrence from about 348 to
+23--26 microseconds.
