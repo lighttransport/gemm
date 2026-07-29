@@ -138,13 +138,14 @@ def fullest_expert_gb(split: WeightSplit, nodes: int) -> float:
 def memory(split: WeightSplit, nodes: int, context: int, batch: int,
            kv_bytes: int = 2, usable_gb: float = USABLE_GB,
            expert_tp: bool = False, dense_q8: bool = False,
-           fused_moe_ar: bool = False) -> Memory:
+           fused_moe_ar: bool = False, q8_up_only: bool = False) -> Memory:
     local_heads = math.ceil(HEADS / nodes)
     expert = split.experts / nodes if expert_tp else fullest_expert_gb(split, nodes)
-    if dense_q8:
+    if dense_q8 or q8_up_only:
         q8_ratio = .5006
-        replicated = split.replicated - ROUTED_DOWN_GB + \
-            q8_ratio * (ROUTED_DOWN_GB + ROUTED_UP_GB)
+        replicated = split.replicated + q8_ratio * ROUTED_UP_GB
+        if dense_q8:
+            replicated += (q8_ratio - 1.0) * ROUTED_DOWN_GB
         tp = max(0.0, split.shardable - ROUTED_UP_GB) / nodes
     elif fused_moe_ar:
         replicated = split.replicated + ROUTED_UP_GB
@@ -268,10 +269,10 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            link_gbps: float, imbalance: float, expert_ms: float,
            expert_samples: int, moe_collectives: int,
            latent_overlap: bool, hierarchical_ar: bool,
-           expert_tp: bool = False, expert_tp_layer_ms: float = .096,
+           expert_tp: bool = False, expert_tp_layer_ms: float = .094,
            fused_moe_ar: bool = False, dense_q8: bool = False,
-           q8_down_gbps: float = 140.0, q8_up_gbps: float = 97.0,
-           attention_rsag: bool = False) -> dict:
+           q8_down_gbps: float = 140.0, q8_up_gbps: float = 167.0,
+           attention_rsag: bool = False, q8_up_only: bool = False) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB -
@@ -283,6 +284,10 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
         weight_s = ROUTER_GB / router_down_gbps
         weight_s += (split.replicated - ROUTER_DOWN_GB + other_tp) / bw_gbps
         weight_s += .5006 * ROUTED_DOWN_GB / q8_down_gbps
+        weight_s += .5006 * ROUTED_UP_GB / q8_up_gbps
+    elif q8_up_only:
+        weight_s = router_down / router_down_gbps
+        weight_s += (split.replicated - router_down + other_tp) / bw_gbps
         weight_s += .5006 * ROUTED_UP_GB / q8_up_gbps
     else:
         weight_s = router_down / router_down_gbps
@@ -399,12 +404,18 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
           f"GEMM={args.gemm_tflops:g} TF/s, collective={args.latency_us:g} us/step, "
           f"hierarchical={'on' if args.hierarchical_ar else 'off'}, "
           f"latent-overlap={'on' if args.latent_overlap else 'off'}")
+    if args.expert_tp or args.fused_moe_ar or args.dense_q8 or args.q8_up_only or args.attention_rsag:
+        print(f"architecture: expert-TP={args.expert_tp} ({args.expert_tp_layer_ms:g} ms/layer), "
+              f"fused-MoE-AR={args.fused_moe_ar}, attention-RSAG={args.attention_rsag}, "
+              f"dense-Q8={args.dense_q8}, Q8-up-only={args.q8_up_only} "
+              f"({args.q8_down_gbps:g}/{args.q8_up_gbps:g} GB/s down/up)")
     print("\nMemory (fullest rank, expanded BF16 MLA cache)")
     print(f"{'ctx':>5} {'M':>3} {'weights':>8} {'KDA':>7} {'MLA-KV':>8} {'total':>8} {'fit27':>6}")
     for ctx in args.contexts:
         for batch in args.batches:
             m = memory(split, args.nodes, ctx, batch, args.kv_bytes, args.usable_gb,
-                       args.expert_tp, args.dense_q8, args.fused_moe_ar)
+                       args.expert_tp, args.dense_q8, args.fused_moe_ar,
+                       args.q8_up_only)
             md = m._asdict()
             md.update({"context": ctx, "batch": batch})
             result["memory"].append(md)
@@ -426,7 +437,8 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
                        args.expert_ms,args.expert_samples,args.moe_collectives,
                        args.latent_overlap,args.hierarchical_ar,args.expert_tp,
                        args.expert_tp_layer_ms,args.fused_moe_ar,args.dense_q8,
-                       args.q8_down_gbps,args.q8_up_gbps,args.attention_rsag)
+                       args.q8_down_gbps,args.q8_up_gbps,args.attention_rsag,
+                       args.q8_up_only)
             result["decode"].append(d)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:7.1f} {d['expert_ms']:7.1f} "
                   f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f}")
@@ -463,7 +475,7 @@ def main() -> None:
     p.add_argument("--bw-gbps", type=float, default=336.0, help="effective per-rank decode bandwidth")
     p.add_argument("--router-down-gbps", type=float, default=283.7,
                    help="measured fused BF16 router+routed-down bandwidth")
-    p.add_argument("--head-bw-gbps", type=float, default=131.8,
+    p.add_argument("--head-bw-gbps", type=float, default=172.5,
                    help="measured cache-evicted one-head BF16 projection bandwidth")
     p.add_argument("--mxfp4-gbps", type=float, default=180.0,
                    help="48-core MXFP4 bandwidth; extrapolated from the measured 3.75 GB/s/core")
@@ -485,20 +497,26 @@ def main() -> None:
     p.add_argument("--imbalance", type=float, default=1.20, help="critical-rank routed-expert traffic factor")
     p.add_argument("--expert-tp", action="store_true",
                    help="shard every expert over its group-32 intermediate blocks")
-    p.add_argument("--expert-tp-layer-ms", type=float, default=.096,
+    p.add_argument("--expert-tp-layer-ms", type=float, default=.094,
                    help="target M=1 critical time for 16 local expert slices")
     p.add_argument("--fused-moe-ar", action="store_true",
                    help="one concatenated latent+shared hidden reduction per MoE layer")
     p.add_argument("--dense-q8", action="store_true",
                    help="row-Q8 routed down and replicated routed up")
+    p.add_argument("--q8-up-only", action="store_true",
+                   help="keep router/down BF16 and quantize only replicated routed-up")
     p.add_argument("--q8-down-gbps", type=float, default=140.0)
-    p.add_argument("--q8-up-gbps", type=float, default=97.0)
+    p.add_argument("--q8-up-gbps", type=float, default=167.0)
     p.add_argument("--attention-rsag", action="store_true",
                    help="use decomposed reduce-scatter/allgather attention reduction")
     p.add_argument("--json", type=Path, help="also write full results as JSON")
     args = p.parse_args()
     if args.dense_q8 and not args.fused_moe_ar:
         p.error("--dense-q8 requires --fused-moe-ar (replicated routed-up)")
+    if args.q8_up_only and not args.fused_moe_ar:
+        p.error("--q8-up-only requires --fused-moe-ar")
+    if args.q8_up_only and args.dense_q8:
+        p.error("choose either --dense-q8 or --q8-up-only")
     if args.nodes < 1 or args.nodes > HEADS:
         p.error("--nodes must be in [1,96] for head TP")
     split = fallback_weights() if args.no_manifest else scan_weights(args.model_dir)

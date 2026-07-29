@@ -247,7 +247,7 @@ int main(int argc,char**argv){
     int nlocal=(argc-1)/2;if(nlocal>16)return 2;loaded_expert le[16];memset(le,0,sizeof(le));k3_apply_numa_interleave();
     for(int e=0;e<nlocal;++e)if(load_expert(argv[1+2*e],argv[2+2*e],&le[e])){fprintf(stderr,"load expert %d failed\n",e);return 2;}
     k3_mxfp4_matrix w1=le[0].w1,w2=le[0].w2,w3=le[0].w3;
-    if(w1.rows!=K3_EXPERT_INTER){int fail=tp_slices_correctness(le,nlocal,48);for(int e=0;e<nlocal;++e)free(le[e].blob);printf("K3 expert-TP probe: %s\n",fail?"FAIL":"PASS");return fail?1:0;}
+    if(w1.rows!=K3_EXPERT_INTER){int th=getenv("K3_TP_THREADS")?atoi(getenv("K3_TP_THREADS")):48;int fail=tp_slices_correctness(le,nlocal,th);for(int e=0;e<nlocal;++e)free(le[e].blob);printf("K3 expert-TP probe: %s\n",fail?"FAIL":"PASS");return fail?1:0;}
     int fail=dispatch_unit()|batched_correctness(&w1,&w2,&w3)|tiled_correctness(&w1,&w2,&w3)|situ_fast_correctness(&w1,&w2,&w3)|local_scheduler_correctness(&w1,&w2,&w3);
     int batches[]={1,2,4,8,16,32},threads[]={24,48};
     int tile_threshold=getenv("K3_MXFP4_TILE")?atoi(getenv("K3_MXFP4_TILE")):8;

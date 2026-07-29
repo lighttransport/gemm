@@ -426,3 +426,28 @@ at 4K, M=1, and
 96 nodes. It does not meet the 15 tok/s gate. The former 20 tok/s projection depended
 on unmeasured 240--336 GB/s Q8 and 0.045 ms expert rates and is retracted. M=32 remains
 above 128 tok/s in the model, pending end-to-end large-payload collective measurement.
+
+### Continued projection tuning
+
+The routed-up sweep found 44 workers optimal for row-Q8: 166.6 GB/s, compared with
+about 252 GB/s for row-major BF16. Group-64 and group-32 packed Q8 improved cosine but
+still missed the relative-L2 gate (`7.170e-3` and `6.491e-3` respectively); neither was
+consistently faster than row-Q8. Pair-vector BF16 was also slower than row-major BF16.
+
+For KDA, fusing the independent q/k/v/g/f_a projections and using four-row tasks fixes
+the 64-task load imbalance of the old eight-row schedule. Real head-0 cold-weight
+bandwidth reaches 172.5 GB/s at 40 workers, up from the prior 131.8 GB/s calibration.
+The TP=96 selected-expert sweep remains best at 48 workers; fusing routed `w2` weighting
+into the output-row workshare reduces scratch and measures 0.094 ms/layer.
+
+With these measured kernel rates, the quality-experimental Q8 architecture projects
+about 14.5 tok/s at 4K M=1 and 96 nodes, and over 180 aggregate tok/s at M=32. It is
+within roughly 2.5 ms/token of the 15 tok/s requirement, but cannot be promoted while
+the Q8 projection gate fails. The exact BF16 path remains slower and slightly exceeds
+the strict 27 GB working budget when routed-up is replicated.
+
+Keeping router and routed-down in BF16 while quantizing only replicated routed-up is
+the fastest mixed placement: it estimates 14.57 tok/s and 25.05 GB/rank at M=1. At
+M=32 it reaches 185.6 aggregate tok/s but models 27.15 GB/rank, narrowly beyond the
+strict 27 GB guard. Use `--q8-up-only`; this remains experimental because routed-up
+alone still fails the projection-level relative-L2 gate.

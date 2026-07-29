@@ -410,6 +410,7 @@ static inline int k3_expert_tp_forward_selected_mxfp4(
         const float *route_weight, int selected, const float *latent,
         float *gate, float *up, float *expert_out, int threads) {
     if(selected<1)return-1;int local=w1[0].rows;
+    (void)expert_out;
     for(int e=0;e<selected;++e)if(w1[e].rows!=local||
         !k3_expert_tp_layout_valid(&w1[e],&w2[e],&w3[e]))return-1;
     int g13=local/8,g2=K3_LATENT/8;
@@ -434,14 +435,12 @@ static inline int k3_expert_tp_forward_selected_mxfp4(
         k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
 #endif
 #pragma omp for schedule(static)
-    for(int task=0;task<selected*g2;++task){int e=task/g2,r=(task%g2)*8;const k3_mxfp4_matrix*m=&w2[e];
-        size_t wr=(size_t)local/2,sr=(size_t)local/32;
-        k3_mxfp4_group_batch(expert_out+(size_t)e*K3_LATENT+r,K3_LATENT,
-            m->packed+(size_t)r*wr,m->scale+(size_t)r*sr,
-            gate+(size_t)e*local,local,1,local,0);}
-#pragma omp for schedule(static)
-    for(int i=0;i<K3_LATENT;++i){float sum=0;for(int e=0;e<selected;++e)
-        sum+=route_weight[e]*expert_out[(size_t)e*K3_LATENT+i];latent_partial[i]=sum;}
+    for(int gr=0;gr<g2;++gr){int r=gr*8;float sum[8]={0},tmp[8];
+        for(int e=0;e<selected;++e){const k3_mxfp4_matrix*m=&w2[e];size_t wr=(size_t)local/2,sr=(size_t)local/32;
+            k3_mxfp4_group_batch(tmp,8,m->packed+(size_t)r*wr,
+                m->scale+(size_t)r*sr,gate+(size_t)e*local,local,1,local,0);
+            for(int j=0;j<8;++j)sum[j]+=route_weight[e]*tmp[j];}
+        for(int j=0;j<8;++j)latent_partial[r+j]=sum[j];}
     }
 #else
     (void)threads;
