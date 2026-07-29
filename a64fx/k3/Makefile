@@ -11,7 +11,7 @@ k3_ep_runner: k3_ep_runner.c k3_moe.h k3_kernels.h k3_runtime.h ../utofu-tests/t
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -ltofucom -o $@
 
 k3_kernel_test: k3_kernel_test.c k3_kernels.h
-	$(CC) $(CFLAGS) $(WARN) $< -lm -o $@
+	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
 
 k3_runtime_test: k3_runtime_test.c k3_runtime.h
 	$(CC) $(CFLAGS) $(WARN) $< -o $@

@@ -69,8 +69,8 @@ int main(void) {
 
     size_t qn = H * K, vn = H * V, sn = (size_t)H * V * K;
     float *q = malloc(qn * 4), *key = malloc(qn * 4), *val = malloc(vn * 4);
-    float *gate = malloc(qn * 4), beta[H], *s0 = calloc(sn, 4), *s1 = calloc(sn, 4);
-    float *kr = malloc(vn * 4), *ko = malloc(vn * 4);
+    float *gate = malloc(qn * 4), beta[H], *s0 = calloc(sn, 4), *s1 = calloc(sn, 4), *s2 = calloc(sn, 4);
+    float *kr = malloc(vn * 4), *ko = malloc(vn * 4), *kp = malloc(vn * 4), *decay2 = malloc(qn * 4);
     for (int step = 0; step < 5; ++step) {
         fill(q, qn, 1); fill(key, qn, 1); fill(val, vn, 1); fill(gate, qn, .2f);
         float alog[K], draw[H*K];
@@ -80,14 +80,27 @@ int main(void) {
         for (int h = 0; h < H; ++h) { k3_l2_normalize_ref(q + h*K, K, 1e-6f); k3_l2_normalize_ref(key+h*K,K,1e-6f); beta[h] = .2f + .6f * (rnd()+1)*.5f; }
         k3_kda_step_ref(kr, q, key, val, gate, beta, s0, H, K, V);
         k3_kda_step_sve(ko, q, key, val, gate, beta, s1, H, K, V);
+        for(size_t i=0;i<qn;++i)decay2[i]=expf(gate[i]);
+        k3_kda_step_decay_parallel_sve(kp,q,key,val,decay2,beta,s2,H,K,V,48);
     }
     fail |= check("kda-output", kr, ko, vn, 3e-5f);
     fail |= check("kda-state", s0, s1, sn, 3e-5f);
+    fail |= check("kda-par-out", kr, kp, vn, 3e-5f);
+    fail |= check("kda-par-state", s0, s2, sn, 3e-5f);
 
     float *keys = malloc((size_t)T * K * 4), *values = malloc((size_t)T * V * 4);
     fill(q, K, 1); fill(keys, (size_t)T*K, 1); fill(values, (size_t)T*V, 1);
     k3_attention_ref(kr, q, keys, values, T, K, V); k3_attention_sve(ko, q, keys, values, T, K, V);
     fail |= check("mla-online", kr, ko, V, 2e-5f);
+    enum { AH=3, AT=17, AP=8 };
+    float *aq=malloc((size_t)AH*K*4),*ak=malloc((size_t)AH*AT*K*4),*av=malloc((size_t)AH*AT*V*4);
+    float *ao2=malloc((size_t)AH*V*4),*ap=malloc((size_t)AH*V*4);
+    float *as=malloc((size_t)AH*AP*V*4),*ast=malloc(((size_t)AH*AP*2+AH*2)*4);
+    fill(aq,(size_t)AH*K,.03f);fill(ak,(size_t)AH*AT*K,.02f);fill(av,(size_t)AH*AT*V,.04f);
+    for(int h=0;h<AH;++h)k3_attention_sve(ao2+(size_t)h*V,aq+(size_t)h*K,
+        ak+(size_t)h*AT*K,av+(size_t)h*AT*V,AT,K,V);
+    k3_attention_heads_parallel_sve(ap,aq,ak,av,AH,AT,AT,K,V,AP,as,ast);
+    fail |= check("mla-parallel", ao2, ap, AH*V, 2e-5f);
 
     float candidates[13 * 64], scores[13], ar[64], ao[64]; fill(candidates, 13*64, 1); fill(scores,13,2);
     k3_attnres_ref(ar,candidates,scores,13,64); k3_attnres_sve(ao,candidates,scores,13,64);
@@ -134,14 +147,28 @@ int main(void) {
     double t0=now_sec(); for(int i=0;i<BI;++i) k3_kda_step_sve(bo,bq,bk,bv,bg,&bb,bs,1,BK,BV); double dt=now_sec()-t0;
     double ops=(double)BI*BV*BK*6.0;
     printf("CALIBRATION kda_gops=%.3f kda_us=%.3f\n",ops/dt/1e9,dt/BI*1e6);
+    enum { PH=8, PI=80 };size_t pn=(size_t)PH*BK,psn=(size_t)PH*BV*BK;
+    float *pq=aligned_alloc(256,pn*4),*pk=aligned_alloc(256,pn*4),*pv=aligned_alloc(256,(size_t)PH*BV*4);
+    float *pd=aligned_alloc(256,pn*4),*pb=aligned_alloc(256,256),*po0=aligned_alloc(256,(size_t)PH*BV*4),*po1=aligned_alloc(256,(size_t)PH*BV*4);
+    float *ps0=aligned_alloc(256,psn*4),*ps1=aligned_alloc(256,psn*4);
+    fill(pq,pn,1);fill(pk,pn,1);fill(pv,(size_t)PH*BV,1);for(int h=0;h<PH;++h){k3_l2_normalize_sve(pq+(size_t)h*BK,BK,1e-6f);k3_l2_normalize_sve(pk+(size_t)h*BK,BK,1e-6f);pb[h]=.5f;}for(size_t i=0;i<pn;++i)pd[i]=.995f;memset(ps0,0,psn*4);memset(ps1,0,psn*4);
+    double pt0=now_sec();for(int it=0;it<PI;++it){
+#pragma omp parallel for schedule(static)
+        for(int h=0;h<PH;++h)k3_kda_step_decay_sve(po0+(size_t)h*BV,pq+(size_t)h*BK,pk+(size_t)h*BK,pv+(size_t)h*BV,pd+(size_t)h*BK,pb+h,ps0+(size_t)h*BV*BK,1,BK,BV);
+    }double olddt=now_sec()-pt0;
+    pt0=now_sec();for(int it=0;it<PI;++it)k3_kda_step_decay_parallel_sve(po1,pq,pk,pv,pd,pb,ps1,PH,BK,BV,48);double newdt=now_sec()-pt0;
+    fail|=check("kda-par-8h",po0,po1,(size_t)PH*BV,3e-5f);fail|=check("kda-par-8s",ps0,ps1,psn,3e-5f);
+    printf("CALIBRATION kda8_old_us=%.3f kda8_parallel_us=%.3f speedup=%.3f\n",olddt/PI*1e6,newdt/PI*1e6,olddt/newdt);
 #if defined(__ARM_FEATURE_SVE)
     printf("CALIBRATION sve_bits=%d\n",(int)svcntb()*8);
 #else
     printf("CALIBRATION sve_bits=0\n");
 #endif
 
-    free(a);free(b);free(r);free(o);free(q);free(key);free(val);free(gate);free(s0);free(s1);free(kr);free(ko);
-    free(keys);free(values);free(bq);free(bk);free(bv);free(bg);free(bs);free(bo);
+    free(a);free(b);free(r);free(o);free(q);free(key);free(val);free(gate);free(s0);free(s1);free(s2);free(kr);free(ko);free(kp);free(decay2);
+    free(keys);free(values);free(aq);free(ak);free(av);free(ao2);free(ap);free(as);free(ast);
+    free(bq);free(bk);free(bv);free(bg);free(bs);free(bo);
+    free(pq);free(pk);free(pv);free(pd);free(pb);free(po0);free(po1);free(ps0);free(ps1);
     free(mw);free(ms);free(mx);
     printf("K3 kernel tests: %s\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;

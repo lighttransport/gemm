@@ -601,3 +601,57 @@ claim: dummy mode uses synthetic attention projections, route weights, dense/sha
 projection, embeddings, and head; bounded real mode replaces the 16 expert slices
 only. Full checkpoint staging and tokenizer-driven generation remain the next runner
 increment after the 96-node graph gate.
+
+### Twelve-node runner tuning and profiling
+
+The runner now accepts `--profile` and reports rank-maximum time for KDA, MLA,
+expert execution, reduction packing, allreduce, and residual update. These separately
+reduced maxima form an upper bound and can slightly exceed wall time; the output labels
+them `measured_upper` rather than implying that they are additive critical-path time.
+`--reuse-stage` skips storage I/O only after an MPI-wide check confirms that every
+rank-local marker matches the requested node count, layer, and expert list. This is
+useful for tuning repeatedly from one bounded real-weight stage:
+
+```sh
+./run_k3_ep.sh --mode real --nodes 12 --layer 1 --experts 0-15 \
+  --layers 1 --tokens 64 --threads 48 --kda-threads 8 --profile \
+  --reuse-stage --stage-dir /local/$USER/k3-runner-profile-$PJM_JOBID
+```
+
+At TP=12, eight KDA heads are local to each rank. The old outer-head workshare could
+therefore occupy at most eight cores. The new exact SVE recurrence flattens independent
+`[head][value-row]` work into one team. The deterministic eight-head kernel test is
+bit exact against the old SVE result and measured 15.23 us versus 29.82 us, a 1.96x
+isolated speedup. Runner tuning keeps 48 threads for the 16 selected MXFP4 slices but
+uses an independent eight-thread KDA team; one team size is not optimal for both.
+
+Job `49852817` reused a 22.31 MiB/rank real layer-1 stage and passed all 12 ranks for
+64 layer steps. Two complete runs measured 69.42--69.75 ms, or 917.6--921.9 partial
+layer-steps/s, with checksum disagreement `2.84e-7` and managed peak memory 23.78
+MiB/rank. Rank-maximum phase time per layer was about 0.339 ms KDA, 0.601 ms selected
+experts, 0.133 ms allreduce, and 0.015 ms residual update. A robust 48-thread single-team baseline was 595.1
+layer-steps/s, so phase-specific team sizing improved this bounded workload by 1.55x.
+The earlier two-step 28.1 layer-steps/s number was dominated by OpenMP and process
+startup and should not be used as steady-state throughput.
+
+MLA head parallelism has the same TP scaling problem: TP=12 leaves eight local heads,
+and TP=96 leaves one. `k3_attention_heads_parallel_sve` divides the context into token
+blocks, computes stable online-softmax triples independently, and combines them with
+the exact log-sum-exp identity. Its three-head correctness test differs from serial SVE
+by at most `2.8e-9`. The runner retains cheaper outer-head attention below 128 context
+tokens and switches to token-block parallelism afterward. On the 12-node synthetic MLA
+probe, a full 4,096-step context sweep averaged 0.190 ms of MLA work per layer step and
+passed 12/12 ranks; the 64-step short-context path retained its prior 1.110 ms figure
+(dominated by repeated OpenMP startup). The full dummy 93-layer schedule also passed
+12/12 ranks after these changes.
+
+The residual harness no longer applies scalar `tanhf` to every latent element. It now
+uses an SVE residual add followed by RMS rescaling, which keeps the synthetic recurrent
+state bounded while representing the graph's residual behavior more faithfully. The
+runner owns all new MLA scratch through the 256-byte-aligned, NUMA-aware memory pool;
+no raw runner allocation was introduced.
+
+All figures in this section are partial-runner measurements: real mode supplies real
+MXFP4 expert slices but still uses synthetic attention projections and omits the full
+dense/shared completion, embedding, tokenizer, and LM head. They are useful for kernel
+scheduling and collective diagnosis, not a full-model token/s claim.

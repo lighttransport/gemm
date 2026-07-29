@@ -11,6 +11,7 @@ NODES=${PJM_MPI_PROC:-96}
 LAYERS=1
 TOKENS=2
 THREADS=48
+KDA_THREADS=8
 LAYER=1
 EXPERTS=0-15
 CHUNK_MIB=8
@@ -18,12 +19,15 @@ MODEL_DIR="$HOME/models/kimi-k3"
 JOB_TAG=${PJM_JOBID:-manual-$$}
 STAGE_DIR="/local/$USER/k3-runner-$JOB_TAG"
 RESULT_DIR="$SCRIPT_DIR/logs/run-$JOB_TAG"
+PROFILE=0
+REUSE_STAGE=0
 
 usage() {
     cat >&2 <<EOF
 usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
-          [--threads N] [--layer N] [--experts LIST] [--chunk-mib N]
+          [--threads N] [--kda-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
+          [--profile] [--reuse-stage]
 EOF
 }
 need_value() { if (( $# < 2 )); then echo "$0: missing value for $1" >&2; usage; exit 2; fi; }
@@ -34,21 +38,24 @@ while (( $# )); do
         --layers) need_value "$@"; LAYERS=$2; shift 2;;
         --tokens) need_value "$@"; TOKENS=$2; shift 2;;
         --threads) need_value "$@"; THREADS=$2; shift 2;;
+        --kda-threads) need_value "$@"; KDA_THREADS=$2; shift 2;;
         --layer) need_value "$@"; LAYER=$2; shift 2;;
         --experts) need_value "$@"; EXPERTS=$2; shift 2;;
         --chunk-mib) need_value "$@"; CHUNK_MIB=$2; shift 2;;
         --model-dir) need_value "$@"; MODEL_DIR=$2; shift 2;;
         --stage-dir) need_value "$@"; STAGE_DIR=$2; shift 2;;
         --result-dir) need_value "$@"; RESULT_DIR=$2; shift 2;;
+        --profile) PROFILE=1; shift;;
+        --reuse-stage) REUSE_STAGE=1; shift;;
         -h|--help) usage; exit 0;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2;;
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$LAYER" "$CHUNK_MIB"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$LAYER" "$CHUNK_MIB"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
-(( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && CHUNK_MIB > 0 )) || {
+(( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && KDA_THREADS > 0 && KDA_THREADS <= 48 && CHUNK_MIB > 0 )) || {
     echo "$0: invalid numeric option range" >&2; exit 2; }
 (( NODES <= 96 )) || { echo "$0: node count must be in [1,96]" >&2; exit 2; }
 if [[ -n "${PJM_MPI_PROC:-}" && "$NODES" -ne "$PJM_MPI_PROC" ]]; then
@@ -80,23 +87,35 @@ done
 
 if [[ "$MODE" == real ]]; then
     if [[ ! -d "$MODEL_DIR" ]]; then echo "$0: model directory is missing: $MODEL_DIR" >&2; exit 4; fi
-    mpiexec -np "$NODES" -of-proc "$RESULT_DIR/stage" \
-        "$SCRIPT_DIR/run_k3_stage_rank.sh" "$SCRIPT_DIR" "$NODES" "$MODEL_DIR" \
-        "$STAGE_DIR" "$LAYER" "$EXPERTS" "$CHUNK_MIB"
-    staged=$(find "$RESULT_DIR" -maxdepth 1 -name 'stage.*' -type f | wc -l)
-    echo "stage launch output files: $staged/$NODES"
+    if (( REUSE_STAGE )); then
+        mpiexec -np "$NODES" /bin/sh -c '
+            rank=${PMIX_RANK:?}; marker="$1/stage-rank$(printf "%03d" "$rank").status"
+            test -f "$marker" && grep -q "nodes=$2 layer=$3 experts=$4" "$marker"
+        ' sh "$STAGE_DIR" "$NODES" "$LAYER" "$EXPERTS" || {
+            echo "$0: --reuse-stage validation failed: $STAGE_DIR" >&2; exit 4; }
+        echo "reusing rank-local stage: $STAGE_DIR"
+    else
+        mpiexec -np "$NODES" -of-proc "$RESULT_DIR/stage" \
+            "$SCRIPT_DIR/run_k3_stage_rank.sh" "$SCRIPT_DIR" "$NODES" "$MODEL_DIR" \
+            "$STAGE_DIR" "$LAYER" "$EXPERTS" "$CHUNK_MIB"
+        staged=$(find "$RESULT_DIR" -maxdepth 1 -name 'stage.*' -type f | wc -l)
+        echo "stage launch output files: $staged/$NODES"
+    fi
 fi
 
 set +e
+RUNNER_EXTRA=()
+(( PROFILE )) && RUNNER_EXTRA+=(--profile)
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --layer "$LAYER" \
-    --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt"
+    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --layer "$LAYER" \
+    --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
+    "${RUNNER_EXTRA[@]}"
 runner_rc=$?
 set -e
 
 passes=$(grep -l 'state=pass' "$RESULT_DIR"/k3_rank*.status 2>/dev/null | wc -l || true)
-grep -hE 'K3_RUN|K3_RESULT|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
+grep -hE 'K3_RUN|K3_RESULT|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
 echo "K3 distributed result: rc=$runner_rc pass_markers=$passes/$NODES results=$RESULT_DIR"
 
 # Rank-local storage is job-scoped and is wiped by the scheduler. Deliberately
