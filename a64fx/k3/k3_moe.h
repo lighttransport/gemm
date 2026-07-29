@@ -18,8 +18,18 @@ typedef struct {
     int cols;
 } k3_mxfp4_matrix;
 
+#ifndef K3_MOE_MAX_BATCH
 #define K3_MOE_MAX_BATCH 256
-#define K3_MXFP4_TILE_K 512
+#endif
+#ifndef K3_MXFP4_TILE_K_SMALL
+#define K3_MXFP4_TILE_K_SMALL 512
+#endif
+#ifndef K3_MXFP4_TILE_K_LARGE
+#define K3_MXFP4_TILE_K_LARGE 1024
+#endif
+#ifndef K3_MXFP4_PREFETCH_BLOCKS
+#define K3_MXFP4_PREFETCH_BLOCKS 8
+#endif
 
 /* Slot-major dispatch buffers have capacity=batch for each local expert. */
 static inline int k3_moe_build_dispatch(const int *route_experts,
@@ -76,6 +86,44 @@ static inline void k3_moe_scatter_add(float *dst, const float *src,
     }
 }
 
+#if defined(__ARM_FEATURE_SVE)
+/* K3 decode-specialized copy of the native MXFP4 kernel.  Keeping it local
+ * permits A64FX scheduling/prefetch experiments without changing every DS4F
+ * backend that consumes the shared reference kernel. */
+static inline void k3_matvec_mxfp4_8row(float *dst,
+        const uint8_t *w0,const uint8_t *w1,const uint8_t *w2,const uint8_t *w3,
+        const uint8_t *w4,const uint8_t *w5,const uint8_t *w6,const uint8_t *w7,
+        const uint8_t *s0,const uint8_t *s1,const uint8_t *s2,const uint8_t *s3,
+        const uint8_t *s4,const uint8_t *s5,const uint8_t *s6,const uint8_t *s7,
+        const float*x,int k){
+    svbool_t pg=svptrue_b32();svfloat32_t kv=svld1(pg,ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+    int nb=k/32;
+#pragma clang loop unroll_count(2)
+    for(int b=0;b<nb;++b){
+#if K3_MXFP4_PREFETCH_BLOCKS > 0
+        int pb=b+K3_MXFP4_PREFETCH_BLOCKS;
+        if(pb<nb){__builtin_prefetch(w0+(size_t)pb*16,0,2);__builtin_prefetch(w1+(size_t)pb*16,0,2);
+            __builtin_prefetch(w2+(size_t)pb*16,0,2);__builtin_prefetch(w3+(size_t)pb*16,0,2);
+            __builtin_prefetch(w4+(size_t)pb*16,0,2);__builtin_prefetch(w5+(size_t)pb*16,0,2);
+            __builtin_prefetch(w6+(size_t)pb*16,0,2);__builtin_prefetch(w7+(size_t)pb*16,0,2);}
+#endif
+        svfloat32_t xl=svld1(pg,x+(size_t)b*32),xh=svld1(pg,x+(size_t)b*32+16);
+#define K3_MXROW(W,S,A) do{svuint32_t z=svld1ub_u32(pg,(W)+(size_t)b*16); \
+        svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
+        svfloat32_t p=svmul_x(pg,svtbl_f32(kv,lo),xl);p=svmla_x(pg,p,svtbl_f32(kv,hi),xh); \
+        (A)=svmla_n_f32_x(pg,(A),p,ggml_e8m0_to_fp32((S)[b]));}while(0)
+        K3_MXROW(w0,s0,a0);K3_MXROW(w1,s1,a1);K3_MXROW(w2,s2,a2);K3_MXROW(w3,s3,a3);
+        K3_MXROW(w4,s4,a4);K3_MXROW(w5,s5,a5);K3_MXROW(w6,s6,a6);K3_MXROW(w7,s7,a7);
+#undef K3_MXROW
+    }
+    dst[0]=svaddv(pg,a0);dst[1]=svaddv(pg,a1);dst[2]=svaddv(pg,a2);dst[3]=svaddv(pg,a3);
+    dst[4]=svaddv(pg,a4);dst[5]=svaddv(pg,a5);dst[6]=svaddv(pg,a6);dst[7]=svaddv(pg,a7);
+}
+
+#endif
+
 static inline void k3_mxfp4_group_svtbl(float *y, int ystride,
                                          const uint8_t *w, const uint8_t *s,
                                          const float *x, int xstride,
@@ -92,8 +140,13 @@ static inline void k3_mxfp4_group_svtbl(float *y, int ystride,
                              s0,s1,s2,s3,s4,s5,s6,s7,
                              x+(size_t)m*xstride,x+(size_t)(m+1)*xstride,k);
     for (; m < batch; ++m)
+#if defined(__ARM_FEATURE_SVE)
+        k3_matvec_mxfp4_8row(y+(size_t)m*ystride,w0,w1,w2,w3,w4,w5,w6,w7,
+                          s0,s1,s2,s3,s4,s5,s6,s7,x+(size_t)m*xstride,k);
+#else
         matvec_mxfp4_8row(y+(size_t)m*ystride,w0,w1,w2,w3,w4,w5,w6,w7,
                           s0,s1,s2,s3,s4,s5,s6,s7,x+(size_t)m*xstride,k);
+#endif
 }
 
 #if defined(__ARM_FEATURE_SVE)
@@ -104,8 +157,9 @@ static inline void k3_mxfp4_group_tile(float *y, int ystride,
                                        const uint8_t *w, const uint8_t *s,
                                        const float *x, int xstride,
                                        int batch, int k) {
-    const int tk = K3_MXFP4_TILE_K;
-    uint16_t pv[4 * 2 * K3_MXFP4_TILE_K] __attribute__((aligned(256)));
+    const int tk = batch >= 24 ? K3_MXFP4_TILE_K_LARGE
+                               : K3_MXFP4_TILE_K_SMALL;
+    uint16_t pv[4 * 2 * K3_MXFP4_TILE_K_LARGE] __attribute__((aligned(256)));
     float acc[K3_MOE_MAX_BATCH][8];
     memset(acc, 0, (size_t)batch * 8 * sizeof(float));
     size_t rb = (size_t)k / 2, sb = (size_t)k / 32;

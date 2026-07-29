@@ -221,9 +221,9 @@ which creates a visible performance step.
 | 64 | 30.86 GB | no | compute-only; not deployable |
 | 72 | 29.05 GB | no | compute-only; not deployable |
 | 80 | 27.29 GB | no, narrowly | compute-only; not deployable |
-| 84 | 25.61 GB | yes | 9.82 token/s |
-| 92 | 23.89 GB | yes | 9.96 token/s |
-| 96 | 23.77 GB | yes | 10.06 token/s |
+| 84 | 25.61 GB | yes | 10.19 token/s |
+| 92 | 23.89 GB | yes | 10.32 token/s |
+| 96 | 23.77 GB | yes | 10.43 token/s |
 
 The KDA calibration now comes from real layer-0/head-0 activations on all twelve nodes:
 8 threads are optimal at 6.67 microseconds/head-step and 14.73 GOP/s. Cache-evicted
@@ -292,14 +292,22 @@ All performance probes first read their bounded blobs into anonymous memory unde
 reported rates. `run_moe_probe_mpi.sh` stages four distinct layer-1 experts per node
 (66.94 MiB/node), runs all ranks, and requires an explicit PASS record from every rank.
 
-Measured on all twelve nodes at 48 threads:
+The decode kernel now prefetches packed rows eight MXFP4 blocks ahead. The tiled batch
+kernel uses a 512-column dequant tile below M=24 and 1,024 columns at M>=24; this keeps
+M=16 from regressing while improving M=32. A 12-row decode experiment was unstable and
+slower and was not retained. A persistent OpenMP team across the three expert stages
+also regressed M=1/M=2 and was removed.
+
+Measured on all twelve nodes at 48 threads after these changes:
 
 | Real expert workload | Time/rate |
 |---|---:|
-| One expert, M=1 | 0.215--0.229 ms, 4.37--4.64k assignments/s |
-| One expert, M=32 tiled | about 3.44 ms, 9.2--9.3k assignments/s |
-| Two distinct M=1 experts, shared workshare | 0.417--0.422 ms, about 4.77k assignments/s |
-| Four distinct M=1 experts, CMG-partitioned | 0.764--0.773 ms on 11 nodes; one 0.927 ms outlier |
+| One expert, M=1 | median 0.176 ms (0.172--0.298 ms) |
+| One expert, M=8 tiled | median 1.030 ms (1.025--1.034 ms) |
+| One expert, M=16 tiled | median 1.863 ms (1.849--1.875 ms) |
+| One expert, M=32 tiled | median 3.237 ms (3.217--3.258 ms), 9.89k assignments/s |
+| Two distinct M=1 experts, shared workshare | median 0.334 ms (one 0.473 ms outlier) |
+| Four distinct M=1 experts, CMG-partitioned | median 0.629 ms (0.625--0.632 ms) |
 
 The exactly-four-expert sparse path pins one bucket per 12-core CMG subgroup. Two and
 three active experts retain the global workshare because a two-way CMG split measured
@@ -320,23 +328,43 @@ at batch one: 16 experts mapped onto 96 owners collide often enough that the mea
 slowest-rank MoE service is about 0.37 ms/layer, or 34.0 ms over 92 layers, rather than
 the impossible bandwidth-average value of 1.8 ms for the whole stack.
 
-For 96 nodes, 4K context, current exact placement (one attention collective plus latent
-and hidden MoE collectives, 278 total), the revised estimates are:
+`k3_dense.h` adds the runner-facing fused router plus routed-latent-down BF16 workshare.
+All twelve nodes passed the real row check. At 47 workers its median is 226.4 us/layer
+slice and 283.7 GB/s (223.4--231.3 us); 48 workers regress to 239.5 GB/s median. The
+47-worker default deliberately reserves the highest cpuset core for uTofu progress.
+
+For 96 nodes, 4K context, current exact placement (93 attention collectives, one dense
+FFN collective, and latent plus hidden collectives for 92 MoE layers: 278 total), the
+revised estimates are:
 
 | Decode batch | Dense/attention | Routed experts | KDA + KV | Collectives | Aggregate token/s |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 24.9 ms | 34.0 ms | 0.7 ms | 39.7 ms | 10.06 |
-| 8 | 24.9 ms | 85.6 ms | 3.9 ms | 45.5 ms | 50.03 |
-| 16 | 24.9 ms | 131.1 ms | 7.6 ms | 52.1 ms | 74.18 |
-| 32 | 24.9 ms | 191.9 ms | 14.9 ms | 65.3 ms | 107.73 |
+| 1 | 28.3 ms | 27.2 ms | 0.7 ms | 39.7 ms | 10.43 |
+| 8 | 28.3 ms | 72.4 ms | 3.9 ms | 45.5 ms | 53.32 |
+| 16 | 28.3 ms | 113.5 ms | 7.6 ms | 52.1 ms | 79.44 |
+| 32 | 28.3 ms | 174.8 ms | 14.9 ms | 65.3 ms | 112.96 |
 
-Therefore the requested 30 token/s single-stream target is not yet feasible: the bare
-modeled compute path is already about 63 ms/token, and the current 278-collective model
-alone is 39.7 ms versus a 33.3 ms total target. Reducing MoE communication all the way
-to one hidden collective for the entire layer (94 stack-wide calls, an architectural
-upper-bound experiment rather than the current exact graph) gives 13.7 token/s at
-batch one and 61.4 aggregate token/s at batch eight. Thus the 60 token/s batched target
-is close under a one-collective MoE redesign, while single-stream 30 requires roughly a
-threefold combined improvement in expert and dense/attention kernels plus fewer
-collectives. These are projections from partial real weights, not a claim of full-layer
-end-to-end validation.
+The production uTofu probe was also rerun on the twelve-node allocation. Exact FP32 SUM
+and MAX checks passed. For 7,168 floats, flat recursive doubling takes 76.3 us and the
+existing 3x4 hierarchical path takes 65.6 us (1.16x). At batch-sized payloads the gain
+is 1.30x: 114,688 floats take 1.164/0.896 ms flat/hierarchical and 229,376 floats take
+2.328/1.782 ms. `--hierarchical-ar` applies the measured payload-dependent speedup;
+carrying that ratio to 96 nodes is an explicit extrapolation, not a 96-node result.
+
+With hierarchical reduction extrapolated and the exact graph retained, the optimistic
+projection is 11.06 token/s at M=1 and 119.42 aggregate token/s at M=32. Overlapping the
+latent reduce with the TP-local shared expert only raises these to 11.16 and 119.76:
+the whole shared-expert stack is 24.310 GB, only 0.253 GB per 96-node rank, so the model
+caps hidden work at about 0.75 ms for the entire stack. There is no legitimate large
+overlap window. The 12-node large-payload measurements also warn that the simulator's
+8 GB/s wire lower bound is optimistic for M=32; 119.76 is therefore a ceiling-oriented
+estimate, not a demonstrated 128 token/s result.
+
+The current exact design does not meet either new target: single decode remains well
+below 15 token/s and M=32 remains below 128 token/s even before applying the conservative
+large-payload correction. Eliminating the latent collective exactly would require
+replicating the 4.727 GB BF16 routed-up stack per rank (or a new 2-D placement); that
+exceeds the 27 GB memory budget on the fullest ranks. Mode `--moe-collectives 0` means
+*no MoE collective* (94 attention/dense calls), not one collective per MoE layer, and is
+only an impossible upper bound: 14.35 token/s at M=1 and 132.3 at M=32. These are
+projections from bounded real weights, not full-layer end-to-end validation.
