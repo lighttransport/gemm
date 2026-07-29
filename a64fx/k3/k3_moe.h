@@ -141,6 +141,10 @@ static inline void k3_moe_finish_reduce_q8w16(float *hidden_out,
         const float *routed_norm_weight,
         const k3_q8pv_matrix *replicated_routed_up, float eps, int threads) {
     k3_rmsnorm_sve(norm_scratch,reduced,routed_norm_weight,K3_LATENT,eps);
+    /* More workers do not raise this bandwidth-bound projection on A64FX;
+     * leave application cores available for transport progress. */
+    if (threads > K3_Q8W16_UP_THREADS)
+        threads = K3_Q8W16_UP_THREADS;
     k3_matvec_q8pv16_f32_bias(hidden_out,replicated_routed_up,norm_scratch,
                               reduced+K3_LATENT,threads);
 }

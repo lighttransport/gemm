@@ -19,6 +19,9 @@ typedef struct {
 typedef k3_bf16_matrix matrix;
 static k3_pool probe_pool;
 static int probe_alloc_failed;
+static int perf_reps = 10;
+static int perf_threads;
+static volatile double evict_sink;
 static void *probe_alloc(size_t bytes) {
     void *p=k3_pool_alloc(&probe_pool,bytes);
     if(!p){probe_alloc_failed=1;fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}
@@ -31,6 +34,26 @@ static void *probe_calloc(size_t count,size_t size) {
 }
 static void probe_free(void *ptr) {
     if(k3_pool_free(&probe_pool,ptr))fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));
+}
+static double sample_percentile(const double *samples, int count, double q) {
+    double sorted[256];
+    for (int i = 0; i < count; ++i)
+        sorted[i] = samples[i];
+    for (int i = 1; i < count; ++i) {
+        double value = sorted[i];
+        int j = i;
+        while (j > 0 && sorted[j - 1] > value) {
+            sorted[j] = sorted[j - 1];
+            --j;
+        }
+        sorted[j] = value;
+    }
+    int index = (int)ceil(q * count) - 1;
+    if (index < 0)
+        index = 0;
+    if (index >= count)
+        index = count - 1;
+    return sorted[index];
 }
 static void evict(float *b, size_t n, int th);
 static void mv(float *y, const matrix *m, const float *x, int threads);
@@ -137,7 +160,7 @@ static int q8pv16_f32_projection(const matrix*m,const float*x,const float*ref,in
     float*tx=probe_alloc((size_t)m->cols*4),*tr=probe_alloc((size_t)m->rows*4);if(!tx||!tr)return 1;
     for(int trial=1;trial<8;++trial){for(int i=0;i<m->cols;++i)tx[i]=rnd()*.125f;mv(tr,m,tx,threads);k3_matvec_q8pv16_f32(out,&qm,tx,threads);se=sr=dot=so=0;for(int i=0;i<m->rows;++i){double a=out[i],b=tr[i],d=a-b;se+=d*d;sr+=b*b;dot+=a*b;so+=a*a;}double rr=sqrt(se/(sr+1e-30)),cc=dot/sqrt((sr+1e-30)*(so+1e-30));if(rr>rel)rel=rr;if(cc<cos)cos=cc;}
     printf("[dense-q8w16-%s] activations=8 worst_rel_l2=%.3e min_cosine=%.8f %s\n",label,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");int ts[]={36,40,44,47,48};
-    for(int ti=0;ti<5;++ti){int th=ts[ti];double sec=0;for(int it=0;it<10;++it){evict(eb,en,th);double t=now_sec();k3_matvec_q8pv16_f32(out,&qm,x,th);sec+=now_sec()-t;}printf("PROBE dense mode=%s-q8w16-f32a threads=%d us=%.3f GB/s=%.2f rel_l2=%.3e cosine=%.8f %s\n",label,th,sec/10*1e6,bytes/(sec/10)/1e9,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");}
+    int nt=perf_threads?1:5;for(int ti=0;ti<nt;++ti){int th=perf_threads?perf_threads:ts[ti];double sec=0,samples[256];for(int it=0;it<perf_reps;++it){evict(eb,en,th);double t=now_sec();k3_matvec_q8pv16_f32(out,&qm,x,th);samples[it]=now_sec()-t;sec+=samples[it];}double mean=sec/perf_reps,p95=sample_percentile(samples,perf_reps,.95);printf("PROBE dense mode=%s-q8w16-f32a threads=%d us=%.3f GB/s=%.2f p95_us=%.3f floor_GB/s=%.2f rel_l2=%.3e cosine=%.8f %s\n",label,th,mean*1e6,bytes/mean/1e9,p95*1e6,bytes/p95/1e9,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");}
     probe_free(q);probe_free(out);probe_free(eb);probe_free(tx);probe_free(tr);return !isfinite(rel)||!isfinite(cos);
 }
 static int bf16pv_projection(const matrix*m,const float*x,const float*ref,int threads,const char*label){
@@ -165,10 +188,12 @@ static void mv(float *y, const matrix *m, const float *x, int threads) {
     }
 }
 static void evict(float *b, size_t n, int th) {
+    double sum = 0.0;
     omp_set_num_threads(th);
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) reduction(+:sum)
     for (size_t i = 0; i < n; i += 16)
-        b[i] += 1;
+        sum += b[i];
+    evict_sink = sum;
 }
 static void perf(const matrix *r, const matrix *d, const float *x, float *yr,
                  float *yd, int th, int use_fused) {
@@ -251,20 +276,32 @@ static int q8_correctness_perf(const matrix *r, const matrix *d, const float *x,
 static int q8w16_pair_perf(const matrix*r,const matrix*d,const float*x,
         const float*down_ref,int threads){size_t bytes=k3_q8pv16_matrix_bytes(d->rows,d->cols);uint8_t*q=probe_alloc(bytes);float*out=probe_alloc((size_t)d->rows*4),*router=probe_alloc((size_t)r->rows*4);size_t en=(size_t)192*1024*1024/4;float*eb=probe_calloc(en,4);if(!q||!out||!router||!eb)return 1;
     k3_q8pv16_quantize_bf16(q,d->weight,d->rows,d->cols);k3_q8pv_matrix qm={q,d->rows,d->cols};k3_dense_router_bf16_down_q8w16(router,out,r,&qm,x,threads);double se=0,sr=0;for(int i=0;i<d->rows;++i){double z=out[i]-down_ref[i];se+=z*z;sr+=(double)down_ref[i]*down_ref[i];}double rel=sqrt(se/(sr+1e-30));int ts[]={36,40,44,47,48};
-    for(int ti=0;ti<5;++ti){int th=ts[ti];double sec=0;for(int it=0;it<10;++it){evict(eb,en,th);double t=now_sec();k3_dense_router_bf16_down_q8w16(router,out,r,&qm,x,th);sec+=now_sec()-t;}double traffic=bytes+2.0*r->rows*r->cols;printf("PROBE dense mode=router-bf16+down-q8w16 threads=%d us=%.3f GB/s=%.2f rel_l2=%.3e\n",th,sec/10*1e6,traffic/(sec/10)/1e9,rel);}
+    int nt=perf_threads?1:5;for(int ti=0;ti<nt;++ti){int th=perf_threads?perf_threads:ts[ti];double sec=0,samples[256];for(int it=0;it<perf_reps;++it){evict(eb,en,th);double t=now_sec();k3_dense_router_bf16_down_q8w16(router,out,r,&qm,x,th);samples[it]=now_sec()-t;sec+=samples[it];}double mean=sec/perf_reps,p95=sample_percentile(samples,perf_reps,.95);double traffic=bytes+2.0*r->rows*r->cols;printf("PROBE dense mode=router-bf16+down-q8w16 threads=%d us=%.3f GB/s=%.2f p95_us=%.3f floor_GB/s=%.2f rel_l2=%.3e\n",th,mean*1e6,traffic/mean/1e9,p95*1e6,traffic/p95/1e9,rel);}
     probe_free(q);probe_free(out);probe_free(router);probe_free(eb);return !isfinite(rel);
 }
 int main(int argc, char **argv) {
     const char *blob_path=NULL,*manifest_path=NULL,*only=NULL;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--only")){if(++i>=argc){fprintf(stderr,"k3_dense_probe: --only requires a value\n");return 2;}only=argv[i];}
-        else if(!strcmp(argv[i],"--help")){printf("usage: %s [--only q8w16|q8w16down] BLOB MANIFEST\n",argv[0]);return 0;}
+        else if(!strcmp(argv[i],"--stable-reps")){
+            if(++i>=argc){fprintf(stderr,"k3_dense_probe: --stable-reps requires a value\n");return 2;}
+            char *end=NULL;long value=strtol(argv[i],&end,10);
+            if(!end||*end||value<1||value>256){fprintf(stderr,"k3_dense_probe: --stable-reps must be 1..256\n");return 2;}
+            perf_reps=(int)value;
+        }
+        else if(!strcmp(argv[i],"--threads")){
+            if(++i>=argc){fprintf(stderr,"k3_dense_probe: --threads requires a value\n");return 2;}
+            char *end=NULL;long value=strtol(argv[i],&end,10);
+            if(!end||*end||value<1||value>48){fprintf(stderr,"k3_dense_probe: --threads must be 1..48\n");return 2;}
+            perf_threads=(int)value;
+        }
+        else if(!strcmp(argv[i],"--help")){printf("usage: %s [--only q8w16|q8w16down] [--threads N] [--stable-reps N] BLOB MANIFEST\n",argv[0]);return 0;}
         else if(argv[i][0]=='-'){fprintf(stderr,"k3_dense_probe: unknown option '%s'\n",argv[i]);return 2;}
         else if(!blob_path)blob_path=argv[i];else if(!manifest_path)manifest_path=argv[i];
         else{fprintf(stderr,"k3_dense_probe: unexpected argument '%s'\n",argv[i]);return 2;}
     }
     if(!blob_path||!manifest_path||(only&&strcmp(only,"q8w16")&&strcmp(only,"q8w16down"))){
-        fprintf(stderr,"usage: %s [--only q8w16|q8w16down] BLOB MANIFEST\n",argv[0]);
+        fprintf(stderr,"usage: %s [--only q8w16|q8w16down] [--threads N] [--stable-reps N] BLOB MANIFEST\n",argv[0]);
         return 2;
     }
     k3_pool_init(&probe_pool,"dense-probe");

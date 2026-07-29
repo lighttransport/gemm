@@ -276,8 +276,8 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            fused_moe_ar: bool = False, dense_q8: bool = False,
            q8_down_gbps: float = 140.0, q8_up_gbps: float = 173.0,
            attention_rsag: bool = False, q8_up_only: bool = False,
-           q8w16_up: bool = False, q8w16_up_gbps: float = 230.0,
-           q8w16_dense: bool = False, q8w16_pair_gbps: float = 235.0) -> dict:
+           q8w16_up: bool = False, q8w16_up_gbps: float = 300.0,
+           q8w16_dense: bool = False, q8w16_pair_gbps: float = 285.0) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB -
@@ -443,6 +443,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
                                          args.hierarchical_ar)
     print(f"\nDecode (batch tokens/s; {calls} collectives/layer-stack)")
     print(f"{'ctx':>5} {'M':>3} {'W ms':>7} {'Exp ms':>7} {'KV ms':>7} {'KDA':>7} {'comm':>7} {'tok/s':>9}")
+    target_decode = None
     for ctx in args.contexts:
         for batch in args.batches:
             d = decode(split,args.nodes,ctx,batch,args.bw_gbps,args.mla_bw_gbps,args.router_down_gbps,args.head_bw_gbps,
@@ -457,6 +458,20 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
             result["decode"].append(d)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:7.1f} {d['expert_ms']:7.1f} "
                   f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f}")
+            if ctx == 4096 and batch == 1:
+                target_decode = d
+    if target_decode is not None:
+        budget_ms = 1000.0 / args.decode_target_tps
+        predicted_ms = 1000.0 / target_decode["tokens_per_second"]
+        margin_ms = budget_ms - predicted_ms
+        target = {"tokens_per_second": args.decode_target_tps,
+                  "budget_ms": budget_ms, "predicted_ms": predicted_ms,
+                  "margin_ms": margin_ms, "passes": margin_ms >= 0.0}
+        result["decode_target_4k_m1"] = target
+        print(f"Decode target {args.decode_target_tps:.2f} tok/s at 4k M=1: "
+              f"{'PASS' if target['passes'] else 'FAIL'} "
+              f"({budget_ms:.2f} ms budget, {predicted_ms:.2f} ms predicted, "
+              f"{margin_ms:+.2f} ms margin)")
     print("\nPrefill (tokens/s)")
     print(f"{'prompt':>7} {'chunk':>6} {'GEMM s':>9} {'KDA s':>9} {'MLA s':>9} {'comm s':>9} {'tok/s':>9}")
     for tokens in args.prompts:
@@ -484,6 +499,8 @@ def main() -> None:
     p.add_argument("--nodes", type=int, default=96)
     p.add_argument("--contexts", type=csv_ints, default=csv_ints("4096,131072,1048576"))
     p.add_argument("--batches", type=csv_ints, default=csv_ints("1,8,32"))
+    p.add_argument("--decode-target-tps", type=float, default=15.0,
+                   help="report the 4k M=1 latency margin against this stable target")
     p.add_argument("--prompts", type=csv_ints, default=csv_ints("1024,8192,131072,1048576"))
     p.add_argument("--chunks", type=csv_ints, default=csv_ints("64,256,1024"))
     p.add_argument("--usable-gb", type=float, default=USABLE_GB)
@@ -529,10 +546,10 @@ def main() -> None:
                    help="quality-gated Q8W16 routed down+up with BF16 router")
     p.add_argument("--q8-down-gbps", type=float, default=140.0)
     p.add_argument("--q8-up-gbps", type=float, default=173.0)
-    p.add_argument("--q8w16-up-gbps", type=float, default=230.0,
-                   help="conservative clean-run stored bandwidth for Q8W16 routed-up")
-    p.add_argument("--q8w16-pair-gbps", type=float, default=235.0,
-                   help="clean-run mixed BF16-router + Q8W16-down traffic bandwidth")
+    p.add_argument("--q8w16-up-gbps", type=float, default=300.0,
+                   help="conservative read-cold p95 bandwidth for Q8W16 routed-up")
+    p.add_argument("--q8w16-pair-gbps", type=float, default=285.0,
+                   help="conservative read-cold p95 BF16-router + Q8W16-down bandwidth")
     p.add_argument("--attention-rsag", action="store_true",
                    help="model measured real RSAG (1.03x flat tree; rejected)")
     p.add_argument("--json", type=Path, help="also write full results as JSON")
@@ -549,6 +566,8 @@ def main() -> None:
         p.error("choose one routed projection quantization mode")
     if args.nodes < 1 or args.nodes > HEADS:
         p.error("--nodes must be in [1,96] for head TP")
+    if args.decode_target_tps <= 0:
+        p.error("--decode-target-tps must be positive")
     split = fallback_weights() if args.no_manifest else scan_weights(args.model_dir)
     result = report(args, split)
     if args.json:

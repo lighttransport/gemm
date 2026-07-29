@@ -54,6 +54,10 @@ typedef struct {
     int cols;
 } k3_q8pv_matrix;
 
+#ifndef K3_DENSE_MIX_INTERLEAVE
+#define K3_DENSE_MIX_INTERLEAVE 1
+#endif
+
 static inline size_t k3_q8pv_matrix_bytes(int rows, int cols) {
     return (size_t)(rows / 8) * (cols / 64) * 528;
 }
@@ -443,6 +447,7 @@ static inline void k3_dense_many_q8p16(float **out, const int8_t **packed,
 /* A64FX loses bandwidth at 48 workers for these two matrices.  Reserving the
  * highest cpuset core for uTofu progress also makes 47 the runner default. */
 #define K3_DENSE_THREADS 47
+#define K3_Q8W16_UP_THREADS 44
 
 static inline void k3_dense_pair_bf16(float *router_out, float *latent_out,
                                       const k3_bf16_matrix *router,
@@ -536,12 +541,22 @@ static inline void k3_dense_router_bf16_down_q8w16(
     (void)threads;
 #endif
     for(int task=0;task<router_groups+down_groups;++task){
-        if(task<router_groups){int r=task*8;const uint16_t*w=router->weight+(size_t)r*router->cols;
+        /* K3 has exactly four routed-down groups per router group.  Interleave
+         * 1 BF16 + 4 Q8W16 tasks so static OpenMP chunks give every CMG the
+         * same instruction/byte mix; concatenating both classes overloads the
+         * first workers with the 1.6x larger BF16 groups. */
+        int block=task/5,lane=task%5;
+        int mixed=K3_DENSE_MIX_INTERLEAVE&&down_groups==4*router_groups;
+        int is_router=mixed?lane==0:task<router_groups;
+        int group=mixed?
+            (is_router?block:block*4+lane-1):
+            (is_router?task:task-router_groups);
+        if(is_router){int r=group*8;const uint16_t*w=router->weight+(size_t)r*router->cols;
             matvec_bf16_8row(router_out+r,w,w+router->cols,w+2*router->cols,
                 w+3*router->cols,w+4*router->cols,w+5*router->cols,
                 w+6*router->cols,w+7*router->cols,hidden,router->cols);
-        }else{int g=task-router_groups;k3_matvec_q8pv16_f32_group(latent_out+g*8,
-                latent_down->data+(size_t)g*down_group_bytes,hidden,latent_down->cols);}
+        }else{k3_matvec_q8pv16_f32_group(latent_out+group*8,
+                latent_down->data+(size_t)group*down_group_bytes,hidden,latent_down->cols);}
     }
 }
 

@@ -549,8 +549,9 @@ real layer-1 32-channel slices match the unfused reference to `9.313e-10` maximu
 absolute error.  In a same-node A/B build, the selected-expert layer falls from
 0.081 to 0.062 ms (23.5%); the conservative simulator default is 0.065 ms.
 
-Clean real Q8W16 reruns reached 232--237 GB/s for routed-up and 241 GB/s for the
-BF16-router/Q8W16-down pair.  Defaults are conservatively 230 and 235 GB/s.  A
+The initial real Q8W16 reruns reached 232--237 GB/s for routed-up and 241 GB/s for the
+BF16-router/Q8W16-down pair. Those write-eviction measurements and their 230/235
+GB/s defaults are superseded by the stable calibration below. A
 16-row tile regressed to 186 GB/s, while activation-Q8 SDOT regressed to 170 GB/s
 and failed quality at 0.605% relative L2; neither rejected kernel remains enabled.
 
@@ -562,6 +563,49 @@ At a 10 us 96-node tree-step calibration it becomes **18.33 token/s**.  Therefor
 roughly 10 us/step or another reduction of the 186-collective stack.  The new
 hierarchical path did pass 32,768 sequential real-weight layer steps on 12/12
 ranks in 14.45 seconds, with bounded KDA state and no collective failure.
+
+### Stable 15 token/s calibration
+
+The earlier 225--235 GB/s Q8W16 calibration was artificially low. The dense
+probe evicted cache by writing 192 MiB immediately before each timed call, so
+outstanding writeback competed with the weight stream. The probe now performs a
+read-only sweep of every cache line and consumes the reduction through a volatile
+sink. This still makes the real weights cold without injecting traffic that the
+runner does not generate. `--stable-reps N` reports both mean bandwidth and the
+p95-latency bandwidth floor; `--threads N` isolates one worker count without
+OpenMP team-resize or sweep-order effects.
+
+Five independent 64-sample runs on the current 12-node interactive allocation
+gave routed-up p95 floors of 330--392 GB/s at 44 workers in the clean runs, and
+the mixed BF16-router/Q8W16-down path gave 288--334 GB/s at 47 workers. The mixed
+task order interleaves one router group with four down groups, raising its median
+mean throughput to 354 GB/s versus 340 GB/s for the concatenated schedule; median
+p95 bandwidth was essentially tied near 319 GB/s. Both real projections retain
+their eight-activation quality gates: worst relative L2 is 0.478% and minimum
+cosine is 0.9999886. Occasional interactive-host scheduling stalls remain visible
+and are not represented as kernel bandwidth; a production rank must be exclusively
+pinned. Reproduce the selected measurements with:
+
+```sh
+OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./k3_dense_probe --only q8w16 --threads 44 --stable-reps 64 BLOB MANIFEST
+OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./k3_dense_probe --only q8w16down --threads 47 --stable-reps 64 BLOB MANIFEST
+```
+
+The simulator deliberately discounts those clean p95 results to 300 GB/s for
+routed-up and 285 GB/s for the router/down pair. With 96 nodes, expert TP, fused
+MoE reduction, hierarchical collectives, and dense Q8W16, the 4K M=1 model is
+**16.89 token/s**: 59.19 ms/token against the stable-15 budget of 66.67 ms, a
+7.47 ms margin. M=32 is **224.98 aggregate token/s** and fits the modeled HBM
+budget at 25.93 GB/rank. The Q8W16 finish path caps its compute team at 44 workers
+so application cores remain available for communication progress.
+
+This establishes a partial-real-weight kernel floor and a conservative full-model
+estimate, not a measured 96-node end-to-end result. The 22.1 ms collective term
+and full-layer scheduling still require validation in an exclusive 96-node job;
+the simulator prints an explicit PASS/FAIL line via `--decode-target-tps` so future
+measurements cannot silently weaken the stable target.
 
 ## Runner runtime and command-line contract
 
