@@ -25,6 +25,7 @@ REUSE_STAGE=0
 NO_FUSED_TEAM=0
 MLA_CACHE_BF16=1
 HEARTBEAT_TOKENS=1024
+AR_GROUPS=0
 
 usage() {
     cat >&2 <<EOF
@@ -34,6 +35,7 @@ usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--profile] [--reuse-stage] [--no-fused-team]
           [--mla-cache-bf16|--mla-cache-fp32]
           [--heartbeat-tokens N]
+          [--ar-groups N] (0=flat, otherwise N contiguous groups)
 EOF
 }
 need_value() { if (( $# < 2 )); then echo "$0: missing value for $1" >&2; usage; exit 2; fi; }
@@ -58,24 +60,28 @@ while (( $# )); do
         --mla-cache-bf16) MLA_CACHE_BF16=1; shift;;
         --mla-cache-fp32) MLA_CACHE_BF16=0; shift;;
         --heartbeat-tokens) need_value "$@"; HEARTBEAT_TOKENS=$2; shift 2;;
+        --ar-groups) need_value "$@"; AR_GROUPS=$2; shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2;;
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$AR_GROUPS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
 (( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && KDA_THREADS > 0 && KDA_THREADS <= THREADS && FUSED_THREADS > 0 && FUSED_THREADS <= THREADS && CHUNK_MIB > 0 )) || {
     echo "$0: invalid numeric option range" >&2; exit 2; }
 (( NODES <= 96 )) || { echo "$0: node count must be in [1,96]" >&2; exit 2; }
+(( AR_GROUPS == 0 || (AR_GROUPS > 1 && NODES % AR_GROUPS == 0) )) || {
+    echo "$0: --ar-groups must be 0 or a divisor in [2,--nodes]" >&2; exit 2; }
 if [[ -n "${PJM_MPI_PROC:-}" && "$NODES" -ne "$PJM_MPI_PROC" ]]; then
     echo "$0: --nodes $NODES differs from allocation process count $PJM_MPI_PROC" >&2
     exit 2
 fi
 if [[ -e "$RESULT_DIR" ]]; then echo "$0: result directory already exists: $RESULT_DIR" >&2; exit 2; fi
 mkdir -p "$RESULT_DIR"
+RESULT_DIR=$(cd "$RESULT_DIR" && pwd)
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 export OMP_NUM_THREADS="$THREADS" OMP_PROC_BIND=close OMP_PLACES=cores
@@ -127,7 +133,7 @@ else
 fi
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" \
+    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --ar-groups "$AR_GROUPS" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?

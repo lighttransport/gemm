@@ -179,7 +179,7 @@ def allreduce_seconds(nodes: int, payload_bytes: int, calls: int,
 
 def hierarchical_ar_speedup(elements: int) -> float:
     """12-node measured 3x4/flat speedup, log-interpolated by payload."""
-    points = ((3584, 1.16), (7168, 1.16),
+    points = ((3584, 1.16), (7168, 1.19), (10752, 1.24),
               (114688, 1.30), (229376, 1.31))
     if elements <= points[0][0]:
         return points[0][1]
@@ -272,12 +272,12 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            link_gbps: float, imbalance: float, expert_ms: float,
            expert_samples: int, moe_collectives: int,
            latent_overlap: bool, hierarchical_ar: bool,
-           expert_tp: bool = False, expert_tp_layer_ms: float = .094,
+           expert_tp: bool = False, expert_tp_layer_ms: float = .065,
            fused_moe_ar: bool = False, dense_q8: bool = False,
            q8_down_gbps: float = 140.0, q8_up_gbps: float = 173.0,
            attention_rsag: bool = False, q8_up_only: bool = False,
-           q8w16_up: bool = False, q8w16_up_gbps: float = 218.0,
-           q8w16_dense: bool = False, q8w16_pair_gbps: float = 216.7) -> dict:
+           q8w16_up: bool = False, q8w16_up_gbps: float = 230.0,
+           q8w16_dense: bool = False, q8w16_pair_gbps: float = 235.0) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB -
@@ -515,8 +515,8 @@ def main() -> None:
     p.add_argument("--imbalance", type=float, default=1.20, help="critical-rank routed-expert traffic factor")
     p.add_argument("--expert-tp", action="store_true",
                    help="shard every expert over its group-32 intermediate blocks")
-    p.add_argument("--expert-tp-layer-ms", type=float, default=.094,
-                   help="target M=1 critical time for 16 local expert slices")
+    p.add_argument("--expert-tp-layer-ms", type=float, default=.065,
+                   help="measured fused M=1 time for 16 native TP=96 slices")
     p.add_argument("--fused-moe-ar", action="store_true",
                    help="one concatenated latent+shared hidden reduction per MoE layer")
     p.add_argument("--dense-q8", action="store_true",
@@ -529,10 +529,10 @@ def main() -> None:
                    help="quality-gated Q8W16 routed down+up with BF16 router")
     p.add_argument("--q8-down-gbps", type=float, default=140.0)
     p.add_argument("--q8-up-gbps", type=float, default=173.0)
-    p.add_argument("--q8w16-up-gbps", type=float, default=218.0,
-                   help="measured stored-byte bandwidth for Q8W16 routed-up")
-    p.add_argument("--q8w16-pair-gbps", type=float, default=216.7,
-                   help="measured mixed BF16-router + Q8W16-down traffic bandwidth")
+    p.add_argument("--q8w16-up-gbps", type=float, default=230.0,
+                   help="conservative clean-run stored bandwidth for Q8W16 routed-up")
+    p.add_argument("--q8w16-pair-gbps", type=float, default=235.0,
+                   help="clean-run mixed BF16-router + Q8W16-down traffic bandwidth")
     p.add_argument("--attention-rsag", action="store_true",
                    help="model measured real RSAG (1.03x flat tree; rejected)")
     p.add_argument("--json", type=Path, help="also write full results as JSON")

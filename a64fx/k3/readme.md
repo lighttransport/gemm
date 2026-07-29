@@ -515,6 +515,54 @@ at M=1 and 25.97 GB/rank at M=32. Its M=1 compute-only lower bound is 47.9 ms, o
 20.9 token/s with free communication; the current 23.0 ms collective term must fall
 to roughly 2 ms to reach 20 token/s without further kernel gains.
 
+### 18 token/s attack
+
+The first pass toward 18 token/s removes two runner/model discrepancies and one
+TP=96 expert bottleneck without relaxing the Q8W16 quality gate.
+
+The runner now accepts `--ar-groups A`.  Zero retains the flat tree; a divisor
+greater than one factors `N=A*B` into contiguous row groups followed by a strided
+column reduction.  Both communication regions come from the NUMA-aware 256-byte
+aligned runner pool, and SUM/MAX use the same checked error path as the flat tree.
+On the current 12-node 2x3x2 allocation, 8,192 exact 10,754-float reductions gave:
+
+| Mapping | Flat | Hierarchical | Speedup |
+|---:|---:|---:|---:|
+| 2x6 | 112.7 us | 96.4 us | 1.17x |
+| 3x4 | 112.7 us | 91.1 us | 1.24x |
+| 4x3 | 112.9 us | 92.0 us | 1.23x |
+| 6x2 | 112.7 us | 96.8 us | 1.16x |
+
+The transport also overlaps local completion of a contiguous payload+trailer Put
+with the reciprocal receive.  A 16,384-reduction rerun improved the flat fused
+payload from 112.7 to 106.8 us and 3x4 from 91.1 to 89.0 us, with zero mismatches.
+Separate 3x4 calibration is 1.16x at 3,584 floats, 1.19x at 7,168, and 1.24x at
+10,752; the simulator uses those payload-dependent values.  Direct all-to-all
+(74.6 to 113.0 us for 7,168 floats), BF16 transport (at most 1.6%), and lean
+polling were measured and rejected.  The 96-node group factor remains a launch
+parameter until a real 96-node topology sweep chooses it.
+
+At TP=96, routed expert down previously horizontally reduced eight rows for each
+of 16 experts and then combined 128 scalars.  The new SVE path applies routing
+weights to vector accumulators and performs only eight final reductions.  Sixteen
+real layer-1 32-channel slices match the unfused reference to `9.313e-10` maximum
+absolute error.  In a same-node A/B build, the selected-expert layer falls from
+0.081 to 0.062 ms (23.5%); the conservative simulator default is 0.065 ms.
+
+Clean real Q8W16 reruns reached 232--237 GB/s for routed-up and 241 GB/s for the
+BF16-router/Q8W16-down pair.  Defaults are conservatively 230 and 235 GB/s.  A
+16-row tile regressed to 186 GB/s, while activation-Q8 SDOT regressed to 170 GB/s
+and failed quality at 0.605% relative L2; neither rejected kernel remains enabled.
+
+With fused expert TP, fused MoE reduction, hierarchical collectives, and Q8W16
+dense projections, the revised 96-node 4K M=1 estimate is **15.32 token/s**:
+36.3 ms weights, 6.0 ms experts, 0.9 ms KV/KDA, and 22.1 ms communication.
+At a 10 us 96-node tree-step calibration it becomes **18.33 token/s**.  Therefore
+18 token/s is not yet claimed: it requires the unavailable 96-node run to show
+roughly 10 us/step or another reduction of the 186-collective stack.  The new
+hierarchical path did pass 32,768 sequential real-weight layer steps on 12/12
+ranks in 14.45 seconds, with bounded KDA state and no collective failure.
+
 ## Runner runtime and command-line contract
 
 The K3 dense, KDA, and MoE probes now allocate through `k3_pool` in
@@ -566,11 +614,14 @@ Both execution modes use the same kernels, scratch buffers, and collective:
   headers. At TP=96 this reads about 2.79 MiB/rank, or about 45 MiB per 16-node SIO
   group. Loading is collective-safe: one rank's failure is reduced to every rank,
   producing `load-failed` status rather than stranding peers in the next collective.
+- `--ar-groups A` enables the pool-backed hierarchical all-reduce when `A` divides
+  the node count; `0` is the safe flat default. Use `--ar-groups 3` for the measured
+  12-node 3x4 allocation. Do not assume that factor is optimal at 96 nodes.
 
 Inside an allocation, use the orchestration wrapper:
 
 ```sh
-./run_k3_ep.sh --mode dummy --nodes 96 --layers 2 --tokens 2
+./run_k3_ep.sh --mode dummy --nodes 96 --layers 2 --tokens 2 --ar-groups 0
 ./run_k3_ep.sh --mode real --nodes 96 --layer 1 --experts 0-15 \
   --model-dir "$HOME/models/kimi-k3" --layers 1 --tokens 2
 ```

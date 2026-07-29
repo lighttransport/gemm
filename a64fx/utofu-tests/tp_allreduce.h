@@ -79,6 +79,7 @@ typedef struct {
     double          timeout;
     size_t          ack_base;                /* byte offset of ack region (nprocs 8B slots + 1 scratch) */
     unsigned long   drop_n, put_ctr;         /* TP_AR_DROP=N: drop 1-in-N payload Puts (loss injection) */
+    int             send_inflight;           /* fast contiguous Put awaiting local completion */
     /* one outstanding send awaiting confirmation. send() is NON-blocking (Put + stash here); it is
      * retransmitted from BOTH the recv-wait spin AND tp_ar_confirm() until the peer acks -- retransmit
      * during recv is essential: if both directions of a doubling pair drop, both ranks block in recv,
@@ -176,6 +177,7 @@ static inline void tp_ar_drain_mrq(tp_comm *c) {
 }
 
 static void tp_ar_send_puts(tp_comm *c, int peer, int sid, size_t pbytes, int contiguous);  /* fwd decl */
+static int tp_ar_put_nb(tp_comm *c,int peer,utofu_stadd_t src,utofu_stadd_t dst,size_t len);
 /* Retransmit the one outstanding send if still unacked and ack_rtt elapsed. Called from BOTH the
  * recv-wait spin AND tp_ar_confirm so a send is re-driven even while this rank blocks in a recv --
  * essential when both directions of a doubling pair drop (both ranks block in recv; only a recv-loop
@@ -249,6 +251,13 @@ static void tp_ar_put(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t dst
     tp_ar_drain_mrq(c);   /* consume receiver-side RMT_PUT notices → no MRQ overflow */
 }
 
+static void tp_ar_complete_sends(tp_comm *c){if(!c->send_inflight)return;void *cb;int rc;
+    while(c->send_inflight>0){rc=utofu_poll_tcq(c->vcq,0,&cb);
+        if(rc==UTOFU_SUCCESS)c->send_inflight--;
+        else if(rc!=UTOFU_ERR_NOT_FOUND)tp_ar_fail(c,EIO,"send poll_tcq rc=%d",rc);}
+    tp_ar_drain_mrq(c);
+}
+
 /* --- TP_AR_ACK reliability helpers --- */
 /* Put the (already-filled) send slot to peer's recv[sid]. Optional TP_AR_DROP loss injection:
  * every drop_n-th call the payload+trailer "vanish" (skipped) to exercise the retransmit path. */
@@ -257,7 +266,9 @@ static void tp_ar_send_puts(tp_comm *c, int peer, int sid, size_t pbytes, int co
     size_t tr_off = tp_ar_trailer_off(c);
     utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
     utofu_stadd_t dst = c->peer_base[peer] + tp_ar_slot_off(c, 1 + sid);
-    if (contiguous) tp_ar_put(c, peer, src, dst, pbytes + 8);
+    if(contiguous&&!c->ack)
+        c->send_inflight+=tp_ar_put_nb(c,peer,src,dst,pbytes+8);
+    else if (contiguous) tp_ar_put(c, peer, src, dst, pbytes + 8);
     else { tp_ar_put(c, peer, src, dst, pbytes); tp_ar_put(c, peer, src + tr_off, dst + tr_off, 8); }
 }
 /* Receiver R -> sender S: Put R's ack tok into S's ack[R] slot (8 B). Never drop-injected. */
@@ -304,6 +315,7 @@ static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int coun
  * then proceed OPTIMISTICALLY after ack_retx tries (idempotent payload). The recv-wait loop already
  * services it too, so by here it is usually already acked. No-op when ack is off. */
 static void tp_ar_confirm(tp_comm *c) {
+    tp_ar_complete_sends(c);
     if (!c->ack) return;
     while (!tp_ar_service_pending(c)) { if (c->robust) tp_ar_drain_mrq(c); }
 }
@@ -882,6 +894,37 @@ static int tp_comm_init_2d(tp_comm *row, tp_comm *col, utofu_vcq_hdl_t vcq,
     return 0;
 }
 
+/* Pool-backed form used by production runners.  The caller owns both regions;
+ * keeping their allocation policy outside this transport avoids hidden mallocs
+ * and lets A64FX runners preserve NUMA placement and 256-byte alignment. */
+static int tp_comm_init_2d_external(tp_comm *row, tp_comm *col,
+                           utofu_vcq_hdl_t vcq,
+                           const utofu_vcq_id_t *peer_vcq,
+                           int my_rank, int nprocs, int A, int max_count,
+                           void (*barrier_fn)(void),
+                           const tp_comm_config *options,
+                           void *row_region, size_t row_region_size,
+                           void *col_region, size_t col_region_size) {
+    if (A < 1 || nprocs % A != 0) {
+        fprintf(stderr, "tp_ar_2d: A=%d does not divide N=%d\n", A, nprocs);
+        return -1;
+    }
+    int B=nprocs/A,g=my_rank/B,b=my_rank%B;
+    utofu_vcq_id_t pv[TP_AR_MAXN];
+    for(int j=0;j<B;++j)pv[j]=peer_vcq[g*B+j];
+    if(tp_comm_init_region_ex(row,vcq,pv,b,B,max_count,barrier_fn,
+            TP_AR_STAG,options,row_region,row_region_size))return-1;
+    for(int i=0;i<A;++i)pv[i]=peer_vcq[i*B+b];
+    if(tp_comm_init_region_ex(col,vcq,pv,g,A,max_count,barrier_fn,
+            TP_AR_STAG2,options,col_region,col_region_size)){
+        tp_comm_free(row);return-1;
+    }
+    if(my_rank==0)fprintf(stderr,
+        "tp_ar_2d: external N=%d = A(%d) x B(%d), rounds %d+%d\n",
+        nprocs,A,B,col->nrounds,row->nrounds);
+    return 0;
+}
+
 /* in-place SUM-all-reduce of buf[0..count) via the 2-level schedule: reduce within the
  * group (row), then across groups (col).  After row, every rank in group g holds the
  * group-sum S_g; col then reduces {S_0..S_{A-1}} so every rank ends with the global sum.
@@ -889,6 +932,18 @@ static int tp_comm_init_2d(tp_comm *row, tp_comm *col, utofu_vcq_hdl_t vcq,
 static void tp_allreduce_sum_2d(tp_comm *row, tp_comm *col, float *buf, int count) {
     tp_allreduce_sum(row, buf, count);   /* within-group partial */
     tp_allreduce_sum(col, buf, count);   /* across-group -> global */
+}
+
+static int tp_allreduce_sum_2d_checked(tp_comm *row,tp_comm *col,
+                                       float *buf,int count){
+    int rc=tp_allreduce_sum_checked(row,buf,count);
+    return rc?rc:tp_allreduce_sum_checked(col,buf,count);
+}
+
+static int tp_allreduce_max_2d_checked(tp_comm *row,tp_comm *col,
+                                       float *buf,int count){
+    int rc=tp_allreduce_max_checked(row,buf,count);
+    return rc?rc:tp_allreduce_max_checked(col,buf,count);
 }
 
 static void tp_comm_free_2d(tp_comm *row, tp_comm *col) { tp_comm_free(row); tp_comm_free(col); }

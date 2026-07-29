@@ -47,6 +47,7 @@ typedef struct {
     int fuse_kda_expert;
     int mla_cache_bf16;
     int heartbeat_tokens;
+    int ar_groups;
     k3_mode mode;
     const char *stage_dir;
     const char *status_dir;
@@ -75,7 +76,8 @@ static void usage(const char *p){
         "          [--threads N] [--layer N] [--stage-dir DIR]\n"
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
-        "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n",p);
+        "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
+        "          [--ar-groups N] (0=flat, otherwise N contiguous groups)\n",p);
 }
 static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
     char *end=NULL;errno=0;long v=strtol(s,&end,10);
@@ -103,6 +105,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--mla-cache-bf16")){o->mla_cache_bf16=1;}
         else if(!strcmp(a,"--mla-cache-fp32")){o->mla_cache_bf16=0;}
         else if(!strcmp(a,"--heartbeat-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->heartbeat_tokens))return-1;}
+        else if(!strcmp(a,"--ar-groups")){VALUE();if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
         else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
         else if(!strcmp(a,"--stage-dir")){VALUE();o->stage_dir=argv[i];}
         else if(!strcmp(a,"--status-dir")){VALUE();o->status_dir=argv[i];}
@@ -120,11 +123,32 @@ static int parse_options(int argc,char **argv,k3_options *o){
         fprintf(stderr,"k3_ep_runner: bounded real mode requires --layer in [1,92] and --layers 1\n");return-1;}
     if(o->layer+o->layers>93){
         fprintf(stderr,"k3_ep_runner: layer range [%d,%d) exceeds the 93-layer network\n",o->layer,o->layer+o->layers);return-1;}
+    if(o->ar_groups>0&&(o->ar_groups==1||o->nodes%o->ar_groups)){
+        fprintf(stderr,"k3_ep_runner: --ar-groups must be 0 or a divisor in [2,--nodes], got %d for %d nodes\n",
+                o->ar_groups,o->nodes);return-1;}
     if(!o->kda_threads)o->kda_threads=o->threads<8?o->threads:8;
     if(!o->fused_threads)o->fused_threads=o->threads;
     if(o->kda_threads>o->threads||o->fused_threads>o->threads){
         fprintf(stderr,"k3_ep_runner: phase team sizes cannot exceed --threads %d\n",o->threads);return-1;}
     return 0;
+}
+
+typedef struct {tp_comm row,col;int groups;} k3_runner_comm;
+
+static uint64_t runner_comm_seq(const k3_runner_comm *c){return c->row.seq;}
+static const char *runner_comm_error(const k3_runner_comm *c){
+    return c->row.error_message[0]?tp_comm_error(&c->row):tp_comm_error(&c->col);
+}
+static int runner_allreduce_sum(k3_runner_comm *c,float *buf,int count){
+    return c->groups?tp_allreduce_sum_2d_checked(&c->row,&c->col,buf,count):
+        tp_allreduce_sum_checked(&c->row,buf,count);
+}
+static int runner_allreduce_max(k3_runner_comm *c,float *buf,int count){
+    return c->groups?tp_allreduce_max_2d_checked(&c->row,&c->col,buf,count):
+        tp_allreduce_max_checked(&c->row,buf,count);
+}
+static void runner_comm_free(k3_runner_comm *c){
+    if(c->groups)tp_comm_free_2d(&c->row,&c->col);else tp_comm_free(&c->row);
 }
 
 static int read_topology(const char *path,uint8_t coords[][TOFU_NCOORDS]){
@@ -429,11 +453,22 @@ int main(int argc,char **argv){
     if(opt.profile&&getenv("K3_DEBUG_COMM_DROP_N")){
         comm_config.drop_n=strtoul(getenv("K3_DEBUG_COMM_DROP_N"),NULL,10);
         if(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))comm_config.timeout=atof(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))*1e-3;}
-    size_t comm_region_size=tp_comm_region_size(g_nodes,K3_RUN_REDUCE_FLOATS,&comm_config);
+    int row_nodes=opt.ar_groups?g_nodes/opt.ar_groups:g_nodes;
+    int col_nodes=opt.ar_groups?opt.ar_groups:0;
+    size_t comm_region_size=tp_comm_region_size(row_nodes,K3_RUN_REDUCE_FLOATS,&comm_config);
+    size_t col_region_size=col_nodes?tp_comm_region_size(col_nodes,K3_RUN_REDUCE_FLOATS,&comm_config):0;
     void *comm_region=k3_pool_alloc(&pool,comm_region_size);
-    if(!comm_region){fprintf(stderr,"k3_ep_runner rank %d: %s\n",g_rank,k3_pool_error(&pool));return 3;}
-    tp_comm comm;if(tp_comm_init_external(&comm,g_vcq,g_peer_vcq,g_rank,g_nodes,
-            K3_RUN_REDUCE_FLOATS,runner_barrier,&comm_config,comm_region,comm_region_size)){
+    void *col_region=col_region_size?k3_pool_alloc(&pool,col_region_size):NULL;
+    if(!comm_region||(col_region_size&&!col_region)){
+        fprintf(stderr,"k3_ep_runner rank %d: %s\n",g_rank,k3_pool_error(&pool));return 3;}
+    k3_runner_comm comm;memset(&comm,0,sizeof comm);comm.groups=opt.ar_groups;
+    int comm_init_rc=opt.ar_groups?
+        tp_comm_init_2d_external(&comm.row,&comm.col,g_vcq,g_peer_vcq,g_rank,g_nodes,
+            opt.ar_groups,K3_RUN_REDUCE_FLOATS,runner_barrier,&comm_config,
+            comm_region,comm_region_size,col_region,col_region_size):
+        tp_comm_init_external(&comm.row,g_vcq,g_peer_vcq,g_rank,g_nodes,
+            K3_RUN_REDUCE_FLOATS,runner_barrier,&comm_config,comm_region,comm_region_size);
+    if(comm_init_rc){
         fprintf(stderr,"k3_ep_runner rank %d: all-reduce initialization failed\n",g_rank);
         utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
     runner_barrier();
@@ -443,13 +478,13 @@ int main(int argc,char **argv){
     for(int e=0;e<K3_SELECTED;++e){int bad=opt.mode==K3_MODE_REAL?
         load_real_expert(&pool,opt.stage_dir,opt.layer,e,local,&experts[e]):
         make_dummy_expert(&pool,g_rank,e,local,&experts[e]);if(bad){ready=0;break;}}
-    float ready_sum=(float)ready;int collective_rc=tp_allreduce_sum_checked(&comm,&ready_sum,1);
-    if(collective_rc){fprintf(stderr,"k3_ep_runner rank %d: readiness collective failed: %s\n",g_rank,tp_comm_error(&comm));
-        write_status(&opt,"comm-failed","weight-readiness",0,-1,comm.seq,0,0,pool.peak_active_bytes);
-        tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
+    float ready_sum=(float)ready;int collective_rc=runner_allreduce_sum(&comm,&ready_sum,1);
+    if(collective_rc){fprintf(stderr,"k3_ep_runner rank %d: readiness collective failed: %s\n",g_rank,runner_comm_error(&comm));
+        write_status(&opt,"comm-failed","weight-readiness",0,-1,runner_comm_seq(&comm),0,0,pool.peak_active_bytes);
+        runner_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
     if((int)lrintf(ready_sum)!=g_nodes){
         if(g_rank==0)fprintf(stderr,"k3_ep_runner: distributed weight readiness failed (%d/%d ranks ready)\n",(int)lrintf(ready_sum),g_nodes);
-        write_status(&opt,"load-failed","weight-load",0,-1,comm.seq,0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
+        write_status(&opt,"load-failed","weight-load",0,-1,runner_comm_seq(&comm),0,0,pool.peak_active_bytes);runner_barrier();runner_comm_free(&comm);
         utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 4;}
 
     k3_mxfp4_matrix w1[K3_SELECTED],w2[K3_SELECTED],w3[K3_SELECTED];float route[K3_SELECTED];
@@ -484,13 +519,13 @@ int main(int argc,char **argv){
     float *mla_stats=k3_pool_alloc(&pool,((size_t)local_heads*opt.threads*2+(size_t)local_heads*2)*sizeof(float));
     ready=capacity_ok&&latent&&partial&&shared&&reduce&&gate&&up&&(!kda_elems||kda_state)&&
         (!mla_key_elems||mla_keys)&&(!mla_value_elems||mla_values)&&q&&k&&v&&decay&&attn_out&&mla_scratch&&mla_stats;
-    ready_sum=(float)ready;collective_rc=tp_allreduce_sum_checked(&comm,&ready_sum,1);
-    if(collective_rc){fprintf(stderr,"k3_ep_runner rank %d: allocation collective failed: %s\n",g_rank,tp_comm_error(&comm));
-        write_status(&opt,"comm-failed","allocation-readiness",0,-1,comm.seq,0,0,pool.peak_active_bytes);
-        tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
+    ready_sum=(float)ready;collective_rc=runner_allreduce_sum(&comm,&ready_sum,1);
+    if(collective_rc){fprintf(stderr,"k3_ep_runner rank %d: allocation collective failed: %s\n",g_rank,runner_comm_error(&comm));
+        write_status(&opt,"comm-failed","allocation-readiness",0,-1,runner_comm_seq(&comm),0,0,pool.peak_active_bytes);
+        runner_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
     if((int)lrintf(ready_sum)!=g_nodes){if(!ready&&pool.error[0])fprintf(stderr,"%s\n",k3_pool_error(&pool));
         if(g_rank==0)fprintf(stderr,"k3_ep_runner: distributed scratch allocation failed (%d/%d ranks ready)\n",(int)lrintf(ready_sum),g_nodes);
-        write_status(&opt,"alloc-failed","state-allocation",0,-1,comm.seq,0,0,pool.peak_active_bytes);runner_barrier();tp_comm_free(&comm);
+        write_status(&opt,"alloc-failed","state-allocation",0,-1,runner_comm_seq(&comm),0,0,pool.peak_active_bytes);runner_barrier();runner_comm_free(&comm);
         utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 4;}
     for(int i=0;i<K3_LATENT;++i)latent[i]=sinf((float)(i+1)*0.001f)*0.125f;
 
@@ -505,8 +540,8 @@ int main(int argc,char **argv){
             if(!finite||g_stop_signal){memset(reduce,0,K3_RUN_REDUCE_FLOATS*sizeof(float));
                 reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
                 reduce[K3_CONTROL_NUMERIC]=finite?0.0f:1.0f;
-                if(tp_allreduce_sum_checked(&comm,reduce,K3_RUN_REDUCE_FLOATS)){
-                    fprintf(stderr,"k3_ep_runner rank %d: stop collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=stopped=1;break;}
+                if(runner_allreduce_sum(&comm,reduce,K3_RUN_REDUCE_FLOATS)){
+                    fprintf(stderr,"k3_ep_runner rank %d: stop collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=stopped=1;break;}
                 stop_signal=reduce[K3_CONTROL_SIGNAL]>0;stop_numeric=reduce[K3_CONTROL_NUMERIC]>0;stopped=1;break;}
             int fused=opt.fuse_kda_expert&&global_layer>0&&layer_is_kda(global_layer);double pt=0;
             if(fused){double ft[2]={0};if(synthetic_kda_expert_partial(shared,partial,latent,
@@ -526,9 +561,9 @@ int main(int argc,char **argv){
             reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
             reduce[K3_CONTROL_NUMERIC]=finite?0.0f:1.0f;
             if(opt.profile)phase[3]+=now_sec()-pt;pt=opt.profile?now_sec():0;
-            if(tp_allreduce_sum_checked(&comm,reduce,K3_RUN_REDUCE_FLOATS)){
+            if(runner_allreduce_sum(&comm,reduce,K3_RUN_REDUCE_FLOATS)){
                 fprintf(stderr,"k3_ep_runner rank %d: layer collective failed at token=%d layer=%d: %s\n",
-                    g_rank,token,global_layer,tp_comm_error(&comm));comm_failed=stopped=1;break;}
+                    g_rank,token,global_layer,runner_comm_error(&comm));comm_failed=stopped=1;break;}
             if(opt.profile)phase[4]+=now_sec()-pt;
             if(reduce[K3_CONTROL_SIGNAL]>0||reduce[K3_CONTROL_NUMERIC]>0){
                 stop_signal=reduce[K3_CONTROL_SIGNAL]>0;stop_numeric=reduce[K3_CONTROL_NUMERIC]>0;stopped=1;break;}
@@ -545,13 +580,13 @@ int main(int argc,char **argv){
             for(size_t i=0;i<kda_elems;++i){float a=fabsf(kda_state[i]);if(a>state_now)state_now=a;}
             float hb[6]={g_stop_signal?1.0f:0.0f,finite?0.0f:1.0f,latent_now,state_now,
                 cache_running_max,-(float)(k3_mem_available_bytes()/1048576.0)};
-            if(tp_allreduce_max_checked(&comm,hb,6)){
-                fprintf(stderr,"k3_ep_runner rank %d: heartbeat collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=stopped=1;break;}
+            if(runner_allreduce_max(&comm,hb,6)){
+                fprintf(stderr,"k3_ep_runner rank %d: heartbeat collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=stopped=1;break;}
             stop_signal=hb[0]>0;stop_numeric=hb[1]>0;
             if(stop_signal||stop_numeric)stopped=1;
-            double elapsed=now_sec()-start;write_progress(&opt,tokens_completed,elapsed,hb[2],hb[3],hb[4],-hb[5],comm.seq);
+            double elapsed=now_sec()-start;write_progress(&opt,tokens_completed,elapsed,hb[2],hb[3],hb[4],-hb[5],runner_comm_seq(&comm));
             if(g_rank==0){printf("K3_PROGRESS tokens=%d/%d elapsed_s=%.3f tokens_per_s=%.3f min_available_MiB=%.1f latent_max=%.6e state_max=%.6e cache_max=%.6e collective_seq=%lu\n",
-                tokens_completed,opt.tokens,elapsed,elapsed>0?tokens_completed/elapsed:0.0,-hb[5],hb[2],hb[3],hb[4],(unsigned long)comm.seq);fflush(stdout);}
+                tokens_completed,opt.tokens,elapsed,elapsed>0?tokens_completed/elapsed:0.0,-hb[5],hb[2],hb[3],hb[4],(unsigned long)runner_comm_seq(&comm));fflush(stdout);}
         }
     }
     if(!comm_failed)runner_barrier();double seconds=now_sec()-start,checksum=0,norm2=0;
@@ -570,25 +605,26 @@ int main(int argc,char **argv){
 #pragma omp parallel for reduction(max:cache_max)
         for(size_t i=0;i<mla_value_elems;++i){float a=fabsf(values[i]);if(a>cache_max)cache_max=a;}}
     float health[3]={latent_max,state_max,cache_max};float checksum_sum=(float)checksum;
-    if(!comm_failed&&(tp_allreduce_max_checked(&comm,health,3)||
-            tp_allreduce_sum_checked(&comm,&checksum_sum,1))){
-        fprintf(stderr,"k3_ep_runner rank %d: final health collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=1;}
+    if(!comm_failed&&(runner_allreduce_max(&comm,health,3)||
+            runner_allreduce_sum(&comm,&checksum_sum,1))){
+        fprintf(stderr,"k3_ep_runner rank %d: final health collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;}
     if(opt.profile&&!comm_failed)for(int i=0;i<6;++i){float x=(float)phase[i];
-        if(tp_allreduce_max_checked(&comm,&x,1)){fprintf(stderr,"k3_ep_runner rank %d: profile collective failed: %s\n",g_rank,tp_comm_error(&comm));comm_failed=1;break;}phase[i]=x;}
+        if(runner_allreduce_max(&comm,&x,1)){fprintf(stderr,"k3_ep_runner rank %d: profile collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;break;}phase[i]=x;}
     double disagreement=comm_failed?INFINITY:fabs((double)checksum_sum/g_nodes-checksum);
     finite&=!comm_failed&&isfinite(checksum)&&isfinite(norm2)&&disagreement<1e-4;
     if(!finite)stop_numeric=1;
     const char *final_state=comm_failed?"comm-failed":stop_signal?"stopped":stop_numeric?"numeric-failed":"pass";
     const char *final_reason=comm_failed?"collective-error":stop_signal?(g_stop_signal==SIGINT?"signal-int":g_stop_signal==SIGTERM?"signal-term":"signal-peer"):
         stop_numeric?"non-finite":"complete";
-    write_status(&opt,final_state,final_reason,tokens_completed,last_layer,comm.seq,seconds,checksum,pool.peak_active_bytes);
+    write_status(&opt,final_state,final_reason,tokens_completed,last_layer,runner_comm_seq(&comm),seconds,checksum,pool.peak_active_bytes);
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
-        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s\n",
-            opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32");
+        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d\n",
+            opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",
+            opt.ar_groups?"hierarchical":"flat",opt.ar_groups);
         printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
             !comm_failed&&!stop_signal&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal?"STOPPED":"FAIL",final_reason,tokens_completed,
-            seconds,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)comm.seq);
+            seconds,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));
         printf("K3_HEALTH kda_slots=%d mla_slots=%d state_MiB=%.2f mla_cache_MiB=%.2f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e\n",
             kda_layers,mla_layers,kda_elems*sizeof(float)/1048576.0,
             (mla_key_elems+mla_value_elems)*cache_element_bytes/1048576.0,health[0],health[1],health[2]);
@@ -599,6 +635,6 @@ int main(int argc,char **argv){
             printf(" measured_upper=%.4f upper_pct=%.1f\n",sum*1e3/steps,seconds>0?100.0*sum/seconds:0.0);
         fflush(stdout);}
     }
-    if(!comm_failed)runner_barrier();tp_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
+    if(!comm_failed)runner_barrier();runner_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
     return comm_failed?3:stop_signal?5:stop_numeric?1:0;
 }
