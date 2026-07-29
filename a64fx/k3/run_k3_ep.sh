@@ -95,7 +95,8 @@ if [[ "$MODE" == real ]]; then
     if (( REUSE_STAGE )); then
         mpiexec -np "$NODES" /bin/sh -c '
             rank=${PMIX_RANK:?}; marker="$1/stage-rank$(printf "%03d" "$rank").status"
-            test -f "$marker" && grep -q "nodes=$2 layer=$3 experts=$4" "$marker"
+            expected="rank=$rank nodes=$2 layer=$3 experts=$4"
+            test -f "$marker" && test "$(cat "$marker")" = "$expected"
         ' sh "$STAGE_DIR" "$NODES" "$LAYER" "$EXPERTS" || {
             echo "$0: --reuse-stage validation failed: $STAGE_DIR" >&2; exit 4; }
         echo "reusing rank-local stage: $STAGE_DIR"
@@ -120,7 +121,7 @@ mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
 runner_rc=$?
 set -e
 
-passes=$(grep -l 'state=pass' "$RESULT_DIR"/k3_rank*.status 2>/dev/null | wc -l || true)
+passes=$(grep -l ' state=pass ' "$RESULT_DIR"/k3_rank*.status 2>/dev/null | wc -l || true)
 grep -hE 'K3_RUN|K3_RESULT|K3_HEALTH|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
 echo "K3 distributed result: rc=$runner_rc pass_markers=$passes/$NODES results=$RESULT_DIR"
 

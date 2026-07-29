@@ -121,6 +121,10 @@ static int read_topology(const char *path,uint8_t coords[][TOFU_NCOORDS]){
         unsigned r,c[TOFU_NCOORDS];
         if(sscanf(line,"%u %u %u %u %u %u %u",&r,&c[0],&c[1],&c[2],&c[3],&c[4],&c[5])!=7||(int)r!=n){
             fprintf(stderr,"k3_ep_runner: malformed/out-of-order topology line: %s",line);fclose(f);return-1;}
+        for(int k=0;k<TOFU_NCOORDS;++k)if(c[k]>UINT8_MAX){
+            fprintf(stderr,"k3_ep_runner: topology coordinate exceeds 255: %s",line);fclose(f);return-1;}
+        for(int p=0;p<n;++p){int same=1;for(int k=0;k<TOFU_NCOORDS;++k)same&=coords[p][k]==c[k];
+            if(same){fprintf(stderr,"k3_ep_runner: duplicate topology coordinates at ranks %d and %d\n",p,n);fclose(f);return-1;}}
         for(int k=0;k<TOFU_NCOORDS;++k)coords[n][k]=(uint8_t)c[k];++n;
     }
     fclose(f);return n;
@@ -175,8 +179,16 @@ static int load_real_expert(k3_pool *pool,const char *stage_dir,int layer,int ex
     if(nb<0||nm<0||(size_t)nb>=sizeof blob||(size_t)nm>=sizeof manifest){fprintf(stderr,"k3_ep_runner: staged path is too long\n");return-1;}
     k3_entry es[8];int ne=load_manifest(manifest,es,8);if(ne!=6){fprintf(stderr,"k3_ep_runner: '%s' has %d entries, expected 6\n",manifest,ne);return-1;}
     size_t size=0;uint8_t *base=k3_pool_load_blob(pool,blob,&size);if(!base){fprintf(stderr,"%s\n",k3_pool_error(pool));return-1;}
-    for(int i=0;i<ne;++i)if(es[i].offset>size||es[i].nbytes>size-es[i].offset){
-        fprintf(stderr,"k3_ep_runner: tensor '%s' exceeds blob '%s'\n",es[i].name,blob);k3_pool_free(pool,base);return-1;}
+    char prefix[256];int np=snprintf(prefix,sizeof prefix,"language_model.model.layers.%d.block_sparse_moe.experts.%d.",layer,expert);
+    size_t max_end=0;int valid=np>0&&(size_t)np<sizeof prefix;
+    for(int i=0;i<ne&&valid;++i){size_t end=es[i].offset+es[i].nbytes;
+        valid=!strcmp(es[i].dtype,"U8")&&!(es[i].offset%256)&&es[i].offset<=size&&es[i].nbytes<=size-es[i].offset&&
+            !strncmp(es[i].name,prefix,(size_t)np);if(end>max_end)max_end=end;
+        for(int j=0;j<i&&valid;++j){size_t other_end=es[j].offset+es[j].nbytes;
+            valid=end<=es[j].offset||other_end<=es[i].offset;}}
+    valid&=max_end==size;
+    if(!valid){fprintf(stderr,"k3_ep_runner: identity/layout validation failed for manifest '%s' and blob '%s'\n",manifest,blob);
+        k3_pool_free(pool,base);return-1;}
 #define MATRIX(prefix,rows_,cols_) do{ \
     k3_entry *p=find_entry(es,ne,#prefix ".weight_packed"),*s=find_entry(es,ne,#prefix ".weight_scale"); \
     if(!p||!s||p->rows!=(uint64_t)(rows_)||p->cols!=(uint64_t)((cols_)/2)|| \
@@ -208,10 +220,15 @@ static int make_dummy_expert(k3_pool *pool,int rank,int expert,int local,k3_load
     out->blob=b;out->size=total;return 0;
 }
 static void write_status(const k3_options *o,const char *state,double seconds,double checksum,size_t peak){
-    char path[1024];int n=snprintf(path,sizeof path,"%s/k3_rank%03d.status",o->status_dir,g_rank);
-    if(n<0||(size_t)n>=sizeof path)return;FILE *f=fopen(path,"w");if(!f)return;
-    fprintf(f,"rank=%d nodes=%d mode=%s state=%s layers=%d tokens=%d seconds=%.9f checksum=%+.9e peak_bytes=%zu\n",
-        g_rank,g_nodes,o->mode==K3_MODE_REAL?"real":"dummy",state,o->layers,o->tokens,seconds,checksum,peak);fclose(f);
+    char path[1024],tmp[1088];int n=snprintf(path,sizeof path,"%s/k3_rank%03d.status",o->status_dir,g_rank);
+    if(n<0||(size_t)n>=sizeof path)return;
+    n=snprintf(tmp,sizeof tmp,"%s.tmp.%ld",path,(long)getpid());if(n<0||(size_t)n>=sizeof tmp)return;
+    FILE *f=fopen(tmp,"wx");if(!f){fprintf(stderr,"k3_ep_runner rank %d: create status '%s': %s\n",g_rank,tmp,strerror(errno));return;}
+    int ok=fprintf(f,"rank=%d nodes=%d mode=%s state=%s layers=%d tokens=%d seconds=%.9f checksum=%+.9e peak_bytes=%zu\n",
+        g_rank,g_nodes,o->mode==K3_MODE_REAL?"real":"dummy",state,o->layers,o->tokens,seconds,checksum,peak)>=0;
+    if(ok)ok=fflush(f)==0;if(ok)ok=fsync(fileno(f))==0;if(fclose(f))ok=0;
+    if(ok)ok=rename(tmp,path)==0;
+    if(!ok){int saved=errno?errno:EIO;unlink(tmp);fprintf(stderr,"k3_ep_runner rank %d: publish status '%s': %s\n",g_rank,path,strerror(saved));}
 }
 
 /* Config lists layers one-based. KDA occupies three of each four through layer

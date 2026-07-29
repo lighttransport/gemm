@@ -712,6 +712,35 @@ still use synthetic attention inputs and only real MXFP4 expert slices; they val
 state evolution, cache indexing, collectives, and failure handling rather than
 full-model generation quality.
 
+### Recovery-marker hardening
+
+Rank completion records and rank-local stage-ready records are now published through a
+same-directory temporary file followed by an atomic rename. Runner status additionally
+flushes and `fsync`s the complete record before rename; stage markers use `sync -f`
+after the Python stager has already atomically published and fsynced every blob and
+manifest. A killed process can therefore leave either no marker or an ignored temporary
+file, but cannot leave a prefix containing `state=pass` that the wrapper accepts.
+
+Retained-stage validation compares the complete expected line, including rank, node
+count, layer, and exact expert-list spelling. The former substring check could accept
+`experts=0-15` for a request of `experts=0-1`; the 12-node negative test now rejects
+that case with exit code 4, while exact `0-15` reuse passes all ranks. Pass counting
+likewise requires the complete space-delimited `state=pass` field. An adversarial
+257-token MLA test with logits large enough to force softmax underflow remains finite
+and is bit exact between serial and parallel online attention.
+
+Real-weight loading additionally binds all six manifest tensor names to the requested
+layer and expert instead of accepting suffixes alone. It requires U8 payloads,
+256-byte-aligned non-overlapping extents, exact containment, and an exact final blob
+size before constructing matrix views. The retained 16-expert layer-1 stage passes the
+new checks on all 12 ranks. Topology parsing now rejects coordinates outside the
+stored byte range and duplicate physical coordinates before uTofu peer construction.
+
+Queued 96-node smoke job `49852287` never started and produced no runner logs. It was
+held by the scheduler with `RSCGRP STOP`, then explicitly canceled on 2026-07-30. This
+was resource-group state rather than evidence of a runner failure; no replacement
+96-node job has been submitted.
+
 All figures in this section are partial-runner measurements: real mode supplies real
 MXFP4 expert slices but still uses synthetic attention projections and omits the full
 dense/shared completion, embedding, tokenizer, and LM head. They are useful for kernel

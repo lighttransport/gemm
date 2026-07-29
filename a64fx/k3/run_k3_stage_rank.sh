@@ -24,5 +24,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$script_dir/k3_stage.py" \
     --expert-tp --tp-size "$nodes" --tp-rank "$rank" \
     --chunk-mib "$chunk_mib"
 
-printf 'rank=%s nodes=%s layer=%s experts=%s\n' "$rank" "$nodes" "$layer" "$experts" \
-    > "$stage_dir/stage-rank$(printf '%03d' "$rank").status"
+marker="$stage_dir/stage-rank$(printf '%03d' "$rank").status"
+marker_tmp="$marker.tmp.$$"
+trap 'rm -f "$marker_tmp"' EXIT HUP INT TERM
+printf 'rank=%s nodes=%s layer=%s experts=%s\n' "$rank" "$nodes" "$layer" "$experts" > "$marker_tmp"
+sync -f "$marker_tmp"
+mv "$marker_tmp" "$marker"
+trap - EXIT HUP INT TERM

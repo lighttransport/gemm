@@ -101,6 +101,19 @@ int main(void) {
         ak+(size_t)h*AT*K,av+(size_t)h*AT*V,AT,K,V);
     k3_attention_heads_parallel_sve(ap,aq,ak,av,AH,AT,AT,K,V,AP,as,ast);
     fail |= check("mla-parallel", ao2, ap, AH*V, 2e-5f);
+    enum { XH=2, XT=257, XP=48 };
+    float *xq=malloc((size_t)XH*K*4),*xk=malloc((size_t)XH*XT*K*4),*xv=malloc((size_t)XH*XT*V*4);
+    float *xr=malloc((size_t)XH*V*4),*xo=malloc((size_t)XH*V*4);
+    float *xs=malloc((size_t)XH*XP*V*4),*xst=malloc(((size_t)XH*XP*2+XH*2)*4);
+    for(int h=0;h<XH;++h)for(int d=0;d<K;++d)xq[(size_t)h*K+d]=(h?-.75f:1.0f)*20.0f;
+    for(int h=0;h<XH;++h)for(int t=0;t<XT;++t){
+        for(int d=0;d<K;++d)xk[((size_t)h*XT+t)*K+d]=(float)(t-XT/2)*.125f;
+        for(int j=0;j<V;++j)xv[((size_t)h*XT+t)*V+j]=sinf((float)(t*V+j)*.013f);}
+    for(int h=0;h<XH;++h)k3_attention_sve(xr+(size_t)h*V,xq+(size_t)h*K,
+        xk+(size_t)h*XT*K,xv+(size_t)h*XT*V,XT,K,V);
+    k3_attention_heads_parallel_sve(xo,xq,xk,xv,XH,XT,XT,K,V,XP,xs,xst);
+    fail |= check("mla-extreme", xr, xo, XH*V, 2e-5f);
+    for(int i=0;i<XH*V;++i)fail|=!isfinite(xo[i]);
 
     float candidates[13 * 64], scores[13], ar[64], ao[64]; fill(candidates, 13*64, 1); fill(scores,13,2);
     k3_attnres_ref(ar,candidates,scores,13,64); k3_attnres_sve(ao,candidates,scores,13,64);
@@ -167,6 +180,7 @@ int main(void) {
 
     free(a);free(b);free(r);free(o);free(q);free(key);free(val);free(gate);free(s0);free(s1);free(s2);free(kr);free(ko);free(kp);free(decay2);
     free(keys);free(values);free(aq);free(ak);free(av);free(ao2);free(ap);free(as);free(ast);
+    free(xq);free(xk);free(xv);free(xr);free(xo);free(xs);free(xst);
     free(bq);free(bk);free(bv);free(bg);free(bs);free(bo);
     free(pq);free(pk);free(pv);free(pd);free(pb);free(po0);free(po1);free(ps0);free(ps1);
     free(mw);free(ms);free(mx);
