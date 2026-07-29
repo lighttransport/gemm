@@ -16,6 +16,11 @@
 
 typedef struct { uint64_t offset,nbytes,rows,cols; char dtype[16],name[512]; } entry;
 typedef struct { uint8_t *blob; size_t size; k3_mxfp4_matrix w1,w2,w3; } loaded_expert;
+static k3_pool probe_pool;
+static int probe_alloc_failed;
+static void *probe_alloc(size_t bytes){void*p=k3_pool_alloc(&probe_pool,bytes);if(!p){probe_alloc_failed=1;fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}return p;}
+static void *probe_calloc(size_t count,size_t size){void*p=k3_pool_calloc(&probe_pool,count,size);if(!p){probe_alloc_failed=1;fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}return p;}
+static void probe_free(void*ptr){if(k3_pool_free(&probe_pool,ptr))fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}
 static double now_sec(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static int load_manifest(const char*path,entry*es,int cap){
     FILE*f=fopen(path,"r");if(!f)return-1;char line[1024];int n=0;
@@ -48,35 +53,36 @@ static int dispatch_unit(void){
 }
 
 static int batched_correctness(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2,const k3_mxfp4_matrix*w3){
-    int m=2;float*x=malloc((size_t)m*K3_LATENT*4),*yb=malloc((size_t)m*K3_LATENT*4),*yr=malloc((size_t)m*K3_LATENT*4);
-    float*g=malloc((size_t)m*K3_EXPERT_INTER*4),*u=malloc((size_t)m*K3_EXPERT_INTER*4);
-    float*g1=malloc((size_t)K3_EXPERT_INTER*4),*u1=malloc((size_t)K3_EXPERT_INTER*4);
+    int m=2;float*x=probe_alloc((size_t)m*K3_LATENT*4),*yb=probe_alloc((size_t)m*K3_LATENT*4),*yr=probe_alloc((size_t)m*K3_LATENT*4);
+    float*g=probe_alloc((size_t)m*K3_EXPERT_INTER*4),*u=probe_alloc((size_t)m*K3_EXPERT_INTER*4);
+    float*g1=probe_alloc((size_t)K3_EXPERT_INTER*4),*u1=probe_alloc((size_t)K3_EXPERT_INTER*4);
+    if(!x||!yb||!yr||!g||!u||!g1||!u1)return 1;
     for(int i=0;i<m*K3_LATENT;++i)x[i]=rf()*.125f;
     k3_expert_forward_mxfp4(yb,w1,w2,w3,x,m,g,u,24);
     for(int t=0;t<m;++t)k3_expert_forward_mxfp4(yr+(size_t)t*K3_LATENT,w1,w2,w3,x+(size_t)t*K3_LATENT,1,g1,u1,24);
     float e=max_abs(yb,yr,(size_t)m*K3_LATENT);printf("[batch-2x] max_abs=%.3e %s\n",e,e<2e-6?"OK":"FAIL");
-    free(x);free(yb);free(yr);free(g);free(u);free(g1);free(u1);return e>=2e-6;
+    probe_free(x);probe_free(yb);probe_free(yr);probe_free(g);probe_free(u);probe_free(g1);probe_free(u1);return e>=2e-6;
 }
 
 static int tiled_correctness(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2,const k3_mxfp4_matrix*w3){
-    enum{M=32};float*x=malloc((size_t)M*K3_LATENT*4),*yt=malloc((size_t)M*K3_LATENT*4),*yr=malloc((size_t)M*K3_LATENT*4);
-    float*gt=malloc((size_t)M*K3_EXPERT_INTER*4),*ut=malloc((size_t)M*K3_EXPERT_INTER*4);
-    float*gr=malloc((size_t)M*K3_EXPERT_INTER*4),*ur=malloc((size_t)M*K3_EXPERT_INTER*4);
+    enum{M=32};float*x=probe_alloc((size_t)M*K3_LATENT*4),*yt=probe_alloc((size_t)M*K3_LATENT*4),*yr=probe_alloc((size_t)M*K3_LATENT*4);
+    float*gt=probe_alloc((size_t)M*K3_EXPERT_INTER*4),*ut=probe_alloc((size_t)M*K3_EXPERT_INTER*4);
+    float*gr=probe_alloc((size_t)M*K3_EXPERT_INTER*4),*ur=probe_alloc((size_t)M*K3_EXPERT_INTER*4);
     if(!x||!yt||!yr||!gt||!ut||!gr||!ur)return 1;
     for(int i=0;i<M*K3_LATENT;++i)x[i]=rf()*.125f;
     k3_expert_forward_mxfp4_mode(yr,w1,w2,w3,x,M,gr,ur,48,0);
     k3_expert_forward_mxfp4_mode(yt,w1,w2,w3,x,M,gt,ut,48,8);
     float e=max_abs(yt,yr,(size_t)M*K3_LATENT);printf("[tile-vs-svtbl] M=32 max_abs=%.3e %s\n",e,e<2e-4?"OK":"FAIL");
-    free(x);free(yt);free(yr);free(gt);free(ut);free(gr);free(ur);return e>=2e-4;
+    probe_free(x);probe_free(yt);probe_free(yr);probe_free(gt);probe_free(ut);probe_free(gr);probe_free(ur);return e>=2e-4;
 }
 
 static int situ_fast_correctness(const k3_mxfp4_matrix*w1,
                                  const k3_mxfp4_matrix*w2,
                                  const k3_mxfp4_matrix*w3){
     enum{M=2};int n=M*K3_EXPERT_INTER;
-    float*x=malloc((size_t)M*K3_LATENT*4),*u=malloc((size_t)n*4);
-    float*gf=malloc((size_t)n*4),*ge=malloc((size_t)n*4);
-    float*yf=malloc((size_t)M*K3_LATENT*4),*ye=malloc((size_t)M*K3_LATENT*4);
+    float*x=probe_alloc((size_t)M*K3_LATENT*4),*u=probe_alloc((size_t)n*4);
+    float*gf=probe_alloc((size_t)n*4),*ge=probe_alloc((size_t)n*4);
+    float*yf=probe_alloc((size_t)M*K3_LATENT*4),*ye=probe_alloc((size_t)M*K3_LATENT*4);
     if(!x||!u||!gf||!ge||!yf||!ye)return 1;
     for(int i=0;i<M*K3_LATENT;++i)x[i]=rf()*.125f;
     k3_mxfp4_gemm2_mode(gf,w1,u,w3,x,M,24,8);memcpy(ge,gf,(size_t)n*4);
@@ -87,16 +93,16 @@ static int situ_fast_correctness(const k3_mxfp4_matrix*w1,
     float e=max_abs(yf,ye,(size_t)M*K3_LATENT);double se=0,sr=0;
     for(int i=0;i<M*K3_LATENT;++i){double d=yf[i]-ye[i];se+=d*d;sr+=(double)ye[i]*ye[i];}
     double rel=sqrt(se/(sr+1e-30));printf("[situ-fexpa-real] max_abs=%.3e rel_l2=%.3e %s\n",e,rel,e<2e-4&&rel<5e-4?"OK":"FAIL");
-    free(x);free(u);free(gf);free(ge);free(yf);free(ye);return e>=2e-4||rel>=5e-4;
+    probe_free(x);probe_free(u);probe_free(gf);probe_free(ge);probe_free(yf);probe_free(ye);return e>=2e-4||rel>=5e-4;
 }
 
 static int local_scheduler_correctness(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2,const k3_mxfp4_matrix*w3){
     enum{B=8,E=4,TK=2};int routes[B*TK],ids[E]={0,1,2,3},counts[E],tok[E*B];float rw[B*TK],tw[E*B];
     k3_mxfp4_matrix a1[E],a2[E],a3[E];for(int e=0;e<E;++e){a1[e]=*w1;a2[e]=*w2;a3[e]=*w3;}
-    float*x=malloc((size_t)B*K3_LATENT*4),*gx=malloc((size_t)E*B*K3_LATENT*4);
-    float*gate=malloc((size_t)E*B*K3_EXPERT_INTER*4),*up=malloc((size_t)E*B*K3_EXPERT_INTER*4);
-    float*eo=malloc((size_t)E*B*K3_LATENT*4),*got=malloc((size_t)B*K3_LATENT*4),*ref=calloc((size_t)B*K3_LATENT,4);
-    float*rg=malloc((size_t)B*K3_EXPERT_INTER*4),*ru=malloc((size_t)B*K3_EXPERT_INTER*4),*ro=malloc((size_t)B*K3_LATENT*4);
+    float*x=probe_alloc((size_t)B*K3_LATENT*4),*gx=probe_alloc((size_t)E*B*K3_LATENT*4);
+    float*gate=probe_alloc((size_t)E*B*K3_EXPERT_INTER*4),*up=probe_alloc((size_t)E*B*K3_EXPERT_INTER*4);
+    float*eo=probe_alloc((size_t)E*B*K3_LATENT*4),*got=probe_alloc((size_t)B*K3_LATENT*4),*ref=probe_calloc((size_t)B*K3_LATENT,4);
+    float*rg=probe_alloc((size_t)B*K3_EXPERT_INTER*4),*ru=probe_alloc((size_t)B*K3_EXPERT_INTER*4),*ro=probe_alloc((size_t)B*K3_LATENT*4);
     if(!x||!gx||!gate||!up||!eo||!got||!ref||!rg||!ru||!ro)return 1;
     for(int t=0;t<B;++t){routes[t*TK]=t%E;routes[t*TK+1]=(t+1)%E;rw[t*TK]=.6f;rw[t*TK+1]=.4f;for(int i=0;i<K3_LATENT;++i)x[(size_t)t*K3_LATENT+i]=rf()*.125f;}
     int n=k3_moe_build_dispatch(routes,rw,B,TK,ids,E,counts,tok,tw);
@@ -104,32 +110,34 @@ static int local_scheduler_correctness(const k3_mxfp4_matrix*w1,const k3_mxfp4_m
     k3_moe_forward_local_mxfp4(got,a1,a2,a3,E,counts,tok,tw,gx,B,gate,up,eo,48,8);
     for(int e=0;e<E;++e){k3_expert_forward_mxfp4(ro,w1,w2,w3,gx+(size_t)e*B*K3_LATENT,counts[e],rg,ru,48);k3_moe_scatter_add(ref,ro,tok+e*B,tw+e*B,counts[e],K3_LATENT);}
     float err=max_abs(got,ref,(size_t)B*K3_LATENT);printf("[local-scheduler] assignments=%d max_abs=%.3e %s\n",n,err,err<2e-6?"OK":"FAIL");
-    free(x);free(gx);free(gate);free(up);free(eo);free(got);free(ref);free(rg);free(ru);free(ro);return err>=2e-6;
+    probe_free(x);probe_free(gx);probe_free(gate);probe_free(up);probe_free(eo);probe_free(got);probe_free(ref);probe_free(rg);probe_free(ru);probe_free(ro);return err>=2e-6;
 }
 
 static void perf(const k3_mxfp4_matrix*w1,const k3_mxfp4_matrix*w2,const k3_mxfp4_matrix*w3,int batch,int threads,int tile_threshold){
-    float*x=malloc((size_t)batch*K3_LATENT*4),*y=malloc((size_t)batch*K3_LATENT*4);
-    float*g=malloc((size_t)batch*K3_EXPERT_INTER*4),*u=malloc((size_t)batch*K3_EXPERT_INTER*4);
-    size_t en=(size_t)128*1024*1024/4;float*eb=calloc(en,4);for(int i=0;i<batch*K3_LATENT;++i)x[i]=rf()*.125f;
+    float*x=probe_alloc((size_t)batch*K3_LATENT*4),*y=probe_alloc((size_t)batch*K3_LATENT*4);
+    float*g=probe_alloc((size_t)batch*K3_EXPERT_INTER*4),*u=probe_alloc((size_t)batch*K3_EXPERT_INTER*4);
+    size_t en=(size_t)128*1024*1024/4;float*eb=probe_calloc(en,4);
+    if(!x||!y||!g||!u||!eb){fprintf(stderr,"k3_moe_probe: skipping perf after allocation failure\n");return;}
+    for(int i=0;i<batch*K3_LATENT;++i)x[i]=rf()*.125f;
     int iters=batch<=2?10:batch<=8?6:3;double sec=0;
     for(int it=0;it<iters;++it){evict(eb,en,threads);double t0=now_sec();k3_expert_forward_mxfp4_mode(y,w1,w2,w3,x,batch,g,u,threads,tile_threshold);sec+=now_sec()-t0;}
     double bytes=(double)(w1->rows*(w1->cols/2+w1->cols/32)+w3->rows*(w3->cols/2+w3->cols/32)+w2->rows*(w2->cols/2+w2->cols/32));
     double sum=0;for(int i=0;i<batch*K3_LATENT;++i)sum+=y[i];
     printf("PROBE expert kernel=%s batch=%2d threads=%2d ms=%.3f tok/s=%.1f distinct_GB/s=%.2f checksum=%+.6e\n",
            tile_threshold?"tile":"svtbl",batch,threads,sec/iters*1e3,batch/(sec/iters),bytes/(sec/iters)/1e9,sum);
-    free(x);free(y);free(g);free(u);free(eb);
+    probe_free(x);probe_free(y);probe_free(g);probe_free(u);probe_free(eb);
 }
 
 static void profile_stages(const k3_mxfp4_matrix *w1,
                            const k3_mxfp4_matrix *w2,
                            const k3_mxfp4_matrix *w3, int batch,
                            int threads, int tile_threshold) {
-    float *x=malloc((size_t)batch*K3_LATENT*4);
-    float *y=malloc((size_t)batch*K3_LATENT*4);
-    float *g=malloc((size_t)batch*K3_EXPERT_INTER*4);
-    float *u=malloc((size_t)batch*K3_EXPERT_INTER*4);
+    float *x=probe_alloc((size_t)batch*K3_LATENT*4);
+    float *y=probe_alloc((size_t)batch*K3_LATENT*4);
+    float *g=probe_alloc((size_t)batch*K3_EXPERT_INTER*4);
+    float *u=probe_alloc((size_t)batch*K3_EXPERT_INTER*4);
     size_t en=(size_t)128*1024*1024/4;
-    float *eb=calloc(en,4);
+    float *eb=probe_calloc(en,4);
     if(!x||!y||!g||!u||!eb)return;
     for(int i=0;i<batch*K3_LATENT;++i)x[i]=rf()*.125f;
     double t13=0,tsitu=0,t2=0;
@@ -154,16 +162,17 @@ static void profile_stages(const k3_mxfp4_matrix *w1,
     printf("PROFILE expert situ=fexpa batch=%d threads=%d w13_ms=%.3f situ_ms=%.3f w2_ms=%.3f total_ms=%.3f\n",
            batch,threads,t13/iters*1e3,tsitu/iters*1e3,t2/iters*1e3,
            (t13+tsitu+t2)/iters*1e3);
-    free(x);free(y);free(g);free(u);free(eb);
+    probe_free(x);probe_free(y);probe_free(g);probe_free(u);probe_free(eb);
 }
 
 static int load_expert(const char *blob_path,const char *manifest_path,loaded_expert *out){
-    entry es[8];int ne=load_manifest(manifest_path,es,8);if(ne!=6)return-1;
-    size_t size=0;uint8_t*blob=k3_load_blob_anon(blob_path,&size);if(!blob)return-1;
+    entry es[8];int ne=load_manifest(manifest_path,es,8);if(ne!=6){fprintf(stderr,"k3_moe_probe: invalid manifest '%s': expected 6 tensors, got %d\n",manifest_path,ne);return-1;}
+    size_t size=0;uint8_t*blob=k3_pool_load_blob(&probe_pool,blob_path,&size);if(!blob){fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));return-1;}
+    for(int i=0;i<ne;++i)if(es[i].offset>size||es[i].nbytes>size-es[i].offset){fprintf(stderr,"k3_moe_probe: tensor '%s' exceeds blob '%s'\n",es[i].name,blob_path);probe_free(blob);return-1;}
     entry*e1=find_entry(es,ne,"w1.weight_packed"),*s1=find_entry(es,ne,"w1.weight_scale");
     entry*e2=find_entry(es,ne,"w2.weight_packed"),*s2=find_entry(es,ne,"w2.weight_scale");
     entry*e3=find_entry(es,ne,"w3.weight_packed"),*s3=find_entry(es,ne,"w3.weight_scale");
-    if(!e1||!s1||!e2||!s2||!e3||!s3){free(blob);return-1;}
+    if(!e1||!s1||!e2||!s2||!e3||!s3){fprintf(stderr,"k3_moe_probe: manifest '%s' lacks an expert tensor\n",manifest_path);probe_free(blob);return-1;}
     out->blob=blob;out->size=size;
     out->w1=(k3_mxfp4_matrix){blob+e1->offset,blob+s1->offset,(int)e1->rows,(int)e1->cols*2};
     out->w2=(k3_mxfp4_matrix){blob+e2->offset,blob+s2->offset,(int)e2->rows,(int)e2->cols*2};
@@ -172,25 +181,26 @@ static int load_expert(const char *blob_path,const char *manifest_path,loaded_ex
 }
 
 static void multi_expert_perf(const loaded_expert *le,int nlocal,int threads){
-    int*counts=malloc((size_t)nlocal*4),*tok=malloc((size_t)nlocal*nlocal*4);float*tw=malloc((size_t)nlocal*nlocal*4);
-    k3_mxfp4_matrix*w1=malloc((size_t)nlocal*sizeof(*w1)),*w2=malloc((size_t)nlocal*sizeof(*w2)),*w3=malloc((size_t)nlocal*sizeof(*w3));
-    float*x=malloc((size_t)nlocal*nlocal*K3_LATENT*4),*gate=malloc((size_t)nlocal*nlocal*K3_EXPERT_INTER*4);
-    float*up=malloc((size_t)nlocal*nlocal*K3_EXPERT_INTER*4),*eo=malloc((size_t)nlocal*nlocal*K3_LATENT*4),*dst=malloc((size_t)nlocal*K3_LATENT*4);
-    size_t en=(size_t)128*1024*1024/4;float*eb=calloc(en,4);if(!counts||!tok||!tw||!w1||!w2||!w3||!x||!gate||!up||!eo||!dst||!eb)return;
+    int*counts=probe_alloc((size_t)nlocal*4),*tok=probe_alloc((size_t)nlocal*nlocal*4);float*tw=probe_alloc((size_t)nlocal*nlocal*4);
+    k3_mxfp4_matrix*w1=probe_alloc((size_t)nlocal*sizeof(*w1)),*w2=probe_alloc((size_t)nlocal*sizeof(*w2)),*w3=probe_alloc((size_t)nlocal*sizeof(*w3));
+    float*x=probe_alloc((size_t)nlocal*nlocal*K3_LATENT*4),*gate=probe_alloc((size_t)nlocal*nlocal*K3_EXPERT_INTER*4);
+    float*up=probe_alloc((size_t)nlocal*nlocal*K3_EXPERT_INTER*4),*eo=probe_alloc((size_t)nlocal*nlocal*K3_LATENT*4),*dst=probe_alloc((size_t)nlocal*K3_LATENT*4);
+    size_t en=(size_t)128*1024*1024/4;float*eb=probe_calloc(en,4);if(!counts||!tok||!tw||!w1||!w2||!w3||!x||!gate||!up||!eo||!dst||!eb)return;
     for(int e=0;e<nlocal;++e){counts[e]=1;tok[e*nlocal]=e;tw[e*nlocal]=1;w1[e]=le[e].w1;w2[e]=le[e].w2;w3[e]=le[e].w3;for(int i=0;i<K3_LATENT;++i)x[((size_t)e*nlocal)*K3_LATENT+i]=rf()*.125f;}
     double sec=0;int iters=8;
     for(int it=0;it<iters;++it){evict(eb,en,threads);double t0=now_sec();k3_moe_forward_local_mxfp4(dst,w1,w2,w3,nlocal,counts,tok,tw,x,nlocal,gate,up,eo,threads,8);sec+=now_sec()-t0;}
     double sum=0;for(int i=0;i<nlocal*K3_LATENT;++i)sum+=dst[i];
     printf("PROBE local-scheduler experts=%d assignments=%d threads=%d ms=%.3f assignments/s=%.1f checksum=%+.6e\n",nlocal,nlocal,threads,sec/iters*1e3,nlocal/(sec/iters),sum);
-    free(counts);free(tok);free(tw);free(w1);free(w2);free(w3);free(x);free(gate);free(up);free(eo);free(dst);free(eb);
+    probe_free(counts);probe_free(tok);probe_free(tw);probe_free(w1);probe_free(w2);probe_free(w3);probe_free(x);probe_free(gate);probe_free(up);probe_free(eo);probe_free(dst);probe_free(eb);
 }
 
-static int tp_slices_correctness(const loaded_expert *le, int nslice, int threads) {
+static int tp_slices_correctness(const loaded_expert *le, int nslice, int threads,
+                                 int selected) {
     int local=le[0].w1.rows,total=local*nslice;
-    if(getenv("K3_TP_SELECTED")){
-        k3_mxfp4_matrix*w1=malloc((size_t)nslice*sizeof(*w1)),*w2=malloc((size_t)nslice*sizeof(*w2)),*w3=malloc((size_t)nslice*sizeof(*w3));
-        float*rw=malloc((size_t)nslice*4),*x=malloc((size_t)K3_LATENT*4),*got=malloc((size_t)K3_LATENT*4),*ref=calloc(K3_LATENT,4),*part=malloc((size_t)K3_LATENT*4);
-        float*g=malloc((size_t)nslice*local*4),*u=malloc((size_t)nslice*local*4),*eo=malloc((size_t)nslice*K3_LATENT*4),*gl=malloc((size_t)local*4),*ul=malloc((size_t)local*4);
+    if(selected){
+        k3_mxfp4_matrix*w1=probe_alloc((size_t)nslice*sizeof(*w1)),*w2=probe_alloc((size_t)nslice*sizeof(*w2)),*w3=probe_alloc((size_t)nslice*sizeof(*w3));
+        float*rw=probe_alloc((size_t)nslice*4),*x=probe_alloc((size_t)K3_LATENT*4),*got=probe_alloc((size_t)K3_LATENT*4),*ref=probe_calloc(K3_LATENT,4),*part=probe_alloc((size_t)K3_LATENT*4);
+        float*g=probe_alloc((size_t)nslice*local*4),*u=probe_alloc((size_t)nslice*local*4),*eo=probe_alloc((size_t)nslice*K3_LATENT*4),*gl=probe_alloc((size_t)local*4),*ul=probe_alloc((size_t)local*4);
         if(!w1||!w2||!w3||!rw||!x||!got||!ref||!part||!g||!u||!eo||!gl||!ul)return 1;
         for(int e=0;e<nslice;++e){w1[e]=le[e].w1;w2[e]=le[e].w2;w3[e]=le[e].w3;rw[e]=1.0f/nslice;}for(int i=0;i<K3_LATENT;++i)x[i]=rf()*.125f;
         for(int e=0;e<nslice;++e){k3_expert_tp_forward_mxfp4(part,&w1[e],&w2[e],&w3[e],x,1,gl,ul,threads,8);for(int i=0;i<K3_LATENT;++i)ref[i]+=rw[e]*part[i];}
@@ -198,11 +208,11 @@ static int tp_slices_correctness(const loaded_expert *le, int nslice, int thread
         float err=max_abs(got,ref,K3_LATENT);double mean=0,best=1e9;for(int it=0;it<8;++it){double t=now_sec();k3_expert_tp_forward_selected_mxfp4(got,w1,w2,w3,rw,nslice,x,g,u,eo,threads);double ms=(now_sec()-t)*1e3;mean+=ms;if(ms<best)best=ms;}mean/=8;
         printf("[expert-tp-selected] experts=%d channels/rank=%d max_abs=%.3e %s\n",nslice,local,err,err<2e-6?"OK":"FAIL");
         printf("PROBE expert-tp-selected experts=%d channels=%d mean_ms=%.3f best_ms=%.3f projected_stack_ms=%.3f\n",nslice,local,mean,best,mean*K3_MOE_LAYERS);
-        free(w1);free(w2);free(w3);free(rw);free(x);free(got);free(ref);free(part);free(g);free(u);free(eo);free(gl);free(ul);return err>=2e-6;
+        probe_free(w1);probe_free(w2);probe_free(w3);probe_free(rw);probe_free(x);probe_free(got);probe_free(ref);probe_free(part);probe_free(g);probe_free(u);probe_free(eo);probe_free(gl);probe_free(ul);return err>=2e-6;
     }
     if(total!=K3_EXPERT_INTER){
-        float*x=malloc((size_t)K3_LATENT*4),*y=malloc((size_t)K3_LATENT*4);
-        float*g=malloc((size_t)local*4),*u=malloc((size_t)local*4);if(!x||!y||!g||!u)return 1;
+        float*x=probe_alloc((size_t)K3_LATENT*4),*y=probe_alloc((size_t)K3_LATENT*4);
+        float*g=probe_alloc((size_t)local*4),*u=probe_alloc((size_t)local*4);if(!x||!y||!g||!u)return 1;
         for(int i=0;i<K3_LATENT;++i)x[i]=rf()*.125f;double mean=0,best=1e9,checksum=0;
         for(int q=0;q<nslice;++q){if(k3_expert_tp_forward_mxfp4(y,&le[q].w1,&le[q].w2,&le[q].w3,x,1,g,u,threads,8))return 1;
             for(int it=0;it<8;++it){double t=now_sec();if(k3_expert_tp_forward_mxfp4(y,&le[q].w1,&le[q].w2,&le[q].w3,x,1,g,u,threads,8))return 1;
@@ -211,13 +221,13 @@ static int tp_slices_correctness(const loaded_expert *le, int nslice, int thread
         mean/=8*nslice;
         printf("[expert-tp-slice] slices=%d channels=%d finite=yes PASS\n",nslice,total);
         printf("PROBE expert-tp local_slices=%d channels=%d mean_ms=%.3f best_ms=%.3f checksum=%+.6e\n",nslice,total,mean,best,checksum);
-        free(x);free(y);free(g);free(u);return 0;
+        probe_free(x);probe_free(y);probe_free(g);probe_free(u);return 0;
     }
     size_t w13=(size_t)K3_EXPERT_INTER*K3_LATENT/2,s13=(size_t)K3_EXPERT_INTER*K3_LATENT/32;
     size_t w2n=(size_t)K3_LATENT*K3_EXPERT_INTER/2,s2n=(size_t)K3_LATENT*K3_EXPERT_INTER/32;
-    uint8_t *p1=malloc(w13),*s1=malloc(s13),*p2=malloc(w2n),*s2=malloc(s2n),*p3=malloc(w13),*s3=malloc(s13);
-    float*x=malloc((size_t)K3_LATENT*4),*ref=malloc((size_t)K3_LATENT*4),*sum=calloc(K3_LATENT,4),*part=malloc((size_t)K3_LATENT*4);
-    float*g=malloc((size_t)K3_EXPERT_INTER*4),*u=malloc((size_t)K3_EXPERT_INTER*4),*gl=malloc((size_t)local*4),*ul=malloc((size_t)local*4);
+    uint8_t *p1=probe_alloc(w13),*s1=probe_alloc(s13),*p2=probe_alloc(w2n),*s2=probe_alloc(s2n),*p3=probe_alloc(w13),*s3=probe_alloc(s13);
+    float*x=probe_alloc((size_t)K3_LATENT*4),*ref=probe_alloc((size_t)K3_LATENT*4),*sum=probe_calloc(K3_LATENT,4),*part=probe_alloc((size_t)K3_LATENT*4);
+    float*g=probe_alloc((size_t)K3_EXPERT_INTER*4),*u=probe_alloc((size_t)K3_EXPERT_INTER*4),*gl=probe_alloc((size_t)local*4),*ul=probe_alloc((size_t)local*4);
     if(!p1||!s1||!p2||!s2||!p3||!s3||!x||!ref||!sum||!part||!g||!u||!gl||!ul)return 1;
     for(int q=0;q<nslice;++q){
         size_t pw=(size_t)local*K3_LATENT/2,ps=(size_t)local*K3_LATENT/32;
@@ -239,21 +249,33 @@ static int tp_slices_correctness(const loaded_expert *le, int nslice, int thread
     float e=max_abs(sum,ref,K3_LATENT);double se=0,sr=0;for(int i=0;i<K3_LATENT;++i){double d=sum[i]-ref[i];se+=d*d;sr+=(double)ref[i]*ref[i];}
     double rel=sqrt(se/(sr+1e-30));printf("[expert-tp] slices=%d channels/rank=%d max_abs=%.3e rel_l2=%.3e %s\n",nslice,local,e,rel,e<2e-4&&rel<5e-4?"OK":"FAIL");
     printf("PROBE expert-tp emulated_ranks=%d serial_ms=%.3f critical_rank_ms=%.3f projected_layers_ms=%.3f\n",nslice,total_ms,max_ms,max_ms*K3_MOE_LAYERS);
-    free(p1);free(s1);free(p2);free(s2);free(p3);free(s3);free(x);free(ref);free(sum);free(part);free(g);free(u);free(gl);free(ul);return e>=2e-4||rel>=5e-4;
+    probe_free(p1);probe_free(s1);probe_free(p2);probe_free(s2);probe_free(p3);probe_free(s3);probe_free(x);probe_free(ref);probe_free(sum);probe_free(part);probe_free(g);probe_free(u);probe_free(gl);probe_free(ul);return e>=2e-4||rel>=5e-4;
+}
+
+static int parse_int_arg(const char*flag,const char*text,int lo,int hi,int*out){
+    char*end=NULL;errno=0;long v=strtol(text,&end,10);if(errno||!end||*end||v<lo||v>hi){fprintf(stderr,"k3_moe_probe: %s expects integer in [%d,%d], got '%s'\n",flag,lo,hi,text);return-1;}*out=(int)v;return 0;
 }
 
 int main(int argc,char**argv){
-    if(argc<3||!(argc&1)){fprintf(stderr,"usage: %s BLOB MANIFEST [BLOB MANIFEST ...]\n",argv[0]);return 2;}
-    int nlocal=(argc-1)/2;if(nlocal>16)return 2;loaded_expert le[16];memset(le,0,sizeof(le));k3_apply_numa_interleave();
-    for(int e=0;e<nlocal;++e)if(load_expert(argv[1+2*e],argv[2+2*e],&le[e])){fprintf(stderr,"load expert %d failed\n",e);return 2;}
+    const char*paths[32];int npath=0,threads=48,tile_threshold=8,selected=0;
+    for(int i=1;i<argc;++i){
+        if(!strcmp(argv[i],"--threads")){if(++i>=argc||parse_int_arg("--threads",argv[i],1,48,&threads))return 2;}
+        else if(!strcmp(argv[i],"--tile-threshold")){if(++i>=argc||parse_int_arg("--tile-threshold",argv[i],0,256,&tile_threshold))return 2;}
+        else if(!strcmp(argv[i],"--tp-selected"))selected=1;
+        else if(!strcmp(argv[i],"--help")){printf("usage: %s [--threads N] [--tile-threshold N] [--tp-selected] BLOB MANIFEST [BLOB MANIFEST ...]\n",argv[0]);return 0;}
+        else if(argv[i][0]=='-'){fprintf(stderr,"k3_moe_probe: unknown option '%s'\n",argv[i]);return 2;}
+        else if(npath<32)paths[npath++]=argv[i];else{fprintf(stderr,"k3_moe_probe: at most 16 expert pairs are supported\n");return 2;}
+    }
+    if(npath<2||(npath&1)){fprintf(stderr,"usage: %s [--threads N] [--tile-threshold N] [--tp-selected] BLOB MANIFEST [BLOB MANIFEST ...]\n",argv[0]);return 2;}
+    int nlocal=npath/2;loaded_expert le[16];memset(le,0,sizeof(le));k3_pool_init(&probe_pool,"moe-probe");
+    for(int e=0;e<nlocal;++e)if(load_expert(paths[2*e],paths[2*e+1],&le[e])){fprintf(stderr,"k3_moe_probe: load expert pair %d failed (%s, %s)\n",e,paths[2*e],paths[2*e+1]);for(int q=0;q<e;++q)probe_free(le[q].blob);k3_pool_destroy(&probe_pool);return 2;}
     k3_mxfp4_matrix w1=le[0].w1,w2=le[0].w2,w3=le[0].w3;
-    if(w1.rows!=K3_EXPERT_INTER){int th=getenv("K3_TP_THREADS")?atoi(getenv("K3_TP_THREADS")):48;int fail=tp_slices_correctness(le,nlocal,th);for(int e=0;e<nlocal;++e)free(le[e].blob);printf("K3 expert-TP probe: %s\n",fail?"FAIL":"PASS");return fail?1:0;}
+    if(w1.rows!=K3_EXPERT_INTER){int fail=tp_slices_correctness(le,nlocal,threads,selected);for(int e=0;e<nlocal;++e)probe_free(le[e].blob);printf("K3 expert-TP probe: %s\n",fail?"FAIL":"PASS");int status=probe_alloc_failed?2:fail?1:0;k3_pool_destroy(&probe_pool);return status;}
     int fail=dispatch_unit()|batched_correctness(&w1,&w2,&w3)|tiled_correctness(&w1,&w2,&w3)|situ_fast_correctness(&w1,&w2,&w3)|local_scheduler_correctness(&w1,&w2,&w3);
-    int batches[]={1,2,4,8,16,32},threads[]={24,48};
-    int tile_threshold=getenv("K3_MXFP4_TILE")?atoi(getenv("K3_MXFP4_TILE")):8;
-    for(int ti=0;ti<2;++ti)for(int bi=0;bi<6;++bi)perf(&w1,&w2,&w3,batches[bi],threads[ti],tile_threshold);
-    profile_stages(&w1,&w2,&w3,32,48,tile_threshold);
-    for(int e=1;e<=nlocal;e*=2)multi_expert_perf(le,e,48);
-    if(nlocal>2&&(nlocal&(nlocal-1)))multi_expert_perf(le,nlocal,48);
-    for(int e=0;e<nlocal;++e)free(le[e].blob);printf("K3 MoE probe: %s\n",fail?"FAIL":"PASS");return fail?1:0;
+    int batches[]={1,2,4,8,16,32},thread_sweep[]={24,threads};
+    if(!probe_alloc_failed)for(int ti=0;ti<2;++ti)for(int bi=0;bi<6;++bi)perf(&w1,&w2,&w3,batches[bi],thread_sweep[ti],tile_threshold);
+    if(!probe_alloc_failed)profile_stages(&w1,&w2,&w3,32,threads,tile_threshold);
+    if(!probe_alloc_failed)for(int e=1;e<=nlocal;e*=2)multi_expert_perf(le,e,threads);
+    if(!probe_alloc_failed&&nlocal>2&&(nlocal&(nlocal-1)))multi_expert_perf(le,nlocal,threads);
+    for(int e=0;e<nlocal;++e)probe_free(le[e].blob);printf("K3 MoE probe: %s\n",fail?"FAIL":"PASS");int status=probe_alloc_failed?2:fail?1:0;fprintf(stderr,"k3 MoE pool: peak=%.2f MiB reserved=%.2f MiB\n",probe_pool.peak_active_bytes/1048576.0,probe_pool.reserved_bytes/1048576.0);k3_pool_destroy(&probe_pool);return status;
 }

@@ -23,6 +23,12 @@ typedef struct {
     char dtype[16], name[512];
 } entry;
 
+static k3_pool probe_pool;
+static int probe_alloc_failed;
+static void *probe_alloc(size_t bytes){void*p=k3_pool_alloc(&probe_pool,bytes);if(!p){probe_alloc_failed=1;fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}return p;}
+static void *probe_calloc(size_t count,size_t size){void*p=k3_pool_calloc(&probe_pool,count,size);if(!p){probe_alloc_failed=1;fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}return p;}
+static void probe_free(void*ptr){if(k3_pool_free(&probe_pool,ptr))fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}
+
 static double now_sec(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return ts.tv_sec+ts.tv_nsec*1e-9;
@@ -108,33 +114,33 @@ static void evict_caches(float *buffer,size_t count,int threads){
 
 static double projection_probe_cold(float *out[4],const uint16_t*w[4],const float*x,int threads,int iters){
     size_t count=(size_t)64*1024*1024/sizeof(float);
-    float *evict=calloc(count,sizeof(float));if(!evict)return 0.0;
+    float *evict=probe_calloc(count,sizeof(float));if(!evict)return 0.0;
     evict_caches(evict,count,threads);double sec=0.0;
     for(int i=0;i<iters;++i){evict_caches(evict,count,threads);double t0=now_sec();projection4(out,w,x,threads);sec+=now_sec()-t0;}
     double bytes=(double)iters*4*128*K3_HIDDEN*2;
     printf("PROBE projection_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f\n",
            threads,sec/iters*1e6,bytes/sec/1e9);
-    free(evict);return sec/iters;
+    probe_free(evict);return sec/iters;
 }
 static double projection4row_probe_cold(float*out[4],const uint16_t*w[4],const float*x,int threads,int iters){
-    size_t count=(size_t)64*1024*1024/sizeof(float);float*evict=calloc(count,4);if(!evict)return 0;double sec=0;
+    size_t count=(size_t)64*1024*1024/sizeof(float);float*evict=probe_calloc(count,4);if(!evict)return 0;double sec=0;
     for(int i=0;i<iters;++i){evict_caches(evict,count,threads);double t=now_sec();projection4_row4(out,w,x,threads);sec+=now_sec()-t;}
-    double bytes=(double)iters*4*128*K3_HIDDEN*2;printf("PROBE projection4row_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f\n",threads,sec/iters*1e6,bytes/sec/1e9);free(evict);return sec/iters;
+    double bytes=(double)iters*4*128*K3_HIDDEN*2;printf("PROBE projection4row_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f\n",threads,sec/iters*1e6,bytes/sec/1e9);probe_free(evict);return sec/iters;
 }
 static double projection5_probe_cold(float*out[5],const uint16_t*w[5],const float*x,int threads,int iters){
-    k3_bf16_matrix m[5];for(int i=0;i<5;++i)m[i]=(k3_bf16_matrix){w[i],128,K3_HIDDEN};size_t count=(size_t)64*1024*1024/4;float*evict=calloc(count,4);if(!evict)return 0;double sec=0;
+    k3_bf16_matrix m[5];for(int i=0;i<5;++i)m[i]=(k3_bf16_matrix){w[i],128,K3_HIDDEN};size_t count=(size_t)64*1024*1024/4;float*evict=probe_calloc(count,4);if(!evict)return 0;double sec=0;
     for(int i=0;i<iters;++i){evict_caches(evict,count,threads);double t=now_sec();k3_dense_many_bf16_row4(out,m,5,x,threads);sec+=now_sec()-t;}
-    double bytes=(double)iters*5*128*K3_HIDDEN*2;printf("PROBE projection5row4_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f\n",threads,sec/iters*1e6,bytes/sec/1e9);free(evict);return sec/iters;
+    double bytes=(double)iters*5*128*K3_HIDDEN*2;printf("PROBE projection5row4_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f\n",threads,sec/iters*1e6,bytes/sec/1e9);probe_free(evict);return sec/iters;
 }
 
 static double projection5_q8p16_probe_cold(float *out[5], const uint16_t *w[5],
         const float *ref[5], const float *x, int threads, int iters) {
     size_t matrix_bytes=(size_t)128*K3_HIDDEN;
-    int8_t *packed[5],*qx=malloc(K3_HIDDEN);float *scale[5];
+    int8_t *packed[5],*qx=probe_alloc(K3_HIDDEN);float *scale[5];
     const int8_t *pm[5];const float *sm[5];
-    size_t count=(size_t)64*1024*1024/sizeof(float);float *evict=calloc(count,sizeof(float));
+    size_t count=(size_t)64*1024*1024/sizeof(float);float *evict=probe_calloc(count,sizeof(float));
     if(!qx||!evict)return 0.0;
-    for(int m=0;m<5;++m){packed[m]=malloc(matrix_bytes);scale[m]=malloc(128*sizeof(float));
+    for(int m=0;m<5;++m){packed[m]=probe_alloc(matrix_bytes);scale[m]=probe_alloc(128*sizeof(float));
         if(!packed[m]||!scale[m])return 0.0;
         k3_q8p16_quantize_bf16(packed[m],scale[m],w[m],128,K3_HIDDEN);
         pm[m]=packed[m];sm[m]=scale[m];}
@@ -148,7 +154,7 @@ static double projection5_q8p16_probe_cold(float *out[5], const uint16_t *w[5],
     printf("PROBE projection5q8p16_cold threads=%2d us/token=%8.3f HBM_GB/s=%8.2f rel_l2=%.3e cosine=%.8f %s\n",
         threads,sec/iters*1e6,(double)iters*5*128*K3_HIDDEN/sec/1e9,rel,cos,
         rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");
-    for(int m=0;m<5;++m){free(packed[m]);free(scale[m]);}free(qx);free(evict);return sec/iters;
+    for(int m=0;m<5;++m){probe_free(packed[m]);probe_free(scale[m]);}probe_free(qx);probe_free(evict);return sec/iters;
 }
 
 static double kda_probe(float*out,const float*q,const float*k,const float*v,const float*decay,
@@ -173,8 +179,12 @@ static double kda_probe(float*out,const float*q,const float*k,const float*v,cons
 
 int main(int argc,char**argv){
     if(argc!=3){fprintf(stderr,"usage: %s BLOB MANIFEST\n",argv[0]);return 2;}
-    entry es[20];int ne=load_manifest(argv[2],es,20);if(ne!=13){fprintf(stderr,"expected 13 tensors, got %d\n",ne);return 2;}
-    k3_apply_numa_interleave();size_t blob_size=0;uint8_t*blob=k3_load_blob_anon(argv[1],&blob_size);if(!blob){perror("blob");return 2;}
+    k3_pool_init(&probe_pool,"kda-probe");
+    entry es[20];int ne=load_manifest(argv[2],es,20);if(ne!=13){fprintf(stderr,"k3_kda_probe: invalid manifest '%s': expected 13 tensors, got %d\n",argv[2],ne);k3_pool_destroy(&probe_pool);return 2;}
+    size_t blob_size=0;uint8_t*blob=k3_pool_load_blob(&probe_pool,argv[1],&blob_size);if(!blob){fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));k3_pool_destroy(&probe_pool);return 2;}
+    for(int i=0;i<ne;++i)if(es[i].offset>blob_size||es[i].nbytes>blob_size-es[i].offset){fprintf(stderr,"k3_kda_probe: tensor '%s' exceeds blob (%llu+%llu > %zu)\n",es[i].name,(unsigned long long)es[i].offset,(unsigned long long)es[i].nbytes,blob_size);k3_pool_destroy(&probe_pool);return 2;}
+    const char*required[]={"q_proj.weight","k_proj.weight","v_proj.weight","g_proj.weight","f_a_proj.weight","f_b_proj.weight","b_proj.weight","q_conv1d.weight","k_conv1d.weight","v_conv1d.weight","dt_bias","A_log","o_norm.weight"};
+    for(size_t i=0;i<sizeof(required)/sizeof(required[0]);++i)if(!find_suffix(es,ne,required[i])){fprintf(stderr,"k3_kda_probe: manifest lacks '%s'\n",required[i]);k3_pool_destroy(&probe_pool);return 2;}
 #define PTR(suf,type) ((type*)(blob+find_suffix(es,ne,suf)->offset))
     const uint16_t *qw=PTR("q_proj.weight",uint16_t),*kw=PTR("k_proj.weight",uint16_t);
     const uint16_t *vw=PTR("v_proj.weight",uint16_t),*gw=PTR("g_proj.weight",uint16_t);
@@ -183,9 +193,9 @@ int main(int argc,char**argv){
     const float *qcw=PTR("q_conv1d.weight",float),*kcw=PTR("k_conv1d.weight",float),*vcw=PTR("v_conv1d.weight",float);
     const float *dt=PTR("dt_bias",float),*alog=PTR("A_log",float),*onorm=PTR("o_norm.weight",float);
 #undef PTR
-    float*x=malloc(K3_HIDDEN*4),q[128],k[128],v[128],gout[128],fa[128],graw[128],decay[128],o[128];
-    float qstate[128*3]={0},kstate[128*3]={0},vstate[128*3]={0};float*state=calloc(128*128,4);
-    if(!x||!state)return 2;for(int i=0;i<K3_HIDDEN;++i)x[i]=rnd()*.125f;
+    float*x=probe_alloc(K3_HIDDEN*4),q[128],k[128],v[128],gout[128],fa[128],graw[128],decay[128],o[128];
+    float qstate[128*3]={0},kstate[128*3]={0},vstate[128*3]={0};float*state=probe_calloc(128*128,4);
+    if(!x||!state){k3_pool_destroy(&probe_pool);return 2;}for(int i=0;i<K3_HIDDEN;++i)x[i]=rnd()*.125f;
     float*outs[4]={q,k,v,gout};const uint16_t*ws[4]={qw,kw,vw,gw};
     float*outs5[5]={q,k,v,gout,fa};const uint16_t*ws5[5]={qw,kw,vw,gw,faw};
     projection4(outs,ws,x,1);
@@ -214,6 +224,6 @@ int main(int argc,char**argv){
     printf("\nReal-activation KDA recurrence scaling (128x128 FP32 state):\n");
     double r1=0;
     for(int i=0;i<8;++i){double t=kda_probe(o,cq,ck,cv,decay,beta,state,ts[i],300);if(i==0)r1=t;printf("PROBE recurrence_eff threads=%2d efficiency=%.3f\n",ts[i],r1/(t*ts[i]));}
-    free(blob);free(x);free(state);
-    return finite?0:1;
+    probe_free(blob);probe_free(x);probe_free(state);
+    int status=probe_alloc_failed?2:finite?0:1;fprintf(stderr,"k3 KDA pool: peak=%.2f MiB reserved=%.2f MiB\n",probe_pool.peak_active_bytes/1048576.0,probe_pool.reserved_bytes/1048576.0);k3_pool_destroy(&probe_pool);return status;
 }

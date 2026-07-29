@@ -489,7 +489,7 @@ Several additional real routed-up and KDA probes delimit the useful kernel space
   best isolated real-weight result is 143.6 us at 47 workers and 223.6 GB/s of stored
   weights; the simulator conservatively uses 218 GB/s. `k3_moe_finish_reduce_q8w16`
   fuses the shared residual into the same workshare. Rerun only this calibration with
-  `K3_DENSE_ONLY=q8w16 ./k3_dense_probe BLOB MANIFEST`; shared-node HBM contention
+  `./k3_dense_probe --only q8w16 BLOB MANIFEST`; shared-node HBM contention
   caused slower outliers, so the modeled rate is an optimistic clean-run calibration.
 
 The quality-gated simulator mode is `--q8w16-up`. With expert TP, fused MoE reduction,
@@ -509,3 +509,31 @@ and 182.1 aggregate token/s at M=32. The smaller weights fit both cases: 23.87 G
 at M=1 and 25.97 GB/rank at M=32. Its M=1 compute-only lower bound is 47.9 ms, or
 20.9 token/s with free communication; the current 23.0 ms collective term must fall
 to roughly 2 ms to reach 20 token/s without further kernel gains.
+
+## Runner runtime and command-line contract
+
+The K3 dense, KDA, and MoE probes now allocate through `k3_pool` in
+`k3_runtime.h`; runner code does not call raw `malloc`, `calloc`, or `free`.
+Every returned address is 256-byte aligned. The pool applies anonymous-memory
+interleave over NUMA nodes visible in the rank's CPU affinity, caches released blocks,
+tracks active/reserved/peak bytes, and trims cached blocks before retrying a failed
+allocation. Partial blobs are loaded with bounded `pread` calls and source pages are
+dropped as they are consumed. Errors include the operation, requested and pool bytes,
+`MemAvailable`, path, and failing file offset where applicable. Manifest counts,
+required tensor names, and every tensor extent are validated before a kernel runs.
+
+Operational settings are command-line arguments. Examples:
+
+```sh
+./k3_dense_probe --only q8w16 BLOB MANIFEST
+./k3_moe_probe --threads 48 --tile-threshold 8 --tp-selected BLOB MANIFEST ...
+./run_kda_probe.sh --model-dir "$HOME/models/kimi-k3" --layer 0 --head 0
+./run_moe_probe_mpi.sh --nodes 12 --layer 1 --experts-per-rank 4 --threads 48
+./run_expert_tp_probe_mpi.sh --nodes 12 --layer 1 --experts 16 --threads 48
+```
+
+The launchers reject missing/unknown arguments, invalid ranges, and pre-existing
+result directories. Cleanup only removes directories created by that invocation.
+Environment variables are limited to scheduler/rank discovery, OpenMP/XOS profiling
+and binding controls, and the debugging retention switches `K3_KEEP_PROBE=1` and
+`K3_KEEP_RESULTS=1`; they no longer select model, layer, kernel, or topology behavior.
