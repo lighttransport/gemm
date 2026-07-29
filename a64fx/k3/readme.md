@@ -704,6 +704,31 @@ from 0.262 to 0.239 ms/step and end-to-end throughput rose from 1,589 to 1,665 p
 layer-steps/s. The optimized 16K run used 160 MiB cache/rank and passed 12/12 ranks at
 1,327 layer-steps/s with `mla_cache_max=0.139` and stable latent RMS.
 
+The runner now stores MLA K/V cache in BF16 by default, matching the modeled Kimi K3
+activation/cache format while retaining FP32 accumulation and stable online-softmax
+statistics. `--mla-cache-fp32` selects the former cache representation for numerical
+diagnosis; `--mla-cache-bf16` is also accepted explicitly. The BF16 SVE dot product
+unpacks vectors in registers and does not materialize an FP32 cache copy. Correctness
+tests measured `1.9e-9` maximum difference between serial and token-block-parallel BF16
+attention and `2.4e-5` between BF16-cache and FP32-cache outputs.
+
+On job `49852817`, one synthetic MLA layer over a complete 8K context passed all 12
+ranks with 40 MiB cache/rank versus 80 MiB for FP32. The MLA phase improved from
+0.2393 to 0.2298 ms/step and end-to-end throughput from 1,665 to 1,703 layer-steps/s.
+At 16K, cache fell from 160 to 80 MiB and throughput was effectively neutral
+(1,327 FP32 versus 1,330 BF16 layer-steps/s), showing that expert and collective time
+mask the saved cache traffic at that scale. The BF16 and FP32 16K checksums differed by
+only `5.5e-5`. A 16-token traversal of the default BF16 full 93-layer schedule passed
+12/12 ranks at 2,439 layer-steps/s, allocated exactly 69 KDA and 24 MLA state slots,
+and reported 59.03 MiB peak managed memory. Commands used for the long-context A/B were:
+
+```sh
+a64fx/k3/run_k3_ep.sh --mode dummy --nodes 12 --layer 3 --layers 1 \
+  --tokens 16384 --threads 48 --kda-threads 8 --mla-cache-bf16 --profile
+a64fx/k3/run_k3_ep.sh --mode dummy --nodes 12 --layer 3 --layers 1 \
+  --tokens 16384 --threads 48 --kda-threads 8 --mla-cache-fp32 --profile
+```
+
 The real layer-1 KDA+MoE path also completed 65,536 recurrent steps on all 12 ranks in
 27.12 seconds (2,416 partial layer-steps/s). Latent RMS remained 7.4833,
 `kda_state_max` was 0.107 versus 0.110 at 8K, and checksum disagreement was below

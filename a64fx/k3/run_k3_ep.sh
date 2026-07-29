@@ -23,6 +23,7 @@ RESULT_DIR="$SCRIPT_DIR/logs/run-$JOB_TAG"
 PROFILE=0
 REUSE_STAGE=0
 NO_FUSED_TEAM=0
+MLA_CACHE_BF16=1
 
 usage() {
     cat >&2 <<EOF
@@ -30,6 +31,7 @@ usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--threads N] [--kda-threads N] [--fused-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
           [--profile] [--reuse-stage] [--no-fused-team]
+          [--mla-cache-bf16|--mla-cache-fp32]
 EOF
 }
 need_value() { if (( $# < 2 )); then echo "$0: missing value for $1" >&2; usage; exit 2; fi; }
@@ -51,6 +53,8 @@ while (( $# )); do
         --profile) PROFILE=1; shift;;
         --reuse-stage) REUSE_STAGE=1; shift;;
         --no-fused-team) NO_FUSED_TEAM=1; shift;;
+        --mla-cache-bf16) MLA_CACHE_BF16=1; shift;;
+        --mla-cache-fp32) MLA_CACHE_BF16=0; shift;;
         -h|--help) usage; exit 0;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2;;
     esac
@@ -113,6 +117,11 @@ set +e
 RUNNER_EXTRA=()
 (( PROFILE )) && RUNNER_EXTRA+=(--profile)
 (( NO_FUSED_TEAM )) && RUNNER_EXTRA+=(--no-fused-team)
+if (( MLA_CACHE_BF16 )); then
+    RUNNER_EXTRA+=(--mla-cache-bf16)
+else
+    RUNNER_EXTRA+=(--mla-cache-fp32)
+fi
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
     --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" \

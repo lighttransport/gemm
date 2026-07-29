@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -390,6 +391,94 @@ static inline void k3_attention_sve(float *out, const float *q, const float *key
         for (int j = 0; j < v_dim; ++j) out[j] /= l;
 #endif
     }
+}
+
+static inline uint16_t k3_f32_to_bf16_rne(float f){
+    uint32_t x;memcpy(&x,&f,sizeof x);x+=UINT32_C(0x7fff)+((x>>16)&1);return(uint16_t)(x>>16);
+}
+static inline float k3_bf16_to_f32(uint16_t b){uint32_t x=(uint32_t)b<<16;float f;memcpy(&f,&x,sizeof f);return f;}
+
+static inline float k3_dot_f32_bf16_sve(const float *a,const uint16_t *b,int n){
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t sum=svdup_f32(0.0f);for(int i=0;i<n;i+=(int)svcntw()){svbool_t pg=svwhilelt_b32(i,n);
+        svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,b+i),16);
+        sum=svmla_f32_m(pg,sum,svld1(pg,a+i),svreinterpret_f32_u32(bits));}
+    return svaddv_f32(svptrue_b32(),sum);
+#else
+    double sum=0;for(int i=0;i<n;++i)sum+=(double)a[i]*k3_bf16_to_f32(b[i]);return(float)sum;
+#endif
+}
+
+static inline void k3_attention_bf16_sve(float *out,const float *q,const uint16_t *keys,
+        const uint16_t *values,int tokens,int qk_dim,int v_dim){
+    for(int j=0;j<v_dim;++j)out[j]=0.0f;
+    float m=-INFINITY,l=0.0f,scale=1.0f/sqrtf((float)qk_dim);
+    for(int t=0;t<tokens;++t){float score=k3_dot_f32_bf16_sve(q,keys+(size_t)t*qk_dim,qk_dim)*scale;
+        float nm=fmaxf(m,score),old=expf(m-nm),add=expf(score-nm);
+#if defined(__ARM_FEATURE_SVE)
+        int vl=(int)svcntw();for(int j=0;j<v_dim;j+=vl){svbool_t pg=svwhilelt_b32(j,v_dim);
+            svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,values+(size_t)t*v_dim+j),16);
+            svfloat32_t z=svmul_n_f32_x(pg,svld1(pg,out+j),old);
+            z=svmla_n_f32_x(pg,z,svreinterpret_f32_u32(bits),add);svst1(pg,out+j,z);}
+#else
+        for(int j=0;j<v_dim;++j)out[j]=out[j]*old+k3_bf16_to_f32(values[(size_t)t*v_dim+j])*add;
+#endif
+        l=l*old+add;m=nm;
+    }
+    if(l!=0.0f){
+#if defined(__ARM_FEATURE_SVE)
+        int vl=(int)svcntw();for(int j=0;j<v_dim;j+=vl){svbool_t pg=svwhilelt_b32(j,v_dim);
+            svst1(pg,out+j,svdiv_n_f32_x(pg,svld1(pg,out+j),l));}
+#else
+        for(int j=0;j<v_dim;++j)out[j]/=l;
+#endif
+    }
+}
+
+static inline void k3_attention_heads_parallel_bf16_sve(float *out,const float *q,
+        const uint16_t *keys,const uint16_t *values,int heads,int tokens,int cache_tokens,
+        int qk_dim,int v_dim,int threads,float *scratch,float *stats){
+    int parts=threads<tokens?threads:tokens;float scale=1.0f/sqrtf((float)qk_dim);
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+#endif
+        for(int task=0;task<heads*parts;++task){int h=task/parts,p=task%parts;
+            int begin=(tokens*p)/parts,end=(tokens*(p+1))/parts;float *num=scratch+(size_t)task*v_dim;
+            const float *qh=q+(size_t)h*qk_dim;const uint16_t *kh=keys+(size_t)h*cache_tokens*qk_dim;
+            const uint16_t *vh=values+(size_t)h*cache_tokens*v_dim;for(int j=0;j<v_dim;++j)num[j]=0.0f;
+            float m=-INFINITY,l=0.0f;for(int t=begin;t<end;++t){
+                float score=k3_dot_f32_bf16_sve(qh,kh+(size_t)t*qk_dim,qk_dim)*scale;
+                float nm=fmaxf(m,score),old=expf(m-nm),add=expf(score-nm);
+#if defined(__ARM_FEATURE_SVE)
+                int vl=(int)svcntw();for(int j=0;j<v_dim;j+=vl){svbool_t pg=svwhilelt_b32(j,v_dim);
+                    svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,vh+(size_t)t*v_dim+j),16);
+                    svfloat32_t z=svmul_n_f32_x(pg,svld1(pg,num+j),old);
+                    z=svmla_n_f32_x(pg,z,svreinterpret_f32_u32(bits),add);svst1(pg,num+j,z);}
+#else
+                for(int j=0;j<v_dim;++j)num[j]=num[j]*old+k3_bf16_to_f32(vh[(size_t)t*v_dim+j])*add;
+#endif
+                l=l*old+add;m=nm;}
+            stats[(size_t)task*2]=m;stats[(size_t)task*2+1]=l;}
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for(int h=0;h<heads;++h){float m=-INFINITY;double l=0.0;
+            for(int p=0;p<parts;++p)m=fmaxf(m,stats[((size_t)h*parts+p)*2]);
+            for(int p=0;p<parts;++p){size_t s=((size_t)h*parts+p)*2;float weight=expf(stats[s]-m);
+                l+=(double)stats[s+1]*weight;stats[s]=weight;}size_t g=(size_t)heads*parts*2+(size_t)h*2;
+            stats[g]=m;stats[g+1]=(float)l;}
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for(int task=0;task<heads*v_dim;++task){int h=task/v_dim,j=task%v_dim;double z=0.0;
+            size_t g=(size_t)heads*parts*2+(size_t)h*2;for(int p=0;p<parts;++p){size_t s=((size_t)h*parts+p)*2;
+                z+=(double)scratch[((size_t)h*parts+p)*v_dim+j]*stats[s];}out[task]=(float)(z/stats[g+1]);}
+#if defined(_OPENMP)
+    }
+#endif
 }
 
 /* Parallel exact online attention for head-TP decode. Token blocks retain

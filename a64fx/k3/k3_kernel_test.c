@@ -101,6 +101,15 @@ int main(void) {
         ak+(size_t)h*AT*K,av+(size_t)h*AT*V,AT,K,V);
     k3_attention_heads_parallel_sve(ap,aq,ak,av,AH,AT,AT,K,V,AP,as,ast);
     fail |= check("mla-parallel", ao2, ap, AH*V, 2e-5f);
+    uint16_t *abk=malloc((size_t)AH*AT*K*2),*abv=malloc((size_t)AH*AT*V*2);
+    float *abr=malloc((size_t)AH*V*4),*abo=malloc((size_t)AH*V*4);
+    for(int i=0;i<AH*AT*K;++i)abk[i]=k3_f32_to_bf16_rne(ak[i]);
+    for(int i=0;i<AH*AT*V;++i)abv[i]=k3_f32_to_bf16_rne(av[i]);
+    for(int h=0;h<AH;++h)k3_attention_bf16_sve(abr+(size_t)h*V,aq+(size_t)h*K,
+        abk+(size_t)h*AT*K,abv+(size_t)h*AT*V,AT,K,V);
+    k3_attention_heads_parallel_bf16_sve(abo,aq,abk,abv,AH,AT,AT,K,V,AP,as,ast);
+    fail |= check("mla-bf16-par", abr, abo, AH*V, 2e-5f);
+    fail |= check("mla-bf16-fp32", ao2, abr, AH*V, 2e-3f);
     enum { XH=2, XT=257, XP=48 };
     float *xq=malloc((size_t)XH*K*4),*xk=malloc((size_t)XH*XT*K*4),*xv=malloc((size_t)XH*XT*V*4);
     float *xr=malloc((size_t)XH*V*4),*xo=malloc((size_t)XH*V*4);
@@ -180,6 +189,7 @@ int main(void) {
 
     free(a);free(b);free(r);free(o);free(q);free(key);free(val);free(gate);free(s0);free(s1);free(s2);free(kr);free(ko);free(kp);free(decay2);
     free(keys);free(values);free(aq);free(ak);free(av);free(ao2);free(ap);free(as);free(ast);
+    free(abk);free(abv);free(abr);free(abo);
     free(xq);free(xk);free(xv);free(xr);free(xo);free(xs);free(xst);
     free(bq);free(bk);free(bv);free(bg);free(bs);free(bo);
     free(pq);free(pk);free(pv);free(pd);free(pb);free(po0);free(po1);free(ps0);free(ps1);
