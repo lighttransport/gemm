@@ -69,6 +69,11 @@ static int q8_projection(const matrix *m,const float*x,const float*ref,int threa
         printf("PROBE dense mode=%s-bf16 threads=%d us=%.3f GB/s=%.2f\n",label,th,bsec/iters*1e6,2.0*m->rows*(double)m->cols/(bsec/iters)/1e9);}
     free(qw);free(qx);free(sc);free(out);free(eb);return !isfinite(rel)||!isfinite(cos);
 }
+static int q8p16_projection(const matrix*m,const float*x,const float*ref,int threads,const char*label){
+    size_t n=(size_t)m->rows*m->cols;int8_t*p=malloc(n),*qx=malloc((size_t)m->cols);float*sc=malloc((size_t)m->rows*4),*out=malloc((size_t)m->rows*4);size_t en=(size_t)192*1024*1024/4;float*eb=calloc(en,4);if(!p||!qx||!sc||!out||!eb)return 1;
+    k3_q8p16_quantize_bf16(p,sc,m->weight,m->rows,m->cols);k3_matvec_q8p16(out,p,sc,m->rows,m->cols,x,qx,threads);double se=0,sr=0;for(int i=0;i<m->rows;++i){double d=out[i]-ref[i];se+=d*d;sr+=(double)ref[i]*ref[i];}double rel=sqrt(se/(sr+1e-30));int ts[]={36,40,44,47,48};for(int ti=0;ti<5;++ti){int th=ts[ti];double sec=0;for(int it=0;it<8;++it){evict(eb,en,th);double t=now_sec();k3_matvec_q8p16(out,p,sc,m->rows,m->cols,x,qx,th);sec+=now_sec()-t;}printf("PROBE dense mode=%s-q8p16 threads=%d us=%.3f GB/s=%.2f rel_l2=%.3e\n",label,th,sec/8*1e6,n/(sec/8)/1e9,rel);}
+    free(p);free(qx);free(sc);free(out);free(eb);return !isfinite(rel);
+}
 static int q8pv_projection(const matrix*m,const float*x,const float*ref,int threads,const char*label){
     size_t bytes=k3_q8pv_matrix_bytes(m->rows,m->cols);uint8_t*q=malloc(bytes);int8_t*xq=malloc((size_t)m->cols);float*xs=malloc((size_t)(m->cols/64)*4),*out=malloc((size_t)m->rows*4);size_t en=(size_t)192*1024*1024/4;float*eb=calloc(en,4);if(!q||!xq||!xs||!out||!eb)return 1;
     k3_q8pv_quantize_bf16(q,m->weight,m->rows,m->cols);k3_q8pv_matrix qm={q,m->rows,m->cols};k3_matvec_q8pv(out,&qm,x,xq,xs,threads);
@@ -233,7 +238,7 @@ int main(int argc, char **argv) {
         perf(&r, &d, x, yr, yd, ts[i], 1);
     }
     int q8_fail = q8_correctness_perf(&r, &d, x, down_ref, 47);
-    if(ue){matrix up={(uint16_t*)(b+ue->offset),ue->rows,ue->cols};float*ux=malloc((size_t)up.cols*4),*uref=malloc((size_t)up.rows*4);for(int i=0;i<up.cols;++i)ux[i]=rnd()*.125f;mv(uref,&up,ux,47);q8_fail|=q8_projection(&up,ux,uref,47,"up");q8_fail|=q8pv_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_projection(&up,ux,uref,47,"up");q8_fail|=bf16pv_projection(&up,ux,uref,47,"up");free(ux);free(uref);}
+    if(ue){matrix up={(uint16_t*)(b+ue->offset),ue->rows,ue->cols};float*ux=malloc((size_t)up.cols*4),*uref=malloc((size_t)up.rows*4);for(int i=0;i<up.cols;++i)ux[i]=rnd()*.125f;mv(uref,&up,ux,47);q8_fail|=q8_projection(&up,ux,uref,47,"up");q8_fail|=q8p16_projection(&up,ux,uref,47,"up");q8_fail|=q8pv_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_projection(&up,ux,uref,47,"up");q8_fail|=bf16pv_projection(&up,ux,uref,47,"up");free(ux);free(uref);}
     free(down_ref);
     free(x);
     free(yr);

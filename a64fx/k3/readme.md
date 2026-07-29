@@ -447,7 +447,9 @@ the Q8 projection gate fails. The exact BF16 path remains slower and slightly ex
 the strict 27 GB working budget when routed-up is replicated.
 
 Keeping router and routed-down in BF16 while quantizing only replicated routed-up is
-the fastest mixed placement: it estimates 14.57 tok/s and 25.05 GB/rank at M=1. At
+the fastest mixed placement. A 16-row K-blocked Q8 layout raises routed-up to 172.9
+GB/s at 44 workers, and the shared hidden residual is now added inside the same
+workshare. It estimates 14.67 tok/s and 25.05 GB/rank at M=1. At
 M=32 it reaches 185.6 aggregate tok/s but models 27.15 GB/rank, narrowly beyond the
 strict 27 GB guard. Use `--q8-up-only`; this remains experimental because routed-up
 alone still fails the projection-level relative-L2 gate.

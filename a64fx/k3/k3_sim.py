@@ -271,7 +271,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            latent_overlap: bool, hierarchical_ar: bool,
            expert_tp: bool = False, expert_tp_layer_ms: float = .094,
            fused_moe_ar: bool = False, dense_q8: bool = False,
-           q8_down_gbps: float = 140.0, q8_up_gbps: float = 167.0,
+           q8_down_gbps: float = 140.0, q8_up_gbps: float = 173.0,
            attention_rsag: bool = False, q8_up_only: bool = False) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
@@ -506,7 +506,7 @@ def main() -> None:
     p.add_argument("--q8-up-only", action="store_true",
                    help="keep router/down BF16 and quantize only replicated routed-up")
     p.add_argument("--q8-down-gbps", type=float, default=140.0)
-    p.add_argument("--q8-up-gbps", type=float, default=167.0)
+    p.add_argument("--q8-up-gbps", type=float, default=173.0)
     p.add_argument("--attention-rsag", action="store_true",
                    help="use decomposed reduce-scatter/allgather attention reduction")
     p.add_argument("--json", type=Path, help="also write full results as JSON")

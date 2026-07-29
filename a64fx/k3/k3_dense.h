@@ -279,8 +279,8 @@ static inline void k3_q8_dot24(int32_t out[24], const int8_t *w,
 #endif
 }
 
-static inline void k3_matvec_q8(float *out, const k3_q8_matrix *m,
-                                 const float *x, int8_t *qx, int threads) {
+static inline void k3_matvec_q8_bias(float *out, const k3_q8_matrix *m,
+        const float *x, int8_t *qx, const float *bias, int threads) {
     float xs = k3_q8_quantize_vector(qx, x, m->cols);
     int groups = (m->rows + 23) / 24;
 #if defined(_OPENMP)
@@ -296,12 +296,60 @@ static inline void k3_matvec_q8(float *out, const k3_q8_matrix *m,
         else k3_q8_dot8(dot,m->weight+(size_t)r*m->cols,qx,m->cols);
         int nr=left<24?left:24;
         for (int j = 0; j < nr; ++j)
-            out[r+j] = (float)dot[j] * (m->scale[r+j] * xs);
+            out[r+j] = (float)dot[j] * (m->scale[r+j] * xs) +
+                (bias ? bias[r+j] : 0.0f);
     }
+}
+static inline void k3_matvec_q8(float *out, const k3_q8_matrix *m,
+                                 const float *x, int8_t *qx, int threads) {
+    k3_matvec_q8_bias(out,m,x,qx,NULL,threads);
 }
 
 static inline size_t k3_q8_matrix_bytes(int rows, int cols) {
     return (size_t)rows * cols + (size_t)rows * sizeof(float);
+}
+
+/* Row-Q8 values repacked as [16 rows][K/64 blocks][16x64].  The scale remains
+ * per row, but a worker now follows one sequential HBM stream instead of 16
+ * distant row streams. */
+static inline void k3_q8p16_quantize_bf16(int8_t*packed,float*scale,
+        const uint16_t*w,int rows,int cols){int blocks=cols/64;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int g=0;g<rows/16;++g)for(int r=0;r<16;++r){int row=g*16+r;const uint16_t*src=w+(size_t)row*cols;float amax=0;
+        for(int j=0;j<cols;++j)amax=fmaxf(amax,fabsf(bf16_to_f32_scalar(src[j])));float s=amax>0?amax/127.0f:1.0f,inv=1.0f/s;scale[row]=s;
+        for(int b=0;b<blocks;++b){int8_t*d=packed+((size_t)g*blocks+b)*1024+r*64;
+            for(int j=0;j<64;++j){long v=lrintf(bf16_to_f32_scalar(src[b*64+j])*inv);d[j]=(int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);}}}
+}
+static inline void k3_q8p16_dot16(int32_t*out,const int8_t*p,const int8_t*x,int blocks){
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg=svptrue_b8(),p32=svptrue_b32();svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0,a8=a0,a9=a0,a10=a0,a11=a0,a12=a0,a13=a0,a14=a0,a15=a0;
+    for(int b=0;b<blocks;++b){const int8_t*q=p+(size_t)b*1024;svint8_t v=svld1_s8(pg,x+(size_t)b*64);
+#define K3_Q8P16_ROW(R) a##R=svdot_s32(a##R,svld1_s8(pg,q+(R)*64),v)
+        K3_Q8P16_ROW(0);K3_Q8P16_ROW(1);K3_Q8P16_ROW(2);K3_Q8P16_ROW(3);K3_Q8P16_ROW(4);K3_Q8P16_ROW(5);K3_Q8P16_ROW(6);K3_Q8P16_ROW(7);K3_Q8P16_ROW(8);K3_Q8P16_ROW(9);K3_Q8P16_ROW(10);K3_Q8P16_ROW(11);K3_Q8P16_ROW(12);K3_Q8P16_ROW(13);K3_Q8P16_ROW(14);K3_Q8P16_ROW(15);
+#undef K3_Q8P16_ROW
+    }
+#define K3_Q8P16_SUM(R) out[R]=svaddv_s32(p32,a##R)
+    K3_Q8P16_SUM(0);K3_Q8P16_SUM(1);K3_Q8P16_SUM(2);K3_Q8P16_SUM(3);K3_Q8P16_SUM(4);K3_Q8P16_SUM(5);K3_Q8P16_SUM(6);K3_Q8P16_SUM(7);K3_Q8P16_SUM(8);K3_Q8P16_SUM(9);K3_Q8P16_SUM(10);K3_Q8P16_SUM(11);K3_Q8P16_SUM(12);K3_Q8P16_SUM(13);K3_Q8P16_SUM(14);K3_Q8P16_SUM(15);
+#undef K3_Q8P16_SUM
+#else
+    (void)out;(void)p;(void)x;(void)blocks;
+#endif
+}
+static inline void k3_matvec_q8p16_bias(float*out,const int8_t*p,const float*scale,
+        int rows,int cols,const float*x,int8_t*qx,const float*bias,int threads){float xs=k3_q8_quantize_vector(qx,x,cols);int blocks=cols/64;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for(int g=0;g<rows/16;++g){int32_t d[16];k3_q8p16_dot16(d,p+(size_t)g*blocks*1024,qx,blocks);for(int r=0;r<16;++r){int row=g*16+r;out[row]=(float)d[r]*(scale[row]*xs)+(bias?bias[row]:0.0f);}}
+}
+static inline void k3_matvec_q8p16(float*out,const int8_t*p,const float*scale,
+        int rows,int cols,const float*x,int8_t*qx,int threads){
+    k3_matvec_q8p16_bias(out,p,scale,rows,cols,x,qx,NULL,threads);
 }
 
 /* A64FX loses bandwidth at 48 workers for these two matrices.  Reserving the

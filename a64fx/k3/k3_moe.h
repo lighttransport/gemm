@@ -56,14 +56,9 @@ static inline void k3_moe_finish_reduce_q8(
         const float *reduced, const float *routed_norm_weight,
         const k3_q8_matrix *replicated_routed_up, float eps, int threads) {
     k3_rmsnorm_sve(norm_scratch, reduced, routed_norm_weight, K3_LATENT, eps);
-    k3_matvec_q8(hidden_out, replicated_routed_up, norm_scratch,
-                 q_scratch, threads);
     const float *shared = reduced + K3_LATENT;
-#if defined(_OPENMP)
-    omp_set_num_threads(threads);
-#pragma omp parallel for schedule(static)
-#endif
-    for (int i = 0; i < K3_HIDDEN; ++i) hidden_out[i] += shared[i];
+    k3_matvec_q8_bias(hidden_out, replicated_routed_up, norm_scratch,
+                      q_scratch, shared, threads);
 }
 
 static inline void k3_moe_finish_reduce_bf16(
@@ -84,6 +79,15 @@ static inline void k3_moe_finish_reduce_bf16(
             w+3*K3_LATENT,w+4*K3_LATENT,w+5*K3_LATENT,
             w+6*K3_LATENT,w+7*K3_LATENT,norm_scratch,K3_LATENT);
         for(int j=0;j<8;++j)hidden_out[r+j]+=reduced[K3_LATENT+r+j];}
+}
+
+static inline void k3_moe_finish_reduce_q8p16(float*hidden_out,
+        float*norm_scratch,int8_t*q_scratch,const float*reduced,
+        const float*routed_norm_weight,const int8_t*routed_up_packed,
+        const float*routed_up_scale,float eps,int threads){
+    k3_rmsnorm_sve(norm_scratch,reduced,routed_norm_weight,K3_LATENT,eps);
+    k3_matvec_q8p16_bias(hidden_out,routed_up_packed,routed_up_scale,
+        K3_HIDDEN,K3_LATENT,norm_scratch,q_scratch,reduced+K3_LATENT,threads);
 }
 
 #ifndef K3_MOE_MAX_BATCH
