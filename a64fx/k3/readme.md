@@ -547,7 +547,8 @@ of 16 experts and then combined 128 scalars.  The new SVE path applies routing
 weights to vector accumulators and performs only eight final reductions.  Sixteen
 real layer-1 32-channel slices match the unfused reference to `9.313e-10` maximum
 absolute error.  In a same-node A/B build, the selected-expert layer falls from
-0.081 to 0.062 ms (23.5%); the conservative simulator default is 0.065 ms.
+0.081 to 0.062 ms (23.5%); the initial conservative simulator default was 0.065
+ms and the stable-18 calibration below uses 0.063 ms.
 
 The initial real Q8W16 reruns reached 232--237 GB/s for routed-up and 241 GB/s for the
 BF16-router/Q8W16-down pair. Those write-eviction measurements and their 230/235
@@ -593,8 +594,9 @@ OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores \
   ./k3_dense_probe --only q8w16down --threads 47 --stable-reps 64 BLOB MANIFEST
 ```
 
-The simulator deliberately discounts those clean p95 results to 300 GB/s for
-routed-up and 285 GB/s for the router/down pair. With 96 nodes, expert TP, fused
+The stable-15 calibration discounted those clean p95 results to 300 GB/s for
+routed-up and 285 GB/s for the router/down pair; it is superseded by the
+quality-gated router and overlap path below. With 96 nodes, expert TP, fused
 MoE reduction, hierarchical collectives, and dense Q8W16, the 4K M=1 model is
 **16.89 token/s**: 59.19 ms/token against the stable-15 budget of 66.67 ms, a
 7.47 ms margin. M=32 is **224.98 aggregate token/s** and fits the modeled HBM
@@ -606,6 +608,58 @@ estimate, not a measured 96-node end-to-end result. The 22.1 ms collective term
 and full-layer scheduling still require validation in an exclusive 96-node job;
 the simulator prints an explicit PASS/FAIL line via `--decode-target-tps` so future
 measurements cannot silently weaken the stable target.
+
+### Stable 18 token/s attack
+
+Two changes close the remaining 3.64 ms gap from stable 15. First, the router is
+no longer left in BF16. Group-16 Q8 narrowly fails on the real layer-1 router
+(0.5298% relative L2), and scale clipping at 0.98/0.96 degrades it to 1.23%/2.36%.
+A router-only group-8 layout passes eight independent activations at 0.4343%
+relative L2 and 0.9999906 minimum cosine. Two adjacent eight-weight groups are
+packed into one 16-lane SVE block with separate lower/upper scales, avoiding the
+half-vector execution cost of a naive group-8 kernel. The fused stage assigns a
+fixed router CMG share and runs group-8 router with group-16 routed-down. Five
+64-sample real-weight runs at 47 workers gave p95 stored-bandwidth floors of
+270--310 GB/s; the model uses 280 GB/s.
+
+Second, the first 16 MiB of each replicated Q8W16 routed-up matrix is pulled into
+L2 while its fused MoE reduction is in flight. A cache-line sampling kernel is
+sufficient because an A64FX fill allocates the complete 256-byte line. Its real
+partial-weight p95 is 64.01 us and 262.1 GB/s, below the measured 12-node MoE
+collective window. The runner has a persistent asynchronous reduction worker,
+uses AArch64 WFE/SEV when idle, and reserves application core 59 while 47 OpenMP
+workers are confined to cores 12--58. Without explicit core ownership the helper
+can alias an OpenMP worker and latency rises by orders of magnitude, so
+`--prefetch-mib` rejects 48-worker launches and the launcher installs the safe
+A64FX place list automatically.
+
+The 12-node hierarchical runner completed 4,096 sequential overlapped layer
+steps on all ranks with the staged real expert slices, identical checksums, and
+no communication failure. The 16 MiB prefetch raised the dummy A/B collective
+stage from 97.6 to 118.1 us; the real partial run measured 122.9 us. The simulator
+therefore charges a conservative 22 us/layer launch penalty instead of assuming
+free overlap. The partial runner intentionally uses a proxy weight window and
+does not consume it as routed-up, so its total loop rate is not an end-to-end
+speed measurement; it validates concurrent HBM fill, real expert execution,
+uTofu progress, numerical lockstep, and long-run transport behavior.
+
+With the measured 0.062 ms expert kernel represented as 0.063 ms, 300 GB/s
+routed-up, 280 GB/s router/down, 248 GB/s prefetch, and the 22 us overlap charge,
+the real 96-shard manifest model predicts **18.15 token/s** at 4K M=1:
+55.09 ms/token against the 55.56 ms target budget, a **0.46 ms margin**. M=32 is
+**234.31 aggregate token/s** and uses 25.63 GB/rank. Reproduce the overlap probe
+inside the 12-node allocation with:
+
+```sh
+./run_k3_ep.sh --mode dummy --nodes 12 --layers 1 --tokens 4096 \
+  --layer 1 --threads 47 --profile --ar-groups 3 --prefetch-mib 16 \
+  --result-dir logs/attack18-overlap
+```
+
+This is a stable partial-runner result plus a full-model estimate. The 0.46 ms
+margin is intentionally small: 18 token/s is not an end-to-end 96-node claim
+until the real routed-up buffers replace the proxy window and the 96-node
+collective calibration confirms the modeled 24.1 ms communication stack.
 
 ## Runner runtime and command-line contract
 

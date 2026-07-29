@@ -149,6 +149,8 @@ def memory(split: WeightSplit, nodes: int, context: int, batch: int,
         replicated = split.replicated + q8_ratio * ROUTED_UP_GB
         if dense_q8 or q8w16_dense:
             replicated += (q8_ratio - 1.0) * ROUTED_DOWN_GB
+        if q8w16_dense:
+            replicated += (.75 - 1.0) * ROUTER_GB
         tp = max(0.0, split.shardable - ROUTED_UP_GB) / nodes
     elif fused_moe_ar:
         replicated = split.replicated + ROUTED_UP_GB
@@ -272,12 +274,14 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
            link_gbps: float, imbalance: float, expert_ms: float,
            expert_samples: int, moe_collectives: int,
            latent_overlap: bool, hierarchical_ar: bool,
-           expert_tp: bool = False, expert_tp_layer_ms: float = .065,
+           expert_tp: bool = False, expert_tp_layer_ms: float = .063,
            fused_moe_ar: bool = False, dense_q8: bool = False,
            q8_down_gbps: float = 140.0, q8_up_gbps: float = 173.0,
            attention_rsag: bool = False, q8_up_only: bool = False,
            q8w16_up: bool = False, q8w16_up_gbps: float = 300.0,
-           q8w16_dense: bool = False, q8w16_pair_gbps: float = 285.0) -> dict:
+           q8w16_dense: bool = False, q8w16_pair_gbps: float = 280.0,
+           moe_prefetch_mib: float = 16.0, prefetch_gbps: float = 248.0,
+           prefetch_launch_us: float = 22.0) -> dict:
     expert = active_expert_gb(split, nodes, batch, imbalance)
     attention = min(ATTENTION_GB, split.shardable) / nodes
     other_tp = max(0.0, split.shardable - ATTENTION_GB -
@@ -286,7 +290,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
     cache = MLA_LAYERS * context * math.ceil(HEADS / nodes) * (192 + 128) * 2 / 1e9
     router_down = min(ROUTER_DOWN_GB, split.replicated)
     if q8w16_dense:
-        weight_s = (ROUTER_GB + .625 * ROUTED_DOWN_GB) / q8w16_pair_gbps
+        weight_s = (.75 * ROUTER_GB + .625 * ROUTED_DOWN_GB) / q8w16_pair_gbps
         weight_s += (split.replicated - ROUTER_DOWN_GB + other_tp) / bw_gbps
         weight_s += .625 * ROUTED_UP_GB / q8w16_up_gbps
     elif dense_q8:
@@ -348,19 +352,29 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
     overlap_s = min(latent_comm_s, SHARED_EXPERT_GB / nodes / bw_gbps) \
         if latent_overlap else 0.0
     comm_s = hidden_comm_s + latent_comm_s - overlap_s
-    lower = weight_s + expert_s + cache_s + kda_s
+    prefetch_s = 0.0
+    if fused_moe_ar and (q8w16_up or q8w16_dense) and moe_prefetch_mib > 0:
+        requested_gb = moe_prefetch_mib * (1 << 20) * MOE_LAYERS / 1e9
+        available_gb = .625 * ROUTED_UP_GB
+        comm_capacity_gb = prefetch_gbps * moe_comm
+        prefetched_gb = min(requested_gb, available_gb, comm_capacity_gb)
+        prefetch_s = prefetched_gb / q8w16_up_gbps
+        comm_s += MOE_LAYERS * prefetch_launch_us * 1e-6
+    lower = weight_s + expert_s + cache_s + kda_s - prefetch_s
     predicted = lower + comm_s
     return {
         "context": context, "batch": batch,
         "dense_gb": dense, "attention_tp_gb": attention,
         "active_expert_gb": expert, "mla_scan_gb": cache,
-        "weight_ms": weight_s * 1e3, "expert_ms": expert_s * 1e3,
+        "weight_ms": (weight_s - prefetch_s) * 1e3,
+        "raw_weight_ms": weight_s * 1e3, "expert_ms": expert_s * 1e3,
         "expert_layer_ms": expert_layer_ms, "expert_layer_p95_ms": expert_p95_ms,
         "cache_ms": cache_s * 1e3,
         "kda_ms": kda_s * 1e3, "comm_ms": comm_s * 1e3,
         "hidden_comm_ms": hidden_comm_s * 1e3,
         "latent_comm_ms": latent_comm_s * 1e3,
         "overlap_ms": overlap_s * 1e3,
+        "prefetch_overlap_ms": prefetch_s * 1e3,
         "collective_calls": collective_calls,
         "lower_bound_ms": lower * 1e3, "predicted_ms": predicted * 1e3,
         "tokens_per_second": batch / predicted,
@@ -422,7 +436,9 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
               f"dense-Q8={args.dense_q8}, Q8-up-only={args.q8_up_only}, "
               f"Q8W16-up={args.q8w16_up}, Q8W16-dense={args.q8w16_dense} "
               f"({args.q8_down_gbps:g}/{args.q8_up_gbps:g}/{args.q8w16_up_gbps:g}/"
-              f"{args.q8w16_pair_gbps:g} GB/s down/up/W16/pair)")
+              f"{args.q8w16_pair_gbps:g} GB/s down/up/W16/pair), "
+              f"MoE-prefetch={args.moe_prefetch_mib:g} MiB/layer at {args.prefetch_gbps:g} GB/s "
+              f"(+{args.prefetch_launch_us:g} us launch)")
     print("\nMemory (fullest rank, expanded BF16 MLA cache)")
     print(f"{'ctx':>5} {'M':>3} {'weights':>8} {'KDA':>7} {'MLA-KV':>8} {'total':>8} {'fit27':>6}")
     for ctx in args.contexts:
@@ -454,7 +470,8 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
                        args.expert_tp_layer_ms,args.fused_moe_ar,args.dense_q8,
                        args.q8_down_gbps,args.q8_up_gbps,args.attention_rsag,
                        args.q8_up_only,args.q8w16_up,args.q8w16_up_gbps,
-                       args.q8w16_dense,args.q8w16_pair_gbps)
+                       args.q8w16_dense,args.q8w16_pair_gbps,
+                       args.moe_prefetch_mib,args.prefetch_gbps,args.prefetch_launch_us)
             result["decode"].append(d)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:7.1f} {d['expert_ms']:7.1f} "
                   f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f}")
@@ -532,7 +549,7 @@ def main() -> None:
     p.add_argument("--imbalance", type=float, default=1.20, help="critical-rank routed-expert traffic factor")
     p.add_argument("--expert-tp", action="store_true",
                    help="shard every expert over its group-32 intermediate blocks")
-    p.add_argument("--expert-tp-layer-ms", type=float, default=.065,
+    p.add_argument("--expert-tp-layer-ms", type=float, default=.063,
                    help="measured fused M=1 time for 16 native TP=96 slices")
     p.add_argument("--fused-moe-ar", action="store_true",
                    help="one concatenated latent+shared hidden reduction per MoE layer")
@@ -548,8 +565,14 @@ def main() -> None:
     p.add_argument("--q8-up-gbps", type=float, default=173.0)
     p.add_argument("--q8w16-up-gbps", type=float, default=300.0,
                    help="conservative read-cold p95 bandwidth for Q8W16 routed-up")
-    p.add_argument("--q8w16-pair-gbps", type=float, default=285.0,
-                   help="conservative read-cold p95 BF16-router + Q8W16-down bandwidth")
+    p.add_argument("--q8w16-pair-gbps", type=float, default=280.0,
+                   help="conservative p95 Q8W8-router + Q8W16-down bandwidth")
+    p.add_argument("--moe-prefetch-mib", type=float, default=16.0,
+                   help="routed-up bytes prefetched per layer during the fused MoE reduction")
+    p.add_argument("--prefetch-gbps", type=float, default=248.0,
+                   help="p95 cache-line prefetch bandwidth measured on A64FX")
+    p.add_argument("--prefetch-launch-us", type=float, default=22.0,
+                   help="measured async-helper overhead per MoE layer")
     p.add_argument("--attention-rsag", action="store_true",
                    help="model measured real RSAG (1.03x flat tree; rejected)")
     p.add_argument("--json", type=Path, help="also write full results as JSON")
@@ -568,6 +591,8 @@ def main() -> None:
         p.error("--nodes must be in [1,96] for head TP")
     if args.decode_target_tps <= 0:
         p.error("--decode-target-tps must be positive")
+    if args.moe_prefetch_mib < 0 or args.prefetch_gbps <= 0 or args.prefetch_launch_us < 0:
+        p.error("prefetch size/overhead must be nonnegative and bandwidth positive")
     split = fallback_weights() if args.no_manifest else scan_weights(args.model_dir)
     result = report(args, split)
     if args.json:

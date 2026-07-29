@@ -7,8 +7,8 @@ all: k3_kernel_test k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe
 
 runner: k3_ep_runner
 
-k3_ep_runner: k3_ep_runner.c k3_moe.h k3_kernels.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
-	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -ltofucom -o $@
+k3_ep_runner: k3_ep_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
+	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -ltofucom -o $@
 
 k3_kernel_test: k3_kernel_test.c k3_kernels.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
@@ -22,7 +22,7 @@ k3_real_mxfp4_test: k3_real_mxfp4_test.c
 k3_kda_probe: k3_kda_probe.c k3_kernels.h k3_runtime.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
 
-k3_moe_probe: k3_moe_probe.c k3_moe.h k3_kernels.h k3_runtime.h
+k3_moe_probe: k3_moe_probe.c k3_moe.h k3_dense.h k3_kernels.h k3_runtime.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
 
 k3_dense_probe: k3_dense_probe.c k3_dense.h k3_runtime.h

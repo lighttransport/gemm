@@ -153,15 +153,30 @@ static int q8pv32_f32_projection(const matrix*m,const float*x,const float*ref,in
     for(int ti=0;ti<5;++ti){int th=ts[ti];double sec=0;for(int it=0;it<10;++it){evict(eb,en,th);double t=now_sec();k3_matvec_q8pv32_f32(out,&qm,x,th);sec+=now_sec()-t;}printf("PROBE dense mode=%s-q8w32-f32a threads=%d us=%.3f GB/s=%.2f rel_l2=%.3e cosine=%.8f %s\n",label,th,sec/10*1e6,bytes/(sec/10)/1e9,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");}
     probe_free(q);probe_free(out);probe_free(eb);return !isfinite(rel)||!isfinite(cos);
 }
-static int q8pv16_f32_projection(const matrix*m,const float*x,const float*ref,int threads,const char*label){
+static int q8pv16_f32_projection(const matrix*m,const float*x,const float*ref,int threads,const char*label,float*selected_clip){
     size_t bytes=k3_q8pv16_matrix_bytes(m->rows,m->cols);uint8_t*q=probe_alloc(bytes);float*out=probe_alloc((size_t)m->rows*4);size_t en=(size_t)192*1024*1024/4;float*eb=probe_calloc(en,4);if(!q||!out||!eb)return 1;
-    k3_q8pv16_quantize_bf16(q,m->weight,m->rows,m->cols);k3_q8pv_matrix qm={q,m->rows,m->cols};k3_matvec_q8pv16_f32(out,&qm,x,threads);
-    double se=0,sr=0,dot=0,so=0;for(int i=0;i<m->rows;++i){double a=out[i],b=ref[i],d=a-b;se+=d*d;sr+=b*b;dot+=a*b;so+=a*a;}double rel=sqrt(se/(sr+1e-30)),cos=dot/sqrt((sr+1e-30)*(so+1e-30));
-    float*tx=probe_alloc((size_t)m->cols*4),*tr=probe_alloc((size_t)m->rows*4);if(!tx||!tr)return 1;
-    for(int trial=1;trial<8;++trial){for(int i=0;i<m->cols;++i)tx[i]=rnd()*.125f;mv(tr,m,tx,threads);k3_matvec_q8pv16_f32(out,&qm,tx,threads);se=sr=dot=so=0;for(int i=0;i<m->rows;++i){double a=out[i],b=tr[i],d=a-b;se+=d*d;sr+=b*b;dot+=a*b;so+=a*a;}double rr=sqrt(se/(sr+1e-30)),cc=dot/sqrt((sr+1e-30)*(so+1e-30));if(rr>rel)rel=rr;if(cc<cos)cos=cc;}
-    printf("[dense-q8w16-%s] activations=8 worst_rel_l2=%.3e min_cosine=%.8f %s\n",label,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");int ts[]={36,40,44,47,48};
+    k3_q8pv_matrix qm={q,m->rows,m->cols};
+    float*tx=probe_alloc((size_t)8*m->cols*4),*tr=probe_alloc((size_t)8*m->rows*4);if(!tx||!tr)return 1;
+    memcpy(tx,x,(size_t)m->cols*4);memcpy(tr,ref,(size_t)m->rows*4);
+    for(int trial=1;trial<8;++trial){float*xt=tx+(size_t)trial*m->cols,*rt=tr+(size_t)trial*m->rows;for(int i=0;i<m->cols;++i)xt[i]=rnd()*.125f;mv(rt,m,xt,threads);}
+    const float clips[]={.96f,.98f,1.0f};double rel=1e9,cos=0;float best_clip=1;
+    for(int ci=0;ci<3;++ci){k3_q8pv16_quantize_bf16_clip(q,m->weight,m->rows,m->cols,clips[ci]);double worst=0,min_cos=1;
+        for(int trial=0;trial<8;++trial){const float*xt=tx+(size_t)trial*m->cols,*rt=tr+(size_t)trial*m->rows;k3_matvec_q8pv16_f32(out,&qm,xt,threads);double se=0,sr=0,dot=0,so=0;for(int i=0;i<m->rows;++i){double a=out[i],b=rt[i],d=a-b;se+=d*d;sr+=b*b;dot+=a*b;so+=a*a;}double rr=sqrt(se/(sr+1e-30)),cc=dot/sqrt((sr+1e-30)*(so+1e-30));if(rr>worst)worst=rr;if(cc<min_cos)min_cos=cc;}
+        printf("[dense-q8w16-%s] clip=%.2f worst_rel_l2=%.3e min_cosine=%.8f\n",label,clips[ci],worst,min_cos);if(worst<rel){rel=worst;cos=min_cos;best_clip=clips[ci];}}
+    k3_q8pv16_quantize_bf16_clip(q,m->weight,m->rows,m->cols,best_clip);
+    if(selected_clip)*selected_clip=best_clip;
+    printf("[dense-q8w16-%s] activations=8 best_clip=%.2f worst_rel_l2=%.3e min_cosine=%.8f %s\n",label,best_clip,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");int ts[]={36,40,44,47,48};
     int nt=perf_threads?1:5;for(int ti=0;ti<nt;++ti){int th=perf_threads?perf_threads:ts[ti];double sec=0,samples[256];for(int it=0;it<perf_reps;++it){evict(eb,en,th);double t=now_sec();k3_matvec_q8pv16_f32(out,&qm,x,th);samples[it]=now_sec()-t;sec+=samples[it];}double mean=sec/perf_reps,p95=sample_percentile(samples,perf_reps,.95);printf("PROBE dense mode=%s-q8w16-f32a threads=%d us=%.3f GB/s=%.2f p95_us=%.3f floor_GB/s=%.2f rel_l2=%.3e cosine=%.8f %s\n",label,th,mean*1e6,bytes/mean/1e9,p95*1e6,bytes/p95/1e9,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");}
+    if(!strcmp(label,"up")){size_t window=bytes<((size_t)16<<20)?bytes:(size_t)16<<20;double sec=0,samples[256];uint64_t sink=0;int th=perf_threads?perf_threads:K3_Q8W16_UP_THREADS;for(int it=0;it<perf_reps;++it){evict(eb,en,th);double t=now_sec();sink+=k3_prefetch_weight_window(q,window,th);samples[it]=now_sec()-t;sec+=samples[it];}double mean=sec/perf_reps,p95=sample_percentile(samples,perf_reps,.95);printf("PROBE dense mode=up-q8w16-prefetch threads=%d MiB=%.2f us=%.3f GB/s=%.2f p95_us=%.3f floor_GB/s=%.2f checksum=%llu\n",th,window/1048576.0,mean*1e6,window/mean/1e9,p95*1e6,window/p95/1e9,(unsigned long long)sink);}
     probe_free(q);probe_free(out);probe_free(eb);probe_free(tx);probe_free(tr);return !isfinite(rel)||!isfinite(cos);
+}
+static int q8pv8_f32_projection(const matrix*m,const float*x,const float*ref,int threads,const char*label){
+    size_t bytes=k3_q8pv8_matrix_bytes(m->rows,m->cols);uint8_t*q=probe_alloc(bytes);float*out=probe_alloc((size_t)m->rows*4);if(!q||!out)return 1;
+    k3_q8pv8_quantize_bf16(q,m->weight,m->rows,m->cols);k3_q8pv_matrix qm={q,m->rows,m->cols};double rel=0,cos=1;
+    float*tx=probe_alloc((size_t)m->cols*4),*tr=probe_alloc((size_t)m->rows*4);if(!tx||!tr)return 1;
+    for(int trial=0;trial<8;++trial){const float*xt=x;const float*rt=ref;if(trial){for(int i=0;i<m->cols;++i)tx[i]=rnd()*.125f;mv(tr,m,tx,threads);xt=tx;rt=tr;}k3_matvec_q8pv8_f32(out,&qm,xt,threads);double se=0,sr=0,dot=0,so=0;for(int i=0;i<m->rows;++i){double a=out[i],b=rt[i],d=a-b;se+=d*d;sr+=b*b;dot+=a*b;so+=a*a;}double rr=sqrt(se/(sr+1e-30)),cc=dot/sqrt((sr+1e-30)*(so+1e-30));if(rr>rel)rel=rr;if(cc<cos)cos=cc;}
+    printf("[dense-q8w8-%s] activations=8 worst_rel_l2=%.3e min_cosine=%.8f %s\n",label,rel,cos,rel<5e-3&&cos>=.99995?"GATE-PASS":"GATE-REJECT");
+    probe_free(q);probe_free(out);probe_free(tx);probe_free(tr);return !isfinite(rel)||!isfinite(cos)||rel>=5e-3||cos<.99995;
 }
 static int bf16pv_projection(const matrix*m,const float*x,const float*ref,int threads,const char*label){
     size_t n=(size_t)m->rows*m->cols;uint16_t*pv=probe_alloc(n*2);float*out=probe_alloc((size_t)m->rows*4);size_t en=(size_t)192*1024*1024/4;float*eb=probe_calloc(en,4);if(!pv||!out||!eb)return 1;k3_pack_bf16_pv(pv,m->weight,m->rows,m->cols);k3_matvec_bf16_pv(out,pv,m->rows,m->cols,x,threads);
@@ -274,10 +289,33 @@ static int q8_correctness_perf(const matrix *r, const matrix *d, const float *x,
     return !isfinite(rel) || !isfinite(cosine);
 }
 static int q8w16_pair_perf(const matrix*r,const matrix*d,const float*x,
-        const float*down_ref,int threads){size_t bytes=k3_q8pv16_matrix_bytes(d->rows,d->cols);uint8_t*q=probe_alloc(bytes);float*out=probe_alloc((size_t)d->rows*4),*router=probe_alloc((size_t)r->rows*4);size_t en=(size_t)192*1024*1024/4;float*eb=probe_calloc(en,4);if(!q||!out||!router||!eb)return 1;
-    k3_q8pv16_quantize_bf16(q,d->weight,d->rows,d->cols);k3_q8pv_matrix qm={q,d->rows,d->cols};k3_dense_router_bf16_down_q8w16(router,out,r,&qm,x,threads);double se=0,sr=0;for(int i=0;i<d->rows;++i){double z=out[i]-down_ref[i];se+=z*z;sr+=(double)down_ref[i]*down_ref[i];}double rel=sqrt(se/(sr+1e-30));int ts[]={36,40,44,47,48};
-    int nt=perf_threads?1:5;for(int ti=0;ti<nt;++ti){int th=perf_threads?perf_threads:ts[ti];double sec=0,samples[256];for(int it=0;it<perf_reps;++it){evict(eb,en,th);double t=now_sec();k3_dense_router_bf16_down_q8w16(router,out,r,&qm,x,th);samples[it]=now_sec()-t;sec+=samples[it];}double mean=sec/perf_reps,p95=sample_percentile(samples,perf_reps,.95);double traffic=bytes+2.0*r->rows*r->cols;printf("PROBE dense mode=router-bf16+down-q8w16 threads=%d us=%.3f GB/s=%.2f p95_us=%.3f floor_GB/s=%.2f rel_l2=%.3e\n",th,mean*1e6,traffic/mean/1e9,p95*1e6,traffic/p95/1e9,rel);}
-    probe_free(q);probe_free(out);probe_free(router);probe_free(eb);return !isfinite(rel);
+        const float*router_ref,const float*down_ref,int threads){
+    size_t rb=k3_q8pv8_matrix_bytes(r->rows,r->cols);
+    size_t db=k3_q8pv16_matrix_bytes(d->rows,d->cols);
+    uint8_t*rq=probe_alloc(rb),*dq=probe_alloc(db);
+    float*out=probe_alloc((size_t)d->rows*4),*router=probe_alloc((size_t)r->rows*4);
+    size_t en=(size_t)192*1024*1024/4;float*eb=probe_calloc(en,4);
+    if(!rq||!dq||!out||!router||!eb)return 1;
+    k3_q8pv8_quantize_bf16(rq,r->weight,r->rows,r->cols);
+    k3_q8pv16_quantize_bf16(dq,d->weight,d->rows,d->cols);
+    k3_q8pv_matrix rqm={rq,r->rows,r->cols},dqm={dq,d->rows,d->cols};
+    k3_dense_router_q8w8_down_q8w16(router,out,&rqm,&dqm,x,threads);
+    double rse=0,rsr=0,dse=0,dsr=0;
+    for(int i=0;i<r->rows;++i){double z=router[i]-router_ref[i];rse+=z*z;rsr+=(double)router_ref[i]*router_ref[i];}
+    for(int i=0;i<d->rows;++i){double z=out[i]-down_ref[i];dse+=z*z;dsr+=(double)down_ref[i]*down_ref[i];}
+    double rrel=sqrt(rse/(rsr+1e-30)),drel=sqrt(dse/(dsr+1e-30));
+    printf("[dense-q8w16-router+down] router_rel_l2=%.3e down_rel_l2=%.3e %s\n",
+        rrel,drel,rrel<5e-3&&drel<5e-3?"GATE-PASS":"GATE-REJECT");
+    int ts[]={36,40,44,47,48};int nt=perf_threads?1:5;
+    for(int ti=0;ti<nt;++ti){int th=perf_threads?perf_threads:ts[ti];double sec=0,samples[256];
+        for(int it=0;it<perf_reps;++it){evict(eb,en,th);double t=now_sec();
+            k3_dense_router_q8w8_down_q8w16(router,out,&rqm,&dqm,x,th);
+            samples[it]=now_sec()-t;sec+=samples[it];}
+        double mean=sec/perf_reps,p95=sample_percentile(samples,perf_reps,.95),traffic=rb+db;
+        printf("PROBE dense mode=router-q8w8+down-q8w16 threads=%d us=%.3f GB/s=%.2f p95_us=%.3f floor_GB/s=%.2f router_rel_l2=%.3e down_rel_l2=%.3e\n",
+            th,mean*1e6,traffic/mean/1e9,p95*1e6,traffic/p95/1e9,rrel,drel);}
+    probe_free(rq);probe_free(dq);probe_free(out);probe_free(router);probe_free(eb);
+    return !isfinite(rrel)||!isfinite(drel)||rrel>=5e-3||drel>=5e-3;
 }
 int main(int argc, char **argv) {
     const char *blob_path=NULL,*manifest_path=NULL,*only=NULL;
@@ -324,19 +362,25 @@ int main(int argc, char **argv) {
     }
     if (only && !strcmp(only, "q8w16down")) {
         matrix down = {(uint16_t *)(b + de->offset), de->rows, de->cols};
+        matrix router = {(uint16_t *)(b + re->offset), re->rows, re->cols};
         float *dx = probe_alloc((size_t)down.cols * 4);
         float *dref = probe_alloc((size_t)down.rows * 4);
-        if(!dx||!dref){k3_pool_destroy(&probe_pool);
+        float *rref = probe_alloc((size_t)router.rows * 4);
+        if(!dx||!dref||!rref){k3_pool_destroy(&probe_pool);
             return 2;
         }
         for (int i = 0; i < down.cols; ++i)
             dx[i] = rnd() * .125f;
         mv(dref, &down, dx, 47);
-        int bad = q8pv16_f32_projection(&down, dx, dref, 47, "down");
-        matrix router = {(uint16_t *)(b + re->offset), re->rows, re->cols};
-        bad |= q8w16_pair_perf(&router, &down, dx, dref, 47);
+        mv(rref, &router, dx, 47);
+        int bad = q8pv16_f32_projection(&down, dx, dref, 47, "down",NULL);
+        float router_clip=1.0f;
+        (void)q8pv16_f32_projection(&router, dx, rref, 47, "router",&router_clip);
+        bad |= q8pv8_f32_projection(&router, dx, rref, 47, "router");
+        bad |= q8w16_pair_perf(&router, &down, dx, rref, dref,47);
         probe_free(dx);
         probe_free(dref);
+        probe_free(rref);
         probe_free(b);k3_pool_destroy(&probe_pool);
         return bad;
     }
@@ -353,7 +397,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < up.cols; ++i)
             ux[i] = rnd() * .125f;
         mv(uref, &up, ux, 47);
-        int bad = q8pv16_f32_projection(&up, ux, uref, 47, "up");
+        int bad = q8pv16_f32_projection(&up, ux, uref, 47, "up",NULL);
         probe_free(ux);
         probe_free(uref);
         probe_free(b);k3_pool_destroy(&probe_pool);
@@ -383,9 +427,12 @@ int main(int argc, char **argv) {
     }
     int q8_fail = q8_correctness_perf(&r, &d, x, down_ref, 47);
     q8_fail |= q8p16_projection(&d,x,down_ref,47,"down");
-    q8_fail |= q8pv16_f32_projection(&d,x,down_ref,47,"down");
-    q8_fail |= q8w16_pair_perf(&r,&d,x,down_ref,47);
-    if(ue){matrix up={(uint16_t*)(b+ue->offset),ue->rows,ue->cols};float*ux=probe_alloc((size_t)up.cols*4),*uref=probe_alloc((size_t)up.rows*4);if(!ux||!uref){k3_pool_destroy(&probe_pool);return 2;}for(int i=0;i<up.cols;++i)ux[i]=rnd()*.125f;mv(uref,&up,ux,47);q8_fail|=q8_projection(&up,ux,uref,47,"up");q8_fail|=q8p16_projection(&up,ux,uref,47,"up");q8_fail|=mxfp4_projection(&up,ux,uref,47,"up");q8_fail|=q8pv_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_f32_projection(&up,ux,uref,47,"up");q8_fail|=q8pv16_f32_projection(&up,ux,uref,47,"up");q8_fail|=bf16pv_projection(&up,ux,uref,47,"up");probe_free(ux);probe_free(uref);}
+    q8_fail |= q8pv16_f32_projection(&d,x,down_ref,47,"down",NULL);
+    float router_clip=1.0f;
+    (void)q8pv16_f32_projection(&r,x,yr,47,"router",&router_clip);
+    q8_fail |= q8pv8_f32_projection(&r,x,yr,47,"router");
+    q8_fail |= q8w16_pair_perf(&r,&d,x,yr,down_ref,47);
+    if(ue){matrix up={(uint16_t*)(b+ue->offset),ue->rows,ue->cols};float*ux=probe_alloc((size_t)up.cols*4),*uref=probe_alloc((size_t)up.rows*4);if(!ux||!uref){k3_pool_destroy(&probe_pool);return 2;}for(int i=0;i<up.cols;++i)ux[i]=rnd()*.125f;mv(uref,&up,ux,47);q8_fail|=q8_projection(&up,ux,uref,47,"up");q8_fail|=q8p16_projection(&up,ux,uref,47,"up");q8_fail|=mxfp4_projection(&up,ux,uref,47,"up");q8_fail|=q8pv_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_projection(&up,ux,uref,47,"up");q8_fail|=q8pv32_f32_projection(&up,ux,uref,47,"up");q8_fail|=q8pv16_f32_projection(&up,ux,uref,47,"up",NULL);q8_fail|=bf16pv_projection(&up,ux,uref,47,"up");probe_free(ux);probe_free(uref);}
     probe_free(down_ref);
     probe_free(x);
     probe_free(yr);
