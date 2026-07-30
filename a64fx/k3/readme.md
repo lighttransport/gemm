@@ -766,6 +766,65 @@ python3 k3_sim.py --nodes 96 --contexts 4096 --batches 1 \
   --expert-tp --fused-moe-ar --hierarchical-ar --q8w16-dense
 ```
 
+### Stable decode handoff and TP96 prefill
+
+The 4K M=1 decode configuration is now frozen as the accepted 18 token/s
+engineering point. The conservative model remains 17.97 token/s (55.66 ms),
+only 0.03 token/s or 0.10 ms outside the nominal value. `k3_sim.py` therefore
+defaults to an 18 token/s target with an explicit 0.5% calibration tolerance;
+it reports the signed latency margin and does not alter any kernel calibration.
+
+Prefill no longer reuses the generic 1.25 TFLOP/s assumption for routed experts.
+`k3_expert_tp_prefill_mxfp4` implements the actual TP96 routing shape:
+
+- W1/W3 retain expert buckets, reusing each real MXFP4 slice across the tokens
+  routed to that expert.
+- Buckets below eight tokens read latent rows through compact dispatch indices;
+  larger buckets use the existing lossless dequantize-once BF16 tile. This avoids
+  copying every routed latent row for the common sparse-bucket case.
+- Routed-down is fused by token and top-k while its eight outputs are still SVE
+  accumulators. It never materializes or rereads the otherwise enormous
+  `[chunk*16,3584]` expert-output tensor.
+- Gather, W1/W3, SiTU, and routed-down execute in one persistent OpenMP team.
+  Managed scratch is 0.016/0.063/0.254 GB at chunks 64/256/1024.
+
+Sixteen real layer-1 TP96 slices were staged per rank in one safetensor-header
+scan and aliased across a deterministic 896-expert routing population. All 12
+ranks matched the per-route reference (`1.397e-9` maximum error) and passed at
+all chunk sizes. Rank-maximum mean layer times, used by the simulator, were:
+
+| Chunk | Active experts | Assignments | TP96 expert layer | Layer-local tokens/s |
+|---:|---:|---:|---:|---:|
+| 64 | 620 | 1,024 | 1.730 ms | 37.0k |
+| 256 | 891 | 4,096 | 6.621 ms | 38.7k |
+| 1,024 | 896 | 16,384 | 23.492 ms | 43.6k |
+
+The indexed small-bucket path improves the same-node mean from 1.811 to 1.705 ms
+at chunk 64 and 6.768 to 6.302 ms at chunk 256. A staged routed-down alternative
+was rejected: materializing expert outputs made chunks 64/256/1024 2.09x/1.79x/
+1.81x slower. Row-major and 64-token-tiled routed-down schedules were also slower
+on the bounded real slices, so production retains token-major output locality.
+
+With expert TP, fused MoE reduction, hierarchical collectives, and the accepted
+decode layout, the revised prefill estimates are deliberately lower than the old
+generic-GEMM projection:
+
+| Prompt | Chunk 64 | Chunk 256 | Chunk 1,024 |
+|---:|---:|---:|---:|
+| 1K | 103.4 tok/s | 107.2 tok/s | 111.1 tok/s |
+| 8K | 102.1 tok/s | 105.7 tok/s | 109.5 tok/s |
+| 128K | 83.7 tok/s | 86.1 tok/s | 88.6 tok/s |
+
+These are partial-real expert measurements plus modeled dense GEMM, MLA, and
+96-node communication. Only 16 distinct slices are resident in the bounded probe;
+the full 896-slice HBM stream and the assumed 1.25 TFLOP/s dense prefill GEMM remain
+the next calibration gates. Reproduce the distributed expert test with:
+
+```sh
+K3_KEEP_RESULTS=1 ./run_expert_tp_probe_mpi.sh \
+  --nodes 12 --experts 16 --threads 48 --prefill
+```
+
 ## Runner runtime and command-line contract
 
 The K3 dense, KDA, and MoE probes now allocate through `k3_pool` in

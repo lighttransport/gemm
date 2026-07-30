@@ -1,6 +1,7 @@
 #ifndef K3_MOE_H
 #define K3_MOE_H
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -308,6 +309,30 @@ static inline void k3_mxfp4_group_svtbl(float *y, int ystride,
 #endif
 }
 
+/* Small routed buckets do not repay a full latent gather. Keep the same 2-token
+ * microkernel but take token rows through the compact dispatch index. */
+static inline void k3_mxfp4_group_svtbl_indexed(float *y,int ystride,
+        const uint8_t*w,const uint8_t*s,const float*x,int xstride,
+        const int*token_ids,int batch,int k){
+    size_t rb=(size_t)k/2,sb=(size_t)k/32;
+    const uint8_t*w0=w,*w1=w+rb,*w2=w+2*rb,*w3=w+3*rb;
+    const uint8_t*w4=w+4*rb,*w5=w+5*rb,*w6=w+6*rb,*w7=w+7*rb;
+    const uint8_t*s0=s,*s1=s+sb,*s2=s+2*sb,*s3=s+3*sb;
+    const uint8_t*s4=s+4*sb,*s5=s+5*sb,*s6=s+6*sb,*s7=s+7*sb;int m=0;
+    for(;m+1<batch;m+=2)matvec_mxfp4_8row_2x(y+(size_t)m*ystride,
+        y+(size_t)(m+1)*ystride,w0,w1,w2,w3,w4,w5,w6,w7,
+        s0,s1,s2,s3,s4,s5,s6,s7,x+(size_t)token_ids[m]*xstride,
+        x+(size_t)token_ids[m+1]*xstride,k);
+    for(;m<batch;++m)
+#if defined(__ARM_FEATURE_SVE)
+        k3_matvec_mxfp4_8row(y+(size_t)m*ystride,w0,w1,w2,w3,w4,w5,w6,w7,
+            s0,s1,s2,s3,s4,s5,s6,s7,x+(size_t)token_ids[m]*xstride,k);
+#else
+        matvec_mxfp4_8row(y+(size_t)m*ystride,w0,w1,w2,w3,w4,w5,w6,w7,
+            s0,s1,s2,s3,s4,s5,s6,s7,x+(size_t)token_ids[m]*xstride,k);
+#endif
+}
+
 #if defined(__ARM_FEATURE_SVE)
 /* Dequantize each 8-row MXFP4 tile once to an L1-resident BF16 pair-vector
  * panel, then reuse it for three tokens at a time.  This is lossless in weight
@@ -501,7 +526,114 @@ static inline void k3_expert_tp_down32_selected_sve(float *out,
     out[0]=svaddv(pg,a0);out[1]=svaddv(pg,a1);out[2]=svaddv(pg,a2);out[3]=svaddv(pg,a3);
     out[4]=svaddv(pg,a4);out[5]=svaddv(pg,a5);out[6]=svaddv(pg,a6);out[7]=svaddv(pg,a7);
 }
+
+/* Prefill form of the TP=96 routed-down kernel. Expert activations are packed
+ * by dispatch position rather than by expert id; fuse the top-k weighted sum
+ * directly so no [assignments,7168] expert-output buffer or scatter pass is
+ * required. */
+static inline void k3_expert_tp_down32_routed_sve(float *out,
+        const k3_mxfp4_matrix *w2,const int *route_experts,
+        const int *positions,const float *route_weight,int topk,
+        const float *gate,int row){
+    svbool_t pg=svptrue_b32();svfloat32_t kv=svld1(pg,ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+    for(int k=0;k<topk;++k){int e=route_experts[k],pos=positions[k];
+        const uint8_t*w=w2[e].packed+(size_t)row*16;
+        const uint8_t*s=w2[e].scale+row;const float*x=gate+(size_t)pos*32;
+        svfloat32_t xl=svld1(pg,x),xh=svld1(pg,x+16);float rw=route_weight[k];
+#define K3_TP_PREFILL_DOWN_ROW(R,A) do{svuint32_t z=svld1ub_u32(pg,w+(size_t)(R)*16); \
+        svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
+        svfloat32_t p=svmul_f32_x(pg,svtbl_f32(kv,lo),xl); \
+        p=svmla_f32_x(pg,p,svtbl_f32(kv,hi),xh); \
+        A=svmla_n_f32_x(pg,A,p,rw*ggml_e8m0_to_fp32(s[R]));}while(0)
+        K3_TP_PREFILL_DOWN_ROW(0,a0);K3_TP_PREFILL_DOWN_ROW(1,a1);
+        K3_TP_PREFILL_DOWN_ROW(2,a2);K3_TP_PREFILL_DOWN_ROW(3,a3);
+        K3_TP_PREFILL_DOWN_ROW(4,a4);K3_TP_PREFILL_DOWN_ROW(5,a5);
+        K3_TP_PREFILL_DOWN_ROW(6,a6);K3_TP_PREFILL_DOWN_ROW(7,a7);
+#undef K3_TP_PREFILL_DOWN_ROW
+    }
+    out[0]=svaddv(pg,a0);out[1]=svaddv(pg,a1);out[2]=svaddv(pg,a2);out[3]=svaddv(pg,a3);
+    out[4]=svaddv(pg,a4);out[5]=svaddv(pg,a5);out[6]=svaddv(pg,a6);out[7]=svaddv(pg,a7);
+}
 #endif
+
+/* Expert-TP prefill over a token chunk. W1/W3 retain expert buckets so their
+ * long-K weights are reused across routed tokens. W2 is fused by token/top-k,
+ * eliminating the otherwise dominant expert-output materialization. Scratch:
+ * counts[nexpert], offsets[nexpert+1], positions/token_ids[batch*topk],
+ * gathered[batch*topk,7168], gate/up[batch*topk,local]. */
+static inline int k3_expert_tp_prefill_mxfp4(float *partial,
+        const k3_mxfp4_matrix *w1,const k3_mxfp4_matrix *w2,
+        const k3_mxfp4_matrix *w3,int nexpert,const int *route_experts,
+        const float *route_weight,int batch,int topk,const float *latent,
+        int *counts,int *offsets,int *positions,int *token_ids,float *gathered,
+        float *gate,float *up,int threads,int tile_threshold){
+    if(!partial||!route_experts||!route_weight||!latent||!counts||!offsets||
+        !positions||!token_ids||!gathered||!gate||!up||nexpert<1||nexpert>4096||
+        batch<1||topk<1||topk>nexpert||batch>INT_MAX/topk||threads<1||
+        !k3_expert_tp_selected_layout_valid(w1,w2,w3,nexpert))return-1;
+    int local=w1[0].rows;if(local!=K3_EXPERT_TP_BLOCK)return-1;
+    memset(counts,0,(size_t)nexpert*sizeof(*counts));
+    for(int i=0;i<batch*topk;++i){int e=route_experts[i];if(e<0||e>=nexpert)return-1;counts[e]++;}
+    offsets[0]=0;for(int e=0;e<nexpert;++e)offsets[e+1]=offsets[e]+counts[e];
+    int cursor[nexpert];memcpy(cursor,offsets,(size_t)nexpert*sizeof(*cursor));
+    for(int i=0;i<batch*topk;++i){int pos=cursor[route_experts[i]]++;positions[i]=pos;token_ids[pos]=i/topk;}
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+#endif
+    for(int i=0;i<batch*topk;++i){int e=route_experts[i];if(tile_threshold>0&&counts[e]>=tile_threshold)
+        memcpy(gathered+(size_t)positions[i]*K3_LATENT,
+            latent+(size_t)(i/topk)*K3_LATENT,(size_t)K3_LATENT*sizeof(float));}
+    int g13=local/8;
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int task=0;task<nexpert*g13;++task){int e=task/g13,r=(task%g13)*8,m=counts[e];if(!m)continue;
+        size_t wr=(size_t)K3_LATENT/2,sr=(size_t)K3_LATENT/32;
+        float*g=gate+(size_t)offsets[e]*local+r,*u=up+(size_t)offsets[e]*local+r;
+        if(tile_threshold>0&&m>=tile_threshold){const float*x=gathered+(size_t)offsets[e]*K3_LATENT;
+            k3_mxfp4_group_batch(g,local,w1[e].packed+(size_t)r*wr,
+                w1[e].scale+(size_t)r*sr,x,K3_LATENT,m,K3_LATENT,tile_threshold);
+            k3_mxfp4_group_batch(u,local,w3[e].packed+(size_t)r*wr,
+                w3[e].scale+(size_t)r*sr,x,K3_LATENT,m,K3_LATENT,tile_threshold);
+        }else{const int*ids=token_ids+offsets[e];
+            k3_mxfp4_group_svtbl_indexed(g,local,w1[e].packed+(size_t)r*wr,
+                w1[e].scale+(size_t)r*sr,latent,K3_LATENT,ids,m,K3_LATENT);
+            k3_mxfp4_group_svtbl_indexed(u,local,w3[e].packed+(size_t)r*wr,
+                w3[e].scale+(size_t)r*sr,latent,K3_LATENT,ids,m,K3_LATENT);}}
+#if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
+    {int total=batch*topk*local,vl=(int)svcntw();
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int i=0;i<total;i+=vl)k3_situ_fast_sve(gate+i,gate+i,up+i,total-i<vl?total-i:vl);}
+#else
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int i=0;i<batch*topk*local;++i)gate[i]=4.0f*tanhf(gate[i]*.25f)*
+        k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
+#endif
+    int g2=K3_LATENT/8;
+#if defined(__ARM_FEATURE_SVE)
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for(int task=0;task<batch*g2;++task){int t=task/g2,row=(task%g2)*8;
+        k3_expert_tp_down32_routed_sve(partial+(size_t)t*K3_LATENT+row,w2,
+            route_experts+(size_t)t*topk,positions+(size_t)t*topk,
+            route_weight+(size_t)t*topk,topk,gate,row);}
+#else
+    (void)partial;return-1;
+#endif
+#if defined(_OPENMP)
+    }
+#endif
+    return 0;
+}
 
 /* Orphaned workshares: every thread in an existing OpenMP team must call it. */
 static inline void k3_expert_tp_forward_selected_team_mxfp4(

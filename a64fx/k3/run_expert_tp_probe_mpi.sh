@@ -9,10 +9,11 @@ model_dir="$HOME/models/kimi-k3"
 layer=1
 experts=16
 threads=48
+prefill=0
 
 usage() {
     echo "usage: $0 [--nodes N] [--result-dir DIR] [--model-dir DIR]" >&2
-    echo "          [--layer N] [--experts N] [--threads N]" >&2
+    echo "          [--layer N] [--experts N] [--threads N] [--prefill]" >&2
 }
 need_value() {
     if [ "$#" -lt 2 ]; then
@@ -29,6 +30,7 @@ while [ "$#" -gt 0 ]; do
         --layer) need_value "$@"; layer=$2; shift 2 ;;
         --experts) need_value "$@"; experts=$2; shift 2 ;;
         --threads) need_value "$@"; threads=$2; shift 2 ;;
+        --prefill) prefill=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -60,12 +62,12 @@ mpiexec -n "$nodes" -of-proc "$result_prefix" \
     -x OMP_PROC_BIND=close -x OMP_PLACES=cores \
     -x XOS_MMM_L_PAGING_POLICY=demand:demand:demand \
     "$script_dir/run_expert_tp_probe_rank.sh" "$script_dir" "$nodes" "$job_tag" \
-    "$model_dir" "$layer" "$experts" "$threads"
+    "$model_dir" "$layer" "$experts" "$threads" "$prefill"
 
 passes=$(grep -l 'K3 expert-TP probe: PASS' "$result_prefix".* | wc -l)
 if [ "$passes" -ne "$nodes" ]; then
     echo "K3 expert-TP probe: FAIL ($passes/$nodes ranks passed)" >&2
     exit 1
 fi
-grep 'PROBE expert-tp-selected' "$result_prefix".*
+if [ "$prefill" -eq 1 ]; then grep 'PROBE expert-tp-prefill' "$result_prefix".*; else grep 'PROBE expert-tp-selected' "$result_prefix".*; fi
 echo "K3 multi-node expert-TP probe: PASS ($passes/$nodes ranks)"

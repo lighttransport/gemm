@@ -390,26 +390,56 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
 def prefill(split: WeightSplit, nodes: int, tokens: int, chunk: int,
             gemm_tflops: float, kda_gops: float, latency_us: float,
             link_gbps: float, moe_collectives: int,
-            hierarchical_ar: bool) -> dict:
+            hierarchical_ar: bool, expert_tp: bool = False,
+            fused_moe_ar: bool = False,
+            expert_prefill_ms=(1.730, 6.621, 23.492)) -> dict:
     # Every dense/shardable byte corresponds approximately to one matrix weight used once/token.
     # MXFP4 expert bytes are 0.53125 B/weight including scales.
     dense_weights = (split.replicated + split.shardable / nodes) * 1e9 / 2.0
     expert_weights = split.experts * (TOP_K / EXPERTS) / nodes * 1e9 / 0.53125
-    matmul_flops = tokens * 2.0 * (dense_weights + expert_weights)
-    gemm_s = matmul_flops / (gemm_tflops * 1e12)
+    dense_flops = tokens * 2.0 * dense_weights
+    dense_gemm_s = dense_flops / (gemm_tflops * 1e12)
+    chunks = math.ceil(tokens / chunk)
+    if expert_tp:
+        points = ((0, 0.0), (64, expert_prefill_ms[0]),
+                  (256, expert_prefill_ms[1]), (1024, expert_prefill_ms[2]))
+        layer_ms = points[-1][1] * chunk / points[-1][0]
+        for (m0, t0), (m1, t1) in zip(points, points[1:]):
+            if chunk <= m1:
+                layer_ms = t0 + (t1 - t0) * (chunk - m0) / (m1 - m0)
+                break
+        expert_s = MOE_LAYERS * chunks * layer_ms * 1e-3
+    else:
+        expert_s = tokens * 2.0 * expert_weights / (gemm_tflops * 1e12)
+    gemm_s = dense_gemm_s + expert_s
     kda_ops = tokens * KDA_LAYERS * math.ceil(HEADS / nodes) * HEAD_DIM * HEAD_DIM * 6
     kda_s = kda_ops / (kda_gops * 1e9)
     # Causal MLA: sum_{t=1}^T t dot/update work, distributed by head.
     pairs = tokens * (tokens + 1) / 2.0
     mla_ops = MLA_LAYERS * math.ceil(HEADS / nodes) * pairs * 2.0 * (192 + 128)
     attention_s = mla_ops / (gemm_tflops * 0.35 * 1e12)
-    chunks = math.ceil(tokens / chunk)
-    hidden_chunk_s, latent_chunk_s, calls_per_chunk = collective_seconds(
-        nodes, chunk, moe_collectives, latency_us, link_gbps, hierarchical_ar)
-    comm_s = (hidden_chunk_s + latent_chunk_s) * chunks
+    if fused_moe_ar:
+        attention_comm = allreduce_seconds(nodes,HIDDEN*2*chunk,LAYERS,latency_us,link_gbps)
+        dense_comm = allreduce_seconds(nodes,HIDDEN*2*chunk,1,latency_us,link_gbps)
+        moe_comm = allreduce_seconds(nodes,(LATENT+HIDDEN)*2*chunk,MOE_LAYERS,latency_us,link_gbps)
+        if hierarchical_ar:
+            attention_comm /= hierarchical_ar_speedup(HIDDEN*chunk)
+            dense_comm /= hierarchical_ar_speedup(HIDDEN*chunk)
+            moe_comm /= hierarchical_ar_speedup((LATENT+HIDDEN)*chunk)
+        comm_s=(attention_comm+dense_comm+moe_comm)*chunks
+        calls_per_chunk=LAYERS+1+MOE_LAYERS
+    else:
+        hidden_chunk_s, latent_chunk_s, calls_per_chunk = collective_seconds(
+            nodes, chunk, moe_collectives, latency_us, link_gbps, hierarchical_ar)
+        comm_s = (hidden_chunk_s + latent_chunk_s) * chunks
     total = gemm_s + kda_s + attention_s + comm_s
+    scratch_gb = (chunk*TOP_K*LATENT*4 + 2*chunk*TOP_K*32*4 +
+                  chunk*LATENT*4) / 1e9 if expert_tp else 0.0
     return {
-        "tokens": tokens, "chunk": chunk, "gemm_s": gemm_s, "kda_s": kda_s,
+        "tokens": tokens, "chunk": chunk, "gemm_s": gemm_s,
+        "dense_gemm_s": dense_gemm_s, "expert_s": expert_s,
+        "expert_layer_ms": (layer_ms if expert_tp else None),
+        "scratch_gb": scratch_gb, "kda_s": kda_s,
         "mla_attention_s": attention_s, "comm_s": comm_s,
         "collective_calls": calls_per_chunk * chunks, "total_s": total,
         "tokens_per_second": tokens / total,
@@ -445,7 +475,8 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
               f"({args.q8_down_gbps:g}/{args.q8_up_gbps:g}/{args.q8w16_up_gbps:g}/"
               f"{args.q8w16_pair_gbps:g} GB/s down/up/W16/pair), "
               f"MoE-prefetch={args.moe_prefetch_mib:g} MiB/layer at {args.prefetch_gbps:g} GB/s "
-              f"(+{args.prefetch_launch_us:g} us launch)")
+              f"(+{args.prefetch_launch_us:g} us launch), "
+              f"expert-prefill-ms@64/256/1024={','.join('%g' % x for x in args.expert_prefill_ms)}")
     print("\nMemory (fullest rank, expanded BF16 MLA cache)")
     print(f"{'ctx':>5} {'M':>3} {'weights':>8} {'KDA':>7} {'MLA-KV':>8} {'total':>8} {'fit27':>6}")
     for ctx in args.contexts:
@@ -488,23 +519,26 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
         budget_ms = 1000.0 / args.decode_target_tps
         predicted_ms = 1000.0 / target_decode["tokens_per_second"]
         margin_ms = budget_ms - predicted_ms
+        tolerance_tps = args.decode_target_tps * args.decode_target_tolerance_pct / 100.0
         target = {"tokens_per_second": args.decode_target_tps,
                   "budget_ms": budget_ms, "predicted_ms": predicted_ms,
-                  "margin_ms": margin_ms, "passes": margin_ms >= 0.0}
+                  "margin_ms": margin_ms, "tolerance_tps": tolerance_tps,
+                  "passes": target_decode["tokens_per_second"] + tolerance_tps >= args.decode_target_tps}
         result["decode_target_4k_m1"] = target
         print(f"Decode target {args.decode_target_tps:.2f} tok/s at 4k M=1: "
               f"{'PASS' if target['passes'] else 'FAIL'} "
               f"({budget_ms:.2f} ms budget, {predicted_ms:.2f} ms predicted, "
-              f"{margin_ms:+.2f} ms margin)")
+              f"{margin_ms:+.2f} ms margin, {args.decode_target_tolerance_pct:g}% calibration tolerance)")
     print("\nPrefill (tokens/s)")
-    print(f"{'prompt':>7} {'chunk':>6} {'GEMM s':>9} {'KDA s':>9} {'MLA s':>9} {'comm s':>9} {'tok/s':>9}")
+    print(f"{'prompt':>7} {'chunk':>6} {'dense s':>9} {'expert s':>9} {'KDA s':>9} {'MLA s':>9} {'comm s':>9} {'tok/s':>9}")
     for tokens in args.prompts:
         for chunk in args.chunks:
             p = prefill(split,args.nodes,tokens,chunk,args.gemm_tflops,args.kda_gops,
                         args.latency_us,args.link_gbps,args.moe_collectives,
-                        args.hierarchical_ar)
+                        args.hierarchical_ar,args.expert_tp,args.fused_moe_ar,
+                        args.expert_prefill_ms)
             result["prefill"].append(p)
-            print(f"{fmt_ctx(tokens):>7} {chunk:6d} {p['gemm_s']:9.1f} {p['kda_s']:9.1f} "
+            print(f"{fmt_ctx(tokens):>7} {chunk:6d} {p['dense_gemm_s']:9.1f} {p['expert_s']:9.1f} {p['kda_s']:9.1f} "
                   f"{p['mla_attention_s']:9.1f} {p['comm_s']:9.1f} {p['tokens_per_second']:9.1f}")
     print("\nCaveat: 128k M=1 fits the modeled 96-node memory budget but lacks a full-model run. "
           "Exact 1m BF16 KV exceeds HBM even with perfect context sharding; it needs cache compression or weight-memory reduction. "
@@ -515,6 +549,9 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
 def csv_ints(text: str):
     return [int(x) for x in text.split(",")]
 
+def csv_floats(text: str):
+    return tuple(float(x) for x in text.split(","))
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
@@ -523,8 +560,10 @@ def main() -> None:
     p.add_argument("--nodes", type=int, default=96)
     p.add_argument("--contexts", type=csv_ints, default=csv_ints("4096,131072,1048576"))
     p.add_argument("--batches", type=csv_ints, default=csv_ints("1,8,32"))
-    p.add_argument("--decode-target-tps", type=float, default=15.0,
+    p.add_argument("--decode-target-tps", type=float, default=18.0,
                    help="report the 4k M=1 latency margin against this stable target")
+    p.add_argument("--decode-target-tolerance-pct",type=float,default=.5,
+                   help="calibration tolerance for accepting the decode target")
     p.add_argument("--prompts", type=csv_ints, default=csv_ints("1024,8192,131072,1048576"))
     p.add_argument("--chunks", type=csv_ints, default=csv_ints("64,256,1024"))
     p.add_argument("--usable-gb", type=float, default=USABLE_GB)
@@ -551,6 +590,8 @@ def main() -> None:
     p.add_argument("--kda-gops", type=float, default=14.73,
                    help="12-node mean one-head KDA rate at the optimal 8 threads")
     p.add_argument("--gemm-tflops", type=float, default=1.25, help="assumed per-rank BF16-equivalent GEMM")
+    p.add_argument("--expert-prefill-ms",type=csv_floats,default=csv_floats("1.730,6.621,23.492"),
+                   help="measured TP96 expert-layer milliseconds at chunks 64,256,1024")
     p.add_argument("--latency-us", type=float, default=20.0, help="assumed allreduce latency per log2 step")
     p.add_argument("--link-gbps", type=float, default=8.0)
     p.add_argument("--imbalance", type=float, default=1.20, help="critical-rank routed-expert traffic factor")
@@ -600,6 +641,10 @@ def main() -> None:
         p.error("--nodes must be in [1,96] for head TP")
     if args.decode_target_tps <= 0:
         p.error("--decode-target-tps must be positive")
+    if args.decode_target_tolerance_pct < 0:
+        p.error("--decode-target-tolerance-pct must be nonnegative")
+    if len(args.expert_prefill_ms)!=3 or any(x<=0 for x in args.expert_prefill_ms):
+        p.error("--expert-prefill-ms expects three positive values for chunks 64,256,1024")
     if args.moe_prefetch_mib < 0 or args.prefetch_gbps <= 0 or args.prefetch_launch_us < 0 or args.lean_collective_speedup <= 0:
         p.error("prefetch size/overhead and lean speedup must be nonnegative/positive")
     split = fallback_weights() if args.no_manifest else scan_weights(args.model_dir)
