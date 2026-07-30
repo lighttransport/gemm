@@ -28,7 +28,7 @@ UTOFU="$REPO/a64fx/utofu-tests"
 MODE="${1:-self-test}"; shift || true
 NP="${PJM_MPI_PROC:-12}"
 PROMPT="The capital of France is"
-IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0
+IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0; KV_FP16=0
 MODEL=""; STAGE=""; NSHARDS=""; PORT=""; MAXPOS=""
 AR_GROUPS=""; COMM_ROBUST=2; COMM_POLL_SPINS=4
 PASS=()
@@ -53,6 +53,7 @@ while [ $# -gt 0 ]; do
     --comm-poll-spins) COMM_POLL_SPINS="$2"; shift 2;;
     --bf16)    VARIANT=bf16; shift;;
     --fp8)     VARIANT=fp8; shift;;
+    --kv-fp16) KV_FP16=1; shift;;
     *) PASS+=("$1"); shift;;
   esac
 done
@@ -70,6 +71,10 @@ case "$VARIANT" in
   fp8)  : "${MODEL:=$HOME/models/laguna-s21-fp8}";  : "${STAGE:=/local/$USER/laguna-s21-fp8-ep$NP}";  RUNNER="$HERE/build/laguna_s21_fp8_ep_runner";  : "${NSHARDS:=24}";;
   *)    : "${MODEL:=$HOME/models/laguna-s21-int4}"; : "${STAGE:=/local/$USER/laguna-s21-ep$NP}";      RUNNER="$HERE/build/laguna_s21_ep_runner";      : "${NSHARDS:=15}";;
 esac
+if [ "$KV_FP16" = 1 ]; then
+  [ "$VARIANT" = fp8 ] || { echo "--kv-fp16 currently requires --fp8" >&2; exit 2; }
+  RUNNER="$HERE/build/laguna_s21_fp8_kvfp16_ep_runner"
+fi
 
 # Optional per-rank stdout capture. Fugaku's mpiexec does not deliver rank
 # stdout to the launching process (a pipe or a redirect both come back empty);
@@ -79,7 +84,10 @@ esac
 OFP=()
 [ -n "${MPIEXEC_OF_PROC:-}" ] && OFP=(-of-proc "$MPIEXEC_OF_PROC")
 
-make -C "$HERE" all $([ "$VARIANT" != int4 ] && echo "$VARIANT") CC="${CC:-fcc}" OPENMP=1 >/dev/null
+targets=(all)
+[ "$VARIANT" != int4 ] && targets+=("$VARIANT")
+[ "$KV_FP16" = 1 ] && targets+=(fp8-kvfp16)
+make -C "$HERE" "${targets[@]}" CC="${CC:-fcc}" OPENMP=1 >/dev/null
 make -C "$UTOFU" tofu_topo_helper >/dev/null 2>&1 || true
 
 case "$MODE" in

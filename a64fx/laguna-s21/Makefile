@@ -28,7 +28,7 @@ CFLAGS += -I$(COMMON) -I$(UTOFU)
 LDFLAGS += -lm -lpthread
 TOFU_LIBS ?= -ltofucom
 
-.PHONY: all clean test bench bf16 fp8
+.PHONY: all clean test bench bf16 fp8 fp8-kvfp16
 all: $(BUILD)/laguna_s21_stage $(BUILD)/laguna_s21_ep_runner
 
 # Pure-bf16 reference build (~/models/laguna-s21, unquantized): same runner with
@@ -43,6 +43,11 @@ fp8: $(BUILD)/laguna_s21_fp8_ep_runner
 $(BUILD)/laguna_s21_fp8_ep_runner: laguna_s21_ep_runner.c laguna_s21.h laguna_tofu.inc | $(BUILD)
 	$(CC) $(CFLAGS) -DLAGUNA_FP8 -o $@ laguna_s21_ep_runner.c $(LDFLAGS) $(TOFU_LIBS)
 
+# Quality A/B: same FP8-weight runner with IEEE FP16 rather than BF16 KV.
+fp8-kvfp16: $(BUILD)/laguna_s21_fp8_kvfp16_ep_runner
+$(BUILD)/laguna_s21_fp8_kvfp16_ep_runner: laguna_s21_ep_runner.c laguna_s21.h laguna_tofu.inc | $(BUILD)
+	$(CC) $(CFLAGS) -DLAGUNA_FP8 -DLAGUNA_KV_FP16 -o $@ laguna_s21_ep_runner.c $(LDFLAGS) $(TOFU_LIBS)
+
 $(BUILD):
 	mkdir -p $@
 
@@ -52,8 +57,12 @@ $(BUILD)/laguna_s21_stage: laguna_s21_stage.c $(COMMON)/safetensors.h | $(BUILD)
 $(BUILD)/laguna_s21_ep_runner: laguna_s21_ep_runner.c laguna_s21.h laguna_tofu.inc | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ laguna_s21_ep_runner.c $(LDFLAGS) $(TOFU_LIBS)
 
-test: $(BUILD)/laguna_s21_ep_runner
+test: $(BUILD)/laguna_s21_ep_runner $(BUILD)/laguna_s21_bf16_ep_runner \
+      $(BUILD)/laguna_s21_fp8_ep_runner $(BUILD)/laguna_s21_fp8_kvfp16_ep_runner
 	$(BUILD)/laguna_s21_ep_runner --self-test
+	$(BUILD)/laguna_s21_bf16_ep_runner --self-test
+	$(BUILD)/laguna_s21_fp8_ep_runner --self-test
+	$(BUILD)/laguna_s21_fp8_kvfp16_ep_runner --self-test
 
 # Single-node synthetic decode benchmark (no uTofu). Run: OMP_NUM_THREADS=47 \
 #   XOS_MMM_L_PAGING_POLICY=demand:demand:demand build/bench_decode 48 1 30

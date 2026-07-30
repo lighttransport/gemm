@@ -45,6 +45,21 @@ static inline uint16_t laguna_f32_to_bf16(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
+/* KV uses two bytes in either mode. BF16 is the production default; FP16 keeps
+ * three more mantissa bits for the small, normalized K/V values and is an
+ * opt-in quality A/B build (-DLAGUNA_KV_FP16). */
+#if defined(LAGUNA_KV_FP16)
+static inline float laguna_kv_to_f32(uint16_t u) {
+    __fp16 h; memcpy(&h, &u, sizeof u); return (float)h;
+}
+static inline uint16_t laguna_f32_to_kv(float f) {
+    __fp16 h=(__fp16)f; uint16_t u; memcpy(&u, &h, sizeof u); return u;
+}
+#else
+#define laguna_kv_to_f32 laguna_bf16_to_f32
+#define laguna_f32_to_kv laguna_f32_to_bf16
+#endif
+
 /* compressed-tensors pack-quantized symmetric INT4: eight low-to-high nibbles
  * per little-endian I32.  Each output row has one BF16 scale per 32 input values. */
 static inline int laguna_i4_at(const uint32_t *packed, int col) {
@@ -109,6 +124,14 @@ static inline int laguna_expert_owner(int expert, int ep_size) { return expert %
 static inline svfloat32_t laguna_ld_bf16(svbool_t pg, const uint16_t *p) {
     return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
 }
+#if defined(LAGUNA_KV_FP16)
+static inline svfloat32_t laguna_ld_kv(svbool_t pg, const uint16_t *p) {
+    svuint32_t u=svld1uh_u32(pg,p);
+    return svcvt_f32_f16_x(pg,svreinterpret_f16_u32(u));
+}
+#else
+#define laguna_ld_kv laguna_ld_bf16
+#endif
 /* 2^x via the A64FX FEXPA accelerator (adapted from glm5_impl.h). */
 static inline svfloat32_t laguna_exp2_fexpa(svbool_t pg, svfloat32_t x) {
     const float shift_f = 204927.0f;               /* 0x48481fc0: FEXPA rounding shift */
@@ -982,10 +1005,10 @@ typedef struct {
     /* rope tables: cos/sin[pos * half] for full (half=32) and sliding (half=64) */
     float *full_cos, *full_sin;       /* [max_pos * 32] */
     float *swa_cos, *swa_sin;         /* [max_pos * 64] */
-    /* KV cache (bf16), replicated per rank.  Full-attention layers keep the whole
+    /* 16-bit KV cache (BF16 default), replicated per rank. Full-attention layers keep the whole
      * context; sliding layers use a SLIDING_WINDOW ring buffer (position p -> slot
      * p%cap), so long-context KV stays small (128k: ~6.5 GB not 25.8). */
-    uint16_t *kcache, *vcache;
+    uint16_t *kcache, *vcache; /* BF16 default; FP16 with LAGUNA_KV_FP16 */
     size_t kv_off[LAGUNA_LAYERS];     /* element offset of each layer's KV block */
     int    kv_cap[LAGUNA_LAYERS];     /* capacity: max_pos (full) or window (sliding) */
     /* Batched serving keeps n_seq independent caches back to back, so sequence s

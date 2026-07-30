@@ -58,6 +58,27 @@ static int test_i4(void) {
 }
 static int test_fht(void) { float a[128],b[128]; for(int i=0;i<128;i++)a[i]=b[i]=(float)(i-63)*0.03125f; laguna_fht128(a);laguna_fht128(a);for(int i=0;i<128;i++)if(fabsf(a[i]-b[i])>2e-5f){fprintf(stderr,"FHT mismatch at %d\n",i);return 1;}return 0; }
 static int test_route(void) { float l[256]={0},b[256]={0},w[10];int id[10];for(int i=0;i<256;i++)l[i]=(float)(i-128)*.01f;laguna_top10(l,b,id,w);float z=0;for(int i=0;i<10;i++){if(id[i]!=255-i){fprintf(stderr,"route id %d=%d\n",i,id[i]);return 1;}z+=w[i];}return fabsf(z-1)>1e-6f; }
+static int test_kv_codec(void) {
+    uint16_t u[64]; float ref[64], got[64]; int n=16;
+#if defined(__ARM_FEATURE_SVE)
+    n=(int)svcntw(); if(n>64)n=64;
+#endif
+    for(int i=0;i<n;i++){ ref[i]=(float)(i-n/2)*0.137f; u[i]=laguna_f32_to_kv(ref[i]); }
+    for(int i=0;i<n;i++) got[i]=laguna_kv_to_f32(u[i]);
+#if defined(__ARM_FEATURE_SVE)
+    { svbool_t pg=svwhilelt_b32(0,n); svst1_f32(pg,got,laguna_ld_kv(pg,u)); }
+#endif
+    for(int i=0;i<n;i++){
+        float lim=
+#if defined(LAGUNA_KV_FP16)
+            0.001f;
+#else
+            0.008f;
+#endif
+        if(fabsf(got[i]-ref[i])>lim){fprintf(stderr,"KV codec mismatch %d: %.8g %.8g\n",i,got[i],ref[i]);return 1;}
+    }
+    return 0;
+}
 /* cross-check the group-32 matvec against a scalar per-element reconstruction */
 static int test_i4_matvec(void) {
     enum { R=5, C=64 };
@@ -684,13 +705,13 @@ double g_d_qkv=0, g_d_core=0, g_d_oproj=0, g_d_router=0, g_d_experts=0,
 static double prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 
 /* Attention for one token at `pos`. `x` is input_layernorm output (n1). Writes attn_out. */
-/* SVE-vectorized per-position attention inner ops (bf16 KV widened to f32).
+/* SVE-vectorized per-position attention inner ops (16-bit KV widened to f32).
  * These are the O(context) hot loops that dominate long-context prefill. */
 #if defined(__ARM_FEATURE_SVE)
 static inline float laguna_qkdot(const float *restrict q, const uint16_t *restrict k, int hd) {
     svfloat32_t a = svdup_f32(0);
     for (int d=0; d<hd; d+=(int)svcntw()) { svbool_t pg=svwhilelt_b32(d,hd);
-        a = svmla_f32_x(pg, a, svld1_f32(pg,q+d), laguna_ld_bf16(pg,k+d)); }
+        a = svmla_f32_x(pg, a, svld1_f32(pg,q+d), laguna_ld_kv(pg,k+d)); }
     return svaddv_f32(svptrue_b32(), a);
 }
 static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
@@ -698,7 +719,7 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
     svfloat32_t sp=svdup_f32(p), scv=svdup_f32(corr);
     for (int d=0; d<hd; d+=(int)svcntw()) { svbool_t pg=svwhilelt_b32(d,hd);
         svfloat32_t a = svmul_f32_x(pg, svld1_f32(pg,acc+d), scv);
-        svst1_f32(pg, acc+d, svmla_f32_x(pg, a, sp, laguna_ld_bf16(pg,v+d))); }
+        svst1_f32(pg, acc+d, svmla_f32_x(pg, a, sp, laguna_ld_kv(pg,v+d))); }
 }
 
 /* ---- run-based attention inner loops (head_dim == 8 vectors at VL=16) ----
@@ -713,9 +734,14 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
  *        whole run removes that entirely.
  * hd is always LAGUNA_HEAD_DIM (128); the generic path is kept as a fallback. */
 #define LAGUNA_AV_NV 8      /* 128 / 16 */
-/* bf16 halves of a full-width u16 load, widened to f32 */
+/* halves of a full-width u16 load, widened from the selected KV format */
+#if defined(LAGUNA_KV_FP16)
+#define LAGUNA_UNLO(pg,h) svcvt_f32_f16_x((pg),svreinterpret_f16_u32(svunpklo_u32(h)))
+#define LAGUNA_UNHI(pg,h) svcvt_f32_f16_x((pg),svreinterpret_f16_u32(svunpkhi_u32(h)))
+#else
 #define LAGUNA_UNLO(pg,h) svreinterpret_f32_u32(svlsl_n_u32_x((pg),svunpklo_u32(h),16))
 #define LAGUNA_UNHI(pg,h) svreinterpret_f32_u32(svlsl_n_u32_x((pg),svunpkhi_u32(h),16))
+#endif
 /* uzp1(a,b)+uzp2(a,b) = [a0+a1, a2+a3, ..., b0+b1, ...] -- four stages reduce 16
  * accumulators to one vector of 16 lane-sums without any svaddv. */
 #define LAGUNA_BFLY(pg,a,b) svadd_f32_x((pg), svuzp1_f32((a),(b)), svuzp2_f32((a),(b)))
@@ -776,11 +802,11 @@ static inline void laguna_qk_run(float *restrict sco, const float *restrict q,
     }
     for (; i<n; ++i) {
         const uint16_t *ki=k+(size_t)i*kvstride;
-        svfloat32_t a=svmul_f32_x(pt,q0,laguna_ld_bf16(pt,ki+0*VL));
-        svfloat32_t b=svmul_f32_x(pt,q4,laguna_ld_bf16(pt,ki+4*VL));
-        a=svmla_f32_x(pt,a,q1,laguna_ld_bf16(pt,ki+1*VL)); b=svmla_f32_x(pt,b,q5,laguna_ld_bf16(pt,ki+5*VL));
-        a=svmla_f32_x(pt,a,q2,laguna_ld_bf16(pt,ki+2*VL)); b=svmla_f32_x(pt,b,q6,laguna_ld_bf16(pt,ki+6*VL));
-        a=svmla_f32_x(pt,a,q3,laguna_ld_bf16(pt,ki+3*VL)); b=svmla_f32_x(pt,b,q7,laguna_ld_bf16(pt,ki+7*VL));
+        svfloat32_t a=svmul_f32_x(pt,q0,laguna_ld_kv(pt,ki+0*VL));
+        svfloat32_t b=svmul_f32_x(pt,q4,laguna_ld_kv(pt,ki+4*VL));
+        a=svmla_f32_x(pt,a,q1,laguna_ld_kv(pt,ki+1*VL)); b=svmla_f32_x(pt,b,q5,laguna_ld_kv(pt,ki+5*VL));
+        a=svmla_f32_x(pt,a,q2,laguna_ld_kv(pt,ki+2*VL)); b=svmla_f32_x(pt,b,q6,laguna_ld_kv(pt,ki+6*VL));
+        a=svmla_f32_x(pt,a,q3,laguna_ld_kv(pt,ki+3*VL)); b=svmla_f32_x(pt,b,q7,laguna_ld_kv(pt,ki+7*VL));
         sco[i]=svaddv_f32(pt,svadd_f32_x(pt,a,b))*scale;
     }
 }
@@ -825,10 +851,10 @@ static inline void laguna_av_run(float *restrict acc, const float *restrict w,
 }
 #else
 static inline float laguna_qkdot(const float *q, const uint16_t *k, int hd) {
-    float s=0; for(int d=0;d<hd;++d) s+=q[d]*laguna_bf16_to_f32(k[d]); return s;
+    float s=0; for(int d=0;d<hd;++d) s+=q[d]*laguna_kv_to_f32(k[d]); return s;
 }
 static inline void laguna_vaxpy(float *acc, const uint16_t *v, float p, float corr, int hd) {
-    for(int d=0;d<hd;++d) acc[d]=acc[d]*corr + p*laguna_bf16_to_f32(v[d]);
+    for(int d=0;d<hd;++d) acc[d]=acc[d]*corr + p*laguna_kv_to_f32(v[d]);
 }
 static inline void laguna_qk_run(float *sco, const float *q, const uint16_t *k,
                                  int kvstride, int n, float scale, int hd) {
@@ -874,8 +900,8 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
         laguna_rmsnorm(tmp, k, ly->k_norm, hd, LAGUNA_RMS_EPS);
         memcpy(k,tmp,sizeof tmp);
         laguna_rope_half(k, rc, rs, rot);
-        for (int d=0; d<hd; ++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
-        for (int d=0; d<hd; ++d) vdst[h*hd+d]=laguna_f32_to_bf16(vf[h*hd+d]);
+        for (int d=0; d<hd; ++d) kdst[h*hd+d]=laguna_f32_to_kv(k[d]);
+        for (int d=0; d<hd; ++d) vdst[h*hd+d]=laguna_f32_to_kv(vf[h*hd+d]);
     }
     /* attention per query head.  Sliding layers attend to the last `cap` positions
      * (the ring holds exactly those); full layers attend to all [0..pos]. */
@@ -965,8 +991,8 @@ static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, 
         uint16_t *kdst=kbase+(size_t)pos*kvstride, *vdst=vbase+(size_t)pos*kvstride;
         for (int h=0;h<LAGUNA_KV_HEADS;++h){ float *k=K+(size_t)c*kvstride+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
             laguna_rmsnorm(tmp,k,ly->k_norm,hd,LAGUNA_RMS_EPS); memcpy(k,tmp,sizeof tmp); laguna_rope_half(k,rc,rs,rot);
-            for(int d=0;d<hd;++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
-            for(int d=0;d<hd;++d) vdst[h*hd+d]=laguna_f32_to_bf16(V[(size_t)c*kvstride+h*hd+d]); }
+            for(int d=0;d<hd;++d) kdst[h*hd+d]=laguna_f32_to_kv(k[d]);
+            for(int d=0;d<hd;++d) vdst[h*hd+d]=laguna_f32_to_kv(V[(size_t)c*kvstride+h*hd+d]); }
     }
     /* 2. flash query-block, parallel over (head, query tile).
      * Parallelising over heads alone leaves 47 threads running ceil(48/47)=2 rounds
@@ -1065,8 +1091,8 @@ static void attention_slide_flash(const laguna_model *m, const laguna_layer *ly,
         uint16_t *kdst=kbase+(size_t)(pos%cap)*kvstride, *vdst=vbase+(size_t)(pos%cap)*kvstride;
         for (int h=0;h<LAGUNA_KV_HEADS;++h){ float *k=K+(size_t)c*kvstride+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
             laguna_rmsnorm(tmp,k,ly->k_norm,hd,LAGUNA_RMS_EPS); memcpy(k,tmp,sizeof tmp); laguna_rope_half(k,rc,rs,rot);
-            for(int d=0;d<hd;++d) kdst[h*hd+d]=laguna_f32_to_bf16(k[d]);
-            for(int d=0;d<hd;++d) vdst[h*hd+d]=laguna_f32_to_bf16(V[(size_t)c*kvstride+h*hd+d]); }
+            for(int d=0;d<hd;++d) kdst[h*hd+d]=laguna_f32_to_kv(k[d]);
+            for(int d=0;d<hd;++d) vdst[h*hd+d]=laguna_f32_to_kv(V[(size_t)c*kvstride+h*hd+d]); }
     }
 
     /* 2. flash over key blocks, parallel over query heads */
@@ -1529,14 +1555,20 @@ static void usage(const char *n){
 
 int main(int argc, char **argv) {
     if (argc==2 && !strcmp(argv[1],"--self-test")) {
-        int rc=test_i4()|test_fht()|test_route()|test_i4_matvec()|test_i8_matmat();
+        int rc=test_i4()|test_fht()|test_route()|test_kv_codec()|test_i4_matvec()|test_i8_matmat();
 #if defined(LAGUNA_FP8)
         rc|=test_fp8_i8blk();
 #endif
         if(!rc)puts("Laguna S21 ABI self-test: PASS"); return rc;
     }
     if (argc==2 && !strcmp(argv[1],"--describe")) {
-        puts("Laguna S21: 48L H=3072 GQA=8x128, full=48h(YaRN rot64)/sliding=72h(rope rot128,win512), 256 experts top-10 INT4 g32, shared+dense0"); return 0;
+        puts("Laguna S21: 48L H=3072 GQA=8x128, full=48h(YaRN rot64)/sliding=72h(rope rot128,win512), 256 experts top-10, shared+dense0, KV="
+#if defined(LAGUNA_KV_FP16)
+             "fp16"
+#else
+             "bf16"
+#endif
+             ); return 0;
     }
     if (argc>=3 && argc<=4 && !strcmp(argv[1],"--check-stage")) return stage_check(argv[2],argc==4?atoi(argv[3]):0);
     if (argc==3 && !strcmp(argv[1],"--probe-stage")) return probe_stage(argv[2]);

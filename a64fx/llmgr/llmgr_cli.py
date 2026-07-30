@@ -135,6 +135,8 @@ def main(argv=None):
     b = sub.add_parser("build")
     b.add_argument("--model", default="laguna")
     b.add_argument("--variant")
+    b.add_argument("--kv-fp16", action="store_true",
+                   help="experimental Laguna FP16 KV (FP8 variant only)")
     b.add_argument("--clean", action="store_true")
 
     st = sub.add_parser("stage")
@@ -157,6 +159,8 @@ def main(argv=None):
     r = sub.add_parser("start", help="start a runner")
     r.add_argument("--model", default="laguna")
     r.add_argument("--variant")
+    r.add_argument("--kv-fp16", action="store_true",
+                   help="experimental Laguna FP16 KV (FP8 variant only)")
     r.add_argument("--mode", choices=("serve", "generate"))
     r.add_argument("--port", type=int)
     r.add_argument("--maxpos", type=int)
@@ -227,6 +231,8 @@ def main(argv=None):
     pr = sub.add_parser("profile")
     pr.add_argument("--model", default="laguna")
     pr.add_argument("--variant")
+    pr.add_argument("--kv-fp16", action="store_true",
+                    help="experimental Laguna FP16 KV (FP8 variant only)")
     pr.add_argument("--ids", help="token ids file (required by Laguna, not K3)")
     pr.add_argument("--max-new", type=int, default=16)
     pr.add_argument("--tokens", type=int, help="K3 profile token steps")
@@ -270,7 +276,7 @@ def main(argv=None):
         return cmd_sh(args)
     elif c == "build":
         emit(call(args, "POST", "/build",
-                  dict(model=args.model, **opt("variant", "clean"))))
+                  dict(model=args.model, **opt("variant", "kv_fp16", "clean"))))
     elif c == "stage":
         emit(call(args, "POST", "/stage",
                   dict(model=args.model,
@@ -286,7 +292,7 @@ def main(argv=None):
     elif c == "start":
         emit(call(args, "POST", "/runner/start",
                   dict(model=args.model,
-                       **opt("variant", "mode", "port", "maxpos", "max_batch",
+                       **opt("variant", "kv_fp16", "mode", "port", "maxpos", "max_batch",
                              "pchunk", "ar_groups", "comm_robust",
                              "comm_poll_spins", "layers",
                              "np", "max_new", "tokens", "layer", "experts",
@@ -333,7 +339,7 @@ def main(argv=None):
     elif c == "profile":
         emit(call(args, "POST", "/profile",
                   dict(model=args.model, max_new=args.max_new,
-                       event=args.event, **opt("variant", "np", "ids",
+                       event=args.event, **opt("variant", "kv_fp16", "np", "ids",
                                               "tokens", "layer", "threads",
                                               "stage_dir")), timeout=600))
     elif c == "artifacts":

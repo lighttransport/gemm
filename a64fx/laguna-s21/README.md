@@ -13,6 +13,7 @@ Performance and the reasoning behind each optimization: **`fp8-optimization.md`*
 make            # int4 production build + stager
 make fp8        # bf16 checkpoint quantized at load: int8 linears + int8-per-block experts
 make bf16       # pure-bf16 reference
+make fp8-kvfp16 # experimental FP8-weight build with IEEE FP16 KV
 ```
 
 For the production FP8 shape, use
@@ -49,6 +50,22 @@ mpiexec -np 12 build/laguna_s21_stage --model-dir ~/models/laguna-s21-fp8 \
 ./run_laguna_s21_12n.sh generate --fp8 --no-stage --prompt "The A64FX processor" --max-new 200
 ```
 
+The normal runner stores KV as BF16. `--kv-fp16` selects an experimental FP16
+KV build for the FP8-weight variant; it has the same memory footprint:
+
+```
+./run_laguna_s21_12n.sh generate --fp8 --kv-fp16 --no-stage \
+    --chat "Write a thread-safe C++ LRU cache" --max-new 2048 \
+    --sample --temp 0.7 --top-p 0.95 --seed 305441741
+```
+
+In a fixed-seed 12-node C++ generation A/B, BF16 KV reached the 2048-token
+limit at 24.8 tok/s and generated a correct LRU implementation (one bad test
+assertion). FP16 KV stopped naturally at 1469 tokens at 25.4 tok/s, but failed
+the core LRU recency behavior by using a shared/read lock in `get()` without
+updating recency. The sampled streams diverged at the second generated token.
+Treat FP16 KV as an experiment, not a quality upgrade; BF16 remains the default.
+
 `--chat` renders the checkpoint's own `chat_template.jinja`; `--prompt` does raw
 continuation. An instruction-shaped prompt without `--chat` is out of distribution
 for this model and will ramble. `--system TEXT` and `--no-think` are available.
@@ -57,6 +74,10 @@ Runner flags: `--ids FILE --max-new N --maxpos N --layers N --stage-dir DIR
 --gen-out FILE --pchunk N --topo PATH --debug --sample --temp --top-k --top-p
 --min-p --seed` and, in the fp8 build, `--fp8-exact` (keep the exact e4m3 kernels
 instead of the int8-per-block re-quantization, for A/B).
+
+llmgr accepts the same experiment as `kv_fp16: true`, or
+`llmgr_cli.py start --variant fp8 --kv-fp16 ...`; it rejects the flag for
+non-FP8 variants and records the dedicated runner binary.
 
 Greedy is the default so runs are reproducible; the checkpoint's
 `generation_config.json` asks for `do_sample=true, top_k=20`, which `--sample`

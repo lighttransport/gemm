@@ -185,6 +185,7 @@ class LagunaAdapter(Adapter):
         "bf16": "laguna_s21_bf16_ep_runner",
         "fp8": "laguna_s21_fp8_ep_runner",
     }
+    _FP16_KV_RUNNER_BIN = "laguna_s21_fp8_kvfp16_ep_runner"
     _DEFAULT_MODEL_DIR = {
         "int4": "~/models/laguna-s21-int4",
         "bf16": "~/models/laguna-s21",
@@ -194,6 +195,13 @@ class LagunaAdapter(Adapter):
 
     def _variant_flag(self, variant):
         return [] if variant == "int4" else ["--%s" % variant]
+
+    def _kv_flags(self, cfg, variant):
+        if not cfg.get("kv_fp16"):
+            return []
+        if variant != "fp8":
+            raise ConfigError("kv_fp16 currently requires variant=fp8")
+        return ["--kv-fp16"]
 
     def _common(self, cfg, variant):
         """Flags shared by every launcher mode."""
@@ -224,6 +232,8 @@ class LagunaAdapter(Adapter):
     def build(self, cfg):
         variant = self.variant(cfg)
         targets = ["all"] + ([] if variant == "int4" else [variant])
+        if self._kv_flags(cfg, variant):
+            targets.append("fp8-kvfp16")
         argv = ["make", "-C", LAGUNA_DIR] + targets + \
                ["CC=%s" % cfg.get("cc", "fcc"), "OPENMP=1"]
         if cfg.get("clean"):
@@ -246,6 +256,7 @@ class LagunaAdapter(Adapter):
         argv = [self.LAUNCHER, "serve", "--port", str(port),
                 "--maxpos", str(maxpos)]
         argv += self._variant_flag(variant) + self._common(cfg, variant)
+        argv += self._kv_flags(cfg, variant)
         argv += ["--layers", str(_int(cfg, "layers", 48))]
         if not cfg.get("stage", False):
             argv += ["--no-stage"]
@@ -275,6 +286,7 @@ class LagunaAdapter(Adapter):
         argv += ["--max-new", str(_int(cfg, "max_new", 48)),
                  "--layers", str(_int(cfg, "layers", 48))]
         argv += self._variant_flag(variant) + self._common(cfg, variant)
+        argv += self._kv_flags(cfg, variant)
         if not cfg.get("stage", False):
             argv += ["--no-stage"]
         argv += _extra(cfg)
@@ -326,8 +338,11 @@ class LagunaAdapter(Adapter):
             loaded, np_, serving, os.path.basename(d))
 
     def runner_bin(self, cfg):
+        variant = self.variant(cfg)
+        if self._kv_flags(cfg, variant):
+            return os.path.join(LAGUNA_DIR, "build", self._FP16_KV_RUNNER_BIN)
         return os.path.join(LAGUNA_DIR, "build",
-                            self._RUNNER_BIN[self.variant(cfg)])
+                            self._RUNNER_BIN[variant])
 
     def profile_argv(self, cfg):
         """Runner argv for an fapp-wrapped run: a bounded --generate.
