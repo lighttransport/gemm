@@ -1322,6 +1322,32 @@ weight staging, decode, prefill, result validation, and the whole-network estima
 An EXIT trap records an interrupted active stage, making the logs suitable for sizing
 later checkpoint-heavy allocations even when a job hits its elapsed-time limit.
 
+### TP72 non-contiguous decode probe
+
+`pjsub_k3_probe_72n.sh` is the first crowded-system fallback probe. It requests the
+`small-s4` group for one hour with scalar `node=72` placement rather than a torus
+shape, allowing a non-contiguous allocation. It runs an eight-token dummy transport
+gate followed by a 256-token partial-real layer-1 decode profile. Automatic hierarchy
+selection resolves to twelve six-rank groups.
+
+TP72 uses the runner's balanced ragged ownership: ranks 0--23 own 64 expert channels
+and two attention heads, while ranks 24--71 own 32 channels and one head. The job does
+not run the expert-prefill calibration because that probe currently requires exactly
+32 channels per rank and is therefore TP96-only. The current whole-model simulator
+also reports about 28.9 GiB on the fullest TP72 rank, above the strict 27 GiB target;
+this allocation calibrates transport and partial-real decode rather than claiming an
+end-to-end TP72 serving configuration.
+
+Submit from the repository root with:
+
+```sh
+pjsub --no-check-directory a64fx/k3/pjsub_k3_probe_72n.sh
+```
+
+Results are retained under `a64fx/k3/logs/probe-72n-$PJM_JOBID`. Success requires
+72/72 pass markers from both phases, the expected 12x6 hierarchy, all 256 real steps,
+and `K3_PROFILE`/`K3_PROFILE_MAX` output in `summary.txt`.
+
 ### HTTP and llmgr control
 
 The generic `a64fx/llmgr` HTTP supervisor now has a `k3` adapter and a dedicated
