@@ -272,6 +272,8 @@ class LagunaAdapter(Adapter):
 
     def generate(self, cfg):
         variant = self.variant(cfg)
+        if cfg.get("quality_cpp") and not cfg.get("chat"):
+            raise ConfigError("quality_cpp requires a chat prompt")
         argv = [self.LAUNCHER, "generate"]
         if cfg.get("ids"):
             argv += ["--ids", str(cfg["ids"])]
@@ -283,10 +285,13 @@ class LagunaAdapter(Adapter):
                 argv += ["--no-think"]
         else:
             argv += ["--prompt", str(cfg.get("prompt", "The capital of France is"))]
-        argv += ["--max-new", str(_int(cfg, "max_new", 48)),
+        default_new = 4096 if cfg.get("quality_cpp") else 48
+        argv += ["--max-new", str(_int(cfg, "max_new", default_new)),
                  "--layers", str(_int(cfg, "layers", 48))]
         argv += self._variant_flag(variant) + self._common(cfg, variant)
         argv += self._kv_flags(cfg, variant)
+        if cfg.get("quality_cpp"):
+            argv += ["--quality-cpp"]
         if not cfg.get("stage", False):
             argv += ["--no-stage"]
         argv += _extra(cfg)

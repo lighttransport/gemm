@@ -28,6 +28,19 @@ class LagunaAdapterTest(unittest.TestCase):
         with self.assertRaises(models.ConfigError):
             self.a.generate({"variant": "bf16", "kv_fp16": True})
 
+    def test_cpp_quality_is_explicit_one_shot_flag(self):
+        argv, _env, _cwd = self.a.generate({
+            "variant": "fp8", "chat": "write C++", "quality_cpp": True,
+        })
+        self.assertIn("--quality-cpp", argv)
+        self.assertEqual(argv[argv.index("--max-new") + 1], "4096")
+        serve, _env, _cwd = self.a.serve({
+            "variant": "fp8", "port": 8080, "quality_cpp": True,
+        })
+        self.assertNotIn("--quality-cpp", serve)
+        with self.assertRaises(models.ConfigError):
+            self.a.generate({"variant": "fp8", "quality_cpp": True})
+
 
 if __name__ == "__main__":
     unittest.main()

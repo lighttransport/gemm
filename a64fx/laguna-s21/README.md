@@ -50,6 +50,23 @@ mpiexec -np 12 build/laguna_s21_stage --model-dir ~/models/laguna-s21-fp8 \
 ./run_laguna_s21_12n.sh generate --fp8 --no-stage --prompt "The A64FX processor" --max-new 200
 ```
 
+For long C++ answers, the opt-in quality workflow reserves 4096 tokens, disables
+visible thinking so reasoning cannot consume the answer budget, compiles and runs
+the first fenced C++ program with a 20-second timeout, and makes one feedback
+repair turn if validation fails:
+
+```
+./run_laguna_s21_12n.sh generate --fp8 --no-stage --quality-cpp \
+    --chat "Write a complete C++20 bounded blocking queue with tests" \
+    --sample --temp 0.7 --top-p 0.95
+```
+
+**Security:** `--quality-cpp` executes model-generated code on the head node. Use
+it only for trusted prompts in an isolated job. Without that explicit flag no
+generated code is compiled or executed. Set `CXX` to select the compiler. The
+initial answer is retained as `gen.initial.ids` when a repair is needed; the
+validated repair becomes `gen.ids`.
+
 The normal runner stores KV as BF16. `--kv-fp16` selects an experimental FP16
 KV build for the FP8-weight variant; it has the same memory footprint:
 
@@ -78,6 +95,8 @@ instead of the int8-per-block re-quantization, for A/B).
 llmgr accepts the same experiment as `kv_fp16: true`, or
 `llmgr_cli.py start --variant fp8 --kv-fp16 ...`; it rejects the flag for
 non-FP8 variants and records the dedicated runner binary.
+For one-shot C++ generation it also accepts `quality_cpp: true`, exposed as
+`llmgr_cli.py start --mode generate --quality-cpp ...`.
 
 Greedy is the default so runs are reproducible; the checkpoint's
 `generation_config.json` asks for `do_sample=true, top_k=20`, which `--sample`
@@ -155,6 +174,7 @@ fcc ... -o run_prim_test  run_prim_test.c  && ./run_prim_test       # qk/av run 
 fcc ... -o sampler_test   sampler_test.c   && ./sampler_test        # top-k/top-p/min-p/temperature/seed
 LAGUNA_TOKENIZER=... python3 tools/tok_test.py                      # added tokens, round-trip, chat template
 python3 tools/repetition.py gen.ids                                 # degeneration metrics for long output
+python3 tools/cpp_quality.py gen.ids --run                           # explicit compile/runtime validation
 ```
 
 Benchmarks used to justify the kernel choices — `fp8_dq_bench.c`, `fp8_mm_bench.c`,

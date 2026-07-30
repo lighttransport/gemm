@@ -516,6 +516,44 @@ the full path had none): 20 cases over prefix/block alignments and chunk sizes,
 with pure-diagonal cases exact to 0.0, plus a control that moves the causal cut by
 one key and shows 1.5e-2 against a ~5e-6 reassociation floor.
 
+## Long C++ quality at a 4096-token cap
+
+Long answers need executable checks, not token similarity or repetition scores.
+All runs below used 12 nodes, BF16 KV, seed 305441741, top-k 20, temperature
+0.7, and top-p 0.95. The original 2048-token LRU run reproduced all 2048 tokens
+exactly when its cap was raised, then reached EOS at 2386 tokens. This rules out
+max-position-dependent drift; the old answer was simply truncated.
+
+| expert path / workflow | output | decode | validation |
+|---|---:|---:|---|
+| fast INT8-q128, LRU | 2386 | 24.3 tok/s | compiled; bad size assertion aborted |
+| exact E4M3, LRU | 1864 | 18.2 tok/s | compiled and stress test passed |
+| experimental INT8-q32, LRU | 2560 | 23.8 tok/s | tests passed, but returned a dangling pointer |
+| fast INT8-q128, blocking queue | 1691 | 25.0 tok/s | missing `<deque>` |
+| exact E4M3, blocking queue | 1713 | 18.3 tok/s | missing `<deque>` and condition variables reversed |
+| hidden audit prompt, queue | 2765 | 23.9 tok/s | correct synchronization, missing `<cassert>` |
+| compiler-feedback repair | 2976 | 19.9 tok/s | warning-clean compile; all runtime tests passed |
+| integrated `--quality-cpp`, queue | 4096 | 22.9 tok/s | compiled; 9 deterministic/runtime tests passed |
+
+Exact E4M3 helped one prompt but failed the second, so it is not promoted as a
+general quality mode. INT8-q32 reduced the synthetic expert matvec error from
+0.702% to 0.566%, but semantic safety got worse; that implementation was rejected.
+Visible chain-of-thought was also rejected as a default: it consumed the entire
+4096-token budget without reaching the final answer.
+
+The retained `--quality-cpp` workflow uses the fast production math, a no-think
+audit system prompt, real compilation/runtime validation, and at most one repair
+turn with the diagnostic. On the blocking-queue case, the repair added the missing
+header and passed producer/consumer stress, timeout, close, and capacity-zero
+tests. This costs another model load and generation only when the first answer
+fails. It executes generated code and is therefore explicitly opt-in.
+The integrated rerun used the full 4096-token cap: its fenced program was
+complete and validated, while only the following prose explanation was cut off.
+
+The repetition heuristic labeled every healthy code answer "DEGENERATE" because
+syntax and identifiers naturally repeat. Distinct-n remains useful for obvious
+language loops, but must not be used as a code-quality gate.
+
 ## Batched serving: the premise was wrong
 
 Continuous batching was built on the assumption that decode is weight-bandwidth

@@ -161,6 +161,8 @@ def main(argv=None):
     r.add_argument("--variant")
     r.add_argument("--kv-fp16", action="store_true",
                    help="experimental Laguna FP16 KV (FP8 variant only)")
+    r.add_argument("--quality-cpp", action="store_true",
+                   help="Laguna one-shot: validate and repair generated C++")
     r.add_argument("--mode", choices=("serve", "generate"))
     r.add_argument("--port", type=int)
     r.add_argument("--maxpos", type=int)
@@ -292,7 +294,7 @@ def main(argv=None):
     elif c == "start":
         emit(call(args, "POST", "/runner/start",
                   dict(model=args.model,
-                       **opt("variant", "kv_fp16", "mode", "port", "maxpos", "max_batch",
+                       **opt("variant", "kv_fp16", "quality_cpp", "mode", "port", "maxpos", "max_batch",
                              "pchunk", "ar_groups", "comm_robust",
                              "comm_poll_spins", "layers",
                              "np", "max_new", "tokens", "layer", "experts",

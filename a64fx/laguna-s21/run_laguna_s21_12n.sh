@@ -19,6 +19,7 @@
 #   --max-new N         tokens to generate (default 48)
 #   --layers L          truncate to first L layers (bring-up; default 48)
 #   --no-stage          skip node-local staging (blobs already present)
+#   --quality-cpp       4K no-think answer, compile/run, then one repair turn on failure
 set -euo pipefail
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -28,7 +29,8 @@ UTOFU="$REPO/a64fx/utofu-tests"
 MODE="${1:-self-test}"; shift || true
 NP="${PJM_MPI_PROC:-12}"
 PROMPT="The capital of France is"
-IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0; KV_FP16=0
+IDS=""; MAX_NEW=48; MAX_NEW_SET=0; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0; KV_FP16=0
+QUALITY_CPP=0
 MODEL=""; STAGE=""; NSHARDS=""; PORT=""; MAXPOS=""
 AR_GROUPS=""; COMM_ROBUST=2; COMM_POLL_SPINS=4
 PASS=()
@@ -39,7 +41,7 @@ while [ $# -gt 0 ]; do
     --system)  SYSMSG="$2"; shift 2;;
     --no-think) NOTHINK=1; shift;;
     --ids)     IDS="$2"; shift 2;;
-    --max-new) MAX_NEW="$2"; shift 2;;
+    --max-new) MAX_NEW="$2"; MAX_NEW_SET=1; shift 2;;
     --layers)  LAYERS="$2"; shift 2;;
     --no-stage) DO_STAGE=0; shift;;
     --np)        NP="$2"; shift 2;;
@@ -54,9 +56,19 @@ while [ $# -gt 0 ]; do
     --bf16)    VARIANT=bf16; shift;;
     --fp8)     VARIANT=fp8; shift;;
     --kv-fp16) KV_FP16=1; shift;;
+    --quality-cpp) QUALITY_CPP=1; shift;;
     *) PASS+=("$1"); shift;;
   esac
 done
+if [ "$QUALITY_CPP" = 1 ]; then
+  [ "$MODE" = generate ] || { echo "--quality-cpp requires generate mode" >&2; exit 2; }
+  [ "$CHAT" = 1 ] || { echo "--quality-cpp requires --chat" >&2; exit 2; }
+  NOTHINK=1
+  [ "$MAX_NEW_SET" = 1 ] || MAX_NEW=4096
+  if [ -z "$SYSMSG" ]; then
+    SYSMSG="You are a meticulous senior software engineer. For code-generation requests, output the final answer only. Before finalizing, internally audit every required header, API contract, ownership and lifetime, synchronization predicate and matching notification, edge case, and assertion. Prefer safe value-returning interfaces. Ensure the complete program compiles and that its tests exercise the requested semantics. Correctness and internal consistency are more important than brevity."
+  fi
+fi
 case "$COMM_ROBUST" in 0|1|2) ;; *) echo "--comm-robust must be 0, 1, or 2" >&2; exit 2;; esac
 case "$COMM_POLL_SPINS" in 1|2|4|8|16|32|64|128|256|512|1024) ;;
   *) echo "--comm-poll-spins must be a power of two in [1,1024]" >&2; exit 2;; esac
@@ -162,10 +174,32 @@ if [ "$MODE" = serve ]; then
       --stage-dir "$STAGE" "${PASS[@]}"
 fi
 
-mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --generate \
-    --ids "$IDS" --max-new "$MAX_NEW" --layers "$LAYERS" \
-    --stage-dir "$STAGE" --gen-out "$RUN_DIR/gen.ids" "${PASS[@]}"
+run_generate() {
+  local prompt_ids="$1" gen_out="$2"
+  mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --generate \
+      --ids "$prompt_ids" --max-new "$MAX_NEW" --layers "$LAYERS" \
+      --stage-dir "$STAGE" --gen-out "$gen_out" "${PASS[@]}"
+}
+
+run_generate "$IDS" "$RUN_DIR/gen.ids"
+
+if [ "$QUALITY_CPP" = 1 ]; then
+  echo "--- C++ quality check (executes generated code; timeout 20s) ---"
+  if ! LAGUNA_TOKENIZER="$MODEL/tokenizer.json" \
+      python3 "$HERE/tools/cpp_quality.py" "$RUN_DIR/gen.ids" --run \
+        --prompt-ids "$IDS" --repair-out "$RUN_DIR/repair_prompt.ids"; then
+    mv "$RUN_DIR/gen.ids" "$RUN_DIR/gen.initial.ids"
+    echo "--- compiler/runtime feedback repair turn ---"
+    run_generate "$RUN_DIR/repair_prompt.ids" "$RUN_DIR/gen.ids"
+    LAGUNA_TOKENIZER="$MODEL/tokenizer.json" \
+      python3 "$HERE/tools/cpp_quality.py" "$RUN_DIR/gen.ids" --run || {
+        echo "repaired C++ answer still failed validation" >&2
+        QUALITY_RC=5
+      }
+  fi
+fi
 
 echo "--- generated text ---"
 LAGUNA_TOKENIZER="$MODEL/tokenizer.json" \
   python3 "$HERE/tools/laguna_tok.py" decode-file "$RUN_DIR/gen.ids" || true
+exit "${QUALITY_RC:-0}"
