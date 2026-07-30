@@ -1325,10 +1325,11 @@ later checkpoint-heavy allocations even when a job hits its elapsed-time limit.
 ### TP72 non-contiguous decode probe
 
 `pjsub_k3_probe_72n.sh` is the first crowded-system fallback probe. It requests the
-`small-s4` group for one hour with scalar `node=72` placement rather than a torus
-shape, allowing a non-contiguous allocation. It runs an eight-token dummy transport
-gate followed by a 256-token partial-real layer-1 decode profile. Automatic hierarchy
-selection resolves to twelve six-rank groups.
+`small` group for one hour with scalar `node=72` placement rather than a torus shape,
+allowing a non-contiguous allocation. The named `small-s4` group is disabled for this
+project and must not be requested explicitly. The job runs an eight-token dummy
+transport gate followed by a 256-token partial-real layer-1 decode profile. Automatic
+hierarchy selection resolves to twelve six-rank groups.
 
 TP72 uses the runner's balanced ragged ownership: ranks 0--23 own 64 expert channels
 and two attention heads, while ranks 24--71 own 32 channels and one head. The job does

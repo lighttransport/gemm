@@ -2,7 +2,7 @@
 # One-hour TP72 non-contiguous partial-real decode calibration job.
 # A scalar node request deliberately avoids a torus-shape placement constraint.
 #PJM -g hp250467
-#PJM -L "rscgrp=small-s4,node=72,elapse=01:00:00"
+#PJM -L "rscgrp=small,node=72,elapse=01:00:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
 #PJM --mpi "proc=72"
 #PJM --llio localtmp-size=1Gi
