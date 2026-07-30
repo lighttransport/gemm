@@ -392,7 +392,7 @@ def prefill(split: WeightSplit, nodes: int, tokens: int, chunk: int,
             link_gbps: float, moe_collectives: int,
             hierarchical_ar: bool, expert_tp: bool = False,
             fused_moe_ar: bool = False,
-            expert_prefill_ms=(1.730, 6.621, 23.492)) -> dict:
+            expert_prefill_ms=(1.783, 6.742, 23.929)) -> dict:
     # Every dense/shardable byte corresponds approximately to one matrix weight used once/token.
     # MXFP4 expert bytes are 0.53125 B/weight including scales.
     dense_weights = (split.replicated + split.shardable / nodes) * 1e9 / 2.0
@@ -594,7 +594,7 @@ def main() -> None:
                    help="conservative per-rank dense BF16 GEMM floor (real K3 probe: 2.0--4.7 TFLOP/s)")
     p.add_argument("--mla-tflops",type=float,default=.4375,
                    help="independent per-rank prefill MLA rate; not inferred from dense GEMM")
-    p.add_argument("--expert-prefill-ms",type=csv_floats,default=csv_floats("1.730,6.621,23.492"),
+    p.add_argument("--expert-prefill-ms",type=csv_floats,default=csv_floats("1.783,6.742,23.929"),
                    help="measured TP96 expert-layer milliseconds at chunks 64,256,1024")
     p.add_argument("--latency-us", type=float, default=20.0, help="assumed allreduce latency per log2 step")
     p.add_argument("--link-gbps", type=float, default=8.0)

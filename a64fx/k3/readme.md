@@ -1345,3 +1345,47 @@ validated the retained real slice on all 12 ranks and exited zero. A subsequent
 coordinated `signal-term` path, no runner/`mpiexec`/`plexec` process survived, and a
 fresh two-step distributed launch passed immediately. This specifically validates the
 edit/build/stop/restart loop needed for later TP96 development allocations.
+
+### Logical TP96 estimate on 12 physical nodes
+
+`run_expert_tp_probe_mpi.sh --logical-tp 96 --logical-waves 8` maps logical rank
+`physical_rank + 12*wave` and therefore samples all 96 distinct group-32 weight
+slices using the 12-node allocation. Each wave stages only its bounded TP slice,
+runs the real selected-expert or prefill kernel, then advances to the next logical
+rank. This is stronger than repeating one weight eight times because it captures
+the complete checkpoint-dependent critical-rank distribution.
+
+On job `49862159`, all 96/96 decode samples and all 96/96 prefill samples passed
+their local numerical references. Decode selected-expert latency had 0.061 ms
+median, 0.062 ms p95, and 0.063 ms maximum. Real expert-prefill results were:
+
+| M | median | p95 | maximum |
+|---:|---:|---:|---:|
+| 64 | 1.724 ms | 1.783 ms | 2.356 ms |
+| 256 | 6.611 ms | 6.742 ms | 7.327 ms |
+| 1,024 | 23.491 ms | 23.929 ms | 25.818 ms |
+
+The p95 values are now the default `--expert-prefill-ms` simulator calibration.
+With the measured 0.062 ms decode expert p95, the 96-node whole-network estimate is
+18.10 tok/s at 1K context and 18.00 tok/s at 4K. An 8K prompt estimates 129.7,
+136.3, and 142.7 tok/s for chunks 64, 256, and 1,024. Substituting the isolated
+0.070 ms cold decode sample and maximum prefill values gives a conservative
+17.86/17.76 tok/s decode and 117.2/132.5/139.4 tok/s prefill range.
+
+Communication remains the extrapolated part. An eight-layer, 4,096-token stress run
+completed 32,768 real K3-payload hierarchical reductions on 12 nodes at 0.1183 ms
+per layer and exact rank agreement. The simulator then applies its 96-node hierarchy
+model, producing 24.7 ms communication per decode stack. Twelve nodes cannot reproduce
+96-node link contention, failure probability, or physical topology; these figures are
+planning estimates until queued job `49863795` runs, not a substitute for its result.
+
+Reproduce both real-weight sweeps with:
+
+```sh
+K3_KEEP_RESULTS=1 a64fx/k3/run_expert_tp_probe_mpi.sh --nodes 12 \
+  --logical-tp 96 --logical-waves 8 --layer 1 --experts 16 --threads 48 \
+  --result-dir a64fx/k3/logs/logical96-decode-$PJM_JOBID
+K3_KEEP_RESULTS=1 a64fx/k3/run_expert_tp_probe_mpi.sh --nodes 12 \
+  --logical-tp 96 --logical-waves 8 --layer 1 --experts 16 --threads 48 \
+  --prefill --result-dir a64fx/k3/logs/logical96-prefill-$PJM_JOBID
+```
