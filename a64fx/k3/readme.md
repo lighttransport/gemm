@@ -1270,8 +1270,13 @@ directory and no temporary root.
 
 Queued 96-node smoke job `49852287` never started and produced no runner logs. It was
 held by the scheduler with `RSCGRP STOP`, then explicitly canceled on 2026-07-30. The
-replacement 10-minute small-group smoke job `49860807` is queued with the dummy gate
-followed by a bounded 16-expert real stage; it will resolve `auto` to 16 groups.
+replacement 10-minute small-group smoke job `49860807` ran on 2026-07-30 at 14:51.
+All 96 ranks completed the two-token, three-layer dummy graph with finite health,
+identical printed checksums, 4.06 MiB peak pool use, and the resolved 6x16 hierarchy.
+The then-current SUM/96 checksum verifier nevertheless produced rank-dependent
+rounding and falsely marked every rank `numeric-failed`; the dummy gate correctly
+prevented the real stage. The max/min FP32 verifier in commit `958defee` directly
+fixes this observed 96-node failure. A replacement run has not been submitted.
 
 All figures in this section are partial-runner measurements: real mode supplies real
 MXFP4 expert slices but still uses synthetic attention projections and omits the full
