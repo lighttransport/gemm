@@ -825,6 +825,55 @@ K3_KEEP_RESULTS=1 ./run_expert_tp_probe_mpi.sh \
   --nodes 12 --experts 16 --threads 48 --prefill
 ```
 
+### Dense BF16 prefill calibration
+
+Dense prefill now has a real A64FX path rather than a simulator-only FLOP
+assumption. `k3_prefill_gemm_bf16_pv` reuses the proven 8x48 SVE microkernel,
+but owns the K3-specific execution contract:
+
+- Real row-major K3 weights are packed directly into pair-interleaved Kx48
+  panels. No full transpose is constructed.
+- Packed weights and activation workspace are supplied by `k3_pool`; the GEMM
+  performs no allocation and all buffers remain 256-byte aligned.
+- Prefill is internally split into 256-token panels. This keeps the long-K
+  packed activation panel within the four CMG L2 caches and bounds scratch,
+  while callers may still submit larger chunks.
+- M and N tails use a bounded local micro-tile and are checked against an FP64
+  sampled reference before performance is reported.
+
+The partial-real test stages the layer-1 router, routed-latent down, and
+routed-latent up weights (110.25 MiB total). Correctness passed with sampled
+relative L2 error below `1.7e-6`. Representative 48-core mean throughput is:
+
+| Projection | M64 | M256 | M1024 |
+|---|---:|---:|---:|
+| Router 896x7168 | 1.60 TFLOP/s | 2.21 TFLOP/s | 2.10 TFLOP/s |
+| Down 3584x7168 | 2.05 TFLOP/s | 4.93 TFLOP/s | 4.74 TFLOP/s |
+| Up 7168x3584 | 2.98 TFLOP/s | 4.94 TFLOP/s | 4.78 TFLOP/s |
+
+Without paneling, M1024 routed-down reached only 2.16 TFLOP/s. The 256-token
+panel raises it to 4.74 TFLOP/s and reduces probe peak active memory from
+243.47 to 208.47 MiB. The simulator uses a conservative 2.0 TFLOP/s dense
+floor instead of the measured 4.7 TFLOP/s large-projection rate. MLA has a
+separate 0.4375 TFLOP/s calibration, so dense improvements do not incorrectly
+accelerate long-context attention. Revised 96-node estimates are:
+
+| Prompt | Chunk 64 | Chunk 256 | Chunk 1,024 |
+|---:|---:|---:|---:|
+| 1K | 133.2 tok/s | 139.5 tok/s | 146.2 tok/s |
+| 8K | 131.0 tok/s | 137.1 tok/s | 143.5 tok/s |
+| 128K | 102.1 tok/s | 105.8 tok/s | 109.6 tok/s |
+
+Reproduce the dense probe after safely staging one layer:
+
+```sh
+python3 k3_dense_stage.py --output-dir /local/u14346/k3-dense-prefill \
+  --layer 1 --include-up
+OMP_PROC_BIND=close OMP_PLACES=cores ./k3_prefill_probe --threads 48 \
+  /local/u14346/k3-dense-prefill/layer01_dense.blob \
+  /local/u14346/k3-dense-prefill/layer01_dense.manifest
+```
+
 ## Runner runtime and command-line contract
 
 The K3 dense, KDA, and MoE probes now allocate through `k3_pool` in

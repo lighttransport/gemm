@@ -388,7 +388,7 @@ def decode(split: WeightSplit, nodes: int, context: int, batch: int,
 
 
 def prefill(split: WeightSplit, nodes: int, tokens: int, chunk: int,
-            gemm_tflops: float, kda_gops: float, latency_us: float,
+            gemm_tflops: float, mla_tflops: float, kda_gops: float, latency_us: float,
             link_gbps: float, moe_collectives: int,
             hierarchical_ar: bool, expert_tp: bool = False,
             fused_moe_ar: bool = False,
@@ -417,7 +417,7 @@ def prefill(split: WeightSplit, nodes: int, tokens: int, chunk: int,
     # Causal MLA: sum_{t=1}^T t dot/update work, distributed by head.
     pairs = tokens * (tokens + 1) / 2.0
     mla_ops = MLA_LAYERS * math.ceil(HEADS / nodes) * pairs * 2.0 * (192 + 128)
-    attention_s = mla_ops / (gemm_tflops * 0.35 * 1e12)
+    attention_s = mla_ops / (mla_tflops * 1e12)
     if fused_moe_ar:
         attention_comm = allreduce_seconds(nodes,HIDDEN*2*chunk,LAYERS,latency_us,link_gbps)
         dense_comm = allreduce_seconds(nodes,HIDDEN*2*chunk,1,latency_us,link_gbps)
@@ -463,7 +463,8 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
           f"MXFP4-BW={args.mxfp4_gbps:g} GB/s, "
           f"expert-M1={args.expert_ms:g} ms, "
           f"KDA={args.kda_gops:g} GOP/s, "
-          f"GEMM={args.gemm_tflops:g} TF/s, collective={args.latency_us:g} us/step, "
+          f"dense-GEMM={args.gemm_tflops:g} TF/s, MLA={args.mla_tflops:g} TF/s, "
+          f"collective={args.latency_us:g} us/step, "
           f"hierarchical={'on' if args.hierarchical_ar else 'off'}, "
           f"lean-decode={(args.lean_collective_speedup if args.hierarchical_ar else 1.0):g}x, "
           f"latent-overlap={'on' if args.latent_overlap else 'off'}")
@@ -533,7 +534,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"{'prompt':>7} {'chunk':>6} {'dense s':>9} {'expert s':>9} {'KDA s':>9} {'MLA s':>9} {'comm s':>9} {'tok/s':>9}")
     for tokens in args.prompts:
         for chunk in args.chunks:
-            p = prefill(split,args.nodes,tokens,chunk,args.gemm_tflops,args.kda_gops,
+            p = prefill(split,args.nodes,tokens,chunk,args.gemm_tflops,args.mla_tflops,args.kda_gops,
                         args.latency_us,args.link_gbps,args.moe_collectives,
                         args.hierarchical_ar,args.expert_tp,args.fused_moe_ar,
                         args.expert_prefill_ms)
@@ -589,7 +590,10 @@ def main() -> None:
                    help="apply measured 12-node 3x4 hierarchical AR speedup curve")
     p.add_argument("--kda-gops", type=float, default=14.73,
                    help="12-node mean one-head KDA rate at the optimal 8 threads")
-    p.add_argument("--gemm-tflops", type=float, default=1.25, help="assumed per-rank BF16-equivalent GEMM")
+    p.add_argument("--gemm-tflops", type=float, default=2.0,
+                   help="conservative per-rank dense BF16 GEMM floor (real K3 probe: 2.0--4.7 TFLOP/s)")
+    p.add_argument("--mla-tflops",type=float,default=.4375,
+                   help="independent per-rank prefill MLA rate; not inferred from dense GEMM")
     p.add_argument("--expert-prefill-ms",type=csv_floats,default=csv_floats("1.730,6.621,23.492"),
                    help="measured TP96 expert-layer milliseconds at chunks 64,256,1024")
     p.add_argument("--latency-us", type=float, default=20.0, help="assumed allreduce latency per log2 step")
@@ -645,6 +649,8 @@ def main() -> None:
         p.error("--decode-target-tolerance-pct must be nonnegative")
     if len(args.expert_prefill_ms)!=3 or any(x<=0 for x in args.expert_prefill_ms):
         p.error("--expert-prefill-ms expects three positive values for chunks 64,256,1024")
+    if args.gemm_tflops<=0 or args.mla_tflops<=0:
+        p.error("--gemm-tflops and --mla-tflops must be positive")
     if args.moe_prefetch_mib < 0 or args.prefetch_gbps <= 0 or args.prefetch_launch_us < 0 or args.lean_collective_speedup <= 0:
         p.error("prefetch size/overhead and lean speedup must be nonnegative/positive")
     split = fallback_weights() if args.no_manifest else scan_weights(args.model_dir)
