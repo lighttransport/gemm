@@ -276,6 +276,28 @@ Full-attention layer throughput, C=256 (`attn_bench.c`):
 - `_Static_assert` ties `LAGUNA_SLIDING_CAP` to `LAGUNA_PCHUNK`, so raising the
   chunk size past the ring is a build error rather than silent corruption.
 
+### 16K and 32K sampled C++ validation
+
+After a fresh node-local FP8 restage, the deterministic fixture from
+`tools/make_long_context.py` was run at the checkpoint's documented sampling
+settings (`temperature=0.7`, `top_p=0.95`; runner default `top_k=20`) with seed
+305441741. It hides `alpha=314159`, `beta=cobalt-orchid`, and `gamma=271828` near
+1/8, 1/2, and 7/8 of the prompt, then requires a complete C++20 program that
+uses and checks all three.
+
+| prompt | actual tokens | memory/rank | prefill | decode | result |
+|---|---:|---:|---:|---:|---|
+| 16K | 16,377 | 14.05 GB | 333.23 s, 49.1 tok/s | 123 tok, 12.1 tok/s | pass |
+| 32K | 32,767 | 14.81 GB | 854.37 s, 38.4 tok/s | 123 tok, 7.8 tok/s | pass |
+
+Both runs stopped naturally on EOS, retrieved every value exactly, produced the
+same concise program, compiled as C++20, and printed exactly
+`314159 cobalt-orchid 271828`. All 124 distributed token picks agreed in both
+runs and both reported `total_nan=0`. The 32K run retained 14.34 GB of memory
+headroom per rank. Full-attention cost is visible but well behaved: prefill
+attention rose from 117.8 s to 421.1 s, while decode attention rose from 50.41
+to 95.42 ms/token.
+
 ## Generation correctness
 
 Three fixes, in order of how badly they could bite:

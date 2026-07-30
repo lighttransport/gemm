@@ -2,6 +2,7 @@ build/
 logs/
 smoke/
 gen_*/
+long_context_tests/
 probe/
 *.ids
 bf16smoke/

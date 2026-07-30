@@ -165,6 +165,28 @@ that would fit, rather than being discovered by the OOM killer part way through 
 Per position only the full-attention layers' KV grows (~49 KB/token at 48 layers);
 sliding layers are ringed at `LAGUNA_SLIDING_CAP` and cost a constant.
 
+Generate reproducible retrieval-plus-C++ prompts at or just below a context
+budget with:
+
+```sh
+export LAGUNA_TOKENIZER=~/models/laguna-s21-fp8/tokenizer.json
+mkdir -p long_context_tests
+python3 tools/make_long_context.py --target 16384 \
+  --out long_context_tests/prompt_16k.ids \
+  --metadata long_context_tests/prompt_16k.json
+python3 tools/make_long_context.py --target 32768 \
+  --out long_context_tests/prompt_32k.ids \
+  --metadata long_context_tests/prompt_32k.json
+
+./run_laguna_s21_12n.sh generate --fp8 --no-stage --np 12 \
+  --ids "$PWD/long_context_tests/prompt_32k.ids" --max-new 2048 \
+  --sample --temp 0.7 --top-p 0.95 --seed 305441741 --prof
+```
+
+The fixture places three binding values near 1/8, 1/2, and 7/8 of the prompt,
+then asks for a complete C++20 program using all three. Validate both retrieval
+and executable correctness with `tools/cpp_quality.py gen.ids --run`.
+
 ## Tests
 
 ```

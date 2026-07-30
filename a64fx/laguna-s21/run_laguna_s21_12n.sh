@@ -154,7 +154,14 @@ if [ "$MODE" = generate ] && [ -z "$IDS" ]; then
       python3 "$HERE/tools/laguna_tok.py" encode "$PROMPT" --bos > "$IDS"
   fi
 fi
-[ "$MODE" = generate ] && echo "prompt ids: $(cat "$IDS")"
+if [ "$MODE" = generate ]; then
+  prompt_count=$(wc -w < "$IDS")
+  if [ "$prompt_count" -le 256 ]; then
+    echo "prompt ids: $(cat "$IDS")"
+  else
+    echo "prompt ids: $prompt_count tokens (full list omitted; $IDS)"
+  fi
+fi
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-47}"   # leave one core free (a64fx-omp-leave-one-core)
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
