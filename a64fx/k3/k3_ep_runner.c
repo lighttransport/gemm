@@ -53,6 +53,7 @@ typedef struct {
     int heartbeat_tokens;
     int ar_groups;
     int comm_robust;
+    int comm_poll_spins;
     int prefetch_mib;
     int prefetch_threads;
     k3_mode mode;
@@ -76,6 +77,8 @@ static volatile sig_atomic_t g_stop_signal;
 static int g_spare_cpu=-1;
 
 static void handle_stop_signal(int sig){g_stop_signal=sig;}
+static void runner_drain_mrq(void){struct utofu_mrq_notice notice;
+    while(utofu_poll_mrq(g_vcq,0,&notice)==UTOFU_SUCCESS){} }
 
 static double now_sec(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static void usage(const char *p){
@@ -85,7 +88,8 @@ static void usage(const char *p){
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
         "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
-        "          [--ar-groups N] [--comm-robust 1|2] [--prefetch-mib N] [--prefetch-threads N]\n"
+        "          [--ar-groups N] [--comm-robust 1|2] [--comm-poll-spins N]\n"
+        "          [--prefetch-mib N] [--prefetch-threads N]\n"
         "          (ar-groups: 0=flat, otherwise N contiguous groups)\n",p);
 }
 static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
@@ -96,7 +100,7 @@ static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
 }
 static int parse_options(int argc,char **argv,k3_options *o){
     *o=(k3_options){.nodes=96,.layers=1,.tokens=2,.threads=48,.layer=1,
-        .mla_cache_bf16=1,.heartbeat_tokens=1024,.comm_robust=2,
+        .mla_cache_bf16=1,.heartbeat_tokens=1024,.comm_robust=2,.comm_poll_spins=8,
         .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.stage_dir="/local/k3-runner",
         .status_dir=".",.topo_path="tofu_topo.txt"};
     for(int i=1;i<argc;++i){const char *a=argv[i];
@@ -116,6 +120,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--heartbeat-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->heartbeat_tokens))return-1;}
         else if(!strcmp(a,"--ar-groups")){VALUE();if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
         else if(!strcmp(a,"--comm-robust")){VALUE();if(parse_int(a,argv[i],1,2,&o->comm_robust))return-1;}
+        else if(!strcmp(a,"--comm-poll-spins")){VALUE();if(parse_int(a,argv[i],1,1024,&o->comm_poll_spins))return-1;}
         else if(!strcmp(a,"--prefetch-mib")){VALUE();if(parse_int(a,argv[i],0,32,&o->prefetch_mib))return-1;}
         else if(!strcmp(a,"--prefetch-threads")){VALUE();if(parse_int(a,argv[i],0,48,&o->prefetch_threads))return-1;}
         else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
@@ -138,6 +143,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
     if(o->ar_groups>0&&(o->ar_groups==1||o->nodes%o->ar_groups)){
         fprintf(stderr,"k3_ep_runner: --ar-groups must be 0 or a divisor in [2,--nodes], got %d for %d nodes\n",
                 o->ar_groups,o->nodes);return-1;}
+    if(o->comm_poll_spins&(o->comm_poll_spins-1)){
+        fprintf(stderr,"k3_ep_runner: --comm-poll-spins must be a power of two, got %d\n",o->comm_poll_spins);return-1;}
     if(!o->kda_threads)o->kda_threads=o->threads<8?o->threads:8;
     if(!o->fused_threads)o->fused_threads=o->threads;
     if(o->kda_threads>o->threads||o->fused_threads>o->threads){
@@ -222,9 +229,13 @@ static int put_issue(utofu_vcq_id_t peer,utofu_stadd_t src,utofu_stadd_t dst,siz
     do{rc=utofu_put(g_vcq,peer,src,dst,bytes,0,g_put_flags,NULL);if(rc==UTOFU_ERR_BUSY)(void)utofu_poll_tcq(g_vcq,0,&cb);}while(rc==UTOFU_ERR_BUSY);
     if(rc!=UTOFU_SUCCESS)return rc;
     do{rc=utofu_poll_tcq(g_vcq,0,&cb);}while(rc==UTOFU_ERR_NOT_FOUND);
-    return rc;
+    runner_drain_mrq();return rc;
 }
-static int wait_ge(volatile uint64_t *p,uint64_t want){double start=now_sec();while(*p<want)if(now_sec()-start>K3_WAIT_TIMEOUT)return-1;return 0;}
+static int wait_ge(volatile uint64_t *p,uint64_t want){double start=now_sec();unsigned spins=0;
+    runner_drain_mrq();tp_ar_flag_inval(p);
+    while(*p<want){if((++spins&7u)==0){runner_drain_mrq();tp_ar_flag_inval(p);}
+        if(now_sec()-start>K3_WAIT_TIMEOUT)return-1;}
+    runner_drain_mrq();return 0;}
 static void runner_barrier(void){
     uint64_t token=++g_bar_token;char *send=g_region+g_send_off;
     if(g_rank==0){
@@ -237,7 +248,8 @@ static void runner_barrier(void){
         volatile uint64_t *go=(volatile uint64_t*)(g_region+bar_go_off());double start=now_sec();
         do{*(volatile uint64_t*)send=token;int rc=put_issue(g_peer_vcq[0],g_base+g_send_off,g_peer_base[0]+bar_recv_off(g_rank),8);
             if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: barrier put rc=%d\n",g_rank,rc);exit(3);}
-            for(int i=0;i<50&&*go<token;++i)usleep(2000);
+            for(int i=0;i<50;++i){runner_drain_mrq();tp_ar_flag_inval(go);
+                if(*go>=token)break;usleep(2000);}
             if(now_sec()-start>K3_WAIT_TIMEOUT){fprintf(stderr,"k3_ep_runner rank %d: barrier release timeout\n",g_rank);exit(3);}
         }while(*go<token);
     }
@@ -488,6 +500,11 @@ int main(int argc,char **argv){
     g_slot_send=DEMO_CACHE_LINE;g_slot_bar=DEMO_CACHE_LINE;g_send_off=0;g_bar_base=g_slot_send;
     size_t region_bytes=g_bar_base+(size_t)(g_nodes+1)*g_slot_bar;
     g_region=k3_pool_calloc(&pool,1,region_bytes);if(!g_region){fprintf(stderr,"%s\n",k3_pool_error(&pool));k3_pool_destroy(&pool);return 2;}
+    /* RDMA-polled slots must be clean before registration.  This prevents a
+     * later dc civac from writing a dirty startup zero over an arrived Put. */
+    for(size_t off=0;off<region_bytes;off+=DEMO_CACHE_LINE)
+        __asm__ __volatile__("dc civac, %0"::"r"(g_region+off):"memory");
+    __asm__ __volatile__("dsb sy":::"memory");
 
     utofu_tni_id_t *tnis=NULL;size_t ntni=0;rc=utofu_get_onesided_tnis(&tnis,&ntni);
     if(rc!=UTOFU_SUCCESS||ntni<1){fprintf(stderr,"k3_ep_runner rank %d: no one-sided TNI (rc=%d count=%zu)\n",g_rank,rc,ntni);k3_pool_destroy(&pool);return 3;}
@@ -500,7 +517,8 @@ int main(int argc,char **argv){
         if(rc==UTOFU_SUCCESS)rc=utofu_query_stadd(g_peer_vcq[r],K3_RUN_STAG,&g_peer_base[r]);
         if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: peer %d bootstrap rc=%d\n",g_rank,r,rc);return 3;}}
     free(tnis);runner_barrier();
-    tp_comm_config comm_config={.robust=opt.comm_robust,.a2a_max=8192,.ack_retx=64,.ack_rtt=0.001,.timeout=120.0};
+    tp_comm_config comm_config={.robust=opt.comm_robust,.poll_spins=opt.comm_poll_spins,
+        .a2a_max=8192,.ack_retx=64,.ack_rtt=0.001,.timeout=120.0};
     if(opt.profile&&getenv("K3_DEBUG_COMM_DROP_N")){
         comm_config.drop_n=strtoul(getenv("K3_DEBUG_COMM_DROP_N"),NULL,10);
         if(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))comm_config.timeout=atof(getenv("K3_DEBUG_COMM_TIMEOUT_MS"))*1e-3;}
@@ -695,9 +713,9 @@ int main(int argc,char **argv){
     write_status(&opt,final_state,final_reason,tokens_completed,last_layer,runner_comm_seq(&comm),seconds,checksum,pool.peak_active_bytes);
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
-        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
+        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
             opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",
-            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.prefetch_mib,
+            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.comm_poll_spins,opt.prefetch_mib,
             opt.prefetch_threads?opt.prefetch_threads:(opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS),(unsigned long long)prefetch_sink);
         printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
             !comm_failed&&!stop_signal&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal?"STOPPED":"FAIL",final_reason,tokens_completed,

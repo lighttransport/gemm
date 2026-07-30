@@ -44,6 +44,7 @@
 
 typedef struct {
     int use_bf16, deterministic, robust;
+    int poll_spins;
     int a2a, a2a_max;
     int ack, ack_retx;
     double ack_rtt, timeout;
@@ -66,7 +67,8 @@ typedef struct {
     int             use_bf16;                /* TP_AR_BF16=1: halve reduce payload */
     int             deterministic;           /* TP_AR_DETERMINISTIC=1: fixed-root reduce/broadcast */
     int             robust;                  /* TP_AR_ROBUST: 0=passive spin, 1=drain+civac per spin,
-                                              * 2=LEAN decode path (amortized drain + civac every 64 spins) */
+                                              * 2=LEAN decode path (configurable amortized civac) */
+    unsigned long   poll_mask;               /* robust=2 trailer invalidation cadence minus one */
     uint64_t        seq;                     /* monotonic call counter            */
     /* --- TP_AR_A2A: direct all-to-all sum for small (decode-size) payloads --- */
     int             a2a;                     /* TP_AR_A2A=1: enable */
@@ -213,8 +215,8 @@ static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
      * per-round cost of the decode all-reduce (the "robustness tax"). Amortize:
      * drain the MRQ once at wait ENTRY (+ once on completion, below) — overflow
      * pressure is ~1 notice per recv, so per-wait draining keeps the queue near
-     * empty without polling it inside the hot spin; civac the trailer line only
-     * every eighth spin — bounded staleness without a
+     * empty without polling it inside the hot spin; civac the trailer line at
+     * the configured power-of-two cadence — bounded staleness without a
      * clean+invalidate+dsb on every iteration. Correctness envelope is the same
      * as robust=1 (nothing is skipped, only done less often); validated
      * bitwise vs robust=1 under the qlair sim and for 16K sequential reduces
@@ -222,7 +224,7 @@ static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
     if (c->robust >= 2) tp_ar_drain_mrq(c);
     while (*trl < tok) {
         if (c->robust == 1) { tp_ar_drain_mrq(c); tp_ar_flag_inval(trl); }
-        else if (c->robust >= 2 && (spins & 7ul) == 7ul) tp_ar_flag_inval(trl);
+        else if (c->robust >= 2 && (spins & c->poll_mask) == c->poll_mask) tp_ar_flag_inval(trl);
         if (c->ack) tp_ar_service_pending(c);   /* re-drive my outstanding send while I block here */
         /* TP_AR_SPIN_DBG=1: report long spins UNBUFFERED (raw write; simulator-friendly —
          * under qlair the sim-time TP_AR_TIMEOUT is effectively unreachable). */
@@ -738,6 +740,7 @@ static tp_comm_config tp_comm_env_config(void) {
     o.use_bf16 = getenv("TP_AR_BF16") ? atoi(getenv("TP_AR_BF16")) : 0;
     o.deterministic = getenv("TP_AR_DETERMINISTIC") ? atoi(getenv("TP_AR_DETERMINISTIC")) : 0;
     o.robust = getenv("TP_AR_ROBUST") ? atoi(getenv("TP_AR_ROBUST")) : 1;
+    o.poll_spins = getenv("TP_AR_POLL_SPINS") ? atoi(getenv("TP_AR_POLL_SPINS")) : 8;
     o.a2a = getenv("TP_AR_A2A") ? atoi(getenv("TP_AR_A2A")) : 0;
     o.a2a_max = getenv("TP_AR_A2A_MAX") ? atoi(getenv("TP_AR_A2A_MAX")) : 8192;
     o.ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
@@ -770,7 +773,10 @@ static int tp_comm_init_region_ex(tp_comm *c, utofu_vcq_hdl_t vcq,
 
     tp_comm_config env;if(!options){env=tp_comm_env_config();options=&env;}
     c->use_bf16=options->use_bf16;c->deterministic=options->deterministic;
-    c->robust=options->robust;c->ack=options->ack;c->ack_retx=options->ack_retx;
+    int poll_spins=options->poll_spins>0?options->poll_spins:8;
+    if(poll_spins&(poll_spins-1))poll_spins=8;
+    c->robust=options->robust;c->poll_mask=(unsigned long)poll_spins-1;
+    c->ack=options->ack;c->ack_retx=options->ack_retx;
     c->ack_rtt=options->ack_rtt;c->timeout=options->timeout>0?options->timeout:TP_AR_TIMEOUT;
     c->drop_n=options->drop_n;c->a2a=options->a2a;
 
@@ -831,9 +837,9 @@ static int tp_comm_init_region_ex(tp_comm *c, utofu_vcq_hdl_t vcq,
      * drop=50 119 -> 2244 reduce/s). ack_retx*ack_rtt = 64 ms optimistic-proceed budget. */
     c->put_ctr  = 0;
     if (my_rank == 0)
-        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s deterministic=%d robust=%d ack=%d%s\n",
+        fprintf(stderr, "tp_ar: N=%d pof2=%d rem=%d rounds=%d payload=%s deterministic=%d robust=%d poll_spins=%lu ack=%d%s\n",
                 nprocs, c->pof2, c->rem, c->nrounds, c->use_bf16 ? "bf16" : "fp32", c->deterministic, c->robust,
-                c->ack, c->drop_n ? " DROP-INJECT" : "");
+                c->poll_mask+1,c->ack, c->drop_n ? " DROP-INJECT" : "");
     return 0;
 }
 

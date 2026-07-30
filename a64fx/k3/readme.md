@@ -730,6 +730,29 @@ Windows larger than 16 MiB are likewise rejected: real 24 and 32 MiB runs raised
 the collective stage to 212.4 and 245.0 us, more than the additional cached
 weight bytes can repay. The stable runner therefore keeps a 16 MiB window.
 
+The robust-2 trailer invalidation cadence is now exposed as
+`--comm-poll-spins N` (a power of two in `[1,1024]`) instead of being buried in
+the transport. The default remains eight. A 12-node sweep initially favored 32
+spins (93--99 us versus 105--108 us in clean 16K dummy trials), and 32 completed
+65,536 consecutive hierarchical layer steps without MRQ growth or a transport
+failure. A same-stage real-MXFP4 series, however, overlapped after system-wide
+slow runs were excluded: 8-spin clean runs were 98--103 us and 32-spin runs were
+97--114 us. This is therefore a 96-node tuning control, not a claimed model gain.
+
+Two further overlap experiments were rejected. Splitting the expert OpenMP team
+at the TP=96 local shape (32 channels/rank, 16 selected experts) raised the
+selected-expert critical path from 77--86 us to 202--282 us for 4--16 prefetch
+workers. Spreading the existing 32 prefetch workers across all four CMGs raised
+the 12-node overlapped stage from 118.4 to 338.3 us because the extra HBM pressure
+interfered with uTofu. Production retains the close-bound asynchronous path.
+
+The runner's outer bootstrap/final barrier now has the same RDMA cache-coherency
+envelope as the allreduce. Receive slots are cleaned before uTofu registration,
+flag polls periodically invalidate the A64FX cache line, and MRQ notices are
+drained at entry, progress, and completion. This closes a long-generation failure
+mode in which every token could finish but the final barrier could spin on a stale
+cached sequence value.
+
 Reproduce the real partial validation in a 12-node allocation with:
 
 ```sh

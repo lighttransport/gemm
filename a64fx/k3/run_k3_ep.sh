@@ -27,6 +27,7 @@ MLA_CACHE_BF16=1
 HEARTBEAT_TOKENS=1024
 AR_GROUPS=0
 COMM_ROBUST=2
+COMM_POLL_SPINS=8
 PREFETCH_MIB=0
 PREFETCH_THREADS=0
 
@@ -40,6 +41,7 @@ usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--heartbeat-tokens N]
           [--ar-groups N] (0=flat, otherwise N contiguous groups)
           [--comm-robust 1|2] (2=amortized polling, default)
+          [--comm-poll-spins N] (power-of-two robust-2 cadence, default 8)
           [--prefetch-mib N] (overlap a routed-up weight window with MoE reduce)
           [--prefetch-threads N] (0=auto, default)
 EOF
@@ -68,6 +70,7 @@ while (( $# )); do
         --heartbeat-tokens) need_value "$@"; HEARTBEAT_TOKENS=$2; shift 2;;
         --ar-groups) need_value "$@"; AR_GROUPS=$2; shift 2;;
         --comm-robust) need_value "$@"; COMM_ROBUST=$2; shift 2;;
+        --comm-poll-spins) need_value "$@"; COMM_POLL_SPINS=$2; shift 2;;
         --prefetch-mib) need_value "$@"; PREFETCH_MIB=$2; shift 2;;
         --prefetch-threads) need_value "$@"; PREFETCH_THREADS=$2; shift 2;;
         -h|--help) usage; exit 0;;
@@ -75,7 +78,7 @@ while (( $# )); do
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$AR_GROUPS" "$COMM_ROBUST" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$AR_GROUPS" "$COMM_ROBUST" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
@@ -86,6 +89,7 @@ done
 (( AR_GROUPS == 0 || (AR_GROUPS > 1 && NODES % AR_GROUPS == 0) )) || {
     echo "$0: --ar-groups must be 0 or a divisor in [2,--nodes]" >&2; exit 2; }
 (( COMM_ROBUST == 1 || COMM_ROBUST == 2 )) || { echo "$0: --comm-robust must be 1 or 2" >&2; exit 2; }
+(( COMM_POLL_SPINS > 0 && COMM_POLL_SPINS <= 1024 && (COMM_POLL_SPINS & (COMM_POLL_SPINS - 1)) == 0 )) || { echo "$0: --comm-poll-spins must be a power of two in [1,1024]" >&2; exit 2; }
 (( PREFETCH_THREADS <= THREADS )) || { echo "$0: --prefetch-threads cannot exceed --threads" >&2; exit 2; }
 if (( PREFETCH_MIB > 0 && THREADS > 47 )); then
     echo "$0: --prefetch-mib requires --threads <=47" >&2
@@ -152,7 +156,7 @@ else
 fi
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
+    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?
