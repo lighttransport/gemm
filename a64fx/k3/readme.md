@@ -960,6 +960,49 @@ was the slowest; cumulative throughput rose from 668 to 865 layer steps/s, confi
 that the short real-weight spike was startup/jitter rather than persistent transport
 failure.
 
+### Fixed-team accuracy, tail profiling, and recovery
+
+Fujitsu OpenMP dynamic teams are now disabled both in `k3_ep_runner` and the launch
+wrapper. This is an accuracy invariant: a 1,024-token partial-real sweep at fused-team
+size 32 produced checksum `-3.565328441`, while the unfused reference and team sizes
+16/24/40/48 all produced `+0.668299676`. With `OMP_DYNAMIC=false`, team 32 returns the
+reference checksum exactly. The runner also creates its full OpenMP team before the
+timed token loop. At team 32 this reduced worst observed KDA startup from 46.8 to
+1.07 ms; the production team remains 48 because its clean 2,048-step run sustained
+2,531 layer steps/s versus 2,071 at team 40.
+
+`--profile` now reports `K3_PROFILE_MAX` with the worst single KDA, MLA, expert, pack,
+collective, and residual occurrence in addition to rank-maximum averages. This keeps
+rare scheduler/arrival tails visible instead of hiding them in the mean. Progress
+files remain atomically renamed but are advisory and no longer `fsync` on the hot
+path; final per-rank status remains fsync-durable.
+
+The final agreement check now reduces FP32 checksum max/min bounds and compares them
+to the local FP32 checksum. The previous FP64-to-FP32 comparison created a false
+`4.254e-6` disagreement at a checksum near 443 even though every rank printed the
+same value. Final `tokens_completed` and `last_layer` are distributed minima, so a
+peer numeric failure produces one consistent recovery point. Injecting NaN at rank 3,
+token 2 caused all 12 ranks to publish `numeric-failed`, `reason=non-finite`, and
+`tokens_completed=2` without hanging.
+
+The communication reliability modes are explicit:
+
+- `--comm-ack 0` is the default clean-traffic path. A partial-real 2,048-step run
+  measured 2,531 layer steps/s and 0.103 ms rank-maximum mean all-reduce time.
+- `--comm-ack 1` enables bounded ACK/retransmit. With every seventh payload Put
+  deliberately dropped, all 12 ranks completed 128 steps with `2.365e-10` checksum
+  disagreement and a 5.061 ms worst recovered collective. On clean traffic ACK mode
+  measured 2,228 layer steps/s, about 12% below the default, so it remains opt-in.
+- `--comm-deterministic 1` exposes the fixed-root reduction for diagnostic accuracy
+  comparisons; normal execution remains `0` because fixed OpenMP teams and the
+  corrected verifier already preserve the observed rank agreement.
+
+A final 4,096-token dummy run covered three KDA layers and one growing-context MLA
+layer per token: 16,384 layer steps and 16,399 checked collectives passed on 12/12
+ranks at 2,298 layer steps/s. The BF16 MLA cache reached 20 MiB/rank, pool peak was
+45.15 MiB, checksum disagreement was exactly zero, and all latent/KDA/cache maxima
+remained finite.
+
 Short 96-node batch smoke scripts are `pjsub_k3_dummy_96n.sh` (five minutes, no model
 I/O), `pjsub_k3_real_96n.sh` (ten minutes, bounded partial weights), and
 `pjsub_k3_smoke_96n.sh` (ten minutes; dummy must pass before real staging begins). They use the

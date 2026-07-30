@@ -53,6 +53,8 @@ typedef struct {
     int heartbeat_tokens;
     int ar_groups;
     int comm_robust;
+    int comm_ack;
+    int comm_deterministic;
     int comm_poll_spins;
     int prefetch_mib;
     int prefetch_threads;
@@ -81,6 +83,9 @@ static void runner_drain_mrq(void){struct utofu_mrq_notice notice;
     while(utofu_poll_mrq(g_vcq,0,&notice)==UTOFU_SUCCESS){} }
 
 static double now_sec(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
+static void profile_add(double sum[6],double high[6],int phase,double seconds){
+    sum[phase]+=seconds;if(seconds>high[phase])high[phase]=seconds;
+}
 static void usage(const char *p){
     fprintf(stderr,
         "usage: %s [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]\n"
@@ -88,7 +93,9 @@ static void usage(const char *p){
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
         "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
-        "          [--ar-groups auto|N] [--comm-robust 1|2] [--comm-poll-spins N]\n"
+        "          [--ar-groups auto|N] [--comm-robust 1|2] [--comm-ack 0|1]\n"
+        "          [--comm-deterministic 0|1]\n"
+        "          [--comm-poll-spins N]\n"
         "          [--prefetch-mib N] [--prefetch-threads N]\n"
         "          (ar-groups: auto uses six-rank rows; 0 forces flat)\n",p);
 }
@@ -121,6 +128,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--ar-groups")){VALUE();if(!strcmp(argv[i],"auto"))o->ar_groups=-1;
             else if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
         else if(!strcmp(a,"--comm-robust")){VALUE();if(parse_int(a,argv[i],1,2,&o->comm_robust))return-1;}
+        else if(!strcmp(a,"--comm-ack")){VALUE();if(parse_int(a,argv[i],0,1,&o->comm_ack))return-1;}
+        else if(!strcmp(a,"--comm-deterministic")){VALUE();if(parse_int(a,argv[i],0,1,&o->comm_deterministic))return-1;}
         else if(!strcmp(a,"--comm-poll-spins")){VALUE();if(parse_int(a,argv[i],1,1024,&o->comm_poll_spins))return-1;}
         else if(!strcmp(a,"--prefetch-mib")){VALUE();if(parse_int(a,argv[i],0,32,&o->prefetch_mib))return-1;}
         else if(!strcmp(a,"--prefetch-threads")){VALUE();if(parse_int(a,argv[i],0,48,&o->prefetch_threads))return-1;}
@@ -359,7 +368,10 @@ static void write_progress(const k3_options *o,int tokens_completed,double secon
     int ok=fprintf(f,"state=running tokens_completed=%d seconds=%.6f tokens_per_s=%.3f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e min_available_mib=%.1f collective_seq=%lu\n",
         tokens_completed,seconds,seconds>0?tokens_completed/seconds:0.0,latent_max,state_max,cache_max,
         min_available_mib,(unsigned long)seq)>=0;
-    if(ok)ok=fflush(f)==0;if(ok)ok=fsync(fileno(f))==0;if(fclose(f))ok=0;
+    /* Progress is advisory and replaced frequently. A shared-filesystem fsync
+     * here stalls rank 0 long enough for every peer to wait in the next
+     * collective; final per-rank status remains fully fsync-durable. */
+    if(fclose(f))ok=0;
     if(ok)ok=rename(tmp,path)==0;if(!ok)unlink(tmp);
 }
 
@@ -486,6 +498,9 @@ static int synthetic_kda_expert_partial(float *shared,float *partial,const float
 
 int main(int argc,char **argv){
     k3_options opt;int parsed=parse_options(argc,argv,&opt);if(parsed)return parsed>0?0:2;
+    /* Dynamic teams changed the fused 32-thread recurrence result on libfjomp.
+     * Fixed team sizes are an accuracy invariant, not only a tuning choice. */
+    omp_set_dynamic(0);
     cpu_set_t initial_affinity;CPU_ZERO(&initial_affinity);
     if(!sched_getaffinity(0,sizeof initial_affinity,&initial_affinity))
         for(int i=0;i<CPU_SETSIZE;++i)if(CPU_ISSET(i,&initial_affinity))g_spare_cpu=i;
@@ -519,7 +534,8 @@ int main(int argc,char **argv){
         if(rc==UTOFU_SUCCESS)rc=utofu_query_stadd(g_peer_vcq[r],K3_RUN_STAG,&g_peer_base[r]);
         if(rc!=UTOFU_SUCCESS){fprintf(stderr,"k3_ep_runner rank %d: peer %d bootstrap rc=%d\n",g_rank,r,rc);return 3;}}
     free(tnis);runner_barrier();
-    tp_comm_config comm_config={.robust=opt.comm_robust,.poll_spins=opt.comm_poll_spins,
+    tp_comm_config comm_config={.robust=opt.comm_robust,.poll_spins=opt.comm_poll_spins,.ack=opt.comm_ack,
+        .deterministic=opt.comm_deterministic,
         .a2a_max=8192,.ack_retx=64,.ack_rtt=0.001,.timeout=120.0};
     if(opt.profile&&getenv("K3_DEBUG_COMM_DROP_N")){
         comm_config.drop_n=strtoul(getenv("K3_DEBUG_COMM_DROP_N"),NULL,10);
@@ -610,16 +626,26 @@ int main(int argc,char **argv){
     int async_ok=!async_rc;if(async_rc)fprintf(stderr,"k3_ep_runner rank %d: async worker: %s\n",g_rank,strerror(async_rc));
     ready_sum=(float)async_ok;collective_rc=runner_allreduce_sum(&comm,&ready_sum,1);
     if(collective_rc||(int)lrintf(ready_sum)!=g_nodes){
-        fprintf(stderr,"k3_ep_runner rank %d: async prefetch worker initialization failed (%d/%d ready)\n",
+        fprintf(stderr,"k3_ep_runner rank %d: post-allocation readiness failed (%d/%d ready)\n",
             g_rank,(int)lrintf(ready_sum),g_nodes);runner_async_destroy(&async_reduce);runner_comm_free(&comm);
         utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
+    /* Pay OpenMP worker creation before the timed token loop. */
+    int warm_threads=1;omp_set_num_threads(opt.threads);
+#pragma omp parallel
+    {
+#pragma omp master
+        warm_threads=omp_get_num_threads();
+    }
+    if(warm_threads!=opt.threads)fprintf(stderr,
+        "k3_ep_runner rank %d: requested %d OpenMP workers but runtime created %d\n",
+        g_rank,opt.threads,warm_threads);
     for(int i=0;i<K3_LATENT;++i)latent[i]=sinf((float)(i+1)*0.001f)*0.125f;
 
     int debug_rank=-1,debug_token=-1,debug_layer=-1;
     if(opt.profile&&getenv("K3_DEBUG_NAN_RANK")){debug_rank=atoi(getenv("K3_DEBUG_NAN_RANK"));
         debug_token=getenv("K3_DEBUG_NAN_TOKEN")?atoi(getenv("K3_DEBUG_NAN_TOKEN")):-1;
         debug_layer=getenv("K3_DEBUG_NAN_LAYER")?atoi(getenv("K3_DEBUG_NAN_LAYER")):-1;}
-    runner_barrier();double start=now_sec(),phase[6]={0};int finite=1,stopped=0,comm_failed=0;
+    runner_barrier();double start=now_sec(),phase[6]={0},phase_max[6]={0};int finite=1,stopped=0,comm_failed=0;
     int stop_numeric=0,stop_signal=0,tokens_completed=0,last_layer=-1;float cache_running_max=0.0f;
     uint64_t prefetch_sink=0;
     for(int token=0;token<opt.tokens&&!stopped;++token){
@@ -634,20 +660,20 @@ int main(int argc,char **argv){
             if(fused){double ft[2]={0};if(synthetic_kda_expert_partial(shared,partial,latent,
                     state_slot[layer],global_layer,token,local_heads,first_head,kda_state,q,k,v,decay,attn_out,
                     w1,w2,w3,route,gate,up,opt.fused_threads,opt.profile,ft))finite=0;
-                if(opt.profile){phase[0]+=ft[0];phase[2]+=ft[1];}}
+                if(opt.profile){profile_add(phase,phase_max,0,ft[0]);profile_add(phase,phase_max,2,ft[1]);}}
             else{pt=opt.profile?now_sec():0;
                 synthetic_attention_partial(shared,latent,state_slot[layer],global_layer,token,opt.tokens,local_heads,first_head,
                     kda_state,mla_keys,mla_values,opt.mla_cache_bf16,q,k,v,decay,attn_out,mla_scratch,mla_stats,
                     &cache_running_max,layer_is_kda(global_layer)?opt.kda_threads:opt.threads);
-                if(opt.profile)phase[layer_is_kda(global_layer)?0:1]+=now_sec()-pt;
+                if(opt.profile)profile_add(phase,phase_max,layer_is_kda(global_layer)?0:1,now_sec()-pt);
                 pt=opt.profile?now_sec():0;
                 if(global_layer==0)memset(partial,0,K3_LATENT*sizeof(float));
                 else if(k3_expert_tp_forward_selected_mxfp4(partial,w1,w2,w3,route,K3_SELECTED,latent,gate,up,NULL,opt.threads))finite=0;
-                if(opt.profile)phase[2]+=now_sec()-pt;}
+                if(opt.profile)profile_add(phase,phase_max,2,now_sec()-pt);}
             pt=opt.profile?now_sec():0;k3_moe_pack_reduce(reduce,partial,shared);
             reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
             reduce[K3_CONTROL_NUMERIC]=finite?0.0f:1.0f;
-            if(opt.profile)phase[3]+=now_sec()-pt;pt=opt.profile?now_sec():0;
+            if(opt.profile)profile_add(phase,phase_max,3,now_sec()-pt);pt=opt.profile?now_sec():0;
             if(prefetch_bytes){runner_comm_set_robust(&comm,1);
                 runner_async_submit(&async_reduce,reduce,K3_RUN_REDUCE_FLOATS);
                 int pth=opt.prefetch_threads?opt.prefetch_threads:
@@ -659,13 +685,13 @@ int main(int argc,char **argv){
             if(collective_rc){
                 fprintf(stderr,"k3_ep_runner rank %d: layer collective failed at token=%d layer=%d: %s\n",
                     g_rank,token,global_layer,runner_comm_error(&comm));comm_failed=stopped=1;break;}
-            if(opt.profile)phase[4]+=now_sec()-pt;
+            if(opt.profile)profile_add(phase,phase_max,4,now_sec()-pt);
             if(reduce[K3_CONTROL_SIGNAL]>0||reduce[K3_CONTROL_NUMERIC]>0){
                 stop_signal=reduce[K3_CONTROL_SIGNAL]>0;stop_numeric=reduce[K3_CONTROL_NUMERIC]>0;stopped=1;break;}
             pt=opt.profile?now_sec():0;residual_update(latent,reduce);last_layer=global_layer;
             if(g_rank==debug_rank&&token==debug_token&&global_layer==debug_layer)latent[0]=NAN;
             for(int i=0;i<K3_LATENT;++i)finite&=isfinite(latent[i]);
-            if(opt.profile)phase[5]+=now_sec()-pt;
+            if(opt.profile)profile_add(phase,phase_max,5,now_sec()-pt);
         }
         if(!stopped&&finite)tokens_completed=token+1;
         int heartbeat=opt.heartbeat_tokens>0&&((token+1)%opt.heartbeat_tokens==0||token+1==opt.tokens);
@@ -681,7 +707,7 @@ int main(int argc,char **argv){
             if(stop_signal||stop_numeric)stopped=1;
             double elapsed=now_sec()-start;write_progress(&opt,tokens_completed,elapsed,hb[2],hb[3],hb[4],-hb[5],runner_comm_seq(&comm));
             if(g_rank==0){printf("K3_PROGRESS tokens=%d/%d elapsed_s=%.3f tokens_per_s=%.3f min_available_MiB=%.1f latent_max=%.6e state_max=%.6e cache_max=%.6e collective_seq=%lu\n",
-                tokens_completed,opt.tokens,elapsed,elapsed>0?tokens_completed/elapsed:0.0,-hb[5],hb[2],hb[3],hb[4],(unsigned long)runner_comm_seq(&comm));fflush(stdout);}
+                tokens_completed,opt.tokens,elapsed,elapsed>0?tokens_completed/elapsed:0.0,-hb[5],hb[2],hb[3],hb[4],(unsigned long)runner_comm_seq(&comm));}
         }
     }
     if(!comm_failed)runner_barrier();double seconds=now_sec()-start,checksum=0,norm2=0;
@@ -700,24 +726,28 @@ int main(int argc,char **argv){
 #pragma omp parallel for reduction(max:cache_max)
         for(size_t i=0;i<mla_value_elems;++i){float a=fabsf(values[i]);if(a>cache_max)cache_max=a;}}
     runner_async_destroy(&async_reduce);
-    float health[3]={latent_max,state_max,cache_max};float checksum_sum=(float)checksum;
-    if(!comm_failed&&(runner_allreduce_max(&comm,health,3)||
-            runner_allreduce_sum(&comm,&checksum_sum,1))){
+    float health[5]={latent_max,state_max,cache_max,-(float)tokens_completed,-(float)last_layer};
+    float checksum_local=(float)checksum,checksum_bounds[2]={checksum_local,-checksum_local};
+    if(!comm_failed&&(runner_allreduce_max(&comm,health,5)||
+            runner_allreduce_max(&comm,checksum_bounds,2))){
         fprintf(stderr,"k3_ep_runner rank %d: final health collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;}
-    if(opt.profile&&!comm_failed)for(int i=0;i<6;++i){float x=(float)phase[i];
-        if(runner_allreduce_max(&comm,&x,1)){fprintf(stderr,"k3_ep_runner rank %d: profile collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;break;}phase[i]=x;}
-    double disagreement=comm_failed?INFINITY:fabs((double)checksum_sum/g_nodes-checksum);
-    finite&=!comm_failed&&isfinite(checksum)&&isfinite(norm2)&&disagreement<1e-4;
-    if(!finite)stop_numeric=1;
+    if(!comm_failed){tokens_completed=(int)lrintf(-health[3]);last_layer=(int)lrintf(-health[4]);}
+    if(opt.profile&&!comm_failed)for(int i=0;i<6;++i){float x[2]={(float)phase[i],(float)phase_max[i]};
+        if(runner_allreduce_max(&comm,x,2)){fprintf(stderr,"k3_ep_runner rank %d: profile collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;break;}phase[i]=x[0];phase_max[i]=x[1];}
+    double checksum_min=-(double)checksum_bounds[1],checksum_max=(double)checksum_bounds[0];
+    double disagreement=comm_failed?INFINITY:fmax(fabs(checksum_max-checksum_local),fabs(checksum_local-checksum_min));
+    int rank_diverged=!comm_failed&&disagreement>=1e-6;
+    finite&=!comm_failed&&isfinite(checksum)&&isfinite(norm2);
+    if(!finite||rank_diverged)stop_numeric=1;
     const char *final_state=comm_failed?"comm-failed":stop_signal?"stopped":stop_numeric?"numeric-failed":"pass";
     const char *final_reason=comm_failed?"collective-error":stop_signal?(g_stop_signal==SIGINT?"signal-int":g_stop_signal==SIGTERM?"signal-term":"signal-peer"):
-        stop_numeric?"non-finite":"complete";
+        stop_numeric?(rank_diverged&&finite?"rank-divergence":"non-finite"):"complete";
     write_status(&opt,final_state,final_reason,tokens_completed,last_layer,runner_comm_seq(&comm),seconds,checksum,pool.peak_active_bytes);
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
-        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
+        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d comm_ack=%d comm_deterministic=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
             opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",
-            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.comm_poll_spins,opt.prefetch_mib,
+            opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.comm_ack,opt.comm_deterministic,opt.comm_poll_spins,opt.prefetch_mib,
             opt.prefetch_threads?opt.prefetch_threads:(opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS),(unsigned long long)prefetch_sink);
         printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
             !comm_failed&&!stop_signal&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal?"STOPPED":"FAIL",final_reason,tokens_completed,
@@ -730,6 +760,8 @@ int main(int argc,char **argv){
         if(g_rank==0){double sum=0;for(int i=0;i<6;++i)sum+=phase[i];
             printf("K3_PROFILE rank_max_ms_per_layer");for(int i=0;i<6;++i)printf(" %s=%.4f",names[i],phase[i]*1e3/steps);
             printf(" measured_upper=%.4f upper_pct=%.1f\n",sum*1e3/steps,seconds>0?100.0*sum/seconds:0.0);
+            printf("K3_PROFILE_MAX rank_max_single_ms");for(int i=0;i<6;++i)printf(" %s=%.4f",names[i],phase_max[i]*1e3);
+            printf("\n");
         fflush(stdout);}
     }
     if(!comm_failed)runner_barrier();runner_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
