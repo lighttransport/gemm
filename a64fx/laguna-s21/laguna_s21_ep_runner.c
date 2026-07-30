@@ -754,7 +754,7 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
 #define LAGUNA_ATTN_CORE_STREAM 0
 #endif
 #ifndef LAGUNA_ATTN_CORE_STREAM_MAX_KEYS
-#define LAGUNA_ATTN_CORE_STREAM_MAX_KEYS 24000
+#define LAGUNA_ATTN_CORE_STREAM_MAX_KEYS 16000
 #endif
 #ifndef LAGUNA_KB
 /* Streamed full-attention decode uses a key-block online softmax pass.  A 2K
