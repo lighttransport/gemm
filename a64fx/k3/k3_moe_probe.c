@@ -267,8 +267,9 @@ static int tp_slices_correctness(const loaded_expert *le, int nslice, int thread
 }
 
 static int tp_prefill_probe(const loaded_expert *le,int nslice,int threads){
-    enum{E=896,TK=16,MAX_B=1024};int local=le[0].w1.rows;if(local!=32){
-        fprintf(stderr,"k3_moe_probe: --prefill TP probe requires 32 channels/rank, got %d\n",local);return 1;}
+    enum{E=896,TK=16,MAX_B=1024};int local=le[0].w1.rows;
+    if(local<K3_EXPERT_TP_BLOCK||local%K3_EXPERT_TP_BLOCK){
+        fprintf(stderr,"k3_moe_probe: --prefill requires native 32-channel TP groups, got %d\n",local);return 1;}
     k3_mxfp4_matrix*w1=probe_alloc((size_t)E*sizeof(*w1)),*w2=probe_alloc((size_t)E*sizeof(*w2)),*w3=probe_alloc((size_t)E*sizeof(*w3));
     int*routes=probe_alloc((size_t)MAX_B*TK*sizeof(*routes)),*counts=probe_alloc(E*sizeof(*counts));
     int*offsets=probe_alloc((E+1)*sizeof(*offsets)),*positions=probe_alloc((size_t)MAX_B*TK*sizeof(*positions));

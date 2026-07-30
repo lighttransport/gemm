@@ -26,6 +26,7 @@ class K3AdapterTest(unittest.TestCase):
         })
         self.assertIn("--stage-only", argv)
         self.assertEqual(argv[argv.index("--nodes") + 1], "96")
+        self.assertEqual(argv[argv.index("--tp-nodes") + 1], "96")
         self.assertEqual(argv[argv.index("--experts") + 1], "0-7")
         self.assertEqual(env, {})
         self.assertEqual(cwd, models.K3_DIR)
@@ -38,9 +39,19 @@ class K3AdapterTest(unittest.TestCase):
         self.assertIn("--reuse-stage", argv)
         self.assertEqual(argv[argv.index("--tokens") + 1], "32")
 
+    def test_192_nodes_split_into_two_tp96_contexts(self):
+        argv, _env, _cwd = self.a.generate({
+            "np": 192, "layer": 1, "tokens": 32, "dummy": True,
+            "result_dir": "/shared/k3-run",
+        })
+        self.assertEqual(argv[argv.index("--nodes") + 1], "192")
+        self.assertEqual(argv[argv.index("--tp-nodes") + 1], "96")
+
     def test_real_layer_range_and_np_are_checked(self):
         with self.assertRaises(models.ConfigError):
-            self.a.generate({"np": 97})
+            self.a.generate({"np": 513})
+        with self.assertRaises(models.ConfigError):
+            self.a.generate({"np": 192, "tp_np": 72})
         with self.assertRaises(models.ConfigError):
             self.a.generate({"np": 12, "layer": 0})
 

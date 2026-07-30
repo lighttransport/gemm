@@ -451,6 +451,8 @@ def fmt_ctx(n: int) -> str:
 
 
 def report(args: argparse.Namespace, split: WeightSplit) -> dict:
+    tp_nodes = args.tp_nodes
+    replicas = args.nodes // tp_nodes
     result = {"assumptions": vars(args).copy(), "weights": split._asdict(), "memory": [],
               "decode": [], "prefill": []}
     print("Kimi K3 / A64FX performance model")
@@ -458,6 +460,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"manifest: {split.source} ({split.shards} shards, {split.tensors:,} tensors)")
     print(f"text weights: {split.total_text:.3f} GB = experts {split.experts:.3f} + "
           f"replicated {split.replicated:.3f} + TP {split.shardable:.3f}")
+    print(f"parallelism: physical={args.nodes} TP={tp_nodes} independent-contexts={replicas}")
     print(f"calibration: dense-BW={args.bw_gbps:g} GB/s, MLA-BW={args.mla_bw_gbps:g} GB/s, router/down={args.router_down_gbps:g} GB/s, "
           f"head-slice-BW={args.head_bw_gbps:g} GB/s, "
           f"MXFP4-BW={args.mxfp4_gbps:g} GB/s, "
@@ -482,7 +485,7 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     print(f"{'ctx':>5} {'M':>3} {'weights':>8} {'KDA':>7} {'MLA-KV':>8} {'total':>8} {'fit27':>6}")
     for ctx in args.contexts:
         for batch in args.batches:
-            m = memory(split, args.nodes, ctx, batch, args.kv_bytes, args.usable_gb,
+            m = memory(split, tp_nodes, ctx, batch, args.kv_bytes, args.usable_gb,
                        args.expert_tp, args.dense_q8, args.fused_moe_ar,
                        args.q8_up_only, args.q8w16_up, args.q8w16_dense)
             md = m._asdict()
@@ -493,15 +496,15 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
     if args.fused_moe_ar:
         calls = LAYERS + 1 + MOE_LAYERS
     else:
-        _, _, calls = collective_seconds(args.nodes, 1, args.moe_collectives,
+        _, _, calls = collective_seconds(tp_nodes, 1, args.moe_collectives,
                                          args.latency_us, args.link_gbps,
                                          args.hierarchical_ar)
     print(f"\nDecode (batch tokens/s; {calls} collectives/layer-stack)")
-    print(f"{'ctx':>5} {'M':>3} {'W ms':>7} {'Exp ms':>7} {'KV ms':>7} {'KDA':>7} {'comm':>7} {'tok/s':>9}")
+    print(f"{'ctx':>5} {'M':>3} {'W ms':>7} {'Exp ms':>7} {'KV ms':>7} {'KDA':>7} {'comm':>7} {'tok/s':>9} {'agg tok/s':>10}")
     target_decode = None
     for ctx in args.contexts:
         for batch in args.batches:
-            d = decode(split,args.nodes,ctx,batch,args.bw_gbps,args.mla_bw_gbps,args.router_down_gbps,args.head_bw_gbps,
+            d = decode(split,tp_nodes,ctx,batch,args.bw_gbps,args.mla_bw_gbps,args.router_down_gbps,args.head_bw_gbps,
                        args.mxfp4_gbps,args.kda_gops,
                        args.latency_us,args.link_gbps,args.imbalance,
                        args.expert_ms,args.expert_samples,args.moe_collectives,
@@ -511,9 +514,14 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
                        args.q8_up_only,args.q8w16_up,args.q8w16_up_gbps,
                        args.q8w16_dense,args.q8w16_pair_gbps,
                        args.moe_prefetch_mib,args.prefetch_gbps,args.prefetch_launch_us)
+            d["physical_nodes"] = args.nodes
+            d["tp_nodes"] = tp_nodes
+            d["independent_contexts"] = replicas
+            d["aggregate_tokens_per_second"] = d["tokens_per_second"] * replicas
             result["decode"].append(d)
             print(f"{fmt_ctx(ctx):>5} {batch:3d} {d['weight_ms']:7.1f} {d['expert_ms']:7.1f} "
-                  f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f}")
+                  f"{d['cache_ms']:7.1f} {d['kda_ms']:7.1f} {d['comm_ms']:7.1f} {d['tokens_per_second']:9.2f} "
+                  f"{d['aggregate_tokens_per_second']:10.2f}")
             if ctx == 4096 and batch == 1:
                 target_decode = d
     if target_decode is not None:
@@ -531,17 +539,24 @@ def report(args: argparse.Namespace, split: WeightSplit) -> dict:
               f"({budget_ms:.2f} ms budget, {predicted_ms:.2f} ms predicted, "
               f"{margin_ms:+.2f} ms margin, {args.decode_target_tolerance_pct:g}% calibration tolerance)")
     print("\nPrefill (tokens/s)")
-    print(f"{'prompt':>7} {'chunk':>6} {'dense s':>9} {'expert s':>9} {'KDA s':>9} {'MLA s':>9} {'comm s':>9} {'tok/s':>9}")
+    print(f"{'prompt':>7} {'chunk':>6} {'dense s':>9} {'expert s':>9} {'KDA s':>9} {'MLA s':>9} {'comm s':>9} {'tok/s':>9} {'agg tok/s':>10}")
     for tokens in args.prompts:
         for chunk in args.chunks:
-            p = prefill(split,args.nodes,tokens,chunk,args.gemm_tflops,args.mla_tflops,args.kda_gops,
+            p = prefill(split,tp_nodes,tokens,chunk,args.gemm_tflops,args.mla_tflops,args.kda_gops,
                         args.latency_us,args.link_gbps,args.moe_collectives,
                         args.hierarchical_ar,args.expert_tp,args.fused_moe_ar,
                         args.expert_prefill_ms)
+            p["physical_nodes"] = args.nodes
+            p["tp_nodes"] = tp_nodes
+            p["independent_contexts"] = replicas
+            p["aggregate_tokens_per_second"] = p["tokens_per_second"] * replicas
             result["prefill"].append(p)
             print(f"{fmt_ctx(tokens):>7} {chunk:6d} {p['dense_gemm_s']:9.1f} {p['expert_s']:9.1f} {p['kda_s']:9.1f} "
-                  f"{p['mla_attention_s']:9.1f} {p['comm_s']:9.1f} {p['tokens_per_second']:9.1f}")
-    print("\nCaveat: 128k M=1 fits the modeled 96-node memory budget but lacks a full-model run. "
+                  f"{p['mla_attention_s']:9.1f} {p['comm_s']:9.1f} {p['tokens_per_second']:9.1f} "
+                  f"{p['aggregate_tokens_per_second']:10.1f}")
+    print(f"\nCaveat: memory and latency are modeled per TP{tp_nodes} context; aggregate throughput assumes "
+          f"{replicas} independent context group(s) with no cross-group contention. "
+          "128k M=1 lacks a full-model run. "
           "Exact 1m BF16 KV exceeds HBM even with perfect context sharding; it needs cache compression or weight-memory reduction. "
           "Predictions are engineering estimates, not measured end-to-end results.")
     return result
@@ -559,6 +574,8 @@ def main() -> None:
     p.add_argument("--model-dir", type=Path, default=Path.home() / "models/kimi-k3")
     p.add_argument("--no-manifest", action="store_true", help="use documented fallback byte totals")
     p.add_argument("--nodes", type=int, default=96)
+    p.add_argument("--tp-nodes", type=int, default=0,
+                   help="tensor-parallel ranks per independent context (default min(nodes,96))")
     p.add_argument("--contexts", type=csv_ints, default=csv_ints("4096,131072,1048576"))
     p.add_argument("--batches", type=csv_ints, default=csv_ints("1,8,32"))
     p.add_argument("--decode-target-tps", type=float, default=18.0,
@@ -641,8 +658,12 @@ def main() -> None:
         p.error("--q8w16-dense requires --fused-moe-ar")
     if sum((args.dense_q8,args.q8_up_only,args.q8w16_up,args.q8w16_dense)) > 1:
         p.error("choose one routed projection quantization mode")
-    if args.nodes < 1 or args.nodes > HEADS:
-        p.error("--nodes must be in [1,96] for head TP")
+    if args.nodes < 1 or args.nodes > 512:
+        p.error("--nodes must be in [1,512]")
+    if args.tp_nodes == 0:
+        args.tp_nodes = min(args.nodes, HEADS)
+    if args.tp_nodes < 1 or args.tp_nodes > HEADS or args.nodes % args.tp_nodes:
+        p.error("--tp-nodes must be in [1,96] and divide --nodes")
     if args.decode_target_tps <= 0:
         p.error("--decode-target-tps must be positive")
     if args.decode_target_tolerance_pct < 0:

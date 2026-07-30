@@ -100,7 +100,7 @@ export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLAC
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
 mpiexec -np "$NODES" -of-proc "$ROOT/prefill/rank" \
     "$K3/run_k3_prefill_staged_rank.sh" "$K3" "$STAGE_DIR" "$NODES" \
-    "$LAYER" "$EXPERTS" "$THREADS"
+    "$NODES" "$LAYER" "$EXPERTS" "$THREADS"
 prefill_passes=$(grep -l 'K3 expert-TP probe: PASS' "$ROOT"/prefill/rank.* 2>/dev/null | wc -l)
 if (( prefill_passes != NODES )); then
     echo "K3 TP96 prefill probe failed: $prefill_passes/$NODES ranks passed" >&2

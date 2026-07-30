@@ -909,11 +909,15 @@ and binding controls, and the debugging retention switches `K3_KEEP_PROBE=1` and
 ## Distributed K3 runner
 
 `k3_ep_runner` is the executable uTofu bring-up path for the intermediate-TP MoE
-architecture. It defaults to 96 nodes but accepts `--nodes N` for any count from 1
-through 96. The 96 native 32-channel MXFP4 scale groups are distributed raggedly when
-necessary: at 64 nodes, 32 ranks own 64 channels and 32 ranks own 32; at 96 nodes each
-rank owns 32 channels from each of the 16 selected experts. Attention heads use the
-same balanced ragged ownership rule.
+architecture. `--nodes N` is the physical allocation and `--tp-nodes T` is the ranks
+assigned to each independent context; `T` must divide `N` and is at most 96. The
+default is `min(N,96)`, so 72 and 96 nodes run one ragged TP72/TP96 context while 192
+nodes run two independent TP96 contexts for aggregate prefill or batched decode. The
+96 native 32-channel MXFP4 scale groups are distributed raggedly inside each context:
+at TP72, 24 ranks own 64 channels and 48 own 32; at TP96 every rank owns 32 channels.
+Attention heads use the same balanced rule. Physical-rank status files remain unique,
+and each context has an independent progress file, collective, state, and synthetic
+input stream.
 The selected-expert SVE kernel shares one OpenMP team, route-weights the local `w2`
 partials, packs the 3,584-float routed latent and 7,168-float hidden partial, and issues
 one 10,752-float sum-allreduce per layer step. All ranks then advance the same residual
@@ -931,8 +935,8 @@ Both execution modes use the same kernels, scratch buffers, and collective:
   producing `load-failed` status rather than stranding peers in the next collective.
 - `--ar-groups auto|A` controls the pool-backed hierarchical all-reduce. `auto` is
   the default and chooses six-rank rows: two contiguous groups on 12 nodes and 16 on
-  96 nodes. An explicit divisor selects that many groups; `0` remains the diagnostic
-  flat override.
+  TP96 ranks. An explicit divisor of `--tp-nodes` selects that many groups; `0`
+  remains the diagnostic flat override.
 
 Inside an allocation, use the orchestration wrapper:
 
@@ -940,7 +944,20 @@ Inside an allocation, use the orchestration wrapper:
 ./run_k3_ep.sh --mode dummy --nodes 96 --layers 2 --tokens 2 --ar-groups auto
 ./run_k3_ep.sh --mode real --nodes 96 --layer 1 --experts 0-15 \
   --model-dir "$HOME/models/kimi-k3" --layers 1 --tokens 2
+./run_k3_ep.sh --mode real --nodes 192 --tp-nodes 96 --layer 1 \
+  --experts 0-15 --model-dir "$HOME/models/kimi-k3" --layers 1 --tokens 256
 ```
+
+The grouping path was validated on job `49868333` by splitting twelve physical ranks
+into two TP6 contexts. Dummy and real-weight runs both passed 12/12 status checks;
+each context completed 32 steps with zero rank disagreement and distinct final
+checksums. A logical TP72 sweep then validated all 72 real slices: every M=2 prefill
+reference passed at roughly `1e-7` relative L2, including all 24 64-channel ranks.
+The generalized fused routed-down path measured 0.065 ms median on those 64-channel
+ranks and 0.060 ms on the 32-channel ranks; their p95 values were 0.082 and 0.069 ms.
+Prefill medians for M=64/256/1024 were 3.178/12.502/43.233 ms on 64-channel ranks and
+1.762/6.779/24.282 ms on 32-channel ranks. These measured ragged-rank critical times,
+not the old TP96 constants, must calibrate TP72 projections.
 
 The wrapper builds the runner and topology helper, retries topology discovery, stages
 only for real mode, captures per-rank output on the shared filesystem, and requires one
@@ -1332,12 +1349,12 @@ transport gate followed by a 256-token partial-real layer-1 decode profile. Auto
 hierarchy selection resolves to twelve six-rank groups.
 
 TP72 uses the runner's balanced ragged ownership: ranks 0--23 own 64 expert channels
-and two attention heads, while ranks 24--71 own 32 channels and one head. The job does
-not run the expert-prefill calibration because that probe currently requires exactly
-32 channels per rank and is therefore TP96-only. The current whole-model simulator
-also reports about 28.9 GiB on the fullest TP72 rank, above the strict 27 GiB target;
-this allocation calibrates transport and partial-real decode rather than claiming an
-end-to-end TP72 serving configuration.
+and two attention heads, while ranks 24--71 own 32 channels and one head. Routed-down
+decode and prefill fuse any number of native 32-channel groups, so the job also runs
+real M=64/256/1024 expert-prefill calibration on both rank shapes. The current
+whole-model simulator reports about 28.9 GiB on the fullest TP72 rank, above the
+strict 27 GiB target; this allocation calibrates transport and partial-real kernels
+rather than claiming an end-to-end TP72 serving configuration.
 
 Submit from the repository root with:
 
@@ -1346,8 +1363,8 @@ pjsub --no-check-directory a64fx/k3/pjsub_k3_probe_72n.sh
 ```
 
 Results are retained under `a64fx/k3/logs/probe-72n-$PJM_JOBID`. Success requires
-72/72 pass markers from both phases, the expected 12x6 hierarchy, all 256 real steps,
-and `K3_PROFILE`/`K3_PROFILE_MAX` output in `summary.txt`.
+72/72 pass markers from decode and prefill, the expected 12x6 hierarchy, all 256 real
+steps, and `K3_PROFILE`/`K3_PROFILE_MAX` output in `summary.txt`.
 
 ### HTTP and llmgr control
 

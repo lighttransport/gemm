@@ -8,6 +8,7 @@ REPO=$(cd "$SCRIPT_DIR/../.." && pwd)
 UTOFU="$REPO/a64fx/utofu-tests"
 MODE=dummy
 NODES=${PJM_MPI_PROC:-96}
+TP_NODES=0
 LAYERS=1
 TOKENS=2
 THREADS=48
@@ -37,7 +38,7 @@ PREFETCH_THREADS=0
 
 usage() {
     cat >&2 <<EOF
-usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
+usage: $0 [--mode dummy|real] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]
           [--threads N] [--kda-threads N] [--fused-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
           [--profile] [--reuse-stage] [--stage-only] [--no-fused-team]
@@ -58,6 +59,7 @@ while (( $# )); do
     case "$1" in
         --mode) need_value "$@"; MODE=$2; shift 2;;
         --nodes) need_value "$@"; NODES=$2; shift 2;;
+        --tp-nodes) need_value "$@"; TP_NODES=$2; shift 2;;
         --layers) need_value "$@"; LAYERS=$2; shift 2;;
         --tokens) need_value "$@"; TOKENS=$2; shift 2;;
         --threads) need_value "$@"; THREADS=$2; shift 2;;
@@ -93,17 +95,19 @@ if (( STAGE_ONLY )) && [[ "$MODE" != real ]]; then
     echo "$0: --stage-only requires --mode real" >&2
     exit 2
 fi
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$MIN_AVAILABLE_MIB" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
+for value in "$NODES" "$TP_NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$MIN_AVAILABLE_MIB" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
+(( TP_NODES == 0 )) && { (( NODES < 96 )) && TP_NODES=$NODES || TP_NODES=96; }
 (( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && KDA_THREADS > 0 && KDA_THREADS <= THREADS && FUSED_THREADS > 0 && FUSED_THREADS <= THREADS && CHUNK_MIB > 0 )) || {
     echo "$0: invalid numeric option range" >&2; exit 2; }
-(( NODES <= 96 )) || { echo "$0: node count must be in [1,96]" >&2; exit 2; }
+(( NODES <= 512 && TP_NODES > 0 && TP_NODES <= 96 && NODES % TP_NODES == 0 )) || {
+    echo "$0: require nodes in [1,512], tp-nodes in [1,96], and nodes divisible by tp-nodes" >&2; exit 2; }
 (( PREFETCH_MIB <= 32 )) || { echo "$0: --prefetch-mib must be in [0,32]" >&2; exit 2; }
 [[ "$AR_GROUPS" == auto || "$AR_GROUPS" =~ ^[0-9]+$ ]] || { echo "$0: --ar-groups must be auto or an integer" >&2; exit 2; }
-if [[ "$AR_GROUPS" != auto ]]; then (( AR_GROUPS == 0 || (AR_GROUPS > 1 && NODES % AR_GROUPS == 0) )) || {
-    echo "$0: --ar-groups must be 0 or a divisor in [2,--nodes]" >&2; exit 2; }
+if [[ "$AR_GROUPS" != auto ]]; then (( AR_GROUPS == 0 || (AR_GROUPS > 1 && TP_NODES % AR_GROUPS == 0) )) || {
+    echo "$0: --ar-groups must be 0 or a divisor in [2,--tp-nodes]" >&2; exit 2; }
 fi
 (( COMM_ROBUST == 1 || COMM_ROBUST == 2 )) || { echo "$0: --comm-robust must be 1 or 2" >&2; exit 2; }
 (( COMM_ACK == 0 || COMM_ACK == 1 )) || { echo "$0: --comm-ack must be 0 or 1" >&2; exit 2; }
@@ -198,17 +202,18 @@ if [[ "$MODE" == real ]]; then
         timing_begin stage_validation
         mpiexec -np "$NODES" /bin/sh -c '
             rank=${PMIX_RANK:?}; marker="$1/stage-rank$(printf "%03d" "$rank").status"
-            expected="rank=$rank nodes=$2 layer=$3 experts=$4"
+            tp_rank=$((rank % $3))
+            expected="rank=$rank nodes=$2 tp_rank=$tp_rank tp_nodes=$3 layer=$4 experts=$5"
             test -f "$marker" && test "$(cat "$marker")" = "$expected"
-        ' sh "$STAGE_DIR" "$NODES" "$LAYER" "$EXPERTS" || {
+        ' sh "$STAGE_DIR" "$NODES" "$TP_NODES" "$LAYER" "$EXPERTS" || {
             echo "$0: --reuse-stage validation failed: $STAGE_DIR" >&2; exit 4; }
         echo "reusing rank-local stage: $STAGE_DIR"
         timing_end 0
     else
         timing_begin weight_staging
         mpiexec -np "$NODES" -of-proc "$STAGE_OUTPUT_PREFIX" \
-            "$SCRIPT_DIR/run_k3_stage_rank.sh" "$SCRIPT_DIR" "$NODES" "$MODEL_DIR" \
-            "$STAGE_DIR" "$LAYER" "$EXPERTS" "$CHUNK_MIB"
+            "$SCRIPT_DIR/run_k3_stage_rank.sh" "$SCRIPT_DIR" "$NODES" "$TP_NODES" \
+            "$MODEL_DIR" "$STAGE_DIR" "$LAYER" "$EXPERTS" "$CHUNK_MIB"
         staged=$(find "$(dirname "$STAGE_OUTPUT_PREFIX")" -maxdepth 1 \
             -name "$(basename "$STAGE_OUTPUT_PREFIX").*" -type f | wc -l)
         echo "stage launch output files: $staged/$NODES"
@@ -220,10 +225,11 @@ if (( STAGE_ONLY )); then
     timing_begin stage_result_validation
     mpiexec -np "$NODES" /bin/sh -c '
         rank=${PMIX_RANK:?}; marker="$1/stage-rank$(printf "%03d" "$rank").status"
-        expected="rank=$rank nodes=$2 layer=$3 experts=$4"
+        tp_rank=$((rank % $3))
+        expected="rank=$rank nodes=$2 tp_rank=$tp_rank tp_nodes=$3 layer=$4 experts=$5"
         test -f "$marker" && test "$(cat "$marker")" = "$expected"
-    ' sh "$STAGE_DIR" "$NODES" "$LAYER" "$EXPERTS"
-    echo "K3_STAGE_ONLY status=PASS nodes=$NODES layer=$LAYER experts=$EXPERTS stage_dir=$STAGE_DIR"
+    ' sh "$STAGE_DIR" "$NODES" "$TP_NODES" "$LAYER" "$EXPERTS"
+    echo "K3_STAGE_ONLY status=PASS nodes=$NODES tp_nodes=$TP_NODES contexts=$((NODES / TP_NODES)) layer=$LAYER experts=$EXPERTS stage_dir=$STAGE_DIR"
     timing_end 0
     exit 0
 fi
@@ -240,6 +246,7 @@ fi
 timing_begin decode_runner
 mpiexec -np "$NODES" -of-proc "$RUN_OUTPUT_PREFIX" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
+    --tp-nodes "$TP_NODES" \
     --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --min-available-mib "$MIN_AVAILABLE_MIB" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-ack "$COMM_ACK" --comm-deterministic "$COMM_DETERMINISTIC" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"

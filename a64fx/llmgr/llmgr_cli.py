@@ -145,6 +145,7 @@ def main(argv=None):
     st.add_argument("--stage-dir")
     st.add_argument("--model-dir")
     st.add_argument("--np", type=int)
+    st.add_argument("--tp-np", type=int, help="K3 tensor-parallel ranks per context")
     st.add_argument("--layer", type=int)
     st.add_argument("--experts")
 
@@ -154,6 +155,7 @@ def main(argv=None):
     ss.add_argument("--stage-dir")
     ss.add_argument("--model-dir")
     ss.add_argument("--np", type=int)
+    ss.add_argument("--tp-np", type=int, help="K3 tensor-parallel ranks per context")
     ss.add_argument("--no-fanout", action="store_true")
 
     r = sub.add_parser("start", help="start a runner")
@@ -173,6 +175,7 @@ def main(argv=None):
     r.add_argument("--comm-poll-spins", type=int)
     r.add_argument("--layers", type=int)
     r.add_argument("--np", type=int)
+    r.add_argument("--tp-np", type=int, help="K3 tensor-parallel ranks per context")
     r.add_argument("--max-new", type=int)
     r.add_argument("--tokens", type=int, help="K3 partial-runner token steps")
     r.add_argument("--layer", type=int, help="K3 first decoder layer")
@@ -243,6 +246,7 @@ def main(argv=None):
     pr.add_argument("--stage-dir", help="existing K3 rank-local stage")
     pr.add_argument("--event", default="statistics")
     pr.add_argument("--np", type=int)
+    pr.add_argument("--tp-np", type=int, help="K3 tensor-parallel ranks per context")
 
     ar = sub.add_parser("artifacts")
     ar.add_argument("id")
@@ -282,11 +286,11 @@ def main(argv=None):
     elif c == "stage":
         emit(call(args, "POST", "/stage",
                   dict(model=args.model,
-                       **opt("variant", "stage_dir", "model_dir", "np",
+                       **opt("variant", "stage_dir", "model_dir", "np", "tp_np",
                              "layer", "experts"))))
     elif c == "stage-status":
         q = {"model": args.model}
-        q.update(opt("variant", "stage_dir", "model_dir", "np"))
+        q.update(opt("variant", "stage_dir", "model_dir", "np", "tp_np"))
         if args.no_fanout:
             q["fanout"] = "0"
         emit(call(args, "GET", "/stage/status?" + urllib.parse.urlencode(q),
@@ -297,7 +301,7 @@ def main(argv=None):
                        **opt("variant", "kv_fp16", "quality_cpp", "mode", "port", "maxpos", "max_batch",
                              "pchunk", "ar_groups", "comm_robust",
                              "comm_poll_spins", "layers",
-                             "np", "max_new", "tokens", "layer", "experts",
+                             "np", "tp_np", "max_new", "tokens", "layer", "experts",
                              "stage_dir", "model_dir", "result_dir",
                              "heartbeat_tokens", "min_available_mib",
                              "prompt", "ids", "prompt_ids",
@@ -341,7 +345,7 @@ def main(argv=None):
     elif c == "profile":
         emit(call(args, "POST", "/profile",
                   dict(model=args.model, max_new=args.max_new,
-                       event=args.event, **opt("variant", "kv_fp16", "np", "ids",
+                       event=args.event, **opt("variant", "kv_fp16", "np", "tp_np", "ids",
                                               "tokens", "layer", "threads",
                                               "stage_dir")), timeout=600))
     elif c == "artifacts":

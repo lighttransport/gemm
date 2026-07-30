@@ -502,26 +502,28 @@ static inline int k3_expert_tp_selected_layout_valid(
 }
 
 #if defined(__ARM_FEATURE_SVE)
-/* Native TP=96 routed-down: fuse the router-weighted sum while accumulators
- * are still vectors.  The generic path horizontally reduces 8 rows for each
- * of 16 experts (128 reductions) and then sums scalars; this performs only the
- * final 8 reductions and streams each 32-channel MXFP4 slice once. */
-static inline void k3_expert_tp_down32_selected_sve(float *out,
+/* Expert-TP routed-down: fuse the router-weighted sum while accumulators are
+ * still vectors. Native 32-channel groups are accumulated directly, so TP72's
+ * 64-channel ranks retain the same eight final horizontal reductions as TP96. */
+static inline void k3_expert_tp_down_selected_sve(float *out,
         const k3_mxfp4_matrix *w2,const float *gate,
-        const float *route_weight,int selected,int row){
+        const float *route_weight,int selected,int local,int row){
     svbool_t pg=svptrue_b32();svfloat32_t kv=svld1(pg,ds4f_kvalues_mxfp4_f32);
     svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
-    for(int e=0;e<selected;++e){const uint8_t*w=w2[e].packed+(size_t)row*16;
-        const uint8_t*s=w2[e].scale+row;const float*x=gate+(size_t)e*32;
+    size_t wr=(size_t)local/2,sr=(size_t)local/32;
+    for(int e=0;e<selected;++e)for(int b=0;b<local;b+=K3_EXPERT_TP_BLOCK){
+        const uint8_t*w=w2[e].packed+(size_t)row*wr+b/2;
+        const uint8_t*s=w2[e].scale+(size_t)row*sr+b/32;
+        const float*x=gate+(size_t)e*local+b;
         svfloat32_t xl=svld1(pg,x),xh=svld1(pg,x+16);float rw=route_weight[e];
-#define K3_TP_DOWN32_ROW(R,A) do{svuint32_t z=svld1ub_u32(pg,w+(size_t)(R)*16); \
+#define K3_TP_DOWN_ROW(R,A) do{svuint32_t z=svld1ub_u32(pg,w+(size_t)(R)*wr); \
         svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
         svfloat32_t p=svmul_f32_x(pg,svtbl_f32(kv,lo),xl); \
         p=svmla_f32_x(pg,p,svtbl_f32(kv,hi),xh); \
-        A=svmla_n_f32_x(pg,A,p,rw*ggml_e8m0_to_fp32(s[R]));}while(0)
-        K3_TP_DOWN32_ROW(0,a0);K3_TP_DOWN32_ROW(1,a1);K3_TP_DOWN32_ROW(2,a2);K3_TP_DOWN32_ROW(3,a3);
-        K3_TP_DOWN32_ROW(4,a4);K3_TP_DOWN32_ROW(5,a5);K3_TP_DOWN32_ROW(6,a6);K3_TP_DOWN32_ROW(7,a7);
-#undef K3_TP_DOWN32_ROW
+        A=svmla_n_f32_x(pg,A,p,rw*ggml_e8m0_to_fp32(s[(size_t)(R)*sr]));}while(0)
+        K3_TP_DOWN_ROW(0,a0);K3_TP_DOWN_ROW(1,a1);K3_TP_DOWN_ROW(2,a2);K3_TP_DOWN_ROW(3,a3);
+        K3_TP_DOWN_ROW(4,a4);K3_TP_DOWN_ROW(5,a5);K3_TP_DOWN_ROW(6,a6);K3_TP_DOWN_ROW(7,a7);
+#undef K3_TP_DOWN_ROW
     }
     out[0]=svaddv(pg,a0);out[1]=svaddv(pg,a1);out[2]=svaddv(pg,a2);out[3]=svaddv(pg,a3);
     out[4]=svaddv(pg,a4);out[5]=svaddv(pg,a5);out[6]=svaddv(pg,a6);out[7]=svaddv(pg,a7);
@@ -531,21 +533,23 @@ static inline void k3_expert_tp_down32_selected_sve(float *out,
  * by dispatch position rather than by expert id; fuse the top-k weighted sum
  * directly so no [assignments,7168] expert-output buffer or scatter pass is
  * required. */
-static inline void k3_expert_tp_down32_routed_sve(float *out,
+static inline void k3_expert_tp_down_routed_sve(float *out,
         const k3_mxfp4_matrix *w2,const int *route_experts,
         const int *positions,const float *route_weight,int topk,
-        const float *gate,int row){
+        const float *gate,int local,int row){
     svbool_t pg=svptrue_b32();svfloat32_t kv=svld1(pg,ds4f_kvalues_mxfp4_f32);
     svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
-    for(int k=0;k<topk;++k){int e=route_experts[k],pos=positions[k];
-        const uint8_t*w=w2[e].packed+(size_t)row*16;
-        const uint8_t*s=w2[e].scale+row;const float*x=gate+(size_t)pos*32;
+    size_t wr=(size_t)local/2,sr=(size_t)local/32;
+    for(int k=0;k<topk;++k)for(int b=0;b<local;b+=K3_EXPERT_TP_BLOCK){int e=route_experts[k],pos=positions[k];
+        const uint8_t*w=w2[e].packed+(size_t)row*wr+b/2;
+        const uint8_t*s=w2[e].scale+(size_t)row*sr+b/32;
+        const float*x=gate+(size_t)pos*local+b;
         svfloat32_t xl=svld1(pg,x),xh=svld1(pg,x+16);float rw=route_weight[k];
-#define K3_TP_PREFILL_DOWN_ROW(R,A) do{svuint32_t z=svld1ub_u32(pg,w+(size_t)(R)*16); \
+#define K3_TP_PREFILL_DOWN_ROW(R,A) do{svuint32_t z=svld1ub_u32(pg,w+(size_t)(R)*wr); \
         svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
         svfloat32_t p=svmul_f32_x(pg,svtbl_f32(kv,lo),xl); \
         p=svmla_f32_x(pg,p,svtbl_f32(kv,hi),xh); \
-        A=svmla_n_f32_x(pg,A,p,rw*ggml_e8m0_to_fp32(s[R]));}while(0)
+        A=svmla_n_f32_x(pg,A,p,rw*ggml_e8m0_to_fp32(s[(size_t)(R)*sr]));}while(0)
         K3_TP_PREFILL_DOWN_ROW(0,a0);K3_TP_PREFILL_DOWN_ROW(1,a1);
         K3_TP_PREFILL_DOWN_ROW(2,a2);K3_TP_PREFILL_DOWN_ROW(3,a3);
         K3_TP_PREFILL_DOWN_ROW(4,a4);K3_TP_PREFILL_DOWN_ROW(5,a5);
@@ -572,7 +576,7 @@ static inline int k3_expert_tp_prefill_mxfp4(float *partial,
         !positions||!token_ids||!gathered||!gate||!up||nexpert<1||nexpert>4096||
         batch<1||topk<1||topk>nexpert||batch>INT_MAX/topk||threads<1||
         !k3_expert_tp_selected_layout_valid(w1,w2,w3,nexpert))return-1;
-    int local=w1[0].rows;if(local!=K3_EXPERT_TP_BLOCK)return-1;
+    int local=w1[0].rows;if(local<K3_EXPERT_TP_BLOCK||local%K3_EXPERT_TP_BLOCK)return-1;
     memset(counts,0,(size_t)nexpert*sizeof(*counts));
     for(int i=0;i<batch*topk;++i){int e=route_experts[i];if(e<0||e>=nexpert)return-1;counts[e]++;}
     offsets[0]=0;for(int e=0;e<nexpert;++e)offsets[e+1]=offsets[e]+counts[e];
@@ -623,9 +627,9 @@ static inline int k3_expert_tp_prefill_mxfp4(float *partial,
 #pragma omp for schedule(static)
 #endif
     for(int task=0;task<batch*g2;++task){int t=task/g2,row=(task%g2)*8;
-        k3_expert_tp_down32_routed_sve(partial+(size_t)t*K3_LATENT+row,w2,
+        k3_expert_tp_down_routed_sve(partial+(size_t)t*K3_LATENT+row,w2,
             route_experts+(size_t)t*topk,positions+(size_t)t*topk,
-            route_weight+(size_t)t*topk,topk,gate,row);}
+            route_weight+(size_t)t*topk,topk,gate,local,row);}
 #else
     (void)partial;return-1;
 #endif
@@ -666,8 +670,8 @@ static inline void k3_expert_tp_forward_selected_team_mxfp4(
 #endif
     for(int gr=0;gr<g2;++gr){int r=gr*8;
 #if defined(__ARM_FEATURE_SVE) && K3_TP_FUSED_DOWN32
-        if(local==32){k3_expert_tp_down32_selected_sve(latent_partial+r,w2,
-                gate,route_weight,selected,r);continue;}
+        if(local%K3_EXPERT_TP_BLOCK==0){k3_expert_tp_down_selected_sve(latent_partial+r,w2,
+                gate,route_weight,selected,local,r);continue;}
 #endif
         float sum[8]={0},tmp[8];
         for(int e=0;e<selected;++e){const k3_mxfp4_matrix*m=&w2[e];size_t wr=(size_t)local/2,sr=(size_t)local/32;

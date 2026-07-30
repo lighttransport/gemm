@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-hour TP72 non-contiguous partial-real decode calibration job.
+# One-hour TP72 non-contiguous partial-real decode/prefill calibration job.
 # A scalar node request deliberately avoids a torus-shape placement constraint.
 #PJM -g hp250467
 #PJM -L "rscgrp=small,node=72,elapse=01:00:00"
@@ -63,7 +63,7 @@ on_exit() {
 trap on_exit EXIT
 
 cat >"$ROOT/workload.txt" <<'EOF'
-probe=TP72 non-contiguous partial-real decode calibration
+probe=TP72 non-contiguous partial-real decode and prefill calibration
 dummy_tokens=8
 decode_tokens=256
 layer=1
@@ -72,7 +72,7 @@ placement=scalar node=72 request; no torus shape constraint
 tp_layout=ranks 0-23 own 64 expert channels and two attention heads; ranks 24-71 own 32 channels and one head
 scope=The runner uses real routed-expert slices with deterministic synthetic activations; it is not an end-to-end K3 generation run.
 memory=The modeled full K3 stack is about 28.9 GiB on the fullest TP72 rank and exceeds the strict 27 GiB target.
-prefill=Excluded because the current expert-prefill probe requires exactly 32 channels per rank (TP96).
+prefill=Real M=64,256,1024 expert-prefill calibration covers both 64- and 32-channel TP72 ranks.
 EOF
 
 stage_begin build
@@ -95,6 +95,21 @@ stage_begin real_weight_decode
     --stage-dir "$STAGE_DIR" --result-dir "$ROOT/decode"
 stage_end 0
 
+stage_begin real_weight_prefill
+mkdir -p "$ROOT/prefill"
+export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores
+export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
+mpiexec -np "$NODES" -of-proc "$ROOT/prefill/rank" \
+    "$K3/run_k3_prefill_staged_rank.sh" "$K3" "$STAGE_DIR" "$NODES" \
+    "$NODES" "$LAYER" 16 "$THREADS"
+prefill_passes=$(grep -l 'K3 expert-TP probe: PASS' "$ROOT"/prefill/rank.* 2>/dev/null | wc -l || true)
+(( prefill_passes == NODES )) || {
+    echo "K3 TP72 prefill validation failed: $prefill_passes/$NODES ranks passed" >&2
+    exit 8
+}
+grep -h 'PROBE expert-tp-prefill' "$ROOT"/prefill/rank.* >"$ROOT/prefill_samples.txt"
+stage_end 0
+
 stage_begin summarize
 {
     cat "$ROOT/workload.txt"
@@ -104,6 +119,8 @@ stage_begin summarize
     printf '\n[real_weight_decode]\n'
     grep -hE 'K3_RUN|K3_PROGRESS|K3_RESULT|K3_HEALTH|K3_PROFILE' \
         "$ROOT"/decode/rank.* || true
+    printf '\n[real_weight_prefill]\n'
+    cat "$ROOT/prefill_samples.txt"
 } >"$SUMMARY"
 
 dummy_passes=$(grep -l ' state=pass ' "$ROOT"/dummy/k3_rank*.status 2>/dev/null | wc -l || true)
@@ -119,19 +136,19 @@ decode_passes=$(grep -l ' state=pass ' "$ROOT"/decode/k3_rank*.status 2>/dev/nul
 grep -hqE 'K3_RUN mode=real nodes=72 .*allreduce=hierarchical ar_groups=12 ' \
     "$ROOT"/decode/rank.* || {
     echo "K3 TP72 decode did not report the expected 12x6 hierarchy" >&2
-    exit 8
+    exit 9
 }
 grep -hqE 'K3_RESULT status=PASS reason=complete tokens_completed=256 ' \
     "$ROOT"/decode/rank.* || {
     echo "K3 TP72 decode did not report 256 completed tokens" >&2
-    exit 9
+    exit 10
 }
 grep -hq 'K3_PROFILE rank_max_ms_per_layer' "$ROOT"/decode/rank.* || {
     echo "K3 TP72 decode profile summary is missing" >&2
-    exit 10
+    exit 11
 }
 cat "$SUMMARY"
 stage_end 0
 
-printf 'K3_PROBE_72 status=PASS dummy=%s decode=%s summary=%s\n' \
-    "$ROOT/dummy" "$ROOT/decode" "$SUMMARY"
+printf 'K3_PROBE_72 status=PASS dummy=%s decode=%s prefill=%s summary=%s\n' \
+    "$ROOT/dummy" "$ROOT/decode" "$ROOT/prefill_samples.txt" "$SUMMARY"

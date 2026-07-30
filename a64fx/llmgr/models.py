@@ -506,9 +506,17 @@ class K3Adapter(Adapter):
 
     def _np(self, cfg):
         np_ = _int(cfg, "np", self.default_np())
-        if np_ < 1 or np_ > 96:
-            raise ConfigError("np must be in [1,96] for K3 (got %d)" % np_)
+        if np_ < 1 or np_ > 512:
+            raise ConfigError("np must be in [1,512] for K3 (got %d)" % np_)
         return np_
+
+    def _tp_np(self, cfg):
+        np_ = self._np(cfg)
+        tp = _int(cfg, "tp_np", min(np_, 96))
+        if tp < 1 or tp > 96 or np_ % tp:
+            raise ConfigError("tp_np must be in [1,96] and divide np=%d (got %d)" %
+                              (np_, tp))
+        return tp
 
     def stage_dir(self, cfg):
         if cfg.get("stage_dir"):
@@ -550,7 +558,8 @@ class K3Adapter(Adapter):
             raise ConfigError("heartbeat_tokens must be in [0,1048576]")
         if min_available is None or not 0 <= min_available <= 1048576:
             raise ConfigError("min_available_mib must be in [0,1048576]")
-        argv = ["--nodes", str(np_), "--layer", str(layer),
+        argv = ["--nodes", str(np_), "--tp-nodes", str(self._tp_np(cfg)),
+                "--layer", str(layer),
                 "--layers", str(layers), "--tokens", str(tokens),
                 "--threads", str(threads),
                 "--heartbeat-tokens", str(heartbeat),
@@ -572,7 +581,8 @@ class K3Adapter(Adapter):
         layer = _int(cfg, "layer", 1)
         experts = str(cfg.get("experts", "0-15"))
         argv = [self.LAUNCHER, "--mode", "real", "--stage-only",
-                "--nodes", str(self._np(cfg)), "--layer", str(layer),
+                "--nodes", str(self._np(cfg)), "--tp-nodes", str(self._tp_np(cfg)),
+                "--layer", str(layer),
                 "--layers", "1", "--tokens", "1", "--experts", experts,
                 "--model-dir", self.model_dir(cfg),
                 "--stage-dir", self.stage_dir(cfg),
@@ -606,6 +616,7 @@ class K3Adapter(Adapter):
         token_default = cfg.get("max_new")
         tokens = _int(cfg, "tokens", 64 if token_default is None else token_default)
         return ["--mode", "real", "--nodes", str(self._np(cfg)),
+                "--tp-nodes", str(self._tp_np(cfg)),
                 "--layer", str(layer), "--layers", "1",
                 "--tokens", str(tokens),
                 "--threads", str(_int(cfg, "threads", 48)),
