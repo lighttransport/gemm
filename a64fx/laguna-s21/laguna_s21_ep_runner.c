@@ -746,6 +746,23 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
  * ahead covers the DRAM latency without displacing the active score block. */
 #define LAGUNA_KV_PREFETCH 16
 #endif
+/* Single-token decode fast-path for full-attention layers:
+ * process keys in blocks with online softmax updates and a small local score
+ * scratch. This removes long-score-buffer traffic for full-attention decode.
+ */
+#ifndef LAGUNA_ATTN_CORE_STREAM
+#define LAGUNA_ATTN_CORE_STREAM 0
+#endif
+#ifndef LAGUNA_ATTN_CORE_STREAM_MAX_KEYS
+#define LAGUNA_ATTN_CORE_STREAM_MAX_KEYS 24000
+#endif
+#ifndef LAGUNA_KB
+/* Streamed full-attention decode uses a key-block online softmax pass.  A 2K
+ * block balances loop-launch overhead against working-set fit for long contexts.
+ * Smaller blocks increase control overhead; much larger blocks increase per-block
+ * latency at high-context boundaries. */
+#define LAGUNA_KB 2048
+#endif
 /* halves of a full-width u16 load, widened from the selected KV format */
 #if defined(LAGUNA_KV_FP16)
 #define LAGUNA_UNLO(pg,h) svcvt_f32_f16_x((pg),svreinterpret_f16_u32(svunpklo_u32(h)))
@@ -964,6 +981,53 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
         memcpy(q,qtmp,sizeof qtmp);
         laguna_rope_half(q, rc, rs, rot);
         int kvh=h/kv_groups;
+        float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
+        float gate=laguna_softplus(gf[h]);
+#if LAGUNA_ATTN_CORE_STREAM
+        if (ly->is_sliding) {
+            float *sco=sc->scores+(size_t)h*m->max_pos;   /* this head's scores */
+            int s0=lo%cap, n1=cap-s0; if(n1>nkeys) n1=nkeys; int n2=nkeys-n1;
+            float mx=laguna_qk_run(sco,q,kbase+(size_t)s0*kvstride+(size_t)kvh*hd,
+                                   kvstride,n1,scale,hd);
+            if(n2){float m2=laguna_qk_run(sco+n1,q,kbase+(size_t)kvh*hd,
+                                          kvstride,n2,scale,hd);if(m2>mx)mx=m2;}
+            float l_i=laguna_exp_shift_sum(sco, nkeys, mx);   /* sco[i]=exp(sco[i]-mx) */
+            laguna_av_run(acc, sco,    vbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, 0.0f, hd);
+            if(n2) laguna_av_run(acc, sco+n1, vbase+(size_t)kvh*hd, kvstride, n2, 1.0f, hd);
+            float s=gate/l_i; float *o=ao+(size_t)h*hd;
+            for(int d=0;d<hd;++d) o[d]=acc[d]*s;
+        } else if (nkeys > LAGUNA_ATTN_CORE_STREAM_MAX_KEYS) {
+            float m_prev=-INFINITY, l_prev=0.0f;
+            for (int kb=0; kb<nkeys; kb+=LAGUNA_KB) {
+                int n=pos-kb+1;
+                if (n > LAGUNA_KB) n=LAGUNA_KB;
+                float sb[LAGUNA_KB];
+                float m2=laguna_qk_run(sb,q,kbase+(size_t)kb*kvstride+(size_t)kvh*hd,kvstride,n,scale,hd);
+                float m_new = (m_prev > m2) ? m_prev : m2;
+                float corr = expf(m_prev - m_new);
+                float p = laguna_exp_shift_sum(sb,n,m_new);
+                laguna_av_run(acc,sb,vbase+(size_t)kb*kvstride+(size_t)kvh*hd,kvstride,n,corr,hd);
+                l_prev = l_prev*corr + p;
+                m_prev = m_new;
+            }
+            float s=gate/l_prev; float *o=ao+(size_t)h*hd;
+            for(int d=0;d<hd;++d) o[d]=acc[d]*s;
+        } else {
+            float *sco=sc->scores+(size_t)h*m->max_pos;   /* this head's scores */
+            /* [lo,pos] is at most two contiguous slot runs (one if the ring doesn't
+             * wrap, which is always the case for full-attention layers). */
+            int s0=lo%cap, n1=cap-s0; if(n1>nkeys) n1=nkeys; int n2=nkeys-n1;
+            float mx=laguna_qk_run(sco,q,kbase+(size_t)s0*kvstride+(size_t)kvh*hd,
+                                   kvstride,n1,scale,hd);
+            if(n2){float m2=laguna_qk_run(sco+n1,q,kbase+(size_t)kvh*hd,
+                                          kvstride,n2,scale,hd);if(m2>mx)mx=m2;}
+            float l_i=laguna_exp_shift_sum(sco, nkeys, mx);   /* sco[i]=exp(sco[i]-mx) */
+            laguna_av_run(acc, sco,    vbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, 0.0f, hd);
+            if(n2) laguna_av_run(acc, sco+n1, vbase+(size_t)kvh*hd, kvstride, n2, 1.0f, hd);
+            float s=gate/l_i; float *o=ao+(size_t)h*hd;
+            for(int d=0;d<hd;++d) o[d]=acc[d]*s;
+        }
+#else
         float *sco=sc->scores+(size_t)h*m->max_pos;   /* this head's scores */
         /* [lo,pos] is at most two contiguous slot runs (one if the ring doesn't
          * wrap, which is always the case for full-attention layers). */
@@ -973,12 +1037,11 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
         if(n2){float m2=laguna_qk_run(sco+n1,q,kbase+(size_t)kvh*hd,
                                       kvstride,n2,scale,hd);if(m2>mx)mx=m2;}
         float l_i=laguna_exp_shift_sum(sco, nkeys, mx);   /* sco[i]=exp(sco[i]-mx) */
-        float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
         laguna_av_run(acc, sco,    vbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, 0.0f, hd);
         if(n2) laguna_av_run(acc, sco+n1, vbase+(size_t)kvh*hd, kvstride, n2, 1.0f, hd);
-        float gate=laguna_softplus(gf[h]);
         float s=gate/l_i; float *o=ao+(size_t)h*hd;
         for(int d=0;d<hd;++d) o[d]=acc[d]*s;
+#endif
     }
 }
 
