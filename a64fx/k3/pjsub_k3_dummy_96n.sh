@@ -10,5 +10,5 @@ set -eu
 
 REPO=/vol0006/mdt0/data/hp250467/work/gemm/k3
 exec "$REPO/a64fx/k3/run_k3_ep.sh" --mode dummy --nodes 96 \
-    --layer 2 --layers 3 --tokens 2 --threads 48 \
+    --layer 2 --layers 3 --tokens 2 --threads 48 --ar-groups auto \
     --result-dir "$REPO/a64fx/k3/logs/dummy-${PJM_JOBID}"

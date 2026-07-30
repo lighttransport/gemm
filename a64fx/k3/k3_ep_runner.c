@@ -88,9 +88,9 @@ static void usage(const char *p){
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
         "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
-        "          [--ar-groups N] [--comm-robust 1|2] [--comm-poll-spins N]\n"
+        "          [--ar-groups auto|N] [--comm-robust 1|2] [--comm-poll-spins N]\n"
         "          [--prefetch-mib N] [--prefetch-threads N]\n"
-        "          (ar-groups: 0=flat, otherwise N contiguous groups)\n",p);
+        "          (ar-groups: auto uses six-rank rows; 0 forces flat)\n",p);
 }
 static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
     char *end=NULL;errno=0;long v=strtol(s,&end,10);
@@ -100,7 +100,7 @@ static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
 }
 static int parse_options(int argc,char **argv,k3_options *o){
     *o=(k3_options){.nodes=96,.layers=1,.tokens=2,.threads=48,.layer=1,
-        .mla_cache_bf16=1,.heartbeat_tokens=1024,.comm_robust=2,.comm_poll_spins=8,
+        .mla_cache_bf16=1,.heartbeat_tokens=1024,.ar_groups=-1,.comm_robust=2,.comm_poll_spins=8,
         .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.stage_dir="/local/k3-runner",
         .status_dir=".",.topo_path="tofu_topo.txt"};
     for(int i=1;i<argc;++i){const char *a=argv[i];
@@ -118,7 +118,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--mla-cache-bf16")){o->mla_cache_bf16=1;}
         else if(!strcmp(a,"--mla-cache-fp32")){o->mla_cache_bf16=0;}
         else if(!strcmp(a,"--heartbeat-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->heartbeat_tokens))return-1;}
-        else if(!strcmp(a,"--ar-groups")){VALUE();if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
+        else if(!strcmp(a,"--ar-groups")){VALUE();if(!strcmp(argv[i],"auto"))o->ar_groups=-1;
+            else if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
         else if(!strcmp(a,"--comm-robust")){VALUE();if(parse_int(a,argv[i],1,2,&o->comm_robust))return-1;}
         else if(!strcmp(a,"--comm-poll-spins")){VALUE();if(parse_int(a,argv[i],1,1024,&o->comm_poll_spins))return-1;}
         else if(!strcmp(a,"--prefetch-mib")){VALUE();if(parse_int(a,argv[i],0,32,&o->prefetch_mib))return-1;}
@@ -140,6 +141,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         fprintf(stderr,"k3_ep_runner: bounded real mode requires --layer in [1,92] and --layers 1\n");return-1;}
     if(o->layer+o->layers>93){
         fprintf(stderr,"k3_ep_runner: layer range [%d,%d) exceeds the 93-layer network\n",o->layer,o->layer+o->layers);return-1;}
+    if(o->ar_groups<0)o->ar_groups=o->nodes>=12&&o->nodes%6==0?o->nodes/6:0;
     if(o->ar_groups>0&&(o->ar_groups==1||o->nodes%o->ar_groups)){
         fprintf(stderr,"k3_ep_runner: --ar-groups must be 0 or a divisor in [2,--nodes], got %d for %d nodes\n",
                 o->ar_groups,o->nodes);return-1;}

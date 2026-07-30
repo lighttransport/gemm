@@ -925,14 +925,15 @@ Both execution modes use the same kernels, scratch buffers, and collective:
   headers. At TP=96 this reads about 2.79 MiB/rank, or about 45 MiB per 16-node SIO
   group. Loading is collective-safe: one rank's failure is reduced to every rank,
   producing `load-failed` status rather than stranding peers in the next collective.
-- `--ar-groups A` enables the pool-backed hierarchical all-reduce when `A` divides
-  the node count; `0` is the safe flat default. Use `--ar-groups 3` for the measured
-  12-node 3x4 allocation. Do not assume that factor is optimal at 96 nodes.
+- `--ar-groups auto|A` controls the pool-backed hierarchical all-reduce. `auto` is
+  the default and chooses six-rank rows: two contiguous groups on 12 nodes and 16 on
+  96 nodes. An explicit divisor selects that many groups; `0` remains the diagnostic
+  flat override.
 
 Inside an allocation, use the orchestration wrapper:
 
 ```sh
-./run_k3_ep.sh --mode dummy --nodes 96 --layers 2 --tokens 2 --ar-groups 0
+./run_k3_ep.sh --mode dummy --nodes 96 --layers 2 --tokens 2 --ar-groups auto
 ./run_k3_ep.sh --mode real --nodes 96 --layer 1 --experts 0-15 \
   --model-dir "$HOME/models/kimi-k3" --layers 1 --tokens 2
 ```
@@ -943,6 +944,21 @@ durable `state=pass` marker per rank. It refuses pre-existing result and rank-lo
 stage directories. Rank-local data is intentionally not recursively deleted by the
 launcher; Fugaku wipes `/local` when the allocation ends, while retention during an
 interactive job makes failures recoverable.
+
+The auto hierarchy was selected from a fresh 12-node sweep. Flat reduction measured
+4.912 ms per layer in the four-layer smoke graph. Six-rank rows plus a two-rank column
+measured 0.108 ms/layer over 128 consecutive reductions with robust-2/poll-8. Robust-1
+and robust-2 poll cadences 1/4/8 all passed 12/12 ranks with identical checksums. The
+runner retains robust-2/poll-8 rather than selecting the slightly faster robust-1 path.
+A 256-token longevity test then passed 12/12 ranks, published four heartbeats, completed
+1,024 layer steps and 1,033 collectives, and kept MemAvailable above 29.8 GiB. The
+launcher reports the resolved topology (`ar_groups=2` on this allocation) in `K3_RUN`.
+The existing partial-real TP stage also completed 256 KDA/expert layer steps on all
+12 ranks with `2.413e-7` checksum disagreement, 24.15 MiB peak pool use, and 0.590 ms
+rank-maximum collective-plus-arrival-skew time per layer. Its first 64-token interval
+was the slowest; cumulative throughput rose from 668 to 865 layer steps/s, confirming
+that the short real-weight spike was startup/jitter rather than persistent transport
+failure.
 
 Short 96-node batch smoke scripts are `pjsub_k3_dummy_96n.sh` (five minutes, no model
 I/O), `pjsub_k3_real_96n.sh` (ten minutes, bounded partial weights), and
@@ -1210,9 +1226,9 @@ same final path safely. A one-expert TP=12 publication test left one complete fi
 directory and no temporary root.
 
 Queued 96-node smoke job `49852287` never started and produced no runner logs. It was
-held by the scheduler with `RSCGRP STOP`, then explicitly canceled on 2026-07-30. This
-was resource-group state rather than evidence of a runner failure; no replacement
-96-node job has been submitted.
+held by the scheduler with `RSCGRP STOP`, then explicitly canceled on 2026-07-30. The
+replacement 10-minute small-group smoke job `49860807` is queued with the dummy gate
+followed by a bounded 16-expert real stage; it will resolve `auto` to 16 groups.
 
 All figures in this section are partial-runner measurements: real mode supplies real
 MXFP4 expert slices but still uses synthetic attention projections and omits the full

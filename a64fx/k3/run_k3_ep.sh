@@ -25,7 +25,7 @@ REUSE_STAGE=0
 NO_FUSED_TEAM=0
 MLA_CACHE_BF16=1
 HEARTBEAT_TOKENS=1024
-AR_GROUPS=0
+AR_GROUPS=auto
 COMM_ROBUST=2
 COMM_POLL_SPINS=8
 PREFETCH_MIB=0
@@ -39,7 +39,7 @@ usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--profile] [--reuse-stage] [--no-fused-team]
           [--mla-cache-bf16|--mla-cache-fp32]
           [--heartbeat-tokens N]
-          [--ar-groups N] (0=flat, otherwise N contiguous groups)
+          [--ar-groups auto|N] (auto uses six-rank rows; 0=flat)
           [--comm-robust 1|2] (2=amortized polling, default)
           [--comm-poll-spins N] (power-of-two robust-2 cadence, default 8)
           [--prefetch-mib N] (overlap a routed-up weight window with MoE reduce)
@@ -78,7 +78,7 @@ while (( $# )); do
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$AR_GROUPS" "$COMM_ROBUST" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$COMM_ROBUST" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
@@ -86,8 +86,10 @@ done
     echo "$0: invalid numeric option range" >&2; exit 2; }
 (( NODES <= 96 )) || { echo "$0: node count must be in [1,96]" >&2; exit 2; }
 (( PREFETCH_MIB <= 32 )) || { echo "$0: --prefetch-mib must be in [0,32]" >&2; exit 2; }
-(( AR_GROUPS == 0 || (AR_GROUPS > 1 && NODES % AR_GROUPS == 0) )) || {
+[[ "$AR_GROUPS" == auto || "$AR_GROUPS" =~ ^[0-9]+$ ]] || { echo "$0: --ar-groups must be auto or an integer" >&2; exit 2; }
+if [[ "$AR_GROUPS" != auto ]]; then (( AR_GROUPS == 0 || (AR_GROUPS > 1 && NODES % AR_GROUPS == 0) )) || {
     echo "$0: --ar-groups must be 0 or a divisor in [2,--nodes]" >&2; exit 2; }
+fi
 (( COMM_ROBUST == 1 || COMM_ROBUST == 2 )) || { echo "$0: --comm-robust must be 1 or 2" >&2; exit 2; }
 (( COMM_POLL_SPINS > 0 && COMM_POLL_SPINS <= 1024 && (COMM_POLL_SPINS & (COMM_POLL_SPINS - 1)) == 0 )) || { echo "$0: --comm-poll-spins must be a power of two in [1,1024]" >&2; exit 2; }
 (( PREFETCH_THREADS <= THREADS )) || { echo "$0: --prefetch-threads cannot exceed --threads" >&2; exit 2; }
