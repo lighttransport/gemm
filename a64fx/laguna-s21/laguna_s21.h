@@ -188,37 +188,54 @@ static inline void laguna_bf16_rowblock(float *restrict y, const uint16_t *restr
 }
 /* Batched matvec (chunked prefill): Y[C][rows] = X[C][cols] @ W[rows][cols]^T,
  * token-major (Y[c*rows+r], X[c*cols]).  8 tokens share each weight-row load, so
- * the weight bandwidth is amortized ~8x vs C separate matvecs. */
+ * the weight bandwidth is amortized ~8x vs C separate matvecs.
+ *
+ * The wide 9k-col shapes (especially o_proj) exceed the L2 budget when C=256; if
+ * every row streams all C tokens, the X block is reread from HBM every row.  Keep
+ * token blocks in ~4 MB of L2 for each row sweep; for narrow shapes TB==C, so the
+ * output order changes but accumulation order does not. */
 static inline void laguna_matmat_bf16(float *restrict Y, const uint16_t *restrict W,
                                       const float *restrict X, int rows, int cols, int C) {
+    if (C <= 0 || cols <= 0 || rows <= 0) return;
+    int TB = (int)(4194304u / ((unsigned)cols * 4u));   /* ~4 MB of X per block */
+    if (TB > C) TB = C;
+    TB &= ~7;
+    if (TB < 8) TB = 8;
+    for (int t0 = 0; t0 < C; t0 += TB) {
+        int TN = C - t0 < TB ? C - t0 : TB;
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static)
 #endif
-    for (int r=0;r<rows;++r) {
-        const uint16_t *w=W+(size_t)r*cols; int ct=0;
-        for (; ct+8<=C; ct+=8) {
-            const float *x0=X+(size_t)(ct+0)*cols,*x1=X+(size_t)(ct+1)*cols,*x2=X+(size_t)(ct+2)*cols,*x3=X+(size_t)(ct+3)*cols;
-            const float *x4=X+(size_t)(ct+4)*cols,*x5=X+(size_t)(ct+5)*cols,*x6=X+(size_t)(ct+6)*cols,*x7=X+(size_t)(ct+7)*cols;
-            svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
-            svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
-            for (int c=0;c<cols;c+=(int)svcntw()) {
-                svbool_t pg=svwhilelt_b32(c,cols); svfloat32_t wv=laguna_ld_bf16(pg,w+c);
-                a0=svmla_f32_x(pg,a0,wv,svld1_f32(pg,x0+c)); a1=svmla_f32_x(pg,a1,wv,svld1_f32(pg,x1+c));
-                a2=svmla_f32_x(pg,a2,wv,svld1_f32(pg,x2+c)); a3=svmla_f32_x(pg,a3,wv,svld1_f32(pg,x3+c));
-                a4=svmla_f32_x(pg,a4,wv,svld1_f32(pg,x4+c)); a5=svmla_f32_x(pg,a5,wv,svld1_f32(pg,x5+c));
-                a6=svmla_f32_x(pg,a6,wv,svld1_f32(pg,x6+c)); a7=svmla_f32_x(pg,a7,wv,svld1_f32(pg,x7+c));
+        for (int r=0;r<rows;++r) {
+            const uint16_t *w=W+(size_t)r*cols; int ct=0;
+            for (; ct+8<=TN; ct+=8) {
+                const float *x0=X+(size_t)(t0+ct+0)*cols,*x1=X+(size_t)(t0+ct+1)*cols,*x2=X+(size_t)(t0+ct+2)*cols,*x3=X+(size_t)(t0+ct+3)*cols;
+                const float *x4=X+(size_t)(t0+ct+4)*cols,*x5=X+(size_t)(t0+ct+5)*cols,*x6=X+(size_t)(t0+ct+6)*cols,*x7=X+(size_t)(t0+ct+7)*cols;
+                svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+                svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+                for (int c=0;c<cols;c+=(int)svcntw()) {
+                    svbool_t pg=svwhilelt_b32(c,cols); svfloat32_t wv=laguna_ld_bf16(pg,w+c);
+                    a0=svmla_f32_x(pg,a0,wv,svld1_f32(pg,x0+c)); a1=svmla_f32_x(pg,a1,wv,svld1_f32(pg,x1+c));
+                    a2=svmla_f32_x(pg,a2,wv,svld1_f32(pg,x2+c)); a3=svmla_f32_x(pg,a3,wv,svld1_f32(pg,x3+c));
+                    a4=svmla_f32_x(pg,a4,wv,svld1_f32(pg,x4+c)); a5=svmla_f32_x(pg,a5,wv,svld1_f32(pg,x5+c));
+                    a6=svmla_f32_x(pg,a6,wv,svld1_f32(pg,x6+c)); a7=svmla_f32_x(pg,a7,wv,svld1_f32(pg,x7+c));
+                }
+                svbool_t pt=svptrue_b32();
+                Y[(size_t)(t0+ct+0)*rows+r]=svaddv_f32(pt,a0);
+                Y[(size_t)(t0+ct+1)*rows+r]=svaddv_f32(pt,a1);
+                Y[(size_t)(t0+ct+2)*rows+r]=svaddv_f32(pt,a2);
+                Y[(size_t)(t0+ct+3)*rows+r]=svaddv_f32(pt,a3);
+                Y[(size_t)(t0+ct+4)*rows+r]=svaddv_f32(pt,a4);
+                Y[(size_t)(t0+ct+5)*rows+r]=svaddv_f32(pt,a5);
+                Y[(size_t)(t0+ct+6)*rows+r]=svaddv_f32(pt,a6);
+                Y[(size_t)(t0+ct+7)*rows+r]=svaddv_f32(pt,a7);
             }
-            svbool_t pt=svptrue_b32();
-            Y[(size_t)(ct+0)*rows+r]=svaddv_f32(pt,a0); Y[(size_t)(ct+1)*rows+r]=svaddv_f32(pt,a1);
-            Y[(size_t)(ct+2)*rows+r]=svaddv_f32(pt,a2); Y[(size_t)(ct+3)*rows+r]=svaddv_f32(pt,a3);
-            Y[(size_t)(ct+4)*rows+r]=svaddv_f32(pt,a4); Y[(size_t)(ct+5)*rows+r]=svaddv_f32(pt,a5);
-            Y[(size_t)(ct+6)*rows+r]=svaddv_f32(pt,a6); Y[(size_t)(ct+7)*rows+r]=svaddv_f32(pt,a7);
-        }
-        for (; ct<C; ++ct) {
-            const float *x=X+(size_t)ct*cols; svfloat32_t a=svdup_f32(0);
-            for (int c=0;c<cols;c+=(int)svcntw()){ svbool_t pg=svwhilelt_b32(c,cols);
-                a=svmla_f32_x(pg,a,laguna_ld_bf16(pg,w+c),svld1_f32(pg,x+c)); }
-            Y[(size_t)ct*rows+r]=svaddv_f32(svptrue_b32(),a);
+            for (; ct<TN; ++ct) {
+                const float *x=X+(size_t)(t0+ct)*cols; svfloat32_t a=svdup_f32(0);
+                for (int c=0;c<cols;c+=(int)svcntw()){ svbool_t pg=svwhilelt_b32(c,cols);
+                    a=svmla_f32_x(pg,a,laguna_ld_bf16(pg,w+c),svld1_f32(pg,x+c)); }
+                Y[(size_t)(t0+ct)*rows+r]=svaddv_f32(svptrue_b32(),a);
+            }
         }
     }
 }
