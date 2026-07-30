@@ -12,7 +12,8 @@ head node itself against loopback.
   llmgr_cli.py start --model laguna --port 8080 --maxpos 8192
   llmgr_cli.py ps
   llmgr_cli.py log run-3 --follow
-  llmgr_cli.py gen run-3 --ids 2,1841,563 --max-new 32
+  llmgr_cli.py gen --ids 2,1841,563 --max-new 32
+  llmgr_cli.py chat 'Explain A64FX SVE briefly' --stream
   llmgr_cli.py stop run-3
 
 Standard library only.
@@ -159,6 +160,11 @@ def main(argv=None):
     r.add_argument("--mode", choices=("serve", "generate"))
     r.add_argument("--port", type=int)
     r.add_argument("--maxpos", type=int)
+    r.add_argument("--max-batch", type=int)
+    r.add_argument("--pchunk", type=int)
+    r.add_argument("--ar-groups", type=int)
+    r.add_argument("--comm-robust", type=int, choices=(0, 1, 2))
+    r.add_argument("--comm-poll-spins", type=int)
     r.add_argument("--layers", type=int)
     r.add_argument("--np", type=int)
     r.add_argument("--max-new", type=int)
@@ -194,7 +200,7 @@ def main(argv=None):
     lg.add_argument("--follow", action="store_true")
 
     g = sub.add_parser("gen", help="generate against a ready serve runner")
-    g.add_argument("id")
+    g.add_argument("--id", help="optional assertion of the active runner id")
     g.add_argument("--ids", required=True, help="comma-separated token ids")
     g.add_argument("--max-new", type=int, default=32)
     g.add_argument("--sample", action="store_true")
@@ -202,6 +208,21 @@ def main(argv=None):
     g.add_argument("--top-k", type=int)
     g.add_argument("--top-p", type=float)
     g.add_argument("--seed", type=int)
+
+    ch = sub.add_parser("chat", help="OpenAI-compatible Laguna chat")
+    ch.add_argument("prompt")
+    ch.add_argument("--system")
+    ch.add_argument("--model", default="laguna-s21")
+    ch.add_argument("--max-new", type=int, default=256)
+    ch.add_argument("--temperature", type=float, default=0.0)
+    ch.add_argument("--top-p", type=float)
+    ch.add_argument("--seed", type=int)
+    ch.add_argument("--no-think", action="store_true")
+    ch.add_argument("--stream", action="store_true")
+
+    sub.add_parser("queue", help="show the inference FIFO")
+    ca = sub.add_parser("cancel", help="cancel a queued/running inference")
+    ca.add_argument("id")
 
     pr = sub.add_parser("profile")
     pr.add_argument("--model", default="laguna")
@@ -265,7 +286,9 @@ def main(argv=None):
     elif c == "start":
         emit(call(args, "POST", "/runner/start",
                   dict(model=args.model,
-                       **opt("variant", "mode", "port", "maxpos", "layers",
+                       **opt("variant", "mode", "port", "maxpos", "max_batch",
+                             "pchunk", "ar_groups", "comm_robust",
+                             "comm_poll_spins", "layers",
                              "np", "max_new", "tokens", "layer", "experts",
                              "stage_dir", "model_dir", "result_dir",
                              "heartbeat_tokens", "min_available_mib",
@@ -286,6 +309,27 @@ def main(argv=None):
         body = dict(id=args.id, ids=ids, max_new=args.max_new)
         body.update(opt("sample", "temp", "top_k", "top_p", "seed"))
         emit(call(args, "POST", "/generate", body, timeout=1800))
+    elif c == "chat":
+        messages = []
+        if args.system is not None:
+            messages.append({"role": "system", "content": args.system})
+        messages.append({"role": "user", "content": args.prompt})
+        body = {"model": args.model, "messages": messages,
+                "max_completion_tokens": args.max_new,
+                "temperature": args.temperature,
+                "enable_thinking": not args.no_think,
+                "stream": args.stream}
+        body.update(opt("top_p", "seed"))
+        if args.stream:
+            call(args, "POST", "/v1/chat/completions", body,
+                 stream=True, timeout=None)
+        else:
+            emit(call(args, "POST", "/v1/chat/completions", body,
+                      timeout=3600))
+    elif c == "queue":
+        emit(call(args, "GET", "/inference/queue"))
+    elif c == "cancel":
+        emit(call(args, "POST", "/inference/cancel", {"id": args.id}))
     elif c == "profile":
         emit(call(args, "POST", "/profile",
                   dict(model=args.model, max_new=args.max_new,

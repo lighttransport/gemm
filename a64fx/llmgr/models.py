@@ -250,7 +250,10 @@ class LagunaAdapter(Adapter):
         if not cfg.get("stage", False):
             argv += ["--no-stage"]
         for key, flag in (("max_batch", "--max-batch"),
-                          ("pchunk", "--pchunk")):
+                          ("pchunk", "--pchunk"),
+                          ("ar_groups", "--ar-groups"),
+                          ("comm_robust", "--comm-robust"),
+                          ("comm_poll_spins", "--comm-poll-spins")):
             if cfg.get(key) is not None:
                 argv += [flag, str(cfg[key])]
         argv += _extra(cfg)

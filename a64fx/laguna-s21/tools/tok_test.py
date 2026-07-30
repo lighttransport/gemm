@@ -31,6 +31,13 @@ def main():
     print("longest-first matching (〈|EOS|〉 must beat its substrings 〈| and |〉):")
     check(t.encode("〈|EOS|〉") == [2], "〈|EOS|〉 is one token")
 
+    print("pre-tokenizer Unicode and newline boundaries:")
+    check(L._split_isolated("café 日本語 42") ==
+          ["café", " 日本語", " ", "4", "2"],
+          "Unicode letters and one-codepoint numeric alternatives")
+    check(L._split_isolated("a \nb") == ["a", " ", "\n", "b"],
+          "MergedWithNext newline split precedes main regex")
+
     print("round-trip:")
     cases = ["plain ascii text",
              "unicode: café naïve 日本語 — em dash",

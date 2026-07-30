@@ -32,6 +32,27 @@ def post(host, port, path, payload=None, timeout=3600):
         return json.loads(r.read().decode())
 
 
+def post_stream(host, port, payload, tok, raw=False, timeout=3600):
+    url = "http://%s:%d/generate" % (host, port)
+    payload = dict(payload); payload["stream"] = True
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    ids, previous, done = [], "", {}
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        for line in response:
+            event = json.loads(line.decode("utf-8", "replace"))
+            if event.get("event") == "token":
+                ids.append(int(event["id"]))
+                text = tok.decode(ids, raw=raw)
+                delta = text[len(previous):] if text.startswith(previous) else text
+                sys.stdout.write(delta); sys.stdout.flush(); previous = text
+            elif event.get("event") == "done":
+                done = event
+    sys.stdout.write("\n")
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -51,6 +72,7 @@ def main():
     ap.add_argument("--show-prompt", action="store_true")
     ap.add_argument("--raw", action="store_true", help="show special tokens in the reply")
     ap.add_argument("--json", action="store_true", help="print the raw server response")
+    ap.add_argument("--stream", action="store_true", help="print native NDJSON tokens as they arrive")
     a = ap.parse_args()
 
     if a.command == "health":
@@ -81,6 +103,12 @@ def main():
         if v is not None:
             req[k] = v
 
+    if a.stream:
+        r = post_stream(a.host, a.port, req, tok, raw=a.raw)
+        sys.stderr.write("[%d tok, stop=%s, prefill %.1f tok/s, decode %.1f tok/s]\n" % (
+            r.get("n", 0), r.get("stop", "?"), r.get("prefill_tok_s", 0),
+            r.get("decode_tok_s", 0)))
+        return 0
     r = post(a.host, a.port, "/generate", req)
     if a.json:
         print(json.dumps(r, indent=2)); return 0

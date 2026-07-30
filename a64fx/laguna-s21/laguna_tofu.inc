@@ -64,12 +64,23 @@ static void barrier(void){
     }
 }
 
-static tp_comm g_comm;
+static tp_comm g_comm, g_comm_col;
+static int g_ar_groups=1;
 static double g_ar_secs=0; static long g_ar_calls=0;
 static void ep_ar(void *ctx, float *buf, int count){
     tp_comm *c=(tp_comm*)ctx; int mc=c->max_count>0?c->max_count:count;
     double t=now_sec();
-    for(int off=0;off<count;){ int nn=count-off; if(nn>mc)nn=mc; tp_allreduce_sum(c,buf+off,nn); off+=nn; }
+    for(int off=0;off<count;){
+        int nn=count-off; if(nn>mc)nn=mc;
+        int rc = g_ar_groups > 1
+               ? tp_allreduce_sum_2d_checked(c,&g_comm_col,buf+off,nn)
+               : tp_allreduce_sum_checked(c,buf+off,nn);
+        if(rc){
+            tp_comm *bad=(g_ar_groups>1&&g_comm_col.error_code)?&g_comm_col:c;
+            die(tp_comm_error(bad),rc);
+        }
+        off+=nn;
+    }
     g_ar_secs+=now_sec()-t; g_ar_calls++;
 }
 
@@ -118,7 +129,14 @@ static void tofu_bootstrap(void){
     barrier();
     /* max_count sized for the batched chunked-prefill allreduce (C*hidden) so the
      * whole chunk reduces in one sync; decode's per-token [hidden] reduce still fits. */
-    if(tp_comm_init(&g_comm,Vcq,PeerVcq,MyRank,N,LAGUNA_PCHUNK*LAGUNA_HIDDEN,barrier)!=0) die("tp_comm_init",-1);
+    g_ar_groups=getenv("LAGUNA_AR_GROUPS")?atoi(getenv("LAGUNA_AR_GROUPS")):((N==12)?2:1);
+    if(g_ar_groups>1 && (N%g_ar_groups ||
+       tp_comm_init_2d(&g_comm,&g_comm_col,Vcq,PeerVcq,MyRank,N,g_ar_groups,
+                       LAGUNA_PCHUNK*LAGUNA_HIDDEN,barrier)!=0))
+        die("tp_comm_init_2d",-1);
+    if(g_ar_groups<=1 &&
+       tp_comm_init(&g_comm,Vcq,PeerVcq,MyRank,N,LAGUNA_PCHUNK*LAGUNA_HIDDEN,barrier)!=0)
+        die("tp_comm_init",-1);
 }
 
 /* Isolate pure collective cost from load-imbalance wait: barrier before each
@@ -399,6 +417,16 @@ static int run_generate(int argc, char **argv){
         pos++;
     }
     double dc1=now_sec();
+    /* Profiling data is collective state too.  The old rank-0-only reduction
+     * stranded rank 0 at shutdown after an otherwise successful generation. */
+    float prof_rank[64*2];
+    int have_prof_rank=g_prof&&N>1&&N<=64;
+    if(have_prof_rank){
+        for(int i=0;i<64*2;i++)prof_rank[i]=0.0f;
+        prof_rank[MyRank]=(float)g_d_expert_n;
+        prof_rank[64+MyRank]=(float)g_ar_secs;
+        ep_ar(&g_comm,prof_rank,64*2);
+    }
     if(MyRank==0){
         int nth=1;
 #ifdef _OPENMP
@@ -438,16 +466,13 @@ static int run_generate(int argc, char **argv){
              * so imbalance is charged to comm.  Gather both per rank and look at
              * whether AR time is ANTI-correlated with expert count -- if it is, the
              * fix is balancing experts (TP-sharding them), not the collective. */
-            if(N>1 && N<=64){
-                float v[64*2]; for(int i=0;i<64*2;i++) v[i]=0.0f;
-                v[MyRank]=(float)g_d_expert_n; v[64+MyRank]=(float)g_ar_secs;
-                tp_allreduce_sum(&g_comm, v, 64*2);
+            if(have_prof_rank){
                 double mn=1e30, mx=-1e30, sum=0;
-                for(int r=0;r<N;r++){ double e=v[r]; sum+=e; if(e<mn)mn=e; if(e>mx)mx=e; }
+                for(int r=0;r<N;r++){ double e=prof_rank[r]; sum+=e; if(e<mn)mn=e; if(e>mx)mx=e; }
                 logmsg("  expert-load imbalance across %d ranks (experts run over %d tokens):\n", N, ngen);
                 for(int r=0;r<N;r++)
                     logmsg("      rank%02d  experts=%-8.0f (%.2f/layer/token)  ar=%.2fs\n",
-                           r, v[r], v[r]/((double)ngen*47.0), v[64+r]);
+                           r,prof_rank[r],prof_rank[r]/((double)ngen*47.0),prof_rank[64+r]);
                 logmsg("      min=%.0f max=%.0f mean=%.1f  => max/mean=%.2fx"
                        "  (uniform-routing prediction: 3.02x)\n",
                        mn, mx, sum/N, (sum/N)>0?mx/(sum/N):0.0);

@@ -34,6 +34,7 @@ Fugaku's private fabric where the port is reachable only through an ssh tunnel.
 import argparse
 import json
 import os
+import queue
 import shlex
 import shutil
 import signal
@@ -55,6 +56,7 @@ sys.path.insert(0, HERE)
 
 import bash_http_server as bhs   # noqa: E402  (path set above)
 import models                    # noqa: E402
+import laguna_openai             # noqa: E402
 
 try:
     from http.server import ThreadingHTTPServer
@@ -62,7 +64,7 @@ except ImportError:                                   # pragma: no cover
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
 
-VERSION = "1.0"
+VERSION = "1.1"
 DEFAULT_PORT = 21274          # bash-over-http owns 21264; stay clear of it
 LOG_DIR = os.path.join(HERE, "logs")
 STATE_DIR = os.path.join(HERE, "state")
@@ -82,6 +84,144 @@ _children = {}
 _children_lock = threading.Lock()
 _next_id = [0]
 _stop_evt = threading.Event()
+
+
+def _ready_laguna():
+    with _children_lock:
+        ready = [c for c in _children.values()
+                 if c.kind == "serve" and c.state == "ready" and
+                 c.meta.get("model") == "laguna"]
+    return ready[0] if len(ready) == 1 else None
+
+
+class InferenceJob:
+    def __init__(self, jid, body, native, tokenizer, chat):
+        self.id = jid
+        self.body = body
+        self.native = native
+        self.tokenizer = tokenizer
+        self.chat = chat
+        self.events = queue.Queue()
+        self.done = threading.Event()
+        self.cancelled = threading.Event()
+        self.state = "queued"
+        self.error = None
+        self.result = None
+        self.created = time.time()
+        self.started = None
+
+    def info(self):
+        return {"id": self.id, "state": self.state, "created": self.created,
+                "started": self.started, "cancelled": self.cancelled.is_set(),
+                "error": self.error}
+
+
+class InferenceQueue:
+    """One bounded FIFO feeding the one default Laguna runner."""
+    def __init__(self, capacity=8):
+        self.capacity = capacity
+        self.pending = queue.Queue(maxsize=capacity)
+        self.jobs = {}
+        self.lock = threading.Lock()
+        self.seq = 0
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def submit(self, body, chat=True, native=None, tokenizer=None):
+        with self.lock:
+            self.seq += 1
+            jid = "infer-%d" % self.seq
+            job = InferenceJob(jid, body, native, tokenizer, chat)
+            self.jobs[jid] = job
+        try:
+            self.pending.put_nowait(job)
+        except queue.Full:
+            with self.lock:
+                self.jobs.pop(jid, None)
+            raise OverflowError("inference queue is full")
+        with self.lock:
+            finished = [key for key, old in self.jobs.items() if old.done.is_set()]
+            for key in finished[:-128]:
+                self.jobs.pop(key, None)
+        return job
+
+    def cancel(self, jid):
+        with self.lock:
+            job = self.jobs.get(jid)
+        if job is None:
+            return None
+        job.cancelled.set()
+        if job.state == "queued":
+            job.state = "cancelled"
+            job.done.set()
+        return job
+
+    def info(self):
+        with self.lock:
+            jobs = [j.info() for j in self.jobs.values()
+                    if not j.done.is_set()]
+        return {"capacity": self.capacity, "depth": self.pending.qsize(),
+                "jobs": jobs,
+                "runner": _ready_laguna().id if _ready_laguna() else None}
+
+    def _work(self):
+        while not _stop_evt.is_set():
+            try:
+                job = self.pending.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if job.cancelled.is_set():
+                job.done.set(); self.pending.task_done(); continue
+            try:
+                self._run(job)
+            except Exception as e:                # noqa: BLE001
+                job.error = str(e); job.state = "failed"
+                job.events.put({"event": "error", "error": str(e)})
+            finally:
+                job.done.set(); job.events.put(None); self.pending.task_done()
+
+    def _run(self, job):
+        runner = _ready_laguna()
+        if runner is None:
+            raise RuntimeError("exactly one ready Laguna runner is required")
+        job.state = "running"; job.started = time.time()
+        native = dict(job.native)
+        native["stream"] = True
+        prompt_ids = list(native.get("ids", []))
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/generate" % runner.port,
+            data=json.dumps(native).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        ids = []
+        meta = {}
+        previous = ""
+        with urllib.request.urlopen(request, timeout=3600.0) as response:
+            for raw in response:
+                if job.cancelled.is_set():
+                    response.close(); job.state = "cancelled"; return
+                event = json.loads(raw.decode("utf-8", "replace"))
+                if event.get("event") == "token":
+                    ids.append(int(event["id"]))
+                    text = job.tokenizer.decode(ids, raw=job.chat) if job.tokenizer else ""
+                    delta = text[len(previous):] if text.startswith(previous) else text
+                    previous = text
+                    event["text"] = delta
+                elif event.get("event") == "done":
+                    meta = event
+                job.events.put(event)
+        meta["ids"] = ids
+        meta.setdefault("n", len(ids))
+        if job.tokenizer:
+            meta["prompt_ids"] = prompt_ids
+            job.result = laguna_openai.completion_response(
+                job.body, job.tokenizer.decode(ids, raw=job.chat), meta, chat=job.chat,
+                request_id=job.id)
+        else:
+            meta.pop("event", None)
+            job.result = meta
+        job.state = "done"
+
+
+_inference = InferenceQueue(int(os.environ.get("LLMGR_QUEUE_CAPACITY", "8")))
 
 
 def _log(msg):
@@ -161,7 +301,9 @@ class Child:
                 # Own process group. Necessary but not sufficient: mpiexec
                 # re-execs into plexec, which leaves this session, so teardown
                 # also needs _sweep_tree(). See its comment.
-                preexec_fn=os.setsid,
+                # start_new_session is thread-safe; preexec_fn=os.setsid is not,
+                # now that the inference FIFO has a permanent worker thread.
+                start_new_session=True,
             )
         except OSError as e:
             self.state = "failed"
@@ -618,6 +760,12 @@ class Handler(bhs.Handler):
                 return self._get_health()
             if path == "/models":
                 return self._send_json(models.describe())
+            if path == "/v1/models":
+                return self._send_json({"object": "list", "data": [{
+                    "id": "laguna-s21", "object": "model",
+                    "created": 0, "owned_by": "poolside"}]})
+            if path == "/inference/queue":
+                return self._send_json(_inference.info())
             if path == "/nodes":
                 return self._get_nodes(q)
             if path == "/runner":
@@ -795,6 +943,12 @@ class Handler(bhs.Handler):
                 return self._post_runner_stop(body)
             if path == "/generate":
                 return self._post_generate(body)
+            if path == "/v1/chat/completions":
+                return self._post_openai(body, chat=True)
+            if path == "/v1/completions":
+                return self._post_openai(body, chat=False)
+            if path == "/inference/cancel":
+                return self._post_inference_cancel(body)
             if path == "/profile":
                 return self._post_profile(body)
             if path == "/kv":
@@ -833,6 +987,15 @@ class Handler(bhs.Handler):
             return self._err("%s has no serve mode -- use mode=generate "
                              "(one-shot) and read the log" % adapter.name)
         if mode == "serve":
+            with _children_lock:
+                active = [x for x in _children.values()
+                          if x.kind == "serve" and
+                          x.meta.get("model") == "laguna" and
+                          x.state in ("starting", "ready", "stopping")]
+            if adapter.name == "laguna" and active:
+                return self._err(
+                    "Laguna runner %s is already active; stop it before starting another"
+                    % active[0].id, status=409)
             port = models._int(body, "port", required=True)
             busy = _port_in_use(port)
             if busy:
@@ -866,36 +1029,149 @@ class Handler(bhs.Handler):
                          "exit_code": c.exit_code})
 
     def _post_generate(self, body):
-        """Proxy to the runner's own HTTP server (ids-in / ids-out)."""
-        cid = body.pop("id", None)
-        if not cid:
-            return self._err("missing 'id' (the serve child to talk to)")
-        c = _get_child(cid)
-        if c is None:
-            return self._err("no such child: %s" % cid, status=404)
-        if c.kind != "serve":
-            return self._err("child %s is not a serve runner" % cid)
-        if c.state != "ready":
-            return self._err("child %s is %s, not ready" % (cid, c.state),
-                             status=503)
-        timeout = float(body.pop("timeout", 900.0))
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(
-            "http://127.0.0.1:%d/generate" % c.port, data=data,
-            headers={"Content-Type": "application/json"}, method="POST")
+        """Queue the native ids-in/ids-out request against the default runner."""
+        req = dict(body)
+        requested = req.pop("id", None)
+        runner = _ready_laguna()
+        if runner is None:
+            return self._err("exactly one ready Laguna runner is required", status=503)
+        if requested and requested != runner.id:
+            return self._err("%s is not the active default runner" % requested,
+                             status=409)
+        req.pop("timeout", None)
+        if not isinstance(req.get("ids"), list):
+            return self._err("ids must be an array")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                payload = r.read()
-                status = r.getcode()
-        except urllib.error.HTTPError as e:
-            payload, status = e.read(), e.code
-        except Exception as e:
-            return self._err("runner %s unreachable: %s" % (cid, e), status=502)
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
+            job = _inference.submit(body, native=req, tokenizer=None, chat=False)
+        except OverflowError as e:
+            return self._err(str(e), status=429)
+        if body.get("stream"):
+            return self._stream_native(job)
+        if not job.done.wait(float(body.get("timeout", 900.0))):
+            _inference.cancel(job.id)
+            return self._err("inference timed out", status=504)
+        if job.error:
+            return self._err(job.error, status=502)
+        self._send_json(job.result)
+
+    def _stream_native(self, job):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            while True:
+                event = job.events.get()
+                if event is None:
+                    break
+                self.wfile.write((json.dumps(event, separators=(",", ":")) +
+                                  "\n").encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            _inference.cancel(job.id)
+
+    def _post_inference_cancel(self, body):
+        job = _inference.cancel(body.get("id"))
+        if job is None:
+            return self._err("no such inference job", status=404)
+        self._send_json(job.info())
+
+    def _post_openai(self, body, chat):
+        if _ready_laguna() is None:
+            return self._err("exactly one ready Laguna runner is required", status=503)
+        try:
+            native, tokenizer = laguna_openai.native_request(body, chat=chat)
+            job = _inference.submit(body, native=native, tokenizer=tokenizer,
+                                    chat=chat)
+        except OverflowError as e:
+            return self._err(str(e), status=429)
+        except (ValueError, OSError) as e:
+            return self._err(str(e))
+        if body.get("stream"):
+            return self._stream_openai(job, body, chat)
+        if not job.done.wait(float(body.get("timeout", 3600.0))):
+            _inference.cancel(job.id)
+            return self._err("inference timed out", status=504)
+        if job.error:
+            return self._err(job.error, status=502)
+        self._send_json(job.result)
+
+    def _stream_openai(self, job, body, chat):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        reasoning = chat and body.get("enable_thinking", True) and \
+            body.get("reasoning_effort") != "none"
+        tool_mode = False
+        try:
+            if chat:
+                self._sse({"id": job.id, "object": "chat.completion.chunk",
+                           "created": int(time.time()),
+                           "model": body.get("model", "laguna-s21"),
+                           "choices": [{"index": 0, "delta": {"role": "assistant"},
+                                        "finish_reason": None}]})
+            while True:
+                event = job.events.get()
+                if event is None:
+                    break
+                if event.get("event") != "token" or not event.get("text"):
+                    continue
+                delta_text = event["text"]
+                delta = {}
+                if delta_text.startswith("<think>"):
+                    delta_text = delta_text[len("<think>"):]
+                if reasoning:
+                    if "</think>" in delta_text:
+                        before, delta_text = delta_text.split("</think>", 1)
+                        if before:
+                            delta["reasoning_content"] = before
+                            delta["reasoning"] = before
+                        reasoning = False
+                    else:
+                        delta["reasoning_content"] = delta_text
+                        delta["reasoning"] = delta_text
+                if not reasoning and delta_text:
+                    if tool_mode:
+                        delta_text = ""
+                    elif "<tool_call>" in delta_text:
+                        delta_text = delta_text.split("<tool_call>", 1)[0]
+                        tool_mode = True
+                    if delta_text:
+                        delta["content"] = delta_text
+                if chat and not delta:
+                    continue
+                kind = "chat.completion.chunk" if chat else "text_completion"
+                choice = {"index": 0, "finish_reason": None}
+                choice["delta" if chat else "text"] = delta if chat else delta_text
+                self._sse({"id": job.id, "object": kind,
+                           "created": int(time.time()),
+                           "model": body.get("model", "laguna-s21"),
+                           "choices": [choice]})
+            if job.error:
+                self._sse({"error": {"message": job.error, "type": "runner_error"}})
+            elif job.result:
+                final = job.result["choices"][0]
+                delta = {}
+                if chat and final.get("message", {}).get("tool_calls"):
+                    delta["tool_calls"] = final["message"]["tool_calls"]
+                choice = {"index": 0, "finish_reason": final.get("finish_reason")}
+                choice["delta" if chat else "text"] = delta if chat else ""
+                self._sse({"id": job.id,
+                           "object": "chat.completion.chunk" if chat else "text_completion",
+                           "created": int(time.time()),
+                           "model": body.get("model", "laguna-s21"),
+                           "choices": [choice]})
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            _inference.cancel(job.id)
+
+    def _sse(self, obj):
+        data = ("data: " + json.dumps(obj, ensure_ascii=False,
+                                      separators=(",", ":")) + "\n\n").encode("utf-8")
+        self.wfile.write(data); self.wfile.flush()
 
     def _post_profile(self, body):
         """fapp-wrapped run of the per-rank binary.

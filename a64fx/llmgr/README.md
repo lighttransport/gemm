@@ -17,8 +17,7 @@ frontend loginN            compute head node            11 other nodes
 ## What it is (and is not)
 
 llmgr is a **generic supervisor**, not an MPI rank. It runs outside MPI and spawns
-runners as `setsid` process groups, so one `killpg` reaps a whole `mpiexec`
-tree. No C code was changed to build it.
+runners as `setsid` process groups and owns their complete lifecycle.
 
 Inference is **proxied** to the runner's own HTTP server
 (`a64fx/laguna-s21/laguna_serve.inc`). That is deliberate: that file's rank-0
@@ -46,13 +45,15 @@ cd a64fx/llmgr
 ./llmgr_cli.py stage-status --model laguna
 ./llmgr_cli.py start  --model laguna --port 8080 --maxpos 8192
 ./llmgr_cli.py ps                                 # wait for state=ready
-./llmgr_cli.py gen run-3 --ids 2,818,1841 --max-new 32
+./llmgr_cli.py gen --ids 2,818,1841 --max-new 32
+./llmgr_cli.py chat 'Explain SVE briefly' --stream
+./llmgr_cli.py queue
 ./llmgr_cli.py log run-3 --follow
 ./llmgr_cli.py stop run-3
 ```
 
-The runner has no tokenizer: `/generate` is ids-in / ids-out. Encode and decode
-on the client with `a64fx/laguna-s21/tools/laguna_tok.py`:
+The low-level `/generate` endpoint is ids-in / ids-out. The `/v1` endpoints use
+the checkpoint's exact Unicode byte-level BPE and chat template in llmgr:
 
 ```sh
 LAGUNA_TOKENIZER=~/models/laguna-s21-int4/tokenizer.json \
@@ -100,6 +101,8 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 |---|---|---|
 | GET | `/health` | uptime, job id, every child's state |
 | GET | `/models` | adapters, variants, whether each supports serve |
+| GET | `/v1/models` | OpenAI-compatible model list |
+| GET | `/inference/queue` | bounded FIFO depth, active runner and jobs |
 | GET | `/nodes` | PJM env, per-node host/mem/`/local` (`?fanout=0` for head only) |
 | GET | `/runner` | list children |
 | GET | `/runner/<id>/log?tail=N&follow=1` | tail, or stream until the child exits |
@@ -109,7 +112,10 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | POST | `/stage` | `{model, variant, stage_dir, model_dir, np}` |
 | POST | `/runner/start` | `{model, mode:serve\|generate, port, maxpos, layers, np, extra:[…], env:{…}}` |
 | POST | `/runner/stop` | `{id, grace}` |
-| POST | `/generate` | `{id, ids:[…], max_new, sample, temp, top_k, top_p, seed}` — proxied |
+| POST | `/generate` | `{ids:[…], max_new, sample, temp, top_k, top_p, seed}` — queued native API |
+| POST | `/v1/chat/completions` | OpenAI chat; supports SSE, reasoning and function tools |
+| POST | `/v1/completions` | OpenAI text completions; supports SSE |
+| POST | `/inference/cancel` | `{id}` — cancel a queued/running request |
 | POST | `/profile` | `{model, ids, max_new, event, np}` — fapp-wrapped run |
 | POST | `/kv` | `{action:save\|load\|clear\|stats, id, path}` |
 | POST | `/shutdown` | stop all children, then exit |
@@ -123,6 +129,12 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | `laguna` | `int4` (default), `bf16`, `fp8` | yes | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
 | `gemma4` | `tp` (default), `pp` | no — one-shot only | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
 | `k3` | `partial` | no — measured one-shot only | `a64fx/k3/run_k3_ep.sh` |
+
+Exactly one Laguna serve child may be starting or ready. All semantic and native
+requests share one bounded FIFO (capacity 8 by default, configurable with
+`LLMGR_QUEUE_CAPACITY`); overflow returns HTTP 429. Closing an SSE connection or
+calling `/inference/cancel` closes the native stream at the next event, and the
+runner retires the disconnected slot at its next collective-safe decode point.
 
 K3's HTTP interface is the llmgr control API, not a semantic completion API:
 the current runner has real TP MXFP4 expert slices but still lacks the tokenizer,

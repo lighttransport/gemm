@@ -24,6 +24,7 @@
 typedef struct {
     int active, fd;
     int n_prompt, pos, ngen, max_new, hit_eos;
+    int stream, client_gone;
     int *ids, *gen;
     laguna_sampler smp;
     double t_admit, t_prefill_done;
@@ -126,6 +127,13 @@ static int lbat_prefill(const laguna_model *m, laguna_scratch *sc, lbat_slot *s,
         for (int c=0;c<C;++c) embed_token(m, s->ids[p+c], Xc+(size_t)c*LAGUNA_HIDDEN);
         forward_prefill_chunk(m, sc, Xc, slot, p, C, &g_aar);
         p += C;
+        if (MyRank == 0 && s->stream && !s->client_gone) {
+            char ev[160];
+            int n = snprintf(ev, sizeof ev,
+                             "{\"event\":\"prefill\",\"done\":%d,\"total\":%d}\n",
+                             p, nprefill);
+            if (lsrv_write_all(s->fd, ev, (size_t)n) != 0) s->client_gone = 1;
+        }
     }
     for (; p < s->n_prompt; ++p) {
         embed_token(m, s->ids[p], x);

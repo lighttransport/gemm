@@ -80,11 +80,29 @@ other ranks sit blocked inside that collective whenever they are idle.
 | endpoint | |
 |---|---|
 | `GET /health` | `{"status":"ok","ranks":12,"maxpos":32768,"layers":48}` |
-| `POST /generate` | `{"ids":[...],"max_new":N,"sample":bool,"temp":f,"top_k":i,"top_p":f,"min_p":f,"seed":u}` |
+| `POST /generate` | `{"ids":[...],"max_new":N,"stream":bool,"sample":bool,"temp":f,"top_k":i,"top_p":f,"min_p":f,"seed":u}` |
 | `POST /shutdown` | stops every rank cleanly |
 
 `/generate` replies with `{"ids":[...],"n":N,"stop":"eos"|"length","nan":N,
 "lockstep_disagree":N,"prefill_tok_s":f,"decode_tok_s":f}`.
+
+With `"stream":true`, the response is NDJSON: `start`, chunk-level `prefill`,
+one `token` event per generated id, then `done` with stop and throughput fields.
+A closed client is detected without SIGPIPE and its slot is retired only at a
+collective-safe boundary. llmgr exposes this as OpenAI-compatible SSE.
+
+On 12 nodes the launcher defaults to the K3-derived reliable transport settings
+`--comm-robust 2 --comm-poll-spins 4` and a 2×6 hierarchical allreduce. Override
+with `--ar-groups`, `--comm-robust`, and `--comm-poll-spins`; every reduction is
+checked and terminates with the transport diagnostic after a collective failure.
+
+Fast FP8 remains the production path and `--fp8-exact` is the reference path.
+Capture the same prompt set from FP8-exact or BF16 and gate a candidate with:
+
+```sh
+python3 tools/quality_gate.py reference.jsonl fast-fp8.jsonl \
+  --min-token-exact 0.80 --min-text-similarity 0.95
+```
 
 The runner has no tokenizer, so the API is ids-in/ids-out. `tools/laguna_cli.py`
 does the chat templating and tokenisation client-side:

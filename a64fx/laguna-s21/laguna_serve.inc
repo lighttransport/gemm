@@ -16,7 +16,8 @@
  *
  * Endpoints
  *   GET  /health    -> {"status":"ok",...}
- *   POST /generate  -> {"ids":[...], "max_new":N, "sample":bool, "temp":f,
+ *   POST /generate  -> {"ids":[...], "max_new":N, "stream":bool,
+ *                       "sample":bool, "temp":f,
  *                       "top_k":i, "top_p":f, "min_p":f, "seed":u}
  *                      response {"ids":[...],"n":N,"stop":"eos"|"length",...}
  *   POST /shutdown  -> stops every rank cleanly
@@ -127,8 +128,14 @@ static int lsrv_listen(int port) {
     if (listen(fd, 64) != 0) { perror("listen"); close(fd); return -1; }
     return fd;
 }
-static void lsrv_write_all(int fd, const char *p, size_t n) {
-    while (n) { ssize_t w = write(fd, p, n); if (w <= 0) return; p += w; n -= (size_t)w; }
+static int lsrv_write_all(int fd, const char *p, size_t n) {
+    while (n) {
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        p += w; n -= (size_t)w;
+    }
+    return 0;
 }
 static void lsrv_respond(int fd, int code, const char *status, const char *body) {
     char hdr[256];
@@ -137,6 +144,20 @@ static void lsrv_respond(int fd, int code, const char *status, const char *body)
         "Content-Length: %zu\r\nConnection: close\r\n\r\n", code, status, strlen(body));
     lsrv_write_all(fd, hdr, (size_t)hn);
     lsrv_write_all(fd, body, strlen(body));
+}
+static int lsrv_stream_begin(int fd) {
+    static const char hdr[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n"
+        "Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
+        "{\"event\":\"start\"}\n";
+    return lsrv_write_all(fd, hdr, sizeof hdr - 1);
+}
+static int lsrv_stream_token(int fd, int id, int index) {
+    char ev[128];
+    int n = snprintf(ev, sizeof ev,
+                     "{\"event\":\"token\",\"id\":%d,\"index\":%d}\n",
+                     id, index);
+    return lsrv_write_all(fd, ev, (size_t)n);
 }
 /* read headers + body; returns malloc'd request text (caller frees) or NULL */
 static char *lsrv_read_request(int fd, char **body_out) {
@@ -198,6 +219,7 @@ static int lsrv_accept_into(lbat_slot *s, int cfd, char *raw, char *body,
     s->smp.top_p     = (float)ljs_num(body,"top_p",defaults.top_p);
     s->smp.min_p     = (float)ljs_num(body,"min_p",defaults.min_p);
     s->smp.rng       = (uint64_t)ljs_num(body,"seed",(double)defaults.rng);
+    s->stream        = (int)ljs_num(body,"stream",0) != 0;
     if (s->max_new < 1) s->max_new = 1;
     if (n + s->max_new > maxpos) {
         lsrv_respond(cfd,400,"Bad Request",
@@ -205,11 +227,28 @@ static int lsrv_accept_into(lbat_slot *s, int cfd, char *raw, char *body,
         return 0;
     }
     s->n_prompt = n; s->fd = cfd; s->pos = 0; s->ngen = 0; s->hit_eos = 0;
+    s->client_gone = 0;
+    if (s->stream && lsrv_stream_begin(cfd) != 0) s->client_gone = 1;
     return 1;
 }
 
 static void lsrv_finish(lbat_slot *s, double t_now, long disagree) {
     if (s->fd < 0) { s->active = 0; return; }
+    if (s->stream) {
+        if (!s->client_gone) {
+            char ev[320];
+            double pf = s->t_prefill_done > s->t_admit ? s->n_prompt/(s->t_prefill_done-s->t_admit) : 0.0;
+            double dt = t_now > s->t_prefill_done ? s->ngen/(t_now-s->t_prefill_done) : 0.0;
+            int n = snprintf(ev, sizeof ev,
+                "{\"event\":\"done\",\"n\":%d,\"stop\":\"%s\","
+                "\"lockstep_disagree\":%ld,\"prefill_tok_s\":%.2f,"
+                "\"decode_tok_s\":%.2f}\n",
+                s->ngen, s->hit_eos?"eos":"length", disagree, pf, dt);
+            lsrv_write_all(s->fd, ev, (size_t)n);
+        }
+        close(s->fd); s->fd = -1; s->active = 0;
+        return;
+    }
     size_t cap = (size_t)s->ngen*8 + 512;
     char *b = malloc(cap);
     if (b) {
@@ -306,11 +345,17 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
             int slot = st.adm_slot[i];
             lbat_slot *s = &B.slot[slot];
             if (MyRank != 0) { s->active = 1; s->fd = -1; s->ngen = 0; s->hit_eos = 0;
+                               s->stream = 0; s->client_gone = 0;
                                s->max_new = maxpos; s->smp = defaults; }
             int nxt = lbat_prefill(m, sc, s, slot, Xc, x, &disagree);
             s->t_prefill_done = now_sec();
             if (nxt==eos0 || nxt==eos1) { s->hit_eos = 1; }
-            else { s->gen[s->ngen++] = nxt; embed_token(m, nxt, B.X + (size_t)slot*LAGUNA_HIDDEN); }
+            else {
+                s->gen[s->ngen++] = nxt;
+                embed_token(m, nxt, B.X + (size_t)slot*LAGUNA_HIDDEN);
+                if (MyRank == 0 && s->stream && !s->client_gone &&
+                    lsrv_stream_token(s->fd, nxt, s->ngen - 1) != 0) s->client_gone = 1;
+            }
             /* a freshly prefilled slot joins the decode batch below */
             if (!s->hit_eos && s->ngen < s->max_new) {
                 st.act_slot[st.n_active] = slot;
@@ -334,6 +379,8 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
             else if (s->ngen < s->max_new) {
                 s->gen[s->ngen++] = nxt;
                 embed_token(m, nxt, B.X + (size_t)slot*LAGUNA_HIDDEN);
+                if (MyRank == 0 && s->stream && !s->client_gone &&
+                    lsrv_stream_token(s->fd, nxt, s->ngen - 1) != 0) s->client_gone = 1;
             }
         } else if (st.n_active > 1) {
             for (int i=0;i<st.n_active;i++) {
@@ -358,6 +405,8 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
                 else if (s->ngen < s->max_new) {
                     s->gen[s->ngen++] = nxt[i];
                     embed_token(m, nxt[i], B.X + (size_t)i*LAGUNA_HIDDEN);
+                    if (MyRank == 0 && s->stream && !s->client_gone &&
+                        lsrv_stream_token(s->fd, nxt[i], s->ngen - 1) != 0) s->client_gone = 1;
                 }
               } }
             /* unpack activations back to slot order for the next step */
@@ -371,7 +420,8 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
         for (int i=0;i<B.nslot;i++) {
             lbat_slot *s = &B.slot[i];
             if (!s->active) continue;
-            if (s->hit_eos || s->ngen >= s->max_new) {
+            if (s->hit_eos || s->ngen >= s->max_new ||
+                (MyRank == 0 && s->client_gone)) {
                 if (MyRank == 0) {
                     logmsg("slot %d done: %d prompt + %d gen tok%s\n",
                            i, s->n_prompt, s->ngen, s->hit_eos?" (eos)":"");

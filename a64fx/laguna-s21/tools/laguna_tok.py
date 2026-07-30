@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal byte-level BPE for Laguna S-2.1 (reads tokenizer.json; no deps, py3.6 ok).
+"""Exact byte-level BPE for Laguna S-2.1 (reads tokenizer.json; no deps, py3.6 ok).
 
-GPT-4-style byte-level BPE: ByteLevel pre-tokenizer + decoder, BPE merges. The
-pretokenize regex uses \\p{L}/\\p{N} which stdlib `re` lacks, so we approximate it
-for ASCII/English (good enough for smoke-test prompts). Decode is exact.
+Implements the checkpoint's Split + ByteLevel + BPE pipeline.  Python's stdlib
+``re`` lacks \\p{L}/\\p{N}, so Unicode properties are scanned with
+``unicodedata.category`` instead of approximating them as ASCII.
 
 Usage:
   python3 laguna_tok.py encode "The capital of France is" [--bos] > prompt.ids
@@ -12,7 +12,7 @@ Usage:
   python3 laguna_tok.py decode-file gen.ids
 Env: LAGUNA_TOKENIZER (default ~/models/laguna-s21-int4/tokenizer.json)
 """
-import sys, os, json, re
+import sys, os, json, re, unicodedata
 
 TOKJSON = os.environ.get("LAGUNA_TOKENIZER",
                          os.path.expanduser("~/models/laguna-s21-int4/tokenizer.json"))
@@ -52,13 +52,91 @@ def bytes_to_unicode():
 B2U = bytes_to_unicode()
 U2B = {v:k for k,v in B2U.items()}
 
+def _cat(ch): return unicodedata.category(ch)[0]
+def _is_l(ch): return _cat(ch) == "L"
+def _is_n(ch): return _cat(ch) == "N"
+def _is_nl(ch): return ch in "\r\n"
+
+def _main_match(s, i):
+    """Match tokenizer.json's main Split-regex alternative at ``i``."""
+    n, c = len(s), s[i]
+    # (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if c == "'":
+        tail = s[i:].lower()
+        for contraction in ("'re", "'ve", "'ll", "'s", "'t", "'m", "'d"):
+            if tail.startswith(contraction): return len(contraction)
+    # [^\r\n\p{L}\p{N}]?\p{L}+
+    j = i
+    if not (_is_nl(c) or _is_l(c) or _is_n(c)):
+        j = i + 1 if i + 1 < n and _is_l(s[i + 1]) else i
+    if j < n and _is_l(s[j]):
+        k = j + 1
+        while k < n and _is_l(s[k]): k += 1
+        return k - i
+    # \p{N}: one numeric code point, deliberately not a run.
+    if _is_n(c): return 1
+    #  ?[^\s\p{L}\p{N}]+[\r\n]*
+    j = i + 1 if c == " " and i + 1 < n and not (
+        s[i + 1].isspace() or _is_l(s[i + 1]) or _is_n(s[i + 1])) else i
+    if j < n and not (s[j].isspace() or _is_l(s[j]) or _is_n(s[j])):
+        k = j + 1
+        while k < n and not (s[k].isspace() or _is_l(s[k]) or _is_n(s[k])): k += 1
+        while k < n and _is_nl(s[k]): k += 1
+        return k - i
+    # \s*[\r\n]+ | \s+(?!\S) | \s+
+    if c.isspace():
+        k = i
+        while k < n and s[k].isspace(): k += 1
+        last_nl = -1
+        for p in range(i, k):
+            if _is_nl(s[p]): last_nl = p
+        if last_nl >= 0: return last_nl + 1 - i
+        if k == n: return k - i
+        return k - i - 1 if k - i >= 2 else 1
+    return 0
+
+def _split_main(text):
+    pieces=[]; i=gap=0
+    while i < len(text):
+        size = _main_match(text, i)
+        if size:
+            if i > gap: pieces.append(text[gap:i])
+            pieces.append(text[i:i+size]); i += size; gap = i
+        else: i += 1
+    if gap < len(text): pieces.append(text[gap:])
+    return pieces
+
+_NEWLINE_RUN = re.compile(r"(?:\r?\n)+(?!\r?\n)")
+
+def _split_isolated(text):
+    """Apply the checkpoint's MergedWithNext Split, then its Isolated Split."""
+    first=[]; end=0; pending=""
+    for match in _NEWLINE_RUN.finditer(text):
+        before=text[end:match.start()]
+        if before:
+            first.append(pending+before); pending=""
+        pending += match.group(0)
+        end=match.end()
+    tail=text[end:]
+    if tail or pending: first.append(pending+tail)
+    pieces=[]
+    for part in first or ([text] if text else []):
+        pieces.extend(_split_main(part))
+    return pieces
+
 class Tok:
     def __init__(self, path):
         j = json.load(open(path)); m = j["model"]
+        if m.get("type") != "BPE" or m.get("byte_fallback", False):
+            raise ValueError("Laguna tokenizer must be BPE without byte_fallback")
+        pts = j.get("pre_tokenizer", {}).get("pretokenizers", [])
+        if len(pts) != 3 or pts[2].get("type") != "ByteLevel" or pts[2].get("add_prefix_space"):
+            raise ValueError("unsupported Laguna pre-tokenizer shape")
         self.vocab = m["vocab"]
         self.id2tok = {v:k for k,v in self.vocab.items()}
         mg = [tuple(x.split(" ")) if isinstance(x,str) else tuple(x) for x in m["merges"]]
         self.ranks = {p:i for i,p in enumerate(mg)}
+        self._cache = {}
         self.added_ids = set(); self.special_ids = set(); added = []
         for a in j.get("added_tokens",[]):
             self.added_ids.add(a["id"])
@@ -68,15 +146,23 @@ class Tok:
         # longest-first so 〈|EOS|〉 wins over its substrings 〈| and |〉
         self.added_re = (re.compile("(" + "|".join(re.escape(c) for c in
                          sorted(added, key=len, reverse=True)) + ")") if added else None)
-        self.pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+""")
     def _bpe(self, tokens):
+        key = "".join(tokens)
+        if key in self._cache: return self._cache[key]
         while len(tokens) > 1:
-            best=None; bi=-1
+            best=None; pair=None
             for i in range(len(tokens)-1):
                 r=self.ranks.get((tokens[i],tokens[i+1]))
-                if r is not None and (best is None or r<best): best=r; bi=i
-            if bi<0: break
-            tokens=tokens[:bi]+[tokens[bi]+tokens[bi+1]]+tokens[bi+2:]
+                if r is not None and (best is None or r<best):
+                    best=r; pair=(tokens[i],tokens[i+1])
+            if pair is None: break
+            out=[]; i=0
+            while i < len(tokens):
+                if i+1 < len(tokens) and (tokens[i],tokens[i+1]) == pair:
+                    out.append(tokens[i]+tokens[i+1]); i += 2
+                else: out.append(tokens[i]); i += 1
+            tokens=out
+        self._cache[key]=tokens
         return tokens
     def encode(self, text, add_bos=False):
         ids=[EOS_ID] if add_bos else []
@@ -90,12 +176,12 @@ class Tok:
                 self._encode_text(part, ids)
         return ids
     def _encode_text(self, text, ids):
-        for piece in self.pat.findall(text):
+        for piece in _split_isolated(text):
             s="".join(B2U[b] for b in piece.encode("utf-8"))
             for t in self._bpe(list(s)):
-                if t in self.vocab: ids.append(self.vocab[t])
-                else:
-                    for ch in t: ids.append(self.vocab.get(ch, 0))
+                if t not in self.vocab:
+                    raise ValueError("BPE symbol missing from vocabulary: %r" % t)
+                ids.append(self.vocab[t])
     def decode(self, ids, raw=False):
         # BPE pieces are byte-level-encoded (each char stands for a byte) but added
         # tokens are literal text, so they cannot go through the same byte decode --

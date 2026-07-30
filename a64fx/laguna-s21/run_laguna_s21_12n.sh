@@ -30,6 +30,7 @@ NP="${PJM_MPI_PROC:-12}"
 PROMPT="The capital of France is"
 IDS=""; MAX_NEW=48; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0
 MODEL=""; STAGE=""; NSHARDS=""; PORT=""; MAXPOS=""
+AR_GROUPS=""; COMM_ROBUST=2; COMM_POLL_SPINS=4
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,11 +48,20 @@ while [ $# -gt 0 ]; do
     --nshards)   NSHARDS="$2"; shift 2;;
     --port)      PORT="$2"; shift 2;;
     --maxpos)    MAXPOS="$2"; shift 2;;
+    --ar-groups) AR_GROUPS="$2"; shift 2;;
+    --comm-robust) COMM_ROBUST="$2"; shift 2;;
+    --comm-poll-spins) COMM_POLL_SPINS="$2"; shift 2;;
     --bf16)    VARIANT=bf16; shift;;
     --fp8)     VARIANT=fp8; shift;;
     *) PASS+=("$1"); shift;;
   esac
 done
+case "$COMM_ROBUST" in 0|1|2) ;; *) echo "--comm-robust must be 0, 1, or 2" >&2; exit 2;; esac
+case "$COMM_POLL_SPINS" in 1|2|4|8|16|32|64|128|256|512|1024) ;;
+  *) echo "--comm-poll-spins must be a power of two in [1,1024]" >&2; exit 2;; esac
+if [ -n "$AR_GROUPS" ] && { [ "$AR_GROUPS" -lt 1 ] || [ $((NP % AR_GROUPS)) -ne 0 ]; }; then
+  echo "--ar-groups must be a positive divisor of --np" >&2; exit 2
+fi
 
 # int4 (production, default), pure-bf16 reference, or fp8 (bf16 linears + fp8
 # experts). Each uses its own checkpoint, runner binary, and stage dir.
@@ -131,6 +141,8 @@ export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 # NB: do NOT set FLIB_BARRIER=HARD here -- it forces the OpenMP runtime to 48
 # threads (oversubscribing all 48 cores), which ~4x-slows the matvec kernels.
 export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
+export TP_AR_ROBUST="$COMM_ROBUST" TP_AR_POLL_SPINS="$COMM_POLL_SPINS"
+[ -n "$AR_GROUPS" ] && export LAGUNA_AR_GROUPS="$AR_GROUPS"
 
 if [ "$MODE" = serve ]; then
   [ -n "$PORT" ] || { echo "serve needs --port N" >&2; exit 2; }
