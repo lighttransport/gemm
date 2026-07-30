@@ -1305,3 +1305,19 @@ All figures in this section are partial-runner measurements: real mode supplies 
 MXFP4 expert slices but still uses synthetic attention projections and omits the full
 dense/shared completion, embedding, tokenizer, and LM head. They are useful for kernel
 scheduling and collective diagnosis, not a full-model token/s claim.
+
+### Combined TP96 decode and prefill calibration job
+
+`pjsub_k3_profile_96n.sh` requests 96 small-group nodes for one hour and stages the
+real layer-1 expert slices exactly once. It first runs an eight-step dummy transport
+gate, then a 256-step real-weight decode profile, reuses the same rank-local slices for
+M=64/256/1024 expert-prefill probes, and feeds the critical-rank measurements into the
+whole-network simulator. The modeled workload shapes are a 1,024-token C++ codegen
+context and an 8,192-token C++ code-analysis prompt. Prompt text and the important
+caveat that activations remain deterministic/synthetic are saved in `workloads.txt`.
+
+Both `run_k3_ep.sh` and the outer batch script write tab-separated stage timing files.
+They preserve start/end epochs, elapsed seconds, and return codes for build, topology,
+weight staging, decode, prefill, result validation, and the whole-network estimate.
+An EXIT trap records an interrupted active stage, making the logs suitable for sizing
+later checkpoint-heavy allocations even when a job hits its elapsed-time limit.

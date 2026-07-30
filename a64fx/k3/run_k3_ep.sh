@@ -116,16 +116,59 @@ if [[ -e "$RESULT_DIR" ]]; then echo "$0: result directory already exists: $RESU
 mkdir -p "$RESULT_DIR"
 RESULT_DIR=$(cd "$RESULT_DIR" && pwd)
 
+# Keep durable wall-clock records for slow shared-storage staging and scheduler
+# sizing.  The EXIT trap also records the active stage when set -e aborts it.
+TIMING_FILE="$RESULT_DIR/k3_stage_timing.tsv"
+TIMING_TOTAL_START=$(date +%s)
+TIMING_ACTIVE=
+TIMING_STAGE_START=0
+printf 'stage\tstart_epoch\tend_epoch\telapsed_s\trc\n' >"$TIMING_FILE"
+timing_begin() {
+    TIMING_ACTIVE=$1
+    TIMING_STAGE_START=$(date +%s)
+    printf 'K3_STAGE_BEGIN stage=%s epoch=%s utc=%s\n' "$TIMING_ACTIVE" \
+        "$TIMING_STAGE_START" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+timing_end() {
+    timing_rc=$1
+    timing_end_epoch=$(date +%s)
+    timing_elapsed=$((timing_end_epoch - TIMING_STAGE_START))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$TIMING_ACTIVE" "$TIMING_STAGE_START" \
+        "$timing_end_epoch" "$timing_elapsed" "$timing_rc" >>"$TIMING_FILE"
+    printf 'K3_STAGE_END stage=%s elapsed_s=%s rc=%s\n' \
+        "$TIMING_ACTIVE" "$timing_elapsed" "$timing_rc"
+    TIMING_ACTIVE=
+}
+timing_on_exit() {
+    timing_rc=$?
+    timing_end_epoch=$(date +%s)
+    if [[ -n "$TIMING_ACTIVE" ]]; then
+        timing_elapsed=$((timing_end_epoch - TIMING_STAGE_START))
+        printf '%s\t%s\t%s\t%s\t%s\n' "$TIMING_ACTIVE" "$TIMING_STAGE_START" \
+            "$timing_end_epoch" "$timing_elapsed" "$timing_rc" >>"$TIMING_FILE"
+        printf 'K3_STAGE_END stage=%s elapsed_s=%s rc=%s\n' \
+            "$TIMING_ACTIVE" "$timing_elapsed" "$timing_rc"
+    fi
+    printf 'total\t%s\t%s\t%s\t%s\n' "$TIMING_TOTAL_START" "$timing_end_epoch" \
+        "$((timing_end_epoch - TIMING_TOTAL_START))" "$timing_rc" >>"$TIMING_FILE"
+    printf 'K3_STAGE_TOTAL elapsed_s=%s rc=%s timing=%s\n' \
+        "$((timing_end_epoch - TIMING_TOTAL_START))" "$timing_rc" "$TIMING_FILE"
+}
+trap timing_on_exit EXIT
+
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 if (( PREFETCH_MIB > 0 )) && [[ -z "${OMP_PLACES:-}" ]]; then
     OMP_PLACES='{12}:47:1'
 fi
 export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
+timing_begin build
 make -C "$UTOFU" tofu_topo_helper >/dev/null
 make -C "$SCRIPT_DIR" runner >/dev/null
+timing_end 0
 
 cd "$RESULT_DIR"
+timing_begin topology
 topology_ok=0
 for attempt in 1 2 3 4 5; do
     rm -f tofu_topo.txt
@@ -138,10 +181,12 @@ for attempt in 1 2 3 4 5; do
     sleep 2
 done
 (( topology_ok == 1 )) || { echo "$0: topology discovery failed" >&2; exit 3; }
+timing_end 0
 
 if [[ "$MODE" == real ]]; then
     if [[ ! -d "$MODEL_DIR" ]]; then echo "$0: model directory is missing: $MODEL_DIR" >&2; exit 4; fi
     if (( REUSE_STAGE )); then
+        timing_begin stage_validation
         mpiexec -np "$NODES" /bin/sh -c '
             rank=${PMIX_RANK:?}; marker="$1/stage-rank$(printf "%03d" "$rank").status"
             expected="rank=$rank nodes=$2 layer=$3 experts=$4"
@@ -149,12 +194,15 @@ if [[ "$MODE" == real ]]; then
         ' sh "$STAGE_DIR" "$NODES" "$LAYER" "$EXPERTS" || {
             echo "$0: --reuse-stage validation failed: $STAGE_DIR" >&2; exit 4; }
         echo "reusing rank-local stage: $STAGE_DIR"
+        timing_end 0
     else
+        timing_begin weight_staging
         mpiexec -np "$NODES" -of-proc "$RESULT_DIR/stage" \
             "$SCRIPT_DIR/run_k3_stage_rank.sh" "$SCRIPT_DIR" "$NODES" "$MODEL_DIR" \
             "$STAGE_DIR" "$LAYER" "$EXPERTS" "$CHUNK_MIB"
         staged=$(find "$RESULT_DIR" -maxdepth 1 -name 'stage.*' -type f | wc -l)
         echo "stage launch output files: $staged/$NODES"
+        timing_end 0
     fi
 fi
 
@@ -167,6 +215,7 @@ if (( MLA_CACHE_BF16 )); then
 else
     RUNNER_EXTRA+=(--mla-cache-fp32)
 fi
+timing_begin decode_runner
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
     --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --min-available-mib "$MIN_AVAILABLE_MIB" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-ack "$COMM_ACK" --comm-deterministic "$COMM_DETERMINISTIC" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
@@ -174,12 +223,17 @@ mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?
 set -e
+timing_end "$runner_rc"
 
+timing_begin result_validation
 passes=$(grep -l ' state=pass ' "$RESULT_DIR"/k3_rank*.status 2>/dev/null | wc -l || true)
 grep -hE 'K3_RUN|K3_PROGRESS|K3_RESULT|K3_HEALTH|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
 echo "K3 distributed result: rc=$runner_rc pass_markers=$passes/$NODES results=$RESULT_DIR"
+validation_rc=0
+(( runner_rc == 0 && passes == NODES )) || validation_rc=5
+timing_end "$validation_rc"
 
 # Rank-local storage is job-scoped and is wiped by the scheduler. Deliberately
 # leave it untouched here: automatic recursive cleanup of a caller-supplied
 # --stage-dir is unsafe, and retaining it helps diagnose a failed run.
-(( runner_rc == 0 && passes == NODES )) || exit 5
+(( validation_rc == 0 )) || exit "$validation_rc"
