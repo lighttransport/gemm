@@ -31,6 +31,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -1583,11 +1584,14 @@ static int load_ids(const char *path, int **out) {
     fclose(f); *out=v; return n;
 }
 
+#include "laguna_prompt_cache.inc"
+
 static void usage(const char *n){
     fprintf(stderr,
       "usage: %s --self-test | --describe | --check-stage DIR [LAYERS] | --probe-stage DIR\n"
       "       %s --generate --ids FILE --max-new N [--maxpos P] [--layers L]\n"
       "                     [--stage-dir DIR] [--gen-out FILE]\n"
+      "                     [--prompt-cache FILE --prompt-cache-ids PREFIX.ids]\n"
       "       %s --ar-probe [--reps N] [--count C]   (needs no weights)\n", n, n, n);
 }
 
@@ -1596,7 +1600,7 @@ static void usage(const char *n){
 
 int main(int argc, char **argv) {
     if (argc==2 && !strcmp(argv[1],"--self-test")) {
-        int rc=test_i4()|test_fht()|test_route()|test_kv_codec()|test_i4_matvec()|test_i8_matmat();
+        int rc=test_i4()|test_fht()|test_route()|test_kv_codec()|test_i4_matvec()|test_i8_matmat()|test_prompt_cache();
 #if defined(LAGUNA_FP8)
         rc|=test_fp8_i8blk();
 #endif

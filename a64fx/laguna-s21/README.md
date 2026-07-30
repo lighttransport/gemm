@@ -108,6 +108,39 @@ follows.
 ./run_laguna_s21_12n.sh serve --fp8 --no-stage --port 8080 --maxpos 32768
 ```
 
+For a repeated system prompt, add a persistent KV prefix cache:
+
+```sh
+./run_laguna_s21_12n.sh serve --fp8 --no-stage --port 8080 --maxpos 32768 \
+  --system "You are a senior C++ reviewer." \
+  --prompt-cache /path/to/laguna-cpp-system.lpc
+```
+
+The same cache option works for repeated one-shot chat generations:
+
+```sh
+./run_laguna_s21_12n.sh generate --fp8 --no-stage \
+  --chat "Review this implementation..." --system "You are a senior C++ reviewer." \
+  --prompt-cache /path/to/laguna-cpp-system.lpc
+```
+
+The cache path must be on a filesystem shared by all ranks. The first run
+prefills the system block and atomically serializes its live KV state; later
+starts deserialize it. Rank 0 uses the named file and the other EP ranks use
+`.rankNN` companions, preserving the small rank-specific differences caused by
+collective reduction order. Each admitted HTTP slot restores the immutable
+snapshot before computing the user/assistant suffix. Requests must begin with the
+same tokenized system prefix (use matching `--system` and thinking mode in
+`tools/laguna_cli.py`); mismatches receive HTTP 400. `GET /health` reports
+`prompt_cache_tokens`, and generation responses report `cached_prompt_tokens`.
+
+Cache files are checksummed and bound to the checkpoint identity, layer count,
+runner weight variant, and BF16/FP16 KV format. A corrupt or incompatible cache is
+rejected rather than silently reused. To replace a system prompt, use a new cache
+path or remove the old file. The direct runner interface also supports
+`--prompt-cache-load FILE`, `--prompt-cache-save FILE`, and
+`--prompt-cache-ids PREFIX.ids`; `--prompt-cache FILE` is the load-or-create alias.
+
 `--maxpos` is required in serve mode: there is no prompt to size the KV cache from,
 and it sets the largest context the server will accept.
 
@@ -119,7 +152,7 @@ other ranks sit blocked inside that collective whenever they are idle.
 
 | endpoint | |
 |---|---|
-| `GET /health` | `{"status":"ok","ranks":12,"maxpos":32768,"layers":48}` |
+| `GET /health` | `{"status":"ok","ranks":12,"maxpos":32768,"layers":48,"prompt_cache_tokens":N}` |
 | `POST /generate` | `{"ids":[...],"max_new":N,"stream":bool,"sample":bool,"temp":f,"top_k":i,"top_p":f,"min_p":f,"seed":u}` |
 | `POST /shutdown` | stops every rank cleanly |
 

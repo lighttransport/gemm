@@ -14,6 +14,7 @@
 #   --nshards N         safetensors shard count of the source checkpoint
 #   --port N            serve mode: HTTP port
 #   --maxpos N          serve mode: largest context to accept
+#   --prompt-cache FILE serialize/reuse the fixed system-prompt KV prefix
 #   --prompt "text"     natural-language prompt (tokenized here)
 #   --ids FILE          pre-tokenized ids (overrides --prompt)
 #   --max-new N         tokens to generate (default 48)
@@ -30,7 +31,7 @@ MODE="${1:-self-test}"; shift || true
 NP="${PJM_MPI_PROC:-12}"
 PROMPT="The capital of France is"
 IDS=""; MAX_NEW=48; MAX_NEW_SET=0; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0; KV_FP16=0
-QUALITY_CPP=0
+QUALITY_CPP=0; PROMPT_CACHE=""
 MODEL=""; STAGE=""; NSHARDS=""; PORT=""; MAXPOS=""
 AR_GROUPS=""; COMM_ROBUST=2; COMM_POLL_SPINS=4
 PASS=()
@@ -50,6 +51,9 @@ while [ $# -gt 0 ]; do
     --nshards)   NSHARDS="$2"; shift 2;;
     --port)      PORT="$2"; shift 2;;
     --maxpos)    MAXPOS="$2"; shift 2;;
+    --prompt-cache)
+      case "$2" in /*) PROMPT_CACHE="$2";; *) PROMPT_CACHE="$PWD/$2";; esac
+      shift 2;;
     --ar-groups) AR_GROUPS="$2"; shift 2;;
     --comm-robust) COMM_ROBUST="$2"; shift 2;;
     --comm-poll-spins) COMM_POLL_SPINS="$2"; shift 2;;
@@ -163,6 +167,22 @@ if [ "$MODE" = generate ]; then
   fi
 fi
 
+# The template's system block is a literal token prefix of every following chat
+# turn.  Build it independently so the runner can serialize exactly that KV state.
+PCACHE_ARGS=()
+if [ -n "$PROMPT_CACHE" ]; then
+  if [ "$MODE" = generate ] && [ "$CHAT" != 1 ]; then
+    echo "--prompt-cache requires --chat in generate mode" >&2; exit 2
+  fi
+  PCACHE_IDS="$RUN_DIR/system_prefix.ids"
+  PCARGS=(system-prefix)
+  [ -n "$SYSMSG" ] && PCARGS+=(--system "$SYSMSG")
+  [ "$NOTHINK" = 1 ] && PCARGS+=(--no-think)
+  LAGUNA_TOKENIZER="$MODEL/tokenizer.json" \
+    python3 "$HERE/tools/laguna_tok.py" "${PCARGS[@]}" > "$PCACHE_IDS"
+  PCACHE_ARGS=(--prompt-cache "$PROMPT_CACHE" --prompt-cache-ids "$PCACHE_IDS")
+fi
+
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-47}"   # leave one core free (a64fx-omp-leave-one-core)
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 # NB: do NOT set FLIB_BARRIER=HARD here -- it forces the OpenMP runtime to 48
@@ -178,14 +198,14 @@ if [ "$MODE" = serve ]; then
   echo "  LAGUNA_TOKENIZER=$MODEL/tokenizer.json python3 $HERE/tools/laguna_cli.py --port $PORT chat 'hello'"
   exec mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --serve \
       --port "$PORT" --maxpos "$MAXPOS" --layers "$LAYERS" \
-      --stage-dir "$STAGE" "${PASS[@]}"
+      --stage-dir "$STAGE" "${PCACHE_ARGS[@]}" "${PASS[@]}"
 fi
 
 run_generate() {
   local prompt_ids="$1" gen_out="$2"
   mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --generate \
       --ids "$prompt_ids" --max-new "$MAX_NEW" --layers "$LAYERS" \
-      --stage-dir "$STAGE" --gen-out "$gen_out" "${PASS[@]}"
+      --stage-dir "$STAGE" --gen-out "$gen_out" "${PCACHE_ARGS[@]}" "${PASS[@]}"
 }
 
 run_generate "$IDS" "$RUN_DIR/gen.ids"

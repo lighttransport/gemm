@@ -105,9 +105,9 @@ def main():
 
     if a.stream:
         r = post_stream(a.host, a.port, req, tok, raw=a.raw)
-        sys.stderr.write("[%d tok, stop=%s, prefill %.1f tok/s, decode %.1f tok/s]\n" % (
-            r.get("n", 0), r.get("stop", "?"), r.get("prefill_tok_s", 0),
-            r.get("decode_tok_s", 0)))
+        sys.stderr.write("[%d tok, stop=%s, cached=%d, prefill %.1f tok/s, decode %.1f tok/s]\n" % (
+            r.get("n", 0), r.get("stop", "?"), r.get("cached_prompt_tokens", 0),
+            r.get("prefill_tok_s", 0), r.get("decode_tok_s", 0)))
         return 0
     r = post(a.host, a.port, "/generate", req)
     if a.json:
@@ -115,8 +115,8 @@ def main():
     if "error" in r:
         sys.exit("server error: %s" % r["error"])
     print(tok.decode(r["ids"], raw=a.raw))
-    sys.stderr.write("[%d tok, stop=%s, prefill %.1f tok/s, decode %.1f tok/s%s]\n" % (
-        r["n"], r["stop"], r.get("prefill_tok_s", 0), r.get("decode_tok_s", 0),
+    sys.stderr.write("[%d tok, stop=%s, cached=%d, prefill %.1f tok/s, decode %.1f tok/s%s]\n" % (
+        r["n"], r["stop"], r.get("cached_prompt_tokens", 0), r.get("prefill_tok_s", 0), r.get("decode_tok_s", 0),
         ", nan=%d" % r["nan"] if r.get("nan") else ""))
     return 0
 

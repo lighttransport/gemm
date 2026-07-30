@@ -227,6 +227,7 @@ static void pick_tokens_batch(laguna_scratch *sc, laguna_sampler *smps, int *out
 /* Options shared by --generate and --serve, and the load sequence they share. */
 typedef struct {
     const char *stage_dir, *topo;
+    const char *pcache_load, *pcache_save, *pcache_ids;
     int maxpos, n_layers, pchunk, debug, fp8_exact, max_batch;
     laguna_sampler smp;
 } laguna_opts;
@@ -248,6 +249,13 @@ static int laguna_opt_parse(laguna_opts *o, int argc, char **argv, int *i) {
     #define NEXT(dst, conv) do { if (*i+1>=argc) return 0; dst = conv(argv[++(*i)]); return 1; } while(0)
     if(!strcmp(a,"--stage-dir")) NEXT(o->stage_dir, );
     if(!strcmp(a,"--topo"))      NEXT(o->topo, );
+    if(!strcmp(a,"--prompt-cache-ids")) NEXT(o->pcache_ids, );
+    if(!strcmp(a,"--prompt-cache-load")) NEXT(o->pcache_load, );
+    if(!strcmp(a,"--prompt-cache-save")) NEXT(o->pcache_save, );
+    if(!strcmp(a,"--prompt-cache")) {
+        if (*i+1>=argc) return 0;
+        o->pcache_load=o->pcache_save=argv[++(*i)]; return 1;
+    }
     if(!strcmp(a,"--maxpos"))    NEXT(o->maxpos, atoi);
     if(!strcmp(a,"--layers"))    NEXT(o->n_layers, atoi);
     if(!strcmp(a,"--pchunk"))    NEXT(o->pchunk, atoi);
@@ -303,6 +311,75 @@ static int laguna_load(laguna_model *m, laguna_scratch *sc, laguna_stage *st,
     return 0;
 }
 
+/* Load a serialized prefix, or build it once and atomically serialize it when
+ * --prompt-cache-save (or the load-or-create --prompt-cache alias) is used. */
+static int laguna_prompt_cache_prepare(laguna_prompt_cache *pc, laguna_model *m,
+                                       laguna_scratch *sc, const laguna_opts *o) {
+    memset(pc,0,sizeof *pc);
+    const char *load_base=o->pcache_load, *save_base=o->pcache_save;
+    char load_rank[4096],save_rank[4096]; const char *load=NULL,*save=NULL;
+    if(load_base){if(MyRank==0)snprintf(load_rank,sizeof load_rank,"%s",load_base);else snprintf(load_rank,sizeof load_rank,"%s.rank%02d",load_base,MyRank);load=load_rank;}
+    if(save_base){if(MyRank==0)snprintf(save_rank,sizeof save_rank,"%s",save_base);else snprintf(save_rank,sizeof save_rank,"%s.rank%02d",save_base,MyRank);save=save_rank;}
+    int have_load=load && access(load,R_OK)==0;
+    char err[512]=""; int local_bad=0;
+    if(have_load) {
+        local_bad=lpc_load(load,pc,m,err,sizeof err)!=0;
+        if(!local_bad && o->pcache_ids){
+            int *v=NULL,n=load_ids(o->pcache_ids,&v);
+            if(n!=pc->n_tokens||!v||memcmp(v,pc->ids,(size_t)pc->n_tokens*sizeof(int))){
+                snprintf(err,sizeof err,"--prompt-cache-ids does not match serialized prefix");local_bad=1;
+            }
+            free(v);
+        }
+    } else {
+        if(load && (!save || strcmp(load,save))){
+            snprintf(err,sizeof err,"cannot load prompt cache %s: %s",load,strerror(errno));local_bad=1;
+        } else if(!save){
+            snprintf(err,sizeof err,"prompt cache has no loadable or writable path");local_bad=1;
+        } else if(!o->pcache_ids){
+            snprintf(err,sizeof err,"creating a prompt cache requires --prompt-cache-ids FILE");local_bad=1;
+        }
+        int *ids=NULL,n=0;
+        if(!local_bad){n=load_ids(o->pcache_ids,&ids);if(n<1||n>=m->max_pos){snprintf(err,sizeof err,"cache prefix must contain 1..%d ids",m->max_pos-1);local_bad=1;}}
+        if(!local_bad){
+            float *X=malloc((size_t)LAGUNA_PCHUNK*LAGUNA_HIDDEN*sizeof(float));
+            if(!X){snprintf(err,sizeof err,"out of memory building prompt cache");local_bad=1;}
+            for(int p=0;!local_bad&&p<n;){
+                int C=n-p;if(C>LAGUNA_PCHUNK)C=LAGUNA_PCHUNK;
+                for(int c=0;c<C;c++)embed_token(m,ids[p+c],X+(size_t)c*LAGUNA_HIDDEN);
+                forward_prefill_chunk(m,sc,X,0,p,C,&g_aar);p+=C;
+            }
+            free(X);
+            if(!local_bad)local_bad=lpc_capture(pc,m,0,ids,n,err,sizeof err)!=0;
+        }
+        free(ids);
+        if(!local_bad)local_bad=lpc_save(save,pc,err,sizeof err)!=0;
+    }
+    /* Every rank must make the same continue/fail decision before generation. */
+    float failed=(float)local_bad;
+    if(N>1)ep_ar(&g_comm,&failed,1);
+    if(failed!=0.0f){
+        if(local_bad)logmsg("rank %d: prompt cache error: %s\n",MyRank,err);
+        lpc_free(pc);return -1;
+    }
+    barrier();
+    /* Rank-specific snapshots preserve reduction-order differences. Rank 0 must
+     * see the whole set, which also rejects rank-local /local paths. */
+    if(!have_load && MyRank==0){
+        for(int r=0;r<N;r++){
+            char p[4096];if(r==0)snprintf(p,sizeof p,"%s",save_base);else snprintf(p,sizeof p,"%s.rank%02d",save_base,r);
+            if(access(p,R_OK)!=0){snprintf(err,sizeof err,"rank %d cache file is not visible; use a shared-filesystem path",r);local_bad=1;break;}
+        }
+    }
+    failed=(float)local_bad;
+    if(N>1)ep_ar(&g_comm,&failed,1);
+    if(failed!=0.0f){if(local_bad)logmsg("rank %d: prompt cache error: %s\n",MyRank,err);lpc_free(pc);return -1;}
+    if(MyRank==0)logmsg("prompt cache %s: %d tokens, %.1f MiB KV\n",
+                        have_load?"loaded":"created",pc->n_tokens,
+                        2.0*(double)pc->elems*sizeof(uint16_t)/(1024.0*1024.0));
+    return 0;
+}
+
 #include "laguna_serve.inc"
 
 /* --serve: load once, then answer HTTP requests until POST /shutdown.
@@ -323,7 +400,10 @@ static int run_serve(int argc, char **argv) {
     tofu_bootstrap();
     laguna_stage st; laguna_model m; laguna_scratch sc;
     if (laguna_load(&m, &sc, &st, &o, o.maxpos) != 0) return 1;
-    return lsrv_run(&m, &sc, port, o.maxpos, o.smp, o.max_batch);
+    laguna_prompt_cache pc, *pcp=NULL;
+    if(o.pcache_load||o.pcache_save){if(laguna_prompt_cache_prepare(&pc,&m,&sc,&o))return 1;pcp=&pc;}
+    int sr=lsrv_run(&m, &sc, port, o.maxpos, o.smp, o.max_batch, pcp);
+    if(pcp)lpc_free(pcp); return sr;
 }
 
 static int run_generate(int argc, char **argv){
@@ -354,6 +434,8 @@ static int run_generate(int argc, char **argv){
     laguna_stage st; laguna_model m; laguna_scratch sc;
     if (laguna_load(&m,&sc,&st,&o,maxpos) != 0) return 1;
     ar_thread_start();
+    laguna_prompt_cache pc, *pcp=NULL;
+    if(o.pcache_load||o.pcache_save){if(laguna_prompt_cache_prepare(&pc,&m,&sc,&o))return 1;pcp=&pc;}
     double t1=now_sec();
     /* eos tokens (config: [2,24]) */
     const int eos0=2, eos1=24;
@@ -370,6 +452,12 @@ static int run_generate(int argc, char **argv){
     int nprefill = n_prompt-1;   /* last token done per-token for logits */
     float *Xc = malloc((size_t)LAGUNA_PCHUNK*LAGUNA_HIDDEN*sizeof(float));
     int p=0;
+    if(pcp){
+        char ce[256];
+        if(!lpc_matches(pcp,prompt,n_prompt)){fprintf(stderr,"prompt ids do not begin with the cached prefix (and must extend it)\n");return 2;}
+        if(lpc_restore(pcp,&m,0,ce,sizeof ce)){fprintf(stderr,"prompt cache restore: %s\n",ce);return 1;}
+        p=pcp->n_tokens;
+    }
     if(pchunk>1){
         for(; p+1<=nprefill; ){
             int C = nprefill-p; if(C>pchunk)C=pchunk; if(C<=0) break;
@@ -394,8 +482,9 @@ static int run_generate(int argc, char **argv){
         /* top-5 logits for sanity */
         for(int t=0;t<5;t++){ int a=argmax(sc.logits,LAGUNA_VOCAB); logmsg("  top%d: id=%d logit=%.3f\n",t,a,sc.logits[a]); sc.logits[a]=-1e30f; }
         int a=next;
-        logmsg("prefill %d tok in %.2fs (%.1f tok/s); argmax first token = %d nan=%d\n",
-               n_prompt,pf1-pf0,n_prompt/(pf1-pf0),a,total_nan);
+        int computed=n_prompt-(pcp?pcp->n_tokens:0);
+        logmsg("prefill %d tok (%d cached) in %.2fs (%.1f computed tok/s); argmax first token = %d nan=%d\n",
+               n_prompt,pcp?pcp->n_tokens:0,pf1-pf0,computed/(pf1-pf0),a,total_nan);
         extern double g_c_qkv,g_c_attn,g_c_op,g_c_router,g_c_expert,g_c_shared;
         logmsg("  chunk phases (s): qkv=%.1f attn=%.1f o_proj+rms=%.1f router=%.1f (expert=%.1f) shared/mlp=%.1f\n",
                g_c_qkv,g_c_attn,g_c_op,g_c_router-g_c_expert,g_c_expert,g_c_shared);

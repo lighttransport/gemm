@@ -23,7 +23,7 @@
 
 typedef struct {
     int active, fd;
-    int n_prompt, pos, ngen, max_new, hit_eos;
+    int n_prompt, n_cached, pos, ngen, max_new, hit_eos;
     int stream, client_gone;
     int *ids, *gen;
     laguna_sampler smp;
@@ -120,8 +120,17 @@ static int lbat_bcast(lbat_state *B, lbat_step *st) {
 /* Prefill an admitted sequence into its own slot's KV, then take its first token.
  * Identical on every rank: the ids arrived through the broadcast. */
 static int lbat_prefill(const laguna_model *m, laguna_scratch *sc, lbat_slot *s, int slot,
-                        float *Xc, float *x, long *disagree) {
+                        float *Xc, float *x, long *disagree,
+                        const laguna_prompt_cache *pc) {
     int nprefill = s->n_prompt - 1, p = 0;
+    if(pc){
+        char err[256];
+        if(lpc_restore(pc,(laguna_model *)m,slot,err,sizeof err)){
+            logmsg("FATAL: prompt cache restore: %s\n",err);exit(1);
+        }
+        p=pc->n_tokens;
+    }
+    s->n_cached=p;
     for (; p + 1 <= nprefill; ) {
         int C = nprefill - p; if (C > LAGUNA_PCHUNK) C = LAGUNA_PCHUNK; if (C <= 0) break;
         for (int c=0;c<C;++c) embed_token(m, s->ids[p+c], Xc+(size_t)c*LAGUNA_HIDDEN);

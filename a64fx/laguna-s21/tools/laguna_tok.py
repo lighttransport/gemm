@@ -10,6 +10,7 @@ Usage:
   python3 laguna_tok.py encode-file prompt.txt > prompt.ids
   python3 laguna_tok.py decode "12 34 56"
   python3 laguna_tok.py decode-file gen.ids
+  python3 laguna_tok.py system-prefix [--system "..."] [--no-think]
 Env: LAGUNA_TOKENIZER (default ~/models/laguna-s21-int4/tokenizer.json)
 """
 import sys, os, json, re, unicodedata
@@ -210,6 +211,13 @@ def main():
         print(" ".join(str(i) for i in t.encode(argv[2], "--bos" in argv)))
     elif cmd=="encode-file":
         print(" ".join(str(i) for i in t.encode(open(argv[2]).read(), "--bos" in argv)))
+    elif cmd=="system-prefix":
+        sysmsg = _opt(argv,"--system")
+        msgs = [{"role":"system","content":sysmsg}] if sysmsg is not None else []
+        text = render_chat(msgs, add_generation_prompt=False,
+                           enable_thinking=("--no-think" not in argv))
+        if "--show-prompt" in argv: sys.stderr.write(text+"\n")
+        print(" ".join(str(i) for i in t.encode(text)))
     elif cmd in ("chat","chat-file"):
         user = open(argv[2]).read() if cmd=="chat-file" else argv[2]
         msgs = []

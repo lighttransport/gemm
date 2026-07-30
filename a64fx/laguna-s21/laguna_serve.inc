@@ -194,11 +194,11 @@ static char *lsrv_read_request(int fd, char **body_out) {
  * (health / error) and needs no compute. */
 static int lsrv_accept_into(lbat_slot *s, int cfd, char *raw, char *body,
                             int maxpos, int nranks, int nlayers,
-                            laguna_sampler defaults) {
+                            laguna_sampler defaults, const laguna_prompt_cache *pc) {
     if (!strncmp(raw,"GET /health",11)) {
         char b[192];
-        snprintf(b,sizeof b,"{\"status\":\"ok\",\"ranks\":%d,\"maxpos\":%d,\"layers\":%d}",
-                 nranks, maxpos, nlayers);
+        snprintf(b,sizeof b,"{\"status\":\"ok\",\"ranks\":%d,\"maxpos\":%d,\"layers\":%d,\"prompt_cache_tokens\":%d}",
+                 nranks, maxpos, nlayers, pc?pc->n_tokens:0);
         lsrv_respond(cfd,200,"OK",b); return 0;
     }
     if (strncmp(raw,"POST /generate",14)) {
@@ -209,6 +209,11 @@ static int lsrv_accept_into(lbat_slot *s, int cfd, char *raw, char *body,
     int n = ljs_ids(body, s->ids, maxpos);
     if (n <= 0) {
         lsrv_respond(cfd,400,"Bad Request","{\"error\":\"missing or malformed ids array\"}");
+        return 0;
+    }
+    if(pc&&!lpc_matches(pc,s->ids,n)){
+        lsrv_respond(cfd,400,"Bad Request",
+                     "{\"error\":\"ids do not begin with the server prompt-cache prefix, or contain no suffix\"}");
         return 0;
     }
     s->smp = defaults;
@@ -237,13 +242,14 @@ static void lsrv_finish(lbat_slot *s, double t_now, long disagree) {
     if (s->stream) {
         if (!s->client_gone) {
             char ev[320];
-            double pf = s->t_prefill_done > s->t_admit ? s->n_prompt/(s->t_prefill_done-s->t_admit) : 0.0;
+            int computed=s->n_prompt-s->n_cached;
+            double pf = s->t_prefill_done > s->t_admit ? computed/(s->t_prefill_done-s->t_admit) : 0.0;
             double dt = t_now > s->t_prefill_done ? s->ngen/(t_now-s->t_prefill_done) : 0.0;
             int n = snprintf(ev, sizeof ev,
                 "{\"event\":\"done\",\"n\":%d,\"stop\":\"%s\","
-                "\"lockstep_disagree\":%ld,\"prefill_tok_s\":%.2f,"
+                "\"cached_prompt_tokens\":%d,\"lockstep_disagree\":%ld,\"prefill_tok_s\":%.2f,"
                 "\"decode_tok_s\":%.2f}\n",
-                s->ngen, s->hit_eos?"eos":"length", disagree, pf, dt);
+                s->ngen, s->hit_eos?"eos":"length", s->n_cached, disagree, pf, dt);
             lsrv_write_all(s->fd, ev, (size_t)n);
         }
         close(s->fd); s->fd = -1; s->active = 0;
@@ -252,11 +258,12 @@ static void lsrv_finish(lbat_slot *s, double t_now, long disagree) {
     size_t cap = (size_t)s->ngen*8 + 512;
     char *b = malloc(cap);
     if (b) {
-        double pf = s->t_prefill_done > s->t_admit ? s->n_prompt/(s->t_prefill_done-s->t_admit) : 0.0;
+        int computed=s->n_prompt-s->n_cached;
+        double pf = s->t_prefill_done > s->t_admit ? computed/(s->t_prefill_done-s->t_admit) : 0.0;
         double dt = t_now > s->t_prefill_done ? s->ngen/(t_now-s->t_prefill_done) : 0.0;
-        int k = snprintf(b, cap, "{\"n\":%d,\"stop\":\"%s\",\"lockstep_disagree\":%ld,"
+        int k = snprintf(b, cap, "{\"n\":%d,\"stop\":\"%s\",\"cached_prompt_tokens\":%d,\"lockstep_disagree\":%ld,"
                 "\"prefill_tok_s\":%.2f,\"decode_tok_s\":%.2f,\"ids\":[",
-                s->ngen, s->hit_eos?"eos":"length", disagree, pf, dt);
+                s->ngen, s->hit_eos?"eos":"length", s->n_cached, disagree, pf, dt);
         for (int i=0;i<s->ngen && k < (int)cap-16; ++i)
             k += snprintf(b+k, cap-(size_t)k, i?",%d":"%d", s->gen[i]);
         k += snprintf(b+k, cap-(size_t)k, "]}");
@@ -267,13 +274,14 @@ static void lsrv_finish(lbat_slot *s, double t_now, long disagree) {
 }
 
 static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
-                    laguna_sampler defaults, int max_batch) {
+                    laguna_sampler defaults, int max_batch,
+                    const laguna_prompt_cache *pc) {
     int listen_fd = -1;
     if (MyRank == 0) {
         listen_fd = lsrv_listen(port);
         if (listen_fd < 0) fprintf(stderr,"FATAL: cannot listen on port %d\n", port);
-        else logmsg("serving HTTP on port %d (maxpos %d, %d ranks, max batch %d)\n",
-                    port, maxpos, N, max_batch);
+        else logmsg("serving HTTP on port %d (maxpos %d, %d ranks, max batch %d, prompt cache %d tokens)\n",
+                    port, maxpos, N, max_batch, pc?pc->n_tokens:0);
     }
     { lsrv_req probe = { .quit = (MyRank==0 && listen_fd<0) ? 1 : 0,
                          .n_prompt = 0, .max_new = 0, .smp = defaults };
@@ -314,7 +322,7 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
                     close(cfd); free(raw); shutting_down = 1; break;
                 }
                 lbat_slot *s = &B.slot[free_slot];
-                int admit = lsrv_accept_into(s, cfd, raw, body, maxpos, N, m->n_layers, defaults);
+                int admit = lsrv_accept_into(s, cfd, raw, body, maxpos, N, m->n_layers, defaults, pc);
                 free(raw);
                 if (!admit) { close(cfd); continue; }
                 s->active = 1; s->t_admit = now_sec();
@@ -347,7 +355,7 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
             if (MyRank != 0) { s->active = 1; s->fd = -1; s->ngen = 0; s->hit_eos = 0;
                                s->stream = 0; s->client_gone = 0;
                                s->max_new = maxpos; s->smp = defaults; }
-            int nxt = lbat_prefill(m, sc, s, slot, Xc, x, &disagree);
+            int nxt = lbat_prefill(m, sc, s, slot, Xc, x, &disagree, pc);
             s->t_prefill_done = now_sec();
             if (nxt==eos0 || nxt==eos1) { s->hit_eos = 1; }
             else {
