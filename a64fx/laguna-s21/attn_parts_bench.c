@@ -37,12 +37,23 @@ int main(int argc, char **argv) {
     double t, dt; volatile float sink=0;
     const double GHZ = 2.0;
 
-    laguna_qk_run(sco,q,K,kvstride,n,0.088f,hd);
-    t=now_s(); for(int r=0;r<reps;r++) laguna_qk_run(sco,q,K,kvstride,n,0.088f,hd);
-    dt=now_s()-t; sink+=sco[0];
+    float qmax=laguna_qk_run(sco,q,K,kvstride,n,0.088f,hd);
+    t=now_s(); for(int r=0;r<reps;r++) qmax=laguna_qk_run(sco,q,K,kvstride,n,0.088f,hd);
+    dt=now_s()-t; sink+=sco[0]+qmax;
     double qk_ns = dt/reps/n*1e9;
-    printf("qk_run        %7.2f ns/key  %6.2f cyc/key  (%d bf16 ld + %d fmla + addv)\n",
+    printf("qk_run+max    %7.2f ns/key  %6.2f cyc/key  (%d bf16 ld + %d fmla + addv)\n",
            qk_ns, qk_ns*GHZ, hd/16, hd/16);
+
+    t=now_s();
+    for(int r=0;r<reps;r++){
+        float mx=-INFINITY;
+        for(int i=0;i<n;i++) if(sco[i]>mx) mx=sco[i];
+        sink+=mx;
+    }
+    dt=now_s()-t;
+    double max_ns=dt/reps/n*1e9;
+    printf("score_max     %7.2f ns/key  %6.2f cyc/key  (separate pass eliminated)\n",
+           max_ns,max_ns*GHZ);
 
     for (int i=0;i<n;i++) sco[i]=(float)((i%17)-8)*0.1f;
     t=now_s(); for(int r=0;r<reps;r++){ sink+=laguna_exp_shift_sum(sco,n,1.0f);
@@ -62,8 +73,8 @@ int main(int argc, char **argv) {
            av_ns, av_ns*GHZ, hd/16, hd/16);
 
     double tot=qk_ns+exp_ns+av_ns;
-    printf("---\ntotal %7.2f ns/key => qk %.0f%%  exp %.0f%%  av %.0f%%\n",
-           tot, 100*qk_ns/tot, 100*exp_ns/tot, 100*av_ns/tot);
+    printf("---\ntotal %7.2f ns/key => qk+max %.0f%%  exp %.0f%%  av %.0f%%\n",
+           tot,100*qk_ns/tot,100*exp_ns/tot,100*av_ns/tot);
     /* 512 flops per (query,key): 256 for qk, 256 for av */
     printf("implies %.0f GFLOP/s/core, %.0f GFLOP/s at 47 cores\n",
            512.0/tot, 512.0/tot*47);

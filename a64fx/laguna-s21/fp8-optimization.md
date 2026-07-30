@@ -327,6 +327,43 @@ the generated token-ID file was byte-identical to baseline, all 124 distributed
 picks agreed, `total_nan=0`, and the C++ compile/runtime gate passed with the
 same exact output.
 
+### 64K decode and fused score maximum
+
+Once KV prefetch removed the memory stalls, the separate maximum scan became
+visible: 4.0 ns/key, about 10% of the optimized QK+softmax+AV primitive time.
+`laguna_qk_run` now tracks and returns the maximum while producing the scores,
+so decode and both chunked-prefill attention paths no longer reread the score
+buffer. The returned maximum is tested for exact equality with a separate scan.
+
+Focused full-layer decode timing:
+
+| context | separate max | fused max | improvement |
+|---:|---:|---:|---:|
+| 32K | 1.71 ms | **1.58 ms** | 7.5% |
+| 64K | 3.44 ms | **3.19 ms** | 7.1% |
+| 128K | 6.94 ms | **6.42 ms** | 7.5% |
+
+The longer-context sweeps also ruled out several tempting alternatives: an
+eight-key butterfly reduction was 19% slower from shuffle/register pressure;
+two-query GQA fusion was 26% slower because 24 active pair tasks could not match
+48 independent head tasks; two-level L2+L1 prefetch and cache-retaining hints
+regressed; and K/V lookahead distances other than 16 were worse at 64K/128K.
+
+The end-to-end 65,525-token retrieval+C++ run used temperature 0.7, top-p 0.95,
+and the same seed as the 32K test:
+
+| metric | 64K result |
+|---|---:|
+| memory/rank | 16.34 GB (12.71 GB available) |
+| prefill | 2,275.99 s, 28.8 tok/s |
+| attention core | 45.81 ms/token |
+| total decode | 78.6 ms/token, **12.7 tok/s** |
+
+It retrieved all three values, emitted token IDs byte-identical to the 32K
+baseline answer, compiled and ran with the exact expected output, stopped on EOS
+after 123 tokens, had all 124 distributed picks agree, and reported
+`total_nan=0`.
+
 ## Generation correctness
 
 Three fixes, in order of how badly they could bite:

@@ -177,6 +177,8 @@ python3 tools/make_long_context.py --target 16384 \
 python3 tools/make_long_context.py --target 32768 \
   --out long_context_tests/prompt_32k.ids \
   --metadata long_context_tests/prompt_32k.json
+# The same command supports 64K and larger budgets, subject to the printed
+# per-rank context-memory check.
 
 ./run_laguna_s21_12n.sh generate --fp8 --no-stage --np 12 \
   --ids "$PWD/long_context_tests/prompt_32k.ids" --max-new 2048 \
@@ -198,6 +200,7 @@ LAGUNA_TOKENIZER=... python3 tools/tok_test.py                      # added toke
 python3 tools/repetition.py gen.ids                                 # degeneration metrics for long output
 python3 tools/cpp_quality.py gen.ids --run                           # explicit compile/runtime validation
 make bench && OMP_NUM_THREADS=47 ./build/decode_attn_bench 32768 100 # single-token attention timing
+fcc ... -o build/run_prim_test run_prim_test.c -lm && ./build/run_prim_test # scores, fused max, AV
 ```
 
 Benchmarks used to justify the kernel choices — `fp8_dq_bench.c`, `fp8_mm_bench.c`,

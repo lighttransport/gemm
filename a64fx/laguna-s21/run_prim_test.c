@@ -14,9 +14,12 @@ int main(void){
         float scale=0.0883883f;
         float *r1=malloc(n*4),*r2=malloc(n*4);
         /* qk: run kernel vs per-key laguna_qkdot */
-        laguna_qk_run(r1,q,k,kvstride,n,scale,hd);
+        float run_max=laguna_qk_run(r1,q,k,kvstride,n,scale,hd);
         for(int i=0;i<n;i++) r2[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
-        double mq=0; for(int i=0;i<n;i++){double d=fabs((double)r1[i]-r2[i]); if(d>mq)mq=d;}
+        double mq=0; float check_max=-INFINITY;
+        for(int i=0;i<n;i++){double d=fabs((double)r1[i]-r2[i]);if(d>mq)mq=d;
+            if(r1[i]>check_max)check_max=r1[i];}
+        int max_ok=run_max==check_max;
         /* av: run kernel vs per-key laguna_vaxpy, with a nonzero incoming acc+corr */
         float *w=malloc(n*4); for(int i=0;i<n;i++)w[i]=fabsf(fr())+0.01f;
         float corr=0.37f;
@@ -26,9 +29,10 @@ int main(void){
         for(int i=0;i<n;i++) laguna_vaxpy(a2,k+(size_t)i*kvstride,w[i],i==0?corr:1.0f,hd);
         double ma=0,den=0; for(int d=0;d<hd;d++){double e=fabs((double)a1[d]-a2[d]);
             if(e>ma)ma=e; den+=fabs(a2[d]);}
-        int ok = mq<2e-4 && ma < 1e-4*(1+den/hd);
-        if(!ok){bad=1; printf("n=%3d  qk max|d|=%.3e  av max|d|=%.3e  ** FAIL **\n",n,mq,ma);}
-        else if(n<8||n>200) printf("n=%3d  qk max|d|=%.3e  av max|d|=%.3e  OK\n",n,mq,ma);
+        int ok = mq<2e-4 && ma < 1e-4*(1+den/hd) && max_ok;
+        if(!ok){bad=1;printf("n=%3d  qk max|d|=%.3e max=%s  av max|d|=%.3e  ** FAIL **\n",
+                            n,mq,max_ok?"exact":"BAD",ma);}
+        else if(n<8||n>200)printf("n=%3d  qk max|d|=%.3e max=exact  av max|d|=%.3e  OK\n",n,mq,ma);
         free(q);free(k);free(r1);free(r2);free(w);
     }
     puts(bad?"run-primitive equivalence: FAIL":"run-primitive equivalence: PASS");

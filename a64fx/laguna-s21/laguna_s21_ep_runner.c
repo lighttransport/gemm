@@ -758,13 +758,17 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
 #define LAGUNA_BFLY(pg,a,b) svadd_f32_x((pg), svuzp1_f32((a),(b)), svuzp2_f32((a),(b)))
 static inline int laguna_run_ok(int hd) { return hd == LAGUNA_AV_NV*(int)svcntw(); }
 
-/* sco[i] = dot(q, k[i]) * scale, for i in [0,n), keys at k + i*kvstride */
-static inline void laguna_qk_run(float *restrict sco, const float *restrict q,
-                                 const uint16_t *restrict k, int kvstride,
-                                 int n, float scale, int hd) {
+/* Fill scaled scores for [0,n) and return their exact maximum. */
+static inline float laguna_qk_run(float *restrict sco, const float *restrict q,
+                                  const uint16_t *restrict k, int kvstride,
+                                  int n, float scale, int hd) {
+    float mx=-INFINITY;
     if (!laguna_run_ok(hd)) {
-        for (int i=0;i<n;++i) sco[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
-        return;
+        for (int i=0;i<n;++i) {
+            sco[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
+            if(sco[i]>mx)mx=sco[i];
+        }
+        return mx;
     }
     svbool_t pt=svptrue_b32(), ph=svptrue_b16(); int VL=(int)svcntw();
     svfloat32_t q0=svld1_f32(pt,q+0*VL),q1=svld1_f32(pt,q+1*VL),
@@ -814,10 +818,12 @@ static inline void laguna_qk_run(float *restrict sco, const float *restrict q,
         a1=svmla_f32_x(pt,a1,q3,LAGUNA_UNHI(pt,m1)); b1=svmla_f32_x(pt,b1,q7,LAGUNA_UNHI(pt,m3));
         a2=svmla_f32_x(pt,a2,q3,LAGUNA_UNHI(pt,n1)); b2=svmla_f32_x(pt,b2,q7,LAGUNA_UNHI(pt,n3));
         a3=svmla_f32_x(pt,a3,q3,LAGUNA_UNHI(pt,r1)); b3=svmla_f32_x(pt,b3,q7,LAGUNA_UNHI(pt,r3));
-        sco[i+0]=svaddv_f32(pt,svadd_f32_x(pt,a0,b0))*scale;
-        sco[i+1]=svaddv_f32(pt,svadd_f32_x(pt,a1,b1))*scale;
-        sco[i+2]=svaddv_f32(pt,svadd_f32_x(pt,a2,b2))*scale;
-        sco[i+3]=svaddv_f32(pt,svadd_f32_x(pt,a3,b3))*scale;
+        float s0=svaddv_f32(pt,svadd_f32_x(pt,a0,b0))*scale;
+        float s1=svaddv_f32(pt,svadd_f32_x(pt,a1,b1))*scale;
+        float s2=svaddv_f32(pt,svadd_f32_x(pt,a2,b2))*scale;
+        float s3=svaddv_f32(pt,svadd_f32_x(pt,a3,b3))*scale;
+        sco[i+0]=s0;sco[i+1]=s1;sco[i+2]=s2;sco[i+3]=s3;
+        if(s0>mx)mx=s0;if(s1>mx)mx=s1;if(s2>mx)mx=s2;if(s3>mx)mx=s3;
     }
     for (; i<n; ++i) {
         const uint16_t *ki=k+(size_t)i*kvstride;
@@ -827,7 +833,9 @@ static inline void laguna_qk_run(float *restrict sco, const float *restrict q,
         a=svmla_f32_x(pt,a,q2,laguna_ld_kv(pt,ki+2*VL)); b=svmla_f32_x(pt,b,q6,laguna_ld_kv(pt,ki+6*VL));
         a=svmla_f32_x(pt,a,q3,laguna_ld_kv(pt,ki+3*VL)); b=svmla_f32_x(pt,b,q7,laguna_ld_kv(pt,ki+7*VL));
         sco[i]=svaddv_f32(pt,svadd_f32_x(pt,a,b))*scale;
+        if(sco[i]>mx)mx=sco[i];
     }
+    return mx;
 }
 
 /* acc[d] = acc[d]*corr + sum_i w[i]*v[i][d], keys at v + i*kvstride */
@@ -879,9 +887,14 @@ static inline float laguna_qkdot(const float *q, const uint16_t *k, int hd) {
 static inline void laguna_vaxpy(float *acc, const uint16_t *v, float p, float corr, int hd) {
     for(int d=0;d<hd;++d) acc[d]=acc[d]*corr + p*laguna_kv_to_f32(v[d]);
 }
-static inline void laguna_qk_run(float *sco, const float *q, const uint16_t *k,
-                                 int kvstride, int n, float scale, int hd) {
-    for (int i=0;i<n;++i) sco[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
+static inline float laguna_qk_run(float *sco, const float *q, const uint16_t *k,
+                                  int kvstride, int n, float scale, int hd) {
+    float mx=-INFINITY;
+    for (int i=0;i<n;++i) {
+        sco[i]=laguna_qkdot(q,k+(size_t)i*kvstride,hd)*scale;
+        if(sco[i]>mx)mx=sco[i];
+    }
+    return mx;
 }
 static inline void laguna_av_run(float *acc, const float *w, const uint16_t *v,
                                  int kvstride, int n, float corr, int hd) {
@@ -954,10 +967,10 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
         /* [lo,pos] is at most two contiguous slot runs (one if the ring doesn't
          * wrap, which is always the case for full-attention layers). */
         int s0=lo%cap, n1=cap-s0; if(n1>nkeys) n1=nkeys; int n2=nkeys-n1;
-        laguna_qk_run(sco,    q, kbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, scale, hd);
-        if(n2) laguna_qk_run(sco+n1, q, kbase+(size_t)kvh*hd, kvstride, n2, scale, hd);
-        float mx=-INFINITY;
-        for (int i=0;i<nkeys;++i) if(sco[i]>mx) mx=sco[i];
+        float mx=laguna_qk_run(sco,q,kbase+(size_t)s0*kvstride+(size_t)kvh*hd,
+                               kvstride,n1,scale,hd);
+        if(n2){float m2=laguna_qk_run(sco+n1,q,kbase+(size_t)kvh*hd,
+                                      kvstride,n2,scale,hd);if(m2>mx)mx=m2;}
         float l_i=laguna_exp_shift_sum(sco, nkeys, mx);   /* sco[i]=exp(sco[i]-mx) */
         float acc[LAGUNA_HEAD_DIM]; for(int d=0;d<hd;++d)acc[d]=0.0f;
         laguna_av_run(acc, sco,    vbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, 0.0f, hd);
@@ -1040,9 +1053,9 @@ static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, 
         for (int kb=0; kb<pos0; kb+=LAGUNA_KB) {
             int bn=pos0-kb; if(bn>LAGUNA_KB)bn=LAGUNA_KB;
             for (int c=cbeg;c<cend;++c) {
-                const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float sb[LAGUNA_KB]; float bmax=-INFINITY;
-                laguna_qk_run(sb, q, kbase+(size_t)kb*kvstride+(size_t)kvh*hd, kvstride, bn, scale, hd);
-                for (int b=0;b<bn;++b) if(sb[b]>bmax) bmax=sb[b];
+                const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float sb[LAGUNA_KB];
+                float bmax=laguna_qk_run(sb,q,kbase+(size_t)kb*kvstride+(size_t)kvh*hd,
+                                         kvstride,bn,scale,hd);
                 float m_old=fm[c], m_new=m_old>bmax?m_old:bmax, corr=expf(m_old-m_new);
                 float psum=laguna_exp_shift_sum(sb, bn, m_new);
                 fl[c]=fl[c]*corr+psum; float *a=acc+(size_t)c*hd;
@@ -1069,9 +1082,8 @@ static void attention_full_flash(const laguna_model *m, const laguna_layer *ly, 
                 const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd; float *a=acc+(size_t)c*hd;
                 const uint16_t *kblk = kbase+(size_t)(pos0+kb)*kvstride+(size_t)kvh*hd;
                 const uint16_t *vblk = vbase+(size_t)(pos0+kb)*kvstride+(size_t)kvh*hd;
-                float sb[LAGUNA_KB], bmax=-INFINITY;
-                laguna_qk_run(sb, q, kblk, kvstride, n, scale, hd);
-                for (int b=0;b<n;++b) if (sb[b]>bmax) bmax=sb[b];
+                float sb[LAGUNA_KB];
+                float bmax=laguna_qk_run(sb,q,kblk,kvstride,n,scale,hd);
                 float m_old=fm[c], m_new=m_old>bmax?m_old:bmax, corr=expf(m_old-m_new);
                 float psum=laguna_exp_shift_sum(sb, n, m_new);
                 fl[c]=fl[c]*corr+psum;
@@ -1147,12 +1159,13 @@ static void attention_slide_flash(const laguna_model *m, const laguna_layer *ly,
                 int js = kb>lo_c?kb:lo_c, je = kend<hi_c?kend:hi_c;
                 if (js>je) continue;
                 const float *q=Q+(size_t)c*nh*hd+(size_t)h*hd;
-                float sb[LAGUNA_KB]; float bmax=-INFINITY; int n=je-js+1;
+                float sb[LAGUNA_KB]; int n=je-js+1;
                 /* the ring makes [js,je] at most two contiguous slot runs */
                 int s0=js%cap, n1=cap-s0; if(n1>n) n1=n; int n2=n-n1;
-                laguna_qk_run(sb,    q, kbase+(size_t)s0*kvstride+(size_t)kvh*hd, kvstride, n1, scale, hd);
-                if(n2) laguna_qk_run(sb+n1, q, kbase+(size_t)kvh*hd, kvstride, n2, scale, hd);
-                for (int b=0;b<n;++b) if(sb[b]>bmax) bmax=sb[b];
+                float bmax=laguna_qk_run(sb,q,kbase+(size_t)s0*kvstride+(size_t)kvh*hd,
+                                         kvstride,n1,scale,hd);
+                if(n2){float m2=laguna_qk_run(sb+n1,q,kbase+(size_t)kvh*hd,
+                                              kvstride,n2,scale,hd);if(m2>bmax)bmax=m2;}
                 float m_old=fm[c], m_new=m_old>bmax?m_old:bmax, corr=expf(m_old-m_new);
                 float psum=laguna_exp_shift_sum(sb, n, m_new);
                 fl[c]=fl[c]*corr+psum; float *a=acc+(size_t)c*hd;
