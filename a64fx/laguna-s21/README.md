@@ -197,6 +197,7 @@ fcc ... -o sampler_test   sampler_test.c   && ./sampler_test        # top-k/top-
 LAGUNA_TOKENIZER=... python3 tools/tok_test.py                      # added tokens, round-trip, chat template
 python3 tools/repetition.py gen.ids                                 # degeneration metrics for long output
 python3 tools/cpp_quality.py gen.ids --run                           # explicit compile/runtime validation
+make bench && OMP_NUM_THREADS=47 ./build/decode_attn_bench 32768 100 # single-token attention timing
 ```
 
 Benchmarks used to justify the kernel choices — `fp8_dq_bench.c`, `fp8_mm_bench.c`,
@@ -212,7 +213,8 @@ described in `fp8-optimization.md`.
 - **Do not set `FLIB_BARRIER=HARD`.** It forces the OpenMP runtime to 48 threads,
   oversubscribing all 48 cores, and ~4x-slows the matvec kernels.
 - **Leave one core free** (`OMP_NUM_THREADS=47`); 48 pinned threads on 48 compute
-  cores costs ~40%.
+  cores costs ~40% for the general weight/communication path. Long full-attention
+  decode automatically uses a 48-thread region because it has exactly 48 heads.
 - **`XOS_MMM_L_PAGING_POLICY=demand:demand:demand`** — the default prepage policy
   collapses multi-CMG bandwidth (94 GB/s vs 843).
 - Never compare timings across allocations; run both binaries back-to-back.

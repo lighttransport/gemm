@@ -20,7 +20,9 @@
  *             --generate --ids prompt.ids --max-new 64 --stage-dir /local/... \
  *             (after tofu_topo_helper produced tofu_topo.txt)
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +35,9 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "laguna_s21.h"
 
 #if defined(LAGUNA_FP8)
@@ -734,6 +739,12 @@ static inline void laguna_vaxpy(float *restrict acc, const uint16_t *restrict v,
  *        whole run removes that entirely.
  * hd is always LAGUNA_HEAD_DIM (128); the generic path is kept as a fallback. */
 #define LAGUNA_AV_NV 8      /* 128 / 16 */
+#ifndef LAGUNA_KV_PREFETCH
+/* Each GQA head consumes one 256-byte row every 2 KiB.  A64FX's automatic
+ * prefetch does not reliably recognize that sparse stream; 16 rows (32 KiB)
+ * ahead covers the DRAM latency without displacing the active score block. */
+#define LAGUNA_KV_PREFETCH 16
+#endif
 /* halves of a full-width u16 load, widened from the selected KV format */
 #if defined(LAGUNA_KV_FP16)
 #define LAGUNA_UNLO(pg,h) svcvt_f32_f16_x((pg),svreinterpret_f16_u32(svunpklo_u32(h)))
@@ -765,6 +776,14 @@ static inline void laguna_qk_run(float *restrict sco, const float *restrict q,
      * 8 widening svld1uh_u32.  Each q register still meets the same dims in the
      * same order, so this is bit-identical. */
     for (; i+4<=n; i+=4) {
+#if LAGUNA_KV_PREFETCH > 0
+        if (i+LAGUNA_KV_PREFETCH+3 < n) {
+            __builtin_prefetch(k+(size_t)(i+LAGUNA_KV_PREFETCH+0)*kvstride,0,0);
+            __builtin_prefetch(k+(size_t)(i+LAGUNA_KV_PREFETCH+1)*kvstride,0,0);
+            __builtin_prefetch(k+(size_t)(i+LAGUNA_KV_PREFETCH+2)*kvstride,0,0);
+            __builtin_prefetch(k+(size_t)(i+LAGUNA_KV_PREFETCH+3)*kvstride,0,0);
+        }
+#endif
         const uint16_t *k0=k+(size_t)(i+0)*kvstride,*k1=k+(size_t)(i+1)*kvstride,
                        *k2=k+(size_t)(i+2)*kvstride,*k3=k+(size_t)(i+3)*kvstride;
         svuint16_t g0=svld1_u16(ph,k0+0*2*VL),g1=svld1_u16(ph,k0+1*2*VL),
@@ -832,6 +851,10 @@ static inline void laguna_av_run(float *restrict acc, const float *restrict w,
      * Each accumulator still sees the same dims in the same order, so the result
      * is bit-identical to the widening-load form. */
     for (int i=0;i<n;++i) {
+#if LAGUNA_KV_PREFETCH > 0
+        if (i+LAGUNA_KV_PREFETCH < n)
+            __builtin_prefetch(v+(size_t)(i+LAGUNA_KV_PREFETCH)*kvstride,0,0);
+#endif
         const uint16_t *vi=v+(size_t)i*kvstride; svfloat32_t p=svdup_f32(w[i]);
         svuint16_t h0=svld1_u16(ph,vi+0*2*VL), h1=svld1_u16(ph,vi+1*2*VL);
         svuint16_t h2=svld1_u16(ph,vi+2*2*VL), h3=svld1_u16(ph,vi+3*2*VL);
@@ -879,16 +902,6 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
     int half = rot/2;
     const float *rc = cosp + (size_t)pos*half, *rs = sinp + (size_t)pos*half;
 
-    /* q_norm + rope per query head */
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for (int h=0; h<nh; ++h) {
-        float *q=qf+(size_t)h*hd; float tmp[LAGUNA_HEAD_DIM];
-        laguna_rmsnorm(tmp, q, ly->q_norm, hd, LAGUNA_RMS_EPS);
-        memcpy(q,tmp,sizeof tmp);
-        laguna_rope_half(q, rc, rs, rot);
-    }
     /* k_norm + rope per kv head, then store to cache at pos (ring slot pos%cap) */
     int cap=m->kv_cap[layer], kvstride=LAGUNA_KV_HEADS*hd;
     size_t sbase=(size_t)seq*m->kv_seq_stride + m->kv_off[layer];
@@ -910,19 +923,34 @@ static void attention_core(const laguna_model *m, const laguna_layer *ly, laguna
     /* Attended range is the WINDOW, never the ring capacity (cap >= window, and
      * they are no longer equal -- see LAGUNA_SLIDING_CAP). */
     int lo = ly->is_sliding ? (pos-LAGUNA_SLIDING_WINDOW+1) : 0; if(lo<0)lo=0;
+    int nkeys=pos-lo+1;
     /* Per-head attention, parallel over heads.  Two passes over the key range with
      * a per-head score buffer: (1) scores = q.k*scale, track max; (2) VECTORIZED
      * softmax exp (FEXPA) -- the O(context) prefill bottleneck; (3) weighted sum of
      * V.  Contiguous key positions when cap doesn't wrap (full layers, or sliding
      * once wrapped) let qk/av stream. */
+    /* There are exactly 48 query heads in a full-attention layer.  With the
+     * runner's normal 47-thread team, static scheduling gives one worker two
+     * heads and 46 workers one, making the whole O(context) region wait for a
+     * second serial head.  At long context use all 48 compute cores for this
+     * region only; weight kernels and uTofu communication retain 47 threads and
+     * their spare core.  Do not override deliberately smaller teams. */
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    int attn_threads = omp_get_max_threads();
+    if (!ly->is_sliding && nkeys >= 8192 && attn_threads >= 47)
+        attn_threads = 48;
+    #pragma omp parallel for schedule(static) num_threads(attn_threads)
 #endif
     for (int h=0; h<nh; ++h) {
-        const float *q=qf+(size_t)h*hd;
+        /* Normalize/rotate Q in the already-required head-parallel region.  A
+         * separate tiny OpenMP region cost one team launch per layer and was
+         * measurable across 48 decode layers. */
+        float *q=qf+(size_t)h*hd; float qtmp[LAGUNA_HEAD_DIM];
+        laguna_rmsnorm(qtmp, q, ly->q_norm, hd, LAGUNA_RMS_EPS);
+        memcpy(q,qtmp,sizeof qtmp);
+        laguna_rope_half(q, rc, rs, rot);
         int kvh=h/kv_groups;
         float *sco=sc->scores+(size_t)h*m->max_pos;   /* this head's scores */
-        int nkeys=pos-lo+1;
         /* [lo,pos] is at most two contiguous slot runs (one if the ring doesn't
          * wrap, which is always the case for full-attention layers). */
         int s0=lo%cap, n1=cap-s0; if(n1>nkeys) n1=nkeys; int n2=nkeys-n1;

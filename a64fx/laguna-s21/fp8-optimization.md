@@ -298,6 +298,35 @@ headroom per rank. Full-attention cost is visible but well behaved: prefill
 attention rose from 117.8 s to 421.1 s, while decode attention rose from 50.41
 to 95.42 ms/token.
 
+### 32K decode: 7.8 to 17.0 tok/s
+
+The original 32K decode assigned 48 full-attention heads to the normal 47-thread
+team. Static scheduling gave one worker two complete heads while the other 46
+finished one and waited. Long full-attention regions now temporarily use all 48
+compute cores; weight kernels and communication retain the safer 47-thread team.
+Q normalization and RoPE were also folded into that existing parallel region,
+removing one small team launch per layer.
+
+The larger gain came from the KV access pattern: for one GQA head the run kernels
+consume one 256-byte row every 2 KiB. Hardware prefetch did not reliably recognize
+this sparse stream. Software-prefetching K and V 16 rows (32 KiB) ahead reduced the
+focused 32K full-layer benchmark from 4.79 to 1.72 ms, with an identical checksum.
+Distances 8, 12, 16, 20, 24, 32, and 64 were swept; 16 was best at 8K, 16K, and
+32K. `decode_attn_bench.c` makes this test independent of model load and uTofu.
+
+| 32K sampled C++ run | baseline | 48 heads + fused Q | + KV prefetch |
+|---|---:|---:|---:|
+| attention core | 95.42 ms/token | 68.12 ms/token | **25.99 ms/token** |
+| total decode | 127.8 ms/token | 100.4 ms/token | **58.8 ms/token** |
+| throughput | 7.8 tok/s | 10.0 tok/s | **17.0 tok/s** |
+| prefill | 38.4 tok/s | 38.4 tok/s | **40.0 tok/s** |
+
+The final end-to-end run used the same 32,767-token prompt, temperature 0.7,
+top-p 0.95, and seed 305441741. It stopped on the same EOS after 123 tokens;
+the generated token-ID file was byte-identical to baseline, all 124 distributed
+picks agreed, `total_nan=0`, and the C++ compile/runtime gate passed with the
+same exact output.
+
 ## Generation correctness
 
 Three fixes, in order of how badly they could bite:

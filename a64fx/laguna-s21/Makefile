@@ -66,9 +66,12 @@ test: $(BUILD)/laguna_s21_ep_runner $(BUILD)/laguna_s21_bf16_ep_runner \
 
 # Single-node synthetic decode benchmark (no uTofu). Run: OMP_NUM_THREADS=47 \
 #   XOS_MMM_L_PAGING_POLICY=demand:demand:demand build/bench_decode 48 1 30
-bench: $(BUILD)/bench_decode
+bench: $(BUILD)/bench_decode $(BUILD)/decode_attn_bench
 $(BUILD)/bench_decode: bench_decode.c laguna_s21_ep_runner.c laguna_s21.h | $(BUILD)
-	$(CC) $(CFLAGS) -DLAGUNA_BENCH -o $@ bench_decode.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ bench_decode.c $(LDFLAGS)
+
+$(BUILD)/decode_attn_bench: decode_attn_bench.c laguna_s21_ep_runner.c laguna_s21.h | $(BUILD)
+	$(CC) $(CFLAGS) -DLAGUNA_FP8 -o $@ decode_attn_bench.c $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD)
