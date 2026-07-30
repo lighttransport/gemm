@@ -31,6 +31,11 @@ int main(void) {
     k3_pool_trim(&pool);
     fail |= pool.active_bytes != 0 || pool.reserved_bytes != 0;
 
+    size_t rss=0,hwm=0;int mem_rc=k3_process_memory_bytes(&rss,&hwm);
+    int mem_ok=!mem_rc&&rss>0&&hwm>=rss;fail|=!mem_ok;
+    printf("[runtime-memory] rss_MiB=%.2f hwm_MiB=%.2f %s\n",
+           rss/1048576.0,hwm/1048576.0,mem_ok?"PASS":"FAIL");
+
     printf("[runtime-pool] alignment=%lu reuse=%s accounting=%s %s\n",
            K3_POOL_ALIGNMENT, b == old_b ? "yes" : "no",
            pool.active_bytes == 0 && pool.reserved_bytes == 0 ? "OK" : "FAIL",

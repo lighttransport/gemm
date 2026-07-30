@@ -51,6 +51,7 @@ typedef struct {
     int fuse_kda_expert;
     int mla_cache_bf16;
     int heartbeat_tokens;
+    int min_available_mib;
     int ar_groups;
     int comm_robust;
     int comm_ack;
@@ -93,6 +94,7 @@ static void usage(const char *p){
         "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
         "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
+        "          [--min-available-mib N]\n"
         "          [--ar-groups auto|N] [--comm-robust 1|2] [--comm-ack 0|1]\n"
         "          [--comm-deterministic 0|1]\n"
         "          [--comm-poll-spins N]\n"
@@ -107,7 +109,8 @@ static int parse_int(const char *flag,const char *s,int lo,int hi,int *out){
 }
 static int parse_options(int argc,char **argv,k3_options *o){
     *o=(k3_options){.nodes=96,.layers=1,.tokens=2,.threads=48,.layer=1,
-        .mla_cache_bf16=1,.heartbeat_tokens=1024,.ar_groups=-1,.comm_robust=2,.comm_poll_spins=8,
+        .mla_cache_bf16=1,.heartbeat_tokens=1024,.min_available_mib=2048,
+        .ar_groups=-1,.comm_robust=2,.comm_poll_spins=4,
         .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.stage_dir="/local/k3-runner",
         .status_dir=".",.topo_path="tofu_topo.txt"};
     for(int i=1;i<argc;++i){const char *a=argv[i];
@@ -125,6 +128,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--mla-cache-bf16")){o->mla_cache_bf16=1;}
         else if(!strcmp(a,"--mla-cache-fp32")){o->mla_cache_bf16=0;}
         else if(!strcmp(a,"--heartbeat-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->heartbeat_tokens))return-1;}
+        else if(!strcmp(a,"--min-available-mib")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->min_available_mib))return-1;}
         else if(!strcmp(a,"--ar-groups")){VALUE();if(!strcmp(argv[i],"auto"))o->ar_groups=-1;
             else if(parse_int(a,argv[i],0,96,&o->ar_groups))return-1;}
         else if(!strcmp(a,"--comm-robust")){VALUE();if(parse_int(a,argv[i],1,2,&o->comm_robust))return-1;}
@@ -350,24 +354,27 @@ static void write_status(const k3_options *o,const char *state,const char *reaso
     if(n<0||(size_t)n>=sizeof path)return;
     n=snprintf(tmp,sizeof tmp,"%s.tmp.%ld",path,(long)getpid());if(n<0||(size_t)n>=sizeof tmp)return;
     FILE *f=fopen(tmp,"wx");if(!f){fprintf(stderr,"k3_ep_runner rank %d: create status '%s': %s\n",g_rank,tmp,strerror(errno));return;}
-    int ok=fprintf(f,"rank=%d nodes=%d mode=%s state=%s reason=%s layers=%d tokens=%d tokens_completed=%d last_layer=%d collective_seq=%lu seconds=%.9f checksum=%+.9e peak_bytes=%zu\n",
+    size_t rss=0,hwm=0;(void)k3_process_memory_bytes(&rss,&hwm);
+    int ok=fprintf(f,"rank=%d nodes=%d mode=%s state=%s reason=%s layers=%d tokens=%d tokens_completed=%d last_layer=%d collective_seq=%lu seconds=%.9f checksum=%+.9e peak_bytes=%zu rss_bytes=%zu hwm_bytes=%zu mem_available_bytes=%zu\n",
         g_rank,g_nodes,o->mode==K3_MODE_REAL?"real":"dummy",state,reason?reason:"none",
-        o->layers,o->tokens,tokens_completed,last_layer,(unsigned long)collective_seq,seconds,checksum,peak)>=0;
+        o->layers,o->tokens,tokens_completed,last_layer,(unsigned long)collective_seq,seconds,checksum,peak,
+        rss,hwm,k3_mem_available_bytes())>=0;
     if(ok)ok=fflush(f)==0;if(ok)ok=fsync(fileno(f))==0;if(fclose(f))ok=0;
     if(ok)ok=rename(tmp,path)==0;
     if(!ok){int saved=errno?errno:EIO;unlink(tmp);fprintf(stderr,"k3_ep_runner rank %d: publish status '%s': %s\n",g_rank,path,strerror(saved));}
 }
 
 static void write_progress(const k3_options *o,int tokens_completed,double seconds,
-        float latent_max,float state_max,float cache_max,float min_available_mib,uint64_t seq){
+        float latent_max,float state_max,float cache_max,float min_available_mib,
+        float max_rss_mib,float max_hwm_mib,uint64_t seq){
     if(g_rank)return;char path[1024],tmp[1088];
     int n=snprintf(path,sizeof path,"%s/k3_progress.status",o->status_dir);
     if(n<0||(size_t)n>=sizeof path)return;
     n=snprintf(tmp,sizeof tmp,"%s.tmp.%ld",path,(long)getpid());if(n<0||(size_t)n>=sizeof tmp)return;
     FILE*f=fopen(tmp,"w");if(!f)return;
-    int ok=fprintf(f,"state=running tokens_completed=%d seconds=%.6f tokens_per_s=%.3f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e min_available_mib=%.1f collective_seq=%lu\n",
+    int ok=fprintf(f,"state=running tokens_completed=%d seconds=%.6f tokens_per_s=%.3f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e min_available_mib=%.1f max_rss_mib=%.2f max_hwm_mib=%.2f collective_seq=%lu\n",
         tokens_completed,seconds,seconds>0?tokens_completed/seconds:0.0,latent_max,state_max,cache_max,
-        min_available_mib,(unsigned long)seq)>=0;
+        min_available_mib,max_rss_mib,max_hwm_mib,(unsigned long)seq)>=0;
     /* Progress is advisory and replaced frequently. A shared-filesystem fsync
      * here stalls rank 0 long enough for every peer to wait in the next
      * collective; final per-rank status remains fully fsync-durable. */
@@ -646,7 +653,7 @@ int main(int argc,char **argv){
         debug_token=getenv("K3_DEBUG_NAN_TOKEN")?atoi(getenv("K3_DEBUG_NAN_TOKEN")):-1;
         debug_layer=getenv("K3_DEBUG_NAN_LAYER")?atoi(getenv("K3_DEBUG_NAN_LAYER")):-1;}
     runner_barrier();double start=now_sec(),phase[6]={0},phase_max[6]={0};int finite=1,stopped=0,comm_failed=0;
-    int stop_numeric=0,stop_signal=0,tokens_completed=0,last_layer=-1;float cache_running_max=0.0f;
+    int stop_numeric=0,stop_signal=0,stop_memory=0,tokens_completed=0,last_layer=-1;float cache_running_max=0.0f;
     uint64_t prefetch_sink=0;
     for(int token=0;token<opt.tokens&&!stopped;++token){
         for(int layer=0;layer<opt.layers;++layer){int global_layer=opt.layer+layer;
@@ -699,15 +706,18 @@ int main(int argc,char **argv){
             for(int i=0;i<K3_LATENT;++i){float a=fabsf(latent[i]);if(a>latent_now)latent_now=a;}
 #pragma omp parallel for reduction(max:state_now)
             for(size_t i=0;i<kda_elems;++i){float a=fabsf(kda_state[i]);if(a>state_now)state_now=a;}
-            float hb[6]={g_stop_signal?1.0f:0.0f,finite?0.0f:1.0f,latent_now,state_now,
-                cache_running_max,-(float)(k3_mem_available_bytes()/1048576.0)};
-            if(runner_allreduce_max(&comm,hb,6)){
+            size_t rss=0,hwm=0;(void)k3_process_memory_bytes(&rss,&hwm);
+            float available_mib=(float)(k3_mem_available_bytes()/1048576.0);
+            float hb[9]={g_stop_signal?1.0f:0.0f,finite?0.0f:1.0f,latent_now,state_now,
+                cache_running_max,-available_mib,(float)(rss/1048576.0),(float)(hwm/1048576.0),
+                opt.min_available_mib>0&&available_mib<(float)opt.min_available_mib?1.0f:0.0f};
+            if(runner_allreduce_max(&comm,hb,9)){
                 fprintf(stderr,"k3_ep_runner rank %d: heartbeat collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=stopped=1;break;}
-            stop_signal=hb[0]>0;stop_numeric=hb[1]>0;
-            if(stop_signal||stop_numeric)stopped=1;
-            double elapsed=now_sec()-start;write_progress(&opt,tokens_completed,elapsed,hb[2],hb[3],hb[4],-hb[5],runner_comm_seq(&comm));
-            if(g_rank==0){printf("K3_PROGRESS tokens=%d/%d elapsed_s=%.3f tokens_per_s=%.3f min_available_MiB=%.1f latent_max=%.6e state_max=%.6e cache_max=%.6e collective_seq=%lu\n",
-                tokens_completed,opt.tokens,elapsed,elapsed>0?tokens_completed/elapsed:0.0,-hb[5],hb[2],hb[3],hb[4],(unsigned long)runner_comm_seq(&comm));}
+            stop_signal=hb[0]>0;stop_numeric=hb[1]>0;stop_memory=hb[8]>0;
+            if(stop_signal||stop_numeric||stop_memory)stopped=1;
+            double elapsed=now_sec()-start;write_progress(&opt,tokens_completed,elapsed,hb[2],hb[3],hb[4],-hb[5],hb[6],hb[7],runner_comm_seq(&comm));
+            if(g_rank==0){printf("K3_PROGRESS tokens=%d/%d elapsed_s=%.3f tokens_per_s=%.3f min_available_MiB=%.1f max_rss_MiB=%.2f max_hwm_MiB=%.2f latent_max=%.6e state_max=%.6e cache_max=%.6e collective_seq=%lu\n",
+                tokens_completed,opt.tokens,elapsed,elapsed>0?tokens_completed/elapsed:0.0,-hb[5],hb[6],hb[7],hb[2],hb[3],hb[4],(unsigned long)runner_comm_seq(&comm));}
         }
     }
     if(!comm_failed)runner_barrier();double seconds=now_sec()-start,checksum=0,norm2=0;
@@ -726,9 +736,11 @@ int main(int argc,char **argv){
 #pragma omp parallel for reduction(max:cache_max)
         for(size_t i=0;i<mla_value_elems;++i){float a=fabsf(values[i]);if(a>cache_max)cache_max=a;}}
     runner_async_destroy(&async_reduce);
-    float health[5]={latent_max,state_max,cache_max,-(float)tokens_completed,-(float)last_layer};
+    size_t final_rss=0,final_hwm=0;(void)k3_process_memory_bytes(&final_rss,&final_hwm);
+    float health[7]={latent_max,state_max,cache_max,-(float)tokens_completed,-(float)last_layer,
+        (float)(final_rss/1048576.0),(float)(final_hwm/1048576.0)};
     float checksum_local=(float)checksum,checksum_bounds[2]={checksum_local,-checksum_local};
-    if(!comm_failed&&(runner_allreduce_max(&comm,health,5)||
+    if(!comm_failed&&(runner_allreduce_max(&comm,health,7)||
             runner_allreduce_max(&comm,checksum_bounds,2))){
         fprintf(stderr,"k3_ep_runner rank %d: final health collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;}
     if(!comm_failed){tokens_completed=(int)lrintf(-health[3]);last_layer=(int)lrintf(-health[4]);}
@@ -739,22 +751,23 @@ int main(int argc,char **argv){
     int rank_diverged=!comm_failed&&disagreement>=1e-6;
     finite&=!comm_failed&&isfinite(checksum)&&isfinite(norm2);
     if(!finite||rank_diverged)stop_numeric=1;
-    const char *final_state=comm_failed?"comm-failed":stop_signal?"stopped":stop_numeric?"numeric-failed":"pass";
-    const char *final_reason=comm_failed?"collective-error":stop_signal?(g_stop_signal==SIGINT?"signal-int":g_stop_signal==SIGTERM?"signal-term":"signal-peer"):
+    const char *final_state=comm_failed?"comm-failed":stop_memory||stop_signal?"stopped":stop_numeric?"numeric-failed":"pass";
+    const char *final_reason=comm_failed?"collective-error":stop_memory?"memory-pressure":stop_signal?(g_stop_signal==SIGINT?"signal-int":g_stop_signal==SIGTERM?"signal-term":"signal-peer"):
         stop_numeric?(rank_diverged&&finite?"rank-divergence":"non-finite"):"complete";
     write_status(&opt,final_state,final_reason,tokens_completed,last_layer,runner_comm_seq(&comm),seconds,checksum,pool.peak_active_bytes);
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
-        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s allreduce=%s ar_groups=%d comm_robust=%d comm_ack=%d comm_deterministic=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
-            opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",
+        printf("K3_RUN mode=%s nodes=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s min_available_mib=%d allreduce=%s ar_groups=%d comm_robust=%d comm_ack=%d comm_deterministic=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
+            opt.mode==K3_MODE_REAL?"real":"dummy",g_nodes,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",opt.min_available_mib,
             opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.comm_ack,opt.comm_deterministic,opt.comm_poll_spins,opt.prefetch_mib,
             opt.prefetch_threads?opt.prefetch_threads:(opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS),(unsigned long long)prefetch_sink);
         printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
-            !comm_failed&&!stop_signal&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal?"STOPPED":"FAIL",final_reason,tokens_completed,
+            !comm_failed&&!stop_signal&&!stop_memory&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal||stop_memory?"STOPPED":"FAIL",final_reason,tokens_completed,
             seconds,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));
-        printf("K3_HEALTH kda_slots=%d mla_slots=%d state_MiB=%.2f mla_cache_MiB=%.2f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e\n",
+        printf("K3_HEALTH kda_slots=%d mla_slots=%d state_MiB=%.2f mla_cache_MiB=%.2f pool_peak_MiB=%.2f rss_max_MiB=%.2f hwm_max_MiB=%.2f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e\n",
             kda_layers,mla_layers,kda_elems*sizeof(float)/1048576.0,
-            (mla_key_elems+mla_value_elems)*cache_element_bytes/1048576.0,health[0],health[1],health[2]);
+            (mla_key_elems+mla_value_elems)*cache_element_bytes/1048576.0,
+            pool.peak_active_bytes/1048576.0,health[5],health[6],health[0],health[1],health[2]);
         fflush(stdout);}
     if(opt.profile&&!comm_failed){const char *names[6]={"kda","mla","expert","pack","allreduce","residual"};double steps=(double)opt.layers*tokens_completed;if(steps<1)steps=1;
         if(g_rank==0){double sum=0;for(int i=0;i<6;++i)sum+=phase[i];
@@ -765,5 +778,5 @@ int main(int argc,char **argv){
         fflush(stdout);}
     }
     if(!comm_failed)runner_barrier();runner_comm_free(&comm);utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
-    return comm_failed?3:stop_signal?5:stop_numeric?1:0;
+    return comm_failed?3:stop_signal||stop_memory?5:stop_numeric?1:0;
 }

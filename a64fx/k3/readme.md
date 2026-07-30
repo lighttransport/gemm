@@ -732,12 +732,16 @@ weight bytes can repay. The stable runner therefore keeps a 16 MiB window.
 
 The robust-2 trailer invalidation cadence is now exposed as
 `--comm-poll-spins N` (a power of two in `[1,1024]`) instead of being buried in
-the transport. The default remains eight. A 12-node sweep initially favored 32
+the transport. A 12-node sweep initially favored 32
 spins (93--99 us versus 105--108 us in clean 16K dummy trials), and 32 completed
 65,536 consecutive hierarchical layer steps without MRQ growth or a transport
 failure. A same-stage real-MXFP4 series, however, overlapped after system-wide
 slow runs were excluded: 8-spin clean runs were 98--103 us and 32-spin runs were
-97--114 us. This is therefore a 96-node tuning control, not a claimed model gain.
+97--114 us. After allocation restart, alternating real-weight 2K runs measured a
+2,539 layer-step/s median with four spins and 2,503 with eight; every four-spin
+run had exact rank agreement, as did a separate 4K trial. The default is therefore
+four spins, while the option remains a 96-node tuning control rather than a claimed
+full-model gain.
 
 Two further overlap experiments were rejected. Splitting the expert OpenMP team
 at the TP=96 local shape (32 channels/rank, 16 selected experts) raised the
@@ -1180,13 +1184,32 @@ versus 0.6287 ms at 32K, with identical checksums.
 
 `--heartbeat-tokens N` defaults to 1024. Rank 0 atomically publishes
 `k3_progress.status` with completed tokens, elapsed rate, global latent/KDA/cache
-maxima, minimum `MemAvailable`, and collective sequence. Cache maxima are accumulated
+maxima, minimum `MemAvailable`, maximum process RSS/HWM, and collective sequence.
+Cache maxima are accumulated
 while appending K/V, avoiding a growing-cache scan at every heartbeat. SIGINT,
 SIGTERM, and non-finite state use two control floats appended to the existing fused
 layer allreduce, so no per-token collective was added. Completion records now include
 the reason, completed token count, last layer, and sequence. A rank-0 NaN injection
 produced 12/12 `numeric-failed` records at sequence 380; SIGTERM delivered to one rank
 produced 12/12 stopped records at sequence 1311 without stranding peers.
+
+Managed-pool accounting is now supplemented by `/proc/self/status` RSS and high-water
+telemetry. Every final per-rank status records RSS, HWM, and system `MemAvailable`;
+heartbeats and `K3_HEALTH` reduce the process values to rank maxima. This makes libc,
+OpenMP, and communication-library allocations visible in postmortems without replacing
+the pool's exact active/peak accounting. On restarted job `49862159`, a bounded 64-step
+dummy run passed 12/12 ranks with 25.46 MiB managed peak and 10.19 MiB reported process
+HWM; the procfs figure is treated as OS telemetry, not an A64FX HBM ownership total.
+The heartbeat also enforces `--min-available-mib` (2,048 MiB by default). If any node
+crosses that floor, all ranks finish the current token, coordinate a stop, and publish
+`state=stopped reason=memory-pressure` instead of letting one process disappear into
+the OOM killer. Set the guard to zero only for controlled diagnostics. The existing
+6 GiB state-allocation reserve remains the earlier, stricter admission check.
+An injected 32 GiB floor on job `49862159` stopped 12/12 ranks after token one with the
+expected status and no stranded peer. With the normal 2 GiB floor, the retained real
+layer-1 weights completed 4,096 steps on 12/12 ranks at 2,456 layer-steps/s, exact rank
+agreement, 0.2185 ms expert time, and 0.1145 ms collective time; minimum reported
+`MemAvailable` remained 29,904 MiB.
 
 The allreduce region is sized explicitly and allocated by the runner's 256-byte-aligned,
 NUMA-aware pool. K3 passes an explicit robust communication configuration rather than

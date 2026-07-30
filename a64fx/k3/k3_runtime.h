@@ -45,6 +45,22 @@ static inline size_t k3_mem_available_bytes(void) {
     fclose(f);return(size_t)kb*1024;
 }
 
+/* Pool accounting excludes libc, OpenMP, and communication-library storage.
+ * Procfs RSS/HWM telemetry makes that memory visible in runner postmortems. */
+static inline int k3_process_memory_bytes(size_t *rss_out,size_t *hwm_out) {
+    if(rss_out)*rss_out=0;if(hwm_out)*hwm_out=0;
+    FILE*f=fopen("/proc/self/status","r");if(!f)return errno?errno:EIO;
+    char line[256];unsigned long long rss_kb=0,hwm_kb=0;
+    while(fgets(line,sizeof line,f)){unsigned long long value;
+        if(sscanf(line,"VmRSS: %llu kB",&value)==1)rss_kb=value;
+        else if(sscanf(line,"VmHWM: %llu kB",&value)==1)hwm_kb=value;}
+    int rc=ferror(f)?EIO:0;if(fclose(f)&&!rc)rc=errno?errno:EIO;
+    if(!rc&&(!rss_kb||!hwm_kb))rc=ENODATA;
+    if(!rc){if(rss_out)*rss_out=(size_t)rss_kb*1024;
+        if(hwm_out)*hwm_out=(size_t)hwm_kb*1024;}
+    return rc;
+}
+
 static inline void k3_pool_set_error(k3_pool *pool, const char *operation,
         size_t bytes, const char *detail) {
     snprintf(pool->error,sizeof pool->error,

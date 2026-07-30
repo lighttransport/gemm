@@ -25,11 +25,12 @@ REUSE_STAGE=0
 NO_FUSED_TEAM=0
 MLA_CACHE_BF16=1
 HEARTBEAT_TOKENS=1024
+MIN_AVAILABLE_MIB=2048
 AR_GROUPS=auto
 COMM_ROBUST=2
 COMM_ACK=0
 COMM_DETERMINISTIC=0
-COMM_POLL_SPINS=8
+COMM_POLL_SPINS=4
 PREFETCH_MIB=0
 PREFETCH_THREADS=0
 
@@ -41,11 +42,12 @@ usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--profile] [--reuse-stage] [--no-fused-team]
           [--mla-cache-bf16|--mla-cache-fp32]
           [--heartbeat-tokens N]
+          [--min-available-mib N] (coordinated runtime guard, default 2048)
           [--ar-groups auto|N] (auto uses six-rank rows; 0=flat)
           [--comm-robust 1|2] (2=amortized polling, default)
           [--comm-ack 0|1] (ACK/retransmit reliability, default off)
           [--comm-deterministic 0|1] (fixed-root bit-consistent reduction)
-          [--comm-poll-spins N] (power-of-two robust-2 cadence, default 8)
+          [--comm-poll-spins N] (power-of-two robust-2 cadence, default 4)
           [--prefetch-mib N] (overlap a routed-up weight window with MoE reduce)
           [--prefetch-threads N] (0=auto, default)
 EOF
@@ -72,6 +74,7 @@ while (( $# )); do
         --mla-cache-bf16) MLA_CACHE_BF16=1; shift;;
         --mla-cache-fp32) MLA_CACHE_BF16=0; shift;;
         --heartbeat-tokens) need_value "$@"; HEARTBEAT_TOKENS=$2; shift 2;;
+        --min-available-mib) need_value "$@"; MIN_AVAILABLE_MIB=$2; shift 2;;
         --ar-groups) need_value "$@"; AR_GROUPS=$2; shift 2;;
         --comm-robust) need_value "$@"; COMM_ROBUST=$2; shift 2;;
         --comm-ack) need_value "$@"; COMM_ACK=$2; shift 2;;
@@ -84,7 +87,7 @@ while (( $# )); do
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
+for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$MIN_AVAILABLE_MIB" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
@@ -166,7 +169,7 @@ else
 fi
 mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-ack "$COMM_ACK" --comm-deterministic "$COMM_DETERMINISTIC" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
+    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --min-available-mib "$MIN_AVAILABLE_MIB" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-ack "$COMM_ACK" --comm-deterministic "$COMM_DETERMINISTIC" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?
