@@ -1321,3 +1321,27 @@ They preserve start/end epochs, elapsed seconds, and return codes for build, top
 weight staging, decode, prefill, result validation, and the whole-network estimate.
 An EXIT trap records an interrupted active stage, making the logs suitable for sizing
 later checkpoint-heavy allocations even when a job hits its elapsed-time limit.
+
+### HTTP and llmgr control
+
+The generic `a64fx/llmgr` HTTP supervisor now has a `k3` adapter and a dedicated
+`pjsub_llmgr_k3_96n.sh` wrapper. It exposes authenticated build, true stage-only,
+bounded partial-run, stop, log, stage-status, and fapp-profile operations. The K3
+launcher honors llmgr's unique `MPIEXEC_OF_PROC` prefix so rank logs are collected
+and detached MPI processes remain recoverable. Its rank-local stage survives runner
+restarts, allowing a source edit through `/bash`, followed by stop, rebuild, and a
+new bounded run without repeating checkpoint I/O.
+
+This is a control/measurement HTTP interface, not an OpenAI-compatible completion
+server. The partial K3 runner still lacks tokenizer, embedding, complete dense/shared
+execution, and LM head, so llmgr advertises `supports_serve=false` and does not
+pretend its synthetic latent steps are generated text. Running machine code is not
+hot-patched: applying a live fix means a coordinated stop and restart against the
+retained stage.
+
+The authenticated HTTP path was exercised on job `49862159`: a stage-only request
+validated the retained real slice on all 12 ranks and exited zero. A subsequent
+65,536-step managed child was stopped after 7,481 steps; every rank completed the
+coordinated `signal-term` path, no runner/`mpiexec`/`plexec` process survived, and a
+fresh two-step distributed launch passed immediately. This specifically validates the
+edit/build/stop/restart loop needed for later TP96 development allocations.

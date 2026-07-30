@@ -18,10 +18,12 @@ Standard library only.
 
 import glob
 import os
+import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 LAGUNA_DIR = os.path.join(REPO, "a64fx", "laguna-s21")
 GEMMA4_DIR = os.path.join(REPO, "a64fx", "gemma4-mn")
+K3_DIR = os.path.join(REPO, "a64fx", "k3")
 UTOFU_DIR = os.path.join(REPO, "a64fx", "utofu-tests")
 
 
@@ -463,7 +465,132 @@ class Gemma4Adapter(Adapter):
                 str(cfg.get("prompt_ids", "")), str(_int(cfg, "max_new", 8))]
 
 
-ADAPTERS = {a.name: a() for a in (LagunaAdapter, Gemma4Adapter)}
+class K3Adapter(Adapter):
+    """Kimi K3 TP partial runner with real MXFP4 expert slices.
+
+    K3 does not yet own a tokenizer, embedding, complete dense path, or LM
+    head, so this is deliberately a one-shot measured-kernel contract.  llmgr
+    supplies the HTTP control plane (build/stage/start/stop/log and /bash), but
+    does not advertise a semantic serving endpoint that the runner cannot
+    implement honestly.
+    """
+
+    name = "k3"
+    variants = ("partial",)
+    default_variant = "partial"
+    supports_serve = False
+    LAUNCHER = os.path.join(K3_DIR, "run_k3_ep.sh")
+
+    def _np(self, cfg):
+        np_ = _int(cfg, "np", self.default_np())
+        if np_ < 1 or np_ > 96:
+            raise ConfigError("np must be in [1,96] for K3 (got %d)" % np_)
+        return np_
+
+    def stage_dir(self, cfg):
+        if cfg.get("stage_dir"):
+            return str(cfg["stage_dir"])
+        user = os.environ.get("USER", "unknown")
+        job = os.environ.get("PJM_JOBID", "interactive")
+        return "/local/%s/k3-llmgr-%s" % (user, job)
+
+    def model_dir(self, cfg):
+        return str(cfg.get("model_dir") or os.path.expanduser("~/models/kimi-k3"))
+
+    def _result_dir(self, cfg, operation):
+        if cfg.get("result_dir"):
+            return str(cfg["result_dir"])
+        job = os.environ.get("PJM_JOBID", "interactive")
+        stamp = int(time.time() * 1000000)
+        return os.path.join(K3_DIR, "logs", "llmgr-%s-%s-%d" %
+                            (operation, job, stamp))
+
+    def _runner_flags(self, cfg):
+        np_ = self._np(cfg)
+        layer = _int(cfg, "layer", 1)
+        layers = _int(cfg, "layers", 1)
+        token_default = cfg.get("max_new")
+        tokens = _int(cfg, "tokens", 256 if token_default is None else token_default)
+        threads = _int(cfg, "threads", 48)
+        heartbeat = _int(cfg, "heartbeat_tokens", 1024)
+        min_available = _int(cfg, "min_available_mib", 2048)
+        if not 0 <= layer <= 92:
+            raise ConfigError("layer must be in [0,92]")
+        if not 1 <= layers <= 93 or layer + layers > 93:
+            raise ConfigError("invalid K3 layer range [%d,%d)" %
+                              (layer, layer + layers))
+        if not 1 <= tokens <= 1048576:
+            raise ConfigError("tokens must be in [1,1048576]")
+        if not 1 <= threads <= 48:
+            raise ConfigError("threads must be in [1,48]")
+        if heartbeat is None or not 0 <= heartbeat <= 1048576:
+            raise ConfigError("heartbeat_tokens must be in [0,1048576]")
+        if min_available is None or not 0 <= min_available <= 1048576:
+            raise ConfigError("min_available_mib must be in [0,1048576]")
+        argv = ["--nodes", str(np_), "--layer", str(layer),
+                "--layers", str(layers), "--tokens", str(tokens),
+                "--threads", str(threads),
+                "--heartbeat-tokens", str(heartbeat),
+                "--min-available-mib", str(min_available),
+                "--ar-groups", str(cfg.get("ar_groups", "auto"))]
+        if cfg.get("profile", True):
+            argv.append("--profile")
+        return argv
+
+    def build(self, cfg):
+        if cfg.get("clean"):
+            argv = ["sh", "-c", "make -C %s clean && make -C %s runner k3_moe_probe"
+                    % (K3_DIR, K3_DIR)]
+        else:
+            argv = ["make", "-C", K3_DIR, "runner", "k3_moe_probe"]
+        return argv, _env_overrides(cfg), K3_DIR
+
+    def stage(self, cfg):
+        layer = _int(cfg, "layer", 1)
+        experts = str(cfg.get("experts", "0-15"))
+        argv = [self.LAUNCHER, "--mode", "real", "--stage-only",
+                "--nodes", str(self._np(cfg)), "--layer", str(layer),
+                "--layers", "1", "--tokens", "1", "--experts", experts,
+                "--model-dir", self.model_dir(cfg),
+                "--stage-dir", self.stage_dir(cfg),
+                "--result-dir", self._result_dir(cfg, "stage")]
+        argv += _extra(cfg)
+        return argv, _env_overrides(cfg), K3_DIR
+
+    def generate(self, cfg):
+        real = not cfg.get("dummy", False)
+        argv = [self.LAUNCHER, "--mode", "real" if real else "dummy"]
+        argv += self._runner_flags(cfg)
+        if real:
+            if _int(cfg, "layer", 1) == 0 or _int(cfg, "layers", 1) != 1:
+                raise ConfigError("K3 real partial mode requires layer 1..92 and layers=1")
+            argv += ["--experts", str(cfg.get("experts", "0-15")),
+                     "--model-dir", self.model_dir(cfg),
+                     "--stage-dir", self.stage_dir(cfg)]
+            if not cfg.get("stage", False):
+                argv.append("--reuse-stage")
+        argv += ["--result-dir", self._result_dir(cfg, "run")]
+        argv += _extra(cfg)
+        return argv, _env_overrides(cfg), K3_DIR
+
+    def runner_bin(self, cfg):
+        return os.path.join(K3_DIR, "k3_ep_runner")
+
+    def profile_argv(self, cfg):
+        layer = _int(cfg, "layer", 1)
+        if layer < 1 or layer > 92:
+            raise ConfigError("K3 profile requires layer in [1,92]")
+        token_default = cfg.get("max_new")
+        tokens = _int(cfg, "tokens", 64 if token_default is None else token_default)
+        return ["--mode", "real", "--nodes", str(self._np(cfg)),
+                "--layer", str(layer), "--layers", "1",
+                "--tokens", str(tokens),
+                "--threads", str(_int(cfg, "threads", 48)),
+                "--stage-dir", self.stage_dir(cfg), "--status-dir", ".",
+                "--topo", "tofu_topo.txt", "--profile"] + _extra(cfg)
+
+
+ADAPTERS = {a.name: a() for a in (LagunaAdapter, Gemma4Adapter, K3Adapter)}
 
 
 def get(model):

@@ -122,6 +122,25 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 |---|---|---|---|
 | `laguna` | `int4` (default), `bf16`, `fp8` | yes | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
 | `gemma4` | `tp` (default), `pp` | no — one-shot only | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
+| `k3` | `partial` | no — measured one-shot only | `a64fx/k3/run_k3_ep.sh` |
+
+K3's HTTP interface is the llmgr control API, not a semantic completion API:
+the current runner has real TP MXFP4 expert slices but still lacks the tokenizer,
+embedding, complete dense/shared path, and LM head. On a K3 llmgr allocation,
+`POST /stage` performs a true stage-only operation; `POST /runner/start` with
+`mode=generate` launches a bounded partial decode and exposes health, logs, stop,
+and profiling through llmgr. `POST /bash/session` can edit sources and rebuild,
+but apply a fix by stopping the active MPI child and restarting it against the
+retained rank-local stage—already-running machine code is never hot-patched.
+
+The dedicated 96-node wrapper is `pjsub_llmgr_k3_96n.sh` and uses frontend port
+21375 by default. The K3 launcher honors llmgr's `MPIEXEC_OF_PROC` prefix, so
+rank output is folded into the child log and the supervisor can identify and
+reap a detached `plexec` tree reliably.
+
+The K3 stop/restart path was tested on 12 nodes: an HTTP stop reached all ranks
+after 7,481 steps, produced coordinated `signal-term` health output, left no MPI
+survivor, and a fresh distributed run passed on the same allocation.
 
 Adding a model is one dict in `models.py`. Adapters deliberately do **not** set
 performance-critical environment: the launchers already encode it

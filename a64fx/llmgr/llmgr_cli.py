@@ -142,10 +142,15 @@ def main(argv=None):
     st.add_argument("--stage-dir")
     st.add_argument("--model-dir")
     st.add_argument("--np", type=int)
+    st.add_argument("--layer", type=int)
+    st.add_argument("--experts")
 
     ss = sub.add_parser("stage-status")
     ss.add_argument("--model", default="laguna")
     ss.add_argument("--variant")
+    ss.add_argument("--stage-dir")
+    ss.add_argument("--model-dir")
+    ss.add_argument("--np", type=int)
     ss.add_argument("--no-fanout", action="store_true")
 
     r = sub.add_parser("start", help="start a runner")
@@ -157,6 +162,14 @@ def main(argv=None):
     r.add_argument("--layers", type=int)
     r.add_argument("--np", type=int)
     r.add_argument("--max-new", type=int)
+    r.add_argument("--tokens", type=int, help="K3 partial-runner token steps")
+    r.add_argument("--layer", type=int, help="K3 first decoder layer")
+    r.add_argument("--experts", help="K3 expert range, e.g. 0-15")
+    r.add_argument("--stage-dir")
+    r.add_argument("--model-dir")
+    r.add_argument("--result-dir")
+    r.add_argument("--heartbeat-tokens", type=int)
+    r.add_argument("--min-available-mib", type=int)
     r.add_argument("--prompt")
     r.add_argument("--ids", help="path to an ids file (generate mode)")
     r.add_argument("--prompt-ids", help="path to a prompt ids file (Gemma4)")
@@ -193,8 +206,12 @@ def main(argv=None):
     pr = sub.add_parser("profile")
     pr.add_argument("--model", default="laguna")
     pr.add_argument("--variant")
-    pr.add_argument("--ids", required=True)
+    pr.add_argument("--ids", help="token ids file (required by Laguna, not K3)")
     pr.add_argument("--max-new", type=int, default=16)
+    pr.add_argument("--tokens", type=int, help="K3 profile token steps")
+    pr.add_argument("--layer", type=int, help="K3 profile decoder layer")
+    pr.add_argument("--threads", type=int, help="K3 profile worker threads")
+    pr.add_argument("--stage-dir", help="existing K3 rank-local stage")
     pr.add_argument("--event", default="statistics")
     pr.add_argument("--np", type=int)
 
@@ -236,11 +253,11 @@ def main(argv=None):
     elif c == "stage":
         emit(call(args, "POST", "/stage",
                   dict(model=args.model,
-                       **opt("variant", "stage_dir", "model_dir", "np"))))
+                       **opt("variant", "stage_dir", "model_dir", "np",
+                             "layer", "experts"))))
     elif c == "stage-status":
         q = {"model": args.model}
-        if args.variant:
-            q["variant"] = args.variant
+        q.update(opt("variant", "stage_dir", "model_dir", "np"))
         if args.no_fanout:
             q["fanout"] = "0"
         emit(call(args, "GET", "/stage/status?" + urllib.parse.urlencode(q),
@@ -249,7 +266,10 @@ def main(argv=None):
         emit(call(args, "POST", "/runner/start",
                   dict(model=args.model,
                        **opt("variant", "mode", "port", "maxpos", "layers",
-                             "np", "max_new", "prompt", "ids", "prompt_ids",
+                             "np", "max_new", "tokens", "layer", "experts",
+                             "stage_dir", "model_dir", "result_dir",
+                             "heartbeat_tokens", "min_available_mib",
+                             "prompt", "ids", "prompt_ids",
                              "gguf", "mtp", "exclude", "threads", "spec_k",
                              "batch", "tp_skip_ar", "stage",
                              "extra"))))
@@ -268,8 +288,10 @@ def main(argv=None):
         emit(call(args, "POST", "/generate", body, timeout=1800))
     elif c == "profile":
         emit(call(args, "POST", "/profile",
-                  dict(model=args.model, ids=args.ids, max_new=args.max_new,
-                       event=args.event, **opt("variant", "np")), timeout=600))
+                  dict(model=args.model, max_new=args.max_new,
+                       event=args.event, **opt("variant", "np", "ids",
+                                              "tokens", "layer", "threads",
+                                              "stage_dir")), timeout=600))
     elif c == "artifacts":
         emit(call(args, "GET", "/profile/%s/artifacts" % args.id))
     elif c == "kv":

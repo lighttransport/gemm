@@ -22,6 +22,7 @@ STAGE_DIR="/local/$USER/k3-runner-$JOB_TAG"
 RESULT_DIR="$SCRIPT_DIR/logs/run-$JOB_TAG"
 PROFILE=0
 REUSE_STAGE=0
+STAGE_ONLY=0
 NO_FUSED_TEAM=0
 MLA_CACHE_BF16=1
 HEARTBEAT_TOKENS=1024
@@ -39,7 +40,7 @@ usage() {
 usage: $0 [--mode dummy|real] [--nodes N] [--layers N] [--tokens N]
           [--threads N] [--kda-threads N] [--fused-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
-          [--profile] [--reuse-stage] [--no-fused-team]
+          [--profile] [--reuse-stage] [--stage-only] [--no-fused-team]
           [--mla-cache-bf16|--mla-cache-fp32]
           [--heartbeat-tokens N]
           [--min-available-mib N] (coordinated runtime guard, default 2048)
@@ -70,6 +71,7 @@ while (( $# )); do
         --result-dir) need_value "$@"; RESULT_DIR=$2; shift 2;;
         --profile) PROFILE=1; shift;;
         --reuse-stage) REUSE_STAGE=1; shift;;
+        --stage-only) STAGE_ONLY=1; shift;;
         --no-fused-team) NO_FUSED_TEAM=1; shift;;
         --mla-cache-bf16) MLA_CACHE_BF16=1; shift;;
         --mla-cache-fp32) MLA_CACHE_BF16=0; shift;;
@@ -87,6 +89,10 @@ while (( $# )); do
     esac
 done
 case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
+if (( STAGE_ONLY )) && [[ "$MODE" != real ]]; then
+    echo "$0: --stage-only requires --mode real" >&2
+    exit 2
+fi
 for value in "$NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$MIN_AVAILABLE_MIB" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
@@ -115,6 +121,9 @@ fi
 if [[ -e "$RESULT_DIR" ]]; then echo "$0: result directory already exists: $RESULT_DIR" >&2; exit 2; fi
 mkdir -p "$RESULT_DIR"
 RESULT_DIR=$(cd "$RESULT_DIR" && pwd)
+RUN_OUTPUT_PREFIX=${MPIEXEC_OF_PROC:-$RESULT_DIR/rank}
+STAGE_OUTPUT_PREFIX=${MPIEXEC_OF_PROC:+$MPIEXEC_OF_PROC.stage}
+STAGE_OUTPUT_PREFIX=${STAGE_OUTPUT_PREFIX:-$RESULT_DIR/stage}
 
 # Keep durable wall-clock records for slow shared-storage staging and scheduler
 # sizing.  The EXIT trap also records the active stage when set -e aborts it.
@@ -197,13 +206,26 @@ if [[ "$MODE" == real ]]; then
         timing_end 0
     else
         timing_begin weight_staging
-        mpiexec -np "$NODES" -of-proc "$RESULT_DIR/stage" \
+        mpiexec -np "$NODES" -of-proc "$STAGE_OUTPUT_PREFIX" \
             "$SCRIPT_DIR/run_k3_stage_rank.sh" "$SCRIPT_DIR" "$NODES" "$MODEL_DIR" \
             "$STAGE_DIR" "$LAYER" "$EXPERTS" "$CHUNK_MIB"
-        staged=$(find "$RESULT_DIR" -maxdepth 1 -name 'stage.*' -type f | wc -l)
+        staged=$(find "$(dirname "$STAGE_OUTPUT_PREFIX")" -maxdepth 1 \
+            -name "$(basename "$STAGE_OUTPUT_PREFIX").*" -type f | wc -l)
         echo "stage launch output files: $staged/$NODES"
         timing_end 0
     fi
+fi
+
+if (( STAGE_ONLY )); then
+    timing_begin stage_result_validation
+    mpiexec -np "$NODES" /bin/sh -c '
+        rank=${PMIX_RANK:?}; marker="$1/stage-rank$(printf "%03d" "$rank").status"
+        expected="rank=$rank nodes=$2 layer=$3 experts=$4"
+        test -f "$marker" && test "$(cat "$marker")" = "$expected"
+    ' sh "$STAGE_DIR" "$NODES" "$LAYER" "$EXPERTS"
+    echo "K3_STAGE_ONLY status=PASS nodes=$NODES layer=$LAYER experts=$EXPERTS stage_dir=$STAGE_DIR"
+    timing_end 0
+    exit 0
 fi
 
 set +e
@@ -216,7 +238,7 @@ else
     RUNNER_EXTRA+=(--mla-cache-fp32)
 fi
 timing_begin decode_runner
-mpiexec -np "$NODES" -of-proc "$RESULT_DIR/rank" \
+mpiexec -np "$NODES" -of-proc "$RUN_OUTPUT_PREFIX" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
     --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --min-available-mib "$MIN_AVAILABLE_MIB" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-ack "$COMM_ACK" --comm-deterministic "$COMM_DETERMINISTIC" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
@@ -227,7 +249,7 @@ timing_end "$runner_rc"
 
 timing_begin result_validation
 passes=$(grep -l ' state=pass ' "$RESULT_DIR"/k3_rank*.status 2>/dev/null | wc -l || true)
-grep -hE 'K3_RUN|K3_PROGRESS|K3_RESULT|K3_HEALTH|K3_PROFILE|FATAL|timeout|failed' "$RESULT_DIR"/rank.* 2>/dev/null || true
+grep -hE 'K3_RUN|K3_PROGRESS|K3_RESULT|K3_HEALTH|K3_PROFILE|FATAL|timeout|failed' "$RUN_OUTPUT_PREFIX".* 2>/dev/null || true
 echo "K3 distributed result: rc=$runner_rc pass_markers=$passes/$NODES results=$RESULT_DIR"
 validation_rc=0
 (( runner_rc == 0 && passes == NODES )) || validation_rc=5
