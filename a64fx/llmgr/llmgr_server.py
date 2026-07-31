@@ -60,6 +60,7 @@ import bash_http_server as bhs   # noqa: E402  (path set above)
 import models                    # noqa: E402
 import laguna_openai             # noqa: E402
 import agentic                   # noqa: E402
+import anthropic_api             # noqa: E402
 
 try:
     from http.server import ThreadingHTTPServer
@@ -825,6 +826,12 @@ class Handler(bhs.Handler):
 
     # -- plumbing ----------------------------------------------------------
 
+    def _authorized(self):
+        token = getattr(bhs, "AUTH_TOKEN", None)
+        if token and self.headers.get("x-api-key") == token:
+            return True
+        return super()._authorized()
+
     def _split(self):
         u = urllib.parse.urlsplit(self.path)
         return u.path, urllib.parse.parse_qs(u.query)
@@ -1086,6 +1093,10 @@ class Handler(bhs.Handler):
                 return self._post_openai(body, chat=True)
             if path == "/v1/responses":
                 return self._post_openai_responses(body)
+            if path == "/v1/messages":
+                return self._post_anthropic(body)
+            if path == "/v1/messages/count_tokens":
+                return self._post_anthropic_count_tokens(body)
             if path in ("/v1/completions", "/completion"):
                 return self._post_openai(body, chat=False)
             if path == "/inference/cancel":
@@ -1249,6 +1260,119 @@ class Handler(bhs.Handler):
         translated = laguna_openai.responses_request(body)
         return self._post_openai(translated, chat=True, response_api=True,
                                  response_body=body)
+
+    def _anthropic_context_id(self, body):
+        metadata = body.get("metadata") or {}
+        return (body.get("context_id") or metadata.get("context_id") or
+                metadata.get("llmgr_context_id"))
+
+    def _accept_anthropic_tool_continuation(self, context, body):
+        results = []
+        for message in body.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    results.append({"tool_call_id": block.get("tool_use_id")})
+        if results:
+            metadata = body.get("metadata") or {}
+            previous = (body.get("previous_response_id") or
+                        metadata.get("previous_response_id") or
+                        context.last_response_id)
+            context.accept_tool_results(previous, results)
+
+    def _post_anthropic(self, body):
+        if not isinstance(body, dict):
+            return self._err("request body must be an object")
+        model_name = body.get("llmgr_model", "laguna-s21")
+        try:
+            adapter = models.get_by_openai_model(model_name)
+        except models.ConfigError as e:
+            return self._err(str(e), status=400)
+        if not adapter.supports_serve:
+            return self._err("%s does not support Anthropic-style serve operations" % adapter.name,
+                             status=400)
+        if _ready_serve(adapter.name) is None:
+            return self._err("ready runner for model %s not found" % adapter.name,
+                             status=503)
+        try:
+            request = anthropic_api.request(body)
+            context = _contexts.get_or_create(self._anthropic_context_id(body),
+                                               model=adapter.name)
+            self._accept_anthropic_tool_continuation(context, body)
+            request["context_id"] = context.context_id
+            request = _apply_prompt_cache(request, adapter)
+            native, tokenizer = laguna_openai.native_request(request, chat=True)
+            job = _inference.submit(request, native=native, tokenizer=tokenizer,
+                                    chat=True, context_id=context.context_id,
+                                    model=adapter.name)
+        except OverflowError as e:
+            return self._err(str(e), status=429)
+        except (ValueError, OSError, agentic.ContextError) as e:
+            return self._err(str(e))
+        if body.get("stream"):
+            return self._stream_anthropic(job, body, context)
+        if not job.done.wait(float(body.get("timeout", 3600.0))):
+            _inference.cancel(job.id)
+            return self._err("inference timed out", status=504)
+        if job.error:
+            return self._err(job.error, status=502)
+        self._record_context_response(context, job)
+        self._send_json(anthropic_api.response(body, job.result,
+                                               request_id=job.id))
+
+    def _post_anthropic_count_tokens(self, body):
+        try:
+            request = anthropic_api.request(body)
+            native, _tokenizer = laguna_openai.native_request(request, chat=True)
+        except (ValueError, OSError) as e:
+            return self._err(str(e))
+        self._send_json({"input_tokens": len(native.get("ids", []))})
+
+    def _stream_anthropic(self, job, body, context):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self._sse(anthropic_api.stream_start(body, job.id))
+            self._sse({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "text", "text": ""}})
+            for event in iter(job.events.get, None):
+                if event.get("event") == "token" and event.get("text"):
+                    self._sse(anthropic_api.stream_text(0, event["text"]))
+            if job.error:
+                self._sse({"type": "error", "error": {
+                    "type": "runner_error", "message": job.error}})
+            elif job.result:
+                self._record_context_response(context, job)
+                self._sse(anthropic_api.stream_stop(0))
+                final = anthropic_api.response(body, job.result, request_id=job.id)
+                next_index = 1
+                for block in final.get("content", []):
+                    if block.get("type") != "tool_use":
+                        continue
+                    self._sse({"type": "content_block_start", "index": next_index,
+                               "content_block": {"type": "tool_use",
+                                                 "id": block.get("id"),
+                                                 "name": block.get("name"),
+                                                 "input": {}}})
+                    self._sse({"type": "content_block_delta", "index": next_index,
+                               "delta": {"type": "input_json_delta",
+                                         "partial_json": json.dumps(
+                                             block.get("input", {}),
+                                             ensure_ascii=False)}})
+                    self._sse(anthropic_api.stream_stop(next_index))
+                    next_index += 1
+                self._sse(anthropic_api.stream_done(job.result))
+                self._sse({"type": "message_stop"})
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            _inference.cancel(job.id)
 
     def _accept_tool_continuation(self, context, request):
         items = request.get("input")

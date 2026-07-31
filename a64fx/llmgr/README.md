@@ -114,7 +114,9 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | POST | `/runner/stop` | `{id, grace}` |
 | POST | `/generate` | `{ids:[…], max_new, sample, temp, top_k, top_p, seed}` — queued native API |
 | POST | `/v1/chat/completions`, `/chat/completions` | OpenAI chat; supports SSE, reasoning, function tools, and runner-specific `cache_load`/`cache_save` extensions |
-| POST | `/v1/responses` | OpenAI Responses-compatible input/output translation, including reasoning/text SSE; use Chat Completions for richer tool-call streaming |
+| POST | `/v1/responses` | OpenAI Responses-compatible input/output translation, including reasoning/text SSE and multi-context batching |
+| POST | `/v1/messages` | Anthropic Messages-compatible text/tool requests and SSE for Claude Code |
+| POST | `/v1/messages/count_tokens` | Anthropic-compatible tokenizer count for Claude Code preflight |
 | POST | `/v1/completions`, `/completion` | OpenAI text completions; supports SSE |
 | POST | `/inference/cancel` | `{id}` — cancel a queued/running request |
 | POST | `/profile` | `{model, ids, max_new, event, np}` — fapp-wrapped run |
@@ -157,6 +159,24 @@ The dedicated 96-node wrapper is `pjsub_llmgr_k3_96n.sh` and uses frontend port
 21375 by default. The K3 launcher honors llmgr's `MPIEXEC_OF_PROC` prefix, so
 rank output is folded into the child log and the supervisor can identify and
 reap a detached `plexec` tree reliably.
+
+### Claude Code
+
+Claude Code can use the llmgr Anthropic compatibility route through the same
+reverse tunnel. Set `ANTHROPIC_BASE_URL` to the llmgr URL and use the llmgr
+token as `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`):
+
+```sh
+export ANTHROPIC_BASE_URL="${LLMGR_URL:-http://127.0.0.1:21274}"
+export ANTHROPIC_AUTH_TOKEN="${LLMGR_TOKEN:-}"
+claude --model claude-sonnet-4
+```
+
+The server maps Claude model IDs to the configured Laguna serving adapter. For
+stable context and checkpoint affinity, pass `metadata.context_id` in a client
+wrapper; tool continuations are validated against pending `tool_use` IDs.
+`metadata.llmgr_context_id`, `prompt_cache_key`, `cache_load`, and `cache_save`
+are llmgr extensions and remain outside the Anthropic model contract.
 
 The K3 stop/restart path was tested on 12 nodes: an HTTP stop reached all ranks
 after 7,481 steps, produced coordinated `signal-term` health output, left no MPI

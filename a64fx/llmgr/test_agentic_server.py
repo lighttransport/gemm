@@ -147,6 +147,37 @@ class AgenticServerTest(unittest.TestCase):
         self.assertEqual(context.pending_tools, {})
         server._contexts.delete("tool-context")
 
+    def test_anthropic_messages_route_uses_llmgr_context_metadata(self):
+        h, out = self._handler()
+        done = threading.Event(); done.set()
+        job = SimpleNamespace(id="msg-1", done=done, error=None,
+                              context_id="claude-context", result={
+                                  "choices": [{"message": {
+                                      "content": "hello"},
+                                      "finish_reason": "stop"}],
+                                  "usage": {}})
+        request = {"model": "claude-sonnet-4", "max_tokens": 8,
+                   "metadata": {"context_id": "claude-context"},
+                   "messages": [{"role": "user", "content": "hello"}]}
+        with mock.patch.object(server, "_ready_serve", return_value=object()), \
+             mock.patch.object(server.laguna_openai, "native_request",
+                               return_value=({"ids": [1], "max_new": 1}, None)), \
+             mock.patch.object(server._inference, "submit", return_value=job):
+            h._post_anthropic(request)
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(out["body"]["type"], "message")
+        self.assertEqual(out["body"]["content"][0]["text"], "hello")
+        server._contexts.delete("claude-context")
+
+    def test_anthropic_count_tokens_uses_native_tokenizer_path(self):
+        h, out = self._handler()
+        with mock.patch.object(server.laguna_openai, "native_request",
+                               return_value=({"ids": [1, 2, 3]}, None)):
+            h._post_anthropic_count_tokens({
+                "messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(out["body"], {"input_tokens": 3})
+
 
 if __name__ == "__main__":
     unittest.main()
