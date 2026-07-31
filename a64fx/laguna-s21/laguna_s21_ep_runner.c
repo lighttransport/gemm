@@ -102,23 +102,68 @@ static int test_i4_matvec(void) {
     return 0;
 }
 
+/* Batched INT4 expert projections must match the scalar path for both the
+ * eight-token SVE fast path and the tail token path. */
+static int test_i4_matmat(void) {
+    enum { R=17, C=96, N=11 };
+    static uint32_t pa[R*(C/8)], pb[R*(C/8)];
+    static uint16_t sa[R*(C/32)], sb[R*(C/32)];
+    static float X[N*C], YA[N*R], YB[N*R], Y[N*R], ref[R], refb[R];
+    uint64_t st=0x31415926ull;
+    for (int i=0;i<R*(C/8);++i) {
+        st=st*6364136223846793005ull+1; pa[i]=(uint32_t)(st>>32);
+        st=st*6364136223846793005ull+1; pb[i]=(uint32_t)(st>>32);
+    }
+    for (int i=0;i<R*(C/32);++i) {
+        sa[i]=laguna_f32_to_bf16(0.05f+0.001f*(i%9));
+        sb[i]=laguna_f32_to_bf16(0.07f+0.001f*(i%7));
+    }
+    for (int i=0;i<N*C;++i) {
+        st=st*6364136223846793005ull+1;
+        X[i]=(float)((int)((st>>34)%2000)-1000)/1000.0f;
+    }
+    laguna_matmat_i4g32(Y,pa,sa,X,R,C,N);
+    laguna_matmat_i4g32_dual(YA,YB,pa,sa,pb,sb,X,R,C,N);
+    for (int n=0;n<N;++n) {
+        laguna_matvec_i4g32(ref,pa,sa,X+(size_t)n*C,R,C);
+        laguna_matvec_i4g32(refb,pb,sb,X+(size_t)n*C,R,C);
+        for (int r=0;r<R;++r) {
+            float lim=3e-4f*(1.0f+fabsf(ref[r]));
+            if (fabsf(Y[(size_t)n*R+r]-ref[r])>lim || fabsf(YA[(size_t)n*R+r]-ref[r])>lim) {
+                fprintf(stderr,"i4 matmat tok %d row %d mismatch: y=%.9g ya=%.9g ref=%.9g lim=%.3g\n",
+                        n,r,Y[(size_t)n*R+r],YA[(size_t)n*R+r],ref[r],lim);
+                return 1;
+            }
+            if (fabsf(YB[(size_t)n*R+r]-refb[r])>3e-4f*(1.0f+fabsf(refb[r]))) {
+                fprintf(stderr,"i4 dual matmat tok %d row %d mismatch\n",n,r); return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Batched int8 GEMM must agree with C separate int8 matvecs (chunked prefill
  * uses the former, the last-token forward the latter). */
 static int test_i8_matmat(void) {
     enum { R=136, C=256, N=11 };
-    static int8_t q[R*C]; static float s[R], X[N*C], Y[N*R], y1[R];
+    static int8_t q[R*C]; static float s[R], X[N*C], Y[N*R], YdualA[N*R], YdualB[N*R], y1[R];
     uint64_t st=0x9e3779b9ull;
     for (int i=0;i<R*C;i++){ st=st*6364136223846793005ull+1; q[i]=(int8_t)((st>>33)%255-127); }
     for (int i=0;i<R;i++) s[i]=0.001f*(1+i%7);
     for (int i=0;i<N*C;i++){ st=st*6364136223846793005ull+1; X[i]=(float)((int)((st>>34)%2000)-1000)/1000.0f; }
     laguna_w8 w={q,s};
     laguna_matmat_i8(Y,&w,X,R,C,N);
+    laguna_matmat_i8_dual(YdualA,YdualB,&w,&w,X,R,C,N);
     for (int n=0;n<N;n++){
         laguna_matvec_i8(y1,&w,X+(size_t)n*C,R,C);
         for (int r=0;r<R;r++){
             float a=Y[(size_t)n*R+r], b=y1[r];
             if (fabsf(a-b) > 1e-4f*(1+fabsf(b))) {
                 fprintf(stderr,"i8 matmat tok %d row %d: %.6g vs %.6g\n",n,r,a,b); return 1; }
+            if (fabsf(YdualA[(size_t)n*R+r]-b) > 1e-4f*(1+fabsf(b)) ||
+                fabsf(YdualB[(size_t)n*R+r]-b) > 1e-4f*(1+fabsf(b))) {
+                fprintf(stderr,"i8 dual matmat tok %d row %d: %.6g vs %.6g\n",
+                        n,r,YdualA[(size_t)n*R+r],b); return 1; }
         }
     }
     return 0;
@@ -129,7 +174,7 @@ static int test_i8_matmat(void) {
 static int test_fp8_i8blk(void) {
     enum { R=256, C=256, N=9 };
     static uint8_t W[R*C]; static uint16_t bs[(R/LAGUNA_FP8_BLK)*(C/LAGUNA_FP8_BLK)];
-    static float x[C], yex[R], yq[R], X[N*C], Y[N*R];
+    static float x[C], yex[R], yq[R], X[N*C], Y[N*R], YdualA[N*R], YdualB[N*R];
     laguna_fp8_init_lut();
     uint64_t st=0xdeadbeefull;
     /* near-Gaussian block content (what a real block-scaled checkpoint holds) */
@@ -158,12 +203,18 @@ static int test_fp8_i8blk(void) {
     if (!(rel < 0.05)) { fprintf(stderr,"fp8->i8blk relerr %.3e too large\n",rel); free(q.q);free(q.s); return 1; }
 
     laguna_matmat_i8blk(Y,&q,X,R,C,N);
+    laguna_matmat_i8blk_dual(YdualA,YdualB,&q,&q,X,R,C,N);
     for (int n=0;n<N;n++){
         laguna_matvec_i8blk(yq,&q,X+(size_t)n*C,R,C);
         for (int r=0;r<R;r++){
             float a=Y[(size_t)n*R+r], b=yq[r];
             if (fabsf(a-b) > 1e-4f*(1+fabsf(b))) {
                 fprintf(stderr,"i8blk matmat tok %d row %d: %.6g vs %.6g\n",n,r,a,b);
+                free(q.q);free(q.s); return 1; }
+            if (fabsf(YdualA[(size_t)n*R+r]-b) > 1e-4f*(1+fabsf(b)) ||
+                fabsf(YdualB[(size_t)n*R+r]-b) > 1e-4f*(1+fabsf(b))) {
+                fprintf(stderr,"i8blk dual matmat tok %d row %d: %.6g vs %.6g\n",
+                        n,r,YdualA[(size_t)n*R+r],b);
                 free(q.q);free(q.s); return 1; }
         }
     }
@@ -384,6 +435,13 @@ static void *qalloc(size_t n) {
                     laguna_hsize(laguna_mem_available(),b3,sizeof b3));
             exit(1);
         }
+#ifdef MADV_HUGEPAGE
+        /* The prefill matmats stream these contiguous arenas repeatedly.  Ask
+         * Linux to back them with transparent huge pages so the 4 GB int8
+         * shared/dense weights do not spend the hot loop walking 4 KB TLB
+         * entries.  Failure is advisory and must not affect correctness. */
+        (void)madvise(p, want, MADV_HUGEPAGE);
+#endif
         g_qcur = p; g_qleft = want; g_mem_weights += want;
     }
     void *r = g_qcur; g_qcur += n; g_qleft -= n; return r;
@@ -640,7 +698,9 @@ typedef struct {
     float *sh_a, *sh_b;    /* [SHARED_INTER] shared-expert gate/up, computed early */
 } laguna_scratch;
 
+#ifndef LAGUNA_PCHUNK
 #define LAGUNA_PCHUNK 256
+#endif
 /* attention_slide_flash writes a whole chunk's K/V before any of the chunk's
  * queries attend, so the sliding ring must hold the window plus the chunk. */
 _Static_assert(LAGUNA_SLIDING_CAP >= LAGUNA_SLIDING_WINDOW + LAGUNA_PCHUNK - 1,
@@ -1294,8 +1354,15 @@ typedef struct {
 /* Batched SwiGLU over C tokens (token-major).  out[C][hidden]. */
 static void swiglu_lin_batch(laguna_scratch *sc, const laguna_lin *gate_w, const laguna_lin *up_w,
                              const laguna_lin *down_w, const float *X, float *out, int inter, int C) {
+#if defined(LAGUNA_BF16)
     laguna_lin_mm(sc->cia, gate_w, X, inter, LAGUNA_HIDDEN, C);
     laguna_lin_mm(sc->cib, up_w,   X, inter, LAGUNA_HIDDEN, C);
+#else
+    /* Gate and up read the same token block.  The int8 production weights can
+     * compute both outputs in one sweep, avoiding a second X read and matmul
+     * launch; the BF16 reference keeps its simpler independent path. */
+    laguna_matmat_i8_dual(sc->cia, sc->cib, gate_w, up_w, X, inter, LAGUNA_HIDDEN, C);
+#endif
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
@@ -1308,7 +1375,7 @@ static double vnorm(const float*v,int n){ double s=0; for(int i=0;i<n;i++)s+=(do
 /* lightweight phase profiling (enabled by the bench) */
 
 /* chunked-prefill phase timers (rank-0, seconds) */
-double g_c_qkv=0, g_c_attn=0, g_c_op=0, g_c_router=0, g_c_expert=0, g_c_shared=0, g_c_ar=0;
+double g_c_qkv=0, g_c_attn=0, g_c_op=0, g_c_router=0, g_c_expert=0, g_c_shared=0, g_c_ar=0, g_c_shared_mm=0;
 
 static void forward_token(const laguna_model *m, laguna_scratch *sc, float *x, int seq, int pos,
                           laguna_async_ar *aar, int compute_logits) {
@@ -1401,10 +1468,17 @@ static void laguna_mlp_chunk(const laguna_model *m, laguna_scratch *sc, float *X
         /* route all C tokens: one batched router GEMM (was C matvecs, i.e. C
          * OpenMP fork/joins per MoE layer), then top-10 per token. */
         laguna_lin_mm(sc->crouter, &ly->router_w, sc->cn2, LAGUNA_EXPERTS, H, C);
+#ifdef _OPENMP
+        /* Each token has an independent, deterministic top-10 selection.  Keep
+         * the expert scan and sigmoid arithmetic unchanged, but distribute the
+         * chunk's selections so routing does not serialize the prefill. */
+        #pragma omp parallel for if(C >= 8) schedule(static)
+#endif
         for (int c=0;c<C;++c)
             laguna_top10(sc->crouter+(size_t)c*LAGUNA_EXPERTS, ly->router_bias,
                          sc->rids+(size_t)c*LAGUNA_ACTIVE, sc->rrw+(size_t)c*LAGUNA_ACTIVE);
         double _te=prof_now();
+        g_c_router+=_te-_t;
 #if defined(LAGUNA_FP8)
         /* BATCHED experts: for each owned expert, gather its tokens and run one
          * (dequant-once) fp8 GEMM -> the fp8 gather is amortized across tokens. */
@@ -1422,8 +1496,8 @@ static void laguna_mlp_chunk(const laguna_model *m, laguna_scratch *sc, float *X
                 for (long i=0;i<(long)ne*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
                 laguna_matmat_fp8blk(sc->ye, ex->down, ex->ds, sc->cia, H, inter, ne);
             } else {
-                laguna_matmat_i8blk(sc->cia, &ex->qg, sc->xe, inter, H, ne);
-                laguna_matmat_i8blk(sc->cib, &ex->qu, sc->xe, inter, H, ne);
+                laguna_matmat_i8blk_dual(sc->cia, sc->cib, &ex->qg, &ex->qu,
+                                          sc->xe, inter, H, ne);
                 for (long i=0;i<(long)ne*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
                 laguna_matmat_i8blk(sc->ye, &ex->qd, sc->cia, H, inter, ne);
             }
@@ -1431,22 +1505,42 @@ static void laguna_mlp_chunk(const laguna_model *m, laguna_scratch *sc, float *X
                 for (int d=0;d<H;++d) pc[d]+=w*ye[d]; }
         }
 #else
-        for (int c=0;c<C;++c) {
-            const float *n2=sc->cn2+(size_t)c*H; float *pc=sc->cpart+(size_t)c*H;
-            const int *id=sc->rids+(size_t)c*LAGUNA_ACTIVE; const float *rw=sc->rrw+(size_t)c*LAGUNA_ACTIVE;
-            for (int k=0;k<LAGUNA_ACTIVE;++k) {
-                const laguna_expert *ex=&ly->experts[id[k]]; if(!ex->present) continue;
-                expert_mv(sc, ex, n2, sc->attn_out);
-                for (int i=0;i<H;++i) pc[i]+=rw[k]*sc->attn_out[i];
+        int tok[LAGUNA_PCHUNK]; float wgt[LAGUNA_PCHUNK];
+        for (int e=m->ep_rank; e<LAGUNA_EXPERTS; e+=m->ep_size) {
+            const laguna_expert *ex=&ly->experts[e]; if(!ex->present) continue;
+            int ne=0;
+            for (int c=0;c<C;++c) {
+                const int *id=sc->rids+(size_t)c*LAGUNA_ACTIVE;
+                for (int k=0;k<LAGUNA_ACTIVE;++k) if(id[k]==e) {
+                    tok[ne]=c; wgt[ne]=sc->rrw[(size_t)c*LAGUNA_ACTIVE+k]; ne++; break;
+                }
+            }
+            if(ne==0) continue;
+            for (int i=0;i<ne;++i)
+                memcpy(sc->xe+(size_t)i*H, sc->cn2+(size_t)tok[i]*H, (size_t)H*sizeof(float));
+            laguna_matmat_i4g32_dual(sc->cia, sc->cib, ex->gp, ex->gs, ex->up, ex->us,
+                                     sc->xe, LAGUNA_EXPERT_INTER, H, ne);
+            for (long i=0;i<(long)ne*LAGUNA_EXPERT_INTER;++i)
+                sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
+            laguna_matmat_i4g32(sc->ye, ex->dp, ex->ds, sc->cia, H, LAGUNA_EXPERT_INTER, ne);
+            for (int i=0;i<ne;++i) {
+                float *pc=sc->cpart+(size_t)tok[i]*H; const float *ye=sc->ye+(size_t)i*H;
+                float w=wgt[i];
+                for (int d=0;d<H;++d) pc[d]+=w*ye[d];
             }
         }
 #endif
-        g_c_expert+=prof_now()-_te;
-        g_c_router+=prof_now()-_t; _t=prof_now();
+        double _ts=prof_now();
+        g_c_expert+=_ts-_te;
+        _t=_ts;
+        double _ta=prof_now();
         if (aar && aar->launch) aar->launch(aar->ctx, sc->cpart, C*H);   /* one AR for C tokens */
+        g_c_ar+=prof_now()-_ta;
+        double _tm=prof_now();
         swiglu_lin_batch(sc, &ly->shared_gate, &ly->shared_up, &ly->shared_down, sc->cn2, sc->cshared, LAGUNA_SHARED_INTER, C);
         if (aar && aar->join) aar->join(aar->ctx);
         for (long i=0;i<(long)C*H;++i) X[i]+=sc->cshared[i]+LAGUNA_ROUTED_SCALE*sc->cpart[i];
+        g_c_shared_mm+=prof_now()-_tm;
         g_c_shared+=prof_now()-_t;
     }
 }
@@ -1663,7 +1757,7 @@ static void usage(const char *n){
 
 int main(int argc, char **argv) {
     if (argc==2 && !strcmp(argv[1],"--self-test")) {
-        int rc=test_i4()|test_fht()|test_route()|test_kv_codec()|test_i4_matvec()|test_i8_matmat()|test_prompt_cache();
+        int rc=test_i4()|test_fht()|test_route()|test_kv_codec()|test_i4_matvec()|test_i4_matmat()|test_i8_matmat()|test_prompt_cache();
 #if defined(LAGUNA_FP8)
         rc|=test_fp8_i8blk();
 #endif

@@ -148,7 +148,7 @@ static int run_ar_probe(int argc, char **argv){
         if(!strcmp(argv[i],"--reps")&&i+1<argc) reps=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--count")&&i+1<argc) count=atoi(argv[++i]);
     }
-    if(count>LAGUNA_HIDDEN) count=LAGUNA_HIDDEN;
+    if(count>LAGUNA_PCHUNK*LAGUNA_HIDDEN) count=LAGUNA_PCHUNK*LAGUNA_HIDDEN;
     tofu_bootstrap();
     float *buf=malloc((size_t)count*sizeof(float));
     for(int i=0;i<count;i++) buf[i]=0.001f*i;
@@ -485,9 +485,13 @@ static int run_generate(int argc, char **argv){
         int computed=n_prompt-(pcp?pcp->n_tokens:0);
         logmsg("prefill %d tok (%d cached) in %.2fs (%.1f computed tok/s); argmax first token = %d nan=%d\n",
                n_prompt,pcp?pcp->n_tokens:0,pf1-pf0,computed/(pf1-pf0),a,total_nan);
-        extern double g_c_qkv,g_c_attn,g_c_op,g_c_router,g_c_expert,g_c_shared;
-        logmsg("  chunk phases (s): qkv=%.1f attn=%.1f o_proj+rms=%.1f router=%.1f (expert=%.1f) shared/mlp=%.1f\n",
-               g_c_qkv,g_c_attn,g_c_op,g_c_router-g_c_expert,g_c_expert,g_c_shared);
+        extern double g_c_qkv,g_c_attn,g_c_op,g_c_router,g_c_expert,g_c_shared,g_c_ar,g_c_shared_mm;
+        logmsg("  chunk phases (s): qkv=%.1f attn=%.1f o_proj+rms=%.1f router=%.1f expert=%.1f shared/mlp=%.1f (ar=%.1f mm=%.1f)\n",
+               g_c_qkv,g_c_attn,g_c_op,g_c_router,g_c_expert,g_c_shared,g_c_ar,g_c_shared_mm);
+    } else {
+        extern double g_c_expert,g_c_shared,g_c_ar;
+        logmsg("rank %d chunk timings: expert=%.1f shared=%.1f ar=%.1f\n",
+               MyRank,g_c_expert,g_c_shared,g_c_ar);
     }
     /* decode loop */
     g_ar_secs=0; g_ar_calls=0;   /* measure decode-only comm */
