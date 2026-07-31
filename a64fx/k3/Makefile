@@ -2,12 +2,17 @@ CC = fcc
 CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -I../../common
 WARN = -Wall -Wextra -Wpedantic -Wno-unused-function
 
-.PHONY: all runner test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
+.PHONY: all runner full-runner test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
 all: k3_kernel_test k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe
 
 runner: k3_ep_runner
 
+full-runner: k3_full_runner
+
 k3_ep_runner: k3_ep_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
+	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -ltofucom -o $@
+
+k3_full_runner: k3_full_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -ltofucom -o $@
 
 k3_kernel_test: k3_kernel_test.c k3_kernels.h
@@ -57,4 +62,4 @@ validate:
 	PYTHONDONTWRITEBYTECODE=1 python3 k3_stage.py --validate-all
 
 clean:
-	rm -f k3_kernel_test k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner
+	rm -f k3_kernel_test k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner k3_full_runner

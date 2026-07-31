@@ -15,6 +15,8 @@ THREADS=48
 KDA_THREADS=8
 FUSED_THREADS=0
 LAYER=1
+CACHE_LOAD=
+CACHE_SAVE=
 EXPERTS=0-15
 CHUNK_MIB=8
 MODEL_DIR="$HOME/models/kimi-k3"
@@ -41,6 +43,7 @@ usage() {
 usage: $0 [--mode dummy|real] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]
           [--threads N] [--kda-threads N] [--fused-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
+          [--cache-load PATH] [--cache-save PATH]
           [--profile] [--reuse-stage] [--stage-only] [--no-fused-team]
           [--mla-cache-bf16|--mla-cache-fp32]
           [--heartbeat-tokens N]
@@ -66,6 +69,8 @@ while (( $# )); do
         --kda-threads) need_value "$@"; KDA_THREADS=$2; shift 2;;
         --fused-threads) need_value "$@"; FUSED_THREADS=$2; shift 2;;
         --layer) need_value "$@"; LAYER=$2; shift 2;;
+        --cache-load) need_value "$@"; CACHE_LOAD=$2; shift 2;;
+        --cache-save) need_value "$@"; CACHE_SAVE=$2; shift 2;;
         --experts) need_value "$@"; EXPERTS=$2; shift 2;;
         --chunk-mib) need_value "$@"; CHUNK_MIB=$2; shift 2;;
         --model-dir) need_value "$@"; MODEL_DIR=$2; shift 2;;
@@ -117,6 +122,20 @@ fi
 if (( PREFETCH_MIB > 0 && THREADS > 47 )); then
     echo "$0: --prefetch-mib requires --threads <=47" >&2
     exit 2
+fi
+if (( NODES > 1 )); then
+    if [[ "$CACHE_SAVE" == /tmp/* ]]; then
+        echo "$0: warning: --cache-save path is under /tmp ($CACHE_SAVE). On multi-rank jobs, /tmp appears to be node-local in this environment and may only retain rank-local cache shards." >&2
+    fi
+    if [[ "$CACHE_LOAD" == /tmp/* ]]; then
+        echo "$0: warning: --cache-load path is under /tmp ($CACHE_LOAD). On multi-rank jobs, /tmp appears to be node-local in this environment and may only contain rank-local cache shards." >&2
+    fi
+    if [[ "$CACHE_SAVE" == /local/* ]]; then
+        echo "$0: warning: --cache-save path is under /local ($CACHE_SAVE). On multi-rank jobs, /local is node-local and cache shards will not be reliably shared across ranks." >&2
+    fi
+    if [[ "$CACHE_LOAD" == /local/* ]]; then
+        echo "$0: warning: --cache-load path is under /local ($CACHE_LOAD). On multi-rank jobs, /local is node-local and cache shards will not be reliably shared across ranks." >&2
+    fi
 fi
 if [[ -n "${PJM_MPI_PROC:-}" && "$NODES" -ne "$PJM_MPI_PROC" ]]; then
     echo "$0: --nodes $NODES differs from allocation process count $PJM_MPI_PROC" >&2
@@ -243,6 +262,8 @@ if (( MLA_CACHE_BF16 )); then
 else
     RUNNER_EXTRA+=(--mla-cache-fp32)
 fi
+(( ${#CACHE_LOAD} > 0 )) && RUNNER_EXTRA+=(--cache-load "$CACHE_LOAD")
+(( ${#CACHE_SAVE} > 0 )) && RUNNER_EXTRA+=(--cache-save "$CACHE_SAVE")
 timing_begin decode_runner
 mpiexec -np "$NODES" -of-proc "$RUN_OUTPUT_PREFIX" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \

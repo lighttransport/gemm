@@ -38,6 +38,29 @@
 #define K3_CONTROL_NUMERIC (K3_MOE_REDUCE_FLOATS+1)
 #define K3_RUN_PREFETCH_THREADS 32
 
+#define K3_CACHE_VERSION 1
+typedef struct __attribute__((packed)) {
+    char magic[8];
+    uint32_t version;
+    uint32_t header_bytes;
+    uint32_t layer;
+    uint32_t layers;
+    uint32_t local_heads;
+    uint32_t kda_layers;
+    uint32_t mla_layers;
+    uint32_t cache_tokens;
+    uint32_t cache_bf16;
+    uint64_t kda_elems;
+    uint64_t mla_key_elems;
+    uint64_t mla_value_elems;
+    uint32_t payload_crc;
+    uint32_t saved_tokens;
+    uint32_t world_rank;
+    uint32_t world_nodes;
+} k3_cache_header;
+
+static const char k3_cache_magic[8] = {'K','3','C','A','C','H','E','1'};
+
 typedef enum { K3_MODE_DUMMY, K3_MODE_REAL } k3_mode;
 typedef struct {
     int nodes;
@@ -61,6 +84,8 @@ typedef struct {
     int prefetch_mib;
     int prefetch_threads;
     k3_mode mode;
+    const char *cache_load;
+    const char *cache_save;
     const char *stage_dir;
     const char *status_dir;
     const char *topo_path;
@@ -93,7 +118,8 @@ static void usage(const char *p){
     fprintf(stderr,
         "usage: %s [--mode dummy|real] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]\n"
         "          [--threads N] [--layer N] [--stage-dir DIR]\n"
-        "          [--status-dir DIR] [--topo FILE] [--profile] [--kda-threads N]\n"
+        "          [--status-dir DIR] [--cache-load PATH] [--cache-save PATH]\n"
+        "          [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
         "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
         "          [--min-available-mib N]\n"
@@ -113,8 +139,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
     *o=(k3_options){.nodes=96,.layers=1,.tokens=2,.threads=48,.layer=1,
         .mla_cache_bf16=1,.heartbeat_tokens=1024,.min_available_mib=2048,
         .ar_groups=-1,.comm_robust=2,.comm_poll_spins=4,
-        .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.stage_dir="/local/k3-runner",
-        .status_dir=".",.topo_path="tofu_topo.txt"};
+        .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.cache_load=NULL,.cache_save=NULL,
+        .stage_dir="/local/k3-runner",.status_dir=".",.topo_path="tofu_topo.txt"};
     for(int i=1;i<argc;++i){const char *a=argv[i];
 #define VALUE() do{if(++i>=argc){fprintf(stderr,"k3_ep_runner: missing value for %s\n",a);usage(argv[0]);return-1;}}while(0)
         if(!strcmp(a,"--mode")){VALUE();if(!strcmp(argv[i],"dummy"))o->mode=K3_MODE_DUMMY;
@@ -143,6 +169,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
         else if(!strcmp(a,"--stage-dir")){VALUE();o->stage_dir=argv[i];}
         else if(!strcmp(a,"--status-dir")){VALUE();o->status_dir=argv[i];}
+        else if(!strcmp(a,"--cache-load")){VALUE();o->cache_load=argv[i];}
+        else if(!strcmp(a,"--cache-save")){VALUE();o->cache_save=argv[i];}
         else if(!strcmp(a,"--topo")){VALUE();o->topo_path=argv[i];}
         else if(!strcmp(a,"--profile")){o->profile=1;}
         else if(!strcmp(a,"-h")||!strcmp(a,"--help")){usage(argv[0]);return 1;}
@@ -295,6 +323,174 @@ static uint32_t crc32_bytes(const uint8_t *data,size_t size){
     if(!initialized){for(unsigned i=0;i<256;++i){uint32_t c=i;for(int b=0;b<8;++b)c=(c>>1)^((c&1)?UINT32_C(0xedb88320):0);table[i]=c;}initialized=1;}
     uint32_t crc=UINT32_MAX;for(size_t i=0;i<size;++i)crc=(crc>>8)^table[(crc^data[i])&255];return crc^UINT32_MAX;
 }
+static uint32_t crc32_init(void){
+    return UINT32_MAX;
+}
+static uint32_t crc32_update(uint32_t crc,const uint8_t *data,size_t size){
+    static uint32_t table[256];static int initialized;
+    if(!initialized){for(unsigned i=0;i<256;++i){uint32_t c=i;for(int b=0;b<8;++b)c=(c>>1)^((c&1)?UINT32_C(0xedb88320):0);table[i]=c;}initialized=1;}
+    for(size_t i=0;i<size;++i)crc=(crc>>8)^table[(crc^data[i])&255];
+    return crc;
+}
+static uint32_t crc32_finalize(uint32_t crc){
+    return crc^UINT32_MAX;
+}
+static int k3_read_all(FILE *f,void *dst,size_t n){
+    uint8_t *p=(uint8_t*)dst;
+    while(n){
+        size_t nread=fread(p,1,n,f);
+        if(nread==0){
+            if(ferror(f))return errno?errno:EIO;
+            return EOF;
+        }
+        p+=nread;n-=nread;
+    }
+    return 0;
+}
+static int k3_write_all(FILE *f,const void *src,size_t n){
+    const uint8_t *p=(const uint8_t*)src;
+    while(n){
+        size_t nw=fwrite(p,1,n,f);
+        if(nw==0)return errno?errno:EIO;
+        p+=nw;n-=nw;
+    }
+    return 0;
+}
+static int k3_make_cache_path(const k3_options *o,char *out,size_t out_cap,const char *base){
+    if(!base||!*base){errno=EINVAL;return -1;}
+    if((size_t)snprintf(out,out_cap,"%s/k3_ep_cache_l%03d_%03d_n%03d_t%03d_g%03d_r%03d.bin",
+            base,o->layer,o->layers,g_world_nodes,o->threads,g_group,g_world_rank)<out_cap) return 0;
+    return -1;
+}
+static int k3_cache_ensure_dir(const char *path){
+    if(!path||!*path)return -1;
+    struct stat st;
+    if(!stat(path,&st)){
+        if(S_ISDIR(st.st_mode))return 0;
+        errno=ENOTDIR;return -1;
+    }
+    if(errno!=ENOENT)return errno?errno:EIO;
+    if(mkdir(path,0755)==-1&&errno!=EEXIST)return errno?errno:EIO;
+    return 0;
+}
+static int k3_cache_load(const k3_options *o,int local_heads,int cache_tokens,size_t kda_elems,
+    size_t mla_key_elems,size_t mla_value_elems,int cache_element_bytes,int *tokens_out,
+    float *latent,float *kda_state,void *mla_keys,void *mla_values){
+    if(!o||!o->cache_load||!latent||(kda_elems&&!kda_state)||(mla_key_elems&&!mla_keys)||(mla_value_elems&&!mla_values))
+        return EINVAL;
+    char base_path[1024];int rc=k3_make_cache_path(o,base_path,sizeof base_path,o->cache_load);
+    if(rc) return errno?errno:EINVAL;
+    FILE *f=fopen(base_path,"rb");if(!f)return errno?errno:EIO;
+    k3_cache_header h;
+    rc=k3_read_all(f,&h,sizeof h);
+    if(!rc&&h.header_bytes>sizeof h)rc=EINVAL;
+    if(!rc&&memcmp(h.magic,k3_cache_magic,sizeof h.magic)!=0)rc=EINVAL;
+    if(!rc&&h.version!=K3_CACHE_VERSION)rc=EINVAL;
+    if(!rc&&h.layer!= (uint32_t)o->layer)rc=EINVAL;
+    if(!rc&&h.layers!=(uint32_t)o->layers)rc=EINVAL;
+    if(!rc&&h.local_heads!=(uint32_t)local_heads)rc=EINVAL;
+    uint32_t file_cache_tokens=h.cache_tokens?(uint32_t)h.cache_tokens:(uint32_t)cache_tokens;
+    size_t file_mla_key_elems=0,file_mla_value_elems=0,file_mla_layers=0;
+    if(!rc&&cache_tokens>0&&file_cache_tokens>(uint32_t)cache_tokens)rc=EINVAL;
+    if(!rc&&h.cache_bf16!=(uint32_t)o->mla_cache_bf16)rc=EINVAL;
+    if(!rc&&h.kda_elems!=kda_elems)rc=EINVAL;
+    /* A serialized prefix may have a smaller cache capacity than the new
+     * destination.  Validate its compact layout, then expand each head's
+     * token stride while restoring it below. */
+    if(!rc){
+        size_t key_unit=(size_t)file_cache_tokens*(size_t)local_heads*192;
+        size_t value_unit=(size_t)file_cache_tokens*(size_t)local_heads*K3_HEAD_DIM;
+        if(!key_unit||!value_unit||h.mla_key_elems%key_unit||h.mla_value_elems%value_unit)
+            rc=EINVAL;
+        else{
+            file_mla_key_elems=(size_t)h.mla_key_elems;
+            file_mla_value_elems=(size_t)h.mla_value_elems;
+            file_mla_layers=file_mla_key_elems/key_unit;
+            if(file_mla_value_elems/value_unit!=file_mla_layers||
+                    file_mla_value_elems!=file_mla_layers*value_unit||
+                    mla_key_elems!=file_mla_layers*(size_t)cache_tokens*(size_t)local_heads*192||
+                    mla_value_elems!=file_mla_layers*(size_t)cache_tokens*(size_t)local_heads*K3_HEAD_DIM)
+                rc=EINVAL;
+        }
+    }
+    if(!rc&&h.world_nodes!=(uint32_t)g_world_nodes)rc=EINVAL;
+    if(!rc&&h.world_rank!=(uint32_t)g_world_rank)rc=EINVAL;
+    if(!rc&&h.saved_tokens>(uint32_t)cache_tokens)rc=EINVAL;
+    if(!rc&&fseek(f,(long)h.header_bytes,SEEK_SET))rc=errno?errno:EIO;
+    void *file_mla_keys=file_mla_key_elems?malloc(file_mla_key_elems*(size_t)cache_element_bytes):NULL;
+    void *file_mla_values=file_mla_value_elems?malloc(file_mla_value_elems*(size_t)cache_element_bytes):NULL;
+    if(!rc&&((file_mla_key_elems&&!file_mla_keys)||(file_mla_value_elems&&!file_mla_values)))rc=ENOMEM;
+    uint32_t payload_crc=crc32_init();
+    if(!rc)rc=k3_read_all(f,latent,K3_LATENT*sizeof(float)),payload_crc=crc32_update(payload_crc,(uint8_t*)latent,K3_LATENT*sizeof(float));
+    if(!rc&&kda_elems)rc=k3_read_all(f,kda_state,kda_elems*sizeof(float)),payload_crc=crc32_update(payload_crc,(uint8_t*)kda_state,kda_elems*sizeof(float));
+    if(!rc&&file_mla_key_elems)rc=k3_read_all(f,file_mla_keys,file_mla_key_elems*cache_element_bytes),payload_crc=crc32_update(payload_crc,(uint8_t*)file_mla_keys,file_mla_key_elems*cache_element_bytes);
+    if(!rc&&file_mla_value_elems)rc=k3_read_all(f,file_mla_values,file_mla_value_elems*cache_element_bytes),payload_crc=crc32_update(payload_crc,(uint8_t*)file_mla_values,file_mla_value_elems*cache_element_bytes);
+    if(!rc&&crc32_finalize(payload_crc)!=h.payload_crc)rc=EIO;
+    if(!rc&&file_mla_layers&&file_cache_tokens!=(uint32_t)cache_tokens){
+        size_t src_head_stride=(size_t)file_cache_tokens;
+        size_t dst_head_stride=(size_t)cache_tokens;
+        size_t key_bytes=192*(size_t)cache_element_bytes,value_bytes=K3_HEAD_DIM*(size_t)cache_element_bytes;
+        for(size_t layer=0;layer<file_mla_layers;++layer)for(int head=0;head<local_heads;++head){
+            const uint8_t *src_k=(const uint8_t*)file_mla_keys+(layer*(size_t)local_heads+(size_t)head)*src_head_stride*key_bytes;
+            uint8_t *dst_k=(uint8_t*)mla_keys+(layer*(size_t)local_heads+(size_t)head)*dst_head_stride*key_bytes;
+            const uint8_t *src_v=(const uint8_t*)file_mla_values+(layer*(size_t)local_heads+(size_t)head)*src_head_stride*value_bytes;
+            uint8_t *dst_v=(uint8_t*)mla_values+(layer*(size_t)local_heads+(size_t)head)*dst_head_stride*value_bytes;
+            memcpy(dst_k,src_k,src_head_stride*key_bytes);memcpy(dst_v,src_v,src_head_stride*value_bytes);
+        }
+    }else if(!rc){
+        if(file_mla_key_elems)memcpy(mla_keys,file_mla_keys,file_mla_key_elems*(size_t)cache_element_bytes);
+        if(file_mla_value_elems)memcpy(mla_values,file_mla_values,file_mla_value_elems*(size_t)cache_element_bytes);
+    }
+    free(file_mla_keys);free(file_mla_values);
+    if(!rc&&tokens_out)*tokens_out=(int)h.saved_tokens;
+    if(fclose(f))rc=rc?rc:EIO;
+    /* Keep a rejected/corrupt artifact for diagnosis and a possible retry.
+     * Saves are published atomically through rename(), so load failure does
+     * not need destructive cleanup here. */
+    return rc;
+}
+
+static const char *k3_cache_load_reason(int rc){
+    if(rc==EINVAL)return "cache-incompatible";
+    if(rc==ENOENT)return "cache-missing";
+    if(rc==EOF||rc==EIO||rc==EPIPE)return "cache-corrupt";
+    return "cache-io";
+}
+static int k3_cache_save(const k3_options *o,int local_heads,int cache_tokens,size_t kda_elems,
+    size_t mla_key_elems,size_t mla_value_elems,int cache_element_bytes,int saved_tokens,
+    float *latent,float *kda_state,void *mla_keys,void *mla_values){
+    if(!o||!o->cache_save||!latent||(kda_elems&&!kda_state)||(mla_key_elems&&!mla_keys)||(mla_value_elems&&!mla_values))
+        return EINVAL;
+    if(saved_tokens<0||saved_tokens>cache_tokens) return EINVAL;
+    int rc=k3_cache_ensure_dir(o->cache_save);
+    if(rc)return rc;
+    char path[1024],tmp[1088],tmp_final[1024];
+    rc=k3_make_cache_path(o,path,sizeof path,o->cache_save);
+    if(rc) return errno?errno:EINVAL;
+    if((size_t)snprintf(tmp,sizeof tmp,"%s.tmp.%ld",path,(long)getpid())>=sizeof tmp)return EINVAL;
+    if((size_t)snprintf(tmp_final,sizeof tmp_final,"%s",path)>=sizeof tmp_final)return EINVAL;
+    k3_cache_header h={.magic={'K','3','C','A','C','H','E','1'},.version=K3_CACHE_VERSION,.header_bytes=sizeof(k3_cache_header),
+        .layer=(uint32_t)o->layer,.layers=(uint32_t)o->layers,.local_heads=(uint32_t)local_heads,
+        .kda_layers=0,.mla_layers=0,.cache_tokens=(uint32_t)cache_tokens,.cache_bf16=(uint32_t)o->mla_cache_bf16,
+        .kda_elems=kda_elems,.mla_key_elems=mla_key_elems,.mla_value_elems=mla_value_elems,.payload_crc=0,
+        .saved_tokens=(uint32_t)(saved_tokens<0?0:saved_tokens),
+        .world_rank=(uint32_t)g_world_rank,.world_nodes=(uint32_t)g_world_nodes};
+    FILE *f=fopen(tmp,"wb");if(!f)return errno?errno:EIO;
+    rc=k3_write_all(f,&h,sizeof h);
+    uint32_t payload_crc=crc32_init();
+    if(!rc)rc=k3_write_all(f,latent,K3_LATENT*sizeof(float)),payload_crc=crc32_update(payload_crc,(uint8_t*)latent,K3_LATENT*sizeof(float));
+    if(!rc&&kda_elems)rc=k3_write_all(f,kda_state,kda_elems*sizeof(float)),payload_crc=crc32_update(payload_crc,(uint8_t*)kda_state,kda_elems*sizeof(float));
+    if(!rc&&mla_key_elems)rc=k3_write_all(f,mla_keys,mla_key_elems*cache_element_bytes),payload_crc=crc32_update(payload_crc,(uint8_t*)mla_keys,mla_key_elems*cache_element_bytes);
+    if(!rc&&mla_value_elems)rc=k3_write_all(f,mla_values,mla_value_elems*cache_element_bytes),payload_crc=crc32_update(payload_crc,(uint8_t*)mla_values,mla_value_elems*cache_element_bytes);
+    h.payload_crc=crc32_finalize(payload_crc);
+    if(!rc)rc=fseeko(f,0,SEEK_SET)?(errno?errno:EIO):0;
+    if(!rc)rc=k3_write_all(f,&h,sizeof h);
+    if(!rc&&fflush(f))rc=errno?errno:EIO;
+    if(!rc&&fsync(fileno(f))!=0)rc=errno?errno:EIO;
+    if(fclose(f))rc=rc?rc:EIO;
+    if(rc||rename(tmp,tmp_final)!=0){if(!rc&&errno)rc=errno;unlink(tmp);return rc?rc:EIO;}
+    return 0;
+}
 static k3_entry *find_entry(k3_entry *entries,int n,const char *suffix){
     size_t sl=strlen(suffix);for(int i=0;i<n;++i){size_t nl=strlen(entries[i].name);
         if(nl>=sl&&!strcmp(entries[i].name+nl-sl,suffix))return&entries[i];}return NULL;
@@ -409,15 +605,15 @@ static void synthetic_attention_prepare(float *shared,const float *latent,
         float *q,float *k,float *v,float *decay){
     size_t qstride=is_kda?K3_HEAD_DIM:192;
     memset(shared,0,K3_HIDDEN*sizeof(float));
-    for(int h=0;h<local_heads;++h){int gh=first_head+h;
+    for(int h=0;h<local_heads;++h){int gh=first_head+h;size_t qbase=is_kda?(size_t)h*K3_HEAD_DIM:(size_t)h*192;
         for(size_t d=0;d<qstride;++d){
             float base=latent[(gh*131+(int)d*17+global_layer*29+token*7)%K3_LATENT];
-            q[(size_t)h*192+d]=base+0.0001f*(float)(d+1);
-            k[(size_t)h*192+d]=base*0.75f-0.00007f*(float)(d+1);
+            q[qbase+d]=base+0.0001f*(float)(d+1);
+            k[qbase+d]=base*0.75f-0.00007f*(float)(d+1);
             if(d<K3_HEAD_DIM){v[(size_t)h*K3_HEAD_DIM+d]=latent[(gh*97+(int)d*11+token)%K3_LATENT]*0.5f;
                 decay[(size_t)h*K3_HEAD_DIM+d]=0.995f;}}
-        if(is_kda){k3_l2_normalize_sve(q+(size_t)h*192,K3_HEAD_DIM,1e-6f);
-            k3_l2_normalize_sve(k+(size_t)h*192,K3_HEAD_DIM,1e-6f);}}
+        if(is_kda){k3_l2_normalize_sve(q+qbase,K3_HEAD_DIM,1e-6f);
+            k3_l2_normalize_sve(k+qbase,K3_HEAD_DIM,1e-6f);}}
 }
 
 static void synthetic_attention_project(float *shared,const float *latent,
@@ -656,17 +852,79 @@ int main(int argc,char **argv){
     if(warm_threads!=opt.threads)fprintf(stderr,
         "k3_ep_runner rank %d: requested %d OpenMP workers but runtime created %d\n",
         g_rank,opt.threads,warm_threads);
-    for(int i=0;i<K3_LATENT;++i)
-        latent[i]=sinf((float)(i+1+g_group*104729)*0.001f)*0.125f;
-
+    if(!opt.cache_load){
+        for(int i=0;i<K3_LATENT;++i)
+            latent[i]=sinf((float)(i+1+g_group*104729)*0.001f)*0.125f;
+    }
+    int start_token=0;
+    float cache_running_max=0.0f;
+    if(opt.cache_load){
+        int cache_tokens=-1,cache_ready=1,cache_load_rc=0,cache_collective_ok=1;
+        cache_load_rc=k3_cache_load(&opt,local_heads,opt.tokens,kda_elems,mla_key_elems,mla_value_elems,cache_element_bytes,&cache_tokens,
+            latent,kda_state,mla_keys,mla_values);
+        if(cache_load_rc||cache_tokens<0||cache_tokens>opt.tokens)cache_ready=0;
+        /* Every rank must join this reduction, even when its local shard
+         * failed.  Otherwise healthy ranks can enter the token reduction
+         * while the failed rank exits, which is a collective deadlock. */
+        /* The reduction must carry a positive errno-like value.  Short
+         * reads return EOF (-1), and reducing raw errors with max would let
+         * healthy ranks' zero hide that failure and enter token collectives.
+         * Normalize negative read errors to EIO so every rank takes the same
+         * diagnostic path. */
+        int normalized_load_rc=cache_load_rc;
+        if(normalized_load_rc<0)normalized_load_rc=EIO;
+        float load_error=(float)normalized_load_rc;
+        if(runner_allreduce_max(&comm,&load_error,1)){
+            cache_collective_ok=0;
+            cache_ready=0;
+            cache_load_rc=EIO;
+        }else if((int)lrintf(load_error)!=0){
+            cache_load_rc=(int)lrintf(load_error);
+            cache_ready=0;
+        }
+        if(cache_ready){
+            float ready_sum=(float)cache_ready;
+            float token_sum=(float)cache_tokens,token_max=(float)cache_tokens;
+            if(runner_allreduce_sum(&comm,&ready_sum,1)||runner_allreduce_sum(&comm,&token_sum,1)||
+                    runner_allreduce_max(&comm,&token_max,1)||(int)lrintf(token_sum)!=(int)lrintf(token_max*(float)g_nodes)){
+                cache_collective_ok=0;
+                cache_ready=0;
+                cache_load_rc=EIO;
+            }
+            if(cache_ready&&(int)lrintf(ready_sum)!=g_nodes)cache_ready=0;
+        }
+        if(cache_ready){
+            for(size_t i=0;i<kda_elems;++i){float a=fabsf(kda_state[i]);if(a>cache_running_max)cache_running_max=a;}
+            if(opt.mla_cache_bf16){
+                uint16_t *keys=mla_keys,*values=mla_values;
+                for(size_t i=0;i<mla_key_elems;++i){float a=fabsf(k3_bf16_to_f32(keys[i]));if(a>cache_running_max)cache_running_max=a;}
+                for(size_t i=0;i<mla_value_elems;++i){float a=fabsf(k3_bf16_to_f32(values[i]));if(a>cache_running_max)cache_running_max=a;}
+            }else{
+                float *keys=mla_keys,*values=mla_values;
+                for(size_t i=0;i<mla_key_elems;++i){float a=fabsf(keys[i]);if(a>cache_running_max)cache_running_max=a;}
+                for(size_t i=0;i<mla_value_elems;++i){float a=fabsf(values[i]);if(a>cache_running_max)cache_running_max=a;}
+            }
+            start_token=cache_tokens;
+        }
+        if(!cache_ready){
+            const char *reason=cache_collective_ok?k3_cache_load_reason(cache_load_rc):"cache-collective";
+            if(g_rank==0)fprintf(stderr,"k3_ep_runner: cache load failed rc=%d reason=%s\n",
+                cache_load_rc,reason);
+            write_status(&opt,"load-failed",reason,0,-1,runner_comm_seq(&comm),0,0,pool.peak_active_bytes);
+            if(cache_collective_ok)runner_barrier();
+            runner_async_destroy(&async_reduce);runner_comm_free(&comm);
+            utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);
+            return cache_collective_ok?5:3;
+        }
+    }
     int debug_rank=-1,debug_token=-1,debug_layer=-1;
     if(opt.profile&&getenv("K3_DEBUG_NAN_RANK")){debug_rank=atoi(getenv("K3_DEBUG_NAN_RANK"));
         debug_token=getenv("K3_DEBUG_NAN_TOKEN")?atoi(getenv("K3_DEBUG_NAN_TOKEN")):-1;
         debug_layer=getenv("K3_DEBUG_NAN_LAYER")?atoi(getenv("K3_DEBUG_NAN_LAYER")):-1;}
     runner_barrier();double start=now_sec(),phase[6]={0},phase_max[6]={0};int finite=1,stopped=0,comm_failed=0;
-    int stop_numeric=0,stop_signal=0,stop_memory=0,tokens_completed=0,last_layer=-1;float cache_running_max=0.0f;
+    int stop_numeric=0,stop_signal=0,stop_memory=0,tokens_completed=0,last_layer=-1;
     uint64_t prefetch_sink=0;
-    for(int token=0;token<opt.tokens&&!stopped;++token){
+    for(int token=start_token;token<opt.tokens&&!stopped;++token){
         for(int layer=0;layer<opt.layers;++layer){int global_layer=opt.layer+layer;
             if(!finite||g_stop_signal){memset(reduce,0,K3_RUN_REDUCE_FLOATS*sizeof(float));
                 reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
@@ -751,6 +1009,12 @@ int main(int argc,char **argv){
     float health[7]={latent_max,state_max,cache_max,-(float)tokens_completed,-(float)last_layer,
         (float)(final_rss/1048576.0),(float)(final_hwm/1048576.0)};
     float checksum_local=(float)checksum,checksum_bounds[2]={checksum_local,-checksum_local};
+    int cache_save_rc=0;
+    if(opt.cache_save&&!comm_failed&&tokens_completed>0){
+        cache_save_rc=k3_cache_save(&opt,local_heads,opt.tokens,kda_elems,mla_key_elems,mla_value_elems,cache_element_bytes,
+            tokens_completed,latent,kda_state,mla_keys,mla_values);
+        if(cache_save_rc&&g_rank==0)fprintf(stderr,"k3_ep_runner rank %d: cache save failed: %s\n",g_rank,strerror(cache_save_rc));
+    }
     if(!comm_failed&&(runner_allreduce_max(&comm,health,7)||
             runner_allreduce_max(&comm,checksum_bounds,2))){
         fprintf(stderr,"k3_ep_runner rank %d: final health collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;}

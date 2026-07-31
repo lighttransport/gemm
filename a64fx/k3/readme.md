@@ -89,6 +89,30 @@ Validation gates are:
 
 Truncated generation is not expected to produce meaningful text; its purpose is loader, graph, collective, and numerical validation.
 
+## Interactive 12-node full-runner debug
+
+The C11 full runner has three explicit modes. `full96` remains strict: it requires
+96 MPI ranks and the complete rank-local image. `layer12` stages one checkpoint
+layer, including all six tensors for experts owned by `expert_id % 12`, and runs
+that real layer on the twelve physical ranks. `synthetic12` traverses all 93
+layers with deterministic shape-preserving operators and replaces one selected
+layer with its real staged image. Synthetic output is a structural/debug oracle,
+not a model-quality result.
+
+The direct interactive harness does not submit a job:
+
+```sh
+./run_k3_full_12n.sh --mode layer12 --layer-index 1 \
+  --prefill-tokens 32 --new-tokens 0 --prefill-chunk 1
+./run_k3_full_12n.sh --mode synthetic12 --layer-index 3 \
+  --prefill-tokens 32 --new-tokens 16 --prefill-chunk 8
+```
+
+Layer indices are checkpoint indices `0..92`; existing `run_k3_ep.sh` keeps its
+older one-based layer convention. Results are retained under
+`logs/full-debug-12n-$PJM_JOBID`, while rank-local images remain under
+`/local/$USER/k3-full-debug-12n-$PJM_JOBID`.
+
 ## Performance simulator
 
 `k3_sim.py` will be based on `a64fx/llm/ds4f_sim.py` and will derive model byte counts from the K3 manifest. It will model:
