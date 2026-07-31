@@ -56,6 +56,21 @@ def _extra(cfg):
     return out
 
 
+def _path(cfg, key):
+    if key not in cfg:
+        return None
+    v = cfg.get(key)
+    if v is None:
+        return None
+    try:
+        path = os.fspath(v)
+    except TypeError:
+        raise ConfigError("%s must be a string path (got %r)" % (key, v))
+    if not isinstance(path, str) or "\0" in path:
+        raise ConfigError("%s must be a NUL-free string path" % key)
+    return path
+
+
 def _env_overrides(cfg):
     env = cfg.get("env") or {}
     if not isinstance(env, dict):
@@ -75,6 +90,8 @@ class Adapter:
     variants = ()
     default_variant = None
     supports_serve = False
+    supports_cache = False
+    openai_models = ()
 
     def default_np(self):
         return int(os.environ.get("PJM_MPI_PROC", "12"))
@@ -161,7 +178,12 @@ class Adapter:
                 fn = getattr(self, mode)
             if fn.__func__ is not getattr(Adapter, mode, None):
                 modes.append(mode)
-        return {"modes": modes, "runner_contract": "llmgr.v1"}
+        return {"modes": modes, "supports_cache": self.supports_cache,
+                "openai_models": list(self.openai_models),
+                "runner_contract": "llmgr.v1"}
+
+    def cache_flags(self, action, path):
+        return []
 
 
 class LagunaAdapter(Adapter):
@@ -177,6 +199,7 @@ class LagunaAdapter(Adapter):
     variants = ("int4", "bf16", "fp8")
     default_variant = "int4"
     supports_serve = True
+    openai_models = ("laguna", "laguna-s21")
 
     LAUNCHER = os.path.join(LAGUNA_DIR, "run_laguna_s21_12n.sh")
 
@@ -502,6 +525,7 @@ class K3Adapter(Adapter):
     variants = ("partial",)
     default_variant = "partial"
     supports_serve = False
+    supports_cache = True
     LAUNCHER = os.path.join(K3_DIR, "run_k3_ep.sh")
 
     def _np(self, cfg):
@@ -558,6 +582,8 @@ class K3Adapter(Adapter):
             raise ConfigError("heartbeat_tokens must be in [0,1048576]")
         if min_available is None or not 0 <= min_available <= 1048576:
             raise ConfigError("min_available_mib must be in [0,1048576]")
+        cache_load = _path(cfg, "cache_load")
+        cache_save = _path(cfg, "cache_save")
         argv = ["--nodes", str(np_), "--tp-nodes", str(self._tp_np(cfg)),
                 "--layer", str(layer),
                 "--layers", str(layers), "--tokens", str(tokens),
@@ -565,9 +591,20 @@ class K3Adapter(Adapter):
                 "--heartbeat-tokens", str(heartbeat),
                 "--min-available-mib", str(min_available),
                 "--ar-groups", str(cfg.get("ar_groups", "auto"))]
+        if cache_load:
+            argv += ["--cache-load", str(cache_load)]
+        if cache_save:
+            argv += ["--cache-save", str(cache_save)]
         if cfg.get("profile", True):
             argv.append("--profile")
         return argv
+
+    def cache_flags(self, action, path):
+        if action == "load":
+            return ["--cache-load", str(path)]
+        if action == "save":
+            return ["--cache-save", str(path)]
+        return []
 
     def build(self, cfg):
         if cfg.get("clean"):
@@ -646,3 +683,14 @@ def describe():
         }
         for name, a in ADAPTERS.items()
     }
+
+
+def get_by_openai_model(model):
+    if model in (None, "", "laguna"):
+        model = "laguna-s21"
+    for a in ADAPTERS.values():
+        if model in a.openai_models:
+            return a
+    raise ConfigError("unknown OpenAI model %r (have: %s)"
+                      % (model, ", ".join(sorted(
+                          m for a in ADAPTERS.values() for m in a.openai_models))))

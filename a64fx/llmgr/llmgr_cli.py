@@ -185,6 +185,8 @@ def main(argv=None):
     r.add_argument("--result-dir")
     r.add_argument("--heartbeat-tokens", type=int)
     r.add_argument("--min-available-mib", type=int)
+    r.add_argument("--cache-load", help="K3: pass --cache-load PATH to the runner")
+    r.add_argument("--cache-save", help="K3: pass --cache-save PATH to the runner")
     r.add_argument("--prompt")
     r.add_argument("--ids", help="path to an ids file (generate mode)")
     r.add_argument("--prompt-ids", help="path to a prompt ids file (Gemma4)")
@@ -224,8 +226,12 @@ def main(argv=None):
     ch.add_argument("--model", default="laguna-s21")
     ch.add_argument("--max-new", type=int, default=256)
     ch.add_argument("--temperature", type=float, default=0.0)
+    ch.add_argument("--top-k", type=int)
     ch.add_argument("--top-p", type=float)
+    ch.add_argument("--min-p", type=float)
     ch.add_argument("--seed", type=int)
+    ch.add_argument("--cache-load", help="OpenAI request cache-load path hint")
+    ch.add_argument("--cache-save", help="OpenAI request cache-save path hint")
     ch.add_argument("--no-think", action="store_true")
     ch.add_argument("--stream", action="store_true")
 
@@ -252,9 +258,12 @@ def main(argv=None):
     ar.add_argument("id")
 
     kv = sub.add_parser("kv")
+    kv.add_argument("--model", default="laguna")
     kv.add_argument("action", choices=("save", "load", "clear", "stats"))
     kv.add_argument("--id")
     kv.add_argument("--path")
+    kv.add_argument("--np", type=int,
+                    help="expected K3 cache shard count for stats")
 
     sub.add_parser("shutdown")
 
@@ -302,6 +311,7 @@ def main(argv=None):
                              "pchunk", "ar_groups", "comm_robust",
                              "comm_poll_spins", "layers",
                              "np", "tp_np", "max_new", "tokens", "layer", "experts",
+                             "cache_load", "cache_save",
                              "stage_dir", "model_dir", "result_dir",
                              "heartbeat_tokens", "min_available_mib",
                              "prompt", "ids", "prompt_ids",
@@ -331,7 +341,7 @@ def main(argv=None):
                 "temperature": args.temperature,
                 "enable_thinking": not args.no_think,
                 "stream": args.stream}
-        body.update(opt("top_p", "seed"))
+        body.update(opt("top_k", "top_p", "min_p", "seed", "cache_load", "cache_save"))
         if args.stream:
             call(args, "POST", "/v1/chat/completions", body,
                  stream=True, timeout=None)
@@ -351,8 +361,14 @@ def main(argv=None):
     elif c == "artifacts":
         emit(call(args, "GET", "/profile/%s/artifacts" % args.id))
     elif c == "kv":
+        if args.action in ("load", "save") and not args.path:
+            sys.stderr.write("kv %s requires --path\n" % args.action)
+            return 1
+        if args.action == "clear":
+            args.path = None
         emit(call(args, "POST", "/kv",
-                  dict(action=args.action, **opt("id", "path"))))
+                  dict(model=args.model,
+                       action=args.action, **opt("id", "path", "np"))))
     elif c == "shutdown":
         emit(call(args, "POST", "/shutdown", {}))
     return 0

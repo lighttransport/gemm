@@ -32,6 +32,7 @@ Fugaku's private fabric where the port is reachable only through an ssh tunnel.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -46,6 +47,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -57,6 +59,7 @@ sys.path.insert(0, HERE)
 import bash_http_server as bhs   # noqa: E402  (path set above)
 import models                    # noqa: E402
 import laguna_openai             # noqa: E402
+import agentic                   # noqa: E402
 
 try:
     from http.server import ThreadingHTTPServer
@@ -84,23 +87,42 @@ _children = {}
 _children_lock = threading.Lock()
 _next_id = [0]
 _stop_evt = threading.Event()
+_contexts = agentic.ContextRegistry(
+    int(os.environ.get("LLMGR_MAX_CONTEXTS", "1024")))
+_managed_cache = agentic.ManagedCacheStore(
+    os.environ.get("LLMGR_CACHE_ROOT", os.path.join(STATE_DIR, "cache")),
+    int(os.environ.get("LLMGR_CACHE_TTL", str(7 * 24 * 3600))))
 
 
-def _ready_laguna():
+def _ready_serve(model):
     with _children_lock:
         ready = [c for c in _children.values()
                  if c.kind == "serve" and c.state == "ready" and
-                 c.meta.get("model") == "laguna"]
+                 c.meta.get("model") == model]
     return ready[0] if len(ready) == 1 else None
 
 
+def _resolve_adapter(model=None):
+    if model is None:
+        model = "laguna"
+    try:
+        return models.get_by_openai_model(model)
+    except models.ConfigError:
+        return models.get(model)
+
+
+def _ready_laguna():
+    return _ready_serve("laguna")
+
+
 class InferenceJob:
-    def __init__(self, jid, body, native, tokenizer, chat):
+    def __init__(self, jid, body, native, tokenizer, chat, context_id=None):
         self.id = jid
         self.body = body
         self.native = native
         self.tokenizer = tokenizer
         self.chat = chat
+        self.context_id = context_id
         self.events = queue.Queue()
         self.done = threading.Event()
         self.cancelled = threading.Event()
@@ -113,7 +135,7 @@ class InferenceJob:
     def info(self):
         return {"id": self.id, "state": self.state, "created": self.created,
                 "started": self.started, "cancelled": self.cancelled.is_set(),
-                "error": self.error}
+                "error": self.error, "context_id": self.context_id}
 
 
 class InferenceQueue:
@@ -126,11 +148,14 @@ class InferenceQueue:
         self.seq = 0
         threading.Thread(target=self._work, daemon=True).start()
 
-    def submit(self, body, chat=True, native=None, tokenizer=None):
+    def submit(self, body, chat=True, native=None, tokenizer=None,
+               context_id=None, model=""):
+        context = _contexts.get_or_create(context_id, model=model)
         with self.lock:
             self.seq += 1
             jid = "infer-%d" % self.seq
-            job = InferenceJob(jid, body, native, tokenizer, chat)
+            job = InferenceJob(jid, body, native, tokenizer, chat,
+                               context.context_id)
             self.jobs[jid] = job
         try:
             self.pending.put_nowait(job)
@@ -172,7 +197,11 @@ class InferenceQueue:
             if job.cancelled.is_set():
                 job.done.set(); self.pending.task_done(); continue
             try:
-                self._run(job)
+                context = _contexts.get(job.context_id)
+                if context is None:
+                    raise RuntimeError("inference context was deleted")
+                with context.reserve():
+                    self._run(job)
             except Exception as e:                # noqa: BLE001
                 job.error = str(e); job.state = "failed"
                 job.events.put({"event": "error", "error": str(e)})
@@ -623,6 +652,79 @@ def _runner_bin(adapter, cfg):
         return None
 
 
+def _cache_set_stats(path, expected=None, shard_prefix=None):
+    out = {"path": path, "exists": os.path.isdir(path), "shards": 0,
+           "bytes": 0}
+    if not out["exists"]:
+        return out
+    try:
+        names = os.listdir(path)
+    except OSError as e:
+        out["error"] = str(e)
+        return out
+    for name in names:
+        if not (name.endswith(".bin") and
+                (name.startswith(shard_prefix) if shard_prefix is not None
+                 else name.startswith("k3_ep_cache_"))):
+            continue
+        p = os.path.join(path, name)
+        try:
+            if os.path.isfile(p):
+                out["shards"] += 1
+                out["bytes"] += os.path.getsize(p)
+        except OSError:
+            continue
+    if expected is not None:
+        out["expected_shards"] = expected
+        out["complete"] = out["shards"] == expected
+    return out
+
+
+def _apply_prompt_cache(body, adapter):
+    """Map the OpenAI prompt-cache key to a private, shared K3 cache set.
+
+    Explicit runner paths are deliberately left untouched.  The key is
+    hashed and scoped by layout-affecting runner settings so arbitrary client
+    strings never become filesystem paths and incompatible K3 layouts do not
+    share a cache directory.
+    """
+    key = body.get("prompt_cache_key")
+    if key is None or adapter.name != "k3":
+        return body
+    if not isinstance(key, str) or not key or len(key) > 512 or "\0" in key:
+        raise ValueError("prompt_cache_key must be a non-empty string of at most 512 characters")
+    if body.get("cache_load") is not None or body.get("cache_save") is not None:
+        return body
+    fields = [
+        body.get("model", "k3"), body.get("variant", "default"),
+        body.get("np", adapter.default_np()), body.get("tp_np", "auto"),
+        body.get("layer", 1), body.get("layers", 1),
+        body.get("threads", 48), body.get("kda_threads", 8),
+        body.get("mla_cache", body.get("mla_cache_dtype", "bf16")),
+    ]
+    scope = "\x1f".join(str(x) for x in fields)
+    digest = hashlib.sha256((scope + "\x1e" + key).encode("utf-8")).hexdigest()
+    path = os.path.join(STATE_DIR, "openai-cache", "k3-" + digest)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    out = dict(body)
+    out["cache_save"] = path
+    try:
+        expected = int(body.get("np", adapter.default_np()))
+    except (TypeError, ValueError):
+        expected = adapter.default_np()
+    try:
+        layer = int(body.get("layer", 1))
+        layers = int(body.get("layers", 1))
+        threads = int(body.get("threads", 48))
+        shard_prefix = "k3_ep_cache_l%03d_%03d_n%03d_t%03d_" % (
+            layer, layers, expected, threads)
+    except (TypeError, ValueError):
+        shard_prefix = None
+    if _cache_set_stats(path, expected, shard_prefix).get("complete"):
+        out["cache_load"] = path
+    return out
+
+
 def _port_in_use(port):
     """A serve child already holding this port would make readiness ambiguous."""
     with _children_lock:
@@ -756,16 +858,50 @@ class Handler(bhs.Handler):
             return self._bash_delegate(super().do_GET)
         try:
             path, q = self._split()
+            path = path.rstrip("/") or "/"
+            if path == "/v1/contexts" or path.startswith("/v1/contexts/"):
+                path = path[3:]
             if path in ("/", "/health"):
                 return self._get_health()
             if path == "/models":
                 return self._send_json(models.describe())
             if path == "/v1/models":
-                return self._send_json({"object": "list", "data": [{
-                    "id": "laguna-s21", "object": "model",
-                    "created": 0, "owned_by": "poolside"}]})
+                entries = []
+                seen = set()
+                for spec in models.describe().values():
+                    for model_id in spec.get("openai_models", ()):
+                        if model_id in seen:
+                            continue
+                        seen.add(model_id)
+                        entries.append({"id": model_id, "object": "model",
+                                        "created": 0, "owned_by": "poolside"})
+                return self._send_json({"object": "list", "data": entries})
             if path == "/inference/queue":
                 return self._send_json(_inference.info())
+            if path == "/contexts":
+                return self._send_json({"object": "list",
+                                        "data": _contexts.info()})
+            if path.startswith("/contexts/") and path.endswith("/checkpoints"):
+                context_id = path.split("/")[2]
+                context = _contexts.get(context_id)
+                if context is None:
+                    return self._err("no such context: %s" % context_id,
+                                     status=404)
+                return self._send_json({"object": "list",
+                                        "data": ([context.checkpoint]
+                                                  if context.checkpoint else [])})
+            if path.startswith("/contexts/"):
+                context_id = path.split("/")[2]
+                context = _contexts.get(context_id)
+                if context is None:
+                    return self._err("no such context: %s" % context_id,
+                                     status=404)
+                return self._send_json({"object": "context",
+                                        "context_id": context.context_id,
+                                        "model": context.model,
+                                        "last_response_id": context.last_response_id,
+                                        "pending_tools": len(context.pending_tools),
+                                        "checkpoint": context.checkpoint})
             if path == "/nodes":
                 return self._get_nodes(q)
             if path == "/runner":
@@ -878,7 +1014,7 @@ class Handler(bhs.Handler):
 
     def _get_stage_status(self, q):
         model = q.get("model", ["laguna"])[0]
-        adapter = models.get(model)
+        adapter = _resolve_adapter(model)
         cfg = {k: v[0] for k, v in q.items()}
         stage_dir = adapter.stage_dir(cfg)
         out = {"model": model, "stage_dir": stage_dir,
@@ -932,6 +1068,9 @@ class Handler(bhs.Handler):
             return self._send_json({"error": "unauthorized"}, status=401)
         try:
             path, _q = self._split()
+            path = path.rstrip("/") or "/"
+            if path == "/v1/contexts" or path.startswith("/v1/contexts/"):
+                path = path[3:]
             body = self._body if isinstance(self._body, dict) else {}
             if path == "/build":
                 return self._post_simple(body, "build")
@@ -943,9 +1082,11 @@ class Handler(bhs.Handler):
                 return self._post_runner_stop(body)
             if path == "/generate":
                 return self._post_generate(body)
-            if path == "/v1/chat/completions":
+            if path in ("/v1/chat/completions", "/chat/completions"):
                 return self._post_openai(body, chat=True)
-            if path == "/v1/completions":
+            if path == "/v1/responses":
+                return self._post_openai_responses(body)
+            if path in ("/v1/completions", "/completion"):
                 return self._post_openai(body, chat=False)
             if path == "/inference/cancel":
                 return self._post_inference_cancel(body)
@@ -953,6 +1094,10 @@ class Handler(bhs.Handler):
                 return self._post_profile(body)
             if path == "/kv":
                 return self._post_kv(body)
+            if path.startswith("/contexts/") and path.endswith("/checkpoints"):
+                return self._post_context_checkpoint(path, body)
+            if path.startswith("/contexts/") and path.endswith("/restore"):
+                return self._post_context_restore(path, body)
             if path == "/shutdown":
                 return self._post_shutdown(body)
             return self._err("not found: %s" % path, status=404)
@@ -968,9 +1113,28 @@ class Handler(bhs.Handler):
             except Exception:
                 pass
 
+    def do_DELETE(self):
+        if not self._authorized():
+            return self._send_json({"error": "unauthorized"}, status=401)
+        path, _q = self._split()
+        path = path.rstrip("/") or "/"
+        if path == "/v1/contexts" or path.startswith("/v1/contexts/"):
+            path = path[3:]
+        parts = path.split("/")
+        if len(parts) == 5 and parts[1] == "contexts" and parts[3] == "checkpoints":
+            context = _contexts.get(parts[2])
+            if context is None:
+                return self._err("no such context: %s" % parts[2], status=404)
+            if not context.checkpoint or context.checkpoint.get("name") != parts[4]:
+                return self._err("checkpoint is not present", status=404)
+            context.checkpoint = None
+            return self._send_json({"deleted": True, "context_id": parts[2],
+                                    "name": parts[4]})
+        return self._err("not found: %s" % path, status=404)
+
     def _post_simple(self, body, mode):
         """/build and /stage: one-shot, identical shape."""
-        adapter = models.get(body.get("model", "laguna"))
+        adapter = _resolve_adapter(body.get("model"))
         argv, env, cwd = adapter.launch(mode, body)
         c = _new_child("oneshot", "%s:%s" % (mode, adapter.name),
                        argv, env, cwd,
@@ -979,7 +1143,7 @@ class Handler(bhs.Handler):
                          "argv": argv}, status=202)
 
     def _post_runner_start(self, body):
-        adapter = models.get(body.get("model", "laguna"))
+        adapter = _resolve_adapter(body.get("model"))
         mode = body.get("mode") or ("serve" if adapter.supports_serve else "generate")
         if mode not in ("serve", "generate"):
             return self._err("mode must be serve or generate")
@@ -990,12 +1154,12 @@ class Handler(bhs.Handler):
             with _children_lock:
                 active = [x for x in _children.values()
                           if x.kind == "serve" and
-                          x.meta.get("model") == "laguna" and
+                          x.meta.get("model") == adapter.name and
                           x.state in ("starting", "ready", "stopping")]
-            if adapter.name == "laguna" and active:
+            if active:
                 return self._err(
-                    "Laguna runner %s is already active; stop it before starting another"
-                    % active[0].id, status=409)
+                    "serve runner for model %s is already active; stop it before starting another"
+                    % adapter.name, status=409)
             port = models._int(body, "port", required=True)
             busy = _port_in_use(port)
             if busy:
@@ -1042,7 +1206,9 @@ class Handler(bhs.Handler):
         if not isinstance(req.get("ids"), list):
             return self._err("ids must be an array")
         try:
-            job = _inference.submit(body, native=req, tokenizer=None, chat=False)
+            job = _inference.submit(body, native=req, tokenizer=None, chat=False,
+                                    context_id=body.get("context_id"),
+                                    model="native")
         except OverflowError as e:
             return self._err(str(e), status=429)
         if body.get("stream"):
@@ -1077,25 +1243,255 @@ class Handler(bhs.Handler):
             return self._err("no such inference job", status=404)
         self._send_json(job.info())
 
-    def _post_openai(self, body, chat):
-        if _ready_laguna() is None:
-            return self._err("exactly one ready Laguna runner is required", status=503)
+    def _post_openai_responses(self, body):
+        if "contexts" in body:
+            return self._post_openai_batch(body)
+        translated = laguna_openai.responses_request(body)
+        return self._post_openai(translated, chat=True, response_api=True,
+                                 response_body=body)
+
+    def _accept_tool_continuation(self, context, request):
+        items = request.get("input")
+        if not isinstance(items, list):
+            return
+        results = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                continue
+            call_id = item.get("call_id") or item.get("tool_call_id")
+            results.append({"tool_call_id": call_id})
+        if results:
+            previous = request.get("previous_response_id") or context.last_response_id
+            context.accept_tool_results(previous, results)
+
+    def _record_context_response(self, context, job):
+        calls = []
         try:
+            choice = (job.result.get("choices") or [{}])[0]
+            calls = (choice.get("message") or {}).get("tool_calls") or []
+        except (AttributeError, TypeError):
+            pass
+        context.record_response(job.id, calls)
+
+    def _submit_batch_item(self, body, item):
+        if not isinstance(item, dict):
+            raise agentic.ContextError("context item must be an object")
+        request = dict(body)
+        request.pop("contexts", None)
+        request.update(item)
+        model = request.get("model", body.get("model", "laguna-s21"))
+        adapter = models.get_by_openai_model(model)
+        if not adapter.supports_serve:
+            raise ValueError("%s does not support OpenAI-style serve operations" % adapter.name)
+        if _ready_serve(adapter.name) is None:
+            raise RuntimeError("ready runner for model %s not found" % adapter.name)
+        translated = laguna_openai.responses_request(request)
+        context_id = request.get("context_id") or request.get("conversation_id")
+        if not context_id and request.get("previous_response_id"):
+            prior = _contexts.find_response(request["previous_response_id"])
+            if prior is None:
+                raise agentic.ContextError("unknown previous_response_id")
+            context_id = prior.context_id
+        context = _contexts.get_or_create(context_id, model=adapter.name)
+        self._accept_tool_continuation(context, request)
+        translated["context_id"] = context.context_id
+        checkpoint = context.checkpoint or {}
+        if not translated.get("cache_load") and checkpoint.get("state") == "restore_requested":
+            translated["cache_load"] = checkpoint["path"]
+        if not translated.get("cache_save") and checkpoint.get("state") == "requested":
+            translated["cache_save"] = checkpoint["staging_path"]
+        translated = _apply_prompt_cache(translated, adapter)
+        native, tokenizer = laguna_openai.native_request(translated, chat=True)
+        job = _inference.submit(translated, native=native, tokenizer=tokenizer,
+                                chat=True, context_id=context.context_id,
+                                model=adapter.name)
+        return request, context, job
+
+    def _post_openai_batch(self, body):
+        contexts = body.get("contexts")
+        if not isinstance(contexts, list) or not contexts:
+            return self._err("contexts must be a non-empty array")
+        if body.get("stream"):
+            return self._stream_openai_batch(body, contexts)
+        results = []
+        for item in contexts:
+            try:
+                request, context, job = self._submit_batch_item(body, item)
+                timeout = float(request.get("timeout", 3600.0))
+                if not job.done.wait(timeout):
+                    _inference.cancel(job.id)
+                    raise RuntimeError("inference timed out")
+                if job.error:
+                    raise RuntimeError(job.error)
+                self._record_context_response(context, job)
+                if context.checkpoint:
+                    if context.checkpoint.get("state") == "requested":
+                        self._finalize_context_checkpoint(context)
+                    elif context.checkpoint.get("state") == "restore_requested":
+                        context.checkpoint["state"] = "restored"
+                response = laguna_openai.responses_response(
+                    request, job.result, request_id=job.id)
+                results.append(agentic.batch_result(context.context_id,
+                                                    response=response))
+            except (ValueError, OSError, RuntimeError, OverflowError,
+                    agentic.ContextError) as e:
+                results.append(agentic.batch_result(
+                    item.get("context_id", "") if isinstance(item, dict) else "",
+                    error=e))
+        failed = any("error" in result for result in results)
+        return self._send_json({"id": "batch_" + uuid.uuid4().hex,
+                                "object": "response.batch",
+                                "status": "partial" if failed else "completed",
+                                "data": results})
+
+    def _stream_openai_batch(self, body, items):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        jobs = {}
+        try:
+            for item in items:
+                try:
+                    request, context, job = self._submit_batch_item(body, item)
+                    jobs[job.id] = {"request": request, "context": context,
+                                    "job": job, "reasoning": bool(
+                                        request.get("enable_thinking", True) and
+                                        request.get("reasoning_effort") != "none")}
+                    self._sse({"type": "response.created",
+                               "context_id": context.context_id,
+                               "response": {"id": job.id, "object": "response",
+                                             "model": request.get("model", "laguna-s21"),
+                                             "status": "in_progress"}})
+                except (ValueError, OSError, RuntimeError, OverflowError,
+                        agentic.ContextError) as e:
+                    self._sse({"type": "response.failed",
+                               "context_id": item.get("context_id", "")
+                               if isinstance(item, dict) else "",
+                               "error": {"message": str(e), "type": "context_error"}})
+            while jobs:
+                progressed = False
+                for jid, state in list(jobs.items()):
+                    job = state["job"]
+                    while True:
+                        try:
+                            event = job.events.get_nowait()
+                        except queue.Empty:
+                            break
+                        progressed = True
+                        if event is None:
+                            context = state["context"]
+                            if job.error:
+                                self._sse({"type": "response.failed",
+                                           "context_id": context.context_id,
+                                           "error": {"message": job.error}})
+                            elif job.result:
+                                self._record_context_response(context, job)
+                                if context.checkpoint:
+                                    if context.checkpoint.get("state") == "requested":
+                                        self._finalize_context_checkpoint(context)
+                                    elif context.checkpoint.get("state") == "restore_requested":
+                                        context.checkpoint["state"] = "restored"
+                                self._sse({"type": "response.completed",
+                                           "context_id": context.context_id,
+                                           "response": laguna_openai.responses_response(
+                                               state["request"], job.result,
+                                               request_id=job.id)})
+                            jobs.pop(jid, None)
+                            break
+                        if event.get("event") != "token" or not event.get("text"):
+                            continue
+                        delta_text = event["text"]
+                        if delta_text.startswith("<think>"):
+                            delta_text = delta_text[len("<think>"):]
+                        if state["reasoning"]:
+                            if "</think>" in delta_text:
+                                before, delta_text = delta_text.split("</think>", 1)
+                                if before:
+                                    self._sse({"type": "response.reasoning_summary_text.delta",
+                                               "context_id": state["context"].context_id,
+                                               "delta": before})
+                                state["reasoning"] = False
+                            else:
+                                self._sse({"type": "response.reasoning_summary_text.delta",
+                                           "context_id": state["context"].context_id,
+                                           "delta": delta_text})
+                                continue
+                        if delta_text:
+                            if "<tool_call>" in delta_text:
+                                delta_text = delta_text.split("<tool_call>", 1)[0]
+                            if delta_text:
+                                self._sse({"type": "response.output_text.delta",
+                                           "context_id": state["context"].context_id,
+                                           "delta": delta_text, "output_index": 0,
+                                           "content_index": 0})
+                if jobs and not progressed:
+                    time.sleep(0.01)
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            for state in jobs.values():
+                _inference.cancel(state["job"].id)
+
+    def _post_openai(self, body, chat, response_api=False, response_body=None):
+        model = body.get("model", "laguna-s21")
+        try:
+            adapter = models.get_by_openai_model(model)
+        except models.ConfigError as e:
+            return self._err(str(e), status=400)
+        if not adapter.supports_serve:
+            return self._err("%s does not support OpenAI-style serve operations" % adapter.name,
+                             status=400)
+        if _ready_serve(adapter.name) is None:
+            return self._err("ready runner for model %s not found" % adapter.name, status=503)
+        try:
+            original = response_body if isinstance(response_body, dict) else body
+            context_id = original.get("context_id") or original.get("conversation_id")
+            if not context_id and original.get("previous_response_id"):
+                prior = _contexts.find_response(original["previous_response_id"])
+                if prior is None:
+                    return self._err("unknown previous_response_id", status=409)
+                context_id = prior.context_id
+            body = dict(body)
+            if context_id:
+                body["context_id"] = context_id
+            context = _contexts.get_or_create(context_id, model=adapter.name)
+            self._accept_tool_continuation(context, original)
+            checkpoint = context.checkpoint or {}
+            if not body.get("cache_load") and checkpoint.get("state") == "restore_requested":
+                body["cache_load"] = checkpoint["path"]
+            if not body.get("cache_save") and checkpoint.get("state") == "requested":
+                body["cache_save"] = checkpoint["staging_path"]
+            body = _apply_prompt_cache(body, adapter)
             native, tokenizer = laguna_openai.native_request(body, chat=chat)
             job = _inference.submit(body, native=native, tokenizer=tokenizer,
-                                    chat=chat)
+                                    chat=chat, context_id=context_id,
+                                    model=adapter.name)
         except OverflowError as e:
             return self._err(str(e), status=429)
         except (ValueError, OSError) as e:
             return self._err(str(e))
         if body.get("stream"):
+            if response_api:
+                return self._stream_responses(job, response_body)
             return self._stream_openai(job, body, chat)
         if not job.done.wait(float(body.get("timeout", 3600.0))):
             _inference.cancel(job.id)
             return self._err("inference timed out", status=504)
         if job.error:
             return self._err(job.error, status=502)
-        self._send_json(job.result)
+        context = _contexts.get(getattr(job, "context_id", None))
+        if context is not None:
+            self._record_context_response(context, job)
+            if context.checkpoint:
+                if body.get("cache_save") and context.checkpoint.get("state") == "requested":
+                    self._finalize_context_checkpoint(context)
+                elif body.get("cache_load") and context.checkpoint.get("state") == "restore_requested":
+                    context.checkpoint["state"] = "restored"
+        result = (laguna_openai.responses_response(response_body, job.result,
+                                                   request_id=job.id)
+                  if response_api else job.result)
+        self._send_json(result)
 
     def _stream_openai(self, job, body, chat):
         self.send_response(200)
@@ -1168,6 +1564,61 @@ class Handler(bhs.Handler):
         except (BrokenPipeError, ConnectionResetError):
             _inference.cancel(job.id)
 
+    def _stream_responses(self, job, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self._sse({"type": "response.created", "response": {
+                "id": job.id, "object": "response", "model": body.get(
+                    "model", "laguna-s21"), "status": "in_progress"}})
+            reasoning = body.get("enable_thinking", True) and \
+                body.get("reasoning_effort") != "none"
+            for event in iter(job.events.get, None):
+                if event.get("event") != "token" or not event.get("text"):
+                    continue
+                delta_text = event["text"]
+                if delta_text.startswith("<think>"):
+                    delta_text = delta_text[len("<think>"):]
+                if reasoning:
+                    if "</think>" in delta_text:
+                        before, delta_text = delta_text.split("</think>", 1)
+                        if before:
+                            self._sse({"type": "response.reasoning_summary_text.delta",
+                                      "delta": before})
+                        reasoning = False
+                    else:
+                        self._sse({"type": "response.reasoning_summary_text.delta",
+                                  "delta": delta_text})
+                        continue
+                if delta_text:
+                    if "<tool_call>" in delta_text:
+                        delta_text = delta_text.split("<tool_call>", 1)[0]
+                    if delta_text:
+                        self._sse({"type": "response.output_text.delta",
+                                  "delta": delta_text, "output_index": 0,
+                                  "content_index": 0})
+            if job.error:
+                self._sse({"type": "response.failed",
+                           "error": {"message": job.error}})
+            elif job.result:
+                context = _contexts.get(getattr(job, "context_id", None))
+                if context is not None:
+                    self._record_context_response(context, job)
+                    if context.checkpoint:
+                        if context.checkpoint.get("state") == "requested":
+                            self._finalize_context_checkpoint(context)
+                        elif context.checkpoint.get("state") == "restore_requested":
+                            context.checkpoint["state"] = "restored"
+                self._sse({"type": "response.completed",
+                           "response": laguna_openai.responses_response(
+                               body, job.result, request_id=job.id)})
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            _inference.cancel(job.id)
+
     def _sse(self, obj):
         data = ("data: " + json.dumps(obj, ensure_ascii=False,
                                       separators=(",", ":")) + "\n\n").encode("utf-8")
@@ -1180,7 +1631,7 @@ class Handler(bhs.Handler):
         binary inside mpiexec -- not the launcher script. Consequence: weights
         must already be staged and a tofu_topo.txt is generated first.
         """
-        adapter = models.get(body.get("model", "laguna"))
+        adapter = _resolve_adapter(body.get("model"))
         runner = adapter.runner_bin(body)
         if not os.path.exists(runner):
             return self._err("runner binary missing: %s (POST /build first)"
@@ -1233,6 +1684,69 @@ class Handler(bhs.Handler):
                          "artifacts": "/profile/%s/artifacts" % c.id},
                         status=202)
 
+    def _post_context_checkpoint(self, path, body):
+        context_id = path.split("/")[2]
+        context = _contexts.get(context_id)
+        if context is None:
+            return self._err("no such context: %s" % context_id, status=404)
+        if context.model != "k3":
+            return self._err("model %s does not support managed checkpoints" % context.model,
+                             status=400)
+        name = body.get("name")
+        if not isinstance(name, str) or not agentic._SAFE_NAME.match(name):
+            return self._err("checkpoint name must match [A-Za-z0-9._-]{1,128}")
+        identity = "checkpoint-%s-%s" % (context_id, name)
+        checkpoint_path = _managed_cache.path(identity)
+        staging_path = os.path.join(_managed_cache.root,
+                                    ".staging-%s-%s" % (context_id, name))
+        context.checkpoint = {"name": name, "identity": identity,
+                              "path": checkpoint_path,
+                              "staging_path": staging_path,
+                              "state": "requested", "updated": time.time()}
+        return self._send_json({"object": "checkpoint",
+                                "context_id": context_id,
+                                "checkpoint": context.checkpoint}, status=202)
+
+    def _finalize_context_checkpoint(self, context):
+        checkpoint = context.checkpoint
+        if not checkpoint or checkpoint.get("state") != "requested":
+            return
+        staging = checkpoint.get("staging_path")
+        try:
+            manifest = _managed_cache.publish(
+                checkpoint["identity"], staging,
+                {"model": context.model, "context_id": context.context_id,
+                 "checkpoint_name": checkpoint["name"]})
+            checkpoint["manifest"] = manifest
+            checkpoint["state"] = "complete"
+            checkpoint["updated"] = time.time()
+            shutil.rmtree(staging)
+        except (OSError, ValueError, agentic.ContextError) as e:
+            checkpoint["state"] = "save_failed"
+            checkpoint["error"] = str(e)
+            checkpoint["updated"] = time.time()
+
+    def _post_context_restore(self, path, body):
+        context_id = path.split("/")[2]
+        context = _contexts.get(context_id)
+        if context is None:
+            return self._err("no such context: %s" % context_id, status=404)
+        checkpoint = context.checkpoint
+        if checkpoint is None:
+            return self._err("context has no checkpoint", status=404)
+        if checkpoint.get("state") != "complete":
+            return self._err("checkpoint is not complete", status=409)
+        if body.get("name") and body["name"] != checkpoint["name"]:
+            return self._err("checkpoint is not present", status=404)
+        checkpoint = dict(checkpoint)
+        checkpoint["state"] = "restore_requested"
+        checkpoint["updated"] = time.time()
+        context.checkpoint = checkpoint
+        return self._send_json({"object": "checkpoint",
+                                "context_id": context_id,
+                                "checkpoint": checkpoint,
+                                "cache_load": checkpoint["path"]})
+
     def _post_kv(self, body):
         """KV cache control.
 
@@ -1246,10 +1760,28 @@ class Handler(bhs.Handler):
             return self._err("action must be save|load|clear|stats")
         cid = body.get("id")
         c = _get_child(cid) if cid else None
+        model = body.get("model")
+        if model is None and c is not None:
+            model = c.meta.get("model")
+        if model is None:
+            model = "laguna"
+        adapter = _resolve_adapter(model)
         if cid and c is None:
             return self._err("no such child: %s" % cid, status=404)
         if action == "stats":
             out = {"action": "stats"}
+            stats_path = body.get("path")
+            if stats_path is not None:
+                if not isinstance(stats_path, str):
+                    return self._err("stats path must be a string")
+                if "\0" in stats_path:
+                    return self._err("stats path must not contain NUL")
+                expected = body.get("np")
+                try:
+                    expected = int(expected) if expected is not None else None
+                except (TypeError, ValueError):
+                    return self._err("stats np must be an integer")
+                out["cache"] = _cache_set_stats(stats_path, expected)
             if c is not None:
                 out["child"] = c.info()
                 if c.kind == "serve" and c.state == "ready":
@@ -1265,6 +1797,10 @@ class Handler(bhs.Handler):
         path = body.get("path")
         if action in ("save", "load") and not path:
             return self._err("%s needs 'path'" % action)
+        if action in ("save", "load") and not isinstance(path, str):
+            return self._err("%s path must be a string" % action)
+        if action in ("save", "load") and "\0" in path:
+            return self._err("%s path must not contain NUL" % action)
         if action == "clear":
             # Clearing means restarting the runner: the KV lives in each rank's
             # memory and there is no wire command to drop it.
@@ -1274,15 +1810,21 @@ class Handler(bhs.Handler):
                 "note": "KV lives in rank-local memory with no wire command to "
                         "drop it; POST /runner/stop then /runner/start to clear.",
             })
-        flags = ["--kv-%s" % action, str(path)]
+        flags = adapter.cache_flags(action, path) if action in ("save", "load") else []
         if c is not None:
             c.meta.setdefault("kv", []).append({"action": action, "path": path})
+        note = "pass these as the next /runner/start request body fields; the running child is unaffected."
+        if not flags and action in ("save", "load"):
+            if not adapter.supports_cache:
+                note = "model does not support cache restart flags"
+            else:
+                note = ("runner-specific restart flags unavailable; pass "
+                        "cache_load/cache_save in /runner/start.")
         self._send_json({
             "action": action,
             "applied": False,
             "restart_flags": flags,
-            "note": "start-time flags: pass them in 'extra' on the next "
-                    "/runner/start; the running child is unaffected.",
+            "note": note,
         })
 
     def _post_shutdown(self, body):

@@ -100,8 +100,8 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | uptime, job id, every child's state |
-| GET | `/models` | adapters, variants, whether each supports serve |
-| GET | `/v1/models` | OpenAI-compatible model list |
+| GET | `/models` | adapters, variants, whether each supports serve and cache restart |
+| GET | `/v1/models` | OpenAI-compatible model list (`laguna-s21` + any adapter OpenAI IDs) |
 | GET | `/inference/queue` | bounded FIFO depth, active runner and jobs |
 | GET | `/nodes` | PJM env, per-node host/mem/`/local` (`?fanout=0` for head only) |
 | GET | `/runner` | list children |
@@ -110,27 +110,28 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | GET | `/profile/<id>/artifacts` | the fapp CSV/text reports a profile produced |
 | POST | `/build` | `{model, variant, clean}` |
 | POST | `/stage` | `{model, variant, stage_dir, model_dir, np}` |
-| POST | `/runner/start` | `{model, mode:serve\|generate, port, maxpos, layers, np, extra:[…], env:{…}}` |
+| POST | `/runner/start` | `{model, mode:serve\|generate, port, maxpos, layers, np, tp_np, extra:[…], env:{…}, cache_load, cache_save}` |
 | POST | `/runner/stop` | `{id, grace}` |
 | POST | `/generate` | `{ids:[…], max_new, sample, temp, top_k, top_p, seed}` — queued native API |
-| POST | `/v1/chat/completions` | OpenAI chat; supports SSE, reasoning and function tools |
-| POST | `/v1/completions` | OpenAI text completions; supports SSE |
+| POST | `/v1/chat/completions`, `/chat/completions` | OpenAI chat; supports SSE, reasoning, function tools, and runner-specific `cache_load`/`cache_save` extensions |
+| POST | `/v1/responses` | OpenAI Responses-compatible input/output translation, including reasoning/text SSE; use Chat Completions for richer tool-call streaming |
+| POST | `/v1/completions`, `/completion` | OpenAI text completions; supports SSE |
 | POST | `/inference/cancel` | `{id}` — cancel a queued/running request |
 | POST | `/profile` | `{model, ids, max_new, event, np}` — fapp-wrapped run |
-| POST | `/kv` | `{action:save\|load\|clear\|stats, id, path}` |
+| POST | `/kv` | `{action:save\|load\|clear\|stats, id, path, model}`; `stats` with a K3 cache `path` optionally accepts `np` and reports shard count/bytes/completeness |
 | POST | `/shutdown` | stop all children, then exit |
 | POST | `/bash/{session,run,interrupt,close}` | see `tools/README.md` |
 | GET | `/bash/{health,sessions}` | ditto |
 
 ## Models
 
-| model | variants | serve? | launcher |
-|---|---|---|---|
-| `laguna` | `int4` (default), `bf16`, `fp8` | yes | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
-| `gemma4` | `tp` (default), `pp` | no — one-shot only | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
-| `k3` | `partial` | no — measured one-shot only | `a64fx/k3/run_k3_ep.sh` |
+| model | variants | serve? | cache restart? | launcher |
+|---|---|---|---|---|
+| `laguna` | `int4` (default), `bf16`, `fp8` | yes | no | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
+| `gemma4` | `tp` (default), `pp` | no — one-shot only | no | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
+| `k3` | `partial` | no — one-shot only | yes | `a64fx/k3/run_k3_ep.sh` |
 
-Exactly one Laguna serve child may be starting or ready. All semantic and native
+Exactly one serving child per model may be starting or ready. All semantic and native
 requests share one bounded FIFO (capacity 8 by default, configurable with
 `LLMGR_QUEUE_CAPACITY`); overflow returns HTTP 429. Closing an SSE connection or
 calling `/inference/cancel` closes the native stream at the next event, and the
@@ -141,7 +142,14 @@ the current runner has real TP MXFP4 expert slices but still lacks the tokenizer
 embedding, complete dense/shared path, and LM head. On a K3 llmgr allocation,
 `POST /stage` performs a true stage-only operation; `POST /runner/start` with
 `mode=generate` launches a bounded partial decode and exposes health, logs, stop,
-and profiling through llmgr. `POST /bash/session` can edit sources and rebuild,
+and profiling through llmgr. `cache_load` and `cache_save` allow prefix-cache
+serialization/deserialization for context carry-over inside one 12-node coding
+agent flow without changing the runner semantics. OpenAI `/v1/chat/completions`
+and `/v1/responses` requests may instead provide `prompt_cache_key`; for K3,
+llmgr maps that key to a hashed shared cache set, loads it when present, and
+saves the updated state. Explicit `cache_load` or `cache_save` paths always
+take precedence, and other model adapters do not use the automatic mapping.
+`POST /bash/session` can edit sources and rebuild,
 but apply a fix by stopping the active MPI child and restarting it against the
 retained rank-local stage—already-running machine code is never hot-patched.
 

@@ -23,6 +23,16 @@ def _text_content(content):
     return "" if content is None else str(content)
 
 
+def _responses_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(x.get("text", "")) for x in content
+                       if isinstance(x, dict) and x.get("type") in
+                       ("input_text", "output_text", "text"))
+    return _text_content(content)
+
+
 def normalize_messages(messages):
     out = []
     for message in messages or []:
@@ -30,14 +40,26 @@ def normalize_messages(messages):
             raise ValueError("each message must be an object with a role")
         item = dict(message)
         item["content"] = _text_content(item.get("content"))
-        for call in item.get("tool_calls") or []:
+        calls = item.get("tool_calls") or []
+        normalized_calls = []
+        for call in calls:
+            if not isinstance(call, dict):
+                raise ValueError("tool_calls entries must be objects")
+            call = dict(call)
             fn = call.get("function") or {}
+            if not isinstance(fn, dict):
+                raise ValueError("tool_calls.function must be an object")
+            fn = dict(fn)
             args = fn.get("arguments", {})
             if isinstance(args, str):
                 try:
                     fn["arguments"] = json.loads(args)
                 except ValueError:
                     fn["arguments"] = {"input": args}
+            call["function"] = fn
+            normalized_calls.append(call)
+        if "tool_calls" in item:
+            item["tool_calls"] = normalized_calls
         out.append(item)
     return out
 
@@ -64,16 +86,84 @@ def native_request(body, tokenizer=None, chat=True):
         else:
             ids = tok.encode(str(prompt), add_bos=True)
     max_new = body.get("max_completion_tokens", body.get("max_tokens", 256))
+    req_n = body.get("n", 1)
+    if req_n != 1:
+        raise ValueError("OpenAI wrapper currently supports n=1 only (got %r)" % req_n)
     req = {"ids": ids, "max_new": int(max_new), "stream": True}
     temp = float(body.get("temperature", 1.0))
     req["sample"] = temp > 0
     if temp > 0:
         req["temp"] = temp
+    for field in ("cache_load", "cache_save"):
+        if body.get(field) is not None:
+            req[field] = body[field]
     for source, target in (("top_p", "top_p"), ("top_k", "top_k"),
                            ("min_p", "min_p"), ("seed", "seed")):
         if body.get(source) is not None:
             req[target] = body[source]
     return req, tok
+
+
+def responses_request(body):
+    """Translate the useful non-streaming Responses API subset to chat input."""
+    item_input = body.get("input")
+    if isinstance(item_input, str):
+        messages = [{"role": "user", "content": item_input}]
+    elif isinstance(item_input, list):
+        messages = []
+        for item in item_input:
+            if not isinstance(item, dict):
+                raise ValueError("Responses input items must be objects")
+            kind = item.get("type", "message")
+            if kind == "message":
+                role = item.get("role")
+                if not role:
+                    raise ValueError("Responses message items need a role")
+                messages.append({"role": role,
+                                 "content": _responses_text(item.get("content"))})
+            elif kind in ("input_text", "output_text"):
+                messages.append({"role": "user" if kind == "input_text" else "assistant",
+                                 "content": str(item.get("text", ""))})
+            elif kind == "function_call_output":
+                messages.append({"role": "tool", "content":
+                                 str(item.get("output", "")),
+                                 "tool_call_id": item.get("call_id")})
+            else:
+                raise ValueError("unsupported Responses input item type: %s" % kind)
+    else:
+        raise ValueError("Responses request needs string or array input")
+    if body.get("instructions") is not None:
+        messages.insert(0, {"role": "system", "content":
+                            _responses_text(body["instructions"])})
+    out = dict(body)
+    out["messages"] = messages
+    if "max_output_tokens" in out and "max_completion_tokens" not in out:
+        out["max_completion_tokens"] = out["max_output_tokens"]
+    return out
+
+
+def responses_response(body, chat_response, request_id=None):
+    """Wrap a Chat Completions result in the Responses object shape."""
+    choice = (chat_response.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    output = []
+    content = message.get("content")
+    if content is not None:
+        output.append({"type": "message", "id": "msg_" + uuid.uuid4().hex,
+                       "role": "assistant", "status": "completed",
+                       "content": [{"type": "output_text", "text": content,
+                                    "annotations": []}]})
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        output.append({"type": "function_call", "id": call.get("id"),
+                       "call_id": call.get("id"), "name": fn.get("name"),
+                       "arguments": fn.get("arguments", ""),
+                       "status": "completed"})
+    usage = chat_response.get("usage") or {}
+    return {"id": request_id or "resp_" + uuid.uuid4().hex,
+            "object": "response", "created_at": int(time.time()),
+            "model": body.get("model", "laguna-s21"), "status": "completed",
+            "output": output, "usage": usage}
 
 
 _TOOL = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.S)
@@ -123,8 +213,6 @@ def completion_response(body, text, native, chat=True, request_id=None):
             message["reasoning"] = parsed["reasoning"]
             message["reasoning_content"] = parsed["reasoning_content"]
         if parsed["tool_calls"] is not None:
-            for call in parsed["tool_calls"]:
-                call.pop("index", None)
             message["tool_calls"] = parsed["tool_calls"]
         choice = {"index": 0, "message": message, "finish_reason": finish}
         kind = "chat.completion"
