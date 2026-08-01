@@ -170,44 +170,41 @@ static int load_cublas(void) {
     } \
 } while(0)
 
-/* FP8 E4M3 conversion utilities */
+/* FP8 E4M3 conversion utilities (round-to-nearest-even, saturate-to-finite —
+ * matches the hardware cvt.rn.satfinite.e4m3x2.f32). Max finite 448
+ * (exp=15,mant=6); (exp=15,mant=7) is NaN; smallest normal 2^-6; subnormals
+ * are k*2^-9 for k=1..7. */
 static uint8_t float_to_fp8_e4m3(float f) {
     if (f != f) return 0x7F;  /* NaN */
-    if (f == 0.0f) return 0;
 
-    int sign = (f < 0) ? 1 : 0;
-    f = fabsf(f);
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    uint8_t s8 = (uint8_t)(((bits >> 31) & 1u) << 7);
+    float af = (f < 0.0f) ? -f : f;
+    if (af == 0.0f) return s8;                       /* +/-0 keep sign */
+    if (af >= 448.0f) return (uint8_t)(s8 | (0xFu << 3) | 0x6u); /* saturate (incl. Inf) */
 
-    /* Clamp to E4M3 range: max = 448 */
-    if (f > 448.0f) f = 448.0f;
-
-    /* Find exponent */
-    int exp = 0;
-    float mantissa = f;
-
-    if (f >= 1.0f) {
-        while (mantissa >= 2.0f && exp < 15) {
-            mantissa /= 2.0f;
-            exp++;
-        }
-    } else {
-        while (mantissa < 1.0f && exp > -6) {
-            mantissa *= 2.0f;
-            exp--;
-        }
+    int32_t E = (int32_t)((bits >> 23) & 0xFF) - 127; /* unbiased f32 exponent */
+    if (E < -6) {
+        /* Subnormal range: nearest multiple of 2^-9 (k=0..8), RNE. */
+        float scaled = af * 512.0f;                  /* exact power-of-two scale */
+        uint32_t k = (uint32_t)scaled;
+        float frac = scaled - (float)k;
+        if (frac > 0.5f || (frac == 0.5f && (k & 1u))) k++;
+        if (k == 0u) return s8;
+        if (k < 8u) return (uint8_t)(s8 | (k & 0x7u));        /* subnormal */
+        return (uint8_t)(s8 | (1u << 3));                     /* -> smallest normal */
     }
-
-    /* Bias: 7 for E4M3 */
-    int biased_exp = exp + 7;
-    if (biased_exp < 0) biased_exp = 0;
-    if (biased_exp > 15) biased_exp = 15;
-
-    /* Extract 3-bit mantissa (without implicit 1) */
-    int mant = (int)((mantissa - 1.0f) * 8.0f + 0.5f);
-    if (mant > 7) mant = 7;
-    if (mant < 0) mant = 0;
-
-    return (uint8_t)((sign << 7) | (biased_exp << 3) | mant);
+    /* Normal range: reduce the 23-bit mantissa to 3 bits with RNE. */
+    uint32_t mant = (bits >> 20) & 0x7u;
+    uint32_t rem  = bits & 0xFFFFFu;
+    if (rem > 0x80000u || (rem == 0x80000u && (mant & 1u))) {
+        if (++mant == 8u) { mant = 0u; E++; }
+    }
+    int32_t exp_field = E + 7;
+    if (exp_field > 15 || (exp_field == 15 && mant > 6u))
+        return (uint8_t)(s8 | (0xFu << 3) | 0x6u);   /* saturate to 448 */
+    return (uint8_t)((uint32_t)s8 | ((uint32_t)exp_field << 3) | mant);
 }
 
 static float fp8_e4m3_to_float(uint8_t fp8) {

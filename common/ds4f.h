@@ -7,7 +7,9 @@
  *
  * Weights stay quantized in HBM and are dequantized on demand per token:
  *   - dense (MLA attn + shared expert) = FP8 E4M3, 128x128 block E8M0 scale
- *   - routed experts                   = split MXFP4 (e2m1), per-32 E8M0 scale
+ *   - routed experts                   = cfg.expert_qt: split MXFP4 (e2m1), per-32 E8M0
+ *                                        scale for Flash/Pro; FP8 E4M3 + 128x128 block
+ *                                        E8M0 scale for base (DS4F_MODEL=ds4fbase)
  *   - embed / head / router / norms    = BF16 ;  attn_sink / mHC = F32
  * Kernels (matvec_fp8e4m3_8row / matvec_mxfp4_8row / matvec_bf16_8row) and the
  * e8m0/fp8 helpers live in ggml_dequant.h (validated by ds4f_kernels_bench.c).
@@ -29,6 +31,8 @@
  *   ffn.gate.weight BF16 [256,4096]   (router)
  *   ffn.shared_experts.w1/w3 F8 [2048,4096] scale[16,32]; w2 F8 [4096,2048] scale[32,16]
  *   ffn.experts.N.w1/w3 I8 [2048,2048] scale[2048,128];  w2 I8 [4096,1024] scale[4096,64]
+ *     (ds4fbase instead: w1/w3 F8 [2048,4096] scale[16,32]; w2 F8 [4096,2048] scale[32,16]
+ *      -- i.e. the experts take the SAME shape as the shared expert above)
  *   hc_attn_* / hc_ffn_* F32 (small, FLOP stand-in)
  */
 #ifndef DS4F_H
@@ -43,6 +47,7 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -51,6 +56,10 @@
 #include <arm_sve.h>
 
 #include "ggml_dequant.h"
+
+/* Weight quant types. Declared up here because ds4f_config carries one (expert_qt);
+ * the per-type layout notes live above the ds4f_tensor definition below. */
+typedef enum { DS4F_BF16 = 0, DS4F_FP8 = 1, DS4F_MXFP4 = 2, DS4F_F32 = 3, DS4F_BF16_PV = 4, DS4F_Q8_PV = 5 } ds4f_qtype;
 
 /* ===================== config ===================== */
 typedef struct {
@@ -100,6 +109,11 @@ typedef struct {
     int   rope_factor;           /* 16 */
     int   beta_fast, beta_slow;  /* 32, 1 */
     int   original_seq_len;      /* 65536 (YaRN orig ctx; 0 => YaRN off) */
+    /* Routed-expert weight format. This is the ONLY thing that differs between the
+     * Flash release (~/models/ds4f, expert_dtype=fp4 -> DS4F_MXFP4) and the base
+     * release (~/models/ds4fbase, expert_dtype=fp8 -> DS4F_FP8). Everything else --
+     * dims, tensor names, tokenizer, dense FP8 -- is identical. */
+    ds4f_qtype expert_qt;
     /* runtime */
     int max_pos;        /* KV cache capacity */
 } ds4f_config;
@@ -111,6 +125,7 @@ static inline ds4f_config ds4f_default_config(void) {
     c.q_lora = 1024; c.kv_lora = 512; c.o_inter = 8192; c.o_groups = 8;
     c.n_experts = 256; c.n_active = 6; c.moe_inter = 2048; c.shared_inter = 2048;
     c.routed_scale = 1.5f; c.max_pos = 4096;
+    c.expert_qt = DS4F_MXFP4;            /* Flash: expert_dtype=fp4 (see ds4f_base_config) */
     c.hc_mult = 4; c.hc_iters = 20; c.hc_eps = 1e-6f; c.norm_eps = 1e-6f;
     /* lightning indexer (matches DeepSeek-V4-Flash config.json) */
     c.index_topk = 512; c.index_head_dim = 128; c.index_n_heads = 64;
@@ -129,6 +144,66 @@ static inline ds4f_config ds4f_default_config(void) {
     return c;
 }
 
+/* DeepSeek-V4-Pro (~/models/ds4p, 805 GB / 64 shards): same deepseek_v4 graph as
+ * Flash (identical tensor names, tokenizer, MXFP4 expert packing, kv_lora=512,
+ * wo_a in-dim n_heads*q_head_dim/o_groups = 4096 in both) — pure dimension scaling.
+ * NOTE: no dense (ratio-0) decode layers — layers 0,1 are HCA(128); index 61 = MTP. */
+static inline ds4f_config ds4f_pro_config(void) {
+    ds4f_config c = ds4f_default_config();
+    c.n_layers = 61; c.hidden = 7168;
+    c.n_heads = 128;                       /* q_head_dim/qk_rope unchanged (512/64) */
+    c.q_lora = 1536;
+    c.o_inter = 16384; c.o_groups = 16;    /* o_lora stays 16384/16 = 1024 */
+    c.o_lora = c.o_inter / c.o_groups;
+    c.n_experts = 384; c.moe_inter = 3072; c.shared_inter = 3072;
+    c.routed_scale = 2.5f;
+    c.index_topk = 1024;                   /* index_head_dim/index_n_heads unchanged */
+    static const int RATIOS_P[62] = {
+        128, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0 };
+    for (int L = 0; L < 64; L++) c.compress_ratios[L] = (L < 62) ? RATIOS_P[L] : 0;
+    return c;
+}
+
+/* DeepSeek-V4 BASE (~/models/ds4fbase, 275 GB / 46 shards): the SAME graph and the SAME
+ * dimensions as Flash -- config.json differs in exactly one field, expert_dtype fp8 (vs fp4).
+ * So the routed experts are FP8-e4m3 with a 128x128 block scale (byte-for-byte the layout the
+ * dense tensors already use) instead of MXFP4, and they cost 24 MiB/expert instead of 12.75.
+ *
+ * The base safetensors also store every *.scale as F32 rather than F8_E8M0. The values are exact
+ * powers of two (config.json: scale_fmt="ue8m0"), so ds4f_stage.c folds them losslessly to E8M0
+ * bytes at stage time -- by the time the loader sees the blob, base and Flash scales are identical
+ * and no kernel here knows the difference.
+ *
+ * Memory: FP8 experts are 22.17 GiB/node at EP=12 (vs 12.85 for Flash at EP=11), so base needs the
+ * dense-TP stack (DS4F_TP_ATTN/OPROJ/WOB/SHARED/HEAD/EMBED) to fit a 32 GB node -- 24.5 GiB with TP
+ * vs 30.5 without. See run_ds4fbase_12n.sh. */
+static inline ds4f_config ds4f_base_config(void) {
+    ds4f_config c = ds4f_default_config();
+    c.expert_qt = DS4F_FP8;              /* the only delta vs Flash */
+    return c;
+}
+
+/* DS4F_MODEL selects the variant: ds4p = Pro, ds4fbase = base, default = Flash.
+ *
+ * DS4F_EXPERTS=q8pv then overrides the routed-expert rep to the OFFLINE-BAKED int8 W8A8
+ * (ds4f_bake.c with DS4F_BAKE_EXPERTS=1). Only meaningful for base: its FP8 experts run the
+ * on-demand gather at ~76 GB/s in-model, 5x below the q8-sdot ceiling, and Q8_PV is 1.03 B/elem
+ * vs FP8's 1.0 -- essentially free. It also cuts COMM, because the per-layer MoE imbalance
+ * (top-6-of-256 landing on <=6 of 12 ranks) IS the straggler skew the all-reduce absorbs.
+ * NOT for Flash: MXFP4 -> Q8 would double its experts (11.8 -> 22.9 GiB) and blow the arena. */
+static inline ds4f_config ds4f_config_from_env(void) {
+    const char *m = getenv("DS4F_MODEL");
+    ds4f_config c = (m && strcmp(m, "ds4p") == 0)     ? ds4f_pro_config()
+                  : (m && strcmp(m, "ds4fbase") == 0) ? ds4f_base_config()
+                                                      : ds4f_default_config();
+    {   const char *e = getenv("DS4F_EXPERTS");
+        if (e && *e && strcmp(e, "q8pv") == 0) c.expert_qt = DS4F_Q8_PV;
+    }
+    return c;
+}
+
 /* ===================== tensor ===================== */
 /* DS4F_BF16_PV: BF16 weights in the pair-interleaved layout consumed by
  * matvec_bf16_8row_pv (p_odd predicated load, +22..28% over plain bf16,
@@ -142,7 +217,6 @@ static inline ds4f_config ds4f_default_config(void) {
  * and svdot is 4x FMLA throughput -> the only sub-f32 dense lever. Argmax-exact
  * but NOT rel<1e-3 (int8 rounding ~1e-2); used ONLY for the big hidden-layer
  * dense GEMMs (qkv/o_proj/shared), never the argmax-critical router/lm-head. */
-typedef enum { DS4F_BF16 = 0, DS4F_FP8 = 1, DS4F_MXFP4 = 2, DS4F_F32 = 3, DS4F_BF16_PV = 4, DS4F_Q8_PV = 5 } ds4f_qtype;
 
 typedef struct {
     void    *w;       /* weight bytes */
@@ -183,7 +257,7 @@ typedef struct {
     ds4f_tensor gate;                 /* BF16 [n_experts, hidden] router */
     float *gate_bias;                 /* [n_experts] F32 selection bias (exact, layers>=n_hash); NULL=hash/synth */
     ds4f_tensor sh_w1, sh_w2, sh_w3;  /* shared expert (FP8) */
-    ds4f_tensor *ex_w1, *ex_w2, *ex_w3; /* owned experts (MXFP4), indexed 0..n_owned-1 */
+    ds4f_tensor *ex_w1, *ex_w2, *ex_w3; /* owned experts (cfg.expert_qt: MXFP4 | FP8), 0..n_owned-1 */
     int *owned_eid;                   /* global expert id of each owned slot */
     int  n_owned;
     /* mHC (F32): fn = [mix_hc=24, hc_mult*hidden=16384] Linear; base = [24] bias;
@@ -262,6 +336,8 @@ typedef struct {
     int       cmp_frozen;  /* 1 once scale frozen & calbuf quantized into cmp_q */
     /* indexer (CSA layers, compress_ratio==4 only) */
     uint16_t *idx_wq_b;              /* [index_n_heads*index_head_dim, q_lora] bf16 (FP8 src, lossless) */
+    int8_t   *idx_wq_b_i8;           /* DS4F_IDX_INT8W: int8 W8A8 qproj weight (lazy, lossy, gated) */
+    float    *idx_wq_b_sc;           /* per-row absmax scale for idx_wq_b_i8 */
     uint16_t *idx_wproj;             /* [index_n_heads, hidden] bf16 */
     uint16_t *idx_cmp_wkv, *idx_cmp_wgate;  /* indexer compressor (rotate=1): [coff*index_head_dim, hidden] bf16 */
     float    *idx_cmp_ape;           /* [4, coff*index_head_dim] */
@@ -275,7 +351,29 @@ typedef struct {
     int       idx_cp_on;             /* DS4F_CP_IDX: idx_kv8_4/idx_pscale slot-sharded [idx_cp_s0,idx_cp_s1) */
     int       idx_cp_s0, idx_cp_s1;  /* this node's owned indexer-slot range (per-slot scale -> no CAL replication) */
     int       idx_cp_nslot;          /* idx_kv8_4 slot capacity (DEBUG bounds guard) */
+    /* DS4F_IDX_REUSE: per-layer cached indexer selection (offset-stripped local cmp indices) + the position
+     * it was scanned at. Re-scan every N decode steps, reuse in between (the O(T) scan+topk is the only
+     * ctx-growing decode term; the selection drifts slowly). Lazily allocated. */
+    int      *sel_cache; int sel_cache_n, sel_cache_pos;
 } ds4f_layer;
+
+/* Batched concurrent decode (DS4F_DECODE_BATCH): the per-sequence DATA/STATE cache buffers for one
+ * (sequence, layer). The batched forward swaps these into ds4f_layer per batch element so the tested
+ * per-position attn/tb2/KV-append run unchanged. Weights (cmp_wkv, idx_wq_b, ...) are shared, never
+ * swapped. bf16/f32 caches only (int8/int4 modes are a later phase). */
+typedef struct {
+    uint16_t *kv_cache;
+    float    *cmp_kv, *cmp_kv_state, *cmp_score_state;
+    float    *idx_kv, *idx_cmp_kv_state, *idx_cmp_score_state;
+    /* int8/int4 quantized stores + their per-sequence calibration (DS4F_INT8_KV / INT8_CMP / INT4_CMP /
+     * IDX_INT8 / IDX_INT4, needed for batched-decode under those modes incl. CP). NULL when the mode is
+     * off. cp_on/cp_t0/cp_t1 stay topology-constant on the base layer (same shard for every sequence). */
+    int8_t   *kv_q;    float *kv_scale;  uint16_t *kv_calbuf;  int kv_caln, kv_frozen;    /* window int8 */
+    uint8_t  *cmp_q4;  int8_t *cmp_q;    float *cmp_scale, *cmp_iscale, *cmp_absmax;
+    uint16_t *cmp_calbuf; int cmp_caln, cmp_frozen;                                       /* compressed int8/int4 */
+    uint8_t  *idx_kv8_4; int8_t *idx_kv8; float *idx_pscale;                              /* indexer int8/int4 */
+    int      *sel_cache; int sel_cache_n, sel_cache_pos;   /* DS4F_IDX_REUSE: per-sequence cached selection */
+} ds4f_lseq;
 
 typedef struct ds4f_pool ds4f_pool;
 
@@ -288,6 +386,12 @@ typedef struct {
      *   x' = e_proj(enorm(embed(next_id))) + h_proj(hnorm(x));  block(x'); head -> logits.
      * Scaffolded (load + forward stub); the draft/verify spec-decode loop is the follow-on. */
     int       has_mtp;                         /* DS4F_MTP loaded */
+    /* DS4F_DECODE_BATCH: when dec_batch_seq!=NULL, ds4f_forward_verify decodes dec_nseq INDEPENDENT
+     * sequences (batch elem k at position dec_batch_pos[k], reading cache set dec_batch_seq[k*L+layer])
+     * instead of K consecutive tokens of one sequence. Set 0 aliases the layers' own live buffers. */
+    int        dec_nseq;
+    int       *dec_batch_pos;                  /* [dec_nseq] per-sequence positions (NULL = consecutive) */
+    ds4f_lseq *dec_batch_seq;                  /* [dec_nseq * n_layers] cache sets (NULL = single-stream) */
     ds4f_layer mtp;                            /* the MTP block (attn + MoE), like a main layer */
     uint16_t *mtp_enorm, *mtp_hnorm, *mtp_norm;/* BF16 [hidden] RMSNorm weights (embed/hidden/final) */
     ds4f_tensor mtp_e_proj, mtp_h_proj;        /* [hidden,hidden] dense fusion projections */
@@ -415,12 +519,23 @@ typedef struct {
     float *s_hn, *s_q, *s_qlat, *s_kvlat, *s_attn, *s_oin, *s_o1, *s_o;
     float *s_h2, *s_router, *s_shg, *s_shu, *s_exg, *s_exu, *s_moe, *s_logits;
     float *s_route;         /* routed-expert partial (owned-only); EP-summed via ar_cb */
+    float *s_attn_sc;       /* DS4F_ATTN_GEMM: [n_heads*(window+index_topk)] scores->softmax weights (lazy) */
+    float *s_attn_m;             /* DS4F_CP_COMBINE: per-head local max (lazy, [n_heads]) */
+    float *s_attn_comb;          /* DS4F_CP_COMBINE: packed [acc: n_heads*q_head_dim | l: n_heads] reduced in
+                                  * ONE ar_cb (min collective count on this latency-bound fabric) (lazy) */
+    float *p_attn_comb, *p_attn_m;  /* DS4F_CP_COMBINE verify/prefill: the K positions' partials collected so the
+                                  * cross-node combine is ONE reduce for the whole chunk (m_tile-sized, lazy) */
+    float *s_idx_qpre;      /* batched-prefill: pre-projected indexer q for the current pos (NULL=compute in index_step) */
+    float *v_idxq;          /* [m_tile*index_n_heads*index_head_dim] batched qproj output (lazy, verify prefill) */
     /* batched (M>1) prefill scratch (only allocated by ds4f_alloc_prefill_batch;
      * NULL unless DS4F_PREFILL_BATCH is wired). Token-major [m_tile, width].
      * p_x is the carried hidden state for all M tokens. */
     int m_tile;
     float *p_x, *p_hn, *p_qlat, *p_q, *p_kvlat, *p_attn, *p_o1, *p_o;
     float *p_h2, *p_shg, *p_shu, *p_moe, *p_route, *p_router, *p_logits;
+    /* [m_tile, vocab] full per-row logits reconstructed for batched SAMPLING under TP_HEAD (zero-fill the
+     * owned shard + ar_cb SUM). When the head is replicated it aliases p_logits. Lazily allocated. */
+    float *p_logits_full;
     /* expert-grouping prefill scratch: per owned slot a bucket of routed tokens
      * (ex_tok[slot*m_tile+p]=token idx, ex_wt=its routed weight); p_exX gathers
      * those tokens' h2, p_exG/p_exU hold the w1/w3 GEMM out, p_exO the w2 out. */
@@ -445,6 +560,11 @@ typedef struct {
     void  (*ar_argmax_cb)(float *val, int32_t *idx, void *ctx);  /* (val,global-idx) argmax all-reduce
                                                                   * (TP_HEAD batched-prefill head merge) */
     void   *ar_argmax_ctx;
+    int     want_full_logits;  /* set by the runner when a caller needs the full-vocab logits vector
+                                 * (e.g. temperature/top_p/top_k sampling) rather than just the argmax
+                                 * token. Under TP_HEAD, ds4f_forward_token uses this to pick between the
+                                 * cheap local-argmax + tiny argmax-reduce path (greedy, want=0) and the
+                                 * full zero-fill + [vocab] all-reduce-SUM path (sampling, want=1). */
     int     cp;             /* DS4F_CP: context parallelism — compressed caches sharded by slot,
                              * selected latents gathered (ar_cb-SUM) so attention reads a full set. */
     float  *s_cmp_gather;   /* [index_topk * kv_lora] gathered selected cmp latents (f32) under CP */
@@ -455,7 +575,8 @@ typedef struct {
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
-    double prof[20];
+#define DS4F_NPHASE 24
+    double prof[DS4F_NPHASE];
 } ds4f_model;
 
 /* phase ids for ds4f_model.prof[]. TB2SCAN..TB2LCMP are SUB-timers of TB2PREP (they
@@ -469,18 +590,20 @@ typedef struct {
  *   tb2lcmp  = layer compressor (the top-of-tb2_prepare cmp_kv write) (O(1))
  *   tb2topk  = index_topk top-k selection (O(k*T) naive scan!) -- the real ctx-scaling cost
  * tb2prep - (sum of these) = glue. These isolate where the index decode time actually goes. */
-#define DS4F_NPHASE 20
 enum { DS4F_P_QKV=0, DS4F_P_ATTN=1, DS4F_P_OPROJ=2, DS4F_P_SHARED=3,
        DS4F_P_ROUTER=4, DS4F_P_EXPERTS=5, DS4F_P_HEAD=6, DS4F_P_OTHER=7,
        DS4F_P_TB2PREP=8, DS4F_P_TB2SCAN=9,
        DS4F_P_TB2QPROJ=10, DS4F_P_TB2ROPE=11, DS4F_P_TB2ICMP=12,
        DS4F_P_TB2WPROJ=13, DS4F_P_TB2LCMP=14, DS4F_P_TB2TOPK=15,
        /* QKV_A..QKV_ROPE are SUB-timers of QKV (like TB2SCAN.. are of TB2PREP) */
-       DS4F_P_QKV_A=16, DS4F_P_QKV_B=17, DS4F_P_QKV_KV=18, DS4F_P_QKV_ROPE=19 };
-static const char *ds4f_prof_names[20] = {
+       DS4F_P_QKV_A=16, DS4F_P_QKV_B=17, DS4F_P_QKV_KV=18, DS4F_P_QKV_ROPE=19,
+       /* mHC + comm decode sub-timers (mhc* are inside "other"/oproj/experts; comm = ar_cb) */
+       DS4F_P_MHCPRE=20, DS4F_P_MHCPOST=21, DS4F_P_MHCCPY=22, DS4F_P_COMM=23 };
+static const char *ds4f_prof_names[24] = {
     "qkv_proj","attn","o_proj","shared","router","experts","head","other","tb2prep","tb2scan",
     "tb2qproj","tb2rope","tb2icmp","tb2wproj","tb2lcmp","tb2topk",
-    "qkv_wqa","qkv_wqb","qkv_wkv","qkv_rope" };
+    "qkv_wqa","qkv_wqb","qkv_wkv","qkv_rope",
+    "mhc_pre","mhc_post","mhc_cpy","comm" };
 
 /* ===================== thread pool (pinned, spin) ===================== */
 typedef void (*ds4f_fn)(void *arg, int tid, int nthr);

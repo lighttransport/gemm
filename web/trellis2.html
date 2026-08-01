@@ -102,9 +102,12 @@ const ORIGIN = resolveOrigin();
 $('origin-label').textContent = ORIGIN;
 
 const DEFAULT_BACKENDS = [
-  { label: "ours (cpu)",     id: "ours-cpu",     defaultOff: true },
-  { label: "ours (cuda)",    id: "ours-cuda"    },
-  { label: "pytorch (cuda)", id: "pytorch-cuda" },
+  { label: "ours (cpu)",            id: "ours-cpu",       defaultOff: true },
+  { label: "ours (cuda)",           id: "ours-cuda"      },
+  { label: "ours (cuda, C-module)", id: "ours-cuda-cmod" },
+  { label: "ours (cpu, C-module)",  id: "ours-cpu-cmod",  defaultOff: true },
+  { label: "ours (hip/rdna4)",      id: "ours-hip"       },
+  { label: "pytorch",               id: "pytorch-cuda"   },
 ];
 const BACKENDS = DEFAULT_BACKENDS;
 

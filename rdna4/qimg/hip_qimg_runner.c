@@ -101,6 +101,32 @@ typedef struct {
     void *txt_mlp_fc1_w, *txt_mlp_fc1_b, *txt_mlp_fc2_w, *txt_mlp_fc2_b;
 } qimg_block_gpu;
 
+/* ---- Per-linear INT4 (Nunchaku/SVDQuant, W4A16) weight descriptor ----
+ * Logical (de-swizzled) layout produced offline by tools/nunchaku_convert_logical.py and uploaded verbatim;
+ * the dequant kernel unpacks contiguous nibbles, applies the per-(out, input-group) wscale, divides the BF16
+ * activation by `smooth`, and adds the rank-128 BF16 low-rank (lora_up · (lora_down · x)) plus bias. */
+typedef struct {
+    void  *qint4;      /* device uint8 [n_out, n_in/2]  contiguous logical int4 nibble pack */
+    float *wscale;     /* device f32   [n_out, n_in/group_size] */
+    float *smooth;     /* device f32   [n_in] */
+    void  *lora_down;  /* device bf16  [rank, n_in] */
+    void  *lora_up;    /* device bf16  [n_out, rank] */
+    float *bias;       /* device f32   [n_out] */
+    int n_out, n_in, rank, group_size;
+} qimg_int4_linear;
+
+/* Upper bound on calibration slots = max blocks (64) * 12 main linears/block. */
+#define QIMG_CALIB_MAXSLOT (64 * 12)
+
+/* INT8 W8A8: 14 quantized linears per block (12 main + img_mod.1 + txt_mod.1). */
+#define QIMG_I8_PER_BLOCK 14
+static const char *const qimg_i8_suffix[QIMG_I8_PER_BLOCK] = {
+    "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
+    "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
+    "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2",
+    "img_mod.1", "txt_mod.1",
+};
+
 /* ---- Runner struct ---- */
 
 struct hip_qimg_runner {
@@ -110,19 +136,36 @@ struct hip_qimg_runner {
     hipModule_t mod;
     hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_opt_fp8;
     hipFunction_t fn_gemm_fp8_wmma;  /* gfx12 BF16 act × FP8 wt matrix-core GEMM */
-    hipFunction_t fn_gemm_fp8_fp8_pgr2;  /* gfx12 FP8 act × FP8 wt WMMA */
+    hipFunction_t fn_gemm_fp8_fp8_pgr2;  /* gfx12 FP8 act × FP8 wt WMMA (hand-written) */
+    /* Vendor (hipBLASLt/Tensile) FP8 GEMM, extracted to a .co. ~1.5x our
+     * hand-written kernel; used for the FP8xFP8 path when QIMG_FP8_VENDOR is
+     * set and the .co loads. Scalar scale only (scaleA=scaleB=1); bias added
+     * separately via fn_add_bias. */
+    hipModule_t fp8_vendor_mod;
+    hipFunction_t fn_fp8_vendor;
+    hipFunction_t fn_add_bias;       /* row-major Y[m,n]+=bias[n] */
+    void *d_scale_one;               /* device float[4] = {1,1,1,1} for scaleA/B/C/D */
+    int use_fp8_vendor;              /* 1 = vendor .co loaded and enabled */
     hipFunction_t fn_quantize_act_perrow;  /* F32 -> FP8 with per-row max-abs scale */
     hipFunction_t fn_quantize_act_scalar;  /* F32 -> FP8 with scalar scale=1, Comfy-style */
     hipFunction_t fn_quantize_act_clamp;   /* F32 -> FP8 with scale=max(1,maxabs/448) */
     hipFunction_t fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
-    hipFunction_t fn_rmsnorm_ph, fn_flash_attn, fn_flash_attn_wmma;
+    hipFunction_t fn_rmsnorm_ph, fn_flash_attn, fn_flash_attn_wmma, fn_flash_attn_wmma_pq, fn_flash_attn_wmma_sp;
     int use_attn_wmma; /* 1 = use BF16 WMMA flash attention (gfx12, head_dim=128) */
+    int use_attn_wmma_pq; /* 1 = use the persistent-Q + double-buffered v2 kernel (opt-in QIMG_ATTN_V2) */
+    int use_attn_wmma_sp; /* 1 = use the software-pipelined v3 kernel (opt-in QIMG_ATTN_V3) */
     hipFunction_t fn_qkv_perhead_maxabs, fn_q_quant_fp8, fn_kv_quant_repack_fp8, fn_flash_attn_fp8;
     hipFunction_t fn_q_quant_perrow, fn_k_quant_repack_perrow, fn_flash_attn_fp8_perrow;
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
+    hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
+    hipFunction_t fn_quant_act_int8, fn_gemm_w8a8, fn_gemm_w8a8_wmma, fn_gemm_w8a8_pgr2;  /* INT8 W8A8 GEMMs */
+    hipFunction_t fn_gemm_int4w_g16;  /* simple RTN int4-g16 BF16-act WMMA GEMM (no LoRA/swizzle) */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
-    hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip;
+    hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip, fn_act_fp8_rt, fn_w_int8_rt, fn_w_int4_rt;
+    int act_fp8_rt;  /* QIMG_ACT_FP8_RT=1: per-row fp8/448 act roundtrip pre-GEMM (CUDA repro) */
+    int w_int8_rt;   /* QIMG_W_INT8_RT=1: int8 g64 weight roundtrip pre-GEMM (int8 quality check) */
+    int w_int4_rt;   /* QIMG_W_INT4_RT=1: simple RTN int4 g16 weight roundtrip (int4 quality check) */
     /* VAE kernels */
     hipFunction_t fn_vae_conv2d, fn_vae_rmsnorm, fn_vae_silu, fn_vae_up2x;
     hipFunction_t fn_vae_conv2d_3x3_wmma, fn_vae_conv2d_1x1_wmma;
@@ -135,7 +178,8 @@ struct hip_qimg_runner {
     int in_ch, txt_dim, mlp_h;
     int use_fp8;  /* 1 = upload FP8 raw + use LUT GEMM (4x less VRAM) */
     int use_wmma; /* 1 = use BF16 WMMA matrix cores for FP8 GEMMs (gfx12 only) */
-    int use_fp8_fp8w; /* 1 = use FP8xFP8 WMMA + per-row act quant when n_tok % 128 == 0 (gfx12) */
+    int use_fp8_fp8w; /* 1 = use FP8xFP8 WMMA + act quant when n_tok % 128 == 0 (gfx12) */
+    int fast_fp8_matrix_mult; /* 1 = ComfyUI --fast fp8_matrix_mult semantics */
     int prefer_bf16_wmma; /* 1 = QIMG_FP8_WMMA_BF16=1 forces BF16xFP8 even when FP8xFP8 would qualify */
 
     /* Persistent scratch for FP8xFP8 path. Sized lazily by op_gemm_fp8 to fit
@@ -160,6 +204,25 @@ struct hip_qimg_runner {
     /* Preloaded blocks on GPU */
     qimg_block_gpu *gpu_blocks;
     int n_preloaded;
+    /* Persistent ping-pong buffers for streamed blocks (>= n_preloaded), reused
+     * every denoise step instead of malloc/free churn. Async-prefetched on
+     * copy_stream and double-buffered to overlap H2D with compute. */
+    qimg_block_gpu stream_blk[2];
+    int stream_blk_alloc;       /* 1 once both buffers' fields are allocated */
+    /* INT4 (Nunchaku/SVDQuant, W4A16 logical layout) path — all blocks resident (no streaming). */
+    qimg_int4_linear *int4_linears;  /* [n_blocks * QIMG_INT4_PER_BLOCK] per-block logical-linear descriptors */
+    qimg_int4_linear *int4_mod;      /* [n_blocks * 2] img_mod/txt_mod RTN-int4 (rank0, no smooth) */
+    float *i4_ldf, *i4_luf, *i4_dt, *i4_dly; size_t i4_dt_cap, i4_dly_cap;  /* persistent lora scratch */
+    int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
+    /* INT8 SmoothQuant (W8A8) path: int8 weights stream via the fp8 byte path (same 1 B/param);
+     * the small per-linear scales stay resident. d_xq_int8/d_x_iscale = per-token quant scratch. */
+    int use_int8, use_int8_smooth;
+    void **i8_ws, **i8_sm;           /* [n_blocks*QIMG_I8_PER_BLOCK] resident weight_scale[n_out] / smooth_scale[n_in] */
+    void *d_xq_int8; float *d_x_iscale; size_t i8_xq_cap, i8_is_cap;
+    hipStream_t copy_stream;
+    hipEvent_t stream_copy_done[2];
+    hipEvent_t stream_use_done[2];
+    int use_block_stream_db;    /* 1 = async double-buffered streaming enabled */
 
     /* Global GPU weights */
     void *d_img_in_w, *d_img_in_b;
@@ -200,6 +263,18 @@ struct hip_qimg_runner {
     int fp8_act_scale_clamp;
     int current_block;
     char current_gemm_label[64];
+
+    /* Activation-stats calibration (QIMG_CALIB_DUMP=<path>): per-(block,slot) per-input-channel
+     * max-abs of each main linear's input, collected in the bf16/fp8 path to drive offline
+     * SVDQuant smoothing. Lazily allocated on first hit; dumped (safetensors of F32 [n_in]) and
+     * freed in hip_qimg_free. Slot = block*12 + op_proj slot (0..11). */
+    const char *calib_dump_path;            /* non-NULL enables collection */
+    hipFunction_t fn_calib_amax;            /* amax_per_col_f32 */
+    float *calib_amax[QIMG_CALIB_MAXSLOT];  /* device [n_in] per main linear */
+    int    calib_nin[QIMG_CALIB_MAXSLOT];   /* n_in per slot (0 = unallocated) */
+    /* Modulation activation absmax: img_mod/txt_mod share the d_t_silu input [dim]; one [dim]
+     * buffer per block, dumped as img_mod.1.amax + txt_mod.1.amax (the 990x-outlier layer). */
+    float *calib_tsilu[64];                 /* device [dim] per block */
 };
 
 enum {
@@ -306,8 +381,18 @@ static int qimg_csv_has_label(const char *csv, const char *label) {
     return 0;
 }
 
+static int qimg_has_fp8_fp8_positive_filter(const hip_qimg_runner *r) {
+    if (!r) return 0;
+    if (r->fp8_fp8_allow && r->fp8_fp8_allow[0]) return 1;
+    if (r->fp8_fp8_block_min >= 0 || r->fp8_fp8_block_max >= 0) return 1;
+    return 0;
+}
+
 static int qimg_allow_fp8_fp8_for_current_label(hip_qimg_runner *r) {
     if (!r) return 0;
+    if (!r->fast_fp8_matrix_mult &&
+        r->fp8_quality_target_db > 0.0f && !qimg_has_fp8_fp8_positive_filter(r))
+        return 0;
     if (r->current_block >= 0) {
         if (r->fp8_fp8_block_min >= 0 && r->current_block < r->fp8_fp8_block_min)
             return 0;
@@ -409,14 +494,55 @@ static void qimg_maybe_quant_stats(hip_qimg_runner *r, void *X,
         int idx = (int)(0.99f * (float)(nsamp - 1));
         p99 = samples[idx];
     }
+
+    /* Block-wise (per-row, per-K-group) and per-tensor reconstruction MAE,
+     * to test whether finer activation-scale granularity reduces e4m3 quant
+     * error vs the shipped per-row scale. scale_div / clamp follow the active
+     * mode so the three numbers are directly comparable. Set the K-group with
+     * QIMG_FP8_QUANT_STATS_GBLK (default 128). */
+    int gblk = 128;
+    {
+        const char *gv = getenv("QIMG_FP8_QUANT_STATS_GBLK");
+        if (gv && atoi(gv) > 0) gblk = atoi(gv);
+    }
+    double sum_mae_blk = 0.0, sum_mae_tensor = 0.0;
+    {
+        float st = r->fp8_act_scale_scalar ? 1.0f :
+                   (r->fp8_act_scale_clamp ? (global_max > 448.0f ? global_max / 448.0f : 1.0f)
+                                            : (global_max / r->fp8_act_scale_div));
+        if (st < 1e-12f) st = 1e-12f;
+        float inv_st = 1.0f / st;
+        for (int m = 0; m < n_tok; m++) {
+            const float *row = h + (size_t)m * K;
+            for (int kb = 0; kb < K; kb += gblk) {
+                int ke = kb + gblk; if (ke > K) ke = K;
+                float gmax = 0.0f;
+                for (int k = kb; k < ke; k++) { float a = fabsf(row[k]); if (a > gmax) gmax = a; }
+                float sb = r->fp8_act_scale_scalar ? 1.0f :
+                           (r->fp8_act_scale_clamp ? (gmax > 448.0f ? gmax / 448.0f : 1.0f)
+                                                    : (gmax / r->fp8_act_scale_div));
+                if (sb < 1e-12f) sb = 1e-12f;
+                float inv_sb = 1.0f / sb;
+                for (int k = kb; k < ke; k++) {
+                    float qb = fp8_e4m3_to_f32(f32_to_fp8_e4m3_cpu(row[k] * inv_sb)) * sb;
+                    sum_mae_blk += fabsf(qb - row[k]);
+                    float qt = fp8_e4m3_to_f32(f32_to_fp8_e4m3_cpu(row[k] * inv_st)) * st;
+                    sum_mae_tensor += fabsf(qt - row[k]);
+                }
+            }
+        }
+    }
+
     fprintf(stderr,
             "  fp8q[%03d] block=%d %-18s M=%d/%d K=%d row_max_avg=%.5g max=%.5g "
-            "scale_mode=%s scale_div=%.1f mae=%.5g p99=%.5g zeros=%.2f%% sat=%.2f%%\n",
+            "scale_mode=%s scale_div=%.1f mae=%.5g mae_blk%d=%.5g mae_tensor=%.5g "
+            "p99=%.5g zeros=%.2f%% sat=%.2f%%\n",
             r->quant_prints, r->current_block, r->current_gemm_label,
             n_tok, M_pad, K, sum_row_max / (double)n_tok, global_max,
             r->fp8_act_scale_scalar ? "comfy" : (r->fp8_act_scale_clamp ? "clamp" : "perrow"),
             r->fp8_act_scale_div,
-            sum_mae / (double)n, p99, 100.0 * (double)zeros / (double)n,
+            sum_mae / (double)n, gblk, sum_mae_blk / (double)n,
+            sum_mae_tensor / (double)n, p99, 100.0 * (double)zeros / (double)n,
             100.0 * (double)sat / (double)n);
     r->quant_prints++;
     free(samples);
@@ -509,9 +635,89 @@ static void *qimg_st_upload_fp8_raw(st_context *st, const char *name) {
 }
 
 /* Upload weight: FP8 raw if use_fp8, else F32 */
+/* Upload a tensor's raw bytes to device verbatim (dtype-agnostic) — for the logical INT4 bundle's packed
+ * nibbles (uint8) and the BF16 low-rank factors, which the dequant kernel reinterprets. */
+static void *qimg_st_upload_raw(st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return NULL;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    const void *data = safetensors_data(st, idx);
+    void *d = NULL;
+    if (hipMalloc(&d, nbytes) != hipSuccess) {
+        fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for %s (raw)\n", (float)nbytes / (1 << 20), name);
+        return NULL;
+    }
+    hipMemcpy(d, data, nbytes, hipMemcpyHostToDevice);
+    return d;
+}
+
+/* Upload one logical INT4 linear bundle (<key>.qint4/.wscale/.smooth/.lora_down/.lora_up/.bias) into a
+ * descriptor; dims inferred from shapes (qint4 [n_out, n_in/2]; lora_up [n_out, rank]). Returns 0 on success.
+ * Used by the Nunchaku-format DiT loader — all blocks preloaded (the INT4 model fits VRAM; no streaming). */
+static int qimg_upload_int4_linear(st_context *st, const char *key, qimg_int4_linear *L) {
+    char nm[256]; int idx;
+    memset(L, 0, sizeof(*L)); L->group_size = 64;
+    snprintf(nm, sizeof(nm), "%s.qint4", key);
+    idx = safetensors_find(st, nm); if (idx < 0) return -1;
+    const uint64_t *qs = safetensors_shape(st, idx);          /* [n_out, n_in/2] */
+    L->n_out = (int)qs[0]; L->n_in = (int)(qs[1] * 2);
+    /* Group size from wscale columns: Nunchaku g64 -> n_in/64 cols; simple g16 -> n_in/16. */
+    snprintf(nm, sizeof(nm), "%s.wscale", key);
+    { int widx = safetensors_find(st, nm);
+      if (widx >= 0) { const uint64_t *ws = safetensors_shape(st, widx);
+        int wcols = (int)ws[safetensors_ndims(st, widx) - 1];
+        if (wcols > 0) L->group_size = L->n_in / wcols; } }
+    snprintf(nm, sizeof(nm), "%s.lora_up", key);
+    idx = safetensors_find(st, nm); if (idx >= 0) L->rank = (int)safetensors_shape(st, idx)[1];
+    snprintf(nm, sizeof(nm), "%s.qint4", key);     L->qint4     = qimg_st_upload_raw(st, nm);
+    snprintf(nm, sizeof(nm), "%s.wscale", key);    L->wscale    = (float *)qimg_st_upload_raw(st, nm);   /* bf16, kernel expands */
+    snprintf(nm, sizeof(nm), "%s.smooth", key);    L->smooth    = (float *)qimg_st_upload_f32(st, nm);
+    snprintf(nm, sizeof(nm), "%s.lora_down", key); L->lora_down = qimg_st_upload_raw(st, nm);
+    snprintf(nm, sizeof(nm), "%s.lora_up", key);   L->lora_up   = qimg_st_upload_raw(st, nm);
+    snprintf(nm, sizeof(nm), "%s.bias", key);      L->bias      = (float *)qimg_st_upload_f32(st, nm);
+    if (!L->qint4 || !L->wscale || !L->bias) return -1;        /* mod: no smooth/lora (rank stays 0) */
+    return 0;
+}
+
 static void *qimg_upload_weight(hip_qimg_runner *r, st_context *st, const char *name) {
+    if (r->use_int8) return qimg_st_upload_raw(st, name);   /* int8 bytes (1 B/param, like fp8) */
     if (r->use_fp8) return qimg_st_upload_fp8_raw(st, name);
     return qimg_st_upload_f32(st, name);
+}
+
+/* Copy a tensor into an already-allocated device buffer `dest` (same shape as a
+ * prior upload of an identically-shaped tensor). Used to re-stream the same set
+ * of blocks every denoise step without re-malloc/free. `stream` may be a copy
+ * stream for async overlap (host F32-convert temp is synced before reuse).
+ * Returns 0 on success, -1 on failure. */
+static int qimg_st_upload_fp8_raw_into(st_context *st, const char *name,
+                                       void *dest, hipStream_t stream) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0 || !dest) return -1;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    const void *data = safetensors_data(st, idx);
+    return hipMemcpyAsync(dest, data, nbytes, hipMemcpyHostToDevice, stream) == hipSuccess ? 0 : -1;
+}
+
+static int qimg_st_upload_f32_into(st_context *st, const char *name, void *dest) {
+    /* Bias/norm tensors: small, host dtype-convert then a synchronous copy.
+     * (Kept synchronous — the temp would otherwise need to outlive an async copy.) */
+    void *tmp = qimg_st_upload_f32(st, name);  /* mallocs+copies a fresh device buffer */
+    if (!tmp || !dest) { if (tmp) hipFree(tmp); return -1; }
+    int idx = safetensors_find(st, name);
+    const uint64_t *shape = safetensors_shape(st, idx);
+    int ndims = safetensors_ndims(st, idx);
+    size_t n = 1; for (int d = 0; d < ndims; d++) n *= shape[d];
+    int rc = hipMemcpy(dest, tmp, n * sizeof(float), hipMemcpyDeviceToDevice) == hipSuccess ? 0 : -1;
+    hipFree(tmp);
+    return rc;
+}
+
+static int qimg_upload_weight_into(hip_qimg_runner *r, st_context *st,
+                                   const char *name, void *dest, hipStream_t stream) {
+    /* fp8_raw_into is a dtype-agnostic raw byte copy -> reuse it for int8 bytes too. */
+    if (r->use_int8 || r->use_fp8) return qimg_st_upload_fp8_raw_into(st, name, dest, stream);
+    return qimg_st_upload_f32_into(st, name, dest);
 }
 
 /* Upload a weight whose source dtype may be FP8 or BF16/F16/F32 (mixed-dtype
@@ -573,7 +779,11 @@ static void qimg_free_block(qimg_block_gpu *b) {
     }
 }
 
-static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b) {
+/* Load all weights of a transformer block into `b`. If `b`'s fields are already
+ * allocated (reuse=streaming buffer), copy into them on `stream` (no malloc/free);
+ * otherwise malloc fresh (preload path). `stream` is only used for the reuse path. */
+static int qimg_load_block_s(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b,
+                             hipStream_t stream) {
     st_context *st = (st_context *)r->dit_st;
     char name[256];
     int ok = 1;
@@ -581,14 +791,14 @@ static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b)
     /* BLK_W: upload as FP8 raw or F32 depending on use_fp8 */
     #define BLK_W(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        b->field = qimg_upload_weight(r, st, name); \
-        if (!b->field) ok = 0; \
+        if (b->field) { if (qimg_upload_weight_into(r, st, name, b->field, stream) != 0) ok = 0; } \
+        else { b->field = qimg_upload_weight(r, st, name); if (!b->field) ok = 0; } \
     } } while(0)
     /* BLK_F32: always upload as F32 (biases, norms) */
     #define BLK_F32(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        b->field = qimg_st_upload_f32(st, name); \
-        if (!b->field) ok = 0; \
+        if (b->field) { if (qimg_st_upload_f32_into(st, name, b->field) != 0) ok = 0; } \
+        else { b->field = qimg_st_upload_f32(st, name); if (!b->field) ok = 0; } \
     } } while(0)
 
     BLK_W(attn_q_w, "attn.to_q.weight"); BLK_F32(attn_q_b, "attn.to_q.bias");
@@ -622,6 +832,11 @@ static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b)
         return -1;
     }
     return 0;
+}
+
+/* Preload path: fresh malloc, default stream. */
+static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b) {
+    return qimg_load_block_s(r, block_idx, b, 0);
 }
 
 
@@ -673,13 +888,72 @@ static int qimg_ensure_act_scratch(hip_qimg_runner *r, size_t M_pad, size_t K) {
 /* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT.
  * Dispatch order:
  *   1. FP8×FP8 WMMA + activation FP8 quant (gfx12, n_tok % 128 == 0,
- *      n_out % 128 == 0, K % 32 == 0) — when QIMG_FP8_FP8_WMMA=1 and
- *      QIMG_FP8_WMMA_BF16 not set. Fastest path, ports the rdna4/fp8
- *      pipe32_pgr2 ~218 TF/s kernel.
- *   2. BF16 WMMA matrix-core (gfx12, n_tok ≥ 16) — when QIMG_FP8_WMMA=1
- *   3. 128×128 tiled scalar LUT (n_tok ≥ 16) — default fast path
+ *      n_out % 128 == 0, K % 32 == 0) — only for ComfyUI-compatible
+ *      --fast fp8_matrix_mult mode.
+ *   2. BF16×FP8 WMMA matrix-core (gfx12, n_tok ≥ 16) — default FP8
+ *      checkpoint compute path when the kernel is present.
+ *   3. 128×128 tiled scalar LUT (n_tok ≥ 16) — fallback path
  *   4. 16×16 scalar LUT — fallback for small token batches
  */
+/* Launch the extracted vendor (Tensile) FP8 GEMM: D[M,N] = A[N,K] (op=T) @
+ * B[M,K] (op=N), scalar scaleA/B (=1). Mirrors rdna4/fp8/bench_fp8_extracted.
+ * A operand = weights W[n_out,n_in], B operand = activations X_fp8[n_tok,n_in].
+ * Bias is NOT applied here (null slot); caller adds it separately. */
+#ifndef HIP_LAUNCH_PARAM_BUFFER_POINTER
+#define HIP_LAUNCH_PARAM_BUFFER_POINTER ((void *)0x01)
+#define HIP_LAUNCH_PARAM_BUFFER_SIZE    ((void *)0x02)
+#define HIP_LAUNCH_PARAM_END            ((void *)0x03)
+#endif
+static int qimg_launch_fp8_vendor(hip_qimg_runner *r, void *Y, void *W,
+                                  void *X_fp8, void *bias, int n_out, int n_in, int n_tok) {
+    /* 172-byte kernarg layout (offsets from rdna4/fp8/bench_fp8_extracted). */
+    unsigned char ka[176];
+    memset(ka, 0, sizeof(ka));
+    #define KAU32(off, v) do { uint32_t t_ = (uint32_t)(v); memcpy(ka + (off), &t_, 4); } while (0)
+    #define KAPTR(off, p)  do { void *t_ = (void *)(p);     memcpy(ka + (off), &t_, sizeof(void *)); } while (0)
+    #define KAF32(off, v) do { float t_ = (float)(v);       memcpy(ka + (off), &t_, 4); } while (0)
+    KAU32(0,  1u);            /* GEMM_INFO   */
+    KAU32(4,  0x02200001u);   /* INTERNAL0   */
+    KAU32(8,  0x08010008u);   /* INTERNAL1   */
+    KAU32(12, (unsigned)(n_out / 128));  /* NUMWG */
+    KAU32(16, (unsigned)n_out);          /* SIZES_FREE0 = N */
+    KAU32(20, (unsigned)n_tok);          /* SIZES_FREE1 = M */
+    KAU32(24, 1u);                       /* SIZES_FREE2 = batch */
+    KAU32(28, (unsigned)n_in);           /* SIZES_SUM0  = K */
+    KAPTR(32, Y);     /* D */
+    KAPTR(40, Y);     /* C */
+    KAPTR(48, W);     /* A = weights [N,K] */
+    KAPTR(56, X_fp8); /* B = activations [M,K] */
+    KAU32(64, (unsigned)n_out); /* stride D0 = N */
+    KAU32(72, (unsigned)n_out); /* stride C0 = N */
+    KAU32(80, (unsigned)n_in);  /* stride A0 = K */
+    KAU32(88, (unsigned)n_in);  /* stride B0 = K */
+    KAF32(96, 1.0f);  /* alpha */
+    KAF32(100, 0.0f); /* beta  */
+    KAPTR(104, r->d_scale_one); /* scaleA */
+    KAPTR(112, r->d_scale_one); /* scaleB */
+    KAPTR(120, r->d_scale_one); /* scaleC */
+    KAPTR(128, r->d_scale_one); /* scaleD */
+    /* Fuse the per-column F32 bias via the kernel's bias slot (sym has _Bias_).
+     * BIAS_TYPE 0 = F32, STRIDE_BIAS 0 = broadcast over rows. scaleAV null. */
+    if (bias) {
+        KAPTR(144, bias);
+        KAU32(152, 0u);  /* BIAS_TYPE = F32 */
+        KAU32(156, 0u);  /* STRIDE_BIAS */
+    }
+    #undef KAU32
+    #undef KAPTR
+    #undef KAF32
+    size_t arg_size = 172;
+    void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ka,
+                      HIP_LAUNCH_PARAM_BUFFER_SIZE,    &arg_size,
+                      HIP_LAUNCH_PARAM_END};
+    hipError_t e = hipModuleLaunchKernel(r->fn_fp8_vendor,
+                                         (unsigned)(n_out / 128), (unsigned)(n_tok / 128), 1,
+                                         128, 1, 1, 0, NULL, NULL, (void **)config);
+    return e == hipSuccess ? 0 : -1;
+}
+
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                         int n_out, int n_in, int n_tok) {
     hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
@@ -696,6 +970,19 @@ static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bia
             qimg_maybe_quant_stats(r, X, n_tok, n_in, M_pad);
             /* Quantize: F32 X[n_tok, n_in] -> FP8 + row writeback scale. */
             int K = n_in;
+            if (r->use_fp8_vendor && r->fn_fp8_vendor) {
+                /* Vendor (Tensile) FP8 GEMM: scalar scale=1 quantize, then GEMM,
+                 * then a separate per-column bias add. The vendor kernel uses a
+                 * scalar scaleA/B, so the activation must be scale=1; per-tensor
+                 * == per-row quant error for these activations (see README), so
+                 * this is quality-neutral vs the hand-written per-row path. */
+                void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad};
+                hipModuleLaunchKernel(r->fn_quantize_act_scalar,
+                                      (unsigned)M_pad, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
+                if (qimg_launch_fp8_vendor(r, Y, W, d_x_fp8, bias, n_out, n_in, n_tok) == 0)
+                    return;
+                /* vendor launch failed -> fall through to hand-written kernel. */
+            }
             if (r->fp8_act_scale_scalar || r->fp8_act_scale_clamp) {
                 void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad};
                 hipModuleLaunchKernel(quant_fn,
@@ -762,8 +1049,19 @@ static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
 /* Weight GEMM + BF16 truncation */
 static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           int n_out, int n_in, int n_tok) {
+    if (r->act_fp8_rt && r->fn_act_fp8_rt) {  /* CUDA-repro: lossy fp8/448 acts, accurate GEMM */
+        void *a[] = {&X, &n_in}; hipModuleLaunchKernel(r->fn_act_fp8_rt, (unsigned)n_tok, 1, 1, 256, 1, 1, 0, NULL, a, NULL);
+    }
+    if (r->w_int8_rt && r->fn_w_int8_rt && !r->use_fp8) {  /* int8 g64 weight precision check (bf16 src) */
+        void *a[] = {&W, &n_in}; hipModuleLaunchKernel(r->fn_w_int8_rt, (unsigned)n_out, 1, 1, 1, 1, 1, 0, NULL, a, NULL);
+    }
+    if (r->w_int4_rt && r->fn_w_int4_rt && !r->use_fp8) {  /* simple RTN int4 g16 weight precision check */
+        void *a[] = {&W, &n_in}; hipModuleLaunchKernel(r->fn_w_int4_rt, (unsigned)n_out, 1, 1, 1, 1, 1, 0, NULL, a, NULL);
+    }
+    hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
+                             (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
     int fp8_fp8_eligible = (r->use_fp8_fp8w && !r->prefer_bf16_wmma && r->fn_gemm_fp8_fp8_pgr2 &&
-                             r->fn_quantize_act_perrow &&
+                             quant_fn && qimg_allow_fp8_fp8_for_current_label(r) &&
                              (n_tok % 128) == 0 && (n_out % 128) == 0 && (n_in % 32) == 0);
     if (r->use_fp8 && (r->fn_gemm_opt_fp8 || (r->use_wmma && r->fn_gemm_fp8_wmma) || fp8_fp8_eligible) && n_tok >= 16) {
         /* Optimized FP8 paths produce already-effectively-BF16 outputs:
@@ -799,6 +1097,116 @@ static void op_gemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bi
                          int n_out, int n_in, int n_tok) {
     op_gemm(r, Y, W, X, bias, n_out, n_in, n_tok);
     op_bf16_trunc(r, Y, n_out * n_tok);
+}
+
+/* Unfused W4A16 SVDQuant linear: Y[n_tok,n_out] = (W·wscale/smooth)@X + lora_up@(lora_down@X) + bias.
+ * Verified-correct, perf-naive (per-call dense materialize + f32 GEMMs); the fused dequant-LDS WMMA kernel
+ * replaces the W-materialize later. L = &int4_linears[block*PER_BLOCK + slot]. X is F32 [n_tok,n_in]. */
+/* INT8 SmoothQuant W8A8 linear: quant X per-token to int8 (dividing by `smooth` if non-NULL),
+ * int8xint8->int32 dp4a GEMM with fused dequant (xscale[t]*wscale[o]) + bias -> f32 Y[n_tok,n_out].
+ * Wq is the (streamed) int8 weight [n_out,n_in]; wscale[n_out]/smooth[n_in] are resident. */
+static void op_gemm_int8(hip_qimg_runner *r, void *Y, void *Wq, void *wscale, void *smooth,
+                         void *X, void *bias, int n_out, int n_in, int n_tok) {
+    size_t xqb = (size_t)n_tok * n_in;
+    if (xqb > r->i8_xq_cap) { if (r->d_xq_int8) { hipDeviceSynchronize(); hipFree(r->d_xq_int8); }
+        hipMalloc(&r->d_xq_int8, xqb); r->i8_xq_cap = xqb; }
+    size_t isb = (size_t)n_tok * 4;
+    if (isb > r->i8_is_cap) { if (r->d_x_iscale) { hipDeviceSynchronize(); hipFree(r->d_x_iscale); }
+        hipMalloc((void **)&r->d_x_iscale, isb); r->i8_is_cap = isb; }
+    void *qa[] = {&X, &smooth, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+    hipModuleLaunchKernel(r->fn_quant_act_int8, (unsigned)n_tok, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
+    void *ga[] = {&Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale, &bias, &n_out, &n_in, &n_tok};
+    static int i8_dp4a = -1; if (i8_dp4a < 0) i8_dp4a = getenv("QIMG_INT8_DP4A") ? 1 : 0;
+    if (r->fn_gemm_w8a8_pgr2 && !i8_dp4a && (n_tok % 128) == 0 && (n_out % 128) == 0 && (n_in % 32) == 0) {
+        /* Pipelined int8 WMMA (double-buffered LDS) — the fast path for the big img linears. */
+        void *gp[] = {&Y, &Wq, &r->d_xq_int8, &bias, &r->d_x_iscale, &wscale, &n_out, &n_in, &n_tok, &n_tok};
+        hipModuleLaunchKernel(r->fn_gemm_w8a8_pgr2, (unsigned)(n_out / 128), (unsigned)(n_tok / 128), 1, 128, 1, 1, 0, NULL, gp, NULL);
+    } else if (r->fn_gemm_w8a8_wmma && !i8_dp4a) {  /* simple int8 WMMA: any size (n_tok=1/19 tails), zero-padded — faster than scalar dp4a even with tile waste */
+        hipModuleLaunchKernel(r->fn_gemm_w8a8_wmma, (unsigned)((n_out + 127) / 128), (unsigned)((n_tok + 127) / 128), 1, 256, 1, 1, 0, NULL, ga, NULL);
+    } else {  /* scalar dp4a fallback (QIMG_INT8_DP4A=1 or no WMMA) */
+        hipModuleLaunchKernel(r->fn_gemm_w8a8, (unsigned)((n_out + 127) / 128), (unsigned)n_tok, 1, 128, 1, 1, 0, NULL, ga, NULL);
+    }
+    /* One-shot kernel self-test: host reference = (Wq*wscale)·(x/smooth)+bias, vs the GEMM Y. */
+    static int i8_dbg_done = 0;
+    if (getenv("QIMG_INT8_DEBUG") && !i8_dbg_done && n_tok >= 64 && n_tok <= 256) {
+        i8_dbg_done = 1; hipDeviceSynchronize();
+        signed char *hW = malloc((size_t)n_out*n_in); float *hws = malloc((size_t)n_out*4);
+        float *hsm = smooth ? malloc((size_t)n_in*4) : NULL, *hX = malloc((size_t)n_tok*n_in*4);
+        float *hY = malloc((size_t)n_tok*n_out*4), *hb = bias ? malloc((size_t)n_out*4) : NULL;
+        hipMemcpy(hW, Wq, (size_t)n_out*n_in, hipMemcpyDeviceToHost);
+        hipMemcpy(hws, wscale, (size_t)n_out*4, hipMemcpyDeviceToHost);
+        if (hsm) hipMemcpy(hsm, smooth, (size_t)n_in*4, hipMemcpyDeviceToHost);
+        hipMemcpy(hX, X, (size_t)n_tok*n_in*4, hipMemcpyDeviceToHost);
+        hipMemcpy(hY, Y, (size_t)n_tok*n_out*4, hipMemcpyDeviceToHost);
+        if (hb) hipMemcpy(hb, bias, (size_t)n_out*4, hipMemcpyDeviceToHost);
+        double dot=0, nr=0, ng=0; int t=0;
+        for (int o=0;o<n_out;o++){ double acc=0; for(int k=0;k<n_in;k++){ double xv=hX[(size_t)t*n_in+k]; if(hsm)xv/=hsm[k];
+            acc += (double)hW[(size_t)o*n_in+k]*hws[o]*xv; } if(hb)acc+=hb[o];
+            double g=hY[(size_t)t*n_out+o]; dot+=acc*g; nr+=acc*acc; ng+=g*g; }
+        fprintf(stderr,"[int8dbg] n_out=%d n_in=%d n_tok=%d smooth=%d cos(gpu,host)=%.5f ||host||=%.3g ||gpu||=%.3g\n",
+                n_out,n_in,n_tok,smooth?1:0, dot/(sqrt(nr)*sqrt(ng)+1e-30), sqrt(nr), sqrt(ng));
+        free(hW);free(hws);free(hX);free(hY); if(hsm)free(hsm); if(hb)free(hb);
+    }
+}
+
+static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
+    int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank;
+    /* Simple RTN int4-g16 path (no swizzle/LoRA/smooth): plain nibble + per-g16
+     * bf16 scale via the validated gemm_int4w_g16 kernel. */
+    if (gs == 16 && r->fn_gemm_int4w_g16) {
+        void *ga[] = {&Y, (void*)&L->qint4, (void*)&L->wscale, &X, (void*)&L->bias, &n_out, &n_in, &n_tok};
+        hipModuleLaunchKernel(r->fn_gemm_int4w_g16, (unsigned)((n_out+127)/128),
+                              (unsigned)((n_tok+127)/128), 1, 256, 1, 1, 0, NULL, ga, NULL);
+        return;
+    }
+    /* fused W4A16: dequant-in-LDS bf16 WMMA (main+smooth+bias) — replaces dense materialize */
+    void *ga[]={&Y,(void*)&L->qint4,&X,(void*)&L->bias,(void*)&L->wscale,(void*)&L->smooth,&n_out,&n_in,&n_tok};
+    hipModuleLaunchKernel(r->fn_gemm_int4w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,ga,NULL);
+    if (rk > 0 && L->lora_down) {                                     /* rank-128 residual (skip for mod: rank 0) */
+        if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
+        /* Growing these shared scratch buffers means hipFree+hipMalloc; sync
+         * first so we never free a buffer a prior launch is still reading. Skip
+         * and the GEMM faults at the first bigger output (img_mlp_fc1, 12288) and
+         * the whole queue hangs. */
+        if ((size_t)rk*n_tok > r->i4_dt_cap) { hipDeviceSynchronize(); hipFree(r->i4_dt); hipMalloc(&r->i4_dt,(size_t)rk*n_tok*4); r->i4_dt_cap=(size_t)rk*n_tok; }
+        if ((size_t)n_out*n_tok > r->i4_dly_cap) { hipDeviceSynchronize(); hipFree(r->i4_dly); hipMalloc(&r->i4_dly,(size_t)n_out*n_tok*4); r->i4_dly_cap=(size_t)n_out*n_tok; }
+        float *ldf=r->i4_ldf,*luf=r->i4_luf,*dt=r->i4_dt,*dly=r->i4_dly;
+        int ldn=rk*n_in, lun=n_out*rk; void *e1[]={(void*)&L->lora_down,&ldf,&ldn}, *e2[]={(void*)&L->lora_up,&luf,&lun};
+        hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((ldn+255)/256),1,1,256,1,1,0,NULL,e1,NULL);
+        hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((lun+255)/256),1,1,256,1,1,0,NULL,e2,NULL);
+        op_gemm(r, dt, ldf, X, NULL, rk, n_in, n_tok); op_gemm(r, dly, luf, dt, NULL, n_out, rk, n_tok);
+        int ny=n_out*n_tok; void *aa[]={&Y,&dly,&ny}; hipModuleLaunchKernel(r->fn_add,(unsigned)((ny+255)/256),1,1,256,1,1,0,NULL,aa,NULL);
+        /* Drain before the next linear reuses the shared dt/dly scratch: 60
+         * blocks x ~6 unsynced launches each overruns the queue and deadlocks
+         * at the final block. ~0.06 ms/step cost; safe. */
+        hipDeviceSynchronize();
+    }
+}
+
+/* Route a block projection: int4 descriptor[blk*12+slot] when a logical-INT4 DiT is loaded, else BF16 weight. */
+static void op_proj(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
+                    int n_out, int n_in, int n_tok, int blk, int slot) {
+    /* Calibration: accumulate this linear's per-input-channel activation max-abs (offline SVDQuant smoothing).
+     * Hooks the activation X before the GEMM; works in the bf16/fp8 path (collected before any INT4 exists). */
+    if (r->calib_dump_path && r->fn_calib_amax && X && blk >= 0 && slot >= 0
+        && blk * 12 + slot < QIMG_CALIB_MAXSLOT) {
+        int idx = blk * 12 + slot;
+        if (!r->calib_amax[idx] && hipMalloc(&r->calib_amax[idx], (size_t)n_in * 4) == hipSuccess) {
+            hipMemset(r->calib_amax[idx], 0, (size_t)n_in * 4);
+            r->calib_nin[idx] = n_in;
+        }
+        if (r->calib_amax[idx]) {
+            void *ca[] = {&r->calib_amax[idx], &X, &n_tok, &n_in};
+            hipModuleLaunchKernel(r->fn_calib_amax, (unsigned)((n_in + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ca, NULL);
+        }
+    }
+    if (r->use_int4 && r->int4_linears) { op_int4_linear(r, Y, X, &r->int4_linears[(size_t)blk*12 + slot], n_tok); return; }
+    if (r->use_int8 && r->i8_ws) {   /* W is the streamed int8 weight; scales resident at [blk,slot] */
+        size_t ix = (size_t)blk * QIMG_I8_PER_BLOCK + slot;
+        op_gemm_int8(r, Y, W, r->i8_ws[ix], r->use_int8_smooth ? r->i8_sm[ix] : NULL, X, bias, n_out, n_in, n_tok);
+        return;
+    }
+    op_wgemm_bf16(r, Y, W, X, bias, n_out, n_in, n_tok);
 }
 
 static void op_silu(hip_qimg_runner *r, void *x, int n) {
@@ -967,6 +1375,22 @@ static void op_attn(hip_qimg_runner *r, void *d_out, void *d_q,
         }
         return;
     }
+    if (r->use_attn_wmma_sp && r->fn_flash_attn_wmma_sp && head_dim == 128) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+        hipModuleLaunchKernel(r->fn_flash_attn_wmma_sp,
+                              (unsigned)n_heads, gy, 1,
+                              128, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
+    if (r->use_attn_wmma_pq && r->fn_flash_attn_wmma_pq && head_dim == 128) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+        hipModuleLaunchKernel(r->fn_flash_attn_wmma_pq,
+                              (unsigned)n_heads, gy, 1,
+                              128, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
     if (r->use_attn_wmma && r->fn_flash_attn_wmma && head_dim == 128) {
         unsigned gy = (unsigned)((n_tok + 63) / 64);
         void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
@@ -1091,6 +1515,52 @@ static void *vae_resblock_gpu(hip_qimg_runner *r, void *x,
 int g_hip_initialized = 0;  /* track if HIP was already init'd by another runner */
 char g_hip_arch[64] = {0};  /* cached arch string (e.g. "gfx1201") */
 
+/* Standalone correctness gate for gemm_int4w_g16_bf16a_wmma_t: pack a random
+ * bf16 weight to simple RTN int4-g16 on the host, run the kernel, and compare to
+ * a CPU reference using the SAME dequantized weights (so it isolates kernel
+ * arithmetic/indexing, not quant error). Gated by QIMG_INT4_SELFTEST. */
+static void qimg_int4_g16_selftest_one(hip_qimg_runner *r, int M, int K, int N) {
+    if (!r->fn_gemm_int4w_g16) { fprintf(stderr, "int4-g16 selftest: kernel missing\n"); return; }
+    float *X = (float*)malloc((size_t)M*K*4), *W = (float*)malloc((size_t)N*K*4);
+    float *Wd = (float*)malloc((size_t)N*K*4); /* dequantized ref */
+    unsigned char *q = (unsigned char*)calloc((size_t)N*(K/2),1);
+    unsigned short *sc = (unsigned short*)malloc((size_t)N*(K/16)*2);
+    unsigned int s=12345;
+    #define RND ((s=s*1664525u+1013904223u),((float)(s>>8)*(1.0f/16777216.0f)*2.0f-1.0f))
+    for (int i=0;i<M*K;i++) X[i]=RND;
+    for (int i=0;i<N*K;i++) W[i]=RND;
+    for (int o=0;o<N;o++) for (int g=0; g<K/16; g++) {
+        float mx=0; for(int j=0;j<16;j++){float a=fabsf(W[o*K+g*16+j]); if(a>mx)mx=a;}
+        float scale=mx/7.0f; if(scale<1e-12f)scale=1e-12f;
+        unsigned int sb; float scf=scale; memcpy(&sb,&scf,4); sc[o*(K/16)+g]=(unsigned short)(sb>>16);
+        unsigned int sbk=((unsigned int)sc[o*(K/16)+g])<<16; float scq; memcpy(&scq,&sbk,4); /* bf16-rounded scale */
+        for (int j=0;j<16;j++){ int kp=g*16+j; int qq=(int)lroundf(W[o*K+kp]/scq); if(qq>7)qq=7; if(qq<-7)qq=-7;
+            Wd[o*K+kp]=qq*scq; unsigned char b=q[o*(K/2)+(kp>>1)];
+            if(kp&1) b=(b&0x0F)|((qq&0xF)<<4); else b=(b&0xF0)|(qq&0xF); q[o*(K/2)+(kp>>1)]=b; }
+    }
+    #undef RND
+    double *Yr=(double*)malloc((size_t)M*N*8);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){double a=0;for(int kk=0;kk<K;kk++)a+=(double)X[m*K+kk]*Wd[n*K+kk];Yr[m*N+n]=a;}
+    void *dX,*dq,*dsc,*dY; hipMalloc(&dX,(size_t)M*K*4); hipMalloc(&dq,(size_t)N*(K/2)); hipMalloc(&dsc,(size_t)N*(K/16)*2); hipMalloc(&dY,(size_t)M*N*4);
+    hipMemcpy(dX,X,(size_t)M*K*4,hipMemcpyHostToDevice); hipMemcpy(dq,q,(size_t)N*(K/2),hipMemcpyHostToDevice); hipMemcpy(dsc,sc,(size_t)N*(K/16)*2,hipMemcpyHostToDevice);
+    void *bias=NULL; void *args[]={&dY,&dq,&dsc,&dX,&bias,&N,&K,&M};
+    hipModuleLaunchKernel(r->fn_gemm_int4w_g16,(unsigned)((N+127)/128),(unsigned)((M+127)/128),1,256,1,1,0,NULL,args,NULL);
+    hipError_t le = hipDeviceSynchronize();
+    float *Yg=(float*)malloc((size_t)M*N*4); hipMemcpy(Yg,dY,(size_t)M*N*4,hipMemcpyDeviceToHost);
+    double dot=0,nr=0,ng=0,mx=0; for(int i=0;i<M*N;i++){double a=Yr[i],b=Yg[i];dot+=a*b;nr+=a*a;ng+=b*b;double d=fabs(a-b);if(d>mx)mx=d;}
+    double cosv = dot/(sqrt(nr)*sqrt(ng)+1e-30);
+    fprintf(stderr,"hip_qimg: int4-g16 selftest M%-4d K%-5d N%-5d  cos=%.6f  max=%.3e  sync_err=%d  %s\n",
+        M,K,N, cosv, mx, le, (le==0 && cosv>0.9999)?"PASS":"FAIL");
+    hipFree(dX);hipFree(dq);hipFree(dsc);hipFree(dY); free(X);free(W);free(Wd);free(q);free(sc);free(Yr);free(Yg);
+}
+static void qimg_int4_g16_selftest(hip_qimg_runner *r) {
+    /* Real DiT linear shapes (N=n_out, K=n_in) at n_tok 256 (img) and 12 (txt). */
+    int shapes[][2] = {{3072,3072},{3072,3584},{12288,3072},{3072,12288},{18432,3072}};
+    int Ms[3] = {256, 12, 1};   /* img, txt, modulation (n_tok=1) */
+    for (int t = 0; t < 3; t++)
+        for (int s = 0; s < 5; s++) qimg_int4_g16_selftest_one(r, Ms[t], shapes[s][1], shapes[s][0]);
+}
+
 hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
         fprintf(stderr, "hip_qimg: rocewInit failed (HIP/HIPRTC libraries not found)\n");
@@ -1137,6 +1607,9 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         r->quant_stats_max = 80;
         e = getenv("QIMG_FP8_QUANT_STATS_MAX");
         if (e && atoi(e) > 0) r->quant_stats_max = atoi(e);
+        { const char *ar = getenv("QIMG_ACT_FP8_RT"); r->act_fp8_rt = (ar && atoi(ar)); }
+        { const char *wr = getenv("QIMG_W_INT8_RT"); r->w_int8_rt = (wr && atoi(wr)); }
+        { const char *wr = getenv("QIMG_W_INT4_RT"); r->w_int4_rt = (wr && atoi(wr)); }
         r->fp8_fp8_allow = getenv("QIMG_FP8_FP8_ALLOW");
         r->fp8_fp8_deny = getenv("QIMG_FP8_FP8_DENY");
         r->fp8_fp8_block_min = -1;
@@ -1158,6 +1631,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
             r->fp8_act_scale_scalar = 1;
         if (e && (!strcmp(e, "clamp") || !strcmp(e, "safe") || !strcmp(e, "safe_scalar")))
             r->fp8_act_scale_clamp = 1;
+        r->calib_dump_path = getenv("QIMG_CALIB_DUMP");  /* enables per-linear activation max-abs collection */
+        if (r->calib_dump_path && !r->calib_dump_path[0]) r->calib_dump_path = NULL;
     }
 
     #define GET(field, name) hipModuleGetFunction(&r->field, mod, name)
@@ -1174,7 +1649,13 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         r->fn_quantize_act_scalar = NULL;
     if (hipModuleGetFunction(&r->fn_quantize_act_clamp, mod, "qimg_quantize_act_clamp_fp8") != hipSuccess)
         r->fn_quantize_act_clamp = NULL;
+    if (hipModuleGetFunction(&r->fn_add_bias, mod, "qimg_add_bias_rowmajor_f32") != hipSuccess)
+        r->fn_add_bias = NULL;
     GET(fn_layernorm, "layernorm_f32");
+    GET(fn_dequant_int4_main, "dequant_int4_logical_main_f32");
+    GET(fn_add, "add_inplace_f32");
+    GET(fn_expand_bf16, "expand_bf16_f32");
+    GET(fn_gemm_int4w, "gemm_int4w_bf16a_wmma_t");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
     GET(fn_adaln, "adaln_modulate_f32");
@@ -1183,6 +1664,10 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_flash_attn, "flash_attn_f32");
     if (hipModuleGetFunction(&r->fn_flash_attn_wmma, mod, "flash_attn_sa_wmma_f32") != hipSuccess)
         r->fn_flash_attn_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_flash_attn_wmma_pq, mod, "flash_attn_sa_wmma_pq_f32") != hipSuccess)
+        r->fn_flash_attn_wmma_pq = NULL;
+    if (hipModuleGetFunction(&r->fn_flash_attn_wmma_sp, mod, "flash_attn_sa_wmma_sp_f32") != hipSuccess)
+        r->fn_flash_attn_wmma_sp = NULL;
     GET(fn_rope_2d, "rope_2d_f32");
     GET(fn_rope_1d, "rope_1d_f32");
     GET(fn_bf16_trunc, "truncate_bf16_f32");
@@ -1192,6 +1677,18 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_cfg_combine, "cfg_combine_f32");
     GET(fn_rmsnorm_weighted, "rmsnorm_weighted_f32");
     GET(fn_fp8_roundtrip, "quantize_fp8_roundtrip_f32");
+    GET(fn_act_fp8_rt, "act_fp8_roundtrip_perrow");
+    GET(fn_w_int8_rt, "w_int8_roundtrip_g64");
+    GET(fn_w_int4_rt, "w_int4_roundtrip_g16");
+    GET(fn_gemm_int4w_g16, "gemm_int4w_g16_bf16a_wmma_t");
+    GET(fn_calib_amax, "amax_per_col_f32");
+    if (hipModuleGetFunction(&r->fn_quant_act_int8, mod, "quant_act_perrow_int8") != hipSuccess) r->fn_quant_act_int8 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8, mod, "gemm_w8a8_perrow_f32") != hipSuccess) r->fn_gemm_w8a8 = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_wmma, mod, "gemm_w8a8_wmma") != hipSuccess) r->fn_gemm_w8a8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_w8a8_pgr2, mod, "gemm_w8a8_pgr2") != hipSuccess) r->fn_gemm_w8a8_pgr2 = NULL;
+    if (r->calib_dump_path)
+        fprintf(stderr, "hip_qimg: QIMG_CALIB_DUMP active -> %s (collecting per-linear activation max-abs)\n",
+                r->calib_dump_path);
     GET(fn_vae_conv2d, "vae_conv2d_f32");
     if (hipModuleGetFunction(&r->fn_vae_conv2d_3x3_wmma, mod, "vae_conv2d_3x3_wmma_f32") != hipSuccess)
         r->fn_vae_conv2d_3x3_wmma = NULL;
@@ -1240,29 +1737,43 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
                 fprintf(stderr, "hip_qimg: FP8 LUT GEMM enabled (4x less VRAM per block)\n");
         }
     }
+    if (getenv("QIMG_FORCE_F32W")) {  /* bf16/f32 ckpt: upload weights as f32, stream (1296MB/blk) */
+        r->use_fp8 = 0;
+        fprintf(stderr, "hip_qimg: QIMG_FORCE_F32W — fp8 disabled, weights uploaded as F32\n");
+    }
 
-    /* WMMA matrix-core path (gfx12). Opt-in via QIMG_FP8_WMMA=1. */
+    /* BF16xFP8 WMMA matrix-core path (gfx12). Default ON for FP8
+     * checkpoints when the kernel is available; opt out with QIMG_FP8_WMMA=0. */
     r->use_wmma = 0;
     {
         const char *v = getenv("QIMG_FP8_WMMA");
-        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+        int want_wmma = !(v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+        if (want_wmma) {
             if (!r->fn_gemm_fp8_wmma) {
-                fprintf(stderr, "hip_qimg: WMMA kernel not present (need gfx12); ignoring QIMG_FP8_WMMA\n");
+                if (v)
+                    fprintf(stderr, "hip_qimg: WMMA kernel not present (need gfx12); ignoring QIMG_FP8_WMMA\n");
             } else if (!r->use_fp8) {
-                fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA requires FP8 mode; ignoring\n");
+                if (v)
+                    fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA requires FP8 mode; ignoring\n");
             } else {
                 r->use_wmma = 1;
                 if (verbose)
                     fprintf(stderr, "hip_qimg: BF16xFP8 WMMA (gfx12 matrix cores) enabled\n");
             }
         }
+        if (!r->use_wmma && r->fp8_quality_target_db > 0.0f && r->fn_gemm_fp8_wmma && r->use_fp8) {
+            r->use_wmma = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: BF16xFP8 WMMA fallback enabled for FP8 quality target\n");
+        }
     }
 
-    /* FP8xFP8 WMMA path (gfx12). Opt-in via QIMG_FP8_FP8_WMMA=1. Eligible when
-     * n_tok and n_out are both multiples of 128 (img-side GEMMs at 256+ res);
-     * falls back to BF16xFP8 WMMA otherwise. QIMG_FP8_WMMA_BF16=1 forces the
+    /* FP8xFP8 WMMA path (gfx12). This is the ComfyUI --fast fp8_matrix_mult
+     * path: activation clamp/cast to FP8, raw FP8 weights, unit scales by
+     * default, BF16xFP8 fallback otherwise. QIMG_FP8_WMMA_BF16=1 forces the
      * BF16 path even when FP8xFP8 qualifies. */
     r->use_fp8_fp8w = 0;
+    r->fast_fp8_matrix_mult = 0;
     r->prefer_bf16_wmma = 0;
     r->d_act_fp8 = NULL;
     r->d_act_scales = NULL;
@@ -1274,20 +1785,53 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     r->fa_perrow_bytes = 0;
     r->act_scales_bytes = 0;
     {
-        const char *v = getenv("QIMG_FP8_FP8_WMMA");
-        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+        const char *v = getenv("QIMG_FAST_FP8_MATRIX_MULT");
+        int fast_off = (v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+        int fast_on  = (v && !fast_off);
+        r->fast_fp8_matrix_mult = fast_on ? 1 : 0;
+
+        /* Quality-safe default preset (2026-05-23): when the user gives no
+         * explicit FP8 fast configuration, route the perceptually-lossless
+         * 48 dB tier to FP8xFP8 — img_mlp_fc1 in blocks >=8, clamp activation
+         * quant. Measured 49.67 dB latent / PNG indistinguishable from the
+         * pure BF16xFP8 default (54.7 dB PNG PSNR, max pixel diff 8/255), at
+         * 29% of the WMMA-eligible GEMM pool. Earlier fc1 blocks (0..7) carry
+         * the intrinsic e4m3 activation-mantissa error that floors at ~44 dB,
+         * so they stay BF16xFP8. See README.native-fp8.md / project memory.
+         * Opt out: --fast none (QIMG_FAST_FP8_MATRIX_MULT=0) or
+         * QIMG_FP8_WMMA_BF16=1 restores the pure BF16xFP8 path. */
+        if (!fast_on && !fast_off && r->use_fp8 &&
+            !getenv("QIMG_FP8_WMMA_BF16") &&
+            !(r->fp8_fp8_allow && r->fp8_fp8_allow[0]) &&
+            !(r->fp8_fp8_deny && r->fp8_fp8_deny[0]) &&
+            r->fp8_fp8_block_min < 0 && r->fp8_fp8_block_max < 0 &&
+            r->fp8_quality_target_db <= 0.0f &&
+            r->fn_gemm_fp8_fp8_pgr2 && r->fn_quantize_act_clamp) {
+            r->fast_fp8_matrix_mult = 1;
+            r->fp8_act_scale_clamp = 1;
+            r->fp8_act_scale_scalar = 0;
+            r->fp8_fp8_allow = "img_mlp_fc1";
+            r->fp8_fp8_block_min = 8;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: quality-safe FP8xFP8 default ON "
+                        "(img_mlp_fc1 blocks>=8, clamp act; ~48 dB tier)\n");
+        }
+
+        if (r->fast_fp8_matrix_mult) {
+            if (!r->fp8_act_scale_scalar && !r->fp8_act_scale_clamp)
+                r->fp8_act_scale_scalar = 1;
             hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
                                      (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
             if (!r->fn_gemm_fp8_fp8_pgr2 || !quant_fn) {
-                fprintf(stderr, "hip_qimg: FP8xFP8 kernel not present (need gfx12); ignoring QIMG_FP8_FP8_WMMA\n");
+                fprintf(stderr, "hip_qimg: FP8xFP8 kernel not present (need gfx12); ignoring --fast fp8_matrix_mult\n");
             } else if (!r->use_fp8) {
-                fprintf(stderr, "hip_qimg: QIMG_FP8_FP8_WMMA requires FP8 mode; ignoring\n");
+                fprintf(stderr, "hip_qimg: --fast fp8_matrix_mult requires FP8 mode; ignoring\n");
             } else {
                 r->use_fp8_fp8w = 1;
                 if (verbose) {
-                    const char *mode = r->fp8_act_scale_scalar ? "scalar scale=1" :
+                    const char *mode = r->fp8_act_scale_scalar ? "Comfy scale=1 clamp/cast" :
                                        (r->fp8_act_scale_clamp ? "safe scalar" : "per-row");
-                    fprintf(stderr, "hip_qimg: FP8xFP8 WMMA + %s act quant enabled\n", mode);
+                    fprintf(stderr, "hip_qimg: ComfyUI --fast fp8_matrix_mult enabled: FP8xFP8 WMMA + %s act quant\n", mode);
                     if (r->fp8_fp8_allow && r->fp8_fp8_allow[0])
                         fprintf(stderr, "hip_qimg: FP8xFP8 allow labels: %s\n", r->fp8_fp8_allow);
                     if (r->fp8_fp8_deny && r->fp8_fp8_deny[0])
@@ -1296,7 +1840,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
                         fprintf(stderr, "hip_qimg: FP8xFP8 block range: %d..%d\n",
                                 r->fp8_fp8_block_min, r->fp8_fp8_block_max);
                     if (r->fp8_quality_target_db > 0.0f)
-                        fprintf(stderr, "hip_qimg: FP8 quality target: %.1f dB (diagnostic only; no automatic fallback)\n",
+                        fprintf(stderr, "hip_qimg: FP8 quality target: %.1f dB\n",
                                 r->fp8_quality_target_db);
                     if (!r->fp8_act_scale_scalar && !r->fp8_act_scale_clamp && r->fp8_act_scale_div != 512.0f)
                         fprintf(stderr, "hip_qimg: FP8 activation scale divisor: %.1f\n", r->fp8_act_scale_div);
@@ -1308,6 +1852,55 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
             r->prefer_bf16_wmma = 1;
             if (verbose)
                 fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA_BF16=1 -- forcing BF16xFP8 path even where FP8xFP8 would qualify\n");
+        }
+    }
+
+    /* Vendor (Tensile) FP8 GEMM for the FP8xFP8 fast path. Default ON when
+     * --fast is enabled and the extracted .co is present (QIMG_FP8_VENDOR=0
+     * forces the hand-written kernel). ~1.5x our kernel, matches torch. The
+     * .co is a build artifact: regenerate via rdna4/fp8/extract_fp8_kernel.sh. */
+    if (r->use_fp8_fp8w) {
+        /* Opt-in (QIMG_FP8_VENDOR=1): the vendor kernel uses a scalar activation
+         * scale, so it forces scale=1 quant (~1.5 dB below the hand-written
+         * clamp path on knife-edge configs). Default OFF keeps the documented
+         * quality-safe configs valid; enable for the ~1.5x GEMM / ~9% e2e win
+         * at the 48 dB (perceptually-lossless) tier. */
+        const char *vd = getenv("QIMG_FP8_VENDOR");
+        int want = (vd && !(strcmp(vd, "0") == 0 || strcmp(vd, "false") == 0));
+        if (want && r->fn_add_bias) {
+            static const char *VSYM =
+                "Cijk_Alik_Bljk_F8SS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs_"
+                "MT128x128x64_MI16x16x1_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_"
+                "DTLA0_DTLB0_DTVA0_DTVB1_EPS0_FDSI0_GRPM1_GRVWA16_GRVWB16_GSUAMB_GLS0_"
+                "ISA1201_IU1_K1_LDSTI0_LBSPPA256_LBSPPB0_LBSPPM0_LPA32_LPB0_LPM0_LRVW16_"
+                "LWPMn1_MIAV1_MIWT4_4_MO40_NTn1_NTA0_NTB0_NTC0_NTD0_NTM0_NEPBS0_NLCA1_"
+                "NLCB2_ONLL0_PGR2_PLR1_PKA0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_"
+                "SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGROn1_VSn1_VWA4_VWB4_WSGRA0_"
+                "WSGRB0_WS32_WG32_4_1";
+            const char *co_env = getenv("QIMG_FP8_VENDOR_CO");
+            const char *cands[3]; int nc = 0;
+            if (co_env && co_env[0]) cands[nc++] = co_env;
+            cands[nc++] = "../fp8/fp8_kernel_gfx1201.co";
+            cands[nc++] = "rdna4/fp8/fp8_kernel_gfx1201.co";
+            for (int ci = 0; ci < nc && !r->use_fp8_vendor; ci++) {
+                FILE *fp = fopen(cands[ci], "rb");
+                if (!fp) continue;
+                fclose(fp);
+                if (hipModuleLoad(&r->fp8_vendor_mod, cands[ci]) != hipSuccess) continue;
+                if (hipModuleGetFunction(&r->fn_fp8_vendor, r->fp8_vendor_mod, VSYM) != hipSuccess) {
+                    r->fn_fp8_vendor = NULL;
+                    continue;
+                }
+                if (hipMalloc(&r->d_scale_one, 4 * sizeof(float)) == hipSuccess) {
+                    float ones[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                    hipMemcpy(r->d_scale_one, ones, sizeof(ones), hipMemcpyHostToDevice);
+                    r->use_fp8_vendor = 1;
+                    if (verbose)
+                        fprintf(stderr, "hip_qimg: FP8xFP8 using vendor Tensile kernel (%s)\n", cands[ci]);
+                }
+            }
+            if (!r->use_fp8_vendor && verbose)
+                fprintf(stderr, "hip_qimg: vendor FP8 .co not found; using hand-written FP8xFP8 kernel\n");
         }
     }
 
@@ -1325,6 +1918,37 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         }
     }
 
+    /* v2 flash-attention: persistent-Q-in-registers + double-buffered K/V (gfx12,
+     * head_dim=128). DEFAULT ON when the kernel is loaded and WMMA attention is
+     * enabled — numerically bit-identical to v1 but ~10% faster at 1024² (it freed
+     * the 16 KB smQ so the load-latency hiding costs no occupancy). QIMG_ATTN_V2=0
+     * reverts to the v1 kernel; QIMG_BF16_ATTN=0 (which clears use_attn_wmma) drops
+     * all WMMA attention to the scalar fallback — and correctly suppresses v2 too,
+     * because the default-enable hangs off the same use_attn_wmma umbrella. */
+    r->use_attn_wmma_pq = 0;
+    if (r->fn_flash_attn_wmma_pq && r->use_attn_wmma) {
+        const char *v = getenv("QIMG_ATTN_V2");
+        int enable = 1;
+        if (v) enable = !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0);
+        if (enable) {
+            r->use_attn_wmma_pq = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: v2 flash-attention (persistent-Q + double-buffer) enabled [default]\n");
+        }
+    }
+
+    /* v3 flash-attention: software-pipelined ("FA3-idea") lookahead-QK + triple-buffered
+     * K/V (gfx12, head_dim=128). Opt-in A/B path via QIMG_ATTN_V3=1; default OFF. */
+    r->use_attn_wmma_sp = 0;
+    if (r->fn_flash_attn_wmma_sp) {
+        const char *v = getenv("QIMG_ATTN_V3");
+        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+            r->use_attn_wmma_sp = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: v3 flash-attention (software-pipelined lookahead-QK) enabled\n");
+        }
+    }
+
     /* BF16 WMMA VAE conv2d (gfx12). Default ON when kernels loaded; opt out via QIMG_VAE_WMMA=0. */
     r->use_vae_wmma = 0;
     if (r->fn_vae_conv2d_3x3_wmma && r->fn_vae_conv2d_1x1_wmma) {
@@ -1339,10 +1963,198 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     }
 
     if (verbose) fprintf(stderr, "hip_qimg: kernels compiled OK\n");
+    if (getenv("QIMG_INT4_SELFTEST")) qimg_int4_g16_selftest(r);
     return r;
 }
 
+/* Fill dst with the active HIP device's marketing name (e.g. "AMD Radeon RX
+ * 9070 XT"). Returns 0 on success. Used by callers to prove the GEMM/VAE work
+ * actually targets the GPU. */
+int hip_qimg_device_name(const hip_qimg_runner *r, char *dst, size_t cap) {
+    if (!r || !dst || cap == 0) return -1;
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, r->device_id) != hipSuccess) {
+        snprintf(dst, cap, "(unknown)");
+        return -1;
+    }
+    snprintf(dst, cap, "%s", props.name);
+    return 0;
+}
+
 /* ---- Load DiT ---- */
+
+/* The 12 logical linears per transformer block, in the order tools/nunchaku_convert_logical.py emits them
+ * (fused QKV split into separate q/k/v slots); the per-linear key is "transformer_blocks.{b}.{suffix}". */
+#define QIMG_INT4_PER_BLOCK 12
+static const char *const qimg_int4_linear_suffix[QIMG_INT4_PER_BLOCK] = {
+    "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
+    "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
+    "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2",
+};
+
+/* Load a Nunchaku/SVDQuant DiT in the offline-converted "logical" INT4 layout (W4A16). All blocks are
+ * resident — the ~12 GB INT4 model fits 16 GB, so the block-streaming the FP8 path needs is gone. This loads
+ * the per-block quantized-linear descriptors (the novel part); BF16 globals/norms/biases and the modulation
+ * still reuse the existing global-upload flow shared with hip_qimg_load_dit (wired in a following step). */
+int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
+    fprintf(stderr, "hip_qimg: loading logical-INT4 DiT %s\n", path);
+    st_context *st = safetensors_open(path);
+    if (!st) return -1;
+    r->dit_st = st; r->use_int4 = 1;
+    size_t free_entry = 0, vram_total = 0; hipMemGetInfo(&free_entry, &vram_total);  /* for the residency delta */
+    r->dim = 3072; r->n_heads = 24; r->head_dim = 128;
+    r->in_ch = 64; r->txt_dim = 3584; r->mlp_h = 12288;
+    r->n_blocks = 0;
+    for (int i = 0; i < st->n_tensors; i++) {
+        const char *bp = strstr(safetensors_name(st, i), "transformer_blocks.");
+        if (bp) { int blk = atoi(bp + 19); if (blk + 1 > r->n_blocks) r->n_blocks = blk + 1; }
+    }
+    r->int4_linears = (qimg_int4_linear *)calloc((size_t)r->n_blocks * QIMG_INT4_PER_BLOCK, sizeof(qimg_int4_linear));
+    if (!r->int4_linears) return -1;
+    int loaded = 0;
+    for (int b = 0; b < r->n_blocks; b++) {
+        for (int j = 0; j < QIMG_INT4_PER_BLOCK; j++) {
+            char key[160];
+            snprintf(key, sizeof(key), "transformer_blocks.%d.%s", b, qimg_int4_linear_suffix[j]);
+            if (qimg_upload_int4_linear(st, key, &r->int4_linears[(size_t)b * QIMG_INT4_PER_BLOCK + j]) == 0) loaded++;
+        }
+    }
+    /* BF16 globals (converter passthrough) — reuse the auto-dtype path: all BF16 here -> f32 upload. */
+    r->d_img_in_w = qimg_upload_weight_auto(r, st, "img_in.weight", &r->is_fp8_img_in);
+    r->d_img_in_b = qimg_st_upload_f32(st, "img_in.bias");
+    r->d_txt_in_w = qimg_upload_weight_auto(r, st, "txt_in.weight", &r->is_fp8_txt_in);
+    r->d_txt_in_b = qimg_st_upload_f32(st, "txt_in.bias");
+    r->d_txt_norm_w = qimg_st_upload_f32(st, "txt_norm.weight");
+    r->d_t_fc1_w = qimg_upload_weight_auto(r, st, "time_text_embed.timestep_embedder.linear_1.weight", &r->is_fp8_t_fc1);
+    r->d_t_fc1_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_1.bias");
+    r->d_t_fc2_w = qimg_upload_weight_auto(r, st, "time_text_embed.timestep_embedder.linear_2.weight", &r->is_fp8_t_fc2);
+    r->d_t_fc2_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_2.bias");
+    r->d_norm_out_w = qimg_upload_weight_auto(r, st, "norm_out.linear.weight", &r->is_fp8_norm_out);
+    r->d_norm_out_b = qimg_st_upload_f32(st, "norm_out.linear.bias");
+    r->d_proj_out_w = qimg_upload_weight_auto(r, st, "proj_out.weight", &r->is_fp8_proj_out);
+    r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
+    if (!r->d_img_in_w || !r->d_txt_in_w || !r->d_proj_out_w)
+        fprintf(stderr, "hip_qimg: int4 globals incomplete (some NULL); render needs all BF16 globals\n");
+    /* Per-block BF16 passthrough (norms + modulation): qkv/mlp come from int4 descriptors, so blocks fully resident. */
+    r->gpu_blocks = (qimg_block_gpu *)calloc((size_t)r->n_blocks, sizeof(qimg_block_gpu)); r->n_preloaded = r->n_blocks;
+    r->int4_mod = (qimg_int4_linear *)calloc((size_t)r->n_blocks * 2, sizeof(qimg_int4_linear));
+    for (int b = 0; b < r->n_blocks; b++) { qimg_block_gpu *g = &r->gpu_blocks[b]; char nm[160];
+        #define MW(f,suf) do{snprintf(nm,sizeof nm,"transformer_blocks.%d." suf,b); g->f=qimg_st_upload_f32(st,nm);}while(0)
+        MW(norm_q_w,"attn.norm_q.weight"); MW(norm_k_w,"attn.norm_k.weight");
+        MW(norm_added_q_w,"attn.norm_added_q.weight"); MW(norm_added_k_w,"attn.norm_added_k.weight");
+        #undef MW
+        snprintf(nm,sizeof nm,"transformer_blocks.%d.img_mod.1",b); int e1=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b]);
+        snprintf(nm,sizeof nm,"transformer_blocks.%d.txt_mod.1",b); int e2=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b+1]);
+        if (e1||e2) fprintf(stderr, "hip_qimg: int4 block %d mod/norm incomplete\n", b);
+    }
+    if (r->verbose) {
+        const qimg_int4_linear *s = &r->int4_linears[0];  /* sample: block 0, attn.to_q */
+        fprintf(stderr, "hip_qimg: logical-INT4 — %d blocks, %d/%d linear descriptors loaded; "
+                "sample to_q n_out=%d n_in=%d rank=%d group=%d\n",
+                r->n_blocks, loaded, r->n_blocks * QIMG_INT4_PER_BLOCK, s->n_out, s->n_in, s->rank, s->group_size);
+        size_t free_now = 0, t = 0; hipMemGetInfo(&free_now, &t);
+        fprintf(stderr, "hip_qimg: logical-INT4 weights resident: %.0f MB (of %.0f MB VRAM; no block streaming)\n",
+                (double)(free_entry - free_now) / 1e6, (double)vram_total / 1e6);
+    }
+    return (loaded == r->n_blocks * QIMG_INT4_PER_BLOCK) ? 0 : -1;
+}
+
+/* Deterministic on-GPU gate for the int4-logical "main" weight dequant. Assumes hip_qimg_load_dit_int4 has
+ * run (descriptors resident, r->dit_st host bytes available). Runs fn_dequant_int4_main on block-0 attn.to_q's
+ * packed nibbles+scales, copies the dense weight back, and compares element-wise against a host nibble-decode of
+ * the *same* bytes — so any mismatch is purely a kernel-indexing bug (the converter's host decode is the proven
+ * oracle). Bit-exact expected: identical float ops on identical operands. Returns 0 on success. */
+int hip_qimg_test_int4_dequant(hip_qimg_runner *r) {
+    if (!r->use_int4 || !r->int4_linears || !r->dit_st || !r->fn_dequant_int4_main) {
+        fprintf(stderr, "hip_qimg: int4-dequant test prerequisites missing (load logical-INT4 DiT first)\n");
+        return -1;
+    }
+    const char *key = "transformer_blocks.0.attn.to_q";   /* descriptor slot [0]; an unfused logical bundle */
+    const qimg_int4_linear *L = &r->int4_linears[0];
+    int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, ng = n_in / gs;
+    long total = (long)n_out * n_in;
+
+    /* host-side raw bytes the descriptor was built from (still mapped in r->dit_st) */
+    st_context *st = (st_context *)r->dit_st;
+    char nm[256];
+    snprintf(nm, sizeof(nm), "%s.qint4", key);  int iq = safetensors_find(st, nm);
+    snprintf(nm, sizeof(nm), "%s.wscale", key); int iw = safetensors_find(st, nm);
+    if (iq < 0 || iw < 0) { fprintf(stderr, "hip_qimg: int4-dequant test — host tensors for %s absent\n", key); return -1; }
+    const unsigned char *qb = (const unsigned char *)safetensors_data(st, iq);
+    const unsigned short *wsb = (const unsigned short *)safetensors_data(st, iw);  /* bf16 scales */
+    #define WS(idx) ({unsigned _u=(unsigned)wsb[idx]<<16; float _f; memcpy(&_f,&_u,4); _f;})
+
+    /* GPU dense weight */
+    float *d_W = NULL;
+    if (hipMalloc(&d_W, (size_t)total * sizeof(float)) != hipSuccess) { fprintf(stderr, "hip_qimg: int4-dequant test hipMalloc failed\n"); return -1; }
+    void *smnull = NULL;  /* pure-decode check uses no smooth (bit-exact vs raw nibble*scale) */
+    void *args[] = { (void *)&L->qint4, (void *)&L->wscale, &smnull, &d_W, &n_out, &n_in, &gs };
+    hipModuleLaunchKernel(r->fn_dequant_int4_main, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, args, NULL);
+    hipDeviceSynchronize();
+    float *h_W = (float *)malloc((size_t)total * sizeof(float));
+    hipMemcpy(h_W, d_W, (size_t)total * sizeof(float), hipMemcpyDeviceToHost);
+
+    /* host reference (the proven converter decode) + max-diff and norm */
+    double max_abs_diff = 0.0, sumsq = 0.0; long n_nonfinite = 0;
+    for (int o = 0; o < n_out; o++) {
+        for (int i = 0; i < n_in; i++) {
+            unsigned char byte = qb[(long)o * (n_in / 2) + (i >> 1)];
+            int nib = (i & 1) ? (byte >> 4) : (byte & 0xF);
+            if (nib >= 8) nib -= 16;
+            float ref = (float)nib * WS((long)o * ng + (i / gs));
+            float got = h_W[(long)o * n_in + i];
+            double d = fabs((double)got - (double)ref);
+            if (d > max_abs_diff) max_abs_diff = d;
+            sumsq += (double)ref * ref;
+            if (!isfinite(got)) n_nonfinite++;
+        }
+    }
+    fprintf(stderr, "hip_qimg: int4-dequant gate — %s  Ŵ[%d,%d] group=%d  ||W||=%.1f  max|gpu-host|=%.3g  nonfinite=%ld\n",
+            key, n_out, n_in, gs, sqrt(sumsq), max_abs_diff, n_nonfinite);
+
+    /* int4-main forward hookup: feed the dense weight through the F32 GEMM (bias) on a small batch,
+     * compare to a host matmul. lora/smoothing deferred — this just proves decode->GEMM wiring. */
+    int n_tok = 4; float *xh = (float *)malloc((size_t)n_tok * n_in * sizeof(float));
+    for (long k = 0; k < (long)n_tok * n_in; k++) xh[k] = ((k * 1103515245u + 12345u) % 2048) / 2048.0f - 0.5f;
+    float *dx = NULL, *dy = NULL; hipMalloc(&dx, (size_t)n_tok*n_in*4); hipMalloc(&dy, (size_t)n_tok*n_out*4);
+    hipMemcpy(dx, xh, (size_t)n_tok*n_in*4, hipMemcpyHostToDevice);
+    /* GPU: re-dequant with smoothing folded, then GEMM+bias — main + smooth + bias on GPU */
+    snprintf(nm, sizeof(nm), "%s.smooth", key); int ism = safetensors_find(st, nm); const float *smh = (const float *)safetensors_data(st, ism);
+    void *args2[] = { (void *)&L->qint4, (void *)&L->wscale, (void *)&L->smooth, &d_W, &n_out, &n_in, &gs };
+    hipModuleLaunchKernel(r->fn_dequant_int4_main, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, args2, NULL);
+    op_gemm(r, dy, d_W, dx, L->bias, n_out, n_in, n_tok);  /* main+smooth+bias */
+    /* + rank-128 low-rank residual on the RAW activation: y += lora_up @ (lora_down @ x). bf16->f32 for the f32 GEMMs. */
+    int rk = L->rank; float *ldf = (float*)malloc((size_t)rk*n_in*4), *luf = (float*)malloc((size_t)n_out*rk*4);
+    const uint16_t *ldb = (const uint16_t*)safetensors_data(st, safetensors_find(st, (snprintf(nm,sizeof nm,"%s.lora_down",key),nm)));
+    const uint16_t *lub = (const uint16_t*)safetensors_data(st, safetensors_find(st, (snprintf(nm,sizeof nm,"%s.lora_up",key),nm)));
+    for (long k=0;k<(long)rk*n_in;k++){unsigned u=ldb[k]<<16; memcpy(&ldf[k],&u,4);} for (long k=0;k<(long)n_out*rk;k++){unsigned u=lub[k]<<16; memcpy(&luf[k],&u,4);}
+    float *dld=0,*dlu=0,*dt=0,*dly=0; hipMalloc(&dld,(size_t)rk*n_in*4);hipMalloc(&dlu,(size_t)n_out*rk*4);hipMalloc(&dt,(size_t)n_tok*rk*4);hipMalloc(&dly,(size_t)n_tok*n_out*4);
+    hipMemcpy(dld,ldf,(size_t)rk*n_in*4,hipMemcpyHostToDevice); hipMemcpy(dlu,luf,(size_t)n_out*rk*4,hipMemcpyHostToDevice);
+    op_gemm(r, dt, dld, dx, NULL, rk, n_in, n_tok); op_gemm(r, dly, dlu, dt, NULL, n_out, rk, n_tok);
+    hipDeviceSynchronize();
+    float *yh = (float *)malloc((size_t)n_tok*n_out*4); hipMemcpy(yh, dy, (size_t)n_tok*n_out*4, hipMemcpyDeviceToHost);
+    float *lyh = (float *)malloc((size_t)n_tok*n_out*4); hipMemcpy(lyh, dly, (size_t)n_tok*n_out*4, hipMemcpyDeviceToHost);
+    for (long k=0;k<(long)n_tok*n_out;k++) yh[k]+=lyh[k]; free(lyh);  /* GPU lora GEMMs + accumulate */
+    float *bh = (float *)malloc(n_out*4); hipMemcpy(bh, L->bias, n_out*4, hipMemcpyDeviceToHost);
+    double dot = 0, ng2 = 0, rg2 = 0;
+    for (int t = 0; t < n_tok; t++) for (int o = 0; o < n_out; o++) {
+        double acc = 0; for (int i = 0; i < n_in; i++) acc += (double)(h_W[(long)o*n_in+i]/smh[i]) * xh[(long)t*n_in+i];
+        for (int rkk=0; rkk<rk; rkk++){ double d=0; for(int i=0;i<n_in;i++) d+=(double)ldf[(long)rkk*n_in+i]*xh[(long)t*n_in+i]; acc+=luf[(long)o*rk+rkk]*d; }
+        double ref = acc + bh[o]; float got = yh[(long)t*n_out+o]; dot += ref*got; rg2 += ref*ref; ng2 += (double)got*got;
+    }
+    fprintf(stderr, "hip_qimg: int4 full linear — y[%d,%d] cos(gpu,host)=%.6f (main+smooth+bias+lora%d)\n",
+            n_tok, n_out, dot / (sqrt(rg2)*sqrt(ng2) + 1e-30), rk);
+    /* fused kernel main+smooth+bias (no lora) vs host main+bias */
+    hipModuleLaunchKernel(r->fn_gemm_int4w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,
+        (void*[]){&dy,(void*)&L->qint4,&dx,(void*)&L->bias,(void*)&L->wscale,(void*)&L->smooth,&n_out,&n_in,&n_tok},NULL);
+    hipDeviceSynchronize(); float *fy=(float*)malloc((size_t)n_tok*n_out*4); hipMemcpy(fy,dy,(size_t)n_tok*n_out*4,hipMemcpyDeviceToHost);
+    double fd=0,fg=0,fr=0; for(int t=0;t<n_tok;t++)for(int o=0;o<n_out;o++){double a=bh[o];for(int i=0;i<n_in;i++)a+=(double)(h_W[(long)o*n_in+i]/smh[i])*xh[(long)t*n_in+i];double g=fy[(long)t*n_out+o];fd+=a*g;fr+=a*a;fg+=g*g;}
+    fprintf(stderr,"hip_qimg: fused int4 GEMM cos(fused,host main+smooth+bias)=%.6f\n",fd/(sqrt(fr)*sqrt(fg)+1e-30)); free(fy);
+    free(bh); free(ldf); free(luf); hipFree(dld); hipFree(dlu); hipFree(dt); hipFree(dly);
+    free(xh); free(yh); hipFree(dx); hipFree(dy);
+    free(h_W); hipFree(d_W);
+    return (max_abs_diff == 0.0 && n_nonfinite == 0) ? 0 : -1;
+}
 
 int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
     fprintf(stderr, "hip_qimg: loading DiT %s\n", path);
@@ -1361,6 +2173,19 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
         if (bp) {
             int blk = atoi(bp + 19);
             if (blk + 1 > r->n_blocks) r->n_blocks = blk + 1;
+        }
+    }
+
+    /* INT8 SmoothQuant (W8A8) detection: if .weight is I8, stream int8 weight bytes via the fp8
+     * byte path and keep the small per-linear scales resident. Must precede global upload so
+     * use_fp8=0 routes the bf16 globals through F32. */
+    if (r->fn_quant_act_int8 && r->fn_gemm_w8a8) {
+        int qi = safetensors_find(st, "transformer_blocks.0.attn.to_q.weight");
+        if (qi >= 0 && strcmp(safetensors_dtype(st, qi), "I8") == 0) {
+            r->use_int8 = 1; r->use_fp8 = 0; r->use_wmma = 0; r->use_fp8_fp8w = 0;
+            r->use_int8_smooth = (safetensors_find(st, "transformer_blocks.0.attn.to_q.smooth_scale") >= 0);
+            fprintf(stderr, "hip_qimg: INT8 W8A8 path%s (per-token act quant + per-out wscale; int8 weights streamed)\n",
+                    r->use_int8_smooth ? " + SmoothQuant" : "");
         }
     }
 
@@ -1432,13 +2257,36 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
         }
     }
 
+    /* INT8: load the small per-linear scales (weight_scale[n_out] + smooth_scale[n_in]) resident
+     * (~40 MB for all 60 blocks); only the int8 weight bytes are streamed. */
+    if (r->use_int8) {
+        size_t n = (size_t)r->n_blocks * QIMG_I8_PER_BLOCK;
+        r->i8_ws = (void **)calloc(n, sizeof(void *));
+        r->i8_sm = (void **)calloc(n, sizeof(void *));
+        int miss = 0;
+        for (int b = 0; b < r->n_blocks; b++)
+            for (int s = 0; s < QIMG_I8_PER_BLOCK; s++) {
+                char nm[256]; size_t ix = (size_t)b * QIMG_I8_PER_BLOCK + s;
+                snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.weight_scale", b, qimg_i8_suffix[s]);
+                r->i8_ws[ix] = qimg_st_upload_f32(st, nm);
+                if (!r->i8_ws[ix]) miss++;
+                if (r->use_int8_smooth) {
+                    snprintf(nm, sizeof(nm), "transformer_blocks.%d.%s.smooth_scale", b, qimg_i8_suffix[s]);
+                    r->i8_sm[ix] = qimg_st_upload_f32(st, nm);
+                }
+            }
+        if (miss) fprintf(stderr, "hip_qimg: INT8 — %d weight_scale tensors missing (render will be wrong)\n", miss);
+        else if (r->verbose) fprintf(stderr, "hip_qimg: INT8 — loaded %zu weight_scale%s vectors resident\n",
+                                     n, r->use_int8_smooth ? "+smooth_scale" : "");
+    }
+
     /* Preload as many blocks as fit in VRAM */
     {
         size_t free_mem = 0, total_mem = 0;
         hipMemGetInfo(&free_mem, &total_mem);
         /* FP8: ~324M params × 1 byte = ~324 MB/block (+ ~20MB F32 biases/norms)
          * F32:  ~324M params × 4 bytes = ~1296 MB/block */
-        size_t block_bytes = r->use_fp8 ? 344ULL * 1024 * 1024
+        size_t block_bytes = (r->use_fp8 || r->use_int8) ? 344ULL * 1024 * 1024
                                         : 1296ULL * 1024 * 1024;
         /* Workspace budget for per-step activation allocations. At 512×512
          * peak usage is ~300 MB (Q/K/V 72 MB, scratch3 48 MB, scratch1/2
@@ -1482,6 +2330,19 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
                 (float)free_mem / (1<<30));
     }
 
+    /* Streamed blocks (>= n_preloaded) reuse a persistent buffer + async copy
+     * instead of malloc/copy/free every step. Default ON; QIMG_BLOCK_STREAM=0
+     * reverts to the per-step malloc/free path. */
+    r->use_block_stream_db = (r->n_preloaded < r->n_blocks);
+    {
+        const char *v = getenv("QIMG_BLOCK_STREAM");
+        if (v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0))
+            r->use_block_stream_db = 0;
+    }
+    if (r->use_block_stream_db && r->verbose)
+        fprintf(stderr, "hip_qimg: persistent streamed-block buffer enabled (%d blocks streamed)\n",
+                r->n_blocks - r->n_preloaded);
+
     fprintf(stderr, "hip_qimg: loaded %d blocks, dim=%d\n", r->n_blocks, r->dim);
     return 0;
 }
@@ -1497,11 +2358,77 @@ int hip_qimg_load_vae(hip_qimg_runner *r, const char *path) {
     return 0;
 }
 
+/* Write collected calibration stats as a minimal safetensors of F32 [n_in] vectors keyed
+ * transformer_blocks.{b}.{suffix}.amax — consumed by tools/svdquant_from_bf16.py --calib. */
+static void qimg_calib_dump(hip_qimg_runner *r) {
+    if (!r->calib_dump_path) return;
+    size_t total_floats = 0; int present = 0;
+    for (int idx = 0; idx < QIMG_CALIB_MAXSLOT; idx++)
+        if (r->calib_amax[idx]) { total_floats += (size_t)r->calib_nin[idx]; present++; }
+    for (int b = 0; b < 64; b++)                          /* tsilu -> img_mod.1 + txt_mod.1 (data written twice) */
+        if (r->calib_tsilu[b]) { total_floats += (size_t)r->dim * 2; present += 2; }
+    if (!present) { fprintf(stderr, "hip_qimg: calib dump: no stats collected (run with a bf16/fp8 DiT)\n"); return; }
+    char *json = (char *)malloc((size_t)present * 256 + 64);
+    float *data = (float *)malloc(total_floats * 4);
+    if (!json || !data) { free(json); free(data); fprintf(stderr, "hip_qimg: calib dump: OOM\n"); return; }
+    size_t jp = 0, foff = 0; int first = 1;
+    jp += sprintf(json + jp, "{");
+    for (int b = 0; b < QIMG_CALIB_MAXSLOT / QIMG_INT4_PER_BLOCK; b++)
+        for (int s = 0; s < QIMG_INT4_PER_BLOCK; s++) {
+            int idx = b * QIMG_INT4_PER_BLOCK + s;
+            if (!r->calib_amax[idx]) continue;
+            int nin = r->calib_nin[idx];
+            hipMemcpy(data + foff, r->calib_amax[idx], (size_t)nin * 4, hipMemcpyDeviceToHost);
+            jp += sprintf(json + jp,
+                "%s\"transformer_blocks.%d.%s.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                first ? "" : ",", b, qimg_int4_linear_suffix[s], nin, foff * 4, (foff + (size_t)nin) * 4);
+            foff += (size_t)nin; first = 0;
+        }
+    for (int b = 0; b < 64; b++) {                        /* modulation: same d_t_silu amax for img_mod.1 + txt_mod.1 */
+        if (!r->calib_tsilu[b]) continue;
+        int nin = r->dim;
+        float *hbuf = data + foff;
+        hipMemcpy(hbuf, r->calib_tsilu[b], (size_t)nin * 4, hipMemcpyDeviceToHost);
+        jp += sprintf(json + jp, "%s\"transformer_blocks.%d.img_mod.1.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                      first ? "" : ",", b, nin, foff * 4, (foff + (size_t)nin) * 4);
+        foff += (size_t)nin; first = 0;
+        memcpy(data + foff, hbuf, (size_t)nin * 4);
+        jp += sprintf(json + jp, ",\"transformer_blocks.%d.txt_mod.1.amax\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%zu,%zu]}",
+                      b, nin, foff * 4, (foff + (size_t)nin) * 4);
+        foff += (size_t)nin;
+    }
+    jp += sprintf(json + jp, "}");
+    while (jp % 8) json[jp++] = ' ';                 /* pad header to 8-byte alignment */
+    FILE *f = fopen(r->calib_dump_path, "wb");
+    if (!f) { fprintf(stderr, "hip_qimg: calib dump: cannot open %s\n", r->calib_dump_path); free(json); free(data); return; }
+    uint64_t hlen = (uint64_t)jp;
+    fwrite(&hlen, 8, 1, f); fwrite(json, 1, jp, f); fwrite(data, 4, foff, f); fclose(f);
+    fprintf(stderr, "hip_qimg: calib dump wrote %d vectors (%zu floats) -> %s\n", present, foff, r->calib_dump_path);
+    free(json); free(data);
+}
+
 /* ---- Free ---- */
 
 void hip_qimg_free(hip_qimg_runner *r) {
     if (!r) return;
     qimg_print_gemm_summary(r);
+    qimg_calib_dump(r);
+    for (int idx = 0; idx < QIMG_CALIB_MAXSLOT; idx++)
+        if (r->calib_amax[idx]) { hipFree(r->calib_amax[idx]); r->calib_amax[idx] = NULL; }
+    for (int b = 0; b < 64; b++)
+        if (r->calib_tsilu[b]) { hipFree(r->calib_tsilu[b]); r->calib_tsilu[b] = NULL; }
+    if (r->i8_ws || r->i8_sm) {
+        size_t n = (size_t)r->n_blocks * QIMG_I8_PER_BLOCK;
+        for (size_t i = 0; i < n; i++) {
+            if (r->i8_ws && r->i8_ws[i]) hipFree(r->i8_ws[i]);
+            if (r->i8_sm && r->i8_sm[i]) hipFree(r->i8_sm[i]);
+        }
+        free(r->i8_ws); free(r->i8_sm); r->i8_ws = r->i8_sm = NULL;
+    }
+    if (r->d_xq_int8) { hipFree(r->d_xq_int8); r->d_xq_int8 = NULL; }
+    if (r->d_x_iscale) { hipFree(r->d_x_iscale); r->d_x_iscale = NULL; }
+    qimg_free_block(&r->stream_blk[0]);
+    qimg_free_block(&r->stream_blk[1]);
     if (r->gpu_blocks) {
         for (int i = 0; i < r->n_preloaded; i++)
             qimg_free_block(&r->gpu_blocks[i]);
@@ -1529,6 +2456,42 @@ void hip_qimg_free(hip_qimg_runner *r) {
     if (r->vae_st) safetensors_close((st_context *)r->vae_st);
     if (r->mod) hipModuleUnload(r->mod);
     free(r);
+}
+
+/* Free resident DiT weights (int4/bf16) to reclaim VRAM before VAE decode. The
+ * int4 model is 14 GB resident — keeping it through decode leaves too little for
+ * the VAE on a 16 GB card. Safe to call after the denoise loop; DiT is unusable
+ * afterward. */
+void hip_qimg_unload_dit(hip_qimg_runner *r) {
+    if (!r) return;
+    hipDeviceSynchronize();
+    /* Fused-QKV split linears alias one lora_down/lora_up/smooth across the 3
+     * descriptors, so free each unique device pointer exactly once. */
+    int n4 = r->int4_linears ? r->n_blocks * QIMG_INT4_PER_BLOCK : 0;
+    int nm = r->int4_mod ? r->n_blocks * 2 : 0;
+    size_t cap = (size_t)(n4 + nm) * 6 + 8;
+    void **seen = (void **)malloc(cap * sizeof(void *)); size_t ns = 0;
+    #define FREE1(p) do{ if(p){ size_t _j; for(_j=0;_j<ns;_j++) if(seen[_j]==(void*)(p)) break; \
+        if(_j==ns){ hipFree(p); seen[ns++]=(void*)(p);} (p)=NULL; } }while(0)
+    for (int i = 0; i < n4; i++) { qimg_int4_linear *L=&r->int4_linears[i];
+        FREE1(L->qint4); FREE1(L->wscale); FREE1(L->smooth); FREE1(L->lora_down); FREE1(L->lora_up); FREE1(L->bias); }
+    for (int i = 0; i < nm; i++) { qimg_int4_linear *L=&r->int4_mod[i];
+        FREE1(L->qint4); FREE1(L->wscale); FREE1(L->smooth); FREE1(L->lora_down); FREE1(L->lora_up); FREE1(L->bias); }
+    #undef FREE1
+    free(seen);
+    free(r->int4_linears); r->int4_linears = NULL;
+    free(r->int4_mod); r->int4_mod = NULL;
+    if (r->gpu_blocks) {
+        for (int i = 0; i < r->n_preloaded; i++) qimg_free_block(&r->gpu_blocks[i]);
+        free(r->gpu_blocks); r->gpu_blocks = NULL; r->n_preloaded = 0;
+    }
+    if (r->i4_ldf) { hipFree(r->i4_ldf); r->i4_ldf = NULL; }
+    if (r->i4_luf) { hipFree(r->i4_luf); r->i4_luf = NULL; }
+    if (r->i4_dt)  { hipFree(r->i4_dt);  r->i4_dt = NULL; r->i4_dt_cap = 0; }
+    if (r->i4_dly) { hipFree(r->i4_dly); r->i4_dly = NULL; r->i4_dly_cap = 0; }
+    r->n_blocks = 0; r->use_int4 = 0;
+    hipDeviceSynchronize();
+    { size_t f=0,t=0; hipMemGetInfo(&f,&t); fprintf(stderr,"hip_qimg: DiT unloaded; %.0f/%.0f MB free\n",f/1e6,t/1e6); }
 }
 
 
@@ -1622,6 +2585,17 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     float rope_theta = 10000.0f;
     int t_dim_rope = 16, h_dim_rope = 56, w_dim_rope = 56;
 
+    /* Pre-size the int4 LoRA scratch once for this step's largest linear
+     * (rank-128 down, mlp_h-wide up, max(n_img,n_txt) tokens), so the per-block
+     * grow path never reallocs a buffer the GPU is mid-using. */
+    if (r->use_int4) {
+        int mt = n_img > n_txt ? n_img : n_txt;
+        if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
+        size_t need_dt=(size_t)128*mt, need_dly=(size_t)mlp_h*mt;
+        if (need_dt > r->i4_dt_cap)  { hipFree(r->i4_dt);  hipMalloc(&r->i4_dt,  need_dt*4);  r->i4_dt_cap=need_dt; }
+        if (need_dly> r->i4_dly_cap) { hipFree(r->i4_dly); hipMalloc(&r->i4_dly, need_dly*4); r->i4_dly_cap=need_dly; }
+    }
+
     /* Pre-allocate per-block modulation buffers (avoid malloc/free inside loop) */
     void *d_t_silu = NULL, *d_img_mod = NULL, *d_txt_mod = NULL;
     hipMalloc(&d_t_silu, (size_t)dim * sizeof(float));
@@ -1658,11 +2632,22 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         if (r->verbose && (L % 10 == 0 || L == r->n_blocks - 1))
             fprintf(stderr, "\r  hip_qimg: block %d/%d", L + 1, r->n_blocks);
 
-        /* Use preloaded block if available, otherwise load on-demand */
+        /* Use preloaded block if available, otherwise stream on-demand. Streamed
+         * blocks reuse a persistent buffer (no per-step malloc/free) and copy
+         * async on the default stream so the host queues ahead instead of
+         * blocking — the dominant denoise overhead (see attention profile note). */
         qimg_block_gpu blk;
         int need_free = 0;
-        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+        if (r->use_int4) {
+            /* INT4: weights live in int4_linears/int4_mod; gpu_blocks[L] holds only the
+             * per-head norm weights (attn_q_w is intentionally NULL). Use it directly —
+             * never stream (the int4 checkpoint has no fp8/bf16 QKV to stream). */
             blk = r->gpu_blocks[L];
+        } else if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+            blk = r->gpu_blocks[L];
+        } else if (r->use_block_stream_db) {
+            qimg_load_block_s(r, L, &r->stream_blk[0], 0);
+            blk = r->stream_blk[0];
         } else {
             memset(&blk, 0, sizeof(blk));
             qimg_load_block(r, L, &blk);
@@ -1674,10 +2659,29 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
                        hipMemcpyDeviceToDevice, NULL);
         op_silu(r, d_t_silu, dim);
 
+        /* Calibration: modulation input (d_t_silu, shared by img_mod/txt_mod) per-channel abs-max. */
+        if (r->calib_dump_path && r->fn_calib_amax && L >= 0 && L < 64) {
+            if (!r->calib_tsilu[L] && hipMalloc(&r->calib_tsilu[L], (size_t)dim * 4) == hipSuccess)
+                hipMemset(r->calib_tsilu[L], 0, (size_t)dim * 4);
+            if (r->calib_tsilu[L]) {
+                int one = 1;
+                void *ca[] = {&r->calib_tsilu[L], &d_t_silu, &one, &dim};
+                hipModuleLaunchKernel(r->fn_calib_amax, (unsigned)((dim + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ca, NULL);
+            }
+        }
+
         qimg_set_gemm_context(r, L, "img_mod");
-        op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
+        if (r->use_int4) op_int4_linear(r, d_img_mod, d_t_silu, &r->int4_mod[2*L], 1);
+        else if (r->use_int8 && r->i8_ws) op_gemm_int8(r, d_img_mod, blk.img_mod_w,
+            r->i8_ws[(size_t)L*QIMG_I8_PER_BLOCK+12], r->use_int8_smooth ? r->i8_sm[(size_t)L*QIMG_I8_PER_BLOCK+12] : NULL,
+            d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
+        else op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         qimg_set_gemm_context(r, L, "txt_mod");
-        op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        if (r->use_int4) op_int4_linear(r, d_txt_mod, d_t_silu, &r->int4_mod[2*L+1], 1);
+        else if (r->use_int8 && r->i8_ws) op_gemm_int8(r, d_txt_mod, blk.txt_mod_w,
+            r->i8_ws[(size_t)L*QIMG_I8_PER_BLOCK+13], r->use_int8_smooth ? r->i8_sm[(size_t)L*QIMG_I8_PER_BLOCK+13] : NULL,
+            d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        else op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
 
         /* Modulation offsets */
         #define MOD_OFF(base, idx) ((void *)((char *)(base) + (size_t)(idx) * dim * sizeof(float)))
@@ -1706,22 +2710,22 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         void *d_img_k = (char *)d_k + (size_t)n_txt * dim * sizeof(float);
         void *d_img_v = (char *)d_v + (size_t)n_txt * dim * sizeof(float);
         qimg_set_gemm_context(r, L, "img_q");
-        op_wgemm_bf16(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img);
+        op_proj(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img, L, 0);
         qimg_set_gemm_context(r, L, "img_k");
-        op_wgemm_bf16(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img);
+        op_proj(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img, L, 1);
         qimg_set_gemm_context(r, L, "img_v");
-        op_wgemm_bf16(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img);
+        op_proj(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img, L, 2);
 
         /* Text QKV → offset at [0:n_txt] */
         void *d_txt_q = d_q;
         void *d_txt_k = d_k;
         void *d_txt_v = d_v;
         qimg_set_gemm_context(r, L, "txt_q");
-        op_wgemm_bf16(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt);
+        op_proj(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt, L, 4);
         qimg_set_gemm_context(r, L, "txt_k");
-        op_wgemm_bf16(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt);
+        op_proj(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt, L, 5);
         qimg_set_gemm_context(r, L, "txt_v");
-        op_wgemm_bf16(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt);
+        op_proj(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt, L, 6);
 
         /* QK RMSNorm */
         op_rmsnorm_ph(r, d_img_q, blk.norm_q_w, n_img, nh, hd);
@@ -1752,9 +2756,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         void *d_img_attn = (char *)d_attn_out + (size_t)n_txt * dim * sizeof(float);
         void *d_txt_attn = d_attn_out;
         qimg_set_gemm_context(r, L, "img_attn_out");
-        op_wgemm_bf16(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img);
+        op_proj(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img, L, 3);
         qimg_set_gemm_context(r, L, "txt_attn_out");
-        op_wgemm_bf16(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt);
+        op_proj(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt, L, 7);
 
         /* Gated residual */
         op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
@@ -1763,23 +2767,19 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         /* MLP: Image (GELU) */
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
         qimg_set_gemm_context(r, L, "img_mlp_fc1");
-        op_wgemm_bf16(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b,
-                     mlp_h, dim, n_img);
+        op_proj(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b, mlp_h, dim, n_img, L, 8);
         op_gelu(r, d_scratch3, n_img * mlp_h);
         qimg_set_gemm_context(r, L, "img_mlp_fc2");
-        op_wgemm_bf16(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b,
-                     dim, mlp_h, n_img);
+        op_proj(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b, dim, mlp_h, n_img, L, 9);
         op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
 
         /* MLP: Text (GELU) */
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
         qimg_set_gemm_context(r, L, "txt_mlp_fc1");
-        op_wgemm_bf16(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b,
-                     mlp_h, dim, n_txt);
+        op_proj(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b, mlp_h, dim, n_txt, L, 10);
         op_gelu(r, d_scratch3, n_txt * mlp_h);
         qimg_set_gemm_context(r, L, "txt_mlp_fc2");
-        op_wgemm_bf16(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
-                     dim, mlp_h, n_txt);
+        op_proj(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b, dim, mlp_h, n_txt, L, 11);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
 
         /* BF16 truncation (image only — text is tiny, not worth a separate launch) */
@@ -1840,14 +2840,46 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
 /* ---- VAE decode on GPU ---- */
 
+/* Env-gated per-stage VAE dump for layer-by-layer comparison vs the CUDA fp8
+ * reference. When QIMG_VAE_DUMP_PREFIX is set, each decode stage's current
+ * activation d_x is copied D->H and written as raw little-endian f32 [c,h,w]
+ * (C-contiguous, channel-major) to "<prefix>_<name>.bin" — matching the layout
+ * of the CUDA cuda_vae_*.npy dumps. No effect when the env var is unset. */
+static void qimg_vae_dump(const char *prefix, const char *name,
+                          void *d_buf, int c, int h, int w) {
+    if (!prefix || !d_buf) return;
+    size_t n = (size_t)c * h * w;
+    float *host = (float *)malloc(n * sizeof(float));
+    if (!host) return;
+    hipDeviceSynchronize();
+    hipMemcpy(host, d_buf, n * sizeof(float), hipMemcpyDeviceToHost);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%s.bin", prefix, name);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(host, sizeof(float), n, f);
+        fclose(f);
+        fprintf(stderr, "  [vae-dump] %s [%d,%d,%d]\n", path, c, h, w);
+    } else {
+        fprintf(stderr, "  [vae-dump] failed to open %s\n", path);
+    }
+    free(host);
+}
+
 int hip_qimg_vae_decode(hip_qimg_runner *r,
                         const float *latent, int lat_h, int lat_w,
                         float *out_rgb) {
     st_context *st = (st_context *)r->vae_st;
     if (!st) { fprintf(stderr, "hip_qimg: VAE not loaded\n"); return -1; }
+    const char *vae_dump_prefix = getenv("QIMG_VAE_DUMP_PREFIX");
 
-    /* Free preloaded DiT blocks to make room */
-    if (r->gpu_blocks) {
+    /* Free DiT weights to make room for the VAE. INT4 keeps ~14 GB resident with
+     * no streaming, so it must be freed here or every VAE hipMalloc fails (OOM ->
+     * gray output). hip_qimg_unload_dit frees int4_linears/int4_mod + scratch +
+     * gpu_blocks; for the fp8 path (no int4) fall back to the block-only free. */
+    if (r->int4_linears || r->int4_mod) {
+        hip_qimg_unload_dit(r);
+    } else if (r->gpu_blocks) {
         for (int i = 0; i < r->n_preloaded; i++)
             qimg_free_block(&r->gpu_blocks[i]);
         r->n_preloaded = 0;
@@ -1871,6 +2903,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         hipFree(d_x); d_x = d_tmp;
         hipFree(d_pqc_w); hipFree(d_pqc_b);
     }
+    qimg_vae_dump(vae_dump_prefix, "post_quant", d_x, c, h, w);
 
     /* decoder.conv1: 16→384, 3×3 */
     int co_c1, ci_c1;
@@ -1884,6 +2917,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         hipFree(d_c1_w); hipFree(d_c1_b);
     }
     fprintf(stderr, "  after conv1: [%d, %d, %d]\n", c, h, w);
+    qimg_vae_dump(vae_dump_prefix, "conv1", d_x, c, h, w);
 
     /* Load resblock weights helper macro */
     #define LOAD_RB_NAMED(pfx_str, n1, c1w, c1b, n2, c2w, c2b, scw, scb) \
@@ -1905,6 +2939,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
       hipFree(d_x); d_x = d_tmp;
       hipFree(n1); hipFree(c1w); hipFree(c1b); hipFree(n2); hipFree(c2w); hipFree(c2b);
       if (scw) { hipFree(scw); } if (scb) { hipFree(scb); } }
+    qimg_vae_dump(vae_dump_prefix, "middle_0", d_x, c, h, w);
 
     /* Middle attention: CPU fallback for spatial self-attention */
     {
@@ -1994,6 +3029,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         double _ms = (_t1.tv_sec-_t0.tv_sec)*1e3 + (_t1.tv_nsec-_t0.tv_nsec)/1e6;
         fprintf(stderr, "  vae middle attention: %.0f ms (spatial=%d, c=%d)\n", _ms, h*w, c);
     }
+    qimg_vae_dump(vae_dump_prefix, "middle_1", d_x, c, h, w);
 
     /* mid.2 */
     { LOAD_RB_NAMED("decoder.middle.2", n1, c1w, c1b, n2, c2w, c2b, scw, scb);
@@ -2002,6 +3038,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
       hipFree(n1); hipFree(c1w); hipFree(c1b); hipFree(n2); hipFree(c2w); hipFree(c2b);
       if (scw) { hipFree(scw); } if (scb) { hipFree(scb); } }
     fprintf(stderr, "  after middle: [%d, %d, %d]\n", c, h, w);
+    qimg_vae_dump(vae_dump_prefix, "middle_2", d_x, c, h, w);
 
     /* Upsample blocks 0-14 */
     for (int i = 0; i < 15; i++) {
@@ -2040,6 +3077,10 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
             hipFree(rs_w); hipFree(rs_b);
             d_x = d_tmp; c = new_c;
             fprintf(stderr, "  upsample %d: [%d, %d, %d]\n", i, c, h, w);
+        }
+        if (vae_dump_prefix) {
+            char nm[32]; snprintf(nm, sizeof(nm), "upsample_%d", i);
+            qimg_vae_dump(vae_dump_prefix, nm, d_x, c, h, w);
         }
     }
     #undef LOAD_RB_NAMED

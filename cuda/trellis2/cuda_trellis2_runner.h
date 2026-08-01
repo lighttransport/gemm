@@ -61,6 +61,10 @@ void cuda_trellis2_invalidate_kv_cache(cuda_trellis2_runner *r);
 
 void cuda_trellis2_free(cuda_trellis2_runner *r);
 
+/* Free a buffer returned by cuda_trellis2_predict (a plain CPU malloc).
+ * Provided so ctypes/FFI callers free with this .so's allocator, not their own. */
+void cuda_trellis2_free_buffer(void *p);
+
 /* ---- Per-stage API (for testing/debugging) ---- */
 
 /* Run DINOv3 encoder. image_f32: [3, 512, 512] CHW normalized. output: [1029, 1024] */
@@ -107,12 +111,65 @@ int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path);
 /* Load texture decoder (SC-VAE, 6 output channels) */
 int cuda_trellis2_load_texture_decoder(cuda_trellis2_runner *r, const char *path);
 
-/* Run shape decoder on GPU. Currently runs stage 0 ConvNeXt blocks only.
- * slat: [N, 32], coords: [N, 4] int32, out_feats: [N, 7], out_coords: [N, 4] */
+void cuda_trellis2_unload_shape_decoder(cuda_trellis2_runner *r);
+void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r);
+void cuda_trellis2_clear_subdiv_plan(cuda_trellis2_runner *r);
+
+/* Free the Stage 1/2/3 DiT GPU weights + cross-attn KV cache. Call after all
+ * three latents are produced (their host-side outputs are kept) and before the
+ * SC-VAE decoders, which otherwise OOM with the DiTs resident. Idempotent. */
+void cuda_trellis2_unload_dit_stages(cuda_trellis2_runner *r);
+
+/* Per-stage DiT unloads, for lazy load-run-free pipelining that caps the GPU
+ * peak at one DiT instead of all three resident at once. Each frees only that
+ * stage's weights (KV cache is kept — it is model-id keyed and recomputed by the
+ * next stage). All idempotent. */
+void cuda_trellis2_unload_stage1(cuda_trellis2_runner *r);
+void cuda_trellis2_unload_stage2(cuda_trellis2_runner *r);
+void cuda_trellis2_unload_stage3(cuda_trellis2_runner *r);
+
+/* Run shape decoder on GPU and allocate CPU output arrays.
+ * slat: [N, 32], coords: [N, 4] int32.
+ * out_feats/out_coords are malloc-owned by the caller. */
+int cuda_trellis2_run_shape_decoder_alloc(cuda_trellis2_runner *r,
+                                           const float *slat,
+                                           const int32_t *coords, int N,
+                                           float **out_feats,
+                                           int32_t **out_coords,
+                                           int *out_N,
+                                           int *out_C);
+/* Debug verifier entry point: start the shape/texture SC-VAE loaded in the
+ * shape-decoder slot from an intermediate sparse tensor. start_stage is 0..4;
+ * start_block is the first ConvNeXt block to execute, or n_convnext[stage] to
+ * start at that stage's C2S. */
+int cuda_trellis2_run_shape_decoder_from_alloc(cuda_trellis2_runner *r,
+                                                const float *feats,
+                                                int C,
+                                                const int32_t *coords, int N,
+                                                int start_stage,
+                                                int start_block,
+                                                float **out_feats,
+                                                int32_t **out_coords,
+                                                int *out_N,
+                                                int *out_C);
+int cuda_trellis2_run_texture_decoder_alloc(cuda_trellis2_runner *r,
+                                             const float *slat,
+                                             const int32_t *coords, int N,
+                                             float **out_feats,
+                                             int32_t **out_coords,
+                                             int *out_N,
+                                             int *out_C);
+
+/* Compatibility wrapper. Caller must provide buffers large enough for the
+ * decoder output. Prefer cuda_trellis2_run_shape_decoder_alloc for new code. */
 int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
                                       const float *slat, const int32_t *coords, int N,
                                       float *out_feats, int32_t *out_coords,
                                       int *out_N);
+int cuda_trellis2_run_texture_decoder(cuda_trellis2_runner *r,
+                                       const float *slat, const int32_t *coords, int N,
+                                       float *out_feats, int32_t *out_coords,
+                                       int *out_N);
 
 #ifdef __cplusplus
 }

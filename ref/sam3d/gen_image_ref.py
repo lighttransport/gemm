@@ -73,8 +73,10 @@ def main():
     # Preprocess image + mask so step-1 scaffold has at least one dump
     # even before the model code is installed.
     from PIL import Image
-    img = np.asarray(Image.open(args.image).convert("RGB"), dtype=np.uint8)
-    msk = np.asarray(Image.open(args.mask).convert("L"),   dtype=np.uint8)
+    image_pil = Image.open(args.image).convert("RGB")
+    mask_pil = Image.open(args.mask).convert("L")
+    img = np.asarray(image_pil, dtype=np.uint8)
+    msk = np.asarray(mask_pil,   dtype=np.uint8)
     save(args.outdir, "input_image.npy", img)
     save(args.outdir, "input_mask.npy",  msk)
 
@@ -107,18 +109,52 @@ def main():
     yaml_dir = os.path.dirname(os.path.abspath(args.pipeline_yaml))
     conf = OmegaConf.load(args.pipeline_yaml)
     OmegaConf.set_struct(conf, False)
+    conf._set_flag("allow_objects", True)
     conf.workspace_dir = yaml_dir
     if os.environ.get("SAM3D_REF_DEVICE"):
         conf.device = os.environ["SAM3D_REF_DEVICE"]
 
     if args.pointmap is not None:
-        # Drop the MoGe block so missing `moge` doesn't fail hydra
-        # instantiate. compute_pointmap(image, pointmap) short-circuits
-        # when a pointmap is supplied, so the depth_model is unused.
-        if "depth_model" in conf:
-            conf.pop("depth_model")
+        # Avoid instantiating/downloading MoGe. compute_pointmap() does
+        # not use depth_model when a pointmap is supplied, but current
+        # upstream still requires the constructor argument to exist.
+        conf.depth_model = None
+        # Upstream compile warmup calls compute_pointmap() without our
+        # pointmap override, so it would dereference the placeholder.
+        conf.compile_model = False
 
-    pipe = instantiate(conf, _recursive_=False)
+    # The native SAM3D verifiers consume the Gaussian path. Upstream
+    # instantiates the mesh decoder unconditionally, and that decoder has
+    # an internal CUDA-default grid allocation even for CPU references.
+    from sam3d_objects.pipeline.inference_pipeline import InferencePipeline
+    InferencePipeline.init_slat_decoder_mesh = (
+        lambda self, *a, **kw: torch.nn.Identity()
+    )
+
+    if str(conf.device) == "cpu":
+        try:
+            import xformers.ops
+
+            def sdpa_memory_efficient_attention(q, k, v, attn_bias=None,
+                                                p=0.0, scale=None, **_kw):
+                if q.ndim == 4:
+                    q = q.permute(0, 2, 1, 3)
+                    k = k.permute(0, 2, 1, 3)
+                    v = v.permute(0, 2, 1, 3)
+                    out = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_bias, dropout_p=p, scale=scale
+                    )
+                    return out.permute(0, 2, 1, 3)
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias, dropout_p=p, scale=scale
+                )
+
+            xformers.ops.memory_efficient_attention = sdpa_memory_efficient_attention
+        except Exception as e:
+            print(f"[gen_image_ref] xformers CPU fallback unavailable: {e}",
+                  file=sys.stderr)
+
+    pipe = instantiate(conf, _recursive_=True)
     pipe.eval() if hasattr(pipe, "eval") else None
 
     # Register forward hooks to capture per-stage outputs.
@@ -147,19 +183,19 @@ def main():
         if dino is not None:
             dino.register_forward_hook(cap("dinov2_tokens"))
 
-    ssg = pipe.models.get("ss_generator", None)
+    ssg = pipe.models["ss_generator"] if "ss_generator" in pipe.models else None
     if ssg is not None:
         ssg.register_forward_hook(cap("ss_latent"))
 
-    ssd = pipe.models.get("ss_decoder", None)
+    ssd = pipe.models["ss_decoder"] if "ss_decoder" in pipe.models else None
     if ssd is not None:
         ssd.register_forward_hook(cap("occupancy"))
 
-    slg = pipe.models.get("slat_generator", None)
+    slg = pipe.models["slat_generator"] if "slat_generator" in pipe.models else None
     if slg is not None:
         slg.register_forward_hook(cap("slat_feats"))
 
-    sgd = pipe.models.get("slat_decoder_gs", None)
+    sgd = pipe.models["slat_decoder_gs"] if "slat_decoder_gs" in pipe.models else None
     if sgd is not None:
         sgd.register_forward_hook(cap("gaussians"))
 
@@ -171,8 +207,9 @@ def main():
         save(args.outdir, "pointmap.npy", pmap_np.astype(np.float32))
 
     run_kwargs = dict(
-        image=args.image, mask=args.mask, seed=args.seed,
+        image=image_pil, mask=mask_pil, seed=args.seed,
         stage1_only=args.stage1_only,
+        decode_formats=["gaussian"],
         with_mesh_postprocess=False,
         with_texture_baking=False,
         with_layout_postprocess=False,

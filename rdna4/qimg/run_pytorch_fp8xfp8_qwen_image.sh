@@ -2,6 +2,9 @@
 set -euo pipefail
 
 # Reproduce Qwen-Image PyTorch native FP8xFP8 generation outside Codex sandbox.
+# This is a ComfyUI fast-FP8 diagnostic, not the normal ComfyUI Qwen-Image
+# workflow. Default ComfyUI keeps this FP8 DiT as storage and computes in the
+# selected BF16/FP16/FP32 dtype unless fast FP8 matrix multiplication is enabled.
 #
 # This intentionally uses rdna4/qimg/.venv and keeps the whole repro in one
 # script so it can be launched directly from the repo root:
@@ -10,6 +13,7 @@ set -euo pipefail
 #
 # Useful overrides:
 #   SIZE=256 STEPS=20 CFG=4.0 bash rdna4/qimg/run_pytorch_fp8xfp8_qwen_image.sh
+#   SCALE_MODE=comfy-fast-fp8 bash rdna4/qimg/run_pytorch_fp8xfp8_qwen_image.sh
 #   SCALE_MODE=comfy bash rdna4/qimg/run_pytorch_fp8xfp8_qwen_image.sh
 #   SCALE_MODE=perrow SCALE_DIV=512 bash rdna4/qimg/run_pytorch_fp8xfp8_qwen_image.sh
 
@@ -29,7 +33,7 @@ export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
 
 MODEL="${MODEL:-Qwen/Qwen-Image}"
 FP8_DIT="${FP8_DIT:-/mnt/disk1/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors}"
-OUT="${OUT:-$QIMG_DIR/pytorch_fp8xfp8_comfy_256.png}"
+OUT="${OUT:-$QIMG_DIR/pytorch_fp8xfp8_comfy_fast_256.png}"
 LOG="${LOG:-${OUT%.png}.log}"
 PROMPT="${PROMPT:-a red apple on a white table}"
 NEGATIVE="${NEGATIVE:- }"
@@ -39,10 +43,11 @@ SEED="${SEED:-42}"
 CFG="${CFG:-4.0}"
 DTYPE="${DTYPE:-bf16}"
 
-# SCALE_MODE=comfy matches current ComfyUI raw FP8 fast path: scalar scale=1,
-# clamp activations to [-448, 448], then torch._scaled_mm(FP8, FP8).
+# SCALE_MODE=comfy-fast-fp8 (alias: comfy) matches ComfyUI's opt-in fast FP8
+# matrix-multiplication path: scalar scale=1, clamp activations to [-448, 448],
+# then torch._scaled_mm(FP8, FP8). It is not ComfyUI's default Qwen-Image path.
 # SCALE_MODE=perrow is the qimg-style diagnostic: scale_a=max(abs(row))/SCALE_DIV.
-SCALE_MODE="${SCALE_MODE:-comfy}"
+SCALE_MODE="${SCALE_MODE:-comfy-fast-fp8}"
 SCALE_DIV="${SCALE_DIV:-512}"
 
 export ROOT QIMG_DIR MODEL FP8_DIT OUT PROMPT NEGATIVE SIZE STEPS SEED CFG DTYPE SCALE_MODE SCALE_DIV
@@ -88,7 +93,7 @@ STEPS = int(env("STEPS", "20"))
 SEED = int(env("SEED", "42"))
 CFG = float(env("CFG", "4.0"))
 DTYPE = torch.bfloat16 if env("DTYPE", "bf16") == "bf16" else torch.float16
-SCALE_MODE = env("SCALE_MODE", "comfy")
+SCALE_MODE = env("SCALE_MODE", "comfy-fast-fp8")
 SCALE_DIV = float(env("SCALE_DIV", "512"))
 
 
@@ -111,11 +116,13 @@ class NativeFp8Linear(nn.Module):
                 x8 = torch.clamp(x2.float() / scale_a, -448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
                 scale_b = torch.ones((1, w.shape[0]), device=x.device, dtype=torch.float32)
                 out_dtype = DTYPE
-            else:
+            elif SCALE_MODE in ("comfy-fast-fp8", "comfy"):
                 scale_a = torch.ones((), device=x.device, dtype=torch.float32)
                 scale_b = torch.ones((), device=x.device, dtype=torch.float32)
                 x8 = torch.clamp(x2.float(), -448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
                 out_dtype = DTYPE
+            else:
+                raise ValueError(f"unsupported SCALE_MODE={SCALE_MODE!r}")
 
             try:
                 y = torch._scaled_mm(

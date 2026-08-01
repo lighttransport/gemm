@@ -28,3 +28,22 @@ dependencies = [
     "pytorch-lightning>=2.6.1",
     "fast-simplification>=0.1.13",
 ]
+
+# Setup on the RDNA4 ROCm 7.2.2 host:
+#   uv venv --python 3.12 .venv
+#   uv pip install -e ".[torch-rocm722]"
+#
+# The base torch/torchvision requirements resolve to PyPI CUDA wheels by
+# default. Use this extra for PyTorch ROCm baseline measurements.
+[project.optional-dependencies]
+torch-rocm722 = [
+    "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.6.0+rocm7.2.2.git4ed88892-cp312-cp312-linux_x86_64.whl",
+    "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl",
+    "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchvision-0.26.0+rocm7.2.2.git336d36e8-cp312-cp312-linux_x86_64.whl",
+]
+
+[tool.uv]
+package = false
+
+[tool.setuptools]
+py-modules = []

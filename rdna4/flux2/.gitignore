@@ -1,0 +1,9 @@
+# Build artifacts
+test_hip_flux2
+verify_dit
+verify_vae
+tools/probe_hipblaslt_fp8
+*.o
+
+# Local renders / dumps (not checkpoint montages committed alongside the code)
+*.ppm

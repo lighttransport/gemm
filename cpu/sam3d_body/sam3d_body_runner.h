@@ -43,6 +43,10 @@ typedef struct {
     const char *mhr_assets_dir;
     /* Backbone variant to load. */
     sam3d_body_backbone_t backbone;
+    int image_size;          /* Legacy square size / default height. */
+    int image_height;        /* DINOv3 input height; 0 -> image_size. */
+    int image_width;         /* DINOv3 input width; 0 -> image_size.
+                              * ViT-H remains fixed 512x384. */
     uint64_t seed;
     int      n_threads;       /* default: OMP_NUM_THREADS or 1 */
     int      verbose;
@@ -141,6 +145,29 @@ int sam3d_body_debug_override_decoder_inputs(
     const float *affine_trans,
     int use_intrin_center,
     float default_scale_factor);
+
+/* Borrow the current decoder input buffers for verifier diagnostics.
+ * Pointers remain owned by ctx and are valid until the next mutating runner
+ * call or sam3d_body_destroy. Any pointer output may be NULL if unused. */
+int sam3d_body_debug_get_decoder_inputs(
+    sam3d_body_ctx *ctx,
+    const float **image_emb_chw,
+    const float **image_pe_chw,
+    const float **init_x,
+    const float **init_xpe,
+    int *H,
+    int *W,
+    int *Dc,
+    int *Nq,
+    int *D,
+    const float **cam_int,
+    const float **bbox_center,
+    float *bbox_scale,
+    const float **ori_img_size,
+    const float **img_size,
+    const float **affine_trans,
+    int *use_intrin_center,
+    float *default_scale_factor);
 
 #ifdef __cplusplus
 }

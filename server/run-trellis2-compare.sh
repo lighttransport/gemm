@@ -33,6 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CPU_BIN="${CPU_BIN:-$REPO_ROOT/cpu/trellis2/test_trellis2}"
 CUDA_BIN="${CUDA_BIN:-$REPO_ROOT/cuda/trellis2/test_cuda_trellis2}"
+HIP_BIN="${HIP_BIN:-$REPO_ROOT/rdna4/trellis2/test_hip_trellis2}"
 REF_SCRIPT="${REF_SCRIPT:-$REPO_ROOT/ref/trellis2/gen_stage1_ref.py}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -50,6 +51,7 @@ echo "[run-trellis2-compare] -> http://$HOST:$PORT   (log: $LOG)"
 echo "    VARIANTS=$VARIANTS"
 echo "    CPU_BIN=$CPU_BIN"
 echo "    CUDA_BIN=$CUDA_BIN"
+echo "    HIP_BIN=$HIP_BIN"
 echo "    REF_SCRIPT=$REF_SCRIPT  REF_PYTHON=$REF_PYTHON"
 echo "    DISABLE=${DISABLE:-<none>}"
 echo
@@ -57,7 +59,7 @@ echo
 # shellcheck disable=SC2086
 exec "$PYTHON" "$REPO_ROOT/ref/trellis2/trellis2_server.py" \
     --host "$HOST" --port "$PORT" \
-    --cpu-bin "$CPU_BIN" --cuda-bin "$CUDA_BIN" \
+    --cpu-bin "$CPU_BIN" --cuda-bin "$CUDA_BIN" --hip-bin "$HIP_BIN" \
     --ref-script "$REF_SCRIPT" --ref-python "$REF_PYTHON" \
     --web-root "$REPO_ROOT/web" \
     --disable "$DISABLE" \

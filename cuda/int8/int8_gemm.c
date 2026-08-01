@@ -37,6 +37,12 @@ static int g_use_opt2 = 0;    /* Use optimized v2 kernel (transposed B) */
 static int g_use_opt3 = 0;    /* Use optimized v3 kernel (K=64 unrolled) */
 static int g_use_tcgen05 = 0; /* Use tcgen05.mma (Blackwell SM 10.0+) */
 
+#if defined(__GNUC__)
+#define INT8_MAYBE_UNUSED __attribute__((unused))
+#else
+#define INT8_MAYBE_UNUSED
+#endif
+
 /* Stochastic rounding settings */
 static int g_use_sr = 0;           /* Enable stochastic rounding output */
 static float g_sr_scale = 0.0f;    /* SR scale (0 = auto-compute) */
@@ -1896,7 +1902,7 @@ static const char* ptx_gemm_tc64_opt2_s8 =
  *
  * For INT8 with .kind::i8, idesc encodes shape/transpose flags (data type is in instruction)
  */
-static const char* ptx_gemm_tcgen05_s8 =
+static const char* INT8_MAYBE_UNUSED ptx_gemm_tcgen05_s8 =
 ".version 8.6\n"
 ".target sm_100a\n"
 "// NOTE: tcgen05 instructions require SM 10.0 (B100/B200), NOT SM 12.0 (RTX 50)\n"
@@ -2077,8 +2083,8 @@ static const char* ptx_gemm_tcgen05_s8 =
 "    // Format: tcgen05.mma.cta_group::1.kind::i8 [d_tmem], a_desc, b_desc, idesc, {mask[4]}, pred;\n"
 "    // enable_d is a predicate: true = accumulate (D=AB+D), false = D=AB\n"
 "    setp.ne.u32 p_enable_d, k_outer, 0;  // accumulate for k>0\n"
-"    // @p_tid0 tcgen05.mma.cta_group::1.kind::i8 [tmem_addr], a_desc, b_desc, idesc, {disable0, disable1, disable2, disable3}, p_enable_d;\n"
-"    // FIXME: tcgen05.mma syntax needs adjustment - commenting out for now\n"
+"    // tcgen05.mma issue is intentionally disabled in host dispatch until\n"
+"    // the PTX operand syntax is validated on SM 10.x hardware.\n"
 "\n"
 "    bar.sync 0;\n"
 "\n"
@@ -2360,7 +2366,7 @@ static void print_usage(const char* prog) {
     printf("  --naive       Use naive scalar kernel\n");
     printf("  --no-verify   Skip CPU verification (for large sizes)\n");
     printf("  --opt         Use optimized kernel (double buffering)\n");
-    printf("  --tcgen05     Use tcgen05.mma kernel (Blackwell SM 10.0+)\n");
+    printf("  --tcgen05     Request tcgen05.mma kernel (currently disabled until SM 10.x PTX is validated)\n");
     printf("\nStochastic Rounding:\n");
     printf("  --sr          Enable stochastic rounding output (int32->fp32->SR->int8)\n");
     printf("  --sr-scale F  Quantization scale for SR (default: auto-compute)\n");
@@ -2478,11 +2484,9 @@ int main(int argc, char** argv) {
             kernel_name = "gemm_int8_tc64_s8";
             block_size = 512;
         } else if (specs.major == 10) {
-            ptx_code = ptx_gemm_tcgen05_s8;
-            kernel_name = "gemm_int8_tcgen05_s8";
-            block_size = 128;
-            actual_tile = 64;
-            printf("Using tcgen05.mma kernel (Blackwell Tensor Core Gen 5)\n");
+            fprintf(stderr, "ERROR: tcgen05.mma path is present but disabled: PTX operand syntax is not validated yet\n");
+            fprintf(stderr, "       Use the default mma.sync kernel or --opt/--opt2/--opt3 for now.\n");
+            return 1;
         } else {
             fprintf(stderr, "ERROR: tcgen05 requires Blackwell SM 10.0+ architecture\n");
             return 1;

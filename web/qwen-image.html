@@ -44,7 +44,7 @@
 <div id="toast"></div>
 <main>
   <h1>Qwen-Image</h1>
-  <div class="sub">Fans out one prompt to each checked backend in parallel and renders the generated image + timings. Variants come from the C server's <code>--qwen-variants</code> registry.</div>
+  <div class="sub">Fans out one prompt across the checked backends &times; the selected precision and renders each generated image + timings. Pick <code>fp8</code>, <code>fp4</code> (native NVFP4 W4A4 OMMA — CUDA sm_120a), or <code>int4</code> (Nunchaku W4A16 — HIP); <code>fp4</code>/<code>int4</code> run only on their capable backend, so picking one generates a single image. Variants come from the server registry.</div>
 
   <form id="form" class="panel">
     <div class="row">
@@ -63,6 +63,8 @@
       <div>
         <label for="variant">Variant</label>
         <select id="variant"><option>loading…</option></select>
+        <label for="precision" style="margin-top:10px;">Precision</label>
+        <select id="precision"><option value="fp8">fp8</option></select>
         <label style="margin-top:10px;">Backends</label>
         <div id="backends" class="backends"></div>
       </div>
@@ -81,13 +83,39 @@
 </main>
 
 <script>
+// Build marker: if you don't see this line in the browser console, you are on a
+// stale (cached) copy of the page — hard-reload / open in a private window.
+console.log('[qwen-image] build 2026-05-27e: fp4 mode + cuda progress + backend-in-params fix');
 const $ = id => document.getElementById(id);
 
 const BACKEND_LABELS = {
-  "cpu":    "ours (cpu)",
-  "hip":    "ours (hip)",
-  "cuda":   "ours (cuda)",
-  "vulkan": "ours (vulkan)",
+  "cpu":          "ours (cpu)",
+  "hip":          "ours (hip)",
+  "cuda":         "ours (cuda)",
+  "vulkan":       "ours (vulkan)",
+  "pytorch":      "pytorch (comfyui fp8)",
+  // sidecar (qwen_image_server.py) backend ids
+  "ours-cpu":     "ours (cpu)",
+  "ours-cuda":    "ours (cuda)",
+  "pytorch-cuda": "pytorch (comfyui fp8)",
+};
+
+// A precision/mode that needs a specific backend capability runs only where it
+// is supported: int4 = Nunchaku W4A16 (HIP); fp4 = native NVFP4 W4A4 OMMA, which
+// only OUR CUDA runner implements (so it must be the ours-cuda backend, not the
+// pytorch-cuda reference). fp8 runs anywhere. Returns true if be.id can run p.
+const PREC_CAP = {
+  int4: id => id.includes('hip'),
+  fp4:  id => id.includes('cuda') && !id.includes('pytorch'),
+};
+function backendCanRun(precision, beId) {
+  const cap = PREC_CAP[precision];
+  return cap ? cap(beId) : true;
+}
+const PREC_LABEL = {
+  fp8:  'fp8',
+  fp4:  'fp4 (native W4A4 · cuda)',
+  int4: 'int4 (W4A16 · hip)',
 };
 
 function showToast(msg, opts) {
@@ -101,10 +129,21 @@ function showToast(msg, opts) {
     el.appendChild(t);
   }
   const b = document.createElement('div'); b.textContent = msg;
+  b.style.userSelect = 'text';
   el.appendChild(b);
+  // Always mirror to the console so the message can be copied even after the
+  // toast is gone. Errors -> console.error, info -> console.log.
+  ((opts.kind === 'info') ? console.log : console.error)('[qwen-image] ' + (opts.title ? opts.title + ': ' : '') + msg);
   host.appendChild(el);
   el.addEventListener('click', () => el.remove());
-  setTimeout(() => { el.style.opacity = '0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),400); }, 5500);
+  // Sticky toasts (e.g. errors) stay until clicked so they can be read/copied.
+  if (!opts.sticky) {
+    setTimeout(() => { el.style.opacity = '0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),400); }, 5500);
+  } else {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:10px;opacity:.6;margin-top:4px;'; hint.textContent = '(click to dismiss)';
+    el.appendChild(hint);
+  }
 }
 
 function extractError(res, body) {
@@ -117,6 +156,33 @@ function extractError(res, body) {
 }
 
 let BACKENDS = [];
+let VARIANTS = [];   // [{name, kind, precisions:[...]}]
+
+function currentVariant() {
+  const name = $('variant').value;
+  return VARIANTS.find(v => v.name === name) || null;
+}
+
+// Rebuild the precision dropdown from the selected variant. Adds a "both"
+// option (side-by-side compare) whenever the variant exposes >1 precision.
+function refreshPrecisions() {
+  const v = currentVariant();
+  const precs = (v && v.precisions && v.precisions.length) ? v.precisions : ['fp8'];
+  const prev = $('precision').value;
+  const sel = $('precision'); sel.innerHTML = '';
+  precs.forEach(p => {
+    const o = document.createElement('option');
+    o.value = p; o.textContent = PREC_LABEL[p] || p;
+    sel.appendChild(o);
+  });
+  if (precs.length > 1) {
+    const o = document.createElement('option');
+    o.value = 'both'; o.textContent = 'both (compare)';
+    sel.appendChild(o);
+  }
+  // keep prior choice if still valid, else default to first
+  sel.value = Array.from(sel.options).some(o => o.value === prev) ? prev : precs[0];
+}
 
 async function loadVariants() {
   try {
@@ -124,6 +190,8 @@ async function loadVariants() {
     const d = await r.json();
     const m = (d.models || []).find(x => x.id === 'qwen-image') || {};
     const vs = m.variants || [];
+    console.log('[qwen-image] /v1/models loaded — backends=%o variants=%o', m.backends, vs);
+    VARIANTS = vs.map(v => ({ name: v.name, kind: v.kind || 'st', precisions: v.precisions || ['fp8'] }));
     const sel = $('variant'); sel.innerHTML = '';
     if (!vs.length) {
       const o = document.createElement('option');
@@ -132,20 +200,36 @@ async function loadVariants() {
     } else {
       vs.forEach(v => {
         const o = document.createElement('option');
-        o.value = v.name; o.textContent = `${v.name}  (${v.kind || 'st'})`;
+        const precs = v.precisions || [];
+        const badge = precs.includes('fp4') ? 'FP4 · ' : (precs.includes('int4') ? '+int4 · ' : '');
+        o.value = v.name; o.textContent = `${v.name}  (${badge}${v.kind || 'st'})`;
         sel.appendChild(o);
       });
     }
+    refreshPrecisions();
     BACKENDS = (m.backends || []).map(id => ({ id, label: BACKEND_LABELS[id] || ('ours (' + id + ')') }));
     renderBackends();
+    loadVariants._tries = 0;
   } catch (e) {
-    showToast('failed to load /v1/models: ' + e, {title:'models'});
-    $('variant').innerHTML = '<option value="">(load failed)</option>';
-    BACKENDS = [{id:'cpu', label:'ours (cpu)'}];
-    renderBackends();
+    // Do NOT fabricate a backend here — the server rejects unknown backend ids
+    // ("unknown backend 'cpu'"), which is confusing. /v1/models can transiently
+    // fail if the page is opened before the server finishes starting, so retry
+    // a few times and surface a clear status instead.
+    const tries = (loadVariants._tries = (loadVariants._tries || 0) + 1);
+    console.error('[qwen-image] /v1/models load failed (try ' + tries + '):', e);
+    VARIANTS = []; refreshPrecisions();
+    BACKENDS = []; renderBackends();
+    if (tries <= 6) {
+      $('variant').innerHTML = '<option value="">(loading models… retry ' + tries + ')</option>';
+      setTimeout(loadVariants, 1500);
+    } else {
+      showToast('failed to load /v1/models: ' + e + ' — is the server up? reload the page.', {title:'models', sticky:true});
+      $('variant').innerHTML = '<option value="">(could not load /v1/models — reload)</option>';
+    }
   }
 }
 loadVariants();
+$('variant').addEventListener('change', refreshPrecisions);
 
 function renderBackends() {
   const host = $('backends'); host.innerHTML = '';
@@ -167,23 +251,27 @@ function renderBackends() {
   });
 }
 
-function mkCell(label, variant) {
+function mkCell(label, variant, precision) {
   const sec = document.createElement('section');
   sec.className = 'cell';
   sec.innerHTML = `
-    <h3><span class="label"></span> <small style="color:#6a7180;font-weight:400" class="vlabel"></small> <span class="pill run status">running</span></h3>
+    <h3><span class="label"></span> <span class="pill prec" style="background:#eef0f4;color:#3a4150"></span> <small style="color:#6a7180;font-weight:400" class="vlabel"></small> <span class="pill run status">queued</span></h3>
     <div class="meta"></div>
     <canvas></canvas>
     <div class="err" style="display:none;"></div>
   `;
   sec.querySelector('.label').textContent = label;
+  sec.querySelector('.prec').textContent = precision || 'fp8';
   sec.querySelector('.vlabel').textContent = variant ? '— ' + variant : '';
   return sec;
 }
 
 let running = [];
+let JOB_BODY = {};
+let cancelled = false;
 
 function cancelAll() {
+  cancelled = true;
   for (const c of running) { try { c.abort(); } catch(_){} }
   running = [];
   $('cancel').disabled = true;
@@ -192,26 +280,60 @@ function cancelAll() {
 }
 $('cancel').addEventListener('click', cancelAll);
 
-async function runOne(be, body, grid) {
-  const cell = mkCell(be.label, $('variant').value);
-  grid.appendChild(cell);
-  const pill = cell.querySelector('.pill');
+// Map a /v1/progress snapshot to a short human label for the status pill.
+function phaseLabel(p) {
+  if (!p) return 'running';
+  switch (p.phase) {
+    case 'starting':  return 'starting';
+    case 'encode':    return 'token encoding';
+    case 'dit_load':  return 'loading DiT';
+    case 'dit':       return p.dit_total ? `DiT ${p.dit_step}/${p.dit_total}` : 'DiT';
+    case 'vae_load':  return 'loading VAE';
+    case 'vae':       return 'VAE decode';
+    case 'done':      return 'finishing';
+    default:          return p.phase || 'running';
+  }
+}
+
+async function runOne(be, precision, cell) {
+  const pill = cell.querySelector('.pill.status');
   const meta = cell.querySelector('.meta');
   const canvas = cell.querySelector('canvas');
   const errEl = cell.querySelector('.err');
 
   const ctrl = new AbortController(); running.push(ctrl);
   const t0 = performance.now();
+  pill.className = 'pill run status'; pill.textContent = 'running';
+  // Live phase label, refreshed by the progress poller below.
+  let phaseTxt = 'running';
   const ticker = setInterval(() => {
-    pill.textContent = 'running ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
+    pill.textContent = phaseTxt + ' · ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
   }, 100);
+  // Poll server-side progress for backends that report it: the C server's HIP
+  // path (in-process) and the CUDA sidecar's ours-cuda path (streams the runner's
+  // stderr phase/step lines into GET /v1/progress). The pytorch reference and
+  // cpu backends don't report, so skip them. Sequential job execution means the
+  // active snapshot is this job.
+  const reportsProgress = /hip|cuda/.test(be.id) && !/pytorch/.test(be.id);
+  const poller = reportsProgress ? setInterval(async () => {
+    try {
+      const r = await fetch('/v1/progress', { cache: 'no-store' });
+      const p = await r.json();
+      if (p && p.active) phaseTxt = phaseLabel(p);
+    } catch (_) {}
+  }, 250) : null;
+  const stopTimers = () => { clearInterval(ticker); if (poller) clearInterval(poller); };
 
   try {
-    const payload = Object.assign({}, body);
-    payload.backend = be.id;
-    payload.params = Object.assign({}, body.params || {}, {
+    const payload = Object.assign({}, JOB_BODY);
+    payload.backend = be.id;   // C server reads top-level backend
+    payload.params = Object.assign({}, JOB_BODY.params || {}, {
       variant: $('variant').value || undefined,
+      precision: precision,
+      backend: be.id,          // CUDA sidecar (qwen_image_server.py) reads params.backend
     });
+    console.log('[qwen-image] POST /v1/infer  backend=%s variant=%s precision=%s',
+                payload.backend, payload.params.variant, payload.params.precision, payload);
     const res = await fetch('/v1/infer', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -221,19 +343,38 @@ async function runOne(be, body, grid) {
     let data = null;
     try { data = await res.json(); } catch(_) { data = null; }
     if (!res.ok || !data || data.ok === false) {
+      console.error('[qwen-image] /v1/infer FAILED', {
+        http_status: res.status, http_statusText: res.statusText, response_body: data,
+        sent_backend: payload.backend, sent_variant: payload.params.variant,
+        sent_precision: payload.params.precision,
+      });
       throw new Error(extractError(res, data));
     }
 
-    clearInterval(ticker);
+    stopTimers();
     const dt = ((performance.now() - t0) / 1000).toFixed(2) + 's';
     pill.className = 'pill'; pill.textContent = 'ok ' + dt;
 
     const out = (data.outputs && data.outputs[0]) || null;
     if (!out || !out.data_base64) throw new Error('no image output');
     const tm = data.timings_ms || {};
-    meta.textContent =
-      `${out.width||'?'}×${out.height||'?'}  ` +
-      `infer=${tm.infer||0}ms total=${tm.total||0}ms`;
+    const dbg = data.debug || null;
+    let line = `${out.width||'?'}×${out.height||'?'}  total=${(tm.total||0).toFixed ? tm.total.toFixed(0) : tm.total}ms`;
+    if (dbg) {
+      // Per-phase device proof: which hardware actually ran each stage.
+      const e = dbg.text_encoder || {}, dd = dbg.dit || {}, vv = dbg.vae || {};
+      line += `\n${dbg.gpu || '?'}`;
+      line += `\nenc[${e.device||'?'}] ${(e.ms||0).toFixed(0)}ms · ` +
+              `dit[${dd.device||'?'}] ${(dd.ms||0).toFixed(0)}ms (${(dd.ms_per_step||0).toFixed(0)}/step) · ` +
+              `vae[${vv.device||'?'}] ${(vv.ms||0).toFixed(0)}ms`;
+      // Flag any stage that did NOT run on the GPU.
+      const cpuStages = ['text_encoder','dit','vae'].filter(k => (dbg[k]||{}).device === 'cpu');
+      if (cpuStages.length) line += `\n⚠ CPU fallback: ${cpuStages.join(', ')}`;
+    } else {
+      line += `  (no device trace — non-hip backend)`;
+    }
+    meta.style.whiteSpace = 'pre-line';
+    meta.textContent = line;
 
     const img = new Image();
     img.onload = () => {
@@ -243,11 +384,14 @@ async function runOne(be, body, grid) {
     };
     img.src = 'data:' + (out.mime || 'image/png') + ';base64,' + out.data_base64;
   } catch (e) {
-    clearInterval(ticker);
+    stopTimers();
     pill.className = 'pill err'; pill.textContent = 'error';
-    errEl.style.display = 'block';
+    errEl.style.display = 'block'; errEl.style.userSelect = 'text';
     errEl.textContent = String(e.message || e);
-    if (e.name !== 'AbortError') showToast(String(e.message || e), {title: be.label});
+    if (e.name !== 'AbortError') {
+      console.error('[qwen-image] infer error [' + be.label + ' / ' + precision + ']:', e.message || e, e);
+      showToast(String(e.message || e), {title: be.label, sticky: true});
+    }
   }
 }
 
@@ -260,10 +404,16 @@ $('form').addEventListener('submit', async (ev) => {
     .map(cb => BACKENDS[+cb.dataset.idx]);
   if (!checked.length) { showToast('check at least one backend'); return; }
 
-  $('go').disabled = true; $('cancel').disabled = false;
-  const grid = $('grid'); grid.innerHTML = '';
+  // Expand "both" into the variant's precisions; precision modes that need a
+  // specific backend (fp4 → ours-cuda, int4 → hip) are paired only with a
+  // capable backend (others would fail or fall back server-side).
+  const v = currentVariant();
+  const avail = (v && v.precisions && v.precisions.length) ? v.precisions : ['fp8'];
+  const selPrec = $('precision').value;
+  const precisions = (selPrec === 'both') ? avail : [selPrec];
 
-  const body = {
+  const variantName = $('variant').value;
+  JOB_BODY = {
     model: 'qwen-image',
     task:  'text-to-image',
     inputs: {
@@ -278,13 +428,50 @@ $('form').addEventListener('submit', async (ev) => {
     },
   };
 
-  $('status').textContent = `running ${checked.length} backend(s)…`;
-  await Promise.allSettled(checked.map(be => runOne(be, body, grid)));
+  // Build the job matrix (backend × precision), skipping precision modes on
+  // backends that can't run them (fp4 → ours-cuda only, int4 → hip only).
+  const jobs = [];
+  for (const p of precisions) {
+    for (const be of checked) {
+      if (!backendCanRun(p, be.id)) continue;
+      jobs.push({ be, precision: p });
+    }
+  }
+  if (!jobs.length) { showToast('no runnable backend × precision combo (fp4 needs the ours-cuda backend; int4 needs a hip backend)'); return; }
+
+  cancelled = false;
+  $('go').disabled = true; $('cancel').disabled = false;
+  const grid = $('grid'); grid.innerHTML = '';
+
+  // Create all cells up front so the side-by-side layout appears immediately,
+  // then run jobs sequentially — the server serializes inference on one GPU
+  // (concurrent requests get HTTP 429), and sequential is the honest cadence
+  // for a same-device fp8-vs-int4 comparison.
+  const cells = jobs.map(j => {
+    const cell = mkCell(j.be.label, variantName, j.precision);
+    grid.appendChild(cell);
+    return cell;
+  });
+
+  let done = 0;
+  for (let i = 0; i < jobs.length; i++) {
+    if (cancelled) {
+      // mark the remaining queued cells
+      for (let j = i; j < jobs.length; j++) {
+        const p = cells[j].querySelector('.pill.status');
+        p.className = 'pill err status'; p.textContent = 'cancelled';
+      }
+      break;
+    }
+    $('status').textContent = `running ${done + 1}/${jobs.length}: ${jobs[i].be.label} · ${jobs[i].precision}…`;
+    await runOne(jobs[i].be, jobs[i].precision, cells[i]);
+    done++;
+  }
 
   running = [];
   $('cancel').disabled = true;
   $('go').disabled = false;
-  $('status').textContent = 'done.';
+  if (!cancelled) $('status').textContent = `done (${jobs.length} run${jobs.length > 1 ? 's' : ''}).`;
 });
 </script>
 </body>

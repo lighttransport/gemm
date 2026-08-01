@@ -2,13 +2,14 @@
  * test_hip_ppd.c - Test program for HIP/ROCm PPD runner
  *
  * Usage:
- *   ./test_hip_ppd <ppd.pth> <depth_anything_v2_vitl.pth> [-i image.ppm] [-o depth.pgm]
+ *   ./test_hip_ppd <ppd.pth> <depth_anything_v2_vitl.pth> [-i image.ppm] [-o depth.pgm] [--npy depth.npy] [--repeat N]
  */
 #include "hip_ppd_runner.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Simple PPM reader (P6 binary) */
 static uint8_t *read_ppm(const char *path, int *w, int *h) {
@@ -54,9 +55,37 @@ static void write_pgm(const char *path, const float *depth, int w, int h) {
     fprintf(stderr, "Wrote depth to %s (range: %.4f - %.4f)\n", path, dmin, dmax);
 }
 
+static void write_npy_f32(const char *path, const float *data, int w, int h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t version[2] = {1, 0};
+    fwrite(version, 1, 2, f);
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", h, w);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(data, sizeof(float), (size_t)w * h, f);
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%dx%d, float32)\n", path, w, h);
+}
+
+static double get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1.0e-6;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <ppd.pth> <da2_vitl.pth> [-i image.ppm] [-o depth.pgm]\n",
+        fprintf(stderr, "Usage: %s <ppd.pth> <da2_vitl.pth> [-i image.ppm] [-o depth.pgm] [--npy depth.npy] [--repeat N]\n",
                 argv[0]);
         return 1;
     }
@@ -65,12 +94,16 @@ int main(int argc, char **argv) {
     const char *sem_path = argv[2];
     const char *img_path = NULL;
     const char *out_path = "depth_ppd.pgm";
+    const char *npy_path = NULL;
     int verbose = 1;
+    int repeat = 1;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) img_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc) verbose = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
+        else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
     }
 
     fprintf(stderr, "Initializing HIP PPD runner...\n");
@@ -89,12 +122,24 @@ int main(int argc, char **argv) {
         uint8_t *rgb = read_ppm(img_path, &w, &h);
         if (!rgb) { fprintf(stderr, "Cannot read %s\n", img_path); hip_ppd_free(r); return 1; }
 
-        fprintf(stderr, "Running inference on %s (%dx%d)...\n", img_path, w, h);
-        ppd_result res = hip_ppd_predict(r, rgb, w, h);
+        if (repeat < 1) repeat = 1;
+        fprintf(stderr, "Running inference on %s (%dx%d, repeat=%d)...\n", img_path, w, h, repeat);
+        ppd_result res = {0};
+        double elapsed = 0.0;
+        for (int ri = 0; ri < repeat; ri++) {
+            ppd_result_free(&res);
+            double t0 = get_time_ms();
+            res = hip_ppd_predict(r, rgb, w, h);
+            elapsed = get_time_ms() - t0;
+            fprintf(stderr, "Inference %d/%d: %.1f ms\n", ri + 1, repeat, elapsed);
+        }
         free(rgb);
 
         if (res.depth) {
+            fprintf(stderr, "Total inference time: %.1f ms\n", elapsed);
             write_pgm(out_path, res.depth, res.width, res.height);
+            if (npy_path)
+                write_npy_f32(npy_path, res.depth, res.width, res.height);
             ppd_result_free(&res);
         }
     } else {

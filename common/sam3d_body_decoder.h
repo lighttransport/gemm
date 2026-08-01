@@ -102,6 +102,7 @@ typedef struct sam3d_body_decoder_model_t {
     int npose;         /* 519 (from MHR head) */
     int ncam;          /* 3 */
     int cond_dim;      /* 3 */
+    int kp_sample_scale_x; /* ViT-H width-crop correction for kp grid_sample. */
     float ln_eps;      /* 1e-6 */
 
     /* Input projections. */
@@ -138,6 +139,9 @@ typedef struct sam3d_body_decoder_model_t {
      * keypoint prompts are supplied; broadcast to (B, 1, 1280) and fed
      * through prompt_to_token. */
     qtensor invalid_point_embed;                    /* (1, 1280) */
+    /* Dense no-mask embedding added to backbone image embeddings before
+     * ray_cond_emb when no binary mask prompt is supplied. */
+    qtensor no_mask_embed;                          /* (1, 1280) */
 
     /* Per-layer weights. */
     sam3d_body_decoder_layer *layers;               /* [n_layers] */
@@ -284,6 +288,12 @@ int sam3d_body_compute_ray_cond_xyz(const float *cam_int,
                                     int H_in, int W_in,
                                     int H_out, int W_out,
                                     float *out);
+int sam3d_body_compute_ray_cond_xyz_ex(const float *cam_int,
+                                       const float *affine_trans,
+                                       int H_in, int W_in,
+                                       int H_out, int W_out,
+                                       int dinov3_rect_reinterpret,
+                                       float *out);
 
 /*
  * Default camera intrinsics for sam-3d-body (prepare_batch.py).
@@ -845,6 +855,7 @@ sam3d_body_decoder_model *sam3d_body_decoder_load(const char *decoder_sft,
     m->npose = 519;
     m->ncam = 3;
     m->cond_dim = 3;
+    m->kp_sample_scale_x = (strstr(decoder_sft, "vith") != NULL);
     m->ln_eps = 1e-6f;
 
     st_context *dec = safetensors_open(decoder_sft);
@@ -892,6 +903,8 @@ sam3d_body_decoder_model *sam3d_body_decoder_load(const char *decoder_sft,
                         &m->prompt_pe_gauss);
     bad |= s3db_find_f32(dec, "prompt_encoder.invalid_point_embed.weight",
                         &m->invalid_point_embed);
+    bad |= s3db_find_f32(dec, "prompt_encoder.no_mask_embed.weight",
+                        &m->no_mask_embed);
     /* hand_pe is optional in v1 body-only path. */
     s3db_find_f32_opt(dec, "hand_pe_layer.positional_encoding_gaussian_matrix",
                       &m->hand_pe_gauss);
@@ -1198,9 +1211,15 @@ int sam3d_body_get_dense_pe(const sam3d_body_decoder_model *m,
     for (int yi = 0; yi < H; yi++) {
         const float yn = ((float)yi + 0.5f) / (float)H;        /* [0,1] */
         const float ys = 2.0f * yn - 1.0f;                     /* [-1,1] */
-        const float x_offset = (W != H) ? 0.5f * (float)(H - W) : 0.0f;
+        /* ViT-H refs use the post-crop 32x24 grid in the original square
+         * crop coordinate frame. DINOv3 rectangular refs use normal HxW grid
+         * normalization. */
+        const float x_offset = (m->kp_sample_scale_x && W != H)
+            ? 0.5f * (float)(H - W) : 0.0f;
         for (int xi = 0; xi < W; xi++) {
-            const float xn = ((float)xi + x_offset + 0.5f) / (float)H;
+            const float xn = (m->kp_sample_scale_x && W != H)
+                ? ((float)xi + x_offset + 0.5f) / (float)H
+                : ((float)xi + 0.5f) / (float)W;
             const float xs = 2.0f * xn - 1.0f;
             const float two_pi = 6.2831853071795864769f;
             for (int k = 0; k < npf; k++) {
@@ -1275,6 +1294,18 @@ int sam3d_body_compute_ray_cond_xyz(const float *cam_int,
                                     int H_out, int W_out,
                                     float *out)
 {
+    return sam3d_body_compute_ray_cond_xyz_ex(cam_int, affine_trans,
+                                              H_in, W_in, H_out, W_out,
+                                              0, out);
+}
+
+int sam3d_body_compute_ray_cond_xyz_ex(const float *cam_int,
+                                       const float *affine_trans,
+                                       int H_in, int W_in,
+                                       int H_out, int W_out,
+                                       int dinov3_rect_reinterpret,
+                                       float *out)
+{
     if (!cam_int || !affine_trans || !out) return SAM3D_BODY_DECODER_E_INVAL;
     if (H_in <= 0 || W_in <= 0 || H_out <= 0 || W_out <= 0)
         return SAM3D_BODY_DECODER_E_INVAL;
@@ -1289,8 +1320,54 @@ int sam3d_body_compute_ray_cond_xyz(const float *cam_int,
     const float t02 = affine_trans[0 * 3 + 2];
     const float t12 = affine_trans[1 * 3 + 2];
 
-    /* x_full[j] = (j/a00 - t02/a00 - cx) / fx,  j ∈ [0, W_in)
-     * y_full[i] = (i/a11 - t12/a11 - cy) / fy,  i ∈ [0, H_in)
+    if (dinov3_rect_reinterpret && H_in != W_in && H_out != W_out) {
+        float *x_full = (float *)malloc((size_t)H_in * sizeof(float));
+        float *y_full = (float *)malloc((size_t)W_in * sizeof(float));
+        if (!x_full || !y_full) {
+            free(x_full); free(y_full);
+            return SAM3D_BODY_DECODER_E_LOAD;
+        }
+        const double inv_a00 = 1.0 / (double)a00;
+        const double inv_a11 = 1.0 / (double)a11;
+        const double inv_fx  = 1.0 / (double)fx;
+        const double inv_fy  = 1.0 / (double)fy;
+        for (int j = 0; j < H_in; j++) {
+            double xp = (double)j * inv_a00 - (double)t02 * inv_a00;
+            x_full[j] = (float)((xp - (double)cx) * inv_fx);
+        }
+        for (int i = 0; i < W_in; i++) {
+            double yp = (double)i * inv_a11 - (double)t12 * inv_a11;
+            y_full[i] = (float)((yp - (double)cy) * inv_fy);
+        }
+
+        float *x_ds = (float *)malloc((size_t)H_out * sizeof(float));
+        float *y_ds = (float *)malloc((size_t)W_out * sizeof(float));
+        if (!x_ds || !y_ds) {
+            free(x_full); free(y_full); free(x_ds); free(y_ds);
+            return SAM3D_BODY_DECODER_E_LOAD;
+        }
+        s3db_antialias_downsample_1d(x_full, H_in, x_ds, H_out);
+        s3db_antialias_downsample_1d(y_full, W_in, y_ds, W_out);
+        free(x_full); free(y_full);
+
+        const int tmp_w = H_out;
+        for (int yi = 0; yi < H_out; yi++) {
+            for (int xi = 0; xi < W_out; xi++) {
+                const int k = yi * W_out + xi;
+                const int tmp_y = k / tmp_w;
+                const int tmp_x = k - tmp_y * tmp_w;
+                size_t base = ((size_t)yi * W_out + xi) * 3;
+                out[base + 0] = x_ds[tmp_x];
+                out[base + 1] = y_ds[tmp_y];
+                out[base + 2] = 1.0f;
+            }
+        }
+        free(x_ds); free(y_ds);
+        return SAM3D_BODY_DECODER_E_OK;
+    }
+
+    /* x_full[j] = (j/a00 - t02/a00 - cx) / fx,  j in [0, W_in)
+     * y_full[i] = (i/a11 - t12/a11 - cy) / fy,  i in [0, H_in)
      * Both are linear ramps; apply 1D antialias separately. */
     float *x_full = (float *)malloc((size_t)W_in * sizeof(float));
     float *y_full = (float *)malloc((size_t)H_in * sizeof(float));
@@ -1317,7 +1394,7 @@ int sam3d_body_compute_ray_cond_xyz(const float *cam_int,
     }
     const float *x_src = x_full;
     int x_src_n = W_in;
-    if (W_out != H_out) {
+    if (W_in == H_in && W_out != H_out) {
         int crop_w = (int)lrint((double)W_in * (double)W_out / (double)H_out);
         if (crop_w > 0 && crop_w <= W_in) {
             int crop_x0 = (W_in - crop_w) / 2;
@@ -1422,7 +1499,8 @@ int sam3d_body_preprocess_image(const uint8_t *img_rgb_hwc,
     if (W_in <= 0 || H_in <= 0 || W_out <= 0 || H_out <= 0)
         return SAM3D_BODY_DECODER_E_INVAL;
 
-    /* Invert 2x3 affine (dst→src). */
+    /* Invert 2x3 affine (dst->src), matching cv::warpAffine without
+     * WARP_INVERSE_MAP. */
     const double a00 = warp_mat_2x3[0], a01 = warp_mat_2x3[1], a02 = warp_mat_2x3[2];
     const double a10 = warp_mat_2x3[3], a11 = warp_mat_2x3[4], a12 = warp_mat_2x3[5];
     const double det = a00 * a11 - a01 * a10;
@@ -1445,26 +1523,42 @@ int sam3d_body_preprocess_image(const uint8_t *img_rgb_hwc,
     };
     const size_t plane = (size_t)H_out * (size_t)W_out;
 
-    /* NOTE: we compute bilinear in double precision then round to uint8 (matching
-     * the ToTensor()-followed-by-normalize path). cv2.warpAffine internally
-     * quantizes subpixel coords to INTER_TAB_SIZE=32 with fixed-point AB_BITS=10
-     * accumulation, which can differ from us by up to a couple of uint8 units on
-     * rare pixels. Downstream DINOv3 runs in bf16, so the residual delta is
-     * within model precision. */
+    /* OpenCV INTER_LINEAR warpAffine uses a fixed-point coordinate path:
+     * AB_BITS=10, INTER_BITS=5, plus a half-table-step round_delta before
+     * remap. Reproduce that path so DINOv3 raw-image refs are not perturbed
+     * by rare 1-2 u8 interpolation differences. For INTER_BITS=5 the
+     * 2D interpolation-table coefficients are exact integer multiples of
+     * 32 in 15-bit fixed-point, so no table is needed. */
+    enum { INTER_BITS_ = 5, INTER_TAB_SIZE_ = 1 << INTER_BITS_ };
+    enum { AB_BITS_ = 10, AB_SCALE_ = 1 << AB_BITS_ };
+    enum { REMAP_BITS_ = 15, REMAP_SCALE_ = 1 << REMAP_BITS_ };
+    const int round_delta = AB_SCALE_ / INTER_TAB_SIZE_ / 2;
+    int *adelta = (int *)malloc((size_t)W_out * 2 * sizeof(int));
+    if (!adelta) return SAM3D_BODY_DECODER_E_INVAL;
+    int *bdelta = adelta + W_out;
+    for (int x = 0; x < W_out; x++) {
+        adelta[x] = (int)lrint(i00 * (double)x * (double)AB_SCALE_);
+        bdelta[x] = (int)lrint(i10 * (double)x * (double)AB_SCALE_);
+    }
+
     for (int y = 0; y < H_out; y++) {
+        const int X0 = (int)lrint((i01 * (double)y + i02) *
+                                  (double)AB_SCALE_) + round_delta;
+        const int Y0 = (int)lrint((i11 * (double)y + i12) *
+                                  (double)AB_SCALE_) + round_delta;
         for (int x = 0; x < W_out; x++) {
-            const double sx = i00 * (double)x + i01 * (double)y + i02;
-            const double sy = i10 * (double)x + i11 * (double)y + i12;
-            const int ix0 = (int)floor(sx);
-            const int iy0 = (int)floor(sy);
+            const int X = (X0 + adelta[x]) >> (AB_BITS_ - INTER_BITS_);
+            const int Y = (Y0 + bdelta[x]) >> (AB_BITS_ - INTER_BITS_);
+            const int ix0 = X >> INTER_BITS_;
+            const int iy0 = Y >> INTER_BITS_;
             const int ix1 = ix0 + 1;
             const int iy1 = iy0 + 1;
-            const float fx = (float)(sx - (double)ix0);
-            const float fy = (float)(sy - (double)iy0);
-            const float w00 = (1.0f - fx) * (1.0f - fy);
-            const float w10 = fx * (1.0f - fy);
-            const float w01 = (1.0f - fx) * fy;
-            const float w11 = fx * fy;
+            const int fx = X & (INTER_TAB_SIZE_ - 1);
+            const int fy = Y & (INTER_TAB_SIZE_ - 1);
+            const int w00 = (INTER_TAB_SIZE_ - fx) * (INTER_TAB_SIZE_ - fy) * 32;
+            const int w10 = fx * (INTER_TAB_SIZE_ - fy) * 32;
+            const int w01 = (INTER_TAB_SIZE_ - fx) * fy * 32;
+            const int w11 = fx * fy * 32;
 
             const int in00 = (ix0 >= 0 && ix0 < W_in && iy0 >= 0 && iy0 < H_in);
             const int in10 = (ix1 >= 0 && ix1 < W_in && iy0 >= 0 && iy0 < H_in);
@@ -1472,14 +1566,12 @@ int sam3d_body_preprocess_image(const uint8_t *img_rgb_hwc,
             const int in11 = (ix1 >= 0 && ix1 < W_in && iy1 >= 0 && iy1 < H_in);
 
             for (int c = 0; c < 3; c++) {
-                float v = 0.0f;
-                if (in00) v += w00 * (float)img_rgb_hwc[((size_t)iy0 * W_in + ix0) * 3 + c];
-                if (in10) v += w10 * (float)img_rgb_hwc[((size_t)iy0 * W_in + ix1) * 3 + c];
-                if (in01) v += w01 * (float)img_rgb_hwc[((size_t)iy1 * W_in + ix0) * 3 + c];
-                if (in11) v += w11 * (float)img_rgb_hwc[((size_t)iy1 * W_in + ix1) * 3 + c];
-                /* cv2.warpAffine returns uint8 — round then /255 to match
-                 * the upstream VisionTransformWrapper(ToTensor()) path. */
-                int iv = (int)floorf(v + 0.5f);
+                int acc = 0;
+                if (in00) acc += w00 * (int)img_rgb_hwc[((size_t)iy0 * W_in + ix0) * 3 + c];
+                if (in10) acc += w10 * (int)img_rgb_hwc[((size_t)iy0 * W_in + ix1) * 3 + c];
+                if (in01) acc += w01 * (int)img_rgb_hwc[((size_t)iy1 * W_in + ix0) * 3 + c];
+                if (in11) acc += w11 * (int)img_rgb_hwc[((size_t)iy1 * W_in + ix1) * 3 + c];
+                int iv = (acc + (REMAP_SCALE_ >> 1)) >> REMAP_BITS_;
                 if (iv < 0) iv = 0; else if (iv > 255) iv = 255;
                 const float norm = ((float)iv / 255.0f) * inv_std[c]
                                  + neg_mean_over_std[c];
@@ -1487,6 +1579,7 @@ int sam3d_body_preprocess_image(const uint8_t *img_rgb_hwc,
             }
         }
     }
+    free(adelta);
     return SAM3D_BODY_DECODER_E_OK;
 }
 
@@ -1959,10 +2052,10 @@ int sam3d_body_kp_token_update(const sam3d_body_decoder_model *m,
         if (invalid[i]) continue;  /* zero from calloc */
         float gx = kp2d_cropped[i*2 + 0] * 2.0f;
         float gy = kp2d_cropped[i*2 + 1] * 2.0f;
-        /* ViT-H uses a rectangular image embedding grid (32x24). Upstream
-         * scales x by H/W before grid_sample so normalized crop coords still
-         * refer to the original square crop before width cropping. */
-        if (W != H) gx *= (float)H / (float)W;
+        /* ViT-H width-crops a square crop before the backbone; upstream scales
+         * x by H/W for those backbones only. Rectangular DINOv3 inputs do not
+         * take this correction even when H != W. */
+        if (m->kp_sample_scale_x && W != H) gx *= (float)H / (float)W;
         s3db_grid_sample_one(image_emb, C_img, H, W, gx, gy,
                              kp_feats + (size_t)i * C_img);
     }

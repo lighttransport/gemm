@@ -59,6 +59,10 @@ all: test_trellis2 test_tex_dec test_shape_dec test_shape_dec_dump verify_slat_d
 test_trellis2: test_trellis2.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
 
+# Shared library for the Python ctypes binding (ref/trellis2/trellis2_cmod.py).
+libcpu_trellis2.so: cpu_trellis2_runner.c cpu_trellis2_runner.h $(HEADERS)
+	$(CC) $(CFLAGS) -fPIC -shared -I$(COMMON) -o $@ cpu_trellis2_runner.c $(LDFLAGS)
+
 test_tex_dec: test_tex_dec.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
 
@@ -72,4 +76,4 @@ verify_slat_dit: verify_slat_dit.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
 
 clean:
-	rm -f test_trellis2 test_tex_dec test_shape_dec test_shape_dec_dump verify_slat_dit
+	rm -f test_trellis2 test_tex_dec test_shape_dec test_shape_dec_dump verify_slat_dit libcpu_trellis2.so

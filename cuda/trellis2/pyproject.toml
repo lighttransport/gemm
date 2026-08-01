@@ -41,6 +41,14 @@ torch-cu124 = [
     "torchvision==0.20.1",
     "triton==3.1.0",
 ]
+# Use this on systems with CUDA 12.9 toolkit (e.g. sm_120 Blackwell hosts).
+# torch wheels are built against cu128; nvcc must be major-12 — cuda-toolkit-12-9
+# is fine. cu130 is *not* compatible (CCCL too strict for CuMesh source).
+torch-cu128 = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "triton==3.3.1",
+]
 
 # For ref/trellis2/gen_stage1_ref.py + gen_stage2_ref.py.
 ref-pipeline = [
@@ -54,14 +62,14 @@ ref-pipeline = [
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
-triton = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+triton = { index = "pytorch-cu128" }
 
 [tool.uv]
 package = false

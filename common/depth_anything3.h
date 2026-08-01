@@ -544,6 +544,41 @@ static void da3_bilinear(float *dst, const float *src, int C,
     cpu_bilinear_resize(dst, src, C, Hi, Wi, Ho, Wo);
 }
 
+/* Official DualDPT UV positional embedding:
+ * create_uv_grid + position_grid_to_embed + ratio, added in CHW layout. */
+static void da3_add_dpt_pos_embed_chw(float *x, int C, int H, int W,
+                                      float aspect, float ratio) {
+    int quarter = C / 4;
+    if (quarter <= 0) return;
+    float diag = sqrtf(aspect * aspect + 1.0f);
+    float span_x = aspect / diag;
+    float span_y = 1.0f / diag;
+    for (int c = 0; c < C; c++) {
+        int band, is_cos;
+        float coord_is_u;
+        if (c < quarter) {
+            band = c; coord_is_u = 1.0f; is_cos = 0;
+        } else if (c < 2 * quarter) {
+            band = c - quarter; coord_is_u = 1.0f; is_cos = 1;
+        } else if (c < 3 * quarter) {
+            band = c - 2 * quarter; coord_is_u = 0.0f; is_cos = 0;
+        } else {
+            band = c - 3 * quarter; coord_is_u = 0.0f; is_cos = 1;
+        }
+        float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);
+        for (int h = 0; h < H; h++) {
+            for (int w = 0; w < W; w++) {
+                float u = (W > 1) ? span_x * (2.0f * w - (W - 1)) / (float)W : 0.0f;
+                float v = (H > 1) ? span_y * (2.0f * h - (H - 1)) / (float)H : 0.0f;
+                float coord = coord_is_u ? u : v;
+                float angle = coord * omega;
+                float emb = is_cos ? cosf(angle) : sinf(angle);
+                x[c * H * W + h * W + w] += emb * ratio;
+            }
+        }
+    }
+}
+
 /* ---- ResidualConvUnit ---- */
 
 static void da3_rcu(float *out, const float *x, const float *c1w, const float *c1b,
@@ -2142,6 +2177,9 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         free(features[fi]);
         features[fi] = NULL;
 
+        da3_add_dpt_pos_embed_chw(chw, oc, gh, gw,
+                                  (float)target_w / (float)target_h, 0.1f);
+
         /* Spatial alignment via resize */
         if (fi == 0) {
             /* ConvTranspose2d 4x4 stride 4 */
@@ -2786,6 +2824,7 @@ static void da3_compute_adapted(da3_model *m, float **features, int np, int dim,
                 chw[c * gh * gw + ph * gw + pw_idx] = proj[p * oc + c];
         }
         free(proj);
+        da3_add_dpt_pos_embed_chw(chw, oc, gh, gw, (float)gw / (float)gh, 0.1f);
         int sph, spw;
         float *sp = NULL;
         if (fi == 0)      sp = da3_conv_transpose2d_qt(chw, &m->head.upsample_0_w, &m->head.upsample_0_b,

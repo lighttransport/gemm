@@ -87,7 +87,10 @@ int main(int argc, char **argv) {
     float *rgb_gpu = (float *)calloc(rgb_sz, sizeof(float));
     fprintf(stderr, "Running GPU VAE decode...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* CPU reference keeps DiT latents in VAE decoder space; match it here. */
+    setenv("FLUX2_SKIP_VAE_BN", "1", 1);
     hip_flux2_vae_decode(r, latent, lat_h, lat_w, rgb_gpu);
+    unsetenv("FLUX2_SKIP_VAE_BN");
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double gpu_time = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     fprintf(stderr, "GPU VAE: %.3f s\n", gpu_time);

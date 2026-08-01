@@ -29,6 +29,9 @@ VCOORD=${VCOORD:-vcoord_ds4f.txt}   # SAME file run_ds4f_11n.sh uses (rank<->nod
 
 # ---- harness knobs forwarded to every rank (mpiexec forwards EXPORTED env) ----
 export DS4F_EP_SIZE=${DS4F_EP_SIZE:-$NP}
+# DS4F_MODEL=ds4p selects the DeepSeek-V4-Pro config so the stager shards its 384 experts
+# (forward to the stager ranks; empty = Flash). Pair with DS4F_MODEL_DIR/DS4F_NSHARDS=64.
+export DS4F_MODEL=${DS4F_MODEL:-}
 export DS4F_MODEL_DIR=${DS4F_MODEL_DIR:-$HOME/models/ds4f}
 export DS4F_STAGE_DIR=${DS4F_STAGE_DIR:-/local/ds4f}
 export DS4F_NSHARDS=${DS4F_NSHARDS:-46}

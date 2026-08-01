@@ -1,0 +1,5 @@
+bench_fa2
+wmma_min_rtc
+wmma_min_aot_f16
+wmma_min_aot_bf16
+wmma_mid_rtc

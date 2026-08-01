@@ -1,0 +1,15 @@
+/test_hip_sam3d_body
+/test_fa_wmma
+/bench_pc_matvec
+/verify_dinov3
+/verify_vith
+/verify_ray_cond
+/verify_build_tokens
+/verify_decoder_layer
+/verify_kp_update
+/verify_mhr_head
+/verify_decoder
+/verify_mhr
+/verify_end_to_end
+*.o
+*.obj

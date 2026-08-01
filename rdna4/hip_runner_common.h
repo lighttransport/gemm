@@ -102,8 +102,12 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
         arch = props.gcnArchName;
     }
 
+    const char *precise_env = getenv("HIP_RUNNER_PRECISE_MATH");
+    int precise_math = precise_env && precise_env[0] && strcmp(precise_env, "0") != 0;
+
     if (verbose >= 1)
-        fprintf(stderr, "%s: compiling kernels for %s ...\n", prefix, arch);
+        fprintf(stderr, "%s: compiling kernels for %s (%s math) ...\n",
+                prefix, arch, precise_math ? "precise" : "fast");
 
     hiprtcProgram prog;
     hiprtcResult cres = hiprtcCreateProgram(&prog, source, prog_name, 0, NULL, NULL);
@@ -112,10 +116,13 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
         return -1;
     }
 
-    char arch_flag[64];
+    char arch_flag[320];
     snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=%s", arch);
-    const char *opts[] = { arch_flag, "-O3", "-ffast-math" };
-    hiprtcResult nres = hiprtcCompileProgram(prog, 3, opts);
+    const char *opts_fast[] = { arch_flag, "-O3", "-ffast-math" };
+    const char *opts_precise[] = { arch_flag, "-O3" };
+    hiprtcResult nres = hiprtcCompileProgram(prog,
+        precise_math ? 2 : 3,
+        precise_math ? opts_precise : opts_fast);
 
     if (nres != HIPRTC_SUCCESS) {
         fprintf(stderr, "%s: HIPRTC compile error %d\n", prefix, (int)nres);

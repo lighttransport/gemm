@@ -88,7 +88,7 @@
 
 #include "tofu_demo.h"
 
-#define MAX_NODES 64
+#define MAX_NODES 128   /* was 64; bumped for DS4P 96/112/128-node overlap validation */
 #define MAX_TNI   6
 #define BENCH_STAG DEMO_STAG
 #define WAIT_TIMEOUT_SEC 30.0

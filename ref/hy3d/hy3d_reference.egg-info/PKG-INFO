@@ -1,0 +1,32 @@
+Metadata-Version: 2.4
+Name: hy3d-reference
+Version: 0.1.0
+Summary: PyTorch reference for Hunyuan3D-2.1 verification
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.3
+Requires-Dist: torchvision
+Requires-Dist: safetensors
+Requires-Dist: numpy
+Requires-Dist: Pillow
+Requires-Dist: transformers
+Requires-Dist: pyyaml
+Requires-Dist: trimesh
+Requires-Dist: einops
+Requires-Dist: diffusers
+Requires-Dist: scikit-image
+Requires-Dist: timm>=1.0.26
+Requires-Dist: omegaconf>=2.3.0
+Requires-Dist: opencv-python>=4.13.0.92
+Requires-Dist: pymeshlab>=2025.7.post1
+Requires-Dist: accelerate>=1.13.0
+Requires-Dist: pygltflib>=1.16.5
+Requires-Dist: xatlas>=0.0.11
+Requires-Dist: basicsr>=1.4.2
+Requires-Dist: realesrgan>=0.3.0
+Requires-Dist: pybind11>=3.0.3
+Requires-Dist: pytorch-lightning>=2.6.1
+Requires-Dist: fast-simplification>=0.1.13
+Provides-Extra: torch-rocm722
+Requires-Dist: triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.6.0+rocm7.2.2.git4ed88892-cp312-cp312-linux_x86_64.whl ; extra == "torch-rocm722"
+Requires-Dist: torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl ; extra == "torch-rocm722"
+Requires-Dist: torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchvision-0.26.0+rocm7.2.2.git336d36e8-cp312-cp312-linux_x86_64.whl ; extra == "torch-rocm722"

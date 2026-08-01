@@ -54,6 +54,12 @@ fi
 # ---- forward harness knobs to the ranks (mpiexec forwards EXPORTED env only) ----
 export LLM_THREADS=${LLM_THREADS:-48}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$LLM_THREADS}
+# NUMA lever (~1.40x bit-identical decode): the runner interleaves its arena across all CMGs in-process
+# (ds4f_apply_numa, default DS4F_NUMA=1); OMP thread affinity is read at runtime init so it MUST be set
+# at launch here. DS4F_NUMA=0 disables the interleave half for an A/B.
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+export OMP_PLACES=${OMP_PLACES:-cores}
+export DS4F_NUMA=${DS4F_NUMA:-1}
 export DS4F_CMGS=${DS4F_CMGS:-4}
 export DS4F_PREFILL=${DS4F_PREFILL:-8}
 # DS4F_PREFILL_BATCH=M_TILE>0 runs prefill as M-token GEMM tiles (needs EXACT+FP8_BF16).
@@ -62,6 +68,20 @@ export DS4F_PREFILL=${DS4F_PREFILL:-8}
 # (Attention is now GEMM-ified per-head-block so its 32MB q/attn buffers no longer
 #  bound L2 — that is why the old M>=128 cliff softened and 64 now wins.)
 export DS4F_PREFILL_BATCH=${DS4F_PREFILL_BATCH:-0}
+
+# ---- PREFILL: batch it through the verify path. ON by default as of 2026-07-14 ---------------
+# Gated on Flash before flipping (gate_prefill_flash.sh): VERIFY_GATE 16/16 PASS, and the completion
+# is CHARACTER-IDENTICAL to the control with the same prefill argmax (361).
+#
+#   PREFILL_GEMM=0   prefill 15.45 tok/s   ar_calls 3010
+#   PREFILL_GEMM=1   prefill 24.86 (+61%)  ar_calls  129     decode unchanged (15.47 -> 15.51)
+#
+# Decode is untouched by design -- this only changes how the prompt is consumed. Flash's TP stack is
+# OFF (below), so the forward_verify x TP_WOB bug that broke every batched path on base (f9daca59)
+# never applied here; that is a reason to EXPECT a pass, not a substitute for gating one.
+export DS4F_PREFILL_GEMM=${DS4F_PREFILL_GEMM:-1}
+export DS4F_PREFILL_K=${DS4F_PREFILL_K:-32}
+
 export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
 export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
 # DS4F_CTX_WARM>0 fills synthetic KV+compressed caches to this ctx, then decodes
@@ -158,6 +178,12 @@ export DS4F_QNR_PAR=${DS4F_QNR_PAR:-1}
 # Default 1 = split the index_heads across the pool (BIT-EXACT, disjoint per-head slices).
 # Was 4.68ms/tok = 5.0% of decode @ctx10240 (scalar, serial on tid0 inside ds4f_index_step).
 export DS4F_TB2ROPE_PAR=${DS4F_TB2ROPE_PAR:-1}
+# DS4F_FLAGBAR=0 forces the OLD shared-counter pool barrier (all 47 workers atomic_fetch_add one
+# _Atomic done -> cache-line ping-pong). Default 1 = per-worker completion flag on its own cache
+# line (main polls each). BIT-IDENTICAL (same worker fn + splits, only the done-signal differs).
+# M=1 decode does ~900 tiny pool dispatches/tok, so the 47-way contention was pure overhead:
+# measured 11n ctx1759 decode 12.26 -> 13.24 tok/s (+8%), prefill 12.32 -> 13.28, byte-identical gen.
+export DS4F_FLAGBAR=${DS4F_FLAGBAR:-1}
 # DS4F_INT8_KV=1 stores the window KV latent as int8 (per-channel STATIC scale calibrated
 # on the first DS4F_INT8KV_CAL positions; S5 scheme), halving the KV footprint (the long-ctx
 # memory dominator). LOSSY (~1% rel) -> argmax NOT bit-exact; coherence is the gate. Forces
@@ -177,13 +203,35 @@ export TF_HW_BARRIER=${TF_HW_BARRIER:-1}
 # Synthetic harness => bf16-rounded reduce is quality-irrelevant; all ranks stay
 # bitwise-identical (lockstep preserved). Default off; flip to cut comm.
 export TP_AR_BF16=${TP_AR_BF16:-0}
+# ---- ds4p / tensor-parallel / lean-cache knobs (export so mpiexec forwards them to ranks) ----
+# DS4F_MODEL=ds4p selects the DeepSeek-V4-Pro config (61L/7168/384E); empty = Flash.
+export DS4F_MODEL=${DS4F_MODEL:-}
+# Tensor-parallel dense sharding across the EP ranks (mandatory to fit ds4p): attn heads,
+# shared-expert up/gate, lm-head and embed are split N-ways instead of replicated.
+export DS4F_TP_ATTN=${DS4F_TP_ATTN:-0}
+export DS4F_TP_SHARED=${DS4F_TP_SHARED:-0}
+export DS4F_TP_HEAD=${DS4F_TP_HEAD:-0}
+export DS4F_TP_EMBED=${DS4F_TP_EMBED:-0}
+# DS4F_INT4_CMP=1 stores cmp_kv as int4 (implies INT8_CMP); leanest long-ctx cmp cache.
+export DS4F_INT4_CMP=${DS4F_INT4_CMP:-0}
+# Context-parallel cache sharding (Phase 2): shard the compressed Tier-B2 caches by slot
+# range across the EP ranks so per-node cache ~ /N instead of replicated. DS4F_CP enables
+# (validated gather), DS4F_CP_SHARD shards cmp_q4, DS4F_CP_IDX shards idx_kv8_4 (needs
+# INT4_CMP + IDX_INT8); DS4F_CP_MERGE (default on) = cross-rank top-k candidate merge.
+export DS4F_CP=${DS4F_CP:-0}
+export DS4F_CP_SHARD=${DS4F_CP_SHARD:-0}
+export DS4F_CP_IDX=${DS4F_CP_IDX:-0}
+export DS4F_CP_MERGE=${DS4F_CP_MERGE:-1}
+# Warm-phase ctx-ceiling guard (clean _exit(42) before OOM) + per-layer MemFree trace.
+export DS4F_WARM_RSS_TRACE=${DS4F_WARM_RSS_TRACE:-0}
+export DS4F_WARM_MEMAVAIL_STOP_GB=${DS4F_WARM_MEMAVAIL_STOP_GB:-1.5}
 
 echo "=== DS4F EP harness on $NP node(s) ($([ "$DS4F_REAL" = 1 ] && echo "REAL weights <- $DS4F_STAGE_DIR" || echo synthetic)$([ "$DS4F_EXACT" = 1 ] && echo " EXACT-math")$([ "$DS4F_TIERB2" = 1 ] && echo " TierB2")$([ "$DS4F_MHC" = 1 ] && echo " mHC")) ==="
 echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS4F_MAXPOS layers=${DS4F_LAYERS:-43} dense=$([ "$DS4F_REAL" = 1 ] && echo "FP8(real)" || ([ "$DS4F_FP8_BF16" = 1 ] && echo BF16 || echo FP8))"
 
 # ---- build (native fcc + OpenMP) ----
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
-make -C "$LLM_DIR" ds4f_ep_runner CC=fcc OPENMP=1 >/dev/null
+[ "${DS4F_NOBUILD:-0}" = 1 ] || make -C "$LLM_DIR" ds4f_ep_runner CC=fcc OPENMP=1 >/dev/null
 BIN="$LLM_DIR/build/ds4f_ep_runner"
 
 # ---- clean per-rank artifacts from any prior run ----

@@ -61,7 +61,7 @@
 
 #include "tofu_demo.h"
 
-#define MAX_NODES 32
+#define MAX_NODES 128
 #define BENCH_STAG DEMO_STAG          /* predictable-STADD convention */
 #define WAIT_TIMEOUT_SEC 30.0
 #define P2P_MAGIC 0x9217EE00u         /* send-buffer head magic = base | sender rank */

@@ -12,13 +12,14 @@ CXXFLAGS = $(CFLAGS) -std=c++17
 LDFLAGS = -ldl -lm -lpthread
 
 CUEW_SRC   = ../cuew.c
+CUBLAS_SRC = ../cublasew.c
 RUNNER_SRC = cuda_sam3d_runner.c
 CPU_SRC    = sam3d_cpu.c
 TEST_SRC   = test_cuda_sam3d.c
 TARGET     = test_cuda_sam3d
 XATLAS_SRC = ../../common/sam3d_xatlas.cc ../../common/xatlas.cc
 TARGET_OBJS = test_cuda_sam3d.o cuda_sam3d_runner.o sam3d_cpu.o \
-              cuew_sam3d.o sam3d_xatlas.o xatlas.o
+              cuew_sam3d.o cublasew_sam3d.o sam3d_xatlas.o xatlas.o
 
 VERIFIES = verify_dinov2 verify_cond_fuser verify_ss_dit verify_ss_decoder \
            verify_slat_dit verify_slat_gs verify_ssdit_block_realw \
@@ -46,7 +47,7 @@ COMMON_DEPS = cuda_sam3d_runner.h cuda_sam3d_kernels.h sam3d_cpu.h \
               cuda_sam3d_ssdit_gpu.h cuda_sam3d_ssdit_forward.h cuda_sam3d_ssdit_outer.h \
               cuda_sam3d_slat_dit_gpu.h cuda_sam3d_slat_dit_forward.h \
               cuda_sam3d_ss_decoder_gpu.h cuda_sam3d_ss_decoder_forward.h \
-              ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
+              ../cuew.h ../cublasew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
               ../../common/safetensors.h ../../common/dinov2.h \
               ../../common/cpu_compute.h ../../common/ggml_dequant.h \
               ../../common/sam3d_cond_fuser.h \
@@ -94,29 +95,32 @@ sam3d_cpu.o: $(CPU_SRC) $(CPU_DEPS)
 cuew_sam3d.o: $(CUEW_SRC) ../cuew.h
 	$(CC) $(CFLAGS) -c -o $@ $(CUEW_SRC)
 
+cublasew_sam3d.o: $(CUBLAS_SRC) ../cublasew.h ../cuew.h
+	$(CC) $(CFLAGS) -c -o $@ $(CUBLAS_SRC)
+
 sam3d_xatlas.o: ../../common/sam3d_xatlas.cc ../../common/sam3d_xatlas.h ../../common/xatlas.h
 	$(CXX) $(CXXFLAGS) -c -o $@ ../../common/sam3d_xatlas.cc
 
 xatlas.o: ../../common/xatlas.cc ../../common/xatlas.h
 	$(CXX) $(CXXFLAGS) -c -o $@ ../../common/xatlas.cc
 
-verify_dinov2: verify_dinov2.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_dinov2.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+verify_dinov2: verify_dinov2.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_dinov2.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
-verify_cond_fuser: verify_cond_fuser.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_cond_fuser.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+verify_cond_fuser: verify_cond_fuser.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_cond_fuser.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
-verify_ss_dit: verify_ss_dit.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ss_dit.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+verify_ss_dit: verify_ss_dit.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ss_dit.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
-verify_ss_decoder: verify_ss_decoder.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ss_decoder.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+verify_ss_decoder: verify_ss_decoder.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ss_decoder.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
-verify_slat_dit: verify_slat_dit.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_dit.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+verify_slat_dit: verify_slat_dit.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_dit.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
-verify_slat_gs: verify_slat_gs.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_gs.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+verify_slat_gs: verify_slat_gs.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_gs.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 test_layernorm_token: test_layernorm_token.c cuda_sam3d_kernels.h \
                       ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h $(CUEW_SRC)
@@ -256,46 +260,48 @@ verify_slat_transformer_block_realw: verify_slat_transformer_block_realw.c cuda_
                                      ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
                                      ../../common/sam3d_slat_dit.h ../../common/sam3d_ss_flow_dit.h \
                                      ../../common/safetensors.h ../../common/npy_io.h \
-                                     $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_transformer_block_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+                                     $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC) $(CUBLAS_SRC)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_transformer_block_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 verify_slat_input_block0_realw: verify_slat_input_block0_realw.c cuda_sam3d_kernels.h \
                                 ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
                                 ../../common/sam3d_slat_dit.h ../../common/npy_io.h \
-                                $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_input_block0_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+                                $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC) $(CUBLAS_SRC)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_input_block0_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 verify_slat_input_block1_realw: verify_slat_input_block1_realw.c cuda_sam3d_kernels.h \
                                 ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
                                 ../../common/sam3d_slat_dit.h ../../common/npy_io.h \
-                                $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_input_block1_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+                                $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC) $(CUBLAS_SRC)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_input_block1_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 verify_slat_out_block0_realw: verify_slat_out_block0_realw.c cuda_sam3d_kernels.h \
                               ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
                               ../../common/sam3d_slat_dit.h ../../common/npy_io.h \
-                              $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_out_block0_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+                              $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC) $(CUBLAS_SRC)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_out_block0_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 verify_slat_out_block1_realw: verify_slat_out_block1_realw.c cuda_sam3d_kernels.h \
                               ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
                               ../../common/sam3d_slat_dit.h ../../common/npy_io.h \
-                              $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_out_block1_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+                              $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC) $(CUBLAS_SRC)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_out_block1_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 verify_ssdit_block_realw: verify_ssdit_block_realw.c cuda_sam3d_ssdit_gpu.h \
                           cuda_sam3d_ssdit_forward.h cuda_sam3d_kernels.h \
-                          ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h $(CUEW_SRC)
-	$(CC) $(CFLAGS) -o $@ verify_ssdit_block_realw.c $(CUEW_SRC) $(LDFLAGS)
+                          ../cuew.h ../cublasew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
+                          $(CUEW_SRC) $(CUBLAS_SRC)
+	$(CC) $(CFLAGS) -o $@ verify_ssdit_block_realw.c $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 verify_ssdit_full_realw: verify_ssdit_full_realw.c cuda_sam3d_ssdit_gpu.h \
                          cuda_sam3d_ssdit_forward.h cuda_sam3d_ssdit_outer.h \
                          cuda_sam3d_kernels.h \
-                         ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h $(CUEW_SRC)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ssdit_full_realw.c $(CUEW_SRC) $(LDFLAGS)
+                         ../cuew.h ../cublasew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
+                         $(CUEW_SRC) $(CUBLAS_SRC)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ssdit_full_realw.c $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
-verify_ss_dit_ode: verify_ss_dit_ode.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ss_dit_ode.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+verify_ss_dit_ode: verify_ss_dit_ode.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_ss_dit_ode.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(CUBLAS_SRC) $(LDFLAGS)
 
 test_fuser_proj: test_fuser_proj.c cuda_sam3d_kernels.h \
                  ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h $(CUEW_SRC)

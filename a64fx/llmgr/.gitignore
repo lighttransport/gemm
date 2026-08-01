@@ -1,0 +1,6 @@
+# Runtime artifacts, not source.
+logs/
+prof/
+state/
+__pycache__/
+output.*/

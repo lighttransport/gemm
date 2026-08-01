@@ -40,10 +40,10 @@ DA3 supports multiple output modalities: depth + confidence, pose estimation (Ca
 |--------|-------|-------|------------|----------|-------|
 | Depth + Confidence | x | x | x | r=0.999 (small), r=0.963 (nested) | Main DualDPT head |
 | Pose (CameraDec) | x | x | x | qcos=0.971 (giant), qcos=0.981 (nested) | backbone_norm(CLS) -> MLP -> 3 heads |
-| Rays (Aux DPT) | - | - | - | GPU=0, needs camera_token fix | Requires camera_token injection at alt_start |
+| Rays (Aux DPT) | - | x | x | PASS on Nested, non-zero | Camera token injection implemented at alt_start |
 | Gaussians (GSDPT) | - | x | x | r=0.998 (giant/nested) | Separate DPT + RGB merger |
-| Metric Depth | - | - | ref only | PyTorch ref works | Needs ViT-L backbone in C/CUDA |
-| Sky Segmentation | - | - | ref only | PyTorch ref works | Needs metric DPT branch |
+| Metric Depth | - | - | x | PASS sanity range | Nested ViT-L metric backbone implemented in CUDA |
+| Sky Segmentation | - | - | x | PASS sanity range | Metric DPT sky branch implemented in CUDA |
 
 See `doc/da3-reference-verification.md` for full verification results.
 
@@ -119,10 +119,16 @@ See `doc/da3-reference-verification.md` for full verification results.
 ## TODOs
 
 ### CUDA DA3
-- **Camera token injection** (enables ray output): Load `backbone.camera_token` from safetensors, inject ref_token at block `alt_start` by overwriting CLS position. ~5 lines in backbone loop. Without this, aux DPT (rays) outputs zeros.
-- **Metric depth backbone** (ViT-L): Implement second backbone (dim=1024, 24 blocks, no RoPE/QKNorm, GELU MLP) + standard DPT head (output_dim=1) for metric-scale depth. Needed for Nested-Giant-Large models.
-- **Sky segmentation**: Add `sky_output_conv2` branch off metric DPT neck (shares neck output, separate Conv3x3+ReLU+Conv1x1 -> 1ch).
-- `cuda/da3/cuda_da3_runner.c:3564` - Inject merger features at level 0 (add to d_dpt_adapted[0])
+- Implement a lower-drift fast attention path before enabling `DA3_MMA_ATTN=1` by default.
+- Improve `DA3_FP8_BACKBONE=1` quantization before considering it as a default. Candidate work: per-channel calibration, selective FP16 fallback for sensitive layers, or BF16 activation storage.
+- Profile Giant backbone GEMM after the current accuracy-first defaults; the remaining default gap is backbone-bound.
+- Re-run full modality verification after any precision default change, especially pose, rays, gaussians, metric depth, and sky segmentation.
+
+### CUDA PPD
+- Add cumulative CUDA event timing for GEMM, attention, layernorm/adaLN, RoPE, and elementwise work across all DiT steps.
+- Optimize high-res attention at 4800 tokens.
+- Keep fast attention and FP8 paths opt-in until they pass PyTorch drift checks on street and tiny images.
+- Reduce Python reference overhead before using it in CI.
 
 ### CUDA INT8
 - `cuda/int8/int8_gemm.c:2081` - tcgen05.mma syntax needs adjustment (Blackwell tensor core instruction)

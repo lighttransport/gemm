@@ -21,7 +21,7 @@
  *   - 4 storage/register tokens after CLS: [CLS, stor1..4, patch1..1024]
  *   - RoPE NOT applied to CLS or storage tokens (only patches)
  *   - Standard GELU MLP (not SwiGLU)
- *   - Output: all 1029 tokens after final LayerNorm
+ *   - Output: all tokens after final LayerNorm
  */
 #ifndef DINOV3_H
 #define DINOV3_H
@@ -58,7 +58,8 @@ typedef struct {
 
 typedef struct {
     int n_blocks, dim, n_heads, head_dim, ffn_hidden;
-    int patch_size, image_size;
+    int patch_size, image_size; /* image_size is the legacy square default. */
+    int image_h, image_w;
     int grid_h, grid_w, n_patches;
     int n_storage;   /* 4 storage/register tokens */
     int n_tokens;    /* 1 CLS + n_storage + n_patches */
@@ -90,7 +91,7 @@ typedef struct {
 } dinov3_model;
 
 typedef struct {
-    float *features;  /* [n_tokens, dim] = [1029, 1024] for ViT-L/16 */
+    float *features;  /* [n_tokens, dim] */
     int n_tokens;
     int dim;
 } dinov3_result;
@@ -101,7 +102,8 @@ dinov3_result  dinov3_encode(dinov3_model *m, const uint8_t *rgb,
                              int w, int h, int n_threads);
 /* Bypass the built-in resize+normalize preprocessing. `chw` is a
  * [3, H, W] f32 tensor already normalized with the model's mean/std.
- * H, W must equal `m->image_size` for the default square layout.
+ * H, W may be any patch-aligned DINOv3 input shape; the model's
+ * grid_h/grid_w/n_tokens fields are updated to match the last call.
  * Used by verify_*.c to anchor on pytorch-produced normalized inputs. */
 dinov3_result  dinov3_encode_from_normalized(dinov3_model *m, const float *chw,
                                              int w, int h, int n_threads);
@@ -170,9 +172,20 @@ static void dinov3_bf16_roundtrip_inplace(float *x, size_t n) {
 }
 
 static int dinov3_emulate_bf16_activations(const dinov3_model *m) {
+    (void)m;
     const char *env = getenv("DINOV3_EMULATE_BF16");
     if (env && env[0]) return strcmp(env, "0") != 0;
-    return m && m->use_learned_final_norm;
+    /* The shipped sam-3d-body C weights store large BF16 upstream matrices as
+     * F16 for the fast threaded GEMM path. Extra BF16 activation round-trips
+     * make that mixed path drift farther from the PyTorch BF16 reference, so
+     * keep emulation opt-in for diagnosis only. */
+    return 0;
+}
+
+static int dinov3_emulate_bf16_input(const dinov3_model *m) {
+    (void)m;
+    const char *env = getenv("DINOV3_EMULATE_BF16_INPUT");
+    return env && env[0] && strcmp(env, "0") != 0;
 }
 
 /* ---- Tensor helpers ---- */
@@ -200,6 +213,41 @@ static void dinov3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
     if (W->type == GGML_TYPE_F16) {
         cpu_gemm_f16(dst, (const uint16_t *)W->data, (float *)bf, src,
                      n_tok, n_out, n_in, n_threads);
+    } else if (W->type == GGML_TYPE_BF16) {
+#if defined(_OPENMP)
+        if (n_threads > 1 && n_out >= n_threads * 2) {
+            int rows_per = ((n_out / n_threads) / 4) * 4;
+            if (rows_per < 4) rows_per = 4;
+            int n_chunks = (n_out + rows_per - 1) / rows_per;
+            if (n_chunks > n_threads) n_chunks = n_threads;
+            #pragma omp parallel for schedule(static) num_threads(n_chunks)
+            for (int i = 0; i < n_chunks; i++) {
+                int r = i * rows_per;
+                int end = (i == n_chunks - 1) ? n_out : r + rows_per;
+                if (end > n_out) end = n_out;
+                int count = end - r;
+                if (count > 0) {
+                    gemm_bf16_f32_tokmajor(dst + r,
+                                           (const uint16_t *)W->data + (size_t)r * n_in,
+                                           src, count, n_in, n_tok,
+                                           n_out, n_in);
+                }
+            }
+        } else
+#endif
+        {
+            gemm_bf16_f32_tokmajor(dst, (const uint16_t *)W->data, src,
+                                   n_out, n_in, n_tok, n_out, n_in);
+        }
+        if (bf) {
+#if defined(_OPENMP)
+            #pragma omp parallel for schedule(static) num_threads(n_threads)
+#endif
+            for (int t = 0; t < n_tok; t++) {
+                float *d = dst + (size_t)t * n_out;
+                for (int i = 0; i < n_out; i++) d[i] += bf[i];
+            }
+        }
     } else if (W->type == GGML_TYPE_F32) {
         cpu_gemm_f32(dst, (const float *)W->data, bf, src,
                      n_tok, n_out, n_in, n_threads);
@@ -453,6 +501,8 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
     m->ffn_hidden = ffn_hidden;
     m->patch_size = patch_size;
     m->image_size = image_size;
+    m->image_h = image_size;
+    m->image_w = image_size;
     m->grid_h = grid_h;
     m->grid_w = grid_w;
     m->n_patches = n_patches;
@@ -695,6 +745,9 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
     if (n_threads < 1) n_threads = 1;
     double t_start = dinov3_time_ms();
     int emulate_bf16 = dinov3_emulate_bf16_activations(m);
+    if (dinov3_emulate_bf16_input(m))
+        dinov3_bf16_roundtrip_inplace(img_norm,
+                                      (size_t)3 * target_h * target_w);
 
     /* ─── Step 2: Patch embedding ─── */
     /* Token layout: [CLS, stor1..stor_ns, patch1..patch_np] */
@@ -1063,6 +1116,24 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
     return result;
 }
 
+static int dinov3_set_input_geometry_(dinov3_model *m, int img_w, int img_h) {
+    if (!m || img_w <= 0 || img_h <= 0) return -1;
+    int ps = m->patch_size;
+    if (ps <= 0 || (img_w % ps) != 0 || (img_h % ps) != 0) {
+        fprintf(stderr,
+                "dinov3: input %dx%d must be divisible by patch size %d\n",
+                img_w, img_h, ps);
+        return -1;
+    }
+    m->image_w = img_w;
+    m->image_h = img_h;
+    m->grid_w = img_w / ps;
+    m->grid_h = img_h / ps;
+    m->n_patches = m->grid_h * m->grid_w;
+    m->n_tokens = 1 + m->n_storage + m->n_patches;
+    return 0;
+}
+
 dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
                             int img_w, int img_h, int n_threads) {
     int ps = m->patch_size;
@@ -1093,13 +1164,10 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
 dinov3_result dinov3_encode_from_normalized(dinov3_model *m, const float *chw,
                                             int img_w, int img_h, int n_threads) {
     dinov3_result zero = {0};
+    if (dinov3_set_input_geometry_(m, img_w, img_h) != 0)
+        return zero;
     int target_h = m->grid_h * m->patch_size;
     int target_w = m->grid_w * m->patch_size;
-    if (img_w != target_w || img_h != target_h) {
-        fprintf(stderr, "dinov3_encode_from_normalized: input %dx%d != expected %dx%d\n",
-                img_w, img_h, target_w, target_h);
-        return zero;
-    }
     size_t nbytes = (size_t)3 * target_h * target_w * sizeof(float);
     float *img_norm = (float *)malloc(nbytes);
     memcpy(img_norm, chw, nbytes);

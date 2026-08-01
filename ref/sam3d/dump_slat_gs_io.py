@@ -58,6 +58,8 @@ def main():
                     help="count for synthetic input when --coords-npy absent")
     ap.add_argument("--outdir", default="/tmp/sam3d_ref")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--device", default="cpu",
+                    help="torch device for model forward (cpu or cuda)")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -66,6 +68,17 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_float32_matmul_precision("highest")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("[dump_slat_gs_io] cuda requested but unavailable; using cpu",
+              file=sys.stderr)
+        device = torch.device("cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
 
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
@@ -76,7 +89,7 @@ def main():
     # Force fp32 so the ref is a clean baseline for bf16 C-side drift budget.
     OmegaConf.set_struct(conf, False)
     conf["use_fp16"] = False
-    model = instantiate(conf, _recursive_=True).eval()
+    model = instantiate(conf, _recursive_=True).eval().to(device)
 
     print(f"[dump_slat_gs_io] loading ckpt {args.gs_ckpt}...", file=sys.stderr)
     blob = torch.load(args.gs_ckpt, map_location="cpu", weights_only=False)
@@ -121,8 +134,8 @@ def main():
     save(args.outdir, "slat_gs_in_coords.npy", coords)
     save(args.outdir, "slat_gs_in_feats.npy", feats)
 
-    coords_t = torch.from_numpy(coords)
-    feats_t  = torch.from_numpy(feats)
+    coords_t = torch.from_numpy(coords).to(device)
+    feats_t  = torch.from_numpy(feats).to(device)
     x = sp.SparseTensor(feats=feats_t, coords=coords_t)
 
     with torch.inference_mode():

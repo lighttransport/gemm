@@ -6,12 +6,14 @@
 # Usage:
 #   make CC=fcc                     # Fujitsu fcc, sequential
 #   make CC=fcc OPENMP=1            # Fujitsu fcc + OpenMP (recommended)
+#   make CC=mpifcc OPENMP=1         # Fujitsu MPI wrapper + OpenMP
 #   make CC=gcc OPENMP=1            # gcc + OpenMP
 #
 # Outputs:
 #   build/llm_runner   - end-to-end runner (text or text+image)
 
 CC      ?= fcc
+HOSTCC  ?= cc
 OPENMP  ?=
 DEBUG   ?=
 EXTRA_CFLAGS ?=
@@ -28,6 +30,17 @@ BUILD       := $(LLM_DIR)build
 
 # ── Compiler-specific flags ────────────────────────────────────────────
 ifeq ($(CC),fcc)
+    BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
+    BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
+    # -g -rdynamic: symbol names for the SIGSEGV backtrace handler (on by default). These do NOT
+    # change codegen at -O3 -- they only keep the symbol table, so a crash reports
+    # "ds4f_pf_qnr_worker -> ds4f_rope_apply" instead of a bare hex address. On a multi-node run with
+    # no core dump and no debugger, that is the difference between a 10-minute fix and a lost day.
+    BASE_CFLAGS  += -g -rdynamic
+    OMP_FLAG     := -fopenmp
+    ASMC         := fcc
+    HWBLIB       := -lhwb
+else ifeq ($(CC),mpifcc)
     BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
     BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
@@ -67,6 +80,10 @@ ifdef OPENMP
     LDFLAGS += $(OMP_FLAG)
 endif
 
+ifdef FAPP
+    CFLAGS  += -DGLM5_USE_FAPP=1
+endif
+
 ifdef DEBUG
     CFLAGS := $(subst -O3,-O0,$(CFLAGS)) -g
 endif
@@ -102,9 +119,18 @@ DS4F_DECBW_SRC := $(LLM_DIR)ds4f_decode_bw_bench.c
 # header deps: ds4f.h / ggml_dequant.h are not in the .c prereqs, so editing them
 # would otherwise leave the binaries stale (a no-op `make`). Track them explicitly.
 DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ds4f_impl.h $(LLM_DIR)../../common/ggml_dequant.h
+# MiniMax-M3 (text) synthetic EP runner (a64fx/m3). Self-contained: common/m3.h +
+# m3_impl.h + uTofu. Links libtofucom; no vlm objs.
+M3_EP_SRC := $(LLM_DIR)../m3/m3_ep_runner.c
+M3_HDRS   := $(COMMON)/m3.h $(COMMON)/m3_impl.h $(COMMON)/ggml_dequant.h
+GLM5_EP_SRC := $(LLM_DIR)../glm5/glm5_ep_runner.c
+GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COMMON)/glm5_mxfp8.h $(COMMON)/glm5_int8.h $(COMMON)/ggml_dequant.h \
+               $(LLM_DIR)../utofu-tests/tp_allreduce.h $(LLM_DIR)../utofu-tests/tofu_demo.h
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw
+# ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
+# built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
+.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
@@ -155,12 +181,54 @@ ds4f_ep_runner: $(BUILD)/ds4f_ep_runner
 $(BUILD)/ds4f_ep_runner: $(DS4F_EP_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_EP_SRC) $(LDFLAGS) -ltofucom
 
+# MiniMax-M3 multinode EP harness (synthetic; GQA + sigmoid-MoE + SwiGLU-OAI).
+m3_ep_runner: $(BUILD)/m3_ep_runner
+$(BUILD)/m3_ep_runner: $(M3_EP_SRC) $(M3_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(M3_EP_SRC) $(LDFLAGS) -ltofucom
+
+# M3 weight stager (safetensors -> per-rank /local blob) and single-node real-weight test.
+m3_stage: $(BUILD)/m3_stage
+$(BUILD)/m3_stage: $(COMMON)/m3_stage.c $(COMMON)/safetensors.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(COMMON)/m3_stage.c $(LDFLAGS)
+m3_real_test: $(BUILD)/m3_real_test
+$(BUILD)/m3_real_test: $(LLM_DIR)../m3/m3_real_test.c $(M3_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)../m3/m3_real_test.c $(LDFLAGS)
+
+# GLM-5.2 192-node BF16 bring-up path.
+glm5_ep_runner: $(BUILD)/glm5_ep_runner
+$(BUILD)/glm5_ep_runner: $(GLM5_EP_SRC) $(GLM5_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(GLM5_EP_SRC) $(LDFLAGS) -ltofucom
+glm5_ep_runner_fapp: $(BUILD)/glm5_ep_runner_fapp
+$(BUILD)/glm5_ep_runner_fapp: $(GLM5_EP_SRC) $(GLM5_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -DGLM5_USE_FAPP=1 -o $@ $(GLM5_EP_SRC) $(LDFLAGS) -ltofucom
+glm5_stage: $(BUILD)/glm5_stage
+$(BUILD)/glm5_stage: $(COMMON)/glm5_stage.c $(COMMON)/safetensors.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(COMMON)/glm5_stage.c $(LDFLAGS)
+glm52_gguf_convert: $(BUILD)/glm52_gguf_convert
+$(BUILD)/glm52_gguf_convert: $(LLM_DIR)../glm5/glm52_gguf_convert.c $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h | $(BUILD)
+	$(HOSTCC) -O2 -std=c11 -D_GNU_SOURCE -I$(COMMON) -o $@ $(LLM_DIR)../glm5/glm52_gguf_convert.c -lm
+glm5_real_test: $(BUILD)/glm5_real_test
+$(BUILD)/glm5_real_test: $(LLM_DIR)../glm5/glm5_real_test.c $(GLM5_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)../glm5/glm5_real_test.c $(LDFLAGS)
+glm5_fp8_kernel_test: $(LLM_DIR)../glm5/glm5_fp8_kernel_test
+$(LLM_DIR)../glm5/glm5_fp8_kernel_test: $(LLM_DIR)../glm5/glm5_fp8_kernel_test.c $(GLM5_HDRS)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)../glm5/glm5_fp8_kernel_test.c $(LDFLAGS)
+
 # DeepSeek-V4-Flash single-node decode-bandwidth bench (no MPI, no vlm objs, no
 # model alloc). Reproduces the M=1 cold-HBM decode regime through the production
 # pinned pool to roofline FP8/bf16/MXFP4 dequant kernels. Runs directly on-node.
 ds4f_decode_bw: $(BUILD)/ds4f_decode_bw
 $(BUILD)/ds4f_decode_bw: $(DS4F_DECBW_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_DECBW_SRC) $(LDFLAGS)
+
+# OFFLINE dense bake: safetensors FP8 -> the kernel-ready BF16_PV / Q8_PV layouts, written
+# permanently under ~/models/<model>-fast/. Removes the runtime bf16 promotion peak (which is
+# what makes the ds4f 8-node decode floor "load-peak-tight" and blocks Q8 dense on ds4fbase
+# entirely). Single node, no allocation, no MPI. Calls the SAME promote/repack workers the
+# runtime uses, so the bytes are identical by construction. See the header of ds4f_bake.c.
+ds4f_bake: $(BUILD)/ds4f_bake
+$(BUILD)/ds4f_bake: $(LLM_DIR)ds4f_bake.c $(DS4F_HDRS) $(COMMON)/safetensors.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)ds4f_bake.c $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD)

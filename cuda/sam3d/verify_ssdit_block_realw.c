@@ -138,7 +138,7 @@ int main(int argc, char **argv)
     if (cs3d_ssdit_fns_lookup(&fns, cmod) < 0) return 6;
 
     cs3d_ssdit_gpu g;
-    if (cs3d_ssdit_gpu_load(&g, m, verbose) < 0) return 7;
+    if (cs3d_ssdit_gpu_load(&g, m, NULL, "fp32", 0, verbose) < 0) return 7;
     cs3d_ssdit_block_ws ws;
     if (cs3d_ssdit_block_ws_alloc(&ws, N_s, N_p, N_c, dim, mlp_h) < 0) return 7;
 

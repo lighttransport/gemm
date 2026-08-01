@@ -326,6 +326,9 @@ float *rt_detr_preprocess_image(const uint8_t *rgb, int w, int h) {
      * RGB is HWC uint8; output is CHW float32 in [0,1]. */
     const float sh = (float)h / (float)S;
     const float sw = (float)w / (float)S;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
     for (int oy = 0; oy < S; oy++) {
         float fy = (oy + 0.5f) * sh - 0.5f;
         int   y0 = (int)floorf(fy);
@@ -904,6 +907,9 @@ static void rt_detr__gemm_f32(float *dst, const float *W, const float *bias,
             const float *a = src + (size_t)t * n_in;
             const float *w = W   + (size_t)r * n_in;
             float s = bias ? bias[r] : 0.0f;
+#if defined(__GNUC__) || defined(__clang__)
+            #pragma omp simd reduction(+:s)
+#endif
             for (int j = 0; j < n_in; j++) s += a[j] * w[j];
             dst[(size_t)t * n_out + r] = s;
         }
@@ -2201,6 +2207,26 @@ int rt_detr_forward_decoder(rt_detr_t *m,
         memcpy(target + (size_t)q * dim, output_memory + (size_t)idx * dim,
                sizeof(float) * dim);
     }
+
+    /* Optional fast auto-bbox path: use RT-DETR's encoder proposals before
+     * the 3-layer decoder. This keeps default parity unchanged and is useful
+     * when the caller only needs an approximate person crop quickly. */
+    const char *encoder_only = getenv("RT_DETR_ENCODER_ONLY");
+    if (encoder_only && encoder_only[0] && strcmp(encoder_only, "0") != 0) {
+        for (int q = 0; q < n_q; q++) {
+            int idx = topk[q];
+            memcpy(out_logits + (size_t)q * n_classes,
+                   enc_class + (size_t)idx * n_classes,
+                   (size_t)n_classes * sizeof(float));
+            for (int k = 0; k < 4; k++)
+                out_boxes[q * 4 + k] = rt_detr__sigmoidf(ref_unact[q * 4 + k]);
+        }
+        free(ref_unact); free(target); free(topk); free(enc_class);
+        free(enc_coord); free(output_memory); free(source_flatten);
+        free(p3); free(p4); free(p5);
+        return 0;
+    }
+
     free(topk); free(enc_class); free(enc_coord); free(output_memory);
 
     /* 9) Initialize ref_points = sigmoid(ref_unact). */

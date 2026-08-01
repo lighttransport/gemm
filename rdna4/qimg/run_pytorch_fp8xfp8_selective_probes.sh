@@ -6,11 +6,14 @@ set -euo pipefail
 # This never calls diffusers `from_single_file()` and never materializes the
 # full DiT. It opens the safetensors file lazily, loads one tensor at a time,
 # runs torch._scaled_mm(FP8, FP8), prints quality/stats, then releases it.
+# This probes ComfyUI's opt-in fast FP8 matrix-multiplication behavior, not the
+# default ComfyUI Qwen-Image path that uses FP8 weights as storage.
 #
 # Run from repo root:
 #   bash rdna4/qimg/run_pytorch_fp8xfp8_selective_probes.sh
 #
 # Useful overrides:
+#   SCALE_MODE=comfy-fast-fp8 bash rdna4/qimg/run_pytorch_fp8xfp8_selective_probes.sh
 #   SCALE_MODE=comfy bash rdna4/qimg/run_pytorch_fp8xfp8_selective_probes.sh
 #   SCALE_MODE=perrow SCALE_DIV=512 bash rdna4/qimg/run_pytorch_fp8xfp8_selective_probes.sh
 #   PROBES=img_in,txt_in,blk0_img_q bash rdna4/qimg/run_pytorch_fp8xfp8_selective_probes.sh
@@ -32,7 +35,7 @@ INIT_BIN="${INIT_BIN:-$ROOT/ref/qwen_image/init_latent_256.bin}"
 TEXT_BIN="${TEXT_BIN:-$ROOT/ref/qwen_image/apple_text_256.bin}"
 OUT_DIR="${OUT_DIR:-$QIMG_DIR/pytorch_fp8xfp8_probes}"
 DTYPE="${DTYPE:-bf16}"
-SCALE_MODE="${SCALE_MODE:-comfy}"
+SCALE_MODE="${SCALE_MODE:-comfy-fast-fp8}"
 SCALE_DIV="${SCALE_DIV:-512}"
 TIMESTEP="${TIMESTEP:-1.0}"
 PROBES="${PROBES:-img_in,txt_in,temb_fc1,temb_fc2,blk0_img_mod,blk0_txt_mod,blk0_img_q,blk0_img_k,blk0_img_v,blk0_txt_q,blk0_txt_k,blk0_txt_v,blk0_img_mlp_fc1,blk0_img_mlp_fc2,blk0_txt_mlp_fc1,blk0_txt_mlp_fc2}"
@@ -60,7 +63,7 @@ INIT_BIN = Path(os.environ["INIT_BIN"])
 TEXT_BIN = Path(os.environ["TEXT_BIN"])
 OUT_DIR = Path(os.environ["OUT_DIR"])
 DTYPE = torch.bfloat16 if os.environ.get("DTYPE", "bf16") == "bf16" else torch.float16
-SCALE_MODE = os.environ.get("SCALE_MODE", "comfy")
+SCALE_MODE = os.environ.get("SCALE_MODE", "comfy-fast-fp8")
 SCALE_DIV = float(os.environ.get("SCALE_DIV", "512"))
 TIMESTEP = float(os.environ.get("TIMESTEP", "1.0"))
 PROBES = [p for p in os.environ.get("PROBES", "").split(",") if p]
@@ -107,10 +110,12 @@ def native_fp8_linear(x, w_fp8, bias_fp8=None):
         scale_a = torch.amax(x2.float().abs(), dim=1, keepdim=True).clamp_min(1.0e-12) / SCALE_DIV
         x8 = torch.clamp(x2.float() / scale_a, -448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
         scale_b = torch.ones((1, w_fp8.shape[0]), device=x.device, dtype=torch.float32)
-    else:
+    elif SCALE_MODE in ("comfy-fast-fp8", "comfy"):
         scale_a = torch.ones((), device=x.device, dtype=torch.float32)
         scale_b = torch.ones((), device=x.device, dtype=torch.float32)
         x8 = torch.clamp(x2.float(), -448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+    else:
+        raise ValueError(f"unsupported SCALE_MODE={SCALE_MODE!r}")
     y = torch._scaled_mm(
         x8,
         w_fp8.t(),

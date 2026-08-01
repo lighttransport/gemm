@@ -1,9 +1,8 @@
-/* HIP/RDNA4 SAM 3 runner — public interface (Phase 1 scaffolding).
+/* CUDA/HIP SAM 3.1 image text-prompt runner — public interface.
  *
- * Current coverage: preprocess (ImageNet) + patch_embed (k=14 s=14) +
- * pos_embed tile + pre-block LayerNorm. Subsequent ViT blocks, FPN,
- * CLIP text, DETR encoder/decoder, mask decoder and post-process are
- * staged in follow-up passes against ref/sam3 dumps.
+ * Current coverage: preprocess, ViT, FPN, CLIP text, DETR encoder/decoder,
+ * dot-product scoring, mask logits, and final mask postprocess. Tracker/video
+ * and prompt-driven interactivity paths are intentionally out of scope here.
  */
 #ifndef CUDA_SAM3_1_RUNNER_H_
 #define CUDA_SAM3_1_RUNNER_H_
@@ -17,13 +16,14 @@ extern "C" {
 typedef struct cuda_sam3_1_ctx cuda_sam3_1_ctx;
 
 typedef struct {
-    const char *ckpt_path;   /* sam3.model.safetensors */
+    const char *ckpt_path;   /* sam3.1.model.safetensors */
     int image_size;          /* fixed 1008 */
     int device_ordinal;
     int verbose;
     /* precision: "fp16" (default, MMA m16n8k16 tensor cores on sm_80+),
-     * "fp32" (tiled shared-memory GEMM, F16 weight × F32 compute; slower
-     * but avoids ~1e-4 per-GEMM drift that compounds over 32 ViT blocks).
+     * "fp32" (F32 linear weights + tiled shared-memory F32 GEMM;
+     * slower, but removes F16 weight quantization from the vision,
+     * text, DETR, scoring, and mask MLP/projection paths).
      * "bf16" and "fp8" are accepted but not yet implemented — they fall
      * back to fp16 with a warning. NULL or empty is equivalent to "fp16". */
     const char *precision;
@@ -32,14 +32,15 @@ typedef struct {
 cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg);
 void          cuda_sam3_1_destroy(cuda_sam3_1_ctx *ctx);
 
-/* Normalize + patch_embed + pos_embed + pre-block LN. Token embeddings
+/* Normalize + patch_embed + learned pos_embed. Token embeddings
  * remain resident on the GPU; use cuda_sam3_1_get_vit_embed to read back. */
 int cuda_sam3_1_set_image(cuda_sam3_1_ctx *ctx, const uint8_t *rgb, int h, int w);
 
 /* Bit-close alternative: pre-normalized pixel values (3, S, S) CHW F32. */
 int cuda_sam3_1_set_pixel_values(cuda_sam3_1_ctx *ctx, const float *pixel_values_chw);
 
-/* Copy token embeddings (pre-LN patch+pos F32 5184×1024) into out_host.
+/* Copy token embeddings (patch+pos F32 5184×1024 before run_vit, then
+ * post-block stream after run_vit) into out_host.
  * After cuda_sam3_1_run_vit(bi), this returns the stream after block bi.  */
 int cuda_sam3_1_get_vit_embed(const cuda_sam3_1_ctx *ctx, float *out_host,
                             int *out_n_tok, int *out_dim);
@@ -49,12 +50,11 @@ int cuda_sam3_1_get_vit_embed(const cuda_sam3_1_ctx *ctx, float *out_host,
  * Subsequent calls resume from the last completed block. */
 int cuda_sam3_1_run_vit(cuda_sam3_1_ctx *ctx, int stop_at_block);
 
-/* Run the 4-level FPN neck on the current ViT output. Requires ViT to
- * have been run through block 31. Produces 4 feature maps at:
+/* Run the 3-level FPN conv stack on the current ViT output. Requires ViT to
+ * have been run through block 31. Produces 3 feature maps at:
  *   level 0: (256, 288, 288)
  *   level 1: (256, 144, 144)
- *   level 2: (256,  72,  72)
- *   level 3: (256,  36,  36) */
+ *   level 2: (256,  72,  72) */
 int cuda_sam3_1_run_fpn(cuda_sam3_1_ctx *ctx);
 
 /* Copy FPN feature map at `level` to host as (C, H, W) F32. */

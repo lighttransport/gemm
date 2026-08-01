@@ -73,7 +73,7 @@ int main(void) {
     int layers    = envi("DS4F_LAYERS", 0);
     int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* prefill synthetic KV to this ctx, decode from there */
 
-    ds4f_config cfg = ds4f_default_config();
+    ds4f_config cfg = ds4f_config_from_env();
     cfg.max_pos = maxpos;
     if (layers > 0) cfg.n_layers = layers;
     /* DS4F_FORCE_RATIO=R: override EVERY layer's compress_ratio to R (bypass the

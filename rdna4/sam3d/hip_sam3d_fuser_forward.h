@@ -12,6 +12,7 @@
 #define HIP_SAM3D_FUSER_FORWARD_H_
 
 #include "../rocew.h"
+#include "hip_sam3d_wmma.h"
 
 #include <stdio.h>
 
@@ -22,6 +23,7 @@ extern "C" {
 typedef struct {
     hipFunction_t layernorm_token_f32;
     hipFunction_t gemm_f32_bias;
+    hipFunction_t gemm_wmma;   /* BF16-WMMA GEMM (gfx12; NULL otherwise) */
     hipFunction_t silu_mul_f32;
 } cs3d_fuser_fns;
 
@@ -36,6 +38,8 @@ static inline int cs3d_fuser_fns_lookup(cs3d_fuser_fns *f, hipModule_t mod)
     LOOKUP_(gemm_f32_bias);
     LOOKUP_(silu_mul_f32);
 #undef LOOKUP_
+    if (hipModuleGetFunction(&f->gemm_wmma, mod, "gemm_f32_bias_wmma") != hipSuccess)
+        f->gemm_wmma = NULL;
     return 0;
 }
 
@@ -113,15 +117,13 @@ static inline int cs3d_fuser_project_forward(const cs3d_fuser_fns *f,
 
     /* h1 = w1 @ ln; h3 = w3 @ ln. gemm_f32_bias grid (ceil(N/16), ceil(Dh/16)), block (16,16). */
     {
-        unsigned gx = (unsigned)((N + 15) / 16);
-        unsigned gy = (unsigned)((Dh + 15) / 16);
         hipDeviceptr_t null_b = 0;
         void *args1[] = { &ws->h1, &ws->ln_buf, &w->w1, &null_b, &N, &Di, &Dh };
         void *args3[] = { &ws->h3, &ws->ln_buf, &w->w3, &null_b, &N, &Di, &Dh };
-        if (hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1,
-                           0, 0, args1, NULL) != hipSuccess) return -3;
-        if (hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1,
-                           0, 0, args3, NULL) != hipSuccess) return -3;
+        if (cs3d_launch_gemm(f->gemm_f32_bias, f->gemm_wmma, args1,
+                           N, Di, Dh, 0) != hipSuccess) return -3;
+        if (cs3d_launch_gemm(f->gemm_f32_bias, f->gemm_wmma, args3,
+                           N, Di, Dh, 0) != hipSuccess) return -3;
     }
 
     /* silu_mul: h1 = silu(h1) * h3, total = N * Dh. */
@@ -136,11 +138,9 @@ static inline int cs3d_fuser_project_forward(const cs3d_fuser_fns *f,
 
     /* out = w2 @ h1 + idx_emb_row (broadcast bias, may be 0). */
     {
-        unsigned gx = (unsigned)((N + 15) / 16);
-        unsigned gy = (unsigned)((Do + 15) / 16);
         void *args[] = { &out, &ws->h1, &w->w2, &idx_emb_row, &N, &Dh, &Do };
-        if (hipModuleLaunchKernel(f->gemm_f32_bias, gx, gy, 1, 16, 16, 1,
-                           0, 0, args, NULL) != hipSuccess) return -5;
+        if (cs3d_launch_gemm(f->gemm_f32_bias, f->gemm_wmma, args,
+                           N, Dh, Do, 0) != hipSuccess) return -5;
     }
     return 0;
 }

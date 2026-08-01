@@ -123,8 +123,11 @@ $(MM0_EXTRACTED_O): mm0_extracted_launcher.cpp
 $(VISION): test_hip_vision.c $(RUNNER_SRC) $(ROCEW_SRC) $(MM0_EXTRACTED_O) hip_vision_encoder.h ../rocew.h
 	$(CC) $(CFLAGS) -o $@ test_hip_vision.c $(RUNNER_SRC) $(ROCEW_SRC) $(MM0_EXTRACTED_O) $(LDFLAGS) -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib -lamdhip64 -lstdc++
 
-$(VLM): test_hip_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(ROCEW_SRC) $(MM0_EXTRACTED_O) hip_vision_encoder.h ../llm/hip_llm_runner.h ../rocew.h
-	$(CC) $(CFLAGS) -o $@ test_hip_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(ROCEW_SRC) $(MM0_EXTRACTED_O) $(LDFLAGS) -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib -lamdhip64 -lstdc++
+../llm/mm_blaslt_bridge.o: ../llm/mm_blaslt_bridge.cpp ../llm/mm_blaslt_bridge.h
+	$(HIPCC) -O3 -fPIE --offload-arch=gfx1201 -c -o $@ ../llm/mm_blaslt_bridge.cpp
+
+$(VLM): test_hip_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(ROCEW_SRC) $(MM0_EXTRACTED_O) ../llm/mm_blaslt_bridge.o hip_vision_encoder.h ../llm/hip_llm_runner.h ../rocew.h
+	$(CC) $(CFLAGS) -DLLM_HIPBLASLT_ENABLED -o $@ test_hip_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(ROCEW_SRC) $(MM0_EXTRACTED_O) ../llm/mm_blaslt_bridge.o $(LDFLAGS) -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib -lamdhip64 -lhipblaslt -lstdc++
 
 $(BENCH_GEMM): bench_vlm_gemm.c $(ROCEW_SRC) ../rocew.h ../hip_runner_common.h $(MM0_EXTRACTED_O)
 	$(CC) $(CFLAGS) -o $@ bench_vlm_gemm.c $(ROCEW_SRC) $(MM0_EXTRACTED_O) $(LDFLAGS) -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib -lamdhip64 -lstdc++

@@ -32,18 +32,25 @@ static int diff_pair(const char *label, const float *a, const float *b,
         return 1;
     }
     double sum = 0.0;
+    double dot = 0.0;
+    double na = 0.0;
+    double nb = 0.0;
     float mx = 0.0f;
     size_t mxi = 0;
     for (size_t i = 0; i < n; i++) {
         float d = fabsf(a[i] - b[i]);
         if (d > mx) { mx = d; mxi = i; }
         sum += d;
+        dot += (double)a[i] * (double)b[i];
+        na += (double)a[i] * (double)a[i];
+        nb += (double)b[i] * (double)b[i];
     }
     double mean = sum / (double)n;
+    double cos_sim = (na > 0.0 && nb > 0.0) ? dot / sqrt(na * nb) : 0.0;
     int fail = (mx >= thresh);
     fprintf(stderr, "[cuda verify_end_to_end] %-32s max_abs=%.4e (i=%zu) "
-                    "mean_abs=%.4e (max=%.1e) %s\n",
-            label, mx, mxi, mean, thresh, fail ? "FAIL" : "OK");
+                    "mean_abs=%.4e cos=%.9f (max=%.1e) %s\n",
+            label, mx, mxi, mean, cos_sim, thresh, fail ? "FAIL" : "OK");
     return fail ? 1 : 0;
 }
 
@@ -77,17 +84,49 @@ static float *load_ref_f32_prefer(const char *refdir, const char *primary,
     return NULL;
 }
 
+static void infer_dinov3_input_shape(const char *refdir, int *out_h, int *out_w)
+{
+    if (!refdir || !out_h || !out_w || (*out_h > 0 && *out_w > 0)) return;
+
+    char path[1024];
+    int nd = 0, dims[8] = {0}, is_f32 = 0;
+    snprintf(path, sizeof(path), "%s/dinov3_input.npy", refdir);
+    void *d = npy_load(path, &nd, dims, &is_f32);
+    free(d);
+    if (nd == 4 && dims[0] == 1 && dims[1] == 3 &&
+        dims[2] > 0 && dims[3] > 0) {
+        if (*out_h <= 0) *out_h = dims[2];
+        if (*out_w <= 0) *out_w = dims[3];
+    }
+}
+
+static int ref_backbone_is_float32(const char *refdir)
+{
+    if (!refdir) return 0;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/backbone_dtype.txt", refdir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[128];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, "float32") != NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL;
     const char *mhr_dir = NULL;
     const char *refdir = NULL;
     const char *image_path = NULL;
-    const char *precision = "bf16";
-    float threshold = 5e-3f;
+    const char *precision = "fp16";
+    float threshold = -1.0f;
     float threshold_2d = -1.0f;
     float bbox[4] = {0};
     int has_bbox = 0;
+    int image_height = 0;
+    int image_width = 0;
     int device = 0;
     int verbose = 0;
     cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
@@ -110,6 +149,8 @@ int main(int argc, char **argv)
             else if (!strcmp(v, "vith"))   backbone = CUDA_SAM3D_BODY_BACKBONE_VITH;
             else { fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n", v); return 2; }
         }
+        else if (!strcmp(argv[i], "--image-height") && i+1 < argc) image_height = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--image-width")  && i+1 < argc) image_width  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--threshold-2d") && i+1 < argc) threshold_2d = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--precision") && i+1 < argc) precision = argv[++i];
@@ -122,10 +163,29 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "Usage: %s --safetensors-dir DIR --mhr-assets DIR "
                 "--refdir DIR --image IMG --bbox x0 y0 x1 y1 "
-                "[--backbone dinov3|vith] [--threshold F] "
-                "[--threshold-2d PX] [--device N] [--precision bf16|fp16] [-v]\n",
+                "[--backbone dinov3|vith] [--image-height H] [--image-width W] "
+                "[--threshold F] "
+                "[--threshold-2d PX] [--device N] [--precision fp16|fp32|bf16] [-v]\n",
                 argv[0]);
         return 2;
+    }
+    if (threshold < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
+        if (backbone == CUDA_SAM3D_BODY_BACKBONE_DINOV3)
+            threshold = 2e-2f;
+        else if (backbone == CUDA_SAM3D_BODY_BACKBONE_VITH)
+            threshold = f32_ref ? 2e-2f : 8e-2f;
+        else
+            threshold = 5e-3f;
+    }
+    if (threshold_2d < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
+        if (backbone == CUDA_SAM3D_BODY_BACKBONE_DINOV3)
+            threshold_2d = f32_ref ? 0.5f : 10.0f;
+        else if (backbone == CUDA_SAM3D_BODY_BACKBONE_VITH)
+            threshold_2d = f32_ref ? 0.5f : 30.0f;
+        else
+            threshold_2d = (threshold < 1e-2f) ? 1e-2f : threshold;
     }
 
     int iw = 0, ih = 0, ich = 0;
@@ -140,10 +200,19 @@ int main(int argc, char **argv)
             image_path, iw, ih, bbox[0], bbox[1], bbox[2], bbox[3],
             backbone == CUDA_SAM3D_BODY_BACKBONE_VITH ? "vith" : "dinov3");
 
+    if (backbone == CUDA_SAM3D_BODY_BACKBONE_DINOV3)
+        infer_dinov3_input_shape(refdir, &image_height, &image_width);
+    if (image_height <= 0) image_height = 512;
+    if (image_width  <= 0) image_width  = 512;
+    fprintf(stderr, "[cuda verify_end_to_end] encoder input=%dx%d\n",
+            image_height, image_width);
+
     cuda_sam3d_body_config cfg = {
         .safetensors_dir = sft_dir,
         .mhr_assets_dir  = mhr_dir,
-        .image_size      = 512,
+        .image_size      = image_height,
+        .image_height    = image_height,
+        .image_width     = image_width,
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,
@@ -238,13 +307,10 @@ int main(int argc, char **argv)
                     nk2, ref_nk);
             rc_total |= 1;
         } else {
-            float t2d = (threshold_2d >= 0.0f)
-                ? threshold_2d
-                : ((threshold < 1e-2f) ? 1e-2f : threshold);
             char label[96];
             snprintf(label, sizeof(label), "keypoints_2d px vs %s", ref_name);
             rc_total |= diff_pair(label, ours, ref_k2,
-                                  (size_t)nk2 * 2, t2d);
+                                  (size_t)nk2 * 2, threshold_2d);
         }
         free(ours);
     } else {

@@ -205,4 +205,4 @@ Minimum data movement:
 ## Contact
 
 For questions or issues, refer to the plan file:
-`/home/u14346/.claude/plans/resilient-spinning-rocket.md`
+`~/.claude/plans/<plan>.md`

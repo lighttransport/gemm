@@ -14,7 +14,7 @@
 #   3. back_project + bake (GPU) + vertex inpaint -> textured OBJ + PNG
 #         test_paint_back_project_e2e --inpaint --gpu-bake --out <out_dir>
 #
-# Stages still needing pyref dumps (extraction TODO):
+# Current external pyref inputs:
 #   * view_maps render (geometry conditioning)
 #   * DINOv2 image conditioning
 #   * UniPC initial-noise / scheduler state

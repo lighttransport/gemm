@@ -10,19 +10,21 @@ Thin wrapper around hy3dshape.pipelines.Hunyuan3DDiTFlowMatchingPipeline that:
 Usage (from ref/hy3d/ with the uv-managed venv):
 
     uv run python run_full_pipeline.py \
-        --image /mnt/disk01/models/Hunyuan3D-2.1-repo/hy3dshape/demos/demo.png \
+        --image /mnt/disk1/models/Hunyuan3D-2.1-repo/assets/example_images/004.png \
         --out  /tmp/hy3d_ref.glb \
-        --steps 30 --guidance 5.0 --octree 256 --seed 42
+        --steps 30 --guidance 5.0 --octree 256 --seed 42 \
+        --bench-json /tmp/hy3d_ref_bench.json
 
 Environment (the script sets these automatically if unset):
     HY3D_REPO       = path that contains the `hy3dshape` python package dir.
-                      Default: /mnt/disk01/models/Hunyuan3D-2.1-repo/hy3dshape
+                      Default: /mnt/disk1/models/Hunyuan3D-2.1-repo/hy3dshape
     HY3DGEN_MODELS  = parent dir of `Hunyuan3D-2.1/` (the weight tree).
-                      Default: /mnt/disk01/models
+                      Default: /mnt/disk1/models
     HY3D_MODEL_NAME = model folder under HY3DGEN_MODELS.
                       Default: Hunyuan3D-2.1
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -31,9 +33,9 @@ import torch
 from PIL import Image
 
 
-def _setup_sys_path():
-    repo = os.environ.get("HY3D_REPO",
-                          "/mnt/disk01/models/Hunyuan3D-2.1-repo/hy3dshape")
+def _setup_sys_path(repo_arg, models_root_arg):
+    repo = repo_arg or os.environ.get(
+        "HY3D_REPO", "/mnt/disk1/models/Hunyuan3D-2.1-repo/hy3dshape")
     if not os.path.isdir(os.path.join(repo, "hy3dshape")):
         sys.exit(f"ERROR: hy3dshape package not found under {repo}. "
                  "Set HY3D_REPO to the repo's hy3dshape/ dir.")
@@ -42,7 +44,22 @@ def _setup_sys_path():
 
     # Point smart_load_model at local weights: it joins
     #   {HY3DGEN_MODELS}/{model_path}/{subfolder}
-    os.environ.setdefault("HY3DGEN_MODELS", "/mnt/disk01/models")
+    if models_root_arg:
+        os.environ["HY3DGEN_MODELS"] = models_root_arg
+    else:
+        os.environ.setdefault("HY3DGEN_MODELS", "/mnt/disk1/models")
+
+
+def _check_torch_device(args):
+    if not args.device.startswith("cuda"):
+        return
+    if torch.version.hip is None:
+        sys.exit("ERROR: --device cuda requires a ROCm PyTorch wheel for the "
+                 "RDNA4 baseline, but this torch build reports "
+                 f"torch.version.hip=None (torch={torch.__version__}).")
+    if not torch.cuda.is_available():
+        sys.exit("ERROR: --device cuda was requested, but torch reports no "
+                 "available HIP/CUDA device.")
 
 
 def main():
@@ -51,6 +68,12 @@ def main():
     parser.add_argument("--image", required=True, help="input image (PNG/JPG)")
     parser.add_argument("--out", default="hy3d_ref.glb",
                         help="output mesh; '.glb' or '.obj' (an '.obj' sibling is also written)")
+    parser.add_argument("--hy3d-repo", default=os.environ.get(
+        "HY3D_REPO", "/mnt/disk1/models/Hunyuan3D-2.1-repo/hy3dshape"),
+        help="repo directory containing the hy3dshape python package")
+    parser.add_argument("--models-root", default=os.environ.get(
+        "HY3DGEN_MODELS", "/mnt/disk1/models"),
+        help="parent directory of the Hunyuan3D-2.1 weight tree")
     parser.add_argument("--model-name", default=os.environ.get("HY3D_MODEL_NAME", "Hunyuan3D-2.1"),
                         help="model folder under HY3DGEN_MODELS")
     parser.add_argument("--steps", type=int, default=30,
@@ -83,9 +106,15 @@ def main():
     parser.add_argument("--trace-dir", default=None,
                         help="dump per-stage .npy tensors for layer-by-layer "
                              "comparison vs the CUDA runner")
+    parser.add_argument("--bench-json", default=None,
+                        help="write load/sample timing and mesh size metadata")
+    parser.add_argument("--per-stage-timing", default=None,
+                        help="emit per-stage GPU timing JSON to this path "
+                             "(uses torch.cuda.Event around DINOv2 / DiT-step / VAE)")
     args = parser.parse_args()
 
-    _setup_sys_path()
+    _setup_sys_path(args.hy3d_repo, args.models_root)
+    _check_torch_device(args)
 
     # Imports happen AFTER sys.path setup
     from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
@@ -98,7 +127,8 @@ def main():
     pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
         args.model_name, device=args.device, dtype=dtype,
         use_safetensors=False, variant="fp16")
-    print(f"  loaded in {time.time() - t0:.1f}s")
+    load_elapsed = time.time() - t0
+    print(f"  loaded in {load_elapsed:.1f}s")
 
     # Upstream Hunyuan3DDiTPipeline inherits enable_model_cpu_offload from
     # diffusers.DiffusionPipeline but never sets up .components / .device /
@@ -128,6 +158,65 @@ def main():
     # With accelerate.cpu_offload each sub-module still reports execution_device
     # as cuda, so the pipeline's latents/prepare_latents path stays on cuda.
     generator = torch.Generator(device=args.device).manual_seed(args.seed)
+
+    # ---- Per-stage GPU timing (torch.cuda.Event) ----
+    timing_handles = []
+    timing_state = {
+        "enabled": args.per_stage_timing is not None,
+        "device": args.device,
+        "dino_start": None, "dino_end": None,
+        "vae_start": None,  "vae_end": None,
+        "dit_step_events": [],   # list of (start, end) per step
+        "_pending_dit_start": None,
+    }
+    if timing_state["enabled"]:
+        def _ev():
+            return torch.cuda.Event(enable_timing=True)
+
+        # DINOv2 wall: pre-hook records start, post-hook records end
+        dino_mod = pipe.conditioner.main_image_encoder.model
+
+        def _dino_t_pre(module, args_):
+            timing_state["dino_start"] = _ev()
+            timing_state["dino_start"].record()
+
+        def _dino_t_post(module, args_, output):
+            timing_state["dino_end"] = _ev()
+            timing_state["dino_end"].record()
+
+        timing_handles.append(dino_mod.register_forward_pre_hook(_dino_t_pre))
+        timing_handles.append(dino_mod.register_forward_hook(_dino_t_post))
+
+        # DiT step: each model() call brackets one cond-or-uncond pass; we
+        # bracket every call individually and collect them all. To match the
+        # HIP "step" definition (cond+uncond+cfg+euler), we collapse pairs
+        # later in the JSON writer.
+        def _dit_t_pre(module, args_):
+            ev_s = _ev(); ev_s.record()
+            timing_state["_pending_dit_start"] = ev_s
+
+        def _dit_t_post(module, args_, output):
+            ev_e = _ev(); ev_e.record()
+            timing_state["dit_step_events"].append(
+                (timing_state["_pending_dit_start"], ev_e))
+            timing_state["_pending_dit_start"] = None
+
+        timing_handles.append(pipe.model.register_forward_pre_hook(_dit_t_pre))
+        timing_handles.append(pipe.model.register_forward_hook(_dit_t_post))
+
+        # VAE wall (post-KL + decoder)
+        def _vae_t_pre(module, args_):
+            timing_state["vae_start"] = _ev()
+            timing_state["vae_start"].record()
+
+        def _vae_t_post(module, args_, output):
+            timing_state["vae_end"] = _ev()
+            timing_state["vae_end"].record()
+
+        timing_handles.append(pipe.vae.register_forward_pre_hook(_vae_t_pre))
+        timing_handles.append(pipe.vae.register_forward_hook(_vae_t_post))
+
+        print(f"Per-stage timing enabled (output: {args.per_stage_timing})")
 
     # ---- Tracing hooks (layer-by-layer debug vs CUDA runner) ----
     hook_handles = []
@@ -212,22 +301,105 @@ def main():
     )
     elapsed = time.time() - t0
     mesh = outputs[0]
-    print(f"  sampled in {elapsed:.1f}s: "
-          f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+    mesh_ok = mesh is not None
+    if mesh_ok:
+        print(f"  sampled in {elapsed:.1f}s: "
+              f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+    else:
+        print(f"  sampled in {elapsed:.1f}s: no mesh surface extracted")
 
     for h in hook_handles:
         h.remove()
+    for h in timing_handles:
+        h.remove()
+
+    if timing_state["enabled"]:
+        torch.cuda.synchronize()
+        import json
+
+        def _ms(s, e):
+            return s.elapsed_time(e) if (s is not None and e is not None) else 0.0
+
+        dino_ms = _ms(timing_state["dino_start"], timing_state["dino_end"])
+        vae_ms  = _ms(timing_state["vae_start"],  timing_state["vae_end"])
+        per_call_ms = [_ms(s, e) for (s, e) in timing_state["dit_step_events"]]
+        # CFG: pipeline calls model twice per step (cond + uncond). Collapse.
+        if len(per_call_ms) >= 2 * args.steps:
+            steps_ms = [per_call_ms[2 * i] + per_call_ms[2 * i + 1]
+                        for i in range(args.steps)]
+        else:
+            steps_ms = per_call_ms
+        dit_total_ms = sum(steps_ms)
+        dit_step_mean = (dit_total_ms / len(steps_ms)) if steps_ms else 0.0
+
+        out = {
+            "backend": "pytorch",
+            "device": args.device,
+            "dtype": args.dtype,
+            "steps": args.steps,
+            "guidance": args.guidance,
+            "octree": args.octree,
+            "dino_ms": dino_ms,
+            "dit_total_ms": dit_total_ms,
+            "vae_ms": vae_ms,
+            "e2e_ms": elapsed * 1000.0,
+            "dit_step_ms_mean": dit_step_mean,
+            "dit_step_ms": steps_ms,
+            "dit_calls_ms_raw": per_call_ms,
+        }
+        os.makedirs(os.path.dirname(args.per_stage_timing) or ".", exist_ok=True)
+        with open(args.per_stage_timing, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Wrote per-stage timing JSON to {args.per_stage_timing}")
+        print(f"  dino={dino_ms:.1f} ms  dit={dit_total_ms:.1f} ms "
+              f"({len(steps_ms)} steps, mean={dit_step_mean:.1f} ms)  "
+              f"vae={vae_ms:.1f} ms  e2e={elapsed * 1000.0:.1f} ms")
 
     out_path = args.out
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    mesh.export(out_path)
-    print(f"  wrote {out_path}")
+    if mesh_ok:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        mesh.export(out_path)
+        print(f"  wrote {out_path}")
 
-    base, ext = os.path.splitext(out_path)
-    if ext.lower() != ".obj":
-        obj_path = base + ".obj"
-        mesh.export(obj_path)
-        print(f"  wrote {obj_path}")
+        base, ext = os.path.splitext(out_path)
+        if ext.lower() != ".obj":
+            obj_path = base + ".obj"
+            mesh.export(obj_path)
+            print(f"  wrote {obj_path}")
+
+    if args.bench_json:
+        bench = {
+            "image": args.image,
+            "out": out_path,
+            "hy3d_repo": args.hy3d_repo,
+            "models_root": os.environ["HY3DGEN_MODELS"],
+            "model_name": args.model_name,
+            "steps": args.steps,
+            "guidance": args.guidance,
+            "octree": args.octree,
+            "mc_level": args.mc_level,
+            "num_chunks": args.num_chunks,
+            "box_v": args.box_v,
+            "seed": args.seed,
+            "device": args.device,
+            "dtype": args.dtype,
+            "low_vram": args.low_vram,
+            "sequential_offload": args.sequential_offload,
+            "load_seconds": load_elapsed,
+            "sample_seconds": elapsed,
+            "mesh_ok": mesh_ok,
+            "vertices": len(mesh.vertices) if mesh_ok else 0,
+            "faces": len(mesh.faces) if mesh_ok else 0,
+        }
+        os.makedirs(os.path.dirname(args.bench_json) or ".", exist_ok=True)
+        with open(args.bench_json, "w", encoding="utf-8") as f:
+            json.dump(bench, f, indent=2)
+            f.write("\n")
+        print(f"  wrote {args.bench_json}")
+
+    if not mesh_ok:
+        sys.exit("ERROR: no mesh surface was extracted; try more steps or a "
+                 "different --mc-level for mesh-export baselines.")
 
 
 if __name__ == "__main__":

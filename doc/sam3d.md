@@ -1,6 +1,6 @@
 # SAM 3D Objects — Current State
 
-Snapshot: 2026-04-30.
+Snapshot: 2026-05-22.
 
 ## What is sam-3d-objects?
 
@@ -120,8 +120,54 @@ common/flexicubes_tables.h          # SAM3D learned mesh DMC tables
 common/tiny_gltf.h                  # minimal binary glTF / GLB mesh writer
 common/stb_image_write.h            # embedded PNG texture encoding
 ref/sam3d/gen_image_ref.py          # pytorch ref dump
+ref/sam3d/dumps/                    # persisted strict reference dumps
 /mnt/disk01/models/sam3d/safetensors/   # converted ckpt
 ```
+
+## Strict reference campaign — 2026-05-22
+
+The current strict target is `max_abs < 1e-5` against PyTorch-reference
+dumps generated with the CUDA PyTorch environment
+`/home/syoyo/work/gemm/sam/ref/sam3d/.venv/bin/python`
+(`torch 2.9.1+cu128`) and GPU access via
+`XDG_RUNTIME_DIR=/run/user/1000`. Reference dumps are persisted under
+`ref/sam3d/dumps/` so the verifier suite does not depend on `/tmp`.
+
+Reference generation policy for the persisted dumps:
+
+- CUDA refs disable TF32 for matmul/cuDNN.
+- CUDA refs force math SDPA where the PyTorch stage uses SDPA.
+- `dump_cond_tokens.py` now has `--allow-tf32` and `--sdp
+  math|default` switches for backend experiments; the persisted refs use
+  strict no-TF32 math-SDPA settings.
+- `dump_ss_dec_io.py`, `dump_ss_dit_io.py`, `dump_slat_dit_io.py`, and
+  `dump_slat_gs_io.py` accept `--device cpu|cuda`; CUDA mode disables
+  TF32. `dump_ss_dec_io.py` also has `--no-cudnn` for diagnostics.
+- `gen_image_ref.py` has current upstream compatibility fixes for
+  pointmap-only runs, GS-only decode, recursive Hydra instantiate, and
+  xformers SDPA fallback.
+
+Strict verifier status against `ref/sam3d/dumps/`:
+
+| Stage | Strict max_abs | Result | Notes |
+|-------|----------------|--------|-------|
+| DINOv2 | `1.826286e-04` | FAIL | Best persisted CUDA math-SDPA ref; TF32/default-SDPA refs were much worse (`~2.7e-2`). `CUDA_RUNNER_NO_FMAD=1` improves to `1.541376e-04` but still misses target. |
+| Cond fuser | `7.152557e-06` | PASS | Uses persisted CUDA DINO/PPE/fuser refs. |
+| SS DiT single forward | worst `6.914139e-06` | PASS | `verify_ss_dit` is max-error gated; mean remains printed for diagnostics. |
+| SS decoder | `1.449585e-04` | FAIL | CUDA no-TF32 ref is best so far. CPU ref, no-cuDNN CUDA ref, precise NVRTC math, and no-FMA diagnostics were all worse or still above target. |
+| SLAT DiT single forward | `8.463860e-06` | PASS | Strict verifier automatically enables `CUDA_RUNNER_PRECISE_MATH=1` when `--threshold <= 1e-5`; fast-math default gives `1.323223e-05`. |
+| SLAT GS transformer / representation | worst `7.868e-05` | FAIL | CPU refs and no-FMA were worse; precise NVRTC math improves transformer to `6.962e-05` but still misses target. |
+| SLAT GS packed PLY | `3.815e-06` | PASS | PLY packing itself is below strict target even when transformer-channel diffs fail. |
+
+NVRTC diagnostic switches:
+
+- `CUDA_RUNNER_PRECISE_MATH=1` omits `--use_fast_math`.
+- `CUDA_RUNNER_NO_FMAD=1` adds `--fmad=false`.
+
+These switches are diagnostics, not global defaults. Precise math fixes
+the strict SLAT DiT verifier, but worsens DINOv2 and does not solve
+SS decoder or SLAT GS. No-FMA helps DINOv2 and SS decoder slightly but
+worsens SLAT GS and remains above `1e-5`.
 
 ## Status — drift table
 

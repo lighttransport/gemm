@@ -75,6 +75,29 @@ int hip_shape_dec_forward(hip_shape_dec_ctx *ctx,
                           int32_t **out_d_coords,
                           int *out_Nf);
 
+/* Subdiv-cache capture API.
+ *
+ * tex_dec has no to_subdiv head — it must be GUIDED by an external
+ * subdivision pattern (the same one shape_dec produced internally). When
+ * capture is enabled on a shape_dec ctx, hip_shape_dec_forward[_ex] will
+ * stash host-side copies of the per-stage (idx, si, xc, Nf) arrays from
+ * the unguided synth path. The caller can then transfer ownership of those
+ * arrays via hip_shape_dec_take_cache() and feed the result as the `cache`
+ * parameter to a separate tex_dec forward.
+ *
+ * Capture is off by default. Pending state from a prior forward is freed
+ * automatically on the next forward call if capture is still enabled. */
+void hip_shape_dec_set_capture(hip_shape_dec_ctx *ctx, int enable);
+
+/* Transfer ownership of the most recent captured cache to `out`. The
+ * ctx's internal pointers are zeroed; future forwards repopulate. Returns
+ * 0 if a cache is available, -1 if capture was off or nothing was synthed. */
+int  hip_shape_dec_take_cache(hip_shape_dec_ctx *ctx, hip_shape_dec_cache *out);
+
+/* Free the host arrays inside a hip_shape_dec_cache obtained via
+ * hip_shape_dec_take_cache(). The cache struct itself is caller-owned. */
+void hip_shape_dec_cache_free(hip_shape_dec_cache *c);
+
 #ifdef __cplusplus
 }
 #endif

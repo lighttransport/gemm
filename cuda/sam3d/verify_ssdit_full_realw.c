@@ -128,7 +128,7 @@ int main(int argc, char **argv)
     if (cs3d_ssdit_outer_fns_lookup(&fns, cmod) < 0) return 6;
 
     cs3d_ssdit_gpu g;
-    if (cs3d_ssdit_gpu_load(&g, m, verbose) < 0) return 7;
+    if (cs3d_ssdit_gpu_load(&g, m, NULL, "fp32", 0, verbose) < 0) return 7;
     cs3d_ssdit_block_ws ws_block;
     int N_s = g.latent[SAM3D_SS_LAT_SHAPE].token_len;
     int N_p = 0;

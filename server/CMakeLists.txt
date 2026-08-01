@@ -8,6 +8,7 @@ option(DIFFUSION_SERVER_ENABLE_SAM3 "Enable SAM3 API surface" ON)
 option(DIFFUSION_SERVER_ENABLE_SAM3_CUDA "Enable SAM3 CUDA backend (NVRTC via cuew)" OFF)
 option(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA "Enable SAM3.1 CUDA backend (NVRTC via cuew)" OFF)
 option(DIFFUSION_SERVER_ENABLE_MCP "Enable minimal MCP stdio mode" OFF)
+option(DIFFUSION_SERVER_ENABLE_LLM "Enable LLM/VLM OpenAI-compatible API server" ON)
 
 set(ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
@@ -49,6 +50,11 @@ if(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
         ${ROOT_DIR}/rdna4/qimg/hip_qimg_runner.c
         ${ROOT_DIR}/rdna4/llm/hip_llm_runner.c
         ${ROOT_DIR}/rdna4/rocew.c)
+    # server.c already carries the SAFETENSORS / json implementations; tell
+    # hip_llm_runner.c to use declarations only (hip_qimg_runner.c already does)
+    # to avoid multiple-definition link errors.
+    set_source_files_properties(${ROOT_DIR}/rdna4/llm/hip_llm_runner.c
+        PROPERTIES COMPILE_DEFINITIONS "HIP_LLM_RUNNER_EXTERNAL_IMPLS=1")
 endif()
 
 if(DIFFUSION_SERVER_ENABLE_SAM3)
@@ -110,4 +116,14 @@ if(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
         ${ROOT_DIR}/cuda/sam3.1)
     set_source_files_properties(${ROOT_DIR}/cuda/sam3.1/cuda_sam3_1_runner.c
         PROPERTIES COMPILE_DEFINITIONS "CUDA_SAM3_1_RUNNER_EXTERNAL_IMPLS=1")
+endif()
+
+if(DIFFUSION_SERVER_ENABLE_LLM)
+    target_sources(diffusion-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/server_llm.c)
+    target_include_directories(diffusion-server PRIVATE
+        ${ROOT_DIR}/cpu/llm
+        ${ROOT_DIR}/cpu/vlm)
+    target_compile_definitions(diffusion-server PRIVATE
+        DIFFUSION_SERVER_ENABLE_LLM=1)
 endif()

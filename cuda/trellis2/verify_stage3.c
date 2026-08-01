@@ -9,24 +9,38 @@
 
 static float *read_npy_f32(const char *p, int *nd, int *dd) {
     FILE *f=fopen(p,"rb"); if(!f) return NULL;
-    fseek(f,8,SEEK_SET); uint16_t hl; fread(&hl,2,1,f);
-    char *h=malloc(hl+1); fread(h,1,hl,f); h[hl]=0;
+    fseek(f,8,SEEK_SET); uint16_t hl;
+    if(fread(&hl,2,1,f)!=1){ fclose(f); return NULL; }
+    char *h=malloc(hl+1);
+    if(fread(h,1,hl,f)!=(size_t)hl){ free(h); fclose(f); return NULL; }
+    h[hl]=0;
     *nd=0; char *sp=strstr(h,"shape"); if(sp){sp=strchr(sp,'('); if(sp){sp++;
-        while(*sp&&*sp!=')'){while(*sp==' '||*sp==',')sp++;
-            if(*sp==')')break; dd[*nd]=(int)strtol(sp,&sp,10);(*nd)++;}}}
+        while(*sp&&*sp!=')'){
+            while(*sp==' '||*sp==',')sp++;
+            if(*sp==')')break;
+            dd[*nd]=(int)strtol(sp,&sp,10);(*nd)++;
+        }}}
     size_t n=1; for(int i=0;i<*nd;i++) n*=dd[i];
-    float *d=malloc(n*sizeof(float)); fread(d,sizeof(float),n,f);
+    float *d=malloc(n*sizeof(float));
+    if(fread(d,sizeof(float),n,f)!=n){ free(d); free(h); fclose(f); return NULL; }
     fclose(f); free(h); return d;
 }
 static int32_t *read_npy_i32(const char *p, int *nd, int *dd) {
     FILE *f=fopen(p,"rb"); if(!f) return NULL;
-    fseek(f,8,SEEK_SET); uint16_t hl; fread(&hl,2,1,f);
-    char *h=malloc(hl+1); fread(h,1,hl,f); h[hl]=0;
+    fseek(f,8,SEEK_SET); uint16_t hl;
+    if(fread(&hl,2,1,f)!=1){ fclose(f); return NULL; }
+    char *h=malloc(hl+1);
+    if(fread(h,1,hl,f)!=(size_t)hl){ free(h); fclose(f); return NULL; }
+    h[hl]=0;
     *nd=0; char *sp=strstr(h,"shape"); if(sp){sp=strchr(sp,'('); if(sp){sp++;
-        while(*sp&&*sp!=')'){while(*sp==' '||*sp==',')sp++;
-            if(*sp==')')break; dd[*nd]=(int)strtol(sp,&sp,10);(*nd)++;}}}
+        while(*sp&&*sp!=')'){
+            while(*sp==' '||*sp==',')sp++;
+            if(*sp==')')break;
+            dd[*nd]=(int)strtol(sp,&sp,10);(*nd)++;
+        }}}
     size_t n=1; for(int i=0;i<*nd;i++) n*=dd[i];
-    int32_t *d=malloc(n*sizeof(int32_t)); fread(d,sizeof(int32_t),n,f);
+    int32_t *d=malloc(n*sizeof(int32_t));
+    if(fread(d,sizeof(int32_t),n,f)!=n){ free(d); free(h); fclose(f); return NULL; }
     fclose(f); free(h); return d;
 }
 
@@ -51,8 +65,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ref: [%d, %d]\n", dd[0], out_ch);
 
     float *output = (float *)malloc((size_t)N * out_ch * sizeof(float));
-    fprintf(stderr, "Running Stage 3 DiT (t_raw=1.0)...\n");
-    cuda_trellis2_run_stage3_dit(r, xt, 1.0f, cond, coords, N, output);
+    /* 10b_tex_dit_step_velocity is a DIRECT model forward at t=0.5; the runner
+     * multiplies timestep by 1000 internally, so pass 0.0005 -> embedder sees
+     * 0.5. Optional argv[6] overrides t_raw. */
+    float t_raw = (argc > 6) ? (float)atof(argv[6]) : 0.0005f;
+    fprintf(stderr, "Running Stage 3 DiT (t_raw=%.4f, model sees t=%.1f)...\n", t_raw, t_raw * 1000.0f);
+    cuda_trellis2_run_stage3_dit(r, xt, t_raw, cond, coords, N, output);
 
     /* Compare */
     double sr=0,sc=0,sr2=0,sc2=0,src2=0;

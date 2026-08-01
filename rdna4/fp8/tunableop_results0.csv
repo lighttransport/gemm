@@ -1,0 +1,6 @@
+Validator,PT_VERSION,2.11.0
+Validator,HIP_VERSION,702
+Validator,HIPBLASLT_VERSION,100202-dabb6df2b9
+Validator,GCN_ARCH_NAME,gfx1201
+Validator,ROCBLAS_VERSION,5.2.0.dabb6df2b9
+ScaledGemmTunableOp_Float8_e4m3fn_Float8_e4m3fn_float_TN,tn_4608_1024_4608_ld_4608_4608_4608_rw_0_bias_None,Gemm_Hipblaslt_84811,0.190991

@@ -101,6 +101,13 @@ int main(int argc, char **argv) {
     double gpu_time = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     fprintf(stderr, "GPU DiT step: %.2f s\n", gpu_time);
 
+    /* Dump the HIP velocity for cross-checkpoint comparison (int8 vs bf16):
+     * the CPU reference can't load int8, so compare two HIP dumps instead. */
+    { const char *dp = getenv("FLUX2_DUMP_VEL");
+      if (dp) { FILE *f = fopen(dp, "wb");
+          if (f) { fwrite(out_gpu, sizeof(float), img_n, f); fclose(f);
+              fprintf(stderr, "dumped HIP velocity [%zu] -> %s\n", img_n, dp); } } }
+
     hip_flux2_free(r);
 
     /* ---- Compare ---- */

@@ -60,6 +60,8 @@ def main():
                     help="timestep pre-time_scale (upstream uses t ∈ [0, 1])")
     ap.add_argument("--d", type=float, default=1.0,
                     help="shortcut jump size; 1.0 = full jump to t=0")
+    ap.add_argument("--device", default="cpu",
+                    help="torch device for model forward (cpu or cuda)")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -68,6 +70,17 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_float32_matmul_precision("highest")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("[dump_ss_dit_io] cuda requested but unavailable; using cpu",
+              file=sys.stderr)
+        device = torch.device("cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
 
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
@@ -81,7 +94,7 @@ def main():
     # and doesn't use cfg at inference here.
     bb_conf.condition_embedder = None
 
-    model = instantiate(bb_conf, _recursive_=True).eval()
+    model = instantiate(bb_conf, _recursive_=True).eval().to(device)
 
     # Load weights from ckpt. Try prefixes until one matches.
     print(f"[dump_ss_dit_io] loading ckpt {args.ss_ckpt}...", file=sys.stderr)
@@ -124,7 +137,7 @@ def main():
     latents = {}
     for name, shape in spec:
         x = torch.randn((1,) + shape, dtype=torch.float32)
-        latents[name] = x
+        latents[name] = x.to(device)
         save(args.outdir, f"ss_dit_in_{name}.npy", x[0].numpy())
 
     # cond: load dumped tensor.
@@ -132,11 +145,11 @@ def main():
     # Expect (N, 1024) or (1, N, 1024)
     if cond_np.ndim == 3:
         cond_np = cond_np[0]
-    cond = torch.from_numpy(cond_np)[None]
+    cond = torch.from_numpy(cond_np)[None].to(device)
     save(args.outdir, "ss_dit_cond.npy", cond_np)
 
-    t = torch.tensor([args.t], dtype=torch.float32)
-    d = torch.tensor([args.d], dtype=torch.float32)
+    t = torch.tensor([args.t], dtype=torch.float32, device=device)
+    d = torch.tensor([args.d], dtype=torch.float32, device=device)
     save(args.outdir, "ss_dit_t.npy", np.asarray(args.t, np.float32))
     save(args.outdir, "ss_dit_d.npy", np.asarray(args.d, np.float32))
 

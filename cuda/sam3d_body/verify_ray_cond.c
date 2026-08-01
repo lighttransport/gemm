@@ -25,7 +25,7 @@ int main(int argc, char **argv)
     float threshold = 2e-3f;
     float mean_threshold = 3e-4f;
     int device = 0, verbose = 0;
-    const char *precision = "bf16";
+    const char *precision = "fp16";
     cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
@@ -50,7 +50,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] "
                         "[--backbone dinov3|vith] [--device N] "
-                        "[--precision bf16|fp16] [-v]\n",
+                        "[--precision fp16|fp32|bf16] [-v]\n",
                 argv[0]);
         return 2;
     }
@@ -89,7 +89,9 @@ int main(int argc, char **argv)
 
     cuda_sam3d_body_config cfg = {
         .safetensors_dir = sft_dir,
-        .image_size      = 512,
+        .image_size      = H * 16,
+        .image_height    = H * 16,
+        .image_width     = W * 16,
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,

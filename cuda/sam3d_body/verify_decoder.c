@@ -83,7 +83,7 @@ static void resolve_variant_path(const char *dir, const char *bucket,
 }
 
 static int diff_pair(const char *label, const float *a, const float *b,
-                     size_t n, float thresh)
+                     size_t n, float thresh, float mean_thresh)
 {
     if (n == 0) {
         fprintf(stderr, "[cuda verify_decoder] %-44s empty diff FAIL\n",
@@ -97,10 +97,10 @@ static int diff_pair(const char *label, const float *a, const float *b,
         sum += d;
     }
     double mean = sum / (double)n;
-    int fail = (mx >= thresh) || (mean >= thresh * 0.15f);
+    int fail = (mx >= thresh) || (mean >= mean_thresh);
     fprintf(stderr, "[cuda verify_decoder] %-44s max_abs=%.4e (i=%zu) "
-                    "mean_abs=%.4e (max=%.1e) %s\n",
-            label, mx, mxi, mean, thresh, fail ? "FAIL" : "OK");
+                    "mean_abs=%.4e (max=%.1e mean=%.1e) %s\n",
+            label, mx, mxi, mean, thresh, mean_thresh, fail ? "FAIL" : "OK");
     return fail ? 1 : 0;
 }
 
@@ -112,9 +112,10 @@ int main(int argc, char **argv)
      * within 1e-5 in earlier per-stage verifies; budget set to match
      * verify_decoder_full's threshold so we catch real drift. */
     float threshold = 5e-3f;
+    float mean_threshold = -1.0f;
     int device = 0, verbose = 0;
     int n_threads = 0;
-    const char *precision = "bf16";
+    const char *precision = "fp16";
     cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
@@ -122,6 +123,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--mhr-assets")      && i+1 < argc) mhr_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--mean-threshold")  && i+1 < argc) mean_threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
             const char *v = argv[++i];
             if      (!strcmp(v, "dinov3")) backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
@@ -140,10 +142,12 @@ int main(int argc, char **argv)
     if (!sft_dir || !mhr_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --mhr-assets DIR "
                         "--refdir DIR [--threshold F] [--device N] "
-                        "[--backbone dinov3|vith] [--precision bf16|fp16] "
+                        "[--mean-threshold F] [--backbone dinov3|vith] "
+                        "[--precision fp16|fp32|bf16] "
                         "[-t N] [-v]\n", argv[0]);
         return 2;
     }
+    if (mean_threshold < 0.0f) mean_threshold = threshold * 0.15f;
 
     /* CPU model (for MHR-in-the-loop helpers + init_pose/init_camera). */
     char p[1024], p2[1024];
@@ -424,13 +428,17 @@ int main(int argc, char **argv)
                 continue;
             }
             snprintf(lbl, sizeof(lbl), "layer%d kp3d (70,3)", li);
-            rc_d |= diff_pair(lbl, dbg_kp3d + (size_t)li*K*3, r_kp3d, K*3, threshold);
+            rc_d |= diff_pair(lbl, dbg_kp3d + (size_t)li*K*3, r_kp3d, K*3,
+                              threshold, mean_threshold);
             snprintf(lbl, sizeof(lbl), "layer%d kp2d_crop (70,2)", li);
-            rc_d |= diff_pair(lbl, dbg_kp2dc + (size_t)li*K*2, r_kp2dc, K*2, threshold);
+            rc_d |= diff_pair(lbl, dbg_kp2dc + (size_t)li*K*2, r_kp2dc, K*2,
+                              threshold, mean_threshold);
             snprintf(lbl, sizeof(lbl), "layer%d kp2d_depth (70,)", li);
-            rc_d |= diff_pair(lbl, dbg_kp2dd + (size_t)li*K, r_kp2dd, K, threshold);
+            rc_d |= diff_pair(lbl, dbg_kp2dd + (size_t)li*K, r_kp2dd, K,
+                              threshold, mean_threshold);
             snprintf(lbl, sizeof(lbl), "layer%d cam_t (3,)", li);
-            rc_d |= diff_pair(lbl, dbg_camt + (size_t)li*3, r_camt, 3, threshold);
+            rc_d |= diff_pair(lbl, dbg_camt + (size_t)li*3, r_camt, 3,
+                              threshold, mean_threshold);
             free(r_kp3d); free(r_kp2dc); free(r_kp2dd); free(r_camt);
         }
         /* Final. */
@@ -441,16 +449,22 @@ int main(int argc, char **argv)
         float *r_kp2ddf= load_or_die(refdir, "decoder_pose_layer5__pred_keypoints_2d_depth");
         float *r_camtf = load_or_die(refdir, "decoder_pose_layer5__pred_cam_t");
         if (r_pose && r_cam && r_kp3df && r_kp2dcf && r_kp2ddf && r_camtf) {
-            rc_d |= diff_pair("head_pose_proj_raw (519,)",     pose_raw, r_pose, 519, threshold);
-            rc_d |= diff_pair("head_camera_proj_raw (3,)",     cam_raw,  r_cam,  3,   threshold);
+            rc_d |= diff_pair("head_pose_proj_raw (519,)",     pose_raw,
+                              r_pose, 519, threshold, mean_threshold);
+            rc_d |= diff_pair("head_camera_proj_raw (3,)",     cam_raw,
+                              r_cam,  3,   threshold, mean_threshold);
             rc_d |= diff_pair("final pred_keypoints_3d (70,3)",
-                              final_kp3d, r_kp3df, K * 3, threshold);
+                              final_kp3d, r_kp3df, K * 3, threshold,
+                              mean_threshold);
             rc_d |= diff_pair("final pred_keypoints_2d_cropped (70,2)",
-                              final_kp2dc, r_kp2dcf, K * 2, threshold);
+                              final_kp2dc, r_kp2dcf, K * 2, threshold,
+                              mean_threshold);
             rc_d |= diff_pair("final pred_keypoints_2d_depth (70,)",
-                              final_kp2dd, r_kp2ddf, K, threshold);
+                              final_kp2dd, r_kp2ddf, K, threshold,
+                              mean_threshold);
             rc_d |= diff_pair("final pred_cam_t (3,)",
-                              final_camt, r_camtf, 3, threshold);
+                              final_camt, r_camtf, 3, threshold,
+                              mean_threshold);
         } else {
             fprintf(stderr,
                     "[cuda verify_decoder] missing one or more final refs FAIL\n");

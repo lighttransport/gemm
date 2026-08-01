@@ -29,7 +29,7 @@ NVCCFLAGS = -O3 -std=c++17 -arch=sm_120 \
 
 CUTILE_SO = libcutile_gemm.so
 
-.PHONY: all clean run-f16 run-bf16 run-fp8 run-all smoke cutile run-cutile
+.PHONY: all clean run-f16 run-bf16 run-fp8 run-all smoke cutile run-cutile test-tf32
 
 all: $(TARGET)
 
@@ -64,5 +64,21 @@ run-cutile: $(TARGET) $(CUTILE_SO)
 
 run-all: run-f16 run-bf16 run-fp8
 
+# Phase 2 precision-tier check: pedantic vs default-SGEMM vs TF32 f32 GEMM.
+TF32_TEST = test_tf32_f32
+test-tf32: $(TF32_TEST)
+	./$(TF32_TEST)
+
+$(TF32_TEST): test_tf32_f32.c ../cuew.c ../cublasew.c ../cublasew.h ../cuew.h
+	$(CC) $(CFLAGS) -o $@ test_tf32_f32.c ../cuew.c ../cublasew.c $(LDFLAGS)
+
+# Phase 3 precision check: per-tensor vs per-row FP8 weight scaling.
+FP8PR_TEST = test_fp8_perrow
+test-fp8-perrow: $(FP8PR_TEST)
+	./$(FP8PR_TEST)
+
+$(FP8PR_TEST): test_fp8_perrow.c ../cuew.c ../cublasew.c ../cublasew.h ../cuew.h ../cuda_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_fp8_perrow.c ../cuew.c ../cublasew.c $(LDFLAGS)
+
 clean:
-	rm -f $(TARGET) $(CUTILE_SO)
+	rm -f $(TARGET) $(CUTILE_SO) $(TF32_TEST) $(FP8PR_TEST)

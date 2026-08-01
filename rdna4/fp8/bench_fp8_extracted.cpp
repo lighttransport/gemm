@@ -174,6 +174,8 @@ int main(int argc, char** argv) {
       const char* s = argv[++i];
       if (!std::strcmp(s, "mm0")) { M=1024; N=4608; K=4608; }
       else { std::fprintf(stderr, "only --shape mm0 supported\n"); return 1; }
+    } else if (!std::strcmp(argv[i], "--mnk") && i + 3 < argc) {
+      M = std::atoi(argv[++i]); N = std::atoi(argv[++i]); K = std::atoi(argv[++i]);
     } else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) {
       iters = std::atoi(argv[++i]);
     } else if (!std::strcmp(argv[i], "--check")) {

@@ -54,7 +54,7 @@
         <label for="model">Model</label>
         <select id="model">
           <option value="sam3">sam3</option>
-          <option value="sam3.1">sam3.1 (pending runner)</option>
+          <option value="sam3.1">sam3.1</option>
         </select>
       </div>
       <div>
@@ -241,9 +241,12 @@ function buildMaskList() {
 
 function syncModelUI(value) {
   $('modelPill').textContent = value;
-  $('modelPill').className = 'pill' + (value === 'sam3.1' ? ' warn' : '');
+  $('modelPill').className = 'pill';
+  const cpuOpt = $('backend').querySelector('option[value="cpu"]');
+  if (cpuOpt) cpuOpt.disabled = value === 'sam3.1';
+  if (value === 'sam3.1') $('backend').value = 'cuda';
   document.title = value === 'sam3.1'
-    ? 'SAM 3.1 Segmentation (preview)'
+    ? 'SAM 3.1 Segmentation'
     : 'SAM 3 Segmentation';
 }
 

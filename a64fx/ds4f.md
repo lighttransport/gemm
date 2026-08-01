@@ -1,14 +1,107 @@
-# DeepSeek-V4-Flash (DS4F) on 11× A64FX (Fugaku) — build & run repro
+# DeepSeek-V4 (Flash + base) on A64FX / Fugaku — build & run repro
 
-EP-only inference harness for DeepSeek-V4-Flash (284B total / 13B activated MoE,
-43 MoE layers, hidden 4096, vocab 129280). 256 routed experts are EP-sharded
-~23–24/node; dense (attn / shared expert / router / embed / head) is replicated and
-computed redundantly per node. Weights stay quantized in HBM with on-demand dequant
-(dense FP8 e4m3fn, experts MXFP4) to fit ~25 GB usable HBM2/node.
+EP inference harness for DeepSeek-V4 **Flash** (`~/models/ds4f`, 149 GB, fp4 experts) and
+**base** (`~/models/ds4fbase`, 275 GB, fp8 experts) — 284B total / 13B activated MoE, 43 layers,
+hidden 4096, vocab 129280, 256 routed experts EP-sharded across the nodes.
 
-This file is the **operational repro** for the real-weight Tier-B1 run. The science /
-status lives in the auto-memory `project_ds4f_flash_ep_harness`; the design rationale
-in `~/.claude/plans/plan-deepseek-v4-flash-iterative-prism.md`.
+---
+
+## ★ CURRENT STATE — decode, 12 nodes (2026-07-13)
+
+| model | experts | single-stream | batched (aggregate) | prefill | arena |
+|---|---|---|---|---|---|
+| **ds4fbase** (275 GB, full fp8 fidelity) | **Q8_PV** (baked) | **21.5–23.0 tok/s** | **34.6 @ M=16** | **37.2 tok/s** (`PREFILL_GEMM`, K=32) | 26.9 GB |
+| ds4f (Flash, 149 GB) | MXFP4 (cannot be Q8'd — would blow the arena) | **15.56 tok/s** | **24.1 @ M=32** / 21.6 @ M=16 | **25.1 tok/s** (`PREFILL_GEMM`, K=32) | 18.9 GB |
+
+**Flash's row is now a single-allocation, gate-first measurement** (`bench_headline_flash_11n.sh`,
+the same standard base meets) — `VERIFY_GATE` 16/16, then decode/prefill on a real 70-token prompt,
+then the batched sweep. Full curve: **M=1 6.3 | M=2 10.1 | M=4 14.4 | M=8 18.2 | M=16 21.6 | M=32 24.1**
+tok/s aggregate (per-seq 6.28 → 0.75: **4× throughput for 8× worse latency** — that is the serving
+trade). Measured on the *hardened* runner; every number is within noise of the pre-hardening values,
+so the reliability work costs nothing.
+
+> Flash's old **18.98** was a synthetic-ctx=8 number, like base's 22.45. On a **real 70-token prompt**
+> it is **15.54** (was 12.57 before the indexer-scan fix).
+>
+> **🔴 Flash's old batched numbers (32.8 @ M=32 / 31.0 @ M=16) were RETRACTED and re-measured.**
+> They were produced by the bare `run_ds4f_11n.sh`, which defaults **`DS4F_EXACT=0`** (stand-in math;
+> base's script defaults it to **1**) — so they were never measurements of DeepSeek-V4 at all. On the
+> real model that path first **segfaulted** (no RoPE tables under `EXACT=0`; fixed below), and once it
+> runs it is **24.0 @ M=32 / 21.6 @ M=16** — the retracted figures were **~35–45% too high**.
+> See the section at the end of this file.
+
+**Every base number above is from ONE allocation (job 49556601) with the gate green** —
+`./bench_headline_12n.sh`, which runs `VERIFY_GATE` **first** and aborts the whole benchmark if it
+does not pass. Reproduced verbatim:
+
+```
+[1/4] VERIFY_GATE  16/16 match, common prefix 16 -> PASS      (43 layers, full stack)
+[2/4] decode    64 tok  46.5 ms/tok  21.49 tok/s  comm 29.3%   \ real 70-token prompt,
+[3/4] prefill   70 tok  26.9 ms/tok  37.16 tok/s  comm 21.8%   / coherent quicksort, 12/12 lockstep
+[4/4] batched   M=1 17.1 | M=2 22.3 | M=4 27.5 | M=8 31.4 | M=16 34.6 tok/s aggregate
+```
+
+**★ ALWAYS state the context a decode number was measured at.** Single-stream reads **23.03** over 32
+decoded tokens and **21.49** over 64 (the run walks further out in context) — both on the same real
+70-token prompt. The old "22.45 tok/s" headline was measured at the run script's **default synthetic
+prefill of 8 tokens**, and it did NOT survive a real prompt (17.08 there) until the indexer-scan bug
+below was fixed. A bare tok/s figure with no stated context is not a fact about this model.
+
+**Batching still pays, but sub-linearly**: M=16 gives 34.6 tok/s aggregate (2.0× M=1) at 2.16
+tok/s/seq — per-sequence latency degrades ~8× to buy 2× throughput. That trade is the whole decision
+for a serving deployment, and it is only meaningful because the batched forward is now *gated*
+(`VERIFY_GATE`); for months these same numbers were garbage produced at full speed.
+
+**The base model is FASTER than Flash** — its fp8 experts convert to the fast int8-sdot kernel
+while Flash's fp4 does not. Cumulative on base: 11.34 → **22.45 tok/s (2.0×)**.
+
+**All of these are output-gated.** Single-stream and token-at-a-time prefill on coherent completions;
+everything batched (decode, `PREFILL_GEMM`, and the serve loops) on `DS4F_VERIFY_GATE=1` at 16/16 plus
+`gate_serve_12n.sh` returning coherent completions for two concurrent real prompts. That qualifier is
+load-bearing: until 2026-07-12 every batched number here was **garbage produced at full speed** (see
+the `forward_verify` × `TP_WOB` fix at the end of this file).
+
+```sh
+# ONE TIME (survives allocations; ~50 min): kernel-ready weights -> ~/models/<model>-fast/
+DS4F_MODEL=ds4fbase DS4F_BAKE_EXPERTS=1 ./build/ds4f_bake     # 11.4 GB bf16pv + 291 GB q8pv
+
+# PER ALLOCATION (/local is node-local and dies with the job): ~30 min
+DS4F_MODEL=ds4fbase DS4F_DENSE=q8pv DS4F_STAGE_DIR=/local/base_q8 ./run_ds4fbase_stage_12n.sh
+
+# RUN — the flags below are the measured optimum; see the notes for why each one matters
+DS4F_MODEL=ds4fbase DS4F_STAGE_DIR=/local/base_q8 \
+  DS4F_DENSE=q8pv DS4F_EXPERTS=q8pv \
+  DS4F_TP_ATTN=0 DS4F_CMP_LOCAL=1 DS4F_HC_SVE=1 DS4F_MV_FUSE=1 \
+  LLM_THREADS=47 ./run_ds4fbase_12n.sh
+```
+
+**The four rules that produced those numbers** (each cost real time to find; details in the
+sections below):
+
+1. **`LLM_THREADS=47`, never 48.** 48 pinned OMP threads on 48 compute cores means ANY other
+   process on the node preempts one — and the pool barrier waits for all 48, which stalls every
+   rank. **+40%**, and it makes the numbers reproducible. It masquerades as fabric noise.
+2. **`comm ≈ 3 × expert_time`.** Decode "comm" is not data movement (fabric floor is 2 ms of the
+   ~11–22 ms observed) — it is the MoE straggler. Top-6-of-256 lands ~2 experts on the max rank vs
+   a 0.5 average. **⇒ cutting expert time by X cuts decode by ~4X.** This is the single most useful
+   predictive rule here.
+3. **Bake the weights offline.** The fast reps (bf16-pv, Q8_PV) were only reachable at runtime via a
+   transient bf16 peak that base could not afford. Baking removes the peak — and it is what made
+   rule 2 actionable (Q8 experts: 6.8 → 3.1 ms ⇒ **+32%** decode).
+4. **`TP_ATTN=0`.** TP's `s_attn` all-reduce (128 KB × 43/token) dominates `o_proj`. With a fast
+   dense kernel the trade flips: TP_ATTN is a LOSS under FP8 but a WIN under Q8.
+
+**Refuted, do not retry:** compute/comm overlap & double-buffering (comm is idle-wait, not
+transfer); static MoE load balancing (the router is statistically random — see the refutation);
+per-row-scale int8 (lossy or zero-gain); `DS4F_INT8_KV` for long ctx (it *costs* context).
+**Context:** 1M fits (arena is flat in ctx); the ceiling is speed, not memory.
+
+---
+
+## Historical: Tier-B1 operational repro (11 nodes, pre-bake)
+
+This section predates the bake + the 47-thread fix; its numbers (decode ~10 tok/s) are superseded
+by the table above and are kept for the staging/validation recipe only.
 
 ## TL;DR
 
@@ -29,6 +122,252 @@ reuse the Step-1 blobs (no re-stage). Last Tier-B1 validation (job 49092345, 202
 `rc=0`, NaNs=0, argmax=122293, prefill 10.44 / decode 10.16 tok/s, arena 22.18 /
 RSS 21.81 GB/node. Per-config numbers are in Steps 2–2d.
 
+## NUMA lever, CLI flags & minimal-node presets (2026-07)
+
+**NUMA interleave (grafted from glm5).** `ds4f_ep_runner` now interleaves its arena across all CMGs
+in-process (`ds4f_apply_numa`: `set_mempolicy(MPOL_INTERLEAVE)`), the in-process equivalent of
+`numactl --interleave=all`. ds4f decode is fp8-stream memory-bound, so this is the same ~1.40×
+bit-identical decode lever measured on glm5. **On by default (`DS4F_NUMA=1`)**; the thread-affinity
+half (`OMP_PROC_BIND=close`, `OMP_PLACES=cores`) is exported at launch by `run_ds4f_11n.sh`. A/B with
+`DS4F_NUMA=0` (or `--numa 0`) — the token stream is bit-identical either way.
+
+**CLI front-end.** `ds4f_ep_runner --flags` map to the `DS4F_*` env (env still works as fallback):
+
+| flag | env | flag | env |
+|---|---|---|---|
+| `--numa[=0\|1]` | (apply; default 1) | `--preset decode` | FP8_BF16+Q8_DENSE+HC_PAR+HC_RMSPAR+TIERB2+MHC+OPROJ_FUSE+ATTN_SVE |
+| `--model DIR` | `DS4F_MODEL_DIR` | `--real N` | `DS4F_REAL` |
+| `--stage-dir D` | `DS4F_STAGE_DIR` | `--ep-size N` | `DS4F_EP_SIZE` |
+| `--nshards N` | `DS4F_NSHARDS` | `--layers N` | `DS4F_LAYERS` |
+| `--prefill N` | `DS4F_PREFILL` | `--max-gen N` | `DS4F_MAXGEN` |
+| `--maxpos N` | `DS4F_MAXPOS` | `--max-new N` | `DS4F_MAX_NEW` |
+| `--cp N` | `DS4F_CP` | `--int8-kv N` | `DS4F_INT8_KV` |
+| `--mtp N` | `DS4F_MTP` | `--tierb2 N` | `DS4F_TIERB2` |
+| `--prompt-ids F` | `DS4F_PROMPT_IDS` | `--set KEY=VAL` | any `DS4F_*` |
+
+**Unified batch launcher `a64fx/llm/pjsub_ds4f.sh`** (MODE = prefill / decode / serve / serve1m /
+dbbench). Unlike the interactive `run_ds4f_*11n.sh` (which reserve 1 node for the control session),
+this is a pjsub batch job where all `NODES` are EP ranks (rank 0 doubles as driver — **no dedicated
+controller node**). Default `NODES=8` (the minimal-node fast-decode sweet spot). It stages then runs
+via the CLI flags:
+
+```sh
+NODES=8  MODE=decode  MAXGEN=64 pjsub a64fx/llm/pjsub_ds4f.sh          # fast Q8 decode @ minimal floor
+NODES=16 MODE=prefill PREFILL=2048 pjsub a64fx/llm/pjsub_ds4f.sh       # TTFT, run above the floor
+NODES=8  MODE=serve1m MAXPOS=1048576 pjsub a64fx/llm/pjsub_ds4f.sh     # 1M-ctx serve (CP-int4 caches)
+NODES=12 MODE=serve   CP=1 MTP=1 PROMPT_IDS=... pjsub a64fx/llm/pjsub_ds4f.sh  # prefill+decode serving
+```
+(To change node count edit **both** `#PJM node=/proc=` **and** `NODES`.)
+
+**Minimal-node floor — three tiers** (`a64fx/llm/ds4f_sim.py`, ragged `e%N`: fullest node =
+`9.02 replicated + 150.59·⌈256/N⌉/256 experts`, ≤27 GB usable). 256 experts do **not** divide by 6 or
+7, so the fullest node bounds memory — **6 EP nodes do NOT fit** (weights alone ~28 GB > usable):
+
+| tier (dense sharding) | decode speed | weight floor | note |
+|---|---|---|---|
+| **fp8ondemand** (`TP_HEAD`+`TP_EMBED`, FP8 dense) | FP8 (dequant-bound) | **≥8** | **MEASURED @8 EP: fits, RSS 24.57 GB, decode 8.69 tok/s, coherent** |
+| q8fast (`+ Q8_DENSE`, needs bf16 promote) | fast Q8 (~13 tok/s@11n) | **≥9** | **8 OOMs at LOAD** — bf16-promote peak ~28.2 GB busts the node before Q8 reclaims |
+| fp8full (`+ TP_ATTN/SHARED/OPROJ/WOB`) | ~2× slower | **≥7** (weights) | absolute weight floor; `Q8_DENSE`+`TP_ATTN` is a wrong-output bug (WS7) |
+
+> **Measured 2026-07-08 (job 49482631, 12-node interactive alloc, TP_HEAD/EMBED on, MAX_NEW=64):**
+> - **8 EP, fast `Q8_DENSE`:** OOM-kills at load (arena ~28.24 GB, rank SIGKILL) — Q8 first promotes
+>   dense to bf16-pv (+~6 GB) before repacking; that load-peak busts the ~30 GB node.
+> - **8 EP, plain FP8 dense** (`DS4F_FP8_BF16=0 DS4F_Q8_DENSE=0`): fits **RSS 24.57 GB/node**, decode
+>   **8.69 tok/s** / prefill 9.41, NaN=0, coherent — but FP8 is dequant-bound (slower).
+> - **9 EP, fast `Q8_DENSE`:** fits (bf16-promote peak arena 26.6 GB, no OOM), reclaims to **RSS
+>   22.92 GB/node**, decode **13.05 tok/s** / prefill 14.68, NaN=0, coherent — **matches 11-node fast
+>   decode with 2 fewer nodes** (decode is comm/BW-bound, flat in N above the floor).
+>
+> Net: **8 nodes = slower FP8 (~8.7 tok/s); 9 nodes = full fast Q8 (~13 tok/s) and is the minimal-node
+> fast-decode sweet spot.** The fast-Q8 path needs ≥9 nodes (its bf16-promote load-peak, not the
+> steady arena, is the limiter).
+
+Above the weight floor, node count for **serving** is pinned by persistent KV (`int8-KV`/`DS4F_CP`
+cut it). MLA-KV min-nodes (weights EP-sharded + KV context-parallel):
+
+| pattern | ctx | M | min nodes (bf16-KV / int8-KV) |
+|---|---|---|---|
+| decode (short) | 4k | 8 | **8** fast-Q8 / 9 plain |
+| serve | 128k | 1 | **9** |
+| serve | 512k | 1 | **10** |
+| serve | 1M | 1 | **12 / 10** (or **8** with the `serve1m` CP-int4 cache stack, load-peak-tight) |
+| serve (batched) | 512k | 8 | **20 / 15** |
+| serve (batched) | 1M | 8 | **32 / 20** |
+
+- **decode-optimized (minimal nodes)** → **8 EP, `MODE=decode`** (fast Q8, TP_HEAD/EMBED); NUMA ~1.40×.
+  Watch the **load-peak** (`DS4F_WARM_RSS_TRACE=1`, `DS4F_WARM_MEMAVAIL_STOP_GB`) — 8 nodes is the edge;
+  fall back to **9 EP** for headroom.
+- **1M-ctx serving at minimal nodes** → **8 EP, `MODE=serve1m MAXPOS=1048576`**: the CP-sharded int4
+  Tier-B2 cache stack (`CP_SHARD/CP_IDX/INT4_CMP/IDX_INT4` + int8-KV) shards the long-ctx caches across
+  ranks independently of the fast Q8 dense path. Feasible but tight — 9 EP is the robust choice.
+- **prefill-optimized** → run **above** the floor (extra ranks = attention/expert-GEMM parallelism).
+
+`python3 a64fx/llm/ds4f_sim.py` prints these floors; `weight_floor_tiers()` / `min_nodes(ctx,M,kvb)`
+are importable.
+
+## Node configurations — prefill / decode / prefill+decode
+
+How to pick the node count per workload. Memory model (per node, ≤27 GB usable):
+`9.02 GB replicated (dense+embed) + 150.59/N GB fp4 experts (EP) + KV/N`. Weight floor **≥9 nodes**;
+staging `localtmp-size` must hold the per-node blob = `9.02 + 150.59/N` GB (11n → 22.7, 9n → 25.8;
+`pjsub_ds4f.sh` sets 48Gi). Comm is ~flat in N (the per-layer MoE all-reduce is straggler-sync-bound,
+not payload-bound — see the roofline / WS4), so **more nodes ≠ faster decode** — it's an efficiency and
+capacity axis, not a latency one.
+
+| pattern | node count | why | launcher |
+|---|---|---|---|
+| **decode-optimized** (chat, short ctx) | **at the floor: 11n** (9n possible, 11n = headroom) | fewest ranks = best efficiency; comm flat in N | `NODES=11 MODE=decode` |
+| **prefill-optimized** (long prompt / RAG ingest) | **above the floor: 12–24n** | extra ranks parallelize attention + expert GEMM (prefill is compute-bound) | `NODES=16 MODE=prefill PREFILL=2048` |
+| **prefill+decode serving** (full request) | **pinned by persistent KV** (min-nodes table) | KV grows with ctx×M; `DS4F_CP` shards it | `NODES=12 MODE=serve CP=1 MTP=1` |
+
+**Decode-optimized.** Run at the floor with `--preset decode` + `DS4F_NUMA=1`. Measured base decode
+10.16 tok/s @11n → ~12.8 with WS1/WS1b (mHC parallelize, landed) → target ~14 with the NUMA lever.
+Elapse: ~10 tok/s means a 64-token gen ≈ 7 s; size elapse to `prefill + max_gen` tokens.
+
+**Prefill-optimized.** Run above the floor; more ranks shorten time-to-first-token. Use
+`--prefill <long> --tierb2 1 --sparse 1` (the lightning indexer's O(topk) payoff kicks in at long ctx).
+Batched prefill ~56 tok/s → a 2048-token prompt ≈ 37 s. NOTE: 64 attention heads over 12 ranks is
+imbalanced (6-head ranks set the attention wall); going past ~24n needs head/query subpartitioning, not
+just more ranks.
+
+**Prefill+decode serving.** Node count is set by the persistent full-ctx KV, so read it off the
+min-nodes table above for the target (ctx, M). `DS4F_CP=1` (context-parallel KV) is mandatory at
+ctx ≥ 512k; `DS4F_INT8_KV=1` cuts ~⅓ of the nodes; `--mtp 1` (speculative decode, α≈76%) amortizes the
+per-layer straggler-sync 1/K. Example: 512k / M=8 → 20n (15n with int8-KV).
+
+### Agentic-coding config (12-node interactive alloc = 11 EP)
+
+The flagship interactive target: one `pjsub` **12-node** interactive alloc (shape 2×3×2), 1 node
+reserved for the claude/login control process → **11 EP nodes**. Real weights, the quality-preserving
+decode bundle, NUMA on, sized to fit. Launcher: **`run_ds4f_agentic_11n.sh`** (wraps
+`run_ds4f_gen_11n.sh`).
+
+```sh
+# inside the live 12-node alloc, from a64fx/llm:
+./run_ds4f_stage_11n.sh                                   # 1. stage once (~22.7 GB/node)
+PROMPT_FILE=task.txt ./run_ds4f_agentic_11n.sh            # 2. agentic coding run (<=64k ctx)
+PROMPT_FILE=task.txt KVBITS=8 MAX_NEW=1024 ./run_ds4f_agentic_11n.sh   # up to 128k ctx (int8 KV)
+```
+
+Config = `DS4F_REAL=1` + decode bundle (`FP8_BF16 Q8_DENSE TIERB2 MHC HC_PAR HC_RMSPAR`, ==
+`--preset decode`) + `DS4F_NUMA=1`. **Context ceiling @11 EP** — use the EMPIRICAL column, not the
+pure-memory model. `ds4f_sim.py` (weights 22.7 GB + MLA-latent KV only) says bf16 fits ~64k, but that
+**omits the Tier-B2 indexer + compressed-key caches + warm-fill scratch**, which the ops log shows OOM
+the alloc at ctx≈32k (safe ceiling **~16k**). ⚠️ **An OOM kills the whole allocation** (gotcha #6:
+SIGKILL degrades the node's PMIx daemon → every later launch dies pre-load; recovery = recycle the
+alloc + re-stage, ~21 min). **Do not probe past the safe ceiling on an alloc you want to keep.**
+
+| KV mode | knob | safe ctx (empirical) | MLA-KV model max | note |
+|---|---|---|---|---|
+| bf16 (default) | `KVBITS=16` | **~16k tokens** | ~64k | validated sweet spot ~10k |
+| int8 KV + cmp | `KVBITS=8` + `DS4F_INT8_CMP=1` | extends (unproven) | ~128k | halves KV *and* indexer cache |
+| context-parallel | `DS4F_CP=1` (`run_ds4f_longctx_11n.sh`) | **512k–1M** | — | the validated long-ctx path, ~0.8–1.2 tok/s @1M |
+
+Expected decode ≈ **12.8 tok/s** (WS1/WS1b landed) → **~14 tok/s** with the NUMA lever, degrading at
+longer context as attention + tb2prep grow per-position. Last real-weight validation: `rc=0`, NaNs=0,
+lockstep argmax, prefill 10.44 / decode 10.16 tok/s (pre-NUMA/pre-WS1) — see "Validated result".
+
+**Larger sibling.** V4-Pro (`ds4p`: 61 L / hidden 7168 / 384 experts, ~805 GB) is a separate, much
+bigger config (weight floor ~54n+) with its own harness — the numbers here are V4-Flash only.
+
+## HTTP serving (llama-server-like) — `run_ds4f_serve_11n.sh` (2026-07)
+
+The EP runner has a persistent **`DS4F_SERVE`** loop: load the model **once** on 11 EP nodes, then
+answer many requests (instead of reloading ~3.5 min per generation). A small python HTTP frontend
+(`ds4f_serve.py`) runs on the control node and drives the runner over shared-FS request/response
+files — all 11 ranks read the same request → lockstep, no broadcast.
+
+```sh
+# inside the live 12-node alloc, from a64fx/llm (weights already staged):
+PORT=8080 ./run_ds4f_serve_11n.sh                       # default ~16k ctx, fast decode
+CTX=65536 ./run_ds4f_serve_11n.sh                       # longer single context (compressed caches)
+CTX=1048576 CP=1 DS4F_SERVE_SLOTS=4 ./run_ds4f_serve_11n.sh   # extreme ctx (TP+CP) + 4 slots
+# then, from anywhere that can reach the node:
+curl -s localhost:8080/v1/completions -d '{"prompt":"def quicksort(a):","max_tokens":128}'
+curl -s localhost:8080/v1/completions -d '{"prompt":"...","max_tokens":128,
+  "temperature":0.8,"top_p":0.95,"top_k":40,"repeat_penalty":1.1,"seed":42}'   # sampling
+```
+
+Endpoints: `POST /v1/completions` (OpenAI shape), `POST /completion` (llama.cpp shape), `GET /health`.
+
+**Features** (all validated real-weight 11n; greedy is byte-reproducible):
+
+| Feature | Knob / request field | What it does | Measured |
+|---|---|---|---|
+| **Sampling** | `temperature` (≤0=greedy), `top_p`, `top_k`, `presence_penalty`, `repeat_penalty`, `seed` | temp/top-k/top-p + penalties over the last 64 tokens; shared-seed SplitMix64 → all ranks draw the same token (lockstep) | greedy deterministic; same seed reproducible; ~+48 ms/tok (full-vocab sort) |
+| **Longer single context** | `CTX=<tokens>` | >16k auto-enables compressed ctx-caches (int8 KV/cmp, int4 cmp/idx) → ~2 KB/pos, keeps fast MHC decode; `CP=1` adds TP+CP sharding (→ millions) | MAXPOS=65536 arena **flat** vs 16k; decode 11.6 tok/s @ctx3246 |
+| **Prefix cache** | `DS4F_SERVE_PREFIX_CACHE` (default on) | a request that EXTENDS the cached sequence skips re-prefilling the shared prefix (append only) | 246-tok turn, 237 cached → **1.94s vs 23.2s = 12× TTFT**, byte-identical |
+| **Multi-slot** | `DS4F_SERVE_SLOTS=N`, request `slot` | N independent conversations; a `slot` switch snapshots the outgoing / restores the incoming caches (`ds4f_ctx_snap`) | independent + coherent; switch **~9.5 ms @256 tok** (see below) |
+| **Persistent KV save/load** | `cache_path` + `cache_load` / `cache_save` | persist a context's full cache state to disk (magic + cfg-hash guard, atomic) and restore later | disk round-trip **byte-identical** to live cache |
+| **System-prompt cache** | `DS4F_SERVE_SYSCACHE=path` | preload a persisted context into slot 0 at startup → every conversation starts pre-prefilled, survives restarts | 197-tok sys prompt: prefill only the user turn, **2.2s vs 17s = ~8× TTFT** |
+| **Per-rank shards (CP)** | (automatic under `CP=1`) | under context-parallel the sharded caches are saved/loaded as one `<path>.rankNN` per node | 11 distinct shards, load byte-identical under TP+CP |
+
+Build a system-prompt cache once with a `cache_save` request (`max_tokens:0` = prefill-only), then
+launch with `DS4F_SERVE_SYSCACHE` pointing at it. Caveat: the on-disk cfg-hash pins the cache-mode
+layout (int8/int4/MAXPOS/CP/rank) — a blob is refused (not silently corrupted) by a differently
+configured runner. TTFT note: under the long-ctx (int8-KV) path prefill is token-by-token
+(~12.5 tok/s), so a *cold* multi-thousand-token prompt is minutes to first token — which is exactly
+what the prefix / system-prompt / KV-save caches eliminate on every subsequent turn.
+
+**Multi-slot context-switch overhead** (`bench_slot_switch.sh`, rank-0 timer on the two snapshot
+memcpys). Measured real-weight 11n at ctx 256 (reproduced across MAXPOS 8192 & 65536 — identical,
+confirming the snapshot copies only the *written* region, not the arena): **save 5.37 ms + restore
+4.10 ms = ~9.5 ms**, blob **29.9 MB/slot** (single-thread ~6–7 GB/s incl. the `realloc`). The blob is
+a fixed part (~24 MB: int8 `kv_calbuf` CAL=256 + compressor/indexer ring states + scales) plus a
+growing part (~24 KB/token: int8 `kv_q` 512 B/tok/layer×43 + int4 cmp/idx), so switch(L) ≈
+24 MB + L·24 KB → ~15 ms @1k, ~37 ms @4k, ~68 ms @8k. Cheap: at ctx 256 a switch is ~2400× cheaper
+than the ~23 s re-prefill it replaces, and ≈0.1 decode-token of time; only at multi-thousand-token
+contexts does it reach tens of ms (still a fraction of one decode step). NOTE: the run couldn't
+extend past 256 tokens — token-by-token prefills of ≳512 tok intermittently trip a uTofu collective
+timeout (`tp_ar bcast timeout … want=N got=N-1` → `FATAL: barrier release`) on this alloc; the larger
+rows are the linear model, not measured.
+
+**Chunked-prefill checkpointing** (`prefill_checkpoint.sh`) — the fix for that comm timeout. Root
+cause (see "uTofu comm" below): `want` in the timeout is the cumulative reduce count, and deaths
+occur at wildly different counts (69 vs 514 tokens) ⇒ a **probabilistic per-Put loss with no
+retransmit** (`exit(1)` after 60 s), so a token-by-token prefill firing ~43 reduces/token is a coin
+flip over its ~10⁴–10⁵ reduces. The driver splits a long prompt into M-token chunks, `cache_save`-ing
+after each (the prefix cache prefills only the new M tokens ⇒ M·43 reduces/chunk ⇒ low per-chunk
+loss). If the runner dies mid-chunk it relaunches with `DS4F_SERVE_SYSCACHE=<ckpt>` (restores all
+checkpointed chunks), and retries **only** the failed chunk — so a long prefill always makes forward
+progress and a completed chunk is never redone. Reuses the byte-exact KV save/load already validated.
+
+**KV precision — int8 vs bf16 accuracy** (`bench_kv_accuracy.sh`, greedy A/B, `DS4F_INT8_KV` the only
+difference, otherwise the production config: FP8→Q8 dense, int4 cmp/idx). Real-weight 11n, 3 diverse
+prompts × 64 tokens: **100 % top-1 token agreement, zero divergences** — int8 KV (S5 per-channel,
+~0.2–0.5 % intrinsic latent rms) is **argmax-lossless** vs bf16 KV here, so the −0.35 GB/16k (linear
+to ~5.7 GB/256k) it saves is free at the output level. (Matches the earlier gen A/B; the model's KV
+cache is bf16 — there is no separate fp16 KV mode.)
+
+## uTofu all-reduce reliability — `TP_AR_ACK` (2026-07)
+
+**Root cause of the prefill comm timeout.** The `tp_ar bcast timeout … want=N got=N-1` death is a
+**probabilistic lost Put with no retransmit**: the trailer-poll all-reduce spins 60 s then `exit(1)`,
+and `want` is the cumulative reduce count — observed deaths at wildly different counts (69 vs 514
+tokens) confirm it's random per-Put loss, not a fixed threshold. A token-by-token prefill fires ~43
+reduces/token, so over its ~10⁴–10⁵ reduces a single loss becomes likely. (Two mitigations already
+shipped: `DS4F_PREFILL_GEMM` batches ~K× fewer reduces; `prefill_checkpoint.sh` checkpoints so a death
+costs only the current chunk.)
+
+**Ack/retransmit layer** (`tp_allreduce.h`, `TP_AR_ACK=1`, **default off** → the default path is
+byte-for-byte unchanged). The receiver Puts an ack into the sender's per-peer ack slot after reading
+the payload; the sender retransmits the outstanding send every `TP_AR_ACK_RTT` (1 ms) up to
+`TP_AR_ACK_RETX` (64) times, then proceeds optimistically (the payload is idempotent) — so a lost Put
+is recovered in ~ms instead of a 60 s fatal spin. Two design points, both found by the standalone
+test: **send is non-blocking** (recursive doubling has both partners send before either recvs, so a
+send that blocked on the ack would deadlock/crawl), and the retransmit runs **from inside the
+recv-wait loop** too (if both directions of a doubling pair drop, both ranks block in recv and only a
+recv-loop retransmit — not the after-recv confirm — breaks it). Ack Puts are never drop-injected.
+
+**Validated 11n.** Standalone `tp_ar_ack_test` (exact integer sum+max reduce, direct arithmetic check
++ `TP_AR_DROP=N` loss injection): no-drop 22 500 reduces 0-mismatch @ **21 143 reduce/s**; DROP=50 and
+DROP=20 (1-in-20 heavy loss) 0-mismatch, recovers every loss (rtt sweep 20 ms→1 ms = **19× faster
+recovery**, no no-loss penalty). End-to-end: the full runner with `TP_AR_ACK=1 TP_AR_DROP=50` generates
+coherent, correct output at normal decode speed (8.8–10 tok/s). *Prototype caveat:* not yet hardened
+against cross-call reordering under simultaneous payload+ack loss (~p⁹, astronomically rare). Note: the
+Makefile doesn't track `tp_allreduce.h`, so `rm build/ds4f_ep_runner` before rebuilding to pick up
+ack changes in the runner.
+
 ## Files (branch `ds4f`)
 
 | File | Role |
@@ -40,6 +379,14 @@ RSS 21.81 GB/node. Per-config numbers are in Steps 2–2d.
 | `a64fx/llm/run_ds4f_stage_11n.sh` | stage launcher (mpiexec, PMIX_RANK self-ID) |
 | `a64fx/llm/run_ds4f_11n.sh` | run launcher (vcoord + topo + mpiexec) |
 | `a64fx/llm/run_ds4f_longctx_11n.sh` | long-ctx Tier-B2 bench wrapper (ctx-warm + sentinel) |
+| `a64fx/llm/run_ds4f_serve_11n.sh` | HTTP serving launcher (persistent runner + `ds4f_serve.py`) |
+| `a64fx/llm/ds4f_serve.py` | control-node HTTP frontend (OpenAI/llama.cpp shapes) |
+| `a64fx/llm/validate_prefix_cache.sh`, `validate_ctx_features.sh`, `validate_cp_shards.sh` | serving A/B validators |
+| `a64fx/llm/prefill_checkpoint.sh` | chunked-prefill checkpoint driver (comm-timeout fix, resumable) |
+| `a64fx/llm/bench_kv_accuracy.sh` + `bench_kv_accuracy_diff.py` | int8-vs-bf16 KV greedy accuracy A/B |
+| `a64fx/llm/bench_slot_switch.sh` | multi-slot context-switch overhead timer |
+| `a64fx/utofu-tests/tp_allreduce.h` | EP all-reduce (sum/max/argmax) + `TP_AR_ACK` ack/retransmit layer |
+| `a64fx/utofu-tests/tp_ar_ack_test.c` | standalone loss-injection test for the ack layer (`TP_AR_DROP`) |
 | `a64fx/utofu-tests/tofu_topo_helper` | MPI program that writes `tofu_topo.txt` (rank→coords) |
 
 Build is native `fcc`/`FCC` (NOT `fccpx`/`FCCpx`); binaries run directly, **no `pjsub`**
@@ -393,6 +740,11 @@ decode M>1 to amortize the 43 per-layer all-reduces.
 | `DS4F_BF16_PV` | (auto) | with `DS4F_FP8_BF16=1`: empty = pair-interleaved pv (fastest); `0` = plain bf16; `1` = force pv |
 | `DS4F_MXFP4_GEMM_TILE` | 0 (auto→16 in batched prefill) | M-threshold ≥ which the MXFP4 (expert/dense) **prefill** GEMM tile-dequants nibbles→bf16 once and reuses across M (1.38–1.72× @M≥16, lossless); `0` = off (svtbl per-pair, best at M≤4). **Auto-set to 16 when batched prefill is active (`ds4f_ep_runner.c`); explicit value overrides. Real-weight 11n: +7.9% prefill, token-exact (Step 2o)** |
 | `DS4F_MHC` | 0 | 1 = exact manifold-constrained hyper-connections (`hc_mult=4`). **REQUIRED for coherent real generation** (Step 2e); gen wrapper defaults it on |
+| `DS4F_PREFILL_GEMM` / `DS4F_PREFILL_K` | 0 / 32 | 1 = batch gen prefill through the MHC+Tier-B2 verify path in chunks of K≤32 (comm ÷K, dense→M=K GEMM, **indexer qproj batched to 1 GEMM**). **+65% prefill** (13.3→21.9 tok/s), COHERENT not bit-identical (GEMM reassoc); opt-in, not-with-MTP. Prints tb2+attn breakdown under `DS4F_PROF`. See Decode-perf wins |
+| `DS4F_FLAGBAR` | **1** | per-worker cache-line completion-flag pool barrier (vs the shared-counter barrier's 47-way ping-pong). **Bit-identical, +8% decode & prefill** (M=1 fires ~900 tiny dispatches/tok). See Decode-perf wins |
+| `DS4F_ATTN_GEMM` | **1** | 8-head-blocked Tier-B2 decode attention: each MLA `kv[j]` loaded once, reused across 8 query heads (score + value). **Bit-identical, attn −50%, +6.6% decode (+8.3% @5k, grows w/ctx)**. Falls back to per-head for exotic quant (int8/int4 KV/cmp, CP) |
+| `DS4F_IDX_GEMM` | **1** | 8-index-head-blocked indexer scan (`idxsc8`) — ILP hides the per-head svaddv latency. Bit-identical, +16% on `tb2scan` (O(T), compounds at long-ctx CP) |
+| `DS4F_IDX_INT8W` | 0 | **LOSSY, opt-in**: int8 W8A8 the indexer q-projection weight (`idx_wq_b`, K=1024, byte-bound). ~2× on `tb2qproj`, **+4.1% decode @5k**. q drives only top-k *selection* (error-tolerant); quality-gated (coherent, NaN=0). **Only helps the small qproj matvec — NOT the compressor (K=4096, not byte-bound)** |
 | `DS4F_PROMPT_IDS` / `DS4F_GEN_OUT` / `DS4F_MAX_NEW` | — | gen-mode (Step 2e): prompt id file in, generated id file out, greedy decode budget (stops on eos=1) |
 | `DS4F_TF_CHECK` | 0 | 1 = teacher-forcing next-token accuracy gate (~0 % = broken forward, ~50–80 % = working); the cheap reference-free correctness check |
 | `DS4F_STAGE_FLUSH_GB` | 2 | stager HBM dirty-cache flush granularity |
@@ -623,12 +975,530 @@ Optimized decode @ctx10240 = **13.03 tok/s = 76.7 ms/tok**. Per-phase (Step 2l b
 - **≥20 tok/s IS achievable — via speculative decode (the math):** draft K + verify-in-one-pass (M=K). At K≈3 accepted: comm 12.7→**4.2** ms/tok (÷3), the 27.5 ms weight matvecs become an M=3 GEMM (dequant amortized ~1.4× ⇒ ≈**12.8** ms/tok), attn+tb2 stay 31.3 (per-position) ⇒ **≈48 ms = ~20.7 tok/s**. Batched **multi-sequence** decode (B=8–32) reaches similar/higher **aggregate throughput** (comm+matvec fully amortize; per-sequence attn/tb2 scale with B). Both need packed-B GEMM (note the known A64FX batched-prefill regression, `project_batched_prefill`).
 - **Ceiling ~32 tok/s** (the per-position attn+tb2 floor). To beat it: cut attn (near floor already) or tb2's O(T) scan — which is exactly what **CP shards at high ctx**, so CP also *preserves* ~20–30 tok/s at 1M+ where decode is otherwise ~1 tok/s (scan-bound). **Net: spec/batched decode gets to ~20–30 tok/s; CP keeps it there at long ctx.**
 
+### Decode-perf wins — LANDED on `glm5-2` (2026-07): 12.26 → 14.13 tok/s (+15.3%), all bit-identical
+
+Real-weight 11n A/B (agentic `--preset decode`, ctx 1759 unless noted). Each lever measured, the wins default-on; the dead ends measured-and-reverted (the discipline: no lever ships without a same-config A/B).
+
+| commit | lever | effect | default |
+|---|---|---|---|
+| `691be067` | **`DS4F_FLAGBAR`** per-worker flag barrier + `ds4f_row_slice` Q8_PV fix | **+8% decode & prefill**, bit-identical | on |
+| `c303fcaa` | **`DS4F_ATTN_GEMM`** 8-head KV-reuse attention | **+6.6% decode, attn −50%** (+8.3% @ctx5026, grows w/ctx), bit-identical | on |
+| `54476f06` | verify-path KV-reuse (spec/GEMM-decode) | verify path only (+5% GEMM-decode) | on |
+| `6cf899b8` | **`DS4F_IDX_GEMM`** 8-head indexer scan | +16% `tb2scan` (O(T), long-ctx lever), bit-identical | on |
+| `1c515aa4` | **`DS4F_IDX_INT8W`** int8 qproj weight | **+4.1% @ctx5026**, LOSSY, quality-gate-passed | **off** (opt-in) |
+
+**Prefill (`9504cd69` + `4fbe5078`, opt-in +74%: 13.28 → 23.08 tok/s):** production gen prefill (MHC+Tier-B2) ran token-by-token because the batched `ds4f_forward` GEMM is die-guarded under MHC/Tier-B2. `DS4F_PREFILL_GEMM` routes it through `ds4f_forward_verify` (the MHC+Tier-B2 batched forward built for spec decode — now Q8-correct + ATTN_GEMM'd) in chunks of K≤32: (1) the per-layer EP all-reduce fires once per K tokens (comm 16.5→7.4%, ar_calls 216k→2.4k) and the dense projections become an M=K GEMM → **17.72 tok/s**; (2) the biggest per-position tb2 cost, the indexer q-projection (`idx_wq_b @ q_lat`, 7.5 ms/tok as K matvecs), is batched to **one M=K GEMM** (weight streams once/chunk) via a `q_pre` injection into `index_step` — also fixes a latent stale-`s_qlat` in the verify → **21.89 tok/s (+23%)**. Coherent (GEMM reassoc), NaN=0. Batched-prefill floor at ctx1759 (45.8 ms/tok): scan 3.66 / attn 3.25 / lcmp 2.39 ms + comm 4 + batched dense GEMM + **per-position mHC (batched, commit 6080ceee)**; remaining floor = scan/attn/lcmp (per-query or sequential, hard). The batched-verify path (which *failed* as a decode/spec lever on accept rate) is the prefill workhorse. **Generalizable: batch any per-position matvec whose weight is shared across positions (qproj) into one M=K GEMM.**
+
+**Longer-context end-to-end validation (real-weight 11n, ctx 7175 prompt + 128 gen, `DS4F_PREFILL_GEMM=1 K=32`):** prefill **21.99 tok/s** (45.5 ms/tok, comm 8.6%), decode **13.13 tok/s** (76.2 ms/tok, comm 15.5%), `rc=0`, **NaNs=0**, RSS 21.94 GB, wall 538 s. Lockstep confirmed (all 11 ranks argmax 9047 prefill / 16 decode); output coherent (continued a benchmark table with correct columns + plausible numbers). Prefill holds ~+65% over token-by-token at 7k (per-position attn/scan floor grows slightly with ctx); decode ~13 (indexer scan + attn grow with T, the expected long-ctx trend).
+
+**The key insight for decode — MLA has 1 KV head, so decode attention re-reads each `kv[j]` latent 64× (once per query head)**, running at ~0.5% of compute peak (L2-read-bound, NOT thread-bound — a balanced head-split gave *zero* gain, which is what pointed to the real fix). `DS4F_ATTN_GEMM` blocks 8 heads so each `kv[j]` is loaded once and reused across 8 heads (score dots + value axpy) → 8× fewer L2 reads. Same pattern applies to the batched prefill attention (already HBLK=8, `ds4f_attn_prefill_worker`) and the verify path.
+
+**Measured & REVERTED dead ends (documented so they're not re-tried):**
+- *Speculative MTP decode* — mechanism works (comm 16.5→3.4% via 1 reduce/2 tok) but net LOSS: batched-K=2-verify cost C₂/C₁≈1.52 needs α>0.76, MTP α is only ~68%; and the real accept rate collapses to 27% (batched verify drifts from the matvec draft). Not economical without a cheaper batched verify (needs batched attn/tb2) + higher α.
+- *Attention SW-prefetch* — −2%: the compressed cache is L2-resident at agentic ctx (index_topk·kv_lora·4B ≈ 0.5–1 MB < 8 MB CMG L2), no HBM miss to hide.
+- *Balanced head-split attention* — flat: attn is NOT thread-bound (this refutation led to the KV-reuse win).
+- *Indexer matvec 8-row / widen-zip* — the indexer qproj is a small (K=1024) matvec that peaks at 24 threads and regresses at 48 (widen_bench); zip==lsl (widen isn't the bottleneck); only **fewer bytes** (int8) help → `DS4F_IDX_INT8W`.
+- *int8 compressor* (`tb2lcmp`, K=4096) — quality gate passed but NO speedup (K=4096 already pipelines across 48t; not byte-bound). **General rule: int8 W8A8 helps only SMALL matvecs (K≲1024).**
+
+The remaining decode cost is genuinely hard: **comm** (straggler-sync, only batched/spec decode amortizes it), the **indexer** (matvecs mostly irreducible, top-k O(T·log k) heap-optimized, scan now blocked), and **dense matvecs** (already near BW). Diagnostics: `DS4F_PROF=1` prints the per-phase decode breakdown; the widen microbench is `scratchpad/widen_bench.c` (throwaway).
+
 ### MTP scaffold + spec-decode plan (commit `09aa458`)
 The model ships an MTP module (`config num_nextn_predict_layers=1`, tensors `mtp.0.*`) — a full Block (MLA attn + 256-expert MoE, **no** tier-B2 compressor) + the fusion `x' = e_proj(enorm(embed(next_id))) + h_proj(hnorm(x))` → block → **shared** head. It was unloaded (`n_layers=43` stops before it; stager skipped `mtp.*`). **Scaffolded (compile-validated; env-blocked for run-validation):** `DS4F_STAGE_MTP` ungates staging (experts EP-sharded), `DS4F_MTP` loads it (`m->mtp` + `mtp_*` fusion tensors), `ds4f_mtp_predict()` is a documented STUB. Off-path byte-identical (regression unchanged).
 **Follow-on (focused fresh-alloc effort), in order:** (1) extract the M=1 block-forward so `ds4f_mtp_predict` can run (fusion → `m->mtp` block → `m->head` with `mtp_hc_*`/`mtp_norm`); validate the MTP head's next-token accuracy vs the main model. (2) Draft/verify/accept loop: MTP drafts K, main model verifies **M=K** in one pass, accept the longest matching prefix, **roll back rejected tokens' KV** (ring + cmp/idx append). (3) The verify needs the **M=K batched-decode rework** of the per-token path (attn/tb2/KV-append/CP-gather) — the dominant effort. **Caveat (decide target ctx first):** spec/batched amortizes comm+dense ⇒ a **moderate-ctx win (~10K–1M)**; at 12M the per-position O(T) scan dominates and does **not** amortize (K draft tokens = K×O(T) scan), so it's **not a 12M lever** — there the lever is a cheaper/coarser scan.
 
+**★ MEASURED on `glm5-2` (2026-07) — gamma=1 spec decode is a NET LOSS vs the optimized decode.** Real-weight 11n, bf16 dense (`DS4F_FP8_BF16=1`, MHC+Tier-B2, ctx≈15+64), `DS4F_MTP=1 DS4F_SPEC=1 DS4F_SPEC_BATCH=1`: MTP accept **75%** (27/9), **1.391 tok/forward** (46 fwds/64 tok), output coherent — but **decode 10.22 tok/s vs 13.26 baseline (−23%)**. Root cause: the memory's old 1.21× spec win was vs an **8.69 tok/s comm-DOMINATED** decode (13.1 ms/tok comm); the landed decode levers (FLAGBAR/ATTN_GEMM/IDX_GEMM/NUMA) since made plain decode **13.26 tok/s with comm only ~16%**, so (a) there's little comm left to amortize and (b) the verify's **per-position tb2/attn scales with K and never amortizes**, while the baseline gets the optimized matvec path the verify GEMM doesn't. gamma≥2 wouldn't rescue it at short ctx (K× the per-position tb2/attn) and is *worse* at long ctx (K× the growing O(T) scan). **Conclusion: MTP spec decode is dominated by the optimized single-stream decode — not a decode-speed lever here.** The MTP module + `ds4f_mtp_predict` remain useful for a *throughput* (batched multi-request) path, not single-stream speed.
+
+### 2026-07-10 session (alloc 49500509, 12-node interactive): prefill 23.3 → 29.3+, decode 13.9 → 15.6 tok/s
+
+Real-weight 11n A/B ladder (2409-tok prompt, MAX_NEW=64, gen config = REAL+FP8_BF16+Q8_DENSE+TIERB2+MHC+
+HC_PAR+HC_RMSPAR+`DS4F_PREFILL_GEMM=1`; per-lever isolated runs). New decode/prefill sub-timers:
+`mhc_pre/mhc_post/mhc_cpy/comm` (DS4F_NPHASE 20→24) + a per-phase PREFILL profile print in the runner.
+
+| run | change | prefill tok/s | decode tok/s | verdict |
+|---|---|---|---|---|
+| A | baseline (K=32) | 23.30 | 13.90 | decode: other 22.7 = comm 12.0 + **mHC 10.7**; dense 22.2; tb2 11.8 |
+| B | +`DS4F_PF_TP=1` | 24.72 | 13.9 | verify compute-shard (below); +1 [K,C] reduce ate most of it at K=32 |
+| C | +`DS4F_HC_SVE=1` | 25.89 | **15.56** | **mhc_pre 10.1→2.67 ms** (SVE hcmix + SVE sinkhorn + fused resid) |
+| D | +`DS4F_Q8_LOCAL=1` | 25.8 | 15.65 | **NEUTRAL — REFUTED**: reader-local mbind of the q8 buffers changes nothing (placement is not the dense-matvec lever; joins prefetch in the refuted pile) |
+| E | +`DS4F_Q8_GEMM_TILE=16` | 25.5 | 15.63 | **NEUTRAL on speed** (verify GEMMs not GEMM-rate-bound at K=32); *numerics improve* (W8A16-like, relL2 8.9e-3→5.0e-3) |
+| G | +SVE batched mHC, K=64 | **29.32** | 15.60 | prefill mhc_pre 4.97→1.41; comm 5.9→5.5; **tb2prep 11.3 (33%) is now the prefill wall** |
+| H | +`TP_AR_A2A=1`, K=128 | 28.74 | 15.60 | **a2a NEUTRAL** (comm is skew, not exchange latency); K=128 < K=64 (payload-bound) |
+| I | +`TP_HEAD/TP_EMBED/MV_FUSE`, K=64 | **29.50** | **16.11** | head 2.0→argmax-merge; RSS 21.9→**20.0 GB** |
+| J | +`DS4F_CMP_LOCAL` (2026-07-10b, fresh alloc 49508574) | 29.19 | **17.35** | cmp_matvec 4.6→1.5 ms, tb2lcmp 5.2→2.8; **BYTE-IDENTICAL**; the shipped config |
+
+**Session net: prefill 23.30 → ~29.5 tok/s (+27%), decode 13.90 → 17.35 (+25%), RSS −1.3 GB** — all
+real-weight 11n, NaN=0, lockstep. Launcher defaults (`run_ds4f_agentic_11n.sh`, `run_ds4f_serve_11n.sh`
+fast path): `DS4F_HC_SVE=1 DS4F_PF_TP=1 DS4F_PREFILL_K=64 DS4F_MV_FUSE=1 DS4F_CMP_LOCAL=1`
+(+`TP_HEAD/TP_EMBED=1` in serve).
+
+**Next-session decode levers** (post-CMP_LOCAL decode 57.6 ms = comm 12.4 + tb2prep 7.5 + o_proj 8.7 +
+qkv 6.8 + shared 5.7 + attn 5.2 + experts 4.7 + mHC 3.1 + head + misc):
+1. **per-row-scale int8 dense rep — REFUTED at the bench** (see below, "per-row-scale int8 dense").
+   v3 fast-but-lossy (1.38×, spike relL2 0.106 vs 0.030), v4 safe-but-no-gain. The int8 dense decode
+   kernel is at its practical ceiling for the model's massive-activation fidelity.
+2. **tb2lcmp — the reader-local win LANDED (`DS4F_CMP_LOCAL`, commit `bd742c0d`, decode +6.6%,
+   BIT-EXACT).** Attribution (`tools/cmp_bench.c` + `g_cmp_mv_secs`): tb2lcmp's 5.2 ms is 89% the
+   compressor matvec (4.6 ms in-model), which is **BW-bound AND NUMA-interleave-penalized** — the
+   ds4f_cmpmv_bf16 matvec is small-W (1024/256 rows), under-saturating, and under MPOL_INTERLEAVE
+   streams cross-CMG at ~150 GB/s. Reader-local page placement (`ds4f_cmp_place_local`: reader-rowsplit
+   first-touch + `mbind(MPOL_LOCAL)`) recovered it to ~450 GB/s effective → cmp_matvec 4.6→1.5 ms.
+   *(The initial "bounded ~1 ms, not pursued" call was WRONG — I mis-analogized to the refuted DS4F_Q8_LOCAL,
+   forgetting the compressor is BW-bound while the dense matvec is issue-bound; the g_cmp_mv split at the
+   real run showed the NUMA penalty and the reader-local fix delivered 3× the estimate.)* Residual: the
+   ~0.6 ms serial softmax tail (per-`e`-independent → parallelizable, bit-exact) is the only bit left,
+   ~+1% — low value.
+3. **batched decode serve integration** (below) — comm+dense amortize only there. **The only material
+   single-node lever left:** v3 int8 (refuted, bench), tb2lcmp (LANDED via CMP_LOCAL +6.6%), and comm
+   (architectural) confirm single-stream decode at ~17.4 tok/s is near its floor — the remaining
+   throughput is batched/serve (comm+dense amortize across M).
+
+**★ per-row-scale int8 dense (lever 1) — REFUTED at the bench (2026-07-10, `tools/q8_mv_bw.c`).** The
+pinned ~390 Gmac/s sdot ceiling is the per-64-block scale APPLICATION (8 fp16→f32 + 8 svcvt + 8 svmla
+*per block*). Two prototypes:
+- **v3** (per-row weight scale + **per-token** activation scale + full-int32 K-accumulation, no per-block
+  scale ops in the inner loop): **538 Gmac/s = 1.38×** — the speed is real and structural. BUT the
+  per-token activation scale is too lossy: a spike test (one channel N× the rest) gives relL2
+  **0.106 vs production 0.030 at N=100** — the per-token scale zeros the O(1) channels while they still
+  contribute ~10% of the output. Real RMSNorm'd dense inputs plausibly hit this 10–1000× "danger band"
+  (residual-stream massive activations, the same ones that force bf16-not-fp16 KV). A quality gamble.
+- **v4** (per-row weight scale + **per-64-block** activation scale, the SAFE version): **389 Gmac/s =
+  ZERO speed win** (identical to production) — because the per-block svcvt+svmla is the actual
+  bottleneck; simplifying only the *weight* scale buys nothing. Accuracy exactly matches production at
+  every spike.
+So the safe path gives no speed and the fast path needs an activation-fidelity gamble the spike test
+flags as real → **not wired** (bench-level refutation, no alloc run, same discipline as the prefetch/OP
+refutations). The int8 dense decode kernel is at its practical ceiling for the per-block activation
+fidelity the model's massive-activation channels require.
+
+**Batched decode re-measured (dbbench, bf16 dense + PF_TP + HC_SVE + TP_HEAD/EMBED, ND=24):**
+aggregate tok/s M=1/2/4/8/16 = **13.0 / 18.5 / 24.4 / 29.0 / 32.4** — vs the prior 9.3/14.1/19.3/23.0/25.7:
+**+26% at M=16** (and M=1-via-verify 9.3→13.0, +40%). PF_TP shards the batch-path shared GEMM
+(~1 ms/step flat at every M); the per-M dominators are now **experts 94.5 ms/step @M=16** (5.9/seq,
+MoE top-6 barely shares experts) and **tb2prep 124.9** (7.8/seq per-position). Serve continuous-batching
+integration (P2 build plan) is the remaining wiring to expose this as multi-request throughput.
+
+**Landed (this session, uncommitted):**
+- **`DS4F_HC_SVE`** (default off): SVE half-row hcmix (110→~35 µs/call, reassoc/coherent-class), SVE
+  sinkhorn divisions (24→5 µs, **bit-exact**, `tools/mhc_bench.c` 16/16 comb bit-equal), resid-copy fused
+  into the hccol collapse (bit-exact), SVE `hcmix_b` + pooled per-position sinkhorns in `hc_pre_batch`
+  (bit-exact pooling). Decode +12%; gen coherent, NaN=0, lockstep (ids diverge from baseline = reassoc class).
+- **`DS4F_PF_TP`** (default off): memory-neutral COMPUTE-shard of the verify-path shared+o-proj GEMMs by
+  rank-slicing the REPLICATED tensors (row_slice at GEMM time; decode path untouched). Q8-safe per
+  `tools/ws7_tp_q8_test.c`; 64-aligned contraction boundaries via new `DS4F_TP_DENSE_ALIGN` (fixes a real
+  Q8 zero-pad straddle bug in the load-time TP_SHARED/TP_OPROJ alignment: relL2 1.5e-3 → 1.5e-7).
+- **WS7 RECLASSIFIED — no kernel bug** (`tools/ws7_tp_q8_test.c`): TP_ATTN×Q8 partial-sum error is
+  fp-reassociation (relL2 1.5e-7, same class as bf16's 2.8e-7 which is also NOT bitwise); the 11n bf16
+  "64/64 identical" was token-level luck. Row-shard+full-input = BIT-EXACT (8192/8192). Gate TP×Q8 changes
+  on coherence, never token-identity. WS6 confirmed fixed in-tree (fp32 xscale; stress NaN=0, 205/205).
+- **`DS4F_Q8_GEMM_TILE`** (M-threshold, default off): int8→bf16-pv fused tile-dequant GEMM. Found: the Q8
+  svdot GEMM is **FLAT ~104-136 Gmac/s M=1→64** (never amortizes, like MXFP4 svtbl); the tile removes the
+  activation quantization (more accurate) but was speed-NEUTRAL in the verify path (not GEMM-rate-bound there).
+- **`TP_AR_A2A`** (`tp_allreduce.h`, default off): direct all-to-all sum for count ≤ `TP_AR_A2A_MAX` (8192)
+  — one detection wait instead of ~5 sequential exchanges; rank-order fold = bitwise-identical across ranks;
+  dedicated 2-generation slot region. Integer-exact validated 11n (`tp_ar_ack_test` sum_mism=0). Microbench:
+  a2a 50.8 vs doubling 40.8 µs synchronized. **Run H (production A/B): NEUTRAL — decode comm 12.1 ms
+  unchanged.** Verdict: decode "comm" is straggler-skew + floor, not exchange-count latency; a2a does not
+  absorb skew (the slowest sender gates either way). D3 closed: the ~12 ms is architectural at M=1 (only
+  batched decode amortizes it). K=128 prefill also NEUTRAL-to-worse vs K=64 (payload-bound reduces): **K=64
+  is the chunk sweet spot.**
+- **int8-sdot matvec ceiling PINNED (`tools/q8_mv_bw.c`)**: reader-local first-touch pool, production
+  dispatch: **bf16-pv 735 GB/s (0.091 ms) vs q8-sdot 402 GB/s at the SAME 0.086 ms wall** — the sdot
+  kernel is ISSUE-bound ~390 Gmac/s (half the bytes, zero time win); production decode dense is AT this
+  kernel ceiling, so placement levers (Q8_LOCAL, prefetch) are structurally neutral. A `svmla_lane`
+  restructure (v2, bit-exact) measured 2× SLOWER — refuted. The real ≥1.5× dense-decode lever is a
+  **per-row-scale int8 rep** (full-int32 K-accumulation: 17 vs 41 instrs/block; no overflow at K=4096) —
+  LOSSY (coarser than per-64), needs repack + kernel + quality gate. Follow-on work.
+- **Fixes**: `ot[8]` out_tok overrun at K>8 in the gen prefill loop (→ `ot[128]`); `DS4F_PREFILL_K` clamp
+  32→128 (`pa[128]` sinkhorn arrays + K>128 abort in `ds4f_forward_verify`); `DS4F_MAX_MTILE` unchanged.
+- TP_HEAD/TP_EMBED are set by `--preset decode` but NOT by the `run_ds4f_gen_11n.sh` env path — the gen
+  config leaves the +2.3% (and −1.9 GB) on the table; head = 2.0 ms of the 64 ms decode.
+
+**Prefill wall after G (34.1 ms/tok):** tb2prep 11.3 (scan 2.7 + attn 3.6 + lcmp 2.4 + glue) per-position,
+comm 5.5 (payload-bound at K=64), experts 5.4 (svtbl floor at per-expert M≈1.5), qkv 4.2 (replicated wq_b),
+o_proj 3.2 (replicated wo_b contraction), mhc_post 2.1. The doc's earlier "compressor-batching neutral"
+diagnosis holds here too (the lcmp cost is dispatch+serial state glue, not the matvec).
+
+### Batched concurrent decode — roofline (2026-07) + build plan
+
+**The throughput lever** (decode M independent requests in one forward). Per-phase decode profile (`DS4F_PROF=1`, bf16 dense, ~74 ms/tok) splits into: **amortizable ~65 ms** — dense GEMM weight read *once* for M sequences (mHC 22.6, qkv 7.2, experts 6.0, shared 5.9, head 2.0, router 0.5, tb2 dense projections 9.3) + comm ~12 (one all-reduce/step ÷M) — and **per-sequence ~8.5 ms** (tb2scan 6.9 O(T), attn 1.3, rope/topk 0.3). **89 % amortizable**, so `step(M) ≈ 65 + 8.5·M` and aggregate tok/s = M/step:
+
+| M | 1 | 4 | 8 | 16 | 32 | →∞ |
+|---|---|---|---|----|----|----|
+| **agg tok/s** | 13.5 (==baseline) | ~41 (3.1×) | ~60 (4.5×) | ~80 (6×) | ~96 (7×) | ~119 (**~9×**) |
+
+Best at short-moderate ctx (tb2scan grows with T → lower ceiling long-ctx) — exactly the serving regime.
+
+**★ MEASURED (P2/P3, `DS4F_DB_BENCH`, bf16 dense, MAXPOS 2048, cold-start): the projection was OPTIMISTIC.** Aggregate tok/s: M=1 9.3, M=2 14.1, M=4 19.3, M=8 23.0, **M=16 25.7** (= 2.8× within the verify path, **~1.9× over the best single-stream matvec decode (13.3)**). The measured per-M increment is **~34 ms/seq, not the projected 8.5** — the roofline was wrong that `tb2prep` amortizes: only the indexer qproj (`tb2qproj`) is batched before the per-position loop; the **compressor (lcmp ~4.6) and indexer (icmp ~1.3 + scan) run PER-POSITION inside the loop**, so they scale with M. Also M=1 via verify (9.3) < single-stream matvec (13.3) — the verify GEMM path is slower per-token (same reason spec decode lost). So batched decode is a **real but modest ~1.9× throughput win** at M=16, not 9×.
+
+**★ Compressor-batching optimization — MEASURED NEUTRAL, REVERTED (2026-07).** Hoisted the Tier-B2 compressor matvec (`cmp_wkv/wgate @ p_hn`) out of the per-position loop into one M-batch GEMM (fed per-position via `cmp_pre_kv/score`), mirroring `tb2qproj`. Result: **M=16 25.6 vs 25.7 tok/s — no change** (step 625.0 vs 623.5 ms, within noise). Diagnosis: the compressor *matvec* is only ~µs/position (an ~8 MB weight read at ~700 GB/s ≈ 11 µs), **not** the profile's 4.6 ms `tb2lcmp` — that number is not the matvec. The per-M ~34 ms/seq is **dispatch-bound**, not compute-bound: each per-position iteration fires multiple **48-thread pool barriers** (attention + O(T) indexer scan + compressor state update), and that dispatch count scales with M×positions. Batching the *compressor compute* removes neither the attention nor the indexer-scan dispatches, so throughput is unchanged. Reverted the change (neutral complexity). **The real lever = batch the per-position *workers* (attention + indexer scan) across M into one dispatch each** — a much larger restructure of `ds4f_attn_tb2_worker`/`ds4f_idxsc*_worker` to process all M sequences per dispatch. Until then ~1.9× (M=16) is the practical ceiling.
+
+**★★ Full verify-path per-M profile (2026-07) — REFUTES the dispatch-bound premise; the ~1.9-3× ceiling is COMPUTE-bound, not batchable.** The verify path only instrumented tb2+attn (dense sections were untimed); adding coarse section timers (`DS4F_P_QKV/OPROJ/SHARED/EXPERTS/HEAD`, gated on `ds4f_prof_on`, verify-only) revealed the tb2 subtimers are only **~6.9 of the ~34 ms/seq** increment — **~80% is the untimed dense/expert path.** Per-seq increment (bf16 dense, real weights, M=1→8, ÷7):
+
+| section | ms/seq | share | batchable? |
+|---|---|---|---|
+| **experts** (routed+shared MoE) | 12.1 | 36% | only at large M — sparse top-6 → ~1 tok/expert until M≫16 (M=16 gives only +10% over M=8: 23.4→25.7) |
+| **dense GEMMs** (qkv+o_proj+shared) | 13.1 | 39% | already batched M=K; scales = **real per-token FLOPs** (weight read already amortized once/K rows) |
+| **tb2prep** (the restructure target) | 7.5 | 22% | ~1.5/seq serial glue + a few dispatches; rest = real O(T) scan + per-token matvec compute |
+| head | 0.8 | 2% | — |
+
+So the earlier "dispatch-bound → batch the tb2 workers" hypothesis is **wrong**: ~85% of the per-seq cost is genuine compute (dense GEMM FLOPs + un-amortized sparse experts + O(T) scan), only ~15% is batchable dispatch/glue. **Batching the tb2 workers would reclaim ~8-12% of per-seq → low-single-digit aggregate gain, for a large high-risk rewrite of the bit-exact kernels — not worth it.** The genuine throughput lever is **larger M** (weight-read amortization), which *already exists* (aggregate 9.3→23.4 tok/s at M=8 = 2.5×), but the MoE experts barely amortize even at M=16 (only +10%) because top-6-of-256 routing rarely shares an expert until M is very large — so the batched-decode ceiling is a genuine **~2.5-3×** (consistent with the prior committed M=16=25.7), *not* the 9× the roofline projected. Also fixed a real bug: the DB_BENCH sweep set `dec_batch_seq=NULL` between M values without freeing the per-sequence cache sets (`ds4f_free_decode_batch`, ~29 MB × (M-1) leaked each iteration → swap-thrash risk at high M). CAVEAT: the M=16/32 confirmation run was blocked by a persistently degraded alloc this session (repeated stage sig9 / PLE-0054 / silent early stage death; `/local` blobs left truncated at ~1.5 GB — a fresh alloc + re-stage is needed to re-run). The M≤8 profile + prior M=16=25.7 already trace the diminishing curve conclusively.
+
+**Build.** `ds4f_forward_verify` already batches *all* dense/MoE/comm as an M=K GEMM with one all-reduce/layer — the amortization exists. The only rework is its per-position attn/tb2 loop → **per-sequence**: M independent live KV/cmp/idx cache **sets** (the multi-slot infra has per-slot *snapshots* but one *live* set), each batch element k with its own `pos[k]` + `cache[k]`. Lowest-risk approach: **pointer-swap** — allocate M cache sets, and before element k's append/tb2/attn, point the layer's cache fields (the ~20 buffers/scalars `ds4f_ctx_snap` enumerates: `kv_*`, `cmp_*`, `idx_*`, the compressor ring states, calibration) at set k, so the existing `ds4f_tb2_prepare`/`ds4f_attn_tb2_worker`/KV-append run unchanged. Phases: **P1** M cache sets + `ds4f_forward_decode_batch` (validate M=1 == single-stream, M=2 == two independent streams); **P2** serve-loop dynamic batch (add/remove sequences, per-sequence sampling/EOS, continuous batching); **P3** measure aggregate tok/s vs the projection. MTP module is staged (throughput draft is a later compose).
+
+### 2026-07-11 session (allocs 49526204 / 49529254) — serve maturation, CP Phase-2 complete, long-ctx attention
+
+Roll-up of the day's landed work (details in the `### LANDED`/`### MEASURED`/CP sections below + the
+`Resuming prompt — Phase 2 CP`). All gated, defaults off, validated real-weight 11n, tree committed.
+
+**Serve path.**
+- **Continuous batching / mid-flight admission** (`DS4F_SERVE_DYNAMIC`, commit `9ea8f684`): admit into free
+  slots as they open. Two cross-node-FS fixes were mandatory — broadcast the request payload (per-rank read
+  deadlocks the collective under FEFS cache skew) + probe `q.<id>` existence, not a same-size `qhead`
+  counter (cached stale), with atomic temp+rename writes. Token-exact independence 40/40, 22.8 tok/s @B=4.
+- **Per-sequence sampling** (dynamic `7b18d816` + static `01f43ce8`): each admitted seq carries its own
+  temp/top_p/top_k/penalties/seed + PRNG; lockstep via full-`[K,vocab]` reconstruction under `TP_HEAD` +
+  broadcast sampler. Bug found: the combine SIGSEGV'd because there are TWO batched heads (`_prefill` vs the
+  serve path `_verify`). Validated reproducible-by-seed, per-seq independent, greedy unchanged.
+- **B-sweep** (`65753d12`): batched-decode aggregate **saturates ~25-30 tok/s across B=8..32** (1.3× from
+  B=4→32) — per-seq tier-B2 attention doesn't amortize past B≈8; corrects the dbbench 2.5-3× projection.
+- **Socket transport** (`DS4F_SERVE_SOCK`, `c856ce83`): rank 0 hosts a TCP listener over the Tofu IP
+  (control→compute 0.7 ms). Single 40-tok request **3.33 s vs ~30 s** under the file protocol — the
+  tens-of-seconds FS-cache latency is gone; single-request serving is now compute-bound.
+
+**CP Phase-2 (context parallelism) — COMPLETE.** Was at "Stage A done, B/C next"; the code was already past
+that (sharded scan + top-k merge in-tree). This session finished it:
+- **Stage-C attention combine** (`DS4F_CP_COMBINE`, decode `15fdac73` + verify/prefill `f89d3f5f`):
+  online-softmax per-node partials + max-reduce + one packed `[acc|l]` sum-reduce replaces the gather
+  (comm `n_heads*HD` ≈ 12K floats vs `ns*KV` ≈ 262K). **−36% decode comm, +12.5% decode tok/s, byte-identical.**
+  Lesson: splitting a bandwidth-bound reduce into more-but-smaller reduces wins even on this latency-bound
+  fabric. Verify/prefill uses a batched combine (one reduce/chunk, not K·2).
+- **Batched-decode CP** (`ef1e07f8`): added the per-sequence int8/int4 stores + calibration to `ds4f_lseq`
+  (was bf16/f32 only) so each sequence has its own `cmp_q4` — with `ds4f_lseq_capture` writing the
+  `frozen`/`caln` scalars back after each step (a seq can cross the freeze point mid-decode). Isolation test
+  48/48 under CP (`DS4F_INT8CMP_CAL=4` forces an early freeze to exercise the sharded path); non-CP 48/48.
+- **Long-ctx memory A/B** (`b3f2c350`): couldn't `pjsub` a dedicated alloc, but the caches are lazily
+  allocated, so a `CTX_CACHE` load-time log measures the reserved (== resident-once-filled) A/B safely: int4
+  CP-off vs CP-on **128k 223→30 MB/node (−193); 512k 876→103 (−773)**. Honest verdict: under int4 the caches
+  are small, so CP's *memory* win is modest until 512k-1M+; CP's real near-term win is *compute* (the combine
+  + sharded scan).
+
+**Long-ctx attention** (details in the `### LANDED — the long-ctx attention cost model` section below).
+Measure-first redirected the work: profiling showed the **only ctx-growing decode terms are the indexer
+scan + top-k** (attn itself is O(1) — window 128 + topk 512 is fixed), ~7% at 8k → **~33% at 128k**. So
+"cheaper long-ctx attention" = "cheaper O(T) indexer scan".
+- **Negative result — `CP_IDX` is a NET LOSS below ~40-50k ctx**: it shards the scan and its candidate-merge
+  *eliminates* the top-k (`tb2topk` → 0.002 ms), but the merge costs ~40 small reduces/token
+  (collective-count-bound, ~11 ms fixed) → measured 16k **7.81 → 4.93 tok/s**. Don't enable it at moderate ctx.
+- **`DS4F_IDX_REUSE=N`** (`098dfdd6`, default off): re-scan every N single-stream steps, reuse the layer's
+  cached selection between — skips **qproj/rope/wproj/scan/topk (the whole O(T) cost) with ZERO comm**. The
+  indexer compressor still runs every step (skipping it corrupts the idx cache). N=4: ctx-warm 8k decode
+  **123.7 → 115.2 ms/tok (+7.3%)**; real gen (2471-tok prompt, T=630 > topk) decode **+5.3%**, prefill
+  **+5.8%**; scales with ctx → **~+35% at 128k**. **Quality gate: TF_ACCURACY 97.7% — IDENTICAL to exact.**
+- *Lesson:* gate lossy ATTENTION changes on `DS4F_TF_CHECK` TF_ACCURACY, never on eyeballing completions —
+  a repetitive test prompt made the EXACT baseline degenerate into copying its input while the reused run
+  correctly summarized, which would have read as a false "the lossy version is better".
+
+**Long-ctx follow-ups** (alloc 49529254; details in `### LANDED/REFUTED — long-ctx follow-ups` below).
+- **`IDX_REUSE` under batched decode** (`94484265`): `sel_cache` into `ds4f_lseq`. **★ Caught a REAL latent bug
+  from `ef1e07f8`** — the serve loops hand `ds4f_forward_verify` a compacted **COPY** of the active bundles, so
+  every `ds4f_lseq_capture` landed in the copy and was DISCARDED; the `cmp_frozen`/`caln` freeze write-back and
+  the reuse cache never advanced. New `ds4f_lseq_sync()`. Validated under real pruning (T=617 > topk=512):
+  A-batched == A-solo. *The `IDX_REUSE=0` control is what proved the divergence was mine, not pre-existing
+  M-reassociation — and the `DECODE_BATCH` isolation test can't catch it (it uses the real bundles, not a view).*
+- **REFUTED — packing the CP_IDX merge reduces** (`a2821722`): zero benefit (202.9 → 203.8 ms/tok); it's
+  byte/chunk-bound, not call-bound. Worse, the merge's comm is **FIXED** (~56 ms/tok) while the sharding saving
+  only grows with ctx → **`DS4F_CP_IDX` is a NET LOSS below ~276k ctx**. Startup WARN added; use `IDX_REUSE`.
+- **`DS4F_IDX_INT8W`**: passes the TF gate (**97.7%, identical**) but only **+1.4%** — the old "+4.1%" doesn't hold.
+- **ctx=32768 CLEARS** with `Q8_DENSE=1`+int8-KV+int4 (the old 256k blocker): **RSS 22.56 GB** (vs 27.95 that
+  OOM'd), ~8.5 GB headroom, NaNs=0. **Memory is no longer the long-ctx constraint — the O(T) scan compute is.**
+- **`IDX_REUSE` confirmed to scale with ctx** (measured, not extrapolated): **+7.3% @8k → +12.0% @32k**
+  (136.7 → 122.0 ms/tok, 7.32 → **8.20 tok/s**) → ~+30-35% @128k.
+
+### LANDED — DS4F_SERVE_BATCH concurrent batched-decode serve (2026-07-10b, commits `782c8f29`/`eb5d9054`/`994cbd27`)
+
+The batched-serve path is built + validated. `ds4f_serve_batch_loop` (`ds4f_ep_runner.c`, gated
+`DS4F_SERVE_BATCH>1`, **default 1 = the existing single-request loop, zero production impact**): B
+persistent per-sequence cache bundles (`ds4f_alloc_decode_batch`, allocated once), each request
+prefilled into its own bundle (PREFILL_GEMM chunk, `dec_batch_seq=NULL`), then all still-active
+sequences decode-stepped TOGETHER via one `ds4f_forward_verify`/step. Greedy, per-seq EOS/max_new,
+per-sequence independent. Static batching (a batch drains before the next admits; dynamic mid-flight
+admission = the follow-on). Protocol `BATCH N`+(max_new,ids)×N → `N`+ids×N; `ds4f_serve.py` gains a
+dispatcher thread that coalesces concurrent HTTP requests within `DS4F_SERVE_BATCH_WINDOW` (30 ms).
+
+**★ Found + fixed a PRE-EXISTING per-sequence independence bug** (commit `782c8f29`) — it also fixes
+`DS4F_DB_BENCH` correctness, and is NOT one of this session's levers (HC_SVE=0 A/B gave identical
+divergence). `ds4f_pf_qnr_worker` RoPE'd query element mm at `pos0+mm` (right for prefill's consecutive
+positions) but in DECODE-BATCH each mm is an independent sequence at `dec_batch_pos[mm]`; the KV RoPE
+(inline per-k) already used the right position, so Q/KV rotated inconsistently and two identical
+sequences at different batch indices diverged. Localized with a per-(layer,k) hn/q/attn checksum dump
+(layer 0: hn identical, q differed → RoPE). Fix: `rpos = dec_batch_pos ? dec_batch_pos[mm] : pos0+mm`.
+
+**Validated real-weight 11n (direct shared-FS protocol):** per-sequence independence (A alone == A in
+[A,B,C]; 4 identical prompts byte-identical), coherent (a Fibonacci prompt yields correct Python:
+`a,b=0,1 / while a<n: print(a,end=' ') / a,b=b,a`), **aggregate N=4 = 23.4 tok/s vs N=1 = 14.9 (1.57×)**
+— dbbench projects ~2.5-3× at N=8/16. The HTTP frontend dispatcher was confirmed to coalesce 4 concurrent
+curls into one correct BATCH request (the runner + protocol are separately validated, so the halves
+connect). **Follow-ons:** dynamic mid-flight admission (a fast request currently waits for its batch to
+drain); per-sequence sampling (currently greedy-only); B>4 throughput measurement on a stable alloc.
+*Ops note: `pkill -9` on the runner is unreliable — verify the `SERVE-BATCH ready: B=N` banner matches
+the launched B and `ps -eo cmd | grep build/ds4f_ep_runner` is empty before relaunching.*
+
+### LANDED — DS4F_SERVE_DYNAMIC continuous batching / mid-flight admission (2026-07-10b, commit `9ea8f684`)
+
+`ds4f_serve_dynbatch_loop` (`ds4f_ep_runner.c`, gated `DS4F_SERVE_DYNAMIC`, **default off**) admits new
+requests into free slots *as they open* instead of the static "prefill N, drain to completion" model —
+a fast request no longer waits behind slow batch-mates. B persistent bundles; each free slot is filled
+from the queue (single-seq prefill) and the active set decode-steps together via one `ds4f_forward_verify`.
+Queue protocol on the shared FS: `q.<id>` (client-written `max_new\nids`), `r.<id>` (runner response,
+temp+rename atomic). `ds4f_serve.py infer_dynamic` routes when `DS4F_SERVE_DYNAMIC=1`.
+
+**Two cross-node-FS robustness fixes were mandatory (both cost a real debug cycle):**
+1. **Lockstep admission via broadcast, not per-rank read.** Rank 0 reads the `q.<id>` payload and
+   BROADCASTS `(ok,mnew,np,ids)` via `ar_cb`; a per-rank read races the FEFS/LLIO cache (rank 0 sees the
+   fresh file, rank 7 doesn't → divergent `np` → the prefill all-reduce **deadlocks**). Manifested as a
+   hard hang the moment a request arrived *after the loop drained to idle* (peak cache skew) — the burst
+   case worked by luck. `int` ids are float32-exact (vocab ≪ 2²⁴).
+2. **Probe `q.<qnext>` existence; do NOT read a `qhead` counter.** A counter file changes value at the
+   same 2-byte size (`"1\n"→"4\n"`); the compute-node client caches it by size+coarse-mtime and **never
+   refetches** → rank 0 reads a stale `qhead` forever and stops admitting (silent stall, not a hang).
+   New-*file* existence IS coherent, so probe `q.<qnext>` directly (the broadcast `ok` flag stops the
+   loop). This made a *counter* the wrong signal and *file existence* the right one. Consequence: clients
+   must write `q.<id>` **atomically (temp+rename)** or the probe reads a half-written file → `np=0` →
+   empty response. The old `qhead` gate had doubled as the write-complete barrier.
+
+**Validated real-weight 11n (alloc 49508574):** token-exact per-sequence independence — A alone ==
+A admitted mid-flight alongside B,C (**40/40 tokens, 5/5 runs**); no deadlock/stall across repeated
+idle→admit transitions; runner-internal **22.8 tok/s aggregate at active=4** (≈4× single-stream, no
+regression from the probe rewrite). Client-observed end-to-end tok/s is lower and FS-round-trip-bound
+(~fixed tens-of-seconds q/r visibility latency across login↔compute) — a property of the file protocol,
+not compute; a socket transport would remove it. **Follow-ons:** socket/shared-mem transport to cut
+the file-visibility latency; B>4 dynamic throughput on a stable alloc.
+
+### LANDED — per-sequence sampling in the dynamic loop (2026-07-11, commit `7b18d816`)
+
+DS4F_SERVE_DYNAMIC decode was greedy-only; now each admitted sequence carries its own sampler
+(temperature / top_p / top_k / repeat+presence penalty / seed) + its own SplitMix64 PRNG, so one batch
+can mix greedy and sampled sequences and each draws independently. `temp<=0` stays greedy (the cheap
+argmax-merge head, bit-identical). Pieces: (1) `ds4f_sample` split into `ds4f_sample_logits(lg,V,sp,
+*rng,hist,nhist)` — a pure fn on an explicit logits row + explicit PRNG state; (2) **`ds4f_forward_verify`
+head gains a `want_full_logits` branch** — under TP_HEAD the head is vocab-sharded, so it scatters each
+row's owned `[K,hrows]` shard into a full-vocab row (zero-fill) + `ar_cb` SUM → every rank holds the
+SAME full `[K,vocab]` logits (new `p_logits_full` buffer, aliases `p_logits` when the head is
+replicated); (3) the admit broadcast payload carries the sampler params + seed so every rank derives an
+IDENTICAL sampler (else ranks draw different tokens → divergence); `want_full_logits` is set per-step
+(any active seq samples) and only on the LAST prefill chunk (first-token draw). `q.<id>` line 1 extended
+to `max_new temp top_p top_k seed rep_pen pres_pen` (params optional → greedy). seed 0 ⇒ derived from
+the request id (reproducible per id, distinct across concurrent requests).
+
+**★ Bug found + fixed en route (the instructive one):** the `want_full_logits` branch was first added to
+`ds4f_forward_prefill`'s head — but the dynamic loop calls `ds4f_forward_verify`, a DIFFERENT function
+(~`ds4f_impl.h:5410`) whose head still argmaxed only → `p_logits_full` stayed NULL → `ds4f_sample_logits(
+NULL+offset)` SIGSEGV on the first sampling request. Localized with per-rank file traces
+(`/home/u14346/sampdbg.r<rank>`, gated `DS4F_SAMP_DBG`): all ranks logged `wfl=1` + `pf_full=(nil)` and
+the head trace never fired → wrong function. **Lesson: there are TWO batched heads (`_prefill` M-rows and
+`_verify` K-rows); the serve/decode path is `_verify`. Per-rank stderr is NOT forwarded to the launcher
+log (only plexec's `sig=11` line is) and the scratchpad dir isn't mounted on compute nodes — write debug
+to `$HOME`.**
+
+**Validated real-weight 11n (alloc 49526204, `DS4F_TP_HEAD=1` sharded head):** greedy determinism +
+token-exact independence unchanged (40/40); sampling reproducible by seed, diverse across seeds, ≠ greedy,
+coherent; per-sequence independence under sampling (A[seed X] admitted mid-flight with B[seed Y] == A[seed
+X] run alone; same-seed seqs in one batch identical; different seed differ). Sampling requests *completing*
+is itself the lockstep proof (mismatched draws would deadlock the per-layer all-reduce). Cost: the full
+`[K,vocab]` SUM (~2.4 MB at K=4) per decode step only when a sampling seq is active — same per-seq cost as
+single-stream sampling. Static-batch parity landed too (commit `01f43ce8`): `ds4f_serve_batch_loop` gains
+the same per-seq sampler (BATCH per-seq line `max_new [temp top_p top_k seed rep_pen pres_pen]`), validated
+B=4 (greedy regression clean, mixed greedy+sampled batch, seed 1234 yields the SAME tokens as the dynamic
+loop — identical seed derivation).
+
+### MEASURED — batched-decode throughput saturates ~25-30 tok/s (B sweep, 2026-07-11)
+
+Dynamic-loop runner-internal peak `tok/s agg` (early-context, N=B concurrent 80-tok requests, alloc 49526204):
+
+| B  | peak agg tok/s | vs single-stream (~17) |
+|----|----------------|------------------------|
+| 4  | 22.8           | 1.34×                  |
+| 8  | 25.8           | 1.52×                  |
+| 16 | 25.3           | 1.49×                  |
+| 32 | 29.4           | 1.73×                  |
+
+**Aggregate throughput saturates at ~25-30 tok/s across B=8..32 — heavily sublinear (only 1.29× from
+B=4→B=32).** The amortizable base (dense GEMM + per-layer EP reduce + mHC) is fully amortized by B≈8; beyond
+that the **per-sequence tier-B2 work does NOT amortize** — each sequence has an independent KV/compressor/
+index cache, so its attention + `tb2_prepare` cost grows ~linearly with B and dominates. This corrects the
+`DS4F_DB_BENCH` ~2.5-3× projection (dbbench measured the dense-amortized regime without the full per-seq
+mHC+tierB2 attention loop). Throughput also DECAYS within a run as context grows (B=32: 29.4→25.1 over the
+window sweep) since per-position attention scales with KV length. Independence held at every B. Per-window
+numbers are noisy (peak depends on exact ctx at measurement) but the saturation is robust. **Practical
+sweet spot ≈ B=8-16** (throughput plateau + lower per-request latency + 8-16 cache bundles vs 32); B=32
+buys little for 2× the bundle memory. The real lever beyond this is per-sequence attention cost (CP shards
+the caches; a cheaper long-ctx attention), not larger B. Client-observed tok/s (10-14) WAS FS-round-trip-
+bound (the file protocol); the socket transport below removes that.
+
+### LANDED — DS4F_SERVE_SOCK TCP transport (2026-07-11, commit `c856ce83`)
+
+The file protocol's admission/response latency is dominated by **cross-node FEFS/LLIO cache visibility**
+(~tens of seconds: login-node client writes `q.<id>`, the compute-node runner sees it only after the
+attr/dentry cache refreshes; `r.<id>` propagates back the same way). **TCP over the Tofu IP interface**
+(the nodes have `tofu0`/`tofu1` 10.x IPv4 addrs) between the login node and the runner's rank-0 compute
+node is **0.7 ms round-trip** (measured with a throwaway `mpiexec -np 1` python server on one compute node
++ a control-node connect). So rank 0 hosts a non-blocking TCP listener and publishes `<ip> <port>` to
+`<base>.sock`; the frontend connects per request. Frame = `[u32 BE len][payload]`; request payload is the
+SAME 2-line text as a `q.<id>` file (so per-seq sampling flows through unchanged); response is `gen ids\n`.
+Only rank 0 touches sockets — the parsed request is broadcast to the EP group via `ar_cb` exactly like the
+file path, so **lockstep is unchanged**. Falls back to file mode if the listener fails. Frontend
+`ds4f_serve.py infer_socket` (routed when `DYNAMIC && SOCK`).
+
+**Result — single-request serving is now COMPUTE-bound, not FS-bound.** Real-weight 11n (alloc 49526204):
+40-tok greedy request **3.33 s** end-to-end (83 ms/tok) vs **~30 s** under the file protocol; 1-token
+request **596 ms** (prefill-bound); 4 concurrent **9.36 s = 17.1 tok/s** end-to-end (vs file's 6.4);
+per-sequence independence (A concurrent == A alone) + sampling reproducibility preserved; runner-internal
+22.7 tok/s at active=4 unchanged (socket admission is free). **The ~tens-of-seconds FS-visibility floor is
+gone.** *Ops note: the throwaway-server trick (`socksrv.py` + `vcoord_1.txt` = one line of `vcoord_ds4f.txt`)
+is the fast way to test cross-node TCP without the runner; debug/aux files for compute nodes go under `$HOME`
+(the scratchpad dir isn't mounted there).*
+
+### LANDED — the long-ctx attention cost model + `DS4F_IDX_REUSE` (2026-07-11, commit `098dfdd6`)
+
+**The cost model (measured, ctx-warm + `DS4F_PROF`, int4 config).** After the landed Step-2g/2h/2i work
+(O(T·log k) `index_topk`, SVE attn, fused o-proj), the **only ctx-GROWING decode terms** are the indexer
+**scan** (`tb2scan`) + **topk** + the **qproj** that feeds them. Everything else — attn (window 128 +
+topk 512 = fixed), o-proj, qkv, dense, MoE, mHC, `tb2lcmp` — is O(1) in ctx.
+
+| ctx (warm) | decode ms/tok | tb2scan | tb2topk | share |
+|---|---|---|---|---|
+| 8k  | 123.7 | 3.62 ms | 3.63 ms | 7.4% |
+| 16k | 128.1 | 5.36 ms | 5.37 ms | 10.4% |
+
+Fitting the slope → **~30 ms scan + ~30 ms topk at 128k ≈ 33% of decode**: that is the long-ctx cliff.
+
+**★ CP_IDX has a ~40-50k crossover — it LOSES below that.** `DS4F_CP_IDX` shards the scan and its
+candidate-merge *eliminates* the topk (measured `tb2topk` **0.002 ms**), but the merge gathers
+`ep_size*index_topk` candidates via **~40 small reduces/token** (2 per CSA layer) — **collective-count-bound**,
+~11 ms fixed. At 16k that cost exceeds the scan-sharding saving: **decode 7.81 → 4.93 tok/s (CP_IDX is a
+NET LOSS)**. It only pays above ~40-50k ctx. *Don't enable CP_IDX at moderate ctx.*
+
+**★ `DS4F_IDX_REUSE=N` (default 0=off) — the lever that works at ALL ctx with ZERO comm.** Re-scan every N
+single-stream steps; reuse the layer's cached selection in between (per-layer `sel_cache` + `sel_cache_pos`).
+A reused step still runs the indexer compressor (idx-cache continuity) but skips **qproj/rope/wproj/scan/topk
+— the entire O(T) cost**. `since>=1` + a `ds4f_serve_reset` invalidation handle request boundaries; batched
+decode (per-seq selections) is excluded. **LOSSY** (the newest ~N/ratio compressed slots aren't selectable
+until the next scan — they're recent, so the sliding window covers them) → coherence-gated.
+
+**Measured (N=4):** ctx-warm 8k — `tb2scan` 3.62→0.86, `tb2topk` 3.63→0.93, `tb2qproj` 3.21→0.80 ms (all
+÷~4); decode **123.7 → 115.2 ms/tok (+7.3%)**. Real gen, 2471-tok prompt (T=630 slots > topk=512, so the
+selection genuinely prunes): decode **119.4 → 113.4 (+5.3%)**, prefill **117.2 → 110.8 (+5.8%)**.
+**QUALITY GATE: `DS4F_TF_CHECK` TF_ACCURACY 2413/2470 = 97.7% — IDENTICAL to the exact baseline.** The gen
+text diverges (expected, lossy) but predictive quality is unchanged. *(Lesson: gate lossy attention changes
+on TF_ACCURACY, not on comparing completions — a repetitive test prompt made the EXACT baseline degenerate
+into copying its input while the reused run correctly summarized, which would have read as a false "win".)*
+**The win scales with ctx** (the skipped terms are the O(T) ones) → extrapolates to **~+35% decode at 128k**.
+
+### LANDED/REFUTED — long-ctx follow-ups (2026-07-11b, commits `94484265`/`a2821722`, alloc 49529254)
+
+**1. `IDX_REUSE` under batched decode + a REAL BUG (commit `94484265`).** `sel_cache` moved into `ds4f_lseq`
+(pre-allocated per bundle; pointer swapped by `ds4f_lseq_apply`, scalars written back by `_capture`), so
+`DS4F_IDX_REUSE` now works batched. **★ In doing so, found a latent bug from `ef1e07f8`: the serve loops hand
+`ds4f_forward_verify` a COMPACTED COPY of the active bundles (`view[a] = bundles[map[a]]`, by value), so every
+`ds4f_lseq_capture` landed in that copy and was DISCARDED when the view was rebuilt next step.** The
+per-sequence mutable state never advanced — the `cmp_frozen`/`caln` mid-decode-freeze write-back was silently
+lost, and IDX_REUSE re-used a stale selection forever. New `ds4f_lseq_sync()` copies the mutable scalars from
+the view back into the owning bundle after each decode step, in both serve loops. *The `DECODE_BATCH`
+isolation test never caught it because it sets `dec_batch_seq` to the REAL bundles array, not a view.*
+Validated with REAL selection pruning (prompts 2471/2134 tok → T=617 > topk=512), dynamic serve B=4 over the
+socket: `IDX_REUSE=0` control **A-batched == A-solo (True — batched decode is bit-exact here)**; `=4` BEFORE
+fix **False, diverged @ token 15**; `=4` AFTER fix **True**. *The control is what proved the divergence was
+mine and not pre-existing M-reassociation — always run it.*
+
+**2. REFUTED — packing the CP_IDX merge reduces (commit `a2821722`).** Hypothesis: the idx-merge is
+collective-COUNT-bound (2 reduces × 20 CSA layers = 40/token at the ~280 µs floor), so packing slot+score
+into ONE contiguous reduce halves the comm. **Measured: ZERO benefit** (16k CP_IDX decode 202.9 → 203.8
+ms/tok, comm 33.1% → 33.3%). The cost is byte/chunk-driven, not call-driven. Reverted. **★ Worse, the
+measurement exposes that CP_IDX's merge comm is FIXED** — it gathers `ep_size*index_topk` candidates per CSA
+layer regardless of ctx (**~56 ms/tok** at N=11, k=512) — while the scan-sharding saving only GROWS with ctx
+(~27 ms even at 128k). **Break-even ≈ 276k ctx: `DS4F_CP_IDX` is a NET LOSS at every practical context**
+(measured 16k: 7.81 → 4.93 tok/s). `ncand` can't shrink without breaking exactness (the global top-k may take
+all k from one node). Added a rank-0 startup WARN below 256k pointing at `DS4F_IDX_REUSE`, which cuts the same
+O(T) scan with **zero comm** at any ctx and is strictly the better lever.
+
+**3. `DS4F_IDX_INT8W` — PASSES the gate, but modest.** int8 W8A8 indexer qproj. **TF_ACCURACY 2413/2470 =
+97.7%, IDENTICAL to the exact baseline** → quality-safe. Speed: decode 119.4 → **117.7 ms/tok (+1.4%)**,
+prefill +0.9%. The old "+4.1% @5k" claim doesn't hold here — qproj is a FIXED ~3.2 ms cost, so its *share*
+shrinks as decode grows. Safe to enable; small win.
+
+**4. ctx=32768 CLEARS with `DS4F_Q8_DENSE=1` + int8 KV + int4 cmp/idx (the 256k blocker).** Fresh alloc,
+ctx-warm 32k: **RSS 22.56 GB** (vs the 27.95 GB that used to OOM), arena 21.74, `CTX_CACHE` 54.6 MB/node,
+decode **7.32 tok/s**, NaNs=0, **MemFree 30.9 GB — ~8.5 GB of headroom.** Extrapolating the cache slope
+(~1.7 MB/1k-ctx) the MEMORY ceiling is millions of tokens. **So memory is no longer the long-ctx binding
+constraint — the O(T) indexer scan COMPUTE is.**
+
+**★ `IDX_REUSE` confirmed to scale with ctx (the point of the lever).** Measured at real ctx (not extrapolated):
+
+| ctx | reuse=0 | reuse=4 | gain |
+|---|---|---|---|
+| 8k  | 123.7 ms/tok | 115.2 | **+7.3%** |
+| 32k | 136.7 ms/tok | 122.0 (7.32 → **8.20 tok/s**) | **+12.0%** |
+
+(at 32k, `tb2scan` 1.96 / `tb2topk` 1.88 / `tb2qproj` 0.80 ms — all ÷~4). Extrapolates to ~+30-35% at 128k.
+
 ### Resuming prompt — Phase 2 CP (next session)
-> **TASK: DS4F sharded-KV context parallelism (`DS4F_CP`).** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`). Full design + file:line in the plan file `~/.claude/plans/see-a64fx-ds4f-md-and-keep-floofy-dragon.md` and the "Phase 2" section above.
+> **STATUS UPDATE 2026-07-11:** the CP code is well past the Stage-A checkpoint the prompt below describes.
+> In-tree now (`ds4f_impl.h`): `ds4f_cp_slot_shard` (`:185`); storage sharding `DS4F_CP_SHARD` for `cmp_q4`
+> (`:2173`, `cp_t0/cp_t1`) and `DS4F_CP_IDX` for `idx_kv8_4` (`:2219`, `idx_cp_s0/s1`); the sharded-read
+> paths (`:3510`, `:4224`); the sharded index scan wired with `idx_cp_on` + `ar_cb` (`:4007`); and the
+> **CP idx-shard top-k merge** (`:1920`). **Validated functional this session** (alloc 49526204): a full CP
+> gen — `DS4F_CP=1 DS4F_CP_SHARD=1 DS4F_CP_IDX=1 DS4F_INT4_CMP=1 DS4F_IDX_INT4=1 DS4F_FP8_BF16=0` — ran
+> **rc=0, NaNs=0, coherent** (correct quicksort completion) at short ctx (max_pos=120; the memory/ctx-ceiling
+> win only shows at large `max_pos`, NOT tested here — long-ctx validation risks OOM-killing the shared
+> interactive alloc, so do it deliberately on a dedicated alloc).
+>
+> **STAGE C DONE (2026-07-11, commit `15fdac73`, `DS4F_CP_COMBINE`).** The prior CP path gathered every
+> selected latent to every node (`ns*KV` ≈ 1 MB/layer, bandwidth-bound) then attended replicated. Now each
+> node attends over only its OWNED terms and emits a per-head online-softmax partial `{max, sum-exp,
+> weighted-V}`; the partials combine with a max-reduce + one packed `[acc|l]` sum-reduce (comm ≈
+> `n_heads*HD` ≈ 12 K floats/layer, ~20× fewer bytes). `ds4f_attn_tb2_combine_worker` + `ds4f_cp_attn_combine`
+> (`ds4f_impl.h`), gated (needs `DS4F_CP_SHARD` + int4_cmp + cmp_frozen + TP_ATTN off), decode path only
+> (verify/prefill stays on gather). Validated ctx=805 (cmp tail genuinely sharded): **combine == gather
+> 48/48 tokens byte-identical**, rc=0/NaNs=0/lockstep; **decode comm 34.8→22.3 ms/tok (−36%), 7.25→8.16
+> tok/s (+12.5%)**.
+>
+> **STAGE C ALSO MIRRORED INTO VERIFY/PREFILL (commit `f89d3f5f`).** `ds4f_forward_verify` runs K positions
+> per call, so a per-position combine would be K*2 collectives/layer (prefill K=64 → 2560/chunk); instead the
+> combine-mode positions' partials are COMPACTED and reduced in ONE batched combine per chunk
+> (`ds4f_cp_attn_combine_batched`: ar_max + one packed `[acc|l]` ar_cb), scattered back to `p_attn[k]`.
+> Per-position mode select (`cmp_frozen && cp_on`) handles a chunk straddling the freeze point (pre-freeze
+> positions take the normal path). Validated `PREFILL_GEMM=1` ctx=805: **verify-COMBINE == verify-noCP 48/48
+> byte-identical** (the 15/48 gap vs the token baseline is the known verify-vs-token GEMM reassociation —
+> verify-noCP diverges identically). CP now composes with the fast batched-verify prefill (56.8 vs 128.8
+> ms/tok token-by-token).
+>
+> **BATCHED-DECODE CP DONE (commit `ef1e07f8`).** `ds4f_lseq` now carries the per-sequence int8/int4 stores +
+> calibration (`kv_q`/`cmp_q4`/`cmp_q`/`cmp_scale`/`cmp_iscale`/`cmp_absmax`/`*_calbuf`/`idx_kv8_4`/`idx_kv8`/
+> `idx_pscale` + the `caln`/`frozen` scalars); previously it held only bf16/f32 so int4 batched decode shared
+> one `cmp_q4` across sequences. `ds4f_lseq_apply` swaps them (NULL/0 when off → bf16 path unchanged); new
+> `ds4f_lseq_capture` writes the calibration SCALARS back after each step (a sequence can cross the freeze
+> point mid-decode) — wired into the forward_verify per-position loop + the serve loops' per-request prefill.
+> `ds4f_alloc_decode_batch`/`_free` allocate/free per-bundle quant buffers (shard capacity = base layer's).
+> Validated via the `DS4F_DECODE_BATCH` isolation test (seqA solo == seqA batched-with-seqB, token-exact):
+> **CP+int4+CP_SHARD/IDX/COMBINE with `DS4F_INT8CMP_CAL=4` (early freeze → positions 16-47 use the SHARDED
+> per-seq cmp_q4): 48/48 PASS**; standard non-CP bf16: 48/48 (no regression).
+>
+> **LONG-CTX MEMORY A/B DONE (commit `b3f2c350`).** Couldn't `pjsub` a dedicated alloc (compute node has no
+> `pjsub`; login node unreachable) — but didn't need to: the caches are LAZILY allocated (RSS at max_pos=16k
+> == 128k with a 2-token gen, both 21.8 GB, since untouched slots aren't resident), and the RESERVED
+> allocation == the resident memory once ctx fills. So a new `CTX_CACHE` load-time log (rank 0 sums the
+> O(ctx) KV/cmp/idx buffers + the CP-shardable int4 subset) measures the A/B safely with a tiny gen. Measured
+> 11n, int4, CP-off vs CP-on(`CP_SHARD`+`CP_IDX`): **128k 223.0 → 30.0 MB/node (−193, 8.8×); 512k 875.9 →
+> 103.0 MB/node (−773, 8.5×)**. Linear (~1.5 MB/1k-ctx/node saved) → ~1.5 GB/node at 1M ctx. **Honest
+> framing: under int4 the caches are already small, so CP's MEMORY saving is modest at 128k (~193 MB/node)
+> and only a GB-scale ceiling lever at 512k-1M+; CP's bigger near-term win is COMPUTE — the combine's −36%
+> decode comm + the sharded index scan.** For a resident-memory check at true long ctx on a dedicated alloc,
+> generate to ~128k actual positions and read node MemFree (expect the CP-off − CP-on gap = the CTX_CACHE
+> delta above). **CP Phase-2 is complete: Stage A/B/C + verify/prefill + batched-decode + the memory A/B.** NOTE the plan file
+> `~/.claude/plans/see-a64fx-ds4f-md-...md` is GONE — reconstruct design from the in-tree code above + the
+> git history (`git log --oneline | grep -iE 'CP |attn-CP|slot-shard'`; some CP commits are glm5/m3, not ds4f).
+>
+> **(original Stage-A prompt, kept for the design detail):** Stage A DONE+committed (`1f7d46a`): `tp_allreduce_max` (`tp_allreduce.h`) + `ep_armax_callback`/`m->ar_max_cb` (`ds4f_ep_runner.c`) + `DS4F_CP_SELFTEST` — validated 11-node (all ranks PASS bad=0 worst=0). **NEXT = Stage B** (slot-shard `cmp_q4`/`idx_kv8_4` by `[s0,s1)`, sharded `ds4f_idxsc8r4_worker` scan, top-k merge via zero-fill+`ar_cb`-SUM), then **Stage C** (partial `{m,l,acc}` refactor of `ds4f_attn_tb2_worker` + the combine `ar_max_cb`(m)+`ar_cb`([l|acc]) in `ds4f_forward_token`).
 > **Standing rules:** native fcc/FCC; in-alloc `mpiexec` (no pjsub) NP=11 EXCLUDE node 0; **measure MemFree not RSS**; validate coherence/lockstep (NOT bit-exact — combine reassociates); FP8 dense (`DS4F_FP8_BF16=0`) required; CP composes with full TP (`DS4F_TP_*`) + int4 cmp/idx (`DS4F_INT4_CMP`/`DS4F_IDX_INT4`), all default-off; commit only when asked; one real-weight gen per Bash call (batched jobs blow the 10-min timeout → SIGKILL degrades PMIx → recover via native re-stage `run_ds4f_stage_11n.sh`).
 > **Cumulative ceiling: ~255k → ~4.8M (~19×)** committed (2p `981350a`, 2q `cc86b0f`, 2r `683cfaf`/`7961f1a`/`5614dea`/`2c00f58`, 2s `f9fb3ff`, 2t `23b793b`); CP targets tens-of-millions + ~20–30 tok/s at long ctx (see roofline above — spec/batched decode is the speed lever, CP shards the O(T) scan that otherwise caps long-ctx decode at ~1 tok/s).
 
@@ -870,3 +1740,1271 @@ breakdown that ranks them is item 1.
 > **If a job restart wipes /local / moves the alloc:** re-stage (Step 1 of this doc) + regenerate
 > topo (never `SKIP_TOPO=1` across jobs). The single-node pinned bench (`ds4f_decode_bw_bench.c`,
 > cores 12–59) is the alloc-free vehicle to roofline a new KV/attn kernel before wiring it.
+
+---
+
+## Optimization R&D — 1–4 node workstreams (folded from ds4f-opt.md, 2026-06)
+
+The perf gaps decomposed into independent workstreams that iterate on **1–4 nodes** (not the scarce
+11/12-node alloc), each with exact repro commands + a resume prompt, so multiple agents can work in
+parallel. Final integration (real-weight 11n token-identical A/B + tok/s) is the only step needing the
+big alloc. Ground rules per agent: native `fcc` single-node; every change behind its own default-OFF
+`DS4F_<NAME>=1` flag; the cheap→expensive validation ladder (single-node Python-ref → single-node perf
+bench → 11n real-weight A/B). *(Originally the companion doc `a64fx/ds4f-opt.md`, folded here.)*
+## The numbers being attacked (from the roofline revisit)
+
+DECODE (M=1, 11n, Q8 dense, @ctx10240 = 77.9 ms/tok; real-gen mHC path = 105.8 ms/tok):
+- matvecs 29.6 ms at **247 GB/s = 31% of 800 GB/s** (µbench proves 85% per-matvec) → WS2
+- **mHC hc_pre/hc_post ~37 ms/tok, 35% of the real-gen wall** (newly found) → WS1
+- comm 13.5 ms = 43 all-reduces × ~300 µs (utofu tree bench = 23.5 µs) → WS4 ❌ CLOSED: the reduce
+  is already a tree and the 300 µs is straggler-sync (EP barrier waiting on the slowest rank's
+  expert compute), NOT comm — unfixable at the comm layer; lever is structural (MTP/spec). See WS4.
+- attn 15.0 + tb2prep 17.4 = per-position floor (already 6.6×/19× optimized; low priority)
+
+PREFILL (batched GEMM, compute-bound): 56.3 tok/s @batch32 = **~13% of the 450 tok/s FMA
+ceiling**; the 8x3-pv GEMM kernel runs at 7–13% of peak vs the 89% proven in
+`a64fx/doc/FP16_GEMM_CEILING.md` → WS3.
+
+## Ground rules (every agent)
+
+1. **Compilers**: native `fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast` (this host IS
+   an A64FX node — run single-node binaries directly, no pjsub). Build via
+   `make -C a64fx/llm <target> CC=fcc OPENMP=1`.
+2. **Every change behind its own env flag, default OFF** (`DS4F_<NAME>=1` to enable). This is how
+   parallel streams merge without conflicts and how A/Bs stay honest.
+3. **Validation ladder** (cheap → expensive; never skip a rung):
+   a. single-node Python-ref tests: `OMP_NUM_THREADS=12 taskset -c 12-23 ./build/ds4f_exact_test`
+      then max-abs vs ref: `paste tools/exact_py.txt exact_c.txt | awk '{d=$2-$4;a=d<0?-d:d;if(a>m)m=a}END{print m}'`
+      — gate **exact ≤ 5e-8**; same for `ds4f_tierb2_test` gate **≤ 2e-6**; `ds4f_mhc_test` for HC
+      paths; `ds4f_gemm_test` must stay **205/205**.
+   b. single-node perf bench (per workstream below) — report before/after numbers.
+   c. FINAL (main session only): 11n real-weight gen A/B — bit-exact/token-identical for
+      disjoint-output changes, "coherent + lockstep + NaN=0" for reassociating changes (the
+      Step-2r standard).
+4. **Do not commit** — leave changes on the worktree + a summary; the main session integrates.
+5. Multi-node (2–4) when needed: synthetic weights (`DS4F_REAL=0`) run at ANY node count
+   (experts shard e%N). Real weights at N=4 are *plausible* (est. RSS ≈ 22.5 GB/node: experts
+   64×~13 MB vs 24× at /11) but unproven — validate against **MemFree, never RSS**
+   (see CLAUDE.md), and don't fight it: synthetic + lockstep is the multi-node R&D vehicle.
+6. Profile vocabulary: `DS4F_PROF=1` prints per-phase ms; top-level phases are indices 0..8
+   (`qkv_proj attn o_proj shared router experts head other tb2prep`); the `tb2*`/`qkv_*` lines
+   are SUB-timers (do not double-count). `o_proj` has an underscore.
+
+---
+
+## WS1 — parallelize mHC hc_pre/hc_post (decode real-gen)  ✅ LANDED (2026-06-11)
+
+**RESULT (11n real-weight gen A/B, MAX_NEW=64, the quicksort prompt):** `DS4F_HC_PAR=1` is
+**TOKEN-IDENTICAL** to off (64/64 ids, identical completion, NaNs=0, lockstep) and lifts real-gen
+decode **9.46 → 11.80 tok/s (+24.7%)**; the `other`/mHC phase drops **51.1 → 30.5 ms** (−40% of the
+phase). Below the optimistic 37→5 ms target — HC_PAR parallelized the collapse/expand fn-matvecs but
+`other` is still 30.5 ms. **Landed**: `DS4F_HC_PAR` now defaults ON in the perf wrappers
+(`run_ds4f_gen_11n.sh`, `run_ds4f_longctx_11n.sh`) and OFF in the base `run_ds4f_11n.sh` (clean
+reference) — mirrors the `Q8_DENSE` pattern. Code was already committed (ef0642e); the impl below
+is unchanged.
+
+**WS1b LANDED (2026-06-11): fold the mHC RMS into the mixes-matvec dispatch.** Measured the residual
+30.5 ms `other`: RMS sum-of-squares = 89 µs/call = **35% of `other`**, a serial latency-bound double
+reduction on tid0 (matvec 111 µs and collapse 61 µs are already-parallel and irreducible). `DS4F_HC_RMSPAR=1`
+runs a fused worker that computes the IDENTICAL F32 matvec rows AND a per-thread partial sum-of-squares
+of x4 over a disjoint slice; the caller combines partials in fixed tid order. Because `ss` is a **double**
+accumulation, the parallel-vs-sequential reassociation (~1e-13) is below the `float rsq` epsilon ⇒
+**BIT-IDENTICAL** result (mhc_test on-vs-off = 0.0 even at 48 threads; exact 5e-8 unchanged). 11n real-gen
+A/B **TOKEN-IDENTICAL** (64/64, NaNs=0, lockstep): `other` 30.5 → 24.1 ms, decode **11.80 → 12.77 tok/s
+(+8.2%)**. Cumulative WS1+WS1b vs pre-mHC-par: 9.46 → **12.77 tok/s (+35%)**, `other` 51.1 → 24.1 ms.
+Default ON in the perf wrappers, OFF in base. (A dead-end checked first: serializing the tiny mixes matvec
+— `DS4F_HC_MVSER` — was a **10× regression**; the 24-row matvec is latency-bound and *needs* the pool.)
+Remaining `other` (24.1 ms) is now the two irreducible parallel dispatches (matvec+collapse) per hc_pre.
+
+
+
+**Current**: ~37 ms/tok ("other" 50.2 gen vs 13.5 synthetic) = 86 calls/tok (2 per layer × 43) of
+`ds4f_hc_pre` / `ds4f_hc_post` (+`ds4f_hc_head` once): f32 fn-matvec `[hc=4, 16384]`, sinkhorn
+weights, collapse/expand loops over `[4×4096]`, plus `memcpy(s_resid, s_x4, 64KB)` — all serial
+on the calling thread, BETWEEN pool dispatches. Same pattern as the validated 2j/2k wins
+(`ds4f_q_norm_rope_par` 15×, `DS4F_TB2ROPE_PAR` 19× — copy their structure).
+**Target**: ~5 ms/tok. **Files**: `common/ds4f_impl.h` — `ds4f_hc_pre`, `ds4f_hc_post`,
+`ds4f_hc_head_p` (~line 3930–4000); flag `DS4F_HC_PAR` (default off).
+
+Repro (1 node):
+```
+make -C a64fx/llm ds4f_mhc_test ds4f_exact_test ds4f_tierb2_test ds4f_runner CC=fcc OPENMP=1
+cd a64fx/llm
+python3 tools/ds4f_mhc_ref.py                     # writes mhc_py reference
+OMP_NUM_THREADS=12 taskset -c 12-23 ./build/ds4f_mhc_test    # correctness gate
+# perf: single-node synthetic decode w/ mHC on, profile "other":
+OMP_NUM_THREADS=48 DS4F_MHC=1 DS4F_TIERB2=1 DS4F_PROF=1 DS4F_MAXGEN=32 ./build/ds4f_runner
+```
+Gates: mhc_test bit-exact serial-vs-par (disjoint per-stream/per-dim splits ⇒ must be
+BIT-EXACT, not just close); exact/tierb2 unchanged; single-node "other" phase before/after.
+
+**Resume prompt**: "In /vol0006/mdt0/data/hp250467/work/gemm/ds4f, the mHC hyper-connection wrap
+(ds4f_hc_pre/ds4f_hc_post in common/ds4f_impl.h, called 86×/token in ds4f_forward_token) costs
+~37 ms/tok of serial scalar work between pool dispatches — 35% of real-gen decode. Parallelize it
+across the existing thread pool (ds4f_pool_run, see ds4f_q_norm_rope_par for the validated
+pattern: split disjoint output ranges, bit-exact). Gate behind DS4F_HC_PAR=1 default off. Validate
+bit-exact via build/ds4f_mhc_test + ds4f_exact_test 5e-8 + ds4f_tierb2_test 2e-6, then measure the
+'other' phase with DS4F_PROF=1 on the single-node ds4f_runner (DS4F_MHC=1 DS4F_TIERB2=1). Target
+37→5 ms. Single A64FX node, no mpiexec. Don't commit; report before/after phase ms."
+
+## WS2 — dense matvec issue efficiency  ⏹ CLOSED / no clean win at production scale (2026-06-11)
+
+**FINISH (2026-06-11):** `DS4F_MV_FUSE` (the landed dispatch-fusion, commit 81575de) was validated
+on 11n real-gen for the first time: **TOKEN-IDENTICAL** but **+0.86% only** (12.77 → 12.88 tok/s,
+phases move both directions) — i.e. **NEUTRAL within noise**. The premise below ("the in-loop matvec
+loss is pool-dispatch/serial-gap overhead") does NOT hold at production scale: real-gen dense is **Q8
+(int8 svdot), which is issue/dequant-bound, not BW- or dispatch-bound** (`ds4f_decode_bw` confirms
+fp8/Q8 decode is ~10% of the 723 GB/s ceiling — a different regime from the bf16 80%-of-BW the "247
+vs 610" framing assumed). The matvec phases (qkv 7 + o_proj 9 + shared 6 + experts 5 + head 2 = 29 ms)
+are near the Q8 kernel's throughput, and fusing 2 dispatches/layer barely registers. `matvec_sdot_8row`
+already runs 8 independent row-accumulators and is svdot-throughput-bound, so the remaining idea
+(SVE prefetch / more accumulators) would help latency, not issue throughput — uncertain micro-opt, not
+a clean win. **MV_FUSE left default-OFF** (bit-exact but not worth enabling). WS2 is closed; the dense
+decode matvec is issue-bound and the realistic next decode lever is structural (MTP/spec). Original
+(refuted-at-scale) framing preserved below.
+
+**Current** (premise refuted at 11n — see above): decode matvecs 29.6 ms for 7.3 GB = 247 GB/s; `ds4f_decode_bw_bench.c` proves ~85%
+of the ~720 GB/s node read ceiling per matvec in isolation ⇒ the loss is in-loop: pool dispatch
+overhead (~10 `ds4f_pool_run` per layer), thread ramp, inter-matvec serial gaps, CMG locality of
+the Q8 528-byte blocks. **Target**: ≥440 GB/s in-loop (matvecs ≤ ~16 ms).
+**Files**: `common/ds4f_impl.h` — `ds4f_matvec`, `ds4f_mv_worker`/`ds4f_mv_bd_worker`,
+`ds4f_pool_run` (pool at top of file); flag `DS4F_MV_FUSE` (or similar).
+
+Repro (1 node, NO model load needed):
+```
+make -C a64fx/llm ds4f_decode_bw CC=fcc OPENMP=1
+cd a64fx/llm && taskset -c 12-59 ./build/ds4f_decode_bw     # per-shape/per-dtype GB/s table
+# in-loop: synthetic single-node decode, watch qkv_proj/o_proj/shared phases:
+OMP_NUM_THREADS=48 DS4F_TIERB2=1 DS4F_PROF=1 DS4F_MAXGEN=32 ./build/ds4f_runner
+```
+Ideas (in expected-value order): chain consecutive matvecs into ONE pool dispatch (qkv triple;
+sh_w1+w3 pair — workers already exist, give them a task list); persistent-worker spin instead of
+wake-per-dispatch; software prefetch (`svprfd`) in the Q8/bf16 inner loops; verify Q8 block
+first-touch is CMG-local to the rowsplit that reads it (the 2i lesson: mismatched first-touch =
+cross-CMG reads). Gates: exact/tierb2/gemm tests unchanged + bit-exact A/B of one forward
+(fused vs not — same dot order ⇒ bit-exact required).
+
+**Resume prompt**: "In /vol0006/mdt0/data/hp250467/work/gemm/ds4f, M=1 decode dense matvecs
+achieve 247 GB/s in-loop vs ~610 GB/s (85% of node ceiling) in the isolated
+build/ds4f_decode_bw bench — the loss is dispatch/serial-gap/locality, not the kernel. Reduce
+per-layer pool dispatches (fuse the wq_a/wq_b/wkv chain and sh_w1+sh_w3 into single dispatches
+with task lists), add SVE prefetch, and check Q8_PV 528B-block first-touch CMG locality (pattern:
+a64fx/ds4f.md Step 2i). Flag DS4F_MV_FUSE=1 default off, keep per-tensor dot order identical
+(bit-exact gate). Validate: ds4f_exact_test 5e-8, ds4f_tierb2_test 2e-6, then DS4F_PROF=1 phases
+(qkv_proj+o_proj+shared+experts+head, currently ~29.6 ms/tok @48T) on single-node ds4f_runner
+synthetic. Target ≤16 ms. One A64FX node. Don't commit; report the phase table before/after."
+
+## WS3 — GEMM kernel 12×2 port (prefill: 7–13% → 20–40% of FMA peak, 3–4×)
+
+**Current**: `ds4f_gemm_worker` (8x3-pv register blocking, K-tile 4096) + MXFP4 tile-dequant hit
+~84–147 Gmac/s vs 3.07 Tmac/s fp32 peak. The repo has an 89%-of-peak blueprint:
+`a64fx/doc/FP16_GEMM_CEILING.md` (12×2 blocking, 4K unroll, no-epilogue-convert).
+**Target**: ≥600 Gmac/s (20%) conservatively; stretch 1 Tmac/s.
+**Files**: `common/ds4f_impl.h` — `ds4f_gemm`/`ds4f_gemm_worker` (~line 558+) + the MXFP4 tile
+path; flag `DS4F_GEMM12X2` (default off, fall back per-shape).
+
+Repro (1 node):
+```
+make -C a64fx/llm ds4f_gemm_test ds4f_kernels_bench CC=fcc OPENMP=1
+cd a64fx/llm
+OMP_NUM_THREADS=48 ./build/ds4f_gemm_test          # MUST stay 205/205, prints Gmac/s per shape
+taskset -c 12-59 ./build/ds4f_kernels_bench        # kernel-level Gmac/s
+```
+Gates: gemm_test 205/205 + relL2 thresholds unchanged + argmax-exact columns; exact/tierb2
+regression. NOTE: stay fp32-accumulate (bf16 in, f32 acc) — fp16-accumulate flips argmax (the
+Step-2o magic/FTZ lesson); it's a later, separately-gated lever.
+
+**Resume prompt**: "In /vol0006/mdt0/data/hp250467/work/gemm/ds4f, the batched-prefill GEMM
+(ds4f_gemm_worker in common/ds4f_impl.h, 8x3-pv) runs at 7–13% of the A64FX 3.07 Tmac/s fp32 FMA
+peak; prefill is compute-bound so this is the whole prefill lever (56.3 tok/s vs 450 ceiling).
+Port the register-blocking/scheduling from a64fx/doc/FP16_GEMM_CEILING.md (89%-of-peak 12×2
+study) into the bf16→f32 GEMM path, keeping fp32 accumulate (fp16-acc flips argmax — do NOT).
+Flag DS4F_GEMM12X2=1 default off with per-shape fallback to 8x3. Validate: build/ds4f_gemm_test
+must stay 205/205 (it also prints Gmac/s per shape — that's the perf metric), plus
+ds4f_exact_test 5e-8 / ds4f_tierb2_test 2e-6. Iterate kernel-only via build/ds4f_kernels_bench
+pinned taskset -c 12-59. Target ≥600 Gmac/s on the [M=32, 4096×4096-class] shapes. One A64FX
+node, no MPI. Don't commit; report Gmac/s per shape before/after."
+
+## WS4 — tree/pipelined EP all-reduce  ❌ CLOSED / NOT-ACTIONABLE (2026-06-11)
+
+**RESOLUTION (do NOT re-attempt the ring→tree port):** the premise below is wrong on two counts.
+(1) `tp_allreduce.h` is **already a Rabenseifner tree**, not a ring (floor 7 µs@N=2 / 14 µs@N=4 /
+23 µs@N=12). (2) The in-loop ~300 µs/reduce is **straggler-sync-bound, not comm-bound**: the
+per-layer MoE-combine all-reduce is a hard EP barrier and `ep_ar_callback`'s timer counts the
+spin-wait for the **slowest rank's expert compute** as "comm". Measured (2–4 node subset,
+`tp_ar_diag_bench.c`): skew slope **b = 0.999–1.000** (reduce time = floor + max per-rank delay,
+1:1); robust-mode overhead **0.3 µs**; cold-cache penalty **~0**. Corroborated by the prior
+`TP_AR_BF16` refutation (−2.5%, not the −35% a payload-bound reduce shows) and a synthetic N=4
+runner (comm ≈1 ms/reduce = ~70× the floor on balanced load — the barrier absorbs per-rank compute
+jitter). ⇒ **No `tp_allreduce.h` header lever (robust cadence / prefetch / topology / bf16 payload)
+can recover it; the floor is already optimal and <8% of 300 µs.** The real fix is **STRUCTURAL** and
+lives in the **MTP/spec-decode stream** — batched/spec decode amortizes the per-barrier straggler
+wait 1/K (exactly why M2b GEMM-decode already cut comm 13.1→2.3 ms/tok). Async overlap (summary.md
+#8) is N/A to M=1 decode (layer L+1 data-depends on L's reduced hidden). Full writeup + tables:
+`a64fx/ds4f-ws4-findings.md`. **No `DS4F_AR_TREE` flag was added.** The original (now-refuted)
+framing is preserved below for the record.
+
+---
+
+**Current** (REFUTED — see resolution above): 43 sequential f32 all-reduces/token (16 KB hidden each)
+at ~300 µs each through `tp_allreduce.h` (ring). `a64fx/utofu-tests/summary.md` measured
+Rabenseifner-tree ≈ 23.5 µs at 11 nodes. **Target**: ≤50 µs/reduce. **Files**:
+`a64fx/utofu-tests/tp_allreduce.h` (the production reduce used by ds4f_ep_runner) + benches
+`reducescatter_bench.c`/`allgather_bench.c`. Flag `DS4F_AR_TREE=1` default off.
+
+CORRECTNESS NOTE: a tree changes the f32 summation ORDER vs the ring ⇒ results are COHERENT, not
+bit-identical to ring (like the Step-2r contraction shards). What MUST hold: (a) every rank
+computes the IDENTICAL value (same deterministic order on all ranks ⇒ lockstep argmax holds);
+(b) NaN=0; (c) fixed order across calls (no opportunistic arrival-order reduction). The earlier
+`TP_AR_BF16` refutation was the *payload precision*, not the topology — f32 tree is fine.
+
+Repro (2–4 nodes; this is the one WS needing mpiexec — use a small pjsub alloc, see CLAUDE.md):
+```
+pjsub -g hp250467 -L "freq=2000,eco_state=0,rscgrp=small,node=4,elapse=00:30:00" --no-check-directory <script>
+# in-script: cd a64fx/utofu-tests && make CC=fcc && mpiexec -np 4 ./tofu_topo_helper && \
+#   mpiexec -np 4 ./<your_tree_allreduce_bench>     # latency vs ring at 16 KB f32
+# integration smoke (synthetic weights run at ANY N):
+cd a64fx/llm && mpiexec -np 4 ./build/ds4f_ep_runner   # DS4F_AR_TREE=0/1: lockstep argmax must match itself across ranks
+```
+Gates: bench exactness (tree sum == ring sum within deterministic-order reproducibility; rank0
+vs rankN identical bits); 4-node synthetic ep_runner lockstep (`argmax_distinct_across_ranks==1`)
++ NaN=0 with the flag on; latency table 16 KB/64 KB/1 MB payloads ring-vs-tree at N=2,4.
+
+**Resume prompt**: "In /vol0006/mdt0/data/hp250467/work/gemm/ds4f, DS4F decode does 43 sequential
+16 KB f32 all-reduces/token via the ring in a64fx/utofu-tests/tp_allreduce.h at ~300 µs each
+(13.5 ms/tok = 17% of decode); the repo's own utofu tree benchmark measured 23.5 µs. Implement a
+deterministic-order tree (Rabenseifner RS+AG or binomial) in tp_allreduce.h behind DS4F_AR_TREE=1
+(default off), keeping f32 payload (bf16 payload was REFUTED — argmax flip) and a FIXED reduction
+order so all ranks produce identical bits (lockstep requirement). R&D on a 4-node pjsub alloc
+(rscgrp=small node=4, see repo CLAUDE.md for pjsub): microbench ring-vs-tree at 16KB/64KB/1MB,
+then smoke ds4f_ep_runner -np 4 with synthetic weights (DS4F_REAL unset) checking
+argmax_distinct_across_ranks==1 and NaN=0 with the flag on. Target ≤50 µs at 16 KB. Don't commit;
+report the latency table + the lockstep check."
+
+## WS5 — quick wins / wiring (low risk, fold into any stream)
+
+- **TP_HEAD in plain decode** (−1.0 ms): already implemented + bit-exact-validated at 11n; just
+  ensure the champion-config wrappers (`run_ds4f_gen_11n.sh`, `run_ds4f_longctx_11n.sh`) can
+  enable it; nothing to R&D. (CAUTION: TP_HEAD currently breaks the MTP *draft* — accepts=0 in
+  the M4 sweep — debug that in the MTP stream, not here.)
+- **tb2prep micro** (17.4 ms: lcmp 4.6 + topk 4.2 + scan 3.6 + qproj 3.2): single-node probes
+  exist (`tools/idxscan_bw_probe.c`, `tools/idxscore_probe.c`). Diminishing returns — only attack
+  after WS1/WS2 land.
+
+## Parallelization & merge notes
+
+- WS1/WS2/WS3 all edit `common/ds4f_impl.h` but DISJOINT functions (hc_*, matvec/pool, gemm) —
+  use separate worktrees/branches off `ds4f`, each behind its own default-off flag; merges are
+  textual no-ops. WS4 edits only `a64fx/utofu-tests/tp_allreduce.h`.
+- Expected combined effect (from the roofline): real-gen decode 105.8 → ~55 ms (~18 tok/s),
+  synthetic 77.9 → ~45 ms (~22 tok/s), prefill 56 → 150–200 tok/s; structural decode ceiling
+  stays ~32 tok/s (attn+tb2 per-position floor — only MTP/spec decode goes past it). **NOTE: WS4's
+  +12% is removed — diagnosed as unrecoverable straggler-sync; its budget folds into MTP/spec.**
+- Integration order (main session, 11n alloc): WS1 (bit-exact) → WS2 (bit-exact) → WS3
+  (argmax-exact). ~~WS4~~ CLOSED (no code change). WS1 HC_PAR + WS2 MV_FUSE already confirmed
+  lockstep + bit-identical on/off at N=4 synthetic (2026-06-11) ahead of the 11n A/B.
+
+## WS6 — Q8 GEMM small-M remainder NaN (1-node bug, found 2026-06-10)
+
+**Symptom**: `ds4f_forward_verify` / `DS4F_GEMM_DECODE` under `DS4F_Q8_DENSE=1` produces **NaN
+nondeterministically** (some 11n runs fine, some all-NaN; |hc_head|=nan at the first head eval ⇒
+the layer dense GEMMs NaN'd). `DS4F_Q8_DENSE=0` (bf16 dense) always works. Plain decode (matvec
+Q8) is fine. Now GUARDED: the runner `die()`s if SPEC/GEMM_DECODE + Q8_DENSE (ds4f_ep_runner.c).
+**Root-cause hypothesis**: the verify calls `ds4f_gemm` with **M=1–2**, so it only hits the Q8
+worker's single-token remainder kernel (`matvec_sdot_8row`, `ds4f_gemm_worker` ~line 570), which
+`ds4f_gemm_test` (M=32/64) barely exercises — vs the M≥3 `matvec_sdot_8row_3x` path it covers
+well. Likely an uninitialized/tail read in the 1–2-token Q8 sdot as driven by the gemm (the
+`__thread` xq/xs scratch is correct; NOT a realloc race — that was mis-diagnosed and reverted).
+
+**1-node repro** (NO alloc, fast iterate):
+```
+make -C a64fx/llm ds4f_gemm_test CC=fcc OPENMP=1
+cd a64fx/llm
+# EXTEND ds4f_gemm_test.c to add M=1 and M=2 Q8_PV cases (it currently tests M=32/64) -> should
+# reproduce the NaN/garbage at M=1,2; then it's a pure single-node kernel debug loop:
+OMP_NUM_THREADS=48 ./build/ds4f_gemm_test            # add small-M Q8 rows; watch relL2/argmax/NaN
+```
+Gate: gemm_test 205/205 + the new small-M Q8 rows pass (relL2 ~1e-6, argmax-exact, NaN=0).
+Then the verify works under Q8 and the guard can be relaxed (though bf16 dense stays the
+recommended spec config — Q8 batched is dequant-bound, no speed win).
+
+**Resume prompt**: "In /vol0006/mdt0/data/hp250467/work/gemm/ds4f, the Q8_PV path in
+ds4f_gemm_worker (common/ds4f_impl.h ~line 550) NaNs nondeterministically for small M (1-2 tokens)
+— the verify hits only the single-token remainder kernel matvec_sdot_8row, which ds4f_gemm_test
+(M=32/64) doesn't cover. Add M=1 and M=2 Q8_PV cases to a64fx/llm/ds4f_gemm_test.c, reproduce on
+ONE node (OMP_NUM_THREADS=48 ./build/ds4f_gemm_test, no mpiexec), and fix the kernel (suspect
+uninitialized accumulator / K-tail / scale read in the 1-2-token Q8 sdot). The __thread xq/xs
+scratch is correct — do NOT touch its allocation (a realloc-race 'fix' was already tried and
+reverted). Gate: gemm_test 205/205 + new small-M rows relL2~1e-6 argmax-exact NaN=0. Then remove
+the DS4F_SPEC/GEMM_DECODE+Q8 guard in ds4f_ep_runner.c. Don't commit; report the failing
+shape + the fix."
+
+## WS7 — DS4F_TP_ATTN + DS4F_Q8_DENSE wrong output (11n bug, found 2026-07-08, likely sibling of WS6)
+
+**Symptom**: `DS4F_TP_ATTN=1` (wq_b head-shard, an existing but never-enabled-in-preset memory/speed
+lever) combined with the decode preset's `DS4F_Q8_DENSE=1` produces **coherent-looking but WRONG**
+generated tokens — diverges from the very FIRST decoded token (gen_ids 0/64 match vs the correct
+reference), yet `NaN=0` and `rc=0` throughout, and the aggregate stats (decode tok/s, RSS) look
+entirely plausible (13.62 tok/s, RSS -1.37 GB — this is what makes it dangerous: a superficial A/B
+that only checks NaN=0 + last-token argmax would ship it as a clean win). **Always diff the FULL
+generated token sequence, not just the last token**, when validating a TP/sharding change.
+
+**Bisection (11n real-weight A/B, same 24-tok prompt, 64-tok greedy decode, `run_ds4f_gen_11n.sh`
+called directly — `run_ds4f_agentic_11n.sh`'s hardcoded `export DS4F_Q8_DENSE=1` clobbers an env
+override, use `run_ds4f_gen_11n.sh`'s `${VAR:-default}` form to actually toggle flags):**
+- `TP_ATTN=1, Q8_DENSE=0, OPROJ_FUSE=0` (plain per-group o-proj, no block-diag at all) → **64/64
+  IDENTICAL** to the `TP_ATTN=0` reference. Correct.
+- `TP_ATTN=1, Q8_DENSE=0, OPROJ_FUSE=1` (bf16 block-diagonal o-proj, `ds4f_matvec_blockdiag`'s
+  `DS4F_BF16_PV` branch) → **64/64 IDENTICAL**. Correct — `ds4f_matvec_blockdiag` itself is fine.
+- `TP_ATTN=1, Q8_DENSE=1` (forces `ly->wo_a.type==DS4F_Q8_PV`, which forces block-diag
+  unconditionally via the `ds4f_oproj_fuse || tpo || wo_a.type==DS4F_Q8_PV` check regardless of the
+  `OPROJ_FUSE` flag) → **0/64 match, diverges at token 1**. **Broken.**
+
+**Isolates the bug to `ds4f_matvec_blockdiag`'s `DS4F_Q8_PV` branch** (common/ds4f_impl.h ~line 498,
+inside `ds4f_mv_bd_worker`) specifically when its activation input (`m->s_attn`) is a TP_ATTN-partial,
+zero-padded buffer. `wq_b`'s own (non-block-diag) `DS4F_Q8_PV` matvec branch (~line 377, in plain
+`ds4f_matvec`) can be ruled out analytically: it quantizes `m->s_qlat`, which is REPLICATED (identical
+on every rank, unaffected by TP_ATTN) — deterministic quantization of identical input cannot diverge
+across ranks, so it's architecturally safe regardless of TP_ATTN's row-sharded *output*.
+
+**Root cause NOT fully pinned down** despite deep inspection: `ds4f_quant_x_sdot_into`'s 64-element
+quantization blocks are each entirely within ONE attention head (HD=512 = 8×64), and TP_ATTN shards
+at whole-head granularity (always a multiple of 512, hence of 64) — so blocks never straddle an
+ownership boundary, and per-block dequant (`matvec_sdot_8row`, ggml_dequant.h:1709) is a standard
+weight-scale × activation-scale × int8-dot with no obvious cross-block interaction. This analysis
+suggests the partial-quantize-then-all-reduce-sum SHOULD reconstruct the full-quantize result exactly
+— yet it measurably doesn't. Given WS6 (above) already documents a DIFFERENT nondeterministic Q8_PV
+bug in the same kernel family (`ds4f_gemm_worker`'s small-M remainder path) that also resisted
+surface-level inspection, this is likely a SIBLING low-level bug in the shared int8 W8A8 machinery
+(`ds4f_quant_x_sdot_into` / `matvec_sdot_8row` / the `__thread` xq/xs scratch reuse across groups),
+not a TP_ATTN-specific logic error — worth debugging WS6 and WS7 together.
+
+**Disposition**: NOT shipped (`DS4F_TP_ATTN` stays off in `--preset decode`). Benefit was modest
+(+1.9% decode speed, -1.37 GB RSS in the broken measurement — unverified once/if fixed) vs. the
+already-landed `TP_HEAD`+`TP_EMBED` wins (+2.3% speed, -1.9 GB combined, both bit-exact). Do not
+enable `DS4F_TP_OPROJ` or `DS4F_TP_SHARED` either without first resolving this — same block-diag /
+Q8_PV interaction surface, same risk.
+
+**Resume prompt**: "In /vol0006/mdt0/data/hp250467/work/gemm/glm5-1, DS4F_TP_ATTN=1 combined with
+DS4F_Q8_DENSE=1 produces wrong (but NaN-free, plausible-looking) decode output — isolated to
+ds4f_matvec_blockdiag's DS4F_Q8_PV branch (common/ds4f_impl.h ~line 498) via 11n A/B bisection (see
+WS7 above for the full trail). Both non-Q8 o-proj paths (plain per-group AND bf16 block-diagonal)
+are bit-exact under TP_ATTN; only the int8 W8A8 block-diag kernel breaks. Likely a sibling of WS6
+(same matvec_sdot_8row/ds4f_quant_x_sdot_into machinery). Reproduce with a 1-node unit test if
+possible (mirroring WS6's ds4f_gemm_test approach) rather than the slow 11n A/B loop: construct a
+synthetic multi-rank TP_ATTN scenario (partial/zero-padded input vector, per-rank local quantization,
+sum the dequantized partial dot products) and compare against a single full-vector quantize+dot
+reference. If the isolated kernel test also shows a mismatch, the bug is confirmed structural
+(not an artifact of the real-weight 11n harness) and can be fixed without needing an allocation.
+Candidate structural fix if root-causing stalls: extend the existing `if (tpo && ...) m->ar_cb(m->
+s_attn, H, m->ar_ctx);` pre-reduce (common/ds4f_impl.h ~line 5352, currently gated only on `tpo`==
+TP_OPROJ) to ALSO fire whenever `ly->wo_a.type==DS4F_Q8_PV`, so every rank quantizes an already-
+fully-reduced (not partial) s_attn — trades away TP_ATTN's comm savings for correctness, needs its
+own A/B to confirm. Don't commit without an 11n token-for-token bit-exact re-validation."
+
+## DS4F-BASE — DeepSeek-V4 base (fp8 experts) on 12 nodes  ✅ LANDED (2026-07-11)
+
+`~/models/ds4fbase` (275 GB) runs on 12 A64FX EP nodes at FULL fp8 expert fidelity (no
+requantization). Scripts: `run_ds4fbase_{stage_12n,12n,gen_12n}.sh`. Commit: "ds4fbase: run
+DeepSeek-V4 base (fp8 experts) on 12 A64FX nodes".
+
+### The whole port was two changes
+
+Diffed all 46 shards of ds4f vs ds4fbase: ZERO missing tensors (the only 2 extras are `mtp.*`,
+already skipped by the stager), and every remaining difference falls into two classes:
+
+1. **Every `*.scale` is `F32`, not `F8_E8M0`** (same shapes). The values are EXACT powers of two
+   (`scale_fmt="ue8m0"`), so `ds4f_stage.c` now folds them to E8M0 bytes at stage time via an
+   exponent bit-extract. Lossless => **zero loader/kernel changes**: by the time the loader sees
+   the blob, base and Flash scales are identical. Keyed on source dtype, so ds4f still passes
+   through untouched. A non-pow2 value is a hard abort — a clean full stage IS the proof the
+   premise holds model-wide (it did, all 46 shards x 12 ranks).
+2. **Routed experts are FP8-e4m3 + 128x128 block scale, not MXFP4.** Only hardcoded at the
+   ALLOCATION sites; `ds4f_matvec`/`ds4f_gemm`/`ds4f_load_q` already dispatch `DS4F_FP8`, and
+   `ds4f_sbytes(DS4F_FP8,2048,4096)` = 16x32 = 512 B is EXACTLY base's scale shape. Became one
+   `cfg.expert_qt` field (`DS4F_MODEL=ds4fbase`).
+
+### Dense TP is MANDATORY (this is what makes 12 nodes work)
+
+FP8 experts are 24 MiB each (vs MXFP4's 12.75) = 22.17 GiB/node at EP=12. Per node (GiB):
+
+| | experts | dense | tb2w | emb/head | TOTAL |
+|---|---|---|---|---|---|
+| no TP  | 22.17 | 5.50 | 0.87 | 1.97 | **30.52  DOES NOT FIT** (29.0 avail) |
+| +TP    | 22.17 | 1.26 | 0.87 | 0.16 | **24.47  fits** |
+
+Measured arena: **25.34 GB** (ranks 0-3, 22 experts) / **24.15 GB** (ranks 4-11, 21 experts).
+`DS4F_TP_ATTN/OPROJ/WOB/SHARED/HEAD/EMBED` all default ON in `run_ds4fbase_12n.sh`. Corollary:
+`DS4F_FP8_BF16` and `DS4F_Q8_DENSE` must stay OFF (they promote dense to bf16, +6 GB we do not
+have), which forces `DS4F_PREFILL_BATCH=0`. More nodes = fewer experts each, so 12 fits where 11
+would not.
+
+Rank placement: 256 = 12*21 + 4, so ranks 0-3 own 22 experts and ranks 4-11 own 21, and
+`ep_rank == MyRank ==` vcoordfile line order. The scripts put the login/claude node LAST (rank 11)
+so it gets the small shard (~1.1 GB less). Interactive is capped at 12 nodes, so that node hosts a
+rank whether we like it or not.
+
+Validated: full stage 2126 s (12/12, no pow2 abort), 43-layer load, NaNs=0, all 12 ranks lockstep
+in prefill AND decode, and a correct greedy quicksort completion.
+
+### CONTEXT: 1M fits. `DS4F_INT8_KV` must be OFF — it COSTS context, it does not save it
+
+**`DS4F_INT8_KV=1` is a long-ctx TRAP on this model.** It allocates `ly->kv_q = max_pos * kv_lora`
+for EVERY layer (`common/ds4f_impl.h` ~2040), which DEFEATS Tier-B2's KV windowing. The default
+(`INT8_KV=0`) `kv_cache` path instead uses `ly->kv_slots`, which windows the 41 sparse layers to
+`window_size`=128 slots. So INT8_KV turns a flat O(1) KV into 43 x max_pos x 512 B = **22 KB/token**
+of ARENA growth. Measured arena slope with INT8_KV=1: exactly 22,016 B/tok = 43*512*1.
+
+With **INT8_KV=0** the arena is FLAT at 25.34 GB at ANY context; only the compressed Tier-B2 caches
+grow, at ~1.7 KB/token. Measured (12n, `INT4_CMP=1 IDX_INT4=1`):
+
+| ctx | INT8_KV=1 | INT8_KV=0 (correct) | ctx-cache | decode |
+|---|---|---|---|---|
+| 32k   | —          | arena 25.34 GB | 60 MB   | 8.47 tok/s |
+| 128k  | RSS 28.24 GB (ok) | arena 25.34 GB | 223 MB  | 1.53 tok/s |
+| 192k  | **OOM (sig 9)**   | —              | —       | — |
+| 256k  | **OOM (sig 9)**   | arena 25.34 GB | 441 MB  | 1.02 tok/s |
+| 1M    | —          | arena 25.34 GB | 1747 MB | 0.25 tok/s |
+
+So **the ceiling is PERFORMANCE, not memory**: 1M fits with ~5 GB of headroom to spare, but decode
+falls off a cliff between 32k and 128k (comm 56% -> 91%) because the indexer scan is O(T).
+Practical guidance: **<=32k is the usable range (~8.5 tok/s); 128k is marginal (1.5); >=256k is a
+capability demo, not a working config.**
+
+`CTX_CACHE:` in the runner log UNDERSTATES the default path — it counts `idx_kv8`/`idx_kv8_4` but
+never the f32 `idx_kv` (2,688 B/tok). Only trust it when IDX_INT8/INT4 is on.
+
+### ❌ REFUTED: `DS4F_IDX_REUSE` does not rescue long-ctx decode here
+
+`DS4F_IDX_REUSE=4` at 256k measured **0.92 tok/s vs 1.02 without it** — slightly WORSE, no win.
+The O(T) scan is not where the 256k/1M time is going (comm is 85-91%). Do not reach for IDX_REUSE
+as the long-ctx decode fix on base/12n without re-measuring.
+
+### Two things that make a BROKEN run look healthy (cost me time; do not be fooled)
+
+- **`prefill ||x||` proves nothing.** It is the norm of the *synthetic random INPUT*
+  (`sm_next()*2-1` over 4096 dims => always ~sqrt(4096/3) = 36.7), not a model output. It is
+  byte-identical across models and configs by construction. NaNs=0 + lockstep + ||x|| would all
+  pass with a completely wrong expert dequant. **Only a coherent completion gates the numerics.**
+- **The gen wrapper's lockstep line cries wolf.** `run_ds4f_gen_11n.sh` pools the prefill and
+  decode argmaxes into one `sort -u`, so a perfectly healthy run reports "2 distinct" — and it
+  counts with `wc -w`, where "last argmax=N" is two words. `run_ds4fbase_gen_12n.sh` compares the
+  phases SEPARATELY and counts lines. The ds4f wrapper still has both bugs.
+
+## Offline dense BAKE → ds4fbase decode 11.34 → 14.06 tok/s (+24%)  ✅ LANDED (2026-07-12)
+
+`ds4f_bake.c` pre-packs the 8 dominant dense tensors/layer into the kernel-ready **BF16_PV** and
+**Q8_PV** layouts, written permanently to `~/models/<model>-fast/` (11.36 GB + 5.86 GB, 344 = 43×8
+tensors, ~107 s). `ds4f_stage.c` gains a bake overlay (`DS4F_DENSE=bf16pv|q8pv`), and the loader
+copies the bytes straight in. **No bf16 promotion peak at load.**
+
+Bit-identity is BY CONSTRUCTION: the bake calls the same `ds4f_promote_worker` / `ds4f_q8repack_worker`
+the runtime calls. **LUT trap:** the real path needs `ds4f_init_fp8_e4m3fn_lut` (exp==15 FINITE),
+NOT the synth `ds4f_init_fp8_e4m3_lut` (exp==15 → NaN). `--verify` therefore checks what can really
+break: FP8→BF16_PV max|err| = **0** (lossless), Q8 round-trip relL2 = 0.026 (int8 band).
+
+### ds4f (the testbed): token-identical, arena −5.50 GB, decode unchanged
+
+11n, 43 layers, real weights. Baked-Q8 vs the runtime `FP8_BF16=1 + Q8_DENSE=1` path:
+
+| | arena | decode | prefill argmax | decode argmax |
+|---|---|---|---|---|
+| runtime Q8 | 25.58 GB | 15.22 | 1805 | 16 |
+| **baked Q8** | **20.08 GB** | 15.24 | **1805** | **16** |
+
+TOKEN-IDENTICAL, and the arena drops exactly `11.36 (bf16) − 5.86 (q8) = 5.50 GB` — the peak.
+Decode is unchanged, as expected (same kernel; bf16-pv is already AT the BW roofline).
+
+### ds4fbase: the payoff — but ONLY after two real bugs
+
+Naive baked-Q8 was a **net LOSS** (8.91 vs 11.34). Two things had to be fixed, and both were mine:
+
+1. **`ds4f_load_dense_cshard` was FP8-only**, so `wob_s` silently fell back to a REPLICATED `wo_b`
+   (33 MiB/layer vs ~2.8). Weight traffic 2.04 → 3.36 GB/tok, o_proj 19.3 → 40.8 ms. Fixed: cshard
+   now col-shards Q8_PV (64-aligned = a contiguous run of whole 528 B blocks per group) and BF16_PV.
+2. **The Q8 block-diagonal worker re-quantized the activation PER THREAD.** Fine without TP (wo_a is
+   8192 rows → ~170 rows/thread, so one O(K) quantize amortizes); catastrophic under `TP_OPROJ`,
+   where the shard is ~683 rows → ~14 rows/thread, so all 48 threads paid a full 4096-element
+   quantize to do 14 rows of matvec. FP8 pays NO activation quant at all. Fixed: hoist it to a
+   shared once-per-group pre-pass (`ds4f_bd_prequant_worker`) — BIT-EXACT (same quantize fn, same
+   input), re-validated token-identical on ds4f.
+
+Measured 12n, SAME allocation (cross-allocation numbers are worthless here — the same FP8 config
+read 8.28 on one alloc and 11.34 on another):
+
+| config | decode | comm | qkv_proj | o_proj | shared | arena |
+|---|---|---|---|---|---|---|
+| FP8 dense, full TP *(reference)* | 11.34 | 40.2% | 6.71 | 19.34 | 7.84 | 25.34 GB |
+| FP8 dense, `TP_ATTN=0` | 8.16 | 43.4% | — | — | — | — |
+| Q8 dense, full TP | 9.02 | 59.2% | 3.89 | 40.08 | 4.70 | 25.33 GB |
+| **Q8 dense, `TP_ATTN=0`** | **14.06** | **32.1%** | 7.37 | **4.60** | 4.76 | 26.68 GB |
+
+Coherent completion, NaNs=0, 12/12 lockstep on both phases.
+
+**The mechanism (this is the transferable bit).** `o_proj`'s timer includes `TP_ATTN`'s 128 KB/layer
+`s_attn` all-reduce (`wo_a` needs the FULL `s_attn`). Q8 makes the plain matvecs ~1.8× faster
+(qkv 6.71→3.89, shared 7.84→4.70, exactly as the roofline says) but that CANNOT show up while the
+reduce dominates o_proj — hence Q8+full-TP is *slower*. Drop `TP_ATTN` and the reduce vanishes:
+o_proj becomes pure compute, 19.3 → **4.60 ms**.
+
+So the earlier "TP conservation curve" (dropping TP_ATTN is always a wash) was an artifact of the
+SLOW dense rep. Under FP8, un-sharding `wq_b` costs more compute than the reduce saves (a LOSS,
+11.34 → 8.16). Under a correct Q8 it is a large win (9.02 → 14.06). **Comm-vs-compute trades are
+not invariant — they flip when you change the kernel's speed.**
+
+### Post-bake: where ds4fbase decode actually goes now (2026-07-12)
+
+**Measure COMPUTE, not tok/s.** On this fabric the IDENTICAL config reads 10.2-13.9 tok/s
+(comm swings 23-60 ms from external contention). Compute = `ms/tok x (1-comm%)` is stable to
+±0.1 ms and is the only part we control. (An earlier "14.06 tok/s" headline of mine was a lucky
+low-comm run — the median for that config is ~10.4.)
+
+Profile after the bake (Q8 dense + TP_ATTN=0), compute 48.3 ms: **tb2prep 12.4, mhc_pre 10.2**,
+experts 7.2, qkv 7.4 (wq_b full), shared 4.8, o_proj 4.6, tb2scan 2.7. o_proj is no longer the
+problem — the Tier-B2 compressor and the mHC collapse are.
+
+Two ALREADY-BUILT levers were simply not enabled:
+
+| | compute | tb2prep | mhc_pre |
+|---|---|---|---|
+| Q8 + TP_ATTN=0 | 48.3 ms | 12.4 | 10.2 |
+| + `DS4F_CMP_LOCAL=1` (BIT-EXACT) | 44.3 | **8.3** | 10.2 |
+| + `DS4F_HC_SVE=1` (reassoc class) | **36.6** | 8.3 | **2.4** |
+
+**−24% compute**, reproduced across 3 runs each (48.3/48.3/48.4 vs 36.5/36.6/36.7). HC_SVE is
+coherence-validated on base (valid quicksort, NaN=0, 12/12 lockstep) but ids diverge → opt-in.
+
+**❌ REFUTED — `TP_ATTN=1 + TP_OPROJ=0`** (shard wq_b without triggering the s_attn reduce; the
+reduce guard needs BOTH). qkv drops 7.4→3.8 as hoped, but wo_a AND wo_b go full → compute 40.1 ms
+(worse than 36.6) and arena 28.05 GB. The bytes you add exceed the bytes you save.
+
+**What is left.** Comm (23-60 ms) is now the dominant term and is architectural at M=1 — a2a was
+already refuted, and the doc's conclusion holds: only BATCHED decode amortizes it (measured ~3.1x
+aggregate at M=16 on base). On the compute side the remaining stack is flat-ish (experts 7.2,
+qkv 7.4, tb2prep 8.3, shared 4.8, o_proj 4.6) with no single dominator left.
+
+### ⚠️ LEAVE ONE CORE FREE: `LLM_THREADS=47`, not 48 (+40%, and it kills the "variance")
+
+The single largest decode lever found on ds4fbase, and it is one env var.
+
+The node cgroup gives the job cores **12-59** (48 compute cores). The assistant cores 0-1 are NOT
+in our cpuset — `taskset` to them fails with EINVAL, so a co-located agent CANNOT be moved off the
+compute cores. With **48 OMP threads pinned 1:1 onto 48 cores**, ANY other process on that node
+(the claude session, an MPI progress thread, an OS daemon) forces one OMP thread to timeshare.
+Because the pool barrier waits for **all** 48, that one descheduled thread stalls its rank — and
+since decode comm is *wait-for-the-slowest* (WS4: skew slope b=0.999), it stalls **all 12 ranks**.
+
+Measured 12n (`DS4F_DENSE=q8pv` + `TP_ATTN=0` + `CMP_LOCAL` + `HC_SVE`), 2 runs each:
+
+| threads | decode | compute spread | comm | rank11 (claude node) |
+|---|---|---|---|---|
+| 48 | 12.00 / 12.51 | **20.3 / 15.0 ms** | 44.6 | 53 ms vs 32 min |
+| **47** | **17.06 / 17.05** | **5.3 / 5.3** | 21.6 | 38 ms |
+| 46 | 16.91 / 16.89 | 5.0 / 5.0 | 22.2 | 38 ms |
+
+**+40%, and the run-to-run variance VANISHES** (17.06 vs 17.05). Every "fabric noise" number
+earlier in this doc (10.2-13.9 tok/s for one config) was actually our own session preempting an
+OMP thread — not the network.
+
+**`renice` does NOT fix it.** The pool workers SPIN-wait, so a niced competitor still gets
+scheduled and still preempts them: 48t + `nice 19` still measured spread 20.4 ms. Only leaving a
+core free works.
+
+Residual spread at 47t is **5.3 ms** = the MoE routing imbalance (top-6-of-256 over 12 ranks →
+E[max] ≈ 2 experts vs mean 0.5, so the critical path is ~4x the average expert work). Structural —
+6 chosen experts can only land on ≤6 ranks — and only **batched decode** amortizes it.
+
+**Comm budget at 47t:** 21.6 ms = fabric floor (23 µs × 86 reduces = 2.0 ms, ~9%) + straggler
+skew (~5 ms) + jitter. It is NOT data movement, so compute/comm OVERLAP (double-buffering) has
+nothing to hide: the fast ranks are already idle waiting on a slow rank's COMPUTE. (Also already
+refuted independently: WS4 for the reduce, and the roofline for decode∥GEMM double-buffering.)
+
+**ds4fbase 12n decode, cumulative:** 11.34 (FP8 baseline) → 17.05 tok/s.
+
+## ds4f (Flash) on 12 nodes with the baked Q8 dense — 18.98 single-stream / 32.8 batched (2026-07-12)
+
+Same stack as ds4fbase (offline bake + `LLM_THREADS=47`), applied to Flash. Flash FITS WITHOUT any
+per-layer TP (arena 18.91 GB), which is the whole difference: **1 all-reduce per layer instead of 2**.
+
+Config: `DS4F_MODEL=ds4f DS4F_DENSE=q8pv`, `TP_ATTN=0 TP_OPROJ=0 TP_WOB=0`, `TP_SHARED=1`
+`TP_HEAD=1 TP_EMBED=1`, `CMP_LOCAL=1 HC_SVE=1 MV_FUSE=1`, `LLM_THREADS=47`.
+
+| step | decode | note |
+|---|---|---|
+| full TP (base-style) | 17.11 | comm 27.5 ms — TP is a NET LOSS here |
+| no per-layer TP | 18.22 | comm 27.5 → 12.4 (half the barriers) |
+| + `TP_SHARED=1` | 18.74 | FREE: its partial folds into the EP reduce, no extra all-reduce |
+| + `DS4F_MV_FUSE=1` | **18.98** | (was implemented + single-node validated but never A/B'd on real weights) |
+| *48 threads* | *14.48* | the leave-a-core-free rule holds on Flash too |
+
+### Single-stream ceiling is ~21.8 tok/s — and it is NOT the dense weights
+
+52.7 ms/tok = compute 39.7 + comm 12.1. Weight bytes 7.06 GB/tok → HBM roofline 8.5 ms.
+
+```
+dense matvec (qkv+o_proj+shared)  19.9 ms  = 295 GB/s = 73% of the PINNED q8-sdot ceiling (402)
+tb2prep (compressor/indexer)       8.3 ms  \
+experts                            4.7 ms   |  19.2 ms of NON-matvec work that
+mhc (HC_SVE already on)            4.6 ms   |  no weight format can shrink
+attn/router/head                   1.6 ms  /
+comm                              12.1 ms  = 43 reduces x ~0.28 ms (already 1/layer)
+```
+Even at the dense kernel's 402 GB/s ceiling: 14.6 + 19.2 + 12.1 = **45.9 ms → ~21.8 tok/s**. The
+blocker is the Tier-B2 attention + MoE + mHC work, i.e. model architecture, not kernel choice.
+(`bf16-pv` does not help: the pinned bench has it at the SAME wall as q8-sdot — 735 GB/s but 2x
+the bytes.)
+
+### Batched decode is where 30-40 tok/s lives
+
+`DS4F_DB_BENCH=1`, same config, aggregate tok/s:
+
+| M | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| baked Q8 | 13.7 | 18.4 | 23.5 | 26.8 | 29.7 | 31.4 |
+| **+ `DS4F_PF_TP=1`** | 15.3 | 19.9 | 24.6 | 28.1 | **31.0** | **32.8** |
+| per-seq | 15.3 | 9.95 | 6.16 | 3.52 | 1.94 | 1.02 |
+
+**Peak 32.8 aggregate at M=32; M=16 (31.0) is the sweet spot** — M=16→32 buys only +6% while
+halving per-seq latency. `PF_TP` is worth ~+6% across the curve.
+
+Two gotchas: the curve saturates because the MoE experts barely amortize (top-6-of-256 rarely
+share an expert) and Tier-B2's compressor/indexer runs PER-POSITION, so tb2prep scales ~linearly
+with M and becomes the new bottleneck. And **M=1 through the batch path (15.3) is SLOWER than
+single-stream matvec decode (18.98)** — batching is a throughput mode you switch into, not a
+strictly-better path.
+
+## Q8 EXPERTS: ds4fbase 17.07 -> 22.45 tok/s (+32%) — and comm ~= 3 x expert_time (2026-07-12)
+
+`DS4F_BAKE_EXPERTS=1` extends the offline bake to the ROUTED experts, and `DS4F_EXPERTS=q8pv`
+loads them. Base ships FP8 experts, whose on-demand gather runs at **~76 GB/s in-model** — 5x below
+the q8-sdot ceiling. Q8_PV is 1.03 B/elem vs FP8's 1.0, so the swap is essentially free on memory.
+
+Measured 12n, SAME allocation, everything else identical (q8 dense, TP_ATTN=0, CMP_LOCAL, HC_SVE,
+MV_FUSE, 47 threads), 2 runs each:
+
+| | decode | experts | comm | compute | arena |
+|---|---|---|---|---|---|
+| FP8 experts | 17.10 / 17.04 | 6.74 / 6.83 ms | 21.7 / 21.8 | 35.2-37.5 | 26.68 GB |
+| **Q8 experts** | **22.45 / 22.45** | **3.13 / 3.17** | **11.3 / 11.4** | 31.6-33.4 | 27.42 GB |
+
+Coherent completion, NaNs=0, 12/12 lockstep — and the same token ids (361/1527) as the FP8 run.
+
+### The payoff is 2x bigger than the expert phase, because **comm ≈ 3 × expert_time**
+
+  FP8: 3 x 6.79 = 20.4   vs measured comm 21.75
+  Q8 : 3 x 3.13 =  9.4   vs measured comm 11.30
+
+Per layer, top-6-of-256 routing puts ~2 experts on the MAX rank against a 0.5 average, so the EP
+all-reduce barrier waits ~3x the average expert work — 43 times per token. Decode comm is not data
+movement (fabric floor is 23 µs x 86 = 2 ms); it is **the MoE straggler, and it is a 3x multiplier
+on expert time**.
+
+**=> Cutting expert time by X cuts decode by ~4X (1X compute + 3X comm).** That is why a 3.7 ms
+expert saving bought 14 ms/token. This is the single most useful predictive rule found here.
+
+### Consequence: the BASE model now decodes FASTER than Flash
+
+| | experts | decode |
+|---|---|---|
+| ds4f (Flash) 12n | MXFP4 (svtbl, dequant-bound ~84 Gmac/s, cannot be Q8'd — would double to 22.9 GiB and blow the arena) | 18.98 |
+| **ds4fbase 12n** | **Q8_PV (sdot)** | **22.45** |
+
+The higher-fidelity 275 GB model is ~18% FASTER than the 149 GB one, purely because its FP8 expert
+format converts to a fast kernel while Flash's fp4 does not. Flash's MXFP4 experts are now its
+bottleneck, and they are stuck there by memory.
+
+Cost: the Q8 expert blob is **291 GB** in `~/models/ds4fbase-fast/` (all 256 experts x 43 layers,
+rank-agnostic; the stager picks each rank's slice). Bake ~50 min, one time.
+
+### Batched decode, ds4fbase 12n (Q8 experts + `DS4F_PF_TP=1`)
+
+| M | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| **Q8 experts** | 17.3 | 22.7 | 28.0 | 32.3 | **35.4** | **OOM** |
+| FP8 experts (old) | 11.7 | 15.4 | 19.7 | 23.9 | 28.0 | — |
+| per-seq (Q8) | 17.3 | 11.4 | 7.01 | 4.04 | 2.21 | — |
+
+**Peak 35.4 tok/s aggregate at M=16** (+26% over FP8 experts at the same M). **M=32 OOMs** (SIGKILL):
+base's arena is 27.42 GB vs Flash's 18.91, so the per-sequence cache bundles do not fit. M=16 is
+base's hard ceiling — unlike Flash, which reaches M=32.
+
+Base beats Flash at every point: **22.45 vs 18.98 single-stream, 35.4 vs 31.0 batched (M=16)**.
+
+At M=16 the step profile is **experts 164.3 ms** (of 451.8) and **tb2prep 122.1** — the MoE still
+barely amortizes even batched (top-6-of-256 rarely shares an expert), and Tier-B2's compressor runs
+per-position. Both remain the bottleneck, batched or not.
+
+### ❌ REFUTED: static MoE load balancing (2026-07-12)
+
+Given `comm ≈ 3 × expert_time` comes from the top-6-of-256 routing landing ~2 experts on the max
+rank vs a 0.5 average, the obvious fix is a smarter expert→rank map than `e % ep_size`. It does
+not work, and the reason is structural.
+
+Captured **7783 real routing decisions** (~181 decode tokens × 43 layers, `DS4F_DEBUG=1`):
+
+| assignment | E[max experts on a rank] |
+|---|---|
+| current `e % 12` | **1.85** (mean load 0.50) |
+| 200 random relabelings | 1.82 – 1.93 |
+| per-layer co-occurrence greedy, **in-sample** | **1.00** ← looks perfect |
+| per-layer co-occurrence greedy, **HELD-OUT** | **1.69** |
+| theoretical optimum | 1.00 |
+
+**Two independent kills:**
+
+1. **Global permutations are provably useless.** `e % 12` (1.85) sits *inside* the random-relabeling
+   spread (1.82–1.93). Symmetry: the top-6 SET is what is random, not the labels, so every bijection
+   e→rank is statistically identical.
+2. **Per-layer maps only memorize.** In-sample E[max] = 1.00 (the optimum!) but held-out = 1.69 —
+   a pure generalization gap. The learning curve (21→98 train tokens/layer) plateaus at ~1.69, it
+   does not trend toward 1.0. More calibration data will not save it.
+
+Best honest case: 1.92 → 1.69 held-out = **1.14×** on the max load, worth ~+4% decode — for a
+per-layer expert map threaded through the stager AND loader, plus a calibration run whose validity
+across prompts/domains is unproven. Not worth it.
+
+**The clincher:** a random-selection simulation predicts E[max] = **1.90** at M=1; the real routing
+measures **1.85–1.92**. DeepSeek's router is statistically indistinguishable from random expert
+selection at this granularity. Nothing static can beat randomness.
+
+It also *derives* the empirical rule: ratio = E[max]/mean = **3.79×**, so the barrier waits
+≈ (max − own) ≈ 3× the average expert work — i.e. `comm ≈ 3 × expert_time`, confirmed independently.
+
+**And it shows what DOES work — batching:**
+
+| M | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| E[max] | 1.90 | 2.85 | 4.53 | 7.50 | 12.84 |
+| mean | 0.50 | 1.00 | 2.00 | 4.00 | 8.00 |
+| **straggler ratio** | **3.79×** | 2.85× | 2.27× | 1.88× | **1.61×** |
+
+The straggler multiplier shrinks with M by the law of large numbers. That is the real, and only,
+fix for MoE imbalance on this fabric — and it is already measured (base: 22.45 → 35.4 tok/s).
+
+## ⚠️ PREFILL: `DS4F_PREFILL_GEMM=1` is +51% but SILENTLY CORRUPTS the output — do not use (2026-07-12)
+
+Prefill on ds4fbase 12n (929-token prompt, Q8 dense + Q8 experts, 47 threads):
+
+| config | prefill | ar_calls | completion |
+|---|---|---|---|
+| **baseline (working)** | **19.84 tok/s** | 80,823 | correctly continues the passage ✓ |
+| `PREFILL_GEMM=1 K=32` | 30.06 (+51%) | 3,509 | `"- Page 2 of 2"` ✗ |
+| `PREFILL_GEMM=1 K=64` | 29.99 | 2,219 | ✗ |
+| + `HC_SVE` | 30.01 | 2,219 | `"https://www.youtube.com/watch?v=..."` ✗ |
+| + `Q8_GEMM_TILE=16` | 29.71 | 3,509 | `"Apotheosis Apotheosis"` ✗ |
+
+**Every** GEMM variant produces text that IGNORES the prompt entirely (web boilerplate, a URL,
+Chinese kinase gibberish) — the signature of a context that was never correctly prefilled. Yet
+**NaNs=0 and 12/12 lockstep pass in all of them.** This is the exact failure mode this doc warns
+about: only a coherence gate catches it.
+
+The same prompt with `PREFILL_GEMM` OFF correctly continues the text, and the standard 24-token
+quicksort prompt still yields correct code (ids 361/1527) — so the weights, stage and build are
+fine. It is the batched verify-path prefill that is broken.
+
+**Not the Q8 kernel:** `DS4F_Q8_GEMM_TILE` (which removes the sdot activation quantization
+entirely) is *also* garbage, and `ds4f_gemm_test` passes 205/205 on Q8_PV. The defect is in
+`ds4f_forward_verify`'s prefill state handling, not the GEMM.
+
+**UNRESOLVED — needs a bisect:** whether this is (a) pre-existing on base, (b) specific to Q8 dense,
+or (c) specific to Q8 experts. Separating them requires staging an FP8-expert blob and re-testing.
+The docs' original validation was on **ds4f with bf16-pv dense + MXFP4 experts**, a config we no
+longer run. **Until bisected, leave `DS4F_PREFILL_GEMM=0`.**
+
+**Also refuted for prefill:** `DS4F_IDX_INT8` (tb2scan 6.41 → 7.72 ms, WORSE — the int8 scan loses
+even batched); `DS4F_Q8_GEMM_TILE` (neutral); `DS4F_PF_TP` (neutral — it only helps batched decode).
+
+Working prefill profile (19.84 tok/s, 50.4 ms/tok) is **tb2prep-dominated**: tb2prep 14.0 ms (42%,
+of which tb2scan 6.4 — the O(T) indexer scan), experts 5.1, comm 5.1, qkv 4.3, attn 3.4. The scan
+grows with prompt length, so prefill degrades on long prompts — that is Tier-B2 architecture.
+
+### BISECT of the `DS4F_PREFILL_GEMM` corruption (2026-07-12) — a latent in-tree bug, NOT the bake
+
+Three stages of ds4fbase on 12n, same prompt, `PREFILL_GEMM=1` vs control:
+
+| dense | routed experts | control (no GEMM) | `PREFILL_GEMM=1` |
+|---|---|---|---|
+| Q8_PV (baked) | Q8_PV (baked) | correct ✓ | garbage ✗ |
+| Q8_PV (baked) | **FP8** (safetensors) | correct ✓ | garbage ✗ |
+| **FP8** | **FP8** — *the ORIGINAL config, no bake at all* | correct ✓ | **garbage ✗** |
+
+**⇒ The bake is exonerated.** Not Q8 dense, not Q8 experts. `DS4F_PREFILL_GEMM` is broken on
+ds4fbase in its original FP8 form.
+
+**It is not a K (chunk-size) bug either** — it is prompt-LENGTH dependent, and the error COMPOUNDS:
+
+| prompt | K | result |
+|---|---|---|
+| 24 tok | 8 | **correct** code ✓ |
+| 24 tok | 32 | `"cpython"` ✗ |
+| 314 tok | 8 or 32 | `"yment the algorithm."` — plausible English, WRONG continuation |
+| 929 tok | 4 / 8 / 16 / 32 | `"2025-01-25 13:04:01 / ## 相关"` — total garbage, prompt ignored |
+
+All K values fail identically at 929 tokens. So `ds4f_forward_verify`, when driven as a prefill
+(1 sequence × K consecutive positions rather than its native speculative-verify shape), produces a
+subtly WRONG context whose error grows with position count. The docs' "+65%, COHERENT" validation
+does not survive a realistic prompt length. Prime suspects (not yet isolated): intra-chunk causal
+masking, RoPE position indexing, or the Tier-B2 compressor/window cache writes across the chunk.
+
+**⚠️ CONSEQUENCE FOR BATCHED DECODE.** The same `ds4f_forward_verify` powers `DS4F_DB_BENCH`. Our
+batched-decode throughput numbers (base 35.4 tok/s @M=16, Flash 32.8 @M=32) measure the speed of
+that path but were **never output-quality-gated** — DB_BENCH only times steps. Batched decode drives
+verify in its native shape (M independent sequences, 1 token each), which is far more likely correct
+than the prefill misuse, but **this has not been verified.** Before trusting batched decode for real
+serving, gate it on output (the `DS4F_DECODE_BATCH` P1 isolation test compares solo vs batched ids).
+
+**Status: `DS4F_PREFILL_GEMM=0`.** The +51-82% prefill it offers is real speed on a wrong answer.
+
+> **SUPERSEDED 2026-07-12/13.** The cause was the `forward_verify` × `TP_WOB` column-shard bug (one
+> line, fixed in `f9daca59`) — not the prefill chunking. `DS4F_PREFILL_GEMM=1` is now the DEFAULT and
+> is output-gated at **28.31 tok/s (+58%)**. See the fix and the K sweep at the end of this file.
+
+### Gating batched decode (P1 isolation) — isolation PASSES; whole-path correctness still OPEN
+
+Prompted by the `PREFILL_GEMM` bisect: the same `ds4f_forward_verify` powers batched decode, so the
+35.4 / 32.8 tok/s throughput numbers needed a correctness gate.
+
+**1. Sequence isolation — PASSES in substance.** `DS4F_DECODE_BATCH=1` reports `15/16 match -> FAIL`,
+but that is a *bit-exactness* assertion against the SOLO run, and it is misleading. Varying the
+neighbour (`DS4F_DB_SEEDB` = 5000 / 777 / 31337) leaves seqA's batched stream **byte-identical**:
+
+```
+seqB=5000   42498 82 14 20 55 49970 51 26 85 223 42498 223
+seqB=777    42498 82 14 20 55 49970 51 26 85 223 42498 223
+seqB=31337  42498 82 14 20 55 49970 51 26 85 223 42498 223
+```
+
+seqA's output does not depend on its neighbour's content **at all** ⇒ **NO cross-sequence
+contamination**, which is the property serving actually needs. The 1/16 divergence from solo is the
+M=1 vs M=2 GEMM reassociation (first 12 tokens identical, then a near-tie argmax flips) — the same
+coherent-not-bit-exact class as HC_SVE. A real leak corrupts early and badly, as the prefill bug does.
+
+**⇒ Treat the P1 "FAIL" as a too-strict assertion, not a defect.** (The test would be more useful if
+it compared against solo *modulo reassoc*, or asserted neighbour-independence as done above.)
+
+**2. Verify-vs-matvec numerical correctness — STILL OPEN.** Driving the same seed (token 100) through
+the matvec decode gives a completely different id stream than the verify path's solo run. That is NOT
+conclusive: the P1 harness leaves its `hcb` hyper-connection buffer **uninitialized** and uses a
+different reset/cache path, so the two are not apples-to-apples. Given that this very function IS
+broken when misused as a prefill, this deserves a proper gate: run a REAL prompt through the
+serve/batch loop and check the completion, rather than trusting DB_BENCH (which only times steps).
+
+**Bottom line for the batched numbers (base 35.4 @M=16, Flash 32.8 @M=32): sequence isolation is
+sound; end-to-end output quality of the batch path is measured-but-not-gated.** Use for capacity
+planning, not as a correctness claim.
+
+## 🚨 BATCHED DECODE IS NOT USABLE: the serve path returns GARBAGE for a real prompt (2026-07-12)
+
+Gating the batched numbers (base 35.4 @M=16, Flash 32.8 @M=32) end-to-end, as the `PREFILL_GEMM`
+bisect demanded. Drove a real 24-token prompt through the **batched serve loop**
+(`DS4F_SERVE=1 DS4F_SERVE_BATCH=2 DS4F_SERVE_DYNAMIC=1`) and detokenized the response:
+
+| serve config | completion |
+|---|---|
+| `prefill_gemm=1` (**the serve DEFAULT**) | `"  Ф.m  15.(D.T..:  https://g en:03."` ✗ |
+| `prefill_gemm=0` (correct token-at-a-time prefill) | `",, append. .(s,;  ._  (  .ppt. 4:"` ✗ |
+
+**Garbage with PREFILL_GEMM both ON and OFF.** So this is NOT (only) the prefill bug — the batched
+serve path is broken end-to-end. Control: the same prompt through the normal gen path
+(`ds4f_forward_token`, no batching) yields correct quicksort code.
+
+**⚠️ The serve path's default is the broken one.** `ds4f_serve_batch_loop` / `ds4f_serve_dynbatch_loop`
+both do `int pf_gemm = envi("DS4F_PREFILL_GEMM", 1)` — i.e. **default 1**, the corrupted prefill. But
+setting it to 0 does not rescue the output, so the defect is deeper.
+
+### What this means for the throughput numbers
+
+**base 35.4 tok/s @M=16 and Flash 32.8 @M=32 are speed measurements of a path that does not produce
+correct output.** They are upper bounds on a broken path, NOT deliverable serving capacity. I
+reported them earlier without an output gate; that was wrong and this supersedes it. `DS4F_DB_BENCH`
+only times steps — it never looks at what it generated, which is exactly how this went unnoticed.
+
+**Single-stream decode is unaffected** (22.45 base / 18.98 Flash) — it uses `ds4f_forward_token`
+(matvec), a different path, and is gated on coherent completions.
+
+### Not yet separated (next step)
+
+Three candidate layers, in order of suspicion:
+1. `ds4f_forward_verify` / `ds4f_forward_decode_batch` itself (shared by DB_BENCH, P1 and serve);
+2. the serve loop's per-slot cache/bundle orchestration;
+3. the serve loop's prefill into a bundle.
+
+Evidence bearing on (1): the P1 isolation test shows the batch path is **neighbour-independent**
+(seqA byte-identical across 3 different batch-mates), so there is no cross-sequence leak — the
+sequences are cleanly separated, they are just each producing wrong tokens. That points AWAY from
+bundle mix-up and TOWARD the verify forward itself, or the prefill into the bundle.
+
+A decisive next test: run `ds4f_forward_decode_batch` at M=1 from a real prompt prefilled by the
+KNOWN-GOOD token-at-a-time path, and compare its ids to `ds4f_forward_token`. If they diverge, the
+bug is in the verify forward.
+
+## 🔴 ROOT CAUSE: `ds4f_forward_verify` IS WRONG (2026-07-12) — `DS4F_VERIFY_GATE`
+
+One defect explains the `PREFILL_GEMM` corruption AND the batched-decode garbage. New gate
+(`DS4F_VERIFY_GATE=1`, `ds4f_ep_runner.c`) isolates the forward function and nothing else: BOTH arms
+prefill the same prompt through the **known-good `ds4f_forward_token`** path (identical caches /
+Tier-B2 state / positions), then decode 16 tokens — arm A with `ds4f_forward_token`, arm B with
+`ds4f_forward_verify(K=1)`.
+
+```
+VERIFY_GATE (forward_token vs forward_verify K=1, IDENTICAL prefill):
+  2/16 match, common prefix 1 -> FAIL (verify forward is WRONG)
+
+  token : 361 855 9080 18561 11 8593 223 19 1137 528 1354 3522     <- coherent
+  verify: 361 313 343 67  11  223 80  223 223 343 20   11          <- degenerate
+```
+
+They agree on 361 (the shared prefill's output) and then **diverge on the very FIRST verify-decoded
+token**, with `forward_verify` collapsing into degenerate low-id tokens. **Not reassociation** — a
+reassoc tail diverges late after a long common prefix; this diverges immediately.
+
+### This one bug explains everything
+
+| symptom | mechanism |
+|---|---|
+| `DS4F_PREFILL_GEMM` corrupts, error grows with prompt length | prefill runs through `forward_verify` |
+| batched serve returns garbage (PREFILL_GEMM on **and** off) | decode runs through `forward_verify` |
+| `DB_BENCH` 35.4 / 32.8 tok/s looked fine | it only TIMES steps; never inspects the output |
+| P1 isolation showed neighbour-independence | both arms used `forward_verify` — equally wrong, so no *relative* leak |
+
+**Everything that touches `ds4f_forward_verify` is unusable:** batched decode, batched serve
+(`DS4F_SERVE_BATCH`>1, incl. the dynbatch loop), `DS4F_PREFILL_GEMM`, and by extension spec-decode's
+verify step. **Single-stream decode and token-at-a-time prefill are unaffected and gated** — they use
+`ds4f_forward_token` (base 22.45 tok/s, Flash 18.98, all backed by coherent completions).
+
+**Both serve loops default to the broken path** (`pf_gemm = envi("DS4F_PREFILL_GEMM", 1)`).
+
+### Next: fix inside `ds4f_forward_verify` (common/ds4f_impl.h:5609)
+
+It diverges at the first decode step against a pre-built cache, so suspect its handling of an
+EXISTING cache at `pos0 > 0` — the K-position loop over window/sparse attention, the KV/compressor
+write offsets, or the Tier-B2 index/top-k selection. `DS4F_VERIFY_GATE=1` is now the regression test:
+it must reach `16/16 match` (or a long common prefix with only a reassoc tail).
+
+## ✅ FIXED (2026-07-12): `forward_verify` ignored the `TP_WOB` column shard — ONE LINE
+
+**The bug.** `ds4f_forward_verify`'s o-projection:
+
+```c
+ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);   /* WRONG */
+```
+
+Under `DS4F_TP_WOB`, `wo_b` is COLUMN-sharded (`cols == oi_rows`), so the GEMM contracts `oi_rows`
+values starting at **column 0** of `p_o1` — but the values this rank actually computed live at
+`[oi0, oi0+oi_rows)`. It read the zero-padded columns belonging to some *other* rank's slice, so
+`p_o` was garbage. `ds4f_forward_token` always did this right
+(`s_o1 + (wo_b.cols < o_inter ? oi0 : 0)`); verify never learned about the shard.
+
+```c
+int wob_shard = (ly->wo_b.cols < c->o_inter);
+ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1 + (wob_shard ? oi0 : 0), K, C, c->o_inter);   /* FIXED */
+```
+
+`TP_WOB` is **ON by default** in `run_ds4fbase_12n.sh`, so every batched path silently produced
+garbage while single-stream decode (a different function) was perfectly fine.
+
+### Bisect (`DS4F_VERIFY_GATE=1`, base 12n)
+
+Both arms prefill the same prompt through the known-good `ds4f_forward_token`, then decode 16 tokens
+— arm A `forward_token`, arm B `forward_verify(K=1)`. Isolates the forward and nothing else.
+
+| TP config | before fix | after fix |
+|---|---|---|
+| all TP off | 16/16 PASS | 16/16 PASS |
+| +`TP_HEAD` +`TP_EMBED` | 16/16 PASS | — |
+| +`TP_SHARED` | 16/16 PASS | — |
+| +`TP_OPROJ` (no WOB) | 14/16 (reassoc tail) | 14/16 |
+| **+`TP_OPROJ` +`TP_WOB`** | **2/16 FAIL** | **14/16** |
+| **full production stack, 43 layers** | **2/16 FAIL** | **16/16 PASS (byte-identical)** |
+
+### Everything it un-breaks
+
+| | before | after |
+|---|---|---|
+| `DS4F_PREFILL_GEMM=1` prefill | garbage | **coherent**, 19.84 → **30.11 tok/s (+52%)** |
+| batched decode (M=16) | garbage | **coherent path**, 35.5 tok/s |
+| batched serve / dynbatch | garbage | **coherent** — measured, see gate below |
+| single-stream decode | fine | unchanged (22.45) |
+
+**Batched throughput was never wrong in MAGNITUDE — it was computing the wrong answer at that speed.**
+The numbers now stand: base **22.45 tok/s single-stream / 35.5 batched @M=16**, prefill **30.11**.
+
+**`DS4F_VERIFY_GATE=1` is the permanent regression test.** Any change touching `forward_verify`, the
+TP shards, or the serve loops must keep it at 16/16 (or a long common prefix + reassoc tail).
+Lesson: `DB_BENCH` only TIMES steps — a throughput benchmark that never inspects its output will
+happily report 35 tok/s of garbage.
+
+**Run it with `./gate_verify_12n.sh`** — full 43 layers, one command, exit 0 = PASS / 3 = FAIL, and
+the verdict lands in `ds4f_verify_gate.txt`. `bench_headline_12n.sh` aborts if it does not pass.
+
+> **There is NO OOM at 43 layers** — I claimed there was, and it was false. The gate had been
+> **PASSING at full depth all along** (16/16, arena 26.9 GB); its result was being *eaten by the
+> harness*. `logmsg()` writes only to `ds4f_ep_rank00.txt`, **which the next run truncates**, so the
+> benchmark's step [2/4] destroyed step [1/4]'s verdict; and the gate exits before generating tokens,
+> so the gen wrapper returns `rc=1` + "no gen_ids produced", which is indistinguishable from a crash.
+> Both are fixed (durable verdict file + meaningful exit code). **Never read a result out of a file
+> the next run rewrites** — and don't diagnose an OOM without looking at what was actually allocated
+> (`ds4f_alloc_prefill_batch` at `m_tile=8` is a few MB, which refuted the theory on inspection).
+
+### ✅ Batched SERVE gated end-to-end (2026-07-13) — `gate_serve_12n.sh`
+
+The serve loop was the last consumer of `ds4f_forward_verify` still taken on faith ("same forward, so
+it must be fixed"). That is an inference, not a measurement, and this file has already been burned
+once by exactly that kind of reasoning. So: gate it.
+
+`a64fx/llm/gate_serve_12n.sh` brings the **dynbatch** loop up on 12n (`DS4F_SERVE=1
+DS4F_SERVE_BATCH=2 DS4F_SERVE_DYNAMIC=1`), submits **two concurrent real prompts**, and decodes the
+responses back to text. Post-fix, both come back coherent:
+
+| req | prompt (tail) | completion |
+|---|---|---|
+| 0 | `…the capital city of Japan is` | **` Tokyo.`** then base-model repetition |
+| 1 | `def fibonacci(n): … return` | **` fibonacci(n-1) + fibonacci(n-2)`** |
+
+Before the fix this same path emitted `"Ф.m 15.(D.T..: https://g en:03."`. **The batched serve path is
+now correct**, and the 35.5 tok/s @M=16 is deliverable serving capacity rather than an upper bound on
+a broken path.
+
+Two harness notes baked into the script:
+- It uses the **dynamic** loop deliberately. The static loop's `reqseq` counter (`"0\n"` → `"1\n"`,
+  same size) is never revalidated by the compute node's FS cache, so rank 0 never sees the request.
+  The dynbatch loop probes `<base>.q.<id>` **existence**, which does invalidate.
+- The queue lives on the **shared FS** (`$HOME`), not `/tmp` or `/local` — rank 0 is on another node.
+
+### ✅ PREFILL: `DS4F_PREFILL_GEMM` is now ON by default — 17.88 → 28.31 tok/s (+58%)
+
+With `forward_verify` fixed, the batched prefill is finally usable, so K got its first sweep on a
+path that produces **correct output** (`sweep_prefill_k.sh`, base 12n, q8pv + TP_ATTN=0, 70-tok
+prompt). Every point is gated on a coherent completion **and** on the prefill argmax matching the
+token-at-a-time control exactly (`361` at every K):
+
+| K | prefill tok/s | ms/tok | comm % | ar_calls |
+|---|---|---|---|---|
+| 1 (`PREFILL_GEMM=0`, control) | 17.88 | 55.9 | 20.3% | 6090 |
+| 8 | 24.75 | 40.4 | 16.4% | 844 |
+| 16 | 26.47 | 37.8 | 16.0% | 500 |
+| **32 (new default)** | **27.56** | 36.3 | 15.2% | 328 |
+| 64 | 27.96 | 35.8 | 15.0% | 242 |
+| 128 (cap) | **28.31 (+58%)** | 35.3 | 14.9% | 156 |
+
+**★ The stated mechanism was WRONG, and the sweep is what caught it.** Both the code comment and the
+earlier write-up explained this as *"the per-layer EP all-reduce fires once per K tokens ⇒ comm ÷ K"*.
+But `ar_calls` falls **39×** (6090 → 156) while comm barely moves (20.3% → 14.9%). Splitting ms/tok:
+
+| | K=1 | K=128 | Δ |
+|---|---|---|---|
+| compute | 44.5 ms | 30.0 ms | **−14.5 ms** |
+| comm | 11.3 ms | 5.3 ms | −6.0 ms |
+
+**~70% of the win is the dense M=K GEMM replacing K matvecs** — the all-reduce elision is the minor
+term. This matters because it predicts the shape: the curve **saturates past K≈16**, since attention,
+Tier-B2 and mHC stay per-position (looped, causal) and form an irreducible floor that no K can touch.
+Chasing K past 32 buys 4 points for 4× the chunk. **Default: `DS4F_PREFILL_GEMM=1 DS4F_PREFILL_K=32`.**
+
+(Note this is *not* the same lesson as decode's `comm ≈ 3 × expert_time`. In decode, comm is the MoE
+straggler and dominates. In prefill, K tokens of work per reduce already amortize it — so prefill is
+compute-bound where decode is straggler-bound, and the two respond to completely different levers.)
+
+## 🔴 THE INDEXER SCAN WAS SERIAL AND SCALAR BELOW T=64 (fixed 2026-07-13) — decode +35%
+
+Trying to reproduce the 22.45 headline on ONE allocation (the "never compare across allocations"
+rule) turned up something better than a doc fix. 22.45 reproduced **exactly** — 22.48 tok/s, tb2prep
+8.358 ms — but only at `DS4F_PREFILL=8`, the run script's **default synthetic prefill**. On a real
+70-token prompt the same config read **17.08**. So I swept context, and the curve is **not monotonic**:
+
+| ctx | decode | tb2scan | |
+|---|---|---|---|
+| 8 | 22.50 tok/s | 2.73 ms | |
+| **64** | **18.07** | **12.80 ms** | ← worst |
+| 256 | 22.94 | **0.24 ms** | ← 4× the work of ctx=64, in 1/53rd the time |
+| 1024 | 22.41 | ~0.3 ms | |
+
+**ctx=256 doing 4× more scan work 53× faster is not a cost curve — it is a bug.** `ds4f_index_score`
+dispatched the pooled SVE scan only at `T >= 64` compressed tokens and otherwise fell through to a
+**scalar, SINGLE-THREADED** triple loop — ~5.6M scalar MACs on one core, summed over 43 layers. With
+the Tier-B2 compressor's ratio-4 stride, `T ≈ ctx/4`, so the slow path covered **ctx < ~256: every
+short prompt a chat or serving workload actually sends.** Decomposition proved it — `tb2scan` was the
+only term moving; `tb2lcmp`/`tb2icmp`/`tb2topk` were flat to the millisecond across all four contexts.
+
+**Fix:** `DS4F_IDX_SCAN_MIN` (default **8**, was a hardcoded 64). The pooled workers already handle
+any `T` — they split `T` across threads — so the threshold was the whole bug.
+
+| | decode | prefill | tb2scan |
+|---|---|---|---|
+| `SCAN_MIN=64` (old), real 70-tok prompt | 17.08 tok/s | 30.68 | 15.31 ms |
+| **`SCAN_MIN=8` (new), real 70-tok prompt** | **23.03 (+35%)** | **36.14 (+18%)** | **0.175 ms (−99%)** |
+| `SCAN_MIN=64`, synthetic ctx=64 | 18.18 | — | 12.79 |
+| **`SCAN_MIN=8`, synthetic ctx=64** | **23.54 (+29%)** | — | **0.162** |
+
+**Gated:** completions are **character-identical** across the A/B (same quicksort). The SVE path
+reassociates the dot products vs the scalar loop, so this could have shifted top-k selection near
+ties — it did not. Prefill gains too, because the indexer scan runs there as well.
+
+The dip is gone: decode is now flat ~23 tok/s from ctx=64 to 1024, and the real-prompt number
+(**23.03**) finally *exceeds* the old synthetic-ctx=8 headline (22.45) instead of collapsing below it.
+
+### It applies to FLASH too — +23.6%, and the mechanism proves itself
+
+`ds4f_index_score` is **shared**, and Flash uses the same indexer geometry (64 index heads × 128 dim,
+`ds4f_default_config`), so Flash was sitting in the same serial-scalar band. Measured (11n, real
+70-token prompt, `ab_scanmin_flash.sh`):
+
+| Flash | decode | prefill | tb2scan | step |
+|---|---|---|---|---|
+| `SCAN_MIN=64` (old) | 12.57 tok/s | 14.42 | 15.317 ms | 79.5 ms/tok |
+| **`SCAN_MIN=8` (new)** | **15.54 (+23.6%)** | **15.51 (+7.6%)** | **0.161 ms (−99%)** | **64.4 ms/tok** |
+
+Completions **character-identical**. Flash's published **18.98 tok/s has the same defect as base's
+22.45 — it was a synthetic-ctx=8 number**; on a real prompt it was 12.57.
+
+**★ The absolute scan saving is IDENTICAL across the two models — 15.16 ms/token.** Base's step went
+58.5 → 43.4 and Flash's 79.5 → 64.4: both exactly 15.1 ms. That is what a shared, model-independent
+kernel must do (same indexer, same 43 layers), and it is why the *relative* wins differ — base +35%
+vs Flash +24% — purely because Flash's MXFP4/svtbl experts make its step longer, diluting a fixed
+saving. The prediction was made before the run and held. **Use this to predict the next model:
+the scan fix is worth ~15 ms/token, full stop; divide by that model's step time.**
+
+### Flash `PREFILL_GEMM`: ON by default too — +61% prefill, gated (`gate_prefill_flash.sh`)
+
+| Flash | prefill | decode | ar_calls |
+|---|---|---|---|
+| `PREFILL_GEMM=0` | 15.45 tok/s | 15.47 | 3010 |
+| **`PREFILL_GEMM=1` (new default)** | **24.86 (+61%)** | 15.51 (unchanged) | **129** |
+
+Gate: **`VERIFY_GATE` 16/16 PASS** on Flash, and the completion is **character-identical** to the
+control with the same prefill argmax (361). Decode is untouched by design — `PREFILL_GEMM` only
+changes how the prompt is consumed, not what it seeds.
+
+Flash's TP stack is **entirely off** (`run_ds4f_11n.sh`: `TP_ATTN/SHARED/HEAD/EMBED = 0`, no
+`TP_OPROJ`/`TP_WOB`), so the `forward_verify` × `TP_WOB` bug that broke every batched path on base
+never applied here. That is a reason to *expect* a pass — it is not a substitute for measuring one,
+which is the entire lesson of this file.
+
+**Lesson: a default that "works" can still be measuring the wrong regime.** The `T >= 64` guard was
+presumably there to dodge pool overhead at tiny T. It was never re-measured, and the fallback it
+guarded was so much worse that it lost by 79× in the band that matters. The synthetic default
+(`DS4F_PREFILL=8`) then hid the whole thing, because it sits *below* the bad band.
+
+## 🔴 `DS4F_EXACT=0` + the batched path = SIGSEGV (fixed 2026-07-14) — and Flash's batched numbers were STAND-IN MATH
+
+Flash's `DB_BENCH` segfaulted (`sig=11`) on **every rank**, at **every batch size including M=1**.
+The hunt is worth recording because three plausible theories died first:
+
+| theory | killed by |
+|---|---|
+| unchecked `aligned_alloc` → NULL deref on OOM | made the allocs checked; **it never fired** |
+| memory pressure (the caches are sized by `max_pos`) | `DS4F_MAXPOS=128` cut them ~32× — **no change** |
+| something M-dependent (M=32 only) | it crashes at **M=1** too |
+
+A crash handler writing to **`$HOME`** (the launcher DROPS rank stderr) plus `sigaltstack` (the first
+handler produced eleven **0-byte** files — it was dying on the overflowed stack before its first
+`write`) finally gave the frame: **`ds4f_pf_qnr_worker` → `ds4f_rope_apply`**.
+
+**Root cause, one line:** `ds4f_build_freqs()` begins `if (!m->exact) return;` — so with `EXACT=0`
+the **RoPE tables are never allocated** (`rope_dense_cos`/`rope_comp_cos` stay NULL).
+`ds4f_forward_token` branches around RoPE in stand-in mode and runs fine; `ds4f_forward_verify`'s
+q-norm/RoPE worker ropes **unconditionally** → NULL `cosb` → SIGSEGV in a pool worker.
+
+**And `run_ds4f_11n.sh` defaults `DS4F_EXACT=0` / `TIERB2=0` / `MHC=0`** — while
+`run_ds4fbase_12n.sh` defaults all three to **1**. The gen wrapper sets them, which is exactly why
+gen, `PREFILL_GEMM` and `VERIFY_GATE` all passed while a bare `DB_BENCH` died.
+
+**The consequence is bigger than the crash.** Flash's published batched figures were produced by the
+bare run script, i.e. **with stand-in math — they were never measurements of DeepSeek-V4 at all.**
+They are retracted, not merely refreshed. This is the `DB_BENCH`-garbage lesson wearing a new coat:
+*a number is only as real as the model that produced it, and nothing in the harness was checking.*
+
+### The real Flash batched numbers (`DS4F_EXACT=1`, 11n, `flash_db_fixed.sh`)
+
+| M | ms/step | aggregate | per-seq |
+|---|---|---|---|
+| 1 | 165.3 | 6.0 tok/s | 6.05 |
+| 2 | 202.4 | 9.9 | 4.94 |
+| 4 | 280.6 | 14.3 | 3.56 |
+| 8 | 441.4 | 18.1 | 2.27 |
+| 16 | 739.9 | **21.6** | 1.35 |
+| 32 | 1330.9 | **24.0** | 0.75 |
+
+**The retracted numbers were ~35–45% too high** (32.8 → 24.0 @ M=32; 31.0 → 21.6 @ M=16) — exactly the
+kind of flattering error stand-in math produces. Correctness of this path rests on `VERIFY_GATE`
+(16/16 PASS on Flash); `DB_BENCH` only *times* steps and never inspects its output.
+
+Two things worth reading off the curve. **Batching pays 4× on aggregate** (6.0 → 24.0) but costs **8×
+in per-sequence latency** (6.05 → 0.75 tok/s/seq) — that is the serving trade, stated honestly.
+And **M=1 batched (6.0) is far below single-stream (15.54)**, because `DB_BENCH` drives the *GEMM*
+forward while single-stream uses the matvec forward — and Flash's MXFP4 experts run the `svtbl`
+dequant path, which is flat ~84 Gmac/s and does not amortize over M. Base does not show this gap as
+sharply (17.1 batched vs 21.5 single) because its Q8 experts hit the fast sdot kernel. **Never quote
+`DB_BENCH` M=1 as a single-stream number; they are different kernels.**
+
+**Fixes:** `ds4f_forward_verify` now **aborts with an explanatory message** when `!m->exact` instead
+of dereferencing NULL; `bench_headline_flash_11n.sh` sets `EXACT/TIERB2/MHC=1` explicitly.
+Also added `DS4F_BACKTRACE=1` (per-rank backtrace → `$HOME/ds4f_crash_rank<NN>.txt`, on an altstack)
+and `DS4F_TRACE=1` (checkpoints), which are what made this findable at all — **the MPI launcher's
+`sig=11` on its own tells you nothing, and rank stderr never reaches your log.**
+
+## 🛡️ PRODUCTION HARDENING (2026-07-15) — read this FIRST when a run "dies silently"
+
+**A run never dies silently any more. If it looks like it did, you are reading the wrong file.**
+
+```sh
+. ./ds4f_show_error.sh; ds4f_show_error        # prints the failing rank's actual error
+cat logs/latest/rank<NN>.err                   # or read it directly
+```
+
+### The three failure modes this fixes, and what each really was
+
+| what you saw | what it actually was |
+|---|---|
+| `PLE 0610 ... (rank=6)(sig=11)` — "a segfault" | **an OOM.** ~215 of 220 allocations were `aligned_alloc` followed straight by a write, so exhaustion was a NULL deref. Flash's "M=32 OOMs" was this. |
+| "died in 3s, no output, cause unknown" | **the `/local` stage was wiped** (it dies with every job restart). The runner said so *precisely* — in `ds4f_ep_stderr_rank00.txt` — but the wrappers grepped `$LOG`, the mpiexec stdout log, which is **always empty**. |
+| a PASSING gate that looked like a crash | **the next run truncated the evidence.** Logs were `fopen(...,"w")` in the CWD, rank 0 only. |
+
+### What is in place now
+
+- **Every allocation checked** (`ds4f_xalloc`/`xmalloc`/`xcalloc`, all 220 sites, zero raw allocs).
+  On failure: *"out of memory allocating `kv_cache` (N MB); X GB allocated so far; node has Y GB available"*.
+- **`ds4f_fatal()`** — one rank-tagged fatal path, prints `MemAvailable`, flushes, aborts.
+- **Pre-flight, before the 4-minute load**: missing stage / arena-won't-fit / `EXACT=0`-with-a-batched-path
+  all fail in **seconds** with an actionable message.
+- **Durable per-run logs**: `logs/run-<jobid>/rank<NN>.{log,err}` + `latest`, **every rank**, never
+  overwritten. `ds4f_ep_rank00.txt` remains as a symlink — see the warning below.
+- **Backtrace handler ON by default** (`sigaltstack` + `-g -rdynamic`): `sig=11` becomes
+  `ds4f_pf_qnr_worker -> ds4f_rope_apply`.
+- **`DS4F_TEST_OOM=1` / `DS4F_TEST_SEGV=1`** — gated hooks that deliberately trip the diagnostics.
+  *A crash handler that has never been triggered is exactly what turns out to be broken on the day
+  you need it.* Verified: `verify_hardening.sh` (all 4 steps pass; costs nothing measurable).
+
+### ★ `DS4F_ALLOC_SANITY_GB` — because on Linux, "checked malloc" is a LIE
+
+A **64 TB `aligned_alloc` SUCCEEDS.** Overcommit hands out the address space, the NULL check never
+fires, and the process is **SIGKILLed later when it TOUCHES the pages** — on a random rank, with no
+message. That is precisely the `sig=9`-with-no-output pattern that costs days, and it is what an
+unchecked **bad size expression** looks like in production.
+
+So a checked allocator catches allocator *failure* but **not overcommit death**; alone it is theatre
+for the failure mode that actually hurts. Hence the **64 GB sanity ceiling**: any single buffer larger
+than twice the node's RAM is a bad size expression *by construction*, and is refused up front with a
+message. Genuine shortage is caught earlier, by the pre-flight.
+
+### ⚠️ Two self-inflicted bugs — do not repeat them
+
+1. **An automated rewrite will rewrite the wrapper's OWN BODY.** Converting 220 call sites to
+   `ds4f_xalloc`, the script also rewrote the definition: `ds4f_xalloc() { void *p = ds4f_xalloc(...); }`
+   — **infinite recursion**, stack blown on all 47 pool threads, presenting as an instant SIGKILL on
+   every rank with no message. It looks exactly like a bad node. **Exclude the definition, then grep
+   the wrapper body to confirm it calls the RAW allocator.**
+2. **Moving a log breaks every consumer.** `ds4f_ep_rank00.txt` is what the wrappers, gates and
+   benchmarks grep for the prefill/decode lines. Relocating it into `logs/` made runs **complete
+   successfully while reporting NO NUMBERS**. It is now a symlink into the per-run dir. *A durability
+   fix that quietly severs the data path is worse than the truncation it replaced.*
+
+(And: `cp`ing a binary over `build/` gives it a fresh mtime, so `make` skips the rebuild — I then
+A/B-tested the reference binary against **itself** and got a meaningless "both pass".)
+
+### ⚠️ Build trap: `make` alone silently builds the WRONG binary
+
+GNU make has a built-in `CC = cc`, and the Makefile's `CC ?= fcc` does **not** override a built-in
+default. So a bare `make ds4f_ep_runner` compiles with gcc, misses the `fcc` branch's
+`-march=armv8.2-a+sve`, and dies on `arm_sve.h: No such file or directory` — or worse, for targets
+that don't need SVE, quietly produces a `-O2` non-SVE binary. **Always `make CC=fcc`.**

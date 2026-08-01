@@ -771,6 +771,7 @@ struct cuda_ppd_runner {
     CUfunction fn_scalar_gemm_f16_f32;
     CUfunction fn_scalar_attn_f32;
     int use_fp8;
+    int use_mma_gemm;
 
     /* ---- DA2 semantic encoder params ---- */
     int sem_n_blocks;       /* 24 */
@@ -1056,18 +1057,10 @@ static CUdeviceptr upload_tensor_as_fp8(CUstream stream, const void *data,
     }
     if (!tmp32) return 0;
 
-    /* F32 → FP8 E4M3 */
+    /* F32 → FP8 E4M3 (RNE + saturate-to-finite via shared helper) */
     uint8_t *fp8 = (uint8_t *)malloc(n);
     for (size_t i = 0; i < n; i++) {
-        float v = tmp32[i];
-        uint32_t fb;
-        memcpy(&fb, &v, 4);
-        int sign = (fb >> 31) & 1;
-        int exp = ((fb >> 23) & 0xff) - 127 + 7; /* FP8 E4M3 bias=7 */
-        int mant = (fb >> 20) & 0x7;  /* 3-bit mantissa */
-        if (exp <= 0) { exp = 0; mant = 0; }
-        if (exp > 15) { exp = 15; mant = 6; } /* max non-inf for E4M3 */
-        fp8[i] = (uint8_t)((sign << 7) | (exp << 3) | mant);
+        fp8[i] = cu_f32_to_fp8_e4m3(tmp32[i]);
     }
     free(tmp32);
     CUdeviceptr d;
@@ -1432,6 +1425,8 @@ cuda_ppd_runner *cuda_ppd_init(int device_id, int verbose) {
 
     cuda_ppd_runner *r = (cuda_ppd_runner *)calloc(1, sizeof(cuda_ppd_runner));
     r->verbose = verbose;
+    const char *env_mma = getenv("PPD_MMA_GEMM");
+    r->use_mma_gemm = !(env_mma && env_mma[0] == '0');
 
     CHECK_CU_NULL(cuDeviceGet(&r->device, device_id));
     CHECK_CU_NULL(cuCtxCreate(&r->context, 0, r->device));
@@ -1477,7 +1472,15 @@ static void kl_layernorm(cuda_ppd_runner *r, CUdeviceptr dst, CUdeviceptr src,
 static void kl_gemm(cuda_ppd_runner *r, CUdeviceptr Y, CUdeviceptr W_f16,
                      CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
-    /* Tiled shared-memory GEMM: grid=(ceil(n_out/64), ceil(n_tok/16)), blockDim=(16,16) */
+    if (r->use_mma_gemm && (n_in % 16) == 0) {
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(r->fn_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
+                       16 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+        return;
+    }
+
+    /* Tiled shared-memory GEMM fallback handles arbitrary K, including patch embed K=588. */
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     cuLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,

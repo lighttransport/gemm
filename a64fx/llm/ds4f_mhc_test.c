@@ -42,7 +42,7 @@ int main(void) {
     for (int d = 0; d < D; d++) fblk[d] = (float)((((d*7) % 13) - 6)) / 6.0f;
 
     float y_pre[D], post[HC], comb[HC*HC];
-    ds4f_hc_pre(&m, x4, afn, ascale, abase, y_pre, post, comb);
+    ds4f_hc_pre(&m, x4, afn, ascale, abase, y_pre, post, comb, NULL);
 
     float y_post[HD];                       /* output streams */
     ds4f_hc_post(&m, y_post, x4, fblk, post, comb);   /* resid = x4, block out = fblk */

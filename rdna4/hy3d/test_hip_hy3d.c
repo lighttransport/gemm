@@ -208,6 +208,7 @@ int main(int argc, char **argv) {
             "       [--init-latents path.npy]\n"
             "       [--init-context path.npy]\n"
             "       [--init-trace-dir trace_dir]\n"
+            "       [--per-stage-timing path.json]\n"
             "\n"
             "Pipeline: Image -> DINOv2 -> DiT diffusion -> ShapeVAE -> Marching Cubes -> Mesh\n",
             argv[0]);
@@ -233,6 +234,7 @@ int main(int argc, char **argv) {
     const char *init_latents_path = NULL;
     const char *init_context_path = NULL;
     const char *init_trace_dir = NULL;
+    const char *timing_json_path = NULL;
 
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i+1 < argc) img_path = argv[++i];
@@ -251,6 +253,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--init-latents") == 0 && i+1 < argc) init_latents_path = argv[++i];
         else if (strcmp(argv[i], "--init-context") == 0 && i+1 < argc) init_context_path = argv[++i];
         else if (strcmp(argv[i], "--init-trace-dir") == 0 && i+1 < argc) init_trace_dir = argv[++i];
+        else if (strcmp(argv[i], "--per-stage-timing") == 0 && i+1 < argc) timing_json_path = argv[++i];
     }
 
     char trace_latents_path[1024];
@@ -327,6 +330,11 @@ int main(int argc, char **argv) {
         free(uncond);
     }
 
+    if (timing_json_path) {
+        hip_hy3d_set_per_stage_timing(r, 1);
+        fprintf(stderr, "Per-stage timing enabled (output: %s)\n", timing_json_path);
+    }
+
     fprintf(stderr, "Loading weights...\n");
     if (hip_hy3d_load_weights(r, cond_path, model_path, vae_path) != 0) {
         fprintf(stderr, "Failed to load weights\n");
@@ -371,6 +379,44 @@ int main(int argc, char **argv) {
             hip_hy3d_mesh_free(&mesh);
         } else {
             fprintf(stderr, "No mesh generated (empty result)\n");
+        }
+
+        if (timing_json_path) {
+            hy3d_stage_times t = {0};
+            if (hip_hy3d_get_stage_times(r, &t) == 0) {
+                FILE *jf = fopen(timing_json_path, "w");
+                if (!jf) {
+                    fprintf(stderr, "WARN: cannot open %s for writing\n", timing_json_path);
+                } else {
+                    fprintf(jf, "{\n");
+                    fprintf(jf, "  \"backend\": \"hip\",\n");
+                    fprintf(jf, "  \"steps\": %d,\n", n_steps);
+                    fprintf(jf, "  \"guidance\": %.4f,\n", guidance);
+                    fprintf(jf, "  \"grid_res\": %d,\n", grid_res);
+                    fprintf(jf, "  \"dino_ms\": %.4f,\n", t.dino_ms);
+                    fprintf(jf, "  \"dit_total_ms\": %.4f,\n", t.dit_total_ms);
+                    fprintf(jf, "  \"vae_ms\": %.4f,\n", t.vae_ms);
+                    fprintf(jf, "  \"e2e_ms\": %.4f,\n", t.e2e_ms);
+                    /* dit_total counts both cond+uncond per step (CFG); per-step
+                     * times below also bracket the full step body. */
+                    float step_sum = 0.0f;
+                    for (int i = 0; i < t.dit_steps; i++) step_sum += t.dit_step_ms[i];
+                    float step_mean = (t.dit_steps > 0) ? step_sum / (float)t.dit_steps : 0.0f;
+                    fprintf(jf, "  \"dit_step_ms_mean\": %.4f,\n", step_mean);
+                    fprintf(jf, "  \"dit_step_ms\": [");
+                    for (int i = 0; i < t.dit_steps; i++) {
+                        fprintf(jf, "%s%.4f", (i == 0) ? "" : ", ", t.dit_step_ms[i]);
+                    }
+                    fprintf(jf, "]\n");
+                    fprintf(jf, "}\n");
+                    fclose(jf);
+                    fprintf(stderr, "Wrote per-stage timing JSON to %s\n", timing_json_path);
+                    fprintf(stderr, "  dino=%.1f ms  dit=%.1f ms (%d steps, mean=%.1f ms)  vae=%.1f ms  e2e=%.1f ms\n",
+                            t.dino_ms, t.dit_total_ms, t.dit_steps, step_mean, t.vae_ms, t.e2e_ms);
+                }
+            } else {
+                fprintf(stderr, "WARN: per-stage timing requested but no times collected\n");
+            }
         }
     } else {
         fprintf(stderr, "No input image specified (-i). Weight loading test passed.\n");

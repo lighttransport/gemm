@@ -82,8 +82,13 @@ int main(int argc, char **argv)
     const float *scores = cuda_sam3_1_get_final_scores(ctx, &n_ours);
     int bn; const float *boxes = cuda_sam3_1_get_final_boxes(ctx, &bn);
     int mn, mh, mw; const uint8_t *masks = cuda_sam3_1_get_final_masks(ctx, &mn, &mh, &mw);
+    int top_ours = 0;
+    for (int i = 1; i < n_ours; i++)
+        if (scores[i] > scores[top_ours]) top_ours = i;
     fprintf(stderr, "ours: n=%d target=(%d,%d) scores[0]=%.4f\n",
             n_ours, mh, mw, n_ours ? scores[0] : 0.0f);
+    if (n_ours) fprintf(stderr, "ours top score[%d]=%.4f\n",
+                        top_ours, scores[top_ours]);
 
     snprintf(path, sizeof(path), "%s/final_scores.npy", refdir);
     float *rs = (float *)read_npy(path, &nd, d, &isz);
@@ -96,8 +101,9 @@ int main(int argc, char **argv)
     float *rb = (float *)read_npy(path, &nd, d, &isz);
     if (rb && n_ref) { fprintf(stderr, "ref boxes[0]=[%.2f,%.2f,%.2f,%.2f]\n",
         rb[0], rb[1], rb[2], rb[3]);
-        if (n_ours) fprintf(stderr, "our boxes[0]=[%.2f,%.2f,%.2f,%.2f]\n",
-            boxes[0], boxes[1], boxes[2], boxes[3]); }
+        if (n_ours) fprintf(stderr, "our top boxes[%d]=[%.2f,%.2f,%.2f,%.2f]\n",
+            top_ours, boxes[top_ours*4], boxes[top_ours*4+1],
+            boxes[top_ours*4+2], boxes[top_ours*4+3]); }
 
     snprintf(path, sizeof(path), "%s/final_masks.npy", refdir);
     void *rm_raw = read_npy(path, &nd, d, &isz);
@@ -106,17 +112,29 @@ int main(int argc, char **argv)
         int rh = (nd == 4) ? d[2] : d[1];
         int rw = (nd == 4) ? d[3] : d[2];
         size_t tot = (size_t)rh * rw;
-        size_t inter = 0, uni = 0;
-        for (size_t i = 0; i < tot; i++) {
-            int a;
-            if (isz == 4) a = ((const float *)rm_raw)[i] > 0.5f;
-            else          a = ((const uint8_t *)rm_raw)[i] ? 1 : 0;
-            int b = masks[i] ? 1 : 0;
-            inter += (a & b); uni += (a | b);
+        double best_iou = -1.0;
+        int best = 0;
+        size_t best_inter = 0, best_uni = 0;
+        for (int q = 0; q < n_ours; q++) {
+            size_t inter = 0, uni = 0;
+            const uint8_t *om = masks + (size_t)q * tot;
+            for (size_t i = 0; i < tot; i++) {
+                int a;
+                if (isz == 4) a = ((const float *)rm_raw)[i] > 0.5f;
+                else          a = ((const uint8_t *)rm_raw)[i] ? 1 : 0;
+                int b = om[i] ? 1 : 0;
+                inter += (a & b); uni += (a | b);
+            }
+            double iou = uni ? (double)inter / (double)uni : 0.0;
+            if (iou > best_iou) {
+                best_iou = iou;
+                best = q;
+                best_inter = inter;
+                best_uni = uni;
+            }
         }
-        double iou = uni ? (double)inter / (double)uni : 0.0;
-        fprintf(stderr, "mask IoU (ref #0 vs ours #0): %.4f (inter=%zu uni=%zu)\n",
-                iou, inter, uni);
+        fprintf(stderr, "mask IoU best(ref #0 vs ours #%d): %.4f (inter=%zu uni=%zu)\n",
+                best, best_iou, best_inter, best_uni);
     }
     free(rs); free(rb); free(rm_raw);
     cuda_sam3_1_destroy(ctx);

@@ -8,17 +8,46 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef __CUEW_H__
 #error "cuda_trellis2_ops.h requires cuew.h to be included first"
 #endif
 
+#include "../cublasew.h"
+
+typedef struct {
+    int M[27];
+    CUdeviceptr src_idx[27];
+    CUdeviceptr dst_idx[27];
+    CUdeviceptr src_storage;
+    CUdeviceptr dst_storage;
+} t2_sparse_conv_pack;
+
 typedef struct {
     /* Common kernels */
     CUfunction layernorm;
+    CUfunction layernorm_sqrt;
+    CUfunction layernorm_cpuavx;
+    CUfunction layernorm_serial;
+    CUfunction layernorm_welford4;
     CUfunction gemm_tiled;
     CUfunction gemm_f32;
+    CUfunction gemm_f32_cpuavx;
+    CUfunction gemm_f32_cpuavx16;
+    CUfunction gemm_f32_scalar;
+    CUfunction gemm_f32_bias_init;
+    CUfunction gemm_f32_pair32;
+    CUfunction gemm_f32_group;
+    CUfunction gemm_f32_group_fma;
+    CUfunction gemm_f32_group_biasinit;
+    CUfunction gemm_f32_group_biasinit_fma;
+    CUfunction gemm_f32_group_mode;
+    CUfunction gemm_f32_group_mode_fma;
+    CUfunction gemm_f32_group_tree;
+    CUfunction gemm_f32_group_tree_fma;
+    CUfunction gemm_f32_double;
     CUfunction gelu;
     CUfunction silu;
     CUfunction add;
@@ -30,11 +59,13 @@ typedef struct {
     CUfunction split_qkv;
     CUfunction split_kv;
     CUfunction broadcast_add;
+    CUfunction add_bias;
 
     /* TRELLIS.2-specific kernels */
     CUfunction adaln;
     CUfunction gated_add;
     CUfunction modulation;
+    CUfunction modulation_add_bias;
     CUfunction rope_3d;
     CUfunction rms_norm_perhead;
     CUfunction conv3d_k3;
@@ -42,6 +73,10 @@ typedef struct {
     CUfunction silu_inplace;
     CUfunction pixel_shuffle_3d;
     CUfunction layernorm_noaffine;
+    CUfunction layernorm_noaffine_sqrt;
+    CUfunction layernorm_noaffine_cpuavx;
+    CUfunction layernorm_noaffine_serial;
+    CUfunction layernorm_noaffine_welford4;
     CUfunction split_qkv_chunk;
     CUfunction split_kv_chunk;
     CUfunction timestep_embed_cossin;
@@ -58,15 +93,47 @@ typedef struct {
     CUfunction attn_mma_hd128;
 
     /* Sparse conv kernels */
+    CUfunction sparse_hash_insert_coords;
     CUfunction sparse_build_gather_map;
     CUfunction sparse_gather;
+    CUfunction sparse_pack_from_gather_map;
+    CUfunction c2s_count_subdiv;
+    CUfunction c2s_write_subdiv_stable;
+    CUfunction sparse_pack_rows;
+    CUfunction scatter_add_rows;
     CUfunction scatter_add;
     CUfunction broadcast_bias;
+    CUfunction sparse_conv_direct;
     CUfunction residual_add;
+    CUfunction c2s_gather;
+    CUfunction c2s_residual_repeat;
 
     int sm_version;
     int use_f32_gemm;   /* 0=F16 weights, 1=F32 weights */
     int use_mma_gemm;   /* 1=use MMA tensor core GEMM (sm_70+, F16 weights) */
+    int use_cublas_f32; /* 1=route F32 GEMMs through cuBLAS when available */
+    int use_cublas_pedantic;
+    int use_tf32_gemm;  /* 1=route F32 GEMMs through TF32 tensor cores (DiT;
+                         * f32 exponent range so no fp16 clipping, ~1e-3 rel err) */
+    int use_bf16_gemm;  /* 1=cast F32 W/X to bf16 and matmul (f32 accumulate) to
+                         * match PyTorch's bf16 DiT reference trajectory (NEGATIVE
+                         * result: GEMM-input casting alone barely moves cosine —
+                         * superseded by bf16_round, default off scaffolding) */
+    int bf16_round;     /* 1=round each DiT-block op output to bf16 precision (kept
+                         * in f32 buffers) so the block runs the bf16 trajectory;
+                         * paired with use_tf32_gemm (TF32 on bf16-valued inputs ==
+                         * a bf16 matmul). Matches PyTorch's bf16 DiT blocks. */
+    int use_packed_sparse_conv; /* 1=pack valid rows before sparse conv GEMM */
+    cublasew_context *cublas;
+    /* Scratch for the bf16 GEMM path (grown on demand; bf16 = 2 bytes/elem). */
+    CUfunction cast_f16_to_f32;
+    CUfunction cast_bf16_to_f32;
+    CUfunction cast_f32_to_bf16;
+    CUfunction round_bf16;  /* in-place f32 -> bf16-precision -> f32 (bf16_round) */
+    CUfunction conv_transpose_f16_to_f32;
+    CUfunction conv_transpose_bf16_to_f32;
+    CUdeviceptr bf16_w, bf16_x;
+    size_t bf16_w_cap, bf16_x_cap;  /* capacity in elements */
 } t2_ops;
 
 static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
@@ -81,8 +148,26 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
 
     /* Common */
     GET_FN("layernorm_f32",           layernorm);
+    GET_FN("layernorm_f32_sqrt",      layernorm_sqrt);
+    GET_FN("layernorm_f32_cpuavx",    layernorm_cpuavx);
+    GET_FN("layernorm_f32_serial",    layernorm_serial);
+    GET_FN("layernorm_welford4_f32",  layernorm_welford4);
     GET_FN("gemm_tiled_f16_f32",      gemm_tiled);
     GET_FN("gemm_f32_f32",            gemm_f32);
+    GET_FN("gemm_f32_cpuavx_f32",     gemm_f32_cpuavx);
+    GET_FN("gemm_f32_cpuavx16_f32",   gemm_f32_cpuavx16);
+    GET_FN("gemm_f32_scalar_f32",     gemm_f32_scalar);
+    GET_FN("gemm_f32_bias_init_f32",  gemm_f32_bias_init);
+    GET_FN("gemm_f32_pair32_f32",     gemm_f32_pair32);
+    GET_FN("gemm_f32_group_f32",      gemm_f32_group);
+    GET_FN("gemm_f32_group_fma_f32",  gemm_f32_group_fma);
+    GET_FN("gemm_f32_group_biasinit_f32", gemm_f32_group_biasinit);
+    GET_FN("gemm_f32_group_biasinit_fma_f32", gemm_f32_group_biasinit_fma);
+    GET_FN("gemm_f32_group_mode_f32", gemm_f32_group_mode);
+    GET_FN("gemm_f32_group_mode_fma_f32", gemm_f32_group_mode_fma);
+    GET_FN("gemm_f32_group_tree_f32", gemm_f32_group_tree);
+    GET_FN("gemm_f32_group_tree_fma_f32", gemm_f32_group_tree_fma);
+    GET_FN("gemm_f32_double_f32",     gemm_f32_double);
     GET_FN("gelu_f32",                gelu);
     GET_FN("silu_f32",                silu);
     GET_FN("add_f32",                 add);
@@ -93,6 +178,28 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("split_qkv_interleaved_f32", split_qkv);
     GET_FN("split_kv_interleaved_f32",  split_kv);
     GET_FN("broadcast_add_f32",       broadcast_add);
+    GET_FN("add_bias_f32",            add_bias);
+
+    /* Optional bf16 cast/round kernels (for the bf16 DiT paths). Tolerant lookup:
+     * if absent (e.g. an older cached module) the bf16 paths stay disabled. */
+    if (cuModuleGetFunction(&ops->cast_f16_to_f32, module, "t2_cast_f16_to_f32")
+            != CUDA_SUCCESS)
+        ops->cast_f16_to_f32 = NULL;
+    if (cuModuleGetFunction(&ops->cast_bf16_to_f32, module, "t2_cast_bf16_to_f32")
+            != CUDA_SUCCESS)
+        ops->cast_bf16_to_f32 = NULL;
+    if (cuModuleGetFunction(&ops->cast_f32_to_bf16, module, "t2_cast_f32_to_bf16")
+            != CUDA_SUCCESS)
+        ops->cast_f32_to_bf16 = NULL;
+    if (cuModuleGetFunction(&ops->round_bf16, module, "t2_round_f32_bf16")
+            != CUDA_SUCCESS)
+        ops->round_bf16 = NULL;
+    if (cuModuleGetFunction(&ops->conv_transpose_f16_to_f32, module,
+                            "t2_conv3d_transpose_f16_to_f32") != CUDA_SUCCESS)
+        ops->conv_transpose_f16_to_f32 = NULL;
+    if (cuModuleGetFunction(&ops->conv_transpose_bf16_to_f32, module,
+                            "t2_conv3d_transpose_bf16_to_f32") != CUDA_SUCCESS)
+        ops->conv_transpose_bf16_to_f32 = NULL;
 
     if (sm_version >= 70) {
         GET_FN("attn_prefill_f32",    attn_prefill);
@@ -104,6 +211,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("adaln_f32",               adaln);
     GET_FN("gated_add_f32",           gated_add);
     GET_FN("modulation_f32",          modulation);
+    GET_FN("modulation_add_bias_f32", modulation_add_bias);
     GET_FN("rope_3d_f32",             rope_3d);
     GET_FN("rms_norm_perhead_f32",    rms_norm_perhead);
     GET_FN("conv3d_k3_f32",           conv3d_k3);
@@ -111,6 +219,10 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("silu_inplace_f32",        silu_inplace);
     GET_FN("pixel_shuffle_3d_f32",    pixel_shuffle_3d);
     GET_FN("layernorm_noaffine_f32",  layernorm_noaffine);
+    GET_FN("layernorm_noaffine_f32_sqrt", layernorm_noaffine_sqrt);
+    GET_FN("layernorm_noaffine_f32_cpuavx", layernorm_noaffine_cpuavx);
+    GET_FN("layernorm_noaffine_serial_f32", layernorm_noaffine_serial);
+    GET_FN("layernorm_noaffine_welford4_f32", layernorm_noaffine_welford4);
     GET_FN("split_qkv_chunk_f32",    split_qkv_chunk);
     GET_FN("split_kv_chunk_f32",     split_kv_chunk);
     GET_FN("timestep_embed_cossin_f32", timestep_embed_cossin);
@@ -127,11 +239,20 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     }
 
     /* Sparse conv kernels */
+    GET_FN("sparse_hash_insert_coords_f32", sparse_hash_insert_coords);
     GET_FN("sparse_build_gather_map_f32", sparse_build_gather_map);
     GET_FN("sparse_gather_f32",           sparse_gather);
+    GET_FN("sparse_pack_from_gather_map_f32", sparse_pack_from_gather_map);
+    GET_FN("c2s_count_subdiv_f32",        c2s_count_subdiv);
+    GET_FN("c2s_write_subdiv_stable_f32", c2s_write_subdiv_stable);
+    GET_FN("sparse_pack_rows_f32",        sparse_pack_rows);
+    GET_FN("scatter_add_rows_f32",        scatter_add_rows);
     GET_FN("scatter_add_f32",             scatter_add);
     GET_FN("broadcast_bias_f32",          broadcast_bias);
+    GET_FN("sparse_conv3d_direct_f32",    sparse_conv_direct);
     GET_FN("residual_add_f32",            residual_add);
+    GET_FN("c2s_gather_f32",              c2s_gather);
+    GET_FN("c2s_residual_repeat_f32",     c2s_residual_repeat);
 
     #undef GET_FN
     return 0;
@@ -141,10 +262,201 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
 /* Launch wrappers                                                          */
 /* ======================================================================== */
 
+/* In-place round a buffer to bf16 precision (kept as f32). No-op if the kernel
+ * is missing or n<=0. Used by the bf16-block DiT path (ops->bf16_round). */
+static inline void t2_op_round_bf16(t2_ops *ops, CUstream s,
+                                    CUdeviceptr x, long n) {
+    if (!ops->round_bf16 || n <= 0) return;
+    void *args[] = {&x, &n};
+    cuLaunchKernel(ops->round_bf16, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
 static inline void t2_op_gemm(t2_ops *ops, CUstream s,
                                 CUdeviceptr Y, CUdeviceptr W,
                                 CUdeviceptr X, CUdeviceptr bias,
                                 int n_out, int n_in, int n_tok) {
+    if (ops->use_f32_gemm && getenv("T2_SCVAE_SCALAR_GEMM")) {
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        cuLaunchKernel(ops->gemm_f32_scalar,
+                       (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                       256, 1, 1, 0, s, args, NULL);
+        return;
+    }
+    if (ops->use_f32_gemm && getenv("T2_SCVAE_CPUAVX_GEMM")) {
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        cuLaunchKernel(ops->gemm_f32_cpuavx,
+                       (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                       256, 1, 1, 0, s, args, NULL);
+        return;
+    }
+    if (ops->use_f32_gemm && bias && getenv("T2_SCVAE_CPUAVX16_GEMM")) {
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        cuLaunchKernel(ops->gemm_f32_cpuavx16,
+                       (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                       256, 1, 1, 0, s, args, NULL);
+        return;
+    }
+    if (ops->use_f32_gemm && bias && getenv("T2_SCVAE_BIAS_INIT_GEMM")) {
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 63) / 64);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(ops->gemm_f32_bias_init, gx, gy, 1, 16, 16, 1, 0, s,
+                       args, NULL);
+        return;
+    }
+    if (ops->use_f32_gemm && ops->gemm_f32_double &&
+        getenv("T2_SCVAE_DOUBLE_GEMM") &&
+        (bias || getenv("T2_SCVAE_DOUBLE_GEMM_ALL"))) {
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        cuLaunchKernel(ops->gemm_f32_double,
+                       (unsigned)(((size_t)n_out * n_tok + 255) / 256),
+                       1, 1, 256, 1, 1, 0, s, args, NULL);
+        return;
+    }
+    {
+        const char *group_env = getenv("T2_SCVAE_GROUP_BIASINIT_GEMM");
+        int group = group_env && group_env[0] ? atoi(group_env) : 0;
+        if (ops->use_f32_gemm && bias && group > 0) {
+            CUfunction fn = getenv("T2_SCVAE_GROUP_BIASINIT_GEMM_FMA")
+                ? ops->gemm_f32_group_biasinit_fma
+                : ops->gemm_f32_group_biasinit;
+            if (fn) {
+                void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &group};
+                cuLaunchKernel(fn,
+                               (unsigned)(((size_t)n_out * n_tok + 255) / 256),
+                               1, 1, 256, 1, 1, 0, s, args, NULL);
+                return;
+            }
+        }
+    }
+    if (ops->use_f32_gemm && ops->cublas && bias &&
+        getenv("T2_SCVAE_CUBLAS_BETA1_GEMM")) {
+        int rc = -1;
+        int total = n_tok * n_out;
+        void *bargs[] = {&Y, &bias, &n_tok, &n_out};
+        cuLaunchKernel(ops->broadcast_bias,
+                       (unsigned)((total + 255) / 256), 1, 1,
+                       256, 1, 1, 0, s, bargs, NULL);
+        if (cublasewSetStream(ops->cublas, s) == 0) {
+            rc = cublasew_gemm_f32_rowmajor_nt_beta1(ops->cublas, Y, W, X,
+                                                     n_tok, n_out, n_in);
+        }
+        if (getenv("T2_SCVAE_DEBUG_GEMM"))
+            fprintf(stderr, "T2: cuBLAS beta=1 biased GEMM %s for [%d,%d]x[%d,%d]\n",
+                    rc == 0 ? "ok" : "fallback", n_tok, n_in, n_out, n_in);
+        if (rc == 0) return;
+    }
+    {
+        const char *group_env = getenv("T2_SCVAE_GROUP_GEMM");
+        int group = group_env && group_env[0] ? atoi(group_env) : 0;
+        if (ops->use_f32_gemm && group > 0 &&
+            (bias || getenv("T2_SCVAE_GROUP_GEMM_ALL"))) {
+            CUfunction fn = getenv("T2_SCVAE_GROUP_GEMM_FMA")
+                ? ops->gemm_f32_group_fma
+                : ops->gemm_f32_group;
+            if (fn) {
+                void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &group};
+                cuLaunchKernel(fn,
+                               (unsigned)(((size_t)n_out * n_tok + 255) / 256),
+                               1, 1, 256, 1, 1, 0, s, args, NULL);
+                return;
+            }
+        }
+    }
+    if (ops->use_f32_gemm && ops->cublas && bias &&
+        getenv("T2_SCVAE_CUBLASLT_BIAS_GEMM")) {
+        int rc = -1;
+        if (cublasewSetStream(ops->cublas, s) == 0) {
+            rc = cublasew_gemm_f32_lt_bias_rowmajor_nt(ops->cublas, Y, W, X,
+                                                       bias, n_tok, n_out, n_in);
+        }
+        if (getenv("T2_SCVAE_DEBUG_GEMM"))
+            fprintf(stderr, "T2: cuBLASLt bias GEMM %s for [%d,%d]x[%d,%d]\n",
+                    rc == 0 ? "ok" : "fallback", n_tok, n_in, n_out, n_in);
+        if (rc == 0) return;
+    }
+    if (ops->use_f32_gemm && ops->cublas && !bias &&
+        getenv("T2_SCVAE_CUBLASLT_GEMM")) {
+        int rc = -1;
+        if (cublasewSetStream(ops->cublas, s) == 0) {
+            rc = cublasew_gemm_f32_lt_rowmajor_nt(ops->cublas, Y, W, X,
+                                                  n_tok, n_out, n_in);
+        }
+        if (getenv("T2_SCVAE_DEBUG_GEMM"))
+            fprintf(stderr, "T2: cuBLASLt GEMM %s for [%d,%d]x[%d,%d]\n",
+                    rc == 0 ? "ok" : "fallback", n_tok, n_in, n_out, n_in);
+        if (rc == 0) return;
+    }
+    const char *cublas_bias_only = getenv("T2_SCVAE_CUBLAS_BIAS_ONLY");
+    int use_cublas_bias_only = cublas_bias_only && atoi(cublas_bias_only);
+    if (ops->use_f32_gemm && ops->cublas &&
+        (ops->use_cublas_f32 || (use_cublas_bias_only && bias))) {
+        int ok = ops->use_cublas_pedantic
+            ? cublasew_gemm_f32_pedantic_rowmajor_nt(ops->cublas, Y, W, X,
+                                                     n_tok, n_out, n_in)
+            : cublasew_gemm_f32_rowmajor_nt(ops->cublas, Y, W, X,
+                                            n_tok, n_out, n_in);
+        if (ok == 0) {
+            if (bias) {
+                void *bargs[] = {&Y, &bias, &n_out, &n_tok};
+                cuLaunchKernel(ops->add_bias,
+                               (unsigned)((n_out * n_tok + 255) / 256), 1, 1,
+                               256, 1, 1, 0, s, bargs, NULL);
+            }
+            return;
+        }
+    }
+    if (ops->use_f32_gemm && ops->use_bf16_gemm && ops->cublas && ops->cast_f32_to_bf16) {
+        /* bf16 matmul to match PyTorch's bf16 DiT reference: cast W (f32, == exact
+         * bf16 upcast) and X (f32 activations) to bf16, then bf16-in/f32-accumulate
+         * GEMM. Scratch grown on demand (W re-cast each call — fine for accuracy
+         * testing; a resident bf16 weight cache would remove the W re-cast). */
+        size_t wn = (size_t)n_out * n_in, xn = (size_t)n_tok * n_in;
+        if (ops->bf16_w_cap < wn) {
+            if (ops->bf16_w) cuMemFree(ops->bf16_w);
+            ops->bf16_w_cap = (cuMemAlloc(&ops->bf16_w, wn * 2) == CUDA_SUCCESS) ? wn : 0;
+        }
+        if (ops->bf16_x_cap < xn) {
+            if (ops->bf16_x) cuMemFree(ops->bf16_x);
+            ops->bf16_x_cap = (cuMemAlloc(&ops->bf16_x, xn * 2) == CUDA_SUCCESS) ? xn : 0;
+        }
+        if (ops->bf16_w_cap >= wn && ops->bf16_x_cap >= xn) {
+            long wn_l = (long)wn, xn_l = (long)xn;
+            void *wa[] = {&W, &ops->bf16_w, &wn_l};
+            cuLaunchKernel(ops->cast_f32_to_bf16, (unsigned)((wn + 255) / 256), 1, 1, 256, 1, 1, 0, s, wa, NULL);
+            void *xa[] = {&X, &ops->bf16_x, &xn_l};
+            cuLaunchKernel(ops->cast_f32_to_bf16, (unsigned)((xn + 255) / 256), 1, 1, 256, 1, 1, 0, s, xa, NULL);
+            if (cublasewSetStream(ops->cublas, s) == 0 &&
+                cublasew_gemm_bf16_bf16_f32_rowmajor_nt(ops->cublas, Y, ops->bf16_w, ops->bf16_x,
+                                                        n_tok, n_out, n_in) == 0) {
+                if (bias) {
+                    void *bargs[] = {&Y, &bias, &n_out, &n_tok};
+                    cuLaunchKernel(ops->add_bias,
+                                   (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                                   256, 1, 1, 0, s, bargs, NULL);
+                }
+                return;
+            }
+        }
+    }
+    if (ops->use_f32_gemm && ops->use_tf32_gemm && ops->cublas) {
+        /* DiT default: TF32 tensor-core GEMM. F32 weights/activations in & out,
+         * f32 exponent range (no fp16 clipping of hot intermediates), TF32-reduced
+         * mantissa (~1e-3 rel err — more precise than PyTorch's bf16). Far faster
+         * than the plain tiled f32 kernel on the dense 4096-token Stage-1 grid. */
+        if (cublasewSetStream(ops->cublas, s) == 0 &&
+            cublasew_gemm_f32_tf32_rowmajor_nt(ops->cublas, Y, W, X,
+                                               n_tok, n_out, n_in) == 0) {
+            if (bias) {
+                void *bargs[] = {&Y, &bias, &n_out, &n_tok};
+                cuLaunchKernel(ops->add_bias,
+                               (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                               256, 1, 1, 0, s, bargs, NULL);
+            }
+            return;
+        }
+    }
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     if (ops->use_f32_gemm) {
         /* F32 weights: use tiled F32 GEMM */
@@ -179,14 +491,210 @@ static inline void t2_op_gemm_f32(t2_ops *ops, CUstream s,
     cuLaunchKernel(ops->gemm_f32, gx, gy, 1, 16, 16, 1, 0, s, args, NULL);
 }
 
+static inline int t2_op_gemm_f32_lt_bias(t2_ops *ops, CUstream s,
+                                           CUdeviceptr Y, CUdeviceptr W,
+                                           CUdeviceptr X, CUdeviceptr bias,
+                                           int n_out, int n_in, int n_tok) {
+    if (!ops->use_f32_gemm || !ops->cublas || !bias) return -1;
+    if (cublasewSetStream(ops->cublas, s) != 0) return -1;
+    int rc = cublasew_gemm_f32_lt_bias_rowmajor_nt(ops->cublas, Y, W, X, bias,
+                                                   n_tok, n_out, n_in);
+    if (getenv("T2_SCVAE_DEBUG_GEMM"))
+        fprintf(stderr, "T2: cuBLASLt bias GEMM %s for [%d,%d]x[%d,%d]\n",
+                rc == 0 ? "ok" : "fallback", n_tok, n_in, n_out, n_in);
+    return rc;
+}
+
+static inline int t2_op_gemm_f32_lt(t2_ops *ops, CUstream s,
+                                      CUdeviceptr Y, CUdeviceptr W,
+                                      CUdeviceptr X,
+                                      int n_out, int n_in, int n_tok) {
+    if (!ops->use_f32_gemm || !ops->cublas) return -1;
+    if (cublasewSetStream(ops->cublas, s) != 0) return -1;
+    int rc = cublasew_gemm_f32_lt_rowmajor_nt(ops->cublas, Y, W, X,
+                                              n_tok, n_out, n_in);
+    if (getenv("T2_SCVAE_DEBUG_GEMM"))
+        fprintf(stderr, "T2: cuBLASLt GEMM %s for [%d,%d]x[%d,%d]\n",
+                rc == 0 ? "ok" : "fallback", n_tok, n_in, n_out, n_in);
+    return rc;
+}
+
+static inline int t2_op_gemm_f32_bias_init(t2_ops *ops, CUstream s,
+                                             CUdeviceptr Y, CUdeviceptr W,
+                                             CUdeviceptr X, CUdeviceptr bias,
+                                             int n_out, int n_in, int n_tok) {
+    if (!ops->use_f32_gemm || !bias || !ops->gemm_f32_bias_init) return -1;
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+    unsigned gx = (unsigned)((n_out + 63) / 64);
+    unsigned gy = (unsigned)((n_tok + 15) / 16);
+    cuLaunchKernel(ops->gemm_f32_bias_init, gx, gy, 1, 16, 16, 1, 0, s,
+                   args, NULL);
+    return 0;
+}
+
+static inline int t2_op_gemm_f32_cublas_beta1(t2_ops *ops, CUstream s,
+                                                CUdeviceptr Y, CUdeviceptr W,
+                                                CUdeviceptr X, int n_out,
+                                                int n_in, int n_tok) {
+    if (!ops->use_f32_gemm || !ops->cublas) return -1;
+    if (cublasewSetStream(ops->cublas, s) != 0) return -1;
+    if (getenv("T2_SCVAE_CUBLASLT_BETA1")) {
+        int rc = cublasew_gemm_f32_lt_rowmajor_nt_beta1(ops->cublas, Y, W, X,
+                                                        n_tok, n_out, n_in);
+        if (getenv("T2_SCVAE_DEBUG_GEMM"))
+            fprintf(stderr, "T2: cuBLASLt beta=1 GEMM %s for [%d,%d]x[%d,%d]\n",
+                    rc == 0 ? "ok" : "fallback", n_tok, n_in, n_in, n_out);
+        if (rc == 0) return 0;
+    }
+    return cublasew_gemm_f32_rowmajor_nt_beta1(ops->cublas, Y, W, X,
+                                              n_tok, n_out, n_in);
+}
+
+static inline int t2_op_gemm_f32_pair32(t2_ops *ops, CUstream s,
+                                          CUdeviceptr Y, CUdeviceptr W,
+                                          CUdeviceptr X, CUdeviceptr bias,
+                                          int n_out, int n_in, int n_tok) {
+    if (!ops->use_f32_gemm || !ops->gemm_f32_pair32) return -1;
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+    cuLaunchKernel(ops->gemm_f32_pair32,
+                   (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+    return 0;
+}
+
+static inline int t2_op_gemm_f32_group(t2_ops *ops, CUstream s,
+                                         CUdeviceptr Y, CUdeviceptr W,
+                                         CUdeviceptr X, CUdeviceptr bias,
+                                         int n_out, int n_in, int n_tok,
+                                         int group) {
+    if (!ops->use_f32_gemm || group <= 0) return -1;
+    int mode = 0;
+    const char *mode_env = getenv("T2_SCVAE_OUTPUT_GROUP_MODE");
+    if (mode_env && mode_env[0]) mode = atoi(mode_env);
+    int use_fma = getenv("T2_SCVAE_OUTPUT_GROUP_FMA") ? 1 : 0;
+    int biasinit = getenv("T2_SCVAE_OUTPUT_GROUP_BIASINIT") ? 1 : 0;
+    int tree = getenv("T2_SCVAE_OUTPUT_GROUP_TREE") ? 1 : 0;
+    if (tree) {
+        CUfunction fn = use_fma ? ops->gemm_f32_group_tree_fma : ops->gemm_f32_group_tree;
+        if (!fn) return -1;
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &group};
+        cuLaunchKernel(fn,
+                       (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                       256, 1, 1, 0, s, args, NULL);
+        return 0;
+    }
+    if (mode) {
+        CUfunction fn = use_fma ? ops->gemm_f32_group_mode_fma : ops->gemm_f32_group_mode;
+        if (!fn) return -1;
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &group, &mode};
+        cuLaunchKernel(fn,
+                       (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                       256, 1, 1, 0, s, args, NULL);
+        return 0;
+    }
+    CUfunction fn = biasinit
+        ? (use_fma ? ops->gemm_f32_group_biasinit_fma : ops->gemm_f32_group_biasinit)
+        : (use_fma ? ops->gemm_f32_group_fma : ops->gemm_f32_group);
+    if (!fn) return -1;
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &group};
+    cuLaunchKernel(fn,
+                   (unsigned)(((size_t)n_out * n_tok + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+    return 0;
+}
+
 static inline void t2_op_layernorm(t2_ops *ops, CUstream s,
                                      CUdeviceptr dst, CUdeviceptr src,
                                      CUdeviceptr w, CUdeviceptr b,
                                      int n_tok, int dim) {
     float eps = 1e-6f;
     void *args[] = {&dst, &src, &w, &b, &dim, &eps};
-    cuLaunchKernel(ops->layernorm, (unsigned)n_tok, 1, 1,
-                   256, 1, 1, 256 * sizeof(float), s, args, NULL);
+    const char *serial_ln = getenv("T2_SCVAE_SERIAL_LN");
+    if (serial_ln && serial_ln[0]) {
+        int mode = atoi(serial_ln);
+        if (mode <= 0) mode = 1;
+        void *sargs[] = {&dst, &src, &w, &b, &dim, &eps, &mode};
+        cuLaunchKernel(ops->layernorm_serial, (unsigned)n_tok, 1, 1,
+                       1, 1, 1, 0, s, sargs, NULL);
+    } else if (getenv("T2_SCVAE_WELFORD_AFFINE_LN") && (dim % 4) == 0) {
+        cuLaunchKernel(ops->layernorm_welford4, (unsigned)n_tok, 1, 1,
+                       32, 8, 1, 12 * sizeof(float), s, args, NULL);
+    } else if (getenv("T2_SCVAE_CPUAVX_LN")) {
+        cuLaunchKernel(ops->layernorm_cpuavx, (unsigned)n_tok, 1, 1,
+                       1, 1, 1, 0, s, args, NULL);
+    } else {
+        CUfunction fn = getenv("T2_SCVAE_LN_SQRT") ? ops->layernorm_sqrt : ops->layernorm;
+        cuLaunchKernel(fn, (unsigned)n_tok, 1, 1,
+                       256, 1, 1, 256 * sizeof(float), s, args, NULL);
+    }
+}
+
+static inline void t2_op_layernorm_welford_eps(t2_ops *ops, CUstream s,
+                                                 CUdeviceptr dst,
+                                                 CUdeviceptr src,
+                                                 CUdeviceptr w,
+                                                 CUdeviceptr b,
+                                                 int n_tok, int dim,
+                                                 float eps) {
+    if (!ops->layernorm_welford4 || (dim % 4) != 0) {
+        t2_op_layernorm(ops, s, dst, src, w, b, n_tok, dim);
+        return;
+    }
+    void *args[] = {&dst, &src, &w, &b, &dim, &eps};
+    cuLaunchKernel(ops->layernorm_welford4, (unsigned)n_tok, 1, 1,
+                   32, 8, 1, 12 * sizeof(float), s, args, NULL);
+}
+
+static inline void t2_op_layernorm_noaffine_eps(t2_ops *ops, CUstream s,
+                                                  CUdeviceptr dst,
+                                                  CUdeviceptr src,
+                                                  int n_tok, int dim,
+    float eps) {
+    void *args[] = {&dst, &src, &dim, &eps};
+    const char *serial_ln = getenv("T2_SCVAE_SERIAL_LN");
+    if (serial_ln && serial_ln[0]) {
+        int mode = atoi(serial_ln);
+        if (mode <= 0) mode = 1;
+        void *sargs[] = {&dst, &src, &dim, &eps, &mode};
+        cuLaunchKernel(ops->layernorm_noaffine_serial, (unsigned)n_tok, 1, 1,
+                       1, 1, 1, 0, s, sargs, NULL);
+    } else if (getenv("T2_SCVAE_WELFORD_LN") && (dim % 4) == 0) {
+        cuLaunchKernel(ops->layernorm_noaffine_welford4, (unsigned)n_tok, 1, 1,
+                       32, 8, 1, 12 * sizeof(float), s, args, NULL);
+    } else if (getenv("T2_SCVAE_CPUAVX_LN")) {
+        cuLaunchKernel(ops->layernorm_noaffine_cpuavx, (unsigned)n_tok, 1, 1,
+                       1, 1, 1, 0, s, args, NULL);
+    } else {
+        CUfunction fn = getenv("T2_SCVAE_LN_SQRT")
+            ? ops->layernorm_noaffine_sqrt
+            : ops->layernorm_noaffine;
+        cuLaunchKernel(fn, (unsigned)n_tok, 1, 1,
+                       256, 1, 1, 512 * sizeof(float), s, args, NULL);
+    }
+}
+
+static inline void t2_op_layernorm_noaffine_serial_eps(t2_ops *ops, CUstream s,
+                                                         CUdeviceptr dst,
+                                                         CUdeviceptr src,
+                                                         int n_tok, int dim,
+                                                         float eps, int mode) {
+    void *args[] = {&dst, &src, &dim, &eps, &mode};
+    cuLaunchKernel(ops->layernorm_noaffine_serial, (unsigned)n_tok, 1, 1,
+                   1, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_layernorm_noaffine_welford_eps(t2_ops *ops, CUstream s,
+                                                          CUdeviceptr dst,
+                                                          CUdeviceptr src,
+                                                          int n_tok, int dim,
+                                                          float eps) {
+    if (!ops->layernorm_noaffine_welford4 || (dim % 4) != 0) {
+        t2_op_layernorm_noaffine_eps(ops, s, dst, src, n_tok, dim, eps);
+        return;
+    }
+    void *args[] = {&dst, &src, &dim, &eps};
+    cuLaunchKernel(ops->layernorm_noaffine_welford4, (unsigned)n_tok, 1, 1,
+                   32, 8, 1, 12 * sizeof(float), s, args, NULL);
 }
 
 static inline void t2_op_adaln(t2_ops *ops, CUstream s,
@@ -213,8 +721,23 @@ static inline void t2_op_modulation(t2_ops *ops, CUstream s,
                                       CUdeviceptr blk_bias,
                                       int dim, int out_dim) {
     void *args[] = {&out, &t_emb, &mod_w, &mod_b, &blk_bias, &dim, &out_dim};
-    cuLaunchKernel(ops->modulation, 1, 1, 1,
+    /* Warp-per-row: 256 threads/block = 8 warps = 8 output rows per block. Grid
+     * covers all out_dim rows so the whole GPU is used (was a single block). */
+    unsigned warps_per_block = 256u / 32u;
+    unsigned grid = (unsigned)(((size_t)out_dim + warps_per_block - 1) / warps_per_block);
+    cuLaunchKernel(ops->modulation, grid, 1, 1,
                    256, 1, 1, (size_t)dim * sizeof(float), s, args, NULL);
+}
+
+static inline void t2_op_modulation_add_bias(t2_ops *ops, CUstream s,
+                                               CUdeviceptr out,
+                                               CUdeviceptr base,
+                                               CUdeviceptr blk_bias,
+                                               int n) {
+    void *args[] = {&out, &base, &blk_bias, &n};
+    cuLaunchKernel(ops->modulation_add_bias,
+                   (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
 }
 
 static inline void t2_op_rope_3d(t2_ops *ops, CUstream s,
@@ -407,6 +930,18 @@ static inline void t2_op_pixel_shuffle_3d(t2_ops *ops, CUstream s,
 /* Sparse convolution ops                                                    */
 /* ======================================================================== */
 
+/* Build hash table from coords on GPU. hash_keys must be initialized to
+ * 0xffffffffffffffff and hash_vals to -1 before launch. */
+static inline void t2_op_sparse_hash_insert_coords(t2_ops *ops, CUstream s,
+                                                     CUdeviceptr hash_keys,
+                                                     CUdeviceptr hash_vals,
+                                                     CUdeviceptr coords,
+                                                     int N, int hash_cap) {
+    void *args[] = {&hash_keys, &hash_vals, &coords, &N, &hash_cap};
+    cuLaunchKernel(ops->sparse_hash_insert_coords, (unsigned)((N + 255) / 256),
+                   1, 1, 256, 1, 1, 0, s, args, NULL);
+}
+
 /* Build gather map: for each voxel, find neighbor indices via hash table.
  * out_map: [N, 27] int32 on GPU */
 static inline void t2_op_sparse_build_gather_map(t2_ops *ops, CUstream s,
@@ -433,6 +968,45 @@ static inline void t2_op_sparse_gather(t2_ops *ops, CUstream s,
                    256, 1, 1, 0, s, args, NULL);
 }
 
+static inline void t2_op_c2s_count_subdiv(t2_ops *ops, CUstream s,
+                                            CUdeviceptr counts,
+                                            CUdeviceptr logits,
+                                            int N, int dense) {
+    void *args[] = {&counts, &logits, &N, &dense};
+    cuLaunchKernel(ops->c2s_count_subdiv, (unsigned)((N + 255) / 256),
+                   1, 1, 256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_c2s_write_subdiv_stable(t2_ops *ops, CUstream s,
+                                                   CUdeviceptr out_idx,
+                                                   CUdeviceptr out_subidx,
+                                                   CUdeviceptr out_coords,
+                                                   CUdeviceptr offsets,
+                                                   CUdeviceptr logits,
+                                                   CUdeviceptr coords,
+                                                   int N, int dense) {
+    void *args[] = {&out_idx, &out_subidx, &out_coords, &offsets,
+                    &logits, &coords, &N, &dense};
+    cuLaunchKernel(ops->c2s_write_subdiv_stable,
+                   (unsigned)((N + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Build packed sparse-conv row lists from an existing gather map.
+ * src_all/dst_all: [27, N] int32, counts: [27] int32 */
+static inline void t2_op_sparse_pack_from_gather_map(t2_ops *ops, CUstream s,
+                                                       CUdeviceptr src_all,
+                                                       CUdeviceptr dst_all,
+                                                       CUdeviceptr counts,
+                                                       CUdeviceptr gather_map,
+                                                       int N) {
+    int total = N * 27;
+    void *args[] = {&src_all, &dst_all, &counts, &gather_map, &N};
+    cuLaunchKernel(ops->sparse_pack_from_gather_map,
+                   (unsigned)((total + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
 /* Broadcast bias: dst[i*C + c] = bias[c] */
 static inline void t2_op_broadcast_bias(t2_ops *ops, CUstream s,
                                           CUdeviceptr dst, CUdeviceptr bias,
@@ -440,6 +1014,16 @@ static inline void t2_op_broadcast_bias(t2_ops *ops, CUstream s,
     int total = N * C;
     void *args[] = {&dst, &bias, &N, &C};
     cuLaunchKernel(ops->broadcast_bias, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Add row bias: dst[i*C + c] += bias[c] */
+static inline void t2_op_add_bias(t2_ops *ops, CUstream s,
+                                    CUdeviceptr dst, CUdeviceptr bias,
+                                    int N, int C) {
+    int total = N * C;
+    void *args[] = {&dst, &bias, &C, &N};
+    cuLaunchKernel(ops->add_bias, (unsigned)((total+255)/256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
 }
 
@@ -456,6 +1040,96 @@ static inline void t2_op_residual_add(t2_ops *ops, CUstream s,
                                         CUdeviceptr dst, CUdeviceptr src, int n) {
     void *args[] = {&dst, &src, &n};
     cuLaunchKernel(ops->residual_add, (unsigned)((n+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_c2s_gather(t2_ops *ops, CUstream s,
+                                      CUdeviceptr h_fine,
+                                      CUdeviceptr x_fine,
+                                      CUdeviceptr h_coarse,
+                                      CUdeviceptr x_coarse,
+                                      CUdeviceptr idx,
+                                      CUdeviceptr subidx,
+                                      int N_fine,
+                                      int C_out,
+                                      int C_in8) {
+    int mx = C_out > C_in8 ? C_out : C_in8;
+    void *args[] = {&h_fine, &x_fine, &h_coarse, &x_coarse,
+                    &idx, &subidx, &C_out, &C_in8};
+    cuLaunchKernel(ops->c2s_gather, (unsigned)N_fine,
+                   (unsigned)((mx + 255) / 256), 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_c2s_residual_repeat(t2_ops *ops, CUstream s,
+                                               CUdeviceptr h,
+                                               CUdeviceptr x,
+                                               int N, int C_out, int C_in8) {
+    void *args[] = {&h, &x, &N, &C_out, &C_in8};
+    cuLaunchKernel(ops->c2s_residual_repeat, (unsigned)N, 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_sparse_pack_rows(t2_ops *ops, CUstream s,
+                                            CUdeviceptr packed,
+                                            CUdeviceptr feats,
+                                            CUdeviceptr src_idx,
+                                            int M, int C) {
+    int total = M * C;
+    void *args[] = {&packed, &feats, &src_idx, &M, &C};
+    cuLaunchKernel(ops->sparse_pack_rows, (unsigned)((total + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_scatter_add_rows(t2_ops *ops, CUstream s,
+                                            CUdeviceptr dst,
+                                            CUdeviceptr src,
+                                            CUdeviceptr dst_idx,
+                                            int M, int C) {
+    int total = M * C;
+    void *args[] = {&dst, &src, &dst_idx, &M, &C};
+    cuLaunchKernel(ops->scatter_add_rows, (unsigned)((total + 255) / 256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_sparse_conv3d_packed(t2_ops *ops, CUstream s,
+                                                CUdeviceptr dst,
+                                                CUdeviceptr feats,
+                                                CUdeviceptr weight,
+                                                CUdeviceptr bias,
+                                                const t2_sparse_conv_pack *pack,
+                                                CUdeviceptr scratch,
+                                                CUdeviceptr scratch2,
+                                                int in_C, int out_C,
+                                                int N_total,
+                                                int use_lt) {
+    t2_op_broadcast_bias(ops, s, dst, bias, N_total, out_C);
+    for (int k = 0; k < 27; k++) {
+        int M = pack->M[k];
+        if (M <= 0) continue;
+        CUdeviceptr weight_k = weight + (size_t)k * out_C * in_C * sizeof(float);
+        t2_op_sparse_pack_rows(ops, s, scratch, feats, pack->src_idx[k], M, in_C);
+        if (!use_lt ||
+            t2_op_gemm_f32_lt(ops, s, scratch2, weight_k, scratch,
+                              out_C, in_C, M) != 0) {
+            t2_op_gemm(ops, s, scratch2, weight_k, scratch, 0, out_C, in_C, M);
+        }
+        t2_op_scatter_add_rows(ops, s, dst, scratch2, pack->dst_idx[k], M, out_C);
+    }
+}
+
+static inline void t2_op_sparse_conv3d_direct(t2_ops *ops, CUstream s,
+                                                CUdeviceptr dst,
+                                                CUdeviceptr feats,
+                                                CUdeviceptr weight,
+                                                CUdeviceptr bias,
+                                                CUdeviceptr gather_map,
+                                                int N, int in_C, int out_C,
+                                                int mode) {
+    void *args[] = {&dst, &feats, &weight, &bias, &gather_map,
+                    &N, &in_C, &out_C, &mode};
+    cuLaunchKernel(ops->sparse_conv_direct,
+                   (unsigned)(((size_t)N * out_C + 255) / 256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
 }
 
@@ -478,7 +1152,8 @@ static inline void t2_op_sparse_conv3d(t2_ops *ops, CUstream s,
                                          CUdeviceptr gather_map,
                                          CUdeviceptr scratch,   /* [N, in_C] gathered features */
                                          CUdeviceptr scratch2,  /* [N, out_C] partial GEMM result */
-                                         int N, int in_C, int out_C) {
+                                         int N, int in_C, int out_C,
+                                         int use_lt) {
     /* Initialize output with bias */
     t2_op_broadcast_bias(ops, s, dst, bias, N, out_C);
 
@@ -507,7 +1182,12 @@ static inline void t2_op_sparse_conv3d(t2_ops *ops, CUstream s,
 
         /* GEMM: scratch2 = weight_k @ scratch^T + 0 (no bias, added once) */
         CUdeviceptr null_bias = 0;
-        t2_op_gemm(ops, s, scratch2, weight_k, scratch, null_bias, out_C, in_C, N);
+        if (!use_lt ||
+            t2_op_gemm_f32_lt(ops, s, scratch2, weight_k, scratch,
+                              out_C, in_C, N) != 0) {
+            t2_op_gemm(ops, s, scratch2, weight_k, scratch, null_bias,
+                       out_C, in_C, N);
+        }
 
         /* Accumulate: dst += scratch2 */
         t2_op_scatter_add(ops, s, dst, scratch2, N * out_C);

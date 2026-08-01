@@ -1,58 +1,69 @@
-# CUDA SAM 3.1 runner (scaffold, cloned from cuda/sam3)
+# CUDA SAM 3.1 runner
 
-Status: **ViT backbone loader ported**; FPN, text encoder, and DETR/head
-loaders still target sam3 key paths. Builds and now reaches the FPN stage
-before the first missing-key error. See `PORT.md` for remaining mappings +
-kernel changes (RoPE, OpenAI-CLIP, segmentation head).
+Status: **image text-prompt pipeline ported and verified** against Meta's
+SAM3.1 PyTorch reference on `fujisan.jpg` / `"mountain"`.
+
+Current reference result:
+
+| phrase | mode | final IoU | top score | top box xyxy |
+|--------|------|-----------|-----------|--------------|
+| mountain | default fp16/MMA | 0.9996 | 0.8406 | [4.31, 184.27, 1691.96, 509.25] |
+| mountain | `SAM3_PRECISION=fp32` | 0.9999 | 0.8410 | [4.29, 184.28, 1691.96, 509.21] |
+| snow | default fp16/MMA | 0.9997 | 0.6359 | [596.34, 184.59, 1110.56, 353.12] |
+| sky | default fp16/MMA | 1.0000 | 0.9801 | [1.52, 1.49, 1688.91, 452.78] |
+
+Mountain reference: score `0.8409`, box `[4.29, 184.27, 1691.95, 509.19]`.
 
 ## Build
 
+```sh
+make -C cuda/sam3.1 all
 ```
-make -j
+
+Produces `test_cuda_sam3_1` plus the `verify_*` binaries.
+
+## Verification
+
+Generate reference dumps:
+
+```sh
+python3 ref/sam3.1/gen_image_ref.py \
+  --ckpt /mnt/disk01/models/sam3.1/sam3.1_multiplex.pt \
+  --image /home/syoyo/work/gemm/main/fujisan.jpg \
+  --phrase mountain \
+  --refdir /tmp/sam3.1_ref \
+  --device cuda
 ```
 
-Produces `test_cuda_sam3_1` plus `verify_*` binaries (same set as `cuda/sam3/`).
+Run verifiers:
 
-## What was done
+```sh
+./cuda/sam3.1/verify_final \
+  --ckpt /mnt/disk01/models/sam3.1/sam3.1.model.safetensors \
+  --refdir /tmp/sam3.1_ref --score 0.3
 
-- Files cloned from `cuda/sam3/` with identifiers renamed:
-  `cuda_sam3_runner.{c,h}` → `cuda_sam3_1_runner.{c,h}`, `test_cuda_sam3` →
-  `test_cuda_sam3_1`, all internal `cuda_sam3_*` symbols similarly renamed.
-- Safetensors top-level prefix changed from `detector_model.` to `detector.`.
-- `Makefile` updated (source names, default `CKPT` path, reuses
-  `cpu/sam3/sam3_clip_bpe.{c,h}` which is architecture-independent).
-- Weight converter: `convert_pt_to_safetensors.py` (flat `.pt` → safetensors;
-  pass `--pt <multiplex.pt> --out <model.safetensors>`).
-- **ViT backbone loader ported** (2026-04-22): entry-level `patch_embed` +
-  `ln_pre` and all 32 blocks (`backbone.vision_backbone.trunk.blocks.N.*`,
-  `attn.qkv`/`attn.proj`, `norm1/norm2`, `mlp.fc1/fc2`) load without errors.
-  Old `fuse_qkv()` / `fuse_qkv_bias()` helpers removed — sam3.1 stores the
-  QKV weight pre-fused as `(3*D, D)`.
+./cuda/sam3.1/verify_mask \
+  --ckpt /mnt/disk01/models/sam3.1/sam3.1.model.safetensors \
+  --refdir /tmp/sam3.1_ref
+```
 
-## What's left (summary — see `PORT.md` for detail)
+`verify_mask` compares raw `segmentation_head_out` logits when present in
+the refdir. Current default fp16/MMA raw-mask checks:
 
-1. **FPN / neck**: *main conv stack loader ported* (2026-04-22) —
-   `backbone.vision_backbone.convs.{0..2}` now loads cleanly with
-   S3_FPN_LEV=3. The parallel `interactive_convs.*` / `propagation_convs.*`
-   stacks are **not** yet loaded (deferred to forward-pass Phase C);
-   their keys do exist in the checkpoint.
-2. **ViT attention kernel**: replace relative-position-bias with 2D RoPE
-   (`attn.freqs_cis` per block, complex64 (576, 32)). Loader-side stash
-   of `freqs_cis` still TODO — weight is on disk but not uploaded yet.
-3. **Text encoder**: retarget to OpenAI-CLIP layout (`transformer.resblocks.*`,
-   `attn.in_proj_*`, `ln_{1,2}`, `mlp.{c_fc,c_proj}`, `text_projection`);
-   verify pre-norm ordering.
-4. **DETR / mask / scoring heads**: re-wire against `detector.transformer.*`,
-   `detector.segmentation_head.*`, `detector.dot_prod_scoring.*`,
-   `detector.geometry_encoder.*`. Box-head layout differs from sam3.
-5. **Tracker** (`tracker.model.*`): 457 new tensors, no sam3 analog —
-   implement separately if video tracking is needed.
+| phrase | pred_masks mean_abs | semantic_seg mean_abs |
+|--------|---------------------|-----------------------|
+| mountain | 8.88e-02 | 6.42e-03 |
+| snow | 2.79e-01 | 5.21e-03 |
+| sky | 4.70e-02 | 4.99e-03 |
 
-## Files
+## Notes
 
-- `cuda_sam3_1_runner.{c,h}`, `cuda_sam3_1_kernels.h` — ported runner/kernels
-- `test_cuda_sam3_1.c`, `verify_*.c` — entrypoints/tests (names unchanged)
-- `Makefile` — build targets
-- `convert_pt_to_safetensors.py`, `inspect_ckpt.py`, `sam3.1_keys.txt`
-- `.venv/` — uv venv with torch/safetensors (gitignored)
-- `PORT.md` — detailed porting guide
+- `precision=fp32` / `SAM3_PRECISION=fp32` uploads linear weights as F32
+  and routes linear GEMMs through the tiled F32 path. Default remains
+  fp16 weights with MMA.
+- The DETR prompt path includes Meta's text-only geometry CLS token.
+- Decoder layer norm mapping follows Meta's module order:
+  `norm2` for self-attention, `catext_norm` for text cross-attention,
+  `norm1` for image cross-attention, and `norm3` for MLP.
+- Tracker/video (`tracker.model.*`) is still out of scope for this image
+  runner.
