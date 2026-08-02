@@ -53,9 +53,15 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
+#endif
 
 #include "ggml_dequant.h"
+#if !defined(__ARM_FEATURE_SVE)
+/* Portable stand-ins for the SVE-only small kernels in ds4f_impl.h. */
+#include "ds4f_kernels_x86.h"
+#endif
 
 /* Weight quant types. Declared up here because ds4f_config carries one (expert_qt);
  * the per-type layout notes live above the ds4f_tensor definition below. */
@@ -425,6 +431,15 @@ typedef struct {
      * subnormals flush to 0 -> values ~5e-5 off, fine for the harness). The
      * magic path also enables FTZ on every pool worker. Set via DS4F_FP8_MAGIC=1. */
     int fp8_magic;
+    /* Zero-copy routed experts: the MXFP4 expert tensors point directly at the
+     * mmap'd safetensors shards instead of at repacked arena copies, so their
+     * ~147 GB stay clean, evictable, file-backed page cache. Requires kernels
+     * that consume the ON-DISK nibble order and undo the x0.5 scale in-kernel
+     * (see matvec_mxfp4_1row_*_raw). Set by ds4f_load_real from a
+     * DS4F_STAGE_NOCOPY manifest; 0 keeps the repack-into-arena behaviour. */
+    int mxfp4_raw;
+    void  *blob_map;      /* kept mapped for the model's lifetime when mxfp4_raw */
+    size_t blob_map_sz;
     /* MXFP4 GEMM (M>1 expert/dense): 0 = svtbl per-token-pair (matvec_mxfp4_8row_2x,
      * default; the M=1 decode + small-M path -- ~84 Gmac/s, dequant re-run per pair);
      * >0 = M threshold above which the GEMM tile-dequants each 8-row group's nibbles
