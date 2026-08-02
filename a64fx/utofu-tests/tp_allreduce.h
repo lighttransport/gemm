@@ -952,6 +952,25 @@ static int tp_allreduce_max_2d_checked(tp_comm *row,tp_comm *col,
     return rc?rc:tp_allreduce_max_checked(col,buf,count);
 }
 
+/* 2D wrappers for the non-sum callbacks used by vocab-sharded head and CP.
+ * The operation is associative/commutative (max-with-index for argmax), so a
+ * row reduction followed by a column reduction is equivalent to one flat
+ * reduction while following the same physical hierarchy as the main sum. */
+static void tp_allreduce_max_2d(tp_comm *row, tp_comm *col, float *buf, int count) {
+    tp_allreduce_max(row, buf, count);
+    tp_allreduce_max(col, buf, count);
+}
+
+static void tp_allreduce_argmax_2d(tp_comm *row, tp_comm *col, float *val, int32_t *idx) {
+    tp_allreduce_argmax(row, val, idx);
+    tp_allreduce_argmax(col, val, idx);
+}
+
+static void tp_allreduce_argmax_n_2d(tp_comm *row, tp_comm *col, float *vi, int n) {
+    tp_allreduce_argmax_n(row, vi, n);
+    tp_allreduce_argmax_n(col, vi, n);
+}
+
 static void tp_comm_free_2d(tp_comm *row, tp_comm *col) { tp_comm_free(row); tp_comm_free(col); }
 
 #endif /* TP_ALLREDUCE_H */

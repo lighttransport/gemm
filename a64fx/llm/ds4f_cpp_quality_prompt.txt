@@ -1,0 +1,10 @@
+You are completing a C++17 programming task. Return only a complete compilable C++17 source file, with no Markdown fences or explanation.
+
+Implement a function `std::vector<int> top_k_frequent(const std::vector<int>& values, int k)` that returns the k most frequent integers, ordered by decreasing frequency and then increasing integer value for ties. Write a `main()` that tests empty input, k larger than the number of distinct values, ties, negative values, and a normal case using `assert`. The program must print `CPP_TEST_PASS` after all assertions succeed.
+
+#include <algorithm>
+#include <cassert>
+#include <iostream>
+#include <unordered_map>
+#include <utility>
+#include <vector>

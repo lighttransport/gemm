@@ -497,3 +497,218 @@ Phase 2 (dynamic merge, GLM5_MERGE_AT=p1:p2): one job traverses 4x96->2x192->1x3
   merges 18.2s/30.2s, survivor 8192 tok NaNs=0, per-tier survivor 17.2/14.9/13.6 tok/s.
   NOTE: pjsub -x splits on commas -> use : in GLM5_MERGE_AT. Commits on glm5-2 (unpushed):
   288de08b 9825950c f68c632d 8e852f77 e34fd707.
+
+---
+
+# Resume Prompt: DS4F-0731 A64FX 12-node optimization
+
+This section is the current DS4F handoff. Work in:
+
+```sh
+cd /vol0006/mdt0/data/hp250467/work/gemm/ds4f
+```
+
+The active allocation used for the measurements was PJM job `49921978`, with
+12 A64FX nodes/ranks. The staged 0731 weights are:
+
+```text
+/local/ds4f-0731-49921978
+```
+
+The source model/tokenizer are under `$HOME/models/ds4f-0731`. `/local` is
+session-local and may be wiped after a restart. Re-stage only if the staged
+rank blobs are missing; staging must remain chunked (`DS4F_STAGE_FLUSH_GB=1`)
+to avoid filling the page cache with the full model.
+
+## Current measured status
+
+The exact/quality-preserving profile currently measures, on the real 149-token
+C++ prompt and 512 generated tokens:
+
+```text
+prefill  30.07 tok/s   (33.3 ms/token)
+decode   15.97 tok/s   (62.6 ms/token)
+12/12 ranks, NaNs=0
+CPP_QUALITY_PASS compile=ok run=ok
+```
+
+Reference result:
+
+```text
+a64fx/llm/runs/ds4f-0731-cpp-exact-final-49921978
+```
+
+The target remains 40 prefill tok/s and 20 decode tok/s. It has not been
+reached. The best measured experimental profile was 31.48 prefill / 16.84
+decode, but its generated C++ failed the quality gate (`missing required
+main/test marker`), so it must not be promoted as a quality-preserving result:
+
+```text
+a64fx/llm/runs/ds4f-0731-cpp-full-flat-49921978
+```
+
+The exact final token stream matched the prior exact reference for all 512
+generated tokens. Keep this as the regression baseline.
+
+## Remaining bottlenecks
+
+The most useful rank-0 decode phase breakdown from the full-shared synthetic
+run is approximately:
+
+```text
+Tier-B2 prepare/latent/index path (tb2* aggregate)  ~12 ms/token
+collectives / communication                         ~12.6-14.6 ms/token
+o_proj                                                ~9.1 ms/token
+qkv_proj                                               ~6.9 ms/token
+qkv WQB / MHC preparation                             material
+```
+
+Communication is about 22-23% of exact decode. Prefill communication is only
+about 8-10%, so the prefill gap is mainly dense/routed compute and batched
+verify efficiency. The likely work required to approach 20/40 is therefore:
+
+1. Reduce or overlap the Tier-B2 preparation and latent/index work. Measure
+   each `tb2*` phase separately for real generation, not only synthetic K=128.
+2. Improve `o_proj` and `qkv_proj` compute/sharding. Do not assume
+   `TP_ATTN`/`TP_OPROJ` helps: extra reductions can erase the local GEMM gain.
+   Benchmark each change with the same 149/512 prompt and 12-rank lockstep.
+3. Investigate topology-aware communication and compute/communication
+   overlap. Reuse the saved topology file rather than repeatedly probing the
+   flaky topology helper:
+   `a64fx/llm/runs/topo.px6djO/tofu_topo.txt`.
+4. Improve batched prefill/verify dense and expert kernels. The actual
+   prefill result is compute-bound enough that transport-only changes cannot
+   provide the missing 30.07 -> 40 tok/s.
+5. Consider a true speculative/MTP path only after the single-token decode
+   path is profiled; speculative acceptance must be measured and output
+   quality must remain exact or pass the agreed quality gate.
+
+## Known rejected or experimental paths
+
+`DS4F_TP_SHARED_FULL=1` shards the shared down projection and folds its partial
+output into the existing routed-expert allreduce. It saves shared compute and
+about 0.6 GB/node, but changes contraction/reassociation enough to change the
+first generated token and produced malformed C++ in the tested fast profile.
+Keep it experimental until an exactness/quality-preserving implementation is
+proved.
+
+The following were not sufficient in the measured runs:
+
+```text
+fast full-shared + flat:  ~31.48 prefill / 16.84 decode, quality failed
+fast full-shared + A2A:   ~31.67 prefill / 16.69 decode, quality failed
+fast partial-shared+A2A:  ~31.15 prefill / 16.47 decode, quality failed
+fast 2D BF16 synthetic:   ~16.36 prefill / 16.38 decode
+```
+
+2D BF16 and A2A are therefore hypotheses to re-measure only after topology,
+message sizes, and overlap are instrumented; they are not current wins.
+
+## Rebuild and rerun commands
+
+Build and check the current tree:
+
+```sh
+make -C a64fx/llm ds4f_ep_runner CC=fcc OPENMP=1
+git diff --check
+```
+
+If staging is missing and the same 12-node interactive job is still active:
+
+```sh
+test -s /local/ds4f-0731-49921978/rank00.blob || \
+  (cd a64fx/llm && DS4F_STAGE_FLUSH_GB=1 ./run_ds4f_0731_stage_12n.sh)
+```
+
+Run the quality-preserving baseline directly in the allocation:
+
+```sh
+cd a64fx/llm
+RESULT_DIR=$PWD/runs/resume-exact-${PJM_JOBID:-manual} \
+DS4F_STAGE_DIR=/local/ds4f-0731-49921978 \
+SKIP_TOPO=1 DS4F_PROFILE=exact \
+DS4F_TP_SHARED=0 DS4F_TP_SHARED_FULL=0 DS4F_COMM_MODE=flat \
+TP_AR_BF16=0 TP_AR_A2A=0 TP_AR_ROBUST=1 \
+MAX_NEW=512 ./run_ds4f_0731_gen_12n.sh
+
+python3 validate_ds4f_cpp.py \
+  runs/resume-exact-${PJM_JOBID:-manual}/completion.cpp.txt
+```
+
+Use an absolute `RESULT_DIR`: the runner changes directory before launching
+MPI ranks. The generated `runner.stdout.txt`, per-rank perf files,
+`gen_ids.txt`, and completion are the primary evidence.
+
+For an experimental fast comparison, explicitly record every knob and never
+call it a promotion without the quality gate:
+
+```sh
+RESULT_DIR=$PWD/runs/resume-fast-${PJM_JOBID:-manual} \
+DS4F_STAGE_DIR=/local/ds4f-0731-49921978 \
+SKIP_TOPO=1 DS4F_PROFILE=fast DS4F_COMM_MODE=2d DS4F_COMM_2D_A=4 \
+DS4F_TP_SHARED=1 DS4F_TP_SHARED_FULL=1 \
+TP_AR_BF16=1 TP_AR_A2A=0 TP_AR_ROBUST=2 \
+MAX_NEW=512 ./run_ds4f_0731_gen_12n.sh
+```
+
+Validate every candidate with all of:
+
+```text
+12/12 rank completion and lockstep
+NaNs=0 on every rank
+149-token prefill and 512-token decode on the same prompt
+CPP_QUALITY_PASS compile=ok run=ok
+exact token-stream match, or an explicitly documented accepted quality delta
+```
+
+Useful source locations for the next pass:
+
+```text
+a64fx/llm/ds4f_ep_runner.c       flat/2D communication dispatch
+a64fx/utofu-tests/tp_allreduce.h 2D allreduce wrappers
+common/ds4f.h                     TP shared-full state
+common/ds4f_impl.h                shared projection and decode/prefill paths
+a64fx/llm/run_ds4f_0731_12n.sh   exact/fast profiles and environment knobs
+```
+
+Do not commit or push during the resumed investigation unless explicitly
+requested. Preserve unrelated working-tree changes and keep run artifacts in
+`a64fx/llm/runs/`.
+
+## Ready-to-paste resuming prompt
+
+```text
+Resume DS4F-0731 optimization in
+/vol0006/mdt0/data/hp250467/work/gemm/ds4f.
+
+We are targeting 20 decode tok/s and 40 prefill tok/s on the existing 12-node
+A64FX interactive job. Current quality-preserving baseline is 15.97 decode /
+30.07 prefill tok/s on the real 149-token C++ prompt with 512 generated tokens.
+The exact run is
+a64fx/llm/runs/ds4f-0731-cpp-exact-final-49921978 and passes
+CPP_QUALITY_PASS compile=ok run=ok; its 512 generated token IDs match the
+previous exact reference. Do not weaken this baseline.
+
+Use /local/ds4f-0731-49921978 if it exists; otherwise re-stage the model with
+DS4F_STAGE_FLUSH_GB=1 using run_ds4f_0731_stage_12n.sh. Build with
+make -C a64fx/llm ds4f_ep_runner CC=fcc OPENMP=1. Reuse
+a64fx/llm/runs/topo.px6djO/tofu_topo.txt and SKIP_TOPO=1 if topology probing is
+flaky. Run benchmarks directly in the 12-node allocation.
+
+The remaining decode bottlenecks are approximately: tb2 prepare/latent/index
+work ~12 ms/token, communication ~12.6-14.6 ms/token (~22-23%), o_proj ~9.1
+ms/token, qkv_proj ~6.9 ms/token, plus qkv WQB/MHC preparation. Prefill
+communication is only ~8-10%, so optimize compute and batched verify for the
+40 tok/s target. Instrument real 149/512 runs and separate compute from
+communication before choosing a kernel or transport change.
+
+DS4F_TP_SHARED_FULL=1, fast 2D BF16, and A2A variants were tested. The best
+fast result was ~31.48/16.84 but generated malformed C++, so it is experimental
+only. Do not promote any lossy/reassociated path unless it passes the C++
+quality gate and the exact-token or explicitly approved quality criterion.
+Benchmark topology-aware communication, overlap, o_proj/qkv_proj sharding,
+Tier-B2 preparation, and batched prefill in small reversible steps. Report
+before/after tok/s, phase breakdown, comm percentage, rank/NaN status, and
+quality output for each candidate. Do not commit or push; leave changes in the
+working tree unless I explicitly ask otherwise.
+```
