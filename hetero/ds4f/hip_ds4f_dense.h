@@ -40,6 +40,11 @@ int hip_ds4f_dense_add(hip_ds4f_dense *ctx,
 
 /* Upload and tag a common ds4f_tensor with the returned bank id. */
 int hip_ds4f_dense_bind_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t);
+/* Upload a raw MXFP4 tensor for the RDNA4 LUT-widening GEMM path. */
+int hip_ds4f_dense_bind_mxfp4_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t);
+/* Widen raw MXFP4 to an exact FP8/E8M0 block representation in the persistent
+ * host pool, then upload it through the optimized FP8 GEMM path. */
+int hip_ds4f_dense_bind_mxfp4_widened_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t);
 /* Upload an FP8 tensor with the CPU-compatible block/lane reduction used by
  * the quality-sensitive KV projection path. */
 int hip_ds4f_dense_bind_fp8_ordered_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t);

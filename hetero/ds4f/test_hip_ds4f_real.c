@@ -26,6 +26,7 @@ static void usage(const char *prog) {
                     "--hip-shared-fp16 0|1 --hip-shared-fp16-layers n "
                     "--hip-ordered-wkv-layers n "
                     "--hip-ordered-fp8-layers n "
+                    "[--hip-mxfp4-gemm-test] [--hip-mxfp4-widened-gemm-test] "
                     "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
 }
 
@@ -62,6 +63,46 @@ static float max_rel_error(const float *a, const float *b, int n, float *max_abs
     }
     *max_abs = absmax;
     return rel;
+}
+
+static int check_mxfp4_gemm(ds4f_model *m, hip_ds4f_dense *hip, int widened) {
+    if (!m || !m->mxfp4_raw || !m->layers[0].ex_w1 ||
+        m->layers[0].ex_w1[0].type != DS4F_MXFP4) {
+        printf("real MXFP4 GEMM: SKIP (raw MXFP4 expert bank unavailable)\n");
+        return 1;
+    }
+    ds4f_tensor *t = &m->layers[0].ex_w1[0];
+    const int M = 16, K = t->cols, N = t->rows;
+    float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)M*K*4, 256, 0);
+    float *ref = (float *)ds4f_mem_alloc(m->mem, (size_t)M*N*4, 256, 0);
+    float *got = (float *)ds4f_mem_alloc(m->mem, (size_t)M*N*4, 256, 0);
+    if (!x || !ref || !got) return 0;
+    for (int i = 0; i < M*K; i++) x[i] = (float)((i * 17) % 101 - 50) / 31.0f;
+    int old_w4a8 = m->mxfp4_w4a8;
+    m->mxfp4_w4a8 = 0; /* compare the widened F32 LUT path first */
+    t->gpu_id = -1;
+    for (int mm = 0; mm < M; mm++)
+        ds4f_matvec(m, ref + (size_t)mm*N, t, x + (size_t)mm*K);
+    int id = widened
+        ? hip_ds4f_dense_bind_mxfp4_widened_tensor(hip, t)
+        : hip_ds4f_dense_bind_mxfp4_tensor(hip, t);
+    int rc = id >= 0 ? hip_ds4f_dense_gemm_tensor(hip, got, t, x, M, N, K) : -1;
+    float absmax = 0.0f, rel = rc == 0 ? max_rel_error(ref, got, M*N, &absmax) : 1.0f;
+    double t0 = wall_seconds();
+    int bench_iters = 8;
+    for (int it = 0; rc == 0 && it < bench_iters; ++it)
+        rc = hip_ds4f_dense_gemm_tensor(hip, got, t, x, M, N, K);
+    double elapsed = wall_seconds() - t0;
+    printf("real MXFP4 %sGEMM: M=%d N=%d K=%d max_abs=%.8g max_rel=%.8g %s\n",
+           widened ? "widened FP8 " : "raw LUT ", M, N, K, absmax, rel,
+           rc == 0 && rel <= 2.0e-5f ? "PASS" : "FAIL");
+    if (rc == 0)
+        printf("real MXFP4 %sGEMM: %.3f ms/call %.1f batch-token/s\n",
+               widened ? "widened FP8 " : "raw LUT ",
+               elapsed * 1000.0 / bench_iters,
+               (double)(M * bench_iters) / elapsed);
+    m->mxfp4_w4a8 = old_w4a8;
+    return rc == 0 && rel <= 2.0e-5f;
 }
 
 static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
@@ -381,6 +422,7 @@ int main(int argc, char **argv) {
     ds4f_runtime_options_init(&opt);
     char config_path[1024] = {0};
     int debug_env = 0, bank_layers = 1, layers = 0;
+    int mxfp4_test = 0, mxfp4_widened_test = 0;
     int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
     /* Load JSON first so explicit command-line values have the conventional
      * higher precedence regardless of where --config appears in argv. */
@@ -419,6 +461,8 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-shared-fp16-layers") == 0 && i + 1 < argc) opt.hip_shared_fp16_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-ordered-wkv-layers") == 0 && i + 1 < argc) opt.hip_ordered_wkv_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-ordered-fp8-layers") == 0 && i + 1 < argc) opt.hip_ordered_fp8_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-gemm-test") == 0) mxfp4_test = 1;
+        else if (strcmp(a, "--hip-mxfp4-widened-gemm-test") == 0) mxfp4_widened_test = 1;
         else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
         else if (strcmp(a, "--debug-env") == 0) debug_env = 1;
         else { usage(argv[0]); return 2; }
@@ -548,6 +592,8 @@ int main(int argc, char **argv) {
     if (head_id >= 0)
         pass &= check_tensor(m, hip, "head_bf16", &m->head, head_id, 0);
     if (pass) {
+        if (mxfp4_test) pass &= check_mxfp4_gemm(m, hip, 0);
+        if (mxfp4_widened_test) pass &= check_mxfp4_gemm(m, hip, 1);
         /* With one layer this is the small A/B gate; with the full bank it is
          * the production multi-layer attachment check.  EP>1 intentionally
          * remains a mechanical path check because the local shard is partial. */

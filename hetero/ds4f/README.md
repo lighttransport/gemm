@@ -415,6 +415,11 @@ with 0/64 argmax mismatches at both contexts. It remains opt-in because the
 ordinary fast reduction is the higher-throughput default for non-deterministic
 workloads.
 
+`"hip_mxfp4_widen_layers": N` uploads local MXFP4 expert weights for the first
+`N` layers after widening them to an exact row-scale FP8 representation. This
+is intended for RDNA4, which has no native MXFP4 instruction; it is opt-in
+because expert residency increases device memory usage.
+
 ## Long-context stability and speculative-decode probe
 
 The real HIP harness now accepts `DS4F_MAXPOS` and can warm a synthetic KV

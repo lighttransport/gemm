@@ -443,6 +443,22 @@ static int gpu_bind_layer(ds4f_session *s, ds4f_layer *ly, int layer,
                 + ds4f_sbytes(t[i]->type, t[i]->rows, t[i]->cols);
         (*count)++;
     }
+    if (s->options.hip_mxfp4_widen_layers > 0 &&
+        layer < s->options.hip_mxfp4_widen_layers) {
+        ds4f_tensor *ex[] = { ly->ex_w1, ly->ex_w2, ly->ex_w3 };
+        for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); wi++) {
+            if (!ex[wi]) return -1;
+            for (int e = 0; e < ly->n_owned; e++) {
+                ds4f_tensor *et = &ex[wi][e];
+                if (et->type != DS4F_MXFP4 || !et->w || !et->scale) return -1;
+                int id = hip_ds4f_dense_bind_mxfp4_widened_tensor(s->gpu, et);
+                if (id < 0) return -1;
+                *bytes += (size_t)et->rows * (size_t)et->cols
+                        + (size_t)et->rows * (size_t)((et->cols + 127) / 128);
+                (*count)++;
+            }
+        }
+    }
     return 0;
 }
 

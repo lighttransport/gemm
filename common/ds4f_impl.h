@@ -1196,7 +1196,8 @@ static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
                       const float *X, int M, int Ystride, int Xstride) {
     if (M > DS4F_MAX_MTILE) { fprintf(stderr, "ds4f_gemm: M=%d > DS4F_MAX_MTILE=%d\n", M, DS4F_MAX_MTILE); abort(); }
     if (M > 1 && !m->gpu_exact_prefill && m->gpu_dense_gemm && t->gpu_id >= 0 &&
-        (t->type == DS4F_FP8 || t->type == DS4F_BF16)) {
+        (t->type == DS4F_FP8 || t->type == DS4F_BF16 ||
+            t->type == DS4F_MXFP4)) {
         if (m->gpu_dense_gemm(m->gpu_dense_ctx, Y, t, X, M, Ystride, Xstride) == 0) {
             m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols)
                            + ds4f_sbytes(t->type, t->rows, t->cols);
@@ -1256,7 +1257,8 @@ static void ds4f_gemm_multi_worker(void *arg, int tid, int nthr) {
 static int ds4f_gemm_gpu_eligible(const ds4f_model *m, const ds4f_gemm_task *q) {
     return m && !m->gpu_exact_prefill && m->gpu_dense_gemm && q && q->M > 1 && q->t &&
            q->t->gpu_id >= 0 &&
-           (q->t->type == DS4F_FP8 || q->t->type == DS4F_BF16);
+           (q->t->type == DS4F_FP8 || q->t->type == DS4F_BF16 ||
+            q->t->type == DS4F_MXFP4);
 }
 
 /* Dispatch just the GPU-owned members of a mixed independent group.  The
@@ -2970,6 +2972,7 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_SHARED_FP16_LAYERS"); o.hip_shared_fp16_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_ORDERED_WKV_LAYERS"); o.hip_ordered_wkv_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_ORDERED_FP8_LAYERS"); o.hip_ordered_fp8_layers = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_MXFP4_WIDEN_LAYERS"); o.hip_mxfp4_widen_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_MHC"); o.mhc = e && *e ? atoi(e) : 0; }
@@ -3066,6 +3069,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_shared_fp16_layers = ds4f_json_int(json, "hip_shared_fp16_layers", o->hip_shared_fp16_layers);
     o->hip_ordered_wkv_layers = ds4f_json_int(json, "hip_ordered_wkv_layers", o->hip_ordered_wkv_layers);
     o->hip_ordered_fp8_layers = ds4f_json_int(json, "hip_ordered_fp8_layers", o->hip_ordered_fp8_layers);
+    o->hip_mxfp4_widen_layers = ds4f_json_int(json, "hip_mxfp4_widen_layers", o->hip_mxfp4_widen_layers);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);
     o->mhc = ds4f_json_int(json, "mhc", o->mhc);

@@ -28,7 +28,9 @@ enum {
     HIP_DS4F_MATRIX_BF16 = 1,
     HIP_DS4F_MATRIX_FP8_BF16 = 2,
     HIP_DS4F_MATRIX_FP8_FP16 = 3,
-    HIP_DS4F_MATRIX_FP8_ORDERED = 4
+    HIP_DS4F_MATRIX_FP8_ORDERED = 4,
+    HIP_DS4F_MATRIX_MXFP4 = 5,
+    HIP_DS4F_MATRIX_FP8_ROWSCALE = 6
 };
 
 static int matrix_is_bf16(int kind) {
@@ -40,11 +42,20 @@ static int matrix_is_fp16(int kind) {
 }
 
 static int matrix_is_fp8(int kind) {
-    return kind == HIP_DS4F_MATRIX_FP8 || kind == HIP_DS4F_MATRIX_FP8_ORDERED;
+    return kind == HIP_DS4F_MATRIX_FP8 || kind == HIP_DS4F_MATRIX_FP8_ORDERED ||
+           kind == HIP_DS4F_MATRIX_FP8_ROWSCALE;
+}
+
+static int matrix_is_mxfp4(int kind) {
+    return kind == HIP_DS4F_MATRIX_MXFP4;
 }
 
 static int matrix_is_fp8_ordered(int kind) {
     return kind == HIP_DS4F_MATRIX_FP8_ORDERED;
+}
+
+static int matrix_is_fp8_rowscale(int kind) {
+    return kind == HIP_DS4F_MATRIX_FP8_ROWSCALE;
 }
 
 static int matrix_is_fp8_promoted(int kind) {
@@ -63,6 +74,8 @@ struct hip_ds4f_dense {
     hipFunction_t blockdiag_matvec;
     hipFunction_t gemm_fp8;
     hipFunction_t gemm_fp8_ordered;
+    hipFunction_t gemm_mxfp4;
+    hipFunction_t gemm_fp8_rowscale;
     hipFunction_t gemm_bf16;
     hipFunction_t gemm_f16;
 
@@ -169,10 +182,14 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                              "ds4f_dense_fp8_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_fp8_ordered, ctx->module,
                              "ds4f_dense_fp8_ordered_gemm") != hipSuccess ||
+        hipModuleGetFunction(&ctx->gemm_mxfp4, ctx->module,
+                             "ds4f_dense_mxfp4_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_bf16, ctx->module,
                              "ds4f_dense_bf16_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_f16, ctx->module,
-                             "gemm_tiled_f16_f32") != hipSuccess) {
+                             "gemm_tiled_f16_f32") != hipSuccess ||
+        hipModuleGetFunction(&ctx->gemm_fp8_rowscale, ctx->module,
+                             "ds4f_dense_fp8_rowscale_gemm") != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: failed to build matvec module\n");
         if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
         ds4f_mem_pool_destroy(ctx->mem);
@@ -293,9 +310,10 @@ static int ensure_multi_vectors(hip_ds4f_dense *ctx, int slot, int rows, int col
     return 0;
 }
 
-int hip_ds4f_dense_add(hip_ds4f_dense *ctx,
-                       const uint8_t *w, const uint8_t *s,
-                       int rows, int cols) {
+static int hip_ds4f_dense_add_storage(hip_ds4f_dense *ctx,
+                                      const uint8_t *w, const uint8_t *s,
+                                      int rows, int cols, int scale_cols,
+                                      size_t w_bytes, size_t s_bytes, int kind) {
     if (!ctx || !w || !s || !valid_dims(rows, cols)) {
         fprintf(stderr, "hip_ds4f_dense: invalid matrix arguments\n");
         return -1;
@@ -306,10 +324,6 @@ int hip_ds4f_dense_add(hip_ds4f_dense *ctx,
     }
     if (hipSetDevice(ctx->device_id) != hipSuccess) return -1;
 
-    const int scale_cols = (cols + 127) / 128;
-    const int scale_rows = (rows + 127) / 128;
-    const size_t w_bytes = (size_t)rows * (size_t)cols;
-    const size_t s_bytes = (size_t)scale_rows * (size_t)scale_cols;
     void *dw = NULL, *ds = NULL;
     if (hipMalloc(&dw, w_bytes) != hipSuccess ||
         hipMalloc(&ds, s_bytes) != hipSuccess) {
@@ -343,15 +357,80 @@ int hip_ds4f_dense_add(hip_ds4f_dense *ctx,
     }
     int id = ctx->n_matrices++;
     ctx->matrices[id] = (hip_ds4f_matrix){ dw, ds, w, s, rows, cols, scale_cols,
-                                           HIP_DS4F_MATRIX_FP8 };
+                                           kind };
     ctx->current = id;
     return id;
+}
+
+int hip_ds4f_dense_add(hip_ds4f_dense *ctx,
+                       const uint8_t *w, const uint8_t *s,
+                       int rows, int cols) {
+    int sc = (cols + 127) / 128;
+    int sr = (rows + 127) / 128;
+    return hip_ds4f_dense_add_storage(ctx, w, s, rows, cols, sc,
+        (size_t)rows * (size_t)cols, (size_t)sr * (size_t)sc,
+        HIP_DS4F_MATRIX_FP8);
 }
 
 int hip_ds4f_dense_bind_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
     if (!t) return -1;
     int id = hip_ds4f_dense_add(ctx, (const uint8_t *)t->w, t->scale,
                                 t->rows, t->cols);
+    if (id >= 0) t->gpu_id = id;
+    return id;
+}
+
+int hip_ds4f_dense_bind_mxfp4_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
+    if (!ctx || !t || t->type != DS4F_MXFP4 || !t->w || !t->scale ||
+        !valid_dims(t->rows, t->cols) || (t->cols & 31)) return -1;
+    int id = hip_ds4f_dense_add_storage(ctx, (const uint8_t *)t->w,
+        t->scale, t->rows, t->cols, t->cols / 32,
+        (size_t)t->rows * (size_t)(t->cols / 2),
+        (size_t)t->rows * (size_t)(t->cols / 32), HIP_DS4F_MATRIX_MXFP4);
+    if (id >= 0) t->gpu_id = id;
+    return id;
+}
+
+int hip_ds4f_dense_bind_mxfp4_widened_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
+    static const float lut[16] = { 0.f,1.f,2.f,3.f,4.f,6.f,8.f,12.f,
+                                   0.f,-1.f,-2.f,-3.f,-4.f,-6.f,-8.f,-12.f };
+    if (!ctx || !t || t->type != DS4F_MXFP4 || !t->w || !t->scale ||
+        !valid_dims(t->rows, t->cols) || (t->cols & 127)) return -1;
+    int sc = (t->cols + 127) / 128, sr = (t->rows + 127) / 128;
+    size_t wb = (size_t)t->rows * (size_t)t->cols;
+    size_t sb = (size_t)t->rows * (size_t)sc;
+    uint8_t *fw = (uint8_t *)ds4f_mem_alloc(ctx->mem, wb, 64, 0);
+    uint8_t *fs = (uint8_t *)ds4f_mem_alloc(ctx->mem, sb, 64, 0);
+    if (!fw || !fs) return -1;
+    const uint8_t *w = (const uint8_t *)t->w, *s = t->scale;
+    int rb = t->cols / 2, rs = t->cols / 32;
+    for (int r = 0; r < t->rows; ++r) {
+        for (int bc = 0; bc < sc; ++bc) {
+            /* Raw MXFP4 stores the E8M0 byte one below the exponent byte
+             * consumed by the regular FP8 kernels. Keep the exponent in
+             * that byte domain while normalizing the FP8 payload. */
+            int emax = 0;
+            for (int b = 0; b < 4; ++b) {
+                int e = s[(size_t)r * rs + bc * 4 + b];
+                int se = e ? e - 1 : 0;
+                if (se > emax) emax = se;
+            }
+            fs[(size_t)r * sc + bc] = (uint8_t)emax;
+            for (int j = 0; j < 128; ++j) {
+                int col = bc * 128 + j, block = col >> 5, p = col & 31;
+                int off = p >> 1;
+                uint8_t q = w[(size_t)r * rb + (size_t)block * 16 + off];
+                int nib = (p & 1) ? q >> 4 : q & 15;
+                int se = s[(size_t)r * rs + block] ?
+                         (int)s[(size_t)r * rs + block] - 1 : 0;
+                float v = s[(size_t)r * rs + block] == 0
+                    ? 0.f : lut[nib] * ldexpf(1.0f, se - emax);
+                fw[(size_t)r * t->cols + col] = hip_f32_to_fp8_e4m3(v);
+            }
+        }
+    }
+    int id = hip_ds4f_dense_add_storage(ctx, fw, fs, t->rows, t->cols,
+        sc, wb, sb, HIP_DS4F_MATRIX_FP8_ROWSCALE);
     if (id >= 0) t->gpu_id = id;
     return id;
 }
@@ -755,11 +834,13 @@ int hip_ds4f_dense_gemm_tensor(
     int row0 = 0;
     if (!ctx || !dst || !x || !t || M < 1 || Ystride < t->rows ||
         Xstride < t->cols || t->gpu_id < 0 ||
-        (t->type != DS4F_FP8 && t->type != DS4F_BF16) ||
+        (t->type != DS4F_FP8 && t->type != DS4F_BF16 && t->type != DS4F_MXFP4) ||
         matrix_get(ctx, t->gpu_id, &mat) != 0 || mat->cols != t->cols ||
         (t->type == DS4F_FP8 && !matrix_is_fp8(mat->kind) &&
          !matrix_is_fp8_promoted(mat->kind)) ||
-        (t->type == DS4F_BF16 && mat->kind != HIP_DS4F_MATRIX_BF16)) {
+        (t->type == DS4F_BF16 && mat->kind != HIP_DS4F_MATRIX_BF16) ||
+        (t->type == DS4F_MXFP4 && !matrix_is_mxfp4(mat->kind) &&
+         !matrix_is_fp8(mat->kind))) {
         fprintf(stderr, "hip_ds4f_dense: invalid batched GEMM arguments\n");
         return -1;
     }
@@ -810,7 +891,22 @@ int hip_ds4f_dense_gemm_tensor(
     unsigned int gx = (unsigned int)((N + 63) / 64);
     unsigned int gy = (unsigned int)((M + 15) / 16);
     hipError_t err;
-    if (matrix_is_fp8_ordered(mat->kind)) {
+    if (matrix_is_mxfp4(mat->kind)) {
+        void *dw = mat->dw, *ds = mat->ds;
+        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy;
+        int n_out = N, n_in = K, n_tok = M;
+        void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok };
+        err = hipModuleLaunchKernel(ctx->gemm_mxfp4, gx, gy, 1, 16, 16, 1, 0,
+                                    ctx->stream, args, NULL);
+    } else if (matrix_is_fp8_rowscale(mat->kind)) {
+        void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
+        void *ds = (uint8_t *)mat->ds + (size_t)row0 * (size_t)mat->scale_cols;
+        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *lut = ctx->fp8_lut;
+        int n_out = N, n_in = K, n_tok = M, scale_cols = mat->scale_cols;
+        void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+        err = hipModuleLaunchKernel(ctx->gemm_fp8_rowscale, gx, gy, 1, 16, 16, 1, 0,
+                                    ctx->stream, args, NULL);
+    } else if (matrix_is_fp8_ordered(mat->kind)) {
         void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
         void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols;
         void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *lut = ctx->fp8_lut;
@@ -864,10 +960,12 @@ int hip_ds4f_dense_gemm_tensors(
     if (m0 < 1 || !dst[0] || !x[0] || !t[0] || xs0 < t[0]->cols ||
         t[0]->gpu_id < 0 || matrix_get(ctx, t[0]->gpu_id, &mat[0]) != 0 ||
         mat[0]->rows != t[0]->rows || mat[0]->cols != t[0]->cols ||
-        (t[0]->type != DS4F_FP8 && t[0]->type != DS4F_BF16) ||
+        (t[0]->type != DS4F_FP8 && t[0]->type != DS4F_BF16 && t[0]->type != DS4F_MXFP4) ||
         (t[0]->type == DS4F_FP8 && !matrix_is_fp8(mat[0]->kind) &&
          !matrix_is_fp8_promoted(mat[0]->kind)) ||
-        (t[0]->type == DS4F_BF16 && mat[0]->kind != HIP_DS4F_MATRIX_BF16))
+        (t[0]->type == DS4F_BF16 && mat[0]->kind != HIP_DS4F_MATRIX_BF16) ||
+        (t[0]->type == DS4F_MXFP4 && !matrix_is_mxfp4(mat[0]->kind) &&
+         !matrix_is_fp8_rowscale(mat[0]->kind)))
         return -1;
     k0 = t[0]->cols;
     for (int i = 0; i < n; ++i) {
@@ -876,10 +974,12 @@ int hip_ds4f_dense_gemm_tensors(
             Xstride[i] < t[i]->cols || t[i]->gpu_id < 0 ||
             matrix_get(ctx, t[i]->gpu_id, &mat[i]) != 0 ||
             mat[i]->rows != t[i]->rows || mat[i]->cols != t[i]->cols ||
-            (t[i]->type != DS4F_FP8 && t[i]->type != DS4F_BF16) ||
+            (t[i]->type != DS4F_FP8 && t[i]->type != DS4F_BF16 && t[i]->type != DS4F_MXFP4) ||
             (t[i]->type == DS4F_FP8 && !matrix_is_fp8(mat[i]->kind) &&
              !matrix_is_fp8_promoted(mat[i]->kind)) ||
-            (t[i]->type == DS4F_BF16 && mat[i]->kind != HIP_DS4F_MATRIX_BF16))
+            (t[i]->type == DS4F_BF16 && mat[i]->kind != HIP_DS4F_MATRIX_BF16) ||
+            (t[i]->type == DS4F_MXFP4 && !matrix_is_mxfp4(mat[i]->kind) &&
+             !matrix_is_fp8_rowscale(mat[i]->kind)))
             return -1;
         ybytes[i] = (size_t)m0 * (size_t)t[i]->rows * sizeof(float);
     }
@@ -905,7 +1005,21 @@ int hip_ds4f_dense_gemm_tensors(
         unsigned int gx = (unsigned int)((t[i]->rows + 63) / 64);
         unsigned int gy = (unsigned int)((m0 + 15) / 16);
         hipError_t err;
-        if (matrix_is_fp8_ordered(mat[i]->kind)) {
+        if (matrix_is_mxfp4(mat[i]->kind)) {
+            int n_out = t[i]->rows, n_in = k0, n_tok = m0;
+            void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok };
+            fn = ctx->gemm_mxfp4;
+            err = hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        } else if (matrix_is_fp8_rowscale(mat[i]->kind)) {
+            int n_out = t[i]->rows, n_in = k0, n_tok = m0;
+            int scale_cols = mat[i]->scale_cols;
+            void *lut = ctx->fp8_lut;
+            void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+            fn = ctx->gemm_fp8_rowscale;
+            err = hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        } else if (matrix_is_fp8_ordered(mat[i]->kind)) {
             int n_out = t[i]->rows, n_in = k0, n_tok = m0;
             int scale_cols = mat[i]->scale_cols;
             void *lut = ctx->fp8_lut;
