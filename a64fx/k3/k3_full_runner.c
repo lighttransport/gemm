@@ -212,7 +212,6 @@ typedef struct {
     float *expert_out;
     float *shared_hidden;
     float *reduce;
-    float *routed_norm;
     int8_t *q_scratch;
     int *expert_counts;
     int *expert_tokens;
@@ -1432,7 +1431,8 @@ static int full_moe_forward_expert_tp(k3_full_model *m, k3_full_layer *l,
     k3_full_prefetch_job prefetch_job;
     int prefetch_active = full_prefetch_start(m, &l->routed_up,
                                               &prefetch_thread, &prefetch_job);
-    memset(m->routed_latent, 0, K3_LATENT * sizeof(float));
+    /* The TP-selected expert kernel assigns every latent lane in its second
+     * workshare; no seed memset is needed before the call. */
     if (k3_expert_tp_forward_selected_mxfp4(
             m->routed_latent, w1, w2, w3, route_weight, K3_TOP_K,
             m->local_latent, m->expert_gate, m->expert_up,
@@ -1464,8 +1464,6 @@ static int full_moe_forward_expert_tp(k3_full_model *m, k3_full_layer *l,
         subphase_start = full_now();
     }
 
-    for (int i = 0; i < K3_LATENT; ++i)
-        m->routed_norm[i] = full_weight_at(&l->routed_norm, i);
     k3_moe_pack_reduce(m->reduce, m->routed_latent, m->shared_hidden);
     if (full_sum(m, m->reduce, K3_FULL_REDUCE_COUNT)) return EIO;
     if (m->profile.enabled) {
@@ -1945,7 +1943,6 @@ static int full_allocate_scratch(k3_full_model *m, const k3_full_options *o) {
     m->shared_hidden = (float *)k3_pool_alloc(m->pool, K3_HIDDEN * sizeof(float));
     m->reduce = (float *)k3_pool_alloc(m->pool,
                                        K3_FULL_REDUCE_COUNT * sizeof(float));
-    m->routed_norm = (float *)k3_pool_alloc(m->pool, K3_LATENT * sizeof(float));
     m->q_scratch = (int8_t *)k3_pool_alloc(m->pool, K3_LATENT * sizeof(int8_t));
     m->expert_counts = (int *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(int));
     m->expert_tokens = (int *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(int));
@@ -1955,7 +1952,7 @@ static int full_allocate_scratch(k3_full_model *m, const k3_full_options *o) {
         !m->attn || !m->q || !m->k || !m->v || !m->gate || !m->up || !m->decay ||
         !m->local_latent || !m->routed_latent || !m->moe_hidden || !m->logits ||
         !m->expert_gathered || !m->expert_gate || !m->expert_up || !m->expert_out ||
-        !m->shared_hidden || !m->reduce || !m->routed_norm || !m->q_scratch ||
+        !m->shared_hidden || !m->reduce || !m->q_scratch ||
         !m->expert_counts || !m->expert_tokens || !m->expert_weights) return ENOMEM;
     return 0;
 }
