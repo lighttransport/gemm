@@ -157,6 +157,18 @@ class RunK3EpScriptTest(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("result directory already exists", stderr)
 
+    def test_96n_smoke_uses_fixed_root_reduction(self):
+        source = (Path(__file__).resolve().parent / "pjsub_k3_smoke_96n.sh").read_text()
+        self.assertIn("COMM_ARGS=(--comm-deterministic 1 --comm-robust 2)", source)
+        self.assertIn('"${COMM_ARGS[@]}"', source)
+
+    def test_runner_scales_nondeterministic_checksum_tolerance(self):
+        source = (Path(__file__).resolve().parent / "k3_ep_runner.c").read_text()
+        self.assertIn("double checksum_local=(double)(float)checksum", source)
+        self.assertIn("checksum_scale", source)
+        self.assertIn("2e-7*checksum_scale", source)
+        self.assertIn("disagreement_tol", source)
+
     def test_comm_poll_spins_one_is_accepted(self):
         with tempfile.TemporaryDirectory() as existing:
             code, _stdout, stderr = self._run(

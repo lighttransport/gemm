@@ -12,11 +12,18 @@ set -eu
 REPO=/vol0006/mdt0/data/hp250467/work/gemm/k3
 RUN="$REPO/a64fx/k3/run_k3_ep.sh"
 
+# Keep the 96-rank gate bit-stable.  The production runner may use the faster
+# non-deterministic reduction, whose final checksum is validated with a scaled
+# FP32 tolerance; this gate is specifically intended to catch real collective
+# corruption and should not depend on reduction-tree rounding.
+COMM_ARGS=(--comm-deterministic 1 --comm-robust 2)
+
 "$RUN" --mode dummy --nodes 96 --layer 2 --layers 3 --tokens 2 --threads 48 \
     --ar-groups auto \
+    "${COMM_ARGS[@]}" \
     --result-dir "$REPO/a64fx/k3/logs/dummy-${PJM_JOBID}"
 
 echo "dummy gate passed on 96 nodes; starting bounded real-weight stage"
 "$RUN" --mode real --nodes 96 --layer 1 --experts 0-15 \
-    --layers 1 --tokens 2 --threads 48 --ar-groups auto --model-dir "$HOME/models/kimi-k3" \
+    --layers 1 --tokens 2 --threads 48 --ar-groups auto "${COMM_ARGS[@]}" --model-dir "$HOME/models/kimi-k3" \
     --result-dir "$REPO/a64fx/k3/logs/real-${PJM_JOBID}"

@@ -1021,7 +1021,11 @@ int main(int argc,char **argv){
     size_t final_rss=0,final_hwm=0;(void)k3_process_memory_bytes(&final_rss,&final_hwm);
     float health[7]={latent_max,state_max,cache_max,-(float)tokens_completed,-(float)last_layer,
         (float)(final_rss/1048576.0),(float)(final_hwm/1048576.0)};
-    float checksum_local=(float)checksum,checksum_bounds[2]={checksum_local,-checksum_local};
+    /* The reduction bounds are FP32 by design.  Compare them with the same
+     * rounded local value; comparing against the original FP64 accumulation
+     * creates a false one-ulp failure at checksums around 371. */
+    double checksum_local=(double)(float)checksum;
+    float checksum_bounds[2]={(float)checksum_local,-(float)checksum_local};
     int cache_save_rc=0;
     if(opt.cache_save&&!comm_failed&&tokens_completed>0){
         cache_save_rc=k3_cache_save(&opt,local_heads,opt.tokens,kda_elems,mla_key_elems,mla_value_elems,cache_element_bytes,
@@ -1036,7 +1040,14 @@ int main(int argc,char **argv){
         if(runner_allreduce_max(&comm,x,2)){fprintf(stderr,"k3_ep_runner rank %d: profile collective failed: %s\n",g_rank,runner_comm_error(&comm));comm_failed=1;break;}phase[i]=x[0];phase_max[i]=x[1];}
     double checksum_min=-(double)checksum_bounds[1],checksum_max=(double)checksum_bounds[0];
     double disagreement=comm_failed?INFINITY:fmax(fabs(checksum_max-checksum_local),fabs(checksum_local-checksum_min));
-    int rank_diverged=!comm_failed&&disagreement>=1e-6;
+    /* A non-deterministic FP32 all-reduce can use a different reduction tree
+     * on different ranks.  The resulting error is bounded by the magnitude of
+     * the reduced value; treating every non-zero low bit as corruption made
+     * the 96-rank dummy gate reject healthy results (3e-5 at checksum 371).
+     * Fixed-root mode remains strict for diagnostic/release runs. */
+    double checksum_scale=fmax(1.0,fmax(fabs(checksum_max),fabs(checksum_local)));
+    double disagreement_tol=opt.comm_deterministic?1e-6:fmax(1e-6,2e-7*checksum_scale);
+    int rank_diverged=!comm_failed&&disagreement>=disagreement_tol;
     finite&=!comm_failed&&isfinite(checksum)&&isfinite(norm2);
     if(!finite||rank_diverged)stop_numeric=1;
     const char *final_state=comm_failed?"comm-failed":stop_memory||stop_signal?"stopped":stop_numeric?"numeric-failed":"pass";
@@ -1049,9 +1060,9 @@ int main(int argc,char **argv){
             k3_mode_name(opt.mode),opt.mode==K3_MODE_HYBRID?"one_real_expert_layer_repeated":opt.mode==K3_MODE_REAL?"one_real_expert_layer":"synthetic",opt.layer,g_world_nodes,g_nodes,g_contexts,g_group,local,K3_SELECTED,schedule_layer,schedule_layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",opt.min_available_mib,
             opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.comm_ack,opt.comm_deterministic,opt.comm_poll_spins,opt.prefetch_mib,
             opt.prefetch_threads?opt.prefetch_threads:(opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS),(unsigned long long)prefetch_sink);
-        printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f decode_tok_s=%.3f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
+        printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f decode_tok_s=%.3f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e disagreement_tol=%.3e peak_MiB=%.2f collective_seq=%lu\n",
             !comm_failed&&!stop_signal&&!stop_memory&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal||stop_memory?"STOPPED":"FAIL",final_reason,tokens_completed,
-            seconds,seconds>0?(double)tokens_completed/seconds:0.0,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));
+            seconds,seconds>0?(double)tokens_completed/seconds:0.0,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,disagreement_tol,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));
         printf("K3_HEALTH kda_slots=%d mla_slots=%d state_MiB=%.2f mla_cache_MiB=%.2f pool_peak_MiB=%.2f rss_max_MiB=%.2f hwm_max_MiB=%.2f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e\n",
             kda_layers,mla_layers,kda_elems*sizeof(float)/1048576.0,
             (mla_key_elems+mla_value_elems)*cache_element_bytes/1048576.0,
