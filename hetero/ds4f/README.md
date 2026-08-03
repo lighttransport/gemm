@@ -423,6 +423,10 @@ used for batched prefill; decode retains the existing resident dense path.
 For upload-latency experiments, `"hip_mxfp4_stream_raw": 1` selects the
 compact raw-MXFP4/LUT kernel instead of FP8 widening; it is exact but slightly
 slower in the expert GEMM itself.
+On 16-GB-class RDNA4 cards, `"hip_mxfp4_resident_layers": 20` keeps the first
+20 local expert layers resident in compact raw form and streams the remainder;
+this measured 35.4 tok/s for full 43-layer batch-64 prefill with zero argmax
+mismatches.
 
 ## Long-context stability and speculative-decode probe
 

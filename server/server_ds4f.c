@@ -479,6 +479,17 @@ static int gpu_attach(ds4f_session *s, char *err, size_t err_cap) {
     }
     bytes += ds4f_wbytes(s->m->head.type, s->m->head.rows, s->m->head.cols);
     count++;
+    if (s->options.hip_mxfp4_resident_layers > 0) {
+        int nr = s->options.hip_mxfp4_resident_layers;
+        if (nr > s->m->cfg.n_layers) nr = s->m->cfg.n_layers;
+        for (int L = 0; L < nr; ++L)
+            if (hip_ds4f_dense_resident_mxfp4_layer(
+                    s->gpu, &s->m->layers[L], s->options.hip_mxfp4_stream_raw) != 0) {
+                set_err(err, err_cap, "DS4F_HIP resident MXFP4 upload exceeded GPU memory");
+                gpu_detach(s);
+                return -1;
+            }
+    }
     s->m->gpu_dense_ctx = s->gpu;
     s->m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
     s->m->gpu_dense_async_multi = s->options.hip_async
@@ -487,12 +498,15 @@ static int gpu_attach(ds4f_session *s, char *err, size_t err_cap) {
     s->m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
     s->m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     s->m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
-    if (s->options.hip_mxfp4_widen_layers > 0)
+    if (s->options.hip_mxfp4_widen_layers > 0 ||
+        s->options.hip_mxfp4_resident_layers > 0)
         s->m->mxfp4_w4a8 = 0;
-    s->m->gpu_dense_layer_begin = s->options.hip_mxfp4_widen_layers > 0
+    s->m->gpu_dense_layer_begin = (s->options.hip_mxfp4_widen_layers > 0 ||
+                                   s->options.hip_mxfp4_resident_layers > 0)
         ? (s->options.hip_mxfp4_stream_raw
             ? hip_ds4f_dense_stream_layer_raw : hip_ds4f_dense_stream_layer) : NULL;
-    s->m->gpu_dense_stream_prefill_only = s->options.hip_mxfp4_widen_layers > 0;
+    s->m->gpu_dense_stream_prefill_only = s->options.hip_mxfp4_widen_layers > 0 ||
+                                          s->options.hip_mxfp4_resident_layers > 0;
     s->m->gpu_dense_mixed = s->options.hip_shared_bf16 || s->options.hip_shared_fp16;
     fprintf(stderr, "[llm/ds4f] HIP dense bank attached: %d matrices, %.3f GB, device=%d\n",
             count, (double)bytes / 1e9, device);

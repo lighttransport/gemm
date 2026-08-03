@@ -23,6 +23,12 @@ typedef struct {
     int rows, cols, scale_cols, kind, owner;
 } hip_ds4f_matrix;
 
+typedef struct {
+    const ds4f_layer *layer;
+    void *dw, *ds;
+    int raw;
+} hip_ds4f_resident_layer;
+
 enum {
     HIP_DS4F_MATRIX_FP8 = 0,
     HIP_DS4F_MATRIX_BF16 = 1,
@@ -109,6 +115,8 @@ struct hip_ds4f_dense {
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
     void *stream_dw, *stream_ds;
+    hip_ds4f_resident_layer *resident_layers;
+    int n_resident_layers, cap_resident_layers;
 };
 
 static int valid_dims(int rows, int cols) {
@@ -126,6 +134,12 @@ static void clear_matrices(hip_ds4f_dense *ctx) {
     if (ctx->stream_dw) hipFree(ctx->stream_dw);
     if (ctx->stream_ds) hipFree(ctx->stream_ds);
     ctx->stream_dw = ctx->stream_ds = NULL;
+    for (int i = 0; i < ctx->n_resident_layers; ++i) {
+        if (ctx->resident_layers[i].dw) hipFree(ctx->resident_layers[i].dw);
+        if (ctx->resident_layers[i].ds) hipFree(ctx->resident_layers[i].ds);
+    }
+    ctx->resident_layers = NULL;
+    ctx->n_resident_layers = ctx->cap_resident_layers = 0;
 }
 
 static void release_matrix(hip_ds4f_dense *ctx, int id) {
@@ -478,9 +492,12 @@ static int widen_mxfp4_host(const ds4f_tensor *t, uint8_t *fw, uint8_t *fs) {
     return 0;
 }
 
-static int stream_layer_impl(void *opaque, const ds4f_layer *layer, int raw) {
+static int stream_layer_impl(void *opaque, const ds4f_layer *layer, int raw, int keep) {
     hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
     if (!ctx || !layer || ctx->pending || ctx->multi_pending) return -1;
+    for (int i = 0; i < ctx->n_resident_layers; ++i)
+        if (ctx->resident_layers[i].layer == layer && ctx->resident_layers[i].raw == raw)
+            return 0;
     if (ctx->stream_layer == layer) return 0;
     if (ctx->stream_layer) {
         const ds4f_layer *old = ctx->stream_layer;
@@ -550,16 +567,37 @@ static int stream_layer_impl(void *opaque, const ds4f_layer *layer, int raw) {
             if (id < 0) return -1;
             t->gpu_id = id; wo += wb; so += sb;
         }
-    ctx->stream_layer = layer;
+    if (keep) {
+        if (ctx->n_resident_layers == ctx->cap_resident_layers) {
+            int cap = ctx->cap_resident_layers ? ctx->cap_resident_layers * 2 : 8;
+            hip_ds4f_resident_layer *p = (hip_ds4f_resident_layer *)ds4f_mem_realloc(
+                ctx->mem, ctx->resident_layers,
+                (size_t)ctx->cap_resident_layers * sizeof(*ctx->resident_layers),
+                (size_t)cap * sizeof(*ctx->resident_layers), 64);
+            if (!p) return -1;
+            ctx->resident_layers = p;
+            ctx->cap_resident_layers = cap;
+        }
+        ctx->resident_layers[ctx->n_resident_layers++] =
+            (hip_ds4f_resident_layer){ layer, ctx->stream_dw, ctx->stream_ds, raw };
+        ctx->stream_dw = ctx->stream_ds = NULL;
+        ctx->stream_layer = NULL;
+    } else {
+        ctx->stream_layer = layer;
+    }
     return 0;
 }
 
 int hip_ds4f_dense_stream_layer(void *opaque, const ds4f_layer *layer) {
-    return stream_layer_impl(opaque, layer, 0);
+    return stream_layer_impl(opaque, layer, 0, 0);
 }
 
 int hip_ds4f_dense_stream_layer_raw(void *opaque, const ds4f_layer *layer) {
-    return stream_layer_impl(opaque, layer, 1);
+    return stream_layer_impl(opaque, layer, 1, 0);
+}
+
+int hip_ds4f_dense_resident_mxfp4_layer(void *opaque, const ds4f_layer *layer, int raw) {
+    return stream_layer_impl(opaque, layer, raw != 0, 1);
 }
 
 int hip_ds4f_dense_bind_fp8_ordered_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {

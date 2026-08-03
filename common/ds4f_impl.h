@@ -2973,6 +2973,7 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_ORDERED_WKV_LAYERS"); o.hip_ordered_wkv_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_ORDERED_FP8_LAYERS"); o.hip_ordered_fp8_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_WIDEN_LAYERS"); o.hip_mxfp4_widen_layers = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_MXFP4_RESIDENT_LAYERS"); o.hip_mxfp4_resident_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_STREAM_RAW"); o.hip_mxfp4_stream_raw = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
@@ -3071,6 +3072,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_ordered_wkv_layers = ds4f_json_int(json, "hip_ordered_wkv_layers", o->hip_ordered_wkv_layers);
     o->hip_ordered_fp8_layers = ds4f_json_int(json, "hip_ordered_fp8_layers", o->hip_ordered_fp8_layers);
     o->hip_mxfp4_widen_layers = ds4f_json_int(json, "hip_mxfp4_widen_layers", o->hip_mxfp4_widen_layers);
+    o->hip_mxfp4_resident_layers = ds4f_json_int(json, "hip_mxfp4_resident_layers", o->hip_mxfp4_resident_layers);
     o->hip_mxfp4_stream_raw = ds4f_json_int(json, "hip_mxfp4_stream_raw", o->hip_mxfp4_stream_raw);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);

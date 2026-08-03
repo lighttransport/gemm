@@ -412,6 +412,7 @@ typedef struct ds4f_runtime_options {
     int hip_ordered_wkv_layers;          /* CPU-compatible FP8 WKV GEMM for prefill prefix */
     int hip_ordered_fp8_layers;          /* CPU-compatible reduction for all FP8 GEMMs */
     int hip_mxfp4_widen_layers;          /* GPU MXFP4 experts, widened to row-scale FP8 */
+    int hip_mxfp4_resident_layers;       /* keep this many widened expert layers on GPU */
     int hip_mxfp4_stream_raw;            /* use compact raw MXFP4/LUT for streamed experts */
     int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
     int debug_env;
