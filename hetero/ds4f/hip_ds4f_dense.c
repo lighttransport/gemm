@@ -20,7 +20,7 @@ enum { HIP_DS4F_ASYNC_MAX = 2, HIP_DS4F_GEMM_MAX = 16 };
 typedef struct {
     void *dw, *ds;
     const void *hw, *hs;
-    int rows, cols, scale_cols, kind;
+    int rows, cols, scale_cols, kind, owner;
 } hip_ds4f_matrix;
 
 enum {
@@ -108,6 +108,7 @@ struct hip_ds4f_dense {
     void *gemm_multi_dy[HIP_DS4F_GEMM_MAX];
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
+    void *stream_dw, *stream_ds;
 };
 
 static int valid_dims(int rows, int cols) {
@@ -116,20 +117,46 @@ static int valid_dims(int rows, int cols) {
 
 static void clear_matrices(hip_ds4f_dense *ctx) {
     for (int i = 0; i < ctx->n_matrices; ++i) {
-        if (ctx->matrices[i].dw) hipFree(ctx->matrices[i].dw);
-        if (ctx->matrices[i].ds) hipFree(ctx->matrices[i].ds);
+        if (ctx->matrices[i].dw && !ctx->matrices[i].owner) hipFree(ctx->matrices[i].dw);
+        if (ctx->matrices[i].ds && !ctx->matrices[i].owner) hipFree(ctx->matrices[i].ds);
     }
     ctx->n_matrices = 0;
     ctx->current = -1;
     ctx->stream_layer = NULL;
+    if (ctx->stream_dw) hipFree(ctx->stream_dw);
+    if (ctx->stream_ds) hipFree(ctx->stream_ds);
+    ctx->stream_dw = ctx->stream_ds = NULL;
 }
 
 static void release_matrix(hip_ds4f_dense *ctx, int id) {
     if (!ctx || id < 0 || id >= ctx->n_matrices) return;
-    if (ctx->matrices[id].dw) hipFree(ctx->matrices[id].dw);
-    if (ctx->matrices[id].ds) hipFree(ctx->matrices[id].ds);
+    if (ctx->matrices[id].dw && !ctx->matrices[id].owner) hipFree(ctx->matrices[id].dw);
+    if (ctx->matrices[id].ds && !ctx->matrices[id].owner) hipFree(ctx->matrices[id].ds);
     memset(&ctx->matrices[id], 0, sizeof(ctx->matrices[id]));
     ctx->matrices[id].kind = -1;
+}
+
+static int append_device_matrix(hip_ds4f_dense *ctx, void *dw, void *ds,
+                                const void *hw, const void *hs,
+                                int rows, int cols, int scale_cols,
+                                int kind, int owner) {
+    int id = -1;
+    for (int i = 0; i < ctx->n_matrices; ++i)
+        if (!ctx->matrices[i].dw && !ctx->matrices[i].ds) { id = i; break; }
+    if (id < 0 && ctx->n_matrices == ctx->cap_matrices) {
+        int cap = ctx->cap_matrices ? ctx->cap_matrices * 2 : 8;
+        if (cap < ctx->n_matrices || cap > INT_MAX / (int)sizeof(*ctx->matrices)) return -1;
+        hip_ds4f_matrix *p = (hip_ds4f_matrix *)ds4f_mem_realloc(
+            ctx->mem, ctx->matrices,
+            (size_t)ctx->cap_matrices * sizeof(*ctx->matrices),
+            (size_t)cap * sizeof(*ctx->matrices), 64);
+        if (!p) return -1;
+        ctx->matrices = p; ctx->cap_matrices = cap;
+    }
+    if (id < 0) id = ctx->n_matrices++;
+    ctx->matrices[id] = (hip_ds4f_matrix){ dw, ds, hw, hs, rows, cols, scale_cols, kind, owner };
+    ctx->current = id;
+    return id;
 }
 
 hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise_math) {
@@ -348,30 +375,9 @@ static int hip_ds4f_dense_add_storage(hip_ds4f_dense *ctx,
         hipFree(dw); hipFree(ds);
         return -1;
     }
-    int id = -1;
-    for (int i = 0; i < ctx->n_matrices; ++i)
-        if (!ctx->matrices[i].dw && !ctx->matrices[i].ds) { id = i; break; }
-    if (id < 0 && ctx->n_matrices == ctx->cap_matrices) {
-        int cap = ctx->cap_matrices ? ctx->cap_matrices * 2 : 8;
-        if (cap < ctx->n_matrices || cap > INT_MAX / (int)sizeof(*ctx->matrices)) {
-            hipFree(dw); hipFree(ds);
-            return -1;
-        }
-        hip_ds4f_matrix *p = (hip_ds4f_matrix *)ds4f_mem_realloc(
-            ctx->mem, ctx->matrices,
-            (size_t)ctx->cap_matrices * sizeof(*ctx->matrices),
-            (size_t)cap * sizeof(*ctx->matrices), 64);
-        if (!p) {
-            hipFree(dw); hipFree(ds);
-            return -1;
-        }
-        ctx->matrices = p;
-        ctx->cap_matrices = cap;
-    }
-    if (id < 0) id = ctx->n_matrices++;
-    ctx->matrices[id] = (hip_ds4f_matrix){ dw, ds, w, s, rows, cols, scale_cols,
-                                           kind };
-    ctx->current = id;
+    int id = append_device_matrix(ctx, dw, ds, w, s, rows, cols,
+                                  scale_cols, kind, 0);
+    if (id < 0) { hipFree(dw); hipFree(ds); }
     return id;
 }
 
@@ -448,7 +454,31 @@ int hip_ds4f_dense_bind_mxfp4_widened_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t
     return id;
 }
 
-int hip_ds4f_dense_stream_layer(void *opaque, const ds4f_layer *layer) {
+static int widen_mxfp4_host(const ds4f_tensor *t, uint8_t *fw, uint8_t *fs) {
+    static const float lut[16] = { 0.f,1.f,2.f,3.f,4.f,6.f,8.f,12.f,
+                                   0.f,-1.f,-2.f,-3.f,-4.f,-6.f,-8.f,-12.f };
+    int sc = (t->cols + 127) / 128, rb = t->cols / 2, rs = t->cols / 32;
+    const uint8_t *w = (const uint8_t *)t->w, *s = t->scale;
+    for (int r = 0; r < t->rows; ++r) for (int bc = 0; bc < sc; ++bc) {
+        int emax = 0;
+        for (int b = 0; b < 4; ++b) {
+            int e = s[(size_t)r * rs + bc * 4 + b];
+            if (e && e - 1 > emax) emax = e - 1;
+        }
+        fs[(size_t)r * sc + bc] = (uint8_t)emax;
+        for (int j = 0; j < 128; ++j) {
+            int col = bc * 128 + j, block = col >> 5, p = col & 31;
+            uint8_t q = w[(size_t)r * rb + (size_t)block * 16 + (p >> 1)];
+            int nib = (p & 1) ? q >> 4 : q & 15;
+            int e = s[(size_t)r * rs + block];
+            float v = e ? lut[nib] * ldexpf(1.0f, (e - 1) - emax) : 0.f;
+            fw[(size_t)r * t->cols + col] = hip_f32_to_fp8_e4m3(v);
+        }
+    }
+    return 0;
+}
+
+static int stream_layer_impl(void *opaque, const ds4f_layer *layer, int raw) {
     hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
     if (!ctx || !layer || ctx->pending || ctx->multi_pending) return -1;
     if (ctx->stream_layer == layer) return 0;
@@ -462,23 +492,74 @@ int hip_ds4f_dense_stream_layer(void *opaque, const ds4f_layer *layer) {
             }
     }
     ctx->stream_layer = NULL;
+    if (ctx->stream_dw) hipFree(ctx->stream_dw);
+    if (ctx->stream_ds) hipFree(ctx->stream_ds);
+    ctx->stream_dw = ctx->stream_ds = NULL;
     const ds4f_tensor *ex[] = { layer->ex_w1, layer->ex_w2, layer->ex_w3 };
-    for (size_t w = 0; w < sizeof(ex) / sizeof(ex[0]); ++w) {
-        if (!ex[w]) return -1;
+    size_t wtotal = 0, stotal = 0;
+    for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi) {
+        if (!ex[wi]) return -1;
         for (int e = 0; e < layer->n_owned; ++e) {
-            ds4f_tensor *t = (ds4f_tensor *)&ex[w][e];
-            if (t->type != DS4F_MXFP4 || hip_ds4f_dense_bind_mxfp4_widened_tensor(ctx, t) < 0) {
-                for (size_t rw = 0; rw <= w; ++rw) if (ex[rw])
-                    for (int re = 0; re < layer->n_owned; ++re) {
-                        ds4f_tensor *rt = (ds4f_tensor *)&ex[rw][re];
-                        if (rt->gpu_id >= 0) { release_matrix(ctx, rt->gpu_id); rt->gpu_id = -1; }
-                    }
-                return -1;
-            }
+            const ds4f_tensor *t = &ex[wi][e];
+            if (t->type != DS4F_MXFP4 || !valid_dims(t->rows, t->cols) || (t->cols & 127)) return -1;
+            wtotal += raw ? (size_t)t->rows * (size_t)(t->cols / 2)
+                          : (size_t)t->rows * (size_t)t->cols;
+            stotal += raw ? (size_t)t->rows * (size_t)(t->cols / 32)
+                          : (size_t)t->rows * (size_t)((t->cols + 127) / 128);
         }
     }
+    uint8_t *hw = (uint8_t *)ds4f_mem_alloc(ctx->mem, wtotal, 256, 0);
+    uint8_t *hs = (uint8_t *)ds4f_mem_alloc(ctx->mem, stotal, 256, 0);
+    if (!hw || !hs || hipSetDevice(ctx->device_id) != hipSuccess) return -1;
+    size_t wo = 0, so = 0;
+    for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi)
+        for (int e = 0; e < layer->n_owned; ++e) {
+            ds4f_tensor *t = (ds4f_tensor *)&ex[wi][e];
+            size_t wb = raw ? (size_t)t->rows * (size_t)(t->cols / 2)
+                            : (size_t)t->rows * (size_t)t->cols;
+            size_t sb = raw ? (size_t)t->rows * (size_t)(t->cols / 32)
+                            : (size_t)t->rows * (size_t)((t->cols + 127) / 128);
+            if (raw) {
+                memcpy(hw + wo, t->w, wb);
+                memcpy(hs + so, t->scale, sb);
+            } else if (widen_mxfp4_host(t, hw + wo, hs + so) != 0) return -1;
+            t->gpu_id = -1;
+            wo += wb; so += sb;
+        }
+    if (hipMalloc(&ctx->stream_dw, wtotal) != hipSuccess ||
+        hipMalloc(&ctx->stream_ds, stotal) != hipSuccess ||
+        hipMemcpy(ctx->stream_dw, hw, wtotal, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(ctx->stream_ds, hs, stotal, hipMemcpyHostToDevice) != hipSuccess) {
+        if (ctx->stream_dw) hipFree(ctx->stream_dw);
+        if (ctx->stream_ds) hipFree(ctx->stream_ds);
+        ctx->stream_dw = ctx->stream_ds = NULL;
+        return -1;
+    }
+    wo = so = 0;
+    for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi)
+        for (int e = 0; e < layer->n_owned; ++e) {
+            ds4f_tensor *t = (ds4f_tensor *)&ex[wi][e];
+            size_t wb = raw ? (size_t)t->rows * (size_t)(t->cols / 2)
+                            : (size_t)t->rows * (size_t)t->cols;
+            size_t sb = raw ? (size_t)t->rows * (size_t)(t->cols / 32)
+                            : (size_t)t->rows * (size_t)((t->cols + 127) / 128);
+            int id = append_device_matrix(ctx, (uint8_t *)ctx->stream_dw + wo,
+                (uint8_t *)ctx->stream_ds + so, hw + wo, hs + so,
+                t->rows, t->cols, raw ? t->cols / 32 : (t->cols + 127) / 128,
+                raw ? HIP_DS4F_MATRIX_MXFP4 : HIP_DS4F_MATRIX_FP8_ROWSCALE, 1);
+            if (id < 0) return -1;
+            t->gpu_id = id; wo += wb; so += sb;
+        }
     ctx->stream_layer = layer;
     return 0;
+}
+
+int hip_ds4f_dense_stream_layer(void *opaque, const ds4f_layer *layer) {
+    return stream_layer_impl(opaque, layer, 0);
+}
+
+int hip_ds4f_dense_stream_layer_raw(void *opaque, const ds4f_layer *layer) {
+    return stream_layer_impl(opaque, layer, 1);
 }
 
 int hip_ds4f_dense_bind_fp8_ordered_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {

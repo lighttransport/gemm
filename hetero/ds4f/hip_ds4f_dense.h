@@ -96,6 +96,7 @@ int hip_ds4f_dense_gemm_tensors(
 /* Release the previous layer's streamed expert matrices and upload the
  * current layer's local MXFP4 experts as exact row-scale FP8. */
 int hip_ds4f_dense_stream_layer(void *ctx, const ds4f_layer *layer);
+int hip_ds4f_dense_stream_layer_raw(void *ctx, const ds4f_layer *layer);
 
 /* Start up to two independent tensor matvecs on separate streams. The
  * corresponding wait call downloads the outputs passed in dst. */

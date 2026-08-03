@@ -490,7 +490,8 @@ static int gpu_attach(ds4f_session *s, char *err, size_t err_cap) {
     if (s->options.hip_mxfp4_widen_layers > 0)
         s->m->mxfp4_w4a8 = 0;
     s->m->gpu_dense_layer_begin = s->options.hip_mxfp4_widen_layers > 0
-        ? hip_ds4f_dense_stream_layer : NULL;
+        ? (s->options.hip_mxfp4_stream_raw
+            ? hip_ds4f_dense_stream_layer_raw : hip_ds4f_dense_stream_layer) : NULL;
     s->m->gpu_dense_stream_prefill_only = s->options.hip_mxfp4_widen_layers > 0;
     s->m->gpu_dense_mixed = s->options.hip_shared_bf16 || s->options.hip_shared_fp16;
     fprintf(stderr, "[llm/ds4f] HIP dense bank attached: %d matrices, %.3f GB, device=%d\n",

@@ -420,6 +420,9 @@ workloads.
 representation. This is intended for RDNA4, which has no native MXFP4
 instruction. Streaming keeps expert residency bounded to one layer and is
 used for batched prefill; decode retains the existing resident dense path.
+For upload-latency experiments, `"hip_mxfp4_stream_raw": 1` selects the
+compact raw-MXFP4/LUT kernel instead of FP8 widening; it is exact but slightly
+slower in the expert GEMM itself.
 
 ## Long-context stability and speculative-decode probe
 
