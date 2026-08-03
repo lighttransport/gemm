@@ -957,6 +957,12 @@ Both execution modes use the same kernels, scratch buffers, and collective:
   headers. At TP=96 this reads about 2.79 MiB/rank, or about 45 MiB per 16-node SIO
   group. Loading is collective-safe: one rank's failure is reduced to every rank,
   producing `load-failed` status rather than stranding peers in the next collective.
+- `--mode hybrid` stages one real expert layer (normally `--layer 1`) and walks the
+  complete 93-layer synthetic schedule. It is a bounded throughput/transport
+  attachment: the staged expert slices are deliberately reused at every schedule
+  layer, while attention and non-expert paths remain synthetic. `K3_RUN` reports
+  `model_coverage=one_real_expert_layer_repeated`; its `K3_RESULT decode_tok_s` is
+  therefore not a full-checkpoint quality-generation rate.
 - `--ar-groups auto|A` controls the pool-backed hierarchical all-reduce. `auto` is
   the default and chooses six-rank rows: two contiguous groups on 12 nodes and 16 on
   TP96 ranks. An explicit divisor of `--tp-nodes` selects that many groups; `0`
@@ -970,7 +976,18 @@ Inside an allocation, use the orchestration wrapper:
   --model-dir "$HOME/models/kimi-k3" --layers 1 --tokens 2
 ./run_k3_ep.sh --mode real --nodes 192 --tp-nodes 96 --layer 1 \
   --experts 0-15 --model-dir "$HOME/models/kimi-k3" --layers 1 --tokens 256
+
+# 12-node, memory-safe 93-layer throughput attachment.  This stages only the
+# selected MXFP4 expert slices; no full-model conversion is needed.
+./run_k3_fast_decode_12n.sh
 ```
+
+On interactive 12-node job `49931652`, `run_k3_fast_decode_12n.sh` streamed 23 MiB
+of rank-local stage data, kept `MemAvailable` at 29,958.5 MiB, and passed all 12
+status markers. The 64-token run completed in 3.188637 s at `decode_tok_s=20.071`
+with zero checksum disagreement and an 81.64 MiB managed pool peak. This is the
+transport/kernel attachment target; it must not be compared with full-model output
+quality until the complete checkpoint graph is wired to the same optimized layout.
 
 The grouping path was validated on job `49868333` by splitting twelve physical ranks
 into two TP6 contexts. Dummy and real-weight runs both passed 12/12 status checks;
@@ -1362,6 +1379,114 @@ They preserve start/end epochs, elapsed seconds, and return codes for build, top
 weight staging, decode, prefill, result validation, and the whole-network estimate.
 An EXIT trap records an interrupted active stage, making the logs suitable for sizing
 later checkpoint-heavy allocations even when a job hits its elapsed-time limit.
+
+### Full-weight TP96 short-context run and Python environment
+
+The full-model runner's tokenizer and output decoder require `tiktoken`; the system
+`python3` on the login/compute path is Python 3.6 and does not provide it. K3 uses
+architecture-specific `uv` environments because the login host is x86_64 while the
+A64FX compute nodes are aarch64. The bootstrap script creates the matching Python
+3.11 environment, installs `requirements-python.txt` (`tiktoken` plus its resolved
+dependencies), and selects it for full staging, prompt encoding, validation, and
+generated-output decoding:
+
+```sh
+a64fx/k3/k3_setup_python.sh
+```
+
+`k3_python.sh` is the common selector. On a compute node the environment is
+`a64fx/k3/.venv-aarch64`; on the login host it is `.venv-x86_64`. If no usable `uv`
+binary is on the compute-node PATH, the bootstrap fetches the matching `uv` release
+under `$HOME/.cache/k3/uv/` before creating the environment.
+
+The one-node small-group validation job `49922924` passed on 2026-08-02. It created
+the A64FX environment, verified Python 3.11, `tiktoken 0.13.0`, `regex`, K3 prompt
+encoding, and the simulator helper. Its retained logs are under
+`logs/python-test-1n-49922924/`.
+
+The one-hour full-weight short-context launcher is
+`pjsub_k3_full_96n_short_1h.sh`. It stages the complete checkpoint on 96 ranks and
+runs a 256-token prefill followed by 256 generated tokens, reporting both
+`prefill_tok_s` and `decode_tok_s` from `k3_full_runner`:
+
+```sh
+pjsub a64fx/k3/pjsub_k3_full_96n_short_1h.sh
+```
+
+The first submission, `49903378`, exited before staging because `tiktoken` was
+missing. After the architecture-specific environment was installed and validated,
+the corrected run was resubmitted as job `49922938` and completed staging, but
+the first full-generation barrier failed: rank 0 waited for rank 46's fan-in
+slot while rank 46 waited for the release token. No throughput number is claimed
+for that run. The full runner barrier now retries fan-in Puts while waiting,
+cleans each rewritten token source line before issuing uTofu Put, and uses the
+supported A64FX clean+invalidate poll sequence against a clean receive-slot
+baseline. The failed-run evidence remains under
+`logs/full-96n-short-1h-49922938/`.
+
+The next short run, `49931198`, completed staging and passed the 96-node barrier,
+but its post-run validator correctly rejected the inference result: 87 ranks had
+output hash `22b11b600ccaf617`, six had `64d719b57f3371ef`, and three had
+`6df6966ca4e1095b`. All ranks happened to end at token 1351, so the runner's
+rank-0 `PASS` line was insufficient evidence. The barrier log also showed 128
+iterations rather than the requested 512 because PJM did not export the
+login-shell `K3_BARRIER_ITERS`; both 96-node launchers now use explicit `#PJM -x`
+exports and write a resolved `config.txt`.
+
+The 1.70 token/s decode measurement from that job was the old correctness-oriented
+BF16/whole-expert path. The full runner now has the optimized `full96-expert-tp`
+layout: every rank owns one 32-channel MXFP4 slice from every expert, and one
+packed `[latent, hidden]` reduction feeds the fused MoE finish. Version-3 mixed
+manifests add Q8W16 dispatch for the BF16 MoE projections; each tensor is checked
+against the rel-L2/cosine gate and failing shared shards remain BF16. The two-level
+all-reduce is enabled by default (`--ar-groups 16` at TP96), while fixed-root
+deterministic reductions, hidden hashes, and shared OpenMP projection teams retain
+the rank-identical correctness checks.
+
+The conversion is streamed from a 12-node allocation into the durable artifact
+tree. It does not load the complete model into HBM and is resumable per logical
+rank:
+
+```sh
+./a64fx/k3/run_k3_full_q8_prepare_12n.sh \
+  --model-dir "$HOME/models/kimi-k3" \
+  --artifact-root /vol0006/mdt0/data/hp250467/work/gemm/k3/artifacts/k3-full96-q8w16/k3
+```
+
+The interactive correctness probe can exercise the same fused and Q8 paths on a
+real layer with `run_k3_full_12n.sh --expert-tp --q8`. A full 93-layer TP12 image
+would be about 131 GiB per rank, so the 12-node allocation is used for conversion
+and one-layer regression; the genuine 93-layer decode remains a TP96 run. Point a
+96-node launcher at the prepared mixed directory with `K3_FULL_STAGE_DIR=...` and
+use `K3_AR_GROUPS=16` for the production run.
+
+The runner also has a model-free `--mode barrier` preflight. It performs 128
+skewed barrier generations by default and is run before checkpoint staging by
+both full 96-node launchers. The interactive 12-node harness runs the same
+preflight before staging its layer image. Override the count with
+`K3_BARRIER_ITERS=N` or `--barrier-iters N` when reproducing a transport issue.
+
+For a broader model-free regression matrix in an interactive 12-node allocation,
+run `./run_k3_12n_regression.sh`. It regenerates the topology, runs four separate
+barrier lifecycles (1, 8, 128, and 512 generations by default), then checks exact
+SUM/MAX all-reduces through flat, deterministic, A2A, BF16, 2D, and ACK/drop paths
+using small buffers. Results and per-rank logs are under
+`logs/k3-12n-regression-$PJM_JOBID/`. Use `--barrier-only` or `--ar-only` to isolate
+one side, and `K3_AR_REPS`/`K3_AR_COUNT` to adjust the all-reduce workload.
+
+The full runner exposes collective tuning explicitly through `--comm-bf16`,
+`--comm-robust`, `--comm-poll-spins`, `--comm-a2a`, and `--comm-a2a-max`; the
+resolved values are written to the output header and launcher `config.txt`.
+`--prefetch-mib` bounds the asynchronous routed-up cache window to 16 MiB by
+default, while `--prefetch-mib 0` disables it. `--profile [FILE]` writes
+rank-maximum per-layer and collective timings, including the
+`rank_max_mean_ms` value used for the 1.08 ms/layer gate.
+
+For an 8-row Q8-compatible routed projection layout, stage with
+`K3_MOE_SHARD_LAYOUT=row-aligned` or pass `--moe-shard-layout row-aligned` to
+`k3_full_stage.py`. The runner detects these local shapes and performs the
+latent and hidden joins required by the row-sharded routed-down/routed-up path.
+The default `replicated` layout remains compatible with existing artifacts.
 
 ### TP72 non-contiguous decode probe
 

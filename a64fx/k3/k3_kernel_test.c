@@ -26,6 +26,17 @@ static int check(const char *name, const float *a, const float *b, size_t n, flo
     float e = max_abs(a, b, n); printf("[%-12s] max_abs=%9.3e %s\n", name, e, e <= tol ? "OK" : "FAIL"); return e > tol;
 }
 
+static void router_topk_uncached(const float *logits,const float *bias,int experts,
+        int topk,int *indices,float *weights){
+    for(int k=0;k<topk;++k){int best=-1;float best_score=-INFINITY;
+        for(int e=0;e<experts;++e){int used=0;for(int p=0;p<k;++p)used|=indices[p]==e;
+            float score=k3_sigmoidf(logits[e])+(bias?bias[e]:0.0f);
+            if(!used&&(score>best_score||(score==best_score&&e<best))){best=e;best_score=score;}}
+        indices[k]=best;}
+    float sum=0;for(int k=0;k<topk;++k)sum+=(weights[k]=k3_sigmoidf(logits[indices[k]]));
+    for(int k=0;k<topk;++k)weights[k]/=sum;
+}
+
 static float mxfp4_ref(const uint8_t *w, const uint8_t *scale, const float *x, int n) {
     double sum = 0.0;
     for (int b = 0; b < n / 32; ++b) {
@@ -134,11 +145,13 @@ int main(void) {
     k3_attnres_ref(ar,candidates,scores,13,64); k3_attnres_sve(ao,candidates,scores,13,64);
     fail |= check("attnres", ar, ao, 64, 3e-7f);
 
-    float logits[32], biasv[32], weights[4]; int idx[4]; fill(logits,32,3); fill(biasv,32,.1f);
+    float logits[32], biasv[32], weights[4],ref_weights[4]; int idx[4],ref_idx[4]; fill(logits,32,3); fill(biasv,32,.1f);
+    router_topk_uncached(logits,biasv,32,4,ref_idx,ref_weights);
     k3_router_topk(logits,biasv,32,4,idx,weights); float wsum=weights[0]+weights[1]+weights[2]+weights[3];
     int unique = idx[0]!=idx[1] && idx[0]!=idx[2] && idx[0]!=idx[3] && idx[1]!=idx[2] && idx[1]!=idx[3] && idx[2]!=idx[3];
     printf("[router      ] indices=%d,%d,%d,%d sum=%.8f %s\n",idx[0],idx[1],idx[2],idx[3],wsum,(unique&&fabsf(wsum-1)<1e-6f)?"OK":"FAIL");
-    fail |= !unique || fabsf(wsum-1) >= 1e-6f;
+    fail |= !unique || fabsf(wsum-1) >= 1e-6f || memcmp(idx,ref_idx,sizeof idx) ||
+            memcmp(weights,ref_weights,sizeof weights);
 
     enum { MK = 3584, MR = 8, MI = 2000 };
     uint8_t *mw = malloc((size_t)MR * MK / 2), *ms = malloc((size_t)MR * MK / 32);

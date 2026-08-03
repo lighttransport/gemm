@@ -40,7 +40,7 @@ PREFETCH_THREADS=0
 
 usage() {
     cat >&2 <<EOF
-usage: $0 [--mode dummy|real] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]
+usage: $0 [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]
           [--threads N] [--kda-threads N] [--fused-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
           [--cache-load PATH] [--cache-save PATH]
@@ -95,9 +95,9 @@ while (( $# )); do
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2;;
     esac
 done
-case "$MODE" in dummy|real) ;; *) echo "$0: --mode must be dummy or real" >&2; exit 2;; esac
-if (( STAGE_ONLY )) && [[ "$MODE" != real ]]; then
-    echo "$0: --stage-only requires --mode real" >&2
+case "$MODE" in dummy|real|hybrid) ;; *) echo "$0: --mode must be dummy, real, or hybrid" >&2; exit 2;; esac
+if (( STAGE_ONLY )) && [[ "$MODE" != real && "$MODE" != hybrid ]]; then
+    echo "$0: --stage-only requires --mode real or hybrid" >&2
     exit 2
 fi
 for value in "$NODES" "$TP_NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$MIN_AVAILABLE_MIB" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
@@ -215,7 +215,7 @@ done
 (( topology_ok == 1 )) || { echo "$0: topology discovery failed" >&2; exit 3; }
 timing_end 0
 
-if [[ "$MODE" == real ]]; then
+if [[ "$MODE" == real || "$MODE" == hybrid ]]; then
     if [[ ! -d "$MODEL_DIR" ]]; then echo "$0: model directory is missing: $MODEL_DIR" >&2; exit 4; fi
     if (( REUSE_STAGE )); then
         timing_begin stage_validation

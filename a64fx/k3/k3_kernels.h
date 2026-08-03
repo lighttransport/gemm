@@ -206,10 +206,12 @@ static inline void k3_conv_step_sve(float *out, const float *x, float *state,
  * A_log[num_heads]. The checkpoint shape is the runtime contract. */
 static inline void k3_kda_log_decay(float *out, const float *g_raw, const float *a_log,
                                     const float *dt_bias, int heads, int key_dim) {
+    float a_scale[key_dim];
+    for (int d = 0; d < key_dim; ++d) a_scale[d] = expf(a_log[d]);
     for (int h = 0; h < heads; ++h) {
         for (int d = 0; d < key_dim; ++d) {
             int i = h * key_dim + d;
-            out[i] = -5.0f * k3_sigmoidf(expf(a_log[d]) * (g_raw[i] + dt_bias[i]));
+            out[i] = -5.0f * k3_sigmoidf(a_scale[d] * (g_raw[i] + dt_bias[i]));
         }
     }
 }
@@ -619,20 +621,25 @@ static inline void k3_attnres_sve(float *out, const float *candidates, const flo
 /* Selection uses corrected sigmoid score; returned weights use uncorrected sigmoid and sum to 1. */
 static inline void k3_router_topk(const float *logits, const float *bias, int experts, int topk,
                                   int *indices, float *weights) {
+    float probability[experts], score[experts];
+    for (int e = 0; e < experts; ++e) {
+        probability[e] = k3_sigmoidf(logits[e]);
+        score[e] = probability[e] + (bias ? bias[e] : 0.0f);
+    }
     for (int k = 0; k < topk; ++k) {
         int best = -1; float best_score = -INFINITY;
         for (int e = 0; e < experts; ++e) {
-            int used = 0;
-            for (int p = 0; p < k; ++p) used |= indices[p] == e;
-            float score = k3_sigmoidf(logits[e]) + (bias ? bias[e] : 0.0f);
-            if (!used && (score > best_score || (score == best_score && e < best))) {
-                best = e; best_score = score;
+            if (score[e] > best_score ||
+                (score[e] == best_score && e < best)) {
+                best = e; best_score = score[e];
             }
         }
         indices[k] = best;
+        score[best] = -INFINITY;
     }
     float sum = 0.0f;
-    for (int k = 0; k < topk; ++k) sum += (weights[k] = k3_sigmoidf(logits[indices[k]]));
+    for (int k = 0; k < topk; ++k)
+        sum += (weights[k] = probability[indices[k]]);
     for (int k = 0; k < topk; ++k) weights[k] /= sum;
 }
 

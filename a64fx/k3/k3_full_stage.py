@@ -112,6 +112,14 @@ def split_dim(total, rank, size):
     return first, count
 
 
+def split_group_dim(total, rank, size, group):
+    """Partition total elements without splitting fixed-size kernel groups."""
+    if total % group:
+        raise ValueError("dimension %d is not divisible by group %d" % (total, group))
+    first_group, group_count = split_dim(total // group, rank, size)
+    return first_group * group, group_count * group
+
+
 def copy_record(rec, mode, rank, size):
     """Return one or more source ranges for a logical row/column slice."""
     shape = rec["shape"]
@@ -124,6 +132,19 @@ def copy_record(rec, mode, rank, size):
         if not shape:
             raise ValueError("cannot row-slice scalar %s" % rec["name"])
         r0, nr = split_dim(shape[0], rank, size)
+        row_elems = 1
+        for dim in shape[1:]:
+            row_elems *= dim
+        row_bytes = row_elems * dtype_size
+        out = dict(rec)
+        out["shape"] = [nr] + list(shape[1:])
+        out["segments"] = [(rec["source_offset"] + r0 * row_bytes, nr * row_bytes)]
+        out["nbytes"] = nr * row_bytes
+        return [out]
+    if mode == "rows-group":
+        if not shape or shape[0] % 8:
+            raise ValueError("group-row slicing requires rows divisible by 8: %s" % rec["name"])
+        r0, nr = split_group_dim(shape[0], rank, size, 8)
         row_elems = 1
         for dim in shape[1:]:
             row_elems *= dim
@@ -162,7 +183,55 @@ def is_mla(layer):
                                84, 88, 92, 93))
 
 
-def make_plan(all_headers, rank, size, layer_indices=None, include_global=True):
+def expert_tp_records(all_headers, prefix, rank, size, expert):
+    """Return one intermediate-channel slice for one expert.
+
+    MXFP4 payloads are stored with two packed values per byte and one scale per
+    32 logical values.  The TP boundary is therefore always a 32-value block.
+    """
+    out = []
+    ep = prefix + "block_sparse_moe.experts.%d." % expert
+    first, local = split_dim(MOE_INTER, rank, size)
+    if first % 32 or local % 32:
+        raise ValueError("expert TP size must partition 32-channel blocks: rank=%d size=%d" %
+                         (rank, size))
+    for suffix in ("w1.weight_packed", "w1.weight_scale",
+                   "w2.weight_packed", "w2.weight_scale",
+                   "w3.weight_packed", "w3.weight_scale"):
+        raw = locate(all_headers, ep + suffix)
+        rec = dict(raw)
+        if suffix.startswith("w1.") or suffix.startswith("w3."):
+            row_bytes = raw["shape"][1]
+            rec["shape"] = [local, raw["shape"][1]]
+            rec["segments"] = [(raw["source_offset"] + first * row_bytes,
+                                 local * row_bytes)]
+            rec["nbytes"] = local * row_bytes
+        elif suffix == "w2.weight_packed":
+            packed_first = first // 2
+            packed_local = local // 2
+            row_bytes = raw["shape"][1]
+            rec["shape"] = [raw["shape"][0], packed_local]
+            # Keep a compact row-slice descriptor.  Materializing one tuple
+            # per row for all 896 experts would consume many GiB before the
+            # first byte is staged.
+            rec["segments"] = ("rows", raw["source_offset"], raw["shape"][0],
+                                row_bytes, packed_first, packed_local)
+            rec["nbytes"] = raw["shape"][0] * packed_local
+        else:
+            scale_first = first // 32
+            scale_local = local // 32
+            row_bytes = raw["shape"][1]
+            rec["shape"] = [raw["shape"][0], scale_local]
+            rec["segments"] = ("rows", raw["source_offset"], raw["shape"][0],
+                                row_bytes, scale_first, scale_local)
+            rec["nbytes"] = raw["shape"][0] * scale_local
+        rec["name"] = ep + suffix
+        out.append(rec)
+    return out
+
+
+def make_plan(all_headers, rank, size, layer_indices=None, include_global=True,
+              expert_tp=False, moe_shard_layout="replicated"):
     records = []
 
     if include_global:
@@ -253,6 +322,10 @@ def make_plan(all_headers, rank, size, layer_indices=None, include_global=True):
                            "block_sparse_moe.routed_expert_up_proj.weight"):
                 mode = "rows" if suffix == "block_sparse_moe.routed_expert_down_proj.weight" else "full"
                 mode = "cols" if suffix == "block_sparse_moe.routed_expert_up_proj.weight" else mode
+                if expert_tp and suffix in (
+                        "block_sparse_moe.routed_expert_down_proj.weight",
+                        "block_sparse_moe.routed_expert_up_proj.weight"):
+                    mode = "rows-group" if moe_shard_layout == "row-aligned" else "full"
                 add_record(all_headers, records, prefix + suffix, mode, rank, size)
             for suffix in ("block_sparse_moe.shared_experts.gate_proj.weight",
                            "block_sparse_moe.shared_experts.up_proj.weight"):
@@ -261,6 +334,10 @@ def make_plan(all_headers, rank, size, layer_indices=None, include_global=True):
                        prefix + "block_sparse_moe.shared_experts.down_proj.weight",
                        "cols", rank, size)
             for expert in range(EXPERTS):
+                if expert_tp:
+                    records.extend(expert_tp_records(all_headers, prefix,
+                                                     rank, size, expert))
+                    continue
                 if expert % size != rank:
                     continue
                 ep = prefix + "block_sparse_moe.experts.%d." % expert
@@ -281,7 +358,37 @@ def write_all(fd, data):
 
 
 def copy_ranges(dst, rec, chunk):
-    for source, count in rec["segments"]:
+    descriptor = rec["segments"]
+    if (isinstance(descriptor, tuple) and len(descriptor) == 6 and
+            descriptor[0] == "rows"):
+        _, base, rows, row_bytes, first, count = descriptor
+        src = os.open(rec["source"], os.O_RDONLY)
+        try:
+            # W2 and its scale matrix are row-strided in the source file.
+            # Read a bounded rectangular source block, compact the selected
+            # columns into one output block, then write once.  This avoids a
+            # tiny pread/write pair for every row without retaining a tensor.
+            rows_per_block = max(1, min(256, chunk // max(1, row_bytes)))
+            output_buf = bytearray(rows_per_block * count)
+            for row0 in range(0, rows, rows_per_block):
+                nr = min(rows_per_block, rows - row0)
+                source_bytes = nr * row_bytes
+                data = os.pread(src, source_bytes, base + row0 * row_bytes)
+                if len(data) != source_bytes:
+                    raise IOError("short read %s at %d" %
+                                  (rec["name"], base + row0 * row_bytes))
+                for row in range(nr):
+                    begin = row * row_bytes + first
+                    output_buf[row * count:(row + 1) * count] = \
+                        data[begin:begin + count]
+                write_all(dst, memoryview(output_buf)[:nr * count])
+                if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                    os.posix_fadvise(src, base + row0 * row_bytes, source_bytes,
+                                     os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(src)
+        return
+    for source, count in descriptor:
         src = os.open(rec["source"], os.O_RDONLY)
         try:
             done = 0
@@ -371,6 +478,11 @@ def main():
     ap.add_argument("--chunk-mib", type=int, default=8)
     ap.add_argument("--plan-only", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--expert-tp", action="store_true",
+                    help="stage one intermediate-channel slice of every expert")
+    ap.add_argument("--moe-shard-layout", choices=("replicated", "row-aligned"),
+                    default="replicated",
+                    help="expert-TP routed projection layout")
     args = ap.parse_args()
     if not (0 <= args.rank < args.nodes):
         ap.error("rank must be within [0,nodes)")
@@ -382,6 +494,8 @@ def main():
         ap.error("layer12 staging requires --layer-index in [0,92]")
     if args.mode == "full96" and args.layer_index is not None:
         ap.error("--layer-index is only valid with --mode layer12")
+    if args.expert_tp and args.mode not in ("full96", "layer12"):
+        ap.error("--expert-tp is only supported with full96/layer12")
     if args.chunk_mib < 1 or args.chunk_mib > 64:
         ap.error("--chunk-mib must be in [1,64]")
     if available_kb() < 6 * 1024 * 1024:
@@ -389,18 +503,23 @@ def main():
     all_headers = shards(args.model_dir)
     records = make_plan(all_headers, args.rank, args.nodes,
                         [args.layer_index] if args.mode == "layer12" else None,
-                        include_global=args.mode == "full96")
+                        include_global=args.mode != "layer12",
+                        expert_tp=args.expert_tp,
+                        moe_shard_layout=args.moe_shard_layout)
+    stage_mode = args.mode + ("-expert-tp" if args.expert_tp else "")
+    if args.expert_tp and args.moe_shard_layout != "replicated":
+        stage_mode += "-" + args.moe_shard_layout
     total = sum(r["nbytes"] for r in records)
     print("K3 full stage plan: mode=%s rank=%d/%d layer_index=%s tensors=%d "
           "bytes=%d (%.3f GiB)" %
-          (args.mode, args.rank, args.nodes,
+          (stage_mode, args.rank, args.nodes,
            args.layer_index if args.layer_index is not None else "all",
            len(records), total, total / float(1 << 30)))
     if args.plan_only:
         return
     blob, manifest, size = stage(records, args.output_dir, args.rank, args.nodes,
                                  args.chunk_mib * 1024 * 1024, args.force,
-                                 args.mode, args.layer_index if args.layer_index is not None else -1)
+                                 stage_mode, args.layer_index if args.layer_index is not None else -1)
     print("staged blob=%s manifest=%s bytes=%d" % (blob, manifest, size))
 
 

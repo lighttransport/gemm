@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <omp.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,9 +35,11 @@
 #include "../utofu-tests/tp_allreduce.h"
 
 #define K3_FULL_MAX_NODES 96
-#define K3_FULL_MAX_ENTRIES 9000
+#define K3_FULL_MAX_ENTRIES 600000
 #define K3_FULL_MAX_NAME 512
 #define K3_FULL_WAIT_SECONDS 120.0
+#define K3_FULL_BARRIER_RETRY_USEC 2000
+#define K3_FULL_BARRIER_ITERS_DEFAULT 128
 #define K3_FULL_STAG DEMO_STAG
 #define K3_FULL_REDUCE_COUNT (K3_HIDDEN + K3_LATENT)
 #define K3_FULL_EPS 1.0e-5f
@@ -45,17 +48,52 @@
 #define K3_FULL_MLA_VALUE 128
 #define K3_FULL_CONV_KERNEL 4
 #define K3_FULL_MAX_DEBUG_TOKENS 4096
+#define K3_FULL_DTYPE_Q8P16 4
+#define K3_FULL_DTYPE_Q8P8 5
+#define K3_FULL_PROFILE_PHASES 13
+
+enum {
+    K3_FULL_PHASE_LAYER = 0,
+    K3_FULL_PHASE_ATTENTION = 1,
+    K3_FULL_PHASE_MOE = 2,
+    K3_FULL_PHASE_REDUCE = 3,
+    K3_FULL_PHASE_RESIDUAL = 4,
+    K3_FULL_PHASE_MOE_DISPATCH = 5,
+    K3_FULL_PHASE_MOE_EXPERT = 6,
+    K3_FULL_PHASE_MOE_SHARED = 7,
+    K3_FULL_PHASE_MOE_COLLECTIVE = 8,
+    K3_FULL_PHASE_MOE_FINISH = 9,
+    K3_FULL_PHASE_DISPATCH_PROJ = 10,
+    K3_FULL_PHASE_ROUTER_REDUCE = 11,
+    K3_FULL_PHASE_LATENT_REDUCE = 12,
+};
+
+typedef struct {
+    int enabled;
+    int current_layer;
+    int current_phase;
+    uint64_t layer_count;
+    uint64_t phase_count[K3_FULL_PROFILE_PHASES];
+    uint64_t collective_count;
+    double layer_sum[K3_LAYERS];
+    double layer_max[K3_LAYERS];
+    double phase_sum[K3_FULL_PROFILE_PHASES];
+    double phase_max[K3_FULL_PROFILE_PHASES];
+    double collective_sum;
+    double collective_max;
+} k3_full_profile;
 
 typedef enum {
     K3_FULL_MODE_FULL96 = 0,
     K3_FULL_MODE_LAYER12 = 1,
     K3_FULL_MODE_SYNTHETIC12 = 2,
+    K3_FULL_MODE_BARRIER = 3,
 } k3_full_mode;
 
 typedef struct {
     const uint8_t *data;
     size_t nbytes;
-    int dtype;              /* 1=BF16, 2=F32, 3=U8 */
+    int dtype;              /* 1=BF16, 2=F32, 3=U8, 4=Q8P16, 5=Q8P8 */
     int ndims;
     size_t shape[3];
     char name[K3_FULL_MAX_NAME];
@@ -110,7 +148,7 @@ typedef struct {
     int nodes;
     int layer_index;
     size_t blob_bytes;
-    char mode[32];
+    char mode[64];
 } k3_full_manifest;
 
 typedef struct {
@@ -136,8 +174,13 @@ typedef struct {
     int kda_count;
     int mla_count;
     tp_comm *comm;
+    tp_comm *comm_col;
     int debug_layer_index;
     k3_full_layer debug_layer;
+    int expert_tp;
+    int q8_mode;
+    int prefetch_mib;
+    k3_full_profile profile;
     uint64_t synthetic_route_hash;
     uint64_t synthetic_collectives;
 
@@ -167,6 +210,10 @@ typedef struct {
     float *expert_gate;
     float *expert_up;
     float *expert_out;
+    float *shared_hidden;
+    float *reduce;
+    float *routed_norm;
+    int8_t *q_scratch;
     int *expert_counts;
     int *expert_tokens;
     float *expert_weights;
@@ -183,6 +230,17 @@ typedef struct {
     int real_layer_index;
     uint64_t input_seed;
     int prefill_chunk;
+    int barrier_iters;
+    int comm_deterministic;
+    int ar_groups;
+    int comm_use_bf16;
+    int comm_robust;
+    int comm_poll_spins;
+    int comm_a2a;
+    int comm_a2a_max;
+    int prefetch_mib;
+    int profile;
+    const char *profile_output;
     const char *stage_dir;
     const char *topo_path;
     const char *prompt_ids;
@@ -215,6 +273,162 @@ static double full_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+}
+
+static void full_profile_phase_begin(k3_full_model *m, int phase) {
+    if (!m->profile.enabled || phase < 0 || phase >= K3_FULL_PROFILE_PHASES)
+        return;
+    m->profile.current_phase = phase;
+}
+
+static void full_profile_phase_add(k3_full_model *m, int phase, double seconds) {
+    if (!m->profile.enabled || phase < 0 || phase >= K3_FULL_PROFILE_PHASES)
+        return;
+    m->profile.phase_sum[phase] += seconds;
+    if (seconds > m->profile.phase_max[phase])
+        m->profile.phase_max[phase] = seconds;
+    ++m->profile.phase_count[phase];
+}
+
+static void full_profile_layer_begin(k3_full_model *m, int layer) {
+    if (!m->profile.enabled) return;
+    m->profile.current_layer = layer;
+    m->profile.current_phase = K3_FULL_PHASE_LAYER;
+}
+
+static void full_profile_layer_add(k3_full_model *m, int layer, double seconds) {
+    if (!m->profile.enabled || layer < 0 || layer >= K3_LAYERS) return;
+    m->profile.layer_sum[layer] += seconds;
+    if (seconds > m->profile.layer_max[layer])
+        m->profile.layer_max[layer] = seconds;
+    ++m->profile.layer_count;
+}
+
+static void full_profile_layer_end(k3_full_model *m, int layer, double start) {
+    if (m->profile.enabled)
+        full_profile_layer_add(m, layer, full_now() - start);
+}
+
+static void full_profile_collective_add(k3_full_model *m, double seconds) {
+    if (!m->profile.enabled) return;
+    m->profile.collective_sum += seconds;
+    if (seconds > m->profile.collective_max)
+        m->profile.collective_max = seconds;
+    ++m->profile.collective_count;
+}
+
+static void full_profile_reset(k3_full_model *m) {
+    int enabled = m->profile.enabled;
+    memset(&m->profile, 0, sizeof m->profile);
+    m->profile.enabled = enabled;
+}
+
+static const char *full_profile_phase_name(int phase) {
+    static const char *names[K3_FULL_PROFILE_PHASES] = {
+        "layer", "attention", "moe", "reduce", "residual",
+        "moe_dispatch", "moe_expert", "moe_shared",
+        "moe_collective", "moe_finish", "dispatch_proj",
+        "router_reduce", "latent_reduce"
+    };
+    return phase >= 0 && phase < K3_FULL_PROFILE_PHASES ? names[phase] : "unknown";
+}
+
+typedef struct {
+    const uint8_t *data;
+    size_t bytes;
+} k3_full_prefetch_job;
+
+static void *full_prefetch_worker(void *opaque) {
+    const k3_full_prefetch_job *job = (const k3_full_prefetch_job *)opaque;
+    for (size_t off = 0; off < job->bytes; off += 64)
+        __builtin_prefetch(job->data + off, 0, 2);
+    return NULL;
+}
+
+static int full_prefetch_start(const k3_full_model *m,
+                               const k3_full_tensor *weights,
+                               pthread_t *thread,
+                               k3_full_prefetch_job *job) {
+    if (!m->prefetch_mib || !weights->data || !weights->nbytes) return 0;
+    size_t limit = (size_t)m->prefetch_mib * 1024 * 1024;
+    if (limit > weights->nbytes) limit = weights->nbytes;
+    *job = (k3_full_prefetch_job){weights->data, limit};
+    return pthread_create(thread, NULL, full_prefetch_worker, job) == 0;
+}
+
+static int full_is_mla(int layer);
+static int full_max(k3_full_model *m, float *data, int count);
+
+static int full_profile_report(k3_full_model *m, const k3_full_options *o) {
+    if (!m->profile.enabled) return 0;
+    float layer_mean[K3_LAYERS], layer_peak[K3_LAYERS];
+    float phase_mean[K3_FULL_PROFILE_PHASES], phase_peak[K3_FULL_PROFILE_PHASES];
+    float collective_mean[1], collective_peak[1];
+    uint64_t layer_samples = m->debug_layer_index >= 0 ?
+        m->profile.layer_count : m->profile.layer_count / K3_LAYERS;
+    if (!layer_samples) return 0;
+    for (int i = 0; i < K3_LAYERS; ++i) {
+        layer_mean[i] = (float)(m->profile.layer_sum[i] / layer_samples);
+        layer_peak[i] = (float)m->profile.layer_max[i];
+    }
+    for (int i = 0; i < K3_FULL_PROFILE_PHASES; ++i) {
+        uint64_t n = m->profile.phase_count[i];
+        phase_mean[i] = n ? (float)(m->profile.phase_sum[i] / n) : 0.0f;
+        phase_peak[i] = (float)m->profile.phase_max[i];
+    }
+    collective_mean[0] = m->profile.collective_count ?
+        (float)(m->profile.collective_sum / m->profile.collective_count) : 0.0f;
+    collective_peak[0] = (float)m->profile.collective_max;
+    if (full_max(m, layer_mean, K3_LAYERS) ||
+        full_max(m, layer_peak, K3_LAYERS) ||
+        full_max(m, phase_mean, K3_FULL_PROFILE_PHASES) ||
+        full_max(m, phase_peak, K3_FULL_PROFILE_PHASES) ||
+        full_max(m, collective_mean, 1) ||
+        full_max(m, collective_peak, 1)) return EIO;
+    if (g_rank != 0) return 0;
+
+    char default_path[1024];
+    const char *path = o->profile_output;
+    if (!path) {
+        snprintf(default_path, sizeof default_path, "%s.profile",
+                 o->output_path ? o->output_path : "k3_full_runner.out");
+        path = default_path;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "k3_full_runner: cannot write profile %s: %s\n",
+                path, strerror(errno));
+        return EIO;
+    }
+    double layer_sum = 0.0;
+    int active_layers = m->debug_layer_index >= 0 ? 1 : K3_LAYERS;
+    int over_budget = 0;
+    fprintf(f, "K3FULL_PROFILE version=1 nodes=%d samples=%llu\n",
+            g_nodes, (unsigned long long)layer_samples);
+    for (int i = 0; i < K3_LAYERS; ++i) {
+        double ms = layer_mean[i] * 1000.0;
+        if (m->debug_layer_index < 0 || i == m->debug_layer_index) {
+            layer_sum += ms;
+            if (ms > 1.08) ++over_budget;
+        }
+        fprintf(f, "layer=%d type=%s rank_max_mean_ms=%.6f rank_max_sample_ms=%.6f\n",
+                i, full_is_mla(i) ? "mla" : "kda", ms,
+                (double)layer_peak[i] * 1000.0);
+    }
+    fprintf(f, "layer_ms_rank_max_mean=%.6f layer_ms_rank_max_avg=%.6f "
+               "layers_over_1p08=%d\n",
+            layer_sum / active_layers, layer_sum / active_layers, over_budget);
+    for (int i = 1; i < K3_FULL_PROFILE_PHASES; ++i)
+        fprintf(f, "phase=%s rank_max_mean_ms=%.6f rank_max_sample_ms=%.6f\n",
+                full_profile_phase_name(i), (double)phase_mean[i] * 1000.0,
+                (double)phase_peak[i] * 1000.0);
+    fprintf(f, "collective_rank_max_mean_ms=%.6f collective_rank_max_sample_ms=%.6f\n",
+            (double)collective_mean[0] * 1000.0,
+            (double)collective_peak[0] * 1000.0);
+    fclose(f);
+    printf("K3FULL_PROFILE path=%s rank_max_layer_ms=%.6f over_1p08=%d\n",
+           path, layer_sum / active_layers, over_budget);
+    return 0;
 }
 
 static void full_drain_mrq(void) {
@@ -288,11 +502,41 @@ static int full_put(utofu_vcq_id_t peer, utofu_stadd_t src,
     return rc;
 }
 
+/* The barrier source line is rewritten for every generation and then read by
+ * uTofu as an RDMA source.  Clean it to the point of coherence before issuing
+ * Put; otherwise a dirty A64FX cache line can leave the transport reading the
+ * previous token.  Keep the source line resident: the transport may consume it
+ * again for the next peer Put. */
+static inline void full_barrier_publish(volatile uint64_t *p, uint64_t token) {
+    *p = token;
+#if defined(__aarch64__)
+    __asm__ __volatile__("dc cvac, %0" :: "r"(p) : "memory");
+    __asm__ __volatile__("dsb sy" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+
+/* A remote Put lands in DRAM while the receiver may still hold an old clean
+ * copy of the receive-only slot.  A64FX exposes clean+invalidate at EL0 (but
+ * not invalidate-only), so establish a clean baseline before registration and
+ * use the supported operation while polling.  These slots are never CPU-written
+ * after that baseline. */
+static inline void full_barrier_invalidate(const volatile uint64_t *p) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("dc civac, %0" :: "r"(p) : "memory");
+    __asm__ __volatile__("dsb sy" ::: "memory");
+#else
+    (void)p;
+    __sync_synchronize();
+#endif
+}
+
 static int full_wait_ge(volatile uint64_t *value, uint64_t want) {
     double start = full_now();
     for (;;) {
         full_drain_mrq();
-        tp_ar_flag_inval(value);
+        full_barrier_invalidate(value);
         if (*value >= want) return 0;
         if (full_now() - start > K3_FULL_WAIT_SECONDS) return -1;
     }
@@ -303,13 +547,19 @@ static void full_barrier(void) {
     char *send = g_region + g_send_off;
     if (g_rank == 0) {
         for (int r = 1; r < g_nodes; ++r) {
-            if (full_wait_ge((volatile uint64_t *)(g_region + full_bar_recv_off(r)), token)) {
-                fprintf(stderr, "k3_full_runner: barrier timeout from rank %d\n", r);
+            volatile uint64_t *recv =
+                (volatile uint64_t *)(g_region + full_bar_recv_off(r));
+            if (full_wait_ge(recv, token)) {
+                full_barrier_invalidate(recv);
+                fprintf(stderr, "k3_full_runner: barrier timeout from rank %d "
+                        "token=%llu got=%llu\n", r,
+                        (unsigned long long)token,
+                        (unsigned long long)*recv);
                 exit(3);
             }
         }
         for (int r = 1; r < g_nodes; ++r) {
-            *(volatile uint64_t *)send = token;
+            full_barrier_publish((volatile uint64_t *)send, token);
             if (full_put(g_peer_vcq[r], g_base + g_send_off,
                          g_peer_base[r] + full_bar_go_off(), sizeof token) != UTOFU_SUCCESS) {
                 fprintf(stderr, "k3_full_runner: barrier release failed for rank %d\n", r);
@@ -318,18 +568,30 @@ static void full_barrier(void) {
         }
     } else {
         volatile uint64_t *go = (volatile uint64_t *)(g_region + full_bar_go_off());
+        double start = full_now();
         do {
-            *(volatile uint64_t *)send = token;
+            full_barrier_publish((volatile uint64_t *)send, token);
             if (full_put(g_peer_vcq[0], g_base + g_send_off,
                          g_peer_base[0] + full_bar_recv_off(g_rank), sizeof token) != UTOFU_SUCCESS) {
                 fprintf(stderr, "k3_full_runner: barrier fan-in failed\n");
                 exit(3);
             }
-            if (full_wait_ge(go, token)) {
-                fprintf(stderr, "k3_full_runner: barrier release timeout\n");
+            for (int i = 0; i < 50; ++i) {
+                full_drain_mrq();
+                full_barrier_invalidate(go);
+                if (*go >= token)
+                    break;
+                usleep(K3_FULL_BARRIER_RETRY_USEC);
+            }
+            if (*go >= token)
+                break;
+            if (full_now() - start > K3_FULL_WAIT_SECONDS) {
+                full_barrier_invalidate(go);
+                fprintf(stderr, "k3_full_runner: barrier release timeout rank=%d token=%llu got=%llu\n",
+                        g_rank, (unsigned long long)token, (unsigned long long)*go);
                 exit(3);
             }
-        } while (*go < token);
+        } while (1);
     }
 }
 
@@ -337,6 +599,8 @@ static int full_dtype(const char *s) {
     if (!strcmp(s, "BF16")) return 1;
     if (!strcmp(s, "F32")) return 2;
     if (!strcmp(s, "U8")) return 3;
+    if (!strcmp(s, "Q8P16")) return K3_FULL_DTYPE_Q8P16;
+    if (!strcmp(s, "Q8P8")) return K3_FULL_DTYPE_Q8P8;
     return 0;
 }
 
@@ -385,7 +649,15 @@ static int full_load_manifest(const char *path, k3_full_entry *entries,
         if (line[0] == '#') {
             unsigned long long bytes;
             int rank, nodes, layer;
-            if (sscanf(line, "# K3FULLV2 mode=%31s rank=%d nodes=%d layer_index=%d "
+            if (sscanf(line, "# K3FULLV3 mode=%63s rank=%d nodes=%d layer_index=%d "
+                       "tensors=%*d blob_bytes=%llu", meta->mode, &rank, &nodes,
+                       &layer, &bytes) == 5) {
+                meta->version = 3;
+                meta->rank = rank;
+                meta->nodes = nodes;
+                meta->layer_index = layer;
+                meta->blob_bytes = (size_t)bytes;
+            } else if (sscanf(line, "# K3FULLV2 mode=%63s rank=%d nodes=%d layer_index=%d "
                        "tensors=%*d blob_bytes=%llu", meta->mode, &rank, &nodes,
                        &layer, &bytes) == 5) {
                 meta->version = 2;
@@ -442,9 +714,21 @@ static int full_check_ranges(const k3_full_entry *entries, int count,
 
 static const k3_full_entry *full_find(const k3_full_entry *entries, int count,
                                       const char *name) {
-    for (int i = 0; i < count; ++i)
-        if (!strcmp(entries[i].name, name)) return &entries[i];
+    int lo = 0, hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(entries[mid].name, name);
+        if (cmp == 0) return &entries[mid];
+        if (cmp < 0) lo = mid + 1;
+        else hi = mid;
+    }
     return NULL;
+}
+
+static int full_entry_name_cmp(const void *a, const void *b) {
+    const k3_full_entry *ea = (const k3_full_entry *)a;
+    const k3_full_entry *eb = (const k3_full_entry *)b;
+    return strcmp(ea->name, eb->name);
 }
 
 static k3_full_tensor full_tensor(const k3_full_entry *entries, int count,
@@ -477,28 +761,134 @@ static int full_split(int total, int rank, int size, int *first, int *count) {
     return 0;
 }
 
-static void full_bf16_matvec(float *out, const k3_full_tensor *t,
-                             int rows, int cols, const float *x, int threads) {
-    const uint16_t *w = (const uint16_t *)t->data;
-    int groups = rows / 8;
+static int full_split_groups(int total, int rank, int size, int group,
+                             int *first, int *count) {
+    if (group <= 0 || total % group) return EINVAL;
+    int first_group, group_count;
+    full_split(total / group, rank, size, &first_group, &group_count);
+    *first = first_group * group;
+    *count = group_count * group;
+    return 0;
+}
+
+typedef struct {
+    float *out;
+    const uint16_t *weights;
+    const uint8_t *packed;
+    const float *input;
+    int rows;
+    int cols;
+    int dtype;
+} full_bf16_task;
+
+static void full_bf16_run_task(const full_bf16_task *task) {
+    if (task->dtype == K3_FULL_DTYPE_Q8P16 && task->rows == 8) {
+        k3_matvec_q8pv16_f32_group(task->out, task->packed,
+                                   task->input, task->cols);
+    } else if (task->dtype == K3_FULL_DTYPE_Q8P8 && task->rows == 8) {
+        k3_matvec_q8pv8_f32_group(task->out, task->packed,
+                                  task->input, task->cols);
+    } else if (task->dtype == 1 && task->rows == 8) {
+        const uint16_t *p = task->weights;
+        matvec_bf16_8row(task->out, p, p + task->cols,
+                         p + (size_t)2 * task->cols,
+                         p + (size_t)3 * task->cols,
+                         p + (size_t)4 * task->cols,
+                         p + (size_t)5 * task->cols,
+                         p + (size_t)6 * task->cols,
+                         p + (size_t)7 * task->cols,
+                         task->input, task->cols);
+    } else {
+        for (int r = 0; r < task->rows; ++r) {
+            const uint16_t *p = task->weights + (size_t)r * task->cols;
+            float sum = 0.0f;
+            for (int c = 0; c < task->cols; ++c)
+                sum += bf16_to_f32_scalar(p[c]) * task->input[c];
+            task->out[r] = sum;
+        }
+    }
+}
+
+/*
+ * Keep all independent projections in one OpenMP team.  The old path opened
+ * a fresh team for every BF16 matvec, even for one-head projections.  On the
+ * full model that turns the small projections and repeated decode launches
+ * into a large synchronization tax.  Tasks are eight-row blocks so the
+ * existing A64FX kernel remains the inner loop; short tails use the scalar
+ * fallback.
+ */
+static void full_bf16_many(float *const *outs,
+                           const k3_full_tensor *const *tensors,
+                           const float *const *inputs,
+                           const int *rows, const int *cols, int count,
+                           int threads) {
+    int task_count = 0;
+    for (int i = 0; i < count; ++i)
+        task_count += (rows[i] + 7) / 8;
+    if (task_count == 0) return;
+
+    full_bf16_task tasks[task_count];
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+        int dtype = tensors[i]->dtype;
+        if (dtype != 1 && dtype != K3_FULL_DTYPE_Q8P16 &&
+            dtype != K3_FULL_DTYPE_Q8P8) {
+            fprintf(stderr, "k3_full_runner: unsupported projection dtype=%d tensor=%s\n",
+                    dtype, tensors[i]->name);
+            return;
+        }
+        if (dtype != 1 && ((rows[i] & 7) || (cols[i] & 15))) {
+            fprintf(stderr, "k3_full_runner: Q8 projection shape is not packed-compatible "
+                            "tensor=%s shape=%dx%d\n",
+                    tensors[i]->name, rows[i], cols[i]);
+            return;
+        }
+        const uint16_t *w = dtype == 1 ? (const uint16_t *)tensors[i]->data : NULL;
+        for (int r = 0; r < rows[i]; r += 8) {
+            int nr = rows[i] - r;
+            if (nr > 8) nr = 8;
+            tasks[n++] = (full_bf16_task){
+                .out = (float *)outs[i] + r,
+                .weights = w ? w + (size_t)r * cols[i] : NULL,
+                .packed = dtype == 1 ? NULL : tensors[i]->data +
+                    (size_t)(r / 8) * (size_t)(cols[i] / 16) *
+                    (dtype == K3_FULL_DTYPE_Q8P8 ? 192 : 160),
+                .input = inputs[i],
+                .rows = nr,
+                .cols = cols[i],
+                .dtype = dtype,
+            };
+        }
+    }
+
+    int workers = threads > 0 && threads < n ? threads : n;
+    if (n == 1) {
+        /* TP96 leaves several projections at one eight-row task.  Avoid
+         * opening an OpenMP team for those latency-bound tails. */
 #if defined(_OPENMP)
-    omp_set_num_threads(threads);
+        omp_set_num_threads(threads > 0 ? threads : 1);
+#endif
+        full_bf16_run_task(&tasks[0]);
+        return;
+    }
+#if defined(_OPENMP)
+    omp_set_num_threads(workers > 0 ? workers : 1);
 #pragma omp parallel for schedule(static)
 #endif
-    for (int g = 0; g < groups; ++g) {
-        int r = g * 8;
-        const uint16_t *p = w + (size_t)r * cols;
-        matvec_bf16_8row(out + r, p, p + cols, p + (size_t)2 * cols,
-                         p + (size_t)3 * cols, p + (size_t)4 * cols,
-                         p + (size_t)5 * cols, p + (size_t)6 * cols,
-                         p + (size_t)7 * cols, x, cols);
+    for (int i = 0; i < n; ++i) {
+        full_bf16_run_task(&tasks[i]);
     }
-    for (int r = groups * 8; r < rows; ++r) {
-        const uint16_t *p = w + (size_t)r * cols;
-        out[r] = 0.0f;
-        for (int c = 0; c < cols; ++c)
-            out[r] += bf16_to_f32_scalar(p[c]) * x[c];
-    }
+#if defined(_OPENMP)
+    omp_set_num_threads(threads > 0 ? threads : 1);
+#endif
+}
+
+static void full_bf16_matvec(float *out, const k3_full_tensor *t,
+                             int rows, int cols, const float *x, int threads) {
+    float *outs[1] = {out};
+    const k3_full_tensor *tensors[1] = {t};
+    const float *inputs[1] = {x};
+    full_bf16_many(outs, tensors, inputs, &rows, &cols, 1, threads);
 }
 
 static void full_f32_copy(float *dst, const k3_full_tensor *t, int n) {
@@ -527,11 +917,20 @@ static float full_weight_at(const k3_full_tensor *t, int index) {
 static void full_rmsnorm_tensor(float *out, const float *x,
                                 const k3_full_tensor *weight, int n) {
     float inv = 1.0f / sqrtf(k3_dot_sve(x, x, n) / n + K3_FULL_EPS);
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
+#if defined(__ARM_FEATURE_SVE)
+    int vl=(int)svcntw();
+    if(weight->dtype==1){const uint16_t*w=(const uint16_t*)weight->data;
+        for(int i=0;i<n;i+=vl){svbool_t pg=svwhilelt_b32(i,n);
+            svuint32_t bits=svlsl_n_u32_x(pg,svld1uh_u32(pg,w+i),16);
+            svfloat32_t y=svmul_n_f32_x(pg,svld1(pg,x+i),inv);
+            svst1(pg,out+i,svmul_f32_x(pg,y,svreinterpret_f32_u32(bits)));}}
+    else{const float*w=(const float*)weight->data;
+        for(int i=0;i<n;i+=vl){svbool_t pg=svwhilelt_b32(i,n);
+            svfloat32_t y=svmul_n_f32_x(pg,svld1(pg,x+i),inv);
+            svst1(pg,out+i,svmul_f32_x(pg,y,svld1(pg,w+i)));}}
+#else
+    for(int i=0;i<n;++i)out[i]=x[i]*inv*full_weight_at(weight,i);
 #endif
-    for (int i = 0; i < n; ++i)
-        out[i] = x[i] * inv * full_weight_at(weight, i);
 }
 
 static void full_gated_rmsnorm_tensor(float *out, const float *x,
@@ -566,11 +965,14 @@ static void full_attn_res(float *out, const float *prefix,
     }
     float denom = 0.0f;
     for (int c = 0; c < count; ++c) denom += expf(scores[c] - max_score);
+    float coefficient[K3_LAYERS / 12 + 2];
+    for (int c = 0; c < count; ++c)
+        coefficient[c] = expf(scores[c] - max_score) / denom;
     for (int j = 0; j < K3_HIDDEN; ++j) {
         float value = 0.0f;
         for (int c = 0; c < count; ++c) {
             const float *v = c == block_count ? prefix : blocks + (size_t)c * K3_HIDDEN;
-            value += v[j] * (expf(scores[c] - max_score) / denom);
+            value += v[j] * coefficient[c];
         }
         out[j] = value;
     }
@@ -645,14 +1047,16 @@ static int full_load_layer(k3_full_model *m, k3_full_layer *l,
         FT(l->shared_gate, "block_sparse_moe.shared_experts.gate_proj.weight");
         FT(l->shared_up, "block_sparse_moe.shared_experts.up_proj.weight");
         FT(l->shared_down, "block_sparse_moe.shared_experts.down_proj.weight");
-        int count = 0;
-        for (int e = m->rank; e < K3_EXPERTS; e += m->nodes) ++count;
+        int count = m->expert_tp ? K3_EXPERTS : 0;
+        if (!m->expert_tp)
+            for (int e = m->rank; e < K3_EXPERTS; e += m->nodes) ++count;
         l->experts = (k3_full_expert *)k3_pool_calloc(m->pool, (size_t)count,
                                                        sizeof *l->experts);
         if (!l->experts) return ENOMEM;
         l->expert_count = count;
         int slot = 0;
-        for (int e = m->rank; e < K3_EXPERTS; e += m->nodes, ++slot) {
+        for (int e = 0; e < K3_EXPERTS; ++e) {
+            if (!m->expert_tp && e % m->nodes != m->rank) continue;
             char name[K3_FULL_MAX_NAME];
             l->experts[slot].expert_id = e;
 #define EX(field, suffix) do { \
@@ -672,9 +1076,19 @@ static int full_load_layer(k3_full_model *m, k3_full_layer *l,
             snprintf(name, sizeof name, "%sblock_sparse_moe.experts.%d.w3.weight_scale", prefix, e);
             s3 = full_tensor(entries, n, m->blob, name);
             if (!full_tensor_valid(&s1) || !full_tensor_valid(&s2) || !full_tensor_valid(&s3)) return EINVAL;
-            l->experts[slot].mw1 = (k3_mxfp4_matrix){l->experts[slot].w1.data, s1.data, 3072, K3_LATENT};
-            l->experts[slot].mw2 = (k3_mxfp4_matrix){l->experts[slot].w2.data, s2.data, K3_LATENT, 3072};
-            l->experts[slot].mw3 = (k3_mxfp4_matrix){l->experts[slot].w3.data, s3.data, 3072, K3_LATENT};
+            l->experts[slot].mw1 = (k3_mxfp4_matrix){
+                l->experts[slot].w1.data, s1.data,
+                (int)l->experts[slot].w1.shape[0],
+                (int)l->experts[slot].w1.shape[1] * 2};
+            l->experts[slot].mw2 = (k3_mxfp4_matrix){
+                l->experts[slot].w2.data, s2.data,
+                (int)l->experts[slot].w2.shape[0],
+                (int)l->experts[slot].w2.shape[1] * 2};
+            l->experts[slot].mw3 = (k3_mxfp4_matrix){
+                l->experts[slot].w3.data, s3.data,
+                (int)l->experts[slot].w3.shape[0],
+                (int)l->experts[slot].w3.shape[1] * 2};
+            ++slot;
 #undef EX
         }
     }
@@ -701,14 +1115,16 @@ static int full_load_model(k3_full_model *m, const k3_full_options *o,
         free(entries);
         return rc;
     }
-    if (meta.version >= 2 && (strcmp(meta.mode, "full96") ||
-                              meta.nodes != m->nodes || meta.rank != m->rank)) {
+    if (meta.version >= 2 && (meta.nodes != m->nodes || meta.rank != m->rank)) {
         fprintf(stderr, "k3_full_runner rank %d: manifest ownership mismatch "
                 "mode=%s rank=%d/%d nodes=%d/%d\n", m->rank, meta.mode,
                 meta.rank, m->rank, meta.nodes, m->nodes);
         free(entries);
         return EINVAL;
     }
+    m->expert_tp = strstr(meta.mode, "expert-tp") != NULL ||
+                   strstr(meta.mode, "tp96") != NULL;
+    m->q8_mode = strstr(meta.mode, "q8") != NULL;
     size_t blob_bytes = 0;
     void *blob = k3_pool_load_blob(pool, blob_path, &blob_bytes);
     if (!blob) {
@@ -722,6 +1138,7 @@ static int full_load_model(k3_full_model *m, const k3_full_options *o,
         free(entries);
         return rc;
     }
+    qsort(entries, (size_t)n, sizeof *entries, full_entry_name_cmp);
     m->blob = (const uint8_t *)blob;
     m->blob_bytes = blob_bytes;
     m->pool = pool;
@@ -775,9 +1192,13 @@ static int full_load_debug_model(k3_full_model *m,
         free(entries);
         return rc;
     }
+    int expert_tp = strstr(meta.mode, "expert-tp") != NULL ||
+                    strstr(meta.mode, "tp96") != NULL;
     const char *want_mode = "layer12";
     if (o->mode == K3_FULL_MODE_SYNTHETIC12) want_mode = "layer12";
-    if (meta.version < 2 || strcmp(meta.mode, want_mode) ||
+    if (meta.version < 2 ||
+        (strcmp(meta.mode, want_mode) &&
+         !(expert_tp && !strcmp(want_mode, "layer12"))) ||
         meta.nodes != m->nodes || meta.rank != m->rank ||
         meta.layer_index != o->real_layer_index) {
         fprintf(stderr, "k3_full_runner rank %d: debug manifest mismatch "
@@ -786,6 +1207,8 @@ static int full_load_debug_model(k3_full_model *m,
         free(entries);
         return EINVAL;
     }
+    m->expert_tp = expert_tp;
+    m->q8_mode = strstr(meta.mode, "q8") != NULL;
     size_t blob_bytes = 0;
     void *blob = k3_pool_load_blob(pool, blob_path, &blob_bytes);
     if (!blob) {
@@ -801,6 +1224,7 @@ static int full_load_debug_model(k3_full_model *m,
         free(entries);
         return rc;
     }
+    qsort(entries, (size_t)n, sizeof *entries, full_entry_name_cmp);
     m->blob = (const uint8_t *)blob;
     m->blob_bytes = blob_bytes;
     m->pool = pool;
@@ -814,11 +1238,22 @@ static int full_load_debug_model(k3_full_model *m,
 }
 
 static int full_sum(k3_full_model *m, float *data, int count) {
-    return tp_allreduce_sum_checked(m->comm, data, count);
+    double start = m->profile.enabled ? full_now() : 0.0;
+    int rc = m->comm_col ? tp_allreduce_sum_2d_checked(m->comm, m->comm_col,
+                                                        data, count) :
+                           tp_allreduce_sum_checked(m->comm, data, count);
+    if (m->profile.enabled) {
+        double elapsed = full_now() - start;
+        full_profile_collective_add(m, elapsed);
+        full_profile_phase_add(m, K3_FULL_PHASE_REDUCE, elapsed);
+    }
+    return rc;
 }
 
 static int full_max(k3_full_model *m, float *data, int count) {
-    return tp_allreduce_max_checked(m->comm, data, count);
+    return m->comm_col ? tp_allreduce_max_2d_checked(m->comm, m->comm_col,
+                                                      data, count) :
+                         tp_allreduce_max_checked(m->comm, data, count);
 }
 
 static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
@@ -829,9 +1264,15 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
     float *qstate = state;
     float *kstate = qstate + state_stride;
     float *vstate = kstate + state_stride;
-    full_bf16_matvec(m->q, &l->q_proj, channels, K3_HIDDEN, x, m->threads);
-    full_bf16_matvec(m->k, &l->k_proj, channels, K3_HIDDEN, x, m->threads);
-    full_bf16_matvec(m->v, &l->v_proj, channels, K3_HIDDEN, x, m->threads);
+    float *qkv_outs[] = {m->q, m->k, m->v, m->tmp, m->expert_out};
+    const k3_full_tensor *qkv_weights[] = {
+        &l->q_proj, &l->k_proj, &l->v_proj, &l->f_a_proj, &l->g_proj,
+    };
+    const float *qkv_inputs[] = {x, x, x, x, x};
+    int qkv_rows[] = {channels, channels, channels, K3_HEAD_DIM, channels};
+    int qkv_cols[] = {K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN};
+    full_bf16_many(qkv_outs, qkv_weights, qkv_inputs,
+                   qkv_rows, qkv_cols, 5, m->threads);
     memcpy(m->up, m->q, (size_t)channels * sizeof(float));
     k3_conv_step_sve(m->q, m->up, qstate, (const float *)l->q_conv.data,
                      NULL, channels, K3_FULL_CONV_KERNEL);
@@ -841,9 +1282,13 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
     memcpy(m->up, m->v, (size_t)channels * sizeof(float));
     k3_conv_step_sve(m->v, m->up, vstate, (const float *)l->v_conv.data,
                      NULL, channels, K3_FULL_CONV_KERNEL);
-    full_bf16_matvec(m->tmp, &l->f_a_proj, K3_HEAD_DIM, K3_HIDDEN, x, m->threads);
-    full_bf16_matvec(m->gate, &l->f_b_proj, channels, K3_HEAD_DIM, m->tmp, m->threads);
-    full_bf16_matvec(m->tmp2, &l->b_proj, m->local_heads, K3_HIDDEN, x, m->threads);
+    float *decay_outs[] = {m->gate, m->tmp2};
+    const k3_full_tensor *decay_weights[] = {&l->f_b_proj, &l->b_proj};
+    const float *decay_inputs[] = {m->tmp, x};
+    int decay_rows[] = {channels, m->local_heads};
+    int decay_cols[] = {K3_HEAD_DIM, K3_HIDDEN};
+    full_bf16_many(decay_outs, decay_weights, decay_inputs,
+                   decay_rows, decay_cols, 2, m->threads);
     for (int h = 0; h < m->local_heads; ++h) {
         k3_l2_normalize_sve(m->q + (size_t)h * K3_HEAD_DIM, K3_HEAD_DIM, 1.0e-6f);
         k3_l2_normalize_sve(m->k + (size_t)h * K3_HEAD_DIM, K3_HEAD_DIM, 1.0e-6f);
@@ -853,10 +1298,13 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
                      (const float *)l->dt_bias.data, m->local_heads, K3_HEAD_DIM);
     float *recurrent = m->kda_state +
         (size_t)l->state_slot * m->local_heads * K3_HEAD_DIM * K3_HEAD_DIM;
-    k3_kda_step_sve(m->attn, m->q, m->k, m->v, m->decay, m->tmp2,
-                    recurrent, m->local_heads, K3_HEAD_DIM, K3_HEAD_DIM);
-    full_bf16_matvec(m->gate, &l->g_proj, channels, K3_HIDDEN, x, m->threads);
-    full_gated_rmsnorm_tensor(m->tmp, m->attn, m->gate,
+    float decay[(size_t)m->local_heads * K3_HEAD_DIM];
+    for (int i = 0; i < m->local_heads * K3_HEAD_DIM; ++i)
+        decay[i] = expf(m->decay[i]);
+    k3_kda_step_decay_parallel_sve(m->attn, m->q, m->k, m->v, decay,
+                    m->tmp2, recurrent, m->local_heads, K3_HEAD_DIM,
+                    K3_HEAD_DIM, m->threads);
+    full_gated_rmsnorm_tensor(m->tmp, m->attn, m->expert_out,
                               &l->o_norm, channels);
     full_bf16_matvec(out, &l->o_proj, K3_HIDDEN, channels, m->tmp, m->threads);
 }
@@ -864,14 +1312,26 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
 static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
                              const float *x, int position, float *out) {
     int channels = m->local_heads * K3_FULL_MLA_QK;
-    full_bf16_matvec(m->tmp, &l->q_a_proj, 1536, K3_HIDDEN, x, m->threads);
+    float *latent_outs[] = {m->tmp, m->tmp2};
+    const k3_full_tensor *latent_weights[] = {&l->q_a_proj, &l->kv_a_proj};
+    const float *latent_inputs[] = {x, x};
+    int latent_rows[] = {1536, 576};
+    int latent_cols[] = {K3_HIDDEN, K3_HIDDEN};
+    full_bf16_many(latent_outs, latent_weights, latent_inputs,
+                   latent_rows, latent_cols, 2, m->threads);
     full_rmsnorm_tensor(m->tmp, m->tmp, &l->q_a_norm, 1536);
-    full_bf16_matvec(m->q, &l->q_b_proj, channels, 1536, m->tmp, m->threads);
-    full_bf16_matvec(m->tmp2, &l->kv_a_proj, 576, K3_HIDDEN, x, m->threads);
     full_rmsnorm_tensor(m->tmp2, m->tmp2, &l->kv_a_norm, 512);
+    float *attn_proj_outs[] = {m->q, m->k, m->gate};
+    const k3_full_tensor *attn_proj_weights[] = {
+        &l->q_b_proj, &l->kv_b_proj, &l->mla_g_proj,
+    };
+    const float *attn_proj_inputs[] = {m->tmp, m->tmp2, x};
+    int attn_proj_rows[] = {channels, m->local_heads * 256,
+                            channels / 192 * 128};
+    int attn_proj_cols[] = {1536, 512, K3_HIDDEN};
+    full_bf16_many(attn_proj_outs, attn_proj_weights, attn_proj_inputs,
+                   attn_proj_rows, attn_proj_cols, 3, m->threads);
     /* kv_b consumes only the 512-dimensional compressed part. */
-    full_bf16_matvec(m->k, &l->kv_b_proj, m->local_heads * 256, 512,
-                     m->tmp2, m->threads);
     int key_stride = m->max_seq * K3_FULL_MLA_QK;
     int value_stride = m->max_seq * K3_FULL_MLA_VALUE;
     float *layer_keys = m->mla_keys + (size_t)l->cache_slot * m->local_heads * key_stride;
@@ -888,8 +1348,6 @@ static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
                          layer_values + (size_t)h * value_stride,
                          position + 1, K3_FULL_MLA_QK, K3_FULL_MLA_VALUE);
     }
-    full_bf16_matvec(m->gate, &l->mla_g_proj, channels / 192 * 128,
-                     K3_HIDDEN, x, m->threads);
     for (int i = 0; i < channels / 192 * 128; ++i)
         m->attn[i] *= k3_sigmoidf(m->gate[i]);
     full_bf16_matvec(out, &l->mla_o_proj, K3_HIDDEN,
@@ -899,29 +1357,166 @@ static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
 static void full_dense_forward(k3_full_model *m, k3_full_layer *l,
                                const float *x, float *out) {
     int local_inter = (int)l->dense_gate.shape[0];
-    full_bf16_matvec(m->expert_gate, &l->dense_gate, local_inter,
-                     K3_HIDDEN, x, m->threads);
-    full_bf16_matvec(m->expert_up, &l->dense_up, local_inter,
-                     K3_HIDDEN, x, m->threads);
+    float *gate_up_outs[] = {m->expert_gate, m->expert_up};
+    const k3_full_tensor *gate_up_weights[] = {&l->dense_gate, &l->dense_up};
+    const float *gate_up_inputs[] = {x, x};
+    int gate_up_rows[] = {local_inter, local_inter};
+    int gate_up_cols[] = {K3_HIDDEN, K3_HIDDEN};
+    full_bf16_many(gate_up_outs, gate_up_weights, gate_up_inputs,
+                   gate_up_rows, gate_up_cols, 2, m->threads);
     k3_situ_sve(m->expert_gate, m->expert_gate, m->expert_up, local_inter);
     full_bf16_matvec(out, &l->dense_down, K3_HIDDEN, local_inter,
                      m->expert_gate, m->threads);
 }
 
+/* Full-model expert-TP path.  Every rank owns the same selected expert IDs
+ * but only one intermediate-channel slice, so W1/W3/W2 produce a partial
+ * routed latent locally.  Shared-expert hidden partials are packed with that
+ * latent before the single MoE reduction. */
+static int full_moe_forward_expert_tp(k3_full_model *m, k3_full_layer *l,
+                                      const float *x, float *out) {
+    double subphase_start = m->profile.enabled ? full_now() : 0.0;
+    int local_latent = (int)l->routed_down.shape[0];
+    int latent_start = 0;
+    if (local_latent != K3_LATENT) {
+        if (l->routed_down.shape[1] != K3_HIDDEN ||
+            full_split_groups(K3_LATENT, m->rank, m->nodes, 8,
+                              &latent_start, &local_latent) ||
+            (int)l->routed_down.shape[0] != local_latent) {
+            fprintf(stderr, "k3_full_runner rank %d: invalid routed-down shard shape\n",
+                    m->rank);
+            return EINVAL;
+        }
+        memset(m->local_latent, 0, K3_LATENT * sizeof(float));
+    }
+    float router_logits[K3_EXPERTS];
+    int route[K3_TOP_K];
+    float route_weight[K3_TOP_K];
+    float *route_outs[] = {router_logits, m->local_latent + latent_start};
+    const k3_full_tensor *route_weights[] = {&l->router, &l->routed_down};
+    const float *route_inputs[] = {x, x};
+    int route_rows[] = {K3_EXPERTS, local_latent};
+    int route_cols[] = {K3_HIDDEN, K3_HIDDEN};
+
+    double dispatch_part = m->profile.enabled ? full_now() : 0.0;
+    full_bf16_many(route_outs, route_weights, route_inputs,
+                   route_rows, route_cols, 2, m->threads);
+    if (m->profile.enabled) {
+        full_profile_phase_add(m, K3_FULL_PHASE_DISPATCH_PROJ,
+                               full_now() - dispatch_part);
+        dispatch_part = full_now();
+    }
+    k3_router_topk(router_logits, (const float *)l->router_bias.data,
+                   K3_EXPERTS, K3_TOP_K, route, route_weight);
+    if (local_latent != K3_LATENT) {
+        if (full_sum(m, m->local_latent, K3_LATENT)) return EIO;
+        if (m->profile.enabled)
+            full_profile_phase_add(m, K3_FULL_PHASE_LATENT_REDUCE,
+                                   full_now() - dispatch_part);
+    }
+    if (m->profile.enabled) {
+        full_profile_phase_add(m, K3_FULL_PHASE_MOE_DISPATCH,
+                               full_now() - subphase_start);
+        subphase_start = full_now();
+    }
+
+    k3_mxfp4_matrix w1[K3_TOP_K], w2[K3_TOP_K], w3[K3_TOP_K];
+    for (int k = 0; k < K3_TOP_K; ++k) {
+        if (route[k] < 0 || route[k] >= l->expert_count ||
+            l->experts[route[k]].expert_id != route[k]) return EINVAL;
+        w1[k] = l->experts[route[k]].mw1;
+        w2[k] = l->experts[route[k]].mw2;
+        w3[k] = l->experts[route[k]].mw3;
+    }
+    pthread_t prefetch_thread;
+    k3_full_prefetch_job prefetch_job;
+    int prefetch_active = full_prefetch_start(m, &l->routed_up,
+                                              &prefetch_thread, &prefetch_job);
+    memset(m->routed_latent, 0, K3_LATENT * sizeof(float));
+    if (k3_expert_tp_forward_selected_mxfp4(
+            m->routed_latent, w1, w2, w3, route_weight, K3_TOP_K,
+            m->local_latent, m->expert_gate, m->expert_up,
+            m->expert_out, m->threads)) {
+        if (prefetch_active) pthread_join(prefetch_thread, NULL);
+        return EIO;
+    }
+    if (m->profile.enabled) {
+        full_profile_phase_add(m, K3_FULL_PHASE_MOE_EXPERT,
+                               full_now() - subphase_start);
+        subphase_start = full_now();
+    }
+
+    int local_shared = (int)l->shared_gate.shape[0];
+    float *shared_outs[] = {m->expert_gate, m->expert_up};
+    const k3_full_tensor *shared_weights[] = {&l->shared_gate, &l->shared_up};
+    const float *shared_inputs[] = {x, x};
+    int shared_rows[] = {local_shared, local_shared};
+    int shared_cols[] = {K3_HIDDEN, K3_HIDDEN};
+    full_bf16_many(shared_outs, shared_weights, shared_inputs,
+                   shared_rows, shared_cols, 2, m->threads);
+    k3_situ_sve(m->expert_gate, m->expert_gate, m->expert_up, local_shared);
+    full_bf16_matvec(m->shared_hidden, &l->shared_down, K3_HIDDEN,
+                     local_shared, m->expert_gate, m->threads);
+    if (prefetch_active) pthread_join(prefetch_thread, NULL);
+    if (m->profile.enabled) {
+        full_profile_phase_add(m, K3_FULL_PHASE_MOE_SHARED,
+                               full_now() - subphase_start);
+        subphase_start = full_now();
+    }
+
+    for (int i = 0; i < K3_LATENT; ++i)
+        m->routed_norm[i] = full_weight_at(&l->routed_norm, i);
+    k3_moe_pack_reduce(m->reduce, m->routed_latent, m->shared_hidden);
+    if (full_sum(m, m->reduce, K3_FULL_REDUCE_COUNT)) return EIO;
+    if (m->profile.enabled) {
+        full_profile_phase_add(m, K3_FULL_PHASE_MOE_COLLECTIVE,
+                               full_now() - subphase_start);
+        subphase_start = full_now();
+    }
+
+    int local_hidden = (int)l->routed_up.shape[0];
+    int hidden_start = 0;
+    if (local_hidden != K3_HIDDEN) {
+        if (l->routed_up.shape[1] != K3_LATENT ||
+            full_split_groups(K3_HIDDEN, m->rank, m->nodes, 8,
+                              &hidden_start, &local_hidden) ||
+            (int)l->routed_up.shape[0] != local_hidden) {
+            fprintf(stderr, "k3_full_runner rank %d: invalid routed-up shard shape\n",
+                    m->rank);
+            return EINVAL;
+        }
+    }
+    full_rmsnorm_tensor(m->tmp, m->reduce, &l->routed_norm, K3_LATENT);
+    memset(out, 0, K3_HIDDEN * sizeof(float));
+    full_bf16_matvec(out + hidden_start, &l->routed_up, local_hidden,
+                     K3_LATENT, m->tmp, m->threads);
+    if (local_hidden != K3_HIDDEN && full_sum(m, out, K3_HIDDEN)) return EIO;
+    full_add(out, m->reduce + K3_LATENT, K3_HIDDEN);
+    if (m->profile.enabled)
+        full_profile_phase_add(m, K3_FULL_PHASE_MOE_FINISH,
+                               full_now() - subphase_start);
+    return 0;
+}
+
 static int full_moe_forward(k3_full_model *m, k3_full_layer *l,
                             const float *x, float *out) {
+    if (m->expert_tp) return full_moe_forward_expert_tp(m, l, x, out);
     int local_latent = (int)l->routed_down.shape[0];
     int local_shared = (int)l->shared_gate.shape[0];
     float router_logits[K3_EXPERTS];
     int route[K3_TOP_K];
     float route_weight[K3_TOP_K];
-    full_bf16_matvec(router_logits, &l->router, K3_EXPERTS,
-                     K3_HIDDEN, x, m->threads);
+    memset(m->local_latent, 0, K3_LATENT * sizeof(float));
+    float *route_outs[] = {router_logits,
+                           m->local_latent + m->latent_start};
+    const k3_full_tensor *route_weights[] = {&l->router, &l->routed_down};
+    const float *route_inputs[] = {x, x};
+    int route_rows[] = {K3_EXPERTS, local_latent};
+    int route_cols[] = {K3_HIDDEN, K3_HIDDEN};
+    full_bf16_many(route_outs, route_weights, route_inputs,
+                   route_rows, route_cols, 2, m->threads);
     k3_router_topk(router_logits, (const float *)l->router_bias.data,
                    K3_EXPERTS, K3_TOP_K, route, route_weight);
-    memset(m->local_latent, 0, K3_LATENT * sizeof(float));
-    full_bf16_matvec(m->local_latent + m->latent_start, &l->routed_down,
-                     local_latent, K3_HIDDEN, x, m->threads);
     if (full_sum(m, m->local_latent, K3_LATENT)) return EIO;
 
     memset(m->expert_counts, 0, (size_t)l->expert_count * sizeof(int));
@@ -958,10 +1553,13 @@ static int full_moe_forward(k3_full_model *m, k3_full_layer *l,
     full_bf16_matvec(m->moe_hidden, &l->routed_up, K3_HIDDEN,
                      local_latent, m->tmp + m->latent_start, m->threads);
 
-    full_bf16_matvec(m->expert_gate, &l->shared_gate, local_shared,
-                     K3_HIDDEN, x, m->threads);
-    full_bf16_matvec(m->expert_up, &l->shared_up, local_shared,
-                     K3_HIDDEN, x, m->threads);
+    float *shared_outs[] = {m->expert_gate, m->expert_up};
+    const k3_full_tensor *shared_weights[] = {&l->shared_gate, &l->shared_up};
+    const float *shared_inputs[] = {x, x};
+    int shared_rows[] = {local_shared, local_shared};
+    int shared_cols[] = {K3_HIDDEN, K3_HIDDEN};
+    full_bf16_many(shared_outs, shared_weights, shared_inputs,
+                   shared_rows, shared_cols, 2, m->threads);
     k3_situ_sve(m->expert_gate, m->expert_gate, m->expert_up, local_shared);
     full_bf16_matvec(m->tmp2, &l->shared_down, K3_HIDDEN,
                      local_shared, m->expert_gate, m->threads);
@@ -982,6 +1580,9 @@ static int full_forward_token(k3_full_model *m, int token, int position) {
     }
     if (full_sum(m, m->hidden, K3_HIDDEN)) return EIO;
     for (int layer = 0; layer < K3_LAYERS; ++layer) {
+        double layer_start = m->profile.enabled ? full_now() : 0.0;
+        double phase_start = m->profile.enabled ? full_now() : 0.0;
+        full_profile_layer_begin(m, layer);
         k3_full_layer *l = &m->layers[layer];
         full_copy(m->tmp, m->hidden, K3_HIDDEN); /* prefix_sum */
         if (m->block_count > 0)
@@ -996,23 +1597,47 @@ static int full_forward_token(k3_full_model *m, int token, int position) {
             ++m->block_count;
         }
         full_rmsnorm_tensor(m->normed, attn_input, &l->input_norm, K3_HIDDEN);
+        full_profile_phase_begin(m, K3_FULL_PHASE_ATTENTION);
         if (l->is_mla)
             full_mla_forward(m, l, m->normed, position, m->attn);
         else
             full_kda_forward(m, l, m->normed, m->attn);
-        if (full_sum(m, m->attn, K3_HIDDEN)) return EIO;
+        if (full_sum(m, m->attn, K3_HIDDEN)) {
+            full_profile_layer_end(m, layer, layer_start);
+            return EIO;
+        }
+        if (m->profile.enabled)
+            full_profile_phase_add(m, K3_FULL_PHASE_ATTENTION,
+                                   full_now() - phase_start);
         if (new_block) full_copy(m->tmp, m->attn, K3_HIDDEN);
         else full_add(m->tmp, m->attn, K3_HIDDEN);
         full_attn_res(m->tmp2, m->tmp, m->block_residual,
                       m->block_count, &l->mlp_res_proj, &l->mlp_res_norm);
         full_rmsnorm_tensor(m->normed, m->tmp2, &l->post_norm, K3_HIDDEN);
+        phase_start = m->profile.enabled ? full_now() : 0.0;
+        full_profile_phase_begin(m, K3_FULL_PHASE_MOE);
         if (layer == 0)
             full_dense_forward(m, l, m->normed, m->moe_hidden);
         else if (full_moe_forward(m, l, m->normed, m->moe_hidden))
+        {
+            full_profile_layer_end(m, layer, layer_start);
             return EIO;
-        if (layer == 0 && full_sum(m, m->moe_hidden, K3_HIDDEN)) return EIO;
+        }
+        if (layer == 0 && full_sum(m, m->moe_hidden, K3_HIDDEN)) {
+            full_profile_layer_end(m, layer, layer_start);
+            return EIO;
+        }
+        if (m->profile.enabled)
+            full_profile_phase_add(m, K3_FULL_PHASE_MOE,
+                                   full_now() - phase_start);
+        phase_start = m->profile.enabled ? full_now() : 0.0;
+        full_profile_phase_begin(m, K3_FULL_PHASE_RESIDUAL);
         full_add(m->tmp, m->moe_hidden, K3_HIDDEN);
         full_copy(m->hidden, m->tmp, K3_HIDDEN);
+        if (m->profile.enabled)
+            full_profile_phase_add(m, K3_FULL_PHASE_RESIDUAL,
+                                   full_now() - phase_start);
+        full_profile_layer_end(m, layer, layer_start);
     }
     full_rmsnorm_tensor(m->hidden, m->hidden, &m->final_norm, K3_HIDDEN);
     return 0;
@@ -1126,6 +1751,7 @@ static int full_parse_u64(const char *flag, const char *s, uint64_t *out) {
 static const char *full_mode_name(k3_full_mode mode) {
     if (mode == K3_FULL_MODE_LAYER12) return "layer12";
     if (mode == K3_FULL_MODE_SYNTHETIC12) return "synthetic12";
+    if (mode == K3_FULL_MODE_BARRIER) return "barrier";
     return "full96";
 }
 
@@ -1133,6 +1759,7 @@ static int full_parse_mode(const char *s, k3_full_mode *out) {
     if (!strcmp(s, "full96")) *out = K3_FULL_MODE_FULL96;
     else if (!strcmp(s, "layer12")) *out = K3_FULL_MODE_LAYER12;
     else if (!strcmp(s, "synthetic12")) *out = K3_FULL_MODE_SYNTHETIC12;
+    else if (!strcmp(s, "barrier")) *out = K3_FULL_MODE_BARRIER;
     else return -1;
     return 0;
 }
@@ -1144,7 +1771,13 @@ static void full_usage(const char *program) {
             "       [--nodes 96|12] [--threads N] [--real-layer-index N]\n"
             "       [--prompt-ids IDS] [--input-seed N] [--prefill-tokens N]\n"
             "       [--new-tokens N] [--prefill-chunk N] [--max-seq N]\n"
-            "       [--prefill-only]\n", program);
+            "       [--barrier-iters N] [--comm-deterministic 0|1] [--comm-bf16 0|1]\n"
+            "       [--comm-robust N] [--comm-poll-spins N] [--comm-a2a 0|1]\n"
+            "       [--comm-a2a-max N] [--prefetch-mib N]\n"
+            "       [--ar-groups N] [--profile [FILE]]\n"
+            "       [--prefill-only]\n"
+            "       %s --mode barrier --topo FILE --nodes N [--barrier-iters N]\n",
+            program, program);
 }
 
 static int full_options(int argc, char **argv, k3_full_options *o) {
@@ -1152,6 +1785,18 @@ static int full_options(int argc, char **argv, k3_full_options *o) {
         .mode = K3_FULL_MODE_FULL96, .nodes = 96, .threads = 48,
         .max_seq = 12288, .real_layer_index = 1,
         .input_seed = UINT64_C(0x4b33444542554701), .prefill_chunk = 1,
+        .barrier_iters = K3_FULL_BARRIER_ITERS_DEFAULT,
+        /* Fixed-root reductions are required for rank-identical full decode. */
+        .comm_deterministic = 1,
+        .ar_groups = 0,
+        .comm_use_bf16 = 0,
+        .comm_robust = 2,
+        .comm_poll_spins = 4,
+        .comm_a2a = 0,
+        .comm_a2a_max = 8192,
+        .prefetch_mib = 16,
+        .profile = 0,
+        .profile_output = NULL,
         .prefill_tokens = 8192, .new_tokens = 4096,
         .stage_dir = NULL, .topo_path = "tofu_topo.txt",
         .prompt_ids = NULL, .output_path = NULL,
@@ -1172,10 +1817,30 @@ static int full_options(int argc, char **argv, k3_full_options *o) {
         else if (!strcmp(a, "--new-tokens")) { VALUE(); if (full_parse_int(a, argv[i], 0, 4096, &o->new_tokens)) return -1; }
         else if (!strcmp(a, "--prefill-chunk")) { VALUE(); if (full_parse_int(a, argv[i], 1, 1024, &o->prefill_chunk)) return -1; }
         else if (!strcmp(a, "--max-seq")) { VALUE(); if (full_parse_int(a, argv[i], 1, 16384, &o->max_seq)) return -1; }
+        else if (!strcmp(a, "--barrier-iters")) { VALUE(); if (full_parse_int(a, argv[i], 1, 100000, &o->barrier_iters)) return -1; }
+        else if (!strcmp(a, "--comm-deterministic")) { VALUE(); if (full_parse_int(a, argv[i], 0, 1, &o->comm_deterministic)) return -1; }
+        else if (!strcmp(a, "--comm-bf16")) { VALUE(); if (full_parse_int(a, argv[i], 0, 1, &o->comm_use_bf16)) return -1; }
+        else if (!strcmp(a, "--comm-robust")) { VALUE(); if (full_parse_int(a, argv[i], 0, 2, &o->comm_robust)) return -1; }
+        else if (!strcmp(a, "--comm-poll-spins")) { VALUE(); if (full_parse_int(a, argv[i], 1, 1024, &o->comm_poll_spins)) return -1; }
+        else if (!strcmp(a, "--comm-a2a")) { VALUE(); if (full_parse_int(a, argv[i], 0, 1, &o->comm_a2a)) return -1; }
+        else if (!strcmp(a, "--comm-a2a-max")) { VALUE(); if (full_parse_int(a, argv[i], 1, K3_FULL_REDUCE_COUNT, &o->comm_a2a_max)) return -1; }
+        else if (!strcmp(a, "--prefetch-mib")) { VALUE(); if (full_parse_int(a, argv[i], 0, 16, &o->prefetch_mib)) return -1; }
+        else if (!strcmp(a, "--ar-groups")) { VALUE(); if (full_parse_int(a, argv[i], 0, 96, &o->ar_groups)) return -1; }
+        else if (!strcmp(a, "--profile")) {
+            o->profile = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') o->profile_output = argv[++i];
+        }
         else if (!strcmp(a, "--prefill-only")) o->prefill_only = 1;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { full_usage(argv[0]); return 1; }
         else { fprintf(stderr, "k3_full_runner: unknown option %s\n", a); full_usage(argv[0]); return -1; }
 #undef VALUE
+    }
+    if (o->mode == K3_FULL_MODE_BARRIER) {
+        if (o->nodes < 2) {
+            fprintf(stderr, "k3_full_runner: barrier mode requires at least two nodes\n");
+            return -1;
+        }
+        return 0;
     }
     if (!o->stage_dir || !o->output_path) {
         full_usage(argv[0]);
@@ -1194,6 +1859,31 @@ static int full_options(int argc, char **argv, k3_full_options *o) {
     if (o->prefill_tokens + o->new_tokens > o->max_seq) {
         fprintf(stderr, "k3_full_runner: prompt plus generation exceeds --max-seq\n");
         return -1;
+    }
+    if (o->ar_groups && o->nodes % o->ar_groups) {
+        fprintf(stderr, "k3_full_runner: --ar-groups must divide nodes\n");
+        return -1;
+    }
+    if (o->comm_poll_spins & (o->comm_poll_spins - 1)) {
+        fprintf(stderr, "k3_full_runner: --comm-poll-spins must be a power of two\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int full_barrier_stress(const k3_full_options *o) {
+    for (int i = 0; i < o->barrier_iters; ++i) {
+        /* Deliberately skew a changing rank before fan-in.  This exercises
+         * both the root's ordered receive polling and non-root retransmit
+         * path without making the batch preflight depend on one fixed rank. */
+        int delayed_rank = (i * 17 + 46) % g_nodes;
+        if (g_rank == delayed_rank)
+            usleep((useconds_t)(250 + (i % 7) * 250));
+        if ((i & 15) == 7)
+            sched_yield();
+        full_barrier();
+        if ((i & 31) == 0 && g_rank != 0)
+            usleep((useconds_t)((g_rank * 13 + i) % 300));
     }
     return 0;
 }
@@ -1252,6 +1942,11 @@ static int full_allocate_scratch(k3_full_model *m, const k3_full_options *o) {
                                           (size_t)max_experts * K3_EXPERT_INTER * sizeof(float));
     m->expert_out = (float *)k3_pool_alloc(m->pool,
                                            (size_t)max_experts * K3_LATENT * sizeof(float));
+    m->shared_hidden = (float *)k3_pool_alloc(m->pool, K3_HIDDEN * sizeof(float));
+    m->reduce = (float *)k3_pool_alloc(m->pool,
+                                       K3_FULL_REDUCE_COUNT * sizeof(float));
+    m->routed_norm = (float *)k3_pool_alloc(m->pool, K3_LATENT * sizeof(float));
+    m->q_scratch = (int8_t *)k3_pool_alloc(m->pool, K3_LATENT * sizeof(int8_t));
     m->expert_counts = (int *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(int));
     m->expert_tokens = (int *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(int));
     m->expert_weights = (float *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(float));
@@ -1260,6 +1955,7 @@ static int full_allocate_scratch(k3_full_model *m, const k3_full_options *o) {
         !m->attn || !m->q || !m->k || !m->v || !m->gate || !m->up || !m->decay ||
         !m->local_latent || !m->routed_latent || !m->moe_hidden || !m->logits ||
         !m->expert_gathered || !m->expert_gate || !m->expert_up || !m->expert_out ||
+        !m->shared_hidden || !m->reduce || !m->routed_norm || !m->q_scratch ||
         !m->expert_counts || !m->expert_tokens || !m->expert_weights) return ENOMEM;
     return 0;
 }
@@ -1292,18 +1988,33 @@ static void full_debug_seed_hidden(k3_full_model *m, uint64_t seed, int token,
 
 static int full_debug_layer_forward(k3_full_model *m, k3_full_layer *l,
                                     int position) {
+    double layer_start = m->profile.enabled ? full_now() : 0.0;
+    full_profile_layer_begin(m, m->debug_layer_index);
     m->block_count = 0;
     full_copy(m->tmp, m->hidden, K3_HIDDEN);
     full_rmsnorm_tensor(m->normed, m->tmp, &l->input_norm, K3_HIDDEN);
+    double phase_start = m->profile.enabled ? full_now() : 0.0;
+    full_profile_phase_begin(m, K3_FULL_PHASE_ATTENTION);
     if (l->is_mla)
         full_mla_forward(m, l, m->normed, position, m->attn);
     else
         full_kda_forward(m, l, m->normed, m->attn);
-    if (full_sum(m, m->attn, K3_HIDDEN)) return EIO;
+    if (full_sum(m, m->attn, K3_HIDDEN)) {
+        if (m->profile.enabled)
+            full_profile_phase_add(m, K3_FULL_PHASE_ATTENTION,
+                                   full_now() - phase_start);
+        full_profile_layer_end(m, m->debug_layer_index, layer_start);
+        return EIO;
+    }
+    if (m->profile.enabled)
+        full_profile_phase_add(m, K3_FULL_PHASE_ATTENTION,
+                               full_now() - phase_start);
     full_add(m->tmp, m->attn, K3_HIDDEN);
     full_attn_res(m->tmp2, m->tmp, NULL, 0, &l->mlp_res_proj,
                   &l->mlp_res_norm);
     full_rmsnorm_tensor(m->normed, m->tmp2, &l->post_norm, K3_HIDDEN);
+    phase_start = m->profile.enabled ? full_now() : 0.0;
+    full_profile_phase_begin(m, K3_FULL_PHASE_MOE);
     int rc;
     if (m->debug_layer_index == 0) {
         full_dense_forward(m, l, m->normed, m->moe_hidden);
@@ -1311,9 +2022,24 @@ static int full_debug_layer_forward(k3_full_model *m, k3_full_layer *l,
     } else {
         rc = full_moe_forward(m, l, m->normed, m->moe_hidden);
     }
-    if (rc) return rc;
+    if (rc) {
+        if (m->profile.enabled)
+            full_profile_phase_add(m, K3_FULL_PHASE_MOE,
+                                   full_now() - phase_start);
+        full_profile_layer_end(m, m->debug_layer_index, layer_start);
+        return rc;
+    }
+    if (m->profile.enabled)
+        full_profile_phase_add(m, K3_FULL_PHASE_MOE,
+                               full_now() - phase_start);
+    phase_start = m->profile.enabled ? full_now() : 0.0;
+    full_profile_phase_begin(m, K3_FULL_PHASE_RESIDUAL);
     full_add(m->tmp, m->moe_hidden, K3_HIDDEN);
     full_copy(m->hidden, m->tmp, K3_HIDDEN);
+    if (m->profile.enabled)
+        full_profile_phase_add(m, K3_FULL_PHASE_RESIDUAL,
+                               full_now() - phase_start);
+    full_profile_layer_end(m, m->debug_layer_index, layer_start);
     return 0;
 }
 
@@ -1419,7 +2145,8 @@ static int full_debug_prefill_chunk(k3_full_model *m,
     return 0;
 }
 
-static int full_debug_run(k3_full_options *o, tp_comm *comm, k3_pool *pool) {
+static int full_debug_run(k3_full_options *o, tp_comm *comm, tp_comm *comm_col,
+                          k3_pool *pool) {
     k3_full_model model;
     memset(&model, 0, sizeof model);
     model.rank = g_rank;
@@ -1427,7 +2154,10 @@ static int full_debug_run(k3_full_options *o, tp_comm *comm, k3_pool *pool) {
     model.threads = o->threads;
     model.max_seq = o->max_seq;
     model.comm = comm;
+    model.comm_col = comm_col;
     model.debug_layer_index = o->real_layer_index;
+    model.prefetch_mib = o->prefetch_mib;
+    model.profile.enabled = o->profile;
 
     int rc = full_load_debug_model(&model, o, pool);
     int ready = rc == 0;
@@ -1471,6 +2201,7 @@ static int full_debug_run(k3_full_options *o, tp_comm *comm, k3_pool *pool) {
             prompt[i] = full_debug_token_id(o->input_seed, i);
     }
 
+    full_profile_reset(&model);
     full_barrier();
     double prefill_start = full_now();
     int failed = 0;
@@ -1501,6 +2232,9 @@ static int full_debug_run(k3_full_options *o, tp_comm *comm, k3_pool *pool) {
     if (full_max(&model, &failure, 1)) return 3;
     if (failure != 0.0f) {
         free(prompt); free(generated); full_barrier(); return 5;
+    }
+    if (full_profile_report(&model, o)) {
+        free(prompt); free(generated); full_barrier(); return 6;
     }
 
     uint64_t output_hash = full_hash_ids(generated, generated_count);
@@ -1656,22 +2390,57 @@ int main(int argc, char **argv) {
     free(tnis);
     full_barrier();
 
+    if (opt.mode == K3_FULL_MODE_BARRIER) {
+        full_barrier_stress(&opt);
+        full_barrier();
+        if (g_rank == 0) {
+            printf("K3FULL_BARRIER PASS nodes=%d iterations=%d total=%d\n",
+                   g_nodes, opt.barrier_iters, opt.barrier_iters + 2);
+            fflush(stdout);
+        }
+        utofu_dereg_mem(g_vcq, g_base, 0);
+        utofu_free_vcq(g_vcq);
+        k3_pool_destroy(&pool);
+        return 0;
+    }
+
     tp_comm_config comm_config = {
-        .robust = 2, .poll_spins = 4, .ack = 0, .deterministic = 0,
-        .a2a_max = 8192, .ack_retx = 64, .ack_rtt = 0.001, .timeout = 120.0,
+        .use_bf16 = opt.comm_use_bf16,
+        .robust = opt.comm_robust, .poll_spins = opt.comm_poll_spins,
+        .a2a = opt.comm_a2a, .a2a_max = opt.comm_a2a_max, .ack = 0,
+        .deterministic = opt.comm_deterministic,
+        .ack_retx = 64, .ack_rtt = 0.001, .timeout = 120.0,
     };
-    size_t comm_bytes = tp_comm_region_size(g_nodes, K3_FULL_REDUCE_COUNT,
-                                            &comm_config);
-    void *comm_region = k3_pool_alloc(&pool, comm_bytes);
+    int ar_groups = opt.ar_groups;
+    if (!ar_groups)
+        ar_groups = g_nodes == 96 ? 16 : (g_nodes == 12 ? 2 : 0);
+    int hierarchical = ar_groups > 1 && ar_groups < g_nodes;
+    int row_nodes = hierarchical ? g_nodes / ar_groups : g_nodes;
+    int col_nodes = hierarchical ? ar_groups : 0;
+    size_t row_comm_bytes = tp_comm_region_size(row_nodes, K3_FULL_REDUCE_COUNT,
+                                                &comm_config);
+    size_t col_comm_bytes = hierarchical ?
+        tp_comm_region_size(col_nodes, K3_FULL_REDUCE_COUNT, &comm_config) : 0;
+    void *row_comm_region = k3_pool_alloc(&pool, row_comm_bytes);
+    void *col_comm_region = hierarchical ? k3_pool_alloc(&pool, col_comm_bytes) : NULL;
     tp_comm comm;
+    tp_comm comm_col;
     memset(&comm, 0, sizeof comm);
-    if (!comm_region) {
+    memset(&comm_col, 0, sizeof comm_col);
+    if (!row_comm_region || (hierarchical && !col_comm_region)) {
         fprintf(stderr, "k3_full_runner rank %d: comm region allocation failed\n", g_rank);
         return 3;
     }
-    rc = tp_comm_init_external(&comm, g_vcq, g_peer_vcq, g_rank, g_nodes,
-                               K3_FULL_REDUCE_COUNT, full_barrier,
-                               &comm_config, comm_region, comm_bytes);
+    if (hierarchical) {
+        rc = tp_comm_init_2d_external(
+            &comm, &comm_col, g_vcq, g_peer_vcq, g_rank, g_nodes, ar_groups,
+            K3_FULL_REDUCE_COUNT, full_barrier, &comm_config,
+            row_comm_region, row_comm_bytes, col_comm_region, col_comm_bytes);
+    } else {
+        rc = tp_comm_init_external(&comm, g_vcq, g_peer_vcq, g_rank, g_nodes,
+                                   K3_FULL_REDUCE_COUNT, full_barrier,
+                                   &comm_config, row_comm_region, row_comm_bytes);
+    }
     if (rc) {
         fprintf(stderr, "k3_full_runner rank %d: comm init rc=%d\n", g_rank, rc);
         return 3;
@@ -1679,8 +2448,9 @@ int main(int argc, char **argv) {
     full_barrier();
 
     if (opt.mode != K3_FULL_MODE_FULL96) {
-        rc = full_debug_run(&opt, &comm, &pool);
-        tp_comm_free(&comm);
+        rc = full_debug_run(&opt, &comm, hierarchical ? &comm_col : NULL, &pool);
+        if (hierarchical) tp_comm_free_2d(&comm, &comm_col);
+        else tp_comm_free(&comm);
         utofu_dereg_mem(g_vcq, g_base, 0);
         utofu_free_vcq(g_vcq);
         k3_pool_destroy(&pool);
@@ -1694,7 +2464,10 @@ int main(int argc, char **argv) {
     model.threads = opt.threads;
     model.max_seq = opt.max_seq;
     model.comm = &comm;
+    model.comm_col = hierarchical ? &comm_col : NULL;
     model.debug_layer_index = -1;
+    model.prefetch_mib = opt.prefetch_mib;
+    model.profile.enabled = opt.profile;
     rc = full_load_model(&model, &opt, &pool);
     int ready = rc == 0;
     float ready_sum = (float)ready;
@@ -1754,6 +2527,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "k3_full_runner: requested %d OpenMP workers, got %d\n",
                 opt.threads, warm_threads);
 
+    full_profile_reset(&model);
     full_barrier();
     double prefill_start = full_now();
     int failed = 0;
@@ -1799,15 +2573,19 @@ int main(int argc, char **argv) {
         if (g_rank == 0) fprintf(stderr, "k3_full_runner: distributed inference failed\n");
         free(prompt); free(generated); return 5;
     }
+    if (full_profile_report(&model, &opt)) {
+        free(prompt); free(generated); return 6;
+    }
 
     uint64_t output_hash = full_hash_ids(generated, opt.new_tokens);
     char rank_path[1200];
     snprintf(rank_path, sizeof rank_path, "%s.rank%03d", opt.output_path, g_rank);
     FILE *rank_file = fopen(rank_path, "w");
     if (rank_file) {
-        fprintf(rank_file, "rank=%d generated=%d hash=%016llx final=%d\n",
+        fprintf(rank_file, "rank=%d generated=%d hash=%016llx final=%d hidden_hash=%016llx\n",
                 g_rank, opt.new_tokens, (unsigned long long)output_hash,
-                opt.new_tokens ? generated[opt.new_tokens - 1] : -1);
+                opt.new_tokens ? generated[opt.new_tokens - 1] : -1,
+                (unsigned long long)full_hash_f32(model.hidden, K3_HIDDEN));
         fclose(rank_file);
     }
     if (g_rank == 0) {
@@ -1817,10 +2595,16 @@ int main(int argc, char **argv) {
                     opt.output_path, strerror(errno));
             free(prompt); free(generated); return 6;
         }
-        fprintf(out, "K3FULLV2 status=PASS mode=full96 nodes=%d real_layer_index=-1 "
-                "prefill_tokens=%d generated_tokens=%d prefill_chunk=%d\n",
-                g_nodes, opt.prefill_tokens, opt.prefill_only ? 0 : opt.new_tokens,
-                opt.prefill_chunk);
+        fprintf(out, "K3FULLV2 status=PASS mode=%s nodes=%d real_layer_index=-1 "
+                "prefill_tokens=%d generated_tokens=%d prefill_chunk=%d "
+                "comm_deterministic=%d comm_bf16=%d comm_robust=%d "
+                "comm_poll_spins=%d comm_a2a=%d comm_a2a_max=%d "
+                "prefetch_mib=%d ar_groups=%d profile=%d\n",
+                full_mode_name(opt.mode), g_nodes, opt.prefill_tokens,
+                opt.prefill_only ? 0 : opt.new_tokens,
+                opt.prefill_chunk, opt.comm_deterministic, opt.comm_use_bf16,
+                opt.comm_robust, opt.comm_poll_spins, opt.comm_a2a,
+                opt.comm_a2a_max, opt.prefetch_mib, ar_groups, opt.profile);
         fprintf(out, "prefill_seconds=%.9f prefill_tok_s=%.6f decode_seconds=%.9f decode_tok_s=%.6f\n",
                 (double)prefill_max,
                 prefill_max > 0.0f ? (double)opt.prefill_tokens / prefill_max : 0.0,
@@ -1834,9 +2618,9 @@ int main(int argc, char **argv) {
             fprintf(out, " %d", generated[i]);
         fputc('\n', out);
         fclose(out);
-        printf("K3FULLV2 PASS mode=full96 nodes=%d prefill=%d %.6f tok/s "
+        printf("K3FULLV2 PASS mode=%s nodes=%d prefill=%d %.6f tok/s "
                "decode=%d %.6f tok/s output=%s hash=%016llx\n",
-               g_nodes, opt.prefill_tokens,
+               full_mode_name(opt.mode), g_nodes, opt.prefill_tokens,
                prefill_max > 0.0f ? (double)opt.prefill_tokens / prefill_max : 0.0,
                opt.prefill_only ? 0 : opt.new_tokens,
                decode_max > 0.0f && !opt.prefill_only ? (double)opt.new_tokens / decode_max : 0.0,
@@ -1845,7 +2629,8 @@ int main(int argc, char **argv) {
     full_barrier();
     free(prompt);
     free(generated);
-    tp_comm_free(&comm);
+    if (hierarchical) tp_comm_free_2d(&comm, &comm_col);
+    else tp_comm_free(&comm);
     utofu_dereg_mem(g_vcq, g_base, 0);
     utofu_free_vcq(g_vcq);
     k3_pool_destroy(&pool);

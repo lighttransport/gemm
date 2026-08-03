@@ -190,10 +190,18 @@ static inline void k3_q8pv16_quantize_bf16_clip(uint8_t*dst,const uint16_t*src,
 static inline void k3_q8pv16_quantize_bf16(uint8_t*dst,const uint16_t*src,int rows,int cols){
     k3_q8pv16_quantize_bf16_clip(dst,src,rows,cols,1.0f);
 }
+#ifndef K3_Q8_PREFETCH_BLOCKS
+#define K3_Q8_PREFETCH_BLOCKS 4
+#endif
 static inline void k3_matvec_q8pv16_f32_group(float*out,const uint8_t*group,const float*x,int k){
 #if defined(__ARM_FEATURE_SVE)
     svbool_t pg=svptrue_b32();svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
-    for(int b=0;b<k/16;++b){const uint8_t*blk=group+(size_t)b*160;const float*sc=(const float*)blk;const int8_t*q=(const int8_t*)(blk+32);svfloat32_t xv=svld1(pg,x+(size_t)b*16);
+    for(int b=0;b<k/16;++b){
+#if K3_Q8_PREFETCH_BLOCKS > 0
+        int pb=b+K3_Q8_PREFETCH_BLOCKS;
+        if(pb<k/16) __builtin_prefetch(group+(size_t)pb*160,0,2);
+#endif
+        const uint8_t*blk=group+(size_t)b*160;const float*sc=(const float*)blk;const int8_t*q=(const int8_t*)(blk+32);svfloat32_t xv=svld1(pg,x+(size_t)b*16);
 #define K3_Q8PV16_F32_ROW(R,A) do{svfloat32_t wv=svcvt_f32_s32_x(pg,svld1sb_s32(pg,q+(size_t)(R)*16));A=svmla_n_f32_x(pg,A,svmul_f32_x(pg,wv,xv),sc[R]);}while(0)
         K3_Q8PV16_F32_ROW(0,a0);K3_Q8PV16_F32_ROW(1,a1);K3_Q8PV16_F32_ROW(2,a2);K3_Q8PV16_F32_ROW(3,a3);K3_Q8PV16_F32_ROW(4,a4);K3_Q8PV16_F32_ROW(5,a5);K3_Q8PV16_F32_ROW(6,a6);K3_Q8PV16_F32_ROW(7,a7);
 #undef K3_Q8PV16_F32_ROW

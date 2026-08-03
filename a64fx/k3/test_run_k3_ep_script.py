@@ -26,26 +26,27 @@ class RunK3EpScriptTest(unittest.TestCase):
         code, stdout, stderr = self._run("--help")
         self.assertEqual(code, 0)
         self.assertIn("usage:", stdout + stderr)
+        self.assertIn("dummy|real|hybrid", stdout + stderr)
 
     def test_invalid_argument_rejected(self):
         code, stdout, stderr = self._run("--nodes", "12", "--bad", "x")
         self.assertNotEqual(code, 0)
         self.assertIn("unknown argument: --bad", (stderr + stdout))
 
-    def test_mode_must_be_dummy_or_real(self):
+    def test_mode_must_be_dummy_real_or_hybrid(self):
         code, _stdout, stderr = self._run("--nodes", "12", "--tp-nodes", "6", "--mode", "weird")
         self.assertNotEqual(code, 0)
-        self.assertIn("--mode must be dummy or real", stderr)
+        self.assertIn("--mode must be dummy, real, or hybrid", stderr)
 
     def test_invalid_tp_nodes_rejected(self):
         code, _stdout, stderr = self._run("--nodes", "12", "--tp-nodes", "5")
         self.assertNotEqual(code, 0)
         self.assertIn("nodes in [1,512], tp-nodes in [1,96], and nodes divisible by tp-nodes", stderr)
 
-    def test_stage_only_requires_real_mode(self):
+    def test_stage_only_requires_real_or_hybrid_mode(self):
         code, _stdout, stderr = self._run("--mode", "dummy", "--stage-only", "--nodes", "12", "--stage-dir", "/tmp")
         self.assertNotEqual(code, 0)
-        self.assertIn("--stage-only requires --mode real", stderr)
+        self.assertIn("--stage-only requires --mode real or hybrid", stderr)
 
     def test_numerics_reject_non_integer_tokens(self):
         code, _stdout, stderr = self._run("--nodes", "12", "--tp-nodes", "12", "--tokens", "abc")

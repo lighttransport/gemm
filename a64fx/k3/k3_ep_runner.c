@@ -61,7 +61,11 @@ typedef struct __attribute__((packed)) {
 
 static const char k3_cache_magic[8] = {'K','3','C','A','C','H','E','1'};
 
-typedef enum { K3_MODE_DUMMY, K3_MODE_REAL } k3_mode;
+typedef enum { K3_MODE_DUMMY, K3_MODE_REAL, K3_MODE_HYBRID } k3_mode;
+
+static const char *k3_mode_name(k3_mode mode){
+    return mode==K3_MODE_REAL?"real":mode==K3_MODE_HYBRID?"hybrid":"dummy";
+}
 typedef struct {
     int nodes;
     int tp_nodes;
@@ -116,7 +120,7 @@ static void profile_add(double sum[6],double high[6],int phase,double seconds){
 }
 static void usage(const char *p){
     fprintf(stderr,
-        "usage: %s [--mode dummy|real] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]\n"
+        "usage: %s [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]\n"
         "          [--threads N] [--layer N] [--stage-dir DIR]\n"
         "          [--status-dir DIR] [--cache-load PATH] [--cache-save PATH]\n"
         "          [--topo FILE] [--profile] [--kda-threads N]\n"
@@ -145,7 +149,8 @@ static int parse_options(int argc,char **argv,k3_options *o){
 #define VALUE() do{if(++i>=argc){fprintf(stderr,"k3_ep_runner: missing value for %s\n",a);usage(argv[0]);return-1;}}while(0)
         if(!strcmp(a,"--mode")){VALUE();if(!strcmp(argv[i],"dummy"))o->mode=K3_MODE_DUMMY;
             else if(!strcmp(argv[i],"real"))o->mode=K3_MODE_REAL;
-            else{fprintf(stderr,"k3_ep_runner: --mode expects dummy or real, got '%s'\n",argv[i]);return-1;}}
+            else if(!strcmp(argv[i],"hybrid"))o->mode=K3_MODE_HYBRID;
+            else{fprintf(stderr,"k3_ep_runner: --mode expects dummy, real, or hybrid, got '%s'\n",argv[i]);return-1;}}
         else if(!strcmp(a,"--nodes")){VALUE();if(parse_int(a,argv[i],1,K3_RUNNER_MAX_NODES,&o->nodes))return-1;}
         else if(!strcmp(a,"--tp-nodes")){VALUE();if(parse_int(a,argv[i],1,96,&o->tp_nodes))return-1;}
         else if(!strcmp(a,"--layers")){VALUE();if(parse_int(a,argv[i],1,93,&o->layers))return-1;}
@@ -181,12 +186,15 @@ static int parse_options(int argc,char **argv,k3_options *o){
     if(o->tp_nodes>96||o->nodes%o->tp_nodes){
         fprintf(stderr,"k3_ep_runner: --tp-nodes must be in [1,96] and divide --nodes (%d), got %d\n",
                 o->nodes,o->tp_nodes);return-1;}
-    if(o->mode==K3_MODE_REAL&&(!o->stage_dir||!o->stage_dir[0])){
-        fprintf(stderr,"k3_ep_runner: real mode requires --stage-dir\n");return-1;}
+    if((o->mode==K3_MODE_REAL||o->mode==K3_MODE_HYBRID)&&(!o->stage_dir||!o->stage_dir[0])){
+        fprintf(stderr,"k3_ep_runner: %s mode requires --stage-dir\n",k3_mode_name(o->mode));return-1;}
     if(o->mode==K3_MODE_REAL&&(o->layer==0||o->layers!=1)){
         fprintf(stderr,"k3_ep_runner: bounded real mode requires --layer in [1,92] and --layers 1\n");return-1;}
-    if(o->layer+o->layers>93){
-        fprintf(stderr,"k3_ep_runner: layer range [%d,%d) exceeds the 93-layer network\n",o->layer,o->layer+o->layers);return-1;}
+    if(o->mode==K3_MODE_HYBRID&&o->layer==0){
+        fprintf(stderr,"k3_ep_runner: hybrid mode requires --layer in [1,92]\n");return-1;}
+    int schedule_layer=o->mode==K3_MODE_HYBRID?0:o->layer;
+    if(schedule_layer+o->layers>93){
+        fprintf(stderr,"k3_ep_runner: layer range [%d,%d) exceeds the 93-layer network\n",schedule_layer,schedule_layer+o->layers);return-1;}
     if(o->ar_groups<0)o->ar_groups=o->tp_nodes>=12&&o->tp_nodes%6==0?o->tp_nodes/6:0;
     if(o->ar_groups>0&&(o->ar_groups==1||o->tp_nodes%o->ar_groups)){
         fprintf(stderr,"k3_ep_runner: --ar-groups must be 0 or a divisor in [2,--tp-nodes], got %d for TP%d\n",
@@ -557,7 +565,7 @@ static void write_status(const k3_options *o,const char *state,const char *reaso
     FILE *f=fopen(tmp,"wx");if(!f){fprintf(stderr,"k3_ep_runner rank %d: create status '%s': %s\n",g_rank,tmp,strerror(errno));return;}
     size_t rss=0,hwm=0;(void)k3_process_memory_bytes(&rss,&hwm);
     int ok=fprintf(f,"rank=%d nodes=%d group=%d contexts=%d tp_rank=%d tp_nodes=%d mode=%s state=%s reason=%s layers=%d tokens=%d tokens_completed=%d last_layer=%d collective_seq=%lu seconds=%.9f checksum=%+.9e peak_bytes=%zu rss_bytes=%zu hwm_bytes=%zu mem_available_bytes=%zu\n",
-        g_world_rank,g_world_nodes,g_group,g_contexts,g_rank,g_nodes,o->mode==K3_MODE_REAL?"real":"dummy",state,reason?reason:"none",
+        g_world_rank,g_world_nodes,g_group,g_contexts,g_rank,g_nodes,k3_mode_name(o->mode),state,reason?reason:"none",
         o->layers,o->tokens,tokens_completed,last_layer,(unsigned long)collective_seq,seconds,checksum,peak,
         rss,hwm,k3_mem_available_bytes())>=0;
     if(ok)ok=fflush(f)==0;if(ok)ok=fsync(fileno(f))==0;if(fclose(f))ok=0;
@@ -775,7 +783,8 @@ int main(int argc,char **argv){
 
     int local=partition_count(96,g_rank,g_nodes)*K3_EXPERT_TP_BLOCK,ready=1;
     k3_loaded_expert experts[K3_SELECTED];memset(experts,0,sizeof experts);
-    for(int e=0;e<K3_SELECTED;++e){int bad=opt.mode==K3_MODE_REAL?
+    int use_real_experts=opt.mode==K3_MODE_REAL||opt.mode==K3_MODE_HYBRID;
+    for(int e=0;e<K3_SELECTED;++e){int bad=use_real_experts?
         load_real_expert(&pool,opt.stage_dir,opt.layer,e,local,&experts[e]):
         make_dummy_expert(&pool,g_rank,e,local,&experts[e]);if(bad){ready=0;break;}}
     float ready_sum=(float)ready;int collective_rc=runner_allreduce_sum(&comm,&ready_sum,1);
@@ -796,8 +805,12 @@ int main(int argc,char **argv){
     float *gate=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
     float *up=k3_pool_alloc(&pool,(size_t)K3_SELECTED*local*sizeof(float));
     int local_heads=partition_count(96,g_rank,g_nodes),first_head=partition_first(96,g_rank,g_nodes);
+    /* Hybrid mode stages one real expert layer but walks the complete synthetic
+     * 0..92 schedule, so its source layer and schedule layer are intentionally
+     * different.  This keeps the 93-layer throughput attachment explicit. */
+    int schedule_layer=opt.mode==K3_MODE_HYBRID?0:opt.layer;
     int state_slot[93],kda_layers=0,mla_layers=0;
-    for(int l=0;l<opt.layers;++l)state_slot[l]=layer_is_kda(opt.layer+l)?kda_layers++:mla_layers++;
+    for(int l=0;l<opt.layers;++l)state_slot[l]=layer_is_kda(schedule_layer+l)?kda_layers++:mla_layers++;
     size_t kda_elems=(size_t)kda_layers*local_heads*K3_HEAD_DIM*K3_HEAD_DIM;
     size_t mla_key_elems=(size_t)mla_layers*local_heads*opt.tokens*192;
     size_t mla_value_elems=(size_t)mla_layers*local_heads*opt.tokens*K3_HEAD_DIM;
@@ -925,7 +938,7 @@ int main(int argc,char **argv){
     int stop_numeric=0,stop_signal=0,stop_memory=0,tokens_completed=0,last_layer=-1;
     uint64_t prefetch_sink=0;
     for(int token=start_token;token<opt.tokens&&!stopped;++token){
-        for(int layer=0;layer<opt.layers;++layer){int global_layer=opt.layer+layer;
+        for(int layer=0;layer<opt.layers;++layer){int global_layer=schedule_layer+layer;
             if(!finite||g_stop_signal){memset(reduce,0,K3_RUN_REDUCE_FLOATS*sizeof(float));
                 reduce[K3_CONTROL_SIGNAL]=g_stop_signal?1.0f:0.0f;
                 reduce[K3_CONTROL_NUMERIC]=finite?0.0f:1.0f;
@@ -1031,14 +1044,14 @@ int main(int argc,char **argv){
         stop_numeric?(rank_diverged&&finite?"rank-divergence":"non-finite"):"complete";
     write_status(&opt,final_state,final_reason,tokens_completed,last_layer,runner_comm_seq(&comm),seconds,checksum,pool.peak_active_bytes);
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
-        int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(opt.layer+l);
-        printf("K3_RUN mode=%s nodes=%d tp_nodes=%d contexts=%d group=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s min_available_mib=%d allreduce=%s ar_groups=%d comm_robust=%d comm_ack=%d comm_deterministic=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
-            opt.mode==K3_MODE_REAL?"real":"dummy",g_world_nodes,g_nodes,g_contexts,g_group,local,K3_SELECTED,opt.layer,opt.layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",opt.min_available_mib,
+        int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(schedule_layer+l);
+        printf("K3_RUN mode=%s model_coverage=%s expert_layer=%d nodes=%d tp_nodes=%d contexts=%d group=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s min_available_mib=%d allreduce=%s ar_groups=%d comm_robust=%d comm_ack=%d comm_deterministic=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
+            k3_mode_name(opt.mode),opt.mode==K3_MODE_HYBRID?"one_real_expert_layer_repeated":opt.mode==K3_MODE_REAL?"one_real_expert_layer":"synthetic",opt.layer,g_world_nodes,g_nodes,g_contexts,g_group,local,K3_SELECTED,schedule_layer,schedule_layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",opt.min_available_mib,
             opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.comm_ack,opt.comm_deterministic,opt.comm_poll_spins,opt.prefetch_mib,
             opt.prefetch_threads?opt.prefetch_threads:(opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS),(unsigned long long)prefetch_sink);
-        printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
+        printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f decode_tok_s=%.3f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e peak_MiB=%.2f collective_seq=%lu\n",
             !comm_failed&&!stop_signal&&!stop_memory&&!stop_numeric?"PASS":comm_failed?"COMM-FAILED":stop_signal||stop_memory?"STOPPED":"FAIL",final_reason,tokens_completed,
-            seconds,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));
+            seconds,seconds>0?(double)tokens_completed/seconds:0.0,seconds>0?steps/seconds:0.0,checksum,sqrt(norm2),disagreement,pool.peak_active_bytes/1048576.0,(unsigned long)runner_comm_seq(&comm));
         printf("K3_HEALTH kda_slots=%d mla_slots=%d state_MiB=%.2f mla_cache_MiB=%.2f pool_peak_MiB=%.2f rss_max_MiB=%.2f hwm_max_MiB=%.2f latent_max=%.6e kda_state_max=%.6e mla_cache_max=%.6e\n",
             kda_layers,mla_layers,kda_elems*sizeof(float)/1048576.0,
             (mla_key_elems+mla_value_elems)*cache_element_bytes/1048576.0,

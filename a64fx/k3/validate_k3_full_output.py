@@ -70,8 +70,8 @@ def main():
         with open(path) as f:
             line = f.readline().strip()
         match = re.search(r"generated=(\d+) hash=([0-9a-f]+) final=(-?\d+)"
-                          r"(?: route_hash=([0-9a-f]+) collectives=(\d+)"
-                          r" hidden_hash=([0-9a-f]+))?", line)
+                          r"(?: route_hash=([0-9a-f]+) collectives=(\d+))?"
+                          r"(?: hidden_hash=([0-9a-f]+))?", line)
         if not match:
             raise SystemExit("malformed rank sidecar %s" % path)
         records.append((int(match.group(1)), match.group(2), int(match.group(3)),
