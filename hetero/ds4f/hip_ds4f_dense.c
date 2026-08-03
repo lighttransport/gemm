@@ -82,6 +82,7 @@ struct hip_ds4f_dense {
     int multi_pending, multi_n;
 
     void *gemm_dx, *gemm_dy;
+    void *fp8_lut;
     size_t gemm_x_bytes, gemm_y_bytes;
     float *gemm_x_pack, *gemm_y_pack;
     size_t gemm_x_pack_bytes, gemm_y_pack_bytes;
@@ -169,9 +170,22 @@ hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
         ds4f_mem_pool_destroy(ctx->mem);
         return NULL;
     }
+    {
+        uint32_t lut[256];
+        ds4f_init_fp8_e4m3fn_lut(lut);
+        if (hipMalloc(&ctx->fp8_lut, sizeof(lut)) != hipSuccess ||
+            hipMemcpy(ctx->fp8_lut, lut, sizeof(lut), hipMemcpyHostToDevice) != hipSuccess) {
+            fprintf(stderr, "hip_ds4f_dense: FP8 LUT upload failed\n");
+            if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
+            if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
+            ds4f_mem_pool_destroy(ctx->mem);
+            return NULL;
+        }
+    }
     if (hipStreamCreate(&ctx->stream) != hipSuccess ||
         hipEventCreate(&ctx->done) != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: failed to create stream/event\n");
+        if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
         if (ctx->stream && hipStreamDestroy) hipStreamDestroy(ctx->stream);
         if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
         ds4f_mem_pool_destroy(ctx->mem);
@@ -187,6 +201,7 @@ hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
             }
             if (ctx->done && hipEventDestroy) hipEventDestroy(ctx->done);
             if (ctx->stream && hipStreamDestroy) hipStreamDestroy(ctx->stream);
+            if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
             if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
             ds4f_mem_pool_destroy(ctx->mem);
             return NULL;
@@ -207,6 +222,7 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->dy) hipFree(ctx->dy);
     if (ctx->gemm_dx) hipFree(ctx->gemm_dx);
     if (ctx->gemm_dy) hipFree(ctx->gemm_dy);
+    if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
     for (int i = 0; i < HIP_DS4F_GEMM_MAX; ++i)
         if (ctx->gemm_multi_dy[i]) hipFree(ctx->gemm_multi_dy[i]);
     for (int i = 0; i < HIP_DS4F_ASYNC_MAX; ++i) {
@@ -778,9 +794,9 @@ int hip_ds4f_dense_gemm_tensor(
     if (matrix_is_fp8(mat->kind)) {
         void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
         void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols;
-        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy;
+        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *lut = ctx->fp8_lut;
         int n_out = N, n_in = K, n_tok = M, scale_cols = mat->scale_cols;
-        void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
+        void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
         err = hipModuleLaunchKernel(ctx->gemm_fp8, gx, gy, 1, 16, 16, 1, 0,
                                     ctx->stream, args, NULL);
     } else if (matrix_is_bf16(mat->kind)) {
@@ -865,7 +881,8 @@ int hip_ds4f_dense_gemm_tensors(
         if (matrix_is_fp8(mat[i]->kind)) {
             int n_out = t[i]->rows, n_in = k0, n_tok = m0;
             int scale_cols = mat[i]->scale_cols;
-            void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
+            void *lut = ctx->fp8_lut;
+            void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
             fn = ctx->gemm_fp8;
             err = hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
                                         ctx->stream, args, NULL);

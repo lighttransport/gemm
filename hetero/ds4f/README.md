@@ -348,6 +348,10 @@ FP16-weight, so it cannot be used directly for DS4F BF16). Eligible projection
 pairs/groups are dispatched through the callback, while MXFP4 experts and
 unsupported/view tensors retain the CPU fallback.
 
+The FP8 batched GEMM uses a resident 256-entry E4M3FN bit-pattern LUT on the
+device, removing repeated decode branches from the tile while preserving the
+standalone correctness result.
+
 The standalone gates cover both types: FP8 `M=19` reaches max relative error
 `2.31e-5`, and BF16 `M=13` reaches `1.91e-6`. On the staged EP=8 real shard,
 one layer with 16 CPU workers measured:
@@ -359,8 +363,9 @@ one layer with 16 CPU workers measured:
 | 128 | ~86 | 608.81 | ~7.1x | 0 |
 
 The current exact default on the complete staged 43-layer shard measures
-**3.450 tok/s CPU versus 21.388 tok/s hybrid GPU at batch 64 (6.20x)** with
-zero argmax mismatches. The earlier batch-16 checkpoint was 16.050 tok/s;
+**3.45 tok/s CPU versus about 22.1 tok/s hybrid GPU at batch 64 (about 6.4x)**
+with zero argmax mismatches. The pre-LUT baseline was 21.388 tok/s; profiled
+runs vary around 21.3--22.1 tok/s. The earlier batch-16 checkpoint was 16.050 tok/s;
 batch 128 reaches 22.401 tok/s but currently has 3/128 mismatches and remains
 a tuning result, not the exactness baseline.
 
@@ -383,7 +388,7 @@ the exactness baseline and is disabled by default.
 `"hip_shared_fp16": 1` is a separate experiment: it expands only the shared
 FP8 weights to mathematically exact FP16 values and reuses the existing RDNA4
 FP16-weight tile. The one-layer gate passes at 753.55 tok/s with zero
-mismatches; the full 43-layer run reached 33.64 tok/s but accumulated one
+mismatches; the full 43-layer run reaches about 34--35 tok/s but accumulated one
 argmax change from the different reduction path. It is therefore also opt-in,
 although its weight conversion itself is exact. The layer cap is
 `"hip_shared_fp16_layers": N`, or pass

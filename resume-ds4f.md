@@ -226,6 +226,12 @@ the exact default. Shared-input GEMM pairs upload activations once, grouped
 each BF16 KV row across eight heads. A device-resident prefill arena and fused
 GPU attention/MLP are the next steps needed to approach the 30-tok/s target.
 
+The FP8 batched GEMM tile now uses a resident 256-entry E4M3FN LUT on the
+device, removing repeated decode branches while preserving the standalone
+correctness result. The latest exact full-shard runs are about 22.1 tok/s at
+batch 64 (profiled runs vary around 21.3--22.1 tok/s), with zero argmax
+mismatches.
+
 An opt-in mixed-BF16 experiment (`hip_shared_bf16=1`, optionally capped with
 `hip_shared_bf16_layers`) reached 34.40 tok/s at batch 64 by promoting hot
 shared weights and the router to BF16 GPU matrices. It currently changes one
@@ -235,7 +241,7 @@ default.
 The separate `hip_shared_fp16=1` experiment expands only shared FP8 weights to
 exact FP16 values and reuses the RDNA4 FP16-weight tile. Its one-layer gate is
 753.55 tok/s with zero mismatches; full 43-layer batch-64 prefill reaches
-33.64 tok/s but accumulates one argmax change from the alternate reduction
+about 34--35 tok/s but accumulates one argmax change from the alternate reduction
 path, so it is also opt-in.
 
 ### Correctness debt (do before trusting any output)
