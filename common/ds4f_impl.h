@@ -2969,6 +2969,7 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_SHARED_FP16"); o.hip_shared_fp16 = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_SHARED_FP16_LAYERS"); o.hip_shared_fp16_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_ORDERED_WKV_LAYERS"); o.hip_ordered_wkv_layers = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_ORDERED_FP8_LAYERS"); o.hip_ordered_fp8_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_MHC"); o.mhc = e && *e ? atoi(e) : 0; }
@@ -3064,6 +3065,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_shared_fp16 = ds4f_json_int(json, "hip_shared_fp16", o->hip_shared_fp16);
     o->hip_shared_fp16_layers = ds4f_json_int(json, "hip_shared_fp16_layers", o->hip_shared_fp16_layers);
     o->hip_ordered_wkv_layers = ds4f_json_int(json, "hip_ordered_wkv_layers", o->hip_ordered_wkv_layers);
+    o->hip_ordered_fp8_layers = ds4f_json_int(json, "hip_ordered_fp8_layers", o->hip_ordered_fp8_layers);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);
     o->mhc = ds4f_json_int(json, "mhc", o->mhc);
@@ -5134,6 +5136,20 @@ static void ds4f_chk(const char *tag, int L, const float *v, int n) {
             L, tag, sqrt(ss), mx, nan, inf);
 }
 
+/* Debug-only prefill trace.  It is intentionally environment-gated so the
+ * production/configuration path remains free of per-layer scans. */
+static int ds4f_prefill_trace_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4F_PREFILL_TRACE"); on = e && atoi(e) != 0; }
+    return on;
+}
+
+static float ds4f_trace_maxabs(const float *v, int n) {
+    float mx = 0.0f;
+    for (int i = 0; i < n; ++i) { float a = fabsf(v[i]); if (a > mx) mx = a; }
+    return mx;
+}
+
 /* ===================== mHC (Hyper-Connections) — exact ===================== */
 static inline float ds4f_sigmoidf(float x){ return 1.0f/(1.0f+expf(-x)); }
 
@@ -6286,6 +6302,14 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         for (int mm = 0; mm < M; mm++) {
             float *x = m->p_x + (size_t)mm*C, *mo = m->p_moe + (size_t)mm*C, *ro = m->p_route + (size_t)mm*C;
             for (int i = 0; i < C; i++) x[i] += (tps ? 0.f : mo[i]) + ro[i];
+        }
+        if (ds4f_prefill_trace_on()) {
+            double sx = 0.0, sk = 0.0;
+            for (int i = 0; i < C; ++i) sx += fabs((double)m->p_x[i]);
+            for (int i = 0; i < KV; ++i) sk += fabs((double)m->p_kvlat[i]);
+            fprintf(stderr, "prefill-trace %s L%d x_l1=%.9g x_max=%.9g kv_l1=%.9g kv_max=%.9g\n",
+                    m->gpu_dense_ctx ? "gpu" : "cpu", L, sx, ds4f_trace_maxabs(m->p_x, C),
+                    sk, ds4f_trace_maxabs(m->p_kvlat, KV));
         }
     }
     /* ---- head: out_norm + lm_head over all M tokens, then per-token argmax ---- */

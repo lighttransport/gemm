@@ -410,6 +410,7 @@ typedef struct ds4f_runtime_options {
     int hip_shared_bf16, hip_shared_bf16_layers;
     int hip_shared_fp16, hip_shared_fp16_layers;
     int hip_ordered_wkv_layers;          /* CPU-compatible FP8 WKV GEMM for prefill prefix */
+    int hip_ordered_fp8_layers;          /* CPU-compatible reduction for all FP8 GEMMs */
     int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
     int debug_env;
 } ds4f_runtime_options;

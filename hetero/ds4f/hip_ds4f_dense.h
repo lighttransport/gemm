@@ -21,6 +21,7 @@ typedef struct hip_ds4f_dense hip_ds4f_dense;
 /* Compile the HIPRTC module for device_id. Returns NULL if HIP/ROCm is not
  * available or compilation/loading fails. */
 hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose);
+hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise_math);
 
 void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx);
 

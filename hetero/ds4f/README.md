@@ -407,6 +407,14 @@ It reduces the first-layer KV rounding error at a small throughput cost, but it
 does not make the full recurrent prompt path mismatch-free; use
 `hip_exact_prefill` when zero mismatches are required.
 
+`"hip_ordered_fp8_layers": N` extends the CPU-compatible reduction to every
+FP8 dense prefill projection in the first `N` layers. Ordered mode compiles the
+HIPRTC module with precise math so the compiler cannot reassociate the ordered
+sum. The validated RDNA4 path reaches 21.27 tok/s at 4k and 20.90 tok/s at 8k,
+with 0/64 argmax mismatches at both contexts. It remains opt-in because the
+ordinary fast reduction is the higher-throughput default for non-deterministic
+workloads.
+
 ## Long-context stability and speculative-decode probe
 
 The real HIP harness now accepts `DS4F_MAXPOS` and can warm a synthetic KV

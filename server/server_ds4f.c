@@ -413,6 +413,8 @@ static int gpu_bind_layer(ds4f_session *s, ds4f_layer *ly, int layer,
          layer < s->options.hip_shared_bf16_layers);
     int ordered_wkv = s->options.hip_ordered_wkv_layers > 0 &&
         layer < s->options.hip_ordered_wkv_layers;
+    int ordered_fp8 = s->options.hip_ordered_fp8_layers > 0 &&
+        layer < s->options.hip_ordered_fp8_layers;
     ds4f_tensor *t[] = {
         &ly->wq_a, &ly->wq_b, &ly->wkv, &ly->wo_a, &ly->wo_b,
         &ly->sh_w1, &ly->sh_w3, &ly->sh_w2, &ly->gate
@@ -426,7 +428,7 @@ static int gpu_bind_layer(ds4f_session *s, ds4f_layer *ly, int layer,
         int shared_bf16 = !shared_fp16 && hot_bf16_layer && i >= 5 &&
                           t[i]->type == DS4F_FP8;
         int id = t[i]->type == DS4F_FP8
-            ? (ordered_wkv && i == 2
+            ? ((ordered_wkv && i == 2) || (ordered_fp8 && !shared_fp16 && !shared_bf16)
                 ? hip_ds4f_dense_bind_fp8_ordered_tensor(s->gpu, t[i])
                 : shared_fp16
                 ? hip_ds4f_dense_bind_fp8_fp16_tensor(s->gpu, t[i])
@@ -452,7 +454,8 @@ static int gpu_attach(ds4f_session *s, char *err, size_t err_cap) {
     }
     int device = s->options.hip_device;
     int verbose = s->options.hip_verbose;
-    s->gpu = hip_ds4f_dense_create(device, verbose);
+    s->gpu = hip_ds4f_dense_create_ex(device, verbose,
+        s->options.hip_ordered_fp8_layers > 0 || s->options.hip_ordered_wkv_layers > 0);
     if (!s->gpu) {
         set_err(err, err_cap, "DS4F_HIP requested but HIPRTC dense-bank initialization failed");
         return -1;

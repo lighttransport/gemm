@@ -109,7 +109,7 @@ static void clear_matrices(hip_ds4f_dense *ctx) {
     ctx->current = -1;
 }
 
-hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
+hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise_math) {
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
         fprintf(stderr, "hip_ds4f_dense: failed to initialize HIP/hipRTC\n");
         return NULL;
@@ -154,9 +154,9 @@ hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
     memcpy(full_src + common_len, hip_ds4f_dense_kernels_src, dense_len);
     full_src[common_len + dense_len] = '}';
     full_src[common_len + dense_len + 1] = '\0';
-    if (hip_compile_kernels(&ctx->module, device_id, full_src,
+    if (hip_compile_kernels_ex(&ctx->module, device_id, full_src,
                             "hip_ds4f_dense.hip", verbose,
-                            "hip_ds4f_dense") < 0 ||
+                            "hip_ds4f_dense", precise_math) < 0 ||
         hipModuleGetFunction(&ctx->matvec, ctx->module,
                              "ds4f_dense_fp8_matvec") != hipSuccess ||
         hipModuleGetFunction(&ctx->bf16_matvec, ctx->module,
@@ -216,6 +216,10 @@ hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
         }
     }
     return ctx;
+}
+
+hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
+    return hip_ds4f_dense_create_ex(device_id, verbose, -1);
 }
 
 void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {

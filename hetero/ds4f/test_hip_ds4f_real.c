@@ -25,6 +25,7 @@ static void usage(const char *prog) {
                     "--hip-shared-bf16 0|1 --hip-shared-bf16-layers n "
                     "--hip-shared-fp16 0|1 --hip-shared-fp16-layers n "
                     "--hip-ordered-wkv-layers n "
+                    "--hip-ordered-fp8-layers n "
                     "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
 }
 
@@ -45,6 +46,10 @@ static int hip_shared_fp16_layer(const ds4f_runtime_options *opt, int layer) {
 static int hip_ordered_wkv_layer(const ds4f_runtime_options *opt, int layer) {
     return opt->hip_ordered_wkv_layers > 0 &&
            layer < opt->hip_ordered_wkv_layers;
+}
+
+static int hip_ordered_fp8_layer(const ds4f_runtime_options *opt, int layer) {
+    return opt->hip_ordered_fp8_layers > 0 && layer < opt->hip_ordered_fp8_layers;
 }
 
 static float max_rel_error(const float *a, const float *b, int n, float *max_abs) {
@@ -413,6 +418,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-shared-fp16") == 0 && i + 1 < argc) opt.hip_shared_fp16 = atoi(argv[++i]);
         else if (strcmp(a, "--hip-shared-fp16-layers") == 0 && i + 1 < argc) opt.hip_shared_fp16_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-ordered-wkv-layers") == 0 && i + 1 < argc) opt.hip_ordered_wkv_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-ordered-fp8-layers") == 0 && i + 1 < argc) opt.hip_ordered_fp8_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
         else if (strcmp(a, "--debug-env") == 0) debug_env = 1;
         else { usage(argv[0]); return 2; }
@@ -443,7 +449,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "real DS4F load failed\n");
         return 1;
     }
-    hip_ds4f_dense *hip = hip_ds4f_dense_create(opt.hip_device, opt.hip_verbose);
+    hip_ds4f_dense *hip = hip_ds4f_dense_create_ex(opt.hip_device, opt.hip_verbose,
+        opt.hip_ordered_fp8_layers > 0 || opt.hip_ordered_wkv_layers > 0);
     if (!hip) {
         printf("SKIP: HIP/hipRTC unavailable\n");
         ds4f_free(m);
@@ -467,11 +474,12 @@ int main(int argc, char **argv) {
             ids[i] = -1;
             continue;
         }
-        int ordered_wkv = i == 2 && hip_ordered_wkv_layer(&opt, 0);
         int shared_fp16 = hip_shared_fp16_layer(&opt, 0) && i >= 5 &&
                           cases[i].t->type == DS4F_FP8;
         int shared_bf16 = !shared_fp16 && hip_shared_bf16_layer(&opt, 0) && i >= 5 &&
                           cases[i].t->type == DS4F_FP8;
+        int ordered_wkv = (i == 2 && hip_ordered_wkv_layer(&opt, 0)) ||
+                          (hip_ordered_fp8_layer(&opt, 0) && !shared_fp16 && !shared_bf16);
         ids[i] = cases[i].t->type == DS4F_BF16
             ? hip_ds4f_dense_bind_bf16_tensor(hip, cases[i].t)
             : ordered_wkv
@@ -498,11 +506,12 @@ int main(int argc, char **argv) {
         };
         for (size_t j = 0; j < sizeof(ts) / sizeof(ts[0]); ++j) {
             if (j == 8 && !hip_shared_bf16_layer(&opt, L)) continue;
-            int ordered_wkv = j == 2 && hip_ordered_wkv_layer(&opt, L);
             int shared_fp16 = hip_shared_fp16_layer(&opt, L) && j >= 5 &&
                               ts[j]->type == DS4F_FP8;
             int shared_bf16 = !shared_fp16 && hip_shared_bf16_layer(&opt, L) && j >= 5 &&
                               ts[j]->type == DS4F_FP8;
+            int ordered_wkv = (j == 2 && hip_ordered_wkv_layer(&opt, L)) ||
+                              (hip_ordered_fp8_layer(&opt, L) && !shared_fp16 && !shared_bf16);
             int id = ts[j]->type == DS4F_BF16
                 ? hip_ds4f_dense_bind_bf16_tensor(hip, ts[j])
                 : ordered_wkv
