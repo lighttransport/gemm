@@ -107,6 +107,7 @@ struct hip_ds4f_dense {
     size_t gemm_x_pack_bytes, gemm_y_pack_bytes;
     void *gemm_multi_dy[HIP_DS4F_GEMM_MAX];
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
+    const ds4f_layer *stream_layer;
 };
 
 static int valid_dims(int rows, int cols) {
@@ -120,6 +121,15 @@ static void clear_matrices(hip_ds4f_dense *ctx) {
     }
     ctx->n_matrices = 0;
     ctx->current = -1;
+    ctx->stream_layer = NULL;
+}
+
+static void release_matrix(hip_ds4f_dense *ctx, int id) {
+    if (!ctx || id < 0 || id >= ctx->n_matrices) return;
+    if (ctx->matrices[id].dw) hipFree(ctx->matrices[id].dw);
+    if (ctx->matrices[id].ds) hipFree(ctx->matrices[id].ds);
+    memset(&ctx->matrices[id], 0, sizeof(ctx->matrices[id]));
+    ctx->matrices[id].kind = -1;
 }
 
 hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise_math) {
@@ -338,7 +348,10 @@ static int hip_ds4f_dense_add_storage(hip_ds4f_dense *ctx,
         hipFree(dw); hipFree(ds);
         return -1;
     }
-    if (ctx->n_matrices == ctx->cap_matrices) {
+    int id = -1;
+    for (int i = 0; i < ctx->n_matrices; ++i)
+        if (!ctx->matrices[i].dw && !ctx->matrices[i].ds) { id = i; break; }
+    if (id < 0 && ctx->n_matrices == ctx->cap_matrices) {
         int cap = ctx->cap_matrices ? ctx->cap_matrices * 2 : 8;
         if (cap < ctx->n_matrices || cap > INT_MAX / (int)sizeof(*ctx->matrices)) {
             hipFree(dw); hipFree(ds);
@@ -355,7 +368,7 @@ static int hip_ds4f_dense_add_storage(hip_ds4f_dense *ctx,
         ctx->matrices = p;
         ctx->cap_matrices = cap;
     }
-    int id = ctx->n_matrices++;
+    if (id < 0) id = ctx->n_matrices++;
     ctx->matrices[id] = (hip_ds4f_matrix){ dw, ds, w, s, rows, cols, scale_cols,
                                            kind };
     ctx->current = id;
@@ -433,6 +446,39 @@ int hip_ds4f_dense_bind_mxfp4_widened_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t
         sc, wb, sb, HIP_DS4F_MATRIX_FP8_ROWSCALE);
     if (id >= 0) t->gpu_id = id;
     return id;
+}
+
+int hip_ds4f_dense_stream_layer(void *opaque, const ds4f_layer *layer) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    if (!ctx || !layer || ctx->pending || ctx->multi_pending) return -1;
+    if (ctx->stream_layer == layer) return 0;
+    if (ctx->stream_layer) {
+        const ds4f_layer *old = ctx->stream_layer;
+        const ds4f_tensor *old_ex[] = { old->ex_w1, old->ex_w2, old->ex_w3 };
+        for (size_t w = 0; w < sizeof(old_ex) / sizeof(old_ex[0]); ++w)
+            if (old_ex[w]) for (int e = 0; e < old->n_owned; ++e) {
+                ds4f_tensor *t = (ds4f_tensor *)&old_ex[w][e];
+                if (t->gpu_id >= 0) { release_matrix(ctx, t->gpu_id); t->gpu_id = -1; }
+            }
+    }
+    ctx->stream_layer = NULL;
+    const ds4f_tensor *ex[] = { layer->ex_w1, layer->ex_w2, layer->ex_w3 };
+    for (size_t w = 0; w < sizeof(ex) / sizeof(ex[0]); ++w) {
+        if (!ex[w]) return -1;
+        for (int e = 0; e < layer->n_owned; ++e) {
+            ds4f_tensor *t = (ds4f_tensor *)&ex[w][e];
+            if (t->type != DS4F_MXFP4 || hip_ds4f_dense_bind_mxfp4_widened_tensor(ctx, t) < 0) {
+                for (size_t rw = 0; rw <= w; ++rw) if (ex[rw])
+                    for (int re = 0; re < layer->n_owned; ++re) {
+                        ds4f_tensor *rt = (ds4f_tensor *)&ex[rw][re];
+                        if (rt->gpu_id >= 0) { release_matrix(ctx, rt->gpu_id); rt->gpu_id = -1; }
+                    }
+                return -1;
+            }
+        }
+    }
+    ctx->stream_layer = layer;
+    return 0;
 }
 
 int hip_ds4f_dense_bind_fp8_ordered_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
@@ -649,7 +695,8 @@ int hip_ds4f_dense_load(hip_ds4f_dense *ctx,
 
 static int matrix_get(const hip_ds4f_dense *ctx, int id,
                       const hip_ds4f_matrix **out) {
-    if (!ctx || id < 0 || id >= ctx->n_matrices || !out) {
+    if (!ctx || id < 0 || id >= ctx->n_matrices || !out ||
+        !ctx->matrices[id].dw) {
         fprintf(stderr, "hip_ds4f_dense: invalid matrix id %d\n", id);
         return -1;
     }

@@ -134,6 +134,10 @@ static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
     m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
+    m->gpu_dense_layer_begin = opt->hip_mxfp4_widen_layers > 0
+        ? hip_ds4f_dense_stream_layer : NULL;
+    m->gpu_dense_stream_prefill_only = opt->hip_mxfp4_widen_layers > 0;
+    if (opt->hip_mxfp4_widen_layers > 0) m->mxfp4_w4a8 = 0;
     int gpu_best = ds4f_forward_token(m, x_gpu, 0);
 
     float x_abs = 0.0f, logits_abs = 0.0f;
@@ -151,6 +155,8 @@ static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_wait = NULL;
     m->gpu_dense_blockdiag = NULL;
     m->gpu_dense_gemm = NULL;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
     m->gpu_dense_gemm_multi = NULL;
     m->gpu_dense_mixed = 0;
     int strict = x_rel <= 3.0e-4f && logits_rel <= 3.0e-4f;
@@ -177,6 +183,10 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
+    m->gpu_dense_layer_begin = opt->hip_mxfp4_widen_layers > 0
+        ? hip_ds4f_dense_stream_layer : NULL;
+    m->gpu_dense_stream_prefill_only = opt->hip_mxfp4_widen_layers > 0;
+    if (opt->hip_mxfp4_widen_layers > 0) m->mxfp4_w4a8 = 0;
 
     if (pos0 < 0) pos0 = 0;
     if (pos0 + iters > m->cfg.max_pos) iters = m->cfg.max_pos - pos0;
@@ -224,6 +234,8 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
     m->gpu_dense_gemm = NULL;
     m->gpu_dense_gemm_multi = NULL;
     m->gpu_dense_mixed = 0;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
     return 1;
 }
 
@@ -576,28 +588,6 @@ int main(int argc, char **argv) {
                     : ds4f_wbytes(ts[j]->type, ts[j]->rows, ts[j]->cols)
                         + ds4f_sbytes(ts[j]->type, ts[j]->rows, ts[j]->cols);
                 bank_matrices++;
-            }
-        }
-    }
-    if (opt.hip_mxfp4_widen_layers > 0) {
-        int nbind = opt.hip_mxfp4_widen_layers < cfg.n_layers
-            ? opt.hip_mxfp4_widen_layers : cfg.n_layers;
-        m->mxfp4_w4a8 = 0; /* widened GPU experts implement exact F32 MXFP4 */
-        for (int L = 0; L < nbind; ++L) {
-            ds4f_layer *z = &m->layers[L];
-            ds4f_tensor *ex[] = { z->ex_w1, z->ex_w2, z->ex_w3 };
-            for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi) {
-                if (!ex[wi]) { pass = 0; continue; }
-                for (int e = 0; e < z->n_owned; ++e) {
-                    ds4f_tensor *et = &ex[wi][e];
-                    int id = hip_ds4f_dense_bind_mxfp4_widened_tensor(hip, et);
-                    if (id < 0) pass = 0;
-                    else {
-                        bank_bytes += (size_t)et->rows * (size_t)et->cols
-                            + (size_t)et->rows * (size_t)((et->cols + 127) / 128);
-                        bank_matrices++;
-                    }
-                }
             }
         }
     }

@@ -255,7 +255,7 @@ static inline size_t ds4f_sbytes(ds4f_qtype t, int rows, int cols) {
 }
 
 /* ===================== layer / model ===================== */
-typedef struct {
+typedef struct ds4f_layer {
     /* norms (BF16) */
     uint16_t *attn_norm, *ffn_norm, *q_norm, *kv_norm;
     /* MLA (FP8) */
@@ -439,6 +439,7 @@ typedef int (*ds4f_gpu_dense_gemm_multi_fn)(
     void *ctx, float *const *dst, const ds4f_tensor *const *t,
     const float *const *x, const int *M, const int *Ystride,
     const int *Xstride, int n);
+typedef int (*ds4f_gpu_dense_layer_fn)(void *ctx, const ds4f_layer *layer);
 
 typedef struct {
     ds4f_config cfg;
@@ -491,6 +492,8 @@ typedef struct {
     ds4f_gpu_dense_blockdiag_fn gpu_dense_blockdiag;
     ds4f_gpu_dense_gemm_fn gpu_dense_gemm;
     ds4f_gpu_dense_gemm_multi_fn gpu_dense_gemm_multi;
+    ds4f_gpu_dense_layer_fn gpu_dense_layer_begin;
+    int gpu_dense_stream_prefill_only;
     int gpu_dense_mixed;       /* opt-in mixed GPU/CPU independent-GEMM dispatch */
     int gpu_exact_prefill;     /* skip GPU M>1 GEMMs; retain GPU M=1 decode */
     /* FP8 dense decode kernel: 0 = gather (LUT, bit-exact), 1 = magic-multiply

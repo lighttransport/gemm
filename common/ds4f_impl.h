@@ -6129,6 +6129,11 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     int tps2 = tps && (m->sh2_rows < C);        /* optional hidden-row shard of sh_w2 */
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
+        if (m->gpu_dense_layer_begin && m->gpu_dense_stream_prefill_only &&
+            m->gpu_dense_layer_begin(m->gpu_dense_ctx, ly) != 0) {
+            fprintf(stderr, "ds4f: GPU layer residency setup failed at layer %d\n", L);
+            abort();
+        }
         int ratio = c->compress_ratios[L];
         const float *rcos = ratio ? m->rope_comp_cos : m->rope_dense_cos;
         const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;
@@ -6364,6 +6369,11 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         memcpy(m->v_x4 + (size_t)k*hcC + (size_t)s*C, X + (size_t)k*C, (size_t)C*4);
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
+        if (m->gpu_dense_layer_begin &&
+            m->gpu_dense_layer_begin(m->gpu_dense_ctx, ly) != 0) {
+            fprintf(stderr, "ds4f: GPU layer residency setup failed at layer %d\n", L);
+            abort();
+        }
         int ratio = c->compress_ratios[L];
         const float *rcos = ratio ? m->rope_comp_cos : m->rope_dense_cos;
         const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;

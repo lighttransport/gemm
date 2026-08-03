@@ -415,10 +415,11 @@ with 0/64 argmax mismatches at both contexts. It remains opt-in because the
 ordinary fast reduction is the higher-throughput default for non-deterministic
 workloads.
 
-`"hip_mxfp4_widen_layers": N` uploads local MXFP4 expert weights for the first
-`N` layers after widening them to an exact row-scale FP8 representation. This
-is intended for RDNA4, which has no native MXFP4 instruction; it is opt-in
-because expert residency increases device memory usage.
+`"hip_mxfp4_widen_layers": N` streams local MXFP4 expert weights for the first
+`N` layers, widening only the active layer to an exact row-scale FP8
+representation. This is intended for RDNA4, which has no native MXFP4
+instruction. Streaming keeps expert residency bounded to one layer and is
+used for batched prefill; decode retains the existing resident dense path.
 
 ## Long-context stability and speculative-decode probe
 

@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 typedef struct ds4f_tensor ds4f_tensor;
+typedef struct ds4f_layer ds4f_layer;
 
 typedef struct hip_ds4f_dense hip_ds4f_dense;
 
@@ -91,6 +92,10 @@ int hip_ds4f_dense_gemm_tensors(
     void *ctx, float *const *dst, const ds4f_tensor *const *t,
     const float *const *x, const int *M, const int *Ystride,
     const int *Xstride, int n);
+
+/* Release the previous layer's streamed expert matrices and upload the
+ * current layer's local MXFP4 experts as exact row-scale FP8. */
+int hip_ds4f_dense_stream_layer(void *ctx, const ds4f_layer *layer);
 
 /* Start up to two independent tensor matvecs on separate streams. The
  * corresponding wait call downloads the outputs passed in dst. */
