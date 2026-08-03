@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -25,6 +26,10 @@
 extern uint8_t *base64_decode_buf(const char *s, size_t in_len, size_t *out_len);
 
 #include "server_llm.h"
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+#include "server_ds4f.h"
+#include "../common/ds4f.h"
+#endif
 
 /* ---- String builder (local copy of server.c's sbuf) ---- */
 typedef struct {
@@ -876,11 +881,32 @@ static int generate_text_stream(llm_state *s, int fd, const char *full_prompt_te
 
 /* ---- Public API ---- */
 
-int llm_init(llm_state *s, const char *model_path, const char *mmproj_path) {
+int llm_init(llm_state *s, const char *model_path, const char *mmproj_path,
+             const ds4f_runtime_options *ds4f_options) {
     memset(s, 0, sizeof(*s));
 
     if (!model_path || !*model_path) return -1;
     snprintf(s->model_path, sizeof(s->model_path), "%s", model_path);
+
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+    if (strncmp(model_path, "ds4f://", 7) == 0) {
+        const char *stage = model_path + 7;
+        char err[512] = {0};
+        s->ds4f = ds4f_session_open_opts(stage, ds4f_options, err, sizeof(err));
+        if (!s->ds4f) {
+            fprintf(stderr, "[llm/ds4f] %s\n", err[0] ? err : "session open failed");
+            return -1;
+        }
+        s->backend = LLM_BACKEND_DS4F;
+        s->n_embd = 4096;
+        s->n_vocab = 129280;
+        s->max_seq_len = 4096;
+        s->eos_id = 1;
+        s->loaded = 1;
+        fprintf(stderr, "[llm/ds4f] native staged session loaded: %s\n", stage);
+        return 0;
+    }
+#endif
 
     /* Load main GGUF model */
     int use_mmap = 1;
@@ -949,6 +975,13 @@ int llm_init(llm_state *s, const char *model_path, const char *mmproj_path) {
 
 void llm_free(llm_state *s) {
     if (!s || !s->loaded) return;
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+    if (s->backend == LLM_BACKEND_DS4F) {
+        ds4f_session_close(s->ds4f);
+        memset(s, 0, sizeof(*s));
+        return;
+    }
+#endif
     if (s->vm) vision_free((vision_model *)s->vm);
     if (s->gguf_mmproj) gguf_close((gguf_context *)s->gguf_mmproj);
     if (s->model) transformer_free((transformer_model *)s->model);
@@ -966,6 +999,35 @@ char *llm_chat_completion(llm_state *s, const json_val *messages,
         if (status) *status = 500;
         return NULL;
     }
+
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+    if (s->backend == LLM_BACKEND_DS4F) {
+        char prompt_err[512] = {0};
+        char *prompt = ds4f_chat_prompt(messages, prompt_err, sizeof(prompt_err));
+        if (!prompt) {
+            if (status) *status = 400;
+            snprintf(err, err_cap, "%s", prompt_err[0] ? prompt_err : "invalid messages");
+            return NULL;
+        }
+        int pt = 0, ct = 0;
+        char *generated = ds4f_session_generate(s->ds4f, prompt, max_tokens,
+                                                  temperature, top_p, seed,
+                                                  &pt, &ct, err, err_cap);
+        ds4f_owned_free(prompt);
+        if (!generated) { if (status) *status = 400; return NULL; }
+        char *ce = json_escape_dup(generated);
+        sbuf resp; sbuf_init(&resp);
+        sbuf_printf(&resp,
+            "{\"id\":\"chatcmpl-ds4f\",\"object\":\"chat.completion\",\"created\":%ld,"
+            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{"
+            "\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+            "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+            (long)time(NULL), s->model_path, ce ? ce : "", pt, ct, pt + ct);
+        free(ce); ds4f_owned_free(generated);
+        if (status) *status = 200;
+        return resp.ptr;
+    }
+#endif
 
     sbuf full_prompt;
     uint8_t *image_rgb = NULL;
@@ -1033,6 +1095,21 @@ int llm_chat_completion_stream(llm_state *s, int fd, const json_val *messages,
         return -1;
     }
 
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+    if (s->backend == LLM_BACKEND_DS4F) {
+        int st = 200;
+        char *body = llm_chat_completion(s, messages, max_tokens, temperature, top_p,
+                                          seed, stop_arr, &st, err, err_cap);
+        if (!body) return -1;
+        char chunk[4096];
+        snprintf(chunk, sizeof(chunk), "data: %s\n\n", body);
+        send(fd, chunk, strlen(chunk), 0);
+        send(fd, "data: [DONE]\n\n", 14, 0);
+        free(body);
+        return 0;
+    }
+#endif
+
     sbuf full_prompt;
     uint8_t *image_rgb = NULL;
     size_t image_len = 0;
@@ -1068,6 +1145,27 @@ char *llm_text_completion(llm_state *s, const char *prompt,
         if (status) *status = 500;
         return NULL;
     }
+
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+    if (s->backend == LLM_BACKEND_DS4F) {
+        int pt = 0, ct = 0;
+        char *generated = ds4f_session_generate(s->ds4f, prompt, max_tokens,
+                                                  temperature, top_p, seed,
+                                                  &pt, &ct, err, err_cap);
+        if (!generated) { if (status) *status = 400; return NULL; }
+        char *ce = json_escape_dup(generated);
+        sbuf resp; sbuf_init(&resp);
+        sbuf_printf(&resp,
+            "{\"id\":\"cmpl-ds4f\",\"object\":\"text_completion\",\"created\":%ld,"
+            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"text\":\"%s\","
+            "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":%d,"
+            "\"completion_tokens\":%d,\"total_tokens\":%d}}",
+            (long)time(NULL), s->model_path, ce ? ce : "", pt, ct, pt + ct);
+        free(ce); ds4f_owned_free(generated);
+        if (status) *status = 200;
+        return resp.ptr;
+    }
+#endif
     if (!prompt || !*prompt) {
         snprintf(err, err_cap, "empty prompt");
         if (status) *status = 400;
@@ -1113,6 +1211,21 @@ int llm_text_completion_stream(llm_state *s, int fd, const char *prompt,
         snprintf(err, err_cap, "model not loaded");
         return -1;
     }
+
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+    if (s->backend == LLM_BACKEND_DS4F) {
+        int st = 200;
+        char *body = llm_text_completion(s, prompt, max_tokens, temperature, top_p,
+                                           seed, stop_arr, &st, err, err_cap);
+        if (!body) return -1;
+        char chunk[4096];
+        snprintf(chunk, sizeof(chunk), "data: %s\n\n", body);
+        send(fd, chunk, strlen(chunk), 0);
+        send(fd, "data: [DONE]\n\n", 14, 0);
+        free(body);
+        return 0;
+    }
+#endif
     if (!prompt || !*prompt) {
         snprintf(err, err_cap, "empty prompt");
         return -1;

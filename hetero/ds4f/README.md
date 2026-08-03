@@ -5,8 +5,13 @@ dense + MXFP4 experts, no requantization). Baseline to beat is llama.cpp on the
 same box: 7.33 tok/s on the full MXFP4 model, 8.57 tok/s on a Q3_K_M requant
 (see `../../../llama.cpp/da4f.md`).
 
-Split: the FP8 dense path (MLA + shared expert, 5.7 GB) is GPU-resident on the
-9070 XT; only the MXFP4 routed experts stay on the CPU.
+Split target: the FP8 dense path (MLA + shared expert, about 5.7 GB) and the
+replicated BF16 vocabulary head are GPU-resident on the 9070 XT; routed
+MXFP4 experts, router, and embedding stay on the CPU.
+The device-bank capacity, full multi-layer model callback, and two-slot
+asynchronous shared-expert path are now validated. The existing CPU runner
+remains CPU-default; the native x86 staged-session adapter in `server/` can
+also attach that HIP bank with the explicit `DS4F_HIP=1` opt-in.
 
 ## Hardware
 
@@ -95,18 +100,18 @@ On the synthetic random-weight smoke test (`--mode verify`) this shows up to
 walk, which is the worst case for activation quantization -- real trained
 weights are far better conditioned. This is the same trade ggml makes for every
 K-quant, and the DS4F A64FX path already has an int8-activation dense mode
-(`DS4F_Q8_PV`). **The real accuracy gate is a model-level logit comparison in
-S1**, and if W4A8 turns out to cost measurable quality, the fallback is to keep
-f32 activations on the `w2` down-projection only (it is 1/3 of the traffic, so
-the cost would be roughly 12.6 -> 11.4 tok/s).
+(`DS4F_Q8_PV`). **The real-token gate now compares exact-f32 and W4A8 model
+logits**, and if W4A8 turns out to cost measurable quality, the fallback is to
+keep f32 activations on the `w2` down-projection only (it is 1/3 of the traffic,
+so the cost would be roughly 12.6 -> 11.4 tok/s).
 
 ### Projection
 
-The GPU dense path is ~5.7 GB at ~640 GB/s = ~10 ms/token, which overlaps the
-80 ms CPU expert time, and the shared expert overlaps too. Adding per-layer
-PCIe sync (~1 ms/token over 86 round trips), sampling and the mHC/router work,
-end-to-end decode should land around **11-12 tok/s** -- against 8.57 tok/s for
-llama.cpp's Q3_K_M, at strictly better quantization quality.
+The GPU dense path plus the BF16 head is 6.741 GB resident and overlaps the CPU
+expert phase. The final safe EP=8 mechanical harness measures **12.40 tok/s**
+short context and **10.53 tok/s** at a warmed 4k position after the cleanup
+(10.33 tok/s on the preceding check); a complete EP=1 run remains the
+quality-valid end-to-end measurement.
 
 ## S1 results — x86 port (2026-08-03)
 
@@ -125,10 +130,15 @@ and runs on x86 without forking it away from the A64FX runners.
   (`common/ds4f_kernels_x86.h`) and scalar twins for six SVE workers
   (compressor/indexer matvecs and scoring).
 - **Arch guards** around the remaining SVE-only code. The mHC SVE paths were
-  already opt-in (`DS4F_HC_SVE`, default 0) with scalar twins. `ds4f_gemm`'s
-  tiled/PV/tile-dequant kernels now fall through to its existing per-token
-  matvec branch off A64FX -- correct, just not batched. Batched prefill
-  attention has no scalar twin and aborts with a pointer to token-at-a-time.
+  already opt-in (`DS4F_HC_SVE`, default 0) with scalar twins. On x86,
+  `ds4f_gemm` now uses the AVX2 row kernels for the supported BF16/FP8/MXFP4
+  prefill types, including two-token BF16/FP8 weight-reuse microkernels and
+  multi-GEMM dispatches that share one pool barrier across independent
+  projections. Routed prefill now stages all local expert assignments in one
+  slab and batches every expert's gate/up, SwiGLU, and down phase. The exact
+  sliding-window prefill attention has an AVX2
+  widen/dot/AXPY worker. Unsupported SVE-only tile formats still fall back to
+  the correct token path.
 - **`ds4f_relax` and `ds4f_pin`** given x86 forms (`pause`; one thread per
   physical core). The ARM `yield` was an assembler-only failure that
   `-fsyntax-only` did not catch.
@@ -241,6 +251,248 @@ is deliberately not optimized here. The FP8 AVX2 kernel uses `vpgatherdd`, which
 is slow on Zen1; if a fast CPU dense path is ever wanted, replace the LUT gather
 with an arithmetic e4m3 decode.
 
+## S2 results — routed-expert batching and shard mapping (2026-08-03)
+
+`DS4F_EXPERT_BATCH` now defaults to 1. The routed path gathers the locally-owned
+top-k experts, runs all w1/w3 projections in one pool dispatch, applies SwiGLU,
+then runs all w2 projections in a second dispatch. `DS4F_EXPERT_BATCH=0` keeps
+the previous per-expert sequence for A/B comparison. The per-expert matvec
+kernels and top-k accumulation order are unchanged.
+
+Full no-copy model, CPU-only, 16 threads, 8 decode tokens:
+
+| Path | experts | total decode |
+|---|---:|---:|
+| legacy (`DS4F_EXPERT_BATCH=0`) | 134.7 ms/tok | 701.8 ms/tok |
+| batched (default) | **107.8 ms/tok** | **675.3 ms/tok** |
+
+Both runs ended at argmax token 128819, with zero major faults. The reduced
+real-weight ep_size=8 run also showed the same argmax and 1.677 -> 1.491 ms/tok
+expert improvement. The full run peaked at 20.0 GiB RSS; load time was 90.5 s
+with batching and 86.5 s in the legacy run, which is normal file-cache noise.
+
+The zero-copy loader now accepts two opt-in mapping experiments:
+`DS4F_BLOB_HUGEPAGE=1` applies `MADV_HUGEPAGE`, and
+`DS4F_BLOB_POPULATE=1` adds `MAP_POPULATE`. On the reduced real model,
+`MADV_HUGEPAGE` made no measurable difference (zero major faults). `MAP_POPULATE`
+was not run interactively because the no-copy mapping spans the full ~166 GB
+virtual shard range; it remains opt-in for a detached/batch measurement.
+
+## S3 results — HIPRTC dense FP8/E8M0 bring-up and integration (2026-08-03)
+
+The first GPU slice is now buildable without a ROCm SDK. It uses the existing
+`rocew` dynamic loader and HIPRTC to compile a one-block-per-row matvec for
+row-major FP8 E4M3FN weights with 128x128 E8M0 scales. The host API uploads a
+matrix once with `hip_ds4f_dense_load()` and reuses the device weights for
+subsequent `hip_ds4f_dense_matvec_loaded()` calls; the convenience API keeps a
+single-call upload path for small tests. A one-in-flight asynchronous API
+(`hip_ds4f_dense_matvec_loaded_async()` / `hip_ds4f_dense_wait()`) owns a stream
+and event so CPU routed-expert work can run while the GPU matvec is pending.
+The two-slot `hip_ds4f_dense_matvec_tensors_async()` /
+`hip_ds4f_dense_wait_tensors()` API launches independent shared-expert matrices
+on separate streams and is used by the model-level overlap gate.
+
+The CPU comparison harness uses a 131x259 matrix, so it exercises partial row
+and column blocks, FP8 zero/subnormal/negative/finite-exp15 codes, and multiple
+E8M0 scales. On the RX 9070 XT (`gfx1201`, ROCm 7.14), it reports
+`max_rel=8.4e-6` and PASS. The loader also accepts `ROCEW_ROCM_LIB` when ROCm
+lives outside the built-in search paths.
+
+```bash
+make -C hetero/ds4f all
+make -C hetero/ds4f hip-test
+make -C hetero/ds4f forward-hip-test
+```
+
+`forward-hip-test` allocates two one-layer synthetic models, binds the eight
+FP8 MLA/shared tensors into the persistent bank, and compares a CPU-default
+forward against the callback-enabled forward. It passed with six synchronous
+GPU calls plus one two-matrix async batch for shared `w1/w3`, matching argmax,
+`x_rel=9.1e-5`, and `logits_rel=3.3e-5`.
+
+The real staged harness now keeps a stable bank ID on each layer-0 tensor and
+does the same forward A/B. With `DS4F_EP_SIZE=8` and one layer, all eight real
+FP8 matvecs passed (`max_rel <= 1.67e-6`), and the hybrid forward matched the
+CPU argmax (`109502`) with `x_rel=6.65e-7` and `logits_rel=5.01e-6`.
+
+The bank holds all eight FP8 dense matrices for all 43 layers (344 matrices,
+**5.682 GB**) plus the replicated flat-BF16 vocabulary head (**345 matrices,
+6.741 GB** total). The staged real harness now binds the complete bank and
+runs a full 43-layer CPU/GPU forward followed by a GPU-attached decode loop.
+The BF16 head A/B gate passes at `max_rel=1.60e-5`; the layer-0 FP8 gates remain
+below `1.67e-6`. The gfx1201 row kernel now defaults to 128 threads (the
+original 256-thread kernel remains selectable with `DS4F_HIP_BLOCK_THREADS`).
+The safe EP=8 mechanical case measures **80.7 ms/token (12.40 tok/s)** at the
+short-context position after the cleanup; the profiled phase split remains
+qkv about 23 ms, attention 0.7 ms, o_proj about 24 ms, shared about 11 ms,
+routed experts about 17 ms, and head about 2.5 ms.
+The local shard is incomplete, so this is an attachment/timing result, not a
+quality result. Across all 43 layers the existing CPU/GPU reduction order
+accumulates `x_rel=0.148` and `logits_rel=0.113`, but the output is finite and
+the greedy argmax remains locked; the harness reports this as cumulative drift
+rather than treating it as a per-kernel failure.
+
+```bash
+./build/test_hip_ds4f_real --stage-dir /tmp/ds4f_nocopy_ep8 \
+  --ep-size 8 --ep-rank 0 --threads 16 --cmgs 1 --max-pos 12288 \
+  --layers 43 --bank-layers 43 --iters 8 --pos0 1 --hip-device 0 --hip-async 1
+```
+
+### S3d — batched GPU prefill GEMM
+
+The prefill path now exposes a `ds4f_gpu_dense_gemm_fn` callback and reuses the
+RDNA4 16x64 tiled GEMM layout for token-major `X[M,K]` to `Y[M,N]` projections.
+FP8/E8M0 weights are dequantized inside the tile; flat BF16 weights use a
+BF16-correct sibling of `rdna4/gemm_tiled_f16_f32` (the existing function is
+FP16-weight, so it cannot be used directly for DS4F BF16). Eligible projection
+pairs/groups are dispatched through the callback, while MXFP4 experts and
+unsupported/view tensors retain the CPU fallback.
+
+The standalone gates cover both types: FP8 `M=19` reaches max relative error
+`2.31e-5`, and BF16 `M=13` reaches `1.91e-6`. On the staged EP=8 real shard,
+one layer with 16 CPU workers measured:
+
+| prefill batch | CPU tok/s | GPU dense tok/s | speedup | argmax mismatches |
+|---:|---:|---:|---:|---:|
+| 16 | ~86 | 353.38 | ~4.1x | 0 |
+| 64 | ~86 | 589.23 | ~6.8x | 0 |
+| 128 | ~86 | 608.81 | ~7.1x | 0 |
+
+The current exact default on the complete staged 43-layer shard measures
+**3.450 tok/s CPU versus 21.388 tok/s hybrid GPU at batch 64 (6.20x)** with
+zero argmax mismatches. The earlier batch-16 checkpoint was 16.050 tok/s;
+batch 128 reaches 22.401 tok/s but currently has 3/128 mismatches and remains
+a tuning result, not the exactness baseline.
+
+The default path uploads 344 FP8 MLA/shared matrices plus the BF16 head;
+routed MXFP4 experts and the router remain CPU-owned. Shared-input GEMM pairs
+upload once, grouped `wo_a` row slices reuse the resident bank, and x86
+attention reuses each BF16 KV row across eight heads. Projection activations
+still cross host memory, so a device-resident activation arena and fused GPU
+attention/norm/MLP are the remaining route toward a full-model 30-tok/s
+prompt-rate result.
+
+There is also an explicit approximate-speed experiment for hot shared weights:
+set `"hip_shared_bf16": 1` (and optionally
+`"hip_shared_bf16_layers": N`) or pass
+`--ds4f-hip-shared-bf16 1 --ds4f-hip-shared-bf16-layers N` to the server.
+This promotes shared `w1/w3/w2` and the router to BF16 GPU matrices and reached
+34.40 tok/s at batch 64, but produced one marginal argmax mismatch. It is not
+the exactness baseline and is disabled by default.
+
+`"hip_shared_fp16": 1` is a separate experiment: it expands only the shared
+FP8 weights to mathematically exact FP16 values and reuses the existing RDNA4
+FP16-weight tile. The one-layer gate passes at 753.55 tok/s with zero
+mismatches; the full 43-layer run reached 33.64 tok/s but accumulated one
+argmax change from the different reduction path. It is therefore also opt-in,
+although its weight conversion itself is exact. The layer cap is
+`"hip_shared_fp16_layers": N`, or pass
+`--ds4f-hip-shared-fp16 1 --ds4f-hip-shared-fp16-layers N` to the server.
+
+## Long-context stability and speculative-decode probe
+
+The real HIP harness now accepts `DS4F_MAXPOS` and can warm a synthetic KV
+prefix before measuring a later position. This reaches a 4k context directly:
+
+```bash
+./build/test_hip_ds4f_real --stage-dir /tmp/ds4f_nocopy_ep8 \
+  --ep-size 8 --ep-rank 0 --threads 16 --cmgs 1 --max-pos 12288 \
+  --layers 43 --bank-layers 43 --iters 8 --pos0 4096 --warm 4096 \
+  --hip-device 0 --hip-async 1
+```
+
+`DS4F_EXPERT_RESIDENT=1` queues readahead for the owned file-backed expert
+shard. `=2` synchronously touches up to 2 GB by default; increase that limit
+with `DS4F_EXPERT_RESIDENT_GB` only when the node has sufficient headroom.
+This avoids requiring a full `MAP_POPULATE` of the 166-GB virtual mapping.
+The exact BF16 attention window now uses AVX2 widen/dot/AXPY helpers on x86;
+the original scalar path remains available with `DS4F_ATTN_SVE=0`. Serial,
+The final serial, uncontended run measures **94.95 ms/token (10.53 tok/s)** at
+position 4096 after the cleanup; the preceding check measured 96.77 ms/token
+(10.33 tok/s), so both remain above the 10 tok/s long-context gate. These
+are EP8 mechanical attachment/timing results, not full-model quality results.
+
+The loader now detects a missing `mtp.0.*` block instead of aborting.
+`make -C hetero/ds4f mtp-test` runs `build/test_ds4f_mtp`, which drafts K
+tokens with the loaded MTP block and checks them against the main model. It
+intentionally claims no speedup yet: verification is sequential, and the MTP
+KV prefix bootstrap/rollback is not complete. The current EP8 mechanical
+manifest has no MTP tensors, so the probe cleanly reports SKIP. No DS4F DFlash
+draft checkpoint or implementation is present; DFlash remains a follow-on
+draft-model integration after MTP is validated.
+
+## Explicit runtime configuration and ownership
+
+AMD/heterogeneous DS4F tools take configuration from command-line arguments or
+the small JSON runtime object. JSON is loaded first and every explicit command-
+line option wins, independent of argument order. For example:
+
+```json
+{
+  "model": "flash",
+  "stage_dir": "/tmp/ds4f_nocopy_ep8",
+  "ep_size": 8,
+  "ep_rank": 0,
+  "threads": 16,
+  "cmgs": 1,
+  "max_pos": 12288,
+  "exact": 1,
+  "hip": 1,
+  "hip_async": 1,
+  "hip_device": 0,
+  "hip_shared_fp16": 0,
+  "hip_shared_fp16_layers": 0
+}
+```
+
+The real GPU harness is then invoked as:
+
+```bash
+./build/test_hip_ds4f_real --config ds4f.json --layers 43 \
+  --bank-layers 43 --iters 8 --pos0 4096 --warm 4096
+```
+
+`test_ds4f_real_tokens` and `test_ds4f_mtp` use the same interface; their
+prompt is supplied with `--prompt-ids`, and MTP uses `--mtp-k N` plus the
+opt-in `--batch-verify`. `--debug-env` is the only compatibility mode that
+reads the old `DS4F_*`/`LLM_THREADS` settings. Low-level profiler, residency,
+and diagnostic switches remain environment-only by design.
+
+Model, session, request, prefill, and harness scratch allocations are owned by
+the mmap-backed `ds4f_mem_pool`. Pool statistics are available through the
+debug-only `DS4F_MEM_STATS=1` switch; normal teardown releases whole mapped
+chunks, so callers do not need raw `malloc/free` ownership rules.
+
+The deterministic prefill gate checks batched versus token-at-a-time argmax
+results and reports throughput:
+
+```bash
+make -C hetero/ds4f prefill-test
+# representative: argmax_mismatch=0, positive batched speedup
+```
+
+The real-staged gate uses the same explicit options. After AVX2 two-token
+weight reuse, multi-GEMM barrier fusion, and routed-expert slab staging, EP8,
+one layer, 16 threads, and batch 16 measure **42.83 tok/s batched versus
+12.67 tok/s token-at-a-time (3.38x)** with `argmax_mismatch=0`; batch 128
+reaches **51.85 tok/s** with zero mismatches. At `pos0=4096`, the same gate
+measures **45.95 tok/s** with zero mismatches. The full 43-layer CPU gate is
+**1.63 tok/s** at batch 16, so the 30 tok/s headline applies to the measured
+one-layer prefill kernel gate, not complete model latency. The test also
+exercises the zero-copy on-disk MXFP4 nibble path.
+
+The explicit resident-BF16 profile (`dense_bf16=1`, `bf16_pv=1` in JSON, or
+the legacy `--debug-env` compatibility path) raises the same one-layer gate
+to **67.73 tok/s** at batch 16 and **86.69 tok/s** at batch 128, with zero
+mismatches; at `pos0=4096` it measures **63.17 tok/s**. It adds about 6 GB of
+resident dense weights, so the default remains on-demand FP8.
+
+```bash
+./build/test_ds4f_prefill_real --stage-dir /tmp/ds4f_nocopy_ep8 \
+  --ep-size 8 --ep-rank 0 --threads 16 --cmgs 1 --max-pos 128 \
+  --layers 1 --batch 16 --iters 1 --pos0 0
+```
+
 ## Files
 
 | | |
@@ -250,6 +502,14 @@ with an arithmetic e4m3 decode.
 | `test_ds4f_kernels.c` | S1 correctness gate: every AVX2 decode kernel vs an independent scalar reference. `make test`. |
 | `../../common/ds4f_matvec_avx2.h` | The AVX2 decode kernels that ship in the model path (S0's winner, productionized). |
 | `../../common/ds4f_kernels_x86.h` | Portable stand-ins for ds4f_impl.h's SVE helper primitives. |
+| `hip_ds4f_dense.{c,h}` | HIPRTC host runner with persistent FP8/E8M0 device-weight loading. |
+| `hip_ds4f_kernels.h` / `test_hip_ds4f_dense.c` | Dense FP8/E8M0 kernel source and CPU comparison harness. |
+| `test_hip_ds4f_real.c` | Real staged-tensor A/B, full multi-layer bank attachment, and hybrid decode timing gate. |
+| `test_hip_ds4f_forward.c` | Synthetic model-level CPU/GPU callback A/B gate. |
+| `test_ds4f_real_tokens.c` | Real-token exact-f32 versus W4A8 teacher-forced logit/argmax gate. |
+| `test_ds4f_mtp.c` | Guarded MTP draft/verification acceptance probe. |
+| `test_ds4f_prefill_real.c` | Real-staged batched-vs-token prefill throughput/parity gate. |
+| `../../server/server_ds4f.{c,h}` | Native x86 staged-session adapter for `server_llm` (seeded sampling, one-slot exact-prefix KV/logit cache). |
 
 ## Reproducing
 
@@ -264,17 +524,80 @@ DS4F_STAGE_DIR=$PWD/stage DS4F_EP_RANK=0 DS4F_EP_SIZE=1 DS4F_NSHARDS=48 \
 # decode (LLM_THREADS=16 -- the A64FX default of 48 oversubscribes this host)
 DS4F_REAL=1 DS4F_EXACT=1 DS4F_STAGE_DIR=$PWD/stage DS4F_EP_RANK=0 DS4F_EP_SIZE=1 \
 LLM_THREADS=16 DS4F_CMGS=1 DS4F_MAXGEN=8 DS4F_PROF=1 ./build/ds4f_runner
+
+# real-token prompt and greedy generation (tokenizer is stdlib-only)
+python3 ../../a64fx/llm/tools/ds4f_tokenizer.py encode \
+  --tokenizer /mnt/disk1/models/ds4f-0731/tokenizer.json \
+  --prompt 'Write a short Python function that adds two numbers.' \
+  --out /tmp/ds4f_prompt_ids.txt
+DS4F_REAL=1 DS4F_EXACT=1 DS4F_PROMPT_IDS=/tmp/ds4f_prompt_ids.txt \
+DS4F_GEN_OUT=/tmp/ds4f_generated_ids.txt DS4F_MAX_NEW=32 \
+DS4F_STAGE_DIR=$PWD/stage DS4F_EP_RANK=0 DS4F_EP_SIZE=1 \
+LLM_THREADS=16 DS4F_CMGS=1 ./build/ds4f_runner
+python3 ../../a64fx/llm/tools/ds4f_tokenizer.py decode \
+  --tokenizer /mnt/disk1/models/ds4f-0731/tokenizer.json \
+  --ids-file /tmp/ds4f_generated_ids.txt
+
+# real-token W4A8 quality gate (EP=8 is mechanical; EP=1 is quality-valid)
+./build/test_ds4f_real_tokens --stage-dir /tmp/ds4f_nocopy_ep8 \
+  --prompt-ids /tmp/ds4f_prompt_ids.txt --ep-size 8 --threads 16 --cmgs 1 \
+  --max-pos 8192
 ```
 
 `DS4F_MXFP4_W4A8=0` selects the exact-f32 expert kernel instead of W4A8.
 
+The native x86 OpenAI server adapter is an opt-in CMake feature. It loads the
+same staged no-copy model, invokes the stdlib-only tokenizer as a child
+process, serves `/v1/completions` and `/v1/chat/completions` with greedy or
+seeded temperature/top-p decoding, and reuses an exact one-slot prompt-prefix
+KV plus logit snapshot. It currently requires replicated embedding/head
+weights and Tier-B1 bf16 KV state.
+
+```bash
+cmake -S ../../server -B /tmp/ds4f-server-build \
+  -DDIFFUSION_SERVER_ENABLE_QWEN_IMAGE=OFF \
+  -DDIFFUSION_SERVER_ENABLE_SAM3=OFF \
+  -DDIFFUSION_SERVER_ENABLE_DS4F_HETERO=ON \
+  -DDIFFUSION_SERVER_ENABLE_DS4F_HIP=ON
+cmake --build /tmp/ds4f-server-build -j
+/tmp/ds4f-server-build/diffusion-server \
+  --ds4f-model /tmp/ds4f_nocopy_ep8 --ds4f-threads 16 \
+  --ds4f-ep-size 8 --ds4f-ep-rank 0 --ds4f-max-pos 8192 \
+  --ds4f-hip 1 --ds4f-hip-async 1 --ds4f-exact 1 --ds4f-mhc 1 \
+  --ds4f-tierb2 0 --ds4f-tp-embed 0 --ds4f-tp-head 0 \
+  --ds4f-config ds4f.json
+```
+
+`--ds4f-hip 1` attaches the persistent RDNA4 dense bank at startup. The server
+then uploads the eight FP8 MLA/shared tensors per layer plus the replicated
+flat-BF16 vocabulary head (345 matrices, about 6.741 GB for the 43-layer
+model), while routed MXFP4 experts, router, and embedding remain on the CPU.
+`--ds4f-hip-async 1` enables the existing two-stream shared-expert launch,
+overlapping that GPU work with CPU routing and experts. Leaving it at zero
+keeps the same native x86 session CPU-only.
+
 ## Next
 
-1. **S2 expert-path tuning**: batch the 774 per-token pool dispatches (S0 used
-   86), and test huge pages / `MAP_POPULATE` on the shard mapping. Closing the
-   24 -> 43 GB/s gap is worth roughly 143 -> 80 ms/token.
-2. **Real accuracy gate for W4A8**: argmax agreement on a synthetic-embedding
-   harness is weak evidence. Needs real token input and a logit comparison
-   against `ref/`.
-3. **S3**: HIP dense offload. 587 of the current 721 ms/token is the FP8 dense
-   path, so this is where the remaining end-to-end win is.
+1. **Long-context endurance run**: repeat the 4k-position harness for at least
+   256 tokens on a quiet host. The final-binary 8-token serial gate passes
+   10.53 tok/s at position 4096; the bounded `DS4F_EXPERT_RESIDENT` policy is
+   available for the longer run.
+2. **Real accuracy gate for W4A8**: the EP=8 real-token gate now reports
+   11/11 argmax matches, worst logit relative error 6.37%, and mean
+   cross-entropy delta -0.00031. Repeat against the complete EP=1 model and a
+   PyTorch/reference token stream before declaring quality.
+3. **S3c follow-up**: repeat the full attachment with the complete EP=1 model
+   for a quality-valid end-to-end measurement; the current CPU-only dense cost
+   is 587 ms/token, while EP=8 is only a mechanical timing case.
+4. **S4a/S4b done**: `DIFFUSION_SERVER_ENABLE_DS4F_HETERO` now adds a native x86
+   staged-safetensors session to `server_llm`; it has stdlib tokenizer handoff,
+   OpenAI text/chat endpoints with seeded sampling, a one-slot exact-prefix
+   KV/logit cache, and an opt-in persistent HIP dense bank. The EP=8 GPU server
+   smoke passed twice through the same process with identical text output.
+   Remaining S4 work is TP-sharded embedding/head state. The A64FX tree still
+   provides the file/socket runner protocol for multi-node deployments.
+5. **MTP/DFlash**: obtain or stage a checkpoint containing `mtp.0.*`, then
+   bootstrap its KV prefix during prompt processing, add safe snapshot/rollback
+   for partial acceptance, and benchmark the existing batched verifier. DFlash
+   needs a separate compatible draft checkpoint; no implementation is present
+   in this tree yet.

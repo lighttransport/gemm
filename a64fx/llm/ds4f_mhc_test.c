@@ -29,9 +29,9 @@ int main(void) {
     m.hc_head_base  = (float *)aligned_alloc(64,  (size_t)HC*4);
     m.hc_head_scale = (float *)aligned_alloc(64,  (size_t)4);
 
-    ds4f_tensor af = { afn, NULL, DS4F_F32, MIX, HD }; ds4f_fill(&m, af);
+    ds4f_tensor af = { afn, NULL, DS4F_F32, MIX, HD, -1 }; ds4f_fill(&m, af);
     ds4f_hc_fill_meta(abase, MIX, ascale, 3, 0);                 /* attn: layer-0 seed */
-    ds4f_tensor hf = { m.hc_head_fn, NULL, DS4F_F32, HC, HD }; ds4f_fill(&m, hf);
+    ds4f_tensor hf = { m.hc_head_fn, NULL, DS4F_F32, HC, HD, -1 }; ds4f_fill(&m, hf);
     ds4f_hc_fill_meta(m.hc_head_base, HC, m.hc_head_scale, 1, 4096);
 
     /* test vectors (identical formulas to ds4f_mhc_ref.py) */

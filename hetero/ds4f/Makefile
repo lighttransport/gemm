@@ -11,8 +11,10 @@ LDFLAGS := -lm -lpthread -ldl
 
 BUILD := build
 
-.PHONY: all clean verify test sve-check
-all: $(BUILD)/bench_expert_bw $(BUILD)/test_ds4f_kernels
+.PHONY: all clean verify test hip-test real-hip-test forward-hip-test real-token-test prefill-test real-prefill-test mtp-test x86-runner sve-check
+all: $(BUILD)/bench_expert_bw $(BUILD)/test_ds4f_kernels $(BUILD)/test_hip_ds4f_dense \
+    $(BUILD)/test_hip_ds4f_real $(BUILD)/test_hip_ds4f_forward $(BUILD)/test_ds4f_real_tokens \
+    $(BUILD)/test_ds4f_prefill $(BUILD)/test_ds4f_prefill_real $(BUILD)/test_ds4f_mtp $(BUILD)/ds4f_runner
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -24,11 +26,76 @@ $(BUILD)/test_ds4f_kernels: test_ds4f_kernels.c ../../common/ds4f_matvec_avx2.h 
                             ../../common/ds4f_impl.h ../../common/ds4f.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCS) -o $@ test_ds4f_kernels.c $(LDFLAGS)
 
+$(BUILD)/test_hip_ds4f_dense: test_hip_ds4f_dense.c hip_ds4f_dense.c \
+                              hip_ds4f_dense.h hip_ds4f_kernels.h \
+                              ../../rdna4/rocew.c ../../rdna4/rocew.h \
+                              ../../rdna4/hip_runner_common.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_hip_ds4f_dense.c hip_ds4f_dense.c \
+		../../rdna4/rocew.c $(LDFLAGS)
+
+$(BUILD)/test_hip_ds4f_real: test_hip_ds4f_real.c hip_ds4f_dense.c \
+                             hip_ds4f_dense.h hip_ds4f_kernels.h \
+                             ../../common/ds4f.h ../../common/ds4f_impl.h \
+                             ../../rdna4/rocew.c ../../rdna4/rocew.h \
+                             ../../rdna4/hip_runner_common.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_hip_ds4f_real.c hip_ds4f_dense.c \
+		../../rdna4/rocew.c $(LDFLAGS)
+
+$(BUILD)/test_hip_ds4f_forward: test_hip_ds4f_forward.c hip_ds4f_dense.c \
+                                hip_ds4f_dense.h hip_ds4f_kernels.h \
+                                ../../common/ds4f.h ../../common/ds4f_impl.h \
+                                ../../rdna4/rocew.c ../../rdna4/rocew.h \
+                                ../../rdna4/hip_runner_common.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_hip_ds4f_forward.c hip_ds4f_dense.c \
+		../../rdna4/rocew.c $(LDFLAGS)
+
+$(BUILD)/test_ds4f_real_tokens: test_ds4f_real_tokens.c \
+                                ../../common/ds4f.h ../../common/ds4f_impl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_ds4f_real_tokens.c $(LDFLAGS)
+
+$(BUILD)/test_ds4f_prefill: test_ds4f_prefill.c \
+                            ../../common/ds4f.h ../../common/ds4f_impl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_ds4f_prefill.c $(LDFLAGS)
+
+$(BUILD)/test_ds4f_prefill_real: test_ds4f_prefill_real.c \
+                                 ../../common/ds4f.h ../../common/ds4f_impl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_ds4f_prefill_real.c $(LDFLAGS)
+
+$(BUILD)/test_ds4f_mtp: test_ds4f_mtp.c ../../common/ds4f.h ../../common/ds4f_impl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_ds4f_mtp.c $(LDFLAGS)
+
+$(BUILD)/ds4f_runner: ../../a64fx/llm/ds4f_runner.c \
+                      ../../common/ds4f.h ../../common/ds4f_impl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -o $@ ../../a64fx/llm/ds4f_runner.c $(LDFLAGS)
+
 verify: $(BUILD)/bench_expert_bw
 	$(BUILD)/bench_expert_bw --mode verify
 
 test: $(BUILD)/test_ds4f_kernels
 	$(BUILD)/test_ds4f_kernels
+
+hip-test: $(BUILD)/test_hip_ds4f_dense
+	$(BUILD)/test_hip_ds4f_dense
+
+real-hip-test: $(BUILD)/test_hip_ds4f_real
+	$(BUILD)/test_hip_ds4f_real
+
+forward-hip-test: $(BUILD)/test_hip_ds4f_forward
+	$(BUILD)/test_hip_ds4f_forward
+
+real-token-test: $(BUILD)/test_ds4f_real_tokens
+	$(BUILD)/test_ds4f_real_tokens
+
+prefill-test: $(BUILD)/test_ds4f_prefill
+	$(BUILD)/test_ds4f_prefill
+
+real-prefill-test: $(BUILD)/test_ds4f_prefill_real
+	$(BUILD)/test_ds4f_prefill_real
+
+mtp-test: $(BUILD)/test_ds4f_mtp
+	$(BUILD)/test_ds4f_mtp
+
+x86-runner: $(BUILD)/ds4f_runner
 
 # The DS4F model headers are shared with the A64FX runners in a64fx/llm. Every
 # change to their SVE guards must keep that build compiling; this checks the

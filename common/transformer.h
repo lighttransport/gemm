@@ -1707,6 +1707,25 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
     const int8_t *base = cache->wi8;
     const int nb_pairs = cache->nb_pairs;
     const float scale_w = cache->scale_w;
+    float x_inv, inv;
+#if defined(__ARM_FEATURE_SVE)
+#else
+    int8_t *xi8 = (int8_t *)aligned_alloc(64, (size_t)((cache->n_cols + 63) & ~63));
+    if (!xi8) return;
+    float xmax = 0.0f;
+    for (int j = 0; j < cache->n_cols; j++) {
+        float a = x[j] < 0.0f ? -x[j] : x[j];
+        if (a > xmax) xmax = a;
+    }
+    x_inv = xmax > 0.0f ? 127.0f / xmax : 1.0f;
+    for (int j = 0; j < cache->n_cols; j++) {
+        int v = (int)lrintf(x[j] * x_inv);
+        if (v < -128) v = -128;
+        if (v > 127) v = 127;
+        xi8[j] = (int8_t)v;
+    }
+    inv = 1.0f / (scale_w * x_inv);
+#endif
 #if defined(__ARM_FEATURE_SVE)
     /* Hoist x quantize: done ONCE per call, not per batch. */
     static int8_t *xi8 = NULL;
@@ -1717,9 +1736,8 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
         xi8 = (int8_t *)aligned_alloc(256, xi8_need);
         xi8_alloc = xi8_need;
     }
-    float x_inv;
     tf_quantize_f32_to_int8(x, xi8, cache->n_cols, &x_inv);
-    const float inv = 1.0f / (scale_w * x_inv);
+    inv = 1.0f / (scale_w * x_inv);
     /* 8-row batches: inlined for minimum overhead. 2x K-unroll:
      * process 2 pairs per iteration using 2 different x vectors
      * to break the SDOT dependency on x. */
@@ -1848,6 +1866,9 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
         }
         dst[i] = (float)s * inv;
     }
+#if !defined(__ARM_FEATURE_SVE)
+    free(xi8);
+#endif
 }
 
 static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,

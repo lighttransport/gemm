@@ -53,6 +53,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <alloca.h>
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 #endif
@@ -224,11 +225,12 @@ static inline ds4f_config ds4f_config_from_env(void) {
  * but NOT rel<1e-3 (int8 rounding ~1e-2); used ONLY for the big hidden-layer
  * dense GEMMs (qkv/o_proj/shared), never the argmax-critical router/lm-head. */
 
-typedef struct {
+typedef struct ds4f_tensor {
     void    *w;       /* weight bytes */
     uint8_t *scale;   /* E8M0 scale bytes (NULL for BF16/F32) */
     ds4f_qtype type;
     int rows, cols;   /* logical [rows, cols] */
+    int gpu_id;       /* optional shared dense-device-bank id; -1 means CPU */
 } ds4f_tensor;
 
 /* bytes of the weight body for a logical [rows,cols] of the given type */
@@ -382,10 +384,62 @@ typedef struct {
 } ds4f_lseq;
 
 typedef struct ds4f_pool ds4f_pool;
+typedef struct ds4f_mem_pool ds4f_mem_pool;
+
+/* Runtime configuration.  The command-line/JSON path fills this structure;
+ * the legacy ds4f_load_real()/ds4f_alloc_synth() wrappers below may still
+ * populate it from the environment for old experiments.  Environment values
+ * are therefore an explicit compatibility/debug path, not the production
+ * configuration interface. */
+typedef struct ds4f_runtime_options {
+    ds4f_config cfg;
+    char stage_dir[1024];
+    char tokenizer[1024];
+    char tokenizer_py[1024];
+    int ep_rank, ep_size;
+    int n_threads, n_cmgs;
+    int dense_bf16, bf16_pv, dense_mxfp4, q8_dense, mxfp4_w4a8;
+    int fp8_magic, mxfp4_gemm_tile;
+    int sparse, mhc, exact, tierb2;
+    int int8_kv, int8_cmp, int4_cmp, cp;
+    int tp_head, tp_shared, tp_shared_full, tp_attn, tp_oproj, tp_embed, tp_wob;
+    int mtp, expert_resident;
+    int int8kv_cal, int8cmp_cal;
+    int zero_copy_experts, load_drop_blob;
+    int use_hip, hip_device, hip_async, hip_verbose;
+    int hip_shared_bf16, hip_shared_bf16_layers;
+    int hip_shared_fp16, hip_shared_fp16_layers;
+    int debug_env;
+} ds4f_runtime_options;
+
+/* Optional S3 dense-device hook.  The common forward path remains CPU-owned;
+ * a backend can attach a persistent FP8 bank and claim only tensors it has
+ * explicitly uploaded.  Returning zero means dst was produced; nonzero asks
+ * the caller to treat the backend invocation as a hard integration failure. */
+typedef int (*ds4f_gpu_dense_matvec_fn)(void *ctx, float *dst,
+                                        const ds4f_tensor *t, const float *x);
+typedef int (*ds4f_gpu_dense_async_multi_fn)(
+    void *ctx, float *const *dst, const ds4f_tensor *const *t,
+    const float *const *x, int n);
+typedef int (*ds4f_gpu_dense_wait_fn)(void *ctx);
+typedef int (*ds4f_gpu_dense_blockdiag_fn)(
+    void *ctx, float *dst, const ds4f_tensor *t, const float *xbase,
+    int gin, int glora, int goff);
+/* Batched prefill GEMM: Y[M,Ystride] = W[rows,cols] * X[M,Xstride]^T,
+ * with token-major host buffers. The backend may use a device GEMM and must
+ * preserve the logical row strides supplied by the caller. */
+typedef int (*ds4f_gpu_dense_gemm_fn)(
+    void *ctx, float *dst, const ds4f_tensor *t, const float *x,
+    int M, int Ystride, int Xstride);
+typedef int (*ds4f_gpu_dense_gemm_multi_fn)(
+    void *ctx, float *const *dst, const ds4f_tensor *const *t,
+    const float *const *x, const int *M, const int *Ystride,
+    const int *Xstride, int n);
 
 typedef struct {
     ds4f_config cfg;
     int ep_rank, ep_size;
+    ds4f_mem_pool *mem;                       /* owns all model-side allocations */
     ds4f_layer *layers;
     /* DS4F_MTP: the multi-token-prediction module (config num_nextn_predict_layers=1, tensors mtp.0.*).
      * A full transformer Block (reuses ds4f_layer: attn + MoE) + the MTP fusion:
@@ -426,11 +480,23 @@ typedef struct {
      * through the BW-bound bf16 kernel ~400 GB/s instead of the gather-bound
      * fp8 kernel ~70 GB/s). Set via DS4F_FP8_BF16=1. Experts stay MXFP4. */
     ds4f_qtype dense_qt;
+    void *gpu_dense_ctx;
+    ds4f_gpu_dense_matvec_fn gpu_dense_matvec;
+    ds4f_gpu_dense_async_multi_fn gpu_dense_async_multi;
+    ds4f_gpu_dense_wait_fn gpu_dense_wait;
+    ds4f_gpu_dense_blockdiag_fn gpu_dense_blockdiag;
+    ds4f_gpu_dense_gemm_fn gpu_dense_gemm;
+    ds4f_gpu_dense_gemm_multi_fn gpu_dense_gemm_multi;
+    int gpu_dense_mixed;       /* opt-in mixed GPU/CPU independent-GEMM dispatch */
     /* FP8 dense decode kernel: 0 = gather (LUT, bit-exact), 1 = magic-multiply
      * (FTZ, ~6 ops/lane, no gather; +2..18% in the HBM-stream decode regime,
      * subnormals flush to 0 -> values ~5e-5 off, fine for the harness). The
      * magic path also enables FTZ on every pool worker. Set via DS4F_FP8_MAGIC=1. */
     int fp8_magic;
+    /* x86 MXFP4 expert activation mode.  Allocators initialize this from
+     * DS4F_MXFP4_W4A8; keeping it per model lets a correctness harness compare
+     * exact-f32 and W4A8 models in one process. */
+    int mxfp4_w4a8;
     /* Zero-copy routed experts: the MXFP4 expert tensors point directly at the
      * mmap'd safetensors shards instead of at repacked arena copies, so their
      * ~147 GB stay clean, evictable, file-backed page cache. Requires kernels
@@ -533,6 +599,10 @@ typedef struct {
     /* scratch (per-forward, single token) */
     float *s_hn, *s_q, *s_qlat, *s_kvlat, *s_attn, *s_oin, *s_o1, *s_o;
     float *s_h2, *s_router, *s_shg, *s_shu, *s_exg, *s_exu, *s_moe, *s_logits;
+    /* S2 routed-expert decode scratch: active experts are evaluated in two
+     * dispatches (all gate/up matvecs, then all down matvecs).  The legacy
+     * serial path continues to use s_exg/s_exu/s_o. */
+    float *s_exb_g, *s_exb_u, *s_exb_o;
     float *s_route;         /* routed-expert partial (owned-only); EP-summed via ar_cb */
     float *s_attn_sc;       /* DS4F_ATTN_GEMM: [n_heads*(window+index_topk)] scores->softmax weights (lazy) */
     float *s_attn_m;             /* DS4F_CP_COMBINE: per-head local max (lazy, [n_heads]) */
@@ -552,8 +622,9 @@ typedef struct {
      * owned shard + ar_cb SUM). When the head is replicated it aliases p_logits. Lazily allocated. */
     float *p_logits_full;
     /* expert-grouping prefill scratch: per owned slot a bucket of routed tokens
-     * (ex_tok[slot*m_tile+p]=token idx, ex_wt=its routed weight); p_exX gathers
-     * those tokens' h2, p_exG/p_exU hold the w1/w3 GEMM out, p_exO the w2 out. */
+     * (ex_tok[slot*m_tile+p]=token idx, ex_wt=its routed weight). The p_ex*
+     * slabs hold all local assignments contiguously so independent experts can
+     * share one gate/up, activation, and down dispatch. */
     int *ex_cnt, *ex_tok; float *ex_wt; float *p_exX, *p_exG, *p_exU, *p_exO; int ex_no;
     /* mHC 4-stream state (only used when m->mhc): x4/resid = [hc_mult*hidden]
      * stream buffers, xc = [hidden] collapsed hc_pre/hc_head output. */

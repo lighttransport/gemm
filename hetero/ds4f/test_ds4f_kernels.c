@@ -36,6 +36,15 @@ static uint32_t rnd(void) { rng_state = rng_state * 1664525u + 1013904223u; retu
 static float rndf(void) { return ((float)(rnd() >> 8) / 8388608.0f) - 1.0f; }
 
 static int g_fail = 0;
+static ds4f_mem_pool *g_mem;
+
+static void *ds4f_test_alloc(size_t size) {
+    return ds4f_mem_alloc(g_mem, size, 64, 0);
+}
+
+static void ds4f_test_free(void *ptr) {
+    (void)ptr; /* the test pool releases all scratch at process teardown */
+}
 
 static void check(const char *name, const float *got, const float *want,
                   int n, float tol) {
@@ -57,8 +66,8 @@ static void check(const char *name, const float *got, const float *want,
 
 /* ---------------- BF16 ---------------- */
 static void test_bf16(void) {
-    uint16_t *w = malloc(sizeof(uint16_t) * 8 * K);
-    float *x = malloc(sizeof(float) * K);
+    uint16_t *w = ds4f_test_alloc(sizeof(uint16_t) * 8 * K);
+    float *x = ds4f_test_alloc(sizeof(float) * K);
     for (int i = 0; i < 8 * K; i++) w[i] = (uint16_t)(rnd() >> 16);
     for (int i = 0; i < K; i++) x[i] = rndf();
 
@@ -74,15 +83,33 @@ static void test_bf16(void) {
         want[r] = (float)a;
     }
     check("matvec_bf16_8row", got, want, 8, 1e-5f);
-    free(w); free(x);
+
+    float *x2 = ds4f_test_alloc(sizeof(float) * K);
+    float got2[8], want2[8];
+    for (int i = 0; i < K; i++) x2[i] = rndf();
+    matvec_bf16_8row_2x(got, got2,
+                        w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
+                        x, x2, K);
+    for (int r = 0; r < 8; r++) {
+        double a = 0.0;
+        for (int i = 0; i < K; i++) {
+            uint32_t b = (uint32_t)w[(size_t)r * K + i] << 16; float f;
+            memcpy(&f, &b, sizeof(f));
+            a += (double)f * x2[i];
+        }
+        want2[r] = (float)a;
+    }
+    check("matvec_bf16_8row_2x token0", got, want, 8, 1e-5f);
+    check("matvec_bf16_8row_2x token1", got2, want2, 8, 1e-5f);
+    ds4f_test_free(w); ds4f_test_free(x); ds4f_test_free(x2);
 }
 
 /* ---------------- BF16_PV ----------------
  * group of 8 rows = 4 pair buffers; pair p holds rows 2p,2p+1 interleaved as
  * [a0,b0,a1,b1,...] over K elements (2K halfwords). */
 static void test_bf16_pv(void) {
-    uint16_t *g = malloc(sizeof(uint16_t) * 8 * K);
-    float *x = malloc(sizeof(float) * K);
+    uint16_t *g = ds4f_test_alloc(sizeof(uint16_t) * 8 * K);
+    float *x = ds4f_test_alloc(sizeof(float) * K);
     for (int i = 0; i < 8 * K; i++) g[i] = (uint16_t)(rnd() >> 16);
     for (int i = 0; i < K; i++) x[i] = rndf();
 
@@ -101,15 +128,15 @@ static void test_bf16_pv(void) {
         }
     }
     check("matvec_bf16_8row_pv", got, want, 8, 1e-5f);
-    free(g); free(x);
+    ds4f_test_free(g); ds4f_test_free(x);
 }
 
 /* ---------------- Q8_PV ----------------
  * K/64 blocks of 528 B: 8 fp16 row scales (16 B) then 8 rows x 64 int8. */
 static void test_q8_pv(void) {
     int nb = K / 64;
-    uint8_t *grp = malloc((size_t)nb * 528);
-    float *x = malloc(sizeof(float) * K);
+    uint8_t *grp = ds4f_test_alloc((size_t)nb * 528);
+    float *x = ds4f_test_alloc(sizeof(float) * K);
     for (int b = 0; b < nb; b++) {
         uint8_t *blk = grp + (size_t)b * 528;
         uint16_t *scl = (uint16_t *)blk;
@@ -119,7 +146,7 @@ static void test_q8_pv(void) {
     }
     for (int i = 0; i < K; i++) x[i] = rndf();
 
-    int8_t *xq = malloc(K); float *xs = malloc(sizeof(float) * nb);
+    int8_t *xq = ds4f_test_alloc(K); float *xs = ds4f_test_alloc(sizeof(float) * nb);
     ds4f_quant_x_sdot_into(x, K, xq, xs);
 
     float got[8], want[8];
@@ -137,15 +164,15 @@ static void test_q8_pv(void) {
         want[r] = (float)a;
     }
     check("matvec_sdot_8row (Q8_PV)", got, want, 8, 1e-5f);
-    free(grp); free(x); free(xq); free(xs);
+    ds4f_test_free(grp); ds4f_test_free(x); ds4f_test_free(xq); ds4f_test_free(xs);
 }
 
 /* ---------------- FP8 E4M3 ---------------- */
 static void test_fp8(void) {
-    uint8_t *w = malloc((size_t)8 * K);
-    float *x = malloc(sizeof(float) * K);
+    uint8_t *w = ds4f_test_alloc((size_t)8 * K);
+    float *x = ds4f_test_alloc(sizeof(float) * K);
     int sbc = (K + 127) / 128;
-    uint8_t *es = malloc(sbc);
+    uint8_t *es = ds4f_test_alloc(sbc);
     uint32_t lut[256];
     ds4f_init_fp8_e4m3fn_lut(lut);
     for (size_t i = 0; i < (size_t)8 * K; i++) w[i] = (uint8_t)(rnd() >> 24);
@@ -165,7 +192,26 @@ static void test_fp8(void) {
         want[r] = (float)a;
     }
     check("matvec_fp8e4m3_8row", got, want, 8, 1e-5f);
-    free(w); free(x); free(es);
+
+    float *x2 = ds4f_test_alloc(sizeof(float) * K);
+    float got2[8], want2[8];
+    for (int i = 0; i < K; i++) x2[i] = rndf();
+    matvec_fp8e4m3_8row_2x(got, got2,
+                           w, w+K, w+2*K, w+3*K, w+4*K, w+5*K, w+6*K, w+7*K,
+                           es, lut, x, x2, K);
+    for (int r = 0; r < 8; r++) {
+        double a = 0.0;
+        for (int c = 0; c < K; c++) {
+            float wf; uint32_t bits = lut[w[(size_t)r * K + c]];
+            memcpy(&wf, &bits, sizeof(wf));
+            a += (double)wf * ggml_e8m0_to_fp32(es[c >> 7]) * x2[c];
+        }
+        want2[r] = (float)a;
+    }
+    check("matvec_fp8e4m3_8row_2x token0", got, want, 8, 1e-5f);
+    check("matvec_fp8e4m3_8row_2x token1", got2, want2, 8, 1e-5f);
+    ds4f_test_free(w); ds4f_test_free(x); ds4f_test_free(es);
+    ds4f_test_free(x2);
 }
 
 /* ---------------- MXFP4 ---------------- */
@@ -173,8 +219,8 @@ static void test_mxfp4(void) {
     static const float kv[16] = { 0.f,1.f,2.f,3.f,4.f,6.f,8.f,12.f,
                                   0.f,-1.f,-2.f,-3.f,-4.f,-6.f,-8.f,-12.f };
     size_t rw = K / 2, rs = K / 32;
-    uint8_t *w = malloc(8 * rw), *s = malloc(8 * rs);
-    float *x = malloc(sizeof(float) * K);
+    uint8_t *w = ds4f_test_alloc(8 * rw), *s = ds4f_test_alloc(8 * rs);
+    float *x = ds4f_test_alloc(sizeof(float) * K);
     for (size_t i = 0; i < 8 * rw; i++) w[i] = (uint8_t)(rnd() >> 24);
     for (size_t i = 0; i < 8 * rs; i++) s[i] = (uint8_t)(120 + (rnd() % 12));
     for (int i = 0; i < K; i++) x[i] = rndf();
@@ -204,25 +250,26 @@ static void test_mxfp4(void) {
      * true dot a random walk, the worst case for activation quantization, so
      * this bound is deliberately loose -- the meaningful gate is the model-level
      * logit comparison, not this. */
-    int8_t *xq = malloc(K);
-    float *xs = malloc(sizeof(float) * (K / 32)), *xc = malloc(sizeof(float) * (K / 32));
+    int8_t *xq = ds4f_test_alloc(K);
+    float *xs = ds4f_test_alloc(sizeof(float) * (K / 32)),
+          *xc = ds4f_test_alloc(sizeof(float) * (K / 32));
     ds4f_mxfp4_quant_act(x, K, xq, xs, xc);
     for (int r = 0; r < 8; r++)
         matvec_mxfp4_1row_i8(got + r, w + (size_t)r * rw, s + (size_t)r * rs, xq, xs, xc, K);
     check("matvec_mxfp4_1row_i8 (W4A8)", got, want, 8, 5e-2f);
 
-    free(xq); free(xs); free(xc);
+    ds4f_test_free(xq); ds4f_test_free(xs); ds4f_test_free(xc);
 
     /* ---- RAW on-disk layout (zero-copy experts) ----
      * Build the on-disk bytes, apply ds4f_copy_worker's exact repack to get the
      * arena form, and require the raw kernels on the on-disk bytes to agree with
      * the repacked kernels on the repacked bytes. This is the gate that lets
      * expert tensors point straight into the mapped safetensors shards. */
-    uint8_t *wraw = malloc(8 * rw), *sraw = malloc(8 * rs);
+    uint8_t *wraw = ds4f_test_alloc(8 * rw), *sraw = ds4f_test_alloc(8 * rs);
     for (size_t i = 0; i < 8 * rw; i++) wraw[i] = (uint8_t)(rnd() >> 24);
     for (size_t i = 0; i < 8 * rs; i++) sraw[i] = (uint8_t)(120 + (rnd() % 12));
 
-    uint8_t *wrp = malloc(8 * rw), *srp = malloc(8 * rs);
+    uint8_t *wrp = ds4f_test_alloc(8 * rw), *srp = ds4f_test_alloc(8 * rs);
     for (int r = 0; r < 8; r++) {
         const uint8_t *sw = wraw + (size_t)r * rw; uint8_t *dw = wrp + (size_t)r * rw;
         for (size_t b = 0; b < rw / 16; b++) {
@@ -241,25 +288,32 @@ static void test_mxfp4(void) {
     for (int r = 0; r < 8; r++)
         matvec_mxfp4_1row(ref + r, wrp + (size_t)r * rw, srp + (size_t)r * rs, x, K);
 
-    float *xp = malloc(sizeof(float) * K);
+    float *xp = ds4f_test_alloc(sizeof(float) * K);
     ds4f_mxfp4_perm_act_f32(x, K, xp);
     for (int r = 0; r < 8; r++)
         matvec_mxfp4_1row_f32_raw(got + r, wraw + (size_t)r * rw, sraw + (size_t)r * rs, xp, K);
     check("mxfp4 raw f32 == repacked", got, ref, 8, 1e-6f);
 
-    int8_t *rq = malloc(K);
-    float *rsq = malloc(sizeof(float) * (K / 32)), *rcq = malloc(sizeof(float) * (K / 32));
+    int8_t *rq = ds4f_test_alloc(K);
+    float *rsq = ds4f_test_alloc(sizeof(float) * (K / 32)),
+          *rcq = ds4f_test_alloc(sizeof(float) * (K / 32));
     ds4f_mxfp4_quant_act_raw(x, K, rq, rsq, rcq);
     for (int r = 0; r < 8; r++)
         matvec_mxfp4_1row_i8_raw(got + r, wraw + (size_t)r * rw, sraw + (size_t)r * rs,
                                  rq, rsq, rcq, K);
     check("mxfp4 raw W4A8 vs repacked", got, ref, 8, 5e-2f);
 
-    free(wraw); free(sraw); free(wrp); free(srp); free(xp); free(rq); free(rsq); free(rcq);
-    free(w); free(s); free(x);
+    ds4f_test_free(wraw); ds4f_test_free(sraw); ds4f_test_free(wrp); ds4f_test_free(srp);
+    ds4f_test_free(xp); ds4f_test_free(rq); ds4f_test_free(rsq); ds4f_test_free(rcq);
+    ds4f_test_free(w); ds4f_test_free(s); ds4f_test_free(x);
 }
 
 int main(void) {
+    g_mem = ds4f_mem_pool_create();
+    if (!g_mem) {
+        fprintf(stderr, "DS4F test: memory pool creation failed\n");
+        return 1;
+    }
     printf("DS4F AVX2 decode kernels vs scalar reference (K=%d)\n\n", K);
     test_bf16();
     test_bf16_pv();
@@ -267,5 +321,6 @@ int main(void) {
     test_fp8();
     test_mxfp4();
     printf("\n%s\n", g_fail ? "FAIL" : "ALL PASS");
+    ds4f_mem_pool_destroy(g_mem);
     return g_fail;
 }

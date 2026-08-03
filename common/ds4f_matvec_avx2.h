@@ -24,6 +24,7 @@
 #define DS4F_MATVEC_AVX2_H
 
 #if defined(__AVX2__) && defined(__FMA__)
+#include <math.h>
 #include <immintrin.h>
 #include <stdint.h>
 
@@ -55,6 +56,104 @@ static inline __m256 ds4f_avx2_bf16x8(const uint16_t *p) {
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
 }
 
+/* Attention uses the same BF16 latent layout as the dense matvecs, but only
+ * needs one dot/AXPY at a time. Keeping these helpers beside the existing
+ * BF16 widening primitive removes the scalar per-element decode from the
+ * long-context window path. */
+static inline float ds4f_avx2_dot_bf16(const float *x, const uint16_t *k, int n) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i),
+                             ds4f_avx2_bf16x8(k + i), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i + 8),
+                             ds4f_avx2_bf16x8(k + i + 8), a1);
+    }
+    for (; i + 7 < n; i += 8)
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i),
+                             ds4f_avx2_bf16x8(k + i), a0);
+    float sum = ds4f_avx2_hsum(_mm256_add_ps(a0, a1));
+    for (; i < n; ++i) {
+        uint32_t bits = (uint32_t)k[i] << 16;
+        float v;
+        memcpy(&v, &bits, sizeof(v));
+        sum += x[i] * v;
+    }
+    return sum;
+}
+
+static inline void ds4f_avx2_axpy_bf16(float *out, const uint16_t *k,
+                                       float weight, int n) {
+    __m256 w = _mm256_set1_ps(weight);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 y = _mm256_loadu_ps(out + i);
+        y = _mm256_fmadd_ps(ds4f_avx2_bf16x8(k + i), w, y);
+        _mm256_storeu_ps(out + i, y);
+    }
+    for (; i < n; ++i) {
+        uint32_t bits = (uint32_t)k[i] << 16;
+        float v;
+        memcpy(&v, &bits, sizeof(v));
+        out[i] += weight * v;
+    }
+}
+
+/* Prefill attention variant: score/accumulate eight heads while widening each
+ * BF16 KV element only once. The query and output streams remain independent,
+ * but the latent KV row is shared across the head block. */
+static inline void ds4f_avx2_score8_bf16(float s[8], const float *q, int qs,
+                                          const uint16_t *k, int n) {
+    __m256 a0[8], a1[8];
+    for (int h = 0; h < 8; ++h) {
+        a0[h] = _mm256_setzero_ps();
+        a1[h] = _mm256_setzero_ps();
+    }
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m256 kv0 = ds4f_avx2_bf16x8(k + i);
+        __m256 kv1 = ds4f_avx2_bf16x8(k + i + 8);
+        for (int h = 0; h < 8; ++h) {
+            const float *qh = q + (size_t)h * qs;
+            a0[h] = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i), kv0, a0[h]);
+            a1[h] = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i + 8), kv1, a1[h]);
+        }
+    }
+    for (; i + 7 < n; i += 8) {
+        __m256 kv = ds4f_avx2_bf16x8(k + i);
+        for (int h = 0; h < 8; ++h)
+            a0[h] = _mm256_fmadd_ps(_mm256_loadu_ps(q + (size_t)h * qs + i), kv, a0[h]);
+    }
+    for (int h = 0; h < 8; ++h) {
+        s[h] = ds4f_avx2_hsum(_mm256_add_ps(a0[h], a1[h]));
+        for (int j = i; j < n; ++j) {
+            uint32_t bits = (uint32_t)k[j] << 16;
+            float v; memcpy(&v, &bits, sizeof(v));
+            s[h] += q[(size_t)h * qs + j] * v;
+        }
+    }
+}
+
+static inline void ds4f_avx2_axpy8_bf16(float *out, int os,
+                                        const uint16_t *k, const float w[8], int n) {
+    __m256 ww[8];
+    for (int h = 0; h < 8; ++h) ww[h] = _mm256_set1_ps(w[h]);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 kv = ds4f_avx2_bf16x8(k + i);
+        for (int h = 0; h < 8; ++h) {
+            float *o = out + (size_t)h * os + i;
+            _mm256_storeu_ps(o, _mm256_fmadd_ps(kv, ww[h], _mm256_loadu_ps(o)));
+        }
+    }
+    for (; i < n; ++i) {
+        uint32_t bits = (uint32_t)k[i] << 16;
+        float v; memcpy(&v, &bits, sizeof(v));
+        for (int h = 0; h < 8; ++h)
+            out[(size_t)h * os + i] += v * w[h];
+    }
+}
+
 /* ---------------- BF16, row-major ---------------- */
 static inline void matvec_bf16_8row(float *dst,
         const uint16_t *w0, const uint16_t *w1, const uint16_t *w2, const uint16_t *w3,
@@ -78,6 +177,45 @@ static inline void matvec_bf16_8row(float *dst,
             acc += f * x[i];
         }
         dst[r] = acc;
+    }
+}
+
+/* Two-token BF16 GEMM microkernel.  Prefill walks an 8-row weight group across
+ * several token vectors; loading each BF16 weight once for two tokens removes
+ * the dominant weight-stream duplication without changing either token's
+ * reduction order. */
+static inline void matvec_bf16_8row_2x(
+        float *dst0, float *dst1,
+        const uint16_t *w0, const uint16_t *w1, const uint16_t *w2, const uint16_t *w3,
+        const uint16_t *w4, const uint16_t *w5, const uint16_t *w6, const uint16_t *w7,
+        const float *x0, const float *x1, int n) {
+    const uint16_t *w[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };
+    for (int r = 0; r < 8; r++) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+        const uint16_t *wr = w[r];
+        int i = 0;
+        for (; i + 15 < n; i += 16) {
+            __m256 wv0 = ds4f_avx2_bf16x8(wr + i);
+            __m256 wv1 = ds4f_avx2_bf16x8(wr + i + 8);
+            a0 = _mm256_fmadd_ps(wv0, _mm256_loadu_ps(x0 + i), a0);
+            a1 = _mm256_fmadd_ps(wv1, _mm256_loadu_ps(x0 + i + 8), a1);
+            b0 = _mm256_fmadd_ps(wv0, _mm256_loadu_ps(x1 + i), b0);
+            b1 = _mm256_fmadd_ps(wv1, _mm256_loadu_ps(x1 + i + 8), b1);
+        }
+        for (; i + 7 < n; i += 8) {
+            __m256 wv = ds4f_avx2_bf16x8(wr + i);
+            a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + i), a0);
+            b0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x1 + i), b0);
+        }
+        dst0[r] = ds4f_avx2_hsum(_mm256_add_ps(a0, a1));
+        dst1[r] = ds4f_avx2_hsum(_mm256_add_ps(b0, b1));
+        for (; i < n; i++) {
+            uint32_t bits = (uint32_t)wr[i] << 16; float f;
+            memcpy(&f, &bits, sizeof(f));
+            dst0[r] += f * x0[i];
+            dst1[r] += f * x1[i];
+        }
     }
 }
 
@@ -165,6 +303,38 @@ static inline void matvec_fp8e4m3_8row(float *dst,
             a0 = _mm256_fmadd_ps(blk, vs, a0);
         }
         dst[r] = ds4f_avx2_hsum(a0);
+    }
+}
+
+/* Two-token FP8 GEMM microkernel.  The FP8 LUT gather is shared by the two
+ * activation vectors; this is particularly effective for the large BF16 head
+ * and FP8 o-projections during batched prefill. */
+static inline void matvec_fp8e4m3_8row_2x(
+        float *dst0, float *dst1,
+        const uint8_t *w0, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
+        const uint8_t *w4, const uint8_t *w5, const uint8_t *w6, const uint8_t *w7,
+        const uint8_t *escale, const uint32_t *lut,
+        const float *x0, const float *x1, int K) {
+    const uint8_t *w[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };
+    for (int r = 0; r < 8; r++) {
+        const uint8_t *wr = w[r];
+        __m256 a0 = _mm256_setzero_ps(), b0 = _mm256_setzero_ps();
+        for (int c0 = 0; c0 < K; c0 += 128) {
+            __m256 vs = _mm256_set1_ps(ggml_e8m0_to_fp32(escale[c0 >> 7]));
+            __m256 blk0 = _mm256_setzero_ps(), blk1 = _mm256_setzero_ps();
+            for (int c = c0; c < c0 + 128; c += 8) {
+                __m256i idx = _mm256_cvtepu8_epi32(
+                    _mm_loadl_epi64((const __m128i *)(wr + c)));
+                __m256 wv = _mm256_castsi256_ps(
+                    _mm256_i32gather_epi32((const int *)lut, idx, 4));
+                blk0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + c), blk0);
+                blk1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x1 + c), blk1);
+            }
+            a0 = _mm256_fmadd_ps(blk0, vs, a0);
+            b0 = _mm256_fmadd_ps(blk1, vs, b0);
+        }
+        dst0[r] = ds4f_avx2_hsum(a0);
+        dst1[r] = ds4f_avx2_hsum(b0);
     }
 }
 

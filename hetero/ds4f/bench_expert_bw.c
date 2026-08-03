@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include "mxfp4_avx2.h"
+#include "../../common/ds4f.h"
 
 static int g_f32seq = 0;   /* --f32seq: exact f32 activation, sequential rows */
 #define MV_F32(...) (g_f32seq ? ds4f_matvec_mxfp4_8row_f32seq(__VA_ARGS__) \
@@ -86,6 +87,7 @@ static double now_s(void) {
 typedef void (*pool_fn)(void *arg, int tid, int nthr);
 
 typedef struct {
+    ds4f_mem_pool *mem;
     int nthr;
     pthread_t *th;
     _Atomic int seq;                 /* incremented to release a job */
@@ -126,12 +128,30 @@ static void *pool_worker(void *v) {
 }
 
 static pool_t *pool_start(int nthr) {
-    pool_t *p = calloc(1, sizeof(*p));
+    ds4f_mem_pool *mem = ds4f_mem_pool_create();
+    if (!mem) return NULL;
+    pool_t *p = ds4f_mem_calloc(mem, 1, sizeof(*p), 64);
+    if (!p) {
+        ds4f_mem_pool_destroy(mem);
+        return NULL;
+    }
+    p->mem = mem;
     p->nthr = nthr;
-    p->th = calloc(nthr, sizeof(pthread_t));
+    p->th = ds4f_mem_calloc(mem, (size_t)nthr, sizeof(pthread_t), 64);
+    if (!p->th) {
+        ds4f_mem_pool_destroy(mem);
+        return NULL;
+    }
     atomic_store(&p->seq, 0); atomic_store(&p->done, 0); atomic_store(&p->stop, 0);
     for (int i = 1; i < nthr; i++) {
-        worker_arg *wa = malloc(sizeof(*wa));
+        worker_arg *wa = ds4f_mem_alloc(mem, sizeof(*wa), 64, 0);
+        if (!wa) {
+            atomic_store_explicit(&p->stop, 1, memory_order_release);
+            atomic_fetch_add_explicit(&p->seq, 1, memory_order_release);
+            for (int j = 1; j < i; ++j) pthread_join(p->th[j], NULL);
+            ds4f_mem_pool_destroy(mem);
+            return NULL;
+        }
         wa->p = p; wa->tid = i;
         pthread_create(&p->th[i], NULL, pool_worker, wa);
     }
@@ -152,7 +172,7 @@ static void pool_stop(pool_t *p) {
     atomic_store_explicit(&p->stop, 1, memory_order_release);
     atomic_fetch_add_explicit(&p->seq, 1, memory_order_release);
     for (int i = 1; i < p->nthr; i++) pthread_join(p->th[i], NULL);
-    free(p->th); free(p);
+    ds4f_mem_pool_destroy(p->mem);
 }
 
 /* ---------------- jobs ---------------- */
@@ -269,9 +289,11 @@ static void job_triad(void *arg, int tid, int nthr) {
 /* ---------------- verify ---------------- */
 static int run_verify(void) {
     const int K = 4096;
-    uint8_t *w = malloc((size_t)8 * K / 2);
-    uint8_t *s = malloc((size_t)8 * K / 32);
-    float *x = malloc(sizeof(float) * K);
+    ds4f_mem_pool *mem = ds4f_mem_pool_create();
+    if (!mem) return 1;
+    uint8_t *w = ds4f_mem_alloc(mem, (size_t)8 * K / 2, 64, 0);
+    uint8_t *s = ds4f_mem_alloc(mem, (size_t)8 * K / 32, 64, 0);
+    float *x = ds4f_mem_alloc(mem, sizeof(float) * K, 64, 0);
     uint32_t st = 12345;
     #define RND() (st = st * 1664525u + 1013904223u)
     for (size_t i = 0; i < (size_t)8 * K / 2; i++) w[i] = (uint8_t)(RND() >> 24);
@@ -296,8 +318,9 @@ static int run_verify(void) {
     }
     /* W4A8 path: activation is int8-quantized per 32-block, so this is checked
      * against the same f32 reference on RELATIVE error, not bit equality. */
-    int8_t *xq = malloc(K);
-    float *xs = malloc(sizeof(float) * K / 32), *xc = malloc(sizeof(float) * K / 32);
+    int8_t *xq = ds4f_mem_alloc(mem, K, 64, 0);
+    float *xs = ds4f_mem_alloc(mem, sizeof(float) * K / 32, 64, 0);
+    float *xc = ds4f_mem_alloc(mem, sizeof(float) * K / 32, 64, 0);
     QUANT_I8(x, K, xq, xs, xc);
     float gi8[8];
     MV_I8(gi8, w, w+rw, w+2*rw, w+3*rw, w+4*rw, w+5*rw, w+6*rw, w+7*rw,
@@ -319,8 +342,7 @@ static int run_verify(void) {
     }
     printf("  max rel %.3e %s\n", relmax, relmax <= 3e-2f ? "ok" : "FAIL");
     if (relmax > 3e-2f) bad = 1;
-    free(xq); free(xs); free(xc);
-    free(w); free(s); free(x);
+    ds4f_mem_pool_destroy(mem);
     printf("verify: %s\n", bad ? "FAIL" : "PASS");
     return bad;
 }
@@ -354,11 +376,17 @@ int main(int argc, char **argv) {
            mode, gib, nthr, tokens);
 
     pool_t *pool = pool_start(nthr);
+    if (!pool) {
+        fprintf(stderr, "pool allocation failed\n");
+        return 1;
+    }
 
     if (!strcmp(mode, "triad")) {
         size_t n = (size_t)(gib * (1u << 30) / (3 * sizeof(float)));
         triad_job t = { NULL, NULL, NULL, n };
-        t.a = aligned_alloc(64, n * 4); t.b = aligned_alloc(64, n * 4); t.c = aligned_alloc(64, n * 4);
+        t.a = ds4f_mem_alloc(pool->mem, n * 4, 64, 0);
+        t.b = ds4f_mem_alloc(pool->mem, n * 4, 64, 0);
+        t.c = ds4f_mem_alloc(pool->mem, n * 4, 64, 0);
         if (!t.a || !t.b || !t.c) { fprintf(stderr, "alloc failed\n"); return 1; }
         for (size_t i = 0; i < n; i++) { t.b[i] = 1.f; t.c[i] = 2.f; t.a[i] = 0.f; }
         pool_run(pool, job_triad, &t);                      /* warm */
@@ -393,23 +421,23 @@ int main(int argc, char **argv) {
     }
     printf("filled in %.1f s\n\n", now_s() - tf);
 
-    float *x = aligned_alloc(64, HIDDEN * sizeof(float));
+    float *x = ds4f_mem_alloc(pool->mem, HIDDEN * sizeof(float), 64, 0);
     for (int i = 0; i < HIDDEN; i++) x[i] = 0.01f * ((i % 17) - 8);
     moe_job job;
     memset(&job, 0, sizeof(job));
     job.n_expert = N_ACTIVE;
     job.x = x;
-    job.g = aligned_alloc(64, (size_t)N_ACTIVE * MOE_INTER * sizeof(float));
-    job.u = aligned_alloc(64, (size_t)N_ACTIVE * MOE_INTER * sizeof(float));
-    job.y = aligned_alloc(64, (size_t)N_ACTIVE * HIDDEN * sizeof(float));
+    job.g = ds4f_mem_alloc(pool->mem, (size_t)N_ACTIVE * MOE_INTER * sizeof(float), 64, 0);
+    job.u = ds4f_mem_alloc(pool->mem, (size_t)N_ACTIVE * MOE_INTER * sizeof(float), 64, 0);
+    job.y = ds4f_mem_alloc(pool->mem, (size_t)N_ACTIVE * HIDDEN * sizeof(float), 64, 0);
     job.use_i8 = use_i8;
     const size_t nb1 = HIDDEN / 32, nb2 = MOE_INTER / 32;
-    job.xq = aligned_alloc(64, HIDDEN);
-    job.xs = aligned_alloc(64, nb1 * sizeof(float));
-    job.xc = aligned_alloc(64, nb1 * sizeof(float));
-    job.gq = aligned_alloc(64, (size_t)N_ACTIVE * MOE_INTER);
-    job.gs = aligned_alloc(64, (size_t)N_ACTIVE * nb2 * sizeof(float));
-    job.gc = aligned_alloc(64, (size_t)N_ACTIVE * nb2 * sizeof(float));
+    job.xq = ds4f_mem_alloc(pool->mem, HIDDEN, 64, 0);
+    job.xs = ds4f_mem_alloc(pool->mem, nb1 * sizeof(float), 64, 0);
+    job.xc = ds4f_mem_alloc(pool->mem, nb1 * sizeof(float), 64, 0);
+    job.gq = ds4f_mem_alloc(pool->mem, (size_t)N_ACTIVE * MOE_INTER, 64, 0);
+    job.gs = ds4f_mem_alloc(pool->mem, (size_t)N_ACTIVE * nb2 * sizeof(float), 64, 0);
+    job.gc = ds4f_mem_alloc(pool->mem, (size_t)N_ACTIVE * nb2 * sizeof(float), 64, 0);
     if (use_i8) QUANT_I8(x, HIDDEN, job.xq, job.xs, job.xc);
 
     int stream = !strcmp(mode, "stream");
