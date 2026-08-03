@@ -2968,6 +2968,7 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_SHARED_BF16_LAYERS"); o.hip_shared_bf16_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_SHARED_FP16"); o.hip_shared_fp16 = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_SHARED_FP16_LAYERS"); o.hip_shared_fp16_layers = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_ORDERED_WKV_LAYERS"); o.hip_ordered_wkv_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_MHC"); o.mhc = e && *e ? atoi(e) : 0; }
@@ -3062,6 +3063,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_shared_bf16_layers = ds4f_json_int(json, "hip_shared_bf16_layers", o->hip_shared_bf16_layers);
     o->hip_shared_fp16 = ds4f_json_int(json, "hip_shared_fp16", o->hip_shared_fp16);
     o->hip_shared_fp16_layers = ds4f_json_int(json, "hip_shared_fp16_layers", o->hip_shared_fp16_layers);
+    o->hip_ordered_wkv_layers = ds4f_json_int(json, "hip_ordered_wkv_layers", o->hip_ordered_wkv_layers);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);
     o->mhc = ds4f_json_int(json, "mhc", o->mhc);

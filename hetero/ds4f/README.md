@@ -401,6 +401,12 @@ although its weight conversion itself is exact. The layer cap is
 `"hip_shared_fp16_layers": N`, or pass
 `--ds4f-hip-shared-fp16 1 --ds4f-hip-shared-fp16-layers N` to the server.
 
+`"hip_ordered_wkv_layers": N` enables a CPU-compatible FP8 reduction for the
+first `N` WKV projections during batched prefill (M=1 decode is unchanged).
+It reduces the first-layer KV rounding error at a small throughput cost, but it
+does not make the full recurrent prompt path mismatch-free; use
+`hip_exact_prefill` when zero mismatches are required.
+
 ## Long-context stability and speculative-decode probe
 
 The real HIP harness now accepts `DS4F_MAXPOS` and can warm a synthetic KV
@@ -428,6 +434,8 @@ recomputing history outside the sliding window. On the staged EP=8 shard:
 |---|---:|---:|---:|
 | exact default | 4096 | 21.20 | 5/64 |
 | exact default | 8192 | 21.01 | 4/64 |
+| ordered WKV first 8 layers | 4096 | 21.11 | 3/64 |
+| ordered WKV first 8 layers | 8192 | 20.86 | 4/64 |
 | exact prefill (`hip_exact_prefill`) | 4096 | 3.33 | 0/64 |
 | exact prefill (`hip_exact_prefill`) | 8192 | 3.34 | 0/64 |
 | shared BF16 | 4096 | 32.89 | 5/64 |
@@ -476,6 +484,7 @@ line option wins, independent of argument order. For example:
   "hip_device": 0,
   "hip_shared_fp16": 0,
   "hip_shared_fp16_layers": 0,
+  "hip_ordered_wkv_layers": 0,
   "hip_exact_prefill": 0
 }
 ```

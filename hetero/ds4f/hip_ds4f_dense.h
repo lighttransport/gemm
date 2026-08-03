@@ -39,6 +39,9 @@ int hip_ds4f_dense_add(hip_ds4f_dense *ctx,
 
 /* Upload and tag a common ds4f_tensor with the returned bank id. */
 int hip_ds4f_dense_bind_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t);
+/* Upload an FP8 tensor with the CPU-compatible block/lane reduction used by
+ * the quality-sensitive KV projection path. */
+int hip_ds4f_dense_bind_fp8_ordered_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t);
 int hip_ds4f_dense_bind_bf16_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t);
 /* Upload an FP8 tensor as an exact BF16 promotion while leaving the common
  * tensor in its original FP8 form. This is useful for selectively accelerating
