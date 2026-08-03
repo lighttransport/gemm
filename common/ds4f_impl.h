@@ -1195,7 +1195,7 @@ static int ds4f_gemm_warned = 0;
 static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
                       const float *X, int M, int Ystride, int Xstride) {
     if (M > DS4F_MAX_MTILE) { fprintf(stderr, "ds4f_gemm: M=%d > DS4F_MAX_MTILE=%d\n", M, DS4F_MAX_MTILE); abort(); }
-    if (M > 1 && m->gpu_dense_gemm && t->gpu_id >= 0 &&
+    if (M > 1 && !m->gpu_exact_prefill && m->gpu_dense_gemm && t->gpu_id >= 0 &&
         (t->type == DS4F_FP8 || t->type == DS4F_BF16)) {
         if (m->gpu_dense_gemm(m->gpu_dense_ctx, Y, t, X, M, Ystride, Xstride) == 0) {
             m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols)
@@ -1254,7 +1254,7 @@ static void ds4f_gemm_multi_worker(void *arg, int tid, int nthr) {
 }
 
 static int ds4f_gemm_gpu_eligible(const ds4f_model *m, const ds4f_gemm_task *q) {
-    return m && m->gpu_dense_gemm && q && q->M > 1 && q->t &&
+    return m && !m->gpu_exact_prefill && m->gpu_dense_gemm && q && q->M > 1 && q->t &&
            q->t->gpu_id >= 0 &&
            (q->t->type == DS4F_FP8 || q->t->type == DS4F_BF16);
 }
@@ -2746,6 +2746,7 @@ static ds4f_model *ds4f_alloc_synth_opts(const ds4f_runtime_options *opt) {
     m->mem = mem;
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
+    m->gpu_exact_prefill = opt->hip_exact_prefill ? 1 : 0;
     m->mxfp4_w4a8 = opt->mxfp4_w4a8;
     ds4f_init_fp8_e4m3_lut(m->fp8_lut);
     /* Dense default is FP8 on-demand (lean ~21.6 GB/node, safe to 128K ctx).
@@ -2967,6 +2968,7 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_SHARED_BF16_LAYERS"); o.hip_shared_bf16_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_SHARED_FP16"); o.hip_shared_fp16 = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_SHARED_FP16_LAYERS"); o.hip_shared_fp16_layers = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_MHC"); o.mhc = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_EXACT"); o.exact = e && *e ? atoi(e) : 0; }
@@ -3060,6 +3062,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_shared_bf16_layers = ds4f_json_int(json, "hip_shared_bf16_layers", o->hip_shared_bf16_layers);
     o->hip_shared_fp16 = ds4f_json_int(json, "hip_shared_fp16", o->hip_shared_fp16);
     o->hip_shared_fp16_layers = ds4f_json_int(json, "hip_shared_fp16_layers", o->hip_shared_fp16_layers);
+    o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);
     o->mhc = ds4f_json_int(json, "mhc", o->mhc);
     o->exact = ds4f_json_int(json, "exact", o->exact);
@@ -3814,6 +3817,7 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
     m->mem = mem;
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
+    m->gpu_exact_prefill = opt->hip_exact_prefill ? 1 : 0;
     m->mxfp4_w4a8 = opt->mxfp4_w4a8;
     /* real dtypes: staged dense = FP8(e4m3fn), experts = MXFP4, router/head/embed/
      * norm = BF16 row-major. DS4F_FP8_BF16=1 PROMOTES the replicated dense FP8->bf16

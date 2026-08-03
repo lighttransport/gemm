@@ -2540,6 +2540,7 @@ static void usage(const char *prog) {
         "  --ds4f-hip-shared-bf16-layers <n>  limit approximate mode layers\n"
         "  --ds4f-hip-shared-fp16 <0|1>  exact-weight FP8->FP16 hot-shared mode\n"
         "  --ds4f-hip-shared-fp16-layers <n>  limit exact mode layers\n"
+        "  --ds4f-hip-exact-prefill <0|1>  CPU-reference prompt GEMMs; keep GPU decode\n"
         "  --ds4f-tp-head/shared/attn/oproj/embed <0|1>  tensor-parallel shards\n"
         "  --ds4f-mtp <0|1>        enable MTP checkpoint loading\n"
         "  --ds4f-debug-env         enable legacy DS4F_* environment overrides\n"
@@ -2599,6 +2600,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--ds4f-hip-shared-bf16-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_bf16_layers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-shared-fp16") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_fp16 = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-shared-fp16-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_fp16_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-exact-prefill") == 0 && i + 1 < argc) cfg.ds4f_options.hip_exact_prefill = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-exact") == 0 && i + 1 < argc) cfg.ds4f_options.exact = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-bf16") == 0 && i + 1 < argc) cfg.ds4f_options.dense_bf16 = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-bf16-pv") == 0 && i + 1 < argc) cfg.ds4f_options.bf16_pv = atoi(argv[++i]);

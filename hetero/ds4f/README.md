@@ -377,6 +377,13 @@ still cross host memory, so a device-resident activation arena and fused GPU
 attention/norm/MLP are the remaining route toward a full-model 30-tok/s
 prompt-rate result.
 
+The fast GPU prefill path is numerically approximate over a separately generated
+KV history: small dense-GEMM reduction differences can accumulate into a few
+CPU-reference argmax changes at long context. For a guaranteed CPU-reference
+prompt, set `"hip_exact_prefill": 1` in the JSON or pass
+`--hip-exact-prefill 1`. This skips only M>1 GPU GEMMs, so M=1 decode continues
+to use the GPU dense bank; the trade-off is CPU prefill throughput.
+
 There is also an explicit approximate-speed experiment for hot shared weights:
 set `"hip_shared_bf16": 1` (and optionally
 `"hip_shared_bf16_layers": N`) or pass
@@ -421,6 +428,8 @@ recomputing history outside the sliding window. On the staged EP=8 shard:
 |---|---:|---:|---:|
 | exact default | 4096 | 21.20 | 5/64 |
 | exact default | 8192 | 21.01 | 4/64 |
+| exact prefill (`hip_exact_prefill`) | 4096 | 3.33 | 0/64 |
+| exact prefill (`hip_exact_prefill`) | 8192 | 3.34 | 0/64 |
 | shared BF16 | 4096 | 32.89 | 5/64 |
 | shared BF16 | 8192 | 32.05 | 5/64 |
 | shared FP16 | 4096 | 32.83 | 1/64 |
@@ -466,7 +475,8 @@ line option wins, independent of argument order. For example:
   "hip_async": 1,
   "hip_device": 0,
   "hip_shared_fp16": 0,
-  "hip_shared_fp16_layers": 0
+  "hip_shared_fp16_layers": 0,
+  "hip_exact_prefill": 0
 }
 ```
 

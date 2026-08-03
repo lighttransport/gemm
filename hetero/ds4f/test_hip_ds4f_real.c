@@ -23,7 +23,8 @@ static void usage(const char *prog) {
                     "--prefill-batch n --prefill-context n] "
                     "[--hip-device n --hip-verbose 0|1 --hip-async 0|1 "
                     "--hip-shared-bf16 0|1 --hip-shared-bf16-layers n "
-                    "--hip-shared-fp16 0|1 --hip-shared-fp16-layers n] [--debug-env]\n", prog);
+                    "--hip-shared-fp16 0|1 --hip-shared-fp16-layers n "
+                    "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
 }
 
 static int hip_async_enabled(const ds4f_runtime_options *opt) {
@@ -405,6 +406,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-shared-bf16-layers") == 0 && i + 1 < argc) opt.hip_shared_bf16_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-shared-fp16") == 0 && i + 1 < argc) opt.hip_shared_fp16 = atoi(argv[++i]);
         else if (strcmp(a, "--hip-shared-fp16-layers") == 0 && i + 1 < argc) opt.hip_shared_fp16_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
         else if (strcmp(a, "--debug-env") == 0) debug_env = 1;
         else { usage(argv[0]); return 2; }
     }

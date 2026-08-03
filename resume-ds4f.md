@@ -287,6 +287,12 @@ The corresponding CPU-vs-GPU argmax mismatch counts were exact `5/4`, BF16
 reflect separately warmed CPU/GPU KV histories and accumulated reduction drift,
 not a GPU-only determinism check.
 
+To guarantee CPU-reference parity for prompt batches, `hip_exact_prefill` is
+now available in JSON or as `--hip-exact-prefill 1`. It disables only M>1 GPU
+GEMMs, preserving GPU M=1 decode, and measured 0/64 mismatches at both 4k
+(3.33 tok/s) and 8k (3.34 tok/s). The default remains the fast GPU prefill
+mode because the exact mode intentionally pays the CPU reference cost.
+
 ### Known-good opportunistic wins
 
 - The FP8 AVX2 kernel uses `vpgatherdd`, slow on Zen1. An arithmetic e4m3 decode

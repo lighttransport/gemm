@@ -409,6 +409,7 @@ typedef struct ds4f_runtime_options {
     int use_hip, hip_device, hip_async, hip_verbose;
     int hip_shared_bf16, hip_shared_bf16_layers;
     int hip_shared_fp16, hip_shared_fp16_layers;
+    int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
     int debug_env;
 } ds4f_runtime_options;
 
@@ -488,6 +489,7 @@ typedef struct {
     ds4f_gpu_dense_gemm_fn gpu_dense_gemm;
     ds4f_gpu_dense_gemm_multi_fn gpu_dense_gemm_multi;
     int gpu_dense_mixed;       /* opt-in mixed GPU/CPU independent-GEMM dispatch */
+    int gpu_exact_prefill;     /* skip GPU M>1 GEMMs; retain GPU M=1 decode */
     /* FP8 dense decode kernel: 0 = gather (LUT, bit-exact), 1 = magic-multiply
      * (FTZ, ~6 ops/lane, no gather; +2..18% in the HBM-stream decode regime,
      * subnormals flush to 0 -> values ~5e-5 off, fine for the harness). The
