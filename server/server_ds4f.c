@@ -445,6 +445,9 @@ static int gpu_bind_layer(ds4f_session *s, ds4f_layer *ly, int layer,
     }
     if (s->options.hip_mxfp4_widen_layers > 0 &&
         layer < s->options.hip_mxfp4_widen_layers) {
+        /* The widened row-scale FP8 kernel reproduces exact F32 MXFP4
+         * weights. Keep the CPU fallback on the same quality contract. */
+        s->m->mxfp4_w4a8 = 0;
         ds4f_tensor *ex[] = { ly->ex_w1, ly->ex_w2, ly->ex_w3 };
         for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); wi++) {
             if (!ex[wi]) return -1;

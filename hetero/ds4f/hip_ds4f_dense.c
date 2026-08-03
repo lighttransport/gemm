@@ -396,7 +396,7 @@ int hip_ds4f_dense_bind_mxfp4_widened_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t
                                    0.f,-1.f,-2.f,-3.f,-4.f,-6.f,-8.f,-12.f };
     if (!ctx || !t || t->type != DS4F_MXFP4 || !t->w || !t->scale ||
         !valid_dims(t->rows, t->cols) || (t->cols & 127)) return -1;
-    int sc = (t->cols + 127) / 128, sr = (t->rows + 127) / 128;
+    int sc = (t->cols + 127) / 128;
     size_t wb = (size_t)t->rows * (size_t)t->cols;
     size_t sb = (size_t)t->rows * (size_t)sc;
     uint8_t *fw = (uint8_t *)ds4f_mem_alloc(ctx->mem, wb, 64, 0);

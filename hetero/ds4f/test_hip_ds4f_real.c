@@ -26,6 +26,7 @@ static void usage(const char *prog) {
                     "--hip-shared-fp16 0|1 --hip-shared-fp16-layers n "
                     "--hip-ordered-wkv-layers n "
                     "--hip-ordered-fp8-layers n "
+                    "--hip-mxfp4-widen-layers n "
                     "[--hip-mxfp4-gemm-test] [--hip-mxfp4-widened-gemm-test] "
                     "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
 }
@@ -461,6 +462,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-shared-fp16-layers") == 0 && i + 1 < argc) opt.hip_shared_fp16_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-ordered-wkv-layers") == 0 && i + 1 < argc) opt.hip_ordered_wkv_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-ordered-fp8-layers") == 0 && i + 1 < argc) opt.hip_ordered_fp8_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-widen-layers") == 0 && i + 1 < argc) opt.hip_mxfp4_widen_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-gemm-test") == 0) mxfp4_test = 1;
         else if (strcmp(a, "--hip-mxfp4-widened-gemm-test") == 0) mxfp4_widened_test = 1;
         else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
@@ -485,6 +487,8 @@ int main(int argc, char **argv) {
     if (cfg.max_pos < 2) cfg.max_pos = 2;
     if (cfg.max_pos > 16384) cfg.max_pos = 16384;
     opt.cfg = cfg;
+    if (opt.hip_mxfp4_widen_layers > 0)
+        mxfp4_test = mxfp4_widened_test = 0;
     if (bank_layers < 1) bank_layers = 1;
     if (bank_layers > cfg.n_layers) bank_layers = cfg.n_layers;
     opt.cfg.n_layers = bank_layers;
@@ -572,6 +576,28 @@ int main(int argc, char **argv) {
                     : ds4f_wbytes(ts[j]->type, ts[j]->rows, ts[j]->cols)
                         + ds4f_sbytes(ts[j]->type, ts[j]->rows, ts[j]->cols);
                 bank_matrices++;
+            }
+        }
+    }
+    if (opt.hip_mxfp4_widen_layers > 0) {
+        int nbind = opt.hip_mxfp4_widen_layers < cfg.n_layers
+            ? opt.hip_mxfp4_widen_layers : cfg.n_layers;
+        m->mxfp4_w4a8 = 0; /* widened GPU experts implement exact F32 MXFP4 */
+        for (int L = 0; L < nbind; ++L) {
+            ds4f_layer *z = &m->layers[L];
+            ds4f_tensor *ex[] = { z->ex_w1, z->ex_w2, z->ex_w3 };
+            for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi) {
+                if (!ex[wi]) { pass = 0; continue; }
+                for (int e = 0; e < z->n_owned; ++e) {
+                    ds4f_tensor *et = &ex[wi][e];
+                    int id = hip_ds4f_dense_bind_mxfp4_widened_tensor(hip, et);
+                    if (id < 0) pass = 0;
+                    else {
+                        bank_bytes += (size_t)et->rows * (size_t)et->cols
+                            + (size_t)et->rows * (size_t)((et->cols + 127) / 128);
+                        bank_matrices++;
+                    }
+                }
             }
         }
     }
