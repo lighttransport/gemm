@@ -276,6 +276,17 @@ the prompt, snapshot/restore partial accepts, attach its dense tensors to the
 HIP bank where useful, and measure the existing mHC+Tier-B2 batched verifier.
 DFlash has no compatible draft checkpoint or DS4F implementation in this tree.
 
+### Long-context batched-prefill stability
+
+The real HIP prefill harness accepts `--prefill-context N`. It warms the final
+128-token sliding attention window and measures a batch of 64 at position N.
+On the staged EP=8 shard, GPU throughput at 4k/8k was: exact `21.20/21.01`
+tok/s, shared BF16 `32.89/32.05` tok/s, and shared FP16 `32.83/31.73` tok/s.
+The corresponding CPU-vs-GPU argmax mismatch counts were exact `5/4`, BF16
+`5/5`, and FP16 `1/4` out of 64. Throughput is stable; the mismatch counts
+reflect separately warmed CPU/GPU KV histories and accumulated reduction drift,
+not a GPU-only determinism check.
+
 ### Known-good opportunistic wins
 
 - The FP8 AVX2 kernel uses `vpgatherdd`, slow on Zen1. An arithmetic e4m3 decode

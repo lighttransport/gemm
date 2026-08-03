@@ -410,6 +410,26 @@ prefix before measuring a later position. This reaches a 4k context directly:
 shard. `=2` synchronously touches up to 2 GB by default; increase that limit
 with `DS4F_EXPERT_RESIDENT_GB` only when the node has sufficient headroom.
 This avoids requiring a full `MAP_POPULATE` of the 166-GB virtual mapping.
+
+For batched prefill at a later context position, use
+`--prefill-context N --prefill-batch 64`. The harness warms the final
+128-token attention window at `N-128` before measuring the batch at `N`, so
+the timing includes long-position RoPE/KV/attention behavior without
+recomputing history outside the sliding window. On the staged EP=8 shard:
+
+| mode | context | GPU tok/s | CPU-vs-GPU argmax mismatches |
+|---|---:|---:|---:|
+| exact default | 4096 | 21.20 | 5/64 |
+| exact default | 8192 | 21.01 | 4/64 |
+| shared BF16 | 4096 | 32.89 | 5/64 |
+| shared BF16 | 8192 | 32.05 | 5/64 |
+| shared FP16 | 4096 | 32.83 | 1/64 |
+| shared FP16 | 8192 | 31.73 | 4/64 |
+
+Prefill throughput is stable within roughly 1% for exact, 2.5% for BF16,
+and 3.4% for FP16 from 4k to 8k. The mismatch column compares CPU and GPU
+passes after separately warming their KV tails; it exposes accumulated
+reduction/history drift and should not be read as a GPU-only determinism test.
 The exact BF16 attention window now uses AVX2 widen/dot/AXPY helpers on x86;
 the original scalar path remains available with `DS4F_ATTN_SVE=0`. Serial,
 The final serial, uncontended run measures **94.95 ms/token (10.53 tok/s)** at

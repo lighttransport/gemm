@@ -19,7 +19,8 @@ static double wall_seconds(void) {
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [--config file.json] [--stage-dir dir] [--model flash|ds4p|ds4fbase] "
                     "[--ep-size n --ep-rank n --threads n --cmgs n --max-pos n] "
-                    "[--layers n --bank-layers n --iters n --pos0 n --warm n --prefill-batch n] "
+                    "[--layers n --bank-layers n --iters n --pos0 n --warm n "
+                    "--prefill-batch n --prefill-context n] "
                     "[--hip-device n --hip-verbose 0|1 --hip-async 0|1 "
                     "--hip-shared-bf16 0|1 --hip-shared-bf16-layers n "
                     "--hip-shared-fp16 0|1 --hip-shared-fp16-layers n] [--debug-env]\n", prog);
@@ -172,14 +173,27 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
     return 1;
 }
 
+static void fill_prefill_inputs(float *x, int batch, int C, int pos0) {
+    for (int mm = 0; mm < batch; mm++) for (int i = 0; i < C; i++)
+        x[(size_t)mm*C+i] = ((float)((i * 29 + (mm + pos0) * 17) % 101) - 50.0f) / 37.0f;
+}
+
 static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
-                             const ds4f_runtime_options *opt) {
+                             int context, const ds4f_runtime_options *opt) {
     if (!m->exact || m->mhc || m->tierb2 || m->int8_kv) {
         fprintf(stderr, "real hybrid prefill: requires exact && !mhc && !tierb2 && !int8_kv\n");
         return 0;
     }
     int C = m->cfg.hidden;
     float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)batch * C * sizeof(float), 256, 0);
+    int warm_batch = context > 0 ? m->cfg.window_size : 0;
+    if (warm_batch > context) warm_batch = context;
+    float *warm_x = warm_batch > 0
+        ? (float *)ds4f_mem_alloc(m->mem, (size_t)warm_batch * C * sizeof(float), 256, 0)
+        : NULL;
+    int *warm_tok = warm_batch > 0
+        ? (int *)ds4f_mem_alloc(m->mem, (size_t)warm_batch * sizeof(int), 64, 0)
+        : NULL;
     int *cpu_tok = (int *)ds4f_mem_alloc(m->mem, (size_t)batch * sizeof(int), 64, 0);
     int *gpu_tok = (int *)ds4f_mem_alloc(m->mem, (size_t)batch * sizeof(int), 64, 0);
     const char *diag_env = getenv("DS4F_PREFILL_DIAG");
@@ -189,10 +203,16 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
         ? (float *)ds4f_mem_alloc(m->mem, (size_t)batch * hrows * sizeof(float), 256, 0)
         : NULL;
     double cpu_prof[DS4F_NPHASE], gpu_prof[DS4F_NPHASE];
-    if (!x || !cpu_tok || !gpu_tok || (diag && !cpu_logits)) return 0;
-    ds4f_alloc_prefill_batch(m, batch);
-    for (int mm = 0; mm < batch; mm++) for (int i = 0; i < C; i++)
-        x[(size_t)mm*C+i] = ((float)((i * 29 + mm * 17) % 101) - 50.0f) / 37.0f;
+    if (!x || !cpu_tok || !gpu_tok || (warm_batch > 0 && (!warm_x || !warm_tok)) ||
+        (diag && !cpu_logits)) return 0;
+    if (context < 0 || context + batch > m->cfg.max_pos) {
+        fprintf(stderr, "real hybrid prefill: context=%d batch=%d exceeds max_pos=%d\n",
+                context, batch, m->cfg.max_pos);
+        return 0;
+    }
+    ds4f_alloc_prefill_batch(m, batch > warm_batch ? batch : warm_batch);
+    fill_prefill_inputs(x, batch, C, context);
+    if (warm_batch > 0) fill_prefill_inputs(warm_x, warm_batch, C, context - warm_batch);
 
     /* First run the same batched forward with all device hooks detached. */
     m->gpu_dense_ctx = NULL;
@@ -204,8 +224,14 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
     m->gpu_dense_gemm_multi = NULL;
     m->gpu_dense_mixed = 0;
     memset(m->prof, 0, sizeof(m->prof));
+    double warm_cpu_s = 0.0, warm_gpu_s = 0.0;
+    if (warm_batch > 0) {
+        double tw = wall_seconds();
+        ds4f_forward_prefill(m, warm_x, warm_batch, context - warm_batch, warm_tok);
+        warm_cpu_s = wall_seconds() - tw;
+    }
     double t0 = wall_seconds();
-    ds4f_forward_prefill(m, x, batch, 0, cpu_tok);
+    ds4f_forward_prefill(m, x, batch, context, cpu_tok);
     double cpu_s = wall_seconds() - t0;
     memcpy(cpu_prof, m->prof, sizeof(cpu_prof));
     if (diag) memcpy(cpu_logits, m->p_logits,
@@ -221,16 +247,24 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
     memset(m->prof, 0, sizeof(m->prof));
+    if (warm_batch > 0) {
+        double tw = wall_seconds();
+        ds4f_forward_prefill(m, warm_x, warm_batch, context - warm_batch, warm_tok);
+        warm_gpu_s = wall_seconds() - tw;
+    }
     t0 = wall_seconds();
-    ds4f_forward_prefill(m, x, batch, 0, gpu_tok);
+    ds4f_forward_prefill(m, x, batch, context, gpu_tok);
     double gpu_s = wall_seconds() - t0;
     memcpy(gpu_prof, m->prof, sizeof(gpu_prof));
 
     int mismatches = 0;
     for (int i = 0; i < batch; i++) if (cpu_tok[i] != gpu_tok[i]) mismatches++;
-    printf("real hybrid prefill: layers=%d batch=%d cpu=%.3f tok/s gpu=%.3f tok/s "
-           "speedup=%.3fx argmax_mismatch=%d\n", m->cfg.n_layers, batch,
+    printf("real hybrid prefill: layers=%d context=%d batch=%d cpu=%.3f tok/s gpu=%.3f tok/s "
+           "speedup=%.3fx argmax_mismatch=%d", m->cfg.n_layers, context, batch,
            batch / cpu_s, batch / gpu_s, cpu_s / gpu_s, mismatches);
+    if (warm_batch > 0)
+        printf(" warm_tail=%d cpu=%.3fs gpu=%.3fs", warm_batch, warm_cpu_s, warm_gpu_s);
+    putchar('\n');
     if (diag) {
         float max_abs = 0.0f, max_rel = 0.0f;
         for (int mm = 0; mm < batch; mm++) {
@@ -335,7 +369,7 @@ int main(int argc, char **argv) {
     ds4f_runtime_options_init(&opt);
     char config_path[1024] = {0};
     int debug_env = 0, bank_layers = 1, layers = 0;
-    int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0;
+    int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
     /* Load JSON first so explicit command-line values have the conventional
      * higher precedence regardless of where --config appears in argv. */
     for (int i = 1; i + 1 < argc; i++)
@@ -363,6 +397,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--pos0") == 0 && i + 1 < argc) pos0 = atoi(argv[++i]);
         else if (strcmp(a, "--warm") == 0 && i + 1 < argc) warm = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-batch") == 0 && i + 1 < argc) prefill_batch = atoi(argv[++i]);
+        else if (strcmp(a, "--prefill-context") == 0 && i + 1 < argc) prefill_context = atoi(argv[++i]);
         else if (strcmp(a, "--hip-device") == 0 && i + 1 < argc) opt.hip_device = atoi(argv[++i]);
         else if (strcmp(a, "--hip-verbose") == 0 && i + 1 < argc) opt.hip_verbose = atoi(argv[++i]);
         else if (strcmp(a, "--hip-async") == 0 && i + 1 < argc) opt.hip_async = atoi(argv[++i]);
@@ -494,7 +529,8 @@ int main(int argc, char **argv) {
          * remains a mechanical path check because the local shard is partial. */
         pass &= forward_ab(m, hip, &opt);
         if (iters > 0) pass &= benchmark_forward(m, hip, iters, pos0, warm, &opt);
-        if (prefill_batch > 1) pass &= benchmark_prefill(m, hip, prefill_batch, &opt);
+        if (prefill_batch > 1)
+            pass &= benchmark_prefill(m, hip, prefill_batch, prefill_context, &opt);
     }
     printf("%s\n", pass ? "PASS" : "FAIL");
 
