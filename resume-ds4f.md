@@ -32,6 +32,207 @@ S3/S4 changes below are intentionally uncommitted.
 > `make -C hetero/ds4f test` after touching any kernel. Do not commit or push
 > unless I ask.
 
+## 2026-08-04: prefill and decode targets met (exact)
+
+Both standing performance targets are now met on the staged EP=8 shard with
+**zero argmax mismatches** against the CPU reference:
+
+| | before | now | target |
+|---|---:|---:|---:|
+| prefill, batch 64, exact | 22.0 tok/s | **39.9--40.3** | 30+ |
+| prefill, batch 128 | 22.4 (3/128 mismatch) | **41.0--41.6** (0/128) | — |
+| prefill, 4k / 8k context | 21.2 / 21.0 | **36.2 / 36.2** | — |
+| decode, short context | 12.28 tok/s | **18.78--18.87** | 15+ |
+| decode, warmed 4k | 10.53 tok/s | **14.13--14.21** | — |
+
+Prefill was measured at 39.9--40.3 tok/s on a quiet host and 37.5--38.7 during a
+later session with `load average: 21.67` and 7 other users; the CPU reference
+dropped in lockstep (3.50 -> 3.34 tok/s) and the GPU/CPU ratio held at
+11.2--11.5x, so the spread is host contention rather than a regression. Re-measure
+on a quiet host before quoting a single figure.
+
+Note this host is a Threadripper 1950X (Zen1, AVX2), not A64FX/SVE — the CPU
+work below targets the AVX2 path only.
+
+Six changes, all small:
+
+1. **`gpu_dense_mixed` was gated on the approximate precision flags**
+   (`test_hip_ds4f_real.c`, three sites). Mixed dispatch is a routing policy,
+   not a precision mode. With it off, `ds4f_gemm_multi` sends an entire
+   independent group to the CPU when any one member is CPU-owned, and the
+   shared-expert group pairs `sh_w2` with the CPU-resident router `gate` — so
+   exact prefill was paying 19.0 ms/token of CPU `sh_w2`. Enabling it
+   unconditionally drops `shared` to 2.6 ms/token. Pair it with
+   `--hip-ordered-fp8-layers 43` to keep `sh_w2`'s reduction order identical to
+   the AVX2 reference; that is what makes 35.28 tok/s a 0-mismatch number.
+   This also retires `hip_shared_bf16` / `hip_shared_fp16` as speed levers —
+   they were only ever switching mixed dispatch on as a side effect.
+2. **The FP8 decode matvecs read one byte per lane per iteration.** They now
+   use `uint4` (16 weights/lane) with a scalar tail. A 16-aligned run cannot
+   straddle a 128-column E8M0 block, so the scale applies once per run. `wq_b`
+   went 132 -> 182.8 GB/s. The reassociation moves results *toward* the CPU
+   reference: worst layer-0 `max_rel` 1.67e-6 -> 1.10e-6, drift `x_rel`
+   0.0547 -> 0.0159, argmax unchanged.
+3. **The AVX2 MXFP4 expert GEMM decoded every weight once per token.** In
+   `ds4f_gemm_worker_x86`'s raw-MXFP4 branch the token loop was *outermost*, so
+   a prefill tile of M tokens ran `ds4f_mxfp4_unpack16` M times over the same
+   weights. That unpack -- mask, shift, two `pshufb`, four sign-extends, four
+   int-to-float converts -- is roughly fifteen ops to produce one 32-weight
+   block against six ops to consume it for one token. BF16 and FP8 both had
+   two-token microkernels; MXFP4 had none. Added
+   `matvec_mxfp4_1row_f32_raw_4x` (and the W4A8 sibling
+   `matvec_mxfp4_1row_i8_raw_4x`), quantize/permute the whole tile up front,
+   and hoist the row loop outside the token loop with token blocks innermost
+   so each row's 2 KB of weights stays in L1 across the tile. Every token keeps
+   its own accumulator pair and accumulates in the original order, so each
+   output is bit-identical to the 1-row kernel. Experts went 13.43 -> 9.78
+   ms/token and prefill 35.0 -> 40.2 tok/s.
+
+   Two gotchas cost time here and are worth knowing. First, **the exact path
+   uses the f32 kernel, not W4A8** (`ds4f_mxfp4_w4a8_on` is 0 under
+   `--hip-ordered-fp8-layers`), so the W4A8 4x kernel written first was
+   unreachable and measured exactly zero change; it is kept because the W4A8
+   mode still uses it. Second, my a-priori estimate that per-expert buckets
+   average ~1.5 tokens (256 experts, top-6, EP=8, batch 64) was **wrong** --
+   measured over 43 layers the histogram is 1:75 2:41 3:42 4:24 5:27 6:19
+   7:10 >=8:90, i.e. most routed work sits in buckets of 8 or more. Measure
+   the bucket distribution before reasoning about expert batching.
+4. **Decode paid a full synchronous round trip per GPU tensor.** Two parts.
+   `DS4F_MV_FUSE` defaults to 0, so decode's independent `wq_a`/`wkv` pair ran
+   as two separate dispatches; it is bit-exact by construction (same rowsplit,
+   kernel and per-row dot order, only the barrier is shared) and the harness
+   now sets it with `setenv(..., 0)` so an explicit env still wins. The shared
+   default is deliberately left at 0 because it has not been re-measured on
+   A64FX. Then `ds4f_matvec_multi`'s GPU branch issued one launch + event sync
+   + blocking download *per tensor*; it now puts the whole group in flight via
+   the existing `gpu_dense_async_multi`/`gpu_dense_wait` pair (slots raised
+   from `HIP_DS4F_ASYNC_MAX` 2 to 8) and falls back to the serial loop if the
+   adapter is already holding a batch. Measured separately: fuse alone
+   15.09 -> 15.55, plus async group -> 16.24 (that pair went 7.92 -> 5.21 ms).
+5. **Every host transfer was pageable** (`grep -c hipHostMalloc` was 0), so the
+   driver bounced each one through its own staging buffer. `wq_b` downloads
+   131 KB per layer, 5.6 MB/token, and measured 11.96 ms against a 7.9 ms
+   kernel. The matvec H2D and D2H paths now stage through pinned buffers and
+   the async group queues all downloads before synchronizing, so they overlap.
+   This changes no arithmetic -- every A/B `max_rel` is unchanged -- and took
+   decode 16.24 -> 17.75 tok/s, `wq_b` 11.96 -> 9.69 ms. `ensure_pinned` returns
+   -1 if the loaded driver lacks `hipHostMalloc`, keeping the pageable path.
+
+6. **The matvec gave each row a whole 128-thread block.** For `wq_b`
+   (cols=1024) that is 64 chunks of work spread over 128 lanes -- half of them
+   idle -- plus a shared-memory reduction tree and a `__syncthreads` per row.
+   All four matvec kernels now run **one wave32 per row**, `blockDim.x/32` rows
+   per block, so the row total is a single shuffle reduction with no shared
+   memory and no barrier, and the block count drops 4x. `wq_b` went 182 -> 280
+   GB/s and 9.69 -> 6.80 ms; qkv 14.8 -> 11.9 ms, head 2.5 -> 1.9 ms. Block size
+   no longer matters much (64/128/256 threads all measure 18.78--18.81 tok/s),
+   which is the expected signature of the row being wave-local.
+
+   This reduces each row over 32 lanes instead of 128, so the summation order
+   changes. Layer-0 A/B errors stay in the same band (dense <= 1.5e-6, head
+   1.48e-5, all PASS), the full-model CPU-vs-GPU forward argmax is unchanged at
+   both pos0=1 and pos0=4096, prefill CPU-parity stays 0/64 at 4k and 8k, and
+   the short-context decode rollout still ends on 103035 in every run. What
+   *did* change is `last_argmax` of the **8-token 4k rollout**, 10371 -> 16.
+   That rollout is autoregressive over a *synthetic* warmed KV context with no
+   CPU reference, so one flip diverges the whole tail; treat it as a
+   self-consistency marker for a given binary, not a correctness gate.
+
+   **That check now exists and passes.** `--decode-verify N` (new,
+   `decode_verify()` in `test_hip_ds4f_real.c`) runs N teacher-forced decode
+   steps against the CPU reference as a KV history accumulates: at each
+   position the CPU pass runs first, the GPU pass reruns the *same* position so
+   both read an identical history and write the same cache slot, and the GPU
+   result is what survives into the next step. Results:
+
+   | | steps | argmax_mismatch | worst_logit_rel |
+   |---|---:|---:|---:|
+   | `--pos0 1` | 8 | **0** | 0.047 |
+   | `--pos0 4096 --warm 4096` | 8 | **0** | 1.01 |
+
+   So the GPU decode path tracks the CPU reference at 4k and the `10371 -> 16`
+   change really was the chaotic rollout. The `worst_logit_rel` of 1.01 at 4k
+   is worth knowing but is against a *synthetic* warmed KV context, which
+   produces unrealistic activations -- the same measure is 0.047 at pos0=1 with
+   no synthetic warm, so treat the 4k figure as an artifact of the warm, not a
+   quality claim. A real-prompt long-context check is still the honest way to
+   validate long generations.
+
+The decode phase split is now qkv 11.9, o_proj 11.9, shared 8.0, router 2.1,
+experts 15.4, head 1.9 ms. **The CPU MXFP4 expert phase is now the single
+largest term at 29.5%.** It is bandwidth-bound, and the PCIe finding below
+shows that moving it to either GPU by streaming is strictly worse -- the only
+viable GPU route is full expert residency split across both cards.
+
+Falsified along the way, recorded so they are not retried:
+
+- The README's `"hip_mxfp4_resident_layers": 20` -> 35.4 tok/s claim **does not
+  reproduce here**. `=20` fails outright ("GPU MXFP4 resident upload failed at
+  layer 12") because the 6.741 GB dense bank leaves too little VRAM, and
+  `--hip-mxfp4-resident-auto 1` picks 9 layers and measures **0.214 tok/s** —
+  a 100x regression, not a win. The widened-MXFP4 resident path is unusable in
+  its current form.
+- Staging the 256-entry E4M3 LUT in LDS, and re-indexing the FP8 GEMM's LDS
+  weight staging for coalesced loads, each moved the shared phase by under
+  0.15 ms/token (19.08 -> 18.96 -> 19.00). Both were reverted. The FP8 GEMM
+  tile is not the prefill bottleneck at these shapes.
+- **The host link is PCIe gen3 x8, and that closes the GPU-expert route.**
+  `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current` reports
+  `3, 8` -- about 7.9 GB/s theoretical, ~6.5 GB/s practical. This single fact
+  explains a pile of earlier results and should be checked before any future
+  offload plan:
+
+  * The HIP raw-LUT MXFP4 GEMM benchmarks at 1.122 ms/call for one
+    2048x4096 expert matrix (`--hip-mxfp4-gemm-test`). That matrix is 4.19 MB,
+    so the call is running at **3.7 GB/s -- it is PCIe-bound on the per-call
+    weight upload, not compute-bound.** The widened FP8 variant is 0.927 ms,
+    same story.
+  * Decode touches roughly **431 MB of expert weights per token**
+    (0.75 owned experts/layer x 43 layers x 13.35 MiB). Streaming that over
+    the link costs ~66 ms/token against the CPU's measured 15.4 ms. Sending
+    experts to *either* GPU is about **4x worse than just computing on the
+    CPU**, and that is before counting the RAM read the host must do anyway to
+    supply the upload.
+  * It also explains the 0.214 tok/s `hip_mxfp4_resident_auto` result above:
+    9 layers resident and 34 layers streaming ~340 MB each is ~1.8 s of pure
+    PCIe per prefill batch.
+
+  **So routed experts belong on the CPU unless they are fully resident.** The
+  one arrangement that could work is residency *split across both cards*: the
+  owned expert bank is 32 experts x 43 layers x 13.35 MiB = **17.9 GiB**,
+  against ~14.4 GiB free on the RTX 5060 Ti plus ~9.5 GiB left on the 9070 XT
+  after the 6.741 GB dense bank -- about 23.9 GiB combined, so it fits with
+  room to spare. Only activations would cross the link (~16 KB per expert
+  call, negligible even on gen3 x8). That, not a faster kernel, is the real
+  remaining decode lever, and it is a substantial piece of work: routing-aware
+  dispatch across two vendors' runtimes with an exact kernel on each.
+- **CPU expert bandwidth is not the lever it looks like.** `bench_expert_bw
+  --mode matvec --i8seq --threads 16` measures **44.3 GB/s** on this host
+  (prefaulted anonymous), and the model path runs the expert stream at roughly
+  26 GB/s. Neither `DS4F_EXPERT_RESIDENT=2` with a 30 GB cap (pages were
+  already cached; 15.22 vs 15.19 tok/s) nor a thread sweep moved it: 8 threads
+  15.21, 12 threads 14.51, 16 threads 15.22, 24 threads 15.17, 32 threads
+  **9.64** tok/s. 16 threads remains right and SMT remains catastrophic. The
+  gap to the synthetic ceiling is a scattered file-backed access pattern, not
+  page-cache residency or thread count. The win came from arithmetic reuse
+  (item 3), not from bandwidth.
+- This box is a single NUMA node (`numactl --hardware`: 1 node, 193 GB), so
+  there is no interleave/affinity lever to pull.
+- hipGraph capture remains inapplicable: `rdna4/llm/decode-graph-capture-audit.md`
+  rules out MoE models (host-side top-K), and DS4F additionally runs host
+  rmsnorm/RoPE/attention between GPU ops.
+
+Not done, in value order, if more decode headroom is wanted: `ds4f_matvec_multi`
+still issues one synchronous round trip per tensor (`common/ds4f_impl.h:698`),
+so decode qkv pays ~129 launch+sync round trips per token where the async
+two-slot API already used for the shared expert would need 43; host staging is
+still fully pageable (`grep -c hipHostMalloc hip_ds4f_dense.c` is 0); and the
+dual-GPU CUDA prefill regression (9--11 tok/s) is untouched — its root cause is
+that `cuda_eligible()` requires `M >= 128`, which no routed-expert bucket
+reaches at batch 64, while `dual_ds4f_prefill_bind_tensor` gives MXFP4 tensors
+a `gpu_id = 0` sentinel without uploading them to HIP, so experts land on the
+CPU on both paths.
+
 ## Where things stand
 
 Goal is to beat llama.cpp on this box (7.33 tok/s full MXFP4, 8.57 tok/s Q3_K_M

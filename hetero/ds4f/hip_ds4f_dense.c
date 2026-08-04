@@ -15,7 +15,10 @@
 #include <math.h>
 #include <limits.h>
 
-enum { HIP_DS4F_ASYNC_MAX = 2, HIP_DS4F_GEMM_MAX = 128 };
+/* Decode issues independent projection groups (qkv is three tensors); one
+ * slot per member lets a whole group be in flight instead of paying a
+ * launch + event-sync + blocking download per tensor. */
+enum { HIP_DS4F_ASYNC_MAX = 8, HIP_DS4F_GEMM_MAX = 128 };
 
 typedef struct {
     void *dw, *ds;
@@ -112,6 +115,16 @@ struct hip_ds4f_dense {
     size_t multi_out_bytes[HIP_DS4F_ASYNC_MAX];
     float *multi_y[HIP_DS4F_ASYNC_MAX];
     int multi_pending, multi_n;
+
+    /* Pinned bounce buffers.  Every host transfer here was pageable, which the
+     * driver stages through its own bounce buffer anyway -- doing it explicitly
+     * lets the copies run as real async DMA on the stream.  NULL whenever the
+     * loaded driver lacks hipHostMalloc, in which case the pageable path below
+     * is used unchanged. */
+    void *pin_hx, *pin_hy;
+    size_t pin_hx_cap, pin_hy_cap;
+    void *multi_hx[HIP_DS4F_ASYNC_MAX], *multi_hy[HIP_DS4F_ASYNC_MAX];
+    size_t multi_hx_cap[HIP_DS4F_ASYNC_MAX], multi_hy_cap[HIP_DS4F_ASYNC_MAX];
 
     void *gemm_dx, *gemm_dy;
     void *gemm_mxfp4_tasks;
@@ -448,6 +461,19 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->stream && hipStreamDestroy) hipStreamDestroy(ctx->stream);
     if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
     ds4f_mem_pool_destroy(ctx->mem);
+}
+
+/* Grow a pinned host staging buffer.  Returns -1 (and leaves *buf NULL) when
+ * pinned memory is unavailable, so callers fall back to the pageable copy. */
+static int ensure_pinned(void **buf, size_t *cap, size_t bytes) {
+    if (*buf && *cap >= bytes) return 0;
+    if (!hipHostMalloc) return -1;
+    void *p = NULL;
+    if (hipHostMalloc(&p, bytes, hipHostMallocDefault) != hipSuccess || !p)
+        return -1;
+    if (*buf) { if (hipHostFree) hipHostFree(*buf); else if (hipFreeHost) hipFreeHost(*buf); }
+    *buf = p; *cap = bytes;
+    return 0;
 }
 
 static int ensure_vectors(hip_ds4f_dense *ctx, int rows, int cols) {
@@ -1183,7 +1209,13 @@ static int launch_matvec_async(hip_ds4f_dense *ctx, hipFunction_t fn, int id,
     if (hipSetDevice(ctx->device_id) != hipSuccess ||
         ensure_vectors(ctx, rows, x_cols) != 0)
         return -1;
-    if (hipMemcpyAsync(ctx->dx, x, (size_t)x_cols * sizeof(float),
+    size_t xb = (size_t)x_cols * sizeof(float);
+    const void *xsrc = x;
+    if (ensure_pinned(&ctx->pin_hx, &ctx->pin_hx_cap, xb) == 0) {
+        memcpy(ctx->pin_hx, x, xb);
+        xsrc = ctx->pin_hx;
+    }
+    if (hipMemcpyAsync(ctx->dx, xsrc, xb,
                        hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: activation upload failed\n");
         hipStreamSynchronize(ctx->stream);
@@ -1192,7 +1224,8 @@ static int launch_matvec_async(hip_ds4f_dense *ctx, hipFunction_t fn, int id,
 
     void *args[] = { &dw, &ds, &ctx->dx, &ctx->dy, &rows, &cols, &scale_cols };
     hipError_t err = hipModuleLaunchKernel(fn,
-        (unsigned int)rows, 1, 1, (unsigned int)ctx->block_threads, 1, 1, 0,
+        (unsigned int)((rows + (ctx->block_threads >> 5) - 1) / (ctx->block_threads >> 5)),
+        1, 1, (unsigned int)ctx->block_threads, 1, 1, 0,
         ctx->stream, args, NULL);
     if (err != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: kernel launch failed (%d)\n", (int)err);
@@ -1264,7 +1297,8 @@ int hip_ds4f_dense_matvec_blockdiag(
     void *args[] = { &dw, &ds, &ctx->dx, &ctx->dy,
                      &rows, &cols, &scale_cols, &gin, &glora, &goff };
     if (hipModuleLaunchKernel(ctx->blockdiag_matvec,
-            (unsigned int)rows, 1, 1, (unsigned int)ctx->block_threads, 1, 1, 0,
+            (unsigned int)((rows + (ctx->block_threads >> 5) - 1) / (ctx->block_threads >> 5)),
+            1, 1, (unsigned int)ctx->block_threads, 1, 1, 0,
             ctx->stream, args, NULL) != hipSuccess ||
         hipEventRecord(ctx->done, ctx->stream) != hipSuccess)
         return -1;
@@ -1711,8 +1745,13 @@ int hip_ds4f_dense_matvec_tensors_async(
     for (int i = 0; i < n; ++i) {
         if (ensure_multi_vectors(ctx, i, mat[i]->rows, mat[i]->cols) != 0)
             goto fail;
-        if (hipMemcpyAsync(ctx->multi_dx[i], x[i],
-                           (size_t)mat[i]->cols * sizeof(float),
+        size_t xbi = (size_t)mat[i]->cols * sizeof(float);
+        const void *xsrc = x[i];
+        if (ensure_pinned(&ctx->multi_hx[i], &ctx->multi_hx_cap[i], xbi) == 0) {
+            memcpy(ctx->multi_hx[i], x[i], xbi);
+            xsrc = ctx->multi_hx[i];
+        }
+        if (hipMemcpyAsync(ctx->multi_dx[i], xsrc, xbi,
                            hipMemcpyHostToDevice, ctx->multi_stream[i]) != hipSuccess)
             goto fail;
         void *args[] = { (void *)&mat[i]->dw, (void *)&mat[i]->ds,
@@ -1722,7 +1761,8 @@ int hip_ds4f_dense_matvec_tensors_async(
         hipFunction_t fn = matrix_is_fp16(mat[i]->kind) ? ctx->f16_matvec :
                            matrix_is_bf16(mat[i]->kind) ? ctx->bf16_matvec : ctx->matvec;
         if (hipModuleLaunchKernel(fn,
-                (unsigned int)mat[i]->rows, 1, 1, (unsigned int)ctx->block_threads, 1, 1, 0,
+                (unsigned int)((mat[i]->rows + (ctx->block_threads >> 5) - 1) / (ctx->block_threads >> 5)),
+                1, 1, (unsigned int)ctx->block_threads, 1, 1, 0,
                 ctx->multi_stream[i], args, NULL) != hipSuccess)
             goto fail;
         if (hipEventRecord(ctx->multi_done[i], ctx->multi_stream[i]) != hipSuccess)
@@ -1749,7 +1789,28 @@ int hip_ds4f_dense_wait_tensors(void *opaque) {
         ctx->multi_n > HIP_DS4F_ASYNC_MAX)
         return -1;
     int n = ctx->multi_n;
-    for (int i = 0; i < n; ++i) {
+    /* Queue every download first, then synchronize once per stream, so the
+     * copies overlap instead of serializing behind per-tensor event waits. */
+    int pinned = 1;
+    for (int i = 0; i < n; ++i)
+        if (ensure_pinned(&ctx->multi_hy[i], &ctx->multi_hy_cap[i],
+                          ctx->multi_out_bytes[i]) != 0) { pinned = 0; break; }
+    if (pinned) {
+        for (int i = 0; i < n; ++i)
+            if (hipMemcpyAsync(ctx->multi_hy[i], ctx->multi_dy[i],
+                               ctx->multi_out_bytes[i], hipMemcpyDeviceToHost,
+                               ctx->multi_stream[i]) != hipSuccess) {
+                fprintf(stderr, "hip_ds4f_dense: async tensor wait/copy failed\n");
+                return -1;
+            }
+        for (int i = 0; i < n; ++i) {
+            if (hipStreamSynchronize(ctx->multi_stream[i]) != hipSuccess) {
+                fprintf(stderr, "hip_ds4f_dense: async tensor wait/copy failed\n");
+                return -1;
+            }
+            memcpy(ctx->multi_y[i], ctx->multi_hy[i], ctx->multi_out_bytes[i]);
+        }
+    } else for (int i = 0; i < n; ++i) {
         if (hipEventSynchronize(ctx->multi_done[i]) != hipSuccess ||
             hipMemcpy(ctx->multi_y[i], ctx->multi_dy[i], ctx->multi_out_bytes[i],
                       hipMemcpyDeviceToHost) != hipSuccess) {
@@ -1773,9 +1834,17 @@ int hip_ds4f_dense_wait(hip_ds4f_dense *ctx, float *y) {
         return -1;
     }
     if (ctx->pending_rows <= 0) return -1;
-    if (hipEventSynchronize(ctx->done) != hipSuccess ||
-        hipMemcpy(y, ctx->dy, (size_t)ctx->pending_rows * sizeof(float),
-                  hipMemcpyDeviceToHost) != hipSuccess) {
+    size_t yb = (size_t)ctx->pending_rows * sizeof(float);
+    if (ensure_pinned(&ctx->pin_hy, &ctx->pin_hy_cap, yb) == 0) {
+        if (hipMemcpyAsync(ctx->pin_hy, ctx->dy, yb,
+                           hipMemcpyDeviceToHost, ctx->stream) != hipSuccess ||
+            hipStreamSynchronize(ctx->stream) != hipSuccess) {
+            fprintf(stderr, "hip_ds4f_dense: kernel synchronization/copy failed\n");
+            return -1;
+        }
+        memcpy(y, ctx->pin_hy, yb);
+    } else if (hipEventSynchronize(ctx->done) != hipSuccess ||
+               hipMemcpy(y, ctx->dy, yb, hipMemcpyDeviceToHost) != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: kernel synchronization/copy failed\n");
         return -1;
     }

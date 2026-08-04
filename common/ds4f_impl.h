@@ -416,6 +416,32 @@ static inline void ds4f_mxfp4_xscratch(int K, int8_t **xq, float **xs, float **x
     *xq = ds4f_mxq_buf; *xs = ds4f_mxs_buf; *xc = ds4f_mxc_buf;
 }
 
+/* Same scratch for a prefill tile: n tokens quantized up front so the row
+ * loop can hoist outside the token loop and reuse each weight decode.
+ * xq is [n, K], xs and xc are [n, K/32]. */
+static __thread int8_t *ds4f_mxqn_buf = NULL;
+static __thread float  *ds4f_mxsn_buf = NULL;
+static __thread float  *ds4f_mxcn_buf = NULL;
+static __thread size_t  ds4f_mxqn_cap = 0;
+static inline int ds4f_mxfp4_xscratch_n(int K, int n, int8_t **xq,
+                                        float **xs, float **xc) {
+    size_t need = (size_t)K * (size_t)n;
+    if (need > ds4f_mxqn_cap) {
+        ds4f_map_free(ds4f_mxqn_buf); ds4f_map_free(ds4f_mxsn_buf);
+        ds4f_map_free(ds4f_mxcn_buf);
+        ds4f_mxqn_buf = (int8_t *)ds4f_map_alloc(need, 64, 0);
+        ds4f_mxsn_buf = (float *)ds4f_map_alloc((need / 32) * sizeof(float), 64, 0);
+        ds4f_mxcn_buf = (float *)ds4f_map_alloc((need / 32) * sizeof(float), 64, 0);
+        if (!ds4f_mxqn_buf || !ds4f_mxsn_buf || !ds4f_mxcn_buf) {
+            ds4f_mxqn_cap = 0;
+            return -1;
+        }
+        ds4f_mxqn_cap = need;
+    }
+    *xq = ds4f_mxqn_buf; *xs = ds4f_mxsn_buf; *xc = ds4f_mxcn_buf;
+    return 0;
+}
+
 /* Permuted f32 activation scratch, for the exact (non-W4A8) raw-layout kernel. */
 static __thread float *ds4f_mxp_buf = NULL;
 static __thread size_t ds4f_mxp_cap = 0;
@@ -426,6 +452,19 @@ static inline float *ds4f_mxfp4_xperm(int K) {
         ds4f_mxp_cap = (size_t)K;
     }
     return ds4f_mxp_buf;
+}
+
+/* Permuted f32 activation scratch for a whole prefill tile: [n, K]. */
+static __thread float *ds4f_mxpn_buf = NULL;
+static __thread size_t ds4f_mxpn_cap = 0;
+static inline float *ds4f_mxfp4_xperm_n(int K, int n) {
+    size_t need = (size_t)K * (size_t)n;
+    if (need > ds4f_mxpn_cap) {
+        ds4f_map_free(ds4f_mxpn_buf);
+        ds4f_mxpn_buf = (float *)ds4f_map_alloc(need * sizeof(float), 64, 0);
+        ds4f_mxpn_cap = ds4f_mxpn_buf ? need : 0;
+    }
+    return ds4f_mxpn_buf;
 }
 
 #endif
@@ -694,6 +733,17 @@ static void ds4f_mv_multi_worker(void *arg, int tid, int nthr) {
         ds4f_mv_worker(&sub, tid, nthr);
     }
 }
+/* Must not exceed the dense adapter's async slot count. */
+#define DS4F_MV_ASYNC_MAX 8
+/* DS4F_MV_ASYNC: put a fused GPU matvec group in flight on separate streams
+ * and download once, instead of one launch + event sync + blocking download
+ * per tensor.  Each tensor is still computed by the same kernel independently,
+ * so results are bit-identical; set to 0 to A/B the dispatch change alone. */
+static int ds4f_mv_async = -1;
+static inline int ds4f_mv_async_on(void) {
+    if (ds4f_mv_async < 0) { const char *e = getenv("DS4F_MV_ASYNC"); ds4f_mv_async = e ? atoi(e) : 1; }
+    return ds4f_mv_async;
+}
 static void ds4f_matvec_multi(ds4f_model *m, const ds4f_mv1 *list, int n) {
     if (m->gpu_dense_matvec) {
         int all_gpu = n > 0;
@@ -706,6 +756,29 @@ static void ds4f_matvec_multi(ds4f_model *m, const ds4f_mv1 *list, int n) {
                 const ds4f_tensor *t = list[s].t;
                 m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols)
                                + ds4f_sbytes(t->type, t->rows, t->cols);
+            }
+            /* Put the whole group in flight on separate streams and download
+             * once, instead of one launch + event sync + blocking download per
+             * tensor.  The adapter refuses (and we fall back) if it is already
+             * holding an async batch, e.g. the overlapped shared expert. */
+            if (n > 1 && n <= DS4F_MV_ASYNC_MAX && ds4f_mv_async_on() &&
+                m->gpu_dense_async_multi && m->gpu_dense_wait) {
+                float *dsts[DS4F_MV_ASYNC_MAX];
+                const ds4f_tensor *ts[DS4F_MV_ASYNC_MAX];
+                const float *xs[DS4F_MV_ASYNC_MAX];
+                for (int s = 0; s < n; s++) {
+                    dsts[s] = list[s].dst; ts[s] = list[s].t; xs[s] = list[s].x;
+                }
+                if (m->gpu_dense_async_multi(m->gpu_dense_ctx, dsts, ts, xs, n) == 0) {
+                    if (m->gpu_dense_wait(m->gpu_dense_ctx) != 0) {
+                        fprintf(stderr, "ds4f: GPU dense async group wait failed\n");
+                        abort();
+                    }
+                    return;
+                }
+            }
+            for (int s = 0; s < n; s++) {
+                const ds4f_tensor *t = list[s].t;
                 if (m->gpu_dense_matvec(m->gpu_dense_ctx, list[s].dst, t, list[s].x) != 0) {
                     fprintf(stderr, "ds4f: GPU dense fused matvec failed (id=%d, %dx%d)\n",
                             t->gpu_id, t->rows, t->cols);
@@ -1099,6 +1172,70 @@ static void ds4f_gemm_worker_x86(void *arg, int tid, int nthr) {
          * 8-row group. This matters for a prefill tile because a 4k vector
          * would otherwise be permuted/quantized hundreds of times. */
         size_t rb = (size_t)K / 2, sb = (size_t)K / 32;
+        /* Prefill tile: quantize the whole tile once, then run rows outside
+         * the token loop so each weight block's nibble decode is shared by
+         * four tokens instead of repeated M times.  Per-token results are
+         * bit-identical to the token-at-a-time path below. */
+        if (M >= 4 && !ds4f_mxfp4_w4a8_on(T->m)) {
+            float *xp = ds4f_mxfp4_xperm_n(K, M);
+            if (xp) {
+                for (int mm = 0; mm < M; mm++)
+                    ds4f_mxfp4_perm_act_f32(T->X + (size_t)mm * Xs, K,
+                                            xp + (size_t)mm * K);
+                for (int i = r0; i + 7 < r1; i += 8) {
+                    const uint8_t *w = (const uint8_t *)t->w + (size_t)i * rb;
+                    const uint8_t *s = t->scale + (size_t)i * sb;
+                    for (int r = 0; r < 8; r++) {
+                        const uint8_t *wr = w + (size_t)r * rb;
+                        const uint8_t *sr = s + (size_t)r * sb;
+                        int mm = 0;
+                        for (; mm + 3 < M; mm += 4)
+                            matvec_mxfp4_1row_f32_raw_4x(
+                                T->Y + (size_t)mm * Ys + i + r, Ys,
+                                wr, sr, xp + (size_t)mm * K, K);
+                        for (; mm < M; mm++)
+                            matvec_mxfp4_1row_f32_raw(
+                                T->Y + (size_t)mm * Ys + i + r, wr, sr,
+                                xp + (size_t)mm * K, K);
+                    }
+                }
+                return;
+            }
+        }
+        if (M >= 4 && ds4f_mxfp4_w4a8_on(T->m)) {
+            int8_t *xq = NULL; float *xs = NULL, *xc = NULL;
+            if (ds4f_mxfp4_xscratch_n(K, M, &xq, &xs, &xc) == 0) {
+                for (int mm = 0; mm < M; mm++)
+                    ds4f_mxfp4_quant_act_raw(T->X + (size_t)mm * Xs, K,
+                                             xq + (size_t)mm * K,
+                                             xs + (size_t)mm * (K / 32),
+                                             xc + (size_t)mm * (K / 32));
+                for (int i = r0; i + 7 < r1; i += 8) {
+                    const uint8_t *w = (const uint8_t *)t->w + (size_t)i * rb;
+                    const uint8_t *s = t->scale + (size_t)i * sb;
+                    for (int r = 0; r < 8; r++) {
+                        const uint8_t *wr = w + (size_t)r * rb;
+                        const uint8_t *sr = s + (size_t)r * sb;
+                        int mm = 0;
+                        /* Token blocks innermost: this row's 2 KB of weights
+                         * stays in L1 across the whole tile. */
+                        for (; mm + 3 < M; mm += 4)
+                            matvec_mxfp4_1row_i8_raw_4x(
+                                T->Y + (size_t)mm * Ys + i + r, Ys,
+                                wr, sr, xq + (size_t)mm * K,
+                                xs + (size_t)mm * (K / 32),
+                                xc + (size_t)mm * (K / 32), K);
+                        for (; mm < M; mm++)
+                            matvec_mxfp4_1row_i8_raw(
+                                T->Y + (size_t)mm * Ys + i + r, wr, sr,
+                                xq + (size_t)mm * K,
+                                xs + (size_t)mm * (K / 32),
+                                xc + (size_t)mm * (K / 32), K);
+                    }
+                }
+                return;
+            }
+        }
         for (int mm = 0; mm < M; mm++) {
             float *y = T->Y + (size_t)mm * Ys;
             const float *x = T->X + (size_t)mm * Xs;

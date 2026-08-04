@@ -20,7 +20,7 @@ static double wall_seconds(void) {
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [--config file.json] [--stage-dir dir] [--model flash|ds4p|ds4fbase] "
                     "[--ep-size n --ep-rank n --threads n --cmgs n --max-pos n] "
-                    "[--layers n --bank-layers n --iters n --pos0 n --warm n "
+                    "[--layers n --bank-layers n --iters n --pos0 n --warm n --decode-verify n "
                     "--prefill-batch n --prefill-context n] "
                     "[--hip-device n --hip-verbose 0|1 --hip-async 0|1 "
                     "--hip-shared-bf16 0|1 --hip-shared-bf16-layers n "
@@ -184,6 +184,107 @@ static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
            (strict || m->cfg.n_layers > 1);
 }
 
+
+static void detach_gpu_hooks(ds4f_model *m) {
+    m->gpu_dense_ctx = NULL;
+    m->gpu_dense_matvec = NULL;
+    m->gpu_dense_async_multi = NULL;
+    m->gpu_dense_wait = NULL;
+    m->gpu_dense_blockdiag = NULL;
+    m->gpu_dense_gemm = NULL;
+    m->gpu_dense_gemm_multi = NULL;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
+    m->gpu_prefill_attn = NULL;
+    m->gpu_dense_mixed = 0;
+}
+
+static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
+                                const ds4f_runtime_options *opt) {
+    m->gpu_dense_ctx = hip;
+    m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
+    m->gpu_dense_async_multi = hip_async_enabled(opt)
+        ? hip_ds4f_dense_matvec_tensors_async : NULL;
+    m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
+    m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
+    m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
+    m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_dense_mixed = 1;
+    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
+        ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
+                                     : hip_ds4f_dense_stream_layer) : NULL;
+    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    if (hip_mxfp4_streaming(opt))
+        m->mxfp4_w4a8 = 0;
+}
+
+/* Multi-step CPU-referenced decode gate.
+ *
+ * forward_ab() checks one token at position 0.  Nothing checked whether the
+ * GPU decode path tracks the CPU path as a KV history accumulates, which is
+ * exactly where a reduction-order change would show up.  At each position the
+ * CPU pass runs first and the GPU pass reruns the SAME position, so both read
+ * an identical history and write the same cache slot; the GPU result is what
+ * survives into the next step.  Inputs are deterministic per position, so the
+ * comparison is teacher-forced rather than a free-running rollout (which
+ * diverges chaotically after any single flip and proves nothing). */
+static int decode_verify(ds4f_model *m, hip_ds4f_dense *hip, int steps,
+                         int pos0, int warm, const ds4f_runtime_options *opt) {
+    const int C = m->cfg.hidden, V = m->cfg.vocab;
+    float *x_cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
+    float *x_gpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
+    float *lg_cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)V * sizeof(float), 256, 0);
+    if (!x_cpu || !x_gpu || !lg_cpu) {
+        fprintf(stderr, "real decode verify: allocation failed\n");
+        return 0;
+    }
+    if (pos0 < 1) pos0 = 1;
+    if (warm > 0) {
+        if (warm > pos0) warm = pos0;
+        ds4f_warm_kv(m, warm);
+        ds4f_warm_tb2(m, warm);
+    }
+    int mismatches = 0;
+    float worst_logit_rel = 0.0f;
+    int worst_step = -1;
+    for (int t = 0; t < steps; ++t) {
+        int pos = pos0 + t;
+        for (int i = 0; i < C; ++i)
+            x_cpu[i] = x_gpu[i] =
+                ((float)((i * 29 + pos * 17) % 101) - 50.0f) / 37.0f;
+
+        detach_gpu_hooks(m);
+        int cpu_best = ds4f_forward_token(m, x_cpu, pos);
+        memcpy(lg_cpu, m->s_logits, (size_t)V * sizeof(float));
+
+        attach_decode_hooks(m, hip, opt);
+        int gpu_best = ds4f_forward_token(m, x_gpu, pos);
+
+        float abs_err = 0.0f;
+        float rel = max_rel_error(lg_cpu, m->s_logits, V, &abs_err);
+        if (rel > worst_logit_rel) { worst_logit_rel = rel; worst_step = t; }
+        if (cpu_best != gpu_best) {
+            ++mismatches;
+            printf("real decode verify: step %d pos %d cpu_argmax=%d gpu_argmax=%d "
+                   "logit_rel=%.6g\n", t, pos, cpu_best, gpu_best, rel);
+        }
+        for (int i = 0; i < V; ++i)
+            if (!isfinite(m->s_logits[i])) {
+                printf("real decode verify: non-finite logit at step %d\n", t);
+                detach_gpu_hooks(m);
+                return 0;
+            }
+    }
+    detach_gpu_hooks(m);
+    printf("real decode verify: steps=%d pos %d..%d argmax_mismatch=%d "
+           "worst_logit_rel=%.6g (step %d)\n",
+           steps, pos0, pos0 + steps - 1, mismatches, worst_logit_rel, worst_step);
+    return mismatches == 0;
+}
+
 static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
                              int pos0, int warm,
                              const ds4f_runtime_options *opt) {
@@ -201,7 +302,10 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_layer_prefetch = NULL;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
-    m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
+    /* Mixed dispatch is not a precision mode.  Without it a group holding
+     * one CPU-only member (the router gate beside shared w2) sends every
+     * member to the CPU; each member keeps its own arithmetic either way. */
+    m->gpu_dense_mixed = 1;
     m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
         ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
                                      : hip_ds4f_dense_stream_layer) : NULL;
@@ -245,6 +349,11 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
                 printf("  %-9s %8.3f ms %5.1f%%\n", ds4f_prof_names[i], ms,
                        accounted > 0.0 ? 100.0 * m->prof[i] / accounted : 0.0);
         }
+        printf("  qkv sub: wq_a+wkv %.3f  wq_b %.3f  wkv_solo %.3f  rope %.3f ms\n",
+               m->prof[DS4F_P_QKV_A] * 1000.0 / iters,
+               m->prof[DS4F_P_QKV_B] * 1000.0 / iters,
+               m->prof[DS4F_P_QKV_KV] * 1000.0 / iters,
+               m->prof[DS4F_P_QKV_ROPE] * 1000.0 / iters);
     }
 
     m->gpu_dense_ctx = NULL;
@@ -284,7 +393,10 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
-    m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
+    /* Mixed dispatch is not a precision mode.  Without it a group holding
+     * one CPU-only member (the router gate beside shared w2) sends every
+     * member to the CPU; each member keeps its own arithmetic either way. */
+    m->gpu_dense_mixed = 1;
 }
 
 static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
@@ -359,7 +471,10 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
         ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_begin_layer
                                      : hip_ds4f_dense_stream_layer) : NULL;
     m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
-    m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
+    /* Mixed dispatch is not a precision mode.  Without it a group holding
+     * one CPU-only member (the router gate beside shared w2) sends every
+     * member to the CPU; each member keeps its own arithmetic either way. */
+    m->gpu_dense_mixed = 1;
     memset(m->prof, 0, sizeof(m->prof));
     if (warm_batch > 0) {
         double tw = wall_seconds();
@@ -483,6 +598,12 @@ static int check_tensor(ds4f_model *m, hip_ds4f_dense *hip,
 }
 
 int main(int argc, char **argv) {
+    /* Fusing the independent wq_a/wkv pair into one dispatch is bit-exact by
+     * construction (same rowsplit, kernel and per-row dot order; only the
+     * barrier is shared) and worth about 1.4 tok/s of decode here, but the
+     * shared default stays 0 because it has not been re-measured on A64FX.
+     * Enable it for this x86 harness only; an explicit env setting still wins. */
+    setenv("DS4F_MV_FUSE", "1", 0);
     ds4f_runtime_options opt;
     ds4f_runtime_options_init(&opt);
     char config_path[1024] = {0};
@@ -490,6 +611,7 @@ int main(int argc, char **argv) {
     int dual_cuda_mxfp4 = 1, dual_cuda_terms = 1;
     int mxfp4_test = 0, mxfp4_widened_test = 0;
     int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
+    int decode_verify_steps = 0;
     /* Load JSON first so explicit command-line values have the conventional
      * higher precedence regardless of where --config appears in argv. */
     for (int i = 1; i + 1 < argc; i++)
@@ -516,6 +638,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--iters") == 0 && i + 1 < argc) iters = atoi(argv[++i]);
         else if (strcmp(a, "--pos0") == 0 && i + 1 < argc) pos0 = atoi(argv[++i]);
         else if (strcmp(a, "--warm") == 0 && i + 1 < argc) warm = atoi(argv[++i]);
+        else if (strcmp(a, "--decode-verify") == 0 && i + 1 < argc) decode_verify_steps = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-batch") == 0 && i + 1 < argc) prefill_batch = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-context") == 0 && i + 1 < argc) prefill_context = atoi(argv[++i]);
         else if (strcmp(a, "--hip-device") == 0 && i + 1 < argc) opt.hip_device = atoi(argv[++i]);
@@ -724,6 +847,8 @@ int main(int argc, char **argv) {
          * the production multi-layer attachment check.  EP>1 intentionally
          * remains a mechanical path check because the local shard is partial. */
         pass &= forward_ab(m, hip, &opt);
+        if (decode_verify_steps > 0)
+            pass &= decode_verify(m, hip, decode_verify_steps, pos0, warm, &opt);
         if (iters > 0) pass &= benchmark_forward(m, hip, iters, pos0, warm, &opt);
         if (prefill_batch > 1)
             pass &= benchmark_prefill(m, hip, dual, prefill_batch, prefill_context, &opt);

@@ -545,6 +545,46 @@ static inline void matvec_mxfp4_1row_f32_raw(float *dst, const uint8_t *w,
     *dst = ds4f_avx2_hsum(_mm256_add_ps(a0, a1));
 }
 
+/* Four-token form of matvec_mxfp4_1row_f32_raw.
+ *
+ * ds4f_mxfp4_unpack16 is about fifteen ops (mask, shift, two pshufb, four
+ * sign-extends and four int-to-float converts) to produce one block's 32
+ * weights, against six ops to consume them for one token.  The 1-row kernel
+ * repeats that decode for every token, so a prefill tile of M tokens unpacks
+ * each expert weight M times.  Here each block is unpacked once and reused by
+ * four tokens.
+ *
+ * Every token keeps its own a0/a1 pair and accumulates in exactly the order
+ * the 1-row kernel uses, so each output is bit-identical to the corresponding
+ * matvec_mxfp4_1row_f32_raw call.  xp is [4, K] with stride K; results go to
+ * dst[0], dst[Ys], dst[2*Ys], dst[3*Ys]. */
+static inline void matvec_mxfp4_1row_f32_raw_4x(float *dst, int Ys,
+                                                const uint8_t *w, const uint8_t *s,
+                                                const float *xp, int K) {
+    __m256 a0[4], a1[4];
+    for (int t = 0; t < 4; t++) {
+        a0[t] = _mm256_setzero_ps();
+        a1[t] = _mm256_setzero_ps();
+    }
+    const size_t xstride = (size_t)K;
+    for (int b = 0; b < K / 32; b++) {
+        __m256 wv[4];
+        ds4f_mxfp4_unpack16(w + (size_t)b * 16, wv);
+        __m256 sc = _mm256_set1_ps(ds4f_mxfp4_raw_scale(s[b]));
+        for (int t = 0; t < 4; t++) {
+            const float *xb = xp + (size_t)t * xstride + (size_t)b * 32;
+            __m256 p0 = _mm256_mul_ps(wv[0], _mm256_loadu_ps(xb));
+            p0 = _mm256_fmadd_ps(wv[1], _mm256_loadu_ps(xb + 8), p0);
+            __m256 p1 = _mm256_mul_ps(wv[2], _mm256_loadu_ps(xb + 16));
+            p1 = _mm256_fmadd_ps(wv[3], _mm256_loadu_ps(xb + 24), p1);
+            a0[t] = _mm256_fmadd_ps(p0, sc, a0[t]);
+            a1[t] = _mm256_fmadd_ps(p1, sc, a1[t]);
+        }
+    }
+    for (int t = 0; t < 4; t++)
+        dst[(size_t)t * Ys] = ds4f_avx2_hsum(_mm256_add_ps(a0[t], a1[t]));
+}
+
 static inline void matvec_mxfp4_1row_i8_raw(float *dst, const uint8_t *w, const uint8_t *s,
                                             const int8_t *xq, const float *xs,
                                             const float *xc, int K) {
@@ -575,6 +615,65 @@ static inline void matvec_mxfp4_1row_i8_raw(float *dst, const uint8_t *w, const 
         #undef DS4F_MXFP4_BLK_RAW
     }
     *dst = ds4f_avx2_hsum128(_mm_add_ps(f0, f1)) - (c0 + c1);
+}
+
+/* Four-token form of matvec_mxfp4_1row_i8_raw.
+ *
+ * The nibble decode -- the 16-byte load, the mask, the shift and the two
+ * pshufb that feed it -- is about half the per-block work and does not depend
+ * on the activation.  The 1-row kernel repeats it once per token, so a
+ * prefill tile of M tokens decodes every expert weight M times.  Here it is
+ * done once per block and reused by four tokens.
+ *
+ * Each token keeps its own pair of accumulators, laid out and reduced exactly
+ * as the 1-row kernel does (even blocks into f0/c0, odd into f1/c1, then
+ * hsum(f0+f1) - (c0+c1)), so each output is bit-identical to the
+ * corresponding matvec_mxfp4_1row_i8_raw call.
+ *
+ * xq is [4, K] with stride K; xs and xc are [4, K/32] with stride K/32.
+ * The four results are written to dst[0], dst[Ys], dst[2*Ys], dst[3*Ys]. */
+static inline void matvec_mxfp4_1row_i8_raw_4x(float *dst, int Ys,
+                                               const uint8_t *w, const uint8_t *s,
+                                               const int8_t *xq, const float *xs,
+                                               const float *xc, int K) {
+    const __m128i tbl  = _mm_loadu_si128((const __m128i *)ds4f_mxfp4_u8_tbl16);
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    const __m128i ones = _mm_set1_epi16(1);
+    __m128 f0[4], f1[4];
+    float c0[4], c1[4];
+    for (int t = 0; t < 4; t++) {
+        f0[t] = _mm_setzero_ps(); f1[t] = _mm_setzero_ps();
+        c0[t] = 0.f; c1[t] = 0.f;
+    }
+    const size_t qs = (size_t)K, ss = (size_t)K / 32;
+    const int nb = K / 32;
+    for (int b = 0; b < nb; b += 2) {
+        #define DS4F_MXFP4_BLK_RAW_4X(BB, FACC, CACC) do {                       \
+            __m128i raw = _mm_loadu_si128((const __m128i *)(w + (size_t)(BB) * 16)); \
+            __m128i wl = _mm_shuffle_epi8(tbl, _mm_and_si128(raw, mask));        \
+            __m128i wh = _mm_shuffle_epi8(tbl,                                   \
+                _mm_and_si128(_mm_srli_epi16(raw, 4), mask));                    \
+            float ws = ds4f_mxfp4_raw_scale(s[BB]);                              \
+            for (int t = 0; t < 4; t++) {                                        \
+                const int8_t *xb = xq + (size_t)t * qs + (size_t)(BB) * 32;      \
+                __m128i p = _mm_add_epi32(                                       \
+                    _mm_madd_epi16(_mm_maddubs_epi16(wl,                         \
+                        _mm_loadu_si128((const __m128i *)xb)), ones),            \
+                    _mm_madd_epi16(_mm_maddubs_epi16(wh,                         \
+                        _mm_loadu_si128((const __m128i *)(xb + 16))), ones));    \
+                float sc = ws * xs[(size_t)t * ss + (BB)];                       \
+                FACC[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(p),                       \
+                                       _mm_set1_ps(sc), FACC[t]);                \
+                CACC[t] += sc * xc[(size_t)t * ss + (BB)];                       \
+            }                                                                    \
+        } while (0)
+        DS4F_MXFP4_BLK_RAW_4X(b, f0, c0);
+        if (b + 1 < nb) DS4F_MXFP4_BLK_RAW_4X(b + 1, f1, c1);
+        #undef DS4F_MXFP4_BLK_RAW_4X
+    }
+    for (int t = 0; t < 4; t++)
+        dst[(size_t)t * Ys] =
+            ds4f_avx2_hsum128(_mm_add_ps(f0[t], f1[t])) - (c0[t] + c1[t]);
 }
 
 #endif /* __AVX2__ && __FMA__ */

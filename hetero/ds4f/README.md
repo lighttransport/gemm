@@ -20,7 +20,15 @@ also attach that HIP bank with the explicit `DS4F_HIP=1` opt-in.
 | CPU | Threadripper 1950X, 16C/32T, AVX2 (Zen1 splits every 256-bit op into 2x128) |
 | RAM | 188 GiB, single NUMA node, quad-channel DDR4 |
 | GPU | RX 9070 XT, gfx1201, 16 GiB |
+| GPU | RTX 5060 Ti, SM120, 16 GiB (14.4 GiB free) |
+| Host link | **PCIe gen3 x8, ~6.5 GB/s practical** |
 | Model | `/mnt/disk1/models/ds4f-0731`, 48 safetensors shards, 156 GB |
+
+The link width matters more than it looks. Decode touches ~431 MB of expert
+weights per token, so streaming experts to a GPU costs ~66 ms/token against
+the CPU's measured 15.4 ms. Any offload plan that moves weights per call is
+dead on arrival here; only fully resident weights pay off. Check
+`nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current` first.
 
 Per-expert weights from the safetensors headers: `w1[2048,2048] I8` +
 `w1.scale[2048,128] F8_E8M0`, `w3` likewise, `w2[4096,1024] I8` +
@@ -322,10 +330,74 @@ runs a full 43-layer CPU/GPU forward followed by a GPU-attached decode loop.
 The BF16 head A/B gate passes at `max_rel=1.60e-5`; the layer-0 FP8 gates remain
 below `1.67e-6`. The gfx1201 row kernel now defaults to 128 threads (the
 original 256-thread kernel remains selectable with `DS4F_HIP_BLOCK_THREADS`).
-The safe EP=8 mechanical case measures **80.7 ms/token (12.40 tok/s)** at the
-short-context position after the cleanup; the profiled phase split remains
-qkv about 23 ms, attention 0.7 ms, o_proj about 24 ms, shared about 11 ms,
-routed experts about 17 ms, and head about 2.5 ms.
+The safe EP=8 mechanical case now measures **53.0--53.2 ms/token
+(18.78--18.87 tok/s)** at the short-context position, and **14.13--14.21 tok/s**
+at a warmed 4k position. The profiled short-context split is qkv 11.9 ms,
+attention 0.9 ms, o_proj 11.9 ms, shared 8.0 ms, router 2.1 ms, routed experts
+15.4 ms, head 1.9 ms. The CPU MXFP4 expert phase is now the largest single
+term (29.5%).
+
+`--decode-verify N` is a CPU-referenced multi-step decode gate: it runs N
+teacher-forced steps as a KV history accumulates, with the CPU pass first and
+the GPU pass rerunning the same position so both read identical history and
+write the same cache slot. It reports 0 argmax mismatches over 8 steps both at
+`--pos0 1` (worst logit rel 0.047) and at `--pos0 4096 --warm 4096` (1.01,
+inflated by the synthetic warm). Use this rather than the free-running
+`last_argmax`, which is autoregressive over synthetic KV and diverges
+chaotically after any single flip.
+
+```bash
+./build/test_hip_ds4f_real --stage-dir /tmp/ds4f_nocopy_ep8 --ep-size 8 \
+  --ep-rank 0 --threads 16 --cmgs 1 --layers 43 --bank-layers 43 \
+  --hip-device 0 --hip-async 1 --max-pos 12288 \
+  --decode-verify 8 --pos0 4096 --warm 4096
+```
+
+The matvec kernels previously gave each output row a whole 128-thread block.
+For `wq_b` (cols=1024) that is 64 chunks of work over 128 lanes, half of them
+idle, plus a shared-memory reduction tree and a `__syncthreads` per row. All
+four now run **one wave32 per row** with `blockDim.x/32` rows per block, so the
+row total is one shuffle reduction with no shared memory and no barrier:
+`wq_b` 182 -> 280 GB/s. Block size stopped mattering (64/128/256 all land at
+18.78--18.81 tok/s), which is what one expects once a row is wave-local.
+
+Beyond the vectorized weight loads described next, two dispatch fixes took
+decode from 15.2 to 17.8 tok/s without touching any arithmetic. `DS4F_MV_FUSE`
+defaults to 0, so the independent `wq_a`/`wkv` pair ran as two dispatches; it
+is bit-exact by construction and this harness now enables it (an explicit env
+setting still wins; the shared default stays 0 pending an A64FX measurement).
+And `ds4f_matvec_multi`'s GPU branch took a launch, event sync and blocking
+download *per tensor* -- it now puts the whole group in flight through the
+existing `gpu_dense_async_multi`/`gpu_dense_wait` pair, with
+`HIP_DS4F_ASYNC_MAX` raised from 2 to 8, falling back to the serial loop when
+the adapter already holds a batch.
+
+Separately, **every host transfer was pageable** -- there was no
+`hipHostMalloc` anywhere in `hip_ds4f_dense.c` -- so the driver bounced each
+one through its own staging buffer. `wq_b` alone downloads 131 KB per layer,
+5.6 MB/token, and measured 11.96 ms against a 7.9 ms kernel. The matvec upload
+and download paths now stage through pinned buffers, and the async group
+queues every download before synchronizing so they overlap: `wq_b` 11.96 ->
+9.69 ms. `ensure_pinned` returns -1 when the loaded driver has no
+`hipHostMalloc`, leaving the original pageable path in place.
+
+The previous figures were 80.7 ms/token (12.40 tok/s) short-context and
+10.53 tok/s at 4k, with qkv about 23 ms and o_proj about 24 ms. The dense
+matvec kernels were reading **one FP8 byte per lane per iteration**
+(`for (col = tid; col < cols; col += blockDim.x)`), so each ~32-byte wave
+request touched a 128-byte line to consume a quarter of it; `wq_b` measured
+132 GB/s of the roughly 640 GB/s the card offers. `ds4f_dense_fp8_matvec` and
+`ds4f_dense_fp8_blockdiag` now take 16 consecutive weights per lane through a
+`uint4` load, with a scalar tail for any `cols % 16`. A 16-aligned run cannot
+straddle a 128-column E8M0 block, so the block scale factors out of the run
+and is applied once; `wq_b` rose to 182.8 GB/s.
+
+That reassociation is the only numerical change, and it moves the result
+*toward* the CPU reference rather than away: every layer-0 A/B gate improved
+(worst `max_rel` 1.67e-6 -> 1.10e-6), the multi-layer drift fell from
+`x_rel=0.0547` to `0.0159`, and the greedy argmax is unchanged across every
+repetition. The odd-shaped `hip-test` case (`cols=259`) exercises the scalar
+tail and still passes.
 The local shard is incomplete, so this is an attachment/timing result, not a
 quality result. Across all 43 layers the existing CPU/GPU reduction order
 accumulates `x_rel=0.148` and `logits_rel=0.113`, but the output is finite and
@@ -363,11 +435,47 @@ one layer with 16 CPU workers measured:
 | 128 | ~86 | 608.81 | ~7.1x | 0 |
 
 The current exact default on the complete staged 43-layer shard measures
-**3.45 tok/s CPU versus about 22.1 tok/s hybrid GPU at batch 64 (about 6.4x)**
-with zero argmax mismatches. The pre-LUT baseline was 21.388 tok/s; profiled
-runs vary around 21.3--22.1 tok/s. The earlier batch-16 checkpoint was 16.050 tok/s;
-batch 128 reaches 22.401 tok/s but currently has 3/128 mismatches and remains
-a tuning result, not the exactness baseline.
+**3.51 tok/s CPU versus 40.2 tok/s hybrid GPU at batch 64 (11.5x)** with zero
+argmax mismatches, using `--hip-ordered-fp8-layers 43`. Batch 128 reaches
+41.60 tok/s, also at 0/128 mismatches. At warmed long context the same
+configuration measures 37.63 tok/s at 4k and 37.06 tok/s at 8k, both 0/64.
+
+Of that, the last 35.0 -> 40.2 tok/s came from the CPU side. The routed-expert
+phase is the only significant CPU work left in prefill, and
+`ds4f_gemm_worker_x86`'s raw-MXFP4 branch ran its token loop *outermost*, so a
+tile of M tokens called `ds4f_mxfp4_unpack16` M times over the same weights --
+about fifteen ops to decode a 32-weight block against six to consume it for
+one token. `matvec_mxfp4_1row_f32_raw_4x` decodes once and feeds four tokens,
+each with its own accumulator pair in the original order, so every output is
+bit-identical to the 1-row kernel. With the tile quantized up front and the
+row loop hoisted outside the token loop (token blocks innermost, so a row's
+2 KB of weights stays in L1), the expert phase went 13.43 -> 9.78 ms/token.
+Note this targets AVX2/Zen1; the SVE path is unchanged.
+
+The previous exact figure was 21.3--22.1 tok/s. The gap was **not** kernel
+throughput: `m->gpu_dense_mixed` was being set from
+`hip_shared_bf16 || hip_shared_fp16`, so in the exact default it was 0. With
+mixed dispatch off, `ds4f_gemm_multi` sends a whole independent group to the
+CPU whenever any one member is CPU-owned — and the shared-expert group pairs
+`sh_w2` with the CPU-resident router `gate`. Shared-expert prefill was
+therefore paying 19.0 ms/token of CPU `sh_w2` work. Mixed dispatch is a
+routing policy, not a precision mode: each member keeps exactly the arithmetic
+it had before, so enabling it unconditionally moved `shared` from 19.0 to
+2.6 ms/token. The one argmax change it introduces on its own is the GPU
+reduction order for `sh_w2`, which `hip_ordered_fp8_layers` removes — hence
+0 mismatches at 35.28 tok/s.
+
+This also explains the old `hip_shared_bf16` / `hip_shared_fp16` results
+(34.40 and ~34--35 tok/s, 1 mismatch each). Those flags were never buying
+speed through BF16/FP16 weights; they were buying it by switching mixed
+dispatch on as a side effect. They are no longer needed to reach this rate.
+
+Two kernel hypotheses were tested against this and **falsified**: staging the
+256-entry E4M3 LUT in LDS to remove the dependent global gather, and
+re-indexing the FP8 GEMM's LDS weight staging so lanes read consecutive bytes
+instead of 16 rows `n_in` apart. Each is value-identical and each moved the
+shared phase by under 0.15 ms/token (19.08 -> 18.96 -> 19.00). Neither was
+kept. The FP8 GEMM tile is not the prefill bottleneck at these shapes.
 
 The default path uploads 344 FP8 MLA/shared matrices plus the BF16 head;
 routed MXFP4 experts and the router remain CPU-owned. Shared-input GEMM pairs
@@ -402,7 +510,11 @@ operational at approximately 9--11 tok/s; its remaining one-or-few argmax
 differences are deterministic cumulative error from SM120 FP4 activation
 quantization, not a dispatcher race. `--dual-cuda-mxfp4 0` selects the exact
 HIP MXFP4 path for small models, but the full 43-layer expert bank does not fit
-on the available 8-GB device, so it is not a full-model fallback.
+in the VRAM left after the dense bank, so it is not a full-model fallback.
+(An earlier revision of this line said "the available 8-GB device". That was
+wrong on both counts: the NVIDIA device is an RTX 5060 Ti with 16311 MiB total
+and about 14.4 GiB free, and the constraint is the dense bank sharing the AMD
+card, not an 8-GB part.)
 
 Routed expert buckets below 128 tokens use the exact CPU path; SM120 native MMQ
 is reserved for full x128 batches. This avoids unstable partial-tile launches
