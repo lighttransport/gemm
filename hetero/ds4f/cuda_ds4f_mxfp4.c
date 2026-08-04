@@ -128,8 +128,6 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, 
     memcpy(c->hx, x, (size_t)M * K * sizeof(float));
     CUresult xr = cuMemcpyHtoD(c->x, c->hx, xb);
     if (xr != CUDA_SUCCESS || cuCtxSynchronize() != CUDA_SUCCESS) return -1;
-    if (cuMemsetD8(c->q8, 0, q8b) != CUDA_SUCCESS) return -1;
-    if (cuMemsetD8(c->y, 0, yb) != CUDA_SUCCESS) return -1;
     long long ne00 = K, s01 = K, ne0 = (K + 511) & ~511;
     int by = ((int)ne0 + 63) / 64;
     long long s02 = 0, s03 = 0;
