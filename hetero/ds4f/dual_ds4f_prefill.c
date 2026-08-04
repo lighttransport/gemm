@@ -28,7 +28,10 @@ struct dual_ds4f_prefill {
 
 static int cuda_eligible(const dual_ds4f_prefill *c, const ds4f_tensor *t,
                          int M, int Ys, int Xs) {
-    return c && c->cuda_mxfp4 && t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= 1 &&
+    /* SM120's native MMQ entry points are only reliable for a full 64-row
+     * bucket.  Let the model's exact CPU fallback handle smaller routed
+     * expert buckets instead of entering an invalid partial tile launch. */
+    return c && c->cuda_mxfp4 && t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= 64 &&
            Ys == t->rows && Xs == t->cols && (t->rows % 128) == 0 &&
            (t->cols % 32) == 0;
 }
@@ -171,6 +174,7 @@ int dual_ds4f_prefill_gemm(void *opaque, float *dst, const ds4f_tensor *t,
                            const float *x, int M, int Ys, int Xs) {
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
     if (!c || !dst || !t || !x) return -1;
+    if (t->type == DS4F_MXFP4 && M < 64) return -1;
     if (cuda_eligible(c, t, M, Ys, Xs) &&
         dual_cuda_one(c, dst, t, x, M, Ys, Xs) == 0)
         return 0;
@@ -184,6 +188,9 @@ int dual_ds4f_prefill_gemm_multi(
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
     if (!c || !dst || !t || !x || !M || !Ys || !Xs || n < 1 || n > 32)
         return -1;
+    for (int i = 0; i < n; ++i)
+        if (t[i] && t[i]->type == DS4F_MXFP4 && M[i] < 64)
+            return -1; /* force ds4f_gemm()'s exact CPU fallback */
     int ci[32], hi[32], nc = 0, nh = 0;
     for (int i = 0; i < n; ++i) {
         if (cuda_eligible(c, t[i], M[i], Ys[i], Xs[i])) ci[nc++] = i;

@@ -207,7 +207,10 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
     int nty = (N + 127) / 128, ntx = use64 ? (Mp + 63) / 64 : (Mp + 127) / 128, tiles = nty * ntx;
     int waves = (tiles + c->nsm - 1) / c->nsm;
     int eff = 100 * tiles / (c->nsm * waves);
-    int sk = eff >= 90 ? tiles : c->nsm;
+    /* A small bucket must not launch idle scheduling blocks.  In particular,
+     * x64 MMQ/fixup can write past its valid tile set when sk exceeds tiles
+     * (common for M<64 expert buckets on a 36-SM device). */
+    int sk = tiles < c->nsm ? tiles : (eff >= 90 ? tiles : c->nsm);
     if (sk < 1) sk = 1;
     if (tiles == 1) sk = 1;
     if (c->verbose) fprintf(stderr, "mmq M=%d Mp=%d tiles=%d nsm=%d sk=%d fix=%d\n", M, Mp, tiles, c->nsm, sk, (tiles % sk) != 0);
