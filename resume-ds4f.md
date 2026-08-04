@@ -222,6 +222,24 @@ Falsified along the way, recorded so they are not retried:
   rules out MoE models (host-side top-K), and DS4F additionally runs host
   rmsnorm/RoPE/attention between GPU ops.
 
+**Phase 5 (dual-GPU prefill) is done.** It is no longer a regression and is
+now exact: batch 64 gives 39.8--40.1 tok/s at 0/64 mismatches, batch 128
+40.8--41.5 at 0/128, 4k/8k 36.5/36.1 at 0/64 -- all matching single-GPU on the
+same host. Three defects: dense tensors bound through dual's bind bypassed the
+ordered/fp16/bf16 variant selection (so dual ignored
+`--hip-ordered-fp8-layers`); `attach_prefill_backend` returned early for dual
+and dropped `gpu_dense_matvec`/`wait`/`blockdiag`, pushing M=1 residual
+matvecs to the CPU (fixed with forwarding wrappers, since `gpu_dense_ctx` is a
+single shared pointer); and the MXFP4 `gpu_id = 0` sentinel was applied
+regardless of batch, making every routed-expert group fail over one task at a
+time. `--dual-cuda-mxfp4 0` now also works instead of failing on a HIP bind of
+the 17.9 GiB expert bank.
+
+But **CUDA is inert**: `--hip-verbose 1` shows all 24 dispatched tasks as
+`cuda=0`, because routed-expert buckets never reach the SM120 MMQ path's
+M >= 128. With the PCIe finding above, engaging it would not help anyway. Dual
+is single-GPU parity plus an idle CUDA context.
+
 Not done, in value order, if more decode headroom is wanted: `ds4f_matvec_multi`
 still issues one synchronous round trip per tensor (`common/ds4f_impl.h:698`),
 so decode qkv pays ~129 launch+sync round trips per token where the async

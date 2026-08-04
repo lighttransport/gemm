@@ -503,9 +503,45 @@ make -C hetero/ds4f real-dual-test STAGE_DIR=/tmp/ds4f_nocopy_ep8 \
   PREFILL_BATCH=64 PREFILL_CONTEXT=0
 ```
 
+**2026-08-04 update.** The dual path is no longer a regression and is now
+exact: batch 64 measures **39.8--40.1 tok/s at 0/64 mismatches** and batch 128
+**40.8--41.5 tok/s at 0/128**, matching the single-GPU numbers on the same
+host, and 4k/8k measure 36.5/36.1 tok/s at 0/64. Three defects were fixed:
+
+1. Dense tensors were bound through `dual_ds4f_prefill_bind_tensor()`, which
+   always takes the plain FP8 bind and silently bypassed the ordered / fp16 /
+   bf16 variant selection. Dual therefore ignored `--hip-ordered-fp8-layers`
+   and reported mismatches the single path did not. Dual wraps the *same* HIP
+   context, so dense now binds through the normal HIP chain and dual's own
+   bind is used only for MXFP4 experts.
+2. `attach_prefill_backend()` returned early for dual and never installed
+   `gpu_dense_matvec` / `wait` / `blockdiag`, so prefill's M=1 residual
+   matvecs fell back to the CPU -- a different reduction order. Because
+   `gpu_dense_ctx` is one pointer shared by every callback, dual now supplies
+   forwarding wrappers (`dual_matvec`, `dual_wait`, `dual_blockdiag`, ...)
+   rather than leaving HIP entry points bound to a dual context.
+3. MXFP4 tensors were given a `gpu_id = 0` sentinel regardless of batch, which
+   made the dispatcher treat them as device-owned and fail every routed-expert
+   group over one task at a time. `dual_ds4f_prefill_set_max_batch()` now
+   leaves them CPU-owned unless the run can actually reach the SM120 MMQ
+   path's M >= 128. A deliberately CPU-owned tensor returns success, not the
+   negative code callers treat as a hard failure, and `--dual-cuda-mxfp4 0`
+   likewise leaves experts on the CPU instead of attempting a HIP bind of the
+   17.9 GiB expert bank (which cannot fit and previously failed the run).
+
+**CUDA is nonetheless inert at realistic batch sizes.** `--hip-verbose 1`
+reports every dispatched task as `cuda=0`: routed-expert buckets top out well
+below the M >= 128 the SM120 MMQ path requires. Combined with the PCIe gen3 x8
+finding above -- the bridge is PCIe-bound at 3.7 GB/s on its per-call weight
+upload -- engaging it would not help even if the buckets were larger. Dual
+mode is currently single-GPU parity plus an idle CUDA context; making the
+NVIDIA card earn its place needs resident experts, not a better kernel.
+
+The historical measurements below predate these fixes.
+
 The bridge gates pass at M=64 and M=128, and the direct small-bucket path
 also passes at M=7. Four-layer real dual runs reach approximately 129--133
-tok/s with zero argmax mismatches. The full 43-layer EP=8 shard is
+tok/s with zero argmax mismatches. The full 43-layer EP=8 shard was
 operational at approximately 9--11 tok/s; its remaining one-or-few argmax
 differences are deterministic cumulative error from SM120 FP4 activation
 quantization, not a dispatcher race. `--dual-cuda-mxfp4 0` selects the exact

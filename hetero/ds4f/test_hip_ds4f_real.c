@@ -379,11 +379,6 @@ static void fill_prefill_inputs(float *x, int batch, int C, int pos0) {
 static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
                                    dual_ds4f_prefill *dual,
                                    const ds4f_runtime_options *opt) {
-    if (dual) {
-        dual_ds4f_prefill_attach_model(m, dual);
-        m->gpu_dense_mixed = 1;
-        return;
-    }
     m->gpu_dense_ctx = hip;
     m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
     m->gpu_dense_async_multi = hip_async_enabled(opt)
@@ -397,6 +392,12 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
      * one CPU-only member (the router gate beside shared w2) sends every
      * member to the CPU; each member keeps its own arithmetic either way. */
     m->gpu_dense_mixed = 1;
+    /* Dual overrides only the batched GEMM entry points.  It must not drop
+     * the rest: without gpu_dense_matvec/wait/blockdiag the M=1 residual
+     * matvecs fall back to the CPU, which is a different reduction order from
+     * the single-GPU path and showed up as a spurious argmax mismatch. */
+    if (dual)
+        dual_ds4f_prefill_attach_model(m, dual);
 }
 
 static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
@@ -706,6 +707,7 @@ int main(int argc, char **argv) {
     if (dual) {
         dual_ds4f_prefill_set_cuda_mxfp4(dual, dual_cuda_mxfp4);
         dual_ds4f_prefill_set_cuda_terms(dual, dual_cuda_terms);
+        dual_ds4f_prefill_set_max_batch(dual, prefill_batch);
     }
     if (dual_gpu && !dual) {
         fprintf(stderr, "dual GPU dispatcher unavailable\n");
@@ -735,9 +737,13 @@ int main(int argc, char **argv) {
                           cases[i].t->type == DS4F_FP8;
         int ordered_wkv = (i == 2 && hip_ordered_wkv_layer(&opt, 0)) ||
                           (hip_ordered_fp8_layer(&opt, 0) && !shared_fp16 && !shared_bf16);
-        ids[i] = dual
-            ? dual_ds4f_prefill_bind_tensor(dual, cases[i].t)
-            : cases[i].t->type == DS4F_BF16
+        /* Dense tensors always bind through the HIP chain, even in dual mode:
+         * dual wraps this same HIP context, and routing them through
+         * dual_ds4f_prefill_bind_tensor() would silently drop the ordered /
+         * fp16 / bf16 variant selection below.  That is what made dual mode
+         * miss --hip-ordered-fp8-layers and report a spurious mismatch.
+         * Dual's own bind is only for the MXFP4 experts. */
+        ids[i] = cases[i].t->type == DS4F_BF16
             ? hip_ds4f_dense_bind_bf16_tensor(hip, cases[i].t)
             : ordered_wkv
                 ? hip_ds4f_dense_bind_fp8_ordered_tensor(hip, cases[i].t)
@@ -769,9 +775,7 @@ int main(int argc, char **argv) {
                               ts[j]->type == DS4F_FP8;
             int ordered_wkv = (j == 2 && hip_ordered_wkv_layer(&opt, L)) ||
                               (hip_ordered_fp8_layer(&opt, L) && !shared_fp16 && !shared_bf16);
-            int id = dual
-                ? dual_ds4f_prefill_bind_tensor(dual, ts[j])
-                : ts[j]->type == DS4F_BF16
+            int id = ts[j]->type == DS4F_BF16
                 ? hip_ds4f_dense_bind_bf16_tensor(hip, ts[j])
                 : ordered_wkv
                     ? hip_ds4f_dense_bind_fp8_ordered_tensor(hip, ts[j])
@@ -806,8 +810,7 @@ int main(int argc, char **argv) {
     }
     int head_id = -1;
     if (m->head.type == DS4F_BF16)
-        head_id = dual ? dual_ds4f_prefill_bind_tensor(dual, &m->head)
-                       : hip_ds4f_dense_bind_bf16_tensor(hip, &m->head);
+        head_id = hip_ds4f_dense_bind_bf16_tensor(hip, &m->head);
     if (head_id < 0) pass = 0;
     else {
         bank_bytes += ds4f_wbytes(m->head.type, m->head.rows, m->head.cols);

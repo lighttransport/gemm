@@ -14,6 +14,10 @@ dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip(hip_ds4f_dense *hip,
 void dual_ds4f_prefill_destroy(dual_ds4f_prefill *ctx);
 void dual_ds4f_prefill_set_cuda_mxfp4(dual_ds4f_prefill *ctx, int enabled);
 void dual_ds4f_prefill_set_cuda_terms(dual_ds4f_prefill *ctx, int terms);
+/* Largest M this run can present to a routed-expert GEMM.  The SM120 MMQ path
+ * needs M >= 128, so below that CUDA can never serve MXFP4 and those tensors
+ * must stay CPU-owned rather than carrying a device sentinel. */
+void dual_ds4f_prefill_set_max_batch(dual_ds4f_prefill *ctx, int max_batch);
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *ctx, ds4f_tensor *t);
 void dual_ds4f_prefill_attach_model(ds4f_model *model,
                                     dual_ds4f_prefill *ctx);

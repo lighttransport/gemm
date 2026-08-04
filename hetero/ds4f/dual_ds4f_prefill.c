@@ -24,6 +24,7 @@ struct dual_ds4f_prefill {
     pthread_mutex_t cuda_lock;
     int verbose;
     int cuda_mxfp4;
+    int max_batch;
 };
 
 static int cuda_eligible(const dual_ds4f_prefill *c, const ds4f_tensor *t,
@@ -145,21 +146,82 @@ void dual_ds4f_prefill_set_cuda_terms(dual_ds4f_prefill *c, int terms) {
     if (c) cuda_ds4f_mxfp4_set_terms(c->cuda, terms);
 }
 
+void dual_ds4f_prefill_set_max_batch(dual_ds4f_prefill *c, int max_batch) {
+    if (c) c->max_batch = max_batch;
+}
+
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *c, ds4f_tensor *t) {
     if (!c || !t) return -1;
     /* CUDA owns raw MXFP4 in dual mode and uploads only the current matrix;
      * avoid duplicating the complete expert bank in HIP VRAM.  A nonnegative
      * sentinel keeps the common dispatcher eligible for batched prefill. */
-    if (t->type == DS4F_MXFP4 && c->cuda_mxfp4) {
+    /* Only claim MXFP4 for CUDA when this run can actually reach the SM120
+     * MMQ path's M >= 128.  Otherwise the sentinel makes the common
+     * dispatcher treat the tensor as device-owned, and every routed-expert
+     * group then fails over one task at a time instead of using the fused CPU
+     * multi-GEMM dispatch. */
+    if (t->type == DS4F_MXFP4 && c->cuda_mxfp4 &&
+        (c->max_batch <= 0 || c->max_batch >= 128)) {
         if (!t->w || !t->scale || t->rows <= 0 || t->cols <= 0) return -1;
         t->gpu_id = 0;
         return 0;
     }
-    if (t->type == DS4F_MXFP4)
-        return hip_ds4f_dense_bind_mxfp4_tensor(c->hip, t);
+    if (t->type == DS4F_MXFP4 && c->cuda_mxfp4) {
+        /* Deliberately CPU-owned, which is a successful bind, not a failure:
+         * callers treat a negative return as a hard integration error. */
+        t->gpu_id = -1;
+        return 0;
+    }
+    if (t->type == DS4F_MXFP4) {
+        /* The owned expert bank is ~17.9 GiB and does not fit alongside the
+         * dense bank, so a HIP MXFP4 bind is not a usable full-model path.
+         * Leave the experts CPU-owned instead of failing the whole run. */
+        t->gpu_id = -1;
+        return 0;
+    }
     if (t->type == DS4F_BF16)
         return hip_ds4f_dense_bind_bf16_tensor(c->hip, t);
     return hip_ds4f_dense_bind_tensor(c->hip, t);
+}
+
+/* gpu_dense_ctx is a single pointer shared by every callback, so a dual
+ * context cannot be mixed with HIP-bound entry points.  Forward the non-GEMM
+ * operations to the wrapped HIP runner; dual only reimplements the batched
+ * GEMMs.  Without these the M=1 residual matvecs silently fall back to the
+ * CPU, which is a different reduction order from the single-GPU path. */
+static int dual_matvec(void *opaque, float *dst, const ds4f_tensor *t,
+                       const float *x) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return hip_ds4f_dense_matvec_tensor(c->hip, dst, t, x);
+}
+
+static int dual_async_multi(void *opaque, float *const *dst,
+                            const ds4f_tensor *const *t,
+                            const float *const *x, int n) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return hip_ds4f_dense_matvec_tensors_async(c->hip, dst, t, x, n);
+}
+
+static int dual_wait(void *opaque) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return hip_ds4f_dense_wait_tensors(c->hip);
+}
+
+static int dual_blockdiag(void *opaque, float *dst, const ds4f_tensor *t,
+                          const float *xbase, int gin, int glora, int goff) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return hip_ds4f_dense_matvec_blockdiag(c->hip, dst, t, xbase,
+                                           gin, glora, goff);
+}
+
+static int dual_prefill_attn(void *opaque, float *dst, const float *q,
+                             const uint16_t *kv, const float *sink, int M,
+                             int pos0, int n_heads, int head_dim, int kv_dim,
+                             int kv_slots, int window, float scale) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return hip_ds4f_dense_prefill_attention(c->hip, dst, q, kv, sink, M, pos0,
+                                            n_heads, head_dim, kv_dim,
+                                            kv_slots, window, scale);
 }
 
 void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
@@ -167,6 +229,11 @@ void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
     m->gpu_dense_ctx = c;
     m->gpu_dense_gemm = c ? dual_ds4f_prefill_gemm : NULL;
     m->gpu_dense_gemm_multi = c ? dual_ds4f_prefill_gemm_multi : NULL;
+    m->gpu_dense_matvec = c ? dual_matvec : NULL;
+    m->gpu_dense_async_multi = (c && m->gpu_dense_async_multi) ? dual_async_multi : NULL;
+    m->gpu_dense_wait = c ? dual_wait : NULL;
+    m->gpu_dense_blockdiag = c ? dual_blockdiag : NULL;
+    m->gpu_prefill_attn = (c && m->gpu_prefill_attn) ? dual_prefill_attn : NULL;
     m->gpu_dense_mixed = c ? 1 : 0;
 }
 
