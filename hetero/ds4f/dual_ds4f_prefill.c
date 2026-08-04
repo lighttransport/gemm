@@ -23,10 +23,12 @@ struct dual_ds4f_prefill {
     int cuda_rows, cuda_cols;
     pthread_mutex_t cuda_lock;
     int verbose;
+    int cuda_mxfp4;
 };
 
-static int cuda_eligible(const ds4f_tensor *t, int M, int Ys, int Xs) {
-    return t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= 1 &&
+static int cuda_eligible(const dual_ds4f_prefill *c, const ds4f_tensor *t,
+                         int M, int Ys, int Xs) {
+    return c && c->cuda_mxfp4 && t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= 1 &&
            Ys == t->rows && Xs == t->cols && (t->rows % 128) == 0 &&
            (t->cols % 32) == 0;
 }
@@ -34,7 +36,7 @@ static int cuda_eligible(const ds4f_tensor *t, int M, int Ys, int Xs) {
 static int dual_cuda_one(dual_ds4f_prefill *c, float *dst,
                          const ds4f_tensor *t, const float *x, int M,
                          int Ys, int Xs) {
-    if (!cuda_eligible(t, M, Ys, Xs)) return -1;
+    if (!cuda_eligible(c, t, M, Ys, Xs)) return -1;
     pthread_mutex_lock(&c->cuda_lock);
     int rc = 0;
     if (c->cuda_tensor != t || c->cuda_rows != t->rows ||
@@ -114,6 +116,7 @@ dual_ds4f_prefill *dual_ds4f_prefill_create(int hip_device, int cuda_device,
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->verbose = verbose;
+    c->cuda_mxfp4 = 1;
     pthread_mutex_init(&c->cuda_lock, NULL);
     c->hip = hip_ds4f_dense_create(hip_device, verbose);
     c->owns_hip = 1;
@@ -135,6 +138,7 @@ dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip(hip_ds4f_dense *hip,
     if (!c) return NULL;
     c->hip = hip;
     c->verbose = verbose;
+    c->cuda_mxfp4 = 1;
     pthread_mutex_init(&c->cuda_lock, NULL);
     c->cuda = cuda_ds4f_mxfp4_create(cuda_device, verbose);
     if (!c->cuda) {
@@ -152,16 +156,22 @@ void dual_ds4f_prefill_destroy(dual_ds4f_prefill *c) {
     free(c);
 }
 
+void dual_ds4f_prefill_set_cuda_mxfp4(dual_ds4f_prefill *c, int enabled) {
+    if (c) c->cuda_mxfp4 = enabled != 0;
+}
+
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *c, ds4f_tensor *t) {
     if (!c || !t) return -1;
     /* CUDA owns raw MXFP4 in dual mode and uploads only the current matrix;
      * avoid duplicating the complete expert bank in HIP VRAM.  A nonnegative
      * sentinel keeps the common dispatcher eligible for batched prefill. */
-    if (t->type == DS4F_MXFP4) {
+    if (t->type == DS4F_MXFP4 && c->cuda_mxfp4) {
         if (!t->w || !t->scale || t->rows <= 0 || t->cols <= 0) return -1;
         t->gpu_id = 0;
         return 0;
     }
+    if (t->type == DS4F_MXFP4)
+        return hip_ds4f_dense_bind_mxfp4_tensor(c->hip, t);
     if (t->type == DS4F_BF16)
         return hip_ds4f_dense_bind_bf16_tensor(c->hip, t);
     return hip_ds4f_dense_bind_tensor(c->hip, t);
@@ -179,7 +189,7 @@ int dual_ds4f_prefill_gemm(void *opaque, float *dst, const ds4f_tensor *t,
                            const float *x, int M, int Ys, int Xs) {
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
     if (!c || !dst || !t || !x) return -1;
-    if (cuda_eligible(t, M, Ys, Xs) &&
+    if (cuda_eligible(c, t, M, Ys, Xs) &&
         dual_cuda_one(c, dst, t, x, M, Ys, Xs) == 0)
         return 0;
     return hip_ds4f_dense_gemm_tensor(c->hip, dst, t, x, M, Ys, Xs);
@@ -194,13 +204,13 @@ int dual_ds4f_prefill_gemm_multi(
         return -1;
     int ci[32], hi[32], nc = 0, nh = 0;
     for (int i = 0; i < n; ++i) {
-        if (cuda_eligible(t[i], M[i], Ys[i], Xs[i])) ci[nc++] = i;
+        if (cuda_eligible(c, t[i], M[i], Ys[i], Xs[i])) ci[nc++] = i;
         else hi[nh++] = i;
         if (c->verbose)
             fprintf(stderr, "dual task %d type=%d M=%d rows=%d cols=%d cuda=%d\n",
                     i, t[i] ? t[i]->type : -1, M[i], t[i] ? t[i]->rows : 0,
                     t[i] ? t[i]->cols : 0,
-                    cuda_eligible(t[i], M[i], Ys[i], Xs[i]));
+                    cuda_eligible(c, t[i], M[i], Ys[i], Xs[i]));
     }
     if (!nc) return hip_ds4f_dense_gemm_tensors(c->hip, dst, t, x, M, Ys, Xs, n);
     if (!nh) {

@@ -32,7 +32,7 @@ static void usage(const char *prog) {
                     "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
                     "--hip-mxfp4-stream-raw 0|1 "
                     "--hip-prefill-attn 0|1 "
-                    "[--dual-gpu 0|1 --cuda-device n] "
+                    "[--dual-gpu 0|1 --cuda-device n --dual-cuda-mxfp4 0|1] "
                     "[--hip-mxfp4-gemm-test] [--hip-mxfp4-widened-gemm-test] "
                     "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
 }
@@ -487,6 +487,7 @@ int main(int argc, char **argv) {
     ds4f_runtime_options_init(&opt);
     char config_path[1024] = {0};
     int debug_env = 0, bank_layers = 1, layers = 0, dual_gpu = 0, cuda_device = 0;
+    int dual_cuda_mxfp4 = 1;
     int mxfp4_test = 0, mxfp4_widened_test = 0;
     int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
     /* Load JSON first so explicit command-line values have the conventional
@@ -534,6 +535,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-prefill-attn") == 0 && i + 1 < argc) opt.hip_prefill_attn = atoi(argv[++i]);
         else if (strcmp(a, "--dual-gpu") == 0 && i + 1 < argc) dual_gpu = atoi(argv[++i]);
         else if (strcmp(a, "--cuda-device") == 0 && i + 1 < argc) cuda_device = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-cuda-mxfp4") == 0 && i + 1 < argc) dual_cuda_mxfp4 = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-gemm-test") == 0) mxfp4_test = 1;
         else if (strcmp(a, "--hip-mxfp4-widened-gemm-test") == 0) mxfp4_widened_test = 1;
         else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
@@ -577,6 +579,7 @@ int main(int argc, char **argv) {
     }
     dual_ds4f_prefill *dual = dual_gpu
         ? dual_ds4f_prefill_wrap_hip(hip, cuda_device, opt.hip_verbose) : NULL;
+    if (dual) dual_ds4f_prefill_set_cuda_mxfp4(dual, dual_cuda_mxfp4);
     if (dual_gpu && !dual) {
         fprintf(stderr, "dual GPU dispatcher unavailable\n");
         hip_ds4f_dense_destroy(hip); ds4f_free(m); return 0;
