@@ -2,7 +2,7 @@
 
 CC = gcc
 NVCC = nvcc
-CFLAGS = -O3 -Wall -Wextra -I.. -mavx2 -mfma -march=native
+CFLAGS = -O3 -Wall -Wextra -D_GNU_SOURCE -I.. -mavx2 -mfma -march=native
 LDFLAGS = -ldl -lm -lpthread
 
 CUEW_SRC = ../cuew.c
