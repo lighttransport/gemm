@@ -2,6 +2,7 @@
 
 #include "../../common/ds4f.h"
 #include "hip_ds4f_dense.h"
+#include "dual_ds4f_prefill.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -31,6 +32,7 @@ static void usage(const char *prog) {
                     "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
                     "--hip-mxfp4-stream-raw 0|1 "
                     "--hip-prefill-attn 0|1 "
+                    "[--dual-gpu 0|1 --cuda-device n] "
                     "[--hip-mxfp4-gemm-test] [--hip-mxfp4-widened-gemm-test] "
                     "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
 }
@@ -265,7 +267,28 @@ static void fill_prefill_inputs(float *x, int batch, int C, int pos0) {
         x[(size_t)mm*C+i] = ((float)((i * 29 + (mm + pos0) * 17) % 101) - 50.0f) / 37.0f;
 }
 
-static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
+static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
+                                   dual_ds4f_prefill *dual,
+                                   const ds4f_runtime_options *opt) {
+    if (dual) {
+        dual_ds4f_prefill_attach_model(m, dual);
+        m->gpu_dense_mixed = 1;
+        return;
+    }
+    m->gpu_dense_ctx = hip;
+    m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
+    m->gpu_dense_async_multi = hip_async_enabled(opt)
+        ? hip_ds4f_dense_matvec_tensors_async : NULL;
+    m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
+    m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
+    m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
+    m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
+}
+
+static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
+                             dual_ds4f_prefill *dual, int batch,
                              int context, const ds4f_runtime_options *opt) {
     if (!m->exact || m->mhc || m->tierb2 || m->int8_kv) {
         fprintf(stderr, "real hybrid prefill: requires exact && !mhc && !tierb2 && !int8_kv\n");
@@ -324,15 +347,11 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
     if (diag) memcpy(cpu_logits, m->p_logits,
                      (size_t)batch * hrows * sizeof(float));
 
-    m->gpu_dense_ctx = hip;
-    m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
-    m->gpu_dense_async_multi = hip_async_enabled(opt)
-        ? hip_ds4f_dense_matvec_tensors_async : NULL;
-    m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
-    m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
-    m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
-    m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
-    m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    attach_prefill_backend(m, hip, dual, opt);
+    if (dual) {
+        m->gpu_dense_gemm_multi = dual_ds4f_prefill_gemm_multi;
+        m->gpu_dense_gemm = dual_ds4f_prefill_gemm;
+    }
     m->gpu_dense_layer_prefetch = opt->hip_mxfp4_stream_raw &&
         hip_mxfp4_streaming(opt)
         ? hip_ds4f_dense_prefetch_layer_raw : NULL;
@@ -467,7 +486,7 @@ int main(int argc, char **argv) {
     ds4f_runtime_options opt;
     ds4f_runtime_options_init(&opt);
     char config_path[1024] = {0};
-    int debug_env = 0, bank_layers = 1, layers = 0;
+    int debug_env = 0, bank_layers = 1, layers = 0, dual_gpu = 0, cuda_device = 0;
     int mxfp4_test = 0, mxfp4_widened_test = 0;
     int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
     /* Load JSON first so explicit command-line values have the conventional
@@ -513,6 +532,8 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-vram-reserve-mb") == 0 && i + 1 < argc) opt.hip_vram_reserve_mb = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-stream-raw") == 0 && i + 1 < argc) opt.hip_mxfp4_stream_raw = atoi(argv[++i]);
         else if (strcmp(a, "--hip-prefill-attn") == 0 && i + 1 < argc) opt.hip_prefill_attn = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-gpu") == 0 && i + 1 < argc) dual_gpu = atoi(argv[++i]);
+        else if (strcmp(a, "--cuda-device") == 0 && i + 1 < argc) cuda_device = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-gemm-test") == 0) mxfp4_test = 1;
         else if (strcmp(a, "--hip-mxfp4-widened-gemm-test") == 0) mxfp4_widened_test = 1;
         else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
@@ -554,6 +575,12 @@ int main(int argc, char **argv) {
         ds4f_free(m);
         return 0;
     }
+    dual_ds4f_prefill *dual = dual_gpu
+        ? dual_ds4f_prefill_wrap_hip(hip, cuda_device, opt.hip_verbose) : NULL;
+    if (dual_gpu && !dual) {
+        fprintf(stderr, "dual GPU dispatcher unavailable\n");
+        hip_ds4f_dense_destroy(hip); ds4f_free(m); return 0;
+    }
 
     ds4f_layer *ly = &m->layers[0];
     struct { const char *name; ds4f_tensor *t; int bench; } cases[] = {
@@ -578,7 +605,9 @@ int main(int argc, char **argv) {
                           cases[i].t->type == DS4F_FP8;
         int ordered_wkv = (i == 2 && hip_ordered_wkv_layer(&opt, 0)) ||
                           (hip_ordered_fp8_layer(&opt, 0) && !shared_fp16 && !shared_bf16);
-        ids[i] = cases[i].t->type == DS4F_BF16
+        ids[i] = dual
+            ? dual_ds4f_prefill_bind_tensor(dual, cases[i].t)
+            : cases[i].t->type == DS4F_BF16
             ? hip_ds4f_dense_bind_bf16_tensor(hip, cases[i].t)
             : ordered_wkv
                 ? hip_ds4f_dense_bind_fp8_ordered_tensor(hip, cases[i].t)
@@ -610,7 +639,9 @@ int main(int argc, char **argv) {
                               ts[j]->type == DS4F_FP8;
             int ordered_wkv = (j == 2 && hip_ordered_wkv_layer(&opt, L)) ||
                               (hip_ordered_fp8_layer(&opt, L) && !shared_fp16 && !shared_bf16);
-            int id = ts[j]->type == DS4F_BF16
+            int id = dual
+                ? dual_ds4f_prefill_bind_tensor(dual, ts[j])
+                : ts[j]->type == DS4F_BF16
                 ? hip_ds4f_dense_bind_bf16_tensor(hip, ts[j])
                 : ordered_wkv
                     ? hip_ds4f_dense_bind_fp8_ordered_tensor(hip, ts[j])
@@ -631,7 +662,8 @@ int main(int argc, char **argv) {
     }
     int head_id = -1;
     if (m->head.type == DS4F_BF16)
-        head_id = hip_ds4f_dense_bind_bf16_tensor(hip, &m->head);
+        head_id = dual ? dual_ds4f_prefill_bind_tensor(dual, &m->head)
+                       : hip_ds4f_dense_bind_bf16_tensor(hip, &m->head);
     if (head_id < 0) pass = 0;
     else {
         bank_bytes += ds4f_wbytes(m->head.type, m->head.rows, m->head.cols);
@@ -673,10 +705,11 @@ int main(int argc, char **argv) {
         pass &= forward_ab(m, hip, &opt);
         if (iters > 0) pass &= benchmark_forward(m, hip, iters, pos0, warm, &opt);
         if (prefill_batch > 1)
-            pass &= benchmark_prefill(m, hip, prefill_batch, prefill_context, &opt);
+            pass &= benchmark_prefill(m, hip, dual, prefill_batch, prefill_context, &opt);
     }
     printf("%s\n", pass ? "PASS" : "FAIL");
 
+    dual_ds4f_prefill_destroy(dual);
     hip_ds4f_dense_destroy(hip);
     ds4f_free(m);
     return pass ? 0 : 1;

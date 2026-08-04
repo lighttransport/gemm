@@ -34,12 +34,15 @@ $(BUILD)/test_hip_ds4f_dense: test_hip_ds4f_dense.c hip_ds4f_dense.c \
 		../../rdna4/rocew.c $(LDFLAGS)
 
 $(BUILD)/test_hip_ds4f_real: test_hip_ds4f_real.c hip_ds4f_dense.c \
+                             dual_ds4f_prefill.c dual_ds4f_prefill.h \
+                             cuda_ds4f_mxfp4.c cuda_ds4f_mxfp4.h \
                              hip_ds4f_dense.h hip_ds4f_kernels.h \
                              ../../common/ds4f.h ../../common/ds4f_impl.h \
                              ../../rdna4/rocew.c ../../rdna4/rocew.h \
                              ../../rdna4/hip_runner_common.h | $(BUILD)
-	$(CC) $(CFLAGS) $(INCS) -o $@ test_hip_ds4f_real.c hip_ds4f_dense.c \
-		../../rdna4/rocew.c $(LDFLAGS)
+	$(CC) $(CFLAGS) $(INCS) -I../../cuda -o $@ test_hip_ds4f_real.c \
+		hip_ds4f_dense.c dual_ds4f_prefill.c cuda_ds4f_mxfp4.c \
+		../../rdna4/rocew.c ../../cuda/cuew.c $(LDFLAGS)
 
 $(BUILD)/test_hip_ds4f_forward: test_hip_ds4f_forward.c hip_ds4f_dense.c \
                                 hip_ds4f_dense.h hip_ds4f_kernels.h \

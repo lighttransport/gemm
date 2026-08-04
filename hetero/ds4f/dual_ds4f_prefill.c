@@ -17,6 +17,7 @@ typedef struct {
 
 struct dual_ds4f_prefill {
     hip_ds4f_dense *hip;
+    int owns_hip;
     cuda_ds4f_mxfp4 *cuda;
     const ds4f_tensor *cuda_tensor;
     int cuda_rows, cuda_cols;
@@ -69,9 +70,18 @@ static void *dual_cuda_worker(void *opaque) {
 static void *dual_hip_worker(void *opaque) {
     dual_job *j = (dual_job *)opaque;
     j->rc = 0;
-    if (j->n > 0 && hip_ds4f_dense_gemm_tensors(
-            j->ctx->hip, j->dst, j->t, j->x, j->M, j->Ys, j->Xs, j->n) != 0)
-        j->rc = -1;
+    if (j->n > 0) {
+        float *dst[32]; const ds4f_tensor *t[32]; const float *x[32];
+        int M[32], Ys[32], Xs[32];
+        for (int k = 0; k < j->n; ++k) {
+            int i = j->idx[k];
+            dst[k] = j->dst[i]; t[k] = j->t[i]; x[k] = j->x[i];
+            M[k] = j->M[i]; Ys[k] = j->Ys[i]; Xs[k] = j->Xs[i];
+        }
+        if (hip_ds4f_dense_gemm_tensors(j->ctx->hip, dst, t, x, M, Ys, Xs,
+                                        j->n) != 0)
+            j->rc = -1;
+    }
     return NULL;
 }
 
@@ -82,6 +92,7 @@ dual_ds4f_prefill *dual_ds4f_prefill_create(int hip_device, int cuda_device,
     c->verbose = verbose;
     pthread_mutex_init(&c->cuda_lock, NULL);
     c->hip = hip_ds4f_dense_create(hip_device, verbose);
+    c->owns_hip = 1;
     c->cuda = cuda_ds4f_mxfp4_create(cuda_device, verbose);
     if (!c->hip || !c->cuda) {
         if (verbose)
@@ -93,18 +104,40 @@ dual_ds4f_prefill *dual_ds4f_prefill_create(int hip_device, int cuda_device,
     return c;
 }
 
+dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip(hip_ds4f_dense *hip,
+                                              int cuda_device, int verbose) {
+    if (!hip) return NULL;
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->hip = hip;
+    c->verbose = verbose;
+    pthread_mutex_init(&c->cuda_lock, NULL);
+    c->cuda = cuda_ds4f_mxfp4_create(cuda_device, verbose);
+    if (!c->cuda) {
+        dual_ds4f_prefill_destroy(c);
+        return NULL;
+    }
+    return c;
+}
+
 void dual_ds4f_prefill_destroy(dual_ds4f_prefill *c) {
     if (!c) return;
     cuda_ds4f_mxfp4_destroy(c->cuda);
-    hip_ds4f_dense_destroy(c->hip);
+    if (c->owns_hip) hip_ds4f_dense_destroy(c->hip);
     pthread_mutex_destroy(&c->cuda_lock);
     free(c);
 }
 
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *c, ds4f_tensor *t) {
     if (!c || !t) return -1;
-    if (t->type == DS4F_MXFP4)
-        return hip_ds4f_dense_bind_mxfp4_tensor(c->hip, t);
+    /* CUDA owns raw MXFP4 in dual mode and uploads only the current matrix;
+     * avoid duplicating the complete expert bank in HIP VRAM.  A nonnegative
+     * sentinel keeps the common dispatcher eligible for batched prefill. */
+    if (t->type == DS4F_MXFP4) {
+        if (!t->w || !t->scale || t->rows <= 0 || t->cols <= 0) return -1;
+        t->gpu_id = 0;
+        return 0;
+    }
     if (t->type == DS4F_BF16)
         return hip_ds4f_dense_bind_bf16_tensor(c->hip, t);
     return hip_ds4f_dense_bind_tensor(c->hip, t);

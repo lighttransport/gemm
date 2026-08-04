@@ -9,6 +9,8 @@ typedef struct dual_ds4f_prefill dual_ds4f_prefill;
 
 dual_ds4f_prefill *dual_ds4f_prefill_create(int hip_device, int cuda_device,
                                              int verbose);
+dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip(hip_ds4f_dense *hip,
+                                              int cuda_device, int verbose);
 void dual_ds4f_prefill_destroy(dual_ds4f_prefill *ctx);
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *ctx, ds4f_tensor *t);
 void dual_ds4f_prefill_attach_model(ds4f_model *model,
