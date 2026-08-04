@@ -4,14 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 typedef struct { unsigned int x, y, z; } ds4f_u3;
 struct cuda_ds4f_mxfp4 {
     CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64;
     CUstream stream; CUevent quant_done;
     CUdeviceptr w, x, q8, y, tmpfix, ids; size_t xb, q8b, yb, fixb, wb, idsb;
-    void *hx, *hy, *hw; size_t hxb, hyb, hwb;
-    int rows, cols, nsm; int verbose;
+    void *hx, *hy, *hw, *hres, *hsecond; size_t hxb, hyb, hwb, hresb, hsecondb;
+    int rows, cols, nsm; int verbose; int terms;
 };
 static ds4f_u3 fastdiv(unsigned long long d) {
     unsigned int L = 0, di = (unsigned int)d;
@@ -65,6 +66,8 @@ void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (c->hx && cuMemFreeHost) cuMemFreeHost(c->hx);
     if (c->hy && cuMemFreeHost) cuMemFreeHost(c->hy);
     if (c->hw && cuMemFreeHost) cuMemFreeHost(c->hw);
+    if (c->hres && cuMemFreeHost) cuMemFreeHost(c->hres);
+    if (c->hsecond && cuMemFreeHost) cuMemFreeHost(c->hsecond);
     if (c->quant_done) cuEventDestroy(c->quant_done); if (c->stream) cuStreamDestroy(c->stream); if (c->mod) cuModuleUnload(c->mod);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev); free(c);
 }
@@ -98,7 +101,8 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     int rc = cuMemAlloc(&c->w, bytes) == CUDA_SUCCESS && cuMemcpyHtoD(c->w, p, bytes) == CUDA_SUCCESS ? 0 : -1;
     if (!rc) { c->wb = bytes; c->rows = rows; c->cols = cols; } return rc;
 }
-int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, int N, int K) {
+static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
+                                     const float *x, int M, int N, int K) {
     if (!c || !dst || !x || !c->w || M < 1 || N != c->rows || K != c->cols || N % 128 || K % 32) return -1;
     if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     /* The x64 MMQ specialization requires a full 64-row tile.  Pad tiny
@@ -172,5 +176,74 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, 
     for (int r = 0; r < M; ++r)
         memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
                (size_t)N * sizeof(float));
+    return 0;
+}
+
+/* Match mmqv_quant_mxfp4's nearest E2M1 representation on the host and form
+ * the residual term for the optional two-term activation decomposition. */
+static void make_mxfp4_residual(float *res, const float *x, int M, int Mp, int K) {
+    static const float lut[8] = { 0.0f, .5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    memset(res, 0, (size_t)Mp * K * sizeof(float));
+    for (int r = 0; r < M; ++r) {
+        for (int b = 0; b < K / 32; ++b) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                float a = fabsf(x[(size_t)r * K + b * 32 + j]);
+                if (a > amax) amax = a;
+            }
+            int e = amax > 0.0f ? (int)lrintf(log2f(amax)) - 2 + 127 : 0;
+            if (e < 0) e = 0;
+            if (e > 254) e = 254;
+            float scale = amax > 0.0f ? ldexpf(1.0f, e - 127) : 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                float v = x[(size_t)r * K + b * 32 + j];
+                float av = scale > 0.0f ? v / scale : 0.0f;
+                int q = 0;
+                float err = fabsf(av) - lut[0];
+                for (int i = 1; i < 8; ++i) {
+                    float d = fabsf(fabsf(av) - lut[i]);
+                    if (d < err) { err = d; q = i; }
+                }
+                float qv = scale * lut[q];
+                if (av < 0.0f) qv = -qv;
+                res[(size_t)r * K + b * 32 + j] = v - qv;
+            }
+        }
+    }
+}
+
+void cuda_ds4f_mxfp4_set_terms(cuda_ds4f_mxfp4 *c, int terms) {
+    if (c) c->terms = terms < 2 ? 1 : 2;
+}
+
+int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
+                         int M, int N, int K) {
+    if (!c || c->terms < 2)
+        return cuda_ds4f_mxfp4_gemm_once(c, dst, x, M, N, K);
+    int Mp = M < 128 ? (M < 64 ? 64 : M) : ((M + 127) & ~127);
+    size_t xb = (size_t)Mp * K * sizeof(float);
+    size_t yb = (size_t)Mp * N * sizeof(float);
+    if (!cuMemHostAlloc || !cuMemFreeHost) return -1;
+    if (c->hresb < xb) {
+        if (c->hres) cuMemFreeHost(c->hres);
+        c->hres = NULL; c->hresb = 0;
+        if (cuMemHostAlloc(&c->hres, xb, 0) != CUDA_SUCCESS) return -1;
+        c->hresb = xb;
+    }
+    if (c->hsecondb < yb) {
+        if (c->hsecond) cuMemFreeHost(c->hsecond);
+        c->hsecond = NULL; c->hsecondb = 0;
+        if (cuMemHostAlloc(&c->hsecond, yb, 0) != CUDA_SUCCESS) return -1;
+        c->hsecondb = yb;
+    }
+    make_mxfp4_residual((float *)c->hres, x, M, Mp, K);
+    if (cuda_ds4f_mxfp4_gemm_once(c, dst, x, M, N, K) != 0 ||
+        cuda_ds4f_mxfp4_gemm_once(c, (float *)c->hsecond,
+                                  (const float *)c->hres, M, N, K) != 0)
+        return -1;
+    for (int r = 0; r < M; ++r)
+        for (int n = 0; n < N; ++n)
+            dst[(size_t)r * N + n] +=
+                ((const float *)c->hsecond)[(size_t)r * N + n];
     return 0;
 }

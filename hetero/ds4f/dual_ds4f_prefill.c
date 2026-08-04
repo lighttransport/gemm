@@ -138,6 +138,10 @@ void dual_ds4f_prefill_set_cuda_mxfp4(dual_ds4f_prefill *c, int enabled) {
     if (c) c->cuda_mxfp4 = enabled != 0;
 }
 
+void dual_ds4f_prefill_set_cuda_terms(dual_ds4f_prefill *c, int terms) {
+    if (c) cuda_ds4f_mxfp4_set_terms(c->cuda, terms);
+}
+
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *c, ds4f_tensor *t) {
     if (!c || !t) return -1;
     /* CUDA owns raw MXFP4 in dual mode and uploads only the current matrix;

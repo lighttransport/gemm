@@ -113,6 +113,7 @@ real-dual-test: $(BUILD)/test_hip_ds4f_real
 		--prefill-batch $(or $(PREFILL_BATCH),64) \
 		--prefill-context $(or $(PREFILL_CONTEXT),0) \
 		--dual-gpu 1 --cuda-device $(or $(CUDA_DEVICE),0) \
+		--dual-cuda-terms $(or $(DUAL_CUDA_TERMS),1) \
 		--hip-device $(or $(HIP_DEVICE),0) --hip-verbose $(or $(HIP_VERBOSE),0) \
 		--hip-exact-prefill $(or $(HIP_EXACT_PREFILL),0)
 
