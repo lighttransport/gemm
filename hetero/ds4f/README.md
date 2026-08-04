@@ -416,6 +416,12 @@ still shown a small number of argmax differences (typically 3--4/64), so it
 is not yet a strict mismatch-free mode. The one-term default is about 10--12
 tok/s and can drift more; two-term is the quality setting.
 
+For a strict CPU-reference quality gate, `--hip-exact-prefill 1` disables the
+approximate HIP dense prefill path: the full context=128 dual-GPU run measured
+0/64 mismatches at 3.64 tok/s. The default approximate path is about 10--11
+tok/s; its remaining long-context differences originate in AMD dense
+approximation rather than the SM120 expert dispatcher.
+
 The fast GPU prefill path is numerically approximate over a separately generated
 KV history: small dense-GEMM reduction differences can accumulate into a few
 CPU-reference argmax changes at long context. For a guaranteed CPU-reference
