@@ -99,14 +99,12 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     if (!rc) { c->wb = bytes; c->rows = rows; c->cols = cols; } return rc;
 }
 int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, int N, int K) {
-    /* Native MMQ is used for prefill-sized batches; leave decode/tiny batches
-     * to the existing HIP/CPU path until a separate small-N kernel is wired. */
-    if (!c || !dst || !x || !c->w || M < 64 || N != c->rows || K != c->cols || N % 128 || K % 32) return -1;
+    if (!c || !dst || !x || !c->w || M < 1 || N != c->rows || K != c->cols || N % 128 || K % 32) return -1;
     if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     /* The x64 MMQ specialization requires a full 64-row tile.  Pad tiny
      * batches to the proven x128 path; normal prefill batches use x64/x128. */
-    const int use64 = M >= 64 && M < 128;
-    const int Mp = use64 ? M : ((M + 127) & ~127);
+    const int use64 = M < 128;
+    const int Mp = use64 ? (M < 64 ? 64 : M) : ((M + 127) & ~127);
     size_t xb = (size_t)Mp * K * sizeof(float), q8b = (size_t)Mp * ((K + 255) & ~255) / 256 * 144 + 256 * 144, yb = (size_t)Mp * N * sizeof(float);
     if (!c->x || c->xb < xb) { if (c->x) cuMemFree(c->x); if (cuMemAlloc(&c->x, xb) != CUDA_SUCCESS) return -1; c->xb = xb; }
     if (!c->q8 || c->q8b < q8b) { if (c->q8) cuMemFree(c->q8); if (cuMemAlloc(&c->q8, q8b) != CUDA_SUCCESS) return -1; c->q8b = q8b; }
