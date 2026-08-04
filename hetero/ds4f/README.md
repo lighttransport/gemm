@@ -404,13 +404,13 @@ quantization, not a dispatcher race. `--dual-cuda-mxfp4 0` selects the exact
 HIP MXFP4 path for small models, but the full 43-layer expert bank does not fit
 on the available 8-GB device, so it is not a full-model fallback.
 
-For mismatch-free CUDA execution, pass `--dual-cuda-terms 2` (or set
+For the highest-quality CUDA approximation, pass `--dual-cuda-terms 2` (or set
 `DUAL_CUDA_TERMS=2` for `real-dual-test`). The bridge decomposes each
-activation into two FP4 terms and accumulates two SM120 GEMMs. The full
-43-layer staged gate reached **0/64 mismatches at 8.0 tok/s** in this mode;
-the one-term default reached about 12 tok/s with occasional long-context
-drift. The two-term mode is therefore the quality setting, while one-term is
-the throughput setting.
+activation into two FP4 terms and accumulates two SM120 GEMMs. This reduces
+the full-model drift substantially, but repeated 43-layer staged runs have
+still shown a small number of argmax differences (typically 3--4/64), so it
+is not yet a strict mismatch-free mode. The one-term default is about 10--12
+tok/s and can drift more; two-term is the quality setting.
 
 The fast GPU prefill path is numerically approximate over a separately generated
 KV history: small dense-GEMM reduction differences can accumulate into a few
