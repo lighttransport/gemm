@@ -132,6 +132,11 @@ extern "C" __global__ void mmqv_quant_mxfp4_rows(
     if (lane == 0) out->d4[quad] = (uint32_t)scale[0] | ((uint32_t)scale[1] << 8);
 }
 
+extern "C" __global__ void mmqv_add_f32(float *dst, const float *src, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) dst[i] += src[i];
+}
+
 // ---------------------------------------------------------------------------
 // Activation quantizer: float -> block_q8_1_mmq.  Copied verbatim from
 // llama.cpp ggml/src/ggml-cuda/quantize.cu (MIT, same commit) so it lives in

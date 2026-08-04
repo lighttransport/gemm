@@ -8,10 +8,10 @@
 
 typedef struct { unsigned int x, y, z; } ds4f_u3;
 struct cuda_ds4f_mxfp4 {
-    CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64;
+    CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64, add;
     CUstream stream; CUevent quant_done;
-    CUdeviceptr w, x, q8, y, tmpfix, ids; size_t xb, q8b, yb, fixb, wb, idsb;
-    void *hx, *hy, *hw, *hres, *hsecond; size_t hxb, hyb, hwb, hresb, hsecondb;
+    CUdeviceptr w, x, q8, y, y2, tmpfix, ids; size_t xb, q8b, yb, y2b, fixb, wb, idsb;
+    void *hx, *hy, *hw, *hres; size_t hxb, hyb, hwb, hresb;
     int rows, cols, nsm; int verbose; int terms;
 };
 static ds4f_u3 fastdiv(unsigned long long d) {
@@ -49,7 +49,8 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
         ck(cuModuleGetFunction(&c->quant_fp4, c->mod, "mmqv_quant_mxfp4"), "mxfp4 quantizer") ||
         ck(cuModuleGetFunction(&c->quant_rows, c->mod, "mmqv_quant_mxfp4_rows"), "row quantizer") ||
         ck(cuModuleGetFunction(&c->gemm, c->mod, "mmqv_mxfp4_x128_nc0"), "mxfp4") ||
-        ck(cuModuleGetFunction(&c->gemm64, c->mod, "mmqv_mxfp4_x64_nc0"), "mxfp4 x64")) goto fail;
+        ck(cuModuleGetFunction(&c->gemm64, c->mod, "mmqv_mxfp4_x64_nc0"), "mxfp4 x64") ||
+        ck(cuModuleGetFunction(&c->add, c->mod, "mmqv_add_f32"), "f32 add")) goto fail;
     cuModuleGetFunction(&c->fixup, c->mod, "mmqv_fixup_mxfp4_x128_nc0");
     cuModuleGetFunction(&c->fixup64, c->mod, "mmqv_fixup_mxfp4_x64_nc0");
     cuDeviceGetAttribute(&c->nsm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, c->dev);
@@ -62,12 +63,11 @@ fail: cuda_ds4f_mxfp4_destroy(c); return NULL;
 }
 void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (!c) return; if (c->stream) cuStreamSynchronize(c->stream);
-    if (c->w) cuMemFree(c->w); if (c->x) cuMemFree(c->x); if (c->q8) cuMemFree(c->q8); if (c->y) cuMemFree(c->y); if (c->tmpfix) cuMemFree(c->tmpfix); if (c->ids) cuMemFree(c->ids);
+    if (c->w) cuMemFree(c->w); if (c->x) cuMemFree(c->x); if (c->q8) cuMemFree(c->q8); if (c->y) cuMemFree(c->y); if (c->y2) cuMemFree(c->y2); if (c->tmpfix) cuMemFree(c->tmpfix); if (c->ids) cuMemFree(c->ids);
     if (c->hx && cuMemFreeHost) cuMemFreeHost(c->hx);
     if (c->hy && cuMemFreeHost) cuMemFreeHost(c->hy);
     if (c->hw && cuMemFreeHost) cuMemFreeHost(c->hw);
     if (c->hres && cuMemFreeHost) cuMemFreeHost(c->hres);
-    if (c->hsecond && cuMemFreeHost) cuMemFreeHost(c->hsecond);
     if (c->quant_done) cuEventDestroy(c->quant_done); if (c->stream) cuStreamDestroy(c->stream); if (c->mod) cuModuleUnload(c->mod);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev); free(c);
 }
@@ -102,8 +102,9 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     if (!rc) { c->wb = bytes; c->rows = rows; c->cols = cols; } return rc;
 }
 static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
-                                     const float *x, int M, int N, int K) {
-    if (!c || !dst || !x || !c->w || M < 1 || N != c->rows || K != c->cols || N % 128 || K % 32) return -1;
+                                     const float *x, int M, int N, int K,
+                                     CUdeviceptr out, int copy_back) {
+    if (!c || (copy_back && !dst) || !x || !c->w || M < 1 || N != c->rows || K != c->cols || N % 128 || K % 32) return -1;
     if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     /* The x64 MMQ specialization requires a full 64-row tile.  Pad tiny
      * batches to the proven x128 path; normal prefill batches use x64/x128. */
@@ -113,6 +114,7 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
     if (!c->x || c->xb < xb) { if (c->x) cuMemFree(c->x); if (cuMemAlloc(&c->x, xb) != CUDA_SUCCESS) return -1; c->xb = xb; }
     if (!c->q8 || c->q8b < q8b) { if (c->q8) cuMemFree(c->q8); if (cuMemAlloc(&c->q8, q8b) != CUDA_SUCCESS) return -1; c->q8b = q8b; }
     if (!c->y || c->yb < yb) { if (c->y) cuMemFree(c->y); if (cuMemAlloc(&c->y, yb) != CUDA_SUCCESS) return -1; c->yb = yb; }
+    if (!out) out = c->y;
     if (!cuMemHostAlloc || !cuMemFreeHost) return -1;
     if (c->hxb < xb) {
         if (c->hx) cuMemFreeHost(c->hx);
@@ -162,20 +164,22 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
     CUfunction gemmfn = use64 ? c->gemm64 : c->gemm;
     CUfunction fixfn = use64 ? c->fixup64 : c->fixup;
     if (fix && !fixfn) return -1;
-    void *a[] = { &c->w, &c->q8, &nullp, &nullp, &c->y, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
+    void *a[] = { &c->w, &c->q8, &nullp, &nullp, &out, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
                   &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
     if (cuLaunchKernel(gemmfn, sk, 1, 1, 32, 8, 1, 57856, c->stream, a, NULL) != CUDA_SUCCESS ||
         cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
     if (fix) {
-        void *fa[] = { &nullp, &nullp, &c->y, &c->tmpfix, &bp, &nrows, &ny, &stride_col,
+        void *fa[] = { &nullp, &nullp, &out, &c->tmpfix, &bp, &nrows, &ny, &stride_col,
                        &one, &zero, &one, &zero, &ntxfd };
         if (cuLaunchKernel(fixfn, sk, 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS ||
             cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
     }
-    if (cuMemcpyDtoH(c->hy, c->y, yb) != CUDA_SUCCESS) return -1;
-    for (int r = 0; r < M; ++r)
-        memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
-               (size_t)N * sizeof(float));
+    if (copy_back) {
+        if (cuMemcpyDtoH(c->hy, out, yb) != CUDA_SUCCESS) return -1;
+        for (int r = 0; r < M; ++r)
+            memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
+                   (size_t)N * sizeof(float));
+    }
     return 0;
 }
 
@@ -219,7 +223,7 @@ void cuda_ds4f_mxfp4_set_terms(cuda_ds4f_mxfp4 *c, int terms) {
 int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
                          int M, int N, int K) {
     if (!c || c->terms < 2)
-        return cuda_ds4f_mxfp4_gemm_once(c, dst, x, M, N, K);
+        return cuda_ds4f_mxfp4_gemm_once(c, dst, x, M, N, K, c ? c->y : 0, 1);
     int Mp = M < 128 ? (M < 64 ? 64 : M) : ((M + 127) & ~127);
     size_t xb = (size_t)Mp * K * sizeof(float);
     size_t yb = (size_t)Mp * N * sizeof(float);
@@ -230,20 +234,27 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
         if (cuMemHostAlloc(&c->hres, xb, 0) != CUDA_SUCCESS) return -1;
         c->hresb = xb;
     }
-    if (c->hsecondb < yb) {
-        if (c->hsecond) cuMemFreeHost(c->hsecond);
-        c->hsecond = NULL; c->hsecondb = 0;
-        if (cuMemHostAlloc(&c->hsecond, yb, 0) != CUDA_SUCCESS) return -1;
-        c->hsecondb = yb;
+    if (!c->y2 || c->y2b < yb) {
+        if (c->y2) cuMemFree(c->y2);
+        c->y2 = 0; c->y2b = 0;
+        if (cuMemAlloc(&c->y2, yb) != CUDA_SUCCESS) return -1;
+        c->y2b = yb;
     }
     make_mxfp4_residual((float *)c->hres, x, M, Mp, K);
-    if (cuda_ds4f_mxfp4_gemm_once(c, dst, x, M, N, K) != 0 ||
-        cuda_ds4f_mxfp4_gemm_once(c, (float *)c->hsecond,
-                                  (const float *)c->hres, M, N, K) != 0)
+    if (cuda_ds4f_mxfp4_gemm_once(c, NULL, x, M, N, K, c->y, 0) != 0 ||
+        cuda_ds4f_mxfp4_gemm_once(c, NULL, (const float *)c->hres,
+                                  M, N, K, c->y2, 0) != 0)
+        return -1;
+    int total = Mp * N;
+    void *aa[] = { &c->y, &c->y2, &total };
+    int blocks = (total + 255) / 256;
+    if (cuLaunchKernel(c->add, blocks, 1, 1, 256, 1, 1, 0,
+                       c->stream, aa, NULL) != CUDA_SUCCESS ||
+        cuStreamSynchronize(c->stream) != CUDA_SUCCESS ||
+        cuMemcpyDtoH(c->hy, c->y, yb) != CUDA_SUCCESS)
         return -1;
     for (int r = 0; r < M; ++r)
-        for (int n = 0; n < N; ++n)
-            dst[(size_t)r * N + n] +=
-                ((const float *)c->hsecond)[(size_t)r * N + n];
+        memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
+               (size_t)N * sizeof(float));
     return 0;
 }
