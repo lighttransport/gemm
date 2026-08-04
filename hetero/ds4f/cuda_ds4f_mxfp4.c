@@ -10,6 +10,7 @@ struct cuda_ds4f_mxfp4 {
     CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64;
     CUstream stream; CUevent quant_done;
     CUdeviceptr w, x, q8, y, tmpfix, ids; size_t xb, q8b, yb, fixb, wb, idsb;
+    void *hx, *hy; size_t hxb, hyb;
     int rows, cols, nsm; int verbose;
 };
 static ds4f_u3 fastdiv(unsigned long long d) {
@@ -61,6 +62,8 @@ fail: cuda_ds4f_mxfp4_destroy(c); return NULL;
 void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (!c) return; if (c->stream) cuStreamSynchronize(c->stream);
     if (c->w) cuMemFree(c->w); if (c->x) cuMemFree(c->x); if (c->q8) cuMemFree(c->q8); if (c->y) cuMemFree(c->y); if (c->tmpfix) cuMemFree(c->tmpfix); if (c->ids) cuMemFree(c->ids);
+    if (c->hx && cuMemFreeHost) cuMemFreeHost(c->hx);
+    if (c->hy && cuMemFreeHost) cuMemFreeHost(c->hy);
     if (c->quant_done) cuEventDestroy(c->quant_done); if (c->stream) cuStreamDestroy(c->stream); if (c->mod) cuModuleUnload(c->mod);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev); free(c);
 }
@@ -100,11 +103,22 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, 
     if (!c->x || c->xb < xb) { if (c->x) cuMemFree(c->x); if (cuMemAlloc(&c->x, xb) != CUDA_SUCCESS) return -1; c->xb = xb; }
     if (!c->q8 || c->q8b < q8b) { if (c->q8) cuMemFree(c->q8); if (cuMemAlloc(&c->q8, q8b) != CUDA_SUCCESS) return -1; c->q8b = q8b; }
     if (!c->y || c->yb < yb) { if (c->y) cuMemFree(c->y); if (cuMemAlloc(&c->y, yb) != CUDA_SUCCESS) return -1; c->yb = yb; }
-    float *xp = (float *)calloc((size_t)Mp * K, sizeof(float));
-    if (!xp) return -1;
-    memcpy(xp, x, (size_t)M * K * sizeof(float));
-    CUresult xr = cuMemcpyHtoD(c->x, xp, xb);
-    free(xp);
+    if (!cuMemHostAlloc || !cuMemFreeHost) return -1;
+    if (c->hxb < xb) {
+        if (c->hx) cuMemFreeHost(c->hx);
+        c->hx = NULL; c->hxb = 0;
+        if (cuMemHostAlloc(&c->hx, xb, 0) != CUDA_SUCCESS) return -1;
+        c->hxb = xb;
+    }
+    if (c->hyb < yb) {
+        if (c->hy) cuMemFreeHost(c->hy);
+        c->hy = NULL; c->hyb = 0;
+        if (cuMemHostAlloc(&c->hy, yb, 0) != CUDA_SUCCESS) return -1;
+        c->hyb = yb;
+    }
+    memset(c->hx, 0, xb);
+    memcpy(c->hx, x, (size_t)M * K * sizeof(float));
+    CUresult xr = cuMemcpyHtoD(c->x, c->hx, xb);
     if (xr != CUDA_SUCCESS || cuCtxSynchronize() != CUDA_SUCCESS) return -1;
     if (cuMemsetD8(c->q8, 0, q8b) != CUDA_SUCCESS) return -1;
     if (cuMemsetD8(c->y, 0, yb) != CUDA_SUCCESS) return -1;
@@ -150,9 +164,9 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, 
         if (cuLaunchKernel(fixfn, sk, 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS ||
             cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
     }
-    float *yp = (float *)malloc(yb);
-    if (!yp || cuMemcpyDtoH(yp, c->y, yb) != CUDA_SUCCESS) { free(yp); return -1; }
-    for (int r = 0; r < M; ++r) memcpy(dst + (size_t)r * N, yp + (size_t)r * N, (size_t)N * sizeof(float));
-    free(yp);
+    if (cuMemcpyDtoH(c->hy, c->y, yb) != CUDA_SUCCESS) return -1;
+    for (int r = 0; r < M; ++r)
+        memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
+               (size_t)N * sizeof(float));
     return 0;
 }
