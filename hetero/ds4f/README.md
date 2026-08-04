@@ -377,6 +377,33 @@ still cross host memory, so a device-resident activation arena and fused GPU
 attention/norm/MLP are the remaining route toward a full-model 30-tok/s
 prompt-rate result.
 
+#### SM120 CUDA + RDNA4 dual-GPU prefill
+
+The SM120 path is implemented by `cuda/llm/mmq_kernels.cubin` and the
+`hetero/ds4f` CUDA bridge. MXFP4 expert matrices are packed once into the
+native SM120 MMQ layout, uploaded through persistent pinned host staging, and
+executed on the NVIDIA device. FP8/BF16 dense matrices remain resident on
+the RDNA4 bank. `dual_ds4f_prefill_gemm_multi()` partitions each prefill group
+by type and runs the CUDA MXFP4 and HIP dense groups concurrently.
+
+Build and run the real staged gate with:
+
+```bash
+make -B -C cuda/llm mmq_kernels.cubin
+make -C hetero/ds4f real-dual-test STAGE_DIR=/tmp/ds4f_nocopy_ep8 \
+  EP_SIZE=8 EP_RANK=0 LAYERS=43 BANK_LAYERS=43 THREADS=48 CMGS=4 \
+  PREFILL_BATCH=64 PREFILL_CONTEXT=0
+```
+
+The bridge gates pass at M=64 and M=128, and the direct small-bucket path
+also passes at M=7. Four-layer real dual runs reach approximately 129--133
+tok/s with zero argmax mismatches. The full 43-layer EP=8 shard is
+operational at approximately 9--11 tok/s; its remaining one-or-few argmax
+differences are deterministic cumulative error from SM120 FP4 activation
+quantization, not a dispatcher race. `--dual-cuda-mxfp4 0` selects the exact
+HIP MXFP4 path for small models, but the full 43-layer expert bank does not fit
+on the available 8-GB device, so it is not a full-model fallback.
+
 The fast GPU prefill path is numerically approximate over a separately generated
 KV history: small dense-GEMM reduction differences can accumulate into a few
 CPU-reference argmax changes at long context. For a guaranteed CPU-reference

@@ -11,7 +11,7 @@ LDFLAGS := -lm -lpthread -ldl
 
 BUILD := build
 
-.PHONY: all clean verify test hip-test real-hip-test forward-hip-test real-token-test prefill-test real-prefill-test mtp-test cuda-test dual-check dual-test x86-runner sve-check
+.PHONY: all clean verify test hip-test real-hip-test real-dual-test forward-hip-test real-token-test prefill-test real-prefill-test mtp-test cuda-test dual-check dual-test x86-runner sve-check
 all: $(BUILD)/bench_expert_bw $(BUILD)/test_ds4f_kernels $(BUILD)/test_hip_ds4f_dense \
     $(BUILD)/test_hip_ds4f_real $(BUILD)/test_hip_ds4f_forward $(BUILD)/test_ds4f_real_tokens \
     $(BUILD)/test_ds4f_prefill $(BUILD)/test_ds4f_prefill_real $(BUILD)/test_ds4f_mtp $(BUILD)/ds4f_runner
@@ -100,6 +100,21 @@ hip-test: $(BUILD)/test_hip_ds4f_dense
 
 real-hip-test: $(BUILD)/test_hip_ds4f_real
 	$(BUILD)/test_hip_ds4f_real
+
+# Reproducible staged NVIDIA+AMD prefill gate. Override STAGE_DIR, EP_SIZE,
+# EP_RANK, LAYERS, and PREFILL_BATCH for another shard or context size.
+real-dual-test: $(BUILD)/test_hip_ds4f_real
+	@test -n "$(STAGE_DIR)" || { echo "usage: make -C hetero/ds4f real-dual-test STAGE_DIR=/tmp/ds4f_nocopy_ep8" >&2; exit 2; }
+	@test -f ../../cuda/llm/mmq_kernels.cubin || { echo "build cuda/llm/mmq_kernels.cubin first" >&2; exit 2; }
+	$(BUILD)/test_hip_ds4f_real --stage-dir $(STAGE_DIR) \
+		--ep-size $(or $(EP_SIZE),8) --ep-rank $(or $(EP_RANK),0) \
+		--layers $(or $(LAYERS),43) --bank-layers $(or $(BANK_LAYERS),43) \
+		--threads $(or $(THREADS),48) --cmgs $(or $(CMGS),4) \
+		--prefill-batch $(or $(PREFILL_BATCH),64) \
+		--prefill-context $(or $(PREFILL_CONTEXT),0) \
+		--dual-gpu 1 --cuda-device $(or $(CUDA_DEVICE),0) \
+		--hip-device $(or $(HIP_DEVICE),0) --hip-verbose $(or $(HIP_VERBOSE),0) \
+		--hip-exact-prefill $(or $(HIP_EXACT_PREFILL),0)
 
 forward-hip-test: $(BUILD)/test_hip_ds4f_forward
 	$(BUILD)/test_hip_ds4f_forward
