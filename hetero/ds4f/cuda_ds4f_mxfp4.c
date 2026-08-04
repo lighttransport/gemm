@@ -66,6 +66,7 @@ void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
 }
 int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s, int rows, int cols) {
     if (!c || !w || !s || rows <= 0 || cols <= 0 || (cols & 127)) return -1;
+    if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     size_t nb = (size_t)cols / 32, bytes = (size_t)rows * nb * 17, rb = (size_t)cols / 2;
     uint8_t *p = (uint8_t *)malloc(bytes); if (!p) return -1;
     for (int r = 0; r < rows; ++r) for (size_t b = 0; b < nb; ++b) {
@@ -90,6 +91,7 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, 
     /* Native MMQ is used for prefill-sized batches; leave decode/tiny batches
      * to the existing HIP/CPU path until a separate small-N kernel is wired. */
     if (!c || !dst || !x || !c->w || M < 64 || N != c->rows || K != c->cols || N % 128 || K % 32) return -1;
+    if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     /* The x64 MMQ specialization requires a full 64-row tile.  Pad tiny
      * batches to the proven x128 path; normal prefill batches use x64/x128. */
     const int use64 = M >= 64 && M < 128;

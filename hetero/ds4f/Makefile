@@ -11,7 +11,7 @@ LDFLAGS := -lm -lpthread -ldl
 
 BUILD := build
 
-.PHONY: all clean verify test hip-test real-hip-test forward-hip-test real-token-test prefill-test real-prefill-test mtp-test cuda-test x86-runner sve-check
+.PHONY: all clean verify test hip-test real-hip-test forward-hip-test real-token-test prefill-test real-prefill-test mtp-test cuda-test dual-check dual-test x86-runner sve-check
 all: $(BUILD)/bench_expert_bw $(BUILD)/test_ds4f_kernels $(BUILD)/test_hip_ds4f_dense \
     $(BUILD)/test_hip_ds4f_real $(BUILD)/test_hip_ds4f_forward $(BUILD)/test_ds4f_real_tokens \
     $(BUILD)/test_ds4f_prefill $(BUILD)/test_ds4f_prefill_real $(BUILD)/test_ds4f_mtp $(BUILD)/ds4f_runner
@@ -73,6 +73,19 @@ $(BUILD)/test_cuda_ds4f_mxfp4: test_cuda_ds4f_mxfp4.c cuda_ds4f_mxfp4.c \
 	$(CC) $(CFLAGS) -I../../cuda -o $@ test_cuda_ds4f_mxfp4.c cuda_ds4f_mxfp4.c \
 		../../cuda/cuew.c $(LDFLAGS)
 
+$(BUILD)/dual_ds4f_prefill.o: dual_ds4f_prefill.c dual_ds4f_prefill.h \
+                              hip_ds4f_dense.h cuda_ds4f_mxfp4.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -I../../cuda -c -o $@ dual_ds4f_prefill.c
+
+$(BUILD)/test_dual_ds4f_prefill: test_dual_ds4f_prefill.c dual_ds4f_prefill.c \
+                                 cuda_ds4f_mxfp4.c \
+                                 dual_ds4f_prefill.h hip_ds4f_dense.c hip_ds4f_dense.h \
+                                 hip_ds4f_kernels.h ../../rdna4/rocew.c \
+                                 ../../cuda/cuew.c | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -I../../cuda -o $@ test_dual_ds4f_prefill.c \
+		dual_ds4f_prefill.c cuda_ds4f_mxfp4.c hip_ds4f_dense.c ../../rdna4/rocew.c \
+		../../cuda/cuew.c $(LDFLAGS)
+
 verify: $(BUILD)/bench_expert_bw
 	$(BUILD)/bench_expert_bw --mode verify
 
@@ -104,6 +117,12 @@ cuda-test: $(BUILD)/test_cuda_ds4f_mxfp4
 	@test -f ../../cuda/llm/mmq_kernels.cubin || { echo "build cuda/llm/mmq_kernels.cubin first" >&2; exit 2; }
 	$(BUILD)/test_cuda_ds4f_mxfp4 64
 	$(BUILD)/test_cuda_ds4f_mxfp4 128
+
+dual-check: $(BUILD)/dual_ds4f_prefill.o
+
+dual-test: $(BUILD)/test_dual_ds4f_prefill
+	@test -f ../../cuda/llm/mmq_kernels.cubin || { echo "build cuda/llm/mmq_kernels.cubin first" >&2; exit 2; }
+	$(BUILD)/test_dual_ds4f_prefill
 
 x86-runner: $(BUILD)/ds4f_runner
 
