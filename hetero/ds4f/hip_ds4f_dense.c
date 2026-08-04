@@ -126,12 +126,69 @@ struct hip_ds4f_dense {
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
     void *stream_dw, *stream_ds;
+    hipStream_t stream_copy;
+    hipEvent_t stream_copy_done[2];
+    void *stream_slot_dw[2], *stream_slot_ds[2];
+    size_t stream_slot_dw_bytes[2], stream_slot_ds_bytes[2];
+    const ds4f_layer *stream_slot_layer[2];
+    int stream_active_slot, stream_pending_slot;
+    const ds4f_layer *stream_pending_layer;
+    pthread_t stream_copy_thread;
+    pthread_mutex_t stream_copy_mu;
+    pthread_cond_t stream_copy_cv;
+    pthread_cond_t stream_copy_ready_cv;
+    int stream_copy_stop, stream_copy_request, stream_copy_submitted;
+    int stream_copy_result, stream_copy_request_slot;
     hip_ds4f_resident_layer *resident_layers;
     int n_resident_layers, cap_resident_layers;
 };
 
 static int valid_dims(int rows, int cols) {
     return rows > 0 && cols > 0 && rows <= INT_MAX / cols;
+}
+
+static void *stream_copy_worker(void *opaque) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    for (;;) {
+        pthread_mutex_lock(&ctx->stream_copy_mu);
+        while (!ctx->stream_copy_request && !ctx->stream_copy_stop)
+            pthread_cond_wait(&ctx->stream_copy_cv, &ctx->stream_copy_mu);
+        if (ctx->stream_copy_stop) {
+            pthread_mutex_unlock(&ctx->stream_copy_mu);
+            break;
+        }
+        int slot = ctx->stream_copy_request_slot;
+        const ds4f_layer *layer = ctx->stream_slot_layer[slot];
+        ctx->stream_copy_request = 0;
+        pthread_mutex_unlock(&ctx->stream_copy_mu);
+
+        int ok = hipSetDevice(ctx->device_id) == hipSuccess;
+        const ds4f_tensor *ex[] = { layer ? layer->ex_w1 : NULL,
+                                    layer ? layer->ex_w2 : NULL,
+                                    layer ? layer->ex_w3 : NULL };
+        size_t wo = 0, so = 0;
+        for (size_t wi = 0; ok && wi < sizeof(ex) / sizeof(ex[0]); ++wi)
+            if (ex[wi]) for (int e = 0; e < layer->n_owned; ++e) {
+                const ds4f_tensor *t = &ex[wi][e];
+                size_t wb = (size_t)t->rows * (size_t)(t->cols / 2);
+                size_t sb = (size_t)t->rows * (size_t)(t->cols / 32);
+                void *dw = (uint8_t *)ctx->stream_slot_dw[slot] + wo;
+                void *ds = (uint8_t *)ctx->stream_slot_ds[slot] + so;
+                if (hipMemcpyAsync(dw, t->w, wb, hipMemcpyHostToDevice,
+                                    ctx->stream_copy) != hipSuccess ||
+                    hipMemcpyAsync(ds, t->scale, sb, hipMemcpyHostToDevice,
+                                   ctx->stream_copy) != hipSuccess) ok = 0;
+                wo += wb; so += sb;
+            }
+        if (ok && hipEventRecord(ctx->stream_copy_done[slot], ctx->stream_copy) != hipSuccess)
+            ok = 0;
+        pthread_mutex_lock(&ctx->stream_copy_mu);
+        ctx->stream_copy_result = ok ? 0 : -1;
+        ctx->stream_copy_submitted = 1;
+        pthread_cond_broadcast(&ctx->stream_copy_ready_cv);
+        pthread_mutex_unlock(&ctx->stream_copy_mu);
+    }
+    return NULL;
 }
 
 static void clear_matrices(hip_ds4f_dense *ctx) {
@@ -205,6 +262,8 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
     ctx->device_id = device_id;
     ctx->verbose = verbose;
     ctx->current = -1;
+    ctx->stream_active_slot = -1;
+    ctx->stream_pending_slot = -1;
     /* One row is one block. 128 threads is the best measured gfx1201 point:
      * it halves the wave reduction/launch footprint versus the original 256,
      * while retaining enough lanes for the 1K--8K column projections. */
@@ -298,6 +357,46 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
             return NULL;
         }
     }
+    if (hipStreamCreateWithFlags(&ctx->stream_copy, hipStreamNonBlocking) != hipSuccess ||
+        hipEventCreate(&ctx->stream_copy_done[0]) != hipSuccess ||
+        hipEventCreate(&ctx->stream_copy_done[1]) != hipSuccess) {
+        fprintf(stderr, "hip_ds4f_dense: failed to create expert prefetch stream/events\n");
+        if (ctx->stream_copy_done[0] && hipEventDestroy) hipEventDestroy(ctx->stream_copy_done[0]);
+        if (ctx->stream_copy_done[1] && hipEventDestroy) hipEventDestroy(ctx->stream_copy_done[1]);
+        if (ctx->stream_copy && hipStreamDestroy) hipStreamDestroy(ctx->stream_copy);
+        for (int j = 0; j < HIP_DS4F_ASYNC_MAX; ++j) {
+            if (ctx->multi_done[j] && hipEventDestroy) hipEventDestroy(ctx->multi_done[j]);
+            if (ctx->multi_stream[j] && hipStreamDestroy) hipStreamDestroy(ctx->multi_stream[j]);
+        }
+        if (ctx->done && hipEventDestroy) hipEventDestroy(ctx->done);
+        if (ctx->stream && hipStreamDestroy) hipStreamDestroy(ctx->stream);
+        if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
+        if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
+        ds4f_mem_pool_destroy(ctx->mem);
+        return NULL;
+    }
+    pthread_mutex_init(&ctx->stream_copy_mu, NULL);
+    pthread_cond_init(&ctx->stream_copy_cv, NULL);
+    pthread_cond_init(&ctx->stream_copy_ready_cv, NULL);
+    if (pthread_create(&ctx->stream_copy_thread, NULL, stream_copy_worker, ctx) != 0) {
+        pthread_cond_destroy(&ctx->stream_copy_ready_cv);
+        pthread_cond_destroy(&ctx->stream_copy_cv);
+        pthread_mutex_destroy(&ctx->stream_copy_mu);
+        for (int i = 0; i < 2; ++i) {
+            if (ctx->stream_copy_done[i] && hipEventDestroy) hipEventDestroy(ctx->stream_copy_done[i]);
+        }
+        if (ctx->stream_copy && hipStreamDestroy) hipStreamDestroy(ctx->stream_copy);
+        for (int j = 0; j < HIP_DS4F_ASYNC_MAX; ++j) {
+            if (ctx->multi_done[j] && hipEventDestroy) hipEventDestroy(ctx->multi_done[j]);
+            if (ctx->multi_stream[j] && hipStreamDestroy) hipStreamDestroy(ctx->multi_stream[j]);
+        }
+        if (ctx->done && hipEventDestroy) hipEventDestroy(ctx->done);
+        if (ctx->stream && hipStreamDestroy) hipStreamDestroy(ctx->stream);
+        if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
+        if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
+        ds4f_mem_pool_destroy(ctx->mem);
+        return NULL;
+    }
     return ctx;
 }
 
@@ -307,6 +406,14 @@ hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
 
 void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (!ctx) return;
+    pthread_mutex_lock(&ctx->stream_copy_mu);
+    ctx->stream_copy_stop = 1;
+    pthread_cond_signal(&ctx->stream_copy_cv);
+    pthread_mutex_unlock(&ctx->stream_copy_mu);
+    pthread_join(ctx->stream_copy_thread, NULL);
+    pthread_cond_destroy(&ctx->stream_copy_ready_cv);
+    pthread_cond_destroy(&ctx->stream_copy_cv);
+    pthread_mutex_destroy(&ctx->stream_copy_mu);
     if (ctx->pending && ctx->done) hipEventSynchronize(ctx->done);
     if (ctx->multi_pending) {
         for (int i = 0; i < ctx->multi_n; ++i)
@@ -325,6 +432,12 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
     for (int i = 0; i < HIP_DS4F_GEMM_MAX; ++i)
         if (ctx->gemm_multi_dy[i]) hipFree(ctx->gemm_multi_dy[i]);
+    for (int i = 0; i < 2; ++i) {
+        if (ctx->stream_slot_dw[i]) hipFree(ctx->stream_slot_dw[i]);
+        if (ctx->stream_slot_ds[i]) hipFree(ctx->stream_slot_ds[i]);
+        if (ctx->stream_copy_done[i] && hipEventDestroy) hipEventDestroy(ctx->stream_copy_done[i]);
+    }
+    if (ctx->stream_copy && hipStreamDestroy) hipStreamDestroy(ctx->stream_copy);
     for (int i = 0; i < HIP_DS4F_ASYNC_MAX; ++i) {
         if (ctx->multi_dx[i]) hipFree(ctx->multi_dx[i]);
         if (ctx->multi_dy[i]) hipFree(ctx->multi_dy[i]);
@@ -608,12 +721,196 @@ static int stream_layer_impl(void *opaque, const ds4f_layer *layer, int raw, int
     return 0;
 }
 
+static size_t mxfp4_layer_bytes(const ds4f_layer *layer, int raw) {
+    if (!layer) return 0;
+    const ds4f_tensor *ex[] = { layer->ex_w1, layer->ex_w2, layer->ex_w3 };
+    size_t total = 0;
+    for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi) {
+        if (!ex[wi]) return 0;
+        for (int e = 0; e < layer->n_owned; ++e) {
+            const ds4f_tensor *t = &ex[wi][e];
+            if (t->type != DS4F_MXFP4 || !valid_dims(t->rows, t->cols)) return 0;
+            size_t wb = raw ? (size_t)t->rows * (size_t)(t->cols / 2)
+                            : (size_t)t->rows * (size_t)t->cols;
+            size_t sb = raw ? (size_t)t->rows * (size_t)(t->cols / 32)
+                            : (size_t)t->rows * (size_t)((t->cols + 127) / 128);
+            if (SIZE_MAX - total < wb + sb) return 0;
+            total += wb + sb;
+        }
+    }
+    return total;
+}
+
+int hip_ds4f_dense_recommend_mxfp4_resident_layers(
+    void *opaque, const ds4f_layer *layers, int n_layers, int raw, int reserve_mb) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    if (!ctx || !layers || n_layers <= 0 || hipSetDevice(ctx->device_id) != hipSuccess)
+        return 0;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) return 0;
+    (void)total_bytes;
+    size_t reserve = (size_t)(reserve_mb > 0 ? reserve_mb : 512) * 1024u * 1024u;
+    size_t max_slot = 0;
+    for (int i = 0; i < n_layers; ++i) {
+        size_t bytes = mxfp4_layer_bytes(&layers[i], raw);
+        if (!bytes) return 0;
+        if (bytes > max_slot) max_slot = bytes;
+    }
+    /* Async prefill keeps two raw expert slots alive. Account for both before
+     * admitting the resident prefix; this avoids discovering the limit only
+     * when prefetch reaches the first non-resident layer. */
+    size_t fixed = reserve;
+    if (max_slot > (SIZE_MAX - fixed) / 2) return 0;
+    fixed += 2 * max_slot;
+    if (free_bytes <= fixed) return 0;
+    size_t budget = free_bytes - fixed;
+    size_t used = 0;
+    int fit = 0;
+    for (; fit < n_layers; ++fit) {
+        size_t bytes = mxfp4_layer_bytes(&layers[fit], raw);
+        if (bytes > budget - used) break;
+        used += bytes;
+    }
+    return fit;
+}
+
 int hip_ds4f_dense_stream_layer(void *opaque, const ds4f_layer *layer) {
     return stream_layer_impl(opaque, layer, 0, 0);
 }
 
 int hip_ds4f_dense_stream_layer_raw(void *opaque, const ds4f_layer *layer) {
     return stream_layer_impl(opaque, layer, 1, 0);
+}
+
+static void release_stream_slot(hip_ds4f_dense *ctx, int slot) {
+    const ds4f_layer *layer = ctx->stream_slot_layer[slot];
+    if (!layer) return;
+    const ds4f_tensor *ex[] = { layer->ex_w1, layer->ex_w2, layer->ex_w3 };
+    for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi)
+        if (ex[wi]) for (int e = 0; e < layer->n_owned; ++e) {
+            ds4f_tensor *t = (ds4f_tensor *)&ex[wi][e];
+            if (t->gpu_id >= 0) { release_matrix(ctx, t->gpu_id); t->gpu_id = -1; }
+        }
+    ctx->stream_slot_layer[slot] = NULL;
+}
+
+static int ensure_stream_slot(hip_ds4f_dense *ctx, int slot,
+                              size_t wbytes, size_t sbytes) {
+    if (ctx->stream_slot_dw[slot] && ctx->stream_slot_dw_bytes[slot] >= wbytes &&
+        ctx->stream_slot_ds[slot] && ctx->stream_slot_ds_bytes[slot] >= sbytes)
+        return 0;
+    void *dw = NULL, *ds = NULL;
+    if (hipMalloc(&dw, wbytes) != hipSuccess || hipMalloc(&ds, sbytes) != hipSuccess) {
+        if (dw) hipFree(dw);
+        if (ds) hipFree(ds);
+        return -1;
+    }
+    if (ctx->stream_slot_dw[slot]) hipFree(ctx->stream_slot_dw[slot]);
+    if (ctx->stream_slot_ds[slot]) hipFree(ctx->stream_slot_ds[slot]);
+    ctx->stream_slot_dw[slot] = dw; ctx->stream_slot_ds[slot] = ds;
+    ctx->stream_slot_dw_bytes[slot] = wbytes;
+    ctx->stream_slot_ds_bytes[slot] = sbytes;
+    return 0;
+}
+
+static int prefetch_layer_raw_async(hip_ds4f_dense *ctx, const ds4f_layer *layer) {
+    if (!ctx || !layer || ctx->pending || ctx->multi_pending || !ctx->stream_copy)
+        return -1;
+    /* The A/B/decode gate may have used the legacy synchronous streamer before
+     * batched prefill attaches the asynchronous lifecycle. Reclaim that one
+     * stale stream before reserving a double-buffer slot. */
+    if (ctx->stream_layer) {
+        const ds4f_layer *old = ctx->stream_layer;
+        const ds4f_tensor *old_ex[] = { old->ex_w1, old->ex_w2, old->ex_w3 };
+        for (size_t wi = 0; wi < sizeof(old_ex) / sizeof(old_ex[0]); ++wi)
+            if (old_ex[wi]) for (int e = 0; e < old->n_owned; ++e) {
+                ds4f_tensor *t = (ds4f_tensor *)&old_ex[wi][e];
+                if (t->gpu_id >= 0) { release_matrix(ctx, t->gpu_id); t->gpu_id = -1; }
+            }
+        if (ctx->stream_dw) hipFree(ctx->stream_dw);
+        if (ctx->stream_ds) hipFree(ctx->stream_ds);
+        ctx->stream_dw = ctx->stream_ds = NULL;
+        ctx->stream_layer = NULL;
+    }
+    for (int i = 0; i < ctx->n_resident_layers; ++i)
+        if (ctx->resident_layers[i].layer == layer && ctx->resident_layers[i].raw)
+            return 0;
+    if (ctx->stream_pending_layer == layer ||
+        (ctx->stream_active_slot >= 0 && ctx->stream_slot_layer[ctx->stream_active_slot] == layer))
+        return 0;
+    if (ctx->stream_pending_layer) return -1;
+
+    const ds4f_tensor *ex[] = { layer->ex_w1, layer->ex_w2, layer->ex_w3 };
+    size_t wtotal = 0, stotal = 0;
+    for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi)
+        if (ex[wi]) for (int e = 0; e < layer->n_owned; ++e) {
+            const ds4f_tensor *t = &ex[wi][e];
+            if (t->type != DS4F_MXFP4 || !valid_dims(t->rows, t->cols) ||
+                (t->cols & 127)) return -1;
+            wtotal += (size_t)t->rows * (size_t)(t->cols / 2);
+            stotal += (size_t)t->rows * (size_t)(t->cols / 32);
+        }
+    int slot = ctx->stream_active_slot < 0 ? 0 : 1 - ctx->stream_active_slot;
+    if (ctx->stream_slot_layer[slot]) release_stream_slot(ctx, slot);
+    if (ensure_stream_slot(ctx, slot, wtotal, stotal) != 0) return -1;
+    ctx->stream_slot_layer[slot] = layer;
+
+    size_t wo = 0, so = 0;
+    for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi)
+        for (int e = 0; e < layer->n_owned; ++e) {
+            ds4f_tensor *t = (ds4f_tensor *)&ex[wi][e];
+            size_t wb = (size_t)t->rows * (size_t)(t->cols / 2);
+            size_t sb = (size_t)t->rows * (size_t)(t->cols / 32);
+            void *dw = (uint8_t *)ctx->stream_slot_dw[slot] + wo;
+            void *ds = (uint8_t *)ctx->stream_slot_ds[slot] + so;
+            int id = append_device_matrix(ctx, dw, ds, t->w, t->scale,
+                                          t->rows, t->cols, t->cols / 32,
+                                          HIP_DS4F_MATRIX_MXFP4, 1);
+            if (id < 0) {
+                release_stream_slot(ctx, slot);
+                return -1;
+            }
+            t->gpu_id = id; wo += wb; so += sb;
+        }
+    ctx->stream_pending_layer = layer;
+    ctx->stream_pending_slot = slot;
+    pthread_mutex_lock(&ctx->stream_copy_mu);
+    ctx->stream_copy_submitted = 0;
+    ctx->stream_copy_result = -1;
+    ctx->stream_copy_request_slot = slot;
+    ctx->stream_copy_request = 1;
+    pthread_cond_signal(&ctx->stream_copy_cv);
+    pthread_mutex_unlock(&ctx->stream_copy_mu);
+    return 0;
+}
+
+int hip_ds4f_dense_prefetch_layer_raw(void *opaque, const ds4f_layer *layer) {
+    return prefetch_layer_raw_async((hip_ds4f_dense *)opaque, layer);
+}
+
+int hip_ds4f_dense_begin_layer(void *opaque, const ds4f_layer *layer) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    if (!ctx || !layer) return -1;
+    for (int i = 0; i < ctx->n_resident_layers; ++i)
+        if (ctx->resident_layers[i].layer == layer && ctx->resident_layers[i].raw)
+            return 0;
+    if (ctx->stream_active_slot >= 0 && ctx->stream_slot_layer[ctx->stream_active_slot] == layer) return 0;
+    if (ctx->stream_pending_layer != layer || ctx->stream_pending_slot < 0) return -1;
+    int slot = ctx->stream_pending_slot;
+    pthread_mutex_lock(&ctx->stream_copy_mu);
+    while (!ctx->stream_copy_submitted && !ctx->stream_copy_stop)
+        pthread_cond_wait(&ctx->stream_copy_ready_cv, &ctx->stream_copy_mu);
+    int copy_result = ctx->stream_copy_result;
+    pthread_mutex_unlock(&ctx->stream_copy_mu);
+    if (copy_result != 0) return -1;
+    if (hipStreamWaitEvent(ctx->stream, ctx->stream_copy_done[slot], 0) != hipSuccess)
+        return -1;
+    if (ctx->stream_active_slot >= 0 && ctx->stream_active_slot != slot)
+        release_stream_slot(ctx, ctx->stream_active_slot);
+    ctx->stream_active_slot = slot;
+    ctx->stream_pending_slot = -1;
+    ctx->stream_pending_layer = NULL;
+    return 0;
 }
 
 int hip_ds4f_dense_resident_mxfp4_layer(void *opaque, const ds4f_layer *layer, int raw) {

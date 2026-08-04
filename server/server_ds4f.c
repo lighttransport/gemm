@@ -397,6 +397,7 @@ static void gpu_detach(ds4f_session *s) {
         s->m->gpu_dense_blockdiag = NULL;
         s->m->gpu_dense_gemm = NULL;
         s->m->gpu_dense_gemm_multi = NULL;
+        s->m->gpu_dense_layer_prefetch = NULL;
         s->m->gpu_dense_layer_begin = NULL;
         s->m->gpu_prefill_attn = NULL;
         s->m->gpu_dense_stream_prefill_only = 0;
@@ -480,8 +481,13 @@ static int gpu_attach(ds4f_session *s, char *err, size_t err_cap) {
     }
     bytes += ds4f_wbytes(s->m->head.type, s->m->head.rows, s->m->head.cols);
     count++;
-    if (s->options.hip_mxfp4_resident_layers > 0) {
+    if (s->options.hip_mxfp4_resident_layers > 0 || s->options.hip_mxfp4_resident_auto) {
         int nr = s->options.hip_mxfp4_resident_layers;
+        if (s->options.hip_mxfp4_resident_auto)
+            nr = hip_ds4f_dense_recommend_mxfp4_resident_layers(
+                s->gpu, s->m->layers, s->m->cfg.n_layers,
+                s->options.hip_mxfp4_stream_raw,
+                s->options.hip_vram_reserve_mb > 0 ? s->options.hip_vram_reserve_mb : 512);
         if (nr > s->m->cfg.n_layers) nr = s->m->cfg.n_layers;
         for (int L = 0; L < nr; ++L)
             if (hip_ds4f_dense_resident_mxfp4_layer(
@@ -501,15 +507,23 @@ static int gpu_attach(ds4f_session *s, char *err, size_t err_cap) {
     s->m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     s->m->gpu_prefill_attn = s->options.hip_prefill_attn
         ? hip_ds4f_dense_prefill_attention : NULL;
-    if (s->options.hip_mxfp4_widen_layers > 0 ||
-        s->options.hip_mxfp4_resident_layers > 0)
-        s->m->mxfp4_w4a8 = 0;
+    s->m->gpu_dense_layer_prefetch = s->options.hip_mxfp4_stream_raw &&
+        (s->options.hip_mxfp4_widen_layers > 0 ||
+         s->options.hip_mxfp4_resident_layers > 0 ||
+         s->options.hip_mxfp4_resident_auto)
+        ? hip_ds4f_dense_prefetch_layer_raw : NULL;
     s->m->gpu_dense_layer_begin = (s->options.hip_mxfp4_widen_layers > 0 ||
-                                   s->options.hip_mxfp4_resident_layers > 0)
+                                   s->options.hip_mxfp4_resident_layers > 0 ||
+                                   s->options.hip_mxfp4_resident_auto)
         ? (s->options.hip_mxfp4_stream_raw
-            ? hip_ds4f_dense_stream_layer_raw : hip_ds4f_dense_stream_layer) : NULL;
+            ? hip_ds4f_dense_begin_layer : hip_ds4f_dense_stream_layer) : NULL;
+    if (s->options.hip_mxfp4_widen_layers > 0 ||
+        s->options.hip_mxfp4_resident_layers > 0 ||
+        s->options.hip_mxfp4_resident_auto)
+        s->m->mxfp4_w4a8 = 0;
     s->m->gpu_dense_stream_prefill_only = s->options.hip_mxfp4_widen_layers > 0 ||
-                                          s->options.hip_mxfp4_resident_layers > 0;
+                                          s->options.hip_mxfp4_resident_layers > 0 ||
+                                          s->options.hip_mxfp4_resident_auto;
     s->m->gpu_dense_mixed = s->options.hip_shared_bf16 || s->options.hip_shared_fp16;
     fprintf(stderr, "[llm/ds4f] HIP dense bank attached: %d matrices, %.3f GB, device=%d\n",
             count, (double)bytes / 1e9, device);

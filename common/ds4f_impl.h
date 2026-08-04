@@ -2974,6 +2974,8 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_ORDERED_FP8_LAYERS"); o.hip_ordered_fp8_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_WIDEN_LAYERS"); o.hip_mxfp4_widen_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_RESIDENT_LAYERS"); o.hip_mxfp4_resident_layers = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_MXFP4_RESIDENT_AUTO"); o.hip_mxfp4_resident_auto = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_VRAM_RESERVE_MB"); o.hip_vram_reserve_mb = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_STREAM_RAW"); o.hip_mxfp4_stream_raw = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_PREFILL_ATTN"); o.hip_prefill_attn = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
@@ -3074,6 +3076,8 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_ordered_fp8_layers = ds4f_json_int(json, "hip_ordered_fp8_layers", o->hip_ordered_fp8_layers);
     o->hip_mxfp4_widen_layers = ds4f_json_int(json, "hip_mxfp4_widen_layers", o->hip_mxfp4_widen_layers);
     o->hip_mxfp4_resident_layers = ds4f_json_int(json, "hip_mxfp4_resident_layers", o->hip_mxfp4_resident_layers);
+    o->hip_mxfp4_resident_auto = ds4f_json_int(json, "hip_mxfp4_resident_auto", o->hip_mxfp4_resident_auto);
+    o->hip_vram_reserve_mb = ds4f_json_int(json, "hip_vram_reserve_mb", o->hip_vram_reserve_mb);
     o->hip_mxfp4_stream_raw = ds4f_json_int(json, "hip_mxfp4_stream_raw", o->hip_mxfp4_stream_raw);
     o->hip_prefill_attn = ds4f_json_int(json, "hip_prefill_attn", o->hip_prefill_attn);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
@@ -6135,9 +6139,20 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
     int tps2 = tps && (m->sh2_rows < C);        /* optional hidden-row shard of sh_w2 */
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
+        if (m->gpu_dense_layer_prefetch && m->gpu_dense_stream_prefill_only &&
+            m->gpu_dense_layer_prefetch(m->gpu_dense_ctx, ly) != 0) {
+            fprintf(stderr, "ds4f: GPU layer prefetch failed at layer %d\n", L);
+            abort();
+        }
         if (m->gpu_dense_layer_begin && m->gpu_dense_stream_prefill_only &&
             m->gpu_dense_layer_begin(m->gpu_dense_ctx, ly) != 0) {
             fprintf(stderr, "ds4f: GPU layer residency setup failed at layer %d\n", L);
+            abort();
+        }
+        if (m->gpu_dense_layer_prefetch && m->gpu_dense_stream_prefill_only &&
+            L + 1 < c->n_layers &&
+            m->gpu_dense_layer_prefetch(m->gpu_dense_ctx, &m->layers[L + 1]) != 0) {
+            fprintf(stderr, "ds4f: GPU layer prefetch failed after layer %d\n", L);
             abort();
         }
         int ratio = c->compress_ratios[L];

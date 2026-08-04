@@ -28,6 +28,7 @@ static void usage(const char *prog) {
                     "--hip-ordered-fp8-layers n "
                     "--hip-mxfp4-widen-layers n "
                     "--hip-mxfp4-resident-layers n "
+                    "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
                     "--hip-mxfp4-stream-raw 0|1 "
                     "--hip-prefill-attn 0|1 "
                     "[--hip-mxfp4-gemm-test] [--hip-mxfp4-widened-gemm-test] "
@@ -55,6 +56,12 @@ static int hip_ordered_wkv_layer(const ds4f_runtime_options *opt, int layer) {
 
 static int hip_ordered_fp8_layer(const ds4f_runtime_options *opt, int layer) {
     return opt->hip_ordered_fp8_layers > 0 && layer < opt->hip_ordered_fp8_layers;
+}
+
+static int hip_mxfp4_streaming(const ds4f_runtime_options *opt) {
+    return opt->hip_mxfp4_widen_layers > 0 ||
+           opt->hip_mxfp4_resident_layers > 0 ||
+           opt->hip_mxfp4_resident_auto;
 }
 
 static float max_rel_error(const float *a, const float *b, int n, float *max_abs) {
@@ -137,13 +144,12 @@ static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
     m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
-    m->gpu_dense_layer_begin = (opt->hip_mxfp4_widen_layers > 0 ||
-                                opt->hip_mxfp4_resident_layers > 0)
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
         ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
                                      : hip_ds4f_dense_stream_layer) : NULL;
-    m->gpu_dense_stream_prefill_only = opt->hip_mxfp4_widen_layers > 0 ||
-                                       opt->hip_mxfp4_resident_layers > 0;
-    if (opt->hip_mxfp4_widen_layers > 0 || opt->hip_mxfp4_resident_layers > 0)
+    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    if (hip_mxfp4_streaming(opt))
         m->mxfp4_w4a8 = 0;
     int gpu_best = ds4f_forward_token(m, x_gpu, 0);
 
@@ -163,6 +169,7 @@ static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_blockdiag = NULL;
     m->gpu_dense_gemm = NULL;
     m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
     m->gpu_dense_stream_prefill_only = 0;
     m->gpu_dense_gemm_multi = NULL;
     m->gpu_prefill_attn = NULL;
@@ -190,15 +197,14 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
     m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    m->gpu_dense_layer_prefetch = NULL;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
     m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
-    m->gpu_dense_layer_begin = (opt->hip_mxfp4_widen_layers > 0 ||
-                                opt->hip_mxfp4_resident_layers > 0)
+    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
         ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
                                      : hip_ds4f_dense_stream_layer) : NULL;
-    m->gpu_dense_stream_prefill_only = opt->hip_mxfp4_widen_layers > 0 ||
-                                       opt->hip_mxfp4_resident_layers > 0;
-    if (opt->hip_mxfp4_widen_layers > 0 || opt->hip_mxfp4_resident_layers > 0)
+    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    if (hip_mxfp4_streaming(opt))
         m->mxfp4_w4a8 = 0;
 
     if (pos0 < 0) pos0 = 0;
@@ -249,6 +255,7 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
     m->gpu_prefill_attn = NULL;
     m->gpu_dense_mixed = 0;
     m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
     m->gpu_dense_stream_prefill_only = 0;
     return 1;
 }
@@ -326,6 +333,13 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_dense_layer_prefetch = opt->hip_mxfp4_stream_raw &&
+        hip_mxfp4_streaming(opt)
+        ? hip_ds4f_dense_prefetch_layer_raw : NULL;
+    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
+        ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_begin_layer
+                                     : hip_ds4f_dense_stream_layer) : NULL;
+    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
     m->gpu_dense_mixed = opt->hip_shared_bf16 || opt->hip_shared_fp16;
     memset(m->prof, 0, sizeof(m->prof));
     if (warm_batch > 0) {
@@ -396,6 +410,9 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip, int batch,
     m->gpu_dense_gemm = NULL;
     m->gpu_dense_gemm_multi = NULL;
     m->gpu_prefill_attn = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
     m->gpu_dense_mixed = 0;
     return mismatches == 0;
 }
@@ -492,6 +509,8 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-ordered-fp8-layers") == 0 && i + 1 < argc) opt.hip_ordered_fp8_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-widen-layers") == 0 && i + 1 < argc) opt.hip_mxfp4_widen_layers = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-resident-layers") == 0 && i + 1 < argc) opt.hip_mxfp4_resident_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-resident-auto") == 0 && i + 1 < argc) opt.hip_mxfp4_resident_auto = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-vram-reserve-mb") == 0 && i + 1 < argc) opt.hip_vram_reserve_mb = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-stream-raw") == 0 && i + 1 < argc) opt.hip_mxfp4_stream_raw = atoi(argv[++i]);
         else if (strcmp(a, "--hip-prefill-attn") == 0 && i + 1 < argc) opt.hip_prefill_attn = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-gemm-test") == 0) mxfp4_test = 1;
@@ -618,8 +637,12 @@ int main(int argc, char **argv) {
         bank_bytes += ds4f_wbytes(m->head.type, m->head.rows, m->head.cols);
         bank_matrices++;
     }
-    if (pass && opt.hip_mxfp4_resident_layers > 0) {
+    if (pass && (opt.hip_mxfp4_resident_layers > 0 || opt.hip_mxfp4_resident_auto)) {
         int nr = opt.hip_mxfp4_resident_layers;
+        if (opt.hip_mxfp4_resident_auto)
+            nr = hip_ds4f_dense_recommend_mxfp4_resident_layers(
+                hip, m->layers, cfg.n_layers, opt.hip_mxfp4_stream_raw,
+                opt.hip_vram_reserve_mb > 0 ? opt.hip_vram_reserve_mb : 512);
         if (nr > cfg.n_layers) nr = cfg.n_layers;
         for (int L = 0; L < nr; ++L)
             if (hip_ds4f_dense_resident_mxfp4_layer(
@@ -629,8 +652,9 @@ int main(int argc, char **argv) {
                 break;
             }
         if (pass)
-            fprintf(stderr, "GPU MXFP4 resident experts: layers=%d mode=%s\n",
-                    nr, opt.hip_mxfp4_stream_raw ? "raw" : "widened");
+            fprintf(stderr, "GPU MXFP4 resident experts: layers=%d%s mode=%s\n",
+                    nr, opt.hip_mxfp4_resident_auto ? " (auto)" : "",
+                    opt.hip_mxfp4_stream_raw ? "raw" : "widened");
     }
     printf("GPU dense bank: layers=%d matrices=%d resident=%.3f GB\n",
            cfg.n_layers, bank_matrices, bank_bytes / 1e9);
