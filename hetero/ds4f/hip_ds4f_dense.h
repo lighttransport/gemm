@@ -97,6 +97,10 @@ int hip_ds4f_dense_gemm_tensors(
  * current layer's local MXFP4 experts as exact row-scale FP8. */
 int hip_ds4f_dense_stream_layer(void *ctx, const ds4f_layer *layer);
 int hip_ds4f_dense_stream_layer_raw(void *ctx, const ds4f_layer *layer);
+int hip_ds4f_dense_prefill_attention(
+    void *ctx, float *dst, const float *q, const uint16_t *kv,
+    const float *sink, int M, int pos0, int n_heads, int head_dim,
+    int kv_dim, int kv_slots, int window, float scale);
 /* Pre-upload one local expert layer and retain it in the dense bank. Resident
  * layers are reused by stream_layer callbacks without another H2D transfer. */
 int hip_ds4f_dense_resident_mxfp4_layer(void *ctx, const ds4f_layer *layer, int raw);

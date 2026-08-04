@@ -398,6 +398,7 @@ static void gpu_detach(ds4f_session *s) {
         s->m->gpu_dense_gemm = NULL;
         s->m->gpu_dense_gemm_multi = NULL;
         s->m->gpu_dense_layer_begin = NULL;
+        s->m->gpu_prefill_attn = NULL;
         s->m->gpu_dense_stream_prefill_only = 0;
         s->m->gpu_dense_mixed = 0;
     }
@@ -498,6 +499,8 @@ static int gpu_attach(ds4f_session *s, char *err, size_t err_cap) {
     s->m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
     s->m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     s->m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    s->m->gpu_prefill_attn = s->options.hip_prefill_attn
+        ? hip_ds4f_dense_prefill_attention : NULL;
     if (s->options.hip_mxfp4_widen_layers > 0 ||
         s->options.hip_mxfp4_resident_layers > 0)
         s->m->mxfp4_w4a8 = 0;

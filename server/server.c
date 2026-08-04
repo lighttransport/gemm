@@ -2605,6 +2605,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--ds4f-hip-mxfp4-widen-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_mxfp4_widen_layers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-mxfp4-resident-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_mxfp4_resident_layers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-mxfp4-stream-raw") == 0 && i + 1 < argc) cfg.ds4f_options.hip_mxfp4_stream_raw = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-prefill-attn") == 0 && i + 1 < argc) cfg.ds4f_options.hip_prefill_attn = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-exact-prefill") == 0 && i + 1 < argc) cfg.ds4f_options.hip_exact_prefill = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-exact") == 0 && i + 1 < argc) cfg.ds4f_options.exact = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-bf16") == 0 && i + 1 < argc) cfg.ds4f_options.dense_bf16 = atoi(argv[++i]);

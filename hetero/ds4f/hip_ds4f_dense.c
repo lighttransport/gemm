@@ -29,6 +29,11 @@ typedef struct {
     int raw;
 } hip_ds4f_resident_layer;
 
+typedef struct {
+    void *w, *s, *x, *y;
+    int n_out, n_in, n_tok;
+} hip_ds4f_mxfp4_task;
+
 enum {
     HIP_DS4F_MATRIX_FP8 = 0,
     HIP_DS4F_MATRIX_BF16 = 1,
@@ -81,9 +86,11 @@ struct hip_ds4f_dense {
     hipFunction_t gemm_fp8;
     hipFunction_t gemm_fp8_ordered;
     hipFunction_t gemm_mxfp4;
+    hipFunction_t gemm_mxfp4_grouped;
     hipFunction_t gemm_fp8_rowscale;
     hipFunction_t gemm_bf16;
     hipFunction_t gemm_f16;
+    hipFunction_t prefill_attn;
 
     hip_ds4f_matrix *matrices;
     int n_matrices, cap_matrices;
@@ -107,10 +114,14 @@ struct hip_ds4f_dense {
     int multi_pending, multi_n;
 
     void *gemm_dx, *gemm_dy;
+    void *gemm_mxfp4_tasks;
+    size_t gemm_mxfp4_tasks_bytes;
     void *fp8_lut;
     size_t gemm_x_bytes, gemm_y_bytes;
     float *gemm_x_pack, *gemm_y_pack;
     size_t gemm_x_pack_bytes, gemm_y_pack_bytes;
+    void *attn_q, *attn_kv, *attn_sink, *attn_y;
+    size_t attn_q_bytes, attn_kv_bytes, attn_sink_bytes, attn_y_bytes;
     void *gemm_multi_dy[HIP_DS4F_GEMM_MAX];
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
@@ -235,10 +246,14 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                              "ds4f_dense_fp8_ordered_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_mxfp4, ctx->module,
                              "ds4f_dense_mxfp4_gemm") != hipSuccess ||
+        hipModuleGetFunction(&ctx->gemm_mxfp4_grouped, ctx->module,
+                             "ds4f_dense_mxfp4_grouped_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_bf16, ctx->module,
                              "ds4f_dense_bf16_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_f16, ctx->module,
                              "gemm_tiled_f16_f32") != hipSuccess ||
+        hipModuleGetFunction(&ctx->prefill_attn, ctx->module,
+                             "ds4f_dense_prefill_attn") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_fp8_rowscale, ctx->module,
                              "ds4f_dense_fp8_rowscale_gemm") != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: failed to build matvec module\n");
@@ -302,6 +317,11 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->dy) hipFree(ctx->dy);
     if (ctx->gemm_dx) hipFree(ctx->gemm_dx);
     if (ctx->gemm_dy) hipFree(ctx->gemm_dy);
+    if (ctx->attn_q) hipFree(ctx->attn_q);
+    if (ctx->attn_kv) hipFree(ctx->attn_kv);
+    if (ctx->attn_sink) hipFree(ctx->attn_sink);
+    if (ctx->attn_y) hipFree(ctx->attn_y);
+    if (ctx->gemm_mxfp4_tasks) hipFree(ctx->gemm_mxfp4_tasks);
     if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
     for (int i = 0; i < HIP_DS4F_GEMM_MAX; ++i)
         if (ctx->gemm_multi_dy[i]) hipFree(ctx->gemm_multi_dy[i]);
@@ -823,6 +843,35 @@ static int matrix_get(const hip_ds4f_dense *ctx, int id,
     return 0;
 }
 
+static int matrix_view(const hip_ds4f_matrix *mat, const ds4f_tensor *t,
+                       void **dw_out, void **ds_out) {
+    if (!mat || !t || !dw_out || !ds_out || mat->cols != t->cols ||
+        mat->rows < t->rows) return -1;
+    size_t row_bytes = (t->type == DS4F_FP8 || t->type == DS4F_MXFP4)
+        ? (size_t)t->cols : (size_t)t->cols * sizeof(uint16_t);
+    int row0 = 0;
+    if (mat->rows != t->rows) {
+        if (!mat->hw || !t->w || (const uint8_t *)t->w < (const uint8_t *)mat->hw ||
+            !row_bytes) return -1;
+        size_t delta = (size_t)((const uint8_t *)t->w - (const uint8_t *)mat->hw);
+        if (delta % row_bytes != 0) return -1;
+        row0 = (int)(delta / row_bytes);
+        if (row0 < 0 || row0 > mat->rows - t->rows) return -1;
+        if (t->type == DS4F_FP8) {
+            if (!mat->hs || row0 % 128 != 0 ||
+                t->scale != (const uint8_t *)mat->hs +
+                    (size_t)(row0 / 128) * (size_t)mat->scale_cols)
+                return -1;
+        }
+    }
+    *dw_out = (uint8_t *)mat->dw + (size_t)row0 * row_bytes;
+    *ds_out = mat->ds;
+    if (t->type == DS4F_FP8 && row0)
+        *ds_out = (uint8_t *)mat->ds +
+                  (size_t)(row0 / 128) * (size_t)mat->scale_cols;
+    return 0;
+}
+
 static int launch_matvec_async(hip_ds4f_dense *ctx, hipFunction_t fn, int id,
                                void *dw, void *ds, int rows, int cols,
                                int scale_cols, const float *x, int x_cols) {
@@ -978,6 +1027,71 @@ static int ensure_gemm_multi_outputs(hip_ds4f_dense *ctx, int n,
     return 0;
 }
 
+static int ensure_mxfp4_task_buffer(hip_ds4f_dense *ctx, int n) {
+    size_t bytes = (size_t)n * sizeof(hip_ds4f_mxfp4_task);
+    if (ctx->gemm_mxfp4_tasks && ctx->gemm_mxfp4_tasks_bytes >= bytes)
+        return 0;
+    void *p = NULL;
+    if (hipMalloc(&p, bytes) != hipSuccess) return -1;
+    if (ctx->gemm_mxfp4_tasks) hipFree(ctx->gemm_mxfp4_tasks);
+    ctx->gemm_mxfp4_tasks = p;
+    ctx->gemm_mxfp4_tasks_bytes = bytes;
+    return 0;
+}
+
+static int ensure_attn_buffer(void **p, size_t *have, size_t need) {
+    if (*p && *have >= need) return 0;
+    void *q = NULL;
+    if (hipMalloc(&q, need ? need : 1) != hipSuccess) return -1;
+    if (*p) hipFree(*p);
+    *p = q; *have = need;
+    return 0;
+}
+
+int hip_ds4f_dense_prefill_attention(
+    void *opaque, float *dst, const float *q, const uint16_t *kv,
+    const float *sink, int M, int pos0, int n_heads, int head_dim,
+    int kv_dim, int kv_slots, int window, float scale) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    if (!ctx || !dst || !q || !kv || !sink || M < 1 || n_heads < 1 ||
+        head_dim < 1 || kv_dim < 1 || kv_dim > head_dim || kv_slots < 1 ||
+        window < 1 || window > 128 || pos0 < 0 ||
+        !valid_dims(M * n_heads, head_dim) ||
+        !valid_dims(kv_slots, kv_dim)) return -1;
+    int base = pos0 - window + 1;
+    if (base < 0) base = 0;
+    int end = pos0 + M;
+    if (end > kv_slots) return -1;
+    int copy_slots = end - base;
+    if (copy_slots < 1) copy_slots = 1;
+    size_t qb = (size_t)M * (size_t)n_heads * (size_t)head_dim * sizeof(float);
+    size_t kb = (size_t)copy_slots * (size_t)kv_dim * sizeof(uint16_t);
+    size_t sb = (size_t)n_heads * sizeof(float);
+    if (ensure_attn_buffer(&ctx->attn_q, &ctx->attn_q_bytes, qb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_kv, &ctx->attn_kv_bytes, kb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_sink, &ctx->attn_sink_bytes, sb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_y, &ctx->attn_y_bytes, qb) != 0 ||
+        hipSetDevice(ctx->device_id) != hipSuccess) return -1;
+    if (hipMemcpy(ctx->attn_q, q, qb, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(ctx->attn_kv, kv + (size_t)base * kv_dim, kb,
+                  hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(ctx->attn_sink, sink, sb, hipMemcpyHostToDevice) != hipSuccess)
+        return -1;
+    void *dy = ctx->attn_y, *dkv = ctx->attn_kv, *dq = ctx->attn_q, *dsink = ctx->attn_sink;
+    int groups = (n_heads + 7) >> 3;
+    unsigned int gx = (unsigned int)(M * groups);
+    int local_pos0 = pos0 - base;
+    void *args[] = { &dy, &dkv, &dq, &dsink, &M, &local_pos0, &n_heads,
+                     &head_dim, &kv_dim, &copy_slots, &window, &scale };
+    hipError_t err = hipModuleLaunchKernel(ctx->prefill_attn, gx, 1, 1,
+                                            256, 1, 1, 0, ctx->stream,
+                                            args, NULL);
+    if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess ||
+        hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess)
+        return -1;
+    return 0;
+}
+
 static int ensure_gemm_host_pack(hip_ds4f_dense *ctx, size_t x_bytes, size_t y_bytes) {
     if (x_bytes > ctx->gemm_x_pack_bytes) {
         float *p = (float *)ds4f_mem_alloc(ctx->mem, x_bytes, 64, 0);
@@ -1125,7 +1239,7 @@ int hip_ds4f_dense_gemm_tensors(
     int m0 = M[0], k0 = 0;
     if (m0 < 1 || !dst[0] || !x[0] || !t[0] || Xstride[0] < t[0]->cols ||
         t[0]->gpu_id < 0 || matrix_get(ctx, t[0]->gpu_id, &mat[0]) != 0 ||
-        mat[0]->rows != t[0]->rows || mat[0]->cols != t[0]->cols ||
+        mat[0]->rows < t[0]->rows || mat[0]->cols != t[0]->cols ||
         (t[0]->type != DS4F_FP8 && t[0]->type != DS4F_BF16 && t[0]->type != DS4F_MXFP4) ||
         (t[0]->type == DS4F_FP8 && !matrix_is_fp8(mat[0]->kind) &&
          !matrix_is_fp8_promoted(mat[0]->kind)) ||
@@ -1135,17 +1249,19 @@ int hip_ds4f_dense_gemm_tensors(
         return -1;
     k0 = t[0]->cols;
     for (int i = 0; i < n; ++i) {
+        void *view_dw = NULL, *view_ds = NULL;
         if (!dst[i] || !x[i] || !t[i] || M[i] < 1 ||
             t[i]->cols != k0 || Ystride[i] < t[i]->rows ||
             Xstride[i] < t[i]->cols || t[i]->gpu_id < 0 ||
             matrix_get(ctx, t[i]->gpu_id, &mat[i]) != 0 ||
-            mat[i]->rows != t[i]->rows || mat[i]->cols != t[i]->cols ||
+            mat[i]->rows < t[i]->rows || mat[i]->cols != t[i]->cols ||
             (t[i]->type != DS4F_FP8 && t[i]->type != DS4F_BF16 && t[i]->type != DS4F_MXFP4) ||
             (t[i]->type == DS4F_FP8 && !matrix_is_fp8(mat[i]->kind) &&
              !matrix_is_fp8_promoted(mat[i]->kind)) ||
             (t[i]->type == DS4F_BF16 && mat[i]->kind != HIP_DS4F_MATRIX_BF16) ||
             (t[i]->type == DS4F_MXFP4 && !matrix_is_mxfp4(mat[i]->kind) &&
-             !matrix_is_fp8_rowscale(mat[i]->kind)))
+             !matrix_is_fp8_rowscale(mat[i]->kind)) ||
+            matrix_view(mat[i], t[i], &view_dw, &view_ds) != 0)
             return -1;
         ybytes[i] = (size_t)M[i] * (size_t)t[i]->rows * sizeof(float);
     }
@@ -1165,8 +1281,41 @@ int hip_ds4f_dense_gemm_tensors(
         return -1;
     if (hipMemcpy(ctx->gemm_dx, ctx->gemm_x_pack, xbytes, hipMemcpyHostToDevice) != hipSuccess)
         return -1;
-    for (int i = 0; i < n; ++i) {
-        void *dw = mat[i]->dw, *ds = mat[i]->ds;
+    int grouped_raw = n > 1;
+    unsigned int group_gx = 0, group_gy = 0;
+    if (grouped_raw) {
+        hip_ds4f_mxfp4_task task[HIP_DS4F_GEMM_MAX];
+        memset(task, 0, (size_t)n * sizeof(*task));
+        for (int i = 0; i < n; ++i) {
+            if (!matrix_is_mxfp4(mat[i]->kind)) { grouped_raw = 0; break; }
+            task[i].w = mat[i]->dw;
+            task[i].s = mat[i]->ds;
+            task[i].x = (uint8_t *)ctx->gemm_dx + xoff[i];
+            task[i].y = ctx->gemm_multi_dy[i];
+            task[i].n_out = t[i]->rows;
+            task[i].n_in = k0;
+            task[i].n_tok = M[i];
+            unsigned int gx = (unsigned int)((t[i]->rows + 63) / 64);
+            unsigned int gy = (unsigned int)((M[i] + 15) / 16);
+            if (gx > group_gx) group_gx = gx;
+            if (gy > group_gy) group_gy = gy;
+        }
+        if (grouped_raw) {
+            if (ensure_mxfp4_task_buffer(ctx, n) != 0 ||
+                hipMemcpy(ctx->gemm_mxfp4_tasks, task,
+                          (size_t)n * sizeof(*task), hipMemcpyHostToDevice) != hipSuccess)
+                return -1;
+            int ntasks = n;
+            void *args[] = { &ctx->gemm_mxfp4_tasks, &ntasks };
+            if (hipModuleLaunchKernel(ctx->gemm_mxfp4_grouped,
+                    group_gx, group_gy, (unsigned int)n, 16, 16, 1, 0,
+                    ctx->stream, args, NULL) != hipSuccess)
+                return -1;
+        }
+    }
+    if (!grouped_raw) for (int i = 0; i < n; ++i) {
+        void *dw = NULL, *ds = NULL;
+        if (matrix_view(mat[i], t[i], &dw, &ds) != 0) return -1;
         void *dx = (uint8_t *)ctx->gemm_dx + xoff[i];
         void *dy = ctx->gemm_multi_dy[i];
         hipFunction_t fn;

@@ -414,6 +414,7 @@ typedef struct ds4f_runtime_options {
     int hip_mxfp4_widen_layers;          /* GPU MXFP4 experts, widened to row-scale FP8 */
     int hip_mxfp4_resident_layers;       /* keep this many widened expert layers on GPU */
     int hip_mxfp4_stream_raw;            /* use compact raw MXFP4/LUT for streamed experts */
+    int hip_prefill_attn;                /* experimental opt-in GPU sliding-window attention; exact default is 0 */
     int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
     int debug_env;
 } ds4f_runtime_options;
@@ -442,6 +443,10 @@ typedef int (*ds4f_gpu_dense_gemm_multi_fn)(
     const float *const *x, const int *M, const int *Ystride,
     const int *Xstride, int n);
 typedef int (*ds4f_gpu_dense_layer_fn)(void *ctx, const ds4f_layer *layer);
+typedef int (*ds4f_gpu_prefill_attn_fn)(
+    void *ctx, float *dst, const float *q, const uint16_t *kv,
+    const float *sink, int M, int pos0, int n_heads, int head_dim,
+    int kv_dim, int kv_slots, int window, float scale);
 
 typedef struct {
     ds4f_config cfg;
@@ -495,6 +500,7 @@ typedef struct {
     ds4f_gpu_dense_gemm_fn gpu_dense_gemm;
     ds4f_gpu_dense_gemm_multi_fn gpu_dense_gemm_multi;
     ds4f_gpu_dense_layer_fn gpu_dense_layer_begin;
+    ds4f_gpu_prefill_attn_fn gpu_prefill_attn;
     int gpu_dense_stream_prefill_only;
     int gpu_dense_mixed;       /* opt-in mixed GPU/CPU independent-GEMM dispatch */
     int gpu_exact_prefill;     /* skip GPU M>1 GEMMs; retain GPU M=1 decode */

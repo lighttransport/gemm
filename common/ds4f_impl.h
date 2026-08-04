@@ -2975,6 +2975,7 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_MXFP4_WIDEN_LAYERS"); o.hip_mxfp4_widen_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_RESIDENT_LAYERS"); o.hip_mxfp4_resident_layers = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_STREAM_RAW"); o.hip_mxfp4_stream_raw = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_PREFILL_ATTN"); o.hip_prefill_attn = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_MHC"); o.mhc = e && *e ? atoi(e) : 0; }
@@ -3074,6 +3075,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_mxfp4_widen_layers = ds4f_json_int(json, "hip_mxfp4_widen_layers", o->hip_mxfp4_widen_layers);
     o->hip_mxfp4_resident_layers = ds4f_json_int(json, "hip_mxfp4_resident_layers", o->hip_mxfp4_resident_layers);
     o->hip_mxfp4_stream_raw = ds4f_json_int(json, "hip_mxfp4_stream_raw", o->hip_mxfp4_stream_raw);
+    o->hip_prefill_attn = ds4f_json_int(json, "hip_prefill_attn", o->hip_prefill_attn);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);
     o->mhc = ds4f_json_int(json, "mhc", o->mhc);
@@ -6157,6 +6159,21 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         DS4F_TOC(DS4F_P_QKV); }
         /* ---- attention (sliding window + sink), over (token,head) ---- */
         { DS4F_TIC();
+        int gpu_attn_ok = 0;
+        if (m->gpu_prefill_attn) {
+            gpu_attn_ok = m->gpu_prefill_attn(
+                m->gpu_dense_ctx, m->p_attn, m->p_q, ly->kv_cache,
+                ly->attn_sink, M, pos0, c->n_heads, HD, KV,
+                ly->kv_slots, c->window_size, 1.0f / sqrtf((float)HD)) == 0;
+            if (gpu_attn_ok) {
+                int nope = HD - c->qk_rope_dim;
+                for (int mm = 0; mm < M; ++mm)
+                    for (int h = 0; h < c->n_heads; ++h)
+                        ds4f_rope_apply(m->p_attn + ((size_t)mm*c->n_heads + h)*HD + nope,
+                                        rcos, rsin, pos0 + mm, c->qk_rope_dim/2, 1);
+            }
+        }
+        if (!gpu_attn_ok) {
 #if defined(__ARM_FEATURE_SVE)
         ds4f_attn_pf_task at = { m, ly, pos0, M, 1.0f/sqrtf((float)HD),
                                  c->window_size, c->qk_rope_dim/2, rcos, rsin };
@@ -6166,6 +6183,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
                                  c->window_size, c->qk_rope_dim/2, rcos, rsin };
         ds4f_pool_run(m->pool, ds4f_attn_prefill_worker_x86, &at);
 #endif
+        }
         DS4F_TOC(DS4F_P_ATTN); }
         /* ---- grouped low-rank o-projection ---- */
         { DS4F_TIC();
