@@ -110,6 +110,14 @@ int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *c, ds4f_tensor *t) {
     return hip_ds4f_dense_bind_tensor(c->hip, t);
 }
 
+void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
+    if (!m) return;
+    m->gpu_dense_ctx = c;
+    m->gpu_dense_gemm = c ? dual_ds4f_prefill_gemm : NULL;
+    m->gpu_dense_gemm_multi = c ? dual_ds4f_prefill_gemm_multi : NULL;
+    m->gpu_dense_mixed = c ? 1 : 0;
+}
+
 int dual_ds4f_prefill_gemm(void *opaque, float *dst, const ds4f_tensor *t,
                            const float *x, int M, int Ys, int Xs) {
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
