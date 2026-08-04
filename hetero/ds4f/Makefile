@@ -11,7 +11,7 @@ LDFLAGS := -lm -lpthread -ldl
 
 BUILD := build
 
-.PHONY: all clean verify test hip-test real-hip-test forward-hip-test real-token-test prefill-test real-prefill-test mtp-test x86-runner sve-check
+.PHONY: all clean verify test hip-test real-hip-test forward-hip-test real-token-test prefill-test real-prefill-test mtp-test cuda-test x86-runner sve-check
 all: $(BUILD)/bench_expert_bw $(BUILD)/test_ds4f_kernels $(BUILD)/test_hip_ds4f_dense \
     $(BUILD)/test_hip_ds4f_real $(BUILD)/test_hip_ds4f_forward $(BUILD)/test_ds4f_real_tokens \
     $(BUILD)/test_ds4f_prefill $(BUILD)/test_ds4f_prefill_real $(BUILD)/test_ds4f_mtp $(BUILD)/ds4f_runner
@@ -68,6 +68,11 @@ $(BUILD)/ds4f_runner: ../../a64fx/llm/ds4f_runner.c \
                       ../../common/ds4f.h ../../common/ds4f_impl.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCS) -o $@ ../../a64fx/llm/ds4f_runner.c $(LDFLAGS)
 
+$(BUILD)/test_cuda_ds4f_mxfp4: test_cuda_ds4f_mxfp4.c cuda_ds4f_mxfp4.c \
+                               cuda_ds4f_mxfp4.h ../../cuda/cuew.c ../../cuda/cuew.h | $(BUILD)
+	$(CC) $(CFLAGS) -I../../cuda -o $@ test_cuda_ds4f_mxfp4.c cuda_ds4f_mxfp4.c \
+		../../cuda/cuew.c $(LDFLAGS)
+
 verify: $(BUILD)/bench_expert_bw
 	$(BUILD)/bench_expert_bw --mode verify
 
@@ -94,6 +99,11 @@ real-prefill-test: $(BUILD)/test_ds4f_prefill_real
 
 mtp-test: $(BUILD)/test_ds4f_mtp
 	$(BUILD)/test_ds4f_mtp
+
+cuda-test: $(BUILD)/test_cuda_ds4f_mxfp4
+	@test -f ../../cuda/llm/mmq_kernels.cubin || { echo "build cuda/llm/mmq_kernels.cubin first" >&2; exit 2; }
+	$(BUILD)/test_cuda_ds4f_mxfp4 64
+	$(BUILD)/test_cuda_ds4f_mxfp4 128
 
 x86-runner: $(BUILD)/ds4f_runner
 

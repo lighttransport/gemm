@@ -29,6 +29,108 @@
 #include "mmq.cuh"        // -> mmq_vendor/mmq.cuh (via -Immq_vendor)
 
 #include <cstdint>
+static_assert(sizeof(block_fp4_mmq) == 144, "unexpected MMQ FP4 block size");
+
+static __device__ __forceinline__ uint8_t mmqv_e8m0_scale(float amax) {
+    if (!(amax > 0.0f)) return 0;
+    int e = __float2int_rn(log2f(amax)) - 2 + 127;
+    return (uint8_t) max(0, min(254, e));
+}
+
+static __device__ __forceinline__ uint8_t mmqv_fp4(float x, float inv_scale) {
+    const float lut[8] = { 0.0f, .5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    float ax = fabsf(x) * inv_scale;
+    int best = 0; float err = ax;
+#pragma unroll
+    for (int i = 1; i < 8; ++i) { float d = fabsf(ax - lut[i]); if (d < err) { err = d; best = i; } }
+    return (uint8_t)(best | ((x < 0.0f) ? 8 : 0));
+}
+
+/* SM120 MXFP4 MMQ consumes block_fp4_mmq activations, not block_q8_1_mmq.
+ * Each warp quantizes two E8M0 blocks (64 values) and stores the interleaved
+ * nibble order expected by load_tiles_mxfp4_fp4. */
+extern "C" __global__ void mmqv_quant_mxfp4(
+        const float *x, const int32_t *ids, void *vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int64_t start = ((int64_t)blockIdx.y * blockDim.y + warp) * 64;
+    if (start >= ne0) return;
+    const int64_t row = ids ? ids[blockIdx.x] : blockIdx.x;
+    const int64_t base = (blockIdx.z / ne2) * s03 + (blockIdx.z % ne2) * s02 + row * s01;
+    uint8_t scale[2], p0[2], p1[2];
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        int64_t p = start + b * 32 + lane;
+        float v = p < ne00 ? x[base + p] : 0.0f;
+        float a = fabsf(v);
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+        uint8_t raw_scale = mmqv_e8m0_scale(a);
+        scale[b] = raw_scale;
+        float inv = a > 0.0f ? exp2f(-((float)raw_scale - 127.0f)) : 0.0f;
+        uint8_t qv = mmqv_fp4(v, inv);
+        int base_lane = (lane / 4) * 2;
+        uint8_t lo0 = __shfl_sync(0xffffffff, qv, base_lane);
+        uint8_t lo1 = __shfl_sync(0xffffffff, qv, base_lane + 1);
+        uint8_t hi0 = __shfl_sync(0xffffffff, qv, base_lane + 16);
+        uint8_t hi1 = __shfl_sync(0xffffffff, qv, base_lane + 17);
+        p0[b] = (uint8_t)(lo0 | (hi0 << 4));
+        p1[b] = (uint8_t)(lo1 | (hi1 << 4));
+    }
+    const int64_t block_fp4 = start / 256;
+    const int quad = (start % 256) / 64;
+    block_fp4_mmq *out = (block_fp4_mmq *)vy + (blockIdx.z * (int64_t)ne1 * (ne0 / 256) + block_fp4 * ne1 + row);
+    int group = lane / 4, in_group = lane & 3;
+    if (in_group == 0) {
+        char2 *dst = (char2 *)out->qs;
+        dst[quad * 16 + group] = make_char2((char)p0[0], (char)p1[0]);
+        dst[quad * 16 + 8 + group] = make_char2((char)p0[1], (char)p1[1]);
+    }
+    if (lane == 0) out->d4[quad] = (uint32_t)scale[0] | ((uint32_t)scale[1] << 8);
+}
+
+/* Conservative row/quad quantizer.  The FP4 MMA path consumes
+ * block_fp4_mmq activations: four E8M0 pairs and 128 packed bytes per
+ * 256-value tile, laid out block-major across rows. */
+extern "C" __global__ void mmqv_quant_mxfp4_rows(
+        const float *x, void *vy, const int64_t ne00, const int64_t s01,
+        const int64_t ne0, const int ne1) {
+    const int lane = threadIdx.x;
+    const int row = (int)blockIdx.x;
+    const int pair = (int)blockIdx.y;
+    const int64_t start = (int64_t)pair * 64;
+    if (row >= ne1 || start >= ne0) return;
+    uint8_t scale[2], packed[2][16];
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const int64_t p = start + b * 32 + lane;
+        const float v = p < ne00 ? x[(int64_t)row * s01 + p] : 0.0f;
+        float a = fabsf(v);
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+        const uint8_t e = mmqv_e8m0_scale(a);
+        scale[b] = e;
+        const float inv = a > 0.0f ? exp2f(-((float)e - 127.0f)) : 0.0f;
+        const uint8_t qv = mmqv_fp4(v, inv);
+        /* Keep every shuffle source in-range.  Only lanes 0..15 consume the
+         * high nibble, but all lanes must participate in the intrinsic. */
+        const uint8_t hi = __shfl_sync(0xffffffff, qv, lane ^ 16);
+        if (lane < 16) {
+            const uint8_t lo = qv;
+            packed[b][lane] = (uint8_t)(lo | (hi << 4));
+        }
+    }
+    const int block = pair / 4;
+    const int quad = pair % 4;
+    block_fp4_mmq *out = (block_fp4_mmq *)vy + (int64_t)block * ne1 + row;
+    if (lane < 16) {
+        uint8_t *qs = (uint8_t *)out->qs;
+        qs[quad * 32 + lane] = packed[0][lane];
+        qs[quad * 32 + 16 + lane] = packed[1][lane];
+    }
+    if (lane == 0) out->d4[quad] = (uint32_t)scale[0] | ((uint32_t)scale[1] << 8);
+}
 
 // ---------------------------------------------------------------------------
 // Activation quantizer: float -> block_q8_1_mmq.  Copied verbatim from
@@ -190,6 +292,21 @@ extern "C" __global__ void mmqv_fixup_##SUFFIX(                                 
     DEFINE_MMQ_FIXUP(SUFFIX##_x128_nc0, TYPE, false)      \
     DEFINE_MMQ_FIXUP(SUFFIX##_x128_nc1, TYPE, true)
 
+#define DEFINE_MMQ_X64(SUFFIX, TYPE) \
+extern "C" __global__ void mmqv_##SUFFIX##_x64_nc0( \
+        const char *x, const int *y, const int32_t *ids_dst, const int32_t *expert_bounds, float *dst, float *tmp_fixup, \
+        const uint3 bp, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst, \
+        const uint3 cr, const uint3 ny, const int scx, const int scy, const int scd, const uint3 sr, const uint3 sy, const int ssx, const int ssy, const int ssd, const uint3 ntx) { \
+    mul_mat_q<TYPE, 64, false>(x,y,ids_dst,expert_bounds,dst,tmp_fixup,bp,nrows_x,ncols_dst,stride_row_x,ncols_y,stride_col_dst,cr,ny,scx,scy,scd,sr,sy,ssx,ssy,ssd,ntx); } \
+extern "C" __global__ void mmqv_##SUFFIX##_x64_nc1( \
+        const char *x, const int *y, const int32_t *ids_dst, const int32_t *expert_bounds, float *dst, float *tmp_fixup, \
+        const uint3 bp, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst, \
+        const uint3 cr, const uint3 ny, const int scx, const int scy, const int scd, const uint3 sr, const uint3 sy, const int ssx, const int ssy, const int ssd, const uint3 ntx) { \
+    mul_mat_q<TYPE, 64, true>(x,y,ids_dst,expert_bounds,dst,tmp_fixup,bp,nrows_x,ncols_dst,stride_row_x,ncols_y,stride_col_dst,cr,ny,scx,scy,scd,sr,sy,ssx,ssy,ssd,ntx); } \
+extern "C" __global__ void mmqv_fixup_##SUFFIX##_x64_nc0( \
+        const int32_t *ids_dst, const int32_t *expert_bounds, float *dst, float *tmp, const uint3 bp, const int nr, const int nc, const int stride, const uint3 ny, const int scd, const uint3 sy, const int ssd, const uint3 ntx) { \
+    mul_mat_q_stream_k_fixup<TYPE,64,false>(ids_dst,expert_bounds,dst,tmp,bp,nr,nc,stride,ny,scd,sy,ssd,ntx); }
+
 DEFINE_MMQ_TYPE(iq2xxs, GGML_TYPE_IQ2_XXS)  // Phase 1 (31B, dominant)
 DEFINE_MMQ_TYPE(iq3xxs, GGML_TYPE_IQ3_XXS)  // 31B attn_v
 DEFINE_MMQ_TYPE(iq2s,   GGML_TYPE_IQ2_S)    // 31B UD-mix
@@ -198,3 +315,4 @@ DEFINE_MMQ_TYPE(q2k,    GGML_TYPE_Q2_K)     // 31B ffn_down (D2S6 quant)
 DEFINE_MMQ_TYPE(q4_0,   GGML_TYPE_Q4_0)     // 12B QAT (DS4 quant, qk=32)
 DEFINE_MMQ_TYPE(q6k,    GGML_TYPE_Q6_K)     // 12B Q6_K
 DEFINE_MMQ_TYPE(mxfp4,  GGML_TYPE_MXFP4)    // DS4F raw MXFP4 experts
+DEFINE_MMQ_X64(mxfp4, GGML_TYPE_MXFP4)

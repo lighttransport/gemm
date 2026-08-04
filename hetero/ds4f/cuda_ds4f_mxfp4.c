@@ -1,0 +1,156 @@
+#define _GNU_SOURCE
+#include "cuda_ds4f_mxfp4.h"
+#include "../../cuda/cuew.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { unsigned int x, y, z; } ds4f_u3;
+struct cuda_ds4f_mxfp4 {
+    CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64;
+    CUstream stream; CUevent quant_done;
+    CUdeviceptr w, x, q8, y, tmpfix, ids; size_t xb, q8b, yb, fixb, wb, idsb;
+    int rows, cols, nsm; int verbose;
+};
+static ds4f_u3 fastdiv(unsigned long long d) {
+    unsigned int L = 0, di = (unsigned int)d;
+    while (L < 32 && ((unsigned int)1 << L) < di) ++L;
+    unsigned int mp = (unsigned int)(((unsigned long long)1 << 32) *
+        (((unsigned long long)1 << L) - di) / di + 1);
+    ds4f_u3 r = { mp, L, di }; return r;
+}
+static int ck(CUresult r, const char *what) {
+    if (r == CUDA_SUCCESS) return 0;
+    const char *s = NULL; if (cuGetErrorString) cuGetErrorString(r, &s);
+    fprintf(stderr, "cuda_ds4f_mxfp4: %s: %s (%d)\n", what, s ? s : "error", (int)r);
+    return -1;
+}
+cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
+    if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
+    cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
+    c->verbose = verbose;
+    if (ck(cuDeviceGet(&c->dev, device_id), "device") ||
+        ck(cuDevicePrimaryCtxRetain(&c->ctx, c->dev), "context") ||
+        ck(cuCtxSetCurrent(c->ctx), "set context") ||
+        ck(cuStreamCreate(&c->stream, CU_STREAM_NON_BLOCKING), "stream") ||
+        ck(cuEventCreate(&c->quant_done, CU_EVENT_DISABLE_TIMING), "event")) goto fail;
+    FILE *f = fopen("cuda/llm/mmq_kernels.cubin", "rb");
+    if (!f) f = fopen("../../cuda/llm/mmq_kernels.cubin", "rb");
+    if (!f) f = fopen("mmq_kernels.cubin", "rb");
+    if (!f) goto fail;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    void *blob = n > 0 ? malloc((size_t)n) : NULL;
+    int ok = blob && fread(blob, 1, (size_t)n, f) == (size_t)n; fclose(f);
+    if (!ok || ck(cuModuleLoadDataEx(&c->mod, blob, 0, NULL, NULL), "module")) { free(blob); goto fail; }
+    free(blob);
+    if (ck(cuModuleGetFunction(&c->quant, c->mod, "mmqv_quant_q8_1_d4"), "quantizer") ||
+        ck(cuModuleGetFunction(&c->quant_fp4, c->mod, "mmqv_quant_mxfp4"), "mxfp4 quantizer") ||
+        ck(cuModuleGetFunction(&c->quant_rows, c->mod, "mmqv_quant_mxfp4_rows"), "row quantizer") ||
+        ck(cuModuleGetFunction(&c->gemm, c->mod, "mmqv_mxfp4_x128_nc0"), "mxfp4") ||
+        ck(cuModuleGetFunction(&c->gemm64, c->mod, "mmqv_mxfp4_x64_nc0"), "mxfp4 x64")) goto fail;
+    cuModuleGetFunction(&c->fixup, c->mod, "mmqv_fixup_mxfp4_x128_nc0");
+    cuModuleGetFunction(&c->fixup64, c->mod, "mmqv_fixup_mxfp4_x64_nc0");
+    cuDeviceGetAttribute(&c->nsm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, c->dev);
+    int sh = 0; cuDeviceGetAttribute(&sh, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, c->dev);
+    if (sh < 65536) sh = 65536;
+    cuFuncSetAttribute(c->gemm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sh);
+    cuFuncSetAttribute(c->gemm64, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sh);
+    return c;
+fail: cuda_ds4f_mxfp4_destroy(c); return NULL;
+}
+void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
+    if (!c) return; if (c->stream) cuStreamSynchronize(c->stream);
+    if (c->w) cuMemFree(c->w); if (c->x) cuMemFree(c->x); if (c->q8) cuMemFree(c->q8); if (c->y) cuMemFree(c->y); if (c->tmpfix) cuMemFree(c->tmpfix); if (c->ids) cuMemFree(c->ids);
+    if (c->quant_done) cuEventDestroy(c->quant_done); if (c->stream) cuStreamDestroy(c->stream); if (c->mod) cuModuleUnload(c->mod);
+    if (c->ctx) cuDevicePrimaryCtxRelease(c->dev); free(c);
+}
+int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s, int rows, int cols) {
+    if (!c || !w || !s || rows <= 0 || cols <= 0 || (cols & 127)) return -1;
+    size_t nb = (size_t)cols / 32, bytes = (size_t)rows * nb * 17, rb = (size_t)cols / 2;
+    uint8_t *p = (uint8_t *)malloc(bytes); if (!p) return -1;
+    for (int r = 0; r < rows; ++r) for (size_t b = 0; b < nb; ++b) {
+        uint8_t *q = p + ((size_t)r * nb + b) * 17; uint8_t e = s[(size_t)r * nb + b];
+        /* DS4F's on-disk LUT is 2x the native E2M1 LUT, so e-1 plus
+         * the 2x LUT is numerically equivalent to native LUT with e. */
+        q[0] = e;
+        const uint8_t *src = w + (size_t)r * rb + b * 16;
+        /* Native block_mxfp4 packs element j with element j+16 in one byte;
+         * this is the layout consumed by the FP4 MMQ dequantizer. */
+        for (int j = 0; j < 16; ++j) {
+            uint8_t lo = (src[j / 2] >> ((j & 1) * 4)) & 0xf;
+            uint8_t hi = (src[8 + j / 2] >> ((j & 1) * 4)) & 0xf;
+            q[1 + j] = (uint8_t)(lo | (hi << 4));
+        }
+    }
+    if (c->w) cuMemFree(c->w); c->w = 0;
+    int rc = cuMemAlloc(&c->w, bytes) == CUDA_SUCCESS && cuMemcpyHtoD(c->w, p, bytes) == CUDA_SUCCESS ? 0 : -1;
+    free(p); if (!rc) { c->wb = bytes; c->rows = rows; c->cols = cols; } return rc;
+}
+int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, int N, int K) {
+    /* Native MMQ is used for prefill-sized batches; leave decode/tiny batches
+     * to the existing HIP/CPU path until a separate small-N kernel is wired. */
+    if (!c || !dst || !x || !c->w || M < 64 || N != c->rows || K != c->cols || N % 128 || K % 32) return -1;
+    /* The x64 MMQ specialization requires a full 64-row tile.  Pad tiny
+     * batches to the proven x128 path; normal prefill batches use x64/x128. */
+    const int use64 = M >= 64 && M < 128;
+    const int Mp = use64 ? M : ((M + 127) & ~127);
+    size_t xb = (size_t)Mp * K * sizeof(float), q8b = (size_t)Mp * ((K + 255) & ~255) / 256 * 144 + 256 * 144, yb = (size_t)Mp * N * sizeof(float);
+    if (!c->x || c->xb < xb) { if (c->x) cuMemFree(c->x); if (cuMemAlloc(&c->x, xb) != CUDA_SUCCESS) return -1; c->xb = xb; }
+    if (!c->q8 || c->q8b < q8b) { if (c->q8) cuMemFree(c->q8); if (cuMemAlloc(&c->q8, q8b) != CUDA_SUCCESS) return -1; c->q8b = q8b; }
+    if (!c->y || c->yb < yb) { if (c->y) cuMemFree(c->y); if (cuMemAlloc(&c->y, yb) != CUDA_SUCCESS) return -1; c->yb = yb; }
+    float *xp = (float *)calloc((size_t)Mp * K, sizeof(float));
+    if (!xp) return -1;
+    memcpy(xp, x, (size_t)M * K * sizeof(float));
+    CUresult xr = cuMemcpyHtoD(c->x, xp, xb);
+    free(xp);
+    if (xr != CUDA_SUCCESS || cuCtxSynchronize() != CUDA_SUCCESS) return -1;
+    if (cuMemsetD8(c->q8, 0, q8b) != CUDA_SUCCESS) return -1;
+    if (cuMemsetD8(c->y, 0, yb) != CUDA_SUCCESS) return -1;
+    long long ne00 = K, s01 = K, ne0 = (K + 511) & ~511;
+    int by = ((int)ne0 + 63) / 64;
+    long long s02 = 0, s03 = 0;
+    int ne1 = Mp, ne2 = 1;
+    CUdeviceptr ids0 = 0;
+    void *qa[] = { &c->x, &ids0, &c->q8, &ne00, &s01, &s02, &s03, &ne0, &ne1, &ne2 };
+    if (cuLaunchKernel(c->quant_fp4, Mp, by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS ||
+        cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
+    if (cuEventRecord(c->quant_done, c->stream) != CUDA_SUCCESS ||
+        cuEventSynchronize(c->quant_done) != CUDA_SUCCESS || cuCtxSynchronize() != CUDA_SUCCESS) return -1;
+    int nty = (N + 127) / 128, ntx = use64 ? (Mp + 63) / 64 : (Mp + 127) / 128, tiles = nty * ntx;
+    int waves = (tiles + c->nsm - 1) / c->nsm;
+    int eff = 100 * tiles / (c->nsm * waves);
+    int sk = eff >= 90 ? tiles : c->nsm;
+    if (sk < 1) sk = 1;
+    if (tiles == 1) sk = 1;
+    if (c->verbose) fprintf(stderr, "mmq M=%d Mp=%d tiles=%d nsm=%d sk=%d fix=%d\n", M, Mp, tiles, c->nsm, sk, (tiles % sk) != 0);
+    int fix = (tiles % sk) != 0;
+    if (fix && !c->fixup) return -1;
+    size_t fixb = fix ? (size_t)sk * 128 * 128 * sizeof(float) : 0;
+    if (fixb > c->fixb) {
+        if (c->tmpfix) cuMemFree(c->tmpfix);
+        if (cuMemAlloc(&c->tmpfix, fixb) != CUDA_SUCCESS) return -1;
+        c->fixb = fixb;
+    }
+    ds4f_u3 bp = fastdiv((unsigned long long)K / 32), one = fastdiv(1), ntxfd = fastdiv((unsigned)ntx);
+    int zero = 0, stride = K / 32, nrows = N, ncols = M, ny = Mp, stride_col = N;
+    CUdeviceptr nullp = 0;
+    CUdeviceptr tmp = fix ? c->tmpfix : 0;
+    CUfunction gemmfn = use64 ? c->gemm64 : c->gemm;
+    CUfunction fixfn = use64 ? c->fixup64 : c->fixup;
+    if (fix && !fixfn) return -1;
+    void *a[] = { &c->w, &c->q8, &nullp, &nullp, &c->y, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
+                  &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
+    if (cuLaunchKernel(gemmfn, sk, 1, 1, 32, 8, 1, 57856, c->stream, a, NULL) != CUDA_SUCCESS ||
+        cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
+    if (fix) {
+        void *fa[] = { &nullp, &nullp, &c->y, &c->tmpfix, &bp, &nrows, &ny, &stride_col,
+                       &one, &zero, &one, &zero, &ntxfd };
+        if (cuLaunchKernel(fixfn, sk, 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS ||
+            cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
+    }
+    float *yp = (float *)malloc(yb);
+    if (!yp || cuMemcpyDtoH(yp, c->y, yb) != CUDA_SUCCESS) { free(yp); return -1; }
+    for (int r = 0; r < M; ++r) memcpy(dst + (size_t)r * N, yp + (size_t)r * N, (size_t)N * sizeof(float));
+    free(yp);
+    return 0;
+}
