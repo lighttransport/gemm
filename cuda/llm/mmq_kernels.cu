@@ -197,3 +197,4 @@ DEFINE_MMQ_TYPE(iq3s,   GGML_TYPE_IQ3_S)    // 31B ffn_down
 DEFINE_MMQ_TYPE(q2k,    GGML_TYPE_Q2_K)     // 31B ffn_down (D2S6 quant)
 DEFINE_MMQ_TYPE(q4_0,   GGML_TYPE_Q4_0)     // 12B QAT (DS4 quant, qk=32)
 DEFINE_MMQ_TYPE(q6k,    GGML_TYPE_Q6_K)     // 12B Q6_K
+DEFINE_MMQ_TYPE(mxfp4,  GGML_TYPE_MXFP4)    // DS4F raw MXFP4 experts
