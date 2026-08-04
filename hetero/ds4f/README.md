@@ -404,6 +404,10 @@ quantization, not a dispatcher race. `--dual-cuda-mxfp4 0` selects the exact
 HIP MXFP4 path for small models, but the full 43-layer expert bank does not fit
 on the available 8-GB device, so it is not a full-model fallback.
 
+Routed expert buckets below 128 tokens use the exact CPU path; SM120 native MMQ
+is reserved for full x128 batches. This avoids unstable partial-tile launches
+while retaining CUDA acceleration for large expert groups.
+
 For the highest-quality CUDA approximation, pass `--dual-cuda-terms 2` (or set
 `DUAL_CUDA_TERMS=2` for `real-dual-test`). The bridge decomposes each
 activation into two FP4 terms and accumulates two SM120 GEMMs. This reduces
