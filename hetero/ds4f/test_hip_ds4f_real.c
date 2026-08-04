@@ -660,6 +660,20 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (dual) {
+        for (int L = 0; L < cfg.n_layers && pass; ++L) {
+            ds4f_layer *z = &m->layers[L];
+            for (int e = 0; e < z->n_owned; ++e) {
+                if (dual_ds4f_prefill_bind_tensor(dual, &z->ex_w1[e]) < 0 ||
+                    dual_ds4f_prefill_bind_tensor(dual, &z->ex_w2[e]) < 0 ||
+                    dual_ds4f_prefill_bind_tensor(dual, &z->ex_w3[e]) < 0) {
+                    fprintf(stderr, "dual GPU expert bind failed at layer=%d expert=%d\n", L, e);
+                    pass = 0;
+                    break;
+                }
+            }
+        }
+    }
     int head_id = -1;
     if (m->head.type == DS4F_BF16)
         head_id = dual ? dual_ds4f_prefill_bind_tensor(dual, &m->head)

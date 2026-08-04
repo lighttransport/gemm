@@ -4,8 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-int main(void) {
-    const int M = 64, N = 128, K = 4096, nb = K / 32;
+int main(int argc, char **argv) {
+    const int M = argc > 1 ? atoi(argv[1]) : 64, N = 128, K = 4096, nb = K / 32;
     uint8_t *mw = malloc((size_t)N*K/2), *ms = malloc((size_t)N*nb);
     uint16_t *bw = malloc((size_t)N*K*2);
     float *x = malloc((size_t)M*K*4), *ym = malloc((size_t)M*N*4),

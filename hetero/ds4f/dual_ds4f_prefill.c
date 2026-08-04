@@ -26,7 +26,7 @@ struct dual_ds4f_prefill {
 };
 
 static int cuda_eligible(const ds4f_tensor *t, int M, int Ys, int Xs) {
-    return t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= 64 &&
+    return t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= 1 &&
            Ys == t->rows && Xs == t->cols && (t->rows % 128) == 0 &&
            (t->cols % 32) == 0;
 }
@@ -47,7 +47,31 @@ static int dual_cuda_one(dual_ds4f_prefill *c, float *dst,
             c->cuda_cols = t->cols;
         }
     }
-    if (!rc) rc = cuda_ds4f_mxfp4_gemm(c->cuda, dst, x, M, t->rows, t->cols);
+    if (!rc) {
+        int run_m = M < 64 ? 64 : M;
+        float *xpad = NULL, *ypad = NULL;
+        const float *run_x = x;
+        float *run_y = dst;
+        if (run_m != M) {
+            xpad = (float *)calloc((size_t)run_m * t->cols, sizeof(float));
+            ypad = (float *)calloc((size_t)run_m * t->rows, sizeof(float));
+            if (!xpad || !ypad) { free(xpad); free(ypad); rc = -1; }
+            else {
+                memcpy(xpad, x, (size_t)M * t->cols * sizeof(float));
+                run_x = xpad; run_y = ypad;
+            }
+        }
+        if (!rc) {
+            rc = cuda_ds4f_mxfp4_gemm(c->cuda, run_y, run_x, run_m,
+                                      t->rows, t->cols);
+            if (!rc && run_m != M)
+                for (int r = 0; r < M; ++r)
+                    memcpy(dst + (size_t)r * t->rows,
+                           ypad + (size_t)r * t->rows,
+                           (size_t)t->rows * sizeof(float));
+        }
+        free(xpad); free(ypad);
+    }
     if (rc && c->verbose)
         fprintf(stderr, "dual_ds4f_prefill: CUDA GEMM failed for %dx%d M=%d\n",
                 t->rows, t->cols, M);
