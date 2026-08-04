@@ -10,7 +10,7 @@ struct cuda_ds4f_mxfp4 {
     CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64;
     CUstream stream; CUevent quant_done;
     CUdeviceptr w, x, q8, y, tmpfix, ids; size_t xb, q8b, yb, fixb, wb, idsb;
-    void *hx, *hy; size_t hxb, hyb;
+    void *hx, *hy, *hw; size_t hxb, hyb, hwb;
     int rows, cols, nsm; int verbose;
 };
 static ds4f_u3 fastdiv(unsigned long long d) {
@@ -64,6 +64,7 @@ void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (c->w) cuMemFree(c->w); if (c->x) cuMemFree(c->x); if (c->q8) cuMemFree(c->q8); if (c->y) cuMemFree(c->y); if (c->tmpfix) cuMemFree(c->tmpfix); if (c->ids) cuMemFree(c->ids);
     if (c->hx && cuMemFreeHost) cuMemFreeHost(c->hx);
     if (c->hy && cuMemFreeHost) cuMemFreeHost(c->hy);
+    if (c->hw && cuMemFreeHost) cuMemFreeHost(c->hw);
     if (c->quant_done) cuEventDestroy(c->quant_done); if (c->stream) cuStreamDestroy(c->stream); if (c->mod) cuModuleUnload(c->mod);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev); free(c);
 }
@@ -71,7 +72,14 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     if (!c || !w || !s || rows <= 0 || cols <= 0 || (cols & 127)) return -1;
     if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     size_t nb = (size_t)cols / 32, bytes = (size_t)rows * nb * 17, rb = (size_t)cols / 2;
-    uint8_t *p = (uint8_t *)malloc(bytes); if (!p) return -1;
+    if (!cuMemHostAlloc || !cuMemFreeHost) return -1;
+    if (c->hwb < bytes) {
+        if (c->hw) cuMemFreeHost(c->hw);
+        c->hw = NULL; c->hwb = 0;
+        if (cuMemHostAlloc(&c->hw, bytes, 0) != CUDA_SUCCESS) return -1;
+        c->hwb = bytes;
+    }
+    uint8_t *p = (uint8_t *)c->hw;
     for (int r = 0; r < rows; ++r) for (size_t b = 0; b < nb; ++b) {
         uint8_t *q = p + ((size_t)r * nb + b) * 17; uint8_t e = s[(size_t)r * nb + b];
         /* DS4F's on-disk LUT is 2x the native E2M1 LUT, so e-1 plus
@@ -88,7 +96,7 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     }
     if (c->w) cuMemFree(c->w); c->w = 0;
     int rc = cuMemAlloc(&c->w, bytes) == CUDA_SUCCESS && cuMemcpyHtoD(c->w, p, bytes) == CUDA_SUCCESS ? 0 : -1;
-    free(p); if (!rc) { c->wb = bytes; c->rows = rows; c->cols = cols; } return rc;
+    if (!rc) { c->wb = bytes; c->rows = rows; c->cols = cols; } return rc;
 }
 int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x, int M, int N, int K) {
     /* Native MMQ is used for prefill-sized batches; leave decode/tiny batches
