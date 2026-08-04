@@ -7,11 +7,24 @@
 #include <math.h>
 
 typedef struct { unsigned int x, y, z; } ds4f_u3;
+#define DS4F_CUDA_MXFP4_CACHE_SLOTS 32
+typedef struct {
+    const void *wkey, *skey;
+    CUdeviceptr d;
+    size_t bytes;
+    unsigned long long age;
+    int rows, cols, valid;
+} cuda_mxfp4_cache_entry;
 struct cuda_ds4f_mxfp4 {
     CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64, add;
     CUstream stream; CUevent quant_done;
     CUdeviceptr w, x, q8, y, y2, tmpfix, ids; size_t xb, q8b, yb, y2b, fixb, wb, idsb;
     void *hx, *hy, *hw, *hres; size_t hxb, hyb, hwb, hresb;
+    cuda_mxfp4_cache_entry cache[DS4F_CUDA_MXFP4_CACHE_SLOTS];
+    size_t cache_bytes, cache_limit;
+    unsigned long long cache_age;
+    unsigned long long cache_hits, cache_misses, cache_evictions;
+    int active_cache_slot;
     int rows, cols, nsm; int verbose; int terms;
 };
 static ds4f_u3 fastdiv(unsigned long long d) {
@@ -31,6 +44,8 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
     cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
     c->verbose = verbose;
+    c->cache_limit = (size_t)512 * 1024 * 1024;
+    c->active_cache_slot = -1;
     if (ck(cuDeviceGet(&c->dev, device_id), "device") ||
         ck(cuDevicePrimaryCtxRetain(&c->ctx, c->dev), "context") ||
         ck(cuCtxSetCurrent(c->ctx), "set context") ||
@@ -63,7 +78,14 @@ fail: cuda_ds4f_mxfp4_destroy(c); return NULL;
 }
 void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (!c) return; if (c->stream) cuStreamSynchronize(c->stream);
-    if (c->w) cuMemFree(c->w); if (c->x) cuMemFree(c->x); if (c->q8) cuMemFree(c->q8); if (c->y) cuMemFree(c->y); if (c->y2) cuMemFree(c->y2); if (c->tmpfix) cuMemFree(c->tmpfix); if (c->ids) cuMemFree(c->ids);
+    for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i)
+        if (c->cache[i].valid) cuMemFree(c->cache[i].d);
+    if (c->verbose && (c->cache_hits || c->cache_misses))
+        fprintf(stderr, "CUDA MXFP4 cache: hits=%llu misses=%llu evictions=%llu resident=%.1f MB\n",
+                c->cache_hits, c->cache_misses, c->cache_evictions,
+                (double)c->cache_bytes / (1024.0 * 1024.0));
+    if (c->active_cache_slot < 0 && c->w) cuMemFree(c->w);
+    if (c->x) cuMemFree(c->x); if (c->q8) cuMemFree(c->q8); if (c->y) cuMemFree(c->y); if (c->y2) cuMemFree(c->y2); if (c->tmpfix) cuMemFree(c->tmpfix); if (c->ids) cuMemFree(c->ids);
     if (c->hx && cuMemFreeHost) cuMemFreeHost(c->hx);
     if (c->hy && cuMemFreeHost) cuMemFreeHost(c->hy);
     if (c->hw && cuMemFreeHost) cuMemFreeHost(c->hw);
@@ -75,6 +97,19 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     if (!c || !w || !s || rows <= 0 || cols <= 0 || (cols & 127)) return -1;
     if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     size_t nb = (size_t)cols / 32, bytes = (size_t)rows * nb * 17, rb = (size_t)cols / 2;
+    if (c->active_cache_slot < 0 && c->w) { cuMemFree(c->w); c->w = 0; }
+    for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i) {
+        cuda_mxfp4_cache_entry *e = &c->cache[i];
+        if (e->valid && e->wkey == w && e->skey == s &&
+            e->rows == rows && e->cols == cols) {
+            c->cache_hits++;
+            e->age = ++c->cache_age;
+            c->active_cache_slot = i;
+            c->w = e->d; c->wb = e->bytes;
+            c->rows = rows; c->cols = cols;
+            return 0;
+        }
+    }
     if (!cuMemHostAlloc || !cuMemFreeHost) return -1;
     if (c->hwb < bytes) {
         if (c->hw) cuMemFreeHost(c->hw);
@@ -97,9 +132,36 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
             q[1 + j] = (uint8_t)(lo | (hi << 4));
         }
     }
-    if (c->w) cuMemFree(c->w); c->w = 0;
-    int rc = cuMemAlloc(&c->w, bytes) == CUDA_SUCCESS && cuMemcpyHtoD(c->w, p, bytes) == CUDA_SUCCESS ? 0 : -1;
-    if (!rc) { c->wb = bytes; c->rows = rows; c->cols = cols; } return rc;
+    c->active_cache_slot = -1;
+    int slot = -1;
+    if (bytes <= c->cache_limit) {
+        while (c->cache_bytes + bytes > c->cache_limit) {
+            int victim = -1;
+            for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i)
+                if (c->cache[i].valid && (victim < 0 || c->cache[i].age < c->cache[victim].age)) victim = i;
+            if (victim < 0) break;
+            cuMemFree(c->cache[victim].d);
+            c->cache_evictions++;
+            c->cache_bytes -= c->cache[victim].bytes;
+            c->cache[victim].valid = 0;
+        }
+        for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i)
+            if (!c->cache[i].valid) { slot = i; break; }
+    }
+    c->cache_misses++;
+    CUdeviceptr d = 0;
+    if (cuMemAlloc(&d, bytes) != CUDA_SUCCESS || cuMemcpyHtoD(d, p, bytes) != CUDA_SUCCESS) {
+        if (d) cuMemFree(d);
+        return -1;
+    }
+    if (slot >= 0) {
+        cuda_mxfp4_cache_entry *e = &c->cache[slot];
+        e->wkey = w; e->skey = s; e->d = d; e->bytes = bytes;
+        e->age = ++c->cache_age; e->rows = rows; e->cols = cols; e->valid = 1;
+        c->cache_bytes += bytes; c->active_cache_slot = slot;
+    }
+    c->w = d; c->wb = bytes; c->rows = rows; c->cols = cols;
+    return 0;
 }
 static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
                                      const float *x, int M, int N, int K,
