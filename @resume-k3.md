@@ -114,7 +114,16 @@ required or pjsub cannot open the script.)
 ## 2. Quantized path — current state
 
 Full detail and tables:
-`a64fx/k3/logs/quant-bench-live12-50000128/SUMMARY.md`.
+`a64fx/k3/logs/quant-bench-live12-50000128/SUMMARY.md` (note `logs/` is
+gitignored, so that file is not in the repo). **The roofline analysis is
+tracked at `a64fx/k3/ROOFLINE.md` — read it before doing more kernel work.**
+
+Its headline: bf16 matvec runs at 90% of the 726 GB/s node ceiling while every
+quantized kernel runs at 2-11%, MXFP4 (the original checkpoint's expert format,
+never optimized) beats our six-times-optimized IQ1_S by 2.6x per mac, and the
+first per-phase profile puts `moe_expert` — everything optimized this session —
+at 0.632 ms of a 4.918 ms layer, behind attention (2.137) and moe_shared
+(1.136).
 
 **The two downloaded GGUF packages are misnamed.** Neither
 `Kimi-K3-UD-IQ1_M-*` nor `Kimi-K3-UD-Q2_K_XL-*` contains a single IQ1_M or Q2_K
