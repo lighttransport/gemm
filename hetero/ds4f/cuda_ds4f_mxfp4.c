@@ -515,10 +515,10 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
             void *aa[] = { &B->y, &B->y2, &total };
             if (cuLaunchKernel(c->add, (total + 255) / 256, 1, 1, 256, 1, 1, 0, c->stream, aa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
         }
-        /* A kernel OOB on the shared stream with many queued tasks was observed
-         * (M~80+ x128 bucket mis-sizes its fixup scratch when launched back to
-         * back).  Draining per task is the safe path and costs little: the
-         * host residual work dominates either way. */
+        /* Drain per task: on a single FIFO stream the kernels serialize anyway,
+         * and an error here is caught at the offending task instead of the
+         * whole dispatch (which used to poison the context for everything
+         * queued behind it). */
         CUresult rr = cuStreamSynchronize(c->stream);
         if (rr != CUDA_SUCCESS) {
             if (dbg > 1) { const char *es = NULL; if (cuGetErrorString) cuGetErrorString(rr, &es); fprintf(stderr, "TASK %d M=%d N=%d K=%d sync %d %s\n", i, mm, N, K, rr, es ? es : "?"); }
