@@ -907,7 +907,18 @@ static void full_bf16_many(float *const *outs,
     }
 #if defined(_OPENMP)
     omp_set_num_threads(workers > 0 ? workers : 1);
-#pragma omp parallel for schedule(static)
+    /* Guided, not static.  The task list mixes projections whose column counts
+     * span 512..12288, so a static split hands some threads several times the
+     * work of others and the team waits on the slowest.  Measured on a layer's
+     * worth of bf16 projections (861 eight-row tasks, 47 threads):
+     * static 1.170 ms, static,1 0.830, dynamic 0.485, guided 0.453.
+     *
+     * This also explains away an apparent memory-bandwidth cliff: under static
+     * the same work ran faster on 30 threads than on 47, which looks like
+     * bandwidth contention and is really the imbalance changing shape with the
+     * chunk boundaries.  Under guided the thread count stops mattering.
+     * Each task writes its own output rows, so scheduling cannot change results. */
+#pragma omp parallel for schedule(guided)
 #endif
     for (int i = 0; i < n; ++i) {
         full_bf16_run_task(&tasks[i]);
