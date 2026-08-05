@@ -55,6 +55,11 @@ TIMING="$ROOT/stage_timing.tsv"
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores
+# Keep idle workers spinning between parallel regions.  perf on a KDA layer put
+# __kmp_fork_barrier at 37% of runtime with __sched_yield at 5%, i.e. threads
+# were sleeping and paying a wakeup per region.  Measured 2.146 -> 2.072
+# ms/layer, and it also removes most of the run-to-run variance.
+export OMP_WAIT_POLICY=active KMP_BLOCKTIME=infinite
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
 export K3_PYTHON="$K3/.venv-$(uname -m)/bin/python" K3_EXPERT_TP=1 K3_MOE_SHARD_LAYOUT="$MOE_SHARD_LAYOUT"
 

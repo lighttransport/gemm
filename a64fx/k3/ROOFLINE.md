@@ -221,3 +221,53 @@ scheduling cannot change results here.
 
 Extrapolated, 2.86 ms x 93 = 266 ms/token = 3.76 tok/s, against 2.19 before and
 the 96-node measured 1.699. Attention remains the largest phase at 47%.
+
+## Attention: KDA is the target, and the cost is OpenMP barriers
+
+Layer 3 is MLA, but only 24 of 93 layers are. Profiling both (12 nodes, 512
+samples, after the schedule fix):
+
+| layer type | count | layer ms | attention ms | attention per token |
+|---|---|---|---|---|
+| KDA | 69 | 2.319 | 0.883 | **60.9 ms** |
+| MLA | 24 | 2.799 | 1.331 | 31.9 ms |
+
+So **KDA attention is twice the target MLA is**, and a token is
+69x2.319 + 24x2.799 = 227 ms => 4.40 tok/s extrapolated.
+
+KDA's weight traffic is small: two `full_bf16_many` batches (5 projections of
+4224 rows x 7168, then f_b 1024x128 and b_proj 8x7168) plus o_proj 7168x1024 =
+~75 MB, about 130 us at the measured static rate. The phase costs 883 us.
+
+`perf record` on rank 0 of a 12-rank KDA run says where the rest goes:
+
+| symbol | share |
+|---|---|
+| `__kmp_fork_barrier` | **37.0%** |
+| `full_bf16_run_task` | 19.9% |
+| kernel (unresolved) | 8.9 + 5.6% |
+| `__sched_yield` | 5.2% |
+| `k3_mxfp4_group_batch` | 4.4% |
+| `__kmp_hyper_barrier_release` | 4.0% |
+
+**~46% of runtime is OpenMP team synchronization**, and `__sched_yield` says
+workers are sleeping between regions and paying a wakeup each time. Note this
+does *not* contradict the earlier "region entry is 10.6 us" measurement — that
+was a warm team looping back-to-back. In the runner the regions are separated by
+serial work, so threads sleep and the real cost is the wakeup.
+
+What the available knobs buy (KDA layer, 2 reps each):
+
+| threads | default | `OMP_WAIT_POLICY=active` + `KMP_BLOCKTIME=infinite` |
+|---|---|---|
+| 24 | 2.165 / 2.127 | **2.072 / 2.072** |
+| 48 | 2.116 / 2.507 | 2.052 / 2.346 |
+
+3-5%, and it removes most of the run-to-run variance; 48 threads is erratic
+either way. Added to the three launcher scripts.
+
+**The remaining ~35% needs fewer parallel regions per layer**, i.e. one
+persistent team per layer with the inner `parallel for` becoming `omp for`.
+That is now justified by data rather than by the assumption it was dismissed on,
+but it touches `k3_full_runner.c`, `k3_kernels.h`, `k3_moe.h` and
+`common/ggml_dequant.h` together and should be its own piece of work.
