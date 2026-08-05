@@ -753,6 +753,201 @@ static inline float k3_quant_iq2_xxs_q8_row(const block_iq2_xxs *w,
     return out * xd * 0.125f;
 }
 
+#if defined(__ARM_FEATURE_SVE)
+/* IQ1_S with sixteen output rows in lanes: the kernel ends in a plain vector
+ * store and performs no horizontal reduction at all.
+ *
+ * Storage stays compressed -- unpacking IQ1_S to int8 would be a 5x expansion
+ * and defeat the format -- so the row-major to lane-major transpose happens in
+ * registers, as a strided gather out of the 16x32 unpack tile.
+ *
+ * a64fx/llm/WS3_GEMM_findings.md rejected this shape for bf16: 2x in isolation,
+ * 0.60-1.0x at 48 threads, because that GEMM is memory-system-bound. IQ1_S is
+ * 1.56 bits/weight, so it is unpack-bound instead and the result inverts --
+ * measured 1.35x at 47 threads on 28672x3072 (ffn_down_exps), rel_l2 1.1e-07. */
+#define K3_IQ_ROWS 16
+static inline void k3_quant_iq1_s_q8_rows16(float *out, const uint8_t *base,
+                                            size_t row_bytes, const int8_t *x,
+                                            float xd, int nb) {
+    const svbool_t l16 = svwhilelt_b32(0, K3_IQ_ROWS);
+    svfloat32_t facc = svdup_f32(0.0f);
+    int8_t tile[K3_IQ_ROWS * 32];
+    float drow[K3_IQ_ROWS];
+    int srow[K3_IQ_ROWS], sdrow[K3_IQ_ROWS];
+
+    for (int b = 0; b < nb; ++b) {
+        svint32_t bacc = svdup_s32(0);
+        for (int r = 0; r < K3_IQ_ROWS; ++r)
+            drow[r] = ggml_fp16_to_fp32(
+                ((const block_iq1_s *)(base + (size_t)r * row_bytes))[b].d);
+
+        for (int ib = 0; ib < 8; ++ib) {
+            for (int r = 0; r < K3_IQ_ROWS; ++r) {
+                const block_iq1_s *wb =
+                    (const block_iq1_s *)(base + (size_t)r * row_bytes) + b;
+                const uint8_t *qs = wb->qs + 4 * ib;
+                uint16_t qh = wb->qh[ib];
+                for (int l = 0; l < 4; ++l) {
+                    int idx = qs[l] | (((qh >> (3 * l)) & 7) << 8);
+                    k3_quant_copy8(tile + r * 32 + 8 * l, k3_iq1_lut[idx]);
+                }
+                srow[r] = 2 * ((qh >> 12) & 7) + 1;
+                sdrow[r] = (qh & 0x8000) ? -srow[r] : srow[r];
+            }
+            /* svld1rq replicates 16 activation bytes to every 128-bit segment
+             * and svdot_lane selects the quad, so the activation never leaves
+             * the vector domain; a scalar load plus svdup would reintroduce the
+             * GPR crossing this kernel exists to avoid. */
+            svint32_t gacc = svdup_s32(0);
+            const int8_t *xg = x + 256 * b + 32 * ib;
+            for (int c = 0; c < 2; ++c) {
+                svint8_t xq = svld1rq_s8(svptrue_b8(), xg + 16 * c);
+                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 0, 32)));
+                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 4, 32)));
+                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 8, 32)));
+                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 12, 32)));
+                gacc = svdot_lane_s32(gacc, w0, xq, 0);
+                gacc = svdot_lane_s32(gacc, w1, xq, 1);
+                gacc = svdot_lane_s32(gacc, w2, xq, 2);
+                gacc = svdot_lane_s32(gacc, w3, xq, 3);
+            }
+            /* sum(x) over the group is shared by all sixteen rows; the delta
+             * term folds in as (8*acc + delta)/8 to keep the scales integral. */
+            int32_t xs = 0;
+            for (int j = 0; j < 32; ++j) xs += xg[j];
+            bacc = svmla_x(l16, bacc, svlsl_n_s32_x(l16, gacc, 3),
+                           svld1_s32(l16, srow));
+            bacc = svmla_x(l16, bacc, svdup_s32(xs), svld1_s32(l16, sdrow));
+        }
+        facc = svmla_x(l16, facc, svcvt_f32_s32_x(l16, bacc),
+                       svmul_n_f32_x(l16, svld1(l16, drow), 0.125f));
+    }
+    svst1(l16, out, svmul_n_f32_x(l16, facc, xd));
+}
+/* IQ2_XS, same shape.  Its two half-group scales cover k 0-15 and 16-31, i.e.
+ * quads 0-3 and 4-7, so the group needs two accumulators before the per-row
+ * scale vectors apply. */
+static inline void k3_quant_iq2_xs_q8_rows16(float *out, const uint8_t *base,
+                                             size_t row_bytes, const int8_t *x,
+                                             float xd, int nb) {
+    const svbool_t l16 = svwhilelt_b32(0, K3_IQ_ROWS);
+    svfloat32_t facc = svdup_f32(0.0f);
+    int8_t tile[K3_IQ_ROWS * 32];
+    float drow[K3_IQ_ROWS];
+    int s0row[K3_IQ_ROWS], s1row[K3_IQ_ROWS];
+
+    for (int b = 0; b < nb; ++b) {
+        svint32_t bacc = svdup_s32(0);
+        for (int r = 0; r < K3_IQ_ROWS; ++r)
+            drow[r] = ggml_fp16_to_fp32(
+                ((const block_iq2_xs *)(base + (size_t)r * row_bytes))[b].d);
+
+        for (int ib = 0; ib < 8; ++ib) {
+            for (int r = 0; r < K3_IQ_ROWS; ++r) {
+                const block_iq2_xs *wb =
+                    (const block_iq2_xs *)(base + (size_t)r * row_bytes) + b;
+                for (int l = 0; l < 4; ++l)
+                    k3_quant_copy8(tile + r * 32 + 8 * l,
+                                   k3_iq2_lut[wb->qs[4 * ib + l]]);
+                s0row[r] = 2 * (wb->scales[ib] & 15) + 1;
+                s1row[r] = 2 * (wb->scales[ib] >> 4) + 1;
+            }
+            svint32_t glo = svdup_s32(0), ghi = svdup_s32(0);
+            const int8_t *xg = x + 256 * b + 32 * ib;
+            for (int c = 0; c < 2; ++c) {
+                svint8_t xq = svld1rq_s8(svptrue_b8(), xg + 16 * c);
+                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 0, 32)));
+                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 4, 32)));
+                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 8, 32)));
+                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 12, 32)));
+                svint32_t *g = c ? &ghi : &glo;
+                *g = svdot_lane_s32(*g, w0, xq, 0);
+                *g = svdot_lane_s32(*g, w1, xq, 1);
+                *g = svdot_lane_s32(*g, w2, xq, 2);
+                *g = svdot_lane_s32(*g, w3, xq, 3);
+            }
+            bacc = svmla_x(l16, bacc, glo, svld1_s32(l16, s0row));
+            bacc = svmla_x(l16, bacc, ghi, svld1_s32(l16, s1row));
+        }
+        facc = svmla_x(l16, facc, svcvt_f32_s32_x(l16, bacc),
+                       svmul_n_f32_x(l16, svld1(l16, drow), 0.125f));
+    }
+    svst1(l16, out, svmul_n_f32_x(l16, facc, xd));
+}
+
+/* IQ2_XXS: one integer scale per group, (0.5+k)*0.25 rewritten as
+ * (1+2k)*0.125, plus the sign pattern applied to the unpack tile. */
+static inline void k3_quant_iq2_xxs_q8_rows16(float *out, const uint8_t *base,
+                                              size_t row_bytes, const int8_t *x,
+                                              float xd, int nb) {
+    const svbool_t l16 = svwhilelt_b32(0, K3_IQ_ROWS);
+    svfloat32_t facc = svdup_f32(0.0f);
+    int8_t tile[K3_IQ_ROWS * 32], sgt[K3_IQ_ROWS * 32];
+    float drow[K3_IQ_ROWS];
+    int srow[K3_IQ_ROWS];
+    uint32_t aux[2];
+
+    for (int b = 0; b < nb; ++b) {
+        svint32_t bacc = svdup_s32(0);
+        for (int r = 0; r < K3_IQ_ROWS; ++r)
+            drow[r] = ggml_fp16_to_fp32(
+                ((const block_iq2_xxs *)(base + (size_t)r * row_bytes))[b].d);
+
+        for (int ib = 0; ib < 8; ++ib) {
+            for (int r = 0; r < K3_IQ_ROWS; ++r) {
+                const block_iq2_xxs *wb =
+                    (const block_iq2_xxs *)(base + (size_t)r * row_bytes) + b;
+                memcpy(aux, wb->qs + 4 * ib, sizeof(aux));
+                int8_t *qr = tile + r * 32, *sr = sgt + r * 32;
+                for (int l = 0; l < 4; ++l) {
+                    k3_quant_copy8(qr + 8 * l,
+                                   iq2xxs_grid + ((const uint8_t *)aux)[l]);
+                    k3_quant_copy8(sr + 8 * l,
+                                   k3_iq_sign_lut[ksigns_iq2xs[(aux[1] >> (7 * l)) & 127]]);
+                }
+                srow[r] = 1 + 2 * (int)(aux[1] >> 28);
+            }
+            /* Sign the whole tile in full-width steps.  Doing it per row costs
+             * sixteen half-vector multiplies per group where the paired
+             * per-row kernel needed one full-width one per two groups, and that
+             * alone made a first version of this kernel slower than what it
+             * replaced. */
+            for (int o = 0; o < K3_IQ_ROWS * 32; o += 64)
+                k3_quant_apply_signs64(tile + o, sgt + o);
+            svint32_t gacc = svdup_s32(0);
+            const int8_t *xg = x + 256 * b + 32 * ib;
+            for (int c = 0; c < 2; ++c) {
+                svint8_t xq = svld1rq_s8(svptrue_b8(), xg + 16 * c);
+                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 0, 32)));
+                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 4, 32)));
+                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 8, 32)));
+                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
+                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 12, 32)));
+                gacc = svdot_lane_s32(gacc, w0, xq, 0);
+                gacc = svdot_lane_s32(gacc, w1, xq, 1);
+                gacc = svdot_lane_s32(gacc, w2, xq, 2);
+                gacc = svdot_lane_s32(gacc, w3, xq, 3);
+            }
+            bacc = svmla_x(l16, bacc, gacc, svld1_s32(l16, srow));
+        }
+        facc = svmla_x(l16, facc, svcvt_f32_s32_x(l16, bacc),
+                       svmul_n_f32_x(l16, svld1(l16, drow), 0.125f));
+    }
+    svst1(l16, out, svmul_n_f32_x(l16, facc, xd));
+}
+#endif
+
 static inline float k3_quant_iq1_s_q8_row(const block_iq1_s *w,
                                           const int8_t *x, float xd, int nb) {
     /* Both terms of the IQ1 group sum, S*<w,x> and S*delta*sum(x), carry an
@@ -1049,6 +1244,44 @@ static inline int k3_quant_matvec_ws(float *out, const k3_quant_matrix *m,
         }
         return 0;
     }
+#if defined(__ARM_FEATURE_SVE)
+    if (mode == K3_QUANT_SVE_Q8 && m->rows >= K3_IQ_ROWS &&
+        (m->type == K3_Q_IQ1_S || m->type == K3_Q_IQ2_XS ||
+         m->type == K3_Q_IQ2_XXS)) {
+        int blocks = m->rows / K3_IQ_ROWS, nb = m->cols / 256;
+#if defined(_OPENMP)
+        k3_quant_set_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+        for (int rb = 0; rb < blocks; ++rb) {
+            int r = rb * K3_IQ_ROWS;
+            const uint8_t *rp = m->data + (size_t)r * m->row_bytes;
+            if (m->type == K3_Q_IQ1_S)
+                k3_quant_iq1_s_q8_rows16(out + r, rp, m->row_bytes,
+                                         ws->q8, ws->scale, nb);
+            else if (m->type == K3_Q_IQ2_XS)
+                k3_quant_iq2_xs_q8_rows16(out + r, rp, m->row_bytes,
+                                          ws->q8, ws->scale, nb);
+            else
+                k3_quant_iq2_xxs_q8_rows16(out + r, rp, m->row_bytes,
+                                           ws->q8, ws->scale, nb);
+        }
+        /* Rows past the last full sixteen fall back to the per-row kernels. */
+        for (int r = blocks * K3_IQ_ROWS; r < m->rows; ++r) {
+            const uint8_t *rp = m->data + (size_t)r * m->row_bytes;
+            if (m->type == K3_Q_IQ1_S)
+                out[r] = k3_quant_iq1_s_q8_row((const block_iq1_s *)rp,
+                                               ws->q8, ws->scale, nb);
+            else if (m->type == K3_Q_IQ2_XS)
+                out[r] = k3_quant_iq2_xs_q8_row((const block_iq2_xs *)rp,
+                                                ws->q8, ws->scale, nb);
+            else
+                out[r] = k3_quant_iq2_xxs_q8_row((const block_iq2_xxs *)rp,
+                                                 ws->q8, ws->scale, nb);
+        }
+        return 0;
+    }
+#endif
     /* Note: a `threads <= 1` serial fast path to skip the one-thread parallel
      * region the full runner enters per eight-row task was tried both as an
      * `if` clause on the pragma and as a separate branch over a shared
