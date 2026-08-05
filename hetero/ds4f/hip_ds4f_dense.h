@@ -118,6 +118,14 @@ int hip_ds4f_dense_matvec_tensors_async(
     const float *const *x, int n);
 int hip_ds4f_dense_wait_tensors(void *ctx);
 
+/* Fused shared expert (w1/w3 -> SwiGLU -> w2) with the two [M, inter]
+ * intermediates kept on the device.  Returns nonzero when the tensors are not
+ * an FP8 kind this path handles, in which case use the unfused GEMMs. */
+int hip_ds4f_dense_shared_ffn(void *ctx, float *dst,
+                              const ds4f_tensor *w1, const ds4f_tensor *w3,
+                              const ds4f_tensor *w2, const float *x,
+                              int M, int inter, int C, float lim);
+
 /* One in-flight operation variant for CPU/GPU overlap. The input upload is
  * queued, the caller may do CPU work, and wait() synchronizes and downloads y. */
 int hip_ds4f_dense_matvec_loaded_async(hip_ds4f_dense *ctx, const float *x);

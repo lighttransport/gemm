@@ -103,6 +103,8 @@ real-hip-test: $(BUILD)/test_hip_ds4f_real
 
 # Reproducible staged NVIDIA+AMD prefill gate. Override STAGE_DIR, EP_SIZE,
 # EP_RANK, LAYERS, and PREFILL_BATCH for another shard or context size.
+# HIP_ORDERED_FP8_LAYERS defaults to LAYERS so the gate is argmax-exact
+# (0 mismatches); set it to 0 to run the faster non-ordered dense reduction.
 real-dual-test: $(BUILD)/test_hip_ds4f_real
 	@test -n "$(STAGE_DIR)" || { echo "usage: make -C hetero/ds4f real-dual-test STAGE_DIR=/tmp/ds4f_nocopy_ep8" >&2; exit 2; }
 	@test -f ../../cuda/llm/mmq_kernels.cubin || { echo "build cuda/llm/mmq_kernels.cubin first" >&2; exit 2; }
@@ -115,7 +117,9 @@ real-dual-test: $(BUILD)/test_hip_ds4f_real
 		--dual-gpu 1 --cuda-device $(or $(CUDA_DEVICE),0) \
 		--dual-cuda-terms $(or $(DUAL_CUDA_TERMS),1) \
 		--hip-device $(or $(HIP_DEVICE),0) --hip-verbose $(or $(HIP_VERBOSE),0) \
-		--hip-exact-prefill $(or $(HIP_EXACT_PREFILL),0)
+		--hip-exact-prefill $(or $(HIP_EXACT_PREFILL),0) \
+		--hip-ordered-fp8-layers $(or $(HIP_ORDERED_FP8_LAYERS),$(or $(LAYERS),43)) \
+		--hip-fused-shared-ffn $(or $(HIP_FUSED_SHARED_FFN),0)
 
 forward-hip-test: $(BUILD)/test_hip_ds4f_forward
 	$(BUILD)/test_hip_ds4f_forward

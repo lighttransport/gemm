@@ -448,4 +448,73 @@ static const char hip_ds4f_dense_kernels_src[] =
 "    }\n"
 "}\n";
 
+/* Fused shared-expert SwiGLU in its OWN HIPRTC module, always compiled precise
+ * (no -ffast-math).  clang's -ffast-math replaces the SiLU's / with an
+ * approximate reciprocal (even through __fdiv_rn / __frcp_rn / double div), so
+ * this kernel must not ride in the fast-compiled dense module.  Compiling it
+ * separately leaves the dense module's math mode (and thus its GEMM results)
+ * untouched, so the fused shared FFN is bit-exact in any dense configuration.
+ *
+ * The expf is a port of glibc 2.39's __expf (e_expf.c + __exp2f_data).
+ * Validated bit-identical to glibc expf() for every float in [-12,20] (the
+ * whole SiLU gate range, where expf(-gv) is evaluated).  rint() replaces
+ * glibc's (z + SHIFT) - SHIFT trick because -fassociative-math collapses that
+ * pair; rint rounds ties to even the same way, and explicit fma() keeps the
+ * degree-3 polynomial from being contracted or reassociated. */
+static const char hip_ds4f_swiglu_kernels_src[] =
+"typedef unsigned char u8;\n"
+"typedef unsigned short u16;\n"
+"typedef unsigned int u32;\n"
+"typedef unsigned long long u64;\n"
+"\n"
+"static const u64 exp2f_tab[32] = {\n"
+"0x3ff0000000000000ULL, 0x3fefd9b0d3158574ULL, 0x3fefb5586cf9890fULL, 0x3fef9301d0125b51ULL,\n"
+"0x3fef72b83c7d517bULL, 0x3fef54873168b9aaULL, 0x3fef387a6e756238ULL, 0x3fef1e9df51fdee1ULL,\n"
+"0x3fef06fe0a31b715ULL, 0x3feef1a7373aa9cbULL, 0x3feedea64c123422ULL, 0x3feece086061892dULL,\n"
+"0x3feebfdad5362a27ULL, 0x3feeb42b569d4f82ULL, 0x3feeab07dd485429ULL, 0x3feea47eb03a5585ULL,\n"
+"0x3feea09e667f3bcdULL, 0x3fee9f75e8ec5f74ULL, 0x3feea11473eb0187ULL, 0x3feea589994cce13ULL,\n"
+"0x3feeace5422aa0dbULL, 0x3feeb737b0cdc5e5ULL, 0x3feec49182a3f090ULL, 0x3feed503b23e255dULL,\n"
+"0x3feee89f995ad3adULL, 0x3feeff76f2fb5e47ULL, 0x3fef199bdd85529cULL, 0x3fef3720dcef9069ULL,\n"
+"0x3fef5818dcfba487ULL, 0x3fef7c97337b9b5fULL, 0x3fefa4afa2a490daULL, 0x3fefd0765b6e4540ULL,\n"
+"};\n"
+"__device__ __forceinline__ float ds4f_expf_bitexact(float x) {\n"
+"    u32 abstop = (__float_as_uint(x) >> 20) & 0x7ffu;\n"
+"    if (abstop >= 0x42bu) {\n"
+"        if (__float_as_uint(x) == 0xff800000u) return 0.0f;\n"
+"        if (abstop >= 0x7f8u) return x + x;\n"
+"        if (x > 0x1.62e42ep6f) return __uint_as_float(0x7f800000u);\n"
+"        if (x < -0x1.9fe368ep6f) return 0.0f;\n"
+"    }\n"
+"    double xd = (double)x;\n"
+"    double z = 0x1.71547652b82fep+5 * xd;\n"
+"    double kr = rint(z);\n"
+"    long long ki = (long long)kr;\n"
+"    double r = z - kr;\n"
+"    u64 t = exp2f_tab[(u64)ki % 32u];\n"
+"    t += (u64)ki << 47;\n"
+"    double s = __longlong_as_double((long long)t);\n"
+"    double z2 = fma(0x1.c6af84b912394p-20, r, 0x1.ebfce50fac4f3p-13);\n"
+"    double r2 = r * r;\n"
+"    double y  = fma(0x1.62e42ff0c52d6p-6, r, 1.0);\n"
+"    y = fma(z2, r2, y);\n"
+"    y = y * s;\n"
+"    return (float)y;\n"
+"}\n"
+"/* Fused shared-expert SwiGLU, device-side.  Mirrors ds4f_pf_swiglu_worker\n"
+" * exactly: g = silu(min(g, lim)) * clamp(u, -lim, lim), silu(x) = x/(1+e^-x).\n"
+" * Keeping it on the device lets w1/w3 -> swiglu -> w2 run without sending the\n"
+" * two [M, inter] intermediates back to the host and the product forward. */\n"
+"extern \"C\" __global__ void ds4f_swiglu_inplace(\n"
+"        float *g, const float *u, int n, float lim) {\n"
+"    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+"    if (i >= n) return;\n"
+"    float gv = g[i];\n"
+"    gv = gv > lim ? lim : gv;\n"
+"    float uv = u[i];\n"
+"    uv = uv < -lim ? -lim : (uv > lim ? lim : uv);\n"
+"    float e = ds4f_expf_bitexact(-gv);\n"
+"    float d = 1.0f + e;\n"
+"    g[i] = (gv / d) * uv;\n"
+"}\n";
+
 #endif /* HIP_DS4F_KERNELS_H */

@@ -431,6 +431,13 @@ typedef int (*ds4f_gpu_dense_async_multi_fn)(
     void *ctx, float *const *dst, const ds4f_tensor *const *t,
     const float *const *x, int n);
 typedef int (*ds4f_gpu_dense_wait_fn)(void *ctx);
+/* Fused shared expert: w1/w3 -> SwiGLU -> w2 with both [M, inter]
+ * intermediates kept on the device, so only x goes up and only [M, hidden]
+ * comes back.  Nonzero means the backend declined and the caller should run
+ * the unfused GEMM/SwiGLU/GEMM sequence. */
+typedef int (*ds4f_gpu_shared_ffn_fn)(
+    void *ctx, float *dst, const ds4f_tensor *w1, const ds4f_tensor *w3,
+    const ds4f_tensor *w2, const float *x, int M, int inter, int C, float lim);
 typedef int (*ds4f_gpu_dense_blockdiag_fn)(
     void *ctx, float *dst, const ds4f_tensor *t, const float *xbase,
     int gin, int glora, int goff);
@@ -499,6 +506,7 @@ typedef struct {
     ds4f_gpu_dense_matvec_fn gpu_dense_matvec;
     ds4f_gpu_dense_async_multi_fn gpu_dense_async_multi;
     ds4f_gpu_dense_wait_fn gpu_dense_wait;
+    ds4f_gpu_shared_ffn_fn gpu_shared_ffn;
     ds4f_gpu_dense_blockdiag_fn gpu_dense_blockdiag;
     ds4f_gpu_dense_gemm_fn gpu_dense_gemm;
     ds4f_gpu_dense_gemm_multi_fn gpu_dense_gemm_multi;

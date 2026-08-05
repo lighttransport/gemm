@@ -82,6 +82,7 @@ struct hip_ds4f_dense {
     int device_id;
     int verbose;
     hipModule_t module;
+    hipModule_t swiglu_module;
     hipFunction_t matvec;
     hipFunction_t bf16_matvec;
     hipFunction_t f16_matvec;
@@ -93,6 +94,9 @@ struct hip_ds4f_dense {
     hipFunction_t gemm_fp8_rowscale;
     hipFunction_t gemm_bf16;
     hipFunction_t gemm_f16;
+    hipFunction_t swiglu;
+    void *ffn_dx, *ffn_dg, *ffn_du, *ffn_dy;
+    size_t ffn_dx_b, ffn_dg_b, ffn_du_b, ffn_dy_b;
     hipFunction_t prefill_attn;
 
     hip_ds4f_matrix *matrices;
@@ -333,6 +337,23 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
         ds4f_mem_pool_destroy(ctx->mem);
         return NULL;
     }
+    /* The fused shared-FFN SwiGLU lives in its own module, ALWAYS compiled
+     * precise: clang's -ffast-math approximates the SiLU's division (even
+     * through __fdiv_rn / __frcp_rn / double div), so it cannot ride in the
+     * fast-compiled dense module without changing its bit-exactness.  A
+     * separate compile keeps the dense module's math mode -- and therefore
+     * its GEMM results -- exactly as configured. */
+    if (hip_compile_kernels_ex(&ctx->swiglu_module, device_id,
+                               hip_ds4f_swiglu_kernels_src,
+                               "hip_ds4f_swiglu.hip", verbose,
+                               "hip_ds4f_swiglu", 1) < 0 ||
+        hipModuleGetFunction(&ctx->swiglu, ctx->swiglu_module,
+                             "ds4f_swiglu_inplace") != hipSuccess) {
+        fprintf(stderr, "hip_ds4f_dense: failed to build precise swiglu module\n");
+        if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
+        ds4f_mem_pool_destroy(ctx->mem);
+        return NULL;
+    }
     {
         uint32_t lut[256];
         ds4f_init_fp8_e4m3fn_lut(lut);
@@ -460,6 +481,7 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->done && hipEventDestroy) hipEventDestroy(ctx->done);
     if (ctx->stream && hipStreamDestroy) hipStreamDestroy(ctx->stream);
     if (ctx->module && hipModuleUnload) hipModuleUnload(ctx->module);
+    if (ctx->swiglu_module && hipModuleUnload) hipModuleUnload(ctx->swiglu_module);
     ds4f_mem_pool_destroy(ctx->mem);
 }
 
@@ -1443,6 +1465,97 @@ static int ensure_gemm_host_pack(hip_ds4f_dense *ctx, size_t x_bytes, size_t y_b
         if (!p) return -1;
         ctx->gemm_y_pack = (float *)p; ctx->gemm_y_pack_bytes = y_bytes;
     }
+    return 0;
+}
+
+/* Launch one batched GEMM with caller-supplied device pointers.  Same kernels
+ * and same launch geometry as hip_ds4f_dense_gemm_tensor(); it just does not
+ * own the staging or the transfers, so chained projections can stay resident. */
+static int launch_gemm_dev(hip_ds4f_dense *ctx, const hip_ds4f_matrix *mat,
+                           int row0, void *dY, void *dX, int N, int K, int M) {
+    unsigned int gx = (unsigned int)((N + 63) / 64);
+    unsigned int gy = (unsigned int)((M + 15) / 16);
+    int n_out = N, n_in = K, n_tok = M, scale_cols = mat->scale_cols;
+    void *lut = ctx->fp8_lut;
+    hipFunction_t fn;
+    size_t soff;
+    if (matrix_is_fp8_rowscale(mat->kind)) { fn = ctx->gemm_fp8_rowscale; soff = (size_t)row0 * (size_t)mat->scale_cols; }
+    else if (matrix_is_fp8_ordered(mat->kind)) { fn = ctx->gemm_fp8_ordered; soff = (size_t)(row0 / 128) * (size_t)mat->scale_cols; }
+    else if (matrix_is_fp8(mat->kind)) { fn = ctx->gemm_fp8; soff = (size_t)(row0 / 128) * (size_t)mat->scale_cols; }
+    else return -1;   /* promoted BF16/FP16 and MXFP4 keep the unfused path */
+    void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
+    void *ds = (uint8_t *)mat->ds + soff;
+    void *args[] = { &dY, &dw, &ds, &dX, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+    return hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
+                                 ctx->stream, args, NULL) == hipSuccess ? 0 : -1;
+}
+
+static int ensure_dev_buf(void **buf, size_t *cap, size_t bytes) {
+    if (*buf && *cap >= bytes) return 0;
+    void *p = NULL;
+    if (hipMalloc(&p, bytes) != hipSuccess) return -1;
+    if (*buf) hipFree(*buf);
+    *buf = p; *cap = bytes;
+    return 0;
+}
+
+/* Fused shared expert: w1/w3 -> SwiGLU -> w2, entirely on the device.
+ *
+ * The unfused form uploads x twice, downloads two [M, inter] intermediates,
+ * uploads their SwiGLU product back, then downloads [M, C].  Here x goes up
+ * once and only [M, C] comes back.  Arithmetic is unchanged: the same GEMM
+ * kernels run on the same shapes and ds4f_swiglu_inplace mirrors
+ * ds4f_pf_swiglu_worker term for term. */
+int hip_ds4f_dense_shared_ffn(void *opaque, float *dst,
+                              const ds4f_tensor *w1, const ds4f_tensor *w3,
+                              const ds4f_tensor *w2, const float *x,
+                              int M, int inter, int C, float lim) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    const hip_ds4f_matrix *m1 = NULL, *m3 = NULL, *m2 = NULL;
+    if (!ctx || !dst || !x || !w1 || !w3 || !w2 || M < 1 ||
+        ctx->pending || ctx->multi_pending ||
+        w1->gpu_id < 0 || w3->gpu_id < 0 || w2->gpu_id < 0 ||
+        matrix_get(ctx, w1->gpu_id, &m1) != 0 ||
+        matrix_get(ctx, w3->gpu_id, &m3) != 0 ||
+        matrix_get(ctx, w2->gpu_id, &m2) != 0 ||
+        w1->rows != inter || w3->rows != inter || w2->cols != inter ||
+        w1->cols != C || w3->cols != C || w2->rows != C)
+        return -1;
+    size_t xb = (size_t)M * C * sizeof(float);
+    size_t ib = (size_t)M * inter * sizeof(float);
+    size_t yb = (size_t)M * C * sizeof(float);
+    if (hipSetDevice(ctx->device_id) != hipSuccess ||
+        ensure_dev_buf(&ctx->ffn_dx, &ctx->ffn_dx_b, xb) != 0 ||
+        ensure_dev_buf(&ctx->ffn_dg, &ctx->ffn_dg_b, ib) != 0 ||
+        ensure_dev_buf(&ctx->ffn_du, &ctx->ffn_du_b, ib) != 0 ||
+        ensure_dev_buf(&ctx->ffn_dy, &ctx->ffn_dy_b, yb) != 0)
+        return -1;
+    if (ensure_gemm_host_pack(ctx, xb, yb) == 0) {
+        memcpy(ctx->gemm_x_pack, x, xb);
+        x = ctx->gemm_x_pack;
+    }
+    if (hipMemcpyAsync(ctx->ffn_dx, x, xb, hipMemcpyHostToDevice,
+                       ctx->stream) != hipSuccess)
+        return -1;
+    if (launch_gemm_dev(ctx, m1, 0, ctx->ffn_dg, ctx->ffn_dx, inter, C, M) != 0 ||
+        launch_gemm_dev(ctx, m3, 0, ctx->ffn_du, ctx->ffn_dx, inter, C, M) != 0)
+        return -1;
+    { int n = M * inter;
+      unsigned int grid = (unsigned int)((n + 255) / 256);
+      void *dg = ctx->ffn_dg, *du = ctx->ffn_du;
+      void *args[] = { &dg, &du, &n, &lim };
+      if (hipModuleLaunchKernel(ctx->swiglu, grid, 1, 1, 256, 1, 1, 0,
+                                ctx->stream, args, NULL) != hipSuccess)
+          return -1; }
+    if (launch_gemm_dev(ctx, m2, 0, ctx->ffn_dy, ctx->ffn_dg, C, inter, M) != 0)
+        return -1;
+    float *out = dst;
+    if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= yb) out = ctx->gemm_y_pack;
+    if (hipMemcpyAsync(out, ctx->ffn_dy, yb, hipMemcpyDeviceToHost,
+                       ctx->stream) != hipSuccess ||
+        hipStreamSynchronize(ctx->stream) != hipSuccess)
+        return -1;
+    if (out != dst) memcpy(dst, out, yb);
     return 0;
 }
 

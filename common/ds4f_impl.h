@@ -6379,12 +6379,23 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
          * [M, shared_inter] buffer (Ystride=shared_inter); full sh_w2 over the zero-pad -> per-node
          * PARTIAL p_moe, folded into the routed [M,C] reduce below (one reduce, like the decode path). */
         if (tps) { memset(m->p_shg, 0, (size_t)M*c->shared_inter*4); memset(m->p_shu, 0, (size_t)M*c->shared_inter*4); }
+        /* Fused device-resident form: the two [M, shared_inter] intermediates
+         * never cross host memory.  Only the untiled (non-TP) case qualifies;
+         * the backend declines any tensor kind it does not handle. */
+        int shared_fused = 0;
+        if (!tps && !tps2 && m->gpu_shared_ffn && !m->gpu_exact_prefill &&
+            ly->sh_w1.gpu_id >= 0 && ly->sh_w3.gpu_id >= 0 && ly->sh_w2.gpu_id >= 0)
+            shared_fused = m->gpu_shared_ffn(
+                m->gpu_dense_ctx, m->p_moe, &ly->sh_w1, &ly->sh_w3, &ly->sh_w2,
+                m->p_h2, M, c->shared_inter, C, c->swiglu_limit) == 0;
+        if (!shared_fused) {
         ds4f_gemm_pair(m, m->p_shg + m->sh_r0, &ly->sh_w1,
                        m->p_shu + m->sh_r0, &ly->sh_w3,
                        m->p_h2, M, c->shared_inter, c->shared_inter, C);
         { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, M,
                                     c->shared_inter, c->shared_inter, c->swiglu_limit };
           ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
+        }
         /* Shared down and router are independent after the shared SwiGLU.
          * Keep both GEMMs under one dispatch; the multi-GEMM worker supports
          * their mixed FP8/BF16 tensor types. */
@@ -6395,7 +6406,10 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
             m->p_shg, M, C, c->shared_inter };   /* partial if tps */
         shared_router[1] = (ds4f_gemm_task){ m, m->p_router, &ly->gate,
             m->p_h2, M, c->n_experts, C };
-        ds4f_gemm_multi(m, shared_router, 2);
+        if (shared_fused)   /* sh_w2 already done on the device */
+            ds4f_gemm(m, m->p_router, &ly->gate, m->p_h2, M, c->n_experts, C);
+        else
+            ds4f_gemm_multi(m, shared_router, 2);
         if (tps2) for (int mm = 0; mm < M; mm++) {
             float *mo = m->p_moe + (size_t)mm*C;
             memset(mo, 0, (size_t)C * sizeof(float));

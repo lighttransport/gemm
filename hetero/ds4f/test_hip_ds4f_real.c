@@ -31,11 +31,14 @@ static void usage(const char *prog) {
                     "--hip-mxfp4-resident-layers n "
                     "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
                     "--hip-mxfp4-stream-raw 0|1 "
-                    "--hip-prefill-attn 0|1 "
+                    "--hip-prefill-attn 0|1 --hip-fused-shared-ffn 0|1 "
                     "[--dual-gpu 0|1 --cuda-device n --dual-cuda-mxfp4 0|1 --dual-cuda-terms 1|2] "
                     "[--hip-mxfp4-gemm-test] [--hip-mxfp4-widened-gemm-test] "
                     "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
 }
+
+/* Set by --hip-fused-shared-ffn; see attach sites. */
+static int ds4f_fused_shared_ffn_on = 0;
 
 static int hip_async_enabled(const ds4f_runtime_options *opt) {
     return opt->hip_async != 0;
@@ -193,6 +196,7 @@ static void detach_gpu_hooks(ds4f_model *m) {
     m->gpu_dense_blockdiag = NULL;
     m->gpu_dense_gemm = NULL;
     m->gpu_dense_gemm_multi = NULL;
+    m->gpu_shared_ffn = NULL;
     m->gpu_dense_layer_begin = NULL;
     m->gpu_dense_layer_prefetch = NULL;
     m->gpu_dense_stream_prefill_only = 0;
@@ -387,6 +391,11 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    /* The fused chain keeps the two [M, shared_inter] intermediates resident
+     * on the device.  Its SiLU uses a bit-exact port of glibc's expf and runs
+     * in its own always-precise HIPRTC module, so it never changes the dense
+     * GEMM results or the argmax.  Opt-in; see --hip-fused-shared-ffn. */
+    m->gpu_shared_ffn = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn : NULL;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
     /* Mixed dispatch is not a precision mode.  Without it a group holding
      * one CPU-only member (the router gate beside shared w2) sends every
@@ -671,6 +680,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--warm") == 0 && i + 1 < argc) warm = atoi(argv[++i]);
         else if (strcmp(a, "--decode-verify") == 0 && i + 1 < argc) decode_verify_steps = atoi(argv[++i]);
         else if (strcmp(a, "--gemm-bench") == 0 && i + 1 < argc) gemm_bench_m = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-fused-shared-ffn") == 0 && i + 1 < argc) ds4f_fused_shared_ffn_on = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-batch") == 0 && i + 1 < argc) prefill_batch = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-context") == 0 && i + 1 < argc) prefill_context = atoi(argv[++i]);
         else if (strcmp(a, "--hip-device") == 0 && i + 1 < argc) opt.hip_device = atoi(argv[++i]);

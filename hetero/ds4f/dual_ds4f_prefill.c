@@ -224,6 +224,15 @@ static int dual_prefill_attn(void *opaque, float *dst, const float *q,
                                             kv_slots, window, scale);
 }
 
+static int dual_shared_ffn(void *opaque, float *dst,
+                           const ds4f_tensor *w1, const ds4f_tensor *w3,
+                           const ds4f_tensor *w2, const float *x,
+                           int M, int inter, int C, float lim) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return hip_ds4f_dense_shared_ffn(c->hip, dst, w1, w3, w2, x,
+                                     M, inter, C, lim);
+}
+
 void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
     if (!m) return;
     m->gpu_dense_ctx = c;
@@ -234,6 +243,7 @@ void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
     m->gpu_dense_wait = c ? dual_wait : NULL;
     m->gpu_dense_blockdiag = c ? dual_blockdiag : NULL;
     m->gpu_prefill_attn = (c && m->gpu_prefill_attn) ? dual_prefill_attn : NULL;
+    m->gpu_shared_ffn = c ? dual_shared_ffn : NULL;
     m->gpu_dense_mixed = c ? 1 : 0;
 }
 
