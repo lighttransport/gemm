@@ -644,6 +644,41 @@ server: the CPU-exact head layers 0-20 still dominate once the CUDA tail is
 fast, and their routed-expert GEMM degrades at large batch -- the next lever
 is covering more layers (or streaming the weights) as the cache allows.
 
+**Weight streaming beats the CPU head layers.** `--dual-cuda-resident-from 0`
+routes every layer's experts to the SM120 and lets the 10 GB cache stream
+(the LRU keeps the working set; the ~4 ms cold load per tensor amortizes once
+the batch is large enough). All tok/s below are approximate (~1/64):
+
+| batch | CUDA-stream | exact |
+|---:|---:|---:|
+| 256 | 27.8 | 40.7 |
+| 512 | 31.8 | 35.6 |
+| 1024 | 36.1 | 24.1 |
+| 2048 | 36.6 | 23.8 |
+| 4096 | 32.4 | 13.7 |
+
+**The ROCm raw-expert path is the real win (2026-08-06).** The RX 9070 XT's
+existing `--hip-mxfp4-resident-layers N --hip-mxfp4-stream-raw 1` uploads the
+first N layers' raw MXFP4 experts resident (dense bank 6.7 GB + ~0.43 GB/layer;
+14 layers leaves headroom for the M=4096 prefill buffers on 16 GB) and streams
+the rest one layer at a time. The HIP MXFP4 kernels are exact for the weights
+and far faster than the CPU routed-expert GEMM:
+
+| batch | ROCm-expert | exact | delta |
+|---:|---:|---:|---:|
+| 256 | 47.2 | 40.7 | +16% |
+| 512 | 46.3 | 35.6 | +30% |
+| 1024 | 51.7 | 24.1 | +115% |
+| 2048 | 53.6 | 23.8 | +125% |
+| 4096 | 42.2 | 13.7 | +208% |
+
+~1/64 argmax mismatch vs the CPU reference (the raw FP4 kernel's rounding),
+batch 64 only ~17 tok/s because the 43-layer streaming cold-load does not
+amortize. The widened FP8 variant (default `--hip-mxfp4-stream-raw 0`) is
+2x the VRAM per layer, so it fits fewer resident layers and is far slower.
+The NVIDIA card is idle under this config; a dual split (ROCm head experts +
+CUDA tail experts) is the remaining integration.
+
 
 The historical measurements below predate these fixes.
 
