@@ -750,6 +750,35 @@ not a kernel fix.
 
 ## Long-context stability and speculative-decode probe
 
+### Prefill tuning for 2k--4k context chunks (2026-08-05)
+
+For a 2k--4k token chunk at a long position, the per-token cost breaks down as
+(43 layers, batch 64, threads=16, dual + ordered + fused, all 0/64):
+
+| phase | ms/token | where |
+|---|---:|---|
+| routed experts | ~10 | CPU (raw-MXFP4 AVX2, bandwidth-bound) |
+| o_proj | ~5.6 | GPU |
+| attention | ~4 | CPU (full 128-token window) |
+| qkv_proj | ~3.8 | GPU |
+| shared FFN | ~1.8 | GPU (fused) |
+| head | ~1.0 | GPU |
+
+Two knobs matter. **(1) Threads = physical cores** (16 here), not `nproc`/48:
+the spin-wait pool oversubscription dropped the prefill to ~17 tok/s. **(2)
+Batch 128--256 for a long chunk**: the routed expert buckets grow, so the
+M>=4 token-block amortizes each expert weight's decode (batch 64 leaves
+~1--2 tokens/expert, bucket M=1--2, per-token decode). Measured at 4k
+context: batch 64 = 39, batch 128 = 40, batch 256 = 41 tok/s, all 0/64. At
+batch 64 context 0 the same phases give ~42 tok/s (no warm tail).
+
+The dense phases (qkv/o_proj/shared/head) are at the measured kernel
+throughput (wq_b ~1370 GFLOP/s); the routed experts are the CPU wall and do
+not offload to either GPU here (the SM120 path quantizes activations and pays
+the 16.5 GB owned-weight PCIe upload; the RDNA4 resident path streams the same
+bank). The attention is full-window at long context and is the second CPU
+term.
+
 The real HIP harness now accepts `DS4F_MAXPOS` and can warm a synthetic KV
 prefix before measuring a later position. This reaches a 4k context directly:
 
