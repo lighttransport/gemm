@@ -397,6 +397,64 @@ static inline void k3_attention_sve(float *out, const float *q, const float *key
     }
 }
 
+static inline float k3_dot_f32_i8_sve(const float *a, const int8_t *b, int n) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t sum = svdup_f32(0.0f);
+    for (int i = 0; i < n; i += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32(i, n);
+        svint32_t bi = svld1sb_s32(pg, b + i);
+        sum = svmla_f32_m(pg, sum, svld1(pg, a + i), svcvt_f32_s32_x(pg, bi));
+    }
+    return svaddv_f32(svptrue_b32(), sum);
+#else
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) sum += a[i] * (float)b[i];
+    return sum;
+#endif
+}
+
+/* Symmetric per-token INT8 MLA attention.  Scales are stored separately for
+ * each key/value token vector; softmax and accumulation remain FP32. */
+static inline void k3_attention_i8_sve(float *out, const float *q,
+        const int8_t *keys, const float *key_scales, const int8_t *values,
+        const float *value_scales, int tokens, int qk_dim, int v_dim) {
+    for (int j = 0; j < v_dim; ++j) out[j] = 0.0f;
+    float m = -INFINITY, l = 0.0f, scale = 1.0f / sqrtf((float)qk_dim);
+    for (int t = 0; t < tokens; ++t) {
+        const int8_t *kt = keys + (size_t)t * qk_dim;
+        float score = k3_dot_f32_i8_sve(q, kt, qk_dim) * key_scales[t] * scale;
+        float nm, old, add;
+        if (score <= m) { nm = m; old = 1.0f; add = expf(score - m); }
+        else { nm = score; old = expf(m - score); add = 1.0f; }
+        const int8_t *vt = values + (size_t)t * v_dim;
+        float vs = value_scales[t];
+#if defined(__ARM_FEATURE_SVE)
+        int vl = (int)svcntw();
+        for (int j = 0; j < v_dim; j += vl) {
+            svbool_t pg = svwhilelt_b32(j, v_dim);
+            svint32_t iz = svld1sb_s32(pg, vt + j);
+            svfloat32_t z = svmul_n_f32_x(pg, svld1(pg, out + j), old);
+            z = svmla_n_f32_x(pg, z, svcvt_f32_s32_x(pg, iz), add * vs);
+            svst1(pg, out + j, z);
+        }
+#else
+        for (int j = 0; j < v_dim; ++j) out[j] = out[j] * old + (float)vt[j] * vs * add;
+#endif
+        l = l * old + add; m = nm;
+    }
+    if (l != 0.0f) {
+#if defined(__ARM_FEATURE_SVE)
+        int vl = (int)svcntw();
+        for (int j = 0; j < v_dim; j += vl) {
+            svbool_t pg = svwhilelt_b32(j, v_dim);
+            svst1(pg, out + j, svdiv_n_f32_x(pg, svld1(pg, out + j), l));
+        }
+#else
+        for (int j = 0; j < v_dim; ++j) out[j] /= l;
+#endif
+    }
+}
+
 static inline uint16_t k3_f32_to_bf16_rne(float f){
     uint32_t x;memcpy(&x,&f,sizeof x);x+=UINT32_C(0x7fff)+((x>>16)&1);return(uint16_t)(x>>16);
 }

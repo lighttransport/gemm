@@ -200,6 +200,24 @@ int main(void) {
     pt0=now_sec();for(int it=0;it<PI;++it)k3_kda_step_decay_parallel_sve(po1,pq,pk,pv,pd,pb,ps1,PH,BK,BV,48);double newdt=now_sec()-pt0;
     fail|=check("kda-par-8h",po0,po1,(size_t)PH*BV,3e-5f);fail|=check("kda-par-8s",ps0,ps1,psn,3e-5f);
     printf("CALIBRATION kda8_old_us=%.3f kda8_parallel_us=%.3f speedup=%.3f\n",olddt/PI*1e6,newdt/PI*1e6,olddt/newdt);
+
+    enum { IT = 17, IQ = 192, IV = 128 };
+    float *iq = malloc(IQ * 4), *ik = malloc((size_t)IT * IQ * 4), *iv = malloc((size_t)IT * IV * 4);
+    int8_t *i8k = malloc((size_t)IT * IQ), *i8v = malloc((size_t)IT * IV);
+    float *iks = malloc(IT * 4), *ivs = malloc(IT * 4), *ior = malloc(IV * 4), *io8 = malloc(IV * 4);
+    fill(iq, IQ, .7f); fill(ik, (size_t)IT * IQ, 1.1f); fill(iv, (size_t)IT * IV, .9f);
+    for (int t = 0; t < IT; ++t) {
+        float ka = 0.0f, va = 0.0f;
+        for (int d = 0; d < IQ; ++d) ka = fmaxf(ka, fabsf(ik[(size_t)t * IQ + d]));
+        for (int d = 0; d < IV; ++d) va = fmaxf(va, fabsf(iv[(size_t)t * IV + d]));
+        iks[t] = ka / 127.0f; ivs[t] = va / 127.0f;
+        for (int d = 0; d < IQ; ++d) i8k[(size_t)t * IQ + d] = (int8_t)lrintf(ik[(size_t)t * IQ + d] / iks[t]);
+        for (int d = 0; d < IV; ++d) i8v[(size_t)t * IV + d] = (int8_t)lrintf(iv[(size_t)t * IV + d] / ivs[t]);
+    }
+    k3_attention_sve(ior, iq, ik, iv, IT, IQ, IV);
+    k3_attention_i8_sve(io8, iq, i8k, iks, i8v, ivs, IT, IQ, IV);
+    fail |= check("mla-int8", ior, io8, IV, 3e-2f);
+    free(iq);free(ik);free(iv);free(i8k);free(i8v);free(iks);free(ivs);free(ior);free(io8);
 #if defined(__ARM_FEATURE_SVE)
     printf("CALIBRATION sve_bits=%d\n",(int)svcntb()*8);
 #else

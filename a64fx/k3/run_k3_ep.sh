@@ -28,6 +28,7 @@ REUSE_STAGE=0
 STAGE_ONLY=0
 NO_FUSED_TEAM=0
 MLA_CACHE_BF16=1
+MLA_CACHE_INT8=0
 HEARTBEAT_TOKENS=1024
 MIN_AVAILABLE_MIB=2048
 AR_GROUPS=auto
@@ -45,7 +46,7 @@ usage: $0 [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
           [--cache-load PATH] [--cache-save PATH]
           [--profile] [--reuse-stage] [--stage-only] [--no-fused-team]
-          [--mla-cache-bf16|--mla-cache-fp32]
+          [--mla-cache-bf16|--mla-cache-fp32|--mla-cache-int8]
           [--heartbeat-tokens N]
           [--min-available-mib N] (coordinated runtime guard, default 2048)
           [--ar-groups auto|N] (auto uses six-rank rows; 0=flat)
@@ -82,6 +83,7 @@ while (( $# )); do
         --no-fused-team) NO_FUSED_TEAM=1; shift;;
         --mla-cache-bf16) MLA_CACHE_BF16=1; shift;;
         --mla-cache-fp32) MLA_CACHE_BF16=0; shift;;
+        --mla-cache-int8) MLA_CACHE_INT8=1; shift;;
         --heartbeat-tokens) need_value "$@"; HEARTBEAT_TOKENS=$2; shift 2;;
         --min-available-mib) need_value "$@"; MIN_AVAILABLE_MIB=$2; shift 2;;
         --ar-groups) need_value "$@"; AR_GROUPS=$2; shift 2;;
@@ -257,7 +259,9 @@ set +e
 RUNNER_EXTRA=()
 (( PROFILE )) && RUNNER_EXTRA+=(--profile)
 (( NO_FUSED_TEAM )) && RUNNER_EXTRA+=(--no-fused-team)
-if (( MLA_CACHE_BF16 )); then
+if (( MLA_CACHE_INT8 )); then
+    RUNNER_EXTRA+=(--mla-cache-int8)
+elif (( MLA_CACHE_BF16 )); then
     RUNNER_EXTRA+=(--mla-cache-bf16)
 else
     RUNNER_EXTRA+=(--mla-cache-fp32)

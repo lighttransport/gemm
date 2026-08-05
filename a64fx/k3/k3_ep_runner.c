@@ -78,6 +78,7 @@ typedef struct {
     int fused_threads;
     int fuse_kda_expert;
     int mla_cache_bf16;
+    int mla_cache_int8;
     int heartbeat_tokens;
     int min_available_mib;
     int ar_groups;
@@ -125,7 +126,7 @@ static void usage(const char *p){
         "          [--status-dir DIR] [--cache-load PATH] [--cache-save PATH]\n"
         "          [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
-        "          [--mla-cache-bf16|--mla-cache-fp32] [--heartbeat-tokens N]\n"
+        "          [--mla-cache-bf16|--mla-cache-fp32|--mla-cache-int8] [--heartbeat-tokens N]\n"
         "          [--min-available-mib N]\n"
         "          [--ar-groups auto|N] [--comm-robust 1|2] [--comm-ack 0|1]\n"
         "          [--comm-deterministic 0|1]\n"
@@ -161,6 +162,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--no-fused-team")){o->fuse_kda_expert=0;}
         else if(!strcmp(a,"--mla-cache-bf16")){o->mla_cache_bf16=1;}
         else if(!strcmp(a,"--mla-cache-fp32")){o->mla_cache_bf16=0;}
+        else if(!strcmp(a,"--mla-cache-int8")){o->mla_cache_int8=1;}
         else if(!strcmp(a,"--heartbeat-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->heartbeat_tokens))return-1;}
         else if(!strcmp(a,"--min-available-mib")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->min_available_mib))return-1;}
         else if(!strcmp(a,"--ar-groups")){VALUE();if(!strcmp(argv[i],"auto"))o->ar_groups=-1;
@@ -209,6 +211,10 @@ static int parse_options(int argc,char **argv,k3_options *o){
         fprintf(stderr,"k3_ep_runner: --prefetch-mib requires --threads <=47 to reserve one communication core\n");return-1;}
     if(o->prefetch_threads>o->threads){
         fprintf(stderr,"k3_ep_runner: --prefetch-threads cannot exceed --threads %d\n",o->threads);return-1;}
+    if(o->mla_cache_int8&&(o->cache_load||o->cache_save)){
+        fprintf(stderr,"k3_ep_runner: INT8 MLA cache does not support --cache-load/--cache-save yet (scales are not in cache format v1)\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -635,7 +641,8 @@ static void synthetic_attention_project(float *shared,const float *latent,
 
 static void synthetic_attention_partial(float *shared,const float *latent,
         int state_slot,int global_layer,int token,int cache_tokens,int local_heads,int first_head,
-        float *kda_state,void *mla_keys,void *mla_values,int mla_cache_bf16,
+        float *kda_state,void *mla_keys,void *mla_values,int mla_cache_bf16,int mla_cache_int8,
+        float *mla_key_scales,float *mla_value_scales,
         float *q,float *k,float *v,float *decay,float *attn_out,
         float *mla_scratch,float *mla_stats,float *cache_running_max,int threads){
     int is_kda=layer_is_kda(global_layer);
@@ -648,7 +655,30 @@ static void synthetic_attention_partial(float *shared,const float *latent,
         k3_kda_step_decay_parallel_sve(attn_out,q,k,v,decay,beta,state,
             local_heads,K3_HEAD_DIM,K3_HEAD_DIM,threads);
     }else{
-        if(mla_cache_bf16){uint16_t *keys=mla_keys,*values=mla_values;
+        if(mla_cache_int8){int8_t *keys=mla_keys,*values=mla_values;
+            for(int h=0;h<local_heads;++h){size_t base=(size_t)state_slot*local_heads+h;
+                int8_t *kh=keys+(base*(size_t)cache_tokens+token)*192;
+                int8_t *vh=values+(base*(size_t)cache_tokens+token)*K3_HEAD_DIM;
+                float *ks=mla_key_scales+base*(size_t)cache_tokens+token;
+                float *vs=mla_value_scales+base*(size_t)cache_tokens+token;
+                float kamax=0.0f,vamax=0.0f;
+                for(int d=0;d<192;++d)kamax=fmaxf(kamax,fabsf(k[(size_t)h*192+d]));
+                for(int d=0;d<K3_HEAD_DIM;++d)vamax=fmaxf(vamax,fabsf(v[(size_t)h*K3_HEAD_DIM+d]));
+                *ks=kamax>0.0f?kamax/127.0f:0.0f;*vs=vamax>0.0f?vamax/127.0f:0.0f;
+                for(int d=0;d<192;++d){float x=k[(size_t)h*192+d];kh[d]=*ks?(int8_t)lrintf(fmaxf(-127.0f,fminf(127.0f,x/ *ks))):0;}
+                for(int d=0;d<K3_HEAD_DIM;++d){float x=v[(size_t)h*K3_HEAD_DIM+d];vh[d]=*vs?(int8_t)lrintf(fmaxf(-127.0f,fminf(127.0f,x/ *vs))):0;}
+                *cache_running_max=fmaxf(*cache_running_max,fmaxf(kamax,vamax));
+            }
+            const int8_t *layer_keys=keys+(size_t)state_slot*local_heads*cache_tokens*192;
+            const int8_t *layer_values=values+(size_t)state_slot*local_heads*cache_tokens*K3_HEAD_DIM;
+            const float *layer_key_scales=mla_key_scales+(size_t)state_slot*local_heads*cache_tokens;
+            const float *layer_value_scales=mla_value_scales+(size_t)state_slot*local_heads*cache_tokens;
+#pragma omp parallel for schedule(static)
+            for(int h=0;h<local_heads;++h)k3_attention_i8_sve(attn_out+(size_t)h*K3_HEAD_DIM,
+                q+(size_t)h*192,layer_keys+(size_t)h*cache_tokens*192,
+                layer_key_scales+(size_t)h*cache_tokens,layer_values+(size_t)h*cache_tokens*K3_HEAD_DIM,
+                layer_value_scales+(size_t)h*cache_tokens,token+1,192,K3_HEAD_DIM);
+        }else if(mla_cache_bf16){uint16_t *keys=mla_keys,*values=mla_values;
             for(int h=0;h<local_heads;++h){size_t base=(size_t)state_slot*local_heads+h;
                 uint16_t *kh=keys+(base*(size_t)cache_tokens+token)*192;
                 uint16_t *vh=values+(base*(size_t)cache_tokens+token)*K3_HEAD_DIM;
@@ -814,8 +844,10 @@ int main(int argc,char **argv){
     size_t kda_elems=(size_t)kda_layers*local_heads*K3_HEAD_DIM*K3_HEAD_DIM;
     size_t mla_key_elems=(size_t)mla_layers*local_heads*opt.tokens*192;
     size_t mla_value_elems=(size_t)mla_layers*local_heads*opt.tokens*K3_HEAD_DIM;
-    size_t cache_element_bytes=opt.mla_cache_bf16?sizeof(uint16_t):sizeof(float);
-    size_t state_bytes=kda_elems*sizeof(float)+(mla_key_elems+mla_value_elems)*cache_element_bytes;
+    size_t cache_element_bytes=opt.mla_cache_int8?sizeof(int8_t):(opt.mla_cache_bf16?sizeof(uint16_t):sizeof(float));
+    size_t mla_scale_elems=(size_t)mla_layers*local_heads*opt.tokens;
+    size_t state_bytes=kda_elems*sizeof(float)+(mla_key_elems+mla_value_elems)*cache_element_bytes+
+        (opt.mla_cache_int8?2*mla_scale_elems*sizeof(float):0);
     size_t available=k3_mem_available_bytes(),reserve=(size_t)6<<30;
     int capacity_ok=available>reserve&&state_bytes<=available-reserve;
     if(!capacity_ok)fprintf(stderr,"k3_ep_runner rank %d: state preflight failed: need=%zu MiB MemAvailable=%zu MiB reserve=%zu MiB\n",
@@ -823,6 +855,8 @@ int main(int argc,char **argv){
     float *kda_state=capacity_ok&&kda_elems?k3_pool_calloc(&pool,kda_elems,sizeof(float)):NULL;
     void *mla_keys=capacity_ok&&mla_key_elems?k3_pool_calloc(&pool,mla_key_elems,cache_element_bytes):NULL;
     void *mla_values=capacity_ok&&mla_value_elems?k3_pool_calloc(&pool,mla_value_elems,cache_element_bytes):NULL;
+    float *mla_key_scales=capacity_ok&&opt.mla_cache_int8&&mla_scale_elems?k3_pool_calloc(&pool,mla_scale_elems,sizeof(float)):NULL;
+    float *mla_value_scales=capacity_ok&&opt.mla_cache_int8&&mla_scale_elems?k3_pool_calloc(&pool,mla_scale_elems,sizeof(float)):NULL;
     float *q=k3_pool_alloc(&pool,(size_t)local_heads*192*sizeof(float));
     float *k=k3_pool_alloc(&pool,(size_t)local_heads*192*sizeof(float));
     float *v=k3_pool_alloc(&pool,(size_t)local_heads*K3_HEAD_DIM*sizeof(float));
@@ -833,7 +867,8 @@ int main(int argc,char **argv){
     size_t prefetch_bytes=(size_t)opt.prefetch_mib<<20;
     uint8_t *prefetch_weights=prefetch_bytes?k3_pool_alloc(&pool,prefetch_bytes):NULL;
     ready=capacity_ok&&latent&&partial&&shared&&reduce&&gate&&up&&(!kda_elems||kda_state)&&
-        (!mla_key_elems||mla_keys)&&(!mla_value_elems||mla_values)&&q&&k&&v&&decay&&attn_out&&mla_scratch&&mla_stats&&
+        (!mla_key_elems||mla_keys)&&(!mla_value_elems||mla_values)&&(!opt.mla_cache_int8||!mla_scale_elems||mla_key_scales)&&
+        (!opt.mla_cache_int8||!mla_scale_elems||mla_value_scales)&&q&&k&&v&&decay&&attn_out&&mla_scratch&&mla_stats&&
         (!prefetch_bytes||prefetch_weights);
     ready_sum=(float)ready;collective_rc=runner_allreduce_sum(&comm,&ready_sum,1);
     if(collective_rc){fprintf(stderr,"k3_ep_runner rank %d: allocation collective failed: %s\n",g_rank,runner_comm_error(&comm));
@@ -952,7 +987,8 @@ int main(int argc,char **argv){
                 if(opt.profile){profile_add(phase,phase_max,0,ft[0]);profile_add(phase,phase_max,2,ft[1]);}}
             else{pt=opt.profile?now_sec():0;
                 synthetic_attention_partial(shared,latent,state_slot[layer],global_layer,token,opt.tokens,local_heads,first_head,
-                    kda_state,mla_keys,mla_values,opt.mla_cache_bf16,q,k,v,decay,attn_out,mla_scratch,mla_stats,
+                    kda_state,mla_keys,mla_values,opt.mla_cache_bf16,opt.mla_cache_int8,mla_key_scales,mla_value_scales,
+                    q,k,v,decay,attn_out,mla_scratch,mla_stats,
                     &cache_running_max,layer_is_kda(global_layer)?opt.kda_threads:opt.threads);
                 if(opt.profile)profile_add(phase,phase_max,layer_is_kda(global_layer)?0:1,now_sec()-pt);
                 pt=opt.profile?now_sec():0;
@@ -1007,7 +1043,12 @@ int main(int argc,char **argv){
     for(int i=0;i<K3_LATENT;++i){float a=fabsf(latent[i]);checksum+=latent[i];norm2+=(double)latent[i]*latent[i];if(a>latent_max)latent_max=a;}
 #pragma omp parallel for reduction(max:state_max)
     for(size_t i=0;i<kda_elems;++i){float a=fabsf(kda_state[i]);if(a>state_max)state_max=a;}
-    if(opt.mla_cache_bf16){uint16_t *keys=mla_keys,*values=mla_values;
+    if(opt.mla_cache_int8){int8_t *keys=mla_keys,*values=mla_values;
+#pragma omp parallel for reduction(max:cache_max)
+        for(size_t i=0;i<mla_key_elems;++i){float a=fabsf((float)keys[i])*mla_key_scales[i/192];if(a>cache_max)cache_max=a;}
+#pragma omp parallel for reduction(max:cache_max)
+        for(size_t i=0;i<mla_value_elems;++i){float a=fabsf((float)values[i])*mla_value_scales[i/K3_HEAD_DIM];if(a>cache_max)cache_max=a;}
+    }else if(opt.mla_cache_bf16){uint16_t *keys=mla_keys,*values=mla_values;
 #pragma omp parallel for reduction(max:cache_max)
         for(size_t i=0;i<mla_key_elems;++i){float a=fabsf(k3_bf16_to_f32(keys[i]));if(a>cache_max)cache_max=a;}
 #pragma omp parallel for reduction(max:cache_max)
@@ -1057,7 +1098,7 @@ int main(int argc,char **argv){
     if(g_rank==0){double steps=(double)opt.layers*tokens_completed;
         int nkda=0;for(int l=0;l<opt.layers;++l)nkda+=layer_is_kda(schedule_layer+l);
         printf("K3_RUN mode=%s model_coverage=%s expert_layer=%d nodes=%d tp_nodes=%d contexts=%d group=%d local_channels=%d selected=%d layer_range=[%d,%d) KDA=%d MLA=%d tokens=%d threads=%d kda_threads=%d fused_team=%d fused_threads=%d mla_cache=%s min_available_mib=%d allreduce=%s ar_groups=%d comm_robust=%d comm_ack=%d comm_deterministic=%d comm_poll_spins=%d prefetch_mib=%d prefetch_threads=%d prefetch_checksum=%llu\n",
-            k3_mode_name(opt.mode),opt.mode==K3_MODE_HYBRID?"one_real_expert_layer_repeated":opt.mode==K3_MODE_REAL?"one_real_expert_layer":"synthetic",opt.layer,g_world_nodes,g_nodes,g_contexts,g_group,local,K3_SELECTED,schedule_layer,schedule_layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_bf16?"bf16":"fp32",opt.min_available_mib,
+            k3_mode_name(opt.mode),opt.mode==K3_MODE_HYBRID?"one_real_expert_layer_repeated":opt.mode==K3_MODE_REAL?"one_real_expert_layer":"synthetic",opt.layer,g_world_nodes,g_nodes,g_contexts,g_group,local,K3_SELECTED,schedule_layer,schedule_layer+opt.layers,nkda,opt.layers-nkda,opt.tokens,opt.threads,opt.kda_threads,opt.fuse_kda_expert,opt.fused_threads,opt.mla_cache_int8?"int8":opt.mla_cache_bf16?"bf16":"fp32",opt.min_available_mib,
             opt.ar_groups?"hierarchical":"flat",opt.ar_groups,opt.comm_robust,opt.comm_ack,opt.comm_deterministic,opt.comm_poll_spins,opt.prefetch_mib,
             opt.prefetch_threads?opt.prefetch_threads:(opt.threads<K3_RUN_PREFETCH_THREADS?opt.threads:K3_RUN_PREFETCH_THREADS),(unsigned long long)prefetch_sink);
         printf("K3_RESULT status=%s reason=%s tokens_completed=%d wall_s=%.6f decode_tok_s=%.3f layer_steps_per_s=%.3f checksum=%+.9e l2=%.9e disagreement=%.3e disagreement_tol=%.3e peak_MiB=%.2f collective_seq=%lu\n",

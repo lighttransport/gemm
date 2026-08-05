@@ -27,9 +27,11 @@
 #include <unistd.h>
 #include <utofu.h>
 
+#define GGML_DEQUANT_IMPLEMENTATION
 #include "k3_dense.h"
 #include "k3_kernels.h"
 #include "k3_moe.h"
+#include "k3_quant.h"
 #include "k3_runtime.h"
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
@@ -50,6 +52,11 @@
 #define K3_FULL_MAX_DEBUG_TOKENS 4096
 #define K3_FULL_DTYPE_Q8P16 4
 #define K3_FULL_DTYPE_Q8P8 5
+#define K3_FULL_DTYPE_Q8_0 6
+#define K3_FULL_DTYPE_IQ1_S 7
+#define K3_FULL_DTYPE_IQ2_XS 8
+#define K3_FULL_DTYPE_IQ2_XXS 9
+#define K3_FULL_DTYPE_IQ3_XXS 10
 #define K3_FULL_PROFILE_PHASES 13
 
 enum {
@@ -600,6 +607,11 @@ static int full_dtype(const char *s) {
     if (!strcmp(s, "U8")) return 3;
     if (!strcmp(s, "Q8P16")) return K3_FULL_DTYPE_Q8P16;
     if (!strcmp(s, "Q8P8")) return K3_FULL_DTYPE_Q8P8;
+    if (!strcmp(s, "Q8_0")) return K3_FULL_DTYPE_Q8_0;
+    if (!strcmp(s, "IQ1_S")) return K3_FULL_DTYPE_IQ1_S;
+    if (!strcmp(s, "IQ2_XS")) return K3_FULL_DTYPE_IQ2_XS;
+    if (!strcmp(s, "IQ2_XXS")) return K3_FULL_DTYPE_IQ2_XXS;
+    if (!strcmp(s, "IQ3_XXS")) return K3_FULL_DTYPE_IQ3_XXS;
     return 0;
 }
 
@@ -775,13 +787,26 @@ typedef struct {
     const uint16_t *weights;
     const uint8_t *packed;
     const float *input;
+    const uint8_t *quant;
+    size_t quant_row_bytes;
+    int quant_mode;
     int rows;
     int cols;
     int dtype;
 } full_bf16_task;
 
 static void full_bf16_run_task(const full_bf16_task *task) {
-    if (task->dtype == K3_FULL_DTYPE_Q8P16 && task->rows == 8) {
+    if (task->dtype >= K3_FULL_DTYPE_Q8_0 && task->dtype <= K3_FULL_DTYPE_IQ3_XXS) {
+        int qt = K3_Q_Q8_0 + (task->dtype - K3_FULL_DTYPE_Q8_0);
+        k3_quant_matrix qm = {task->quant, qt, task->rows, task->cols,
+                              task->quant_row_bytes};
+        if (k3_quant_matvec_mode(task->out, &qm, task->input, 0,
+                                 task->quant_mode)) {
+            for (int r = 0; r < task->rows; ++r)
+                task->out[r] = k3_quant_dot_row(task->quant +
+                    (size_t)r * task->quant_row_bytes, qt, task->input, task->cols);
+        }
+    } else if (task->dtype == K3_FULL_DTYPE_Q8P16 && task->rows == 8) {
         k3_matvec_q8pv16_f32_group(task->out, task->packed,
                                    task->input, task->cols);
     } else if (task->dtype == K3_FULL_DTYPE_Q8P8 && task->rows == 8) {
@@ -831,18 +856,23 @@ static void full_bf16_many(float *const *outs,
     for (int i = 0; i < count; ++i) {
         int dtype = tensors[i]->dtype;
         if (dtype != 1 && dtype != K3_FULL_DTYPE_Q8P16 &&
-            dtype != K3_FULL_DTYPE_Q8P8) {
+            dtype != K3_FULL_DTYPE_Q8P8 &&
+            (dtype < K3_FULL_DTYPE_Q8_0 || dtype > K3_FULL_DTYPE_IQ3_XXS)) {
             fprintf(stderr, "k3_full_runner: unsupported projection dtype=%d tensor=%s\n",
                     dtype, tensors[i]->name);
             return;
         }
-        if (dtype != 1 && ((rows[i] & 7) || (cols[i] & 15))) {
+        if (dtype >= K3_FULL_DTYPE_Q8P16 && dtype <= K3_FULL_DTYPE_Q8P8 &&
+            ((rows[i] & 7) || (cols[i] & 15))) {
             fprintf(stderr, "k3_full_runner: Q8 projection shape is not packed-compatible "
                             "tensor=%s shape=%dx%d\n",
                     tensors[i]->name, rows[i], cols[i]);
             return;
         }
         const uint16_t *w = dtype == 1 ? (const uint16_t *)tensors[i]->data : NULL;
+        size_t qrb = (dtype >= K3_FULL_DTYPE_Q8_0 &&
+                      dtype <= K3_FULL_DTYPE_IQ3_XXS) ?
+            k3_quant_row_bytes(K3_Q_Q8_0 + (dtype - K3_FULL_DTYPE_Q8_0), cols[i]) : 0;
         for (int r = 0; r < rows[i]; r += 8) {
             int nr = rows[i] - r;
             if (nr > 8) nr = 8;
@@ -853,6 +883,11 @@ static void full_bf16_many(float *const *outs,
                     (size_t)(r / 8) * (size_t)(cols[i] / 16) *
                     (dtype == K3_FULL_DTYPE_Q8P8 ? 192 : 160),
                 .input = inputs[i],
+                .quant = (dtype >= K3_FULL_DTYPE_Q8_0 &&
+                          dtype <= K3_FULL_DTYPE_IQ3_XXS) ?
+                    tensors[i]->data + (size_t)r * qrb : NULL,
+                .quant_row_bytes = qrb,
+                .quant_mode = k3_quant_kernel_mode_env(),
                 .rows = nr,
                 .cols = cols[i],
                 .dtype = dtype,
