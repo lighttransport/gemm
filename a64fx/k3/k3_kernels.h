@@ -413,16 +413,60 @@ static inline float k3_dot_f32_i8_sve(const float *a, const int8_t *b, int n) {
 #endif
 }
 
+/* Symmetric int8 quantization of one query vector.  The query is reused across
+ * every key in the scan, so this pays for itself after the first token. */
+static inline float k3_quantize_i8(const float *x, int n, int8_t *out) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float a = x[i] < 0.0f ? -x[i] : x[i];
+        if (a > amax) amax = a;
+    }
+    if (amax <= 0.0f) {
+        for (int i = 0; i < n; ++i) out[i] = 0;
+        return 0.0f;
+    }
+    float inv = 127.0f / amax;
+    for (int i = 0; i < n; ++i) {
+        int v = (int)lrintf(x[i] * inv);
+        out[i] = (int8_t)(v > 127 ? 127 : v < -127 ? -127 : v);
+    }
+    return amax / 127.0f;
+}
+
+static inline int32_t k3_dot_i8_i8_sve(const int8_t *a, const int8_t *b, int n) {
+#if defined(__ARM_FEATURE_SVE)
+    svint32_t acc = svdup_s32(0);
+    for (int i = 0; i < n; i += (int)svcntb()) {
+        svbool_t pg = svwhilelt_b8(i, n);
+        acc = svdot_s32(acc, svld1_s8(pg, a + i), svld1_s8(pg, b + i));
+    }
+    return svaddv_s32(svptrue_b32(), acc);
+#else
+    int32_t acc = 0;
+    for (int i = 0; i < n; ++i) acc += (int32_t)a[i] * b[i];
+    return acc;
+#endif
+}
+
 /* Symmetric per-token INT8 MLA attention.  Scales are stored separately for
- * each key/value token vector; softmax and accumulation remain FP32. */
+ * each key/value token vector; softmax and accumulation remain FP32.
+ *
+ * The QK score is a true int8 SDOT: quantizing the query once turns the scan's
+ * inner product from one fp32 lane per element into four int8 lanes per lane,
+ * where the old kernel widened every stored key byte back to fp32 before a
+ * plain FMLA.  PV stays fp32 — it is the accuracy-sensitive half and it is not
+ * the term that grows with context. */
 static inline void k3_attention_i8_sve(float *out, const float *q,
         const int8_t *keys, const float *key_scales, const int8_t *values,
         const float *value_scales, int tokens, int qk_dim, int v_dim) {
     for (int j = 0; j < v_dim; ++j) out[j] = 0.0f;
     float m = -INFINITY, l = 0.0f, scale = 1.0f / sqrtf((float)qk_dim);
+    int8_t q8[qk_dim];
+    float qs = k3_quantize_i8(q, qk_dim, q8);
     for (int t = 0; t < tokens; ++t) {
         const int8_t *kt = keys + (size_t)t * qk_dim;
-        float score = k3_dot_f32_i8_sve(q, kt, qk_dim) * key_scales[t] * scale;
+        float score = (float)k3_dot_i8_i8_sve(q8, kt, qk_dim) * qs *
+                      key_scales[t] * scale;
         float nm, old, add;
         if (score <= m) { nm = m; old = 1.0f; add = expf(score - m); }
         else { nm = score; old = expf(m - score); add = 1.0f; }

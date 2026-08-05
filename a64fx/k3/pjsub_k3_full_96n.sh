@@ -4,26 +4,16 @@
 #   codegen: 1K prompt -> 4K generated IDs (decode throughput)
 #   source:  8K prompt, no generation (prefill throughput)
 #PJM -g hp250467
-#PJM -L "rscgrp=small-s2,node=96,elapse=08:00:00"
+# Use the non-torus scalar placement accepted by the K3 96-node probes.
+#PJM -L "rscgrp=small,node=96,elapse=08:00:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
 #PJM --mpi "proc=96"
-#PJM --llio localtmp-size=80Gi
+#PJM --llio localtmp-size=87Gi
 #PJM -x PJM_LLIO_GFSCACHE=/vol0004
-# Propagate launch-time overrides from the login1 environment into the job.
-#PJM -x K3_BARRIER_ITERS
-#PJM -x K3_THREADS
-#PJM -x K3_COMM_DETERMINISTIC
-#PJM -x K3_COMM_BF16
-#PJM -x K3_COMM_ROBUST
-#PJM -x K3_COMM_POLL_SPINS
-#PJM -x K3_COMM_A2A
-#PJM -x K3_COMM_A2A_MAX
-#PJM -x K3_PREFETCH_MIB
-#PJM -x K3_PROFILE
-#PJM -x K3_MODEL_DIR
-#PJM -x K3_FULL_STAGE_DIR
-#PJM -x K3_AR_GROUPS
-#PJM -x K3_MOE_SHARD_LAYOUT
+#
+# No bare `#PJM -x NAME` directives: that form fails the gate check at 96 nodes
+# (see pjsub_k3_full_96n_short_1h.sh for the canary evidence).  Pass overrides
+# as `-x NAME=value` on the pjsub command line instead.
 #PJM -j
 set -euo pipefail
 

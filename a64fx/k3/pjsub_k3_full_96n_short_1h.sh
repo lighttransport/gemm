@@ -1,31 +1,29 @@
 #!/bin/bash
-# One-hour TP96 full-weight short-context end-to-end run.
+# TP96 full-weight short-context end-to-end run.
 # Measures real full-model prefill and generation after rank-local staging.
+#
+# Three hours, not one: job 49931198 spent 2885 s of a 3600 s reservation on
+# rank-local weight staging alone and was killed mid-validation, and 49922938
+# spent 3103 s on the same stage.  One hour cannot fit staging plus generation
+# plus validation.
 #PJM -g hp250467
-#PJM -L "rscgrp=small-s2,node=96,elapse=01:01:00"
+# Use the non-torus scalar placement accepted by the K3 96-node probes.
+#PJM -L "rscgrp=small,node=96,elapse=03:00:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
 #PJM --mpi "proc=96"
-#PJM --llio localtmp-size=80Gi
+#PJM --llio localtmp-size=87Gi
 #PJM -x PJM_LLIO_GFSCACHE=/vol0004
-# Propagate launch-time overrides from the login1 environment into the job.
-# Without these directives pjsub silently used the shell defaults below.
-#PJM -x K3_BARRIER_ITERS
-#PJM -x K3_THREADS
-#PJM -x K3_PREFILL_TOKENS
-#PJM -x K3_NEW_TOKENS
-#PJM -x K3_PREFILL_CHUNK
-#PJM -x K3_COMM_DETERMINISTIC
-#PJM -x K3_COMM_BF16
-#PJM -x K3_COMM_ROBUST
-#PJM -x K3_COMM_POLL_SPINS
-#PJM -x K3_COMM_A2A
-#PJM -x K3_COMM_A2A_MAX
-#PJM -x K3_PREFETCH_MIB
-#PJM -x K3_PROFILE
-#PJM -x K3_MODEL_DIR
-#PJM -x K3_FULL_STAGE_DIR
-#PJM -x K3_AR_GROUPS
-#PJM -x K3_MOE_SHARD_LAYOUT
+#
+# There are deliberately no bare `#PJM -x NAME` directives here.  That form is
+# what killed jobs 49973647, 49959412 and 49973486 with REASON=GATE CHECK
+# before the script body ever ran: pjsub accepts the directive at submit time,
+# then the gate check fails at scale.  Proven by canary, 96 nodes, 1 minute:
+#   50001241  87Gi + bare -x     -> ERR / GATE CHECK
+#   50001247  80Gi, no bare -x   -> ran
+# `-x NAME=value` is the supported form.  Pass launch-time overrides on the
+# pjsub command line instead:
+#   pjsub --no-check-directory -x K3_THREADS=47 -x K3_PROFILE=1 ... <script>
+# Anything not passed falls back to the defaults below.
 #PJM -j
 set -euo pipefail
 
@@ -50,8 +48,8 @@ PROFILE=${K3_PROFILE:-0}
 AR_GROUPS=${K3_AR_GROUPS:-16}
 MOE_SHARD_LAYOUT=${K3_MOE_SHARD_LAYOUT:-replicated}
 JOB_TAG=${PJM_JOBID:-manual-$$}
-ROOT="$K3/logs/full-96n-short-1h-$JOB_TAG"
-STAGE_DIR="/local/$USER/k3-full-short-1h-$JOB_TAG"
+ROOT="$K3/logs/full-96n-short-3h-$JOB_TAG"
+STAGE_DIR="/local/$USER/k3-full-short-3h-$JOB_TAG"
 if [ -n "${K3_FULL_STAGE_DIR:-}" ]; then STAGE_DIR=$K3_FULL_STAGE_DIR; fi
 TIMING="$ROOT/stage_timing.tsv"
 
@@ -114,6 +112,10 @@ EOF
     --tokens "$PREFILL_TOKENS" --bos --repeat-to
 
 stage_begin full_weight_staging
+# 8 MiB chunks moved ~16 GB/rank in 2885 s (~5.6 MB/s) in job 49931198, far
+# under what LLIO can do.  Larger chunks are the cheapest thing to try; the
+# stage_timing row is what tells us whether it helped.
+export CHUNK_MIB=${K3_STAGE_CHUNK_MIB:-32}
 if [ -n "${K3_FULL_STAGE_DIR:-}" ]; then
     [[ -s "$STAGE_DIR/rank000.manifest" && -s "$STAGE_DIR/rank095.manifest" ]] || {
         echo "K3_FULL_STAGE_DIR is missing prepared rank manifests: $STAGE_DIR" >&2; exit 4;

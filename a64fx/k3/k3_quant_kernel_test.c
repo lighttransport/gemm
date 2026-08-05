@@ -40,7 +40,10 @@ static int check_type(const char *name, int type, int cols) {
         ref[r] = k3_quant_dot_row_ref(row, type, x, cols);
     }
     k3_quant_matrix m = {w, type, rows, cols, rb};
-    int rc = k3_quant_matvec(got, &m, x, 48);
+    /* The reference matvec must stay bit-faithful to the row reference.  The
+     * default entry point now takes an SDOT kernel, so it is held to the
+     * activation-quantization tolerance instead. */
+    int rc = k3_quant_matvec_ref(got, &m, x, 48);
     double se = 0.0, sr = 0.0, mx = 0.0;
     for (int r = 0; r < rows; ++r) {
         double d = (double)got[r] - ref[r];
@@ -48,10 +51,24 @@ static int check_type(const char *name, int type, int cols) {
         if (fabs(d) > mx) mx = fabs(d);
     }
     double rel = sqrt(se / (sr + 1e-30));
-    printf("[%s] rows=%d cols=%d rel_l2=%.3e max_abs=%.3e %s\n",
+    printf("[%s ref] rows=%d cols=%d rel_l2=%.3e max_abs=%.3e %s\n",
            name, rows, cols, rel, mx, rc == 0 && rel < 1e-6 ? "OK" : "FAIL");
     int bad = rc || rel >= 1e-6;
-    if (type >= K3_Q_IQ1_S && type <= K3_Q_IQ3_XXS) {
+
+    /* Default path: W8A8 quantizes the activation to 7 bits + sign, so ~1e-2
+     * relative is the floor here regardless of how exact the weights are. */
+    int drc = k3_quant_matvec(got, &m, x, 48);
+    double dse = 0.0, dsr = 0.0;
+    for (int r = 0; r < rows; ++r) {
+        double d = (double)got[r] - ref[r];
+        dse += d * d; dsr += (double)ref[r] * ref[r];
+    }
+    double drel = sqrt(dse / (dsr + 1e-30));
+    printf("[%s default] rel_l2=%.3e %s\n", name, drel,
+           drc == 0 && drel < 0.02 ? "OK" : "FAIL");
+    bad |= drc || drel >= 0.02;
+
+    if (type == K3_Q_Q8_0 || (type >= K3_Q_IQ1_S && type <= K3_Q_IQ3_XXS)) {
         for (int mode = K3_QUANT_SVE_A16; mode <= K3_QUANT_SVE_Q8; ++mode) {
             int mrc = k3_quant_matvec_mode(got, &m, x, 48, mode);
             double mse = 0.0, mse_ref = 0.0;
