@@ -350,6 +350,31 @@ static inline int64_t k3_quant_dot_i8_quad16(const int8_t *w, const int8_t *x,
 }
 
 #if defined(__ARM_FEATURE_SVE)
+/* A16 group accumulator.  Unlike the q8 path there is nothing to gain from
+ * pairing groups: 32 int16 activations already fill a 512-bit vector.  The
+ * wins here are staging the grid as int8 doublewords and widening it in the
+ * load (svld1sb_s16), plus keeping the per-group scaling in the vector domain
+ * so a block needs one svaddv instead of eight.
+ *
+ * svdot_s64 folds four int16 pairs into each int64 lane, so a 32-element group
+ * occupies lanes 0-7 and IQ2_XS's two half-group scales split at lane 4. */
+static inline svint64_t k3_quant_acc_a16(svint64_t vacc, const int8_t *w,
+                                         const int16_t *x, svint64_t scale) {
+    svbool_t pg = svwhilelt_b16(0, 32);
+    svint64_t d = svdot_s64(svdup_s64(0), svld1sb_s16(pg, w), svld1_s16(pg, x));
+    return svmla_s64_x(svptrue_b64(), vacc, d, scale);
+}
+
+static inline svint64_t k3_quant_a16_split_scale(int s_lo, int s_hi) {
+    return svsel_s64(svwhilelt_b64(0, 4), svdup_s64(s_lo), svdup_s64(s_hi));
+}
+
+static inline int64_t k3_quant_acc_a16_total(svint64_t vacc) {
+    return svaddv_s64(svptrue_b64(), vacc);
+}
+#endif
+
+#if defined(__ARM_FEATURE_SVE)
 /* Accumulator forms of the two dot helpers.  Reducing to a scalar per group
  * costs an svaddv plus a SIMD->GPR move, which profiling showed to be the two
  * hottest instructions in the IQ kernels.  Staying in the vector domain across
@@ -428,19 +453,32 @@ static inline int64_t k3_quant_dot_i8(const int8_t *a, const int8_t *b, int n) {
 
 static inline float k3_quant_iq2_xs_row(const block_iq2_xs *w,
                                         const int16_t *x, float xd, int nb) {
-    float out = 0.0f; int16_t qw[32];
+    float out = 0.0f; int8_t qw[32];
     for (int b = 0; b < nb; ++b) {
         int64_t part = 0;
+#if defined(__ARM_FEATURE_SVE)
+        svint64_t vacc = svdup_s64(0);
+#endif
         for (int ib = 0; ib < 8; ++ib) {
             for (int l = 0; l < 4; ++l) {
                 uint16_t code = w[b].qs[4 * ib + l];
-                for (int j = 0; j < 8; ++j) qw[8 * l + j] = k3_iq2_lut[code][j];
+                k3_quant_copy8(qw + 8 * l, k3_iq2_lut[code]);
             }
             int s0 = 2 * (w[b].scales[ib] & 15) + 1;
             int s1 = 2 * (w[b].scales[ib] >> 4) + 1;
-            part += k3_quant_dot_i16(qw, x + 256 * b + 32 * ib, 16) * s0;
-            part += k3_quant_dot_i16(qw + 16, x + 256 * b + 32 * ib + 16, 16) * s1;
+#if defined(__ARM_FEATURE_SVE)
+            vacc = k3_quant_acc_a16(vacc, qw, x + 256 * b + 32 * ib,
+                                    k3_quant_a16_split_scale(s0, s1));
+#else
+            for (int j = 0; j < 16; ++j) {
+                part += (int)qw[j] * x[256 * b + 32 * ib + j] * s0;
+                part += (int)qw[j + 16] * x[256 * b + 32 * ib + j + 16] * s1;
+            }
+#endif
         }
+#if defined(__ARM_FEATURE_SVE)
+        part = k3_quant_acc_a16_total(vacc);
+#endif
         out += ggml_fp16_to_fp32(w[b].d) * xd * (float)part * 0.125f;
     }
     return out;
@@ -448,68 +486,113 @@ static inline float k3_quant_iq2_xs_row(const block_iq2_xs *w,
 
 static inline float k3_quant_iq2_xxs_row(const block_iq2_xxs *w,
                                          const int16_t *x, float xd, int nb) {
-    float out = 0.0f; uint32_t aux[2]; int16_t qw[32];
+    /* (0.5 + k) * 0.25 is (1 + 2k) * 0.125, so the group scale is an integer
+     * and the whole block can accumulate before one reduction. */
+    float out = 0.0f; uint32_t aux[2]; int8_t qw[32], sg[32];
     for (int b = 0; b < nb; ++b) {
+        int64_t part = 0;
+#if defined(__ARM_FEATURE_SVE)
+        svint64_t vacc = svdup_s64(0);
+#endif
         for (int ib = 0; ib < 8; ++ib) {
             memcpy(aux, w[b].qs + 4 * ib, sizeof(aux));
-            int64_t part = 0;
             for (int l = 0; l < 4; ++l) {
-                const uint8_t *g = (const uint8_t *)(iq2xxs_grid + ((const uint8_t *)aux)[l]);
-                uint8_t signs = ksigns_iq2xs[(aux[1] >> (7 * l)) & 127];
-                for (int j = 0; j < 8; ++j)
-                    qw[8 * l + j] = (int16_t)((signs & kmask_iq2xs[j]) ? -(int)g[j] : (int)g[j]);
+                k3_quant_copy8(qw + 8 * l,
+                               iq2xxs_grid + ((const uint8_t *)aux)[l]);
+                k3_quant_copy8(sg + 8 * l,
+                               k3_iq_sign_lut[ksigns_iq2xs[(aux[1] >> (7 * l)) & 127]]);
             }
-            part += k3_quant_dot_i16(qw, x + 256 * b + 32 * ib, 32);
-            out += ggml_fp16_to_fp32(w[b].d) * xd *
-                   (0.5f + (float)(aux[1] >> 28)) * 0.25f * (float)part;
+            k3_quant_apply_signs32(qw, sg);
+            int s = 1 + 2 * (int)(aux[1] >> 28);
+#if defined(__ARM_FEATURE_SVE)
+            vacc = k3_quant_acc_a16(vacc, qw, x + 256 * b + 32 * ib,
+                                    svdup_s64(s));
+#else
+            for (int j = 0; j < 32; ++j)
+                part += (int)qw[j] * x[256 * b + 32 * ib + j] * s;
+#endif
         }
+#if defined(__ARM_FEATURE_SVE)
+        part = k3_quant_acc_a16_total(vacc);
+#endif
+        out += ggml_fp16_to_fp32(w[b].d) * xd * 0.125f * (float)part;
     }
     return out;
 }
 
 static inline float k3_quant_iq1_s_row(const block_iq1_s *w,
                                        const int16_t *x, float xd, int nb) {
+    /* Both terms carry an integer group scale, so the block accumulates once
+     * for the weight product and once for sum(x) against ones. */
     float out = 0.0f; const uint8_t *qs; const uint16_t *qh;
-    int16_t qw[32];
+    int8_t qw[32];
     for (int b = 0; b < nb; ++b) {
         const block_iq1_s *wb = w + b; qs = wb->qs; qh = wb->qh;
+        int64_t acc = 0, dacc = 0;
+#if defined(__ARM_FEATURE_SVE)
+        svint64_t vacc = svdup_s64(0), vdacc = svdup_s64(0);
+#endif
         for (int ib = 0; ib < 8; ++ib) {
-            int64_t part = 0, xs = 0;
-            float delta = qh[ib] & 0x8000 ? -0.125f : 0.125f;
             for (int l = 0; l < 4; ++l) {
                 int idx = qs[l] | (((qh[ib] >> (3 * l)) & 7) << 8);
-                for (int j = 0; j < 8; ++j) qw[8 * l + j] = k3_iq1_lut[idx][j];
+                k3_quant_copy8(qw + 8 * l, k3_iq1_lut[idx]);
             }
-            part = k3_quant_dot_i16(qw, x + 256 * b + 32 * ib, 32);
-            for (int j = 0; j < 32; ++j) xs += x[256 * b + 32 * ib + j];
-            out += ggml_fp16_to_fp32(wb->d) * xd *
-                   (float)(2 * ((qh[ib] >> 12) & 7) + 1) *
-                   ((float)part + delta * (float)xs);
+            int s = 2 * ((qh[ib] >> 12) & 7) + 1;
+            int sd = (qh[ib] & 0x8000) ? -s : s;
+            const int16_t *xg = x + 256 * b + 32 * ib;
+#if defined(__ARM_FEATURE_SVE)
+            vacc = k3_quant_acc_a16(vacc, qw, xg, svdup_s64(s));
+            vdacc = k3_quant_acc_a16(vdacc, k3_iq_ones, xg, svdup_s64(sd));
+#else
+            for (int j = 0; j < 32; ++j) {
+                acc += (int)qw[j] * xg[j] * s;
+                dacc += (int)xg[j] * sd;
+            }
+#endif
             qs += 4;
         }
+#if defined(__ARM_FEATURE_SVE)
+        acc = k3_quant_acc_a16_total(vacc);
+        dacc = k3_quant_acc_a16_total(vdacc);
+#endif
+        out += ggml_fp16_to_fp32(wb->d) * xd *
+               ((float)acc + 0.125f * (float)dacc);
     }
     return out;
 }
 
 static inline float k3_quant_iq3_xxs_row(const block_iq3_xxs *w,
                                          const int16_t *x, float xd, int nb) {
-    float out = 0.0f; int16_t qw[32];
+    float out = 0.0f; int8_t qw[32], sg[32];
     for (int b = 0; b < nb; ++b) {
         const uint8_t *q3 = w[b].qs, *gas = w[b].qs + 64;
         int64_t part = 0;
+#if defined(__ARM_FEATURE_SVE)
+        svint64_t vacc = svdup_s64(0);
+#endif
         for (int ib = 0; ib < 8; ++ib) {
             uint32_t aux; memcpy(&aux, gas + 4 * ib, sizeof(aux));
+            const uint8_t *q3h = q3 + 8 * ib;
             for (int l = 0; l < 4; ++l) {
-                const uint8_t *g1 = (const uint8_t *)(iq3xxs_grid + q3[8 * ib + 2 * l]);
-                const uint8_t *g2 = (const uint8_t *)(iq3xxs_grid + q3[8 * ib + 2 * l + 1]);
-                uint8_t s = ksigns_iq2xs[(aux >> (7 * l)) & 127];
-                for (int j = 0; j < 4; ++j) {
-                    qw[8 * l + j] = (int16_t)((s & kmask_iq2xs[j]) ? -(int)g1[j] : (int)g1[j]);
-                    qw[8 * l + j + 4] = (int16_t)((s & kmask_iq2xs[j + 4]) ? -(int)g2[j] : (int)g2[j]);
-                }
+                /* IQ3 packs two 4-byte grid entries per group. */
+                memcpy(qw + 8 * l, iq3xxs_grid + q3h[2 * l], 4);
+                memcpy(qw + 8 * l + 4, iq3xxs_grid + q3h[2 * l + 1], 4);
+                k3_quant_copy8(sg + 8 * l,
+                               k3_iq_sign_lut[ksigns_iq2xs[(aux >> (7 * l)) & 127]]);
             }
-            part += k3_quant_dot_i16(qw, x + 256 * b + 32 * ib, 32) * (2 * (int)(aux >> 28) + 1);
+            k3_quant_apply_signs32(qw, sg);
+            int s = 2 * (int)(aux >> 28) + 1;
+#if defined(__ARM_FEATURE_SVE)
+            vacc = k3_quant_acc_a16(vacc, qw, x + 256 * b + 32 * ib,
+                                    svdup_s64(s));
+#else
+            for (int j = 0; j < 32; ++j)
+                part += (int)qw[j] * x[256 * b + 32 * ib + j] * s;
+#endif
         }
+#if defined(__ARM_FEATURE_SVE)
+        part = k3_quant_acc_a16_total(vacc);
+#endif
         out += ggml_fp16_to_fp32(w[b].d) * xd * (float)part * 0.25f;
     }
     return out;

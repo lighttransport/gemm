@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -57,12 +58,30 @@ class K3FullRunnerTest(unittest.TestCase):
             source = (HERE / name).read_text()
             self.assertIn('--mode barrier --nodes "$NODES"', source)
             self.assertIn('BARRIER_ITERS=${K3_BARRIER_ITERS:-128}', source)
-            self.assertIn('#PJM -x K3_BARRIER_ITERS', source)
             self.assertIn('COMM_DETERMINISTIC=${K3_COMM_DETERMINISTIC:-1}', source)
             self.assertIn('--comm-deterministic "$COMM_DETERMINISTIC"', source)
-            self.assertIn('#PJM -x K3_FULL_STAGE_DIR', source)
+            self.assertIn('K3_FULL_STAGE_DIR', source)
             self.assertIn('--ar-groups "$AR_GROUPS"', source)
             self.assertIn('K3_MOE_SHARD_LAYOUT', source)
+
+    def test_batch_launchers_have_no_bare_export_directives(self):
+        """`#PJM -x NAME` without a value passes submission and then fails the
+        gate check at 96 nodes, which killed jobs 49973647, 49959412 and
+        49973486 before the script body ran.  Canary 2x2 at 96 nodes: bare -x
+        gate-checks at both 80Gi and 87Gi, no bare -x runs at both.  Overrides
+        belong on the pjsub command line as `-x NAME=value`."""
+        bare = re.compile(r'^#PJM\s+-x\s+[A-Za-z_][A-Za-z0-9_]*\s*$', re.M)
+        for name in ("pjsub_k3_full_96n_short_1h.sh", "pjsub_k3_full_96n.sh"):
+            source = (HERE / name).read_text()
+            self.assertEqual([], bare.findall(source),
+                             "%s carries bare '#PJM -x NAME' directives" % name)
+            # The valued form is still required for the LLIO cache setting.
+            self.assertIn('#PJM -x PJM_LLIO_GFSCACHE=/vol0004', source)
+
+    def test_batch_launchers_request_full_localtmp(self):
+        for name in ("pjsub_k3_full_96n_short_1h.sh", "pjsub_k3_full_96n.sh"):
+            source = (HERE / name).read_text()
+            self.assertIn('#PJM --llio localtmp-size=87Gi', source)
 
     def test_full_runner_defaults_to_deterministic_reductions(self):
         source = (HERE / "k3_full_runner.c").read_text()
@@ -97,6 +116,11 @@ class K3FullRunnerTest(unittest.TestCase):
         self.assertIn("full_moe_forward_expert_tp", source)
         self.assertIn("tp_comm_init_2d_external", source)
         self.assertIn("tp_allreduce_sum_2d_checked", source)
+
+    def test_deterministic_tp64_has_twelve_receive_slots(self):
+        source = (HERE / "../utofu-tests/tp_allreduce.h").resolve().read_text()
+        self.assertIn("#define TP_AR_NSTEP  13", source)
+        self.assertIn("deterministic N=%d needs %d slots", source)
 
     def test_q8_converter_uses_high_quality_router_layout(self):
         source = (HERE / "k3_full_convert.c").read_text()
