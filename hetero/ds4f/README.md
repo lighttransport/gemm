@@ -698,10 +698,34 @@ Current measurements on this host (2026-08-05, batch 64, 43 layers) put all
 three expert routes behind the CPU-expert baseline: `resident-raw` measures
 ~7.2 tok/s and `widen` slower still, versus ~17 tok/s with the exact CPU
 expert fallback plus the GPU dense/shared path (`--hip-ordered-fp8-layers 43
---hip-fused-shared-ffn 1`). The historical 35.4 tok/s resident figure predates
-the current kernels; the RDNA4 raw/LUT expert GEMM and the per-layer streaming
-uploads are now the cost. The recommended stable-fast config is the CPU-expert
-dual (or single) run at 0/64 argmax mismatches.
+--hip-fused-shared-ffn 1`). The recommended stable-fast config is the
+CPU-expert dual (or single) run at 0/64 argmax mismatches.
+
+Why the GPU expert routes lose here, point by point (profiled):
+
+- **Streaming bandwidth, not the GEMM, dominates.** `resident-raw` with 20
+  resident layers still streams the other 23 layers' *entire* owned expert
+  bank (32 experts x ~12 MB = 384 MB/layer -> ~8.8 GB total). At the PCIe
+  gen3 x8 ~3.7 GB/s limit that is ~2.4 s of uploads, which is exactly the
+  37 ms/token the `experts` phase shows. No per-layer async prefetch can hide
+  it: 8.8 GB > the whole prefill's GPU-compute budget.
+- **Routed buckets are tiny at batch 64.** Top-6 of 256 experts over 64 tokens
+  leaves ~1--2 tokens per active expert. The raw-MXFP4 tile is 16 tokens wide,
+  so ~93% of every tile's M lanes are padding; the raw LUT GEMM measures
+  196 GFLOP/s at a full M=16 tile (widened-FP8: 279 GFLOP/s), which collapses
+  toward ~12--25 GFLOP/s effective at the real bucket sizes. The CPU
+  per-token AVX2 matvec has no such floor.
+- **Full residency does not fit.** All 43 layers resident would need ~16.5 GB
+  of experts on top of the ~6.7 GB dense bank on a 16 GB card, so non-resident
+  layers must stream, which loses anyway.
+- **Not a kernel regression.** The grouped and per-expert kernels share the
+  same tile arithmetic (196 GFLOP/s); the historical 35.4 tok/s resident
+  figure is not reproducible on this host and likely predates the current
+  bucket/routing behavior or a different card.
+
+The path forward for GPU experts is larger buckets (bigger batch or
+cross-expert packing), native MXFP4 hardware, or a much faster interconnect --
+not a kernel fix.
 
 ## Long-context stability and speculative-decode probe
 
