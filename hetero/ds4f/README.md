@@ -316,7 +316,10 @@ make -C hetero/ds4f forward-hip-test
 FP8 MLA/shared tensors into the persistent bank, and compares a CPU-default
 forward against the callback-enabled forward. It passed with six synchronous
 GPU calls plus one two-matrix async batch for shared `w1/w3`, matching argmax,
-`x_rel=9.1e-5`, and `logits_rel=3.3e-5`.
+`x_rel=9.1e-5`, and `logits_rel=3.3e-5`. (2026-08-05: this gate used to hang --
+`ds4f_runtime_options_debug_env()` clobbered the caller's `cfg` with the full
+43-layer default, so the one-layer synthetic model allocated a 155 GB arena.
+Fixed: the env config is applied only when `DS4F_MODEL` is explicitly set.)
 
 The real staged harness now keeps a stable bank ID on each layer-0 tensor and
 does the same forward A/B. With `DS4F_EP_SIZE=8` and one layer, all eight real
