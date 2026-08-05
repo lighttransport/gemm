@@ -543,9 +543,14 @@ Build and run the real staged gate with:
 ```bash
 make -B -C cuda/llm mmq_kernels.cubin
 make -C hetero/ds4f real-dual-test STAGE_DIR=/tmp/ds4f_nocopy_ep8 \
-  EP_SIZE=8 EP_RANK=0 LAYERS=43 BANK_LAYERS=43 THREADS=48 CMGS=4 \
+  EP_SIZE=8 EP_RANK=0 LAYERS=43 BANK_LAYERS=43 CMGS=4 \
   PREFILL_BATCH=64 PREFILL_CONTEXT=0
 ```
+
+`real-dual-test` defaults `THREADS` to `nproc` (32 on this 16-core Threadripper
+1950X). **Do not set `THREADS=48` here**: the spin-wait pool with 48 threads on
+32 hardware threads oversubscribes the CPU phases and drops the prefill from
+~43 to ~17 tok/s. Setting it to the core count is worth the full speedup.
 
 **2026-08-04 update.** The dual path is no longer a regression and is now
 exact: batch 64 measures **39.8--40.1 tok/s at 0/64 mismatches** and batch 128
@@ -607,15 +612,15 @@ NVIDIA card earn its place needs resident experts, not a better kernel.
 **Measured prefill case (2026-08-05).** `--dual-cuda-small-buckets 1` opts the
 owned MXFP4 experts into the padded small-bucket SM120 path (verified
 numerically correct at M=1--64 for the real N=2048/K=4096 shapes). At batch 64
-on 43 layers it measures **6.34 tok/s with 3/64 argmax mismatches** versus
-**17.6 tok/s at 0/64** for the exact CPU-expert default (`--hip-ordered-fp8-
-layers 43 --hip-fused-shared-ffn 1`). The 16.5 GB owned expert bank is used
-once per layer in order and does not fit the ~12 GB CUDA budget, so a single
-prefill pays the full PCIe weight upload; the SM120 activation quantization
-adds the argmax drift. CUDA experts only pay off for a long-lived server whose
-resident weight cache amortizes the upload across many prompts -- and even then
-the result is approximate. The exact prefill best is ROCm dense/shared + CPU
-experts.
+on 43 layers it measures **~6.5 tok/s with argmax mismatches** versus
+**~43 tok/s at 0/64** for the exact CPU-expert default (`--hip-ordered-fp8-
+layers 43 --hip-fused-shared-ffn 1`, threads = `nproc`). The 16.5 GB owned
+expert bank is used once per layer in order and does not fit the ~12 GB CUDA
+budget, so a single prefill pays the full PCIe weight upload; the SM120
+activation quantization adds the argmax drift. CUDA experts only pay off for a
+long-lived server whose resident weight cache amortizes the upload across many
+prompts -- and even then the result is approximate. The exact prefill best is
+ROCm dense/shared + CPU experts.
 
 The historical measurements below predate these fixes.
 
@@ -709,10 +714,10 @@ wrapper swapped `gpu_dense_ctx` out from under the raw HIP entry points).
 
 Current measurements on this host (2026-08-05, batch 64, 43 layers) put all
 three expert routes behind the CPU-expert baseline: `resident-raw` measures
-~7.2 tok/s and `widen` slower still, versus ~17 tok/s with the exact CPU
+~7.2 tok/s and `widen` slower still, versus ~43 tok/s with the exact CPU
 expert fallback plus the GPU dense/shared path (`--hip-ordered-fp8-layers 43
---hip-fused-shared-ffn 1`). The recommended stable-fast config is the
-CPU-expert dual (or single) run at 0/64 argmax mismatches.
+--hip-fused-shared-ffn 1`, threads = `nproc`). The recommended stable-fast
+config is the CPU-expert dual (or single) run at 0/64 argmax mismatches.
 
 Why the GPU expert routes lose here, point by point (profiled):
 

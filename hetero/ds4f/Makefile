@@ -111,7 +111,7 @@ real-dual-test: $(BUILD)/test_hip_ds4f_real
 	$(BUILD)/test_hip_ds4f_real --stage-dir $(STAGE_DIR) \
 		--ep-size $(or $(EP_SIZE),8) --ep-rank $(or $(EP_RANK),0) \
 		--layers $(or $(LAYERS),43) --bank-layers $(or $(BANK_LAYERS),43) \
-		--threads $(or $(THREADS),48) --cmgs $(or $(CMGS),4) \
+		--threads $(or $(THREADS),$(shell nproc)) --cmgs $(or $(CMGS),4) \
 		--prefill-batch $(or $(PREFILL_BATCH),64) \
 		--prefill-context $(or $(PREFILL_CONTEXT),0) \
 		--dual-gpu 1 --cuda-device $(or $(CUDA_DEVICE),0) \
