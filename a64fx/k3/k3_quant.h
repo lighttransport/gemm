@@ -372,6 +372,18 @@ static inline svint64_t k3_quant_a16_split_scale(int s_lo, int s_hi) {
 static inline int64_t k3_quant_acc_a16_total(svint64_t vacc) {
     return svaddv_s64(svptrue_b64(), vacc);
 }
+
+/* Same block fold as the q8 path, in the int64/f64 domain the a16 kernels
+ * accumulate in: one horizontal reduction per row rather than per block. */
+static inline svfloat64_t k3_quant_fold_block_a16(svfloat64_t facc,
+                                                  svint64_t vacc, float scale) {
+    svbool_t pd = svptrue_b64();
+    return svmla_n_f64_x(pd, facc, svcvt_f64_s64_x(pd, vacc), (double)scale);
+}
+
+static inline float k3_quant_fold_total_a16(svfloat64_t facc) {
+    return (float)svaddv_f64(svptrue_b64(), facc);
+}
 #endif
 
 #if defined(__ARM_FEATURE_SVE)
@@ -404,6 +416,21 @@ static inline svint32_t k3_quant_acc_quad16(svint32_t vacc, const int8_t *w,
 
 static inline int64_t k3_quant_acc_total(svint32_t vacc) {
     return (int64_t)svaddv_s32(svwhilelt_b32(0, 16), vacc);
+}
+
+/* Fold one block's int32 lane accumulator into a float accumulator, scaled by
+ * that block's own scale.  Lane summation is linear, so
+ *   sum_b d_b * sum_lanes(vacc_b) == sum_lanes(sum_b d_b * vacc_b),
+ * which lets a whole row finish with a single svaddv instead of one per
+ * 256-element block -- twelve of them per row at cols=3072. */
+static inline svfloat32_t k3_quant_fold_block(svfloat32_t facc, svint32_t vacc,
+                                              float scale) {
+    svbool_t lanes = svwhilelt_b32(0, 16);
+    return svmla_n_f32_x(lanes, facc, svcvt_f32_s32_x(lanes, vacc), scale);
+}
+
+static inline float k3_quant_fold_total(svfloat32_t facc) {
+    return svaddv_f32(svwhilelt_b32(0, 16), facc);
 }
 #endif
 
@@ -454,8 +481,11 @@ static inline int64_t k3_quant_dot_i8(const int8_t *a, const int8_t *b, int n) {
 static inline float k3_quant_iq2_xs_row(const block_iq2_xs *w,
                                         const int16_t *x, float xd, int nb) {
     float out = 0.0f; int8_t qw[32];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat64_t facc = svdup_f64(0.0);
+#endif
     for (int b = 0; b < nb; ++b) {
-        int64_t part = 0;
+        int64_t part = 0; (void)part;
 #if defined(__ARM_FEATURE_SVE)
         svint64_t vacc = svdup_s64(0);
 #endif
@@ -477,11 +507,15 @@ static inline float k3_quant_iq2_xs_row(const block_iq2_xs *w,
 #endif
         }
 #if defined(__ARM_FEATURE_SVE)
-        part = k3_quant_acc_a16_total(vacc);
+        facc = k3_quant_fold_block_a16(facc, vacc, ggml_fp16_to_fp32(w[b].d));
+#else
+        out += ggml_fp16_to_fp32(w[b].d) * (float)part;
 #endif
-        out += ggml_fp16_to_fp32(w[b].d) * xd * (float)part * 0.125f;
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total_a16(facc);
+#endif
+    return out * xd * 0.125f;
 }
 
 static inline float k3_quant_iq2_xxs_row(const block_iq2_xxs *w,
@@ -489,8 +523,11 @@ static inline float k3_quant_iq2_xxs_row(const block_iq2_xxs *w,
     /* (0.5 + k) * 0.25 is (1 + 2k) * 0.125, so the group scale is an integer
      * and the whole block can accumulate before one reduction. */
     float out = 0.0f; uint32_t aux[2]; int8_t qw[32], sg[32];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat64_t facc = svdup_f64(0.0);
+#endif
     for (int b = 0; b < nb; ++b) {
-        int64_t part = 0;
+        int64_t part = 0; (void)part;
 #if defined(__ARM_FEATURE_SVE)
         svint64_t vacc = svdup_s64(0);
 #endif
@@ -513,11 +550,15 @@ static inline float k3_quant_iq2_xxs_row(const block_iq2_xxs *w,
 #endif
         }
 #if defined(__ARM_FEATURE_SVE)
-        part = k3_quant_acc_a16_total(vacc);
+        facc = k3_quant_fold_block_a16(facc, vacc, ggml_fp16_to_fp32(w[b].d));
+#else
+        out += ggml_fp16_to_fp32(w[b].d) * (float)part;
 #endif
-        out += ggml_fp16_to_fp32(w[b].d) * xd * 0.125f * (float)part;
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total_a16(facc);
+#endif
+    return out * xd * 0.125f;
 }
 
 static inline float k3_quant_iq1_s_row(const block_iq1_s *w,
@@ -526,9 +567,12 @@ static inline float k3_quant_iq1_s_row(const block_iq1_s *w,
      * for the weight product and once for sum(x) against ones. */
     float out = 0.0f; const uint8_t *qs; const uint16_t *qh;
     int8_t qw[32];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat64_t facc = svdup_f64(0.0);
+#endif
     for (int b = 0; b < nb; ++b) {
         const block_iq1_s *wb = w + b; qs = wb->qs; qh = wb->qh;
-        int64_t acc = 0, dacc = 0;
+        int64_t acc = 0, dacc = 0; (void)acc; (void)dacc;
 #if defined(__ARM_FEATURE_SVE)
         svint64_t vacc = svdup_s64(0), vdacc = svdup_s64(0);
 #endif
@@ -552,21 +596,35 @@ static inline float k3_quant_iq1_s_row(const block_iq1_s *w,
             qs += 4;
         }
 #if defined(__ARM_FEATURE_SVE)
-        acc = k3_quant_acc_a16_total(vacc);
-        dacc = k3_quant_acc_a16_total(vdacc);
-#endif
-        out += ggml_fp16_to_fp32(wb->d) * xd *
+        /* acc + 0.125*dacc == (8*acc + dacc) / 8, and both are integers, so the
+         * two accumulators combine with a shift and an add before a *single*
+         * fold.  Folding them separately costs two f64 converts per block and
+         * measured ~10% slower than the per-block svaddv it replaced. */
+        svint64_t vcomb = svadd_s64_x(svptrue_b64(),
+                                      svlsl_n_s64_x(svptrue_b64(), vacc, 3),
+                                      vdacc);
+        facc = k3_quant_fold_block_a16(facc, vcomb,
+                                       ggml_fp16_to_fp32(wb->d) * 0.125f);
+#else
+        out += ggml_fp16_to_fp32(wb->d) *
                ((float)acc + 0.125f * (float)dacc);
+#endif
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total_a16(facc);
+#endif
+    return out * xd;
 }
 
 static inline float k3_quant_iq3_xxs_row(const block_iq3_xxs *w,
                                          const int16_t *x, float xd, int nb) {
     float out = 0.0f; int8_t qw[32], sg[32];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat64_t facc = svdup_f64(0.0);
+#endif
     for (int b = 0; b < nb; ++b) {
         const uint8_t *q3 = w[b].qs, *gas = w[b].qs + 64;
-        int64_t part = 0;
+        int64_t part = 0; (void)part;
 #if defined(__ARM_FEATURE_SVE)
         svint64_t vacc = svdup_s64(0);
 #endif
@@ -591,11 +649,15 @@ static inline float k3_quant_iq3_xxs_row(const block_iq3_xxs *w,
 #endif
         }
 #if defined(__ARM_FEATURE_SVE)
-        part = k3_quant_acc_a16_total(vacc);
+        facc = k3_quant_fold_block_a16(facc, vacc, ggml_fp16_to_fp32(w[b].d));
+#else
+        out += ggml_fp16_to_fp32(w[b].d) * (float)part;
 #endif
-        out += ggml_fp16_to_fp32(w[b].d) * xd * (float)part * 0.25f;
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total_a16(facc);
+#endif
+    return out * xd * 0.25f;
 }
 
 static inline float k3_quant_iq2_xs_q8_row(const block_iq2_xs *w,
@@ -606,10 +668,14 @@ static inline float k3_quant_iq2_xs_q8_row(const block_iq2_xs *w,
      * expanding IQ2_XXS up to a 256 KiB merged table costs ~9%.  Table size
      * alone does not predict this; each format had to be measured. */
     float out = 0.0f; int8_t qw[64];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t facc = svdup_f32(0.0f);
+#endif
     for (int b = 0; b < nb; ++b) {
-        int64_t part = 0;
 #if defined(__ARM_FEATURE_SVE)
         svint32_t vacc = svdup_s32(0);
+#else
+        int64_t part = 0;
 #endif
         for (int ib = 0; ib < 8; ib += 2) {
             int s[4];
@@ -628,11 +694,15 @@ static inline float k3_quant_iq2_xs_q8_row(const block_iq2_xs *w,
 #endif
         }
 #if defined(__ARM_FEATURE_SVE)
-        part = k3_quant_acc_total(vacc);
+        facc = k3_quant_fold_block(facc, vacc, ggml_fp16_to_fp32(w[b].d));
+#else
+        out += ggml_fp16_to_fp32(w[b].d) * (float)part;
 #endif
-        out += ggml_fp16_to_fp32(w[b].d) * xd * (float)part * 0.125f;
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total(facc);
+#endif
+    return out * xd * 0.125f;
 }
 
 static inline float k3_quant_iq2_xxs_q8_row(const block_iq2_xxs *w,
@@ -640,10 +710,14 @@ static inline float k3_quant_iq2_xxs_q8_row(const block_iq2_xxs *w,
     /* The per-group multiplier (0.5 + k) * 0.25 is (1 + 2k) * 0.125, so the
      * group scale is an integer and two groups can share one 64-lane dot. */
     float out = 0.0f; uint32_t aux[2]; int8_t qw[64], sg[64];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t facc = svdup_f32(0.0f);
+#endif
     for (int b = 0; b < nb; ++b) {
-        int64_t part = 0;
 #if defined(__ARM_FEATURE_SVE)
         svint32_t vacc = svdup_s32(0);
+#else
+        int64_t part = 0;
 #endif
         for (int ib = 0; ib < 8; ib += 2) {
             int s[2];
@@ -668,11 +742,15 @@ static inline float k3_quant_iq2_xxs_q8_row(const block_iq2_xxs *w,
 #endif
         }
 #if defined(__ARM_FEATURE_SVE)
-        part = k3_quant_acc_total(vacc);
+        facc = k3_quant_fold_block(facc, vacc, ggml_fp16_to_fp32(w[b].d));
+#else
+        out += ggml_fp16_to_fp32(w[b].d) * (float)part;
 #endif
-        out += ggml_fp16_to_fp32(w[b].d) * xd * 0.125f * (float)part;
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total(facc);
+#endif
+    return out * xd * 0.125f;
 }
 
 static inline float k3_quant_iq1_s_q8_row(const block_iq1_s *w,
@@ -681,11 +759,15 @@ static inline float k3_quant_iq1_s_q8_row(const block_iq1_s *w,
      * integer group scale, so a pair of groups shares one 64-lane dot for the
      * product and another for the sum-against-ones. */
     float out = 0.0f; int8_t qw[64];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t facc = svdup_f32(0.0f);
+#endif
     for (int b = 0; b < nb; ++b) {
         const uint8_t *qs = w[b].qs; const uint16_t *qh = w[b].qh;
-        int64_t acc = 0, dacc = 0;
 #if defined(__ARM_FEATURE_SVE)
         svint32_t vacc = svdup_s32(0), vdacc = svdup_s32(0);
+#else
+        int64_t acc = 0, dacc = 0;
 #endif
         for (int ib = 0; ib < 8; ib += 2) {
             int s[2], sd[2];
@@ -710,22 +792,36 @@ static inline float k3_quant_iq1_s_q8_row(const block_iq1_s *w,
 #endif
         }
 #if defined(__ARM_FEATURE_SVE)
-        acc = k3_quant_acc_total(vacc);
-        dacc = k3_quant_acc_total(vdacc);
-#endif
-        out += ggml_fp16_to_fp32(w[b].d) * xd *
+        /* acc + 0.125*dacc == (8*acc + dacc) / 8; combining the accumulators
+         * with a shift and an add costs one fold per block instead of two. */
+        svbool_t lanes16 = svwhilelt_b32(0, 16);
+        svint32_t vcomb = svadd_s32_x(lanes16,
+                                      svlsl_n_s32_x(lanes16, vacc, 3), vdacc);
+        facc = k3_quant_fold_block(facc, vcomb,
+                                   ggml_fp16_to_fp32(w[b].d) * 0.125f);
+#else
+        out += ggml_fp16_to_fp32(w[b].d) *
                ((float)acc + 0.125f * (float)dacc);
+#endif
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total(facc);
+#endif
+    return out * xd;
 }
 
 static inline float k3_quant_iq3_xxs_q8_row(const block_iq3_xxs *w,
                                             const int8_t *x, float xd, int nb) {
     float out = 0.0f; int8_t qw[64], sg[64];
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t facc = svdup_f32(0.0f);
+#endif
     for (int b = 0; b < nb; ++b) {
-        const uint8_t *q3 = w[b].qs, *gas = w[b].qs + 64; int64_t part = 0;
+        const uint8_t *q3 = w[b].qs, *gas = w[b].qs + 64;
 #if defined(__ARM_FEATURE_SVE)
         svint32_t vacc = svdup_s32(0);
+#else
+        int64_t part = 0;
 #endif
         for (int ib = 0; ib < 8; ib += 2) {
             int s[2];
@@ -752,11 +848,15 @@ static inline float k3_quant_iq3_xxs_q8_row(const block_iq3_xxs *w,
 #endif
         }
 #if defined(__ARM_FEATURE_SVE)
-        part = k3_quant_acc_total(vacc);
+        facc = k3_quant_fold_block(facc, vacc, ggml_fp16_to_fp32(w[b].d));
+#else
+        out += ggml_fp16_to_fp32(w[b].d) * (float)part;
 #endif
-        out += ggml_fp16_to_fp32(w[b].d) * xd * (float)part * 0.25f;
     }
-    return out;
+#if defined(__ARM_FEATURE_SVE)
+    out = k3_quant_fold_total(facc);
+#endif
+    return out * xd * 0.25f;
 }
 
 static inline float k3_quant_q8_0_a16_row(const block_q8_0 *w,
