@@ -400,6 +400,36 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
         dual_ds4f_prefill_attach_model(m, dual);
 }
 
+/* GPU-only batched-GEMM timing.  Whole-phase prefill numbers mix in CPU
+ * rmsnorm/RoPE/SwiGLU/expert work, so they move with host load; this times
+ * repeated device GEMMs on real bound tensors and nothing else. */
+static void gemm_bench(ds4f_model *m, hip_ds4f_dense *hip, int M) {
+    struct { const char *name; const ds4f_tensor *t; } cases[] = {
+        { "wq_b",  &m->layers[0].wq_b  },
+        { "wo_b",  &m->layers[0].wo_b  },
+        { "sh_w1", &m->layers[0].sh_w1 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const ds4f_tensor *t = cases[i].t;
+        if (!t || t->gpu_id < 0) continue;
+        int N = t->rows, K = t->cols;
+        float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)M * K * 4, 256, 0);
+        float *y = (float *)ds4f_mem_alloc(m->mem, (size_t)M * N * 4, 256, 0);
+        if (!x || !y) return;
+        for (size_t j = 0; j < (size_t)M * K; ++j)
+            x[j] = (float)((j * 17) % 101 - 50) / 31.0f;
+        if (hip_ds4f_dense_gemm_tensor(hip, y, t, x, M, N, K) != 0) continue;
+        enum { ITERS = 20 };
+        double t0 = wall_seconds();
+        for (int it = 0; it < ITERS; ++it)
+            if (hip_ds4f_dense_gemm_tensor(hip, y, t, x, M, N, K) != 0) break;
+        double el = wall_seconds() - t0;
+        double gflop = 2.0 * (double)M * N * K * ITERS / 1e9;
+        printf("gemm bench: %-5s M=%d N=%d K=%d %.3f ms/call %.1f GFLOP/s\n",
+               cases[i].name, M, N, K, el * 1000.0 / ITERS, gflop / el);
+    }
+}
+
 static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
                              dual_ds4f_prefill *dual, int batch,
                              int context, const ds4f_runtime_options *opt) {
@@ -612,7 +642,7 @@ int main(int argc, char **argv) {
     int dual_cuda_mxfp4 = 1, dual_cuda_terms = 1;
     int mxfp4_test = 0, mxfp4_widened_test = 0;
     int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
-    int decode_verify_steps = 0;
+    int decode_verify_steps = 0, gemm_bench_m = 0;
     /* Load JSON first so explicit command-line values have the conventional
      * higher precedence regardless of where --config appears in argv. */
     for (int i = 1; i + 1 < argc; i++)
@@ -640,6 +670,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--pos0") == 0 && i + 1 < argc) pos0 = atoi(argv[++i]);
         else if (strcmp(a, "--warm") == 0 && i + 1 < argc) warm = atoi(argv[++i]);
         else if (strcmp(a, "--decode-verify") == 0 && i + 1 < argc) decode_verify_steps = atoi(argv[++i]);
+        else if (strcmp(a, "--gemm-bench") == 0 && i + 1 < argc) gemm_bench_m = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-batch") == 0 && i + 1 < argc) prefill_batch = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-context") == 0 && i + 1 < argc) prefill_context = atoi(argv[++i]);
         else if (strcmp(a, "--hip-device") == 0 && i + 1 < argc) opt.hip_device = atoi(argv[++i]);
@@ -849,6 +880,7 @@ int main(int argc, char **argv) {
         /* With one layer this is the small A/B gate; with the full bank it is
          * the production multi-layer attachment check.  EP>1 intentionally
          * remains a mechanical path check because the local shard is partial. */
+        if (gemm_bench_m > 0) gemm_bench(m, hip, gemm_bench_m);
         pass &= forward_ab(m, hip, &opt);
         if (decode_verify_steps > 0)
             pass &= decode_verify(m, hip, decode_verify_steps, pos0, warm, &opt);

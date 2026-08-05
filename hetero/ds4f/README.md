@@ -485,6 +485,47 @@ still cross host memory, so a device-resident activation arena and fused GPU
 attention/norm/MLP are the remaining route toward a full-model 30-tok/s
 prompt-rate result.
 
+#### GPU prefill GEMM
+
+`--gemm-bench M` times repeated device GEMMs on real bound layer-0 tensors and
+nothing else. Use it instead of the whole-phase prefill numbers when the host
+is busy: the `gpu=` phase columns still contain CPU rmsnorm/RoPE/SwiGLU and
+the routed-expert phase, so they move with load average.
+
+Best-of-5 at M=64, batch-64 prefill shapes:
+
+| tensor | N x K | before | after | |
+|---|---|---:|---:|---:|
+| `wq_b`  | 32768 x 1024 | 4.637 ms / 926 GFLOP/s | 3.633 ms / 1182 | 1.28x |
+| `wo_b`  | 4096 x 8192  | 4.509 ms / 953 GFLOP/s | 2.707 ms / 1587 | 1.67x |
+| `sh_w1` | 2048 x 4096  | 1.471 ms / 730 GFLOP/s | 0.792 ms / 1355 | 1.86x |
+
+Two changes:
+
+1. **The FP8 tile staged `smB` four times per k-step**, paying eight
+   `__syncthreads` per 16 columns of K for four outputs per thread. It now
+   stages one `smB[16][65]` and pays two. The odd row stride matters: the tile
+   is indexed `[tx][...]` on the staging store, and a 64-float stride puts
+   every lane in LDS bank 0. Worth about 1.26x on its own. The ordered kernel
+   keeps its per-output accumulation order, so `--hip-ordered-fp8-layers`
+   remains exact; the lane index is now written `i & 7` directly, which is
+   provably what `(k - kb + i) & 7` evaluates to since `k - kb` always steps
+   by 16.
+2. **The GEMM staging buffers were pageable.** A batch-64 `wq_b` GEMM moves
+   8.4 MB back per call, so the driver was bouncing it through its own staging
+   buffer. `ensure_gemm_host_pack` now prefers `hipHostMalloc` and both
+   directions route through it. This is where `wo_b` and `sh_w1` get most of
+   their gain.
+
+`wq_b` barely moved because it is **transfer-bound, not compute-bound**: 8.4 MB
+over PCIe gen3 x8 is a ~1.3 ms floor against roughly 0.9 ms of arithmetic.
+Nothing in the kernel can fix that. The remaining structural win for GPU
+prefill is a device-resident activation arena so projection intermediates stop
+crossing host memory between chained GEMMs -- which needs GPU rmsnorm / SiLU /
+SwiGLU kernels, since today the CPU work between `wq_a -> wq_b`,
+`wo_a -> wo_b` and `sh_w1/w3 -> sh_w2` forces every intermediate back to the
+host.
+
 #### SM120 CUDA + RDNA4 dual-GPU prefill
 
 The SM120 path is implemented by `cuda/llm/mmq_kernels.cubin` and the

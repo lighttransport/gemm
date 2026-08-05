@@ -1423,16 +1423,25 @@ int hip_ds4f_dense_prefill_attention(
     return 0;
 }
 
+/* Prefer pinned memory for the GEMM staging buffers.  A batch-64 wq_b GEMM
+ * downloads 8.4 MB per call, so on this host's PCIe gen3 x8 link the transfer
+ * costs more than the arithmetic; a pageable copy makes the driver bounce it
+ * through its own staging buffer on top of that.  Falls back to arena memory
+ * when the driver has no hipHostMalloc. */
 static int ensure_gemm_host_pack(hip_ds4f_dense *ctx, size_t x_bytes, size_t y_bytes) {
     if (x_bytes > ctx->gemm_x_pack_bytes) {
-        float *p = (float *)ds4f_mem_alloc(ctx->mem, x_bytes, 64, 0);
+        void *p = NULL;
+        if (!hipHostMalloc || hipHostMalloc(&p, x_bytes, hipHostMallocDefault) != hipSuccess)
+            p = ds4f_mem_alloc(ctx->mem, x_bytes, 64, 0);
         if (!p) return -1;
-        ctx->gemm_x_pack = p; ctx->gemm_x_pack_bytes = x_bytes;
+        ctx->gemm_x_pack = (float *)p; ctx->gemm_x_pack_bytes = x_bytes;
     }
     if (y_bytes > ctx->gemm_y_pack_bytes) {
-        float *p = (float *)ds4f_mem_alloc(ctx->mem, y_bytes, 64, 0);
+        void *p = NULL;
+        if (!hipHostMalloc || hipHostMalloc(&p, y_bytes, hipHostMallocDefault) != hipSuccess)
+            p = ds4f_mem_alloc(ctx->mem, y_bytes, 64, 0);
         if (!p) return -1;
-        ctx->gemm_y_pack = p; ctx->gemm_y_pack_bytes = y_bytes;
+        ctx->gemm_y_pack = (float *)p; ctx->gemm_y_pack_bytes = y_bytes;
     }
     return 0;
 }
@@ -1496,6 +1505,14 @@ int hip_ds4f_dense_gemm_tensor(
         if (Ystride != N) yh = ctx->gemm_y_pack;
     }
     if (ensure_gemm_vectors(ctx, x_bytes, y_bytes) != 0) return -1;
+    /* Route both directions through the pinned pack buffers even when the
+     * strides already match, so the transfers are real async DMA. */
+    if (ensure_gemm_host_pack(ctx, x_bytes, y_bytes) == 0) {
+        if (xh != ctx->gemm_x_pack) {
+            memcpy(ctx->gemm_x_pack, xh, x_bytes);
+            xh = ctx->gemm_x_pack;
+        }
+    }
     if (hipMemcpy(ctx->gemm_dx, xh, x_bytes, hipMemcpyHostToDevice) != hipSuccess)
         return -1;
 
@@ -1550,7 +1567,14 @@ int hip_ds4f_dense_gemm_tensor(
     }
     if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess)
         return -1;
-    if (hipMemcpy(yh, ctx->gemm_dy, y_bytes, hipMemcpyDeviceToHost) != hipSuccess)
+    if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= y_bytes) {
+        if (hipMemcpyAsync(ctx->gemm_y_pack, ctx->gemm_dy, y_bytes,
+                           hipMemcpyDeviceToHost, ctx->stream) != hipSuccess ||
+            hipStreamSynchronize(ctx->stream) != hipSuccess)
+            return -1;
+        if (yh != ctx->gemm_y_pack) memcpy(yh, ctx->gemm_y_pack, y_bytes);
+        else yh = ctx->gemm_y_pack;
+    } else if (hipMemcpy(yh, ctx->gemm_dy, y_bytes, hipMemcpyDeviceToHost) != hipSuccess)
         return -1;
     if (Ystride != N) for (int mm = 0; mm < M; mm++)
         memcpy(dst + (size_t)mm*Ystride, yh + (size_t)mm*N, (size_t)N*sizeof(float));
