@@ -462,7 +462,7 @@ static void gemm_bench(ds4f_model *m, hip_ds4f_dense *hip, int M) {
 static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
                              dual_ds4f_prefill *dual, int batch,
                              int context, const ds4f_runtime_options *opt,
-                             int repeat, int approx) {
+                             int repeat, int approx, int skip_cpu_ref) {
     if (!m->exact || m->mhc || m->tierb2 || m->int8_kv) {
         fprintf(stderr, "real hybrid prefill: requires exact && !mhc && !tierb2 && !int8_kv\n");
         return 0;
@@ -485,7 +485,8 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
     float *cpu_logits = diag
         ? (float *)ds4f_mem_alloc(m->mem, (size_t)batch * hrows * sizeof(float), 256, 0)
         : NULL;
-    double cpu_prof[DS4F_NPHASE], gpu_prof[DS4F_NPHASE];
+    double cpu_prof[DS4F_NPHASE] = {0}, gpu_prof[DS4F_NPHASE];
+    double cpu_s = 0.0, warm_cpu_s = 0.0, warm_gpu_s = 0.0, t0 = 0.0;
     if (!x || !cpu_tok || !gpu_tok || (warm_batch > 0 && (!warm_x || !warm_tok)) ||
         (diag && !cpu_logits)) return 0;
     if (context < 0 || context + batch > m->cfg.max_pos) {
@@ -497,28 +498,31 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
     fill_prefill_inputs(x, batch, C, context);
     if (warm_batch > 0) fill_prefill_inputs(warm_x, warm_batch, C, context - warm_batch);
 
-    /* First run the same batched forward with all device hooks detached. */
-    m->gpu_dense_ctx = NULL;
-    m->gpu_dense_matvec = NULL;
-    m->gpu_dense_async_multi = NULL;
-    m->gpu_dense_wait = NULL;
-    m->gpu_dense_blockdiag = NULL;
-    m->gpu_dense_gemm = NULL;
-    m->gpu_dense_gemm_multi = NULL;
-    m->gpu_dense_mixed = 0;
-    memset(m->prof, 0, sizeof(m->prof));
-    double warm_cpu_s = 0.0, warm_gpu_s = 0.0;
-    if (warm_batch > 0) {
-        double tw = wall_seconds();
-        ds4f_forward_prefill(m, warm_x, warm_batch, context - warm_batch, warm_tok);
-        warm_cpu_s = wall_seconds() - tw;
+    /* First run the same batched forward with all device hooks detached.  For
+     * the large-batch throughput probe this reference is ~minutes; skip it
+     * (--skip-cpu-ref) and report the GPU rate only. */
+    if (!skip_cpu_ref) {
+        m->gpu_dense_ctx = NULL;
+        m->gpu_dense_matvec = NULL;
+        m->gpu_dense_async_multi = NULL;
+        m->gpu_dense_wait = NULL;
+        m->gpu_dense_blockdiag = NULL;
+        m->gpu_dense_gemm = NULL;
+        m->gpu_dense_gemm_multi = NULL;
+        m->gpu_dense_mixed = 0;
+        memset(m->prof, 0, sizeof(m->prof));
+        if (warm_batch > 0) {
+            double tw = wall_seconds();
+            ds4f_forward_prefill(m, warm_x, warm_batch, context - warm_batch, warm_tok);
+            warm_cpu_s = wall_seconds() - tw;
+        }
+        t0 = wall_seconds();
+        ds4f_forward_prefill(m, x, batch, context, cpu_tok);
+        cpu_s = wall_seconds() - t0;
+        memcpy(cpu_prof, m->prof, sizeof(cpu_prof));
+        if (diag) memcpy(cpu_logits, m->p_logits,
+                         (size_t)batch * hrows * sizeof(float));
     }
-    double t0 = wall_seconds();
-    ds4f_forward_prefill(m, x, batch, context, cpu_tok);
-    double cpu_s = wall_seconds() - t0;
-    memcpy(cpu_prof, m->prof, sizeof(cpu_prof));
-    if (diag) memcpy(cpu_logits, m->p_logits,
-                     (size_t)batch * hrows * sizeof(float));
 
     attach_prefill_backend(m, hip, dual, opt);
     if (dual) {
@@ -555,10 +559,12 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
     }
 
     int mismatches = 0;
-    for (int i = 0; i < batch; i++) if (cpu_tok[i] != gpu_tok[i]) mismatches++;
+    if (!skip_cpu_ref)
+        for (int i = 0; i < batch; i++) if (cpu_tok[i] != gpu_tok[i]) mismatches++;
     printf("real hybrid prefill: layers=%d context=%d batch=%d cpu=%.3f tok/s gpu=%.3f tok/s "
            "speedup=%.3fx argmax_mismatch=%d", m->cfg.n_layers, context, batch,
-           batch / cpu_s, batch / gpu_s, cpu_s / gpu_s, mismatches);
+           skip_cpu_ref ? 0.0 : batch / cpu_s, batch / gpu_s,
+           skip_cpu_ref ? 0.0 : cpu_s / gpu_s, mismatches);
     if (warm_batch > 0)
         printf(" warm_tail=%d cpu=%.3fs gpu=%.3fs", warm_batch, warm_cpu_s, warm_gpu_s);
     putchar('\n');
@@ -683,6 +689,7 @@ int main(int argc, char **argv) {
     int mxfp4_test = 0, mxfp4_widened_test = 0;
     int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
     int prefill_repeat = 1;
+    int skip_cpu_ref = 0;
     int decode_verify_steps = 0, gemm_bench_m = 0;
     /* Load JSON first so explicit command-line values have the conventional
      * higher precedence regardless of where --config appears in argv. */
@@ -716,6 +723,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--prefill-batch") == 0 && i + 1 < argc) prefill_batch = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-context") == 0 && i + 1 < argc) prefill_context = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-repeat") == 0 && i + 1 < argc) prefill_repeat = atoi(argv[++i]);
+        else if (strcmp(a, "--skip-cpu-ref") == 0 && i + 1 < argc) skip_cpu_ref = atoi(argv[++i]);
         else if (strcmp(a, "--hip-device") == 0 && i + 1 < argc) opt.hip_device = atoi(argv[++i]);
         else if (strcmp(a, "--hip-verbose") == 0 && i + 1 < argc) opt.hip_verbose = atoi(argv[++i]);
         else if (strcmp(a, "--hip-async") == 0 && i + 1 < argc) opt.hip_async = atoi(argv[++i]);
@@ -942,7 +950,7 @@ int main(int argc, char **argv) {
             pass &= decode_verify(m, hip, decode_verify_steps, pos0, warm, &opt);
         if (iters > 0) pass &= benchmark_forward(m, hip, iters, pos0, warm, &opt);
         if (prefill_batch > 1)
-            pass &= benchmark_prefill(m, hip, dual, prefill_batch, prefill_context, &opt, prefill_repeat, dual_cuda_small);
+            pass &= benchmark_prefill(m, hip, dual, prefill_batch, prefill_context, &opt, prefill_repeat, dual_cuda_small, skip_cpu_ref);
     }
     printf("%s\n", pass ? "PASS" : "FAIL");
 
