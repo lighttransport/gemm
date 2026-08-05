@@ -2,12 +2,23 @@ CC = fcc
 CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -I../../common
 WARN = -Wall -Wextra -Wpedantic -Wno-unused-function
 
-.PHONY: all runner full-runner full-convert full-runner-test full-12n-regression fast-12n-decode test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
+.PHONY: all runner full-runner full-convert full-runner-test iq1-text test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
 all: k3_kernel_test k3_quant_kernel_test k3_gguf_layer_bench k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe
 
 runner: k3_ep_runner
 
 full-runner: k3_full_runner
+
+# Built with the site Clang/llama.cpp RPC libraries; used only by the 32-node
+# IQ1 GGUF text smoke job.
+iq1-text:
+	CLANG=/vol0004/apps/r/OSS_CN/llvm-21.1.0/own_clangfx/clang-comp/bin/clang++; \
+	B=/home/u14346/work/llama.cpp/build-a64fx-rpc-clang; \
+	$$CLANG -std=c++17 -O3 -march=armv8.2-a+sve \
+		-I/home/u14346/work/llama.cpp/include -I/home/u14346/work/llama.cpp/ggml/include \
+		k3_iq1_text_runner.cpp -L$$B/bin -Wl,-rpath,$$B/bin \
+		-lllama -lggml -lggml-rpc -lggml-cpu -lggml-base -lomp -lstdc++fs \
+		-pthread -ldl -lm -o k3_iq1_text_runner
 
 full-convert: k3_full_convert
 
