@@ -11,6 +11,7 @@ NODES=${PJM_MPI_PROC:-96}
 TP_NODES=0
 LAYERS=1
 TOKENS=2
+CACHE_TOKENS=0
 THREADS=48
 KDA_THREADS=8
 FUSED_THREADS=0
@@ -41,7 +42,7 @@ PREFETCH_THREADS=0
 
 usage() {
     cat >&2 <<EOF
-usage: $0 [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]
+usage: $0 [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N] [--cache-tokens N]
           [--threads N] [--kda-threads N] [--fused-threads N] [--layer N] [--experts LIST] [--chunk-mib N]
           [--model-dir DIR] [--stage-dir DIR] [--result-dir DIR]
           [--cache-load PATH] [--cache-save PATH]
@@ -66,6 +67,7 @@ while (( $# )); do
         --tp-nodes) need_value "$@"; TP_NODES=$2; shift 2;;
         --layers) need_value "$@"; LAYERS=$2; shift 2;;
         --tokens) need_value "$@"; TOKENS=$2; shift 2;;
+        --cache-tokens) need_value "$@"; CACHE_TOKENS=$2; shift 2;;
         --threads) need_value "$@"; THREADS=$2; shift 2;;
         --kda-threads) need_value "$@"; KDA_THREADS=$2; shift 2;;
         --fused-threads) need_value "$@"; FUSED_THREADS=$2; shift 2;;
@@ -102,10 +104,11 @@ if (( STAGE_ONLY )) && [[ "$MODE" != real && "$MODE" != hybrid ]]; then
     echo "$0: --stage-only requires --mode real or hybrid" >&2
     exit 2
 fi
-for value in "$NODES" "$TP_NODES" "$LAYERS" "$TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$MIN_AVAILABLE_MIB" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
+for value in "$NODES" "$TP_NODES" "$LAYERS" "$TOKENS" "$CACHE_TOKENS" "$THREADS" "$KDA_THREADS" "$FUSED_THREADS" "$LAYER" "$CHUNK_MIB" "$HEARTBEAT_TOKENS" "$MIN_AVAILABLE_MIB" "$COMM_ROBUST" "$COMM_ACK" "$COMM_DETERMINISTIC" "$COMM_POLL_SPINS" "$PREFETCH_MIB" "$PREFETCH_THREADS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "$0: numeric options must be integers" >&2; exit 2; }
 done
 (( FUSED_THREADS == 0 )) && FUSED_THREADS=$THREADS
+(( CACHE_TOKENS == 0 )) && CACHE_TOKENS=$TOKENS
 (( TP_NODES == 0 )) && { (( NODES < 96 )) && TP_NODES=$NODES || TP_NODES=96; }
 (( NODES > 0 && LAYERS > 0 && TOKENS > 0 && THREADS > 0 && THREADS <= 48 && KDA_THREADS > 0 && KDA_THREADS <= THREADS && FUSED_THREADS > 0 && FUSED_THREADS <= THREADS && CHUNK_MIB > 0 )) || {
     echo "$0: invalid numeric option range" >&2; exit 2; }
@@ -272,7 +275,7 @@ timing_begin decode_runner
 mpiexec -np "$NODES" -of-proc "$RUN_OUTPUT_PREFIX" \
     "$SCRIPT_DIR/k3_ep_runner" --mode "$MODE" --nodes "$NODES" \
     --tp-nodes "$TP_NODES" \
-    --layers "$LAYERS" --tokens "$TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --min-available-mib "$MIN_AVAILABLE_MIB" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-ack "$COMM_ACK" --comm-deterministic "$COMM_DETERMINISTIC" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
+    --layers "$LAYERS" --tokens "$TOKENS" --cache-tokens "$CACHE_TOKENS" --threads "$THREADS" --kda-threads "$KDA_THREADS" --fused-threads "$FUSED_THREADS" --layer "$LAYER" --heartbeat-tokens "$HEARTBEAT_TOKENS" --min-available-mib "$MIN_AVAILABLE_MIB" --ar-groups "$AR_GROUPS" --comm-robust "$COMM_ROBUST" --comm-ack "$COMM_ACK" --comm-deterministic "$COMM_DETERMINISTIC" --comm-poll-spins "$COMM_POLL_SPINS" --prefetch-mib "$PREFETCH_MIB" --prefetch-threads "$PREFETCH_THREADS" \
     --stage-dir "$STAGE_DIR" --status-dir "$RESULT_DIR" --topo "$RESULT_DIR/tofu_topo.txt" \
     "${RUNNER_EXTRA[@]}"
 runner_rc=$?

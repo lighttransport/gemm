@@ -71,6 +71,7 @@ typedef struct {
     int tp_nodes;
     int layers;
     int tokens;
+    int cache_tokens;
     int threads;
     int layer;
     int profile;
@@ -121,7 +122,7 @@ static void profile_add(double sum[6],double high[6],int phase,double seconds){
 }
 static void usage(const char *p){
     fprintf(stderr,
-        "usage: %s [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N]\n"
+        "usage: %s [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N] [--cache-tokens N]\n"
         "          [--threads N] [--layer N] [--stage-dir DIR]\n"
         "          [--status-dir DIR] [--cache-load PATH] [--cache-save PATH]\n"
         "          [--topo FILE] [--profile] [--kda-threads N]\n"
@@ -156,6 +157,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--tp-nodes")){VALUE();if(parse_int(a,argv[i],1,96,&o->tp_nodes))return-1;}
         else if(!strcmp(a,"--layers")){VALUE();if(parse_int(a,argv[i],1,93,&o->layers))return-1;}
         else if(!strcmp(a,"--tokens")){VALUE();if(parse_int(a,argv[i],1,1048576,&o->tokens))return-1;}
+        else if(!strcmp(a,"--cache-tokens")){VALUE();if(parse_int(a,argv[i],1,1048576,&o->cache_tokens))return-1;}
         else if(!strcmp(a,"--threads")){VALUE();if(parse_int(a,argv[i],1,48,&o->threads))return-1;}
         else if(!strcmp(a,"--kda-threads")){VALUE();if(parse_int(a,argv[i],1,48,&o->kda_threads))return-1;}
         else if(!strcmp(a,"--fused-threads")){VALUE();if(parse_int(a,argv[i],1,48,&o->fused_threads))return-1;}
@@ -185,6 +187,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
 #undef VALUE
     }
     if(!o->tp_nodes)o->tp_nodes=o->nodes<96?o->nodes:96;
+    if(!o->cache_tokens)o->cache_tokens=o->tokens;
     if(o->tp_nodes>96||o->nodes%o->tp_nodes){
         fprintf(stderr,"k3_ep_runner: --tp-nodes must be in [1,96] and divide --nodes (%d), got %d\n",
                 o->nodes,o->tp_nodes);return-1;}
@@ -842,10 +845,11 @@ int main(int argc,char **argv){
     int state_slot[93],kda_layers=0,mla_layers=0;
     for(int l=0;l<opt.layers;++l)state_slot[l]=layer_is_kda(schedule_layer+l)?kda_layers++:mla_layers++;
     size_t kda_elems=(size_t)kda_layers*local_heads*K3_HEAD_DIM*K3_HEAD_DIM;
-    size_t mla_key_elems=(size_t)mla_layers*local_heads*opt.tokens*192;
-    size_t mla_value_elems=(size_t)mla_layers*local_heads*opt.tokens*K3_HEAD_DIM;
+    int cache_tokens=opt.cache_tokens;
+    size_t mla_key_elems=(size_t)mla_layers*local_heads*cache_tokens*192;
+    size_t mla_value_elems=(size_t)mla_layers*local_heads*cache_tokens*K3_HEAD_DIM;
     size_t cache_element_bytes=opt.mla_cache_int8?sizeof(int8_t):(opt.mla_cache_bf16?sizeof(uint16_t):sizeof(float));
-    size_t mla_scale_elems=(size_t)mla_layers*local_heads*opt.tokens;
+    size_t mla_scale_elems=(size_t)mla_layers*local_heads*cache_tokens;
     size_t state_bytes=kda_elems*sizeof(float)+(mla_key_elems+mla_value_elems)*cache_element_bytes+
         (opt.mla_cache_int8?2*mla_scale_elems*sizeof(float):0);
     size_t available=k3_mem_available_bytes(),reserve=(size_t)6<<30;
@@ -908,7 +912,7 @@ int main(int argc,char **argv){
     float cache_running_max=0.0f;
     if(opt.cache_load){
         int cache_tokens=-1,cache_ready=1,cache_load_rc=0,cache_collective_ok=1;
-        cache_load_rc=k3_cache_load(&opt,local_heads,opt.tokens,kda_elems,mla_key_elems,mla_value_elems,cache_element_bytes,&cache_tokens,
+        cache_load_rc=k3_cache_load(&opt,local_heads,cache_tokens,kda_elems,mla_key_elems,mla_value_elems,cache_element_bytes,&cache_tokens,
             latent,kda_state,mla_keys,mla_values);
         if(cache_load_rc||cache_tokens<0||cache_tokens>opt.tokens)cache_ready=0;
         /* Every rank must join this reduction, even when its local shard
@@ -986,7 +990,7 @@ int main(int argc,char **argv){
                     w1,w2,w3,route,gate,up,opt.fused_threads,opt.profile,ft))finite=0;
                 if(opt.profile){profile_add(phase,phase_max,0,ft[0]);profile_add(phase,phase_max,2,ft[1]);}}
             else{pt=opt.profile?now_sec():0;
-                synthetic_attention_partial(shared,latent,state_slot[layer],global_layer,token,opt.tokens,local_heads,first_head,
+                synthetic_attention_partial(shared,latent,state_slot[layer],global_layer,token,cache_tokens,local_heads,first_head,
                     kda_state,mla_keys,mla_values,opt.mla_cache_bf16,opt.mla_cache_int8,mla_key_scales,mla_value_scales,
                     q,k,v,decay,attn_out,mla_scratch,mla_stats,
                     &cache_running_max,layer_is_kda(global_layer)?opt.kda_threads:opt.threads);
@@ -1069,7 +1073,7 @@ int main(int argc,char **argv){
     float checksum_bounds[2]={(float)checksum_local,-(float)checksum_local};
     int cache_save_rc=0;
     if(opt.cache_save&&!comm_failed&&tokens_completed>0){
-        cache_save_rc=k3_cache_save(&opt,local_heads,opt.tokens,kda_elems,mla_key_elems,mla_value_elems,cache_element_bytes,
+        cache_save_rc=k3_cache_save(&opt,local_heads,cache_tokens,kda_elems,mla_key_elems,mla_value_elems,cache_element_bytes,
             tokens_completed,latent,kda_state,mla_keys,mla_values);
         if(cache_save_rc&&g_rank==0)fprintf(stderr,"k3_ep_runner rank %d: cache save failed: %s\n",g_rank,strerror(cache_save_rc));
     }

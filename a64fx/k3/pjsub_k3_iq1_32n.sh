@@ -19,5 +19,11 @@ mpiexec -np 32 -of-proc "$OUT/bench" sh -c '
     exec "$1/k3_gguf_layer_bench" "$2/rank$(printf "%03d" "$r").manifest" \
         "$2/rank$(printf "%03d" "$r").blob" "$3"
 ' sh "$S" "$OUT" "$REPS"
+"$S/run_k3_ep.sh" --mode dummy --nodes 32 --tp-nodes 32 \
+    --layers 1 --layer 3 --tokens 1 --cache-tokens 16384 \
+    --threads 47 --kda-threads 8 --fused-threads 47 \
+    --mla-cache-int8 --heartbeat-tokens 1 --min-available-mib 2048 \
+    --ar-groups 2 --comm-robust 2 --result-dir "$OUT/context-preflight"
 echo "K3_IQ1_STAGE_READY nodes=32 layer=$LAYER output=$OUT"
 echo "K3_IQ1_DEQUANT_CHECK nodes=32 layer=$LAYER kernel=${K3_QUANT_KERNEL:-sve-q8} logs=$OUT/bench.*"
+echo "K3_IQ1_CONTEXT_CHECK nodes=32 cache_tokens=16384 cache=int8 result=$OUT/context-preflight"
