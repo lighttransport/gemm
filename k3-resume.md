@@ -208,3 +208,104 @@ pjsub a64fx/k3/pjsub_k3_probe_96n_short.sh
 - Harness oracle hardening: `run_12n_cache_matrix.sh` now normalizes relative result roots to absolute paths, captures each phase log, and requires `rc=0`, all rank status markers, at least one group `K3_RESULT`, zero disagreement, and the expected token count (`0` for full-cache verification). Added `a64fx/k3/test_cache_matrix_script.py` covering a complete lifecycle and missing-rank rejection. The real relative-root TP12 BF16 `32->64` run passed all phases with `12/12` markers and zero disagreement: `a64fx/k3/logs/cache-matrix-oracle-pass-1785499083`. Focused launcher/llmgr plus harness suite: `95` tests passed.
 - Harness negative-result coverage: the reusable harness test now also rejects a complete rank set with nonzero `disagreement`; the dedicated harness suite passes `3/3`.
 - Cache artifact-integrity coverage: the matrix harness now requires exactly `NODES` canonical cache shard files after save and in-place phases, catching silent local cache-save failures that aggregate launcher status can miss. TP12 BF16 `32->64` real run passed all lifecycle phases, `12/12` rank markers, exactly 12 shards, zero disagreement, and zero-token verification. Results: `a64fx/k3/logs/cache-matrix-artifact-1785499214`.
+
+## Laguna S-2.1 12-node decode status (as of 2026-08-01)
+
+- The latest 12-node Laguna S-2.1 long-context quality checkpoints available in this
+  tree are the following July 30 runs (all from 12-node int4):
+  - `a64fx/laguna-s21/gen_20260730-221203` (16K+ context, 16,377 prefill tokens, decode 123 tok at 12.1 tok/s)
+  - `a64fx/laguna-s21/gen_20260730-222040` (32K+ context, 32,767 prefill tokens, decode 123 tok at 7.8 tok/s)
+  - `a64fx/laguna-s21/gen_20260730-230226` (32K+ context, 32,767 prefill tokens, decode 123 tok at 9.9 tok/s)
+  - `a64fx/laguna-s21/gen_20260730-232203` (32K+ context, 32,767 prefill tokens, decode 123 tok at 10.0 tok/s)
+  - `a64fx/laguna-s21/gen_20260730-234401` (32K+ context, 32,767 prefill tokens, decode 123 tok at 17.0 tok/s)
+  - `a64fx/laguna-s21/gen_20260731-005642` (65K+ context, 65,525 prefill tokens, decode 123 tok at 12.7 tok/s)
+- Generation quality on those long-context runs was consistent:
+  - Sampling line in all runs: `temp=0.70 top_k=20 top_p=0.95 min_p=0.00`.
+  - `lockstep: all ... token picks agreed across ranks` in all runs.
+  - Decoded output from `gen.ids` reconstructs to valid C++ solutions for the
+    requested fenced-program recovery task in each run (exactly the expected
+    `assert`/`cout` block with `314159`, `cobalt-orchid`, `271828`).
+- A job from `output.49899304` remains the most recent non-user-facing run artifact in
+  this workspace and is a staging regression case: `laguna_s21_stage` was invoked with
+  `--expert-groups` against a binary lacking that flag support.
+
+### Recommended resume/next pass command (12 nodes)
+
+- If you want a clean rerun with current code on 12 nodes, generate prompts with the
+  repository helper first (16K or 32K target lengths):
+  - `python3 a64fx/laguna-s21/tools/make_long_context.py --target 16384 --out /shared/laguna-16k.ids --metadata /shared/laguna-16k.meta`
+  - `python3 a64fx/laguna-s21/tools/make_long_context.py --target 32768 --out /shared/laguna-32k.ids --metadata /shared/laguna-32k.meta`
+- Then run a quality pass (set `MODEL`/`STAGE` paths explicitly in your environment if needed):
+  - `cd /vol0006/mdt0/data/hp250467/work/gemm/k3/a64fx/laguna-s21`
+  - `./run_laguna_s21_12n.sh generate --fp8 --ids /shared/laguna-32k.ids --chat \"You are a meticulous senior software engineer...\" --max-new 123 --no-stage --quality-cpp --prompt-cache /shared/laguna-system-prefix.ids --maxpos 34823 --np 12`
+- Capture job output and `laguna_rank00.txt` as:
+  - `output_dir/a64fx/laguna-s21/gen_<timestamp>/laguna_rank00.txt`
+  - `output_dir/a64fx/laguna-s21/gen_<timestamp>/gen.ids` (decode/quality validation).
+- For a no-stage rerun, ensure all ranks already share valid `STAGE` blobs from the
+  matching `--expert-groups` configuration before launching.
+
+## Revisit attempt (2026-08-01 17:00 JST)
+
+- I rechecked the 12-node Laguna S-2.1 path from this workspace and confirmed:
+  - Existing long-context 12-node runs remain valid (`16k/32k/65k` checkpoints listed above),
+    with sampling at `temp=0.70 top_k=20 top_p=0.95`, lockstep agreement, and expected
+    C++ recovery output.
+  - `output.49899304` is still a known stale regression artifact from an earlier
+    staging/build mismatch (`--expert-groups` passed to a stager binary that did not accept it).
+- In this environment I fixed the stager flag parity so `laguna_s21_stage` now accepts
+  `--expert-groups` and emits staged headers including that value. This closes the
+  local CLI mismatch we were hitting during stage prep.
+- A true 12-rank interactive launch is not available in this session’s MPI context, so
+  a full authorized 12-node decode quality run could not be executed end-to-end here.
+- Resume command for next authorized run (12-node interactive/job allocation):
+  - `cd /vol0006/mdt0/data/hp250467/work/gemm/k3/a64fx/laguna-s21`
+  - `./run_laguna_s21_12n.sh stage --np 12 --model-dir /home/u14346/models/laguna-s21-int4 --stage-dir /local/$USER/laguna-s21-int4-ep12 --nshards 15 --expert-groups 1`
+  - `./run_laguna_s21_12n.sh generate --np 12 --no-stage --model-dir /home/u14346/models/laguna-s21-int4 --ids /shared/laguna-32k.ids --chat \"You are a meticulous senior software engineer...\" --max-new 123 --quality-cpp --prompt-cache /shared/laguna-system-prefix.ids --maxpos 65536`
+
+
+## 12-node Laguna S-2.1 revisit status (2026-08-01 17:37 JST)
+
+- 12-node interactive execution is still not runnable from this chat session without a real multi-node PJM allocation.
+- I created fresh long-context inputs for local reuse:
+  - `a64fx/laguna-s21/long16k.ids` (`16377` tokens, target `16384`)
+  - `a64fx/laguna-s21/long32k.ids` (`32767` tokens, target `32768`)
+- Metadata produced:
+  - `a64fx/laguna-s21/long16k.meta`
+  - `a64fx/laguna-s21/long32k.meta`
+- Recommended restart command on a 12-node allocation (with fresh stage from fp8 or int4 as needed):
+  - `cd /vol0006/mdt0/data/hp250467/work/gemm/k3/a64fx/laguna-s21`
+  - `./run_laguna_s21_12n.sh generate --fp8 --no-stage --np 12 --ids /vol0006/mdt0/data/hp250467/work/gemm/k3/a64fx/laguna-s21/long32k.ids --chat "You are a meticulous senior software engineer" --max-new 123 --quality-cpp --prompt-cache /tmp/laguna-system-prefix.ids --sample --temp 0.70 --top-p 0.95 --seed 305441741 --maxpos 34823`
+  - For 16K prefix, use `long16k.ids` and `--maxpos 20000` (or larger)
+- Historical 12-node result checks to carry forward:
+  - Last successful long-context checkpoints remain `temp=0.70 top_k=20 top_p=0.95` with lockstep agreement and valid C++ recovery text (e.g. `314159 cobalt-orchid 271828`) in `gen_20260730-*` and `gen_20260731-005642`.
+- Note: the most recent transient local attempts in this session (`gen_20260801-1737xx`) are incomplete/inconclusive due environment/runtime interruptions; use the above fresh IDs + job allocation for a clean validation.
+
+## 12-node Laguna S-2.1 revisit check (2026-08-01 session)
+
+- Completed quick launcher validation for the 12-node path in this session:
+  - `./run_laguna_s21_12n.sh self-test --fp8 --np 12` passes (`Laguna S21 ABI self-test: PASS`).
+- No successful clean end-to-end 12-node generate run was produced in this chat session because the interactive environment does not provide a real multi-node allocation.
+- There are multiple stale/incomplete 12-node `gen_20260801-17xxxx` artifacts that are not valid quality baselines:
+  - `gen_20260801-155151`: staging artifacts missing (`rankXX.manifest` not found) due `/local/u14346/laguna-s21-ep12` mismatch
+  - `gen_20260801-1723xx` and `gen_20260801-173732`: wrong checkpoint tensor set (`missing tensor model.layers.1.mlp.experts.*`) or stale manifest (`/local/u14346/laguna-s21-ep1`)
+  - `gen_20260801-00xx`/`-16xx`: timeout/rpc-synchronization failures (`rc=110`) during `bcast/wait`
+  - `gen_20260801-083047/48` etc: missing local prompt-id files (`/tmp/laguna-8k.ids`)
+- The last valid long-context quality baselines still in-tree remain the July 30/31 12-node runs listed in prior section (16k, 32k, 65k cases), all with `temp=0.70 top_k=20 top_p=0.95` and lockstep agreement.
+
+Next clean rerun (12-node allocation):
+
+```bash
+cd /vol0006/mdt0/data/hp250467/work/gemm/k3/a64fx/laguna-s21
+./run_laguna_s21_12n.sh stage --fp8 --np 12 --model-dir /home/u14346/models/laguna-s21-fp8   --stage-dir /local/$USER/laguna-s21-fp8-ep12 --nshards 24 --expert-groups 1
+
+./run_laguna_s21_12n.sh generate --fp8 --np 12 --no-stage --model-dir /home/u14346/models/laguna-s21-fp8   --stage-dir /local/$USER/laguna-s21-fp8-ep12 --ids /vol0006/mdt0/data/hp250467/work/gemm/k3/a64fx/laguna-s21/long16k.ids   --chat "You are a meticulous senior software engineer" --sample --temp 0.70 --top-p 0.95 --seed 305441741   --max-new 123 --quality-cpp --prompt-cache /tmp/laguna-system-prefix.ids --maxpos 17000
+
+# 32K pass (optional)
+./run_laguna_s21_12n.sh generate --fp8 --np 12 --no-stage --model-dir /home/u14346/models/laguna-s21-fp8   --stage-dir /local/$USER/laguna-s21-fp8-ep12 --ids /vol0006/mdt0/data/hp250467/work/gemm/k3/a64fx/laguna-s21/long32k.ids   --chat "You are a meticulous senior software engineer" --sample --temp 0.70 --top-p 0.95 --seed 305441741   --max-new 123 --quality-cpp --prompt-cache /tmp/laguna-system-prefix.ids --maxpos 36000
+```
+
+Required for clean resume:
+
+- Use a writable shared path for prompt/id and prompt-cache files visible on all nodes.
+- Ensure `--stage` artifacts are regenerated once per allocation if stale/missing.
+- Keep `--no-stage` only after a successful prior stage pass with matching `--nshards` + `--expert-groups`.
