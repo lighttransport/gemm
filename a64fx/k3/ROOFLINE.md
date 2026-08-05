@@ -119,3 +119,59 @@ nodes** — it does not need the queue to iterate on.
 Also free: the straggler tails (sample max 4-6x mean) and, for prefill, the
 measured run's `chunk 64` on a 256-token prompt, the worst case for GEMM
 efficiency.
+
+## Follow-up: the per-layer prefetch thread is a net loss
+
+`full_prefetch_start` (`k3_full_runner.c:354`) does a `pthread_create` per MoE
+layer whose worker issues one `__builtin_prefetch` per 64 bytes over 16 MiB —
+262144 of them on a single core — and it is joined inside the `moe_shared`
+timed region, which also mis-attributed the wait to that phase.
+
+Layer 3, 12 nodes, 512 samples per run:
+
+| prefetch | rep1 | rep2 |
+|---|---|---|
+| off | **4.146** | **4.138** |
+| 16 MiB | 4.894 | 5.413 |
+
+1.18-1.31x, and note the off case is reproducible where the on case is not —
+the rogue thread adds jitter as well as time. Default changed to 0 in
+`k3_full_runner.c` and `run_k3_full_12n.sh`; the production 96-node script
+already passed 0 explicitly.
+
+**A caution on measuring this.** A single on/off pair suggested 2x. Three
+repeats at the default 32 samples gave overlapping distributions (off
+3.87/3.63/5.47, on 4.16/5.42/4.46) — i.e. the 2x was noise. Only at 512 samples
+(`--prefill-tokens 512`) does the effect resolve. Use 512 samples for anything
+under ~30% on this node.
+
+## Clean baseline and what to attack next
+
+Layer 3 (MLA), 12 nodes, expert-TP, prefetch off, 512 samples — **4.303 ms**:
+
+| phase | ms | share |
+|---|---|---|
+| attention | **1.855** | 43% |
+| moe_collective | 0.933 | 22% |
+| moe_shared | 0.711 | 17% |
+| moe_finish | 0.583 | 14% |
+| moe_dispatch | 0.499 | 12% |
+| moe_expert | 0.479 | 11% |
+
+Sub-phases are rank-maxima and do not sum to the parent; every phase's sample
+peak is 12-20 ms against means under 2 ms, so straggler tails are large.
+
+**`moe_shared` is overhead, not compute.** With TP over 12 nodes it is 512 local
+rows: gate 512x7168, up 512x7168, down 7168x512 = 11.0e6 macs on 22 MB of bf16
+weights. At the measured bf16 rate (326 Gmac/s) that is 0.034 ms; it takes
+0.711 ms, i.e. **15.5 Gmac/s, 21x off the kernel's own rate**. The block is two
+OpenMP regions (`full_bf16_many` for gate+up, then `full_bf16_matvec` for down,
+separated by a SiTU dependency) plus the activation. At this size the region
+entry dominates — the same `__kmp_fork_barrier` cost that was 12-14% of the
+quant bench. The fix is fewer, larger parallel regions per layer, not a faster
+kernel.
+
+The same argument likely applies to `attention` and to `moe_dispatch` /
+`dispatch_proj`, which are also small projections in their own regions. That is
+the next piece of work, and it is a restructuring of where parallel regions
+begin and end across a layer, not kernel tuning.

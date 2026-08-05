@@ -1852,7 +1852,14 @@ static int full_options(int argc, char **argv, k3_full_options *o) {
         .comm_poll_spins = 4,
         .comm_a2a = 0,
         .comm_a2a_max = 8192,
-        .prefetch_mib = 16,
+        /* Off by default: the prefetch is a per-layer pthread_create whose
+         * worker issues one __builtin_prefetch per 64 bytes over 16 MiB on a
+         * single core, and it costs more than it saves.  Measured on layer 3 at
+         * 12 nodes, 512 samples: 4.14 ms/layer with it off against 4.89-5.41
+         * with it on, and the off case is reproducible (4.146/4.138) where the
+         * on case is not -- the rogue thread adds jitter as well as time.  The
+         * production 96-node script already passed 0. */
+        .prefetch_mib = 0,
         .profile = 0,
         .profile_output = NULL,
         .prefill_tokens = 8192, .new_tokens = 4096,
