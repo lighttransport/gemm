@@ -685,7 +685,7 @@ int main(int argc, char **argv) {
     char config_path[1024] = {0};
     int debug_env = 0, bank_layers = 1, layers = 0, dual_gpu = 0, cuda_device = 0;
     int dual_cuda_mxfp4 = 1, dual_cuda_terms = 1, dual_cuda_small = 0;
-    int dual_cuda_resident_from = 0;
+    int dual_cuda_resident_from = 0, dual_cuda_preload = 1;
     int mxfp4_test = 0, mxfp4_widened_test = 0;
     int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
     int prefill_repeat = 1;
@@ -745,6 +745,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--dual-cuda-terms") == 0 && i + 1 < argc) dual_cuda_terms = atoi(argv[++i]);
         else if (strcmp(a, "--dual-cuda-small-buckets") == 0 && i + 1 < argc) dual_cuda_small = atoi(argv[++i]);
         else if (strcmp(a, "--dual-cuda-resident-from") == 0 && i + 1 < argc) dual_cuda_resident_from = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-cuda-preload") == 0 && i + 1 < argc) dual_cuda_preload = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-gemm-test") == 0) mxfp4_test = 1;
         else if (strcmp(a, "--hip-mxfp4-widened-gemm-test") == 0) mxfp4_widened_test = 1;
         else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
@@ -903,7 +904,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-    if (dual && dual_cuda_small && dual_cuda_resident_from > 0) {
+    if (dual && dual_cuda_small && dual_cuda_resident_from > 0 && dual_cuda_preload) {
         fprintf(stderr, "preloading CUDA resident expert weights (layers %d..%d)\n",
                 dual_cuda_resident_from, cfg.n_layers - 1);
         for (int L = dual_cuda_resident_from; L < cfg.n_layers && pass; ++L) {

@@ -39,9 +39,14 @@ static int cuda_eligible(const dual_ds4f_prefill *c, const ds4f_tensor *t,
     /* Keep the exact CPU fallback for small routed buckets by default.  CUDA
      * is used only once a full x128 batch is available; this avoids partial-tile
      * instability and limits long-context accumulation drift.  c->small_buckets
-     * opts into the padded small-bucket path (the MMQ pads internally). */
+     * opts into the padded small-bucket path (the MMQ pads internally).
+     * A tensor with a positive gpu_id is owned by the HIP MXFP4 resident
+     * upload (matrix id >= the dense bank), so it must NOT be re-routed to the
+     * SM120 -- the dual split keeps the head layers on the ROCm and the tail
+     * on the RTX card. */
     int mmin = c->small_buckets ? 1 : 128;
-    return c && c->cuda_mxfp4 && t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= mmin &&
+    return c && c->cuda_mxfp4 && t && t->type == DS4F_MXFP4 && t->w && t->scale &&
+           t->gpu_id == 0 && M >= mmin &&
            Ys == t->rows && Xs == t->cols && (t->rows % 128) == 0 &&
            (t->cols % 32) == 0;
 }
