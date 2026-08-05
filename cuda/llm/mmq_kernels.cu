@@ -132,6 +132,34 @@ extern "C" __global__ void mmqv_quant_mxfp4_rows(
     if (lane == 0) out->d4[quad] = (uint32_t)scale[0] | ((uint32_t)scale[1] << 8);
 }
 
+/* Two-term activation decomposition: res = x - dequant(E2M1-quant(x)), using
+ * the same block absmax / e8m0 scale / FP4 lut as mmqv_quant_mxfp4 so the
+ * residual plus the quantized term reproduces x in FP32.  In-place safe: the
+ * block absmax (shuffle reduction) completes before any lane writes. */
+extern "C" __global__ void mmqv_mxfp4_residual(
+        float *res, const float *x,
+        const int64_t ne00, const int ne1) {
+    const int lane = threadIdx.x;
+    const int row = (int)blockIdx.x;
+    const int64_t start = (int64_t)blockIdx.y * 64;
+    if (row >= ne1 || start >= ne00) return;
+    const float lut[8] = { 0.0f, .5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const int64_t base = (int64_t)row * ne00;
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const int64_t p = start + b * 32 + lane;
+        const float v = p < ne00 ? x[base + p] : 0.0f;
+        float a = fabsf(v);
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+        const uint8_t e = mmqv_e8m0_scale(a);
+        const float inv = a > 0.0f ? exp2f(-((float)e - 127.0f)) : 0.0f;
+        const uint8_t qv = mmqv_fp4(v, inv);
+        const float qval = lut[qv & 7] * exp2f((float)e - 127.0f) * ((qv & 8) ? -1.0f : 1.0f);
+        if (p < ne00) res[base + p] = v - qval;
+    }
+}
+
 extern "C" __global__ void mmqv_add_f32(float *dst, const float *src, int n) {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) dst[i] += src[i];

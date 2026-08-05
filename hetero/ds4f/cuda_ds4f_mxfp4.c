@@ -10,7 +10,7 @@
 typedef struct { unsigned int x, y, z; } ds4f_u3;
 /* ~1000 slots = ~12 GB of expert tensors (the whole owned bank is ~16.5 GB;
  * a resident-weight server keeps what fits and streams the rest). */
-#define DS4F_CUDA_MXFP4_CACHE_SLOTS 2048
+#define DS4F_CUDA_MXFP4_CACHE_SLOTS 4096
 typedef struct {
     const void *wkey, *skey;
     CUdeviceptr d;
@@ -24,7 +24,7 @@ typedef struct {
     size_t xb, q8b, yb, hxb, hresb, hyb2, fixb;
 } cuda_batch_buf;
 struct cuda_ds4f_mxfp4 {
-    CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64, add;
+    CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64, add, residual;
     CUstream stream; CUevent quant_done;
     CUdeviceptr w, x, q8, y, y2, tmpfix, ids; size_t xb, q8b, yb, y2b, fixb, wb, idsb;
     void *hx, *hy, *hw, *hres; size_t hxb, hyb, hwb, hresb;
@@ -54,7 +54,7 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
     cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
     c->verbose = verbose;
-    c->cache_limit = (size_t)14 * 1024 * 1024 * 1024;
+    c->cache_limit = (size_t)10 * 1024 * 1024 * 1024;
     {   const char *e = getenv("DS4F_CUDA_MXFP4_CACHE_MB");
         if (e && *e) {
             long mb = atol(e);
@@ -82,6 +82,7 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
         ck(cuModuleGetFunction(&c->gemm, c->mod, "mmqv_mxfp4_x128_nc0"), "mxfp4") ||
         ck(cuModuleGetFunction(&c->gemm64, c->mod, "mmqv_mxfp4_x64_nc0"), "mxfp4 x64") ||
         ck(cuModuleGetFunction(&c->add, c->mod, "mmqv_add_f32"), "f32 add")) goto fail;
+    cuModuleGetFunction(&c->residual, c->mod, "mmqv_mxfp4_residual");
     cuModuleGetFunction(&c->fixup, c->mod, "mmqv_fixup_mxfp4_x128_nc0");
     cuModuleGetFunction(&c->fixup64, c->mod, "mmqv_fixup_mxfp4_x64_nc0");
     cuDeviceGetAttribute(&c->nsm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, c->dev);
@@ -177,7 +178,9 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     }
     c->cache_misses++;
     CUdeviceptr d = 0;
-    if (cuMemAlloc(&d, bytes) != CUDA_SUCCESS || cuMemcpyHtoD(d, p, bytes) != CUDA_SUCCESS) {
+    CUresult ar = cuMemAlloc(&d, bytes);
+    if (ar != CUDA_SUCCESS || cuMemcpyHtoD(d, p, bytes) != CUDA_SUCCESS) {
+        if (getenv("DS4F_DBG_BATCH")) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(ar, &es); fprintf(stderr, "LOADFAIL %dx%d bytes=%zu arr=%d %s cache=%.1fGB\n", rows, cols, bytes, ar, es?es:"?", (double)c->cache_bytes/1e9); }
         if (d) cuMemFree(d);
         return -1;
     }
@@ -199,7 +202,7 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
      * batches to the proven x128 path; normal prefill batches use x64/x128. */
     const int use64 = M < 128;
     const int Mp = use64 ? (M < 64 ? 64 : M) : ((M + 127) & ~127);
-    size_t xb = (size_t)Mp * K * sizeof(float), q8b = (size_t)Mp * ((K + 255) & ~255) / 256 * 144 + 256 * 144, yb = (size_t)Mp * N * sizeof(float);
+    size_t xb = (size_t)Mp * K * sizeof(float), q8b = (size_t)Mp * ((K + 255) & ~255) / 256 * 144 + 256 * 144, yb = (size_t)Mp * N * sizeof(float) + 1024;
     if (!c->x || c->xb < xb) {
         if (c->x) cuMemFree(c->x);
         if (cuMemAlloc(&c->x, xb) != CUDA_SUCCESS) return -1;
@@ -425,7 +428,7 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
         int K = cols[i], N = rows[i], mm = M[i];
         size_t xb = (size_t)Mp[i] * K * sizeof(float);
         size_t q8b = (size_t)Mp[i] * ((K + 255) & ~255) / 256 * 144 + 256 * 144;
-        size_t yb = (size_t)Mp[i] * N * sizeof(float);
+        size_t yb = (size_t)Mp[i] * N * sizeof(float) + 1024;
         if (xb > B->xb) {
             if (B->x) cuMemFree(B->x);
             CUresult arx = cuMemAlloc(&B->x, xb);
@@ -492,8 +495,10 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
             if (cuLaunchKernel(fixfn, sk[i], 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
         }
         if (terms == 2) {
-            make_mxfp4_residual(B->hres, x[i], mm, Mp[i], K);
-            if (cuMemcpyHtoDAsync(B->x, B->hres, (size_t)mm * K * sizeof(float), c->stream) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            if (!c->residual) { if (dbg) fprintf(stderr, "BATCHFAIL nores\n"); return -1; }
+            long long r00 = K; int r1 = Mp[i];
+            void *ra[] = { &B->x, &B->x, &r00, &r1 };
+            if (cuLaunchKernel(c->residual, Mp[i], K / 64, 1, 32, 1, 1, 0, c->stream, ra, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
             if (cuLaunchKernel(c->quant_fp4, Mp[i], by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
             void *a2[] = { &dw[i], &B->q8, &nullp, &nullp, &B->y2, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
                            &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
