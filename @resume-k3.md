@@ -125,10 +125,13 @@ attention/dense projection plus `output.weight`).
 Single-layer projection rate with real weights (layer 3, rank 0 of 12,
 47 threads), default kernel path:
 
-| package | at session start | now (best-of-5) |
+| package | at session start | now |
 |---|---|---|
-| IQ1 | 20.84 tok/s | **106.6** |
-| Q2 | ~20.8 tok/s | **106.9** |
+| IQ1 | 20.84 tok/s | **141.2** |
+| Q2 | ~20.8 tok/s | **120.4** |
+
+(Later figures were taken on a different node after a session restart; treat
+absolutes as node-specific and compare only same-node before/after pairs.)
 
 Roughly 5x, and ~34x versus the scalar reference the default entry point was
 actually taking. These are single-layer projection proxies, **not** full-model
