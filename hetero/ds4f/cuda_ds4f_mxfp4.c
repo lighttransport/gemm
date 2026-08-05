@@ -207,17 +207,19 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
     }
     memcpy(c->hx, x, (size_t)M * K * sizeof(float));
     CUresult xr = cuMemcpyHtoD(c->x, c->hx, (size_t)M * K * sizeof(float));
-    if (xr != CUDA_SUCCESS || cuCtxSynchronize() != CUDA_SUCCESS) return -1;
+    if (xr != CUDA_SUCCESS) return -1;
     long long ne00 = K, s01 = K, ne0 = (K + 511) & ~511;
     int by = ((int)ne0 + 63) / 64;
     long long s02 = 0, s03 = 0;
     int ne1 = Mp, ne2 = 1;
     CUdeviceptr ids0 = 0;
     void *qa[] = { &c->x, &ids0, &c->q8, &ne00, &s01, &s02, &s03, &ne0, &ne1, &ne2 };
-    if (cuLaunchKernel(c->quant_fp4, Mp, by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS ||
-        cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
-    if (cuEventRecord(c->quant_done, c->stream) != CUDA_SUCCESS ||
-        cuEventSynchronize(c->quant_done) != CUDA_SUCCESS || cuCtxSynchronize() != CUDA_SUCCESS) return -1;
+    /* Everything runs on one FIFO stream, so the quant -> gemm -> fixup chain
+     * is ordered without per-step syncs.  One sync (before the host download)
+     * is enough; this removes ~4 synchronizations per expert GEMM, which is
+     * the dominant per-call cost for the tiny routed buckets. */
+    if (cuLaunchKernel(c->quant_fp4, Mp, by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS)
+        return -1;
     int nty = (N + 127) / 128, ntx = use64 ? (Mp + 63) / 64 : (Mp + 127) / 128, tiles = nty * ntx;
     int waves = (tiles + c->nsm - 1) / c->nsm;
     int eff = 100 * tiles / (c->nsm * waves);
@@ -245,15 +247,16 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
     if (fix && !fixfn) return -1;
     void *a[] = { &c->w, &c->q8, &nullp, &nullp, &out, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
                   &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
-    if (cuLaunchKernel(gemmfn, sk, 1, 1, 32, 8, 1, 57856, c->stream, a, NULL) != CUDA_SUCCESS ||
-        cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
+    if (cuLaunchKernel(gemmfn, sk, 1, 1, 32, 8, 1, 57856, c->stream, a, NULL) != CUDA_SUCCESS)
+        return -1;
     if (fix) {
         void *fa[] = { &nullp, &nullp, &out, &c->tmpfix, &bp, &nrows, &ny, &stride_col,
                        &one, &zero, &one, &zero, &ntxfd };
-        if (cuLaunchKernel(fixfn, sk, 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS ||
-            cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
+        if (cuLaunchKernel(fixfn, sk, 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS)
+            return -1;
     }
     if (copy_back) {
+        if (cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
         if (cuMemcpyDtoH(c->hy, out, (size_t)M * N * sizeof(float)) != CUDA_SUCCESS) return -1;
         for (int r = 0; r < M; ++r)
             memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
