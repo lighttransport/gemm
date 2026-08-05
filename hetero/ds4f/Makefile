@@ -105,13 +105,23 @@ real-hip-test: $(BUILD)/test_hip_ds4f_real
 # EP_RANK, LAYERS, and PREFILL_BATCH for another shard or context size.
 # HIP_ORDERED_FP8_LAYERS defaults to LAYERS so the gate is argmax-exact
 # (0 mismatches); set it to 0 to run the faster non-ordered dense reduction.
+#
+# Thread default is one thread per PHYSICAL core (no SMT siblings).  The
+# spin-wait prefill pool contends on SMT siblings and adds run-to-run variance
+# (threads=32 on this 16-core/32-thread part measured 33-43 tok/s; physical 16
+# is a steady ~42).  The old hard default 48 oversubscribed and dropped the
+# prefill to ~17 tok/s.  Set THREADS=N to override.
+PHYS_CORES := $(shell lscpu -p=core 2>/dev/null | grep -v '^#' | cut -d, -f2 | sort -u | wc -l)
+ifeq ($(strip $(PHYS_CORES)),0)
+  PHYS_CORES := $(shell nproc)
+endif
 real-dual-test: $(BUILD)/test_hip_ds4f_real
 	@test -n "$(STAGE_DIR)" || { echo "usage: make -C hetero/ds4f real-dual-test STAGE_DIR=/tmp/ds4f_nocopy_ep8" >&2; exit 2; }
 	@test -f ../../cuda/llm/mmq_kernels.cubin || { echo "build cuda/llm/mmq_kernels.cubin first" >&2; exit 2; }
 	$(BUILD)/test_hip_ds4f_real --stage-dir $(STAGE_DIR) \
 		--ep-size $(or $(EP_SIZE),8) --ep-rank $(or $(EP_RANK),0) \
 		--layers $(or $(LAYERS),43) --bank-layers $(or $(BANK_LAYERS),43) \
-		--threads $(or $(THREADS),$(shell nproc)) --cmgs $(or $(CMGS),4) \
+		--threads $(or $(THREADS),$(PHYS_CORES)) --cmgs $(or $(CMGS),4) \
 		--prefill-batch $(or $(PREFILL_BATCH),64) \
 		--prefill-context $(or $(PREFILL_CONTEXT),0) \
 		--dual-gpu 1 --cuda-device $(or $(CUDA_DEVICE),0) \

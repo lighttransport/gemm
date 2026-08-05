@@ -547,10 +547,13 @@ make -C hetero/ds4f real-dual-test STAGE_DIR=/tmp/ds4f_nocopy_ep8 \
   PREFILL_BATCH=64 PREFILL_CONTEXT=0
 ```
 
-`real-dual-test` defaults `THREADS` to `nproc` (32 on this 16-core Threadripper
-1950X). **Do not set `THREADS=48` here**: the spin-wait pool with 48 threads on
-32 hardware threads oversubscribes the CPU phases and drops the prefill from
-~43 to ~17 tok/s. Setting it to the core count is worth the full speedup.
+`real-dual-test` defaults `THREADS` to one thread per **physical** core (16 on
+this 16-core Threadripper 1950X), the same default the harness uses when
+`--threads` is omitted. This is the stable point for the spin-wait pool: SMT
+siblings contend and add run-to-run variance (threads=32 measured 33--43
+tok/s), and the old hard default 48 oversubscribed the 32 hardware threads and
+dropped the prefill to ~17 tok/s. Override with `THREADS=N` if you have a
+reason to; 24 measured marginally faster but with more variance.
 
 **2026-08-04 update.** The dual path is no longer a regression and is now
 exact: batch 64 measures **39.8--40.1 tok/s at 0/64 mismatches** and batch 128

@@ -3147,10 +3147,41 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     return o;
 }
 
+/* One thread per PHYSICAL core (no SMT siblings) for the spin-wait pool.  SMT
+ * siblings contend on the same execution units and add run-to-run variance, so
+ * the default is the physical core count rather than nproc.  Counts unique
+ * "core id" values from /proc/cpuinfo; falls back to online logical CPUs. */
+static int ds4f_physical_cores(void) {
+    static int cached = -1;
+    if (cached > 0) return cached;
+    int bits[2048] = {0}, n = 0;
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+            if (strncmp(line, "core id", 7) == 0) {
+                const char *v = strchr(line, ':');
+                if (v) {
+                    int cid = atoi(v + 1);
+                    if (cid >= 0 && cid < 2048 * 32 &&
+                        !(bits[cid >> 5] & (1u << (cid & 31)))) {
+                        bits[cid >> 5] |= 1u << (cid & 31);
+                        n++;
+                    }
+                }
+            }
+        fclose(f);
+        if (n > 0) { cached = n; return n; }
+    }
+    long l = sysconf(_SC_NPROCESSORS_ONLN);
+    cached = l > 0 ? (int)l : 16;
+    return cached;
+}
+
 static void ds4f_runtime_options_init(ds4f_runtime_options *o) {
     memset(o, 0, sizeof(*o));
     o->cfg = ds4f_default_config();
-    o->ep_size = 1; o->n_threads = 16; o->n_cmgs = 1;
+    o->ep_size = 1; o->n_threads = ds4f_physical_cores(); o->n_cmgs = 1;
     o->bf16_pv = -1; o->int8kv_cal = 256; o->int8cmp_cal = 64;
     o->exact = 1; o->zero_copy_experts = 1; o->load_drop_blob = 1;
     o->hip_async = 1;
